@@ -13,12 +13,19 @@ const csv = @import("../connect/csv.zig");
 const driver = @import("../connect/driver.zig");
 const starrocks = @import("../connect/starrocks.zig");
 const tds = @import("../connect/tds.zig");
+const mysql = @import("../connect/mysql.zig");
+const postgres = @import("../connect/postgres.zig");
+const sql = @import("../connect/sql.zig");
 const request = @import("../connect/request.zig");
 const valuemod = @import("../exec/value.zig");
 
 const Value = valuemod.Value;
 
-pub const Diag = struct { msg: []const u8 = "" };
+/// `msg` points into the inline `buf`, so it outlives the run's plan arena.
+pub const Diag = struct {
+    buf: [512]u8 = undefined,
+    msg: []const u8 = "",
+};
 pub const Stats = struct { rows_out: usize = 0 };
 pub const ParamArg = struct { key: []const u8, val: []const u8 };
 
@@ -320,21 +327,45 @@ fn openSource(env: *Env, rd: ast.Read) !driver.Source {
     const conn = env.connections.get(rd.connector) orelse
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown connection `{s}`", .{rd.connector}));
     if (std.mem.eql(u8, conn.connector, "sqlserver")) {
-        const cfg = try resolveSqlServerConfig(env, conn);
-        const sql = switch (rd.form) {
-            .query => |q| q,
-            .table => |t| try std.fmt.allocPrint(env.arena, "SELECT * FROM {s}", .{try qualStr(env.arena, t)}),
-            else => return planErr(env.diag, "sqlserver read needs `table <name>` or `query \"...\"`"),
-        };
-        const s = tds.Source.open(env.gpa, cfg, sql) catch |e|
+        const cfg = try resolveDbConfig(env, conn, 1433);
+        const query = try readSql(env, rd);
+        const c = tds.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sqlserver connect failed: {s}", .{@errorName(e)}));
+        const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e|
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sqlserver read failed: {s}", .{@errorName(e)}));
+        return s.source();
+    }
+    if (std.mem.eql(u8, conn.connector, "mysql")) {
+        const cfg = try resolveDbConfig(env, conn, 3306);
+        const query = try readSql(env, rd);
+        const c = mysql.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "mysql connect failed: {s}", .{@errorName(e)}));
+        const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e|
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "mysql read failed: {s}", .{@errorName(e)}));
+        return s.source();
+    }
+    if (std.mem.eql(u8, conn.connector, "postgres")) {
+        const cfg = try resolveDbConfig(env, conn, 5432);
+        const query = try readSql(env, rd);
+        const c = postgres.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "postgres connect failed: {s}", .{@errorName(e)}));
+        const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e|
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "postgres read failed: {s}", .{@errorName(e)}));
         return s.source();
     }
     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unsupported source connector `{s}`", .{conn.connector}));
 }
 
-fn resolveSqlServerConfig(env: *Env, conn: ast.Connection) !tds.SqlConfig {
-    var cfg = tds.SqlConfig{ .host = "", .user = "", .password = "" };
+const DbConfig = struct {
+    host: []const u8 = "",
+    port: u16,
+    user: []const u8 = "",
+    password: []const u8 = "",
+    database: []const u8 = "",
+};
+
+fn resolveDbConfig(env: *Env, conn: ast.Connection, default_port: u16) !DbConfig {
+    var cfg = DbConfig{ .port = default_port };
     for (conn.config) |attr| {
         const k = attr.key;
         if (std.mem.eql(u8, k, "host")) {
@@ -349,8 +380,16 @@ fn resolveSqlServerConfig(env: *Env, conn: ast.Connection) !tds.SqlConfig {
             cfg.database = try evalCfgStr(env, attr.value);
         }
     }
-    if (cfg.host.len == 0) return planErr(env.diag, "sqlserver connection needs a `host`");
+    if (cfg.host.len == 0) return planErr(env.diag, "connection needs a `host`");
     return cfg;
+}
+
+fn readSql(env: *Env, rd: ast.Read) ![]const u8 {
+    return switch (rd.form) {
+        .query => |q| q,
+        .table => |t| try std.fmt.allocPrint(env.arena, "SELECT * FROM {s}", .{try qualStr(env.arena, t)}),
+        else => planErr(env.diag, "a DB read needs `table <name>` or `query \"...\"`"),
+    };
 }
 
 fn qualStr(arena: std.mem.Allocator, q: ast.QualName) ![]const u8 {
@@ -370,6 +409,30 @@ fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         const cfg = try resolveStarrocksConfig(env, conn);
         const s = starrocks.StreamLoadSink.open(env.gpa, cfg, w.target, schema, w.mode) catch |e|
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "starrocks sink open failed ({s}) — {s}", .{ @errorName(e), env.diag.msg }));
+        return s.sink();
+    }
+    if (std.mem.eql(u8, conn.connector, "mysql")) {
+        const cfg = try resolveDbConfig(env, conn, 3306);
+        const c = mysql.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "mysql connect failed: {s}", .{@errorName(e)}));
+        const s = sql.Sink.open(env.gpa, c.sqlConn(), .mysql, w.target, schema, w.mode) catch |e|
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "mysql sink failed: {s}", .{@errorName(e)}));
+        return s.sink();
+    }
+    if (std.mem.eql(u8, conn.connector, "sqlserver")) {
+        const cfg = try resolveDbConfig(env, conn, 1433);
+        const c = tds.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sqlserver connect failed: {s}", .{@errorName(e)}));
+        const s = sql.Sink.open(env.gpa, c.sqlConn(), .sqlserver, w.target, schema, w.mode) catch |e|
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sqlserver sink failed: {s}", .{@errorName(e)}));
+        return s.sink();
+    }
+    if (std.mem.eql(u8, conn.connector, "postgres")) {
+        const cfg = try resolveDbConfig(env, conn, 5432);
+        const c = postgres.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "postgres connect failed: {s}", .{@errorName(e)}));
+        const s = sql.Sink.open(env.gpa, c.sqlConn(), .postgres, w.target, schema, w.mode) catch |e|
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "postgres sink failed: {s}", .{@errorName(e)}));
         return s.sink();
     }
     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unsupported sink connector `{s}`", .{conn.connector}));
@@ -541,14 +604,20 @@ fn mkLit(arena: std.mem.Allocator, v: Value) anyerror!*ast.Expr {
 
 // --- small helpers ---
 
+fn setMsg(diag: *Diag, msg: []const u8) void {
+    const n = @min(msg.len, diag.buf.len);
+    @memcpy(diag.buf[0..n], msg[0..n]);
+    diag.msg = diag.buf[0..n];
+}
+
 fn planErr(diag: *Diag, msg: []const u8) error{PlanFailed} {
-    diag.msg = msg;
+    setMsg(diag, msg);
     return error.PlanFailed;
 }
 
 fn typeErr(e: eval.TypeError, diag: *Diag, msg: []const u8) error{ PlanFailed, OutOfMemory } {
     if (e == error.OutOfMemory) return error.OutOfMemory;
-    diag.msg = msg;
+    setMsg(diag, msg);
     return error.PlanFailed;
 }
 

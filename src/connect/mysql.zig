@@ -7,6 +7,14 @@
 
 const std = @import("std");
 const sr = @import("starrocks.zig");
+const sqlmod = @import("sql.zig");
+const types = @import("../lang/types.zig");
+const column = @import("../exec/column.zig");
+const valuemod = @import("../exec/value.zig");
+const batchmod = @import("../exec/batch.zig");
+
+const Value = valuemod.Value;
+const Batch = batchmod.Batch;
 
 const CLIENT_LONG_PASSWORD = 0x00000001;
 const CLIENT_CONNECT_WITH_DB = 0x00000008;
@@ -21,10 +29,16 @@ pub const Conn = struct {
     stream: std.net.Stream,
     buf: std.ArrayList(u8),
     last_error: []const u8 = "",
+    // streaming cursor state (valid between queryCursor and close)
+    meta_arena: std.heap.ArenaAllocator = undefined,
+    cols: []MyCol = &.{},
+    cur_schema: *types.Schema = undefined,
+    done: bool = false,
 
-    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8) !Conn {
+    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8) !*Conn {
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
-        var self = Conn{ .gpa = gpa, .stream = stream, .buf = std.ArrayList(u8).init(gpa) };
+        const self = try gpa.create(Conn);
+        self.* = .{ .gpa = gpa, .stream = stream, .buf = std.ArrayList(u8).init(gpa) };
         errdefer self.close();
 
         // 1. server handshake
@@ -80,6 +94,96 @@ pub const Conn = struct {
     pub fn close(self: *Conn) void {
         self.buf.deinit();
         self.stream.close();
+        self.gpa.destroy(self);
+    }
+
+    pub fn sqlConn(self: *Conn) sqlmod.Conn {
+        return .{ .ptr = self, .vtable = &sql_vtable };
+    }
+
+    /// Start streaming a query: send it, parse the column-def header.
+    pub fn queryCursor(self: *Conn, sql: []const u8) !sqlmod.Cursor {
+        self.meta_arena = std.heap.ArenaAllocator.init(self.gpa);
+        self.openCursor(sql) catch |e| {
+            self.meta_arena.deinit();
+            self.close();
+            return e;
+        };
+        return .{ .ptr = self, .vtable = &cursor_vtable };
+    }
+
+    fn openCursor(self: *Conn, sql: []const u8) !void {
+        const ma = self.meta_arena.allocator();
+        const payload = try self.gpa.alloc(u8, sql.len + 1);
+        defer self.gpa.free(payload);
+        payload[0] = 0x03; // COM_QUERY
+        @memcpy(payload[1..], sql);
+        try self.writePacket(0, payload);
+
+        _ = try self.readPacket();
+        const first = self.buf.items;
+        if (first.len == 0) return error.MysqlProtocol;
+        if (first[0] == 0xff) {
+            self.last_error = try self.gpa.dupe(u8, errMessage(first));
+            return error.MysqlQueryFailed;
+        }
+        if (first[0] == 0x00 or first[0] == 0xfe) {
+            self.cols = &.{};
+            const empty = try ma.create(types.Schema);
+            empty.* = .{ .fields = &.{} };
+            self.cur_schema = empty;
+            self.done = true;
+            return;
+        }
+
+        var ci: usize = 0;
+        const ncol: usize = @intCast(lenencInt(first, &ci));
+        self.cols = try ma.alloc(MyCol, ncol);
+        for (0..ncol) |k| {
+            _ = try self.readPacket();
+            self.cols[k] = try parseColDef(ma, self.buf.items);
+        }
+        _ = try self.readPacket(); // EOF after column defs
+
+        const fields = try ma.alloc(types.Schema.Field, ncol);
+        for (self.cols, 0..) |c, k| fields[k] = .{ .name = c.name, .ty = c.engine_type };
+        const sch = try ma.create(types.Schema);
+        sch.* = .{ .fields = fields };
+        self.cur_schema = sch;
+        self.done = false;
+    }
+
+    fn fetchBatch(self: *Conn, arena: std.mem.Allocator) !?Batch {
+        if (self.done) return null;
+        const ncol = self.cols.len;
+        if (ncol == 0) return null;
+        const builders = try arena.alloc(column.Builder, ncol);
+        for (self.cols, builders) |c, *b| b.* = column.Builder.init(arena, c.engine_type);
+
+        var n: usize = 0;
+        while (n < sqlmod.STREAM_ROWS) {
+            _ = try self.readPacket();
+            const r = self.buf.items;
+            if (r.len > 0 and r[0] == 0xfe and r.len < 9) { // EOF = end of rows
+                self.done = true;
+                break;
+            }
+            var ri: usize = 0;
+            for (self.cols, 0..) |c, k| {
+                const text = lenencStrOrNull(r, &ri);
+                try builders[k].append(try sqlmod.coerceText(arena, text, c.engine_type));
+            }
+            n += 1;
+        }
+        if (n == 0) return null;
+        const out = try arena.alloc(column.Column, ncol);
+        for (builders, 0..) |*b, k| out[k] = try b.finish();
+        return .{ .schema = self.cur_schema, .columns = out, .len = n };
+    }
+
+    fn cursorClose(self: *Conn) void {
+        self.meta_arena.deinit();
+        self.close();
     }
 
     // --- packet framing ---
@@ -178,4 +282,108 @@ fn errMessage(p: []const u8) []const u8 {
     if (p.len > 3 and p[3] == '#') i = 9; // skip '#XXXXX'
     if (i > p.len) return "mysql error";
     return p[i..];
+}
+
+// --- result-set parsing ---
+
+const sql_vtable = sqlmod.Conn.VTable{ .queryCursor = sqlQueryCursor, .exec = sqlExec, .close = sqlClose };
+
+fn sqlQueryCursor(ptr: *anyopaque, q: []const u8) anyerror!sqlmod.Cursor {
+    const self: *Conn = @ptrCast(@alignCast(ptr));
+    return self.queryCursor(q);
+}
+fn sqlExec(ptr: *anyopaque, q: []const u8) anyerror!void {
+    const self: *Conn = @ptrCast(@alignCast(ptr));
+    return self.exec(q);
+}
+fn sqlClose(ptr: *anyopaque) void {
+    const self: *Conn = @ptrCast(@alignCast(ptr));
+    self.close();
+}
+
+const cursor_vtable = sqlmod.Cursor.VTable{ .schema = curSchema, .nextBatch = curNext, .close = curClose };
+
+fn curSchema(ptr: *anyopaque) types.Schema {
+    const self: *Conn = @ptrCast(@alignCast(ptr));
+    return self.cur_schema.*;
+}
+fn curNext(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
+    const self: *Conn = @ptrCast(@alignCast(ptr));
+    return self.fetchBatch(arena);
+}
+fn curClose(ptr: *anyopaque) void {
+    const self: *Conn = @ptrCast(@alignCast(ptr));
+    self.cursorClose();
+}
+
+const MyCol = struct {
+    name: []const u8,
+    mtype: u8,
+    decimals: u8,
+    engine_type: types.Type,
+};
+
+fn parseColDef(arena: std.mem.Allocator, p: []const u8) !MyCol {
+    var i: usize = 0;
+    _ = lenencStr(p, &i); // catalog
+    _ = lenencStr(p, &i); // schema
+    _ = lenencStr(p, &i); // table
+    _ = lenencStr(p, &i); // org_table
+    const name = lenencStr(p, &i);
+    _ = lenencStr(p, &i); // org_name
+    _ = lenencInt(p, &i); // length of fixed fields (0x0c)
+    i += 2; // charset
+    i += 4; // column length
+    const mtype = p[i];
+    i += 1;
+    i += 2; // flags
+    const decimals = p[i];
+    return .{ .name = try arena.dupe(u8, name), .mtype = mtype, .decimals = decimals, .engine_type = engineTypeFor(mtype, decimals) };
+}
+
+fn engineTypeFor(mtype: u8, decimals: u8) types.Type {
+    return (switch (mtype) {
+        0x01, 0x02, 0x03, 0x08, 0x09, 0x0d => types.Type.init(.int), // TINY/SHORT/LONG/LONGLONG/INT24/YEAR
+        0x04, 0x05 => types.Type.init(.float), // FLOAT/DOUBLE
+        0x00, 0xf6 => types.Type.decimal(38, decimals), // DECIMAL/NEWDECIMAL
+        0x0a => types.Type.init(.date), // DATE
+        0x07, 0x0c => types.Type.init(.timestamp), // TIMESTAMP/DATETIME
+        0x10 => types.Type.init(.int), // BIT
+        else => types.Type.init(.string),
+    }).asNullable();
+}
+
+fn lenencInt(buf: []const u8, i: *usize) u64 {
+    const b = buf[i.*];
+    i.* += 1;
+    if (b < 0xfb) return b;
+    if (b == 0xfc) {
+        const v = @as(u64, buf[i.*]) | (@as(u64, buf[i.* + 1]) << 8);
+        i.* += 2;
+        return v;
+    }
+    if (b == 0xfd) {
+        const v = @as(u64, buf[i.*]) | (@as(u64, buf[i.* + 1]) << 8) | (@as(u64, buf[i.* + 2]) << 16);
+        i.* += 3;
+        return v;
+    }
+    var v: u64 = 0;
+    for (0..8) |k| v |= @as(u64, buf[i.* + k]) << @intCast(k * 8);
+    i.* += 8;
+    return v;
+}
+
+fn lenencStr(buf: []const u8, i: *usize) []const u8 {
+    const n: usize = @intCast(lenencInt(buf, i));
+    const s = buf[i.* .. i.* + n];
+    i.* += n;
+    return s;
+}
+
+fn lenencStrOrNull(buf: []const u8, i: *usize) ?[]const u8 {
+    if (buf[i.*] == 0xfb) {
+        i.* += 1;
+        return null;
+    }
+    return lenencStr(buf, i);
 }
