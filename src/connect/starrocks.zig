@@ -240,7 +240,7 @@ pub const StreamLoadSink = struct {
     fn runDDL(self: *StreamLoadSink, sql: []const u8) !void {
         // connect without a preselected database (it may not exist yet); DDL uses
         // fully-qualified `db`.`table` names.
-        var conn = try mysql.Conn.connect(self.gpa, self.cfg.fe_host, self.cfg.fe_port, self.cfg.user, self.cfg.password, "");
+        const conn = try mysql.Conn.connect(self.gpa, self.cfg.fe_host, self.cfg.fe_port, self.cfg.user, self.cfg.password, "");
         defer conn.close();
         conn.exec(sql) catch |e| {
             std.debug.print("starrocks DDL error: {s}\n  sql: {s}\n", .{ conn.last_error, sql });

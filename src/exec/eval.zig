@@ -401,7 +401,7 @@ pub fn valueToString(arena: std.mem.Allocator, v: Value) ![]const u8 {
 }
 
 /// Render an exact decimal `unscaled * 10^-scale`, e.g. (12345, 2) -> "123.45".
-fn formatDecimal(arena: std.mem.Allocator, unscaled: i128, scale: u8) ![]const u8 {
+pub fn formatDecimal(arena: std.mem.Allocator, unscaled: i128, scale: u8) ![]const u8 {
     const neg = unscaled < 0;
     var mag: u128 = if (neg) @intCast(-unscaled) else @intCast(unscaled);
 
