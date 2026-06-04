@@ -1042,10 +1042,65 @@ pub fn valueToString(arena: std.mem.Allocator, v: Value) ![]const u8 {
         .int => |x| try std.fmt.allocPrint(arena, "{d}", .{x}),
         .float => |x| try std.fmt.allocPrint(arena, "{d}", .{x}),
         .decimal => |d| try formatDecimal(arena, d.unscaled, d.scale),
-        .date => |x| try std.fmt.allocPrint(arena, "{d}", .{x}),
-        .time => |x| try std.fmt.allocPrint(arena, "{d}", .{x}),
-        .timestamp => |x| try std.fmt.allocPrint(arena, "{d}", .{x}),
+        .date => |x| try formatDate(arena, x),
+        .time => |x| try formatTime(arena, x),
+        .timestamp => |x| try formatTimestamp(arena, x),
     };
+}
+
+/// `YYYY-MM-DD` from a day count since the 1970 epoch.
+pub fn formatDate(arena: std.mem.Allocator, days: i64) ![]const u8 {
+    const c = civilFromDays(days);
+    return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u32, @intCast(c.y)), c.m, c.d });
+}
+
+/// `HH:MM:SS.ffffff` from microseconds since midnight. (Time parts are unsigned so
+/// `{d:0>2}` zero-pads instead of printing a sign.)
+pub fn formatTime(arena: std.mem.Allocator, t: i64) ![]const u8 {
+    const us: u64 = @intCast(@mod(t, 86_400_000_000));
+    const secs = us / 1_000_000;
+    return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ secs / 3600, (secs % 3600) / 60, secs % 60, us % 1_000_000 });
+}
+
+/// `YYYY-MM-DD HH:MM:SS` from microseconds since the 1970 epoch (floor-divides so
+/// pre-epoch instants format correctly).
+pub fn formatTimestamp(arena: std.mem.Allocator, micros: i64) ![]const u8 {
+    const days = @divFloor(micros, 86_400_000_000);
+    const us: u64 = @intCast(micros - days * 86_400_000_000); // intraday remainder, ≥ 0
+    const secs = us / 1_000_000;
+    const c = civilFromDays(days);
+    return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+        @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60,
+    });
+}
+
+/// Civil (Gregorian) date from a day count since the 1970 epoch (Howard Hinnant's
+/// algorithm). Shared by the text-sink serializer and the SQL INSERT serializer.
+pub fn civilFromDays(z0: i64) struct { y: i64, m: u32, d: u32 } {
+    const z = z0 + 719468;
+    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe = z - era * 146097; // [0, 146096]
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+    const y = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const d: u32 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
+    const m: u32 = @intCast(if (mp < 10) mp + 3 else mp - 9);
+    return .{ .y = y + (if (m <= 2) @as(i64, 1) else 0), .m = m, .d = d };
+}
+
+test "format temporal values for text sinks" {
+    const alloc = std.testing.allocator;
+    const cases = .{
+        .{ try formatDate(alloc, 0), "1970-01-01" },
+        .{ try formatDate(alloc, -1), "1969-12-31" },
+        .{ try formatTimestamp(alloc, 0), "1970-01-01 00:00:00" },
+        .{ try formatTimestamp(alloc, 86_400_000_000 + (1 * 3600 + 2 * 60 + 3) * 1_000_000), "1970-01-02 01:02:03" },
+    };
+    inline for (cases) |c| {
+        defer alloc.free(c[0]);
+        try std.testing.expectEqualStrings(c[1], c[0]);
+    }
 }
 
 /// Render an exact decimal `unscaled * 10^-scale`, e.g. (12345, 2) -> "123.45".

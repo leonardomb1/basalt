@@ -420,23 +420,9 @@ fn serializeValue(w: anytype, dialect: Dialect, v: Value, scratch: std.mem.Alloc
         },
         .string => |s| try quoteString(w, dialect, s),
         .bytes => |s| try hexLiteral(w, dialect, s),
-        .date => |days| {
-            const c = civilFromDays(days);
-            try w.print("'{d:0>4}-{d:0>2}-{d:0>2}'", .{ @as(u32, @intCast(c.y)), c.m, c.d });
-        },
-        .time => |t| {
-            const secs = @divFloor(t, 1_000_000);
-            try w.print("'{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}'", .{ @divFloor(secs, 3600), @divFloor(@mod(secs, 3600), 60), @mod(secs, 60), @mod(t, 1_000_000) });
-        },
-        .timestamp => |micros| {
-            const days = @divFloor(micros, 86_400_000_000);
-            const rem = micros - days * 86_400_000_000;
-            const secs = @divFloor(rem, 1_000_000);
-            const c = civilFromDays(days);
-            try w.print("'{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}'", .{
-                @as(u32, @intCast(c.y)), c.m, c.d, @divFloor(secs, 3600), @divFloor(@mod(secs, 3600), 60), @mod(secs, 60),
-            });
-        },
+        .date => |days| try w.print("'{s}'", .{try eval.formatDate(scratch, days)}),
+        .time => |t| try w.print("'{s}'", .{try eval.formatTime(scratch, t)}),
+        .timestamp => |micros| try w.print("'{s}'", .{try eval.formatTimestamp(scratch, micros)}),
     }
 }
 
@@ -501,20 +487,9 @@ pub fn valueText(arena: std.mem.Allocator, v: Value, fmt: BulkFormat) ![]const u
     return switch (v) {
         .null => "",
         .bool => |b| if (b) fmt.bool_true else fmt.bool_false,
-        .date => |days| blk: {
-            const c = civilFromDays(days);
-            break :blk try std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u32, @intCast(c.y)), c.m, c.d });
-        },
-        .time => |t| blk: {
-            const secs = @divFloor(t, 1_000_000);
-            break :blk try std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ @divFloor(secs, 3600), @divFloor(@mod(secs, 3600), 60), @mod(secs, 60), @mod(t, 1_000_000) });
-        },
-        .timestamp => |micros| blk: {
-            const days = @divFloor(micros, 86_400_000_000);
-            const secs = @divFloor(micros - days * 86_400_000_000, 1_000_000);
-            const c = civilFromDays(days);
-            break :blk try std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{ @as(u32, @intCast(c.y)), c.m, c.d, @divFloor(secs, 3600), @divFloor(@mod(secs, 3600), 60), @mod(secs, 60) });
-        },
+        .date => |days| try eval.formatDate(arena, days),
+        .time => |t| try eval.formatTime(arena, t),
+        .timestamp => |micros| try eval.formatTimestamp(arena, micros),
         else => try eval.valueToString(arena, v),
     };
 }
@@ -625,19 +600,6 @@ fn daysFromCivil(y0: i64, m: u32, d: u32) i64 {
     return era * 146097 + doe - 719468;
 }
 
-/// Civil date from days-since-1970 (Howard Hinnant's algorithm).
-pub fn civilFromDays(z0: i64) struct { y: i64, m: u32, d: u32 } {
-    const z = z0 + 719468;
-    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
-    const doe = z - era * 146097; // [0, 146096]
-    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
-    const y = yoe + era * 400;
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153);
-    const d: u32 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
-    const m: u32 = @intCast(if (mp < 10) mp + 3 else mp - 9);
-    return .{ .y = y + (if (m <= 2) @as(i64, 1) else 0), .m = m, .d = d };
-}
 
 test "create table + upsert SQL (postgres)" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
