@@ -51,11 +51,12 @@ pub fn wrap(arena: std.mem.Allocator, base: []const u8, pred: []const u8) ![]con
 // ---------------------------------------------------------------------------
 
 /// Discover a single-column int/uuid primary key for `table`, or null (no PK, a
-/// composite PK, or an unsupported key type → caller stays serial). Postgres only
-/// for now; other dialects return null until their catalog query is added.
+/// composite PK, or an unsupported key type → caller stays serial). Each dialect's
+/// catalog query returns the same shape: (pk_column_name, type_name, est_rows) —
+/// one row per PK column, so a composite PK yields >1 row and is rejected below.
 pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, table: []const u8) !?KeyInfo {
-    // One probe returns the single-column PK (name + type) and the planner's row
-    // estimate (pg_class.reltuples), so the size gate costs no extra round-trip.
+    // One probe returns the single-column PK (name + type) and the engine's row
+    // estimate, so the size gate costs no extra round-trip.
     const sql = switch (dialect) {
         .postgres => try std.fmt.allocPrint(arena,
             \\SELECT a.attname, t.typname, c.reltuples::bigint
@@ -65,7 +66,24 @@ pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect,
             \\JOIN pg_class c ON c.oid = i.indrelid
             \\WHERE i.indrelid = '{s}'::regclass AND i.indisprimary
         , .{table}),
-        else => return null,
+        .sqlserver => try std.fmt.allocPrint(arena,
+            \\SELECT c.name, ty.name, p.rows
+            \\FROM sys.indexes i
+            \\JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            \\JOIN sys.columns c ON c.object_id = i.object_id AND c.column_id = ic.column_id
+            \\JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+            \\JOIN (SELECT object_id, SUM(rows) AS rows FROM sys.partitions WHERE index_id IN (0,1) GROUP BY object_id) p ON p.object_id = i.object_id
+            \\WHERE i.object_id = OBJECT_ID('{s}') AND i.is_primary_key = 1
+            \\ORDER BY ic.key_ordinal
+        , .{table}),
+        .mysql => try std.fmt.allocPrint(arena,
+            \\SELECT k.COLUMN_NAME, c.DATA_TYPE, t.TABLE_ROWS
+            \\FROM information_schema.KEY_COLUMN_USAGE k
+            \\JOIN information_schema.COLUMNS c ON c.TABLE_SCHEMA = k.TABLE_SCHEMA AND c.TABLE_NAME = k.TABLE_NAME AND c.COLUMN_NAME = k.COLUMN_NAME
+            \\JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = k.TABLE_SCHEMA AND t.TABLE_NAME = k.TABLE_NAME
+            \\WHERE k.CONSTRAINT_NAME = 'PRIMARY' AND k.TABLE_SCHEMA = DATABASE() AND k.TABLE_NAME = '{s}'
+            \\ORDER BY k.ORDINAL_POSITION
+        , .{table}),
     };
     const conn = prober.open() catch return null;
     var cur = conn.queryCursor(sql) catch {
@@ -85,9 +103,14 @@ pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect,
 }
 
 fn keyKindFor(typname: []const u8) ?KeyKind {
-    const ints = [_][]const u8{ "int2", "int4", "int8", "serial", "bigserial", "smallserial" };
+    const ints = [_][]const u8{
+        "int2",   "int4",      "int8",   "serial", "bigserial", "smallserial", // postgres
+        "int",    "bigint",    "smallint", "tinyint", "mediumint", // sql server / mysql
+    };
     for (ints) |t| if (std.mem.eql(u8, typname, t)) return .int;
-    if (std.mem.eql(u8, typname, "uuid")) return .uuid;
+    // uuid: postgres `uuid`, sql server `uniqueidentifier` (only postgres splits it —
+    // plan() bails on uuid for other dialects since their sort order isn't lexical).
+    if (std.mem.eql(u8, typname, "uuid") or std.mem.eql(u8, typname, "uniqueidentifier")) return .uuid;
     return null;
 }
 

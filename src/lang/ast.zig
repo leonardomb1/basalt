@@ -192,6 +192,19 @@ pub const Connection = struct {
 
 pub const Let = struct { name: []const u8, pipeline: Pipeline, pos: Pos };
 
+/// `for <var,...> in <source> @[...] <body-pipeline>`: a plan-time fan-out.
+/// `source` is a discovery read; the planner runs it once, mapping its first N
+/// columns onto the N `var_names`, then instantiates `body` per row with each
+/// `${var}` interpolated into the read/write targets. `hints` carry `mode`
+/// (sequential|parallel) and `on_error` (stop|continue).
+pub const ForEach = struct {
+    var_names: []const []const u8,
+    source: Read,
+    hints: []const Hint,
+    body: Pipeline,
+    pos: Pos,
+};
+
 pub const Kind = enum { batch, http, stream };
 
 pub const KindDecl = struct { kind: Kind, config: []const Attr, pos: Pos };
@@ -202,6 +215,7 @@ pub const Stmt = union(enum) {
     connection: Connection,
     binding: Let,
     output: Pipeline,
+    for_each: ForEach,
 };
 
 pub const Program = struct { stmts: []const Stmt };

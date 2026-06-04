@@ -291,6 +291,10 @@ pub fn analyze(arena: std.mem.Allocator, program: ast.Program, resolver: ?Resolv
         .binding => |b| try bindings.put(b.name, b.pipeline),
         .connection => |c| try connections.put(c.name, c),
         .output => |p| try outputs.append(p),
+        // A for-each contributes its body template as an output for validation;
+        // `${var}` placeholders ride through as literal text (DB source schemas stay
+        // unresolved offline, so they don't false-error — same as a normal DB read).
+        .for_each => |fe| try outputs.append(fe.body),
         .param, .kind => {},
     };
     if (outputs.items.len == 0)

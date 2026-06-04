@@ -85,6 +85,15 @@ pub const Parser = struct {
         if (self.at(.ident)) return self.advance().text;
         return self.fail(self.curPos(), "expected identifier, found {s}", .{self.curTag().describe()});
     }
+    /// A name part: an identifier or a `${var}` interpolation placeholder (whose
+    /// text is carried through verbatim and rendered at plan time).
+    fn atName(self: *Parser) bool {
+        return self.at(.ident) or self.at(.interp);
+    }
+    fn expectName(self: *Parser) Error![]const u8 {
+        if (self.atName()) return self.advance().text;
+        return self.fail(self.curPos(), "expected identifier, found {s}", .{self.curTag().describe()});
+    }
     fn expectKw(self: *Parser, kw: []const u8) Error!void {
         if (self.eatKw(kw)) return;
         return self.fail(self.curPos(), "expected `{s}`, found {s}", .{ kw, self.curTag().describe() });
@@ -121,6 +130,7 @@ pub const Parser = struct {
         if (self.isKw("param")) return .{ .param = try self.parseParam() };
         if (self.isKw("connection")) return .{ .connection = try self.parseConnection() };
         if (self.isKw("let")) return .{ .binding = try self.parseLet() };
+        if (self.isKw("for")) return .{ .for_each = try self.parseForEach() };
         if (self.at(.ident)) return .{ .output = try self.parsePipeline() };
         return self.fail(self.curPos(), "expected a declaration (param/connection/let) or a pipeline", .{});
     }
@@ -207,6 +217,22 @@ pub const Parser = struct {
         _ = try self.expect(.assign);
         const pipeline = try self.parsePipeline();
         return .{ .name = name, .pipeline = pipeline, .pos = pos };
+    }
+
+    /// `for <var> in <source-read> @[...] <body-pipeline>`. The source is a read
+    /// without the leading `read` keyword (e.g. `mssql query "..."`); the body is
+    /// the single pipeline that follows.
+    fn parseForEach(self: *Parser) Error!ast.ForEach {
+        const pos = self.curPos();
+        try self.expectKw("for");
+        var names = std.ArrayList([]const u8).init(self.arena);
+        try names.append(try self.expectIdent());
+        while (self.eat(.comma)) try names.append(try self.expectIdent());
+        try self.expectKw("in");
+        const source = try self.parseRead();
+        const hints = try self.parseHints();
+        const body = try self.parsePipeline();
+        return .{ .var_names = try names.toOwnedSlice(), .source = source, .hints = hints, .body = body, .pos = pos };
     }
 
     // --- pipelines / stages ---
@@ -411,7 +437,7 @@ pub const Parser = struct {
         const first = try self.parseQualName();
         var form: ?[]const u8 = null;
         var target = try joinQual(self.arena, first);
-        if (self.at(.ident) and !self.isModeKw()) {
+        if (self.atName() and !self.isModeKw()) {
             form = target;
             target = try joinQual(self.arena, try self.parseQualName());
         }
@@ -434,15 +460,15 @@ pub const Parser = struct {
         if (self.eatKw("upsert")) {
             try self.expectKw("on");
             var keys = std.ArrayList([]const u8).init(self.arena);
-            try keys.append(try self.expectIdent());
-            while (self.eat(.comma)) try keys.append(try self.expectIdent());
+            try keys.append(try self.expectName());
+            while (self.eat(.comma)) try keys.append(try self.expectName());
             var partial: ?[]const []const u8 = null;
             if (self.eatKw("partial")) {
                 try self.expectKw("cols");
                 _ = try self.expect(.lparen);
                 var cols = std.ArrayList([]const u8).init(self.arena);
-                try cols.append(try self.expectIdent());
-                while (self.eat(.comma)) try cols.append(try self.expectIdent());
+                try cols.append(try self.expectName());
+                while (self.eat(.comma)) try cols.append(try self.expectName());
                 _ = try self.expect(.rparen);
                 partial = try cols.toOwnedSlice();
             }
@@ -483,7 +509,7 @@ pub const Parser = struct {
                 if (self.at(.ident)) return .{ .size = .{ .n = n, .unit = self.advance().text } };
                 return .{ .int = n };
             },
-            .ident => {
+            .ident, .interp => {
                 _ = self.advance();
                 return .{ .ident = t.text };
             },
@@ -685,8 +711,8 @@ pub const Parser = struct {
 
     fn parseQualName(self: *Parser) Error!ast.QualName {
         var parts = std.ArrayList([]const u8).init(self.arena);
-        try parts.append(try self.expectIdent());
-        while (self.eat(.dot)) try parts.append(try self.expectIdent());
+        try parts.append(try self.expectName());
+        while (self.eat(.dot)) try parts.append(try self.expectName());
         return .{ .parts = try parts.toOwnedSlice() };
     }
 
@@ -822,6 +848,37 @@ test "parse precedence and conditionals" {
     try std.testing.expectEqual(@as(usize, 2), m.arms.len);
     try std.testing.expectEqual(@as(usize, 2), m.arms[0].pats.len); // "paid" | "ok"
     try std.testing.expect(m.arms[1].is_default);
+}
+
+test "parse a for-each over a table list" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const src =
+        \\@batch
+        \\connection mssql = sqlserver host = "h"
+        \\connection sr = starrocks
+        \\for tbl, pk in mssql query "SELECT name, pk FROM meta" @[mode = parallel, on_error = continue]
+        \\  read mssql table dbo.${tbl}
+        \\    | write sr stream_load ${tbl} upsert on ${pk}
+    ;
+    const prog = try parseTest(ar.allocator(), src);
+    try std.testing.expect(prog.stmts[3] == .for_each);
+    const fe = prog.stmts[3].for_each;
+    try std.testing.expectEqual(@as(usize, 2), fe.var_names.len);
+    try std.testing.expectEqualStrings("tbl", fe.var_names[0]);
+    try std.testing.expectEqualStrings("pk", fe.var_names[1]);
+    try std.testing.expectEqualStrings("mssql", fe.source.connector);
+    try std.testing.expect(fe.source.form == .query);
+    try std.testing.expectEqual(@as(usize, 2), fe.hints.len);
+    try std.testing.expectEqual(@as(usize, 2), fe.body.stages.len);
+    const rd = fe.body.stages[0].node.read;
+    try std.testing.expectEqual(@as(usize, 2), rd.form.table.parts.len);
+    try std.testing.expectEqualStrings("${tbl}", rd.form.table.parts[1]);
+    const w = fe.body.stages[1].node.write;
+    try std.testing.expectEqualStrings("stream_load", w.form.?);
+    try std.testing.expectEqualStrings("${tbl}", w.target);
+    try std.testing.expect(w.mode == .upsert);
+    try std.testing.expectEqualStrings("${pk}", w.mode.upsert.keys[0]);
 }
 
 test "missing @kind is an error" {

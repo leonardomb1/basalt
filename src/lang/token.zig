@@ -10,6 +10,7 @@ pub const Tag = enum {
     string, // text excludes the surrounding quotes (escapes not yet unescaped)
     int,
     float,
+    interp, // ${name} — template placeholder; text is the full lexeme incl. `${}`
 
     pipe, // |
     at, // @
@@ -45,6 +46,7 @@ pub const Tag = enum {
             .string => "string",
             .int => "integer",
             .float => "float",
+            .interp => "interpolation `${...}`",
             .pipe => "'|'",
             .at => "'@'",
             .lparen => "'('",

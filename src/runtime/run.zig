@@ -115,7 +115,9 @@ fn connectSql(gpa: std.mem.Allocator, kind: SqlKind, cfg: DbConfig) !sql.Conn {
 fn openSplitSource(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, pred: []const u8) anyerror!driver.Source {
     const ctx: *SplitCtx = @ptrCast(@alignCast(ctx_ptr));
     const q = try splitmod.wrap(gpa, ctx.base_sql, pred);
+    defer gpa.free(q); // the cursor sends the query during open; we don't retain it
     const conn = try connectSql(gpa, ctx.kind, ctx.cfg);
+    errdefer conn.close(); // queryCursor leaves conn open on error (the caller owns it)
     const s = try sql.Source.open(gpa, conn, q);
     return s.source();
 }
@@ -287,14 +289,14 @@ pub fn run(gpa: std.mem.Allocator, program: ast.Program, opts: RunOptions, diag:
 
     var bindings = std.StringHashMap(ast.Pipeline).init(arena);
     var connections = std.StringHashMap(ast.Connection).init(arena);
-    var outputs = std.ArrayList(ast.Pipeline).init(arena);
+    var runnable: usize = 0; // outputs + for-each blocks
     for (program.stmts[1..]) |s| switch (s) {
         .binding => |b| try bindings.put(b.name, b.pipeline),
         .connection => |c| try connections.put(c.name, c),
-        .output => |p| try outputs.append(p),
+        .output, .for_each => runnable += 1,
         .param, .kind => {},
     };
-    if (outputs.items.len == 0)
+    if (runnable == 0)
         return planErr(diag, "no output pipeline (a pipeline ending in `write`)");
 
     const run_id: u64 = @intCast(std.time.milliTimestamp());
@@ -315,55 +317,12 @@ pub fn run(gpa: std.mem.Allocator, program: ast.Program, opts: RunOptions, diag:
 
     var stats = Stats{ .run_id = run_id };
     var lanes_used: usize = 1; // actual parallelism (1 unless split-parallel engaged)
-    for (outputs.items) |out| {
-        const stages = out.stages;
-        const last = stages[stages.len - 1].node;
-        if (last != .write) return planErr(diag, "a top-level pipeline must end in `write`");
-        env.sink_name = connectorType(&env, last.write.connector);
-
-        env.sql_desc = null;
-        env.src_name = ""; // reset per output so this pipeline's first read sets it
-        const src_base = env.sources.items.len; // sources this output opens (for early release on the split path)
-        const res = try buildPipeline(&env, stages[0 .. stages.len - 1]);
-
-        // Split-parallel: a map-only pipeline (no breakers/limit) reading a
-        // splittable SQL source fans out into N key-range lanes, each on its own
-        // connection. A StarRocks sink also fans out — one stream-load stream per
-        // lane (lane-distinct labels, shared run_id); other sinks (CSV) stay shared
-        // under a mutex. Non-splittable sources or stateful pipelines stay serial.
-        if (opts.threads > 1 and env.sql_desc != null) {
-            if (try op.linearize(arena, res.op)) |lin| {
-                if (try planSplit(&env, env.sql_desc.?, stages[0], opts.threads, last.write)) |sp| {
-                    // The planning source was opened only to build res.op + discover the
-                    // split descriptor (which copies its own config); the lanes open their
-                    // own connections, so close it now rather than holding an idle
-                    // connection with an unconsumed result set for the whole parallel run.
-                    for (env.sources.items[src_base..]) |sc| sc.close();
-                    env.sources.shrinkRetainingCapacity(src_base);
-                    var ctx = SplitCtx{ .gpa = gpa, .kind = env.sql_desc.?.kind, .cfg = env.sql_desc.?.cfg, .base_sql = env.sql_desc.?.base_sql };
-                    lanes_used = @max(lanes_used, @min(opts.threads, sp.predicates.len));
-                    env.log.log(.info, "split-parallel: {d} splits over {d} lanes on key range", .{ sp.predicates.len, @min(opts.threads, sp.predicates.len) });
-                    if (try buildParallelSink(&env, last.write, res.schema)) |mode| {
-                        stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lin.stages, mode, opts.threads, &rows_read);
-                    } else {
-                        const snk = try openSink(&env, last.write, res.schema);
-                        stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lin.stages, .{ .shared = snk }, opts.threads, &rows_read);
-                        try snk.close();
-                    }
-                    continue;
-                }
-            }
-        }
-
-        const snk = try openSink(&env, last.write, res.schema);
-        while (true) {
-            _ = batch_arena.reset(.retain_capacity);
-            const b = (try res.op.next(batch_arena.allocator())) orelse break;
-            try snk.writeBatch(batch_arena.allocator(), b);
-            stats.rows_out += b.len;
-        }
-        try snk.close();
-    }
+    // Execute outputs and for-each blocks in program order.
+    for (program.stmts[1..]) |s| switch (s) {
+        .output => |p| try runOutput(&env, p, opts, &stats, &lanes_used, &batch_arena),
+        .for_each => |fe| try runForEach(&env, fe, opts, &stats, &lanes_used, &batch_arena),
+        else => {},
+    };
     for (sources.items) |sc| sc.close();
 
     stats.rows_read = rows_read.load(.monotonic);
@@ -389,6 +348,328 @@ pub fn run(gpa: std.mem.Allocator, program: ast.Program, opts: RunOptions, diag:
         .none => {},
     }
     return stats;
+}
+
+/// Run one output pipeline (ending in `write`): build it, then either split it
+/// into parallel key-range lanes or stream it serially into the sink.
+fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) !void {
+    const arena = env.arena;
+    const gpa = env.gpa;
+    const stages = out.stages;
+    if (stages.len == 0) return planErr(env.diag, "empty pipeline");
+    const last = stages[stages.len - 1].node;
+    if (last != .write) return planErr(env.diag, "a top-level pipeline must end in `write`");
+    env.sink_name = connectorType(env, last.write.connector);
+
+    env.sql_desc = null;
+    env.src_name = ""; // reset per output so this pipeline's first read sets it
+    const src_base = env.sources.items.len; // sources this output opens (for early release on the split path)
+    const res = try buildPipeline(env, stages[0 .. stages.len - 1]);
+
+    // Split-parallel: a map-only pipeline (no breakers/limit) reading a splittable
+    // SQL source fans out into N key-range lanes, each on its own connection. A
+    // StarRocks sink also fans out (one stream-load stream per lane); other sinks
+    // (CSV) stay shared under a mutex. Non-splittable/stateful pipelines stay serial.
+    if (opts.threads > 1 and env.sql_desc != null) {
+        if (try op.linearize(arena, res.op)) |lin| {
+            if (try planSplit(env, env.sql_desc.?, stages[0], opts.threads, last.write)) |sp| {
+                // The planning source was opened only to build res.op + discover the
+                // split descriptor (which copies its own config); the lanes open their
+                // own connections, so close it now rather than holding an idle
+                // connection with an unconsumed result set for the whole parallel run.
+                for (env.sources.items[src_base..]) |sc| sc.close();
+                env.sources.shrinkRetainingCapacity(src_base);
+                var ctx = SplitCtx{ .gpa = gpa, .kind = env.sql_desc.?.kind, .cfg = env.sql_desc.?.cfg, .base_sql = env.sql_desc.?.base_sql };
+                lanes_used.* = @max(lanes_used.*, @min(opts.threads, sp.predicates.len));
+                env.log.log(.info, "split-parallel: {d} splits over {d} lanes on key range", .{ sp.predicates.len, @min(opts.threads, sp.predicates.len) });
+                if (try buildParallelSink(env, last.write, res.schema)) |mode| {
+                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lin.stages, mode, opts.threads, env.rows_read);
+                } else {
+                    const snk = try openSink(env, last.write, res.schema);
+                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lin.stages, .{ .shared = snk }, opts.threads, env.rows_read);
+                    try snk.close();
+                }
+                return;
+            }
+        }
+    }
+
+    const snk = try openSink(env, last.write, res.schema);
+    while (true) {
+        _ = batch_arena.reset(.retain_capacity);
+        const b = (try res.op.next(batch_arena.allocator())) orelse break;
+        try snk.writeBatch(batch_arena.allocator(), b);
+        stats.rows_out += b.len;
+    }
+    try snk.close();
+}
+
+// --- for-each: plan-time fan-out over a discovered value list ---
+
+const ForMode = enum { sequential, parallel };
+const OnError = enum { stop, continue_ };
+
+fn forHintIdent(hints: []const ast.Hint, key: []const u8) ?[]const u8 {
+    for (hints) |h| {
+        if (std.mem.eql(u8, h.key, key) and h.value == .ident) return h.value.ident;
+    }
+    return null;
+}
+
+/// One discovery row: the first `var_names.len` columns coerced to text.
+const Row = []const []const u8;
+
+/// Run the discovery source once and collect its first `ncols` columns as rows of
+/// text (strings/ints; null → ""). The list is small — a table catalog — so it is
+/// fully materialized into the plan arena.
+fn discoverRows(env: *Env, src_read: ast.Read, ncols: usize) ![]const Row {
+    const src = openSource(env, src_read) catch |e|
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each discovery failed: {s}", .{@errorName(e)}));
+    defer src.close();
+    var rows = std.ArrayList(Row).init(env.arena);
+    var da = std.heap.ArenaAllocator.init(env.gpa);
+    defer da.deinit();
+    while (true) {
+        _ = da.reset(.retain_capacity);
+        const b = (try src.next(da.allocator())) orelse break;
+        if (b.columns.len == 0) continue;
+        if (b.columns.len < ncols)
+            return planErr(env.diag, "for-each: the discovery query returns fewer columns than loop variables");
+        for (0..b.len) |r| {
+            const row = try env.arena.alloc([]const u8, ncols);
+            for (0..ncols) |j| {
+                row[j] = switch (b.columns[j].getValue(r)) {
+                    .null => "",
+                    .string, .bytes => |s| try env.arena.dupe(u8, s),
+                    .int => |x| try std.fmt.allocPrint(env.arena, "{d}", .{x}),
+                    else => return planErr(env.diag, "for-each values must be string or int"),
+                };
+            }
+            try rows.append(row);
+        }
+    }
+    return rows.toOwnedSlice();
+}
+
+/// Replace every needle (`${var}`) in `s` with its row value (chained over all
+/// loop variables). Returns `s` unchanged (no copy) when no needle is present.
+fn interpAll(arena: std.mem.Allocator, s: []const u8, needles: []const []const u8, row: Row) ![]const u8 {
+    var cur = s;
+    for (needles, row) |needle, value| {
+        if (std.mem.indexOf(u8, cur, needle) == null) continue;
+        const size = std.mem.replacementSize(u8, cur, needle, value);
+        const buf = try arena.alloc(u8, size);
+        _ = std.mem.replace(u8, cur, needle, value, buf);
+        cur = buf;
+    }
+    return cur;
+}
+
+fn renderQual(arena: std.mem.Allocator, q: ast.QualName, needles: []const []const u8, row: Row) !ast.QualName {
+    const parts = try arena.alloc([]const u8, q.parts.len);
+    for (q.parts, parts) |s, *dst| dst.* = try interpAll(arena, s, needles, row);
+    return .{ .parts = parts };
+}
+
+fn renderRead(arena: std.mem.Allocator, rd: ast.Read, needles: []const []const u8, row: Row) !ast.Read {
+    return .{ .connector = rd.connector, .form = switch (rd.form) {
+        .table => |q| .{ .table = try renderQual(arena, q, needles, row) },
+        .query => |s| .{ .query = try interpAll(arena, s, needles, row) },
+        .path => |s| .{ .path = try interpAll(arena, s, needles, row) },
+        .request => .request,
+    } };
+}
+
+fn renderMode(arena: std.mem.Allocator, mode: ast.WriteMode, needles: []const []const u8, row: Row) !ast.WriteMode {
+    switch (mode) {
+        .upsert => |u| {
+            const keys = try arena.alloc([]const u8, u.keys.len);
+            for (u.keys, keys) |k, *dst| dst.* = try interpAll(arena, k, needles, row);
+            var partial: ?[]const []const u8 = null;
+            if (u.partial) |pc| {
+                const out = try arena.alloc([]const u8, pc.len);
+                for (pc, out) |c, *dst| dst.* = try interpAll(arena, c, needles, row);
+                partial = out;
+            }
+            return .{ .upsert = .{ .keys = keys, .partial = partial } };
+        },
+        else => return mode,
+    }
+}
+
+fn renderWrite(arena: std.mem.Allocator, w: ast.Write, needles: []const []const u8, row: Row) !ast.Write {
+    return .{
+        .connector = w.connector,
+        .form = if (w.form) |f| try interpAll(arena, f, needles, row) else null,
+        .target = try interpAll(arena, w.target, needles, row),
+        .mode = try renderMode(arena, w.mode, needles, row),
+    };
+}
+
+/// Instantiate the body template for one row: interpolate each `${var}` into the
+/// read/write targets + upsert keys (v1 = targets only; expressions untouched).
+fn renderHints(arena: std.mem.Allocator, hints: []const ast.Hint, needles: []const []const u8, row: Row) ![]const ast.Hint {
+    if (hints.len == 0) return hints;
+    const out = try arena.alloc(ast.Hint, hints.len);
+    for (hints, out) |h, *o| {
+        o.* = h;
+        o.value = switch (h.value) {
+            .str => |s| .{ .str = try interpAll(arena, s, needles, row) },
+            .ident => |s| .{ .ident = try interpAll(arena, s, needles, row) },
+            else => h.value,
+        };
+    }
+    return out;
+}
+
+fn renderPipeline(env: *Env, body: ast.Pipeline, needles: []const []const u8, row: Row) !ast.Pipeline {
+    const arena = env.arena;
+    const stages = try arena.alloc(ast.Stage, body.stages.len);
+    for (body.stages, stages) |src, *dst| {
+        dst.* = src;
+        dst.hints = try renderHints(arena, src.hints, needles, row); // e.g. @[split=${pk}]
+        switch (src.node) {
+            .read => |rd| dst.node = .{ .read = try renderRead(arena, rd, needles, row) },
+            .write => |w| dst.node = .{ .write = try renderWrite(arena, w, needles, row) },
+            else => {},
+        }
+    }
+    return .{ .stages = stages, .pos = body.pos };
+}
+
+/// Shared state for parallel-for workers. Per-table work uses a worker-private
+/// arena/env; only the counters + the first-error buffer are shared (atomics +
+/// a mutex), so no allocation ever races on the plan arena.
+const ForCtx = struct {
+    fe: ast.ForEach,
+    needles: []const []const u8,
+    rows: []const Row,
+    base: *Env,
+    worker_opts: RunOptions,
+    on_error: OnError,
+    next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    mu: std.Thread.Mutex = .{},
+    first_err_buf: [256]u8 = undefined,
+    first_err_len: usize = 0,
+};
+
+fn forRecordFail(ctx: *ForCtx, label: []const u8, ename: []const u8, msg: []const u8) void {
+    _ = ctx.failures.fetchAdd(1, .monotonic);
+    ctx.mu.lock();
+    defer ctx.mu.unlock();
+    if (ctx.first_err_len == 0) {
+        const s = std.fmt.bufPrint(&ctx.first_err_buf, "{s}: {s} {s}", .{ label, ename, msg }) catch ctx.first_err_buf[0..0];
+        ctx.first_err_len = s.len;
+    }
+    if (ctx.on_error == .stop) ctx.stop.store(true, .release);
+}
+
+fn forWorker(ctx: *ForCtx) void {
+    const gpa = ctx.base.gpa;
+    while (true) {
+        if (ctx.on_error == .stop and ctx.stop.load(.acquire)) break;
+        const i = ctx.next.fetchAdd(1, .monotonic);
+        if (i >= ctx.rows.len) break;
+        const row = ctx.rows[i];
+
+        var w_arena = std.heap.ArenaAllocator.init(gpa);
+        defer w_arena.deinit();
+        var w_batch = std.heap.ArenaAllocator.init(gpa);
+        defer w_batch.deinit();
+        var w_sources = std.ArrayList(driver.Source).init(w_arena.allocator());
+        var w_diag = Diag{};
+        var w_errctx = op.ErrCtx{};
+        var w_env = Env{
+            .arena = w_arena.allocator(),
+            .gpa = gpa,
+            .params = ctx.base.params,
+            .bindings = ctx.base.bindings,
+            .connections = ctx.base.connections,
+            .sources = &w_sources,
+            .request_body = ctx.base.request_body,
+            .diag = &w_diag,
+            .log = ctx.base.log,
+            .params_expr = ctx.base.params_expr,
+            .errctx = &w_errctx,
+            .rows_read = ctx.base.rows_read,
+        };
+        var st = Stats{ .run_id = 0 };
+        var lanes: usize = 1;
+        const pipe = renderPipeline(&w_env, ctx.fe.body, ctx.needles, row) catch |e| {
+            forRecordFail(ctx, row[0], @errorName(e), "");
+            continue;
+        };
+        if (runOutput(&w_env, pipe, ctx.worker_opts, &st, &lanes, &w_batch)) |_| {
+            _ = ctx.rows_out.fetchAdd(st.rows_out, .monotonic);
+        } else |e| {
+            forRecordFail(ctx, row[0], @errorName(e), w_diag.msg);
+        }
+        for (w_sources.items) |sc| sc.close();
+    }
+}
+
+/// Expand a `for <vars> in <source>` block into one pipeline per discovered row.
+/// `mode` (sequential|parallel) and `on_error` (stop|continue) come from `@[...]`.
+fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) !void {
+    const mode: ForMode = if (forHintIdent(fe.hints, "mode")) |m|
+        (if (std.mem.eql(u8, m, "parallel")) ForMode.parallel else ForMode.sequential)
+    else
+        .sequential;
+    const on_error: OnError = if (forHintIdent(fe.hints, "on_error")) |m|
+        (if (std.mem.eql(u8, m, "continue")) OnError.continue_ else OnError.stop)
+    else
+        .stop;
+
+    const rows = try discoverRows(env, fe.source, fe.var_names.len);
+    env.log.log(.info, "for-each {s}: {d} row(s) [{s}, on_error={s}]", .{ fe.var_names[0], rows.len, @tagName(mode), if (on_error == .continue_) "continue" else "stop" });
+    if (rows.len == 0) return;
+    const needles = try env.arena.alloc([]const u8, fe.var_names.len);
+    for (fe.var_names, needles) |name, *n| n.* = try std.fmt.allocPrint(env.arena, "${{{s}}}", .{name});
+
+    switch (mode) {
+        .sequential => {
+            var failures: usize = 0;
+            var first_err: ?[]const u8 = null;
+            for (rows) |row| {
+                const base = env.sources.items.len;
+                const pipe = try renderPipeline(env, fe.body, needles, row);
+                if (runOutput(env, pipe, opts, stats, lanes_used, batch_arena)) |_| {
+                    for (env.sources.items[base..]) |sc| sc.close();
+                    env.sources.shrinkRetainingCapacity(base);
+                } else |e| {
+                    for (env.sources.items[base..]) |sc| sc.close();
+                    env.sources.shrinkRetainingCapacity(base);
+                    failures += 1;
+                    env.log.log(.err, "for-each {s} failed: {s}", .{ row[0], @errorName(e) });
+                    if (first_err == null)
+                        first_err = std.fmt.allocPrint(env.arena, "{s}: {s}", .{ row[0], @errorName(e) }) catch null;
+                    if (on_error == .stop) return planErr(env.diag, first_err orelse "for-each failed");
+                }
+            }
+            if (failures > 0)
+                return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each: {d}/{d} failed (first: {s})", .{ failures, rows.len, first_err orelse "?" }));
+        },
+        .parallel => {
+            var wopts = opts;
+            wopts.threads = 1; // each table runs serially; the for-loop provides the parallelism
+            const nworkers = @min(@max(opts.threads, @as(usize, 1)), rows.len);
+            var ctx = ForCtx{ .fe = fe, .needles = needles, .rows = rows, .base = env, .worker_opts = wopts, .on_error = on_error };
+            const threads = try env.arena.alloc(std.Thread, nworkers);
+            var spawned: usize = 0;
+            while (spawned < nworkers) : (spawned += 1) {
+                threads[spawned] = std.Thread.spawn(.{}, forWorker, .{&ctx}) catch break;
+            }
+            if (spawned == 0) forWorker(&ctx) else for (threads[0..spawned]) |t| t.join();
+            stats.rows_out += ctx.rows_out.load(.monotonic);
+            lanes_used.* = @max(lanes_used.*, @max(spawned, @as(usize, 1)));
+            const fails = ctx.failures.load(.monotonic);
+            if (fails > 0)
+                return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each: {d}/{d} failed (first: {s})", .{ fails, rows.len, ctx.first_err_buf[0..ctx.first_err_len] }));
+        },
+    }
 }
 
 /// Resolve a sink/source connector name to its driver type for the summary
@@ -1221,4 +1502,74 @@ test "let binding + inner join" {
     defer alloc.free(out);
     // id 3 (code Z) has no match -> dropped by inner join
     try std.testing.expectEqualStrings("id,label\n1,Apple\n2,Banana\n", out);
+}
+
+test "for-each fans out over a discovered list with interpolation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "names.csv", .data = "name\nalpha\nbeta\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "alpha.csv", .data = "id,v\n1,10\n2,20\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "beta.csv", .data = "id,v\n3,30\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    // for name in csv "<base>/names.csv"
+    //   read csv "<base>/${name}.csv" | select id, v | write csv "<base>/out_${name}.csv"
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "@batch\nfor name in csv \"{s}/names.csv\"\n  read csv \"{s}/${{name}}.csv\"\n    | select id, v\n    | write csv \"{s}/out_${{name}}.csv\"",
+        .{ base, base, base },
+    );
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+
+    var rdiag: Diag = .{};
+    const stats = run(alloc, prog, .{}, &rdiag) catch |e| {
+        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+        return e;
+    };
+    try std.testing.expectEqual(@as(u64, 3), stats.rows_out); // 2 (alpha) + 1 (beta)
+
+    const a = try tmp.dir.readFileAlloc(alloc, "out_alpha.csv", 1 << 20);
+    defer alloc.free(a);
+    const b = try tmp.dir.readFileAlloc(alloc, "out_beta.csv", 1 << 20);
+    defer alloc.free(b);
+    try std.testing.expectEqualStrings("id,v\n1,10\n2,20\n", a);
+    try std.testing.expectEqualStrings("id,v\n3,30\n", b);
+}
+
+test "for-each parallel + on_error=continue isolates a failing table" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "names.csv", .data = "name\nalpha\nghost\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "alpha.csv", .data = "id\n7\n" });
+    // ghost.csv is intentionally missing -> that table's read fails.
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "@batch\nfor name in csv \"{s}/names.csv\" @[mode = parallel, on_error = continue]\n  read csv \"{s}/${{name}}.csv\"\n    | write csv \"{s}/out_${{name}}.csv\"",
+        .{ base, base, base },
+    );
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+
+    var rdiag: Diag = .{};
+    // one table fails, so the run reports a non-zero (PlanFailed) result...
+    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{ .threads = 2 }, &rdiag));
+    // ...but the healthy table still produced its output (failure was isolated).
+    const a = try tmp.dir.readFileAlloc(alloc, "out_alpha.csv", 1 << 20);
+    defer alloc.free(a);
+    try std.testing.expectEqualStrings("id\n7\n", a);
 }
