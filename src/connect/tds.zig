@@ -840,7 +840,7 @@ fn decodeValue(arena: std.mem.Allocator, d: ColumnDesc, bytes: []const u8) !Valu
         .bool => .{ .bool = bytes.len > 0 and bytes[0] != 0 },
         .float => .{ .float = if (bytes.len == 4) @as(f64, @as(f32, @bitCast(@as(u32, @truncate(readULE(bytes))))) ) else @bitCast(readULE(bytes)) },
         .decimal => decodeDecimal(d, bytes),
-        .string => .{ .string = if (d.is_unicode) try utf16ToUtf8(arena, bytes) else try arena.dupe(u8, bytes) },
+        .string => .{ .string = if (d.is_unicode) try utf16ToUtf8(arena, bytes) else try win1252ToUtf8(arena, bytes) },
         .bytes => .{ .bytes = try arena.dupe(u8, bytes) },
         .date => .{ .date = @intCast(@as(i64, @intCast(readULE(bytes))) - 719162) },
         .timestamp => .{ .timestamp = decodeDateTime(d, bytes) },
@@ -924,6 +924,47 @@ fn readIntLE(bytes: []const u8) i64 {
     };
 }
 
+/// Map a high byte (0x80–0xFF) of Windows-1252 to its Unicode code point. 0xA0–0xFF
+/// match Latin-1 (cp == byte); 0x80–0x9F carry the cp1252-specific punctuation;
+/// the five undefined slots (0x81/0x8D/0x8F/0x90/0x9D) fall back to the byte value.
+fn cp1252High(b: u8) u21 {
+    return switch (b) {
+        0x80 => 0x20AC, 0x82 => 0x201A, 0x83 => 0x0192, 0x84 => 0x201E, 0x85 => 0x2026,
+        0x86 => 0x2020, 0x87 => 0x2021, 0x88 => 0x02C6, 0x89 => 0x2030, 0x8A => 0x0160,
+        0x8B => 0x2039, 0x8C => 0x0152, 0x8E => 0x017D, 0x91 => 0x2018, 0x92 => 0x2019,
+        0x93 => 0x201C, 0x94 => 0x201D, 0x95 => 0x2022, 0x96 => 0x2013, 0x97 => 0x2014,
+        0x98 => 0x02DC, 0x99 => 0x2122, 0x9A => 0x0161, 0x9B => 0x203A, 0x9C => 0x0153,
+        0x9E => 0x017E, 0x9F => 0x0178,
+        else => b,
+    };
+}
+
+/// Transcode a non-Unicode (single-byte) SQL Server char value to UTF-8, assuming
+/// Windows-1252 — the code page behind the common Latin collations (e.g.
+/// SQL_Latin1_General_CP1). Pure-ASCII input is duped as-is (no allocation growth).
+/// Without this, accented Latin text (RELÓGIO, SINALIZAÇÃO) reaches a UTF-8 sink as
+/// invalid bytes and is rejected (e.g. StarRocks "Invalid UTF-8 row").
+fn win1252ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    var high = false;
+    for (bytes) |b| {
+        if (b >= 0x80) {
+            high = true;
+            break;
+        }
+    }
+    if (!high) return arena.dupe(u8, bytes);
+
+    var out = std.ArrayList(u8).init(arena);
+    try out.ensureTotalCapacity(bytes.len + bytes.len / 2 + 4);
+    var tmp: [4]u8 = undefined;
+    for (bytes) |b| {
+        const cp: u21 = if (b < 0x80) b else cp1252High(b);
+        const n = std.unicode.utf8Encode(cp, &tmp) catch unreachable; // cp1252 maps only to valid scalars
+        try out.appendSlice(tmp[0..n]);
+    }
+    return out.toOwnedSlice();
+}
+
 fn utf16ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     var out = std.ArrayList(u8).init(arena);
     var k: usize = 0;
@@ -937,6 +978,22 @@ fn utf16ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
         try out.appendSlice(tmp[0..n]);
     }
     return out.toOwnedSlice();
+}
+
+test "win1252 transcode to utf8" {
+    const alloc = std.testing.allocator;
+    // 0xD3 is 'Ó' in Windows-1252/Latin-1 (the RELÓGIO case from the SQL Server data)
+    const out = try win1252ToUtf8(alloc, &[_]u8{ 'R', 'E', 'L', 0xD3, 'G', 'I', 'O' });
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("RELÓGIO", out);
+    // pure ASCII passes through unchanged
+    const a = try win1252ToUtf8(alloc, "plain");
+    defer alloc.free(a);
+    try std.testing.expectEqualStrings("plain", a);
+    // 0x80 is the cp1252-specific euro sign (not Latin-1)
+    const e = try win1252ToUtf8(alloc, &[_]u8{0x80});
+    defer alloc.free(e);
+    try std.testing.expectEqualStrings("€", e);
 }
 
 // --- LOGIN7 construction ---

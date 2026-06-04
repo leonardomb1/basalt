@@ -69,6 +69,7 @@ pub const Lexer = struct {
         }
         if (std.ascii.isDigit(c)) return self.lexNumber(start, sline, scol);
         if (c == '"') return self.lexString(sline, scol);
+        if (c == '$' and self.peek1() == '{') return self.lexInterp(start, sline, scol);
         return self.lexPunct(start, sline, scol);
     }
 
@@ -91,6 +92,21 @@ pub const Lexer = struct {
             }
         }
         return self.make(.int, start, sline, scol);
+    }
+
+    /// `${ident}` — a template placeholder. The token text is the whole lexeme
+    /// (including `${` and `}`) so the planner can render it by literal replacement.
+    fn lexInterp(self: *Lexer, start: usize, sline: u32, scol: u32) Token {
+        self.bump(); // $
+        self.bump(); // {
+        const name_start = self.pos;
+        while (self.peek()) |d| {
+            if (!isIdentCont(d)) break;
+            self.bump();
+        }
+        if (self.pos == name_start or self.peek() != '}') return self.make(.invalid, start, sline, scol);
+        self.bump(); // }
+        return self.make(.interp, start, sline, scol);
     }
 
     fn lexString(self: *Lexer, sline: u32, scol: u32) Token {
@@ -239,6 +255,16 @@ test "lex operators, annotations, and unit suffix split" {
     const expect = [_]Tag{ .ident, .eq, .ident, .ne, .ident, .le, .ident, .ge, .at, .lbracket, .ident, .assign, .int, .ident, .rbracket, .eof };
     try std.testing.expectEqual(expect.len, toks.len);
     for (expect, toks) |e, t| try std.testing.expectEqual(e, t.tag);
+}
+
+test "lex interpolation placeholders" {
+    const alloc = std.testing.allocator;
+    const toks = try tokenize(alloc, "read mssql table dbo.${tbl} | write sr ${tbl}");
+    defer alloc.free(toks);
+    const expect = [_]Tag{ .ident, .ident, .ident, .ident, .dot, .interp, .pipe, .ident, .ident, .interp, .eof };
+    try std.testing.expectEqual(expect.len, toks.len);
+    for (expect, toks) |e, t| try std.testing.expectEqual(e, t.tag);
+    try std.testing.expectEqualStrings("${tbl}", toks[5].text);
 }
 
 test "unterminated string is invalid" {
