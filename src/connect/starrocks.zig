@@ -106,7 +106,16 @@ pub fn genCreateTable(
     } else {
         try w.print("DUPLICATE KEY(`{s}`)\n", .{keys[0]});
     }
-    try w.print("DISTRIBUTED BY HASH(`{s}`) BUCKETS {d}\n", .{ keys[0], buckets });
+    // Distribute by the full key for a PK table — hashing on a single low-cardinality
+    // lead key (e.g. a tenant code) would pile most rows into a few buckets.
+    try w.writeAll("DISTRIBUTED BY HASH(");
+    if (is_pk) {
+        for (keys, 0..) |k, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.print("`{s}`", .{k});
+        }
+    } else try w.print("`{s}`", .{keys[0]});
+    try w.print(") BUCKETS {d}\n", .{buckets});
     try w.print("PROPERTIES(\"replication_num\"=\"{d}\");", .{replication_num});
     return buf.toOwnedSlice();
 }

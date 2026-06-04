@@ -145,6 +145,20 @@ pub const WriteMode = union(enum) {
     };
 };
 
+pub const UnionBranch = struct { read: Read, tag: ?[]const u8 };
+
+/// A leading source that reconciles N tables to a canon schema and concatenates
+/// them. Explicit: `union from <conn> <table|query|path> as "<tag>" ...`. Discovered:
+/// `union <conn> tables "<query returning (table_name, tag)>"`. Reconciliation is by
+/// name (take / NULL-fill missing / drop extra / cast type diffs); a `tag` column
+/// (per-branch value) is optional. `tag` and `canon` come from the stage's `@[...]`.
+pub const Union = struct {
+    branches: []const UnionBranch = &.{}, // explicit form
+    discover_conn: []const u8 = "", // discovered form: connection holding the tables
+    discover_query: []const u8 = "", // discovered form: query -> (table_name, tag)
+    pos: Pos,
+};
+
 pub const Stage = struct {
     node: Node,
     hints: []const Hint,
@@ -153,6 +167,7 @@ pub const Stage = struct {
     pub const Node = union(enum) {
         ref: []const u8, // a binding used as a source
         read: Read,
+        union_: Union, // multi-source union (leading)
         filter: *Expr,
         select: []const SelectItem,
         explode: Explode,

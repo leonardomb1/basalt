@@ -377,15 +377,18 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
                 // split descriptor (which copies its own config); the lanes open their
                 // own connections, so close it now rather than holding an idle
                 // connection with an unconsumed result set for the whole parallel run.
+                // res.schema's column names live in the source cursor's arena, so dupe
+                // them into the run arena first — the sinks use the schema all run.
+                const schema = try dupeSchema(arena, res.schema);
                 for (env.sources.items[src_base..]) |sc| sc.close();
                 env.sources.shrinkRetainingCapacity(src_base);
                 var ctx = SplitCtx{ .gpa = gpa, .kind = env.sql_desc.?.kind, .cfg = env.sql_desc.?.cfg, .base_sql = env.sql_desc.?.base_sql };
                 lanes_used.* = @max(lanes_used.*, @min(opts.threads, sp.predicates.len));
                 env.log.log(.info, "split-parallel: {d} splits over {d} lanes on key range", .{ sp.predicates.len, @min(opts.threads, sp.predicates.len) });
-                if (try buildParallelSink(env, last.write, res.schema)) |mode| {
+                if (try buildParallelSink(env, last.write, schema)) |mode| {
                     stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lin.stages, mode, opts.threads, env.rows_read);
                 } else {
-                    const snk = try openSink(env, last.write, res.schema);
+                    const snk = try openSink(env, last.write, schema);
                     stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lin.stages, .{ .shared = snk }, opts.threads, env.rows_read);
                     try snk.close();
                 }
@@ -709,7 +712,12 @@ fn buildPipeline(env: *Env, stages: []const ast.Stage) anyerror!PipeRes {
             current = r.op;
             schema = r.schema;
         },
-        else => return planErr(env.diag, "a pipeline must start with `read` or a binding reference"),
+        .union_ => |u| {
+            const r = try buildUnion(env, u, stages[0].hints);
+            current = r.op;
+            schema = r.schema;
+        },
+        else => return planErr(env.diag, "a pipeline must start with `read`, `union`, or a binding reference"),
     }
 
     for (stages[1..]) |stage| {
@@ -718,6 +726,100 @@ fn buildPipeline(env: *Env, stages: []const ast.Stage) anyerror!PipeRes {
         schema = r.schema;
     }
     return .{ .op = current, .schema = schema };
+}
+
+// --- union: reconcile N tables to a canon schema, then concatenate ---
+
+fn readName(rd: ast.Read) []const u8 {
+    return switch (rd.form) {
+        .table => |q| q.last(),
+        else => "",
+    };
+}
+
+/// Synthesize the per-branch "reconcile to canon" projection as a `select`: an
+/// optional tag literal, then every canon column cast to its canon type — taking
+/// the source field when present, else NULL. (Extra source columns aren't listed,
+/// so they're dropped.) Reusing `select` gets us the vectorized cast/eval for free.
+fn synthReconcile(arena: std.mem.Allocator, src: types.Schema, canon: types.Schema, tag_col: ?[]const u8, tag_val: ?[]const u8) ![]const ast.SelectItem {
+    var items = std.ArrayList(ast.SelectItem).init(arena);
+    if (tag_col) |tc|
+        try items.append(.{ .computed = .{ .name = tc, .expr = try mk(arena, .{ .str_lit = tag_val orelse "" }) } });
+    for (canon.fields) |cf| {
+        var present = false;
+        for (src.fields) |sf| {
+            if (std.mem.eql(u8, sf.name, cf.name)) {
+                present = true;
+                break;
+            }
+        }
+        const parts = try arena.alloc([]const u8, 1);
+        parts[0] = cf.name;
+        const inner = if (present) try mk(arena, .{ .field = .{ .parts = parts } }) else try mk(arena, .null_lit);
+        const e = try mk(arena, .{ .cast = .{ .e = inner, .ty = cf.ty } });
+        try items.append(.{ .computed = .{ .name = cf.name, .expr = e } });
+    }
+    return items.toOwnedSlice();
+}
+
+fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint) anyerror!PipeRes {
+    const arena = env.arena;
+    const tag_col = forHintIdent(hints, "tag");
+    const canon_opt = forHintIdent(hints, "canon");
+
+    // 1. resolve the branch list: explicit, or discovered via a (table, tag) query.
+    const Spec = struct { read: ast.Read, tag: ?[]const u8, name: []const u8 };
+    var specs = std.ArrayList(Spec).init(arena);
+    if (u.discover_query.len > 0) {
+        const disc = ast.Read{ .connector = u.discover_conn, .form = .{ .query = u.discover_query } };
+        for (try discoverRows(env, disc, 2)) |row| {
+            const parts = try arena.alloc([]const u8, 1);
+            parts[0] = row[0];
+            try specs.append(.{ .read = .{ .connector = u.discover_conn, .form = .{ .table = .{ .parts = parts } } }, .tag = row[1], .name = row[0] });
+        }
+    } else for (u.branches) |b| try specs.append(.{ .read = b.read, .tag = b.tag, .name = readName(b.read) });
+    if (specs.items.len == 0) return planErr(env.diag, "union has no source tables");
+
+    // 2. open each branch source (kept open — drained sequentially by the Union op).
+    const Br = struct { sop: op.Op, schema: types.Schema, name: []const u8, tag: ?[]const u8 };
+    var brs = std.ArrayList(Br).init(arena);
+    for (specs.items) |s| {
+        const raw = try openSource(env, s.read);
+        const cs = try arena.create(obs.CountingSource);
+        cs.* = .{ .inner = raw, .count = env.rows_read };
+        const src = cs.source();
+        try env.sources.append(src);
+        if (env.src_name.len == 0) env.src_name = connectorType(env, s.read.connector);
+        const scan = try arena.create(op.Scan);
+        scan.* = .{ .src = src };
+        try brs.append(.{ .sop = .{ .scan = scan }, .schema = src.schema(), .name = s.name, .tag = s.tag });
+    }
+
+    // 3. pick the canon schema (a named source table, or `first`).
+    var canon_src = brs.items[0].schema;
+    if (canon_opt) |c| if (!std.mem.eql(u8, c, "first")) {
+        var found = false;
+        for (brs.items) |b| if (std.mem.eql(u8, b.name, c)) {
+            canon_src = b.schema;
+            found = true;
+            break;
+        };
+        if (!found) return planErr(env.diag, try std.fmt.allocPrint(arena, "union canon `{s}` is not one of the source tables", .{c}));
+    };
+    const canon = try dupeSchema(arena, canon_src);
+
+    // 4. reconcile each branch to canon, then union the children.
+    const children = try arena.alloc(op.Op, brs.items.len);
+    var out_schema: types.Schema = undefined;
+    for (brs.items, 0..) |b, i| {
+        const items = try synthReconcile(arena, b.schema, canon, tag_col, b.tag);
+        const proj = try buildProject(env, items, b.schema, b.sop);
+        children[i] = proj.op;
+        out_schema = proj.schema;
+    }
+    const un = try arena.create(op.Union);
+    un.* = .{ .children = children };
+    return .{ .op = .{ .union_ = un }, .schema = out_schema };
 }
 
 /// Bridge an analyze-layer error (which writes `ad.msg`) into a plan error.
@@ -775,7 +877,7 @@ fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schema) a
             o.* = .{ .child = child, .field_idx = ep.idx, .delim = ex.delim orelse ",", .out_schema = out };
             return .{ .op = .{ .explode = o }, .schema = out.* };
         },
-        .read, .ref, .write => return planErr(env.diag, "unexpected operator in the middle of a pipeline"),
+        .read, .ref, .write, .union_ => return planErr(env.diag, "unexpected operator in the middle of a pipeline"),
     }
 }
 
@@ -1502,6 +1604,43 @@ test "let binding + inner join" {
     defer alloc.free(out);
     // id 3 (code Z) has no match -> dropped by inner join
     try std.testing.expectEqualStrings("id,label\n1,Apple\n2,Banana\n", out);
+}
+
+test "union reconciles branches to a canon schema (tag, null-fill, drop-extra)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.csv", .data = "id,v\n1,10\n2,20\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.csv", .data = "id,w\n3,99\n" }); // missing v, extra w
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    // canon = first (a: id, v) + tag `src`. b: id present, v -> NULL, w dropped.
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "@batch\nunion from csv \"{s}/a.csv\" as \"01\" from csv \"{s}/b.csv\" as \"02\"\n  @[tag = src, canon = first]\n  | write csv \"{s}/out.csv\"",
+        .{ base, base, base },
+    );
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+
+    var rdiag: Diag = .{};
+    _ = run(alloc, prog, .{}, &rdiag) catch |e| {
+        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+        return e;
+    };
+    const out = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
+    defer alloc.free(out);
+    // header is the canon (tag, id, v) — `w` is dropped; b's missing `v` is null.
+    try std.testing.expect(std.mem.startsWith(u8, out, "src,id,v\n"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "w") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "01,1,10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "01,2,20") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "02,3,") != null); // b: tag 02, id 3, v null
 }
 
 test "for-each fans out over a discovered list with interpolation" {
