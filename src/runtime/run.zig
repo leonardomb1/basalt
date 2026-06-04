@@ -361,6 +361,21 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     if (last != .write) return planErr(env.diag, "a top-level pipeline must end in `write`");
     env.sink_name = connectorType(env, last.write.connector);
 
+    // Union split-per-branch: when threads>1 and the post-union stages are map-only,
+    // expand into one `read branch | select(reconcile) | … | write` pipeline per
+    // branch and run each through runOutput, which split-reads a single source — so a
+    // big tenant table (e.g. CT2010) reads in key-range lanes instead of serially. A
+    // breaker after the union (sort/aggregate/distinct) needs the whole union at once,
+    // so those fall through to the serial op.Union below. CSV is excluded because each
+    // branch opens the sink afresh and the CSV writer truncates — DB sinks (Stream
+    // Load / bulk) accumulate across opens, so branches add to the same table.
+    if (stages[0].node == .union_ and opts.threads > 1 and
+        !std.mem.eql(u8, last.write.connector, "csv") and
+        unionDownstreamMapOnly(stages[1 .. stages.len - 1]))
+    {
+        return runUnionSplit(env, stages[0].node.union_, stages[0].hints, stages[1 .. stages.len - 1], stages[stages.len - 1], opts, stats, lanes_used, batch_arena);
+    }
+
     env.sql_desc = null;
     env.src_name = ""; // reset per output so this pipeline's first read sets it
     const src_base = env.sources.items.len; // sources this output opens (for early release on the split path)
@@ -762,14 +777,13 @@ fn synthReconcile(arena: std.mem.Allocator, src: types.Schema, canon: types.Sche
     return items.toOwnedSlice();
 }
 
-fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint) anyerror!PipeRes {
-    const arena = env.arena;
-    const tag_col = forHintIdent(hints, "tag");
-    const canon_opt = forHintIdent(hints, "canon");
+const UnionSpec = struct { read: ast.Read, tag: ?[]const u8, name: []const u8 };
 
-    // 1. resolve the branch list: explicit, or discovered via a (table, tag) query.
-    const Spec = struct { read: ast.Read, tag: ?[]const u8, name: []const u8 };
-    var specs = std.ArrayList(Spec).init(arena);
+/// Resolve a union's branch list — explicit branches, or tables discovered via a
+/// `(table_name, tag)` query.
+fn unionSpecs(env: *Env, u: ast.Union) ![]UnionSpec {
+    const arena = env.arena;
+    var specs = std.ArrayList(UnionSpec).init(arena);
     if (u.discover_query.len > 0) {
         const disc = ast.Read{ .connector = u.discover_conn, .form = .{ .query = u.discover_query } };
         for (try discoverRows(env, disc, 2)) |row| {
@@ -778,12 +792,40 @@ fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint) anyerror!PipeRes
             try specs.append(.{ .read = .{ .connector = u.discover_conn, .form = .{ .table = .{ .parts = parts } } }, .tag = row[1], .name = row[0] });
         }
     } else for (u.branches) |b| try specs.append(.{ .read = b.read, .tag = b.tag, .name = readName(b.read) });
-    if (specs.items.len == 0) return planErr(env.diag, "union has no source tables");
+    return specs.toOwnedSlice();
+}
 
-    // 2. open each branch source (kept open — drained sequentially by the Union op).
-    const Br = struct { sop: op.Op, schema: types.Schema, name: []const u8, tag: ?[]const u8 };
-    var brs = std.ArrayList(Br).init(arena);
-    for (specs.items) |s| {
+/// Pick the canon schema among the branch schemas: a named source table, or the
+/// first branch.
+fn unionCanon(env: *Env, specs: []const UnionSpec, schemas: []const types.Schema, canon_opt: ?[]const u8) !types.Schema {
+    if (canon_opt) |c| if (!std.mem.eql(u8, c, "first")) {
+        for (specs, schemas) |s, sch| if (std.mem.eql(u8, s.name, c)) return sch;
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "union canon `{s}` is not one of the source tables", .{c}));
+    };
+    return schemas[0];
+}
+
+fn unionDownstreamMapOnly(stages: []const ast.Stage) bool {
+    for (stages) |s| switch (s.node) {
+        .filter, .select, .explode => {},
+        else => return false,
+    };
+    return true;
+}
+
+/// Build the serial union op: open every branch (kept open, drained in order by
+/// op.Union), reconcile each to the canon, and concatenate. Used when split isn't
+/// applicable (threads=1, a breaker downstream, or non-splittable branches).
+fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint) anyerror!PipeRes {
+    const arena = env.arena;
+    const tag_col = forHintIdent(hints, "tag");
+    const canon_opt = forHintIdent(hints, "canon");
+    const specs = try unionSpecs(env, u);
+    if (specs.len == 0) return planErr(env.diag, "union has no source tables");
+
+    const children = try arena.alloc(op.Op, specs.len);
+    const schemas = try arena.alloc(types.Schema, specs.len);
+    for (specs, 0..) |s, i| {
         const raw = try openSource(env, s.read);
         const cs = try arena.create(obs.CountingSource);
         cs.* = .{ .inner = raw, .count = env.rows_read };
@@ -792,34 +834,57 @@ fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint) anyerror!PipeRes
         if (env.src_name.len == 0) env.src_name = connectorType(env, s.read.connector);
         const scan = try arena.create(op.Scan);
         scan.* = .{ .src = src };
-        try brs.append(.{ .sop = .{ .scan = scan }, .schema = src.schema(), .name = s.name, .tag = s.tag });
+        children[i] = .{ .scan = scan };
+        schemas[i] = src.schema();
     }
+    const canon = try dupeSchema(arena, try unionCanon(env, specs, schemas, canon_opt));
 
-    // 3. pick the canon schema (a named source table, or `first`).
-    var canon_src = brs.items[0].schema;
-    if (canon_opt) |c| if (!std.mem.eql(u8, c, "first")) {
-        var found = false;
-        for (brs.items) |b| if (std.mem.eql(u8, b.name, c)) {
-            canon_src = b.schema;
-            found = true;
-            break;
-        };
-        if (!found) return planErr(env.diag, try std.fmt.allocPrint(arena, "union canon `{s}` is not one of the source tables", .{c}));
-    };
-    const canon = try dupeSchema(arena, canon_src);
-
-    // 4. reconcile each branch to canon, then union the children.
-    const children = try arena.alloc(op.Op, brs.items.len);
     var out_schema: types.Schema = undefined;
-    for (brs.items, 0..) |b, i| {
-        const items = try synthReconcile(arena, b.schema, canon, tag_col, b.tag);
-        const proj = try buildProject(env, items, b.schema, b.sop);
+    for (specs, 0..) |s, i| {
+        const items = try synthReconcile(arena, schemas[i], canon, tag_col, s.tag);
+        const proj = try buildProject(env, items, schemas[i], children[i]);
         children[i] = proj.op;
         out_schema = proj.schema;
     }
     const un = try arena.create(op.Union);
     un.* = .{ .children = children };
     return .{ .op = .{ .union_ = un }, .schema = out_schema };
+}
+
+/// Split-parallel union: expand each branch into a `read | select(reconcile) |
+/// <downstream maps> | write` pipeline and run it through runOutput, which
+/// split-reads the single branch source into key-range lanes. Branches share the
+/// sink — the first keeps the write mode (so `overwrite` truncates once), later
+/// branches append/upsert into it.
+fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: []const ast.Stage, write_stage: ast.Stage, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) !void {
+    const arena = env.arena;
+    const tag_col = forHintIdent(hints, "tag");
+    const canon_opt = forHintIdent(hints, "canon");
+    const specs = try unionSpecs(env, u);
+    if (specs.len == 0) return planErr(env.diag, "union has no source tables");
+
+    // Probe each branch's schema (open, read COLMETADATA, close without draining);
+    // the canon must be known before any branch runs.
+    const schemas = try arena.alloc(types.Schema, specs.len);
+    for (specs, schemas) |s, *sch| {
+        const src = try openSource(env, s.read);
+        sch.* = try dupeSchema(arena, src.schema());
+        src.close();
+    }
+    const canon = try unionCanon(env, specs, schemas, canon_opt);
+
+    const w = write_stage.node.write;
+    for (specs, schemas, 0..) |s, sch, i| {
+        const items = try synthReconcile(arena, sch, canon, tag_col, s.tag);
+        var bstages = std.ArrayList(ast.Stage).init(arena);
+        try bstages.append(.{ .node = .{ .read = s.read }, .hints = &.{}, .pos = u.pos });
+        try bstages.append(.{ .node = .{ .select = items }, .hints = &.{}, .pos = u.pos });
+        try bstages.appendSlice(downstream);
+        const bmode: ast.WriteMode = if (i == 0 or w.mode != .overwrite) w.mode else .append;
+        const bw = ast.Write{ .connector = w.connector, .form = w.form, .target = w.target, .mode = bmode };
+        try bstages.append(.{ .node = .{ .write = bw }, .hints = write_stage.hints, .pos = write_stage.pos });
+        try runOutput(env, .{ .stages = try bstages.toOwnedSlice(), .pos = u.pos }, opts, stats, lanes_used, batch_arena);
+    }
 }
 
 /// Bridge an analyze-layer error (which writes `ad.msg`) into a plan error.

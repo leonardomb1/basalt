@@ -638,6 +638,27 @@ const TdsCursor = struct {
                 d.engine_type = strT;
                 d.is_binary = true;
             },
+            0xF1 => { // XMLTYPE: optional schema info, then a PLP UTF-16 value
+                if (try self.reader.readByte() != 0) { // SchemaPresent
+                    try self.reader.skip(@as(usize, try self.reader.readByte()) * 2); // DBName (B_VARCHAR)
+                    try self.reader.skip(@as(usize, try self.reader.readByte()) * 2); // OwningSchema (B_VARCHAR)
+                    try self.reader.skip(@as(usize, try self.reader.readU16()) * 2); // XmlSchemaCollection (US_VARCHAR)
+                }
+                d.kind = .plp;
+                d.engine_type = strT;
+                d.is_unicode = true;
+            },
+            0x22, 0x23, 0x63 => { // IMAGE / TEXT / NTEXT (legacy LOB; value is TEXTPTR-framed)
+                _ = try self.reader.readU32(); // LONGLEN max length
+                if (t == 0x23 or t == 0x63) try self.reader.skip(5); // collation (text/ntext only)
+                // TableName: NumParts (BYTE) then that many US_VARCHAR parts
+                var parts = try self.reader.readByte();
+                while (parts > 0) : (parts -= 1) try self.reader.skip(@as(usize, try self.reader.readU16()) * 2);
+                d.kind = .textptr;
+                d.engine_type = strT;
+                if (t == 0x63) d.is_unicode = true; // ntext -> UTF-16
+                if (t == 0x22) d.is_binary = true; // image -> hex
+            },
             else => return error.UnsupportedTdsType,
         }
         return d;
@@ -678,6 +699,14 @@ const TdsCursor = struct {
             },
             .plp => {
                 const bytes = (try self.reader.readPlp(arena)) orelse return .null;
+                return decodeValue(arena, col, bytes);
+            },
+            .textptr => { // legacy LOB: TextPtr(len) + Timestamp(8) + DataLen(4) + Data
+                const ptrlen = try self.reader.readByte();
+                if (ptrlen == 0) return .null;
+                try self.reader.skip(@as(usize, ptrlen) + 8); // text pointer + timestamp
+                const dlen = try self.reader.readU32();
+                const bytes = try self.reader.readSlice(arena, dlen);
                 return decodeValue(arena, col, bytes);
             },
         }
@@ -863,7 +892,7 @@ fn writeU32(w: anytype, v: u32) !void {
     try w.writeAll(&b);
 }
 
-const ColKind = enum { fixed, bytelen, ushortlen, plp };
+const ColKind = enum { fixed, bytelen, ushortlen, plp, textptr };
 const ColumnDesc = struct {
     name: []const u8 = "",
     tds_type: u8,
