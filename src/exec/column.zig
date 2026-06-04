@@ -34,7 +34,64 @@ pub const Bitmap = struct {
             self.bits[i >> 3] &= ~mask;
         }
     }
+
+    /// True if the first `n` bits are all set (no nulls) — lets kernels take a
+    /// branch-free fast path. Whole bytes are checked at once.
+    pub fn allSet(self: Bitmap, n: usize) bool {
+        if (n == 0) return true;
+        const full = n >> 3;
+        var i: usize = 0;
+        while (i < full) : (i += 1) {
+            if (self.bits[i] != 0xFF) return false;
+        }
+        const rem: u3 = @intCast(n & 7);
+        if (rem != 0) {
+            const mask = (@as(u8, 1) << rem) - 1;
+            if ((self.bits[full] & mask) != mask) return false;
+        }
+        return true;
+    }
 };
+
+/// Copy a typed backing slice, keeping only rows where `keep[i]` is true.
+fn gatherSlice(comptime T: type, arena: std.mem.Allocator, src: []const T, keep: []const bool, kept: usize) ![]T {
+    const out = try arena.alloc(T, kept);
+    var w: usize = 0;
+    for (keep, 0..) |k, i| {
+        if (k) {
+            out[w] = src[i];
+            w += 1;
+        }
+    }
+    return out;
+}
+
+fn gatherValidity(arena: std.mem.Allocator, v: Bitmap, keep: []const bool, kept: usize) !Bitmap {
+    var bm = try Bitmap.initFull(arena, kept);
+    var w: usize = 0;
+    for (keep, 0..) |k, i| {
+        if (k) {
+            if (!v.get(i)) bm.setValid(w, false);
+            w += 1;
+        }
+    }
+    return bm;
+}
+
+/// Select the `kept` rows of `c` flagged in `keep` into a fresh column, copying
+/// the typed buffer directly (no per-row `Value` boxing). The hot filter path.
+pub fn gather(arena: std.mem.Allocator, c: Column, keep: []const bool, kept: usize) !Column {
+    const bm = try gatherValidity(arena, c.validity, keep, kept);
+    const data: Column.Data = switch (c.data) {
+        .b => |s| .{ .b = try gatherSlice(bool, arena, s, keep, kept) },
+        .i32 => |s| .{ .i32 = try gatherSlice(i32, arena, s, keep, kept) },
+        .i64 => |s| .{ .i64 = try gatherSlice(i64, arena, s, keep, kept) },
+        .f64 => |s| .{ .f64 = try gatherSlice(f64, arena, s, keep, kept) },
+        .dec => |s| .{ .dec = try gatherSlice(value.Decimal, arena, s, keep, kept) },
+        .bytes => |s| .{ .bytes = try gatherSlice([]const u8, arena, s, keep, kept) },
+    };
+    return .{ .ty = c.ty, .len = kept, .validity = bm, .data = data };
+}
 
 pub const Column = struct {
     ty: types.Type,

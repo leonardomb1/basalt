@@ -16,8 +16,6 @@ const ast = @import("../lang/ast.zig");
 const Value = valuemod.Value;
 const Batch = batchmod.Batch;
 
-pub const Result = struct { schema: *types.Schema, batch: Batch };
-
 /// Rows are this many per streamed batch.
 pub const STREAM_ROWS = 4096;
 
@@ -46,7 +44,8 @@ pub const Cursor = struct {
 
 /// A connection to a SQL database (protocol-agnostic). `queryCursor` sends a
 /// query, reads the result-set header, and returns a streaming cursor (which
-/// then owns the connection until closed). On error it closes the connection.
+/// then owns the connection until closed). On error it leaves the connection
+/// open: the caller owns it (so it can read `last_error`) and must close it.
 pub const Conn = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -123,6 +122,7 @@ pub const Dialect = enum {
             else => "TEXT",
         };
     }
+
 };
 
 // ---------------------------------------------------------------------------
@@ -166,7 +166,14 @@ fn srcClose(ptr: *anyopaque) void {
 // Generic sink: auto-create then batched INSERT / upsert
 // ---------------------------------------------------------------------------
 
-const FLUSH_ROWS = 500;
+/// Rows per multi-row INSERT. Bigger = fewer round-trips/commits (the dominant
+/// cost of row loading), but SQL Server caps a `VALUES` list at 1000 rows.
+fn flushRowsFor(dialect: Dialect) usize {
+    return switch (dialect) {
+        .sqlserver => 1000,
+        .postgres, .mysql => 5000,
+    };
+}
 
 pub const Sink = struct {
     gpa: std.mem.Allocator,
@@ -175,22 +182,39 @@ pub const Sink = struct {
     table: []const u8, // quoted, qualified
     schema: types.Schema, // field names + types (owned in gpa)
     mode: ast.WriteMode,
-    rows: std.ArrayList([]const u8), // serialized "(...)" tuples
+    rows: std.ArrayList([]const u8), // serialized "(...)" tuples (slices into tuple_arena)
+    tuple_arena: std.heap.ArenaAllocator, // backs the tuple bytes; reset per flush (no per-row malloc/free)
+    flush_rows: usize, // rows per INSERT (dialect-dependent cap)
 
     pub fn open(gpa: std.mem.Allocator, conn: Conn, dialect: Dialect, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode) !*Sink {
+        // On error we free only what we allocate here; the caller keeps `conn`
+        // (so it can read conn.last_error) and closes it on failure.
         const self = try gpa.create(Sink);
+        errdefer gpa.destroy(self);
         // own copies of schema (field names) + quoted table name
         const fields = try gpa.alloc(types.Schema.Field, schema.fields.len);
-        for (schema.fields, 0..) |f, i| fields[i] = .{ .name = try gpa.dupe(u8, f.name), .ty = f.ty };
+        errdefer gpa.free(fields);
+        var nf: usize = 0;
+        errdefer for (fields[0..nf]) |f| gpa.free(f.name);
+        for (schema.fields, 0..) |f, i| {
+            fields[i] = .{ .name = try gpa.dupe(u8, f.name), .ty = f.ty };
+            nf += 1;
+        }
+        const qtable = try quoteIdent(gpa, dialect, table_name);
+        errdefer gpa.free(qtable);
         self.* = .{
             .gpa = gpa,
             .conn = conn,
             .dialect = dialect,
-            .table = try quoteIdent(gpa, dialect, table_name),
+            .table = qtable,
             .schema = .{ .fields = fields },
             .mode = mode,
             .rows = std.ArrayList([]const u8).init(gpa),
+            .tuple_arena = std.heap.ArenaAllocator.init(gpa),
+            .flush_rows = flushRowsFor(dialect),
         };
+        errdefer self.rows.deinit();
+        errdefer self.tuple_arena.deinit();
 
         var aa = std.heap.ArenaAllocator.init(gpa);
         defer aa.deinit();
@@ -210,9 +234,9 @@ pub const Sink = struct {
     fn writeBatch(self: *Sink, arena: std.mem.Allocator, batch: Batch) !void {
         var r: usize = 0;
         while (r < batch.len) : (r += 1) {
-            const tuple = try serializeRow(self.gpa, self.dialect, batch, r);
+            const tuple = try serializeRow(self.tuple_arena.allocator(), self.dialect, batch, r);
             try self.rows.append(tuple);
-            if (self.rows.items.len >= FLUSH_ROWS) try self.flush();
+            if (self.rows.items.len >= self.flush_rows) try self.flush();
         }
         _ = arena;
     }
@@ -223,14 +247,15 @@ pub const Sink = struct {
         defer aa.deinit();
         const stmt = try buildStatement(aa.allocator(), self.dialect, self.table, self.schema, self.mode, self.rows.items);
         try self.conn.exec(stmt);
-        for (self.rows.items) |t| self.gpa.free(t);
         self.rows.clearRetainingCapacity();
+        _ = self.tuple_arena.reset(.retain_capacity);
     }
 
     fn closeImpl(self: *Sink) !void {
         try self.flush();
         self.conn.close();
         self.rows.deinit();
+        self.tuple_arena.deinit();
         for (self.schema.fields) |f| self.gpa.free(f.name);
         self.gpa.free(self.schema.fields);
         self.gpa.free(self.table);
@@ -253,7 +278,7 @@ fn sinkClose(ptr: *anyopaque) anyerror!void {
 // SQL generation
 // ---------------------------------------------------------------------------
 
-fn createTableSql(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8, schema: types.Schema, mode: ast.WriteMode) ![]const u8 {
+pub fn createTableSql(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8, schema: types.Schema, mode: ast.WriteMode) ![]const u8 {
     const keys: []const []const u8 = switch (mode) {
         .upsert => |u| u.keys,
         else => &.{},
@@ -388,14 +413,21 @@ fn serializeValue(w: anytype, dialect: Dialect, v: Value, scratch: std.mem.Alloc
         .bool => |b| try w.writeAll(if (dialect == .sqlserver) (if (b) "1" else "0") else (if (b) "TRUE" else "FALSE")),
         .int => |x| try w.print("{d}", .{x}),
         .float => |x| try w.print("{d}", .{x}),
-        .decimal => |d| try w.writeAll(try eval.formatDecimal(scratch, d.unscaled, d.scale)),
+        .decimal => |d| {
+            const s = try eval.formatDecimal(scratch, d.unscaled, d.scale);
+            defer scratch.free(s);
+            try w.writeAll(s);
+        },
         .string => |s| try quoteString(w, dialect, s),
         .bytes => |s| try hexLiteral(w, dialect, s),
         .date => |days| {
             const c = civilFromDays(days);
             try w.print("'{d:0>4}-{d:0>2}-{d:0>2}'", .{ @as(u32, @intCast(c.y)), c.m, c.d });
         },
-        .time => |t| try w.print("'{d}'", .{t}),
+        .time => |t| {
+            const secs = @divFloor(t, 1_000_000);
+            try w.print("'{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}'", .{ @divFloor(secs, 3600), @divFloor(@mod(secs, 3600), 60), @mod(secs, 60), @mod(t, 1_000_000) });
+        },
         .timestamp => |micros| {
             const days = @divFloor(micros, 86_400_000_000);
             const rem = micros - days * 86_400_000_000;
@@ -433,7 +465,71 @@ fn hexLiteral(w: anytype, dialect: Dialect, s: []const u8) !void {
     }
 }
 
-fn quoteIdent(arena: std.mem.Allocator, dialect: Dialect, name: []const u8) ![]const u8 {
+// ---------------------------------------------------------------------------
+// Bulk-load text format (PostgreSQL COPY / MySQL LOAD DATA share it): tab-separated
+// fields, `\N` for null, newline-terminated rows, `\`-escaped t/n/r/backslash, and
+// dates/timestamps as real text. The only difference is the bool literal.
+// ---------------------------------------------------------------------------
+
+pub const BulkFormat = struct {
+    bool_true: []const u8 = "t",
+    bool_false: []const u8 = "f",
+};
+
+pub fn appendBulkText(w: anytype, arena: std.mem.Allocator, batch: Batch, fmt: BulkFormat) !void {
+    var r: usize = 0;
+    while (r < batch.len) : (r += 1) {
+        for (batch.columns, 0..) |*col, i| {
+            if (i > 0) try w.writeByte('\t');
+            try bulkValue(w, arena, col.getValue(r), fmt);
+        }
+        try w.writeByte('\n');
+    }
+}
+
+fn bulkValue(w: anytype, arena: std.mem.Allocator, v: Value, fmt: BulkFormat) !void {
+    if (v.isNull()) {
+        try w.writeAll("\\N");
+    } else {
+        try bulkEscaped(w, try valueText(arena, v, fmt));
+    }
+}
+
+/// The plain text of a non-null value (no escaping), with real date/timestamp
+/// formatting — shared by the delimited bulk format and the TDS NVARCHAR encoding.
+pub fn valueText(arena: std.mem.Allocator, v: Value, fmt: BulkFormat) ![]const u8 {
+    return switch (v) {
+        .null => "",
+        .bool => |b| if (b) fmt.bool_true else fmt.bool_false,
+        .date => |days| blk: {
+            const c = civilFromDays(days);
+            break :blk try std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u32, @intCast(c.y)), c.m, c.d });
+        },
+        .time => |t| blk: {
+            const secs = @divFloor(t, 1_000_000);
+            break :blk try std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ @divFloor(secs, 3600), @divFloor(@mod(secs, 3600), 60), @mod(secs, 60), @mod(t, 1_000_000) });
+        },
+        .timestamp => |micros| blk: {
+            const days = @divFloor(micros, 86_400_000_000);
+            const secs = @divFloor(micros - days * 86_400_000_000, 1_000_000);
+            const c = civilFromDays(days);
+            break :blk try std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{ @as(u32, @intCast(c.y)), c.m, c.d, @divFloor(secs, 3600), @divFloor(@mod(secs, 3600), 60), @mod(secs, 60) });
+        },
+        else => try eval.valueToString(arena, v),
+    };
+}
+
+fn bulkEscaped(w: anytype, s: []const u8) !void {
+    for (s) |c| switch (c) {
+        '\\' => try w.writeAll("\\\\"),
+        '\t' => try w.writeAll("\\t"),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        else => try w.writeByte(c),
+    };
+}
+
+pub fn quoteIdent(arena: std.mem.Allocator, dialect: Dialect, name: []const u8) ![]const u8 {
     var buf = std.ArrayList(u8).init(arena);
     var it = std.mem.splitScalar(u8, name, '.');
     var first = true;
@@ -530,7 +626,7 @@ fn daysFromCivil(y0: i64, m: u32, d: u32) i64 {
 }
 
 /// Civil date from days-since-1970 (Howard Hinnant's algorithm).
-fn civilFromDays(z0: i64) struct { y: i64, m: u32, d: u32 } {
+pub fn civilFromDays(z0: i64) struct { y: i64, m: u32, d: u32 } {
     const z = z0 + 719468;
     const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
     const doe = z - era * 146097; // [0, 146096]

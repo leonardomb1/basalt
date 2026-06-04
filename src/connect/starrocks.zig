@@ -30,7 +30,7 @@ pub const Config = struct {
     replication_num: u32 = 1,
     auto_create: bool = true,
     label_prefix: []const u8 = "pipeline",
-    run_id: u64 = 0, // 0 => generate per run (timestamp); set for retry-idempotency
+    run_id: u64 = 0, // 0 => generate per run (timestamp); see genLabel for the label scheme
 };
 
 // ---------------------------------------------------------------------------
@@ -129,10 +129,12 @@ fn nameIn(names: []const []const u8, n: []const u8) bool {
 // Stream Load body + helpers
 // ---------------------------------------------------------------------------
 
-/// Stream Load label: `<prefix>_<table>_<run_id>_<seq>`. `run_id` is unique per
-/// run (so distinct runs don't collide) but can be made stable by a caller that
-/// wants retry-idempotency (re-using the same run_id re-uses labels, which
-/// StarRocks dedups).
+/// Stream Load label: `<prefix>_<table>_<run_id>_<seq>`. The label makes each flush
+/// at-most-once within a run (StarRocks rejects a duplicate label). It does NOT give
+/// cross-run idempotency: split key-ranges are re-probed each run and work-stealing
+/// assigns them to lanes non-deterministically, so the same (prefix, run_id, seq) can
+/// cover different rows on a re-run. Exactly-once across re-runs is owned by downstream
+/// dedup (a StarRocks primary-key table), per the split.zig contract — not by run_id.
 pub fn genLabel(arena: std.mem.Allocator, prefix: []const u8, table: []const u8, run_id: u64, seq: u64) ![]const u8 {
     return std.fmt.allocPrint(arena, "{s}_{s}_{d}_{d}", .{ prefix, table, run_id, seq });
 }
@@ -204,17 +206,27 @@ pub const StreamLoadSink = struct {
 
     pub fn open(gpa: std.mem.Allocator, cfg: Config, table: []const u8, schema: types.Schema, mode: ast.WriteMode) !*StreamLoadSink {
         const self = try gpa.create(StreamLoadSink);
+        errdefer gpa.destroy(self);
+        const columns = try columnList(gpa, schema);
+        errdefer gpa.free(columns);
+        // Own our copy of label_prefix (the caller's may be a literal, a run-arena
+        // string, or a per-lane temp); closeImpl frees it.
+        var cfg_owned = cfg;
+        cfg_owned.label_prefix = try gpa.dupe(u8, cfg.label_prefix);
+        errdefer gpa.free(cfg_owned.label_prefix);
         self.* = .{
             .gpa = gpa,
-            .cfg = cfg,
+            .cfg = cfg_owned,
             .db = cfg.database,
             .table = table,
-            .columns = try columnList(gpa, schema),
+            .columns = columns,
             .mode = mode,
             .buffer = std.ArrayList(u8).init(gpa),
             .run_id = if (cfg.run_id != 0) cfg.run_id else @intCast(std.time.milliTimestamp()),
             .client = std.http.Client{ .allocator = gpa },
         };
+        errdefer self.buffer.deinit();
+        errdefer self.client.deinit();
         if (cfg.auto_create) {
             const cdb = try std.fmt.allocPrint(gpa, "CREATE DATABASE IF NOT EXISTS `{s}`", .{cfg.database});
             defer gpa.free(cdb);
@@ -258,6 +270,7 @@ pub const StreamLoadSink = struct {
         self.client.deinit();
         self.buffer.deinit();
         self.gpa.free(self.columns);
+        self.gpa.free(self.cfg.label_prefix);
         self.gpa.destroy(self);
     }
 
@@ -380,6 +393,14 @@ test "label and column list" {
     defer ar.deinit();
     const a = ar.allocator();
     try std.testing.expectEqualStrings("pipeline_orders_99_3", try genLabel(a, "pipeline", "orders", 99, 3));
+
+    // Parallel sink: lane-distinct prefixes + a shared run_id keep labels unique
+    // across lanes (no Stream Load "label already exists" collisions) while staying
+    // idempotent across re-runs (same run_id -> same labels -> StarRocks dedups).
+    const l0 = try genLabel(a, "pipeline_l0", "orders", 99, 1);
+    const l1 = try genLabel(a, "pipeline_l1", "orders", 99, 1);
+    try std.testing.expect(!std.mem.eql(u8, l0, l1));
+    try std.testing.expectEqualStrings("pipeline_l0_orders_99_1", l0);
     const schema = types.Schema{ .fields = &.{
         .{ .name = "id", .ty = types.Type.init(.int) },
         .{ .name = "amount", .ty = types.Type.init(.int) },

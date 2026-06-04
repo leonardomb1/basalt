@@ -1,0 +1,294 @@
+//! Split planning for parallel source reads. A "split" is a SQL boolean predicate
+//! over a key column; the set of splits is **disjoint and covering** over the
+//! key's `[min,max]` (captured at plan time), so each lane reads one key range on
+//! its own connection. This is an *unsynchronized* partitioned read: a row present
+//! and unchanged for the whole read appears exactly once, but concurrent writes are
+//! fuzzy and re-runs repeat rows — downstream dedup (StarRocks PK / ClickHouse
+//! Replacing / Snowflake MERGE) owns exactly-once. See `runtime/parallel.zig`.
+
+const std = @import("std");
+const sqlmod = @import("sql.zig");
+const types = @import("../lang/types.zig");
+
+const Conn = sqlmod.Conn;
+const Dialect = sqlmod.Dialect;
+
+pub const KeyKind = enum { int, uuid };
+pub const Key = struct { col: []const u8, kind: KeyKind };
+pub const KeyInfo = struct { key: Key, est_rows: i64 };
+
+/// Below this estimated row count, auto-splitting a table costs more in
+/// per-connection setup (each lane re-connects; SCRAM/handshake is not free) than
+/// it saves, so the planner stays serial. An explicit @[split]/@[splits] overrides.
+pub const min_rows_to_split: i64 = 2_000_000;
+
+/// Opens a fresh connection for one probe query. Each probe consumes its
+/// connection (a `Cursor` owns and closes its `Conn`), so probes never share one.
+pub const Prober = struct {
+    ctx: *anyopaque,
+    openFn: *const fn (ctx: *anyopaque) anyerror!Conn,
+
+    fn open(self: Prober) !Conn {
+        return self.openFn(self.ctx);
+    }
+};
+
+pub const Plan = struct {
+    key: Key,
+    /// Each entry is a SQL boolean expression over the key column. Wrap the base
+    /// query with `wrap(base, predicates[i])` to get one lane's query.
+    predicates: []const []const u8,
+};
+
+/// `SELECT * FROM (<base>) _split WHERE <pred>` — uniform whether `base` came from
+/// a `table T` (`SELECT * FROM T`) or an explicit `query`.
+pub fn wrap(arena: std.mem.Allocator, base: []const u8, pred: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "SELECT * FROM ({s}) _split WHERE {s}", .{ base, pred });
+}
+
+// ---------------------------------------------------------------------------
+// Key discovery (table reads only — arbitrary queries name the key via @[split])
+// ---------------------------------------------------------------------------
+
+/// Discover a single-column int/uuid primary key for `table`, or null (no PK, a
+/// composite PK, or an unsupported key type → caller stays serial). Postgres only
+/// for now; other dialects return null until their catalog query is added.
+pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, table: []const u8) !?KeyInfo {
+    // One probe returns the single-column PK (name + type) and the planner's row
+    // estimate (pg_class.reltuples), so the size gate costs no extra round-trip.
+    const sql = switch (dialect) {
+        .postgres => try std.fmt.allocPrint(arena,
+            \\SELECT a.attname, t.typname, c.reltuples::bigint
+            \\FROM pg_index i
+            \\JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+            \\JOIN pg_type t ON t.oid = a.atttypid
+            \\JOIN pg_class c ON c.oid = i.indrelid
+            \\WHERE i.indrelid = '{s}'::regclass AND i.indisprimary
+        , .{table}),
+        else => return null,
+    };
+    const conn = prober.open() catch return null;
+    var cur = conn.queryCursor(sql) catch {
+        conn.close();
+        return null;
+    };
+    defer cur.close(); // closes the connection
+    const b = (try cur.nextBatch(arena)) orelse return null;
+    if (b.len != 1) return null; // no PK, or composite PK (>1 key column)
+    const name = b.columns[0].getValue(0);
+    const typ = b.columns[1].getValue(0);
+    if (name.isNull() or typ.isNull()) return null;
+    const kind = keyKindFor(typ.string) orelse return null;
+    const est = b.columns[2].getValue(0);
+    const rows: i64 = if (est == .int) est.int else 0;
+    return KeyInfo{ .key = .{ .col = try arena.dupe(u8, name.string), .kind = kind }, .est_rows = rows };
+}
+
+fn keyKindFor(typname: []const u8) ?KeyKind {
+    const ints = [_][]const u8{ "int2", "int4", "int8", "serial", "bigserial", "smallserial" };
+    for (ints) |t| if (std.mem.eql(u8, typname, t)) return .int;
+    if (std.mem.eql(u8, typname, "uuid")) return .uuid;
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Plan construction
+// ---------------------------------------------------------------------------
+
+/// Build up to `m` split predicates for `key` over `base` (the unsplit query).
+/// Returns null when the source isn't worth/possible to split (empty, or the key
+/// has no usable bounds), so the caller falls back to a single serial read.
+pub fn plan(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, key: Key, m: usize) !?Plan {
+    if (m <= 1) return null;
+    switch (key.kind) {
+        .int => {
+            const b = (try intBounds(arena, prober, dialect, base, key.col)) orelse return null;
+            const preds = try intRangePreds(arena, dialect, key.col, b.min, b.max, m);
+            if (preds.len <= 1) return null;
+            return Plan{ .key = key, .predicates = preds };
+        },
+        .uuid => {
+            if (dialect != .postgres) return null; // others order uuids non-lexically
+            if (!(try hasAnyRow(arena, prober, base))) return null; // empty table: don't fan out lanes
+            const preds = try uuidSpacePreds(arena, dialect, key.col, m);
+            return Plan{ .key = key, .predicates = preds };
+        },
+    }
+}
+
+/// Cheap non-empty probe (`LIMIT 1`) so a forced uuid split doesn't fan out lanes
+/// over an empty table. A failed probe returns true (uuid splitting doesn't depend
+/// on it, so don't block on a transient probe error) — we only skip on a confirmed
+/// empty result.
+fn hasAnyRow(arena: std.mem.Allocator, prober: Prober, base: []const u8) !bool {
+    const q = try std.fmt.allocPrint(arena, "SELECT 1 FROM ({s}) _e LIMIT 1", .{base});
+    const conn = prober.open() catch return true;
+    var cur = conn.queryCursor(q) catch {
+        conn.close();
+        return true;
+    };
+    defer cur.close();
+    const b = (try cur.nextBatch(arena)) orelse return false;
+    return b.len > 0;
+}
+
+const Bounds = struct { min: i64, max: i64 };
+
+fn intBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, col: []const u8) !?Bounds {
+    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ quoteIdent(arena, dialect, col) catch col, base });
+    const conn = prober.open() catch return null;
+    var cur = conn.queryCursor(q) catch {
+        conn.close();
+        return null;
+    };
+    defer cur.close(); // closes the connection
+    const b = (try cur.nextBatch(arena)) orelse return null;
+    if (b.len == 0) return null;
+    const lo = b.columns[0].getValue(0);
+    const hi = b.columns[1].getValue(0);
+    if (lo.isNull() or hi.isNull() or lo != .int or hi != .int) return null; // empty table or non-int key
+    if (hi.int <= lo.int) return null; // single value: nothing to split
+    return Bounds{ .min = lo.int, .max = hi.int };
+}
+
+/// Equal-width half-open ranges over `[min, max]`. The last range has no upper
+/// bound (`>= lo`), so it also captures rows inserted past `max` after the probe.
+fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, min: i64, max: i64, m_in: usize) ![]const []const u8 {
+    const qcol = quoteIdent(arena, dialect, col) catch col;
+    const span: i128 = @as(i128, max) - @as(i128, min) + 1;
+    var m: usize = m_in;
+    if (@as(i128, @intCast(m)) > span) m = @intCast(span); // don't make empty slices
+    if (m <= 1) {
+        const one = try std.fmt.allocPrint(arena, "{s} >= {d}", .{ qcol, min });
+        return try dupeOne(arena, one);
+    }
+    const width: i128 = @divTrunc(span + @as(i128, @intCast(m)) - 1, @as(i128, @intCast(m))); // ceil
+    var list = std.ArrayList([]const u8).init(arena);
+    var k: usize = 0;
+    while (k < m) : (k += 1) {
+        const lo: i128 = @as(i128, min) + @as(i128, @intCast(k)) * width;
+        if (k == m - 1) {
+            try list.append(try std.fmt.allocPrint(arena, "{s} >= {d}", .{ qcol, lo }));
+        } else {
+            const hi: i128 = lo + width;
+            try list.append(try std.fmt.allocPrint(arena, "{s} >= {d} AND {s} < {d}", .{ qcol, lo, qcol, hi }));
+        }
+    }
+    return list.toOwnedSlice();
+}
+
+/// Equal lexicographic slices of the whole 128-bit UUID space. Random (v4) UUIDs
+/// are uniform over this space, so the slices are balanced with no bounds probe.
+fn uuidSpacePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m: usize) ![]const []const u8 {
+    const qcol = quoteIdent(arena, dialect, col) catch col;
+    var list = std.ArrayList([]const u8).init(arena);
+    var k: usize = 0;
+    while (k < m) : (k += 1) {
+        const lo = if (k == 0) null else try uuidAt(arena, k, m);
+        const hi = if (k == m - 1) null else try uuidAt(arena, k + 1, m);
+        if (lo == null) {
+            try list.append(try std.fmt.allocPrint(arena, "{s} < '{s}'", .{ qcol, hi.? }));
+        } else if (hi == null) {
+            try list.append(try std.fmt.allocPrint(arena, "{s} >= '{s}'", .{ qcol, lo.? }));
+        } else {
+            try list.append(try std.fmt.allocPrint(arena, "{s} >= '{s}' AND {s} < '{s}'", .{ qcol, lo.?, qcol, hi.? }));
+        }
+    }
+    return list.toOwnedSlice();
+}
+
+/// The k/m boundary of the UUID space as a canonical UUID string. Uses u256 to
+/// compute `floor(k * 2^128 / m)` without overflow.
+fn uuidAt(arena: std.mem.Allocator, k: usize, m: usize) ![]const u8 {
+    const val: u128 = @intCast((@as(u256, k) << 128) / @as(u256, m));
+    var bytes: [16]u8 = undefined;
+    std.mem.writeInt(u128, &bytes, val, .big);
+    return std.fmt.allocPrint(arena, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+        bytes[0],  bytes[1],  bytes[2],  bytes[3],
+        bytes[4],  bytes[5],  bytes[6],  bytes[7],
+        bytes[8],  bytes[9],  bytes[10], bytes[11],
+        bytes[12], bytes[13], bytes[14], bytes[15],
+    });
+}
+
+fn quoteIdent(arena: std.mem.Allocator, dialect: Dialect, name: []const u8) ![]const u8 {
+    return switch (dialect) {
+        .postgres => std.fmt.allocPrint(arena, "\"{s}\"", .{name}),
+        .mysql => std.fmt.allocPrint(arena, "`{s}`", .{name}),
+        .sqlserver => std.fmt.allocPrint(arena, "[{s}]", .{name}),
+    };
+}
+
+fn dupeOne(arena: std.mem.Allocator, s: []const u8) ![]const []const u8 {
+    const out = try arena.alloc([]const u8, 1);
+    out[0] = s;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Tests (pure: predicate math — coverage & disjointness)
+// ---------------------------------------------------------------------------
+
+test "int range splits are covering and disjoint" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // [1, 1000] into 7 slices: every id in range hits exactly one predicate.
+    const preds = try intRangePreds(a, .postgres, "id", 1, 1000, 7);
+    try std.testing.expect(preds.len == 7);
+    var id: i64 = 1;
+    while (id <= 1000) : (id += 1) {
+        var hits: usize = 0;
+        for (preds) |p| if (intPredHolds(p, id)) {
+            hits += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 1), hits);
+    }
+    // A row inserted past max is still captured by the open-ended last slice.
+    var hits_over: usize = 0;
+    for (preds) |p| if (intPredHolds(p, 5000)) {
+        hits_over += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), hits_over);
+}
+
+test "int range clamps slice count to the value span" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const preds = try intRangePreds(a, .postgres, "id", 1, 3, 8);
+    try std.testing.expect(preds.len <= 3);
+}
+
+test "uuid space splits are ordered and cover the endpoints" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const preds = try uuidSpacePreds(a, .postgres, "id", 4);
+    try std.testing.expect(preds.len == 4);
+    // First slice is open-below, last is open-above; boundaries are monotonic.
+    try std.testing.expect(std.mem.indexOf(u8, preds[0], ">=") == null);
+    try std.testing.expect(std.mem.startsWith(u8, preds[3], "\"id\" >= "));
+    const b1 = try uuidAt(a, 1, 4);
+    const b2 = try uuidAt(a, 2, 4);
+    try std.testing.expect(std.mem.order(u8, b1, b2) == .lt);
+}
+
+/// Minimal evaluator for the int predicates this module emits, for tests only:
+/// `"id" >= LO` or `"id" >= LO AND "id" < HI`.
+fn intPredHolds(pred: []const u8, id: i64) bool {
+    var lo: i64 = std.math.minInt(i64);
+    var hi: ?i64 = null;
+    var it = std.mem.splitSequence(u8, pred, " AND ");
+    while (it.next()) |part| {
+        const ge = std.mem.indexOf(u8, part, ">= ");
+        const lt = std.mem.indexOf(u8, part, "< ");
+        if (ge) |i| {
+            lo = std.fmt.parseInt(i64, part[i + 3 ..], 10) catch unreachable;
+        } else if (lt) |i| {
+            hi = std.fmt.parseInt(i64, part[i + 2 ..], 10) catch unreachable;
+        }
+    }
+    return id >= lo and (hi == null or id < hi.?);
+}

@@ -18,8 +18,12 @@ pub const tds = @import("connect/tds.zig");
 pub const mysql = @import("connect/mysql.zig");
 pub const postgres = @import("connect/postgres.zig");
 pub const request = @import("connect/request.zig");
+pub const split = @import("connect/split.zig");
 pub const http = @import("server/http.zig");
 pub const runtime = @import("runtime/run.zig");
+pub const parallel = @import("runtime/parallel.zig");
+pub const obs = @import("runtime/obs.zig");
+pub const analyze = @import("runtime/analyze.zig");
 pub const cli = @import("cli/cli.zig");
 
 test {
