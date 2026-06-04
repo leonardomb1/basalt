@@ -51,6 +51,7 @@ pub const Op = union(enum) {
     aggregate: *Aggregate,
     join: *Join,
     explode: *Explode,
+    union_: *Union,
 
     pub fn next(self: Op, arena: std.mem.Allocator) anyerror!?Batch {
         return switch (self) {
@@ -63,7 +64,24 @@ pub const Op = union(enum) {
             .aggregate => |a| a.next(arena),
             .join => |j| j.next(arena),
             .explode => |e| e.next(arena),
+            .union_ => |u| u.next(arena),
         };
+    }
+};
+
+/// Concatenate (UNION ALL) several child ops: drain child 0 fully, then child 1,
+/// … Each child is expected to already emit the unified output schema (e.g. a
+/// reconcile-projection over its source), so this op just forwards their batches.
+pub const Union = struct {
+    children: []const Op,
+    idx: usize = 0,
+
+    pub fn next(self: *Union, arena: std.mem.Allocator) anyerror!?Batch {
+        while (self.idx < self.children.len) {
+            if (try self.children[self.idx].next(arena)) |b| return b;
+            self.idx += 1;
+        }
+        return null;
     }
 };
 

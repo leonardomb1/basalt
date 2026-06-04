@@ -111,13 +111,25 @@ pub const Conn = struct {
 
     // --- packet framing ---
 
+    /// Frame a message into one or more TDS packets of <= the negotiated packet
+    /// size (4096; 4088 payload), setting EOM only on the last. Splitting matters:
+    /// a SQLBatch larger than one packet (e.g. a wide UNION query) sent as a single
+    /// oversized packet is reset by the server/gateway.
     fn writePacket(self: *Conn, ptype: u8, payload: []const u8) !void {
-        var header: [8]u8 = .{ ptype, STATUS_EOM, 0, 0, 0, 0, 0, 0 };
-        const total: u16 = @intCast(payload.len + 8);
-        header[2] = @intCast(total >> 8);
-        header[3] = @intCast(total & 0xff);
-        try self.stream.writer().writeAll(&header);
-        try self.stream.writer().writeAll(payload);
+        const w = self.stream.writer();
+        var off: usize = 0;
+        while (true) {
+            const chunk: usize = @min(payload.len - off, BULK_PKT_PAYLOAD);
+            const last = off + chunk == payload.len;
+            var header: [8]u8 = .{ ptype, if (last) STATUS_EOM else 0x00, 0, 0, 0, 0, 0, 0 };
+            const total: u16 = @intCast(chunk + 8);
+            header[2] = @intCast(total >> 8);
+            header[3] = @intCast(total & 0xff);
+            try w.writeAll(&header);
+            try w.writeAll(payload[off .. off + chunk]);
+            off += chunk;
+            if (last) break;
+        }
     }
 
     /// Reassemble a full message (across packets) into self.msg.
@@ -360,6 +372,32 @@ const PacketReader = struct {
         try self.readBytes(&b);
         return @as(u16, b[0]) | (@as(u16, b[1]) << 8);
     }
+    fn readU32(self: *PacketReader) !u32 {
+        var b: [4]u8 = undefined;
+        try self.readBytes(&b);
+        return std.mem.readInt(u32, &b, .little);
+    }
+    fn readU64(self: *PacketReader) !u64 {
+        var b: [8]u8 = undefined;
+        try self.readBytes(&b);
+        return std.mem.readInt(u64, &b, .little);
+    }
+    /// Read a PLP (Partially Length-Prefixed) value — how SQL Server frames
+    /// varchar(max)/nvarchar(max)/varbinary(max): an 8-byte total length (0xFF…FF =
+    /// NULL; otherwise ignored), then 4-byte-prefixed chunks until a 0-length chunk.
+    fn readPlp(self: *PacketReader, arena: std.mem.Allocator) !?[]u8 {
+        const total = try self.readU64();
+        if (total == 0xFFFFFFFFFFFFFFFF) return null; // PLP_NULL
+        var buf = std.ArrayList(u8).init(arena);
+        while (true) {
+            const chunk = try self.readU32();
+            if (chunk == 0) break; // terminator
+            const start = buf.items.len;
+            try buf.resize(start + chunk);
+            try self.readBytes(buf.items[start..]);
+        }
+        return try buf.toOwnedSlice();
+    }
     fn readSlice(self: *PacketReader, arena: std.mem.Allocator, n: usize) ![]u8 {
         const s = try arena.alloc(u8, n);
         try self.readBytes(s);
@@ -487,7 +525,6 @@ const TdsCursor = struct {
         const boolT = types.Type.init(.bool).asNullable();
         const floatT = types.Type.init(.float).asNullable();
         const strT = types.Type.init(.string).asNullable();
-        const bytesT = types.Type.init(.bytes).asNullable();
         const dateT = types.Type.init(.date).asNullable();
         const tsT = types.Type.init(.timestamp).asNullable();
 
@@ -562,9 +599,10 @@ const TdsCursor = struct {
                 d.scale = scale;
                 d.engine_type = types.Type.decimal(prec, scale).asNullable();
             },
-            0x24 => {
+            0x24 => { // GUIDTYPE (uniqueidentifier): 16 raw bytes -> formatted GUID string
                 _ = try self.reader.readByte();
                 d.engine_type = strT;
+                d.is_guid = true;
             },
             0x28 => {
                 d.engine_type = dateT;
@@ -581,26 +619,24 @@ const TdsCursor = struct {
                 d.scale = try self.reader.readByte();
                 d.engine_type = tsT;
             },
-            0xA7, 0xAF => {
+            0xA7, 0xAF => { // (BIG)VARCHAR / (BIG)CHAR — incl. varchar(max) via PLP
                 const ml = try self.reader.readU16();
                 try self.reader.skip(5); // collation
-                if (ml == 0xFFFF) return error.UnsupportedTdsType;
-                d.kind = .ushortlen;
+                d.kind = if (ml == 0xFFFF) .plp else .ushortlen;
                 d.engine_type = strT;
             },
-            0xE7, 0xEF => {
+            0xE7, 0xEF => { // (BIG)NVARCHAR / NCHAR — incl. nvarchar(max) via PLP
                 const ml = try self.reader.readU16();
                 try self.reader.skip(5);
-                if (ml == 0xFFFF) return error.UnsupportedTdsType;
-                d.kind = .ushortlen;
+                d.kind = if (ml == 0xFFFF) .plp else .ushortlen;
                 d.engine_type = strT;
                 d.is_unicode = true;
             },
-            0xA5, 0xAD => {
+            0xA5, 0xAD => { // (BIG)VARBINARY / BINARY — incl. varbinary(max) via PLP; -> hex string
                 const ml = try self.reader.readU16();
-                if (ml == 0xFFFF) return error.UnsupportedTdsType;
-                d.kind = .ushortlen;
-                d.engine_type = bytesT;
+                d.kind = if (ml == 0xFFFF) .plp else .ushortlen;
+                d.engine_type = strT;
+                d.is_binary = true;
             },
             else => return error.UnsupportedTdsType,
         }
@@ -638,6 +674,10 @@ const TdsCursor = struct {
                 const len = try self.reader.readU16();
                 if (len == 0xFFFF) return .null;
                 const bytes = try self.reader.readSlice(arena, len);
+                return decodeValue(arena, col, bytes);
+            },
+            .plp => {
+                const bytes = (try self.reader.readPlp(arena)) orelse return .null;
                 return decodeValue(arena, col, bytes);
             },
         }
@@ -823,7 +863,7 @@ fn writeU32(w: anytype, v: u32) !void {
     try w.writeAll(&b);
 }
 
-const ColKind = enum { fixed, bytelen, ushortlen };
+const ColKind = enum { fixed, bytelen, ushortlen, plp };
 const ColumnDesc = struct {
     name: []const u8 = "",
     tds_type: u8,
@@ -832,6 +872,8 @@ const ColumnDesc = struct {
     fixed_len: u8 = 0,
     scale: u8 = 0,
     is_unicode: bool = false,
+    is_guid: bool = false,
+    is_binary: bool = false, // SQL Server binary/varbinary(+MAX) -> hex string (CSV-safe)
 };
 
 fn decodeValue(arena: std.mem.Allocator, d: ColumnDesc, bytes: []const u8) !Value {
@@ -840,7 +882,7 @@ fn decodeValue(arena: std.mem.Allocator, d: ColumnDesc, bytes: []const u8) !Valu
         .bool => .{ .bool = bytes.len > 0 and bytes[0] != 0 },
         .float => .{ .float = if (bytes.len == 4) @as(f64, @as(f32, @bitCast(@as(u32, @truncate(readULE(bytes))))) ) else @bitCast(readULE(bytes)) },
         .decimal => decodeDecimal(d, bytes),
-        .string => .{ .string = if (d.is_unicode) try utf16ToUtf8(arena, bytes) else try win1252ToUtf8(arena, bytes) },
+        .string => .{ .string = if (d.is_guid) try formatGuid(arena, bytes) else if (d.is_binary) try bytesToHex(arena, bytes) else if (d.is_unicode) try utf16ToUtf8(arena, bytes) else try win1252ToUtf8(arena, bytes) },
         .bytes => .{ .bytes = try arena.dupe(u8, bytes) },
         .date => .{ .date = @intCast(@as(i64, @intCast(readULE(bytes))) - 719162) },
         .timestamp => .{ .timestamp = decodeDateTime(d, bytes) },
@@ -965,6 +1007,30 @@ fn win1252ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     return out.toOwnedSlice();
 }
 
+/// Format a SQL Server `uniqueidentifier` (16 wire bytes, mixed-endian) as the
+/// canonical lowercase GUID string. Decoding it as raw text would emit control
+/// bytes (incl. the load separator/newline) and corrupt a delimited bulk load.
+/// Render binary as a `0x…` lowercase hex string (CSV/Stream-Load safe — raw
+/// binary bytes would otherwise carry separators/newlines and corrupt the load).
+fn bytesToHex(arena: std.mem.Allocator, b: []const u8) ![]const u8 {
+    const digits = "0123456789abcdef";
+    const out = try arena.alloc(u8, 2 + b.len * 2);
+    out[0] = '0';
+    out[1] = 'x';
+    for (b, 0..) |byte, i| {
+        out[2 + i * 2] = digits[byte >> 4];
+        out[2 + i * 2 + 1] = digits[byte & 0x0F];
+    }
+    return out;
+}
+
+fn formatGuid(arena: std.mem.Allocator, b: []const u8) ![]const u8 {
+    if (b.len < 16) return arena.dupe(u8, "");
+    return std.fmt.allocPrint(arena, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+        b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+    });
+}
+
 fn utf16ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     var out = std.ArrayList(u8).init(arena);
     var k: usize = 0;
@@ -978,6 +1044,21 @@ fn utf16ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
         try out.appendSlice(tmp[0..n]);
     }
     return out.toOwnedSlice();
+}
+
+test "bytes to hex string" {
+    const alloc = std.testing.allocator;
+    const out = try bytesToHex(alloc, &[_]u8{ 0x00, 0x01, 0xAB, 0xFF });
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("0x0001abff", out);
+}
+
+test "format sql server guid (mixed-endian)" {
+    const alloc = std.testing.allocator;
+    const b = [_]u8{ 0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF };
+    const out = try formatGuid(alloc, &b);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("76543210-ba98-fedc-0123-456789abcdef", out);
 }
 
 test "win1252 transcode to utf8" {

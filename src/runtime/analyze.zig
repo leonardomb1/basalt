@@ -413,7 +413,16 @@ const Ctx = struct {
                 src.detail = try std.fmt.allocPrint(self.arena, "{s} (via binding {s})", .{ src.detail, name });
                 return src;
             },
-            else => return fail(self.diag, "a pipeline must start with `read` or a binding reference", .{}),
+            .union_ => |un| {
+                // Reconciliation needs each branch's schema (DB → connect to resolve),
+                // so offline the unified schema is left unresolved for now.
+                const detail = if (un.discover_query.len > 0)
+                    try std.fmt.allocPrint(self.arena, "union (tables discovered from {s})", .{un.discover_conn})
+                else
+                    try std.fmt.allocPrint(self.arena, "union of {d} sources", .{un.branches.len});
+                return .{ .connector = "union", .detail = detail, .schema = null };
+            },
+            else => return fail(self.diag, "a pipeline must start with `read`, `union`, or a binding reference", .{}),
         }
     }
 
@@ -463,7 +472,7 @@ const Ctx = struct {
             .sort => |s| .{ .kind = "sort", .detail = try std.fmt.allocPrint(self.arena, "{d} key(s)", .{s.keys.len}), .breaker = true },
             .aggregate => |ag| .{ .kind = "aggregate", .detail = try std.fmt.allocPrint(self.arena, "{d} agg(s), {d} group(s)", .{ ag.aggs.len, ag.by.len }), .breaker = true },
             .join => |j| try self.joinInfo(j),
-            .read, .ref, .write => fail(self.diag, "unexpected operator in the middle of a pipeline", .{}),
+            .read, .ref, .write, .union_ => fail(self.diag, "unexpected operator in the middle of a pipeline", .{}),
         };
     }
 

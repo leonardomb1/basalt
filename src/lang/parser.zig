@@ -255,6 +255,7 @@ pub const Parser = struct {
     fn parseStageNode(self: *Parser) Error!ast.Stage.Node {
         const name = try self.expectIdent();
         if (std.mem.eql(u8, name, "read")) return .{ .read = try self.parseRead() };
+        if (std.mem.eql(u8, name, "union")) return .{ .union_ = try self.parseUnion() };
         if (std.mem.eql(u8, name, "filter")) return .{ .filter = try self.parseExpr() };
         if (std.mem.eql(u8, name, "select")) return .{ .select = try self.parseSelect() };
         if (std.mem.eql(u8, name, "explode")) return .{ .explode = try self.parseExplode() };
@@ -266,6 +267,27 @@ pub const Parser = struct {
         if (std.mem.eql(u8, name, "join")) return .{ .join = try self.parseJoin() };
         // otherwise: a binding used as a source.
         return .{ .ref = name };
+    }
+
+    /// `union from <conn> <src> as "<tag>" ...` (explicit branches) or
+    /// `union <conn> tables "<query -> (table, tag)>"` (discovered). The `tag`/`canon`
+    /// options ride on the stage's `@[...]` hints, parsed by parseStage.
+    fn parseUnion(self: *Parser) Error!ast.Union {
+        const pos = self.curPos();
+        if (self.isKw("from")) {
+            var branches = std.ArrayList(ast.UnionBranch).init(self.arena);
+            while (self.eatKw("from")) {
+                const rd = try self.parseRead();
+                try self.expectKw("as");
+                const tag = (try self.expect(.string)).text;
+                try branches.append(.{ .read = rd, .tag = tag });
+            }
+            return .{ .branches = try branches.toOwnedSlice(), .pos = pos };
+        }
+        const conn = try self.expectIdent();
+        try self.expectKw("tables");
+        const q = (try self.expect(.string)).text;
+        return .{ .discover_conn = conn, .discover_query = q, .pos = pos };
     }
 
     fn parseRead(self: *Parser) Error!ast.Read {
@@ -879,6 +901,34 @@ test "parse a for-each over a table list" {
     try std.testing.expectEqualStrings("${tbl}", w.target);
     try std.testing.expect(w.mode == .upsert);
     try std.testing.expectEqualStrings("${pk}", w.mode.upsert.keys[0]);
+}
+
+test "parse a union (explicit + discovered)" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const src =
+        \\@batch
+        \\union from erp table CT2010 as "01" from erp table CT2020 as "02"
+        \\  @[tag = CT2_EMPRESA, canon = CT2010]
+        \\  | write sr stream_load CT2_UNIFIED upsert on CT2_EMPRESA, R_E_C_N_O_
+    ;
+    const prog = try parseTest(ar.allocator(), src);
+    const out = prog.stmts[1].output;
+    try std.testing.expect(out.stages[0].node == .union_);
+    const un = out.stages[0].node.union_;
+    try std.testing.expectEqual(@as(usize, 2), un.branches.len);
+    try std.testing.expectEqualStrings("erp", un.branches[0].read.connector);
+    try std.testing.expectEqualStrings("CT2010", un.branches[0].read.form.table.last());
+    try std.testing.expectEqualStrings("01", un.branches[0].tag.?);
+    try std.testing.expectEqual(@as(usize, 2), out.stages[0].hints.len);
+    try std.testing.expect(out.stages[1].node == .write);
+
+    // discovered form
+    const prog2 = try parseTest(ar.allocator(), "@batch\nunion erp tables \"SELECT name, x FROM t\" @[tag = src]\n  | write csv \"/o\"");
+    const un2 = prog2.stmts[1].output.stages[0].node.union_;
+    try std.testing.expectEqualStrings("erp", un2.discover_conn);
+    try std.testing.expectEqualStrings("SELECT name, x FROM t", un2.discover_query);
+    try std.testing.expectEqual(@as(usize, 0), un2.branches.len);
 }
 
 test "missing @kind is an error" {
