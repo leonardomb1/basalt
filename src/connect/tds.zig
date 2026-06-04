@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
+const ast = @import("../lang/ast.zig");
 const column = @import("../exec/column.zig");
 const batchmod = @import("../exec/batch.zig");
 const valuemod = @import("../exec/value.zig");
@@ -17,7 +18,9 @@ const Batch = batchmod.Batch;
 const PKT_PRELOGIN = 0x12;
 const PKT_LOGIN7 = 0x10;
 const PKT_SQLBATCH = 0x01;
+const PKT_BULK = 0x07; // Bulk Load BCP data
 const STATUS_EOM = 0x01;
+const BULK_PKT_PAYLOAD = 4088; // default 4096-byte TDS packet minus the 8-byte header
 
 pub const Error = error{ TdsProtocol, LoginFailed, QueryFailed, EncryptionRequired, UnsupportedTdsType } || std.mem.Allocator.Error || std.net.Stream.WriteError || std.net.Stream.ReadError;
 
@@ -38,6 +41,7 @@ pub const Conn = struct {
     }
 
     pub fn close(self: *Conn) void {
+        if (self.last_error.len > 0) self.gpa.free(self.last_error);
         self.msg.deinit();
         self.stream.close();
         self.gpa.destroy(self);
@@ -65,8 +69,7 @@ pub const Conn = struct {
             cur.reader.deinit();
             cur.meta_arena.deinit();
             self.gpa.destroy(cur);
-            self.close();
-            return e;
+            return e; // leave conn open: the caller owns it (can read last_error) and closes it
         };
         return .{ .ptr = cur, .vtable = &cursor_vtable };
     }
@@ -75,20 +78,32 @@ pub const Conn = struct {
     pub fn exec(self: *Conn, statement: []const u8) !void {
         try self.sendBatch(statement);
         try self.readMessage();
+        try self.scanResultTokens();
+    }
+
+    /// Scan a server response token stream (DONE/ERROR/ENVCHANGE/…) in self.msg.
+    /// Bounds-checked against truncated/malformed tokens (mirrors the guards in
+    /// parseLoginResponse); an ERROR token sets last_error and returns QueryFailed.
+    fn scanResultTokens(self: *Conn) !void {
         const p = self.msg.items;
         var i: usize = 0;
         while (i < p.len) {
             const token = p[i];
             i += 1;
             switch (token) {
-                0xAA => {
+                0xAA => { // ERROR
+                    if (i + 2 > p.len) return error.TdsProtocol;
                     const len = rdU16(p, i);
+                    if (i + 2 + len > p.len) return error.TdsProtocol;
                     self.last_error = try self.decodeError(p[i + 2 .. i + 2 + len]);
                     return error.QueryFailed;
                 },
-                0xAB, 0xE3, 0xA9, 0xA4, 0xA5 => i += 2 + rdU16(p, i),
-                0x79 => i += 4,
-                0xFD, 0xFE, 0xFF => i += 12,
+                0xAB, 0xE3, 0xA9, 0xA4, 0xA5 => { // length-prefixed (INFO/ENVCHANGE/…)
+                    if (i + 2 > p.len) return error.TdsProtocol;
+                    i += 2 + rdU16(p, i);
+                },
+                0x79 => i += 4, // RETURNSTATUS
+                0xFD, 0xFE, 0xFF => i += 12, // DONE/DONEPROC/DONEINPROC
                 else => break,
             }
         }
@@ -188,7 +203,7 @@ pub const Conn = struct {
 
     /// ERROR token body: Number(4) State(1) Class(1) MsgLen(2) Msg(UTF16)...
     fn decodeError(self: *Conn, body: []const u8) ![]const u8 {
-        if (body.len < 8) return "tds login error";
+        if (body.len < 8) return try self.gpa.dupe(u8, "tds login error");
         const msglen: usize = rdU16(body, 6);
         const utf16 = body[8..@min(body.len, 8 + msglen * 2)];
         const out = try self.gpa.alloc(u8, utf16.len / 2);
@@ -217,9 +232,36 @@ pub const Conn = struct {
         }
         try self.writePacket(PKT_SQLBATCH, payload.items);
     }
-};
 
-pub const Result = sqlmod.Result;
+    // --- bulk load (INSERT BULK + BCP token stream) ---
+
+    /// Send `INSERT BULK …` and read the server's acknowledgment; the bulk data
+    /// then streams via `bulkPacket`, finished by `bulkFinish`.
+    pub fn bulkStart(self: *Conn, insert_bulk_sql: []const u8) !void {
+        try self.sendBatch(insert_bulk_sql);
+        try self.readBulkResponse();
+    }
+
+    /// One Bulk Load (0x07) packet; `status` carries EOM on the final one.
+    pub fn bulkPacket(self: *Conn, status: u8, payload: []const u8) !void {
+        var header: [8]u8 = .{ PKT_BULK, status, 0, 0, 0, 0, 0, 0 };
+        const total: u16 = @intCast(payload.len + 8);
+        header[2] = @intCast(total >> 8);
+        header[3] = @intCast(total & 0xff);
+        try self.stream.writer().writeAll(&header);
+        try self.stream.writer().writeAll(payload);
+    }
+
+    /// Read the server's response to the bulk load (DONE on success, ERROR token).
+    pub fn bulkFinish(self: *Conn) !void {
+        try self.readBulkResponse();
+    }
+
+    fn readBulkResponse(self: *Conn) !void {
+        try self.readMessage();
+        try self.scanResultTokens();
+    }
+};
 
 const sql_vtable = sqlmod.Conn.VTable{ .queryCursor = sqlQueryCursor, .exec = sqlExec, .close = sqlClose };
 
@@ -258,14 +300,19 @@ fn curClose(ptr: *anyopaque) void {
 /// Reads the TDS response as a continuous byte stream, pulling packets on
 /// demand (respecting the EOM bit). Multi-byte reads transparently span packet
 /// boundaries — so a ROW token straddling two packets is invisible to the parser.
+const ReadBuf = std.io.BufferedReader(64 * 1024, std.net.Stream.Reader);
+
 const PacketReader = struct {
     stream: std.net.Stream,
+    reader: ReadBuf,
     buf: std.ArrayList(u8),
     pos: usize = 0,
     eom: bool = false,
 
     fn init(gpa: std.mem.Allocator, stream: std.net.Stream) PacketReader {
-        return .{ .stream = stream, .buf = std.ArrayList(u8).init(gpa) };
+        // Login reads (Conn.stream, unbuffered) complete before any cursor, so the
+        // buffered reader here starts on a clean stream with no over-read overlap.
+        return .{ .stream = stream, .reader = .{ .unbuffered_reader = stream.reader() }, .buf = std.ArrayList(u8).init(gpa) };
     }
     fn deinit(self: *PacketReader) void {
         self.buf.deinit();
@@ -275,8 +322,9 @@ const PacketReader = struct {
     fn ensure(self: *PacketReader) !bool {
         while (self.pos >= self.buf.items.len) {
             if (self.eom) return false;
+            const r = self.reader.reader();
             var hdr: [8]u8 = undefined;
-            self.stream.reader().readNoEof(&hdr) catch |e| {
+            r.readNoEof(&hdr) catch |e| {
                 if (e == error.EndOfStream) return false;
                 return e;
             };
@@ -284,7 +332,7 @@ const PacketReader = struct {
             if (len < 8) return error.TdsProtocol;
             self.eom = (hdr[1] & STATUS_EOM) != 0;
             try self.buf.resize(len - 8);
-            try self.stream.reader().readNoEof(self.buf.items);
+            try r.readNoEof(self.buf.items);
             self.pos = 0;
         }
         return true;
@@ -616,6 +664,164 @@ const TdsCursor = struct {
         self.gpa.destroy(self);
     }
 };
+
+// ---------------------------------------------------------------------------
+// Bulk sink (INSERT BULK / BCP). Declares every column as NVARCHAR and lets SQL
+// Server convert to the table's real types (created via DDL) during the bulk
+// insert — one streamed BCP token sequence instead of per-batch INSERTs. Flow:
+// `INSERT BULK <table> (cols nvarchar(4000))` → read the ack → stream a 0x07 Bulk
+// Load packet (COLMETADATA + 0xD1 ROW tokens, ≤4088 bytes/packet, EOM on the
+// last) → read the result. The COLMETADATA must byte-match what the server emits
+// for these columns (verified via SELECT … WHERE 1=0): the key detail was the
+// flags = 0x0008. Append/overwrite only; upsert routes to the INSERT sink.
+// ---------------------------------------------------------------------------
+
+const NVARCHAR_MAX_BYTES = 8000; // must match the table's NVARCHAR(4000) = 8000 bytes
+const BULK_COLLATION = [5]u8{ 0x09, 0x04, 0xD0, 0x00, 0x34 }; // SQL_Latin1_General_CP1_CI_AS
+
+pub const BulkSink = struct {
+    gpa: std.mem.Allocator,
+    conn: *Conn,
+    schema: types.Schema,
+    buffer: std.ArrayList(u8),
+
+    pub fn open(gpa: std.mem.Allocator, conn: *Conn, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode) !*BulkSink {
+        // On error we free only what we allocate here; the caller keeps `conn`
+        // (so it can read conn.last_error) and closes it on failure.
+        const self = try gpa.create(BulkSink);
+        errdefer gpa.destroy(self);
+        // own a copy of the schema (field names) — the caller's may not outlive us
+        const fields = try gpa.alloc(types.Schema.Field, schema.fields.len);
+        errdefer gpa.free(fields);
+        var nf: usize = 0;
+        errdefer for (fields[0..nf]) |f| gpa.free(f.name);
+        for (schema.fields, fields) |f, *o| {
+            o.* = .{ .name = try gpa.dupe(u8, f.name), .ty = f.ty };
+            nf += 1;
+        }
+        self.* = .{ .gpa = gpa, .conn = conn, .schema = .{ .fields = fields }, .buffer = std.ArrayList(u8).init(gpa) };
+        errdefer self.buffer.deinit();
+
+        var aa = std.heap.ArenaAllocator.init(gpa);
+        defer aa.deinit();
+        const a = aa.allocator();
+        const qtable = try sqlmod.quoteIdent(a, .sqlserver, table_name);
+        try conn.exec(try sqlmod.createTableSql(a, .sqlserver, qtable, schema, mode));
+        if (mode == .overwrite) try conn.exec(try std.fmt.allocPrint(a, "DELETE FROM {s}", .{qtable}));
+
+        var cols = std.ArrayList(u8).init(a);
+        for (schema.fields, 0..) |f, i| {
+            if (i > 0) try cols.appendSlice(", ");
+            try cols.appendSlice(try sqlmod.quoteIdent(a, .sqlserver, f.name));
+            try cols.appendSlice(" nvarchar(4000)");
+        }
+        try conn.bulkStart(try std.fmt.allocPrint(a, "INSERT BULK {s} ({s})", .{ qtable, cols.items }));
+        try self.writeColMetadata();
+        return self;
+    }
+
+    pub fn sink(self: *BulkSink) driver.Sink {
+        return .{ .ptr = self, .vtable = &bulk_vtable };
+    }
+
+    fn writeColMetadata(self: *BulkSink) !void {
+        const w = self.buffer.writer();
+        try w.writeByte(0x81); // COLMETADATA
+        try writeU16(w, @intCast(self.schema.fields.len));
+        for (self.schema.fields) |f| {
+            try writeU32(w, 0); // UserType (TDS 7.2+ : 4 bytes)
+            try writeU16(w, 0x0008); // Flags — exactly what the server emits for these columns
+            try w.writeByte(0xE7); // NVARCHARTYPE
+            try writeU16(w, NVARCHAR_MAX_BYTES);
+            try w.writeAll(&BULK_COLLATION);
+            // Column name as B_VARCHAR (1-byte char count + UCS2), like SqlBulkCopy.
+            const name16 = try std.unicode.utf8ToUtf16LeAlloc(self.gpa, f.name);
+            defer self.gpa.free(name16);
+            try w.writeByte(@intCast(name16.len));
+            for (name16) |u| {
+                try w.writeByte(@intCast(u & 0xff));
+                try w.writeByte(@intCast(u >> 8));
+            }
+        }
+    }
+
+    fn writeBatch(self: *BulkSink, arena: std.mem.Allocator, batch: Batch) !void {
+        const w = self.buffer.writer();
+        const fmt = sqlmod.BulkFormat{ .bool_true = "1", .bool_false = "0" };
+        var r: usize = 0;
+        while (r < batch.len) : (r += 1) {
+            try w.writeByte(0xD1); // ROW
+            for (batch.columns) |*col| {
+                const v = col.getValue(r);
+                if (v.isNull()) {
+                    try writeU16(w, 0xFFFF); // CHARBIN_NULL
+                    continue;
+                }
+                const u16s = try std.unicode.utf8ToUtf16LeAlloc(arena, try sqlmod.valueText(arena, v, fmt));
+                var blen = @min(u16s.len * 2, NVARCHAR_MAX_BYTES);
+                // Don't truncate in the middle of a surrogate pair: if the last kept
+                // code unit is a high surrogate, drop it so we never emit a lone half.
+                if (blen < u16s.len * 2 and blen >= 2) {
+                    const last = u16s[blen / 2 - 1];
+                    if (last >= 0xD800 and last <= 0xDBFF) blen -= 2;
+                }
+                try writeU16(w, @intCast(blen));
+                var k: usize = 0;
+                while (k * 2 < blen) : (k += 1) {
+                    try w.writeByte(@intCast(u16s[k] & 0xff));
+                    try w.writeByte(@intCast(u16s[k] >> 8));
+                }
+            }
+            try self.flushFull();
+        }
+    }
+
+    /// Emit whole TDS packets from the buffer, keeping any trailing partial.
+    fn flushFull(self: *BulkSink) !void {
+        var off: usize = 0;
+        while (self.buffer.items.len - off >= BULK_PKT_PAYLOAD) {
+            try self.conn.bulkPacket(0x00, self.buffer.items[off .. off + BULK_PKT_PAYLOAD]);
+            off += BULK_PKT_PAYLOAD;
+        }
+        if (off > 0) {
+            const rem = self.buffer.items.len - off;
+            std.mem.copyForwards(u8, self.buffer.items[0..rem], self.buffer.items[off..]);
+            self.buffer.shrinkRetainingCapacity(rem);
+        }
+    }
+
+    fn closeImpl(self: *BulkSink) !void {
+        try self.flushFull();
+        try self.conn.bulkPacket(STATUS_EOM, self.buffer.items); // final packet (may be empty)
+        try self.conn.bulkFinish();
+        self.conn.close();
+        self.buffer.deinit();
+        for (self.schema.fields) |f| self.gpa.free(f.name);
+        self.gpa.free(self.schema.fields);
+        self.gpa.destroy(self);
+    }
+};
+
+const bulk_vtable = driver.Sink.VTable{ .writeBatch = bulkWrite, .close = bulkClose };
+
+fn bulkWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
+    const self: *BulkSink = @ptrCast(@alignCast(ptr));
+    return self.writeBatch(arena, b);
+}
+fn bulkClose(ptr: *anyopaque) anyerror!void {
+    const self: *BulkSink = @ptrCast(@alignCast(ptr));
+    return self.closeImpl();
+}
+
+fn writeU16(w: anytype, v: u16) !void {
+    try w.writeByte(@intCast(v & 0xff));
+    try w.writeByte(@intCast(v >> 8));
+}
+fn writeU32(w: anytype, v: u32) !void {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, v, .little);
+    try w.writeAll(&b);
+}
 
 const ColKind = enum { fixed, bytelen, ushortlen };
 const ColumnDesc = struct {

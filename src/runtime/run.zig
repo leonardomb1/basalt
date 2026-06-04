@@ -2,12 +2,10 @@
 //! Handles full program structure: `param`s (bound from the CLI or defaults),
 //! `let` bindings (recompiled per reference), `ref` sources, and multiple output
 //! pipelines. Params are substituted into expressions as literals before planning.
-//! (CSV is the only wired connector until the drivers land.)
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
-const eval = @import("../exec/eval.zig");
 const op = @import("../exec/op.zig");
 const csv = @import("../connect/csv.zig");
 const driver = @import("../connect/driver.zig");
@@ -17,6 +15,10 @@ const mysql = @import("../connect/mysql.zig");
 const postgres = @import("../connect/postgres.zig");
 const sql = @import("../connect/sql.zig");
 const request = @import("../connect/request.zig");
+const splitmod = @import("../connect/split.zig");
+const parallel = @import("parallel.zig");
+const analyze = @import("analyze.zig");
+const obs = @import("obs.zig");
 const valuemod = @import("../exec/value.zig");
 
 const Value = valuemod.Value;
@@ -26,14 +28,51 @@ pub const Diag = struct {
     buf: [512]u8 = undefined,
     msg: []const u8 = "",
 };
-pub const Stats = struct { rows_out: usize = 0 };
+pub const Stats = struct {
+    rows_out: usize = 0, // rows written (kept name for the HTTP response)
+    rows_read: usize = 0,
+    run_id: u64 = 0,
+    elapsed_ms: u64 = 0,
+    source: []const u8 = "",
+    sink: []const u8 = "",
+};
 pub const ParamArg = struct { key: []const u8, val: []const u8 };
+
+/// Where the end-of-run summary goes. `.none` keeps `run()` silent when embedded
+/// (tests, the HTTP server); the CLI opts into `.stderr` or `.json_stdout`.
+pub const SummaryMode = enum { none, stderr, json_stdout };
+
+/// Logging/output config (from CLI flags). `format = .auto` picks human text on a
+/// TTY, NDJSON when piped.
+pub const LogConfig = struct {
+    format: obs.Format = .auto,
+    level: obs.Level = .info,
+    quiet: bool = false,
+    summary: SummaryMode = .none,
+};
 
 /// Inputs to a run: params (from CLI flags or an HTTP request's query string) and
 /// an optional request body that `read request` consumes.
 pub const RunOptions = struct {
     params: []const ParamArg = &.{},
     request_body: ?[]const u8 = null,
+    /// Worker threads for map-only pipelines (scan → filter/project/explode). 1 =
+    /// the serial driver (deterministic, used by the in-process test harness); the
+    /// CLI defaults this to the detected core count.
+    threads: usize = 1,
+    log: LogConfig = .{},
+};
+
+const SqlKind = enum { postgres, mysql, sqlserver };
+
+/// Captured when a SQL source is opened, so the planner can re-open the same
+/// source per split (each split = the base query wrapped with a key-range WHERE).
+const SqlDesc = struct {
+    kind: SqlKind,
+    dialect: sql.Dialect,
+    cfg: DbConfig,
+    base_sql: []const u8,
+    table: ?[]const u8, // null for `query` reads (key must come from @[split])
 };
 
 const Env = struct {
@@ -45,9 +84,188 @@ const Env = struct {
     sources: *std.ArrayList(driver.Source),
     request_body: ?[]const u8,
     diag: *Diag,
+    log: *obs.Logger,
+    /// Param name → literal expr, for substitution in stage expressions.
+    params_expr: *std.StringHashMap(*const ast.Expr),
+    /// Runtime expression-error context (which stage/column failed).
+    errctx: *op.ErrCtx,
+    /// Emitted-row counter shared by every source (via `obs.CountingSource`).
+    rows_read: *std.atomic.Value(u64),
+    /// Set by `openSource` to the leading SQL source of the pipeline being built.
+    sql_desc: ?SqlDesc = null,
+    /// Connector types of the first source/sink, for the run summary.
+    src_name: []const u8 = "",
+    sink_name: []const u8 = "",
 };
 
 const PipeRes = struct { op: op.Op, schema: types.Schema };
+
+/// Connection config carried into the split lanes (referenced via *anyopaque).
+const SplitCtx = struct { gpa: std.mem.Allocator, kind: SqlKind, cfg: DbConfig, base_sql: []const u8 };
+
+fn connectSql(gpa: std.mem.Allocator, kind: SqlKind, cfg: DbConfig) !sql.Conn {
+    return switch (kind) {
+        .postgres => (try postgres.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database)).sqlConn(),
+        .mysql => (try mysql.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database)).sqlConn(),
+        .sqlserver => (try tds.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database)).sqlConn(),
+    };
+}
+
+/// `parallel.OpenSplitFn`: open a fresh source for one split predicate.
+fn openSplitSource(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, pred: []const u8) anyerror!driver.Source {
+    const ctx: *SplitCtx = @ptrCast(@alignCast(ctx_ptr));
+    const q = try splitmod.wrap(gpa, ctx.base_sql, pred);
+    const conn = try connectSql(gpa, ctx.kind, ctx.cfg);
+    const s = try sql.Source.open(gpa, conn, q);
+    return s.source();
+}
+
+/// Resolved config for a per-lane StarRocks sink (DDL already done once at plan
+/// time; lanes just stream-load with a shared run_id and lane-distinct labels).
+const StarrocksSinkSpec = struct {
+    cfg: starrocks.Config,
+    target: []const u8,
+    schema: types.Schema,
+    mode: ast.WriteMode,
+};
+
+/// `parallel.OpenSinkFn`: one StarRocks stream-load stream per lane.
+fn openLaneStarrocksSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize) anyerror!driver.Sink {
+    const spec: *StarrocksSinkSpec = @ptrCast(@alignCast(ctx_ptr));
+    var cfg = spec.cfg;
+    // Lane-distinct prefix → labels never collide across lanes. (StreamLoadSink.open
+    // dupes this, so the temp is freed here.)
+    const lp = try std.fmt.allocPrint(gpa, "{s}_l{d}", .{ spec.cfg.label_prefix, lane_idx });
+    defer gpa.free(lp);
+    cfg.label_prefix = lp;
+    const s = try starrocks.StreamLoadSink.open(gpa, cfg, spec.target, spec.schema, spec.mode);
+    return s.sink();
+}
+
+/// Resolved config for a per-lane SQL sink (reverse-ETL). DDL + any overwrite
+/// DELETE run once at plan time; each lane opens its own connection and INSERTs.
+/// Safe under concurrency because the source splits are disjoint key ranges, so no
+/// two lanes ever write the same key (upserts never collide cross-lane).
+const SqlSinkSpec = struct {
+    kind: SqlKind,
+    dialect: sql.Dialect,
+    cfg: DbConfig,
+    target: []const u8,
+    schema: types.Schema,
+    lane_mode: ast.WriteMode, // overwrite -> append for lanes (DELETE already done)
+};
+
+/// Open the per-dialect write strategy from an already-connected conn: a bulk
+/// loader (COPY / LOAD DATA / INSERT BULK) for append/overwrite, or the generic
+/// INSERT `sql.Sink` for upsert. Centralizes the bulk-vs-INSERT rule so the serial
+/// (`openSink`) and per-lane (`openLaneSqlSink`) paths can't drift. `conn` is the
+/// concrete driver connection; on error the caller still owns and closes it.
+fn openBulkOrInsert(gpa: std.mem.Allocator, conn: anytype, comptime BulkSink: type, dialect: sql.Dialect, target: []const u8, schema: types.Schema, mode: ast.WriteMode) !driver.Sink {
+    if (mode != .upsert) return (try BulkSink.open(gpa, conn, target, schema, mode)).sink();
+    return (try sql.Sink.open(gpa, conn.sqlConn(), dialect, target, schema, mode)).sink();
+}
+
+/// `parallel.OpenSinkFn`: one DB stream per lane (append/overwrite → bulk loader,
+/// upsert → INSERT, per `openBulkOrInsert`).
+fn openLaneSqlSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize) anyerror!driver.Sink {
+    _ = lane_idx; // SQL sinks need no per-lane discriminator (INSERTs aren't labelled)
+    const spec: *SqlSinkSpec = @ptrCast(@alignCast(ctx_ptr));
+    const cfg = spec.cfg;
+    switch (spec.kind) {
+        .postgres => {
+            const c = try postgres.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database);
+            errdefer c.close();
+            return openBulkOrInsert(gpa, c, postgres.CopySink, spec.dialect, spec.target, spec.schema, spec.lane_mode);
+        },
+        .mysql => {
+            const c = try mysql.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database);
+            errdefer c.close();
+            return openBulkOrInsert(gpa, c, mysql.LoadDataSink, spec.dialect, spec.target, spec.schema, spec.lane_mode);
+        },
+        .sqlserver => {
+            const c = try tds.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database);
+            errdefer c.close();
+            return openBulkOrInsert(gpa, c, tds.BulkSink, spec.dialect, spec.target, spec.schema, spec.lane_mode);
+        },
+    }
+}
+
+/// Build the parallel-sink mode for a split pipeline: a per-lane StarRocks or SQL
+/// sink, or null to fall back to the shared-mutex path (CSV).
+fn buildParallelSink(env: *Env, w: ast.Write, schema: types.Schema) !?parallel.SinkMode {
+    if (try buildStarrocksSpec(env, w, schema)) |spec|
+        return parallel.SinkMode{ .per_lane = .{ .open = openLaneStarrocksSink, .ctx = spec } };
+    if (try buildSqlSinkSpec(env, w, schema)) |spec|
+        return parallel.SinkMode{ .per_lane = .{ .open = openLaneSqlSink, .ctx = spec } };
+    return null;
+}
+
+fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpec {
+    const conn = env.connections.get(w.connector) orelse return null;
+    var kind: SqlKind = undefined;
+    var port: u16 = undefined;
+    if (std.mem.eql(u8, conn.connector, "mysql")) {
+        kind = .mysql;
+        port = 3306;
+    } else if (std.mem.eql(u8, conn.connector, "postgres")) {
+        kind = .postgres;
+        port = 5432;
+    } else if (std.mem.eql(u8, conn.connector, "sqlserver")) {
+        kind = .sqlserver;
+        port = 1433;
+    } else return null;
+    const dialect: sql.Dialect = switch (kind) {
+        .mysql => .mysql,
+        .postgres => .postgres,
+        .sqlserver => .sqlserver,
+    };
+    const cfg = try resolveDbConfig(env, conn, port);
+
+    // One-time setup: create the table (and DELETE once for overwrite), so lanes
+    // don't race DDL or repeatedly delete. Lanes then append into it.
+    const setup_conn = connectSql(env.gpa, kind, cfg) catch |e|
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink connect failed: {s}", .{ conn.connector, @errorName(e) }));
+    const setup = sql.Sink.open(env.gpa, setup_conn, dialect, w.target, schema, w.mode) catch |e|
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink setup failed: {s}", .{ conn.connector, @errorName(e) }));
+    setup.sink().close() catch |e|
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink setup close failed: {s}", .{ conn.connector, @errorName(e) }));
+
+    const spec = try env.arena.create(SqlSinkSpec);
+    spec.* = .{
+        .kind = kind,
+        .dialect = dialect,
+        .cfg = cfg,
+        .target = w.target,
+        .schema = schema,
+        .lane_mode = if (w.mode == .overwrite) .append else w.mode,
+    };
+    return spec;
+}
+
+/// If `w` writes to StarRocks, run the one-time DDL/truncate now and return a spec
+/// the lanes use to open their own stream-load streams. Returns null for any other
+/// sink (those use the shared mutex path).
+fn buildStarrocksSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*StarrocksSinkSpec {
+    const conn = env.connections.get(w.connector) orelse return null;
+    if (!std.mem.eql(u8, conn.connector, "starrocks")) return null;
+
+    var cfg = try resolveStarrocksConfig(env, conn);
+    cfg.run_id = if (cfg.run_id != 0) cfg.run_id else @intCast(std.time.milliTimestamp());
+
+    // One-time setup: create DB/table (and TRUNCATE for overwrite) once, so the
+    // lanes don't race DDL or repeatedly truncate.
+    const setup = starrocks.StreamLoadSink.open(env.gpa, cfg, w.target, schema, w.mode) catch |e|
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "starrocks setup failed ({s}) — {s}", .{ @errorName(e), env.diag.msg }));
+    setup.sink().close() catch |e|
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "starrocks setup close failed: {s}", .{@errorName(e)}));
+    cfg.auto_create = false;
+
+    const spec = try env.arena.create(StarrocksSinkSpec);
+    // Lanes must not re-truncate (overwrite's TRUNCATE already ran once in setup
+    // above), so map overwrite -> append for the per-lane sinks — same as buildSqlSinkSpec.
+    spec.* = .{ .cfg = cfg, .target = w.target, .schema = schema, .mode = if (w.mode == .overwrite) .append else w.mode };
+    return spec;
+}
 
 pub fn run(gpa: std.mem.Allocator, program: ast.Program, opts: RunOptions, diag: *Diag) !Stats {
     var plan_arena = std.heap.ArenaAllocator.init(gpa);
@@ -62,6 +280,10 @@ pub fn run(gpa: std.mem.Allocator, program: ast.Program, opts: RunOptions, diag:
 
     var params = std.StringHashMap(Value).init(arena);
     try resolveParams(arena, program, opts.params, &params, diag);
+    // Substitution map: param name → a literal expression of its resolved value.
+    var params_expr = std.StringHashMap(*const ast.Expr).init(arena);
+    var pit = params.iterator();
+    while (pit.next()) |kv| try params_expr.put(kv.key_ptr.*, try mkLit(arena, kv.value_ptr.*));
 
     var bindings = std.StringHashMap(ast.Pipeline).init(arena);
     var connections = std.StringHashMap(ast.Connection).init(arena);
@@ -75,21 +297,65 @@ pub fn run(gpa: std.mem.Allocator, program: ast.Program, opts: RunOptions, diag:
     if (outputs.items.len == 0)
         return planErr(diag, "no output pipeline (a pipeline ending in `write`)");
 
+    const run_id: u64 = @intCast(std.time.milliTimestamp());
+    var logger = obs.Logger.init(run_id, opts.log.format, if (opts.log.quiet) .err else opts.log.level);
+    const t0 = std.time.milliTimestamp();
+    var rows_read = std.atomic.Value(u64).init(0);
+
+    // On any error exit, surface the runtime expression-error context (set deep in
+    // an operator) as the diagnostic the CLI prints.
+    var errctx = op.ErrCtx{};
+    errdefer if (errctx.msg.len > 0) setMsg(diag, errctx.msg);
+
     var sources = std.ArrayList(driver.Source).init(arena);
-    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag };
+    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read };
 
     var batch_arena = std.heap.ArenaAllocator.init(gpa);
     defer batch_arena.deinit();
 
-    var stats = Stats{};
+    var stats = Stats{ .run_id = run_id };
+    var lanes_used: usize = 1; // actual parallelism (1 unless split-parallel engaged)
     for (outputs.items) |out| {
         const stages = out.stages;
         const last = stages[stages.len - 1].node;
         if (last != .write) return planErr(diag, "a top-level pipeline must end in `write`");
+        env.sink_name = connectorType(&env, last.write.connector);
 
+        env.sql_desc = null;
+        env.src_name = ""; // reset per output so this pipeline's first read sets it
+        const src_base = env.sources.items.len; // sources this output opens (for early release on the split path)
         const res = try buildPipeline(&env, stages[0 .. stages.len - 1]);
-        const snk = try openSink(&env, last.write, res.schema);
 
+        // Split-parallel: a map-only pipeline (no breakers/limit) reading a
+        // splittable SQL source fans out into N key-range lanes, each on its own
+        // connection. A StarRocks sink also fans out — one stream-load stream per
+        // lane (lane-distinct labels, shared run_id); other sinks (CSV) stay shared
+        // under a mutex. Non-splittable sources or stateful pipelines stay serial.
+        if (opts.threads > 1 and env.sql_desc != null) {
+            if (try op.linearize(arena, res.op)) |lin| {
+                if (try planSplit(&env, env.sql_desc.?, stages[0], opts.threads, last.write)) |sp| {
+                    // The planning source was opened only to build res.op + discover the
+                    // split descriptor (which copies its own config); the lanes open their
+                    // own connections, so close it now rather than holding an idle
+                    // connection with an unconsumed result set for the whole parallel run.
+                    for (env.sources.items[src_base..]) |sc| sc.close();
+                    env.sources.shrinkRetainingCapacity(src_base);
+                    var ctx = SplitCtx{ .gpa = gpa, .kind = env.sql_desc.?.kind, .cfg = env.sql_desc.?.cfg, .base_sql = env.sql_desc.?.base_sql };
+                    lanes_used = @max(lanes_used, @min(opts.threads, sp.predicates.len));
+                    env.log.log(.info, "split-parallel: {d} splits over {d} lanes on key range", .{ sp.predicates.len, @min(opts.threads, sp.predicates.len) });
+                    if (try buildParallelSink(&env, last.write, res.schema)) |mode| {
+                        stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lin.stages, mode, opts.threads, &rows_read);
+                    } else {
+                        const snk = try openSink(&env, last.write, res.schema);
+                        stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lin.stages, .{ .shared = snk }, opts.threads, &rows_read);
+                        try snk.close();
+                    }
+                    continue;
+                }
+            }
+        }
+
+        const snk = try openSink(&env, last.write, res.schema);
         while (true) {
             _ = batch_arena.reset(.retain_capacity);
             const b = (try res.op.next(batch_arena.allocator())) orelse break;
@@ -99,7 +365,38 @@ pub fn run(gpa: std.mem.Allocator, program: ast.Program, opts: RunOptions, diag:
         try snk.close();
     }
     for (sources.items) |sc| sc.close();
+
+    stats.rows_read = rows_read.load(.monotonic);
+    stats.elapsed_ms = @intCast(std.time.milliTimestamp() - t0);
+    stats.source = env.src_name;
+    stats.sink = env.sink_name;
+
+    // The run summary is a result, not a log line: `--json` emits it to stdout
+    // (machine output); otherwise the logger renders it to stderr (human text on a
+    // TTY, NDJSON when piped). The HTTP path skips both and builds its own response.
+    const summary = obs.Summary{
+        .run_id = run_id,
+        .source = stats.source,
+        .sink = stats.sink,
+        .rows_read = stats.rows_read,
+        .rows_written = stats.rows_out,
+        .elapsed_ms = stats.elapsed_ms,
+        .threads = lanes_used,
+    };
+    switch (opts.log.summary) {
+        .json_stdout => summary.renderJson(std.io.getStdOut().writer()) catch {},
+        .stderr => logger.summary(summary),
+        .none => {},
+    }
     return stats;
+}
+
+/// Resolve a sink/source connector name to its driver type for the summary
+/// (`csv`/`request` are types; a connection name maps to its `connector`).
+fn connectorType(env: *Env, name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "csv") or std.mem.eql(u8, name, "request")) return name;
+    if (env.connections.get(name)) |c| return c.connector;
+    return name;
 }
 
 // --- pipeline construction ---
@@ -112,8 +409,13 @@ fn buildPipeline(env: *Env, stages: []const ast.Stage) anyerror!PipeRes {
 
     switch (stages[0].node) {
         .read => |rd| {
-            const src = try openSource(env, rd);
+            const raw = try openSource(env, rd);
+            // Count rows read through every source without per-operator wiring.
+            const cs = try env.arena.create(obs.CountingSource);
+            cs.* = .{ .inner = raw, .count = env.rows_read };
+            const src = cs.source();
             try env.sources.append(src);
+            if (env.src_name.len == 0) env.src_name = connectorType(env, rd.connector);
             const scan = try env.arena.create(op.Scan);
             scan.* = .{ .src = src };
             current = .{ .scan = scan };
@@ -137,16 +439,22 @@ fn buildPipeline(env: *Env, stages: []const ast.Stage) anyerror!PipeRes {
     return .{ .op = current, .schema = schema };
 }
 
+/// Bridge an analyze-layer error (which writes `ad.msg`) into a plan error.
+fn aErr(env: *Env, ad: *analyze.Diag, e: analyze.Error) anyerror {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.AnalyzeFailed => planErr(env.diag, ad.msg),
+    };
+}
+
 fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schema) anyerror!PipeRes {
     const arena = env.arena;
     switch (stage.node) {
         .filter => |pred0| {
-            const pred = try substParams(env, pred0);
-            var ctx = eval.TypeCtx{ .schema = schema, .arena = arena };
-            const t = ctx.typeOf(pred) catch |e| return typeErr(e, env.diag, ctx.msg);
-            if (!(t.kind == .bool or t.unknown)) return planErr(env.diag, "filter predicate must be bool");
+            var ad = analyze.Diag{};
+            const pred = analyze.checkFilter(arena, schema, pred0, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
             const f = try arena.create(op.Filter);
-            f.* = .{ .child = child, .pred = pred };
+            f.* = .{ .child = child, .pred = pred, .err = env.errctx };
             return .{ .op = .{ .filter = f }, .schema = schema };
         },
         .select => |items| return buildProject(env, items, schema, child),
@@ -158,22 +466,20 @@ fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schema) a
         .distinct => |d| {
             var keys: ?[]const usize = null;
             if (d.on) |fields| {
-                const idxs = try arena.alloc(usize, fields.len);
-                for (fields, 0..) |q, i| idxs[i] = schema.indexOf(lastp(q)) orelse
-                    return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown field `{s}`", .{lastp(q)}));
-                keys = idxs;
+                var ad = analyze.Diag{};
+                keys = analyze.fieldIndices(arena, schema, fields, &ad) catch |e| return aErr(env, &ad, e);
             }
             const o = try arena.create(op.Distinct);
             o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = keys };
             return .{ .op = .{ .distinct = o }, .schema = schema };
         },
         .sort => |s| {
+            const qs = try arena.alloc(ast.QualName, s.keys.len);
+            for (s.keys, qs) |sk, *q| q.* = sk.field;
+            var ad = analyze.Diag{};
+            const idxs = analyze.fieldIndices(arena, schema, qs, &ad) catch |e| return aErr(env, &ad, e);
             const ks = try arena.alloc(op.Sort.Key, s.keys.len);
-            for (s.keys, 0..) |sk, i| {
-                const idx = schema.indexOf(lastp(sk.field)) orelse
-                    return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown field `{s}`", .{lastp(sk.field)}));
-                ks[i] = .{ .idx = idx, .desc = sk.desc };
-            }
+            for (s.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc };
             const o = try arena.create(op.Sort);
             o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = ks };
             return .{ .op = .{ .sort = o }, .schema = schema };
@@ -181,23 +487,11 @@ fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schema) a
         .aggregate => |ag| return buildAggregate(env, ag, schema, child),
         .join => |j| return buildJoin(env, j, schema, child),
         .explode => |ex| {
-            const idx = schema.indexOf(ex.field) orelse
-                return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown field `{s}`", .{ex.field}));
-            const fty = schema.fields[idx].ty;
-            if (!(fty.kind == .string or fty.kind == .bytes))
-                return planErr(env.diag, "explode needs a string column (it splits a delimited value)");
-            var fields = std.ArrayList(types.Schema.Field).init(arena);
-            for (schema.fields, 0..) |f, i| {
-                if (i == idx) {
-                    try fields.append(.{ .name = ex.as_name orelse f.name, .ty = types.Type.init(.string) });
-                } else {
-                    try fields.append(f);
-                }
-            }
-            const out = try arena.create(types.Schema);
-            out.* = .{ .fields = try fields.toOwnedSlice() };
+            var ad = analyze.Diag{};
+            const ep = analyze.explodePlan(arena, schema, ex, &ad) catch |e| return aErr(env, &ad, e);
+            const out = try schemaPtr(arena, ep.schema);
             const o = try arena.create(op.Explode);
-            o.* = .{ .child = child, .field_idx = idx, .delim = ex.delim orelse ",", .out_schema = out };
+            o.* = .{ .child = child, .field_idx = ep.idx, .delim = ex.delim orelse ",", .out_schema = out };
             return .{ .op = .{ .explode = o }, .schema = out.* };
         },
         .read, .ref, .write => return planErr(env.diag, "unexpected operator in the middle of a pipeline"),
@@ -206,102 +500,51 @@ fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schema) a
 
 fn buildProject(env: *Env, items: []const ast.SelectItem, in_schema: types.Schema, child: op.Op) anyerror!PipeRes {
     const arena = env.arena;
-    var cols = std.ArrayList(op.Project.Col).init(arena);
-    var fields = std.ArrayList(types.Schema.Field).init(arena);
+    var ad = analyze.Diag{};
+    const rcols = analyze.selectCols(arena, in_schema, items, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
 
-    for (items) |item| switch (item) {
-        .star => for (in_schema.fields, 0..) |f, idx| {
-            try cols.append(.{ .source = .{ .passthrough = idx }, .ty = f.ty });
-            try fields.append(.{ .name = f.name, .ty = f.ty });
+    const cols = try arena.alloc(op.Project.Col, rcols.len);
+    for (rcols, cols) |rc, *c| c.* = .{
+        .source = switch (rc.source) {
+            .passthrough => |idx| .{ .passthrough = idx },
+            .expr => |e| .{ .expr = e },
         },
-        .star_except => |names| for (in_schema.fields, 0..) |f, idx| {
-            if (containsName(names, f.name)) continue;
-            try cols.append(.{ .source = .{ .passthrough = idx }, .ty = f.ty });
-            try fields.append(.{ .name = f.name, .ty = f.ty });
-        },
-        .field => |q| {
-            const nm = lastp(q);
-            const idx = in_schema.indexOf(nm) orelse
-                return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown field `{s}`", .{nm}));
-            try cols.append(.{ .source = .{ .passthrough = idx }, .ty = in_schema.fields[idx].ty });
-            try fields.append(.{ .name = nm, .ty = in_schema.fields[idx].ty });
-        },
-        .computed => |c| {
-            const e = try substParams(env, c.expr);
-            var ctx = eval.TypeCtx{ .schema = in_schema, .arena = arena };
-            const t = ctx.typeOf(e) catch |err| return typeErr(err, env.diag, ctx.msg);
-            try cols.append(.{ .source = .{ .expr = e }, .ty = t });
-            try fields.append(.{ .name = c.name, .ty = t });
-        },
+        .ty = rc.ty,
     };
-
     const out = try arena.create(types.Schema);
-    out.* = .{ .fields = try fields.toOwnedSlice() };
+    out.* = try analyze.schemaOfCols(arena, rcols);
     const p = try arena.create(op.Project);
-    p.* = .{ .child = child, .cols = try cols.toOwnedSlice(), .out_schema = out };
+    p.* = .{ .child = child, .cols = cols, .out_schema = out, .err = env.errctx };
     return .{ .op = .{ .project = p }, .schema = out.* };
 }
 
 fn buildAggregate(env: *Env, ag: ast.Aggregate, schema: types.Schema, child: op.Op) anyerror!PipeRes {
     const arena = env.arena;
-    const by = try arena.alloc(usize, ag.by.len);
-    var fields = std.ArrayList(types.Schema.Field).init(arena);
-    for (ag.by, 0..) |q, i| {
-        const idx = schema.indexOf(lastp(q)) orelse
-            return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown group field `{s}`", .{lastp(q)}));
-        by[i] = idx;
-        try fields.append(.{ .name = lastp(q), .ty = schema.fields[idx].ty });
-    }
-    const aggs = try arena.alloc(op.Aggregate.Agg, ag.aggs.len);
-    for (ag.aggs, 0..) |item, i| {
-        const arg: ?*const ast.Expr = if (item.arg) |a| try substParams(env, a) else null;
-        const aty = try aggResultType(arena, item.func, arg, schema, env.diag);
-        aggs[i] = .{ .func = item.func, .arg = arg, .ty = aty };
-        try fields.append(.{ .name = item.name, .ty = aty });
-    }
-    const out = try arena.create(types.Schema);
-    out.* = .{ .fields = try fields.toOwnedSlice() };
+    var ad = analyze.Diag{};
+    const ap = analyze.aggregatePlan(arena, schema, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
+    const aggs = try arena.alloc(op.Aggregate.Agg, ap.aggs.len);
+    for (ap.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty };
+    const out = try schemaPtr(arena, ap.schema);
     const o = try arena.create(op.Aggregate);
-    o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .by = by, .aggs = aggs, .out_schema = out };
+    o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .by = ap.by, .aggs = aggs, .out_schema = out, .err = env.errctx };
     return .{ .op = .{ .aggregate = o }, .schema = out.* };
 }
 
 fn buildJoin(env: *Env, j: ast.Join, left_schema: types.Schema, probe: op.Op) anyerror!PipeRes {
     const arena = env.arena;
-    if (j.kind == .right or j.kind == .full or j.kind == .cross)
-        return planErr(env.diag, "this join type is not implemented yet (inner/left/semi/anti supported)");
-    const bnd = env.bindings.get(j.binding) orelse
+    if (env.bindings.get(j.binding) == null)
         return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown binding `{s}` in join", .{j.binding}));
-    const build = try buildPipeline(env, bnd.stages);
+    const build = try buildPipeline(env, env.bindings.get(j.binding).?.stages);
 
-    const lk = left_schema.indexOf(lastp(j.left_key)) orelse
-        return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown left join key `{s}`", .{lastp(j.left_key)}));
-    const rk = build.schema.indexOf(lastp(j.right_key)) orelse
-        return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown right join key `{s}`", .{lastp(j.right_key)}));
-
-    const emit_right = (j.kind == .inner or j.kind == .left);
-    const right_nullable = (j.kind == .left);
-
-    var fields = std.ArrayList(types.Schema.Field).init(arena);
-    for (left_schema.fields) |f| try fields.append(f);
-    if (emit_right) {
-        for (build.schema.fields) |f| {
-            var name = f.name;
-            if (left_schema.indexOf(name) != null) name = try std.fmt.allocPrint(arena, "{s}_r", .{name});
-            var ty = f.ty;
-            if (right_nullable) ty = ty.asNullable();
-            try fields.append(.{ .name = name, .ty = ty });
-        }
-    }
-    const out = try arena.create(types.Schema);
-    out.* = .{ .fields = try fields.toOwnedSlice() };
-
+    var ad = analyze.Diag{};
+    const jp = analyze.joinPlan(arena, left_schema, build.schema, j, &ad) catch |e| return aErr(env, &ad, e);
+    const out = try schemaPtr(arena, jp.schema);
     const o = try arena.create(op.Join);
     o.* = .{
         .probe = probe,
         .build = build.op,
-        .left_key = lk,
-        .right_key = rk,
+        .left_key = jp.lk,
+        .right_key = jp.rk,
         .left_schema = try schemaPtr(arena, left_schema),
         .right_schema = try schemaPtr(arena, build.schema),
         .out_schema = out,
@@ -331,8 +574,11 @@ fn openSource(env: *Env, rd: ast.Read) !driver.Source {
         const query = try readSql(env, rd);
         const c = tds.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sqlserver connect failed: {s}", .{@errorName(e)}));
-        const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e|
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sqlserver read failed: {s}", .{@errorName(e)}));
+        const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
+            defer c.close();
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sqlserver read failed ({s}): {s}", .{ @errorName(e), c.last_error }));
+        };
+        env.sql_desc = try sqlDescFor(env, .sqlserver, .sqlserver, cfg, query, rd);
         return s.source();
     }
     if (std.mem.eql(u8, conn.connector, "mysql")) {
@@ -340,8 +586,11 @@ fn openSource(env: *Env, rd: ast.Read) !driver.Source {
         const query = try readSql(env, rd);
         const c = mysql.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "mysql connect failed: {s}", .{@errorName(e)}));
-        const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e|
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "mysql read failed: {s}", .{@errorName(e)}));
+        const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
+            defer c.close();
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "mysql read failed ({s}): {s}", .{ @errorName(e), c.last_error }));
+        };
+        env.sql_desc = try sqlDescFor(env, .mysql, .mysql, cfg, query, rd);
         return s.source();
     }
     if (std.mem.eql(u8, conn.connector, "postgres")) {
@@ -349,8 +598,11 @@ fn openSource(env: *Env, rd: ast.Read) !driver.Source {
         const query = try readSql(env, rd);
         const c = postgres.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "postgres connect failed: {s}", .{@errorName(e)}));
-        const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e|
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "postgres read failed: {s}", .{@errorName(e)}));
+        const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
+            defer c.close();
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "postgres read failed ({s}): {s}", .{ @errorName(e), c.last_error }));
+        };
+        env.sql_desc = try sqlDescFor(env, .postgres, .postgres, cfg, query, rd);
         return s.source();
     }
     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unsupported source connector `{s}`", .{conn.connector}));
@@ -392,6 +644,169 @@ fn readSql(env: *Env, rd: ast.Read) ![]const u8 {
     };
 }
 
+fn sqlDescFor(env: *Env, kind: SqlKind, dialect: sql.Dialect, cfg: DbConfig, base_sql: []const u8, rd: ast.Read) !SqlDesc {
+    const table: ?[]const u8 = switch (rd.form) {
+        .table => |t| try qualStr(env.arena, t),
+        else => null,
+    };
+    return .{ .kind = kind, .dialect = dialect, .cfg = cfg, .base_sql = base_sql, .table = table };
+}
+
+/// Pull `@[split = col]` / `@[splits = N]` off the leading read stage.
+const SplitHints = struct { col: ?[]const u8 = null, count: ?usize = null };
+fn splitHints(stage: ast.Stage) SplitHints {
+    var h = SplitHints{};
+    for (stage.hints) |hint| {
+        if (std.mem.eql(u8, hint.key, "split")) {
+            if (hint.value == .ident) h.col = hint.value.ident;
+        } else if (std.mem.eql(u8, hint.key, "splits")) {
+            if (hint.value == .int and hint.value.int > 0) h.count = @intCast(hint.value.int);
+        }
+    }
+    return h;
+}
+
+/// Try to build a split plan for a map-only SQL pipeline. Returns null (→ run
+/// serial) when the source isn't a splittable SQL table/query, no usable key is
+/// found, or the table is too small to split.
+/// True when this sink is the Postgres COPY path (append/overwrite to a postgres
+/// connection), which benchmarks faster run serially than split — see planSplit.
+fn isPostgresCopySink(env: *Env, w: ast.Write) bool {
+    return w.mode != .upsert and std.mem.eql(u8, connectorType(env, w.connector), "postgres");
+}
+
+fn planSplit(env: *Env, desc: SqlDesc, lead: ast.Stage, threads: usize, w: ast.Write) !?splitmod.Plan {
+    const hints = splitHints(lead);
+    // Default to a few splits per worker so faster lanes can steal from slower
+    // ones (skew tolerance); cap to keep connection churn bounded.
+    const forced = hints.col != null or hints.count != null;
+    const m: usize = hints.count orelse @min(@as(usize, 64), threads * 4);
+    if (m < 2) return null;
+    // Sink-aware gate: Postgres COPY (append/overwrite) is faster serial than split
+    // at the sizes measured — the per-lane connection + COPY-stream overhead exceeds
+    // the benefit — so don't auto-split it. StarRocks (benefits from splitting),
+    // mysql LOAD DATA, sqlserver BULK, and INSERT/upsert keep the size-gated default;
+    // an explicit @[split]/@[splits] still forces a split.
+    if (!forced and isPostgresCopySink(env, w)) return null;
+
+    // Each probe opens its own connection (a cursor owns+closes its conn), so the
+    // prober hands out fresh connections rather than sharing one.
+    var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql };
+    const prober = splitmod.Prober{ .ctx = &pctx, .openFn = proberOpen };
+
+    var key: splitmod.Key = undefined;
+    if (hints.col) |col| {
+        key = .{ .col = col, .kind = .int }; // explicit key: assume int (range)
+    } else if (desc.table) |table| {
+        const info = (try splitmod.introspectKey(env.arena, prober, desc.dialect, table)) orelse return null;
+        // Size gate: small tables aren't worth the per-lane connection setup.
+        if (!forced and info.est_rows < splitmod.min_rows_to_split) return null;
+        key = info.key;
+    } else {
+        return null; // a query read with no @[split] hint
+    }
+    return splitmod.plan(env.arena, prober, desc.dialect, desc.base_sql, key, m);
+}
+
+fn proberOpen(ctx_ptr: *anyopaque) anyerror!sql.Conn {
+    const ctx: *SplitCtx = @ptrCast(@alignCast(ctx_ptr));
+    return connectSql(ctx.gpa, ctx.kind, ctx.cfg);
+}
+
+// --- `check --connect`: resolve a DB source's schema by connecting ---
+
+/// An `analyze.Resolver` that connects to DB sources and reads their result-set
+/// schema (CSV is handled offline by the analyzer). `ctx` is a `*std.mem.Allocator`.
+pub fn connectingResolver(gpa_ptr: *std.mem.Allocator) analyze.Resolver {
+    return .{ .ctx = gpa_ptr, .resolveFn = resolveSchema, .splitFn = probeSplit };
+}
+
+const SqlConnInfo = struct { kind: SqlKind, dialect: sql.Dialect, port: u16 };
+
+fn sqlConnInfo(conn: ast.Connection) ?SqlConnInfo {
+    if (std.mem.eql(u8, conn.connector, "postgres")) return .{ .kind = .postgres, .dialect = .postgres, .port = 5432 };
+    if (std.mem.eql(u8, conn.connector, "mysql")) return .{ .kind = .mysql, .dialect = .mysql, .port = 3306 };
+    if (std.mem.eql(u8, conn.connector, "sqlserver")) return .{ .kind = .sqlserver, .dialect = .sqlserver, .port = 1433 };
+    return null;
+}
+
+fn resolveSchema(ctx_ptr: *anyopaque, arena: std.mem.Allocator, rd: ast.Read, conn_opt: ?ast.Connection) anyerror!?types.Schema {
+    const gpa = @as(*std.mem.Allocator, @ptrCast(@alignCast(ctx_ptr))).*;
+    const conn = conn_opt orelse return null;
+    const info = sqlConnInfo(conn) orelse return null;
+    const cfg = dbConfigOf(arena, conn, info.port) orelse return null;
+    const query = switch (rd.form) {
+        .query => |q| q,
+        .table => |t| try std.fmt.allocPrint(arena, "SELECT * FROM {s}", .{try qualStr(arena, t)}),
+        else => return null,
+    };
+    const c = connectSql(gpa, info.kind, cfg) catch return null;
+    var cur = c.queryCursor(query) catch {
+        c.close();
+        return null;
+    };
+    defer cur.close();
+    return try dupeSchema(arena, cur.schema());
+}
+
+/// `analyze.Resolver.splitFn`: introspect a table's PK + estimated size to report
+/// the real split decision (mirrors the runtime planner's gate).
+fn probeSplit(ctx_ptr: *anyopaque, arena: std.mem.Allocator, rd: ast.Read, conn_opt: ?ast.Connection) anyerror!?analyze.SplitProbe {
+    const gpa = @as(*std.mem.Allocator, @ptrCast(@alignCast(ctx_ptr))).*;
+    const conn = conn_opt orelse return null;
+    const table = switch (rd.form) {
+        .table => |t| try qualStr(arena, t),
+        else => return null, // query reads declare the key via @[split]; nothing to introspect
+    };
+    const info = sqlConnInfo(conn) orelse return null;
+    const cfg = dbConfigOf(arena, conn, info.port) orelse return null;
+    var pctx = SplitCtx{ .gpa = gpa, .kind = info.kind, .cfg = cfg, .base_sql = "" };
+    const prober = splitmod.Prober{ .ctx = &pctx, .openFn = proberOpen };
+    const key = (try splitmod.introspectKey(arena, prober, info.dialect, table)) orelse
+        return analyze.SplitProbe{ .key = "", .est_rows = 0, .will_split = false };
+    return .{ .key = key.key.col, .est_rows = key.est_rows, .will_split = key.est_rows >= splitmod.min_rows_to_split };
+}
+
+/// Resolve a connection's host/port/user/password/database (literals + env()/
+/// secret()), independent of the run `Env`. Returns null if `host` is missing.
+fn dbConfigOf(arena: std.mem.Allocator, conn: ast.Connection, default_port: u16) ?DbConfig {
+    var cfg = DbConfig{ .port = default_port };
+    for (conn.config) |attr| {
+        const v = cfgStr(arena, attr.value) orelse continue;
+        if (std.mem.eql(u8, attr.key, "host")) {
+            cfg.host = v;
+        } else if (std.mem.eql(u8, attr.key, "port")) {
+            cfg.port = std.fmt.parseInt(u16, v, 10) catch default_port;
+        } else if (std.mem.eql(u8, attr.key, "user")) {
+            cfg.user = v;
+        } else if (std.mem.eql(u8, attr.key, "password")) {
+            cfg.password = v;
+        } else if (std.mem.eql(u8, attr.key, "database")) {
+            cfg.database = v;
+        }
+    }
+    if (cfg.host.len == 0) return null;
+    return cfg;
+}
+
+fn cfgStr(arena: std.mem.Allocator, expr: *const ast.Expr) ?[]const u8 {
+    return switch (expr.*) {
+        .str_lit => |s| s,
+        .int_lit => |i| std.fmt.allocPrint(arena, "{d}", .{i}) catch null,
+        .call => |c| if ((std.mem.eql(u8, c.name, "env") or std.mem.eql(u8, c.name, "secret")) and c.args.len == 1 and c.args[0].* == .str_lit)
+            (std.process.getEnvVarOwned(arena, c.args[0].str_lit) catch null)
+        else
+            null,
+        else => null,
+    };
+}
+
+fn dupeSchema(arena: std.mem.Allocator, s: types.Schema) !types.Schema {
+    const fields = try arena.alloc(types.Schema.Field, s.fields.len);
+    for (s.fields, fields) |f, *o| o.* = .{ .name = try arena.dupe(u8, f.name), .ty = f.ty };
+    return .{ .fields = fields };
+}
+
 fn qualStr(arena: std.mem.Allocator, q: ast.QualName) ![]const u8 {
     if (q.parts.len == 1) return q.parts[0];
     return std.mem.join(arena, ".", q.parts);
@@ -415,25 +830,31 @@ fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         const cfg = try resolveDbConfig(env, conn, 3306);
         const c = mysql.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "mysql connect failed: {s}", .{@errorName(e)}));
-        const s = sql.Sink.open(env.gpa, c.sqlConn(), .mysql, w.target, schema, w.mode) catch |e|
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "mysql sink failed: {s}", .{@errorName(e)}));
-        return s.sink();
+        // append/overwrite → LOAD DATA LOCAL INFILE (bulk); upsert → INSERT.
+        return openBulkOrInsert(env.gpa, c, mysql.LoadDataSink, .mysql, w.target, schema, w.mode) catch |e| {
+            defer c.close();
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "mysql sink failed ({s}): {s}", .{ @errorName(e), c.last_error }));
+        };
     }
     if (std.mem.eql(u8, conn.connector, "sqlserver")) {
         const cfg = try resolveDbConfig(env, conn, 1433);
         const c = tds.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sqlserver connect failed: {s}", .{@errorName(e)}));
-        const s = sql.Sink.open(env.gpa, c.sqlConn(), .sqlserver, w.target, schema, w.mode) catch |e|
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sqlserver sink failed: {s}", .{@errorName(e)}));
-        return s.sink();
+        // append/overwrite → INSERT BULK; upsert → INSERT.
+        return openBulkOrInsert(env.gpa, c, tds.BulkSink, .sqlserver, w.target, schema, w.mode) catch |e| {
+            defer c.close();
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sqlserver sink failed ({s}): {s}", .{ @errorName(e), c.last_error }));
+        };
     }
     if (std.mem.eql(u8, conn.connector, "postgres")) {
         const cfg = try resolveDbConfig(env, conn, 5432);
         const c = postgres.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "postgres connect failed: {s}", .{@errorName(e)}));
-        const s = sql.Sink.open(env.gpa, c.sqlConn(), .postgres, w.target, schema, w.mode) catch |e|
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "postgres sink failed: {s}", .{@errorName(e)}));
-        return s.sink();
+        // append/overwrite → COPY FROM STDIN (bulk, fast); upsert → INSERT.
+        return openBulkOrInsert(env.gpa, c, postgres.CopySink, .postgres, w.target, schema, w.mode) catch |e| {
+            defer c.close();
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "postgres sink failed ({s}): {s}", .{ @errorName(e), c.last_error }));
+        };
     }
     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unsupported sink connector `{s}`", .{conn.connector}));
 }
@@ -555,36 +976,6 @@ fn constEvalDefault(expr: *const ast.Expr, diag: *Diag) !Value {
     };
 }
 
-/// Deep-copy `expr`, replacing single-name field refs that match a param with a
-/// literal of the param's value. No params => returns the original (no copy).
-fn substParams(env: *Env, expr: *ast.Expr) anyerror!*ast.Expr {
-    if (env.params.count() == 0) return expr;
-    return substExpr(env, expr);
-}
-
-fn substExpr(env: *Env, expr: *ast.Expr) anyerror!*ast.Expr {
-    const arena = env.arena;
-    switch (expr.*) {
-        .field => |q| {
-            if (q.parts.len == 1) {
-                if (env.params.get(q.parts[0])) |v| return try mkLit(arena, v);
-            }
-            return expr;
-        },
-        .unary => |u| return mk(arena, .{ .unary = .{ .op = u.op, .e = try substExpr(env, u.e) } }),
-        .binary => |b| return mk(arena, .{ .binary = .{ .op = b.op, .l = try substExpr(env, b.l), .r = try substExpr(env, b.r) } }),
-        .is_null => |n| return mk(arena, .{ .is_null = .{ .e = try substExpr(env, n.e), .negated = n.negated } }),
-        .cast => |c| return mk(arena, .{ .cast = .{ .e = try substExpr(env, c.e), .ty = c.ty } }),
-        .cond => |c| return mk(arena, .{ .cond = .{ .cond = try substExpr(env, c.cond), .then = try substExpr(env, c.then), .els = try substExpr(env, c.els) } }),
-        .call => |c| {
-            const args = try arena.alloc(*ast.Expr, c.args.len);
-            for (c.args, 0..) |a, i| args[i] = try substExpr(env, a);
-            return mk(arena, .{ .call = .{ .name = c.name, .args = args } });
-        },
-        else => return expr, // literals
-    }
-}
-
 fn mk(arena: std.mem.Allocator, e: ast.Expr) anyerror!*ast.Expr {
     const p = try arena.create(ast.Expr);
     p.* = e;
@@ -615,44 +1006,10 @@ fn planErr(diag: *Diag, msg: []const u8) error{PlanFailed} {
     return error.PlanFailed;
 }
 
-fn typeErr(e: eval.TypeError, diag: *Diag, msg: []const u8) error{ PlanFailed, OutOfMemory } {
-    if (e == error.OutOfMemory) return error.OutOfMemory;
-    setMsg(diag, msg);
-    return error.PlanFailed;
-}
-
-fn containsName(names: []const []const u8, n: []const u8) bool {
-    for (names) |x| {
-        if (std.mem.eql(u8, x, n)) return true;
-    }
-    return false;
-}
-
-fn lastp(q: ast.QualName) []const u8 {
-    return q.parts[q.parts.len - 1];
-}
-
 fn schemaPtr(arena: std.mem.Allocator, schema: types.Schema) !*types.Schema {
     const p = try arena.create(types.Schema);
     p.* = schema;
     return p;
-}
-
-fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const ast.Expr, schema: types.Schema, diag: *Diag) !types.Type {
-    switch (func) {
-        .count => return types.Type.init(.int),
-        else => {
-            const a = arg orelse return planErr(diag, "this aggregate requires an argument");
-            var ctx = eval.TypeCtx{ .schema = schema, .arena = arena };
-            const at = ctx.typeOf(a) catch |e| return typeErr(e, diag, ctx.msg);
-            return switch (func) {
-                .sum => if (at.kind == .float) types.Type.init(.float).withNull(true) else types.Type.init(.int).withNull(true),
-                .avg => types.Type.init(.float).withNull(true),
-                .min, .max => at.withNull(true),
-                .count => unreachable,
-            };
-        },
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -791,6 +1148,52 @@ test "explode splits a delimited column into rows" {
     defer alloc.free(out);
     // row 1 -> 3 rows; row 2 -> 1 row; row 3 (null) -> 0 rows
     try std.testing.expectEqualStrings("id,tag\n1,a\n1,b\n1,c\n2,x\n", out);
+}
+
+test "parallel driver matches serial output across many batches" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // ~5000 rows -> several 1024-row batches. CSV is non-splittable, so both the
+    // 1- and 4-thread runs execute serially (split-parallel needs a SQL source);
+    // this guards that requesting threads does not change or corrupt the output.
+    var in = std.ArrayList(u8).init(alloc);
+    defer in.deinit();
+    try in.appendSlice("id,amount\n");
+    var k: usize = 0;
+    while (k < 5000) : (k += 1) try in.writer().print("{d},{d}\n", .{ k, (k * 7) % 1000 });
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = in.items });
+
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
+    defer alloc.free(in_path);
+
+    const body = "  | filter cast(amount as int) >= 500\n  | select id, doubled = cast(amount as int) * 2";
+
+    var outputs: [2][]u8 = undefined;
+    for ([_]usize{ 1, 4 }, 0..) |nthreads, idx| {
+        const out_path = try std.fs.path.join(alloc, &.{ base, if (idx == 0) "s.csv" else "p.csv" });
+        defer alloc.free(out_path);
+        const script = try std.fmt.allocPrint(alloc, "@batch\nread csv \"{s}\"\n{s}\n  | write csv \"{s}\"", .{ in_path, body, out_path });
+        defer alloc.free(script);
+
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+
+        var rdiag: Diag = .{};
+        _ = try run(alloc, prog, .{ .threads = nthreads }, &rdiag);
+        outputs[idx] = try tmp.dir.readFileAlloc(alloc, if (idx == 0) "s.csv" else "p.csv", 1 << 20);
+    }
+    defer alloc.free(outputs[0]);
+    defer alloc.free(outputs[1]);
+
+    // Byte-identical: serial output is unchanged by the thread count.
+    try std.testing.expectEqualStrings(outputs[0], outputs[1]);
+    try std.testing.expect(std.mem.indexOf(u8, outputs[1], "id,doubled\n") != null);
 }
 
 test "let binding + inner join" {

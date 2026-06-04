@@ -1,23 +1,29 @@
 //! Minimal PostgreSQL v3 wire-protocol client: startup, auth (trust/cleartext/
-//! md5 for now — SCRAM added next), simple Query, and RowDescription/DataRow
-//! parsing into a batch. Values arrive in text format, so the shared
-//! `sql.coerceText` does the typing. Exposes the `sql.Conn` interface.
+//! md5/SCRAM-SHA-256), simple Query, and RowDescription/DataRow parsing into a
+//! batch. Values arrive in text format, so the shared `sql.coerceText` does the
+//! typing. Exposes the `sql.Conn` interface.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
+const ast = @import("../lang/ast.zig");
 const column = @import("../exec/column.zig");
-const valuemod = @import("../exec/value.zig");
 const batchmod = @import("../exec/batch.zig");
+const driver = @import("driver.zig");
 const sqlmod = @import("sql.zig");
 
-const Value = valuemod.Value;
 const Batch = batchmod.Batch;
 
 pub const Error = error{ PgProtocol, PgAuthFailed, PgQueryFailed, PgAuthUnsupported } || std.mem.Allocator.Error;
 
+/// Buffered socket reads: without this, every backend message costs two recv
+/// syscalls (5-byte header + body) — ~2 per row — which dominates read time and
+/// caps throughput. A 64 KB buffer turns that into one syscall per ~64 KB.
+const ReadBuf = std.io.BufferedReader(64 * 1024, std.net.Stream.Reader);
+
 pub const Conn = struct {
     gpa: std.mem.Allocator,
     stream: std.net.Stream,
+    reader: ReadBuf = undefined,
     payload: std.ArrayList(u8), // current message payload
     last_error: []const u8 = "",
     // streaming cursor state (valid between queryCursor and close)
@@ -30,6 +36,7 @@ pub const Conn = struct {
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
         const self = try gpa.create(Conn);
         self.* = .{ .gpa = gpa, .stream = stream, .payload = std.ArrayList(u8).init(gpa) };
+        self.reader = .{ .unbuffered_reader = self.stream.reader() };
         errdefer self.close();
         try self.startup(user, database);
         try self.authenticate(user, password);
@@ -37,6 +44,7 @@ pub const Conn = struct {
     }
 
     pub fn close(self: *Conn) void {
+        if (self.last_error.len > 0) self.gpa.free(self.last_error);
         self.payload.deinit();
         self.stream.close();
         self.gpa.destroy(self);
@@ -73,7 +81,7 @@ pub const Conn = struct {
             const p = self.payload.items;
             switch (t) {
                 'R' => { // Authentication
-                    const code = readI32(p, 0);
+                    const code = try readI32(p, 0);
                     switch (code) {
                         0 => {}, // AuthenticationOk
                         3 => try self.sendPassword(password), // cleartext
@@ -150,7 +158,7 @@ pub const Conn = struct {
         try self.writeMsg('p', init_msg.items);
 
         // server-first (R, code 11)
-        if ((try self.readMsg()) != 'R' or readI32(self.payload.items, 0) != 11) return error.PgAuthFailed;
+        if ((try self.readMsg()) != 'R' or (try readI32(self.payload.items, 0)) != 11) return error.PgAuthFailed;
         const server_first = try a.dupe(u8, self.payload.items[4..]);
         const sr = scramAttr(server_first, 'r') orelse return error.PgProtocol;
         const ss = scramAttr(server_first, 's') orelse return error.PgProtocol;
@@ -186,7 +194,7 @@ pub const Conn = struct {
             self.last_error = try self.gpa.dupe(u8, errMessage(self.payload.items));
             return error.PgAuthFailed;
         }
-        if (t != 'R' or readI32(self.payload.items, 0) != 12) return error.PgAuthFailed;
+        if (t != 'R' or (try readI32(self.payload.items, 0)) != 12) return error.PgAuthFailed;
     }
 
     // --- streaming query ---
@@ -195,8 +203,7 @@ pub const Conn = struct {
         self.meta_arena = std.heap.ArenaAllocator.init(self.gpa);
         self.openCursor(sql) catch |e| {
             self.meta_arena.deinit();
-            self.close();
-            return e;
+            return e; // leave conn open: the caller owns it (can read last_error) and closes it
         };
         return .{ .ptr = self, .vtable = &cursor_vtable };
     }
@@ -294,6 +301,44 @@ pub const Conn = struct {
         try self.writeMsg('Q', body.items);
     }
 
+    // --- COPY FROM STDIN (bulk load) ---
+
+    /// Send `COPY … FROM STDIN` and wait for the server's CopyInResponse ('G').
+    pub fn copyIn(self: *Conn, cmd: []const u8) !void {
+        try self.sendQuery(cmd);
+        while (true) {
+            switch (try self.readMsg()) {
+                'G' => return, // ready to receive CopyData
+                'E' => {
+                    self.last_error = try self.gpa.dupe(u8, errMessage(self.payload.items));
+                    return error.PgQueryFailed;
+                },
+                'Z' => return error.PgProtocol, // ReadyForQuery without 'G'
+                else => {},
+            }
+        }
+    }
+
+    /// Send one CopyData chunk ('d').
+    pub fn copyData(self: *Conn, data: []const u8) !void {
+        try self.writeMsg('d', data);
+    }
+
+    /// Send CopyDone ('c') and drain to ReadyForQuery, surfacing any error.
+    pub fn copyDone(self: *Conn) !void {
+        try self.writeMsg('c', "");
+        while (true) {
+            switch (try self.readMsg()) {
+                'E' => {
+                    self.last_error = try self.gpa.dupe(u8, errMessage(self.payload.items));
+                    return error.PgQueryFailed;
+                },
+                'Z' => return,
+                else => {}, // CommandComplete, etc.
+            }
+        }
+    }
+
     // --- message framing ---
 
     fn writeMsg(self: *Conn, msg_type: u8, body: []const u8) !void {
@@ -305,12 +350,13 @@ pub const Conn = struct {
     }
 
     fn readMsg(self: *Conn) !u8 {
+        const r = self.reader.reader();
         var hdr: [5]u8 = undefined;
-        try self.stream.reader().readNoEof(&hdr);
+        try r.readNoEof(&hdr);
         const len = std.mem.readInt(u32, hdr[1..5], .big);
         if (len < 4) return error.PgProtocol;
         try self.payload.resize(len - 4);
-        try self.stream.reader().readNoEof(self.payload.items);
+        try r.readNoEof(self.payload.items);
         return hdr[0];
     }
 };
@@ -351,7 +397,7 @@ const PgCol = struct { name: []const u8, oid: i32, engine_type: types.Type };
 const RowDesc = struct { cols: []PgCol, fields: []types.Schema.Field };
 
 fn parseRowDescription(arena: std.mem.Allocator, p: []const u8) !RowDesc {
-    const n: usize = @intCast(readI16(p, 0));
+    const n: usize = @intCast(try readI16(p, 0));
     var i: usize = 2;
     const cols = try arena.alloc(PgCol, n);
     const fields = try arena.alloc(types.Schema.Field, n);
@@ -359,10 +405,10 @@ fn parseRowDescription(arena: std.mem.Allocator, p: []const u8) !RowDesc {
         const name = readCStr(p, &i);
         i += 4; // table OID
         i += 2; // column attr number
-        const oid = readI32(p, i);
+        const oid = try readI32(p, i);
         i += 4;
         i += 2; // type size
-        const typmod = readI32(p, i);
+        const typmod = try readI32(p, i);
         i += 4;
         i += 2; // format code
         const ty = pgType(oid, typmod);
@@ -373,15 +419,16 @@ fn parseRowDescription(arena: std.mem.Allocator, p: []const u8) !RowDesc {
 }
 
 fn parseDataRow(arena: std.mem.Allocator, p: []const u8, cols: []const PgCol, builders: []column.Builder) !void {
-    const n: usize = @intCast(readI16(p, 0));
+    const n: usize = @intCast(try readI16(p, 0));
     var i: usize = 2;
     for (0..n) |k| {
-        const len = readI32(p, i);
+        const len = try readI32(p, i);
         i += 4;
         if (len < 0) {
             try builders[k].append(.null);
         } else {
             const ulen: usize = @intCast(len);
+            if (i + ulen > p.len) return error.PgProtocol;
             try builders[k].append(try sqlmod.coerceText(arena, p[i .. i + ulen], cols[k].engine_type));
             i += ulen;
         }
@@ -427,10 +474,12 @@ fn writeI32(w: anytype, v: u32) !void {
     try w.writeAll(&b);
 }
 
-fn readI16(p: []const u8, i: usize) i16 {
+fn readI16(p: []const u8, i: usize) !i16 {
+    if (i + 2 > p.len) return error.PgProtocol;
     return std.mem.readInt(i16, p[i..][0..2], .big);
 }
-fn readI32(p: []const u8, i: usize) i32 {
+fn readI32(p: []const u8, i: usize) !i32 {
+    if (i + 4 > p.len) return error.PgProtocol;
     return std.mem.readInt(i32, p[i..][0..4], .big);
 }
 fn readCStr(p: []const u8, i: *usize) []const u8 {
@@ -439,6 +488,84 @@ fn readCStr(p: []const u8, i: *usize) []const u8 {
     const s = p[start..i.*];
     i.* += 1; // skip null
     return s;
+}
+
+// ---------------------------------------------------------------------------
+// COPY-based bulk sink (append/overwrite). 10-100× faster than row INSERTs:
+// data streams to the server in CopyData chunks instead of per-batch statements.
+// Upsert isn't expressible in COPY — callers route upsert to the generic INSERT
+// sink (a COPY-to-staging + ON CONFLICT path is the follow-up).
+// ---------------------------------------------------------------------------
+
+const COPY_FLUSH_BYTES = 1 << 20; // ~1MB per CopyData chunk
+
+pub const CopySink = struct {
+    gpa: std.mem.Allocator,
+    conn: *Conn,
+    table: []const u8, // quoted, qualified
+    ncols: usize,
+    buffer: std.ArrayList(u8),
+
+    pub fn open(gpa: std.mem.Allocator, conn: *Conn, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode) !*CopySink {
+        // On error we free only what we allocate here; the caller keeps `conn`
+        // (so it can read conn.last_error) and closes it on failure.
+        const self = try gpa.create(CopySink);
+        errdefer gpa.destroy(self);
+        const qtable = try sqlmod.quoteIdent(gpa, .postgres, table_name);
+        errdefer gpa.free(qtable);
+        self.* = .{ .gpa = gpa, .conn = conn, .table = qtable, .ncols = schema.fields.len, .buffer = std.ArrayList(u8).init(gpa) };
+        errdefer self.buffer.deinit();
+
+        var aa = std.heap.ArenaAllocator.init(gpa);
+        defer aa.deinit();
+        const a = aa.allocator();
+        try conn.exec(try sqlmod.createTableSql(a, .postgres, qtable, schema, mode));
+        if (mode == .overwrite) try conn.exec(try std.fmt.allocPrint(a, "DELETE FROM {s}", .{qtable}));
+
+        // COPY <table> ("c1","c2",…) FROM STDIN  (default text format)
+        var cols = std.ArrayList(u8).init(a);
+        for (schema.fields, 0..) |f, i| {
+            if (i > 0) try cols.append(',');
+            try cols.appendSlice(try sqlmod.quoteIdent(a, .postgres, f.name));
+        }
+        try conn.copyIn(try std.fmt.allocPrint(a, "COPY {s} ({s}) FROM STDIN", .{ qtable, cols.items }));
+        return self;
+    }
+
+    pub fn sink(self: *CopySink) driver.Sink {
+        return .{ .ptr = self, .vtable = &copy_vtable };
+    }
+
+    fn writeBatch(self: *CopySink, arena: std.mem.Allocator, batch: Batch) !void {
+        try sqlmod.appendBulkText(self.buffer.writer(), arena, batch, .{}); // PG: bool t/f
+        if (self.buffer.items.len >= COPY_FLUSH_BYTES) try self.flush();
+    }
+
+    fn flush(self: *CopySink) !void {
+        if (self.buffer.items.len == 0) return;
+        try self.conn.copyData(self.buffer.items);
+        self.buffer.clearRetainingCapacity();
+    }
+
+    fn closeImpl(self: *CopySink) !void {
+        try self.flush();
+        try self.conn.copyDone();
+        self.conn.close();
+        self.buffer.deinit();
+        self.gpa.free(self.table);
+        self.gpa.destroy(self);
+    }
+};
+
+const copy_vtable = driver.Sink.VTable{ .writeBatch = copyWrite, .close = copyClose };
+
+fn copyWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
+    const self: *CopySink = @ptrCast(@alignCast(ptr));
+    return self.writeBatch(arena, b);
+}
+fn copyClose(ptr: *anyopaque) anyerror!void {
+    const self: *CopySink = @ptrCast(@alignCast(ptr));
+    return self.closeImpl();
 }
 
 fn errMessage(p: []const u8) []const u8 {

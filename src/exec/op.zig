@@ -15,6 +15,32 @@ const driver = @import("../connect/driver.zig");
 const Batch = batchmod.Batch;
 const Value = valuemod.Value;
 
+/// Captures context for a runtime expression error (which stage/column), turning
+/// a bare `CastFailed` into something actionable. Inline buffer so it outlives the
+/// per-batch arena; mutex + first-wins so concurrent lanes report deterministically.
+pub const ErrCtx = struct {
+    buf: [256]u8 = undefined,
+    msg: []const u8 = "",
+    mutex: std.Thread.Mutex = .{},
+
+    pub fn set(self: *ErrCtx, comptime fmt: []const u8, args: anytype) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.msg.len > 0) return; // first error wins
+        self.msg = std.fmt.bufPrint(&self.buf, fmt, args) catch return;
+    }
+};
+
+/// Human label for an evaluation error.
+pub fn errLabel(e: anyerror) []const u8 {
+    return switch (e) {
+        error.CastFailed => "cast failed",
+        error.DivByZero => "division by zero",
+        error.TypeMismatch => "type mismatch",
+        else => @errorName(e),
+    };
+}
+
 pub const Op = union(enum) {
     scan: *Scan,
     filter: *Filter,
@@ -41,6 +67,56 @@ pub const Op = union(enum) {
     }
 };
 
+/// A stateless per-batch transform (it does NOT pull from a child) — the building
+/// block of a parallelizable "map" pipeline. Only filter/project/explode qualify;
+/// breakers and limit are order/state sensitive and stay on the serial driver.
+pub const Stage = union(enum) {
+    filter: *Filter,
+    project: *Project,
+    explode: *Explode,
+
+    pub fn apply(self: Stage, arena: std.mem.Allocator, b: Batch) anyerror!Batch {
+        return switch (self) {
+            .filter => |f| f.transform(arena, b),
+            .project => |p| p.transform(arena, b),
+            .explode => |e| e.transform(arena, b),
+        };
+    }
+};
+
+pub const Linear = struct { src: driver.Source, stages: []const Stage };
+
+/// If `top` is a map-only pipeline (scan → filter/project/explode chain, no
+/// breakers or limit), decompose it into a source + ordered stage list the
+/// parallel driver can fan out across threads. Returns null otherwise.
+pub fn linearize(arena: std.mem.Allocator, top: Op) !?Linear {
+    var rev = std.ArrayList(Stage).init(arena);
+    var cur = top;
+    while (true) {
+        switch (cur) {
+            .scan => |s| {
+                const stages = try arena.alloc(Stage, rev.items.len);
+                // rev is in sink→source order; reverse into source→sink order.
+                for (rev.items, 0..) |st, i| stages[rev.items.len - 1 - i] = st;
+                return Linear{ .src = s.src, .stages = stages };
+            },
+            .filter => |f| {
+                try rev.append(.{ .filter = f });
+                cur = f.child;
+            },
+            .project => |p| {
+                try rev.append(.{ .project = p });
+                cur = p.child;
+            },
+            .explode => |e| {
+                try rev.append(.{ .explode = e });
+                cur = e.child;
+            },
+            else => return null,
+        }
+    }
+}
+
 /// Streaming 1→N: split a delimited string column, emitting one row per element
 /// (other columns repeated). Null/missing cells produce zero rows.
 pub const Explode = struct {
@@ -55,6 +131,11 @@ pub const Explode = struct {
             if (out.len > 0) return out;
         }
         return null;
+    }
+
+    /// Stateless transform of one input batch (for the parallel driver).
+    pub fn transform(self: *Explode, arena: std.mem.Allocator, b: Batch) anyerror!Batch {
+        return self.explodeBatch(arena, b);
     }
 
     fn explodeBatch(self: *Explode, arena: std.mem.Allocator, b: Batch) anyerror!Batch {
@@ -101,13 +182,22 @@ pub const Scan = struct {
 pub const Filter = struct {
     child: Op,
     pred: *const ast.Expr,
+    err: ?*ErrCtx = null,
 
     pub fn next(self: *Filter, arena: std.mem.Allocator) anyerror!?Batch {
         while (try self.child.next(arena)) |b| {
-            const out = try applyFilter(arena, b, self.pred);
+            const out = try self.transform(arena, b);
             if (out.len > 0) return out;
         }
         return null;
+    }
+
+    /// Stateless transform of one input batch (for the parallel driver).
+    pub fn transform(self: *Filter, arena: std.mem.Allocator, b: Batch) anyerror!Batch {
+        return applyFilter(arena, b, self.pred) catch |e| {
+            if (self.err) |ec| ec.set("{s}: in filter predicate", .{errLabel(e)});
+            return e;
+        };
     }
 };
 
@@ -115,6 +205,7 @@ pub const Project = struct {
     child: Op,
     cols: []const Col,
     out_schema: *const types.Schema,
+    err: ?*ErrCtx = null,
 
     /// A projected output column: either a passthrough of an input column index,
     /// or a computed expression with its resolved output type.
@@ -125,11 +216,19 @@ pub const Project = struct {
 
     pub fn next(self: *Project, arena: std.mem.Allocator) anyerror!?Batch {
         const b = (try self.child.next(arena)) orelse return null;
+        return try self.transform(arena, b);
+    }
+
+    /// Stateless transform of one input batch (for the parallel driver).
+    pub fn transform(self: *Project, arena: std.mem.Allocator, b: Batch) anyerror!Batch {
         const outcols = try arena.alloc(column.Column, self.cols.len);
         for (self.cols, 0..) |c, i| {
             outcols[i] = switch (c.source) {
                 .passthrough => |idx| b.columns[idx],
-                .expr => |e| try eval.evalColumn(arena, e, b, c.ty),
+                .expr => |e| eval.evalColumn(arena, e, b, c.ty) catch |err| {
+                    if (self.err) |ec| ec.set("{s}: computing column `{s}` in select", .{ errLabel(err), self.out_schema.fields[i].name });
+                    return err;
+                },
             };
         }
         return Batch{ .schema = self.out_schema, .columns = outcols, .len = b.len };
@@ -167,23 +266,27 @@ pub const Limit = struct {
 // --- helpers ---
 
 fn applyFilter(arena: std.mem.Allocator, b: Batch, pred: *const ast.Expr) anyerror!Batch {
-    const keep = try arena.alloc(bool, b.len);
+    // The predicate evaluates to a bool column through the vectorized kernels
+    // (falling back to row-at-a-time internally for unsupported nodes); a null
+    // result drops the row (3VL: only a known-true keeps it).
+    const mask = try eval.evalColumn(arena, pred, b, types.Type.init(.bool));
+    // Reuse the mask's own bool storage as the keep array (it's a fresh arena
+    // column we own), folding nulls in (3VL: a null result drops the row). Avoids
+    // a second n-sized buffer; the no-null case skips the per-row validity AND.
+    const keep = mask.data.b;
     var kept: usize = 0;
-    var i: usize = 0;
-    while (i < b.len) : (i += 1) {
-        const v = try eval.evalRow(arena, pred, b, i);
-        keep[i] = (v == .bool and v.bool); // 3VL: null and false both drop
-        if (keep[i]) kept += 1;
+    if (mask.validity.allSet(b.len)) {
+        for (keep) |k| {
+            if (k) kept += 1;
+        }
+    } else {
+        for (keep, 0..) |*k, i| {
+            if (!mask.validity.get(i)) k.* = false;
+            if (k.*) kept += 1;
+        }
     }
     const outcols = try arena.alloc(column.Column, b.columns.len);
-    for (b.columns, 0..) |*col, ci| {
-        var bld = column.Builder.init(arena, col.ty);
-        var r: usize = 0;
-        while (r < b.len) : (r += 1) {
-            if (keep[r]) try bld.append(col.getValue(r));
-        }
-        outcols[ci] = try bld.finish();
-    }
+    for (b.columns, 0..) |*col, ci| outcols[ci] = try column.gather(arena, col.*, keep, kept);
     return Batch{ .schema = b.schema, .columns = outcols, .len = kept };
 }
 
@@ -228,14 +331,7 @@ fn materializeAll(arena: std.mem.Allocator, child: Op, schema: *const types.Sche
 /// Build a batch selecting the rows where `keep[r]` is true.
 fn gather(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usize) anyerror!Batch {
     const outcols = try arena.alloc(column.Column, b.columns.len);
-    for (b.columns, 0..) |*col, ci| {
-        var bld = column.Builder.init(arena, col.ty);
-        var r: usize = 0;
-        while (r < b.len) : (r += 1) {
-            if (keep[r]) try bld.append(col.getValue(r));
-        }
-        outcols[ci] = try bld.finish();
-    }
+    for (b.columns, 0..) |*col, ci| outcols[ci] = try column.gather(arena, col.*, keep, kept);
     return Batch{ .schema = b.schema, .columns = outcols, .len = kept };
 }
 
@@ -350,6 +446,7 @@ pub const Aggregate = struct {
     by: []const usize,
     aggs: []const Agg,
     out_schema: *const types.Schema,
+    err: ?*ErrCtx = null,
     done: bool = false,
 
     pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Type };
@@ -389,7 +486,10 @@ pub const Aggregate = struct {
             const g = &groups.items[gop.value_ptr.*];
             for (self.aggs, 0..) |agg, j| {
                 var v: Value = .null;
-                if (agg.arg) |e| v = try eval.evalRow(arena, e, all, r);
+                if (agg.arg) |e| v = eval.evalRow(arena, e, all, r) catch |err| {
+                    if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
+                    return err;
+                };
                 updateAcc(&g.accs[j], agg, v, agg.arg != null);
             }
         }

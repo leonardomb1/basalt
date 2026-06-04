@@ -9,24 +9,33 @@ const std = @import("std");
 const sr = @import("starrocks.zig");
 const sqlmod = @import("sql.zig");
 const types = @import("../lang/types.zig");
+const ast = @import("../lang/ast.zig");
 const column = @import("../exec/column.zig");
 const valuemod = @import("../exec/value.zig");
 const batchmod = @import("../exec/batch.zig");
+const driver = @import("driver.zig");
 
 const Value = valuemod.Value;
 const Batch = batchmod.Batch;
 
 const CLIENT_LONG_PASSWORD = 0x00000001;
 const CLIENT_CONNECT_WITH_DB = 0x00000008;
+const CLIENT_LOCAL_FILES = 0x00000080; // enables LOAD DATA LOCAL INFILE
 const CLIENT_PROTOCOL_41 = 0x00000200;
 const CLIENT_SECURE_CONNECTION = 0x00008000;
 const CLIENT_PLUGIN_AUTH = 0x00080000;
 
 pub const Error = error{ MysqlAuthFailed, MysqlQueryFailed, MysqlProtocol } || std.mem.Allocator.Error;
 
+/// Buffered socket reads: each result row is its own MySQL packet, so without
+/// buffering every row costs two recv syscalls (4-byte header + body). A 64 KB
+/// buffer collapses that to one syscall per ~64 KB — the dominant read-time win.
+const ReadBuf = std.io.BufferedReader(64 * 1024, std.net.Stream.Reader);
+
 pub const Conn = struct {
     gpa: std.mem.Allocator,
     stream: std.net.Stream,
+    reader: ReadBuf = undefined,
     buf: std.ArrayList(u8),
     last_error: []const u8 = "",
     // streaming cursor state (valid between queryCursor and close)
@@ -34,11 +43,13 @@ pub const Conn = struct {
     cols: []MyCol = &.{},
     cur_schema: *types.Schema = undefined,
     done: bool = false,
+    ld_seq: u8 = 0, // packet sequence during a LOAD DATA exchange
 
     pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8) !*Conn {
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
         const self = try gpa.create(Conn);
         self.* = .{ .gpa = gpa, .stream = stream, .buf = std.ArrayList(u8).init(gpa) };
+        self.reader = .{ .unbuffered_reader = self.stream.reader() };
         errdefer self.close();
 
         // 1. server handshake
@@ -91,7 +102,48 @@ pub const Conn = struct {
         // 0x00 (OK) or a result-set header — DDL yields OK; accept anything non-ERR.
     }
 
+    // --- LOAD DATA LOCAL INFILE (bulk load) ---
+
+    /// Send the `LOAD DATA LOCAL INFILE …` query and wait for the server's local
+    /// infile request (a packet whose first byte is 0xFB). Data then streams via
+    /// `loadDataChunk`; `loadDataEnd` finishes it.
+    pub fn loadDataStart(self: *Conn, cmd: []const u8) !void {
+        const payload = try self.gpa.alloc(u8, cmd.len + 1);
+        defer self.gpa.free(payload);
+        payload[0] = 0x03; // COM_QUERY
+        @memcpy(payload[1..], cmd);
+        try self.writePacket(0, payload);
+
+        const rseq = try self.readPacket();
+        const p = self.buf.items;
+        if (p.len > 0 and p[0] == 0xff) {
+            self.last_error = try self.gpa.dupe(u8, errMessage(p));
+            return error.MysqlQueryFailed;
+        }
+        if (p.len == 0 or p[0] != 0xfb) return error.MysqlProtocol; // expected local-infile request
+        self.ld_seq = rseq +% 1;
+    }
+
+    /// One data packet (must be < 16MB; the sink flushes well under that).
+    pub fn loadDataChunk(self: *Conn, data: []const u8) !void {
+        if (data.len == 0) return;
+        try self.writePacket(self.ld_seq, data);
+        self.ld_seq +%= 1;
+    }
+
+    /// Empty packet = end of data; then read the server's OK/ERR.
+    pub fn loadDataEnd(self: *Conn) !void {
+        try self.writePacket(self.ld_seq, "");
+        _ = try self.readPacket();
+        const p = self.buf.items;
+        if (p.len > 0 and p[0] == 0xff) {
+            self.last_error = try self.gpa.dupe(u8, errMessage(p));
+            return error.MysqlQueryFailed;
+        }
+    }
+
     pub fn close(self: *Conn) void {
+        if (self.last_error.len > 0) self.gpa.free(self.last_error);
         self.buf.deinit();
         self.stream.close();
         self.gpa.destroy(self);
@@ -106,8 +158,7 @@ pub const Conn = struct {
         self.meta_arena = std.heap.ArenaAllocator.init(self.gpa);
         self.openCursor(sql) catch |e| {
             self.meta_arena.deinit();
-            self.close();
-            return e;
+            return e; // leave conn open: the caller owns it (can read last_error) and closes it
         };
         return .{ .ptr = self, .vtable = &cursor_vtable };
     }
@@ -137,7 +188,7 @@ pub const Conn = struct {
         }
 
         var ci: usize = 0;
-        const ncol: usize = @intCast(lenencInt(first, &ci));
+        const ncol: usize = @intCast(try lenencInt(first, &ci));
         self.cols = try ma.alloc(MyCol, ncol);
         for (0..ncol) |k| {
             _ = try self.readPacket();
@@ -170,7 +221,7 @@ pub const Conn = struct {
             }
             var ri: usize = 0;
             for (self.cols, 0..) |c, k| {
-                const text = lenencStrOrNull(r, &ri);
+                const text = try lenencStrOrNull(r, &ri);
                 try builders[k].append(try sqlmod.coerceText(arena, text, c.engine_type));
             }
             n += 1;
@@ -189,11 +240,12 @@ pub const Conn = struct {
     // --- packet framing ---
 
     fn readPacket(self: *Conn) !u8 {
+        const r = self.reader.reader();
         var header: [4]u8 = undefined;
-        try self.stream.reader().readNoEof(&header);
+        try r.readNoEof(&header);
         const len: usize = @as(usize, header[0]) | (@as(usize, header[1]) << 8) | (@as(usize, header[2]) << 16);
         try self.buf.resize(len);
-        try self.stream.reader().readNoEof(self.buf.items[0..len]);
+        try r.readNoEof(self.buf.items[0..len]);
         return header[3];
     }
 
@@ -231,7 +283,7 @@ pub const Conn = struct {
     }
 
     fn writeHandshakeResponse(self: *Conn, seq: u8, user: []const u8, password: []const u8, database: []const u8, salt: [20]u8) !void {
-        var caps: u32 = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH | CLIENT_LONG_PASSWORD;
+        var caps: u32 = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH | CLIENT_LONG_PASSWORD | CLIENT_LOCAL_FILES;
         if (database.len > 0) caps |= CLIENT_CONNECT_WITH_DB;
 
         var out = std.ArrayList(u8).init(self.gpa);
@@ -273,6 +325,79 @@ fn parseAuthSwitch(p: []const u8) [20]u8 {
     const n = @min(@as(usize, 20), p.len -| i);
     if (n > 0) @memcpy(salt[0..n], p[i .. i + n]);
     return salt;
+}
+
+// ---------------------------------------------------------------------------
+// LOAD DATA LOCAL INFILE bulk sink (append/overwrite). Streams the same tab-
+// separated text COPY uses (MySQL LOAD DATA defaults: TERMINATED BY '\t', ESCAPED
+// BY '\\', LINES BY '\n', NULL = \N). Requires server `local_infile=ON`. Upsert
+// routes to the INSERT sink. (Bool literal is 1/0 for MySQL, not t/f.)
+// ---------------------------------------------------------------------------
+
+const LD_FLUSH_BYTES = 1 << 20; // ~1MB per data packet (well under MySQL's 16MB cap)
+
+pub const LoadDataSink = struct {
+    gpa: std.mem.Allocator,
+    conn: *Conn,
+    buffer: std.ArrayList(u8),
+
+    pub fn open(gpa: std.mem.Allocator, conn: *Conn, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode) !*LoadDataSink {
+        // On error we free only what we allocate here; the caller keeps `conn`
+        // (so it can read conn.last_error) and closes it on failure.
+        const self = try gpa.create(LoadDataSink);
+        errdefer gpa.destroy(self);
+        self.* = .{ .gpa = gpa, .conn = conn, .buffer = std.ArrayList(u8).init(gpa) };
+        errdefer self.buffer.deinit();
+
+        var aa = std.heap.ArenaAllocator.init(gpa);
+        defer aa.deinit();
+        const a = aa.allocator();
+        const qtable = try sqlmod.quoteIdent(a, .mysql, table_name);
+        try conn.exec(try sqlmod.createTableSql(a, .mysql, qtable, schema, mode));
+        if (mode == .overwrite) try conn.exec(try std.fmt.allocPrint(a, "DELETE FROM {s}", .{qtable}));
+
+        var cols = std.ArrayList(u8).init(a);
+        for (schema.fields, 0..) |f, i| {
+            if (i > 0) try cols.append(',');
+            try cols.appendSlice(try sqlmod.quoteIdent(a, .mysql, f.name));
+        }
+        try conn.loadDataStart(try std.fmt.allocPrint(a, "LOAD DATA LOCAL INFILE 'pipe' INTO TABLE {s} ({s})", .{ qtable, cols.items }));
+        return self;
+    }
+
+    pub fn sink(self: *LoadDataSink) driver.Sink {
+        return .{ .ptr = self, .vtable = &ld_vtable };
+    }
+
+    fn writeBatch(self: *LoadDataSink, arena: std.mem.Allocator, batch: Batch) !void {
+        try sqlmod.appendBulkText(self.buffer.writer(), arena, batch, .{ .bool_true = "1", .bool_false = "0" });
+        if (self.buffer.items.len >= LD_FLUSH_BYTES) try self.flush();
+    }
+
+    fn flush(self: *LoadDataSink) !void {
+        if (self.buffer.items.len == 0) return;
+        try self.conn.loadDataChunk(self.buffer.items);
+        self.buffer.clearRetainingCapacity();
+    }
+
+    fn closeImpl(self: *LoadDataSink) !void {
+        try self.flush();
+        try self.conn.loadDataEnd();
+        self.conn.close();
+        self.buffer.deinit();
+        self.gpa.destroy(self);
+    }
+};
+
+const ld_vtable = driver.Sink.VTable{ .writeBatch = ldWrite, .close = ldClose };
+
+fn ldWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
+    const self: *LoadDataSink = @ptrCast(@alignCast(ptr));
+    return self.writeBatch(arena, b);
+}
+fn ldClose(ptr: *anyopaque) anyerror!void {
+    const self: *LoadDataSink = @ptrCast(@alignCast(ptr));
+    return self.closeImpl();
 }
 
 fn errMessage(p: []const u8) []const u8 {
@@ -325,13 +450,14 @@ const MyCol = struct {
 
 fn parseColDef(arena: std.mem.Allocator, p: []const u8) !MyCol {
     var i: usize = 0;
-    _ = lenencStr(p, &i); // catalog
-    _ = lenencStr(p, &i); // schema
-    _ = lenencStr(p, &i); // table
-    _ = lenencStr(p, &i); // org_table
-    const name = lenencStr(p, &i);
-    _ = lenencStr(p, &i); // org_name
-    _ = lenencInt(p, &i); // length of fixed fields (0x0c)
+    _ = try lenencStr(p, &i); // catalog
+    _ = try lenencStr(p, &i); // schema
+    _ = try lenencStr(p, &i); // table
+    _ = try lenencStr(p, &i); // org_table
+    const name = try lenencStr(p, &i);
+    _ = try lenencStr(p, &i); // org_name
+    _ = try lenencInt(p, &i); // length of fixed fields (0x0c)
+    if (i + 10 > p.len) return error.MysqlProtocol; // charset(2)+collen(4)+type(1)+flags(2)+decimals(1)
     i += 2; // charset
     i += 4; // column length
     const mtype = p[i];
@@ -353,37 +479,32 @@ fn engineTypeFor(mtype: u8, decimals: u8) types.Type {
     }).asNullable();
 }
 
-fn lenencInt(buf: []const u8, i: *usize) u64 {
+fn lenencInt(buf: []const u8, i: *usize) !u64 {
+    if (i.* >= buf.len) return error.MysqlProtocol;
     const b = buf[i.*];
     i.* += 1;
     if (b < 0xfb) return b;
-    if (b == 0xfc) {
-        const v = @as(u64, buf[i.*]) | (@as(u64, buf[i.* + 1]) << 8);
-        i.* += 2;
-        return v;
-    }
-    if (b == 0xfd) {
-        const v = @as(u64, buf[i.*]) | (@as(u64, buf[i.* + 1]) << 8) | (@as(u64, buf[i.* + 2]) << 16);
-        i.* += 3;
-        return v;
-    }
+    const nbytes: usize = if (b == 0xfc) 2 else if (b == 0xfd) 3 else 8;
+    if (i.* + nbytes > buf.len) return error.MysqlProtocol;
     var v: u64 = 0;
-    for (0..8) |k| v |= @as(u64, buf[i.* + k]) << @intCast(k * 8);
-    i.* += 8;
+    for (0..nbytes) |k| v |= @as(u64, buf[i.* + k]) << @intCast(k * 8);
+    i.* += nbytes;
     return v;
 }
 
-fn lenencStr(buf: []const u8, i: *usize) []const u8 {
-    const n: usize = @intCast(lenencInt(buf, i));
+fn lenencStr(buf: []const u8, i: *usize) ![]const u8 {
+    const n: usize = @intCast(try lenencInt(buf, i));
+    if (i.* + n > buf.len) return error.MysqlProtocol;
     const s = buf[i.* .. i.* + n];
     i.* += n;
     return s;
 }
 
-fn lenencStrOrNull(buf: []const u8, i: *usize) ?[]const u8 {
+fn lenencStrOrNull(buf: []const u8, i: *usize) !?[]const u8 {
+    if (i.* >= buf.len) return error.MysqlProtocol;
     if (buf[i.*] == 0xfb) {
         i.* += 1;
         return null;
     }
-    return lenencStr(buf, i);
+    return try lenencStr(buf, i);
 }

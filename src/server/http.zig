@@ -53,7 +53,9 @@ fn handleConn(gpa: std.mem.Allocator, program: ast.Program, conn: std.net.Server
         try parseQuery(&params, query);
 
         var diag: runtime.Diag = .{};
-        const result = runtime.run(gpa, program, .{ .params = params.items, .request_body = body }, &diag);
+        // Each request logs a completion line to stderr (NDJSON in a container); the
+        // HTTP response body is a small ad-hoc status JSON ({status, rows}) built below.
+        const result = runtime.run(gpa, program, .{ .params = params.items, .request_body = body, .log = .{ .summary = .stderr } }, &diag);
 
         if (result) |stats| {
             const resp = try std.fmt.allocPrint(gpa, "{{\"status\":\"ok\",\"rows\":{d}}}\n", .{stats.rows_out});

@@ -8,6 +8,8 @@ const std = @import("std");
 const parser = @import("../lang/parser.zig");
 const ast = @import("../lang/ast.zig");
 const runtime = @import("../runtime/run.zig");
+const obs = @import("../runtime/obs.zig");
+const analyze = @import("../runtime/analyze.zig");
 const server = @import("../server/http.zig");
 
 pub fn run(alloc: std.mem.Allocator) !void {
@@ -64,11 +66,36 @@ fn parseFile(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8) !?ast.P
 fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    const prog = (try parseFile(arena.allocator(), "check", args)) orelse return 1;
-    try std.io.getStdOut().writer().print(
-        "ok: {s} parsed ({d} statements)\n",
-        .{ args[2], prog.stmts.len },
-    );
+    const a = arena.allocator();
+    const prog = (try parseFile(a, "check", args)) orelse return 1;
+
+    var show_plan = false;
+    var connect = false;
+    for (args[3..]) |arg| {
+        if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--show-plan")) show_plan = true;
+        if (std.mem.eql(u8, arg, "--connect")) connect = true;
+    }
+
+    // Offline: structure + reference + param validation, plus type-flow where the
+    // schema is local (CSV). `--connect` also reaches DB sources to resolve their
+    // schemas and type-check the full pipeline.
+    var galloc = alloc;
+    const resolver: ?analyze.Resolver = if (connect) runtime.connectingResolver(&galloc) else null;
+    var adiag = analyze.Diag{};
+    const plan = analyze.analyze(a, prog, resolver, &adiag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.AnalyzeFailed => {
+            try std.io.getStdErr().writer().print("{s}: error: {s}\n", .{ args[2], adiag.msg });
+            return 1;
+        },
+    };
+
+    const stdout = std.io.getStdOut().writer();
+    if (show_plan) {
+        try analyze.render(plan, stdout);
+    } else {
+        try stdout.print("ok: {s} checks out\n", .{args[2]});
+    }
     return 0;
 }
 
@@ -83,10 +110,47 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var params = std.ArrayList(runtime.ParamArg).init(alloc);
     defer params.deinit();
     var port: u16 = 8080;
+    // Default to the core count, but threads are only *used* when the source is
+    // splittable (a SQL table with a discoverable key, or a query with @[split]);
+    // non-splittable sources (CSV, request) run serial regardless, so this never
+    // regresses the local single-stream case.
+    var threads: usize = std.Thread.getCpuCount() catch 1;
+    var log = runtime.LogConfig{};
+    var json_summary = false;
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "-p") or std.mem.eql(u8, a, "--param")) {
+        if (threadFlagValue(a, args, &i)) |tv| {
+            threads = std.fmt.parseInt(usize, tv, 10) catch {
+                try stderr.print("error: invalid --threads `{s}`\n", .{tv});
+                return 2;
+            };
+            if (threads == 0) threads = 1;
+        } else if (std.mem.eql(u8, a, "--json")) {
+            json_summary = true;
+        } else if (std.mem.eql(u8, a, "--quiet") or std.mem.eql(u8, a, "-q")) {
+            log.quiet = true;
+        } else if (std.mem.eql(u8, a, "--log-format")) {
+            i += 1;
+            if (i >= args.len) {
+                try stderr.print("error: missing value after `--log-format`\n", .{});
+                return 2;
+            }
+            log.format = if (std.mem.eql(u8, args[i], "text")) .text else if (std.mem.eql(u8, args[i], "json")) .json else if (std.mem.eql(u8, args[i], "auto")) .auto else {
+                try stderr.print("error: --log-format must be auto|text|json\n", .{});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, a, "--log-level")) {
+            i += 1;
+            if (i >= args.len) {
+                try stderr.print("error: missing value after `--log-level`\n", .{});
+                return 2;
+            }
+            log.level = obs.Level.parse(args[i]) orelse {
+                try stderr.print("error: --log-level must be error|warn|info|debug\n", .{});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, a, "-p") or std.mem.eql(u8, a, "--param")) {
             i += 1;
             if (i >= args.len) {
                 try stderr.print("error: missing value after `{s}`\n", .{a});
@@ -120,20 +184,42 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         return 0;
     }
 
+    // The summary is the run's result: --json emits it to stdout, otherwise it's
+    // rendered on stderr (text on a TTY, NDJSON when piped). run() owns rendering.
+    log.summary = if (json_summary) .json_stdout else .stderr;
+
     var diag: runtime.Diag = .{};
-    const stats = runtime.run(alloc, prog, .{ .params = params.items }, &diag) catch |e| switch (e) {
+    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .log = log }, &diag) catch |e| switch (e) {
         error.PlanFailed => {
             try stderr.print("{s}: error: {s}\n", .{ args[2], diag.msg });
             return 1;
         },
         error.OutOfMemory => return e,
         else => {
-            try stderr.print("{s}: runtime error: {s}\n", .{ args[2], @errorName(e) });
+            // run() fills diag.msg with stage/column context for expression errors.
+            if (diag.msg.len > 0)
+                try stderr.print("{s}: error: {s}\n", .{ args[2], diag.msg })
+            else
+                try stderr.print("{s}: runtime error: {s}\n", .{ args[2], @errorName(e) });
             return 1;
         },
     };
-    try std.io.getStdOut().writer().print("ok: {s} wrote {d} rows\n", .{ args[2], stats.rows_out });
     return 0;
+}
+
+/// Recognize the threads flag in all of `-j N`, `-jN`, `--threads N`,
+/// `--threads=N`, returning the value string (advancing `i` past a separate arg).
+fn threadFlagValue(a: []const u8, args: [][:0]u8, i: *usize) ?[]const u8 {
+    if (std.mem.eql(u8, a, "-j") or std.mem.eql(u8, a, "--threads")) {
+        if (i.* + 1 < args.len) {
+            i.* += 1;
+            return args[i.*];
+        }
+        return "";
+    }
+    if (std.mem.startsWith(u8, a, "-j")) return a[2..];
+    if (std.mem.startsWith(u8, a, "--threads=")) return a["--threads=".len..];
+    return null;
 }
 
 fn usage(w: anytype) !void {
@@ -141,8 +227,14 @@ fn usage(w: anytype) !void {
         \\pipeline — a DSL-driven data pipeline engine
         \\
         \\usage:
-        \\  pipeline run   <script> [-p key=value ...] [--port N]   run a pipeline (mode from @kind)
-        \\  pipeline check <script>                                 parse + type-check, no execution
+        \\  pipeline run   <script> [-p key=value ...] [-j N] [--port N]   run a pipeline (mode from @kind)
+        \\  pipeline check <script> [-s|--show-plan] [--connect]         validate; -s prints the plan, --connect resolves DB schemas
+        \\
+        \\  -j, --threads N    lanes for splittable SQL sources (default: CPU count; non-split sources are serial)
+        \\  --json             emit the run summary as JSON on stdout (machine output)
+        \\  --log-format FMT   auto|text|json — logs to stderr (default auto: text on a TTY, NDJSON when piped)
+        \\  --log-level LVL    error|warn|info|debug (default info)
+        \\  -q, --quiet        suppress info/warn logs (the run summary still prints)
         \\  pipeline help                                           show this help
         \\
     );
