@@ -30,7 +30,41 @@ const Value = valuemod.Value;
 pub const Diag = struct {
     buf: [512]u8 = undefined,
     msg: []const u8 = "",
+    /// Set when the failure looks transient (network/connection) so the control
+    /// plane can retry; left false for permanent failures (bad SQL, schema, auth,
+    /// rejected data) where a retry would just fail the same way.
+    retryable: bool = false,
 };
+
+// --- cooperative cancellation (SIGTERM/SIGINT from the control plane) ---
+var g_abort = std.atomic.Value(bool).init(false);
+
+/// Ask the current run to stop at the next batch/item boundary. A single atomic
+/// store, so it is async-signal-safe — safe to call from a signal handler.
+pub fn requestAbort() void {
+    g_abort.store(true, .seq_cst);
+}
+pub fn aborting() bool {
+    return g_abort.load(.seq_cst);
+}
+
+/// A failure worth retrying: connection/network-level, not a config or data error.
+/// Host resolution (`UnknownHostName`) is treated as permanent — usually a typo.
+pub fn isTransient(e: anyerror) bool {
+    return switch (e) {
+        error.ConnectionRefused,
+        error.ConnectionTimedOut,
+        error.ConnectionResetByPeer,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.BrokenPipe,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        error.HostLacksNetworkAddresses,
+        => true,
+        else => false,
+    };
+}
 pub const Stats = struct {
     rows_out: usize = 0, // rows written (kept name for the HTTP response)
     rows_read: usize = 0,
@@ -56,6 +90,47 @@ pub const LogConfig = struct {
 
 /// Inputs to a run: params (from CLI flags or an HTTP request's query string) and
 /// an optional request body that `read request` consumes.
+/// The result of one for-each item (one table in a fan-out batch), so the control
+/// plane can retry just the failures rather than the whole batch.
+pub const ItemOutcome = struct {
+    item: []const u8,
+    ok: bool,
+    err: []const u8 = "",
+    retryable: bool = false,
+};
+
+/// A thread-safe collector for per-item outcomes. Strings are duped into the
+/// caller-provided allocator so they outlive the run's internal arena.
+pub const OutcomeSink = struct {
+    alloc: std.mem.Allocator,
+    list: std.array_list.Managed(ItemOutcome),
+    mutex: std.Thread.Mutex = .{},
+
+    pub fn init(alloc: std.mem.Allocator) OutcomeSink {
+        return .{ .alloc = alloc, .list = std.array_list.Managed(ItemOutcome).init(alloc) };
+    }
+    pub fn deinit(self: *OutcomeSink) void {
+        self.list.deinit();
+    }
+    fn record(self: *OutcomeSink, item: []const u8, ok: bool, err: []const u8, retryable: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.list.append(.{
+            .item = self.alloc.dupe(u8, item) catch item,
+            .ok = ok,
+            .err = self.alloc.dupe(u8, err) catch err,
+            .retryable = retryable,
+        }) catch {};
+    }
+    pub fn failures(self: *OutcomeSink) usize {
+        var n: usize = 0;
+        for (self.list.items) |o| {
+            if (!o.ok) n += 1;
+        }
+        return n;
+    }
+};
+
 pub const RunOptions = struct {
     params: []const ParamArg = &.{},
     request_body: ?[]const u8 = null,
@@ -64,6 +139,9 @@ pub const RunOptions = struct {
     /// CLI defaults this to the detected core count.
     threads: usize = 1,
     log: LogConfig = .{},
+    /// Optional collector for per-item outcomes of a `for`-each fan-out. When set,
+    /// continue-mode partial failures are reported here instead of failing the run.
+    outcomes: ?*OutcomeSink = null,
 };
 
 const SqlKind = enum { postgres, mysql, sqlserver };
@@ -232,7 +310,7 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
     // One-time setup: create the table (and DELETE once for overwrite), so lanes
     // don't race DDL or repeatedly delete. Lanes then append into it.
     const setup_conn = connectSql(env.gpa, kind, cfg) catch |e|
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink connect failed: {s}", .{ conn.connector, @errorName(e) }));
+        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} sink connect failed: {s}", .{ conn.connector, @errorName(e) }));
     const setup = sql.Sink.open(env.gpa, setup_conn, dialect, w.target, schema, w.mode) catch |e|
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink setup failed: {s}", .{ conn.connector, @errorName(e) }));
     setup.sink().close() catch |e|
@@ -263,7 +341,7 @@ fn buildStarrocksSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*Starrock
     // One-time setup: create DB/table (and TRUNCATE for overwrite) once, so the
     // lanes don't race DDL or repeatedly truncate.
     const setup = starrocks.StreamLoadSink.open(env.gpa, cfg, w.target, schema, w.mode) catch |e|
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "starrocks setup failed ({s}) — {s}", .{ @errorName(e), env.diag.msg }));
+        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "starrocks setup failed ({s}) — {s}", .{ @errorName(e), env.diag.msg }));
     setup.sink().close() catch |e|
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "starrocks setup close failed: {s}", .{@errorName(e)}));
     cfg.auto_create = false;
@@ -291,9 +369,6 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts: RunOptions, d
     if (program.stmts.len == 0 or program.stmts[0] != .kind)
         return planErr(diag, "script must begin with a @kind tag");
     // @batch runs once; @http reuses this for each request (with a request body).
-    if (program.stmts[0].kind.kind == .stream)
-        return planErr(diag, "@stream is not implemented yet");
-
     var params = std.StringHashMap(Value).init(arena);
     try resolveParams(arena, program, opts.params, &params, diag);
     // Substitution map: param name → a literal expression of its resolved value.
@@ -505,6 +580,7 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
 
     const snk = try openSink(env, last.write, res.schema);
     while (true) {
+        if (aborting()) return error.Aborted; // cancelled by the control plane
         _ = batch_arena.reset(.retain_capacity);
         const b = (try res.op.next(batch_arena.allocator())) orelse break;
         try snk.writeBatch(batch_arena.allocator(), b);
@@ -599,22 +675,60 @@ fn jsonToStr(arena: std.mem.Allocator, v: std.json.Value) ![]const u8 {
         .integer => |i| try std.fmt.allocPrint(arena, "{d}", .{i}),
         .float => |f| try std.fmt.allocPrint(arena, "{d}", .{f}),
         .number_string, .string => |s| s,
-        .array, .object => "", // non-scalar field — not usable as a ${var}
+        // Serialize a nested field back to JSON text so it can flow through a `${var}`
+        // (e.g. a per-table `source` array consumed by `union <conn> json "${source}"`).
+        .array, .object => try std.json.Stringify.valueAlloc(arena, v, .{}),
     };
 }
 
 /// Replace every needle (`${var}`) in `s` with its row value (chained over all
 /// loop variables). Returns `s` unchanged (no copy) when no needle is present.
-fn interpAll(arena: std.mem.Allocator, s: []const u8, needles: []const []const u8, row: Row) ![]const u8 {
-    var cur = s;
-    for (needles, row) |needle, value| {
-        if (std.mem.indexOf(u8, cur, needle) == null) continue;
-        const size = std.mem.replacementSize(u8, cur, needle, value);
-        const buf = try arena.alloc(u8, size);
-        _ = std.mem.replace(u8, cur, needle, value, buf);
-        cur = buf;
+/// Replace `${var}` / `${var:modifier}` occurrences in `s`. `names[i]` is a loop
+/// variable bound to `values[i]`. Supported modifiers: `lower`, `upper`. An unknown
+/// `${...}` (no matching var) is left verbatim. Strings without `${` are returned
+/// as-is (no allocation).
+fn interpAll(arena: std.mem.Allocator, s: []const u8, names: []const []const u8, values: Row) ![]const u8 {
+    if (std.mem.indexOf(u8, s, "${") == null) return s;
+    var out = std.array_list.Managed(u8).init(arena);
+    errdefer out.deinit();
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '$' and i + 1 < s.len and s[i + 1] == '{') {
+            const close = std.mem.indexOfScalarPos(u8, s, i + 2, '}') orelse {
+                try out.appendSlice(s[i..]); // unterminated `${` — emit literally
+                break;
+            };
+            const inner = s[i + 2 .. close]; // `var` or `var:mod`
+            const colon = std.mem.indexOfScalar(u8, inner, ':');
+            const vname = if (colon) |c| inner[0..c] else inner;
+            const mod: ?[]const u8 = if (colon) |c| inner[c + 1 ..] else null;
+            var found = false;
+            for (names, values) |nm, val| {
+                if (std.mem.eql(u8, nm, vname)) {
+                    try appendInterp(&out, val, mod);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) try out.appendSlice(s[i .. close + 1]); // unknown var: leave verbatim
+            i = close + 1;
+        } else {
+            try out.append(s[i]);
+            i += 1;
+        }
     }
-    return cur;
+    return out.toOwnedSlice();
+}
+
+fn appendInterp(out: *std.array_list.Managed(u8), val: []const u8, mod: ?[]const u8) !void {
+    const m = mod orelse return out.appendSlice(val);
+    if (std.mem.eql(u8, m, "lower")) {
+        for (val) |c| try out.append(std.ascii.toLower(c));
+    } else if (std.mem.eql(u8, m, "upper")) {
+        for (val) |c| try out.append(std.ascii.toUpper(c));
+    } else {
+        try out.appendSlice(val); // unknown modifier: emit value unchanged
+    }
 }
 
 fn renderQual(arena: std.mem.Allocator, q: ast.QualName, needles: []const []const u8, row: Row) !ast.QualName {
@@ -630,6 +744,27 @@ fn renderRead(arena: std.mem.Allocator, rd: ast.Read, needles: []const []const u
         .path => |s| .{ .path = try interpAll(arena, s, needles, row) },
         .request => .request,
     } };
+}
+
+/// Interpolate `${var}` into a union stage: the discovered form's discovery query,
+/// or each explicit branch's read target + tag. Lets a for-loop drive which tables
+/// a union reconciles (e.g. a per-table discovery query keyed by the loop value).
+fn renderUnion(arena: std.mem.Allocator, u: ast.Union, needles: []const []const u8, row: Row) !ast.Union {
+    if (u.branches.len > 0) {
+        const branches = try arena.alloc(ast.UnionBranch, u.branches.len);
+        for (u.branches, branches) |b, *o| o.* = .{
+            .read = try renderRead(arena, b.read, needles, row),
+            .tag = if (b.tag) |t| try interpAll(arena, t, needles, row) else null,
+        };
+        return .{ .branches = branches, .discover_conn = u.discover_conn, .discover_query = u.discover_query, .discover_json = u.discover_json, .pos = u.pos };
+    }
+    return .{
+        .branches = u.branches,
+        .discover_conn = u.discover_conn,
+        .discover_query = try interpAll(arena, u.discover_query, needles, row),
+        .discover_json = try interpAll(arena, u.discover_json, needles, row),
+        .pos = u.pos,
+    };
 }
 
 fn renderMode(arena: std.mem.Allocator, mode: ast.WriteMode, needles: []const []const u8, row: Row) !ast.WriteMode {
@@ -682,6 +817,7 @@ fn renderPipeline(env: *Env, body: ast.Pipeline, needles: []const []const u8, ro
         dst.hints = try renderHints(arena, src.hints, needles, row); // e.g. @[split=${pk}]
         switch (src.node) {
             .read => |rd| dst.node = .{ .read = try renderRead(arena, rd, needles, row) },
+            .union_ => |u| dst.node = .{ .union_ = try renderUnion(arena, u, needles, row) },
             .write => |w| dst.node = .{ .write = try renderWrite(arena, w, needles, row) },
             // Interpolate `${var}` inside expression string-literals too, so loop
             // values can drive computed columns / predicates, not just targets.
@@ -728,9 +864,16 @@ fn renderExpr(arena: std.mem.Allocator, e: *const ast.Expr, needles: []const []c
 }
 
 fn renderSelect(arena: std.mem.Allocator, items: []const ast.SelectItem, needles: []const []const u8, row: Row) ![]const ast.SelectItem {
+    // Computed items interpolate both the expression and the alias name. A bare
+    // ident alias has no `${var}` so interpAll is a no-op; a quoted-string alias
+    // (`"${name}_EMPRESA" = emp`) is where the loop value builds the column name.
+    // Bare field/except identifiers are NOT templated.
     const out = try arena.alloc(ast.SelectItem, items.len);
     for (items, 0..) |it, i| out[i] = switch (it) {
-        .computed => |c| .{ .computed = .{ .name = c.name, .expr = try renderExpr(arena, c.expr, needles, row) } },
+        .computed => |c| .{ .computed = .{
+            .name = try interpAll(arena, c.name, needles, row),
+            .expr = try renderExpr(arena, c.expr, needles, row),
+        } },
         else => it,
     };
     return out;
@@ -746,6 +889,7 @@ const ForCtx = struct {
     base: *Env,
     worker_opts: RunOptions,
     on_error: OnError,
+    outcomes: ?*OutcomeSink = null,
     next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -755,8 +899,9 @@ const ForCtx = struct {
     first_err_len: usize = 0,
 };
 
-fn forRecordFail(ctx: *ForCtx, label: []const u8, ename: []const u8, msg: []const u8) void {
+fn forRecordFail(ctx: *ForCtx, label: []const u8, ename: []const u8, msg: []const u8, retryable: bool) void {
     _ = ctx.failures.fetchAdd(1, .monotonic);
+    if (ctx.outcomes) |sink| sink.record(label, false, if (msg.len > 0) msg else ename, retryable);
     ctx.mu.lock();
     defer ctx.mu.unlock();
     if (ctx.first_err_len == 0) {
@@ -769,6 +914,7 @@ fn forRecordFail(ctx: *ForCtx, label: []const u8, ename: []const u8, msg: []cons
 fn forWorker(ctx: *ForCtx) void {
     const gpa = ctx.base.gpa;
     while (true) {
+        if (aborting()) break; // cancelled — workers stop pulling new items
         if (ctx.on_error == .stop and ctx.stop.load(.acquire)) break;
         const i = ctx.next.fetchAdd(1, .monotonic);
         if (i >= ctx.rows.len) break;
@@ -799,13 +945,14 @@ fn forWorker(ctx: *ForCtx) void {
         var st = Stats{ .run_id = 0 };
         var lanes: usize = 1;
         const pipe = renderPipeline(&w_env, ctx.fe.body, ctx.needles, row) catch |e| {
-            forRecordFail(ctx, row[0], @errorName(e), "");
+            forRecordFail(ctx, row[0], @errorName(e), "", isTransient(e));
             continue;
         };
         if (runOutput(&w_env, pipe, ctx.worker_opts, &st, &lanes, &w_batch)) |_| {
             _ = ctx.rows_out.fetchAdd(st.rows_out, .monotonic);
+            if (ctx.outcomes) |sink| sink.record(row[0], true, "", false);
         } else |e| {
-            forRecordFail(ctx, row[0], @errorName(e), w_diag.msg);
+            forRecordFail(ctx, row[0], @errorName(e), w_diag.msg, isTransient(e) or w_diag.retryable);
         }
         for (w_sources.items) |sc| sc.close();
     }
@@ -829,37 +976,45 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
     };
     env.log.log(.info, "for-each {s}: {d} row(s) [{s}, on_error={s}]", .{ fe.var_names[0], rows.len, @tagName(mode), if (on_error == .continue_) "continue" else "stop" });
     if (rows.len == 0) return;
-    const needles = try env.arena.alloc([]const u8, fe.var_names.len);
-    for (fe.var_names, needles) |name, *n| n.* = try std.fmt.allocPrint(env.arena, "${{{s}}}", .{name});
+    // `interpAll` scans for `${var}` / `${var:mod}` itself, so it takes the raw
+    // variable names (not pre-formatted `${var}` needles) paired with row values.
+    const needles = fe.var_names;
 
     switch (mode) {
         .sequential => {
             var failures: usize = 0;
             var first_err: ?[]const u8 = null;
             for (rows) |row| {
+                if (aborting()) return error.Aborted; // stop starting new items
                 const base = env.sources.items.len;
+                env.diag.retryable = false; // classify this item's failure freshly
                 const pipe = try renderPipeline(env, fe.body, needles, row);
                 if (runOutput(env, pipe, opts, stats, lanes_used, batch_arena)) |_| {
                     for (env.sources.items[base..]) |sc| sc.close();
                     env.sources.shrinkRetainingCapacity(base);
+                    if (opts.outcomes) |sink| sink.record(row[0], true, "", false);
                 } else |e| {
                     for (env.sources.items[base..]) |sc| sc.close();
                     env.sources.shrinkRetainingCapacity(base);
                     failures += 1;
+                    const emsg = if (env.diag.msg.len > 0) env.diag.msg else @errorName(e);
+                    if (opts.outcomes) |sink| sink.record(row[0], false, emsg, isTransient(e) or env.diag.retryable);
                     env.log.log(.err, "for-each {s} failed: {s}", .{ row[0], @errorName(e) });
                     if (first_err == null)
                         first_err = std.fmt.allocPrint(env.arena, "{s}: {s}", .{ row[0], @errorName(e) }) catch null;
                     if (on_error == .stop) return planErr(env.diag, first_err orelse "for-each failed");
                 }
             }
-            if (failures > 0)
+            // Continue-mode partial failures surface via the sink (the run succeeds).
+            // Without a sink (embedded/test callers), preserve the legacy run failure.
+            if (failures > 0 and opts.outcomes == null)
                 return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each: {d}/{d} failed (first: {s})", .{ failures, rows.len, first_err orelse "?" }));
         },
         .parallel => {
             var wopts = opts;
             wopts.threads = 1; // each table runs serially; the for-loop provides the parallelism
             const nworkers = @min(@max(opts.threads, @as(usize, 1)), rows.len);
-            var ctx = ForCtx{ .fe = fe, .needles = needles, .rows = rows, .base = env, .worker_opts = wopts, .on_error = on_error };
+            var ctx = ForCtx{ .fe = fe, .needles = needles, .rows = rows, .base = env, .worker_opts = wopts, .on_error = on_error, .outcomes = opts.outcomes };
             const threads = try env.arena.alloc(std.Thread, nworkers);
             var spawned: usize = 0;
             while (spawned < nworkers) : (spawned += 1) {
@@ -869,7 +1024,9 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
             stats.rows_out += ctx.rows_out.load(.monotonic);
             lanes_used.* = @max(lanes_used.*, @max(spawned, @as(usize, 1)));
             const fails = ctx.failures.load(.monotonic);
-            if (fails > 0)
+            // stop-mode is a whole-request failure; continue-mode with a sink is a
+            // partial success (failures reported via outcomes, the run succeeds).
+            if (fails > 0 and (on_error == .stop or opts.outcomes == null))
                 return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each: {d}/{d} failed (first: {s})", .{ fails, rows.len, ctx.first_err_buf[0..ctx.first_err_len] }));
         },
     }
@@ -966,10 +1123,50 @@ const UnionSpec = struct { read: ast.Read, tag: ?[]const u8, name: []const u8 };
 
 /// Resolve a union's branch list — explicit branches, or tables discovered via a
 /// `(table_name, tag)` query.
-fn unionSpecs(env: *Env, u: ast.Union) ![]UnionSpec {
+fn unionSpecs(env: *Env, u: ast.Union, hints: []const ast.Hint) ![]UnionSpec {
     const arena = env.arena;
     var specs = std.array_list.Managed(UnionSpec).init(arena);
-    if (u.discover_query.len > 0) {
+    if (u.discover_json.len > 0) {
+        // Which JSON keys hold the table / tag, and an optional substring rule to
+        // derive the tag from the table name — all configurable via the stage hints
+        // (`@[table_field=.., tag_field=.., tag_substr="start,len"]`). Defaults below.
+        const table_key = forHintName(hints, "table_field");
+        const tag_key = forHintName(hints, "tag_field");
+        const tag_substr = forHintName(hints, "tag_substr");
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, u.discover_json, .{}) catch
+            return planErr(env.diag, try std.fmt.allocPrint(arena, "union json: invalid JSON: {s}", .{u.discover_json}));
+        const items = switch (parsed) {
+            .array => |a| a.items,
+            else => return planErr(env.diag, "union json: expected a JSON array"),
+        };
+        for (items) |elem| {
+            var tbl: []const u8 = undefined;
+            var tag: ?[]const u8 = null;
+            switch (elem) {
+                // A bare string element is just the table name (tag derived/absent).
+                .string => |s| tbl = s,
+                .object => |o| {
+                    tbl = (if (table_key) |k| jsonStrField(o, k) else null) orelse
+                        jsonStrField(o, "table") orelse jsonStrField(o, "name") orelse
+                        return planErr(env.diag, "union json: element has no table name");
+                    tag = (if (tag_key) |k| jsonStrField(o, k) else null) orelse
+                        jsonStrField(o, "tag") orelse jsonStrField(o, "emp");
+                },
+                else => return planErr(env.diag, "union json: each element must be a string or object"),
+            }
+            // No explicit tag → derive it from the table name via `tag_substr`.
+            if (tag == null) if (tag_substr) |spec| {
+                tag = deriveSubstr(tbl, spec);
+            };
+            const parts = try arena.alloc([]const u8, 1);
+            parts[0] = tbl;
+            try specs.append(.{
+                .read = .{ .connector = u.discover_conn, .form = .{ .table = .{ .parts = parts } } },
+                .tag = tag,
+                .name = tbl,
+            });
+        }
+    } else if (u.discover_query.len > 0) {
         const disc = ast.Read{ .connector = u.discover_conn, .form = .{ .query = u.discover_query } };
         for (try discoverRows(env, disc, 2)) |row| {
             const parts = try arena.alloc([]const u8, 1);
@@ -978,6 +1175,38 @@ fn unionSpecs(env: *Env, u: ast.Union) ![]UnionSpec {
         }
     } else for (u.branches) |b| try specs.append(.{ .read = b.read, .tag = b.tag, .name = readName(b.read) });
     return specs.toOwnedSlice();
+}
+
+/// A string-valued field of a JSON object, or null if absent / not a string.
+fn jsonStrField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    return switch (obj.get(key) orelse return null) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+/// A hint value as a name, accepting either a bare ident or a quoted string
+/// (`@[table_field = physical]` or `@[tag_substr = "4,2"]`).
+fn forHintName(hints: []const ast.Hint, key: []const u8) ?[]const u8 {
+    for (hints) |h| {
+        if (std.mem.eql(u8, h.key, key)) return switch (h.value) {
+            .ident => |s| s,
+            .str => |s| s,
+            else => null,
+        };
+    }
+    return null;
+}
+
+/// Derive a substring of `s` from a `"start,len"` spec (1-based start, matching the
+/// `substr` builtin). Returns null on a malformed/out-of-range spec.
+fn deriveSubstr(s: []const u8, spec: []const u8) ?[]const u8 {
+    const comma = std.mem.indexOfScalar(u8, spec, ',') orelse return null;
+    const start = std.fmt.parseInt(usize, std.mem.trim(u8, spec[0..comma], " "), 10) catch return null;
+    const len = std.fmt.parseInt(usize, std.mem.trim(u8, spec[comma + 1 ..], " "), 10) catch return null;
+    if (start == 0 or start > s.len) return null;
+    const a = start - 1;
+    return s[a..@min(a + len, s.len)];
 }
 
 /// Pick the canon schema among the branch schemas: a named source table, or the
@@ -1005,7 +1234,7 @@ fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint) anyerror!PipeRes
     const arena = env.arena;
     const tag_col = forHintIdent(hints, "tag");
     const canon_opt = forHintIdent(hints, "canon");
-    const specs = try unionSpecs(env, u);
+    const specs = try unionSpecs(env, u, hints);
     if (specs.len == 0) return planErr(env.diag, "union has no source tables");
 
     const children = try arena.alloc(op.Op, specs.len);
@@ -1045,7 +1274,7 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
     const arena = env.arena;
     const tag_col = forHintIdent(hints, "tag");
     const canon_opt = forHintIdent(hints, "canon");
-    const specs = try unionSpecs(env, u);
+    const specs = try unionSpecs(env, u, hints);
     if (specs.len == 0) return planErr(env.diag, "union has no source tables");
 
     // Probe each branch's schema (open, read COLMETADATA, close without draining);
@@ -1206,7 +1435,7 @@ fn openSource(env: *Env, rd: ast.Read) !driver.Source {
         const cfg = try resolveDbConfig(env, conn, 1433);
         const query = try readSql(env, rd);
         const c = tds.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sqlserver connect failed: {s}", .{@errorName(e)}));
+            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "sqlserver connect failed: {s}", .{@errorName(e)}));
         const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
             defer c.close();
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sqlserver read failed ({s}): {s}", .{ @errorName(e), c.last_error }));
@@ -1218,7 +1447,7 @@ fn openSource(env: *Env, rd: ast.Read) !driver.Source {
         const cfg = try resolveDbConfig(env, conn, 3306);
         const query = try readSql(env, rd);
         const c = mysql.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "mysql connect failed: {s}", .{@errorName(e)}));
+            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "mysql connect failed: {s}", .{@errorName(e)}));
         const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
             defer c.close();
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "mysql read failed ({s}): {s}", .{ @errorName(e), c.last_error }));
@@ -1230,7 +1459,7 @@ fn openSource(env: *Env, rd: ast.Read) !driver.Source {
         const cfg = try resolveDbConfig(env, conn, 5432);
         const query = try readSql(env, rd);
         const c = postgres.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "postgres connect failed: {s}", .{@errorName(e)}));
+            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "postgres connect failed: {s}", .{@errorName(e)}));
         const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
             defer c.close();
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "postgres read failed ({s}): {s}", .{ @errorName(e), c.last_error }));
@@ -1467,7 +1696,7 @@ fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (std.mem.eql(u8, conn.connector, "mysql")) {
         const cfg = try resolveDbConfig(env, conn, 3306);
         const c = mysql.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "mysql connect failed: {s}", .{@errorName(e)}));
+            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "mysql connect failed: {s}", .{@errorName(e)}));
         // append/overwrite → LOAD DATA LOCAL INFILE (bulk); upsert → INSERT.
         return openBulkOrInsert(env.gpa, c, mysql.LoadDataSink, .mysql, w.target, schema, w.mode) catch |e| {
             defer c.close();
@@ -1477,7 +1706,7 @@ fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (std.mem.eql(u8, conn.connector, "sqlserver")) {
         const cfg = try resolveDbConfig(env, conn, 1433);
         const c = tds.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sqlserver connect failed: {s}", .{@errorName(e)}));
+            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "sqlserver connect failed: {s}", .{@errorName(e)}));
         // append/overwrite → INSERT BULK; upsert → INSERT.
         return openBulkOrInsert(env.gpa, c, tds.BulkSink, .sqlserver, w.target, schema, w.mode) catch |e| {
             defer c.close();
@@ -1487,7 +1716,7 @@ fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (std.mem.eql(u8, conn.connector, "postgres")) {
         const cfg = try resolveDbConfig(env, conn, 5432);
         const c = postgres.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "postgres connect failed: {s}", .{@errorName(e)}));
+            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "postgres connect failed: {s}", .{@errorName(e)}));
         // append/overwrite → COPY FROM STDIN (bulk, fast); upsert → INSERT.
         return openBulkOrInsert(env.gpa, c, postgres.CopySink, .postgres, w.target, schema, w.mode) catch |e| {
             defer c.close();
@@ -1641,6 +1870,14 @@ fn setMsg(diag: *Diag, msg: []const u8) void {
 }
 
 fn planErr(diag: *Diag, msg: []const u8) error{PlanFailed} {
+    setMsg(diag, msg);
+    return error.PlanFailed;
+}
+
+/// `planErr` that also classifies the underlying error as transient/permanent,
+/// so the wrapped (PlanFailed) result still carries retry intent to the CLI.
+fn planErrT(diag: *Diag, e: anyerror, msg: []const u8) error{PlanFailed} {
+    if (isTransient(e)) diag.retryable = true;
     setMsg(diag, msg);
     return error.PlanFailed;
 }

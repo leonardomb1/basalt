@@ -94,8 +94,9 @@ pub const Lexer = struct {
         return self.make(.int, start, sline, scol);
     }
 
-    /// `${ident}` — a template placeholder. The token text is the whole lexeme
-    /// (including `${` and `}`) so the planner can render it by literal replacement.
+    /// `${ident}` or `${ident:modifier}` — a template placeholder. The token text
+    /// is the whole lexeme (including `${`, optional `:mod`, and `}`) so the planner
+    /// can render it. Modifiers (e.g. `:lower`, `:upper`) are applied at render time.
     fn lexInterp(self: *Lexer, start: usize, sline: u32, scol: u32) Token {
         self.bump(); // $
         self.bump(); // {
@@ -104,11 +105,24 @@ pub const Lexer = struct {
             if (!isIdentCont(d)) break;
             self.bump();
         }
-        if (self.pos == name_start or self.peek() != '}') return self.make(.invalid, start, sline, scol);
+        if (self.pos == name_start) return self.make(.invalid, start, sline, scol);
+        if (self.peek() == ':') {
+            self.bump(); // :
+            const mod_start = self.pos;
+            while (self.peek()) |d| {
+                if (!isIdentCont(d)) break;
+                self.bump();
+            }
+            if (self.pos == mod_start) return self.make(.invalid, start, sline, scol);
+        }
+        if (self.peek() != '}') return self.make(.invalid, start, sline, scol);
         self.bump(); // }
         return self.make(.interp, start, sline, scol);
     }
 
+    // Scan a `"..."` body, honoring `\` escapes so an escaped `\"` does not end
+    // the string. The token text is the raw inner slice; `tokenize` resolves the
+    // escapes (see `unescape`) once scanning is done.
     fn lexString(self: *Lexer, sline: u32, scol: u32) Token {
         self.bump(); // opening quote
         const inner_start = self.pos;
@@ -211,13 +225,48 @@ fn isIdentCont(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
+/// Translate backslash escapes in a string-literal body into their byte values.
+/// Recognized: `\"` `\\` `\n` `\t` `\r` `\'`. An unrecognized escape (`\x`) is
+/// kept verbatim (backslash and all) so data like Windows paths survives. The
+/// result is allocated in `alloc`; only called when the body contains a `\`.
+fn unescape(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(alloc);
+    errdefer out.deinit();
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        if (s[i] != '\\' or i + 1 >= s.len) {
+            try out.append(s[i]);
+            continue;
+        }
+        i += 1;
+        switch (s[i]) {
+            '"' => try out.append('"'),
+            '\\' => try out.append('\\'),
+            'n' => try out.append('\n'),
+            't' => try out.append('\t'),
+            'r' => try out.append('\r'),
+            '\'' => try out.append('\''),
+            else => |e| {
+                try out.append('\\'); // unknown escape: keep both bytes
+                try out.append(e);
+            },
+        }
+    }
+    return out.toOwnedSlice();
+}
+
 /// Lex the whole source into a slice ending with an `eof` token. Caller frees.
 pub fn tokenize(alloc: std.mem.Allocator, src: []const u8) ![]Token {
     var lx = Lexer.init(src);
     var list = std.array_list.Managed(Token).init(alloc);
     errdefer list.deinit();
     while (true) {
-        const t = lx.next();
+        var t = lx.next();
+        // String bodies are lexed raw (slice into src); resolve their escapes
+        // here, the single point every `.string` token flows through.
+        if (t.tag == .string and std.mem.indexOfScalar(u8, t.text, '\\') != null) {
+            t.text = try unescape(alloc, t.text);
+        }
         try list.append(t);
         if (t.tag == .eof) break;
     }
@@ -247,6 +296,22 @@ test "lex string content and number kinds" {
     try std.testing.expectEqualStrings("100", toks[3].text);
     try std.testing.expectEqual(Tag.float, toks[4].tag);
     try std.testing.expectEqualStrings("1.5", toks[4].text);
+}
+
+test "string escapes are resolved" {
+    const alloc = std.testing.allocator;
+    // \" -> " (embedded SQL identifier quoting), \\ -> \, and an unknown escape kept verbatim.
+    const toks = try tokenize(alloc, "query \"where \\\"updated_at\\\" > 0\" \"a\\\\b\" \"c\\d\"");
+    defer {
+        // toks[1..3] contained escapes, so their text is heap-allocated by unescape.
+        alloc.free(toks[1].text);
+        alloc.free(toks[2].text);
+        alloc.free(toks[3].text);
+        alloc.free(toks);
+    }
+    try std.testing.expectEqualStrings("where \"updated_at\" > 0", toks[1].text);
+    try std.testing.expectEqualStrings("a\\b", toks[2].text);
+    try std.testing.expectEqualStrings("c\\d", toks[3].text);
 }
 
 test "lex operators, annotations, and unit suffix split" {

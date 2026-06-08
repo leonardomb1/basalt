@@ -14,7 +14,24 @@ const obs = @import("../runtime/obs.zig");
 const analyze = @import("../runtime/analyze.zig");
 const server = @import("../server/http.zig");
 
+/// SIGTERM/SIGINT → ask the run to stop at its next boundary (async-signal-safe:
+/// one atomic store). The control plane uses this to cancel a job or roll a server.
+fn onTerminate(_: i32) callconv(.c) void {
+    runtime.requestAbort();
+}
+
+fn installSignalHandlers() void {
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = onTerminate },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+}
+
 pub fn run(alloc: std.mem.Allocator) !void {
+    installSignalHandlers();
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
 
@@ -228,7 +245,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         }
     }
 
-    // @http scripts become a server; @batch/@stream run once.
+    // @http scripts become a server; @batch runs once.
     if (prog.stmts.len > 0 and prog.stmts[0] == .kind and prog.stmts[0].kind.kind == .http) {
         server.serve(alloc, prog, port) catch |e| {
             try stderr.print("{s}: serve error: {s}\n", .{ src.label, @errorName(e) });
@@ -242,21 +259,48 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     log.summary = if (json_summary) .json_stdout else .stderr;
 
     var diag: runtime.Diag = .{};
-    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .log = log }, &diag) catch |e| switch (e) {
+    var sink = runtime.OutcomeSink.init(alloc);
+    defer sink.deinit();
+    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log }, &diag) catch |e| switch (e) {
+        error.Aborted => {
+            // Cancelled by the control plane (SIGTERM/SIGINT). 130 = 128 + SIGINT.
+            try stderr.print("{s}: aborted\n", .{src.label});
+            return 130;
+        },
         error.PlanFailed => {
-            try stderr.print("{s}: error: {s}\n", .{ src.label, diag.msg });
-            return 1;
+            const tag = if (diag.retryable) " (transient)" else "";
+            try stderr.print("{s}: error{s}: {s}\n", .{ src.label, tag, diag.msg });
+            // Exit 75 (EX_TEMPFAIL) on a transient failure so the control plane can
+            // retry; 1 on a permanent failure where a retry would fail identically.
+            return if (diag.retryable) 75 else 1;
         },
         error.OutOfMemory => return e,
         else => {
+            const transient = diag.retryable or runtime.isTransient(e);
+            const tag = if (transient) " (transient)" else "";
             // run() fills diag.msg with stage/column context for expression errors.
             if (diag.msg.len > 0)
-                try stderr.print("{s}: error: {s}\n", .{ src.label, diag.msg })
+                try stderr.print("{s}: error{s}: {s}\n", .{ src.label, tag, diag.msg })
             else
-                try stderr.print("{s}: runtime error: {s}\n", .{ src.label, @errorName(e) });
-            return 1;
+                try stderr.print("{s}: runtime error{s}: {s}\n", .{ src.label, tag, @errorName(e) });
+            return if (transient) 75 else 1;
         },
     };
+    // Continue-mode fan-out (e.g. `for ... @[on_error = continue]`) succeeds as a
+    // run even with per-item failures. Report them and exit non-zero so the control
+    // plane notices: 75 if every failure was transient (retry the batch), else 1.
+    const nfail = sink.failures();
+    if (nfail > 0) {
+        var all_retryable = true;
+        for (sink.list.items) |o| {
+            if (o.ok) continue;
+            if (!o.retryable) all_retryable = false;
+            const tag = if (o.retryable) " (transient)" else "";
+            try stderr.print("{s}: item `{s}` failed{s}: {s}\n", .{ src.label, o.item, tag, o.err });
+        }
+        try stderr.print("{s}: {d}/{d} item(s) failed\n", .{ src.label, nfail, sink.list.items.len });
+        return if (all_retryable) 75 else 1;
+    }
     return 0;
 }
 

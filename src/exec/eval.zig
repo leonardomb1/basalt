@@ -91,6 +91,14 @@ pub const TypeCtx = struct {
         inline for (.{ "count", "sum", "avg", "min", "max" }) |agg| {
             if (std.mem.eql(u8, name, agg)) return self.err("aggregate `{s}` is only valid inside `aggregate`", .{name});
         }
+        if (eq(name, "now")) {
+            if (c.args.len != 0) return self.err("`now` takes no arguments", .{});
+            return Type.init(.timestamp); // current wall-clock, non-null
+        }
+        if (eq(name, "today")) {
+            if (c.args.len != 0) return self.err("`today` takes no arguments", .{});
+            return Type.init(.date); // current UTC date, non-null
+        }
         if (eq(name, "upper") or eq(name, "lower")) {
             const a = try self.argType(c, 0);
             return Type.init(.string).withNull(a.nullable);
@@ -1027,6 +1035,13 @@ fn evalMatch(arena: std.mem.Allocator, m: ast.Match, batch: Batch, row: usize) E
 
 fn evalCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
     const name = c.name;
+    if (eq(name, "now")) {
+        return .{ .timestamp = std.time.microTimestamp() };
+    }
+    if (eq(name, "today")) {
+        const days = @divFloor(std.time.microTimestamp(), 86_400_000_000);
+        return .{ .date = @intCast(days) };
+    }
     if (eq(name, "coalesce")) {
         for (c.args) |a| {
             const v = try evalRow(arena, a, batch, row);
