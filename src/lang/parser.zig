@@ -94,6 +94,13 @@ pub const Parser = struct {
         if (self.atName()) return self.advance().text;
         return self.fail(self.curPos(), "expected identifier, found {s}", .{self.curTag().describe()});
     }
+    /// A column name that may also be given as a quoted string, so `${var}` can
+    /// build it (e.g. an upsert key `"${name}_EMPRESA"`). Used for column lists,
+    /// not table references.
+    fn expectColName(self: *Parser) Error![]const u8 {
+        if (self.atName() or self.at(.string)) return self.advance().text;
+        return self.fail(self.curPos(), "expected a column name, found {s}", .{self.curTag().describe()});
+    }
     fn expectKw(self: *Parser, kw: []const u8) Error!void {
         if (self.eatKw(kw)) return;
         return self.fail(self.curPos(), "expected `{s}`, found {s}", .{ kw, self.curTag().describe() });
@@ -125,7 +132,7 @@ pub const Parser = struct {
             if (!is_first) return self.fail(self.curPos(), "the @kind tag must be the first declaration", .{});
             return .{ .kind = try self.parseKind() };
         }
-        if (is_first) return self.fail(self.curPos(), "script must begin with a @kind tag (@batch, @http, or @stream)", .{});
+        if (is_first) return self.fail(self.curPos(), "script must begin with a @kind tag (@batch or @http)", .{});
 
         if (self.isKw("param")) return .{ .param = try self.parseParam() };
         if (self.isKw("connection")) return .{ .connection = try self.parseConnection() };
@@ -145,10 +152,8 @@ pub const Parser = struct {
             .batch
         else if (std.mem.eql(u8, name, "http"))
             .http
-        else if (std.mem.eql(u8, name, "stream"))
-            .stream
         else
-            return self.fail(pos, "unknown @kind `{s}` (expected batch, http, or stream)", .{name});
+            return self.fail(pos, "unknown @kind `{s}` (expected batch or http)", .{name});
 
         var config: []const ast.Attr = &[_]ast.Attr{};
         if (self.eat(.lparen)) {
@@ -374,6 +379,13 @@ pub const Parser = struct {
             return .{ .branches = try branches.toOwnedSlice(), .pos = pos };
         }
         const conn = try self.expectIdent();
+        // `union <conn> json "<array>"`: branch list comes from a JSON array of
+        // {table, tag} objects (e.g. a `${source}` field from the request body),
+        // instead of a discovery query.
+        if (self.eatKw("json")) {
+            const j = (try self.expect(.string)).text;
+            return .{ .discover_conn = conn, .discover_json = j, .pos = pos };
+        }
         try self.expectKw("tables");
         const q = (try self.expect(.string)).text;
         return .{ .discover_conn = conn, .discover_query = q, .pos = pos };
@@ -416,7 +428,10 @@ pub const Parser = struct {
             }
             return .star;
         }
-        if (self.at(.ident) and self.peekTag() == .assign) {
+        // Computed column: `name = expr`. The alias may be a bare ident or a quoted
+        // string — a string lets `${var}` build the name (e.g. a per-table
+        // `"${name}_EMPRESA" = emp`). Bare identifiers cannot be templated.
+        if ((self.at(.ident) or self.at(.string)) and self.peekTag() == .assign) {
             const name = self.advance().text;
             _ = try self.expect(.assign);
             const e = try self.parseExpr();
@@ -542,22 +557,34 @@ pub const Parser = struct {
 
     fn parseWrite(self: *Parser) Error!ast.Write {
         const connector = try self.expectIdent();
-        if (self.at(.string)) {
-            return .{ .connector = connector, .form = null, .target = self.advance().text, .mode = .default };
-        }
         // Bare connector with no target, e.g. `write stdout`.
-        if (!self.atName()) {
+        if (!self.atName() and !self.at(.string)) {
             return .{ .connector = connector, .form = null, .target = "", .mode = .default };
         }
-        const first = try self.parseQualName();
         var form: ?[]const u8 = null;
-        var target = try joinQual(self.arena, first);
-        if (self.atName() and !self.isModeKw()) {
-            form = target;
-            target = try joinQual(self.arena, try self.parseQualName());
+        var target: []const u8 = undefined;
+        if (self.at(.string)) {
+            // A string is always the target (a templated `"proth_${name}"`); a form
+            // is never a string, so there is no second name to look for.
+            target = self.advance().text;
+        } else {
+            // A name is form-or-target: if another name/string (not a mode keyword)
+            // follows, the first was the form (e.g. `stream_load <target>`).
+            const first = try joinQual(self.arena, try self.parseQualName());
+            if ((self.atName() or self.at(.string)) and !self.isModeKw()) {
+                form = first;
+                target = try self.parseWriteTarget();
+            } else {
+                target = first;
+            }
         }
         const mode = try self.parseWriteMode();
         return .{ .connector = connector, .form = form, .target = target, .mode = mode };
+    }
+    /// A write target: a quoted string (so `${var}` can build it) or a qualified name.
+    fn parseWriteTarget(self: *Parser) Error![]const u8 {
+        if (self.at(.string)) return self.advance().text;
+        return joinQual(self.arena, try self.parseQualName());
     }
 
     fn isModeKw(self: *Parser) bool {
@@ -575,15 +602,15 @@ pub const Parser = struct {
         if (self.eatKw("upsert")) {
             try self.expectKw("on");
             var keys = std.array_list.Managed([]const u8).init(self.arena);
-            try keys.append(try self.expectName());
-            while (self.eat(.comma)) try keys.append(try self.expectName());
+            try keys.append(try self.expectColName());
+            while (self.eat(.comma)) try keys.append(try self.expectColName());
             var partial: ?[]const []const u8 = null;
             if (self.eatKw("partial")) {
                 try self.expectKw("cols");
                 _ = try self.expect(.lparen);
                 var cols = std.array_list.Managed([]const u8).init(self.arena);
-                try cols.append(try self.expectName());
-                while (self.eat(.comma)) try cols.append(try self.expectName());
+                try cols.append(try self.expectColName());
+                while (self.eat(.comma)) try cols.append(try self.expectColName());
                 _ = try self.expect(.rparen);
                 partial = try cols.toOwnedSlice();
             }

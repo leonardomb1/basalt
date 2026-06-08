@@ -154,8 +154,9 @@ pub const UnionBranch = struct { read: Read, tag: ?[]const u8 };
 /// (per-branch value) is optional. `tag` and `canon` come from the stage's `@[...]`.
 pub const Union = struct {
     branches: []const UnionBranch = &.{}, // explicit form
-    discover_conn: []const u8 = "", // discovered form: connection holding the tables
+    discover_conn: []const u8 = "", // discovered/json form: connection holding the tables
     discover_query: []const u8 = "", // discovered form: query -> (table_name, tag)
+    discover_json: []const u8 = "", // json form: a JSON array of {table, tag} objects
     pos: Pos,
 };
 
@@ -243,7 +244,7 @@ pub const ForEach = struct {
     pos: Pos,
 };
 
-pub const Kind = enum { batch, http, stream };
+pub const Kind = enum { batch, http };
 
 pub const KindDecl = struct { kind: Kind, config: []const Attr, pos: Pos };
 

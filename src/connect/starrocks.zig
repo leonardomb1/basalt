@@ -159,8 +159,12 @@ pub fn columnList(arena: std.mem.Allocator, schema: types.Schema) ![]const u8 {
 }
 
 /// Append a batch to the load buffer. Fields are separated by 0x01 (`\x01`, set
-/// as the Stream Load `column_separator`) since StarRocks CSV does no quoting;
-/// nulls are `\N`, rows end with `\n`.
+/// as the Stream Load `column_separator`) and rows by 0x02 (`\x02`, set as the
+/// `row_delimiter`) — both control bytes StarRocks CSV does no quoting for, so
+/// they must not appear in the data. A literal `\n` is NOT used as the row
+/// delimiter because text columns routinely contain embedded newlines, which
+/// would otherwise split one row into several and break the column count.
+/// Nulls are `\N`.
 pub fn appendBatchTsv(w: anytype, arena: std.mem.Allocator, batch: Batch) !void {
     var r: usize = 0;
     while (r < batch.len) : (r += 1) {
@@ -173,7 +177,7 @@ pub fn appendBatchTsv(w: anytype, arena: std.mem.Allocator, batch: Batch) !void 
                 try w.writeAll(try eval.valueToString(arena, v));
             }
         }
-        try w.writeByte('\n');
+        try w.writeByte(0x02);
     }
 }
 
@@ -275,12 +279,17 @@ pub const StreamLoadSink = struct {
     }
 
     fn closeImpl(self: *StreamLoadSink) !void {
+        // Free every owned resource even if the final flush fails — otherwise a
+        // failed Stream Load on close leaks the sink, buffer, columns, label copy,
+        // and the HTTP client's connection pool (once per lane).
+        defer {
+            self.client.deinit();
+            self.buffer.deinit();
+            self.gpa.free(self.columns);
+            self.gpa.free(self.cfg.label_prefix);
+            self.gpa.destroy(self);
+        }
         try self.flush();
-        self.client.deinit();
-        self.buffer.deinit();
-        self.gpa.free(self.columns);
-        self.gpa.free(self.cfg.label_prefix);
-        self.gpa.destroy(self);
     }
 
     fn flush(self: *StreamLoadSink) !void {
@@ -309,6 +318,7 @@ pub const StreamLoadSink = struct {
         try hdrs.append(.{ .name = "label", .value = label });
         try hdrs.append(.{ .name = "format", .value = "CSV" });
         try hdrs.append(.{ .name = "column_separator", .value = "\\x01" });
+        try hdrs.append(.{ .name = "row_delimiter", .value = "\\x02" });
         try hdrs.append(.{ .name = "columns", .value = self.columns });
         try hdrs.append(.{ .name = "max_filter_ratio", .value = "0" });
         if (self.mode == .upsert and self.mode.upsert.partial != null) {
