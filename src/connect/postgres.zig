@@ -18,13 +18,16 @@ pub const Error = error{ PgProtocol, PgAuthFailed, PgQueryFailed, PgAuthUnsuppor
 /// Buffered socket reads: without this, every backend message costs two recv
 /// syscalls (5-byte header + body) — ~2 per row — which dominates read time and
 /// caps throughput. A 64 KB buffer turns that into one syscall per ~64 KB.
-const ReadBuf = std.io.BufferedReader(64 * 1024, std.net.Stream.Reader);
+const SOCK_BUF = 64 * 1024;
 
 pub const Conn = struct {
     gpa: std.mem.Allocator,
     stream: std.net.Stream,
-    reader: ReadBuf = undefined,
-    payload: std.ArrayList(u8), // current message payload
+    read_buf: [SOCK_BUF]u8 = undefined,
+    write_buf: [SOCK_BUF]u8 = undefined,
+    sr: std.net.Stream.Reader = undefined,
+    sw: std.net.Stream.Writer = undefined,
+    payload: std.array_list.Managed(u8), // current message payload
     last_error: []const u8 = "",
     // streaming cursor state (valid between queryCursor and close)
     meta_arena: std.heap.ArenaAllocator = undefined,
@@ -35,8 +38,9 @@ pub const Conn = struct {
     pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8) !*Conn {
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
         const self = try gpa.create(Conn);
-        self.* = .{ .gpa = gpa, .stream = stream, .payload = std.ArrayList(u8).init(gpa) };
-        self.reader = .{ .unbuffered_reader = self.stream.reader() };
+        self.* = .{ .gpa = gpa, .stream = stream, .payload = std.array_list.Managed(u8).init(gpa) };
+        self.sr = std.net.Stream.Reader.init(stream, &self.read_buf);
+        self.sw = std.net.Stream.Writer.init(stream, &self.write_buf);
         errdefer self.close();
         try self.startup(user, database);
         try self.authenticate(user, password);
@@ -57,7 +61,7 @@ pub const Conn = struct {
     // --- handshake ---
 
     fn startup(self: *Conn, user: []const u8, database: []const u8) !void {
-        var body = std.ArrayList(u8).init(self.gpa);
+        var body = std.array_list.Managed(u8).init(self.gpa);
         defer body.deinit();
         try writeI32(body.writer(), 0x0003_0000); // protocol 3.0
         try appendCStr(&body, "user");
@@ -71,8 +75,10 @@ pub const Conn = struct {
         // startup packet has no type byte: just length + body
         var hdr: [4]u8 = undefined;
         std.mem.writeInt(u32, &hdr, @intCast(body.items.len + 4), .big);
-        try self.stream.writer().writeAll(&hdr);
-        try self.stream.writer().writeAll(body.items);
+        const w = &self.sw.interface;
+        try w.writeAll(&hdr);
+        try w.writeAll(body.items);
+        try w.flush();
     }
 
     fn authenticate(self: *Conn, user: []const u8, password: []const u8) !void {
@@ -102,7 +108,7 @@ pub const Conn = struct {
     }
 
     fn sendPassword(self: *Conn, password: []const u8) !void {
-        var body = std.ArrayList(u8).init(self.gpa);
+        var body = std.array_list.Managed(u8).init(self.gpa);
         defer body.deinit();
         try appendCStr(&body, password);
         try self.writeMsg('p', body.items);
@@ -115,8 +121,7 @@ pub const Conn = struct {
         h.update(password);
         h.update(user);
         h.final(&inner);
-        var inner_hex: [32]u8 = undefined;
-        _ = std.fmt.bufPrint(&inner_hex, "{s}", .{std.fmt.fmtSliceHexLower(&inner)}) catch unreachable;
+        const inner_hex: [32]u8 = std.fmt.bytesToHex(&inner, .lower);
 
         var outer: [16]u8 = undefined;
         h = Md5.init(.{});
@@ -124,10 +129,10 @@ pub const Conn = struct {
         h.update(salt);
         h.final(&outer);
 
-        var body = std.ArrayList(u8).init(self.gpa);
+        var body = std.array_list.Managed(u8).init(self.gpa);
         defer body.deinit();
         try body.appendSlice("md5");
-        try body.writer().print("{s}", .{std.fmt.fmtSliceHexLower(&outer)});
+        try body.appendSlice(&std.fmt.bytesToHex(&outer, .lower));
         try body.append(0);
         try self.writeMsg('p', body.items);
     }
@@ -151,7 +156,7 @@ pub const Conn = struct {
         const cfb = try std.fmt.allocPrint(a, "n=,r={s}", .{client_nonce}); // client-first-bare
         const client_first = try std.fmt.allocPrint(a, "n,,{s}", .{cfb});
 
-        var init_msg = std.ArrayList(u8).init(a);
+        var init_msg = std.array_list.Managed(u8).init(a);
         try appendCStr(&init_msg, "SCRAM-SHA-256");
         try writeI32(init_msg.writer(), @intCast(client_first.len));
         try init_msg.appendSlice(client_first);
@@ -295,7 +300,7 @@ pub const Conn = struct {
     }
 
     fn sendQuery(self: *Conn, sql: []const u8) !void {
-        var body = std.ArrayList(u8).init(self.gpa);
+        var body = std.array_list.Managed(u8).init(self.gpa);
         defer body.deinit();
         try appendCStr(&body, sql);
         try self.writeMsg('Q', body.items);
@@ -345,18 +350,20 @@ pub const Conn = struct {
         var hdr: [5]u8 = undefined;
         hdr[0] = msg_type;
         std.mem.writeInt(u32, hdr[1..5], @intCast(body.len + 4), .big);
-        try self.stream.writer().writeAll(&hdr);
-        try self.stream.writer().writeAll(body);
+        const w = &self.sw.interface;
+        try w.writeAll(&hdr);
+        try w.writeAll(body);
+        try w.flush();
     }
 
     fn readMsg(self: *Conn) !u8 {
-        const r = self.reader.reader();
+        const r = self.sr.interface();
         var hdr: [5]u8 = undefined;
-        try r.readNoEof(&hdr);
+        try r.readSliceAll(&hdr);
         const len = std.mem.readInt(u32, hdr[1..5], .big);
         if (len < 4) return error.PgProtocol;
         try self.payload.resize(len - 4);
-        try r.readNoEof(self.payload.items);
+        try r.readSliceAll(self.payload.items);
         return hdr[0];
     }
 };
@@ -463,7 +470,7 @@ fn scramAttr(s: []const u8, key: u8) ?[]const u8 {
     return null;
 }
 
-fn appendCStr(list: *std.ArrayList(u8), s: []const u8) !void {
+fn appendCStr(list: *std.array_list.Managed(u8), s: []const u8) !void {
     try list.appendSlice(s);
     try list.append(0);
 }
@@ -504,7 +511,7 @@ pub const CopySink = struct {
     conn: *Conn,
     table: []const u8, // quoted, qualified
     ncols: usize,
-    buffer: std.ArrayList(u8),
+    buffer: std.array_list.Managed(u8),
 
     pub fn open(gpa: std.mem.Allocator, conn: *Conn, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode) !*CopySink {
         // On error we free only what we allocate here; the caller keeps `conn`
@@ -513,7 +520,7 @@ pub const CopySink = struct {
         errdefer gpa.destroy(self);
         const qtable = try sqlmod.quoteIdent(gpa, .postgres, table_name);
         errdefer gpa.free(qtable);
-        self.* = .{ .gpa = gpa, .conn = conn, .table = qtable, .ncols = schema.fields.len, .buffer = std.ArrayList(u8).init(gpa) };
+        self.* = .{ .gpa = gpa, .conn = conn, .table = qtable, .ncols = schema.fields.len, .buffer = std.array_list.Managed(u8).init(gpa) };
         errdefer self.buffer.deinit();
 
         var aa = std.heap.ArenaAllocator.init(gpa);
@@ -523,7 +530,7 @@ pub const CopySink = struct {
         if (mode == .overwrite) try conn.exec(try std.fmt.allocPrint(a, "DELETE FROM {s}", .{qtable}));
 
         // COPY <table> ("c1","c2",…) FROM STDIN  (default text format)
-        var cols = std.ArrayList(u8).init(a);
+        var cols = std.array_list.Managed(u8).init(a);
         for (schema.fields, 0..) |f, i| {
             if (i > 0) try cols.append(',');
             try cols.appendSlice(try sqlmod.quoteIdent(a, .postgres, f.name));

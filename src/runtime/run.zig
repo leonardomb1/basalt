@@ -5,9 +5,12 @@
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
+const expand = @import("../lang/expand.zig");
 const types = @import("../lang/types.zig");
 const op = @import("../exec/op.zig");
+const eval = @import("../exec/eval.zig");
 const csv = @import("../connect/csv.zig");
+const tablemod = @import("../connect/table.zig");
 const driver = @import("../connect/driver.zig");
 const starrocks = @import("../connect/starrocks.zig");
 const tds = @import("../connect/tds.zig");
@@ -81,7 +84,7 @@ const Env = struct {
     params: *std.StringHashMap(Value),
     bindings: *std.StringHashMap(ast.Pipeline),
     connections: *std.StringHashMap(ast.Connection),
-    sources: *std.ArrayList(driver.Source),
+    sources: *std.array_list.Managed(driver.Source),
     request_body: ?[]const u8,
     diag: *Diag,
     log: *obs.Logger,
@@ -91,6 +94,9 @@ const Env = struct {
     errctx: *op.ErrCtx,
     /// Emitted-row counter shared by every source (via `obs.CountingSource`).
     rows_read: *std.atomic.Value(u64),
+    /// Parsed JSON params (the request body), navigated by `for x in p.path`.
+    /// Scalar `p.a.b` path access is substituted at plan time (expand.zig).
+    json_params: *std.StringHashMap(std.json.Value),
     /// Set by `openSource` to the leading SQL source of the pipeline being built.
     sql_desc: ?SqlDesc = null,
     /// Connector types of the first source/sink, for the run summary.
@@ -269,10 +275,18 @@ fn buildStarrocksSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*Starrock
     return spec;
 }
 
-pub fn run(gpa: std.mem.Allocator, program: ast.Program, opts: RunOptions, diag: *Diag) !Stats {
+pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts: RunOptions, diag: *Diag) !Stats {
     var plan_arena = std.heap.ArenaAllocator.init(gpa);
     defer plan_arena.deinit();
     const arena = plan_arena.allocator();
+
+    // Expand user-defined `fn`s inline (and drop their declarations) up front, so
+    // nothing downstream sees a user function.
+    var expand_msg: []const u8 = "";
+    const program = expand.expandProgram(arena, raw_program, opts.request_body, &expand_msg) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.ExpandFailed => return planErr(diag, expand_msg),
+    };
 
     if (program.stmts.len == 0 or program.stmts[0] != .kind)
         return planErr(diag, "script must begin with a @kind tag");
@@ -287,14 +301,30 @@ pub fn run(gpa: std.mem.Allocator, program: ast.Program, opts: RunOptions, diag:
     var pit = params.iterator();
     while (pit.next()) |kv| try params_expr.put(kv.key_ptr.*, try mkLit(arena, kv.value_ptr.*));
 
+    // Parse JSON params (from the request body) for runtime navigation by for-each
+    // (`for x in p.tables`). expandProgram already validated the body and inlined
+    // scalar `p.a.b` path access, so a parse error here is unexpected → ignore.
+    var json_params = std.StringHashMap(std.json.Value).init(arena);
+    {
+        var any_json = false;
+        for (program.stmts) |s| if (s == .param and s.param.is_json) {
+            any_json = true;
+        };
+        if (any_json) if (opts.request_body) |b| {
+            if (std.json.parseFromSliceLeaky(std.json.Value, arena, b, .{})) |jv| {
+                for (program.stmts) |s| if (s == .param and s.param.is_json) try json_params.put(s.param.name, jv);
+            } else |_| {}
+        };
+    }
+
     var bindings = std.StringHashMap(ast.Pipeline).init(arena);
     var connections = std.StringHashMap(ast.Connection).init(arena);
     var runnable: usize = 0; // outputs + for-each blocks
     for (program.stmts[1..]) |s| switch (s) {
         .binding => |b| try bindings.put(b.name, b.pipeline),
         .connection => |c| try connections.put(c.name, c),
-        .output, .for_each => runnable += 1,
-        .param, .kind => {},
+        .output, .for_each, .match => runnable += 1,
+        .param, .kind, .func => {},
     };
     if (runnable == 0)
         return planErr(diag, "no output pipeline (a pipeline ending in `write`)");
@@ -309,8 +339,8 @@ pub fn run(gpa: std.mem.Allocator, program: ast.Program, opts: RunOptions, diag:
     var errctx = op.ErrCtx{};
     errdefer if (errctx.msg.len > 0) setMsg(diag, errctx.msg);
 
-    var sources = std.ArrayList(driver.Source).init(arena);
-    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read };
+    var sources = std.array_list.Managed(driver.Source).init(arena);
+    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params };
 
     var batch_arena = std.heap.ArenaAllocator.init(gpa);
     defer batch_arena.deinit();
@@ -321,6 +351,7 @@ pub fn run(gpa: std.mem.Allocator, program: ast.Program, opts: RunOptions, diag:
     for (program.stmts[1..]) |s| switch (s) {
         .output => |p| try runOutput(&env, p, opts, &stats, &lanes_used, &batch_arena),
         .for_each => |fe| try runForEach(&env, fe, opts, &stats, &lanes_used, &batch_arena),
+        .match => |m| try runStmtMatch(&env, m, opts, &stats, &lanes_used, &batch_arena),
         else => {},
     };
     for (sources.items) |sc| sc.close();
@@ -343,11 +374,71 @@ pub fn run(gpa: std.mem.Allocator, program: ast.Program, opts: RunOptions, diag:
         .threads = lanes_used,
     };
     switch (opts.log.summary) {
-        .json_stdout => summary.renderJson(std.io.getStdOut().writer()) catch {},
+        .json_stdout => {
+            var sbuf: [1024]u8 = undefined;
+            var sfw = std.fs.File.stdout().writer(&sbuf);
+            summary.renderJson(&sfw.interface) catch {};
+            sfw.interface.flush() catch {};
+        },
         .stderr => logger.summary(summary),
         .none => {},
     }
     return stats;
+}
+
+/// Plan-time structural dispatch: evaluate the subject/guards over the resolved
+/// params and run the first matching arm's block. No matching arm (and no `_`) is
+/// a no-op. Subject form compares the subject to each pattern; guard form runs the
+/// first arm whose boolean condition holds.
+fn runStmtMatch(env: *Env, m: ast.StmtMatch, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+    var names = std.array_list.Managed([]const u8).init(env.arena);
+    var values = std.array_list.Managed(Value).init(env.arena);
+    var it = env.params.iterator();
+    while (it.next()) |kv| {
+        try names.append(kv.key_ptr.*);
+        try values.append(kv.value_ptr.*);
+    }
+    const ns = names.items;
+    const vs = values.items;
+
+    var subj: ?Value = null;
+    if (m.subject) |s| subj = eval.constEval(env.arena, s, ns, vs) catch |e|
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "match subject: {s}", .{@errorName(e)}));
+
+    for (m.arms) |arm| {
+        const hit = blk: {
+            if (arm.is_default) break :blk true;
+            if (arm.guard) |g| {
+                const gv = eval.constEval(env.arena, g, ns, vs) catch |e|
+                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "match guard: {s}", .{@errorName(e)}));
+                break :blk (gv == .bool and gv.bool);
+            }
+            const sv = subj orelse break :blk false;
+            for (arm.pats) |p| {
+                const pv = eval.constEval(env.arena, p, ns, vs) catch |e|
+                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "match pattern: {s}", .{@errorName(e)}));
+                if (eval.compareValues(sv, pv)) |ord| if (ord == .eq) break :blk true;
+            }
+            break :blk false;
+        };
+        if (hit) {
+            for (arm.body) |*st| try runStmt(env, st, opts, stats, lanes_used, batch_arena);
+            return; // first matching arm wins
+        }
+    }
+}
+
+/// Execute one statement — used for match arm bodies. Registers declarations into
+/// the env and runs output / for-each / nested match.
+fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+    switch (s.*) {
+        .output => |p| try runOutput(env, p, opts, stats, lanes_used, batch_arena),
+        .for_each => |fe| try runForEach(env, fe, opts, stats, lanes_used, batch_arena),
+        .match => |mm| try runStmtMatch(env, mm, opts, stats, lanes_used, batch_arena),
+        .binding => |b| try env.bindings.put(b.name, b.pipeline),
+        .connection => |c| try env.connections.put(c.name, c),
+        .param, .kind, .func => {},
+    }
 }
 
 /// Run one output pipeline (ending in `write`): build it, then either split it
@@ -444,7 +535,7 @@ fn discoverRows(env: *Env, src_read: ast.Read, ncols: usize) ![]const Row {
     const src = openSource(env, src_read) catch |e|
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each discovery failed: {s}", .{@errorName(e)}));
     defer src.close();
-    var rows = std.ArrayList(Row).init(env.arena);
+    var rows = std.array_list.Managed(Row).init(env.arena);
     var da = std.heap.ArenaAllocator.init(env.gpa);
     defer da.deinit();
     while (true) {
@@ -467,6 +558,49 @@ fn discoverRows(env: *Env, src_read: ast.Read, ncols: usize) ![]const Row {
         }
     }
     return rows.toOwnedSlice();
+}
+
+/// Discover for-each rows from a JSON array param (`for a, b in job.tables`):
+/// navigate to the array, then bind each loop variable to the like-named field of
+/// each object element (coerced to text). Mirrors `discoverRows` for reads.
+fn discoverRowsJson(env: *Env, path: ast.QualName, var_names: []const []const u8) ![]const Row {
+    const head = path.parts[0];
+    var cur = env.json_params.get(head) orelse
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each: `{s}` is not a JSON param", .{head}));
+    for (path.parts[1..]) |key| {
+        cur = switch (cur) {
+            .object => |o| o.get(key) orelse
+                return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each: json key `{s}` not found", .{key})),
+            else => return planErr(env.diag, "for-each: json path is not an object"),
+        };
+    }
+    const arr = switch (cur) {
+        .array => |a| a,
+        else => return planErr(env.diag, "for-each: json source is not an array"),
+    };
+    var rows = std.array_list.Managed(Row).init(env.arena);
+    for (arr.items) |elem| {
+        const row = try env.arena.alloc([]const u8, var_names.len);
+        for (var_names, 0..) |vn, i| {
+            row[i] = switch (elem) {
+                .object => |o| if (o.get(vn)) |fv| try jsonToStr(env.arena, fv) else "",
+                else => "",
+            };
+        }
+        try rows.append(row);
+    }
+    return rows.toOwnedSlice();
+}
+
+fn jsonToStr(arena: std.mem.Allocator, v: std.json.Value) ![]const u8 {
+    return switch (v) {
+        .null => "",
+        .bool => |b| if (b) "true" else "false",
+        .integer => |i| try std.fmt.allocPrint(arena, "{d}", .{i}),
+        .float => |f| try std.fmt.allocPrint(arena, "{d}", .{f}),
+        .number_string, .string => |s| s,
+        .array, .object => "", // non-scalar field — not usable as a ${var}
+    };
 }
 
 /// Replace every needle (`${var}`) in `s` with its row value (chained over all
@@ -549,10 +683,57 @@ fn renderPipeline(env: *Env, body: ast.Pipeline, needles: []const []const u8, ro
         switch (src.node) {
             .read => |rd| dst.node = .{ .read = try renderRead(arena, rd, needles, row) },
             .write => |w| dst.node = .{ .write = try renderWrite(arena, w, needles, row) },
+            // Interpolate `${var}` inside expression string-literals too, so loop
+            // values can drive computed columns / predicates, not just targets.
+            .filter => |e| dst.node = .{ .filter = try renderExpr(arena, e, needles, row) },
+            .select => |items| dst.node = .{ .select = try renderSelect(arena, items, needles, row) },
+            .aggregate => |ag| {
+                const aggs = try arena.alloc(ast.AggItem, ag.aggs.len);
+                for (ag.aggs, 0..) |a, i| aggs[i] = .{ .name = a.name, .func = a.func, .arg = if (a.arg) |e| try renderExpr(arena, e, needles, row) else null };
+                dst.node = .{ .aggregate = .{ .aggs = aggs, .by = ag.by } };
+            },
             else => {},
         }
     }
     return .{ .stages = stages, .pos = body.pos };
+}
+
+/// Deep-copy an expression, interpolating `${var}` needles into every string
+/// literal. Non-string leaves are reused as-is (identifiers can't hold needles).
+fn renderExpr(arena: std.mem.Allocator, e: *const ast.Expr, needles: []const []const u8, row: Row) anyerror!*ast.Expr {
+    return switch (e.*) {
+        .str_lit => |s| try mk(arena, .{ .str_lit = try interpAll(arena, s, needles, row) }),
+        .null_lit, .bool_lit, .int_lit, .float_lit, .field => @constCast(e),
+        .unary => |u| try mk(arena, .{ .unary = .{ .op = u.op, .e = try renderExpr(arena, u.e, needles, row) } }),
+        .binary => |b| try mk(arena, .{ .binary = .{ .op = b.op, .l = try renderExpr(arena, b.l, needles, row), .r = try renderExpr(arena, b.r, needles, row) } }),
+        .cond => |c| try mk(arena, .{ .cond = .{ .cond = try renderExpr(arena, c.cond, needles, row), .then = try renderExpr(arena, c.then, needles, row), .els = try renderExpr(arena, c.els, needles, row) } }),
+        .cast => |c| try mk(arena, .{ .cast = .{ .e = try renderExpr(arena, c.e, needles, row), .ty = c.ty } }),
+        .is_null => |n| try mk(arena, .{ .is_null = .{ .e = try renderExpr(arena, n.e, needles, row), .negated = n.negated } }),
+        .call => |c| blk: {
+            const args = try arena.alloc(*ast.Expr, c.args.len);
+            for (c.args, 0..) |a, i| args[i] = try renderExpr(arena, a, needles, row);
+            break :blk try mk(arena, .{ .call = .{ .name = c.name, .args = args } });
+        },
+        .match => |m| blk: {
+            const subject = if (m.subject) |s| try renderExpr(arena, s, needles, row) else null;
+            const arms = try arena.alloc(ast.MatchArm, m.arms.len);
+            for (m.arms, 0..) |arm, i| {
+                const pats = try arena.alloc(*ast.Expr, arm.pats.len);
+                for (arm.pats, 0..) |p, j| pats[j] = try renderExpr(arena, p, needles, row);
+                arms[i] = .{ .pats = pats, .guard = if (arm.guard) |g| try renderExpr(arena, g, needles, row) else null, .value = try renderExpr(arena, arm.value, needles, row), .is_default = arm.is_default };
+            }
+            break :blk try mk(arena, .{ .match = .{ .subject = subject, .arms = arms } });
+        },
+    };
+}
+
+fn renderSelect(arena: std.mem.Allocator, items: []const ast.SelectItem, needles: []const []const u8, row: Row) ![]const ast.SelectItem {
+    const out = try arena.alloc(ast.SelectItem, items.len);
+    for (items, 0..) |it, i| out[i] = switch (it) {
+        .computed => |c| .{ .computed = .{ .name = c.name, .expr = try renderExpr(arena, c.expr, needles, row) } },
+        else => it,
+    };
+    return out;
 }
 
 /// Shared state for parallel-for workers. Per-table work uses a worker-private
@@ -597,7 +778,7 @@ fn forWorker(ctx: *ForCtx) void {
         defer w_arena.deinit();
         var w_batch = std.heap.ArenaAllocator.init(gpa);
         defer w_batch.deinit();
-        var w_sources = std.ArrayList(driver.Source).init(w_arena.allocator());
+        var w_sources = std.array_list.Managed(driver.Source).init(w_arena.allocator());
         var w_diag = Diag{};
         var w_errctx = op.ErrCtx{};
         var w_env = Env{
@@ -613,6 +794,7 @@ fn forWorker(ctx: *ForCtx) void {
             .params_expr = ctx.base.params_expr,
             .errctx = &w_errctx,
             .rows_read = ctx.base.rows_read,
+            .json_params = ctx.base.json_params,
         };
         var st = Stats{ .run_id = 0 };
         var lanes: usize = 1;
@@ -641,7 +823,10 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
     else
         .stop;
 
-    const rows = try discoverRows(env, fe.source, fe.var_names.len);
+    const rows = switch (fe.source) {
+        .read => |rd| try discoverRows(env, rd, fe.var_names.len),
+        .json_path => |p| try discoverRowsJson(env, p, fe.var_names),
+    };
     env.log.log(.info, "for-each {s}: {d} row(s) [{s}, on_error={s}]", .{ fe.var_names[0], rows.len, @tagName(mode), if (on_error == .continue_) "continue" else "stop" });
     if (rows.len == 0) return;
     const needles = try env.arena.alloc([]const u8, fe.var_names.len);
@@ -757,7 +942,7 @@ fn readName(rd: ast.Read) []const u8 {
 /// the source field when present, else NULL. (Extra source columns aren't listed,
 /// so they're dropped.) Reusing `select` gets us the vectorized cast/eval for free.
 fn synthReconcile(arena: std.mem.Allocator, src: types.Schema, canon: types.Schema, tag_col: ?[]const u8, tag_val: ?[]const u8) ![]const ast.SelectItem {
-    var items = std.ArrayList(ast.SelectItem).init(arena);
+    var items = std.array_list.Managed(ast.SelectItem).init(arena);
     if (tag_col) |tc|
         try items.append(.{ .computed = .{ .name = tc, .expr = try mk(arena, .{ .str_lit = tag_val orelse "" }) } });
     for (canon.fields) |cf| {
@@ -783,7 +968,7 @@ const UnionSpec = struct { read: ast.Read, tag: ?[]const u8, name: []const u8 };
 /// `(table_name, tag)` query.
 fn unionSpecs(env: *Env, u: ast.Union) ![]UnionSpec {
     const arena = env.arena;
-    var specs = std.ArrayList(UnionSpec).init(arena);
+    var specs = std.array_list.Managed(UnionSpec).init(arena);
     if (u.discover_query.len > 0) {
         const disc = ast.Read{ .connector = u.discover_conn, .form = .{ .query = u.discover_query } };
         for (try discoverRows(env, disc, 2)) |row| {
@@ -876,7 +1061,7 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
     const w = write_stage.node.write;
     for (specs, schemas, 0..) |s, sch, i| {
         const items = try synthReconcile(arena, sch, canon, tag_col, s.tag);
-        var bstages = std.ArrayList(ast.Stage).init(arena);
+        var bstages = std.array_list.Managed(ast.Stage).init(arena);
         try bstages.append(.{ .node = .{ .read = s.read }, .hints = &.{}, .pos = u.pos });
         try bstages.append(.{ .node = .{ .select = items }, .hints = &.{}, .pos = u.pos });
         try bstages.appendSlice(downstream);
@@ -1261,6 +1446,11 @@ fn qualStr(arena: std.mem.Allocator, q: ast.QualName) ![]const u8 {
 }
 
 fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
+    if (std.mem.eql(u8, w.connector, "stdout")) {
+        const writer = tablemod.TableWriter.open(env.gpa, schema) catch
+            return planErr(env.diag, "could not open stdout table");
+        return writer.sink();
+    }
     if (std.mem.eql(u8, w.connector, "csv")) {
         const writer = csv.CsvWriter.open(env.arena, w.target, schema) catch
             return planErr(env.diag, "could not open output CSV");
@@ -1385,6 +1575,7 @@ fn resolveParams(arena: std.mem.Allocator, program: ast.Program, cli: []const Pa
     for (program.stmts) |s| {
         if (s != .param) continue;
         const p = s.param;
+        if (p.is_json) continue; // JSON params live in a separate namespace (expand.zig)
         var v: ?Value = null;
         for (cli) |kv| {
             if (std.mem.eql(u8, kv.key, p.name)) {
@@ -1547,6 +1738,74 @@ test "distinct keeps first row per key" {
     try std.testing.expectEqualStrings("status,amount\npaid,100\npending,50\n", out);
 }
 
+test "for-each over a JSON array param iterates and binds fields by name" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,status\n1,paid\n2,pending\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
+    defer alloc.free(in_path);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    // Job spec body: one table entry whose `name` field is the input path.
+    const body = try std.fmt.allocPrint(alloc, "{{\"tables\":[{{\"name\":\"{s}\"}}]}}", .{in_path});
+    defer alloc.free(body);
+    const script = try std.fmt.allocPrint(alloc, "@batch\nparam job json from body\n" ++
+        "for name in job.tables @[mode = sequential]\n" ++
+        "  read csv \"${{name}}\" | select id | write csv \"{s}\"", .{out_path});
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    _ = run(alloc, prog, .{ .request_body = body }, &rdiag) catch |e| {
+        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+        return e;
+    };
+    const out = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id\n1\n2\n", out);
+}
+
+test "for-each loop var interpolates into a select column value" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,status\n1,paid\n2,pending\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
+    defer alloc.free(in_path);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    const body = try std.fmt.allocPrint(alloc, "{{\"tables\":[{{\"name\":\"{s}\",\"emp\":\"01\"}}]}}", .{in_path});
+    defer alloc.free(body);
+    // `${emp}` flows into a computed select column VALUE (the new capability).
+    const script = try std.fmt.allocPrint(alloc, "@batch\nparam job json from body\n" ++
+        "for name, emp in job.tables @[mode = sequential]\n" ++
+        "  read csv \"${{name}}\" | select id, EMPRESA = \"${{emp}}\" | write csv \"{s}\"", .{out_path});
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    _ = run(alloc, prog, .{ .request_body = body }, &rdiag) catch |e| {
+        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+        return e;
+    };
+    const out = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id,EMPRESA\n1,01\n2,01\n", out);
+}
+
 /// Parse and run a fully-assembled `script`, returning the contents of out.csv.
 fn runScript(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, script: []const u8, cli_params: []const ParamArg) ![]u8 {
     var parena = std.heap.ArenaAllocator.init(alloc);
@@ -1606,7 +1865,7 @@ test "parallel driver matches serial output across many batches" {
     // ~5000 rows -> several 1024-row batches. CSV is non-splittable, so both the
     // 1- and 4-thread runs execute serially (split-parallel needs a SQL source);
     // this guards that requesting threads does not change or corrupt the output.
-    var in = std.ArrayList(u8).init(alloc);
+    var in = std.array_list.Managed(u8).init(alloc);
     defer in.deinit();
     try in.appendSlice("id,amount\n");
     var k: usize = 0;

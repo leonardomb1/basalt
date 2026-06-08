@@ -9,6 +9,7 @@ const types = @import("../lang/types.zig");
 const column = @import("column.zig");
 const batchmod = @import("batch.zig");
 const eval = @import("eval.zig");
+const simd = @import("simd.zig");
 const valuemod = @import("value.zig");
 const driver = @import("../connect/driver.zig");
 
@@ -108,7 +109,7 @@ pub const Linear = struct { src: driver.Source, stages: []const Stage };
 /// breakers or limit), decompose it into a source + ordered stage list the
 /// parallel driver can fan out across threads. Returns null otherwise.
 pub fn linearize(arena: std.mem.Allocator, top: Op) !?Linear {
-    var rev = std.ArrayList(Stage).init(arena);
+    var rev = std.array_list.Managed(Stage).init(arena);
     var cur = top;
     while (true) {
         switch (cur) {
@@ -356,7 +357,7 @@ fn gather(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usize) a
 /// Serialize the key columns of one row into a comparable byte string (with a
 /// null marker and field separator), for hash-grouping/dedup.
 fn rowKey(arena: std.mem.Allocator, b: Batch, idxs: []const usize, row: usize) anyerror![]const u8 {
-    var buf = std.ArrayList(u8).init(arena);
+    var buf = std.array_list.Managed(u8).init(arena);
     for (idxs) |ci| {
         const v = b.columns[ci].getValue(row);
         if (v.isNull()) {
@@ -487,7 +488,13 @@ pub const Aggregate = struct {
             return null;
         };
 
-        var groups = std.ArrayList(Group).init(arena);
+        // No GROUP BY: try the vectorized columnar path (evaluate each arg as a
+        // column once, then SIMD-reduce) before the row-wise fallback.
+        if (self.by.len == 0) {
+            if (try self.globalFast(arena, all)) |b| return b;
+        }
+
+        var groups = std.array_list.Managed(Group).init(arena);
         var map = std.StringHashMap(usize).init(arena);
         var r: usize = 0;
         while (r < all.len) : (r += 1) {
@@ -512,6 +519,60 @@ pub const Aggregate = struct {
             }
         }
         return try self.emit(arena, groups.items);
+    }
+
+    /// Vectorized global aggregation (no GROUP BY): evaluate each agg's argument
+    /// to a column once and reduce it, instead of boxing every row. Returns null
+    /// to fall back to the row-wise path for any agg this path doesn't handle.
+    fn globalFast(self: *Aggregate, arena: std.mem.Allocator, all: Batch) anyerror!?Batch {
+        const vals = try arena.alloc(Value, self.aggs.len);
+        for (self.aggs, 0..) |agg, j| {
+            vals[j] = (try self.reduceAgg(arena, agg, all)) orelse return null;
+        }
+        const builders = try arena.alloc(column.Builder, self.aggs.len);
+        for (builders, self.out_schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
+        for (vals, 0..) |v, j| try builders[j].append(v);
+        const cols = try arena.alloc(column.Column, self.aggs.len);
+        for (builders, 0..) |*b, i| cols[i] = try b.finish();
+        return Batch{ .schema = self.out_schema, .columns = cols, .len = 1 };
+    }
+
+    /// Reduce one agg over the whole batch. Outer `null` means "unsupported, fall
+    /// back to row-wise"; an inner `Value.null` is a real SQL NULL result.
+    fn reduceAgg(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, all: Batch) anyerror!?Value {
+        if (agg.func == .count and agg.arg == null) return Value{ .int = @intCast(all.len) };
+        const e = agg.arg orelse return null;
+        const col = eval.evalColumn(arena, e, all, agg.ty) catch |err| {
+            if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
+            return err;
+        };
+        if (col.ty.kind != .int and col.ty.kind != .float) return null; // row-wise handles the rest
+        const n = all.len;
+        const nvalid = simd.popcountValid(col.validity.bits, n);
+        switch (agg.func) {
+            .count => return Value{ .int = @intCast(nvalid) },
+            .sum => {
+                if (nvalid == 0) return @as(Value, .null);
+                return switch (col.ty.kind) {
+                    .float => Value{ .float = simd.sumF(col.data.f64[0..n]) },
+                    .int => Value{ .int = sumIntCol(col.data.i64[0..n]) }, // null lanes are 0
+                    else => unreachable,
+                };
+            },
+            .avg => {
+                if (nvalid == 0) return @as(Value, .null);
+                const total: f64 = switch (col.ty.kind) {
+                    .float => simd.sumF(col.data.f64[0..n]),
+                    .int => @floatFromInt(sumIntCol(col.data.i64[0..n])),
+                    else => unreachable,
+                };
+                return Value{ .float = total / @as(f64, @floatFromInt(nvalid)) };
+            },
+            .min, .max => {
+                if (nvalid == 0) return @as(Value, .null);
+                return reduceExtreme(col, agg.func, n);
+            },
+        }
     }
 
     fn emit(self: *Aggregate, arena: std.mem.Allocator, groups: []const Group) anyerror!Batch {
@@ -584,6 +645,36 @@ fn lessV(a: Value, b: Value) bool {
     return (eval.compareValues(a, b) orelse .eq) == .lt;
 }
 
+fn sumIntCol(d: []const i64) i64 {
+    var s: i64 = 0;
+    for (d) |x| s +%= x; // LLVM auto-vectorizes integer reduction; null lanes hold 0
+    return s;
+}
+
+/// MIN/MAX over an int/float column, honoring nulls. SIMD on the all-valid fast
+/// path (null lanes' 0 default would corrupt the extreme), else a scalar skip.
+fn reduceExtreme(col: column.Column, func: ast.AggFunc, n: usize) Value {
+    const is_min = func == .min;
+    if (col.ty.kind == .float) {
+        const d = col.data.f64[0..n];
+        if (col.validity.allSet(n)) {
+            return .{ .float = if (is_min) simd.minF(d) else simd.maxF(d) };
+        }
+        var m: ?f64 = null;
+        for (d, 0..) |x, i| {
+            if (!col.validity.get(i)) continue;
+            m = if (m) |cur| (if (is_min) @min(cur, x) else @max(cur, x)) else x;
+        }
+        return if (m) |x| Value{ .float = x } else .null;
+    }
+    var m: ?i64 = null;
+    for (col.data.i64[0..n], 0..) |x, i| {
+        if (!col.validity.get(i)) continue;
+        m = if (m) |cur| (if (is_min) @min(cur, x) else @max(cur, x)) else x;
+    }
+    return if (m) |x| Value{ .int = x } else .null;
+}
+
 /// Like materializeAll but always returns a (possibly empty) batch with the
 /// schema's columns present — so a join can emit right-side nulls even when the
 /// build side is empty.
@@ -626,7 +717,7 @@ pub const Join = struct {
 
     built: bool = false,
     build_batch: Batch = undefined,
-    index: std.StringHashMap(std.ArrayList(usize)) = undefined,
+    index: std.StringHashMap(std.array_list.Managed(usize)) = undefined,
 
     const empty_match: []const usize = &.{};
 
@@ -634,12 +725,12 @@ pub const Join = struct {
         if (!self.built) {
             self.built = true;
             self.build_batch = try materializeFull(arena, self.build, self.right_schema);
-            self.index = std.StringHashMap(std.ArrayList(usize)).init(arena);
+            self.index = std.StringHashMap(std.array_list.Managed(usize)).init(arena);
             var r: usize = 0;
             while (r < self.build_batch.len) : (r += 1) {
                 const k = (try valueKey(arena, self.build_batch.columns[self.right_key].getValue(r))) orelse continue;
                 const gop = try self.index.getOrPut(k);
-                if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(usize).init(arena);
+                if (!gop.found_existing) gop.value_ptr.* = std.array_list.Managed(usize).init(arena);
                 try gop.value_ptr.append(r);
             }
         }

@@ -18,8 +18,11 @@ pub fn serve(gpa: std.mem.Allocator, program: ast.Program, port: u16) !void {
     var net_server = try address.listen(.{ .reuse_address = true });
     defer net_server.deinit();
 
-    const stderr = std.io.getStdErr().writer();
+    var stderr_buf: [512]u8 = undefined;
+    var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+    const stderr = &stderr_file.interface;
     try stderr.print("pipeline serving @http on http://0.0.0.0:{d}{s}\n", .{ port, path });
+    try stderr.flush();
 
     var read_buf: [64 * 1024]u8 = undefined;
     while (true) {
@@ -30,8 +33,11 @@ pub fn serve(gpa: std.mem.Allocator, program: ast.Program, port: u16) !void {
 }
 
 fn handleConn(gpa: std.mem.Allocator, program: ast.Program, conn: std.net.Server.Connection, path: []const u8, read_buf: []u8) !void {
-    var http = std.http.Server.init(conn, read_buf);
-    while (http.state == .ready) {
+    var send_buf: [16 * 1024]u8 = undefined;
+    var creader = conn.stream.reader(read_buf);
+    var cwriter = conn.stream.writer(&send_buf);
+    var http = std.http.Server.init(creader.interface(), &cwriter.interface);
+    while (http.reader.state == .ready) {
         var req = http.receiveHead() catch return;
 
         const target = req.head.target;
@@ -44,11 +50,12 @@ fn handleConn(gpa: std.mem.Allocator, program: ast.Program, conn: std.net.Server
             return;
         }
 
-        const reader = try req.reader();
-        const body = try reader.readAllAlloc(gpa, 64 * 1024 * 1024);
+        var body_buf: [64 * 1024]u8 = undefined;
+        const reader = try req.readerExpectContinue(&body_buf);
+        const body = try reader.allocRemaining(gpa, .limited(64 * 1024 * 1024));
         defer gpa.free(body);
 
-        var params = std.ArrayList(runtime.ParamArg).init(gpa);
+        var params = std.array_list.Managed(runtime.ParamArg).init(gpa);
         defer params.deinit();
         try parseQuery(&params, query);
 
@@ -75,7 +82,7 @@ fn handleConn(gpa: std.mem.Allocator, program: ast.Program, conn: std.net.Server
 }
 
 /// Parse a `k=v&k2=v2` query string into params (no percent-decoding for now).
-fn parseQuery(params: *std.ArrayList(runtime.ParamArg), query: []const u8) !void {
+fn parseQuery(params: *std.array_list.Managed(runtime.ParamArg), query: []const u8) !void {
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
         if (pair.len == 0) continue;

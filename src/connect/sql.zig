@@ -182,7 +182,7 @@ pub const Sink = struct {
     table: []const u8, // quoted, qualified
     schema: types.Schema, // field names + types (owned in gpa)
     mode: ast.WriteMode,
-    rows: std.ArrayList([]const u8), // serialized "(...)" tuples (slices into tuple_arena)
+    rows: std.array_list.Managed([]const u8), // serialized "(...)" tuples (slices into tuple_arena)
     tuple_arena: std.heap.ArenaAllocator, // backs the tuple bytes; reset per flush (no per-row malloc/free)
     flush_rows: usize, // rows per INSERT (dialect-dependent cap)
 
@@ -209,7 +209,7 @@ pub const Sink = struct {
             .table = qtable,
             .schema = .{ .fields = fields },
             .mode = mode,
-            .rows = std.ArrayList([]const u8).init(gpa),
+            .rows = std.array_list.Managed([]const u8).init(gpa),
             .tuple_arena = std.heap.ArenaAllocator.init(gpa),
             .flush_rows = flushRowsFor(dialect),
         };
@@ -283,7 +283,7 @@ pub fn createTableSql(arena: std.mem.Allocator, dialect: Dialect, qtable: []cons
         .upsert => |u| u.keys,
         else => &.{},
     };
-    var buf = std.ArrayList(u8).init(arena);
+    var buf = std.array_list.Managed(u8).init(arena);
     const w = buf.writer();
 
     if (dialect == .sqlserver) {
@@ -319,7 +319,7 @@ fn buildStatement(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8
         return buildMerge(arena, dialect, qtable, schema, mode.upsert.keys, cols, values);
     }
 
-    var buf = std.ArrayList(u8).init(arena);
+    var buf = std.array_list.Managed(u8).init(arena);
     const w = buf.writer();
     try w.print("INSERT INTO {s} ({s}) VALUES {s}", .{ qtable, cols, values });
 
@@ -346,7 +346,7 @@ fn buildStatement(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8
 }
 
 fn buildMerge(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8, schema: types.Schema, keys: []const []const u8, cols: []const u8, values: []const u8) ![]const u8 {
-    var buf = std.ArrayList(u8).init(arena);
+    var buf = std.array_list.Managed(u8).init(arena);
     const w = buf.writer();
     try w.print("MERGE INTO {s} AS T USING (VALUES {s}) AS S ({s}) ON ", .{ qtable, values, cols });
     for (keys, 0..) |k, i| {
@@ -388,7 +388,7 @@ fn writeMysqlUpdate(w: anytype, arena: std.mem.Allocator, dialect: Dialect, sche
 }
 
 fn colList(arena: std.mem.Allocator, dialect: Dialect, schema: types.Schema) ![]const u8 {
-    var buf = std.ArrayList(u8).init(arena);
+    var buf = std.array_list.Managed(u8).init(arena);
     for (schema.fields, 0..) |f, i| {
         if (i > 0) try buf.append(',');
         try buf.appendSlice(try quoteIdent(arena, dialect, f.name));
@@ -397,7 +397,7 @@ fn colList(arena: std.mem.Allocator, dialect: Dialect, schema: types.Schema) ![]
 }
 
 fn serializeRow(gpa: std.mem.Allocator, dialect: Dialect, batch: Batch, row: usize) ![]const u8 {
-    var buf = std.ArrayList(u8).init(gpa);
+    var buf = std.array_list.Managed(u8).init(gpa);
     try buf.append('(');
     for (batch.columns, 0..) |*c, i| {
         if (i > 0) try buf.append(',');
@@ -505,7 +505,7 @@ fn bulkEscaped(w: anytype, s: []const u8) !void {
 }
 
 pub fn quoteIdent(arena: std.mem.Allocator, dialect: Dialect, name: []const u8) ![]const u8 {
-    var buf = std.ArrayList(u8).init(arena);
+    var buf = std.array_list.Managed(u8).init(arena);
     var it = std.mem.splitScalar(u8, name, '.');
     var first = true;
     while (it.next()) |part| {
@@ -624,7 +624,7 @@ test "value serialization escapes quotes and formats dates" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var buf = std.ArrayList(u8).init(a);
+    var buf = std.array_list.Managed(u8).init(a);
     try serializeValue(buf.writer(), .postgres, .{ .string = "O'Brien" }, a);
     try std.testing.expectEqualStrings("'O''Brien'", buf.items);
 

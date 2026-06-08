@@ -1,8 +1,10 @@
-//! Command-line surface. One verb dispatches on the script's `@kind` meta tag:
-//!   pipeline run   <script> [-p k=v ...] [--port N]
-//!   pipeline check <script>
-//! `check` is real (parse + report). `run` parses then reports that execution
-//! lands in M2.
+//! Command-line surface:
+//!   basalt run   <script>|-c <script> [-p k=v ...] [-j N] [--port N]
+//!   basalt check <script>|-c <script> [-s|--show-plan] [--connect]
+//!   basalt repl
+//! `run` executes (mode from the script's `@kind`); `check` validates/plans. A
+//! script comes from a file path or, with `-c/--command`, inline. `repl` is an
+//! interactive loop that prints results via the `write stdout` table sink.
 
 const std = @import("std");
 const parser = @import("../lang/parser.zig");
@@ -16,10 +18,13 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
 
-    const stderr = std.io.getStdErr().writer();
+    var stderr_buf: [4096]u8 = undefined;
+    var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+    const stderr = &stderr_file.interface;
 
     if (args.len < 2) {
         try usage(stderr);
+        try stderr.flush();
         std.process.exit(2);
     }
 
@@ -28,35 +33,58 @@ pub fn run(alloc: std.mem.Allocator) !void {
         std.process.exit(try cmdCheck(alloc, args));
     } else if (std.mem.eql(u8, verb, "run")) {
         std.process.exit(try cmdRun(alloc, args));
+    } else if (std.mem.eql(u8, verb, "repl")) {
+        std.process.exit(try cmdRepl(alloc));
     } else if (std.mem.eql(u8, verb, "help") or std.mem.eql(u8, verb, "-h") or std.mem.eql(u8, verb, "--help")) {
-        try usage(std.io.getStdOut().writer());
+        var stdout_buf: [4096]u8 = undefined;
+        var stdout_file = std.fs.File.stdout().writer(&stdout_buf);
+        try usage(&stdout_file.interface);
+        try stdout_file.interface.flush();
         return;
     }
 
     try stderr.print("error: unknown command `{s}`\n\n", .{verb});
     try usage(stderr);
+    try stderr.flush();
     std.process.exit(2);
 }
 
-/// Parse <script>, printing diagnostics. Returns the parsed program on success
-/// (allocated in `arena`, with the source kept alive in `arena` too since the AST
-/// slices into it), or null after printing the error (caller exits 1).
-fn parseFile(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8) !?ast.Program {
-    const stderr = std.io.getStdErr().writer();
-    if (args.len < 3) {
-        try stderr.print("error: `{s}` requires a <script> path\n", .{verb});
+/// A script source plus a label used in diagnostics (a file path, or `<command>`).
+const Source = struct { label: []const u8, text: []const u8 };
+
+/// Resolve the script source: `-c/--command <text>` for an inline script, else the
+/// positional <script> path read from disk. Prints diagnostics and returns null on
+/// failure. `text` is owned by `arena` (or by argv, also long-lived).
+fn loadSource(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8, stderr: *std.Io.Writer) !?Source {
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "-c") or std.mem.eql(u8, args[i], "--command")) {
+            if (i + 1 >= args.len) {
+                try stderr.print("error: missing script after `{s}`\n", .{args[i]});
+                return null;
+            }
+            return Source{ .label = "<command>", .text = args[i + 1] };
+        }
+    }
+    if (args.len < 3 or (args[2].len > 0 and args[2][0] == '-')) {
+        try stderr.print("error: `{s}` requires a <script> path or `-c <script>`\n", .{verb});
         return null;
     }
-    const script = args[2];
-    const src = std.fs.cwd().readFileAlloc(arena, script, 8 << 20) catch |e| {
-        try stderr.print("error: cannot read `{s}`: {s}\n", .{ script, @errorName(e) });
+    const path = args[2];
+    const text = std.fs.cwd().readFileAlloc(arena, path, 8 << 20) catch |e| {
+        try stderr.print("error: cannot read `{s}`: {s}\n", .{ path, @errorName(e) });
         return null;
     };
+    return Source{ .label = path, .text = text };
+}
 
+/// Parse a resolved source, printing a located diagnostic on failure. The AST is
+/// allocated in `arena` and slices into `src.text`, so both must outlive use.
+fn parseSrc(arena: std.mem.Allocator, src: Source, stderr: *std.Io.Writer) !?ast.Program {
     var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    return parser.parseSource(arena, src, &diag) catch |e| switch (e) {
+    return parser.parseSource(arena, src.text, &diag) catch |e| switch (e) {
         error.ParseFailed => {
-            try stderr.print("{s}:{d}:{d}: error: {s}\n", .{ script, diag.line, diag.col, diag.msg });
+            try stderr.print("{s}:{d}:{d}: error: {s}\n", .{ src.label, diag.line, diag.col, diag.msg });
             return null;
         },
         error.OutOfMemory => return e,
@@ -67,11 +95,28 @@ fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    const prog = (try parseFile(a, "check", args)) orelse return 1;
+
+    var out_buf: [8192]u8 = undefined;
+    var out_file = std.fs.File.stdout().writer(&out_buf);
+    const stdout = &out_file.interface;
+    defer stdout.flush() catch {};
+    var err_buf: [4096]u8 = undefined;
+    var err_file = std.fs.File.stderr().writer(&err_buf);
+    const stderr = &err_file.interface;
+    defer stderr.flush() catch {};
+
+    const src = (try loadSource(a, "check", args, stderr)) orelse return 1;
+    const prog = (try parseSrc(a, src, stderr)) orelse return 1;
 
     var show_plan = false;
     var connect = false;
-    for (args[3..]) |arg| {
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--command")) {
+            i += 1; // skip inline script value
+            continue;
+        }
         if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--show-plan")) show_plan = true;
         if (std.mem.eql(u8, arg, "--connect")) connect = true;
     }
@@ -85,16 +130,15 @@ fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     const plan = analyze.analyze(a, prog, resolver, &adiag) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.AnalyzeFailed => {
-            try std.io.getStdErr().writer().print("{s}: error: {s}\n", .{ args[2], adiag.msg });
+            try stderr.print("{s}: error: {s}\n", .{ src.label, adiag.msg });
             return 1;
         },
     };
 
-    const stdout = std.io.getStdOut().writer();
     if (show_plan) {
         try analyze.render(plan, stdout);
     } else {
-        try stdout.print("ok: {s} checks out\n", .{args[2]});
+        try stdout.print("ok: {s} checks out\n", .{src.label});
     }
     return 0;
 }
@@ -102,12 +146,17 @@ fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
 fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    const prog = (try parseFile(arena.allocator(), "run", args)) orelse return 1;
 
-    const stderr = std.io.getStdErr().writer();
+    var stderr_buf: [4096]u8 = undefined;
+    var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+    const stderr = &stderr_file.interface;
+    defer stderr.flush() catch {};
+
+    const src = (try loadSource(arena.allocator(), "run", args, stderr)) orelse return 1;
+    const prog = (try parseSrc(arena.allocator(), src, stderr)) orelse return 1;
 
     // collect `-p key=value` params and `--port N`
-    var params = std.ArrayList(runtime.ParamArg).init(alloc);
+    var params = std.array_list.Managed(runtime.ParamArg).init(alloc);
     defer params.deinit();
     var port: u16 = 8080;
     // Default to the core count, but threads are only *used* when the source is
@@ -117,9 +166,13 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var threads: usize = std.Thread.getCpuCount() catch 1;
     var log = runtime.LogConfig{};
     var json_summary = false;
-    var i: usize = 3;
+    var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const a = args[i];
+        if (std.mem.eql(u8, a, "-c") or std.mem.eql(u8, a, "--command")) {
+            i += 1; // skip inline script value
+            continue;
+        }
         if (threadFlagValue(a, args, &i)) |tv| {
             threads = std.fmt.parseInt(usize, tv, 10) catch {
                 try stderr.print("error: invalid --threads `{s}`\n", .{tv});
@@ -178,7 +231,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     // @http scripts become a server; @batch/@stream run once.
     if (prog.stmts.len > 0 and prog.stmts[0] == .kind and prog.stmts[0].kind.kind == .http) {
         server.serve(alloc, prog, port) catch |e| {
-            try stderr.print("{s}: serve error: {s}\n", .{ args[2], @errorName(e) });
+            try stderr.print("{s}: serve error: {s}\n", .{ src.label, @errorName(e) });
             return 1;
         };
         return 0;
@@ -191,20 +244,170 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var diag: runtime.Diag = .{};
     _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .log = log }, &diag) catch |e| switch (e) {
         error.PlanFailed => {
-            try stderr.print("{s}: error: {s}\n", .{ args[2], diag.msg });
+            try stderr.print("{s}: error: {s}\n", .{ src.label, diag.msg });
             return 1;
         },
         error.OutOfMemory => return e,
         else => {
             // run() fills diag.msg with stage/column context for expression errors.
             if (diag.msg.len > 0)
-                try stderr.print("{s}: error: {s}\n", .{ args[2], diag.msg })
+                try stderr.print("{s}: error: {s}\n", .{ src.label, diag.msg })
             else
-                try stderr.print("{s}: runtime error: {s}\n", .{ args[2], @errorName(e) });
+                try stderr.print("{s}: runtime error: {s}\n", .{ src.label, @errorName(e) });
             return 1;
         },
     };
     return 0;
+}
+
+/// Interactive read-eval-print loop. Each entry is one or more lines terminated by
+/// a blank line (so multi-stage pipelines can span lines); `@batch` is assumed and
+/// a `write stdout` table sink is appended when the entry doesn't write itself.
+/// Reads from stdin (so `echo ... | basalt repl` works); prompts only on a TTY.
+fn cmdRepl(alloc: std.mem.Allocator) !u8 {
+    var in_buf: [64 * 1024]u8 = undefined;
+    var in_file = std.fs.File.stdin().reader(&in_buf);
+    const in = &in_file.interface;
+
+    var msg_buf: [4096]u8 = undefined;
+    var msg_file = std.fs.File.stderr().writer(&msg_buf);
+    const msg = &msg_file.interface;
+
+    const tty = std.posix.isatty(std.fs.File.stdin().handle);
+    if (tty) {
+        try msg.writeAll("basalt REPL — enter a pipeline, blank line runs it. \\q quits, \\help for help.\n");
+        try msg.flush();
+    }
+
+    var block = std.array_list.Managed(u8).init(alloc);
+    defer block.deinit();
+
+    while (true) {
+        if (tty) {
+            try msg.writeAll("\xc2\xbb "); // "» "
+            try msg.flush();
+        }
+        block.clearRetainingCapacity();
+        var eof = false;
+        while (true) {
+            const maybe = in.takeDelimiter('\n') catch |e| {
+                try msg.print("input error: {s}\n", .{@errorName(e)});
+                try msg.flush();
+                eof = true;
+                break;
+            };
+            const line = maybe orelse {
+                eof = true;
+                break;
+            };
+            if (isBlank(line)) break;
+            try block.appendSlice(line);
+            try block.append('\n');
+        }
+
+        const trimmed = std.mem.trim(u8, block.items, " \t\r\n");
+        if (trimmed.len == 0) {
+            if (eof) break;
+            continue;
+        }
+        if (isQuit(trimmed)) break;
+        if (isHelp(trimmed)) {
+            try replHelp(msg);
+            if (eof) break;
+            continue;
+        }
+
+        try runBlock(alloc, trimmed, msg);
+        if (eof) break;
+    }
+    if (tty) {
+        try msg.writeAll("bye\n");
+        try msg.flush();
+    }
+    return 0;
+}
+
+/// Parse and run one REPL entry, reporting errors without aborting the loop.
+fn runBlock(alloc: std.mem.Allocator, block: []const u8, msg: *std.Io.Writer) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Assume @batch unless the entry opens with its own @kind tag.
+    const text = if (block[0] == '@')
+        block
+    else
+        try std.fmt.allocPrint(a, "@batch\n{s}", .{block});
+
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = parser.parseSource(a, text, &diag) catch |e| switch (e) {
+        error.ParseFailed => {
+            try msg.print("error: {d}:{d}: {s}\n", .{ diag.line, diag.col, diag.msg });
+            try msg.flush();
+            return;
+        },
+        error.OutOfMemory => return e,
+    };
+
+    const prepared = try appendDisplaySinks(a, prog);
+
+    var rdiag: runtime.Diag = .{};
+    _ = runtime.run(alloc, prepared, .{ .log = .{ .summary = .none, .quiet = true } }, &rdiag) catch |e| {
+        if (e == error.OutOfMemory) return e;
+        if (rdiag.msg.len > 0)
+            try msg.print("error: {s}\n", .{rdiag.msg})
+        else
+            try msg.print("error: {s}\n", .{@errorName(e)});
+        try msg.flush();
+    };
+}
+
+/// Append a `write stdout` table sink to any output pipeline that doesn't already
+/// end in a `write`, so REPL entries show their results.
+fn appendDisplaySinks(arena: std.mem.Allocator, prog: ast.Program) !ast.Program {
+    const stmts = try arena.alloc(ast.Stmt, prog.stmts.len);
+    for (prog.stmts, 0..) |st, i| {
+        stmts[i] = st;
+        if (st != .output) continue;
+        const p = st.output;
+        if (p.stages.len > 0 and p.stages[p.stages.len - 1].node == .write) continue;
+        const stages = try arena.alloc(ast.Stage, p.stages.len + 1);
+        @memcpy(stages[0..p.stages.len], p.stages);
+        stages[p.stages.len] = .{
+            .node = .{ .write = .{ .connector = "stdout", .form = null, .target = "", .mode = .default } },
+            .hints = &.{},
+            .pos = p.pos,
+        };
+        stmts[i] = .{ .output = .{ .stages = stages, .pos = p.pos } };
+    }
+    return .{ .stmts = stmts };
+}
+
+fn isBlank(s: []const u8) bool {
+    return std.mem.trim(u8, s, " \t\r\n").len == 0;
+}
+fn isQuit(s: []const u8) bool {
+    inline for (.{ "\\q", "\\quit", ":q", "quit", "exit" }) |k| {
+        if (std.mem.eql(u8, s, k)) return true;
+    }
+    return false;
+}
+fn isHelp(s: []const u8) bool {
+    inline for (.{ "\\help", "\\h", "help", "?" }) |k| {
+        if (std.mem.eql(u8, s, k)) return true;
+    }
+    return false;
+}
+fn replHelp(msg: *std.Io.Writer) !void {
+    try msg.writeAll(
+        \\REPL — enter a pipeline, then a blank line to run it (results print as a table).
+        \\  • `@batch` is assumed unless you start with a @kind tag.
+        \\  • `| write stdout` is appended unless you write to a sink yourself.
+        \\  example:  read csv "examples/in.csv" | filter status == "paid" | select id, amount
+        \\  \q quit    \help this help
+        \\
+    );
+    try msg.flush();
 }
 
 /// Recognize the threads flag in all of `-j N`, `-jN`, `--threads N`,
@@ -224,18 +427,21 @@ fn threadFlagValue(a: []const u8, args: [][:0]u8, i: *usize) ?[]const u8 {
 
 fn usage(w: anytype) !void {
     try w.writeAll(
-        \\pipeline — a DSL-driven data pipeline engine
+        \\basalt — a DSL-driven data pipeline engine
         \\
         \\usage:
-        \\  pipeline run   <script> [-p key=value ...] [-j N] [--port N]   run a pipeline (mode from @kind)
-        \\  pipeline check <script> [-s|--show-plan] [--connect]         validate; -s prints the plan, --connect resolves DB schemas
+        \\  basalt run   <script>|-c <script> [-p key=value ...] [-j N] [--port N]   run a pipeline (mode from @kind)
+        \\  basalt check <script>|-c <script> [-s|--show-plan] [--connect]          validate; -s prints the plan
+        \\  basalt repl                                              interactive read-eval-print loop
         \\
+        \\  -c, --command S    run/check an inline script S instead of a file path
+        \\  use `write stdout` to print results as a table (the REPL appends it for you)
         \\  -j, --threads N    lanes for splittable SQL sources (default: CPU count; non-split sources are serial)
         \\  --json             emit the run summary as JSON on stdout (machine output)
         \\  --log-format FMT   auto|text|json — logs to stderr (default auto: text on a TTY, NDJSON when piped)
         \\  --log-level LVL    error|warn|info|debug (default info)
         \\  -q, --quiet        suppress info/warn logs (the run summary still prints)
-        \\  pipeline help                                           show this help
+        \\  basalt help                                             show this help
         \\
     );
 }

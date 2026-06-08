@@ -144,6 +144,8 @@ pub const Lexer = struct {
             ')' => return self.single(.rparen, start, sline, scol),
             '[' => return self.single(.lbracket, start, sline, scol),
             ']' => return self.single(.rbracket, start, sline, scol),
+            '{' => return self.single(.lbrace, start, sline, scol),
+            '}' => return self.single(.rbrace, start, sline, scol),
             ',' => return self.single(.comma, start, sline, scol),
             '.' => return self.single(.dot, start, sline, scol),
             '*' => return self.single(.star, start, sline, scol),
@@ -212,7 +214,7 @@ fn isIdentCont(c: u8) bool {
 /// Lex the whole source into a slice ending with an `eof` token. Caller frees.
 pub fn tokenize(alloc: std.mem.Allocator, src: []const u8) ![]Token {
     var lx = Lexer.init(src);
-    var list = std.ArrayList(Token).init(alloc);
+    var list = std.array_list.Managed(Token).init(alloc);
     errdefer list.deinit();
     while (true) {
         const t = lx.next();

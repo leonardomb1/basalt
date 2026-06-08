@@ -133,29 +133,29 @@ pub const Column = struct {
 pub const Builder = struct {
     arena: std.mem.Allocator,
     ty: types.Type,
-    valid: std.ArrayList(bool),
+    valid: std.array_list.Managed(bool),
     store: Store,
 
     pub const Store = union(enum) {
-        b: std.ArrayList(bool),
-        i32: std.ArrayList(i32),
-        i64: std.ArrayList(i64),
-        f64: std.ArrayList(f64),
-        dec: std.ArrayList(value.Decimal),
-        bytes: std.ArrayList([]const u8),
+        b: std.array_list.Managed(bool),
+        i32: std.array_list.Managed(i32),
+        i64: std.array_list.Managed(i64),
+        f64: std.array_list.Managed(f64),
+        dec: std.array_list.Managed(value.Decimal),
+        bytes: std.array_list.Managed([]const u8),
     };
 
     pub fn init(arena: std.mem.Allocator, ty: types.Type) Builder {
         const store: Store = switch (ty.kind) {
-            .bool => .{ .b = std.ArrayList(bool).init(arena) },
-            .date => .{ .i32 = std.ArrayList(i32).init(arena) },
-            .int, .time, .timestamp => .{ .i64 = std.ArrayList(i64).init(arena) },
-            .float => .{ .f64 = std.ArrayList(f64).init(arena) },
-            .decimal => .{ .dec = std.ArrayList(value.Decimal).init(arena) },
-            .string, .bytes => .{ .bytes = std.ArrayList([]const u8).init(arena) },
-            .array, .@"struct" => .{ .bytes = std.ArrayList([]const u8).init(arena) }, // unsupported; placeholder
+            .bool => .{ .b = std.array_list.Managed(bool).init(arena) },
+            .date => .{ .i32 = std.array_list.Managed(i32).init(arena) },
+            .int, .time, .timestamp => .{ .i64 = std.array_list.Managed(i64).init(arena) },
+            .float => .{ .f64 = std.array_list.Managed(f64).init(arena) },
+            .decimal => .{ .dec = std.array_list.Managed(value.Decimal).init(arena) },
+            .string, .bytes => .{ .bytes = std.array_list.Managed([]const u8).init(arena) },
+            .array, .@"struct" => .{ .bytes = std.array_list.Managed([]const u8).init(arena) }, // unsupported; placeholder
         };
-        return .{ .arena = arena, .ty = ty, .valid = std.ArrayList(bool).init(arena), .store = store };
+        return .{ .arena = arena, .ty = ty, .valid = std.array_list.Managed(bool).init(arena), .store = store };
     }
 
     pub fn append(self: *Builder, v: Value) !void {

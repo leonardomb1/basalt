@@ -15,14 +15,15 @@ const Batch = batchmod.Batch;
 const Value = valuemod.Value;
 
 const BATCH_ROWS = 1024;
-const BufReader = std.io.BufferedReader(4096, std.fs.File.Reader);
-const BufWriter = std.io.BufferedWriter(4096, std.fs.File.Writer);
+/// Reader/writer buffer size; also the max CSV line length (a line longer than
+/// this yields `error.StreamTooLong`).
+const LINE_BUF = 64 * 1024;
 
 pub const CsvReader = struct {
     arena: std.mem.Allocator,
     file: std.fs.File,
-    br: BufReader,
-    line: std.ArrayList(u8),
+    read_buf: [LINE_BUF]u8 = undefined,
+    fr: std.fs.File.Reader = undefined,
     schema: types.Schema,
     done: bool = false,
 
@@ -31,15 +32,13 @@ pub const CsvReader = struct {
         self.* = .{
             .arena = arena,
             .file = try std.fs.cwd().openFile(path, .{}),
-            .br = undefined,
-            .line = std.ArrayList(u8).init(arena),
             .schema = undefined,
             .done = false,
         };
-        self.br = std.io.bufferedReader(self.file.reader());
+        self.fr = self.file.reader(&self.read_buf);
 
         const header = (try self.readLine()) orelse return error.EmptyCsv;
-        var fields = std.ArrayList(types.Schema.Field).init(arena);
+        var fields = std.array_list.Managed(types.Schema.Field).init(arena);
         var it = std.mem.splitScalar(u8, header, ',');
         while (it.next()) |name| {
             try fields.append(.{
@@ -83,14 +82,10 @@ pub const CsvReader = struct {
     }
 
     fn readLine(self: *CsvReader) !?[]const u8 {
-        self.line.clearRetainingCapacity();
-        self.br.reader().streamUntilDelimiter(self.line.writer(), '\n', null) catch |e| switch (e) {
-            error.EndOfStream => {
-                if (self.line.items.len == 0) return null;
-            },
-            else => return e,
-        };
-        var s: []const u8 = self.line.items;
+        // Returns a slice into the reader's buffer (invalidated on the next read);
+        // safe because `column.Builder.append` dupes string values into the arena.
+        const line = (try self.fr.interface.takeDelimiter('\n')) orelse return null;
+        var s: []const u8 = line;
         if (s.len > 0 and s[s.len - 1] == '\r') s = s[0 .. s.len - 1];
         return s;
     }
@@ -102,7 +97,7 @@ fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Buil
     while (col < builders.len) : (col += 1) {
         if (i < line.len and line[i] == '"') {
             i += 1;
-            var buf = std.ArrayList(u8).init(arena);
+            var buf = std.array_list.Managed(u8).init(arena);
             while (i < line.len) {
                 if (line[i] == '"') {
                     if (i + 1 < line.len and line[i + 1] == '"') {
@@ -148,14 +143,15 @@ fn srcClose(ptr: *anyopaque) void {
 
 pub const CsvWriter = struct {
     file: std.fs.File,
-    bw: BufWriter,
+    write_buf: [LINE_BUF]u8 = undefined,
+    fw: std.fs.File.Writer = undefined,
 
     pub fn open(arena: std.mem.Allocator, path: []const u8, schema: types.Schema) !*CsvWriter {
         const self = try arena.create(CsvWriter);
-        self.* = .{ .file = try std.fs.cwd().createFile(path, .{}), .bw = undefined };
-        self.bw = std.io.bufferedWriter(self.file.writer());
+        self.* = .{ .file = try std.fs.cwd().createFile(path, .{}) };
+        self.fw = self.file.writer(&self.write_buf);
 
-        const w = self.bw.writer();
+        const w = &self.fw.interface;
         for (schema.fields, 0..) |f, i| {
             if (i > 0) try w.writeByte(',');
             try writeField(w, f.name);
@@ -165,7 +161,7 @@ pub const CsvWriter = struct {
     }
 
     pub fn writeBatch(self: *CsvWriter, arena: std.mem.Allocator, batch: Batch) !void {
-        const w = self.bw.writer();
+        const w = &self.fw.interface;
         var r: usize = 0;
         while (r < batch.len) : (r += 1) {
             for (batch.columns, 0..) |*col, i| {
@@ -178,7 +174,7 @@ pub const CsvWriter = struct {
     }
 
     pub fn close(self: *CsvWriter) !void {
-        try self.bw.flush();
+        try self.fw.interface.flush();
         self.file.close();
     }
 

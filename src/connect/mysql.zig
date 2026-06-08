@@ -30,13 +30,16 @@ pub const Error = error{ MysqlAuthFailed, MysqlQueryFailed, MysqlProtocol } || s
 /// Buffered socket reads: each result row is its own MySQL packet, so without
 /// buffering every row costs two recv syscalls (4-byte header + body). A 64 KB
 /// buffer collapses that to one syscall per ~64 KB — the dominant read-time win.
-const ReadBuf = std.io.BufferedReader(64 * 1024, std.net.Stream.Reader);
+const SOCK_BUF = 64 * 1024;
 
 pub const Conn = struct {
     gpa: std.mem.Allocator,
     stream: std.net.Stream,
-    reader: ReadBuf = undefined,
-    buf: std.ArrayList(u8),
+    read_buf: [SOCK_BUF]u8 = undefined,
+    write_buf: [SOCK_BUF]u8 = undefined,
+    sr: std.net.Stream.Reader = undefined,
+    sw: std.net.Stream.Writer = undefined,
+    buf: std.array_list.Managed(u8),
     last_error: []const u8 = "",
     // streaming cursor state (valid between queryCursor and close)
     meta_arena: std.heap.ArenaAllocator = undefined,
@@ -48,8 +51,9 @@ pub const Conn = struct {
     pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8) !*Conn {
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
         const self = try gpa.create(Conn);
-        self.* = .{ .gpa = gpa, .stream = stream, .buf = std.ArrayList(u8).init(gpa) };
-        self.reader = .{ .unbuffered_reader = self.stream.reader() };
+        self.* = .{ .gpa = gpa, .stream = stream, .buf = std.array_list.Managed(u8).init(gpa) };
+        self.sr = std.net.Stream.Reader.init(stream, &self.read_buf);
+        self.sw = std.net.Stream.Writer.init(stream, &self.write_buf);
         errdefer self.close();
 
         // 1. server handshake
@@ -240,12 +244,12 @@ pub const Conn = struct {
     // --- packet framing ---
 
     fn readPacket(self: *Conn) !u8 {
-        const r = self.reader.reader();
+        const r = self.sr.interface();
         var header: [4]u8 = undefined;
-        try r.readNoEof(&header);
+        try r.readSliceAll(&header);
         const len: usize = @as(usize, header[0]) | (@as(usize, header[1]) << 8) | (@as(usize, header[2]) << 16);
         try self.buf.resize(len);
-        try r.readNoEof(self.buf.items[0..len]);
+        try r.readSliceAll(self.buf.items[0..len]);
         return header[3];
     }
 
@@ -255,8 +259,10 @@ pub const Conn = struct {
         header[1] = @intCast((payload.len >> 8) & 0xff);
         header[2] = @intCast((payload.len >> 16) & 0xff);
         header[3] = seq;
-        try self.stream.writer().writeAll(&header);
-        try self.stream.writer().writeAll(payload);
+        const w = &self.sw.interface;
+        try w.writeAll(&header);
+        try w.writeAll(payload);
+        try w.flush();
     }
 
     fn parseHandshake(self: *Conn, p: []const u8) ![20]u8 {
@@ -286,7 +292,7 @@ pub const Conn = struct {
         var caps: u32 = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH | CLIENT_LONG_PASSWORD | CLIENT_LOCAL_FILES;
         if (database.len > 0) caps |= CLIENT_CONNECT_WITH_DB;
 
-        var out = std.ArrayList(u8).init(self.gpa);
+        var out = std.array_list.Managed(u8).init(self.gpa);
         defer out.deinit();
         const w = out.writer();
 
@@ -321,7 +327,7 @@ fn parseAuthSwitch(p: []const u8) [20]u8 {
     var i: usize = 1;
     while (i < p.len and p[i] != 0) : (i += 1) {}
     i += 1;
-    var salt: [20]u8 = [_]u8{0} ** 20;
+    var salt: [20]u8 = std.mem.zeroes([20]u8);
     const n = @min(@as(usize, 20), p.len -| i);
     if (n > 0) @memcpy(salt[0..n], p[i .. i + n]);
     return salt;
@@ -339,14 +345,14 @@ const LD_FLUSH_BYTES = 1 << 20; // ~1MB per data packet (well under MySQL's 16MB
 pub const LoadDataSink = struct {
     gpa: std.mem.Allocator,
     conn: *Conn,
-    buffer: std.ArrayList(u8),
+    buffer: std.array_list.Managed(u8),
 
     pub fn open(gpa: std.mem.Allocator, conn: *Conn, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode) !*LoadDataSink {
         // On error we free only what we allocate here; the caller keeps `conn`
         // (so it can read conn.last_error) and closes it on failure.
         const self = try gpa.create(LoadDataSink);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .conn = conn, .buffer = std.ArrayList(u8).init(gpa) };
+        self.* = .{ .gpa = gpa, .conn = conn, .buffer = std.array_list.Managed(u8).init(gpa) };
         errdefer self.buffer.deinit();
 
         var aa = std.heap.ArenaAllocator.init(gpa);
@@ -356,7 +362,7 @@ pub const LoadDataSink = struct {
         try conn.exec(try sqlmod.createTableSql(a, .mysql, qtable, schema, mode));
         if (mode == .overwrite) try conn.exec(try std.fmt.allocPrint(a, "DELETE FROM {s}", .{qtable}));
 
-        var cols = std.ArrayList(u8).init(a);
+        var cols = std.array_list.Managed(u8).init(a);
         for (schema.fields, 0..) |f, i| {
             if (i > 0) try cols.append(',');
             try cols.appendSlice(try sqlmod.quoteIdent(a, .mysql, f.name));

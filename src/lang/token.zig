@@ -19,6 +19,8 @@ pub const Tag = enum {
     rparen,
     lbracket,
     rbracket,
+    lbrace,
+    rbrace,
 
     comma,
     dot,
@@ -53,6 +55,8 @@ pub const Tag = enum {
             .rparen => "')'",
             .lbracket => "'['",
             .rbracket => "']'",
+            .lbrace => "'{'",
+            .rbrace => "'}'",
             .comma => "','",
             .dot => "'.'",
             .star => "'*'",

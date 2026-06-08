@@ -186,7 +186,7 @@ fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, mi
         return try dupeOne(arena, one);
     }
     const width: i128 = @divTrunc(span + @as(i128, @intCast(m)) - 1, @as(i128, @intCast(m))); // ceil
-    var list = std.ArrayList([]const u8).init(arena);
+    var list = std.array_list.Managed([]const u8).init(arena);
     var k: usize = 0;
     while (k < m) : (k += 1) {
         const lo: i128 = @as(i128, min) + @as(i128, @intCast(k)) * width;
@@ -204,7 +204,7 @@ fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, mi
 /// are uniform over this space, so the slices are balanced with no bounds probe.
 fn uuidSpacePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m: usize) ![]const []const u8 {
     const qcol = quoteIdent(arena, dialect, col) catch col;
-    var list = std.ArrayList([]const u8).init(arena);
+    var list = std.array_list.Managed([]const u8).init(arena);
     var k: usize = 0;
     while (k < m) : (k += 1) {
         const lo = if (k == 0) null else try uuidAt(arena, k, m);
