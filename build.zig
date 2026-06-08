@@ -3,11 +3,15 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // ReleaseFast keeps debug info by default (for backtraces); `-Dstrip` drops it
+    // for a smaller release/container binary.
+    const strip = b.option(bool, "strip", "Omit debug info from the binary") orelse false;
 
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
 
     const exe = b.addExecutable(.{

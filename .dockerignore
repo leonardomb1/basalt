@@ -1,0 +1,11 @@
+# The build only needs build.zig, build.zig.zon, and src/ — keep the context small.
+.git
+.github
+.zig-cache
+zig-out
+**/*.bsl
+*.csv
+examples
+*.md
+Dockerfile
+.dockerignore
