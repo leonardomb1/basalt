@@ -116,6 +116,27 @@ pub const TypeCtx = struct {
             }
             return result.?.withNull(all_null);
         }
+        if (eq(name, "starts_with") or eq(name, "ends_with") or eq(name, "contains") or eq(name, "like")) {
+            const a = try self.argType(c, 0);
+            const b = try self.argType(c, 1);
+            return Type.init(.bool).withNull(a.nullable or b.nullable);
+        }
+        if (eq(name, "trim")) {
+            const a = try self.argType(c, 0);
+            return Type.init(.string).withNull(a.nullable);
+        }
+        if (eq(name, "substr")) {
+            const a = try self.argType(c, 0);
+            _ = try self.argType(c, 1); // start (1-based)
+            if (c.args.len > 2) _ = try self.argType(c, 2); // optional length
+            return Type.init(.string).withNull(a.nullable);
+        }
+        if (eq(name, "replace")) {
+            const a = try self.argType(c, 0);
+            _ = try self.argType(c, 1);
+            _ = try self.argType(c, 2);
+            return Type.init(.string).withNull(a.nullable);
+        }
         return self.err("unknown function `{s}`", .{name});
     }
 
@@ -830,6 +851,41 @@ fn broadcastScalar(arena: std.mem.Allocator, s: Value, out_ty: Type, n: usize) E
     return b.finish();
 }
 
+/// Evaluate an expression at PLAN TIME against named scalar bindings (params,
+/// for-each loop variables) — no columns exist yet. Implemented by materializing
+/// the bindings as a one-row batch and reusing `evalRow`, so the full expression
+/// language (the C primitives, `match`, `cond`, `cast`) is available for `match`
+/// subjects/guards and `fn` folding. Errors if a referenced name isn't bound.
+pub fn constEval(arena: std.mem.Allocator, expr: *const ast.Expr, names: []const []const u8, values: []const Value) EvalError!Value {
+    const fields = try arena.alloc(types.Schema.Field, names.len);
+    const cols = try arena.alloc(column.Column, names.len);
+    for (names, values, 0..) |nm, v, i| {
+        const ty = scalarType(v);
+        fields[i] = .{ .name = nm, .ty = ty };
+        var b = column.Builder.init(arena, ty);
+        try b.append(v);
+        cols[i] = try b.finish();
+    }
+    const schema = types.Schema{ .fields = fields };
+    const batch = Batch{ .schema = &schema, .columns = cols, .len = 1 };
+    return evalRow(arena, expr, batch, 0);
+}
+
+fn scalarType(v: Value) Type {
+    return switch (v) {
+        .null => Type.init(.string).asNullable(),
+        .bool => Type.init(.bool),
+        .int => Type.init(.int),
+        .float => Type.init(.float),
+        .decimal => Type.init(.decimal),
+        .string => Type.init(.string),
+        .bytes => Type.init(.bytes),
+        .date => Type.init(.date),
+        .time => Type.init(.time),
+        .timestamp => Type.init(.timestamp),
+    };
+}
+
 pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, row: usize) EvalError!Value {
     switch (expr.*) {
         .null_lit => return .null,
@@ -991,13 +1047,59 @@ fn evalCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize
         return .{ .int = @intCast((try valueToString(arena, v)).len) };
     }
     if (eq(name, "concat")) {
-        var buf = std.ArrayList(u8).init(arena);
+        var buf = std.array_list.Managed(u8).init(arena);
         for (c.args) |a| {
             const v = try evalRow(arena, a, batch, row);
             if (v.isNull()) return .null;
             try buf.appendSlice(try valueToString(arena, v));
         }
         return .{ .string = try buf.toOwnedSlice() };
+    }
+    if (eq(name, "starts_with") or eq(name, "ends_with") or eq(name, "contains")) {
+        const sv = try evalRow(arena, c.args[0], batch, row);
+        const pv = try evalRow(arena, c.args[1], batch, row);
+        if (sv.isNull() or pv.isNull()) return .null;
+        const s = try valueToString(arena, sv);
+        const p = try valueToString(arena, pv);
+        const r = if (eq(name, "starts_with")) std.mem.startsWith(u8, s, p) else if (eq(name, "ends_with")) std.mem.endsWith(u8, s, p) else (std.mem.indexOf(u8, s, p) != null);
+        return .{ .bool = r };
+    }
+    if (eq(name, "like")) {
+        const sv = try evalRow(arena, c.args[0], batch, row);
+        const pv = try evalRow(arena, c.args[1], batch, row);
+        if (sv.isNull() or pv.isNull()) return .null;
+        return .{ .bool = likeMatch(try valueToString(arena, sv), try valueToString(arena, pv)) };
+    }
+    if (eq(name, "trim")) {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return .null;
+        return .{ .string = try arena.dupe(u8, trim(try valueToString(arena, v))) };
+    }
+    if (eq(name, "substr")) {
+        const sv = try evalRow(arena, c.args[0], batch, row);
+        if (sv.isNull()) return .null;
+        const startv = try evalRow(arena, c.args[1], batch, row);
+        if (startv.isNull()) return .null;
+        var len_opt: ?i64 = null;
+        if (c.args.len > 2) {
+            const lv = try evalRow(arena, c.args[2], batch, row);
+            if (lv.isNull()) return .null;
+            len_opt = toI64(lv);
+        }
+        return .{ .string = try substrBytes(arena, try valueToString(arena, sv), toI64(startv), len_opt) };
+    }
+    if (eq(name, "replace")) {
+        const sv = try evalRow(arena, c.args[0], batch, row);
+        const fv = try evalRow(arena, c.args[1], batch, row);
+        const tv = try evalRow(arena, c.args[2], batch, row);
+        if (sv.isNull() or fv.isNull() or tv.isNull()) return .null;
+        const s = try valueToString(arena, sv);
+        const from = try valueToString(arena, fv);
+        const to = try valueToString(arena, tv);
+        if (from.len == 0) return .{ .string = try arena.dupe(u8, s) };
+        const out = try arena.alloc(u8, std.mem.replacementSize(u8, s, from, to));
+        _ = std.mem.replace(u8, s, from, to, out);
+        return .{ .string = out };
     }
     return error.TypeMismatch;
 }
@@ -1120,7 +1222,7 @@ pub fn formatDecimal(arena: std.mem.Allocator, unscaled: i128, scale: u8) ![]con
     }
     while (n <= scale) : (n += 1) digits[n] = '0'; // pad so there's an integer digit
 
-    var out = std.ArrayList(u8).init(arena);
+    var out = std.array_list.Managed(u8).init(arena);
     if (neg) try out.append('-');
     var k: usize = n;
     while (k > 0) {
@@ -1175,9 +1277,90 @@ fn trim(s: []const u8) []const u8 {
     return std.mem.trim(u8, s, " \t\r\n");
 }
 
+fn toI64(v: Value) i64 {
+    return switch (v) {
+        .int => |x| x,
+        .float => |x| @intFromFloat(x),
+        .string => |s| std.fmt.parseInt(i64, std.mem.trim(u8, s, " "), 10) catch 0,
+        else => 0,
+    };
+}
+
+/// Byte-based substring with a 1-based start (SQL `substr`); `len` null = to end.
+fn substrBytes(arena: std.mem.Allocator, s: []const u8, start1: i64, len_opt: ?i64) ![]const u8 {
+    const slen: i64 = @intCast(s.len);
+    var start: usize = 0;
+    if (start1 > 1) start = @intCast(@min(start1 - 1, slen));
+    var end: usize = s.len;
+    if (len_opt) |l| {
+        if (l <= 0) return "";
+        end = @min(start + @as(usize, @intCast(l)), s.len);
+    }
+    return arena.dupe(u8, s[start..end]);
+}
+
+/// SQL `LIKE`: `%` matches any run (including empty), `_` matches one byte.
+fn likeMatch(s: []const u8, pat: []const u8) bool {
+    var si: usize = 0;
+    var pi: usize = 0;
+    var star: ?usize = null;
+    var smark: usize = 0;
+    while (si < s.len) {
+        if (pi < pat.len and (pat[pi] == '_' or pat[pi] == s[si])) {
+            si += 1;
+            pi += 1;
+        } else if (pi < pat.len and pat[pi] == '%') {
+            star = pi;
+            smark = si;
+            pi += 1;
+        } else if (star) |st| {
+            pi = st + 1;
+            smark += 1;
+            si = smark;
+        } else return false;
+    }
+    while (pi < pat.len and pat[pi] == '%') pi += 1;
+    return pi == pat.len;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "substr (1-based, byte) and like wildcard matcher" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("01", try substrBytes(a, "SD1010", 4, 2)); // empresa code
+    try std.testing.expectEqualStrings("SD1", try substrBytes(a, "SD1010", 1, 3)); // prefix
+    try std.testing.expectEqualStrings("010", try substrBytes(a, "SD1010", 4, null)); // to end
+    try std.testing.expectEqualStrings("", try substrBytes(a, "SD1010", 99, 2)); // past end
+
+    try std.testing.expect(likeMatch("hello, world", "hello%"));
+    try std.testing.expect(likeMatch("hello", "h_llo"));
+    try std.testing.expect(likeMatch("anything", "%"));
+    try std.testing.expect(!likeMatch("hello", "h_l"));
+    try std.testing.expect(!likeMatch("paid", "pending%"));
+}
+
+test "constEval folds an expression over plan-time bindings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tbl = ast.Expr{ .field = .{ .parts = &[_][]const u8{"tbl"} } };
+    var prefix = ast.Expr{ .str_lit = "SD1" };
+    var sw_args = [_]*ast.Expr{ &tbl, &prefix };
+    var sw = ast.Expr{ .call = .{ .name = "starts_with", .args = &sw_args } };
+    const r = try constEval(a, &sw, &[_][]const u8{"tbl"}, &[_]Value{.{ .string = "SD1010" }});
+    try std.testing.expect(r.bool);
+
+    var four = ast.Expr{ .int_lit = 4 };
+    var two = ast.Expr{ .int_lit = 2 };
+    var ss_args = [_]*ast.Expr{ &tbl, &four, &two };
+    var ss = ast.Expr{ .call = .{ .name = "substr", .args = &ss_args } };
+    const e = try constEval(a, &ss, &[_][]const u8{"tbl"}, &[_]Value{.{ .string = "SD1010" }});
+    try std.testing.expectEqualStrings("01", e.string);
+}
 
 const parser = @import("../lang/parser.zig");
 

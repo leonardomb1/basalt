@@ -194,6 +194,10 @@ pub const Param = struct {
     default: ?*Expr,
     source: ?ParamSource,
     pos: Pos,
+    /// `param x json from body`: the value is a JSON document (parsed into a
+    /// separate binding namespace, navigated via `x.a.b` paths), not a scalar
+    /// column value. `ty` is an unused placeholder when this is set.
+    is_json: bool = false,
 };
 
 pub const Attr = struct { key: []const u8, value: *Expr, pos: Pos };
@@ -207,14 +211,33 @@ pub const Connection = struct {
 
 pub const Let = struct { name: []const u8, pipeline: Pipeline, pos: Pos };
 
+/// `fn name(a, b) = <expr>`: a user-defined scalar function. Expanded inline at
+/// plan time (`expand.zig`) — each call is replaced by the body with arguments
+/// substituted for the parameters — so the type-checker and evaluator never see
+/// user functions. Recursion is rejected during expansion.
+pub const FnDecl = struct {
+    name: []const u8,
+    params: []const []const u8,
+    body: *Expr,
+    pos: Pos,
+};
+
 /// `for <var,...> in <source> @[...] <body-pipeline>`: a plan-time fan-out.
 /// `source` is a discovery read; the planner runs it once, mapping its first N
 /// columns onto the N `var_names`, then instantiates `body` per row with each
 /// `${var}` interpolated into the read/write targets. `hints` carry `mode`
 /// (sequential|parallel) and `on_error` (stop|continue).
+/// A for-each source: either a discovery `read` (`for x in <conn> query "..."`)
+/// or a JSON-array param path (`for x in job.tables`, with each object element's
+/// fields bound to the loop variables by name).
+pub const ForSource = union(enum) {
+    read: Read,
+    json_path: QualName,
+};
+
 pub const ForEach = struct {
     var_names: []const []const u8,
-    source: Read,
+    source: ForSource,
     hints: []const Hint,
     body: Pipeline,
     pos: Pos,
@@ -224,6 +247,24 @@ pub const Kind = enum { batch, http, stream };
 
 pub const KindDecl = struct { kind: Kind, config: []const Attr, pos: Pos };
 
+/// Plan-time structural dispatch: `match [subject] arm... end`, where each arm's
+/// body is a `{ ... }` block of statements. Mirrors the expression `Match` arm
+/// shapes (subject + `|` alternation, guard form, `_` default) but runs whole
+/// statements. Evaluated once at plan time over params / loop variables; an
+/// unmatched value with no `_` arm is a no-op.
+pub const StmtMatch = struct {
+    subject: ?*Expr,
+    arms: []const StmtArm,
+    pos: Pos,
+};
+
+pub const StmtArm = struct {
+    pats: []const *Expr, // subject-form patterns (empty for guard/default arms)
+    guard: ?*Expr, // guard-form condition (null otherwise)
+    body: []const Stmt, // `{ ... }` block to run when this arm matches
+    is_default: bool,
+};
+
 pub const Stmt = union(enum) {
     kind: KindDecl,
     param: Param,
@@ -231,6 +272,8 @@ pub const Stmt = union(enum) {
     binding: Let,
     output: Pipeline,
     for_each: ForEach,
+    match: StmtMatch,
+    func: FnDecl,
 };
 
 pub const Program = struct { stmts: []const Stmt };

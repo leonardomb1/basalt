@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
+const expand = @import("../lang/expand.zig");
 const types = @import("../lang/types.zig");
 const eval = @import("../exec/eval.zig");
 const csv = @import("../connect/csv.zig");
@@ -83,7 +84,7 @@ pub const Col = struct {
 };
 
 pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast.SelectItem, params: *const ParamMap, diag: *Diag) Error![]Col {
-    var cols = std.ArrayList(Col).init(arena);
+    var cols = std.array_list.Managed(Col).init(arena);
     for (items) |item| switch (item) {
         .star => for (in.fields, 0..) |f, idx| try cols.append(.{ .name = f.name, .ty = f.ty, .source = .{ .passthrough = idx } }),
         .star_except => |names| for (in.fields, 0..) |f, idx| {
@@ -129,7 +130,7 @@ pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Typ
 pub const AggregatePlan = struct { by: []usize, aggs: []Agg, schema: types.Schema };
 
 pub fn aggregatePlan(arena: std.mem.Allocator, in: types.Schema, ag: ast.Aggregate, params: *const ParamMap, diag: *Diag) Error!AggregatePlan {
-    var fields = std.ArrayList(types.Schema.Field).init(arena);
+    var fields = std.array_list.Managed(types.Schema.Field).init(arena);
     const by = try arena.alloc(usize, ag.by.len);
     for (ag.by, 0..) |q, i| {
         const idx = in.indexOf(lastPart(q)) orelse return fail(diag, "unknown group field `{s}`", .{lastPart(q)});
@@ -186,7 +187,7 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
     const emit_right = (j.kind == .inner or j.kind == .left);
     const right_nullable = (j.kind == .left);
 
-    var fields = std.ArrayList(types.Schema.Field).init(arena);
+    var fields = std.array_list.Managed(types.Schema.Field).init(arena);
     for (left.fields) |f| try fields.append(f);
     if (emit_right) for (right.fields) |f| {
         var name = f.name;
@@ -279,14 +280,19 @@ pub const Resolver = struct {
 // Analysis
 // ---------------------------------------------------------------------------
 
-pub fn analyze(arena: std.mem.Allocator, program: ast.Program, resolver: ?Resolver, diag: *Diag) error{ AnalyzeFailed, OutOfMemory }!Plan {
+pub fn analyze(arena: std.mem.Allocator, raw_program: ast.Program, resolver: ?Resolver, diag: *Diag) error{ AnalyzeFailed, OutOfMemory }!Plan {
+    var expand_msg: []const u8 = "";
+    const program = expand.expandProgram(arena, raw_program, null, &expand_msg) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ExpandFailed => return fail(diag, "{s}", .{expand_msg}),
+    };
     if (program.stmts.len == 0 or program.stmts[0] != .kind)
         return fail(diag, "script must begin with a @kind tag", .{});
     const kind_name = @tagName(program.stmts[0].kind.kind);
 
     var bindings = std.StringHashMap(ast.Pipeline).init(arena);
     var connections = std.StringHashMap(ast.Connection).init(arena);
-    var outputs = std.ArrayList(ast.Pipeline).init(arena);
+    var outputs = std.array_list.Managed(ast.Pipeline).init(arena);
     for (program.stmts[1..]) |s| switch (s) {
         .binding => |b| try bindings.put(b.name, b.pipeline),
         .connection => |c| try connections.put(c.name, c),
@@ -295,7 +301,15 @@ pub fn analyze(arena: std.mem.Allocator, program: ast.Program, resolver: ?Resolv
         // `${var}` placeholders ride through as literal text (DB source schemas stay
         // unresolved offline, so they don't false-error — same as a normal DB read).
         .for_each => |fe| try outputs.append(fe.body),
-        .param, .kind => {},
+        // Validate the output pipelines inside match arm bodies (one level; nested
+        // matches are validated at run time). Which arm fires is plan-time, so all
+        // arms' pipelines are checked.
+        .match => |m| for (m.arms) |arm| for (arm.body) |st| switch (st) {
+            .output => |p| try outputs.append(p),
+            .for_each => |fe| try outputs.append(fe.body),
+            else => {},
+        },
+        .param, .kind, .func => {},
     };
     if (outputs.items.len == 0)
         return fail(diag, "no output pipeline (a pipeline ending in `write`)", .{});
@@ -310,7 +324,7 @@ pub fn analyze(arena: std.mem.Allocator, program: ast.Program, resolver: ?Resolv
 
     var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .resolver = resolver, .params = &params_map, .diag = diag };
 
-    var out_plans = std.ArrayList(Output).init(arena);
+    var out_plans = std.array_list.Managed(Output).init(arena);
     for (outputs.items) |pipe| try out_plans.append(try ctx.analyzeOutput(pipe));
 
     return .{ .kind = kind_name, .outputs = try out_plans.toOwnedSlice() };
@@ -332,7 +346,7 @@ const Ctx = struct {
 
         const source = try self.resolveSource(stages[0]);
 
-        var stage_infos = std.ArrayList(Stage).init(self.arena);
+        var stage_infos = std.array_list.Managed(Stage).init(self.arena);
         var has_breaker = false;
         var map_only = true;
         var cur: ?types.Schema = source.schema; // type flow; null once unresolvable
@@ -427,12 +441,13 @@ const Ctx = struct {
     }
 
     fn resolveSink(self: *Ctx, w: ast.Write) !Sink {
-        if (!std.mem.eql(u8, w.connector, "csv")) {
-            const conn = self.connections.get(w.connector) orelse
-                return fail(self.diag, "unknown connection `{s}` in write", .{w.connector});
-            return .{ .connector = conn.connector, .target = w.target, .mode = @tagName(w.mode) };
+        // Built-in sinks need no `connection` declaration.
+        if (std.mem.eql(u8, w.connector, "csv") or std.mem.eql(u8, w.connector, "stdout")) {
+            return .{ .connector = w.connector, .target = w.target, .mode = @tagName(w.mode) };
         }
-        return .{ .connector = "csv", .target = w.target, .mode = @tagName(w.mode) };
+        const conn = self.connections.get(w.connector) orelse
+            return fail(self.diag, "unknown connection `{s}` in write", .{w.connector});
+        return .{ .connector = conn.connector, .target = w.target, .mode = @tagName(w.mode) };
     }
 
     /// Output schema after a stage (type-checking expressions along the way).
@@ -484,7 +499,7 @@ const Ctx = struct {
     }
 
     fn selectDetail(self: *Ctx, items: []const ast.SelectItem) ![]const u8 {
-        var buf = std.ArrayList(u8).init(self.arena);
+        var buf = std.array_list.Managed(u8).init(self.arena);
         for (items, 0..) |item, i| {
             if (i > 0) try buf.appendSlice(", ");
             switch (item) {

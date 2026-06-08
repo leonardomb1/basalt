@@ -29,7 +29,7 @@ pub const Config = struct {
     buckets: u32 = 4,
     replication_num: u32 = 1,
     auto_create: bool = true,
-    label_prefix: []const u8 = "pipeline",
+    label_prefix: []const u8 = "basalt",
     run_id: u64 = 0, // 0 => generate per run (timestamp); see genLabel for the label scheme
 };
 
@@ -73,7 +73,7 @@ pub fn genCreateTable(
     };
 
     // Column order: for a Primary Key table the key columns must come first.
-    var ordered = std.ArrayList(types.Schema.Field).init(arena);
+    var ordered = std.array_list.Managed(types.Schema.Field).init(arena);
     if (is_pk) {
         for (keys) |k| {
             const f = findField(schema, k) orelse return error.UnknownKeyColumn;
@@ -86,7 +86,7 @@ pub fn genCreateTable(
         for (schema.fields) |f| try ordered.append(f);
     }
 
-    var buf = std.ArrayList(u8).init(arena);
+    var buf = std.array_list.Managed(u8).init(arena);
     const w = buf.writer();
     try w.print("CREATE TABLE IF NOT EXISTS `{s}`.`{s}` (\n", .{ db, table });
     for (ordered.items, 0..) |f, i| {
@@ -150,7 +150,7 @@ pub fn genLabel(arena: std.mem.Allocator, prefix: []const u8, table: []const u8,
 
 /// The comma-joined column list for the Stream Load `columns` header.
 pub fn columnList(arena: std.mem.Allocator, schema: types.Schema) ![]const u8 {
-    var buf = std.ArrayList(u8).init(arena);
+    var buf = std.array_list.Managed(u8).init(arena);
     for (schema.fields, 0..) |f, i| {
         if (i > 0) try buf.append(',');
         try buf.appendSlice(f.name);
@@ -208,7 +208,7 @@ pub const StreamLoadSink = struct {
     table: []const u8,
     columns: []const u8,
     mode: ast.WriteMode,
-    buffer: std.ArrayList(u8),
+    buffer: std.array_list.Managed(u8),
     seq: u64 = 0,
     run_id: u64 = 0,
     client: std.http.Client,
@@ -230,7 +230,7 @@ pub const StreamLoadSink = struct {
             .table = table,
             .columns = columns,
             .mode = mode,
-            .buffer = std.ArrayList(u8).init(gpa),
+            .buffer = std.array_list.Managed(u8).init(gpa),
             .run_id = if (cfg.run_id != 0) cfg.run_id else @intCast(std.time.milliTimestamp()),
             .client = std.http.Client{ .allocator = gpa },
         };
@@ -303,7 +303,7 @@ pub const StreamLoadSink = struct {
         const auth = try std.fmt.allocPrint(self.gpa, "Basic {s}", .{b64});
         defer self.gpa.free(auth);
 
-        var hdrs = std.ArrayList(std.http.Header).init(self.gpa);
+        var hdrs = std.array_list.Managed(std.http.Header).init(self.gpa);
         defer hdrs.deinit();
         try hdrs.append(.{ .name = "Authorization", .value = auth });
         try hdrs.append(.{ .name = "label", .value = label });
@@ -315,17 +315,18 @@ pub const StreamLoadSink = struct {
             try hdrs.append(.{ .name = "partial_update", .value = "true" });
         }
 
-        var body_buf = std.ArrayList(u8).init(self.gpa);
-        defer body_buf.deinit();
+        var body_aw = std.Io.Writer.Allocating.init(self.gpa);
+        defer body_aw.deinit();
         const res = try self.client.fetch(.{
             .method = .PUT,
             .location = .{ .url = url },
             .extra_headers = hdrs.items,
             .payload = self.buffer.items,
-            .response_storage = .{ .dynamic = &body_buf },
+            .response_writer = &body_aw.writer,
         });
-        if (!loadSucceeded(body_buf.items)) {
-            std.debug.print("stream load failed (http {d}): {s}\n", .{ @intFromEnum(res.status), body_buf.items });
+        const body = body_aw.writer.buffered();
+        if (!loadSucceeded(body)) {
+            std.debug.print("stream load failed (http {d}): {s}\n", .{ @intFromEnum(res.status), body });
             return error.StreamLoadFailed;
         }
     }
@@ -401,7 +402,7 @@ test "label and column list" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    try std.testing.expectEqualStrings("pipeline_orders_99_3", try genLabel(a, "pipeline", "orders", 99, 3));
+    try std.testing.expectEqualStrings("basalt_orders_99_3", try genLabel(a, "basalt", "orders", 99, 3));
 
     // Parallel sink: lane-distinct prefixes + a shared run_id keep labels unique
     // across lanes (no Stream Load "label already exists" collisions) while staying

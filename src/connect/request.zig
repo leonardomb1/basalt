@@ -43,7 +43,7 @@ pub const RequestSource = struct {
             else => return error.ExpectedJsonArrayOrObject,
         };
 
-        var fields = std.ArrayList(types.Schema.Field).init(arena);
+        var fields = std.array_list.Managed(types.Schema.Field).init(arena);
         if (items.len > 0 and items[0] == .object) {
             const obj = items[0].object;
             for (obj.keys()) |k| {

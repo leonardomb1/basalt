@@ -27,13 +27,19 @@ pub const Error = error{ TdsProtocol, LoginFailed, QueryFailed, EncryptionRequir
 pub const Conn = struct {
     gpa: std.mem.Allocator,
     stream: std.net.Stream,
-    msg: std.ArrayList(u8), // reassembled response message payload (login path)
+    read_buf: [SOCK_BUF]u8 = undefined,
+    write_buf: [SOCK_BUF]u8 = undefined,
+    sr: std.net.Stream.Reader = undefined,
+    sw: std.net.Stream.Writer = undefined,
+    msg: std.array_list.Managed(u8), // reassembled response message payload (login path)
     last_error: []const u8 = "",
 
     pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8) !*Conn {
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
         const self = try gpa.create(Conn);
-        self.* = .{ .gpa = gpa, .stream = stream, .msg = std.ArrayList(u8).init(gpa) };
+        self.* = .{ .gpa = gpa, .stream = stream, .msg = std.array_list.Managed(u8).init(gpa) };
+        self.sr = std.net.Stream.Reader.init(stream, &self.read_buf);
+        self.sw = std.net.Stream.Writer.init(stream, &self.write_buf);
         errdefer self.close();
         try self.prelogin();
         try self.login(user, password, database, host);
@@ -65,6 +71,7 @@ pub const Conn = struct {
             .schema = undefined,
             .done = false,
         };
+        cur.reader.attach();
         cur.readHeader() catch |e| {
             cur.reader.deinit();
             cur.meta_arena.deinit();
@@ -116,7 +123,7 @@ pub const Conn = struct {
     /// a SQLBatch larger than one packet (e.g. a wide UNION query) sent as a single
     /// oversized packet is reset by the server/gateway.
     fn writePacket(self: *Conn, ptype: u8, payload: []const u8) !void {
-        const w = self.stream.writer();
+        const w = &self.sw.interface;
         var off: usize = 0;
         while (true) {
             const chunk: usize = @min(payload.len - off, BULK_PKT_PAYLOAD);
@@ -130,19 +137,21 @@ pub const Conn = struct {
             off += chunk;
             if (last) break;
         }
+        try w.flush();
     }
 
     /// Reassemble a full message (across packets) into self.msg.
     fn readMessage(self: *Conn) !void {
         self.msg.clearRetainingCapacity();
+        const r = self.sr.interface();
         while (true) {
             var header: [8]u8 = undefined;
-            try self.stream.reader().readNoEof(&header);
+            try r.readSliceAll(&header);
             const len: usize = (@as(usize, header[2]) << 8) | header[3];
             if (len < 8) return error.TdsProtocol;
             const start = self.msg.items.len;
             try self.msg.resize(start + (len - 8));
-            try self.stream.reader().readNoEof(self.msg.items[start..]);
+            try r.readSliceAll(self.msg.items[start..]);
             if (header[1] & STATUS_EOM != 0) break;
         }
     }
@@ -226,7 +235,7 @@ pub const Conn = struct {
     // --- query ---
 
     fn sendBatch(self: *Conn, sql: []const u8) !void {
-        var payload = std.ArrayList(u8).init(self.gpa);
+        var payload = std.array_list.Managed(u8).init(self.gpa);
         defer payload.deinit();
         // ALL_HEADERS: a single transaction-descriptor header (no active txn)
         try payload.appendSlice(&[_]u8{
@@ -260,8 +269,10 @@ pub const Conn = struct {
         const total: u16 = @intCast(payload.len + 8);
         header[2] = @intCast(total >> 8);
         header[3] = @intCast(total & 0xff);
-        try self.stream.writer().writeAll(&header);
-        try self.stream.writer().writeAll(payload);
+        const w = &self.sw.interface;
+        try w.writeAll(&header);
+        try w.writeAll(payload);
+        try w.flush();
     }
 
     /// Read the server's response to the bulk load (DONE on success, ERROR token).
@@ -312,19 +323,26 @@ fn curClose(ptr: *anyopaque) void {
 /// Reads the TDS response as a continuous byte stream, pulling packets on
 /// demand (respecting the EOM bit). Multi-byte reads transparently span packet
 /// boundaries — so a ROW token straddling two packets is invisible to the parser.
-const ReadBuf = std.io.BufferedReader(64 * 1024, std.net.Stream.Reader);
+const SOCK_BUF = 64 * 1024;
 
 const PacketReader = struct {
     stream: std.net.Stream,
-    reader: ReadBuf,
-    buf: std.ArrayList(u8),
+    read_buf: [SOCK_BUF]u8 = undefined,
+    sr: std.net.Stream.Reader = undefined,
+    buf: std.array_list.Managed(u8),
     pos: usize = 0,
     eom: bool = false,
 
     fn init(gpa: std.mem.Allocator, stream: std.net.Stream) PacketReader {
-        // Login reads (Conn.stream, unbuffered) complete before any cursor, so the
-        // buffered reader here starts on a clean stream with no over-read overlap.
-        return .{ .stream = stream, .reader = .{ .unbuffered_reader = stream.reader() }, .buf = std.ArrayList(u8).init(gpa) };
+        return .{ .stream = stream, .buf = std.array_list.Managed(u8).init(gpa) };
+    }
+    /// Wire the buffered reader to its own `read_buf`. Must be called after the
+    /// PacketReader is at its final address (it is embedded in a heap-allocated
+    /// TdsCursor) because `sr` holds a pointer into `read_buf`. Login reads (Conn)
+    /// complete before any cursor, so this starts on a clean stream with no
+    /// over-read overlap.
+    fn attach(self: *PacketReader) void {
+        self.sr = std.net.Stream.Reader.init(self.stream, &self.read_buf);
     }
     fn deinit(self: *PacketReader) void {
         self.buf.deinit();
@@ -334,9 +352,9 @@ const PacketReader = struct {
     fn ensure(self: *PacketReader) !bool {
         while (self.pos >= self.buf.items.len) {
             if (self.eom) return false;
-            const r = self.reader.reader();
+            const r = self.sr.interface();
             var hdr: [8]u8 = undefined;
-            r.readNoEof(&hdr) catch |e| {
+            r.readSliceAll(&hdr) catch |e| {
                 if (e == error.EndOfStream) return false;
                 return e;
             };
@@ -344,7 +362,7 @@ const PacketReader = struct {
             if (len < 8) return error.TdsProtocol;
             self.eom = (hdr[1] & STATUS_EOM) != 0;
             try self.buf.resize(len - 8);
-            try r.readNoEof(self.buf.items);
+            try r.readSliceAll(self.buf.items);
             self.pos = 0;
         }
         return true;
@@ -388,7 +406,7 @@ const PacketReader = struct {
     fn readPlp(self: *PacketReader, arena: std.mem.Allocator) !?[]u8 {
         const total = try self.readU64();
         if (total == 0xFFFFFFFFFFFFFFFF) return null; // PLP_NULL
-        var buf = std.ArrayList(u8).init(arena);
+        var buf = std.array_list.Managed(u8).init(arena);
         while (true) {
             const chunk = try self.readU32();
             if (chunk == 0) break; // terminator
@@ -752,7 +770,7 @@ pub const BulkSink = struct {
     gpa: std.mem.Allocator,
     conn: *Conn,
     schema: types.Schema,
-    buffer: std.ArrayList(u8),
+    buffer: std.array_list.Managed(u8),
 
     pub fn open(gpa: std.mem.Allocator, conn: *Conn, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode) !*BulkSink {
         // On error we free only what we allocate here; the caller keeps `conn`
@@ -768,7 +786,7 @@ pub const BulkSink = struct {
             o.* = .{ .name = try gpa.dupe(u8, f.name), .ty = f.ty };
             nf += 1;
         }
-        self.* = .{ .gpa = gpa, .conn = conn, .schema = .{ .fields = fields }, .buffer = std.ArrayList(u8).init(gpa) };
+        self.* = .{ .gpa = gpa, .conn = conn, .schema = .{ .fields = fields }, .buffer = std.array_list.Managed(u8).init(gpa) };
         errdefer self.buffer.deinit();
 
         var aa = std.heap.ArenaAllocator.init(gpa);
@@ -778,7 +796,7 @@ pub const BulkSink = struct {
         try conn.exec(try sqlmod.createTableSql(a, .sqlserver, qtable, schema, mode));
         if (mode == .overwrite) try conn.exec(try std.fmt.allocPrint(a, "DELETE FROM {s}", .{qtable}));
 
-        var cols = std.ArrayList(u8).init(a);
+        var cols = std.array_list.Managed(u8).init(a);
         for (schema.fields, 0..) |f, i| {
             if (i > 0) try cols.appendSlice(", ");
             try cols.appendSlice(try sqlmod.quoteIdent(a, .sqlserver, f.name));
@@ -984,7 +1002,7 @@ fn readIntLE(bytes: []const u8) i64 {
         4 => std.mem.readInt(i32, bytes[0..4], .little),
         8 => std.mem.readInt(i64, bytes[0..8], .little),
         else => blk: {
-            var b8: [8]u8 = .{0} ** 8;
+            var b8: [8]u8 = std.mem.zeroes([8]u8);
             const n = @min(bytes.len, 8);
             @memcpy(b8[0..n], bytes[0..n]);
             if (bytes[n - 1] & 0x80 != 0) {
@@ -1025,7 +1043,7 @@ fn win1252ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     }
     if (!high) return arena.dupe(u8, bytes);
 
-    var out = std.ArrayList(u8).init(arena);
+    var out = std.array_list.Managed(u8).init(arena);
     try out.ensureTotalCapacity(bytes.len + bytes.len / 2 + 4);
     var tmp: [4]u8 = undefined;
     for (bytes) |b| {
@@ -1061,7 +1079,7 @@ fn formatGuid(arena: std.mem.Allocator, b: []const u8) ![]const u8 {
 }
 
 fn utf16ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
-    var out = std.ArrayList(u8).init(arena);
+    var out = std.array_list.Managed(u8).init(arena);
     var k: usize = 0;
     while (k + 1 < bytes.len) : (k += 2) {
         const cu = @as(u16, bytes[k]) | (@as(u16, bytes[k + 1]) << 8);
@@ -1109,23 +1127,23 @@ test "win1252 transcode to utf8" {
 // --- LOGIN7 construction ---
 
 fn buildLogin7(gpa: std.mem.Allocator, user: []const u8, password: []const u8, database: []const u8, host: []const u8) ![]u8 {
-    var fixed = [_]u8{0} ** 94;
+    var fixed = std.mem.zeroes([94]u8);
     // TDSVersion 7.4 = 0x74000004 (LE), PacketSize 4096
     fixed[4] = 0x04;
     fixed[7] = 0x74;
     fixed[8] = 0x00;
     fixed[9] = 0x10; // 0x1000 = 4096
 
-    var vd = std.ArrayList(u8).init(gpa);
+    var vd = std.array_list.Managed(u8).init(gpa);
     defer vd.deinit();
 
     try addField(&fixed, 36, host, &vd, false); // HostName
     try addField(&fixed, 40, user, &vd, false); // UserName
     try addField(&fixed, 44, password, &vd, true); // Password (obfuscated)
-    try addField(&fixed, 48, "pipeline", &vd, false); // AppName
+    try addField(&fixed, 48, "basalt", &vd, false); // AppName
     try addField(&fixed, 52, host, &vd, false); // ServerName
     try addField(&fixed, 56, "", &vd, false); // Extension (unused)
-    try addField(&fixed, 60, "pipeline", &vd, false); // CltIntName
+    try addField(&fixed, 60, "basalt", &vd, false); // CltIntName
     try addField(&fixed, 64, "", &vd, false); // Language
     try addField(&fixed, 68, database, &vd, false); // Database
     // ClientID at 72..78 = zeros
@@ -1145,7 +1163,7 @@ fn buildLogin7(gpa: std.mem.Allocator, user: []const u8, password: []const u8, d
 
 /// Append a UTF-16LE string to var-data and write its (offset, char-count) into
 /// the fixed offset/length block. ASCII only (sufficient for creds/identifiers).
-fn addField(fixed: []u8, ib_pos: usize, s: []const u8, vd: *std.ArrayList(u8), obfuscate: bool) !void {
+fn addField(fixed: []u8, ib_pos: usize, s: []const u8, vd: *std.array_list.Managed(u8), obfuscate: bool) !void {
     const ib: u16 = @intCast(94 + vd.items.len);
     const start = vd.items.len;
     for (s) |ch| {

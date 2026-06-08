@@ -111,7 +111,7 @@ pub const Parser = struct {
     // --- program / statements ---
 
     pub fn parseProgram(self: *Parser) Error!ast.Program {
-        var stmts = std.ArrayList(ast.Stmt).init(self.arena);
+        var stmts = std.array_list.Managed(ast.Stmt).init(self.arena);
         var first = true;
         while (!self.at(.eof)) {
             try stmts.append(try self.parseStmt(first));
@@ -130,7 +130,9 @@ pub const Parser = struct {
         if (self.isKw("param")) return .{ .param = try self.parseParam() };
         if (self.isKw("connection")) return .{ .connection = try self.parseConnection() };
         if (self.isKw("let")) return .{ .binding = try self.parseLet() };
+        if (self.isKw("fn")) return .{ .func = try self.parseFnDecl() };
         if (self.isKw("for")) return .{ .for_each = try self.parseForEach() };
+        if (self.isKw("match")) return .{ .match = try self.parseStmtMatch() };
         if (self.at(.ident)) return .{ .output = try self.parsePipeline() };
         return self.fail(self.curPos(), "expected a declaration (param/connection/let) or a pipeline", .{});
     }
@@ -157,7 +159,7 @@ pub const Parser = struct {
     }
 
     fn parseParenAttrs(self: *Parser) Error![]const ast.Attr {
-        var list = std.ArrayList(ast.Attr).init(self.arena);
+        var list = std.array_list.Managed(ast.Attr).init(self.arena);
         if (self.at(.rparen)) return try list.toOwnedSlice();
         while (true) {
             const pos = self.curPos();
@@ -174,7 +176,16 @@ pub const Parser = struct {
         const pos = self.curPos();
         try self.expectKw("param");
         const name = try self.expectIdent();
-        const ty = try self.parseTypeName();
+        // `json` is a pseudo-type: the value is a JSON document, not a column.
+        var is_json = false;
+        var ty: types.Type = undefined;
+        if (self.at(.ident) and std.mem.eql(u8, self.cur().text, "json")) {
+            _ = self.advance();
+            is_json = true;
+            ty = types.Type.init(.string); // placeholder; never used for JSON params
+        } else {
+            ty = try self.parseTypeName();
+        }
         var default: ?*ast.Expr = null;
         if (self.eat(.assign)) default = try self.parseExpr();
         var source: ?ast.ParamSource = null;
@@ -189,7 +200,7 @@ pub const Parser = struct {
             else
                 return self.fail(self.curPos(), "unknown param source `{s}` (expected query, body, or header)", .{sname});
         }
-        return .{ .name = name, .ty = ty, .default = default, .source = source, .pos = pos };
+        return .{ .name = name, .ty = ty, .default = default, .source = source, .pos = pos, .is_json = is_json };
     }
 
     fn parseConnection(self: *Parser) Error!ast.Connection {
@@ -199,7 +210,7 @@ pub const Parser = struct {
         _ = try self.expect(.assign);
         const connector = try self.expectIdent();
         // config: a run of `ident = expr` pairs, delimited by `ident =` lookahead.
-        var list = std.ArrayList(ast.Attr).init(self.arena);
+        var list = std.array_list.Managed(ast.Attr).init(self.arena);
         while (self.at(.ident) and self.peekTag() == .assign) {
             const apos = self.curPos();
             const key = self.advance().text;
@@ -208,6 +219,23 @@ pub const Parser = struct {
             try list.append(.{ .key = key, .value = val, .pos = apos });
         }
         return .{ .name = name, .connector = connector, .config = try list.toOwnedSlice(), .pos = pos };
+    }
+
+    /// `fn name(p1, p2, ...) = <expr>`
+    fn parseFnDecl(self: *Parser) Error!ast.FnDecl {
+        const pos = self.curPos();
+        try self.expectKw("fn");
+        const name = try self.expectIdent();
+        _ = try self.expect(.lparen);
+        var params = std.array_list.Managed([]const u8).init(self.arena);
+        if (!self.at(.rparen)) {
+            try params.append(try self.expectIdent());
+            while (self.eat(.comma)) try params.append(try self.expectIdent());
+        }
+        _ = try self.expect(.rparen);
+        _ = try self.expect(.assign);
+        const body = try self.parseExpr();
+        return .{ .name = name, .params = try params.toOwnedSlice(), .body = body, .pos = pos };
     }
 
     fn parseLet(self: *Parser) Error!ast.Let {
@@ -225,21 +253,82 @@ pub const Parser = struct {
     fn parseForEach(self: *Parser) Error!ast.ForEach {
         const pos = self.curPos();
         try self.expectKw("for");
-        var names = std.ArrayList([]const u8).init(self.arena);
+        var names = std.array_list.Managed([]const u8).init(self.arena);
         try names.append(try self.expectIdent());
         while (self.eat(.comma)) try names.append(try self.expectIdent());
         try self.expectKw("in");
-        const source = try self.parseRead();
+        const source = try self.parseForSource();
         const hints = try self.parseHints();
         const body = try self.parsePipeline();
         return .{ .var_names = try names.toOwnedSlice(), .source = source, .hints = hints, .body = body, .pos = pos };
+    }
+
+    /// A discovery `read` (`<conn> table|query|<path>`) or a JSON-array path
+    /// (`job.tables`). Distinguished by lookahead: a read has `table`/`query`/a
+    /// string after the connector; anything else is a (dotted) param path.
+    fn parseForSource(self: *Parser) Error!ast.ForSource {
+        const save = self.i;
+        _ = try self.expectIdent();
+        const is_read = self.isKw("table") or self.isKw("query") or self.at(.string);
+        self.i = save;
+        if (is_read) return .{ .read = try self.parseRead() };
+        return .{ .json_path = try self.parseQualName() };
+    }
+
+    // --- statement-level match (plan-time structural dispatch) ---
+
+    /// Mirrors `parseMatchExpr` but each arm body is a `{ ... }` statement block.
+    fn parseStmtMatch(self: *Parser) Error!ast.StmtMatch {
+        const pos = self.curPos();
+        _ = self.advance(); // match
+        var subject: ?*ast.Expr = null;
+        if (!self.isKw("end") and !self.isWildcard()) {
+            const save = self.i;
+            const e = try self.parseExpr();
+            if (self.at(.fat_arrow)) {
+                self.i = save; // guard form: rewind, no subject
+            } else {
+                subject = e;
+            }
+        }
+        var arms = std.array_list.Managed(ast.StmtArm).init(self.arena);
+        while (!self.isKw("end")) try arms.append(try self.parseStmtArm(subject != null));
+        try self.expectKw("end");
+        return .{ .subject = subject, .arms = try arms.toOwnedSlice(), .pos = pos };
+    }
+
+    fn parseStmtArm(self: *Parser, subject_form: bool) Error!ast.StmtArm {
+        if (self.isWildcard()) {
+            _ = self.advance();
+            _ = try self.expect(.fat_arrow);
+            return .{ .pats = &[_]*ast.Expr{}, .guard = null, .body = try self.parseBlock(), .is_default = true };
+        }
+        if (subject_form) {
+            var pats = std.array_list.Managed(*ast.Expr).init(self.arena);
+            try pats.append(try self.parseExpr());
+            while (self.eat(.pipe)) try pats.append(try self.parseExpr());
+            _ = try self.expect(.fat_arrow);
+            return .{ .pats = try pats.toOwnedSlice(), .guard = null, .body = try self.parseBlock(), .is_default = false };
+        }
+        const g = try self.parseExpr();
+        _ = try self.expect(.fat_arrow);
+        return .{ .pats = &[_]*ast.Expr{}, .guard = g, .body = try self.parseBlock(), .is_default = false };
+    }
+
+    /// A `{ ... }` block of zero or more statements (an empty block is an explicit no-op).
+    fn parseBlock(self: *Parser) Error![]const ast.Stmt {
+        _ = try self.expect(.lbrace);
+        var stmts = std.array_list.Managed(ast.Stmt).init(self.arena);
+        while (!self.at(.rbrace) and !self.at(.eof)) try stmts.append(try self.parseStmt(false));
+        _ = try self.expect(.rbrace);
+        return try stmts.toOwnedSlice();
     }
 
     // --- pipelines / stages ---
 
     fn parsePipeline(self: *Parser) Error!ast.Pipeline {
         const pos = self.curPos();
-        var stages = std.ArrayList(ast.Stage).init(self.arena);
+        var stages = std.array_list.Managed(ast.Stage).init(self.arena);
         try stages.append(try self.parseStage());
         while (self.eat(.pipe)) try stages.append(try self.parseStage());
         return .{ .stages = try stages.toOwnedSlice(), .pos = pos };
@@ -275,7 +364,7 @@ pub const Parser = struct {
     fn parseUnion(self: *Parser) Error!ast.Union {
         const pos = self.curPos();
         if (self.isKw("from")) {
-            var branches = std.ArrayList(ast.UnionBranch).init(self.arena);
+            var branches = std.array_list.Managed(ast.UnionBranch).init(self.arena);
             while (self.eatKw("from")) {
                 const rd = try self.parseRead();
                 try self.expectKw("as");
@@ -307,7 +396,7 @@ pub const Parser = struct {
     }
 
     fn parseSelect(self: *Parser) Error![]const ast.SelectItem {
-        var items = std.ArrayList(ast.SelectItem).init(self.arena);
+        var items = std.array_list.Managed(ast.SelectItem).init(self.arena);
         while (true) {
             try items.append(try self.parseSelectItem());
             if (!self.eat(.comma)) break;
@@ -319,7 +408,7 @@ pub const Parser = struct {
         if (self.eat(.star)) {
             if (self.eatKw("except")) {
                 _ = try self.expect(.lparen);
-                var names = std.ArrayList([]const u8).init(self.arena);
+                var names = std.array_list.Managed([]const u8).init(self.arena);
                 try names.append(try self.expectIdent());
                 while (self.eat(.comma)) try names.append(try self.expectIdent());
                 _ = try self.expect(.rparen);
@@ -354,7 +443,7 @@ pub const Parser = struct {
 
     fn parseDistinct(self: *Parser) Error!ast.Distinct {
         if (self.eatKw("on")) {
-            var keys = std.ArrayList(ast.QualName).init(self.arena);
+            var keys = std.array_list.Managed(ast.QualName).init(self.arena);
             try keys.append(try self.parseQualName());
             while (self.eat(.comma)) try keys.append(try self.parseQualName());
             return .{ .on = try keys.toOwnedSlice() };
@@ -363,7 +452,7 @@ pub const Parser = struct {
     }
 
     fn parseSort(self: *Parser) Error!ast.Sort {
-        var keys = std.ArrayList(ast.SortKey).init(self.arena);
+        var keys = std.array_list.Managed(ast.SortKey).init(self.arena);
         while (true) {
             const field = try self.parseQualName();
             var desc = false;
@@ -379,7 +468,7 @@ pub const Parser = struct {
     }
 
     fn parseAggregate(self: *Parser) Error!ast.Aggregate {
-        var aggs = std.ArrayList(ast.AggItem).init(self.arena);
+        var aggs = std.array_list.Managed(ast.AggItem).init(self.arena);
         while (true) {
             const name = try self.expectIdent();
             _ = try self.expect(.assign);
@@ -405,7 +494,7 @@ pub const Parser = struct {
         }
         var by: []const ast.QualName = &[_]ast.QualName{};
         if (self.eatKw("by")) {
-            var g = std.ArrayList(ast.QualName).init(self.arena);
+            var g = std.array_list.Managed(ast.QualName).init(self.arena);
             try g.append(try self.parseQualName());
             while (self.eat(.comma)) try g.append(try self.parseQualName());
             by = try g.toOwnedSlice();
@@ -456,6 +545,10 @@ pub const Parser = struct {
         if (self.at(.string)) {
             return .{ .connector = connector, .form = null, .target = self.advance().text, .mode = .default };
         }
+        // Bare connector with no target, e.g. `write stdout`.
+        if (!self.atName()) {
+            return .{ .connector = connector, .form = null, .target = "", .mode = .default };
+        }
         const first = try self.parseQualName();
         var form: ?[]const u8 = null;
         var target = try joinQual(self.arena, first);
@@ -481,14 +574,14 @@ pub const Parser = struct {
         if (self.eatKw("overwrite")) return .overwrite;
         if (self.eatKw("upsert")) {
             try self.expectKw("on");
-            var keys = std.ArrayList([]const u8).init(self.arena);
+            var keys = std.array_list.Managed([]const u8).init(self.arena);
             try keys.append(try self.expectName());
             while (self.eat(.comma)) try keys.append(try self.expectName());
             var partial: ?[]const []const u8 = null;
             if (self.eatKw("partial")) {
                 try self.expectKw("cols");
                 _ = try self.expect(.lparen);
-                var cols = std.ArrayList([]const u8).init(self.arena);
+                var cols = std.array_list.Managed([]const u8).init(self.arena);
                 try cols.append(try self.expectName());
                 while (self.eat(.comma)) try cols.append(try self.expectName());
                 _ = try self.expect(.rparen);
@@ -503,7 +596,7 @@ pub const Parser = struct {
         if (!(self.at(.at) and self.peekTag() == .lbracket)) return &[_]ast.Hint{};
         _ = self.advance(); // @
         _ = self.advance(); // [
-        var list = std.ArrayList(ast.Hint).init(self.arena);
+        var list = std.array_list.Managed(ast.Hint).init(self.arena);
         if (!self.at(.rbracket)) {
             while (true) {
                 const pos = self.curPos();
@@ -677,7 +770,7 @@ pub const Parser = struct {
     fn parseCall(self: *Parser) Error!*ast.Expr {
         const name = self.advance().text;
         _ = try self.expect(.lparen);
-        var args = std.ArrayList(*ast.Expr).init(self.arena);
+        var args = std.array_list.Managed(*ast.Expr).init(self.arena);
         if (!self.at(.rparen)) {
             try args.append(try self.parseExpr());
             while (self.eat(.comma)) try args.append(try self.parseExpr());
@@ -700,7 +793,7 @@ pub const Parser = struct {
                 subject = e;
             }
         }
-        var arms = std.ArrayList(ast.MatchArm).init(self.arena);
+        var arms = std.array_list.Managed(ast.MatchArm).init(self.arena);
         while (!self.isKw("end")) try arms.append(try self.parseMatchArm(subject != null));
         try self.expectKw("end");
         return self.mk(.{ .match = .{ .subject = subject, .arms = try arms.toOwnedSlice() } });
@@ -713,7 +806,7 @@ pub const Parser = struct {
             return .{ .pats = &[_]*ast.Expr{}, .guard = null, .value = try self.parseExpr(), .is_default = true };
         }
         if (subject_form) {
-            var pats = std.ArrayList(*ast.Expr).init(self.arena);
+            var pats = std.array_list.Managed(*ast.Expr).init(self.arena);
             try pats.append(try self.parseExpr());
             while (self.eat(.pipe)) try pats.append(try self.parseExpr());
             _ = try self.expect(.fat_arrow);
@@ -732,7 +825,7 @@ pub const Parser = struct {
     // --- shared helpers ---
 
     fn parseQualName(self: *Parser) Error!ast.QualName {
-        var parts = std.ArrayList([]const u8).init(self.arena);
+        var parts = std.array_list.Managed([]const u8).init(self.arena);
         try parts.append(try self.expectName());
         while (self.eat(.dot)) try parts.append(try self.expectName());
         return .{ .parts = try parts.toOwnedSlice() };
@@ -889,8 +982,9 @@ test "parse a for-each over a table list" {
     try std.testing.expectEqual(@as(usize, 2), fe.var_names.len);
     try std.testing.expectEqualStrings("tbl", fe.var_names[0]);
     try std.testing.expectEqualStrings("pk", fe.var_names[1]);
-    try std.testing.expectEqualStrings("mssql", fe.source.connector);
-    try std.testing.expect(fe.source.form == .query);
+    try std.testing.expect(fe.source == .read);
+    try std.testing.expectEqualStrings("mssql", fe.source.read.connector);
+    try std.testing.expect(fe.source.read.form == .query);
     try std.testing.expectEqual(@as(usize, 2), fe.hints.len);
     try std.testing.expectEqual(@as(usize, 2), fe.body.stages.len);
     const rd = fe.body.stages[0].node.read;
@@ -901,6 +995,20 @@ test "parse a for-each over a table list" {
     try std.testing.expectEqualStrings("${tbl}", w.target);
     try std.testing.expect(w.mode == .upsert);
     try std.testing.expectEqualStrings("${pk}", w.mode.upsert.keys[0]);
+}
+
+test "for-each over a JSON array param" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const prog = try parseTest(ar.allocator(),
+        "@batch\nparam job json from body\n" ++
+        "for name in job.tables @[mode = parallel]\n  read csv \"${name}.csv\" | write stdout");
+    const fe = prog.stmts[2].for_each;
+    try std.testing.expect(fe.source == .json_path);
+    try std.testing.expectEqual(@as(usize, 2), fe.source.json_path.parts.len);
+    try std.testing.expectEqualStrings("job", fe.source.json_path.parts[0]);
+    try std.testing.expectEqualStrings("tables", fe.source.json_path.parts[1]);
+    try std.testing.expectEqualStrings("name", fe.var_names[0]);
 }
 
 test "parse a union (explicit + discovered)" {
@@ -929,6 +1037,45 @@ test "parse a union (explicit + discovered)" {
     try std.testing.expectEqualStrings("erp", un2.discover_conn);
     try std.testing.expectEqualStrings("SELECT name, x FROM t", un2.discover_query);
     try std.testing.expectEqual(@as(usize, 0), un2.branches.len);
+}
+
+test "write stdout: bare connector with no target" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const prog = try parseTest(ar.allocator(), "@batch\nread csv \"x\" | write stdout");
+    const out = prog.stmts[1].output;
+    const w = out.stages[out.stages.len - 1].node.write;
+    try std.testing.expectEqualStrings("stdout", w.connector);
+    try std.testing.expectEqualStrings("", w.target);
+    try std.testing.expect(w.form == null);
+}
+
+test "statement-level match: subject form with block arms + default" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const prog = try parseTest(ar.allocator(),
+        "@batch\nparam env string = \"prod\"\n" ++
+        "match env\n  \"prod\" => { read csv \"x\" | write stdout }\n  _ => { read csv \"y\" | write stdout }\nend");
+    const m = prog.stmts[2].match;
+    try std.testing.expect(m.subject != null);
+    try std.testing.expectEqual(@as(usize, 2), m.arms.len);
+    try std.testing.expect(!m.arms[0].is_default);
+    try std.testing.expectEqual(@as(usize, 1), m.arms[0].pats.len);
+    try std.testing.expect(m.arms[1].is_default);
+    try std.testing.expectEqual(@as(usize, 1), m.arms[0].body.len);
+    try std.testing.expect(m.arms[0].body[0] == .output);
+}
+
+test "statement-level match: guard form" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const prog = try parseTest(ar.allocator(),
+        "@batch\nparam t string = \"SD1010\"\n" ++
+        "match\n  starts_with(t, \"SD1\") => { read csv \"x\" | write stdout }\nend");
+    const m = prog.stmts[2].match;
+    try std.testing.expect(m.subject == null);
+    try std.testing.expectEqual(@as(usize, 1), m.arms.len);
+    try std.testing.expect(m.arms[0].guard != null);
 }
 
 test "missing @kind is an error" {

@@ -49,7 +49,7 @@ pub const Logger = struct {
     mutex: std.Thread.Mutex = .{},
 
     pub fn init(run_id: u64, format: Format, min: Level) Logger {
-        const file = std.io.getStdErr();
+        const file = std.fs.File.stderr();
         const tty = std.posix.isatty(file.handle);
         const json = switch (format) {
             .auto => !tty,
@@ -68,7 +68,9 @@ pub const Logger = struct {
     pub fn summary(self: *Logger, s: Summary) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const w = self.file.writer();
+        var wbuf: [1024]u8 = undefined;
+        var fw = self.file.writer(&wbuf);
+        const w = &fw.interface;
         if (self.json) {
             w.print(
                 "{{\"ts\":{d},\"level\":\"info\",\"run_id\":{d},\"event\":\"run_complete\",\"source\":\"{s}\",\"sink\":\"{s}\",\"rows_read\":{d},\"rows_written\":{d},\"elapsed_ms\":{d},\"rows_per_sec\":{d}}}\n",
@@ -77,6 +79,7 @@ pub const Logger = struct {
         } else {
             s.renderText(w) catch return;
         }
+        w.flush() catch return;
     }
 
     pub fn log(self: *Logger, level: Level, comptime fmt: []const u8, args: anytype) void {
@@ -85,7 +88,9 @@ pub const Logger = struct {
         const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
         self.mutex.lock();
         defer self.mutex.unlock();
-        const w = self.file.writer();
+        var wbuf: [1024]u8 = undefined;
+        var fw = self.file.writer(&wbuf);
+        const w = &fw.interface;
         if (self.json) {
             w.print("{{\"ts\":{d},\"level\":\"{s}\",\"run_id\":{d},\"msg\":\"", .{ std.time.milliTimestamp(), level.label(), self.run_id }) catch return;
             writeEscaped(w, msg) catch return;
@@ -93,6 +98,7 @@ pub const Logger = struct {
         } else {
             w.print("{s}: {s}\n", .{ level.label(), msg }) catch return;
         }
+        w.flush() catch return;
     }
 };
 
@@ -181,10 +187,10 @@ test "level parse + summary rate" {
 test "json log line escapes and is one line" {
     // Render to a buffer by mimicking the json branch.
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const w = fbs.writer();
+    var fbw = std.Io.Writer.fixed(&buf);
+    const w = &fbw;
     try w.writeAll("{\"msg\":\"");
     try writeEscaped(w, "a\"b\nc");
     try w.writeAll("\"}");
-    try std.testing.expectEqualStrings("{\"msg\":\"a\\\"b\\nc\"}", fbs.getWritten());
+    try std.testing.expectEqualStrings("{\"msg\":\"a\\\"b\\nc\"}", w.buffered());
 }
