@@ -10,14 +10,30 @@ on:
 permissions:
   contents: read
 
+env:
+  ZIG_VERSION: 0.15.2
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v1
+      # Install Zig directly from the official release (tarball naming is arch-first
+      # since 0.14.1: zig-<arch>-<os>-<version>); avoids stale third-party actions.
+      - name: Cache Zig
+        id: zig-cache
+        uses: actions/cache@v4
         with:
-          version: 0.15.2
+          path: ~/.zig
+          key: zig-${{ env.ZIG_VERSION }}-x86_64-linux
+      - name: Install Zig
+        if: steps.zig-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.zig
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            | tar -xJ -C ~/.zig --strip-components=1
+      - name: Add Zig to PATH
+        run: echo "$HOME/.zig" >> "$GITHUB_PATH"
       - name: Build
         run: zig build
       - name: Test
