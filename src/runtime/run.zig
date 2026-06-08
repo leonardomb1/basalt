@@ -48,6 +48,16 @@ pub fn aborting() bool {
     return g_abort.load(.seq_cst);
 }
 
+// SIGHUP → reload a multi-script server's script directory (control plane writes
+// updated scripts, then signals). Consumed (swapped back to false) by the server.
+var g_reload = std.atomic.Value(bool).init(false);
+pub fn requestReload() void {
+    g_reload.store(true, .seq_cst);
+}
+pub fn takeReload() bool {
+    return g_reload.swap(false, .seq_cst);
+}
+
 /// A failure worth retrying: connection/network-level, not a config or data error.
 /// Host resolution (`UnknownHostName`) is treated as permanent — usually a typo.
 pub fn isTransient(e: anyerror) bool {

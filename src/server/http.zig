@@ -1,51 +1,144 @@
 //! HTTP trigger host for `@http` scripts. Each matching request runs the pipeline
 //! once: query-string values bind params, the request body feeds `read request`,
-//! and the response is a JSON run summary. Single-threaded accept loop (one
-//! request at a time) — a worker pool / bounded queue is the scaling step.
+//! and the response is a JSON run summary. Single-threaded accept loop (one request
+//! at a time) — scale out with replicas behind a load balancer.
+//!
+//! Two entry points: `serve` hosts a single program; `serveDir` hosts every `@http`
+//! script in a directory, routing by each script's declared `@http(path=…)` and
+//! reloading the directory on SIGHUP (the control plane writes scripts, then signals).
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
+const parser = @import("../lang/parser.zig");
 const runtime = @import("../runtime/run.zig");
 
-pub fn serve(gpa: std.mem.Allocator, program: ast.Program, port: u16) !void {
-    const kind = program.stmts[0].kind;
-    var path: []const u8 = "/";
-    for (kind.config) |attr| {
-        if (std.mem.eql(u8, attr.key, "path")) path = attrToStr(attr.value);
-    }
+pub const Route = struct { path: []const u8, program: ast.Program, label: []const u8 };
 
+/// The `@http(path=…)` of a program (defaults to "/").
+fn httpPath(program: ast.Program) []const u8 {
+    if (program.stmts.len == 0 or program.stmts[0] != .kind) return "/";
+    var p: []const u8 = "/";
+    for (program.stmts[0].kind.config) |attr| {
+        if (std.mem.eql(u8, attr.key, "path")) p = attrToStr(attr.value);
+    }
+    return p;
+}
+
+/// Listen on `0.0.0.0:port` with a 1s accept timeout so the loop re-checks the
+/// shutdown/reload flags even when idle (SIGTERM/SIGHUP take effect within ~1s).
+fn listen(port: u16) !std.net.Server {
     const address = try std.net.Address.parseIp("0.0.0.0", port);
     var net_server = try address.listen(.{ .reuse_address = true });
-    defer net_server.deinit();
-
-    // A 1s accept timeout makes accept() return periodically (EWOULDBLOCK) so the
-    // loop can re-check the shutdown flag even with no traffic — SIGTERM then exits
-    // within ~1s instead of blocking until the next connection or SIGKILL.
+    errdefer net_server.deinit();
     const tv = std.posix.timeval{ .sec = 1, .usec = 0 };
     std.posix.setsockopt(net_server.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+    return net_server;
+}
 
-    var stderr_buf: [512]u8 = undefined;
-    var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
-    const stderr = &stderr_file.interface;
-    try stderr.print("pipeline serving @http on http://0.0.0.0:{d}{s}\n", .{ port, path });
-    try stderr.flush();
+fn banner(port: u16, routes: []const Route) void {
+    std.debug.print("basalt serving {d} route(s) on http://0.0.0.0:{d}\n", .{ routes.len, port });
+    for (routes) |r| std.debug.print("  {s}  <- {s}\n", .{ r.path, r.label });
+}
 
-    // Worker count for parallel `for`-each fan-out (e.g. many tables per request);
-    // matches the CLI's default. Detected once, reused for every request.
+/// Serve a single `@http` program.
+pub fn serve(gpa: std.mem.Allocator, program: ast.Program, port: u16) !void {
+    const routes = [_]Route{.{ .path = httpPath(program), .program = program, .label = "<script>" }};
+    var net_server = try listen(port);
+    defer net_server.deinit();
+    banner(port, &routes);
     const threads = std.Thread.getCpuCount() catch 1;
-
     var read_buf: [64 * 1024]u8 = undefined;
-    // Stop accepting once the control plane signals shutdown (SIGTERM/SIGINT). An
-    // idle server blocked in accept() exits on the next connection or SIGKILL; an
-    // in-flight request finishes (or aborts at its next batch boundary) first.
     while (!runtime.aborting()) {
         const conn = net_server.accept() catch continue;
-        handleConn(gpa, program, conn, path, &read_buf, threads) catch {};
+        handleConn(gpa, &routes, conn, &read_buf, threads) catch {};
         conn.stream.close();
     }
 }
 
-fn handleConn(gpa: std.mem.Allocator, program: ast.Program, conn: std.net.Server.Connection, path: []const u8, read_buf: []u8, threads: usize) !void {
+const Registry = struct {
+    arena: std.heap.ArenaAllocator,
+    routes: []const Route,
+    fn deinit(self: *Registry) void {
+        self.arena.deinit();
+    }
+};
+
+/// Parse every `*.bsl` `@http` script in `dir_path` into a route table. Non-`@http`
+/// scripts and parse failures are skipped (logged), so one bad file doesn't take
+/// down the rest of the fleet.
+fn loadDir(gpa: std.mem.Allocator, dir_path: []const u8) !Registry {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    var routes = std.array_list.Managed(Route).init(a);
+
+    var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".bsl")) continue;
+        const text = dir.readFileAlloc(a, entry.name, 8 << 20) catch |e| {
+            std.debug.print("skip {s}: read failed: {s}\n", .{ entry.name, @errorName(e) });
+            continue;
+        };
+        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = parser.parseSource(a, text, &pdiag) catch {
+            std.debug.print("skip {s}: {d}:{d}: {s}\n", .{ entry.name, pdiag.line, pdiag.col, pdiag.msg });
+            continue;
+        };
+        if (prog.stmts.len == 0 or prog.stmts[0] != .kind or prog.stmts[0].kind.kind != .http) {
+            std.debug.print("skip {s}: not an @http script\n", .{entry.name});
+            continue;
+        }
+        const label = try a.dupe(u8, entry.name); // entry.name is reused by the iterator
+        const path = httpPath(prog);
+        var dup = false;
+        for (routes.items) |r| {
+            if (std.mem.eql(u8, r.path, path)) {
+                std.debug.print("skip {s}: path `{s}` already served by {s}\n", .{ entry.name, path, r.label });
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        try routes.append(.{ .path = path, .program = prog, .label = label });
+    }
+    if (routes.items.len == 0) return error.NoRoutes;
+    return .{ .arena = arena, .routes = try routes.toOwnedSlice() };
+}
+
+/// Serve every `@http` script in a directory, routing by path; SIGHUP reloads.
+pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, port: u16) !void {
+    var reg = try loadDir(gpa, dir_path);
+    defer reg.deinit();
+    var net_server = try listen(port);
+    defer net_server.deinit();
+    banner(port, reg.routes);
+    const threads = std.Thread.getCpuCount() catch 1;
+    var read_buf: [64 * 1024]u8 = undefined;
+    while (!runtime.aborting()) {
+        if (runtime.takeReload()) {
+            if (loadDir(gpa, dir_path)) |new_reg| {
+                reg.deinit();
+                reg = new_reg;
+                std.debug.print("reloaded {s}\n", .{dir_path});
+                banner(port, reg.routes);
+            } else |e| std.debug.print("reload failed (keeping current routes): {s}\n", .{@errorName(e)});
+        }
+        const conn = net_server.accept() catch continue;
+        handleConn(gpa, reg.routes, conn, &read_buf, threads) catch {};
+        conn.stream.close();
+    }
+}
+
+fn findRoute(routes: []const Route, req_path: []const u8) ?Route {
+    for (routes) |r| {
+        if (std.mem.eql(u8, r.path, req_path)) return r;
+    }
+    return null;
+}
+
+fn handleConn(gpa: std.mem.Allocator, routes: []const Route, conn: std.net.Server.Connection, read_buf: []u8, threads: usize) !void {
     var send_buf: [16 * 1024]u8 = undefined;
     var creader = conn.stream.reader(read_buf);
     var cwriter = conn.stream.writer(&send_buf);
@@ -58,10 +151,18 @@ fn handleConn(gpa: std.mem.Allocator, program: ast.Program, conn: std.net.Server
         const req_path = if (q) |qi| target[0..qi] else target;
         const query = if (q) |qi| target[qi + 1 ..] else "";
 
-        if (!std.mem.eql(u8, req_path, path)) {
-            try req.respond("{\"status\":\"error\",\"error\":\"not found\"}", .{ .status = .not_found, .keep_alive = false });
+        // Liveness/readiness for k8s probes & load balancers — always 200 while up.
+        if (std.mem.eql(u8, req_path, "/healthz") or std.mem.eql(u8, req_path, "/readyz")) {
+            try req.respond("{\"status\":\"ok\"}\n", .{ .status = .ok, .keep_alive = false, .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json" },
+            } });
             return;
         }
+
+        const route = findRoute(routes, req_path) orelse {
+            try req.respond("{\"status\":\"error\",\"error\":\"not found\"}\n", .{ .status = .not_found, .keep_alive = false });
+            return;
+        };
 
         var body_buf: [64 * 1024]u8 = undefined;
         const reader = try req.readerExpectContinue(&body_buf);
@@ -78,7 +179,7 @@ fn handleConn(gpa: std.mem.Allocator, program: ast.Program, conn: std.net.Server
         // Each request logs a completion line to stderr (NDJSON in a container); the
         // body below carries a status JSON. The HTTP status mirrors the CLI exit-code
         // contract: 200 ok · 207 partial · 503 transient (retry) · 500 permanent.
-        const result = runtime.run(gpa, program, .{ .params = params.items, .request_body = body, .threads = threads, .outcomes = &sink, .log = .{ .summary = .stderr } }, &diag);
+        const result = runtime.run(gpa, route.program, .{ .params = params.items, .request_body = body, .threads = threads, .outcomes = &sink, .log = .{ .summary = .stderr } }, &diag);
 
         var out = std.array_list.Managed(u8).init(gpa);
         defer out.deinit();

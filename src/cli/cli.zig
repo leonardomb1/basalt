@@ -20,14 +20,18 @@ fn onTerminate(_: i32) callconv(.c) void {
     runtime.requestAbort();
 }
 
+/// SIGHUP → reload a multi-script server's directory (control plane writes new
+/// scripts, then signals). Async-signal-safe: one atomic store.
+fn onReload(_: i32) callconv(.c) void {
+    runtime.requestReload();
+}
+
 fn installSignalHandlers() void {
-    const act = std.posix.Sigaction{
-        .handler = .{ .handler = onTerminate },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
-    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    const term = std.posix.Sigaction{ .handler = .{ .handler = onTerminate }, .mask = std.posix.sigemptyset(), .flags = 0 };
+    std.posix.sigaction(std.posix.SIG.TERM, &term, null);
+    std.posix.sigaction(std.posix.SIG.INT, &term, null);
+    const hup = std.posix.Sigaction{ .handler = .{ .handler = onReload }, .mask = std.posix.sigemptyset(), .flags = 0 };
+    std.posix.sigaction(std.posix.SIG.HUP, &hup, null);
 }
 
 pub fn run(alloc: std.mem.Allocator) !void {
@@ -50,6 +54,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
         std.process.exit(try cmdCheck(alloc, args));
     } else if (std.mem.eql(u8, verb, "run")) {
         std.process.exit(try cmdRun(alloc, args));
+    } else if (std.mem.eql(u8, verb, "serve")) {
+        std.process.exit(try cmdServe(alloc, args));
     } else if (std.mem.eql(u8, verb, "repl")) {
         std.process.exit(try cmdRepl(alloc));
     } else if (std.mem.eql(u8, verb, "help") or std.mem.eql(u8, verb, "-h") or std.mem.eql(u8, verb, "--help")) {
@@ -83,8 +89,21 @@ fn loadSource(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8, stderr
             return Source{ .label = "<command>", .text = args[i + 1] };
         }
     }
-    if (args.len < 3 or (args[2].len > 0 and args[2][0] == '-')) {
-        try stderr.print("error: `{s}` requires a <script> path or `-c <script>`\n", .{verb});
+    if (args.len < 3) {
+        try stderr.print("error: `{s}` requires a <script> path, `-` for stdin, or `-c <script>`\n", .{verb});
+        return null;
+    }
+    // `-` reads the script from stdin, so any delivery mechanism can pipe it
+    // without a temp file (`cat x.bsl | basalt run -`, a control-plane fetch, etc.).
+    if (std.mem.eql(u8, args[2], "-")) {
+        const text = std.fs.File.stdin().readToEndAlloc(arena, 8 << 20) catch |e| {
+            try stderr.print("error: cannot read script from stdin: {s}\n", .{@errorName(e)});
+            return null;
+        };
+        return Source{ .label = "<stdin>", .text = text };
+    }
+    if (args[2].len > 0 and args[2][0] == '-') {
+        try stderr.print("error: `{s}` requires a <script> path, `-` for stdin, or `-c <script>`\n", .{verb});
         return null;
     }
     const path = args[2];
@@ -304,6 +323,43 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     return 0;
 }
 
+/// `serve <dir> [--port N]`: host every `@http` script in a directory, routing by
+/// each script's declared path. SIGHUP reloads the directory.
+fn cmdServe(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
+    var err_buf: [4096]u8 = undefined;
+    var err_file = std.fs.File.stderr().writer(&err_buf);
+    const stderr = &err_file.interface;
+    defer stderr.flush() catch {};
+
+    if (args.len < 3 or (args[2].len > 0 and args[2][0] == '-')) {
+        try stderr.print("error: `serve` requires a <dir> of @http scripts\n", .{});
+        return 2;
+    }
+    const dir = args[2];
+
+    var port: u16 = 8080;
+    var i: usize = 3;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--port") or std.mem.eql(u8, args[i], "-p")) {
+            i += 1;
+            if (i >= args.len) {
+                try stderr.print("error: missing value after `--port`\n", .{});
+                return 2;
+            }
+            port = std.fmt.parseInt(u16, args[i], 10) catch {
+                try stderr.print("error: invalid --port `{s}`\n", .{args[i]});
+                return 2;
+            };
+        }
+    }
+
+    server.serveDir(alloc, dir, port) catch |e| {
+        try stderr.print("serve error: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    return 0;
+}
+
 /// Interactive read-eval-print loop. Each entry is one or more lines terminated by
 /// a blank line (so multi-stage pipelines can span lines); `@batch` is assumed and
 /// a `write stdout` table sink is appended when the entry doesn't write itself.
@@ -474,11 +530,12 @@ fn usage(w: anytype) !void {
         \\basalt — a DSL-driven data pipeline engine
         \\
         \\usage:
-        \\  basalt run   <script>|-c <script> [-p key=value ...] [-j N] [--port N]   run a pipeline (mode from @kind)
-        \\  basalt check <script>|-c <script> [-s|--show-plan] [--connect]          validate; -s prints the plan
+        \\  basalt run   <script>|-|-c <script> [-p key=value ...] [-j N] [--port N]  run a pipeline (mode from @kind)
+        \\  basalt serve <dir> [--port N]                            host every @http script in a dir (SIGHUP reloads)
+        \\  basalt check <script>|-|-c <script> [-s|--show-plan] [--connect]         validate; -s prints the plan
         \\  basalt repl                                              interactive read-eval-print loop
         \\
-        \\  -c, --command S    run/check an inline script S instead of a file path
+        \\  <script> may be a path, `-` for stdin, or `-c <script>` for an inline script
         \\  use `write stdout` to print results as a table (the REPL appends it for you)
         \\  -j, --threads N    lanes for splittable SQL sources (default: CPU count; non-split sources are serial)
         \\  --json             emit the run summary as JSON on stdout (machine output)
