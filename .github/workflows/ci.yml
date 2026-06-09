@@ -77,3 +77,28 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Publish the raw static binary as a release asset on tags, so it can be run
+  # directly (e.g. downloaded + executed in a Windmill bash step — no container).
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig
+        run: |
+          mkdir -p ~/.zig
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            | tar -xJ -C ~/.zig --strip-components=1
+          echo "$HOME/.zig" >> "$GITHUB_PATH"
+      - name: Build static binary
+        run: |
+          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dstrip=true
+          cp zig-out/bin/basalt basalt-x86_64-linux
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: basalt-x86_64-linux

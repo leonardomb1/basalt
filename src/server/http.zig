@@ -107,20 +107,56 @@ fn loadDir(gpa: std.mem.Allocator, dir_path: []const u8) !Registry {
     return .{ .arena = arena, .routes = try routes.toOwnedSlice() };
 }
 
-/// Serve every `@http` script in a directory, routing by path; SIGHUP reloads.
-pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, port: u16) !void {
+/// A cheap content fingerprint of the `.bsl` files in `dir_path` (name + mtime +
+/// size). Changes when a script is added, removed, or edited — including when a
+/// git-sync `current` symlink repoints to a fresh checkout. 0 on error.
+fn dirFingerprint(dir_path: []const u8) u64 {
+    var fp: u64 = 0xcbf29ce484222325; // FNV-1a basis as a seed
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return 0;
+    defer dir.close();
+    var it = dir.iterate();
+    while (it.next() catch null) |e| {
+        if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".bsl")) continue;
+        const st = dir.statFile(e.name) catch continue;
+        for (e.name) |c| fp = (fp ^ c) *% 0x100000001b3;
+        fp = (fp ^ @as(u64, @truncate(@as(u128, @bitCast(st.mtime))))) *% 0x100000001b3;
+        fp = (fp ^ st.size) *% 0x100000001b3;
+    }
+    return fp;
+}
+
+/// Serve every `@http` script in a directory, routing by path. Reloads on SIGHUP,
+/// and — when `watch` is set — automatically when the directory's contents change
+/// (e.g. a git-sync sidecar pulled new scripts), checked at most every ~2s.
+pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, port: u16, watch: bool) !void {
     var reg = try loadDir(gpa, dir_path);
     defer reg.deinit();
     var net_server = try listen(port);
     defer net_server.deinit();
     banner(port, reg.routes);
+    if (watch) std.debug.print("watching {s} for changes\n", .{dir_path});
     const threads = std.Thread.getCpuCount() catch 1;
     var read_buf: [64 * 1024]u8 = undefined;
+    var fp: u64 = if (watch) dirFingerprint(dir_path) else 0;
+    var last_check: i64 = 0;
     while (!runtime.aborting()) {
-        if (runtime.takeReload()) {
+        var do_reload = runtime.takeReload();
+        if (watch) {
+            const now_ms = std.time.milliTimestamp();
+            if (now_ms - last_check >= 2000) {
+                last_check = now_ms;
+                const cur = dirFingerprint(dir_path);
+                if (cur != fp) {
+                    fp = cur;
+                    do_reload = true;
+                }
+            }
+        }
+        if (do_reload) {
             if (loadDir(gpa, dir_path)) |new_reg| {
                 reg.deinit();
                 reg = new_reg;
+                if (watch) fp = dirFingerprint(dir_path); // settle after the read
                 std.debug.print("reloaded {s}\n", .{dir_path});
                 banner(port, reg.routes);
             } else |e| std.debug.print("reload failed (keeping current routes): {s}\n", .{@errorName(e)});
