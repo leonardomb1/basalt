@@ -1,0 +1,77 @@
+# basalt as a stateless @http server. No Jobs/CronJobs, no persistent state — your
+# scheduler (an external cron / job that makes an HTTP call) triggers runs by POSTing
+# to the endpoint. Scale with `replicas`.
+#
+#   kubectl create secret generic basalt-secrets \
+#     --from-literal=SR_USER=root --from-literal=SR_PASS=...
+#   kubectl apply -f deploy/k8s.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: basalt-pipeline
+data:
+  pipeline.bsl: |
+    @http(path = "/ingest")
+    connection sr = starrocks
+      fe_host = env("SR_FE_HOST") fe_port = env("SR_FE_PORT")
+      be_url  = env("SR_BE_URL")
+      user = env("SR_USER") password = secret("SR_PASS")
+      database = env("SR_DB")
+    read request
+      | select id, kind = event, ingested_at = now()
+      | write sr stream_load events append
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: basalt
+  labels: { app: basalt }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: basalt }
+  template:
+    metadata:
+      labels: { app: basalt }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: basalt
+          image: ghcr.io/leonardomb1/basalt:latest
+          args: ["run", "/scripts/pipeline.bsl", "--port", "8080"]
+          ports:
+            - { name: http, containerPort: 8080 }
+          envFrom:
+            - secretRef: { name: basalt-secrets }
+          env:
+            - { name: SR_FE_HOST, value: "10.140.0.7" }
+            - { name: SR_FE_PORT, value: "9030" }
+            - { name: SR_BE_URL,  value: "http://10.140.0.10:8040" }
+            - { name: SR_DB,      value: "bronze" }
+          livenessProbe:  { httpGet: { path: /healthz, port: http } }
+          readinessProbe: { httpGet: { path: /readyz,  port: http } }
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts, readOnly: true }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits:   { cpu: "1",   memory: "512Mi" }
+      volumes:
+        - name: scripts
+          configMap: { name: basalt-pipeline }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: basalt
+spec:
+  selector: { app: basalt }
+  ports:
+    - { name: http, port: 80, targetPort: http }

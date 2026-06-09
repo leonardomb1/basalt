@@ -1,0 +1,85 @@
+# basalt with pipelines pulled from git (no ConfigMap). A git-sync sidecar clones
+# your pipelines repo into a shared volume; basalt `serve`s it, routing by each
+# script's @http(path=…). Editing a pipeline = `git push`; git-sync pulls it.
+#
+#   private repo: create a token secret and uncomment the --password-file bits.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: basalt
+  labels: { app: basalt }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: basalt }
+  template:
+    metadata:
+      labels: { app: basalt }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 65532          # shared volume readable by both containers
+        seccompProfile: { type: RuntimeDefault }
+      volumes:
+        - name: scripts
+          emptyDir: {}
+        # - name: git-token
+        #   secret: { secretName: basalt-git-token }   # private repos
+      initContainers:
+        # Native sidecar (k8s 1.29+): the first clone completes before basalt starts,
+        # then it keeps running and pulling every --period.
+        - name: git-sync
+          image: registry.k8s.io/git-sync/git-sync:v4.4.0
+          restartPolicy: Always
+          args:
+            - --repo=https://github.com/leonardomb1/pipelines.git
+            - --ref=main
+            - --root=/scripts
+            - --link=current        # /scripts/current -> latest worktree
+            - --period=30s
+            - --depth=1
+            # - --username=git
+            # - --password-file=/etc/git-token/token
+          securityContext:
+            runAsUser: 65533
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+            # - { name: git-token, mountPath: /etc/git-token, readOnly: true }
+      containers:
+        - name: basalt
+          image: ghcr.io/leonardomb1/basalt:latest
+          # --watch auto-reloads when git-sync pulls new scripts (no restart, no SIGHUP).
+          args: ["serve", "/scripts/current", "--watch"]   # git-sync symlinks current -> the repo
+          ports:
+            - { name: http, containerPort: 8080 }
+          envFrom:
+            - secretRef: { name: basalt-secrets }
+          env:
+            - { name: SR_FE_HOST, value: "10.140.0.7" }
+            - { name: SR_FE_PORT, value: "9030" }
+            - { name: SR_BE_URL,  value: "http://10.140.0.10:8040" }
+            - { name: SR_DB,      value: "bronze" }
+          livenessProbe:  { httpGet: { path: /healthz, port: http } }
+          readinessProbe: { httpGet: { path: /readyz,  port: http } }
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts, readOnly: true }
+          securityContext:
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits:   { cpu: "1",   memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: basalt
+spec:
+  selector: { app: basalt }
+  ports:
+    - { name: http, port: 80, targetPort: http }

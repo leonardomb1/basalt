@@ -338,6 +338,7 @@ fn cmdServe(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     const dir = args[2];
 
     var port: u16 = 8080;
+    var watch = false;
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--port") or std.mem.eql(u8, args[i], "-p")) {
@@ -350,10 +351,12 @@ fn cmdServe(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
                 try stderr.print("error: invalid --port `{s}`\n", .{args[i]});
                 return 2;
             };
+        } else if (std.mem.eql(u8, args[i], "--watch") or std.mem.eql(u8, args[i], "-w")) {
+            watch = true;
         }
     }
 
-    server.serveDir(alloc, dir, port) catch |e| {
+    server.serveDir(alloc, dir, port, watch) catch |e| {
         try stderr.print("serve error: {s}\n", .{@errorName(e)});
         return 1;
     };
@@ -531,7 +534,7 @@ fn usage(w: anytype) !void {
         \\
         \\usage:
         \\  basalt run   <script>|-|-c <script> [-p key=value ...] [-j N] [--port N]  run a pipeline (mode from @kind)
-        \\  basalt serve <dir> [--port N]                            host every @http script in a dir (SIGHUP reloads)
+        \\  basalt serve <dir> [--port N] [--watch]                  host every @http script in a dir (SIGHUP/-w reloads)
         \\  basalt check <script>|-|-c <script> [-s|--show-plan] [--connect]         validate; -s prints the plan
         \\  basalt repl                                              interactive read-eval-print loop
         \\

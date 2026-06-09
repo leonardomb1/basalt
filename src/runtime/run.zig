@@ -386,20 +386,24 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts: RunOptions, d
     var pit = params.iterator();
     while (pit.next()) |kv| try params_expr.put(kv.key_ptr.*, try mkLit(arena, kv.value_ptr.*));
 
-    // Parse JSON params (from the request body) for runtime navigation by for-each
-    // (`for x in p.tables`). expandProgram already validated the body and inlined
-    // scalar `p.a.b` path access, so a parse error here is unexpected → ignore.
+    // JSON params for runtime navigation by for-each (`for x in tables`). Two
+    // sources: the HTTP request body (@http — the whole body is the document), or a
+    // `-p name=<json>` CLI flag (@batch — each json param gets its own value).
     var json_params = std.StringHashMap(std.json.Value).init(arena);
-    {
-        var any_json = false;
-        for (program.stmts) |s| if (s == .param and s.param.is_json) {
-            any_json = true;
-        };
-        if (any_json) if (opts.request_body) |b| {
+    for (program.stmts) |s| {
+        if (s != .param or !s.param.is_json) continue;
+        const name = s.param.name;
+        if (opts.request_body) |b| {
             if (std.json.parseFromSliceLeaky(std.json.Value, arena, b, .{})) |jv| {
-                for (program.stmts) |s| if (s == .param and s.param.is_json) try json_params.put(s.param.name, jv);
+                try json_params.put(name, jv);
             } else |_| {}
-        };
+        }
+        for (opts.params) |kv| {
+            if (!std.mem.eql(u8, kv.key, name)) continue;
+            if (std.json.parseFromSliceLeaky(std.json.Value, arena, kv.val, .{})) |jv| {
+                try json_params.put(name, jv); // -p overrides the body if both given
+            } else |_| return planErr(diag, try std.fmt.allocPrint(arena, "param `{s}`: value is not valid JSON", .{name}));
+        }
     }
 
     var bindings = std.StringHashMap(ast.Pipeline).init(arena);
