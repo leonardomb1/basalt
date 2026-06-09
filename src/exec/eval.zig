@@ -527,9 +527,23 @@ fn cmpStrVec(arena: std.mem.Allocator, op: ast.BinOp, l: Str, r: Str, n: usize) 
     return mkCol(Type.init(.bool).withNull(any), n, bm, .{ .b = out });
 }
 
+/// Evaluate a subexpression whose value the rowwise evaluator might never need
+/// (an untaken `if` branch, the short-circuited side of and/or). The vectorized
+/// path is eager — it computes every row of every branch — so a value-dependent
+/// error (div-by-zero, failed cast) here must not escape: rowwise semantics only
+/// raise it on rows that actually take the branch. Demote it to Unsupported,
+/// which falls the whole expression back to the lazy rowwise evaluator: that
+/// either succeeds (the error was on an untaken row) or raises it for real.
+fn evalVecLazy(arena: std.mem.Allocator, e: *const ast.Expr, batch: Batch) VecError!Vec {
+    return evalVec(arena, e, batch) catch |err| switch (err) {
+        error.DivByZero, error.CastFailed => error.Unsupported,
+        else => err,
+    };
+}
+
 fn boolOpVec(arena: std.mem.Allocator, op: ast.BinOp, le: *const ast.Expr, re: *const ast.Expr, batch: Batch) VecError!Vec {
-    const lv = try evalVec(arena, le, batch);
-    const rv = try evalVec(arena, re, batch);
+    const lv = try evalVecLazy(arena, le, batch);
+    const rv = try evalVecLazy(arena, re, batch);
     const l = asBool(lv) orelse return error.Unsupported;
     const r = asBool(rv) orelse return error.Unsupported;
     const n = batch.len;
@@ -649,9 +663,11 @@ fn castColVec(arena: std.mem.Allocator, col: Column, target: types.TypeKind, n: 
 }
 
 fn condVec(arena: std.mem.Allocator, c: ast.Expr.Cond, batch: Batch) VecError!Vec {
+    // The condition is evaluated on every row in both paths, so its errors are
+    // genuine; the branches are lazy rowwise and must go through evalVecLazy.
     const cond = try evalVec(arena, c.cond, batch);
-    const tv = try evalVec(arena, c.then, batch);
-    const ev = try evalVec(arena, c.els, batch);
+    const tv = try evalVecLazy(arena, c.then, batch);
+    const ev = try evalVecLazy(arena, c.els, batch);
     const n = batch.len;
     const t = (try realize(arena, tv, n)) orelse return error.Unsupported;
     const e = (try realize(arena, ev, n)) orelse return error.Unsupported;
@@ -1436,6 +1452,12 @@ test "vectorized kernels match the rowwise evaluator" {
         "if(x > y, x, y)",
         "-x",
         "x is null",
+        // Fallible ops on lazily-evaluated branches: x is 0 on the last row, so
+        // the eager vectorized path hits a div-by-zero the rowwise path never
+        // evaluates — it must fall back instead of raising.
+        "if(x != 0, y / x, 0)",
+        "x != 0 and y / x > 1",
+        "x == 0 or y / x > 1",
     };
     for (exprs) |body| {
         const src = try std.fmt.allocPrint(a, "@batch\nread t query \"q\" | select r = {s}", .{body});

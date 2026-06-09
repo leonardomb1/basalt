@@ -41,7 +41,15 @@ pub const Sink = struct {
     pub const VTable = struct {
         writeBatch: *const fn (*anyopaque, std.mem.Allocator, Batch) anyerror!void,
         /// Flush and finalize (commit). Called once at end of a successful run.
+        /// Must release every owned resource even when the final flush fails.
         close: *const fn (*anyopaque) anyerror!void,
+        /// Failure-path teardown: discard any buffered, un-flushed data and
+        /// release every owned resource WITHOUT committing. Called instead of
+        /// `close` when the run failed, so a sink never pushes its tail buffer
+        /// for a pipeline that errored. Best-effort: must not fail. Data from
+        /// flushes that already happened stays committed (the exactly-once
+        /// story is owned by downstream dedup, per split.zig).
+        abort: *const fn (*anyopaque) void,
     };
 
     pub fn writeBatch(self: Sink, arena: std.mem.Allocator, b: Batch) anyerror!void {
@@ -49,5 +57,8 @@ pub const Sink = struct {
     }
     pub fn close(self: Sink) anyerror!void {
         return self.vtable.close(self.ptr);
+    }
+    pub fn abort(self: Sink) void {
+        self.vtable.abort(self.ptr);
     }
 };

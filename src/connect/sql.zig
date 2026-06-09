@@ -252,7 +252,20 @@ pub const Sink = struct {
     }
 
     fn closeImpl(self: *Sink) !void {
+        // Release everything even if the final flush fails — otherwise a failed
+        // INSERT on close leaks the connection, the tuple buffers and the sink.
+        defer self.teardown();
         try self.flush();
+    }
+
+    /// Failure path: drop the buffered tuples without a final INSERT. Flushes
+    /// that already ran are autocommitted and stay (downstream dedup owns
+    /// exactly-once, per split.zig).
+    fn abortImpl(self: *Sink) void {
+        self.teardown();
+    }
+
+    fn teardown(self: *Sink) void {
         self.conn.close();
         self.rows.deinit();
         self.tuple_arena.deinit();
@@ -263,7 +276,7 @@ pub const Sink = struct {
     }
 };
 
-const sink_vtable = driver.Sink.VTable{ .writeBatch = sinkWrite, .close = sinkClose };
+const sink_vtable = driver.Sink.VTable{ .writeBatch = sinkWrite, .close = sinkClose, .abort = sinkAbort };
 
 fn sinkWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
     const self: *Sink = @ptrCast(@alignCast(ptr));
@@ -272,6 +285,10 @@ fn sinkWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void 
 fn sinkClose(ptr: *anyopaque) anyerror!void {
     const self: *Sink = @ptrCast(@alignCast(ptr));
     return self.closeImpl();
+}
+fn sinkAbort(ptr: *anyopaque) void {
+    const self: *Sink = @ptrCast(@alignCast(ptr));
+    self.abortImpl();
 }
 
 // ---------------------------------------------------------------------------
@@ -534,11 +551,15 @@ fn nameIn(names: []const []const u8, n: []const u8) bool {
 // Text-format value parsing (shared by MySQL + Postgres result sets)
 // ---------------------------------------------------------------------------
 
+/// Errors with `UnparseableNumber` when an int/float cell doesn't parse:
+/// silently coercing bad source text to 0 would corrupt the pipeline's output
+/// with valid-looking values. The driver cursors wrap the error with the failing
+/// column's name in `last_error`.
 pub fn coerceText(arena: std.mem.Allocator, text: ?[]const u8, ty: types.Type) !Value {
     const t = text orelse return .null;
     return switch (ty.kind) {
-        .int => .{ .int = std.fmt.parseInt(i64, std.mem.trim(u8, t, " "), 10) catch 0 },
-        .float => .{ .float = std.fmt.parseFloat(f64, t) catch 0 },
+        .int => .{ .int = std.fmt.parseInt(i64, std.mem.trim(u8, t, " "), 10) catch return error.UnparseableNumber },
+        .float => .{ .float = std.fmt.parseFloat(f64, t) catch return error.UnparseableNumber },
         .decimal => parseDecimalText(t),
         .bool => .{ .bool = t.len > 0 and (t[0] == '1' or t[0] == 't' or t[0] == 'T' or t[0] == 'y' or t[0] == 'Y') },
         .date => .{ .date = @intCast(parseDateText(t)) },
@@ -618,6 +639,18 @@ test "create table + upsert SQL (postgres)" {
     const stmt = try buildStatement(a, .postgres, qt, schema, .{ .upsert = .{ .keys = &.{"id"} } }, &.{ "(1,'a')", "(2,'b')" });
     try std.testing.expect(std.mem.indexOf(u8, stmt, "INSERT INTO \"people\" (\"id\",\"name\") VALUES (1,'a'),(2,'b')") != null);
     try std.testing.expect(std.mem.indexOf(u8, stmt, "ON CONFLICT (\"id\") DO UPDATE SET \"name\"=EXCLUDED.\"name\"") != null);
+}
+
+test "coerceText: bad numeric text errors instead of silently zeroing" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqual(@as(i64, 42), (try coerceText(a, "42", types.Type.init(.int))).int);
+    try std.testing.expectEqual(@as(i64, 7), (try coerceText(a, " 7 ", types.Type.init(.int))).int);
+    try std.testing.expect((try coerceText(a, null, types.Type.init(.int))).isNull());
+    try std.testing.expectError(error.UnparseableNumber, coerceText(a, "abc", types.Type.init(.int)));
+    try std.testing.expectError(error.UnparseableNumber, coerceText(a, "", types.Type.init(.int)));
+    try std.testing.expectError(error.UnparseableNumber, coerceText(a, "1.2.3", types.Type.init(.float)));
 }
 
 test "value serialization escapes quotes and formats dates" {

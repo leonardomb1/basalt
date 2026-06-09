@@ -261,7 +261,7 @@ pub const Conn = struct {
             const p = self.payload.items;
             switch (t) {
                 'D' => {
-                    try parseDataRow(arena, p, self.cols, builders);
+                    try parseDataRow(self, arena, p, builders);
                     n += 1;
                 },
                 'C' => {},
@@ -425,7 +425,7 @@ fn parseRowDescription(arena: std.mem.Allocator, p: []const u8) !RowDesc {
     return .{ .cols = cols, .fields = fields };
 }
 
-fn parseDataRow(arena: std.mem.Allocator, p: []const u8, cols: []const PgCol, builders: []column.Builder) !void {
+fn parseDataRow(conn: *Conn, arena: std.mem.Allocator, p: []const u8, builders: []column.Builder) !void {
     const n: usize = @intCast(try readI16(p, 0));
     var i: usize = 2;
     for (0..n) |k| {
@@ -436,7 +436,13 @@ fn parseDataRow(arena: std.mem.Allocator, p: []const u8, cols: []const PgCol, bu
         } else {
             const ulen: usize = @intCast(len);
             if (i + ulen > p.len) return error.PgProtocol;
-            try builders[k].append(try sqlmod.coerceText(arena, p[i .. i + ulen], cols[k].engine_type));
+            const cell = p[i .. i + ulen];
+            const v = sqlmod.coerceText(arena, cell, conn.cols[k].engine_type) catch |e| {
+                if (e == error.UnparseableNumber)
+                    conn.last_error = try std.fmt.allocPrint(conn.gpa, "column \"{s}\": unparseable numeric value \"{s}\"", .{ conn.cols[k].name, cell });
+                return e;
+            };
+            try builders[k].append(v);
             i += ulen;
         }
     }
@@ -555,8 +561,20 @@ pub const CopySink = struct {
     }
 
     fn closeImpl(self: *CopySink) !void {
+        // Release everything even if the final flush/CopyDone fails — otherwise
+        // a failed COPY on close leaks the connection, buffer and sink.
+        defer self.teardown();
         try self.flush();
         try self.conn.copyDone();
+    }
+
+    /// Failure path: drop the buffer and close the socket mid-COPY. The server
+    /// aborts the COPY when the connection dies, so none of it is committed.
+    fn abortImpl(self: *CopySink) void {
+        self.teardown();
+    }
+
+    fn teardown(self: *CopySink) void {
         self.conn.close();
         self.buffer.deinit();
         self.gpa.free(self.table);
@@ -564,7 +582,7 @@ pub const CopySink = struct {
     }
 };
 
-const copy_vtable = driver.Sink.VTable{ .writeBatch = copyWrite, .close = copyClose };
+const copy_vtable = driver.Sink.VTable{ .writeBatch = copyWrite, .close = copyClose, .abort = copyAbort };
 
 fn copyWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
     const self: *CopySink = @ptrCast(@alignCast(ptr));
@@ -573,6 +591,10 @@ fn copyWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void 
 fn copyClose(ptr: *anyopaque) anyerror!void {
     const self: *CopySink = @ptrCast(@alignCast(ptr));
     return self.closeImpl();
+}
+fn copyAbort(ptr: *anyopaque) void {
+    const self: *CopySink = @ptrCast(@alignCast(ptr));
+    self.abortImpl();
 }
 
 fn errMessage(p: []const u8) []const u8 {

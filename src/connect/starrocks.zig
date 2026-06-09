@@ -297,14 +297,23 @@ pub const StreamLoadSink = struct {
         // Free every owned resource even if the final flush fails — otherwise a
         // failed Stream Load on close leaks the sink, buffer, columns, label copy,
         // and the HTTP client's connection pool (once per lane).
-        defer {
-            self.client.deinit();
-            self.buffer.deinit();
-            self.gpa.free(self.columns);
-            self.gpa.free(self.cfg.label_prefix);
-            self.gpa.destroy(self);
-        }
+        defer self.teardown();
         try self.flush();
+    }
+
+    /// Failure path: drop the buffered TSV without a final Stream Load. Loads
+    /// that already went out are committed server-side and stay (downstream
+    /// dedup owns exactly-once, per the label scheme above).
+    fn abortImpl(self: *StreamLoadSink) void {
+        self.teardown();
+    }
+
+    fn teardown(self: *StreamLoadSink) void {
+        self.client.deinit();
+        self.buffer.deinit();
+        self.gpa.free(self.columns);
+        self.gpa.free(self.cfg.label_prefix);
+        self.gpa.destroy(self);
     }
 
     fn flush(self: *StreamLoadSink) !void {
@@ -363,7 +372,7 @@ fn loadSucceeded(body: []const u8) bool {
         std.mem.indexOf(u8, body, "Publish Timeout") != null;
 }
 
-const sink_vtable = driver.Sink.VTable{ .writeBatch = slWrite, .close = slClose };
+const sink_vtable = driver.Sink.VTable{ .writeBatch = slWrite, .close = slClose, .abort = slAbort };
 
 fn slWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
     const self: *StreamLoadSink = @ptrCast(@alignCast(ptr));
@@ -372,6 +381,10 @@ fn slWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
 fn slClose(ptr: *anyopaque) anyerror!void {
     const self: *StreamLoadSink = @ptrCast(@alignCast(ptr));
     return self.closeImpl();
+}
+fn slAbort(ptr: *anyopaque) void {
+    const self: *StreamLoadSink = @ptrCast(@alignCast(ptr));
+    self.abortImpl();
 }
 
 // ---------------------------------------------------------------------------
