@@ -584,7 +584,10 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
                     stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lin.stages, mode, opts.threads, env.rows_read);
                 } else {
                     const snk = try openSink(env, last.write, schema);
+                    var snk_open = true;
+                    errdefer if (snk_open) snk.abort(); // failed run: discard the tail buffer, don't commit it
                     stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lin.stages, .{ .shared = snk }, opts.threads, env.rows_read);
+                    snk_open = false;
                     try snk.close();
                 }
                 return;
@@ -593,6 +596,12 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     }
 
     const snk = try openSink(env, last.write, res.schema);
+    // On any error before close, abort the sink: discard its tail buffer instead
+    // of letting a later close commit partial data, and release its connection.
+    // Once close() runs it owns teardown (success or failure), so the flag keeps
+    // a failed close from double-freeing via abort.
+    var snk_open = true;
+    errdefer if (snk_open) snk.abort();
     while (true) {
         if (aborting()) return error.Aborted; // cancelled by the control plane
         _ = batch_arena.reset(.retain_capacity);
@@ -600,6 +609,7 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
         try snk.writeBatch(batch_arena.allocator(), b);
         stats.rows_out += b.len;
     }
+    snk_open = false;
     try snk.close();
 }
 
@@ -1433,6 +1443,9 @@ fn buildJoin(env: *Env, j: ast.Join, left_schema: types.Schema, probe: op.Op) an
         .right_schema = try schemaPtr(arena, build.schema),
         .out_schema = out,
         .kind = j.kind,
+        // Build-side batch + hash index survive across pulls; the per-batch arena
+        // is reset before every pull, so they live in the plan arena instead.
+        .state = arena,
     };
     return .{ .op = .{ .join = o }, .schema = out.* };
 }
@@ -2199,6 +2212,46 @@ test "let binding + inner join" {
     defer alloc.free(out);
     // id 3 (code Z) has no match -> dropped by inner join
     try std.testing.expectEqualStrings("id,label\n1,Apple\n2,Banana\n", out);
+}
+
+test "join probe side spanning multiple batches" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // More rows than one CSV batch (1024), so the join probes its build index
+    // across several pulls — the per-batch arena is reset between pulls, which
+    // must not invalidate the build batch or hash index (they live in the plan
+    // arena via Join.state).
+    var in_buf = std.array_list.Managed(u8).init(alloc);
+    defer in_buf.deinit();
+    try in_buf.appendSlice("id,code\n");
+    var i: usize = 0;
+    while (i < 2500) : (i += 1) {
+        try in_buf.writer().print("{d},{s}\n", .{ i, if (i % 2 == 0) "A" else "B" });
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = in_buf.items });
+    try tmp.dir.writeFile(.{ .sub_path = "lookup.csv", .data = "code,label\nA,Apple\nB,Banana\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
+    defer alloc.free(in_path);
+    const lookup_path = try std.fs.path.join(alloc, &.{ base, "lookup.csv" });
+    defer alloc.free(lookup_path);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "@batch\nlet labels = read csv \"{s}\"\nread csv \"{s}\"\n  | join inner labels on code = code\n  | select id, label\n  | write csv \"{s}\"",
+        .{ lookup_path, in_path, out_path },
+    );
+    defer alloc.free(script);
+
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqual(@as(usize, 2501), std.mem.count(u8, out, "\n"));
+    try std.testing.expect(std.mem.startsWith(u8, out, "id,label\n0,Apple\n1,Banana\n"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "\n2499,Banana\n") != null);
 }
 
 test "union reconciles branches to a canon schema (tag, null-fill, drop-extra)" {

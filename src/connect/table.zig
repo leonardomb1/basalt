@@ -44,7 +44,9 @@ pub const TableWriter = struct {
     }
 
     pub fn close(self: *TableWriter) !void {
-        // Capture the allocator locally: `deinit()` below destroys `self`, so the
+        // Free the cells even if a stdout write below fails.
+        defer self.deinit();
+        // Capture the allocator locally: `deinit()` destroys `self`, so the
         // deferred free must not touch `self.gpa` afterwards.
         const gpa = self.gpa;
         const widths = try gpa.alloc(usize, self.ncols);
@@ -80,8 +82,6 @@ pub const TableWriter = struct {
         }
         try out.print("({d} row{s})\n", .{ self.nrows, if (self.nrows == 1) "" else "s" });
         try out.flush();
-
-        self.deinit();
     }
 
     fn deinit(self: *TableWriter) void {
@@ -96,7 +96,7 @@ pub const TableWriter = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable = driver.Sink.VTable{ .writeBatch = vtWrite, .close = vtClose };
+    const vtable = driver.Sink.VTable{ .writeBatch = vtWrite, .close = vtClose, .abort = vtAbort };
 
     fn vtWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
         const self: *TableWriter = @ptrCast(@alignCast(ptr));
@@ -105,6 +105,11 @@ pub const TableWriter = struct {
     fn vtClose(ptr: *anyopaque) anyerror!void {
         const self: *TableWriter = @ptrCast(@alignCast(ptr));
         return self.close();
+    }
+    fn vtAbort(ptr: *anyopaque) void {
+        // Failure path: free the accumulated cells without rendering the table.
+        const self: *TableWriter = @ptrCast(@alignCast(ptr));
+        self.deinit();
     }
 };
 

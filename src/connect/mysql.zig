@@ -223,10 +223,21 @@ pub const Conn = struct {
                 self.done = true;
                 break;
             }
+            // A mid-stream ERR packet (e.g. a server-side timeout while
+            // streaming) must not be parsed as row data.
+            if (r.len > 0 and r[0] == 0xff) {
+                self.last_error = try self.gpa.dupe(u8, errMessage(r));
+                return error.MysqlQueryFailed;
+            }
             var ri: usize = 0;
             for (self.cols, 0..) |c, k| {
                 const text = try lenencStrOrNull(r, &ri);
-                try builders[k].append(try sqlmod.coerceText(arena, text, c.engine_type));
+                const v = sqlmod.coerceText(arena, text, c.engine_type) catch |e| {
+                    if (e == error.UnparseableNumber)
+                        self.last_error = try std.fmt.allocPrint(self.gpa, "column `{s}`: unparseable numeric value \"{s}\"", .{ c.name, text orelse "" });
+                    return e;
+                };
+                try builders[k].append(v);
             }
             n += 1;
         }
@@ -387,15 +398,27 @@ pub const LoadDataSink = struct {
     }
 
     fn closeImpl(self: *LoadDataSink) !void {
+        // Release everything even if the final flush/end fails — otherwise a
+        // failed LOAD DATA on close leaks the connection, buffer and sink.
+        defer self.teardown();
         try self.flush();
         try self.conn.loadDataEnd();
+    }
+
+    /// Failure path: drop the buffer and close the socket mid-LOAD DATA. The
+    /// server aborts the statement when the connection dies.
+    fn abortImpl(self: *LoadDataSink) void {
+        self.teardown();
+    }
+
+    fn teardown(self: *LoadDataSink) void {
         self.conn.close();
         self.buffer.deinit();
         self.gpa.destroy(self);
     }
 };
 
-const ld_vtable = driver.Sink.VTable{ .writeBatch = ldWrite, .close = ldClose };
+const ld_vtable = driver.Sink.VTable{ .writeBatch = ldWrite, .close = ldClose, .abort = ldAbort };
 
 fn ldWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
     const self: *LoadDataSink = @ptrCast(@alignCast(ptr));
@@ -404,6 +427,10 @@ fn ldWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
 fn ldClose(ptr: *anyopaque) anyerror!void {
     const self: *LoadDataSink = @ptrCast(@alignCast(ptr));
     return self.closeImpl();
+}
+fn ldAbort(ptr: *anyopaque) void {
+    const self: *LoadDataSink = @ptrCast(@alignCast(ptr));
+    self.abortImpl();
 }
 
 fn errMessage(p: []const u8) []const u8 {

@@ -178,6 +178,12 @@ pub const CsvWriter = struct {
         self.file.close();
     }
 
+    /// Failure path: drop the unflushed write buffer and close the file. Rows
+    /// already flushed stay in the file (a CSV has no transaction to roll back).
+    pub fn abort(self: *CsvWriter) void {
+        self.file.close();
+    }
+
     pub fn sink(self: *CsvWriter) driver.Sink {
         return .{ .ptr = self, .vtable = &sink_vtable };
     }
@@ -186,6 +192,7 @@ pub const CsvWriter = struct {
 const sink_vtable = driver.Sink.VTable{
     .writeBatch = sinkWrite,
     .close = sinkClose,
+    .abort = sinkAbort,
 };
 fn sinkWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
     const self: *CsvWriter = @ptrCast(@alignCast(ptr));
@@ -194,6 +201,10 @@ fn sinkWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void 
 fn sinkClose(ptr: *anyopaque) anyerror!void {
     const self: *CsvWriter = @ptrCast(@alignCast(ptr));
     return self.close();
+}
+fn sinkAbort(ptr: *anyopaque) void {
+    const self: *CsvWriter = @ptrCast(@alignCast(ptr));
+    self.abort();
 }
 
 fn writeField(w: anytype, s: []const u8) !void {

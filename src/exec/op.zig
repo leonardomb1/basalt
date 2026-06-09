@@ -677,20 +677,22 @@ fn reduceExtreme(col: column.Column, func: ast.AggFunc, n: usize) Value {
 
 /// Like materializeAll but always returns a (possibly empty) batch with the
 /// schema's columns present — so a join can emit right-side nulls even when the
-/// build side is empty.
-fn materializeFull(arena: std.mem.Allocator, child: Op, schema: *const types.Schema) anyerror!Batch {
+/// build side is empty. The result is built in `state` (which must outlive the
+/// per-pull batch arena: the join probes it across many pulls), while the child
+/// is pulled with the transient `pull` arena.
+fn materializeFull(state: std.mem.Allocator, pull: std.mem.Allocator, child: Op, schema: *const types.Schema) anyerror!Batch {
     const ncols = schema.fields.len;
-    const builders = try arena.alloc(column.Builder, ncols);
-    for (builders, schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
+    const builders = try state.alloc(column.Builder, ncols);
+    for (builders, schema.fields) |*b, f| b.* = column.Builder.init(state, f.ty);
     var total: usize = 0;
-    while (try child.next(arena)) |b| {
+    while (try child.next(pull)) |b| {
         var r: usize = 0;
         while (r < b.len) : (r += 1) {
             for (b.columns, 0..) |*col, ci| try builders[ci].append(col.getValue(r));
         }
         total += b.len;
     }
-    const cols = try arena.alloc(column.Column, ncols);
+    const cols = try state.alloc(column.Column, ncols);
     for (builders, 0..) |*bd, i| cols[i] = try bd.finish();
     return Batch{ .schema = schema, .columns = cols, .len = total };
 }
@@ -705,6 +707,10 @@ fn valueKey(arena: std.mem.Allocator, v: Value) anyerror!?[]const u8 {
 /// Hash equi-join. The build (right) side is materialized into a hash index on
 /// the first `next`; the probe (left) side then streams through. Supports
 /// inner / left / semi / anti.
+///
+/// The build batch and index live across pulls, so they MUST NOT go into the
+/// per-pull batch arena (the driver resets it before every `next`). They are
+/// allocated in `state` — the plan arena, freed when the run ends.
 pub const Join = struct {
     probe: Op,
     build: Op,
@@ -714,6 +720,7 @@ pub const Join = struct {
     right_schema: *const types.Schema,
     out_schema: *const types.Schema,
     kind: ast.JoinKind,
+    state: std.mem.Allocator,
 
     built: bool = false,
     build_batch: Batch = undefined,
@@ -724,13 +731,13 @@ pub const Join = struct {
     pub fn next(self: *Join, arena: std.mem.Allocator) anyerror!?Batch {
         if (!self.built) {
             self.built = true;
-            self.build_batch = try materializeFull(arena, self.build, self.right_schema);
-            self.index = std.StringHashMap(std.array_list.Managed(usize)).init(arena);
+            self.build_batch = try materializeFull(self.state, arena, self.build, self.right_schema);
+            self.index = std.StringHashMap(std.array_list.Managed(usize)).init(self.state);
             var r: usize = 0;
             while (r < self.build_batch.len) : (r += 1) {
-                const k = (try valueKey(arena, self.build_batch.columns[self.right_key].getValue(r))) orelse continue;
+                const k = (try valueKey(self.state, self.build_batch.columns[self.right_key].getValue(r))) orelse continue;
                 const gop = try self.index.getOrPut(k);
-                if (!gop.found_existing) gop.value_ptr.* = std.array_list.Managed(usize).init(arena);
+                if (!gop.found_existing) gop.value_ptr.* = std.array_list.Managed(usize).init(self.state);
                 try gop.value_ptr.append(r);
             }
         }

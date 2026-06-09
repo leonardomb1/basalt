@@ -878,9 +878,21 @@ pub const BulkSink = struct {
     }
 
     fn closeImpl(self: *BulkSink) !void {
+        // Release everything even if the final packets fail — otherwise a failed
+        // INSERT BULK on close leaks the connection, buffer, schema and sink.
+        defer self.teardown();
         try self.flushFull();
         try self.conn.bulkPacket(STATUS_EOM, self.buffer.items); // final packet (may be empty)
         try self.conn.bulkFinish();
+    }
+
+    /// Failure path: drop the buffer and close the socket mid-INSERT BULK; the
+    /// server rolls the bulk batch back when the connection dies.
+    fn abortImpl(self: *BulkSink) void {
+        self.teardown();
+    }
+
+    fn teardown(self: *BulkSink) void {
         self.conn.close();
         self.buffer.deinit();
         for (self.schema.fields) |f| self.gpa.free(f.name);
@@ -889,7 +901,7 @@ pub const BulkSink = struct {
     }
 };
 
-const bulk_vtable = driver.Sink.VTable{ .writeBatch = bulkWrite, .close = bulkClose };
+const bulk_vtable = driver.Sink.VTable{ .writeBatch = bulkWrite, .close = bulkClose, .abort = bulkAbort };
 
 fn bulkWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
     const self: *BulkSink = @ptrCast(@alignCast(ptr));
@@ -898,6 +910,10 @@ fn bulkWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void 
 fn bulkClose(ptr: *anyopaque) anyerror!void {
     const self: *BulkSink = @ptrCast(@alignCast(ptr));
     return self.closeImpl();
+}
+fn bulkAbort(ptr: *anyopaque) void {
+    const self: *BulkSink = @ptrCast(@alignCast(ptr));
+    self.abortImpl();
 }
 
 fn writeU16(w: anytype, v: u16) !void {

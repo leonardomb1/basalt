@@ -64,10 +64,18 @@ fn lane(sh: *Shared, lane_idx: usize) void {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // A per-lane sink is opened on first use and committed when the lane ends.
+    // A per-lane sink is opened on first use and committed when the lane ends —
+    // unless the run failed, in which case its tail buffer is discarded (abort)
+    // rather than flushed: a failed run must not commit more data on the way out.
+    // (Best-effort: a lane that already closed before another lane failed has
+    // committed its tail; prior flushes are always committed regardless.)
     var own_sink: ?driver.Sink = null;
     defer if (own_sink) |s| {
-        s.close() catch |e| fail(sh, e);
+        if (sh.failed.load(.seq_cst)) {
+            s.abort();
+        } else {
+            s.close() catch |e| fail(sh, e);
+        }
     };
 
     while (true) {
