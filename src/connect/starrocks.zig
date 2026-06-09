@@ -160,11 +160,12 @@ pub fn columnList(arena: std.mem.Allocator, schema: types.Schema) ![]const u8 {
 
 /// Append a batch to the load buffer. Fields are separated by 0x01 (`\x01`, set
 /// as the Stream Load `column_separator`) and rows by 0x02 (`\x02`, set as the
-/// `row_delimiter`) — both control bytes StarRocks CSV does no quoting for, so
-/// they must not appear in the data. A literal `\n` is NOT used as the row
-/// delimiter because text columns routinely contain embedded newlines, which
-/// would otherwise split one row into several and break the column count.
-/// Nulls are `\N`.
+/// `row_delimiter`) — control bytes StarRocks CSV does no quoting for. A literal
+/// `\n` is NOT used as the row delimiter because text columns routinely contain
+/// embedded newlines, which would otherwise split one row into several and break
+/// the column count. ERP text/memo columns do carry stray 0x01/0x02 bytes in
+/// practice (e.g. Protheus memo fields), so values are sanitized: those two
+/// bytes are replaced with a space. Nulls are `\N`.
 pub fn appendBatchTsv(w: anytype, arena: std.mem.Allocator, batch: Batch) !void {
     var r: usize = 0;
     while (r < batch.len) : (r += 1) {
@@ -174,11 +175,25 @@ pub fn appendBatchTsv(w: anytype, arena: std.mem.Allocator, batch: Batch) !void 
             if (v.isNull()) {
                 try w.writeAll("\\N");
             } else {
-                try w.writeAll(try eval.valueToString(arena, v));
+                try writeSanitized(w, try eval.valueToString(arena, v));
             }
         }
         try w.writeByte(0x02);
     }
+}
+
+/// Write `s` with any separator/delimiter bytes (0x01, 0x02) replaced by a space,
+/// so data can never shift the Stream Load column or row framing.
+fn writeSanitized(w: anytype, s: []const u8) !void {
+    var start: usize = 0;
+    for (s, 0..) |b, i| {
+        if (b == 0x01 or b == 0x02) {
+            try w.writeAll(s[start..i]);
+            try w.writeByte(' ');
+            start = i + 1;
+        }
+    }
+    try w.writeAll(s[start..]);
 }
 
 /// mysql_native_password auth token:
@@ -426,6 +441,17 @@ test "label and column list" {
         .{ .name = "amount", .ty = types.Type.init(.int) },
     } };
     try std.testing.expectEqualStrings("id,amount", try columnList(a, schema));
+}
+
+test "writeSanitized replaces separator bytes embedded in data" {
+    var buf = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer buf.deinit();
+    try writeSanitized(buf.writer(), "memo\x01with\x02stray bytes\x02");
+    try std.testing.expectEqualStrings("memo with stray bytes ", buf.items);
+
+    buf.clearRetainingCapacity();
+    try writeSanitized(buf.writer(), "clean value");
+    try std.testing.expectEqualStrings("clean value", buf.items);
 }
 
 test "mysql_native_password token matches a known vector" {
