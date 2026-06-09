@@ -87,6 +87,10 @@ pub const Size = struct { n: i64, unit: []const u8 };
 pub const Read = struct {
     connector: []const u8,
     form: ReadForm,
+    /// Optional raw SQL predicate pushed down to the source (no dialect
+    /// translation). Not surface syntax on `read` itself — set by the runtime
+    /// from a union stage's `@[where = "..."]` hint. Empty = no predicate.
+    where: []const u8 = "",
 };
 
 pub const ReadForm = union(enum) {

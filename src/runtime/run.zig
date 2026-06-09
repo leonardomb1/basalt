@@ -757,7 +757,7 @@ fn renderRead(arena: std.mem.Allocator, rd: ast.Read, needles: []const []const u
         .query => |s| .{ .query = try interpAll(arena, s, needles, row) },
         .path => |s| .{ .path = try interpAll(arena, s, needles, row) },
         .request => .request,
-    } };
+    }, .where = try interpAll(arena, rd.where, needles, row) };
 }
 
 /// Interpolate `${var}` into a union stage: the discovered form's discovery query,
@@ -1140,6 +1140,10 @@ const UnionSpec = struct { read: ast.Read, tag: ?[]const u8, name: []const u8 };
 fn unionSpecs(env: *Env, u: ast.Union, hints: []const ast.Hint) ![]UnionSpec {
     const arena = env.arena;
     var specs = std.array_list.Managed(UnionSpec).init(arena);
+    // `@[where = "..."]` pushes a raw source-dialect predicate into every branch's
+    // SQL (incremental extraction: only changed rows cross the wire). The hint
+    // value was already `${var}`-interpolated by renderHints when inside a for-loop.
+    const where = forHintName(hints, "where") orelse "";
     if (u.discover_json.len > 0) {
         // Which JSON keys hold the table / tag, and an optional substring rule to
         // derive the tag from the table name — all configurable via the stage hints
@@ -1175,7 +1179,7 @@ fn unionSpecs(env: *Env, u: ast.Union, hints: []const ast.Hint) ![]UnionSpec {
             const parts = try arena.alloc([]const u8, 1);
             parts[0] = tbl;
             try specs.append(.{
-                .read = .{ .connector = u.discover_conn, .form = .{ .table = .{ .parts = parts } } },
+                .read = .{ .connector = u.discover_conn, .form = .{ .table = .{ .parts = parts } }, .where = where },
                 .tag = tag,
                 .name = tbl,
             });
@@ -1185,9 +1189,13 @@ fn unionSpecs(env: *Env, u: ast.Union, hints: []const ast.Hint) ![]UnionSpec {
         for (try discoverRows(env, disc, 2)) |row| {
             const parts = try arena.alloc([]const u8, 1);
             parts[0] = row[0];
-            try specs.append(.{ .read = .{ .connector = u.discover_conn, .form = .{ .table = .{ .parts = parts } } }, .tag = row[1], .name = row[0] });
+            try specs.append(.{ .read = .{ .connector = u.discover_conn, .form = .{ .table = .{ .parts = parts } }, .where = where }, .tag = row[1], .name = row[0] });
         }
-    } else for (u.branches) |b| try specs.append(.{ .read = b.read, .tag = b.tag, .name = readName(b.read) });
+    } else for (u.branches) |b| {
+        var rd = b.read;
+        if (where.len > 0) rd.where = where;
+        try specs.append(.{ .read = rd, .tag = b.tag, .name = readName(b.read) });
+    }
     return specs.toOwnedSlice();
 }
 
@@ -1513,11 +1521,23 @@ fn resolveDbConfig(env: *Env, conn: ast.Connection, default_port: u16) !DbConfig
 }
 
 fn readSql(env: *Env, rd: ast.Read) ![]const u8 {
-    return switch (rd.form) {
+    const base = switch (rd.form) {
         .query => |q| q,
         .table => |t| try std.fmt.allocPrint(env.arena, "SELECT * FROM {s}", .{try qualStr(env.arena, t)}),
-        else => planErr(env.diag, "a DB read needs `table <name>` or `query \"...\"`"),
+        else => return planErr(env.diag, "a DB read needs `table <name>` or `query \"...\"`"),
     };
+    return sqlWithWhere(env.arena, base, rd.form == .query, rd.where);
+}
+
+/// Compose a pushed-down predicate into a read's SQL. Table reads get a plain
+/// `WHERE`; query reads are wrapped as a subquery so the predicate composes with
+/// whatever the query already filters (same shape split.zig uses for lane ranges).
+/// An empty predicate is "no WHERE" — a for-loop `${var}` that rendered empty
+/// (e.g. no `since` field on a full extraction) falls through to a full scan.
+fn sqlWithWhere(arena: std.mem.Allocator, base: []const u8, is_query: bool, where: []const u8) ![]const u8 {
+    if (where.len == 0) return base;
+    if (is_query) return std.fmt.allocPrint(arena, "SELECT * FROM ({s}) _w WHERE {s}", .{ base, where });
+    return std.fmt.allocPrint(arena, "{s} WHERE {s}", .{ base, where });
 }
 
 fn sqlDescFor(env: *Env, kind: SqlKind, dialect: sql.Dialect, cfg: DbConfig, base_sql: []const u8, rd: ast.Read) !SqlDesc {
@@ -2255,6 +2275,25 @@ test "for-each fans out over a discovered list with interpolation" {
     defer alloc.free(b);
     try std.testing.expectEqualStrings("id,v\n1,10\n2,20\n", a);
     try std.testing.expectEqualStrings("id,v\n3,30\n", b);
+}
+
+test "sqlWithWhere: table appends WHERE, query wraps, empty is a no-op" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings(
+        "SELECT * FROM SC1010 WHERE S_T_A_M_P_ >= '2026-05-09'",
+        try sqlWithWhere(a, "SELECT * FROM SC1010", false, "S_T_A_M_P_ >= '2026-05-09'"),
+    );
+    try std.testing.expectEqualStrings(
+        "SELECT * FROM (SELECT id FROM t WHERE x = 1) _w WHERE id > 5",
+        try sqlWithWhere(a, "SELECT id FROM t WHERE x = 1", true, "id > 5"),
+    );
+    // empty predicate (e.g. `${since}` rendered empty on a full extraction) -> base untouched
+    try std.testing.expectEqualStrings(
+        "SELECT * FROM SC1010",
+        try sqlWithWhere(a, "SELECT * FROM SC1010", false, ""),
+    );
 }
 
 test "for-each parallel + on_error=continue isolates a failing table" {
