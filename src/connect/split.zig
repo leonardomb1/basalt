@@ -9,11 +9,17 @@
 const std = @import("std");
 const sqlmod = @import("sql.zig");
 const types = @import("../lang/types.zig");
+const eval = @import("../exec/eval.zig");
+const valuemod = @import("../exec/value.zig");
 
 const Conn = sqlmod.Conn;
 const Dialect = sqlmod.Dialect;
+const Value = valuemod.Value;
 
-pub const KeyKind = enum { int, uuid };
+/// `.date` covers DATE and DATETIME/TIMESTAMP keys alike: ranges are sliced at
+/// day granularity with date literals, which all three dialects compare against
+/// either type (a date literal coerces to that day's midnight).
+pub const KeyKind = enum { int, uuid, date };
 pub const Key = struct { col: []const u8, kind: KeyKind };
 pub const KeyInfo = struct { key: Key, est_rows: i64 };
 
@@ -108,6 +114,12 @@ fn keyKindFor(typname: []const u8) ?KeyKind {
         "int",    "bigint",    "smallint", "tinyint", "mediumint", // sql server / mysql
     };
     for (ints) |t| if (std.mem.eql(u8, typname, t)) return .int;
+    const dates = [_][]const u8{
+        "date",     "timestamp", "timestamptz", // postgres
+        "datetime", // mysql / sql server (mysql `timestamp` matches above)
+        "datetime2", "smalldatetime", // sql server
+    };
+    for (dates) |t| if (std.mem.eql(u8, typname, t)) return .date;
     // uuid: postgres `uuid`, sql server `uniqueidentifier` (only postgres splits it —
     // plan() bails on uuid for other dialects since their sort order isn't lexical).
     if (std.mem.eql(u8, typname, "uuid") or std.mem.eql(u8, typname, "uniqueidentifier")) return .uuid;
@@ -134,6 +146,12 @@ pub fn plan(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []
             if (dialect != .postgres) return null; // others order uuids non-lexically
             if (!(try hasAnyRow(arena, prober, base))) return null; // empty table: don't fan out lanes
             const preds = try uuidSpacePreds(arena, dialect, key.col, m);
+            return Plan{ .key = key, .predicates = preds };
+        },
+        .date => {
+            const b = (try dateBounds(arena, prober, dialect, base, key.col)) orelse return null;
+            const preds = try dateRangePreds(arena, dialect, key.col, b.min, b.max, m);
+            if (preds.len <= 1) return null;
             return Plan{ .key = key, .predicates = preds };
         },
     }
@@ -195,6 +213,62 @@ fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, mi
         } else {
             const hi: i128 = lo + width;
             try list.append(try std.fmt.allocPrint(arena, "{s} >= {d} AND {s} < {d}", .{ qcol, lo, qcol, hi }));
+        }
+    }
+    return list.toOwnedSlice();
+}
+
+/// MIN/MAX of a date/timestamp key as day counts since the 1970 epoch. The
+/// cursor's text coercion yields `.date` (days) or `.timestamp` (micros);
+/// anything else (e.g. a driver that left the column as text) → no split.
+fn dateBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, col: []const u8) !?Bounds {
+    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ quoteIdent(arena, dialect, col) catch col, base });
+    const conn = prober.open() catch return null;
+    var cur = conn.queryCursor(q) catch {
+        conn.close();
+        return null;
+    };
+    defer cur.close(); // closes the connection
+    const b = (try cur.nextBatch(arena)) orelse return null;
+    if (b.len == 0) return null;
+    const lo = dayOf(b.columns[0].getValue(0)) orelse return null;
+    const hi = dayOf(b.columns[1].getValue(0)) orelse return null;
+    if (hi <= lo) return null; // empty table or single-day key: nothing to split
+    return Bounds{ .min = lo, .max = hi };
+}
+
+fn dayOf(v: Value) ?i64 {
+    return switch (v) {
+        .date => |d| d,
+        .timestamp => |us| @divFloor(us, 86_400_000_000),
+        else => null,
+    };
+}
+
+/// Equal-width day ranges over `[min_day, max_day]` rendered as date literals:
+/// `col >= 'YYYY-MM-DD' AND col < 'YYYY-MM-DD'`, last slice open-ended. Works
+/// for both DATE and DATETIME/TIMESTAMP keys: a timestamp inside the boundary
+/// day falls in the slice whose half-open range contains its midnight-floored
+/// day, so slices stay disjoint and covering.
+fn dateRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, min_day: i64, max_day: i64, m_in: usize) ![]const []const u8 {
+    const qcol = quoteIdent(arena, dialect, col) catch col;
+    const span: i128 = @as(i128, max_day) - @as(i128, min_day) + 1;
+    var m: usize = m_in;
+    if (@as(i128, @intCast(m)) > span) m = @intCast(span); // at least one day per slice
+    if (m <= 1) {
+        const one = try std.fmt.allocPrint(arena, "{s} >= '{s}'", .{ qcol, try eval.formatDate(arena, min_day) });
+        return try dupeOne(arena, one);
+    }
+    const width: i128 = @divTrunc(span + @as(i128, @intCast(m)) - 1, @as(i128, @intCast(m))); // ceil
+    var list = std.array_list.Managed([]const u8).init(arena);
+    var k: usize = 0;
+    while (k < m) : (k += 1) {
+        const lo: i64 = @intCast(@as(i128, min_day) + @as(i128, @intCast(k)) * width);
+        if (k == m - 1) {
+            try list.append(try std.fmt.allocPrint(arena, "{s} >= '{s}'", .{ qcol, try eval.formatDate(arena, lo) }));
+        } else {
+            const hi: i64 = @intCast(@as(i128, lo) + width);
+            try list.append(try std.fmt.allocPrint(arena, "{s} >= '{s}' AND {s} < '{s}'", .{ qcol, try eval.formatDate(arena, lo), qcol, try eval.formatDate(arena, hi) }));
         }
     }
     return list.toOwnedSlice();
@@ -296,6 +370,41 @@ test "uuid space splits are ordered and cover the endpoints" {
     const b1 = try uuidAt(a, 1, 4);
     const b2 = try uuidAt(a, 2, 4);
     try std.testing.expect(std.mem.order(u8, b1, b2) == .lt);
+}
+
+test "date range splits are covering, disjoint, and day-aligned" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // 2024-01-01 (19723) .. 2024-12-31 (20088) into 4 slices.
+    const preds = try dateRangePreds(a, .mysql, "updated_at", 19723, 20088, 4);
+    try std.testing.expectEqual(@as(usize, 4), preds.len);
+    try std.testing.expectEqualStrings("`updated_at` >= '2024-01-01' AND `updated_at` < '2024-04-02'", preds[0]);
+    try std.testing.expect(std.mem.endsWith(u8, preds[3], ">= '2024-10-03'")); // 2024-01-01 + 3*ceil(366/4) days
+    // Boundaries chain: each slice's upper bound is the next slice's lower bound.
+    var k: usize = 0;
+    while (k + 1 < preds.len) : (k += 1) {
+        const hi_pos = std.mem.lastIndexOf(u8, preds[k], "< '").?;
+        const hi = preds[k][hi_pos + 3 ..][0..10];
+        const lo_pos = std.mem.indexOf(u8, preds[k + 1], ">= '").?;
+        const lo = preds[k + 1][lo_pos + 4 ..][0..10];
+        try std.testing.expectEqualStrings(hi, lo);
+    }
+}
+
+test "date range clamps slice count to the day span" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const preds = try dateRangePreds(a, .postgres, "d", 100, 102, 8);
+    try std.testing.expect(preds.len <= 3);
+}
+
+test "dayOf converts date and timestamp values" {
+    try std.testing.expectEqual(@as(?i64, 19723), dayOf(.{ .date = 19723 }));
+    try std.testing.expectEqual(@as(?i64, 19723), dayOf(.{ .timestamp = 19723 * 86_400_000_000 + 3_600_000_000 }));
+    try std.testing.expectEqual(@as(?i64, null), dayOf(.{ .string = "2024-01-01" }));
 }
 
 /// Minimal evaluator for the int predicates this module emits, for tests only:

@@ -288,8 +288,236 @@ fn evalVec(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch) VecErr
         .binary => |b| return binaryVec(arena, b, batch),
         .cast => |c| return castVec(arena, c, batch),
         .cond => |c| return condVec(arena, c, batch),
-        .match, .call => return error.Unsupported,
+        .call => |c| return callVec(arena, c, batch),
+        .match => return error.Unsupported,
     }
+}
+
+// --- vectorized string/function kernels ---
+//
+// Args are evaluated once per batch (one dispatch per node), then a tight loop
+// runs over the `[]const u8` slices — no per-row tree walk, no `Value` boxing.
+// Functions keep the rowwise null semantics exactly: any null input → null row
+// (except coalesce). Anything not covered (non-string args that rowwise would
+// stringify, `match`) raises Unsupported and the whole expression falls back —
+// results are identical either way, only the path differs.
+
+/// Evaluate an argument to a string operand, or null → Unsupported fallback.
+fn strArg(arena: std.mem.Allocator, e: *const ast.Expr, batch: Batch) VecError!Str {
+    const v = try evalVec(arena, e, batch);
+    return asStr(v) orelse error.Unsupported;
+}
+
+fn callVec(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
+    const name = c.name;
+    const n = batch.len;
+
+    // Per-batch timestamps: rowwise re-reads the clock per row; one consistent
+    // instant per batch is the intended (SQL-like) semantics.
+    if (eq(name, "now")) return .{ .scalar = .{ .timestamp = std.time.microTimestamp() } };
+    if (eq(name, "today")) return .{ .scalar = .{ .date = @intCast(@divFloor(std.time.microTimestamp(), 86_400_000_000)) } };
+
+    if (eq(name, "upper") or eq(name, "lower")) {
+        if (c.args.len < 1) return error.Unsupported;
+        const s = try strArg(arena, c.args[0], batch);
+        const up = eq(name, "upper");
+        const out = try arena.alloc([]const u8, n);
+        var bm = try Bitmap.initFull(arena, n);
+        var any = false;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const sv = strAt(s, i) orelse {
+                out[i] = "";
+                bm.setValid(i, false);
+                any = true;
+                continue;
+            };
+            const o = try arena.dupe(u8, sv);
+            for (o) |*ch| ch.* = if (up) std.ascii.toUpper(ch.*) else std.ascii.toLower(ch.*);
+            out[i] = o;
+        }
+        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = out });
+    }
+
+    if (eq(name, "trim")) {
+        if (c.args.len < 1) return error.Unsupported;
+        const s = try strArg(arena, c.args[0], batch);
+        const out = try arena.alloc([]const u8, n);
+        var bm = try Bitmap.initFull(arena, n);
+        var any = false;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const sv = strAt(s, i) orelse {
+                out[i] = "";
+                bm.setValid(i, false);
+                any = true;
+                continue;
+            };
+            out[i] = trim(sv); // subslice of the source bytes: no copy
+        }
+        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = out });
+    }
+
+    if (eq(name, "length")) {
+        if (c.args.len < 1) return error.Unsupported;
+        const s = try strArg(arena, c.args[0], batch);
+        const out = try arena.alloc(i64, n);
+        var bm = try Bitmap.initFull(arena, n);
+        var any = false;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (strAt(s, i)) |sv| {
+                out[i] = @intCast(sv.len);
+            } else {
+                out[i] = 0;
+                bm.setValid(i, false);
+                any = true;
+            }
+        }
+        return mkCol(Type.init(.int).withNull(any), n, bm, .{ .i64 = out });
+    }
+
+    if (eq(name, "starts_with") or eq(name, "ends_with") or eq(name, "contains") or eq(name, "like")) {
+        if (c.args.len < 2) return error.Unsupported;
+        const s = try strArg(arena, c.args[0], batch);
+        const p = try strArg(arena, c.args[1], batch);
+        const out = try arena.alloc(bool, n);
+        var bm = try Bitmap.initFull(arena, n);
+        var any = false;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const sv = strAt(s, i);
+            const pv = strAt(p, i);
+            if (sv == null or pv == null) {
+                out[i] = false;
+                bm.setValid(i, false);
+                any = true;
+                continue;
+            }
+            out[i] = if (eq(name, "starts_with"))
+                std.mem.startsWith(u8, sv.?, pv.?)
+            else if (eq(name, "ends_with"))
+                std.mem.endsWith(u8, sv.?, pv.?)
+            else if (eq(name, "contains"))
+                std.mem.indexOf(u8, sv.?, pv.?) != null
+            else
+                likeMatch(sv.?, pv.?);
+        }
+        return mkCol(Type.init(.bool).withNull(any), n, bm, .{ .b = out });
+    }
+
+    if (eq(name, "concat")) {
+        if (c.args.len == 0) return error.Unsupported;
+        const parts = try arena.alloc(Str, c.args.len);
+        for (c.args, parts) |a, *sp| sp.* = try strArg(arena, a, batch);
+        const out = try arena.alloc([]const u8, n);
+        var bm = try Bitmap.initFull(arena, n);
+        var any = false;
+        var i: usize = 0;
+        rows: while (i < n) : (i += 1) {
+            var total: usize = 0;
+            for (parts) |sp| {
+                total += (strAt(sp, i) orelse {
+                    out[i] = "";
+                    bm.setValid(i, false);
+                    any = true;
+                    continue :rows;
+                }).len;
+            }
+            const o = try arena.alloc(u8, total);
+            var off: usize = 0;
+            for (parts) |sp| {
+                const sv = strAt(sp, i).?;
+                @memcpy(o[off..][0..sv.len], sv);
+                off += sv.len;
+            }
+            out[i] = o;
+        }
+        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = out });
+    }
+
+    if (eq(name, "coalesce")) {
+        if (c.args.len == 0) return error.Unsupported;
+        const parts = try arena.alloc(Str, c.args.len);
+        for (c.args, parts) |a, *sp| sp.* = try strArg(arena, a, batch);
+        const out = try arena.alloc([]const u8, n);
+        var bm = try Bitmap.initFull(arena, n);
+        var any = false;
+        var i: usize = 0;
+        rows: while (i < n) : (i += 1) {
+            for (parts) |sp| {
+                if (strAt(sp, i)) |sv| {
+                    out[i] = sv; // alias the winning slice: no copy
+                    continue :rows;
+                }
+            }
+            out[i] = "";
+            bm.setValid(i, false);
+            any = true;
+        }
+        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = out });
+    }
+
+    if (eq(name, "substr")) {
+        if (c.args.len < 2) return error.Unsupported;
+        const s = try strArg(arena, c.args[0], batch);
+        const start = (try asNum(arena, try evalVec(arena, c.args[1], batch), n)) orelse return error.Unsupported;
+        if (!isIntNum(start)) return error.Unsupported;
+        var len_num: ?Num = null;
+        if (c.args.len > 2) {
+            len_num = (try asNum(arena, try evalVec(arena, c.args[2], batch), n)) orelse return error.Unsupported;
+            if (!isIntNum(len_num.?)) return error.Unsupported;
+        }
+        const out = try arena.alloc([]const u8, n);
+        var bm = try Bitmap.initFull(arena, n);
+        var any = false;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const sv = strAt(s, i);
+            const start_ok = numValid(start, i);
+            const len_ok = if (len_num) |l| numValid(l, i) else true;
+            if (sv == null or !start_ok or !len_ok) {
+                out[i] = "";
+                bm.setValid(i, false);
+                any = true;
+                continue;
+            }
+            out[i] = try substrBytes(arena, sv.?, numI(start, i), if (len_num) |l| numI(l, i) else null);
+        }
+        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = out });
+    }
+
+    if (eq(name, "replace")) {
+        if (c.args.len < 3) return error.Unsupported;
+        const s = try strArg(arena, c.args[0], batch);
+        const f = try strArg(arena, c.args[1], batch);
+        const t = try strArg(arena, c.args[2], batch);
+        const out = try arena.alloc([]const u8, n);
+        var bm = try Bitmap.initFull(arena, n);
+        var any = false;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const sv = strAt(s, i);
+            const fv = strAt(f, i);
+            const tv = strAt(t, i);
+            if (sv == null or fv == null or tv == null) {
+                out[i] = "";
+                bm.setValid(i, false);
+                any = true;
+                continue;
+            }
+            if (fv.?.len == 0) {
+                out[i] = sv.?;
+                continue;
+            }
+            const o = try arena.alloc(u8, std.mem.replacementSize(u8, sv.?, fv.?, tv.?));
+            _ = std.mem.replace(u8, sv.?, fv.?, tv.?, o);
+            out[i] = o;
+        }
+        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = out });
+    }
+
+    return error.Unsupported;
 }
 
 fn unaryVec(arena: std.mem.Allocator, u: ast.Expr.Unary, batch: Batch) VecError!Vec {
@@ -1466,6 +1694,74 @@ test "vectorized kernels match the rowwise evaluator" {
         const e = prog.stmts[1].output.stages[1].node.select[0].computed.expr;
         var ctx = TypeCtx{ .schema = schema, .arena = a };
         const ty = try ctx.typeOf(e);
+
+        const vec = try evalColumn(a, e, batch, ty);
+        const rowwise = try evalColumnRowwise(a, e, batch, ty);
+        try std.testing.expectEqual(rowwise.len, vec.len);
+        var i: usize = 0;
+        while (i < vec.len) : (i += 1) {
+            const want = rowwise.getValue(i);
+            const got = vec.getValue(i);
+            try std.testing.expectEqual(want.isNull(), got.isNull());
+            if (!want.isNull()) {
+                if (compareValues(want, got)) |ord| {
+                    try std.testing.expect(ord == .eq);
+                } else try std.testing.expect(false);
+            }
+        }
+    }
+}
+
+test "vectorized string kernels match the rowwise evaluator" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var sb = column.Builder.init(a, Type.init(.string).asNullable());
+    try sb.append(.{ .string = "  Apple " });
+    try sb.append(.null);
+    try sb.append(.{ .string = "banana" });
+    try sb.append(.{ .string = "" });
+    try sb.append(.{ .string = "Cherry pie" });
+    const s = try sb.finish();
+    const x = try column.intColumn(a, &.{ 1, 2, null, 4, 5 });
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "s", .ty = Type.init(.string).asNullable() },
+        .{ .name = "x", .ty = Type.init(.int).asNullable() },
+    } };
+    var cols = [_]column.Column{ s, x };
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 5 };
+
+    const exprs = [_][]const u8{
+        "upper(s)",
+        "lower(s)",
+        "trim(s)",
+        "length(s)",
+        "concat(s, \"-\", s)",
+        "starts_with(s, \"b\")",
+        "ends_with(s, \"e\")",
+        "contains(s, \"an\")",
+        "like(s, \"%an%\")",
+        "substr(s, 2, 3)",
+        "replace(s, \"an\", \"AN\")",
+        "coalesce(s, \"fallback\")",
+        "if(contains(s, \"p\"), upper(s), s)",
+        "length(trim(s)) > 5 and contains(s, \"e\")",
+    };
+    for (exprs) |body| {
+        const src = try std.fmt.allocPrint(a, "@batch\nread t query \"q\" | select r = {s}", .{body});
+        var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = try parser.parseSource(a, src, &diag);
+        const e = prog.stmts[1].output.stages[1].node.select[0].computed.expr;
+        var ctx = TypeCtx{ .schema = schema, .arena = a };
+        const ty = try ctx.typeOf(e);
+
+        // Every expression here must take the vectorized path for real — a
+        // silent rowwise fallback would make this test vacuous.
+        _ = evalVec(a, e, batch) catch |err| {
+            std.debug.print("expr de-vectorized: {s}\n", .{body});
+            try std.testing.expect(err != error.Unsupported);
+        };
 
         const vec = try evalColumn(a, e, batch, ty);
         const rowwise = try evalColumnRowwise(a, e, batch, ty);

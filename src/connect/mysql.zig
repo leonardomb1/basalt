@@ -22,6 +22,7 @@ const CLIENT_LONG_PASSWORD = 0x00000001;
 const CLIENT_CONNECT_WITH_DB = 0x00000008;
 const CLIENT_LOCAL_FILES = 0x00000080; // enables LOAD DATA LOCAL INFILE
 const CLIENT_PROTOCOL_41 = 0x00000200;
+const CLIENT_SSL = 0x00000800;
 const CLIENT_SECURE_CONNECTION = 0x00008000;
 const CLIENT_PLUGIN_AUTH = 0x00080000;
 
@@ -41,6 +42,7 @@ pub const Conn = struct {
     sw: std.net.Stream.Writer = undefined,
     buf: std.array_list.Managed(u8),
     last_error: []const u8 = "",
+    tls: ?*sqlmod.TlsState = null,
     // streaming cursor state (valid between queryCursor and close)
     meta_arena: std.heap.ArenaAllocator = undefined,
     cols: []MyCol = &.{},
@@ -48,7 +50,7 @@ pub const Conn = struct {
     done: bool = false,
     ld_seq: u8 = 0, // packet sequence during a LOAD DATA exchange
 
-    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8) !*Conn {
+    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sqlmod.TlsMode) !*Conn {
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
         const self = try gpa.create(Conn);
         self.* = .{ .gpa = gpa, .stream = stream, .buf = std.array_list.Managed(u8).init(gpa) };
@@ -56,35 +58,76 @@ pub const Conn = struct {
         self.sw = std.net.Stream.Writer.init(stream, &self.write_buf);
         errdefer self.close();
 
-        // 1. server handshake
+        // 1. server handshake (always plaintext)
         const seq = try self.readPacket();
-        const salt = try self.parseHandshake(self.buf.items);
+        const hs = try self.parseHandshake(self.buf.items);
 
-        // 2. handshake response
-        try self.writeHandshakeResponse(seq + 1, user, password, database, salt);
+        // 2. TLS upgrade: a short SSLRequest packet (the response's fixed prefix
+        // with CLIENT_SSL set), then the handshake; the rest of the exchange —
+        // including credentials — runs inside the session.
+        var rseq = seq + 1;
+        if (tls_mode != .off) {
+            try self.writeSslRequest(rseq, database);
+            const ts = try gpa.create(sqlmod.TlsState);
+            errdefer gpa.destroy(ts);
+            try ts.start(gpa, self.sr.interface(), &self.sw.interface, host, tls_mode);
+            self.tls = ts;
+            rseq += 1;
+        }
 
-        // 3. auth result
-        _ = try self.readPacket();
-        const p = self.buf.items;
-        if (p.len == 0) return error.MysqlProtocol;
-        switch (p[0]) {
-            0x00 => {}, // OK
-            0xff => {
-                self.last_error = try self.gpa.dupe(u8, errMessage(p));
-                return error.MysqlAuthFailed;
-            },
-            0xfe => {
-                // auth switch request: payload = 0xfe + plugin(null) + salt(...)
-                const new_salt = parseAuthSwitch(p);
-                const token = sr.mysqlAuthToken(password, &new_salt);
-                try self.writePacket(3, if (password.len == 0) "" else &token);
-                _ = try self.readPacket();
-                if (self.buf.items.len == 0 or self.buf.items[0] == 0xff) {
-                    if (self.buf.items.len > 0) self.last_error = try self.gpa.dupe(u8, errMessage(self.buf.items));
+        // 3. handshake response, with the token for the plugin the server chose
+        try self.writeHandshakeResponse(rseq, user, password, database, hs.salt, hs.plugin);
+
+        // 4. auth result loop: OK / ERR / auth-switch / caching_sha2 more-data
+        while (true) {
+            rseq = try self.readPacket();
+            const p = self.buf.items;
+            if (p.len == 0) return error.MysqlProtocol;
+            switch (p[0]) {
+                0x00 => break, // OK
+                0xff => {
+                    self.last_error = try self.gpa.dupe(u8, errMessage(p));
                     return error.MysqlAuthFailed;
-                }
-            },
-            else => return error.MysqlProtocol,
+                },
+                0xfe => {
+                    // auth switch request: payload = 0xfe + plugin(null) + salt
+                    const sw = parseAuthSwitch(p);
+                    if (password.len == 0) {
+                        try self.writePacket(rseq +% 1, "");
+                    } else switch (sw.plugin orelse return error.MysqlAuthFailed) {
+                        .native => {
+                            const token = sr.mysqlAuthToken(password, &sw.salt);
+                            try self.writePacket(rseq +% 1, &token);
+                        },
+                        .caching_sha2 => {
+                            const token = cachingSha2Token(password, &sw.salt);
+                            try self.writePacket(rseq +% 1, &token);
+                        },
+                    }
+                },
+                0x01 => {
+                    // caching_sha2_password "more data": 3 = fast-auth ok (an OK
+                    // packet follows), 4 = full auth — the cached entry is cold,
+                    // so the server wants the cleartext password. Only safe (and
+                    // only implemented) inside TLS; the plaintext alternative is
+                    // an RSA exchange we don't speak.
+                    if (p.len >= 2 and p[1] == 3) continue;
+                    if (p.len >= 2 and p[1] == 4) {
+                        if (self.tls == null) {
+                            self.last_error = try self.gpa.dupe(u8, "caching_sha2_password full auth needs `tls` (or a warmed server-side cache)");
+                            return error.MysqlAuthFailed;
+                        }
+                        const pw = try self.gpa.alloc(u8, password.len + 1);
+                        defer self.gpa.free(pw);
+                        @memcpy(pw[0..password.len], password);
+                        pw[password.len] = 0;
+                        try self.writePacket(rseq +% 1, pw);
+                        continue;
+                    }
+                    return error.MysqlProtocol;
+                },
+                else => return error.MysqlProtocol,
+            }
         }
         return self;
     }
@@ -148,9 +191,23 @@ pub const Conn = struct {
 
     pub fn close(self: *Conn) void {
         if (self.last_error.len > 0) self.gpa.free(self.last_error);
+        if (self.tls) |t| t.deinit(self.gpa);
         self.buf.deinit();
         self.stream.close();
         self.gpa.destroy(self);
+    }
+
+    /// Cleartext reader/writer: through the TLS session when enabled, else the
+    /// plain socket interfaces.
+    fn rd(self: *Conn) *std.Io.Reader {
+        return if (self.tls) |t| &t.client.reader else self.sr.interface();
+    }
+    fn wr(self: *Conn) *std.Io.Writer {
+        return if (self.tls) |t| &t.client.writer else &self.sw.interface;
+    }
+    fn flushOut(self: *Conn) !void {
+        if (self.tls) |t| try t.client.writer.flush(); // seal TLS records...
+        try self.sw.interface.flush(); // ...then push them down the socket
     }
 
     pub fn sqlConn(self: *Conn) sqlmod.Conn {
@@ -159,15 +216,10 @@ pub const Conn = struct {
 
     /// Start streaming a query: send it, parse the column-def header.
     pub fn queryCursor(self: *Conn, sql: []const u8) !sqlmod.Cursor {
-        self.meta_arena = std.heap.ArenaAllocator.init(self.gpa);
-        self.openCursor(sql) catch |e| {
-            self.meta_arena.deinit();
-            return e; // leave conn open: the caller owns it (can read last_error) and closes it
-        };
-        return .{ .ptr = self, .vtable = &cursor_vtable };
+        return sqlmod.openTextCursor(self, sql, &cursor_vtable);
     }
 
-    fn openCursor(self: *Conn, sql: []const u8) !void {
+    pub fn openCursor(self: *Conn, sql: []const u8) !void {
         const ma = self.meta_arena.allocator();
         const payload = try self.gpa.alloc(u8, sql.len + 1);
         defer self.gpa.free(payload);
@@ -208,54 +260,42 @@ pub const Conn = struct {
         self.done = false;
     }
 
-    fn fetchBatch(self: *Conn, arena: std.mem.Allocator) !?Batch {
-        if (self.done) return null;
-        const ncol = self.cols.len;
-        if (ncol == 0) return null;
-        const builders = try arena.alloc(column.Builder, ncol);
-        for (self.cols, builders) |c, *b| b.* = column.Builder.init(arena, c.engine_type);
-
-        var n: usize = 0;
-        while (n < sqlmod.STREAM_ROWS) {
-            _ = try self.readPacket();
-            const r = self.buf.items;
-            if (r.len > 0 and r[0] == 0xfe and r.len < 9) { // EOF = end of rows
-                self.done = true;
-                break;
-            }
-            // A mid-stream ERR packet (e.g. a server-side timeout while
-            // streaming) must not be parsed as row data.
-            if (r.len > 0 and r[0] == 0xff) {
-                self.last_error = try self.gpa.dupe(u8, errMessage(r));
-                return error.MysqlQueryFailed;
-            }
-            var ri: usize = 0;
-            for (self.cols, 0..) |c, k| {
-                const text = try lenencStrOrNull(r, &ri);
-                const v = sqlmod.coerceText(arena, text, c.engine_type) catch |e| {
+    /// One result-set packet, classified for `sql.fetchTextBatch`: a row
+    /// (values appended), the end of the stream, or a server error.
+    pub fn nextRow(self: *Conn, arena: std.mem.Allocator, builders: []column.Builder) !sqlmod.RowStep {
+        _ = try self.readPacket();
+        const r = self.buf.items;
+        if (r.len > 0 and r[0] == 0xfe and r.len < 9) return .end; // EOF
+        // A mid-stream ERR packet (e.g. a server-side timeout while streaming)
+        // must not be parsed as row data.
+        if (r.len > 0 and r[0] == 0xff) {
+            self.last_error = try self.gpa.dupe(u8, errMessage(r));
+            return error.MysqlQueryFailed;
+        }
+        var ri: usize = 0;
+        for (self.cols, 0..) |c, k| {
+            const text = try lenencStrOrNull(r, &ri);
+            const v: Value = if (text == null)
+                .null
+            else if (c.mtype == 0x10)
+                // BIT columns arrive as raw big-endian bytes even in the text
+                // protocol ("\x05", not "5") — fold them instead of parsing.
+                .{ .int = decodeBits(text.?) }
+            else
+                sqlmod.coerceText(arena, text, c.engine_type) catch |e| {
                     if (e == error.UnparseableNumber)
-                        self.last_error = try std.fmt.allocPrint(self.gpa, "column `{s}`: unparseable numeric value \"{s}\"", .{ c.name, text orelse "" });
+                        self.last_error = try std.fmt.allocPrint(self.gpa, "column `{s}`: unparseable numeric value \"{s}\"", .{ c.name, text.? });
                     return e;
                 };
-                try builders[k].append(v);
-            }
-            n += 1;
+            try builders[k].append(v);
         }
-        if (n == 0) return null;
-        const out = try arena.alloc(column.Column, ncol);
-        for (builders, 0..) |*b, k| out[k] = try b.finish();
-        return .{ .schema = self.cur_schema, .columns = out, .len = n };
-    }
-
-    fn cursorClose(self: *Conn) void {
-        self.meta_arena.deinit();
-        self.close();
+        return .row;
     }
 
     // --- packet framing ---
 
     fn readPacket(self: *Conn) !u8 {
-        const r = self.sr.interface();
+        const r = self.rd();
         var header: [4]u8 = undefined;
         try r.readSliceAll(&header);
         const len: usize = @as(usize, header[0]) | (@as(usize, header[1]) << 8) | (@as(usize, header[2]) << 16);
@@ -270,13 +310,15 @@ pub const Conn = struct {
         header[1] = @intCast((payload.len >> 8) & 0xff);
         header[2] = @intCast((payload.len >> 16) & 0xff);
         header[3] = seq;
-        const w = &self.sw.interface;
+        const w = self.wr();
         try w.writeAll(&header);
         try w.writeAll(payload);
-        try w.flush();
+        try self.flushOut();
     }
 
-    fn parseHandshake(self: *Conn, p: []const u8) ![20]u8 {
+    const Handshake = struct { salt: [20]u8, plugin: AuthPlugin };
+
+    fn parseHandshake(self: *Conn, p: []const u8) !Handshake {
         _ = self;
         if (p.len < 1 or p[0] != 10) return error.MysqlProtocol;
         var i: usize = 1;
@@ -296,12 +338,39 @@ pub const Conn = struct {
         i += 10; // reserved
         if (i + 12 > p.len) return error.MysqlProtocol;
         @memcpy(salt[8..20], p[i .. i + 12]); // auth-plugin-data part 2 (first 12)
-        return salt;
+        i += 13; // part 2 incl. its null terminator
+        // trailing null-terminated auth plugin name; default to native if absent
+        var plugin: AuthPlugin = .native;
+        if (i < p.len) {
+            const end = std.mem.indexOfScalarPos(u8, p, i, 0) orelse p.len;
+            plugin = pluginByName(p[i..end]) orelse .native;
+        }
+        return .{ .salt = salt, .plugin = plugin };
     }
 
-    fn writeHandshakeResponse(self: *Conn, seq: u8, user: []const u8, password: []const u8, database: []const u8, salt: [20]u8) !void {
+    fn capsFor(self: *Conn, database: []const u8) u32 {
         var caps: u32 = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH | CLIENT_LONG_PASSWORD | CLIENT_LOCAL_FILES;
         if (database.len > 0) caps |= CLIENT_CONNECT_WITH_DB;
+        if (self.tls != null) caps |= CLIENT_SSL;
+        return caps;
+    }
+
+    /// The SSLRequest packet: just the fixed 32-byte prefix of the handshake
+    /// response (caps with CLIENT_SSL, max packet, charset, 23 zero bytes). The
+    /// caps here must match the full response sent after the TLS handshake.
+    fn writeSslRequest(self: *Conn, seq: u8, database: []const u8) !void {
+        var out = std.array_list.Managed(u8).init(self.gpa);
+        defer out.deinit();
+        const w = out.writer();
+        try w.writeInt(u32, self.capsFor(database) | CLIENT_SSL, .little);
+        try w.writeInt(u32, 0x01000000, .little); // max packet 16M
+        try w.writeByte(33); // utf8_general_ci
+        try w.writeByteNTimes(0, 23); // reserved
+        try self.writePacket(seq, out.items);
+    }
+
+    fn writeHandshakeResponse(self: *Conn, seq: u8, user: []const u8, password: []const u8, database: []const u8, salt: [20]u8, plugin: AuthPlugin) !void {
+        const caps = self.capsFor(database);
 
         var out = std.array_list.Managed(u8).init(self.gpa);
         defer out.deinit();
@@ -316,32 +385,81 @@ pub const Conn = struct {
 
         if (password.len == 0) {
             try w.writeByte(0); // empty auth response
-        } else {
-            const token = sr.mysqlAuthToken(password, &salt);
-            try w.writeByte(20);
-            try w.writeAll(&token);
+        } else switch (plugin) {
+            .native => {
+                const token = sr.mysqlAuthToken(password, &salt);
+                try w.writeByte(20);
+                try w.writeAll(&token);
+            },
+            .caching_sha2 => {
+                const token = cachingSha2Token(password, &salt);
+                try w.writeByte(32);
+                try w.writeAll(&token);
+            },
         }
 
         if (database.len > 0) {
             try w.writeAll(database);
             try w.writeByte(0);
         }
-        try w.writeAll("mysql_native_password");
+        try w.writeAll(plugin.name());
         try w.writeByte(0);
 
         try self.writePacket(seq, out.items);
     }
 };
 
-fn parseAuthSwitch(p: []const u8) [20]u8 {
+pub const AuthPlugin = enum {
+    native,
+    caching_sha2,
+
+    fn name(self: AuthPlugin) []const u8 {
+        return switch (self) {
+            .native => "mysql_native_password",
+            .caching_sha2 => "caching_sha2_password",
+        };
+    }
+};
+
+fn pluginByName(s: []const u8) ?AuthPlugin {
+    if (std.mem.eql(u8, s, "mysql_native_password")) return .native;
+    if (std.mem.eql(u8, s, "caching_sha2_password")) return .caching_sha2;
+    return null;
+}
+
+/// caching_sha2_password fast-auth token:
+///   SHA256(pw) XOR SHA256( SHA256(SHA256(pw)) ++ nonce )
+/// (note: digest-then-nonce — the opposite order of mysql_native_password).
+pub fn cachingSha2Token(password: []const u8, salt: []const u8) [32]u8 {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    var h1: [32]u8 = undefined; // SHA256(pw)
+    Sha256.hash(password, &h1, .{});
+    var h2: [32]u8 = undefined; // SHA256(SHA256(pw))
+    Sha256.hash(&h1, &h2, .{});
+
+    var ctx = Sha256.init(.{});
+    ctx.update(&h2);
+    ctx.update(salt);
+    var h3: [32]u8 = undefined; // SHA256(SHA256(SHA256(pw)) ++ nonce)
+    ctx.final(&h3);
+
+    var out: [32]u8 = undefined;
+    for (&out, 0..) |*b, i| b.* = h1[i] ^ h3[i];
+    return out;
+}
+
+const AuthSwitch = struct { plugin: ?AuthPlugin, salt: [20]u8 };
+
+fn parseAuthSwitch(p: []const u8) AuthSwitch {
     // 0xfe, plugin name (null-terminated), then salt
     var i: usize = 1;
-    while (i < p.len and p[i] != 0) : (i += 1) {}
-    i += 1;
+    const name_end = std.mem.indexOfScalarPos(u8, p, i, 0) orelse p.len;
+    const plugin = pluginByName(p[i..name_end]);
+    i = name_end + 1;
     var salt: [20]u8 = std.mem.zeroes([20]u8);
     const n = @min(@as(usize, 20), p.len -| i);
     if (n > 0) @memcpy(salt[0..n], p[i .. i + n]);
-    return salt;
+    return .{ .plugin = plugin, .salt = salt };
 }
 
 // ---------------------------------------------------------------------------
@@ -467,11 +585,27 @@ fn curSchema(ptr: *anyopaque) types.Schema {
 }
 fn curNext(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
     const self: *Conn = @ptrCast(@alignCast(ptr));
-    return self.fetchBatch(arena);
+    return sqlmod.fetchTextBatch(self, arena);
 }
 fn curClose(ptr: *anyopaque) void {
     const self: *Conn = @ptrCast(@alignCast(ptr));
-    self.cursorClose();
+    sqlmod.closeTextCursor(self);
+}
+
+/// Fold a BIT column's raw big-endian bytes into an int (BIT(64) max; longer
+/// inputs keep the low 64 bits).
+fn decodeBits(raw: []const u8) i64 {
+    var v: u64 = 0;
+    for (raw[raw.len -| 8 ..]) |b| v = (v << 8) | b;
+    return @bitCast(v);
+}
+
+test "decodeBits folds big-endian BIT bytes" {
+    try std.testing.expectEqual(@as(i64, 0), decodeBits(""));
+    try std.testing.expectEqual(@as(i64, 5), decodeBits("\x05"));
+    try std.testing.expectEqual(@as(i64, 1), decodeBits("\x01"));
+    try std.testing.expectEqual(@as(i64, 256), decodeBits("\x01\x00"));
+    try std.testing.expectEqual(@as(i64, 0xA1B2), decodeBits("\xA1\xB2"));
 }
 
 const MyCol = struct {

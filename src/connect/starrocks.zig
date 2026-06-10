@@ -14,6 +14,7 @@ const batchmod = @import("../exec/batch.zig");
 const eval = @import("../exec/eval.zig");
 const driver = @import("driver.zig");
 const mysql = @import("mysql.zig");
+const sqlmod = @import("sql.zig");
 
 const Batch = batchmod.Batch;
 
@@ -280,7 +281,7 @@ pub const StreamLoadSink = struct {
     fn runDDL(self: *StreamLoadSink, sql: []const u8) !void {
         // connect without a preselected database (it may not exist yet); DDL uses
         // fully-qualified `db`.`table` names.
-        const conn = try mysql.Conn.connect(self.gpa, self.cfg.fe_host, self.cfg.fe_port, self.cfg.user, self.cfg.password, "");
+        const conn = try mysql.Conn.connect(self.gpa, self.cfg.fe_host, self.cfg.fe_port, self.cfg.user, self.cfg.password, "", .off);
         defer conn.close();
         conn.exec(sql) catch |e| {
             std.debug.print("starrocks DDL error: {s}\n  sql: {s}\n", .{ conn.last_error, sql });
@@ -319,7 +320,20 @@ pub const StreamLoadSink = struct {
     fn flush(self: *StreamLoadSink) !void {
         if (self.buffer.items.len == 0) return;
         self.seq += 1;
-        try self.streamLoad();
+        // Retry transient network failures with backoff, reusing the SAME label
+        // (seq was bumped once above): if the failed PUT actually committed,
+        // the server answers the retry with "Label Already Exists", which
+        // loadSucceeded treats as success — at-most-once per flush.
+        var attempt: usize = 0;
+        while (true) {
+            self.streamLoad() catch |e| {
+                attempt += 1;
+                if (attempt >= 3 or !sqlmod.transientNet(e)) return e;
+                std.Thread.sleep(attempt * 500 * std.time.ns_per_ms);
+                continue;
+            };
+            break;
+        }
         self.buffer.clearRetainingCapacity();
     }
 
@@ -367,9 +381,19 @@ pub const StreamLoadSink = struct {
 };
 
 fn loadSucceeded(body: []const u8) bool {
-    // tolerate pretty/compact JSON; accept Success and Publish Timeout (committed)
+    // tolerate pretty/compact JSON; accept Success and Publish Timeout
+    // (committed). "Label Already Exists" means a previous attempt with this
+    // label committed — the retry-after-lost-response case — also success.
     return std.mem.indexOf(u8, body, "Success") != null or
-        std.mem.indexOf(u8, body, "Publish Timeout") != null;
+        std.mem.indexOf(u8, body, "Publish Timeout") != null or
+        std.mem.indexOf(u8, body, "Label Already Exists") != null;
+}
+
+test "loadSucceeded accepts success, publish timeout, and duplicate label" {
+    try std.testing.expect(loadSucceeded("{\"Status\": \"Success\"}"));
+    try std.testing.expect(loadSucceeded("{\"Status\": \"Publish Timeout\"}"));
+    try std.testing.expect(loadSucceeded("{\"Status\": \"Label Already Exists\", \"ExistingJobStatus\": \"FINISHED\"}"));
+    try std.testing.expect(!loadSucceeded("{\"Status\": \"Fail\", \"Message\": \"too many filtered rows\"}"));
 }
 
 const sink_vtable = driver.Sink.VTable{ .writeBatch = slWrite, .close = slClose, .abort = slAbort };
