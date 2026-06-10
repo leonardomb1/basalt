@@ -1,7 +1,8 @@
-//! Minimal TDS (SQL Server) client — plaintext only (the dev server accepts
-//! ENCRYPT_NOT_SUP, so no TLS). Packet framing, PRELOGIN, LOGIN7 with SQL auth,
-//! SQLBatch, and a streaming token-stream reader (PacketReader/TdsCursor) that
-//! pulls packets on demand so ROW tokens may span packet boundaries.
+//! Minimal TDS (SQL Server) client. Packet framing, PRELOGIN, optional TDS 7.x
+//! tunneled TLS (the handshake rides inside PRELOGIN packets; all TDS traffic
+//! then flows inside the session), LOGIN7 with SQL auth, SQLBatch, and a
+//! streaming token-stream reader (PacketReader/TdsCursor) that pulls packets
+//! on demand so ROW tokens may span packet boundaries.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -22,7 +23,7 @@ const PKT_BULK = 0x07; // Bulk Load BCP data
 const STATUS_EOM = 0x01;
 const BULK_PKT_PAYLOAD = 4088; // default 4096-byte TDS packet minus the 8-byte header
 
-pub const Error = error{ TdsProtocol, LoginFailed, QueryFailed, EncryptionRequired, UnsupportedTdsType } || std.mem.Allocator.Error || std.net.Stream.WriteError || std.net.Stream.ReadError;
+pub const Error = error{ TdsProtocol, LoginFailed, QueryFailed, EncryptionRequired, TdsTlsRefused, UnsupportedTdsType } || std.mem.Allocator.Error || std.net.Stream.WriteError || std.net.Stream.ReadError;
 
 pub const Conn = struct {
     gpa: std.mem.Allocator,
@@ -33,24 +34,59 @@ pub const Conn = struct {
     sw: std.net.Stream.Writer = undefined,
     msg: std.array_list.Managed(u8), // reassembled response message payload (login path)
     last_error: []const u8 = "",
+    tls: ?*sqlmod.TlsState = null,
+    shim: TlsShim = undefined, // valid iff tls != null
 
-    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8) !*Conn {
+    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sqlmod.TlsMode) !*Conn {
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
         const self = try gpa.create(Conn);
         self.* = .{ .gpa = gpa, .stream = stream, .msg = std.array_list.Managed(u8).init(gpa) };
         self.sr = std.net.Stream.Reader.init(stream, &self.read_buf);
         self.sw = std.net.Stream.Writer.init(stream, &self.write_buf);
         errdefer self.close();
-        try self.prelogin();
+        try self.prelogin(tls_mode != .off);
+        if (tls_mode != .off) try self.startTls(host, tls_mode);
         try self.login(user, password, database, host);
         return self;
     }
 
+    /// TDS 7.x tunneled TLS: the handshake's TLS records are wrapped in
+    /// PRELOGIN packets by `shim`; once established, the shim switches to
+    /// passthrough and every TDS packet flows inside the session.
+    fn startTls(self: *Conn, host: []const u8, mode: sqlmod.TlsMode) !void {
+        self.shim = .{ .inner_r = self.sr.interface(), .inner_w = &self.sw.interface, .reader = undefined, .writer = undefined };
+        self.shim.reader = .{ .vtable = &TlsShim.reader_vtable, .buffer = &self.shim.rbuf, .seek = 0, .end = 0 };
+        self.shim.writer = .{ .vtable = &TlsShim.writer_vtable, .buffer = &self.shim.wbuf };
+
+        const ts = try self.gpa.create(sqlmod.TlsState);
+        errdefer self.gpa.destroy(ts);
+        try ts.start(self.gpa, &self.shim.reader, &self.shim.writer, host, mode);
+        self.tls = ts;
+        self.shim.handshaking = false;
+    }
+
     pub fn close(self: *Conn) void {
         if (self.last_error.len > 0) self.gpa.free(self.last_error);
+        if (self.tls) |t| t.deinit(self.gpa);
         self.msg.deinit();
         self.stream.close();
         self.gpa.destroy(self);
+    }
+
+    /// Cleartext reader/writer: through the TLS session when enabled, else the
+    /// plain socket interfaces.
+    fn rd(self: *Conn) *std.Io.Reader {
+        return if (self.tls) |t| &t.client.reader else self.sr.interface();
+    }
+    fn wr(self: *Conn) *std.Io.Writer {
+        return if (self.tls) |t| &t.client.writer else &self.sw.interface;
+    }
+    fn flushOut(self: *Conn) !void {
+        if (self.tls) |t| {
+            try t.client.writer.flush(); // seal TLS records into the shim...
+            try self.shim.writer.flush(); // ...forward them to the socket writer...
+        }
+        try self.sw.interface.flush(); // ...and push everything down the socket
     }
 
     pub fn sqlConn(self: *Conn) sqlmod.Conn {
@@ -65,13 +101,14 @@ pub const Conn = struct {
         cur.* = .{
             .gpa = self.gpa,
             .conn = self,
-            .reader = PacketReader.init(self.gpa, self.stream),
+            // Reads through the conn's own (possibly TLS) reader — sharing one
+            // buffered reader also removes the old fragile second-reader setup.
+            .reader = PacketReader.init(self.gpa, self.rd()),
             .meta_arena = std.heap.ArenaAllocator.init(self.gpa),
             .cols = &.{},
             .schema = undefined,
             .done = false,
         };
-        cur.reader.attach();
         cur.readHeader() catch |e| {
             cur.reader.deinit();
             cur.meta_arena.deinit();
@@ -123,7 +160,7 @@ pub const Conn = struct {
     /// a SQLBatch larger than one packet (e.g. a wide UNION query) sent as a single
     /// oversized packet is reset by the server/gateway.
     fn writePacket(self: *Conn, ptype: u8, payload: []const u8) !void {
-        const w = &self.sw.interface;
+        const w = self.wr();
         var off: usize = 0;
         while (true) {
             const chunk: usize = @min(payload.len - off, BULK_PKT_PAYLOAD);
@@ -137,13 +174,13 @@ pub const Conn = struct {
             off += chunk;
             if (last) break;
         }
-        try w.flush();
+        try self.flushOut();
     }
 
     /// Reassemble a full message (across packets) into self.msg.
     fn readMessage(self: *Conn) !void {
         self.msg.clearRetainingCapacity();
-        const r = self.sr.interface();
+        const r = self.rd();
         while (true) {
             var header: [8]u8 = undefined;
             try r.readSliceAll(&header);
@@ -158,13 +195,13 @@ pub const Conn = struct {
 
     // --- prelogin ---
 
-    fn prelogin(self: *Conn) !void {
+    fn prelogin(self: *Conn, want_tls: bool) !void {
         const payload = [_]u8{
             0x00, 0x00, 0x0B, 0x00, 0x06, // VERSION  off=11 len=6
             0x01, 0x00, 0x11, 0x00, 0x01, // ENCRYPTION off=17 len=1
             0xFF, // terminator
             0x11, 0x00, 0x00, 0x00, 0x00, 0x00, // version
-            0x02, // ENCRYPT_NOT_SUP
+            if (want_tls) @as(u8, 0x01) else 0x02, // ENCRYPT_ON / ENCRYPT_NOT_SUP
         };
         try self.writePacket(PKT_PRELOGIN, &payload);
         try self.readMessage();
@@ -175,7 +212,10 @@ pub const Conn = struct {
         while (i + 5 <= p.len and p[i] != 0xFF) : (i += 5) {
             if (p[i] == 0x01) {
                 const off: usize = (@as(usize, p[i + 1]) << 8) | p[i + 2];
-                if (off < p.len and (p[off] == 0x01 or p[off] == 0x03)) return error.EncryptionRequired;
+                if (off >= p.len) return error.TdsProtocol;
+                const enc_on = (p[off] == 0x01 or p[off] == 0x03); // ENCRYPT_ON / ENCRYPT_REQ
+                if (want_tls and !enc_on) return error.TdsTlsRefused; // no silent plaintext downgrade
+                if (!want_tls and enc_on) return error.EncryptionRequired;
             }
         }
     }
@@ -269,10 +309,10 @@ pub const Conn = struct {
         const total: u16 = @intCast(payload.len + 8);
         header[2] = @intCast(total >> 8);
         header[3] = @intCast(total & 0xff);
-        const w = &self.sw.interface;
+        const w = self.wr();
         try w.writeAll(&header);
         try w.writeAll(payload);
-        try w.flush();
+        try self.flushOut();
     }
 
     /// Read the server's response to the bulk load (DONE on success, ERROR token).
@@ -283,6 +323,95 @@ pub const Conn = struct {
     fn readBulkResponse(self: *Conn) !void {
         try self.readMessage();
         try self.scanResultTokens();
+    }
+};
+
+/// TDS 7.x tunneled TLS framing between the socket and the TLS client. While
+/// `handshaking`, outgoing TLS flights are wrapped in PRELOGIN packets and the
+/// server's wrapped replies are unwrapped; afterwards both directions pass
+/// through raw (the TLS records themselves frame the post-login stream, with
+/// whole TDS packets riding inside the session).
+const TlsShim = struct {
+    inner_r: *std.Io.Reader,
+    inner_w: *std.Io.Writer,
+    handshaking: bool = true,
+    remaining: usize = 0, // unread payload bytes of the current wrapped packet
+    reader: std.Io.Reader,
+    writer: std.Io.Writer,
+    rbuf: [shim_buf_len]u8 = undefined,
+    wbuf: [shim_buf_len]u8 = undefined,
+
+    // The TLS client requires its input reader to buffer at least one
+    // ciphertext record, and asks its output writer for record-sized slices.
+    const shim_buf_len = @import("tls_client.zig").min_buffer_len;
+    const reader_vtable = std.Io.Reader.VTable{ .stream = readStream };
+    const writer_vtable = std.Io.Writer.VTable{ .drain = drainFn };
+
+    fn readStream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *TlsShim = @fieldParentPtr("reader", r);
+        if (self.handshaking) {
+            while (self.remaining == 0) {
+                const hdr = self.inner_r.peek(8) catch |e| switch (e) {
+                    error.EndOfStream => return error.EndOfStream,
+                    else => return error.ReadFailed,
+                };
+                const len: usize = (@as(usize, hdr[2]) << 8) | hdr[3];
+                if (len < 8) return error.ReadFailed;
+                self.inner_r.toss(8);
+                self.remaining = len - 8;
+            }
+        }
+        if (self.inner_r.buffered().len == 0) {
+            _ = self.inner_r.peek(1) catch |e| switch (e) {
+                error.EndOfStream => return error.EndOfStream,
+                else => return error.ReadFailed,
+            };
+        }
+        const avail = self.inner_r.buffered();
+        var cap = limit.minInt(avail.len);
+        if (self.handshaking) cap = @min(cap, self.remaining);
+        const n = try w.write(avail[0..cap]);
+        self.inner_r.toss(n);
+        if (self.handshaking) self.remaining -= n;
+        return n;
+    }
+
+    fn drainFn(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *TlsShim = @fieldParentPtr("writer", w);
+        var total: usize = 0;
+        total += try self.put(w.buffered());
+        for (data[0 .. data.len - 1]) |d| total += try self.put(d);
+        const last = data[data.len - 1];
+        for (0..splat) |_| total += try self.put(last);
+        if (self.handshaking) {
+            // Nothing else flushes the socket during the handshake (the TLS
+            // client only flushes *this* writer), so push the flight out now.
+            self.inner_w.flush() catch return error.WriteFailed;
+        }
+        return w.consume(total);
+    }
+
+    fn put(self: *TlsShim, bytes: []const u8) std.Io.Writer.Error!usize {
+        if (bytes.len == 0) return 0;
+        if (!self.handshaking) {
+            self.inner_w.writeAll(bytes) catch return error.WriteFailed;
+            return bytes.len;
+        }
+        // Wrap in PRELOGIN packets (EOM on the last chunk). Handshake flights
+        // are small; chunking only matters if one ever exceeds a packet.
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const chunk: usize = @min(bytes.len - off, BULK_PKT_PAYLOAD);
+            const is_last = off + chunk == bytes.len;
+            var header: [8]u8 = .{ PKT_PRELOGIN, if (is_last) STATUS_EOM else 0x00, 0, 0, 0, 0, 0, 0 };
+            const tot: u16 = @intCast(chunk + 8);
+            header[2] = @intCast(tot >> 8);
+            header[3] = @intCast(tot & 0xff);
+            self.inner_w.writeAll(&header) catch return error.WriteFailed;
+            self.inner_w.writeAll(bytes[off..][0..chunk]) catch return error.WriteFailed;
+            off += chunk;
+        }
+        return bytes.len;
     }
 };
 
@@ -326,23 +455,13 @@ fn curClose(ptr: *anyopaque) void {
 const SOCK_BUF = 64 * 1024;
 
 const PacketReader = struct {
-    stream: std.net.Stream,
-    read_buf: [SOCK_BUF]u8 = undefined,
-    sr: std.net.Stream.Reader = undefined,
+    r: *std.Io.Reader, // the connection's cleartext reader (socket or TLS)
     buf: std.array_list.Managed(u8),
     pos: usize = 0,
     eom: bool = false,
 
-    fn init(gpa: std.mem.Allocator, stream: std.net.Stream) PacketReader {
-        return .{ .stream = stream, .buf = std.array_list.Managed(u8).init(gpa) };
-    }
-    /// Wire the buffered reader to its own `read_buf`. Must be called after the
-    /// PacketReader is at its final address (it is embedded in a heap-allocated
-    /// TdsCursor) because `sr` holds a pointer into `read_buf`. Login reads (Conn)
-    /// complete before any cursor, so this starts on a clean stream with no
-    /// over-read overlap.
-    fn attach(self: *PacketReader) void {
-        self.sr = std.net.Stream.Reader.init(self.stream, &self.read_buf);
+    fn init(gpa: std.mem.Allocator, r: *std.Io.Reader) PacketReader {
+        return .{ .r = r, .buf = std.array_list.Managed(u8).init(gpa) };
     }
     fn deinit(self: *PacketReader) void {
         self.buf.deinit();
@@ -352,7 +471,7 @@ const PacketReader = struct {
     fn ensure(self: *PacketReader) !bool {
         while (self.pos >= self.buf.items.len) {
             if (self.eom) return false;
-            const r = self.sr.interface();
+            const r = self.r;
             var hdr: [8]u8 = undefined;
             r.readSliceAll(&hdr) catch |e| {
                 if (e == error.EndOfStream) return false;

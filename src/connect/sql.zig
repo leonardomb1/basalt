@@ -5,6 +5,7 @@
 //! just a protocol client + a dialect.
 
 const std = @import("std");
+const TlsClient = @import("tls_client.zig");
 const types = @import("../lang/types.zig");
 const batchmod = @import("../exec/batch.zig");
 const valuemod = @import("../exec/value.zig");
@@ -18,6 +19,66 @@ const Batch = batchmod.Batch;
 
 /// Rows are this many per streamed batch.
 pub const STREAM_ROWS = 4096;
+
+/// Socket-level failures worth retrying (the connection broke; the server
+/// did not report a SQL error). Server-sent errors (PgQueryFailed etc.) are
+/// permanent and never retried.
+pub fn transientNet(e: anyerror) bool {
+    return switch (e) {
+        error.ConnectionRefused,
+        error.ConnectionTimedOut,
+        error.ConnectionResetByPeer,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.ReadFailed,
+        error.WriteFailed,
+        error.UnexpectedConnectFailure,
+        error.TemporaryNameServerFailure,
+        => true,
+        else => false,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// TLS (shared by the protocol clients)
+// ---------------------------------------------------------------------------
+
+/// `require` = full verification (system CA bundle + hostname); `insecure` =
+/// encrypt but skip verification (self-signed dev/test servers).
+pub const TlsMode = enum { off, require, insecure };
+
+/// A TLS session layered over an established plain socket. Must live at a
+/// stable heap address before `start` (the client holds internal pointers),
+/// and per std.crypto.tls the socket reader's buffer must hold at least one
+/// ciphertext record (the drivers' 64 KB socket buffers satisfy this).
+///
+/// Uses the vendored `tls_client.zig` (std's client + TLS 1.3 client-cert
+/// request handling) because MySQL servers always request a client certificate.
+pub const TlsState = struct {
+    client: TlsClient,
+    read_buf: [TlsClient.min_buffer_len]u8,
+    write_buf: [TlsClient.min_buffer_len]u8,
+    bundle: std.crypto.Certificate.Bundle,
+
+    pub fn start(self: *TlsState, gpa: std.mem.Allocator, input: *std.Io.Reader, output: *std.Io.Writer, host: []const u8, mode: TlsMode) !void {
+        self.bundle = .{};
+        if (mode == .require) try self.bundle.rescan(gpa);
+        errdefer self.bundle.deinit(gpa);
+        self.client = try TlsClient.init(input, output, .{
+            .host = if (mode == .require) .{ .explicit = host } else .no_verification,
+            .ca = if (mode == .require) .{ .bundle = self.bundle } else .no_verification,
+            .read_buffer = &self.read_buf,
+            .write_buffer = &self.write_buf,
+        });
+    }
+
+    pub fn deinit(self: *TlsState, gpa: std.mem.Allocator) void {
+        self.bundle.deinit(gpa);
+        gpa.destroy(self);
+    }
+};
 
 /// A streaming cursor over a result set: read the schema up front, then pull
 /// batches of rows on demand (bounded memory). `close` releases the connection.
@@ -41,6 +102,63 @@ pub const Cursor = struct {
         self.vtable.close(self.ptr);
     }
 };
+
+// ---------------------------------------------------------------------------
+// Shared text-protocol cursor skeleton (postgres/mysql)
+//
+// Both drivers keep identical cursor state on their Conn (`meta_arena`,
+// `cols`, `cur_schema`, `done`) and used to duplicate the open-guard and the
+// fetch loop — which drifted once (a mid-stream server error parsed as row
+// data). The skeleton owns the lifecycle and the loop; a driver provides only
+// `nextRow`, which MUST classify every wire packet as a row, the end of the
+// stream, or an error — leaving no place to forget a case. The TDS driver is
+// not covered: it is a token-stream cursor with a different shape.
+// ---------------------------------------------------------------------------
+
+pub const RowStep = enum { row, end };
+
+/// `conn` requires: `meta_arena`, `openCursor(sql)`, and `last_error`
+/// conventions. On open failure the connection is left open so the caller can
+/// read `last_error`, and the caller closes it.
+pub fn openTextCursor(conn: anytype, sql_text: []const u8, vt: *const Cursor.VTable) !Cursor {
+    conn.meta_arena = std.heap.ArenaAllocator.init(conn.gpa);
+    conn.openCursor(sql_text) catch |e| {
+        conn.meta_arena.deinit();
+        return e;
+    };
+    return .{ .ptr = conn, .vtable = vt };
+}
+
+/// `conn` requires: `cols` (each with `.engine_type`), `cur_schema`, `done`,
+/// and `nextRow(arena, builders) !RowStep` appending exactly one value per
+/// column on `.row`.
+pub fn fetchTextBatch(conn: anytype, arena: std.mem.Allocator) !?Batch {
+    if (conn.done) return null;
+    const ncol = conn.cols.len;
+    if (ncol == 0) return null;
+    const builders = try arena.alloc(column.Builder, ncol);
+    for (conn.cols, builders) |c, *b| b.* = column.Builder.init(arena, c.engine_type);
+
+    var n: usize = 0;
+    while (n < STREAM_ROWS) {
+        switch (try conn.nextRow(arena, builders)) {
+            .row => n += 1,
+            .end => {
+                conn.done = true;
+                break;
+            },
+        }
+    }
+    if (n == 0) return null;
+    const out = try arena.alloc(column.Column, ncol);
+    for (builders, 0..) |*b, k| out[k] = try b.finish();
+    return .{ .schema = conn.cur_schema, .columns = out, .len = n };
+}
+
+pub fn closeTextCursor(conn: anytype) void {
+    conn.meta_arena.deinit();
+    conn.close();
+}
 
 /// A connection to a SQL database (protocol-agnostic). `queryCursor` sends a
 /// query, reads the result-set header, and returns a streaming cursor (which
@@ -175,6 +293,14 @@ fn flushRowsFor(dialect: Dialect) usize {
     };
 }
 
+/// Re-establishes a connection for the INSERT sink's transient retry. `ctx`
+/// is read-only shared config (safe across lanes); the allocator is the
+/// calling sink's own, so lane-confined allocators stay lane-confined.
+pub const Redial = struct {
+    ctx: *const anyopaque,
+    dial: *const fn (*const anyopaque, std.mem.Allocator) anyerror!Conn,
+};
+
 pub const Sink = struct {
     gpa: std.mem.Allocator,
     conn: Conn,
@@ -185,8 +311,10 @@ pub const Sink = struct {
     rows: std.array_list.Managed([]const u8), // serialized "(...)" tuples (slices into tuple_arena)
     tuple_arena: std.heap.ArenaAllocator, // backs the tuple bytes; reset per flush (no per-row malloc/free)
     flush_rows: usize, // rows per INSERT (dialect-dependent cap)
+    redial: ?Redial = null,
+    conn_alive: bool = true,
 
-    pub fn open(gpa: std.mem.Allocator, conn: Conn, dialect: Dialect, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode) !*Sink {
+    pub fn open(gpa: std.mem.Allocator, conn: Conn, dialect: Dialect, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?Redial) !*Sink {
         // On error we free only what we allocate here; the caller keeps `conn`
         // (so it can read conn.last_error) and closes it on failure.
         const self = try gpa.create(Sink);
@@ -212,6 +340,7 @@ pub const Sink = struct {
             .rows = std.array_list.Managed([]const u8).init(gpa),
             .tuple_arena = std.heap.ArenaAllocator.init(gpa),
             .flush_rows = flushRowsFor(dialect),
+            .redial = redial,
         };
         errdefer self.rows.deinit();
         errdefer self.tuple_arena.deinit();
@@ -246,7 +375,21 @@ pub const Sink = struct {
         var aa = std.heap.ArenaAllocator.init(self.gpa);
         defer aa.deinit();
         const stmt = try buildStatement(aa.allocator(), self.dialect, self.table, self.schema, self.mode, self.rows.items);
-        try self.conn.exec(stmt);
+        self.conn.exec(stmt) catch |e| {
+            // Retry once over a fresh connection if the socket broke (a SQL
+            // error from the server is permanent — never retried). Ambiguity
+            // note: if the dropped exec actually committed, the retry can
+            // double-insert on append; upsert is idempotent. Same contract as
+            // re-runs (downstream dedup owns exactly-once, per split.zig).
+            const rd = self.redial orelse return e;
+            if (!transientNet(e)) return e;
+            self.conn.close();
+            self.conn_alive = false;
+            std.Thread.sleep(500 * std.time.ns_per_ms);
+            self.conn = try rd.dial(rd.ctx, self.gpa);
+            self.conn_alive = true;
+            try self.conn.exec(stmt);
+        };
         self.rows.clearRetainingCapacity();
         _ = self.tuple_arena.reset(.retain_capacity);
     }
@@ -266,7 +409,7 @@ pub const Sink = struct {
     }
 
     fn teardown(self: *Sink) void {
-        self.conn.close();
+        if (self.conn_alive) self.conn.close();
         self.rows.deinit();
         self.tuple_arena.deinit();
         for (self.schema.fields) |f| self.gpa.free(f.name);

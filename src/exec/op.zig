@@ -327,23 +327,26 @@ fn sliceBatch(arena: std.mem.Allocator, b: Batch, start: usize, take: usize) any
 
 /// Drain `child` and concatenate every row into one in-memory batch (or null if
 /// the input is empty). Memory is O(dataset) — the defining cost of a breaker.
+/// All chunks live in this single `next()`'s arena (no reset happens mid-call),
+/// so the typed buffers are concatenated directly: no per-row `Value` boxing
+/// and no re-duping of string bytes.
 fn materializeAll(arena: std.mem.Allocator, child: Op, schema: *const types.Schema) anyerror!?Batch {
-    const ncols = schema.fields.len;
-    const builders = try arena.alloc(column.Builder, ncols);
-    for (builders, schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
-
+    var chunks = std.array_list.Managed(Batch).init(arena);
     var total: usize = 0;
     while (try child.next(arena)) |b| {
-        var r: usize = 0;
-        while (r < b.len) : (r += 1) {
-            for (b.columns, 0..) |*col, ci| try builders[ci].append(col.getValue(r));
-        }
+        if (b.len == 0) continue;
+        try chunks.append(b);
         total += b.len;
     }
     if (total == 0) return null;
 
+    const ncols = schema.fields.len;
     const cols = try arena.alloc(column.Column, ncols);
-    for (builders, 0..) |*bd, i| cols[i] = try bd.finish();
+    const per = try arena.alloc(column.Column, chunks.items.len); // one column's chunks
+    for (cols, 0..) |*out, ci| {
+        for (chunks.items, 0..) |b, k| per[k] = b.columns[ci];
+        out.* = try column.concat(arena, per, total);
+    }
     return Batch{ .schema = schema, .columns = cols, .len = total };
 }
 
@@ -371,41 +374,49 @@ fn rowKey(arena: std.mem.Allocator, b: Batch, idxs: []const usize, row: usize) a
     return buf.toOwnedSlice();
 }
 
+/// Streaming dedup: batches flow through one at a time, filtered against a
+/// seen-set of key strings — O(distinct keys) memory, not O(dataset). The
+/// seen-set (and its key copies) live in `state` (the plan arena), because the
+/// per-pull batch arena is reset between pulls.
 pub const Distinct = struct {
     child: Op,
     in_schema: *const types.Schema,
     keys: ?[]const usize, // null = all columns
-    done: bool = false,
+    state: std.mem.Allocator,
+    seen: ?std.StringHashMap(void) = null,
 
     pub fn next(self: *Distinct, arena: std.mem.Allocator) anyerror!?Batch {
-        if (self.done) return null;
-        self.done = true;
-        const all = (try materializeAll(arena, self.child, self.in_schema)) orelse return null;
+        if (self.seen == null) self.seen = std.StringHashMap(void).init(self.state);
+        const seen = &self.seen.?;
 
-        var key_idx: []const usize = undefined;
-        if (self.keys) |k| {
-            key_idx = k;
-        } else {
-            const idxs = try arena.alloc(usize, all.columns.len);
-            for (idxs, 0..) |*x, i| x.* = i;
-            key_idx = idxs;
-        }
-
-        var seen = std.StringHashMap(void).init(arena);
-        const keep = try arena.alloc(bool, all.len);
-        var kept: usize = 0;
-        var r: usize = 0;
-        while (r < all.len) : (r += 1) {
-            const k = try rowKey(arena, all, key_idx, r);
-            if (seen.contains(k)) {
-                keep[r] = false;
+        while (try self.child.next(arena)) |b| {
+            var key_idx: []const usize = undefined;
+            if (self.keys) |k| {
+                key_idx = k;
             } else {
-                try seen.put(k, {});
-                keep[r] = true;
-                kept += 1;
+                const idxs = try arena.alloc(usize, b.columns.len);
+                for (idxs, 0..) |*x, i| x.* = i;
+                key_idx = idxs;
             }
+
+            const keep = try arena.alloc(bool, b.len);
+            var kept: usize = 0;
+            var r: usize = 0;
+            while (r < b.len) : (r += 1) {
+                const k = try rowKey(arena, b, key_idx, r); // transient: only stored copies survive
+                if (seen.contains(k)) {
+                    keep[r] = false;
+                } else {
+                    try seen.put(try self.state.dupe(u8, k), {});
+                    keep[r] = true;
+                    kept += 1;
+                }
+            }
+            if (kept == 0) continue;
+            if (kept == b.len) return b; // nothing dropped: pass the batch through
+            return try gather(arena, b, keep, kept);
         }
-        return try gather(arena, all, keep, kept);
+        return null;
     }
 };
 
@@ -427,11 +438,7 @@ pub const Sort = struct {
         std.mem.sort(usize, idx, SortCtx{ .b = all, .keys = self.keys }, SortCtx.lessThan);
 
         const outcols = try arena.alloc(column.Column, all.columns.len);
-        for (all.columns, 0..) |*col, ci| {
-            var bld = column.Builder.init(arena, col.ty);
-            for (idx) |r| try bld.append(col.getValue(r));
-            outcols[ci] = try bld.finish();
-        }
+        for (all.columns, 0..) |*col, ci| outcols[ci] = try column.permute(arena, col.*, idx);
         return Batch{ .schema = all.schema, .columns = outcols, .len = all.len };
     }
 };
@@ -459,6 +466,10 @@ const SortCtx = struct {
     }
 };
 
+/// Streaming hash aggregation: batches are consumed one at a time, folding into
+/// per-group accumulators — O(groups) memory, not O(dataset). Group state (keys,
+/// key values, accumulators) lives in `state` (the plan arena), with string key
+/// values deep-copied there because batch memory dies between pulls.
 pub const Aggregate = struct {
     child: Op,
     in_schema: *const types.Schema,
@@ -466,6 +477,7 @@ pub const Aggregate = struct {
     aggs: []const Agg,
     out_schema: *const types.Schema,
     err: ?*ErrCtx = null,
+    state: std.mem.Allocator,
     done: bool = false,
 
     pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Type };
@@ -480,97 +492,144 @@ pub const Aggregate = struct {
 
     const Group = struct { key_vals: []Value, accs: []Acc };
 
+    /// One agg's vectorized reduction of a single batch, merged into the running
+    /// accumulator by `mergePartial`.
+    const Partial = struct {
+        nvalid: usize,
+        sum_i: i64 = 0,
+        sum_f: f64 = 0,
+        ext: ?Value = null,
+    };
+
     pub fn next(self: *Aggregate, arena: std.mem.Allocator) anyerror!?Batch {
         if (self.done) return null;
         self.done = true;
-        const all = (try materializeAll(arena, self.child, self.in_schema)) orelse {
-            if (self.by.len == 0) return try self.emit(arena, &.{}); // global aggregate over empty input
-            return null;
-        };
 
-        // No GROUP BY: try the vectorized columnar path (evaluate each arg as a
-        // column once, then SIMD-reduce) before the row-wise fallback.
+        // No GROUP BY: one accumulator set; each batch folds in via the
+        // vectorized partial reduce (SIMD per batch) or row-wise fallback.
         if (self.by.len == 0) {
-            if (try self.globalFast(arena, all)) |b| return b;
+            const accs = try self.state.alloc(Acc, self.aggs.len);
+            for (accs) |*a| a.* = .{};
+            while (try self.child.next(arena)) |b| {
+                if (b.len == 0) continue;
+                if (!(try self.foldVectorized(arena, b, accs))) try self.foldRowwise(arena, b, accs);
+            }
+            // Empty input still emits one row of finalized fresh accumulators.
+            return try self.emit(arena, &.{.{ .key_vals = &.{}, .accs = accs }});
         }
 
-        var groups = std.array_list.Managed(Group).init(arena);
-        var map = std.StringHashMap(usize).init(arena);
-        var r: usize = 0;
-        while (r < all.len) : (r += 1) {
-            const key = try rowKey(arena, all, self.by, r);
-            const gop = try map.getOrPut(key);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = groups.items.len;
-                const kv = try arena.alloc(Value, self.by.len);
-                for (self.by, 0..) |ci, j| kv[j] = all.columns[ci].getValue(r);
-                const accs = try arena.alloc(Acc, self.aggs.len);
-                for (accs) |*a| a.* = .{};
-                try groups.append(.{ .key_vals = kv, .accs = accs });
-            }
-            const g = &groups.items[gop.value_ptr.*];
-            for (self.aggs, 0..) |agg, j| {
-                var v: Value = .null;
-                if (agg.arg) |e| v = eval.evalRow(arena, e, all, r) catch |err| {
-                    if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
-                    return err;
-                };
-                updateAcc(&g.accs[j], agg, v, agg.arg != null);
+        var groups = std.array_list.Managed(Group).init(self.state);
+        var map = std.StringHashMap(usize).init(self.state);
+        while (try self.child.next(arena)) |b| {
+            var r: usize = 0;
+            while (r < b.len) : (r += 1) {
+                const key = try rowKey(arena, b, self.by, r); // transient; state copy adopted below
+                const gop = try map.getOrPut(key);
+                if (!gop.found_existing) {
+                    gop.key_ptr.* = try self.state.dupe(u8, key);
+                    gop.value_ptr.* = groups.items.len;
+                    const kv = try self.state.alloc(Value, self.by.len);
+                    for (self.by, 0..) |ci, j| kv[j] = try dupeValue(self.state, b.columns[ci].getValue(r));
+                    const accs = try self.state.alloc(Acc, self.aggs.len);
+                    for (accs) |*a| a.* = .{};
+                    try groups.append(.{ .key_vals = kv, .accs = accs });
+                }
+                const g = &groups.items[gop.value_ptr.*];
+                for (self.aggs, 0..) |agg, j| {
+                    var v: Value = .null;
+                    if (agg.arg) |e| v = eval.evalRow(arena, e, b, r) catch |err| {
+                        if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
+                        return err;
+                    };
+                    try updateAcc(self.state, &g.accs[j], agg, v, agg.arg != null);
+                }
             }
         }
+        if (groups.items.len == 0) return null;
         return try self.emit(arena, groups.items);
     }
 
-    /// Vectorized global aggregation (no GROUP BY): evaluate each agg's argument
-    /// to a column once and reduce it, instead of boxing every row. Returns null
-    /// to fall back to the row-wise path for any agg this path doesn't handle.
-    fn globalFast(self: *Aggregate, arena: std.mem.Allocator, all: Batch) anyerror!?Batch {
-        const vals = try arena.alloc(Value, self.aggs.len);
-        for (self.aggs, 0..) |agg, j| {
-            vals[j] = (try self.reduceAgg(arena, agg, all)) orelse return null;
+    /// Try the vectorized path for one batch: every agg's argument evaluated as
+    /// a column once and SIMD-reduced to a `Partial`. Returns false (touching
+    /// nothing) if any agg isn't covered, so the caller folds the batch row-wise.
+    /// The int/float-only constraint depends on the (fixed) schema, so the same
+    /// path is taken for every batch of a run.
+    fn foldVectorized(self: *Aggregate, arena: std.mem.Allocator, b: Batch, accs: []Acc) anyerror!bool {
+        const partials = try arena.alloc(Partial, self.aggs.len);
+        for (self.aggs, partials) |agg, *p| {
+            p.* = (try self.reduceBatch(arena, agg, b)) orelse return false;
         }
-        const builders = try arena.alloc(column.Builder, self.aggs.len);
-        for (builders, self.out_schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
-        for (vals, 0..) |v, j| try builders[j].append(v);
-        const cols = try arena.alloc(column.Column, self.aggs.len);
-        for (builders, 0..) |*b, i| cols[i] = try b.finish();
-        return Batch{ .schema = self.out_schema, .columns = cols, .len = 1 };
+        for (self.aggs, partials, accs) |agg, p, *acc| mergePartial(acc, agg, p);
+        return true;
     }
 
-    /// Reduce one agg over the whole batch. Outer `null` means "unsupported, fall
-    /// back to row-wise"; an inner `Value.null` is a real SQL NULL result.
-    fn reduceAgg(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, all: Batch) anyerror!?Value {
-        if (agg.func == .count and agg.arg == null) return Value{ .int = @intCast(all.len) };
+    fn foldRowwise(self: *Aggregate, arena: std.mem.Allocator, b: Batch, accs: []Acc) anyerror!void {
+        var r: usize = 0;
+        while (r < b.len) : (r += 1) {
+            for (self.aggs, 0..) |agg, j| {
+                var v: Value = .null;
+                if (agg.arg) |e| v = eval.evalRow(arena, e, b, r) catch |err| {
+                    if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
+                    return err;
+                };
+                try updateAcc(self.state, &accs[j], agg, v, agg.arg != null);
+            }
+        }
+    }
+
+    /// Vectorized reduce of one agg over one batch. `null` means "not covered,
+    /// fold row-wise" (non-numeric arg); the constraint is schema-dependent.
+    fn reduceBatch(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, b: Batch) anyerror!?Partial {
+        if (agg.func == .count and agg.arg == null) return Partial{ .nvalid = b.len };
         const e = agg.arg orelse return null;
-        const col = eval.evalColumn(arena, e, all, agg.ty) catch |err| {
+        const col = eval.evalColumn(arena, e, b, agg.ty) catch |err| {
             if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
             return err;
         };
         if (col.ty.kind != .int and col.ty.kind != .float) return null; // row-wise handles the rest
-        const n = all.len;
+        const n = b.len;
         const nvalid = simd.popcountValid(col.validity.bits, n);
+        var p = Partial{ .nvalid = nvalid };
+        if (nvalid == 0) return p;
         switch (agg.func) {
-            .count => return Value{ .int = @intCast(nvalid) },
-            .sum => {
-                if (nvalid == 0) return @as(Value, .null);
-                return switch (col.ty.kind) {
-                    .float => Value{ .float = simd.sumF(col.data.f64[0..n]) },
-                    .int => Value{ .int = sumIntCol(col.data.i64[0..n]) }, // null lanes are 0
-                    else => unreachable,
-                };
+            .count => {},
+            .sum, .avg => switch (col.ty.kind) {
+                .float => p.sum_f = simd.sumF(col.data.f64[0..n]),
+                .int => {
+                    p.sum_i = sumIntCol(col.data.i64[0..n]); // null lanes are 0
+                    p.sum_f = @floatFromInt(p.sum_i);
+                },
+                else => unreachable,
             },
-            .avg => {
-                if (nvalid == 0) return @as(Value, .null);
-                const total: f64 = switch (col.ty.kind) {
-                    .float => simd.sumF(col.data.f64[0..n]),
-                    .int => @floatFromInt(sumIntCol(col.data.i64[0..n])),
-                    else => unreachable,
-                };
-                return Value{ .float = total / @as(f64, @floatFromInt(nvalid)) };
+            .min, .max => p.ext = reduceExtreme(col, agg.func, n),
+        }
+        return p;
+    }
+
+    /// Fold one batch's `Partial` into the running accumulator. Mirrors the
+    /// row-wise `updateAcc` semantics (null-skipping, agg.ty-driven sum kind).
+    fn mergePartial(acc: *Acc, agg: Agg, p: Partial) void {
+        switch (agg.func) {
+            .count => acc.n += @intCast(p.nvalid),
+            .sum => if (p.nvalid > 0) {
+                if (agg.ty.kind == .float) acc.sum_f += p.sum_f else acc.sum_i += p.sum_i;
+                acc.n += @intCast(p.nvalid);
             },
-            .min, .max => {
-                if (nvalid == 0) return @as(Value, .null);
-                return reduceExtreme(col, agg.func, n);
+            .avg => if (p.nvalid > 0) {
+                acc.sum_f += p.sum_f;
+                acc.n += @intCast(p.nvalid);
+            },
+            .min => if (p.ext) |v| {
+                if (!acc.has_ext or lessV(v, acc.ext)) {
+                    acc.ext = v; // numeric scalar: no batch memory to outlive
+                    acc.has_ext = true;
+                }
+            },
+            .max => if (p.ext) |v| {
+                if (!acc.has_ext or lessV(acc.ext, v)) {
+                    acc.ext = v;
+                    acc.has_ext = true;
+                }
             },
         }
     }
@@ -603,7 +662,9 @@ pub const Aggregate = struct {
         return Batch{ .schema = self.out_schema, .columns = cols, .len = n };
     }
 
-    fn updateAcc(acc: *Acc, agg: Agg, v: Value, has_arg: bool) void {
+    /// `state` owns any string extremum copied into the accumulator: the value
+    /// must outlive the batch it came from (the per-pull arena is reset).
+    fn updateAcc(state: std.mem.Allocator, acc: *Acc, agg: Agg, v: Value, has_arg: bool) !void {
         switch (agg.func) {
             .count => {
                 if (!has_arg or !v.isNull()) acc.n += 1;
@@ -618,13 +679,13 @@ pub const Aggregate = struct {
             },
             .min => if (!v.isNull()) {
                 if (!acc.has_ext or lessV(v, acc.ext)) {
-                    acc.ext = v;
+                    acc.ext = try dupeValue(state, v);
                     acc.has_ext = true;
                 }
             },
             .max => if (!v.isNull()) {
                 if (!acc.has_ext or lessV(acc.ext, v)) {
-                    acc.ext = v;
+                    acc.ext = try dupeValue(state, v);
                     acc.has_ext = true;
                 }
             },
@@ -643,6 +704,16 @@ pub const Aggregate = struct {
 
 fn lessV(a: Value, b: Value) bool {
     return (eval.compareValues(a, b) orelse .eq) == .lt;
+}
+
+/// Deep-copy a value into `state` so it survives the batch it was read from.
+/// Only string/bytes carry pointers into batch memory; scalars copy by value.
+fn dupeValue(state: std.mem.Allocator, v: Value) !Value {
+    return switch (v) {
+        .string => |s| .{ .string = try state.dupe(u8, s) },
+        .bytes => |s| .{ .bytes = try state.dupe(u8, s) },
+        else => v,
+    };
 }
 
 fn sumIntCol(d: []const i64) i64 {

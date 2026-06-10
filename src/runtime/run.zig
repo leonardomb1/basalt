@@ -199,9 +199,9 @@ const SplitCtx = struct { gpa: std.mem.Allocator, kind: SqlKind, cfg: DbConfig, 
 
 fn connectSql(gpa: std.mem.Allocator, kind: SqlKind, cfg: DbConfig) !sql.Conn {
     return switch (kind) {
-        .postgres => (try postgres.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database)).sqlConn(),
-        .mysql => (try mysql.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database)).sqlConn(),
-        .sqlserver => (try tds.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database)).sqlConn(),
+        .postgres => (try postgres.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls)).sqlConn(),
+        .mysql => (try mysql.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls)).sqlConn(),
+        .sqlserver => (try tds.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls)).sqlConn(),
     };
 }
 
@@ -249,16 +249,35 @@ const SqlSinkSpec = struct {
     target: []const u8,
     schema: types.Schema,
     lane_mode: ast.WriteMode, // overwrite -> append for lanes (DELETE already done)
+    redial: sql.Redial, // INSERT-sink transient retry (plan-arena, lane-shared, read-only)
 };
+
+/// Read-only dial config for the INSERT sink's transient-retry reconnect.
+/// Allocated in the plan arena; shared (immutably) across lanes.
+const DialSpec = struct { kind: SqlKind, cfg: DbConfig };
+
+fn dialSqlConn(ctx: *const anyopaque, gpa: std.mem.Allocator) anyerror!sql.Conn {
+    const spec: *const DialSpec = @ptrCast(@alignCast(ctx));
+    return connectSql(gpa, spec.kind, spec.cfg);
+}
+
+fn redialFor(arena: std.mem.Allocator, kind: SqlKind, cfg: DbConfig) !sql.Redial {
+    const ds = try arena.create(DialSpec);
+    ds.* = .{ .kind = kind, .cfg = cfg };
+    return .{ .ctx = ds, .dial = dialSqlConn };
+}
 
 /// Open the per-dialect write strategy from an already-connected conn: a bulk
 /// loader (COPY / LOAD DATA / INSERT BULK) for append/overwrite, or the generic
 /// INSERT `sql.Sink` for upsert. Centralizes the bulk-vs-INSERT rule so the serial
 /// (`openSink`) and per-lane (`openLaneSqlSink`) paths can't drift. `conn` is the
 /// concrete driver connection; on error the caller still owns and closes it.
-fn openBulkOrInsert(gpa: std.mem.Allocator, conn: anytype, comptime BulkSink: type, dialect: sql.Dialect, target: []const u8, schema: types.Schema, mode: ast.WriteMode) !driver.Sink {
+/// `redial` arms the INSERT sink's transient retry; the bulk loaders are
+/// mid-protocol streams (COPY/LOAD DATA/INSERT BULK) that cannot resume on a
+/// fresh connection, so they stay fail-fast.
+fn openBulkOrInsert(gpa: std.mem.Allocator, conn: anytype, comptime BulkSink: type, dialect: sql.Dialect, target: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?sql.Redial) !driver.Sink {
     if (mode != .upsert) return (try BulkSink.open(gpa, conn, target, schema, mode)).sink();
-    return (try sql.Sink.open(gpa, conn.sqlConn(), dialect, target, schema, mode)).sink();
+    return (try sql.Sink.open(gpa, conn.sqlConn(), dialect, target, schema, mode, redial)).sink();
 }
 
 /// `parallel.OpenSinkFn`: one DB stream per lane (append/overwrite → bulk loader,
@@ -269,19 +288,19 @@ fn openLaneSqlSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize)
     const cfg = spec.cfg;
     switch (spec.kind) {
         .postgres => {
-            const c = try postgres.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database);
+            const c = try postgres.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls);
             errdefer c.close();
-            return openBulkOrInsert(gpa, c, postgres.CopySink, spec.dialect, spec.target, spec.schema, spec.lane_mode);
+            return openBulkOrInsert(gpa, c, postgres.CopySink, spec.dialect, spec.target, spec.schema, spec.lane_mode, spec.redial);
         },
         .mysql => {
-            const c = try mysql.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database);
+            const c = try mysql.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls);
             errdefer c.close();
-            return openBulkOrInsert(gpa, c, mysql.LoadDataSink, spec.dialect, spec.target, spec.schema, spec.lane_mode);
+            return openBulkOrInsert(gpa, c, mysql.LoadDataSink, spec.dialect, spec.target, spec.schema, spec.lane_mode, spec.redial);
         },
         .sqlserver => {
-            const c = try tds.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database);
+            const c = try tds.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls);
             errdefer c.close();
-            return openBulkOrInsert(gpa, c, tds.BulkSink, spec.dialect, spec.target, spec.schema, spec.lane_mode);
+            return openBulkOrInsert(gpa, c, tds.BulkSink, spec.dialect, spec.target, spec.schema, spec.lane_mode, spec.redial);
         },
     }
 }
@@ -321,7 +340,7 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
     // don't race DDL or repeatedly delete. Lanes then append into it.
     const setup_conn = connectSql(env.gpa, kind, cfg) catch |e|
         return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} sink connect failed: {s}", .{ conn.connector, @errorName(e) }));
-    const setup = sql.Sink.open(env.gpa, setup_conn, dialect, w.target, schema, w.mode) catch |e|
+    const setup = sql.Sink.open(env.gpa, setup_conn, dialect, w.target, schema, w.mode, null) catch |e|
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink setup failed: {s}", .{ conn.connector, @errorName(e) }));
     setup.sink().close() catch |e|
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink setup close failed: {s}", .{ conn.connector, @errorName(e) }));
@@ -334,6 +353,7 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
         .target = w.target,
         .schema = schema,
         .lane_mode = if (w.mode == .overwrite) .append else w.mode,
+        .redial = try redialFor(env.arena, kind, cfg),
     };
     return spec;
 }
@@ -1364,7 +1384,7 @@ fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schema) a
                 keys = analyze.fieldIndices(arena, schema, fields, &ad) catch |e| return aErr(env, &ad, e);
             }
             const o = try arena.create(op.Distinct);
-            o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = keys };
+            o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = keys, .state = arena };
             return .{ .op = .{ .distinct = o }, .schema = schema };
         },
         .sort => |s| {
@@ -1420,7 +1440,7 @@ fn buildAggregate(env: *Env, ag: ast.Aggregate, schema: types.Schema, child: op.
     for (ap.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty };
     const out = try schemaPtr(arena, ap.schema);
     const o = try arena.create(op.Aggregate);
-    o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .by = ap.by, .aggs = aggs, .out_schema = out, .err = env.errctx };
+    o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .by = ap.by, .aggs = aggs, .out_schema = out, .err = env.errctx, .state = arena };
     return .{ .op = .{ .aggregate = o }, .schema = out.* };
 }
 
@@ -1469,7 +1489,7 @@ fn openSource(env: *Env, rd: ast.Read) !driver.Source {
     if (std.mem.eql(u8, conn.connector, "sqlserver")) {
         const cfg = try resolveDbConfig(env, conn, 1433);
         const query = try readSql(env, rd);
-        const c = tds.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
+        const c = tds.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "sqlserver connect failed: {s}", .{@errorName(e)}));
         const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
             defer c.close();
@@ -1481,7 +1501,7 @@ fn openSource(env: *Env, rd: ast.Read) !driver.Source {
     if (std.mem.eql(u8, conn.connector, "mysql")) {
         const cfg = try resolveDbConfig(env, conn, 3306);
         const query = try readSql(env, rd);
-        const c = mysql.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
+        const c = mysql.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "mysql connect failed: {s}", .{@errorName(e)}));
         const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
             defer c.close();
@@ -1493,7 +1513,7 @@ fn openSource(env: *Env, rd: ast.Read) !driver.Source {
     if (std.mem.eql(u8, conn.connector, "postgres")) {
         const cfg = try resolveDbConfig(env, conn, 5432);
         const query = try readSql(env, rd);
-        const c = postgres.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
+        const c = postgres.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "postgres connect failed: {s}", .{@errorName(e)}));
         const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
             defer c.close();
@@ -1511,6 +1531,7 @@ const DbConfig = struct {
     user: []const u8 = "",
     password: []const u8 = "",
     database: []const u8 = "",
+    tls: sql.TlsMode = .off,
 };
 
 fn resolveDbConfig(env: *Env, conn: ast.Connection, default_port: u16) !DbConfig {
@@ -1527,6 +1548,10 @@ fn resolveDbConfig(env: *Env, conn: ast.Connection, default_port: u16) !DbConfig
             cfg.password = try evalCfgStr(env, attr.value);
         } else if (std.mem.eql(u8, k, "database")) {
             cfg.database = try evalCfgStr(env, attr.value);
+        } else if (std.mem.eql(u8, k, "tls")) {
+            const v = try evalCfgStr(env, attr.value);
+            cfg.tls = std.meta.stringToEnum(sql.TlsMode, v) orelse
+                return planErr(env.diag, "connection `tls` must be \"off\", \"require\" or \"insecure\"");
         }
     }
     if (cfg.host.len == 0) return planErr(env.diag, "connection needs a `host`");
@@ -1561,8 +1586,9 @@ fn sqlDescFor(env: *Env, kind: SqlKind, dialect: sql.Dialect, cfg: DbConfig, bas
     return .{ .kind = kind, .dialect = dialect, .cfg = cfg, .base_sql = base_sql, .table = table };
 }
 
-/// Pull `@[split = col]` / `@[splits = N]` off the leading read stage.
-const SplitHints = struct { col: ?[]const u8 = null, count: ?usize = null };
+/// Pull `@[split = col]` / `@[splits = N]` / `@[split_kind = int|uuid|date]`
+/// off the leading read stage.
+const SplitHints = struct { col: ?[]const u8 = null, count: ?usize = null, kind: ?splitmod.KeyKind = null };
 fn splitHints(stage: ast.Stage) SplitHints {
     var h = SplitHints{};
     for (stage.hints) |hint| {
@@ -1570,6 +1596,8 @@ fn splitHints(stage: ast.Stage) SplitHints {
             if (hint.value == .ident) h.col = hint.value.ident;
         } else if (std.mem.eql(u8, hint.key, "splits")) {
             if (hint.value == .int and hint.value.int > 0) h.count = @intCast(hint.value.int);
+        } else if (std.mem.eql(u8, hint.key, "split_kind")) {
+            if (hint.value == .ident) h.kind = std.meta.stringToEnum(splitmod.KeyKind, hint.value.ident);
         }
     }
     return h;
@@ -1605,7 +1633,7 @@ fn planSplit(env: *Env, desc: SqlDesc, lead: ast.Stage, threads: usize, w: ast.W
 
     var key: splitmod.Key = undefined;
     if (hints.col) |col| {
-        key = .{ .col = col, .kind = .int }; // explicit key: assume int (range)
+        key = .{ .col = col, .kind = hints.kind orelse .int }; // explicit key: int unless @[split_kind] says otherwise
     } else if (desc.table) |table| {
         const info = (try splitmod.introspectKey(env.arena, prober, desc.dialect, table)) orelse return null;
         // Size gate: small tables aren't worth the per-lane connection setup.
@@ -1692,6 +1720,8 @@ fn dbConfigOf(arena: std.mem.Allocator, conn: ast.Connection, default_port: u16)
             cfg.password = v;
         } else if (std.mem.eql(u8, attr.key, "database")) {
             cfg.database = v;
+        } else if (std.mem.eql(u8, attr.key, "tls")) {
+            cfg.tls = std.meta.stringToEnum(sql.TlsMode, v) orelse .off;
         }
     }
     if (cfg.host.len == 0) return null;
@@ -1742,30 +1772,30 @@ fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     }
     if (std.mem.eql(u8, conn.connector, "mysql")) {
         const cfg = try resolveDbConfig(env, conn, 3306);
-        const c = mysql.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
+        const c = mysql.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "mysql connect failed: {s}", .{@errorName(e)}));
         // append/overwrite → LOAD DATA LOCAL INFILE (bulk); upsert → INSERT.
-        return openBulkOrInsert(env.gpa, c, mysql.LoadDataSink, .mysql, w.target, schema, w.mode) catch |e| {
+        return openBulkOrInsert(env.gpa, c, mysql.LoadDataSink, .mysql, w.target, schema, w.mode, try redialFor(env.arena, .mysql, cfg)) catch |e| {
             defer c.close();
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "mysql sink failed ({s}): {s}", .{ @errorName(e), c.last_error }));
         };
     }
     if (std.mem.eql(u8, conn.connector, "sqlserver")) {
         const cfg = try resolveDbConfig(env, conn, 1433);
-        const c = tds.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
+        const c = tds.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "sqlserver connect failed: {s}", .{@errorName(e)}));
         // append/overwrite → INSERT BULK; upsert → INSERT.
-        return openBulkOrInsert(env.gpa, c, tds.BulkSink, .sqlserver, w.target, schema, w.mode) catch |e| {
+        return openBulkOrInsert(env.gpa, c, tds.BulkSink, .sqlserver, w.target, schema, w.mode, try redialFor(env.arena, .sqlserver, cfg)) catch |e| {
             defer c.close();
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sqlserver sink failed ({s}): {s}", .{ @errorName(e), c.last_error }));
         };
     }
     if (std.mem.eql(u8, conn.connector, "postgres")) {
         const cfg = try resolveDbConfig(env, conn, 5432);
-        const c = postgres.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database) catch |e|
+        const c = postgres.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "postgres connect failed: {s}", .{@errorName(e)}));
         // append/overwrite → COPY FROM STDIN (bulk, fast); upsert → INSERT.
-        return openBulkOrInsert(env.gpa, c, postgres.CopySink, .postgres, w.target, schema, w.mode) catch |e| {
+        return openBulkOrInsert(env.gpa, c, postgres.CopySink, .postgres, w.target, schema, w.mode, try redialFor(env.arena, .postgres, cfg)) catch |e| {
             defer c.close();
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "postgres sink failed ({s}): {s}", .{ @errorName(e), c.last_error }));
         };
@@ -2212,6 +2242,93 @@ test "let binding + inner join" {
     defer alloc.free(out);
     // id 3 (code Z) has no match -> dropped by inner join
     try std.testing.expectEqualStrings("id,label\n1,Apple\n2,Banana\n", out);
+}
+
+test "aggregate folds groups across multiple batches" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // 3000 rows over several 1024-row CSV batches: group accumulators (and the
+    // string min, which must be deep-copied into state) carry across pulls.
+    var in_buf = std.array_list.Managed(u8).init(alloc);
+    defer in_buf.deinit();
+    try in_buf.appendSlice("code,amount,name\n");
+    var i: usize = 0;
+    while (i < 3000) : (i += 1) {
+        try in_buf.writer().print("{c},{d},n{d:0>4}\n", .{ "XY"[i % 2], i, i });
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = in_buf.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "@batch\nread csv \"{s}/in.csv\"\n  | aggregate n = count(), total = sum(cast(amount as int)), first_name = min(name) by code\n  | sort code\n  | write csv \"{s}/out.csv\"",
+        .{ base, base },
+    );
+    defer alloc.free(script);
+
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    // X: even i (0..2998) -> n=1500, sum=2248500, min name n0000
+    // Y: odd  i (1..2999) -> n=1500, sum=2250000, min name n0001
+    try std.testing.expectEqualStrings("code,n,total,first_name\nX,1500,2248500,n0000\nY,1500,2250000,n0001\n", out);
+}
+
+test "global aggregate streams vectorized partials across batches" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var in_buf = std.array_list.Managed(u8).init(alloc);
+    defer in_buf.deinit();
+    try in_buf.appendSlice("amount\n");
+    var i: usize = 0;
+    while (i < 3000) : (i += 1) {
+        try in_buf.writer().print("{d}\n", .{i});
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = in_buf.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "@batch\nread csv \"{s}/in.csv\"\n  | select amt = cast(amount as int)\n  | aggregate n = count(), total = sum(amt), lo = min(amt), hi = max(amt)\n  | write csv \"{s}/out.csv\"",
+        .{ base, base },
+    );
+    defer alloc.free(script);
+
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("n,total,lo,hi\n3000,4498500,0,2999\n", out);
+}
+
+test "distinct dedups across multiple batches" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // 3000 rows / 3 distinct codes, spanning several 1024-row CSV batches: the
+    // streaming seen-set must carry across pulls (and arena resets).
+    var in_buf = std.array_list.Managed(u8).init(alloc);
+    defer in_buf.deinit();
+    try in_buf.appendSlice("code\n");
+    var i: usize = 0;
+    while (i < 3000) : (i += 1) {
+        try in_buf.writer().print("{c}\n", .{"XYZ"[i % 3]});
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = in_buf.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "@batch\nread csv \"{s}/in.csv\"\n  | distinct\n  | write csv \"{s}/out.csv\"",
+        .{ base, base },
+    );
+    defer alloc.free(script);
+
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("code\nX\nY\nZ\n", out);
 }
 
 test "join probe side spanning multiple batches" {

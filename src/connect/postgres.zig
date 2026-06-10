@@ -13,7 +13,7 @@ const sqlmod = @import("sql.zig");
 
 const Batch = batchmod.Batch;
 
-pub const Error = error{ PgProtocol, PgAuthFailed, PgQueryFailed, PgAuthUnsupported } || std.mem.Allocator.Error;
+pub const Error = error{ PgProtocol, PgAuthFailed, PgQueryFailed, PgAuthUnsupported, PgTlsRefused } || std.mem.Allocator.Error;
 
 /// Buffered socket reads: without this, every backend message costs two recv
 /// syscalls (5-byte header + body) — ~2 per row — which dominates read time and
@@ -29,29 +29,65 @@ pub const Conn = struct {
     sw: std.net.Stream.Writer = undefined,
     payload: std.array_list.Managed(u8), // current message payload
     last_error: []const u8 = "",
+    tls: ?*sqlmod.TlsState = null,
     // streaming cursor state (valid between queryCursor and close)
     meta_arena: std.heap.ArenaAllocator = undefined,
     cols: []PgCol = &.{},
     cur_schema: *types.Schema = undefined,
     done: bool = false,
 
-    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8) !*Conn {
+    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sqlmod.TlsMode) !*Conn {
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
         const self = try gpa.create(Conn);
         self.* = .{ .gpa = gpa, .stream = stream, .payload = std.array_list.Managed(u8).init(gpa) };
         self.sr = std.net.Stream.Reader.init(stream, &self.read_buf);
         self.sw = std.net.Stream.Writer.init(stream, &self.write_buf);
         errdefer self.close();
+        if (tls_mode != .off) try self.startTls(host, tls_mode);
         try self.startup(user, database);
         try self.authenticate(user, password);
         return self;
     }
 
+    /// SSLRequest (len=8, code 80877103) → server answers one byte: 'S' starts
+    /// the TLS handshake, 'N' means TLS is disabled server-side (we error rather
+    /// than silently downgrading to plaintext).
+    fn startTls(self: *Conn, host: []const u8, mode: sqlmod.TlsMode) !void {
+        var req: [8]u8 = undefined;
+        std.mem.writeInt(u32, req[0..4], 8, .big);
+        std.mem.writeInt(u32, req[4..8], 80877103, .big);
+        const w = &self.sw.interface;
+        try w.writeAll(&req);
+        try w.flush();
+        var resp: [1]u8 = undefined;
+        try self.sr.interface().readSliceAll(&resp);
+        if (resp[0] != 'S') return error.PgTlsRefused;
+
+        const ts = try self.gpa.create(sqlmod.TlsState);
+        errdefer self.gpa.destroy(ts);
+        try ts.start(self.gpa, self.sr.interface(), &self.sw.interface, host, mode);
+        self.tls = ts;
+    }
+
     pub fn close(self: *Conn) void {
         if (self.last_error.len > 0) self.gpa.free(self.last_error);
+        if (self.tls) |t| t.deinit(self.gpa);
         self.payload.deinit();
         self.stream.close();
         self.gpa.destroy(self);
+    }
+
+    /// Cleartext reader/writer: through the TLS session when enabled, else the
+    /// plain socket interfaces.
+    fn rd(self: *Conn) *std.Io.Reader {
+        return if (self.tls) |t| &t.client.reader else self.sr.interface();
+    }
+    fn wr(self: *Conn) *std.Io.Writer {
+        return if (self.tls) |t| &t.client.writer else &self.sw.interface;
+    }
+    fn flushOut(self: *Conn) !void {
+        if (self.tls) |t| try t.client.writer.flush(); // seal TLS records...
+        try self.sw.interface.flush(); // ...then push them down the socket
     }
 
     pub fn sqlConn(self: *Conn) sqlmod.Conn {
@@ -75,10 +111,10 @@ pub const Conn = struct {
         // startup packet has no type byte: just length + body
         var hdr: [4]u8 = undefined;
         std.mem.writeInt(u32, &hdr, @intCast(body.items.len + 4), .big);
-        const w = &self.sw.interface;
+        const w = self.wr();
         try w.writeAll(&hdr);
         try w.writeAll(body.items);
-        try w.flush();
+        try self.flushOut();
     }
 
     fn authenticate(self: *Conn, user: []const u8, password: []const u8) !void {
@@ -144,7 +180,6 @@ pub const Conn = struct {
         defer aa.deinit();
         const a = aa.allocator();
 
-        const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
         const enc = std.base64.standard.Encoder;
         const dec = std.base64.standard.Decoder;
 
@@ -173,20 +208,12 @@ pub const Conn = struct {
         const salt = try a.alloc(u8, try dec.calcSizeForSlice(ss));
         try dec.decode(salt, ss);
 
-        var salted: [32]u8 = undefined;
-        try std.crypto.pwhash.pbkdf2(&salted, password, salt, iters, Hmac);
-        var client_key: [32]u8 = undefined;
-        Hmac.create(&client_key, "Client Key", &salted);
-        var stored_key: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(&client_key, &stored_key, .{});
+        const keys = try scramKeys(password, salt, iters);
 
         const cfwp = try std.fmt.allocPrint(a, "c=biws,r={s}", .{sr}); // client-final-without-proof
         const auth_message = try std.fmt.allocPrint(a, "{s},{s},{s}", .{ cfb, server_first, cfwp });
 
-        var client_sig: [32]u8 = undefined;
-        Hmac.create(&client_sig, auth_message, &stored_key);
-        var proof: [32]u8 = undefined;
-        for (&proof, 0..) |*b, k| b.* = client_key[k] ^ client_sig[k];
+        const proof = scramProof(keys, auth_message);
         var proof_b64: [64]u8 = undefined;
         const proof_enc = enc.encode(&proof_b64, &proof);
 
@@ -200,22 +227,26 @@ pub const Conn = struct {
             return error.PgAuthFailed;
         }
         if (t != 'R' or (try readI32(self.payload.items, 0)) != 12) return error.PgAuthFailed;
+
+        // Verify the server signature (`v=`): proves the server also knows the
+        // password derivation (mutual auth) — without this, anything that can
+        // intercept the connection can pose as the server past this point.
+        const sv = scramAttr(self.payload.items[4..], 'v') orelse return error.PgAuthFailed;
+        var server_sig: [32]u8 = undefined;
+        if ((dec.calcSizeForSlice(sv) catch return error.PgAuthFailed) != 32) return error.PgAuthFailed;
+        dec.decode(&server_sig, sv) catch return error.PgAuthFailed;
+        if (!std.mem.eql(u8, &server_sig, &scramServerSig(keys, auth_message))) return error.PgAuthFailed;
     }
 
     // --- streaming query ---
 
     pub fn queryCursor(self: *Conn, sql: []const u8) !sqlmod.Cursor {
-        self.meta_arena = std.heap.ArenaAllocator.init(self.gpa);
-        self.openCursor(sql) catch |e| {
-            self.meta_arena.deinit();
-            return e; // leave conn open: the caller owns it (can read last_error) and closes it
-        };
-        return .{ .ptr = self, .vtable = &cursor_vtable };
+        return sqlmod.openTextCursor(self, sql, &cursor_vtable);
     }
 
     /// Send the query and read up to RowDescription (the header); leaves the
     /// connection positioned just before the DataRows.
-    fn openCursor(self: *Conn, sql: []const u8) !void {
+    pub fn openCursor(self: *Conn, sql: []const u8) !void {
         try self.sendQuery(sql);
         const ma = self.meta_arena.allocator();
         self.cols = &.{};
@@ -228,10 +259,10 @@ pub const Conn = struct {
             const p = self.payload.items;
             switch (t) {
                 'T' => {
-                    const rd = try parseRowDescription(ma, p);
-                    self.cols = rd.cols;
+                    const rowdesc = try parseRowDescription(ma, p);
+                    self.cols = rowdesc.cols;
                     const sch = try ma.create(types.Schema);
-                    sch.* = .{ .fields = rd.fields };
+                    sch.* = .{ .fields = rowdesc.fields };
                     self.cur_schema = sch;
                     return;
                 },
@@ -249,39 +280,25 @@ pub const Conn = struct {
         }
     }
 
-    fn fetchBatch(self: *Conn, arena: std.mem.Allocator) !?Batch {
-        const ncol = self.cols.len;
-        if (ncol == 0) return null;
-        const builders = try arena.alloc(column.Builder, ncol);
-        for (self.cols, builders) |c, *b| b.* = column.Builder.init(arena, c.engine_type);
-
-        var n: usize = 0;
-        while (n < sqlmod.STREAM_ROWS and !self.done) {
+    /// One backend message, classified for `sql.fetchTextBatch`: a DataRow
+    /// (values appended), ReadyForQuery (end), or a server error.
+    pub fn nextRow(self: *Conn, arena: std.mem.Allocator, builders: []column.Builder) !sqlmod.RowStep {
+        while (true) {
             const t = try self.readMsg();
             const p = self.payload.items;
             switch (t) {
                 'D' => {
                     try parseDataRow(self, arena, p, builders);
-                    n += 1;
+                    return .row;
                 },
-                'C' => {},
-                'Z' => self.done = true,
+                'Z' => return .end,
                 'E' => {
                     self.last_error = try self.gpa.dupe(u8, errMessage(p));
                     return error.PgQueryFailed;
                 },
-                else => {},
+                else => {}, // CommandComplete, notices, …
             }
         }
-        if (n == 0) return null;
-        const out = try arena.alloc(column.Column, ncol);
-        for (builders, 0..) |*b, k| out[k] = try b.finish();
-        return .{ .schema = self.cur_schema, .columns = out, .len = n };
-    }
-
-    fn cursorClose(self: *Conn) void {
-        self.meta_arena.deinit();
-        self.close();
     }
 
     pub fn exec(self: *Conn, sql: []const u8) !void {
@@ -350,14 +367,14 @@ pub const Conn = struct {
         var hdr: [5]u8 = undefined;
         hdr[0] = msg_type;
         std.mem.writeInt(u32, hdr[1..5], @intCast(body.len + 4), .big);
-        const w = &self.sw.interface;
+        const w = self.wr();
         try w.writeAll(&hdr);
         try w.writeAll(body);
-        try w.flush();
+        try self.flushOut();
     }
 
     fn readMsg(self: *Conn) !u8 {
-        const r = self.sr.interface();
+        const r = self.rd();
         var hdr: [5]u8 = undefined;
         try r.readSliceAll(&hdr);
         const len = std.mem.readInt(u32, hdr[1..5], .big);
@@ -391,11 +408,11 @@ fn curSchema(ptr: *anyopaque) types.Schema {
 }
 fn curNext(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
     const self: *Conn = @ptrCast(@alignCast(ptr));
-    return self.fetchBatch(arena);
+    return sqlmod.fetchTextBatch(self, arena);
 }
 fn curClose(ptr: *anyopaque) void {
     const self: *Conn = @ptrCast(@alignCast(ptr));
-    self.cursorClose();
+    sqlmod.closeTextCursor(self);
 }
 
 // --- result parsing ---
@@ -474,6 +491,63 @@ fn scramAttr(s: []const u8, key: u8) ?[]const u8 {
         if (part.len >= 2 and part[0] == key and part[1] == '=') return part[2..];
     }
     return null;
+}
+
+// --- SCRAM-SHA-256 key derivation (RFC 5802/7677), pure and vector-tested ---
+
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+
+const ScramKeys = struct {
+    client_key: [32]u8,
+    stored_key: [32]u8,
+    server_key: [32]u8,
+};
+
+fn scramKeys(password: []const u8, salt: []const u8, iters: u32) !ScramKeys {
+    var salted: [32]u8 = undefined;
+    try std.crypto.pwhash.pbkdf2(&salted, password, salt, iters, HmacSha256);
+    var keys: ScramKeys = undefined;
+    HmacSha256.create(&keys.client_key, "Client Key", &salted);
+    std.crypto.hash.sha2.Sha256.hash(&keys.client_key, &keys.stored_key, .{});
+    HmacSha256.create(&keys.server_key, "Server Key", &salted);
+    return keys;
+}
+
+/// ClientProof = ClientKey XOR HMAC(StoredKey, AuthMessage)
+fn scramProof(keys: ScramKeys, auth_message: []const u8) [32]u8 {
+    var client_sig: [32]u8 = undefined;
+    HmacSha256.create(&client_sig, auth_message, &keys.stored_key);
+    var proof: [32]u8 = undefined;
+    for (&proof, 0..) |*b, k| b.* = keys.client_key[k] ^ client_sig[k];
+    return proof;
+}
+
+/// ServerSignature = HMAC(ServerKey, AuthMessage) — what the server's `v=` must equal.
+fn scramServerSig(keys: ScramKeys, auth_message: []const u8) [32]u8 {
+    var sig: [32]u8 = undefined;
+    HmacSha256.create(&sig, auth_message, &keys.server_key);
+    return sig;
+}
+
+test "SCRAM-SHA-256 proof and server signature match the RFC 7677 vector" {
+    // RFC 7677 §3: user "user", password "pencil", i=4096.
+    const dec = std.base64.standard.Decoder;
+    const enc = std.base64.standard.Encoder;
+
+    var salt: [16]u8 = undefined;
+    try dec.decode(&salt, "W22ZaJ0SNY7soEsUEjb6gQ==");
+    const keys = try scramKeys("pencil", &salt, 4096);
+
+    const auth_message = "n=user,r=rOprNGfwEbeRWgbNEkqO," ++
+        "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096," ++
+        "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
+
+    var b64: [64]u8 = undefined;
+    const proof = scramProof(keys, auth_message);
+    try std.testing.expectEqualStrings("dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=", enc.encode(&b64, &proof));
+
+    const sig = scramServerSig(keys, auth_message);
+    try std.testing.expectEqualStrings("6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=", enc.encode(&b64, &sig));
 }
 
 fn appendCStr(list: *std.array_list.Managed(u8), s: []const u8) !void {

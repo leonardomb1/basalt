@@ -93,6 +93,72 @@ pub fn gather(arena: std.mem.Allocator, c: Column, keep: []const bool, kept: usi
     return .{ .ty = c.ty, .len = kept, .validity = bm, .data = data };
 }
 
+/// Concatenate same-typed column chunks into one column of `total` rows by
+/// copying the typed backing slices directly — no per-row `Value` boxing. Byte
+/// slices are NOT re-duped: the caller guarantees the chunks' bytes live at
+/// least as long as the output (e.g. all in the same arena).
+pub fn concat(arena: std.mem.Allocator, chunks: []const Column, total: usize) !Column {
+    std.debug.assert(chunks.len > 0);
+    var bm = try Bitmap.initFull(arena, total);
+    {
+        var off: usize = 0;
+        for (chunks) |c| {
+            if (!c.validity.allSet(c.len)) {
+                var i: usize = 0;
+                while (i < c.len) : (i += 1) {
+                    if (!c.validity.get(i)) bm.setValid(off + i, false);
+                }
+            }
+            off += c.len;
+        }
+    }
+    const data: Column.Data = switch (chunks[0].data) {
+        .b => .{ .b = try concatSlices("b", bool, arena, chunks, total) },
+        .i32 => .{ .i32 = try concatSlices("i32", i32, arena, chunks, total) },
+        .i64 => .{ .i64 = try concatSlices("i64", i64, arena, chunks, total) },
+        .f64 => .{ .f64 = try concatSlices("f64", f64, arena, chunks, total) },
+        .dec => .{ .dec = try concatSlices("dec", value.Decimal, arena, chunks, total) },
+        .bytes => .{ .bytes = try concatSlices("bytes", []const u8, arena, chunks, total) },
+    };
+    return .{ .ty = chunks[0].ty, .len = total, .validity = bm, .data = data };
+}
+
+fn concatSlices(comptime tag: []const u8, comptime T: type, arena: std.mem.Allocator, chunks: []const Column, total: usize) ![]T {
+    const out = try arena.alloc(T, total);
+    var off: usize = 0;
+    for (chunks) |c| {
+        @memcpy(out[off..][0..c.len], @field(c.data, tag)[0..c.len]);
+        off += c.len;
+    }
+    return out;
+}
+
+/// Reorder a column by `idx` (`out[i] = c[idx[i]]`) into a fresh column, copying
+/// the typed buffer directly (no per-row `Value` boxing). The sort output path.
+pub fn permute(arena: std.mem.Allocator, c: Column, idx: []const usize) !Column {
+    var bm = try Bitmap.initFull(arena, idx.len);
+    if (!c.validity.allSet(c.len)) {
+        for (idx, 0..) |r, i| {
+            if (!c.validity.get(r)) bm.setValid(i, false);
+        }
+    }
+    const data: Column.Data = switch (c.data) {
+        .b => |s| .{ .b = try permuteSlice(bool, arena, s, idx) },
+        .i32 => |s| .{ .i32 = try permuteSlice(i32, arena, s, idx) },
+        .i64 => |s| .{ .i64 = try permuteSlice(i64, arena, s, idx) },
+        .f64 => |s| .{ .f64 = try permuteSlice(f64, arena, s, idx) },
+        .dec => |s| .{ .dec = try permuteSlice(value.Decimal, arena, s, idx) },
+        .bytes => |s| .{ .bytes = try permuteSlice([]const u8, arena, s, idx) },
+    };
+    return .{ .ty = c.ty, .len = idx.len, .validity = bm, .data = data };
+}
+
+fn permuteSlice(comptime T: type, arena: std.mem.Allocator, src: []const T, idx: []const usize) ![]T {
+    const out = try arena.alloc(T, idx.len);
+    for (idx, 0..) |r, i| out[i] = src[r];
+    return out;
+}
+
 pub const Column = struct {
     ty: types.Type,
     len: usize,
@@ -263,6 +329,32 @@ test "builder assembles a nullable string column" {
     try std.testing.expectEqualStrings("a", c.getValue(0).string);
     try std.testing.expect(c.getValue(1).isNull());
     try std.testing.expectEqualStrings("c", c.getValue(2).string);
+}
+
+test "concat joins typed chunks and carries nulls across offsets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c1 = try intColumn(a, &.{ 1, null, 3 });
+    const c2 = try intColumn(a, &.{ null, 5 });
+    const out = try concat(a, &.{ c1, c2 }, 5);
+    try std.testing.expectEqual(@as(usize, 5), out.len);
+    try std.testing.expectEqual(@as(i64, 1), out.getValue(0).int);
+    try std.testing.expect(out.getValue(1).isNull());
+    try std.testing.expectEqual(@as(i64, 3), out.getValue(2).int);
+    try std.testing.expect(out.getValue(3).isNull());
+    try std.testing.expectEqual(@as(i64, 5), out.getValue(4).int);
+}
+
+test "permute reorders values and validity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try intColumn(a, &.{ 10, null, 30 });
+    const out = try permute(a, c, &.{ 2, 0, 1 });
+    try std.testing.expectEqual(@as(i64, 30), out.getValue(0).int);
+    try std.testing.expectEqual(@as(i64, 10), out.getValue(1).int);
+    try std.testing.expect(out.getValue(2).isNull());
 }
 
 test "bitmap set/get across byte boundaries" {
