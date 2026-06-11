@@ -22,6 +22,23 @@
 //! take literals (useful with for-loop `${var}` interpolation), and
 //! `header = "Name: value"` adds one extra raw header.
 //!
+//! Connection-level form: `connection itsm = http` + `read itsm "/path?query"`.
+//! The path resolves against the connection's `base_url` (spaces auto-encoded,
+//! so OData filters read naturally) and auth lives on the connection:
+//!   auth = "bearer"      token = secret("TOK")               -> Bearer <token>
+//!   auth = "basic"       user = ..., password = ...          -> Basic <b64>
+//!   auth = "header"      header_name/header_value            -> any API-key header
+//!   auth = "login_json"  login_url + body_* attrs            -> POST a JSON object
+//!                        built from every `body_<field>` attr; the response token
+//!                        (`token_path`, default the whole response string) is sent
+//!                        as `token_header` (default Authorization) with
+//!                        `token_prefix` (default none).
+//!   auth = "oauth2"      login_url ("token_url" also accepted) + client_id/
+//!                        client_secret [+ scope] -> client-credentials form POST;
+//!                        token_path defaults to access_token, prefix to "Bearer ".
+//! Session kinds (login_json, oauth2) re-login and retry the page once on a 401,
+//! so server-side session expiry mid-pull heals itself.
+//!
 //! The schema is inferred from the first page (request.zig rules); later pages
 //! coerce to it — missing keys become null, new keys are dropped. Each page is
 //! fetched whole into the per-batch arena (pages are bounded; the stream as a
@@ -105,6 +122,218 @@ pub fn uriHost(uri: std.Uri) ?[]const u8 {
     };
 }
 
+pub const AuthKind = enum { none, bearer, basic, header, login_json, oauth2 };
+
+pub const KV = struct { key: []const u8, value: []const u8 };
+
+/// Resolved configuration of a `connection <name> = http` block.
+pub const ConnConfig = struct {
+    base_url: []const u8 = "",
+    auth: AuthKind = .none,
+    token: []const u8 = "", // bearer
+    user: []const u8 = "", // basic / oauth2 client_id
+    password: []const u8 = "", // basic / oauth2 client_secret
+    header_name: []const u8 = "", // header kind
+    header_value: []const u8 = "",
+    login_url: []const u8 = "", // login_json / oauth2 (absolute or base_url-relative)
+    scope: []const u8 = "", // oauth2, optional
+    body: []const KV = &.{}, // login_json: the POSTed JSON object's fields
+    token_path: []const u8 = "", // dotted path to the token; "" = kind default
+    token_header: []const u8 = "Authorization",
+    token_prefix: ?[]const u8 = null, // null = kind default ("" / "Bearer ")
+};
+
+/// Build a ConnConfig from resolved (string) connection attrs. `body_<field>`
+/// attrs pass through into the login JSON object — vendor-agnostic, so any
+/// login body shape works without templating. Unknown keys are an error
+/// (connections are explicit config, unlike advisory hints); `errmsg` says which.
+pub fn connFromKvs(arena: std.mem.Allocator, kvs: []const KV, errmsg: *[]const u8) !ConnConfig {
+    var cc = ConnConfig{};
+    var body = std.array_list.Managed(KV).init(arena);
+    for (kvs) |kv| {
+        if (std.mem.startsWith(u8, kv.key, "body_")) {
+            try body.append(.{ .key = kv.key["body_".len..], .value = kv.value });
+        } else if (std.mem.eql(u8, kv.key, "base_url")) {
+            cc.base_url = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "auth")) {
+            cc.auth = std.meta.stringToEnum(AuthKind, kv.value) orelse {
+                errmsg.* = try std.fmt.allocPrint(arena, "unknown auth kind `{s}`", .{kv.value});
+                return error.BadHttpConn;
+            };
+        } else if (std.mem.eql(u8, kv.key, "token")) {
+            cc.token = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "user") or std.mem.eql(u8, kv.key, "client_id")) {
+            cc.user = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "password") or std.mem.eql(u8, kv.key, "client_secret")) {
+            cc.password = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "header_name")) {
+            cc.header_name = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "header_value")) {
+            cc.header_value = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "login_url") or std.mem.eql(u8, kv.key, "login_path") or std.mem.eql(u8, kv.key, "token_url")) {
+            cc.login_url = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "scope")) {
+            cc.scope = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "token_path")) {
+            cc.token_path = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "token_header")) {
+            cc.token_header = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "token_prefix")) {
+            cc.token_prefix = kv.value;
+        } else {
+            errmsg.* = try std.fmt.allocPrint(arena, "unknown attribute `{s}`", .{kv.key});
+            return error.BadHttpConn;
+        }
+    }
+    cc.body = try body.toOwnedSlice();
+    if (cc.base_url.len == 0) {
+        errmsg.* = "missing `base_url`";
+        return error.BadHttpConn;
+    }
+    return cc;
+}
+
+/// Produces and refreshes the auth header for a connection. Static kinds
+/// (bearer/basic/header) compute once; session kinds (login_json/oauth2) log in
+/// lazily and can mint a fresh token after a 401.
+pub const AuthState = struct {
+    arena: std.mem.Allocator,
+    cc: ConnConfig,
+    header: ?std.http.Header = null,
+
+    pub fn ensure(self: *AuthState, client: *std.http.Client) !?std.http.Header {
+        if (self.header) |h| return h;
+        switch (self.cc.auth) {
+            .none => return null,
+            .bearer => self.header = .{
+                .name = "Authorization",
+                .value = try std.fmt.allocPrint(self.arena, "Bearer {s}", .{self.cc.token}),
+            },
+            .basic => {
+                const raw = try std.fmt.allocPrint(self.arena, "{s}:{s}", .{ self.cc.user, self.cc.password });
+                const enc = std.base64.standard.Encoder;
+                const b64 = try self.arena.alloc(u8, enc.calcSize(raw.len));
+                _ = enc.encode(b64, raw);
+                self.header = .{ .name = "Authorization", .value = try std.fmt.allocPrint(self.arena, "Basic {s}", .{b64}) };
+            },
+            .header => self.header = .{ .name = self.cc.header_name, .value = self.cc.header_value },
+            .login_json, .oauth2 => try self.login(client),
+        }
+        return self.header;
+    }
+
+    /// Session kinds re-login (server-side expiry mid-pull); static kinds can't.
+    pub fn refresh(self: *AuthState, client: *std.http.Client) bool {
+        switch (self.cc.auth) {
+            .login_json, .oauth2 => {
+                self.header = null;
+                self.login(client) catch return false;
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    fn login(self: *AuthState, client: *std.http.Client) !void {
+        const arena = self.arena;
+        const is_oauth = self.cc.auth == .oauth2;
+        var content_type: []const u8 = undefined;
+        var payload: []const u8 = undefined;
+        if (is_oauth) {
+            content_type = "application/x-www-form-urlencoded";
+            var buf = std.array_list.Managed(u8).init(arena);
+            try buf.appendSlice("grant_type=client_credentials");
+            try appendForm(&buf, "client_id", self.cc.user);
+            try appendForm(&buf, "client_secret", self.cc.password);
+            if (self.cc.scope.len > 0) try appendForm(&buf, "scope", self.cc.scope);
+            payload = try buf.toOwnedSlice();
+        } else {
+            content_type = "application/json";
+            var map = std.json.ObjectMap.init(arena);
+            for (self.cc.body) |kv| try map.put(kv.key, .{ .string = kv.value });
+            payload = try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = map }, .{});
+        }
+
+        var aw = std.Io.Writer.Allocating.init(arena);
+        const res = try client.fetch(.{
+            .method = .POST,
+            .location = .{ .url = self.cc.login_url },
+            .headers = .{ .content_type = .{ .override = content_type } },
+            .payload = payload,
+            .response_writer = &aw.writer,
+        });
+        const code = @intFromEnum(res.status);
+        if (code != 200) {
+            const b = aw.writer.buffered();
+            std.debug.print("login http {d} from {s}: {s}\n", .{ code, self.cc.login_url, b[0..@min(b.len, 300)] });
+            return statusError(code);
+        }
+        const root = try json.parseFromSliceLeaky(json.Value, arena, aw.writer.buffered(), .{});
+        const path = if (self.cc.token_path.len > 0)
+            self.cc.token_path
+        else if (is_oauth) "access_token" else ".";
+        const tok_val = if (std.mem.eql(u8, path, ".")) root else (jsonPath(root, path) orelse return error.LoginTokenMissing);
+        const tok = switch (tok_val) {
+            .string => |t| t,
+            else => return error.LoginTokenMissing,
+        };
+        const prefix = self.cc.token_prefix orelse (if (is_oauth) "Bearer " else "");
+        self.header = .{
+            .name = self.cc.token_header,
+            .value = try std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, tok }),
+        };
+    }
+};
+
+fn appendForm(buf: *std.array_list.Managed(u8), key: []const u8, val: []const u8) !void {
+    try buf.append('&');
+    try buf.appendSlice(key);
+    try buf.append('=');
+    const hex = "0123456789ABCDEF";
+    for (val) |c| {
+        if (formUnreserved(c)) {
+            try buf.append(c);
+        } else {
+            try buf.append('%');
+            try buf.append(hex[c >> 4]);
+            try buf.append(hex[c & 0xF]);
+        }
+    }
+}
+
+fn formUnreserved(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
+}
+
+/// Resolve a read path against a base URL; absolute http(s) paths pass through.
+pub fn joinUrl(arena: std.mem.Allocator, base: []const u8, path: []const u8) ![]const u8 {
+    if (path.len == 0) return base;
+    if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://")) return path;
+    const b = std.mem.trimRight(u8, base, "/");
+    const sep: []const u8 = if (path.len > 0 and path[0] == '/') "" else "/";
+    return std.fmt.allocPrint(arena, "{s}{s}{s}", .{ b, sep, path });
+}
+
+/// Encode the one character that breaks URI parsing but appears constantly in
+/// hand-written query strings (OData filters): the space. Everything else is
+/// the script author's responsibility.
+pub fn encodeSpaces(arena: std.mem.Allocator, url: []const u8) ![]const u8 {
+    const n = std.mem.count(u8, url, " ");
+    if (n == 0) return url;
+    const out = try arena.alloc(u8, url.len + n * 2);
+    var j: usize = 0;
+    for (url) |c| {
+        if (c == ' ') {
+            @memcpy(out[j..][0..3], "%20");
+            j += 3;
+        } else {
+            out[j] = c;
+            j += 1;
+        }
+    }
+    return out;
+}
+
 /// A std.http.Client with the CA store pre-loaded: system roots plus, when the
 /// BASALT_CA_BUNDLE env var names a PEM file, every certificate in it. That's
 /// the manual override for chains the automatic repair can't fix (e.g. a server
@@ -139,6 +368,15 @@ pub const Options = struct {
     cursor_param: []const u8 = "cursor",
     cursor_field: []const u8 = "next",
     max_pages: i64 = 10_000,
+    /// page/offset modes: fetch up to N pages concurrently (1 = sequential).
+    /// The win is server-side latency: slow APIs compute pages in parallel.
+    /// Counterproductive on servers that serialize requests per session.
+    prefetch: i64 = 1,
+    /// page/offset modes: a page shorter than page_size ends the stream,
+    /// skipping the trailing empty-page request (a full server-side scan on
+    /// slow OData backends). Opt-in: unsafe when the server caps page size
+    /// below the requested one (the short page would lie).
+    stop_short: bool = false,
 };
 
 /// Hint keys mirror the Options field names. Unknown hints are ignored, per the
@@ -186,6 +424,10 @@ pub fn optsFromHints(hints: []const ast.Hint) Options {
             if (sv) |s| o.cursor_field = s;
         } else if (std.mem.eql(u8, h.key, "max_pages")) {
             if (iv) |n| o.max_pages = n;
+        } else if (std.mem.eql(u8, h.key, "prefetch")) {
+            if (iv) |n| o.prefetch = n;
+        } else if (std.mem.eql(u8, h.key, "stop_short")) {
+            o.stop_short = (h.value == .flag);
         }
     }
     return o;
@@ -193,6 +435,7 @@ pub fn optsFromHints(hints: []const ast.Hint) Options {
 
 pub const HttpSource = struct {
     arena: std.mem.Allocator, // run arena: self, schema, headers, first page
+    gpa: std.mem.Allocator, // worker page bodies (freed after each batch)
     client: std.http.Client,
     base_url: []const u8,
     opts: Options,
@@ -204,20 +447,62 @@ pub const HttpSource = struct {
     pages_fetched: i64 = 0,
     done: bool = false,
     repaired: bool = false, // one trust-repair attempt per source
+    auth: ?*AuthState = null, // connection-level auth (read http URL form: null)
+    slots: std.array_list.Managed(*Slot) = undefined, // in-flight prefetched pages, FIFO
+    pages_issued: i64 = 0,
+    issue_done: bool = false,
+    auth_gen: u32 = 0, // bumped on re-login so stale-token slots retry without a second login
 
-    pub fn open(arena: std.mem.Allocator, url: []const u8, opts: Options) !*HttpSource {
+    /// One prefetched page in flight. The URL lives in the run arena; the body
+    /// is gpa-owned and freed once parsed into the batch arena.
+    const Slot = struct {
+        thread: std.Thread = undefined,
+        url: []const u8,
+        auth_hdr: ?std.http.Header, // snapshot (arena strings stay valid across refresh)
+        gen: u32,
+        code: u16 = 0,
+        body: []u8 = &.{},
+        err: ?anyerror = null,
+    };
+
+    pub fn open(arena: std.mem.Allocator, gpa: std.mem.Allocator, url: []const u8, opts: Options) !*HttpSource {
+        return openConn(arena, gpa, .{ .base_url = url }, "", opts);
+    }
+
+    /// Open against a `connection ... = http`: `path` resolves on the
+    /// connection's base_url, and the connection's auth kind applies (with
+    /// mid-run re-login for session kinds).
+    pub fn openConn(arena: std.mem.Allocator, gpa: std.mem.Allocator, cc: ConnConfig, path: []const u8, opts: Options) !*HttpSource {
+        // A line break in the URL is always an accident (an editor or terminal
+        // hard-wrapped the script line mid-string); fail with a name that says
+        // so rather than sending a corrupt request.
+        if (std.mem.indexOfAny(u8, path, "\r\n") != null) return error.UrlContainsLineBreak;
+        const url = try encodeSpaces(arena, try joinUrl(arena, cc.base_url, path));
         const self = try arena.create(HttpSource);
         self.* = .{
             .arena = arena,
-            .client = initClient(arena),
+            .gpa = gpa,
+            // The client allocator must be thread-safe (prefetch workers share
+            // the client and its connection pool); the run arena is not.
+            .client = initClient(gpa),
             .base_url = url,
+            .auth = null,
             .opts = opts,
             .headers = try buildHeaders(arena, opts),
             .schema = undefined,
             .first = null,
             .page_no = if (opts.paginate == .offset) opts.start_offset else opts.start_page,
         };
+        self.slots = std.array_list.Managed(*Slot).init(gpa);
         errdefer self.client.deinit();
+        if (cc.auth != .none) {
+            var rcc = cc;
+            // The login endpoint may be base_url-relative; resolve it once here.
+            rcc.login_url = try joinUrl(arena, cc.base_url, cc.login_url);
+            const a = try arena.create(AuthState);
+            a.* = .{ .arena = arena, .cc = rcc };
+            self.auth = a;
+        }
 
         const first_url = try self.pageUrl(arena);
         const page = try self.fetchParsed(arena, first_url);
@@ -248,11 +533,11 @@ pub const HttpSource = struct {
             .none => self.done = true,
             .page => {
                 self.page_no += 1;
-                if (n_items == 0 or self.pages_fetched >= self.opts.max_pages) self.done = true;
+                if (self.pageEnds(n_items)) self.done = true;
             },
             .offset => {
                 self.page_no += self.opts.page_size;
-                if (n_items == 0 or self.pages_fetched >= self.opts.max_pages) self.done = true;
+                if (self.pageEnds(n_items)) self.done = true;
             },
             .cursor => {
                 self.next_url = null;
@@ -287,6 +572,11 @@ pub const HttpSource = struct {
         }
     }
 
+    fn pageEnds(self: *HttpSource, n_items: usize) bool {
+        if (n_items == 0 or self.pages_fetched >= self.opts.max_pages) return true;
+        return self.opts.stop_short and n_items < self.opts.page_size;
+    }
+
     fn pageUrl(self: *HttpSource, arena: std.mem.Allocator) ![]const u8 {
         switch (self.opts.paginate) {
             .none => return self.base_url,
@@ -305,11 +595,21 @@ pub const HttpSource = struct {
     }
 
     fn fetchPage(self: *HttpSource, arena: std.mem.Allocator, url: []const u8) ![]const u8 {
+        // Pages on slow APIs run tens of seconds; honoring an abort here caps
+        // cancellation latency at one in-flight request instead of a whole run.
+        if (driver.aborting()) return error.Aborted;
         return self.fetchPageRaw(arena, url) catch |e| switch (e) {
             // Likely a misordered server chain: rebuild trust from the chain
             // itself (repairBundle) and retry once.
             error.TlsInitializationFailed => {
                 if (!self.tryRepair(url)) return e;
+                return self.fetchPageRaw(arena, url);
+            },
+            // Session expired mid-pull: session auth kinds re-login and the
+            // page is retried once; static kinds surface the 401.
+            error.HttpUnauthorized => {
+                const a = self.auth orelse return e;
+                if (!a.refresh(&self.client)) return e;
                 return self.fetchPageRaw(arena, url);
             },
             else => e,
@@ -321,17 +621,162 @@ pub const HttpSource = struct {
         self.repaired = true;
         const uri = std.Uri.parse(url) catch return false;
         const h = uriHost(uri) orelse return false;
-        if (!repairBundle(self.arena, &self.client.ca_bundle, h, uri.port orelse 443)) return false;
+        if (!repairBundle(self.client.allocator, &self.client.ca_bundle, h, uri.port orelse 443)) return false;
         self.client.next_https_rescan_certs = false;
         return true;
     }
 
+    fn prefetchOn(self: *HttpSource) bool {
+        return self.opts.prefetch > 1 and
+            (self.opts.paginate == .page or self.opts.paginate == .offset);
+    }
+
+    /// Spawn a worker for the next page; page bookkeeping happens at issue time
+    /// (the sequential path does it at consume time via advance()).
+    fn issueSlot(self: *HttpSource) !void {
+        if (self.pages_issued + 1 >= self.opts.max_pages) self.issue_done = true;
+        const url = try self.pageUrl(self.arena);
+        switch (self.opts.paginate) {
+            .page => self.page_no += 1,
+            .offset => self.page_no += self.opts.page_size,
+            else => unreachable,
+        }
+        self.pages_issued += 1;
+        var auth_hdr: ?std.http.Header = null;
+        if (self.auth) |a| auth_hdr = try a.ensure(&self.client);
+        const slot = try self.gpa.create(Slot);
+        slot.* = .{ .url = url, .auth_hdr = auth_hdr, .gen = self.auth_gen };
+        errdefer self.gpa.destroy(slot);
+        slot.thread = try std.Thread.spawn(.{}, workerMain, .{ self, slot });
+        try self.slots.append(slot);
+    }
+
+    /// Worker thread: GET one page into a gpa-owned buffer. The std client's
+    /// connection pool is mutex-guarded, so sharing it across workers is fine
+    /// (and shares the repaired CA bundle).
+    fn workerMain(self: *HttpSource, slot: *Slot) void {
+        var hdrs: [12]std.http.Header = undefined;
+        var nh: usize = 0;
+        for (self.headers) |h| {
+            hdrs[nh] = h;
+            nh += 1;
+        }
+        if (slot.auth_hdr) |h| {
+            hdrs[nh] = h;
+            nh += 1;
+        }
+        var aw = std.Io.Writer.Allocating.init(self.gpa);
+        defer aw.deinit();
+        const res = self.client.fetch(.{
+            .method = .GET,
+            .location = .{ .url = slot.url },
+            .extra_headers = hdrs[0..nh],
+            .response_writer = &aw.writer,
+        }) catch |e| {
+            slot.err = e;
+            return;
+        };
+        slot.code = @intFromEnum(res.status);
+        // dupe instead of toOwnedSlice: the latter hands back the grown buffer
+        // whose capacity differs from its length, which a precise allocator
+        // rejects on free.
+        slot.body = self.gpa.dupe(u8, aw.writer.buffered()) catch |e| {
+            slot.err = e;
+            return;
+        };
+    }
+
+    fn drainSlots(self: *HttpSource) void {
+        for (self.slots.items) |slot| {
+            slot.thread.join();
+            self.gpa.free(slot.body);
+            self.gpa.destroy(slot);
+        }
+        self.slots.clearRetainingCapacity();
+    }
+
+    /// End of dataset reached: requests already in flight past the end are
+    /// joined and discarded (same waste profile as any prefetch window).
+    fn finishEmpty(self: *HttpSource) ?Batch {
+        self.issue_done = true;
+        self.drainSlots();
+        self.done = true;
+        return null;
+    }
+
+    fn nextPrefetched(self: *HttpSource, arena: std.mem.Allocator) !?Batch {
+        if (self.done) return null;
+        if (driver.aborting()) {
+            self.drainSlots();
+            return error.Aborted;
+        }
+        while (!self.issue_done and self.slots.items.len < @as(usize, @intCast(self.opts.prefetch)))
+            try self.issueSlot();
+        if (self.slots.items.len == 0) {
+            self.done = true;
+            return null;
+        }
+        const slot = self.slots.orderedRemove(0);
+        slot.thread.join();
+        defer {
+            self.gpa.free(slot.body);
+            self.gpa.destroy(slot);
+        }
+        if (slot.err) |e| return e;
+        if (slot.code == 401) {
+            // Stale token (gen behind) just re-fetches; a current-gen 401 means
+            // the session expired — session auths re-login once.
+            const a = self.auth orelse return error.HttpUnauthorized;
+            if (slot.gen >= self.auth_gen) {
+                if (!a.refresh(&self.client)) return error.HttpUnauthorized;
+                self.auth_gen += 1;
+            }
+            const body = try self.fetchPageRaw(arena, slot.url);
+            return self.consumeBody(arena, body);
+        }
+        if (slot.code == 204) return self.finishEmpty();
+        if (slot.code != 200) {
+            std.debug.print("http {d} from {s}: {s}\n", .{ slot.code, slot.url, slot.body[0..@min(slot.body.len, 300)] });
+            return statusError(slot.code);
+        }
+        // Parsed JSON slices into the source text, so the body must move into
+        // the batch arena before the gpa copy is freed.
+        return self.consumeBody(arena, try arena.dupe(u8, slot.body));
+    }
+
+    fn consumeBody(self: *HttpSource, arena: std.mem.Allocator, body: []const u8) !?Batch {
+        const trimmed = std.mem.trim(u8, body, " \t\r\n");
+        if (trimmed.len == 0) return self.finishEmpty();
+        const root = try json.parseFromSliceLeaky(json.Value, arena, trimmed, .{});
+        if (root == .null) return self.finishEmpty();
+        const items = try itemsOf(arena, root, self.opts.items);
+        if (items.len == 0) return self.finishEmpty();
+        const batch = try request.batchFromJson(arena, self.schema, items);
+        if (self.opts.stop_short and items.len < self.opts.page_size) {
+            // Short page = end of data: stop issuing and discard in-flight pages
+            // (they'd come back empty), but still yield this final batch.
+            self.issue_done = true;
+            self.drainSlots();
+            self.done = true;
+        }
+        return batch;
+    }
+
     fn fetchPageRaw(self: *HttpSource, arena: std.mem.Allocator, url: []const u8) ![]const u8 {
+        var hdrs = try arena.alloc(std.http.Header, self.headers.len + 1);
+        @memcpy(hdrs[0..self.headers.len], self.headers);
+        var nh = self.headers.len;
+        if (self.auth) |a| {
+            if (try a.ensure(&self.client)) |h| {
+                hdrs[nh] = h;
+                nh += 1;
+            }
+        }
         var aw = std.Io.Writer.Allocating.init(arena);
         const res = try self.client.fetch(.{
             .method = .GET,
             .location = .{ .url = url },
-            .extra_headers = self.headers,
+            .extra_headers = hdrs[0..nh],
             .response_writer = &aw.writer,
         });
         const code = @intFromEnum(res.status);
@@ -351,6 +796,7 @@ pub const HttpSource = struct {
             self.first = null;
             return b;
         }
+        if (self.prefetchOn()) return self.nextPrefetched(arena);
         if (self.done) return null;
         const url = try self.pageUrl(arena);
         const page = try self.fetchParsed(arena, url);
@@ -360,6 +806,8 @@ pub const HttpSource = struct {
     }
 
     pub fn close(self: *HttpSource) void {
+        self.drainSlots();
+        self.slots.deinit();
         self.client.deinit();
     }
 
@@ -491,6 +939,8 @@ const TestServer = struct {
     listener: std.net.Server,
     responses: []const []const u8,
     statuses: ?[]const []const u8 = null, // per-response status lines; null = all "200 OK"
+    route_div: ?i64 = null, // route by $skip/div (prefetch arrives out of order)
+    expected: ?usize = null, // connections to serve; default responses.len
     captured: [4][2048]u8 = undefined,
     captured_len: [4]usize = .{ 0, 0, 0, 0 },
 
@@ -507,17 +957,34 @@ const TestServer = struct {
         self.serve() catch {};
     }
     fn serve(self: *TestServer) !void {
-        for (self.responses, 0..) |body, i| {
+        const total = self.expected orelse self.responses.len;
+        var i: usize = 0;
+        while (i < total) : (i += 1) {
             const conn = try self.listener.accept();
             defer conn.stream.close();
+            var req_buf: [2048]u8 = undefined;
+            const req_len = try conn.stream.read(&req_buf);
             if (i < self.captured.len) {
-                self.captured_len[i] = try conn.stream.read(&self.captured[i]);
+                @memcpy(self.captured[i][0..req_len], req_buf[0..req_len]);
+                self.captured_len[i] = req_len;
+            }
+            var body: []const u8 = undefined;
+            var status: []const u8 = "200 OK";
+            if (self.route_div) |div| {
+                // prefetch issues pages concurrently; route by the $skip value
+                var skip: i64 = 0;
+                if (std.mem.indexOf(u8, req_buf[0..req_len], "$skip=")) |at| {
+                    var j = at + "$skip=".len;
+                    while (j < req_len and req_buf[j] >= '0' and req_buf[j] <= '9') : (j += 1)
+                        skip = skip * 10 + (req_buf[j] - '0');
+                }
+                const idx: usize = @intCast(@divTrunc(skip, div));
+                body = if (idx < self.responses.len) self.responses[idx] else "[]";
             } else {
-                var sink: [2048]u8 = undefined;
-                _ = try conn.stream.read(&sink);
+                body = self.responses[i];
+                if (self.statuses) |st| status = st[i];
             }
             var wb: [256]u8 = undefined;
-            const status = if (self.statuses) |st| st[i] else "200 OK";
             const head = try std.fmt.bufPrint(&wb, "HTTP/1.1 {s}\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n", .{ status, body.len });
             try conn.stream.writeAll(head);
             try conn.stream.writeAll(body);
@@ -548,7 +1015,7 @@ test "http source: bare array, single fetch, bearer header sent" {
     defer th.join();
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
-    const s = try HttpSource.open(a, url, .{ .bearer = "sek" });
+    const s = try HttpSource.open(a, std.testing.allocator, url, .{ .bearer = "sek" });
     defer s.close();
     try std.testing.expectEqual(@as(usize, 2), s.schema.fields.len);
     try std.testing.expectEqual(types.TypeKind.int, s.schema.fields[0].ty.kind);
@@ -573,7 +1040,7 @@ test "http source: page pagination stops on empty page" {
     defer th.join();
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
-    const s = try HttpSource.open(a, url, .{ .items = "data", .paginate = .page });
+    const s = try HttpSource.open(a, std.testing.allocator, url, .{ .items = "data", .paginate = .page });
     defer s.close();
     try std.testing.expectEqual(@as(usize, 3), try drain(s, a));
     // page numbers advanced in the query string
@@ -599,7 +1066,7 @@ test "http source: offset pagination advances $skip by page_size, raw auth sent"
     defer th.join();
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/api/odata/businessobject/incidents", .{srv.port()});
-    const s = try HttpSource.open(a, url, .{
+    const s = try HttpSource.open(a, std.testing.allocator, url, .{
         .auth = "session-tok-xyz",
         .items = "value",
         .paginate = .offset,
@@ -633,7 +1100,7 @@ test "http source: 204 past the end of the dataset ends the stream cleanly" {
     defer th.join();
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
-    const s = try HttpSource.open(a, url, .{
+    const s = try HttpSource.open(a, std.testing.allocator, url, .{
         .items = "value",
         .paginate = .offset,
         .page_param = "$skip",
@@ -642,6 +1109,223 @@ test "http source: 204 past the end of the dataset ends the stream cleanly" {
     });
     defer s.close();
     try std.testing.expectEqual(@as(usize, 2), try drain(s, a));
+}
+
+test "connFromKvs maps attrs, collects body_*, rejects unknown keys" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var errmsg: []const u8 = "";
+
+    const cc = try connFromKvs(a, &.{
+        .{ .key = "base_url", .value = "https://x" },
+        .{ .key = "auth", .value = "login_json" },
+        .{ .key = "login_path", .value = "/login" },
+        .{ .key = "body_tenant", .value = "t" },
+        .{ .key = "body_username", .value = "u" },
+    }, &errmsg);
+    try std.testing.expectEqual(AuthKind.login_json, cc.auth);
+    try std.testing.expectEqualStrings("/login", cc.login_url);
+    try std.testing.expectEqual(@as(usize, 2), cc.body.len);
+    try std.testing.expectEqualStrings("tenant", cc.body[0].key);
+
+    try std.testing.expectError(error.BadHttpConn, connFromKvs(a, &.{
+        .{ .key = "base_url", .value = "https://x" },
+        .{ .key = "baseurl_typo", .value = "y" },
+    }, &errmsg));
+    try std.testing.expect(std.mem.indexOf(u8, errmsg, "baseurl_typo") != null);
+}
+
+test "http connection: login_json posts body, token rides later requests" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const srv = try TestServer.start(&.{
+        "\"tok-abc\"",
+        \\[{"id":1},{"id":2}]
+    });
+    defer srv.deinit();
+    const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+    defer th.join();
+
+    const base = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{srv.port()});
+    const s = try HttpSource.openConn(a, std.testing.allocator, .{
+        .base_url = base,
+        .auth = .login_json,
+        .login_url = "/api/login",
+        .body = &.{ .{ .key = "tenant", .value = "t1" }, .{ .key = "username", .value = "u1" } },
+    }, "/items", .{});
+    defer s.close();
+    try std.testing.expectEqual(@as(usize, 2), try drain(s, a));
+
+    const login_req = srv.captured[0][0..srv.captured_len[0]];
+    try std.testing.expect(std.mem.indexOf(u8, login_req, "POST /api/login") != null);
+    try std.testing.expect(std.mem.indexOf(u8, login_req, "\"tenant\":\"t1\"") != null);
+    const data_req = srv.captured[1][0..srv.captured_len[1]];
+    try std.testing.expect(std.mem.indexOf(u8, data_req, "GET /items") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data_req, "Authorization: tok-abc") != null);
+}
+
+test "http connection: 401 mid-run triggers re-login and the page retries" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const srv = try TestServer.start(&.{
+        "\"tok-A\"",
+        "expired",
+        "\"tok-B\"",
+        \\[{"id":7}]
+    });
+    srv.statuses = &.{ "200 OK", "401 Unauthorized", "200 OK", "200 OK" };
+    defer srv.deinit();
+    const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+    defer th.join();
+
+    const base = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{srv.port()});
+    const s = try HttpSource.openConn(a, std.testing.allocator, .{
+        .base_url = base,
+        .auth = .login_json,
+        .login_url = "/login",
+    }, "/items", .{});
+    defer s.close();
+    try std.testing.expectEqual(@as(usize, 1), try drain(s, a));
+    try std.testing.expect(std.mem.indexOf(u8, srv.captured[3][0..srv.captured_len[3]], "Authorization: tok-B") != null);
+}
+
+test "http connection: oauth2 client credentials form post -> Bearer" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const srv = try TestServer.start(&.{
+        \\{"access_token":"xyz","expires_in":3600}
+        ,
+        \\[{"id":1}]
+    });
+    defer srv.deinit();
+    const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+    defer th.join();
+
+    const base = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{srv.port()});
+    const s = try HttpSource.openConn(a, std.testing.allocator, .{
+        .base_url = base,
+        .auth = .oauth2,
+        .login_url = "/oauth/token",
+        .user = "cid",
+        .password = "sec ret",
+    }, "/items", .{});
+    defer s.close();
+    try std.testing.expectEqual(@as(usize, 1), try drain(s, a));
+
+    const tok_req = srv.captured[0][0..srv.captured_len[0]];
+    try std.testing.expect(std.mem.indexOf(u8, tok_req, "grant_type=client_credentials") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tok_req, "client_id=cid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tok_req, "client_secret=sec%20ret") != null);
+    try std.testing.expect(std.mem.indexOf(u8, srv.captured[1][0..srv.captured_len[1]], "Authorization: Bearer xyz") != null);
+}
+
+test "http source: prefetch fetches pages concurrently and stops on empty" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const srv = try TestServer.start(&.{
+        \\[{"id":1},{"id":2}]
+        ,
+        \\[{"id":3}]
+        ,
+        "[]",
+    });
+    srv.route_div = 2;
+    srv.expected = 5; // open(skip0) + slots skip2,4,6 + top-up skip8
+    defer srv.deinit();
+    const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+    defer th.join();
+
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+    const s = try HttpSource.open(a, std.testing.allocator, url, .{
+        .paginate = .offset,
+        .page_param = "$skip",
+        .size_param = "$top",
+        .page_size = 2,
+        .prefetch = 3,
+    });
+    defer s.close();
+    try std.testing.expectEqual(@as(usize, 3), try drain(s, a));
+    var seen2 = false;
+    var seen4 = false;
+    for (0..4) |i| {
+        const req = srv.captured[i][0..srv.captured_len[i]];
+        if (std.mem.indexOf(u8, req, "$skip=2&") != null) seen2 = true;
+        if (std.mem.indexOf(u8, req, "$skip=4&") != null) seen4 = true;
+    }
+    try std.testing.expect(seen2 and seen4);
+}
+
+test "http source: stop_short ends after a short page (no trailing empty fetch)" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // Only two responses served; without stop_short the source would issue a
+    // third request and this test would hang on the closed listener.
+    const srv = try TestServer.start(&.{
+        \\[{"id":1},{"id":2}]
+        ,
+        \\[{"id":3}]
+    });
+    defer srv.deinit();
+    const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+    defer th.join();
+
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+    const s = try HttpSource.open(a, std.testing.allocator, url, .{
+        .paginate = .offset,
+        .page_param = "$skip",
+        .size_param = "$top",
+        .page_size = 2,
+        .stop_short = true,
+    });
+    defer s.close();
+    try std.testing.expectEqual(@as(usize, 3), try drain(s, a));
+}
+
+test "abort flag stops pagination between page requests" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const srv = try TestServer.start(&.{
+        \\[{"id":1}]
+    });
+    defer srv.deinit();
+    const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+    defer th.join();
+
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+    const s = try HttpSource.open(a, std.testing.allocator, url, .{ .paginate = .page });
+    defer s.close();
+    _ = (try s.next(a)).?; // first page, fetched at open
+
+    driver.requestAbort();
+    defer driver.resetAbort();
+    // would otherwise issue the page-2 request; the abort check fires first
+    try std.testing.expectError(error.Aborted, s.next(a));
+}
+
+test "joinUrl and encodeSpaces" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("https://x/api/v1", try joinUrl(a, "https://x/", "/api/v1"));
+    try std.testing.expectEqualStrings("https://x/api", try joinUrl(a, "https://x", "api"));
+    try std.testing.expectEqualStrings("https://y/z", try joinUrl(a, "https://x", "https://y/z"));
+    try std.testing.expectEqualStrings(
+        "https://x/o?$filter=a%20eq%20'b'",
+        try encodeSpaces(a, "https://x/o?$filter=a eq 'b'"),
+    );
 }
 
 test "http source: cursor pagination follows token then stops" {
@@ -659,7 +1343,7 @@ test "http source: cursor pagination follows token then stops" {
     defer th.join();
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
-    const s = try HttpSource.open(a, url, .{ .items = "data", .paginate = .cursor });
+    const s = try HttpSource.open(a, std.testing.allocator, url, .{ .items = "data", .paginate = .cursor });
     defer s.close();
     try std.testing.expectEqual(@as(usize, 2), try drain(s, a));
     try std.testing.expect(std.mem.indexOf(u8, srv.captured[1][0..srv.captured_len[1]], "GET /items?cursor=t1") != null);
@@ -676,7 +1360,7 @@ test "http source: non-200 maps to permanent/transient errors" {
     const th = try std.Thread.spawn(.{}, serve404Once, .{&listener});
     defer th.join();
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/x", .{listener.listen_address.getPort()});
-    try std.testing.expectError(error.HttpNotFound, HttpSource.open(a, url, .{}));
+    try std.testing.expectError(error.HttpNotFound, HttpSource.open(a, std.testing.allocator, url, .{}));
 }
 
 fn serve404Once(listener: *std.net.Server) void {
