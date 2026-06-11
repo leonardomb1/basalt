@@ -38,16 +38,10 @@ pub const Diag = struct {
 };
 
 // --- cooperative cancellation (SIGTERM/SIGINT from the control plane) ---
-var g_abort = std.atomic.Value(bool).init(false);
-
-/// Ask the current run to stop at the next batch/item boundary. A single atomic
-/// store, so it is async-signal-safe — safe to call from a signal handler.
-pub fn requestAbort() void {
-    g_abort.store(true, .seq_cst);
-}
-pub fn aborting() bool {
-    return g_abort.load(.seq_cst);
-}
+// The flag itself lives in connect/driver.zig so connectors can check it
+// between network requests; these re-exports keep the public surface here.
+pub const requestAbort = driver.requestAbort;
+pub const aborting = driver.aborting;
 
 // SIGHUP → reload a multi-script server's script directory (control plane writes
 // updated scripts, then signals). Consumed (swapped back to false) by the server.
@@ -1482,7 +1476,7 @@ fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
     }
     if (std.mem.eql(u8, rd.connector, "http")) {
         if (rd.form != .path) return planErr(env.diag, "read http needs a quoted URL");
-        const s = httpsrc.HttpSource.open(env.arena, rd.form.path, httpsrc.optsFromHints(hints)) catch |e|
+        const s = httpsrc.HttpSource.open(env.arena, env.gpa, rd.form.path, httpsrc.optsFromHints(hints)) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "http read failed for `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
         return s.source();
     }
@@ -1494,6 +1488,17 @@ fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
     }
     const conn = env.connections.get(rd.connector) orelse
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown connection `{s}`", .{rd.connector}));
+    if (std.mem.eql(u8, conn.connector, "http")) {
+        if (rd.form != .path) return planErr(env.diag, "reading an http connection needs a quoted path");
+        const kvs = try env.arena.alloc(httpsrc.KV, conn.config.len);
+        for (conn.config, kvs) |attr, *kv| kv.* = .{ .key = attr.key, .value = try evalCfgStr(env, attr.value) };
+        var errmsg: []const u8 = "";
+        const cc = httpsrc.connFromKvs(env.arena, kvs, &errmsg) catch
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "http connection `{s}`: {s}", .{ rd.connector, errmsg }));
+        const s = httpsrc.HttpSource.openConn(env.arena, env.gpa, cc, rd.form.path, httpsrc.optsFromHints(hints)) catch |e|
+            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "http read failed for `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
+        return s.source();
+    }
     if (std.mem.eql(u8, conn.connector, "sqlserver")) {
         const cfg = try resolveDbConfig(env, conn, 1433);
         const query = try readSql(env, rd);
@@ -1688,7 +1693,7 @@ fn resolveSchema(ctx_ptr: *anyopaque, arena: std.mem.Allocator, rd: ast.Read, co
     // Same for `read http` — default options only (the resolver has no stage
     // hints), so auth-gated APIs come back unresolved rather than failing check.
     if (std.mem.eql(u8, rd.connector, "http") and rd.form == .path) {
-        const r = httpsrc.HttpSource.open(arena, rd.form.path, .{}) catch return null;
+        const r = httpsrc.HttpSource.open(arena, gpa, rd.form.path, .{}) catch return null;
         defer r.close();
         return r.schema.*;
     }

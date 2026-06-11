@@ -16,7 +16,10 @@ const server = @import("../server/http.zig");
 
 /// SIGTERM/SIGINT → ask the run to stop at its next boundary (async-signal-safe:
 /// one atomic store). The control plane uses this to cancel a job or roll a server.
+/// A second signal means "stop being graceful": exit 130 on the spot, so an
+/// interactive ^C ^C isn't held hostage by a slow upstream read.
 fn onTerminate(_: i32) callconv(.c) void {
+    if (runtime.aborting()) std.posix.exit(130);
     runtime.requestAbort();
 }
 
