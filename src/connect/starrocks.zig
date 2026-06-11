@@ -149,12 +149,19 @@ pub fn genLabel(arena: std.mem.Allocator, prefix: []const u8, table: []const u8,
     return std.fmt.allocPrint(arena, "{s}_{s}_{d}_{d}", .{ prefix, table, run_id, seq });
 }
 
-/// The comma-joined column list for the Stream Load `columns` header.
+/// The comma-joined column list for the Stream Load `columns` header. Names are
+/// backtick-quoted: source field names can contain spaces or symbols (e.g.
+/// payroll APIs emitting keys like "extra noturna 110"), which the header's
+/// SQL-ish parser would otherwise reject.
 pub fn columnList(arena: std.mem.Allocator, schema: types.Schema) ![]const u8 {
     var buf = std.array_list.Managed(u8).init(arena);
     for (schema.fields, 0..) |f, i| {
         if (i > 0) try buf.append(',');
-        try buf.appendSlice(f.name);
+        try buf.append('`');
+        for (f.name) |c| {
+            if (c != '`') try buf.append(c);
+        }
+        try buf.append('`');
     }
     return buf.toOwnedSlice();
 }
@@ -365,13 +372,16 @@ pub const StreamLoadSink = struct {
 
         var body_aw = std.Io.Writer.Allocating.init(self.gpa);
         defer body_aw.deinit();
-        const res = try self.client.fetch(.{
+        const res = self.client.fetch(.{
             .method = .PUT,
             .location = .{ .url = url },
             .extra_headers = hdrs.items,
             .payload = self.buffer.items,
             .response_writer = &body_aw.writer,
-        });
+        }) catch |e| {
+            std.debug.print("stream load PUT failed ({s}): {s} ({d} bytes)\n", .{ @errorName(e), url, self.buffer.items.len });
+            return e;
+        };
         const body = body_aw.writer.buffered();
         if (!loadSucceeded(body)) {
             std.debug.print("stream load failed (http {d}): {s}\n", .{ @intFromEnum(res.status), body });
@@ -477,7 +487,7 @@ test "label and column list" {
         .{ .name = "id", .ty = types.Type.init(.int) },
         .{ .name = "amount", .ty = types.Type.init(.int) },
     } };
-    try std.testing.expectEqualStrings("id,amount", try columnList(a, schema));
+    try std.testing.expectEqualStrings("`id`,`amount`", try columnList(a, schema));
 }
 
 test "writeSanitized replaces separator bytes embedded in data" {
