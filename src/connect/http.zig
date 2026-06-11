@@ -383,6 +383,11 @@ pub const Options = struct {
     /// this, one blip at page 400k of a long backfill restarts the whole run.
     retries: i64 = 2, // extra attempts per request (3 total, matching common practice)
     retry_base_ms: i64 = 500,
+    /// Extra status codes to treat as transient (comma-separated, e.g. "404,408").
+    /// For vendors that lie: iFractal answers 404 with "Erro ao conectar no banco
+    /// de dados" when ITS database is down. Listed codes retry with backoff and,
+    /// if they outlive the retry budget, exit 75 so the control plane re-runs.
+    retry_statuses: ?[]const u8 = null,
     /// page mode: dotted path to a "total pages" field in the response; when
     /// set, exactly that many pages are fetched. For APIs that never return an
     /// empty page (page-overrun keeps yielding data), where the empty-page
@@ -458,6 +463,8 @@ pub fn optsFromHints(hints: []const ast.Hint) Options {
             if (iv) |n| o.retries = n;
         } else if (std.mem.eql(u8, h.key, "retry_base_ms")) {
             if (iv) |n| o.retry_base_ms = n;
+        } else if (std.mem.eql(u8, h.key, "retry_statuses")) {
+            o.retry_statuses = sv;
         }
     }
     return o;
@@ -764,7 +771,7 @@ pub const HttpSource = struct {
             };
             const code = @intFromEnum(res.status);
             // Retry transient statuses in-thread too (worker = its own backoff).
-            if ((code == 429 or code >= 500) and attempt < self.opts.retries and !driver.aborting()) {
+            if ((code == 429 or code >= 500 or statusListed(self.opts.retry_statuses, code)) and attempt < self.opts.retries and !driver.aborting()) {
                 attempt += 1;
                 std.Thread.sleep(retryDelayNs(self.opts.retry_base_ms, attempt));
                 continue;
@@ -835,6 +842,7 @@ pub const HttpSource = struct {
         if (slot.code == 204) return self.finishEmpty();
         if (slot.code != 200) {
             std.debug.print("http {d} from {s}: {s}\n", .{ slot.code, slot.url, slot.body[0..@min(slot.body.len, 300)] });
+            if (statusListed(self.opts.retry_statuses, slot.code)) return error.HttpServerBusy;
             return statusError(slot.code);
         }
         // Parsed JSON slices into the source text, so the body must move into
@@ -886,6 +894,7 @@ pub const HttpSource = struct {
         if (code != 200) {
             const b = aw.writer.buffered();
             std.debug.print("http {d} from {s}: {s}\n", .{ code, req.url, b[0..@min(b.len, 300)] });
+            if (statusListed(self.opts.retry_statuses, code)) return error.HttpServerBusy;
             return statusError(code);
         }
         return aw.writer.buffered();
@@ -1006,6 +1015,18 @@ pub fn statusError(code: u16) anyerror {
         404 => error.HttpNotFound,
         else => error.HttpRequestFailed,
     };
+}
+
+/// Is `code` in a comma-separated status list ("404,408")?
+fn statusListed(list_opt: ?[]const u8, code: u16) bool {
+    const list = list_opt orelse return false;
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |part| {
+        const t = std.mem.trim(u8, part, " ");
+        const n = std.fmt.parseInt(u16, t, 10) catch continue;
+        if (n == code) return true;
+    }
+    return false;
 }
 
 /// Worth an in-place retry: server overload/restart or a dropped connection.
@@ -1534,6 +1555,39 @@ test "http source: transient 503 retries in place and succeeds" {
     const s = try HttpSource.open(a, std.testing.allocator, url, .{ .retries = 2, .retry_base_ms = 10 });
     defer s.close();
     try std.testing.expectEqual(@as(usize, 2), try drain(s, a));
+}
+
+test "retry_statuses treats a lying 404 as transient and retries through it" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const srv = try TestServer.start(&.{
+        "{\"success\":false,\"error_html\":\"Erro ao conectar no banco de dados.\"}",
+        \\[{"id":1}]
+    });
+    srv.statuses = &.{ "404 Not Found", "200 OK" };
+    defer srv.deinit();
+    const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+    defer th.join();
+
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/rest", .{srv.port()});
+    const s = try HttpSource.open(a, std.testing.allocator, url, .{
+        .retries = 2,
+        .retry_base_ms = 10,
+        .retry_statuses = "404",
+    });
+    defer s.close();
+    try std.testing.expectEqual(@as(usize, 1), try drain(s, a));
+}
+
+test "statusListed parses comma lists with spaces" {
+    try std.testing.expect(statusListed("404,408, 410", 404));
+    try std.testing.expect(statusListed("404,408, 410", 408));
+    try std.testing.expect(statusListed("404,408, 410", 410));
+    try std.testing.expect(!statusListed("404,408, 410", 500));
+    try std.testing.expect(!statusListed(null, 404));
+    try std.testing.expect(!statusListed("garbage,abc", 404));
 }
 
 test "joinUrl and encodeSpaces" {
