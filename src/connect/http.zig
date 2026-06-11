@@ -33,15 +33,83 @@ const ast = @import("../lang/ast.zig");
 const batchmod = @import("../exec/batch.zig");
 const driver = @import("driver.zig");
 const request = @import("request.zig");
+const tlsmod = @import("tls_client.zig");
 
 const Batch = batchmod.Batch;
 const json = std.json;
 
+/// std's verifier does no path building: it walks the server's chain strictly
+/// in presentation order, so a misordered chain (a depressingly common server
+/// misconfiguration) fails with CertificateIssuerMismatch even though every
+/// certificate is valid. This fixes that out-of-band: harvest the chain over an
+/// unverified handshake, then add to the bundle each presented certificate that
+/// itself verifies against a certificate already in the bundle, repeating until
+/// a fixpoint so order doesn't matter. Nothing gets trusted that doesn't chain
+/// to an existing root — this only reorders trust the server already earned.
+/// Returns true if the bundle gained at least one certificate.
+pub fn repairBundle(gpa: std.mem.Allocator, bundle: *std.crypto.Certificate.Bundle, host: []const u8, port: u16) bool {
+    var cap = tlsmod.ChainCapture{};
+    harvestChain(gpa, host, port, &cap) catch return false;
+    const now = std.time.timestamp();
+    var added_any = false;
+    var progress = true;
+    while (progress) {
+        progress = false;
+        for (0..cap.count) |i| {
+            if (cap.used[i]) continue;
+            const der = cap.bufs[i][0..cap.lens[i]];
+            const cert = std.crypto.Certificate{ .buffer = der, .index = 0 };
+            const parsed = cert.parse() catch {
+                cap.used[i] = true;
+                continue;
+            };
+            // Only admit certs whose issuer is already trusted.
+            bundle.verify(parsed, now) catch continue;
+            const start: u32 = @intCast(bundle.bytes.items.len);
+            bundle.bytes.appendSlice(gpa, der) catch return added_any;
+            bundle.parseCert(gpa, start, now) catch return added_any;
+            cap.used[i] = true;
+            progress = true;
+            added_any = true;
+        }
+    }
+    return added_any;
+}
+
+/// Capture the certificate chain a server presents, trusting nothing: the
+/// hostname is still sent and checked (we need SNI to reach the right vhost)
+/// but the CA path is not verified.
+fn harvestChain(gpa: std.mem.Allocator, host: []const u8, port: u16, cap: *tlsmod.ChainCapture) !void {
+    const stream = try std.net.tcpConnectToHost(gpa, host, port);
+    defer stream.close();
+    var in_buf: [std.crypto.tls.max_ciphertext_record_len]u8 = undefined;
+    var out_buf: [std.crypto.tls.max_ciphertext_record_len]u8 = undefined;
+    var sr = stream.reader(&in_buf);
+    var sw = stream.writer(&out_buf);
+    var wbuf: [std.crypto.tls.max_ciphertext_record_len]u8 = undefined;
+    var rbuf: [std.crypto.tls.max_ciphertext_record_len * 2]u8 = undefined;
+    _ = try tlsmod.init(sr.interface(), &sw.interface, .{
+        .host = .{ .explicit = host },
+        .ca = .no_verification,
+        .chain = cap,
+        .write_buffer = &wbuf,
+        .read_buffer = &rbuf,
+    });
+}
+
+pub fn uriHost(uri: std.Uri) ?[]const u8 {
+    const c = uri.host orelse return null;
+    return switch (c) {
+        .raw => |s| s,
+        .percent_encoded => |s| s,
+    };
+}
+
 /// A std.http.Client with the CA store pre-loaded: system roots plus, when the
 /// BASALT_CA_BUNDLE env var names a PEM file, every certificate in it. That's
-/// the escape hatch for servers that send misordered or incomplete chains —
-/// std's verifier does no path building, so appending the missing intermediate
-/// lets the chain anchor at it (same trust model as `curl --cacert`).
+/// the manual override for chains the automatic repair can't fix (e.g. a server
+/// that omits its intermediate entirely — repair can only re-anchor what the
+/// server actually sends).
 pub fn initClient(gpa: std.mem.Allocator) std.http.Client {
     var client = std.http.Client{ .allocator = gpa };
     const path = std.process.getEnvVarOwned(gpa, "BASALT_CA_BUNDLE") catch return client;
@@ -135,6 +203,7 @@ pub const HttpSource = struct {
     next_url: ?[]const u8 = null, // cursor mode: resolved next request URL
     pages_fetched: i64 = 0,
     done: bool = false,
+    repaired: bool = false, // one trust-repair attempt per source
 
     pub fn open(arena: std.mem.Allocator, url: []const u8, opts: Options) !*HttpSource {
         const self = try arena.create(HttpSource);
@@ -151,13 +220,25 @@ pub const HttpSource = struct {
         errdefer self.client.deinit();
 
         const first_url = try self.pageUrl(arena);
-        const body = try self.fetchPage(arena, first_url);
-        const root = try json.parseFromSliceLeaky(json.Value, arena, body, .{});
-        const items = try itemsOf(arena, root, opts.items);
+        const page = try self.fetchParsed(arena, first_url);
+        const items = page.items;
         self.schema = try request.inferSchema(arena, items);
         self.first = try request.batchFromJson(arena, self.schema, items);
-        self.advance(arena, root, items.len) catch |e| return e;
+        self.advance(arena, page.root, items.len) catch |e| return e;
         return self;
+    }
+
+    const Page = struct { root: json.Value, items: []const json.Value };
+
+    /// Fetch one page and extract its rows. An empty body or a bare JSON `null`
+    /// (end-of-dataset markers in the wild, alongside http 204) yields no items.
+    fn fetchParsed(self: *HttpSource, arena: std.mem.Allocator, url: []const u8) !Page {
+        const body = try self.fetchPage(arena, url);
+        const trimmed = std.mem.trim(u8, body, " \t\r\n");
+        if (trimmed.len == 0) return .{ .root = .null, .items = &.{} };
+        const root = try json.parseFromSliceLeaky(json.Value, arena, trimmed, .{});
+        if (root == .null) return .{ .root = .null, .items = &.{} };
+        return .{ .root = root, .items = try itemsOf(arena, root, self.opts.items) };
     }
 
     /// Per-page bookkeeping: decide whether another page exists and what its URL is.
@@ -224,6 +305,28 @@ pub const HttpSource = struct {
     }
 
     fn fetchPage(self: *HttpSource, arena: std.mem.Allocator, url: []const u8) ![]const u8 {
+        return self.fetchPageRaw(arena, url) catch |e| switch (e) {
+            // Likely a misordered server chain: rebuild trust from the chain
+            // itself (repairBundle) and retry once.
+            error.TlsInitializationFailed => {
+                if (!self.tryRepair(url)) return e;
+                return self.fetchPageRaw(arena, url);
+            },
+            else => e,
+        };
+    }
+
+    fn tryRepair(self: *HttpSource, url: []const u8) bool {
+        if (self.repaired) return false;
+        self.repaired = true;
+        const uri = std.Uri.parse(url) catch return false;
+        const h = uriHost(uri) orelse return false;
+        if (!repairBundle(self.arena, &self.client.ca_bundle, h, uri.port orelse 443)) return false;
+        self.client.next_https_rescan_certs = false;
+        return true;
+    }
+
+    fn fetchPageRaw(self: *HttpSource, arena: std.mem.Allocator, url: []const u8) ![]const u8 {
         var aw = std.Io.Writer.Allocating.init(arena);
         const res = try self.client.fetch(.{
             .method = .GET,
@@ -232,10 +335,13 @@ pub const HttpSource = struct {
             .response_writer = &aw.writer,
         });
         const code = @intFromEnum(res.status);
+        // 204 = no content: some OData servers (e.g. Ivanti) signal "past the
+        // end of the dataset" this way instead of an empty `value` array.
+        if (code == 204) return "";
         if (code != 200) {
-            // Same contract as the CSV-over-HTTP source: 429/5xx are worth a
-            // control-plane retry (exit 75); other non-200s are config/auth.
-            return if (code == 429 or code >= 500) error.HttpServerBusy else error.HttpRequestFailed;
+            const b = aw.writer.buffered();
+            std.debug.print("http {d} from {s}: {s}\n", .{ code, url, b[0..@min(b.len, 300)] });
+            return statusError(code);
         }
         return aw.writer.buffered();
     }
@@ -247,12 +353,10 @@ pub const HttpSource = struct {
         }
         if (self.done) return null;
         const url = try self.pageUrl(arena);
-        const body = try self.fetchPage(arena, url);
-        const root = try json.parseFromSliceLeaky(json.Value, arena, body, .{});
-        const items = try itemsOf(arena, root, self.opts.items);
-        try self.advance(arena, root, items.len);
-        if (items.len == 0) return null;
-        return try request.batchFromJson(arena, self.schema, items);
+        const page = try self.fetchParsed(arena, url);
+        try self.advance(arena, page.root, page.items.len);
+        if (page.items.len == 0) return null;
+        return try request.batchFromJson(arena, self.schema, page.items);
     }
 
     pub fn close(self: *HttpSource) void {
@@ -334,6 +438,22 @@ fn withParam(arena: std.mem.Allocator, base: []const u8, key: []const u8, val: [
     return std.fmt.allocPrint(arena, "{s}{c}{s}={s}", .{ base, sep, key, val });
 }
 
+/// Map a non-200 status to a named error so failures are diagnosable from the
+/// error name alone. 429/5xx are worth a control-plane retry (exit 75); the
+/// 4xx family is config/auth — distinct names because each means a different
+/// fix (401: token expired mid-run -> re-auth + retry the step; 400: the
+/// server rejected the request, e.g. deep $skip paging).
+pub fn statusError(code: u16) anyerror {
+    if (code == 429 or code >= 500) return error.HttpServerBusy;
+    return switch (code) {
+        400 => error.HttpBadRequest,
+        401 => error.HttpUnauthorized,
+        403 => error.HttpForbidden,
+        404 => error.HttpNotFound,
+        else => error.HttpRequestFailed,
+    };
+}
+
 const source_vtable = driver.Source.VTable{ .schema = srcSchema, .next = srcNext, .close = srcClose };
 fn srcSchema(ptr: *anyopaque) types.Schema {
     const self: *HttpSource = @ptrCast(@alignCast(ptr));
@@ -370,6 +490,7 @@ test "optsFromHints maps hint keys" {
 const TestServer = struct {
     listener: std.net.Server,
     responses: []const []const u8,
+    statuses: ?[]const []const u8 = null, // per-response status lines; null = all "200 OK"
     captured: [4][2048]u8 = undefined,
     captured_len: [4]usize = .{ 0, 0, 0, 0 },
 
@@ -396,7 +517,8 @@ const TestServer = struct {
                 _ = try conn.stream.read(&sink);
             }
             var wb: [256]u8 = undefined;
-            const head = try std.fmt.bufPrint(&wb, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n", .{body.len});
+            const status = if (self.statuses) |st| st[i] else "200 OK";
+            const head = try std.fmt.bufPrint(&wb, "HTTP/1.1 {s}\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n", .{ status, body.len });
             try conn.stream.writeAll(head);
             try conn.stream.writeAll(body);
         }
@@ -495,6 +617,33 @@ test "http source: offset pagination advances $skip by page_size, raw auth sent"
     try std.testing.expect(std.mem.indexOf(u8, srv.captured[0][0..srv.captured_len[0]], "Authorization: session-tok-xyz") != null);
 }
 
+test "http source: 204 past the end of the dataset ends the stream cleanly" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const srv = try TestServer.start(&.{
+        \\{"value":[{"RecId":"a"},{"RecId":"b"}]}
+        ,
+        "",
+    });
+    srv.statuses = &.{ "200 OK", "204 No Content" };
+    defer srv.deinit();
+    const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+    defer th.join();
+
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+    const s = try HttpSource.open(a, url, .{
+        .items = "value",
+        .paginate = .offset,
+        .page_param = "$skip",
+        .size_param = "$top",
+        .page_size = 100,
+    });
+    defer s.close();
+    try std.testing.expectEqual(@as(usize, 2), try drain(s, a));
+}
+
 test "http source: cursor pagination follows token then stops" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -527,7 +676,7 @@ test "http source: non-200 maps to permanent/transient errors" {
     const th = try std.Thread.spawn(.{}, serve404Once, .{&listener});
     defer th.join();
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/x", .{listener.listen_address.getPort()});
-    try std.testing.expectError(error.HttpRequestFailed, HttpSource.open(a, url, .{}));
+    try std.testing.expectError(error.HttpNotFound, HttpSource.open(a, url, .{}));
 }
 
 fn serve404Once(listener: *std.net.Server) void {

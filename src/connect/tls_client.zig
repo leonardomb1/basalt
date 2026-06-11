@@ -137,6 +137,27 @@ pub const Options = struct {
     read_buffer: []u8,
     /// Populated when `error.TlsAlert` is returned from `init`.
     alert: ?*tls.Alert = null,
+    /// When set, the raw DER of every certificate the server presents is copied
+    /// here during the handshake (in presentation order). Combine with
+    /// `.ca = .no_verification` to harvest a chain for out-of-band path building
+    /// (see http.zig repairBundle) — capture alone grants no trust.
+    chain: ?*ChainCapture = null,
+};
+
+/// Fixed-capacity sink for a server's presented certificate chain. Certs larger
+/// than a slot or beyond capacity are silently skipped (repair just degrades).
+pub const ChainCapture = struct {
+    bufs: [8][4096]u8 = undefined,
+    lens: [8]usize = @splat(0),
+    used: [8]bool = @splat(false),
+    count: usize = 0,
+
+    pub fn add(self: *ChainCapture, der: []const u8) void {
+        if (self.count >= self.bufs.len or der.len > self.bufs[self.count].len) return;
+        @memcpy(self.bufs[self.count][0..der.len], der);
+        self.lens[self.count] = der.len;
+        self.count += 1;
+    }
 };
 
 const InitError = error{
@@ -649,6 +670,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 .index = @intCast(certd.idx),
                             };
                             const subject = try subject_cert.parse();
+                            if (options.chain) |cap| cap.add(certd.buf[certd.idx..][0..cert_size]);
                             if (cert_index == 0) {
                                 // Verify the host on the first certificate.
                                 switch (options.host) {
@@ -659,14 +681,19 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 // Keep track of the public key for the
                                 // certificate_verify message later.
                                 try main_cert_pub_key.init(subject.pub_key_algo, subject.pubKey());
-                            } else {
+                            } else if (options.ca != .no_verification) {
+                                // Chain-order check is part of trust verification;
+                                // skipped under no_verification so a capture pass can
+                                // see the whole chain even when it's misordered.
                                 try prev_cert.verify(subject, now_sec);
                             }
 
                             switch (options.ca) {
                                 .no_verification => {
                                     handshake_state = .trust_chain_established;
-                                    break :cert;
+                                    // keep iterating when capturing: the rest of the
+                                    // chain is in this same message.
+                                    if (options.chain == null) break :cert;
                                 },
                                 .self_signed => {
                                     try subject.verify(subject, now_sec);

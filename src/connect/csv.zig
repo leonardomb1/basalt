@@ -67,16 +67,20 @@ pub const CsvReader = struct {
             hf.* = .{ .client = httpx.initClient(arena), .req = undefined, .response = undefined };
             errdefer hf.client.deinit();
             const uri = std.Uri.parse(path) catch return error.InvalidUrl;
-            hf.req = try hf.client.request(.GET, uri, .{});
+            startHttp(hf, uri) catch |e| switch (e) {
+                // Likely a misordered server chain: rebuild trust from the chain
+                // itself and retry once (see http.zig repairBundle).
+                error.TlsInitializationFailed => {
+                    const h = httpx.uriHost(uri) orelse return e;
+                    if (!httpx.repairBundle(arena, &hf.client.ca_bundle, h, uri.port orelse 443)) return e;
+                    hf.client.next_https_rescan_certs = false;
+                    try startHttp(hf, uri);
+                },
+                else => return e,
+            };
             errdefer hf.req.deinit();
-            try hf.req.sendBodiless();
-            hf.response = try hf.req.receiveHead(&hf.redirect_buf);
             const code = @intFromEnum(hf.response.head.status);
-            if (code != 200) {
-                // 429/5xx are worth a control-plane retry (exit 75); other non-200s
-                // are a bad URL or auth (e.g. expired SAS token) — retrying won't help.
-                return if (code == 429 or code >= 500) error.HttpServerBusy else error.HttpRequestFailed;
-            }
+            if (code != 200) return httpx.statusError(code);
             self.backend = .{ .http = hf };
             // Servers may force gzip/zstd regardless of what we asked for (GitHub
             // does); route through the decompressing reader, which is a passthrough
@@ -140,6 +144,13 @@ pub const CsvReader = struct {
 
     pub fn source(self: *CsvReader) driver.Source {
         return .{ .ptr = self, .vtable = &source_vtable };
+    }
+
+    fn startHttp(hf: *HttpFetch, uri: std.Uri) !void {
+        hf.req = try hf.client.request(.GET, uri, .{});
+        errdefer hf.req.deinit();
+        try hf.req.sendBodiless();
+        hf.response = try hf.req.receiveHead(&hf.redirect_buf);
     }
 
     fn readLine(self: *CsvReader) !?[]const u8 {
@@ -347,7 +358,7 @@ test "CsvReader maps http status: 4xx permanent, 5xx transient" {
         const th = try std.Thread.spawn(.{}, serveOnce, .{ &listener, "404 Not Found", "nope" });
         defer th.join();
         const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/missing.csv", .{listener.listen_address.getPort()});
-        try std.testing.expectError(error.HttpRequestFailed, CsvReader.open(a, url));
+        try std.testing.expectError(error.HttpNotFound, CsvReader.open(a, url));
     }
     {
         const addr = try std.net.Address.parseIp("127.0.0.1", 0);
