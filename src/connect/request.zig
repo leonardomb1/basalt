@@ -43,35 +43,47 @@ pub const RequestSource = struct {
             else => return error.ExpectedJsonArrayOrObject,
         };
 
-        var fields = std.array_list.Managed(types.Schema.Field).init(arena);
-        if (items.len > 0 and items[0] == .object) {
-            const obj = items[0].object;
-            for (obj.keys()) |k| {
-                try fields.append(.{ .name = k, .ty = inferType(obj.get(k).?) });
-            }
-        }
-        const schema = try arena.create(types.Schema);
-        schema.* = .{ .fields = try fields.toOwnedSlice() };
-        self.schema = schema;
-
-        const builders = try arena.alloc(column.Builder, schema.fields.len);
-        for (builders, schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
-        for (items) |row| {
-            const obj: ?json.ObjectMap = if (row == .object) row.object else null;
-            for (schema.fields, 0..) |f, ci| {
-                const jv: ?json.Value = if (obj) |o| o.get(f.name) else null;
-                try builders[ci].append(try coerce(arena, jv, f.ty));
-            }
-        }
-        const cols = try arena.alloc(column.Column, schema.fields.len);
-        for (builders, 0..) |*b, k| cols[k] = try b.finish();
-        self.batch = .{ .schema = schema, .columns = cols, .len = items.len };
+        self.schema = try inferSchema(arena, items);
+        self.batch = try batchFromJson(arena, self.schema, items);
     }
 
     pub fn source(self: *RequestSource) driver.Source {
         return .{ .ptr = self, .vtable = &source_vtable };
     }
 };
+
+/// Schema from the first object's keys and value types (int/float/bool/string,
+/// all nullable). Shared by `read request` and `read http`.
+pub fn inferSchema(arena: std.mem.Allocator, items: []const json.Value) !*types.Schema {
+    var fields = std.array_list.Managed(types.Schema.Field).init(arena);
+    if (items.len > 0 and items[0] == .object) {
+        const obj = items[0].object;
+        for (obj.keys()) |k| {
+            try fields.append(.{ .name = try arena.dupe(u8, k), .ty = inferType(obj.get(k).?) });
+        }
+    }
+    const schema = try arena.create(types.Schema);
+    schema.* = .{ .fields = try fields.toOwnedSlice() };
+    return schema;
+}
+
+/// One batch from an array of JSON objects, coerced to `schema`. Fields missing
+/// from an object become null; fields not in the schema are dropped (keeps later
+/// REST pages with drifting keys from breaking the run).
+pub fn batchFromJson(arena: std.mem.Allocator, schema: *types.Schema, items: []const json.Value) !Batch {
+    const builders = try arena.alloc(column.Builder, schema.fields.len);
+    for (builders, schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
+    for (items) |row| {
+        const obj: ?json.ObjectMap = if (row == .object) row.object else null;
+        for (schema.fields, 0..) |f, ci| {
+            const jv: ?json.Value = if (obj) |o| o.get(f.name) else null;
+            try builders[ci].append(try coerce(arena, jv, f.ty));
+        }
+    }
+    const cols = try arena.alloc(column.Column, schema.fields.len);
+    for (builders, 0..) |*b, k| cols[k] = try b.finish();
+    return .{ .schema = schema, .columns = cols, .len = items.len };
+}
 
 fn inferType(v: json.Value) types.Type {
     return (switch (v) {

@@ -573,7 +573,7 @@ fn printSchema(w: anytype, indent: []const u8, schema: ?types.Schema) !void {
 // ---------------------------------------------------------------------------
 
 fn isBuiltinSource(connector: []const u8) bool {
-    return std.mem.eql(u8, connector, "csv") or std.mem.eql(u8, connector, "request");
+    return std.mem.eql(u8, connector, "csv") or std.mem.eql(u8, connector, "request") or std.mem.eql(u8, connector, "http");
 }
 
 fn isSqlConnector(connector: []const u8) bool {
@@ -603,9 +603,12 @@ fn splittableRead(node: ast.Stage.Node) bool {
 /// Offline schema resolution: CSV header is local; everything else is unresolved.
 fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read) ?types.Schema {
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
+        // URL CSVs are a network fetch — plain `check` stays offline (schema
+        // unknown, like DB sources without --connect); `check --connect` resolves them.
+        if (csv.CsvReader.isUrl(rd.form.path)) return null;
         const reader = csv.CsvReader.open(arena, rd.form.path) catch return null;
         const schema = reader.schema;
-        reader.file.close();
+        reader.close();
         return schema;
     }
     return null;

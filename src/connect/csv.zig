@@ -10,6 +10,7 @@ const batchmod = @import("../exec/batch.zig");
 const valuemod = @import("../exec/value.zig");
 const eval = @import("../exec/eval.zig");
 const driver = @import("driver.zig");
+const httpx = @import("http.zig");
 
 const Batch = batchmod.Batch;
 const Value = valuemod.Value;
@@ -21,21 +22,75 @@ const LINE_BUF = 64 * 1024;
 
 pub const CsvReader = struct {
     arena: std.mem.Allocator,
-    file: std.fs.File,
+    backend: Backend,
     read_buf: [LINE_BUF]u8 = undefined,
-    fr: std.fs.File.Reader = undefined,
+    /// Line source, independent of where bytes come from: points at the file
+    /// reader's interface or the HTTP response body reader.
+    rdr: *std.Io.Reader = undefined,
     schema: types.Schema,
     done: bool = false,
+
+    const Backend = union(enum) {
+        file: FileBackend,
+        http: *HttpFetch,
+    };
+    const FileBackend = struct {
+        file: std.fs.File,
+        fr: std.fs.File.Reader,
+    };
+    /// The live HTTP request whose body the reader streams from. Separate
+    /// allocation: Request/Response hold internal pointers, so they are built
+    /// in place here and never moved.
+    const HttpFetch = struct {
+        client: std.http.Client,
+        req: std.http.Client.Request,
+        response: std.http.Client.Response,
+        decompress: std.http.Decompress = undefined,
+        redirect_buf: [8 * 1024]u8 = undefined,
+        transfer_buf: [LINE_BUF]u8 = undefined,
+    };
+
+    pub fn isUrl(path: []const u8) bool {
+        return std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://");
+    }
 
     pub fn open(arena: std.mem.Allocator, path: []const u8) !*CsvReader {
         const self = try arena.create(CsvReader);
         self.* = .{
             .arena = arena,
-            .file = try std.fs.cwd().openFile(path, .{}),
+            .backend = undefined,
             .schema = undefined,
             .done = false,
         };
-        self.fr = self.file.reader(&self.read_buf);
+        if (isUrl(path)) {
+            const hf = try arena.create(HttpFetch);
+            hf.* = .{ .client = httpx.initClient(arena), .req = undefined, .response = undefined };
+            errdefer hf.client.deinit();
+            const uri = std.Uri.parse(path) catch return error.InvalidUrl;
+            hf.req = try hf.client.request(.GET, uri, .{});
+            errdefer hf.req.deinit();
+            try hf.req.sendBodiless();
+            hf.response = try hf.req.receiveHead(&hf.redirect_buf);
+            const code = @intFromEnum(hf.response.head.status);
+            if (code != 200) {
+                // 429/5xx are worth a control-plane retry (exit 75); other non-200s
+                // are a bad URL or auth (e.g. expired SAS token) — retrying won't help.
+                return if (code == 429 or code >= 500) error.HttpServerBusy else error.HttpRequestFailed;
+            }
+            self.backend = .{ .http = hf };
+            // Servers may force gzip/zstd regardless of what we asked for (GitHub
+            // does); route through the decompressing reader, which is a passthrough
+            // for identity. The window buffer is sized per negotiated encoding.
+            const ce = hf.response.head.content_encoding;
+            if (ce == .compress) return error.UnsupportedCompressionMethod;
+            const win = ce.minBufferCapacity();
+            const dbuf: []u8 = if (win > 0) try arena.alloc(u8, win) else &.{};
+            self.rdr = hf.response.readerDecompressing(&hf.transfer_buf, &hf.decompress, dbuf);
+        } else {
+            self.backend = .{ .file = .{ .file = try std.fs.cwd().openFile(path, .{}), .fr = undefined } };
+            self.backend.file.fr = self.backend.file.file.reader(&self.read_buf);
+            self.rdr = &self.backend.file.fr.interface;
+        }
 
         const header = (try self.readLine()) orelse return error.EmptyCsv;
         var fields = std.array_list.Managed(types.Schema.Field).init(arena);
@@ -74,7 +129,13 @@ pub const CsvReader = struct {
     }
 
     pub fn close(self: *CsvReader) void {
-        self.file.close();
+        switch (self.backend) {
+            .file => |f| f.file.close(),
+            .http => |hf| {
+                hf.req.deinit();
+                hf.client.deinit();
+            },
+        }
     }
 
     pub fn source(self: *CsvReader) driver.Source {
@@ -84,7 +145,7 @@ pub const CsvReader = struct {
     fn readLine(self: *CsvReader) !?[]const u8 {
         // Returns a slice into the reader's buffer (invalidated on the next read);
         // safe because `column.Builder.append` dupes string values into the arena.
-        const line = (try self.fr.interface.takeDelimiter('\n')) orelse return null;
+        const line = (try self.rdr.takeDelimiter('\n')) orelse return null;
         var s: []const u8 = line;
         if (s.len > 0 and s[s.len - 1] == '\r') s = s[0 .. s.len - 1];
         return s;
@@ -225,4 +286,76 @@ fn needsQuote(s: []const u8) bool {
         if (c == ',' or c == '"' or c == '\n' or c == '\r') return true;
     }
     return false;
+}
+
+// --- tests ---------------------------------------------------------------
+
+/// Accept one connection, swallow the request, write a canned HTTP response.
+fn serveOnce(listener: *std.net.Server, status_line: []const u8, body: []const u8) void {
+    serveOnceInner(listener, status_line, body) catch {};
+}
+fn serveOnceInner(listener: *std.net.Server, status_line: []const u8, body: []const u8) !void {
+    const conn = try listener.accept();
+    defer conn.stream.close();
+    var rb: [4096]u8 = undefined;
+    _ = try conn.stream.read(&rb);
+    var wb: [512]u8 = undefined;
+    const head = try std.fmt.bufPrint(
+        &wb,
+        "HTTP/1.1 {s}\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n",
+        .{ status_line, body.len },
+    );
+    try conn.stream.writeAll(head);
+    try conn.stream.writeAll(body);
+}
+
+test "CsvReader streams a CSV over http" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var listener = try addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+    const th = try std.Thread.spawn(.{}, serveOnce, .{ &listener, "200 OK", "id,name\n1,alpha\n2,beta\n" });
+    defer th.join();
+
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/data.csv", .{listener.listen_address.getPort()});
+    const r = try CsvReader.open(a, url);
+    defer r.close();
+    try std.testing.expectEqual(@as(usize, 2), r.schema.fields.len);
+    try std.testing.expectEqualStrings("id", r.schema.fields[0].name);
+    try std.testing.expectEqualStrings("name", r.schema.fields[1].name);
+
+    const b = (try r.next(a)).?;
+    try std.testing.expectEqual(@as(usize, 2), b.len);
+    try std.testing.expectEqualStrings("1", b.columns[0].getValue(0).string);
+    try std.testing.expectEqualStrings("alpha", b.columns[1].getValue(0).string);
+    try std.testing.expectEqualStrings("beta", b.columns[1].getValue(1).string);
+    try std.testing.expect((try r.next(a)) == null);
+}
+
+test "CsvReader maps http status: 4xx permanent, 5xx transient" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    {
+        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var listener = try addr.listen(.{ .reuse_address = true });
+        defer listener.deinit();
+        const th = try std.Thread.spawn(.{}, serveOnce, .{ &listener, "404 Not Found", "nope" });
+        defer th.join();
+        const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/missing.csv", .{listener.listen_address.getPort()});
+        try std.testing.expectError(error.HttpRequestFailed, CsvReader.open(a, url));
+    }
+    {
+        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var listener = try addr.listen(.{ .reuse_address = true });
+        defer listener.deinit();
+        const th = try std.Thread.spawn(.{}, serveOnce, .{ &listener, "503 Service Unavailable", "busy" });
+        defer th.join();
+        const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/data.csv", .{listener.listen_address.getPort()});
+        try std.testing.expectError(error.HttpServerBusy, CsvReader.open(a, url));
+    }
 }

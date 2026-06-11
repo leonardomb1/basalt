@@ -18,6 +18,7 @@ const mysql = @import("../connect/mysql.zig");
 const postgres = @import("../connect/postgres.zig");
 const sql = @import("../connect/sql.zig");
 const request = @import("../connect/request.zig");
+const httpsrc = @import("../connect/http.zig");
 const splitmod = @import("../connect/split.zig");
 const parallel = @import("parallel.zig");
 const analyze = @import("analyze.zig");
@@ -71,6 +72,7 @@ pub fn isTransient(e: anyerror) bool {
         error.TemporaryNameServerFailure,
         error.NameServerFailure,
         error.HostLacksNetworkAddresses,
+        error.HttpServerBusy, // http source: 429 / 5xx
         => true,
         else => false,
     };
@@ -652,7 +654,7 @@ const Row = []const []const u8;
 /// text (strings/ints; null → ""). The list is small — a table catalog — so it is
 /// fully materialized into the plan arena.
 fn discoverRows(env: *Env, src_read: ast.Read, ncols: usize) ![]const Row {
-    const src = openSource(env, src_read) catch |e|
+    const src = openSource(env, src_read, &.{}) catch |e|
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each discovery failed: {s}", .{@errorName(e)}));
     defer src.close();
     var rows = std.array_list.Managed(Row).init(env.arena);
@@ -1079,7 +1081,7 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
 /// Resolve a sink/source connector name to its driver type for the summary
 /// (`csv`/`request` are types; a connection name maps to its `connector`).
 fn connectorType(env: *Env, name: []const u8) []const u8 {
-    if (std.mem.eql(u8, name, "csv") or std.mem.eql(u8, name, "request")) return name;
+    if (std.mem.eql(u8, name, "csv") or std.mem.eql(u8, name, "request") or std.mem.eql(u8, name, "http")) return name;
     if (env.connections.get(name)) |c| return c.connector;
     return name;
 }
@@ -1094,7 +1096,7 @@ fn buildPipeline(env: *Env, stages: []const ast.Stage) anyerror!PipeRes {
 
     switch (stages[0].node) {
         .read => |rd| {
-            const raw = try openSource(env, rd);
+            const raw = try openSource(env, rd, stages[0].hints);
             // Count rows read through every source without per-operator wiring.
             const cs = try env.arena.create(obs.CountingSource);
             cs.* = .{ .inner = raw, .count = env.rows_read };
@@ -1292,7 +1294,7 @@ fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint) anyerror!PipeRes
     const children = try arena.alloc(op.Op, specs.len);
     const schemas = try arena.alloc(types.Schema, specs.len);
     for (specs, 0..) |s, i| {
-        const raw = try openSource(env, s.read);
+        const raw = try openSource(env, s.read, hints);
         const cs = try arena.create(obs.CountingSource);
         cs.* = .{ .inner = raw, .count = env.rows_read };
         const src = cs.source();
@@ -1333,7 +1335,7 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
     // the canon must be known before any branch runs.
     const schemas = try arena.alloc(types.Schema, specs.len);
     for (specs, schemas) |s, *sch| {
-        const src = try openSource(env, s.read);
+        const src = try openSource(env, s.read, hints);
         sch.* = try dupeSchema(arena, src.schema());
         src.close();
     }
@@ -1470,7 +1472,7 @@ fn buildJoin(env: *Env, j: ast.Join, left_schema: types.Schema, probe: op.Op) an
     return .{ .op = .{ .join = o }, .schema = out.* };
 }
 
-fn openSource(env: *Env, rd: ast.Read) !driver.Source {
+fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
     if (std.mem.eql(u8, rd.connector, "request")) {
         const body = env.request_body orelse
             return planErr(env.diag, "`read request` is only available when serving HTTP (@http)");
@@ -1478,10 +1480,16 @@ fn openSource(env: *Env, rd: ast.Read) !driver.Source {
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "could not parse request body as JSON: {s}", .{@errorName(e)}));
         return s.source();
     }
+    if (std.mem.eql(u8, rd.connector, "http")) {
+        if (rd.form != .path) return planErr(env.diag, "read http needs a quoted URL");
+        const s = httpsrc.HttpSource.open(env.arena, rd.form.path, httpsrc.optsFromHints(hints)) catch |e|
+            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "http read failed for `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
+        return s.source();
+    }
     if (std.mem.eql(u8, rd.connector, "csv")) {
         if (rd.form != .path) return planErr(env.diag, "read csv needs a quoted path");
-        const reader = csv.CsvReader.open(env.arena, rd.form.path) catch
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "could not open input CSV `{s}`", .{rd.form.path}));
+        const reader = csv.CsvReader.open(env.arena, rd.form.path) catch |e|
+            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open input CSV `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
         return reader.source();
     }
     const conn = env.connections.get(rd.connector) orelse
@@ -1669,6 +1677,21 @@ fn sqlConnInfo(conn: ast.Connection) ?SqlConnInfo {
 
 fn resolveSchema(ctx_ptr: *anyopaque, arena: std.mem.Allocator, rd: ast.Read, conn_opt: ?ast.Connection) anyerror!?types.Schema {
     const gpa = @as(*std.mem.Allocator, @ptrCast(@alignCast(ctx_ptr))).*;
+    // A URL CSV is a network source: its schema is only resolvable when the user
+    // opted into connecting (this resolver IS the --connect path). Fetch the
+    // header, then drop the connection.
+    if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path and csv.CsvReader.isUrl(rd.form.path)) {
+        const r = csv.CsvReader.open(arena, rd.form.path) catch return null;
+        defer r.close();
+        return r.schema;
+    }
+    // Same for `read http` — default options only (the resolver has no stage
+    // hints), so auth-gated APIs come back unresolved rather than failing check.
+    if (std.mem.eql(u8, rd.connector, "http") and rd.form == .path) {
+        const r = httpsrc.HttpSource.open(arena, rd.form.path, .{}) catch return null;
+        defer r.close();
+        return r.schema.*;
+    }
     const conn = conn_opt orelse return null;
     const info = sqlConnInfo(conn) orelse return null;
     const cfg = dbConfigOf(arena, conn, info.port) orelse return null;
