@@ -1505,6 +1505,7 @@ fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
         if (rd.form != .path) return planErr(env.diag, "read http needs a quoted URL");
         const s = httpsrc.HttpSource.open(env.arena, env.gpa, rd.form.path, httpsrc.optsFromHints(hints)) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "http read failed for `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
+        s.logger = env.log;
         return s.source();
     }
     if (std.mem.eql(u8, rd.connector, "csv")) {
@@ -1524,6 +1525,7 @@ fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "http connection `{s}`: {s}", .{ rd.connector, errmsg }));
         const s = httpsrc.HttpSource.openConn(env.arena, env.gpa, cc, rd.form.path, httpsrc.optsFromHints(hints)) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "http read failed for `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
+        s.logger = env.log;
         return s.source();
     }
     if (std.mem.eql(u8, conn.connector, "sqlserver")) {
