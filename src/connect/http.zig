@@ -51,6 +51,7 @@ const batchmod = @import("../exec/batch.zig");
 const driver = @import("driver.zig");
 const request = @import("request.zig");
 const tlsmod = @import("tls_client.zig");
+const obs = @import("../runtime/obs.zig");
 
 const Batch = batchmod.Batch;
 const json = std.json;
@@ -507,6 +508,9 @@ pub const HttpSource = struct {
     issue_done: bool = false,
     auth_gen: u32 = 0, // bumped on re-login so stale-token slots retry without a second login
     total_pages: ?i64 = null, // from total_field on the first response
+    /// Set by the runtime after open(): heartbeats go through the structured
+    /// logger (JSON-safe, level-gated). Null (tests/probes) falls back to stderr.
+    logger: ?*obs.Logger = null,
     rows_done: u64 = 0,
     pages_done: i64 = 0,
     last_progress_ms: i64 = 0,
@@ -615,7 +619,13 @@ pub const HttpSource = struct {
         }
         if (now - self.last_progress_ms < self.opts.progress_ms) return;
         self.last_progress_ms = now;
-        if (self.total_pages) |t| {
+        if (self.logger) |lg| {
+            if (self.total_pages) |t| {
+                lg.log(.info, "http: pages {d}/{d}, rows {d}", .{ self.pages_done, t, self.rows_done });
+            } else {
+                lg.log(.info, "http: pages {d}, rows {d}", .{ self.pages_done, self.rows_done });
+            }
+        } else if (self.total_pages) |t| {
             std.debug.print("[http] pages {d}/{d}, rows {d}\n", .{ self.pages_done, t, self.rows_done });
         } else {
             std.debug.print("[http] pages {d}, rows {d}\n", .{ self.pages_done, self.rows_done });
