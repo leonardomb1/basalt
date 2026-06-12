@@ -24,21 +24,7 @@ pub const STREAM_ROWS = 4096;
 /// did not report a SQL error). Server-sent errors (PgQueryFailed etc.) are
 /// permanent and never retried.
 pub fn transientNet(e: anyerror) bool {
-    return switch (e) {
-        error.ConnectionRefused,
-        error.ConnectionTimedOut,
-        error.ConnectionResetByPeer,
-        error.NetworkUnreachable,
-        error.HostUnreachable,
-        error.BrokenPipe,
-        error.EndOfStream,
-        error.ReadFailed,
-        error.WriteFailed,
-        error.UnexpectedConnectFailure,
-        error.TemporaryNameServerFailure,
-        => true,
-        else => false,
-    };
+    return driver.transientNet(e);
 }
 
 // ---------------------------------------------------------------------------

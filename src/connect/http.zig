@@ -383,7 +383,8 @@ pub const Options = struct {
     /// this, one blip at page 400k of a long backfill restarts the whole run.
     retries: i64 = 2, // extra attempts per request (3 total, matching common practice)
     retry_base_ms: i64 = 500,
-    /// Per-page deadline (ms) for prefetched fetches; 0 disables. A request
+    /// Per-page deadline (ms) for page fetches (both sequential and prefetched
+    /// paths); 0 disables. A request
     /// that black-holes (no reset, just silence) is abandoned at the deadline
     /// and surfaces as ConnectionTimedOut (transient). The blocked worker
     /// thread can't be interrupted — it frees itself if the server ever
@@ -730,7 +731,10 @@ pub const HttpSource = struct {
                     std.Thread.sleep(retryDelayNs(self.opts.retry_base_ms, attempt));
                     continue;
                 }
-                return e;
+                // Exhausted: classify HERE, where we know the peer was a network
+                // socket — the run-level classifier must not treat the ambient
+                // std.Io names (WriteFailed et al) as transient globally.
+                return mapTransport(e);
             };
         }
     }
@@ -739,22 +743,42 @@ pub const HttpSource = struct {
         // Pages on slow APIs run tens of seconds; honoring an abort here caps
         // cancellation latency at one in-flight request instead of a whole run.
         if (driver.aborting()) return error.Aborted;
-        return self.fetchPageRaw(arena, req) catch |e| switch (e) {
+        return self.rawOrTimed(arena, req) catch |e| switch (e) {
             // Likely a misordered server chain: rebuild trust from the chain
             // itself (repairBundle) and retry once.
             error.TlsInitializationFailed => {
                 if (!self.tryRepair(req.url)) return e;
-                return self.fetchPageRaw(arena, req);
+                return self.rawOrTimed(arena, req);
             },
             // Session expired mid-pull: session auth kinds re-login and the
-            // page is retried once; static kinds surface the 401.
+            // page is retried once; static kinds surface the 401. A 401 in
+            // retry_statuses still maps to transient when auth declines it.
             error.HttpUnauthorized => {
-                const a = self.auth orelse return e;
-                if (!a.refresh(self.client)) return e;
-                return self.fetchPageRaw(arena, req);
+                const a = self.auth orelse return self.listedFallback(401, e);
+                if (!a.refresh(self.client)) return self.listedFallback(401, e);
+                return self.rawOrTimed(arena, req);
             },
             else => e,
         };
+    }
+
+    /// One request attempt with the page deadline applied (timeout_ms > 0):
+    /// runs through the same slot machinery as prefetch, window of one, so the
+    /// sequential/cursor/default paths get the black-hole protection too. The
+    /// slot carries retries=0 — fetchPage owns the sequential retry budget.
+    fn rawOrTimed(self: *HttpSource, arena: std.mem.Allocator, req: PageReq) ![]const u8 {
+        if (self.opts.timeout_ms <= 0) return self.fetchPageRaw(arena, req);
+        const slot = try self.spawnFetch(req, 0);
+        const url_copy = arena.dupe(u8, slot.url) catch "";
+        self.awaitSlot(slot) catch |e| {
+            std.debug.print("page fetch abandoned ({s}): {s}\n", .{ @errorName(e), url_copy });
+            return e; // slot now belongs to its worker — do not free or touch
+        };
+        defer freeSlot(slot);
+        if (slot.err) |e| return e;
+        if (slot.code == 204) return "";
+        if (slot.code != 200) return self.raiseStatus(slot.code, slot.url, slot.body);
+        return try arena.dupe(u8, slot.body);
     }
 
     fn tryRepair(self: *HttpSource, url: []const u8) bool {
@@ -783,16 +807,23 @@ pub const HttpSource = struct {
             }
         }
         if (self.pages_issued + 1 >= self.opts.max_pages) self.issue_done = true;
-        const req = try self.pageReq(self.arena);
+        // Reserve the list space first: once the worker is spawned and detached,
+        // no error path may free the slot (the state CAS owns that decision).
+        try self.slots.ensureUnusedCapacity(1);
+        const slot = try self.spawnSlot();
+        self.slots.appendAssumeCapacity(slot);
         switch (self.opts.paginate) {
             .page => self.page_no += 1,
             .offset => self.page_no += self.opts.page_size,
             else => unreachable,
         }
         self.pages_issued += 1;
-        var auth_hdr: ?std.http.Header = null;
-        if (self.auth) |a| auth_hdr = try a.ensure(self.client);
+    }
 
+    /// Build + spawn the next page's slot. Page strings are built directly in
+    /// the slot's own arena — building them in the run arena would grow it by
+    /// ~2x url bytes per page for the life of the run.
+    fn spawnSlot(self: *HttpSource) !*Slot {
         const slot = try self.gpa.create(Slot);
         slot.* = .{
             .gpa = self.gpa,
@@ -805,22 +836,54 @@ pub const HttpSource = struct {
             .retries = self.opts.retries,
             .retry_base_ms = self.opts.retry_base_ms,
         };
-        errdefer freeSlot(slot);
+        errdefer freeSlot(slot); // safe: fires only before the thread exists
+        const sa = slot.snap.allocator();
+        const req = try self.pageReq(sa);
+        slot.url = req.url; // page/offset urls are allocated by pageReq in sa
+        if (req.body) |b| slot.req_body = try sa.dupe(u8, b);
+        try self.snapshotInto(slot);
+        var th = try std.Thread.spawn(.{}, workerMain, .{slot});
+        th.detach();
+        return slot;
+    }
+
+    /// Same, for an explicit request (the sequential timed path).
+    fn spawnFetch(self: *HttpSource, req: PageReq, retries: i64) !*Slot {
+        const slot = try self.gpa.create(Slot);
+        slot.* = .{
+            .gpa = self.gpa,
+            .snap = std.heap.ArenaAllocator.init(self.gpa),
+            .client = self.client,
+            .method_post = self.opts.method == .post,
+            .content_type = self.contentType(),
+            .url = undefined,
+            .gen = self.auth_gen,
+            .retries = retries,
+            .retry_base_ms = self.opts.retry_base_ms,
+        };
+        errdefer freeSlot(slot); // safe: fires only before the thread exists
         const sa = slot.snap.allocator();
         slot.url = try sa.dupe(u8, req.url);
         if (req.body) |b| slot.req_body = try sa.dupe(u8, b);
+        try self.snapshotInto(slot);
+        var th = try std.Thread.spawn(.{}, workerMain, .{slot});
+        th.detach();
+        return slot;
+    }
+
+    fn snapshotInto(self: *HttpSource, slot: *Slot) !void {
+        const sa = slot.snap.allocator();
         if (self.opts.retry_statuses) |rs| slot.retry_statuses = try sa.dupe(u8, rs);
         for (self.headers) |h| {
             slot.hdrs[slot.nh] = .{ .name = try sa.dupe(u8, h.name), .value = try sa.dupe(u8, h.value) };
             slot.nh += 1;
         }
-        if (auth_hdr) |h| {
-            slot.hdrs[slot.nh] = .{ .name = try sa.dupe(u8, h.name), .value = try sa.dupe(u8, h.value) };
-            slot.nh += 1;
+        if (self.auth) |a| {
+            if (try a.ensure(self.client)) |h| {
+                slot.hdrs[slot.nh] = .{ .name = try sa.dupe(u8, h.name), .value = try sa.dupe(u8, h.value) };
+                slot.nh += 1;
+            }
         }
-        var th = try std.Thread.spawn(.{}, workerMain, .{slot});
-        th.detach();
-        try self.slots.append(slot);
     }
 
     /// Worker thread (detached): GET one page. Reads ONLY the slot (never the
@@ -852,7 +915,7 @@ pub const HttpSource = struct {
             };
             const code = @intFromEnum(res.status);
             // Retry transient statuses in-thread too (worker = its own backoff).
-            if ((code == 429 or code >= 500 or statusListed(slot.retry_statuses, code)) and attempt < slot.retries and !driver.aborting()) {
+            if ((code == 429 or code >= 500 or (code != 401 and statusListed(slot.retry_statuses, code))) and attempt < slot.retries and !driver.aborting()) {
                 attempt += 1;
                 std.Thread.sleep(retryDelayNs(slot.retry_base_ms, attempt));
                 continue;
@@ -880,9 +943,13 @@ pub const HttpSource = struct {
     /// abandoned to its worker and counted as a zombie.
     fn awaitSlot(self: *HttpSource, slot: *Slot) !void {
         const deadline: i64 = if (self.opts.timeout_ms > 0)
-            std.time.milliTimestamp() + self.opts.timeout_ms
+            std.time.milliTimestamp() +| self.opts.timeout_ms
         else
             std.math.maxInt(i64);
+        return self.awaitSlotUntil(slot, deadline);
+    }
+
+    fn awaitSlotUntil(self: *HttpSource, slot: *Slot, deadline: i64) !void {
         while (true) {
             if (slot.state.load(.acquire) == @intFromEnum(SlotState.done)) return;
             if (driver.aborting() or std.time.milliTimestamp() >= deadline) {
@@ -901,9 +968,15 @@ pub const HttpSource = struct {
         }
     }
 
+    /// Discard in-flight slots whose results are no longer wanted (end of data,
+    /// stop_short, teardown). One short SHARED grace window — they are usually
+    /// milliseconds from done — then abandon; nothing here waits a full page
+    /// deadline per slot.
     fn drainSlots(self: *HttpSource) void {
+        const grace_ms: i64 = if (self.opts.timeout_ms > 0) @min(self.opts.timeout_ms, 5_000) else 5_000;
+        const deadline = std.time.milliTimestamp() +| grace_ms;
         for (self.slots.items) |slot| {
-            if (self.awaitSlot(slot)) |_| freeSlot(slot) else |_| {}
+            if (self.awaitSlotUntil(slot, deadline)) |_| freeSlot(slot) else |_| {}
         }
         self.slots.clearRetainingCapacity();
     }
@@ -930,32 +1003,32 @@ pub const HttpSource = struct {
             return null;
         }
         const slot = self.slots.orderedRemove(0);
+        // After an abandon CAS the worker owns (and may free) the slot — only a
+        // pre-made copy of the URL is safe to reference in error reporting.
+        const url_copy = arena.dupe(u8, slot.url) catch "";
         self.awaitSlot(slot) catch |e| {
-            std.debug.print("page fetch abandoned ({s}): {s}\n", .{ @errorName(e), slot.url });
-            return e; // slot now belongs to its worker — do not free
+            std.debug.print("page fetch abandoned ({s}): {s}\n", .{ @errorName(e), url_copy });
+            return e; // slot now belongs to its worker — do not free or touch
         };
         defer freeSlot(slot);
         if (slot.err) |e| {
             std.debug.print("page fetch failed ({s}): {s}\n", .{ @errorName(e), slot.url });
-            return e;
+            return mapTransport(e);
         }
         if (slot.code == 401) {
             // Stale token (gen behind) just re-fetches; a current-gen 401 means
             // the session expired — session auths re-login once.
-            const a = self.auth orelse return error.HttpUnauthorized;
+            const a = self.auth orelse return self.listedFallback(401, error.HttpUnauthorized);
             if (slot.gen >= self.auth_gen) {
-                if (!a.refresh(self.client)) return error.HttpUnauthorized;
+                if (!a.refresh(self.client)) return self.listedFallback(401, error.HttpUnauthorized);
                 self.auth_gen += 1;
             }
-            const body = try self.fetchPageRaw(arena, .{ .url = slot.url, .body = slot.req_body });
+            const body = self.fetchPageRaw(arena, .{ .url = slot.url, .body = slot.req_body }) catch |e|
+                return mapTransport(e);
             return self.consumeBody(arena, body);
         }
         if (slot.code == 204) return self.finishEmpty();
-        if (slot.code != 200) {
-            std.debug.print("http {d} from {s}: {s}\n", .{ slot.code, slot.url, slot.body[0..@min(slot.body.len, 300)] });
-            if (statusListed(self.opts.retry_statuses, slot.code)) return error.HttpServerBusy;
-            return statusError(slot.code);
-        }
+        if (slot.code != 200) return self.raiseStatus(slot.code, slot.url, slot.body);
         // Parsed JSON slices into the source text, so the body must move into
         // the batch arena before the gpa copy is freed.
         return self.consumeBody(arena, try arena.dupe(u8, slot.body));
@@ -1003,13 +1076,22 @@ pub const HttpSource = struct {
         // 204 = no content: some OData servers (e.g. Ivanti) signal "past the
         // end of the dataset" this way instead of an empty `value` array.
         if (code == 204) return "";
-        if (code != 200) {
-            const b = aw.writer.buffered();
-            std.debug.print("http {d} from {s}: {s}\n", .{ code, req.url, b[0..@min(b.len, 300)] });
-            if (statusListed(self.opts.retry_statuses, code)) return error.HttpServerBusy;
-            return statusError(code);
-        }
+        if (code != 200) return self.raiseStatus(code, req.url, aw.writer.buffered());
         return aw.writer.buffered();
+    }
+
+    /// Single status-disposition policy for every fetch path. 401 outranks the
+    /// retry_statuses mapping: session re-login gets first claim, and only when
+    /// auth declines (no auth kind / refresh failed) does listedFallback apply.
+    fn raiseStatus(self: *HttpSource, code: u16, url: []const u8, body: []const u8) anyerror {
+        std.debug.print("http {d} from {s}: {s}\n", .{ code, url, body[0..@min(body.len, 300)] });
+        if (code == 401) return error.HttpUnauthorized;
+        if (statusListed(self.opts.retry_statuses, code)) return error.HttpServerBusy;
+        return statusError(code);
+    }
+
+    fn listedFallback(self: *HttpSource, code: u16, e: anyerror) anyerror {
+        return if (statusListed(self.opts.retry_statuses, code)) error.HttpServerBusy else e;
     }
 
     pub fn next(self: *HttpSource, arena: std.mem.Allocator) !?Batch {
@@ -1151,21 +1233,20 @@ fn statusListed(list_opt: ?[]const u8, code: u16) bool {
 
 /// Worth an in-place retry: server overload/restart or a dropped connection.
 /// 4xx (other than 429, mapped to HttpServerBusy) is config — retrying lies.
+/// The socket set is the shared driver.transientNet, so the retry layers
+/// (sql reconnect, http backoff) can never drift apart.
 fn isRetryableNet(e: anyerror) bool {
-    return switch (e) {
-        error.HttpServerBusy,
-        error.ConnectionResetByPeer,
-        error.ConnectionRefused,
-        error.ConnectionTimedOut,
-        error.BrokenPipe,
-        error.WriteFailed,
-        error.ReadFailed,
-        error.EndOfStream,
-        error.NetworkUnreachable,
-        error.TemporaryNameServerFailure,
-        => true,
-        else => false,
-    };
+    return e == error.HttpServerBusy or driver.transientNet(e);
+}
+
+/// Site-level transient classification: a socket failure that survived the
+/// retry budget surfaces as HttpTransportFailed — a name the run-level
+/// classifier can safely treat as transient. The ambient std.Io names
+/// (WriteFailed/ReadFailed/EndOfStream) must NOT be transient globally:
+/// a CSV sink's disk-full is also WriteFailed.
+fn mapTransport(e: anyerror) anyerror {
+    if (e == error.HttpServerBusy) return e;
+    return if (driver.transientNet(e)) error.HttpTransportFailed else e;
 }
 
 /// base * 2^(attempt-1), with +-30% time-seeded jitter so concurrent workers
