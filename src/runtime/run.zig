@@ -67,13 +67,12 @@ pub fn isTransient(e: anyerror) bool {
         error.NameServerFailure,
         error.HostLacksNetworkAddresses,
         error.HttpServerBusy, // http source: 429 / 5xx / declared retry_statuses
-        // Socket-level failures mid-transfer: the peer reset or the pipe broke.
-        // Same class sql.transientNet already treats as retryable — a control
-        // plane retry is exactly right for these.
-        error.WriteFailed,
-        error.ReadFailed,
-        error.EndOfStream,
-        error.UnexpectedConnectFailure,
+        // Socket failure classified AT THE SITE (http source, after its retry
+        // budget): the source maps the ambient std.Io names to this specific
+        // one only when the peer was a network socket. The ambient names
+        // (WriteFailed/ReadFailed/EndOfStream) stay non-transient here — a CSV
+        // sink's disk-full or a closed stdout pipe must exit 1, not retry.
+        error.HttpTransportFailed,
         => true,
         else => false,
     };
@@ -944,6 +943,7 @@ const ForCtx = struct {
     mu: std.Thread.Mutex = .{},
     first_err_buf: [256]u8 = undefined,
     first_err_len: usize = 0,
+    first_retryable: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
 fn forRecordFail(ctx: *ForCtx, label: []const u8, ename: []const u8, msg: []const u8, retryable: bool) void {
@@ -954,6 +954,7 @@ fn forRecordFail(ctx: *ForCtx, label: []const u8, ename: []const u8, msg: []cons
     if (ctx.first_err_len == 0) {
         const s = std.fmt.bufPrint(&ctx.first_err_buf, "{s}: {s} {s}", .{ label, ename, msg }) catch ctx.first_err_buf[0..0];
         ctx.first_err_len = s.len;
+        ctx.first_retryable.store(retryable, .monotonic);
     }
     if (ctx.on_error == .stop) ctx.stop.store(true, .release);
 }
@@ -999,6 +1000,11 @@ fn forWorker(ctx: *ForCtx) void {
             _ = ctx.rows_out.fetchAdd(st.rows_out, .monotonic);
             if (ctx.outcomes) |sink| sink.record(row[0], true, "", false);
         } else |e| {
+            if (e == error.Aborted) {
+                // Cancellation, not an item failure — the join path raises it.
+                for (w_sources.items) |sc| sc.close();
+                break;
+            }
             forRecordFail(ctx, row[0], @errorName(e), w_diag.msg, isTransient(e) or w_diag.retryable);
         }
         for (w_sources.items) |sc| sc.close();
@@ -1043,13 +1049,21 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
                 } else |e| {
                     for (env.sources.items[base..]) |sc| sc.close();
                     env.sources.shrinkRetainingCapacity(base);
+                    // Cancellation is not an item failure: surface it as the
+                    // abort it is (exit 130), not a failed-items run (exit 1).
+                    if (e == error.Aborted) return error.Aborted;
                     failures += 1;
                     const emsg = if (env.diag.msg.len > 0) env.diag.msg else @errorName(e);
                     if (opts.outcomes) |sink| sink.record(row[0], false, emsg, isTransient(e) or env.diag.retryable);
                     env.log.log(.err, "for-each {s} failed: {s}", .{ row[0], @errorName(e) });
                     if (first_err == null)
                         first_err = std.fmt.allocPrint(env.arena, "{s}: {s}", .{ row[0], @errorName(e) }) catch null;
-                    if (on_error == .stop) return planErr(env.diag, first_err orelse "for-each failed");
+                    if (on_error == .stop) {
+                        // Preserve the transient/permanent split through the
+                        // wrap, or a textbook-transient timeout exits 1.
+                        if (isTransient(e)) env.diag.retryable = true;
+                        return planErr(env.diag, first_err orelse "for-each failed");
+                    }
                 }
             }
             // Continue-mode partial failures surface via the sink (the run succeeds).
@@ -1068,13 +1082,19 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
                 threads[spawned] = std.Thread.spawn(.{}, forWorker, .{&ctx}) catch break;
             }
             if (spawned == 0) forWorker(&ctx) else for (threads[0..spawned]) |t| t.join();
+            // Cancellation outranks failure accounting: a SIGTERM mid-run is an
+            // abort (exit 130), not "N items failed" (exit 1).
+            if (aborting()) return error.Aborted;
             stats.rows_out += ctx.rows_out.load(.monotonic);
             lanes_used.* = @max(lanes_used.*, @max(spawned, @as(usize, 1)));
             const fails = ctx.failures.load(.monotonic);
             // stop-mode is a whole-request failure; continue-mode with a sink is a
             // partial success (failures reported via outcomes, the run succeeds).
-            if (fails > 0 and (on_error == .stop or opts.outcomes == null))
+            if (fails > 0 and (on_error == .stop or opts.outcomes == null)) {
+                // Preserve the transient/permanent split through the wrap.
+                if (ctx.first_retryable.load(.monotonic)) env.diag.retryable = true;
                 return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each: {d}/{d} failed (first: {s})", .{ fails, rows.len, ctx.first_err_buf[0..ctx.first_err_len] }));
+            }
         },
     }
 }

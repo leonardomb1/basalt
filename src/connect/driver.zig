@@ -30,6 +30,30 @@ pub fn resetAbort() void {
     g_abort.store(false, .seq_cst);
 }
 
+/// The socket-level transient set shared by the connector retry layers (sql
+/// reconnect loops, http in-place backoff). Run-level exit-code classification
+/// deliberately does NOT consume this set: names like WriteFailed/ReadFailed/
+/// EndOfStream are ambient std.Io errors there (a disk-full CSV write is not
+/// transient) — connectors map them to specific names at the failure site
+/// (e.g. http's HttpTransportFailed) where the peer is known to be a network.
+pub fn transientNet(e: anyerror) bool {
+    return switch (e) {
+        error.ConnectionRefused,
+        error.ConnectionTimedOut,
+        error.ConnectionResetByPeer,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.ReadFailed,
+        error.WriteFailed,
+        error.UnexpectedConnectFailure,
+        error.TemporaryNameServerFailure,
+        => true,
+        else => false,
+    };
+}
+
 pub const Source = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
