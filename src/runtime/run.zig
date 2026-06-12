@@ -66,7 +66,14 @@ pub fn isTransient(e: anyerror) bool {
         error.TemporaryNameServerFailure,
         error.NameServerFailure,
         error.HostLacksNetworkAddresses,
-        error.HttpServerBusy, // http source: 429 / 5xx
+        error.HttpServerBusy, // http source: 429 / 5xx / declared retry_statuses
+        // Socket-level failures mid-transfer: the peer reset or the pipe broke.
+        // Same class sql.transientNet already treats as retryable — a control
+        // plane retry is exactly right for these.
+        error.WriteFailed,
+        error.ReadFailed,
+        error.EndOfStream,
+        error.UnexpectedConnectFailure,
         => true,
         else => false,
     };
