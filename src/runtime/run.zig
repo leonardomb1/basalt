@@ -8,6 +8,7 @@ const ast = @import("../lang/ast.zig");
 const expand = @import("../lang/expand.zig");
 const types = @import("../lang/types.zig");
 const op = @import("../exec/op.zig");
+const batchmod = @import("../exec/batch.zig");
 const eval = @import("../exec/eval.zig");
 const csv = @import("../connect/csv.zig");
 const tablemod = @import("../connect/table.zig");
@@ -625,6 +626,13 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
         }
     }
 
+    // `@[buffer]` on the read: drain the source fully BEFORE writing. For
+    // sources that abort a query when the client consumes too slowly (the
+    // Dataverse TDS endpoint kills a query if a slow sink stalls reads), this
+    // reads everything fast, releases the source connection, then writes at the
+    // sink's pace. Holds all rows in memory — opt-in, for bounded result sets.
+    const buffered = hasFlagHint(stages[0].hints, "buffer");
+
     const snk = try openSink(env, wr, res.schema);
     // On any error before close, abort the sink: discard its tail buffer instead
     // of letting a later close commit partial data, and release its connection.
@@ -632,12 +640,30 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     // a failed close from double-freeing via abort.
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
-    while (true) {
-        if (aborting()) return error.Aborted; // cancelled by the control plane
-        _ = batch_arena.reset(.retain_capacity);
-        const b = (try res.op.next(batch_arena.allocator())) orelse break;
-        try snk.writeBatch(batch_arena.allocator(), b);
-        stats.rows_out += b.len;
+    if (buffered) {
+        // batch_arena is NOT reset between reads, so every batch persists.
+        var batches = std.array_list.Managed(batchmod.Batch).init(arena);
+        while (true) {
+            if (aborting()) return error.Aborted;
+            const b = (try res.op.next(batch_arena.allocator())) orelse break;
+            try batches.append(b);
+        }
+        // Release the (time-limited) source connection now that it's drained.
+        for (env.sources.items[src_base..]) |sc| sc.close();
+        env.sources.shrinkRetainingCapacity(src_base);
+        for (batches.items) |b| {
+            if (aborting()) return error.Aborted;
+            try snk.writeBatch(batch_arena.allocator(), b);
+            stats.rows_out += b.len;
+        }
+    } else {
+        while (true) {
+            if (aborting()) return error.Aborted; // cancelled by the control plane
+            _ = batch_arena.reset(.retain_capacity);
+            const b = (try res.op.next(batch_arena.allocator())) orelse break;
+            try snk.writeBatch(batch_arena.allocator(), b);
+            stats.rows_out += b.len;
+        }
     }
     snk_open = false;
     try snk.close();
@@ -1270,6 +1296,13 @@ fn jsonStrField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 
 /// A hint value as a name, accepting either a bare ident or a quoted string
 /// (`@[table_field = physical]` or `@[tag_substr = "4,2"]`).
+fn hasFlagHint(hints: []const ast.Hint, key: []const u8) bool {
+    for (hints) |h| {
+        if (std.mem.eql(u8, h.key, key)) return true;
+    }
+    return false;
+}
+
 fn forHintName(hints: []const ast.Hint, key: []const u8) ?[]const u8 {
     for (hints) |h| {
         if (std.mem.eql(u8, h.key, key)) return switch (h.value) {
