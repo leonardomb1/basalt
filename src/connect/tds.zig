@@ -36,6 +36,8 @@ pub const Conn = struct {
     last_error: []const u8 = "",
     tls: ?*sqlmod.TlsState = null,
     shim: TlsShim = undefined, // valid iff tls != null
+    fed_required: bool = false, // server asked for federated (Azure AD) auth
+    fed_nonce: ?[32]u8 = null, // server PRELOGIN nonce, echoed in the FEDAUTH ext
 
     pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sqlmod.TlsMode) !*Conn {
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
@@ -47,6 +49,32 @@ pub const Conn = struct {
         try self.prelogin(tls_mode != .off);
         if (tls_mode != .off) try self.startTls(host, tls_mode);
         try self.login(user, password, database, host);
+        return self;
+    }
+
+    /// Connect with an Azure AD access token (the Dataverse / Azure SQL TDS
+    /// endpoints). PRELOGIN advertises FEDAUTHREQUIRED, TLS is mandatory, and the
+    /// LOGIN7 carries the token in a FEDAUTH feature extension (Security Token
+    /// library) instead of a SQL password. The caller fetches the token (see
+    /// aad.ropcToken); this only speaks the wire protocol.
+    pub fn connectAad(gpa: std.mem.Allocator, host: []const u8, port: u16, token: []const u8, database: []const u8, tls_mode: sqlmod.TlsMode) !*Conn {
+        if (tls_mode == .off) return error.EncryptionRequired; // AAD requires TLS
+        const stream = try std.net.tcpConnectToHost(gpa, host, port);
+        const self = try gpa.create(Conn);
+        self.* = .{ .gpa = gpa, .stream = stream, .msg = std.array_list.Managed(u8).init(gpa) };
+        self.sr = std.net.Stream.Reader.init(stream, &self.read_buf);
+        self.sw = std.net.Stream.Writer.init(stream, &self.write_buf);
+        errdefer self.close();
+        try self.preloginFed();
+        try self.startTls(host, tls_mode);
+        const payload = try buildLogin7Fedauth(gpa, token, database, host, self.fed_required, self.fed_nonce);
+        defer gpa.free(payload);
+        try self.writePacket(PKT_LOGIN7, payload);
+        try self.readMessage();
+        self.parseLoginResponse() catch |e| {
+            if (self.last_error.len > 0) std.debug.print("[tds] login rejected: {s}\n", .{self.last_error});
+            return e;
+        };
         return self;
     }
 
@@ -195,6 +223,44 @@ pub const Conn = struct {
 
     // --- prelogin ---
 
+    /// PRELOGIN that advertises FEDAUTHREQUIRED + encryption-on (Azure AD). The
+    /// option table holds VERSION, ENCRYPTION, FEDAUTHREQUIRED, then data. Parses
+    /// the response for the server's FEDAUTHREQUIRED value and any 32-byte nonce.
+    fn preloginFed(self: *Conn) !void {
+        const payload = [_]u8{
+            0x00, 0x00, 0x10, 0x00, 0x06, // VERSION         off=16 len=6
+            0x01, 0x00, 0x16, 0x00, 0x01, // ENCRYPTION      off=22 len=1
+            0x06, 0x00, 0x17, 0x00, 0x01, // FEDAUTHREQUIRED off=23 len=1
+            0xFF, // terminator
+            0x11, 0x00, 0x00, 0x00, 0x00, 0x00, // version (off 16)
+            0x01, // ENCRYPT_ON (off 22) — AAD mandates TLS
+            0x01, // FEDAUTHREQUIRED = yes, client supports it (off 23)
+        };
+        try self.writePacket(PKT_PRELOGIN, &payload);
+        try self.readMessage();
+
+        const p = self.msg.items;
+        var i: usize = 0;
+        while (i + 5 <= p.len and p[i] != 0xFF) : (i += 5) {
+            const tok = p[i];
+            const off: usize = (@as(usize, p[i + 1]) << 8) | p[i + 2];
+            const len: usize = (@as(usize, p[i + 3]) << 8) | p[i + 4];
+            if (off + len > p.len) continue;
+            switch (tok) {
+                0x01 => { // ENCRYPTION — must be on/required (we offered on)
+                    if (len >= 1 and !(p[off] == 0x01 or p[off] == 0x03)) return error.TdsTlsRefused;
+                },
+                0x06 => self.fed_required = (len >= 1 and p[off] == 0x01), // FEDAUTHREQUIRED
+                0x07 => if (len == 32) { // NONCEOPT
+                    var n: [32]u8 = undefined;
+                    @memcpy(&n, p[off .. off + 32]);
+                    self.fed_nonce = n;
+                },
+                else => {},
+            }
+        }
+    }
+
     fn prelogin(self: *Conn, want_tls: bool) !void {
         const payload = [_]u8{
             0x00, 0x00, 0x0B, 0x00, 0x06, // VERSION  off=11 len=6
@@ -253,6 +319,19 @@ pub const Conn = struct {
                 0xAB, 0xE3 => { // INFO, ENVCHANGE
                     if (i + 2 > p.len) return error.TdsProtocol;
                     i += 2 + rdU16(p, i);
+                },
+                0xEE => { // FEDAUTHINFO — 4-byte length + data (AAD flows)
+                    if (i + 4 > p.len) return error.TdsProtocol;
+                    i += 4 + std.mem.readInt(u32, p[i..][0..4], .little);
+                },
+                0xAE => { // FEATUREEXTACK — (FeatureId, u32 len, data)* terminated by 0xFF
+                    while (i < p.len) {
+                        const fid = p[i];
+                        i += 1;
+                        if (fid == 0xFF) break;
+                        if (i + 4 > p.len) return error.TdsProtocol;
+                        i += 4 + std.mem.readInt(u32, p[i..][0..4], .little);
+                    }
                 },
                 0xFD, 0xFE, 0xFF => i += 12, // DONE*
                 0x79 => i += 4, // RETURNSTATUS
@@ -1296,6 +1375,71 @@ fn buildLogin7(gpa: std.mem.Allocator, user: []const u8, password: []const u8, d
     return out;
 }
 
+/// LOGIN7 carrying an Azure AD access token in a FEDAUTH feature extension
+/// (Security Token library) — no SQL username/password. The token rides as
+/// UTF-16LE bytes; `echo` mirrors the server's FEDAUTHREQUIRED and, when set with
+/// a server nonce, the nonce is appended. The OptionFlags3 fExtension bit (0x10)
+/// flags the feature block, whose offset lives in a 4-byte slot referenced by the
+/// repurposed "Extension" offset/length pair.
+fn buildLogin7Fedauth(gpa: std.mem.Allocator, token: []const u8, database: []const u8, host: []const u8, echo: bool, nonce: ?[32]u8) ![]u8 {
+    var fixed = std.mem.zeroes([94]u8);
+    fixed[4] = 0x04; // TDS 7.4
+    fixed[7] = 0x74;
+    fixed[9] = 0x10; // packet size 4096
+    fixed[27] = 0x10; // OptionFlags3: fExtension
+
+    var vd = std.array_list.Managed(u8).init(gpa);
+    defer vd.deinit();
+
+    try addField(&fixed, 36, host, &vd, false); // HostName
+    try addField(&fixed, 40, "", &vd, false); // UserName — empty (fedauth)
+    try addField(&fixed, 44, "", &vd, true); // Password — empty
+    try addField(&fixed, 48, "basalt", &vd, false); // AppName
+    try addField(&fixed, 52, host, &vd, false); // ServerName
+    // Extension field (offset 56): points at a 4-byte slot holding the FeatureExt
+    // offset (filled in once all var-data is laid out).
+    const ext_ib: u16 = @intCast(94 + vd.items.len);
+    std.mem.writeInt(u16, fixed[56..][0..2], ext_ib, .little);
+    std.mem.writeInt(u16, fixed[58..][0..2], 4, .little);
+    const ext_slot = vd.items.len;
+    try vd.appendSlice(&[_]u8{ 0, 0, 0, 0 });
+    try addField(&fixed, 60, "basalt", &vd, false); // CltIntName
+    try addField(&fixed, 64, "", &vd, false); // Language
+    try addField(&fixed, 68, database, &vd, false); // Database
+    // ClientID 72..78 = zero
+    try addField(&fixed, 78, "", &vd, false); // SSPI
+    try addField(&fixed, 82, "", &vd, false); // AtchDBFile
+    try addField(&fixed, 86, "", &vd, false); // ChangePassword
+
+    // FeatureExt begins here; backpatch the slot with its message offset.
+    const feat_off: u32 = @intCast(94 + vd.items.len);
+    std.mem.writeInt(u32, vd.items[ext_slot..][0..4], feat_off, .little);
+
+    const have_nonce = echo and nonce != null;
+    const tok_bytes: u32 = @intCast(token.len * 2);
+    const data_len: u32 = 1 + 4 + tok_bytes + (if (have_nonce) @as(u32, 32) else 0);
+    try vd.append(0x02); // FEATUREID FEDAUTH
+    var lb: [4]u8 = undefined;
+    std.mem.writeInt(u32, &lb, data_len, .little);
+    try vd.appendSlice(&lb);
+    try vd.append((0x01 << 1) | @as(u8, if (echo) 1 else 0)); // SECURITYTOKEN lib | echo
+    std.mem.writeInt(u32, &lb, tok_bytes, .little);
+    try vd.appendSlice(&lb);
+    for (token) |ch| {
+        try vd.append(ch);
+        try vd.append(0); // UTF-16LE
+    }
+    if (have_nonce) try vd.appendSlice(&nonce.?);
+    try vd.append(0xFF); // FeatureExt terminator
+
+    const total: u32 = @intCast(94 + vd.items.len);
+    std.mem.writeInt(u32, fixed[0..4], total, .little);
+    const out = try gpa.alloc(u8, total);
+    @memcpy(out[0..94], &fixed);
+    @memcpy(out[94..], vd.items);
+    return out;
+}
+
 /// Append a UTF-16LE string to var-data and write its (offset, char-count) into
 /// the fixed offset/length block. ASCII only (sufficient for creds/identifiers).
 fn addField(fixed: []u8, ib_pos: usize, s: []const u8, vd: *std.array_list.Managed(u8), obfuscate: bool) !void {
@@ -1331,4 +1475,52 @@ test "login7 packet has sane framing" {
     try std.testing.expectEqual(@as(u16, 2), cch_user);
     try std.testing.expect(ib_user >= 94 and ib_user < pkt.len);
     try std.testing.expectEqual(@as(u8, 's'), pkt[ib_user]); // UTF16LE 's','\0'
+}
+
+
+test "buildLogin7Fedauth: fExtension flag, empty creds, FEDAUTH ext layout" {
+    const a = std.testing.allocator;
+    const token = "HEADER.PAYLOAD.SIG";
+    const out = try buildLogin7Fedauth(a, token, "db", "h", true, null);
+    defer a.free(out);
+
+    // total length header matches buffer
+    try std.testing.expectEqual(@as(u32, @intCast(out.len)), std.mem.readInt(u32, out[0..4], .little));
+    // OptionFlags3 fExtension bit
+    try std.testing.expectEqual(@as(u8, 0x10), out[27] & 0x10);
+    // UserName (offset 40) and Password (44) are empty
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, out[42..44], .little));
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, out[46..48], .little));
+
+    // Extension field (56): ib points at a 4-byte slot whose value is the
+    // FeatureExt offset; that offset must land on FEATUREID FEDAUTH (0x02).
+    const ext_ib = std.mem.readInt(u16, out[56..58], .little);
+    try std.testing.expectEqual(@as(u16, 4), std.mem.readInt(u16, out[58..60], .little));
+    const feat_off = std.mem.readInt(u32, out[ext_ib..][0..4], .little);
+    try std.testing.expectEqual(@as(u8, 0x02), out[feat_off]); // FEDAUTH FeatureId
+    // options byte = (SECURITYTOKEN<<1)|echo = 0x02|0x01
+    const opt = out[feat_off + 5];
+    try std.testing.expectEqual(@as(u8, 0x03), opt);
+    // token length field = UTF-16LE byte length
+    const tlen = std.mem.readInt(u32, out[feat_off + 6 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, token.len * 2), tlen);
+    // ends with FeatureExt terminator
+    try std.testing.expectEqual(@as(u8, 0xFF), out[out.len - 1]);
+    // FeatureDataLen = 1 + 4 + tokbytes (no nonce since nonce==null)
+    const dlen = std.mem.readInt(u32, out[feat_off + 1 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 1 + 4 + token.len * 2), dlen);
+}
+
+test "buildLogin7Fedauth: nonce appended when echo && nonce present" {
+    const a = std.testing.allocator;
+    var nonce: [32]u8 = undefined;
+    for (&nonce, 0..) |*b, i| b.* = @intCast(i);
+    const out = try buildLogin7Fedauth(a, "tok", "db", "h", true, nonce);
+    defer a.free(out);
+    const ext_ib = std.mem.readInt(u16, out[56..58], .little);
+    const feat_off = std.mem.readInt(u32, out[ext_ib..][0..4], .little);
+    const dlen = std.mem.readInt(u32, out[feat_off + 1 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 1 + 4 + 3 * 2 + 32), dlen);
+    // nonce sits right before the 0xFF terminator
+    try std.testing.expectEqualSlices(u8, &nonce, out[out.len - 33 .. out.len - 1]);
 }
