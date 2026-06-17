@@ -626,12 +626,35 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
         }
     }
 
-    // `@[buffer]` on the read: drain the source fully BEFORE writing. For
-    // sources that abort a query when the client consumes too slowly (the
-    // Dataverse TDS endpoint kills a query if a slow sink stalls reads), this
-    // reads everything fast, releases the source connection, then writes at the
-    // sink's pace. Holds all rows in memory — opt-in, for bounded result sets.
-    const buffered = hasFlagHint(stages[0].hints, "buffer");
+    // `@[buffer]` on the read: drain the source fully and close it BEFORE the
+    // sink is even opened. For sources that abort a query when the client reads
+    // too slowly (the Dataverse TDS endpoint), a slow sink OPEN — e.g. StarRocks
+    // CREATE TABLE DDL, several seconds — would leave the query idle long enough
+    // to be killed. So read everything first, release the source, then open the
+    // sink and write at its own pace. Holds all rows in memory — opt-in, bounded.
+    if (hasFlagHint(stages[0].hints, "buffer")) {
+        // batch_arena is NOT reset between reads, so every batch persists.
+        var batches = std.array_list.Managed(batchmod.Batch).init(arena);
+        while (true) {
+            if (aborting()) return error.Aborted;
+            const b = (try res.op.next(batch_arena.allocator())) orelse break;
+            try batches.append(b);
+        }
+        for (env.sources.items[src_base..]) |sc| sc.close(); // release the source now
+        env.sources.shrinkRetainingCapacity(src_base);
+
+        const snk = try openSink(env, wr, res.schema); // DDL runs here, source already closed
+        var snk_open = true;
+        errdefer if (snk_open) snk.abort();
+        for (batches.items) |b| {
+            if (aborting()) return error.Aborted;
+            try snk.writeBatch(batch_arena.allocator(), b);
+            stats.rows_out += b.len;
+        }
+        snk_open = false;
+        try snk.close();
+        return;
+    }
 
     const snk = try openSink(env, wr, res.schema);
     // On any error before close, abort the sink: discard its tail buffer instead
@@ -640,30 +663,12 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     // a failed close from double-freeing via abort.
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
-    if (buffered) {
-        // batch_arena is NOT reset between reads, so every batch persists.
-        var batches = std.array_list.Managed(batchmod.Batch).init(arena);
-        while (true) {
-            if (aborting()) return error.Aborted;
-            const b = (try res.op.next(batch_arena.allocator())) orelse break;
-            try batches.append(b);
-        }
-        // Release the (time-limited) source connection now that it's drained.
-        for (env.sources.items[src_base..]) |sc| sc.close();
-        env.sources.shrinkRetainingCapacity(src_base);
-        for (batches.items) |b| {
-            if (aborting()) return error.Aborted;
-            try snk.writeBatch(batch_arena.allocator(), b);
-            stats.rows_out += b.len;
-        }
-    } else {
-        while (true) {
-            if (aborting()) return error.Aborted; // cancelled by the control plane
-            _ = batch_arena.reset(.retain_capacity);
-            const b = (try res.op.next(batch_arena.allocator())) orelse break;
-            try snk.writeBatch(batch_arena.allocator(), b);
-            stats.rows_out += b.len;
-        }
+    while (true) {
+        if (aborting()) return error.Aborted; // cancelled by the control plane
+        _ = batch_arena.reset(.retain_capacity);
+        const b = (try res.op.next(batch_arena.allocator())) orelse break;
+        try snk.writeBatch(batch_arena.allocator(), b);
+        stats.rows_out += b.len;
     }
     snk_open = false;
     try snk.close();
