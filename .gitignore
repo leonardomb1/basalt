@@ -1,3 +1,4 @@
 .zig-cache/
 zig-out/
 examples/out.csv
+ex/.env

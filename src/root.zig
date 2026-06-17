@@ -22,6 +22,7 @@ pub const mysql = @import("connect/mysql.zig");
 pub const postgres = @import("connect/postgres.zig");
 pub const request = @import("connect/request.zig");
 pub const httpsrc = @import("connect/http.zig");
+pub const aad = @import("connect/aad.zig");
 pub const split = @import("connect/split.zig");
 pub const http = @import("server/http.zig");
 pub const runtime = @import("runtime/run.zig");

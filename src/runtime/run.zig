@@ -19,6 +19,7 @@ const postgres = @import("../connect/postgres.zig");
 const sql = @import("../connect/sql.zig");
 const request = @import("../connect/request.zig");
 const httpsrc = @import("../connect/http.zig");
+const aad = @import("../connect/aad.zig");
 const splitmod = @import("../connect/split.zig");
 const parallel = @import("parallel.zig");
 const analyze = @import("analyze.zig");
@@ -203,7 +204,7 @@ fn connectSql(gpa: std.mem.Allocator, kind: SqlKind, cfg: DbConfig) !sql.Conn {
     return switch (kind) {
         .postgres => (try postgres.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls)).sqlConn(),
         .mysql => (try mysql.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls)).sqlConn(),
-        .sqlserver => (try tds.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls)).sqlConn(),
+        .sqlserver => (try tdsConnect(gpa, cfg)).sqlConn(),
     };
 }
 
@@ -302,7 +303,7 @@ fn openLaneSqlSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize)
             return openBulkOrInsert(gpa, c, mysql.LoadDataSink, spec.dialect, spec.target, spec.schema, spec.lane_mode, spec.redial);
         },
         .sqlserver => {
-            const c = try tds.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls);
+            const c = try tdsConnect(gpa, cfg);
             errdefer c.close();
             return openBulkOrInsert(gpa, c, tds.BulkSink, spec.dialect, spec.target, spec.schema, spec.lane_mode, spec.redial);
         },
@@ -1547,7 +1548,7 @@ fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
     if (std.mem.eql(u8, conn.connector, "sqlserver")) {
         const cfg = try resolveDbConfig(env, conn, 1433);
         const query = try readSql(env, rd_eff);
-        const c = tds.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls) catch |e|
+        const c = tdsConnect(env.gpa, cfg) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "sqlserver connect failed: {s}", .{@errorName(e)}));
         const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
             defer c.close();
@@ -1590,7 +1591,44 @@ const DbConfig = struct {
     password: []const u8 = "",
     database: []const u8 = "",
     tls: sql.TlsMode = .off,
+    // Azure AD (sqlserver only): when set, `user`/`password` are the AAD
+    // username/password (ROPC grant) and a federated token is sent instead of a
+    // SQL login. TLS is forced on. `resource` defaults to https://<host>.
+    aad: bool = false,
+    tenant: []const u8 = "",
+    client_id: []const u8 = "",
+    resource: []const u8 = "",
+    token: []const u8 = "", // pre-fetched AAD access token (skips ROPC) — for
+    // federated tenants where the token is obtained out-of-band (az / MSAL / C#).
 };
+
+/// Open a SQL Server connection, using Azure AD (ROPC token -> FEDAUTH) when the
+/// connection declared `auth = aad`, else a normal SQL login.
+fn tdsConnect(gpa: std.mem.Allocator, cfg: DbConfig) !*tds.Conn {
+    if (!cfg.aad) return tds.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls);
+    // Defaults mirror Microsoft.Data.SqlClient's "Active Directory Password":
+    // the built-in ADO.NET first-party client (pre-consented in every tenant, so
+    // no app registration), tenant discovery via "organizations", and the Azure
+    // SQL resource — the Dataverse TDS endpoint accepts database.windows.net tokens.
+    const mode: sql.TlsMode = if (cfg.tls == .off) .require else cfg.tls; // AAD mandates TLS
+    // A pre-fetched token wins (federated tenants: get it via az/MSAL out-of-band).
+    if (cfg.token.len > 0) return tds.Conn.connectAad(gpa, cfg.host, cfg.port, cfg.token, cfg.database, mode);
+    // Otherwise ROPC, defaulting to SqlClient's "Active Directory Password" values.
+    // Username/password: auto-detect managed (ROPC) vs federated/ADFS (WS-Trust),
+    // mirroring Microsoft.Data.SqlClient "Active Directory Password" — no app reg.
+    const client_id = if (cfg.client_id.len > 0) cfg.client_id else aad.ado_client_id;
+    // Dataverse (*.dynamics.com) wants a token for the org URL; Azure SQL wants
+    // database.windows.net. Both overridable via `resource`.
+    var rbuf: ?[]u8 = null;
+    defer if (rbuf) |b| gpa.free(b);
+    const resource = if (cfg.resource.len > 0) cfg.resource else if (std.mem.endsWith(u8, cfg.host, ".dynamics.com")) blk: {
+        rbuf = try std.fmt.allocPrint(gpa, "https://{s}", .{cfg.host});
+        break :blk rbuf.?;
+    } else aad.sql_resource;
+    const token = try aad.passwordToken(gpa, client_id, cfg.user, cfg.password, resource);
+    defer gpa.free(token);
+    return tds.Conn.connectAad(gpa, cfg.host, cfg.port, token, cfg.database, mode);
+}
 
 fn resolveDbConfig(env: *Env, conn: ast.Connection, default_port: u16) !DbConfig {
     var cfg = DbConfig{ .port = default_port };
@@ -1610,9 +1648,21 @@ fn resolveDbConfig(env: *Env, conn: ast.Connection, default_port: u16) !DbConfig
             const v = try evalCfgStr(env, attr.value);
             cfg.tls = std.meta.stringToEnum(sql.TlsMode, v) orelse
                 return planErr(env.diag, "connection `tls` must be \"off\", \"require\" or \"insecure\"");
+        } else if (std.mem.eql(u8, k, "auth")) {
+            cfg.aad = std.mem.eql(u8, try evalCfgStr(env, attr.value), "aad");
+        } else if (std.mem.eql(u8, k, "tenant")) {
+            cfg.tenant = try evalCfgStr(env, attr.value);
+        } else if (std.mem.eql(u8, k, "client_id")) {
+            cfg.client_id = try evalCfgStr(env, attr.value);
+        } else if (std.mem.eql(u8, k, "resource")) {
+            cfg.resource = try evalCfgStr(env, attr.value);
+        } else if (std.mem.eql(u8, k, "token")) {
+            cfg.token = try evalCfgStr(env, attr.value);
         }
     }
     if (cfg.host.len == 0) return planErr(env.diag, "connection needs a `host`");
+    // tenant/client_id are optional for aad — they default to SqlClient's
+    // built-in "Active Directory Password" values (see tdsConnect).
     return cfg;
 }
 
@@ -1795,6 +1845,16 @@ fn dbConfigOf(arena: std.mem.Allocator, conn: ast.Connection, default_port: u16)
             cfg.database = v;
         } else if (std.mem.eql(u8, attr.key, "tls")) {
             cfg.tls = std.meta.stringToEnum(sql.TlsMode, v) orelse .off;
+        } else if (std.mem.eql(u8, attr.key, "auth")) {
+            cfg.aad = std.mem.eql(u8, v, "aad");
+        } else if (std.mem.eql(u8, attr.key, "tenant")) {
+            cfg.tenant = v;
+        } else if (std.mem.eql(u8, attr.key, "client_id")) {
+            cfg.client_id = v;
+        } else if (std.mem.eql(u8, attr.key, "resource")) {
+            cfg.resource = v;
+        } else if (std.mem.eql(u8, attr.key, "token")) {
+            cfg.token = v;
         }
     }
     if (cfg.host.len == 0) return null;
@@ -1875,7 +1935,7 @@ fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     }
     if (std.mem.eql(u8, conn.connector, "sqlserver")) {
         const cfg = try resolveDbConfig(env, conn, 1433);
-        const c = tds.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls) catch |e|
+        const c = tdsConnect(env.gpa, cfg) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "sqlserver connect failed: {s}", .{@errorName(e)}));
         // append/overwrite → INSERT BULK; upsert → INSERT.
         return openBulkOrInsert(env.gpa, c, tds.BulkSink, .sqlserver, w.target, schema, w.mode, try redialFor(env.arena, .sqlserver, cfg)) catch |e| {
