@@ -600,10 +600,14 @@ pub const Parser = struct {
         if (self.eatKw("append")) return .append;
         if (self.eatKw("overwrite")) return .overwrite;
         if (self.eatKw("upsert")) {
-            try self.expectKw("on");
+            // `upsert on a, b` names the keys explicitly; bare `upsert` (no `on`)
+            // leaves keys empty — the runtime infers them from the source table's
+            // primary key at plan time (needs a `table` read on a SQL source).
             var keys = std.array_list.Managed([]const u8).init(self.arena);
-            try keys.append(try self.expectColName());
-            while (self.eat(.comma)) try keys.append(try self.expectColName());
+            if (self.eatKw("on")) {
+                try keys.append(try self.expectColName());
+                while (self.eat(.comma)) try keys.append(try self.expectColName());
+            }
             var partial: ?[]const []const u8 = null;
             if (self.eatKw("partial")) {
                 try self.expectKw("cols");
@@ -1127,4 +1131,18 @@ test "guard-form match has no subject" {
     try std.testing.expect(m.subject == null);
     try std.testing.expect(m.arms[0].guard != null);
     try std.testing.expect(m.arms[1].is_default);
+}
+
+test "bare upsert (no `on`) parses to empty keys for PK inference" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const src =
+        \\@batch
+        \\read sr table orders
+        \\  | write sr stream_load orders upsert
+    ;
+    const prog = try parseTest(ar.allocator(), src);
+    const w = prog.stmts[1].output.stages[1].node.write;
+    try std.testing.expect(w.mode == .upsert);
+    try std.testing.expectEqual(@as(usize, 0), w.mode.upsert.keys.len);
 }
