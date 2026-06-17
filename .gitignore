@@ -2,3 +2,5 @@
 zig-out/
 examples/out.csv
 ex/.env
+ex/crm_opportunity.sh
+ex/opportunity_columns.txt
