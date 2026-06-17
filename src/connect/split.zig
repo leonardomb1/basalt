@@ -60,6 +60,51 @@ pub fn wrap(arena: std.mem.Allocator, base: []const u8, pred: []const u8) ![]con
 /// composite PK, or an unsupported key type → caller stays serial). Each dialect's
 /// catalog query returns the same shape: (pk_column_name, type_name, est_rows) —
 /// one row per PK column, so a composite PK yields >1 row and is rejected below.
+/// Every primary-key column name for `table`, in key order — composite-safe and
+/// type-agnostic, unlike `introspectKey` (which gates to a single int/uuid split
+/// key). Returns an empty slice when the table has no declared primary key.
+/// Used to infer upsert keys from the source.
+pub fn introspectPkCols(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, table: []const u8) ![]const []const u8 {
+    const sql = switch (dialect) {
+        .postgres => try std.fmt.allocPrint(arena,
+            \\SELECT a.attname
+            \\FROM pg_index i
+            \\JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+            \\WHERE i.indrelid = '{s}'::regclass AND i.indisprimary
+            \\ORDER BY (SELECT k FROM generate_subscripts(i.indkey, 1) k WHERE i.indkey[k] = a.attnum)
+        , .{table}),
+        .sqlserver => try std.fmt.allocPrint(arena,
+            \\SELECT c.name
+            \\FROM sys.indexes i
+            \\JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            \\JOIN sys.columns c ON c.object_id = i.object_id AND c.column_id = ic.column_id
+            \\WHERE i.object_id = OBJECT_ID('{s}') AND i.is_primary_key = 1
+            \\ORDER BY ic.key_ordinal
+        , .{table}),
+        .mysql => try std.fmt.allocPrint(arena,
+            \\SELECT k.COLUMN_NAME
+            \\FROM information_schema.KEY_COLUMN_USAGE k
+            \\WHERE k.CONSTRAINT_NAME = 'PRIMARY' AND k.TABLE_SCHEMA = DATABASE() AND k.TABLE_NAME = '{s}'
+            \\ORDER BY k.ORDINAL_POSITION
+        , .{table}),
+    };
+    const conn = prober.open() catch return &.{};
+    var cur = conn.queryCursor(sql) catch {
+        conn.close();
+        return &.{};
+    };
+    defer cur.close(); // closes the connection
+    var cols = std.array_list.Managed([]const u8).init(arena);
+    while (try cur.nextBatch(arena)) |b| {
+        var r: usize = 0;
+        while (r < b.len) : (r += 1) {
+            const v = b.columns[0].getValue(r);
+            if (!v.isNull()) try cols.append(try arena.dupe(u8, v.string));
+        }
+    }
+    return cols.toOwnedSlice();
+}
+
 pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, table: []const u8) !?KeyInfo {
     // One probe returns the single-column PK (name + type) and the engine's row
     // estimate, so the size gate costs no extra round-trip.

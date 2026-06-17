@@ -16,6 +16,17 @@ const Batch = batchmod.Batch;
 
 pub const Format = enum { auto, text, json };
 
+/// Log through `logger` when a handle is wired (connectors get one from the
+/// runtime after open), else fall back to a raw stderr line — keeps standalone
+/// and test use noisy enough to debug without a logger.
+pub fn logOr(logger: ?*Logger, level: Level, comptime fmt: []const u8, args: anytype) void {
+    if (logger) |lg| {
+        lg.log(level, fmt, args);
+    } else {
+        std.debug.print(fmt ++ "\n", args);
+    }
+}
+
 pub const Level = enum(u8) {
     err = 0,
     warn = 1,

@@ -15,6 +15,7 @@ const eval = @import("../exec/eval.zig");
 const driver = @import("driver.zig");
 const mysql = @import("mysql.zig");
 const sqlmod = @import("sql.zig");
+const obs = @import("../runtime/obs.zig");
 
 const Batch = batchmod.Batch;
 
@@ -72,6 +73,9 @@ pub fn genCreateTable(
         .upsert => |u| u.keys,
         else => &.{schema.fields[0].name},
     };
+    // Inferred-PK upsert must have its keys resolved before reaching here; an
+    // empty key list would emit malformed DDL (empty PRIMARY KEY / DISTRIBUTED BY).
+    if (is_pk and keys.len == 0) return error.UpsertKeysUnresolved;
 
     // Column order: for a Primary Key table the key columns must come first.
     var ordered = std.array_list.Managed(types.Schema.Field).init(arena);
@@ -239,6 +243,9 @@ pub const StreamLoadSink = struct {
     seq: u64 = 0,
     run_id: u64 = 0,
     client: std.http.Client,
+    /// Set by the runtime after open(): error diagnostics go through the
+    /// structured logger; null (tests/embedded) falls back to raw stderr.
+    logger: ?*obs.Logger = null,
 
     pub fn open(gpa: std.mem.Allocator, cfg: Config, table: []const u8, schema: types.Schema, mode: ast.WriteMode) !*StreamLoadSink {
         const self = try gpa.create(StreamLoadSink);
@@ -291,7 +298,7 @@ pub const StreamLoadSink = struct {
         const conn = try mysql.Conn.connect(self.gpa, self.cfg.fe_host, self.cfg.fe_port, self.cfg.user, self.cfg.password, "", .off);
         defer conn.close();
         conn.exec(sql) catch |e| {
-            std.debug.print("starrocks DDL error: {s}\n  sql: {s}\n", .{ conn.last_error, sql });
+            obs.logOr(self.logger, .err, "starrocks DDL error: {s} (sql: {s})", .{ conn.last_error, sql });
             return e;
         };
     }
@@ -379,12 +386,12 @@ pub const StreamLoadSink = struct {
             .payload = self.buffer.items,
             .response_writer = &body_aw.writer,
         }) catch |e| {
-            std.debug.print("stream load PUT failed ({s}): {s} ({d} bytes)\n", .{ @errorName(e), url, self.buffer.items.len });
+            obs.logOr(self.logger, .err, "stream load PUT failed ({s}): {s} ({d} bytes)", .{ @errorName(e), url, self.buffer.items.len });
             return e;
         };
         const body = body_aw.writer.buffered();
         if (!loadSucceeded(body)) {
-            std.debug.print("stream load failed (http {d}): {s}\n", .{ @intFromEnum(res.status), body });
+            obs.logOr(self.logger, .err, "stream load failed (http {d}): {s}", .{ @intFromEnum(res.status), body });
             return error.StreamLoadFailed;
         }
     }
@@ -450,6 +457,34 @@ test "create table: append -> Duplicate Key" {
     try std.testing.expect(std.mem.indexOf(u8, sql, "`name` VARCHAR(65533)") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "DUPLICATE KEY(`id`)") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "BUCKETS 4") != null);
+}
+
+test "create table: inferred upsert with unresolved (empty) keys errors" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "id", .ty = types.Type.init(.int) },
+    } };
+    const mode = ast.WriteMode{ .upsert = .{ .keys = &.{}, .partial = null } };
+    try std.testing.expectError(error.UpsertKeysUnresolved, genCreateTable(ar.allocator(), "db", "t", schema, mode, 4, 1));
+}
+
+test "create table: composite inferred upsert -> multi-col PRIMARY KEY, ordered first" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "payload", .ty = types.Type.init(.string) },
+        .{ .name = "emp", .ty = types.Type.init(.string) },
+        .{ .name = "recno", .ty = types.Type.init(.int) },
+    } };
+    const mode = ast.WriteMode{ .upsert = .{ .keys = &.{ "emp", "recno" }, .partial = null } };
+    const sql = try genCreateTable(ar.allocator(), "bronze", "t", schema, mode, 4, 1);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "PRIMARY KEY(`emp`,`recno`)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "`emp` VARCHAR(65533) NOT NULL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "`recno` BIGINT NOT NULL") != null);
+    const epos = std.mem.indexOf(u8, sql, "`emp`").?;
+    const ppos = std.mem.indexOf(u8, sql, "`payload`").?;
+    try std.testing.expect(epos < ppos);
 }
 
 test "create table: upsert -> Primary Key, keys first + NOT NULL" {

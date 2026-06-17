@@ -201,6 +201,7 @@ pub const AuthState = struct {
     arena: std.mem.Allocator,
     cc: ConnConfig,
     header: ?std.http.Header = null,
+    logger: ?*obs.Logger = null,
 
     pub fn ensure(self: *AuthState, client: *std.http.Client) !?std.http.Header {
         if (self.header) |h| return h;
@@ -266,7 +267,7 @@ pub const AuthState = struct {
         const code = @intFromEnum(res.status);
         if (code != 200) {
             const b = aw.writer.buffered();
-            std.debug.print("login http {d} from {s}: {s}\n", .{ code, self.cc.login_url, b[0..@min(b.len, 300)] });
+            obs.logOr(self.logger, .err, "login http {d} from {s}: {s}", .{ code, self.cc.login_url, b[0..@min(b.len, 300)] });
             return statusError(code);
         }
         const root = try json.parseFromSliceLeaky(json.Value, arena, aw.writer.buffered(), .{});
@@ -399,6 +400,10 @@ pub const Options = struct {
     /// de dados" when ITS database is down. Listed codes retry with backoff and,
     /// if they outlive the retry budget, exit 75 so the control plane re-runs.
     retry_statuses: ?[]const u8 = null,
+    /// Runtime-injected (not a hint): structured logger for diagnostics and
+    /// heartbeats, wired BEFORE the first fetch so even open()-time errors log
+    /// structured. Null (tests/probes) falls back to raw stderr.
+    logger: ?*obs.Logger = null,
     /// page mode: dotted path to a "total pages" field in the response; when
     /// set, exactly that many pages are fetched. For APIs that never return an
     /// empty page (page-overrun keeps yielding data), where the empty-page
@@ -581,13 +586,14 @@ pub const HttpSource = struct {
             .first = null,
             .page_no = if (opts.paginate == .offset) opts.start_offset else opts.start_page,
         };
+        self.logger = opts.logger;
         self.slots = std.array_list.Managed(*Slot).init(gpa);
         if (cc.auth != .none) {
             var rcc = cc;
             // The login endpoint may be base_url-relative; resolve it once here.
             rcc.login_url = try joinUrl(arena, cc.base_url, cc.login_url);
             const a = try arena.create(AuthState);
-            a.* = .{ .arena = arena, .cc = rcc };
+            a.* = .{ .arena = arena, .cc = rcc, .logger = opts.logger };
             self.auth = a;
         }
 
@@ -619,16 +625,10 @@ pub const HttpSource = struct {
         }
         if (now - self.last_progress_ms < self.opts.progress_ms) return;
         self.last_progress_ms = now;
-        if (self.logger) |lg| {
-            if (self.total_pages) |t| {
-                lg.log(.info, "http: pages {d}/{d}, rows {d}", .{ self.pages_done, t, self.rows_done });
-            } else {
-                lg.log(.info, "http: pages {d}, rows {d}", .{ self.pages_done, self.rows_done });
-            }
-        } else if (self.total_pages) |t| {
-            std.debug.print("[http] pages {d}/{d}, rows {d}\n", .{ self.pages_done, t, self.rows_done });
+        if (self.total_pages) |t| {
+            obs.logOr(self.logger, .info, "http: pages {d}/{d}, rows {d}", .{ self.pages_done, t, self.rows_done });
         } else {
-            std.debug.print("[http] pages {d}, rows {d}\n", .{ self.pages_done, self.rows_done });
+            obs.logOr(self.logger, .info, "http: pages {d}, rows {d}", .{ self.pages_done, self.rows_done });
         }
     }
 
@@ -781,7 +781,7 @@ pub const HttpSource = struct {
         const slot = try self.spawnFetch(req, 0);
         const url_copy = arena.dupe(u8, slot.url) catch "";
         self.awaitSlot(slot) catch |e| {
-            std.debug.print("page fetch abandoned ({s}): {s}\n", .{ @errorName(e), url_copy });
+            obs.logOr(self.logger, .warn, "page fetch abandoned ({s}): {s}", .{ @errorName(e), url_copy });
             return e; // slot now belongs to its worker — do not free or touch
         };
         defer freeSlot(slot);
@@ -1017,12 +1017,12 @@ pub const HttpSource = struct {
         // pre-made copy of the URL is safe to reference in error reporting.
         const url_copy = arena.dupe(u8, slot.url) catch "";
         self.awaitSlot(slot) catch |e| {
-            std.debug.print("page fetch abandoned ({s}): {s}\n", .{ @errorName(e), url_copy });
+            obs.logOr(self.logger, .warn, "page fetch abandoned ({s}): {s}", .{ @errorName(e), url_copy });
             return e; // slot now belongs to its worker — do not free or touch
         };
         defer freeSlot(slot);
         if (slot.err) |e| {
-            std.debug.print("page fetch failed ({s}): {s}\n", .{ @errorName(e), slot.url });
+            obs.logOr(self.logger, .err, "page fetch failed ({s}): {s}", .{ @errorName(e), slot.url });
             return mapTransport(e);
         }
         if (slot.code == 401) {
@@ -1094,7 +1094,7 @@ pub const HttpSource = struct {
     /// retry_statuses mapping: session re-login gets first claim, and only when
     /// auth declines (no auth kind / refresh failed) does listedFallback apply.
     fn raiseStatus(self: *HttpSource, code: u16, url: []const u8, body: []const u8) anyerror {
-        std.debug.print("http {d} from {s}: {s}\n", .{ code, url, body[0..@min(body.len, 300)] });
+        obs.logOr(self.logger, .warn, "http {d} from {s}: {s}", .{ code, url, body[0..@min(body.len, 300)] });
         if (code == 401) return error.HttpUnauthorized;
         if (statusListed(self.opts.retry_statuses, code)) return error.HttpServerBusy;
         return statusError(code);
@@ -1128,7 +1128,7 @@ pub const HttpSource = struct {
         } else {
             // Abandoned workers may still touch the client's pool; leaking it
             // is the only safe option (the zombies die with the process).
-            std.debug.print("[http] {d} timed-out request(s) abandoned; http client leaked intentionally\n", .{self.zombies});
+            obs.logOr(self.logger, .warn, "http: {d} timed-out request(s) abandoned; client leaked intentionally", .{self.zombies});
         }
     }
 

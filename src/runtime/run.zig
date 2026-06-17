@@ -225,6 +225,7 @@ const StarrocksSinkSpec = struct {
     target: []const u8,
     schema: types.Schema,
     mode: ast.WriteMode,
+    logger: ?*obs.Logger = null,
 };
 
 /// `parallel.OpenSinkFn`: one StarRocks stream-load stream per lane.
@@ -237,6 +238,7 @@ fn openLaneStarrocksSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx: 
     defer gpa.free(lp);
     cfg.label_prefix = lp;
     const s = try starrocks.StreamLoadSink.open(gpa, cfg, spec.target, spec.schema, spec.mode);
+    s.logger = spec.logger;
     return s.sink();
 }
 
@@ -374,6 +376,7 @@ fn buildStarrocksSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*Starrock
     // lanes don't race DDL or repeatedly truncate.
     const setup = starrocks.StreamLoadSink.open(env.gpa, cfg, w.target, schema, w.mode) catch |e|
         return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "starrocks setup failed ({s}) — {s}", .{ @errorName(e), env.diag.msg }));
+    setup.logger = env.log;
     setup.sink().close() catch |e|
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "starrocks setup close failed: {s}", .{@errorName(e)}));
     cfg.auto_create = false;
@@ -381,7 +384,7 @@ fn buildStarrocksSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*Starrock
     const spec = try env.arena.create(StarrocksSinkSpec);
     // Lanes must not re-truncate (overwrite's TRUNCATE already ran once in setup
     // above), so map overwrite -> append for the per-lane sinks — same as buildSqlSinkSpec.
-    spec.* = .{ .cfg = cfg, .target = w.target, .schema = schema, .mode = if (w.mode == .overwrite) .append else w.mode };
+    spec.* = .{ .cfg = cfg, .target = w.target, .schema = schema, .mode = if (w.mode == .overwrite) .append else w.mode, .logger = env.log };
     return spec;
 }
 
@@ -583,13 +586,17 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     const src_base = env.sources.items.len; // sources this output opens (for early release on the split path)
     const res = try buildPipeline(env, stages[0 .. stages.len - 1]);
 
+    // Resolve a bare `upsert` (inferred PK) now that the read is open and
+    // env.sql_desc names the source table. Used by every sink path below.
+    const wr = try resolveUpsertKeys(env, last.write);
+
     // Split-parallel: a map-only pipeline (no breakers/limit) reading a splittable
     // SQL source fans out into N key-range lanes, each on its own connection. A
     // StarRocks sink also fans out (one stream-load stream per lane); other sinks
     // (CSV) stay shared under a mutex. Non-splittable/stateful pipelines stay serial.
     if (opts.threads > 1 and env.sql_desc != null) {
         if (try op.linearize(arena, res.op)) |lin| {
-            if (try planSplit(env, env.sql_desc.?, stages[0], opts.threads, last.write)) |sp| {
+            if (try planSplit(env, env.sql_desc.?, stages[0], opts.threads, wr)) |sp| {
                 // The planning source was opened only to build res.op + discover the
                 // split descriptor (which copies its own config); the lanes open their
                 // own connections, so close it now rather than holding an idle
@@ -602,10 +609,10 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
                 var ctx = SplitCtx{ .gpa = gpa, .kind = env.sql_desc.?.kind, .cfg = env.sql_desc.?.cfg, .base_sql = env.sql_desc.?.base_sql };
                 lanes_used.* = @max(lanes_used.*, @min(opts.threads, sp.predicates.len));
                 env.log.log(.info, "split-parallel: {d} splits over {d} lanes on key range", .{ sp.predicates.len, @min(opts.threads, sp.predicates.len) });
-                if (try buildParallelSink(env, last.write, schema)) |mode| {
+                if (try buildParallelSink(env, wr, schema)) |mode| {
                     stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lin.stages, mode, opts.threads, env.rows_read);
                 } else {
-                    const snk = try openSink(env, last.write, schema);
+                    const snk = try openSink(env, wr, schema);
                     var snk_open = true;
                     errdefer if (snk_open) snk.abort(); // failed run: discard the tail buffer, don't commit it
                     stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lin.stages, .{ .shared = snk }, opts.threads, env.rows_read);
@@ -617,7 +624,7 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
         }
     }
 
-    const snk = try openSink(env, last.write, res.schema);
+    const snk = try openSink(env, wr, res.schema);
     // On any error before close, abort the sink: discard its tail buffer instead
     // of letting a later close commit partial data, and release its connection.
     // Once close() runs it owns teardown (success or failure), so the flag keeps
@@ -1503,9 +1510,10 @@ fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
     }
     if (std.mem.eql(u8, rd.connector, "http")) {
         if (rd.form != .path) return planErr(env.diag, "read http needs a quoted URL");
-        const s = httpsrc.HttpSource.open(env.arena, env.gpa, rd.form.path, httpsrc.optsFromHints(hints)) catch |e|
+        var hopts = httpsrc.optsFromHints(hints);
+        hopts.logger = env.log;
+        const s = httpsrc.HttpSource.open(env.arena, env.gpa, rd.form.path, hopts) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "http read failed for `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
-        s.logger = env.log;
         return s.source();
     }
     if (std.mem.eql(u8, rd.connector, "csv")) {
@@ -1516,6 +1524,13 @@ fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
     }
     const conn = env.connections.get(rd.connector) orelse
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown connection `{s}`", .{rd.connector}));
+    // A read stage may carry a `@[where = "..."]` predicate (pushed into the SQL,
+    // already `${var}`-interpolated by renderHints) — same hint the union form
+    // uses, now honored on a plain `read <conn> table/query` too.
+    var rd_eff = rd;
+    if (forHintName(hints, "where")) |wh| {
+        if (wh.len > 0) rd_eff.where = wh;
+    }
     if (std.mem.eql(u8, conn.connector, "http")) {
         if (rd.form != .path) return planErr(env.diag, "reading an http connection needs a quoted path");
         const kvs = try env.arena.alloc(httpsrc.KV, conn.config.len);
@@ -1523,45 +1538,46 @@ fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
         var errmsg: []const u8 = "";
         const cc = httpsrc.connFromKvs(env.arena, kvs, &errmsg) catch
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "http connection `{s}`: {s}", .{ rd.connector, errmsg }));
-        const s = httpsrc.HttpSource.openConn(env.arena, env.gpa, cc, rd.form.path, httpsrc.optsFromHints(hints)) catch |e|
+        var hopts = httpsrc.optsFromHints(hints);
+        hopts.logger = env.log;
+        const s = httpsrc.HttpSource.openConn(env.arena, env.gpa, cc, rd.form.path, hopts) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "http read failed for `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
-        s.logger = env.log;
         return s.source();
     }
     if (std.mem.eql(u8, conn.connector, "sqlserver")) {
         const cfg = try resolveDbConfig(env, conn, 1433);
-        const query = try readSql(env, rd);
+        const query = try readSql(env, rd_eff);
         const c = tds.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "sqlserver connect failed: {s}", .{@errorName(e)}));
         const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
             defer c.close();
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sqlserver read failed ({s}): {s}", .{ @errorName(e), c.last_error }));
         };
-        env.sql_desc = try sqlDescFor(env, .sqlserver, .sqlserver, cfg, query, rd);
+        env.sql_desc = try sqlDescFor(env, .sqlserver, .sqlserver, cfg, query, rd_eff);
         return s.source();
     }
     if (std.mem.eql(u8, conn.connector, "mysql")) {
         const cfg = try resolveDbConfig(env, conn, 3306);
-        const query = try readSql(env, rd);
+        const query = try readSql(env, rd_eff);
         const c = mysql.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "mysql connect failed: {s}", .{@errorName(e)}));
         const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
             defer c.close();
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "mysql read failed ({s}): {s}", .{ @errorName(e), c.last_error }));
         };
-        env.sql_desc = try sqlDescFor(env, .mysql, .mysql, cfg, query, rd);
+        env.sql_desc = try sqlDescFor(env, .mysql, .mysql, cfg, query, rd_eff);
         return s.source();
     }
     if (std.mem.eql(u8, conn.connector, "postgres")) {
         const cfg = try resolveDbConfig(env, conn, 5432);
-        const query = try readSql(env, rd);
+        const query = try readSql(env, rd_eff);
         const c = postgres.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "postgres connect failed: {s}", .{@errorName(e)}));
         const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
             defer c.close();
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "postgres read failed ({s}): {s}", .{ @errorName(e), c.last_error }));
         };
-        env.sql_desc = try sqlDescFor(env, .postgres, .postgres, cfg, query, rd);
+        env.sql_desc = try sqlDescFor(env, .postgres, .postgres, cfg, query, rd_eff);
         return s.source();
     }
     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unsupported source connector `{s}`", .{conn.connector}));
@@ -1808,6 +1824,25 @@ fn qualStr(arena: std.mem.Allocator, q: ast.QualName) ![]const u8 {
     return std.mem.join(arena, ".", q.parts);
 }
 
+/// Bare `upsert` (no `on <key>`) infers the upsert keys from the source table's
+/// primary key at plan time. Needs the lead read to be a SQL `table` source
+/// (env.sql_desc.table set); a `query` source or non-SQL source can't be
+/// introspected and gets a clear error pointing at `upsert on <col>`.
+fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
+    if (w.mode != .upsert or w.mode.upsert.keys.len > 0) return w;
+    const desc = env.sql_desc orelse return planErr(env.diag, "`upsert` without `on <key>` infers the primary key from the source, which needs a SQL `table` read — this pipeline's source can't be introspected; name the key with `upsert on <col>`");
+    const table = desc.table orelse return planErr(env.diag, "`upsert` key inference needs `read <conn> table <name>` (a `query` source has no single table to introspect); name the key with `upsert on <col>`");
+    var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql };
+    const prober = splitmod.Prober{ .ctx = &pctx, .openFn = proberOpen };
+    const keys = splitmod.introspectPkCols(env.arena, prober, desc.dialect, table) catch |e|
+        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read primary key of `{s}`: {s}", .{ table, @errorName(e) }));
+    if (keys.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no primary key found on `{s}`; name the key with `upsert on <col>`", .{table}));
+    env.log.log(.info, "upsert: inferred key on {s}: {s}", .{ table, try std.mem.join(env.arena, ", ", keys) });
+    var out = w;
+    out.mode = .{ .upsert = .{ .keys = keys, .partial = w.mode.upsert.partial } };
+    return out;
+}
+
 fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (std.mem.eql(u8, w.connector, "stdout")) {
         const writer = tablemod.TableWriter.open(env.gpa, schema) catch
@@ -1825,6 +1860,7 @@ fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         const cfg = try resolveStarrocksConfig(env, conn);
         const s = starrocks.StreamLoadSink.open(env.gpa, cfg, w.target, schema, w.mode) catch |e|
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "starrocks sink open failed ({s}) — {s}", .{ @errorName(e), env.diag.msg }));
+        s.logger = env.log;
         return s.sink();
     }
     if (std.mem.eql(u8, conn.connector, "mysql")) {
