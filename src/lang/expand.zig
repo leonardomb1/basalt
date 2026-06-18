@@ -62,7 +62,14 @@ fn expandStmt(cx: *Ctx, s: ast.Stmt) Error!ast.Stmt {
         .connection => |c| .{ .connection = .{ .name = c.name, .connector = c.connector, .config = try expandAttrs(cx, c.config), .pos = c.pos } },
         .binding => |b| .{ .binding = .{ .name = b.name, .pipeline = try expandPipeline(cx, b.pipeline), .pos = b.pos } },
         .output => |p| .{ .output = try expandPipeline(cx, p) },
-        .for_each => |fe| .{ .for_each = .{ .var_names = fe.var_names, .source = fe.source, .hints = fe.hints, .body = try expandPipeline(cx, fe.body), .pos = fe.pos } },
+        .for_each => |fe| blk: {
+            var body = std.array_list.Managed(ast.Stmt).init(cx.arena);
+            for (fe.body) |st| {
+                if (st == .func) continue; // fns are top-level; ignore in for bodies
+                try body.append(try expandStmt(cx, st));
+            }
+            break :blk .{ .for_each = .{ .var_names = fe.var_names, .source = fe.source, .hints = fe.hints, .body = try body.toOwnedSlice(), .pos = fe.pos } };
+        },
         .match => |m| .{ .match = try expandStmtMatch(cx, m) },
         .func => unreachable, // dropped in expandProgram / skipped in arm bodies
     };

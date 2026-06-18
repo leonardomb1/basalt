@@ -28,6 +28,19 @@ pub fn parseSource(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic)
     return p.parseProgram();
 }
 
+/// Tokenize and parse a single standalone expression (used to evaluate the body of
+/// a `${ <expr> }` interpolation). Fails if there is trailing input after the expr.
+pub fn parseExprStr(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic) Error!*ast.Expr {
+    const toks = try lex.tokenize(arena, src);
+    var p = Parser{ .arena = arena, .toks = toks, .diag = diag };
+    for (toks) |t| {
+        if (t.tag == .invalid) return p.fail(.{ .line = t.line, .col = t.col }, "invalid token `{s}`", .{t.text});
+    }
+    const e = try p.parseExpr();
+    if (!p.at(.eof)) return p.fail(p.curPos(), "unexpected trailing input in expression", .{});
+    return e;
+}
+
 pub const Parser = struct {
     arena: std.mem.Allocator,
     toks: []const Token,
@@ -264,8 +277,21 @@ pub const Parser = struct {
         try self.expectKw("in");
         const source = try self.parseForSource();
         const hints = try self.parseHints();
-        const body = try self.parsePipeline();
+        const body = try self.parseForBody();
         return .{ .var_names = try names.toOwnedSlice(), .source = source, .hints = hints, .body = body, .pos = pos };
+    }
+
+    /// A `for` body: a `{ ... }` statement block, a bare `match` statement (which
+    /// branches per row on the loop variables), or a single pipeline. The latter two
+    /// are sugar for a one-statement block.
+    fn parseForBody(self: *Parser) Error![]const ast.Stmt {
+        if (self.at(.lbrace)) return self.parseBlock();
+        const one = try self.arena.alloc(ast.Stmt, 1);
+        one[0] = if (self.isKw("match"))
+            .{ .match = try self.parseStmtMatch() }
+        else
+            .{ .output = try self.parsePipeline() };
+        return one;
     }
 
     /// A discovery `read` (`<conn> table|query|<path>`) or a JSON-array path
@@ -1017,11 +1043,14 @@ test "parse a for-each over a table list" {
     try std.testing.expectEqualStrings("mssql", fe.source.read.connector);
     try std.testing.expect(fe.source.read.form == .query);
     try std.testing.expectEqual(@as(usize, 2), fe.hints.len);
-    try std.testing.expectEqual(@as(usize, 2), fe.body.stages.len);
-    const rd = fe.body.stages[0].node.read;
+    // A bare pipeline body is a one-statement block holding an `output` pipeline.
+    try std.testing.expectEqual(@as(usize, 1), fe.body.len);
+    const body = fe.body[0].output;
+    try std.testing.expectEqual(@as(usize, 2), body.stages.len);
+    const rd = body.stages[0].node.read;
     try std.testing.expectEqual(@as(usize, 2), rd.form.table.parts.len);
     try std.testing.expectEqualStrings("${tbl}", rd.form.table.parts[1]);
-    const w = fe.body.stages[1].node.write;
+    const w = body.stages[1].node.write;
     try std.testing.expectEqualStrings("stream_load", w.form.?);
     try std.testing.expectEqualStrings("${tbl}", w.target);
     try std.testing.expect(w.mode == .upsert);

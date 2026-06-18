@@ -280,6 +280,18 @@ pub const Resolver = struct {
 // Analysis
 // ---------------------------------------------------------------------------
 
+/// Collect every output pipeline reachable in a statement block (a `for` or
+/// `match` arm body), descending through nested `for`/`match` so all branches
+/// are type-checked offline.
+fn collectStmtOutputs(outputs: *std.array_list.Managed(ast.Pipeline), stmts: []const ast.Stmt) error{OutOfMemory}!void {
+    for (stmts) |st| switch (st) {
+        .output => |p| try outputs.append(p),
+        .for_each => |fe| try collectStmtOutputs(outputs, fe.body),
+        .match => |m| for (m.arms) |arm| try collectStmtOutputs(outputs, arm.body),
+        else => {},
+    };
+}
+
 pub fn analyze(arena: std.mem.Allocator, raw_program: ast.Program, resolver: ?Resolver, diag: *Diag) error{ AnalyzeFailed, OutOfMemory }!Plan {
     var expand_msg: []const u8 = "";
     const program = expand.expandProgram(arena, raw_program, null, &expand_msg) catch |e| switch (e) {
@@ -297,18 +309,13 @@ pub fn analyze(arena: std.mem.Allocator, raw_program: ast.Program, resolver: ?Re
         .binding => |b| try bindings.put(b.name, b.pipeline),
         .connection => |c| try connections.put(c.name, c),
         .output => |p| try outputs.append(p),
-        // A for-each contributes its body template as an output for validation;
+        // A for-each contributes the output pipelines in its body for validation;
         // `${var}` placeholders ride through as literal text (DB source schemas stay
         // unresolved offline, so they don't false-error — same as a normal DB read).
-        .for_each => |fe| try outputs.append(fe.body),
-        // Validate the output pipelines inside match arm bodies (one level; nested
-        // matches are validated at run time). Which arm fires is plan-time, so all
-        // arms' pipelines are checked.
-        .match => |m| for (m.arms) |arm| for (arm.body) |st| switch (st) {
-            .output => |p| try outputs.append(p),
-            .for_each => |fe| try outputs.append(fe.body),
-            else => {},
-        },
+        .for_each => |fe| try collectStmtOutputs(&outputs, fe.body),
+        // Validate the output pipelines inside match arm bodies. Which arm fires is
+        // plan-time, so all arms' pipelines are checked.
+        .match => |m| for (m.arms) |arm| try collectStmtOutputs(&outputs, arm.body),
         .param, .kind, .func => {},
     };
     if (outputs.items.len == 0)

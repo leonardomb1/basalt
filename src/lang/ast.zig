@@ -227,10 +227,12 @@ pub const FnDecl = struct {
     pos: Pos,
 };
 
-/// `for <var,...> in <source> @[...] <body-pipeline>`: a plan-time fan-out.
-/// `source` is a discovery read; the planner runs it once, mapping its first N
-/// columns onto the N `var_names`, then instantiates `body` per row with each
-/// `${var}` interpolated into the read/write targets. `hints` carry `mode`
+/// `for <var,...> in <source> @[...] <body>`: a plan-time fan-out. `source` is a
+/// discovery read; the planner runs it once, mapping its first N columns onto the
+/// N `var_names`, then runs `body` per row with each `${var}` interpolated into the
+/// read/write targets. The body is a statement block — a bare pipeline is sugar for
+/// a one-statement block — so it may hold `match` statements that branch per row on
+/// the loop variables (e.g. picking an upsert key). `hints` carry `mode`
 /// (sequential|parallel) and `on_error` (stop|continue).
 /// A for-each source: either a discovery `read` (`for x in <conn> query "..."`)
 /// or a JSON-array param path (`for x in job.tables`, with each object element's
@@ -244,7 +246,7 @@ pub const ForEach = struct {
     var_names: []const []const u8,
     source: ForSource,
     hints: []const Hint,
-    body: Pipeline,
+    body: []const Stmt,
     pos: Pos,
 };
 
