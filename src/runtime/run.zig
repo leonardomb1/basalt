@@ -766,12 +766,15 @@ fn jsonToStr(arena: std.mem.Allocator, v: std.json.Value) ![]const u8 {
     };
 }
 
-/// Replace every needle (`${var}`) in `s` with its row value (chained over all
-/// loop variables). Returns `s` unchanged (no copy) when no needle is present.
-/// Replace `${var}` / `${var:modifier}` occurrences in `s`. `names[i]` is a loop
-/// variable bound to `values[i]`. Supported modifiers: `lower`, `upper`. An unknown
-/// `${...}` (no matching var) is left verbatim. Strings without `${` are returned
-/// as-is (no allocation).
+/// Render every `${ ... }` placeholder in `s`, chaining over the loop variables
+/// `names[i]` → `values[i]`. Two body shapes:
+///   * `${var}` — fast path: substitute the loop variable's value. An unknown
+///     variable is left verbatim, so non-loop `${...}` text rides through untouched.
+///   * `${ <expr> }` — anything else is parsed as an expression and evaluated with
+///     the loop variables in scope (as string values), then formatted to text. This
+///     is where conditionals/coalesce/case-folding live: `${lower(name)}`,
+///     `${if(pk == "", concat(name, "id"), pk)}`, `${coalesce(pk, "default")}`.
+/// Strings without `${` are returned as-is (no allocation).
 fn interpAll(arena: std.mem.Allocator, s: []const u8, names: []const []const u8, values: Row) ![]const u8 {
     if (std.mem.indexOf(u8, s, "${") == null) return s;
     var out = std.array_list.Managed(u8).init(arena);
@@ -779,23 +782,24 @@ fn interpAll(arena: std.mem.Allocator, s: []const u8, names: []const []const u8,
     var i: usize = 0;
     while (i < s.len) {
         if (s[i] == '$' and i + 1 < s.len and s[i + 1] == '{') {
-            const close = std.mem.indexOfScalarPos(u8, s, i + 2, '}') orelse {
+            const close = interpClose(s, i + 2) orelse {
                 try out.appendSlice(s[i..]); // unterminated `${` — emit literally
                 break;
             };
-            const inner = s[i + 2 .. close]; // `var` or `var:mod`
-            const colon = std.mem.indexOfScalar(u8, inner, ':');
-            const vname = if (colon) |c| inner[0..c] else inner;
-            const mod: ?[]const u8 = if (colon) |c| inner[c + 1 ..] else null;
-            var found = false;
-            for (names, values) |nm, val| {
-                if (std.mem.eql(u8, nm, vname)) {
-                    try appendInterp(&out, val, mod);
-                    found = true;
-                    break;
+            const inner = s[i + 2 .. close];
+            if (bareInterp(inner)) {
+                var found = false;
+                for (names, values) |nm, val| {
+                    if (std.mem.eql(u8, nm, inner)) {
+                        try out.appendSlice(val);
+                        found = true;
+                        break;
+                    }
                 }
+                if (!found) try out.appendSlice(s[i .. close + 1]); // unknown var: leave verbatim
+            } else {
+                try out.appendSlice(try evalInterpExpr(arena, inner, names, values));
             }
-            if (!found) try out.appendSlice(s[i .. close + 1]); // unknown var: leave verbatim
             i = close + 1;
         } else {
             try out.append(s[i]);
@@ -805,15 +809,79 @@ fn interpAll(arena: std.mem.Allocator, s: []const u8, names: []const []const u8,
     return out.toOwnedSlice();
 }
 
-fn appendInterp(out: *std.array_list.Managed(u8), val: []const u8, mod: ?[]const u8) !void {
-    const m = mod orelse return out.appendSlice(val);
-    if (std.mem.eql(u8, m, "lower")) {
-        for (val) |c| try out.append(std.ascii.toLower(c));
-    } else if (std.mem.eql(u8, m, "upper")) {
-        for (val) |c| try out.append(std.ascii.toUpper(c));
-    } else {
-        try out.appendSlice(val); // unknown modifier: emit value unchanged
+/// The index of the `}` that closes a `${` opened just before `start`. Scanning is
+/// string-aware (a `}` inside a `"..."` does not close) and brace-balanced.
+fn interpClose(s: []const u8, start: usize) ?usize {
+    var depth: usize = 1;
+    var k = start;
+    while (k < s.len) {
+        switch (s[k]) {
+            '"' => {
+                k += 1;
+                while (k < s.len) {
+                    if (s[k] == '\\') {
+                        k += 2;
+                        continue;
+                    }
+                    if (s[k] == '"') {
+                        k += 1;
+                        break;
+                    }
+                    k += 1;
+                }
+            },
+            '{' => {
+                depth += 1;
+                k += 1;
+            },
+            '}' => {
+                depth -= 1;
+                if (depth == 0) return k;
+                k += 1;
+            },
+            else => k += 1,
+        }
     }
+    return null;
+}
+
+/// A `${var}` body — a bare identifier (the fast variable-substitution path).
+/// Anything richer (calls, operators, a path) is evaluated as an expression.
+fn bareInterp(inner: []const u8) bool {
+    if (inner.len == 0 or !(std.ascii.isAlphabetic(inner[0]) or inner[0] == '_')) return false;
+    for (inner[1..]) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
+    return true;
+}
+
+/// The removed `${var:lower}` / `${var:upper}` modifier shape — `ident:ident`. Kept
+/// only to emit a clear migration error pointing at the function form.
+fn deprecatedModifier(inner: []const u8) bool {
+    const c = std.mem.indexOfScalar(u8, inner, ':') orelse return false;
+    return bareInterp(inner[0..c]) and bareInterp(inner[c + 1 ..]);
+}
+
+/// Parse a `${ <expr> }` body and evaluate it with the loop variables bound as
+/// string values, returning the result formatted as text. A parse/eval failure is
+/// a permanent error (the placeholder is reported on stderr for diagnosis).
+fn evalInterpExpr(arena: std.mem.Allocator, text: []const u8, names: []const []const u8, values: Row) ![]const u8 {
+    if (deprecatedModifier(text)) {
+        std.debug.print("[interp] ${{{s}}}: the `:lower`/`:upper` modifier was removed — use a function, e.g. lower(name) / upper(name)\n", .{text});
+        return error.InterpFailed;
+    }
+    var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const e = parser.parseExprStr(arena, text, &diag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        std.debug.print("[interp] ${{{s}}}: {s}\n", .{ text, diag.msg });
+        return error.InterpFailed;
+    };
+    const vals = try arena.alloc(Value, values.len);
+    for (values, vals) |cell, *v| v.* = .{ .string = cell };
+    const result = eval.constEval(arena, e, names, vals) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        std.debug.print("[interp] ${{{s}}}: {s}\n", .{ text, @errorName(err) });
+        return error.InterpFailed;
+    };
+    return eval.valueToString(arena, result);
 }
 
 fn renderQual(arena: std.mem.Allocator, q: ast.QualName, needles: []const []const u8, row: Row) !ast.QualName {
@@ -1031,11 +1099,7 @@ fn forWorker(ctx: *ForCtx) void {
         };
         var st = Stats{ .run_id = 0 };
         var lanes: usize = 1;
-        const pipe = renderPipeline(&w_env, ctx.fe.body, ctx.needles, row) catch |e| {
-            forRecordFail(ctx, row[0], @errorName(e), "", isTransient(e));
-            continue;
-        };
-        if (runOutput(&w_env, pipe, ctx.worker_opts, &st, &lanes, &w_batch)) |_| {
+        if (runForBody(&w_env, ctx.fe.body, ctx.needles, row, ctx.worker_opts, &st, &lanes, &w_batch)) |_| {
             _ = ctx.rows_out.fetchAdd(st.rows_out, .monotonic);
             if (ctx.outcomes) |sink| sink.record(row[0], true, "", false);
         } else |e| {
@@ -1050,7 +1114,70 @@ fn forWorker(ctx: *ForCtx) void {
     }
 }
 
-/// Expand a `for <vars> in <source>` block into one pipeline per discovered row.
+/// Run one row of a `for` body. The body is a statement block (a bare pipeline is a
+/// one-statement block): each pipeline is rendered with the row's `${var}` values and
+/// executed; a `match` branches on the loop variables and runs the winning arm.
+fn runForBody(env: *Env, body: []const ast.Stmt, needles: []const []const u8, row: Row, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+    for (body) |*st| try runForStmt(env, st, needles, row, opts, stats, lanes_used, batch_arena);
+}
+
+fn runForStmt(env: *Env, s: *const ast.Stmt, needles: []const []const u8, row: Row, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+    switch (s.*) {
+        .output => |p| {
+            const pipe = try renderPipeline(env, p, needles, row);
+            try runOutput(env, pipe, opts, stats, lanes_used, batch_arena);
+        },
+        .match => |m| try runForMatch(env, m, needles, row, opts, stats, lanes_used, batch_arena),
+        // Only pipelines and the `match` that selects among them are meaningful per row.
+        else => return planErr(env.diag, "a `for` body may contain only pipelines and `match` statements"),
+    }
+}
+
+/// A `match` evaluated per row of a `for`: the loop variables are bound as string
+/// values (shadowing same-named params), so a guard like `pk == ""` picks a branch.
+fn runForMatch(env: *Env, m: ast.StmtMatch, needles: []const []const u8, row: Row, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+    var names = std.array_list.Managed([]const u8).init(env.arena);
+    var values = std.array_list.Managed(Value).init(env.arena);
+    for (needles, row) |nm, cell| {
+        try names.append(nm);
+        try values.append(.{ .string = cell });
+    }
+    var it = env.params.iterator();
+    while (it.next()) |kv| {
+        try names.append(kv.key_ptr.*);
+        try values.append(kv.value_ptr.*);
+    }
+    const ns = names.items;
+    const vs = values.items;
+
+    var subj: ?Value = null;
+    if (m.subject) |s| subj = eval.constEval(env.arena, s, ns, vs) catch |e|
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for/match subject: {s}", .{@errorName(e)}));
+
+    for (m.arms) |arm| {
+        const hit = blk: {
+            if (arm.is_default) break :blk true;
+            if (arm.guard) |g| {
+                const gv = eval.constEval(env.arena, g, ns, vs) catch |e|
+                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for/match guard: {s}", .{@errorName(e)}));
+                break :blk (gv == .bool and gv.bool);
+            }
+            const sv = subj orelse break :blk false;
+            for (arm.pats) |p| {
+                const pv = eval.constEval(env.arena, p, ns, vs) catch |e|
+                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for/match pattern: {s}", .{@errorName(e)}));
+                if (eval.compareValues(sv, pv)) |ord| if (ord == .eq) break :blk true;
+            }
+            break :blk false;
+        };
+        if (hit) {
+            for (arm.body) |*st| try runForStmt(env, st, needles, row, opts, stats, lanes_used, batch_arena);
+            return; // first matching arm wins
+        }
+    }
+}
+
+/// Expand a `for <vars> in <source>` block, running its body once per discovered row.
 /// `mode` (sequential|parallel) and `on_error` (stop|continue) come from `@[...]`.
 fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) !void {
     const mode: ForMode = if (forHintIdent(fe.hints, "mode")) |m|
@@ -1080,8 +1207,7 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
                 if (aborting()) return error.Aborted; // stop starting new items
                 const base = env.sources.items.len;
                 env.diag.retryable = false; // classify this item's failure freshly
-                const pipe = try renderPipeline(env, fe.body, needles, row);
-                if (runOutput(env, pipe, opts, stats, lanes_used, batch_arena)) |_| {
+                if (runForBody(env, fe.body, needles, row, opts, stats, lanes_used, batch_arena)) |_| {
                     for (env.sources.items[base..]) |sc| sc.close();
                     env.sources.shrinkRetainingCapacity(base);
                     if (opts.outcomes) |sink| sink.record(row[0], true, "", false);
@@ -2309,6 +2435,45 @@ test "for-each loop var interpolates into a select column value" {
     const out = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
     defer alloc.free(out);
     try std.testing.expectEqualStrings("id,EMPRESA\n1,01\n2,01\n", out);
+}
+
+test "interpAll: bare-var fast path and expression bodies" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const names = [_][]const u8{ "name", "pk" };
+
+    // fast path: bare var substitution; unknown var left verbatim
+    const empty = [_][]const u8{ "Account", "" };
+    try std.testing.expectEqualStrings("Account", try interpAll(a, "${name}", &names, &empty));
+    try std.testing.expectEqualStrings("${nope}", try interpAll(a, "${nope}", &names, &empty));
+
+    // case folding is now a function, not a modifier
+    try std.testing.expectEqualStrings("crm_account", try interpAll(a, "crm_${lower(name)}", &names, &empty));
+    try std.testing.expectEqualStrings("ACCOUNT", try interpAll(a, "${upper(name)}", &names, &empty));
+
+    // expression body: conditional + concat picks the convention when pk is empty
+    const key = "${if(pk == \"\", concat(lower(name), \"id\"), pk)}";
+    try std.testing.expectEqualStrings("accountid", try interpAll(a, key, &names, &empty));
+
+    // ...and uses the supplied pk when present
+    const given = [_][]const u8{ "ListMember", "lm_custom_id" };
+    try std.testing.expectEqualStrings("lm_custom_id", try interpAll(a, key, &names, &given));
+
+    // a string literal containing `}` inside the expression does not end the placeholder
+    try std.testing.expectEqualStrings("}", try interpAll(a, "${if(pk == \"\", \"}\", pk)}", &names, &empty));
+}
+
+test "interpAll: malformed and deprecated-modifier bodies are permanent errors" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const names = [_][]const u8{ "name", "pk" };
+    const vals = [_][]const u8{ "Account", "" };
+    try std.testing.expectError(error.InterpFailed, interpAll(a, "${if(pk ==)}", &names, &vals));
+    // the removed `:lower` / `:upper` modifier shape
+    try std.testing.expectError(error.InterpFailed, interpAll(a, "${name:lower}", &names, &vals));
+    try std.testing.expectError(error.InterpFailed, interpAll(a, "${name:upper}", &names, &vals));
 }
 
 /// Parse and run a fully-assembled `script`, returning the contents of out.csv.

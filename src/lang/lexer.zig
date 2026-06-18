@@ -94,35 +94,23 @@ pub const Lexer = struct {
         return self.make(.int, start, sline, scol);
     }
 
-    /// `${ident}` or `${ident:modifier}` — a template placeholder. The token text
-    /// is the whole lexeme (including `${`, optional `:mod`, and `}`) so the planner
-    /// can render it. Modifiers (e.g. `:lower`, `:upper`) are applied at render time.
+    /// `${ <body> }` in a bare-name position — a template placeholder. The body is any
+    /// expression text (`name`, `lower(name)`, `if(pk == "", concat(name, "id"), pk)`,
+    /// …); it is captured verbatim and parsed/evaluated at render time. The token text
+    /// is the whole lexeme (including `${` and `}`).
     fn lexInterp(self: *Lexer, start: usize, sline: u32, scol: u32) Token {
-        self.bump(); // $
-        self.bump(); // {
-        const name_start = self.pos;
-        while (self.peek()) |d| {
-            if (!isIdentCont(d)) break;
-            self.bump();
-        }
-        if (self.pos == name_start) return self.make(.invalid, start, sline, scol);
-        if (self.peek() == ':') {
-            self.bump(); // :
-            const mod_start = self.pos;
-            while (self.peek()) |d| {
-                if (!isIdentCont(d)) break;
-                self.bump();
-            }
-            if (self.pos == mod_start) return self.make(.invalid, start, sline, scol);
-        }
-        if (self.peek() != '}') return self.make(.invalid, start, sline, scol);
-        self.bump(); // }
+        const body_start = self.pos + 2; // after `${`
+        const closed = self.skipInterpHole();
+        if (!closed) return self.make(.invalid, start, sline, scol); // unterminated
+        if (self.pos - 1 == body_start) return self.make(.invalid, start, sline, scol); // empty `${}`
         return self.make(.interp, start, sline, scol);
     }
 
-    // Scan a `"..."` body, honoring `\` escapes so an escaped `\"` does not end
-    // the string. The token text is the raw inner slice; `tokenize` resolves the
-    // escapes (see `unescape`) once scanning is done.
+    // Scan a `"..."` body, honoring `\` escapes so an escaped `\"` does not end the
+    // string. A `${ ... }` interpolation hole is scanned through brace-balanced and
+    // string-aware (C#-style): nested `"..."` inside a hole do NOT end the outer
+    // string, so `"${if(pk == "", a, b)}"` needs no escaping. The token text is the
+    // raw inner slice; `tokenize` resolves any `\` escapes (see `unescape`) after.
     fn lexString(self: *Lexer, sline: u32, scol: u32) Token {
         self.bump(); // opening quote
         const inner_start = self.pos;
@@ -130,6 +118,10 @@ pub const Lexer = struct {
             if (c == '\\') {
                 self.bump(); // backslash
                 if (self.peek() != null) self.bump(); // escaped char
+                continue;
+            }
+            if (c == '$' and self.peek1() == '{') {
+                _ = self.skipInterpHole();
                 continue;
             }
             if (c == '"') {
@@ -141,6 +133,46 @@ pub const Lexer = struct {
         }
         // unterminated string
         return .{ .tag = .invalid, .text = self.src[inner_start..self.pos], .line = sline, .col = scol };
+    }
+
+    /// Consume a `${ ... }` interpolation hole (the cursor is on the `$`), scanning
+    /// brace-balanced and string-aware so a `"` or `}` inside a nested string does
+    /// not end the hole. Returns true if it consumed the matching `}`, false on
+    /// end-of-input (unbalanced). Shared by `lexString` and `lexInterp`.
+    fn skipInterpHole(self: *Lexer) bool {
+        self.bump(); // $
+        self.bump(); // {
+        var depth: usize = 1;
+        while (self.peek()) |c| {
+            switch (c) {
+                '"' => {
+                    self.bump();
+                    while (self.peek()) |d| {
+                        if (d == '\\') {
+                            self.bump();
+                            if (self.peek() != null) self.bump();
+                            continue;
+                        }
+                        if (d == '"') {
+                            self.bump();
+                            break;
+                        }
+                        self.bump();
+                    }
+                },
+                '{' => {
+                    depth += 1;
+                    self.bump();
+                },
+                '}' => {
+                    depth -= 1;
+                    self.bump();
+                    if (depth == 0) return true;
+                },
+                else => self.bump(),
+            }
+        }
+        return false;
     }
 
     fn lexPunct(self: *Lexer, start: usize, sline: u32, scol: u32) Token {
@@ -332,6 +364,25 @@ test "lex interpolation placeholders" {
     try std.testing.expectEqual(expect.len, toks.len);
     for (expect, toks) |e, t| try std.testing.expectEqual(e, t.tag);
     try std.testing.expectEqualStrings("${tbl}", toks[5].text);
+}
+
+test "string with an interpolation hole keeps nested quotes (C#-style, no escaping)" {
+    const alloc = std.testing.allocator;
+    // The inner `"" ` and `"id"` must NOT terminate the outer string.
+    const toks = try tokenize(alloc, "select k = \"${if(pk == \"\", concat(name, \"id\"), pk)}\"");
+    defer alloc.free(toks);
+    // select, k, =, <string>, eof
+    try std.testing.expectEqual(Tag.string, toks[3].tag);
+    try std.testing.expectEqualStrings("${if(pk == \"\", concat(name, \"id\"), pk)}", toks[3].text);
+    try std.testing.expectEqual(Tag.eof, toks[4].tag);
+}
+
+test "interpolation hole with a literal prefix is one string token" {
+    const alloc = std.testing.allocator;
+    const toks = try tokenize(alloc, "write csv \"crm_${lower(name)}\"");
+    defer alloc.free(toks);
+    try std.testing.expectEqual(Tag.string, toks[2].tag);
+    try std.testing.expectEqualStrings("crm_${lower(name)}", toks[2].text);
 }
 
 test "unterminated string is invalid" {
