@@ -9,6 +9,7 @@ const expand = @import("../lang/expand.zig");
 const types = @import("../lang/types.zig");
 const op = @import("../exec/op.zig");
 const batchmod = @import("../exec/batch.zig");
+const column = @import("../exec/column.zig");
 const eval = @import("../exec/eval.zig");
 const csv = @import("../connect/csv.zig");
 const tablemod = @import("../connect/table.zig");
@@ -605,6 +606,8 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
         if (classifyAggPipeline(stages)) |shape| {
             if (try runParallelCsvAgg(env, stages[0].node.read, shape.prefix, shape.ag, shape.tail, last.write, opts, stats, lanes_used)) return;
             // not eligible (URL, mmap failure, bare-upsert sink) → fall through to serial.
+        } else if (classifyTopNPipeline(stages)) |tn| {
+            if (try runParallelCsvTopN(env, stages[0].node.read, tn.prefix, tn.srt, tn.lim, last.write, opts, stats, lanes_used)) return;
         } else if (classifyMapPipeline(stages)) |map_stages| {
             if (try runParallelCsvMap(env, stages[0].node.read, map_stages, last.write, opts, stats, lanes_used)) return;
         }
@@ -1095,6 +1098,168 @@ fn runParallelCsvMap(env: *Env, rd: ast.Read, map_stages: []const ast.Stage, w: 
 
     if (ctx.first_err) |e| return e;
     stats.rows_out += ctx.rows_out.load(.monotonic);
+    snk_open = false;
+    try snk.close();
+    return true;
+}
+
+// --- parallel CSV Top-N (sort | limit) ---
+
+const TopNShape = struct { prefix: []const ast.Stage, srt: ast.Sort, lim: ast.Limit };
+
+/// Recognize `read … | (filter|select)* | sort | limit | write` — a Top-N. The sort
+/// must be immediately followed by the limit (the fusable form). null otherwise.
+fn classifyTopNPipeline(stages: []const ast.Stage) ?TopNShape {
+    const middle = stages[1 .. stages.len - 1];
+    if (middle.len < 2) return null;
+    if (middle[middle.len - 1].node != .limit or middle[middle.len - 2].node != .sort) return null;
+    const prefix = middle[0 .. middle.len - 2];
+    for (prefix) |st| switch (st.node) {
+        .filter, .select => {},
+        else => return null,
+    };
+    return .{ .prefix = prefix, .srt = middle[middle.len - 2].node.sort, .lim = middle[middle.len - 1].node.limit };
+}
+
+const TopNCtx = struct {
+    mapped: *csv.MappedCsv,
+    csv_schema: *const types.Schema,
+    row_schema: *const types.Schema, // schema after the prefix (Top-N preserves it)
+    prefix: []const ast.Stage,
+    params: *std.StringHashMap(*const ast.Expr),
+    keys: []const op.Sort.Key,
+    cap: u64, // per-worker rows to keep = offset + count
+    nchunks: usize,
+    next_chunk: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    builders: []column.Builder, // shared collector of per-worker top rows (plan arena)
+    mtx: std.Thread.Mutex = .{},
+    err_mtx: std.Thread.Mutex = .{},
+    first_err: ?anyerror = null,
+    rows_read: *std.atomic.Value(u64),
+};
+
+fn topnWorker(ctx: *TopNCtx) void {
+    while (true) {
+        if (ctx.first_err != null) return;
+        const i = ctx.next_chunk.fetchAdd(1, .seq_cst);
+        if (i >= ctx.nchunks) break;
+        topnWorkOne(ctx, i) catch |e| {
+            ctx.err_mtx.lock();
+            if (ctx.first_err == null) ctx.first_err = e;
+            ctx.err_mtx.unlock();
+            return;
+        };
+    }
+}
+
+fn topnWorkOne(ctx: *TopNCtx, i: usize) !void {
+    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
+    defer _ = wgpa.deinit();
+    var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
+    defer warena.deinit();
+    var batch_arena = std.heap.ArenaAllocator.init(wgpa.allocator());
+    defer batch_arena.deinit();
+
+    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.nchunks), .schema = ctx.csv_schema };
+    var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
+    var scan = op.Scan{ .src = cs.source() };
+    const child = try buildMapChain(warena.allocator(), ctx.params, ctx.prefix, &scan, ctx.csv_schema);
+    // Per-worker Top-N keeps the chunk's top `cap` rows (offset applied globally).
+    var tn = op.TopN{
+        .child = child,
+        .in_schema = ctx.row_schema,
+        .keys = ctx.keys,
+        .count = ctx.cap,
+        .offset = 0,
+        .state = batch_arena.allocator(),
+        .gpa = wgpa.allocator(),
+    };
+    const local = (try tn.next(batch_arena.allocator())) orelse return; // ≤cap sorted rows
+
+    ctx.mtx.lock();
+    defer ctx.mtx.unlock();
+    var r: usize = 0;
+    while (r < local.len) : (r += 1) {
+        for (local.columns, ctx.builders) |*col, *bld| try bld.append(col.getValue(r));
+    }
+}
+
+/// Parallel CSV Top-N: each worker keeps its chunk's top `offset+count` rows, then a
+/// global Top-N over the union produces the final sorted, offset/limited output. The
+/// output is small and sorted, so (unlike map-only) it stays deterministic.
+fn runParallelCsvTopN(env: *Env, rd: ast.Read, prefix: []const ast.Stage, srt: ast.Sort, lim: ast.Limit, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    const arena = env.arena;
+    const path = switch (rd.form) {
+        .path => |p| p,
+        else => return false,
+    };
+    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
+
+    const mapped = csv.MappedCsv.open(arena, path) catch return false;
+    defer mapped.close();
+
+    const row_schema = try schemaPtr(arena, try mapChainSchema(env, prefix, mapped.schema));
+
+    // Resolve sort keys against the post-prefix schema (shared by workers + global).
+    const qs = try arena.alloc(ast.QualName, srt.keys.len);
+    for (srt.keys, qs) |sk, *q| q.* = sk.field;
+    var ad = analyze.Diag{};
+    const idxs = analyze.fieldIndices(arena, row_schema.*, qs, &ad) catch |e| return aErr(env, &ad, e);
+    const ks = try arena.alloc(op.Sort.Key, srt.keys.len);
+    for (srt.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc };
+
+    env.src_name = "csv";
+    env.sink_name = connectorType(env, w.connector);
+
+    const nthreads = @max(@as(usize, 1), opts.threads);
+    const builders = try arena.alloc(column.Builder, row_schema.fields.len);
+    for (builders, row_schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
+    var ctx = TopNCtx{
+        .mapped = mapped,
+        .csv_schema = &mapped.schema,
+        .row_schema = row_schema,
+        .prefix = prefix,
+        .params = env.params_expr,
+        .keys = ks,
+        .cap = lim.offset + lim.count,
+        .nchunks = nthreads,
+        .builders = builders,
+        .rows_read = env.rows_read,
+    };
+
+    const threads = try arena.alloc(std.Thread, nthreads);
+    var spawned: usize = 0;
+    while (spawned < nthreads) : (spawned += 1) {
+        threads[spawned] = std.Thread.spawn(.{}, topnWorker, .{&ctx}) catch break;
+    }
+    if (spawned == 0) topnWorker(&ctx) else for (threads[0..spawned]) |t| t.join();
+    lanes_used.* = @max(lanes_used.*, @max(spawned, 1));
+    env.log.log(.info, "parallel csv top-n: {d} chunks over {d} lanes", .{ nthreads, @max(spawned, 1) });
+    if (ctx.first_err) |e| return e;
+
+    // Combine the per-worker top rows, then a global Top-N gives the final output.
+    const cols = try arena.alloc(column.Column, builders.len);
+    for (builders, cols) |*b, *c| c.* = try b.finish();
+    var combined = OneBatch{ .b = .{ .schema = row_schema, .columns = cols, .len = cols[0].len }, .sch = row_schema.* };
+    var gscan = op.Scan{ .src = combined.source() };
+    var global = op.TopN{
+        .child = .{ .scan = &gscan },
+        .in_schema = row_schema,
+        .keys = ks,
+        .count = lim.count,
+        .offset = lim.offset,
+        .state = arena,
+        .gpa = env.gpa,
+    };
+
+    const wr = try resolveUpsertKeys(env, w);
+    const snk = try openSink(env, wr, row_schema.*);
+    var snk_open = true;
+    errdefer if (snk_open) snk.abort();
+    while (try global.next(arena)) |b| {
+        try snk.writeBatch(arena, b);
+        stats.rows_out += b.len;
+    }
     snk_open = false;
     try snk.close();
     return true;
@@ -2934,6 +3099,19 @@ test "parallel CSV aggregate: filter/select prefix + sort/limit tail (threads>1)
         4);
     defer alloc.free(out);
     try std.testing.expectEqualStrings("g,s\na,90\nb,20\n", out); // a:10+30+50, b:20 (5 filtered out)
+}
+
+test "parallel CSV Top-N: sort | limit (threads>1) matches serial" {
+    const alloc = std.testing.allocator;
+    const input = "id,v\n1,10\n2,40\n3,20\n4,50\n5,30\n";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // per-worker top-K heaps merged into a global Top-N; output is sorted (deterministic)
+    const out = try runCsvThreaded(alloc, &tmp, input,
+        "  | select id, v = cast(v as int)\n  | sort v desc, id asc\n  | limit 3",
+        4);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id,v\n4,50\n2,40\n5,30\n", out);
 }
 
 test "parallel CSV aggregate: grouped agg (threads>1) merges partials by key" {
