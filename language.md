@@ -100,6 +100,11 @@ names are interchangeable — `secret` only documents intent).
 - `auth = "aad"` switches SQL Server login to **Azure AD username+password** (federated
   ADFS or managed, auto-detected; no app registration). `tenant` / `client_id` /
   `resource` default sensibly (resource defaults to the org URL for `*.dynamics.com`).
+- MySQL / StarRocks logins auto-negotiate the auth plugin: `mysql_native_password`,
+  `caching_sha2_password`, and `mysql_clear_password` (sent when the server defers to an
+  external IdP — e.g. StarRocks with LDAP / security integration). `mysql_clear_password`
+  and `caching_sha2` full-auth put the password on the wire in the clear, so set
+  `tls = "require"` whenever the network path to the server isn't already trusted.
 
 ---
 
