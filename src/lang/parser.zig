@@ -1317,3 +1317,40 @@ test "bare upsert (no `on`) parses to empty keys for PK inference" {
     try std.testing.expect(w.mode == .upsert);
     try std.testing.expectEqual(@as(usize, 0), w.mode.upsert.keys.len);
 }
+
+/// Parsing arbitrary bytes must never crash — only return an AST or a `Diagnostic`
+/// error. Exercises the full lexer→Pratt-parser path including the new `??`/`?.`/
+/// `let…in`/comma-match grammar and `${...}` interpolation scanning. Run the real
+/// fuzzer with `zig build test --fuzz`; otherwise this just covers the seed corpus.
+fn fuzzParseSource(_: void, input: []const u8) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag = Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    _ = parseSource(arena.allocator(), input, &diag) catch {};
+}
+
+test "fuzz: parseSource never crashes on arbitrary input" {
+    try std.testing.fuzz({}, fuzzParseSource, .{
+        .corpus = &.{
+            "@batch\nread csv \"x\" | filter a is empty | select * rename (a as b) | write stdout",
+            "@batch\nfor n, p:int in j match p >= 1 => { read csv \"x\" | write stdout } _ => {} end",
+            "@batch\nread x query \"q\" | select v = a ?? b ?? \"c\", w = let d = a in d * d | write stdout",
+            "@http(path=\"/x\", doc=\"y\")\nparam j json\nread csv \"x\" | select h = j.a?.b | write stdout",
+        },
+    });
+}
+
+/// Same for the `${ <expr> }` interpolation sub-parser, which re-parses untrusted
+/// placeholder text per row.
+fn fuzzParseExpr(_: void, input: []const u8) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag = Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    _ = parseExprStr(arena.allocator(), input, &diag) catch {};
+}
+
+test "fuzz: parseExprStr never crashes on arbitrary input" {
+    try std.testing.fuzz({}, fuzzParseExpr, .{
+        .corpus = &.{ "if(p == \"\", concat(a, \"b\"), p)", "a ?? b ?? c", "match x \"a\", \"b\" => 1 _ => 2 end", "let d = x in d + d", "cast(x as decimal(18,2))" },
+    });
+}
