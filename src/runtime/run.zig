@@ -606,6 +606,8 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
         if (classifyAggPipeline(stages)) |shape| {
             if (try runParallelCsvAgg(env, stages[0].node.read, shape.prefix, shape.ag, shape.tail, last.write, opts, stats, lanes_used)) return;
             // not eligible (URL, mmap failure, bare-upsert sink) → fall through to serial.
+        } else if (classifyDistinctPipeline(stages)) |ds| {
+            if (try runParallelCsvDistinct(env, stages[0].node.read, ds.prefix, ds.dist, ds.tail, last.write, opts, stats, lanes_used)) return;
         } else if (classifyTopNPipeline(stages)) |tn| {
             if (try runParallelCsvTopN(env, stages[0].node.read, tn.prefix, tn.srt, tn.lim, last.write, opts, stats, lanes_used)) return;
         } else if (classifyMapPipeline(stages)) |map_stages| {
@@ -1259,6 +1261,199 @@ fn runParallelCsvTopN(env: *Env, rd: ast.Read, prefix: []const ast.Stage, srt: a
     while (try global.next(arena)) |b| {
         try snk.writeBatch(arena, b);
         stats.rows_out += b.len;
+    }
+    snk_open = false;
+    try snk.close();
+    return true;
+}
+
+// --- parallel CSV distinct ---
+
+const DistinctShape = struct { prefix: []const ast.Stage, dist: ast.Distinct, tail: []const ast.Stage };
+
+/// Recognize `read … | (filter|select)* | distinct | (sort|limit)* | write`.
+fn classifyDistinctPipeline(stages: []const ast.Stage) ?DistinctShape {
+    const middle = stages[1 .. stages.len - 1];
+    var di: ?usize = null;
+    for (middle, 0..) |st, i| switch (st.node) {
+        .filter, .select => if (di != null) return null,
+        .distinct => {
+            if (di != null) return null;
+            di = i;
+        },
+        .sort, .limit => if (di == null) return null,
+        else => return null,
+    };
+    const d = di orelse return null;
+    return .{ .prefix = middle[0..d], .dist = middle[d].node.distinct, .tail = middle[d + 1 ..] };
+}
+
+const DistinctCtx = struct {
+    mapped: *csv.MappedCsv,
+    csv_schema: *const types.Schema,
+    row_schema: *const types.Schema, // schema after the prefix (distinct preserves it)
+    prefix: []const ast.Stage,
+    params: *std.StringHashMap(*const ast.Expr),
+    local_keys: ?[]const usize, // distinct key columns for the per-worker op (null = all)
+    key_idx: []const usize, // key columns for the global dedup (all, when bare)
+    nchunks: usize,
+    next_chunk: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    seen: *op.Aggregate.GroupMap(), // global cross-worker dedup set
+    builders: []column.Builder, // collected distinct rows (plan arena)
+    mtx: std.Thread.Mutex = .{},
+    err_mtx: std.Thread.Mutex = .{},
+    first_err: ?anyerror = null,
+    plan_arena: std.mem.Allocator,
+    rows_read: *std.atomic.Value(u64),
+};
+
+fn distinctWorker(ctx: *DistinctCtx) void {
+    while (true) {
+        if (ctx.first_err != null) return;
+        const i = ctx.next_chunk.fetchAdd(1, .seq_cst);
+        if (i >= ctx.nchunks) break;
+        distinctWorkOne(ctx, i) catch |e| {
+            ctx.err_mtx.lock();
+            if (ctx.first_err == null) ctx.first_err = e;
+            ctx.err_mtx.unlock();
+            return;
+        };
+    }
+}
+
+fn distinctWorkOne(ctx: *DistinctCtx, i: usize) !void {
+    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
+    defer _ = wgpa.deinit();
+    var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
+    defer warena.deinit();
+    var batch_arena = std.heap.ArenaAllocator.init(wgpa.allocator());
+    defer batch_arena.deinit();
+
+    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.nchunks), .schema = ctx.csv_schema };
+    var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
+    var scan = op.Scan{ .src = cs.source() };
+    const child = try buildMapChain(warena.allocator(), ctx.params, ctx.prefix, &scan, ctx.csv_schema);
+    // Per-worker distinct collapses each chunk first, so only locally-unique rows
+    // cross the global lock.
+    var d = op.Distinct{ .child = child, .in_schema = ctx.row_schema, .keys = ctx.local_keys, .state = warena.allocator(), .gpa = wgpa.allocator() };
+
+    const probe = try warena.allocator().alloc(Value, ctx.key_idx.len); // reused per row
+    while (try d.next(batch_arena.allocator())) |b| {
+        ctx.mtx.lock();
+        var r: usize = 0;
+        while (r < b.len) : (r += 1) {
+            for (ctx.key_idx, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
+            const gop = ctx.seen.getOrPut(probe) catch |e| {
+                ctx.mtx.unlock();
+                return e;
+            };
+            if (!gop.found_existing) {
+                const kv = ctx.plan_arena.alloc(Value, ctx.key_idx.len) catch |e| {
+                    ctx.mtx.unlock();
+                    return e;
+                };
+                for (ctx.key_idx, 0..) |ci, j| kv[j] = try op.dupeValue(ctx.plan_arena, b.columns[ci].getValue(r));
+                gop.key_ptr.* = kv;
+                gop.value_ptr.* = 0;
+                for (b.columns, ctx.builders) |*col, *bld| try bld.append(col.getValue(r));
+            }
+        }
+        ctx.mtx.unlock();
+        _ = batch_arena.reset(.retain_capacity);
+    }
+}
+
+/// Parallel CSV distinct: each worker dedups its chunk locally, then a global
+/// seen-set dedups across workers and collects the surviving rows. Output rows may
+/// reorder under -j>1 (use -j 1 for stable order). Returns false to fall back.
+fn runParallelCsvDistinct(env: *Env, rd: ast.Read, prefix: []const ast.Stage, dist: ast.Distinct, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    const arena = env.arena;
+    const path = switch (rd.form) {
+        .path => |p| p,
+        else => return false,
+    };
+    if (std.mem.eql(u8, w.connector, "stdout")) return false;
+    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
+
+    const mapped = csv.MappedCsv.open(arena, path) catch return false;
+    defer mapped.close();
+
+    const row_schema = try schemaPtr(arena, try mapChainSchema(env, prefix, mapped.schema));
+
+    // Distinct key columns: the `on (...)` list, or all columns for a bare distinct.
+    var local_keys: ?[]const usize = null;
+    var key_idx: []const usize = undefined;
+    if (dist.on) |fields| {
+        var ad = analyze.Diag{};
+        const ks = analyze.fieldIndices(arena, row_schema.*, fields, &ad) catch |e| return aErr(env, &ad, e);
+        local_keys = ks;
+        key_idx = ks;
+    } else {
+        const all = try arena.alloc(usize, row_schema.fields.len);
+        for (all, 0..) |*x, j| x.* = j;
+        key_idx = all;
+    }
+
+    env.src_name = "csv";
+    env.sink_name = connectorType(env, w.connector);
+
+    const nthreads = @max(@as(usize, 1), opts.threads);
+    var seen = op.Aggregate.GroupMap().init(arena);
+    const builders = try arena.alloc(column.Builder, row_schema.fields.len);
+    for (builders, row_schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
+    var ctx = DistinctCtx{
+        .mapped = mapped,
+        .csv_schema = &mapped.schema,
+        .row_schema = row_schema,
+        .prefix = prefix,
+        .params = env.params_expr,
+        .local_keys = local_keys,
+        .key_idx = key_idx,
+        .nchunks = nthreads,
+        .seen = &seen,
+        .builders = builders,
+        .plan_arena = arena,
+        .rows_read = env.rows_read,
+    };
+
+    const threads = try arena.alloc(std.Thread, nthreads);
+    var spawned: usize = 0;
+    while (spawned < nthreads) : (spawned += 1) {
+        threads[spawned] = std.Thread.spawn(.{}, distinctWorker, .{&ctx}) catch break;
+    }
+    if (spawned == 0) distinctWorker(&ctx) else for (threads[0..spawned]) |t| t.join();
+    lanes_used.* = @max(lanes_used.*, @max(spawned, 1));
+    env.log.log(.info, "parallel csv distinct: {d} chunks over {d} lanes", .{ nthreads, @max(spawned, 1) });
+    if (ctx.first_err) |e| return e;
+
+    const cols = try arena.alloc(column.Column, builders.len);
+    for (builders, cols) |*b, *c| c.* = try b.finish();
+    const merged = batchmod.Batch{ .schema = row_schema, .columns = cols, .len = cols[0].len };
+
+    const wr = try resolveUpsertKeys(env, w);
+    const snk = try openSink(env, wr, row_schema.*);
+    var snk_open = true;
+    errdefer if (snk_open) snk.abort();
+
+    if (tail.len == 0) {
+        if (merged.len > 0) {
+            try snk.writeBatch(arena, merged);
+            stats.rows_out += merged.len;
+        }
+    } else {
+        var ob = OneBatch{ .b = merged, .sch = row_schema.* };
+        var scan = op.Scan{ .src = ob.source() };
+        var cur: op.Op = .{ .scan = &scan };
+        var sch = row_schema.*;
+        for (tail) |st| {
+            const r = try buildStage(env, st, cur, sch);
+            cur = r.op;
+            sch = r.schema;
+        }
+        while (try cur.next(arena)) |outb| {
+            try snk.writeBatch(arena, outb);
+            stats.rows_out += outb.len;
+        }
     }
     snk_open = false;
     try snk.close();
@@ -3099,6 +3294,19 @@ test "parallel CSV aggregate: filter/select prefix + sort/limit tail (threads>1)
         4);
     defer alloc.free(out);
     try std.testing.expectEqualStrings("g,s\na,90\nb,20\n", out); // a:10+30+50, b:20 (5 filtered out)
+}
+
+test "parallel CSV distinct (threads>1): dedups across chunks" {
+    const alloc = std.testing.allocator;
+    const input = "id,g\n1,a\n2,b\n3,a\n4,c\n5,b\n6,a\n";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // sort tail makes the (otherwise reordered) parallel output deterministic
+    const out = try runCsvThreaded(alloc, &tmp, input,
+        "  | select g\n  | distinct on g\n  | sort g asc",
+        4);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("g\na\nb\nc\n", out);
 }
 
 test "parallel CSV Top-N: sort | limit (threads>1) matches serial" {
