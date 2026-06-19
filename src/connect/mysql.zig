@@ -103,6 +103,7 @@ pub const Conn = struct {
                             const token = cachingSha2Token(password, &sw.salt);
                             try self.writePacket(rseq +% 1, &token);
                         },
+                        .clear => try self.writeClearPassword(rseq +% 1, password),
                     }
                 },
                 0x01 => {
@@ -369,6 +370,18 @@ pub const Conn = struct {
         try self.writePacket(seq, out.items);
     }
 
+    /// mysql_clear_password auth-switch response: the password as a null-terminated
+    /// cleartext string, which the server (e.g. StarRocks with LDAP / external auth)
+    /// validates itself. The password crosses the wire in the clear, so pair it with
+    /// `tls` whenever the path to the server isn't already trusted.
+    fn writeClearPassword(self: *Conn, seq: u8, password: []const u8) !void {
+        const pw = try self.gpa.alloc(u8, password.len + 1);
+        defer self.gpa.free(pw);
+        @memcpy(pw[0..password.len], password);
+        pw[password.len] = 0;
+        try self.writePacket(seq, pw);
+    }
+
     fn writeHandshakeResponse(self: *Conn, seq: u8, user: []const u8, password: []const u8, database: []const u8, salt: [20]u8, plugin: AuthPlugin) !void {
         const caps = self.capsFor(database);
 
@@ -396,6 +409,13 @@ pub const Conn = struct {
                 try w.writeByte(32);
                 try w.writeAll(&token);
             },
+            .clear => {
+                // cleartext password + null terminator (length-prefixed here for the
+                // initial response; bare in the auth-switch reply, see writeClearPassword)
+                try w.writeByte(@intCast(password.len + 1));
+                try w.writeAll(password);
+                try w.writeByte(0);
+            },
         }
 
         if (database.len > 0) {
@@ -412,11 +432,13 @@ pub const Conn = struct {
 pub const AuthPlugin = enum {
     native,
     caching_sha2,
+    clear, // mysql_clear_password: send the password as cleartext (StarRocks LDAP / external auth)
 
     fn name(self: AuthPlugin) []const u8 {
         return switch (self) {
             .native => "mysql_native_password",
             .caching_sha2 => "caching_sha2_password",
+            .clear => "mysql_clear_password",
         };
     }
 };
@@ -424,6 +446,7 @@ pub const AuthPlugin = enum {
 fn pluginByName(s: []const u8) ?AuthPlugin {
     if (std.mem.eql(u8, s, "mysql_native_password")) return .native;
     if (std.mem.eql(u8, s, "caching_sha2_password")) return .caching_sha2;
+    if (std.mem.eql(u8, s, "mysql_clear_password")) return .clear;
     return null;
 }
 
@@ -598,6 +621,19 @@ fn decodeBits(raw: []const u8) i64 {
     var v: u64 = 0;
     for (raw[raw.len -| 8 ..]) |b| v = (v << 8) | b;
     return @bitCast(v);
+}
+
+test "pluginByName round-trips the supported auth plugins" {
+    inline for (.{ AuthPlugin.native, AuthPlugin.caching_sha2, AuthPlugin.clear }) |pl| {
+        try std.testing.expectEqual(pl, pluginByName(pl.name()).?);
+    }
+    try std.testing.expect(pluginByName("sha256_password") == null);
+}
+
+test "parseAuthSwitch recognizes mysql_clear_password (StarRocks LDAP/external auth)" {
+    // 0xfe + "mysql_clear_password\0" + (empty salt — the server validates externally)
+    const sw = parseAuthSwitch("\xfe" ++ "mysql_clear_password" ++ "\x00");
+    try std.testing.expectEqual(AuthPlugin.clear, sw.plugin.?);
 }
 
 test "decodeBits folds big-endian BIT bytes" {
