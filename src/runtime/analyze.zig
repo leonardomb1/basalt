@@ -38,27 +38,23 @@ const ParamMap = std.StringHashMap(*const ast.Expr);
 
 /// Deep-copy `expr`, replacing single-name field refs that name a param with its
 /// literal. No params ⇒ returns the original (no copy).
+const SubstCtx = struct { arena: std.mem.Allocator, params: *const ParamMap };
+
+fn substRecur(ctx: SubstCtx, e: *const ast.Expr) Error!*ast.Expr {
+    return @constCast(try substExpr(ctx.arena, e, ctx.params));
+}
+
 pub fn substExpr(arena: std.mem.Allocator, expr: *const ast.Expr, params: *const ParamMap) Error!*const ast.Expr {
     if (params.count() == 0) return expr;
-    switch (expr.*) {
-        .field => |q| {
-            if (q.parts.len == 1) {
-                if (params.get(q.parts[0])) |lit| return lit;
-            }
-            return expr;
-        },
-        .unary => |u| return mk(arena, .{ .unary = .{ .op = u.op, .e = @constCast(try substExpr(arena, u.e, params)) } }),
-        .binary => |b| return mk(arena, .{ .binary = .{ .op = b.op, .l = @constCast(try substExpr(arena, b.l, params)), .r = @constCast(try substExpr(arena, b.r, params)) } }),
-        .is_null => |n| return mk(arena, .{ .is_null = .{ .e = @constCast(try substExpr(arena, n.e, params)), .negated = n.negated, .kind = n.kind } }),
-        .cast => |c| return mk(arena, .{ .cast = .{ .e = @constCast(try substExpr(arena, c.e, params)), .ty = c.ty } }),
-        .cond => |c| return mk(arena, .{ .cond = .{ .cond = @constCast(try substExpr(arena, c.cond, params)), .then = @constCast(try substExpr(arena, c.then, params)), .els = @constCast(try substExpr(arena, c.els, params)) } }),
-        .call => |c| {
-            const args = try arena.alloc(*ast.Expr, c.args.len);
-            for (c.args, 0..) |a, i| args[i] = @constCast(try substExpr(arena, a, params));
-            return mk(arena, .{ .call = .{ .name = c.name, .args = args } });
-        },
-        else => return expr, // literals
+    // Special case: a single-name field that names a param becomes its literal.
+    if (expr.* == .field) {
+        const q = expr.field;
+        if (q.parts.len == 1) if (params.get(q.parts[0])) |lit| return lit;
+        return expr;
     }
+    // Everything else: structural recursion shared with the other passes — every
+    // child is itself substituted, every own field copied (see ast.rebuildExpr).
+    return ast.rebuildExpr(arena, expr, SubstCtx{ .arena = arena, .params = params }, substRecur);
 }
 
 fn mk(arena: std.mem.Allocator, e: ast.Expr) Error!*const ast.Expr {
@@ -749,4 +745,37 @@ test "analyze rejects unknown connection" {
     var diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, prog, null, &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "unknown connection") != null);
+}
+
+/// Analyze `read csv <2-col data> | <stage>` offline and expect a type/plan error.
+fn expectAnalyzeErr(a: std.mem.Allocator, csv_data: []const u8, stage: []const u8) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = csv_data });
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const in = try std.fs.path.join(a, &.{ base, "in.csv" });
+    const src = try std.fmt.allocPrint(a, "@batch\nread csv \"{s}\"\n  | {s}\n  | write csv \"/tmp/x.csv\"", .{ in, stage });
+    var diag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, src), null, &diag));
+}
+
+test "analyze rejects `* rename` onto a duplicate column name" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    // renaming `id` onto the existing `name` column would emit two `name` columns
+    try expectAnalyzeErr(ar.allocator(), "id,name\n1,x\n", "select * rename (id as name)");
+}
+
+test "analyze rejects `is empty` on a non-string operand" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    // cast(amount as int) is an int — `is empty` only makes sense for strings
+    try expectAnalyzeErr(ar.allocator(), "id,amount\n1,100\n", "filter cast(amount as int) is empty");
+}
+
+test "analyze rejects `?.` safe navigation on a plain column reference" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    // `?.` is only for JSON-param paths; on a real column it must be an error, not a no-op
+    try expectAnalyzeErr(ar.allocator(), "id,name\n1,x\n", "select v = name?.foo");
 }

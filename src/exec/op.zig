@@ -11,6 +11,7 @@ const batchmod = @import("batch.zig");
 const eval = @import("eval.zig");
 const simd = @import("simd.zig");
 const valuemod = @import("value.zig");
+const keyhash = @import("keyhash.zig");
 const driver = @import("../connect/driver.zig");
 
 const Batch = batchmod.Batch;
@@ -50,6 +51,7 @@ pub const Op = union(enum) {
     distinct: *Distinct,
     sort: *Sort,
     aggregate: *Aggregate,
+    top_n: *TopN,
     join: *Join,
     explode: *Explode,
     union_: *Union,
@@ -63,6 +65,7 @@ pub const Op = union(enum) {
             .distinct => |d| d.next(arena),
             .sort => |s| s.next(arena),
             .aggregate => |a| a.next(arena),
+            .top_n => |t| t.next(arena),
             .join => |j| j.next(arena),
             .explode => |e| e.next(arena),
             .union_ => |u| u.next(arena),
@@ -357,23 +360,6 @@ fn gather(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usize) a
     return Batch{ .schema = b.schema, .columns = outcols, .len = kept };
 }
 
-/// Serialize the key columns of one row into a comparable byte string (with a
-/// null marker and field separator), for hash-grouping/dedup.
-fn rowKey(arena: std.mem.Allocator, b: Batch, idxs: []const usize, row: usize) anyerror![]const u8 {
-    var buf = std.array_list.Managed(u8).init(arena);
-    for (idxs) |ci| {
-        const v = b.columns[ci].getValue(row);
-        if (v.isNull()) {
-            try buf.appendSlice(&.{ 0, 'N' });
-        } else {
-            try buf.append(1);
-            try buf.appendSlice(try eval.valueToString(arena, v));
-        }
-        try buf.append(0);
-    }
-    return buf.toOwnedSlice();
-}
-
 /// Streaming dedup: batches flow through one at a time, filtered against a
 /// seen-set of key strings — O(distinct keys) memory, not O(dataset). The
 /// seen-set (and its key copies) live in `state` (the plan arena), because the
@@ -383,42 +369,78 @@ pub const Distinct = struct {
     in_schema: *const types.Schema,
     keys: ?[]const usize, // null = all columns
     state: std.mem.Allocator,
-    seen: ?std.StringHashMap(void) = null,
+    gpa: std.mem.Allocator, // backs the per-batch scratch arena
+    seen: ?Seen = null,
+
+    const Seen = std.HashMap([]const Value, void, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
 
     pub fn next(self: *Distinct, arena: std.mem.Allocator) anyerror!?Batch {
-        if (self.seen == null) self.seen = std.StringHashMap(void).init(self.state);
+        if (self.seen == null) self.seen = Seen.init(self.state);
         const seen = &self.seen.?;
 
-        while (try self.child.next(arena)) |b| {
+        // The seen-set keys live in `state`, so each child batch (and its transient
+        // row keys) can be freed once scanned. Pull into a scratch arena reset per
+        // batch — otherwise a long run of all-duplicate batches (common once the
+        // distinct set is saturated) accumulates the whole remaining input here in
+        // one `next` call.
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        const pull = scratch.allocator();
+
+        while (try self.child.next(pull)) |b| {
             var key_idx: []const usize = undefined;
             if (self.keys) |k| {
                 key_idx = k;
             } else {
-                const idxs = try arena.alloc(usize, b.columns.len);
+                const idxs = try pull.alloc(usize, b.columns.len);
                 for (idxs, 0..) |*x, i| x.* = i;
                 key_idx = idxs;
             }
 
-            const keep = try arena.alloc(bool, b.len);
+            const keep = try pull.alloc(bool, b.len);
+            const probe = try pull.alloc(Value, key_idx.len); // reused per row (scratch)
             var kept: usize = 0;
             var r: usize = 0;
             while (r < b.len) : (r += 1) {
-                const k = try rowKey(arena, b, key_idx, r); // transient: only stored copies survive
-                if (seen.contains(k)) {
+                for (key_idx, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r); // aliases batch; lookup only
+                const gop = try seen.getOrPut(probe);
+                if (gop.found_existing) {
                     keep[r] = false;
                 } else {
-                    try seen.put(try self.state.dupe(u8, k), {});
+                    // First sight: store a copy of the key (the probe aliases batch memory).
+                    const kv = try self.state.alloc(Value, key_idx.len);
+                    for (key_idx, 0..) |ci, j| kv[j] = try dupeValue(self.state, b.columns[ci].getValue(r));
+                    gop.key_ptr.* = kv;
                     keep[r] = true;
                     kept += 1;
                 }
             }
-            if (kept == 0) continue;
-            if (kept == b.len) return b; // nothing dropped: pass the batch through
-            return try gather(arena, b, keep, kept);
+            if (kept == 0) {
+                _ = scratch.reset(.retain_capacity);
+                continue;
+            }
+            // The returned batch must outlive `scratch`, so deep-copy the kept rows
+            // into the caller's arena (column.gather only copies string *pointers*,
+            // which would dangle once scratch is freed).
+            return try gatherDeep(arena, b, keep, kept);
         }
         return null;
     }
 };
+
+/// Deep-copy the `keep`-marked rows of `b` into `arena` via column builders, which
+/// dupe string/bytes payloads (unlike `gather`, which aliases them). Used when the
+/// source batch lives in a scratch arena that is about to be freed.
+fn gatherDeep(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usize) anyerror!Batch {
+    const outcols = try arena.alloc(column.Column, b.columns.len);
+    for (b.columns, b.schema.fields, 0..) |*col, f, ci| {
+        var bd = column.Builder.init(arena, f.ty);
+        var r: usize = 0;
+        while (r < b.len) : (r += 1) if (keep[r]) try bd.append(col.getValue(r));
+        outcols[ci] = try bd.finish();
+    }
+    return Batch{ .schema = b.schema, .columns = outcols, .len = kept };
+}
 
 pub const Sort = struct {
     child: Op,
@@ -466,6 +488,161 @@ const SortCtx = struct {
     }
 };
 
+/// Effective order of two sort-key values: `.lt` means `va` sorts before `vb`.
+/// Nulls always sort last (independent of `desc`); `desc` flips non-null order.
+/// Shared by Top-N's heap and final sort (mirrors `SortCtx.lessThan`).
+fn keyOrder(va: Value, vb: Value, desc: bool) std.math.Order {
+    const an = va.isNull();
+    const bn = vb.isNull();
+    if (an or bn) {
+        if (an and bn) return .eq;
+        return if (an) .gt else .lt; // null is "greater" → sorts last
+    }
+    const ord = eval.compareValues(va, vb) orelse return .eq;
+    if (ord == .eq) return .eq;
+    return if (desc) (if (ord == .lt) std.math.Order.gt else std.math.Order.lt) else ord;
+}
+
+/// `sort … | limit N [offset M]` fused into a bounded Top-(M+N) heap: O(n log K)
+/// time and O(K) memory instead of materializing + sorting the whole input. The K
+/// kept rows are deep-copied into `gpa` (strings freed on eviction), so memory is
+/// bounded regardless of input size; only the final K rows are emitted into the
+/// caller arena. A plain `sort` (no following `limit`) still uses the full Sort op.
+pub const TopN = struct {
+    child: Op,
+    in_schema: *const types.Schema,
+    keys: []const Sort.Key,
+    count: u64,
+    offset: u64,
+    state: std.mem.Allocator, // output batch
+    gpa: std.mem.Allocator, // heap row storage (per-entry alloc/free)
+    done: bool = false,
+
+    const Entry = []Value; // one materialized row: a value per input column
+
+    pub fn next(self: *TopN, arena: std.mem.Allocator) anyerror!?Batch {
+        if (self.done) return null;
+        self.done = true;
+        if (self.count == 0) return null;
+        const cap = self.offset + self.count; // keep this many best rows
+
+        // Max-heap by `entryLess` (root = the worst-ranked kept row), entries owned
+        // by `gpa` and freed on eviction → O(cap) memory. Child pulled through a
+        // scratch arena reset per batch (the batches themselves are never retained).
+        var heap = std.array_list.Managed(Entry).init(self.gpa);
+        defer {
+            for (heap.items) |e| self.freeEntry(e);
+            heap.deinit();
+        }
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        const pull = scratch.allocator();
+
+        while (try self.child.next(pull)) |b| {
+            var r: usize = 0;
+            while (r < b.len) : (r += 1) {
+                if (heap.items.len < cap) {
+                    try heap.append(try self.cloneRow(b, r));
+                    siftUp(heap.items, heap.items.len - 1, self.keys);
+                } else if (self.rowLess(b, r, heap.items[0])) {
+                    // r ranks before the current worst kept → replace the root
+                    self.freeEntry(heap.items[0]);
+                    heap.items[0] = try self.cloneRow(b, r);
+                    siftDown(heap.items, 0, self.keys);
+                }
+            }
+            _ = scratch.reset(.retain_capacity);
+        }
+        if (heap.items.len == 0) return null;
+
+        // Order the kept rows, then drop `offset` and take `count`.
+        std.mem.sort(Entry, heap.items, self.keys, entryLessCtx);
+        const start = @min(self.offset, heap.items.len);
+        const end = @min(self.offset + self.count, heap.items.len);
+        if (start >= end) return null;
+        return try self.emit(arena, heap.items[start..end]);
+    }
+
+    fn cloneRow(self: *TopN, b: Batch, r: usize) !Entry {
+        const vals = try self.gpa.alloc(Value, b.columns.len);
+        for (b.columns, vals) |*col, *out| out.* = try dupeValueGpa(self.gpa, col.getValue(r));
+        return vals;
+    }
+
+    fn freeEntry(self: *TopN, e: Entry) void {
+        for (e) |v| switch (v) {
+            .string, .bytes => |s| self.gpa.free(s),
+            else => {},
+        };
+        self.gpa.free(e);
+    }
+
+    /// Does row `r` of `b` rank before stored entry `e` (i.e. belongs above it)?
+    fn rowLess(self: *TopN, b: Batch, r: usize, e: Entry) bool {
+        for (self.keys) |k| {
+            const o = keyOrder(b.columns[k.idx].getValue(r), e[k.idx], k.desc);
+            if (o != .eq) return o == .lt;
+        }
+        return false;
+    }
+
+    fn emit(self: *TopN, arena: std.mem.Allocator, entries: []const Entry) !Batch {
+        const cols = try arena.alloc(column.Column, self.in_schema.fields.len);
+        for (self.in_schema.fields, 0..) |f, ci| {
+            var bd = column.Builder.init(arena, f.ty);
+            for (entries) |e| try bd.append(e[ci]);
+            cols[ci] = try bd.finish();
+        }
+        return Batch{ .schema = self.in_schema, .columns = cols, .len = entries.len };
+    }
+};
+
+fn entryLess(a: TopN.Entry, b: TopN.Entry, keys: []const Sort.Key) bool {
+    for (keys) |k| {
+        const o = keyOrder(a[k.idx], b[k.idx], k.desc);
+        if (o != .eq) return o == .lt;
+    }
+    return false;
+}
+
+fn entryLessCtx(keys: []const Sort.Key, a: TopN.Entry, b: TopN.Entry) bool {
+    return entryLess(a, b, keys);
+}
+
+/// Binary max-heap (root = greatest under `entryLess`) sift helpers over a slice.
+fn siftUp(h: []TopN.Entry, start: usize, keys: []const Sort.Key) void {
+    var i = start;
+    while (i > 0) {
+        const parent = (i - 1) / 2;
+        if (!entryLess(h[parent], h[i], keys)) break; // parent already >= child
+        std.mem.swap(TopN.Entry, &h[parent], &h[i]);
+        i = parent;
+    }
+}
+
+fn siftDown(h: []TopN.Entry, start: usize, keys: []const Sort.Key) void {
+    var i = start;
+    const n = h.len;
+    while (true) {
+        const l = 2 * i + 1;
+        const r = 2 * i + 2;
+        var largest = i;
+        if (l < n and entryLess(h[largest], h[l], keys)) largest = l;
+        if (r < n and entryLess(h[largest], h[r], keys)) largest = r;
+        if (largest == i) break;
+        std.mem.swap(TopN.Entry, &h[i], &h[largest]);
+        i = largest;
+    }
+}
+
+fn dupeValueGpa(gpa: std.mem.Allocator, v: Value) !Value {
+    return switch (v) {
+        .string => |s| .{ .string = try gpa.dupe(u8, s) },
+        .bytes => |s| .{ .bytes = try gpa.dupe(u8, s) },
+        else => v,
+    };
+}
+
 /// Streaming hash aggregation: batches are consumed one at a time, folding into
 /// per-group accumulators — O(groups) memory, not O(dataset). Group state (keys,
 /// key values, accumulators) lives in `state` (the plan arena), with string key
@@ -478,6 +655,7 @@ pub const Aggregate = struct {
     out_schema: *const types.Schema,
     err: ?*ErrCtx = null,
     state: std.mem.Allocator,
+    gpa: std.mem.Allocator, // backs the per-batch scratch arena
     done: bool = false,
 
     pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Type };
@@ -505,31 +683,42 @@ pub const Aggregate = struct {
         if (self.done) return null;
         self.done = true;
 
+        // Group state (accumulators, keys, key values) lives in `state`, so each
+        // child batch can be freed once folded. Pull into a scratch arena reset per
+        // batch — this drain runs the WHOLE input in one call, so reusing the
+        // caller's arena (never reset mid-call) would retain every parsed batch,
+        // making aggregation O(dataset) memory instead of O(groups).
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        const pull = scratch.allocator();
+
         // No GROUP BY: one accumulator set; each batch folds in via the
         // vectorized partial reduce (SIMD per batch) or row-wise fallback.
         if (self.by.len == 0) {
             const accs = try self.state.alloc(Acc, self.aggs.len);
             for (accs) |*a| a.* = .{};
-            while (try self.child.next(arena)) |b| {
-                if (b.len == 0) continue;
-                if (!(try self.foldVectorized(arena, b, accs))) try self.foldRowwise(arena, b, accs);
+            while (try self.child.next(pull)) |b| {
+                if (b.len != 0 and !(try self.foldVectorized(pull, b, accs))) try self.foldRowwise(pull, b, accs);
+                _ = scratch.reset(.retain_capacity);
             }
             // Empty input still emits one row of finalized fresh accumulators.
             return try self.emit(arena, &.{.{ .key_vals = &.{}, .accs = accs }});
         }
 
         var groups = std.array_list.Managed(Group).init(self.state);
-        var map = std.StringHashMap(usize).init(self.state);
-        while (try self.child.next(arena)) |b| {
+        const Map = std.HashMap([]const Value, usize, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
+        var map = Map.init(self.state);
+        while (try self.child.next(pull)) |b| {
+            const probe = try pull.alloc(Value, self.by.len); // reused per row (scratch)
             var r: usize = 0;
             while (r < b.len) : (r += 1) {
-                const key = try rowKey(arena, b, self.by, r); // transient; state copy adopted below
-                const gop = try map.getOrPut(key);
+                for (self.by, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r); // aliases batch; lookup only
+                const gop = try map.getOrPut(probe);
                 if (!gop.found_existing) {
-                    gop.key_ptr.* = try self.state.dupe(u8, key);
-                    gop.value_ptr.* = groups.items.len;
                     const kv = try self.state.alloc(Value, self.by.len);
                     for (self.by, 0..) |ci, j| kv[j] = try dupeValue(self.state, b.columns[ci].getValue(r));
+                    gop.key_ptr.* = kv;
+                    gop.value_ptr.* = groups.items.len;
                     const accs = try self.state.alloc(Acc, self.aggs.len);
                     for (accs) |*a| a.* = .{};
                     try groups.append(.{ .key_vals = kv, .accs = accs });
@@ -537,13 +726,14 @@ pub const Aggregate = struct {
                 const g = &groups.items[gop.value_ptr.*];
                 for (self.aggs, 0..) |agg, j| {
                     var v: Value = .null;
-                    if (agg.arg) |e| v = eval.evalRow(arena, e, b, r) catch |err| {
+                    if (agg.arg) |e| v = eval.evalRow(pull, e, b, r) catch |err| {
                         if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
                         return err;
                     };
                     try updateAcc(self.state, &g.accs[j], agg, v, agg.arg != null);
                 }
             }
+            _ = scratch.reset(.retain_capacity);
         }
         if (groups.items.len == 0) return null;
         return try self.emit(arena, groups.items);
@@ -768,13 +958,6 @@ fn materializeFull(state: std.mem.Allocator, pull: std.mem.Allocator, child: Op,
     return Batch{ .schema = schema, .columns = cols, .len = total };
 }
 
-/// A join key string for one value, or null if the value is null (null keys
-/// never match, per SQL).
-fn valueKey(arena: std.mem.Allocator, v: Value) anyerror!?[]const u8 {
-    if (v.isNull()) return null;
-    return try arena.dupe(u8, try eval.valueToString(arena, v));
-}
-
 /// Hash equi-join. The build (right) side is materialized into a hash index on
 /// the first `next`; the probe (left) side then streams through. Supports
 /// inner / left / semi / anti.
@@ -795,18 +978,22 @@ pub const Join = struct {
 
     built: bool = false,
     build_batch: Batch = undefined,
-    index: std.StringHashMap(std.array_list.Managed(usize)) = undefined,
+    index: Index = undefined,
 
+    // Value-keyed hash index (no per-row string serialization). Build keys live in
+    // `build_batch` (in state), so they need no separate copy. Null keys never match.
+    const Index = std.HashMap(Value, std.array_list.Managed(usize), keyhash.SingleKeyCtx, std.hash_map.default_max_load_percentage);
     const empty_match: []const usize = &.{};
 
     pub fn next(self: *Join, arena: std.mem.Allocator) anyerror!?Batch {
         if (!self.built) {
             self.built = true;
             self.build_batch = try materializeFull(self.state, arena, self.build, self.right_schema);
-            self.index = std.StringHashMap(std.array_list.Managed(usize)).init(self.state);
+            self.index = Index.init(self.state);
             var r: usize = 0;
             while (r < self.build_batch.len) : (r += 1) {
-                const k = (try valueKey(self.state, self.build_batch.columns[self.right_key].getValue(r))) orelse continue;
+                const k = self.build_batch.columns[self.right_key].getValue(r);
+                if (k.isNull()) continue; // SQL: null keys never match
                 const gop = try self.index.getOrPut(k);
                 if (!gop.found_existing) gop.value_ptr.* = std.array_list.Managed(usize).init(self.state);
                 try gop.value_ptr.append(r);
@@ -828,9 +1015,11 @@ pub const Join = struct {
         var n: usize = 0;
         var r: usize = 0;
         while (r < lb.len) : (r += 1) {
-            const key = try valueKey(arena, lb.columns[self.left_key].getValue(r));
-            const matches: []const usize = if (key) |k|
-                (if (self.index.get(k)) |list| list.items else empty_match)
+            const key = lb.columns[self.left_key].getValue(r);
+            const matches: []const usize = if (key.isNull())
+                empty_match
+            else if (self.index.get(key)) |list|
+                list.items
             else
                 empty_match;
 

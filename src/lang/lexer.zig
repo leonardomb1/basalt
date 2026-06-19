@@ -414,3 +414,19 @@ test "unterminated string is invalid" {
     try std.testing.expectEqual(Tag.ident, toks[0].tag);
     try std.testing.expectEqual(Tag.invalid, toks[1].tag);
 }
+
+/// Tokenizing arbitrary bytes must never crash (OOB read, integer-overflow panic,
+/// unreachable) — only return tokens or an allocator error. The string-escape and
+/// brace-balanced `${...}` hole scanners are the riskiest spots. Run the real fuzzer
+/// with `zig build test --fuzz`; without it this just exercises the seed corpus.
+fn fuzzTokenize(_: void, input: []const u8) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    _ = tokenize(arena.allocator(), input) catch {};
+}
+
+test "fuzz: tokenize never crashes on arbitrary input" {
+    try std.testing.fuzz({}, fuzzTokenize, .{
+        .corpus = &.{ "read x table a.b | filter c > 0", "\"${if(p == \"\", a, b)}\"", "a?.b.c", "1.5 100mb \\d", "\"unterminated", "${" },
+    });
+}

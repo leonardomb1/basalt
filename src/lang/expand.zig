@@ -175,32 +175,35 @@ fn jsonScalarLit(cx: *Ctx, v: std.json.Value) Error!*ast.Expr {
     };
 }
 
+const ExpandCtx = struct { cx: *Ctx, subst: ?*Subst, depth: usize };
+
+fn expandRecur(ctx: ExpandCtx, e: *const ast.Expr) Error!*ast.Expr {
+    return expandExpr(ctx.cx, e, ctx.subst, ctx.depth);
+}
+
 fn expandExpr(cx: *Ctx, e: *const ast.Expr, subst: ?*Subst, depth: usize) Error!*ast.Expr {
     if (depth > max_depth) {
         cx.msg.* = "fn expansion too deep (recursive `fn`?)";
         return error.ExpandFailed;
     }
-    return switch (e.*) {
-        .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit => mk(cx, e.*),
+    // Node kinds expansion handles specially; everything else (unary/binary/cond/
+    // cast/is_null/match and the literals) is structural recursion via rebuildExpr,
+    // which keeps `subst`/`depth` constant for sub-expressions.
+    switch (e.*) {
         .field => |q| {
             if (subst) |s| if (q.single()) |nm| if (s.get(nm)) |arg| return arg;
             // JSON-param path access: `p.a.b` where `p` is a declared json param.
-            // `?.` segments (via `q.safe`) tolerate a missing/null intermediate by
-            // resolving the whole path to null instead of erroring.
-            // `safe` is separator-parallel, so it aligns one-to-one with `parts[1..]`.
+            // `?.` segments (via `q.safe`, separator-parallel so aligned with
+            // `parts[1..]`) tolerate a missing/null intermediate by resolving to null.
             if (q.parts.len >= 1) if (cx.json.get(q.parts[0])) |maybe_val|
                 return jsonPathLit(cx, maybe_val, q.parts[1..], q.safe);
             return mk(cx, e.*);
         },
-        .unary => |u| mk(cx, .{ .unary = .{ .op = u.op, .e = try expandExpr(cx, u.e, subst, depth) } }),
-        .binary => |b| mk(cx, .{ .binary = .{ .op = b.op, .l = try expandExpr(cx, b.l, subst, depth), .r = try expandExpr(cx, b.r, subst, depth) } }),
-        .cond => |c| mk(cx, .{ .cond = .{ .cond = try expandExpr(cx, c.cond, subst, depth), .then = try expandExpr(cx, c.then, subst, depth), .els = try expandExpr(cx, c.els, subst, depth) } }),
-        .cast => |c| mk(cx, .{ .cast = .{ .e = try expandExpr(cx, c.e, subst, depth), .ty = c.ty } }),
-        .is_null => |n| mk(cx, .{ .is_null = .{ .e = try expandExpr(cx, n.e, subst, depth), .negated = n.negated, .kind = n.kind } }),
-        .match => |m| expandMatchExpr(cx, m, subst, depth),
-        .call => |c| expandCall(cx, c, subst, depth),
-        .let_in => |l| expandLetIn(cx, l, subst, depth),
-    };
+        .call => |c| return expandCall(cx, c, subst, depth),
+        .let_in => |l| return expandLetIn(cx, l, subst, depth),
+        else => {},
+    }
+    return ast.rebuildExpr(cx.arena, e, ExpandCtx{ .cx = cx, .subst = subst, .depth = depth }, expandRecur);
 }
 
 /// Inline `let name = value in body` by substituting the (expanded) value for
@@ -240,20 +243,28 @@ fn expandCall(cx: *Ctx, c: ast.Expr.Call, subst: ?*Subst, depth: usize) Error!*a
     return mk(cx, .{ .call = .{ .name = c.name, .args = args } });
 }
 
-fn expandMatchExpr(cx: *Ctx, m: ast.Match, subst: ?*Subst, depth: usize) Error!*ast.Expr {
-    const subject = if (m.subject) |s| try expandExpr(cx, s, subst, depth) else null;
-    const arms = try cx.arena.alloc(ast.MatchArm, m.arms.len);
-    for (m.arms, 0..) |arm, i| {
-        const pats = try cx.arena.alloc(*ast.Expr, arm.pats.len);
-        for (arm.pats, 0..) |p, j| pats[j] = try expandExpr(cx, p, subst, depth);
-        arms[i] = .{
-            .pats = pats,
-            .guard = if (arm.guard) |g| try expandExpr(cx, g, subst, depth) else null,
-            .value = try expandExpr(cx, arm.value, subst, depth),
-            .is_default = arm.is_default,
-        };
-    }
-    return mk(cx, .{ .match = .{ .subject = subject, .arms = arms } });
+test "expansion preserves is_empty kind and match structure (via rebuildExpr)" {
+    const parser = @import("parser.zig");
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a, "@batch\nread csv \"x\"\n" ++
+        "  | filter status is empty\n" ++
+        "  | select g = match status \"a\", \"b\" => \"y\" _ => \"z\" end\n" ++
+        "  | write stdout", &diag);
+    var msg: []const u8 = "";
+    const out = try expandProgram(a, prog, null, &msg);
+    const stages = out.stmts[1].output.stages;
+    // `status is empty` — the is_empty kind survives the expand pass (not flattened to is_null)
+    const f = stages[1].node.filter;
+    try std.testing.expect(f.* == .is_null);
+    try std.testing.expectEqual(ast.Expr.NullTest.is_empty, f.is_null.kind);
+    // the match (now handled by the shared rebuildExpr, not a bespoke expandMatchExpr)
+    // round-trips with both arms and the 2-pattern alternation intact
+    const m = stages[2].node.select[0].computed.expr.match;
+    try std.testing.expectEqual(@as(usize, 2), m.arms.len);
+    try std.testing.expectEqual(@as(usize, 2), m.arms[0].pats.len);
 }
 
 test "expandProgram inlines a user fn and drops its declaration" {

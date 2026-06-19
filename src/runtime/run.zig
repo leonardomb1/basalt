@@ -1104,34 +1104,18 @@ fn renderPipeline(env: *Env, body: ast.Pipeline, lr: LoopRow) !ast.Pipeline {
 
 /// Deep-copy an expression, interpolating `${var}` needles into every string
 /// literal. Non-string leaves are reused as-is (identifiers can't hold needles).
+const RenderCtx = struct { arena: std.mem.Allocator, lr: LoopRow };
+
+fn renderRecur(ctx: RenderCtx, e: *const ast.Expr) anyerror!*ast.Expr {
+    return renderExpr(ctx.arena, e, ctx.lr);
+}
+
 fn renderExpr(arena: std.mem.Allocator, e: *const ast.Expr, lr: LoopRow) anyerror!*ast.Expr {
-    return switch (e.*) {
-        .str_lit => |s| try mk(arena, .{ .str_lit = try interpAll(arena, s, lr) }),
-        .null_lit, .bool_lit, .int_lit, .float_lit, .field => @constCast(e),
-        .unary => |u| try mk(arena, .{ .unary = .{ .op = u.op, .e = try renderExpr(arena, u.e, lr) } }),
-        .binary => |b| try mk(arena, .{ .binary = .{ .op = b.op, .l = try renderExpr(arena, b.l, lr), .r = try renderExpr(arena, b.r, lr) } }),
-        .cond => |c| try mk(arena, .{ .cond = .{ .cond = try renderExpr(arena, c.cond, lr), .then = try renderExpr(arena, c.then, lr), .els = try renderExpr(arena, c.els, lr) } }),
-        .cast => |c| try mk(arena, .{ .cast = .{ .e = try renderExpr(arena, c.e, lr), .ty = c.ty } }),
-        .is_null => |n| try mk(arena, .{ .is_null = .{ .e = try renderExpr(arena, n.e, lr), .negated = n.negated, .kind = n.kind } }),
-        // `let … in` is inlined away by expandProgram (run.zig start) before any
-        // pipeline renders, so it can never reach the per-row renderer.
-        .let_in => unreachable,
-        .call => |c| blk: {
-            const args = try arena.alloc(*ast.Expr, c.args.len);
-            for (c.args, 0..) |a, i| args[i] = try renderExpr(arena, a, lr);
-            break :blk try mk(arena, .{ .call = .{ .name = c.name, .args = args } });
-        },
-        .match => |m| blk: {
-            const subject = if (m.subject) |s| try renderExpr(arena, s, lr) else null;
-            const arms = try arena.alloc(ast.MatchArm, m.arms.len);
-            for (m.arms, 0..) |arm, i| {
-                const pats = try arena.alloc(*ast.Expr, arm.pats.len);
-                for (arm.pats, 0..) |p, j| pats[j] = try renderExpr(arena, p, lr);
-                arms[i] = .{ .pats = pats, .guard = if (arm.guard) |g| try renderExpr(arena, g, lr) else null, .value = try renderExpr(arena, arm.value, lr), .is_default = arm.is_default };
-            }
-            break :blk try mk(arena, .{ .match = .{ .subject = subject, .arms = arms } });
-        },
-    };
+    // `str_lit` is the only node rendering transforms (it interpolates `${...}`);
+    // every other node is the structural recursion shared with expand/subst (see
+    // ast.rebuildExpr), which copies all own fields so none can be dropped.
+    if (e.* == .str_lit) return try mk(arena, .{ .str_lit = try interpAll(arena, e.str_lit, lr) });
+    return ast.rebuildExpr(arena, e, RenderCtx{ .arena = arena, .lr = lr }, renderRecur);
 }
 
 fn renderSelect(arena: std.mem.Allocator, items: []const ast.SelectItem, lr: LoopRow) ![]const ast.SelectItem {
@@ -1405,12 +1389,36 @@ fn buildPipeline(env: *Env, stages: []const ast.Stage) anyerror!PipeRes {
         else => return planErr(env.diag, "a pipeline must start with `read`, `union`, or a binding reference"),
     }
 
-    for (stages[1..]) |stage| {
+    var si: usize = 1;
+    while (si < stages.len) : (si += 1) {
+        const stage = stages[si];
+        // Fuse `sort … | limit N` into a single bounded Top-N (heap) operator:
+        // O(n log K) time and O(K) memory instead of a full materialize-and-sort.
+        if (stage.node == .sort and si + 1 < stages.len and stages[si + 1].node == .limit) {
+            const r = try buildTopN(env, stage.node.sort, stages[si + 1].node.limit, current, schema);
+            current = r.op;
+            schema = r.schema;
+            si += 1; // also consume the fused limit
+            continue;
+        }
         const r = try buildStage(env, stage, current, schema);
         current = r.op;
         schema = r.schema;
     }
     return .{ .op = current, .schema = schema };
+}
+
+fn buildTopN(env: *Env, s: ast.Sort, lim: ast.Limit, child: op.Op, schema: types.Schema) anyerror!PipeRes {
+    const arena = env.arena;
+    const qs = try arena.alloc(ast.QualName, s.keys.len);
+    for (s.keys, qs) |sk, *q| q.* = sk.field;
+    var ad = analyze.Diag{};
+    const idxs = analyze.fieldIndices(arena, schema, qs, &ad) catch |e| return aErr(env, &ad, e);
+    const ks = try arena.alloc(op.Sort.Key, s.keys.len);
+    for (s.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc };
+    const o = try arena.create(op.TopN);
+    o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = ks, .count = lim.count, .offset = lim.offset, .state = arena, .gpa = env.gpa };
+    return .{ .op = .{ .top_n = o }, .schema = schema };
 }
 
 // --- union: reconcile N tables to a canon schema, then concatenate ---
@@ -1675,7 +1683,7 @@ fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schema) a
                 keys = analyze.fieldIndices(arena, schema, fields, &ad) catch |e| return aErr(env, &ad, e);
             }
             const o = try arena.create(op.Distinct);
-            o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = keys, .state = arena };
+            o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = keys, .state = arena, .gpa = env.gpa };
             return .{ .op = .{ .distinct = o }, .schema = schema };
         },
         .sort => |s| {
@@ -1731,7 +1739,7 @@ fn buildAggregate(env: *Env, ag: ast.Aggregate, schema: types.Schema, child: op.
     for (ap.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty };
     const out = try schemaPtr(arena, ap.schema);
     const o = try arena.create(op.Aggregate);
-    o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .by = ap.by, .aggs = aggs, .out_schema = out, .err = env.errctx, .state = arena };
+    o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .by = ap.by, .aggs = aggs, .out_schema = out, .err = env.errctx, .state = arena, .gpa = env.gpa };
     return .{ .op = .{ .aggregate = o }, .schema = out.* };
 }
 
@@ -2451,6 +2459,68 @@ test "sort: numeric desc, nulls last" {
     );
     defer alloc.free(out);
     try std.testing.expectEqualStrings("id,amt\n3,200\n1,100\n2,\n", out);
+}
+
+test "aggregate: group by a numeric (int) key (value-keyed hashing)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // group by a computed int column — exercises the numeric value-key path
+    const out = try runToString(alloc, &tmp,
+        "id,n\n1,5\n2,5\n3,7\n4,5\n",
+        "  | select g = cast(n as int)\n  | aggregate c = count() by g\n  | sort g asc",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("g,c\n5,3\n7,1\n", out);
+}
+
+test "distinct: multi-column key (value-keyed)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try runToString(alloc, &tmp,
+        "a,b\nx,1\nx,1\nx,2\ny,1\n",
+        "  | distinct on a, b",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("a,b\nx,1\nx,2\ny,1\n", out);
+}
+
+test "top-N: sort | limit fuses to the K largest, in order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try runToString(alloc, &tmp,
+        "id,amount\n1,100\n2,50\n3,200\n4,\n5,150\n",
+        "  | select id, amt = cast(amount as int)\n  | sort amt desc\n  | limit 2",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id,amt\n3,200\n5,150\n", out);
+}
+
+test "top-N: offset skips before taking" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try runToString(alloc, &tmp,
+        "id,amount\n1,100\n2,50\n3,200\n4,\n5,150\n",
+        "  | select id, amt = cast(amount as int)\n  | sort amt desc\n  | limit 2 offset 1",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id,amt\n5,150\n1,100\n", out);
+}
+
+test "top-N: nulls sort last, matching a full sort | limit-all" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // limit covering all rows must reproduce the plain-sort order (nulls last)
+    const out = try runToString(alloc, &tmp,
+        "id,amount\n1,100\n2,50\n3,200\n4,\n5,150\n",
+        "  | select id, amt = cast(amount as int)\n  | sort amt desc\n  | limit 99",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id,amt\n3,200\n5,150\n1,100\n2,50\n4,\n", out);
 }
 
 test "distinct keeps first row per key" {

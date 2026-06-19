@@ -85,6 +85,56 @@ pub const MatchArm = struct {
     is_default: bool,
 };
 
+fn mkExpr(arena: std.mem.Allocator, e: Expr) !*Expr {
+    const p = try arena.create(Expr);
+    p.* = e;
+    return p;
+}
+
+/// The structural recursion every expression-transforming pass shares: rebuild `e`
+/// by replacing each child sub-expression with `recur(ctx, child)`, copying every
+/// own field (`op`, `ty`, `kind`, `name`, `negated`, `is_default`, …) exactly. Leaf
+/// nodes have no children, so they are shared unchanged (the AST is immutable).
+///
+/// This is the SINGLE place that enumerates `Expr`'s variants and fields, so a pass
+/// can't silently drop a field on rebuild (the bug that hit `is_null.kind` three
+/// times). A pass handles the few node kinds it cares about, then delegates the rest
+/// here; adding a new `Expr` field or variant is a one-line change guarded by Zig's
+/// exhaustive switch. `recur` is the pass's own transform, so `ctx`/error set flow
+/// through unchanged (the error set is inferred per instantiation).
+pub fn rebuildExpr(arena: std.mem.Allocator, e: *const Expr, ctx: anytype, comptime recur: anytype) !*Expr {
+    return switch (e.*) {
+        // Leaves: no child expressions to transform — share the original node.
+        .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit, .field => @constCast(e),
+        .unary => |u| try mkExpr(arena, .{ .unary = .{ .op = u.op, .e = try recur(ctx, u.e) } }),
+        .binary => |b| try mkExpr(arena, .{ .binary = .{ .op = b.op, .l = try recur(ctx, b.l), .r = try recur(ctx, b.r) } }),
+        .cond => |c| try mkExpr(arena, .{ .cond = .{ .cond = try recur(ctx, c.cond), .then = try recur(ctx, c.then), .els = try recur(ctx, c.els) } }),
+        .cast => |c| try mkExpr(arena, .{ .cast = .{ .e = try recur(ctx, c.e), .ty = c.ty } }),
+        .is_null => |n| try mkExpr(arena, .{ .is_null = .{ .e = try recur(ctx, n.e), .negated = n.negated, .kind = n.kind } }),
+        .let_in => |l| try mkExpr(arena, .{ .let_in = .{ .name = l.name, .value = try recur(ctx, l.value), .body = try recur(ctx, l.body) } }),
+        .call => |c| blk: {
+            const args = try arena.alloc(*Expr, c.args.len);
+            for (c.args, args) |a, *out| out.* = try recur(ctx, a);
+            break :blk try mkExpr(arena, .{ .call = .{ .name = c.name, .args = args } });
+        },
+        .match => |m| blk: {
+            const subject = if (m.subject) |s| try recur(ctx, s) else null;
+            const arms = try arena.alloc(MatchArm, m.arms.len);
+            for (m.arms, arms) |arm, *out| {
+                const pats = try arena.alloc(*Expr, arm.pats.len);
+                for (arm.pats, pats) |p, *po| po.* = try recur(ctx, p);
+                out.* = .{
+                    .pats = pats,
+                    .guard = if (arm.guard) |g| try recur(ctx, g) else null,
+                    .value = try recur(ctx, arm.value),
+                    .is_default = arm.is_default,
+                };
+            }
+            break :blk try mkExpr(arena, .{ .match = .{ .subject = subject, .arms = arms } });
+        },
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Hints  (@[ key [= value] , ... ])  — parsed, unused in v1
 // ---------------------------------------------------------------------------
@@ -312,3 +362,27 @@ pub const Stmt = union(enum) {
 };
 
 pub const Program = struct { stmts: []const Stmt };
+
+test "rebuildExpr identity copies every field — no silent drop" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // An identity transform: recurse structurally, change nothing. If rebuildExpr
+    // omitted any field (the bug class this guards), it would be lost here.
+    const Id = struct {
+        fn r(arena: std.mem.Allocator, e: *const Expr) anyerror!*Expr {
+            return rebuildExpr(arena, e, arena, r);
+        }
+    };
+    // cast( (x is empty) as int ) — exercises is_null.kind, .negated, and cast.ty.
+    const x = try mkExpr(a, .{ .field = .{ .parts = &[_][]const u8{"x"} } });
+    const empty = try mkExpr(a, .{ .is_null = .{ .e = x, .negated = true, .kind = .is_empty } });
+    const casted = try mkExpr(a, .{ .cast = .{ .e = empty, .ty = types.Type.init(.int) } });
+
+    const out = try Id.r(a, casted);
+    try std.testing.expect(out.* == .cast);
+    try std.testing.expectEqual(types.TypeKind.int, out.cast.ty.kind); // cast.ty survived
+    try std.testing.expect(out.cast.e.* == .is_null);
+    try std.testing.expectEqual(Expr.NullTest.is_empty, out.cast.e.is_null.kind); // is_null.kind survived
+    try std.testing.expect(out.cast.e.is_null.negated); // .negated survived
+}
