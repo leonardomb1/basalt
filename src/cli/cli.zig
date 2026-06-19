@@ -543,7 +543,8 @@ fn usage(w: anytype) !void {
         \\
         \\  <script> may be a path, `-` for stdin, or `-c <script>` for an inline script
         \\  use `write stdout` to print results as a table (the REPL appends it for you)
-        \\  -j, --threads N    lanes for splittable SQL sources (default: CPU count; non-split sources are serial)
+        \\  -j, --threads N    parallelism: key-range lanes for splittable SQL reads, and byte-range
+        \\                     workers for `read csv | aggregate | write` (default: CPU count)
         \\  --json             emit the run summary as JSON on stdout (machine output)
         \\  --log-format FMT   auto|text|json — logs to stderr (default auto: text on a TTY, NDJSON when piped)
         \\  --log-level LVL    error|warn|info|debug (default info)
