@@ -629,6 +629,16 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     // StarRocks sink also fans out (one stream-load stream per lane); other sinks
     // (CSV) stay shared under a mutex. Non-splittable/stateful pipelines stay serial.
     if (opts.threads > 1 and env.sql_desc != null) {
+        // Parallel SQL aggregate: a `read sqltable | (filter|select)* | aggregate |
+        // (sort|limit)* | write` over a splittable source fans into key-range lanes,
+        // each folding a partial group set, merged via drainGroups/mergeGroups. The
+        // map-only `linearize` path below can't handle the aggregate breaker, so try
+        // this first; it falls back (planning source intact) if the source won't split.
+        if (stages[0].node == .read) {
+            if (classifyAggPipeline(stages)) |shape| {
+                if (try runParallelSqlAgg(env, stages, shape.prefix, shape.ag, shape.tail, wr, opts, stats, lanes_used, src_base)) return;
+            }
+        }
         if (try op.linearize(arena, res.op)) |lin| {
             if (try planSplit(env, env.sql_desc.?, stages[0], opts.threads, wr)) |sp| {
                 // The planning source was opened only to build res.op + discover the
@@ -962,6 +972,192 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
         }
     } else {
         // Run the small post-aggregate tail serially over the merged batch.
+        var ob = OneBatch{ .b = batch, .sch = out_schema.* };
+        var scan = op.Scan{ .src = ob.source() };
+        var cur: op.Op = .{ .scan = &scan };
+        var sch = out_schema.*;
+        for (tail) |st| {
+            const r = try buildStage(env, st, cur, sch);
+            cur = r.op;
+            sch = r.schema;
+        }
+        while (try cur.next(arena)) |outb| {
+            try snk.writeBatch(arena, outb);
+            stats.rows_out += outb.len;
+        }
+    }
+    snk_open = false;
+    try snk.close();
+    return true;
+}
+
+// --- parallel SQL aggregate (key-range lanes) ---
+
+/// Shared state for parallel SQL-aggregate lanes. Mirrors `AggCtx`, but each lane opens
+/// its own DB connection over one key-range predicate (`openSplitSource`) instead of
+/// reading a CSV byte-range. Each lane folds its range into a thread-local partial group
+/// set, then merges it into the combined set under `mtx` at the raw-`Acc` level (so AVG
+/// stays correct). The merge is O(groups) vs the O(rows) fold, so contention is low.
+const SqlAggCtx = struct {
+    split: SplitCtx,
+    predicates: []const []const u8,
+    src_schema: *const types.Schema, // raw SQL source columns (the lane scans' schema)
+    agg_in_schema: *const types.Schema, // schema after the prefix (the aggregate's input)
+    out_schema: *const types.Schema,
+    prefix: []const ast.Stage,
+    params: *std.StringHashMap(*const ast.Expr),
+    by: []const usize,
+    aggs: []const op.Aggregate.Agg,
+    next_pred: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    cmap: *op.Aggregate.GroupMap(),
+    cgroups: *std.array_list.Managed(op.Aggregate.Group),
+    mtx: std.Thread.Mutex = .{},
+    err_mtx: std.Thread.Mutex = .{},
+    first_err: ?anyerror = null,
+    plan_arena: std.mem.Allocator, // combined groups live here (plan arena)
+    rows_read: *std.atomic.Value(u64),
+};
+
+fn sqlAggWorker(ctx: *SqlAggCtx) void {
+    while (true) {
+        if (ctx.first_err != null) return;
+        const i = ctx.next_pred.fetchAdd(1, .seq_cst);
+        if (i >= ctx.predicates.len) break;
+        sqlAggWorkOne(ctx, i) catch |e| {
+            ctx.err_mtx.lock();
+            if (ctx.first_err == null) ctx.first_err = e;
+            ctx.err_mtx.unlock();
+            return;
+        };
+    }
+}
+
+fn sqlAggWorkOne(ctx: *SqlAggCtx, i: usize) !void {
+    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
+    defer _ = wgpa.deinit();
+    var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
+    defer warena.deinit(); // freed after the merge copies what survives into plan_arena
+    const wa = warena.allocator();
+
+    // One DB connection per lane, scanning this lane's key range. The cursor owns its
+    // connection, so close the source after the fold to release it.
+    const src = try openSplitSource(&ctx.split, wgpa.allocator(), ctx.predicates[i]);
+    defer src.close();
+
+    var cs = obs.CountingSource{ .inner = src, .count = ctx.rows_read };
+    var scan = op.Scan{ .src = cs.source() };
+    const child = try buildMapChain(wa, ctx.params, ctx.prefix, &scan, ctx.src_schema);
+    var agg = op.Aggregate{
+        .child = child,
+        .in_schema = ctx.agg_in_schema,
+        .by = ctx.by,
+        .aggs = ctx.aggs,
+        .out_schema = ctx.out_schema,
+        .err = null, // errors propagate via the return value; no shared ErrCtx race
+        .state = wa,
+        .gpa = wgpa.allocator(),
+    };
+    const groups = try agg.drainGroups();
+
+    ctx.mtx.lock();
+    defer ctx.mtx.unlock();
+    try op.Aggregate.mergeGroups(ctx.cmap, ctx.cgroups, ctx.plan_arena, groups, ctx.aggs);
+}
+
+/// Parallel SQL aggregate: `read <sqltable> | (filter|select)* | aggregate | (sort|limit)* | write`
+/// over a splittable source. Fans into key-range lanes (one DB connection each), folds a
+/// partial group set per lane, merges at the raw-`Acc` level, then runs the small
+/// post-aggregate tail serially over the merged batch. Returns false to fall back to the
+/// serial path (non-splittable source, no split plan, bare upsert). NOTE: exercised only
+/// against a live DB — there is no local DB in the test suite, so this path is covered by
+/// the shared CSV-aggregate machinery (`drainGroups`/`mergeGroups`/`emit`) it reuses, not
+/// by a direct test.
+fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, src_base: usize) anyerror!bool {
+    const arena = env.arena;
+    const desc = env.sql_desc orelse return false;
+    if (stages[0].node != .read) return false;
+    // Bare `upsert` (PK inference) needs source metadata resolved on the serial path.
+    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
+    if (src_base >= env.sources.items.len) return false; // no planning source open
+
+    // The raw SQL source columns — names live in the source cursor's arena, so dupe them
+    // into the plan arena now (the planning source is closed once we commit below).
+    const src_schema = try schemaPtr(arena, try dupeSchema(arena, env.sources.items[src_base].schema()));
+
+    // Validate the prefix serially (proper errors) → the aggregate's input schema; lanes
+    // rebuild the identical prefix on their own arenas.
+    const agg_in = try schemaPtr(arena, try mapChainSchema(env, prefix, src_schema.*));
+
+    var ad = analyze.Diag{};
+    const apl = analyze.aggregatePlan(arena, agg_in.*, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
+    const aggs = try arena.alloc(op.Aggregate.Agg, apl.aggs.len);
+    for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty };
+    const out_schema = try schemaPtr(arena, apl.schema);
+
+    // Commit point: build the split plan. null → not splittable, fall back with the
+    // planning source still open for the serial path.
+    const sp = (try planSplit(env, desc, stages[0], opts.threads, w)) orelse return false;
+
+    // Committed to the parallel path: release the planning source (lanes open their own).
+    for (env.sources.items[src_base..]) |sc| sc.close();
+    env.sources.shrinkRetainingCapacity(src_base);
+
+    env.sink_name = connectorType(env, w.connector);
+
+    const nlanes = @min(@max(@as(usize, 1), opts.threads), sp.predicates.len);
+    var cmap = op.Aggregate.GroupMap().init(arena);
+    var cgroups = std.array_list.Managed(op.Aggregate.Group).init(arena);
+    var ctx = SqlAggCtx{
+        .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql },
+        .predicates = sp.predicates,
+        .src_schema = src_schema,
+        .agg_in_schema = agg_in,
+        .out_schema = out_schema,
+        .prefix = prefix,
+        .params = env.params_expr,
+        .by = apl.by,
+        .aggs = aggs,
+        .cmap = &cmap,
+        .cgroups = &cgroups,
+        .plan_arena = arena,
+        .rows_read = env.rows_read,
+    };
+
+    const threads = try arena.alloc(std.Thread, nlanes);
+    var spawned: usize = 0;
+    while (spawned < nlanes) : (spawned += 1) {
+        threads[spawned] = std.Thread.spawn(.{}, sqlAggWorker, .{&ctx}) catch break;
+    }
+    if (spawned == 0) sqlAggWorker(&ctx) else for (threads[0..spawned]) |t| t.join();
+    lanes_used.* = @max(lanes_used.*, @max(spawned, 1));
+    env.log.log(.info, "parallel sql aggregate: {d} splits over {d} lanes on key range", .{ sp.predicates.len, @max(spawned, 1) });
+
+    if (ctx.first_err) |e| return e;
+
+    // Finalize the merged groups into one output batch (a "merger" Aggregate just for
+    // `emit`; it never pulls a child).
+    var merger = op.Aggregate{
+        .child = undefined,
+        .in_schema = agg_in,
+        .by = apl.by,
+        .aggs = aggs,
+        .out_schema = out_schema,
+        .state = arena,
+        .gpa = env.gpa,
+    };
+    const batch = try merger.emit(arena, cgroups.items);
+
+    // `w` arrived already upsert-resolved from runOutput; the tail preserves the schema.
+    const snk = try openSink(env, w, out_schema.*);
+    var snk_open = true;
+    errdefer if (snk_open) snk.abort();
+
+    if (tail.len == 0) {
+        if (batch.len > 0) {
+            try snk.writeBatch(arena, batch);
+            stats.rows_out += batch.len;
+        }
+    } else {
         var ob = OneBatch{ .b = batch, .sch = out_schema.* };
         var scan = op.Scan{ .src = ob.source() };
         var cur: op.Op = .{ .scan = &scan };
