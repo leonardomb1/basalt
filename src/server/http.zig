@@ -12,16 +12,27 @@ const ast = @import("../lang/ast.zig");
 const parser = @import("../lang/parser.zig");
 const runtime = @import("../runtime/run.zig");
 
-pub const Route = struct { path: []const u8, program: ast.Program, label: []const u8 };
+pub const Route = struct { path: []const u8, program: ast.Program, label: []const u8, doc: []const u8 = "" };
 
 /// The `@http(path=…)` of a program (defaults to "/").
 fn httpPath(program: ast.Program) []const u8 {
-    if (program.stmts.len == 0 or program.stmts[0] != .kind) return "/";
-    var p: []const u8 = "/";
+    return httpAttr(program, "path") orelse "/";
+}
+
+/// The optional `@http(doc=…)` route description (empty when unset). Surfaced in the
+/// startup banner so `basalt serve` self-documents what each route does.
+fn httpDoc(program: ast.Program) []const u8 {
+    return httpAttr(program, "doc") orelse "";
+}
+
+/// The string value of an `@http(<key>=…)` config attribute, or null if absent.
+fn httpAttr(program: ast.Program, key: []const u8) ?[]const u8 {
+    if (program.stmts.len == 0 or program.stmts[0] != .kind) return null;
+    var v: ?[]const u8 = null;
     for (program.stmts[0].kind.config) |attr| {
-        if (std.mem.eql(u8, attr.key, "path")) p = attrToStr(attr.value);
+        if (std.mem.eql(u8, attr.key, key)) v = attrToStr(attr.value);
     }
-    return p;
+    return v;
 }
 
 /// Listen on `0.0.0.0:port` with a 1s accept timeout so the loop re-checks the
@@ -37,12 +48,17 @@ fn listen(port: u16) !std.net.Server {
 
 fn banner(port: u16, routes: []const Route) void {
     std.debug.print("basalt serving {d} route(s) on http://0.0.0.0:{d}\n", .{ routes.len, port });
-    for (routes) |r| std.debug.print("  {s}  <- {s}\n", .{ r.path, r.label });
+    for (routes) |r| {
+        if (r.doc.len > 0)
+            std.debug.print("  {s}  <- {s}  — {s}\n", .{ r.path, r.label, r.doc })
+        else
+            std.debug.print("  {s}  <- {s}\n", .{ r.path, r.label });
+    }
 }
 
 /// Serve a single `@http` program.
 pub fn serve(gpa: std.mem.Allocator, program: ast.Program, port: u16) !void {
-    const routes = [_]Route{.{ .path = httpPath(program), .program = program, .label = "<script>" }};
+    const routes = [_]Route{.{ .path = httpPath(program), .program = program, .label = "<script>", .doc = httpDoc(program) }};
     var net_server = try listen(port);
     defer net_server.deinit();
     banner(port, &routes);
@@ -101,7 +117,7 @@ fn loadDir(gpa: std.mem.Allocator, dir_path: []const u8) !Registry {
             }
         }
         if (dup) continue;
-        try routes.append(.{ .path = path, .program = prog, .label = label });
+        try routes.append(.{ .path = path, .program = prog, .label = label, .doc = httpDoc(prog) });
     }
     if (routes.items.len == 0) return error.NoRoutes;
     return .{ .arena = arena, .routes = try routes.toOwnedSlice() };

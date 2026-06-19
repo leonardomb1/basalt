@@ -20,4 +20,4 @@ connection sr = starrocks
 for name, source in tables @[mode = parallel, on_error = continue]
   union erp json "${source}" @[tag = emp, canon = first, tag_substr = "4,2"]
     | select R_E_C_N_O_, "${name}_EMPRESA" = emp, * except(R_E_C_N_O_, emp), updated_at = now()
-    | write sr stream_load "proth_${name:lower}" upsert on R_E_C_N_O_, "${name}_EMPRESA"
+    | write sr stream_load "proth_${lower(name)}" upsert on R_E_C_N_O_, "${name}_EMPRESA"

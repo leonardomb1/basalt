@@ -7,15 +7,26 @@ const types = @import("types.zig");
 
 pub const Pos = struct { line: u32, col: u32 };
 
-/// A possibly-qualified name: `id`, `public.orders`, `a.b.c`.
+/// A possibly-qualified name: `id`, `public.orders`, `a.b.c`. `safe` (when present)
+/// is parallel to the *separators*: `safe[i]` is true when the separator between
+/// `parts[i]` and `parts[i+1]` was `?.` (safe navigation) rather than `.` — so its
+/// length is `parts.len - 1`, and it aligns one-to-one with `parts[1..]`. An empty
+/// `safe` means no `?.` was used (every separator is a plain `.`). Only JSON-param
+/// paths honor `?.` (a missing intermediate key resolves the path to null instead of
+/// erroring); a `?.` on a plain column reference is rejected at type-check.
 pub const QualName = struct {
     parts: []const []const u8,
+    safe: []const bool = &.{},
 
     pub fn single(self: QualName) ?[]const u8 {
         return if (self.parts.len == 1) self.parts[0] else null;
     }
     pub fn last(self: QualName) []const u8 {
         return self.parts[self.parts.len - 1];
+    }
+    /// Was segment `i` reached via `?.` (safe navigation)? Segment 0 never is.
+    pub fn safeAt(self: QualName, i: usize) bool {
+        return i >= 1 and i - 1 < self.safe.len and self.safe[i - 1];
     }
 };
 
@@ -40,17 +51,27 @@ pub const Expr = union(enum) {
     match: Match,
     cast: Cast,
     is_null: IsNull,
+    let_in: LetIn, // `let name = value in body` — desugared away at plan time
 
     pub const Unary = struct { op: UnOp, e: *Expr };
     pub const Binary = struct { op: BinOp, l: *Expr, r: *Expr };
     pub const Call = struct { name: []const u8, args: []const *Expr };
     pub const Cond = struct { cond: *Expr, then: *Expr, els: *Expr };
+    /// `let name = value in body`: a local binding inside an expression. Inlined at
+    /// plan time (`expand.zig`) by substituting `value` for `name` in `body`, so the
+    /// type-checker and evaluator never see it — like a single-use `fn`. Lets a `fn`
+    /// body (or any computed column) name an intermediate instead of repeating it.
+    pub const LetIn = struct { name: []const u8, value: *Expr, body: *Expr };
     pub const Cast = struct { e: *Expr, ty: types.Type };
-    pub const IsNull = struct { e: *Expr, negated: bool };
+    /// `x is null` / `x is not null` (`.is_null`), and the additive
+    /// `x is empty` / `x is not empty` (`.is_empty`) which is true when the
+    /// operand is null OR an empty string. Both forms are total (never null).
+    pub const NullTest = enum { is_null, is_empty };
+    pub const IsNull = struct { e: *Expr, negated: bool, kind: NullTest = .is_null };
 };
 
 /// `match [subject] arm... end`. Subject form: each arm has `pats` (alternation
-/// via `|`). Guard form (no subject): each arm has a boolean `guard`. A default
+/// via `,`). Guard form (no subject): each arm has a boolean `guard`. A default
 /// arm (`_`) has empty `pats` and null `guard`.
 pub const Match = struct {
     subject: ?*Expr,
@@ -103,10 +124,12 @@ pub const ReadForm = union(enum) {
 pub const SelectItem = union(enum) {
     star,
     star_except: []const []const u8,
+    star_rename: []const Rename, // `* rename (old as new, ...)` — passthrough all, with renames
     field: QualName,
     computed: Computed,
 
     pub const Computed = struct { name: []const u8, expr: *Expr };
+    pub const Rename = struct { from: []const u8, to: []const u8 };
 };
 
 pub const Explode = struct { field: []const u8, as_name: ?[]const u8, delim: ?[]const u8 = null };
@@ -244,6 +267,11 @@ pub const ForSource = union(enum) {
 
 pub const ForEach = struct {
     var_names: []const []const u8,
+    /// Optional declared type per loop variable (parallel to `var_names`; `null` =
+    /// untyped/string). `for name, port:int in ...` lets a `match` over the loop
+    /// values compare them as the declared type instead of as strings. An empty
+    /// slice means every variable is untyped.
+    var_types: []const ?types.Type = &.{},
     source: ForSource,
     hints: []const Hint,
     body: []const Stmt,
@@ -256,7 +284,7 @@ pub const KindDecl = struct { kind: Kind, config: []const Attr, pos: Pos };
 
 /// Plan-time structural dispatch: `match [subject] arm... end`, where each arm's
 /// body is a `{ ... }` block of statements. Mirrors the expression `Match` arm
-/// shapes (subject + `|` alternation, guard form, `_` default) but runs whole
+/// shapes (subject + `,` alternation, guard form, `_` default) but runs whole
 /// statements. Evaluated once at plan time over params / loop variables; an
 /// unmatched value with no `_` arm is a no-op.
 pub const StmtMatch = struct {

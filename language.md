@@ -38,7 +38,9 @@ Whitespace and newlines are insignificant. `#` starts a line comment. Identifier
   body/query/headers feed `param` declarations. `path` defaults to `/`. Served by
   `basalt serve <dir>`, which routes each script by its declared `path`.
 
-The `@kind` parentheses take `key = value` attributes (only `path` is currently read).
+The `@kind` parentheses take `key = value` attributes: `path` (the route) and an
+optional `doc` (`@http(path = "/ingest", doc = "Ingest events")`) — a one-line route
+description shown in the `basalt serve` startup banner.
 
 ---
 
@@ -141,6 +143,8 @@ read mssql query "select id, total from orders where total > 0"
 **`select` item forms:**
 - `*` — all columns
 - `* except (a, b)` — all but the named columns
+- `* rename (old as new, ...)` — all columns, with the named ones renamed (an
+  unknown `old` is an error)
 - `field` or `a.b` — a column passthrough
 - `name = <expr>` — a computed column. The alias may be a **quoted string** so a
   `${var}` can build it: `"${name}_EMPRESA" = emp`.
@@ -164,15 +168,30 @@ write sr stream_load orders upsert on id @[split = id]
 ## 5. Expressions
 
 Pratt-parsed, SQL-ish. Precedence (high → low): unary `- not` → `* / %` → `+ -` →
-comparisons `== != < <= > >=` → `and` → `or`. (`=` is also accepted as equality inside
-a `join ... on`.)
+comparisons `== != < <= > >=` → `??` → `and` → `or`. (`=` is also accepted as equality
+inside a `join ... on`.)
 
 - **Literals:** `null`, `true`, `false`, ints, floats, `"strings"`.
 - **Columns:** `id`, `table.col`, `a.b.c`.
 - **Conditional:** `if(cond, then, else)`.
 - **Null tests:** `x is null`, `x is not null`.
+- **Empty tests:** `x is empty`, `x is not empty` — true when `x` is null **or** an
+  empty string. `x` must be a string operand (a non-string is a type error — use
+  `is null`). Handy for `for`/JSON loop values, where a missing field binds to `""`
+  (see §8), so `pk is empty` covers both the missing and the blank case.
+- **Null-coalesce:** `a ?? b` — the first non-null of `a`, `b` (sugar for
+  `coalesce(a, b)`; chains right-to-left: `a ?? b ?? c`).
 - **Cast:** `cast(x as int)` / `cast(x as decimal(18,2))` (implicit widening is
   *int→float/decimal* only; everything else needs an explicit cast).
+- **Safe navigation:** `a?.b` — like `a.b`, but on a JSON-param path a missing/null
+  intermediate resolves the whole path to `null` instead of erroring (`job.src?.host`,
+  and likewise on a `for ... in job?.tables` source, where a missing path yields zero
+  iterations). Plain `.` still errors on a missing key. `?.` applies only to JSON-param
+  paths — using it on a plain column reference is a type error.
+- **Local binding:** `let name = <value> in <body>` — names an intermediate inside an
+  expression (so a `fn` body or computed column need not repeat a subexpression). It is
+  inlined at plan time: `let d = id + 1 in d * d` becomes `(id+1) * (id+1)`. Not
+  available inside a `${...}` interpolation hole.
 - **Match expression** (see §6).
 - **Function call:** `name(args...)`.
 
@@ -185,7 +204,9 @@ a `join ... on`.)
 fn empresa(t) = substr(t, 4, 2)
 ... | select e = empresa(id)        # becomes substr(id, 4, 2)
 ```
-Recursion and arity mismatches are compile errors. `fn` bodies are a single expression.
+Recursion and arity mismatches are compile errors. A `fn` body is a single expression,
+but `let name = <value> in <body>` lets it name intermediates: `fn net(p) = let b =
+cast(p as int) in b + b/10`.
 
 ---
 
@@ -193,8 +214,8 @@ Recursion and arity mismatches are compile errors. `fn` bodies are a single expr
 
 **Match expression** — a value, two forms:
 ```
-# subject form ( `|` alternation, `_` default )
-grade = match status "paid" | "ok" => "done"  _ => "open" end
+# subject form ( `,` alternation, `_` default )
+grade = match status "paid", "ok" => "done"  _ => "open" end
 # guard form (no subject; first true guard wins)
 tier  = match amount >= 1000 => "gold"  amount >= 100 => "silver"  _ => "std" end
 ```
@@ -264,6 +285,15 @@ for name, cols, where in tables @[mode = parallel, on_error = continue]
   element's fields bound to the loop vars **by name**).
 - For each row, the body is run with every `${var}` interpolated into read/write
   targets, `where`, upsert keys, hint values, and string literals.
+- A loop variable may be **typed**: `for name, port:int in cfg`. The declared type
+  applies wherever the body evaluates the variable as an expression — both a `match`
+  guard (`match port >= 1000 => ...`) and a `${ <expr> }` interpolation
+  (`"${if(port >= 1000, "big", "small")}"`) then compare it numerically. (Without the
+  annotation, comparing a loop value to a non-string literal fails when that row is
+  evaluated — declare the type or `cast(...)`. This is a per-row runtime error, not a
+  `basalt check` plan-time one, since the values aren't known until discovery.) A
+  missing/blank value binds to `null`. A bare `${var}` is always substituted as text
+  regardless of type.
 - `@[mode]` = `parallel` | `sequential`; `@[on_error]` = `continue` | `stop`.
 
 ### `for` body: a pipeline, a `match`, or a `{ }` block
@@ -306,8 +336,9 @@ A `${ ... }` placeholder has two body shapes:
   "crm_${lower(name)}"                                   # case-fold with a function
   key = "${coalesce(pk, "default")}"
   ```
-  > The old `${var:lower}` / `${var:upper}` modifier syntax was **removed** — use the
-  > `lower(...)` / `upper(...)` functions instead.
+  > The `${var:lower}` / `${var:upper}` modifier syntax is **deprecated** — it still
+  > resolves but prints a deprecation warning; use the `lower(...)` / `upper(...)`
+  > functions instead.
   All built-in scalar functions (§5) are available. **Interpolation is C#-style**: a
   `${...}` hole inside a `"..."` string is scanned brace-balanced and string-aware, so
   nested string literals inside the hole need **no escaping** — write `"${concat(a, "b")}"`,
@@ -318,9 +349,9 @@ Two facts that matter for the conditional case:
 
 - **Missing JSON field binds to `""`** (empty string), **never `null`**. So a
   `for name, cols, where, pk in tables` over objects lacking `pk` gives `pk == ""` —
-  test for `""`, not `null`.
+  test with `pk is empty` (covers both null and `""`), or compare `pk == ""`.
 - Loop values are strings, so compare against string literals (`pk == ""`), and reach for
-  `concat`, `coalesce`, `if`, `substr`, etc.
+  `is empty`, `??`, `concat`, `coalesce`, `if`, `substr`, etc.
 
 For value selection (like choosing an upsert key) this is the simplest tool — no `match`
 needed. Use a `match` body (below) when you need to choose a whole **pipeline** per row,

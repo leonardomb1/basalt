@@ -35,6 +35,10 @@ pub const TypeCtx = struct {
             .float_lit => return Type.init(.float),
             .str_lit => return Type.init(.string),
             .field => |q| {
+                // `?.` is meaningful only on JSON-param paths, which expansion has
+                // already turned into literals; a `?.` still on a column reference is
+                // a mistake, not a silent no-op.
+                if (q.safe.len > 0) return self.err("`?.` (safe navigation) only applies to JSON-param paths, not column `{s}`", .{lastPart(q)});
                 const idx = fieldIndex(self.schema, q) orelse
                     return self.err("unknown field `{s}`", .{lastPart(q)});
                 return self.schema.fields[idx].ty;
@@ -61,7 +65,17 @@ pub const TypeCtx = struct {
                 const s = try self.typeOf(c.e);
                 return c.ty.withNull(s.nullable);
             },
-            .is_null => return Type.init(.bool),
+            .is_null => |n| {
+                // `is empty` (null-or-empty-string) is only meaningful for strings;
+                // on a non-string it would silently collapse to `is null`.
+                if (n.kind == .is_empty) {
+                    const t = try self.typeOf(n.e);
+                    if (!(t.kind == .string or t.kind == .bytes or t.unknown))
+                        return self.err("`is empty` needs a string operand (got {s}); use `is null`", .{@tagName(t.kind)});
+                }
+                return Type.init(.bool);
+            },
+            .let_in => return self.err("internal: `let … in` should have been expanded before type-checking", .{}),
         }
     }
 
@@ -290,6 +304,7 @@ fn evalVec(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch) VecErr
         .cond => |c| return condVec(arena, c, batch),
         .call => |c| return callVec(arena, c, batch),
         .match => return error.Unsupported,
+        .let_in => return error.Unsupported, // expanded away at plan time; never vectorized
     }
 }
 
@@ -561,6 +576,9 @@ fn unaryVec(arena: std.mem.Allocator, u: ast.Expr.Unary, batch: Batch) VecError!
 }
 
 fn isNullVec(arena: std.mem.Allocator, n: ast.Expr.IsNull, batch: Batch) VecError!Vec {
+    // `is empty` (null-or-empty-string) has no vectorized kernel — fall the whole
+    // expression back to the rowwise evaluator, which implements it.
+    if (n.kind == .is_empty) return error.Unsupported;
     const v = try evalVec(arena, n.e, batch);
     switch (v) {
         .scalar => |s| {
@@ -1138,6 +1156,14 @@ fn scalarType(v: Value) Type {
     };
 }
 
+/// True for an empty string/bytes value — the non-null half of `is empty`.
+fn isEmptyVal(v: Value) bool {
+    return switch (v) {
+        .string, .bytes => |s| s.len == 0,
+        else => false,
+    };
+}
+
 pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, row: usize) EvalError!Value {
     switch (expr.*) {
         .null_lit => return .null,
@@ -1164,8 +1190,11 @@ pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, ro
         .binary => |b| return evalBinary(arena, b, batch, row),
         .is_null => |n| {
             const v = try evalRow(arena, n.e, batch, row);
-            const is_null = v.isNull();
-            return .{ .bool = if (n.negated) !is_null else is_null };
+            const hit = switch (n.kind) {
+                .is_null => v.isNull(),
+                .is_empty => v.isNull() or isEmptyVal(v),
+            };
+            return .{ .bool = if (n.negated) !hit else hit };
         },
         .cond => |c| {
             const cv = try evalRow(arena, c.cond, batch, row);
@@ -1179,6 +1208,10 @@ pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, ro
         },
         .match => |m| return evalMatch(arena, m, batch, row),
         .call => |c| return evalCall(arena, c, batch, row),
+        // `let … in` is inlined away during expansion. It can only reach here in a
+        // raw `${ ... }` interpolation expression (which is not expanded); that is
+        // unsupported — use the function/`coalesce` forms there instead.
+        .let_in => return error.TypeMismatch,
     }
 }
 
@@ -1363,7 +1396,7 @@ fn evalCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize
     return error.TypeMismatch;
 }
 
-fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalError!Value {
+pub fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalError!Value {
     return switch (kind) {
         .int => switch (v) {
             .int => v,

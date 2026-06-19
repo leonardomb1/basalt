@@ -502,6 +502,44 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts: RunOptions, d
     return stats;
 }
 
+/// Equality for plan-time `match`: numbers/strings/bools/temporals compare by value;
+/// a typed-vs-literal mismatch (e.g. a `port:int` subject vs a `"9030"` string
+/// pattern) falls back to a textual compare so a typed value still matches a string
+/// pattern instead of silently never matching.
+fn valuesEqualLoose(arena: std.mem.Allocator, a: Value, b: Value) bool {
+    if (eval.compareValues(a, b)) |ord| return ord == .eq;
+    const as = eval.valueToString(arena, a) catch return false;
+    const bs = eval.valueToString(arena, b) catch return false;
+    return std.mem.eql(u8, as, bs);
+}
+
+/// Evaluate a statement-`match`'s subject/guards/patterns over the bound names/values
+/// and return the index of the first matching arm (a `_` default matches), or null if
+/// none. Shared by the param-level (`runStmtMatch`) and per-row for-loop
+/// (`runForMatch`) runners, which differ only in how they bind names/values and how
+/// they run the chosen arm's body. `ctx` prefixes any eval-error message.
+fn matchArmIndex(env: *Env, m: ast.StmtMatch, ns: []const []const u8, vs: []const Value, ctx: []const u8) anyerror!?usize {
+    var subj: ?Value = null;
+    if (m.subject) |s| subj = eval.constEval(env.arena, s, ns, vs) catch |e|
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} subject: {s}", .{ ctx, @errorName(e) }));
+    for (m.arms, 0..) |arm, i| {
+        if (arm.is_default) return i;
+        if (arm.guard) |g| {
+            const gv = eval.constEval(env.arena, g, ns, vs) catch |e|
+                return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} guard: {s}", .{ ctx, @errorName(e) }));
+            if (gv == .bool and gv.bool) return i;
+            continue;
+        }
+        const sv = subj orelse continue;
+        for (arm.pats) |p| {
+            const pv = eval.constEval(env.arena, p, ns, vs) catch |e|
+                return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} pattern: {s}", .{ ctx, @errorName(e) }));
+            if (valuesEqualLoose(env.arena, sv, pv)) return i;
+        }
+    }
+    return null;
+}
+
 /// Plan-time structural dispatch: evaluate the subject/guards over the resolved
 /// params and run the first matching arm's block. No matching arm (and no `_`) is
 /// a no-op. Subject form compares the subject to each pattern; guard form runs the
@@ -514,34 +552,8 @@ fn runStmtMatch(env: *Env, m: ast.StmtMatch, opts: RunOptions, stats: *Stats, la
         try names.append(kv.key_ptr.*);
         try values.append(kv.value_ptr.*);
     }
-    const ns = names.items;
-    const vs = values.items;
-
-    var subj: ?Value = null;
-    if (m.subject) |s| subj = eval.constEval(env.arena, s, ns, vs) catch |e|
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "match subject: {s}", .{@errorName(e)}));
-
-    for (m.arms) |arm| {
-        const hit = blk: {
-            if (arm.is_default) break :blk true;
-            if (arm.guard) |g| {
-                const gv = eval.constEval(env.arena, g, ns, vs) catch |e|
-                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "match guard: {s}", .{@errorName(e)}));
-                break :blk (gv == .bool and gv.bool);
-            }
-            const sv = subj orelse break :blk false;
-            for (arm.pats) |p| {
-                const pv = eval.constEval(env.arena, p, ns, vs) catch |e|
-                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "match pattern: {s}", .{@errorName(e)}));
-                if (eval.compareValues(sv, pv)) |ord| if (ord == .eq) break :blk true;
-            }
-            break :blk false;
-        };
-        if (hit) {
-            for (arm.body) |*st| try runStmt(env, st, opts, stats, lanes_used, batch_arena);
-            return; // first matching arm wins
-        }
-    }
+    const idx = (try matchArmIndex(env, m, names.items, values.items, "match")) orelse return;
+    for (m.arms[idx].body) |*st| try runStmt(env, st, opts, stats, lanes_used, batch_arena);
 }
 
 /// Execute one statement — used for match arm bodies. Registers declarations into
@@ -689,6 +701,20 @@ fn forHintIdent(hints: []const ast.Hint, key: []const u8) ?[]const u8 {
 /// One discovery row: the first `var_names.len` columns coerced to text.
 const Row = []const []const u8;
 
+/// A for-loop's per-row binding, threaded as one value through the interpolation and
+/// render chain: the loop variable names, their declared types (parallel; empty = all
+/// untyped), and this row's raw text cells. Bundled so a new per-variable attribute
+/// doesn't mean re-touching every render signature.
+const LoopRow = struct {
+    names: []const []const u8,
+    types: []const ?types.Type = &.{},
+    cells: Row,
+
+    fn typeAt(self: LoopRow, i: usize) ?types.Type {
+        return if (i < self.types.len) self.types[i] else null;
+    }
+};
+
 /// Run the discovery source once and collect its first `ncols` columns as rows of
 /// text (strings/ints; null → ""). The list is small — a table catalog — so it is
 /// fully materialized into the plan arena.
@@ -728,11 +754,19 @@ fn discoverRowsJson(env: *Env, path: ast.QualName, var_names: []const []const u8
     const head = path.parts[0];
     var cur = env.json_params.get(head) orelse
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each: `{s}` is not a JSON param", .{head}));
-    for (path.parts[1..]) |key| {
+    for (path.parts[1..], 0..) |key, j| {
+        // `safe` is separator-parallel and aligns with parts[1..]; a `?.` segment
+        // tolerates a missing/non-object intermediate by yielding zero rows.
+        const seg_safe = j < path.safe.len and path.safe[j];
         cur = switch (cur) {
-            .object => |o| o.get(key) orelse
-                return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each: json key `{s}` not found", .{key})),
-            else => return planErr(env.diag, "for-each: json path is not an object"),
+            .object => |o| o.get(key) orelse {
+                if (seg_safe) return &.{};
+                return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each: json key `{s}` not found", .{key}));
+            },
+            else => {
+                if (seg_safe) return &.{};
+                return planErr(env.diag, "for-each: json path is not an object");
+            },
         };
     }
     const arr = switch (cur) {
@@ -753,6 +787,23 @@ fn discoverRowsJson(env: *Env, path: ast.QualName, var_names: []const []const u8
     return rows.toOwnedSlice();
 }
 
+/// Coerce a loop variable's raw text cell to its declared type for expression
+/// evaluation. Untyped (`null`) stays a string; an empty/blank cell or an
+/// unparseable value under a declared numeric/bool type binds to null (so a typed
+/// guard simply doesn't match a missing value). String/bytes/temporal/decimal types
+/// keep the raw text — the eval layer coerces those as needed.
+fn loopValue(arena: std.mem.Allocator, cell: []const u8, ty: ?types.Type) Value {
+    const t = ty orelse return .{ .string = cell };
+    if (cell.len == 0) return .null;
+    return switch (t.kind) {
+        // Route int/float/bool through the canonical cast so a typed loop value and
+        // an in-expression cast(...) agree on whitespace trimming and true/false
+        // parsing (a single source of truth for string→scalar coercion).
+        .int, .float, .bool => eval.castValue(arena, .{ .string = cell }, t.kind) catch .null,
+        else => .{ .string = cell }, // string/bytes/temporal/decimal: keep raw text
+    };
+}
+
 fn jsonToStr(arena: std.mem.Allocator, v: std.json.Value) ![]const u8 {
     return switch (v) {
         .null => "",
@@ -771,11 +822,12 @@ fn jsonToStr(arena: std.mem.Allocator, v: std.json.Value) ![]const u8 {
 ///   * `${var}` — fast path: substitute the loop variable's value. An unknown
 ///     variable is left verbatim, so non-loop `${...}` text rides through untouched.
 ///   * `${ <expr> }` — anything else is parsed as an expression and evaluated with
-///     the loop variables in scope (as string values), then formatted to text. This
+///     the loop variables in scope (bound as strings, or as their declared type when
+///     the `for` header annotated one, e.g. `port:int`), then formatted to text. This
 ///     is where conditionals/coalesce/case-folding live: `${lower(name)}`,
 ///     `${if(pk == "", concat(name, "id"), pk)}`, `${coalesce(pk, "default")}`.
 /// Strings without `${` are returned as-is (no allocation).
-fn interpAll(arena: std.mem.Allocator, s: []const u8, names: []const []const u8, values: Row) ![]const u8 {
+fn interpAll(arena: std.mem.Allocator, s: []const u8, lr: LoopRow) ![]const u8 {
     if (std.mem.indexOf(u8, s, "${") == null) return s;
     var out = std.array_list.Managed(u8).init(arena);
     errdefer out.deinit();
@@ -789,7 +841,7 @@ fn interpAll(arena: std.mem.Allocator, s: []const u8, names: []const []const u8,
             const inner = s[i + 2 .. close];
             if (bareInterp(inner)) {
                 var found = false;
-                for (names, values) |nm, val| {
+                for (lr.names, lr.cells) |nm, val| {
                     if (std.mem.eql(u8, nm, inner)) {
                         try out.appendSlice(val);
                         found = true;
@@ -798,7 +850,7 @@ fn interpAll(arena: std.mem.Allocator, s: []const u8, names: []const []const u8,
                 }
                 if (!found) try out.appendSlice(s[i .. close + 1]); // unknown var: leave verbatim
             } else {
-                try out.appendSlice(try evalInterpExpr(arena, inner, names, values));
+                try out.appendSlice(try evalInterpExpr(arena, inner, lr));
             }
             i = close + 1;
         } else {
@@ -853,30 +905,93 @@ fn bareInterp(inner: []const u8) bool {
     return true;
 }
 
-/// The removed `${var:lower}` / `${var:upper}` modifier shape — `ident:ident`. Kept
-/// only to emit a clear migration error pointing at the function form.
+/// The deprecated `${var:lower}` / `${var:upper}` modifier shape — `ident:lower` or
+/// `ident:upper`. Still honored (with a warning); superseded by the function form
+/// (`lower(var)` / `upper(var)`).
 fn deprecatedModifier(inner: []const u8) bool {
     const c = std.mem.indexOfScalar(u8, inner, ':') orelse return false;
-    return bareInterp(inner[0..c]) and bareInterp(inner[c + 1 ..]);
+    if (!bareInterp(inner[0..c])) return false;
+    const mod = inner[c + 1 ..];
+    return std.mem.eql(u8, mod, "lower") or std.mem.eql(u8, mod, "upper");
 }
 
-/// Parse a `${ <expr> }` body and evaluate it with the loop variables bound as
-/// string values, returning the result formatted as text. A parse/eval failure is
-/// a permanent error (the placeholder is reported on stderr for diagnosis).
-fn evalInterpExpr(arena: std.mem.Allocator, text: []const u8, names: []const []const u8, values: Row) ![]const u8 {
-    if (deprecatedModifier(text)) {
-        std.debug.print("[interp] ${{{s}}}: the `:lower`/`:upper` modifier was removed — use a function, e.g. lower(name) / upper(name)\n", .{text});
-        return error.InterpFailed;
+/// Latched so the `:lower`/`:upper` deprecation prints once per process instead of
+/// once per occurrence per row (which would flood a parallel for-loop's stderr).
+var deprecation_warned = std.atomic.Value(bool).init(false);
+
+/// Honor a deprecated `${var:lower}` / `${var:upper}` placeholder: apply the case-fold
+/// to the loop variable's value (warning once, only when it is a real loop variable).
+/// An unknown variable is left verbatim — and unwarned — mirroring the bare `${var}`
+/// path, so non-loop `${x:y}`-shaped text rides through without a spurious notice.
+fn applyDeprecatedModifier(arena: std.mem.Allocator, text: []const u8, names: []const []const u8, values: Row) ![]const u8 {
+    const c = std.mem.indexOfScalar(u8, text, ':').?;
+    const var_name = text[0..c];
+    const mod = text[c + 1 ..];
+    const is_lower = std.mem.eql(u8, mod, "lower");
+    for (names, values) |nm, val| {
+        if (std.mem.eql(u8, nm, var_name)) {
+            if (!deprecation_warned.swap(true, .monotonic))
+                std.debug.print("[interp] the `:lower`/`:upper` modifier is deprecated — use lower(x)/upper(x) instead (first seen at ${{{s}}})\n", .{text});
+            const buf = try arena.alloc(u8, val.len);
+            for (val, buf) |ch, *dst| dst.* = if (is_lower) std.ascii.toLower(ch) else std.ascii.toUpper(ch);
+            return buf;
+        }
     }
+    return std.fmt.allocPrint(arena, "${{{s}}}", .{text}); // unknown var: verbatim, no warning
+}
+
+/// Detect constructs that only work after plan-time expansion and so cannot appear in
+/// a `${...}` hole (which is parsed/evaluated fresh, without expansion): `let … in`
+/// and `?.` safe navigation. Returns a user-facing reason, or null if the expression
+/// is fine for interpolation.
+fn interpUnsupported(e: *const ast.Expr) ?[]const u8 {
+    return switch (e.*) {
+        .let_in => "`let … in` is not supported inside ${...}; bind it in a select/fn instead",
+        .field => |q| if (q.safe.len > 0) "`?.` safe navigation is not supported inside ${...}" else null,
+        .unary => |u| interpUnsupported(u.e),
+        .binary => |b| interpUnsupported(b.l) orelse interpUnsupported(b.r),
+        .cond => |c| interpUnsupported(c.cond) orelse interpUnsupported(c.then) orelse interpUnsupported(c.els),
+        .cast => |c| interpUnsupported(c.e),
+        .is_null => |n| interpUnsupported(n.e),
+        .call => |c| {
+            for (c.args) |a| if (interpUnsupported(a)) |why| return why;
+            return null;
+        },
+        .match => |m| {
+            if (m.subject) |s| if (interpUnsupported(s)) |why| return why;
+            for (m.arms) |arm| {
+                for (arm.pats) |p| if (interpUnsupported(p)) |why| return why;
+                if (arm.guard) |g| if (interpUnsupported(g)) |why| return why;
+                if (interpUnsupported(arm.value)) |why| return why;
+            }
+            return null;
+        },
+        else => null,
+    };
+}
+
+/// Parse a `${ <expr> }` body and evaluate it with the loop variables in scope,
+/// returning the result formatted as text. Variables bind as strings unless the
+/// `for` header declared a type (`port:int`), in which case the coerced value is
+/// used — so `${if(port > 1000, ...)}` compares numerically, matching the `match`
+/// path. A parse/eval failure is a permanent error (reported on stderr).
+fn evalInterpExpr(arena: std.mem.Allocator, text: []const u8, lr: LoopRow) ![]const u8 {
+    if (deprecatedModifier(text)) return applyDeprecatedModifier(arena, text, lr.names, lr.cells);
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
     const e = parser.parseExprStr(arena, text, &diag) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         std.debug.print("[interp] ${{{s}}}: {s}\n", .{ text, diag.msg });
         return error.InterpFailed;
     };
-    const vals = try arena.alloc(Value, values.len);
-    for (values, vals) |cell, *v| v.* = .{ .string = cell };
-    const result = eval.constEval(arena, e, names, vals) catch |err| {
+    // `${...}` holes are not run through plan-time expansion, so plan-time-only
+    // constructs would otherwise fail with an opaque eval error — reject them clearly.
+    if (interpUnsupported(e)) |why| {
+        std.debug.print("[interp] ${{{s}}}: {s}\n", .{ text, why });
+        return error.InterpFailed;
+    }
+    const vals = try arena.alloc(Value, lr.cells.len);
+    for (lr.cells, vals, 0..) |cell, *v, i| v.* = loopValue(arena, cell, lr.typeAt(i));
+    const result = eval.constEval(arena, e, lr.names, vals) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         std.debug.print("[interp] ${{{s}}}: {s}\n", .{ text, @errorName(err) });
         return error.InterpFailed;
@@ -884,51 +999,51 @@ fn evalInterpExpr(arena: std.mem.Allocator, text: []const u8, names: []const []c
     return eval.valueToString(arena, result);
 }
 
-fn renderQual(arena: std.mem.Allocator, q: ast.QualName, needles: []const []const u8, row: Row) !ast.QualName {
+fn renderQual(arena: std.mem.Allocator, q: ast.QualName, lr: LoopRow) !ast.QualName {
     const parts = try arena.alloc([]const u8, q.parts.len);
-    for (q.parts, parts) |s, *dst| dst.* = try interpAll(arena, s, needles, row);
-    return .{ .parts = parts };
+    for (q.parts, parts) |s, *dst| dst.* = try interpAll(arena, s, lr);
+    return .{ .parts = parts, .safe = q.safe }; // preserve `?.` flags (bools need no interpolation)
 }
 
-fn renderRead(arena: std.mem.Allocator, rd: ast.Read, needles: []const []const u8, row: Row) !ast.Read {
+fn renderRead(arena: std.mem.Allocator, rd: ast.Read, lr: LoopRow) !ast.Read {
     return .{ .connector = rd.connector, .form = switch (rd.form) {
-        .table => |q| .{ .table = try renderQual(arena, q, needles, row) },
-        .query => |s| .{ .query = try interpAll(arena, s, needles, row) },
-        .path => |s| .{ .path = try interpAll(arena, s, needles, row) },
+        .table => |q| .{ .table = try renderQual(arena, q, lr) },
+        .query => |s| .{ .query = try interpAll(arena, s, lr) },
+        .path => |s| .{ .path = try interpAll(arena, s, lr) },
         .request => .request,
-    }, .where = try interpAll(arena, rd.where, needles, row) };
+    }, .where = try interpAll(arena, rd.where, lr) };
 }
 
 /// Interpolate `${var}` into a union stage: the discovered form's discovery query,
 /// or each explicit branch's read target + tag. Lets a for-loop drive which tables
 /// a union reconciles (e.g. a per-table discovery query keyed by the loop value).
-fn renderUnion(arena: std.mem.Allocator, u: ast.Union, needles: []const []const u8, row: Row) !ast.Union {
+fn renderUnion(arena: std.mem.Allocator, u: ast.Union, lr: LoopRow) !ast.Union {
     if (u.branches.len > 0) {
         const branches = try arena.alloc(ast.UnionBranch, u.branches.len);
         for (u.branches, branches) |b, *o| o.* = .{
-            .read = try renderRead(arena, b.read, needles, row),
-            .tag = if (b.tag) |t| try interpAll(arena, t, needles, row) else null,
+            .read = try renderRead(arena, b.read, lr),
+            .tag = if (b.tag) |t| try interpAll(arena, t, lr) else null,
         };
         return .{ .branches = branches, .discover_conn = u.discover_conn, .discover_query = u.discover_query, .discover_json = u.discover_json, .pos = u.pos };
     }
     return .{
         .branches = u.branches,
         .discover_conn = u.discover_conn,
-        .discover_query = try interpAll(arena, u.discover_query, needles, row),
-        .discover_json = try interpAll(arena, u.discover_json, needles, row),
+        .discover_query = try interpAll(arena, u.discover_query, lr),
+        .discover_json = try interpAll(arena, u.discover_json, lr),
         .pos = u.pos,
     };
 }
 
-fn renderMode(arena: std.mem.Allocator, mode: ast.WriteMode, needles: []const []const u8, row: Row) !ast.WriteMode {
+fn renderMode(arena: std.mem.Allocator, mode: ast.WriteMode, lr: LoopRow) !ast.WriteMode {
     switch (mode) {
         .upsert => |u| {
             const keys = try arena.alloc([]const u8, u.keys.len);
-            for (u.keys, keys) |k, *dst| dst.* = try interpAll(arena, k, needles, row);
+            for (u.keys, keys) |k, *dst| dst.* = try interpAll(arena, k, lr);
             var partial: ?[]const []const u8 = null;
             if (u.partial) |pc| {
                 const out = try arena.alloc([]const u8, pc.len);
-                for (pc, out) |c, *dst| dst.* = try interpAll(arena, c, needles, row);
+                for (pc, out) |c, *dst| dst.* = try interpAll(arena, c, lr);
                 partial = out;
             }
             return .{ .upsert = .{ .keys = keys, .partial = partial } };
@@ -937,48 +1052,48 @@ fn renderMode(arena: std.mem.Allocator, mode: ast.WriteMode, needles: []const []
     }
 }
 
-fn renderWrite(arena: std.mem.Allocator, w: ast.Write, needles: []const []const u8, row: Row) !ast.Write {
+fn renderWrite(arena: std.mem.Allocator, w: ast.Write, lr: LoopRow) !ast.Write {
     return .{
         .connector = w.connector,
-        .form = if (w.form) |f| try interpAll(arena, f, needles, row) else null,
-        .target = try interpAll(arena, w.target, needles, row),
-        .mode = try renderMode(arena, w.mode, needles, row),
+        .form = if (w.form) |f| try interpAll(arena, f, lr) else null,
+        .target = try interpAll(arena, w.target, lr),
+        .mode = try renderMode(arena, w.mode, lr),
     };
 }
 
 /// Instantiate the body template for one row: interpolate each `${var}` into the
 /// read/write targets + upsert keys (v1 = targets only; expressions untouched).
-fn renderHints(arena: std.mem.Allocator, hints: []const ast.Hint, needles: []const []const u8, row: Row) ![]const ast.Hint {
+fn renderHints(arena: std.mem.Allocator, hints: []const ast.Hint, lr: LoopRow) ![]const ast.Hint {
     if (hints.len == 0) return hints;
     const out = try arena.alloc(ast.Hint, hints.len);
     for (hints, out) |h, *o| {
         o.* = h;
         o.value = switch (h.value) {
-            .str => |s| .{ .str = try interpAll(arena, s, needles, row) },
-            .ident => |s| .{ .ident = try interpAll(arena, s, needles, row) },
+            .str => |s| .{ .str = try interpAll(arena, s, lr) },
+            .ident => |s| .{ .ident = try interpAll(arena, s, lr) },
             else => h.value,
         };
     }
     return out;
 }
 
-fn renderPipeline(env: *Env, body: ast.Pipeline, needles: []const []const u8, row: Row) !ast.Pipeline {
+fn renderPipeline(env: *Env, body: ast.Pipeline, lr: LoopRow) !ast.Pipeline {
     const arena = env.arena;
     const stages = try arena.alloc(ast.Stage, body.stages.len);
     for (body.stages, stages) |src, *dst| {
         dst.* = src;
-        dst.hints = try renderHints(arena, src.hints, needles, row); // e.g. @[split=${pk}]
+        dst.hints = try renderHints(arena, src.hints, lr); // e.g. @[split=${pk}]
         switch (src.node) {
-            .read => |rd| dst.node = .{ .read = try renderRead(arena, rd, needles, row) },
-            .union_ => |u| dst.node = .{ .union_ = try renderUnion(arena, u, needles, row) },
-            .write => |w| dst.node = .{ .write = try renderWrite(arena, w, needles, row) },
+            .read => |rd| dst.node = .{ .read = try renderRead(arena, rd, lr) },
+            .union_ => |u| dst.node = .{ .union_ = try renderUnion(arena, u, lr) },
+            .write => |w| dst.node = .{ .write = try renderWrite(arena, w, lr) },
             // Interpolate `${var}` inside expression string-literals too, so loop
             // values can drive computed columns / predicates, not just targets.
-            .filter => |e| dst.node = .{ .filter = try renderExpr(arena, e, needles, row) },
-            .select => |items| dst.node = .{ .select = try renderSelect(arena, items, needles, row) },
+            .filter => |e| dst.node = .{ .filter = try renderExpr(arena, e, lr) },
+            .select => |items| dst.node = .{ .select = try renderSelect(arena, items, lr) },
             .aggregate => |ag| {
                 const aggs = try arena.alloc(ast.AggItem, ag.aggs.len);
-                for (ag.aggs, 0..) |a, i| aggs[i] = .{ .name = a.name, .func = a.func, .arg = if (a.arg) |e| try renderExpr(arena, e, needles, row) else null };
+                for (ag.aggs, 0..) |a, i| aggs[i] = .{ .name = a.name, .func = a.func, .arg = if (a.arg) |e| try renderExpr(arena, e, lr) else null };
                 dst.node = .{ .aggregate = .{ .aggs = aggs, .by = ag.by } };
             },
             else => {},
@@ -989,34 +1104,37 @@ fn renderPipeline(env: *Env, body: ast.Pipeline, needles: []const []const u8, ro
 
 /// Deep-copy an expression, interpolating `${var}` needles into every string
 /// literal. Non-string leaves are reused as-is (identifiers can't hold needles).
-fn renderExpr(arena: std.mem.Allocator, e: *const ast.Expr, needles: []const []const u8, row: Row) anyerror!*ast.Expr {
+fn renderExpr(arena: std.mem.Allocator, e: *const ast.Expr, lr: LoopRow) anyerror!*ast.Expr {
     return switch (e.*) {
-        .str_lit => |s| try mk(arena, .{ .str_lit = try interpAll(arena, s, needles, row) }),
+        .str_lit => |s| try mk(arena, .{ .str_lit = try interpAll(arena, s, lr) }),
         .null_lit, .bool_lit, .int_lit, .float_lit, .field => @constCast(e),
-        .unary => |u| try mk(arena, .{ .unary = .{ .op = u.op, .e = try renderExpr(arena, u.e, needles, row) } }),
-        .binary => |b| try mk(arena, .{ .binary = .{ .op = b.op, .l = try renderExpr(arena, b.l, needles, row), .r = try renderExpr(arena, b.r, needles, row) } }),
-        .cond => |c| try mk(arena, .{ .cond = .{ .cond = try renderExpr(arena, c.cond, needles, row), .then = try renderExpr(arena, c.then, needles, row), .els = try renderExpr(arena, c.els, needles, row) } }),
-        .cast => |c| try mk(arena, .{ .cast = .{ .e = try renderExpr(arena, c.e, needles, row), .ty = c.ty } }),
-        .is_null => |n| try mk(arena, .{ .is_null = .{ .e = try renderExpr(arena, n.e, needles, row), .negated = n.negated } }),
+        .unary => |u| try mk(arena, .{ .unary = .{ .op = u.op, .e = try renderExpr(arena, u.e, lr) } }),
+        .binary => |b| try mk(arena, .{ .binary = .{ .op = b.op, .l = try renderExpr(arena, b.l, lr), .r = try renderExpr(arena, b.r, lr) } }),
+        .cond => |c| try mk(arena, .{ .cond = .{ .cond = try renderExpr(arena, c.cond, lr), .then = try renderExpr(arena, c.then, lr), .els = try renderExpr(arena, c.els, lr) } }),
+        .cast => |c| try mk(arena, .{ .cast = .{ .e = try renderExpr(arena, c.e, lr), .ty = c.ty } }),
+        .is_null => |n| try mk(arena, .{ .is_null = .{ .e = try renderExpr(arena, n.e, lr), .negated = n.negated, .kind = n.kind } }),
+        // `let … in` is inlined away by expandProgram (run.zig start) before any
+        // pipeline renders, so it can never reach the per-row renderer.
+        .let_in => unreachable,
         .call => |c| blk: {
             const args = try arena.alloc(*ast.Expr, c.args.len);
-            for (c.args, 0..) |a, i| args[i] = try renderExpr(arena, a, needles, row);
+            for (c.args, 0..) |a, i| args[i] = try renderExpr(arena, a, lr);
             break :blk try mk(arena, .{ .call = .{ .name = c.name, .args = args } });
         },
         .match => |m| blk: {
-            const subject = if (m.subject) |s| try renderExpr(arena, s, needles, row) else null;
+            const subject = if (m.subject) |s| try renderExpr(arena, s, lr) else null;
             const arms = try arena.alloc(ast.MatchArm, m.arms.len);
             for (m.arms, 0..) |arm, i| {
                 const pats = try arena.alloc(*ast.Expr, arm.pats.len);
-                for (arm.pats, 0..) |p, j| pats[j] = try renderExpr(arena, p, needles, row);
-                arms[i] = .{ .pats = pats, .guard = if (arm.guard) |g| try renderExpr(arena, g, needles, row) else null, .value = try renderExpr(arena, arm.value, needles, row), .is_default = arm.is_default };
+                for (arm.pats, 0..) |p, j| pats[j] = try renderExpr(arena, p, lr);
+                arms[i] = .{ .pats = pats, .guard = if (arm.guard) |g| try renderExpr(arena, g, lr) else null, .value = try renderExpr(arena, arm.value, lr), .is_default = arm.is_default };
             }
             break :blk try mk(arena, .{ .match = .{ .subject = subject, .arms = arms } });
         },
     };
 }
 
-fn renderSelect(arena: std.mem.Allocator, items: []const ast.SelectItem, needles: []const []const u8, row: Row) ![]const ast.SelectItem {
+fn renderSelect(arena: std.mem.Allocator, items: []const ast.SelectItem, lr: LoopRow) ![]const ast.SelectItem {
     // Computed items interpolate both the expression and the alias name. A bare
     // ident alias has no `${var}` so interpAll is a no-op; a quoted-string alias
     // (`"${name}_EMPRESA" = emp`) is where the loop value builds the column name.
@@ -1024,8 +1142,8 @@ fn renderSelect(arena: std.mem.Allocator, items: []const ast.SelectItem, needles
     const out = try arena.alloc(ast.SelectItem, items.len);
     for (items, 0..) |it, i| out[i] = switch (it) {
         .computed => |c| .{ .computed = .{
-            .name = try interpAll(arena, c.name, needles, row),
-            .expr = try renderExpr(arena, c.expr, needles, row),
+            .name = try interpAll(arena, c.name, lr),
+            .expr = try renderExpr(arena, c.expr, lr),
         } },
         else => it,
     };
@@ -1099,7 +1217,8 @@ fn forWorker(ctx: *ForCtx) void {
         };
         var st = Stats{ .run_id = 0 };
         var lanes: usize = 1;
-        if (runForBody(&w_env, ctx.fe.body, ctx.needles, row, ctx.worker_opts, &st, &lanes, &w_batch)) |_| {
+        const lr = LoopRow{ .names = ctx.needles, .types = ctx.fe.var_types, .cells = row };
+        if (runForBody(&w_env, ctx.fe.body, lr, ctx.worker_opts, &st, &lanes, &w_batch)) |_| {
             _ = ctx.rows_out.fetchAdd(st.rows_out, .monotonic);
             if (ctx.outcomes) |sink| sink.record(row[0], true, "", false);
         } else |e| {
@@ -1117,64 +1236,40 @@ fn forWorker(ctx: *ForCtx) void {
 /// Run one row of a `for` body. The body is a statement block (a bare pipeline is a
 /// one-statement block): each pipeline is rendered with the row's `${var}` values and
 /// executed; a `match` branches on the loop variables and runs the winning arm.
-fn runForBody(env: *Env, body: []const ast.Stmt, needles: []const []const u8, row: Row, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
-    for (body) |*st| try runForStmt(env, st, needles, row, opts, stats, lanes_used, batch_arena);
+fn runForBody(env: *Env, body: []const ast.Stmt, lr: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+    for (body) |*st| try runForStmt(env, st, lr, opts, stats, lanes_used, batch_arena);
 }
 
-fn runForStmt(env: *Env, s: *const ast.Stmt, needles: []const []const u8, row: Row, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+fn runForStmt(env: *Env, s: *const ast.Stmt, lr: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     switch (s.*) {
         .output => |p| {
-            const pipe = try renderPipeline(env, p, needles, row);
+            const pipe = try renderPipeline(env, p, lr);
             try runOutput(env, pipe, opts, stats, lanes_used, batch_arena);
         },
-        .match => |m| try runForMatch(env, m, needles, row, opts, stats, lanes_used, batch_arena),
+        .match => |m| try runForMatch(env, m, lr, opts, stats, lanes_used, batch_arena),
         // Only pipelines and the `match` that selects among them are meaningful per row.
         else => return planErr(env.diag, "a `for` body may contain only pipelines and `match` statements"),
     }
 }
 
-/// A `match` evaluated per row of a `for`: the loop variables are bound as string
-/// values (shadowing same-named params), so a guard like `pk == ""` picks a branch.
-fn runForMatch(env: *Env, m: ast.StmtMatch, needles: []const []const u8, row: Row, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+/// A `match` evaluated per row of a `for`: the loop variables are bound (shadowing
+/// same-named params), so a guard like `pk == ""` picks a branch. Untyped variables
+/// bind as strings; a `name:type` annotation binds the coerced value, so a guard like
+/// `port >= 1000` compares numerically rather than lexically.
+fn runForMatch(env: *Env, m: ast.StmtMatch, lr: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     var names = std.array_list.Managed([]const u8).init(env.arena);
     var values = std.array_list.Managed(Value).init(env.arena);
-    for (needles, row) |nm, cell| {
+    for (lr.names, lr.cells, 0..) |nm, cell, i| {
         try names.append(nm);
-        try values.append(.{ .string = cell });
+        try values.append(loopValue(env.arena, cell, lr.typeAt(i)));
     }
     var it = env.params.iterator();
     while (it.next()) |kv| {
         try names.append(kv.key_ptr.*);
         try values.append(kv.value_ptr.*);
     }
-    const ns = names.items;
-    const vs = values.items;
-
-    var subj: ?Value = null;
-    if (m.subject) |s| subj = eval.constEval(env.arena, s, ns, vs) catch |e|
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for/match subject: {s}", .{@errorName(e)}));
-
-    for (m.arms) |arm| {
-        const hit = blk: {
-            if (arm.is_default) break :blk true;
-            if (arm.guard) |g| {
-                const gv = eval.constEval(env.arena, g, ns, vs) catch |e|
-                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for/match guard: {s}", .{@errorName(e)}));
-                break :blk (gv == .bool and gv.bool);
-            }
-            const sv = subj orelse break :blk false;
-            for (arm.pats) |p| {
-                const pv = eval.constEval(env.arena, p, ns, vs) catch |e|
-                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for/match pattern: {s}", .{@errorName(e)}));
-                if (eval.compareValues(sv, pv)) |ord| if (ord == .eq) break :blk true;
-            }
-            break :blk false;
-        };
-        if (hit) {
-            for (arm.body) |*st| try runForStmt(env, st, needles, row, opts, stats, lanes_used, batch_arena);
-            return; // first matching arm wins
-        }
-    }
+    const idx = (try matchArmIndex(env, m, names.items, values.items, "for/match")) orelse return;
+    for (m.arms[idx].body) |*st| try runForStmt(env, st, lr, opts, stats, lanes_used, batch_arena);
 }
 
 /// Expand a `for <vars> in <source>` block, running its body once per discovered row.
@@ -1207,7 +1302,8 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
                 if (aborting()) return error.Aborted; // stop starting new items
                 const base = env.sources.items.len;
                 env.diag.retryable = false; // classify this item's failure freshly
-                if (runForBody(env, fe.body, needles, row, opts, stats, lanes_used, batch_arena)) |_| {
+                const lr = LoopRow{ .names = needles, .types = fe.var_types, .cells = row };
+                if (runForBody(env, fe.body, lr, opts, stats, lanes_used, batch_arena)) |_| {
                     for (env.sources.items[base..]) |sc| sc.close();
                     env.sources.shrinkRetainingCapacity(base);
                     if (opts.outcomes) |sink| sink.record(row[0], true, "", false);
@@ -2445,35 +2541,54 @@ test "interpAll: bare-var fast path and expression bodies" {
 
     // fast path: bare var substitution; unknown var left verbatim
     const empty = [_][]const u8{ "Account", "" };
-    try std.testing.expectEqualStrings("Account", try interpAll(a, "${name}", &names, &empty));
-    try std.testing.expectEqualStrings("${nope}", try interpAll(a, "${nope}", &names, &empty));
+    const empty_row = LoopRow{ .names = &names, .cells = &empty };
+    try std.testing.expectEqualStrings("Account", try interpAll(a, "${name}", empty_row));
+    try std.testing.expectEqualStrings("${nope}", try interpAll(a, "${nope}", empty_row));
 
     // case folding is now a function, not a modifier
-    try std.testing.expectEqualStrings("crm_account", try interpAll(a, "crm_${lower(name)}", &names, &empty));
-    try std.testing.expectEqualStrings("ACCOUNT", try interpAll(a, "${upper(name)}", &names, &empty));
+    try std.testing.expectEqualStrings("crm_account", try interpAll(a, "crm_${lower(name)}", empty_row));
+    try std.testing.expectEqualStrings("ACCOUNT", try interpAll(a, "${upper(name)}", empty_row));
 
     // expression body: conditional + concat picks the convention when pk is empty
     const key = "${if(pk == \"\", concat(lower(name), \"id\"), pk)}";
-    try std.testing.expectEqualStrings("accountid", try interpAll(a, key, &names, &empty));
+    try std.testing.expectEqualStrings("accountid", try interpAll(a, key, empty_row));
 
     // ...and uses the supplied pk when present
     const given = [_][]const u8{ "ListMember", "lm_custom_id" };
-    try std.testing.expectEqualStrings("lm_custom_id", try interpAll(a, key, &names, &given));
+    try std.testing.expectEqualStrings("lm_custom_id", try interpAll(a, key, .{ .names = &names, .cells = &given }));
 
     // a string literal containing `}` inside the expression does not end the placeholder
-    try std.testing.expectEqualStrings("}", try interpAll(a, "${if(pk == \"\", \"}\", pk)}", &names, &empty));
+    try std.testing.expectEqualStrings("}", try interpAll(a, "${if(pk == \"\", \"}\", pk)}", empty_row));
 }
 
-test "interpAll: malformed and deprecated-modifier bodies are permanent errors" {
+test "interpAll: malformed bodies error; deprecated modifier warns but still applies" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     const names = [_][]const u8{ "name", "pk" };
     const vals = [_][]const u8{ "Account", "" };
-    try std.testing.expectError(error.InterpFailed, interpAll(a, "${if(pk ==)}", &names, &vals));
-    // the removed `:lower` / `:upper` modifier shape
-    try std.testing.expectError(error.InterpFailed, interpAll(a, "${name:lower}", &names, &vals));
-    try std.testing.expectError(error.InterpFailed, interpAll(a, "${name:upper}", &names, &vals));
+    const row = LoopRow{ .names = &names, .cells = &vals };
+    try std.testing.expectError(error.InterpFailed, interpAll(a, "${if(pk ==)}", row));
+    // the deprecated `:lower` / `:upper` modifier shape still resolves (with a warning)
+    try std.testing.expectEqualStrings("account", try interpAll(a, "${name:lower}", row));
+    try std.testing.expectEqualStrings("ACCOUNT", try interpAll(a, "${name:upper}", row));
+}
+
+test "interpAll: a typed loop var binds as its type in an expression body" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const names = [_][]const u8{"port"};
+    const expr = "${if(port >= 1000, \"big\", \"small\")}";
+
+    // `port:int` → numeric comparison against the int literal
+    const typed = [_]?types.Type{types.Type.init(.int)};
+    try std.testing.expectEqualStrings("big", try interpAll(a, expr, .{ .names = &names, .types = &typed, .cells = &[_][]const u8{"9030"} }));
+    try std.testing.expectEqualStrings("small", try interpAll(a, expr, .{ .names = &names, .types = &typed, .cells = &[_][]const u8{"80"} }));
+
+    // untyped: a string vs. an int literal is a type error (use `cast`, or declare `:int`)
+    const untyped = [_]?types.Type{null};
+    try std.testing.expectError(error.InterpFailed, interpAll(a, expr, .{ .names = &names, .types = &untyped, .cells = &[_][]const u8{"9030"} }));
 }
 
 /// Parse and run a fully-assembled `script`, returning the contents of out.csv.

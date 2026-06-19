@@ -272,13 +272,26 @@ pub const Parser = struct {
         const pos = self.curPos();
         try self.expectKw("for");
         var names = std.array_list.Managed([]const u8).init(self.arena);
+        var ftypes = std.array_list.Managed(?types.Type).init(self.arena);
+        var any_typed = false;
         try names.append(try self.expectIdent());
-        while (self.eat(.comma)) try names.append(try self.expectIdent());
+        try ftypes.append(try self.parseOptVarType(&any_typed));
+        while (self.eat(.comma)) {
+            try names.append(try self.expectIdent());
+            try ftypes.append(try self.parseOptVarType(&any_typed));
+        }
         try self.expectKw("in");
         const source = try self.parseForSource();
         const hints = try self.parseHints();
         const body = try self.parseForBody();
-        return .{ .var_names = try names.toOwnedSlice(), .source = source, .hints = hints, .body = body, .pos = pos };
+        return .{
+            .var_names = try names.toOwnedSlice(),
+            .var_types = if (any_typed) try ftypes.toOwnedSlice() else &.{},
+            .source = source,
+            .hints = hints,
+            .body = body,
+            .pos = pos,
+        };
     }
 
     /// A `for` body: a `{ ... }` statement block, a bare `match` statement (which
@@ -292,6 +305,14 @@ pub const Parser = struct {
         else
             .{ .output = try self.parsePipeline() };
         return one;
+    }
+
+    /// An optional `:type` annotation on a loop variable. Sets `*any` when present
+    /// so the caller knows whether to keep the parallel `var_types` slice.
+    fn parseOptVarType(self: *Parser, any: *bool) Error!?types.Type {
+        if (!self.eat(.colon)) return null;
+        any.* = true;
+        return try self.parseTypeName();
     }
 
     /// A discovery `read` (`<conn> table|query|<path>`) or a JSON-array path
@@ -337,7 +358,7 @@ pub const Parser = struct {
         if (subject_form) {
             var pats = std.array_list.Managed(*ast.Expr).init(self.arena);
             try pats.append(try self.parseExpr());
-            while (self.eat(.pipe)) try pats.append(try self.parseExpr());
+            while (self.eat(.comma)) try pats.append(try self.parseExpr());
             _ = try self.expect(.fat_arrow);
             return .{ .pats = try pats.toOwnedSlice(), .guard = null, .body = try self.parseBlock(), .is_default = false };
         }
@@ -452,6 +473,14 @@ pub const Parser = struct {
                 _ = try self.expect(.rparen);
                 return .{ .star_except = try names.toOwnedSlice() };
             }
+            if (self.eatKw("rename")) {
+                _ = try self.expect(.lparen);
+                var renames = std.array_list.Managed(ast.SelectItem.Rename).init(self.arena);
+                try renames.append(try self.parseRename());
+                while (self.eat(.comma)) try renames.append(try self.parseRename());
+                _ = try self.expect(.rparen);
+                return .{ .star_rename = try renames.toOwnedSlice() };
+            }
             return .star;
         }
         // Computed column: `name = expr`. The alias may be a bare ident or a quoted
@@ -464,6 +493,14 @@ pub const Parser = struct {
             return .{ .computed = .{ .name = name, .expr = e } };
         }
         return .{ .field = try self.parseQualName() };
+    }
+
+    /// One `old as new` pair inside `* rename ( ... )`.
+    fn parseRename(self: *Parser) Error!ast.SelectItem.Rename {
+        const from = try self.expectIdent();
+        try self.expectKw("as");
+        const to = try self.expectIdent();
+        return .{ .from = from, .to = to };
     }
 
     fn parseExplode(self: *Parser) Error!ast.Explode {
@@ -695,9 +732,27 @@ pub const Parser = struct {
         return self.parseBin(0);
     }
 
+    // null-coalesce `a ?? b` binds looser than comparison and tighter than
+    // `and`/`or`; right-associative so `a ?? b ?? c` is `a ?? (b ?? c)`. It is
+    // pure sugar: desugared here into `coalesce(a, b)`, so the type-checker and
+    // both evaluators (which already implement `coalesce`) need no new cases.
+    const qq_lbp: u8 = 5;
+    const qq_rbp: u8 = 5;
+
     fn parseBin(self: *Parser, min_bp: u8) Error!*ast.Expr {
         var lhs = try self.parseUnary();
-        while (self.peekBinOp()) |info| {
+        while (true) {
+            if (self.at(.qq)) {
+                if (qq_lbp < min_bp) break;
+                _ = self.advance();
+                const rhs = try self.parseBin(qq_rbp);
+                const args = try self.arena.alloc(*ast.Expr, 2);
+                args[0] = lhs;
+                args[1] = rhs;
+                lhs = try self.mk(.{ .call = .{ .name = "coalesce", .args = args } });
+                continue;
+            }
+            const info = self.peekBinOp() orelse break;
             if (info.lbp < min_bp) break;
             _ = self.advance();
             const rhs = try self.parseBin(info.rbp);
@@ -747,8 +802,11 @@ pub const Parser = struct {
         while (self.isKw("is")) {
             _ = self.advance();
             const negated = self.eatKw("not");
-            try self.expectKw("null");
-            e = try self.mk(.{ .is_null = .{ .e = e, .negated = negated } });
+            const kind: ast.Expr.NullTest = if (self.eatKw("empty")) .is_empty else blk: {
+                try self.expectKw("null");
+                break :blk .is_null;
+            };
+            e = try self.mk(.{ .is_null = .{ .e = e, .negated = negated, .kind = kind } });
         }
         return e;
     }
@@ -798,6 +856,7 @@ pub const Parser = struct {
         if (std.mem.eql(u8, t.text, "if")) return self.parseIf();
         if (std.mem.eql(u8, t.text, "match")) return self.parseMatchExpr();
         if (std.mem.eql(u8, t.text, "cast")) return self.parseCast();
+        if (std.mem.eql(u8, t.text, "let")) return self.parseLetIn();
         if (self.peekTag() == .lparen) return self.parseCall();
         return self.mk(.{ .field = try self.parseQualName() });
     }
@@ -812,6 +871,18 @@ pub const Parser = struct {
         const b = try self.parseExpr();
         _ = try self.expect(.rparen);
         return self.mk(.{ .cond = .{ .cond = c, .then = a, .els = b } });
+    }
+
+    /// `let <name> = <value> in <body>` — a local binding inside an expression.
+    /// (`in` is not an operator, so `parseExpr` stops cleanly before it.)
+    fn parseLetIn(self: *Parser) Error!*ast.Expr {
+        _ = self.advance(); // let
+        const name = try self.expectIdent();
+        _ = try self.expect(.assign);
+        const value = try self.parseExpr();
+        try self.expectKw("in");
+        const body = try self.parseExpr();
+        return self.mk(.{ .let_in = .{ .name = name, .value = value, .body = body } });
     }
 
     fn parseCast(self: *Parser) Error!*ast.Expr {
@@ -865,7 +936,7 @@ pub const Parser = struct {
         if (subject_form) {
             var pats = std.array_list.Managed(*ast.Expr).init(self.arena);
             try pats.append(try self.parseExpr());
-            while (self.eat(.pipe)) try pats.append(try self.parseExpr());
+            while (self.eat(.comma)) try pats.append(try self.parseExpr());
             _ = try self.expect(.fat_arrow);
             return .{ .pats = try pats.toOwnedSlice(), .guard = null, .value = try self.parseExpr(), .is_default = false };
         }
@@ -884,8 +955,22 @@ pub const Parser = struct {
     fn parseQualName(self: *Parser) Error!ast.QualName {
         var parts = std.array_list.Managed([]const u8).init(self.arena);
         try parts.append(try self.expectName());
-        while (self.eat(.dot)) try parts.append(try self.expectName());
-        return .{ .parts = try parts.toOwnedSlice() };
+        // `safe` is parallel to the separators and lazily allocated only once a `?.`
+        // is actually seen — the common plain-`.` path stays allocation-free (`&.{}`).
+        var safe: ?std.array_list.Managed(bool) = null;
+        while (true) {
+            const is_safe = if (self.eat(.dot)) false else if (self.eat(.qdot)) true else break;
+            if (is_safe and safe == null) {
+                safe = std.array_list.Managed(bool).init(self.arena);
+                try safe.?.appendNTimes(false, parts.items.len - 1); // prior separators were all `.`
+            }
+            try parts.append(try self.expectName());
+            if (safe) |*sf| try sf.append(is_safe);
+        }
+        return .{
+            .parts = try parts.toOwnedSlice(),
+            .safe = if (safe) |*sf| try sf.toOwnedSlice() else &.{},
+        };
     }
 
     fn parseTypeName(self: *Parser) Error!types.Type {
@@ -958,6 +1043,63 @@ fn parseTest(arena: std.mem.Allocator, src: []const u8) !ast.Program {
     };
 }
 
+test "?? desugars to coalesce; is empty; star rename" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const prog = try parseTest(ar.allocator(),
+        \\@batch
+        \\read x query "q"
+        \\  | filter a is not empty
+        \\  | select * rename (a as b, c as d), v = a ?? a ?? "z"
+        \\  | write stdout
+    );
+    const stages = prog.stmts[1].output.stages;
+    // filter: `a is not empty`
+    const f = stages[1].node.filter;
+    try std.testing.expect(f.* == .is_null);
+    try std.testing.expectEqual(ast.Expr.NullTest.is_empty, f.is_null.kind);
+    try std.testing.expect(f.is_null.negated);
+    // select item 0: `* rename (a as b, c as d)`
+    const items = stages[2].node.select;
+    try std.testing.expectEqual(@as(usize, 2), items[0].star_rename.len);
+    try std.testing.expectEqualStrings("a", items[0].star_rename[0].from);
+    try std.testing.expectEqualStrings("b", items[0].star_rename[0].to);
+    // select item 1: `v = a ?? a ?? "z"` -> coalesce(a, coalesce(a, "z"))  (right-assoc)
+    const v = items[1].computed.expr;
+    try std.testing.expect(v.* == .call);
+    try std.testing.expectEqualStrings("coalesce", v.call.name);
+    try std.testing.expectEqual(@as(usize, 2), v.call.args.len);
+    try std.testing.expect(v.call.args[1].* == .call); // nested coalesce on the right
+    try std.testing.expectEqualStrings("coalesce", v.call.args[1].call.name);
+}
+
+test "typed loop vars, ?. safe-nav, and let-in parse into the right AST" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const prog = try parseTest(ar.allocator(),
+        \\@batch
+        \\param job json
+        \\for name, port:int in job.tables
+        \\  read x query "q"
+        \\    | select host = job.source?.host, v = let a = port in a + 1
+        \\    | write stdout
+    );
+    const fe = prog.stmts[2].for_each;
+    // loop var types: name untyped, port:int
+    try std.testing.expectEqual(@as(usize, 2), fe.var_types.len);
+    try std.testing.expect(fe.var_types[0] == null);
+    try std.testing.expectEqual(types.TypeKind.int, fe.var_types[1].?.kind);
+    const sel = fe.body[0].output.stages[1].node.select;
+    // host = job.source?.host  -> safe[2] (before `host`) is true
+    const hq = sel[0].computed.expr.field;
+    try std.testing.expectEqual(@as(usize, 3), hq.parts.len);
+    try std.testing.expect(hq.safeAt(2));
+    try std.testing.expect(!hq.safeAt(1));
+    // v = let a = port in a + 1
+    try std.testing.expect(sel[1].computed.expr.* == .let_in);
+    try std.testing.expectEqualStrings("a", sel[1].computed.expr.let_in.name);
+}
+
 test "parse a batch ETL script" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -1001,7 +1143,7 @@ test "parse precedence and conditionals" {
         \\read x query "q"
         \\  | filter a + b * c > 10 and d is not null
         \\  | select tier = if(amount > 100, "gold", "silver"),
-        \\           grade = match status "paid" | "ok" => "done" _ => "open" end
+        \\           grade = match status "paid", "ok" => "done" _ => "open" end
     ;
     const prog = try parseTest(ar.allocator(), src);
     const stages = prog.stmts[1].output.stages;
@@ -1018,7 +1160,7 @@ test "parse precedence and conditionals" {
     const m = items[1].computed.expr.match;
     try std.testing.expect(m.subject != null);
     try std.testing.expectEqual(@as(usize, 2), m.arms.len);
-    try std.testing.expectEqual(@as(usize, 2), m.arms[0].pats.len); // "paid" | "ok"
+    try std.testing.expectEqual(@as(usize, 2), m.arms[0].pats.len); // "paid", "ok"
     try std.testing.expect(m.arms[1].is_default);
 }
 
