@@ -24,6 +24,7 @@ pub const Tag = enum {
 
     comma,
     dot,
+    colon, // : (loop-variable type annotation)
     star, // * (also multiply)
 
     assign, // =
@@ -38,6 +39,8 @@ pub const Tag = enum {
     minus,
     slash,
     percent,
+    qq, // ?? (null-coalesce)
+    qdot, // ?. (safe navigation)
 
     eof,
     invalid,
@@ -59,6 +62,7 @@ pub const Tag = enum {
             .rbrace => "'}'",
             .comma => "','",
             .dot => "'.'",
+            .colon => "':'",
             .star => "'*'",
             .assign => "'='",
             .fat_arrow => "'=>'",
@@ -72,6 +76,8 @@ pub const Tag = enum {
             .minus => "'-'",
             .slash => "'/'",
             .percent => "'%'",
+            .qq => "'??'",
+            .qdot => "'?.'",
             .eof => "end of input",
             .invalid => "invalid token",
         };

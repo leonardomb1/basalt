@@ -49,7 +49,7 @@ pub fn substExpr(arena: std.mem.Allocator, expr: *const ast.Expr, params: *const
         },
         .unary => |u| return mk(arena, .{ .unary = .{ .op = u.op, .e = @constCast(try substExpr(arena, u.e, params)) } }),
         .binary => |b| return mk(arena, .{ .binary = .{ .op = b.op, .l = @constCast(try substExpr(arena, b.l, params)), .r = @constCast(try substExpr(arena, b.r, params)) } }),
-        .is_null => |n| return mk(arena, .{ .is_null = .{ .e = @constCast(try substExpr(arena, n.e, params)), .negated = n.negated } }),
+        .is_null => |n| return mk(arena, .{ .is_null = .{ .e = @constCast(try substExpr(arena, n.e, params)), .negated = n.negated, .kind = n.kind } }),
         .cast => |c| return mk(arena, .{ .cast = .{ .e = @constCast(try substExpr(arena, c.e, params)), .ty = c.ty } }),
         .cond => |c| return mk(arena, .{ .cond = .{ .cond = @constCast(try substExpr(arena, c.cond, params)), .then = @constCast(try substExpr(arena, c.then, params)), .els = @constCast(try substExpr(arena, c.els, params)) } }),
         .call => |c| {
@@ -90,6 +90,20 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
         .star_except => |names| for (in.fields, 0..) |f, idx| {
             if (nameIn(names, f.name)) continue;
             try cols.append(.{ .name = f.name, .ty = f.ty, .source = .{ .passthrough = idx } });
+        },
+        .star_rename => |renames| {
+            for (renames) |r| if (in.indexOf(r.from) == null)
+                return fail(diag, "unknown rename field `{s}`", .{r.from});
+            for (in.fields, 0..) |f, idx| {
+                const nm = renameTo(renames, f.name) orelse f.name;
+                // Reject a name that collides with an earlier output column (two
+                // renames to the same target, or a rename onto an existing column) —
+                // duplicates would silently confuse name-keyed writers/upserts.
+                for (in.fields[0..idx]) |g|
+                    if (std.mem.eql(u8, nm, renameTo(renames, g.name) orelse g.name))
+                        return fail(diag, "`* rename` produces duplicate column `{s}`", .{nm});
+                try cols.append(.{ .name = nm, .ty = f.ty, .source = .{ .passthrough = idx } });
+            }
         },
         .field => |q| {
             const nm = lastPart(q);
@@ -200,6 +214,12 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
 fn nameIn(names: []const []const u8, n: []const u8) bool {
     for (names) |x| if (std.mem.eql(u8, x, n)) return true;
     return false;
+}
+
+/// The new name for field `n` under a `* rename (...)` list, or null if unrenamed.
+fn renameTo(renames: []const ast.SelectItem.Rename, n: []const u8) ?[]const u8 {
+    for (renames) |r| if (std.mem.eql(u8, r.from, n)) return r.to;
+    return null;
 }
 
 /// A literal of the right type (value irrelevant) to stand in for a param during
@@ -512,6 +532,7 @@ const Ctx = struct {
             switch (item) {
                 .star => try buf.appendSlice("*"),
                 .star_except => try buf.appendSlice("* except (…)"),
+                .star_rename => try buf.appendSlice("* rename (…)"),
                 .field => |q| try buf.appendSlice(lastPart(q)),
                 .computed => |c| try buf.appendSlice(c.name),
             }

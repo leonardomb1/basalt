@@ -194,11 +194,24 @@ pub const Lexer = struct {
             '}' => return self.single(.rbrace, start, sline, scol),
             ',' => return self.single(.comma, start, sline, scol),
             '.' => return self.single(.dot, start, sline, scol),
+            ':' => return self.single(.colon, start, sline, scol),
             '*' => return self.single(.star, start, sline, scol),
             '+' => return self.single(.plus, start, sline, scol),
             '-' => return self.single(.minus, start, sline, scol),
             '/' => return self.single(.slash, start, sline, scol),
             '%' => return self.single(.percent, start, sline, scol),
+            '?' => {
+                self.bump();
+                if (self.peek() == '?') {
+                    self.bump();
+                    return self.make(.qq, start, sline, scol);
+                }
+                if (self.peek() == '.') {
+                    self.bump();
+                    return self.make(.qdot, start, sline, scol);
+                }
+                return self.make(.invalid, start, sline, scol);
+            },
             '=' => {
                 self.bump();
                 if (self.peek() == '=') {
@@ -352,6 +365,15 @@ test "lex operators, annotations, and unit suffix split" {
     defer alloc.free(toks);
 
     const expect = [_]Tag{ .ident, .eq, .ident, .ne, .ident, .le, .ident, .ge, .at, .lbracket, .ident, .assign, .int, .ident, .rbracket, .eof };
+    try std.testing.expectEqual(expect.len, toks.len);
+    for (expect, toks) |e, t| try std.testing.expectEqual(e, t.tag);
+}
+
+test "lex null-coalesce operator" {
+    const alloc = std.testing.allocator;
+    const toks = try tokenize(alloc, "a ?? b");
+    defer alloc.free(toks);
+    const expect = [_]Tag{ .ident, .qq, .ident, .eof };
     try std.testing.expectEqual(expect.len, toks.len);
     for (expect, toks) |e, t| try std.testing.expectEqual(e, t.tag);
 }

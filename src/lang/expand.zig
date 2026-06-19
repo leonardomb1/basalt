@@ -68,7 +68,7 @@ fn expandStmt(cx: *Ctx, s: ast.Stmt) Error!ast.Stmt {
                 if (st == .func) continue; // fns are top-level; ignore in for bodies
                 try body.append(try expandStmt(cx, st));
             }
-            break :blk .{ .for_each = .{ .var_names = fe.var_names, .source = fe.source, .hints = fe.hints, .body = try body.toOwnedSlice(), .pos = fe.pos } };
+            break :blk .{ .for_each = .{ .var_names = fe.var_names, .var_types = fe.var_types, .source = fe.source, .hints = fe.hints, .body = try body.toOwnedSlice(), .pos = fe.pos } };
         },
         .match => |m| .{ .match = try expandStmtMatch(cx, m) },
         .func => unreachable, // dropped in expandProgram / skipped in arm bodies
@@ -141,15 +141,18 @@ fn mkNull(cx: *Ctx) Error!*ast.Expr {
 /// Navigate a JSON value along `path`, returning a literal of the leaf scalar. An
 /// unbound binding (offline `check`) yields `null`; a missing key or non-scalar
 /// leaf at run time is an error.
-fn jsonPathLit(cx: *Ctx, maybe_val: ?std.json.Value, path: []const []const u8) Error!*ast.Expr {
+fn jsonPathLit(cx: *Ctx, maybe_val: ?std.json.Value, path: []const []const u8, safe: []const bool) Error!*ast.Expr {
     var cur = maybe_val orelse return mkNull(cx);
-    for (path) |key| {
+    for (path, 0..) |key, i| {
+        const seg_safe = i < safe.len and safe[i];
         switch (cur) {
             .object => |o| cur = o.get(key) orelse {
+                if (seg_safe) return mkNull(cx); // `?.`: missing key → null
                 cx.msg.* = std.fmt.allocPrint(cx.arena, "json path: key `{s}` not found", .{key}) catch "json path: key not found";
                 return error.ExpandFailed;
             },
             else => {
+                if (seg_safe) return mkNull(cx); // `?.` over a null/non-object → null
                 cx.msg.* = std.fmt.allocPrint(cx.arena, "json path: `{s}` is not an object", .{key}) catch "json path: not an object";
                 return error.ExpandFailed;
             },
@@ -172,7 +175,7 @@ fn jsonScalarLit(cx: *Ctx, v: std.json.Value) Error!*ast.Expr {
     };
 }
 
-fn expandExpr(cx: *Ctx, e: *const ast.Expr, subst: ?*const Subst, depth: usize) Error!*ast.Expr {
+fn expandExpr(cx: *Ctx, e: *const ast.Expr, subst: ?*Subst, depth: usize) Error!*ast.Expr {
     if (depth > max_depth) {
         cx.msg.* = "fn expansion too deep (recursive `fn`?)";
         return error.ExpandFailed;
@@ -182,20 +185,45 @@ fn expandExpr(cx: *Ctx, e: *const ast.Expr, subst: ?*const Subst, depth: usize) 
         .field => |q| {
             if (subst) |s| if (q.single()) |nm| if (s.get(nm)) |arg| return arg;
             // JSON-param path access: `p.a.b` where `p` is a declared json param.
-            if (q.parts.len >= 1) if (cx.json.get(q.parts[0])) |maybe_val| return jsonPathLit(cx, maybe_val, q.parts[1..]);
+            // `?.` segments (via `q.safe`) tolerate a missing/null intermediate by
+            // resolving the whole path to null instead of erroring.
+            // `safe` is separator-parallel, so it aligns one-to-one with `parts[1..]`.
+            if (q.parts.len >= 1) if (cx.json.get(q.parts[0])) |maybe_val|
+                return jsonPathLit(cx, maybe_val, q.parts[1..], q.safe);
             return mk(cx, e.*);
         },
         .unary => |u| mk(cx, .{ .unary = .{ .op = u.op, .e = try expandExpr(cx, u.e, subst, depth) } }),
         .binary => |b| mk(cx, .{ .binary = .{ .op = b.op, .l = try expandExpr(cx, b.l, subst, depth), .r = try expandExpr(cx, b.r, subst, depth) } }),
         .cond => |c| mk(cx, .{ .cond = .{ .cond = try expandExpr(cx, c.cond, subst, depth), .then = try expandExpr(cx, c.then, subst, depth), .els = try expandExpr(cx, c.els, subst, depth) } }),
         .cast => |c| mk(cx, .{ .cast = .{ .e = try expandExpr(cx, c.e, subst, depth), .ty = c.ty } }),
-        .is_null => |n| mk(cx, .{ .is_null = .{ .e = try expandExpr(cx, n.e, subst, depth), .negated = n.negated } }),
+        .is_null => |n| mk(cx, .{ .is_null = .{ .e = try expandExpr(cx, n.e, subst, depth), .negated = n.negated, .kind = n.kind } }),
         .match => |m| expandMatchExpr(cx, m, subst, depth),
         .call => |c| expandCall(cx, c, subst, depth),
+        .let_in => |l| expandLetIn(cx, l, subst, depth),
     };
 }
 
-fn expandCall(cx: *Ctx, c: ast.Expr.Call, subst: ?*const Subst, depth: usize) Error!*ast.Expr {
+/// Inline `let name = value in body` by substituting the (expanded) value for
+/// `name` while expanding `body` — the binding disappears, like a single-use `fn`.
+/// `value` is expanded under the outer scope; `body` under the scope extended with
+/// `name`. The extension is done in place on the existing scope map (install →
+/// expand body → restore prior binding), so nested/chained lets don't pay the
+/// O(n²) cost of copying the whole map each time.
+fn expandLetIn(cx: *Ctx, l: ast.Expr.LetIn, subst: ?*Subst, depth: usize) Error!*ast.Expr {
+    const val = try expandExpr(cx, l.value, subst, depth);
+    if (subst) |s| {
+        const prior = try s.fetchPut(l.name, val);
+        const body = try expandExpr(cx, l.body, s, depth);
+        if (prior) |kv| s.putAssumeCapacity(l.name, kv.value) else _ = s.remove(l.name);
+        return body;
+    }
+    // No enclosing scope (a `let` outside any fn): a one-entry map suffices.
+    var inner = Subst.init(cx.arena);
+    try inner.put(l.name, val);
+    return expandExpr(cx, l.body, &inner, depth);
+}
+
+fn expandCall(cx: *Ctx, c: ast.Expr.Call, subst: ?*Subst, depth: usize) Error!*ast.Expr {
     // Expand the arguments under the current substitution first.
     const args = try cx.arena.alloc(*ast.Expr, c.args.len);
     for (c.args, 0..) |a, i| args[i] = try expandExpr(cx, a, subst, depth);
@@ -212,7 +240,7 @@ fn expandCall(cx: *Ctx, c: ast.Expr.Call, subst: ?*const Subst, depth: usize) Er
     return mk(cx, .{ .call = .{ .name = c.name, .args = args } });
 }
 
-fn expandMatchExpr(cx: *Ctx, m: ast.Match, subst: ?*const Subst, depth: usize) Error!*ast.Expr {
+fn expandMatchExpr(cx: *Ctx, m: ast.Match, subst: ?*Subst, depth: usize) Error!*ast.Expr {
     const subject = if (m.subject) |s| try expandExpr(cx, s, subst, depth) else null;
     const arms = try cx.arena.alloc(ast.MatchArm, m.arms.len);
     for (m.arms, 0..) |arm, i| {
@@ -265,6 +293,25 @@ test "expandProgram rejects recursion and arity mismatch" {
     try std.testing.expectError(error.ExpandFailed, expandProgram(a, p2, null, &m2));
 }
 
+test "expandProgram inlines `let … in` away (single-use binding)" {
+    const parser = @import("parser.zig");
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    // `let d = id + 1 in d * d` -> `(id + 1) * (id + 1)`: a `binary` mul whose
+    // operands are both the substituted value, with no `let_in` node left.
+    const prog = try parser.parseSource(a, "@batch\n" ++
+        "read csv \"x\" | select v = let d = id + 1 in d * d | write stdout", &diag);
+    var msg: []const u8 = "";
+    const out = try expandProgram(a, prog, null, &msg);
+    const e = outputSelect(out)[0].computed.expr;
+    try std.testing.expect(e.* == .binary);
+    try std.testing.expectEqual(ast.BinOp.mul, e.binary.op);
+    try std.testing.expect(e.binary.l.* == .binary); // each side is the inlined `id + 1`
+    try std.testing.expectEqual(ast.BinOp.add, e.binary.l.binary.op);
+}
+
 fn outputSelect(prog: ast.Program) []const ast.SelectItem {
     for (prog.stmts) |s| if (s == .output) return s.output.stages[1].node.select;
     return &.{};
@@ -285,6 +332,36 @@ test "expandProgram substitutes JSON-param path access from the body" {
     try std.testing.expectEqualStrings("142.0.65.89", sel[0].computed.expr.str_lit);
     try std.testing.expect(sel[1].computed.expr.* == .int_lit);
     try std.testing.expectEqual(@as(i64, 7), sel[1].computed.expr.int_lit);
+}
+
+test "?. safe navigation: a missing intermediate resolves to null instead of erroring" {
+    const parser = @import("parser.zig");
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // `job?.source.host` over a body lacking `source`: the `?.` tolerates the miss.
+    var d1 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const p1 = try parser.parseSource(a, "@batch\nparam job json from body\n" ++
+        "read csv \"x\" | select h = job?.source.host | write stdout", &d1);
+    var m1: []const u8 = "";
+    const o1 = try expandProgram(a, p1, "{\"other\":1}", &m1);
+    try std.testing.expect(outputSelect(o1)[0].computed.expr.* == .null_lit);
+
+    // `job.source?.host`: source present, host missing under `?.` → null.
+    var d2 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const p2 = try parser.parseSource(a, "@batch\nparam job json from body\n" ++
+        "read csv \"x\" | select h = job.source?.host | write stdout", &d2);
+    var m2: []const u8 = "";
+    const o2 = try expandProgram(a, p2, "{\"source\":{\"x\":1}}", &m2);
+    try std.testing.expect(outputSelect(o2)[0].computed.expr.* == .null_lit);
+
+    // The same miss with a plain `.` is still a hard error.
+    var d3 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const p3 = try parser.parseSource(a, "@batch\nparam job json from body\n" ++
+        "read csv \"x\" | select h = job.source.host | write stdout", &d3);
+    var m3: []const u8 = "";
+    try std.testing.expectError(error.ExpandFailed, expandProgram(a, p3, "{\"other\":1}", &m3));
 }
 
 test "expandProgram leaves JSON paths null when unbound (offline check)" {
