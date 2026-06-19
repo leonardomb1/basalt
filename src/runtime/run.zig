@@ -599,12 +599,15 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     // the file into newline-aligned byte ranges parsed + folded on worker threads,
     // then merges the partial group tables. The parallel-aware blocking-operator path
     // — what lets aggregation use every core (the rest of the engine is serial-pull).
-    if (opts.threads > 1 and stages.len == 3 and
-        stages[0].node == .read and stages[0].hints.len == 0 and
-        stages[1].node == .aggregate and isLocalCsvRead(stages[0].node.read))
+    if (opts.threads > 1 and stages.len >= 2 and
+        stages[0].node == .read and stages[0].hints.len == 0 and isLocalCsvRead(stages[0].node.read))
     {
-        if (try runParallelCsvAgg(env, stages[0].node.read, stages[1].node.aggregate, last.write, opts, stats, lanes_used)) return;
-        // not eligible (URL, mmap failure, bare-upsert sink) → fall through to serial.
+        if (classifyAggPipeline(stages)) |shape| {
+            if (try runParallelCsvAgg(env, stages[0].node.read, shape.prefix, shape.ag, shape.tail, last.write, opts, stats, lanes_used)) return;
+            // not eligible (URL, mmap failure, bare-upsert sink) → fall through to serial.
+        } else if (classifyMapPipeline(stages)) |map_stages| {
+            if (try runParallelCsvMap(env, stages[0].node.read, map_stages, last.write, opts, stats, lanes_used)) return;
+        }
     }
 
     env.sql_desc = null;
@@ -708,15 +711,114 @@ fn isLocalCsvRead(rd: ast.Read) bool {
     };
 }
 
-/// Shared state for the parallel-aggregate workers. Each worker folds one or more
-/// newline-aligned file chunks into a thread-local partial group set, then merges it
-/// into the combined set under `mtx` (deep-copying keys/min-max into the plan arena,
-/// so its own arena can be freed). The merge is small (O(groups)) relative to the
-/// fold (O(rows)), so lock contention is negligible.
+const AggShape = struct { prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage };
+
+/// Recognize `read … | (filter|select)* | aggregate | (sort|limit)* | write` — the
+/// shape the parallel CSV-aggregate path handles: a map-only prefix (folded in
+/// parallel), exactly one aggregate (the breaker), and a small post-aggregate tail
+/// (run serially on the merged result). Anything else → null (serial path).
+fn classifyAggPipeline(stages: []const ast.Stage) ?AggShape {
+    const middle = stages[1 .. stages.len - 1]; // between read and write
+    var ai: ?usize = null;
+    for (middle, 0..) |st, i| switch (st.node) {
+        .filter, .select => if (ai != null) return null, // map ops only before the aggregate
+        .aggregate => {
+            if (ai != null) return null; // only one aggregate
+            ai = i;
+        },
+        .sort, .limit => if (ai == null) return null, // sort/limit only after the aggregate
+        else => return null,
+    };
+    const a = ai orelse return null;
+    return .{ .prefix = middle[0..a], .ag = middle[a].node.aggregate, .tail = middle[a + 1 ..] };
+}
+
+/// Build the map-only prefix (`filter`/`select`) onto `scan` using `ta` (a thread
+/// arena). `checkFilter`/`selectCols` are pure (arena + read-only schema/params), so
+/// each worker rebuilds its own prefix chain safely from the shared AST stages — the
+/// resolution is plan-time-cheap and avoids sharing mutable op state across threads.
+fn buildMapChain(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), prefix: []const ast.Stage, scan: *op.Scan, csv_schema: *const types.Schema) !op.Op {
+    var cur: op.Op = .{ .scan = scan };
+    var sch = csv_schema.*;
+    for (prefix) |st| switch (st.node) {
+        .filter => |pred0| {
+            var ad = analyze.Diag{};
+            const pred = try analyze.checkFilter(ta, sch, pred0, params, &ad);
+            const f = try ta.create(op.Filter);
+            f.* = .{ .child = cur, .pred = pred, .err = null };
+            cur = .{ .filter = f };
+        },
+        .select => |items| {
+            var ad = analyze.Diag{};
+            const rcols = try analyze.selectCols(ta, sch, items, params, &ad);
+            const cols = try ta.alloc(op.Project.Col, rcols.len);
+            for (rcols, cols) |rc, *c| c.* = .{ .source = switch (rc.source) {
+                .passthrough => |x| .{ .passthrough = x },
+                .expr => |e| .{ .expr = e },
+            }, .ty = rc.ty };
+            const out = try ta.create(types.Schema);
+            out.* = try analyze.schemaOfCols(ta, rcols);
+            const p = try ta.create(op.Project);
+            p.* = .{ .child = cur, .cols = cols, .out_schema = out, .err = null };
+            cur = .{ .project = p };
+            sch = out.*;
+        },
+        else => unreachable, // classifyAggPipeline guarantees filter/select only
+    };
+    return cur;
+}
+
+/// The schema after the map-only prefix — validated once serially (so worker rebuilds
+/// can't hit an analyze error) and used as the aggregate's input schema.
+fn mapChainSchema(env: *Env, prefix: []const ast.Stage, csv_schema: types.Schema) !types.Schema {
+    var sch = csv_schema;
+    for (prefix) |st| switch (st.node) {
+        .filter => |pred0| {
+            var ad = analyze.Diag{};
+            _ = analyze.checkFilter(env.arena, sch, pred0, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
+        },
+        .select => |items| {
+            var ad = analyze.Diag{};
+            const rcols = analyze.selectCols(env.arena, sch, items, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
+            sch = analyze.schemaOfCols(env.arena, rcols) catch |e| return aErr(env, &ad, e);
+        },
+        else => unreachable,
+    };
+    return sch;
+}
+
+/// A `driver.Source` yielding one in-memory batch then EOF — used to run a small
+/// post-aggregate `sort`/`limit` tail over the merged result.
+const OneBatch = struct {
+    b: ?batchmod.Batch,
+    sch: types.Schema,
+    pub fn source(self: *OneBatch) driver.Source {
+        return .{ .ptr = self, .vtable = &ob_vtable };
+    }
+};
+const ob_vtable = driver.Source.VTable{ .schema = obSchema, .next = obNext, .close = obClose };
+fn obSchema(ptr: *anyopaque) types.Schema {
+    return @as(*OneBatch, @ptrCast(@alignCast(ptr))).sch;
+}
+fn obNext(ptr: *anyopaque, _: std.mem.Allocator) anyerror!?batchmod.Batch {
+    const self: *OneBatch = @ptrCast(@alignCast(ptr));
+    defer self.b = null;
+    return self.b;
+}
+fn obClose(_: *anyopaque) void {}
+
+/// Shared state for the parallel-aggregate workers. Each worker rebuilds the prefix
+/// chain on its own arena, folds one or more newline-aligned file chunks into a
+/// thread-local partial group set, then merges it into the combined set under `mtx`
+/// (deep-copying keys/min-max into the plan arena, so its own arena can be freed).
+/// The merge is small (O(groups)) vs the fold (O(rows)), so lock contention is low.
 const AggCtx = struct {
     mapped: *csv.MappedCsv,
-    in_schema: *const types.Schema,
+    csv_schema: *const types.Schema, // raw CSV columns (the chunk readers' schema)
+    agg_in_schema: *const types.Schema, // schema after the prefix (the aggregate's input)
     out_schema: *const types.Schema,
+    prefix: []const ast.Stage,
+    params: *std.StringHashMap(*const ast.Expr),
     by: []const usize,
     aggs: []const op.Aggregate.Agg,
     nchunks: usize,
@@ -749,18 +851,20 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
     defer _ = wgpa.deinit();
     var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
     defer warena.deinit(); // freed after the merge copies what survives into plan_arena
+    const wa = warena.allocator();
 
-    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.nchunks), .schema = ctx.in_schema };
+    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.nchunks), .schema = ctx.csv_schema };
     var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
+    const child = try buildMapChain(wa, ctx.params, ctx.prefix, &scan, ctx.csv_schema);
     var agg = op.Aggregate{
-        .child = .{ .scan = &scan },
-        .in_schema = ctx.in_schema,
+        .child = child,
+        .in_schema = ctx.agg_in_schema,
         .by = ctx.by,
         .aggs = ctx.aggs,
         .out_schema = ctx.out_schema,
         .err = null, // errors propagate via the return value; no shared ErrCtx race
-        .state = warena.allocator(),
+        .state = wa,
         .gpa = wgpa.allocator(),
     };
     const groups = try agg.drainGroups();
@@ -771,7 +875,7 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
 }
 
 /// Returns true if it handled the pipeline in parallel; false to fall back to serial.
-fn runParallelCsvAgg(env: *Env, rd: ast.Read, ag: ast.Aggregate, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     const arena = env.arena;
     const path = switch (rd.form) {
         .path => |p| p,
@@ -784,8 +888,12 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, ag: ast.Aggregate, w: ast.Write, o
     const mapped = csv.MappedCsv.open(arena, path) catch return false; // fall back on mmap/open failure
     defer mapped.close(); // merged groups + output batch are copied into the plan arena
 
+    // Validate the prefix serially (proper error messages) and get the aggregate's
+    // input schema; workers rebuild the identical prefix on their own arenas.
+    const agg_in = try schemaPtr(arena, try mapChainSchema(env, prefix, mapped.schema));
+
     var ad = analyze.Diag{};
-    const apl = analyze.aggregatePlan(arena, mapped.schema, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
+    const apl = analyze.aggregatePlan(arena, agg_in.*, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
     const aggs = try arena.alloc(op.Aggregate.Agg, apl.aggs.len);
     for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty };
     const out_schema = try schemaPtr(arena, apl.schema);
@@ -798,8 +906,11 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, ag: ast.Aggregate, w: ast.Write, o
     var cgroups = std.array_list.Managed(op.Aggregate.Group).init(arena);
     var ctx = AggCtx{
         .mapped = mapped,
-        .in_schema = &mapped.schema,
+        .csv_schema = &mapped.schema,
+        .agg_in_schema = agg_in,
         .out_schema = out_schema,
+        .prefix = prefix,
+        .params = env.params_expr,
         .by = apl.by,
         .aggs = aggs,
         .nchunks = nthreads,
@@ -824,7 +935,7 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, ag: ast.Aggregate, w: ast.Write, o
     // for `emit`; it never pulls a child).
     var merger = op.Aggregate{
         .child = undefined,
-        .in_schema = &mapped.schema,
+        .in_schema = agg_in,
         .by = apl.by,
         .aggs = aggs,
         .out_schema = out_schema,
@@ -833,14 +944,157 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, ag: ast.Aggregate, w: ast.Write, o
     };
     const batch = try merger.emit(arena, cgroups.items);
 
+    // `sort`/`limit` preserve the schema, so the sink uses the aggregate's out schema.
     const wr = try resolveUpsertKeys(env, w);
     const snk = try openSink(env, wr, out_schema.*);
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
-    if (batch.len > 0) {
-        try snk.writeBatch(arena, batch);
-        stats.rows_out += batch.len;
+
+    if (tail.len == 0) {
+        if (batch.len > 0) {
+            try snk.writeBatch(arena, batch);
+            stats.rows_out += batch.len;
+        }
+    } else {
+        // Run the small post-aggregate tail serially over the merged batch.
+        var ob = OneBatch{ .b = batch, .sch = out_schema.* };
+        var scan = op.Scan{ .src = ob.source() };
+        var cur: op.Op = .{ .scan = &scan };
+        var sch = out_schema.*;
+        for (tail) |st| {
+            const r = try buildStage(env, st, cur, sch);
+            cur = r.op;
+            sch = r.schema;
+        }
+        while (try cur.next(arena)) |outb| {
+            try snk.writeBatch(arena, outb);
+            stats.rows_out += outb.len;
+        }
     }
+    snk_open = false;
+    try snk.close();
+    return true;
+}
+
+/// Recognize a map-only `read … | (filter|select)* | write` (no breaker, no limit),
+/// returning the middle stages. Such a pipeline parallelizes by byte-range chunks
+/// with each worker writing to a shared sink. null → not eligible.
+fn classifyMapPipeline(stages: []const ast.Stage) ?[]const ast.Stage {
+    const middle = stages[1 .. stages.len - 1];
+    for (middle) |st| switch (st.node) {
+        .filter, .select => {},
+        else => return null,
+    };
+    return middle;
+}
+
+const MapCtx = struct {
+    mapped: *csv.MappedCsv,
+    csv_schema: *const types.Schema,
+    map_stages: []const ast.Stage,
+    params: *std.StringHashMap(*const ast.Expr),
+    nchunks: usize,
+    next_chunk: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    sink: driver.Sink,
+    sink_mtx: std.Thread.Mutex = .{},
+    err_mtx: std.Thread.Mutex = .{},
+    first_err: ?anyerror = null,
+    rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    rows_read: *std.atomic.Value(u64),
+};
+
+fn mapWorker(ctx: *MapCtx) void {
+    while (true) {
+        if (ctx.first_err != null) return;
+        const i = ctx.next_chunk.fetchAdd(1, .seq_cst);
+        if (i >= ctx.nchunks) break;
+        mapWorkOne(ctx, i) catch |e| {
+            ctx.err_mtx.lock();
+            if (ctx.first_err == null) ctx.first_err = e;
+            ctx.err_mtx.unlock();
+            return;
+        };
+    }
+}
+
+fn mapWorkOne(ctx: *MapCtx, i: usize) !void {
+    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
+    defer _ = wgpa.deinit();
+    var warena = std.heap.ArenaAllocator.init(wgpa.allocator()); // holds the op chain
+    defer warena.deinit();
+    var batch_arena = std.heap.ArenaAllocator.init(wgpa.allocator()); // reset per batch
+    defer batch_arena.deinit();
+
+    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.nchunks), .schema = ctx.csv_schema };
+    var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
+    var scan = op.Scan{ .src = cs.source() };
+    const chain = try buildMapChain(warena.allocator(), ctx.params, ctx.map_stages, &scan, ctx.csv_schema);
+
+    while (try chain.next(batch_arena.allocator())) |b| {
+        if (b.len > 0) {
+            ctx.sink_mtx.lock();
+            ctx.sink.writeBatch(batch_arena.allocator(), b) catch |e| {
+                ctx.sink_mtx.unlock();
+                return e;
+            };
+            ctx.sink_mtx.unlock();
+            _ = ctx.rows_out.fetchAdd(b.len, .monotonic);
+        }
+        _ = batch_arena.reset(.retain_capacity);
+    }
+}
+
+/// Parallel map-only CSV pipeline (`read csv <local> | (filter|select)* | write`):
+/// fans the file into byte-range chunks, runs the map chain on each worker, and
+/// writes batches to a shared sink under a mutex. Row ORDER is not preserved (chunks
+/// interleave); use `-j 1` for a deterministic order. Returns false to fall back.
+fn runParallelCsvMap(env: *Env, rd: ast.Read, map_stages: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    const arena = env.arena;
+    const path = switch (rd.form) {
+        .path => |p| p,
+        else => return false,
+    };
+    // stdout's table writer assumes a single ordered stream; bare `upsert` needs
+    // source PK metadata this path doesn't open. Both stay serial.
+    if (std.mem.eql(u8, w.connector, "stdout")) return false;
+    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
+
+    const mapped = csv.MappedCsv.open(arena, path) catch return false;
+    defer mapped.close();
+
+    // Validate the map chain serially (proper errors) and get the output schema.
+    const out_schema = try mapChainSchema(env, map_stages, mapped.schema);
+
+    env.src_name = "csv";
+    env.sink_name = connectorType(env, w.connector);
+
+    const wr = try resolveUpsertKeys(env, w);
+    const snk = try openSink(env, wr, out_schema);
+    var snk_open = true;
+    errdefer if (snk_open) snk.abort();
+
+    const nthreads = @max(@as(usize, 1), opts.threads);
+    var ctx = MapCtx{
+        .mapped = mapped,
+        .csv_schema = &mapped.schema,
+        .map_stages = map_stages,
+        .params = env.params_expr,
+        .nchunks = nthreads,
+        .sink = snk,
+        .rows_read = env.rows_read,
+    };
+
+    const threads = try arena.alloc(std.Thread, nthreads);
+    var spawned: usize = 0;
+    while (spawned < nthreads) : (spawned += 1) {
+        threads[spawned] = std.Thread.spawn(.{}, mapWorker, .{&ctx}) catch break;
+    }
+    if (spawned == 0) mapWorker(&ctx) else for (threads[0..spawned]) |t| t.join();
+    lanes_used.* = @max(lanes_used.*, @max(spawned, 1));
+    env.log.log(.info, "parallel csv map: {d} chunks over {d} lanes", .{ nthreads, @max(spawned, 1) });
+
+    if (ctx.first_err) |e| return e;
+    stats.rows_out += ctx.rows_out.load(.monotonic);
     snk_open = false;
     try snk.close();
     return true;
@@ -2669,6 +2923,19 @@ test "parallel CSV aggregate: global agg (threads>1) matches serial" {
     try std.testing.expectEqualStrings("n,s\n5,150\n", par);
 }
 
+test "parallel CSV aggregate: filter/select prefix + sort/limit tail (threads>1)" {
+    const alloc = std.testing.allocator;
+    const input = "id,g,v\n1,a,10\n2,b,20\n3,a,30\n4,b,5\n5,a,50\n";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // prefix (filter+select) folds in parallel; tail (sort) runs on the merged result
+    const out = try runCsvThreaded(alloc, &tmp, input,
+        "  | filter cast(v as int) > 6\n  | select g, v2 = cast(v as int)\n  | aggregate s = sum(v2) by g\n  | sort g asc",
+        4);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("g,s\na,90\nb,20\n", out); // a:10+30+50, b:20 (5 filtered out)
+}
+
 test "parallel CSV aggregate: grouped agg (threads>1) merges partials by key" {
     const alloc = std.testing.allocator;
     const input = "id,g,v\n1,a,10\n2,b,20\n3,a,30\n4,b,40\n5,a,50\n";
@@ -2926,9 +3193,9 @@ test "parallel driver matches serial output across many batches" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // ~5000 rows -> several 1024-row batches. CSV is non-splittable, so both the
-    // 1- and 4-thread runs execute serially (split-parallel needs a SQL source);
-    // this guards that requesting threads does not change or corrupt the output.
+    // ~5000 rows -> several 1024-row batches. A map-only CSV pipeline parallelizes
+    // under -j by byte-range chunks, which interleaves output rows (order is not
+    // preserved); the row CONTENT must still match the serial run exactly.
     var in = std.array_list.Managed(u8).init(alloc);
     defer in.deinit();
     try in.appendSlice("id,amount\n");
@@ -2962,9 +3229,35 @@ test "parallel driver matches serial output across many batches" {
     defer alloc.free(outputs[0]);
     defer alloc.free(outputs[1]);
 
-    // Byte-identical: serial output is unchanged by the thread count.
-    try std.testing.expectEqualStrings(outputs[0], outputs[1]);
+    // Same row content regardless of thread count (order may differ under -j>1, so
+    // compare the line sets).
+    const s = try sortedLines(alloc, outputs[0]);
+    defer alloc.free(s);
+    const p = try sortedLines(alloc, outputs[1]);
+    defer alloc.free(p);
+    try std.testing.expectEqualStrings(s, p);
     try std.testing.expect(std.mem.indexOf(u8, outputs[1], "id,doubled\n") != null);
+}
+
+/// Sort the newline-separated lines of `text` (for order-insensitive comparison of
+/// parallel vs serial output). Caller frees.
+fn sortedLines(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
+    var lines = std.array_list.Managed([]const u8).init(alloc);
+    defer lines.deinit();
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |l| try lines.append(l);
+    std.mem.sort([]const u8, lines.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    var out = std.array_list.Managed(u8).init(alloc);
+    errdefer out.deinit();
+    for (lines.items) |l| {
+        try out.appendSlice(l);
+        try out.append('\n');
+    }
+    return out.toOwnedSlice();
 }
 
 test "let binding + inner join" {
