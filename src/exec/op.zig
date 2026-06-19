@@ -967,7 +967,7 @@ fn lessV(a: Value, b: Value) bool {
 
 /// Deep-copy a value into `state` so it survives the batch it was read from.
 /// Only string/bytes carry pointers into batch memory; scalars copy by value.
-fn dupeValue(state: std.mem.Allocator, v: Value) !Value {
+pub fn dupeValue(state: std.mem.Allocator, v: Value) !Value {
     return switch (v) {
         .string => |s| .{ .string = try state.dupe(u8, s) },
         .bytes => |s| .{ .bytes = try state.dupe(u8, s) },
