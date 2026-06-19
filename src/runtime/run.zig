@@ -1000,23 +1000,28 @@ const MapCtx = struct {
     params: *std.StringHashMap(*const ast.Expr),
     nchunks: usize,
     next_chunk: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    sink: driver.Sink,
+    // `.shared` (one sink, mutex-serialized writes — e.g. a single CSV file) or
+    // `.per_lane` (each worker opens its own sink and writes lock-free — e.g. a
+    // StarRocks stream-load, so the WRITE parallelizes too, not just read+transform).
+    sink_mode: parallel.SinkMode,
     sink_mtx: std.Thread.Mutex = .{},
     err_mtx: std.Thread.Mutex = .{},
     first_err: ?anyerror = null,
+    failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     rows_read: *std.atomic.Value(u64),
 };
 
 fn mapWorker(ctx: *MapCtx) void {
     while (true) {
-        if (ctx.first_err != null) return;
+        if (ctx.failed.load(.seq_cst)) return;
         const i = ctx.next_chunk.fetchAdd(1, .seq_cst);
         if (i >= ctx.nchunks) break;
         mapWorkOne(ctx, i) catch |e| {
             ctx.err_mtx.lock();
             if (ctx.first_err == null) ctx.first_err = e;
             ctx.err_mtx.unlock();
+            ctx.failed.store(true, .seq_cst);
             return;
         };
     }
@@ -1025,10 +1030,21 @@ fn mapWorker(ctx: *MapCtx) void {
 fn mapWorkOne(ctx: *MapCtx, i: usize) !void {
     var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
     defer _ = wgpa.deinit();
-    var warena = std.heap.ArenaAllocator.init(wgpa.allocator()); // holds the op chain
+    const wa = wgpa.allocator();
+    var warena = std.heap.ArenaAllocator.init(wa); // holds the op chain
     defer warena.deinit();
-    var batch_arena = std.heap.ArenaAllocator.init(wgpa.allocator()); // reset per batch
+    var batch_arena = std.heap.ArenaAllocator.init(wa); // reset per batch
     defer batch_arena.deinit();
+
+    // Per-lane sink: open this worker's own sink (StarRocks stream etc.). Aborted
+    // (not committed) if the run failed by the time we finish.
+    var own_sink: ?driver.Sink = switch (ctx.sink_mode) {
+        .shared => null,
+        .per_lane => |pl| try pl.open(pl.ctx, wa, i),
+    };
+    defer if (own_sink) |s| {
+        if (ctx.failed.load(.seq_cst)) s.abort() else s.close() catch {};
+    };
 
     var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.nchunks), .schema = ctx.csv_schema };
     var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
@@ -1036,13 +1052,16 @@ fn mapWorkOne(ctx: *MapCtx, i: usize) !void {
     const chain = try buildMapChain(warena.allocator(), ctx.params, ctx.map_stages, &scan, ctx.csv_schema);
 
     while (try chain.next(batch_arena.allocator())) |b| {
+        if (ctx.failed.load(.seq_cst)) return;
         if (b.len > 0) {
-            ctx.sink_mtx.lock();
-            ctx.sink.writeBatch(batch_arena.allocator(), b) catch |e| {
-                ctx.sink_mtx.unlock();
-                return e;
-            };
-            ctx.sink_mtx.unlock();
+            switch (ctx.sink_mode) {
+                .shared => |snk| {
+                    ctx.sink_mtx.lock();
+                    defer ctx.sink_mtx.unlock();
+                    try snk.writeBatch(batch_arena.allocator(), b);
+                },
+                .per_lane => try own_sink.?.writeBatch(batch_arena.allocator(), b),
+            }
             _ = ctx.rows_out.fetchAdd(b.len, .monotonic);
         }
         _ = batch_arena.reset(.retain_capacity);
@@ -1074,9 +1093,12 @@ fn runParallelCsvMap(env: *Env, rd: ast.Read, map_stages: []const ast.Stage, w: 
     env.sink_name = connectorType(env, w.connector);
 
     const wr = try resolveUpsertKeys(env, w);
-    const snk = try openSink(env, wr, out_schema);
-    var snk_open = true;
-    errdefer if (snk_open) snk.abort();
+    // Parallel-capable sink (StarRocks/SQL) → per-lane streams (lock-free writes);
+    // otherwise a single shared sink whose writes serialize on a mutex (CSV file).
+    const sink_mode: parallel.SinkMode = (try buildParallelSink(env, wr, out_schema)) orelse
+        .{ .shared = try openSink(env, wr, out_schema) };
+    var shared_open = sink_mode == .shared;
+    errdefer if (shared_open) sink_mode.shared.abort();
 
     const nthreads = @max(@as(usize, 1), opts.threads);
     var ctx = MapCtx{
@@ -1085,7 +1107,7 @@ fn runParallelCsvMap(env: *Env, rd: ast.Read, map_stages: []const ast.Stage, w: 
         .map_stages = map_stages,
         .params = env.params_expr,
         .nchunks = nthreads,
-        .sink = snk,
+        .sink_mode = sink_mode,
         .rows_read = env.rows_read,
     };
 
@@ -1096,12 +1118,14 @@ fn runParallelCsvMap(env: *Env, rd: ast.Read, map_stages: []const ast.Stage, w: 
     }
     if (spawned == 0) mapWorker(&ctx) else for (threads[0..spawned]) |t| t.join();
     lanes_used.* = @max(lanes_used.*, @max(spawned, 1));
-    env.log.log(.info, "parallel csv map: {d} chunks over {d} lanes", .{ nthreads, @max(spawned, 1) });
+    env.log.log(.info, "parallel csv map: {d} chunks over {d} lanes ({s} sink)", .{ nthreads, @max(spawned, 1), @tagName(sink_mode) });
 
-    if (ctx.first_err) |e| return e;
+    if (ctx.first_err) |e| return e; // per-lane sinks already aborted in their workers
     stats.rows_out += ctx.rows_out.load(.monotonic);
-    snk_open = false;
-    try snk.close();
+    if (sink_mode == .shared) {
+        shared_open = false;
+        try sink_mode.shared.close();
+    }
     return true;
 }
 
