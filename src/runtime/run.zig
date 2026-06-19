@@ -595,6 +595,18 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
         return runUnionSplit(env, stages[0].node.union_, stages[0].hints, stages[1 .. stages.len - 1], stages[stages.len - 1], opts, stats, lanes_used, batch_arena);
     }
 
+    // Parallel CSV aggregate (Layer 1): `read csv <local> | aggregate … | write` fans
+    // the file into newline-aligned byte ranges parsed + folded on worker threads,
+    // then merges the partial group tables. The parallel-aware blocking-operator path
+    // — what lets aggregation use every core (the rest of the engine is serial-pull).
+    if (opts.threads > 1 and stages.len == 3 and
+        stages[0].node == .read and stages[0].hints.len == 0 and
+        stages[1].node == .aggregate and isLocalCsvRead(stages[0].node.read))
+    {
+        if (try runParallelCsvAgg(env, stages[0].node.read, stages[1].node.aggregate, last.write, opts, stats, lanes_used)) return;
+        // not eligible (URL, mmap failure, bare-upsert sink) → fall through to serial.
+    }
+
     env.sql_desc = null;
     env.src_name = ""; // reset per output so this pipeline's first read sets it
     const src_base = env.sources.items.len; // sources this output opens (for early release on the split path)
@@ -684,6 +696,154 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     }
     snk_open = false;
     try snk.close();
+}
+
+// --- parallel CSV aggregate (Layer 1: parallel-aware blocking operator) ---
+
+fn isLocalCsvRead(rd: ast.Read) bool {
+    if (!std.mem.eql(u8, rd.connector, "csv")) return false;
+    return switch (rd.form) {
+        .path => |p| !csv.CsvReader.isUrl(p),
+        else => false,
+    };
+}
+
+/// Shared state for the parallel-aggregate workers. Each worker folds one or more
+/// newline-aligned file chunks into a thread-local partial group set, then merges it
+/// into the combined set under `mtx` (deep-copying keys/min-max into the plan arena,
+/// so its own arena can be freed). The merge is small (O(groups)) relative to the
+/// fold (O(rows)), so lock contention is negligible.
+const AggCtx = struct {
+    mapped: *csv.MappedCsv,
+    in_schema: *const types.Schema,
+    out_schema: *const types.Schema,
+    by: []const usize,
+    aggs: []const op.Aggregate.Agg,
+    nchunks: usize,
+    next_chunk: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    cmap: *op.Aggregate.GroupMap(),
+    cgroups: *std.array_list.Managed(op.Aggregate.Group),
+    mtx: std.Thread.Mutex = .{},
+    err_mtx: std.Thread.Mutex = .{},
+    first_err: ?anyerror = null,
+    plan_arena: std.mem.Allocator, // combined groups live here (plan arena)
+    rows_read: *std.atomic.Value(u64),
+};
+
+fn aggWorker(ctx: *AggCtx) void {
+    while (true) {
+        if (ctx.first_err != null) return;
+        const i = ctx.next_chunk.fetchAdd(1, .seq_cst);
+        if (i >= ctx.nchunks) break;
+        aggWorkOne(ctx, i) catch |e| {
+            ctx.err_mtx.lock();
+            if (ctx.first_err == null) ctx.first_err = e;
+            ctx.err_mtx.unlock();
+            return;
+        };
+    }
+}
+
+fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
+    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
+    defer _ = wgpa.deinit();
+    var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
+    defer warena.deinit(); // freed after the merge copies what survives into plan_arena
+
+    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.nchunks), .schema = ctx.in_schema };
+    var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
+    var scan = op.Scan{ .src = cs.source() };
+    var agg = op.Aggregate{
+        .child = .{ .scan = &scan },
+        .in_schema = ctx.in_schema,
+        .by = ctx.by,
+        .aggs = ctx.aggs,
+        .out_schema = ctx.out_schema,
+        .err = null, // errors propagate via the return value; no shared ErrCtx race
+        .state = warena.allocator(),
+        .gpa = wgpa.allocator(),
+    };
+    const groups = try agg.drainGroups();
+
+    ctx.mtx.lock();
+    defer ctx.mtx.unlock();
+    try op.Aggregate.mergeGroups(ctx.cmap, ctx.cgroups, ctx.plan_arena, groups, ctx.aggs);
+}
+
+/// Returns true if it handled the pipeline in parallel; false to fall back to serial.
+fn runParallelCsvAgg(env: *Env, rd: ast.Read, ag: ast.Aggregate, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    const arena = env.arena;
+    const path = switch (rd.form) {
+        .path => |p| p,
+        else => return false,
+    };
+    // Bare `upsert` (PK inference) needs the source's SQL metadata, which this path
+    // doesn't open — leave it to the serial path.
+    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
+
+    const mapped = csv.MappedCsv.open(arena, path) catch return false; // fall back on mmap/open failure
+    defer mapped.close(); // merged groups + output batch are copied into the plan arena
+
+    var ad = analyze.Diag{};
+    const apl = analyze.aggregatePlan(arena, mapped.schema, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
+    const aggs = try arena.alloc(op.Aggregate.Agg, apl.aggs.len);
+    for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty };
+    const out_schema = try schemaPtr(arena, apl.schema);
+
+    env.src_name = "csv";
+    env.sink_name = connectorType(env, w.connector);
+
+    const nthreads = @max(@as(usize, 1), opts.threads);
+    var cmap = op.Aggregate.GroupMap().init(arena);
+    var cgroups = std.array_list.Managed(op.Aggregate.Group).init(arena);
+    var ctx = AggCtx{
+        .mapped = mapped,
+        .in_schema = &mapped.schema,
+        .out_schema = out_schema,
+        .by = apl.by,
+        .aggs = aggs,
+        .nchunks = nthreads,
+        .cmap = &cmap,
+        .cgroups = &cgroups,
+        .plan_arena = arena,
+        .rows_read = env.rows_read,
+    };
+
+    const threads = try arena.alloc(std.Thread, nthreads);
+    var spawned: usize = 0;
+    while (spawned < nthreads) : (spawned += 1) {
+        threads[spawned] = std.Thread.spawn(.{}, aggWorker, .{&ctx}) catch break;
+    }
+    if (spawned == 0) aggWorker(&ctx) else for (threads[0..spawned]) |t| t.join();
+    lanes_used.* = @max(lanes_used.*, @max(spawned, 1));
+    env.log.log(.info, "parallel csv aggregate: {d} chunks over {d} lanes", .{ nthreads, @max(spawned, 1) });
+
+    if (ctx.first_err) |e| return e;
+
+    // Finalize the merged groups into one output batch (a "merger" Aggregate just
+    // for `emit`; it never pulls a child).
+    var merger = op.Aggregate{
+        .child = undefined,
+        .in_schema = &mapped.schema,
+        .by = apl.by,
+        .aggs = aggs,
+        .out_schema = out_schema,
+        .state = arena,
+        .gpa = env.gpa,
+    };
+    const batch = try merger.emit(arena, cgroups.items);
+
+    const wr = try resolveUpsertKeys(env, w);
+    const snk = try openSink(env, wr, out_schema.*);
+    var snk_open = true;
+    errdefer if (snk_open) snk.abort();
+    if (batch.len > 0) {
+        try snk.writeBatch(arena, batch);
+        stats.rows_out += batch.len;
+    }
+    snk_open = false;
+    try snk.close();
+    return true;
 }
 
 // --- for-each: plan-time fan-out over a discovered value list ---
@@ -2472,6 +2632,55 @@ test "aggregate: group by a numeric (int) key (value-keyed hashing)" {
     );
     defer alloc.free(out);
     try std.testing.expectEqualStrings("g,c\n5,3\n7,1\n", out);
+}
+
+/// Run `read csv | <body> | write csv` with an explicit thread count, returning
+/// out.csv. Used to exercise the parallel CSV-aggregate path (`threads > 1`), which
+/// the default in-process harness (`threads = 1`) never reaches.
+fn runCsvThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []const u8, body: []const u8, threads: usize) ![]u8 {
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = input });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
+    defer alloc.free(in_path);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+    const script = try std.fmt.allocPrint(alloc, "@batch\nread csv \"{s}\"\n{s}\n  | write csv \"{s}\"", .{ in_path, body, out_path });
+    defer alloc.free(script);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    _ = run(alloc, prog, .{ .threads = threads }, &rdiag) catch |e| {
+        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+        return e;
+    };
+    return tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
+}
+
+test "parallel CSV aggregate: global agg (threads>1) matches serial" {
+    const alloc = std.testing.allocator;
+    const input = "id,v\n1,10\n2,20\n3,30\n4,40\n5,50\n";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const par = try runCsvThreaded(alloc, &tmp, input, "  | aggregate n = count(), s = sum(cast(v as int))", 4);
+    defer alloc.free(par);
+    try std.testing.expectEqualStrings("n,s\n5,150\n", par);
+}
+
+test "parallel CSV aggregate: grouped agg (threads>1) merges partials by key" {
+    const alloc = std.testing.allocator;
+    const input = "id,g,v\n1,a,10\n2,b,20\n3,a,30\n4,b,40\n5,a,50\n";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Merge order across worker partials is nondeterministic, so check the row SET.
+    const par = try runCsvThreaded(alloc, &tmp, input, "  | aggregate s = sum(cast(v as int)) by g", 4);
+    defer alloc.free(par);
+    try std.testing.expect(std.mem.startsWith(u8, par, "g,s\n"));
+    try std.testing.expect(std.mem.indexOf(u8, par, "a,90\n") != null); // 10+30+50
+    try std.testing.expect(std.mem.indexOf(u8, par, "b,60\n") != null); // 20+40
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, par, "\n")); // header + 2 groups
 }
 
 test "distinct: multi-column key (value-keyed)" {

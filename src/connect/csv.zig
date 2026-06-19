@@ -163,6 +163,112 @@ pub const CsvReader = struct {
     }
 };
 
+/// A local CSV file mapped into memory once, so N worker threads can parse disjoint
+/// newline-aligned byte ranges in parallel (the parse, not the read, is the CSV
+/// bottleneck). The mapping is shared read-only; each thread builds a `CsvSliceReader`
+/// over its chunk. Only for local files — not URLs.
+pub const MappedCsv = struct {
+    data: []align(std.heap.page_size_min) const u8,
+    body: []const u8, // bytes after the header line
+    schema: types.Schema,
+    file: std.fs.File,
+
+    pub fn open(arena: std.mem.Allocator, path: []const u8) !*MappedCsv {
+        const self = try arena.create(MappedCsv);
+        const file = try std.fs.cwd().openFile(path, .{});
+        errdefer file.close();
+        const size = (try file.stat()).size;
+        if (size == 0) return error.EmptyCsv;
+        const data = try std.posix.mmap(null, size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
+        errdefer std.posix.munmap(data);
+
+        // Header → schema; body starts after the first newline.
+        const nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.EmptyCsv;
+        var header = data[0..nl];
+        if (header.len > 0 and header[header.len - 1] == '\r') header = header[0 .. header.len - 1];
+        var fields = std.array_list.Managed(types.Schema.Field).init(arena);
+        var it = std.mem.splitScalar(u8, header, ',');
+        while (it.next()) |name| try fields.append(.{
+            .name = try arena.dupe(u8, std.mem.trim(u8, name, " \t")),
+            .ty = types.Type.init(.string).asNullable(),
+        });
+        self.* = .{ .data = data, .body = data[nl + 1 ..], .schema = .{ .fields = try fields.toOwnedSlice() }, .file = file };
+        return self;
+    }
+
+    /// The i-th of `n` newline-aligned chunks of the body (whole lines only; a line
+    /// belongs to the chunk that contains its first byte). May be empty.
+    pub fn chunk(self: *const MappedCsv, i: usize, n: usize) []const u8 {
+        const lo = self.lineStart(self.body.len * i / n);
+        const hi = self.lineStart(self.body.len * (i + 1) / n);
+        return self.body[lo..hi];
+    }
+
+    /// Smallest line-start offset >= `raw` (0, or just past a '\n').
+    fn lineStart(self: *const MappedCsv, raw: usize) usize {
+        if (raw == 0) return 0;
+        if (raw >= self.body.len) return self.body.len;
+        var p = raw;
+        while (p < self.body.len and self.body[p] != '\n') p += 1;
+        return if (p < self.body.len) p + 1 else self.body.len;
+    }
+
+    pub fn close(self: *MappedCsv) void {
+        std.posix.munmap(self.data);
+        self.file.close();
+    }
+};
+
+/// A `driver.Source` over an in-memory byte slice of whole CSV lines (one chunk of a
+/// `MappedCsv`). Shares the parent's schema; copies field bytes into the pull arena.
+pub const CsvSliceReader = struct {
+    data: []const u8,
+    pos: usize = 0,
+    schema: *const types.Schema,
+
+    pub fn next(self: *CsvSliceReader, arena: std.mem.Allocator) !?Batch {
+        if (self.pos >= self.data.len) return null;
+        const ncols = self.schema.fields.len;
+        const builders = try arena.alloc(column.Builder, ncols);
+        for (builders) |*b| b.* = column.Builder.init(arena, types.Type.init(.string).asNullable());
+
+        var rows: usize = 0;
+        while (rows < BATCH_ROWS and self.pos < self.data.len) {
+            const rest = self.data[self.pos..];
+            const nl = std.mem.indexOfScalar(u8, rest, '\n');
+            var line = if (nl) |k| rest[0..k] else rest;
+            self.pos += (nl orelse rest.len) + 1;
+            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+            if (line.len == 0) continue;
+            try splitInto(arena, line, builders);
+            rows += 1;
+        }
+        if (rows == 0) return null;
+        const cols = try arena.alloc(column.Column, ncols);
+        for (builders, 0..) |*b, i| cols[i] = try b.finish();
+        return Batch{ .schema = self.schema, .columns = cols, .len = rows };
+    }
+
+    pub fn source(self: *CsvSliceReader) driver.Source {
+        return .{ .ptr = self, .vtable = &slice_vtable };
+    }
+};
+
+const slice_vtable = driver.Source.VTable{
+    .schema = sliceSchema,
+    .next = sliceNext,
+    .close = sliceClose,
+};
+fn sliceSchema(ptr: *anyopaque) types.Schema {
+    const self: *CsvSliceReader = @ptrCast(@alignCast(ptr));
+    return self.schema.*;
+}
+fn sliceNext(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
+    const self: *CsvSliceReader = @ptrCast(@alignCast(ptr));
+    return self.next(arena);
+}
+fn sliceClose(_: *anyopaque) void {}
+
 fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Builder) !void {
     var i: usize = 0;
     var col: usize = 0;

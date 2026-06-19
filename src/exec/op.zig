@@ -660,7 +660,7 @@ pub const Aggregate = struct {
 
     pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Type };
 
-    const Acc = struct {
+    pub const Acc = struct {
         n: i64 = 0,
         sum_i: i64 = 0,
         sum_f: f64 = 0,
@@ -668,7 +668,20 @@ pub const Aggregate = struct {
         has_ext: bool = false,
     };
 
-    const Group = struct { key_vals: []Value, accs: []Acc };
+    pub const Group = struct { key_vals: []Value, accs: []Acc };
+
+    /// Group-key hash map (value-keyed). Used by `drainGroups` and by `mergeGroups`
+    /// when combining partial group sets from parallel workers.
+    ///
+    /// A type-returning fn, NOT a `const` type decl: `std.testing.refAllDeclsRecursive`
+    /// (main.zig's test root) recurses into every container-level *type* declaration,
+    /// and diving through a `std.HashMap` instantiation here produces a binary that
+    /// segfaults at startup under Zig 0.15.2. Wrapping in a fn keeps the type reachable
+    /// across modules while hiding it from that recursion. (Matches the codebase's other
+    /// HashMaps, which stay function-local for the same reason.)
+    pub fn GroupMap() type {
+        return std.HashMap([]const Value, usize, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
+    }
 
     /// One agg's vectorized reduction of a single batch, merged into the running
     /// accumulator by `mergePartial`.
@@ -682,18 +695,26 @@ pub const Aggregate = struct {
     pub fn next(self: *Aggregate, arena: std.mem.Allocator) anyerror!?Batch {
         if (self.done) return null;
         self.done = true;
+        const groups = try self.drainGroups();
+        // Grouped + empty input → no rows; a no-GROUP-BY still emits one row.
+        if (self.by.len != 0 and groups.len == 0) return null;
+        return try self.emit(arena, groups);
+    }
 
-        // Group state (accumulators, keys, key values) lives in `state`, so each
-        // child batch can be freed once folded. Pull into a scratch arena reset per
-        // batch — this drain runs the WHOLE input in one call, so reusing the
-        // caller's arena (never reset mid-call) would retain every parsed batch,
-        // making aggregation O(dataset) memory instead of O(groups).
+    /// Fold the entire child into raw per-group accumulators (kept in `state`). This
+    /// is the parallelizable half of aggregation: a worker drains its slice of the
+    /// input into a partial group set, and `mergeGroups` combines partials across
+    /// workers by recombining the *raw* accumulators (so AVG etc. stay correct);
+    /// `emit` finalizes once at the end. No-GROUP-BY returns exactly one group.
+    pub fn drainGroups(self: *Aggregate) anyerror![]Group {
+        // Group state lives in `state`, so each child batch can be freed once folded.
+        // Pull into a scratch arena reset per batch — this drains the WHOLE input in
+        // one call, so reusing a never-reset arena would retain every parsed batch
+        // (O(dataset) memory instead of O(groups)).
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
         const pull = scratch.allocator();
 
-        // No GROUP BY: one accumulator set; each batch folds in via the
-        // vectorized partial reduce (SIMD per batch) or row-wise fallback.
         if (self.by.len == 0) {
             const accs = try self.state.alloc(Acc, self.aggs.len);
             for (accs) |*a| a.* = .{};
@@ -701,13 +722,13 @@ pub const Aggregate = struct {
                 if (b.len != 0 and !(try self.foldVectorized(pull, b, accs))) try self.foldRowwise(pull, b, accs);
                 _ = scratch.reset(.retain_capacity);
             }
-            // Empty input still emits one row of finalized fresh accumulators.
-            return try self.emit(arena, &.{.{ .key_vals = &.{}, .accs = accs }});
+            const one = try self.state.alloc(Group, 1);
+            one[0] = .{ .key_vals = &.{}, .accs = accs };
+            return one;
         }
 
         var groups = std.array_list.Managed(Group).init(self.state);
-        const Map = std.HashMap([]const Value, usize, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
-        var map = Map.init(self.state);
+        var map = GroupMap().init(self.state);
         while (try self.child.next(pull)) |b| {
             const probe = try pull.alloc(Value, self.by.len); // reused per row (scratch)
             var r: usize = 0;
@@ -735,8 +756,56 @@ pub const Aggregate = struct {
             }
             _ = scratch.reset(.retain_capacity);
         }
-        if (groups.items.len == 0) return null;
-        return try self.emit(arena, groups.items);
+        return groups.toOwnedSlice();
+    }
+
+    /// Combine a partial accumulator `src` into `dst` for one agg — the dual of
+    /// `updateAcc`, but folding two partials instead of a row. `dst_alloc` owns any
+    /// min/max string carried over (the source partial's memory may be freed).
+    pub fn mergeAcc(dst_alloc: std.mem.Allocator, dst: *Acc, src: Acc, agg: Agg) !void {
+        switch (agg.func) {
+            .count => dst.n += src.n,
+            .sum => {
+                if (agg.ty.kind == .float) dst.sum_f += src.sum_f else dst.sum_i += src.sum_i;
+                dst.n += src.n;
+            },
+            .avg => {
+                dst.sum_f += src.sum_f;
+                dst.n += src.n;
+            },
+            .min => if (src.has_ext and (!dst.has_ext or lessV(src.ext, dst.ext))) {
+                dst.ext = try dupeValue(dst_alloc, src.ext);
+                dst.has_ext = true;
+            },
+            .max => if (src.has_ext and (!dst.has_ext or lessV(dst.ext, src.ext))) {
+                dst.ext = try dupeValue(dst_alloc, src.ext);
+                dst.has_ext = true;
+            },
+        }
+    }
+
+    /// Merge a worker's partial `src_groups` into a combined (`map`, `groups`) set,
+    /// deep-copying keys and min/max values into `dst_alloc` so they survive the
+    /// worker's arena being freed. Call under a lock when workers share the combiner.
+    pub fn mergeGroups(map: *GroupMap(), groups: *std.array_list.Managed(Group), dst_alloc: std.mem.Allocator, src_groups: []const Group, aggs: []const Agg) !void {
+        for (src_groups) |g| {
+            const gop = try map.getOrPut(g.key_vals); // probe aliases worker arena; ok for lookup
+            if (!gop.found_existing) {
+                const kv = try dst_alloc.alloc(Value, g.key_vals.len);
+                for (g.key_vals, kv) |v, *o| o.* = try dupeValue(dst_alloc, v);
+                gop.key_ptr.* = kv;
+                gop.value_ptr.* = groups.items.len;
+                const accs = try dst_alloc.alloc(Acc, aggs.len);
+                for (g.accs, accs, aggs) |src, *dst, agg| {
+                    dst.* = src;
+                    if ((agg.func == .min or agg.func == .max) and src.has_ext) dst.ext = try dupeValue(dst_alloc, src.ext);
+                }
+                try groups.append(.{ .key_vals = kv, .accs = accs });
+            } else {
+                const cg = &groups.items[gop.value_ptr.*];
+                for (g.accs, aggs, 0..) |src, agg, j| try mergeAcc(dst_alloc, &cg.accs[j], src, agg);
+            }
+        }
     }
 
     /// Try the vectorized path for one batch: every agg's argument evaluated as
@@ -824,7 +893,7 @@ pub const Aggregate = struct {
         }
     }
 
-    fn emit(self: *Aggregate, arena: std.mem.Allocator, groups: []const Group) anyerror!Batch {
+    pub fn emit(self: *Aggregate, arena: std.mem.Allocator, groups: []const Group) anyerror!Batch {
         const nfields = self.out_schema.fields.len;
         const builders = try arena.alloc(column.Builder, nfields);
         for (builders, self.out_schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
