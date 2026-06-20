@@ -201,7 +201,14 @@ const Env = struct {
 const PipeRes = struct { op: op.Op, schema: types.Schema };
 
 /// Connection config carried into the split lanes (referenced via *anyopaque).
-const SplitCtx = struct { gpa: std.mem.Allocator, kind: SqlKind, cfg: DbConfig, base_sql: []const u8 };
+const SplitCtx = struct {
+    gpa: std.mem.Allocator,
+    kind: SqlKind,
+    cfg: DbConfig,
+    base_sql: []const u8,
+    proj_select: ?[]const u8 = null, // pushed projection (comma-joined cols), null → SELECT *
+    where_extra: ?[]const u8 = null, // pushed filter predicate AND-ed onto the key range, or null
+};
 
 fn connectSql(gpa: std.mem.Allocator, kind: SqlKind, cfg: DbConfig) !sql.Conn {
     return switch (kind) {
@@ -214,7 +221,9 @@ fn connectSql(gpa: std.mem.Allocator, kind: SqlKind, cfg: DbConfig) !sql.Conn {
 /// `parallel.OpenSplitFn`: open a fresh source for one split predicate.
 fn openSplitSource(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, pred: []const u8) anyerror!driver.Source {
     const ctx: *SplitCtx = @ptrCast(@alignCast(ctx_ptr));
-    const q = try splitmod.wrap(gpa, ctx.base_sql, pred);
+    // Pushdown (when planned): fetch only the projected columns, and AND the translated
+    // filter onto this lane's key range so the server drops rows before sending them.
+    const q = try splitmod.wrapProjected(gpa, ctx.base_sql, ctx.proj_select, pred, ctx.where_extra);
     defer gpa.free(q); // the cursor sends the query during open; we don't retain it
     return openSqlQuery(ctx, gpa, q);
 }
@@ -225,6 +234,26 @@ fn openSqlQuery(ctx: *const SplitCtx, gpa: std.mem.Allocator, query: []const u8)
     errdefer conn.close(); // queryCursor leaves conn open on error (the caller owns it)
     const s = try sql.Source.open(gpa, conn, query);
     return s.source();
+}
+
+/// Rebuild a map-only `filter`/`select` chain against the projected source schema and
+/// return its linearized stages for `parallel.run` — so projecting fewer columns at the
+/// source keeps each `project` op's column indices in step. Returns null (caller keeps
+/// the full chain) if anything doesn't fit: a non-filter/select stage, or an analyze
+/// hitch. The throwaway scan is only a chain anchor; `linearize` drops it and the stages
+/// apply statelessly, so it's never read.
+fn rebuildMapStages(env: *Env, middle: []const ast.Stage, proj_schema: *const types.Schema) ?[]const op.Stage {
+    for (middle) |st| switch (st.node) {
+        .filter, .select => {},
+        else => return null, // buildMapChain only knows filter/select
+    };
+    const ob = env.arena.create(OneBatch) catch return null;
+    ob.* = .{ .b = null, .sch = proj_schema.* };
+    const scan = env.arena.create(op.Scan) catch return null;
+    scan.* = .{ .src = ob.source() };
+    const chain = buildMapChain(env.arena, env.params_expr, middle, scan, proj_schema) catch return null;
+    const lin = (op.linearize(env.arena, chain) catch return null) orelse return null;
+    return lin.stages;
 }
 
 /// Resolved config for a per-lane StarRocks sink (DDL already done once at plan
@@ -654,18 +683,40 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
                 // res.schema's column names live in the source cursor's arena, so dupe
                 // them into the run arena first — the sinks use the schema all run.
                 const schema = try dupeSchema(arena, res.schema);
+
+                // Pushdown: narrow each lane's query to the columns the stages reference
+                // (projection) and the leading filters they apply (predicate). Read the
+                // source columns before closing the planning source. Projection rebuilds
+                // the stage chain against the narrowed schema so its column indices line
+                // up; on any hitch it falls back to the full chain + `SELECT *`.
+                const middle = stages[1 .. stages.len - 1];
+                var lane_stages = lin.stages;
+                var proj_select: ?[]const u8 = null;
+                var where_extra: ?[]const u8 = null;
+                if (stages[0].node == .read) {
+                    const src_schema = try dupeSchema(arena, env.sources.items[src_base].schema());
+                    const mp = try pushdown.planMap(arena, env.sql_desc.?.dialect, src_schema, middle);
+                    where_extra = mp.where_extra;
+                    if (mp.proj_schema) |ps| {
+                        if (rebuildMapStages(env, middle, try schemaPtr(arena, ps))) |rs| {
+                            lane_stages = rs;
+                            proj_select = mp.proj_select;
+                        }
+                    }
+                }
+
                 for (env.sources.items[src_base..]) |sc| sc.close();
                 env.sources.shrinkRetainingCapacity(src_base);
-                var ctx = SplitCtx{ .gpa = gpa, .kind = env.sql_desc.?.kind, .cfg = env.sql_desc.?.cfg, .base_sql = env.sql_desc.?.base_sql };
+                var ctx = SplitCtx{ .gpa = gpa, .kind = env.sql_desc.?.kind, .cfg = env.sql_desc.?.cfg, .base_sql = env.sql_desc.?.base_sql, .proj_select = proj_select, .where_extra = where_extra };
                 lanes_used.* = @max(lanes_used.*, @min(opts.threads, sp.predicates.len));
-                env.log.log(.info, "split-parallel: {d} splits over {d} lanes on key range", .{ sp.predicates.len, @min(opts.threads, sp.predicates.len) });
+                env.log.log(.info, "split-parallel: {d} splits over {d} lanes on key range (projection: {s}, filter pushdown: {s})", .{ sp.predicates.len, @min(opts.threads, sp.predicates.len), proj_select orelse "all", if (where_extra != null) "yes" else "no" });
                 if (try buildParallelSink(env, wr, schema)) |mode| {
-                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lin.stages, mode, opts.threads, env.rows_read);
+                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, mode, opts.threads, env.rows_read);
                 } else {
                     const snk = try openSink(env, wr, schema);
                     var snk_open = true;
                     errdefer if (snk_open) snk.abort(); // failed run: discard the tail buffer, don't commit it
-                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lin.stages, .{ .shared = snk }, opts.threads, env.rows_read);
+                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, .{ .shared = snk }, opts.threads, env.rows_read);
                     snk_open = false;
                     try snk.close();
                 }
