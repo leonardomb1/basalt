@@ -695,10 +695,14 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
                 var where_extra: ?[]const u8 = null;
                 if (stages[0].node == .read) {
                     const src_schema = try dupeSchema(arena, env.sources.items[src_base].schema());
-                    const mp = try pushdown.planMap(arena, env.sql_desc.?.dialect, src_schema, middle);
+                    const out_cols = try arena.alloc([]const u8, schema.fields.len);
+                    for (schema.fields, out_cols) |f, *o| o.* = f.name;
+                    const mp = try pushdown.planMap(arena, env.sql_desc.?.dialect, src_schema, middle, out_cols);
                     where_extra = mp.where_extra;
                     if (mp.proj_schema) |ps| {
-                        if (rebuildMapStages(env, middle, try schemaPtr(arena, ps))) |rs| {
+                        // Rebuild from the dead-item-pruned stages so no surviving select
+                        // references a projected-away column.
+                        if (rebuildMapStages(env, mp.stages orelse middle, try schemaPtr(arena, ps))) |rs| {
                             lane_stages = rs;
                             proj_select = mp.proj_select;
                         }
@@ -2709,11 +2713,22 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
     }
     const canon = try unionCanon(env, specs, schemas, canon_opt);
 
+    // Forward only the split hints (`split`/`splits`/`split_kind`) from the union onto
+    // each branch read, so `@[split = col]` fans every branch into key-range lanes (the
+    // recursive runOutput's split path reads them). tag/canon/where/etc. stay union-level
+    // — `where` is already baked into each branch read's SQL by unionSpecs.
+    var split_hints = std.array_list.Managed(ast.Hint).init(arena);
+    for (hints) |h| {
+        if (std.mem.eql(u8, h.key, "split") or std.mem.eql(u8, h.key, "splits") or std.mem.eql(u8, h.key, "split_kind"))
+            try split_hints.append(h);
+    }
+    const branch_hints = try split_hints.toOwnedSlice();
+
     const w = write_stage.node.write;
     for (specs, schemas, 0..) |s, sch, i| {
         const items = try synthReconcile(arena, sch, canon, tag_col, s.tag);
         var bstages = std.array_list.Managed(ast.Stage).init(arena);
-        try bstages.append(.{ .node = .{ .read = s.read }, .hints = &.{}, .pos = u.pos });
+        try bstages.append(.{ .node = .{ .read = s.read }, .hints = branch_hints, .pos = u.pos });
         try bstages.append(.{ .node = .{ .select = items }, .hints = &.{}, .pos = u.pos });
         try bstages.appendSlice(downstream);
         const bmode: ast.WriteMode = if (i == 0 or w.mode != .overwrite) w.mode else .append;

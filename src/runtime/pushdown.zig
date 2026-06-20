@@ -84,16 +84,24 @@ pub const MapPlan = struct {
     proj_select: ?[]const u8 = null,
     proj_schema: ?types.Schema = null,
     where_extra: ?[]const u8 = null,
+    /// The middle stages with dead `select` items removed, so the rebuilt chain doesn't
+    /// reference a projected-away column. Set only alongside `proj_schema`; the caller
+    /// rebuilds from these instead of the originals. Null → projection not applied.
+    stages: ?[]const ast.Stage = null,
 };
 
-/// Plan pushdown for a map-only split read. Only the FILTERS before the first non-filter
-/// stage are source-attributable (a later filter sees a select's renamed/computed output,
-/// not source columns), so only those become a WHERE. Projection applies when the prefix
-/// is `(filter)* select?` with an explicit-column select (no `*`/`* rename`, no explode):
-/// then the lane fetches just the columns the filters and the select reference. The caller
-/// rebuilds its stage chain against `proj_schema` so the (now narrower) column indices line
-/// up. Anything else → no projection, and the caller keeps its full stage chain.
-pub fn planMap(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, middle: []const ast.Stage) !MapPlan {
+/// Plan pushdown for a map-only split read. `out_cols` is the pipeline's final output
+/// column set (what the sink receives). Only the FILTERS before the first non-filter stage
+/// are source-attributable (a later filter sees a select's renamed output), so only those
+/// become a WHERE. Projection is computed by a backward liveness pass: start from the
+/// output columns, and walk the stages in reverse — a `select` maps each live output back
+/// to the source columns its item reads, a `filter` adds its predicate's columns. What
+/// survives to the source is the minimal column set to fetch. This traces a union branch's
+/// `select(reconcile) | … | select id, recno` all the way back, so only the columns that
+/// reach the sink cross the wire. A `*`/`* rename`/explode stage makes liveness imprecise,
+/// so projection is dropped (the caller keeps the full `SELECT *` chain). The caller
+/// rebuilds its stage chain against `proj_schema` so the narrower indices line up.
+pub fn planMap(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, middle: []const ast.Stage, out_cols: []const []const u8) !MapPlan {
     var plan = MapPlan{};
 
     var nf: usize = middle.len; // index of the first non-filter stage
@@ -112,21 +120,55 @@ pub fn planMap(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Sch
     }
     if (where.items.len > 0) plan.where_extra = try where.toOwnedSlice();
 
-    // projection: leading-filter columns + an optional single explicit-column select
-    var need = std.StringHashMap(void).init(arena);
-    defer need.deinit();
-    for (leading) |st| try collectFields(st.node.filter, &need);
-    const rest = middle[nf..];
-    var proj_ok = rest.len == 1 and rest[0].node == .select;
-    if (proj_ok) for (rest[0].node.select) |item| switch (item) {
-        .field => |q| try need.put(q.parts[0], {}),
-        .computed => |c| try collectFields(c.expr, &need),
-        else => proj_ok = false, // star / star_except / star_rename → can't narrow safely
-    };
+    // projection: backward liveness from the output columns to the source columns, with
+    // dead-item elimination — each select keeps only the items still live downstream, so a
+    // wide reconcile narrows to what the final `select` actually emits. (`arena`-backed
+    // maps; intermediates are reclaimed with the arena, not deinit'd.)
+    var live = std.StringHashMap(void).init(arena);
+    for (out_cols) |c| try live.put(c, {});
+    var pruned_rev = std.array_list.Managed(ast.Stage).init(arena);
+    var proj_ok = true;
+    var i = middle.len;
+    while (i > 0 and proj_ok) {
+        i -= 1;
+        const st = middle[i];
+        switch (st.node) {
+            // A filter keeps the schema and reads its predicate's columns.
+            .filter => |pred| {
+                try collectFields(pred, &live);
+                try pruned_rev.append(st);
+            },
+            // A select redefines the schema: keep each item whose output is still live,
+            // make that item's source reads live, and drop the rest.
+            .select => |items| {
+                var kept = std.array_list.Managed(ast.SelectItem).init(arena);
+                var nl = std.StringHashMap(void).init(arena);
+                for (items) |item| switch (item) {
+                    .field => |q| if (live.contains(q.last())) {
+                        try kept.append(item);
+                        try nl.put(q.parts[0], {});
+                    },
+                    .computed => |c| if (live.contains(c.name)) {
+                        try kept.append(item);
+                        try collectFields(c.expr, &nl);
+                    },
+                    else => proj_ok = false, // star family: can't attribute precisely
+                };
+                try pruned_rev.append(.{ .node = .{ .select = try kept.toOwnedSlice() }, .hints = st.hints, .pos = st.pos });
+                live = nl;
+            },
+            else => proj_ok = false,
+        }
+    }
     if (proj_ok) {
-        const p = try buildProjection(arena, dialect, src_schema, &need);
-        plan.proj_select = p.sel;
-        plan.proj_schema = p.schema;
+        const p = try buildProjection(arena, dialect, src_schema, &live);
+        if (p.schema != null) {
+            plan.proj_select = p.sel;
+            plan.proj_schema = p.schema;
+            const pruned = try arena.alloc(ast.Stage, pruned_rev.items.len);
+            for (pruned_rev.items, 0..) |st, k| pruned[pruned_rev.items.len - 1 - k] = st; // reverse to source→sink
+            plan.stages = pruned;
+        }
     }
 
     return plan;
@@ -349,6 +391,100 @@ test "planAgg: projects only referenced columns and pushes the filter" {
     try testing.expectEqualStrings("[a], [b], [c]", plan.proj_select.?); // d dropped
     try testing.expectEqual(@as(usize, 3), plan.proj_schema.?.fields.len);
     try testing.expectEqualStrings("([a] >= 5)", plan.where_extra.?);
+}
+
+fn fieldItem(arena: std.mem.Allocator, name: []const u8) !ast.SelectItem {
+    const parts = try arena.alloc([]const u8, 1);
+    parts[0] = name;
+    return .{ .field = .{ .parts = parts } };
+}
+
+fn selectStage(arena: std.mem.Allocator, items: []const ast.SelectItem) ast.Stage {
+    _ = arena;
+    return .{ .node = .{ .select = items }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
+}
+
+fn schema4() types.Schema {
+    const I = types.Type.init(.int);
+    const S = types.Type.init(.string);
+    return .{ .fields = &.{
+        .{ .name = "a", .ty = I }, .{ .name = "b", .ty = S }, .{ .name = "c", .ty = I }, .{ .name = "d", .ty = I },
+    } };
+}
+
+test "planMap: a downstream select narrows a wide reconcile (dead items pruned)" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // reconcile passes a,b,c,d; a downstream select narrows to c,a (the output cols).
+    const recon = try a.alloc(ast.SelectItem, 4);
+    recon[0] = try fieldItem(a, "a");
+    recon[1] = try fieldItem(a, "b");
+    recon[2] = try fieldItem(a, "c");
+    recon[3] = try fieldItem(a, "d");
+    const down = try a.alloc(ast.SelectItem, 2);
+    down[0] = try fieldItem(a, "c");
+    down[1] = try fieldItem(a, "a");
+    const middle = [_]ast.Stage{ selectStage(a, recon), selectStage(a, down) };
+    const out_cols = [_][]const u8{ "c", "a" };
+
+    const plan = try planMap(a, .postgres, schema4(), &middle, &out_cols);
+    try testing.expectEqualStrings("\"a\", \"c\"", plan.proj_select.?); // b, d dropped (never reach the sink)
+    try testing.expectEqual(@as(usize, 2), plan.proj_schema.?.fields.len);
+    // the reconcile stage was pruned to its two live items.
+    try testing.expectEqual(@as(usize, 2), plan.stages.?[0].node.select.len);
+}
+
+test "planMap: a downstream filter through the reconcile keeps its column live" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // reconcile(a,b,c,d) | filter c > 1 | select b  → output b, but c stays live for the filter.
+    const recon = try a.alloc(ast.SelectItem, 4);
+    recon[0] = try fieldItem(a, "a");
+    recon[1] = try fieldItem(a, "b");
+    recon[2] = try fieldItem(a, "c");
+    recon[3] = try fieldItem(a, "d");
+    const litc = try a.create(ast.Expr);
+    litc.* = .{ .int_lit = 1 };
+    const fc = ast.Stage{ .node = .{ .filter = try bin(a, .gt, try fld(a, "c"), litc) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
+    const down = try a.alloc(ast.SelectItem, 1);
+    down[0] = try fieldItem(a, "b");
+    const middle = [_]ast.Stage{ selectStage(a, recon), fc, selectStage(a, down) };
+    const out_cols = [_][]const u8{"b"};
+
+    const plan = try planMap(a, .mysql, schema4(), &middle, &out_cols);
+    try testing.expect(plan.where_extra == null); // the filter is after the reconcile → not a leading filter
+    try testing.expectEqualStrings("`b`, `c`", plan.proj_select.?); // b (output) + c (filter); a, d dropped
+}
+
+test "planMap: a leading filter is pushed as a predicate" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const lit0 = try a.create(ast.Expr);
+    lit0.* = .{ .int_lit = 0 };
+    const filt = ast.Stage{ .node = .{ .filter = try bin(a, .gt, try fld(a, "a"), lit0) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
+    const down = try a.alloc(ast.SelectItem, 1);
+    down[0] = try fieldItem(a, "a");
+    const middle = [_]ast.Stage{ filt, selectStage(a, down) };
+    const out_cols = [_][]const u8{"a"};
+
+    const plan = try planMap(a, .mysql, schema4(), &middle, &out_cols);
+    try testing.expectEqualStrings("(`a` > 0)", plan.where_extra.?);
+    try testing.expectEqualStrings("`a`", plan.proj_select.?); // only a reaches the sink / filter
+}
+
+test "planMap: a star select disables projection" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const items = try a.alloc(ast.SelectItem, 1);
+    items[0] = .star;
+    const middle = [_]ast.Stage{selectStage(a, items)};
+    const out_cols = [_][]const u8{ "a", "b" };
+    const plan = try planMap(a, .postgres, testSchema(), &middle, &out_cols);
+    try testing.expect(plan.proj_select == null);
 }
 
 test "planAgg: a select in the prefix disables projection (filter still pushed)" {
