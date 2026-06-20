@@ -25,6 +25,7 @@ const aad = @import("../connect/aad.zig");
 const splitmod = @import("../connect/split.zig");
 const parallel = @import("parallel.zig");
 const analyze = @import("analyze.zig");
+const pushdown = @import("pushdown.zig");
 const obs = @import("obs.zig");
 const valuemod = @import("../exec/value.zig");
 
@@ -215,9 +216,14 @@ fn openSplitSource(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, pred: []const u8
     const ctx: *SplitCtx = @ptrCast(@alignCast(ctx_ptr));
     const q = try splitmod.wrap(gpa, ctx.base_sql, pred);
     defer gpa.free(q); // the cursor sends the query during open; we don't retain it
+    return openSqlQuery(ctx, gpa, q);
+}
+
+/// Open a SQL source for a ready-built lane query (one connection per call).
+fn openSqlQuery(ctx: *const SplitCtx, gpa: std.mem.Allocator, query: []const u8) anyerror!driver.Source {
     const conn = try connectSql(gpa, ctx.kind, ctx.cfg);
     errdefer conn.close(); // queryCursor leaves conn open on error (the caller owns it)
-    const s = try sql.Source.open(gpa, conn, q);
+    const s = try sql.Source.open(gpa, conn, query);
     return s.source();
 }
 
@@ -1001,7 +1007,9 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
 const SqlAggCtx = struct {
     split: SplitCtx,
     predicates: []const []const u8,
-    src_schema: *const types.Schema, // raw SQL source columns (the lane scans' schema)
+    proj_select: ?[]const u8, // pushed projection (comma-joined cols), null → SELECT *
+    where_extra: ?[]const u8, // pushed filter predicate AND-ed onto the key range, or null
+    src_schema: *const types.Schema, // SQL columns the lane scans (projected when pushdown applies)
     agg_in_schema: *const types.Schema, // schema after the prefix (the aggregate's input)
     out_schema: *const types.Schema,
     prefix: []const ast.Stage,
@@ -1039,9 +1047,11 @@ fn sqlAggWorkOne(ctx: *SqlAggCtx, i: usize) !void {
     defer warena.deinit(); // freed after the merge copies what survives into plan_arena
     const wa = warena.allocator();
 
-    // One DB connection per lane, scanning this lane's key range. The cursor owns its
-    // connection, so close the source after the fold to release it.
-    const src = try openSplitSource(&ctx.split, wgpa.allocator(), ctx.predicates[i]);
+    // One DB connection per lane, scanning this lane's key range — narrowed to the
+    // projected columns and pushed-down filter when planning found them. The cursor
+    // owns its connection, so close the source after the fold to release it.
+    const q = try splitmod.wrapProjected(wa, ctx.split.base_sql, ctx.proj_select, ctx.predicates[i], ctx.where_extra);
+    const src = try openSqlQuery(&ctx.split, wgpa.allocator(), q);
     defer src.close();
 
     var cs = obs.CountingSource{ .inner = src, .count = ctx.rows_read };
@@ -1084,9 +1094,17 @@ fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.S
     // into the plan arena now (the planning source is closed once we commit below).
     const src_schema = try schemaPtr(arena, try dupeSchema(arena, env.sources.items[src_base].schema()));
 
+    // Pushdown: narrow each lane's query to the columns the aggregate consumes
+    // (projection) and the filters it can translate (predicate). `eff` is the schema the
+    // lanes actually scan — the projected subset when projection applies, else the full
+    // source. The filter ops are kept regardless, so a pushed predicate only has to be a
+    // superset; untranslatable parts simply aren't pushed.
+    const pd = try pushdown.planAgg(arena, desc.dialect, src_schema.*, prefix, ag);
+    const eff = if (pd.proj_schema) |ps| try schemaPtr(arena, ps) else src_schema;
+
     // Validate the prefix serially (proper errors) → the aggregate's input schema; lanes
     // rebuild the identical prefix on their own arenas.
-    const agg_in = try schemaPtr(arena, try mapChainSchema(env, prefix, src_schema.*));
+    const agg_in = try schemaPtr(arena, try mapChainSchema(env, prefix, eff.*));
 
     var ad = analyze.Diag{};
     const apl = analyze.aggregatePlan(arena, agg_in.*, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
@@ -1110,7 +1128,9 @@ fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.S
     var ctx = SqlAggCtx{
         .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql },
         .predicates = sp.predicates,
-        .src_schema = src_schema,
+        .proj_select = pd.proj_select,
+        .where_extra = pd.where_extra,
+        .src_schema = eff,
         .agg_in_schema = agg_in,
         .out_schema = out_schema,
         .prefix = prefix,
@@ -1130,7 +1150,13 @@ fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.S
     }
     if (spawned == 0) sqlAggWorker(&ctx) else for (threads[0..spawned]) |t| t.join();
     lanes_used.* = @max(lanes_used.*, @max(spawned, 1));
-    env.log.log(.info, "parallel sql aggregate: {d} splits over {d} lanes on key range", .{ sp.predicates.len, @max(spawned, 1) });
+    env.log.log(.info, "parallel sql aggregate: {d} splits over {d} lanes on key range (projection: {d}/{d} cols, filter pushdown: {s})", .{
+        sp.predicates.len,
+        @max(spawned, 1),
+        if (pd.proj_schema) |ps| ps.fields.len else src_schema.fields.len,
+        src_schema.fields.len,
+        if (pd.where_extra != null) "yes" else "no",
+    });
 
     if (ctx.first_err) |e| return e;
 
