@@ -49,7 +49,19 @@ pub const Plan = struct {
 /// `SELECT * FROM (<base>) _split WHERE <pred>` — uniform whether `base` came from
 /// a `table T` (`SELECT * FROM T`) or an explicit `query`.
 pub fn wrap(arena: std.mem.Allocator, base: []const u8, pred: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "SELECT * FROM ({s}) _split WHERE {s}", .{ base, pred });
+    return wrapProjected(arena, base, null, pred, null);
+}
+
+/// `wrap` with pushdown: `SELECT <proj or *> FROM (<base>) _split WHERE <pred> [AND
+/// (<extra>)]`. `proj` is a ready comma-joined column list (null → `*`); `extra` is a
+/// translated filter predicate AND-ed onto the key-range `pred` (null → none). Both
+/// reference base columns, all in scope inside the subquery regardless of the
+/// projection list — so a pushed filter may test a column the projection drops.
+pub fn wrapProjected(arena: std.mem.Allocator, base: []const u8, proj: ?[]const u8, pred: []const u8, extra: ?[]const u8) ![]const u8 {
+    const sel = proj orelse "*";
+    if (extra) |x|
+        return std.fmt.allocPrint(arena, "SELECT {s} FROM ({s}) _split WHERE {s} AND ({s})", .{ sel, base, pred, x });
+    return std.fmt.allocPrint(arena, "SELECT {s} FROM ({s}) _split WHERE {s}", .{ sel, base, pred });
 }
 
 // ---------------------------------------------------------------------------
@@ -353,7 +365,7 @@ fn uuidAt(arena: std.mem.Allocator, k: usize, m: usize) ![]const u8 {
     });
 }
 
-fn quoteIdent(arena: std.mem.Allocator, dialect: Dialect, name: []const u8) ![]const u8 {
+pub fn quoteIdent(arena: std.mem.Allocator, dialect: Dialect, name: []const u8) ![]const u8 {
     return switch (dialect) {
         .postgres => std.fmt.allocPrint(arena, "\"{s}\"", .{name}),
         .mysql => std.fmt.allocPrint(arena, "`{s}`", .{name}),
