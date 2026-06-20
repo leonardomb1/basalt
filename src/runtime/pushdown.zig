@@ -61,22 +61,9 @@ pub fn planAgg(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Sch
         for (prefix) |st| if (st.node == .filter) try collectFields(st.node.filter, &need);
         for (ag.by) |q| try need.put(q.parts[0], {});
         for (ag.aggs) |a| if (a.arg) |arg| try collectFields(arg, &need);
-
-        // Emit the projection in source-schema order (deterministic, and matches the
-        // order the engine expects columns in). Only worthwhile when it actually drops
-        // columns — all-columns or no-columns falls back to `*`.
-        var sel = std.array_list.Managed(u8).init(arena);
-        var fields = std.array_list.Managed(types.Schema.Field).init(arena);
-        for (src_schema.fields) |f| {
-            if (!need.contains(f.name)) continue;
-            if (sel.items.len > 0) try sel.appendSlice(", ");
-            try sel.appendSlice(try splitmod.quoteIdent(arena, dialect, f.name));
-            try fields.append(f);
-        }
-        if (fields.items.len > 0 and fields.items.len < src_schema.fields.len) {
-            plan.proj_select = try sel.toOwnedSlice();
-            plan.proj_schema = .{ .fields = try fields.toOwnedSlice() };
-        }
+        const p = try buildProjection(arena, dialect, src_schema, &need);
+        plan.proj_select = p.sel;
+        plan.proj_schema = p.schema;
     }
 
     // --- predicate: translate each prefix filter; AND the pushable ones ---
@@ -90,6 +77,78 @@ pub fn planAgg(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Sch
     if (where.items.len > 0) plan.where_extra = try where.toOwnedSlice();
 
     return plan;
+}
+
+/// The result of map-only pushdown planning (`read … | (filter|select|…) | write`).
+pub const MapPlan = struct {
+    proj_select: ?[]const u8 = null,
+    proj_schema: ?types.Schema = null,
+    where_extra: ?[]const u8 = null,
+};
+
+/// Plan pushdown for a map-only split read. Only the FILTERS before the first non-filter
+/// stage are source-attributable (a later filter sees a select's renamed/computed output,
+/// not source columns), so only those become a WHERE. Projection applies when the prefix
+/// is `(filter)* select?` with an explicit-column select (no `*`/`* rename`, no explode):
+/// then the lane fetches just the columns the filters and the select reference. The caller
+/// rebuilds its stage chain against `proj_schema` so the (now narrower) column indices line
+/// up. Anything else → no projection, and the caller keeps its full stage chain.
+pub fn planMap(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, middle: []const ast.Stage) !MapPlan {
+    var plan = MapPlan{};
+
+    var nf: usize = middle.len; // index of the first non-filter stage
+    for (middle, 0..) |st, i| if (st.node != .filter) {
+        nf = i;
+        break;
+    };
+    const leading = middle[0..nf];
+
+    // predicate: the leading filters reference source columns directly
+    var where = std.array_list.Managed(u8).init(arena);
+    for (leading) |st| {
+        const frag = (try translatePred(arena, st.node.filter, dialect, src_schema)) orelse continue;
+        if (where.items.len > 0) try where.appendSlice(" AND ");
+        try where.appendSlice(frag);
+    }
+    if (where.items.len > 0) plan.where_extra = try where.toOwnedSlice();
+
+    // projection: leading-filter columns + an optional single explicit-column select
+    var need = std.StringHashMap(void).init(arena);
+    defer need.deinit();
+    for (leading) |st| try collectFields(st.node.filter, &need);
+    const rest = middle[nf..];
+    var proj_ok = rest.len == 1 and rest[0].node == .select;
+    if (proj_ok) for (rest[0].node.select) |item| switch (item) {
+        .field => |q| try need.put(q.parts[0], {}),
+        .computed => |c| try collectFields(c.expr, &need),
+        else => proj_ok = false, // star / star_except / star_rename → can't narrow safely
+    };
+    if (proj_ok) {
+        const p = try buildProjection(arena, dialect, src_schema, &need);
+        plan.proj_select = p.sel;
+        plan.proj_schema = p.schema;
+    }
+
+    return plan;
+}
+
+const Projection = struct { sel: ?[]const u8 = null, schema: ?types.Schema = null };
+
+/// Build a `SELECT` list + matching schema for the source columns in `need`, in
+/// source-schema order (deterministic, and the order the engine expects). Null when it
+/// wouldn't drop anything (all or no columns) — the caller then scans `SELECT *`.
+fn buildProjection(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, need: *std.StringHashMap(void)) !Projection {
+    var sel = std.array_list.Managed(u8).init(arena);
+    var fields = std.array_list.Managed(types.Schema.Field).init(arena);
+    for (src_schema.fields) |f| {
+        if (!need.contains(f.name)) continue;
+        if (sel.items.len > 0) try sel.appendSlice(", ");
+        try sel.appendSlice(try splitmod.quoteIdent(arena, dialect, f.name));
+        try fields.append(f);
+    }
+    if (fields.items.len > 0 and fields.items.len < src_schema.fields.len)
+        return .{ .sel = try sel.toOwnedSlice(), .schema = .{ .fields = try fields.toOwnedSlice() } };
+    return .{};
 }
 
 /// Translate a filter predicate to an equivalent SQL boolean expression, or null if
