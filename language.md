@@ -49,18 +49,16 @@ description shown in the `basalt serve` startup banner.
 ```
 param since   timestamp                      # typed scalar, required
 param limit   int = 1000                      # typed scalar with a default
-param region  string from query               # bound from ?region=...
-param token   string from header              # bound from a request header
-param job     json from body                  # whole JSON body, navigated by path
+param job     json                            # whole JSON request body, navigated by path
 ```
 
 - Types: `bool int float string bytes date time timestamp decimal(p,s)`.
-- `from query | body | header` chooses the binding source (for `@http`). Without
-  `from`, a `@batch` param comes from `-p key=value` on the CLI.
-- `param x json from body` is special: `x` is a **JSON document**, not a scalar.
-  Navigate it with dotted paths in expressions — `x.source.host`, `x.n` — which are
-  resolved to literals at plan time (`expand.zig`). An unbound path (offline `check`)
-  resolves to `null`.
+- Scalar params bind by name: from `-p key=value` on the CLI (`@batch`), or from the
+  query string (`@http`).
+- `param x json` is special: `x` is the request body as a **JSON document**, not a
+  scalar. Navigate it with dotted paths in expressions — `x.source.host`, `x.n` —
+  which are resolved to literals at plan time (`expand.zig`). An unbound path
+  (offline `check`) resolves to `null`.
 - A JSON param is also the canonical **`for` fan-out source** (§8): `for t in job.tables`.
 
 ---
@@ -127,7 +125,7 @@ read mssql query "select id, total from orders where total > 0"
 |--------|---------|
 | `read <conn> table <qualified.name>` | read a whole table |
 | `read <conn> query "<SQL>"` | read a raw SQL query (no dialect translation) |
-| `read csv "<path-or-https-url>"` | read a CSV file or HTTPS CSV |
+| `read csv "<path-or-https-url>"` | read a CSV file or HTTPS CSV; column types inferred from the first 1024 rows (int → float → string; quoted cells and leading-zero numbers stay text, empty cells are null) |
 | `read http "<url>"` / `read <httpconn> request` | read a REST/JSON source (§9) |
 | `union ...` | reconcile + concatenate many tables (§6) |
 | `<binding-name>` | use a `let` binding as the source |
@@ -143,7 +141,7 @@ read mssql query "select id, total from orders where total > 0"
 | `distinct` | `distinct` or `distinct on a, b` | dedup |
 | `limit` | `limit 100` or `limit 100 offset 20` | row cap |
 | `explode` | `explode tags as tag on ","` | one row per element (`as`/`on` optional) |
-| `join` | `join <binding> on left.k = right.k` | kinds: `inner left right full semi anti cross` (`cross` takes no `on`) |
+| `join` | `join <binding> on left.k = right.k` | kinds: `inner left semi anti` |
 
 **`select` item forms:**
 - `*` — all columns
@@ -257,7 +255,7 @@ schema authority.
 ## 7. Hints — `@[...]`
 
 Any stage (and the `for` header) may carry a trailing `@[key, key = value, ...]`.
-Values are flags (bare key), strings, ints, idents, or sizes (`100mb`). Recognized:
+Values are flags (bare key), strings, ints, or idents. Recognized:
 
 | hint | where | meaning |
 |------|-------|---------|
@@ -341,9 +339,6 @@ A `${ ... }` placeholder has two body shapes:
   "crm_${lower(name)}"                                   # case-fold with a function
   key = "${coalesce(pk, "default")}"
   ```
-  > The `${var:lower}` / `${var:upper}` modifier syntax is **deprecated** — it still
-  > resolves but prints a deprecation warning; use the `lower(...)` / `upper(...)`
-  > functions instead.
   All built-in scalar functions (§5) are available. **Interpolation is C#-style**: a
   `${...}` hole inside a `"..."` string is scanned brace-balanced and string-aware, so
   nested string literals inside the hole need **no escaping** — write `"${concat(a, "b")}"`,
