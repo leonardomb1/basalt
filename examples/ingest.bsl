@@ -1,8 +1,8 @@
 @http(path = "/ingest")
 
 connection sr = starrocks
-  fe_host = "10.140.0.7" fe_port = 9030
-  be_url = "http://10.140.0.10:8040"
+  fe_host = "10.0.0.7" fe_port = 9030
+  be_url = "http://10.0.0.10:8040"
   user = env("SR_USER") password = secret("SR_PASS")
   database = "test"
 
