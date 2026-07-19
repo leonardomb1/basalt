@@ -38,6 +38,7 @@ pub const Conn = struct {
 
     pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sqlmod.TlsMode) !*Conn {
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
+        driver.tuneSocket(stream.handle);
         const self = try gpa.create(Conn);
         self.* = .{ .gpa = gpa, .stream = stream, .payload = std.array_list.Managed(u8).init(gpa) };
         self.sr = std.net.Stream.Reader.init(stream, &self.read_buf);
@@ -347,16 +348,19 @@ pub const Conn = struct {
     }
 
     /// Send CopyDone ('c') and drain to ReadyForQuery, surfacing any error.
-    pub fn copyDone(self: *Conn) !void {
+    /// Returns the server's row count from the "COPY <n>" CommandComplete tag.
+    pub fn copyDone(self: *Conn) !u64 {
         try self.writeMsg('c', "");
+        var count: ?u64 = null;
         while (true) {
             switch (try self.readMsg()) {
+                'C' => count = parseCopyCount(self.payload.items),
                 'E' => {
                     self.last_error = try self.gpa.dupe(u8, errMessage(self.payload.items));
                     return error.PgQueryFailed;
                 },
-                'Z' => return,
-                else => {}, // CommandComplete, etc.
+                'Z' => return count orelse error.PgProtocol,
+                else => {},
             }
         }
     }
@@ -550,6 +554,74 @@ test "SCRAM-SHA-256 proof and server signature match the RFC 7677 vector" {
     try std.testing.expectEqualStrings("6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=", enc.encode(&b64, &sig));
 }
 
+test "pgType maps OIDs; numeric typmod carries precision and scale" {
+    try std.testing.expectEqual(types.TypeKind.bool, pgType(16, -1).kind);
+    try std.testing.expectEqual(types.TypeKind.int, pgType(20, -1).kind); // int8
+    try std.testing.expectEqual(types.TypeKind.int, pgType(23, -1).kind); // int4
+    try std.testing.expectEqual(types.TypeKind.float, pgType(701, -1).kind); // float8
+    try std.testing.expectEqual(types.TypeKind.date, pgType(1082, -1).kind);
+    try std.testing.expectEqual(types.TypeKind.timestamp, pgType(1184, -1).kind); // timestamptz
+    try std.testing.expectEqual(types.TypeKind.string, pgType(25, -1).kind); // text -> string
+    try std.testing.expect(pgType(23, -1).nullable); // wire types are always nullable
+
+    // NUMERIC(10,2): typmod = (precision << 16 | scale) + 4
+    const d = pgType(1700, (10 << 16 | 2) + 4);
+    try std.testing.expectEqual(types.TypeKind.decimal, d.kind);
+    try std.testing.expectEqual(@as(u8, 10), d.precision);
+    try std.testing.expectEqual(@as(u8, 2), d.scale);
+    // unconstrained NUMERIC (typmod -1) falls back to (38,6)
+    const u = pgType(1700, -1);
+    try std.testing.expectEqual(@as(u8, 38), u.precision);
+    try std.testing.expectEqual(@as(u8, 6), u.scale);
+}
+
+test "ErrorResponse extraction picks the M field" {
+    // (type byte, cstr) pairs: severity, code, then message
+    const payload = "SFATAL\x00C28P01\x00Mpassword authentication failed\x00\x00";
+    try std.testing.expectEqualStrings("password authentication failed", errMessage(payload));
+    // no M field -> stable fallback
+    try std.testing.expectEqualStrings("postgres error", errMessage("SERROR\x00\x00"));
+}
+
+test "scramAttr finds comma-separated attributes exactly" {
+    const server_first = "r=abcdef,s=c2FsdA==,i=4096";
+    try std.testing.expectEqualStrings("abcdef", scramAttr(server_first, 'r').?);
+    try std.testing.expectEqualStrings("c2FsdA==", scramAttr(server_first, 's').?);
+    try std.testing.expectEqualStrings("4096", scramAttr(server_first, 'i').?);
+    try std.testing.expect(scramAttr(server_first, 'v') == null);
+    // value containing '=' (base64 padding) is returned whole
+    try std.testing.expect(scramAttr("x=,r=a", 'x').?.len == 0);
+}
+
+test "parseRowDescription decodes names, OIDs, and column order" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // 2 columns: id (int4, oid 23) and name (text, oid 25); big-endian fields
+    var p = std.array_list.Managed(u8).init(a);
+    try p.appendSlice(&.{ 0, 2 }); // column count
+    try appendCStr(&p, "id");
+    try p.appendSlice(&.{ 0, 0, 0, 0 }); // table oid
+    try p.appendSlice(&.{ 0, 0 }); // attr number
+    try p.appendSlice(&.{ 0, 0, 0, 23 }); // type oid int4
+    try p.appendSlice(&.{ 0, 4 }); // type size
+    try p.appendSlice(&.{ 0xFF, 0xFF, 0xFF, 0xFF }); // typmod -1
+    try p.appendSlice(&.{ 0, 0 }); // format code
+    try appendCStr(&p, "name");
+    try p.appendSlice(&.{ 0, 0, 0, 0, 0, 0 });
+    try p.appendSlice(&.{ 0, 0, 0, 25 }); // text
+    try p.appendSlice(&.{ 0xFF, 0xFF });
+    try p.appendSlice(&.{ 0xFF, 0xFF, 0xFF, 0xFF });
+    try p.appendSlice(&.{ 0, 0 });
+
+    const rd = try parseRowDescription(a, p.items);
+    try std.testing.expectEqual(@as(usize, 2), rd.cols.len);
+    try std.testing.expectEqualStrings("id", rd.cols[0].name);
+    try std.testing.expectEqual(types.TypeKind.int, rd.cols[0].engine_type.kind);
+    try std.testing.expectEqualStrings("name", rd.fields[1].name);
+    try std.testing.expectEqual(types.TypeKind.string, rd.fields[1].ty.kind);
+}
+
 fn appendCStr(list: *std.array_list.Managed(u8), s: []const u8) !void {
     try list.appendSlice(s);
     try list.append(0);
@@ -584,23 +656,38 @@ fn readCStr(p: []const u8, i: *usize) []const u8 {
 // sink (a COPY-to-staging + ON CONFLICT path is the follow-up).
 // ---------------------------------------------------------------------------
 
-const COPY_FLUSH_BYTES = 1 << 20; // ~1MB per CopyData chunk
+/// CommandComplete tag for COPY: "COPY <n>". Null on any other tag shape.
+fn parseCopyCount(p: []const u8) ?u64 {
+    const tag = std.mem.sliceTo(p, 0);
+    if (!std.mem.startsWith(u8, tag, "COPY ")) return null;
+    return std.fmt.parseInt(u64, tag["COPY ".len..], 10) catch null;
+}
+
+test "parseCopyCount: COPY tag, other tags, junk" {
+    try std.testing.expectEqual(@as(?u64, 42), parseCopyCount("COPY 42\x00"));
+    try std.testing.expectEqual(@as(?u64, 0), parseCopyCount("COPY 0"));
+    try std.testing.expectEqual(@as(?u64, null), parseCopyCount("INSERT 0 5\x00"));
+    try std.testing.expectEqual(@as(?u64, null), parseCopyCount("COPY x"));
+}
 
 pub const CopySink = struct {
     gpa: std.mem.Allocator,
     conn: *Conn,
     table: []const u8, // quoted, qualified
     ncols: usize,
-    buffer: std.array_list.Managed(u8),
+    buffer: std.array_list.Managed(u8), // current segment's encoded rows (replay unit)
+    copy_cmd: []const u8, // gpa-owned; issued once per segment
+    seg_rows: u64 = 0,
+    redial: ?sqlmod.Redial = null,
 
-    pub fn open(gpa: std.mem.Allocator, conn: *Conn, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode) !*CopySink {
+    pub fn open(gpa: std.mem.Allocator, conn: *Conn, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?sqlmod.Redial) !*CopySink {
         // On error we free only what we allocate here; the caller keeps `conn`
         // (so it can read conn.last_error) and closes it on failure.
         const self = try gpa.create(CopySink);
         errdefer gpa.destroy(self);
         const qtable = try sqlmod.quoteIdent(gpa, .postgres, table_name);
         errdefer gpa.free(qtable);
-        self.* = .{ .gpa = gpa, .conn = conn, .table = qtable, .ncols = schema.fields.len, .buffer = std.array_list.Managed(u8).init(gpa) };
+        self.* = .{ .gpa = gpa, .conn = conn, .table = qtable, .ncols = schema.fields.len, .buffer = std.array_list.Managed(u8).init(gpa), .copy_cmd = "", .redial = redial };
         errdefer self.buffer.deinit();
 
         var aa = std.heap.ArenaAllocator.init(gpa);
@@ -609,13 +696,13 @@ pub const CopySink = struct {
         try conn.exec(try sqlmod.createTableSql(a, .postgres, qtable, schema, mode));
         if (mode == .overwrite) try conn.exec(try std.fmt.allocPrint(a, "DELETE FROM {s}", .{qtable}));
 
-        // COPY <table> ("c1","c2",…) FROM STDIN  (default text format)
+        // COPY <table> ("c1","c2",…) FROM STDIN — issued once per segment.
         var cols = std.array_list.Managed(u8).init(a);
         for (schema.fields, 0..) |f, i| {
             if (i > 0) try cols.append(',');
             try cols.appendSlice(try sqlmod.quoteIdent(a, .postgres, f.name));
         }
-        try conn.copyIn(try std.fmt.allocPrint(a, "COPY {s} ({s}) FROM STDIN", .{ qtable, cols.items }));
+        self.copy_cmd = try std.fmt.allocPrint(gpa, "COPY {s} ({s}) FROM STDIN", .{ qtable, cols.items });
         return self;
     }
 
@@ -625,21 +712,48 @@ pub const CopySink = struct {
 
     fn writeBatch(self: *CopySink, arena: std.mem.Allocator, batch: Batch) !void {
         try sqlmod.appendBulkText(self.buffer.writer(), arena, batch, .{}); // PG: bool t/f
-        if (self.buffer.items.len >= COPY_FLUSH_BYTES) try self.flush();
+        self.seg_rows += batch.len;
+        if (self.buffer.items.len >= sqlmod.SEGMENT_BYTES) try self.commitSegment();
     }
 
-    fn flush(self: *CopySink) !void {
-        if (self.buffer.items.len == 0) return;
-        try self.conn.copyData(self.buffer.items);
+    /// Transmit the buffered segment as one COPY statement and verify the
+    /// server's "COPY n" count. A transient network failure redials once and
+    /// resends the intact segment: a COPY that dies mid-statement rolls back
+    /// server-side, so the replay cannot duplicate. (The one unavoidable window:
+    /// if the connection dies AFTER the server committed but before its reply
+    /// arrived, the replay double-writes — same tradeoff as the INSERT sink.)
+    fn commitSegment(self: *CopySink) !void {
+        if (self.seg_rows == 0) return;
+        self.sendSegment() catch |e| {
+            const rd = self.redial orelse return e;
+            if (!driver.transientNet(e)) return e;
+            const fresh = try rd.dial(rd.ctx, self.gpa);
+            self.conn.close();
+            // The redial ctx is built for this driver kind, so the vtable ptr is
+            // always a *postgres.Conn.
+            self.conn = @ptrCast(@alignCast(fresh.ptr));
+            try self.sendSegment();
+        };
         self.buffer.clearRetainingCapacity();
+        self.seg_rows = 0;
+    }
+
+    fn sendSegment(self: *CopySink) !void {
+        try self.conn.copyIn(self.copy_cmd);
+        try self.conn.copyData(self.buffer.items);
+        const n = try self.conn.copyDone();
+        if (n != self.seg_rows) {
+            if (self.conn.last_error.len == 0)
+                self.conn.last_error = try std.fmt.allocPrint(self.gpa, "COPY count mismatch: sent {d} rows, server loaded {d}", .{ self.seg_rows, n });
+            return error.BulkCountMismatch;
+        }
     }
 
     fn closeImpl(self: *CopySink) !void {
-        // Release everything even if the final flush/CopyDone fails — otherwise
-        // a failed COPY on close leaks the connection, buffer and sink.
+        // Release everything even if the final segment fails — otherwise a
+        // failed COPY on close leaks the connection, buffer and sink.
         defer self.teardown();
-        try self.flush();
-        try self.conn.copyDone();
+        try self.commitSegment();
     }
 
     /// Failure path: drop the buffer and close the socket mid-COPY. The server
@@ -651,6 +765,7 @@ pub const CopySink = struct {
     fn teardown(self: *CopySink) void {
         self.conn.close();
         self.buffer.deinit();
+        if (self.copy_cmd.len > 0) self.gpa.free(self.copy_cmd);
         self.gpa.free(self.table);
         self.gpa.destroy(self);
     }
