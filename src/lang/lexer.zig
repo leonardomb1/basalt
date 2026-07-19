@@ -1,6 +1,6 @@
 //! Hand-written lexer. Skips whitespace (incl. newlines) and `#` line comments,
 //! then emits one token at a time. Numbers split a trailing unit suffix into a
-//! separate ident (so `100mb` lexes as int(100) + ident(mb) for the hint parser).
+//! separate ident (so `100mb` lexes as int(100) + ident(mb)).
 
 const std = @import("std");
 const tok = @import("token.zig");
@@ -405,6 +405,64 @@ test "interpolation hole with a literal prefix is one string token" {
     defer alloc.free(toks);
     try std.testing.expectEqual(Tag.string, toks[2].tag);
     try std.testing.expectEqualStrings("crm_${lower(name)}", toks[2].text);
+}
+
+test "lex safe-nav and fat-arrow" {
+    const alloc = std.testing.allocator;
+    const toks = try tokenize(alloc, "a?.b => c");
+    defer alloc.free(toks);
+    const expect = [_]Tag{ .ident, .qdot, .ident, .fat_arrow, .ident, .eof };
+    try std.testing.expectEqual(expect.len, toks.len);
+    for (expect, toks) |e, t| try std.testing.expectEqual(e, t.tag);
+}
+
+test "lone `?` and `!` are invalid tokens" {
+    const alloc = std.testing.allocator;
+    const toks = try tokenize(alloc, "a ? b");
+    defer alloc.free(toks);
+    try std.testing.expectEqual(Tag.invalid, toks[1].tag);
+
+    const toks2 = try tokenize(alloc, "a ! b");
+    defer alloc.free(toks2);
+    try std.testing.expectEqual(Tag.invalid, toks2[1].tag);
+}
+
+test "a dot with no following digit ends the number" {
+    const alloc = std.testing.allocator;
+    // `1.x` must stay int(1) . ident(x) (so `a.b` field paths work); a trailing
+    // `2.` is int(2) followed by a bare dot, not a float.
+    const toks = try tokenize(alloc, "1.x 2.");
+    defer alloc.free(toks);
+    const expect = [_]Tag{ .int, .dot, .ident, .int, .dot, .eof };
+    try std.testing.expectEqual(expect.len, toks.len);
+    for (expect, toks) |e, t| try std.testing.expectEqual(e, t.tag);
+    try std.testing.expectEqualStrings("1", toks[0].text);
+    try std.testing.expectEqualStrings("2", toks[3].text);
+}
+
+test "unterminated and empty interpolation are invalid" {
+    const alloc = std.testing.allocator;
+    const toks = try tokenize(alloc, "${tbl");
+    defer alloc.free(toks);
+    try std.testing.expectEqual(Tag.invalid, toks[0].tag);
+
+    const toks2 = try tokenize(alloc, "${}");
+    defer alloc.free(toks2);
+    try std.testing.expectEqual(Tag.invalid, toks2[0].tag);
+}
+
+test "comments are trivia; line/col positions survive newlines" {
+    const alloc = std.testing.allocator;
+    const toks = try tokenize(alloc, "a # note\n  b");
+    defer alloc.free(toks);
+    // the comment vanishes: just a, b, eof
+    try std.testing.expectEqual(@as(usize, 3), toks.len);
+    try std.testing.expectEqual(@as(u32, 1), toks[0].line);
+    try std.testing.expectEqual(@as(u32, 1), toks[0].col);
+    try std.testing.expectEqual(Tag.ident, toks[1].tag);
+    try std.testing.expectEqualStrings("b", toks[1].text);
+    try std.testing.expectEqual(@as(u32, 2), toks[1].line);
+    try std.testing.expectEqual(@as(u32, 3), toks[1].col);
 }
 
 test "unterminated string is invalid" {

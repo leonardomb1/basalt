@@ -24,10 +24,6 @@ pub const QualName = struct {
     pub fn last(self: QualName) []const u8 {
         return self.parts[self.parts.len - 1];
     }
-    /// Was segment `i` reached via `?.` (safe navigation)? Segment 0 never is.
-    pub fn safeAt(self: QualName, i: usize) bool {
-        return i >= 1 and i - 1 < self.safe.len and self.safe[i - 1];
-    }
 };
 
 // ---------------------------------------------------------------------------
@@ -146,10 +142,7 @@ pub const HintVal = union(enum) {
     str: []const u8,
     int: i64,
     ident: []const u8,
-    size: Size, // `100mb`
 };
-
-pub const Size = struct { n: i64, unit: []const u8 };
 
 // ---------------------------------------------------------------------------
 // Operators / stages
@@ -195,7 +188,7 @@ pub const AggFunc = enum { count, sum, avg, min, max };
 pub const AggItem = struct { name: []const u8, func: AggFunc, arg: ?*Expr };
 pub const Aggregate = struct { aggs: []const AggItem, by: []const QualName };
 
-pub const JoinKind = enum { inner, left, right, full, semi, anti, cross };
+pub const JoinKind = enum { inner, left, semi, anti };
 pub const Join = struct {
     kind: JoinKind,
     binding: []const u8, // right side: a `let` binding referenced by name
@@ -264,13 +257,10 @@ pub const Pipeline = struct { stages: []const Stage, pos: Pos };
 // Top-level declarations
 // ---------------------------------------------------------------------------
 
-pub const ParamSource = enum { query, body, header };
-
 pub const Param = struct {
     name: []const u8,
     ty: types.Type,
     default: ?*Expr,
-    source: ?ParamSource,
     pos: Pos,
     /// `param x json from body`: the value is a JSON document (parsed into a
     /// separate binding namespace, navigated via `x.a.b` paths), not a scalar
@@ -385,4 +375,21 @@ test "rebuildExpr identity copies every field — no silent drop" {
     try std.testing.expect(out.cast.e.* == .is_null);
     try std.testing.expectEqual(Expr.NullTest.is_empty, out.cast.e.is_null.kind); // is_null.kind survived
     try std.testing.expect(out.cast.e.is_null.negated); // .negated survived
+
+    // let v = <casted> in x — exercises let_in.name; concat(x, ...) — call.name/args.
+    const bound = try mkExpr(a, .{ .let_in = .{ .name = "v", .value = casted, .body = x } });
+    const out2 = try Id.r(a, bound);
+    try std.testing.expect(out2.* == .let_in);
+    try std.testing.expectEqualStrings("v", out2.let_in.name); // let_in.name survived
+    try std.testing.expect(out2.let_in.value.* == .cast);
+
+    const args = try a.alloc(*Expr, 2);
+    args[0] = x;
+    args[1] = empty;
+    const call = try mkExpr(a, .{ .call = .{ .name = "concat", .args = args } });
+    const out3 = try Id.r(a, call);
+    try std.testing.expect(out3.* == .call);
+    try std.testing.expectEqualStrings("concat", out3.call.name); // call.name survived
+    try std.testing.expectEqual(@as(usize, 2), out3.call.args.len);
+    try std.testing.expect(out3.call.args[1].* == .is_null);
 }

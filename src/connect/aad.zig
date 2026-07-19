@@ -78,9 +78,9 @@ fn getUserRealm(gpa: std.mem.Allocator, upn: []const u8) !Realm {
 }
 
 fn hostOf(url: []const u8) ?[]const u8 {
-    const s = if (std.mem.indexOf(u8, url, "://")) |i| url[i + 3 ..] else url;
-    const end = std.mem.indexOfAny(u8, s, "/:?") orelse s.len;
-    return if (end == 0) null else s[0..end];
+    const uri = std.Uri.parse(url) catch return null;
+    const h = httpx.uriHost(uri) orelse return null;
+    return if (h.len == 0) null else h;
 }
 
 // --- WS-Trust (ADFS) -------------------------------------------------------
@@ -235,25 +235,8 @@ fn postForToken(gpa: std.mem.Allocator, url: []const u8, body: []const u8) ![]co
 
 // --- small helpers ---------------------------------------------------------
 
-fn appendForm(buf: *std.array_list.Managed(u8), key: []const u8, val: []const u8) !void {
-    try buf.append('&');
-    try buf.appendSlice(key);
-    try buf.append('=');
-    try formEncode(buf, val);
-}
-
-fn formEncode(buf: *std.array_list.Managed(u8), val: []const u8) !void {
-    const hex = "0123456789ABCDEF";
-    for (val) |c| {
-        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
-            try buf.append(c);
-        } else {
-            try buf.append('%');
-            try buf.append(hex[c >> 4]);
-            try buf.append(hex[c & 0xF]);
-        }
-    }
-}
+const appendForm = httpx.appendForm;
+const formEncode = httpx.formEncode;
 
 fn xmlEscape(gpa: std.mem.Allocator, s: []const u8) ![]const u8 {
     var out = std.array_list.Managed(u8).init(gpa);

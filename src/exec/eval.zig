@@ -609,14 +609,14 @@ fn binaryVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecErro
             if (scalarNull(l) or scalarNull(r)) return .{ .scalar = .null };
             const ln = (try asNum(arena, l, batch.len)) orelse return error.Unsupported;
             const rn = (try asNum(arena, r, batch.len)) orelse return error.Unsupported;
-            return arithVec(arena, b.op, ln, rn, batch.len);
+            return numOpVec(arena, b.op, ln, rn, batch.len);
         },
         .eq, .ne, .lt, .le, .gt, .ge => {
             const l = try evalVec(arena, b.l, batch);
             const r = try evalVec(arena, b.r, batch);
             if (scalarNull(l) or scalarNull(r)) return .{ .scalar = .null };
             if (try asNum(arena, l, batch.len)) |ln| {
-                if (try asNum(arena, r, batch.len)) |rn| return cmpNumVec(arena, b.op, ln, rn, batch.len);
+                if (try asNum(arena, r, batch.len)) |rn| return numOpVec(arena, b.op, ln, rn, batch.len);
             }
             if (asStr(l)) |ls| {
                 if (asStr(r)) |rs| return cmpStrVec(arena, b.op, ls, rs, batch.len);
@@ -626,132 +626,82 @@ fn binaryVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecErro
     }
 }
 
-fn arithVec(arena: std.mem.Allocator, op: ast.BinOp, l: Num, r: Num, n: usize) VecError!Vec {
-    const all_valid = allValidNum(l, n) and allValidNum(r, n);
-    if (isIntNum(l) and isIntNum(r)) {
-        const out = try arena.alloc(i64, n);
-        if (all_valid) {
-            switch (op) {
-                .add => for (0..n) |i| {
-                    out[i] = numI(l, i) + numI(r, i);
-                },
-                .sub => for (0..n) |i| {
-                    out[i] = numI(l, i) - numI(r, i);
-                },
-                .mul => for (0..n) |i| {
-                    out[i] = numI(l, i) * numI(r, i);
-                },
-                .div => for (0..n) |i| {
-                    const d = numI(r, i);
-                    if (d == 0) return error.DivByZero;
-                    out[i] = @divTrunc(numI(l, i), d);
-                },
-                .mod => for (0..n) |i| {
-                    const d = numI(r, i);
-                    if (d == 0) return error.DivByZero;
-                    out[i] = @rem(numI(l, i), d);
-                },
-                else => unreachable,
-            }
-            return mkCol(Type.init(.int), n, try Bitmap.initFull(arena, n), .{ .i64 = out });
-        }
-        var bm = try Bitmap.initFull(arena, n);
-        var any: bool = false;
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            if (!numValid(l, i) or !numValid(r, i)) {
-                out[i] = 0;
-                bm.setValid(i, false);
-                any = true;
-                continue;
-            }
-            const a = numI(l, i);
-            const d = numI(r, i);
-            out[i] = switch (op) {
-                .add => a + d,
-                .sub => a - d,
-                .mul => a * d,
-                .div => if (d == 0) return error.DivByZero else @divTrunc(a, d),
-                .mod => if (d == 0) return error.DivByZero else @rem(a, d),
-                else => unreachable,
-            };
-        }
-        return mkCol(Type.init(.int).withNull(any), n, bm, .{ .i64 = out });
+/// Vectorized arithmetic/comparison over two numeric operands: dispatches the
+/// runtime op and int-vs-float lane type to a comptime-specialized kernel
+/// (`numOpVecT`), keeping each op's inner loop free of per-row branching —
+/// the same codegen shape as the previous hand-unrolled per-op loops.
+fn numOpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Num, r: Num, n: usize) VecError!Vec {
+    const int_lane = isIntNum(l) and isIntNum(r);
+    switch (op) {
+        inline .add, .sub, .mul, .div, .mod, .eq, .ne, .lt, .le, .gt, .ge => |cop| {
+            return if (int_lane)
+                numOpVecT(i64, cop, arena, l, r, n)
+            else
+                numOpVecT(f64, cop, arena, l, r, n);
+        },
+        else => unreachable,
     }
-    // float path
-    const out = try arena.alloc(f64, n);
-    if (all_valid) {
-        switch (op) {
-            .add => for (0..n) |i| {
-                out[i] = numF(l, i) + numF(r, i);
-            },
-            .sub => for (0..n) |i| {
-                out[i] = numF(l, i) - numF(r, i);
-            },
-            .mul => for (0..n) |i| {
-                out[i] = numF(l, i) * numF(r, i);
-            },
-            .div => for (0..n) |i| {
-                out[i] = numF(l, i) / numF(r, i);
-            },
-            .mod => for (0..n) |i| {
-                out[i] = @mod(numF(l, i), numF(r, i));
-            },
-            else => unreachable,
-        }
-        return mkCol(Type.init(.float), n, try Bitmap.initFull(arena, n), .{ .f64 = out });
-    }
-    var bm = try Bitmap.initFull(arena, n);
-    var any: bool = false;
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        if (!numValid(l, i) or !numValid(r, i)) {
-            out[i] = 0;
-            bm.setValid(i, false);
-            any = true;
-            continue;
-        }
-        const a = numF(l, i);
-        const d = numF(r, i);
-        out[i] = switch (op) {
-            .add => a + d,
-            .sub => a - d,
-            .mul => a * d,
-            .div => a / d,
-            .mod => @mod(a, d),
-            else => unreachable,
-        };
-    }
-    return mkCol(Type.init(.float).withNull(any), n, bm, .{ .f64 = out });
 }
 
-fn cmpNumVec(arena: std.mem.Allocator, op: ast.BinOp, l: Num, r: Num, n: usize) VecError!Vec {
-    const out = try arena.alloc(bool, n);
-    const both_int = isIntNum(l) and isIntNum(r);
+/// Shared valid/nullable template behind `numOpVec`: apply `op` elementwise
+/// over two numeric operands widened to comptime `T`. All-valid inputs skip
+/// the per-row validity checks; otherwise null-in → null-out with the evicted
+/// slot zero-filled (builder convention).
+fn numOpVecT(comptime T: type, comptime op: ast.BinOp, arena: std.mem.Allocator, l: Num, r: Num, n: usize) VecError!Vec {
+    const Out = OpOut(T, op);
+    const ty = Type.init(if (Out == bool) .bool else if (T == i64) .int else .float);
+    const out = try arena.alloc(Out, n);
     if (allValidNum(l, n) and allValidNum(r, n)) {
-        if (both_int) {
-            for (0..n) |i| out[i] = cmpResult(op, std.math.order(numI(l, i), numI(r, i)));
-        } else {
-            for (0..n) |i| out[i] = cmpResult(op, std.math.order(numF(l, i), numF(r, i)));
-        }
-        return mkCol(Type.init(.bool), n, try Bitmap.initFull(arena, n), .{ .b = out });
+        for (0..n) |i| out[i] = try applyOp(T, op, numAt(T, l, i), numAt(T, r, i));
+        return mkCol(ty, n, try Bitmap.initFull(arena, n), outData(Out, out));
     }
     var bm = try Bitmap.initFull(arena, n);
     var any: bool = false;
     var i: usize = 0;
     while (i < n) : (i += 1) {
         if (!numValid(l, i) or !numValid(r, i)) {
-            out[i] = false;
+            out[i] = if (Out == bool) false else 0;
             bm.setValid(i, false);
             any = true;
             continue;
         }
-        out[i] = if (both_int)
-            cmpResult(op, std.math.order(numI(l, i), numI(r, i)))
-        else
-            cmpResult(op, std.math.order(numF(l, i), numF(r, i)));
+        out[i] = try applyOp(T, op, numAt(T, l, i), numAt(T, r, i));
     }
-    return mkCol(Type.init(.bool).withNull(any), n, bm, .{ .b = out });
+    return mkCol(ty.withNull(any), n, bm, outData(Out, out));
+}
+
+/// Result element type of `applyOp`: comparisons yield `bool`, arithmetic the
+/// operand type.
+fn OpOut(comptime T: type, comptime op: ast.BinOp) type {
+    return switch (op) {
+        .eq, .ne, .lt, .le, .gt, .ge => bool,
+        else => T,
+    };
+}
+
+/// One elementwise binary op over already-valid operands widened to `T` (i64
+/// or f64). Int div/mod raise on a zero divisor; float div/mod follow float
+/// semantics (`/`, `@mod`) — both matching the rowwise evaluator.
+inline fn applyOp(comptime T: type, comptime op: ast.BinOp, a: T, d: T) VecError!OpOut(T, op) {
+    return switch (op) {
+        .add => a + d,
+        .sub => a - d,
+        .mul => a * d,
+        .div => if (T == i64)
+            (if (d == 0) error.DivByZero else @divTrunc(a, d))
+        else
+            a / d,
+        .mod => if (T == i64)
+            (if (d == 0) error.DivByZero else @rem(a, d))
+        else
+            @mod(a, d),
+        .eq, .ne, .lt, .le, .gt, .ge => cmpResult(op, std.math.order(a, d)),
+        else => unreachable,
+    };
+}
+
+inline fn outData(comptime Out: type, out: []Out) Column.Data {
+    return if (Out == bool) .{ .b = out } else if (Out == i64) .{ .i64 = out } else .{ .f64 = out };
 }
 
 fn cmpStrVec(arena: std.mem.Allocator, op: ast.BinOp, l: Str, r: Str, n: usize) VecError!Vec {
@@ -1054,6 +1004,10 @@ inline fn numF(x: Num, i: usize) f64 {
         .iscalar => |s| @floatFromInt(s),
         .fscalar => |s| s,
     };
+}
+/// `numI`/`numF` selected by comptime lane type (folds to a direct call).
+inline fn numAt(comptime T: type, x: Num, i: usize) T {
+    return if (T == i64) numI(x, i) else numF(x, i);
 }
 inline fn numValid(x: Num, i: usize) bool {
     return switch (x) {
@@ -1825,4 +1779,96 @@ test "type errors: unknown field and non-bool not" {
     var ctx = TypeCtx{ .schema = schema, .arena = a };
     try std.testing.expectError(error.TypeError, ctx.typeOf(pred));
     try std.testing.expect(std.mem.indexOf(u8, ctx.msg, "unknown field") != null);
+
+    // `not` over an int column must be rejected too (with its own message).
+    var fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
+    var notx = ast.Expr{ .unary = .{ .op = .not, .e = &fx } };
+    try std.testing.expectError(error.TypeError, ctx.typeOf(&notx));
+    try std.testing.expect(std.mem.indexOf(u8, ctx.msg, "bool operand") != null);
+}
+
+test "castValue: conversions succeed and failures are CastFailed specifically" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    try std.testing.expectEqual(@as(i64, 42), (try castValue(a, .{ .string = " 42 " }, .int)).int);
+    try std.testing.expectEqual(@as(i64, 1), (try castValue(a, .{ .bool = true }, .int)).int);
+    try std.testing.expectEqual(@as(i64, -3), (try castValue(a, .{ .float = -3.9 }, .int)).int); // truncates toward zero
+    try std.testing.expectEqual(@as(f64, 2.5), (try castValue(a, .{ .string = "2.5" }, .float)).float);
+    try std.testing.expect((try castValue(a, .{ .string = " TRUE " }, .bool)).bool);
+    try std.testing.expect(!(try castValue(a, .{ .int = 0 }, .bool)).bool);
+    try std.testing.expectEqualStrings("123.45", (try castValue(a, .{ .decimal = .{ .unscaled = 12345, .scale = 2 } }, .string)).string);
+
+    // Which error matters: all of these are CastFailed, never TypeMismatch/panic.
+    try std.testing.expectError(error.CastFailed, castValue(a, .{ .string = "abc" }, .int));
+    try std.testing.expectError(error.CastFailed, castValue(a, .{ .float = std.math.nan(f64) }, .int));
+    try std.testing.expectError(error.CastFailed, castValue(a, .{ .float = 1e19 }, .int)); // beyond i64 range
+    try std.testing.expectError(error.CastFailed, castValue(a, .{ .string = "yes" }, .bool));
+    try std.testing.expectError(error.CastFailed, castValue(a, .{ .bool = true }, .float));
+}
+
+test "formatDecimal pads sub-unit magnitudes, zero, and negatives" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("-0.005", try formatDecimal(a, -5, 3));
+    try std.testing.expectEqualStrings("0", try formatDecimal(a, 0, 0));
+    try std.testing.expectEqualStrings("0.00", try formatDecimal(a, 0, 2));
+    try std.testing.expectEqualStrings("7", try formatDecimal(a, 7, 0));
+}
+
+test "int division/modulo by zero raise DivByZero; float division yields inf" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const schema = types.Schema{ .fields = &.{.{ .name = "x", .ty = Type.init(.int).asNullable() }} };
+    const x = try column.intColumn(a, &.{ 6, null });
+    var cols = [_]column.Column{x};
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 2 };
+
+    var fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
+    var zero = ast.Expr{ .int_lit = 0 };
+    var div = ast.Expr{ .binary = .{ .op = .div, .l = &fx, .r = &zero } };
+    var mod = ast.Expr{ .binary = .{ .op = .mod, .l = &fx, .r = &zero } };
+    // Both the vectorized (whole-column) and rowwise paths must raise, not fall back.
+    try std.testing.expectError(error.DivByZero, evalColumn(a, &div, batch, Type.init(.int).asNullable()));
+    try std.testing.expectError(error.DivByZero, evalRow(a, &div, batch, 0));
+    try std.testing.expectError(error.DivByZero, evalRow(a, &mod, batch, 0));
+
+    // Float lanes follow IEEE: 6 / 0.0 is inf, and null still propagates.
+    var fzero = ast.Expr{ .float_lit = 0.0 };
+    var fdiv = ast.Expr{ .binary = .{ .op = .div, .l = &fx, .r = &fzero } };
+    const out = try evalColumn(a, &fdiv, batch, Type.init(.float).asNullable());
+    try std.testing.expect(std.math.isInf(out.getValue(0).float));
+    try std.testing.expect(out.getValue(1).isNull());
+}
+
+test "compareValues orders across numeric kinds and rejects mixed kinds" {
+    try std.testing.expectEqual(std.math.Order.lt, compareValues(.{ .int = 1 }, .{ .float = 1.5 }).?);
+    try std.testing.expectEqual(std.math.Order.eq, compareValues(.{ .float = 2.0 }, .{ .int = 2 }).?);
+    try std.testing.expectEqual(std.math.Order.gt, compareValues(.{ .decimal = .{ .unscaled = 250, .scale = 2 } }, .{ .int = 2 }).?);
+    try std.testing.expectEqual(std.math.Order.lt, compareValues(.{ .string = "a" }, .{ .string = "b" }).?);
+    try std.testing.expectEqual(std.math.Order.lt, compareValues(.{ .bool = false }, .{ .bool = true }).?);
+    try std.testing.expect(compareValues(.{ .string = "1" }, .{ .int = 1 }) == null);
+    try std.testing.expect(compareValues(.{ .bool = true }, .{ .int = 1 }) == null);
+    try std.testing.expect(compareValues(.{ .date = 1 }, .{ .timestamp = 1 }) == null);
+}
+
+test "evalColumn over an empty batch yields an empty column" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const schema = types.Schema{ .fields = &.{.{ .name = "x", .ty = Type.init(.int) }} };
+    const x = try column.intColumn(a, &.{});
+    var cols = [_]column.Column{x};
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 0 };
+
+    var fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
+    var one = ast.Expr{ .int_lit = 1 };
+    var plus = ast.Expr{ .binary = .{ .op = .add, .l = &fx, .r = &one } };
+    const out = try evalColumn(a, &plus, batch, Type.init(.int));
+    try std.testing.expectEqual(@as(usize, 0), out.len);
 }

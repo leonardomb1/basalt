@@ -287,10 +287,14 @@ pub const AuthState = struct {
     }
 };
 
-fn appendForm(buf: *std.array_list.Managed(u8), key: []const u8, val: []const u8) !void {
+pub fn appendForm(buf: *std.array_list.Managed(u8), key: []const u8, val: []const u8) !void {
     try buf.append('&');
     try buf.appendSlice(key);
     try buf.append('=');
+    try formEncode(buf, val);
+}
+
+pub fn formEncode(buf: *std.array_list.Managed(u8), val: []const u8) !void {
     const hex = "0123456789ABCDEF";
     for (val) |c| {
         if (formUnreserved(c)) {
@@ -830,34 +834,18 @@ pub const HttpSource = struct {
         self.pages_issued += 1;
     }
 
-    /// Build + spawn the next page's slot. Page strings are built directly in
-    /// the slot's own arena — building them in the run arena would grow it by
-    /// ~2x url bytes per page for the life of the run.
+    /// Build + spawn the next page's slot. Page strings are built in a scratch
+    /// arena (freed on return) and duped into the slot's own arena by
+    /// spawnFetch — building them in the run arena would grow it by ~2x url
+    /// bytes per page for the life of the run.
     fn spawnSlot(self: *HttpSource) !*Slot {
-        const slot = try self.gpa.create(Slot);
-        slot.* = .{
-            .gpa = self.gpa,
-            .snap = std.heap.ArenaAllocator.init(self.gpa),
-            .client = self.client,
-            .method_post = self.opts.method == .post,
-            .content_type = self.contentType(),
-            .url = undefined,
-            .gen = self.auth_gen,
-            .retries = self.opts.retries,
-            .retry_base_ms = self.opts.retry_base_ms,
-        };
-        errdefer freeSlot(slot); // safe: fires only before the thread exists
-        const sa = slot.snap.allocator();
-        const req = try self.pageReq(sa);
-        slot.url = req.url; // page/offset urls are allocated by pageReq in sa
-        if (req.body) |b| slot.req_body = try sa.dupe(u8, b);
-        try self.snapshotInto(slot);
-        var th = try std.Thread.spawn(.{}, workerMain, .{slot});
-        th.detach();
-        return slot;
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        const req = try self.pageReq(scratch.allocator());
+        return self.spawnFetch(req, self.opts.retries);
     }
 
-    /// Same, for an explicit request (the sequential timed path).
+    /// Spawn a slot for an explicit request (also the sequential timed path).
     fn spawnFetch(self: *HttpSource, req: PageReq, retries: i64) !*Slot {
         const slot = try self.gpa.create(Slot);
         slot.* = .{
@@ -1902,4 +1890,74 @@ fn serve404Once(listener: *std.net.Server) void {
     var rb: [2048]u8 = undefined;
     _ = conn.stream.read(&rb) catch return;
     conn.stream.writeAll("HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n") catch return;
+}
+
+test "statusError names each status family distinctly" {
+    try std.testing.expectEqual(error.HttpBadRequest, statusError(400));
+    try std.testing.expectEqual(error.HttpUnauthorized, statusError(401));
+    try std.testing.expectEqual(error.HttpForbidden, statusError(403));
+    try std.testing.expectEqual(error.HttpNotFound, statusError(404));
+    try std.testing.expectEqual(error.HttpRequestFailed, statusError(418));
+    // transient family: 429 and every 5xx map to the retryable name
+    try std.testing.expectEqual(error.HttpServerBusy, statusError(429));
+    try std.testing.expectEqual(error.HttpServerBusy, statusError(500));
+    try std.testing.expectEqual(error.HttpServerBusy, statusError(503));
+}
+
+test "jsonPath walks dotted paths; null and missing are both absent" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const root = try json.parseFromSliceLeaky(json.Value, a,
+        \\{"meta":{"next":"tok","total":3,"gone":null},"data":[1]}
+    , .{});
+    try std.testing.expectEqualStrings("tok", jsonPath(root, "meta.next").?.string);
+    try std.testing.expectEqual(@as(i64, 3), jsonPath(root, "meta.total").?.integer);
+    try std.testing.expect(jsonPath(root, "meta.missing") == null);
+    try std.testing.expect(jsonPath(root, "meta.gone") == null); // JSON null == absent
+    try std.testing.expect(jsonPath(root, "data.next") == null); // array is not an object
+}
+
+test "itemsOf: bare array, dotted path, and named errors" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const arr = try json.parseFromSliceLeaky(json.Value, a, "[{\"id\":1},{\"id\":2}]", .{});
+    try std.testing.expectEqual(@as(usize, 2), (try itemsOf(a, arr, null)).len);
+
+    const wrapped = try json.parseFromSliceLeaky(json.Value, a,
+        \\{"result":{"rows":[{"id":1}]}}
+    , .{});
+    try std.testing.expectEqual(@as(usize, 1), (try itemsOf(a, wrapped, "result.rows")).len);
+    try std.testing.expectError(error.ItemsFieldMissing, itemsOf(a, wrapped, "result.nope"));
+    try std.testing.expectError(error.ItemsFieldNotArray, itemsOf(a, wrapped, "result"));
+
+    // a single object with no path is one row
+    const one = try json.parseFromSliceLeaky(json.Value, a, "{\"id\":9}", .{});
+    try std.testing.expectEqual(@as(usize, 1), (try itemsOf(a, one, null)).len);
+    const scalar = try json.parseFromSliceLeaky(json.Value, a, "5", .{});
+    try std.testing.expectError(error.ExpectedJsonArrayOrObject, itemsOf(a, scalar, null));
+}
+
+test "withParam and appendParam pick the right separator" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("http://x/i?page=2", try withParam(a, "http://x/i", "page", "2"));
+    try std.testing.expectEqualStrings("http://x/i?a=1&page=2", try withParam(a, "http://x/i?a=1", "page", "2"));
+    try std.testing.expectEqualStrings("page=1", try appendParam(a, "", "page", "1"));
+    try std.testing.expectEqualStrings("cmd=get&page=1", try appendParam(a, "cmd=get", "page", "1"));
+}
+
+test "retryDelayNs: exponential base doubling within the +-30% jitter band" {
+    // attempt 1 -> base, attempt 3 -> 4x base; jitter stays within 70..130%.
+    const base_ms: i64 = 100;
+    const a1 = retryDelayNs(base_ms, 1);
+    try std.testing.expect(a1 >= 70 * std.time.ns_per_ms and a1 <= 130 * std.time.ns_per_ms);
+    const a3 = retryDelayNs(base_ms, 3);
+    try std.testing.expect(a3 >= 280 * std.time.ns_per_ms and a3 <= 520 * std.time.ns_per_ms);
+    // the shift is capped, so huge attempt numbers can't overflow into 0
+    const a99 = retryDelayNs(base_ms, 99);
+    try std.testing.expect(a99 >= 4480 * std.time.ns_per_ms and a99 <= 8320 * std.time.ns_per_ms);
 }

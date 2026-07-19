@@ -30,7 +30,3 @@ pub const parallel = @import("runtime/parallel.zig");
 pub const obs = @import("runtime/obs.zig");
 pub const analyze = @import("runtime/analyze.zig");
 pub const cli = @import("cli/cli.zig");
-
-test {
-    @import("std").testing.refAllDeclsRecursive(@This());
-}

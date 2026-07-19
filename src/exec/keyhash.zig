@@ -85,3 +85,68 @@ pub const SingleKeyCtx = struct {
         return valueEq(a, b);
     }
 };
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "equal values hash equal; payload and type tag discriminate" {
+    try testing.expectEqual(hashOne(.{ .int = 42 }), hashOne(.{ .int = 42 }));
+    try testing.expectEqual(hashOne(.{ .string = "abc" }), hashOne(.{ .string = "abc" }));
+    try testing.expectEqual(hashOne(.null), hashOne(.null));
+    try testing.expect(hashOne(.{ .int = 42 }) != hashOne(.{ .int = 43 }));
+    // Same payload bytes under a different tag must not collide by construction:
+    // int 1 vs timestamp 1 (identical i64), null vs int 0.
+    try testing.expect(hashOne(.{ .int = 1 }) != hashOne(.{ .timestamp = 1 }));
+    try testing.expect(hashOne(.null) != hashOne(.{ .int = 0 }));
+    try testing.expect(hashOne(.{ .string = "" }) != hashOne(.null));
+}
+
+test "distinct int keys produce no 64-bit collisions over a dense domain" {
+    var hashes: [512]u64 = undefined;
+    for (&hashes, 0..) |*h, i| h.* = hashOne(.{ .int = @intCast(i) });
+    std.mem.sort(u64, &hashes, {}, std.sort.asc(u64));
+    for (hashes[0 .. hashes.len - 1], hashes[1..]) |a, b| try testing.expect(a != b);
+}
+
+test "valueEq: nulls group together, null never equals a value, mixed types unequal" {
+    try testing.expect(valueEq(.null, .null));
+    try testing.expect(!valueEq(.null, .{ .int = 0 }));
+    try testing.expect(!valueEq(.{ .string = "" }, .null));
+    try testing.expect(valueEq(.{ .string = "a" }, .{ .string = "a" }));
+    try testing.expect(!valueEq(.{ .string = "a" }, .{ .string = "b" }));
+    try testing.expect(valueEq(.{ .float = 2.5 }, .{ .float = 2.5 }));
+    try testing.expect(valueEq(.{ .bool = true }, .{ .bool = true }));
+    // Incomparable types compare unequal (no error): compareValues yields null.
+    try testing.expect(!valueEq(.{ .string = "1" }, .{ .int = 1 }));
+    try testing.expect(!valueEq(.{ .bool = true }, .{ .int = 1 }));
+}
+
+test "MultiKeyCtx: composite equality and order-sensitive hashing" {
+    const ctx = MultiKeyCtx{};
+    const k1 = [_]Value{ .{ .int = 1 }, .{ .string = "x" } };
+    const k2 = [_]Value{ .{ .int = 1 }, .{ .string = "x" } };
+    const k3 = [_]Value{ .{ .string = "x" }, .{ .int = 1 } };
+    try testing.expect(ctx.eql(&k1, &k2));
+    try testing.expectEqual(ctx.hash(&k1), ctx.hash(&k2));
+    try testing.expect(!ctx.eql(&k1, &k3)); // column order matters
+    try testing.expect(ctx.hash(&k1) != ctx.hash(&k3));
+    try testing.expect(!ctx.eql(k1[0..1], &k2)); // prefix != full key
+
+    // Null slots participate in grouping: (null) == (null), (null) != (0).
+    const n1 = [_]Value{.null};
+    const n2 = [_]Value{.null};
+    const z0 = [_]Value{.{ .int = 0 }};
+    try testing.expect(ctx.eql(&n1, &n2));
+    try testing.expectEqual(ctx.hash(&n1), ctx.hash(&n2));
+    try testing.expect(!ctx.eql(&n1, &z0));
+}
+
+test "SingleKeyCtx delegates to hashOne/valueEq" {
+    const ctx = SingleKeyCtx{};
+    try testing.expectEqual(hashOne(.{ .int = 9 }), ctx.hash(.{ .int = 9 }));
+    try testing.expect(ctx.eql(.{ .string = "k" }, .{ .string = "k" }));
+    try testing.expect(!ctx.eql(.{ .string = "k" }, .null));
+}

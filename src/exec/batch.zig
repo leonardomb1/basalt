@@ -36,3 +36,18 @@ test "batch column lookup by name" {
     try std.testing.expectEqual(@as(i64, 10), got.getValue(0).int);
     try std.testing.expect(b.column("missing") == null);
 }
+
+test "zero-row batch still resolves columns" {
+    const alloc = std.testing.allocator;
+    const c = try col.intColumn(alloc, &.{});
+    defer {
+        alloc.free(c.validity.bits);
+        alloc.free(c.data.i64);
+    }
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "id", .ty = types.Type.init(.int) },
+    } };
+    var cols = [_]col.Column{c};
+    const b = Batch{ .schema = &schema, .columns = &cols, .len = 0 };
+    try std.testing.expectEqual(@as(usize, 0), b.column("id").?.len);
+}
