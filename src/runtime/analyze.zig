@@ -190,8 +190,6 @@ pub fn explodePlan(arena: std.mem.Allocator, in: types.Schema, ex: ast.Explode, 
 pub const JoinPlan = struct { lk: usize, rk: usize, schema: types.Schema, emit_right: bool, right_nullable: bool };
 
 pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schema, j: ast.Join, diag: *Diag) Error!JoinPlan {
-    if (j.kind == .right or j.kind == .full or j.kind == .cross)
-        return fail(diag, "this join type is not implemented yet (inner/left/semi/anti supported)", .{});
     const lk = left.indexOf(lastPart(j.left_key)) orelse return fail(diag, "unknown left join key `{s}`", .{lastPart(j.left_key)});
     const rk = right.indexOf(lastPart(j.right_key)) orelse return fail(diag, "unknown right join key `{s}`", .{lastPart(j.right_key)});
     const emit_right = (j.kind == .inner or j.kind == .left);
@@ -757,6 +755,144 @@ fn expectAnalyzeErr(a: std.mem.Allocator, csv_data: []const u8, stage: []const u
     const src = try std.fmt.allocPrint(a, "@batch\nread csv \"{s}\"\n  | {s}\n  | write csv \"/tmp/x.csv\"", .{ in, stage });
     var diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, src), null, &diag));
+}
+
+test "analyze rejects a program with no output pipeline" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parse(a, "@batch\nparam x int = 1");
+    var diag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyze(a, prog, null, &diag));
+    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "no output pipeline") != null);
+}
+
+test "physical plan: a breaker keeps SQL serial; a query read is not split-eligible" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag = Diag{};
+
+    // sort is a breaker → not map-only → not splittable
+    const p1 = try analyze(a, try parse(a,
+        \\@batch
+        \\connection pg = postgres
+        \\  host = "h"  user = "u"  password = "p"  database = "d"
+        \\read pg table orders
+        \\  | sort id
+        \\  | write csv "/tmp/x.csv"
+    ), null, &diag);
+    try std.testing.expect(p1.outputs[0].physical.has_breaker);
+    try std.testing.expect(!p1.outputs[0].physical.splittable);
+
+    // a `query` read has no table to introspect a key from → not split-eligible,
+    // even though the chain is map-only
+    const p2 = try analyze(a, try parse(a,
+        \\@batch
+        \\connection pg = postgres
+        \\  host = "h"  user = "u"  password = "p"  database = "d"
+        \\read pg query "SELECT 1 AS x"
+        \\  | write csv "/tmp/x.csv"
+    ), null, &diag);
+    try std.testing.expect(!p2.outputs[0].physical.has_breaker);
+    try std.testing.expect(!p2.outputs[0].physical.splittable);
+}
+
+fn tfld(a: std.mem.Allocator, name: []const u8) !*ast.Expr {
+    const parts = try a.alloc([]const u8, 1);
+    parts[0] = name;
+    const e = try a.create(ast.Expr);
+    e.* = .{ .field = .{ .parts = parts } };
+    return e;
+}
+
+test "joinPlan: collision suffix `_r`, left-nullability, semi/anti drop the right side" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const I = types.Type.init(.int);
+    const S = types.Type.init(.string);
+    const left = types.Schema{ .fields = &.{ .{ .name = "id", .ty = I }, .{ .name = "code", .ty = S } } };
+    const right = types.Schema{ .fields = &.{ .{ .name = "code", .ty = S }, .{ .name = "label", .ty = S } } };
+    const key = ast.QualName{ .parts = &.{"code"} };
+    var diag = Diag{};
+
+    const inner = try joinPlan(a, left, right, .{ .kind = .inner, .binding = "r", .left_key = key, .right_key = key }, &diag);
+    try std.testing.expectEqual(@as(usize, 1), inner.lk);
+    try std.testing.expectEqual(@as(usize, 0), inner.rk);
+    try std.testing.expectEqual(@as(usize, 4), inner.schema.fields.len);
+    try std.testing.expectEqualStrings("code_r", inner.schema.fields[2].name); // right `code` collides
+    try std.testing.expectEqualStrings("label", inner.schema.fields[3].name);
+    try std.testing.expect(!inner.schema.fields[3].ty.nullable); // inner: right stays non-null
+
+    const lj = try joinPlan(a, left, right, .{ .kind = .left, .binding = "r", .left_key = key, .right_key = key }, &diag);
+    try std.testing.expect(lj.right_nullable);
+    try std.testing.expect(lj.schema.fields[2].ty.nullable and lj.schema.fields[3].ty.nullable);
+    try std.testing.expect(!lj.schema.fields[0].ty.nullable); // left side untouched
+
+    const semi = try joinPlan(a, left, right, .{ .kind = .semi, .binding = "r", .left_key = key, .right_key = key }, &diag);
+    try std.testing.expect(!semi.emit_right);
+    try std.testing.expectEqual(@as(usize, 2), semi.schema.fields.len); // left columns only
+
+    try std.testing.expectError(error.AnalyzeFailed, joinPlan(a, left, right, .{ .kind = .inner, .binding = "r", .left_key = .{ .parts = &.{"nope"} }, .right_key = key }, &diag));
+    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "unknown left join key") != null);
+}
+
+test "aggregatePlan: result types per function and group-key passthrough" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const in = types.Schema{ .fields = &.{
+        .{ .name = "g", .ty = types.Type.init(.string) },
+        .{ .name = "v", .ty = types.Type.init(.int) },
+    } };
+    const by = try a.alloc(ast.QualName, 1);
+    by[0] = .{ .parts = &.{"g"} };
+    const aggs = try a.alloc(ast.AggItem, 4);
+    aggs[0] = .{ .name = "n", .func = .count, .arg = null };
+    aggs[1] = .{ .name = "s", .func = .sum, .arg = try tfld(a, "v") };
+    aggs[2] = .{ .name = "m", .func = .avg, .arg = try tfld(a, "v") };
+    aggs[3] = .{ .name = "lo", .func = .min, .arg = try tfld(a, "g") };
+    var pm = std.StringHashMap(*const ast.Expr).init(a);
+    var diag = Diag{};
+    const plan = try aggregatePlan(a, in, .{ .aggs = aggs, .by = by }, &pm, &diag);
+
+    try std.testing.expectEqual(@as(usize, 1), plan.by.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.by[0]);
+    const f = plan.schema.fields;
+    try std.testing.expectEqual(@as(usize, 5), f.len);
+    try std.testing.expectEqual(types.TypeKind.string, f[0].ty.kind); // g rides through
+    try std.testing.expect(f[1].ty.kind == .int and !f[1].ty.nullable); // count: never null
+    try std.testing.expect(f[2].ty.kind == .int and f[2].ty.nullable); // sum(int) → int?
+    try std.testing.expect(f[3].ty.kind == .float and f[3].ty.nullable); // avg → float?
+    try std.testing.expect(f[4].ty.kind == .string and f[4].ty.nullable); // min(string) → string?
+
+    // unknown group key names the field in the error
+    const bad = try a.alloc(ast.QualName, 1);
+    bad[0] = .{ .parts = &.{"zzz"} };
+    try std.testing.expectError(error.AnalyzeFailed, aggregatePlan(a, in, .{ .aggs = aggs, .by = bad }, &pm, &diag));
+    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "zzz") != null);
+}
+
+test "selectCols: `* except` drops the named columns and keeps source order" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const I = types.Type.init(.int);
+    const in = types.Schema{ .fields = &.{
+        .{ .name = "a", .ty = I },
+        .{ .name = "b", .ty = I },
+        .{ .name = "c", .ty = I },
+    } };
+    var pm = std.StringHashMap(*const ast.Expr).init(a);
+    var diag = Diag{};
+    const items = [_]ast.SelectItem{.{ .star_except = &.{"b"} }};
+    const cols = try selectCols(a, in, &items, &pm, &diag);
+    try std.testing.expectEqual(@as(usize, 2), cols.len);
+    try std.testing.expectEqualStrings("a", cols[0].name);
+    try std.testing.expectEqualStrings("c", cols[1].name);
+    try std.testing.expectEqual(@as(usize, 0), cols[0].source.passthrough);
+    try std.testing.expectEqual(@as(usize, 2), cols[1].source.passthrough); // original index, not 1
 }
 
 test "analyze rejects `* rename` onto a duplicate column name" {

@@ -206,19 +206,7 @@ pub const Parser = struct {
         }
         var default: ?*ast.Expr = null;
         if (self.eat(.assign)) default = try self.parseExpr();
-        var source: ?ast.ParamSource = null;
-        if (self.eatKw("from")) {
-            const sname = try self.expectIdent();
-            source = if (std.mem.eql(u8, sname, "query"))
-                .query
-            else if (std.mem.eql(u8, sname, "body"))
-                .body
-            else if (std.mem.eql(u8, sname, "header"))
-                .header
-            else
-                return self.fail(self.curPos(), "unknown param source `{s}` (expected query, body, or header)", .{sname});
-        }
-        return .{ .name = name, .ty = ty, .default = default, .source = source, .pos = pos, .is_json = is_json };
+        return .{ .name = name, .ty = ty, .default = default, .pos = pos, .is_json = is_json };
     }
 
     fn parseConnection(self: *Parser) Error!ast.Connection {
@@ -587,16 +575,12 @@ pub const Parser = struct {
             kind = k;
         }
         const binding = try self.expectIdent();
-        var left_key: ast.QualName = .{ .parts = &.{} };
-        var right_key: ast.QualName = .{ .parts = &.{} };
-        if (kind != .cross) {
-            try self.expectKw("on");
-            left_key = try self.parseQualName();
-            // accept `=` or `==`
-            if (!self.eat(.assign) and !self.eat(.eq))
-                return self.fail(self.curPos(), "expected `=` in join condition, found {s}", .{self.curTag().describe()});
-            right_key = try self.parseQualName();
-        }
+        try self.expectKw("on");
+        const left_key = try self.parseQualName();
+        // accept `=` or `==`
+        if (!self.eat(.assign) and !self.eat(.eq))
+            return self.fail(self.curPos(), "expected `=` in join condition, found {s}", .{self.curTag().describe()});
+        const right_key = try self.parseQualName();
         return .{ .kind = kind, .binding = binding, .left_key = left_key, .right_key = right_key };
     }
 
@@ -606,11 +590,8 @@ pub const Parser = struct {
         const map = .{
             .{ "inner", ast.JoinKind.inner },
             .{ "left", ast.JoinKind.left },
-            .{ "right", ast.JoinKind.right },
-            .{ "full", ast.JoinKind.full },
             .{ "semi", ast.JoinKind.semi },
             .{ "anti", ast.JoinKind.anti },
-            .{ "cross", ast.JoinKind.cross },
         };
         inline for (map) |m| {
             if (std.mem.eql(u8, t.text, m[0])) return m[1];
@@ -714,9 +695,7 @@ pub const Parser = struct {
             },
             .int => {
                 _ = self.advance();
-                const n = try self.i64Of(t);
-                if (self.at(.ident)) return .{ .size = .{ .n = n, .unit = self.advance().text } };
-                return .{ .int = n };
+                return .{ .int = try self.i64Of(t) };
             },
             .ident, .interp => {
                 _ = self.advance();
@@ -1090,11 +1069,11 @@ test "typed loop vars, ?. safe-nav, and let-in parse into the right AST" {
     try std.testing.expect(fe.var_types[0] == null);
     try std.testing.expectEqual(types.TypeKind.int, fe.var_types[1].?.kind);
     const sel = fe.body[0].output.stages[1].node.select;
-    // host = job.source?.host  -> safe[2] (before `host`) is true
+    // host = job.source?.host  -> safe[1] (the separator before `host`) is true
     const hq = sel[0].computed.expr.field;
     try std.testing.expectEqual(@as(usize, 3), hq.parts.len);
-    try std.testing.expect(hq.safeAt(2));
-    try std.testing.expect(!hq.safeAt(1));
+    try std.testing.expect(hq.safe[1]); // separator before `host` was `?.`
+    try std.testing.expect(!hq.safe[0]);
     // v = let a = port in a + 1
     try std.testing.expect(sel[1].computed.expr.* == .let_in);
     try std.testing.expectEqualStrings("a", sel[1].computed.expr.let_in.name);
@@ -1112,7 +1091,7 @@ test "parse a batch ETL script" {
         \\  read mssql query "select id, total from orders where updated_at > :since"
         \\  | filter total > 0
         \\  | select id, amount = total
-        \\recent | write sr stream_load orders upsert on id @[format = csv, batch_bytes = 100mb]
+        \\recent | write sr stream_load orders upsert on id @[format = csv, batch_bytes = 4096]
     ;
     const prog = try parseTest(ar.allocator(), src);
     try std.testing.expectEqual(@as(usize, 5), prog.stmts.len);
@@ -1153,6 +1132,12 @@ test "parse precedence and conditionals" {
     try std.testing.expectEqual(ast.BinOp.@"and", pred.binary.op);
     // left of `and` is a comparison `>`
     try std.testing.expectEqual(ast.BinOp.gt, pred.binary.l.binary.op);
+    // whose left side groups as `a + (b * c)` — `*` binds under `+`
+    const sum = pred.binary.l.binary.l;
+    try std.testing.expect(sum.* == .binary);
+    try std.testing.expectEqual(ast.BinOp.add, sum.binary.op);
+    try std.testing.expect(sum.binary.r.* == .binary);
+    try std.testing.expectEqual(ast.BinOp.mul, sum.binary.r.binary.op);
     // select has two computed items; second is a match with a subject
     const items = stages[2].node.select;
     try std.testing.expectEqual(@as(usize, 2), items.len);
@@ -1203,7 +1188,7 @@ test "for-each over a JSON array param" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const prog = try parseTest(ar.allocator(),
-        "@batch\nparam job json from body\n" ++
+        "@batch\nparam job json\n" ++
         "for name in job.tables @[mode = parallel]\n  read csv \"${name}.csv\" | write stdout");
     const fe = prog.stmts[2].for_each;
     try std.testing.expect(fe.source == .json_path);
@@ -1316,6 +1301,157 @@ test "bare upsert (no `on`) parses to empty keys for PK inference" {
     const w = prog.stmts[1].output.stages[1].node.write;
     try std.testing.expect(w.mode == .upsert);
     try std.testing.expectEqual(@as(usize, 0), w.mode.upsert.keys.len);
+}
+
+test "stage forms: flag hint, * except, explode, limit offset, distinct on, sort" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const src =
+        \\@batch
+        \\read csv "x" @[headers]
+        \\  | select * except (a, b)
+        \\  | explode tags as tag on ","
+        \\  | limit 10 offset 5
+        \\  | distinct on id, name
+        \\  | sort name desc, id
+        \\  | write stdout
+    ;
+    const prog = try parseTest(ar.allocator(), src);
+    const stages = prog.stmts[1].output.stages;
+    // bare hint key -> flag value
+    try std.testing.expectEqualStrings("headers", stages[0].hints[0].key);
+    try std.testing.expect(stages[0].hints[0].value == .flag);
+    const ex = stages[1].node.select[0].star_except;
+    try std.testing.expectEqual(@as(usize, 2), ex.len);
+    try std.testing.expectEqualStrings("a", ex[0]);
+    try std.testing.expectEqualStrings("b", ex[1]);
+    const xp = stages[2].node.explode;
+    try std.testing.expectEqualStrings("tags", xp.field);
+    try std.testing.expectEqualStrings("tag", xp.as_name.?);
+    try std.testing.expectEqualStrings(",", xp.delim.?);
+    const lim = stages[3].node.limit;
+    try std.testing.expectEqual(@as(u64, 10), lim.count);
+    try std.testing.expectEqual(@as(u64, 5), lim.offset);
+    const d = stages[4].node.distinct;
+    try std.testing.expectEqual(@as(usize, 2), d.on.?.len);
+    try std.testing.expectEqualStrings("name", d.on.?[1].last());
+    const so = stages[5].node.sort;
+    try std.testing.expectEqual(@as(usize, 2), so.keys.len);
+    try std.testing.expectEqualStrings("name", so.keys[0].field.last());
+    try std.testing.expect(so.keys[0].desc);
+    try std.testing.expect(!so.keys[1].desc);
+}
+
+test "join kind with `==` condition, and aggregate ... by" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const src =
+        \\@batch
+        \\let dim = read csv "d"
+        \\read csv "x"
+        \\  | join left dim on cust_id == id
+        \\  | aggregate n = count(), total = sum(amount) by region
+        \\  | write stdout
+    ;
+    const prog = try parseTest(ar.allocator(), src);
+    const stages = prog.stmts[2].output.stages;
+    const j = stages[1].node.join;
+    try std.testing.expectEqual(ast.JoinKind.left, j.kind);
+    try std.testing.expectEqualStrings("dim", j.binding);
+    try std.testing.expectEqualStrings("cust_id", j.left_key.last());
+    try std.testing.expectEqualStrings("id", j.right_key.last());
+    const ag = stages[2].node.aggregate;
+    try std.testing.expectEqual(@as(usize, 2), ag.aggs.len);
+    try std.testing.expectEqual(ast.AggFunc.count, ag.aggs[0].func);
+    try std.testing.expect(ag.aggs[0].arg == null); // count() takes no arg
+    try std.testing.expectEqual(ast.AggFunc.sum, ag.aggs[1].func);
+    try std.testing.expect(ag.aggs[1].arg != null);
+    try std.testing.expectEqual(@as(usize, 1), ag.by.len);
+    try std.testing.expectEqualStrings("region", ag.by[0].last());
+}
+
+test "upsert partial cols and cast to decimal(p, s)" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const src =
+        \\@batch
+        \\read sr table t
+        \\  | select id, v2 = cast(v as decimal(18, 2))
+        \\  | write sr stream_load t upsert on id partial cols (v2, u)
+    ;
+    const prog = try parseTest(ar.allocator(), src);
+    const stages = prog.stmts[1].output.stages;
+    const c = stages[1].node.select[1].computed.expr.cast;
+    try std.testing.expectEqual(types.TypeKind.decimal, c.ty.kind);
+    try std.testing.expectEqual(@as(u8, 18), c.ty.precision);
+    try std.testing.expectEqual(@as(u8, 2), c.ty.scale);
+    const up = stages[2].node.write.mode.upsert;
+    try std.testing.expectEqual(@as(usize, 1), up.keys.len);
+    try std.testing.expectEqualStrings("id", up.keys[0]);
+    try std.testing.expectEqual(@as(usize, 2), up.partial.?.len);
+    try std.testing.expectEqualStrings("v2", up.partial.?[0]);
+    try std.testing.expectEqualStrings("u", up.partial.?[1]);
+}
+
+test "@http kind carries its config attrs" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const prog = try parseTest(ar.allocator(), "@http(path = \"/sync\", doc = \"Sync\")\nread csv \"x\" | write stdout");
+    const k = prog.stmts[0].kind;
+    try std.testing.expectEqual(ast.Kind.http, k.kind);
+    try std.testing.expectEqual(@as(usize, 2), k.config.len);
+    try std.testing.expectEqualStrings("path", k.config[0].key);
+    try std.testing.expect(k.config[0].value.* == .str_lit);
+    try std.testing.expectEqualStrings("/sync", k.config[0].value.str_lit);
+    try std.testing.expectEqualStrings("doc", k.config[1].key);
+}
+
+test "parse errors name the offender and carry its position" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var d1: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try std.testing.expectError(error.ParseFailed, parseSource(a, "@stream\nread csv \"x\" | write stdout", &d1));
+    try std.testing.expect(std.mem.indexOf(u8, d1.msg, "unknown @kind `stream`") != null);
+
+    var d2: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try std.testing.expectError(error.ParseFailed, parseSource(a, "@batch\nparam p uuid", &d2));
+    try std.testing.expect(std.mem.indexOf(u8, d2.msg, "unknown type `uuid`") != null);
+    try std.testing.expectEqual(@as(u32, 2), d2.line);
+    try std.testing.expectEqual(@as(u32, 9), d2.col); // the `uuid` token
+
+    var d3: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try std.testing.expectError(error.ParseFailed, parseSource(a, "@batch\nread csv \"x\" | aggregate n = median(v) | write stdout", &d3));
+    try std.testing.expect(std.mem.indexOf(u8, d3.msg, "unknown aggregate function `median`") != null);
+
+    // a second @kind tag is rejected as non-first
+    var d4: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try std.testing.expectError(error.ParseFailed, parseSource(a, "@batch\nread csv \"x\" | write stdout\n@batch", &d4));
+    try std.testing.expect(std.mem.indexOf(u8, d4.msg, "must be the first declaration") != null);
+
+    // an invalid token is reported before any parsing
+    var d5: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try std.testing.expectError(error.ParseFailed, parseSource(a, "@batch\nread csv \"x\" | filter a ; b | write stdout", &d5));
+    try std.testing.expect(std.mem.indexOf(u8, d5.msg, "invalid token `;`") != null);
+    try std.testing.expectEqual(@as(u32, 2), d5.line);
+}
+
+test "parseExprStr rejects trailing input; `not` binds tighter than `and`" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var d1: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const e = try parseExprStr(a, "not a and b", &d1);
+    try std.testing.expect(e.* == .binary);
+    try std.testing.expectEqual(ast.BinOp.@"and", e.binary.op);
+    try std.testing.expect(e.binary.l.* == .unary); // `not` grabbed only `a`
+    try std.testing.expectEqual(ast.UnOp.not, e.binary.l.unary.op);
+
+    var d2: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try std.testing.expectError(error.ParseFailed, parseExprStr(a, "a + b c", &d2));
+    try std.testing.expect(std.mem.indexOf(u8, d2.msg, "trailing") != null);
 }
 
 /// Parsing arbitrary bytes must never crash — only return an AST or a `Diagnostic`

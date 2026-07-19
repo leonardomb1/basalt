@@ -58,7 +58,7 @@ pub fn expandProgram(arena: std.mem.Allocator, program: ast.Program, body: ?[]co
 fn expandStmt(cx: *Ctx, s: ast.Stmt) Error!ast.Stmt {
     return switch (s) {
         .kind => |k| .{ .kind = .{ .kind = k.kind, .config = try expandAttrs(cx, k.config), .pos = k.pos } },
-        .param => |p| .{ .param = .{ .name = p.name, .ty = p.ty, .default = if (p.default) |d| try expandExpr(cx, d, null, 0) else null, .source = p.source, .pos = p.pos, .is_json = p.is_json } },
+        .param => |p| .{ .param = .{ .name = p.name, .ty = p.ty, .default = if (p.default) |d| try expandExpr(cx, d, null, 0) else null, .pos = p.pos, .is_json = p.is_json } },
         .connection => |c| .{ .connection = .{ .name = c.name, .connector = c.connector, .config = try expandAttrs(cx, c.config), .pos = c.pos } },
         .binding => |b| .{ .binding = .{ .name = b.name, .pipeline = try expandPipeline(cx, b.pipeline), .pos = b.pos } },
         .output => |p| .{ .output = try expandPipeline(cx, p) },
@@ -297,11 +297,13 @@ test "expandProgram rejects recursion and arity mismatch" {
     const p1 = try parser.parseSource(a, "@batch\nfn loopy(x) = loopy(x)\nread csv \"x\" | select y = loopy(id) | write stdout", &d1);
     var m1: []const u8 = "";
     try std.testing.expectError(error.ExpandFailed, expandProgram(a, p1, null, &m1));
+    try std.testing.expect(std.mem.indexOf(u8, m1, "too deep") != null); // hit the recursion limit
 
     var d2 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
     const p2 = try parser.parseSource(a, "@batch\nfn one(b) = b\nread csv \"x\" | select y = one(id, status) | write stdout", &d2);
     var m2: []const u8 = "";
     try std.testing.expectError(error.ExpandFailed, expandProgram(a, p2, null, &m2));
+    try std.testing.expect(std.mem.indexOf(u8, m2, "expects 1 argument(s), got 2") != null);
 }
 
 test "expandProgram inlines `let … in` away (single-use binding)" {
@@ -334,13 +336,13 @@ test "expandProgram substitutes JSON-param path access from the body" {
     defer ar.deinit();
     const a = ar.allocator();
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(a, "@batch\nparam job json from body\n" ++
+    const prog = try parser.parseSource(a, "@batch\nparam job json\n" ++
         "read csv \"x\" | select h = job.source.host, n = job.n | write stdout", &diag);
     var msg: []const u8 = "";
-    const out = try expandProgram(a, prog, "{\"source\":{\"host\":\"142.0.65.89\"},\"n\":7}", &msg);
+    const out = try expandProgram(a, prog, "{\"source\":{\"host\":\"203.0.113.9\"},\"n\":7}", &msg);
     const sel = outputSelect(out);
     try std.testing.expect(sel[0].computed.expr.* == .str_lit);
-    try std.testing.expectEqualStrings("142.0.65.89", sel[0].computed.expr.str_lit);
+    try std.testing.expectEqualStrings("203.0.113.9", sel[0].computed.expr.str_lit);
     try std.testing.expect(sel[1].computed.expr.* == .int_lit);
     try std.testing.expectEqual(@as(i64, 7), sel[1].computed.expr.int_lit);
 }
@@ -353,7 +355,7 @@ test "?. safe navigation: a missing intermediate resolves to null instead of err
 
     // `job?.source.host` over a body lacking `source`: the `?.` tolerates the miss.
     var d1 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const p1 = try parser.parseSource(a, "@batch\nparam job json from body\n" ++
+    const p1 = try parser.parseSource(a, "@batch\nparam job json\n" ++
         "read csv \"x\" | select h = job?.source.host | write stdout", &d1);
     var m1: []const u8 = "";
     const o1 = try expandProgram(a, p1, "{\"other\":1}", &m1);
@@ -361,7 +363,7 @@ test "?. safe navigation: a missing intermediate resolves to null instead of err
 
     // `job.source?.host`: source present, host missing under `?.` → null.
     var d2 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const p2 = try parser.parseSource(a, "@batch\nparam job json from body\n" ++
+    const p2 = try parser.parseSource(a, "@batch\nparam job json\n" ++
         "read csv \"x\" | select h = job.source?.host | write stdout", &d2);
     var m2: []const u8 = "";
     const o2 = try expandProgram(a, p2, "{\"source\":{\"x\":1}}", &m2);
@@ -369,10 +371,90 @@ test "?. safe navigation: a missing intermediate resolves to null instead of err
 
     // The same miss with a plain `.` is still a hard error.
     var d3 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const p3 = try parser.parseSource(a, "@batch\nparam job json from body\n" ++
+    const p3 = try parser.parseSource(a, "@batch\nparam job json\n" ++
         "read csv \"x\" | select h = job.source.host | write stdout", &d3);
     var m3: []const u8 = "";
     try std.testing.expectError(error.ExpandFailed, expandProgram(a, p3, "{\"other\":1}", &m3));
+    try std.testing.expect(std.mem.indexOf(u8, m3, "key `source` not found") != null);
+}
+
+test "?. over a scalar intermediate resolves to null" {
+    const parser = @import("parser.zig");
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // `job.n?.x` where `n` is 7: navigating into a non-object under `?.` -> null.
+    var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a, "@batch\nparam job json\n" ++
+        "read csv \"x\" | select h = job.n?.x | write stdout", &diag);
+    var msg: []const u8 = "";
+    const out = try expandProgram(a, prog, "{\"n\":7}", &msg);
+    try std.testing.expect(outputSelect(out)[0].computed.expr.* == .null_lit);
+}
+
+test "json body errors: non-scalar leaf and invalid JSON" {
+    const parser = @import("parser.zig");
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // `job.source` resolves to an object where a scalar is expected.
+    var d1 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const p1 = try parser.parseSource(a, "@batch\nparam job json\n" ++
+        "read csv \"x\" | select s = job.source | write stdout", &d1);
+    var m1: []const u8 = "";
+    try std.testing.expectError(error.ExpandFailed, expandProgram(a, p1, "{\"source\":{\"h\":1}}", &m1));
+    try std.testing.expect(std.mem.indexOf(u8, m1, "scalar") != null);
+
+    // A malformed body fails up front with the JSON message.
+    var d2 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const p2 = try parser.parseSource(a, "@batch\nparam job json\n" ++
+        "read csv \"x\" | select n = job.n | write stdout", &d2);
+    var m2: []const u8 = "";
+    try std.testing.expectError(error.ExpandFailed, expandProgram(a, p2, "not json{", &m2));
+    try std.testing.expect(std.mem.indexOf(u8, m2, "invalid JSON") != null);
+}
+
+test "nested user fns inline through each other" {
+    const parser = @import("parser.zig");
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a, "@batch\nfn inc(x) = x + 1\nfn twice(y) = inc(y) * 2\n" ++
+        "read csv \"x\" | select v = twice(id) | write stdout", &diag);
+    var msg: []const u8 = "";
+    const out = try expandProgram(a, prog, null, &msg);
+    // twice(id) -> inc(id) * 2 -> (id + 1) * 2
+    const e = outputSelect(out)[0].computed.expr;
+    try std.testing.expect(e.* == .binary);
+    try std.testing.expectEqual(ast.BinOp.mul, e.binary.op);
+    try std.testing.expect(e.binary.l.* == .binary);
+    try std.testing.expectEqual(ast.BinOp.add, e.binary.l.binary.op);
+    try std.testing.expect(e.binary.l.binary.l.* == .field);
+    try std.testing.expectEqualStrings("id", e.binary.l.binary.l.field.last());
+    try std.testing.expect(e.binary.r.* == .int_lit);
+    try std.testing.expectEqual(@as(i64, 2), e.binary.r.int_lit);
+}
+
+test "a `let` shadowing a fn param is restored after the let body" {
+    const parser = @import("parser.zig");
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    // Inside the let body `x` is 1; after it, `x` must be the fn argument again.
+    const prog = try parser.parseSource(a, "@batch\nfn f(x) = (let x = 1 in x) + x\n" ++
+        "read csv \"d\" | select v = f(id) | write stdout", &diag);
+    var msg: []const u8 = "";
+    const out = try expandProgram(a, prog, null, &msg);
+    const e = outputSelect(out)[0].computed.expr;
+    try std.testing.expect(e.* == .binary);
+    try std.testing.expectEqual(ast.BinOp.add, e.binary.op);
+    try std.testing.expect(e.binary.l.* == .int_lit); // shadowed inside the let
+    try std.testing.expectEqual(@as(i64, 1), e.binary.l.int_lit);
+    try std.testing.expect(e.binary.r.* == .field); // outer binding restored
+    try std.testing.expectEqualStrings("id", e.binary.r.field.last());
 }
 
 test "expandProgram leaves JSON paths null when unbound (offline check)" {
@@ -381,7 +463,7 @@ test "expandProgram leaves JSON paths null when unbound (offline check)" {
     defer ar.deinit();
     const a = ar.allocator();
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(a, "@batch\nparam job json from body\n" ++
+    const prog = try parser.parseSource(a, "@batch\nparam job json\n" ++
         "read csv \"x\" | select h = job.source.host | write stdout", &diag);
     var msg: []const u8 = "";
     const out = try expandProgram(a, prog, null, &msg);

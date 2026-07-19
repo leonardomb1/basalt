@@ -132,12 +132,7 @@ fn findField(schema: types.Schema, name: []const u8) ?types.Schema.Field {
     return null;
 }
 
-fn nameIn(names: []const []const u8, n: []const u8) bool {
-    for (names) |x| {
-        if (std.mem.eql(u8, x, n)) return true;
-    }
-    return false;
-}
+const nameIn = sqlmod.nameIn;
 
 // ---------------------------------------------------------------------------
 // Stream Load body + helpers
@@ -342,7 +337,7 @@ pub const StreamLoadSink = struct {
         while (true) {
             self.streamLoad() catch |e| {
                 attempt += 1;
-                if (attempt >= 3 or !sqlmod.transientNet(e)) return e;
+                if (attempt >= 3 or !driver.transientNet(e)) return e;
                 std.Thread.sleep(attempt * 500 * std.time.ns_per_ms);
                 continue;
             };
@@ -537,22 +532,44 @@ test "writeSanitized replaces separator bytes embedded in data" {
 }
 
 test "mysql_native_password token matches a known vector" {
-    // password "foobar", salt = 20 bytes 0x01..0x14
+    // password "foobar", salt = 20 bytes 0x01..0x14. Expected value computed
+    // externally (Python hashlib) so a wrong formula can't verify itself.
     var salt: [20]u8 = undefined;
     for (&salt, 0..) |*b, i| b.* = @intCast(i + 1);
     const tok = mysqlAuthToken("foobar", &salt);
-    // recompute independently to guard the formula (XOR of two SHA1s)
-    const Sha1 = std.crypto.hash.Sha1;
-    var s1: [20]u8 = undefined;
-    Sha1.hash("foobar", &s1, .{});
-    var s2: [20]u8 = undefined;
-    Sha1.hash(&s1, &s2, .{});
-    var c = Sha1.init(.{});
-    c.update(&salt);
-    c.update(&s2);
-    var s3: [20]u8 = undefined;
-    c.final(&s3);
     var expect: [20]u8 = undefined;
-    for (&expect, 0..) |*b, i| b.* = s1[i] ^ s3[i];
+    _ = try std.fmt.hexToBytes(&expect, "e419caeec63ade5aeb8e0f8bbb2ac2d86b183350");
     try std.testing.expectEqualSlices(u8, &expect, &tok);
+    // salt must matter (guards against hashing the password alone)
+    var salt2 = salt;
+    salt2[0] ^= 0xFF;
+    try std.testing.expect(!std.mem.eql(u8, &tok, &mysqlAuthToken("foobar", &salt2)));
+}
+
+test "stream-load TSV body: control-byte framing, nulls, sanitized values" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const columnmod = @import("../exec/column.zig");
+    const int_ty = types.Type.init(.int).asNullable();
+    const str_ty = types.Type.init(.string).asNullable();
+    var b0 = columnmod.Builder.init(a, int_ty);
+    try b0.append(.{ .int = 1 });
+    try b0.append(.null);
+    var b1 = columnmod.Builder.init(a, str_ty);
+    try b1.append(.{ .string = "memo\x01with\x02bytes" }); // stray separators in data
+    try b1.append(.{ .string = "line\nbreak" }); // newline must NOT split the row
+    const cols = try a.alloc(columnmod.Column, 2);
+    cols[0] = try b0.finish();
+    cols[1] = try b1.finish();
+    var schema = types.Schema{ .fields = &.{
+        .{ .name = "id", .ty = int_ty },
+        .{ .name = "memo", .ty = str_ty },
+    } };
+    const batch = Batch{ .schema = &schema, .columns = cols, .len = 2 };
+
+    var out = std.array_list.Managed(u8).init(a);
+    try appendBatchTsv(out.writer(), a, batch);
+    try std.testing.expectEqualStrings("1\x01memo with bytes\x02\\N\x01line\nbreak\x02", out.items);
 }

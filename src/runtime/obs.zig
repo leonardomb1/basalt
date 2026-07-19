@@ -85,10 +85,8 @@ pub const Logger = struct {
         var lbuf: [2048]u8 = undefined;
         var w = std.Io.Writer.fixed(&lbuf);
         if (self.json) {
-            w.print(
-                "{{\"ts\":{d},\"level\":\"info\",\"run_id\":{d},\"event\":\"run_complete\",\"source\":\"{s}\",\"sink\":\"{s}\",\"rows_read\":{d},\"rows_written\":{d},\"elapsed_ms\":{d},\"rows_per_sec\":{d}}}\n",
-                .{ std.time.milliTimestamp(), s.run_id, s.source, s.sink, s.rows_read, s.rows_written, s.elapsed_ms, s.rate() },
-            ) catch return;
+            w.print("{{\"ts\":{d},\"level\":\"info\",\"run_id\":{d},\"event\":\"run_complete\",", .{ std.time.milliTimestamp(), s.run_id }) catch return;
+            s.renderJsonFields(&w) catch return;
         } else {
             s.renderText(&w) catch return;
         }
@@ -149,9 +147,17 @@ pub const Summary = struct {
     }
 
     pub fn renderJson(self: Summary, w: anytype) !void {
+        try w.print("{{\"status\":\"ok\",\"run_id\":{d},", .{self.run_id});
+        try self.renderJsonFields(w);
+    }
+
+    /// The shared metric fields (and closing brace/newline) of both JSON
+    /// renderings: the `--json` stdout summary and the NDJSON `run_complete`
+    /// stderr line — only their envelope prefixes differ.
+    fn renderJsonFields(self: Summary, w: anytype) !void {
         try w.print(
-            "{{\"status\":\"ok\",\"run_id\":{d},\"source\":\"{s}\",\"sink\":\"{s}\",\"rows_read\":{d},\"rows_written\":{d},\"elapsed_ms\":{d},\"rows_per_sec\":{d}}}\n",
-            .{ self.run_id, self.source, self.sink, self.rows_read, self.rows_written, self.elapsed_ms, self.rate() },
+            "\"source\":\"{s}\",\"sink\":\"{s}\",\"rows_read\":{d},\"rows_written\":{d},\"elapsed_ms\":{d},\"rows_per_sec\":{d}}}\n",
+            .{ self.source, self.sink, self.rows_read, self.rows_written, self.elapsed_ms, self.rate() },
         );
     }
 };
@@ -208,7 +214,82 @@ test "json log line escapes and is one line" {
     var fbw = std.Io.Writer.fixed(&buf);
     const w = &fbw;
     try w.writeAll("{\"msg\":\"");
-    try writeEscaped(w, "a\"b\nc");
+    try writeEscaped(w, "a\"b\nc\\d\t\r\x01");
     try w.writeAll("\"}");
-    try std.testing.expectEqualStrings("{\"msg\":\"a\\\"b\\nc\"}", w.buffered());
+    try std.testing.expectEqualStrings("{\"msg\":\"a\\\"b\\nc\\\\d\\t\\r\\u0001\"}", w.buffered());
+}
+
+test "summary rate: zero elapsed falls back to rows_written (no div-by-zero)" {
+    const s = Summary{ .run_id = 1, .rows_written = 42, .elapsed_ms = 0 };
+    try std.testing.expectEqual(@as(u64, 42), s.rate());
+}
+
+test "summary renderJson: one status-ok object with every metric field" {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const s = Summary{ .run_id = 7, .source = "csv", .sink = "starrocks", .rows_read = 10, .rows_written = 8, .elapsed_ms = 2000 };
+    try s.renderJson(&w);
+    try std.testing.expectEqualStrings(
+        "{\"status\":\"ok\",\"run_id\":7,\"source\":\"csv\",\"sink\":\"starrocks\",\"rows_read\":10,\"rows_written\":8,\"elapsed_ms\":2000,\"rows_per_sec\":4}\n",
+        w.buffered(),
+    );
+}
+
+test "summary renderText: read≠written shows both; lane count only when parallel" {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const s = Summary{ .run_id = 7, .source = "csv", .sink = "starrocks", .rows_read = 10, .rows_written = 8, .elapsed_ms = 2000, .threads = 2 };
+    try s.renderText(&w);
+    try std.testing.expectEqualStrings("✓ csv → starrocks  read 10 → wrote 8  (4 rows/s, 2000 ms, 2 lanes)  run=7\n", w.buffered());
+
+    var buf2: [256]u8 = undefined;
+    var w2 = std.Io.Writer.fixed(&buf2);
+    const eq = Summary{ .run_id = 7, .source = "csv", .sink = "csv", .rows_read = 8, .rows_written = 8, .elapsed_ms = 1000 };
+    try eq.renderText(&w2);
+    try std.testing.expectEqualStrings("✓ csv → csv  wrote 8  (8 rows/s, 1000 ms)  run=7\n", w2.buffered());
+}
+
+test "logger level gate: err/warn/info pass at min=info, debug is filtered" {
+    var lg = Logger.init(1, .text, .info);
+    try std.testing.expect(lg.enabled(.err));
+    try std.testing.expect(lg.enabled(.warn));
+    try std.testing.expect(lg.enabled(.info));
+    try std.testing.expect(!lg.enabled(.debug));
+}
+
+const test_empty_schema = types.Schema{ .fields = &.{} };
+var test_no_cols: [0]@import("../exec/column.zig").Column = .{};
+
+/// A source emitting one zero-column batch per entry of `batches`, then EOF.
+const FakeSource = struct {
+    batches: []const usize,
+    i: usize = 0,
+
+    fn source(self: *FakeSource) driver.Source {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    const vtable = driver.Source.VTable{ .schema = vtSchema, .next = vtNext, .close = vtClose };
+    fn vtSchema(_: *anyopaque) types.Schema {
+        return test_empty_schema;
+    }
+    fn vtNext(ptr: *anyopaque, _: std.mem.Allocator) anyerror!?Batch {
+        const self: *FakeSource = @ptrCast(@alignCast(ptr));
+        if (self.i >= self.batches.len) return null;
+        const n = self.batches[self.i];
+        self.i += 1;
+        return Batch{ .schema = &test_empty_schema, .columns = &test_no_cols, .len = n };
+    }
+    fn vtClose(_: *anyopaque) void {}
+};
+
+test "CountingSource accumulates emitted rows across batches and forwards EOF" {
+    var cnt = std.atomic.Value(u64).init(0);
+    var fake = FakeSource{ .batches = &.{ 2, 3 } };
+    var cs = CountingSource{ .inner = fake.source(), .count = &cnt };
+    const src = cs.source();
+    try std.testing.expectEqual(@as(usize, 0), src.schema().fields.len); // schema passthrough
+    try std.testing.expectEqual(@as(usize, 2), ((try src.next(std.testing.allocator)) orelse unreachable).len);
+    try std.testing.expectEqual(@as(usize, 3), ((try src.next(std.testing.allocator)) orelse unreachable).len);
+    try std.testing.expect((try src.next(std.testing.allocator)) == null);
+    try std.testing.expectEqual(@as(u64, 5), cnt.load(.monotonic)); // EOF adds nothing
 }

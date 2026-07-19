@@ -80,21 +80,6 @@ pub fn popcountValid(bits: []const u8, n: usize) usize {
     return count;
 }
 
-/// Vectorized `i64` -> `f64` conversion (used to sum/avg an int column as float).
-pub fn intToFloat(out: []f64, src: []const i64) void {
-    const N = lanes(f64);
-    const n = out.len;
-    var i: usize = 0;
-    if (N > 1) {
-        while (i + N <= n) : (i += N) {
-            const vi: @Vector(N, i64) = src[i..][0..N].*;
-            const vf: @Vector(N, f64) = @floatFromInt(vi);
-            out[i..][0..N].* = vf;
-        }
-    }
-    while (i < n) : (i += 1) out[i] = @floatFromInt(src[i]);
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -112,6 +97,29 @@ test "sumF matches scalar across vector body + tail" {
     try testing.expectApproxEqAbs(expect, sumF(&a), 1e-9);
 }
 
+test "sumF agrees with a scalar loop at every remainder length" {
+    const L = lanes(f64);
+    var buf: [2 * L + 3]f64 = undefined;
+    for (&buf, 0..) |*x, i| x.* = @as(f64, @floatFromInt(i)) * 1.5 - 3;
+    var n: usize = 0;
+    while (n <= buf.len) : (n += 1) { // n = 0 covers the empty slice
+        var expect: f64 = 0;
+        for (buf[0..n]) |x| expect += x;
+        try testing.expectApproxEqAbs(expect, sumF(buf[0..n]), 1e-9);
+    }
+}
+
+test "sumF propagates NaN from vector body and scalar tail" {
+    const L = lanes(f64);
+    var a: [2 * L + 1]f64 = undefined;
+    @memset(&a, 1.0);
+    a[0] = std.math.nan(f64); // lands in the vector body (or scalar loop if L == 1)
+    try testing.expect(std.math.isNan(sumF(&a)));
+    @memset(&a, 1.0);
+    a[a.len - 1] = std.math.nan(f64); // odd length: always the scalar tail
+    try testing.expect(std.math.isNan(sumF(&a)));
+}
+
 test "minF/maxF" {
     const a = [_]f64{ 5, 3, 9, 1, 7, 2, 8, 4, 6, 0, 11, 10, 12, 13 };
     try testing.expectEqual(@as(f64, 0), minF(&a));
@@ -119,6 +127,25 @@ test "minF/maxF" {
     const one = [_]f64{42};
     try testing.expectEqual(@as(f64, 42), minF(&one));
     try testing.expectEqual(@as(f64, 42), maxF(&one));
+}
+
+test "minF/maxF honor extremes in the scalar tail at odd lengths" {
+    const L = lanes(f64);
+    var a: [2 * L + 1]f64 = undefined; // full vector body + 1-element tail
+    for (&a, 0..) |*x, i| x.* = @floatFromInt(i + 10);
+    a[a.len - 1] = -1; // extreme only reachable via the tail loop
+    try testing.expectEqual(@as(f64, -1), minF(&a));
+    a[a.len - 1] = 1e9;
+    try testing.expectEqual(@as(f64, 10), minF(&a)); // body extreme
+    try testing.expectEqual(@as(f64, 1e9), maxF(&a)); // tail extreme
+}
+
+test "popcountValid: zero bits and exact byte multiples read no partial byte" {
+    const bits = [_]u8{ 0b1010_1010, 0xFF };
+    try testing.expectEqual(@as(usize, 0), popcountValid(&bits, 0));
+    try testing.expectEqual(@as(usize, 1), popcountValid(&bits, 2)); // bits 0..1 -> only bit 1
+    // n == bits.len * 8: rem is 0, so bits[full] must not be touched (would be OOB)
+    try testing.expectEqual(@as(usize, 12), popcountValid(&bits, 16));
 }
 
 test "popcountValid honors partial trailing byte" {
@@ -131,13 +158,4 @@ test "popcountValid honors partial trailing byte" {
     bits[0] &= ~@as(u8, 1); // clear bit 0
     bits[2] &= ~@as(u8, 0b0000_1000); // clear bit 19
     try testing.expectEqual(@as(usize, 18), popcountValid(bits, 20));
-}
-
-test "intToFloat" {
-    const n = 17;
-    var src: [n]i64 = undefined;
-    var out: [n]f64 = undefined;
-    for (0..n) |i| src[i] = @intCast(i * 3);
-    intToFloat(&out, &src);
-    for (0..n) |i| try testing.expectEqual(@as(f64, @floatFromInt(src[i])), out[i]);
 }
