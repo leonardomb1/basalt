@@ -38,9 +38,17 @@ pub const Conn = struct {
     shim: TlsShim = undefined, // valid iff tls != null
     fed_required: bool = false, // server asked for federated (Azure AD) auth
     fed_nonce: ?[32]u8 = null, // server PRELOGIN nonce, echoed in the FEDAUTH ext
+    // Max packet payload for outgoing SQLBatch/bulk packets. Starts at the 4096
+    // default; LOGIN7 requests 16384 and the server's ENVCHANGE(4) sets the
+    // negotiated value (fewer header+flush round trips per MB of bulk data).
+    pkt_payload: usize = BULK_PKT_PAYLOAD,
+    // Row count from the last DONE token whose DONE_COUNT flag was set; reset
+    // by bulkFinish so a bulk load's ack can't be mistaken for its result.
+    last_done_count: ?u64 = null,
 
     pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sqlmod.TlsMode) !*Conn {
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
+        driver.tuneSocket(stream.handle);
         const self = try gpa.create(Conn);
         self.* = .{ .gpa = gpa, .stream = stream, .msg = std.array_list.Managed(u8).init(gpa) };
         self.sr = std.net.Stream.Reader.init(stream, &self.read_buf);
@@ -60,6 +68,7 @@ pub const Conn = struct {
     pub fn connectAad(gpa: std.mem.Allocator, host: []const u8, port: u16, token: []const u8, database: []const u8, tls_mode: sqlmod.TlsMode) !*Conn {
         if (tls_mode == .off) return error.EncryptionRequired; // AAD requires TLS
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
+        driver.tuneSocket(stream.handle);
         const self = try gpa.create(Conn);
         self.* = .{ .gpa = gpa, .stream = stream, .msg = std.array_list.Managed(u8).init(gpa) };
         self.sr = std.net.Stream.Reader.init(stream, &self.read_buf);
@@ -175,7 +184,11 @@ pub const Conn = struct {
                     i += 2 + rdU16(p, i);
                 },
                 0x79 => i += 4, // RETURNSTATUS
-                0xFD, 0xFE, 0xFF => i += 12, // DONE/DONEPROC/DONEINPROC
+                0xFD, 0xFE, 0xFF => { // DONE/DONEPROC/DONEINPROC
+                    if (i + 12 > p.len) return error.TdsProtocol;
+                    if (parseDoneRowCount(token, p[i .. i + 12])) |n| self.last_done_count = n;
+                    i += 12;
+                },
                 else => break,
             }
         }
@@ -191,7 +204,7 @@ pub const Conn = struct {
         const w = self.wr();
         var off: usize = 0;
         while (true) {
-            const chunk: usize = @min(payload.len - off, BULK_PKT_PAYLOAD);
+            const chunk: usize = @min(payload.len - off, self.pkt_payload);
             const last = off + chunk == payload.len;
             var header: [8]u8 = .{ ptype, if (last) STATUS_EOM else 0x00, 0, 0, 0, 0, 0, 0 };
             const total: u16 = @intCast(chunk + 8);
@@ -316,9 +329,16 @@ pub const Conn = struct {
                     self.last_error = try self.decodeError(p[i + 2 .. i + 2 + len]);
                     return error.LoginFailed;
                 },
-                0xAB, 0xE3 => { // INFO, ENVCHANGE
+                0xAB => { // INFO
                     if (i + 2 > p.len) return error.TdsProtocol;
                     i += 2 + rdU16(p, i);
+                },
+                0xE3 => { // ENVCHANGE; type 4 = negotiated packet size
+                    if (i + 2 > p.len) return error.TdsProtocol;
+                    const len = rdU16(p, i);
+                    if (i + 2 + len > p.len) return error.TdsProtocol;
+                    if (parseEnvPacketSize(p[i + 2 .. i + 2 + len])) |sz| self.pkt_payload = sz - 8;
+                    i += 2 + len;
                 },
                 0xEE => { // FEDAUTHINFO — 4-byte length + data (AAD flows)
                     if (i + 4 > p.len) return error.TdsProtocol;
@@ -394,9 +414,13 @@ pub const Conn = struct {
         try self.flushOut();
     }
 
-    /// Read the server's response to the bulk load (DONE on success, ERROR token).
-    pub fn bulkFinish(self: *Conn) !void {
+    /// Read the server's response to the bulk load (DONE on success, ERROR
+    /// token). Returns the DONE row count, the server's word on how many rows
+    /// actually landed.
+    pub fn bulkFinish(self: *Conn) !?u64 {
+        self.last_done_count = null;
         try self.readBulkResponse();
+        return self.last_done_count;
     }
 
     fn readBulkResponse(self: *Conn) !void {
@@ -968,9 +992,14 @@ pub const BulkSink = struct {
     gpa: std.mem.Allocator,
     conn: *Conn,
     schema: types.Schema,
+    // Current segment's bulk token stream (COLMETADATA + ROW tokens) — kept
+    // whole until the server confirms the segment, so it can be replayed.
     buffer: std.array_list.Managed(u8),
+    insert_sql: []const u8 = "", // gpa-owned; issued once per segment
+    seg_rows: u64 = 0,
+    redial: ?sqlmod.Redial = null,
 
-    pub fn open(gpa: std.mem.Allocator, conn: *Conn, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode) !*BulkSink {
+    pub fn open(gpa: std.mem.Allocator, conn: *Conn, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?sqlmod.Redial) !*BulkSink {
         // On error we free only what we allocate here; the caller keeps `conn`
         // (so it can read conn.last_error) and closes it on failure.
         const self = try gpa.create(BulkSink);
@@ -984,7 +1013,7 @@ pub const BulkSink = struct {
             o.* = .{ .name = try gpa.dupe(u8, f.name), .ty = f.ty };
             nf += 1;
         }
-        self.* = .{ .gpa = gpa, .conn = conn, .schema = .{ .fields = fields }, .buffer = std.array_list.Managed(u8).init(gpa) };
+        self.* = .{ .gpa = gpa, .conn = conn, .schema = .{ .fields = fields }, .buffer = std.array_list.Managed(u8).init(gpa), .redial = redial };
         errdefer self.buffer.deinit();
 
         var aa = std.heap.ArenaAllocator.init(gpa);
@@ -1000,8 +1029,8 @@ pub const BulkSink = struct {
             try cols.appendSlice(try sqlmod.quoteIdent(a, .sqlserver, f.name));
             try cols.appendSlice(" nvarchar(4000)");
         }
-        try conn.bulkStart(try std.fmt.allocPrint(a, "INSERT BULK {s} ({s})", .{ qtable, cols.items }));
-        try self.writeColMetadata();
+        self.insert_sql = try std.fmt.allocPrint(gpa, "INSERT BULK {s} ({s})", .{ qtable, cols.items });
+        try self.writeColMetadata(); // each segment's stream starts with COLMETADATA
         return self;
     }
 
@@ -1015,7 +1044,7 @@ pub const BulkSink = struct {
         try writeU16(w, @intCast(self.schema.fields.len));
         for (self.schema.fields) |f| {
             try writeU32(w, 0); // UserType (TDS 7.2+ : 4 bytes)
-            try writeU16(w, 0x0008); // Flags — exactly what the server emits for these columns
+            try writeU16(w, 0x0009); // Flags: fNullable | usUpdateable=read-write — without fNullable the server silently drops rows containing a NULL
             try w.writeByte(0xE7); // NVARCHARTYPE
             try writeU16(w, NVARCHAR_MAX_BYTES);
             try w.writeAll(&BULK_COLLATION);
@@ -1057,31 +1086,57 @@ pub const BulkSink = struct {
                     try w.writeByte(@intCast(u16s[k] >> 8));
                 }
             }
-            try self.flushFull();
+        }
+        self.seg_rows += batch.len;
+        if (self.buffer.items.len >= sqlmod.SEGMENT_BYTES) {
+            try self.commitSegment();
+            try self.writeColMetadata(); // next segment's stream header
         }
     }
 
-    /// Emit whole TDS packets from the buffer, keeping any trailing partial.
-    fn flushFull(self: *BulkSink) !void {
-        var off: usize = 0;
-        while (self.buffer.items.len - off >= BULK_PKT_PAYLOAD) {
-            try self.conn.bulkPacket(0x00, self.buffer.items[off .. off + BULK_PKT_PAYLOAD]);
-            off += BULK_PKT_PAYLOAD;
+    /// Transmit the buffered segment as one INSERT BULK statement and verify the
+    /// DONE row count. Transient failure → redial once and resend the intact
+    /// segment (the server rolls back a bulk batch when its connection dies).
+    /// Same lost-reply double-write window as the other bulk sinks.
+    fn commitSegment(self: *BulkSink) !void {
+        if (self.seg_rows == 0) {
+            self.buffer.clearRetainingCapacity(); // drop the unused COLMETADATA header
+            return;
         }
-        if (off > 0) {
-            const rem = self.buffer.items.len - off;
-            std.mem.copyForwards(u8, self.buffer.items[0..rem], self.buffer.items[off..]);
-            self.buffer.shrinkRetainingCapacity(rem);
+        self.sendSegment() catch |e| {
+            const rd = self.redial orelse return e;
+            if (!driver.transientNet(e)) return e;
+            const fresh = try rd.dial(rd.ctx, self.gpa);
+            self.conn.close();
+            // Redial ctx is kind-matched: the vtable ptr is always a *tds.Conn.
+            self.conn = @ptrCast(@alignCast(fresh.ptr));
+            try self.sendSegment();
+        };
+        self.buffer.clearRetainingCapacity();
+        self.seg_rows = 0;
+    }
+
+    fn sendSegment(self: *BulkSink) !void {
+        try self.conn.bulkStart(self.insert_sql);
+        var off: usize = 0;
+        while (self.buffer.items.len - off > self.conn.pkt_payload) {
+            try self.conn.bulkPacket(0x00, self.buffer.items[off .. off + self.conn.pkt_payload]);
+            off += self.conn.pkt_payload;
+        }
+        try self.conn.bulkPacket(STATUS_EOM, self.buffer.items[off..]);
+        const n = (try self.conn.bulkFinish()) orelse self.seg_rows; // no DONE_COUNT → trust ERROR-token detection
+        if (n != self.seg_rows) {
+            if (self.conn.last_error.len == 0)
+                self.conn.last_error = try std.fmt.allocPrint(self.gpa, "INSERT BULK count mismatch: sent {d} rows, server loaded {d}", .{ self.seg_rows, n });
+            return error.BulkCountMismatch;
         }
     }
 
     fn closeImpl(self: *BulkSink) !void {
-        // Release everything even if the final packets fail — otherwise a failed
+        // Release everything even if the final segment fails — otherwise a failed
         // INSERT BULK on close leaks the connection, buffer, schema and sink.
         defer self.teardown();
-        try self.flushFull();
-        try self.conn.bulkPacket(STATUS_EOM, self.buffer.items); // final packet (may be empty)
-        try self.conn.bulkFinish();
+        try self.commitSegment();
     }
 
     /// Failure path: drop the buffer and close the socket mid-INSERT BULK; the
@@ -1093,6 +1148,7 @@ pub const BulkSink = struct {
     fn teardown(self: *BulkSink) void {
         self.conn.close();
         self.buffer.deinit();
+        if (self.insert_sql.len > 0) self.gpa.free(self.insert_sql);
         for (self.schema.fields) |f| self.gpa.free(f.name);
         self.gpa.free(self.schema.fields);
         self.gpa.destroy(self);
@@ -1338,15 +1394,125 @@ test "win1252 transcode to utf8" {
     try std.testing.expectEqualStrings("€", e);
 }
 
+test "readIntLE sign-extends every TDS integer width" {
+    try std.testing.expectEqual(@as(i64, 0), readIntLE(&.{}));
+    try std.testing.expectEqual(@as(i64, -1), readIntLE(&.{0xFF})); // tinyint as i8
+    try std.testing.expectEqual(@as(i64, 127), readIntLE(&.{0x7F}));
+    try std.testing.expectEqual(@as(i64, -2), readIntLE(&.{ 0xFE, 0xFF })); // smallint
+    try std.testing.expectEqual(@as(i64, -1), readIntLE(&.{ 0xFF, 0xFF, 0xFF, 0xFF })); // int
+    try std.testing.expectEqual(@as(i64, 1), readIntLE(&.{ 1, 0, 0, 0, 0, 0, 0, 0 })); // bigint
+    try std.testing.expectEqual(std.math.minInt(i64), readIntLE(&.{ 0, 0, 0, 0, 0, 0, 0, 0x80 }));
+    // odd width (3 bytes) takes the sign-extension fallback
+    try std.testing.expectEqual(@as(i64, -1), readIntLE(&.{ 0xFF, 0xFF, 0xFF }));
+    try std.testing.expectEqual(@as(i64, 0x010203), readIntLE(&.{ 0x03, 0x02, 0x01 }));
+}
+
+test "decodeDecimal: sign byte + little-endian magnitude at the column scale" {
+    const d = ColumnDesc{ .tds_type = 0x6C, .engine_type = types.Type.decimal(10, 2).asNullable(), .kind = .bytelen, .scale = 2 };
+    // sign=1 (positive), magnitude 0x3039 = 12345 -> 123.45
+    const pos = decodeDecimal(d, &.{ 1, 0x39, 0x30, 0, 0 });
+    try std.testing.expectEqual(@as(i128, 12345), pos.decimal.unscaled);
+    try std.testing.expectEqual(@as(u8, 2), pos.decimal.scale);
+    // sign=0 -> negative
+    const neg = decodeDecimal(d, &.{ 0, 0x39, 0x30, 0, 0 });
+    try std.testing.expectEqual(@as(i128, -12345), neg.decimal.unscaled);
+    try std.testing.expect(decodeDecimal(d, &.{}) == .null);
+}
+
+test "decodeDateTime: DATETIME ticks, SMALLDATETIME minutes, DATETIME2 scale" {
+    // DATETIME: days since 1900 (25567 = 1970-01-01), 1/300s ticks. 300 ticks = 1s.
+    var dt = ColumnDesc{ .tds_type = 0x3D, .engine_type = types.Type.init(.timestamp).asNullable(), .kind = .fixed, .fixed_len = 8 };
+    var bytes8: [8]u8 = undefined;
+    std.mem.writeInt(i32, bytes8[0..4], 25567, .little);
+    std.mem.writeInt(u32, bytes8[4..8], 300, .little);
+    try std.testing.expectEqual(@as(i64, 1_000_000), decodeDateTime(dt, &bytes8));
+
+    // SMALLDATETIME: days(2) + minutes(2). One day + 90 min past epoch.
+    dt.tds_type = 0x3A;
+    var bytes4: [4]u8 = undefined;
+    std.mem.writeInt(u16, bytes4[0..2], 25568, .little);
+    std.mem.writeInt(u16, bytes4[2..4], 90, .little);
+    try std.testing.expectEqual(@as(i64, 86_400_000_000 + 90 * 60_000_000), decodeDateTime(dt, &bytes4));
+
+    // DATETIME2(3): time units at 10^-3 s in N bytes, then 3-byte days since 0001-01-01
+    // (719162 = 1970-01-01). 1500ms -> 1.5s.
+    const dt2 = ColumnDesc{ .tds_type = 0x2A, .engine_type = types.Type.init(.timestamp).asNullable(), .kind = .bytelen, .scale = 3 };
+    var b7: [7]u8 = .{ 0, 0, 0, 0, 0, 0, 0 };
+    std.mem.writeInt(u32, b7[0..4], 1500, .little); // fits in the low 4 time bytes
+    const days: u24 = 719162 + 1; // 1970-01-02
+    b7[4] = @intCast(days & 0xFF);
+    b7[5] = @intCast((days >> 8) & 0xFF);
+    b7[6] = @intCast(days >> 16);
+    try std.testing.expectEqual(@as(i64, 86_400_000_000 + 1_500_000), decodeDateTime(dt2, &b7));
+}
+
+test "utf16ToUtf8 decodes BMP text and replaces invalid units" {
+    const alloc = std.testing.allocator;
+    const ok = try utf16ToUtf8(alloc, "h\x00i\x00\xe9\x00"); // "hié" in UTF-16LE
+    defer alloc.free(ok);
+    try std.testing.expectEqualStrings("hié", ok);
+    // a lone surrogate half becomes '?', not invalid UTF-8
+    const bad = try utf16ToUtf8(alloc, "\x00\xd8");
+    defer alloc.free(bad);
+    try std.testing.expectEqualStrings("?", bad);
+}
+
+/// DONE token body (status u16, curcmd u16, rowcount u64, all LE) → the count
+/// when this is a final DONE (0xFD) with the DONE_COUNT flag (0x10) set.
+fn parseDoneRowCount(token: u8, d: []const u8) ?u64 {
+    if (token != 0xFD or d.len != 12) return null;
+    if (std.mem.readInt(u16, d[0..2], .little) & 0x10 == 0) return null;
+    return std.mem.readInt(u64, d[4..12], .little);
+}
+
+test "parseDoneRowCount: counted DONE, uncounted DONE, DONEINPROC" {
+    const counted = [_]u8{ 0x10, 0x00, 0x00, 0x00, 7, 0, 0, 0, 0, 0, 0, 0 };
+    try std.testing.expectEqual(@as(?u64, 7), parseDoneRowCount(0xFD, &counted));
+    const uncounted = [_]u8{ 0x00, 0x00, 0x00, 0x00, 7, 0, 0, 0, 0, 0, 0, 0 };
+    try std.testing.expectEqual(@as(?u64, null), parseDoneRowCount(0xFD, &uncounted));
+    try std.testing.expectEqual(@as(?u64, null), parseDoneRowCount(0xFF, &counted));
+}
+
+/// ENVCHANGE data → negotiated packet size, or null if it's another env type or
+/// malformed. Layout: Type u8; type 4's NewValue is a B_VARCHAR (char count,
+/// UCS-2 digits). Accepts the server's value only within the spec's 512-32767.
+fn parseEnvPacketSize(d: []const u8) ?usize {
+    if (d.len < 2 or d[0] != 4) return null;
+    const n: usize = d[1];
+    if (n == 0 or d.len < 2 + 2 * n) return null;
+    var v: usize = 0;
+    for (0..n) |k| {
+        const ch = d[2 + 2 * k];
+        if (ch < '0' or ch > '9' or d[3 + 2 * k] != 0) return null;
+        v = v * 10 + (ch - '0');
+    }
+    return if (v >= 512 and v <= 32767) v else null;
+}
+
+test "parseEnvPacketSize: negotiated size, wrong type, junk" {
+    // type 4, "16384" as UCS-2
+    const good = [_]u8{ 4, 5, '1', 0, '6', 0, '3', 0, '8', 0, '4', 0 };
+    try std.testing.expectEqual(@as(?usize, 16384), parseEnvPacketSize(&good));
+    const wrong_type = [_]u8{ 1, 5, '1', 0, '6', 0, '3', 0, '8', 0, '4', 0 };
+    try std.testing.expectEqual(@as(?usize, null), parseEnvPacketSize(&wrong_type));
+    const non_digit = [_]u8{ 4, 2, 'x', 0, '1', 0 };
+    try std.testing.expectEqual(@as(?usize, null), parseEnvPacketSize(&non_digit));
+    const truncated = [_]u8{ 4, 5, '1', 0 };
+    try std.testing.expectEqual(@as(?usize, null), parseEnvPacketSize(&truncated));
+    const out_of_range = [_]u8{ 4, 2, '6', 0, '4', 0 }; // 64 < 512
+    try std.testing.expectEqual(@as(?usize, null), parseEnvPacketSize(&out_of_range));
+}
+
 // --- LOGIN7 construction ---
 
 fn buildLogin7(gpa: std.mem.Allocator, user: []const u8, password: []const u8, database: []const u8, host: []const u8) ![]u8 {
     var fixed = std.mem.zeroes([94]u8);
-    // TDSVersion 7.4 = 0x74000004 (LE), PacketSize 4096
+    // TDSVersion 7.4 = 0x74000004 (LE), PacketSize 16384 requested; the server
+    // answers with ENVCHANGE(4) carrying the granted size (see parseLoginResponse).
     fixed[4] = 0x04;
     fixed[7] = 0x74;
     fixed[8] = 0x00;
-    fixed[9] = 0x10; // 0x1000 = 4096
+    fixed[9] = 0x40; // 0x4000 = 16384
 
     var vd = std.array_list.Managed(u8).init(gpa);
     defer vd.deinit();
