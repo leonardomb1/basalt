@@ -28,6 +28,9 @@ pub const CsvReader = struct {
     /// reader's interface or the HTTP response body reader.
     rdr: *std.Io.Reader = undefined,
     schema: types.Schema,
+    pending: []const []const u8 = &.{}, // sampled lines, replayed before the stream
+    pending_i: usize = 0,
+    stream_eof: bool = false, // sampling consumed the whole stream; never read rdr again
     done: bool = false,
 
     const Backend = union(enum) {
@@ -105,6 +108,24 @@ pub const CsvReader = struct {
                 .ty = types.Type.init(.string).asNullable(),
             });
         }
+
+        // Sample the first SAMPLE_ROWS lines for type inference; they are kept
+        // (arena-duped, bounded) and replayed by `next` before streaming resumes.
+        var sniff = try TypeSniffer.init(arena, fields.items.len);
+        var pending = std.array_list.Managed([]const u8).init(arena);
+        while (pending.items.len < SAMPLE_ROWS) {
+            const line = (try self.readLine()) orelse {
+                self.stream_eof = true;
+                break;
+            };
+            if (line.len == 0) continue;
+            const own = try arena.dupe(u8, line);
+            sniff.feed(own);
+            try pending.append(own);
+        }
+        for (fields.items, 0..) |*f, j| f.ty = sniff.resolve(j);
+
+        self.pending = try pending.toOwnedSlice();
         self.schema = .{ .fields = try fields.toOwnedSlice() };
         return self;
     }
@@ -113,14 +134,24 @@ pub const CsvReader = struct {
         if (self.done) return null;
         const ncols = self.schema.fields.len;
         const builders = try arena.alloc(column.Builder, ncols);
-        for (builders) |*b| b.* = column.Builder.init(arena, types.Type.init(.string).asNullable());
+        for (builders, self.schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
 
         var rows: usize = 0;
         while (rows < BATCH_ROWS) {
-            const line = (try self.readLine()) orelse {
-                self.done = true;
-                break;
-            };
+            var line: []const u8 = undefined;
+            if (self.pending_i < self.pending.len) {
+                line = self.pending[self.pending_i];
+                self.pending_i += 1;
+            } else {
+                if (self.stream_eof) {
+                    self.done = true;
+                    break;
+                }
+                line = (try self.readLine()) orelse {
+                    self.done = true;
+                    break;
+                };
+            }
             if (line.len == 0) continue;
             try splitInto(arena, line, builders);
             rows += 1;
@@ -182,7 +213,9 @@ pub const MappedCsv = struct {
         const data = try std.posix.mmap(null, size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
         errdefer std.posix.munmap(data);
 
-        // Header → schema; body starts after the first newline.
+        // Header → schema; body starts after the first newline. Types come from
+        // the same SAMPLE_ROWS sniff the serial reader does, so both paths always
+        // infer identical schemas for a file.
         const nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.EmptyCsv;
         var header = data[0..nl];
         if (header.len > 0 and header[header.len - 1] == '\r') header = header[0 .. header.len - 1];
@@ -192,7 +225,23 @@ pub const MappedCsv = struct {
             .name = try arena.dupe(u8, std.mem.trim(u8, name, " \t")),
             .ty = types.Type.init(.string).asNullable(),
         });
-        self.* = .{ .data = data, .body = data[nl + 1 ..], .schema = .{ .fields = try fields.toOwnedSlice() }, .file = file };
+
+        const body = data[nl + 1 ..];
+        var sniff = try TypeSniffer.init(arena, fields.items.len);
+        var fed: usize = 0;
+        var pos: usize = 0;
+        while (fed < SAMPLE_ROWS and pos < body.len) {
+            const k = std.mem.indexOfScalar(u8, body[pos..], '\n');
+            var line = if (k) |j| body[pos .. pos + j] else body[pos..];
+            pos += (k orelse line.len) + 1;
+            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+            if (line.len == 0) continue;
+            sniff.feed(line);
+            fed += 1;
+        }
+        for (fields.items, 0..) |*f, j| f.ty = sniff.resolve(j);
+
+        self.* = .{ .data = data, .body = body, .schema = .{ .fields = try fields.toOwnedSlice() }, .file = file };
         return self;
     }
 
@@ -230,7 +279,7 @@ pub const CsvSliceReader = struct {
         if (self.pos >= self.data.len) return null;
         const ncols = self.schema.fields.len;
         const builders = try arena.alloc(column.Builder, ncols);
-        for (builders) |*b| b.* = column.Builder.init(arena, types.Type.init(.string).asNullable());
+        for (builders, self.schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
 
         var rows: usize = 0;
         while (rows < BATCH_ROWS and self.pos < self.data.len) {
@@ -269,6 +318,86 @@ fn sliceNext(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
 }
 fn sliceClose(_: *anyopaque) void {}
 
+/// Rows sampled for type inference. Both CSV readers sniff the same first
+/// SAMPLE_ROWS lines with the same rules, so the serial and mapped-parallel
+/// paths always agree on a file's schema.
+pub const SAMPLE_ROWS = 1024;
+
+/// Column type inference over sampled lines: int ⊂ float ⊂ string. Quoted cells
+/// force string (quotes mark text), empty cells only mark nullability, and a
+/// leading zero / '+' sign disqualifies int ("007" must round-trip verbatim).
+const TypeSniffer = struct {
+    const ColState = struct { seen: bool = false, all_int: bool = true, all_float: bool = true };
+    cols: []ColState,
+
+    fn init(arena: std.mem.Allocator, ncols: usize) !TypeSniffer {
+        const cols = try arena.alloc(ColState, ncols);
+        for (cols) |*c| c.* = .{};
+        return .{ .cols = cols };
+    }
+
+    fn feed(self: *TypeSniffer, line: []const u8) void {
+        var i: usize = 0;
+        for (self.cols) |*c| {
+            if (i < line.len and line[i] == '"') {
+                c.seen = true;
+                c.all_int = false;
+                c.all_float = false;
+                i += 1;
+                while (i < line.len) {
+                    if (line[i] == '"') {
+                        if (i + 1 < line.len and line[i + 1] == '"') {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            } else {
+                const start = i;
+                while (i < line.len and line[i] != ',') i += 1;
+                const raw = line[start..i];
+                if (raw.len > 0) {
+                    c.seen = true;
+                    if (raw[0] == '+' or (raw.len > 1 and (raw[0] == '0' or (raw[0] == '-' and raw[1] == '0')) and std.mem.indexOfScalar(u8, raw, '.') == null)) {
+                        c.all_int = false;
+                        c.all_float = false; // "007", "+5", "-012": text that numeric round-tripping would rewrite
+                    } else {
+                        if (c.all_int) _ = std.fmt.parseInt(i64, raw, 10) catch {
+                            c.all_int = false;
+                        };
+                        if (c.all_float) _ = std.fmt.parseFloat(f64, raw) catch {
+                            c.all_float = false;
+                        };
+                    }
+                }
+            }
+            if (i < line.len and line[i] == ',') i += 1;
+        }
+    }
+
+    fn resolve(self: *const TypeSniffer, j: usize) types.Type {
+        const c = self.cols[j];
+        const k: types.TypeKind = if (!c.seen or !c.all_float) .string else if (c.all_int) .int else .float;
+        return types.Type.init(k).asNullable();
+    }
+};
+
+/// Append one decoded cell per the builder's column type. Unquoted empty is
+/// null; quoted "" is an empty string. A cell beyond the sample that no longer
+/// parses as the inferred type is a hard error rather than silent corruption.
+// ponytail: bare error name, no line/column context — add when it bites.
+fn appendCell(b: *column.Builder, raw: []const u8, quoted: bool) !void {
+    if (raw.len == 0) return b.append(if (quoted and b.ty.kind == .string) Value{ .string = raw } else .null);
+    switch (b.ty.kind) {
+        .int => try b.append(.{ .int = std.fmt.parseInt(i64, raw, 10) catch return error.CsvTypeMismatch }),
+        .float => try b.append(.{ .float = std.fmt.parseFloat(f64, raw) catch return error.CsvTypeMismatch }),
+        else => try b.append(.{ .string = raw }),
+    }
+}
+
 fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Builder) !void {
     var i: usize = 0;
     var col: usize = 0;
@@ -289,13 +418,12 @@ fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Buil
                 try buf.append(line[i]);
                 i += 1;
             }
-            try builders[col].append(.{ .string = try buf.toOwnedSlice() });
+            try appendCell(&builders[col], try buf.toOwnedSlice(), true);
             if (i < line.len and line[i] == ',') i += 1;
         } else {
             const start = i;
             while (i < line.len and line[i] != ',') i += 1;
-            const raw = line[start..i];
-            try builders[col].append(if (raw.len == 0) .null else Value{ .string = raw });
+            try appendCell(&builders[col], line[start..i], false);
             if (i < line.len and line[i] == ',') i += 1;
         }
     }
@@ -446,7 +574,7 @@ test "CsvReader streams a CSV over http" {
 
     const b = (try r.next(a)).?;
     try std.testing.expectEqual(@as(usize, 2), b.len);
-    try std.testing.expectEqualStrings("1", b.columns[0].getValue(0).string);
+    try std.testing.expectEqual(@as(i64, 1), b.columns[0].getValue(0).int); // numeric column: inferred int
     try std.testing.expectEqualStrings("alpha", b.columns[1].getValue(0).string);
     try std.testing.expectEqualStrings("beta", b.columns[1].getValue(1).string);
     try std.testing.expect((try r.next(a)) == null);
@@ -459,7 +587,7 @@ test "CsvReader maps http status: 4xx permanent, 5xx transient" {
 
     {
         const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var listener = try addr.listen(.{ .reuse_address = true });
+        var listener = try addr.listen(.{ .reuse_address = true });
         defer listener.deinit();
         const th = try std.Thread.spawn(.{}, serveOnce, .{ &listener, "404 Not Found", "nope" });
         defer th.join();
@@ -468,11 +596,207 @@ test "CsvReader maps http status: 4xx permanent, 5xx transient" {
     }
     {
         const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var listener = try addr.listen(.{ .reuse_address = true });
+        var listener = try addr.listen(.{ .reuse_address = true });
         defer listener.deinit();
         const th = try std.Thread.spawn(.{}, serveOnce, .{ &listener, "503 Service Unavailable", "busy" });
         defer th.join();
         const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/data.csv", .{listener.listen_address.getPort()});
         try std.testing.expectError(error.HttpServerBusy, CsvReader.open(a, url));
     }
+}
+
+/// Parse `data` (whole CSV lines, no header) as `ncols` string columns and
+/// return the one resulting batch — the pure-parsing entry shared by every
+/// reader backend (`splitInto` under a `CsvSliceReader`).
+fn parseSlice(a: std.mem.Allocator, schema: *const types.Schema, data: []const u8) !Batch {
+    var r = CsvSliceReader{ .data = data, .schema = schema };
+    return (try r.next(a)).?;
+}
+
+fn stringSchema(a: std.mem.Allocator, names: []const []const u8) !types.Schema {
+    const fields = try a.alloc(types.Schema.Field, names.len);
+    for (names, 0..) |n, i| fields[i] = .{ .name = n, .ty = types.Type.init(.string).asNullable() };
+    return .{ .fields = fields };
+}
+
+test "csv parsing: quoted fields, escaped quotes, empty fields" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const schema = try stringSchema(a, &.{ "a", "b", "c" });
+
+    // quoted field with embedded delimiter; "" escape; empty field -> null
+    const b = try parseSlice(a, &schema, "\"x,y\",\"say \"\"hi\"\"\",\n1,2,3\n");
+    try std.testing.expectEqual(@as(usize, 2), b.len);
+    try std.testing.expectEqualStrings("x,y", b.columns[0].getValue(0).string);
+    try std.testing.expectEqualStrings("say \"hi\"", b.columns[1].getValue(0).string);
+    try std.testing.expect(b.columns[2].getValue(0).isNull());
+    try std.testing.expectEqualStrings("3", b.columns[2].getValue(1).string);
+}
+
+test "csv parsing: CRLF endings, blank lines, ragged rows" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const schema = try stringSchema(a, &.{ "a", "b", "c" });
+
+    // \r stripped; blank lines skipped; short row pads with null; long row drops extras
+    const b = try parseSlice(a, &schema, "1,2,3\r\n\r\n4,5\r\n6,7,8,NINE\n");
+    try std.testing.expectEqual(@as(usize, 3), b.len);
+    try std.testing.expectEqualStrings("3", b.columns[2].getValue(0).string); // no trailing \r
+    try std.testing.expect(b.columns[2].getValue(1).isNull()); // short row -> null
+    try std.testing.expectEqualStrings("6", b.columns[0].getValue(2).string);
+    try std.testing.expectEqualStrings("8", b.columns[2].getValue(2).string); // "NINE" dropped
+}
+
+test "csv parsing: leading/trailing empty fields and last line without newline" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const schema = try stringSchema(a, &.{ "a", "b", "c" });
+
+    const b = try parseSlice(a, &schema, ",mid,\nx,y,z"); // no trailing \n
+    try std.testing.expectEqual(@as(usize, 2), b.len);
+    try std.testing.expect(b.columns[0].getValue(0).isNull());
+    try std.testing.expectEqualStrings("mid", b.columns[1].getValue(0).string);
+    try std.testing.expect(b.columns[2].getValue(0).isNull());
+    try std.testing.expectEqualStrings("z", b.columns[2].getValue(1).string);
+}
+
+test "writeField quotes exactly the fields that need it, doubling quotes" {
+    var buf = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer buf.deinit();
+    try writeField(buf.writer(), "plain");
+    try buf.append('|');
+    try writeField(buf.writer(), "a,b");
+    try buf.append('|');
+    try writeField(buf.writer(), "say \"hi\"");
+    try buf.append('|');
+    try writeField(buf.writer(), "line\nbreak");
+    try std.testing.expectEqualStrings("plain|\"a,b\"|\"say \"\"hi\"\"\"|\"line\nbreak\"", buf.items);
+}
+
+test "csv write/parse round-trip preserves quoted values" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const schema = try stringSchema(a, &.{ "a", "b" });
+
+    // serialize one row through writeField, then parse it back with splitInto
+    var line = std.array_list.Managed(u8).init(a);
+    try writeField(line.writer(), "O'Neil, \"Jr\"");
+    try line.append(',');
+    try writeField(line.writer(), "plain");
+    try line.append('\n');
+    const b = try parseSlice(a, &schema, line.items);
+    try std.testing.expectEqualStrings("O'Neil, \"Jr\"", b.columns[0].getValue(0).string);
+    try std.testing.expectEqualStrings("plain", b.columns[1].getValue(0).string);
+}
+
+test "TypeSniffer: int/float promotion, leading zeros and quoted cells force string, empties only mark nulls" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    var s = try TypeSniffer.init(ar.allocator(), 6);
+    s.feed("1,1.5,abc,007,\"9\",");
+    s.feed("-2,2,x,12,3,");
+    try std.testing.expectEqual(types.TypeKind.int, s.resolve(0).kind);
+    try std.testing.expectEqual(types.TypeKind.float, s.resolve(1).kind); // int promoted by 1.5
+    try std.testing.expectEqual(types.TypeKind.string, s.resolve(2).kind);
+    try std.testing.expectEqual(types.TypeKind.string, s.resolve(3).kind); // "007" must survive verbatim
+    try std.testing.expectEqual(types.TypeKind.string, s.resolve(4).kind); // quoted = text
+    try std.testing.expectEqual(types.TypeKind.string, s.resolve(5).kind); // all-empty column
+    try std.testing.expect(s.resolve(0).nullable);
+}
+
+test "serial and mapped readers infer the same schema; mismatch past the sample errors" {
+    const gpa = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // > SAMPLE_ROWS int rows, then text in the int column past the sample.
+    var data = std.array_list.Managed(u8).init(a);
+    try data.appendSlice("id,name\n");
+    for (0..SAMPLE_ROWS + 10) |i| try data.writer().print("{d},n{d}\n", .{ i + 1, i + 1 });
+    try tmp.dir.writeFile(.{ .sub_path = "ok.csv", .data = data.items });
+    try data.appendSlice("oops,tail\n");
+    try tmp.dir.writeFile(.{ .sub_path = "bad.csv", .data = data.items });
+    const base = try tmp.dir.realpathAlloc(a, ".");
+
+    const ok_path = try std.fs.path.join(a, &.{ base, "ok.csv" });
+    const r = try CsvReader.open(a, ok_path);
+    defer r.close();
+    const m = try MappedCsv.open(a, ok_path);
+    defer m.close();
+    try std.testing.expectEqual(types.TypeKind.int, r.schema.fields[0].ty.kind);
+    try std.testing.expectEqual(types.TypeKind.int, m.schema.fields[0].ty.kind);
+    try std.testing.expectEqual(types.TypeKind.string, r.schema.fields[1].ty.kind);
+    try std.testing.expectEqual(types.TypeKind.string, m.schema.fields[1].ty.kind);
+
+    const bad_path = try std.fs.path.join(a, &.{ base, "bad.csv" });
+    const rb = try CsvReader.open(a, bad_path);
+    defer rb.close();
+    var err: ?anyerror = null;
+    while (rb.next(a) catch |e| blk: {
+        err = e;
+        break :blk null;
+    }) |_| {}
+    try std.testing.expectEqual(@as(?anyerror, error.CsvTypeMismatch), err);
+}
+
+test "MappedCsv chunks are newline-aligned, disjoint, and covering" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Uneven line lengths so naive byte splits would land mid-line.
+    const body = "1,alpha\n22,bb\n333,c\n4444,dddd\n5,e\n";
+    try tmp.dir.writeFile(.{ .sub_path = "t.csv", .data = "id,name\n" ++ body });
+    const path = try tmp.dir.realpathAlloc(a, "t.csv");
+
+    const m = try MappedCsv.open(a, path);
+    defer m.close();
+    try std.testing.expectEqual(@as(usize, 2), m.schema.fields.len);
+    try std.testing.expectEqualStrings("name", m.schema.fields[1].name);
+    try std.testing.expectEqualStrings(body, m.body);
+
+    const n = 3;
+    var reassembled = std.array_list.Managed(u8).init(a);
+    for (0..n) |i| {
+        const c = m.chunk(i, n);
+        // whole lines only: each non-empty chunk ends exactly at a newline
+        if (c.len > 0) try std.testing.expectEqual(@as(u8, '\n'), c[c.len - 1]);
+        try reassembled.appendSlice(c);
+    }
+    // disjoint + covering: concatenating the chunks reproduces the body exactly
+    try std.testing.expectEqualStrings(body, reassembled.items);
+
+    // more chunks than lines: still covering, extras are empty
+    var total: usize = 0;
+    for (0..16) |i| total += m.chunk(i, 16).len;
+    try std.testing.expectEqual(body.len, total);
+}
+
+test "CsvSliceReader over a MappedCsv chunk parses only its rows" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "t.csv", .data = "id\n1\n2\n3\n4\n" });
+    const path = try tmp.dir.realpathAlloc(a, "t.csv");
+    const m = try MappedCsv.open(a, path);
+    defer m.close();
+
+    var rows: usize = 0;
+    for (0..2) |i| {
+        var r = CsvSliceReader{ .data = m.chunk(i, 2), .schema = &m.schema };
+        while (try r.next(a)) |b| rows += b.len;
+    }
+    try std.testing.expectEqual(@as(usize, 4), rows);
 }
