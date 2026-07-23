@@ -35,7 +35,9 @@ CASE ... END CASE;                -- plan-time dispatch
   accepted with BSL backslash escapes.
 - **Raw SQL literals** use Postgres dollar-quoting: `$$...$$`, or
   `$tag$...$tag$` when the body contains `$$`. No escaping inside; `${...}`
-  interpolation still applies.
+  interpolation of loop vars still applies within them (§7).
+- **Dynamic names** (per-row table/sink names, keys) use `$var` +
+  `IDENTIFIER()` + `||`, not raw string interpolation — see §7.
 
 ## 2. Parameters
 
@@ -91,8 +93,8 @@ AS
 ```
 
 - File target by path: `LOAD INTO '/out/x.csv' AS ...` (CSV writer).
-- The target may be a quoted, interpolated string part:
-  `LOAD INTO sr.'crm_${lower(name)}' ...`.
+- A per-row dynamic target uses `IDENTIFIER(<string-expr>)` over loop vars
+  (§7): `LOAD INTO sr.IDENTIFIER('crm_' || lower($name)) ...`.
 - Dispositions: `APPEND` (default, omissible) · `REPLACE` (overwrite) ·
   `UPSERT ON (k1, k2)` · `UPSERT ON (id) PARTIAL COLS (a, b)` · bare `UPSERT`
   (infer the PK from the source table's metadata at plan time — needs a table
@@ -126,6 +128,7 @@ LIMIT 100 OFFSET 20;
 | source | syntax |
 |--------|--------|
 | SQL table | `FROM erp.dbo.SC5010` |
+| SQL table (per-row name) | `FROM erp.dbo.IDENTIFIER($name)` (§7) — still a table read |
 | raw query | `FROM erp.QUERY($$SELECT ...$$)` (no dialect translation) |
 | CSV file / HTTPS CSV | `FROM 'path-or-url.csv'` |
 | REST (connection) | `FROM crm.'/v1/customers'` (path on the conn's base URL) |
@@ -136,10 +139,12 @@ LIMIT 100 OFFSET 20;
 
 Source clauses, in any order after the source:
 
-- **`PUSHDOWN($$<fragment>$$)`** — raw predicate fragment sent verbatim into
-  the generated source query's `WHERE` (the successor of BSL `@[where]`).
-  ANDed with whatever the translated `WHERE` pushes down. Empty literal = no
-  clause. Syntax errors surface at the source at runtime (permanent, exit 1).
+- **`PUSHDOWN(<expr>)`** — a raw predicate sent verbatim into the generated
+  source query's `WHERE` (the successor of BSL `@[where]`). The argument is a
+  string expression: a `$$...$$` literal (`PUSHDOWN($$D_E_L_E_T_ <> '*'$$)`),
+  a loop-var value (`PUSHDOWN($where)`), or one built with `||`. ANDed with
+  whatever the translated `WHERE` pushes down. Empty ⇒ no clause. Syntax errors
+  surface at the source at runtime (permanent, exit 1).
 - **Implicit pushdown** — the contiguous `WHERE` (filter) prefix directly after
   a SQL table/query read is translated into that source query's `WHERE`
   automatically. Translatable: comparisons, `AND`/`OR`/`NOT`, `IS [NOT]
@@ -211,35 +216,57 @@ remappable via `WITH (table_field = ..., tag_field = ..., tag_substr = '4,2')`.
 
 ## 7. `FOR EACH ROW OF` and the `CASE` statement
 
-Plan-time fan-out — one pipeline (or dispatch) per row of a discovery source:
+Plan-time fan-out — one pipeline (or dispatch) per row of a discovery source.
+A catalog of tables, each read and loaded under a per-row name:
 
 ```sql
-FOR EACH ROW OF (crm.QUERY($$SELECT name, pk FROM meta$$)) AS (name, pk)
+FOR EACH ROW OF ($tables) AS (name, where)
   PARALLEL ON ERROR CONTINUE           -- or SEQUENTIAL / ON ERROR STOP
-  CASE
-    WHEN pk IS EMPTY THEN
-      LOAD INTO sr.'crm_${lower(name)}' USING stream_load AS
-      SELECT * FROM crm.QUERY($$SELECT * FROM ${name}$$);
-    ELSE
-      LOAD INTO sr.'crm_${lower(name)}' USING stream_load
-        UPSERT ON ('${pk}') AS
-      SELECT * FROM crm.QUERY($$SELECT * FROM ${name}$$);
-  END CASE
+  LOAD INTO sr.IDENTIFIER('fluig_' || lower($name))
+    USING stream_load UPSERT AS        -- bare UPSERT: PK inferred from source
+  SELECT *, now() AS extraction_timestamp
+  FROM fluig.dbo.IDENTIFIER($name)     -- a per-row TABLE read
+  PUSHDOWN($where);                    -- raw predicate value ("" ⇒ no WHERE)
 END FOR;
 ```
 
 - Sources: a raw discovery query (`conn.QUERY($$...$$)`, first N columns → N
-  loop vars positionally) or a JSON param path (`$job.tables`, object fields
-  bound by name; a missing field binds to `""`).
+  loop vars positionally) or a JSON param path (`$tables`, `$job.tables`, …;
+  object fields bound to the loop vars by name, a missing field ⇒ `""`).
 - Loop variables may be typed: `AS (name, port:INT)`.
-- `${var}` interpolates into targets, keys, raw SQL literals, and strings;
-  `${ <expr> }` evaluates an expression with the loop vars in scope
-  (`'${if(pk == "", concat(name, "id"), pk)}'`). C#-style: nested string
-  literals inside the hole need no escaping.
 - The `CASE` **statement** (`... THEN <statements> ... END CASE`) dispatches
   whole pipelines per row — subject form (`CASE $env WHEN 'prod', 'staging'
-  THEN ... END CASE`) and guard form shown above. `END CASE` distinguishes it
-  from the CASE **expression** (§9).
+  THEN ... END CASE`) and the guard form. `END CASE` distinguishes it from the
+  CASE **expression** (§9). Use it when the branches are *different pipelines*
+  (different sources/sinks); for choosing a *value*, put the conditional in the
+  expression (`IDENTIFIER(if($pk = '', $name || 'id', $pk))`).
+
+### Dynamic names — `$var`, `IDENTIFIER()`, `||`
+
+Loop variables (and params) are referenced with `$` — `$name`, `$where` —
+resolved by name per row. A *name* is computed from them by an ordinary string
+expression, and **`IDENTIFIER(<string-expr>)`** turns that string into a table
+or object reference (the precedent is Snowflake / Databricks `IDENTIFIER`).
+`||` is string concat; `lower()`, `if()`, `concat()` compose as usual.
+
+| you want | write |
+|---|---|
+| a per-row source table | `FROM conn.schema.IDENTIFIER($name)` |
+| a computed sink name | `LOAD INTO conn.IDENTIFIER('pre_' \|\| lower($name))` |
+| a raw predicate value | `PUSHDOWN($where)` |
+| a conditional key | `UPSERT ON (IDENTIFIER(if($pk = '', $name \|\| 'id', $pk)))` |
+
+`IDENTIFIER($name)` resolves to a **table** read, so bare `UPSERT` still infers
+the PK from source metadata — a raw `QUERY(...)` read cannot. This is why the
+catalog holds only `{name, where}`, never a PK.
+
+### Raw `${...}` interpolation (raw SQL bodies only)
+
+Inside a raw `QUERY($$...$$)` or `PUSHDOWN($$...$$)` literal, `${var}` /
+`${ <expr> }` still splices loop values into the SQL text (C#-style: nested
+string literals in the hole need no escaping) — `QUERY($$SELECT ${cols} FROM
+${name}$$)`. Prefer `$var` + `IDENTIFIER()` everywhere a *name* is meant;
+reach for `${...}` only when you are literally building a raw SQL string.
 
 ## 8. HTTP mode
 
@@ -308,9 +335,15 @@ FROM BUFFER 'eventos'
 
 ## 9. Expressions
 
-SQL-ish, Pratt-parsed. Precedence (high→low): unary `- NOT` → `* / %` → `+ -`
-→ comparisons `= == != <> < <= > >= LIKE IN IS` → `??` → `AND` → `OR`.
+SQL-ish, Pratt-parsed. Precedence (high→low): unary `- NOT` → `* / %` →
+`+ - ||` → comparisons `= == != <> < <= > >= LIKE IN IS` → `??` → `AND` → `OR`.
 
+- `$name` — a reference to a param or (inside `FOR EACH ROW OF`) a loop
+  variable, resolved by name. `$job.a?.b` navigates a JSON param.
+- `a || b` — string concat (ANSI), sugar for `concat(a, b)`.
+- `IDENTIFIER(<string-expr>)` — treat a computed string as a table/object name
+  (§7); valid in `FROM`/`LOAD INTO`/upsert-key positions, not general
+  expressions.
 - `CASE` expression, both forms:
   `CASE status WHEN 'paid', 'ok' THEN 'done' ELSE 'open' END` ·
   `CASE WHEN amount >= 1000 THEN 'gold' WHEN amount >= 100 THEN 'silver' ELSE 'std' END`
@@ -355,6 +388,12 @@ From migration.md, accepted design not yet in the engine:
   translator (`runtime/pushdown.zig`) is the reusable core when this lands.
 - **Generalized `EACH TABLE OF (SELECT ...)`** discovery — needs the same
   query→SQL translation; the raw `QUERY($$...$$)` form covers it meanwhile.
+- **`$var` reflection is wired for names, not values.** `$name` works in
+  `IDENTIFIER()`, `PUSHDOWN`, and target/key positions (§7). A loop var used
+  as a computed `SELECT` **value** still needs the raw form
+  (`SELECT '${emp}' AS empresa`), and a dynamic **CSV file path** still uses
+  string interpolation inside the quote (`FROM 'dir/${name}.csv'`) — neither
+  accepts a bare `$var`/`||` expression yet.
 
 The golden corpus that gated the BSL parser's removal lives in
 `examples/golden/` — see its README for the comparison rules.

@@ -247,6 +247,14 @@ pub const Lexer = struct {
             '-' => return self.make(.minus, self.src[start..self.i], line, col),
             '/' => return self.make(.slash, self.src[start..self.i], line, col),
             '%' => return self.make(.percent, self.src[start..self.i], line, col),
+            '|' => {
+                // `||` — string concat (SQL). A lone `|` is invalid.
+                if (self.i < self.src.len and self.src[self.i] == '|') {
+                    _ = self.bump();
+                    return self.make(.pipe, self.src[start..self.i], line, col);
+                }
+                return self.make(.invalid, self.src[start..self.i], line, col);
+            },
             '=' => {
                 if (self.i < self.src.len and self.src[self.i] == '=') {
                     _ = self.bump();
