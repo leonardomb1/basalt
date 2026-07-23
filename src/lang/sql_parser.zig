@@ -315,6 +315,126 @@ pub const Parser = struct {
         return decl;
     }
 
+    // --- reflection: $var refs + IDENTIFIER()/||, lowered to `${...}` templates
+    // ------------------------------------------------------------------------
+    // The runtime already interpolates `${...}` per for-each row (renderQual /
+    // renderHints / interpAll). So `IDENTIFIER(<string-expr>)` and a PUSHDOWN
+    // expression are lowered here into that internal template form — the engine
+    // stays untouched. `$name` (a loop var / param) parses as a field ref and
+    // becomes a bare `${name}` hole; `||` is concat; `lower($x)` etc. compose.
+
+    /// One dotted name atom: a plain identifier, or `IDENTIFIER(<expr>)` whose
+    /// string value is computed per row (lowered to a `${...}` template).
+    fn parseNameSegment(self: *Parser) Error![]const u8 {
+        if (self.isKw("identifier") and self.peekTag() == .lparen) {
+            _ = self.advance(); // IDENTIFIER
+            _ = try self.expect(.lparen);
+            const e = try self.parseExpr();
+            _ = try self.expect(.rparen);
+            return self.exprToTemplate(e);
+        }
+        return self.expectIdent();
+    }
+
+    /// A write-target atom: a name, a quoted string (interpolated as-is), or
+    /// IDENTIFIER(<expr>) for a computed name.
+    fn parseTargetSegment(self: *Parser) Error![]const u8 {
+        if (self.isKw("identifier") and self.peekTag() == .lparen) {
+            _ = self.advance();
+            _ = try self.expect(.lparen);
+            const e = try self.parseExpr();
+            _ = try self.expect(.rparen);
+            return self.exprToTemplate(e);
+        }
+        return self.expectColName(); // ident or quoted string
+    }
+
+    /// Lower a reflection expression into the internal `${...}` template. A
+    /// `concat(...)` / `||` chain becomes literal text spliced with `${expr}`
+    /// holes; a bare string literal stays literal (no hole); anything else is
+    /// one `${expr}` hole re-parsed and evaluated per row.
+    fn exprToTemplate(self: *Parser, e: *const ast.Expr) Error![]const u8 {
+        var buf = std.array_list.Managed(u8).init(self.arena);
+        try self.templatePart(&buf, e);
+        return buf.toOwnedSlice();
+    }
+
+    fn templatePart(self: *Parser, buf: *std.array_list.Managed(u8), e: *const ast.Expr) Error!void {
+        switch (e.*) {
+            .str_lit => |s| try buf.appendSlice(s),
+            .call => |c| {
+                if (std.mem.eql(u8, c.name, "concat")) {
+                    for (c.args) |arg| try self.templatePart(buf, arg);
+                    return;
+                }
+                try buf.appendSlice("${");
+                try self.unparse(buf, e);
+                try buf.append('}');
+            },
+            else => {
+                try buf.appendSlice("${");
+                try self.unparse(buf, e);
+                try buf.append('}');
+            },
+        }
+    }
+
+    /// Print an expression back as interpolation-hole text (the `${ <here> }`
+    /// sub-language, which is the same expression grammar; `$name` already
+    /// parsed to a bare field, so it prints as `name`).
+    fn unparse(self: *Parser, buf: *std.array_list.Managed(u8), e: *const ast.Expr) Error!void {
+        switch (e.*) {
+            .null_lit => try buf.appendSlice("null"),
+            .bool_lit => |b| try buf.appendSlice(if (b) "true" else "false"),
+            .int_lit => |v| try buf.writer().print("{d}", .{v}),
+            .float_lit => |v| try buf.writer().print("{d}", .{v}),
+            .str_lit => |s| {
+                try buf.append('\'');
+                for (s) |ch| {
+                    if (ch == '\'') try buf.append('\'');
+                    try buf.append(ch);
+                }
+                try buf.append('\'');
+            },
+            .field => |q| for (q.parts, 0..) |p, i| {
+                if (i > 0) try buf.append('.');
+                try buf.appendSlice(p);
+            },
+            .call => |c| {
+                try buf.appendSlice(c.name);
+                try buf.append('(');
+                for (c.args, 0..) |arg, i| {
+                    if (i > 0) try buf.appendSlice(", ");
+                    try self.unparse(buf, arg);
+                }
+                try buf.append(')');
+            },
+            .binary => |b| {
+                try buf.append('(');
+                try self.unparse(buf, b.l);
+                try buf.append(' ');
+                try buf.appendSlice(binOpText(b.op));
+                try buf.append(' ');
+                try self.unparse(buf, b.r);
+                try buf.append(')');
+            },
+            .unary => |u| {
+                try buf.appendSlice(if (u.op == .not) "not " else "-");
+                try self.unparse(buf, u.e);
+            },
+            .cond => |c| {
+                try buf.appendSlice("if(");
+                try self.unparse(buf, c.cond);
+                try buf.appendSlice(", ");
+                try self.unparse(buf, c.then);
+                try buf.appendSlice(", ");
+                try self.unparse(buf, c.els);
+                try buf.append(')');
+            },
+            else => return self.fail(self.curPos(), "expression too complex to use as a dynamic identifier or predicate", .{}),
+        }
+    }
+
     /// `<int> KB|MB|GB` -> bytes.
     fn parseByteSize(self: *Parser) Error!u64 {
         const n = try self.expect(.int);
@@ -484,9 +604,11 @@ pub const Parser = struct {
             if (!self.isConn(conn))
                 return self.fail(pos, "unknown connection `{s}` in LOAD INTO (declare it with CREATE CONNECTION first)", .{conn});
             _ = try self.expect(.dot);
+            // Target segments: a name, a quoted `'...'` (interpolated) string, or
+            // IDENTIFIER(<expr>) for a per-row dynamic name.
             var parts = std.array_list.Managed([]const u8).init(self.arena);
-            try parts.append(try self.expectColName());
-            while (self.eat(.dot)) try parts.append(try self.expectColName());
+            try parts.append(try self.parseTargetSegment());
+            while (self.eat(.dot)) try parts.append(try self.parseTargetSegment());
             const target = try std.mem.join(self.arena, ".", parts.items);
             write = .{ .connector = conn, .form = null, .target = target, .mode = .default };
         }
@@ -740,10 +862,13 @@ pub const Parser = struct {
         while (true) {
             if (self.eatKw("pushdown")) {
                 _ = try self.expect(.lparen);
-                const frag = try self.expect(.string);
+                // A raw predicate: a `$$...$$` literal, a `$var` (injected
+                // verbatim per row), or a string expression building one.
+                const e = try self.parseExpr();
                 _ = try self.expect(.rparen);
-                if (frag.text.len > 0)
-                    try read_hints.append(.{ .key = "where", .value = .{ .str = frag.text }, .pos = pos });
+                const frag = try self.exprToTemplate(e);
+                if (frag.len > 0)
+                    try read_hints.append(.{ .key = "where", .value = .{ .str = frag }, .pos = pos });
             } else if (self.isKw("paginate")) {
                 try self.parsePaginate(&read_hints);
             } else if (self.isKw("retry")) {
@@ -1059,11 +1184,13 @@ pub const Parser = struct {
                     // REST path relative to an http connection's base URL.
                     node = .{ .read = .{ .connector = head, .form = .{ .path = self.advance().text } } };
                 } else {
+                    // conn.schema.table — any segment may be IDENTIFIER(<expr>)
+                    // for a per-row dynamic name (e.g. `fluig.dbo.IDENTIFIER($name)`).
                     var parts = std.array_list.Managed([]const u8).init(self.arena);
-                    try parts.append(try self.expectIdent());
+                    try parts.append(try self.parseNameSegment());
                     while (self.at(.dot) and self.peekTag() == .ident) {
                         _ = self.advance();
-                        try parts.append(try self.expectIdent());
+                        try parts.append(try self.parseNameSegment());
                     }
                     node = .{ .read = .{ .connector = head, .form = .{ .table = .{ .parts = try parts.toOwnedSlice() } } } };
                 }
@@ -1503,6 +1630,17 @@ pub const Parser = struct {
                 lhs = try self.mk(.{ .call = .{ .name = "coalesce", .args = args } });
                 continue;
             }
+            // `a || b` — string concat (ANSI), sugar for concat(a, b). Same
+            // strength as `+` so it composes left-to-right in a name/predicate.
+            if (self.at(.pipe) and min_bp < 50) {
+                _ = self.advance();
+                const rhs = try self.parseBin(50);
+                const args = try self.arena.alloc(*ast.Expr, 2);
+                args[0] = lhs;
+                args[1] = rhs;
+                lhs = try self.mk(.{ .call = .{ .name = "concat", .args = args } });
+                continue;
+            }
             const info = self.binInfo() orelse break;
             if (info.lbp <= min_bp) break;
             _ = self.advance();
@@ -1674,6 +1812,14 @@ pub const Parser = struct {
 };
 
 // --- helpers ------------------------------------------------------------------
+
+fn binOpText(op: ast.BinOp) []const u8 {
+    return switch (op) {
+        .add => "+",   .sub => "-",  .mul => "*",  .div => "/",  .mod => "%",
+        .eq => "==",   .ne => "!=",  .lt => "<",   .le => "<=",  .gt => ">",
+        .ge => ">=",   .@"and" => "and", .@"or" => "or",
+    };
+}
 
 fn qualHasPrefix(q: ast.QualName, prefix: []const u8) bool {
     return q.parts.len > 1 and std.mem.eql(u8, q.parts[0], prefix);
@@ -1945,4 +2091,51 @@ test "sql: ACCEPT INTO BUFFER declaration and FROM BUFFER source" {
     try testing.expectEqualStrings("flush_rows", pl.stages[0].hints[1].key);
     try testing.expectEqual(@as(i64, 50000), pl.stages[0].hints[1].value.int);
     try testing.expect(pl.stages[1].node == .filter);
+}
+
+test "sql: reflection lowering — IDENTIFIER / || / PUSHDOWN(expr) -> ${...} templates" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a,
+        \\PARAM tables JSON;
+        \\CREATE CONNECTION fluig TYPE sqlserver OPTIONS (host = 'h', database = 'd');
+        \\CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = 'h', database = 'b');
+        \\FOR EACH ROW OF ($tables) AS (name, where)
+        \\  PARALLEL ON ERROR CONTINUE
+        \\  LOAD INTO sr.IDENTIFIER('fluig_' || lower($name))
+        \\    USING stream_load UPSERT AS
+        \\  SELECT *, now() AS extraction_timestamp
+        \\  FROM fluig.dbo.IDENTIFIER($name)
+        \\  PUSHDOWN($where);
+        \\END FOR;
+    );
+    const fe = prog.stmts[4].for_each;
+    const body = fe.body[0].output;
+    const rd = body.stages[0].node.read;
+    // table: fluig.dbo.IDENTIFIER($name) -> parts ["dbo", "${name}"]
+    try testing.expectEqualStrings("dbo", rd.form.table.parts[0]);
+    try testing.expectEqualStrings("${name}", rd.form.table.parts[1]);
+    // PUSHDOWN($where) -> where hint "${where}"
+    try testing.expectEqualStrings("where", body.stages[0].hints[0].key);
+    try testing.expectEqualStrings("${where}", body.stages[0].hints[0].value.str);
+    // target IDENTIFIER('fluig_' || lower($name)) -> "fluig_${lower(name)}"
+    const w = body.stages[body.stages.len - 1].node.write;
+    try testing.expectEqualStrings("fluig_${lower(name)}", w.target);
+    try testing.expect(w.mode == .upsert);
+    try testing.expectEqual(@as(usize, 0), w.mode.upsert.keys.len); // bare upsert (PK inferred)
+}
+
+test "sql: PUSHDOWN($$literal$$) still lowers to a plain fragment (no hole)" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parseTest(a,
+        \\CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'h', database = 'd');
+        \\LOAD INTO '/tmp/x.csv' AS
+        \\SELECT filial FROM erp.dbo.T PUSHDOWN($$D_E_L_E_T_ <> '*'$$);
+    );
+    const st = prog.stmts[2].output.stages[0];
+    try testing.expectEqualStrings("D_E_L_E_T_ <> '*'", st.hints[0].value.str);
 }
