@@ -57,8 +57,8 @@ pub fn expandProgram(arena: std.mem.Allocator, program: ast.Program, body: ?[]co
 
 fn expandStmt(cx: *Ctx, s: ast.Stmt) Error!ast.Stmt {
     return switch (s) {
-        .kind => |k| .{ .kind = .{ .kind = k.kind, .config = try expandAttrs(cx, k.config), .pos = k.pos } },
-        .param => |p| .{ .param = .{ .name = p.name, .ty = p.ty, .default = if (p.default) |d| try expandExpr(cx, d, null, 0) else null, .source = p.source, .pos = p.pos, .is_json = p.is_json } },
+        .kind => |k| .{ .kind = .{ .kind = k.kind, .config = try expandAttrs(cx, k.config), .buffer = k.buffer, .pos = k.pos } },
+        .param => |p| .{ .param = .{ .name = p.name, .ty = p.ty, .default = if (p.default) |d| try expandExpr(cx, d, null, 0) else null, .source = p.source, .header_name = p.header_name, .pos = p.pos, .is_json = p.is_json } },
         .connection => |c| .{ .connection = .{ .name = c.name, .connector = c.connector, .config = try expandAttrs(cx, c.config), .pos = c.pos } },
         .binding => |b| .{ .binding = .{ .name = b.name, .pipeline = try expandPipeline(cx, b.pipeline), .pos = b.pos } },
         .output => |p| .{ .output = try expandPipeline(cx, p) },
@@ -96,8 +96,45 @@ fn expandNode(cx: *Ctx, n: ast.Stage.Node) Error!ast.Stage.Node {
             for (ag.aggs, 0..) |a, i| aggs[i] = .{ .name = a.name, .func = a.func, .arg = if (a.arg) |e| try expandExpr(cx, e, null, 0) else null };
             break :blk .{ .aggregate = .{ .aggs = aggs, .by = ag.by } };
         },
-        else => n, // read/union/limit/distinct/sort/join/write/explode/ref carry no free exprs
+        // A json-form union (`EACH TABLE OF ($job.tables) IN conn`) carries its
+        // source as a `${param.path}` placeholder — substitute the raw JSON
+        // subtree here, where the body document lives.
+        .union_ => |u| blk: {
+            const rendered = (try renderDiscoverJson(cx, u.discover_json)) orelse break :blk n;
+            var uu = u;
+            uu.discover_json = rendered;
+            break :blk .{ .union_ = uu };
+        },
+        else => n, // read/limit/distinct/sort/join/write/explode/ref carry no free exprs
     };
+}
+
+/// If `s` is exactly `${<json-param>.<path>}`, render the addressed JSON
+/// subtree as text (the union's branch array). Returns null when `s` is not
+/// that shape or names no JSON param (e.g. a loop-var placeholder rendered
+/// later by the for-each pass). An unbound param (offline check / no body)
+/// renders `[]` — zero branches.
+fn renderDiscoverJson(cx: *Ctx, s: []const u8) Error!?[]const u8 {
+    if (s.len < 4 or !std.mem.startsWith(u8, s, "${") or s[s.len - 1] != '}') return null;
+    const body = s[2 .. s.len - 1];
+    var it = std.mem.splitScalar(u8, body, '.');
+    const head = it.next().?;
+    const doc = cx.json.get(head) orelse return null; // not a JSON param
+    var cur = doc orelse return "[]"; // param unbound: no branches
+    while (it.next()) |key| {
+        if (key.len == 0) return null; // not a plain dotted path
+        switch (cur) {
+            .object => |o| cur = o.get(key) orelse {
+                cx.msg.* = std.fmt.allocPrint(cx.arena, "union json: key `{s}` not found in `{s}`", .{ key, s }) catch "union json: key not found";
+                return error.ExpandFailed;
+            },
+            else => {
+                cx.msg.* = std.fmt.allocPrint(cx.arena, "union json: `{s}` is not an object in `{s}`", .{ key, s }) catch "union json: not an object";
+                return error.ExpandFailed;
+            },
+        }
+    }
+    return std.json.Stringify.valueAlloc(cx.arena, cur, .{}) catch return error.OutOfMemory;
 }
 
 fn expandSelect(cx: *Ctx, items: []const ast.SelectItem) Error![]const ast.SelectItem {
@@ -384,4 +421,43 @@ test "expandProgram leaves JSON paths null when unbound (offline check)" {
     var msg: []const u8 = "";
     const out = try expandProgram(a, prog, null, &msg);
     try std.testing.expect(outputSelect(out)[0].computed.expr.* == .null_lit);
+}
+
+test "json-form union: $param.path renders the branch array into discover_json" {
+    const parser = @import("sql_parser.zig");
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a,
+        \\PARAM job JSON FROM BODY;
+        \\CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'h', database = 'd');
+        \\CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = 'h', database = 'b');
+        \\LOAD INTO sr.UNIFIED USING stream_load AS
+        \\SELECT * FROM EACH TABLE OF ($job.tables) IN erp AS (table_name, emp);
+    , &diag);
+
+    var msg: []const u8 = "";
+    const out = try expandProgram(a, prog,
+        \\{"tables":[{"table":"CT2010","tag":"01"},{"table":"CT2020","tag":"02"}]}
+    , &msg);
+    var found = false;
+    for (out.stmts) |s| {
+        if (s != .output) continue;
+        const u = s.output.stages[0].node.union_;
+        try std.testing.expectEqualStrings("erp", u.discover_conn);
+        try std.testing.expectEqualStrings(
+            \\[{"table":"CT2010","tag":"01"},{"table":"CT2020","tag":"02"}]
+        , u.discover_json);
+        found = true;
+    }
+    try std.testing.expect(found);
+
+    // Offline (no body): the placeholder renders to zero branches, not an error.
+    var msg2: []const u8 = "";
+    const off = try expandProgram(a, prog, null, &msg2);
+    for (off.stmts) |s| {
+        if (s != .output) continue;
+        try std.testing.expectEqualStrings("[]", s.output.stages[0].node.union_.discover_json);
+    }
 }

@@ -172,6 +172,27 @@ pub const ReadForm = union(enum) {
     /// (`FROM BODY (col TYPE [NOT NULL], ...)`, enforced at bind time), or
     /// null to infer it from the first object (BSL `read request`).
     request: ?[]const types.BodyCol,
+    /// `FROM BUFFER 'name' [AT 'dir']` — replay/drain a durable WAL buffer.
+    /// An empty `dir` resolves from the program's `INTO BUFFER` declaration.
+    buffer: BufferRef,
+};
+
+pub const BufferRef = struct { name: []const u8, dir: []const u8 = "" };
+
+/// `CREATE ENDPOINT ... ACCEPT BODY (schema) INTO BUFFER 'name' AT 'dir'
+/// SEGMENT n MB [RETAIN UNTIL LOADED | RETAIN n HOURS]` — the durable-buffer
+/// declaration (migration.md §10). The endpoint acks 200 after fsync; the
+/// pipeline drains the buffer asynchronously via `FROM BUFFER`.
+pub const BufferDecl = struct {
+    name: []const u8,
+    dir: []const u8,
+    segment_bytes: u64 = 16 << 20,
+    retain_hours: ?u32 = null, // null = RETAIN UNTIL LOADED (purge once loaded)
+    /// Backpressure limit (`MAX n MB|GB`): bytes on disk beyond this ⇒ the
+    /// endpoint answers 503 + Retry-After.
+    max_bytes: u64 = 1 << 30,
+    schema: []const types.BodyCol,
+    pos: Pos,
 };
 
 pub const SelectItem = union(enum) {
@@ -274,6 +295,9 @@ pub const Param = struct {
     ty: types.Type,
     default: ?*Expr,
     source: ?ParamSource,
+    /// `FROM HEADER('X-Tenant')`: which request header binds this param.
+    /// Null (bare `FROM HEADER`) means the header is named like the param.
+    header_name: ?[]const u8 = null,
     pos: Pos,
     /// `param x json from body`: the value is a JSON document (parsed into a
     /// separate binding namespace, navigated via `x.a.b` paths), not a scalar
@@ -333,7 +357,13 @@ pub const ForEach = struct {
 
 pub const Kind = enum { batch, http };
 
-pub const KindDecl = struct { kind: Kind, config: []const Attr, pos: Pos };
+pub const KindDecl = struct {
+    kind: Kind,
+    config: []const Attr,
+    /// Set by `ACCEPT ... INTO BUFFER` on a CREATE ENDPOINT (http only).
+    buffer: ?BufferDecl = null,
+    pos: Pos,
+};
 
 /// Plan-time structural dispatch: `match [subject] arm... end`, where each arm's
 /// body is a `{ ... }` block of statements. Mirrors the expression `Match` arm

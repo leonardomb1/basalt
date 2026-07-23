@@ -64,14 +64,7 @@ pub const RequestSource = struct {
 
         if (declared) |cols| {
             try validateBody(items, cols, msg_arena, msg_out);
-            const fields = try arena.alloc(types.Schema.Field, cols.len);
-            for (cols, fields) |c, *f| f.* = .{
-                .name = try arena.dupe(u8, c.name),
-                .ty = if (c.not_null) c.ty else c.ty.asNullable(),
-            };
-            const schema = try arena.create(types.Schema);
-            schema.* = .{ .fields = fields };
-            self.schema = schema;
+            self.schema = try schemaFromBodyCols(arena, cols);
         } else {
             self.schema = try inferSchema(arena, items);
         }
@@ -83,10 +76,25 @@ pub const RequestSource = struct {
     }
 };
 
+/// A Schema from declared `FROM BODY` / `ACCEPT BODY` columns: field order is
+/// declaration order; NOT NULL keeps the type non-nullable. Shared by the
+/// request source and the WAL buffer source.
+pub fn schemaFromBodyCols(arena: std.mem.Allocator, cols: []const types.BodyCol) !*types.Schema {
+    const fields = try arena.alloc(types.Schema.Field, cols.len);
+    for (cols, fields) |c, *f| f.* = .{
+        .name = try arena.dupe(u8, c.name),
+        .ty = if (c.not_null) c.ty else c.ty.asNullable(),
+    };
+    const schema = try arena.create(types.Schema);
+    schema.* = .{ .fields = fields };
+    return schema;
+}
+
 /// Row-by-row check of a body against a declared schema: a required column
 /// that is missing/null, or a value the declared type can't read, fails the
-/// whole request with a message naming the first offending row.
-fn validateBody(
+/// whole request with a message naming the first offending row. Shared with
+/// the serve buffer accept path (`ACCEPT BODY ... INTO BUFFER`).
+pub fn validateBody(
     items: []const json.Value,
     cols: []const types.BodyCol,
     msg_arena: std.mem.Allocator,
@@ -224,7 +232,10 @@ fn jsonToString(arena: std.mem.Allocator, v: json.Value) ![]const u8 {
         .integer => |x| try std.fmt.allocPrint(arena, "{d}", .{x}),
         .float => |x| try std.fmt.allocPrint(arena, "{d}", .{x}),
         .bool => |x| if (x) "true" else "false",
-        else => "",
+        // Objects/arrays ride as canonical JSON text (a declared `payload JSON`
+        // column must not flatten to "").
+        .object, .array => try std.json.Stringify.valueAlloc(arena, v, .{}),
+        .null => "",
     };
 }
 
@@ -297,4 +308,35 @@ test "declared body schema: column order, types, and enforcement" {
         \\[{"device_id":"a","value":"x"}]
     , &decl, a, &msg));
     try std.testing.expect(std.mem.indexOf(u8, msg, "value") != null);
+}
+
+test "JSON-typed columns keep object payloads as JSON text" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const decl = [_]types.BodyCol{
+        .{ .name = "payload", .ty = types.Type.init(.string) }, // JSON rides as text
+    };
+    var msg: []const u8 = "";
+    var s = try RequestSource.open(gpa,
+        \\[{"payload":{"a":1,"b":[true,null]}}]
+    , &decl, arena.allocator(), &msg);
+    defer srcClose(s);
+    try std.testing.expectEqualStrings(
+        \\{"a":1,"b":[true,null]}
+    , s.batch.columns[0].getValue(0).string);
+}
+
+test "inferred schema: object payloads type as string and keep JSON text" {
+    const gpa = std.testing.allocator;
+    var msg: []const u8 = "";
+    var s = try RequestSource.open(gpa,
+        \\[{"id":1,"payload":{"a":[1,2]}}]
+    , null, std.testing.allocator, &msg);
+    defer srcClose(s);
+    try std.testing.expectEqual(types.TypeKind.string, s.schema.fields[1].ty.kind);
+    try std.testing.expectEqualStrings(
+        \\{"a":[1,2]}
+    , s.batch.columns[1].getValue(0).string);
 }

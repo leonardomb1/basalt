@@ -70,7 +70,7 @@ pub fn planAgg(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Sch
     var where = std.array_list.Managed(u8).init(arena);
     for (prefix) |st| {
         if (st.node != .filter) continue;
-        const frag = (try translatePred(arena, st.node.filter, dialect, src_schema)) orelse continue;
+        const frag = (try translateExpr(arena, st.node.filter, dialect, src_schema, true)) orelse continue;
         if (where.items.len > 0) try where.appendSlice(" AND ");
         try where.appendSlice(frag);
     }
@@ -114,7 +114,7 @@ pub fn planMap(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Sch
     // predicate: the leading filters reference source columns directly
     var where = std.array_list.Managed(u8).init(arena);
     for (leading) |st| {
-        const frag = (try translatePred(arena, st.node.filter, dialect, src_schema)) orelse continue;
+        const frag = (try translateExpr(arena, st.node.filter, dialect, src_schema, true)) orelse continue;
         if (where.items.len > 0) try where.appendSlice(" AND ");
         try where.appendSlice(frag);
     }
@@ -198,7 +198,12 @@ fn buildProjection(arena: std.mem.Allocator, dialect: Dialect, src_schema: types
 /// so a null here just forgoes the wire saving). Only single-part fields that exist in
 /// `schema` are emitted — a param, a nested/JSON path, or a typo yields null, never a
 /// guess.
-pub fn translatePred(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dialect, schema: types.Schema) error{OutOfMemory}!?[]const u8 {
+/// ast.Expr -> source-dialect SQL, or null for anything whose semantics
+/// aren't guaranteed identical at the source (the caller then keeps that
+/// part engine-side — pushing is always optional). `schema` null means
+/// "trust bare field names" — safe for filters DIRECTLY after a read, whose
+/// fields the type-checker already resolved against the source schema.
+pub fn translateExpr(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dialect, schema: types.Schema, check_fields: bool) error{OutOfMemory}!?[]const u8 {
     switch (e.*) {
         .bool_lit => |b| return try arena.dupe(u8, if (b) "(1=1)" else "(1=0)"),
         .int_lit => |v| return try std.fmt.allocPrint(arena, "{d}", .{v}),
@@ -206,18 +211,22 @@ pub fn translatePred(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dial
         .null_lit => return try arena.dupe(u8, "NULL"),
         .str_lit => |s| return try sqlStr(arena, s),
         .field => |q| {
-            if (q.parts.len != 1 or !inSchema(schema, q.parts[0])) return null;
+            if (q.parts.len != 1) return null;
+            if (check_fields and !inSchema(schema, q.parts[0])) return null;
             return try splitmod.quoteIdent(arena, dialect, q.parts[0]);
         },
         .unary => |u| {
             if (u.op != .not) return null;
-            const inner = (try translatePred(arena, u.e, dialect, schema)) orelse return null;
+            const inner = (try translateExpr(arena, u.e, dialect, schema, check_fields)) orelse return null;
             return try std.fmt.allocPrint(arena, "(NOT ({s}))", .{inner});
         },
         .is_null => |n| {
-            if (n.kind != .is_null) return null; // `is empty` (null OR '') — op handles it
-            const inner = (try translatePred(arena, n.e, dialect, schema)) orelse return null;
-            return try std.fmt.allocPrint(arena, "({s} IS {s}NULL)", .{ inner, if (n.negated) "NOT " else "" });
+            const inner = (try translateExpr(arena, n.e, dialect, schema, check_fields)) orelse return null;
+            if (n.kind == .is_null)
+                return try std.fmt.allocPrint(arena, "({s} IS {s}NULL)", .{ inner, if (n.negated) "NOT " else "" });
+            // `is empty` == null OR '' — exact, portable
+            const test_sql = try std.fmt.allocPrint(arena, "({s} IS NULL OR {s} = '')", .{ inner, inner });
+            return if (n.negated) try std.fmt.allocPrint(arena, "(NOT {s})", .{test_sql}) else test_sql;
         },
         .binary => |b| {
             const op = switch (b.op) {
@@ -231,12 +240,156 @@ pub fn translatePred(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dial
                 .@"or" => "OR",
                 else => return null, // arithmetic: coercion/division semantics differ — skip
             };
-            const l = (try translatePred(arena, b.l, dialect, schema)) orelse return null;
-            const r = (try translatePred(arena, b.r, dialect, schema)) orelse return null;
+            const l = (try translateExpr(arena, b.l, dialect, schema, check_fields)) orelse return null;
+            const r = (try translateExpr(arena, b.r, dialect, schema, check_fields)) orelse return null;
             return try std.fmt.allocPrint(arena, "({s} {s} {s})", .{ l, op, r });
         },
-        else => return null, // call, cond, match, cast, let_in
+        .cond => |c| {
+            const cnd = (try translateExpr(arena, c.cond, dialect, schema, check_fields)) orelse return null;
+            const t = (try translateExpr(arena, c.then, dialect, schema, check_fields)) orelse return null;
+            const f = (try translateExpr(arena, c.els, dialect, schema, check_fields)) orelse return null;
+            return try std.fmt.allocPrint(arena, "(CASE WHEN {s} THEN {s} ELSE {s} END)", .{ cnd, t, f });
+        },
+        .match => |m| return translateMatch(arena, m, dialect, schema, check_fields),
+        .cast => |c| {
+            const inner = (try translateExpr(arena, c.e, dialect, schema, check_fields)) orelse return null;
+            const ty = sqlTypeName(arena, dialect, c.ty) catch return error.OutOfMemory;
+            return try std.fmt.allocPrint(arena, "CAST({s} AS {s})", .{ inner, (ty orelse return null) });
+        },
+        .call => |c| return translateCall(arena, c, dialect, schema, check_fields),
+        else => return null, // let_in (inlined before planning anyway)
     }
+}
+
+fn translateMatch(arena: std.mem.Allocator, m: ast.Match, dialect: Dialect, schema: types.Schema, check_fields: bool) error{OutOfMemory}!?[]const u8 {
+    var out = std.array_list.Managed(u8).init(arena);
+    const w = out.writer();
+    if (m.subject) |subj| {
+        const s = (try translateExpr(arena, subj, dialect, schema, check_fields)) orelse return null;
+        w.print("(CASE {s}", .{s}) catch return error.OutOfMemory;
+    } else {
+        w.writeAll("(CASE") catch return error.OutOfMemory;
+    }
+    for (m.arms) |arm| {
+        const v = (try translateExpr(arena, arm.value, dialect, schema, check_fields)) orelse return null;
+        if (arm.is_default) {
+            w.print(" ELSE {s}", .{v}) catch return error.OutOfMemory;
+        } else if (m.subject != null) {
+            for (arm.pats) |p| {
+                const ps = (try translateExpr(arena, p, dialect, schema, check_fields)) orelse return null;
+                w.print(" WHEN {s} THEN {s}", .{ ps, v }) catch return error.OutOfMemory;
+            }
+        } else {
+            const g = (try translateExpr(arena, arm.guard orelse return null, dialect, schema, check_fields)) orelse return null;
+            w.print(" WHEN {s} THEN {s}", .{ g, v }) catch return error.OutOfMemory;
+        }
+    }
+    // no ELSE -> SQL CASE yields NULL, matching the engine's match semantics
+    w.writeAll(" END)") catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+/// Dialect spelling of a CAST target type (null = don't push this cast).
+fn sqlTypeName(arena: std.mem.Allocator, dialect: Dialect, ty: types.Type) !?[]const u8 {
+    return switch (ty.kind) {
+        .int => switch (dialect) {
+            .mysql => "SIGNED",
+            else => "BIGINT",
+        },
+        .float => switch (dialect) {
+            .sqlserver => "FLOAT",
+            .mysql => "DOUBLE",
+            .postgres => "DOUBLE PRECISION",
+        },
+        .string => switch (dialect) {
+            .sqlserver => "VARCHAR(MAX)",
+            .mysql => "CHAR",
+            .postgres => "TEXT",
+        },
+        .decimal => try std.fmt.allocPrint(arena, "DECIMAL({d},{d})", .{ ty.precision, ty.scale }),
+        .date => "DATE",
+        .time => "TIME",
+        .timestamp => switch (dialect) {
+            .sqlserver => "DATETIME2",
+            .mysql => "DATETIME",
+            .postgres => "TIMESTAMP",
+        },
+        else => null, // bool/bytes: cast semantics diverge per dialect
+    };
+}
+
+/// Scalar-function translation — only names whose semantics are identical in
+/// all three dialects (or have an exact per-dialect spelling).
+fn translateCall(arena: std.mem.Allocator, c: ast.Expr.Call, dialect: Dialect, schema: types.Schema, check_fields: bool) error{OutOfMemory}!?[]const u8 {
+    const args = try arena.alloc([]const u8, c.args.len);
+    for (c.args, args) |a, *out| out.* = (try translateExpr(arena, a, dialect, schema, check_fields)) orelse return null;
+
+    const n = c.name;
+    if (std.mem.eql(u8, n, "lower") and args.len == 1)
+        return try std.fmt.allocPrint(arena, "LOWER({s})", .{args[0]});
+    if (std.mem.eql(u8, n, "upper") and args.len == 1)
+        return try std.fmt.allocPrint(arena, "UPPER({s})", .{args[0]});
+    if (std.mem.eql(u8, n, "length") and args.len == 1) {
+        const f = switch (dialect) {
+            .sqlserver => "LEN",
+            .mysql => "CHAR_LENGTH",
+            .postgres => "LENGTH",
+        };
+        return try std.fmt.allocPrint(arena, "{s}({s})", .{ f, args[0] });
+    }
+    if (std.mem.eql(u8, n, "trim") and args.len == 1) {
+        return switch (dialect) {
+            .sqlserver => try std.fmt.allocPrint(arena, "LTRIM(RTRIM({s}))", .{args[0]}), // TRIM is 2017+
+            else => try std.fmt.allocPrint(arena, "TRIM({s})", .{args[0]}),
+        };
+    }
+    if (std.mem.eql(u8, n, "substr") and args.len == 3)
+        return try std.fmt.allocPrint(arena, "SUBSTRING({s}, {s}, {s})", .{ args[0], args[1], args[2] });
+    if (std.mem.eql(u8, n, "replace") and args.len == 3)
+        return try std.fmt.allocPrint(arena, "REPLACE({s}, {s}, {s})", .{ args[0], args[1], args[2] });
+    if ((std.mem.eql(u8, n, "concat") or std.mem.eql(u8, n, "coalesce")) and args.len >= 2) {
+        const f = if (n[0] == 'c' and n[1] == 'o' and n[2] == 'n') "CONCAT" else "COALESCE";
+        const joined = try std.mem.join(arena, ", ", args);
+        return try std.fmt.allocPrint(arena, "{s}({s})", .{ f, joined });
+    }
+    if (std.mem.eql(u8, n, "like") and args.len == 2)
+        return try std.fmt.allocPrint(arena, "({s} LIKE {s})", .{ args[0], args[1] });
+    // starts_with/ends_with/contains -> LIKE, only for literal patterns free
+    // of wildcard chars (no ESCAPE portability games).
+    if ((std.mem.eql(u8, n, "starts_with") or std.mem.eql(u8, n, "ends_with") or
+        std.mem.eql(u8, n, "contains")) and c.args.len == 2)
+    {
+        if (c.args[1].* != .str_lit) return null;
+        const pat = c.args[1].str_lit;
+        for (pat) |ch| {
+            if (ch == '%' or ch == '_' or ch == '\\') return null;
+        }
+        const shaped = if (std.mem.eql(u8, n, "starts_with"))
+            try std.fmt.allocPrint(arena, "{s}%", .{pat})
+        else if (std.mem.eql(u8, n, "ends_with"))
+            try std.fmt.allocPrint(arena, "%{s}", .{pat})
+        else
+            try std.fmt.allocPrint(arena, "%{s}%", .{pat});
+        return try std.fmt.allocPrint(arena, "({s} LIKE {s})", .{ args[0], try sqlStr(arena, shaped) });
+    }
+    return null; // now()/today() (clock skew!), unknown/user fns: keep engine-side
+}
+
+/// §7 implicit pushdown for a serial pipeline: translate the `filter` stages
+/// that immediately follow a SQL read into one AND-ed WHERE fragment. The
+/// engine KEEPS the filter stages (superset rule) — the fragment only lets
+/// the source pre-narrow, so an untranslatable piece just isn't pushed.
+pub fn serialWhere(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage) !?[]const u8 {
+    if (stages.len < 2 or stages[0].node != .read) return null;
+    var parts = std.array_list.Managed([]const u8).init(arena);
+    for (stages[1..]) |st| {
+        if (st.node != .filter) break; // only the contiguous filter prefix
+        if (try translateExpr(arena, st.node.filter, dialect, .{ .fields = &.{} }, false)) |sql_frag| {
+            try parts.append(sql_frag);
+        }
+    }
+    if (parts.items.len == 0) return null;
+    return try std.mem.join(arena, " AND ", parts.items);
 }
 
 /// Single-quoted SQL string literal with `'` doubled — ANSI, accepted by all three
@@ -323,7 +476,7 @@ test "translatePred: equality with a string literal escapes quotes" {
     const lit = try a.create(ast.Expr);
     lit.* = .{ .str_lit = "O'Brien" };
     const e = try bin(a, .eq, try fld(a, "b"), lit);
-    const sql = (try translatePred(a, e, .mysql, testSchema())).?;
+    const sql = (try translateExpr(a, e, .mysql, testSchema(), true)).?;
     try testing.expectEqualStrings("(`b` = 'O''Brien')", sql);
 }
 
@@ -336,8 +489,8 @@ test "translatePred: AND of comparisons, per-dialect quoting" {
     const lit9 = try a.create(ast.Expr);
     lit9.* = .{ .int_lit = 9 };
     const e = try bin(a, .@"and", try bin(a, .ge, try fld(a, "a"), lit5), try bin(a, .lt, try fld(a, "c"), lit9));
-    try testing.expectEqualStrings("((\"a\" >= 5) AND (\"c\" < 9))", (try translatePred(a, e, .postgres, testSchema())).?);
-    try testing.expectEqualStrings("(([a] >= 5) AND ([c] < 9))", (try translatePred(a, e, .sqlserver, testSchema())).?);
+    try testing.expectEqualStrings("((\"a\" >= 5) AND (\"c\" < 9))", (try translateExpr(a, e, .postgres, testSchema(), true)).?);
+    try testing.expectEqualStrings("(([a] >= 5) AND ([c] < 9))", (try translateExpr(a, e, .sqlserver, testSchema(), true)).?);
 }
 
 test "translatePred: is not null" {
@@ -346,7 +499,7 @@ test "translatePred: is not null" {
     const a = ar.allocator();
     const e = try a.create(ast.Expr);
     e.* = .{ .is_null = .{ .e = try fld(a, "a"), .negated = true } };
-    try testing.expectEqualStrings("(`a` IS NOT NULL)", (try translatePred(a, e, .mysql, testSchema())).?);
+    try testing.expectEqualStrings("(`a` IS NOT NULL)", (try translateExpr(a, e, .mysql, testSchema(), true)).?);
 }
 
 test "translatePred: unknown field and unsupported nodes are not pushed" {
@@ -356,15 +509,13 @@ test "translatePred: unknown field and unsupported nodes are not pushed" {
     // unknown column → null
     const lit = try a.create(ast.Expr);
     lit.* = .{ .int_lit = 1 };
-    try testing.expect((try translatePred(a, try bin(a, .eq, try fld(a, "zzz"), lit), .mysql, testSchema())) == null);
+    try testing.expect((try translateExpr(a, try bin(a, .eq, try fld(a, "zzz"), lit), .mysql, testSchema(), true)) == null);
     // arithmetic → null
-    try testing.expect((try translatePred(a, try bin(a, .add, try fld(a, "a"), lit), .mysql, testSchema())) == null);
-    // function call → null
+    try testing.expect((try translateExpr(a, try bin(a, .add, try fld(a, "a"), lit), .mysql, testSchema(), true)) == null);
+    // an untranslatable function (clock skew) → null
     const call = try a.create(ast.Expr);
-    const args = try a.alloc(*ast.Expr, 1);
-    args[0] = try fld(a, "b");
-    call.* = .{ .call = .{ .name = "lower", .args = args } };
-    try testing.expect((try translatePred(a, call, .mysql, testSchema())) == null);
+    call.* = .{ .call = .{ .name = "now", .args = &.{} } };
+    try testing.expect((try translateExpr(a, call, .mysql, testSchema(), true)) == null);
 }
 
 test "planAgg: projects only referenced columns and pushes the filter" {
@@ -507,3 +658,71 @@ test "planAgg: a select in the prefix disables projection (filter still pushed)"
     try testing.expect(plan.proj_select == null); // select present → no projection
     try testing.expectEqualStrings("(\"a\" >= 5)", plan.where_extra.?); // filter still pushed
 }
+
+test "translateExpr: extended constructs (is empty, CASE, CAST, functions)" {
+    var arn = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arn.deinit();
+    const a = arn.allocator();
+    const sqlp = @import("../lang/sql_parser.zig");
+
+    const cases = [_]struct { src: []const u8, want: ?[]const u8, d: Dialect = .sqlserver }{
+        .{ .src = "status IS EMPTY", .want = "([status] IS NULL OR [status] = '')" },
+        .{ .src = "status IS NOT EMPTY", .want = "(NOT ([status] IS NULL OR [status] = ''))" },
+        .{ .src = "IF(v > 1, 'a', 'b')", .want = "(CASE WHEN ([v] > 1) THEN 'a' ELSE 'b' END)" },
+        .{ .src = "CASE status WHEN 'x', 'y' THEN 1 ELSE 0 END", .want = "(CASE [status] WHEN 'x' THEN 1 WHEN 'y' THEN 1 ELSE 0 END)" },
+        .{ .src = "CAST(v AS INT) > 5", .want = "(CAST([v] AS BIGINT) > 5)" },
+        .{ .src = "CAST(v AS INT) > 5", .want = "(CAST(`v` AS SIGNED) > 5)", .d = .mysql },
+        .{ .src = "lower(status) = 'ok'", .want = "(LOWER([status]) = 'ok')" },
+        .{ .src = "length(status) > 2", .want = "(LEN([status]) > 2)" },
+        .{ .src = "length(status) > 2", .want = "(CHAR_LENGTH(`status`) > 2)", .d = .mysql },
+        .{ .src = "trim(status) = 'x'", .want = "(LTRIM(RTRIM([status])) = 'x')" },
+        .{ .src = "substr(status, 1, 2) = 'AB'", .want = "(SUBSTRING([status], 1, 2) = 'AB')" },
+        .{ .src = "coalesce(status, 'n') = 'n'", .want = "(COALESCE([status], 'n') = 'n')" },
+        .{ .src = "contains(status, 'ab')", .want = "([status] LIKE '%ab%')" },
+        .{ .src = "starts_with(status, 'CT2')", .want = "([status] LIKE 'CT2%')" },
+        .{ .src = "status LIKE 'a%'", .want = "([status] LIKE 'a%')" },
+        // refusals: wildcards in the pattern, clock functions, arithmetic
+        .{ .src = "contains(status, '10%')", .want = null },
+        .{ .src = "now() > v", .want = null },
+        .{ .src = "v + 1 > 2", .want = null },
+    };
+    for (cases) |tc| {
+        var diag: sqlp.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const e = try sqlp.parseExprStr(a, tc.src, &diag);
+        const got = try translateExpr(a, e, tc.d, .{ .fields = &.{} }, false);
+        if (tc.want) |w| {
+            try std.testing.expectEqualStrings(w, got orelse return error.TestUnexpectedResult);
+        } else {
+            try std.testing.expect(got == null);
+        }
+    }
+}
+
+test "serialWhere: contiguous filter prefix, partial translation, stops at non-filter" {
+    var arn = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arn.deinit();
+    const a = arn.allocator();
+    const sqlp = @import("../lang/sql_parser.zig");
+
+    // read | filter (translatable) | filter (not) | filter (translatable)
+    var diag: sqlp.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const f1 = try sqlp.parseExprStr(a, "v > 0", &diag);
+    const f2 = try sqlp.parseExprStr(a, "v + 1 > 2", &diag); // arithmetic: refused
+    const f3 = try sqlp.parseExprStr(a, "status = 'ok'", &diag);
+    const rd = ast.Stage{ .node = .{ .read = .{ .connector = "erp", .form = .{ .table = .{ .parts = &.{"T"} } } } }, .hints = &.{}, .pos = .{ .line = 1, .col = 1 } };
+    const mk = struct {
+        fn f(e: *ast.Expr) ast.Stage {
+            return .{ .node = .{ .filter = e }, .hints = &.{}, .pos = .{ .line = 1, .col = 1 } };
+        }
+    }.f;
+
+    const stages = [_]ast.Stage{ rd, mk(f1), mk(f2), mk(f3) };
+    const w = (try serialWhere(a, .sqlserver, &stages)).?;
+    try std.testing.expectEqualStrings("([v] > 0) AND ([status] = 'ok')", w);
+
+    // filter after a select is NOT part of the prefix
+    const sel = ast.Stage{ .node = .{ .select = &.{.star} }, .hints = &.{}, .pos = .{ .line = 1, .col = 1 } };
+    const stages2 = [_]ast.Stage{ rd, sel, mk(f1) };
+    try std.testing.expect((try serialWhere(a, .sqlserver, &stages2)) == null);
+}
+

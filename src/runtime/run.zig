@@ -23,6 +23,7 @@ const request = @import("../connect/request.zig");
 const httpsrc = @import("../connect/http.zig");
 const aad = @import("../connect/aad.zig");
 const splitmod = @import("../connect/split.zig");
+const walmod = @import("../connect/wal.zig");
 const parallel = @import("parallel.zig");
 const analyze = @import("analyze.zig");
 const pushdown = @import("pushdown.zig");
@@ -158,6 +159,13 @@ pub const RunOptions = struct {
     /// Optional collector for per-item outcomes of a `for`-each fan-out. When set,
     /// continue-mode partial failures are reported here instead of failing the run.
     outcomes: ?*OutcomeSink = null,
+    /// Serve flusher: restrict every `FROM BUFFER` source to this one segment.
+    buffer_segment: ?u64 = null,
+    /// Serve flusher: pin the StarRocks label prefix (the segment label) and
+    /// run_id (the segment seq) so a replayed segment produces the SAME labels
+    /// — the sink's dedup then makes redelivery effectively-once.
+    load_label_prefix: ?[]const u8 = null,
+    load_run_id: ?u64 = null,
 };
 
 const SqlKind = enum { postgres, mysql, sqlserver };
@@ -191,6 +199,13 @@ const Env = struct {
     /// Parsed JSON params (the request body), navigated by `for x in p.path`.
     /// Scalar `p.a.b` path access is substituted at plan time (expand.zig).
     json_params: *std.StringHashMap(std.json.Value),
+    /// The endpoint's `INTO BUFFER` declaration, if any (dir + declared schema
+    /// for `FROM BUFFER` reads that don't name them).
+    buffer_decl: ?ast.BufferDecl = null,
+    /// See RunOptions: flusher-mode segment restriction and label pinning.
+    buffer_segment: ?u64 = null,
+    load_label_prefix: ?[]const u8 = null,
+    load_run_id: ?u64 = null,
     /// Set by `openSource` to the leading SQL source of the pipeline being built.
     sql_desc: ?SqlDesc = null,
     /// Connector types of the first source/sink, for the run summary.
@@ -492,7 +507,11 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts: RunOptions, d
     errdefer if (errctx.msg.len > 0) setMsg(diag, errctx.msg);
 
     var sources = std.array_list.Managed(driver.Source).init(arena);
-    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params };
+    var buffer_decl: ?ast.BufferDecl = null;
+    for (program.stmts) |s| {
+        if (s == .kind) buffer_decl = s.kind.buffer;
+    }
+    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .buffer_decl = buffer_decl, .buffer_segment = opts.buffer_segment, .load_label_prefix = opts.load_label_prefix, .load_run_id = opts.load_run_id };
 
     var batch_arena = std.heap.ArenaAllocator.init(gpa);
     defer batch_arena.deinit();
@@ -610,11 +629,38 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
 fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) !void {
     const arena = env.arena;
     const gpa = env.gpa;
-    const stages = out.stages;
+    var stages = out.stages;
     if (stages.len == 0) return planErr(env.diag, "empty pipeline");
     const last = stages[stages.len - 1].node;
     if (last != .write) return planErr(env.diag, "a top-level pipeline must end in `write`");
     env.sink_name = connectorType(env, last.write.connector);
+
+    // §7 implicit pushdown: the contiguous `filter` prefix after a SQL read is
+    // translated into the source query's WHERE (AND-ed with any PUSHDOWN
+    // fragment). The filter stages are KEPT — an untranslatable predicate (or
+    // half of one) simply runs engine-side, never silently dropped.
+    if (stages[0].node == .read) implicit: {
+        const rd = stages[0].node.read;
+        if (rd.form != .table and rd.form != .query) break :implicit;
+        const conn = env.connections.get(rd.connector) orelse break :implicit;
+        const d: sql.Dialect = if (std.mem.eql(u8, conn.connector, "sqlserver"))
+            .sqlserver
+        else if (std.mem.eql(u8, conn.connector, "mysql"))
+            .mysql
+        else if (std.mem.eql(u8, conn.connector, "postgres"))
+            .postgres
+        else
+            break :implicit;
+        const extra = (try pushdown.serialWhere(arena, d, stages)) orelse break :implicit;
+        const new_stages = try arena.dupe(ast.Stage, stages);
+        var nrd = rd;
+        nrd.where = if (rd.where.len > 0)
+            try std.fmt.allocPrint(arena, "({s}) AND ({s})", .{ rd.where, extra })
+        else
+            extra;
+        new_stages[0].node = .{ .read = nrd };
+        stages = new_stages;
+    }
 
     // Union split-per-branch: when threads>1 and the post-union stages are map-only,
     // expand into one `read branch | select(reconcile) | … | write` pipeline per
@@ -2086,6 +2132,10 @@ fn renderRead(arena: std.mem.Allocator, rd: ast.Read, lr: LoopRow) !ast.Read {
         .query => |s| .{ .query = try interpAll(arena, s, lr) },
         .path => |s| .{ .path = try interpAll(arena, s, lr) },
         .request => |d| .{ .request = d },
+        .buffer => |b| .{ .buffer = .{
+            .name = try interpAll(arena, b.name, lr),
+            .dir = try interpAll(arena, b.dir, lr),
+        } },
     }, .where = try interpAll(arena, rd.where, lr) };
 }
 
@@ -2422,7 +2472,8 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
 /// Resolve a sink/source connector name to its driver type for the summary
 /// (`csv`/`request` are types; a connection name maps to its `connector`).
 fn connectorType(env: *Env, name: []const u8) []const u8 {
-    if (std.mem.eql(u8, name, "csv") or std.mem.eql(u8, name, "request") or std.mem.eql(u8, name, "http")) return name;
+    if (std.mem.eql(u8, name, "csv") or std.mem.eql(u8, name, "request") or
+        std.mem.eql(u8, name, "http") or std.mem.eql(u8, name, "buffer")) return name;
     if (env.connections.get(name)) |c| return c.connector;
     return name;
 }
@@ -2868,6 +2919,24 @@ fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
         };
         return s.source();
     }
+    if (std.mem.eql(u8, rd.connector, "buffer")) {
+        const ref = rd.form.buffer;
+        var dir = ref.dir;
+        var declared: ?[]const types.BodyCol = null;
+        if (env.buffer_decl) |decl| {
+            if (std.mem.eql(u8, decl.name, ref.name)) {
+                if (dir.len == 0) dir = decl.dir;
+                declared = decl.schema;
+            }
+        }
+        if (dir.len == 0)
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "buffer `{s}`: no INTO BUFFER declaration in this script — name its directory with AT '<dir>'", .{ref.name}));
+        const s = walmod.BufferSource.open(env.gpa, dir, ref.name, declared, env.buffer_segment) catch |e| switch (e) {
+            error.BufferEmpty => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "buffer `{s}` at {s}: no segments to replay (and no declared schema)", .{ ref.name, dir })),
+            else => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "buffer `{s}` at {s}: {s}", .{ ref.name, dir, @errorName(e) })),
+        };
+        return s.source();
+    }
     if (std.mem.eql(u8, rd.connector, "http")) {
         if (rd.form != .path) return planErr(env.diag, "read http needs a quoted URL");
         var hopts = httpsrc.optsFromHints(hints);
@@ -2884,12 +2953,17 @@ fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
     }
     const conn = env.connections.get(rd.connector) orelse
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown connection `{s}`", .{rd.connector}));
-    // A read stage may carry a `@[where = "..."]` predicate (pushed into the SQL,
-    // already `${var}`-interpolated by renderHints) — same hint the union form
-    // uses, now honored on a plain `read <conn> table/query` too.
+    // A read stage may carry a `PUSHDOWN($$...$$)` / `@[where]` raw predicate.
+    // It composes (AND) with whatever `rd.where` already holds — e.g. the
+    // translated implicit pushdown from the filter prefix (runOutput).
     var rd_eff = rd;
     if (forHintName(hints, "where")) |wh| {
-        if (wh.len > 0) rd_eff.where = wh;
+        if (wh.len > 0) {
+            rd_eff.where = if (rd.where.len > 0)
+                try std.fmt.allocPrint(env.arena, "({s}) AND ({s})", .{ wh, rd.where })
+            else
+                wh;
+        }
     }
     if (std.mem.eql(u8, conn.connector, "http")) {
         if (rd.form != .path) return planErr(env.diag, "reading an http connection needs a quoted path");
@@ -3342,6 +3416,10 @@ fn resolveStarrocksConfig(env: *Env, conn: ast.Connection) !starrocks.Config {
         }
     }
     if (cfg.database.len == 0) return planErr(env.diag, "starrocks connection needs a `database`");
+    // Flusher-mode label pinning (see RunOptions): a drained segment must
+    // produce the same labels on every (re)delivery.
+    if (env.load_label_prefix) |lp| cfg.label_prefix = lp;
+    if (env.load_run_id) |rid| cfg.run_id = rid;
     return cfg;
 }
 
@@ -4244,4 +4322,37 @@ test "for-each parallel + on_error=continue isolates a failing table" {
     const a = try tmp.dir.readFileAlloc(alloc, "out_alpha.csv", 1 << 20);
     defer alloc.free(a);
     try std.testing.expectEqualStrings("id\n7\n", a);
+}
+
+test "FROM BUFFER replays WAL segments as a source (batch mode)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const wal_dir = try std.fs.path.join(alloc, &.{ base, "wal" });
+    defer alloc.free(wal_dir);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    // Two segments' worth of accepted rows.
+    {
+        var w = try walmod.Wal.open(alloc, wal_dir, "ev", 1 << 20);
+        defer w.close();
+        try w.append("{\"device_id\":\"a\",\"v\":1}");
+        try w.append("{\"device_id\":\"b\",\"v\":2}");
+        try w.rotate();
+        try w.append("{\"device_id\":\"c\",\"v\":3}");
+        try w.sync();
+    }
+
+    const script = try std.fmt.allocPrint(alloc,
+        "LOAD INTO '{s}' AS SELECT device_id, CAST(v AS INT) AS v FROM BUFFER 'ev' AT '{s}';",
+        .{ out_path, wal_dir },
+    );
+    defer alloc.free(script);
+
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("device_id,v\na,1\nb,2\nc,3\n", out);
 }

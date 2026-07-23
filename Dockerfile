@@ -1,14 +1,14 @@
 # syntax=docker/dockerfile:1
 
-# basalt ships as a single static binary. Pipeline (.bsl) scripts are DATA —
+# basalt ships as a single static binary. Pipeline (.sql) scripts are DATA —
 # mounted at runtime (volume / ConfigMap / git-sync), never baked into the image,
 # so editing a pipeline never means rebuilding the image.
 #
 #   batch:  docker run --rm -v "$PWD/pipelines:/scripts:ro" \
-#             -e SR_USER -e SR_PASS  IMAGE run /scripts/etl.bsl
+#             -e SR_USER -e SR_PASS  IMAGE run /scripts/etl.sql
 #   serve:  docker run --rm -p 8080:8080 -v "$PWD/pipelines:/scripts:ro" \
 #             -e SR_USER -e SR_PASS  IMAGE serve /scripts
-#   stdin:  cat etl.bsl | docker run --rm -i IMAGE run -
+#   stdin:  cat etl.sql | docker run --rm -i IMAGE run -
 
 # --- build: compile a static musl binary ----------------------------------
 FROM alpine:3.20 AS build

@@ -97,7 +97,7 @@ fn loadSource(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8, stderr
         return null;
     }
     // `-` reads the script from stdin, so any delivery mechanism can pipe it
-    // without a temp file (`cat x.bsl | basalt run -`, a control-plane fetch, etc.).
+    // without a temp file (`cat x.sql | basalt run -`, a control-plane fetch, etc.).
     if (std.mem.eql(u8, args[2], "-")) {
         const text = std.fs.File.stdin().readToEndAlloc(arena, 8 << 20) catch |e| {
             try stderr.print("error: cannot read script from stdin: {s}\n", .{@errorName(e)});
