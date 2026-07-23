@@ -11,8 +11,164 @@ const std = @import("std");
 const ast = @import("../lang/ast.zig");
 const parser = @import("../lang/sql_parser.zig");
 const runtime = @import("../runtime/run.zig");
+const walmod = @import("../connect/wal.zig");
+const request = @import("../connect/request.zig");
 
-pub const Route = struct { path: []const u8, program: ast.Program, label: []const u8, doc: []const u8 = "" };
+pub const Route = struct {
+    path: []const u8,
+    program: ast.Program,
+    label: []const u8,
+    doc: []const u8 = "",
+    /// Set for `ACCEPT ... INTO BUFFER` endpoints: requests are validated,
+    /// appended to the WAL, and acked after fsync; a flusher thread drains
+    /// completed segments through the program's pipeline.
+    buf: ?*BufState = null,
+};
+
+/// Shared state of one buffered endpoint (accept loop + flusher thread).
+pub const BufState = struct {
+    wal: walmod.Wal, // internally mutex-guarded
+    decl: ast.BufferDecl,
+    program: ast.Program,
+    flush_secs: u64 = 5,
+    flush_rows: u64 = 50_000,
+    /// Backpressure limit (`MAX n MB|GB` on the declaration; 1 GiB default):
+    /// bytes on disk beyond this ⇒ 503 + Retry-After (the client is the queue).
+    max_bytes: u64 = 1 << 30,
+    rows_since: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: ?std.Thread = null,
+
+    pub fn shutdown(self: *BufState) void {
+        self.stop.store(true, .seq_cst);
+        if (self.thread) |t| t.join();
+        self.thread = null;
+        self.wal.close();
+    }
+};
+
+/// Build the flusher state for a buffered program (or null). `FLUSH EVERY n
+/// SECONDS [OR n ROWS]` comes from the program's `FROM BUFFER` stage hints.
+pub fn initBufState(gpa: std.mem.Allocator, program: ast.Program) !?*BufState {
+    if (program.stmts.len == 0 or program.stmts[0] != .kind) return null;
+    const decl = program.stmts[0].kind.buffer orelse return null;
+
+    const bs = try gpa.create(BufState);
+    errdefer gpa.destroy(bs);
+    bs.* = .{
+        .wal = try walmod.Wal.open(gpa, decl.dir, decl.name, decl.segment_bytes),
+        .decl = decl,
+        .program = program,
+        .max_bytes = decl.max_bytes,
+    };
+    // flush cadence from the FROM BUFFER read stage, if declared
+    for (program.stmts) |s| {
+        if (s != .output) continue;
+        for (s.output.stages) |st| {
+            if (st.node != .read or st.node.read.form != .buffer) continue;
+            for (st.hints) |h| {
+                if (std.mem.eql(u8, h.key, "flush_secs") and h.value == .int)
+                    bs.flush_secs = @intCast(@max(1, h.value.int));
+                if (std.mem.eql(u8, h.key, "flush_rows") and h.value == .int)
+                    bs.flush_rows = @intCast(@max(1, h.value.int));
+            }
+        }
+    }
+    return bs;
+}
+
+/// Accept-path: validate the body against the declared schema and append one
+/// JSONL line per row, acking only after fsync. Returns the row count.
+/// Errors map to statuses: BodySchemaViolation/bad JSON ⇒ 422 (msg says why),
+/// Backpressure ⇒ 503.
+pub fn acceptIntoBuffer(bs: *BufState, arena: std.mem.Allocator, body: []const u8, msg_out: *[]const u8) !usize {
+    if (bs.wal.bytesOnDisk() > bs.max_bytes) return error.Backpressure;
+
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch {
+        msg_out.* = "invalid JSON in request body";
+        return error.BodySchemaViolation;
+    };
+    const items: []const std.json.Value = switch (root) {
+        .array => |arr| arr.items,
+        .object => blk: {
+            const one = try arena.alloc(std.json.Value, 1);
+            one[0] = root;
+            break :blk one;
+        },
+        else => {
+            msg_out.* = "request body must be a JSON object or array";
+            return error.BodySchemaViolation;
+        },
+    };
+    try request.validateBody(items, bs.decl.schema, arena, msg_out);
+
+    for (items) |item| {
+        const line = try std.json.Stringify.valueAlloc(arena, item, .{});
+        try bs.wal.append(line);
+    }
+    try bs.wal.sync(); // durability point — the 200 means "on disk"
+    _ = bs.rows_since.fetchAdd(items.len, .seq_cst);
+    return items.len;
+}
+
+/// Drain every completed segment through the program's pipeline, one run per
+/// segment, labeled after it (label prefix = segment stem, run_id = seq — a
+/// replay produces identical labels, and the sink dedups). A failed segment
+/// stops the drain (order preserved); it retries on the next flush tick.
+pub fn drainPending(gpa: std.mem.Allocator, bs: *BufState) void {
+    const pending = bs.wal.pendingSegments(gpa) catch |e| {
+        std.debug.print("buffer {s}: listing segments failed: {s}\n", .{ bs.decl.name, @errorName(e) });
+        return;
+    };
+    defer gpa.free(pending);
+    for (pending) |s| {
+        var lbuf: [300]u8 = undefined;
+        const label = bs.wal.labelFor(&lbuf, s);
+        var diag: runtime.Diag = .{};
+        _ = runtime.run(gpa, bs.program, .{
+            .buffer_segment = s,
+            .load_label_prefix = label,
+            .load_run_id = s,
+            .log = .{ .summary = .stderr },
+        }, &diag) catch |e| {
+            std.debug.print("buffer {s}: flush of segment {d} failed: {s} ({s}) — will retry\n", .{ bs.decl.name, s, @errorName(e), diag.msg });
+            return;
+        };
+        bs.wal.markLoaded(s) catch |e| {
+            std.debug.print("buffer {s}: manifest update failed after segment {d}: {s}\n", .{ bs.decl.name, s, @errorName(e) });
+            return;
+        };
+        if (bs.decl.retain_hours == null) _ = bs.wal.purgeLoaded() catch 0;
+    }
+    // RETAIN n HOURS: age out loaded segments past the retention window.
+    if (bs.decl.retain_hours) |h| _ = bs.wal.purgeOlderThan(h) catch 0;
+}
+
+fn flusherMain(gpa: std.mem.Allocator, bs: *BufState) void {
+    var last: i64 = std.time.milliTimestamp();
+    while (!bs.stop.load(.seq_cst)) {
+        std.Thread.sleep(200 * std.time.ns_per_ms);
+        const now = std.time.milliTimestamp();
+        const due_time = now - last >= @as(i64, @intCast(bs.flush_secs * 1000));
+        const due_rows = bs.rows_since.load(.seq_cst) >= bs.flush_rows;
+        if (!due_time and !due_rows) continue;
+        last = now;
+        bs.rows_since.store(0, .seq_cst);
+        bs.wal.rotateIfNonEmpty() catch |e| {
+            std.debug.print("buffer {s}: rotate failed: {s}\n", .{ bs.decl.name, @errorName(e) });
+            continue;
+        };
+        drainPending(gpa, bs);
+    }
+    // shutdown: one last best-effort drain so a clean stop loses nothing
+    bs.wal.rotateIfNonEmpty() catch {};
+    drainPending(gpa, bs);
+}
+
+/// Spawn the flusher for a buffered route.
+pub fn startFlusher(gpa: std.mem.Allocator, bs: *BufState) !void {
+    bs.thread = try std.Thread.spawn(.{}, flusherMain, .{ gpa, bs });
+}
 
 /// The `@http(path=…)` of a program (defaults to "/").
 fn httpPath(program: ast.Program) []const u8 {
@@ -58,7 +214,13 @@ fn banner(port: u16, routes: []const Route) void {
 
 /// Serve a single `@http` program.
 pub fn serve(gpa: std.mem.Allocator, program: ast.Program, port: u16) !void {
-    const routes = [_]Route{.{ .path = httpPath(program), .program = program, .label = "<script>", .doc = httpDoc(program) }};
+    const bs = try initBufState(gpa, program);
+    defer if (bs) |b| {
+        b.shutdown();
+        gpa.destroy(b);
+    };
+    if (bs) |b| try startFlusher(gpa, b);
+    const routes = [_]Route{.{ .path = httpPath(program), .program = program, .label = "<script>", .doc = httpDoc(program), .buf = bs }};
     var net_server = try listen(port);
     defer net_server.deinit();
     banner(port, &routes);
@@ -72,9 +234,18 @@ pub fn serve(gpa: std.mem.Allocator, program: ast.Program, port: u16) !void {
 }
 
 const Registry = struct {
+    gpa: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     routes: []const Route,
     fn deinit(self: *Registry) void {
+        // Stop flushers before dropping the programs they run (each does a
+        // final rotate+drain, so a clean reload/shutdown loses nothing).
+        for (self.routes) |r| {
+            if (r.buf) |b| {
+                b.shutdown();
+                self.gpa.destroy(b);
+            }
+        }
         self.arena.deinit();
     }
 };
@@ -117,10 +288,20 @@ fn loadDir(gpa: std.mem.Allocator, dir_path: []const u8) !Registry {
             }
         }
         if (dup) continue;
-        try routes.append(.{ .path = path, .program = prog, .label = label, .doc = httpDoc(prog) });
+        const bs = initBufState(gpa, prog) catch |e| {
+            std.debug.print("skip {s}: buffer setup failed: {s}\n", .{ entry.name, @errorName(e) });
+            continue;
+        };
+        if (bs) |b| startFlusher(gpa, b) catch |e| {
+            std.debug.print("skip {s}: flusher spawn failed: {s}\n", .{ entry.name, @errorName(e) });
+            b.shutdown();
+            gpa.destroy(b);
+            continue;
+        };
+        try routes.append(.{ .path = path, .program = prog, .label = label, .doc = httpDoc(prog), .buf = bs });
     }
     if (routes.items.len == 0) return error.NoRoutes;
-    return .{ .arena = arena, .routes = try routes.toOwnedSlice() };
+    return .{ .gpa = gpa, .arena = arena, .routes = try routes.toOwnedSlice() };
 }
 
 /// A cheap content fingerprint of the `.sql` files in `dir_path` (name + mtime +
@@ -221,9 +402,49 @@ fn handleConn(gpa: std.mem.Allocator, routes: []const Route, conn: std.net.Serve
         const body = try reader.allocRemaining(gpa, .limited(64 * 1024 * 1024));
         defer gpa.free(body);
 
+        // Buffered endpoint: validate + persist + ack; the flusher loads later.
+        // 200 here means "accepted durably" (fsynced), not "loaded".
+        if (route.buf) |bs| {
+            var req_arena = std.heap.ArenaAllocator.init(gpa);
+            defer req_arena.deinit();
+            var vmsg: []const u8 = "";
+            if (acceptIntoBuffer(bs, req_arena.allocator(), body, &vmsg)) |rows| {
+                var ok_buf: [96]u8 = undefined;
+                const ok = std.fmt.bufPrint(&ok_buf, "{{\"status\":\"accepted\",\"rows\":{d}}}\n", .{rows}) catch unreachable;
+                try req.respond(ok, .{ .status = .ok, .keep_alive = false, .extra_headers = &.{
+                    .{ .name = "content-type", .value = "application/json" },
+                } });
+            } else |e| switch (e) {
+                error.Backpressure => try req.respond("{\"status\":\"error\",\"retryable\":true,\"error\":\"buffer full\"}\n", .{
+                    .status = .service_unavailable,
+                    .keep_alive = false,
+                    .extra_headers = &.{ .{ .name = "content-type", .value = "application/json" }, .{ .name = "retry-after", .value = "5" } },
+                }),
+                error.BodySchemaViolation => {
+                    var out = std.array_list.Managed(u8).init(gpa);
+                    defer out.deinit();
+                    try out.appendSlice("{\"status\":\"error\",\"retryable\":false,\"error\":\"");
+                    try writeJsonStr(out.writer(), vmsg);
+                    try out.appendSlice("\"}\n");
+                    try req.respond(out.items, .{ .status = .unprocessable_entity, .keep_alive = false, .extra_headers = &.{
+                        .{ .name = "content-type", .value = "application/json" },
+                    } });
+                },
+                else => return e,
+            }
+            return;
+        }
+
         var params = std.array_list.Managed(runtime.ParamArg).init(gpa);
         defer params.deinit();
         try parseQuery(&params, query);
+
+        // FROM HEADER params: collect the request headers once, then bind.
+        var hdrs = std.array_list.Managed(std.http.Header).init(gpa);
+        defer hdrs.deinit();
+        var hit = req.iterateHeaders();
+        while (hit.next()) |h| try hdrs.append(h);
+        try bindHeaderParams(&params, route.program, hdrs.items);
 
         var diag: runtime.Diag = .{};
         var sink = runtime.OutcomeSink.init(gpa);
@@ -298,6 +519,29 @@ fn writeJsonStr(w: anytype, s: []const u8) !void {
     };
 }
 
+/// Bind every `FROM HEADER` param whose header is present in `headers`.
+/// The header to match is `header_name` (`FROM HEADER('X-Tenant')`) or, bare,
+/// the param's own name. Header names compare case-insensitively (RFC 9110).
+fn bindHeaderParams(
+    params: *std.array_list.Managed(runtime.ParamArg),
+    program: ast.Program,
+    headers: []const std.http.Header,
+) !void {
+    for (program.stmts) |s| {
+        if (s != .param) continue;
+        const p = s.param;
+        const src = p.source orelse continue;
+        if (src != .header) continue;
+        const want = p.header_name orelse p.name;
+        for (headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, want)) {
+                try params.append(.{ .key = p.name, .val = h.value });
+                break;
+            }
+        }
+    }
+}
+
 /// Parse a `k=v&k2=v2` query string into params (no percent-decoding for now).
 fn parseQuery(params: *std.array_list.Managed(runtime.ParamArg), query: []const u8) !void {
     var it = std.mem.splitScalar(u8, query, '&');
@@ -314,4 +558,213 @@ fn attrToStr(e: *const ast.Expr) []const u8 {
         .field => |q| q.parts[q.parts.len - 1],
         else => "/",
     };
+}
+
+test "bindHeaderParams: named + bare FROM HEADER, case-insensitive, missing skipped" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a,
+        \\CREATE ENDPOINT '/x';
+        \\PARAM tenant STRING FROM HEADER('X-Tenant');
+        \\PARAM trace  STRING FROM HEADER;
+        \\PARAM ghost  STRING FROM HEADER('X-Ghost');
+    , &diag);
+
+    var params = std.array_list.Managed(runtime.ParamArg).init(a);
+    const headers = [_]std.http.Header{
+        .{ .name = "x-tenant", .value = "acme" }, // case-insensitive match
+        .{ .name = "Trace", .value = "t-123" }, // bare form binds by param name
+        .{ .name = "Content-Type", .value = "application/json" },
+    };
+    try bindHeaderParams(&params, prog, &headers);
+
+    try std.testing.expectEqual(@as(usize, 2), params.items.len);
+    try std.testing.expectEqualStrings("tenant", params.items[0].key);
+    try std.testing.expectEqualStrings("acme", params.items[0].val);
+    try std.testing.expectEqualStrings("trace", params.items[1].key);
+    try std.testing.expectEqualStrings("t-123", params.items[1].val);
+}
+
+test "buffered endpoint: accept -> WAL -> drain through the pipeline" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+
+    const script = try std.fmt.allocPrint(a,
+        \\CREATE ENDPOINT '/ev'
+        \\  ACCEPT BODY (device_id STRING NOT NULL, v INT)
+        \\  INTO BUFFER 'ev' AT '{s}/wal' SEGMENT 1 MB RETAIN UNTIL LOADED;
+        \\LOAD INTO '{s}/out.csv' AS
+        \\SELECT device_id, CAST(v AS INT) AS v FROM BUFFER 'ev' FLUSH EVERY 1 SECONDS;
+    , .{ base, base });
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a, script, &diag);
+
+    const bs = (try initBufState(gpa, prog)).?;
+    defer {
+        bs.shutdown();
+        gpa.destroy(bs);
+    }
+    try std.testing.expectEqual(@as(u64, 1), bs.flush_secs);
+
+    // Accept a valid batch of two rows (durably: fsynced before return).
+    var vmsg: []const u8 = "";
+    const n = try acceptIntoBuffer(bs, a,
+        \\[{"device_id":"a","v":1},{"device_id":"b","v":2}]
+    , &vmsg);
+    try std.testing.expectEqual(@as(usize, 2), n);
+
+    // Schema violation names the column; nothing is appended.
+    try std.testing.expectError(error.BodySchemaViolation, acceptIntoBuffer(bs, a,
+        \\[{"v":3}]
+    , &vmsg));
+    try std.testing.expect(std.mem.indexOf(u8, vmsg, "device_id") != null);
+
+    // Backpressure: bytes on disk over the limit -> 503-mapped error.
+    const saved_max = bs.max_bytes;
+    bs.max_bytes = 1;
+    try std.testing.expectError(error.Backpressure, acceptIntoBuffer(bs, a,
+        \\[{"device_id":"c","v":3}]
+    , &vmsg));
+    bs.max_bytes = saved_max;
+
+    // Flush cycle: rotate the open segment, drain it through the pipeline.
+    try bs.wal.rotateIfNonEmpty();
+    drainPending(gpa, bs);
+
+    const out = try tmp.dir.readFileAlloc(a, "out.csv", 1 << 20);
+    try std.testing.expectEqualStrings("device_id,v\na,1\nb,2\n", out);
+    try std.testing.expectEqual(@as(u64, 1), bs.wal.loadedUpTo());
+    // RETAIN UNTIL LOADED: the drained segment was purged.
+    const pending = try bs.wal.pendingSegments(gpa);
+    defer gpa.free(pending);
+    try std.testing.expectEqual(@as(usize, 0), pending.len);
+    try std.testing.expectEqual(@as(u64, 0), bs.wal.bytesOnDisk());
+}
+
+/// Accept exactly `n` connections and handle each (test harness).
+fn acceptN(gpa: std.mem.Allocator, routes: []const Route, srv: *std.net.Server, n: usize) void {
+    var read_buf: [64 * 1024]u8 = undefined;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const conn = srv.accept() catch return;
+        handleConn(gpa, routes, conn, &read_buf, 1) catch {};
+        conn.stream.close();
+    }
+}
+
+test "serve integration: buffered accept and FROM HEADER over real HTTP" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n7\n" });
+
+    // Route 1: buffered telemetry endpoint. Route 2: header-bound param.
+    const ev_script = try std.fmt.allocPrint(a,
+        \\CREATE ENDPOINT '/ev'
+        \\  ACCEPT BODY (device_id STRING NOT NULL, v INT)
+        \\  INTO BUFFER 'ev' AT '{s}/wal' SEGMENT 1 MB MAX 512 MB RETAIN UNTIL LOADED;
+        \\LOAD INTO '{s}/out_ev.csv' AS
+        \\SELECT device_id, CAST(v AS INT) AS v FROM BUFFER 'ev';
+    , .{ base, base });
+    const hdr_script = try std.fmt.allocPrint(a,
+        \\CREATE ENDPOINT '/hdr';
+        \\PARAM tenant STRING FROM HEADER('X-Tenant');
+        \\LOAD INTO '{s}/out_hdr.csv' AS
+        \\SELECT id, $tenant AS tenant FROM '{s}/in.csv';
+    , .{ base, base });
+
+    var d1: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const ev_prog = try parser.parseSource(a, ev_script, &d1);
+    var d2: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const hdr_prog = try parser.parseSource(a, hdr_script, &d2);
+
+    const bs = (try initBufState(gpa, ev_prog)).?;
+    defer {
+        bs.shutdown();
+        gpa.destroy(bs);
+    }
+    try std.testing.expectEqual(@as(u64, 512 << 20), bs.max_bytes); // MAX knob applied
+    const routes = [_]Route{
+        .{ .path = "/ev", .program = ev_prog, .label = "ev", .buf = bs },
+        .{ .path = "/hdr", .program = hdr_prog, .label = "hdr" },
+    };
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var srv = try addr.listen(.{ .reuse_address = true });
+    defer srv.deinit();
+    const port = srv.listen_address.getPort();
+    const th = try std.Thread.spawn(.{}, acceptN, .{ gpa, &routes, &srv, @as(usize, 3) });
+
+    var client = std.http.Client{ .allocator = gpa };
+    defer client.deinit();
+    const ev_url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/ev", .{port});
+    const hdr_url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/hdr", .{port});
+
+    // 1) valid rows -> 200 accepted (durable, not yet loaded)
+    {
+        var aw = std.Io.Writer.Allocating.init(gpa);
+        defer aw.deinit();
+        const res = try client.fetch(.{
+            .location = .{ .url = ev_url },
+            .method = .POST,
+            .payload =
+            \\[{"device_id":"a","v":1},{"device_id":"b","v":2}]
+            ,
+            .response_writer = &aw.writer,
+            .keep_alive = false,
+        });
+        try std.testing.expectEqual(std.http.Status.ok, res.status);
+        try std.testing.expect(std.mem.indexOf(u8, aw.written(), "accepted") != null);
+    }
+    // 2) schema violation -> 422 naming the column
+    {
+        var aw = std.Io.Writer.Allocating.init(gpa);
+        defer aw.deinit();
+        const res = try client.fetch(.{
+            .location = .{ .url = ev_url },
+            .method = .POST,
+            .payload =
+            \\[{"v":9}]
+            ,
+            .response_writer = &aw.writer,
+            .keep_alive = false,
+        });
+        try std.testing.expectEqual(std.http.Status.unprocessable_entity, res.status);
+        try std.testing.expect(std.mem.indexOf(u8, aw.written(), "device_id") != null);
+    }
+    // 3) FROM HEADER('X-Tenant') binds end-to-end
+    {
+        var aw = std.Io.Writer.Allocating.init(gpa);
+        defer aw.deinit();
+        const res = try client.fetch(.{
+            .location = .{ .url = hdr_url },
+            .method = .GET,
+            .response_writer = &aw.writer,
+            .keep_alive = false,
+            .extra_headers = &.{.{ .name = "X-Tenant", .value = "acme" }},
+        });
+        try std.testing.expectEqual(std.http.Status.ok, res.status);
+    }
+    th.join();
+
+    const hdr_out = try tmp.dir.readFileAlloc(a, "out_hdr.csv", 1 << 20);
+    try std.testing.expectEqualStrings("id,tenant\n7,acme\n", hdr_out);
+
+    // Deterministic drain (the flusher thread isn't running in this test).
+    try bs.wal.rotateIfNonEmpty();
+    drainPending(gpa, bs);
+    const ev_out = try tmp.dir.readFileAlloc(a, "out_ev.csv", 1 << 20);
+    try std.testing.expectEqualStrings("device_id,v\na,1\nb,2\n", ev_out);
 }

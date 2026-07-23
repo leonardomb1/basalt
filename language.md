@@ -140,6 +140,15 @@ Source clauses, in any order after the source:
   the generated source query's `WHERE` (the successor of BSL `@[where]`).
   ANDed with whatever the translated `WHERE` pushes down. Empty literal = no
   clause. Syntax errors surface at the source at runtime (permanent, exit 1).
+- **Implicit pushdown** — the contiguous `WHERE` (filter) prefix directly after
+  a SQL table/query read is translated into that source query's `WHERE`
+  automatically. Translatable: comparisons, `AND`/`OR`/`NOT`, `IS [NOT]
+  NULL`/`EMPTY`, `IN`, `LIKE`, `CASE`/`IF`, `CAST`, and the portable string
+  functions (`lower upper length trim substr replace concat coalesce
+  starts_with ends_with contains`). Untranslatable pieces (arithmetic,
+  `now()`/`today()`, user funcs) stay in the engine — the filter is always
+  kept, so results never change, only how much crosses the wire. `check -s`
+  prints the descended predicate on a `pushdown:` line.
 - **`PAGINATE BY page|offset|cursor (param = 'page', size = 100,
   total = 'count', field = 'next', start = 2, max = 50)`** — REST pagination.
   Friendly keys map to the engine hints (`param`→`page_param`/`cursor_param`,
@@ -254,8 +263,48 @@ WHERE tipo IN ('leitura', 'alarme');
   or single object) is validated row by row: a missing/null `NOT NULL` column
   or an unreadable value rejects the request with a message naming the row —
   served as **422**. Extra keys are dropped. `JSON` columns ride as text.
+- **`FROM HEADER('X-Tenant')`** on a `PARAM` binds it from that request header
+  (case-insensitive); bare `FROM HEADER` matches the param's own name.
 - Status contract: success → `200` + summary JSON; per-item failures → `207`;
   permanent error → `422`; transient → `503` + `Retry-After`.
+
+### Durable buffer (WAL)
+
+`ACCEPT ... INTO BUFFER` turns the endpoint into a queue: **200 means
+"accepted durably"** (fsynced), and the load happens asynchronously.
+
+```sql
+CREATE ENDPOINT '/eventos'
+  DOC 'Recebe telemetria; ack após persistir em disco'
+  ACCEPT BODY (
+    device_id STRING NOT NULL,
+    ts        STRING,
+    payload   JSON
+  )
+  INTO BUFFER 'eventos'
+    AT '/var/lib/basalt/wal'
+    SEGMENT 16 MB
+    RETAIN UNTIL LOADED;          -- or: RETAIN 24 HOURS (allows reprocessing)
+
+LOAD INTO sr.bronze.eventos USING stream_load AS
+SELECT device_id, CAST(ts AS TIMESTAMP) AS ts, payload, now() AS recebido_em
+FROM BUFFER 'eventos'
+  FLUSH EVERY 5 SECONDS OR 50000 ROWS;
+```
+
+- Requests are validated against the `ACCEPT BODY` schema (422 naming the
+  row), appended to append-only JSONL segments, and acked after one fsync
+  (group commit: N rows, one sync).
+- A flusher thread drains completed segments through the pipeline, one run
+  per segment. The StarRocks label is derived from the segment name
+  (`eventos-000042`), so a crash between "loaded" and "marked" replays the
+  same label and the sink dedups — effectively exactly-once, no 2PC.
+- Backpressure: buffer disk usage over the limit (1 GiB default) ⇒ `503 +
+  Retry-After` — the client is the queue.
+- **Batch replay**: `FROM BUFFER 'eventos' AT '<dir>'` in a plain batch script
+  reads every retained segment — the queue is just another source.
+- Honest cost: `serve` becomes stateful (the WAL directory needs a persistent
+  volume) and durability is the node's disk, not replicated.
 
 ## 9. Expressions
 
@@ -296,9 +345,16 @@ basalt check <script>|-|-c "<inline>" [-s|--show-plan] [--connect]
 
 ## 11. Designed but not yet implemented
 
-From migration.md, accepted design not yet in the engine: the durable buffer
-(`ACCEPT ... INTO BUFFER` / `FROM BUFFER`, §10 there), the generalized
-`EACH TABLE OF (SELECT ...)` discovery (needs query→SQL translation), and
-`FROM HEADER('X-Name')` header selection (parsed, name currently unused).
-The golden corpus that gates the BSL parser's removal lives in
+From migration.md, accepted design not yet in the engine:
+
+- **Whole-CTE / cross-source pushdown** (§7's full Trino model): implicit
+  pushdown currently translates the filter prefix of a *single* SQL read. A
+  multi-stage CTE that is entirely one connection isn't yet collapsed into one
+  descended query, and a cross-connection join still materializes the smaller
+  side in the engine (correct, just not maximally pushed). The predicate
+  translator (`runtime/pushdown.zig`) is the reusable core when this lands.
+- **Generalized `EACH TABLE OF (SELECT ...)`** discovery — needs the same
+  query→SQL translation; the raw `QUERY($$...$$)` form covers it meanwhile.
+
+The golden corpus that gated the BSL parser's removal lives in
 `examples/golden/` — see its README for the comparison rules.

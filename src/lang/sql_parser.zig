@@ -264,10 +264,12 @@ pub const Parser = struct {
                 const doc = try self.expect(.string);
                 try attrs.append(.{ .key = "doc", .value = try self.mk(.{ .str_lit = doc.text }), .pos = pos });
             }
+            var buffer: ?ast.BufferDecl = null;
+            if (self.eatKw("accept")) buffer = try self.parseAcceptBuffer(pos);
             _ = try self.expect(.semi);
             if (self.endpoint != null)
                 return self.fail(pos, "duplicate CREATE ENDPOINT", .{});
-            self.endpoint = .{ .kind = .http, .config = try attrs.toOwnedSlice(), .pos = pos };
+            self.endpoint = .{ .kind = .http, .config = try attrs.toOwnedSlice(), .buffer = buffer, .pos = pos };
             return;
         }
         if (self.eatKw("connection")) {
@@ -279,6 +281,50 @@ pub const Parser = struct {
             return out.append(.{ .func = try self.parseFunction(pos) });
         }
         return self.fail(self.curPos(), "expected ENDPOINT, CONNECTION, or FUNCTION after CREATE", .{});
+    }
+
+    /// `ACCEPT BODY (schema) INTO BUFFER 'name' [AT 'dir'] [SEGMENT n MB|KB|GB]
+    /// [MAX n MB|GB] [RETAIN UNTIL LOADED | RETAIN n HOURS]` — after CREATE
+    /// ENDPOINT. `MAX` is the on-disk backpressure limit (503 beyond it).
+    fn parseAcceptBuffer(self: *Parser, pos: Pos) Error!ast.BufferDecl {
+        try self.expectKw("body");
+        const schema = try self.parseBodySchema();
+        try self.expectKw("into");
+        try self.expectKw("buffer");
+        const name = try self.expect(.string);
+        var decl = ast.BufferDecl{ .name = name.text, .dir = "wal", .schema = schema, .pos = pos };
+        while (true) {
+            if (self.eatKw("at")) {
+                decl.dir = (try self.expect(.string)).text;
+            } else if (self.eatKw("segment")) {
+                decl.segment_bytes = try self.parseByteSize();
+            } else if (self.eatKw("max")) {
+                decl.max_bytes = try self.parseByteSize();
+            } else if (self.eatKw("retain")) {
+                if (self.eatKw("until")) {
+                    try self.expectKw("loaded");
+                    decl.retain_hours = null;
+                } else {
+                    const n = try self.expect(.int);
+                    try self.expectKw("hours");
+                    decl.retain_hours = std.fmt.parseInt(u32, n.text, 10) catch
+                        return self.fail(pos, "bad RETAIN hours `{s}`", .{n.text});
+                }
+            } else break;
+        }
+        return decl;
+    }
+
+    /// `<int> KB|MB|GB` -> bytes.
+    fn parseByteSize(self: *Parser) Error!u64 {
+        const n = try self.expect(.int);
+        const v = std.fmt.parseInt(u64, n.text, 10) catch
+            return self.fail(self.curPos(), "bad size `{s}`", .{n.text});
+        const unit = try self.expectIdent();
+        if (eqlNoCase(unit, "kb")) return v << 10;
+        if (eqlNoCase(unit, "mb")) return v << 20;
+        if (eqlNoCase(unit, "gb")) return v << 30;
+        return self.fail(self.curPos(), "expected KB, MB, or GB (got `{s}`)", .{unit});
     }
 
     fn parseConnection(self: *Parser, pos: Pos) Error!ast.Connection {
@@ -352,6 +398,7 @@ pub const Parser = struct {
         var default: ?*ast.Expr = null;
         if (self.eatKw("default")) default = try self.parseExpr();
         var source: ?ast.ParamSource = null;
+        var header_name: ?[]const u8 = null;
         if (self.eatKw("from")) {
             if (self.eatKw("query")) {
                 source = .query;
@@ -359,8 +406,8 @@ pub const Parser = struct {
                 source = .body;
             } else if (self.eatKw("header")) {
                 source = .header;
-                if (self.eat(.lparen)) { // FROM HEADER('X-Name') — name currently unused
-                    _ = try self.expect(.string);
+                if (self.eat(.lparen)) { // FROM HEADER('X-Name')
+                    header_name = (try self.expect(.string)).text;
                     _ = try self.expect(.rparen);
                 }
             } else {
@@ -369,7 +416,7 @@ pub const Parser = struct {
         }
         if (is_json and source == null) source = .body;
         _ = try self.expect(.semi);
-        return .{ .name = name, .ty = ty, .default = default, .source = source, .pos = pos, .is_json = is_json };
+        return .{ .name = name, .ty = ty, .default = default, .source = source, .header_name = header_name, .pos = pos, .is_json = is_json };
     }
 
     fn parseTypeName(self: *Parser) Error!types.Type {
@@ -970,6 +1017,29 @@ pub const Parser = struct {
             const url = try self.expect(.string);
             _ = try self.expect(.rparen);
             node = .{ .read = .{ .connector = "http", .form = .{ .path = url.text } } };
+        } else if (self.isKw("buffer") and self.peekTag() == .string) {
+            // FROM BUFFER 'name' [AT 'dir'] [FLUSH EVERY n SECONDS [OR n ROWS]]
+            _ = self.advance();
+            const name = self.advance().text;
+            var ref = ast.BufferRef{ .name = name };
+            if (self.eatKw("at")) ref.dir = (try self.expect(.string)).text;
+            if (self.eatKw("flush")) {
+                const fpos = self.curPos();
+                try self.expectKw("every");
+                const n = try self.expect(.int);
+                try self.expectKw("seconds");
+                const secs = std.fmt.parseInt(i64, n.text, 10) catch
+                    return self.fail(fpos, "bad FLUSH EVERY seconds `{s}`", .{n.text});
+                try read_hints.append(.{ .key = "flush_secs", .value = .{ .int = secs }, .pos = fpos });
+                if (self.eatKw("or")) {
+                    const r = try self.expect(.int);
+                    try self.expectKw("rows");
+                    const rows = std.fmt.parseInt(i64, r.text, 10) catch
+                        return self.fail(fpos, "bad FLUSH rows `{s}`", .{r.text});
+                    try read_hints.append(.{ .key = "flush_rows", .value = .{ .int = rows }, .pos = fpos });
+                }
+            }
+            node = .{ .read = .{ .connector = "buffer", .form = .{ .buffer = ref } } };
         } else if (self.isKw("each")) {
             return self.parseEachTableOf(read_hints);
         } else {
@@ -1840,4 +1910,41 @@ test "sql: truncated expression is a parse error" {
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const r = parseSource(a, "SELECT * FROM x.QUERY($$q$$) WHERE a >", &diag);
     try testing.expectError(error.ParseFailed, r);
+}
+
+test "sql: ACCEPT INTO BUFFER declaration and FROM BUFFER source" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a,
+        \\CREATE ENDPOINT '/eventos' DOC 'telemetria'
+        \\  ACCEPT BODY (device_id STRING NOT NULL, v INT)
+        \\  INTO BUFFER 'ev' AT '/var/lib/basalt/wal' SEGMENT 16 MB RETAIN 24 HOURS;
+        \\CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = 'h', database = 'b');
+        \\LOAD INTO sr.eventos USING stream_load AS
+        \\SELECT device_id, CAST(v AS INT) AS v
+        \\FROM BUFFER 'ev' FLUSH EVERY 5 SECONDS OR 50000 ROWS
+        \\WHERE device_id IS NOT NULL;
+    );
+    const kd = prog.stmts[0].kind;
+    try testing.expect(kd.kind == .http);
+    const buf = kd.buffer.?;
+    try testing.expectEqualStrings("ev", buf.name);
+    try testing.expectEqualStrings("/var/lib/basalt/wal", buf.dir);
+    try testing.expectEqual(@as(u64, 16 << 20), buf.segment_bytes);
+    try testing.expectEqual(@as(u32, 24), buf.retain_hours.?);
+    try testing.expectEqual(@as(usize, 2), buf.schema.len);
+    try testing.expect(buf.schema[0].not_null);
+
+    const pl = prog.stmts[2].output;
+    const rd = pl.stages[0].node.read;
+    try testing.expectEqualStrings("buffer", rd.connector);
+    try testing.expectEqualStrings("ev", rd.form.buffer.name);
+    try testing.expectEqualStrings("", rd.form.buffer.dir); // resolves from the decl
+    try testing.expectEqualStrings("flush_secs", pl.stages[0].hints[0].key);
+    try testing.expectEqual(@as(i64, 5), pl.stages[0].hints[0].value.int);
+    try testing.expectEqualStrings("flush_rows", pl.stages[0].hints[1].key);
+    try testing.expectEqual(@as(i64, 50000), pl.stages[0].hints[1].value.int);
+    try testing.expect(pl.stages[1].node == .filter);
 }

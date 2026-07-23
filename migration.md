@@ -627,6 +627,11 @@ Ordem sugerida; cada item é independente dos demais.
 
 ### 13.1 Buffer durável (§10) — o único subsistema novo
 
+> **Status:** IMPLEMENTADO (fases 1–4; ver `language.md` §"Durable buffer").
+> Pendências menores: purge por idade (`RETAIN n HOURS` retém mas não expira),
+> knob de gramática para o limite de backpressure (default 1 GiB), e teste de
+> integração serve+socket (o ciclo accept→WAL→drain é testado sem socket).
+
 Fases incrementais, cada uma útil sozinha:
 
 1. **WAL writer** (`src/connect/wal.zig`): segmentos JSONL append-only
@@ -652,12 +657,23 @@ Riscos a validar cedo: fsync custo por request (medir; group commit resolve),
 formato do manifesto sob crash (escrever-e-rename atômico), interação do
 flusher com SIGHUP/reload do serve.
 
-### 13.2 `EACH TABLE OF (SELECT ...)` generalizado
+### 13.2 Tradutor expr→SQL e pushdown implícito
 
-Requer o tradutor plano→SQL da fonte (o mesmo bloco que um dia serve o
-pushdown implícito §7 de CTE inteira). Até lá a forma crua
-`conn.QUERY($$...$$)` cobre o caso; a grafia já comporta a evolução. Não
-bloquear v0.2.x nisso.
+> **Status:** PARCIAL (implementado o essencial). O tradutor `ast.Expr` → SQL
+> da fonte existe (`runtime/pushdown.zig` `translateExpr`): comparações,
+> `AND/OR/NOT`, `IS NULL/EMPTY`, `IN`, `LIKE`, `CASE/IF`, `CAST`, e funções
+> escalares portáveis (`lower upper length trim substr replace concat coalesce
+> starts_with ends_with contains`). O pushdown implícito de um único read está
+> ligado: o prefixo de `filter` logo após um `read` SQL desce para o `WHERE`
+> da query (`serialWhere` em run.zig; preview em `analyze` → linha `pushdown:`
+> no `check -s`). O filtro é sempre MANTIDO (regra superset), então o resultado
+> nunca muda — só o volume na rede.
+>
+> **Falta:** colapsar uma CTE inteiramente de UMA conexão numa única query
+> descida (o modelo Trino completo do §7); o join cross-conexão ainda
+> materializa o lado menor no engine. O `EACH TABLE OF (SELECT ...)`
+> generalizado cai no mesmo bloco. `conn.QUERY($$...$$)` cobre o caso cru
+> até lá.
 
 ### 13.3 Miudezas
 

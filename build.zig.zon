@@ -1,6 +1,6 @@
 .{
     .name = .basalt,
-    .version = "0.1.0",
+    .version = "0.2.0",
     // Globally unique package id, generated once by the Zig toolchain. Never change it.
     .fingerprint = 0xfe136ee47f43bd82,
     // Tracks the earliest Zig version this package supports. Built and tested

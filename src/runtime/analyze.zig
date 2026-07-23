@@ -9,6 +9,8 @@ const std = @import("std");
 const ast = @import("../lang/ast.zig");
 const expand = @import("../lang/expand.zig");
 const types = @import("../lang/types.zig");
+const pushdown = @import("pushdown.zig");
+const Dialect = @import("../connect/sql.zig").Dialect;
 const eval = @import("../exec/eval.zig");
 const csv = @import("../connect/csv.zig");
 
@@ -241,6 +243,10 @@ pub const Source = struct {
     detail: []const u8, // path, `table X`, `query`, or `binding X`
     /// Resolved column schema, or null when it needs a live connection.
     schema: ?types.Schema = null,
+    /// The predicate translated down into the source query (§7 implicit
+    /// pushdown + any raw `PUSHDOWN` fragment), or "" when none — so `check -s`
+    /// shows the cut line between "descended to the source" and "runs here".
+    pushdown: []const u8 = "",
 };
 
 pub const Sink = struct {
@@ -367,7 +373,25 @@ const Ctx = struct {
         if (stages[stages.len - 1].node != .write)
             return fail(self.diag, "a top-level pipeline must end in `write`", .{});
 
-        const source = try self.resolveSource(stages[0]);
+        var source = try self.resolveSource(stages[0]);
+
+        // §7 implicit pushdown preview: the contiguous filter prefix that would
+        // descend into a SQL source query (same translator the runtime uses),
+        // AND-ed with any raw PUSHDOWN/@[where] fragment on the read.
+        if (stages[0].node == .read) {
+            const rd = stages[0].node.read;
+            if ((rd.form == .table or rd.form == .query))
+                if (self.connections.get(rd.connector)) |conn| {
+                    if (dialectOf(conn.connector)) |d| {
+                        var raw: []const u8 = rd.where;
+                        for (stages[0].hints) |h| {
+                            if (std.mem.eql(u8, h.key, "where") and h.value == .str) raw = h.value.str;
+                        }
+                        const implicit = pushdown.serialWhere(self.arena, d, stages) catch null;
+                        source.pushdown = try composePushdown(self.arena, raw, implicit);
+                    }
+                };
+        }
 
         var stage_infos = std.array_list.Managed(Stage).init(self.arena);
         var has_breaker = false;
@@ -425,6 +449,7 @@ const Ctx = struct {
                     .query => "query",
                     .path => |p| p,
                     .request => "request",
+                    .buffer => |b| try std.fmt.allocPrint(self.arena, "buffer {s}", .{b.name}),
                 };
                 // CSV resolves locally; a resolver (e.g. `--connect`) fills DB sources.
                 var schema = offlineSchema(self.arena, rd);
@@ -545,6 +570,8 @@ pub fn render(plan: Plan, w: anytype) !void {
     try w.print("@{s}\n", .{plan.kind});
     for (plan.outputs) |o| {
         try w.print("  read  {s}  {s}\n", .{ o.source.connector, o.source.detail });
+        if (o.source.pushdown.len > 0)
+            try w.print("        pushdown: {s}\n", .{o.source.pushdown});
         try printSchema(w, "        ", o.source.schema);
         for (o.stages) |st| {
             if (st.detail.len > 0) {
@@ -597,11 +624,29 @@ fn printSchema(w: anytype, indent: []const u8, schema: ?types.Schema) !void {
 // ---------------------------------------------------------------------------
 
 fn isBuiltinSource(connector: []const u8) bool {
-    return std.mem.eql(u8, connector, "csv") or std.mem.eql(u8, connector, "request") or std.mem.eql(u8, connector, "http");
+    return std.mem.eql(u8, connector, "csv") or std.mem.eql(u8, connector, "request") or
+        std.mem.eql(u8, connector, "http") or std.mem.eql(u8, connector, "buffer");
 }
 
 fn isSqlConnector(connector: []const u8) bool {
     return std.mem.eql(u8, connector, "postgres") or std.mem.eql(u8, connector, "mysql") or std.mem.eql(u8, connector, "sqlserver");
+}
+
+/// The pushdown dialect for a connector, or null if it's not a SQL source.
+fn dialectOf(connector: []const u8) ?Dialect {
+    if (std.mem.eql(u8, connector, "postgres")) return .postgres;
+    if (std.mem.eql(u8, connector, "mysql")) return .mysql;
+    if (std.mem.eql(u8, connector, "sqlserver")) return .sqlserver;
+    return null;
+}
+
+/// AND a raw `PUSHDOWN`/@[where] fragment with the translated implicit
+/// predicate for the plan preview.
+fn composePushdown(arena: std.mem.Allocator, raw: []const u8, implicit: ?[]const u8) ![]const u8 {
+    if (raw.len > 0 and implicit != null)
+        return std.fmt.allocPrint(arena, "({s}) AND ({s})", .{ raw, implicit.? });
+    if (raw.len > 0) return raw;
+    return implicit orelse "";
 }
 
 fn isMapStage(node: ast.Stage.Node) bool {
@@ -700,6 +745,40 @@ test "analyze a SQL table pipeline: unresolved schema offline, split candidate" 
     try std.testing.expectEqualStrings("postgres", o.source.connector);
     try std.testing.expect(o.source.schema == null); // DB needs --connect
     try std.testing.expect(o.physical.splittable); // SQL table, map-only
+    // §7 implicit pushdown preview: the filter descends into the source query.
+    try std.testing.expectEqualStrings("(\"amount\" > 0)", o.source.pushdown);
+}
+
+test "analyze pushdown preview: raw PUSHDOWN AND-ed with the translated filter" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parse(a,
+        \\CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'h', database = 'd');
+        \\LOAD INTO '/tmp/x.csv' AS
+        \\SELECT filial FROM erp.dbo.T PUSHDOWN($$D_E_L_E_T_ <> '*'$$)
+        \\WHERE valor > 0 AND status = 'ok';
+    );
+    var diag = Diag{};
+    const plan = try analyze(a, prog, null, &diag);
+    // raw fragment first, then the two translated comparisons AND-ed together
+    try std.testing.expectEqualStrings(
+        "(D_E_L_E_T_ <> '*') AND ((([valor] > 0) AND ([status] = 'ok')))",
+        plan.outputs[0].source.pushdown,
+    );
+}
+
+test "analyze pushdown preview: an untranslatable filter is not pushed (stays engine-side)" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parse(a,
+        \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');
+        \\LOAD INTO '/tmp/x.csv' AS SELECT * FROM pg.t WHERE amount + 1 > 5;
+    );
+    var diag = Diag{};
+    const plan = try analyze(a, prog, null, &diag);
+    try std.testing.expectEqualStrings("", plan.outputs[0].source.pushdown); // arithmetic: not pushable
 }
 
 test "type flow fills out_schema for resolved sources" {
