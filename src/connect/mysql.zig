@@ -52,6 +52,7 @@ pub const Conn = struct {
 
     pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sqlmod.TlsMode) !*Conn {
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
+        driver.tuneSocket(stream.handle);
         const self = try gpa.create(Conn);
         self.* = .{ .gpa = gpa, .stream = stream, .buf = std.array_list.Managed(u8).init(gpa) };
         self.sr = std.net.Stream.Reader.init(stream, &self.read_buf);
@@ -179,8 +180,9 @@ pub const Conn = struct {
         self.ld_seq +%= 1;
     }
 
-    /// Empty packet = end of data; then read the server's OK/ERR.
-    pub fn loadDataEnd(self: *Conn) !void {
+    /// Empty packet = end of data; then read the server's OK/ERR. Returns the
+    /// OK packet's affected-rows count.
+    pub fn loadDataEnd(self: *Conn) !u64 {
         try self.writePacket(self.ld_seq, "");
         _ = try self.readPacket();
         const p = self.buf.items;
@@ -188,6 +190,7 @@ pub const Conn = struct {
             self.last_error = try self.gpa.dupe(u8, errMessage(p));
             return error.MysqlQueryFailed;
         }
+        return parseOkAffected(p) orelse error.MysqlProtocol;
     }
 
     pub fn close(self: *Conn) void {
@@ -497,14 +500,17 @@ const LD_FLUSH_BYTES = 1 << 20; // ~1MB per data packet (well under MySQL's 16MB
 pub const LoadDataSink = struct {
     gpa: std.mem.Allocator,
     conn: *Conn,
-    buffer: std.array_list.Managed(u8),
+    buffer: std.array_list.Managed(u8), // current segment's encoded rows (replay unit)
+    load_cmd: []const u8 = "", // gpa-owned; issued once per segment
+    seg_rows: u64 = 0,
+    redial: ?sqlmod.Redial = null,
 
-    pub fn open(gpa: std.mem.Allocator, conn: *Conn, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode) !*LoadDataSink {
+    pub fn open(gpa: std.mem.Allocator, conn: *Conn, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?sqlmod.Redial) !*LoadDataSink {
         // On error we free only what we allocate here; the caller keeps `conn`
         // (so it can read conn.last_error) and closes it on failure.
         const self = try gpa.create(LoadDataSink);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .conn = conn, .buffer = std.array_list.Managed(u8).init(gpa) };
+        self.* = .{ .gpa = gpa, .conn = conn, .buffer = std.array_list.Managed(u8).init(gpa), .redial = redial };
         errdefer self.buffer.deinit();
 
         var aa = std.heap.ArenaAllocator.init(gpa);
@@ -519,7 +525,7 @@ pub const LoadDataSink = struct {
             if (i > 0) try cols.append(',');
             try cols.appendSlice(try sqlmod.quoteIdent(a, .mysql, f.name));
         }
-        try conn.loadDataStart(try std.fmt.allocPrint(a, "LOAD DATA LOCAL INFILE 'pipe' INTO TABLE {s} ({s})", .{ qtable, cols.items }));
+        self.load_cmd = try std.fmt.allocPrint(gpa, "LOAD DATA LOCAL INFILE 'pipe' INTO TABLE {s} ({s})", .{ qtable, cols.items });
         return self;
     }
 
@@ -529,21 +535,50 @@ pub const LoadDataSink = struct {
 
     fn writeBatch(self: *LoadDataSink, arena: std.mem.Allocator, batch: Batch) !void {
         try sqlmod.appendBulkText(self.buffer.writer(), arena, batch, .{ .bool_true = "1", .bool_false = "0" });
-        if (self.buffer.items.len >= LD_FLUSH_BYTES) try self.flush();
+        self.seg_rows += batch.len;
+        if (self.buffer.items.len >= sqlmod.SEGMENT_BYTES) try self.commitSegment();
     }
 
-    fn flush(self: *LoadDataSink) !void {
-        if (self.buffer.items.len == 0) return;
-        try self.conn.loadDataChunk(self.buffer.items);
+    /// Transmit the buffered segment as one LOAD DATA statement and verify the
+    /// OK packet's affected-rows count. Transient failure → redial once and
+    /// resend the intact segment (a LOAD DATA cut mid-statement rolls back).
+    /// Same lost-reply double-write window as the other bulk sinks.
+    fn commitSegment(self: *LoadDataSink) !void {
+        if (self.seg_rows == 0) return;
+        self.sendSegment() catch |e| {
+            const rd = self.redial orelse return e;
+            if (!driver.transientNet(e)) return e;
+            const fresh = try rd.dial(rd.ctx, self.gpa);
+            self.conn.close();
+            // Redial ctx is kind-matched: the vtable ptr is always a *mysql.Conn.
+            self.conn = @ptrCast(@alignCast(fresh.ptr));
+            try self.sendSegment();
+        };
         self.buffer.clearRetainingCapacity();
+        self.seg_rows = 0;
+    }
+
+    fn sendSegment(self: *LoadDataSink) !void {
+        try self.conn.loadDataStart(self.load_cmd);
+        var off: usize = 0; // ≤1MB data packets, well under the 16MB packet cap
+        while (off < self.buffer.items.len) {
+            const chunk = @min(self.buffer.items.len - off, LD_FLUSH_BYTES);
+            try self.conn.loadDataChunk(self.buffer.items[off .. off + chunk]);
+            off += chunk;
+        }
+        const n = try self.conn.loadDataEnd();
+        if (n != self.seg_rows) {
+            if (self.conn.last_error.len == 0)
+                self.conn.last_error = try std.fmt.allocPrint(self.gpa, "LOAD DATA count mismatch: sent {d} rows, server loaded {d}", .{ self.seg_rows, n });
+            return error.BulkCountMismatch;
+        }
     }
 
     fn closeImpl(self: *LoadDataSink) !void {
-        // Release everything even if the final flush/end fails — otherwise a
+        // Release everything even if the final segment fails — otherwise a
         // failed LOAD DATA on close leaks the connection, buffer and sink.
         defer self.teardown();
-        try self.flush();
-        try self.conn.loadDataEnd();
+        try self.commitSegment();
     }
 
     /// Failure path: drop the buffer and close the socket mid-LOAD DATA. The
@@ -555,6 +590,7 @@ pub const LoadDataSink = struct {
     fn teardown(self: *LoadDataSink) void {
         self.conn.close();
         self.buffer.deinit();
+        if (self.load_cmd.len > 0) self.gpa.free(self.load_cmd);
         self.gpa.destroy(self);
     }
 };
@@ -572,6 +608,21 @@ fn ldClose(ptr: *anyopaque) anyerror!void {
 fn ldAbort(ptr: *anyopaque) void {
     const self: *LoadDataSink = @ptrCast(@alignCast(ptr));
     self.abortImpl();
+}
+
+/// OK packet → affected-rows count (header 0x00, then affected_rows lenenc).
+fn parseOkAffected(p: []const u8) ?u64 {
+    if (p.len < 2 or p[0] != 0x00) return null;
+    var i: usize = 1;
+    return lenencInt(p, &i) catch null;
+}
+
+test "parseOkAffected: small and lenenc counts, non-OK header" {
+    try std.testing.expectEqual(@as(?u64, 3), parseOkAffected(&.{ 0x00, 0x03, 0x00, 0x00 }));
+    // 0xfc = 2-byte lenenc: 300 affected rows
+    try std.testing.expectEqual(@as(?u64, 300), parseOkAffected(&.{ 0x00, 0xfc, 0x2c, 0x01 }));
+    try std.testing.expectEqual(@as(?u64, null), parseOkAffected(&.{ 0xff, 0x03 }));
+    try std.testing.expectEqual(@as(?u64, null), parseOkAffected(&.{0x00}));
 }
 
 fn errMessage(p: []const u8) []const u8 {
@@ -642,6 +693,92 @@ test "decodeBits folds big-endian BIT bytes" {
     try std.testing.expectEqual(@as(i64, 1), decodeBits("\x01"));
     try std.testing.expectEqual(@as(i64, 256), decodeBits("\x01\x00"));
     try std.testing.expectEqual(@as(i64, 0xA1B2), decodeBits("\xA1\xB2"));
+}
+
+test "caching_sha2_password token matches a known vector" {
+    // password "foobar", nonce = 20 bytes 0x01..0x14; computed externally
+    // (Python hashlib) — the digest-then-nonce order is the easy bug here.
+    var salt: [20]u8 = undefined;
+    for (&salt, 0..) |*b, i| b.* = @intCast(i + 1);
+    const tok = cachingSha2Token("foobar", &salt);
+    var expect: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expect, "b8d219ce85485ca1b632dba17e782bb0a42698fad919896ff91e86c9896489fd");
+    try std.testing.expectEqualSlices(u8, &expect, &tok);
+}
+
+test "lenenc integers: inline, 2/3/8-byte forms, truncation errors" {
+    var i: usize = 0;
+    try std.testing.expectEqual(@as(u64, 0xfa), try lenencInt("\xfa", &i));
+    i = 0;
+    try std.testing.expectEqual(@as(u64, 0x1234), try lenencInt("\xfc\x34\x12", &i));
+    try std.testing.expectEqual(@as(usize, 3), i);
+    i = 0;
+    try std.testing.expectEqual(@as(u64, 0x010203), try lenencInt("\xfd\x03\x02\x01", &i));
+    i = 0;
+    try std.testing.expectEqual(
+        @as(u64, 0x0807060504030201),
+        try lenencInt("\xfe\x01\x02\x03\x04\x05\x06\x07\x08", &i),
+    );
+    // truncated payloads must error, not read past the buffer
+    i = 0;
+    try std.testing.expectError(error.MysqlProtocol, lenencInt("", &i));
+    i = 0;
+    try std.testing.expectError(error.MysqlProtocol, lenencInt("\xfc\x34", &i));
+}
+
+test "lenenc strings: value, 0xfb NULL marker, truncation" {
+    var i: usize = 0;
+    try std.testing.expectEqualStrings("abc", (try lenencStrOrNull("\x03abcrest", &i)).?);
+    try std.testing.expectEqual(@as(usize, 4), i);
+    i = 0;
+    try std.testing.expectEqual(@as(?[]const u8, null), try lenencStrOrNull("\xfb", &i));
+    try std.testing.expectEqual(@as(usize, 1), i); // marker consumed
+    i = 0;
+    try std.testing.expectError(error.MysqlProtocol, lenencStr("\x05ab", &i));
+}
+
+test "ERR packet message extraction, with and without sql-state" {
+    // 0xff, code(2), '#' + 5-char sql state, message
+    try std.testing.expectEqualStrings("Access denied", errMessage("\xff\x15\x04#28000Access denied"));
+    // pre-4.1 form: no '#' marker, message directly after the code
+    try std.testing.expectEqualStrings("boom", errMessage("\xff\x15\x04boom"));
+    try std.testing.expectEqualStrings("mysql error", errMessage("\xff\x15"));
+}
+
+test "parseColDef decodes a column definition packet" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // catalog/schema/table/org_table/name/org_name as lenenc strings, then
+    // 0x0c fixed block: charset(2) collen(4) type(1) flags(2) decimals(1) filler(2)
+    const pkt = "\x03def" ++ "\x02db" ++ "\x01t" ++ "\x01t" ++ "\x06amount" ++ "\x06amount" ++
+        "\x0c" ++ "\x21\x00" ++ "\x0b\x00\x00\x00" ++ "\xf6" ++ "\x00\x00" ++ "\x02" ++ "\x00\x00";
+    const c = try parseColDef(a, pkt);
+    try std.testing.expectEqualStrings("amount", c.name);
+    try std.testing.expectEqual(@as(u8, 0xf6), c.mtype); // NEWDECIMAL
+    try std.testing.expectEqual(@as(u8, 2), c.decimals);
+    try std.testing.expectEqual(types.TypeKind.decimal, c.engine_type.kind);
+    try std.testing.expectEqual(@as(u8, 2), c.engine_type.scale);
+}
+
+test "engineTypeFor maps MySQL wire types to engine types" {
+    try std.testing.expectEqual(types.TypeKind.int, engineTypeFor(0x03, 0).kind); // LONG
+    try std.testing.expectEqual(types.TypeKind.int, engineTypeFor(0x08, 0).kind); // LONGLONG
+    try std.testing.expectEqual(types.TypeKind.float, engineTypeFor(0x05, 0).kind); // DOUBLE
+    try std.testing.expectEqual(types.TypeKind.date, engineTypeFor(0x0a, 0).kind); // DATE
+    try std.testing.expectEqual(types.TypeKind.timestamp, engineTypeFor(0x0c, 0).kind); // DATETIME
+    try std.testing.expectEqual(types.TypeKind.string, engineTypeFor(0xfd, 0).kind); // VAR_STRING
+    // every result-set type is nullable: the wire has no NOT NULL guarantee here
+    try std.testing.expect(engineTypeFor(0x03, 0).nullable);
+}
+
+test "parseAuthSwitch extracts the plugin and its trailing salt" {
+    const payload = "\xfe" ++ "mysql_native_password" ++ "\x00" ++ "ABCDEFGHIJKLMNOPQRST";
+    const sw = parseAuthSwitch(payload);
+    try std.testing.expectEqual(AuthPlugin.native, sw.plugin.?);
+    try std.testing.expectEqualStrings("ABCDEFGHIJKLMNOPQRST", &sw.salt);
+    // unknown plugin -> null so the caller can fail auth instead of guessing
+    try std.testing.expect(parseAuthSwitch("\xfe" ++ "sha256_password" ++ "\x00").plugin == null);
 }
 
 const MyCol = struct {

@@ -225,12 +225,35 @@ const SplitCtx = struct {
     where_extra: ?[]const u8 = null, // pushed filter predicate AND-ed onto the key range, or null
 };
 
-fn connectSql(gpa: std.mem.Allocator, kind: SqlKind, cfg: DbConfig) !sql.Conn {
+/// The concrete driver for one `SqlKind`: `connect` opens the driver connection
+/// (sqlserver routes through `tdsConnect` for AAD) and `Bulk` is its bulk write
+/// strategy. Comptime, so callers that need the concrete conn type (bulk sinks,
+/// `last_error`) can reach it via `switch (kind) { inline else => |k| ... }`.
+fn SqlDriver(comptime kind: SqlKind) type {
     return switch (kind) {
-        .postgres => (try postgres.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls)).sqlConn(),
-        .mysql => (try mysql.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls)).sqlConn(),
-        .sqlserver => (try tdsConnect(gpa, cfg)).sqlConn(),
+        .postgres => struct {
+            const Bulk = postgres.CopySink;
+            fn connect(gpa: std.mem.Allocator, cfg: DbConfig) !*postgres.Conn {
+                return postgres.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls);
+            }
+        },
+        .mysql => struct {
+            const Bulk = mysql.LoadDataSink;
+            fn connect(gpa: std.mem.Allocator, cfg: DbConfig) !*mysql.Conn {
+                return mysql.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls);
+            }
+        },
+        .sqlserver => struct {
+            const Bulk = tds.BulkSink;
+            const connect = tdsConnect;
+        },
     };
+}
+
+fn connectSql(gpa: std.mem.Allocator, kind: SqlKind, cfg: DbConfig) !sql.Conn {
+    switch (kind) {
+        inline else => |k| return (try SqlDriver(k).connect(gpa, cfg)).sqlConn(),
+    }
 }
 
 /// `parallel.OpenSplitFn`: open a fresh source for one split predicate.
@@ -333,7 +356,7 @@ fn redialFor(arena: std.mem.Allocator, kind: SqlKind, cfg: DbConfig) !sql.Redial
 /// mid-protocol streams (COPY/LOAD DATA/INSERT BULK) that cannot resume on a
 /// fresh connection, so they stay fail-fast.
 fn openBulkOrInsert(gpa: std.mem.Allocator, conn: anytype, comptime BulkSink: type, dialect: sql.Dialect, target: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?sql.Redial) !driver.Sink {
-    if (mode != .upsert) return (try BulkSink.open(gpa, conn, target, schema, mode)).sink();
+    if (mode != .upsert) return (try BulkSink.open(gpa, conn, target, schema, mode, redial)).sink();
     return (try sql.Sink.open(gpa, conn.sqlConn(), dialect, target, schema, mode, redial)).sink();
 }
 
@@ -342,22 +365,11 @@ fn openBulkOrInsert(gpa: std.mem.Allocator, conn: anytype, comptime BulkSink: ty
 fn openLaneSqlSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize) anyerror!driver.Sink {
     _ = lane_idx; // SQL sinks need no per-lane discriminator (INSERTs aren't labelled)
     const spec: *SqlSinkSpec = @ptrCast(@alignCast(ctx_ptr));
-    const cfg = spec.cfg;
     switch (spec.kind) {
-        .postgres => {
-            const c = try postgres.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls);
+        inline else => |k| {
+            const c = try SqlDriver(k).connect(gpa, spec.cfg);
             errdefer c.close();
-            return openBulkOrInsert(gpa, c, postgres.CopySink, spec.dialect, spec.target, spec.schema, spec.lane_mode, spec.redial);
-        },
-        .mysql => {
-            const c = try mysql.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls);
-            errdefer c.close();
-            return openBulkOrInsert(gpa, c, mysql.LoadDataSink, spec.dialect, spec.target, spec.schema, spec.lane_mode, spec.redial);
-        },
-        .sqlserver => {
-            const c = try tdsConnect(gpa, cfg);
-            errdefer c.close();
-            return openBulkOrInsert(gpa, c, tds.BulkSink, spec.dialect, spec.target, spec.schema, spec.lane_mode, spec.redial);
+            return openBulkOrInsert(gpa, c, SqlDriver(k).Bulk, spec.dialect, spec.target, spec.schema, spec.lane_mode, spec.redial);
         },
     }
 }
@@ -812,13 +824,25 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     // a failed close from double-freeing via abort.
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
+
+    // Pipelined write: batch N is on the wire while N+1 is read/built. Two
+    // arenas ping-pong; submit returning means the batch built in the OTHER
+    // arena is written, so that arena is safe to reset for the next read.
+    var pw = parallel.PipelinedSink{ .snk = snk, .gpa = gpa };
+    try pw.start();
+    defer pw.shutdown();
+    var ping_pong: [2]std.heap.ArenaAllocator = .{ std.heap.ArenaAllocator.init(gpa), std.heap.ArenaAllocator.init(gpa) };
+    defer for (&ping_pong) |*a| a.deinit();
+    var cur: usize = 0;
     while (true) {
         if (aborting()) return error.Aborted; // cancelled by the control plane
-        _ = batch_arena.reset(.retain_capacity);
-        const b = (try res.op.next(batch_arena.allocator())) orelse break;
-        try snk.writeBatch(batch_arena.allocator(), b);
+        const b = (try res.op.next(ping_pong[cur].allocator())) orelse break;
+        try pw.submit(b);
         stats.rows_out += b.len;
+        cur ^= 1;
+        _ = ping_pong[cur].reset(.retain_capacity);
     }
+    try pw.finish();
     snk_open = false;
     try snk.close();
 }
@@ -929,6 +953,84 @@ fn obNext(ptr: *anyopaque, _: std.mem.Allocator) anyerror!?batchmod.Batch {
 }
 fn obClose(_: *anyopaque) void {}
 
+/// Shared header for the parallel workers: a work-stealing item counter plus the
+/// first-error latch. `failed` flags the other workers to stop (checked lock-free);
+/// `first_err` is what the caller re-raises after the join.
+const WorkQueue = struct {
+    nitems: usize,
+    next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    err_mtx: std.Thread.Mutex = .{},
+    first_err: ?anyerror = null,
+    failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn fail(q: *WorkQueue, e: anyerror) void {
+        q.err_mtx.lock();
+        if (q.first_err == null) q.first_err = e;
+        q.err_mtx.unlock();
+        q.failed.store(true, .seq_cst);
+    }
+};
+
+/// The worker-dispatch loop shared by the parallel CSV/SQL paths: steal the next
+/// item off `ctx.queue`, run `workOne(ctx, i)`, and latch the first error (which
+/// also stops the other workers). `Ctx` only needs a `queue: WorkQueue` field.
+fn dispatchWorker(comptime Ctx: type, comptime workOne: anytype) fn (*Ctx, usize) void {
+    return struct {
+        fn go(ctx: *Ctx, _: usize) void {
+            while (true) {
+                if (ctx.queue.failed.load(.seq_cst)) return;
+                const i = ctx.queue.next.fetchAdd(1, .seq_cst);
+                if (i >= ctx.queue.nitems) break;
+                workOne(ctx, i) catch |e| {
+                    ctx.queue.fail(e);
+                    return;
+                };
+            }
+        }
+    }.go;
+}
+
+/// Finalize merged parallel-aggregate groups into one output batch (a "merger"
+/// Aggregate just for `emit`; it never pulls a child).
+fn emitMergedGroups(env: *Env, agg_in: *const types.Schema, by: []const usize, aggs: []const op.Aggregate.Agg, out_schema: *const types.Schema, groups: []const op.Aggregate.Group) !batchmod.Batch {
+    var merger = op.Aggregate{
+        .child = undefined,
+        .in_schema = agg_in,
+        .by = by,
+        .aggs = aggs,
+        .out_schema = out_schema,
+        .state = env.arena,
+        .gpa = env.gpa,
+    };
+    return merger.emit(env.arena, groups);
+}
+
+/// Write a parallel breaker's merged batch to the sink, first running the small
+/// post-breaker `sort`/`limit` tail (which preserves `schema`) serially over it.
+fn writeTail(env: *Env, snk: driver.Sink, batch: batchmod.Batch, schema: types.Schema, tail: []const ast.Stage, stats: *Stats) !void {
+    const arena = env.arena;
+    if (tail.len == 0) {
+        if (batch.len > 0) {
+            try snk.writeBatch(arena, batch);
+            stats.rows_out += batch.len;
+        }
+        return;
+    }
+    var ob = OneBatch{ .b = batch, .sch = schema };
+    var scan = op.Scan{ .src = ob.source() };
+    var cur: op.Op = .{ .scan = &scan };
+    var sch = schema;
+    for (tail) |st| {
+        const r = try buildStage(env, st, cur, sch);
+        cur = r.op;
+        sch = r.schema;
+    }
+    while (try cur.next(arena)) |outb| {
+        try snk.writeBatch(arena, outb);
+        stats.rows_out += outb.len;
+    }
+}
+
 /// Shared state for the parallel-aggregate workers. Each worker rebuilds the prefix
 /// chain on its own arena, folds one or more newline-aligned file chunks into a
 /// thread-local partial group set, then merges it into the combined set under `mtx`
@@ -943,30 +1045,15 @@ const AggCtx = struct {
     params: *std.StringHashMap(*const ast.Expr),
     by: []const usize,
     aggs: []const op.Aggregate.Agg,
-    nchunks: usize,
-    next_chunk: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    queue: WorkQueue, // one item per file chunk
     cmap: *op.Aggregate.GroupMap(),
     cgroups: *std.array_list.Managed(op.Aggregate.Group),
     mtx: std.Thread.Mutex = .{},
-    err_mtx: std.Thread.Mutex = .{},
-    first_err: ?anyerror = null,
     plan_arena: std.mem.Allocator, // combined groups live here (plan arena)
     rows_read: *std.atomic.Value(u64),
 };
 
-fn aggWorker(ctx: *AggCtx) void {
-    while (true) {
-        if (ctx.first_err != null) return;
-        const i = ctx.next_chunk.fetchAdd(1, .seq_cst);
-        if (i >= ctx.nchunks) break;
-        aggWorkOne(ctx, i) catch |e| {
-            ctx.err_mtx.lock();
-            if (ctx.first_err == null) ctx.first_err = e;
-            ctx.err_mtx.unlock();
-            return;
-        };
-    }
-}
+const aggWorker = dispatchWorker(AggCtx, aggWorkOne);
 
 fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
     var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
@@ -975,7 +1062,7 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
     defer warena.deinit(); // freed after the merge copies what survives into plan_arena
     const wa = warena.allocator();
 
-    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.nchunks), .schema = ctx.csv_schema };
+    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.queue.nitems), .schema = ctx.csv_schema };
     var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     const child = try buildMapChain(wa, ctx.params, ctx.prefix, &scan, ctx.csv_schema);
@@ -1035,36 +1122,20 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
         .params = env.params_expr,
         .by = apl.by,
         .aggs = aggs,
-        .nchunks = nthreads,
+        .queue = .{ .nitems = nthreads },
         .cmap = &cmap,
         .cgroups = &cgroups,
         .plan_arena = arena,
         .rows_read = env.rows_read,
     };
 
-    const threads = try arena.alloc(std.Thread, nthreads);
-    var spawned: usize = 0;
-    while (spawned < nthreads) : (spawned += 1) {
-        threads[spawned] = std.Thread.spawn(.{}, aggWorker, .{&ctx}) catch break;
-    }
-    if (spawned == 0) aggWorker(&ctx) else for (threads[0..spawned]) |t| t.join();
-    lanes_used.* = @max(lanes_used.*, @max(spawned, 1));
-    env.log.log(.info, "parallel csv aggregate: {d} chunks over {d} lanes", .{ nthreads, @max(spawned, 1) });
+    const lanes = try parallel.spawnJoin(arena, nthreads, aggWorker, &ctx);
+    lanes_used.* = @max(lanes_used.*, lanes);
+    env.log.log(.info, "parallel csv aggregate: {d} chunks over {d} lanes", .{ nthreads, lanes });
 
-    if (ctx.first_err) |e| return e;
+    if (ctx.queue.first_err) |e| return e;
 
-    // Finalize the merged groups into one output batch (a "merger" Aggregate just
-    // for `emit`; it never pulls a child).
-    var merger = op.Aggregate{
-        .child = undefined,
-        .in_schema = agg_in,
-        .by = apl.by,
-        .aggs = aggs,
-        .out_schema = out_schema,
-        .state = arena,
-        .gpa = env.gpa,
-    };
-    const batch = try merger.emit(arena, cgroups.items);
+    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, cgroups.items);
 
     // `sort`/`limit` preserve the schema, so the sink uses the aggregate's out schema.
     const wr = try resolveUpsertKeys(env, w);
@@ -1072,27 +1143,8 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
 
-    if (tail.len == 0) {
-        if (batch.len > 0) {
-            try snk.writeBatch(arena, batch);
-            stats.rows_out += batch.len;
-        }
-    } else {
-        // Run the small post-aggregate tail serially over the merged batch.
-        var ob = OneBatch{ .b = batch, .sch = out_schema.* };
-        var scan = op.Scan{ .src = ob.source() };
-        var cur: op.Op = .{ .scan = &scan };
-        var sch = out_schema.*;
-        for (tail) |st| {
-            const r = try buildStage(env, st, cur, sch);
-            cur = r.op;
-            sch = r.schema;
-        }
-        while (try cur.next(arena)) |outb| {
-            try snk.writeBatch(arena, outb);
-            stats.rows_out += outb.len;
-        }
-    }
+    // Run the small post-aggregate tail serially over the merged batch.
+    try writeTail(env, snk, batch, out_schema.*, tail, stats);
     snk_open = false;
     try snk.close();
     return true;
@@ -1117,29 +1169,15 @@ const SqlAggCtx = struct {
     params: *std.StringHashMap(*const ast.Expr),
     by: []const usize,
     aggs: []const op.Aggregate.Agg,
-    next_pred: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    queue: WorkQueue, // one item per split predicate
     cmap: *op.Aggregate.GroupMap(),
     cgroups: *std.array_list.Managed(op.Aggregate.Group),
     mtx: std.Thread.Mutex = .{},
-    err_mtx: std.Thread.Mutex = .{},
-    first_err: ?anyerror = null,
     plan_arena: std.mem.Allocator, // combined groups live here (plan arena)
     rows_read: *std.atomic.Value(u64),
 };
 
-fn sqlAggWorker(ctx: *SqlAggCtx) void {
-    while (true) {
-        if (ctx.first_err != null) return;
-        const i = ctx.next_pred.fetchAdd(1, .seq_cst);
-        if (i >= ctx.predicates.len) break;
-        sqlAggWorkOne(ctx, i) catch |e| {
-            ctx.err_mtx.lock();
-            if (ctx.first_err == null) ctx.first_err = e;
-            ctx.err_mtx.unlock();
-            return;
-        };
-    }
-}
+const sqlAggWorker = dispatchWorker(SqlAggCtx, sqlAggWorkOne);
 
 fn sqlAggWorkOne(ctx: *SqlAggCtx, i: usize) !void {
     var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
@@ -1238,67 +1276,33 @@ fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.S
         .params = env.params_expr,
         .by = apl.by,
         .aggs = aggs,
+        .queue = .{ .nitems = sp.predicates.len },
         .cmap = &cmap,
         .cgroups = &cgroups,
         .plan_arena = arena,
         .rows_read = env.rows_read,
     };
 
-    const threads = try arena.alloc(std.Thread, nlanes);
-    var spawned: usize = 0;
-    while (spawned < nlanes) : (spawned += 1) {
-        threads[spawned] = std.Thread.spawn(.{}, sqlAggWorker, .{&ctx}) catch break;
-    }
-    if (spawned == 0) sqlAggWorker(&ctx) else for (threads[0..spawned]) |t| t.join();
-    lanes_used.* = @max(lanes_used.*, @max(spawned, 1));
+    const lanes = try parallel.spawnJoin(arena, nlanes, sqlAggWorker, &ctx);
+    lanes_used.* = @max(lanes_used.*, lanes);
     env.log.log(.info, "parallel sql aggregate: {d} splits over {d} lanes on key range (projection: {d}/{d} cols, filter pushdown: {s})", .{
         sp.predicates.len,
-        @max(spawned, 1),
+        lanes,
         if (pd.proj_schema) |ps| ps.fields.len else src_schema.fields.len,
         src_schema.fields.len,
         if (pd.where_extra != null) "yes" else "no",
     });
 
-    if (ctx.first_err) |e| return e;
+    if (ctx.queue.first_err) |e| return e;
 
-    // Finalize the merged groups into one output batch (a "merger" Aggregate just for
-    // `emit`; it never pulls a child).
-    var merger = op.Aggregate{
-        .child = undefined,
-        .in_schema = agg_in,
-        .by = apl.by,
-        .aggs = aggs,
-        .out_schema = out_schema,
-        .state = arena,
-        .gpa = env.gpa,
-    };
-    const batch = try merger.emit(arena, cgroups.items);
+    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, cgroups.items);
 
     // `w` arrived already upsert-resolved from runOutput; the tail preserves the schema.
     const snk = try openSink(env, w, out_schema.*);
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
 
-    if (tail.len == 0) {
-        if (batch.len > 0) {
-            try snk.writeBatch(arena, batch);
-            stats.rows_out += batch.len;
-        }
-    } else {
-        var ob = OneBatch{ .b = batch, .sch = out_schema.* };
-        var scan = op.Scan{ .src = ob.source() };
-        var cur: op.Op = .{ .scan = &scan };
-        var sch = out_schema.*;
-        for (tail) |st| {
-            const r = try buildStage(env, st, cur, sch);
-            cur = r.op;
-            sch = r.schema;
-        }
-        while (try cur.next(arena)) |outb| {
-            try snk.writeBatch(arena, outb);
-            stats.rows_out += outb.len;
-        }
-    }
+    try writeTail(env, snk, batch, out_schema.*, tail, stats);
     snk_open = false;
     try snk.close();
     return true;
@@ -1321,34 +1325,17 @@ const MapCtx = struct {
     csv_schema: *const types.Schema,
     map_stages: []const ast.Stage,
     params: *std.StringHashMap(*const ast.Expr),
-    nchunks: usize,
-    next_chunk: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    queue: WorkQueue, // one item per file chunk
     // `.shared` (one sink, mutex-serialized writes — e.g. a single CSV file) or
     // `.per_lane` (each worker opens its own sink and writes lock-free — e.g. a
     // StarRocks stream-load, so the WRITE parallelizes too, not just read+transform).
     sink_mode: parallel.SinkMode,
     sink_mtx: std.Thread.Mutex = .{},
-    err_mtx: std.Thread.Mutex = .{},
-    first_err: ?anyerror = null,
-    failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     rows_read: *std.atomic.Value(u64),
 };
 
-fn mapWorker(ctx: *MapCtx) void {
-    while (true) {
-        if (ctx.failed.load(.seq_cst)) return;
-        const i = ctx.next_chunk.fetchAdd(1, .seq_cst);
-        if (i >= ctx.nchunks) break;
-        mapWorkOne(ctx, i) catch |e| {
-            ctx.err_mtx.lock();
-            if (ctx.first_err == null) ctx.first_err = e;
-            ctx.err_mtx.unlock();
-            ctx.failed.store(true, .seq_cst);
-            return;
-        };
-    }
-}
+const mapWorker = dispatchWorker(MapCtx, mapWorkOne);
 
 fn mapWorkOne(ctx: *MapCtx, i: usize) !void {
     var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
@@ -1361,33 +1348,35 @@ fn mapWorkOne(ctx: *MapCtx, i: usize) !void {
 
     // Per-lane sink: open this worker's own sink (StarRocks stream etc.). Aborted
     // (not committed) if the run failed by the time we finish.
-    var own_sink: ?driver.Sink = switch (ctx.sink_mode) {
+    const own_sink: ?driver.Sink = switch (ctx.sink_mode) {
         .shared => null,
         .per_lane => |pl| try pl.open(pl.ctx, wa, i),
     };
+    // Abort on any failure path (early return / error); on success the explicit
+    // close below runs first and clears the flag, so a failed close is not
+    // swallowed — it propagates as this lane's error.
+    var own_sink_open = own_sink != null;
     defer if (own_sink) |s| {
-        if (ctx.failed.load(.seq_cst)) s.abort() else s.close() catch {};
+        if (own_sink_open) s.abort();
     };
 
-    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.nchunks), .schema = ctx.csv_schema };
+    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.queue.nitems), .schema = ctx.csv_schema };
     var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     const chain = try buildMapChain(warena.allocator(), ctx.params, ctx.map_stages, &scan, ctx.csv_schema);
 
     while (try chain.next(batch_arena.allocator())) |b| {
-        if (ctx.failed.load(.seq_cst)) return;
+        if (ctx.queue.failed.load(.seq_cst)) return;
         if (b.len > 0) {
-            switch (ctx.sink_mode) {
-                .shared => |snk| {
-                    ctx.sink_mtx.lock();
-                    defer ctx.sink_mtx.unlock();
-                    try snk.writeBatch(batch_arena.allocator(), b);
-                },
-                .per_lane => try own_sink.?.writeBatch(batch_arena.allocator(), b),
-            }
+            try parallel.writeLaneBatch(ctx.sink_mode, &ctx.sink_mtx, own_sink, batch_arena.allocator(), b);
             _ = ctx.rows_out.fetchAdd(b.len, .monotonic);
         }
         _ = batch_arena.reset(.retain_capacity);
+    }
+
+    if (own_sink) |s| {
+        own_sink_open = false; // close tears the sink down even on failure — never abort after it
+        try s.close();
     }
 }
 
@@ -1429,21 +1418,16 @@ fn runParallelCsvMap(env: *Env, rd: ast.Read, map_stages: []const ast.Stage, w: 
         .csv_schema = &mapped.schema,
         .map_stages = map_stages,
         .params = env.params_expr,
-        .nchunks = nthreads,
+        .queue = .{ .nitems = nthreads },
         .sink_mode = sink_mode,
         .rows_read = env.rows_read,
     };
 
-    const threads = try arena.alloc(std.Thread, nthreads);
-    var spawned: usize = 0;
-    while (spawned < nthreads) : (spawned += 1) {
-        threads[spawned] = std.Thread.spawn(.{}, mapWorker, .{&ctx}) catch break;
-    }
-    if (spawned == 0) mapWorker(&ctx) else for (threads[0..spawned]) |t| t.join();
-    lanes_used.* = @max(lanes_used.*, @max(spawned, 1));
-    env.log.log(.info, "parallel csv map: {d} chunks over {d} lanes ({s} sink)", .{ nthreads, @max(spawned, 1), @tagName(sink_mode) });
+    const lanes = try parallel.spawnJoin(arena, nthreads, mapWorker, &ctx);
+    lanes_used.* = @max(lanes_used.*, lanes);
+    env.log.log(.info, "parallel csv map: {d} chunks over {d} lanes ({s} sink)", .{ nthreads, lanes, @tagName(sink_mode) });
 
-    if (ctx.first_err) |e| return e; // per-lane sinks already aborted in their workers
+    if (ctx.queue.first_err) |e| return e; // per-lane sinks already aborted in their workers
     stats.rows_out += ctx.rows_out.load(.monotonic);
     if (sink_mode == .shared) {
         shared_open = false;
@@ -1478,28 +1462,13 @@ const TopNCtx = struct {
     params: *std.StringHashMap(*const ast.Expr),
     keys: []const op.Sort.Key,
     cap: u64, // per-worker rows to keep = offset + count
-    nchunks: usize,
-    next_chunk: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    queue: WorkQueue, // one item per file chunk
     builders: []column.Builder, // shared collector of per-worker top rows (plan arena)
     mtx: std.Thread.Mutex = .{},
-    err_mtx: std.Thread.Mutex = .{},
-    first_err: ?anyerror = null,
     rows_read: *std.atomic.Value(u64),
 };
 
-fn topnWorker(ctx: *TopNCtx) void {
-    while (true) {
-        if (ctx.first_err != null) return;
-        const i = ctx.next_chunk.fetchAdd(1, .seq_cst);
-        if (i >= ctx.nchunks) break;
-        topnWorkOne(ctx, i) catch |e| {
-            ctx.err_mtx.lock();
-            if (ctx.first_err == null) ctx.first_err = e;
-            ctx.err_mtx.unlock();
-            return;
-        };
-    }
-}
+const topnWorker = dispatchWorker(TopNCtx, topnWorkOne);
 
 fn topnWorkOne(ctx: *TopNCtx, i: usize) !void {
     var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
@@ -1509,7 +1478,7 @@ fn topnWorkOne(ctx: *TopNCtx, i: usize) !void {
     var batch_arena = std.heap.ArenaAllocator.init(wgpa.allocator());
     defer batch_arena.deinit();
 
-    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.nchunks), .schema = ctx.csv_schema };
+    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.queue.nitems), .schema = ctx.csv_schema };
     var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     const child = try buildMapChain(warena.allocator(), ctx.params, ctx.prefix, &scan, ctx.csv_schema);
@@ -1571,20 +1540,15 @@ fn runParallelCsvTopN(env: *Env, rd: ast.Read, prefix: []const ast.Stage, srt: a
         .params = env.params_expr,
         .keys = ks,
         .cap = lim.offset + lim.count,
-        .nchunks = nthreads,
+        .queue = .{ .nitems = nthreads },
         .builders = builders,
         .rows_read = env.rows_read,
     };
 
-    const threads = try arena.alloc(std.Thread, nthreads);
-    var spawned: usize = 0;
-    while (spawned < nthreads) : (spawned += 1) {
-        threads[spawned] = std.Thread.spawn(.{}, topnWorker, .{&ctx}) catch break;
-    }
-    if (spawned == 0) topnWorker(&ctx) else for (threads[0..spawned]) |t| t.join();
-    lanes_used.* = @max(lanes_used.*, @max(spawned, 1));
-    env.log.log(.info, "parallel csv top-n: {d} chunks over {d} lanes", .{ nthreads, @max(spawned, 1) });
-    if (ctx.first_err) |e| return e;
+    const lanes = try parallel.spawnJoin(arena, nthreads, topnWorker, &ctx);
+    lanes_used.* = @max(lanes_used.*, lanes);
+    env.log.log(.info, "parallel csv top-n: {d} chunks over {d} lanes", .{ nthreads, lanes });
+    if (ctx.queue.first_err) |e| return e;
 
     // Combine the per-worker top rows, then a global Top-N gives the final output.
     const cols = try arena.alloc(column.Column, builders.len);
@@ -1643,30 +1607,15 @@ const DistinctCtx = struct {
     params: *std.StringHashMap(*const ast.Expr),
     local_keys: ?[]const usize, // distinct key columns for the per-worker op (null = all)
     key_idx: []const usize, // key columns for the global dedup (all, when bare)
-    nchunks: usize,
-    next_chunk: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    queue: WorkQueue, // one item per file chunk
     seen: *op.Aggregate.GroupMap(), // global cross-worker dedup set
     builders: []column.Builder, // collected distinct rows (plan arena)
     mtx: std.Thread.Mutex = .{},
-    err_mtx: std.Thread.Mutex = .{},
-    first_err: ?anyerror = null,
     plan_arena: std.mem.Allocator,
     rows_read: *std.atomic.Value(u64),
 };
 
-fn distinctWorker(ctx: *DistinctCtx) void {
-    while (true) {
-        if (ctx.first_err != null) return;
-        const i = ctx.next_chunk.fetchAdd(1, .seq_cst);
-        if (i >= ctx.nchunks) break;
-        distinctWorkOne(ctx, i) catch |e| {
-            ctx.err_mtx.lock();
-            if (ctx.first_err == null) ctx.first_err = e;
-            ctx.err_mtx.unlock();
-            return;
-        };
-    }
-}
+const distinctWorker = dispatchWorker(DistinctCtx, distinctWorkOne);
 
 fn distinctWorkOne(ctx: *DistinctCtx, i: usize) !void {
     var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
@@ -1676,7 +1625,7 @@ fn distinctWorkOne(ctx: *DistinctCtx, i: usize) !void {
     var batch_arena = std.heap.ArenaAllocator.init(wgpa.allocator());
     defer batch_arena.deinit();
 
-    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.nchunks), .schema = ctx.csv_schema };
+    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.queue.nitems), .schema = ctx.csv_schema };
     var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     const child = try buildMapChain(warena.allocator(), ctx.params, ctx.prefix, &scan, ctx.csv_schema);
@@ -1756,22 +1705,17 @@ fn runParallelCsvDistinct(env: *Env, rd: ast.Read, prefix: []const ast.Stage, di
         .params = env.params_expr,
         .local_keys = local_keys,
         .key_idx = key_idx,
-        .nchunks = nthreads,
+        .queue = .{ .nitems = nthreads },
         .seen = &seen,
         .builders = builders,
         .plan_arena = arena,
         .rows_read = env.rows_read,
     };
 
-    const threads = try arena.alloc(std.Thread, nthreads);
-    var spawned: usize = 0;
-    while (spawned < nthreads) : (spawned += 1) {
-        threads[spawned] = std.Thread.spawn(.{}, distinctWorker, .{&ctx}) catch break;
-    }
-    if (spawned == 0) distinctWorker(&ctx) else for (threads[0..spawned]) |t| t.join();
-    lanes_used.* = @max(lanes_used.*, @max(spawned, 1));
-    env.log.log(.info, "parallel csv distinct: {d} chunks over {d} lanes", .{ nthreads, @max(spawned, 1) });
-    if (ctx.first_err) |e| return e;
+    const lanes = try parallel.spawnJoin(arena, nthreads, distinctWorker, &ctx);
+    lanes_used.* = @max(lanes_used.*, lanes);
+    env.log.log(.info, "parallel csv distinct: {d} chunks over {d} lanes", .{ nthreads, lanes });
+    if (ctx.queue.first_err) |e| return e;
 
     const cols = try arena.alloc(column.Column, builders.len);
     for (builders, cols) |*b, *c| c.* = try b.finish();
@@ -1782,26 +1726,7 @@ fn runParallelCsvDistinct(env: *Env, rd: ast.Read, prefix: []const ast.Stage, di
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
 
-    if (tail.len == 0) {
-        if (merged.len > 0) {
-            try snk.writeBatch(arena, merged);
-            stats.rows_out += merged.len;
-        }
-    } else {
-        var ob = OneBatch{ .b = merged, .sch = row_schema.* };
-        var scan = op.Scan{ .src = ob.source() };
-        var cur: op.Op = .{ .scan = &scan };
-        var sch = row_schema.*;
-        for (tail) |st| {
-            const r = try buildStage(env, st, cur, sch);
-            cur = r.op;
-            sch = r.schema;
-        }
-        while (try cur.next(arena)) |outb| {
-            try snk.writeBatch(arena, outb);
-            stats.rows_out += outb.len;
-        }
-    }
+    try writeTail(env, snk, merged, row_schema.*, tail, stats);
     snk_open = false;
     try snk.close();
     return true;
@@ -2026,41 +1951,6 @@ fn bareInterp(inner: []const u8) bool {
     return true;
 }
 
-/// The deprecated `${var:lower}` / `${var:upper}` modifier shape — `ident:lower` or
-/// `ident:upper`. Still honored (with a warning); superseded by the function form
-/// (`lower(var)` / `upper(var)`).
-fn deprecatedModifier(inner: []const u8) bool {
-    const c = std.mem.indexOfScalar(u8, inner, ':') orelse return false;
-    if (!bareInterp(inner[0..c])) return false;
-    const mod = inner[c + 1 ..];
-    return std.mem.eql(u8, mod, "lower") or std.mem.eql(u8, mod, "upper");
-}
-
-/// Latched so the `:lower`/`:upper` deprecation prints once per process instead of
-/// once per occurrence per row (which would flood a parallel for-loop's stderr).
-var deprecation_warned = std.atomic.Value(bool).init(false);
-
-/// Honor a deprecated `${var:lower}` / `${var:upper}` placeholder: apply the case-fold
-/// to the loop variable's value (warning once, only when it is a real loop variable).
-/// An unknown variable is left verbatim — and unwarned — mirroring the bare `${var}`
-/// path, so non-loop `${x:y}`-shaped text rides through without a spurious notice.
-fn applyDeprecatedModifier(arena: std.mem.Allocator, text: []const u8, names: []const []const u8, values: Row) ![]const u8 {
-    const c = std.mem.indexOfScalar(u8, text, ':').?;
-    const var_name = text[0..c];
-    const mod = text[c + 1 ..];
-    const is_lower = std.mem.eql(u8, mod, "lower");
-    for (names, values) |nm, val| {
-        if (std.mem.eql(u8, nm, var_name)) {
-            if (!deprecation_warned.swap(true, .monotonic))
-                std.debug.print("[interp] the `:lower`/`:upper` modifier is deprecated — use lower(x)/upper(x) instead (first seen at ${{{s}}})\n", .{text});
-            const buf = try arena.alloc(u8, val.len);
-            for (val, buf) |ch, *dst| dst.* = if (is_lower) std.ascii.toLower(ch) else std.ascii.toUpper(ch);
-            return buf;
-        }
-    }
-    return std.fmt.allocPrint(arena, "${{{s}}}", .{text}); // unknown var: verbatim, no warning
-}
-
 /// Detect constructs that only work after plan-time expansion and so cannot appear in
 /// a `${...}` hole (which is parsed/evaluated fresh, without expansion): `let … in`
 /// and `?.` safe navigation. Returns a user-facing reason, or null if the expression
@@ -2097,7 +1987,6 @@ fn interpUnsupported(e: *const ast.Expr) ?[]const u8 {
 /// used — so `${if(port > 1000, ...)}` compares numerically, matching the `match`
 /// path. A parse/eval failure is a permanent error (reported on stderr).
 fn evalInterpExpr(arena: std.mem.Allocator, text: []const u8, lr: LoopRow) ![]const u8 {
-    if (deprecatedModifier(text)) return applyDeprecatedModifier(arena, text, lr.names, lr.cells);
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
     const e = parser.parseExprStr(arena, text, &diag) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -2293,7 +2182,7 @@ fn forRecordFail(ctx: *ForCtx, label: []const u8, ename: []const u8, msg: []cons
     if (ctx.on_error == .stop) ctx.stop.store(true, .release);
 }
 
-fn forWorker(ctx: *ForCtx) void {
+fn forWorker(ctx: *ForCtx, _: usize) void {
     const gpa = ctx.base.gpa;
     while (true) {
         if (aborting()) break; // cancelled — workers stop pulling new items
@@ -2399,8 +2288,8 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
     };
     env.log.log(.info, "for-each {s}: {d} row(s) [{s}, on_error={s}]", .{ fe.var_names[0], rows.len, @tagName(mode), if (on_error == .continue_) "continue" else "stop" });
     if (rows.len == 0) return;
-    // `interpAll` scans for `${var}` / `${var:mod}` itself, so it takes the raw
-    // variable names (not pre-formatted `${var}` needles) paired with row values.
+    // `interpAll` scans for `${var}` itself, so it takes the raw variable names
+    // (not pre-formatted `${var}` needles) paired with row values.
     const needles = fe.var_names;
 
     switch (mode) {
@@ -2446,17 +2335,12 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
             wopts.threads = 1; // each table runs serially; the for-loop provides the parallelism
             const nworkers = @min(@max(opts.threads, @as(usize, 1)), rows.len);
             var ctx = ForCtx{ .fe = fe, .needles = needles, .rows = rows, .base = env, .worker_opts = wopts, .on_error = on_error, .outcomes = opts.outcomes };
-            const threads = try env.arena.alloc(std.Thread, nworkers);
-            var spawned: usize = 0;
-            while (spawned < nworkers) : (spawned += 1) {
-                threads[spawned] = std.Thread.spawn(.{}, forWorker, .{&ctx}) catch break;
-            }
-            if (spawned == 0) forWorker(&ctx) else for (threads[0..spawned]) |t| t.join();
+            const lanes = try parallel.spawnJoin(env.arena, nworkers, forWorker, &ctx);
             // Cancellation outranks failure accounting: a SIGTERM mid-run is an
             // abort (exit 130), not "N items failed" (exit 1).
             if (aborting()) return error.Aborted;
             stats.rows_out += ctx.rows_out.load(.monotonic);
-            lanes_used.* = @max(lanes_used.*, @max(spawned, @as(usize, 1)));
+            lanes_used.* = @max(lanes_used.*, lanes);
             const fails = ctx.failures.load(.monotonic);
             // stop-mode is a whole-request failure; continue-mode with a sink is a
             // partial success (failures reported via outcomes, the run succeeds).
@@ -2978,41 +2862,21 @@ fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "http read failed for `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
         return s.source();
     }
-    if (std.mem.eql(u8, conn.connector, "sqlserver")) {
-        const cfg = try resolveDbConfig(env, conn, 1433);
+    if (sqlConnInfo(conn)) |info| {
+        const cfg = try resolveDbConfig(env, conn, info.port);
         const query = try readSql(env, rd_eff);
-        const c = tdsConnect(env.gpa, cfg) catch |e|
-            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "sqlserver connect failed: {s}", .{@errorName(e)}));
-        const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
-            defer c.close();
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sqlserver read failed ({s}): {s}", .{ @errorName(e), c.last_error }));
-        };
-        env.sql_desc = try sqlDescFor(env, .sqlserver, .sqlserver, cfg, query, rd_eff);
-        return s.source();
-    }
-    if (std.mem.eql(u8, conn.connector, "mysql")) {
-        const cfg = try resolveDbConfig(env, conn, 3306);
-        const query = try readSql(env, rd_eff);
-        const c = mysql.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls) catch |e|
-            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "mysql connect failed: {s}", .{@errorName(e)}));
-        const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
-            defer c.close();
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "mysql read failed ({s}): {s}", .{ @errorName(e), c.last_error }));
-        };
-        env.sql_desc = try sqlDescFor(env, .mysql, .mysql, cfg, query, rd_eff);
-        return s.source();
-    }
-    if (std.mem.eql(u8, conn.connector, "postgres")) {
-        const cfg = try resolveDbConfig(env, conn, 5432);
-        const query = try readSql(env, rd_eff);
-        const c = postgres.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls) catch |e|
-            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "postgres connect failed: {s}", .{@errorName(e)}));
-        const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
-            defer c.close();
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "postgres read failed ({s}): {s}", .{ @errorName(e), c.last_error }));
-        };
-        env.sql_desc = try sqlDescFor(env, .postgres, .postgres, cfg, query, rd_eff);
-        return s.source();
+        switch (info.kind) {
+            inline else => |k| {
+                const c = SqlDriver(k).connect(env.gpa, cfg) catch |e|
+                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} connect failed: {s}", .{ conn.connector, @errorName(e) }));
+                const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
+                    defer c.close();
+                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} read failed ({s}): {s}", .{ conn.connector, @errorName(e), c.last_error }));
+                };
+                env.sql_desc = try sqlDescFor(env, info.kind, info.dialect, cfg, query, rd_eff);
+                return s.source();
+            },
+        }
     }
     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unsupported source connector `{s}`", .{conn.connector}));
 }
@@ -3028,7 +2892,6 @@ const DbConfig = struct {
     // username/password (ROPC grant) and a federated token is sent instead of a
     // SQL login. TLS is forced on. `resource` defaults to https://<host>.
     aad: bool = false,
-    tenant: []const u8 = "",
     client_id: []const u8 = "",
     resource: []const u8 = "",
     token: []const u8 = "", // pre-fetched AAD access token (skips ROPC) — for
@@ -3063,39 +2926,84 @@ fn tdsConnect(gpa: std.mem.Allocator, cfg: DbConfig) !*tds.Conn {
     return tds.Conn.connectAad(gpa, cfg.host, cfg.port, token, cfg.database, mode);
 }
 
-fn resolveDbConfig(env: *Env, conn: ast.Connection, default_port: u16) !DbConfig {
+/// One key-dispatch for the shared DB connection attributes. The two resolvers
+/// differ only in how attribute exprs become values (`f`): the run-time path
+/// (`resolveDbConfig`) evaluates strictly and errors via the diag; the offline
+/// path (`dbConfigOf`) is lenient — unresolvable values are skipped/defaulted.
+fn parseDbConfig(conn: ast.Connection, default_port: u16, f: anytype) anyerror!DbConfig {
     var cfg = DbConfig{ .port = default_port };
     for (conn.config) |attr| {
         const k = attr.key;
+        if (std.mem.eql(u8, k, "port")) {
+            cfg.port = (try f.port(attr.value)) orelse default_port;
+            continue;
+        }
+        // Only fetch values of known keys, so an unrecognized key's expr never
+        // has to survive the literal/env() evaluator.
+        if (!eqlAny(k, &.{ "host", "user", "password", "database", "tls", "auth", "client_id", "resource", "token" })) continue;
+        const v = (try f.str(attr.value)) orelse continue;
         if (std.mem.eql(u8, k, "host")) {
-            cfg.host = try evalCfgStr(env, attr.value);
-        } else if (std.mem.eql(u8, k, "port")) {
-            cfg.port = @intCast(try evalCfgInt(env, attr.value));
+            cfg.host = v;
         } else if (std.mem.eql(u8, k, "user")) {
-            cfg.user = try evalCfgStr(env, attr.value);
+            cfg.user = v;
         } else if (std.mem.eql(u8, k, "password")) {
-            cfg.password = try evalCfgStr(env, attr.value);
+            cfg.password = v;
         } else if (std.mem.eql(u8, k, "database")) {
-            cfg.database = try evalCfgStr(env, attr.value);
+            cfg.database = v;
         } else if (std.mem.eql(u8, k, "tls")) {
-            const v = try evalCfgStr(env, attr.value);
-            cfg.tls = std.meta.stringToEnum(sql.TlsMode, v) orelse
-                return planErr(env.diag, "connection `tls` must be \"off\", \"require\" or \"insecure\"");
+            cfg.tls = try f.tls(v);
         } else if (std.mem.eql(u8, k, "auth")) {
-            cfg.aad = std.mem.eql(u8, try evalCfgStr(env, attr.value), "aad");
-        } else if (std.mem.eql(u8, k, "tenant")) {
-            cfg.tenant = try evalCfgStr(env, attr.value);
+            cfg.aad = std.mem.eql(u8, v, "aad");
         } else if (std.mem.eql(u8, k, "client_id")) {
-            cfg.client_id = try evalCfgStr(env, attr.value);
+            cfg.client_id = v;
         } else if (std.mem.eql(u8, k, "resource")) {
-            cfg.resource = try evalCfgStr(env, attr.value);
+            cfg.resource = v;
         } else if (std.mem.eql(u8, k, "token")) {
-            cfg.token = try evalCfgStr(env, attr.value);
+            cfg.token = v;
         }
     }
+    return cfg;
+}
+
+/// Strict attribute fetcher for `parseDbConfig`: literals + env()/secret(), with
+/// plan errors on anything unresolvable (the run-time path).
+const EnvCfg = struct {
+    env: *Env,
+    fn str(self: EnvCfg, e: *const ast.Expr) !?[]const u8 {
+        return try evalCfgStr(self.env, e);
+    }
+    fn port(self: EnvCfg, e: *const ast.Expr) !?u16 {
+        const p: u16 = @intCast(try evalCfgInt(self.env, e));
+        return p;
+    }
+    fn tls(self: EnvCfg, v: []const u8) !sql.TlsMode {
+        return std.meta.stringToEnum(sql.TlsMode, v) orelse
+            planErr(self.env.diag, "connection `tls` must be \"off\", \"require\" or \"insecure\"");
+    }
+};
+
+/// Lenient fetcher for `parseDbConfig`: unresolvable or malformed values fall
+/// back to defaults instead of erroring (offline `check`, no run `Env`).
+const OfflineCfg = struct {
+    arena: std.mem.Allocator,
+    fn str(self: OfflineCfg, e: *const ast.Expr) !?[]const u8 {
+        return cfgStr(self.arena, e);
+    }
+    fn port(self: OfflineCfg, e: *const ast.Expr) !?u16 {
+        const v = cfgStr(self.arena, e) orelse return null;
+        return std.fmt.parseInt(u16, v, 10) catch null;
+    }
+    fn tls(self: OfflineCfg, v: []const u8) !sql.TlsMode {
+        _ = self;
+        return std.meta.stringToEnum(sql.TlsMode, v) orelse .off;
+    }
+};
+
+fn resolveDbConfig(env: *Env, conn: ast.Connection, default_port: u16) !DbConfig {
+    const cfg = try parseDbConfig(conn, default_port, EnvCfg{ .env = env });
     if (cfg.host.len == 0) return planErr(env.diag, "connection needs a `host`");
-    // tenant/client_id are optional for aad — they default to SqlClient's
-    // built-in "Active Directory Password" values (see tdsConnect).
+    // client_id is optional for aad — it defaults to SqlClient's built-in
+    // "Active Directory Password" client (see tdsConnect).
     return cfg;
 }
 
@@ -3263,33 +3171,7 @@ fn probeSplit(ctx_ptr: *anyopaque, arena: std.mem.Allocator, rd: ast.Read, conn_
 /// Resolve a connection's host/port/user/password/database (literals + env()/
 /// secret()), independent of the run `Env`. Returns null if `host` is missing.
 fn dbConfigOf(arena: std.mem.Allocator, conn: ast.Connection, default_port: u16) ?DbConfig {
-    var cfg = DbConfig{ .port = default_port };
-    for (conn.config) |attr| {
-        const v = cfgStr(arena, attr.value) orelse continue;
-        if (std.mem.eql(u8, attr.key, "host")) {
-            cfg.host = v;
-        } else if (std.mem.eql(u8, attr.key, "port")) {
-            cfg.port = std.fmt.parseInt(u16, v, 10) catch default_port;
-        } else if (std.mem.eql(u8, attr.key, "user")) {
-            cfg.user = v;
-        } else if (std.mem.eql(u8, attr.key, "password")) {
-            cfg.password = v;
-        } else if (std.mem.eql(u8, attr.key, "database")) {
-            cfg.database = v;
-        } else if (std.mem.eql(u8, attr.key, "tls")) {
-            cfg.tls = std.meta.stringToEnum(sql.TlsMode, v) orelse .off;
-        } else if (std.mem.eql(u8, attr.key, "auth")) {
-            cfg.aad = std.mem.eql(u8, v, "aad");
-        } else if (std.mem.eql(u8, attr.key, "tenant")) {
-            cfg.tenant = v;
-        } else if (std.mem.eql(u8, attr.key, "client_id")) {
-            cfg.client_id = v;
-        } else if (std.mem.eql(u8, attr.key, "resource")) {
-            cfg.resource = v;
-        } else if (std.mem.eql(u8, attr.key, "token")) {
-            cfg.token = v;
-        }
-    }
+    const cfg = parseDbConfig(conn, default_port, OfflineCfg{ .arena = arena }) catch return null;
     if (cfg.host.len == 0) return null;
     return cfg;
 }
@@ -3356,35 +3238,20 @@ fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         s.logger = env.log;
         return s.sink();
     }
-    if (std.mem.eql(u8, conn.connector, "mysql")) {
-        const cfg = try resolveDbConfig(env, conn, 3306);
-        const c = mysql.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls) catch |e|
-            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "mysql connect failed: {s}", .{@errorName(e)}));
-        // append/overwrite → LOAD DATA LOCAL INFILE (bulk); upsert → INSERT.
-        return openBulkOrInsert(env.gpa, c, mysql.LoadDataSink, .mysql, w.target, schema, w.mode, try redialFor(env.arena, .mysql, cfg)) catch |e| {
-            defer c.close();
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "mysql sink failed ({s}): {s}", .{ @errorName(e), c.last_error }));
-        };
-    }
-    if (std.mem.eql(u8, conn.connector, "sqlserver")) {
-        const cfg = try resolveDbConfig(env, conn, 1433);
-        const c = tdsConnect(env.gpa, cfg) catch |e|
-            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "sqlserver connect failed: {s}", .{@errorName(e)}));
-        // append/overwrite → INSERT BULK; upsert → INSERT.
-        return openBulkOrInsert(env.gpa, c, tds.BulkSink, .sqlserver, w.target, schema, w.mode, try redialFor(env.arena, .sqlserver, cfg)) catch |e| {
-            defer c.close();
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sqlserver sink failed ({s}): {s}", .{ @errorName(e), c.last_error }));
-        };
-    }
-    if (std.mem.eql(u8, conn.connector, "postgres")) {
-        const cfg = try resolveDbConfig(env, conn, 5432);
-        const c = postgres.Conn.connect(env.gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls) catch |e|
-            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "postgres connect failed: {s}", .{@errorName(e)}));
-        // append/overwrite → COPY FROM STDIN (bulk, fast); upsert → INSERT.
-        return openBulkOrInsert(env.gpa, c, postgres.CopySink, .postgres, w.target, schema, w.mode, try redialFor(env.arena, .postgres, cfg)) catch |e| {
-            defer c.close();
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "postgres sink failed ({s}): {s}", .{ @errorName(e), c.last_error }));
-        };
+    if (sqlConnInfo(conn)) |info| {
+        const cfg = try resolveDbConfig(env, conn, info.port);
+        switch (info.kind) {
+            inline else => |k| {
+                const c = SqlDriver(k).connect(env.gpa, cfg) catch |e|
+                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} connect failed: {s}", .{ conn.connector, @errorName(e) }));
+                // append/overwrite → the dialect's bulk loader (COPY FROM STDIN /
+                // LOAD DATA LOCAL INFILE / INSERT BULK); upsert → INSERT.
+                return openBulkOrInsert(env.gpa, c, SqlDriver(k).Bulk, info.dialect, w.target, schema, w.mode, try redialFor(env.arena, info.kind, cfg)) catch |e| {
+                    defer c.close();
+                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink failed ({s}): {s}", .{ conn.connector, @errorName(e), c.last_error }));
+                };
+            },
+        }
     }
     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unsupported sink connector `{s}`", .{conn.connector}));
 }
@@ -3685,12 +3552,12 @@ test "parallel CSV aggregate: filter/select prefix + sort/limit tail (threads>1)
     const input = "id,g,v\n1,a,10\n2,b,20\n3,a,30\n4,b,5\n5,a,50\n";
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // prefix (filter+select) folds in parallel; tail (sort) runs on the merged result
+    // prefix (filter+select) folds in parallel; tail (sort + limit) runs on the merged result
     const out = try runCsvThreaded(alloc, &tmp, input,
-        "SELECT g, SUM(CAST(v AS INT)) AS s FROM '$IN' WHERE CAST(v AS INT) > 6 GROUP BY g ORDER BY g ASC",
+        "SELECT g, SUM(CAST(v AS INT)) AS s FROM '$IN' WHERE CAST(v AS INT) > 6 GROUP BY g ORDER BY s DESC LIMIT 1",
         4);
     defer alloc.free(out);
-    try std.testing.expectEqualStrings("g,s\na,90\nb,20\n", out); // a:10+30+50, b:20 (5 filtered out)
+    try std.testing.expectEqualStrings("g,s\na,90\n", out); // a:10+30+50 wins; b:20 cut by the limit (5 filtered out)
 }
 
 test "parallel CSV distinct (threads>1): dedups across chunks" {
@@ -3892,7 +3759,7 @@ test "interpAll: bare-var fast path and expression bodies" {
     try std.testing.expectEqualStrings("}", try interpAll(a, "${if(pk == \"\", \"}\", pk)}", empty_row));
 }
 
-test "interpAll: malformed bodies error; deprecated modifier warns but still applies" {
+test "interpAll: malformed bodies error" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -3900,9 +3767,8 @@ test "interpAll: malformed bodies error; deprecated modifier warns but still app
     const vals = [_][]const u8{ "Account", "" };
     const row = LoopRow{ .names = &names, .cells = &vals };
     try std.testing.expectError(error.InterpFailed, interpAll(a, "${if(pk ==)}", row));
-    // the deprecated `:lower` / `:upper` modifier shape still resolves (with a warning)
-    try std.testing.expectEqualStrings("account", try interpAll(a, "${name:lower}", row));
-    try std.testing.expectEqualStrings("ACCOUNT", try interpAll(a, "${name:upper}", row));
+    // the removed `:lower`/`:upper` modifier now fails expression parsing like any bad body
+    try std.testing.expectError(error.InterpFailed, interpAll(a, "${name:lower}", row));
 }
 
 test "interpAll: a typed loop var binds as its type in an expression body" {
@@ -4324,6 +4190,7 @@ test "for-each parallel + on_error=continue isolates a failing table" {
     try std.testing.expectEqualStrings("id\n7\n", a);
 }
 
+
 test "FROM BUFFER replays WAL segments as a source (batch mode)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4355,4 +4222,208 @@ test "FROM BUFFER replays WAL segments as a source (batch mode)" {
     const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
     defer alloc.free(out);
     try std.testing.expectEqualStrings("device_id,v\na,1\nb,2\nc,3\n", out);
+}
+
+// --- ported from origin/main (BSL → Basalt SQL): engine-behavior unit tests ---
+
+test "empty source and an all-dropping filter still write just the header" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // header-only input: zero batches through the whole pipeline
+    const empty = try runToString(alloc, &tmp, "id,v\n", "SELECT id FROM '$IN'");
+    defer alloc.free(empty);
+    try std.testing.expectEqualStrings("id\n", empty);
+    // rows exist but the filter drops every one (v is inferred int)
+    const dropped = try runToString(alloc, &tmp, "id,v\n1,10\n2,20\n", "SELECT * FROM '$IN' WHERE v = 999");
+    defer alloc.free(dropped);
+    try std.testing.expectEqualStrings("id,v\n", dropped);
+}
+
+test "csv aggregate: min/max on inferred numeric columns compare numerically, not lexically" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Lexicographic order would give min "10", max "9".
+    const got = try runToString(alloc, &tmp, "id\n9\n10\n2\n", "SELECT MIN(id) AS mn, MAX(id) AS mx, SUM(id) AS s FROM '$IN'");
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("mn,mx,s\n2,10,21\n", got);
+}
+
+test "limit: plain (unfused) limit takes the first N; offset past the end empties" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const first2 = try runToString(alloc, &tmp, "id\n1\n2\n3\n", "SELECT * FROM '$IN' LIMIT 2");
+    defer alloc.free(first2);
+    try std.testing.expectEqualStrings("id\n1\n2\n", first2);
+    const none = try runToString(alloc, &tmp, "id\n1\n2\n3\n", "SELECT * FROM '$IN' LIMIT 5 OFFSET 100");
+    defer alloc.free(none);
+    try std.testing.expectEqualStrings("id\n", none);
+}
+
+test "join: an empty build side drops all rows (inner) and null-fills (left)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,code\n1,A\n2,B\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "lookup.csv", .data = "code,label\n" }); // header only
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "LOAD INTO '{s}/inner.csv' AS WITH labels AS (SELECT * FROM '{s}/lookup.csv') " ++
+            "SELECT t.id, l.label FROM '{s}/in.csv' t JOIN labels l ON t.code = l.code;\n" ++
+            "LOAD INTO '{s}/left.csv' AS WITH labels AS (SELECT * FROM '{s}/lookup.csv') " ++
+            "SELECT t.id, l.label FROM '{s}/in.csv' t LEFT JOIN labels l ON t.code = l.code;",
+        .{ base, base, base, base, base, base });
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    _ = run(alloc, prog, .{}, &rdiag) catch |e| {
+        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+        return e;
+    };
+    const inner = try tmp.dir.readFileAlloc(alloc, "inner.csv", 1 << 20);
+    defer alloc.free(inner);
+    try std.testing.expectEqualStrings("id,label\n", inner);
+    const left = try tmp.dir.readFileAlloc(alloc, "left.csv", 1 << 20);
+    defer alloc.free(left);
+    try std.testing.expectEqualStrings("id,label\n1,\n2,\n", left);
+}
+
+test "join: duplicate build keys fan out (inner); semi/anti reduce to existence" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,code\n1,A\n2,Z\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "lookup.csv", .data = "code,label\nA,x1\nA,x2\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "LOAD INTO '{s}/inner.csv' AS WITH labels AS (SELECT * FROM '{s}/lookup.csv') " ++
+            "SELECT t.id, l.label FROM '{s}/in.csv' t JOIN labels l ON t.code = l.code;\n" ++
+            "LOAD INTO '{s}/semi.csv' AS WITH labels AS (SELECT * FROM '{s}/lookup.csv') " ++
+            "SELECT * FROM '{s}/in.csv' t SEMI JOIN labels l ON t.code = l.code;\n" ++
+            "LOAD INTO '{s}/anti.csv' AS WITH labels AS (SELECT * FROM '{s}/lookup.csv') " ++
+            "SELECT * FROM '{s}/in.csv' t ANTI JOIN labels l ON t.code = l.code;",
+        .{ base, base, base, base, base, base, base, base, base });
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    _ = run(alloc, prog, .{}, &rdiag) catch |e| {
+        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+        return e;
+    };
+    const inner = try tmp.dir.readFileAlloc(alloc, "inner.csv", 1 << 20);
+    defer alloc.free(inner);
+    try std.testing.expectEqualStrings("id,label\n1,x1\n1,x2\n", inner); // one row per match
+    const semi = try tmp.dir.readFileAlloc(alloc, "semi.csv", 1 << 20);
+    defer alloc.free(semi);
+    try std.testing.expectEqualStrings("id,code\n1,A\n", semi); // once, left columns only
+    const anti = try tmp.dir.readFileAlloc(alloc, "anti.csv", 1 << 20);
+    defer alloc.free(anti);
+    try std.testing.expectEqualStrings("id,code\n2,Z\n", anti); // the complement
+}
+
+test "statement-level CASE dispatches on a resolved param (default arm otherwise)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,v\n1,10\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "PARAM mode STRING DEFAULT 'small';\nCASE $mode\n" ++
+            "  WHEN 'big' THEN LOAD INTO '{s}/out.csv' AS SELECT id, v FROM '{s}/in.csv';\n" ++
+            "  ELSE LOAD INTO '{s}/out.csv' AS SELECT id FROM '{s}/in.csv';\nEND CASE;",
+        .{ base, base, base, base });
+    defer alloc.free(script);
+
+    // default value → the ELSE arm runs
+    const dflt = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(dflt);
+    try std.testing.expectEqualStrings("id\n1\n", dflt);
+    // -p mode=big → the pattern arm runs instead
+    const big = try runScript(alloc, &tmp, script, &[_]ParamArg{.{ .key = "mode", .val = "big" }});
+    defer alloc.free(big);
+    try std.testing.expectEqualStrings("id,v\n1,10\n", big);
+}
+
+test "for-each on_error=continue with an OutcomeSink: run succeeds, failure recorded" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "names.csv", .data = "name\nalpha\nghost\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "alpha.csv", .data = "id\n7\n" });
+    // ghost.csv is intentionally missing → that item fails (permanent: bad path).
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "FOR EACH ROW OF ('{s}/names.csv') AS (name) SEQUENTIAL ON ERROR CONTINUE\n" ++
+            "  LOAD INTO '{s}/out_${{name}}.csv' AS SELECT * FROM '{s}/${{name}}.csv';\nEND FOR;",
+        .{ base, base, base });
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+
+    var oc_arena = std.heap.ArenaAllocator.init(alloc); // outcome strings are duped into it
+    defer oc_arena.deinit();
+    var outcomes = OutcomeSink.init(oc_arena.allocator());
+    defer outcomes.deinit();
+
+    var rdiag: Diag = .{};
+    // with a sink wired, continue-mode partial failure is a SUCCESSFUL run
+    const stats = try run(alloc, prog, .{ .outcomes = &outcomes }, &rdiag);
+    try std.testing.expectEqual(@as(usize, 1), stats.rows_out); // alpha's row
+    try std.testing.expectEqual(@as(usize, 2), outcomes.list.items.len);
+    try std.testing.expectEqual(@as(usize, 1), outcomes.failures());
+    for (outcomes.list.items) |o| {
+        if (o.ok) {
+            try std.testing.expectEqualStrings("alpha", o.item);
+        } else {
+            try std.testing.expectEqualStrings("ghost", o.item);
+            try std.testing.expect(o.err.len > 0);
+            try std.testing.expect(!o.retryable); // a missing file is permanent, not transient
+        }
+    }
+}
+
+test "for-each with an empty discovery list is a no-op" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "names.csv", .data = "name\n" }); // no rows
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    // the body would fail if it ever ran (no such input file)
+    const script = try std.fmt.allocPrint(alloc,
+        "FOR EACH ROW OF ('{s}/names.csv') AS (name)\n" ++
+            "  LOAD INTO '{s}/out.csv' AS SELECT * FROM '{s}/${{name}}.csv';\nEND FOR;",
+        .{ base, base, base });
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    const stats = try run(alloc, prog, .{}, &rdiag);
+    try std.testing.expectEqual(@as(usize, 0), stats.rows_out);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20));
 }

@@ -464,6 +464,51 @@ test "dayOf converts date and timestamp values" {
     try std.testing.expectEqual(@as(?i64, null), dayOf(.{ .string = "2024-01-01" }));
 }
 
+test "int range splits handle negative bounds" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // [-100, 50] into 4 slices: still covering and disjoint across zero.
+    const preds = try intRangePreds(a, .mysql, "id", -100, 50, 4);
+    try std.testing.expectEqual(@as(usize, 4), preds.len);
+    var id: i64 = -100;
+    while (id <= 50) : (id += 1) {
+        var hits: usize = 0;
+        for (preds) |p| if (intPredHolds(p, id)) {
+            hits += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 1), hits);
+    }
+    // below min is captured by no slice (first slice has a lower bound)
+    for (preds) |p| try std.testing.expect(!intPredHolds(p, -101));
+}
+
+test "uuid boundary values are exact space fractions" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // k/m of 2^128, canonical text: 1/2 -> 0x80…, 1/4 -> 0x40…
+    try std.testing.expectEqualStrings("80000000-0000-0000-0000-000000000000", try uuidAt(a, 1, 2));
+    try std.testing.expectEqualStrings("40000000-0000-0000-0000-000000000000", try uuidAt(a, 1, 4));
+    try std.testing.expectEqualStrings("00000000-0000-0000-0000-000000000000", try uuidAt(a, 0, 3));
+}
+
+test "plan-level guards: m<=1 and non-postgres uuid never split" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // Prober that fails to open: reached only for kinds that probe. m<=1 and
+    // the mysql-uuid case must both bail out BEFORE any connection attempt.
+    const failing = Prober{ .ctx = undefined, .openFn = failOpen };
+    try std.testing.expectEqual(@as(?Plan, null), try plan(a, failing, .postgres, "SELECT * FROM t", .{ .col = "id", .kind = .int }, 1));
+    try std.testing.expectEqual(@as(?Plan, null), try plan(a, failing, .mysql, "SELECT * FROM t", .{ .col = "id", .kind = .uuid }, 4));
+}
+
+fn failOpen(_: *anyopaque) anyerror!Conn {
+    return error.ConnectionRefused;
+}
+
 /// Minimal evaluator for the int predicates this module emits, for tests only:
 /// `"id" >= LO` or `"id" >= LO AND "id" < HI`.
 fn intPredHolds(pred: []const u8, id: i64) bool {

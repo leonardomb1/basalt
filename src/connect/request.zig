@@ -258,6 +258,51 @@ fn srcClose(ptr: *anyopaque) void {
     self.gpa.destroy(self);
 }
 
+test "request source: a single object becomes one row" {
+    const gpa = std.testing.allocator;
+    var msg: []const u8 = "";
+    var s = try RequestSource.open(gpa,
+        \\{"id": 7, "name": "solo"}
+    , null, gpa, &msg);
+    defer srcClose(s);
+    try std.testing.expectEqual(@as(usize, 1), s.batch.len);
+    try std.testing.expectEqual(@as(i64, 7), s.batch.columns[0].getValue(0).int);
+    try std.testing.expectEqualStrings("solo", s.batch.columns[1].getValue(0).string);
+}
+
+test "request source: schema comes from row 1; later rows coerce or null" {
+    const gpa = std.testing.allocator;
+    var msg: []const u8 = "";
+    // row 2: id arrives as a string (coerced), name is missing (null),
+    // extra is not in the schema (dropped)
+    var s = try RequestSource.open(gpa,
+        \\[{"id":1,"name":"a","score":1.5},{"id":"42","extra":true}]
+    , null, gpa, &msg);
+    defer srcClose(s);
+    try std.testing.expectEqual(@as(usize, 3), s.schema.fields.len);
+    try std.testing.expectEqual(types.TypeKind.float, s.schema.fields[2].ty.kind);
+    try std.testing.expectEqual(@as(i64, 42), s.batch.columns[0].getValue(1).int);
+    try std.testing.expect(s.batch.columns[1].getValue(1).isNull());
+    try std.testing.expect(s.batch.columns[2].getValue(1).isNull());
+    // unparseable numeric text nulls rather than corrupting
+    var s2 = try RequestSource.open(gpa,
+        \\[{"n":1},{"n":"not-a-number"}]
+    , null, gpa, &msg);
+    defer srcClose(s2);
+    try std.testing.expect(s2.batch.columns[0].getValue(1).isNull());
+}
+
+test "request source: non-array/object bodies are rejected by name" {
+    const gpa = std.testing.allocator;
+    var msg: []const u8 = "";
+    try std.testing.expectError(error.ExpectedJsonArrayOrObject, RequestSource.open(gpa, "42", null, gpa, &msg));
+    try std.testing.expectError(error.ExpectedJsonArrayOrObject, RequestSource.open(gpa,
+        \\"just a string"
+    , null, gpa, &msg));
+    // malformed JSON surfaces the parser's error, not a crash
+    try std.testing.expectError(error.SyntaxError, RequestSource.open(gpa, "{nope", null, gpa, &msg));
+}
+
 test "request source parses a JSON array of objects" {
     const gpa = std.testing.allocator;
     var msg: []const u8 = "";

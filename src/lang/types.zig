@@ -154,6 +154,37 @@ test "unify widens and reconciles nullability" {
     try std.testing.expect(Type.unify(Type.init(.string), i) == null);
 }
 
+test "unify: unknown-null unifies with any type, yielding it nullable" {
+    const s = Type.init(.string);
+    const ua = Type.unify(Type.unknownNull(), s).?;
+    try std.testing.expectEqual(TypeKind.string, ua.kind);
+    try std.testing.expect(ua.nullable);
+    try std.testing.expect(!ua.unknown); // the result is a concrete type
+    const ub = Type.unify(s, Type.unknownNull()).?;
+    try std.testing.expectEqual(TypeKind.string, ub.kind);
+    try std.testing.expect(ub.nullable);
+}
+
+test "unify decimals takes max precision/scale; int widens into decimal" {
+    const u = Type.unify(Type.decimal(18, 2), Type.decimal(10, 4)).?;
+    try std.testing.expectEqual(TypeKind.decimal, u.kind);
+    try std.testing.expectEqual(@as(u8, 18), u.precision);
+    try std.testing.expectEqual(@as(u8, 4), u.scale);
+
+    const w = Type.unify(Type.init(.int), Type.decimal(12, 3)).?;
+    try std.testing.expectEqual(TypeKind.decimal, w.kind);
+    try std.testing.expectEqual(@as(u8, 12), w.precision);
+    try std.testing.expectEqual(@as(u8, 3), w.scale);
+}
+
+test "eql compares decimal parameters but ignores nullability" {
+    try std.testing.expect(Type.eql(Type.decimal(10, 2), Type.decimal(10, 2)));
+    try std.testing.expect(!Type.eql(Type.decimal(10, 2), Type.decimal(10, 3)));
+    try std.testing.expect(!Type.eql(Type.decimal(11, 2), Type.decimal(10, 2)));
+    try std.testing.expect(!Type.eql(Type.init(.int), Type.init(.float)));
+    try std.testing.expect(Type.eql(Type.init(.int).asNullable(), Type.init(.int)));
+}
+
 test "schema lookup" {
     const s = Schema{ .fields = &.{
         .{ .name = "id", .ty = Type.init(.int) },

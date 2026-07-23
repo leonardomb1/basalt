@@ -357,6 +357,42 @@ test "permute reorders values and validity" {
     try std.testing.expect(out.getValue(2).isNull());
 }
 
+test "gather selects flagged rows preserving validity; all-false keep yields empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try intColumn(a, &.{ 1, null, 3, 4 });
+    const out = try gather(a, c, &.{ true, true, false, true }, 3);
+    try std.testing.expectEqual(@as(usize, 3), out.len);
+    try std.testing.expectEqual(@as(i64, 1), out.getValue(0).int);
+    try std.testing.expect(out.getValue(1).isNull());
+    try std.testing.expectEqual(@as(i64, 4), out.getValue(2).int);
+
+    const none = try gather(a, c, &.{ false, false, false, false }, 0);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "builder finish with zero appended rows yields an empty column" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var b = Builder.init(arena.allocator(), types.Type.init(.int));
+    const c = try b.finish();
+    try std.testing.expectEqual(@as(usize, 0), c.len);
+    try std.testing.expectEqual(@as(usize, 0), c.data.i64.len);
+}
+
+test "bitmap allSet: empty prefix, partial byte, exact byte multiple" {
+    const alloc = std.testing.allocator;
+    var bm = try Bitmap.initFull(alloc, 16);
+    defer alloc.free(bm.bits);
+    try std.testing.expect(bm.allSet(0)); // vacuously true
+    try std.testing.expect(bm.allSet(16)); // rem == 0: whole-byte path only
+    bm.setValid(11, false);
+    try std.testing.expect(bm.allSet(11)); // cleared bit sits outside the prefix
+    try std.testing.expect(!bm.allSet(12)); // partial trailing byte sees it
+    try std.testing.expect(!bm.allSet(16));
+}
+
 test "bitmap set/get across byte boundaries" {
     const alloc = std.testing.allocator;
     var bm = try Bitmap.initFull(alloc, 20);

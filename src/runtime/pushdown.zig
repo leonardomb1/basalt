@@ -638,6 +638,83 @@ test "planMap: a star select disables projection" {
     try testing.expect(plan.proj_select == null);
 }
 
+test "translatePred: NOT over an OR with a bool literal" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const lit1 = try a.create(ast.Expr);
+    lit1.* = .{ .int_lit = 1 };
+    const f = try a.create(ast.Expr);
+    f.* = .{ .bool_lit = false };
+    const or_e = try bin(a, .@"or", try bin(a, .gt, try fld(a, "a"), lit1), f);
+    const not_e = try a.create(ast.Expr);
+    not_e.* = .{ .unary = .{ .op = .not, .e = or_e } };
+    try testing.expectEqualStrings("(NOT (((`a` > 1) OR (1=0))))", (try translateExpr(a, not_e, .mysql, testSchema(), true)).?);
+}
+
+test "translatePred: `is empty` translates to null-or-'', plain `is null` to IS NULL" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // `is empty` is now pushable (exact, portable): b IS NULL OR b = ''
+    const e = try a.create(ast.Expr);
+    e.* = .{ .is_null = .{ .e = try fld(a, "b"), .negated = false, .kind = .is_empty } };
+    try testing.expectEqualStrings("(`b` IS NULL OR `b` = '')", (try translateExpr(a, e, .mysql, testSchema(), true)).?);
+    const n = try a.create(ast.Expr);
+    n.* = .{ .is_null = .{ .e = try fld(a, "b"), .negated = false, .kind = .is_null } };
+    try testing.expectEqualStrings("(`b` IS NULL)", (try translateExpr(a, n, .mysql, testSchema(), true)).?);
+}
+
+test "planAgg: no projection when the aggregate consumes every source column" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // sum(c) by a, b over {a,b,c}: nothing to drop → SELECT * (null halves all round)
+    const by = try a.alloc(ast.QualName, 2);
+    by[0] = .{ .parts = &.{"a"} };
+    by[1] = .{ .parts = &.{"b"} };
+    const aggs = try a.alloc(ast.AggItem, 1);
+    aggs[0] = .{ .name = "total", .func = .sum, .arg = try fld(a, "c") };
+    const plan = try planAgg(a, .mysql, testSchema(), &.{}, .{ .aggs = aggs, .by = by });
+    try testing.expect(plan.proj_select == null);
+    try testing.expect(plan.proj_schema == null);
+    try testing.expect(plan.where_extra == null);
+}
+
+test "planAgg: an untranslatable filter is not pushed but its columns stay projected" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // filter b > now() can't become SQL (clock skew), but the kept filter op still
+    // reads `b` — so the projection must fetch it (the pushed set is a superset).
+    const nowc = try a.create(ast.Expr);
+    nowc.* = .{ .call = .{ .name = "now", .args = &.{} } };
+    const filt = ast.Stage{ .node = .{ .filter = try bin(a, .gt, try fld(a, "b"), nowc) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
+    const by = try a.alloc(ast.QualName, 1);
+    by[0] = .{ .parts = &.{"a"} };
+    const aggs = try a.alloc(ast.AggItem, 1);
+    aggs[0] = .{ .name = "total", .func = .sum, .arg = try fld(a, "c") };
+    const plan = try planAgg(a, .mysql, schema4(), &.{filt}, .{ .aggs = aggs, .by = by });
+    try testing.expect(plan.where_extra == null); // call → not translatable
+    try testing.expectEqualStrings("`a`, `b`, `c`", plan.proj_select.?); // b kept live, d dropped
+}
+
+test "planMap: no projection when every source column reaches the sink" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const items = try a.alloc(ast.SelectItem, 3);
+    items[0] = try fieldItem(a, "a");
+    items[1] = try fieldItem(a, "b");
+    items[2] = try fieldItem(a, "c");
+    const middle = [_]ast.Stage{selectStage(a, items)};
+    const out_cols = [_][]const u8{ "a", "b", "c" };
+    const plan = try planMap(a, .postgres, testSchema(), &middle, &out_cols);
+    try testing.expect(plan.proj_select == null); // nothing dropped → SELECT *
+    try testing.expect(plan.stages == null); // and the original chain is kept
+    try testing.expect(plan.where_extra == null);
+}
+
 test "planAgg: a select in the prefix disables projection (filter still pushed)" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
