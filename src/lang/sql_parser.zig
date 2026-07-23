@@ -625,9 +625,11 @@ pub const Parser = struct {
             } else if (self.eatKw("upsert")) {
                 var keys = std.array_list.Managed([]const u8).init(self.arena);
                 if (self.eatKw("on")) {
+                    // A key may be a plain column, a quoted interpolated string,
+                    // or IDENTIFIER(<expr>) for a per-row computed key column.
                     _ = try self.expect(.lparen);
-                    try keys.append(try self.expectColName());
-                    while (self.eat(.comma)) try keys.append(try self.expectColName());
+                    try keys.append(try self.parseTargetSegment());
+                    while (self.eat(.comma)) try keys.append(try self.parseTargetSegment());
                     _ = try self.expect(.rparen);
                 }
                 var partial: ?[]const []const u8 = null;
@@ -2138,4 +2140,23 @@ test "sql: PUSHDOWN($$literal$$) still lowers to a plain fragment (no hole)" {
     );
     const st = prog.stmts[2].output.stages[0];
     try testing.expectEqualStrings("D_E_L_E_T_ <> '*'", st.hints[0].value.str);
+}
+
+test "sql: IDENTIFIER in an UPSERT key -> per-row computed key column" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parseTest(a,
+        \\PARAM tables JSON;
+        \\CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = 'h', database = 'b');
+        \\FOR EACH ROW OF ($tables) AS (name, pk)
+        \\  LOAD INTO sr.T
+        \\    USING stream_load
+        \\    UPSERT ON (IDENTIFIER(if($pk = '', $name || 'id', $pk))) AS
+        \\  SELECT * FROM 'x.csv';
+        \\END FOR;
+    );
+    const w = prog.stmts[3].for_each.body[0].output.stages[1].node.write;
+    try testing.expectEqual(@as(usize, 1), w.mode.upsert.keys.len);
+    try testing.expectEqualStrings("${if((pk == ''), concat(name, 'id'), pk)}", w.mode.upsert.keys[0]);
 }
