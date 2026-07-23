@@ -757,29 +757,34 @@ pub const Parser = struct {
         var stages = std.array_list.Managed(ast.Stage).init(self.arena);
         try stages.append(.{ .node = src, .hints = try read_hints.toOwnedSlice(), .pos = pos });
 
-        // joins
+        // joins — the executor supports INNER/LEFT/SEMI/ANTI; CROSS exists only
+        // as `CROSS JOIN UNNEST(...)` (an explode). RIGHT/FULL are rejected.
         while (true) {
+            var is_cross = false;
             const jk: ?ast.JoinKind = blk: {
                 if (self.isKw("inner")) break :blk .inner;
                 if (self.isKw("left")) break :blk .left;
-                if (self.isKw("right")) break :blk .right;
-                if (self.isKw("full")) break :blk .full;
-                if (self.isKw("cross")) break :blk .cross;
                 if (self.isKw("semi")) break :blk .semi;
                 if (self.isKw("anti")) break :blk .anti;
                 if (self.isKw("join")) break :blk .inner;
+                if (self.isKw("cross")) {
+                    is_cross = true;
+                    break :blk null;
+                }
+                if (self.isKw("right") or self.isKw("full"))
+                    return self.fail(self.curPos(), "{s} JOIN is not supported — use LEFT JOIN (swap sides) or restructure", .{self.cur().text});
                 break :blk null;
             };
-            if (jk == null) break;
-            const kind = jk.?;
+            if (jk == null and !is_cross) break;
+            const kind = jk orelse .inner; // placeholder for the cross/unnest path
             if (!self.isKw("join")) _ = self.advance(); // the kind word
             _ = self.eatKw("outer");
             try self.expectKw("join");
             const jpos = self.curPos();
             // CROSS JOIN UNNEST(SPLIT(col, ',')) AS name -> explode stage
-            if (self.isKw("unnest")) {
-                if (kind != .cross)
-                    return self.fail(jpos, "UNNEST requires CROSS JOIN", .{});
+            if (is_cross) {
+                if (!self.isKw("unnest"))
+                    return self.fail(jpos, "CROSS JOIN is only supported as CROSS JOIN UNNEST(...)", .{});
                 _ = self.advance();
                 _ = try self.expect(.lparen);
                 var field: []const u8 = undefined;
@@ -812,23 +817,16 @@ pub const Parser = struct {
                 jalias = self.advance().text;
                 aliases.add(jalias.?);
             }
-            var left_key: ast.QualName = undefined;
-            var right_key: ast.QualName = undefined;
-            if (kind != .cross) {
-                try self.expectKw("on");
-                const a = try self.parseQualNameTok();
-                if (!(self.eat(.assign) or self.eat(.eq)))
-                    return self.fail(self.curPos(), "expected `=` in join condition, found {s}", .{self.curTag().describe()});
-                const b = try self.parseQualNameTok();
-                const a_right = qualHasPrefix(a, jalias orelse binding);
-                const l = if (a_right) b else a;
-                const r = if (a_right) a else b;
-                left_key = stripQual(l, &aliases);
-                right_key = stripPrefix(r, jalias orelse binding);
-            } else {
-                left_key = .{ .parts = &.{} };
-                right_key = .{ .parts = &.{} };
-            }
+            try self.expectKw("on");
+            const a = try self.parseQualNameTok();
+            if (!(self.eat(.assign) or self.eat(.eq)))
+                return self.fail(self.curPos(), "expected `=` in join condition, found {s}", .{self.curTag().describe()});
+            const b = try self.parseQualNameTok();
+            const a_right = qualHasPrefix(a, jalias orelse binding);
+            const l = if (a_right) b else a;
+            const r = if (a_right) a else b;
+            const left_key = stripQual(l, &aliases);
+            const right_key = stripPrefix(r, jalias orelse binding);
             try stages.append(.{
                 .node = .{ .join = .{ .kind = kind, .binding = binding, .left_key = left_key, .right_key = right_key } },
                 .hints = &.{},

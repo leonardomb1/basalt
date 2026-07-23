@@ -353,13 +353,6 @@ fn materializeAll(arena: std.mem.Allocator, child: Op, schema: *const types.Sche
     return Batch{ .schema = schema, .columns = cols, .len = total };
 }
 
-/// Build a batch selecting the rows where `keep[r]` is true.
-fn gather(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usize) anyerror!Batch {
-    const outcols = try arena.alloc(column.Column, b.columns.len);
-    for (b.columns, 0..) |*col, ci| outcols[ci] = try column.gather(arena, col.*, keep, kept);
-    return Batch{ .schema = b.schema, .columns = outcols, .len = kept };
-}
-
 /// Streaming dedup: batches flow through one at a time, filtered against a
 /// seen-set of key strings — O(distinct keys) memory, not O(dataset). The
 /// seen-set (and its key copies) live in `state` (the plan arena), because the
@@ -429,7 +422,7 @@ pub const Distinct = struct {
 };
 
 /// Deep-copy the `keep`-marked rows of `b` into `arena` via column builders, which
-/// dupe string/bytes payloads (unlike `gather`, which aliases them). Used when the
+/// dupe string/bytes payloads (unlike `column.gather`, which aliases them). Used when the
 /// source batch lives in a scratch arena that is about to be freed.
 fn gatherDeep(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usize) anyerror!Batch {
     const outcols = try arena.alloc(column.Column, b.columns.len);
@@ -471,18 +464,8 @@ const SortCtx = struct {
 
     fn lessThan(self: SortCtx, a: usize, c: usize) bool {
         for (self.keys) |k| {
-            const va = self.b.columns[k.idx].getValue(a);
-            const vc = self.b.columns[k.idx].getValue(c);
-            const an = va.isNull();
-            const cn = vc.isNull();
-            if (an or cn) {
-                if (an and cn) continue; // equal on this key
-                return !an; // nulls last: non-null sorts before null
-            }
-            const ord = eval.compareValues(va, vc) orelse continue;
-            if (ord == .eq) continue;
-            const less = (ord == .lt);
-            return if (k.desc) !less else less;
+            const o = keyOrder(self.b.columns[k.idx].getValue(a), self.b.columns[k.idx].getValue(c), k.desc);
+            if (o != .eq) return o == .lt;
         }
         return false;
     }
@@ -490,7 +473,7 @@ const SortCtx = struct {
 
 /// Effective order of two sort-key values: `.lt` means `va` sorts before `vb`.
 /// Nulls always sort last (independent of `desc`); `desc` flips non-null order.
-/// Shared by Top-N's heap and final sort (mirrors `SortCtx.lessThan`).
+/// Shared by `SortCtx.lessThan` and Top-N's heap and final sort.
 fn keyOrder(va: Value, vb: Value, desc: bool) std.math.Order {
     const an = va.isNull();
     const bn = vb.isNull();
@@ -519,6 +502,7 @@ pub const TopN = struct {
     done: bool = false,
 
     const Entry = []Value; // one materialized row: a value per input column
+    const Heap = std.PriorityQueue(Entry, []const Sort.Key, entryWorstFirst);
 
     pub fn next(self: *TopN, arena: std.mem.Allocator) anyerror!?Batch {
         if (self.done) return null;
@@ -526,10 +510,11 @@ pub const TopN = struct {
         if (self.count == 0) return null;
         const cap = self.offset + self.count; // keep this many best rows
 
-        // Max-heap by `entryLess` (root = the worst-ranked kept row), entries owned
-        // by `gpa` and freed on eviction → O(cap) memory. Child pulled through a
-        // scratch arena reset per batch (the batches themselves are never retained).
-        var heap = std.array_list.Managed(Entry).init(self.gpa);
+        // Priority queue keyed worst-first (root = the worst-ranked kept row),
+        // entries owned by `gpa` and freed on eviction → O(cap) memory. Child
+        // pulled through a scratch arena reset per batch (the batches themselves
+        // are never retained).
+        var heap = Heap.init(self.gpa, self.keys);
         defer {
             for (heap.items) |e| self.freeEntry(e);
             heap.deinit();
@@ -541,14 +526,12 @@ pub const TopN = struct {
         while (try self.child.next(pull)) |b| {
             var r: usize = 0;
             while (r < b.len) : (r += 1) {
-                if (heap.items.len < cap) {
-                    try heap.append(try self.cloneRow(b, r));
-                    siftUp(heap.items, heap.items.len - 1, self.keys);
+                if (heap.count() < cap) {
+                    try heap.add(try self.cloneRow(b, r));
                 } else if (self.rowLess(b, r, heap.items[0])) {
-                    // r ranks before the current worst kept → replace the root
-                    self.freeEntry(heap.items[0]);
-                    heap.items[0] = try self.cloneRow(b, r);
-                    siftDown(heap.items, 0, self.keys);
+                    // r ranks before the current worst kept → evict the root
+                    self.freeEntry(heap.remove());
+                    try heap.add(try self.cloneRow(b, r));
                 }
             }
             _ = scratch.reset(.retain_capacity);
@@ -609,30 +592,15 @@ fn entryLessCtx(keys: []const Sort.Key, a: TopN.Entry, b: TopN.Entry) bool {
     return entryLess(a, b, keys);
 }
 
-/// Binary max-heap (root = greatest under `entryLess`) sift helpers over a slice.
-fn siftUp(h: []TopN.Entry, start: usize, keys: []const Sort.Key) void {
-    var i = start;
-    while (i > 0) {
-        const parent = (i - 1) / 2;
-        if (!entryLess(h[parent], h[i], keys)) break; // parent already >= child
-        std.mem.swap(TopN.Entry, &h[parent], &h[i]);
-        i = parent;
+/// `std.PriorityQueue` comparator: ranks the *worst* row (greatest under
+/// `entryLess`) as highest priority, so `peek`/`remove` yield the eviction
+/// candidate — the max-heap TopN needs, expressed against a min-heap API.
+fn entryWorstFirst(keys: []const Sort.Key, a: TopN.Entry, b: TopN.Entry) std.math.Order {
+    for (keys) |k| {
+        const o = keyOrder(a[k.idx], b[k.idx], k.desc);
+        if (o != .eq) return o.invert();
     }
-}
-
-fn siftDown(h: []TopN.Entry, start: usize, keys: []const Sort.Key) void {
-    var i = start;
-    const n = h.len;
-    while (true) {
-        const l = 2 * i + 1;
-        const r = 2 * i + 2;
-        var largest = i;
-        if (l < n and entryLess(h[largest], h[l], keys)) largest = l;
-        if (r < n and entryLess(h[largest], h[r], keys)) largest = r;
-        if (largest == i) break;
-        std.mem.swap(TopN.Entry, &h[i], &h[largest]);
-        i = largest;
-    }
+    return .eq;
 }
 
 fn dupeValueGpa(gpa: std.mem.Allocator, v: Value) !Value {
@@ -746,11 +714,7 @@ pub const Aggregate = struct {
                 }
                 const g = &groups.items[gop.value_ptr.*];
                 for (self.aggs, 0..) |agg, j| {
-                    var v: Value = .null;
-                    if (agg.arg) |e| v = eval.evalRow(pull, e, b, r) catch |err| {
-                        if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
-                        return err;
-                    };
+                    const v = try self.argValue(pull, agg, b, r);
                     try updateAcc(self.state, &g.accs[j], agg, v, agg.arg != null);
                 }
             }
@@ -826,14 +790,30 @@ pub const Aggregate = struct {
         var r: usize = 0;
         while (r < b.len) : (r += 1) {
             for (self.aggs, 0..) |agg, j| {
-                var v: Value = .null;
-                if (agg.arg) |e| v = eval.evalRow(arena, e, b, r) catch |err| {
-                    if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
-                    return err;
-                };
+                const v = try self.argValue(arena, agg, b, r);
                 try updateAcc(self.state, &accs[j], agg, v, agg.arg != null);
             }
         }
+    }
+
+    /// One agg argument for one row, coerced to the planned type. The parallel
+    /// CSV lanes carry raw string columns (the planner types sum/avg numeric and
+    /// expects runtime coercion — the vectorized path gets it via `evalColumn`);
+    /// without this a string cell reaching `sum` is a union-access crash, and
+    /// unparseable text is a clean CastFailed instead.
+    fn argValue(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, b: Batch, r: usize) anyerror!Value {
+        const e = agg.arg orelse return .null;
+        var v = eval.evalRow(arena, e, b, r) catch |err| {
+            if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
+            return err;
+        };
+        if (v == .string and (agg.func == .sum or agg.func == .avg)) {
+            v = eval.castValue(arena, v, agg.ty.kind) catch |err| {
+                if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
+                return err;
+            };
+        }
+        return v;
     }
 
     /// Vectorized reduce of one agg over one batch. `null` means "not covered,
@@ -1112,7 +1092,6 @@ pub const Join = struct {
                     try self.emitRow(builders, lb, r, 0, false, false);
                     n += 1;
                 },
-                else => unreachable,
             }
         }
 
@@ -1135,3 +1114,564 @@ pub const Join = struct {
         }
     }
 };
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+/// Test-only in-memory source handing out prebuilt batches. The batches live in
+/// the test arena (outliving any pull arena), so operators that deep-copy for
+/// cross-pull survival are still exercised safely.
+const TestSource = struct {
+    schema_: types.Schema,
+    batches: []const Batch,
+    idx: usize = 0,
+
+    const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
+
+    fn schemaFn(p: *anyopaque) types.Schema {
+        return @as(*TestSource, @ptrCast(@alignCast(p))).schema_;
+    }
+    fn nextFn(p: *anyopaque, _: std.mem.Allocator) anyerror!?Batch {
+        const self: *TestSource = @ptrCast(@alignCast(p));
+        if (self.idx >= self.batches.len) return null;
+        defer self.idx += 1;
+        return self.batches[self.idx];
+    }
+    fn closeFn(_: *anyopaque) void {}
+
+    fn src(self: *TestSource) driver.Source {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+/// One nullable-int column batch.
+fn intBatch(a: std.mem.Allocator, schema: *const types.Schema, vals: []const ?i64) !Batch {
+    const cols = try a.alloc(column.Column, 1);
+    cols[0] = try column.intColumn(a, vals);
+    return Batch{ .schema = schema, .columns = cols, .len = vals.len };
+}
+
+/// One nullable-string column batch.
+fn strBatch(a: std.mem.Allocator, schema: *const types.Schema, vals: []const ?[]const u8) !Batch {
+    var bd = column.Builder.init(a, types.Type.init(.string).asNullable());
+    for (vals) |v| try bd.append(if (v) |s| Value{ .string = s } else .null);
+    const cols = try a.alloc(column.Column, 1);
+    cols[0] = try bd.finish();
+    return Batch{ .schema = schema, .columns = cols, .len = vals.len };
+}
+
+/// Two-column (nullable int, nullable string) batch; slices must be equal length.
+fn kvBatch(a: std.mem.Allocator, schema: *const types.Schema, ints: []const ?i64, strs: []const ?[]const u8) !Batch {
+    const cols = try a.alloc(column.Column, 2);
+    cols[0] = try column.intColumn(a, ints);
+    var bd = column.Builder.init(a, types.Type.init(.string).asNullable());
+    for (strs) |v| try bd.append(if (v) |s| Value{ .string = s } else .null);
+    cols[1] = try bd.finish();
+    return Batch{ .schema = schema, .columns = cols, .len = ints.len };
+}
+
+/// Drain `top` and collect column 0 as optional ints.
+fn drainInts(a: std.mem.Allocator, top: Op) ![]const ?i64 {
+    var got = std.array_list.Managed(?i64).init(a);
+    while (try top.next(a)) |b| {
+        var r: usize = 0;
+        while (r < b.len) : (r += 1) {
+            const v = b.columns[0].getValue(r);
+            try got.append(if (v.isNull()) null else v.int);
+        }
+    }
+    return got.toOwnedSlice();
+}
+
+const int_schema = types.Schema{ .fields = &.{
+    .{ .name = "x", .ty = types.Type.init(.int).asNullable() },
+} };
+
+test "limit skips offset rows across batch boundaries and stops at count" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const batches = [_]Batch{
+        try intBatch(a, &int_schema, &.{ 1, 2, 3 }),
+        try intBatch(a, &int_schema, &.{ 4, 5, 6 }),
+    };
+    var ts = TestSource{ .schema_ = int_schema, .batches = &batches };
+    var scan = Scan{ .src = ts.src() };
+    // offset 4 swallows batch 1 entirely and one row of batch 2; count 3 > what's left.
+    var lim = Limit{ .child = .{ .scan = &scan }, .remaining = 3, .to_skip = 4 };
+    try testing.expectEqualDeep(@as([]const ?i64, &.{ 5, 6 }), try drainInts(a, .{ .limit = &lim }));
+
+    // count cutting a batch mid-way: skip 1, take 3 of 6.
+    var ts2 = TestSource{ .schema_ = int_schema, .batches = &batches };
+    var scan2 = Scan{ .src = ts2.src() };
+    var lim2 = Limit{ .child = .{ .scan = &scan2 }, .remaining = 3, .to_skip = 1 };
+    try testing.expectEqualDeep(@as([]const ?i64, &.{ 2, 3, 4 }), try drainInts(a, .{ .limit = &lim2 }));
+}
+
+test "filter keeps only known-true rows: null predicate drops the row (3VL)" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const batches = [_]Batch{try intBatch(a, &int_schema, &.{ 1, null, 5, 3, 2 })};
+    var ts = TestSource{ .schema_ = int_schema, .batches = &batches };
+    var scan = Scan{ .src = ts.src() };
+
+    var fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
+    var two = ast.Expr{ .int_lit = 2 };
+    var pred = ast.Expr{ .binary = .{ .op = .gt, .l = &fx, .r = &two } };
+    var flt = Filter{ .child = .{ .scan = &scan }, .pred = &pred };
+    try testing.expectEqualDeep(@as([]const ?i64, &.{ 5, 3 }), try drainInts(a, .{ .filter = &flt }));
+}
+
+test "filter surfaces eval errors through ErrCtx; first error wins" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const batches = [_]Batch{try intBatch(a, &int_schema, &.{1})};
+    var ts = TestSource{ .schema_ = int_schema, .batches = &batches };
+    var scan = Scan{ .src = ts.src() };
+
+    var fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
+    var zero = ast.Expr{ .int_lit = 0 };
+    var one = ast.Expr{ .int_lit = 1 };
+    var div = ast.Expr{ .binary = .{ .op = .div, .l = &fx, .r = &zero } };
+    var pred = ast.Expr{ .binary = .{ .op = .gt, .l = &div, .r = &one } };
+
+    var ec = ErrCtx{};
+    var flt = Filter{ .child = .{ .scan = &scan }, .pred = &pred, .err = &ec };
+    const top = Op{ .filter = &flt };
+    try testing.expectError(error.DivByZero, top.next(a));
+    try testing.expectEqualStrings("division by zero: in filter predicate", ec.msg);
+    ec.set("later error", .{});
+    try testing.expectEqualStrings("division by zero: in filter predicate", ec.msg);
+}
+
+test "project passes columns through and computes expressions with null propagation" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const batches = [_]Batch{try intBatch(a, &int_schema, &.{ 10, null })};
+    var ts = TestSource{ .schema_ = int_schema, .batches = &batches };
+    var scan = Scan{ .src = ts.src() };
+
+    var fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
+    var one = ast.Expr{ .int_lit = 1 };
+    var plus = ast.Expr{ .binary = .{ .op = .add, .l = &fx, .r = &one } };
+    const out_schema = types.Schema{ .fields = &.{
+        .{ .name = "x", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "y", .ty = types.Type.init(.int).asNullable() },
+    } };
+    const pcols = [_]Project.Col{
+        .{ .source = .{ .passthrough = 0 }, .ty = types.Type.init(.int).asNullable() },
+        .{ .source = .{ .expr = &plus }, .ty = types.Type.init(.int).asNullable() },
+    };
+    var proj = Project{ .child = .{ .scan = &scan }, .cols = &pcols, .out_schema = &out_schema };
+
+    const b = (try proj.next(a)).?;
+    try testing.expectEqual(@as(usize, 2), b.len);
+    try testing.expectEqual(@as(i64, 10), b.columns[0].getValue(0).int);
+    try testing.expectEqual(@as(i64, 11), b.columns[1].getValue(0).int);
+    try testing.expect(b.columns[0].getValue(1).isNull());
+    try testing.expect(b.columns[1].getValue(1).isNull());
+}
+
+test "distinct dedups across batches, groups nulls as one key, deep-copies strings" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "s", .ty = types.Type.init(.string).asNullable() },
+    } };
+    const batches = [_]Batch{
+        try strBatch(a, &schema, &.{ "a", "b", null }),
+        try strBatch(a, &schema, &.{ "b", null, "c", "a" }),
+    };
+    var ts = TestSource{ .schema_ = schema, .batches = &batches };
+    var scan = Scan{ .src = ts.src() };
+    var dst = Distinct{ .child = .{ .scan = &scan }, .in_schema = &schema, .keys = null, .state = a, .gpa = testing.allocator };
+
+    var got = std.array_list.Managed(?[]const u8).init(a);
+    const top = Op{ .distinct = &dst };
+    while (try top.next(a)) |b| {
+        var r: usize = 0;
+        while (r < b.len) : (r += 1) {
+            const v = b.columns[0].getValue(r);
+            try got.append(if (v.isNull()) null else v.string);
+        }
+    }
+    const want = [_]?[]const u8{ "a", "b", null, "c" };
+    try testing.expectEqual(want.len, got.items.len);
+    for (want, got.items) |w, g| {
+        if (w) |s| try testing.expectEqualStrings(s, g.?) else try testing.expect(g == null);
+    }
+}
+
+test "sort: descending order with nulls always last" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const batches = [_]Batch{
+        try intBatch(a, &int_schema, &.{ 3, null }),
+        try intBatch(a, &int_schema, &.{ 1, 2 }),
+    };
+    var ts = TestSource{ .schema_ = int_schema, .batches = &batches };
+    var scan = Scan{ .src = ts.src() };
+    var srt = Sort{ .child = .{ .scan = &scan }, .in_schema = &int_schema, .keys = &[_]Sort.Key{.{ .idx = 0, .desc = true }} };
+    try testing.expectEqualDeep(@as([]const ?i64, &.{ 3, 2, 1, null }), try drainInts(a, .{ .sort = &srt }));
+}
+
+test "top_n keeps best rows across batches, honors offset, matches full sort" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "x", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "s", .ty = types.Type.init(.string).asNullable() },
+    } };
+    const batches = [_]Batch{
+        try kvBatch(a, &schema, &.{ 5, 1, 4 }, &.{ "e", "a", "d" }),
+        try kvBatch(a, &schema, &.{ 2, 8, 3 }, &.{ "b", "z", "c" }),
+    };
+    var ts = TestSource{ .schema_ = schema, .batches = &batches };
+    var scan = Scan{ .src = ts.src() };
+    // sorted asc: 1,2,3,4,5,8; offset 1, count 2 -> rows 2,3. Heap cap 3 forces evictions.
+    var tn = TopN{
+        .child = .{ .scan = &scan },
+        .in_schema = &schema,
+        .keys = &[_]Sort.Key{.{ .idx = 0, .desc = false }},
+        .count = 2,
+        .offset = 1,
+        .state = a,
+        .gpa = testing.allocator, // leak-checks cloned row strings
+    };
+    const b = (try tn.next(a)).?;
+    try testing.expectEqual(@as(usize, 2), b.len);
+    try testing.expectEqual(@as(i64, 2), b.columns[0].getValue(0).int);
+    try testing.expectEqualStrings("b", b.columns[1].getValue(0).string);
+    try testing.expectEqual(@as(i64, 3), b.columns[0].getValue(1).int);
+    try testing.expectEqualStrings("c", b.columns[1].getValue(1).string);
+    try testing.expect((try tn.next(a)) == null); // done after one emission
+}
+
+test "aggregate: grouped count/sum/avg/min/max skip nulls per group" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // kvBatch puts ints in column 0, strings in column 1 -> key column is 1.
+    const in_schema = types.Schema{ .fields = &.{
+        .{ .name = "v", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "k", .ty = types.Type.init(.string).asNullable() },
+    } };
+    const batches = [_]Batch{
+        try kvBatch(a, &in_schema, &.{ 1, 10 }, &.{ "a", "b" }),
+        try kvBatch(a, &in_schema, &.{ null, 3, 2 }, &.{ "a", "a", "b" }),
+    };
+    var ts = TestSource{ .schema_ = in_schema, .batches = &batches };
+    var scan = Scan{ .src = ts.src() };
+
+    const fv = ast.Expr{ .field = .{ .parts = &[_][]const u8{"v"} } };
+    const aggs = [_]Aggregate.Agg{
+        .{ .func = .count, .arg = null, .ty = types.Type.init(.int) },
+        .{ .func = .sum, .arg = &fv, .ty = types.Type.init(.int).asNullable() },
+        .{ .func = .avg, .arg = &fv, .ty = types.Type.init(.float).asNullable() },
+        .{ .func = .min, .arg = &fv, .ty = types.Type.init(.int).asNullable() },
+        .{ .func = .max, .arg = &fv, .ty = types.Type.init(.int).asNullable() },
+    };
+    const out_schema = types.Schema{ .fields = &.{
+        .{ .name = "k", .ty = types.Type.init(.string) },
+        .{ .name = "c", .ty = types.Type.init(.int) },
+        .{ .name = "s", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "av", .ty = types.Type.init(.float).asNullable() },
+        .{ .name = "mn", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "mx", .ty = types.Type.init(.int).asNullable() },
+    } };
+    var agg = Aggregate{
+        .child = .{ .scan = &scan },
+        .in_schema = &in_schema,
+        .by = &.{1},
+        .aggs = &aggs,
+        .out_schema = &out_schema,
+        .state = a,
+        .gpa = testing.allocator,
+    };
+    const b = (try agg.next(a)).?;
+    try testing.expectEqual(@as(usize, 2), b.len);
+    // Groups emit in first-seen order: "a" (rows 1, null, 3), then "b" (10, 2).
+    try testing.expectEqualStrings("a", b.columns[0].getValue(0).string);
+    try testing.expectEqual(@as(i64, 3), b.columns[1].getValue(0).int); // count(*) counts the null row
+    try testing.expectEqual(@as(i64, 4), b.columns[2].getValue(0).int); // sum skips the null
+    try testing.expectEqual(@as(f64, 2.0), b.columns[3].getValue(0).float); // avg over 2 non-null rows
+    try testing.expectEqual(@as(i64, 1), b.columns[4].getValue(0).int);
+    try testing.expectEqual(@as(i64, 3), b.columns[5].getValue(0).int);
+    try testing.expectEqualStrings("b", b.columns[0].getValue(1).string);
+    try testing.expectEqual(@as(i64, 2), b.columns[1].getValue(1).int);
+    try testing.expectEqual(@as(i64, 12), b.columns[2].getValue(1).int);
+    try testing.expectEqual(@as(f64, 6.0), b.columns[3].getValue(1).float);
+    try testing.expectEqual(@as(i64, 2), b.columns[4].getValue(1).int);
+    try testing.expectEqual(@as(i64, 10), b.columns[5].getValue(1).int);
+}
+
+test "aggregate: sum/avg coerce raw string cells (parallel CSV lane shape); garbage text errors" {
+    // The mapped-CSV lanes feed all-string columns; the planner types sum(int-ish)
+    // as int and expects runtime coercion. Regression: this used to be a
+    // union-access crash in the row-wise fold.
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const s_schema = types.Schema{ .fields = &.{
+        .{ .name = "x", .ty = types.Type.init(.string).asNullable() },
+    } };
+    const fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
+    const aggs = [_]Aggregate.Agg{
+        .{ .func = .sum, .arg = &fx, .ty = types.Type.init(.int).asNullable() },
+        .{ .func = .avg, .arg = &fx, .ty = types.Type.init(.float).asNullable() },
+    };
+    const out_schema = types.Schema{ .fields = &.{
+        .{ .name = "s", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "av", .ty = types.Type.init(.float).asNullable() },
+    } };
+
+    {
+        const batches = [_]Batch{try strBatch(a, &s_schema, &.{ "4", null, "2" })};
+        var ts = TestSource{ .schema_ = s_schema, .batches = &batches };
+        var scan = Scan{ .src = ts.src() };
+        var agg = Aggregate{ .child = .{ .scan = &scan }, .in_schema = &s_schema, .by = &.{}, .aggs = &aggs, .out_schema = &out_schema, .state = a, .gpa = testing.allocator };
+        const b = (try agg.next(a)).?;
+        try testing.expectEqual(@as(i64, 6), b.columns[0].getValue(0).int);
+        try testing.expectEqual(@as(f64, 3.0), b.columns[1].getValue(0).float);
+    }
+    {
+        const batches = [_]Batch{try strBatch(a, &s_schema, &.{ "4", "oops" })};
+        var ts = TestSource{ .schema_ = s_schema, .batches = &batches };
+        var scan = Scan{ .src = ts.src() };
+        var agg = Aggregate{ .child = .{ .scan = &scan }, .in_schema = &s_schema, .by = &.{}, .aggs = &aggs, .out_schema = &out_schema, .state = a, .gpa = testing.allocator };
+        try testing.expectError(error.CastFailed, agg.next(a));
+    }
+}
+
+test "aggregate: global vectorized reductions honor nulls; empty input edge cases" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
+    const aggs = [_]Aggregate.Agg{
+        .{ .func = .count, .arg = null, .ty = types.Type.init(.int) },
+        .{ .func = .count, .arg = &fx, .ty = types.Type.init(.int) },
+        .{ .func = .sum, .arg = &fx, .ty = types.Type.init(.int).asNullable() },
+        .{ .func = .avg, .arg = &fx, .ty = types.Type.init(.float).asNullable() },
+        .{ .func = .min, .arg = &fx, .ty = types.Type.init(.int).asNullable() },
+        .{ .func = .max, .arg = &fx, .ty = types.Type.init(.int).asNullable() },
+    };
+    const out_schema = types.Schema{ .fields = &.{
+        .{ .name = "c", .ty = types.Type.init(.int) },
+        .{ .name = "cv", .ty = types.Type.init(.int) },
+        .{ .name = "s", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "av", .ty = types.Type.init(.float).asNullable() },
+        .{ .name = "mn", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "mx", .ty = types.Type.init(.int).asNullable() },
+    } };
+
+    const batches = [_]Batch{
+        try intBatch(a, &int_schema, &.{ 4, null }),
+        try intBatch(a, &int_schema, &.{ 2, 9 }),
+    };
+    var ts = TestSource{ .schema_ = int_schema, .batches = &batches };
+    var scan = Scan{ .src = ts.src() };
+    var agg = Aggregate{
+        .child = .{ .scan = &scan },
+        .in_schema = &int_schema,
+        .by = &.{},
+        .aggs = &aggs,
+        .out_schema = &out_schema,
+        .state = a,
+        .gpa = testing.allocator,
+    };
+    const b = (try agg.next(a)).?;
+    try testing.expectEqual(@as(usize, 1), b.len);
+    try testing.expectEqual(@as(i64, 4), b.columns[0].getValue(0).int); // count(*) includes null row
+    try testing.expectEqual(@as(i64, 3), b.columns[1].getValue(0).int); // count(x) does not
+    try testing.expectEqual(@as(i64, 15), b.columns[2].getValue(0).int);
+    try testing.expectEqual(@as(f64, 5.0), b.columns[3].getValue(0).float);
+    try testing.expectEqual(@as(i64, 2), b.columns[4].getValue(0).int);
+    try testing.expectEqual(@as(i64, 9), b.columns[5].getValue(0).int);
+
+    // Empty input: a global aggregate still emits one row (count 0, sum/min null)...
+    var ets = TestSource{ .schema_ = int_schema, .batches = &.{} };
+    var escan = Scan{ .src = ets.src() };
+    var eagg = Aggregate{
+        .child = .{ .scan = &escan },
+        .in_schema = &int_schema,
+        .by = &.{},
+        .aggs = &aggs,
+        .out_schema = &out_schema,
+        .state = a,
+        .gpa = testing.allocator,
+    };
+    const eb = (try eagg.next(a)).?;
+    try testing.expectEqual(@as(usize, 1), eb.len);
+    try testing.expectEqual(@as(i64, 0), eb.columns[0].getValue(0).int);
+    try testing.expect(eb.columns[2].getValue(0).isNull());
+    try testing.expect(eb.columns[4].getValue(0).isNull());
+
+    // ...while a grouped aggregate over empty input emits no rows at all.
+    var gts = TestSource{ .schema_ = int_schema, .batches = &.{} };
+    var gscan = Scan{ .src = gts.src() };
+    var gagg = Aggregate{
+        .child = .{ .scan = &gscan },
+        .in_schema = &int_schema,
+        .by = &.{0},
+        .aggs = &aggs,
+        .out_schema = &out_schema, // shape unused: no rows come out
+        .state = a,
+        .gpa = testing.allocator,
+    };
+    try testing.expect((try gagg.next(a)) == null);
+}
+
+test "join: inner/left/semi/anti; null keys never match on either side" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const left_schema = types.Schema{ .fields = &.{
+        .{ .name = "lk", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "lv", .ty = types.Type.init(.string).asNullable() },
+    } };
+    const right_schema = types.Schema{ .fields = &.{
+        .{ .name = "rk", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "rv", .ty = types.Type.init(.string).asNullable() },
+    } };
+    const both_schema = types.Schema{ .fields = &.{
+        .{ .name = "lk", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "lv", .ty = types.Type.init(.string).asNullable() },
+        .{ .name = "rk", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "rv", .ty = types.Type.init(.string).asNullable() },
+    } };
+
+    const Case = struct { kind: ast.JoinKind, keys: []const ?i64, rvs: []const ?[]const u8 };
+    const cases = [_]Case{
+        .{ .kind = .inner, .keys = &.{ 1, 1 }, .rvs = &.{ "x", "y" } },
+        .{ .kind = .left, .keys = &.{ 1, 1, 2, null, 3 }, .rvs = &.{ "x", "y", null, null, null } },
+        .{ .kind = .semi, .keys = &.{1}, .rvs = &.{} },
+        .{ .kind = .anti, .keys = &.{ 2, null, 3 }, .rvs = &.{} },
+    };
+    for (cases) |case| {
+        const lb = [_]Batch{try kvBatch(a, &left_schema, &.{ 1, 2, null, 3 }, &.{ "a", "b", "n", "c" })};
+        const rb = [_]Batch{try kvBatch(a, &right_schema, &.{ 1, 1, 4, null }, &.{ "x", "y", "z", "m" })};
+        var lts = TestSource{ .schema_ = left_schema, .batches = &lb };
+        var rts = TestSource{ .schema_ = right_schema, .batches = &rb };
+        var lscan = Scan{ .src = lts.src() };
+        var rscan = Scan{ .src = rts.src() };
+        const emit_right = case.kind == .inner or case.kind == .left;
+        var jn = Join{
+            .probe = .{ .scan = &lscan },
+            .build = .{ .scan = &rscan },
+            .left_key = 0,
+            .right_key = 0,
+            .left_schema = &left_schema,
+            .right_schema = &right_schema,
+            .out_schema = if (emit_right) &both_schema else &left_schema,
+            .kind = case.kind,
+            .state = a,
+        };
+        var keys = std.array_list.Managed(?i64).init(a);
+        var rvs = std.array_list.Managed(?[]const u8).init(a);
+        const top = Op{ .join = &jn };
+        while (try top.next(a)) |b| {
+            var r: usize = 0;
+            while (r < b.len) : (r += 1) {
+                const kv = b.columns[0].getValue(r);
+                try keys.append(if (kv.isNull()) null else kv.int);
+                if (emit_right) {
+                    const rv = b.columns[3].getValue(r);
+                    try rvs.append(if (rv.isNull()) null else rv.string);
+                }
+            }
+        }
+        try testing.expectEqualDeep(case.keys, @as([]const ?i64, keys.items));
+        try testing.expectEqual(case.rvs.len, rvs.items.len);
+        for (case.rvs, rvs.items) |w, g| {
+            if (w) |s| try testing.expectEqualStrings(s, g.?) else try testing.expect(g == null);
+        }
+    }
+}
+
+test "union drains children in order, skipping empty ones" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const b1 = [_]Batch{try intBatch(a, &int_schema, &.{ 1, 2 })};
+    const b3 = [_]Batch{try intBatch(a, &int_schema, &.{3})};
+    var ts1 = TestSource{ .schema_ = int_schema, .batches = &b1 };
+    var ts2 = TestSource{ .schema_ = int_schema, .batches = &.{} }; // empty middle child
+    var ts3 = TestSource{ .schema_ = int_schema, .batches = &b3 };
+    var s1 = Scan{ .src = ts1.src() };
+    var s2 = Scan{ .src = ts2.src() };
+    var s3 = Scan{ .src = ts3.src() };
+    const children = [_]Op{ .{ .scan = &s1 }, .{ .scan = &s2 }, .{ .scan = &s3 } };
+    var un = Union{ .children = &children };
+    try testing.expectEqualDeep(@as([]const ?i64, &.{ 1, 2, 3 }), try drainInts(a, .{ .union_ = &un }));
+}
+
+test "explode splits delimited strings, repeats other columns, drops null cells" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "id", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "tags", .ty = types.Type.init(.string).asNullable() },
+    } };
+    const batches = [_]Batch{try kvBatch(a, &schema, &.{ 1, 2, 3, 4 }, &.{ "a,b", null, "c", "" })};
+    var ts = TestSource{ .schema_ = schema, .batches = &batches };
+    var scan = Scan{ .src = ts.src() };
+    var ex = Explode{ .child = .{ .scan = &scan }, .field_idx = 1, .delim = ",", .out_schema = &schema };
+
+    const b = (try (Op{ .explode = &ex }).next(a)).?;
+    try testing.expectEqual(@as(usize, 4), b.len);
+    const want_ids = [_]i64{ 1, 1, 3, 4 };
+    const want_tags = [_][]const u8{ "a", "b", "c", "" }; // empty string -> one empty element
+    for (want_ids, want_tags, 0..) |wi, wt, r| {
+        try testing.expectEqual(wi, b.columns[0].getValue(r).int);
+        try testing.expectEqualStrings(wt, b.columns[1].getValue(r).string);
+    }
+}
+
+test "linearize decomposes map-only pipelines source-to-sink; breakers refuse" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var ts = TestSource{ .schema_ = int_schema, .batches = &.{} };
+    var scan = Scan{ .src = ts.src() };
+    var fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
+    var zero = ast.Expr{ .int_lit = 0 };
+    var pred = ast.Expr{ .binary = .{ .op = .gt, .l = &fx, .r = &zero } };
+    var flt = Filter{ .child = .{ .scan = &scan }, .pred = &pred };
+    const pcols = [_]Project.Col{.{ .source = .{ .passthrough = 0 }, .ty = types.Type.init(.int).asNullable() }};
+    var proj = Project{ .child = .{ .filter = &flt }, .cols = &pcols, .out_schema = &int_schema };
+
+    const lin = (try linearize(a, .{ .project = &proj })).?;
+    try testing.expectEqual(@as(usize, 2), lin.stages.len);
+    try testing.expect(lin.stages[0] == .filter); // source-side stage first
+    try testing.expect(lin.stages[1] == .project);
+    try testing.expectEqual(@as(*anyopaque, &ts), lin.src.ptr);
+
+    // A breaker anywhere in the chain disqualifies the whole pipeline.
+    var srt = Sort{ .child = .{ .project = &proj }, .in_schema = &int_schema, .keys = &.{} };
+    try testing.expect((try linearize(a, .{ .sort = &srt })) == null);
+}

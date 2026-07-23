@@ -560,6 +560,7 @@ fn attrToStr(e: *const ast.Expr) []const u8 {
     };
 }
 
+
 test "bindHeaderParams: named + bare FROM HEADER, case-insensitive, missing skipped" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -767,4 +768,68 @@ test "serve integration: buffered accept and FROM HEADER over real HTTP" {
     drainPending(gpa, bs);
     const ev_out = try tmp.dir.readFileAlloc(a, "out_ev.csv", 1 << 20);
     try std.testing.expectEqualStrings("device_id,v\na,1\nb,2\n", ev_out);
+}
+
+// --- tests (pure routing/query logic — no server socket) --------------------
+
+test "findRoute matches exact paths only" {
+    const routes = [_]Route{
+        .{ .path = "/ingest", .program = .{ .stmts = &.{} }, .label = "a.bsl" },
+        .{ .path = "/ingest/v2", .program = .{ .stmts = &.{} }, .label = "b.bsl" },
+    };
+    try std.testing.expectEqualStrings("a.bsl", findRoute(&routes, "/ingest").?.label);
+    try std.testing.expectEqualStrings("b.bsl", findRoute(&routes, "/ingest/v2").?.label);
+    // no prefix or suffix matching — near-misses must 404
+    try std.testing.expect(findRoute(&routes, "/ingest/") == null);
+    try std.testing.expect(findRoute(&routes, "/inge") == null);
+    try std.testing.expect(findRoute(&routes, "/") == null);
+}
+
+test "parseQuery binds k=v pairs and skips malformed ones" {
+    const gpa = std.testing.allocator;
+    var params = std.array_list.Managed(runtime.ParamArg).init(gpa);
+    defer params.deinit();
+    try parseQuery(&params, "a=1&b=x%20y&novalue&&c=");
+    try std.testing.expectEqual(@as(usize, 3), params.items.len);
+    try std.testing.expectEqualStrings("a", params.items[0].key);
+    try std.testing.expectEqualStrings("1", params.items[0].val);
+    try std.testing.expectEqualStrings("x%20y", params.items[1].val); // no percent-decoding (yet)
+    try std.testing.expectEqualStrings("c", params.items[2].key);
+    try std.testing.expectEqualStrings("", params.items[2].val); // `c=` binds empty, `novalue` is dropped
+
+    params.clearRetainingCapacity();
+    try parseQuery(&params, "");
+    try std.testing.expectEqual(@as(usize, 0), params.items.len);
+}
+
+test "writeJsonStr escapes everything that would break the response body" {
+    var buf = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer buf.deinit();
+    try writeJsonStr(buf.writer(), "say \"hi\"\\\n\ttab\r");
+    try std.testing.expectEqualStrings("say \\\"hi\\\"\\\\\\n\\ttab\\r", buf.items);
+    buf.clearRetainingCapacity();
+    try writeJsonStr(buf.writer(), "ctrl:\x01");
+    try std.testing.expectEqualStrings("ctrl:\\u0001", buf.items);
+}
+
+test "httpPath/httpDoc read CREATE ENDPOINT config, with defaults" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a,
+        \\CREATE ENDPOINT '/events' DOC 'Ingest events';
+        \\LOAD INTO 'out.csv' AS SELECT * FROM BODY (id INT);
+    , &diag);
+    try std.testing.expectEqualStrings("/events", httpPath(prog));
+    try std.testing.expectEqualStrings("Ingest events", httpDoc(prog));
+
+    // bare endpoint: path from the literal, doc defaults to ""
+    const bare = try parser.parseSource(a,
+        \\CREATE ENDPOINT '/';
+        \\LOAD INTO 'out.csv' AS SELECT * FROM BODY (id INT);
+    , &diag);
+    try std.testing.expectEqualStrings("/", httpPath(bare));
+    try std.testing.expectEqualStrings("", httpDoc(bare));
 }

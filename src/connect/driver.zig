@@ -30,6 +30,24 @@ pub fn resetAbort() void {
     g_abort.store(false, .seq_cst);
 }
 
+/// Tune a freshly connected DB/data-movement socket. TCP_NODELAY: the drivers
+/// flush whole protocol messages (login exchanges, per-batch INSERTs, 4-32K
+/// bulk packets) and then wait for the reply — Nagle + delayed ACK stalls each
+/// exchange. SO_KEEPALIVE (with a 60s idle probe on Linux): multi-hour loads
+/// sit idle through NATs/LBs during slow server-side phases; dead peers should
+/// surface as an error, not a hang. Best-effort: tuning never fails a connect.
+pub fn tuneSocket(handle: std.posix.socket_t) void {
+    const one: c_int = 1;
+    std.posix.setsockopt(handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
+    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, std.mem.asBytes(&one)) catch {};
+    if (@import("builtin").os.tag == .linux) {
+        const idle: c_int = 60;
+        const intvl: c_int = 15;
+        std.posix.setsockopt(handle, std.posix.IPPROTO.TCP, std.os.linux.TCP.KEEPIDLE, std.mem.asBytes(&idle)) catch {};
+        std.posix.setsockopt(handle, std.posix.IPPROTO.TCP, std.os.linux.TCP.KEEPINTVL, std.mem.asBytes(&intvl)) catch {};
+    }
+}
+
 /// The socket-level transient set shared by the connector retry layers (sql
 /// reconnect loops, http in-place backoff). Run-level exit-code classification
 /// deliberately does NOT consume this set: names like WriteFailed/ReadFailed/

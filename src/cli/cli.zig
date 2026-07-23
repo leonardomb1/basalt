@@ -223,45 +223,28 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         } else if (std.mem.eql(u8, a, "--quiet") or std.mem.eql(u8, a, "-q")) {
             log.quiet = true;
         } else if (std.mem.eql(u8, a, "--log-format")) {
-            i += 1;
-            if (i >= args.len) {
-                try stderr.print("error: missing value after `--log-format`\n", .{});
-                return 2;
-            }
-            log.format = if (std.mem.eql(u8, args[i], "text")) .text else if (std.mem.eql(u8, args[i], "json")) .json else if (std.mem.eql(u8, args[i], "auto")) .auto else {
+            const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
+            log.format = if (std.mem.eql(u8, v, "text")) .text else if (std.mem.eql(u8, v, "json")) .json else if (std.mem.eql(u8, v, "auto")) .auto else {
                 try stderr.print("error: --log-format must be auto|text|json\n", .{});
                 return 2;
             };
         } else if (std.mem.eql(u8, a, "--log-level")) {
-            i += 1;
-            if (i >= args.len) {
-                try stderr.print("error: missing value after `--log-level`\n", .{});
-                return 2;
-            }
-            log.level = obs.Level.parse(args[i]) orelse {
+            const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
+            log.level = obs.Level.parse(v) orelse {
                 try stderr.print("error: --log-level must be error|warn|info|debug\n", .{});
                 return 2;
             };
         } else if (std.mem.eql(u8, a, "-p") or std.mem.eql(u8, a, "--param")) {
-            i += 1;
-            if (i >= args.len) {
-                try stderr.print("error: missing value after `{s}`\n", .{a});
-                return 2;
-            }
-            const kv = args[i];
+            const kv = (try nextVal(args, &i, a, stderr)) orelse return 2;
             const eqp = std.mem.indexOfScalar(u8, kv, '=') orelse {
                 try stderr.print("error: param must be key=value, got `{s}`\n", .{kv});
                 return 2;
             };
             try params.append(.{ .key = kv[0..eqp], .val = kv[eqp + 1 ..] });
         } else if (std.mem.eql(u8, a, "--port")) {
-            i += 1;
-            if (i >= args.len) {
-                try stderr.print("error: missing value after `--port`\n", .{});
-                return 2;
-            }
-            port = std.fmt.parseInt(u16, args[i], 10) catch {
-                try stderr.print("error: invalid --port `{s}`\n", .{args[i]});
+            const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
+            port = std.fmt.parseInt(u16, v, 10) catch {
+                try stderr.print("error: invalid --port `{s}`\n", .{v});
                 return 2;
             };
         }
@@ -345,13 +328,9 @@ fn cmdServe(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--port") or std.mem.eql(u8, args[i], "-p")) {
-            i += 1;
-            if (i >= args.len) {
-                try stderr.print("error: missing value after `--port`\n", .{});
-                return 2;
-            }
-            port = std.fmt.parseInt(u16, args[i], 10) catch {
-                try stderr.print("error: invalid --port `{s}`\n", .{args[i]});
+            const v = (try nextVal(args, &i, "--port", stderr)) orelse return 2;
+            port = std.fmt.parseInt(u16, v, 10) catch {
+                try stderr.print("error: invalid --port `{s}`\n", .{v});
                 return 2;
             };
         } else if (std.mem.eql(u8, args[i], "--watch") or std.mem.eql(u8, args[i], "-w")) {
@@ -511,6 +490,17 @@ fn replHelp(msg: *std.Io.Writer) !void {
     try msg.flush();
 }
 
+/// Advance past a flag to its value argument; null (after printing the
+/// `missing value` error) when the flag is the last argument.
+fn nextVal(args: [][:0]u8, i: *usize, flag: []const u8, stderr: *std.Io.Writer) !?[]const u8 {
+    i.* += 1;
+    if (i.* >= args.len) {
+        try stderr.print("error: missing value after `{s}`\n", .{flag});
+        return null;
+    }
+    return args[i.*];
+}
+
 /// Recognize the threads flag in all of `-j N`, `-jN`, `--threads N`,
 /// `--threads=N`, returning the value string (advancing `i` past a separate arg).
 fn threadFlagValue(a: []const u8, args: [][:0]u8, i: *usize) ?[]const u8 {
@@ -524,6 +514,96 @@ fn threadFlagValue(a: []const u8, args: [][:0]u8, i: *usize) ?[]const u8 {
     if (std.mem.startsWith(u8, a, "-j")) return a[2..];
     if (std.mem.startsWith(u8, a, "--threads=")) return a["--threads=".len..];
     return null;
+}
+
+// --- tests (pure argument/REPL-input parsing) --------------------------------
+
+/// Build a mutable argv ([][:0]u8) from string literals for flag-parsing tests.
+fn testArgv(arena: std.mem.Allocator, strs: []const []const u8) ![][:0]u8 {
+    const out = try arena.alloc([:0]u8, strs.len);
+    for (strs, 0..) |s, i| out[i] = try arena.dupeZ(u8, s);
+    return out;
+}
+
+test "threadFlagValue recognizes all four -j/--threads spellings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // separate value: `-j 4` and `--threads 4` advance the cursor past the value
+    var args = try testArgv(a, &.{ "-j", "4" });
+    var i: usize = 0;
+    try std.testing.expectEqualStrings("4", threadFlagValue(args[0], args, &i).?);
+    try std.testing.expectEqual(@as(usize, 1), i);
+    args = try testArgv(a, &.{ "--threads", "8" });
+    i = 0;
+    try std.testing.expectEqualStrings("8", threadFlagValue(args[0], args, &i).?);
+    try std.testing.expectEqual(@as(usize, 1), i);
+
+    // attached value: `-j16` and `--threads=2` leave the cursor alone
+    args = try testArgv(a, &.{"-j16"});
+    i = 0;
+    try std.testing.expectEqualStrings("16", threadFlagValue(args[0], args, &i).?);
+    try std.testing.expectEqual(@as(usize, 0), i);
+    args = try testArgv(a, &.{"--threads=2"});
+    i = 0;
+    try std.testing.expectEqualStrings("2", threadFlagValue(args[0], args, &i).?);
+
+    // trailing `-j` with no value yields "" (caller rejects it as invalid)
+    args = try testArgv(a, &.{"-j"});
+    i = 0;
+    try std.testing.expectEqualStrings("", threadFlagValue(args[0], args, &i).?);
+
+    // non-thread flags don't match (incl. -p, which also starts with '-')
+    args = try testArgv(a, &.{ "-p", "k=v" });
+    i = 0;
+    try std.testing.expect(threadFlagValue(args[0], args, &i) == null);
+    try std.testing.expectEqual(@as(usize, 0), i);
+}
+
+test "REPL input classification: blank, quit, help" {
+    try std.testing.expect(isBlank(""));
+    try std.testing.expect(isBlank(" \t\r\n"));
+    try std.testing.expect(!isBlank(" x "));
+    try std.testing.expect(isQuit("\\q"));
+    try std.testing.expect(isQuit("exit"));
+    try std.testing.expect(!isQuit("exit()"));
+    try std.testing.expect(isHelp("?"));
+    try std.testing.expect(isHelp("\\help"));
+    try std.testing.expect(!isHelp("help me"));
+}
+
+test "appendDisplaySinks adds `write stdout` only to sink-less pipelines" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const bare = try parser.parseSource(a,
+        \\SELECT * FROM 'in.csv' LIMIT 2;
+    , &diag);
+    const prepared = try appendDisplaySinks(a, bare);
+    var found = false;
+    for (prepared.stmts) |st| {
+        if (st != .output) continue;
+        found = true;
+        const stages = st.output.stages;
+        try std.testing.expect(stages[stages.len - 1].node == .write);
+        try std.testing.expectEqualStrings("stdout", stages[stages.len - 1].node.write.connector);
+    }
+    try std.testing.expect(found);
+
+    // a pipeline that already writes is left untouched
+    const sunk = try parser.parseSource(a,
+        \\LOAD INTO 'out.csv' AS SELECT * FROM 'in.csv';
+    , &diag);
+    const kept = try appendDisplaySinks(a, sunk);
+    for (kept.stmts, sunk.stmts) |st, orig| {
+        if (st != .output) continue;
+        const stages = st.output.stages;
+        try std.testing.expectEqualStrings("csv", stages[stages.len - 1].node.write.connector);
+        try std.testing.expectEqual(orig.output.stages.len, stages.len); // no stage appended
+    }
 }
 
 fn usage(w: anytype) !void {
