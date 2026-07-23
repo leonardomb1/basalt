@@ -168,7 +168,10 @@ pub const ReadForm = union(enum) {
     table: QualName,
     query: []const u8,
     path: []const u8,
-    request,
+    /// The HTTP request body as rows. Payload = the declared schema
+    /// (`FROM BODY (col TYPE [NOT NULL], ...)`, enforced at bind time), or
+    /// null to infer it from the first object (BSL `read request`).
+    request: ?[]const types.BodyCol,
 };
 
 pub const SelectItem = union(enum) {

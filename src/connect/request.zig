@@ -1,6 +1,9 @@
-//! `read request` — turns an HTTP request body (JSON) into rows. Accepts a JSON
-//! array of objects (or a single object), infers the schema from the first
-//! object, and materializes one batch. A `driver.Source`, like the others.
+//! `read request` / `FROM BODY` — turns an HTTP request body (JSON) into rows.
+//! Accepts a JSON array of objects (or a single object) and materializes one
+//! batch. With a DECLARED schema (`FROM BODY (col TYPE [NOT NULL], ...)`) the
+//! body is validated row by row — a violation is a permanent error naming the
+//! offending row/column (the server surfaces it as 422). Without one, the
+//! schema is inferred from the first object (BSL `read request`).
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -20,18 +23,34 @@ pub const RequestSource = struct {
     batch: Batch,
     yielded: bool = false,
 
-    pub fn open(gpa: std.mem.Allocator, body: []const u8) !*RequestSource {
+    /// `declared` is the `FROM BODY (...)` schema (null = infer). On
+    /// `error.BodySchemaViolation`, a human-readable reason naming the row and
+    /// column is allocated in `msg_arena` and stored in `msg_out`.
+    pub fn open(
+        gpa: std.mem.Allocator,
+        body: []const u8,
+        declared: ?[]const types.BodyCol,
+        msg_arena: std.mem.Allocator,
+        msg_out: *[]const u8,
+    ) !*RequestSource {
         const self = try gpa.create(RequestSource);
         self.* = .{ .gpa = gpa, .arena_inst = std.heap.ArenaAllocator.init(gpa), .schema = undefined, .batch = undefined };
         errdefer {
             self.arena_inst.deinit();
             gpa.destroy(self);
         }
-        try self.build(self.arena_inst.allocator(), body);
+        try self.build(self.arena_inst.allocator(), body, declared, msg_arena, msg_out);
         return self;
     }
 
-    fn build(self: *RequestSource, arena: std.mem.Allocator, body: []const u8) !void {
+    fn build(
+        self: *RequestSource,
+        arena: std.mem.Allocator,
+        body: []const u8,
+        declared: ?[]const types.BodyCol,
+        msg_arena: std.mem.Allocator,
+        msg_out: *[]const u8,
+    ) !void {
         const root = try json.parseFromSliceLeaky(json.Value, arena, body, .{});
         const items: []const json.Value = switch (root) {
             .array => |arr| arr.items,
@@ -43,7 +62,19 @@ pub const RequestSource = struct {
             else => return error.ExpectedJsonArrayOrObject,
         };
 
-        self.schema = try inferSchema(arena, items);
+        if (declared) |cols| {
+            try validateBody(items, cols, msg_arena, msg_out);
+            const fields = try arena.alloc(types.Schema.Field, cols.len);
+            for (cols, fields) |c, *f| f.* = .{
+                .name = try arena.dupe(u8, c.name),
+                .ty = if (c.not_null) c.ty else c.ty.asNullable(),
+            };
+            const schema = try arena.create(types.Schema);
+            schema.* = .{ .fields = fields };
+            self.schema = schema;
+        } else {
+            self.schema = try inferSchema(arena, items);
+        }
         self.batch = try batchFromJson(arena, self.schema, items);
     }
 
@@ -51,6 +82,70 @@ pub const RequestSource = struct {
         return .{ .ptr = self, .vtable = &source_vtable };
     }
 };
+
+/// Row-by-row check of a body against a declared schema: a required column
+/// that is missing/null, or a value the declared type can't read, fails the
+/// whole request with a message naming the first offending row.
+fn validateBody(
+    items: []const json.Value,
+    cols: []const types.BodyCol,
+    msg_arena: std.mem.Allocator,
+    msg_out: *[]const u8,
+) !void {
+    for (items, 0..) |row, i| {
+        if (row != .object) {
+            msg_out.* = try std.fmt.allocPrint(msg_arena, "body row {d} is not a JSON object", .{i});
+            return error.BodySchemaViolation;
+        }
+        const obj = row.object;
+        for (cols) |c| {
+            const jv = obj.get(c.name);
+            if (jv == null or jv.? == .null) {
+                if (c.not_null) {
+                    msg_out.* = try std.fmt.allocPrint(msg_arena, "body row {d}: required column `{s}` is missing or null", .{ i, c.name });
+                    return error.BodySchemaViolation;
+                }
+                continue;
+            }
+            if (!coercible(jv.?, c.ty.kind)) {
+                msg_out.* = try std.fmt.allocPrint(msg_arena, "body row {d}: column `{s}` cannot be read as {s}", .{ i, c.name, @tagName(c.ty.kind) });
+                return error.BodySchemaViolation;
+            }
+        }
+    }
+}
+
+/// Can this JSON value be read as the declared kind? (Mirrors `coerce`, which
+/// is lenient — validation is the strict pass that runs first.)
+fn coercible(v: json.Value, kind: types.TypeKind) bool {
+    return switch (kind) {
+        .int => switch (v) {
+            .integer, .bool => true,
+            .float => true,
+            .string => |s| blk: {
+                _ = std.fmt.parseInt(i64, s, 10) catch break :blk false;
+                break :blk true;
+            },
+            else => false,
+        },
+        .float => switch (v) {
+            .float, .integer => true,
+            .number_string, .string => |s| blk: {
+                _ = std.fmt.parseFloat(f64, s) catch break :blk false;
+                break :blk true;
+            },
+            else => false,
+        },
+        .bool => switch (v) {
+            .bool, .integer => true,
+            .string => true,
+            else => false,
+        },
+        // string / bytes / temporal / decimal / json: stored as text downstream
+        // (a CAST in the query does the strict conversion) — anything passes.
+        else => true,
+    };
+}
 
 /// Schema from the first object's keys and value types (int/float/bool/string,
 /// all nullable). Shared by `read request` and `read http`.
@@ -154,9 +249,10 @@ fn srcClose(ptr: *anyopaque) void {
 
 test "request source parses a JSON array of objects" {
     const gpa = std.testing.allocator;
+    var msg: []const u8 = "";
     var s = try RequestSource.open(gpa,
         \\[{"id":1,"name":"alice","ok":true},{"id":2,"name":"bob","ok":false}]
-    );
+    , null, std.testing.allocator, &msg);
     defer srcClose(s);
     try std.testing.expectEqual(@as(usize, 2), s.batch.len);
     try std.testing.expectEqualStrings("id", s.schema.fields[0].name);
@@ -165,4 +261,40 @@ test "request source parses a JSON array of objects" {
     try std.testing.expectEqual(@as(i64, 1), s.batch.columns[0].getValue(0).int);
     try std.testing.expectEqualStrings("bob", s.batch.columns[1].getValue(1).string);
     try std.testing.expect(s.batch.columns[2].getValue(0).bool);
+}
+
+test "declared body schema: column order, types, and enforcement" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const decl = [_]types.BodyCol{
+        .{ .name = "device_id", .ty = types.Type.init(.string), .not_null = true },
+        .{ .name = "value", .ty = types.Type.init(.int) },
+    };
+    var msg: []const u8 = "";
+
+    // Valid body: schema follows the declaration (order + types), extra keys drop.
+    var s = try RequestSource.open(gpa,
+        \\[{"value":7,"device_id":"a","extra":true},{"device_id":"b"}]
+    , &decl, a, &msg);
+    defer srcClose(s);
+    try std.testing.expectEqual(@as(usize, 2), s.schema.fields.len);
+    try std.testing.expectEqualStrings("device_id", s.schema.fields[0].name);
+    try std.testing.expectEqual(types.TypeKind.int, s.schema.fields[1].ty.kind);
+    try std.testing.expectEqual(@as(i64, 7), s.batch.columns[1].getValue(0).int);
+
+    // NOT NULL violation names the row and column.
+    try std.testing.expectError(error.BodySchemaViolation, RequestSource.open(gpa,
+        \\[{"device_id":"a"},{"value":3}]
+    , &decl, a, &msg));
+    try std.testing.expect(std.mem.indexOf(u8, msg, "row 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "device_id") != null);
+
+    // Type violation: "x" is not readable as int.
+    try std.testing.expectError(error.BodySchemaViolation, RequestSource.open(gpa,
+        \\[{"device_id":"a","value":"x"}]
+    , &decl, a, &msg));
+    try std.testing.expect(std.mem.indexOf(u8, msg, "value") != null);
 }

@@ -244,15 +244,13 @@ fn expandCall(cx: *Ctx, c: ast.Expr.Call, subst: ?*Subst, depth: usize) Error!*a
 }
 
 test "expansion preserves is_empty kind and match structure (via rebuildExpr)" {
-    const parser = @import("parser.zig");
+    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(a, "@batch\nread csv \"x\"\n" ++
-        "  | filter status is empty\n" ++
-        "  | select g = match status \"a\", \"b\" => \"y\" _ => \"z\" end\n" ++
-        "  | write stdout", &diag);
+    const prog = try parser.parseSource(a,
+        "SELECT CASE status WHEN 'a', 'b' THEN 'y' ELSE 'z' END AS g FROM 'x' WHERE status IS EMPTY;", &diag);
     var msg: []const u8 = "";
     const out = try expandProgram(a, prog, null, &msg);
     const stages = out.stmts[1].output.stages;
@@ -268,13 +266,13 @@ test "expansion preserves is_empty kind and match structure (via rebuildExpr)" {
 }
 
 test "expandProgram inlines a user fn and drops its declaration" {
-    const parser = @import("parser.zig");
+    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(a, "@batch\nfn empresa(t) = substr(t, 4, 2)\n" ++
-        "read csv \"x\" | select e = empresa(id) | write stdout", &diag);
+    const prog = try parser.parseSource(a, "CREATE FUNCTION empresa(t) AS substr(t, 4, 2);\n" ++
+        "SELECT empresa(id) AS e FROM 'x';", &diag);
     var msg: []const u8 = "";
     const out = try expandProgram(a, prog, null, &msg);
     // the `fn` declaration is dropped → stmts are [kind, output]
@@ -289,31 +287,31 @@ test "expandProgram inlines a user fn and drops its declaration" {
 }
 
 test "expandProgram rejects recursion and arity mismatch" {
-    const parser = @import("parser.zig");
+    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     var d1 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const p1 = try parser.parseSource(a, "@batch\nfn loopy(x) = loopy(x)\nread csv \"x\" | select y = loopy(id) | write stdout", &d1);
+    const p1 = try parser.parseSource(a, "CREATE FUNCTION loopy(x) AS loopy(x);\nSELECT loopy(id) AS y FROM 'x';", &d1);
     var m1: []const u8 = "";
     try std.testing.expectError(error.ExpandFailed, expandProgram(a, p1, null, &m1));
 
     var d2 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const p2 = try parser.parseSource(a, "@batch\nfn one(b) = b\nread csv \"x\" | select y = one(id, status) | write stdout", &d2);
+    const p2 = try parser.parseSource(a, "CREATE FUNCTION one(b) AS b;\nSELECT one(id, status) AS y FROM 'x';", &d2);
     var m2: []const u8 = "";
     try std.testing.expectError(error.ExpandFailed, expandProgram(a, p2, null, &m2));
 }
 
 test "expandProgram inlines `let … in` away (single-use binding)" {
-    const parser = @import("parser.zig");
+    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    // `let d = id + 1 in d * d` -> `(id + 1) * (id + 1)`: a `binary` mul whose
+    // `LET d = id + 1 IN d * d` -> `(id + 1) * (id + 1)`: a `binary` mul whose
     // operands are both the substituted value, with no `let_in` node left.
-    const prog = try parser.parseSource(a, "@batch\n" ++
-        "read csv \"x\" | select v = let d = id + 1 in d * d | write stdout", &diag);
+    const prog = try parser.parseSource(a,
+        "SELECT LET d = id + 1 IN d * d AS v FROM 'x';", &diag);
     var msg: []const u8 = "";
     const out = try expandProgram(a, prog, null, &msg);
     const e = outputSelect(out)[0].computed.expr;
@@ -329,13 +327,13 @@ fn outputSelect(prog: ast.Program) []const ast.SelectItem {
 }
 
 test "expandProgram substitutes JSON-param path access from the body" {
-    const parser = @import("parser.zig");
+    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(a, "@batch\nparam job json from body\n" ++
-        "read csv \"x\" | select h = job.source.host, n = job.n | write stdout", &diag);
+    const prog = try parser.parseSource(a, "PARAM job JSON FROM BODY;\n" ++
+        "SELECT $job.source.host AS h, $job.n AS n FROM 'x';", &diag);
     var msg: []const u8 = "";
     const out = try expandProgram(a, prog, "{\"source\":{\"host\":\"142.0.65.89\"},\"n\":7}", &msg);
     const sel = outputSelect(out);
@@ -346,43 +344,43 @@ test "expandProgram substitutes JSON-param path access from the body" {
 }
 
 test "?. safe navigation: a missing intermediate resolves to null instead of erroring" {
-    const parser = @import("parser.zig");
+    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
 
-    // `job?.source.host` over a body lacking `source`: the `?.` tolerates the miss.
+    // `$job?.source.host` over a body lacking `source`: the `?.` tolerates the miss.
     var d1 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const p1 = try parser.parseSource(a, "@batch\nparam job json from body\n" ++
-        "read csv \"x\" | select h = job?.source.host | write stdout", &d1);
+    const p1 = try parser.parseSource(a, "PARAM job JSON FROM BODY;\n" ++
+        "SELECT $job?.source.host AS h FROM 'x';", &d1);
     var m1: []const u8 = "";
     const o1 = try expandProgram(a, p1, "{\"other\":1}", &m1);
     try std.testing.expect(outputSelect(o1)[0].computed.expr.* == .null_lit);
 
-    // `job.source?.host`: source present, host missing under `?.` → null.
+    // `$job.source?.host`: source present, host missing under `?.` → null.
     var d2 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const p2 = try parser.parseSource(a, "@batch\nparam job json from body\n" ++
-        "read csv \"x\" | select h = job.source?.host | write stdout", &d2);
+    const p2 = try parser.parseSource(a, "PARAM job JSON FROM BODY;\n" ++
+        "SELECT $job.source?.host AS h FROM 'x';", &d2);
     var m2: []const u8 = "";
     const o2 = try expandProgram(a, p2, "{\"source\":{\"x\":1}}", &m2);
     try std.testing.expect(outputSelect(o2)[0].computed.expr.* == .null_lit);
 
     // The same miss with a plain `.` is still a hard error.
     var d3 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const p3 = try parser.parseSource(a, "@batch\nparam job json from body\n" ++
-        "read csv \"x\" | select h = job.source.host | write stdout", &d3);
+    const p3 = try parser.parseSource(a, "PARAM job JSON FROM BODY;\n" ++
+        "SELECT $job.source.host AS h FROM 'x';", &d3);
     var m3: []const u8 = "";
     try std.testing.expectError(error.ExpandFailed, expandProgram(a, p3, "{\"other\":1}", &m3));
 }
 
 test "expandProgram leaves JSON paths null when unbound (offline check)" {
-    const parser = @import("parser.zig");
+    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(a, "@batch\nparam job json from body\n" ++
-        "read csv \"x\" | select h = job.source.host | write stdout", &diag);
+    const prog = try parser.parseSource(a, "PARAM job JSON FROM BODY;\n" ++
+        "SELECT $job.source.host AS h FROM 'x';", &diag);
     var msg: []const u8 = "";
     const out = try expandProgram(a, prog, null, &msg);
     try std.testing.expect(outputSelect(out)[0].computed.expr.* == .null_lit);

@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
-const parser = @import("../lang/parser.zig");
+const parser = @import("../lang/sql_parser.zig");
 const runtime = @import("../runtime/run.zig");
 
 pub const Route = struct { path: []const u8, program: ast.Program, label: []const u8, doc: []const u8 = "" };
@@ -79,7 +79,7 @@ const Registry = struct {
     }
 };
 
-/// Parse every `*.bsl` `@http` script in `dir_path` into a route table. Non-`@http`
+/// Parse every `*.sql` `CREATE ENDPOINT` script in `dir_path` into a route table. Non-endpoint
 /// scripts and parse failures are skipped (logged), so one bad file doesn't take
 /// down the rest of the fleet.
 fn loadDir(gpa: std.mem.Allocator, dir_path: []const u8) !Registry {
@@ -92,7 +92,7 @@ fn loadDir(gpa: std.mem.Allocator, dir_path: []const u8) !Registry {
     defer dir.close();
     var it = dir.iterate();
     while (try it.next()) |entry| {
-        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".bsl")) continue;
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".sql")) continue;
         const text = dir.readFileAlloc(a, entry.name, 8 << 20) catch |e| {
             std.debug.print("skip {s}: read failed: {s}\n", .{ entry.name, @errorName(e) });
             continue;
@@ -123,7 +123,7 @@ fn loadDir(gpa: std.mem.Allocator, dir_path: []const u8) !Registry {
     return .{ .arena = arena, .routes = try routes.toOwnedSlice() };
 }
 
-/// A cheap content fingerprint of the `.bsl` files in `dir_path` (name + mtime +
+/// A cheap content fingerprint of the `.sql` files in `dir_path` (name + mtime +
 /// size). Changes when a script is added, removed, or edited — including when a
 /// git-sync `current` symlink repoints to a fresh checkout. 0 on error.
 fn dirFingerprint(dir_path: []const u8) u64 {
@@ -132,7 +132,7 @@ fn dirFingerprint(dir_path: []const u8) u64 {
     defer dir.close();
     var it = dir.iterate();
     while (it.next() catch null) |e| {
-        if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".bsl")) continue;
+        if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".sql")) continue;
         const st = dir.statFile(e.name) catch continue;
         for (e.name) |c| fp = (fp ^ c) *% 0x100000001b3;
         fp = (fp ^ @as(u64, @truncate(@as(u128, @bitCast(st.mtime))))) *% 0x100000001b3;
@@ -263,7 +263,10 @@ fn handleConn(gpa: std.mem.Allocator, routes: []const Route, conn: std.net.Serve
             }
         } else |err| {
             const transient = diag.retryable or runtime.isTransient(err);
-            status = if (transient) .service_unavailable else .internal_server_error;
+            // Status contract (migration.md §9): permanent failures (bad script /
+            // rejected data — the batch exit-1 class) are the caller's to fix, so
+            // 422, not 500; transient ones map to 503 + Retry-After.
+            status = if (transient) .service_unavailable else .unprocessable_entity;
             retry_after = transient;
             try w.print("{{\"status\":\"error\",\"retryable\":{},\"error\":\"", .{transient});
             try writeJsonStr(w, @errorName(err));

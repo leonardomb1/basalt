@@ -113,6 +113,12 @@ pub const Type = struct {
 };
 
 /// An ordered set of named, typed columns — the schema flowing between operators.
+/// A declared request-body column — `FROM BODY (name TYPE [NOT NULL], ...)`.
+/// Carried on `ast.ReadForm.request`; the request source enforces it at bind
+/// time (a violating row is a permanent error naming the row). Lives here so
+/// the connect layer doesn't need the AST.
+pub const BodyCol = struct { name: []const u8, ty: Type, not_null: bool = false };
+
 pub const Schema = struct {
     fields: []const Field,
 

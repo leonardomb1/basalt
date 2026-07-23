@@ -1,0 +1,17 @@
+# Throwaway Postgres for local extraction targets.
+#   docker compose -f docker-compose.postgres.yml up -d
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: basalt_pg
+    environment:
+      POSTGRES_USER: basalt
+      POSTGRES_PASSWORD: basalt
+      POSTGRES_DB: bronze
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U basalt -d bronze"]
+      interval: 3s
+      timeout: 3s
+      retries: 20

@@ -646,7 +646,7 @@ fn lastPart(q: ast.QualName) []const u8 {
 // Tests
 // ---------------------------------------------------------------------------
 
-const parser = @import("../lang/parser.zig");
+const parser = @import("../lang/sql_parser.zig");
 
 fn parse(a: std.mem.Allocator, src: []const u8) !ast.Program {
     var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
@@ -664,7 +664,7 @@ test "analyze a CSV map pipeline: structure, offline schema, physical" {
     const in = try std.fs.path.join(a, &.{ base, "in.csv" });
 
     const src = try std.fmt.allocPrint(a,
-        "@batch\nread csv \"{s}\"\n  | filter cast(amount as int) >= 50\n  | select id\n  | write csv \"/tmp/x.csv\"",
+        "LOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}' WHERE CAST(amount AS INT) >= 50;",
         .{in},
     );
     const prog = try parse(a, src);
@@ -689,12 +689,10 @@ test "analyze a SQL table pipeline: unresolved schema offline, split candidate" 
     defer ar.deinit();
     const a = ar.allocator();
     const prog = try parse(a,
-        \\@batch
-        \\connection pg = postgres
-        \\  host = "h"  user = "u"  password = "p"  database = "d"
-        \\read pg table orders
-        \\  | filter amount > 0
-        \\  | write csv "/tmp/x.csv"
+        \\CREATE CONNECTION pg TYPE postgres OPTIONS (
+        \\  host = 'h', user = 'u', password = 'p', database = 'd'
+        \\);
+        \\LOAD INTO '/tmp/x.csv' AS SELECT * FROM pg.orders WHERE amount > 0;
     );
     var diag = Diag{};
     const plan = try analyze(a, prog, null, &diag);
@@ -713,7 +711,7 @@ test "type flow fills out_schema for resolved sources" {
     try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,amount\n1,100\n" });
     const base = try tmp.dir.realpathAlloc(a, ".");
     const in = try std.fs.path.join(a, &.{ base, "in.csv" });
-    const src = try std.fmt.allocPrint(a, "@batch\nread csv \"{s}\"\n  | select id, d = cast(amount as int) * 2\n  | write csv \"/tmp/x.csv\"", .{in});
+    const src = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS SELECT id, CAST(amount AS INT) * 2 AS d FROM '{s}';", .{in});
     var diag = Diag{};
     const plan = try analyze(a, try parse(a, src), null, &diag);
     const sel = plan.outputs[0].stages[0];
@@ -731,8 +729,8 @@ test "type flow catches a type error in an expression" {
     try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,name\n1,x\n" });
     const base = try tmp.dir.realpathAlloc(a, ".");
     const in = try std.fs.path.join(a, &.{ base, "in.csv" });
-    // `not name` — `not` on a non-bool string is a type error, caught offline (CSV).
-    const src = try std.fmt.allocPrint(a, "@batch\nread csv \"{s}\"\n  | filter not name\n  | write csv \"/tmp/x.csv\"", .{in});
+    // `NOT name` — `not` on a non-bool string is a type error, caught offline (CSV).
+    const src = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS SELECT * FROM '{s}' WHERE NOT name;", .{in});
     var diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, src), null, &diag));
 }
@@ -741,20 +739,22 @@ test "analyze rejects unknown connection" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const prog = try parse(a, "@batch\nread nope table t | write csv \"/tmp/x.csv\"");
+    const prog = try parse(a, "LOAD INTO '/tmp/x.csv' AS SELECT * FROM nope.t;");
     var diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, prog, null, &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "unknown connection") != null);
 }
 
-/// Analyze `read csv <2-col data> | <stage>` offline and expect a type/plan error.
-fn expectAnalyzeErr(a: std.mem.Allocator, csv_data: []const u8, stage: []const u8) !void {
+/// Analyze `LOAD INTO ... AS <query over a 2-col CSV>` offline and expect a
+/// type/plan error. `$IN` in the query is the input CSV's path.
+fn expectAnalyzeErr(a: std.mem.Allocator, csv_data: []const u8, query: []const u8) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = csv_data });
     const base = try tmp.dir.realpathAlloc(a, ".");
     const in = try std.fs.path.join(a, &.{ base, "in.csv" });
-    const src = try std.fmt.allocPrint(a, "@batch\nread csv \"{s}\"\n  | {s}\n  | write csv \"/tmp/x.csv\"", .{ in, stage });
+    const q = try std.mem.replaceOwned(u8, a, query, "$IN", in);
+    const src = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS {s};", .{q});
     var diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, src), null, &diag));
 }
@@ -763,19 +763,19 @@ test "analyze rejects `* rename` onto a duplicate column name" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     // renaming `id` onto the existing `name` column would emit two `name` columns
-    try expectAnalyzeErr(ar.allocator(), "id,name\n1,x\n", "select * rename (id as name)");
+    try expectAnalyzeErr(ar.allocator(), "id,name\n1,x\n", "SELECT * RENAME (id AS name) FROM '$IN'");
 }
 
 test "analyze rejects `is empty` on a non-string operand" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     // cast(amount as int) is an int — `is empty` only makes sense for strings
-    try expectAnalyzeErr(ar.allocator(), "id,amount\n1,100\n", "filter cast(amount as int) is empty");
+    try expectAnalyzeErr(ar.allocator(), "id,amount\n1,100\n", "SELECT * FROM '$IN' WHERE CAST(amount AS INT) IS EMPTY");
 }
 
 test "analyze rejects `?.` safe navigation on a plain column reference" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     // `?.` is only for JSON-param paths; on a real column it must be an error, not a no-op
-    try expectAnalyzeErr(ar.allocator(), "id,name\n1,x\n", "select v = name?.foo");
+    try expectAnalyzeErr(ar.allocator(), "id,name\n1,x\n", "SELECT name?.foo AS v FROM '$IN'");
 }
