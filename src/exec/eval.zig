@@ -1654,7 +1654,7 @@ test "constEval folds an expression over plan-time bindings" {
     try std.testing.expectEqualStrings("01", e.string);
 }
 
-const parser = @import("../lang/parser.zig");
+const parser = @import("../lang/sql_parser.zig");
 
 test "type-check and evaluate an if-expression with 3VL" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1662,15 +1662,8 @@ test "type-check and evaluate an if-expression with 3VL" {
     const a = ar.allocator();
 
     var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(a,
-        \\@batch
-        \\read x query "q"
-        \\  | filter amount > 100
-        \\  | select big = if(amount >= 100, "yes", "no")
-    , &diag);
-    const stages = prog.stmts[1].output.stages;
-    const pred = stages[1].node.filter;
-    const sel = stages[2].node.select[0].computed.expr;
+    const pred = try parser.parseExprStr(a, "amount > 100", &diag);
+    const sel = try parser.parseExprStr(a, "if(amount >= 100, 'yes', 'no')", &diag);
 
     const schema = types.Schema{ .fields = &.{.{ .name = "amount", .ty = Type.init(.int).asNullable() }} };
     var ctx = TypeCtx{ .schema = schema, .arena = a };
@@ -1721,10 +1714,8 @@ test "vectorized kernels match the rowwise evaluator" {
         "x == 0 or y / x > 1",
     };
     for (exprs) |body| {
-        const src = try std.fmt.allocPrint(a, "@batch\nread t query \"q\" | select r = {s}", .{body});
         var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const prog = try parser.parseSource(a, src, &diag);
-        const e = prog.stmts[1].output.stages[1].node.select[0].computed.expr;
+        const e = try parser.parseExprStr(a, body, &diag);
         var ctx = TypeCtx{ .schema = schema, .arena = a };
         const ty = try ctx.typeOf(e);
 
@@ -1782,10 +1773,8 @@ test "vectorized string kernels match the rowwise evaluator" {
         "length(trim(s)) > 5 and contains(s, \"e\")",
     };
     for (exprs) |body| {
-        const src = try std.fmt.allocPrint(a, "@batch\nread t query \"q\" | select r = {s}", .{body});
         var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const prog = try parser.parseSource(a, src, &diag);
-        const e = prog.stmts[1].output.stages[1].node.select[0].computed.expr;
+        const e = try parser.parseExprStr(a, body, &diag);
         var ctx = TypeCtx{ .schema = schema, .arena = a };
         const ty = try ctx.typeOf(e);
 
@@ -1820,8 +1809,7 @@ test "type errors: unknown field and non-bool not" {
     const schema = types.Schema{ .fields = &.{.{ .name = "x", .ty = Type.init(.int) }} };
 
     var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(a, "@batch\nread t query \"q\" | filter missing > 1", &diag);
-    const pred = prog.stmts[1].output.stages[1].node.filter;
+    const pred = try parser.parseExprStr(a, "missing > 1", &diag);
     var ctx = TypeCtx{ .schema = schema, .arena = a };
     try std.testing.expectError(error.TypeError, ctx.typeOf(pred));
     try std.testing.expect(std.mem.indexOf(u8, ctx.msg, "unknown field") != null);

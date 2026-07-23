@@ -2085,7 +2085,7 @@ fn renderRead(arena: std.mem.Allocator, rd: ast.Read, lr: LoopRow) !ast.Read {
         .table => |q| .{ .table = try renderQual(arena, q, lr) },
         .query => |s| .{ .query = try interpAll(arena, s, lr) },
         .path => |s| .{ .path = try interpAll(arena, s, lr) },
-        .request => .request,
+        .request => |d| .{ .request = d },
     }, .where = try interpAll(arena, rd.where, lr) };
 }
 
@@ -2859,8 +2859,13 @@ fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
     if (std.mem.eql(u8, rd.connector, "request")) {
         const body = env.request_body orelse
             return planErr(env.diag, "`read request` is only available when serving HTTP (@http)");
-        const s = request.RequestSource.open(env.gpa, body) catch |e|
+        const declared: ?[]const types.BodyCol = if (rd.form == .request) rd.form.request else null;
+        var reject: []const u8 = "";
+        const s = request.RequestSource.open(env.gpa, body, declared, env.arena, &reject) catch |e| {
+            if (e == error.BodySchemaViolation)
+                return planErr(env.diag, try std.fmt.allocPrint(env.arena, "request body rejected: {s}", .{reject}));
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "could not parse request body as JSON: {s}", .{@errorName(e)}));
+        };
         return s.source();
     }
     if (std.mem.eql(u8, rd.connector, "http")) {
@@ -3476,14 +3481,15 @@ fn schemaPtr(arena: std.mem.Allocator, schema: types.Schema) !*types.Schema {
 // Tests
 // ---------------------------------------------------------------------------
 
-const parser = @import("../lang/parser.zig");
+const parser = @import("../lang/sql_parser.zig");
 
-/// Run `@batch read csv | <body> | write csv` over `input`, returning the output.
-fn runToString(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []const u8, body: []const u8) ![]u8 {
-    return runToStringP(alloc, tmp, input, body, &[_]ParamArg{});
+/// Run `LOAD INTO out.csv AS <query>` over `input`. `$IN` in the query is
+/// replaced with the input CSV's path.
+fn runToString(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []const u8, query: []const u8) ![]u8 {
+    return runToStringP(alloc, tmp, input, query, &[_]ParamArg{});
 }
 
-fn runToStringP(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []const u8, body: []const u8, cli_params: []const ParamArg) ![]u8 {
+fn runToStringP(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []const u8, query: []const u8, cli_params: []const ParamArg) ![]u8 {
     try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = input });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
@@ -3492,10 +3498,9 @@ fn runToStringP(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []con
     const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
     defer alloc.free(out_path);
 
-    const script = try std.fmt.allocPrint(alloc,
-        "@batch\nread csv \"{s}\"\n{s}\n  | write csv \"{s}\"",
-        .{ in_path, body, out_path },
-    );
+    const q = try std.mem.replaceOwned(u8, alloc, query, "$IN", in_path);
+    defer alloc.free(q);
+    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS {s};", .{ out_path, q });
     defer alloc.free(script);
 
     var parena = std.heap.ArenaAllocator.init(alloc);
@@ -3517,7 +3522,7 @@ test "CSV -> filter/select -> CSV round-trips" {
     defer tmp.cleanup();
     const out = try runToString(alloc, &tmp,
         "id,status,amount\n1,paid,100\n2,pending,50\n3,paid,200\n",
-        "  | filter status == \"paid\"\n  | select id, amount",
+        "SELECT id, amount FROM '$IN' WHERE status = 'paid'",
     );
     defer alloc.free(out);
     try std.testing.expectEqualStrings("id,amount\n1,100\n3,200\n", out);
@@ -3529,7 +3534,7 @@ test "aggregate: count and sum by group (nulls skipped)" {
     defer tmp.cleanup();
     const out = try runToString(alloc, &tmp,
         "status,amount\npaid,100\npending,50\npaid,200\npaid,\n",
-        "  | aggregate n = count(), total = sum(cast(amount as int)) by status",
+        "SELECT status, COUNT(*) AS n, SUM(CAST(amount AS INT)) AS total FROM '$IN' GROUP BY status",
     );
     defer alloc.free(out);
     try std.testing.expectEqualStrings("status,n,total\npaid,3,300\npending,1,50\n", out);
@@ -3541,7 +3546,7 @@ test "sort: numeric desc, nulls last" {
     defer tmp.cleanup();
     const out = try runToString(alloc, &tmp,
         "id,amount\n1,100\n2,\n3,200\n",
-        "  | select id, amt = cast(amount as int)\n  | sort amt desc",
+        "SELECT id, CAST(amount AS INT) AS amt FROM '$IN' ORDER BY amt DESC",
     );
     defer alloc.free(out);
     try std.testing.expectEqualStrings("id,amt\n3,200\n1,100\n2,\n", out);
@@ -3554,7 +3559,7 @@ test "aggregate: group by a numeric (int) key (value-keyed hashing)" {
     // group by a computed int column — exercises the numeric value-key path
     const out = try runToString(alloc, &tmp,
         "id,n\n1,5\n2,5\n3,7\n4,5\n",
-        "  | select g = cast(n as int)\n  | aggregate c = count() by g\n  | sort g asc",
+        "SELECT CAST(n AS INT) AS g, COUNT(*) AS c FROM '$IN' GROUP BY g ORDER BY g ASC",
     );
     defer alloc.free(out);
     try std.testing.expectEqualStrings("g,c\n5,3\n7,1\n", out);
@@ -3563,7 +3568,7 @@ test "aggregate: group by a numeric (int) key (value-keyed hashing)" {
 /// Run `read csv | <body> | write csv` with an explicit thread count, returning
 /// out.csv. Used to exercise the parallel CSV-aggregate path (`threads > 1`), which
 /// the default in-process harness (`threads = 1`) never reaches.
-fn runCsvThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []const u8, body: []const u8, threads: usize) ![]u8 {
+fn runCsvThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []const u8, query: []const u8, threads: usize) ![]u8 {
     try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = input });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
@@ -3571,7 +3576,9 @@ fn runCsvThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []c
     defer alloc.free(in_path);
     const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
     defer alloc.free(out_path);
-    const script = try std.fmt.allocPrint(alloc, "@batch\nread csv \"{s}\"\n{s}\n  | write csv \"{s}\"", .{ in_path, body, out_path });
+    const q = try std.mem.replaceOwned(u8, alloc, query, "$IN", in_path);
+    defer alloc.free(q);
+    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS {s};", .{ out_path, q });
     defer alloc.free(script);
     var parena = std.heap.ArenaAllocator.init(alloc);
     defer parena.deinit();
@@ -3590,7 +3597,7 @@ test "parallel CSV aggregate: global agg (threads>1) matches serial" {
     const input = "id,v\n1,10\n2,20\n3,30\n4,40\n5,50\n";
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const par = try runCsvThreaded(alloc, &tmp, input, "  | aggregate n = count(), s = sum(cast(v as int))", 4);
+    const par = try runCsvThreaded(alloc, &tmp, input, "SELECT COUNT(*) AS n, SUM(CAST(v AS INT)) AS s FROM '$IN'", 4);
     defer alloc.free(par);
     try std.testing.expectEqualStrings("n,s\n5,150\n", par);
 }
@@ -3602,7 +3609,7 @@ test "parallel CSV aggregate: filter/select prefix + sort/limit tail (threads>1)
     defer tmp.cleanup();
     // prefix (filter+select) folds in parallel; tail (sort) runs on the merged result
     const out = try runCsvThreaded(alloc, &tmp, input,
-        "  | filter cast(v as int) > 6\n  | select g, v2 = cast(v as int)\n  | aggregate s = sum(v2) by g\n  | sort g asc",
+        "SELECT g, SUM(CAST(v AS INT)) AS s FROM '$IN' WHERE CAST(v AS INT) > 6 GROUP BY g ORDER BY g ASC",
         4);
     defer alloc.free(out);
     try std.testing.expectEqualStrings("g,s\na,90\nb,20\n", out); // a:10+30+50, b:20 (5 filtered out)
@@ -3615,7 +3622,7 @@ test "parallel CSV distinct (threads>1): dedups across chunks" {
     defer tmp.cleanup();
     // sort tail makes the (otherwise reordered) parallel output deterministic
     const out = try runCsvThreaded(alloc, &tmp, input,
-        "  | select g\n  | distinct on g\n  | sort g asc",
+        "SELECT DISTINCT g FROM '$IN' ORDER BY g ASC",
         4);
     defer alloc.free(out);
     try std.testing.expectEqualStrings("g\na\nb\nc\n", out);
@@ -3628,7 +3635,7 @@ test "parallel CSV Top-N: sort | limit (threads>1) matches serial" {
     defer tmp.cleanup();
     // per-worker top-K heaps merged into a global Top-N; output is sorted (deterministic)
     const out = try runCsvThreaded(alloc, &tmp, input,
-        "  | select id, v = cast(v as int)\n  | sort v desc, id asc\n  | limit 3",
+        "SELECT id, CAST(v AS INT) AS v FROM '$IN' ORDER BY v DESC, id ASC LIMIT 3",
         4);
     defer alloc.free(out);
     try std.testing.expectEqualStrings("id,v\n4,50\n2,40\n5,30\n", out);
@@ -3640,7 +3647,7 @@ test "parallel CSV aggregate: grouped agg (threads>1) merges partials by key" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     // Merge order across worker partials is nondeterministic, so check the row SET.
-    const par = try runCsvThreaded(alloc, &tmp, input, "  | aggregate s = sum(cast(v as int)) by g", 4);
+    const par = try runCsvThreaded(alloc, &tmp, input, "SELECT g, SUM(CAST(v AS INT)) AS s FROM '$IN' GROUP BY g", 4);
     defer alloc.free(par);
     try std.testing.expect(std.mem.startsWith(u8, par, "g,s\n"));
     try std.testing.expect(std.mem.indexOf(u8, par, "a,90\n") != null); // 10+30+50
@@ -3654,7 +3661,7 @@ test "distinct: multi-column key (value-keyed)" {
     defer tmp.cleanup();
     const out = try runToString(alloc, &tmp,
         "a,b\nx,1\nx,1\nx,2\ny,1\n",
-        "  | distinct on a, b",
+        "SELECT DISTINCT ON (a, b) * FROM '$IN'",
     );
     defer alloc.free(out);
     try std.testing.expectEqualStrings("a,b\nx,1\nx,2\ny,1\n", out);
@@ -3666,7 +3673,7 @@ test "top-N: sort | limit fuses to the K largest, in order" {
     defer tmp.cleanup();
     const out = try runToString(alloc, &tmp,
         "id,amount\n1,100\n2,50\n3,200\n4,\n5,150\n",
-        "  | select id, amt = cast(amount as int)\n  | sort amt desc\n  | limit 2",
+        "SELECT id, CAST(amount AS INT) AS amt FROM '$IN' ORDER BY amt DESC LIMIT 2",
     );
     defer alloc.free(out);
     try std.testing.expectEqualStrings("id,amt\n3,200\n5,150\n", out);
@@ -3678,7 +3685,7 @@ test "top-N: offset skips before taking" {
     defer tmp.cleanup();
     const out = try runToString(alloc, &tmp,
         "id,amount\n1,100\n2,50\n3,200\n4,\n5,150\n",
-        "  | select id, amt = cast(amount as int)\n  | sort amt desc\n  | limit 2 offset 1",
+        "SELECT id, CAST(amount AS INT) AS amt FROM '$IN' ORDER BY amt DESC LIMIT 2 OFFSET 1",
     );
     defer alloc.free(out);
     try std.testing.expectEqualStrings("id,amt\n5,150\n1,100\n", out);
@@ -3691,7 +3698,7 @@ test "top-N: nulls sort last, matching a full sort | limit-all" {
     // limit covering all rows must reproduce the plain-sort order (nulls last)
     const out = try runToString(alloc, &tmp,
         "id,amount\n1,100\n2,50\n3,200\n4,\n5,150\n",
-        "  | select id, amt = cast(amount as int)\n  | sort amt desc\n  | limit 99",
+        "SELECT id, CAST(amount AS INT) AS amt FROM '$IN' ORDER BY amt DESC LIMIT 99",
     );
     defer alloc.free(out);
     try std.testing.expectEqualStrings("id,amt\n3,200\n5,150\n1,100\n2,50\n4,\n", out);
@@ -3703,7 +3710,7 @@ test "distinct keeps first row per key" {
     defer tmp.cleanup();
     const out = try runToString(alloc, &tmp,
         "status,amount\npaid,100\npending,50\npaid,200\n",
-        "  | distinct on status",
+        "SELECT DISTINCT ON (status) * FROM '$IN'",
     );
     defer alloc.free(out);
     try std.testing.expectEqualStrings("status,amount\npaid,100\npending,50\n", out);
@@ -3724,9 +3731,10 @@ test "for-each over a JSON array param iterates and binds fields by name" {
     // Job spec body: one table entry whose `name` field is the input path.
     const body = try std.fmt.allocPrint(alloc, "{{\"tables\":[{{\"name\":\"{s}\"}}]}}", .{in_path});
     defer alloc.free(body);
-    const script = try std.fmt.allocPrint(alloc, "@batch\nparam job json from body\n" ++
-        "for name in job.tables @[mode = sequential]\n" ++
-        "  read csv \"${{name}}\" | select id | write csv \"{s}\"", .{out_path});
+    const script = try std.fmt.allocPrint(alloc, "PARAM job JSON FROM BODY;\n" ++
+        "FOR EACH ROW OF ($job.tables) AS (name) SEQUENTIAL\n" ++
+        "  LOAD INTO '{s}' AS SELECT id FROM '${{name}}';\n" ++
+        "END FOR;", .{out_path});
     defer alloc.free(script);
 
     var parena = std.heap.ArenaAllocator.init(alloc);
@@ -3758,9 +3766,10 @@ test "for-each loop var interpolates into a select column value" {
     const body = try std.fmt.allocPrint(alloc, "{{\"tables\":[{{\"name\":\"{s}\",\"emp\":\"01\"}}]}}", .{in_path});
     defer alloc.free(body);
     // `${emp}` flows into a computed select column VALUE (the new capability).
-    const script = try std.fmt.allocPrint(alloc, "@batch\nparam job json from body\n" ++
-        "for name, emp in job.tables @[mode = sequential]\n" ++
-        "  read csv \"${{name}}\" | select id, EMPRESA = \"${{emp}}\" | write csv \"{s}\"", .{out_path});
+    const script = try std.fmt.allocPrint(alloc, "PARAM job JSON FROM BODY;\n" ++
+        "FOR EACH ROW OF ($job.tables) AS (name, emp) SEQUENTIAL\n" ++
+        "  LOAD INTO '{s}' AS SELECT id, '${{emp}}' AS EMPRESA FROM '${{name}}';\n" ++
+        "END FOR;", .{out_path});
     defer alloc.free(script);
 
     var parena = std.heap.ArenaAllocator.init(alloc);
@@ -3863,8 +3872,8 @@ test "param substitution filters by a CLI-bound value" {
     defer alloc.free(out_path);
 
     const script = try std.fmt.allocPrint(alloc,
-        "@batch\nparam min int = 0\nread csv \"{s}\"\n  | filter cast(amount as int) >= min\n  | select id\n  | write csv \"{s}\"",
-        .{ in_path, out_path },
+        "PARAM min INT DEFAULT 0;\nLOAD INTO '{s}' AS SELECT id FROM '{s}' WHERE CAST(amount AS INT) >= $min;",
+        .{ out_path, in_path },
     );
     defer alloc.free(script);
 
@@ -3879,7 +3888,7 @@ test "explode splits a delimited column into rows" {
     defer tmp.cleanup();
     const out = try runToString(alloc, &tmp,
         "id,tags\n1,\"a,b,c\"\n2,x\n3,\n",
-        "  | explode tags as tag",
+        "SELECT * FROM '$IN' CROSS JOIN UNNEST(tags) AS tag",
     );
     defer alloc.free(out);
     // row 1 -> 3 rows; row 2 -> 1 row; row 3 (null) -> 0 rows
@@ -3906,13 +3915,13 @@ test "parallel driver matches serial output across many batches" {
     const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
     defer alloc.free(in_path);
 
-    const body = "  | filter cast(amount as int) >= 500\n  | select id, doubled = cast(amount as int) * 2";
-
     var outputs: [2][]u8 = undefined;
     for ([_]usize{ 1, 4 }, 0..) |nthreads, idx| {
         const out_path = try std.fs.path.join(alloc, &.{ base, if (idx == 0) "s.csv" else "p.csv" });
         defer alloc.free(out_path);
-        const script = try std.fmt.allocPrint(alloc, "@batch\nread csv \"{s}\"\n{s}\n  | write csv \"{s}\"", .{ in_path, body, out_path });
+        const script = try std.fmt.allocPrint(alloc,
+            "LOAD INTO '{s}' AS SELECT id, CAST(amount AS INT) * 2 AS doubled FROM '{s}' WHERE CAST(amount AS INT) >= 500;",
+            .{ out_path, in_path });
         defer alloc.free(script);
 
         var parena = std.heap.ArenaAllocator.init(alloc);
@@ -3974,8 +3983,8 @@ test "let binding + inner join" {
     defer alloc.free(out_path);
 
     const script = try std.fmt.allocPrint(alloc,
-        "@batch\nlet labels = read csv \"{s}\"\nread csv \"{s}\"\n  | join inner labels on code = code\n  | select id, label\n  | write csv \"{s}\"",
-        .{ lookup_path, in_path, out_path },
+        "LOAD INTO '{s}' AS\nWITH labels AS (SELECT * FROM '{s}')\nSELECT t.id, l.label FROM '{s}' t JOIN labels l ON t.code = l.code;",
+        .{ out_path, lookup_path, in_path },
     );
     defer alloc.free(script);
 
@@ -4004,7 +4013,7 @@ test "aggregate folds groups across multiple batches" {
     defer alloc.free(base);
 
     const script = try std.fmt.allocPrint(alloc,
-        "@batch\nread csv \"{s}/in.csv\"\n  | aggregate n = count(), total = sum(cast(amount as int)), first_name = min(name) by code\n  | sort code\n  | write csv \"{s}/out.csv\"",
+        "LOAD INTO '{s}/out.csv' AS SELECT code, COUNT(*) AS n, SUM(CAST(amount AS INT)) AS total, MIN(name) AS first_name FROM '{s}/in.csv' GROUP BY code ORDER BY code;",
         .{ base, base },
     );
     defer alloc.free(script);
@@ -4033,7 +4042,7 @@ test "global aggregate streams vectorized partials across batches" {
     defer alloc.free(base);
 
     const script = try std.fmt.allocPrint(alloc,
-        "@batch\nread csv \"{s}/in.csv\"\n  | select amt = cast(amount as int)\n  | aggregate n = count(), total = sum(amt), lo = min(amt), hi = max(amt)\n  | write csv \"{s}/out.csv\"",
+        "LOAD INTO '{s}/out.csv' AS SELECT COUNT(*) AS n, SUM(CAST(amount AS INT)) AS total, MIN(CAST(amount AS INT)) AS lo, MAX(CAST(amount AS INT)) AS hi FROM '{s}/in.csv';",
         .{ base, base },
     );
     defer alloc.free(script);
@@ -4062,7 +4071,7 @@ test "distinct dedups across multiple batches" {
     defer alloc.free(base);
 
     const script = try std.fmt.allocPrint(alloc,
-        "@batch\nread csv \"{s}/in.csv\"\n  | distinct\n  | write csv \"{s}/out.csv\"",
+        "LOAD INTO '{s}/out.csv' AS SELECT DISTINCT * FROM '{s}/in.csv';",
         .{ base, base },
     );
     defer alloc.free(script);
@@ -4100,8 +4109,8 @@ test "join probe side spanning multiple batches" {
     defer alloc.free(out_path);
 
     const script = try std.fmt.allocPrint(alloc,
-        "@batch\nlet labels = read csv \"{s}\"\nread csv \"{s}\"\n  | join inner labels on code = code\n  | select id, label\n  | write csv \"{s}\"",
-        .{ lookup_path, in_path, out_path },
+        "LOAD INTO '{s}' AS\nWITH labels AS (SELECT * FROM '{s}')\nSELECT t.id, l.label FROM '{s}' t JOIN labels l ON t.code = l.code;",
+        .{ out_path, lookup_path, in_path },
     );
     defer alloc.free(script);
 
@@ -4124,7 +4133,7 @@ test "union reconciles branches to a canon schema (tag, null-fill, drop-extra)" 
     // canon = first (a: id, v) + tag `src`. b: id present, v -> NULL, w dropped.
     const script = try std.fmt.allocPrint(
         alloc,
-        "@batch\nunion from csv \"{s}/a.csv\" as \"01\" from csv \"{s}/b.csv\" as \"02\"\n  @[tag = src, canon = first]\n  | write csv \"{s}/out.csv\"",
+        "LOAD INTO '{s}/out.csv' AS\nSELECT '01' AS src, t.* FROM '{s}/a.csv' t\nUNION ALL BY NAME\nSELECT '02' AS src, t.* FROM '{s}/b.csv' t\nANCHOR SCHEMA first;",
         .{ base, base, base },
     );
     defer alloc.free(script);
@@ -4159,11 +4168,10 @@ test "for-each fans out over a discovered list with interpolation" {
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
 
-    // for name in csv "<base>/names.csv"
-    //   read csv "<base>/${name}.csv" | select id, v | write csv "<base>/out_${name}.csv"
+    // FOR EACH ROW OF names.csv: LOAD out_${name}.csv AS SELECT ... FROM ${name}.csv
     const script = try std.fmt.allocPrint(
         alloc,
-        "@batch\nfor name in csv \"{s}/names.csv\"\n  read csv \"{s}/${{name}}.csv\"\n    | select id, v\n    | write csv \"{s}/out_${{name}}.csv\"",
+        "FOR EACH ROW OF ('{s}/names.csv') AS (name)\n  LOAD INTO '{s}/out_${{name}}.csv' AS SELECT id, v FROM '{s}/${{name}}.csv';\nEND FOR;",
         .{ base, base, base },
     );
     defer alloc.free(script);
@@ -4219,7 +4227,7 @@ test "for-each parallel + on_error=continue isolates a failing table" {
 
     const script = try std.fmt.allocPrint(
         alloc,
-        "@batch\nfor name in csv \"{s}/names.csv\" @[mode = parallel, on_error = continue]\n  read csv \"{s}/${{name}}.csv\"\n    | write csv \"{s}/out_${{name}}.csv\"",
+        "FOR EACH ROW OF ('{s}/names.csv') AS (name) PARALLEL ON ERROR CONTINUE\n  LOAD INTO '{s}/out_${{name}}.csv' AS SELECT * FROM '{s}/${{name}}.csv';\nEND FOR;",
         .{ base, base, base },
     );
     defer alloc.free(script);

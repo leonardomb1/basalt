@@ -7,7 +7,7 @@
 //! interactive loop that prints results via the `write stdout` table sink.
 
 const std = @import("std");
-const parser = @import("../lang/parser.zig");
+const parser = @import("../lang/sql_parser.zig");
 const ast = @import("../lang/ast.zig");
 const runtime = @import("../runtime/run.zig");
 const obs = @import("../runtime/obs.zig");
@@ -367,8 +367,8 @@ fn cmdServe(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
 }
 
 /// Interactive read-eval-print loop. Each entry is one or more lines terminated by
-/// a blank line (so multi-stage pipelines can span lines); `@batch` is assumed and
-/// a `write stdout` table sink is appended when the entry doesn't write itself.
+/// a blank line (so multi-clause queries can span lines); a terminal SELECT
+/// prints as a table (a stdout sink is appended when the entry doesn't write).
 /// Reads from stdin (so `echo ... | basalt repl` works); prompts only on a TTY.
 fn cmdRepl(alloc: std.mem.Allocator) !u8 {
     var in_buf: [64 * 1024]u8 = undefined;
@@ -439,11 +439,7 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, msg: *std.Io.Writer) !v
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Assume @batch unless the entry opens with its own @kind tag.
-    const text = if (block[0] == '@')
-        block
-    else
-        try std.fmt.allocPrint(a, "@batch\n{s}", .{block});
+    const text = block;
 
     var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const prog = parser.parseSource(a, text, &diag) catch |e| switch (e) {
@@ -506,10 +502,9 @@ fn isHelp(s: []const u8) bool {
 }
 fn replHelp(msg: *std.Io.Writer) !void {
     try msg.writeAll(
-        \\REPL — enter a pipeline, then a blank line to run it (results print as a table).
-        \\  • `@batch` is assumed unless you start with a @kind tag.
-        \\  • `| write stdout` is appended unless you write to a sink yourself.
-        \\  example:  read csv "examples/in.csv" | filter status == "paid" | select id, amount
+        \\REPL — enter a query, then a blank line to run it (results print as a table).
+        \\  • a terminal SELECT prints; LOAD INTO writes to its target.
+        \\  example:  SELECT id, amount FROM 'examples/in.csv' WHERE status = 'paid';
         \\  \q quit    \help this help
         \\
     );

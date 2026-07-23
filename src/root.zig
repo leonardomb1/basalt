@@ -2,9 +2,9 @@
 
 pub const types = @import("lang/types.zig");
 pub const token = @import("lang/token.zig");
-pub const lexer = @import("lang/lexer.zig");
 pub const ast = @import("lang/ast.zig");
-pub const parser = @import("lang/parser.zig");
+pub const sql_lexer = @import("lang/sql_lexer.zig");
+pub const sql_parser = @import("lang/sql_parser.zig");
 pub const expand = @import("lang/expand.zig");
 pub const value = @import("exec/value.zig");
 pub const column = @import("exec/column.zig");

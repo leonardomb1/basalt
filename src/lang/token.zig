@@ -42,6 +42,10 @@ pub const Tag = enum {
     qq, // ?? (null-coalesce)
     qdot, // ?. (safe navigation)
 
+    // SQL-dialect tokens (unused by the BSL lexer).
+    semi, // ;
+    dollar_ident, // $name — PARAM reference; text excludes the `$`
+
     eof,
     invalid,
 
@@ -78,6 +82,8 @@ pub const Tag = enum {
             .percent => "'%'",
             .qq => "'??'",
             .qdot => "'?.'",
+            .semi => "';'",
+            .dollar_ident => "parameter reference `$name`",
             .eof => "end of input",
             .invalid => "invalid token",
         };
