@@ -23,6 +23,7 @@ const request = @import("../connect/request.zig");
 const httpsrc = @import("../connect/http.zig");
 const aad = @import("../connect/aad.zig");
 const splitmod = @import("../connect/split.zig");
+const ssrp = @import("../connect/ssrp.zig");
 const walmod = @import("../connect/wal.zig");
 const parallel = @import("parallel.zig");
 const analyze = @import("analyze.zig");
@@ -2884,6 +2885,10 @@ fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
 const DbConfig = struct {
     host: []const u8 = "",
     port: u16,
+    /// Was `port` set explicitly in the connection config? A named instance
+    /// (`host\INSTANCE`) resolves its port via the SQL Server Browser only when
+    /// this is false — an explicit port skips the lookup (firewalled UDP 1434).
+    port_explicit: bool = false,
     user: []const u8 = "",
     password: []const u8 = "",
     database: []const u8 = "",
@@ -2900,7 +2905,17 @@ const DbConfig = struct {
 
 /// Open a SQL Server connection, using Azure AD (ROPC token -> FEDAUTH) when the
 /// connection declared `auth = aad`, else a normal SQL login.
-fn tdsConnect(gpa: std.mem.Allocator, cfg: DbConfig) !*tds.Conn {
+fn tdsConnect(gpa: std.mem.Allocator, cfg_in: DbConfig) !*tds.Conn {
+    var cfg = cfg_in;
+    // Named instance (`host\INSTANCE`): resolve the dynamic TCP port via the SQL
+    // Server Browser (UDP 1434) unless a port was given explicitly. `*.dynamics.com`
+    // (AAD/Dataverse) has no instance, so this never triggers there. (Split lanes
+    // each re-resolve — a few extra UDP round-trips, negligible on success.)
+    const hi = ssrp.splitHostInstance(cfg.host);
+    if (hi.instance) |inst| {
+        cfg.host = hi.host;
+        if (!cfg.port_explicit) cfg.port = try ssrp.resolveInstancePort(gpa, hi.host, inst);
+    }
     if (!cfg.aad) return tds.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls);
     // Defaults mirror Microsoft.Data.SqlClient's "Active Directory Password":
     // the built-in ADO.NET first-party client (pre-consented in every tenant, so
@@ -2935,7 +2950,10 @@ fn parseDbConfig(conn: ast.Connection, default_port: u16, f: anytype) anyerror!D
     for (conn.config) |attr| {
         const k = attr.key;
         if (std.mem.eql(u8, k, "port")) {
-            cfg.port = (try f.port(attr.value)) orelse default_port;
+            if (try f.port(attr.value)) |p| {
+                cfg.port = p;
+                cfg.port_explicit = true;
+            }
             continue;
         }
         // Only fetch values of known keys, so an unrecognized key's expr never
