@@ -72,6 +72,13 @@ Connector types and their options are unchanged from BSL: `sqlserver`
 `mysql`, `postgres`, `starrocks` (`fe_host fe_port be_url database buckets
 replication_num auto_create label_prefix ...`), `http`.
 
+**Named SQL Server instances:** write `host = '10.110.2.5\WMS'`. When a `host`
+carries a `\INSTANCE` and no explicit `port` is given, basalt resolves the
+instance's TCP port via the SQL Server Browser (UDP 1434) before connecting.
+Give an explicit `port` to skip the lookup — the robust choice where UDP 1434
+is firewalled but the TDS port is open. (`*.dynamics.com` / Azure SQL are
+default-instance cloud endpoints, so this never applies there.)
+
 **Credentials by convention:** connection `erp` resolves `ERP_USER` /
 `ERP_PASS` from the environment at connect time — the common case costs zero
 characters. Explicit `user = ...` / `password = ...` options override the
