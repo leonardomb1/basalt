@@ -198,6 +198,30 @@ SELECT id, name, amt, flag FROM 'src/connect/testdata/$c.parquet' ORDER BY id;";
       report "parquet-$c (run error)" bad
     fi
   done
+
+  # Write path: CSV -> parquet -> read back. Reading our own output only proves
+  # self-consistency, so the seed round-trip is checked against it/expected.csv,
+  # which every other backend is held to as well.
+  if brun run -c "LOAD INTO '$out/w.parquet' AS SELECT * FROM 'it/seed.csv';" &&
+     brun run -c "LOAD INTO '$out/parquet_rt.csv' AS SELECT * FROM '$out/w.parquet' ORDER BY id;"; then
+    check parquet-write "$out/parquet_rt.csv" it/expected.csv
+  else
+    report "parquet-write (run error)" bad
+  fi
+
+  # A file written by basalt must also satisfy a different implementation. Skipped
+  # rather than failed when duckdb is absent, so the suite stays runnable anywhere.
+  if command -v duckdb >/dev/null 2>&1 || [ -x "$HOME/.duckdb/cli/latest/duckdb" ]; then
+    DUCK=$(command -v duckdb || echo "$HOME/.duckdb/cli/latest/duckdb")
+    # COPY with NULLSTR '' so duckdb renders nulls the way basalt's CSV sink does
+    if "$DUCK" -c "COPY (SELECT id, name, val FROM '$out/w.parquet' ORDER BY id) TO '$out/parquet_duck.csv' (FORMAT CSV, HEADER, NULLSTR '');" >/dev/null 2>&1; then
+      check parquet-interop "$out/parquet_duck.csv" it/expected.csv
+    else
+      report "parquet-interop (duckdb could not read basalt output)" bad
+    fi
+  else
+    echo "SKIP parquet-interop (no duckdb)"
+  fi
 fi
 
 echo "==> $pass passed, $fail failed"
