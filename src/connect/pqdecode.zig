@@ -681,7 +681,7 @@ fn appendDataPage(
             // `present == n` rather than `defs == null`: most writers mark every
             // column OPTIONAL, so levels are present even when no row is null,
             // and keying off their absence would never fire in practice.
-            if (present == n and tscale == 1 and try bulkPlain(arena, b, ty, meta.ty, body, n)) {
+            if (tscale == 1 and try bulkPlain(arena, b, ty, meta.ty, body, present, defs, max_def)) {
                 return n;
             }
             var cur = PlainCursor.init(meta.ty, elem.type_length orelse 0, body);
@@ -741,42 +741,54 @@ fn bulkPlain(
     ty: types.Type,
     phys: pq.PhysicalType,
     body: []const u8,
-    n: usize,
+    present: usize,
+    defs: ?[]const u32,
+    max_def: u32,
 ) Error!bool {
+    // values are only stored for present rows; nulls occupy a level, not a slot
+    const count = present;
     switch (phys) {
         .int64 => {
             if (ty.kind != .int) return false;
-            if (body.len < n * 8) return Error.CorruptParquetPage;
-            const out = try arena.alloc(i64, n);
+            if (body.len < count * 8) return Error.CorruptParquetPage;
+            const out = try arena.alloc(i64, count);
             for (out, 0..) |*o, i| o.* = std.mem.readInt(i64, body[i * 8 ..][0..8], .little);
-            b.appendBulk(i64, out) catch return false;
+            if (defs) |d| {
+                b.appendBulkScattered(i64, out, d, max_def) catch return false;
+            } else b.appendBulk(i64, out) catch return false;
             return true;
         },
         .int32 => {
             if (ty.kind != .int) return false;
-            if (body.len < n * 4) return Error.CorruptParquetPage;
-            const out = try arena.alloc(i64, n);
+            if (body.len < count * 4) return Error.CorruptParquetPage;
+            const out = try arena.alloc(i64, count);
             for (out, 0..) |*o, i| o.* = std.mem.readInt(i32, body[i * 4 ..][0..4], .little);
-            b.appendBulk(i64, out) catch return false;
+            if (defs) |d| {
+                b.appendBulkScattered(i64, out, d, max_def) catch return false;
+            } else b.appendBulk(i64, out) catch return false;
             return true;
         },
         .double => {
             if (ty.kind != .float) return false;
-            if (body.len < n * 8) return Error.CorruptParquetPage;
-            const out = try arena.alloc(f64, n);
+            if (body.len < count * 8) return Error.CorruptParquetPage;
+            const out = try arena.alloc(f64, count);
             for (out, 0..) |*o, i| o.* = @bitCast(std.mem.readInt(u64, body[i * 8 ..][0..8], .little));
-            b.appendBulk(f64, out) catch return false;
+            if (defs) |d| {
+                b.appendBulkScattered(f64, out, d, max_def) catch return false;
+            } else b.appendBulk(f64, out) catch return false;
             return true;
         },
         .float => {
             if (ty.kind != .float) return false;
-            if (body.len < n * 4) return Error.CorruptParquetPage;
-            const out = try arena.alloc(f64, n);
+            if (body.len < count * 4) return Error.CorruptParquetPage;
+            const out = try arena.alloc(f64, count);
             for (out, 0..) |*o, i| {
                 const raw = std.mem.readInt(u32, body[i * 4 ..][0..4], .little);
                 o.* = @floatCast(@as(f32, @bitCast(raw)));
             }
-            b.appendBulk(f64, out) catch return false;
+            if (defs) |d| {
+                b.appendBulkScattered(f64, out, d, max_def) catch return false;
+            } else b.appendBulk(f64, out) catch return false;
             return true;
         },
         else => return false,

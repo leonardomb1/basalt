@@ -170,6 +170,10 @@ fn gatherSlice(comptime T: type, arena: std.mem.Allocator, src: []const T, keep:
 
 fn gatherValidity(arena: std.mem.Allocator, v: Bitmap, keep: []const bool, kept: usize) !Bitmap {
     var bm = try Bitmap.initFull(arena, kept);
+    // Mirrors the guard `concat` and `permute` already use: with no nulls in the
+    // source there is nothing to clear, and this backs `gather`, the filter hot
+    // path — the most frequently executed loop in the executor.
+    if (v.allSet(v.len)) return bm;
     var w: usize = 0;
     for (keep, 0..) |k, i| {
         if (k) {
@@ -332,6 +336,9 @@ pub const Builder = struct {
     ty: types.Type,
     valid: std.array_list.Managed(bool),
     store: Store,
+    /// Set the first time a null is appended. Most columns never have one, and
+    /// `finish` can then skip scanning the validity array entirely.
+    has_null: bool = false,
 
     /// Byte payloads accumulate into one growing buffer; `ends` holds each row's
     /// end offset, which `finish` turns into Arrow's leading-zero offsets buffer.
@@ -402,8 +409,45 @@ pub const Builder = struct {
         try self.valid.appendNTimes(true, vals.len);
     }
 
+    /// Bulk append where only `vals` for present rows are supplied: `defs[i] ==
+    /// max_def` marks a row present, and nulls consume a slot without a value.
+    ///
+    /// This is the nullable twin of `appendBulk`. Without it any column holding
+    /// a single null falls back to boxing every value into a `Value`, which
+    /// measures ~5x slower than the typed path.
+    pub fn appendBulkScattered(
+        self: *Builder,
+        comptime T: type,
+        vals: []const T,
+        defs: []const u32,
+        max_def: u32,
+    ) !void {
+        switch (self.store) {
+            inline .b, .i32, .i64, .f64, .dec => |*l| {
+                if (@TypeOf(l.items) != []T) return error.BulkTypeMismatch;
+                try l.ensureUnusedCapacity(defs.len);
+                try self.valid.ensureUnusedCapacity(defs.len);
+                var j: usize = 0;
+                for (defs) |d| {
+                    const present = d == max_def;
+                    if (present) {
+                        if (j >= vals.len) return error.BulkTypeMismatch;
+                        l.appendAssumeCapacity(vals[j]);
+                        j += 1;
+                    } else {
+                        l.appendAssumeCapacity(std.mem.zeroes(T));
+                        self.has_null = true;
+                    }
+                    self.valid.appendAssumeCapacity(present);
+                }
+            },
+            .bytes => return error.BulkTypeMismatch,
+        }
+    }
+
     pub fn append(self: *Builder, v: Value) !void {
         const ok = !v.isNull();
+        if (!ok) self.has_null = true;
         try self.valid.append(ok);
         switch (self.store) {
             .b => |*l| try l.append(if (ok) v.bool else false),
@@ -450,8 +494,13 @@ pub const Builder = struct {
     pub fn finish(self: *Builder) !Column {
         const n = self.valid.items.len;
         var bm = try Bitmap.initFull(self.arena, n);
-        for (self.valid.items, 0..) |is_valid, i| {
-            if (!is_valid) bm.setValid(i, false);
+        // `initFull` already marks every row valid, so the per-row scan only
+        // has work to do when a null was actually appended. Skipping it removes
+        // an O(rows) shift/mask pass from every null-free column.
+        if (self.has_null) {
+            for (self.valid.items, 0..) |is_valid, i| {
+                if (!is_valid) bm.setValid(i, false);
+            }
         }
         const data: Column.Data = switch (self.store) {
             .b => |*l| .{ .b = try l.toOwnedSlice() },
