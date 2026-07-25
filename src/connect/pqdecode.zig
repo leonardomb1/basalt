@@ -588,13 +588,16 @@ pub fn readColumnChunk(
     elem: pq.SchemaElement,
     rows: usize,
     max_def: u32,
+    /// Offset of `file_bytes[0]` within the file. Zero when the caller passed a
+    /// slice that already starts at the chunk, as the ranged reader does.
+    base_offset: u64,
 ) (Error || pq.Error || @import("codec.zig").Error)!column.Column {
     const ty = (try basaltType(elem)).asNullable();
     const tscale = temporalScale(elem);
 
     var b = try column.Builder.initCapacity(arena, ty, rows);
     var dict: ?[]Value = null;
-    var offset: usize = @intCast(meta.startOffset());
+    var offset: usize = @intCast(@as(u64, @intCast(meta.startOffset())) - base_offset);
     var produced: usize = 0;
 
     while (produced < rows) {
@@ -968,14 +971,58 @@ const azure = @import("azure.zig");
 const httpx = @import("http.zig");
 const Batch = batchmod.Batch;
 
+/// Byte source a reader pulls from: a local file read on demand, or an already
+/// resident buffer.
+///
+/// Parquet is random-access by design — the footer sits at the end and points at
+/// chunks — so holding the whole object in memory is unnecessary. Fetching only
+/// the footer and the chunks a query touches is what keeps a multi-gigabyte file
+/// from becoming multi-gigabyte resident.
+pub const Bytes = union(enum) {
+    memory: []const u8,
+    file: struct { f: std.fs.File, size: u64 },
+
+    pub fn size(self: Bytes) u64 {
+        return switch (self) {
+            .memory => |m| m.len,
+            .file => |x| x.size,
+        };
+    }
+
+    /// Reads `len` bytes at `off`. The result is owned by `arena` for the file
+    /// case and borrowed for the memory case; callers treat it as read-only.
+    pub fn range(self: Bytes, arena: std.mem.Allocator, off: u64, len: usize) ![]const u8 {
+        switch (self) {
+            .memory => |m| {
+                if (off + len > m.len) return Error.CorruptParquetPage;
+                return m[@intCast(off)..][0..len];
+            },
+            .file => |x| {
+                if (off + len > x.size) return Error.CorruptParquetPage;
+                const buf = try arena.alloc(u8, len);
+                const n = try x.f.preadAll(buf, off);
+                if (n != len) return Error.CorruptParquetPage;
+                return buf;
+            },
+        }
+    }
+
+    pub fn close(self: Bytes) void {
+        switch (self) {
+            .memory => {},
+            .file => |x| x.f.close(),
+        }
+    }
+};
+
 /// Reads a Parquet file as a pipeline source, one batch per row group.
 ///
-/// The whole object is held in memory: Parquet metadata lives at the end, and a
-/// column chunk is only meaningful in full, so streaming a byte at a time is not
-/// possible the way it is for CSV. Row-group-sized batches are the natural unit.
+/// Only the footer and the column chunks a query needs are read; a chunk is
+/// fetched, decoded and released per row group, so resident memory tracks the
+/// widest row group's projected columns rather than the file.
 pub const Reader = struct {
     arena: std.mem.Allocator,
-    bytes: []const u8,
+    src: Bytes,
     md: pq.FileMetaData,
     schema: types.Schema,
     /// Readable leaves, in output order. Repeated (list) leaves are excluded but
@@ -983,6 +1030,9 @@ pub const Reader = struct {
     leaves: []const Leaf,
     /// Names of columns skipped because they are list elements, for reporting.
     skipped: []const []const u8,
+    /// Ascending chunk start offsets plus the footer start, used to bound each
+    /// ranged read.
+    boundaries: []const u64 = &.{},
     /// Bounds used to skip row groups outright; empty means read them all.
     bounds: []const Bound = &.{},
     /// Row groups skipped on statistics, for reporting.
@@ -1005,12 +1055,18 @@ pub const Reader = struct {
     /// hint, and a stage that truly needs a missing column will fail loudly when
     /// it cannot resolve it.
     pub fn openProjected(arena: std.mem.Allocator, path: []const u8, want: ?[]const []const u8) !*Reader {
-        const bytes = if (azure.isUrl(path))
-            try fetchBlob(arena, path)
-        else
-            try std.fs.cwd().readFileAlloc(arena, path, 1 << 31);
+        // Remote objects are fetched whole for now; local files are read by
+        // range, which is where the large-file risk actually lives.
+        const src: Bytes = if (azure.isUrl(path))
+            .{ .memory = try fetchBlob(arena, path) }
+        else blk: {
+            const f = try std.fs.cwd().openFile(path, .{});
+            break :blk .{ .file = .{ .f = f, .size = (try f.stat()).size } };
+        };
+        errdefer src.close();
 
-        const md = try pq.parseFile(arena, bytes);
+        var footer_start: u64 = 0;
+        const md = try parseFooterOf(arena, src, &footer_start);
 
         // Struct fields read fine as flat dotted columns; only list elements
         // (repeated) have no representation, so those alone are skipped.
@@ -1057,11 +1113,12 @@ pub const Reader = struct {
         const self = try arena.create(Reader);
         self.* = .{
             .arena = arena,
-            .bytes = bytes,
+            .src = src,
             .md = md,
             .schema = .{ .fields = try fields.toOwnedSlice() },
             .leaves = try keep.toOwnedSlice(),
             .skipped = try skipped.toOwnedSlice(),
+            .boundaries = try chunkBoundaries(arena, md, footer_start),
         };
         return self;
     }
@@ -1085,13 +1142,19 @@ pub const Reader = struct {
             for (self.leaves, 0..) |lf, ci| {
                 if (lf.chunk_idx >= g.columns.len) return Error.CorruptParquetPage;
                 const meta = g.columns[lf.chunk_idx].meta orelse return Error.CorruptParquetPage;
+                // fetch just this chunk, bounded by wherever the next one begins
+                const start: u64 = @intCast(meta.startOffset());
+                const end = chunkEnd(self.boundaries, start);
+                if (end <= start) return Error.CorruptParquetPage;
+                const chunk = try self.src.range(arena, start, @intCast(end - start));
                 cols[ci] = try readColumnChunk(
                     arena,
-                    self.bytes,
+                    chunk,
                     meta,
                     self.md.schema[lf.schema_idx],
                     rows,
                     lf.max_def,
+                    start,
                 );
             }
             return Batch{ .schema = &self.schema, .columns = cols, .len = rows };
@@ -1100,7 +1163,7 @@ pub const Reader = struct {
     }
 
     pub fn close(self: *Reader) void {
-        _ = self; // everything is arena-owned
+        self.src.close();
     }
 
     pub fn source(self: *Reader) driver.Source {
@@ -1122,6 +1185,49 @@ fn srcNext(p: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
 }
 fn srcClose(p: *anyopaque) void {
     @as(*Reader, @ptrCast(@alignCast(p))).close();
+}
+
+/// End offset of the chunk starting at `start`.
+///
+/// `total_compressed_size` cannot be used for this: writers disagree about
+/// whether it counts page headers and the dictionary page, so trusting it
+/// truncates chunks. The next chunk's start is unambiguous, and the footer
+/// bounds the last one.
+fn chunkEnd(boundaries: []const u64, start: u64) u64 {
+    for (boundaries) |b| {
+        if (b > start) return b;
+    }
+    return start;
+}
+
+/// Every chunk start in the file plus the footer offset, ascending. Built once
+/// so each chunk read knows exactly where it ends.
+fn chunkBoundaries(arena: std.mem.Allocator, md: pq.FileMetaData, footer_start: u64) ![]u64 {
+    var out = std.array_list.Managed(u64).init(arena);
+    for (md.row_groups) |g| {
+        for (g.columns) |c| {
+            const m = c.meta orelse continue;
+            try out.append(@intCast(m.startOffset()));
+        }
+    }
+    try out.append(footer_start);
+    const sl = try out.toOwnedSlice();
+    std.mem.sort(u64, sl, {}, comptime std.sort.asc(u64));
+    return sl;
+}
+
+/// Reads the footer with two small ranged reads instead of the whole file.
+fn parseFooterOf(arena: std.mem.Allocator, src: Bytes, footer_start: *u64) !pq.FileMetaData {
+    const total = src.size();
+    if (total < pq.trailer_len + pq.magic.len) return pq.Error.NotParquet;
+    const head = try src.range(arena, 0, pq.magic.len);
+    if (!std.mem.eql(u8, head, pq.magic)) return pq.Error.NotParquet;
+
+    const trailer = try src.range(arena, total - pq.trailer_len, pq.trailer_len);
+    const r = try pq.footerRange(total, trailer);
+    footer_start.* = r.offset;
+    const footer = try src.range(arena, r.offset, r.len);
+    return pq.parseFooter(arena, footer);
 }
 
 /// Whole-blob GET for `az://` paths. Parquet needs the footer before anything
@@ -1229,23 +1335,23 @@ test "decodes real column values from a DuckDB-written file" {
     const rows: usize = @intCast(g.num_rows);
 
     // id INT32: 0..59
-    const id = try readColumnChunk(a, fx, g.columns[0].meta.?, md.schema[1], rows, 1);
+    const id = try readColumnChunk(a, fx, g.columns[0].meta.?, md.schema[1], rows, 1, 0);
     try testing.expectEqual(@as(usize, 60), id.len);
     try testing.expectEqual(@as(i64, 0), id.getValue(0).int);
     try testing.expectEqual(@as(i64, 59), id.getValue(59).int);
 
     // name BYTE_ARRAY/UTF8 -> string
-    const name = try readColumnChunk(a, fx, g.columns[1].meta.?, md.schema[2], rows, 1);
+    const name = try readColumnChunk(a, fx, g.columns[1].meta.?, md.schema[2], rows, 1, 0);
     try testing.expectEqualStrings("row-0", name.getValue(0).string);
     try testing.expectEqualStrings("row-59", name.getValue(59).string);
 
     // amt DOUBLE: i * 1.5
-    const amt = try readColumnChunk(a, fx, g.columns[2].meta.?, md.schema[3], rows, 1);
+    const amt = try readColumnChunk(a, fx, g.columns[2].meta.?, md.schema[3], rows, 1, 0);
     try testing.expectEqual(@as(f64, 0.0), amt.getValue(0).float);
     try testing.expectEqual(@as(f64, 88.5), amt.getValue(59).float);
 
     // flag BOOLEAN: even ids true — bit-packed, one bit per value
-    const flag = try readColumnChunk(a, fx, g.columns[3].meta.?, md.schema[4], rows, 1);
+    const flag = try readColumnChunk(a, fx, g.columns[3].meta.?, md.schema[4], rows, 1, 0);
     try testing.expectEqual(true, flag.getValue(0).bool);
     try testing.expectEqual(false, flag.getValue(1).bool);
     try testing.expectEqual(false, flag.getValue(59).bool);
@@ -1264,7 +1370,7 @@ test "every codec's fixture decodes to the same values" {
     for (files) |f| {
         const md = try pq.parseFile(a, f);
         const g = md.row_groups[0];
-        const name = try readColumnChunk(a, f, g.columns[1].meta.?, md.schema[2], @intCast(g.num_rows), 1);
+        const name = try readColumnChunk(a, f, g.columns[1].meta.?, md.schema[2], @intCast(g.num_rows), 1, 0);
         try testing.expectEqualStrings("row-0", name.getValue(0).string);
         try testing.expectEqualStrings("row-42", name.getValue(42).string);
     }
@@ -1450,4 +1556,46 @@ test "row groups are skipped only when statistics prove no row can match" {
     // an unknown column contributes no bound
     const other = [_]Bound{.{ .column = "nosuch", .op = .lt, .value = .{ .int = 0 } }};
     try testing.expect(groupMayMatch(&schema, &leaves, g, &other));
+}
+
+test "chunk extents come from the next chunk, never from total_compressed_size" {
+    const b = [_]u64{ 4, 100, 250, 900 };
+    try testing.expectEqual(@as(u64, 100), chunkEnd(&b, 4));
+    try testing.expectEqual(@as(u64, 250), chunkEnd(&b, 100));
+    // the last chunk ends at the footer, which is the final boundary
+    try testing.expectEqual(@as(u64, 900), chunkEnd(&b, 250));
+    // an offset past every boundary yields no span, which the caller rejects
+    try testing.expectEqual(@as(u64, 900), chunkEnd(&b, 900));
+}
+
+test "ranged reads return the same values as an in-memory file" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "r.parquet", .data = @embedFile("testdata/zstd.parquet") });
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ dir, "r.parquet" });
+
+    // the reader opens by range; compare against decoding the same bytes whole
+    const r = try Reader.open(a, path);
+    defer r.close();
+    const got = (try r.next(a)).?;
+    try testing.expectEqual(@as(usize, 60), got.len);
+    try testing.expectEqual(@as(i64, 0), got.columns[0].getValue(0).int);
+    try testing.expectEqual(@as(i64, 59), got.columns[0].getValue(59).int);
+    try testing.expectEqualStrings("row-59", got.columns[1].getValue(59).string);
+    try testing.expectEqual(@as(f64, 88.5), got.columns[2].getValue(59).float);
+    try testing.expect((try r.next(a)) == null);
+}
+
+test "a Bytes range refuses to read past the end" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const src = Bytes{ .memory = "0123456789" };
+    try testing.expectEqualStrings("234", try src.range(ar.allocator(), 2, 3));
+    try testing.expectError(Error.CorruptParquetPage, src.range(ar.allocator(), 8, 5));
+    try testing.expectEqual(@as(u64, 10), src.size());
 }
