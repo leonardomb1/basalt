@@ -398,3 +398,166 @@ test "a real stream decoded with the wrong expected length is corruption" {
     defer ar.deinit();
     try t.expectError(Error.CorruptCompressedData, decompress(ar.allocator(), .gzip, ref_gzip, ref_payload.len - 1));
 }
+
+// --- compression (write path) ------------------------------------------------
+
+/// Codecs this build can *produce*, which is narrower than what it can read.
+///
+/// std ships no zstd or lz4 compressor, and its flate `Compress` is unfinished
+/// in 0.15.2 (`drain` ends in `@panic("TODO")`), so gzip is out too — only the
+/// `Simple` huffman/store path works there, and it has no public write method.
+/// Snappy is the dominant Parquet codec anyway, so the gap costs little; a
+/// writer asked for anything else fails up front instead of emitting a file no
+/// one can read.
+pub fn canCompress(c: Codec) bool {
+    return switch (c) {
+        .uncompressed, .snappy => true,
+        else => false,
+    };
+}
+
+/// Compresses `src` for a Parquet page. Returns a slice owned by `arena`.
+pub fn compress(arena: std.mem.Allocator, codec: Codec, src: []const u8) Error![]u8 {
+    if (!canCompress(codec)) return Error.UnsupportedCodec;
+    return switch (codec) {
+        .uncompressed => arena.dupe(u8, src),
+        .snappy => snappyCompress(arena, src),
+        else => unreachable,
+    };
+}
+
+// --- Snappy compressor -------------------------------------------------------
+
+const snappy_hash_bits = 14;
+/// Largest back-reference a 2-byte copy can encode. 65536 would serialise as
+/// two zero bytes, i.e. offset 0, which is invalid — so the window is one less.
+const snappy_window = (1 << 16) - 1;
+const snappy_min_match = 4;
+
+/// Snappy raw block encoder: a greedy LZ77 matcher over a hash table of 4-byte
+/// sequences. Not the fastest or tightest possible, but it emits a stream any
+/// Snappy decoder accepts, which is what Parquet interoperability needs.
+fn snappyCompress(arena: std.mem.Allocator, src: []const u8) Error![]u8 {
+    var out = std.array_list.Managed(u8).init(arena);
+    try putVarint(&out, src.len);
+    if (src.len == 0) return out.toOwnedSlice();
+
+    const table = try arena.alloc(u32, 1 << snappy_hash_bits);
+    defer arena.free(table);
+    @memset(table, std.math.maxInt(u32));
+
+    var pos: usize = 0;
+    var lit_start: usize = 0;
+    while (pos + snappy_min_match <= src.len) {
+        const h = snappyHash(src[pos..][0..4]);
+        const cand = table[h];
+        table[h] = @intCast(pos);
+
+        const hit = cand != std.math.maxInt(u32) and
+            pos - cand <= snappy_window and
+            std.mem.eql(u8, src[cand..][0..snappy_min_match], src[pos..][0..snappy_min_match]);
+        if (!hit) {
+            pos += 1;
+            continue;
+        }
+
+        // extend the match as far as both sides agree
+        var len: usize = snappy_min_match;
+        while (pos + len < src.len and src[cand + len] == src[pos + len]) len += 1;
+
+        try emitLiteral(&out, src[lit_start..pos]);
+        try emitCopy(&out, pos - cand, len);
+        pos += len;
+        lit_start = pos;
+    }
+    try emitLiteral(&out, src[lit_start..]);
+    return out.toOwnedSlice();
+}
+
+fn snappyHash(b: *const [4]u8) usize {
+    const v = std.mem.readInt(u32, b, .little);
+    return (v *% 0x1e35a7bd) >> (32 - snappy_hash_bits);
+}
+
+fn putVarint(out: *std.array_list.Managed(u8), n_in: usize) Error!void {
+    var n = n_in;
+    while (true) {
+        const b: u8 = @intCast(n & 0x7F);
+        n >>= 7;
+        try out.append(if (n != 0) b | 0x80 else b);
+        if (n == 0) return;
+    }
+}
+
+fn emitLiteral(out: *std.array_list.Managed(u8), data: []const u8) Error!void {
+    if (data.len == 0) return;
+    const n = data.len - 1;
+    if (n < 60) {
+        try out.append(@intCast(n << 2));
+    } else {
+        // 60..63 select how many little-endian length bytes follow
+        var extra: u8 = 0;
+        var v = n;
+        while (v > 0) : (v >>= 8) extra += 1;
+        try out.append(@intCast((@as(usize, 59 + extra) << 2)));
+        var k: u8 = 0;
+        while (k < extra) : (k += 1) try out.append(@intCast((n >> @intCast(8 * k)) & 0xFF));
+    }
+    try out.appendSlice(data);
+}
+
+/// Emits back-references. The 2-byte-offset form encodes a length of 1..64, so
+/// longer matches are split across several copies.
+fn emitCopy(out: *std.array_list.Managed(u8), offset: usize, len_in: usize) Error!void {
+    var len = len_in;
+    while (len > 0) {
+        // `take` must be explicitly usize: @min against a comptime bound narrows
+        // the result type to fit 0..64 (u7), and the shift below then overflows
+        // it and truncates the tag silently.
+        const take: usize = @min(len, 64);
+        try out.append(@intCast(((take - 1) << 2) | 2));
+        try out.append(@intCast(offset & 0xFF));
+        try out.append(@intCast((offset >> 8) & 0xFF));
+        len -= take;
+    }
+}
+
+test "snappy compressor output round-trips through our own decoder" {
+    var ar = std.heap.ArenaAllocator.init(t.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const cases = [_][]const u8{
+        "",
+        "a",
+        "hello hello hello hello hello hello",
+        "the quick brown fox jumps over the lazy dog, the quick brown fox again",
+    };
+    for (cases) |want| {
+        const comp = try compress(a, .snappy, want);
+        const got = try decompress(a, .snappy, comp, want.len);
+        try t.expectEqualStrings(want, got);
+    }
+
+    // a long highly-compressible run exercises multi-copy splitting and the
+    // extended literal length encoding
+    const big = try a.alloc(u8, 100_000);
+    for (big, 0..) |*c, i| c.* = @intCast('a' + (i / 997) % 26);
+    const comp = try compress(a, .snappy, big);
+    try t.expect(comp.len < big.len);
+    try t.expectEqualSlices(u8, big, try decompress(a, .snappy, comp, big.len));
+}
+
+test "codecs without an encoder are refused before a file is written" {
+    var ar = std.heap.ArenaAllocator.init(t.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // readable but not writable: reading and writing support differ on purpose
+    try t.expect(supported(.gzip) and !canCompress(.gzip));
+    try t.expect(supported(.zstd) and !canCompress(.zstd));
+    try t.expect(supported(.lz4_raw) and !canCompress(.lz4_raw));
+    try t.expectError(Error.UnsupportedCodec, compress(a, .zstd, "x"));
+    try t.expectError(Error.UnsupportedCodec, compress(a, .gzip, "x"));
+
+    try t.expectEqualStrings("abc", try decompress(a, .uncompressed, try compress(a, .uncompressed, "abc"), 3));
+}

@@ -342,3 +342,165 @@ test "nesting deeper than max_depth is an error, not a stack overflow" {
     var r = Reader.init(&buf);
     try t.expectError(Error.CorruptThrift, r.skipStruct());
 }
+
+// --- write side --------------------------------------------------------------
+
+/// Compact-protocol encoder. Mirrors `Reader`: field ids are written as deltas
+/// from the previous field of the same struct, so it keeps the same id stack.
+pub const Writer = struct {
+    out: *std.array_list.Managed(u8),
+    last_id: i16 = 0,
+    id_stack: [max_depth]i16 = undefined,
+    depth: usize = 0,
+
+    pub fn init(out: *std.array_list.Managed(u8)) Writer {
+        return .{ .out = out };
+    }
+
+    pub fn writeVarint(self: *Writer, v_in: u64) !void {
+        var v = v_in;
+        while (true) {
+            const b: u8 = @intCast(v & 0x7F);
+            v >>= 7;
+            try self.out.append(if (v != 0) b | 0x80 else b);
+            if (v == 0) return;
+        }
+    }
+
+    pub fn writeZigZag(self: *Writer, v: i64) !void {
+        try self.writeVarint(@bitCast((v >> 63) ^ (v << 1)));
+    }
+
+    pub fn structBegin(self: *Writer) !void {
+        if (self.depth >= max_depth) return error.CorruptThrift;
+        self.id_stack[self.depth] = self.last_id;
+        self.depth += 1;
+        self.last_id = 0;
+    }
+
+    pub fn structEnd(self: *Writer) !void {
+        try self.out.append(0); // STOP
+        if (self.depth == 0) return error.CorruptThrift;
+        self.depth -= 1;
+        self.last_id = self.id_stack[self.depth];
+    }
+
+    /// Field header. A delta of 1..15 packs into the header byte; anything else
+    /// (including a lower id) needs the explicit zigzag form.
+    pub fn fieldBegin(self: *Writer, ty: Type, id: i16) !void {
+        const delta = id - self.last_id;
+        if (delta > 0 and delta <= 15) {
+            try self.out.append(@intCast((@as(u8, @intCast(delta)) << 4) | @intFromEnum(ty)));
+        } else {
+            try self.out.append(@intFromEnum(ty));
+            try self.writeZigZag(id);
+        }
+        self.last_id = id;
+    }
+
+    pub fn writeI32(self: *Writer, id: i16, v: i32) !void {
+        try self.fieldBegin(.i32, id);
+        try self.writeZigZag(v);
+    }
+
+    pub fn writeI64(self: *Writer, id: i16, v: i64) !void {
+        try self.fieldBegin(.i64, id);
+        try self.writeZigZag(v);
+    }
+
+    pub fn writeBool(self: *Writer, id: i16, v: bool) !void {
+        // the value lives in the type nibble; no bytes follow
+        try self.fieldBegin(if (v) .bool_true else .bool_false, id);
+    }
+
+    pub fn writeBinary(self: *Writer, id: i16, v: []const u8) !void {
+        try self.fieldBegin(.binary, id);
+        try self.writeVarint(v.len);
+        try self.out.appendSlice(v);
+    }
+
+    /// List header only; the caller writes the elements.
+    pub fn listBegin(self: *Writer, id: i16, elem: Type, size: usize) !void {
+        try self.fieldBegin(.list, id);
+        if (size < 15) {
+            try self.out.append(@intCast((@as(u8, @intCast(size)) << 4) | @intFromEnum(elem)));
+        } else {
+            try self.out.append(0xF0 | @intFromEnum(elem));
+            try self.writeVarint(size);
+        }
+    }
+};
+
+test "writer output round-trips through the reader" {
+    var buf = std.array_list.Managed(u8).init(t.allocator);
+    defer buf.deinit();
+    var w = Writer.init(&buf);
+
+    try w.structBegin();
+    try w.writeI32(1, 7);
+    try w.writeI64(3, -12345);
+    try w.writeBool(4, true);
+    try w.writeBinary(20, "hello"); // id jump > 15 forces the explicit form
+    try w.structEnd();
+
+    var r = Reader.init(buf.items);
+    try r.structBegin();
+    const f1 = try r.readField();
+    try t.expectEqual(@as(i16, 1), f1.id);
+    try t.expectEqual(@as(i32, 7), try r.readI32());
+    const f2 = try r.readField();
+    try t.expectEqual(@as(i16, 3), f2.id);
+    try t.expectEqual(@as(i64, -12345), try r.readZigZag());
+    const f3 = try r.readField();
+    try t.expectEqual(@as(i16, 4), f3.id);
+    try t.expectEqual(Type.bool_true, f3.ty);
+    const f4 = try r.readField();
+    try t.expectEqual(@as(i16, 20), f4.id);
+    try t.expectEqualStrings("hello", try r.readBinary());
+    try t.expectEqual(Type.stop, (try r.readField()).ty);
+    try r.structEnd();
+}
+
+test "lists round-trip in both the short and escaped size forms" {
+    for ([_]usize{ 3, 40 }) |n| {
+        var buf = std.array_list.Managed(u8).init(t.allocator);
+        defer buf.deinit();
+        var w = Writer.init(&buf);
+        try w.structBegin();
+        try w.listBegin(2, .i32, n);
+        for (0..n) |i| try w.writeZigZag(@intCast(i));
+        try w.structEnd();
+
+        var r = Reader.init(buf.items);
+        try r.structBegin();
+        _ = try r.readField();
+        const h = try r.readListHeader();
+        try t.expectEqual(Type.i32, h.elem);
+        try t.expectEqual(n, h.size);
+        for (0..n) |i| try t.expectEqual(@as(i64, @intCast(i)), try r.readZigZag());
+    }
+}
+
+test "nested struct writing restores the outer field id" {
+    var buf = std.array_list.Managed(u8).init(t.allocator);
+    defer buf.deinit();
+    var w = Writer.init(&buf);
+    try w.structBegin();
+    try w.fieldBegin(.@"struct", 1);
+    try w.structBegin();
+    try w.writeI32(1, 42);
+    try w.structEnd();
+    try w.writeI32(2, 99); // delta 1 from the outer id 1
+    try w.structEnd();
+
+    var r = Reader.init(buf.items);
+    try r.structBegin();
+    try t.expectEqual(@as(i16, 1), (try r.readField()).id);
+    try r.structBegin();
+    try t.expectEqual(@as(i16, 1), (try r.readField()).id);
+    try t.expectEqual(@as(i32, 42), try r.readI32());
+    try t.expectEqual(Type.stop, (try r.readField()).ty);
+    try r.structEnd();
+    try t.expectEqual(@as(i16, 2), (try r.readField()).id);
+    try t.expectEqual(@as(i32, 99), try r.readI32());
+}
