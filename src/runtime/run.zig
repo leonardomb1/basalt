@@ -13,6 +13,7 @@ const column = @import("../exec/column.zig");
 const eval = @import("../exec/eval.zig");
 const csv = @import("../connect/csv.zig");
 const pqdecode = @import("../connect/pqdecode.zig");
+const pqwrite = @import("../connect/pqwrite.zig");
 const tablemod = @import("../connect/table.zig");
 const driver = @import("../connect/driver.zig");
 const starrocks = @import("../connect/starrocks.zig");
@@ -3018,6 +3019,13 @@ fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         return writer.sink();
     }
     if (std.mem.eql(u8, w.connector, "csv")) {
+        // A `.parquet` target shares the csv connector but is a different format;
+        // without this it would be written as CSV text under a .parquet name.
+        if (pqwrite.Writer.isPath(w.target)) {
+            const pw = pqwrite.Writer.open(env.arena, w.target, schema, .snappy) catch |e|
+                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output parquet `{s}` ({s})", .{ w.target, @errorName(e) }));
+            return pw.sink();
+        }
         const writer = csv.CsvWriter.open(env.arena, w.target, schema) catch
             return planErr(env.diag, "could not open output CSV");
         return writer.sink();
