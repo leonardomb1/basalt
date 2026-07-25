@@ -798,6 +798,107 @@ fn emit(
     }
 }
 
+// --- row group filtering -----------------------------------------------------
+
+/// A simple `column <op> literal` bound, the shape a row-group filter can use.
+pub const Bound = struct {
+    column: []const u8,
+    op: Op,
+    value: Value,
+
+    pub const Op = enum { lt, le, gt, ge, eq };
+};
+
+/// Whether a row group can possibly satisfy `bounds`, judged from its
+/// statistics alone.
+///
+/// Conservative in one direction only: a group is skipped solely when its
+/// statistics *prove* no row can match. Missing or unreadable statistics always
+/// mean "keep", so this can never drop matching rows.
+pub fn groupMayMatch(
+    schema: []const pq.SchemaElement,
+    leaves: []const Leaf,
+    g: pq.RowGroup,
+    bounds: []const Bound,
+) bool {
+    for (bounds) |b| {
+        const lf = findLeaf(leaves, b.column) orelse continue;
+        if (lf.chunk_idx >= g.columns.len) continue;
+        const meta = g.columns[lf.chunk_idx].meta orelse continue;
+        const elem = schema[lf.schema_idx];
+
+        const lo = statValue(elem, meta.ty, meta.stats.min) orelse continue;
+        const hi = statValue(elem, meta.ty, meta.stats.max) orelse continue;
+
+        const excluded = switch (b.op) {
+            // every value is >= lo, so `col < v` is impossible when lo >= v
+            .lt => cmp(lo, b.value) != .lt,
+            .le => cmp(lo, b.value) == .gt,
+            .gt => cmp(hi, b.value) != .gt,
+            .ge => cmp(hi, b.value) == .lt,
+            .eq => cmp(b.value, lo) == .lt or cmp(b.value, hi) == .gt,
+        };
+        if (excluded) return false;
+    }
+    return true;
+}
+
+fn findLeaf(leaves: []const Leaf, name: []const u8) ?Leaf {
+    for (leaves) |lf| {
+        if (std.mem.eql(u8, lf.name, name)) return lf;
+    }
+    return null;
+}
+
+/// Decodes one PLAIN-encoded statistics blob into a comparable `Value`.
+fn statValue(elem: pq.SchemaElement, phys: pq.PhysicalType, raw: ?[]const u8) ?Value {
+    const b = raw orelse return null;
+    const ty = basaltType(elem) catch return null;
+    var cur = PlainCursor.init(phys, elem.type_length orelse 0, b);
+    const v = cur.next() catch return null;
+    return coerce(ty, v, temporalScale(elem));
+}
+
+fn cmp(a: Value, b: Value) std.math.Order {
+    return switch (a) {
+        .int => std.math.order(a.int, switch (b) {
+            .int => |x| x,
+            .float => |x| @as(i64, @intFromFloat(x)),
+            else => a.int,
+        }),
+        .float => std.math.order(a.float, switch (b) {
+            .float => |x| x,
+            .int => |x| @as(f64, @floatFromInt(x)),
+            else => a.float,
+        }),
+        .date => std.math.order(a.date, switch (b) {
+            .date => |x| x,
+            .int => |x| @as(i32, @intCast(x)),
+            else => a.date,
+        }),
+        .time, .timestamp => blk: {
+            const av = if (a == .time) a.time else a.timestamp;
+            const bv = switch (b) {
+                .time => |x| x,
+                .timestamp => |x| x,
+                .int => |x| x,
+                else => av,
+            };
+            break :blk std.math.order(av, bv);
+        },
+        .string, .bytes => blk: {
+            const sa = if (a == .string) a.string else a.bytes;
+            const sb = switch (b) {
+                .string => |x| x,
+                .bytes => |x| x,
+                else => sa,
+            };
+            break :blk std.mem.order(u8, sa, sb);
+        },
+        else => .eq,
+    };
+}
+
 // --- source ------------------------------------------------------------------
 
 const driver = @import("driver.zig");
@@ -821,6 +922,10 @@ pub const Reader = struct {
     leaves: []const Leaf,
     /// Names of columns skipped because they are list elements, for reporting.
     skipped: []const []const u8,
+    /// Bounds used to skip row groups outright; empty means read them all.
+    bounds: []const Bound = &.{},
+    /// Row groups skipped on statistics, for reporting.
+    groups_skipped: usize = 0,
     rg: usize = 0,
 
     pub fn isPath(path: []const u8) bool {
@@ -908,6 +1013,13 @@ pub const Reader = struct {
             self.rg += 1;
             const rows: usize = @intCast(g.num_rows);
             if (rows == 0) continue;
+            // statistics can rule a whole group out before any page is touched
+            if (self.bounds.len > 0 and
+                !groupMayMatch(self.md.schema, self.leaves, g, self.bounds))
+            {
+                self.groups_skipped += 1;
+                continue;
+            }
             const cols = try arena.alloc(column.Column, self.leaves.len);
             for (self.leaves, 0..) |lf, ci| {
                 if (lf.chunk_idx >= g.columns.len) return Error.CorruptParquetPage;
@@ -1233,4 +1345,48 @@ test "projection keeps only the named columns and never drops all of them" {
     try testing.expectEqual(@as(usize, 1), none.schema.fields.len);
     const nb = (try none.next(a)).?;
     try testing.expectEqual(@as(usize, 60), nb.len);
+}
+
+test "row groups are skipped only when statistics prove no row can match" {
+    const schema = [_]pq.SchemaElement{
+        .{ .name = "root", .num_children = 1 },
+        .{ .name = "id", .ty = .int64, .repetition = .optional },
+    };
+    const leaves = [_]Leaf{.{ .schema_idx = 1, .chunk_idx = 0, .name = "id", .max_def = 1, .max_rep = 0 }};
+
+    // a chunk whose values run 100..200
+    var lo: [8]u8 = undefined;
+    var hi: [8]u8 = undefined;
+    std.mem.writeInt(i64, &lo, 100, .little);
+    std.mem.writeInt(i64, &hi, 200, .little);
+    var chunks = [_]pq.ColumnChunk{.{ .meta = .{
+        .ty = .int64,
+        .stats = .{ .min = &lo, .max = &hi },
+    } }};
+    const g = pq.RowGroup{ .columns = &chunks, .num_rows = 10 };
+
+    const keep = [_]Bound{.{ .column = "id", .op = .lt, .value = .{ .int = 500 } }};
+    const drop = [_]Bound{.{ .column = "id", .op = .lt, .value = .{ .int = 50 } }};
+    try testing.expect(groupMayMatch(&schema, &leaves, g, &keep));
+    try testing.expect(!groupMayMatch(&schema, &leaves, g, &drop));
+
+    // equality outside [min,max] is provably empty; inside it is not
+    const eq_in = [_]Bound{.{ .column = "id", .op = .eq, .value = .{ .int = 150 } }};
+    const eq_out = [_]Bound{.{ .column = "id", .op = .eq, .value = .{ .int = 999 } }};
+    try testing.expect(groupMayMatch(&schema, &leaves, g, &eq_in));
+    try testing.expect(!groupMayMatch(&schema, &leaves, g, &eq_out));
+
+    const gt_keep = [_]Bound{.{ .column = "id", .op = .gt, .value = .{ .int = 150 } }};
+    const gt_drop = [_]Bound{.{ .column = "id", .op = .gt, .value = .{ .int = 200 } }};
+    try testing.expect(groupMayMatch(&schema, &leaves, g, &gt_keep));
+    try testing.expect(!groupMayMatch(&schema, &leaves, g, &gt_drop));
+
+    // without statistics nothing is provable, so the group is always kept
+    var bare = [_]pq.ColumnChunk{.{ .meta = .{ .ty = .int64 } }};
+    const g2 = pq.RowGroup{ .columns = &bare, .num_rows = 10 };
+    try testing.expect(groupMayMatch(&schema, &leaves, g2, &drop));
+
+    // an unknown column contributes no bound
+    const other = [_]Bound{.{ .column = "nosuch", .op = .lt, .value = .{ .int = 0 } }};
+    try testing.expect(groupMayMatch(&schema, &leaves, g, &other));
 }

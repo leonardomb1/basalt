@@ -67,6 +67,15 @@ pub const SchemaElement = struct {
     }
 };
 
+/// Per-chunk statistics. `min`/`max` are PLAIN-encoded bytes of the column's
+/// physical type, which is enough to decide whether a row group can contain a
+/// value without decoding any of it.
+pub const Statistics = struct {
+    null_count: ?i64 = null,
+    min: ?[]const u8 = null,
+    max: ?[]const u8 = null,
+};
+
 pub const ColumnMetaData = struct {
     ty: PhysicalType = .boolean,
     encodings: []Encoding = &.{},
@@ -77,6 +86,7 @@ pub const ColumnMetaData = struct {
     total_compressed_size: i64 = 0,
     data_page_offset: i64 = 0,
     dictionary_page_offset: ?i64 = null,
+    stats: Statistics = .{},
 
     /// Where this chunk's pages start. A dictionary page, when present, precedes
     /// the data pages, so it — not `data_page_offset` — is the true beginning.
@@ -227,6 +237,31 @@ fn readColumnChunk(arena: std.mem.Allocator, r: *thrift.Reader) Error!ColumnChun
     return c;
 }
 
+/// Reads `Statistics`, preferring `min_value`/`max_value` (fields 5/6) over the
+/// deprecated `min`/`max` (2/1) whose byte-array ordering was never consistent.
+fn readStatistics(r: *thrift.Reader) Error!Statistics {
+    var st = Statistics{};
+    var legacy_min: ?[]const u8 = null;
+    var legacy_max: ?[]const u8 = null;
+    try r.structBegin();
+    while (true) {
+        const f = try r.readField();
+        if (f.ty == .stop) break;
+        switch (f.id) {
+            1 => legacy_max = try r.readBinary(),
+            2 => legacy_min = try r.readBinary(),
+            3 => st.null_count = try r.readZigZag(),
+            5 => st.max = try r.readBinary(),
+            6 => st.min = try r.readBinary(),
+            else => try r.skip(f.ty),
+        }
+    }
+    try r.structEnd();
+    if (st.min == null) st.min = legacy_min;
+    if (st.max == null) st.max = legacy_max;
+    return st;
+}
+
 fn readColumnMetaData(arena: std.mem.Allocator, r: *thrift.Reader) Error!ColumnMetaData {
     var m = ColumnMetaData{};
     try r.structBegin();
@@ -253,6 +288,7 @@ fn readColumnMetaData(arena: std.mem.Allocator, r: *thrift.Reader) Error!ColumnM
             7 => m.total_compressed_size = try r.readZigZag(),
             9 => m.data_page_offset = try r.readZigZag(),
             11 => m.dictionary_page_offset = try r.readZigZag(),
+            12 => m.stats = try readStatistics(r),
             else => try r.skip(f.ty),
         }
     }

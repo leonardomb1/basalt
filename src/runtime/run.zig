@@ -2247,6 +2247,56 @@ fn projectedColumns(env: *Env, stages: []const ast.Stage) !?[][]const u8 {
     return try out.toOwnedSlice();
 }
 
+/// Simple `column <op> literal` conjuncts of a filter, usable to skip whole
+/// row groups from their statistics.
+///
+/// Only `AND`-joined comparisons are collected. Anything else contributes no
+/// bound, which loses an optimisation but can never exclude a matching row.
+fn filterBounds(env: *Env, stages: []const ast.Stage) ![]pqdecode.Bound {
+    var out = std.array_list.Managed(pqdecode.Bound).init(env.arena);
+    for (stages) |st| {
+        switch (st.node) {
+            .filter => |e| try collectBounds(e, &out),
+            // stop at the first stage that redefines the columns
+            .select, .aggregate, .join, .explode, .union_ => break,
+            else => {},
+        }
+    }
+    return out.toOwnedSlice();
+}
+
+fn collectBounds(e: *const ast.Expr, out: *std.array_list.Managed(pqdecode.Bound)) !void {
+    const b = switch (e.*) {
+        .binary => |x| x,
+        else => return,
+    };
+    if (b.op == .@"and") {
+        try collectBounds(b.l, out);
+        try collectBounds(b.r, out);
+        return;
+    }
+    // only `field <op> literal` in that order; the mirrored form is left alone
+    const name = switch (b.l.*) {
+        .field => |q| q.parts[q.parts.len - 1],
+        else => return,
+    };
+    const v: valuemod.Value = switch (b.r.*) {
+        .int_lit => |x| .{ .int = x },
+        .float_lit => |x| .{ .float = x },
+        .str_lit => |x| .{ .string = x },
+        else => return,
+    };
+    const bop: pqdecode.Bound.Op = switch (b.op) {
+        .lt => .lt,
+        .le => .le,
+        .gt => .gt,
+        .ge => .ge,
+        .eq => .eq,
+        else => return,
+    };
+    try out.append(.{ .column = name, .op = bop, .value = v });
+}
+
 fn buildPipeline(env: *Env, stages: []const ast.Stage) anyerror!PipeRes {
     if (stages.len == 0) return planErr(env.diag, "empty pipeline");
 
@@ -2255,7 +2305,7 @@ fn buildPipeline(env: *Env, stages: []const ast.Stage) anyerror!PipeRes {
 
     switch (stages[0].node) {
         .read => |rd| {
-            const raw = try openSourceProjected(env, rd, stages[0].hints, try projectedColumns(env, stages[1..]));
+            const raw = try openSourceProjected(env, rd, stages[0].hints, try projectedColumns(env, stages[1..]), try filterBounds(env, stages[1..]));
             const cs = try env.arena.create(obs.CountingSource);
             cs.* = .{ .inner = raw, .count = env.rows_read };
             const src = cs.source();
@@ -2653,18 +2703,25 @@ fn buildJoin(env: *Env, j: ast.Join, left_schema: types.Schema, probe: op.Op) an
 }
 
 fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
-    return openSourceProjected(env, rd, hints, null);
+    return openSourceProjected(env, rd, hints, null, &.{});
 }
 
 /// `openSource`, with the column set the pipeline needs when it is known.
 /// Only the parquet reader can act on it; every other source ignores it.
-fn openSourceProjected(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[][]const u8) !driver.Source {
-    if (project) |cols| {
-        if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path and pqdecode.Reader.isPath(rd.form.path)) {
-            const pr = pqdecode.Reader.openProjected(env.arena, rd.form.path, cols) catch |e|
-                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
-            return pr.source();
-        }
+fn openSourceProjected(
+    env: *Env,
+    rd: ast.Read,
+    hints: []const ast.Hint,
+    project: ?[][]const u8,
+    bounds: []const pqdecode.Bound,
+) !driver.Source {
+    const is_pq = std.mem.eql(u8, rd.connector, "csv") and rd.form == .path and
+        pqdecode.Reader.isPath(rd.form.path);
+    if (is_pq and (project != null or bounds.len > 0)) {
+        const pr = pqdecode.Reader.openProjected(env.arena, rd.form.path, project) catch |e|
+            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
+        pr.bounds = bounds;
+        return pr.source();
     }
     return openSourceAll(env, rd, hints);
 }
