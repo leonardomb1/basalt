@@ -828,6 +828,17 @@ pub const Reader = struct {
     }
 
     pub fn open(arena: std.mem.Allocator, path: []const u8) !*Reader {
+        return openProjected(arena, path, null);
+    }
+
+    /// `open`, decoding only the named columns.
+    ///
+    /// This is what makes Parquet worth its complexity: a column not asked for
+    /// is never touched, so a query over two of forty columns reads two chunks.
+    /// An unknown name is ignored rather than an error — the caller's set is a
+    /// hint, and a stage that truly needs a missing column will fail loudly when
+    /// it cannot resolve it.
+    pub fn openProjected(arena: std.mem.Allocator, path: []const u8, want: ?[]const []const u8) !*Reader {
         const bytes = if (azure.isUrl(path))
             try fetchBlob(arena, path)
         else
@@ -846,11 +857,34 @@ pub const Reader = struct {
                 try skipped.append(lf.name);
                 continue;
             }
+            if (want) |names| {
+                var hit = false;
+                for (names) |n| {
+                    if (std.mem.eql(u8, n, lf.name)) {
+                        hit = true;
+                        break;
+                    }
+                }
+                if (!hit) continue;
+            }
             try keep.append(lf);
             try fields.append(.{
                 .name = lf.name,
                 .ty = (try basaltType(md.schema[lf.schema_idx])).asNullable(),
             });
+        }
+        // An empty projection (COUNT(*)) still needs batches with a row count,
+        // so the narrowest column is kept rather than none.
+        if (fields.items.len == 0 and want != null) {
+            for (all) |lf| {
+                if (lf.isRepeated()) continue;
+                try keep.append(lf);
+                try fields.append(.{
+                    .name = lf.name,
+                    .ty = (try basaltType(md.schema[lf.schema_idx])).asNullable(),
+                });
+                break;
+            }
         }
         if (fields.items.len == 0) return Error.UnsupportedParquetSchema;
 
@@ -1163,4 +1197,40 @@ test "byte stream split regroups transposed value bytes" {
     const got = try decodeByteStreamSplit(ar.allocator(), &src, 4, 2);
     try testing.expectEqualSlices(u8, &.{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07 }, got);
     try testing.expectError(Error.CorruptParquetPage, decodeByteStreamSplit(ar.allocator(), &src, 4, 3));
+}
+
+test "projection keeps only the named columns and never drops all of them" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ dir, "p.parquet" });
+    try tmp.dir.writeFile(.{ .sub_path = "p.parquet", .data = @embedFile("testdata/zstd.parquet") });
+
+    // no projection: every column
+    const all = try Reader.open(a, path);
+    try testing.expectEqual(@as(usize, 4), all.schema.fields.len);
+
+    // two of four
+    const two = try Reader.openProjected(a, path, &.{ "name", "flag" });
+    try testing.expectEqual(@as(usize, 2), two.schema.fields.len);
+    try testing.expectEqualStrings("name", two.schema.fields[0].name);
+    try testing.expectEqualStrings("flag", two.schema.fields[1].name);
+    const b = (try two.next(a)).?;
+    try testing.expectEqual(@as(usize, 60), b.len);
+    try testing.expectEqualStrings("row-0", b.columns[0].getValue(0).string);
+    try testing.expectEqual(true, b.columns[1].getValue(0).bool);
+
+    // an unknown name is ignored rather than fatal
+    const one = try Reader.openProjected(a, path, &.{ "name", "nosuch" });
+    try testing.expectEqual(@as(usize, 1), one.schema.fields.len);
+
+    // an empty projection still yields batches with a usable row count
+    const none = try Reader.openProjected(a, path, &.{});
+    try testing.expectEqual(@as(usize, 1), none.schema.fields.len);
+    const nb = (try none.next(a)).?;
+    try testing.expectEqual(@as(usize, 60), nb.len);
 }

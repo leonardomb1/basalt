@@ -2195,6 +2195,58 @@ fn connectorType(env: *Env, name: []const u8) []const u8 {
     return name;
 }
 
+/// Source columns the stages after a read actually need, or null when that set
+/// cannot be proven — in which case every column is read.
+///
+/// Only used to skip decoding work: if this under-reports, a later stage fails
+/// to resolve a field and the query errors loudly. It can never silently return
+/// wrong rows, which is what makes the optimisation safe to attempt.
+fn projectedColumns(env: *Env, stages: []const ast.Stage) !?[][]const u8 {
+    var set = std.StringHashMap(void).init(env.arena);
+    // Projection is only sound once some stage *defines* the output columns.
+    // With no such stage the read's own columns are the result — an empty
+    // reference set then means "everything", not "nothing".
+    var defines_output = false;
+    for (stages) |st| {
+        switch (st.node) {
+            .filter => |e| try pushdown.collectFields(e, &set),
+            .sort => |so| for (so.keys) |k| try set.put(k.field.parts[0], {}),
+            .distinct => |d| {
+                // `distinct` with no key list looks at every column
+                const on = d.on orelse return null;
+                for (on) |q| try set.put(q.parts[0], {});
+            },
+            .aggregate => |ag| {
+                for (ag.by) |q| try set.put(q.parts[0], {});
+                for (ag.aggs) |a| if (a.arg) |e| try pushdown.collectFields(e, &set);
+                defines_output = true;
+                break;
+            },
+            .select => |items| {
+                for (items) |it| switch (it) {
+                    // a star keeps every column, and after it names are no
+                    // longer the source's, so nothing further can be proven
+                    .star, .star_except, .star_rename => return null,
+                    .field => |q| try set.put(q.parts[0], {}),
+                    .computed => |c| try pushdown.collectFields(c.expr, &set),
+                };
+                // downstream stages refer to this select's outputs, not the
+                // source's columns, so the set is complete here
+                defines_output = true;
+                break;
+            },
+            .limit => {},
+            // anything else may reference columns in ways not modelled here
+            else => return null,
+        }
+    }
+    if (!defines_output) return null;
+    var out = std.array_list.Managed([]const u8).init(env.arena);
+    var it = set.keyIterator();
+    while (it.next()) |k| try out.append(k.*);
+    return try out.toOwnedSlice();
+}
+
 fn buildPipeline(env: *Env, stages: []const ast.Stage) anyerror!PipeRes {
     if (stages.len == 0) return planErr(env.diag, "empty pipeline");
 
@@ -2203,7 +2255,7 @@ fn buildPipeline(env: *Env, stages: []const ast.Stage) anyerror!PipeRes {
 
     switch (stages[0].node) {
         .read => |rd| {
-            const raw = try openSource(env, rd, stages[0].hints);
+            const raw = try openSourceProjected(env, rd, stages[0].hints, try projectedColumns(env, stages[1..]));
             const cs = try env.arena.create(obs.CountingSource);
             cs.* = .{ .inner = raw, .count = env.rows_read };
             const src = cs.source();
@@ -2601,6 +2653,23 @@ fn buildJoin(env: *Env, j: ast.Join, left_schema: types.Schema, probe: op.Op) an
 }
 
 fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
+    return openSourceProjected(env, rd, hints, null);
+}
+
+/// `openSource`, with the column set the pipeline needs when it is known.
+/// Only the parquet reader can act on it; every other source ignores it.
+fn openSourceProjected(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[][]const u8) !driver.Source {
+    if (project) |cols| {
+        if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path and pqdecode.Reader.isPath(rd.form.path)) {
+            const pr = pqdecode.Reader.openProjected(env.arena, rd.form.path, cols) catch |e|
+                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
+            return pr.source();
+        }
+    }
+    return openSourceAll(env, rd, hints);
+}
+
+fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
     if (std.mem.eql(u8, rd.connector, "request")) {
         const body = env.request_body orelse
             return planErr(env.diag, "`read request` is only available when serving HTTP (@http)");

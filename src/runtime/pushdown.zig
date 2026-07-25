@@ -393,7 +393,7 @@ fn sqlStr(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
 
 /// Collect every source column an expression references (by `parts[0]`, the base
 /// column even for a nested path) into `set`.
-fn collectFields(e: *const ast.Expr, set: *std.StringHashMap(void)) !void {
+pub fn collectFields(e: *const ast.Expr, set: *std.StringHashMap(void)) !void {
     switch (e.*) {
         .field => |q| try set.put(q.parts[0], {}),
         .unary => |u| try collectFields(u.e, set),
