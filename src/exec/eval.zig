@@ -253,7 +253,7 @@ const Num = union(enum) {
 };
 
 const Str = union(enum) {
-    col: struct { d: []const []const u8, v: Bitmap },
+    col: struct { d: column.Bytes, v: Bitmap },
     scalar: []const u8,
 };
 
@@ -301,41 +301,40 @@ fn callVec(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Ve
         if (c.args.len < 1) return error.Unsupported;
         const s = try strArg(arena, c.args[0], batch);
         const up = eq(name, "upper");
-        const out = try arena.alloc([]const u8, n);
+        var out = try column.BytesAppender.init(arena, n);
         var bm = try Bitmap.initFull(arena, n);
         var any = false;
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const sv = strAt(s, i) orelse {
-                out[i] = "";
+                try out.pushNull();
                 bm.setValid(i, false);
                 any = true;
                 continue;
             };
-            const o = try arena.dupe(u8, sv);
+            const o = try out.pushMutable(sv);
             for (o) |*ch| ch.* = if (up) std.ascii.toUpper(ch.*) else std.ascii.toLower(ch.*);
-            out[i] = o;
         }
-        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = out });
+        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
     }
 
     if (eq(name, "trim")) {
         if (c.args.len < 1) return error.Unsupported;
         const s = try strArg(arena, c.args[0], batch);
-        const out = try arena.alloc([]const u8, n);
+        var out = try column.BytesAppender.init(arena, n);
         var bm = try Bitmap.initFull(arena, n);
         var any = false;
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const sv = strAt(s, i) orelse {
-                out[i] = "";
+                try out.pushNull();
                 bm.setValid(i, false);
                 any = true;
                 continue;
             };
-            out[i] = trim(sv); // subslice of the source bytes: no copy
+            try out.push(trim(sv));
         }
-        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = out });
+        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
     }
 
     if (eq(name, "length")) {
@@ -390,52 +389,45 @@ fn callVec(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Ve
         if (c.args.len == 0) return error.Unsupported;
         const parts = try arena.alloc(Str, c.args.len);
         for (c.args, parts) |a, *sp| sp.* = try strArg(arena, a, batch);
-        const out = try arena.alloc([]const u8, n);
+        var out = try column.BytesAppender.init(arena, n);
         var bm = try Bitmap.initFull(arena, n);
         var any = false;
         var i: usize = 0;
         rows: while (i < n) : (i += 1) {
-            var total: usize = 0;
             for (parts) |sp| {
-                total += (strAt(sp, i) orelse {
-                    out[i] = "";
+                if (strAt(sp, i) == null) {
+                    try out.pushNull();
                     bm.setValid(i, false);
                     any = true;
                     continue :rows;
-                }).len;
+                }
             }
-            const o = try arena.alloc(u8, total);
-            var off: usize = 0;
-            for (parts) |sp| {
-                const sv = strAt(sp, i).?;
-                @memcpy(o[off..][0..sv.len], sv);
-                off += sv.len;
-            }
-            out[i] = o;
+            for (parts) |sp| try out.append(strAt(sp, i).?);
+            try out.endRow();
         }
-        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = out });
+        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
     }
 
     if (eq(name, "coalesce")) {
         if (c.args.len == 0) return error.Unsupported;
         const parts = try arena.alloc(Str, c.args.len);
         for (c.args, parts) |a, *sp| sp.* = try strArg(arena, a, batch);
-        const out = try arena.alloc([]const u8, n);
+        var out = try column.BytesAppender.init(arena, n);
         var bm = try Bitmap.initFull(arena, n);
         var any = false;
         var i: usize = 0;
         rows: while (i < n) : (i += 1) {
             for (parts) |sp| {
                 if (strAt(sp, i)) |sv| {
-                    out[i] = sv; // alias the winning slice: no copy
+                    try out.push(sv);
                     continue :rows;
                 }
             }
-            out[i] = "";
+            try out.pushNull();
             bm.setValid(i, false);
             any = true;
         }
-        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = out });
+        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
     }
 
     if (eq(name, "substr")) {
@@ -448,7 +440,7 @@ fn callVec(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Ve
             len_num = (try asNum(arena, try evalVec(arena, c.args[2], batch), n)) orelse return error.Unsupported;
             if (!isIntNum(len_num.?)) return error.Unsupported;
         }
-        const out = try arena.alloc([]const u8, n);
+        var out = try column.BytesAppender.init(arena, n);
         var bm = try Bitmap.initFull(arena, n);
         var any = false;
         var i: usize = 0;
@@ -457,14 +449,14 @@ fn callVec(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Ve
             const start_ok = numValid(start, i);
             const len_ok = if (len_num) |l| numValid(l, i) else true;
             if (sv == null or !start_ok or !len_ok) {
-                out[i] = "";
+                try out.pushNull();
                 bm.setValid(i, false);
                 any = true;
                 continue;
             }
-            out[i] = try substrBytes(arena, sv.?, numI(start, i), if (len_num) |l| numI(l, i) else null);
+            try out.push(try substrBytes(arena, sv.?, numI(start, i), if (len_num) |l| numI(l, i) else null));
         }
-        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = out });
+        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
     }
 
     if (eq(name, "replace")) {
@@ -472,7 +464,7 @@ fn callVec(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Ve
         const s = try strArg(arena, c.args[0], batch);
         const f = try strArg(arena, c.args[1], batch);
         const t = try strArg(arena, c.args[2], batch);
-        const out = try arena.alloc([]const u8, n);
+        var out = try column.BytesAppender.init(arena, n);
         var bm = try Bitmap.initFull(arena, n);
         var any = false;
         var i: usize = 0;
@@ -481,20 +473,20 @@ fn callVec(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Ve
             const fv = strAt(f, i);
             const tv = strAt(t, i);
             if (sv == null or fv == null or tv == null) {
-                out[i] = "";
+                try out.pushNull();
                 bm.setValid(i, false);
                 any = true;
                 continue;
             }
             if (fv.?.len == 0) {
-                out[i] = sv.?;
+                try out.push(sv.?);
                 continue;
             }
             const o = try arena.alloc(u8, std.mem.replacementSize(u8, sv.?, fv.?, tv.?));
             _ = std.mem.replace(u8, sv.?, fv.?, tv.?, o);
-            out[i] = o;
+            try out.push(o);
         }
-        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = out });
+        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
     }
 
     return error.Unsupported;
@@ -777,12 +769,12 @@ fn castColVec(arena: std.mem.Allocator, col: Column, target: types.TypeKind, n: 
                 .bool => for (col.data.b, 0..) |x, i| {
                     out[i] = if (x) 1 else 0;
                 },
-                .string => for (col.data.bytes, 0..) |s, i| {
+                .string => for (0..n) |i| {
                     if (!col.validity.get(i)) {
                         out[i] = 0;
                         continue;
                     }
-                    out[i] = std.fmt.parseInt(i64, trim(s), 10) catch return error.CastFailed;
+                    out[i] = std.fmt.parseInt(i64, trim(col.data.bytes.at(i)), 10) catch return error.CastFailed;
                 },
                 else => return error.Unsupported,
             }
@@ -794,12 +786,12 @@ fn castColVec(arena: std.mem.Allocator, col: Column, target: types.TypeKind, n: 
                 .int => for (col.data.i64, 0..) |x, i| {
                     out[i] = @floatFromInt(x);
                 },
-                .string => for (col.data.bytes, 0..) |s, i| {
+                .string => for (0..n) |i| {
                     if (!col.validity.get(i)) {
                         out[i] = 0;
                         continue;
                     }
-                    out[i] = std.fmt.parseFloat(f64, trim(s)) catch return error.CastFailed;
+                    out[i] = std.fmt.parseFloat(f64, trim(col.data.bytes.at(i))) catch return error.CastFailed;
                 },
                 else => return error.Unsupported,
             }
@@ -874,12 +866,32 @@ fn mergeCols(arena: std.mem.Allocator, take: []const bool, t: Column, e: Column)
             break :blk .{ .dec = o };
         },
         .bytes => |ts| blk: {
-            const o = try arena.alloc([]const u8, n);
-            mergePick([]const u8, o, &bm, take, ts, e.data.bytes, t.validity, e.validity);
-            break :blk .{ .bytes = o };
+            break :blk .{ .bytes = try mergeBytes(arena, &bm, take, ts, e.data.bytes, t.validity, e.validity) };
         },
     };
     return .{ .col = .{ .ty = t.ty.withNull(true), .len = n, .validity = bm, .data = data } };
+}
+
+/// `mergePick` for the Arrow bytes layout: the picked payloads have to be copied
+/// into a fresh values buffer, so sizes are summed first and the buffer is
+/// allocated exactly once.
+fn mergeBytes(arena: std.mem.Allocator, bm: *Bitmap, take: []const bool, ts: column.Bytes, es: column.Bytes, tv: Bitmap, ev: Bitmap) !column.Bytes {
+    const n = take.len;
+    var span: usize = 0;
+    for (0..n) |i| span += (if (take[i]) ts.at(i) else es.at(i)).len;
+
+    const values = try arena.alloc(u8, span);
+    const offsets = try arena.alloc(i32, n + 1);
+    offsets[0] = 0;
+    var off: usize = 0;
+    for (0..n) |i| {
+        const s = if (take[i]) ts.at(i) else es.at(i);
+        @memcpy(values[off..][0..s.len], s);
+        off += s.len;
+        offsets[i + 1] = @intCast(off);
+        if (!(if (take[i]) tv.get(i) else ev.get(i))) bm.setValid(i, false);
+    }
+    return .{ .offsets = offsets, .values = values };
 }
 
 fn mergePick(comptime T: type, out: []T, bm: *Bitmap, take: []const bool, ts: []const T, es: []const T, tv: Bitmap, ev: Bitmap) void {
@@ -982,7 +994,7 @@ inline fn allValidNum(x: Num, n: usize) bool {
 }
 inline fn strAt(x: Str, i: usize) ?[]const u8 {
     return switch (x) {
-        .col => |c| if (c.v.get(i)) c.d[i] else null,
+        .col => |c| if (c.v.get(i)) c.d.at(i) else null,
         .scalar => |s| s,
     };
 }

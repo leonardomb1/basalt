@@ -53,6 +53,108 @@ pub const Bitmap = struct {
     }
 };
 
+/// Arrow variable-size binary layout: one contiguous `values` buffer plus an
+/// `offsets` buffer of `len + 1` entries delimiting each row. Costs 4 bytes of
+/// per-row overhead instead of the 16 a slice header takes, and needs one
+/// allocation per column rather than one per value.
+pub const Bytes = struct {
+    offsets: []i32,
+    values: []u8,
+
+    pub fn at(self: Bytes, i: usize) []const u8 {
+        const lo: usize = @intCast(self.offsets[i]);
+        const hi: usize = @intCast(self.offsets[i + 1]);
+        return self.values[lo..hi];
+    }
+
+    pub fn rows(self: Bytes) usize {
+        return if (self.offsets.len == 0) 0 else self.offsets.len - 1;
+    }
+
+    /// Total bytes spanned by rows `i` where `pick(i)` — sizes the values buffer
+    /// before a copy so the output is allocated exactly once.
+    fn spanOf(self: Bytes, rows_idx: []const usize) usize {
+        var total: usize = 0;
+        for (rows_idx) |r| total += self.at(r).len;
+        return total;
+    }
+
+    /// Copy the rows listed in `rows_idx` (in that order) into a fresh Bytes.
+    fn take(self: Bytes, arena: std.mem.Allocator, rows_idx: []const usize) !Bytes {
+        const values = try arena.alloc(u8, self.spanOf(rows_idx));
+        const offsets = try arena.alloc(i32, rows_idx.len + 1);
+        offsets[0] = 0;
+        var off: usize = 0;
+        for (rows_idx, 0..) |r, w| {
+            const s = self.at(r);
+            @memcpy(values[off..][0..s.len], s);
+            off += s.len;
+            offsets[w + 1] = @intCast(off);
+        }
+        return .{ .offsets = offsets, .values = values };
+    }
+};
+
+/// Row-order accumulator for the Arrow bytes layout, for kernels that emit one
+/// payload per row. A null row is an empty slot: offsets repeat, no bytes added.
+pub const BytesAppender = struct {
+    values: std.array_list.Managed(u8),
+    offsets: std.array_list.Managed(i32),
+
+    pub fn init(arena: std.mem.Allocator, n: usize) !BytesAppender {
+        var offsets = std.array_list.Managed(i32).init(arena);
+        try offsets.ensureTotalCapacity(n + 1);
+        offsets.appendAssumeCapacity(0);
+        return .{ .values = std.array_list.Managed(u8).init(arena), .offsets = offsets };
+    }
+
+    /// Add bytes to the row being built, without closing it — lets a kernel
+    /// assemble a row from several pieces with no temporary allocation.
+    pub fn append(self: *BytesAppender, s: []const u8) !void {
+        try self.values.appendSlice(s);
+    }
+
+    /// Close the current row. With nothing appended since the last close this
+    /// is an empty slot, which is how a null row is stored.
+    pub fn endRow(self: *BytesAppender) !void {
+        try self.offsets.append(@intCast(self.values.items.len));
+    }
+
+    pub fn push(self: *BytesAppender, s: []const u8) !void {
+        try self.append(s);
+        try self.endRow();
+    }
+
+    pub fn pushNull(self: *BytesAppender) !void {
+        try self.endRow();
+    }
+
+    /// Appends `s` as a whole row, then hands back the just-written region so a
+    /// kernel can transform it in place instead of duping first.
+    pub fn pushMutable(self: *BytesAppender, s: []const u8) ![]u8 {
+        const start = self.values.items.len;
+        try self.push(s);
+        return self.values.items[start..];
+    }
+
+    pub fn finish(self: *BytesAppender) !Bytes {
+        return .{ .offsets = try self.offsets.toOwnedSlice(), .values = try self.values.toOwnedSlice() };
+    }
+};
+
+/// Row indices flagged in `keep`, in order — the shape `Bytes.take` wants.
+fn keptIndices(arena: std.mem.Allocator, keep: []const bool, kept: usize) ![]usize {
+    const idx = try arena.alloc(usize, kept);
+    var w: usize = 0;
+    for (keep, 0..) |k, i| {
+        if (k) {
+            idx[w] = i;
+            w += 1;
+        }
+    }
+    return idx;
+}
+
 /// Copy a typed backing slice, keeping only rows where `keep[i]` is true.
 fn gatherSlice(comptime T: type, arena: std.mem.Allocator, src: []const T, keep: []const bool, kept: usize) ![]T {
     const out = try arena.alloc(T, kept);
@@ -88,7 +190,7 @@ pub fn gather(arena: std.mem.Allocator, c: Column, keep: []const bool, kept: usi
         .i64 => |s| .{ .i64 = try gatherSlice(i64, arena, s, keep, kept) },
         .f64 => |s| .{ .f64 = try gatherSlice(f64, arena, s, keep, kept) },
         .dec => |s| .{ .dec = try gatherSlice(value.Decimal, arena, s, keep, kept) },
-        .bytes => |s| .{ .bytes = try gatherSlice([]const u8, arena, s, keep, kept) },
+        .bytes => |s| .{ .bytes = try s.take(arena, try keptIndices(arena, keep, kept)) },
     };
     return .{ .ty = c.ty, .len = kept, .validity = bm, .data = data };
 }
@@ -118,9 +220,38 @@ pub fn concat(arena: std.mem.Allocator, chunks: []const Column, total: usize) !C
         .i64 => .{ .i64 = try concatSlices("i64", i64, arena, chunks, total) },
         .f64 => .{ .f64 = try concatSlices("f64", f64, arena, chunks, total) },
         .dec => .{ .dec = try concatSlices("dec", value.Decimal, arena, chunks, total) },
-        .bytes => .{ .bytes = try concatSlices("bytes", []const u8, arena, chunks, total) },
+        .bytes => .{ .bytes = try concatBytes(arena, chunks, total) },
     };
     return .{ .ty = chunks[0].ty, .len = total, .validity = bm, .data = data };
+}
+
+/// Byte payloads concatenate as one memcpy per chunk (rows are contiguous
+/// within a chunk); only the offsets need rebasing row by row.
+fn concatBytes(arena: std.mem.Allocator, chunks: []const Column, total: usize) !Bytes {
+    var span: usize = 0;
+    for (chunks) |c| {
+        const b = c.data.bytes;
+        span += @as(usize, @intCast(b.offsets[c.len])) - @as(usize, @intCast(b.offsets[0]));
+    }
+    const values = try arena.alloc(u8, span);
+    const offsets = try arena.alloc(i32, total + 1);
+    offsets[0] = 0;
+
+    var off: usize = 0;
+    var w: usize = 0;
+    for (chunks) |c| {
+        const b = c.data.bytes;
+        const lo: usize = @intCast(b.offsets[0]);
+        const hi: usize = @intCast(b.offsets[c.len]);
+        @memcpy(values[off..][0 .. hi - lo], b.values[lo..hi]);
+        var i: usize = 0;
+        while (i < c.len) : (i += 1) {
+            w += 1;
+            offsets[w] = @intCast(off + @as(usize, @intCast(b.offsets[i + 1])) - lo);
+        }
+        off += hi - lo;
+    }
+    return .{ .offsets = offsets, .values = values };
 }
 
 fn concatSlices(comptime tag: []const u8, comptime T: type, arena: std.mem.Allocator, chunks: []const Column, total: usize) ![]T {
@@ -148,7 +279,7 @@ pub fn permute(arena: std.mem.Allocator, c: Column, idx: []const usize) !Column 
         .i64 => |s| .{ .i64 = try permuteSlice(i64, arena, s, idx) },
         .f64 => |s| .{ .f64 = try permuteSlice(f64, arena, s, idx) },
         .dec => |s| .{ .dec = try permuteSlice(value.Decimal, arena, s, idx) },
-        .bytes => |s| .{ .bytes = try permuteSlice([]const u8, arena, s, idx) },
+        .bytes => |s| .{ .bytes = try s.take(arena, idx) },
     };
     return .{ .ty = c.ty, .len = idx.len, .validity = bm, .data = data };
 }
@@ -169,11 +300,11 @@ pub const Column = struct {
     /// (e.g. int/time/timestamp all share `i64`, string/bytes share `bytes`).
     pub const Data = union(enum) {
         b: []bool,
-        i32: []i32, // date
-        i64: []i64, // int, time, timestamp
-        f64: []f64, // float
+        i32: []i32,
+        i64: []i64,
+        f64: []f64,
         dec: []value.Decimal,
-        bytes: [][]const u8, // string (utf-8), bytes
+        bytes: Bytes,
     };
 
     /// Boxed read of row `i`, honoring the validity bitmap.
@@ -184,8 +315,8 @@ pub const Column = struct {
             .int => .{ .int = self.data.i64[i] },
             .float => .{ .float = self.data.f64[i] },
             .decimal => .{ .decimal = self.data.dec[i] },
-            .string => .{ .string = self.data.bytes[i] },
-            .bytes => .{ .bytes = self.data.bytes[i] },
+            .string => .{ .string = self.data.bytes.at(i) },
+            .bytes => .{ .bytes = self.data.bytes.at(i) },
             .date => .{ .date = self.data.i32[i] },
             .time => .{ .time = self.data.i64[i] },
             .timestamp => .{ .timestamp = self.data.i64[i] },
@@ -202,24 +333,34 @@ pub const Builder = struct {
     valid: std.array_list.Managed(bool),
     store: Store,
 
+    /// Byte payloads accumulate into one growing buffer; `ends` holds each row's
+    /// end offset, which `finish` turns into Arrow's leading-zero offsets buffer.
+    pub const BytesStore = struct {
+        values: std.array_list.Managed(u8),
+        ends: std.array_list.Managed(i32),
+    };
+
     pub const Store = union(enum) {
         b: std.array_list.Managed(bool),
         i32: std.array_list.Managed(i32),
         i64: std.array_list.Managed(i64),
         f64: std.array_list.Managed(f64),
         dec: std.array_list.Managed(value.Decimal),
-        bytes: std.array_list.Managed([]const u8),
+        bytes: BytesStore,
     };
 
     pub fn init(arena: std.mem.Allocator, ty: types.Type) Builder {
+        const bytes_store: Store = .{ .bytes = .{
+            .values = std.array_list.Managed(u8).init(arena),
+            .ends = std.array_list.Managed(i32).init(arena),
+        } };
         const store: Store = switch (ty.kind) {
             .bool => .{ .b = std.array_list.Managed(bool).init(arena) },
             .date => .{ .i32 = std.array_list.Managed(i32).init(arena) },
             .int, .time, .timestamp => .{ .i64 = std.array_list.Managed(i64).init(arena) },
             .float => .{ .f64 = std.array_list.Managed(f64).init(arena) },
             .decimal => .{ .dec = std.array_list.Managed(value.Decimal).init(arena) },
-            .string, .bytes => .{ .bytes = std.array_list.Managed([]const u8).init(arena) },
-            .array, .@"struct" => .{ .bytes = std.array_list.Managed([]const u8).init(arena) }, // unsupported; placeholder
+            .string, .bytes, .array, .@"struct" => bytes_store,
         };
         return .{ .arena = arena, .ty = ty, .valid = std.array_list.Managed(bool).init(arena), .store = store };
     }
@@ -233,7 +374,10 @@ pub const Builder = struct {
             .i64 => |*l| try l.append(if (ok) self.asI64(v) else 0),
             .f64 => |*l| try l.append(if (ok) self.asF64(v) else 0),
             .dec => |*l| try l.append(if (ok) v.decimal else .{ .unscaled = 0, .scale = self.ty.scale }),
-            .bytes => |*l| try l.append(if (ok) try self.arena.dupe(u8, self.asBytes(v)) else ""),
+            .bytes => |*l| {
+                if (ok) try l.values.appendSlice(self.asBytes(v));
+                try l.ends.append(@intCast(l.values.items.len));
+            },
         }
     }
 
@@ -278,7 +422,12 @@ pub const Builder = struct {
             .i64 => |*l| .{ .i64 = try l.toOwnedSlice() },
             .f64 => |*l| .{ .f64 = try l.toOwnedSlice() },
             .dec => |*l| .{ .dec = try l.toOwnedSlice() },
-            .bytes => |*l| .{ .bytes = try l.toOwnedSlice() },
+            .bytes => |*l| blk: {
+                const offsets = try self.arena.alloc(i32, n + 1);
+                offsets[0] = 0;
+                @memcpy(offsets[1..], l.ends.items);
+                break :blk .{ .bytes = .{ .offsets = offsets, .values = try l.values.toOwnedSlice() } };
+            },
         };
         return .{ .ty = self.ty, .len = n, .validity = bm, .data = data };
     }
