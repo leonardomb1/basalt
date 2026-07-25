@@ -31,6 +31,11 @@ pub const Error = error{
 /// Rows buffered before a row group is flushed.
 pub const row_group_rows = 100_000;
 
+/// Target uncompressed size of one data page. Splitting a chunk into pages of
+/// roughly this size lets a reader skip and buffer page-by-page instead of
+/// materialising a whole column chunk.
+pub const page_target_bytes = 1 << 20;
+
 /// How a basalt column is stored in Parquet.
 const Mapping = struct {
     phys: pq.PhysicalType,
@@ -70,9 +75,19 @@ fn mapType(t: types.Type) Error!Mapping {
     };
 }
 
+/// A page whose rows are complete, waiting to be written at row-group flush.
+/// Pages of one chunk must land contiguously in the file, so they cannot be
+/// emitted as they fill — they are held until the group is flushed.
+const PendingPage = struct {
+    defs: []const u8,
+    values: []const u8,
+    rows: usize,
+};
+
 /// Per-column accumulation for the row group being built.
 const ColBuf = struct {
     values: List(u8),
+    pages: List(PendingPage),
     /// One entry per row: 1 present, 0 null. Packed at flush time.
     defs: List(u8),
     /// BOOLEAN values are bit-packed, so they need their own accumulator.
@@ -86,11 +101,34 @@ const ColBuf = struct {
     max: ?Value = null,
 
     fn init(a: std.mem.Allocator) ColBuf {
-        return .{ .values = List(u8).init(a), .defs = List(u8).init(a) };
+        return .{
+            .values = List(u8).init(a),
+            .pages = List(PendingPage).init(a),
+            .defs = List(u8).init(a),
+        };
+    }
+
+    /// Seals the in-progress page. Definition levels are packed now, while the
+    /// row set is known.
+    fn sealPage(self: *ColBuf, arena: std.mem.Allocator, optional: bool) !void {
+        if (self.defs.items.len == 0) return;
+        try self.flushBits();
+        const defs: []const u8 = if (optional)
+            try packLevels(arena, self.defs.items)
+        else
+            &.{};
+        try self.pages.append(.{
+            .defs = defs,
+            .values = try arena.dupe(u8, self.values.items),
+            .rows = self.defs.items.len,
+        });
+        self.values.clearRetainingCapacity();
+        self.defs.clearRetainingCapacity();
     }
 
     fn reset(self: *ColBuf) void {
         self.values.clearRetainingCapacity();
+        self.pages.clearRetainingCapacity();
         self.defs.clearRetainingCapacity();
         self.bit_buf = 0;
         self.bit_n = 0;
@@ -262,6 +300,9 @@ pub const Writer = struct {
                 try cb.observe(self.arena, v);
                 try encodePlain(cb, m, v);
             }
+            for (self.cols, self.maps) |*cb, m| {
+                if (cb.values.items.len >= page_target_bytes) try cb.sealPage(self.arena, m.optional);
+            }
             self.rows += 1;
             self.total_rows += 1;
             if (self.rows >= row_group_rows) try self.flushRowGroup();
@@ -275,39 +316,47 @@ pub const Writer = struct {
         var group_bytes: i64 = 0;
 
         for (self.cols, chunks, self.maps) |*cb, *cm, m| {
-            try cb.flushBits();
-
-            // page body: [4-byte level length][RLE def levels][PLAIN values],
-            // with the level section omitted entirely for REQUIRED columns
-            var body = List(u8).init(self.arena);
-            if (m.optional) {
-                const levels = try packLevels(self.arena, cb.defs.items);
-                var len4: [4]u8 = undefined;
-                std.mem.writeInt(u32, &len4, @intCast(levels.len), .little);
-                try body.appendSlice(&len4);
-                try body.appendSlice(levels);
-            }
-            try body.appendSlice(cb.values.items);
-
-            const raw = body.items;
-            const packed_body = try codec.compress(self.arena, self.compression, raw);
+            try cb.sealPage(self.arena, m.optional);
 
             const start = self.offset;
-            var hdr = List(u8).init(self.arena);
-            try writePageHeader(&hdr, raw.len, packed_body.len, cb.defs.items.len);
-            try self.emit(hdr.items);
-            try self.emit(packed_body);
+            var values: i64 = 0;
+            var uncompressed: i64 = 0;
+            var compressed: i64 = 0;
+
+            for (cb.pages.items) |pgm| {
+                // page body: [4-byte level length][RLE def levels][values],
+                // with the level section omitted for REQUIRED columns
+                var body = List(u8).init(self.arena);
+                if (m.optional) {
+                    var len4: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &len4, @intCast(pgm.defs.len), .little);
+                    try body.appendSlice(&len4);
+                    try body.appendSlice(pgm.defs);
+                }
+                try body.appendSlice(pgm.values);
+
+                const raw = body.items;
+                const packed_body = try codec.compress(self.arena, self.compression, raw);
+                var hdr = List(u8).init(self.arena);
+                try writePageHeader(&hdr, raw.len, packed_body.len, pgm.rows, std.hash.Crc32.hash(packed_body));
+                try self.emit(hdr.items);
+                try self.emit(packed_body);
+
+                values += @intCast(pgm.rows);
+                uncompressed += @intCast(raw.len);
+                compressed += @intCast(packed_body.len);
+            }
 
             cm.* = .{
                 .offset = start,
-                .num_values = @intCast(cb.defs.items.len),
-                .uncompressed = @intCast(raw.len),
-                .compressed = @intCast(packed_body.len),
+                .num_values = values,
+                .uncompressed = uncompressed,
+                .compressed = compressed,
                 .nulls = cb.nulls,
                 .min = cb.min,
                 .max = cb.max,
             };
-            group_bytes += @intCast(raw.len);
+            group_bytes += uncompressed;
             cb.reset();
         }
 
@@ -473,15 +522,72 @@ fn writeSchemaLeaf(w: *thrift.Writer, name: []const u8, m: Mapping) !void {
     if (m.converted) |c| try w.writeI32(6, c);
     if (m.scale) |s| try w.writeI32(7, s);
     if (m.precision) |p| try w.writeI32(8, p);
+    try writeLogicalType(w, m);
     try w.structEnd();
 }
 
-fn writePageHeader(out: *List(u8), uncompressed: usize, compressed: usize, values: usize) !void {
+/// `LogicalType` (SchemaElement field 10), the modern annotation that
+/// supersedes ConvertedType. It carries what ConvertedType cannot — a
+/// timestamp's unit and whether it is UTC-adjusted — and newer readers prefer
+/// it. Both are emitted so old and new readers agree.
+fn writeLogicalType(w: *thrift.Writer, m: Mapping) !void {
+    const c = m.converted orelse return;
+    try w.fieldBegin(.@"struct", 10);
+    try w.structBegin();
+    switch (c) {
+        conv_utf8 => try emptyVariant(w, 1), // STRING
+        conv_decimal => {
+            try w.fieldBegin(.@"struct", 5); // DECIMAL
+            try w.structBegin();
+            try w.writeI32(1, m.scale orelse 0);
+            try w.writeI32(2, m.precision orelse 18);
+            try w.structEnd();
+        },
+        conv_date => try emptyVariant(w, 6), // DATE
+        conv_time_micros => try timeVariant(w, 7), // TIME
+        conv_timestamp_micros => try timeVariant(w, 8), // TIMESTAMP
+        else => {},
+    }
+    try w.structEnd();
+}
+
+fn emptyVariant(w: *thrift.Writer, id: i16) !void {
+    try w.fieldBegin(.@"struct", id);
+    try w.structBegin();
+    try w.structEnd();
+}
+
+/// TIME and TIMESTAMP both carry `isAdjustedToUTC` and a unit.
+///
+/// `isAdjustedToUTC` is false: basalt has no timezone concept, so its
+/// timestamps are wall-clock values. Claiming UTC would make readers treat them
+/// as instants and re-render them in the viewer's zone, shifting every
+/// displayed time.
+fn timeVariant(w: *thrift.Writer, id: i16) !void {
+    try w.fieldBegin(.@"struct", id);
+    try w.structBegin();
+    try w.writeBool(1, false); // isAdjustedToUTC
+    try w.fieldBegin(.@"struct", 2); // TimeUnit
+    try w.structBegin();
+    try emptyVariant(w, 2); // MICROS
+    try w.structEnd();
+    try w.structEnd();
+}
+
+fn writePageHeader(
+    out: *List(u8),
+    uncompressed: usize,
+    compressed: usize,
+    values: usize,
+    crc: u32,
+) !void {
     var w = thrift.Writer.init(out);
     try w.structBegin();
     try w.writeI32(1, @intFromEnum(pq.PageType.data_page));
     try w.writeI32(2, @intCast(uncompressed));
     try w.writeI32(3, @intCast(compressed));
+    // CRC32 of the compressed page data, so a reader can detect corruption
+    try w.writeI32(4, @bitCast(crc));
     try w.fieldBegin(.@"struct", 5); // data_page_header
     try w.structBegin();
     try w.writeI32(1, @intCast(values));
