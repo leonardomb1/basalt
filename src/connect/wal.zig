@@ -1,5 +1,5 @@
 //! Durable request buffer — the WAL under `ACCEPT ... INTO BUFFER` and the
-//! `FROM BUFFER` source (migration.md §10, §13.1 phase 1).
+//! `FROM BUFFER` source: a durable WAL buffer replayed by a later run.
 //!
 //! Layout inside the buffer directory, for a buffer named `eventos`:
 //!   eventos-000001.jsonl    append-only JSONL segments, rotated by size

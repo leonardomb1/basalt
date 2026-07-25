@@ -1,4 +1,4 @@
-//! Lexer for the Basalt SQL dialect (migration.md). Shares `token.Token` with
+//! Lexer for the Basalt SQL dialect (language.md). Shares `token.Token` with
 //! the BSL lexer; keywords are plain `ident`s matched case-insensitively by the
 //! SQL parser. Differences from the BSL lexer:
 //!   - comments: `--` to end of line and `/* ... */` blocks (not `#`)

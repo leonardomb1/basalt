@@ -4,7 +4,7 @@ Basalt scripts describe a **columnar data pipeline**: read from a source,
 transform with a query, write to a sink. A script is plan-time static — parsed,
 type-checked, and planned once, then executed as a streaming pull pipeline.
 
-This is the reference for the SQL dialect (v0.2, migration.md). It is derived
+This is the reference for the SQL dialect. It is derived
 from the parser (`src/lang/sql_parser.zig`) and reflects what the engine
 actually accepts. Basalt SQL is the only dialect: the BSL (`.bsl`) parser was
 removed in v0.2.0 — `examples/golden/` holds the frozen plans that gated the
@@ -385,7 +385,7 @@ basalt check <script>|-|-c "<inline>" [-s|--show-plan] [--connect]
 
 ## 11. Designed but not yet implemented
 
-From migration.md, accepted design not yet in the engine:
+Accepted design not yet in the engine:
 
 - **Whole-CTE / cross-source pushdown** (§7's full Trino model): implicit
   pushdown currently translates the filter prefix of a *single* SQL read. A

@@ -2,7 +2,8 @@
 //!   basalt run   <script>|-c <script> [-p k=v ...] [-j N] [--port N]
 //!   basalt check <script>|-c <script> [-s|--show-plan] [--connect]
 //!   basalt repl
-//! `run` executes (mode from the script's `@kind`); `check` validates/plans. A
+//! `run` executes (HTTP mode when the script declares an endpoint); `check`
+//! validates and plans without running. A
 //! script comes from a file path or, with `-c/--command`, inline. `repl` is an
 //! interactive loop that prints results via the `write stdout` table sink.
 
@@ -581,25 +582,49 @@ test "appendDisplaySinks adds `write stdout` only to sink-less pipelines" {
 
 fn usage(w: anytype) !void {
     try w.writeAll(
-        \\basalt — a DSL-driven data pipeline engine
+        \\basalt — a SQL-driven data pipeline engine
         \\
         \\usage:
-        \\  basalt run   <script>|-|-c <script> [-p key=value ...] [-j N] [--port N]  run a pipeline (mode from @kind)
-        \\  basalt serve <dir> [--port N] [--watch]                  host every @http script in a dir (SIGHUP/-w reloads)
-        \\  basalt check <script>|-|-c <script> [-s|--show-plan] [--connect]         validate; -s prints the plan
-        \\  basalt repl                                              interactive read-eval-print loop
+        \\  basalt run   <script>|-|-c <script> [-p key=value ...] [-j N] [--port N]
+        \\               run a pipeline; HTTP mode when the script declares CREATE ENDPOINT
+        \\  basalt serve <dir> [--port N] [--watch]
+        \\               host every endpoint script in a dir (SIGHUP or -w reloads)
+        \\  basalt check <script>|-|-c <script> [-s|--show-plan] [--connect]
+        \\               validate without running; -s prints the plan
+        \\  basalt repl  interactive read-eval-print loop
+        \\  basalt help  show this help
         \\
-        \\  <script> may be a path, `-` for stdin, or `-c <script>` for an inline script
-        \\  use `write stdout` to print results as a table (the REPL appends it for you)
-        \\  -j, --threads N    parallelism: key-range lanes for splittable SQL reads (map-only and
-        \\                     aggregate), and byte-range workers for CSV aggregate / distinct /
-        \\                     top-N (sort|limit) / map-only pipelines
-        \\                     (default: CPU count; map output may reorder under -j>1 — -j 1 = stable)
-        \\  --json             emit the run summary as JSON on stdout (machine output)
-        \\  --log-format FMT   auto|text|json — logs to stderr (default auto: text on a TTY, NDJSON when piped)
+        \\script:
+        \\  a path, `-` for stdin, or `-c <script>` for an inline script
+        \\  a terminal `SELECT ...;` prints a table; `LOAD INTO <target> AS <query>;` writes
+        \\  see language.md for the dialect
+        \\
+        \\sources and sinks:
+        \\  files      CSV and Parquet, by path or URL — the extension picks the format
+        \\  object     az://<account>/<container>/<path>, and a trailing / reads every
+        \\             blob under that prefix as one table
+        \\  databases  postgres, mysql, sqlserver, starrocks (CREATE CONNECTION ... TYPE ...)
+        \\  http       REST sources and sinks; `request` for an HTTP request body
+        \\  buffer     durable WAL buffer, replayed by a later run
+        \\
+        \\credentials:
+        \\  a connection named `erp` reads ERP_USER / ERP_PASS from the environment;
+        \\  explicit user = ... / password = ... override it. Azure uses AZURE_STORAGE_KEY
+        \\  (and AZURE_BLOB_ENDPOINT to point at an emulator).
+        \\
+        \\options:
+        \\  -p, --param k=v    bind a PARAM declared by the script (repeatable)
+        \\  -j, --threads N    parallelism: key-range lanes for splittable SQL reads, and
+        \\                     byte-range workers for CSV aggregate / distinct / top-N /
+        \\                     map-only pipelines. Parquet reads are single-threaded.
+        \\                     (default: CPU count; map output may reorder under -j>1,
+        \\                     so -j 1 is the stable-order choice)
+        \\  --port N           listen port for HTTP mode
+        \\  --json             emit the run summary as JSON on stdout
+        \\  --log-format FMT   auto|text|json — logs go to stderr
+        \\                     (auto: text on a TTY, NDJSON when piped)
         \\  --log-level LVL    error|warn|info|debug (default info)
         \\  -q, --quiet        suppress info/warn logs (the run summary still prints)
-        \\  basalt help                                             show this help
         \\
     );
 }
