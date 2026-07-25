@@ -894,6 +894,8 @@ fn emit(
 // --- row group filtering -----------------------------------------------------
 
 /// A simple `column <op> literal` bound, the shape a row-group filter can use.
+pub const Threshold = valuemod.Threshold;
+
 pub const Bound = struct {
     column: []const u8,
     op: Op,
@@ -934,6 +936,32 @@ pub fn groupMayMatch(
         if (excluded) return false;
     }
     return true;
+}
+
+/// Whether a row group could hold a row that enters the current top-N.
+///
+/// Conservative by construction: unknown column, missing statistics, or an
+/// unfilled heap all return true. Only a proven strict miss skips.
+pub fn groupBeatsThreshold(
+    schema: []const pq.SchemaElement,
+    leaves: []const Leaf,
+    g: pq.RowGroup,
+    t: Threshold,
+) bool {
+    if (!t.full or t.value == .null) return true;
+    const lf = findLeaf(leaves, t.column) orelse return true;
+    if (lf.chunk_idx >= g.columns.len) return true;
+    const meta = g.columns[lf.chunk_idx].meta orelse return true;
+    const elem = schema[lf.schema_idx];
+
+    // A null sorts last, so a group holding any null can still matter when the
+    // bound itself is null — but that case already returned above.
+    if (t.desc) {
+        const hi = statValue(elem, meta.ty, meta.stats.max) orelse return true;
+        return cmp(hi, t.value) == .gt;
+    }
+    const lo = statValue(elem, meta.ty, meta.stats.min) orelse return true;
+    return cmp(lo, t.value) == .lt;
 }
 
 fn findLeaf(leaves: []const Leaf, name: []const u8) ?Leaf {
@@ -1064,6 +1092,8 @@ pub const Reader = struct {
     boundaries: []const u64 = &.{},
     /// Bounds used to skip row groups outright; empty means read them all.
     bounds: []const Bound = &.{},
+    /// Live top-N bound, when the pipeline is a `sort … limit` over this file.
+    threshold: ?*const Threshold = null,
     /// Row groups skipped on statistics, for reporting.
     groups_skipped: usize = 0,
     rg: usize = 0,
@@ -1166,6 +1196,12 @@ pub const Reader = struct {
             {
                 self.groups_skipped += 1;
                 continue;
+            }
+            if (self.threshold) |t| {
+                if (!groupBeatsThreshold(self.md.schema, self.leaves, g, t.*)) {
+                    self.groups_skipped += 1;
+                    continue;
+                }
             }
             const cols = try arena.alloc(column.Column, self.leaves.len);
             for (self.leaves, 0..) |lf, ci| {
@@ -1627,4 +1663,36 @@ test "a Bytes range refuses to read past the end" {
     try testing.expectEqualStrings("234", try src.range(ar.allocator(), 2, 3));
     try testing.expectError(Error.CorruptParquetPage, src.range(ar.allocator(), 8, 5));
     try testing.expectEqual(@as(u64, 10), src.size());
+}
+
+test "top-N threshold skips only groups it can prove cannot contribute" {
+    const schema = [_]pq.SchemaElement{
+        .{ .name = "root", .num_children = 1 },
+        .{ .name = "v", .ty = .int64, .repetition = .optional },
+    };
+    const leaves = [_]Leaf{.{ .schema_idx = 1, .chunk_idx = 0, .name = "v", .max_def = 1, .max_rep = 0 }};
+    var lo: [8]u8 = undefined;
+    var hi: [8]u8 = undefined;
+    std.mem.writeInt(i64, &lo, 100, .little);
+    std.mem.writeInt(i64, &hi, 200, .little);
+    var chunks = [_]pq.ColumnChunk{.{ .meta = .{ .ty = .int64, .stats = .{ .min = &lo, .max = &hi } } }};
+    const g = pq.RowGroup{ .columns = &chunks, .num_rows = 10 };
+
+    // DESC: the group tops out at 200, so a bound of 500 rules it out entirely
+    try testing.expect(!groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = true, .full = true, .value = .{ .int = 500 } }));
+    try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = true, .full = true, .value = .{ .int = 150 } }));
+    // equal to the bound is NOT skippable on its own, but cannot beat it either
+    try testing.expect(!groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = true, .full = true, .value = .{ .int = 200 } }));
+
+    // ASC mirrors it against the minimum
+    try testing.expect(!groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = false, .full = true, .value = .{ .int = 50 } }));
+    try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = false, .full = true, .value = .{ .int = 150 } }));
+
+    // every conservative case must keep the group
+    try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = true, .full = false, .value = .{ .int = 500 } }));
+    try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "nosuch", .desc = true, .full = true, .value = .{ .int = 500 } }));
+    try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = true, .full = true, .value = .null }));
+    var bare = [_]pq.ColumnChunk{.{ .meta = .{ .ty = .int64 } }};
+    const g2 = pq.RowGroup{ .columns = &bare, .num_rows = 10 };
+    try testing.expect(groupBeatsThreshold(&schema, &leaves, g2, .{ .column = "v", .desc = true, .full = true, .value = .{ .int = 500 } }));
 }

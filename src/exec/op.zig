@@ -563,6 +563,9 @@ pub const TopN = struct {
     state: std.mem.Allocator,
     gpa: std.mem.Allocator,
     done: bool = false,
+    /// When set, the K-th best key is published here so a source can skip
+    /// row groups that cannot beat it.
+    threshold: ?*valuemod.Threshold = null,
 
     const Entry = []Value;
     const Heap = std.PriorityQueue(Entry, []const Sort.Key, entryWorstFirst);
@@ -587,9 +590,11 @@ pub const TopN = struct {
             while (r < b.len) : (r += 1) {
                 if (heap.count() < cap) {
                     try heap.add(try self.cloneRow(b, r));
+                    if (heap.count() >= cap) self.publish(heap.items[0]);
                 } else if (self.rowLess(b, r, heap.items[0])) {
                     self.freeEntry(heap.remove());
                     try heap.add(try self.cloneRow(b, r));
+                    self.publish(heap.items[0]);
                 }
             }
             _ = scratch.reset(.retain_capacity);
@@ -601,6 +606,18 @@ pub const TopN = struct {
         const end = @min(self.offset + self.count, heap.items.len);
         if (start >= end) return null;
         return try self.emit(arena, heap.items[start..end]);
+    }
+
+    /// Publishes the worst kept entry's first key. Only a single sort key is
+    /// pushed down; with several, the leading key still bounds the rest.
+    fn publish(self: *TopN, worst: Entry) void {
+        const t = self.threshold orelse return;
+        if (self.keys.len == 0) return;
+        const v = worst[self.keys[0].idx];
+        // a null bound would skip nothing useful, and nulls sort last anyway
+        if (v == .null or v == .string or v == .bytes) return;
+        t.value = v;
+        t.full = true;
     }
 
     fn cloneRow(self: *TopN, b: Batch, r: usize) !Entry {

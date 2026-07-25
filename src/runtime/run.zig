@@ -203,6 +203,10 @@ const Env = struct {
     sql_desc: ?SqlDesc = null,
     /// Connector types of the first source/sink, for the run summary.
     src_name: []const u8 = "",
+    /// Parquet readers opened for the current pipeline, and the last one — used
+    /// to push a top-N bound only when there is exactly one.
+    pq_readers: usize = 0,
+    pq_reader: ?*pqdecode.Reader = null,
     sink_name: []const u8 = "",
 };
 
@@ -2363,6 +2367,18 @@ fn buildTopN(env: *Env, s: ast.Sort, lim: ast.Limit, child: op.Op, schema: types
     for (s.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc };
     const o = try arena.create(op.TopN);
     o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = ks, .count = lim.count, .offset = lim.offset, .state = arena, .gpa = env.gpa };
+
+    // Push the running K-th-best bound into a single parquet source so it can
+    // skip row groups its statistics rule out. Requires exactly one parquet
+    // reader and one sort key, so the bound is unambiguous.
+    if (env.pq_readers == 1 and s.keys.len == 1) {
+        if (env.pq_reader) |pr| {
+            const t = try arena.create(valuemod.Threshold);
+            t.* = .{ .column = s.keys[0].field.last(), .desc = s.keys[0].desc };
+            pr.threshold = t;
+            o.threshold = t;
+        }
+    }
     return .{ .op = .{ .top_n = o }, .schema = schema };
 }
 
@@ -2720,12 +2736,17 @@ fn openSourceProjected(
     project: ?[][]const u8,
     bounds: []const pqdecode.Bound,
 ) !driver.Source {
+    // Track parquet readers so a top-N bound is only ever pushed into a pipeline
+    // with exactly one of them; with two the single slot would be ambiguous and
+    // could skip groups of the wrong file.
     const is_pq = std.mem.eql(u8, rd.connector, "csv") and rd.form == .path and
         pqdecode.Reader.isPath(rd.form.path);
-    if (is_pq and (project != null or bounds.len > 0)) {
+    if (is_pq) {
         const pr = pqdecode.Reader.openProjected(env.arena, rd.form.path, project) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
         pr.bounds = bounds;
+        env.pq_readers += 1;
+        env.pq_reader = pr;
         return pr.source();
     }
     return openSourceAll(env, rd, hints);
