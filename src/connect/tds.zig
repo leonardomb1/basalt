@@ -493,21 +493,10 @@ const TlsShim = struct {
     }
 };
 
-const sql_vtable = sqlmod.Conn.VTable{ .queryCursor = sqlQueryCursor, .exec = sqlExec, .close = sqlClose };
+const sql_vtable = sqlmod.connVTable(Conn);
 
-fn sqlQueryCursor(ptr: *anyopaque, q: []const u8) anyerror!sqlmod.Cursor {
-    const self: *Conn = @ptrCast(@alignCast(ptr));
-    return self.queryCursor(q);
-}
-fn sqlExec(ptr: *anyopaque, q: []const u8) anyerror!void {
-    const self: *Conn = @ptrCast(@alignCast(ptr));
-    return self.exec(q);
-}
-fn sqlClose(ptr: *anyopaque) void {
-    const self: *Conn = @ptrCast(@alignCast(ptr));
-    self.close();
-}
-
+/// Hand-written: the tds cursor is a separate `TdsCursor` with its own batch
+/// reader, so it does not fit `sqlmod.textCursorVTable`.
 const cursor_vtable = sqlmod.Cursor.VTable{ .schema = curSchema, .nextBatch = curNext, .close = curClose };
 
 fn curSchema(ptr: *anyopaque) types.Schema {

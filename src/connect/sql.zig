@@ -156,6 +156,51 @@ pub const Conn = struct {
     }
 };
 
+/// Builds the `*anyopaque` shims a driver needs to satisfy `Conn.VTable`, from a
+/// concrete connection type exposing `queryCursor`/`exec`/`close`.
+pub fn connVTable(comptime T: type) Conn.VTable {
+    return .{
+        .queryCursor = struct {
+            fn f(p: *anyopaque, q: []const u8) anyerror!Cursor {
+                return @as(*T, @ptrCast(@alignCast(p))).queryCursor(q);
+            }
+        }.f,
+        .exec = struct {
+            fn f(p: *anyopaque, q: []const u8) anyerror!void {
+                return @as(*T, @ptrCast(@alignCast(p))).exec(q);
+            }
+        }.f,
+        .close = struct {
+            fn f(p: *anyopaque) void {
+                @as(*T, @ptrCast(@alignCast(p))).close();
+            }
+        }.f,
+    };
+}
+
+/// `Cursor.VTable` for drivers whose cursor is the connection itself and which
+/// pull rows through the shared text-protocol reader. Drivers with a distinct
+/// cursor type (tds) write their own shims.
+pub fn textCursorVTable(comptime T: type) Cursor.VTable {
+    return .{
+        .schema = struct {
+            fn f(p: *anyopaque) types.Schema {
+                return @as(*T, @ptrCast(@alignCast(p))).cur_schema.*;
+            }
+        }.f,
+        .nextBatch = struct {
+            fn f(p: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
+                return fetchTextBatch(@as(*T, @ptrCast(@alignCast(p))), arena);
+            }
+        }.f,
+        .close = struct {
+            fn f(p: *anyopaque) void {
+                closeTextCursor(@as(*T, @ptrCast(@alignCast(p))));
+            }
+        }.f,
+    };
+}
+
 pub const Dialect = enum {
     postgres,
     mysql,

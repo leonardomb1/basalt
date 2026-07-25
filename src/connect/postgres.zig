@@ -373,37 +373,8 @@ pub const Conn = struct {
     }
 };
 
-const sql_vtable = sqlmod.Conn.VTable{ .queryCursor = sqlQueryCursor, .exec = sqlExec, .close = sqlClose };
-
-fn sqlQueryCursor(ptr: *anyopaque, q: []const u8) anyerror!sqlmod.Cursor {
-    const self: *Conn = @ptrCast(@alignCast(ptr));
-    return self.queryCursor(q);
-}
-fn sqlExec(ptr: *anyopaque, q: []const u8) anyerror!void {
-    const self: *Conn = @ptrCast(@alignCast(ptr));
-    return self.exec(q);
-}
-fn sqlClose(ptr: *anyopaque) void {
-    const self: *Conn = @ptrCast(@alignCast(ptr));
-    self.close();
-}
-
-const cursor_vtable = sqlmod.Cursor.VTable{ .schema = curSchema, .nextBatch = curNext, .close = curClose };
-
-fn curSchema(ptr: *anyopaque) types.Schema {
-    const self: *Conn = @ptrCast(@alignCast(ptr));
-    return self.cur_schema.*;
-}
-fn curNext(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
-    const self: *Conn = @ptrCast(@alignCast(ptr));
-    return sqlmod.fetchTextBatch(self, arena);
-}
-fn curClose(ptr: *anyopaque) void {
-    const self: *Conn = @ptrCast(@alignCast(ptr));
-    sqlmod.closeTextCursor(self);
-}
-
-// --- result parsing ---
+const sql_vtable = sqlmod.connVTable(Conn);
+const cursor_vtable = sqlmod.textCursorVTable(Conn);
 
 const PgCol = struct { name: []const u8, oid: i32, engine_type: types.Type };
 const RowDesc = struct { cols: []PgCol, fields: []types.Schema.Field };
