@@ -459,8 +459,16 @@ pub const CsvWriter = struct {
         while (r < batch.len) : (r += 1) {
             for (batch.columns, 0..) |*col, i| {
                 if (i > 0) try w.writeByte(',');
-                const v = col.getValue(r);
-                if (!v.isNull()) try writeField(w, try eval.valueToString(arena, v));
+                switch (col.ty.kind) {
+                    // Text columns already hold their bytes: read straight out of
+                    // the Arrow buffers rather than boxing into a `Value` only for
+                    // `valueToString` to switch back out and hand back the slice.
+                    .string, .bytes => if (col.validity.get(r)) try writeField(w, col.data.bytes.at(r)),
+                    else => {
+                        const v = col.getValue(r);
+                        if (!v.isNull()) try writeField(w, try eval.valueToString(arena, v));
+                    },
+                }
             }
             try w.writeByte('\n');
         }
