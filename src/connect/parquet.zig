@@ -279,6 +279,13 @@ pub const PageHeader = struct {
     encoding: Encoding = .plain,
     /// Bytes consumed by the header itself; the page body follows it.
     header_len: usize = 0,
+    /// Data page v2 only: level sections sit *outside* the compressed region and
+    /// their lengths come from the header rather than an inline prefix.
+    def_levels_len: usize = 0,
+    rep_levels_len: usize = 0,
+    /// Data page v2 may declare its values uncompressed even when the chunk has
+    /// a codec.
+    is_compressed: bool = true,
 };
 
 /// Decodes a page header from the start of `bytes`, reporting how many bytes it
@@ -294,15 +301,34 @@ pub fn parsePageHeader(bytes: []const u8) Error!PageHeader {
             1 => h.ty = @enumFromInt(try r.readI32()),
             2 => h.uncompressed_page_size = try r.readI32(),
             3 => h.compressed_page_size = try r.readI32(),
-            // v1 data page, dictionary page and v2 data page each carry their
-            // own count and encoding; whichever is present wins.
-            5, 7, 8 => try readPageDetail(&r, &h),
+            // v1 data page and dictionary page
+            5, 7 => try readPageDetail(&r, &h),
+            8 => try readPageV2Detail(&r, &h),
             else => try r.skip(f.ty),
         }
     }
     try r.structEnd();
     h.header_len = r.pos;
     return h;
+}
+
+/// DataPageHeaderV2 numbers its fields differently from v1: the encoding is
+/// field 4, and the level byte lengths are fields 5 and 6.
+fn readPageV2Detail(r: *thrift.Reader, h: *PageHeader) Error!void {
+    try r.structBegin();
+    while (true) {
+        const f = try r.readField();
+        if (f.ty == .stop) break;
+        switch (f.id) {
+            1 => h.num_values = try r.readI32(),
+            4 => h.encoding = @enumFromInt(try r.readI32()),
+            5 => h.def_levels_len = @intCast(@max(0, try r.readI32())),
+            6 => h.rep_levels_len = @intCast(@max(0, try r.readI32())),
+            7 => h.is_compressed = f.ty == .bool_true,
+            else => try r.skip(f.ty),
+        }
+    }
+    try r.structEnd();
 }
 
 fn readPageDetail(r: *thrift.Reader, h: *PageHeader) Error!void {
@@ -348,12 +374,25 @@ pub fn readPage(
     const clen: usize = @intCast(h.compressed_page_size);
     if (body_start + clen > bytes.len) return Error.NotParquet;
 
-    const raw = try codec.decompress(
-        arena,
-        compression,
-        bytes[body_start..][0..clen],
-        @intCast(h.uncompressed_page_size),
-    );
+    const body = bytes[body_start..][0..clen];
+    const ulen: usize = @intCast(h.uncompressed_page_size);
+
+    if (h.ty == .data_page_v2) {
+        // v2 layout: [rep levels][def levels][values]. Only the values are
+        // compressed, so the levels must be carved off before decompressing —
+        // running the codec over the whole body would fail or produce garbage.
+        const lvl = h.rep_levels_len + h.def_levels_len;
+        if (lvl > body.len or lvl > ulen) return Error.NotParquet;
+        const codec_used: Codec = if (h.is_compressed) compression else .uncompressed;
+        const values = try codec.decompress(arena, codec_used, body[lvl..], ulen - lvl);
+
+        const out = try arena.alloc(u8, ulen);
+        @memcpy(out[0..lvl], body[0..lvl]);
+        @memcpy(out[lvl..], values);
+        return .{ .header = h, .data = out, .next_offset = body_start + clen };
+    }
+
+    const raw = try codec.decompress(arena, compression, body, ulen);
     return .{ .header = h, .data = raw, .next_offset = body_start + clen };
 }
 
