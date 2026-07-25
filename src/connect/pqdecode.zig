@@ -671,6 +671,16 @@ fn appendDataPage(
 
     switch (pg.header.encoding) {
         .plain => {
+            // Fast path: a page of fixed-width values with no nulls and no unit
+            // conversion is just a typed array. Skipping the per-value `Value`
+            // round trip is worth a special case on the hottest loop there is.
+            //
+            // `present == n` rather than `defs == null`: most writers mark every
+            // column OPTIONAL, so levels are present even when no row is null,
+            // and keying off their absence would never fire in practice.
+            if (present == n and tscale == 1 and try bulkPlain(arena, b, ty, meta.ty, body, n)) {
+                return n;
+            }
             var cur = PlainCursor.init(meta.ty, elem.type_length orelse 0, body);
             try emit(b, ty, defs, max_def, n, &cur, null, null, tscale);
         },
@@ -717,6 +727,57 @@ fn appendDataPage(
         else => return Error.UnsupportedParquetEncoding,
     }
     return n;
+}
+
+/// Decodes a whole PLAIN page of fixed-width values directly into the column's
+/// typed store. Returns false when the shape is not one of the handled cases,
+/// leaving the caller to take the general path.
+fn bulkPlain(
+    arena: std.mem.Allocator,
+    b: *column.Builder,
+    ty: types.Type,
+    phys: pq.PhysicalType,
+    body: []const u8,
+    n: usize,
+) Error!bool {
+    switch (phys) {
+        .int64 => {
+            if (ty.kind != .int) return false;
+            if (body.len < n * 8) return Error.CorruptParquetPage;
+            const out = try arena.alloc(i64, n);
+            for (out, 0..) |*o, i| o.* = std.mem.readInt(i64, body[i * 8 ..][0..8], .little);
+            b.appendBulk(i64, out) catch return false;
+            return true;
+        },
+        .int32 => {
+            if (ty.kind != .int) return false;
+            if (body.len < n * 4) return Error.CorruptParquetPage;
+            const out = try arena.alloc(i64, n);
+            for (out, 0..) |*o, i| o.* = std.mem.readInt(i32, body[i * 4 ..][0..4], .little);
+            b.appendBulk(i64, out) catch return false;
+            return true;
+        },
+        .double => {
+            if (ty.kind != .float) return false;
+            if (body.len < n * 8) return Error.CorruptParquetPage;
+            const out = try arena.alloc(f64, n);
+            for (out, 0..) |*o, i| o.* = @bitCast(std.mem.readInt(u64, body[i * 8 ..][0..8], .little));
+            b.appendBulk(f64, out) catch return false;
+            return true;
+        },
+        .float => {
+            if (ty.kind != .float) return false;
+            if (body.len < n * 4) return Error.CorruptParquetPage;
+            const out = try arena.alloc(f64, n);
+            for (out, 0..) |*o, i| {
+                const raw = std.mem.readInt(u32, body[i * 4 ..][0..4], .little);
+                o.* = @floatCast(@as(f32, @bitCast(raw)));
+            }
+            b.appendBulk(f64, out) catch return false;
+            return true;
+        },
+        else => return false,
+    }
 }
 
 /// Emits integer-shaped decoded values, interleaving nulls by definition level.

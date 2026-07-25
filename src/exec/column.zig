@@ -385,6 +385,23 @@ pub const Builder = struct {
         return b;
     }
 
+    /// Appends `n` non-null values straight into the typed store.
+    ///
+    /// The per-row path boxes every value into a `Value` and switches on its
+    /// kind; for a page of plain fixed-width values none of that is needed, and
+    /// this is the difference between a memcpy-shaped loop and a million
+    /// tagged-union round trips.
+    pub fn appendBulk(self: *Builder, comptime T: type, vals: []const T) !void {
+        switch (self.store) {
+            inline .b, .i32, .i64, .f64, .dec => |*l| {
+                if (@TypeOf(l.items) != []T) return error.BulkTypeMismatch;
+                try l.appendSlice(vals);
+            },
+            .bytes => return error.BulkTypeMismatch,
+        }
+        try self.valid.appendNTimes(true, vals.len);
+    }
+
     pub fn append(self: *Builder, v: Value) !void {
         const ok = !v.isNull();
         try self.valid.append(ok);
