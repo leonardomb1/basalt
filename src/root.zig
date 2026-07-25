@@ -27,6 +27,7 @@ pub const azure = @import("connect/azure.zig");
 pub const codec = @import("connect/codec.zig");
 pub const thrift = @import("connect/thrift.zig");
 pub const parquet = @import("connect/parquet.zig");
+pub const pqdecode = @import("connect/pqdecode.zig");
 pub const split = @import("connect/split.zig");
 pub const wal = @import("connect/wal.zig");
 pub const ssrp = @import("connect/ssrp.zig");

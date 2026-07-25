@@ -12,6 +12,7 @@ const batchmod = @import("../exec/batch.zig");
 const column = @import("../exec/column.zig");
 const eval = @import("../exec/eval.zig");
 const csv = @import("../connect/csv.zig");
+const pqdecode = @import("../connect/pqdecode.zig");
 const tablemod = @import("../connect/table.zig");
 const driver = @import("../connect/driver.zig");
 const starrocks = @import("../connect/starrocks.zig");
@@ -760,10 +761,13 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     try snk.close();
 }
 
+/// Gates the mmap'd parallel-CSV fast paths. A `.parquet` path shares the `csv`
+/// connector but is not CSV — without this it would be memory-mapped and parsed
+/// as text, silently yielding binary garbage instead of rows.
 fn isLocalCsvRead(rd: ast.Read) bool {
     if (!std.mem.eql(u8, rd.connector, "csv")) return false;
     return switch (rd.form) {
-        .path => |p| !csv.CsvReader.isUrl(p),
+        .path => |p| !csv.CsvReader.isUrl(p) and !pqdecode.Reader.isPath(p),
         else => false,
     };
 }
@@ -2636,6 +2640,11 @@ fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
     }
     if (std.mem.eql(u8, rd.connector, "csv")) {
         if (rd.form != .path) return planErr(env.diag, "read csv needs a quoted path");
+        if (pqdecode.Reader.isPath(rd.form.path)) {
+            const pr = pqdecode.Reader.open(env.arena, rd.form.path) catch |e|
+                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
+            return pr.source();
+        }
         const reader = csv.CsvReader.open(env.arena, rd.form.path) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open input CSV `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
         return reader.source();
@@ -2903,6 +2912,10 @@ fn sqlConnInfo(conn: ast.Connection) ?SqlConnInfo {
 
 fn resolveSchema(ctx_ptr: *anyopaque, arena: std.mem.Allocator, rd: ast.Read, conn_opt: ?ast.Connection) anyerror!?types.Schema {
     const gpa = @as(*std.mem.Allocator, @ptrCast(@alignCast(ctx_ptr))).*;
+    if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path and pqdecode.Reader.isPath(rd.form.path)) {
+        const pr = pqdecode.Reader.open(arena, rd.form.path) catch return null;
+        return pr.schema;
+    }
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path and csv.CsvReader.isUrl(rd.form.path)) {
         const r = csv.CsvReader.open(arena, rd.form.path) catch return null;
         defer r.close();
