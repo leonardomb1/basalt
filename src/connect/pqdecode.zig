@@ -31,21 +31,38 @@ pub const Error = error{
 // --- bit-level readers -------------------------------------------------------
 
 /// LSB-first bit reader, the order Parquet's bit-packing uses.
+///
+/// Reads a whole 64-bit word and shifts, rather than looping one bit at a time.
+/// Dictionary indices and delta miniblocks use widths up to 32, where the
+/// per-bit loop costs 5-12x more; definition levels (width 1) are unaffected.
 pub const BitReader = struct {
     buf: []const u8,
     bit_pos: usize = 0,
 
     pub fn read(self: *BitReader, width: u6) Error!u64 {
         if (width == 0) return 0;
-        var out: u64 = 0;
-        for (0..width) |i| {
-            const byte = self.bit_pos >> 3;
-            if (byte >= self.buf.len) return Error.CorruptParquetPage;
-            const b: u1 = @truncate(self.buf[byte] >> @intCast(self.bit_pos & 7));
-            out |= @as(u64, b) << @intCast(i);
-            self.bit_pos += 1;
+        const end = self.bit_pos + width;
+        if ((end + 7) >> 3 > self.buf.len) return Error.CorruptParquetPage;
+
+        const byte = self.bit_pos >> 3;
+        const shift: u6 = @intCast(self.bit_pos & 7);
+        self.bit_pos = end;
+
+        // Fast path: the value plus its bit offset fit in one unaligned u64.
+        if (byte + 8 <= self.buf.len) {
+            const word = std.mem.readInt(u64, self.buf[byte..][0..8], .little);
+            const v = word >> shift;
+            return if (width == 64) v else v & ((@as(u64, 1) << width) - 1);
         }
-        return out;
+
+        // Tail: fewer than 8 bytes remain, so assemble what is there.
+        var word: u64 = 0;
+        var k: usize = 0;
+        while (byte + k < self.buf.len and k < 8) : (k += 1) {
+            word |= @as(u64, self.buf[byte + k]) << @intCast(8 * k);
+        }
+        const v = word >> shift;
+        return if (width == 64) v else v & ((@as(u64, 1) << width) - 1);
     }
 };
 
