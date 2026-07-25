@@ -101,9 +101,13 @@ const ColBuf = struct {
 
     /// Statistics are per row group, so they track only values since the last
     /// flush.
-    fn observe(self: *ColBuf, v: Value) void {
-        if (self.min == null or order(v, self.min.?) == .lt) self.min = v;
-        if (self.max == null or order(v, self.max.?) == .gt) self.max = v;
+    ///
+    /// String and byte values must be copied: the incoming `Value` borrows from
+    /// the *batch* arena, which is recycled long before the row group flushes.
+    /// Keeping the borrowed slice reads freed memory at flush time.
+    fn observe(self: *ColBuf, arena: std.mem.Allocator, v: Value) !void {
+        if (self.min == null or order(v, self.min.?) == .lt) self.min = try own(arena, v);
+        if (self.max == null or order(v, self.max.?) == .gt) self.max = try own(arena, v);
     }
 
     fn pushBit(self: *ColBuf, b: bool) !void {
@@ -123,6 +127,15 @@ const ColBuf = struct {
         }
     }
 };
+
+/// Copies any value that borrows memory, so it can outlive the batch it came from.
+fn own(arena: std.mem.Allocator, v: Value) !Value {
+    return switch (v) {
+        .string => |x| .{ .string = try arena.dupe(u8, x) },
+        .bytes => |x| .{ .bytes = try arena.dupe(u8, x) },
+        else => v,
+    };
+}
 
 const ChunkMeta = struct {
     offset: i64,
@@ -246,7 +259,7 @@ pub const Writer = struct {
                     cb.nulls += 1;
                     continue;
                 }
-                cb.observe(v);
+                try cb.observe(self.arena, v);
                 try encodePlain(cb, m, v);
             }
             self.rows += 1;
