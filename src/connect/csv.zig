@@ -127,7 +127,7 @@ pub const CsvReader = struct {
         if (self.done) return null;
         const ncols = self.schema.fields.len;
         const builders = try arena.alloc(column.Builder, ncols);
-        for (builders, self.schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
+        for (builders, self.schema.fields) |*b, f| b.* = try column.Builder.initCapacity(arena, f.ty, BATCH_ROWS);
 
         var rows: usize = 0;
         while (rows < BATCH_ROWS) {
@@ -267,7 +267,7 @@ pub const CsvSliceReader = struct {
         if (self.pos >= self.data.len) return null;
         const ncols = self.schema.fields.len;
         const builders = try arena.alloc(column.Builder, ncols);
-        for (builders, self.schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
+        for (builders, self.schema.fields) |*b, f| b.* = try column.Builder.initCapacity(arena, f.ty, BATCH_ROWS);
 
         var rows: usize = 0;
         while (rows < BATCH_ROWS and self.pos < self.data.len) {

@@ -365,6 +365,26 @@ pub const Builder = struct {
         return .{ .arena = arena, .ty = ty, .valid = std.array_list.Managed(bool).init(arena), .store = store };
     }
 
+    /// Starting guess for a byte column's payload, in bytes per row. Only sizes
+    /// the first allocation — the buffer still grows if rows are longer.
+    const BYTES_PER_ROW_HINT = 24;
+
+    /// `init` with the buffers pre-sized for `rows`. Callers that know their
+    /// batch size should use this: the values buffer otherwise grows by doubling,
+    /// and each growth memcpys everything appended so far.
+    pub fn initCapacity(arena: std.mem.Allocator, ty: types.Type, rows: usize) !Builder {
+        var b = init(arena, ty);
+        try b.valid.ensureTotalCapacity(rows);
+        switch (b.store) {
+            .bytes => |*l| {
+                try l.ends.ensureTotalCapacity(rows);
+                try l.values.ensureTotalCapacity(rows * BYTES_PER_ROW_HINT);
+            },
+            inline else => |*l| try l.ensureTotalCapacity(rows),
+        }
+        return b;
+    }
+
     pub fn append(self: *Builder, v: Value) !void {
         const ok = !v.isNull();
         try self.valid.append(ok);

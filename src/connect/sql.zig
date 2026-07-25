@@ -108,7 +108,7 @@ pub fn fetchTextBatch(conn: anytype, arena: std.mem.Allocator) !?Batch {
     const ncol = conn.cols.len;
     if (ncol == 0) return null;
     const builders = try arena.alloc(column.Builder, ncol);
-    for (conn.cols, builders) |c, *b| b.* = column.Builder.init(arena, c.engine_type);
+    for (conn.cols, builders) |c, *b| b.* = try column.Builder.initCapacity(arena, c.engine_type, STREAM_ROWS);
 
     var n: usize = 0;
     while (n < STREAM_ROWS) {
