@@ -9,7 +9,7 @@ const col = @import("column.zig");
 pub const Batch = struct {
     schema: *const types.Schema,
     columns: []col.Column,
-    len: usize, // rows
+    len: usize,
 
     pub fn column(self: Batch, name: []const u8) ?*col.Column {
         const idx = self.schema.indexOf(name) orelse return null;

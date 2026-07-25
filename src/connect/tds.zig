@@ -19,9 +19,9 @@ const Batch = batchmod.Batch;
 const PKT_PRELOGIN = 0x12;
 const PKT_LOGIN7 = 0x10;
 const PKT_SQLBATCH = 0x01;
-const PKT_BULK = 0x07; // Bulk Load BCP data
+const PKT_BULK = 0x07;
 const STATUS_EOM = 0x01;
-const BULK_PKT_PAYLOAD = 4088; // default 4096-byte TDS packet minus the 8-byte header
+const BULK_PKT_PAYLOAD = 4088;
 
 pub const Error = error{ TdsProtocol, LoginFailed, QueryFailed, EncryptionRequired, TdsTlsRefused, UnsupportedTdsType } || std.mem.Allocator.Error || std.net.Stream.WriteError || std.net.Stream.ReadError;
 
@@ -32,18 +32,13 @@ pub const Conn = struct {
     write_buf: [SOCK_BUF]u8 = undefined,
     sr: std.net.Stream.Reader = undefined,
     sw: std.net.Stream.Writer = undefined,
-    msg: std.array_list.Managed(u8), // reassembled response message payload (login path)
+    msg: std.array_list.Managed(u8),
     last_error: []const u8 = "",
     tls: ?*sqlmod.TlsState = null,
-    shim: TlsShim = undefined, // valid iff tls != null
-    fed_required: bool = false, // server asked for federated (Azure AD) auth
-    fed_nonce: ?[32]u8 = null, // server PRELOGIN nonce, echoed in the FEDAUTH ext
-    // Max packet payload for outgoing SQLBatch/bulk packets. Starts at the 4096
-    // default; LOGIN7 requests 16384 and the server's ENVCHANGE(4) sets the
-    // negotiated value (fewer header+flush round trips per MB of bulk data).
+    shim: TlsShim = undefined,
+    fed_required: bool = false,
+    fed_nonce: ?[32]u8 = null,
     pkt_payload: usize = BULK_PKT_PAYLOAD,
-    // Row count from the last DONE token whose DONE_COUNT flag was set; reset
-    // by bulkFinish so a bulk load's ack can't be mistaken for its result.
     last_done_count: ?u64 = null,
 
     pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sqlmod.TlsMode) !*Conn {
@@ -66,7 +61,7 @@ pub const Conn = struct {
     /// library) instead of a SQL password. The caller fetches the token (see
     /// aad.ropcToken); this only speaks the wire protocol.
     pub fn connectAad(gpa: std.mem.Allocator, host: []const u8, port: u16, token: []const u8, database: []const u8, tls_mode: sqlmod.TlsMode) !*Conn {
-        if (tls_mode == .off) return error.EncryptionRequired; // AAD requires TLS
+        if (tls_mode == .off) return error.EncryptionRequired;
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
         driver.tuneSocket(stream.handle);
         const self = try gpa.create(Conn);
@@ -120,10 +115,10 @@ pub const Conn = struct {
     }
     fn flushOut(self: *Conn) !void {
         if (self.tls) |t| {
-            try t.client.writer.flush(); // seal TLS records into the shim...
-            try self.shim.writer.flush(); // ...forward them to the socket writer...
+            try t.client.writer.flush();
+            try self.shim.writer.flush();
         }
-        try self.sw.interface.flush(); // ...and push everything down the socket
+        try self.sw.interface.flush();
     }
 
     pub fn sqlConn(self: *Conn) sqlmod.Conn {
@@ -138,8 +133,6 @@ pub const Conn = struct {
         cur.* = .{
             .gpa = self.gpa,
             .conn = self,
-            // Reads through the conn's own (possibly TLS) reader — sharing one
-            // buffered reader also removes the old fragile second-reader setup.
             .reader = PacketReader.init(self.gpa, self.rd()),
             .meta_arena = std.heap.ArenaAllocator.init(self.gpa),
             .cols = &.{},
@@ -150,7 +143,7 @@ pub const Conn = struct {
             cur.reader.deinit();
             cur.meta_arena.deinit();
             self.gpa.destroy(cur);
-            return e; // leave conn open: the caller owns it (can read last_error) and closes it
+            return e;
         };
         return .{ .ptr = cur, .vtable = &cursor_vtable };
     }
@@ -172,19 +165,19 @@ pub const Conn = struct {
             const token = p[i];
             i += 1;
             switch (token) {
-                0xAA => { // ERROR
+                0xAA => {
                     if (i + 2 > p.len) return error.TdsProtocol;
                     const len = rdU16(p, i);
                     if (i + 2 + len > p.len) return error.TdsProtocol;
                     self.last_error = try self.decodeError(p[i + 2 .. i + 2 + len]);
                     return error.QueryFailed;
                 },
-                0xAB, 0xE3, 0xA9, 0xA4, 0xA5 => { // length-prefixed (INFO/ENVCHANGE/…)
+                0xAB, 0xE3, 0xA9, 0xA4, 0xA5 => {
                     if (i + 2 > p.len) return error.TdsProtocol;
                     i += 2 + rdU16(p, i);
                 },
-                0x79 => i += 4, // RETURNSTATUS
-                0xFD, 0xFE, 0xFF => { // DONE/DONEPROC/DONEINPROC
+                0x79 => i += 4,
+                0xFD, 0xFE, 0xFF => {
                     if (i + 12 > p.len) return error.TdsProtocol;
                     if (parseDoneRowCount(token, p[i .. i + 12])) |n| self.last_done_count = n;
                     i += 12;
@@ -193,8 +186,6 @@ pub const Conn = struct {
             }
         }
     }
-
-    // --- packet framing ---
 
     /// Frame a message into one or more TDS packets of <= the negotiated packet
     /// size (4096; 4088 payload), setting EOM only on the last. Splitting matters:
@@ -234,20 +225,18 @@ pub const Conn = struct {
         }
     }
 
-    // --- prelogin ---
-
     /// PRELOGIN that advertises FEDAUTHREQUIRED + encryption-on (Azure AD). The
     /// option table holds VERSION, ENCRYPTION, FEDAUTHREQUIRED, then data. Parses
     /// the response for the server's FEDAUTHREQUIRED value and any 32-byte nonce.
     fn preloginFed(self: *Conn) !void {
         const payload = [_]u8{
-            0x00, 0x00, 0x10, 0x00, 0x06, // VERSION         off=16 len=6
-            0x01, 0x00, 0x16, 0x00, 0x01, // ENCRYPTION      off=22 len=1
-            0x06, 0x00, 0x17, 0x00, 0x01, // FEDAUTHREQUIRED off=23 len=1
-            0xFF, // terminator
-            0x11, 0x00, 0x00, 0x00, 0x00, 0x00, // version (off 16)
-            0x01, // ENCRYPT_ON (off 22) — AAD mandates TLS
-            0x01, // FEDAUTHREQUIRED = yes, client supports it (off 23)
+            0x00, 0x00, 0x10, 0x00, 0x06,
+            0x01, 0x00, 0x16, 0x00, 0x01,
+            0x06, 0x00, 0x17, 0x00, 0x01,
+            0xFF,
+            0x11, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01,
+            0x01,
         };
         try self.writePacket(PKT_PRELOGIN, &payload);
         try self.readMessage();
@@ -260,11 +249,11 @@ pub const Conn = struct {
             const len: usize = (@as(usize, p[i + 3]) << 8) | p[i + 4];
             if (off + len > p.len) continue;
             switch (tok) {
-                0x01 => { // ENCRYPTION — must be on/required (we offered on)
+                0x01 => {
                     if (len >= 1 and !(p[off] == 0x01 or p[off] == 0x03)) return error.TdsTlsRefused;
                 },
-                0x06 => self.fed_required = (len >= 1 and p[off] == 0x01), // FEDAUTHREQUIRED
-                0x07 => if (len == 32) { // NONCEOPT
+                0x06 => self.fed_required = (len >= 1 and p[off] == 0x01),
+                0x07 => if (len == 32) {
                     var n: [32]u8 = undefined;
                     @memcpy(&n, p[off .. off + 32]);
                     self.fed_nonce = n;
@@ -276,30 +265,27 @@ pub const Conn = struct {
 
     fn prelogin(self: *Conn, want_tls: bool) !void {
         const payload = [_]u8{
-            0x00, 0x00, 0x0B, 0x00, 0x06, // VERSION  off=11 len=6
-            0x01, 0x00, 0x11, 0x00, 0x01, // ENCRYPTION off=17 len=1
-            0xFF, // terminator
-            0x11, 0x00, 0x00, 0x00, 0x00, 0x00, // version
-            if (want_tls) @as(u8, 0x01) else 0x02, // ENCRYPT_ON / ENCRYPT_NOT_SUP
+            0x00, 0x00, 0x0B, 0x00, 0x06,
+            0x01, 0x00, 0x11, 0x00, 0x01,
+            0xFF,
+            0x11, 0x00, 0x00, 0x00, 0x00, 0x00,
+            if (want_tls) @as(u8, 0x01) else 0x02,
         };
         try self.writePacket(PKT_PRELOGIN, &payload);
         try self.readMessage();
 
-        // find ENCRYPTION (token 0x01) in the response option table
         const p = self.msg.items;
         var i: usize = 0;
         while (i + 5 <= p.len and p[i] != 0xFF) : (i += 5) {
             if (p[i] == 0x01) {
                 const off: usize = (@as(usize, p[i + 1]) << 8) | p[i + 2];
                 if (off >= p.len) return error.TdsProtocol;
-                const enc_on = (p[off] == 0x01 or p[off] == 0x03); // ENCRYPT_ON / ENCRYPT_REQ
-                if (want_tls and !enc_on) return error.TdsTlsRefused; // no silent plaintext downgrade
+                const enc_on = (p[off] == 0x01 or p[off] == 0x03);
+                if (want_tls and !enc_on) return error.TdsTlsRefused;
                 if (!want_tls and enc_on) return error.EncryptionRequired;
             }
         }
     }
-
-    // --- login7 ---
 
     fn login(self: *Conn, user: []const u8, password: []const u8, database: []const u8, host: []const u8) !void {
         const payload = try buildLogin7(self.gpa, user, password, database, host);
@@ -317,34 +303,34 @@ pub const Conn = struct {
             const token = p[i];
             i += 1;
             switch (token) {
-                0xAD => { // LOGINACK
+                0xAD => {
                     if (i + 2 > p.len) return error.TdsProtocol;
                     const len = rdU16(p, i);
                     i += 2 + len;
                     ok = true;
                 },
-                0xAA => { // ERROR
+                0xAA => {
                     if (i + 2 > p.len) return error.TdsProtocol;
                     const len = rdU16(p, i);
                     self.last_error = try self.decodeError(p[i + 2 .. i + 2 + len]);
                     return error.LoginFailed;
                 },
-                0xAB => { // INFO
+                0xAB => {
                     if (i + 2 > p.len) return error.TdsProtocol;
                     i += 2 + rdU16(p, i);
                 },
-                0xE3 => { // ENVCHANGE; type 4 = negotiated packet size
+                0xE3 => {
                     if (i + 2 > p.len) return error.TdsProtocol;
                     const len = rdU16(p, i);
                     if (i + 2 + len > p.len) return error.TdsProtocol;
                     if (parseEnvPacketSize(p[i + 2 .. i + 2 + len])) |sz| self.pkt_payload = sz - 8;
                     i += 2 + len;
                 },
-                0xEE => { // FEDAUTHINFO — 4-byte length + data (AAD flows)
+                0xEE => {
                     if (i + 4 > p.len) return error.TdsProtocol;
                     i += 4 + std.mem.readInt(u32, p[i..][0..4], .little);
                 },
-                0xAE => { // FEATUREEXTACK — (FeatureId, u32 len, data)* terminated by 0xFF
+                0xAE => {
                     while (i < p.len) {
                         const fid = p[i];
                         i += 1;
@@ -353,8 +339,8 @@ pub const Conn = struct {
                         i += 4 + std.mem.readInt(u32, p[i..][0..4], .little);
                     }
                 },
-                0xFD, 0xFE, 0xFF => i += 12, // DONE*
-                0x79 => i += 4, // RETURNSTATUS
+                0xFD, 0xFE, 0xFF => i += 12,
+                0x79 => i += 4,
                 else => break,
             }
         }
@@ -367,22 +353,19 @@ pub const Conn = struct {
         const msglen: usize = rdU16(body, 6);
         const utf16 = body[8..@min(body.len, 8 + msglen * 2)];
         const out = try self.gpa.alloc(u8, utf16.len / 2);
-        for (out, 0..) |*c, k| c.* = utf16[k * 2]; // ASCII slice of UTF16LE
+        for (out, 0..) |*c, k| c.* = utf16[k * 2];
         return out;
     }
-
-    // --- query ---
 
     fn sendBatch(self: *Conn, sql: []const u8) !void {
         var payload = std.array_list.Managed(u8).init(self.gpa);
         defer payload.deinit();
-        // ALL_HEADERS: a single transaction-descriptor header (no active txn)
         try payload.appendSlice(&[_]u8{
-            22, 0, 0, 0, // TotalLength
-            18, 0, 0, 0, // HeaderLength
-            0x02, 0x00, // header type = transaction descriptor
-            0, 0, 0, 0, 0, 0, 0, 0, // transaction descriptor
-            1, 0, 0, 0, // outstanding request count
+            22, 0, 0, 0,
+            18, 0, 0, 0,
+            0x02, 0x00,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            1, 0, 0, 0,
         });
         const u16s = try std.unicode.utf8ToUtf16LeAlloc(self.gpa, sql);
         defer self.gpa.free(u16s);
@@ -392,8 +375,6 @@ pub const Conn = struct {
         }
         try self.writePacket(PKT_SQLBATCH, payload.items);
     }
-
-    // --- bulk load (INSERT BULK + BCP token stream) ---
 
     /// Send `INSERT BULK …` and read the server's acknowledgment; the bulk data
     /// then streams via `bulkPacket`, finished by `bulkFinish`.
@@ -438,14 +419,12 @@ const TlsShim = struct {
     inner_r: *std.Io.Reader,
     inner_w: *std.Io.Writer,
     handshaking: bool = true,
-    remaining: usize = 0, // unread payload bytes of the current wrapped packet
+    remaining: usize = 0,
     reader: std.Io.Reader,
     writer: std.Io.Writer,
     rbuf: [shim_buf_len]u8 = undefined,
     wbuf: [shim_buf_len]u8 = undefined,
 
-    // The TLS client requires its input reader to buffer at least one
-    // ciphertext record, and asks its output writer for record-sized slices.
     const shim_buf_len = @import("tls_client.zig").min_buffer_len;
     const reader_vtable = std.Io.Reader.VTable{ .stream = readStream };
     const writer_vtable = std.Io.Writer.VTable{ .drain = drainFn };
@@ -487,8 +466,6 @@ const TlsShim = struct {
         const last = data[data.len - 1];
         for (0..splat) |_| total += try self.put(last);
         if (self.handshaking) {
-            // Nothing else flushes the socket during the handshake (the TLS
-            // client only flushes *this* writer), so push the flight out now.
             self.inner_w.flush() catch return error.WriteFailed;
         }
         return w.consume(total);
@@ -500,8 +477,6 @@ const TlsShim = struct {
             self.inner_w.writeAll(bytes) catch return error.WriteFailed;
             return bytes.len;
         }
-        // Wrap in PRELOGIN packets (EOM on the last chunk). Handshake flights
-        // are small; chunking only matters if one ever exceeds a packet.
         var off: usize = 0;
         while (off < bytes.len) {
             const chunk: usize = @min(bytes.len - off, BULK_PKT_PAYLOAD);
@@ -548,17 +523,13 @@ fn curClose(ptr: *anyopaque) void {
     self.closeCursor();
 }
 
-// ---------------------------------------------------------------------------
-// Streaming token reader
-// ---------------------------------------------------------------------------
-
 /// Reads the TDS response as a continuous byte stream, pulling packets on
 /// demand (respecting the EOM bit). Multi-byte reads transparently span packet
 /// boundaries — so a ROW token straddling two packets is invisible to the parser.
 const SOCK_BUF = 64 * 1024;
 
 const PacketReader = struct {
-    r: *std.Io.Reader, // the connection's cleartext reader (socket or TLS)
+    r: *std.Io.Reader,
     buf: std.array_list.Managed(u8),
     pos: usize = 0,
     eom: bool = false,
@@ -627,11 +598,11 @@ const PacketReader = struct {
     /// NULL; otherwise ignored), then 4-byte-prefixed chunks until a 0-length chunk.
     fn readPlp(self: *PacketReader, arena: std.mem.Allocator) !?[]u8 {
         const total = try self.readU64();
-        if (total == 0xFFFFFFFFFFFFFFFF) return null; // PLP_NULL
+        if (total == 0xFFFFFFFFFFFFFFFF) return null;
         var buf = std.array_list.Managed(u8).init(arena);
         while (true) {
             const chunk = try self.readU32();
-            if (chunk == 0) break; // terminator
+            if (chunk == 0) break;
             const start = buf.items.len;
             try buf.resize(start + chunk);
             try self.readBytes(buf.items[start..]);
@@ -679,7 +650,7 @@ const TdsCursor = struct {
                 return e;
             };
             switch (token) {
-                0x81 => return self.parseColMeta(ma), // COLMETADATA -> header complete
+                0x81 => return self.parseColMeta(ma),
                 0xAA => try self.handleError(),
                 0xAB, 0xE3, 0xA9, 0xA4, 0xA5 => try self.reader.skip(try self.reader.readU16()),
                 0x79 => try self.reader.skip(4),
@@ -747,7 +718,7 @@ const TdsCursor = struct {
         self.cols = try ma.alloc(ColumnDesc, count);
         const fields = try ma.alloc(types.Schema.Field, count);
         for (0..count) |k| {
-            try self.reader.skip(6); // UserType(4) + Flags(2)
+            try self.reader.skip(6);
             var d = try self.parseTypeInfo();
             const namelen: usize = try self.reader.readByte();
             const nbytes = try self.reader.readSlice(ma, namelen * 2);
@@ -833,13 +804,13 @@ const TdsCursor = struct {
                 d.engine_type = tsT;
             },
             0x6A, 0x6C => {
-                _ = try self.reader.readByte(); // max len
+                _ = try self.reader.readByte();
                 const prec = try self.reader.readByte();
                 const scale = try self.reader.readByte();
                 d.scale = scale;
                 d.engine_type = types.Type.decimal(prec, scale).asNullable();
             },
-            0x24 => { // GUIDTYPE (uniqueidentifier): 16 raw bytes -> formatted GUID string
+            0x24 => {
                 _ = try self.reader.readByte();
                 d.engine_type = strT;
                 d.is_guid = true;
@@ -859,45 +830,44 @@ const TdsCursor = struct {
                 d.scale = try self.reader.readByte();
                 d.engine_type = tsT;
             },
-            0xA7, 0xAF => { // (BIG)VARCHAR / (BIG)CHAR — incl. varchar(max) via PLP
+            0xA7, 0xAF => {
                 const ml = try self.reader.readU16();
-                try self.reader.skip(5); // collation
+                try self.reader.skip(5);
                 d.kind = if (ml == 0xFFFF) .plp else .ushortlen;
                 d.engine_type = strT;
             },
-            0xE7, 0xEF => { // (BIG)NVARCHAR / NCHAR — incl. nvarchar(max) via PLP
+            0xE7, 0xEF => {
                 const ml = try self.reader.readU16();
                 try self.reader.skip(5);
                 d.kind = if (ml == 0xFFFF) .plp else .ushortlen;
                 d.engine_type = strT;
                 d.is_unicode = true;
             },
-            0xA5, 0xAD => { // (BIG)VARBINARY / BINARY — incl. varbinary(max) via PLP; -> hex string
+            0xA5, 0xAD => {
                 const ml = try self.reader.readU16();
                 d.kind = if (ml == 0xFFFF) .plp else .ushortlen;
                 d.engine_type = strT;
                 d.is_binary = true;
             },
-            0xF1 => { // XMLTYPE: optional schema info, then a PLP UTF-16 value
-                if (try self.reader.readByte() != 0) { // SchemaPresent
-                    try self.reader.skip(@as(usize, try self.reader.readByte()) * 2); // DBName (B_VARCHAR)
-                    try self.reader.skip(@as(usize, try self.reader.readByte()) * 2); // OwningSchema (B_VARCHAR)
-                    try self.reader.skip(@as(usize, try self.reader.readU16()) * 2); // XmlSchemaCollection (US_VARCHAR)
+            0xF1 => {
+                if (try self.reader.readByte() != 0) {
+                    try self.reader.skip(@as(usize, try self.reader.readByte()) * 2);
+                    try self.reader.skip(@as(usize, try self.reader.readByte()) * 2);
+                    try self.reader.skip(@as(usize, try self.reader.readU16()) * 2);
                 }
                 d.kind = .plp;
                 d.engine_type = strT;
                 d.is_unicode = true;
             },
-            0x22, 0x23, 0x63 => { // IMAGE / TEXT / NTEXT (legacy LOB; value is TEXTPTR-framed)
-                _ = try self.reader.readU32(); // LONGLEN max length
-                if (t == 0x23 or t == 0x63) try self.reader.skip(5); // collation (text/ntext only)
-                // TableName: NumParts (BYTE) then that many US_VARCHAR parts
+            0x22, 0x23, 0x63 => {
+                _ = try self.reader.readU32();
+                if (t == 0x23 or t == 0x63) try self.reader.skip(5);
                 var parts = try self.reader.readByte();
                 while (parts > 0) : (parts -= 1) try self.reader.skip(@as(usize, try self.reader.readU16()) * 2);
                 d.kind = .textptr;
                 d.engine_type = strT;
-                if (t == 0x63) d.is_unicode = true; // ntext -> UTF-16
-                if (t == 0x22) d.is_binary = true; // image -> hex
+                if (t == 0x63) d.is_unicode = true;
+                if (t == 0x22) d.is_binary = true;
             },
             else => return error.UnsupportedTdsType,
         }
@@ -941,10 +911,10 @@ const TdsCursor = struct {
                 const bytes = (try self.reader.readPlp(arena)) orelse return .null;
                 return decodeValue(arena, col, bytes);
             },
-            .textptr => { // legacy LOB: TextPtr(len) + Timestamp(8) + DataLen(4) + Data
+            .textptr => {
                 const ptrlen = try self.reader.readByte();
                 if (ptrlen == 0) return .null;
-                try self.reader.skip(@as(usize, ptrlen) + 8); // text pointer + timestamp
+                try self.reader.skip(@as(usize, ptrlen) + 8);
                 const dlen = try self.reader.readU32();
                 const bytes = try self.reader.readSlice(arena, dlen);
                 return decodeValue(arena, col, bytes);
@@ -974,37 +944,21 @@ const TdsCursor = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Bulk sink (INSERT BULK / BCP). Declares every column as NVARCHAR and lets SQL
-// Server convert to the table's real types (created via DDL) during the bulk
-// insert — one streamed BCP token sequence instead of per-batch INSERTs. Flow:
-// `INSERT BULK <table> (cols nvarchar(4000))` → read the ack → stream a 0x07 Bulk
-// Load packet (COLMETADATA + 0xD1 ROW tokens, ≤4088 bytes/packet, EOM on the
-// last) → read the result. The COLMETADATA must byte-match what the server emits
-// for these columns (verified via SELECT … WHERE 1=0): the key detail was the
-// flags = 0x0008. Append/overwrite only; upsert routes to the INSERT sink.
-// ---------------------------------------------------------------------------
-
-const NVARCHAR_MAX_BYTES = 8000; // must match the table's NVARCHAR(4000) = 8000 bytes
-const BULK_COLLATION = [5]u8{ 0x09, 0x04, 0xD0, 0x00, 0x34 }; // SQL_Latin1_General_CP1_CI_AS
+const NVARCHAR_MAX_BYTES = 8000;
+const BULK_COLLATION = [5]u8{ 0x09, 0x04, 0xD0, 0x00, 0x34 };
 
 pub const BulkSink = struct {
     gpa: std.mem.Allocator,
     conn: *Conn,
     schema: types.Schema,
-    // Current segment's bulk token stream (COLMETADATA + ROW tokens) — kept
-    // whole until the server confirms the segment, so it can be replayed.
     buffer: std.array_list.Managed(u8),
-    insert_sql: []const u8 = "", // gpa-owned; issued once per segment
+    insert_sql: []const u8 = "",
     seg_rows: u64 = 0,
     redial: ?sqlmod.Redial = null,
 
     pub fn open(gpa: std.mem.Allocator, conn: *Conn, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?sqlmod.Redial) !*BulkSink {
-        // On error we free only what we allocate here; the caller keeps `conn`
-        // (so it can read conn.last_error) and closes it on failure.
         const self = try gpa.create(BulkSink);
         errdefer gpa.destroy(self);
-        // own a copy of the schema (field names) — the caller's may not outlive us
         const fields = try gpa.alloc(types.Schema.Field, schema.fields.len);
         errdefer gpa.free(fields);
         var nf: usize = 0;
@@ -1030,7 +984,7 @@ pub const BulkSink = struct {
             try cols.appendSlice(" nvarchar(4000)");
         }
         self.insert_sql = try std.fmt.allocPrint(gpa, "INSERT BULK {s} ({s})", .{ qtable, cols.items });
-        try self.writeColMetadata(); // each segment's stream starts with COLMETADATA
+        try self.writeColMetadata();
         return self;
     }
 
@@ -1040,15 +994,14 @@ pub const BulkSink = struct {
 
     fn writeColMetadata(self: *BulkSink) !void {
         const w = self.buffer.writer();
-        try w.writeByte(0x81); // COLMETADATA
+        try w.writeByte(0x81);
         try writeU16(w, @intCast(self.schema.fields.len));
         for (self.schema.fields) |f| {
-            try writeU32(w, 0); // UserType (TDS 7.2+ : 4 bytes)
-            try writeU16(w, 0x0009); // Flags: fNullable | usUpdateable=read-write — without fNullable the server silently drops rows containing a NULL
-            try w.writeByte(0xE7); // NVARCHARTYPE
+            try writeU32(w, 0);
+            try writeU16(w, 0x0009);
+            try w.writeByte(0xE7);
             try writeU16(w, NVARCHAR_MAX_BYTES);
             try w.writeAll(&BULK_COLLATION);
-            // Column name as B_VARCHAR (1-byte char count + UCS2), like SqlBulkCopy.
             const name16 = try std.unicode.utf8ToUtf16LeAlloc(self.gpa, f.name);
             defer self.gpa.free(name16);
             try w.writeByte(@intCast(name16.len));
@@ -1064,17 +1017,15 @@ pub const BulkSink = struct {
         const fmt = sqlmod.BulkFormat{ .bool_true = "1", .bool_false = "0" };
         var r: usize = 0;
         while (r < batch.len) : (r += 1) {
-            try w.writeByte(0xD1); // ROW
+            try w.writeByte(0xD1);
             for (batch.columns) |*col| {
                 const v = col.getValue(r);
                 if (v.isNull()) {
-                    try writeU16(w, 0xFFFF); // CHARBIN_NULL
+                    try writeU16(w, 0xFFFF);
                     continue;
                 }
                 const u16s = try std.unicode.utf8ToUtf16LeAlloc(arena, try sqlmod.valueText(arena, v, fmt));
                 var blen = @min(u16s.len * 2, NVARCHAR_MAX_BYTES);
-                // Don't truncate in the middle of a surrogate pair: if the last kept
-                // code unit is a high surrogate, drop it so we never emit a lone half.
                 if (blen < u16s.len * 2 and blen >= 2) {
                     const last = u16s[blen / 2 - 1];
                     if (last >= 0xD800 and last <= 0xDBFF) blen -= 2;
@@ -1090,7 +1041,7 @@ pub const BulkSink = struct {
         self.seg_rows += batch.len;
         if (self.buffer.items.len >= sqlmod.SEGMENT_BYTES) {
             try self.commitSegment();
-            try self.writeColMetadata(); // next segment's stream header
+            try self.writeColMetadata();
         }
     }
 
@@ -1100,7 +1051,7 @@ pub const BulkSink = struct {
     /// Same lost-reply double-write window as the other bulk sinks.
     fn commitSegment(self: *BulkSink) !void {
         if (self.seg_rows == 0) {
-            self.buffer.clearRetainingCapacity(); // drop the unused COLMETADATA header
+            self.buffer.clearRetainingCapacity();
             return;
         }
         self.sendSegment() catch |e| {
@@ -1108,7 +1059,6 @@ pub const BulkSink = struct {
             if (!driver.transientNet(e)) return e;
             const fresh = try rd.dial(rd.ctx, self.gpa);
             self.conn.close();
-            // Redial ctx is kind-matched: the vtable ptr is always a *tds.Conn.
             self.conn = @ptrCast(@alignCast(fresh.ptr));
             try self.sendSegment();
         };
@@ -1124,7 +1074,7 @@ pub const BulkSink = struct {
             off += self.conn.pkt_payload;
         }
         try self.conn.bulkPacket(STATUS_EOM, self.buffer.items[off..]);
-        const n = (try self.conn.bulkFinish()) orelse self.seg_rows; // no DONE_COUNT → trust ERROR-token detection
+        const n = (try self.conn.bulkFinish()) orelse self.seg_rows;
         if (n != self.seg_rows) {
             if (self.conn.last_error.len == 0)
                 self.conn.last_error = try std.fmt.allocPrint(self.gpa, "INSERT BULK count mismatch: sent {d} rows, server loaded {d}", .{ self.seg_rows, n });
@@ -1133,8 +1083,6 @@ pub const BulkSink = struct {
     }
 
     fn closeImpl(self: *BulkSink) !void {
-        // Release everything even if the final segment fails — otherwise a failed
-        // INSERT BULK on close leaks the connection, buffer, schema and sink.
         defer self.teardown();
         try self.commitSegment();
     }
@@ -1190,7 +1138,7 @@ const ColumnDesc = struct {
     scale: u8 = 0,
     is_unicode: bool = false,
     is_guid: bool = false,
-    is_binary: bool = false, // SQL Server binary/varbinary(+MAX) -> hex string (CSV-safe)
+    is_binary: bool = false,
 };
 
 fn decodeValue(arena: std.mem.Allocator, d: ColumnDesc, bytes: []const u8) !Value {
@@ -1217,7 +1165,7 @@ fn decodeDecimal(d: ColumnDesc, bytes: []const u8) Value {
 
 fn decodeDateTime(d: ColumnDesc, bytes: []const u8) i64 {
     switch (d.tds_type) {
-        0x2A, 0x2B => { // DATETIME2 / DATETIMEOFFSET
+        0x2A, 0x2B => {
             const off_bytes: usize = if (d.tds_type == 0x2B) 2 else 0;
             if (bytes.len < 3 + off_bytes) return 0;
             const tlen = bytes.len - 3 - off_bytes;
@@ -1228,7 +1176,7 @@ fn decodeDateTime(d: ColumnDesc, bytes: []const u8) i64 {
             const time_micros = @divTrunc(tu * 1_000_000, pow10(d.scale));
             return days1970 * 86_400_000_000 + time_micros;
         },
-        else => { // DATETIME (8) / SMALLDATETIME (4)
+        else => {
             if (bytes.len >= 8) {
                 const date4 = readIntLE(bytes[0..4]);
                 const ticks: i64 = @intCast(readULE(bytes[4..8]));
@@ -1318,7 +1266,7 @@ fn win1252ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     var tmp: [4]u8 = undefined;
     for (bytes) |b| {
         const cp: u21 = if (b < 0x80) b else cp1252High(b);
-        const n = std.unicode.utf8Encode(cp, &tmp) catch unreachable; // cp1252 maps only to valid scalars
+        const n = std.unicode.utf8Encode(cp, &tmp) catch unreachable;
         try out.appendSlice(tmp[0..n]);
     }
     return out.toOwnedSlice();
@@ -1380,15 +1328,12 @@ test "format sql server guid (mixed-endian)" {
 
 test "win1252 transcode to utf8" {
     const alloc = std.testing.allocator;
-    // 0xD3 is 'Ó' in Windows-1252/Latin-1 (the RELÓGIO case from the SQL Server data)
     const out = try win1252ToUtf8(alloc, &[_]u8{ 'R', 'E', 'L', 0xD3, 'G', 'I', 'O' });
     defer alloc.free(out);
     try std.testing.expectEqualStrings("RELÓGIO", out);
-    // pure ASCII passes through unchanged
     const a = try win1252ToUtf8(alloc, "plain");
     defer alloc.free(a);
     try std.testing.expectEqualStrings("plain", a);
-    // 0x80 is the cp1252-specific euro sign (not Latin-1)
     const e = try win1252ToUtf8(alloc, &[_]u8{0x80});
     defer alloc.free(e);
     try std.testing.expectEqualStrings("€", e);
@@ -1396,50 +1341,43 @@ test "win1252 transcode to utf8" {
 
 test "readIntLE sign-extends every TDS integer width" {
     try std.testing.expectEqual(@as(i64, 0), readIntLE(&.{}));
-    try std.testing.expectEqual(@as(i64, -1), readIntLE(&.{0xFF})); // tinyint as i8
+    try std.testing.expectEqual(@as(i64, -1), readIntLE(&.{0xFF}));
     try std.testing.expectEqual(@as(i64, 127), readIntLE(&.{0x7F}));
-    try std.testing.expectEqual(@as(i64, -2), readIntLE(&.{ 0xFE, 0xFF })); // smallint
-    try std.testing.expectEqual(@as(i64, -1), readIntLE(&.{ 0xFF, 0xFF, 0xFF, 0xFF })); // int
-    try std.testing.expectEqual(@as(i64, 1), readIntLE(&.{ 1, 0, 0, 0, 0, 0, 0, 0 })); // bigint
+    try std.testing.expectEqual(@as(i64, -2), readIntLE(&.{ 0xFE, 0xFF }));
+    try std.testing.expectEqual(@as(i64, -1), readIntLE(&.{ 0xFF, 0xFF, 0xFF, 0xFF }));
+    try std.testing.expectEqual(@as(i64, 1), readIntLE(&.{ 1, 0, 0, 0, 0, 0, 0, 0 }));
     try std.testing.expectEqual(std.math.minInt(i64), readIntLE(&.{ 0, 0, 0, 0, 0, 0, 0, 0x80 }));
-    // odd width (3 bytes) takes the sign-extension fallback
     try std.testing.expectEqual(@as(i64, -1), readIntLE(&.{ 0xFF, 0xFF, 0xFF }));
     try std.testing.expectEqual(@as(i64, 0x010203), readIntLE(&.{ 0x03, 0x02, 0x01 }));
 }
 
 test "decodeDecimal: sign byte + little-endian magnitude at the column scale" {
     const d = ColumnDesc{ .tds_type = 0x6C, .engine_type = types.Type.decimal(10, 2).asNullable(), .kind = .bytelen, .scale = 2 };
-    // sign=1 (positive), magnitude 0x3039 = 12345 -> 123.45
     const pos = decodeDecimal(d, &.{ 1, 0x39, 0x30, 0, 0 });
     try std.testing.expectEqual(@as(i128, 12345), pos.decimal.unscaled);
     try std.testing.expectEqual(@as(u8, 2), pos.decimal.scale);
-    // sign=0 -> negative
     const neg = decodeDecimal(d, &.{ 0, 0x39, 0x30, 0, 0 });
     try std.testing.expectEqual(@as(i128, -12345), neg.decimal.unscaled);
     try std.testing.expect(decodeDecimal(d, &.{}) == .null);
 }
 
 test "decodeDateTime: DATETIME ticks, SMALLDATETIME minutes, DATETIME2 scale" {
-    // DATETIME: days since 1900 (25567 = 1970-01-01), 1/300s ticks. 300 ticks = 1s.
     var dt = ColumnDesc{ .tds_type = 0x3D, .engine_type = types.Type.init(.timestamp).asNullable(), .kind = .fixed, .fixed_len = 8 };
     var bytes8: [8]u8 = undefined;
     std.mem.writeInt(i32, bytes8[0..4], 25567, .little);
     std.mem.writeInt(u32, bytes8[4..8], 300, .little);
     try std.testing.expectEqual(@as(i64, 1_000_000), decodeDateTime(dt, &bytes8));
 
-    // SMALLDATETIME: days(2) + minutes(2). One day + 90 min past epoch.
     dt.tds_type = 0x3A;
     var bytes4: [4]u8 = undefined;
     std.mem.writeInt(u16, bytes4[0..2], 25568, .little);
     std.mem.writeInt(u16, bytes4[2..4], 90, .little);
     try std.testing.expectEqual(@as(i64, 86_400_000_000 + 90 * 60_000_000), decodeDateTime(dt, &bytes4));
 
-    // DATETIME2(3): time units at 10^-3 s in N bytes, then 3-byte days since 0001-01-01
-    // (719162 = 1970-01-01). 1500ms -> 1.5s.
     const dt2 = ColumnDesc{ .tds_type = 0x2A, .engine_type = types.Type.init(.timestamp).asNullable(), .kind = .bytelen, .scale = 3 };
     var b7: [7]u8 = .{ 0, 0, 0, 0, 0, 0, 0 };
-    std.mem.writeInt(u32, b7[0..4], 1500, .little); // fits in the low 4 time bytes
-    const days: u24 = 719162 + 1; // 1970-01-02
+    std.mem.writeInt(u32, b7[0..4], 1500, .little);
+    const days: u24 = 719162 + 1;
     b7[4] = @intCast(days & 0xFF);
     b7[5] = @intCast((days >> 8) & 0xFF);
     b7[6] = @intCast(days >> 16);
@@ -1448,10 +1386,9 @@ test "decodeDateTime: DATETIME ticks, SMALLDATETIME minutes, DATETIME2 scale" {
 
 test "utf16ToUtf8 decodes BMP text and replaces invalid units" {
     const alloc = std.testing.allocator;
-    const ok = try utf16ToUtf8(alloc, "h\x00i\x00\xe9\x00"); // "hié" in UTF-16LE
+    const ok = try utf16ToUtf8(alloc, "h\x00i\x00\xe9\x00");
     defer alloc.free(ok);
     try std.testing.expectEqualStrings("hié", ok);
-    // a lone surrogate half becomes '?', not invalid UTF-8
     const bad = try utf16ToUtf8(alloc, "\x00\xd8");
     defer alloc.free(bad);
     try std.testing.expectEqualStrings("?", bad);
@@ -1490,7 +1427,6 @@ fn parseEnvPacketSize(d: []const u8) ?usize {
 }
 
 test "parseEnvPacketSize: negotiated size, wrong type, junk" {
-    // type 4, "16384" as UCS-2
     const good = [_]u8{ 4, 5, '1', 0, '6', 0, '3', 0, '8', 0, '4', 0 };
     try std.testing.expectEqual(@as(?usize, 16384), parseEnvPacketSize(&good));
     const wrong_type = [_]u8{ 1, 5, '1', 0, '6', 0, '3', 0, '8', 0, '4', 0 };
@@ -1499,38 +1435,32 @@ test "parseEnvPacketSize: negotiated size, wrong type, junk" {
     try std.testing.expectEqual(@as(?usize, null), parseEnvPacketSize(&non_digit));
     const truncated = [_]u8{ 4, 5, '1', 0 };
     try std.testing.expectEqual(@as(?usize, null), parseEnvPacketSize(&truncated));
-    const out_of_range = [_]u8{ 4, 2, '6', 0, '4', 0 }; // 64 < 512
+    const out_of_range = [_]u8{ 4, 2, '6', 0, '4', 0 };
     try std.testing.expectEqual(@as(?usize, null), parseEnvPacketSize(&out_of_range));
 }
 
-// --- LOGIN7 construction ---
-
 fn buildLogin7(gpa: std.mem.Allocator, user: []const u8, password: []const u8, database: []const u8, host: []const u8) ![]u8 {
     var fixed = std.mem.zeroes([94]u8);
-    // TDSVersion 7.4 = 0x74000004 (LE), PacketSize 16384 requested; the server
-    // answers with ENVCHANGE(4) carrying the granted size (see parseLoginResponse).
     fixed[4] = 0x04;
     fixed[7] = 0x74;
     fixed[8] = 0x00;
-    fixed[9] = 0x40; // 0x4000 = 16384
+    fixed[9] = 0x40;
 
     var vd = std.array_list.Managed(u8).init(gpa);
     defer vd.deinit();
 
-    try addField(&fixed, 36, host, &vd, false); // HostName
-    try addField(&fixed, 40, user, &vd, false); // UserName
-    try addField(&fixed, 44, password, &vd, true); // Password (obfuscated)
-    try addField(&fixed, 48, "basalt", &vd, false); // AppName
-    try addField(&fixed, 52, host, &vd, false); // ServerName
-    try addField(&fixed, 56, "", &vd, false); // Extension (unused)
-    try addField(&fixed, 60, "basalt", &vd, false); // CltIntName
-    try addField(&fixed, 64, "", &vd, false); // Language
-    try addField(&fixed, 68, database, &vd, false); // Database
-    // ClientID at 72..78 = zeros
-    try addField(&fixed, 78, "", &vd, false); // SSPI
-    try addField(&fixed, 82, "", &vd, false); // AtchDBFile
-    try addField(&fixed, 86, "", &vd, false); // ChangePassword
-    // cbSSPILong at 90..94 = 0
+    try addField(&fixed, 36, host, &vd, false);
+    try addField(&fixed, 40, user, &vd, false);
+    try addField(&fixed, 44, password, &vd, true);
+    try addField(&fixed, 48, "basalt", &vd, false);
+    try addField(&fixed, 52, host, &vd, false);
+    try addField(&fixed, 56, "", &vd, false);
+    try addField(&fixed, 60, "basalt", &vd, false);
+    try addField(&fixed, 64, "", &vd, false);
+    try addField(&fixed, 68, database, &vd, false);
+    try addField(&fixed, 78, "", &vd, false);
+    try addField(&fixed, 82, "", &vd, false);
+    try addField(&fixed, 86, "", &vd, false);
 
     const total: u32 = @intCast(94 + vd.items.len);
     std.mem.writeInt(u32, fixed[0..4], total, .little);
@@ -1549,54 +1479,50 @@ fn buildLogin7(gpa: std.mem.Allocator, user: []const u8, password: []const u8, d
 /// repurposed "Extension" offset/length pair.
 fn buildLogin7Fedauth(gpa: std.mem.Allocator, token: []const u8, database: []const u8, host: []const u8, echo: bool, nonce: ?[32]u8) ![]u8 {
     var fixed = std.mem.zeroes([94]u8);
-    fixed[4] = 0x04; // TDS 7.4
+    fixed[4] = 0x04;
     fixed[7] = 0x74;
-    fixed[9] = 0x10; // packet size 4096
-    fixed[27] = 0x10; // OptionFlags3: fExtension
+    fixed[9] = 0x10;
+    fixed[27] = 0x10;
 
     var vd = std.array_list.Managed(u8).init(gpa);
     defer vd.deinit();
 
-    try addField(&fixed, 36, host, &vd, false); // HostName
-    try addField(&fixed, 40, "", &vd, false); // UserName — empty (fedauth)
-    try addField(&fixed, 44, "", &vd, true); // Password — empty
-    try addField(&fixed, 48, "basalt", &vd, false); // AppName
-    try addField(&fixed, 52, host, &vd, false); // ServerName
-    // Extension field (offset 56): points at a 4-byte slot holding the FeatureExt
-    // offset (filled in once all var-data is laid out).
+    try addField(&fixed, 36, host, &vd, false);
+    try addField(&fixed, 40, "", &vd, false);
+    try addField(&fixed, 44, "", &vd, true);
+    try addField(&fixed, 48, "basalt", &vd, false);
+    try addField(&fixed, 52, host, &vd, false);
     const ext_ib: u16 = @intCast(94 + vd.items.len);
     std.mem.writeInt(u16, fixed[56..][0..2], ext_ib, .little);
     std.mem.writeInt(u16, fixed[58..][0..2], 4, .little);
     const ext_slot = vd.items.len;
     try vd.appendSlice(&[_]u8{ 0, 0, 0, 0 });
-    try addField(&fixed, 60, "basalt", &vd, false); // CltIntName
-    try addField(&fixed, 64, "", &vd, false); // Language
-    try addField(&fixed, 68, database, &vd, false); // Database
-    // ClientID 72..78 = zero
-    try addField(&fixed, 78, "", &vd, false); // SSPI
-    try addField(&fixed, 82, "", &vd, false); // AtchDBFile
-    try addField(&fixed, 86, "", &vd, false); // ChangePassword
+    try addField(&fixed, 60, "basalt", &vd, false);
+    try addField(&fixed, 64, "", &vd, false);
+    try addField(&fixed, 68, database, &vd, false);
+    try addField(&fixed, 78, "", &vd, false);
+    try addField(&fixed, 82, "", &vd, false);
+    try addField(&fixed, 86, "", &vd, false);
 
-    // FeatureExt begins here; backpatch the slot with its message offset.
     const feat_off: u32 = @intCast(94 + vd.items.len);
     std.mem.writeInt(u32, vd.items[ext_slot..][0..4], feat_off, .little);
 
     const have_nonce = echo and nonce != null;
     const tok_bytes: u32 = @intCast(token.len * 2);
     const data_len: u32 = 1 + 4 + tok_bytes + (if (have_nonce) @as(u32, 32) else 0);
-    try vd.append(0x02); // FEATUREID FEDAUTH
+    try vd.append(0x02);
     var lb: [4]u8 = undefined;
     std.mem.writeInt(u32, &lb, data_len, .little);
     try vd.appendSlice(&lb);
-    try vd.append((0x01 << 1) | @as(u8, if (echo) 1 else 0)); // SECURITYTOKEN lib | echo
+    try vd.append((0x01 << 1) | @as(u8, if (echo) 1 else 0));
     std.mem.writeInt(u32, &lb, tok_bytes, .little);
     try vd.appendSlice(&lb);
     for (token) |ch| {
         try vd.append(ch);
-        try vd.append(0); // UTF-16LE
+        try vd.append(0);
     }
     if (have_nonce) try vd.appendSlice(&nonce.?);
-    try vd.append(0xFF); // FeatureExt terminator
+    try vd.append(0xFF);
 
     const total: u32 = @intCast(94 + vd.items.len);
     std.mem.writeInt(u32, fixed[0..4], total, .little);
@@ -1633,16 +1559,13 @@ test "login7 packet has sane framing" {
     const gpa = std.testing.allocator;
     const pkt = try buildLogin7(gpa, "sa", "pw", "master", "host");
     defer gpa.free(pkt);
-    // length field == total length
     try std.testing.expectEqual(@as(u32, @intCast(pkt.len)), std.mem.readInt(u32, pkt[0..4], .little));
-    // user offset points within the packet, length 2 chars
     const ib_user = std.mem.readInt(u16, pkt[40..42], .little);
     const cch_user = std.mem.readInt(u16, pkt[42..44], .little);
     try std.testing.expectEqual(@as(u16, 2), cch_user);
     try std.testing.expect(ib_user >= 94 and ib_user < pkt.len);
-    try std.testing.expectEqual(@as(u8, 's'), pkt[ib_user]); // UTF16LE 's','\0'
+    try std.testing.expectEqual(@as(u8, 's'), pkt[ib_user]);
 }
-
 
 test "buildLogin7Fedauth: fExtension flag, empty creds, FEDAUTH ext layout" {
     const a = std.testing.allocator;
@@ -1650,29 +1573,20 @@ test "buildLogin7Fedauth: fExtension flag, empty creds, FEDAUTH ext layout" {
     const out = try buildLogin7Fedauth(a, token, "db", "h", true, null);
     defer a.free(out);
 
-    // total length header matches buffer
     try std.testing.expectEqual(@as(u32, @intCast(out.len)), std.mem.readInt(u32, out[0..4], .little));
-    // OptionFlags3 fExtension bit
     try std.testing.expectEqual(@as(u8, 0x10), out[27] & 0x10);
-    // UserName (offset 40) and Password (44) are empty
     try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, out[42..44], .little));
     try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, out[46..48], .little));
 
-    // Extension field (56): ib points at a 4-byte slot whose value is the
-    // FeatureExt offset; that offset must land on FEATUREID FEDAUTH (0x02).
     const ext_ib = std.mem.readInt(u16, out[56..58], .little);
     try std.testing.expectEqual(@as(u16, 4), std.mem.readInt(u16, out[58..60], .little));
     const feat_off = std.mem.readInt(u32, out[ext_ib..][0..4], .little);
-    try std.testing.expectEqual(@as(u8, 0x02), out[feat_off]); // FEDAUTH FeatureId
-    // options byte = (SECURITYTOKEN<<1)|echo = 0x02|0x01
+    try std.testing.expectEqual(@as(u8, 0x02), out[feat_off]);
     const opt = out[feat_off + 5];
     try std.testing.expectEqual(@as(u8, 0x03), opt);
-    // token length field = UTF-16LE byte length
     const tlen = std.mem.readInt(u32, out[feat_off + 6 ..][0..4], .little);
     try std.testing.expectEqual(@as(u32, token.len * 2), tlen);
-    // ends with FeatureExt terminator
     try std.testing.expectEqual(@as(u8, 0xFF), out[out.len - 1]);
-    // FeatureDataLen = 1 + 4 + tokbytes (no nonce since nonce==null)
     const dlen = std.mem.readInt(u32, out[feat_off + 1 ..][0..4], .little);
     try std.testing.expectEqual(@as(u32, 1 + 4 + token.len * 2), dlen);
 }
@@ -1687,6 +1601,5 @@ test "buildLogin7Fedauth: nonce appended when echo && nonce present" {
     const feat_off = std.mem.readInt(u32, out[ext_ib..][0..4], .little);
     const dlen = std.mem.readInt(u32, out[feat_off + 1 ..][0..4], .little);
     try std.testing.expectEqual(@as(u32, 1 + 4 + 3 * 2 + 32), dlen);
-    // nonce sits right before the 0xFF terminator
     try std.testing.expectEqualSlices(u8, &nonce, out[out.len - 33 .. out.len - 1]);
 }

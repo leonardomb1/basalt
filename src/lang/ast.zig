@@ -26,10 +26,6 @@ pub const QualName = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Expressions
-// ---------------------------------------------------------------------------
-
 pub const BinOp = enum { add, sub, mul, div, mod, eq, ne, lt, le, gt, ge, @"and", @"or" };
 pub const UnOp = enum { neg, not };
 
@@ -43,11 +39,11 @@ pub const Expr = union(enum) {
     unary: Unary,
     binary: Binary,
     call: Call,
-    cond: Cond, // if(c, a, b)
+    cond: Cond,
     match: Match,
     cast: Cast,
     is_null: IsNull,
-    let_in: LetIn, // `let name = value in body` — desugared away at plan time
+    let_in: LetIn,
 
     pub const Unary = struct { op: UnOp, e: *Expr };
     pub const Binary = struct { op: BinOp, l: *Expr, r: *Expr };
@@ -75,8 +71,8 @@ pub const Match = struct {
 };
 
 pub const MatchArm = struct {
-    pats: []const *Expr, // subject form patterns (empty for guard/default arms)
-    guard: ?*Expr, // guard form condition (null otherwise)
+    pats: []const *Expr,
+    guard: ?*Expr,
     value: *Expr,
     is_default: bool,
 };
@@ -100,7 +96,6 @@ fn mkExpr(arena: std.mem.Allocator, e: Expr) !*Expr {
 /// through unchanged (the error set is inferred per instantiation).
 pub fn rebuildExpr(arena: std.mem.Allocator, e: *const Expr, ctx: anytype, comptime recur: anytype) !*Expr {
     return switch (e.*) {
-        // Leaves: no child expressions to transform — share the original node.
         .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit, .field => @constCast(e),
         .unary => |u| try mkExpr(arena, .{ .unary = .{ .op = u.op, .e = try recur(ctx, u.e) } }),
         .binary => |b| try mkExpr(arena, .{ .binary = .{ .op = b.op, .l = try recur(ctx, b.l), .r = try recur(ctx, b.r) } }),
@@ -131,22 +126,14 @@ pub fn rebuildExpr(arena: std.mem.Allocator, e: *const Expr, ctx: anytype, compt
     };
 }
 
-// ---------------------------------------------------------------------------
-// Hints  (@[ key [= value] , ... ])  — parsed, unused in v1
-// ---------------------------------------------------------------------------
-
 pub const Hint = struct { key: []const u8, value: HintVal, pos: Pos };
 
 pub const HintVal = union(enum) {
-    flag, // bare `key`
+    flag,
     str: []const u8,
     int: i64,
     ident: []const u8,
 };
-
-// ---------------------------------------------------------------------------
-// Operators / stages
-// ---------------------------------------------------------------------------
 
 pub const Read = struct {
     connector: []const u8,
@@ -180,7 +167,7 @@ pub const BufferDecl = struct {
     name: []const u8,
     dir: []const u8,
     segment_bytes: u64 = 16 << 20,
-    retain_hours: ?u32 = null, // null = RETAIN UNTIL LOADED (purge once loaded)
+    retain_hours: ?u32 = null,
     /// Backpressure limit (`MAX n MB|GB`): bytes on disk beyond this ⇒ the
     /// endpoint answers 503 + Retry-After.
     max_bytes: u64 = 1 << 30,
@@ -191,7 +178,7 @@ pub const BufferDecl = struct {
 pub const SelectItem = union(enum) {
     star,
     star_except: []const []const u8,
-    star_rename: []const Rename, // `* rename (old as new, ...)` — passthrough all, with renames
+    star_rename: []const Rename,
     field: QualName,
     computed: Computed,
 
@@ -215,14 +202,14 @@ pub const Aggregate = struct { aggs: []const AggItem, by: []const QualName };
 pub const JoinKind = enum { inner, left, semi, anti };
 pub const Join = struct {
     kind: JoinKind,
-    binding: []const u8, // right side: a `let` binding referenced by name
+    binding: []const u8,
     left_key: QualName,
     right_key: QualName,
 };
 
 pub const Write = struct {
     connector: []const u8,
-    form: ?[]const u8, // e.g. "stream_load"
+    form: ?[]const u8,
     target: []const u8,
     mode: WriteMode,
 };
@@ -247,10 +234,10 @@ pub const UnionBranch = struct { read: Read, tag: ?[]const u8 };
 /// name (take / NULL-fill missing / drop extra / cast type diffs); a `tag` column
 /// (per-branch value) is optional. `tag` and `canon` come from the stage's `@[...]`.
 pub const Union = struct {
-    branches: []const UnionBranch = &.{}, // explicit form
-    discover_conn: []const u8 = "", // discovered/json form: connection holding the tables
-    discover_query: []const u8 = "", // discovered form: query -> (table_name, tag)
-    discover_json: []const u8 = "", // json form: a JSON array of {table, tag} objects
+    branches: []const UnionBranch = &.{},
+    discover_conn: []const u8 = "",
+    discover_query: []const u8 = "",
+    discover_json: []const u8 = "",
     pos: Pos,
 };
 
@@ -260,9 +247,9 @@ pub const Stage = struct {
     pos: Pos,
 
     pub const Node = union(enum) {
-        ref: []const u8, // a binding used as a source
+        ref: []const u8,
         read: Read,
-        union_: Union, // multi-source union (leading)
+        union_: Union,
         filter: *Expr,
         select: []const SelectItem,
         explode: Explode,
@@ -276,10 +263,6 @@ pub const Stage = struct {
 };
 
 pub const Pipeline = struct { stages: []const Stage, pos: Pos };
-
-// ---------------------------------------------------------------------------
-// Top-level declarations
-// ---------------------------------------------------------------------------
 
 pub const ParamSource = enum { query, body, header };
 
@@ -370,9 +353,9 @@ pub const StmtMatch = struct {
 };
 
 pub const StmtArm = struct {
-    pats: []const *Expr, // subject-form patterns (empty for guard/default arms)
-    guard: ?*Expr, // guard-form condition (null otherwise)
-    body: []const Stmt, // `{ ... }` block to run when this arm matches
+    pats: []const *Expr,
+    guard: ?*Expr,
+    body: []const Stmt,
     is_default: bool,
 };
 
@@ -393,30 +376,26 @@ test "rebuildExpr identity copies every field — no silent drop" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // An identity transform: recurse structurally, change nothing. If rebuildExpr
-    // omitted any field (the bug class this guards), it would be lost here.
     const Id = struct {
         fn r(arena: std.mem.Allocator, e: *const Expr) anyerror!*Expr {
             return rebuildExpr(arena, e, arena, r);
         }
     };
-    // cast( (x is empty) as int ) — exercises is_null.kind, .negated, and cast.ty.
     const x = try mkExpr(a, .{ .field = .{ .parts = &[_][]const u8{"x"} } });
     const empty = try mkExpr(a, .{ .is_null = .{ .e = x, .negated = true, .kind = .is_empty } });
     const casted = try mkExpr(a, .{ .cast = .{ .e = empty, .ty = types.Type.init(.int) } });
 
     const out = try Id.r(a, casted);
     try std.testing.expect(out.* == .cast);
-    try std.testing.expectEqual(types.TypeKind.int, out.cast.ty.kind); // cast.ty survived
+    try std.testing.expectEqual(types.TypeKind.int, out.cast.ty.kind);
     try std.testing.expect(out.cast.e.* == .is_null);
-    try std.testing.expectEqual(Expr.NullTest.is_empty, out.cast.e.is_null.kind); // is_null.kind survived
-    try std.testing.expect(out.cast.e.is_null.negated); // .negated survived
+    try std.testing.expectEqual(Expr.NullTest.is_empty, out.cast.e.is_null.kind);
+    try std.testing.expect(out.cast.e.is_null.negated);
 
-    // let v = <casted> in x — exercises let_in.name; concat(x, ...) — call.name/args.
     const bound = try mkExpr(a, .{ .let_in = .{ .name = "v", .value = casted, .body = x } });
     const out2 = try Id.r(a, bound);
     try std.testing.expect(out2.* == .let_in);
-    try std.testing.expectEqualStrings("v", out2.let_in.name); // let_in.name survived
+    try std.testing.expectEqualStrings("v", out2.let_in.name);
     try std.testing.expect(out2.let_in.value.* == .cast);
 
     const args = try a.alloc(*Expr, 2);
@@ -425,7 +404,7 @@ test "rebuildExpr identity copies every field — no silent drop" {
     const call = try mkExpr(a, .{ .call = .{ .name = "concat", .args = args } });
     const out3 = try Id.r(a, call);
     try std.testing.expect(out3.* == .call);
-    try std.testing.expectEqualStrings("concat", out3.call.name); // call.name survived
+    try std.testing.expectEqualStrings("concat", out3.call.name);
     try std.testing.expectEqual(@as(usize, 2), out3.call.args.len);
     try std.testing.expect(out3.call.args[1].* == .is_null);
 }

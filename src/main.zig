@@ -8,6 +8,5 @@ pub fn main() !void {
 }
 
 test {
-    // Pull every module's tests into the `zig build test` run.
     std.testing.refAllDeclsRecursive(root);
 }

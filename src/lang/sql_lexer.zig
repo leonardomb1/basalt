@@ -115,7 +115,7 @@ pub const Lexer = struct {
                         out.appendAssumeCapacity('\r');
                         k += 1;
                     },
-                    else => out.appendAssumeCapacity(c), // unknown escape: keep the backslash
+                    else => out.appendAssumeCapacity(c),
                 }
             } else out.appendAssumeCapacity(c);
         }
@@ -166,7 +166,7 @@ pub const Lexer = struct {
             }
             if (self.i >= self.src.len) return self.make(.invalid, self.src[start - 1 ..], line, col);
             const body = self.src[start..self.i];
-            _ = self.bump(); // closing '
+            _ = self.bump();
             return self.make(.string, try self.unquoteSingle(body), line, col);
         }
 
@@ -184,12 +184,11 @@ pub const Lexer = struct {
             }
             if (self.i >= self.src.len) return self.make(.invalid, self.src[start - 1 ..], line, col);
             const body = self.src[start..self.i];
-            _ = self.bump(); // closing "
+            _ = self.bump();
             return self.make(.string, try self.unquoteDouble(body), line, col);
         }
 
         if (c == '$') {
-            // $$...$$ | $tag$...$tag$ | $name
             if (self.peek(1) == '$') {
                 _ = self.bump();
                 _ = self.bump();
@@ -204,12 +203,11 @@ pub const Lexer = struct {
                 return self.make(.string, body, line, col);
             }
             if (isIdentStart(self.peek(1))) {
-                _ = self.bump(); // $
+                _ = self.bump();
                 const nstart = self.i;
                 while (self.i < self.src.len and isIdentChar(self.src[self.i])) _ = self.bump();
                 const name = self.src[nstart..self.i];
                 if (self.i < self.src.len and self.src[self.i] == '$') {
-                    // tagged dollar quote: $tag$ ... $tag$
                     _ = self.bump();
                     const closer = std.fmt.allocPrint(self.alloc, "${s}$", .{name}) catch return error.OutOfMemory;
                     const start = self.i;
@@ -228,7 +226,6 @@ pub const Lexer = struct {
             return self.make(.invalid, self.src[self.i - 1 .. self.i], line, col);
         }
 
-        // punctuation / operators
         const start = self.i;
         _ = self.bump();
         switch (c) {
@@ -248,7 +245,6 @@ pub const Lexer = struct {
             '/' => return self.make(.slash, self.src[start..self.i], line, col),
             '%' => return self.make(.percent, self.src[start..self.i], line, col),
             '|' => {
-                // `||` — string concat (SQL). A lone `|` is invalid.
                 if (self.i < self.src.len and self.src[self.i] == '|') {
                     _ = self.bump();
                     return self.make(.pipe, self.src[start..self.i], line, col);
@@ -314,8 +310,6 @@ pub fn tokenize(alloc: std.mem.Allocator, src: []const u8) ![]Token {
     return try list.toOwnedSlice();
 }
 
-// ---------------------------------------------------------------------------
-
 const testing = std.testing;
 
 test "sql lexer: keywords, strings, dollar quoting, params" {
@@ -324,20 +318,20 @@ test "sql lexer: keywords, strings, dollar quoting, params" {
     const a = arena.allocator();
 
     const toks = try tokenize(a, "SELECT 'it''s' FROM $job.tables WHERE x <> 1; -- c\n$$D <> '*'$$ $sql$a$$b$sql$");
-    try testing.expectEqual(tok.Tag.ident, toks[0].tag); // SELECT
+    try testing.expectEqual(tok.Tag.ident, toks[0].tag);
     try testing.expectEqual(tok.Tag.string, toks[1].tag);
-    try testing.expectEqualStrings("it's", toks[1].text); // '' unescaped
-    try testing.expectEqual(tok.Tag.ident, toks[2].tag); // FROM
+    try testing.expectEqualStrings("it's", toks[1].text);
+    try testing.expectEqual(tok.Tag.ident, toks[2].tag);
     try testing.expectEqual(tok.Tag.dollar_ident, toks[3].tag);
     try testing.expectEqualStrings("job", toks[3].text);
     try testing.expectEqual(tok.Tag.dot, toks[4].tag);
     try testing.expectEqualStrings("tables", toks[5].text);
-    try testing.expectEqual(tok.Tag.ident, toks[6].tag); // WHERE
-    try testing.expectEqual(tok.Tag.ne, toks[8].tag); // <>
+    try testing.expectEqual(tok.Tag.ident, toks[6].tag);
+    try testing.expectEqual(tok.Tag.ne, toks[8].tag);
     try testing.expectEqual(tok.Tag.semi, toks[10].tag);
-    try testing.expectEqual(tok.Tag.string, toks[11].tag); // $$...$$ raw
+    try testing.expectEqual(tok.Tag.string, toks[11].tag);
     try testing.expectEqualStrings("D <> '*'", toks[11].text);
-    try testing.expectEqual(tok.Tag.string, toks[12].tag); // $sql$...$sql$
+    try testing.expectEqual(tok.Tag.string, toks[12].tag);
     try testing.expectEqualStrings("a$$b", toks[12].text);
     try testing.expectEqual(tok.Tag.eof, toks[13].tag);
 }

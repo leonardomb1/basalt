@@ -73,7 +73,6 @@ pub fn main() !void {
         N, REPS, simd.lanes(i64), simd.lanes(f64),
     });
 
-    // The win: f64 reduction (LLVM cannot auto-vectorize; explicit @reduce can).
     {
         timer.reset();
         var acc: f64 = 0;
@@ -87,7 +86,6 @@ pub fn main() !void {
         sink +%= @bitCast(vacc);
         try report("f64 sum", s, v, w);
     }
-    // The counter-example: i64 reduction — LLVM already wins, kept as a reminder.
     {
         timer.reset();
         var acc: i64 = 0;

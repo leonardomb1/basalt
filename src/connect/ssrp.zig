@@ -41,7 +41,6 @@ pub fn splitHostInstance(host: []const u8) HostInstance {
 /// "no such instance" from "found but TCP disabled" so the caller can say
 /// something actionable. Offline-testable — no socket involved.
 pub fn parsePort(data: []const u8, instance: []const u8) Error!u16 {
-    // Skip the `0x05` + 2-byte length header when present; be lenient if not.
     var body = data;
     if (body.len >= 3 and body[0] == 0x05) body = body[3..];
 
@@ -53,7 +52,7 @@ pub fn parsePort(data: []const u8, instance: []const u8) Error!u16 {
         var name: ?[]const u8 = null;
         var tcp: ?u16 = null;
         while (toks.next()) |key| {
-            const val = toks.next() orelse break; // pairs; a lone trailing key is ignored
+            const val = toks.next() orelse break;
             if (std.ascii.eqlIgnoreCase(key, "InstanceName")) {
                 name = val;
             } else if (std.ascii.eqlIgnoreCase(key, "tcp")) {
@@ -81,21 +80,19 @@ pub fn resolveInstancePort(gpa: std.mem.Allocator, host: []const u8, instance: [
     const tv = std.posix.timeval{ .sec = 2, .usec = 0 };
     try std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
 
-    const req = [_]u8{0x03}; // CLNT_UCAST_EX
+    const req = [_]u8{0x03};
     var buf: [4096]u8 = undefined;
     var attempt: usize = 0;
     while (attempt < 2) : (attempt += 1) {
         _ = std.posix.sendto(sock, &req, 0, &addr.any, addr.getOsSockLen()) catch |e| return e;
         const n = std.posix.recvfrom(sock, &buf, 0, null, null) catch |e| switch (e) {
-            error.WouldBlock => continue, // timeout — retry once, then give up
+            error.WouldBlock => continue,
             else => return e,
         };
         return parsePort(buf[0..n], instance);
     }
     return Error.BrowserTimeout;
 }
-
-// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -110,7 +107,6 @@ test "splitHostInstance: named instance vs plain host" {
 }
 
 test "parsePort: picks the matching instance's tcp port (case-insensitive)" {
-    // A two-instance response with the 0x05 + length header.
     const payload =
         "ServerName;HOST;InstanceName;MSSQLSERVER;IsClustered;No;Version;15.0.2000.5;tcp;1433;;" ++
         "ServerName;HOST;InstanceName;WMS;IsClustered;No;Version;15.0.2000.5;tcp;51000;;";
@@ -119,16 +115,15 @@ test "parsePort: picks the matching instance's tcp port (case-insensitive)" {
     std.mem.writeInt(u16, data[1..3], @intCast(payload.len), .little);
     @memcpy(data[3..], payload);
 
-    try testing.expectEqual(@as(u16, 51000), try parsePort(&data, "wms")); // case-insensitive
+    try testing.expectEqual(@as(u16, 51000), try parsePort(&data, "wms"));
     try testing.expectEqual(@as(u16, 1433), try parsePort(&data, "MSSQLSERVER"));
 }
 
 test "parsePort: header-less body and error cases" {
     const one = "ServerName;H;InstanceName;WMS;tcp;51000;;";
-    try testing.expectEqual(@as(u16, 51000), try parsePort(one, "WMS")); // no 0x05 header
+    try testing.expectEqual(@as(u16, 51000), try parsePort(one, "WMS"));
     try testing.expectError(Error.InstanceNotFound, parsePort(one, "OTHER"));
 
-    // TCP disabled: instance present, only a named-pipe entry, no tcp.
     const np = "ServerName;H;InstanceName;WMS;np;\\\\H\\pipe\\sql\\query;;";
     try testing.expectError(Error.TcpDisabled, parsePort(np, "WMS"));
 }

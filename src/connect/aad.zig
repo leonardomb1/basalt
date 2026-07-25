@@ -46,8 +46,6 @@ fn tenantOf(upn: []const u8) []const u8 {
     return upn[at + 1 ..];
 }
 
-// --- realm discovery -------------------------------------------------------
-
 const Realm = struct { federated: bool, sts_url: []const u8 };
 
 /// GET getuserrealm.srf -> {NameSpaceType, AuthURL}. For a federated domain,
@@ -70,7 +68,6 @@ fn getUserRealm(gpa: std.mem.Allocator, upn: []const u8) !Realm {
     };
     const ns = if (obj.get("NameSpaceType")) |v| (if (v == .string) v.string else "") else "";
     if (!std.ascii.eqlIgnoreCase(ns, "Federated")) return Realm{ .federated = false, .sts_url = "" };
-    // AuthURL = https://fs.host/adfs/ls/?... -> https://fs.host/adfs/services/trust/13/usernamemixed
     const auth = if (obj.get("AuthURL")) |v| (if (v == .string) v.string else "") else "";
     const host = hostOf(auth) orelse return Realm{ .federated = true, .sts_url = "" };
     const sts = try std.fmt.allocPrint(gpa, "https://{s}/adfs/services/trust/13/usernamemixed", .{host});
@@ -82,8 +79,6 @@ fn hostOf(url: []const u8) ?[]const u8 {
     const h = httpx.uriHost(uri) orelse return null;
     return if (h.len == 0) null else h;
 }
-
-// --- WS-Trust (ADFS) -------------------------------------------------------
 
 /// POST a WS-Trust 1.3 RST with the username/password to the ADFS usernamemixed
 /// endpoint and return the SAML assertion XML (caller owns it).
@@ -123,8 +118,6 @@ fn wsTrustAssertion(gpa: std.mem.Allocator, username: []const u8, password: []co
     };
     const body = aw.writer.buffered();
     const assertion = extractElement(body, "Assertion") orelse {
-        // Surface the SOAP fault reason (<s:Text>) — distinguishes a bad password
-        // from an envelope/format problem.
         const reason = extractElement(body, "Text") orelse extractElement(body, "faultstring") orelse "";
         std.debug.print("ADFS WS-Trust http {d}; fault: {s}\n", .{ @intFromEnum(res.status), reason });
         return error.AadTokenFailed;
@@ -137,7 +130,6 @@ fn wsTrustAssertion(gpa: std.mem.Allocator, username: []const u8, password: []co
 fn extractElement(xml: []const u8, name: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, xml, i, name)) |p| {
-        // require an element start just before: '<' or '<prefix:'
         var s = p;
         while (s > 0 and (std.ascii.isAlphanumeric(xml[s - 1]) or xml[s - 1] == ':' or xml[s - 1] == '_')) s -= 1;
         if (s == 0 or xml[s - 1] != '<') {
@@ -145,8 +137,7 @@ fn extractElement(xml: []const u8, name: []const u8) ?[]const u8 {
             continue;
         }
         const open_lt = s - 1;
-        const prefix = xml[s..p]; // "" or "ns:"
-        // build the matching close tag "</prefix:Name>"
+        const prefix = xml[s..p];
         var close_buf: [64]u8 = undefined;
         const close = std.fmt.bufPrint(&close_buf, "</{s}{s}>", .{ prefix, name }) catch return null;
         const close_at = std.mem.indexOfPos(u8, xml, p, close) orelse return null;
@@ -154,8 +145,6 @@ fn extractElement(xml: []const u8, name: []const u8) ?[]const u8 {
     }
     return null;
 }
-
-// --- token exchanges -------------------------------------------------------
 
 /// SAML-bearer grant: exchange the assertion for an AAD access token (v1.0
 /// endpoint with `resource`, like ADAL's federated flow).
@@ -232,8 +221,6 @@ fn postForToken(gpa: std.mem.Allocator, url: []const u8, body: []const u8) ![]co
         else => error.AadTokenFailed,
     };
 }
-
-// --- small helpers ---------------------------------------------------------
 
 const appendForm = httpx.appendForm;
 const formEncode = httpx.formEncode;

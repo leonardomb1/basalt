@@ -19,12 +19,12 @@ const obs = @import("../runtime/obs.zig");
 
 const Batch = batchmod.Batch;
 
-const FLUSH_BYTES = 8 * 1024 * 1024; // ~8MB per Stream Load PUT
+const FLUSH_BYTES = 8 * 1024 * 1024;
 
 pub const Config = struct {
     fe_host: []const u8 = "127.0.0.1",
     fe_port: u16 = 9030,
-    load_url: []const u8 = "http://127.0.0.1:8040", // BE (direct) or FE :8030
+    load_url: []const u8 = "http://127.0.0.1:8040",
     database: []const u8,
     user: []const u8 = "root",
     password: []const u8 = "",
@@ -32,12 +32,8 @@ pub const Config = struct {
     replication_num: u32 = 1,
     auto_create: bool = true,
     label_prefix: []const u8 = "basalt",
-    run_id: u64 = 0, // 0 => generate per run (timestamp); see genLabel for the label scheme
+    run_id: u64 = 0,
 };
-
-// ---------------------------------------------------------------------------
-// Type mapping
-// ---------------------------------------------------------------------------
 
 pub fn srType(arena: std.mem.Allocator, t: types.Type) ![]const u8 {
     return switch (t.kind) {
@@ -48,16 +44,12 @@ pub fn srType(arena: std.mem.Allocator, t: types.Type) ![]const u8 {
         .string => "VARCHAR(65533)",
         .bytes => "STRING",
         .date => "DATE",
-        .time => "VARCHAR(32)", // StarRocks has no TIME type
+        .time => "VARCHAR(32)",
         .timestamp => "DATETIME",
         .array => "STRING",
         .@"struct" => "JSON",
     };
 }
-
-// ---------------------------------------------------------------------------
-// DDL generation (auto-create)
-// ---------------------------------------------------------------------------
 
 pub fn genCreateTable(
     arena: std.mem.Allocator,
@@ -73,11 +65,8 @@ pub fn genCreateTable(
         .upsert => |u| u.keys,
         else => &.{schema.fields[0].name},
     };
-    // Inferred-PK upsert must have its keys resolved before reaching here; an
-    // empty key list would emit malformed DDL (empty PRIMARY KEY / DISTRIBUTED BY).
     if (is_pk and keys.len == 0) return error.UpsertKeysUnresolved;
 
-    // Column order: for a Primary Key table the key columns must come first.
     var ordered = std.array_list.Managed(types.Schema.Field).init(arena);
     if (is_pk) {
         for (keys) |k| {
@@ -111,8 +100,6 @@ pub fn genCreateTable(
     } else {
         try w.print("DUPLICATE KEY(`{s}`)\n", .{keys[0]});
     }
-    // Distribute by the full key for a PK table — hashing on a single low-cardinality
-    // lead key (e.g. a tenant code) would pile most rows into a few buckets.
     try w.writeAll("DISTRIBUTED BY HASH(");
     if (is_pk) {
         for (keys, 0..) |k, i| {
@@ -133,10 +120,6 @@ fn findField(schema: types.Schema, name: []const u8) ?types.Schema.Field {
 }
 
 const nameIn = sqlmod.nameIn;
-
-// ---------------------------------------------------------------------------
-// Stream Load body + helpers
-// ---------------------------------------------------------------------------
 
 /// Stream Load label: `<prefix>_<table>_<run_id>_<seq>`. The label makes each flush
 /// at-most-once within a run (StarRocks rejects a duplicate label). It does NOT give
@@ -207,25 +190,21 @@ fn writeSanitized(w: anytype, s: []const u8) !void {
 ///   SHA1(pw) XOR SHA1( salt ++ SHA1(SHA1(pw)) )
 pub fn mysqlAuthToken(password: []const u8, salt: []const u8) [20]u8 {
     const Sha1 = std.crypto.hash.Sha1;
-    var h1: [20]u8 = undefined; // SHA1(pw)
+    var h1: [20]u8 = undefined;
     Sha1.hash(password, &h1, .{});
-    var h2: [20]u8 = undefined; // SHA1(SHA1(pw))
+    var h2: [20]u8 = undefined;
     Sha1.hash(&h1, &h2, .{});
 
     var ctx = Sha1.init(.{});
     ctx.update(salt);
     ctx.update(&h2);
-    var h3: [20]u8 = undefined; // SHA1(salt ++ SHA1(SHA1(pw)))
+    var h3: [20]u8 = undefined;
     ctx.final(&h3);
 
     var out: [20]u8 = undefined;
     for (&out, 0..) |*b, i| b.* = h1[i] ^ h3[i];
     return out;
 }
-
-// ---------------------------------------------------------------------------
-// Sink: auto-create via FE (MySQL), then Stream Load batches to the BE (HTTP)
-// ---------------------------------------------------------------------------
 
 pub const StreamLoadSink = struct {
     gpa: std.mem.Allocator,
@@ -247,8 +226,6 @@ pub const StreamLoadSink = struct {
         errdefer gpa.destroy(self);
         const columns = try columnList(gpa, schema);
         errdefer gpa.free(columns);
-        // Own our copy of label_prefix (the caller's may be a literal, a run-arena
-        // string, or a per-lane temp); closeImpl frees it.
         var cfg_owned = cfg;
         cfg_owned.label_prefix = try gpa.dupe(u8, cfg.label_prefix);
         errdefer gpa.free(cfg_owned.label_prefix);
@@ -288,8 +265,6 @@ pub const StreamLoadSink = struct {
     }
 
     fn runDDL(self: *StreamLoadSink, sql: []const u8) !void {
-        // connect without a preselected database (it may not exist yet); DDL uses
-        // fully-qualified `db`.`table` names.
         const conn = try mysql.Conn.connect(self.gpa, self.cfg.fe_host, self.cfg.fe_port, self.cfg.user, self.cfg.password, "", .off);
         defer conn.close();
         conn.exec(sql) catch |e| {
@@ -304,9 +279,6 @@ pub const StreamLoadSink = struct {
     }
 
     fn closeImpl(self: *StreamLoadSink) !void {
-        // Free every owned resource even if the final flush fails — otherwise a
-        // failed Stream Load on close leaks the sink, buffer, columns, label copy,
-        // and the HTTP client's connection pool (once per lane).
         defer self.teardown();
         try self.flush();
     }
@@ -329,10 +301,6 @@ pub const StreamLoadSink = struct {
     fn flush(self: *StreamLoadSink) !void {
         if (self.buffer.items.len == 0) return;
         self.seq += 1;
-        // Retry transient network failures with backoff, reusing the SAME label
-        // (seq was bumped once above): if the failed PUT actually committed,
-        // the server answers the retry with "Label Already Exists", which
-        // loadSucceeded treats as success — at-most-once per flush.
         var attempt: usize = 0;
         while (true) {
             self.streamLoad() catch |e| {
@@ -393,9 +361,6 @@ pub const StreamLoadSink = struct {
 };
 
 fn loadSucceeded(body: []const u8) bool {
-    // tolerate pretty/compact JSON; accept Success and Publish Timeout
-    // (committed). "Label Already Exists" means a previous attempt with this
-    // label committed — the retry-after-lost-response case — also success.
     return std.mem.indexOf(u8, body, "Success") != null or
         std.mem.indexOf(u8, body, "Publish Timeout") != null or
         std.mem.indexOf(u8, body, "Label Already Exists") != null;
@@ -422,10 +387,6 @@ fn slAbort(ptr: *anyopaque) void {
     const self: *StreamLoadSink = @ptrCast(@alignCast(ptr));
     self.abortImpl();
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 test "type mapping" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -494,7 +455,6 @@ test "create table: upsert -> Primary Key, keys first + NOT NULL" {
     const sql = try genCreateTable(a, "warehouse", "orders", schema, mode, 4, 1);
     try std.testing.expect(std.mem.indexOf(u8, sql, "PRIMARY KEY(`id`)") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "`id` BIGINT NOT NULL") != null);
-    // id reordered before name
     const ipos = std.mem.indexOf(u8, sql, "`id`").?;
     const npos = std.mem.indexOf(u8, sql, "`name`").?;
     try std.testing.expect(ipos < npos);
@@ -506,9 +466,6 @@ test "label and column list" {
     const a = ar.allocator();
     try std.testing.expectEqualStrings("basalt_orders_99_3", try genLabel(a, "basalt", "orders", 99, 3));
 
-    // Parallel sink: lane-distinct prefixes + a shared run_id keep labels unique
-    // across lanes (no Stream Load "label already exists" collisions) while staying
-    // idempotent across re-runs (same run_id -> same labels -> StarRocks dedups).
     const l0 = try genLabel(a, "pipeline_l0", "orders", 99, 1);
     const l1 = try genLabel(a, "pipeline_l1", "orders", 99, 1);
     try std.testing.expect(!std.mem.eql(u8, l0, l1));
@@ -532,15 +489,12 @@ test "writeSanitized replaces separator bytes embedded in data" {
 }
 
 test "mysql_native_password token matches a known vector" {
-    // password "foobar", salt = 20 bytes 0x01..0x14. Expected value computed
-    // externally (Python hashlib) so a wrong formula can't verify itself.
     var salt: [20]u8 = undefined;
     for (&salt, 0..) |*b, i| b.* = @intCast(i + 1);
     const tok = mysqlAuthToken("foobar", &salt);
     var expect: [20]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expect, "e419caeec63ade5aeb8e0f8bbb2ac2d86b183350");
     try std.testing.expectEqualSlices(u8, &expect, &tok);
-    // salt must matter (guards against hashing the password alone)
     var salt2 = salt;
     salt2[0] ^= 0xFF;
     try std.testing.expect(!std.mem.eql(u8, &tok, &mysqlAuthToken("foobar", &salt2)));
@@ -558,8 +512,8 @@ test "stream-load TSV body: control-byte framing, nulls, sanitized values" {
     try b0.append(.{ .int = 1 });
     try b0.append(.null);
     var b1 = columnmod.Builder.init(a, str_ty);
-    try b1.append(.{ .string = "memo\x01with\x02bytes" }); // stray separators in data
-    try b1.append(.{ .string = "line\nbreak" }); // newline must NOT split the row
+    try b1.append(.{ .string = "memo\x01with\x02bytes" });
+    try b1.append(.{ .string = "line\nbreak" });
     const cols = try a.alloc(columnmod.Column, 2);
     cols[0] = try b0.finish();
     cols[1] = try b1.finish();

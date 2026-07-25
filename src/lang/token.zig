@@ -7,13 +7,13 @@ const std = @import("std");
 
 pub const Tag = enum {
     ident,
-    string, // text excludes the surrounding quotes (escapes not yet unescaped)
+    string,
     int,
     float,
-    interp, // ${name} — template placeholder; text is the full lexeme incl. `${}`
+    interp,
 
-    pipe, // |
-    at, // @
+    pipe,
+    at,
 
     lparen,
     rparen,
@@ -24,27 +24,26 @@ pub const Tag = enum {
 
     comma,
     dot,
-    colon, // : (loop-variable type annotation)
-    star, // * (also multiply)
+    colon,
+    star,
 
-    assign, // =
-    fat_arrow, // =>
-    eq, // ==
-    ne, // !=
-    lt, // <
-    le, // <=
-    gt, // >
-    ge, // >=
+    assign,
+    fat_arrow,
+    eq,
+    ne,
+    lt,
+    le,
+    gt,
+    ge,
     plus,
     minus,
     slash,
     percent,
-    qq, // ?? (null-coalesce)
-    qdot, // ?. (safe navigation)
+    qq,
+    qdot,
 
-    // SQL-dialect tokens (unused by the BSL lexer).
-    semi, // ;
-    dollar_ident, // $name — PARAM reference; text excludes the `$`
+    semi,
+    dollar_ident,
 
     eof,
     invalid,
@@ -92,7 +91,7 @@ pub const Tag = enum {
 
 pub const Token = struct {
     tag: Tag,
-    text: []const u8, // slice into the source
+    text: []const u8,
     line: u32,
     col: u32,
 };

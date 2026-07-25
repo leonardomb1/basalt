@@ -95,8 +95,8 @@ pub fn gather(arena: std.mem.Allocator, c: Column, keep: []const bool, kept: usi
 
 /// Concatenate same-typed column chunks into one column of `total` rows by
 /// copying the typed backing slices directly — no per-row `Value` boxing. Byte
-/// slices are NOT re-duped: the caller guarantees the chunks' bytes live at
-/// least as long as the output (e.g. all in the same arena).
+/// payloads are copied into a fresh values buffer (one memcpy per chunk), so
+/// the output does not borrow from the inputs.
 pub fn concat(arena: std.mem.Allocator, chunks: []const Column, total: usize) !Column {
     std.debug.assert(chunks.len > 0);
     var bm = try Bitmap.initFull(arena, total);
@@ -189,7 +189,7 @@ pub const Column = struct {
             .date => .{ .date = self.data.i32[i] },
             .time => .{ .time = self.data.i64[i] },
             .timestamp => .{ .timestamp = self.data.i64[i] },
-            .array, .@"struct" => .null, // composite columns are deferred past M0
+            .array, .@"struct" => .null,
         };
     }
 };
@@ -385,11 +385,11 @@ test "bitmap allSet: empty prefix, partial byte, exact byte multiple" {
     const alloc = std.testing.allocator;
     var bm = try Bitmap.initFull(alloc, 16);
     defer alloc.free(bm.bits);
-    try std.testing.expect(bm.allSet(0)); // vacuously true
-    try std.testing.expect(bm.allSet(16)); // rem == 0: whole-byte path only
+    try std.testing.expect(bm.allSet(0));
+    try std.testing.expect(bm.allSet(16));
     bm.setValid(11, false);
-    try std.testing.expect(bm.allSet(11)); // cleared bit sits outside the prefix
-    try std.testing.expect(!bm.allSet(12)); // partial trailing byte sees it
+    try std.testing.expect(bm.allSet(11));
+    try std.testing.expect(!bm.allSet(12));
     try std.testing.expect(!bm.allSet(16));
 }
 

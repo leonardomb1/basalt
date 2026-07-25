@@ -15,9 +15,9 @@ pub const Value = union(enum) {
     decimal: Decimal,
     string: []const u8,
     bytes: []const u8,
-    date: i32, // days since 1970-01-01
-    time: i64, // microseconds since midnight
-    timestamp: i64, // microseconds since epoch, UTC
+    date: i32,
+    time: i64,
+    timestamp: i64,
 
     pub fn isNull(self: Value) bool {
         return self == .null;

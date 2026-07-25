@@ -231,7 +231,6 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
     const legacy_session_id = random_buffer[32..64].*;
 
     var key_share = KeyShare.init(random_buffer[64..176].*) catch |err| switch (err) {
-        // Only possible to happen if the seed is all zeroes.
         error.IdentityElement => return error.InsufficientEntropy,
     };
 
@@ -272,9 +271,9 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
             array(u16, u8, key_share.x25519_kp.public_key),
     ));
     const server_name_extension = int(u16, @intFromEnum(tls.ExtensionType.server_name)) ++
-        int(u16, 2 + 1 + 2 + host_len) ++ // byte length of this extension payload
-        int(u16, 1 + 2 + host_len) ++ // server_name_list byte count
-        .{0x00} ++ // name_type
+        int(u16, 2 + 1 + 2 + host_len) ++
+        int(u16, 1 + 2 + host_len) ++
+        .{0x00} ++
         int(u16, host_len);
     const server_name_extension_len = switch (options.host) {
         .no_verification => 0,
@@ -314,13 +313,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
     }
 
     var tls_version: tls.ProtocolVersion = undefined;
-    // These are used for two purposes:
-    // * Detect whether a certificate is the first one presented, in which case
-    //   we need to verify the host name.
     var cert_index: usize = 0;
-    // * Flip back and forth between the two cleartext buffers in order to keep
-    //   the previous certificate in memory so that it can be verified by the
-    //   next one.
     var cert_buf_index: usize = 0;
     var write_seq: u64 = 0;
     var read_seq: u64 = 0;
@@ -335,7 +328,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
     };
     var pending_cipher_state: CipherState = .cleartext;
     var cipher_state = pending_cipher_state;
-    var client_cert_requested = false; // [basalt]
+    var client_cert_requested = false;
     const HandshakeState = enum {
         /// In this state we expect only a server hello message.
         hello,
@@ -362,17 +355,16 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
     var cleartext_fragment_end: usize = 0;
     var cleartext_bufs: [2][tls.max_ciphertext_inner_record_len]u8 = undefined;
     fragment: while (true) {
-        // Ensure the input buffer pointer is stable in this scope.
         input.rebase(tls.max_ciphertext_record_len) catch |err| switch (err) {
-            error.EndOfStream => {}, // We have assurance the remainder of stream can be buffered.
+            error.EndOfStream => {},
         };
         const record_header = input.peek(tls.record_header_len) catch |err| switch (err) {
             error.EndOfStream => return error.TlsConnectionTruncated,
             error.ReadFailed => return error.ReadFailed,
         };
-        const record_ct = input.takeEnumNonexhaustive(tls.ContentType, .big) catch unreachable; // already peeked
-        input.toss(2); // legacy_version
-        const record_len = input.takeInt(u16, .big) catch unreachable; // already peeked
+        const record_ct = input.takeEnumNonexhaustive(tls.ContentType, .big) catch unreachable;
+        input.toss(2);
+        const record_len = input.takeInt(u16, .big) catch unreachable;
         if (record_len > tls.max_ciphertext_len) return error.TlsRecordOverflow;
         const record_buffer = input.take(record_len) catch |err| switch (err) {
             error.EndOfStream => return error.TlsConnectionTruncated,
@@ -404,7 +396,6 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         };
                         P.AEAD.decrypt(cleartext, ciphertext, auth_tag, record_header, nonce, pv.server_handshake_key) catch
                             return error.TlsBadRecordMac;
-                        // TODO use scalar, non-slice version
                         cleartext_fragment_end += mem.trimEnd(u8, cleartext, "\x00").len;
                     },
                 }
@@ -478,15 +469,13 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         const legacy_version = hsd.decode(u16);
                         @memcpy(&server_hello_rand, hsd.array(32));
                         if (mem.eql(u8, &server_hello_rand, &tls.hello_retry_request_sequence)) {
-                            // This is a HelloRetryRequest message. This client implementation
-                            // does not expect to get one.
                             return error.TlsUnexpectedMessage;
                         }
                         const legacy_session_id_echo_len = hsd.decode(u8);
                         try hsd.ensure(legacy_session_id_echo_len + 2 + 1);
                         const legacy_session_id_echo = hsd.slice(legacy_session_id_echo_len);
                         const cipher_suite_tag = hsd.decode(tls.CipherSuite);
-                        hsd.skip(1); // legacy_compression_method
+                        hsd.skip(1);
                         var supported_version: ?u16 = null;
                         if (!hsd.eof()) {
                             try hsd.ensure(2);
@@ -540,8 +529,8 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     .version = undefined,
                                 });
                                 const p = &@field(handshake_cipher, @tagName(tag.with()));
-                                p.transcript_hash.update(cleartext_header[tls.record_header_len..]); // Client Hello part 1
-                                p.transcript_hash.update(host); // Client Hello part 2
+                                p.transcript_hash.update(cleartext_header[tls.record_header_len..]);
+                                p.transcript_hash.update(host);
                                 p.transcript_hash.update(wrapped_handshake);
                             },
 
@@ -622,7 +611,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         }
                         handshake_state = .certificate;
                     },
-                    .certificate_request => { // [basalt] empty-cert reply happens in .finished
+                    .certificate_request => {
                         if (tls_version != .tls_1_3) return error.TlsUnexpectedMessage;
                         if (cipher_state != .handshake) return error.TlsUnexpectedMessage;
                         if (handshake_state != .certificate) return error.TlsUnexpectedMessage;
@@ -672,27 +661,19 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             const subject = try subject_cert.parse();
                             if (options.chain) |cap| cap.add(certd.buf[certd.idx..][0..cert_size]);
                             if (cert_index == 0) {
-                                // Verify the host on the first certificate.
                                 switch (options.host) {
                                     .no_verification => {},
                                     .explicit => try subject.verifyHostName(host),
                                 }
 
-                                // Keep track of the public key for the
-                                // certificate_verify message later.
                                 try main_cert_pub_key.init(subject.pub_key_algo, subject.pubKey());
                             } else if (options.ca != .no_verification) {
-                                // Chain-order check is part of trust verification;
-                                // skipped under no_verification so a capture pass can
-                                // see the whole chain even when it's misordered.
                                 try prev_cert.verify(subject, now_sec);
                             }
 
                             switch (options.ca) {
                                 .no_verification => {
                                     handshake_state = .trust_chain_established;
-                                    // keep iterating when capturing: the rest of the
-                                    // chain is in this same message.
                                     if (options.chain == null) break :cert;
                                 },
                                 .self_signed => {
@@ -728,7 +709,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         }
                         try hsd.ensure(1 + 2 + 1);
                         const curve_type = hsd.decode(u8);
-                        if (curve_type != 0x03) return error.TlsIllegalParameter; // named_curve
+                        if (curve_type != 0x03) return error.TlsIllegalParameter;
                         const named_group = hsd.decode(tls.NamedGroup);
                         tls12_negotiated_group = named_group;
                         const key_size = hsd.decode(u8);
@@ -752,10 +733,10 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
 
                         const client_key_exchange_prefix = .{@intFromEnum(tls.ContentType.handshake)} ++
                             int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
-                            int(u16, @intCast(public_key_bytes.len + 5)) ++ // record length
+                            int(u16, @intCast(public_key_bytes.len + 5)) ++
                             .{@intFromEnum(tls.HandshakeType.client_key_exchange)} ++
-                            int(u24, @intCast(public_key_bytes.len + 1)) ++ // handshake message length
-                            .{@as(u8, @intCast(public_key_bytes.len))}; // public key length
+                            int(u24, @intCast(public_key_bytes.len + 1)) ++
+                            .{@as(u8, @intCast(public_key_bytes.len))};
                         const client_change_cipher_spec_msg = .{@intFromEnum(tls.ContentType.change_cipher_spec)} ++
                             int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
                             array(u16, tls.ChangeCipherSpecType, .{.change_cipher_spec});
@@ -855,7 +836,6 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                     .finished => {
                         if (cipher_state == .cleartext) return error.TlsUnexpectedMessage;
                         if (handshake_state != .finished) return error.TlsUnexpectedMessage;
-                        // This message is to trick buggy proxies into behaving correctly.
                         const client_change_cipher_spec_msg = .{@intFromEnum(tls.ContentType.change_cipher_spec)} ++
                             int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
                             array(u16, tls.ChangeCipherSpecType, .{.change_cipher_spec});
@@ -869,20 +849,12 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     p.transcript_hash.update(wrapped_handshake);
                                     const expected_server_verify_data = tls.hmac(P.Hmac, &finished_digest, pv.server_finished_key);
                                     if (!std.crypto.timing_safe.eql([P.Hmac.mac_length]u8, expected_server_verify_data, hsd.array(P.Hmac.mac_length).*)) return error.TlsDecryptError;
-                                    // [basalt] If the server asked for a client certificate we
-                                    // have none: reply with an empty Certificate message in the
-                                    // same encrypted record as Finished, hashed into the
-                                    // transcript before the client verify_data is computed.
                                     const empty_cert_msg = [8]u8{
                                         @intFromEnum(tls.HandshakeType.certificate),
-                                        0, 0, 4, // u24 length
-                                        0, // certificate_request_context length
-                                        0, 0, 0, // u24 certificate_list length
+                                        0, 0, 4,
+                                        0,
+                                        0, 0, 0,
                                     };
-                                    // [basalt] Application traffic secrets derive from the
-                                    // transcript through *server* Finished only (RFC 8446 §7.1);
-                                    // the client Certificate below is part of the client
-                                    // Finished's transcript but NOT of the traffic secrets.
                                     const app_hash = p.transcript_hash.peek();
                                     if (client_cert_requested) p.transcript_hash.update(&empty_cert_msg);
                                     const handshake_hash = p.transcript_hash.finalResult();
@@ -921,8 +893,8 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     try output.writeVecAll(&all_msgs_vec);
                                     try output.flush();
 
-                                    const client_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "c ap traffic", &app_hash, P.Hash.digest_length); // [basalt] app_hash, see above
-                                    const server_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "s ap traffic", &app_hash, P.Hash.digest_length); // [basalt]
+                                    const client_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "c ap traffic", &app_hash, P.Hash.digest_length);
+                                    const server_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "s ap traffic", &app_hash, P.Hash.digest_length);
                                     if (options.ssl_key_log) |key_log| logSecrets(key_log.writer, .{
                                         .counter = key_seq,
                                         .client_random = &client_hello_rand,
@@ -1065,8 +1037,6 @@ fn prepareCiphertextRecord(
     ciphertext_end: usize,
     cleartext_len: usize,
 } {
-    // Due to the trailing inner content type byte in the ciphertext, we need
-    // an additional buffer for storing the cleartext into before encrypting.
     var cleartext_buf: [max_ciphertext_len]u8 = undefined;
     var ciphertext_end: usize = 0;
     var bytes_i: usize = 0;
@@ -1109,7 +1079,7 @@ fn prepareCiphertextRecord(
                         break :nonce @as(V, pv.client_iv) ^ operand;
                     };
                     P.AEAD.encrypt(ciphertext, auth_tag, cleartext, ad, nonce, pv.client_key);
-                    c.write_seq += 1; // TODO send key_update on overflow
+                    c.write_seq += 1;
                 }
             },
             .tls_1_2 => {
@@ -1151,7 +1121,7 @@ fn prepareCiphertextRecord(
                     const auth_tag = ciphertext_buf[ciphertext_end..][0..P.mac_length];
                     ciphertext_end += P.mac_length;
                     P.AEAD.encrypt(ciphertext, auth_tag, cleartext, ad, nonce, pv.client_write_key);
-                    c.write_seq += 1; // TODO send key_update on overflow
+                    c.write_seq += 1;
                 }
             },
             else => unreachable,
@@ -1164,7 +1134,6 @@ pub fn eof(c: Client) bool {
 }
 
 fn stream(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
-    // This function writes exclusively to the buffer.
     _ = w;
     _ = limit;
     const c: *Client = @alignCast(@fieldParentPtr("reader", r));
@@ -1172,7 +1141,6 @@ fn stream(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize 
 }
 
 fn readVec(r: *Reader, data: [][]u8) Reader.Error!usize {
-    // This function writes exclusively to the buffer.
     _ = data;
     const c: *Client = @alignCast(@fieldParentPtr("reader", r));
     return readIndirect(c);
@@ -1182,12 +1150,8 @@ fn readIndirect(c: *Client) Reader.Error!usize {
     const r = &c.reader;
     if (c.eof()) return error.EndOfStream;
     const input = c.input;
-    // If at least one full encrypted record is not buffered, read once.
     const record_header = input.peek(tls.record_header_len) catch |err| switch (err) {
         error.EndOfStream => {
-            // This is either a truncation attack, a bug in the server, or an
-            // intentional omission of the close_notify message due to truncation
-            // detection handled above the TLS layer.
             if (c.allow_truncation_attacks) {
                 c.received_close_notify = true;
                 return error.EndOfStream;
@@ -1216,10 +1180,10 @@ fn readIndirect(c: *Client) Reader.Error!usize {
             .tls_1_3 => {
                 const pv = &p.tls_1_3;
                 const P = @TypeOf(p.*);
-                const ad = input.take(tls.record_header_len) catch unreachable; // already peeked
+                const ad = input.take(tls.record_header_len) catch unreachable;
                 const ciphertext_len = record_len - P.AEAD.tag_length;
-                const ciphertext = input.take(ciphertext_len) catch unreachable; // already peeked
-                const auth_tag = (input.takeArray(P.AEAD.tag_length) catch unreachable).*; // already peeked
+                const ciphertext = input.take(ciphertext_len) catch unreachable;
+                const auth_tag = (input.takeArray(P.AEAD.tag_length) catch unreachable).*;
                 const nonce = nonce: {
                     const V = @Vector(P.AEAD.nonce_length, u8);
                     const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
@@ -1230,7 +1194,6 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                 const cleartext = r.buffer[r.end..][0..ciphertext.len];
                 P.AEAD.decrypt(cleartext, ciphertext, auth_tag, ad, nonce, pv.server_key) catch
                     return failRead(c, error.TlsBadRecordMac);
-                // TODO use scalar, non-slice version
                 const msg = mem.trimRight(u8, cleartext, "\x00");
                 break :cleartext .{ msg.len - 1, @enumFromInt(msg[msg.len - 1]) };
             },
@@ -1238,11 +1201,11 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                 const pv = &p.tls_1_2;
                 const P = @TypeOf(p.*);
                 const message_len: u16 = record_len - P.record_iv_length - P.mac_length;
-                const ad_header = input.take(tls.record_header_len) catch unreachable; // already peeked
+                const ad_header = input.take(tls.record_header_len) catch unreachable;
                 const ad = mem.toBytes(big(c.read_seq)) ++
                     ad_header[0 .. 1 + 2] ++
                     mem.toBytes(big(message_len));
-                const record_iv = (input.takeArray(P.record_iv_length) catch unreachable).*; // already peeked
+                const record_iv = (input.takeArray(P.record_iv_length) catch unreachable).*;
                 const masked_read_seq = c.read_seq &
                     comptime std.math.shl(u64, std.math.maxInt(u64), 8 * P.record_iv_length);
                 const nonce: [P.AEAD.nonce_length]u8 = nonce: {
@@ -1251,8 +1214,8 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                     const operand: V = pad ++ @as([8]u8, @bitCast(big(masked_read_seq)));
                     break :nonce @as(V, pv.server_write_IV ++ record_iv) ^ operand;
                 };
-                const ciphertext = input.take(message_len) catch unreachable; // already peeked
-                const auth_tag = (input.takeArray(P.mac_length) catch unreachable).*; // already peeked
+                const ciphertext = input.take(message_len) catch unreachable;
+                const auth_tag = (input.takeArray(P.mac_length) catch unreachable).*;
                 rebase(r, ciphertext.len);
                 const cleartext = r.buffer[r.end..][0..ciphertext.len];
                 P.AEAD.decrypt(cleartext, ciphertext, auth_tag, ad, nonce, pv.server_write_key) catch
@@ -1277,7 +1240,6 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                     return 0;
                 },
                 .user_canceled => {
-                    // TODO: handle server-side closures
                     return failRead(c, error.TlsUnexpectedMessage);
                 },
                 else => {
@@ -1298,7 +1260,6 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                 const handshake = cleartext[ct_i..next_handshake_i];
                 switch (handshake_type) {
                     .new_session_ticket => {
-                        // This client implementation ignores new session tickets.
                     },
                     .key_update => {
                         switch (c.application_cipher) {
@@ -1542,19 +1503,16 @@ const CertificatePublicKey = struct {
     }
 
     const VerifyError = error{ TlsDecodeError, TlsBadSignatureScheme, InvalidEncoding } ||
-        // ecdsa
         crypto.errors.EncodingError ||
         crypto.errors.NotSquareError ||
         crypto.errors.NonCanonicalError ||
         SchemeEcdsa(.ecdsa_secp256r1_sha256).Signature.VerifyError ||
         SchemeEcdsa(.ecdsa_secp384r1_sha384).Signature.VerifyError ||
-        // rsa
         error{TlsBadRsaSignatureBitCount} ||
         Certificate.rsa.PublicKey.ParseDerError ||
         Certificate.rsa.PublicKey.FromBytesError ||
         Certificate.rsa.PSSSignature.VerifyError ||
         Certificate.rsa.PKCS1v1_5Signature.VerifyError ||
-        // eddsa
         SchemeEddsa(.ed25519).Signature.VerifyError;
 
     fn verifySignature(

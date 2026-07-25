@@ -86,10 +86,6 @@ pub const SingleKeyCtx = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 const testing = std.testing;
 
 test "equal values hash equal; payload and type tag discriminate" {
@@ -97,8 +93,6 @@ test "equal values hash equal; payload and type tag discriminate" {
     try testing.expectEqual(hashOne(.{ .string = "abc" }), hashOne(.{ .string = "abc" }));
     try testing.expectEqual(hashOne(.null), hashOne(.null));
     try testing.expect(hashOne(.{ .int = 42 }) != hashOne(.{ .int = 43 }));
-    // Same payload bytes under a different tag must not collide by construction:
-    // int 1 vs timestamp 1 (identical i64), null vs int 0.
     try testing.expect(hashOne(.{ .int = 1 }) != hashOne(.{ .timestamp = 1 }));
     try testing.expect(hashOne(.null) != hashOne(.{ .int = 0 }));
     try testing.expect(hashOne(.{ .string = "" }) != hashOne(.null));
@@ -119,7 +113,6 @@ test "valueEq: nulls group together, null never equals a value, mixed types uneq
     try testing.expect(!valueEq(.{ .string = "a" }, .{ .string = "b" }));
     try testing.expect(valueEq(.{ .float = 2.5 }, .{ .float = 2.5 }));
     try testing.expect(valueEq(.{ .bool = true }, .{ .bool = true }));
-    // Incomparable types compare unequal (no error): compareValues yields null.
     try testing.expect(!valueEq(.{ .string = "1" }, .{ .int = 1 }));
     try testing.expect(!valueEq(.{ .bool = true }, .{ .int = 1 }));
 }
@@ -131,11 +124,10 @@ test "MultiKeyCtx: composite equality and order-sensitive hashing" {
     const k3 = [_]Value{ .{ .string = "x" }, .{ .int = 1 } };
     try testing.expect(ctx.eql(&k1, &k2));
     try testing.expectEqual(ctx.hash(&k1), ctx.hash(&k2));
-    try testing.expect(!ctx.eql(&k1, &k3)); // column order matters
+    try testing.expect(!ctx.eql(&k1, &k3));
     try testing.expect(ctx.hash(&k1) != ctx.hash(&k3));
-    try testing.expect(!ctx.eql(k1[0..1], &k2)); // prefix != full key
+    try testing.expect(!ctx.eql(k1[0..1], &k2));
 
-    // Null slots participate in grouping: (null) == (null), (null) != (0).
     const n1 = [_]Value{.null};
     const n2 = [_]Value{.null};
     const z0 = [_]Value{.{ .int = 0 }};

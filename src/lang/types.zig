@@ -9,16 +9,16 @@ const std = @import("std");
 
 pub const TypeKind = enum {
     bool,
-    int, // i64
-    float, // f64
-    decimal, // (precision, scale), exact
-    string, // utf-8
+    int,
+    float,
+    decimal,
+    string,
     bytes,
-    date, // days since 1970-01-01
-    time, // microseconds since midnight
-    timestamp, // microseconds since epoch, UTC
-    array, // element type in `elem`
-    @"struct", // named fields in `fields`
+    date,
+    time,
+    timestamp,
+    array,
+    @"struct",
 
     pub fn isNumeric(self: TypeKind) bool {
         return switch (self) {
@@ -31,15 +31,10 @@ pub const TypeKind = enum {
 pub const Type = struct {
     kind: TypeKind,
     nullable: bool = false,
-    // `unknown` marks the type of a bare `null` literal: it unifies with any
-    // concrete type (yielding that type, nullable). Never appears on a column.
     unknown: bool = false,
-    // decimal parameters (kind == .decimal)
     precision: u8 = 0,
     scale: u8 = 0,
-    // array element (kind == .array)
     elem: ?*const Type = null,
-    // struct fields (kind == .@"struct")
     fields: ?[]const Field = null,
 
     pub const Field = struct { name: []const u8, ty: Type };
@@ -72,7 +67,6 @@ pub const Type = struct {
     pub fn eql(a: Type, b: Type) bool {
         if (a.kind != b.kind) return false;
         if (a.kind == .decimal and (a.precision != b.precision or a.scale != b.scale)) return false;
-        // array/struct deep comparison is deferred past M0.
         return true;
     }
 
@@ -159,7 +153,7 @@ test "unify: unknown-null unifies with any type, yielding it nullable" {
     const ua = Type.unify(Type.unknownNull(), s).?;
     try std.testing.expectEqual(TypeKind.string, ua.kind);
     try std.testing.expect(ua.nullable);
-    try std.testing.expect(!ua.unknown); // the result is a concrete type
+    try std.testing.expect(!ua.unknown);
     const ub = Type.unify(s, Type.unknownNull()).?;
     try std.testing.expectEqual(TypeKind.string, ub.kind);
     try std.testing.expect(ub.nullable);

@@ -3,8 +3,6 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    // ReleaseFast keeps debug info by default (for backtraces); `-Dstrip` drops it
-    // for a smaller release/container binary.
     const strip = b.option(bool, "strip", "Omit debug info from the binary") orelse false;
 
     const root_module = b.createModule(.{
@@ -33,8 +31,6 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
-    // SIMD microbenchmarks: always ReleaseFast so the measurement is meaningful
-    // regardless of the top-level optimize mode.
     const bench = b.addExecutable(.{
         .name = "bench",
         .root_module = b.createModule(.{

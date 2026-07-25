@@ -122,8 +122,6 @@ pub const Parser = struct {
     conn_names: std.array_list.Managed([]const u8) = undefined,
     let_names: std.array_list.Managed([]const u8) = undefined,
 
-    // --- cursor helpers -----------------------------------------------------
-
     fn cur(self: *Parser) Token {
         return self.toks[self.i];
     }
@@ -219,8 +217,6 @@ pub const Parser = struct {
         return false;
     }
 
-    // --- program ------------------------------------------------------------
-
     pub fn parseProgram(self: *Parser) Error!ast.Program {
         self.conn_names = std.array_list.Managed([]const u8).init(self.arena);
         self.let_names = std.array_list.Managed([]const u8).init(self.arena);
@@ -232,7 +228,6 @@ pub const Parser = struct {
         if (stmts.items.len == 0)
             return self.fail(self.curPos(), "empty program: expected at least one statement", .{});
 
-        // The runtime expects the @kind declaration first.
         const kind: ast.KindDecl = self.endpoint orelse
             .{ .kind = .batch, .config = &.{}, .pos = .{ .line = 1, .col = 1 } };
         try stmts.insert(0, .{ .kind = kind });
@@ -249,8 +244,6 @@ pub const Parser = struct {
         if (self.isKw("with") or self.isKw("select")) return self.parseTerminalQuery(out);
         return self.fail(self.curPos(), "expected a statement (CREATE / PARAM / LOAD INTO / SELECT / FOR / CASE), found {s}", .{self.curTag().describe()});
     }
-
-    // --- CREATE -------------------------------------------------------------
 
     fn parseCreate(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
         const pos = self.curPos();
@@ -315,19 +308,11 @@ pub const Parser = struct {
         return decl;
     }
 
-    // --- reflection: $var refs + IDENTIFIER()/||, lowered to `${...}` templates
-    // ------------------------------------------------------------------------
-    // The runtime already interpolates `${...}` per for-each row (renderQual /
-    // renderHints / interpAll). So `IDENTIFIER(<string-expr>)` and a PUSHDOWN
-    // expression are lowered here into that internal template form — the engine
-    // stays untouched. `$name` (a loop var / param) parses as a field ref and
-    // becomes a bare `${name}` hole; `||` is concat; `lower($x)` etc. compose.
-
     /// One dotted name atom: a plain identifier, or `IDENTIFIER(<expr>)` whose
     /// string value is computed per row (lowered to a `${...}` template).
     fn parseNameSegment(self: *Parser) Error![]const u8 {
         if (self.isKw("identifier") and self.peekTag() == .lparen) {
-            _ = self.advance(); // IDENTIFIER
+            _ = self.advance();
             _ = try self.expect(.lparen);
             const e = try self.parseExpr();
             _ = try self.expect(.rparen);
@@ -346,7 +331,7 @@ pub const Parser = struct {
             _ = try self.expect(.rparen);
             return self.exprToTemplate(e);
         }
-        return self.expectColName(); // ident or quoted string
+        return self.expectColName();
     }
 
     /// Lower a reflection expression into the internal `${...}` template. A
@@ -470,8 +455,6 @@ pub const Parser = struct {
             _ = try self.expect(.rparen);
         }
         _ = try self.expect(.semi);
-        // Credential convention: connection `erp` resolves ERP_USER / ERP_PASS
-        // from the environment unless the script names them explicitly.
         if (!has_user) try attrs.append(.{ .key = "user", .value = try self.envCall(name, "_USER"), .pos = pos });
         if (!has_pass) try attrs.append(.{ .key = "password", .value = try self.envCall(name, "_PASS"), .pos = pos });
         return .{ .name = name, .connector = connector, .config = try attrs.toOwnedSlice(), .pos = pos };
@@ -501,8 +484,6 @@ pub const Parser = struct {
         return .{ .name = name, .params = try params.toOwnedSlice(), .body = body, .pos = pos };
     }
 
-    // --- PARAM --------------------------------------------------------------
-
     fn parseParam(self: *Parser) Error!ast.Param {
         const pos = self.curPos();
         try self.expectKw("param");
@@ -526,7 +507,7 @@ pub const Parser = struct {
                 source = .body;
             } else if (self.eatKw("header")) {
                 source = .header;
-                if (self.eat(.lparen)) { // FROM HEADER('X-Name')
+                if (self.eat(.lparen)) {
                     header_name = (try self.expect(.string)).text;
                     _ = try self.expect(.rparen);
                 }
@@ -588,8 +569,6 @@ pub const Parser = struct {
             self.fail(.{ .line = t.line, .col = t.col }, "number out of range: {s}", .{t.text});
     }
 
-    // --- LOAD INTO ------------------------------------------------------------
-
     fn parseLoadInto(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
         const pos = self.curPos();
         try self.expectKw("load");
@@ -597,15 +576,12 @@ pub const Parser = struct {
 
         var write: ast.Write = undefined;
         if (self.at(.string)) {
-            // file target by path: LOAD INTO '/out/x.csv'
             write = .{ .connector = "csv", .form = null, .target = self.advance().text, .mode = .default };
         } else {
             const conn = try self.expectIdent();
             if (!self.isConn(conn))
                 return self.fail(pos, "unknown connection `{s}` in LOAD INTO (declare it with CREATE CONNECTION first)", .{conn});
             _ = try self.expect(.dot);
-            // Target segments: a name, a quoted `'...'` (interpolated) string, or
-            // IDENTIFIER(<expr>) for a per-row dynamic name.
             var parts = std.array_list.Managed([]const u8).init(self.arena);
             try parts.append(try self.parseTargetSegment());
             while (self.eat(.dot)) try parts.append(try self.parseTargetSegment());
@@ -616,7 +592,6 @@ pub const Parser = struct {
         if (self.eatKw("using")) write.form = try self.expectIdent();
 
         var whints = std.array_list.Managed(ast.Hint).init(self.arena);
-        // dispositions + load clauses, any order
         while (true) {
             if (self.eatKw("append")) {
                 write.mode = .append;
@@ -625,8 +600,6 @@ pub const Parser = struct {
             } else if (self.eatKw("upsert")) {
                 var keys = std.array_list.Managed([]const u8).init(self.arena);
                 if (self.eatKw("on")) {
-                    // A key may be a plain column, a quoted interpolated string,
-                    // or IDENTIFIER(<expr>) for a per-row computed key column.
                     _ = try self.expect(.lparen);
                     try keys.append(try self.parseTargetSegment());
                     while (self.eat(.comma)) try keys.append(try self.parseTargetSegment());
@@ -708,8 +681,6 @@ pub const Parser = struct {
         }
         _ = try self.expect(.rparen);
     }
-
-    // --- query -> pipeline stages ---------------------------------------------
 
     /// Parse `[WITH ctes] core [UNION ALL BY NAME core]* [ANCHOR SCHEMA q]
     /// [ORDER BY ...] [LIMIT n [OFFSET m]]`, appending Let stmts for CTEs to
@@ -803,10 +774,9 @@ pub const Parser = struct {
             }
         }
 
-        // Items are parsed before FROM, so alias qualifiers are stripped afterwards.
         const RawItem = union(enum) {
             item: ast.SelectItem,
-            qstar: []const u8, // `t.*`
+            qstar: []const u8,
         };
         var raw_items = std.array_list.Managed(RawItem).init(self.arena);
         while (true) {
@@ -837,8 +807,8 @@ pub const Parser = struct {
                 self.i + 2 < self.toks.len and self.toks[self.i + 2].tag == .star)
             {
                 const alias = self.advance().text;
-                _ = self.advance(); // .
-                _ = self.advance(); // *
+                _ = self.advance();
+                _ = self.advance();
                 try raw_items.append(.{ .qstar = alias });
             } else {
                 const e = try self.parseExpr();
@@ -860,12 +830,9 @@ pub const Parser = struct {
         var read_hints = std.array_list.Managed(ast.Hint).init(self.arena);
         const src = try self.parseFromSource(&aliases, &read_hints);
 
-        // Source clauses, any order: PUSHDOWN($$...$$), PAGINATE BY, RETRY, WITH (...).
         while (true) {
             if (self.eatKw("pushdown")) {
                 _ = try self.expect(.lparen);
-                // A raw predicate: a `$$...$$` literal, a `$var` (injected
-                // verbatim per row), or a string expression building one.
                 const e = try self.parseExpr();
                 _ = try self.expect(.rparen);
                 const frag = try self.exprToTemplate(e);
@@ -884,8 +851,6 @@ pub const Parser = struct {
         var stages = std.array_list.Managed(ast.Stage).init(self.arena);
         try stages.append(.{ .node = src, .hints = try read_hints.toOwnedSlice(), .pos = pos });
 
-        // joins — the executor supports INNER/LEFT/SEMI/ANTI; CROSS exists only
-        // as `CROSS JOIN UNNEST(...)` (an explode). RIGHT/FULL are rejected.
         while (true) {
             var is_cross = false;
             const jk: ?ast.JoinKind = blk: {
@@ -903,12 +868,11 @@ pub const Parser = struct {
                 break :blk null;
             };
             if (jk == null and !is_cross) break;
-            const kind = jk orelse .inner; // placeholder for the cross/unnest path
-            if (!self.isKw("join")) _ = self.advance(); // the kind word
+            const kind = jk orelse .inner;
+            if (!self.isKw("join")) _ = self.advance();
             _ = self.eatKw("outer");
             try self.expectKw("join");
             const jpos = self.curPos();
-            // CROSS JOIN UNNEST(SPLIT(col, ',')) AS name -> explode stage
             if (is_cross) {
                 if (!self.isKw("unnest"))
                     return self.fail(jpos, "CROSS JOIN is only supported as CROSS JOIN UNNEST(...)", .{});
@@ -961,7 +925,6 @@ pub const Parser = struct {
             });
         }
 
-        // WHERE -> filter
         if (self.eatKw("where")) {
             const fpos = self.curPos();
             var e = try self.parseExpr();
@@ -969,7 +932,6 @@ pub const Parser = struct {
             try stages.append(.{ .node = .{ .filter = e }, .hints = &.{}, .pos = fpos });
         }
 
-        // GROUP BY
         var group: []const ast.QualName = &.{};
         if (self.eatKw("group")) {
             try self.expectKw("by");
@@ -983,7 +945,6 @@ pub const Parser = struct {
             group = try keys.toOwnedSlice();
         }
 
-        // Resolve items: strip aliases; split into aggregate vs plain select.
         var items = std.array_list.Managed(ast.SelectItem).init(self.arena);
         var aggs = std.array_list.Managed(ast.AggItem).init(self.arena);
         var union_tag: ?[]const u8 = null;
@@ -1026,11 +987,6 @@ pub const Parser = struct {
         if (aggs.items.len > 0 or group.len > 0) {
             if (aggs.items.len == 0)
                 return self.fail(pos, "GROUP BY without aggregate functions in SELECT", .{});
-            // A group key naming a computed alias (`SELECT CAST(n AS INT) AS g ...
-            // GROUP BY g`) needs the computation before the aggregate: emit the
-            // non-agg items as a projection stage first. Agg args must then
-            // reference projected columns. With plain-field keys only, aggregate
-            // directly (args may be arbitrary expressions over source columns).
             var needs_pre = false;
             for (group) |k| {
                 for (items.items) |it| {
@@ -1056,7 +1012,6 @@ pub const Parser = struct {
                 .pos = pos,
             });
         } else {
-            // A lone `*` projects nothing new — omit the stage (matches BSL).
             const lone_star = items.items.len == 1 and items.items[0] == .star;
             if (!lone_star) {
                 try stages.append(.{ .node = .{ .select = try items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
@@ -1067,7 +1022,6 @@ pub const Parser = struct {
             try stages.append(.{ .node = .{ .distinct = .{ .on = distinct_on } }, .hints = &.{}, .pos = pos });
         }
 
-        // Union-branch shape: read + optional (tag computed + star), nothing else.
         var union_branch: ?BranchInfo = null;
         const s = stages.items;
         if (s.len <= 2 and s[0].node == .read) {
@@ -1076,7 +1030,7 @@ pub const Parser = struct {
             if (shape_ok) {
                 union_branch = .{ .read = s[0].node.read, .tag = union_tag, .tag_col = union_tag_col };
                 if (s.len == 2 and union_tag == null and s[1].node.select.len == 2)
-                    union_branch = null; // computed col that isn't a literal tag
+                    union_branch = null;
             }
         }
 
@@ -1143,7 +1097,6 @@ pub const Parser = struct {
             _ = try self.expect(.rparen);
             node = .{ .read = .{ .connector = "http", .form = .{ .path = url.text } } };
         } else if (self.isKw("buffer") and self.peekTag() == .string) {
-            // FROM BUFFER 'name' [AT 'dir'] [FLUSH EVERY n SECONDS [OR n ROWS]]
             _ = self.advance();
             const name = self.advance().text;
             var ref = ast.BufferRef{ .name = name };
@@ -1171,11 +1124,7 @@ pub const Parser = struct {
             const pos = self.curPos();
             const head = try self.expectIdent();
             if (self.at(.dot)) {
-                // A dotted head is always a connection-qualified source (CTEs are
-                // single names). Whether the connection exists is the analyzer's
-                // diagnostic, not the parser's — matching `basalt check` behavior.
-                _ = self.advance(); // .
-                // conn.QUERY($$...$$) | conn.'/rest/path' | conn.schema.table
+                _ = self.advance();
                 if (self.isKw("query") and self.peekTag() == .lparen) {
                     _ = self.advance();
                     _ = try self.expect(.lparen);
@@ -1183,11 +1132,8 @@ pub const Parser = struct {
                     _ = try self.expect(.rparen);
                     node = .{ .read = .{ .connector = head, .form = .{ .query = q.text } } };
                 } else if (self.at(.string)) {
-                    // REST path relative to an http connection's base URL.
                     node = .{ .read = .{ .connector = head, .form = .{ .path = self.advance().text } } };
                 } else {
-                    // conn.schema.table — any segment may be IDENTIFIER(<expr>)
-                    // for a per-row dynamic name (e.g. `fluig.dbo.IDENTIFIER($name)`).
                     var parts = std.array_list.Managed([]const u8).init(self.arena);
                     try parts.append(try self.parseNameSegment());
                     while (self.at(.dot) and self.peekTag() == .ident) {
@@ -1221,7 +1167,6 @@ pub const Parser = struct {
 
         var u = ast.Union{ .pos = pos };
         if (self.at(.dollar_ident)) {
-            // JSON array from a param path: rendered by the interpolation pass.
             const q = try self.parseDollarPath();
             const joined = try std.mem.join(self.arena, ".", q.parts);
             u.discover_json = try std.fmt.allocPrint(self.arena, "${{{s}}}", .{joined});
@@ -1251,7 +1196,7 @@ pub const Parser = struct {
 
         if (self.eatKw("as")) {
             _ = try self.expect(.lparen);
-            _ = try self.expectIdent(); // positional: the table-name column
+            _ = try self.expectIdent();
             if (self.eat(.comma)) {
                 const tag_col = try self.expectIdent();
                 try hints.append(.{ .key = "tag", .value = .{ .ident = tag_col }, .pos = pos });
@@ -1287,7 +1232,6 @@ pub const Parser = struct {
                 const kpos = self.curPos();
                 const key = try self.expectIdent();
                 _ = try self.expect(.assign);
-                // Friendly clause keys -> engine hint names.
                 const hint_key = if (eqlNoCase(key, "param"))
                     (if (is_cursor) "cursor_param" else "page_param")
                 else if (eqlNoCase(key, "size"))
@@ -1301,7 +1245,7 @@ pub const Parser = struct {
                 else if (eqlNoCase(key, "max"))
                     "max_pages"
                 else
-                    key; // pass through (size_param, ...)
+                    key;
                 if (self.at(.string)) {
                     try hints.append(.{ .key = hint_key, .value = .{ .str = self.advance().text }, .pos = kpos });
                 } else if (self.at(.int)) {
@@ -1347,7 +1291,6 @@ pub const Parser = struct {
         var cols = std.array_list.Managed(types.BodyCol).init(self.arena);
         while (!self.at(.rparen)) {
             const name = try self.expectIdent();
-            // JSON columns ride as text (navigate/CAST downstream).
             const ty = if (self.isKw("json")) blk: {
                 _ = self.advance();
                 break :blk types.Type.init(.string);
@@ -1364,8 +1307,6 @@ pub const Parser = struct {
         return cols.toOwnedSlice();
     }
 
-    // --- FOR EACH ROW OF -------------------------------------------------------
-
     fn parseForEach(self: *Parser) Error!ast.ForEach {
         const pos = self.curPos();
         try self.expectKw("for");
@@ -1378,7 +1319,6 @@ pub const Parser = struct {
         if (self.at(.dollar_ident)) {
             source = .{ .json_path = try self.parseDollarPath() };
         } else if (self.at(.string)) {
-            // CSV discovery list: one loop row per CSV row.
             source = .{ .read = .{ .connector = "csv", .form = .{ .path = self.advance().text } } };
         } else if (self.at(.ident)) {
             const conn = try self.expectIdent();
@@ -1466,8 +1406,6 @@ pub const Parser = struct {
         };
     }
 
-    // --- CASE statement ---------------------------------------------------------
-
     fn parseCaseStmt(self: *Parser) Error!ast.StmtMatch {
         const pos = self.curPos();
         try self.expectKw("case");
@@ -1511,8 +1449,6 @@ pub const Parser = struct {
         return .{ .subject = subject, .arms = try arms.toOwnedSlice(), .pos = pos };
     }
 
-    // --- qualified names / alias stripping ---------------------------------------
-
     fn parseQualNameTok(self: *Parser) Error!ast.QualName {
         var parts = std.array_list.Managed([]const u8).init(self.arena);
         try parts.append(try self.expectColName());
@@ -1540,8 +1476,6 @@ pub const Parser = struct {
         return S.recur(.{ .p = self, .aliases = aliases }, e);
     }
 
-    // --- expressions (Pratt) ------------------------------------------------------
-
     fn parseExpr(self: *Parser) Error!*ast.Expr {
         return self.parseBin(0);
     }
@@ -1549,7 +1483,6 @@ pub const Parser = struct {
     const BinInfo = struct { op: ast.BinOp, lbp: u8 };
 
     fn binInfo(self: *Parser) ?BinInfo {
-        // precedence: or(10) < and(20) < ??(30) < cmp(40) < add(50) < mul(60)
         switch (self.curTag()) {
             .eq, .assign => return .{ .op = .eq, .lbp = 40 },
             .ne => return .{ .op = .ne, .lbp = 40 },
@@ -1574,7 +1507,6 @@ pub const Parser = struct {
     fn parseBin(self: *Parser, min_bp: u8) Error!*ast.Expr {
         var lhs = try self.parseUnary();
         while (true) {
-            // postfix: IS [NOT] NULL / EMPTY, LIKE, IN — comparison strength (40)
             if (self.isKw("is") and min_bp < 40) {
                 _ = self.advance();
                 const negated = self.eatKw("not");
@@ -1610,7 +1542,7 @@ pub const Parser = struct {
             if ((self.isKw("in") or (self.isKw("not") and self.peekKw("in"))) and min_bp < 40) {
                 const negated = self.isKw("not");
                 if (negated) _ = self.advance();
-                _ = self.advance(); // in
+                _ = self.advance();
                 _ = try self.expect(.lparen);
                 var alt: ?*ast.Expr = null;
                 while (true) {
@@ -1632,8 +1564,6 @@ pub const Parser = struct {
                 lhs = try self.mk(.{ .call = .{ .name = "coalesce", .args = args } });
                 continue;
             }
-            // `a || b` — string concat (ANSI), sugar for concat(a, b). Same
-            // strength as `+` so it composes left-to-right in a name/predicate.
             if (self.at(.pipe) and min_bp < 50) {
                 _ = self.advance();
                 const rhs = try self.parseBin(50);
@@ -1732,9 +1662,6 @@ pub const Parser = struct {
                     _ = self.advance();
                     const name = try self.expectIdent();
                     _ = try self.expect(.assign);
-                    // Parse the value at comparison precedence so the LET's own
-                    // `IN` isn't taken as the membership operator (`x IN (...)`).
-                    // Parenthesize a comparison-valued binding if needed.
                     const value = try self.parseBin(40);
                     try self.expectKw("in");
                     const body = try self.parseExpr();
@@ -1746,7 +1673,7 @@ pub const Parser = struct {
                     var args = std.array_list.Managed(*ast.Expr).init(self.arena);
                     if (!self.at(.rparen)) {
                         if (self.at(.star) and self.peekTag() == .rparen) {
-                            _ = self.advance(); // COUNT(*) — no argument
+                            _ = self.advance();
                         } else {
                             try args.append(try self.parseExpr());
                             while (self.eat(.comma)) try args.append(try self.parseExpr());
@@ -1813,8 +1740,6 @@ pub const Parser = struct {
     }
 };
 
-// --- helpers ------------------------------------------------------------------
-
 fn binOpText(op: ast.BinOp) []const u8 {
     return switch (op) {
         .add => "+",   .sub => "-",  .mul => "*",  .div => "/",  .mod => "%",
@@ -1838,8 +1763,6 @@ fn stripQual(q: ast.QualName, aliases: *const AliasSet) ast.QualName {
     return q;
 }
 
-// --- tests ----------------------------------------------------------------------
-
 const testing = std.testing;
 
 fn parseTest(a: std.mem.Allocator, src: []const u8) !ast.Program {
@@ -1860,7 +1783,6 @@ test "sql: terminal select from csv becomes read+write stdout" {
     try testing.expect(prog.stmts[0] == .kind);
     try testing.expectEqual(ast.Kind.batch, prog.stmts[0].kind.kind);
     const pl = prog.stmts[1].output;
-    // read, filter, select, limit, write
     try testing.expectEqual(@as(usize, 5), pl.stages.len);
     try testing.expect(pl.stages[0].node == .read);
     try testing.expect(pl.stages[1].node == .filter);
@@ -1882,7 +1804,7 @@ test "sql: LOAD INTO with GROUP BY becomes aggregate" {
         \\GROUP BY status;
     );
     const pl = prog.stmts[1].output;
-    try testing.expectEqual(@as(usize, 3), pl.stages.len); // read, aggregate, write
+    try testing.expectEqual(@as(usize, 3), pl.stages.len);
     const agg = pl.stages[1].node.aggregate;
     try testing.expectEqual(@as(usize, 2), agg.aggs.len);
     try testing.expectEqual(ast.AggFunc.count, agg.aggs[0].func);
@@ -1906,7 +1828,6 @@ test "sql: CTE + LEFT JOIN with alias stripping" {
         \\FROM 'in.csv' t
         \\LEFT JOIN paid p ON t.id = p.id;
     );
-    // kind, binding, output
     try testing.expectEqual(@as(usize, 3), prog.stmts.len);
     try testing.expect(prog.stmts[1] == .binding);
     try testing.expectEqualStrings("paid", prog.stmts[1].binding.name);
@@ -1917,7 +1838,6 @@ test "sql: CTE + LEFT JOIN with alias stripping" {
     try testing.expectEqualStrings("paid", j.binding);
     try testing.expectEqualStrings("id", j.left_key.parts[0]);
     try testing.expectEqualStrings("id", j.right_key.parts[0]);
-    // select items got their aliases stripped
     const sel = pl.stages[2].node.select;
     try testing.expectEqualStrings("id", sel[0].field.parts[0]);
     try testing.expectEqual(@as(usize, 1), sel[0].field.parts.len);
@@ -1941,17 +1861,15 @@ test "sql: UNION ALL BY NAME with tag literal and anchor" {
         \\ANCHOR SCHEMA erp.dbo.CT2010;
     );
     const pl = prog.stmts[3].output;
-    try testing.expectEqual(@as(usize, 2), pl.stages.len); // union, write
+    try testing.expectEqual(@as(usize, 2), pl.stages.len);
     const u = pl.stages[0].node.union_;
     try testing.expectEqual(@as(usize, 2), u.branches.len);
     try testing.expectEqualStrings("01", u.branches[0].tag.?);
     try testing.expectEqualStrings("02", u.branches[1].tag.?);
-    // hints: tag + canon
     try testing.expectEqualStrings("tag", pl.stages[0].hints[0].key);
     try testing.expectEqualStrings("CT2_EMPRESA", pl.stages[0].hints[0].value.ident);
     try testing.expectEqualStrings("canon", pl.stages[0].hints[1].key);
     try testing.expectEqualStrings("CT2010", pl.stages[0].hints[1].value.ident);
-    // write: upsert composite + split hint
     const w = pl.stages[1].node.write;
     try testing.expectEqual(@as(usize, 2), w.mode.upsert.keys.len);
     try testing.expectEqualStrings("split", pl.stages[1].hints[0].key);
@@ -2013,10 +1931,8 @@ test "sql: FOR EACH ROW OF json path with CASE dispatch" {
     try testing.expectEqual(@as(usize, 2), m.arms.len);
     try testing.expect(m.arms[0].guard != null);
     try testing.expect(m.arms[1].is_default);
-    // arm 1: pipeline with read query + write (no select — lone star)
     const arm1 = m.arms[0].body[0].output;
     try testing.expectEqual(@as(usize, 2), arm1.stages.len);
-    // arm 2: read, select(*, computed), write upsert
     const arm2 = m.arms[1].body[0].output;
     try testing.expectEqual(@as(usize, 3), arm2.stages.len);
     try testing.expectEqualStrings("crm_${lower(name)}", arm2.stages[2].node.write.target);
@@ -2087,7 +2003,7 @@ test "sql: ACCEPT INTO BUFFER declaration and FROM BUFFER source" {
     const rd = pl.stages[0].node.read;
     try testing.expectEqualStrings("buffer", rd.connector);
     try testing.expectEqualStrings("ev", rd.form.buffer.name);
-    try testing.expectEqualStrings("", rd.form.buffer.dir); // resolves from the decl
+    try testing.expectEqualStrings("", rd.form.buffer.dir);
     try testing.expectEqualStrings("flush_secs", pl.stages[0].hints[0].key);
     try testing.expectEqual(@as(i64, 5), pl.stages[0].hints[0].value.int);
     try testing.expectEqualStrings("flush_rows", pl.stages[0].hints[1].key);
@@ -2116,17 +2032,14 @@ test "sql: reflection lowering — IDENTIFIER / || / PUSHDOWN(expr) -> ${...} te
     const fe = prog.stmts[4].for_each;
     const body = fe.body[0].output;
     const rd = body.stages[0].node.read;
-    // table: fluig.dbo.IDENTIFIER($name) -> parts ["dbo", "${name}"]
     try testing.expectEqualStrings("dbo", rd.form.table.parts[0]);
     try testing.expectEqualStrings("${name}", rd.form.table.parts[1]);
-    // PUSHDOWN($where) -> where hint "${where}"
     try testing.expectEqualStrings("where", body.stages[0].hints[0].key);
     try testing.expectEqualStrings("${where}", body.stages[0].hints[0].value.str);
-    // target IDENTIFIER('fluig_' || lower($name)) -> "fluig_${lower(name)}"
     const w = body.stages[body.stages.len - 1].node.write;
     try testing.expectEqualStrings("fluig_${lower(name)}", w.target);
     try testing.expect(w.mode == .upsert);
-    try testing.expectEqual(@as(usize, 0), w.mode.upsert.keys.len); // bare upsert (PK inferred)
+    try testing.expectEqual(@as(usize, 0), w.mode.upsert.keys.len);
 }
 
 test "sql: PUSHDOWN($$literal$$) still lowers to a plain fragment (no hole)" {

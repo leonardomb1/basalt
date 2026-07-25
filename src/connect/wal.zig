@@ -25,10 +25,10 @@ const std = @import("std");
 pub const Wal = struct {
     gpa: std.mem.Allocator,
     dir: std.fs.Dir,
-    name: []const u8, // owned
+    name: []const u8,
     segment_bytes: u64,
-    seq: u64, // current (open) segment sequence, 1-based
-    cur: ?std.fs.File = null, // created lazily on first append
+    seq: u64,
+    cur: ?std.fs.File = null,
     cur_size: u64 = 0,
     mu: std.Thread.Mutex = .{},
 
@@ -56,7 +56,6 @@ pub const Wal = struct {
         const loaded = self.loadedUpTo();
         if (newest) |n| {
             if (n > loaded) {
-                // resume the unfinished segment
                 self.seq = n;
                 var fname_buf: [256]u8 = undefined;
                 const fname = segmentFileName(&fname_buf, name, n);
@@ -247,7 +246,7 @@ pub const Wal = struct {
         while (try it.next()) |e| {
             if (e.kind != .file) continue;
             const s = self.parseSegmentSeq(e.name) orelse continue;
-            if (s > loaded) continue; // never purge unloaded data
+            if (s > loaded) continue;
             const st = self.dir.statFile(e.name) catch continue;
             if (st.mtime < cutoff) try names.append(s);
         }
@@ -300,10 +299,6 @@ fn segSeqOf(name: []const u8, fname: []const u8) ?u64 {
     return std.fmt.parseInt(u64, digits, 10) catch null;
 }
 
-// ---------------------------------------------------------------------------
-// FROM BUFFER — the replay/drain source (§13.1 phase 4)
-// ---------------------------------------------------------------------------
-
 const types = @import("../lang/types.zig");
 const driver = @import("driver.zig");
 const request = @import("request.zig");
@@ -319,7 +314,7 @@ pub const BufferSource = struct {
     gpa: std.mem.Allocator,
     arena_inst: std.heap.ArenaAllocator,
     dir: std.fs.Dir,
-    name: []const u8, // owned by arena
+    name: []const u8,
     schema: *types.Schema,
     segs: []u64,
     idx: usize = 0,
@@ -368,7 +363,7 @@ pub const BufferSource = struct {
         if (declared) |cols| {
             self.schema = try request.schemaFromBodyCols(arena, cols);
         } else {
-            if (self.segs.len == 0) return error.BufferEmpty; // nothing to infer from
+            if (self.segs.len == 0) return error.BufferEmpty;
             const first = try self.readSeg(arena, self.segs[0]);
             const items = try parseLines(arena, first);
             self.schema = try request.inferSchema(arena, items);
@@ -414,7 +409,7 @@ fn bufNext(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?batchmod.Batch {
         self.idx += 1;
         const text = try self.readSeg(arena, s);
         const items = try parseLines(arena, text);
-        if (items.len == 0) continue; // empty segment: skip
+        if (items.len == 0) continue;
         return try request.batchFromJson(arena, self.schema, items);
     }
     return null;
@@ -435,8 +430,6 @@ fn stateFileName(buf: []u8, name: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}.state", .{name}) catch unreachable;
 }
 
-// ---------------------------------------------------------------------------
-
 const testing = std.testing;
 
 test "wal: append, rotate by size, pending list, label" {
@@ -446,13 +439,13 @@ test "wal: append, rotate by size, pending list, label" {
     const base = try tmp.dir.realpathAlloc(gpa, ".");
     defer gpa.free(base);
 
-    var w = try Wal.open(gpa, base, "eventos", 32); // tiny segments to force rotation
+    var w = try Wal.open(gpa, base, "eventos", 32);
     defer w.close();
 
-    try w.append("{\"a\":1}"); // 8 bytes
+    try w.append("{\"a\":1}");
     try w.append("{\"a\":2}");
     try w.sync();
-    try w.append("{\"a\":3,\"pad\":\"xxxxxxxxxx\"}"); // would cross 32 -> rotates first
+    try w.append("{\"a\":3,\"pad\":\"xxxxxxxxxx\"}");
     try w.sync();
 
     try testing.expectEqual(@as(u64, 2), w.currentSeq());
@@ -477,10 +470,10 @@ test "wal: markLoaded is atomic-rename, purge removes loaded segments" {
 
     var w = try Wal.open(gpa, base, "ev", 16);
     defer w.close();
-    try w.append("0123456789"); // fills segment 1
-    try w.append("0123456789"); // rotates to 2
-    try w.append("0123456789"); // rotates to 3
-    try w.rotate(); // close 3 too
+    try w.append("0123456789");
+    try w.append("0123456789");
+    try w.append("0123456789");
+    try w.rotate();
 
     var pending = try w.pendingSegments(gpa);
     try testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, pending);
@@ -492,7 +485,6 @@ test "wal: markLoaded is atomic-rename, purge removes loaded segments" {
     try testing.expectEqualSlices(u64, &.{ 2, 3 }, pending);
     gpa.free(pending);
 
-    // no stray temp file after the rename
     try testing.expectError(error.FileNotFound, w.dir.statFile("ev.state.tmp"));
 
     try w.markLoaded(3);
@@ -513,12 +505,11 @@ test "wal: reopen resumes the unfinished segment; loaded tail starts a new one" 
         defer w.close();
         try w.append("{\"n\":1}");
         try w.sync();
-        // "crash": close without rotating — segment 1 is unfinished
     }
     {
         var w = try Wal.open(gpa, base, "ev", 1 << 20);
         defer w.close();
-        try testing.expectEqual(@as(u64, 1), w.currentSeq()); // resumed, not skipped
+        try testing.expectEqual(@as(u64, 1), w.currentSeq());
         try w.append("{\"n\":2}");
         try w.sync();
         const seg_after = try w.readSegment(gpa, 1, 1 << 20);
@@ -528,8 +519,6 @@ test "wal: reopen resumes the unfinished segment; loaded tail starts a new one" 
         try w.markLoaded(1);
     }
     {
-        // everything loaded -> a fresh open starts the NEXT segment (never
-        // append to a segment whose label was already consumed)
         var w = try Wal.open(gpa, base, "ev", 1 << 20);
         defer w.close();
         try testing.expectEqual(@as(u64, 2), w.currentSeq());
@@ -545,12 +534,11 @@ test "wal: purgeOlderThan removes only LOADED segments past the window" {
 
     var w = try Wal.open(gpa, base, "ev", 4);
     defer w.close();
-    try w.append("11111111"); // seg 1 (over threshold -> next append rotates)
-    try w.append("22222222"); // seg 2
-    try w.rotate(); // close seg 2
+    try w.append("11111111");
+    try w.append("22222222");
+    try w.rotate();
     try w.markLoaded(1);
 
-    // Age both segments two hours into the past.
     const past: i128 = std.time.nanoTimestamp() - 2 * std.time.ns_per_hour;
     for ([_][]const u8{ "ev-000001.jsonl", "ev-000002.jsonl" }) |fname| {
         const f = try w.dir.openFile(fname, .{ .mode = .read_write });
@@ -558,11 +546,9 @@ test "wal: purgeOlderThan removes only LOADED segments past the window" {
         try f.updateTimes(past, past);
     }
 
-    // 1h window: seg 1 (loaded, old) purged; seg 2 (old but UNLOADED) kept.
     try testing.expectEqual(@as(usize, 1), try w.purgeOlderThan(1));
     try testing.expectError(error.FileNotFound, w.dir.statFile("ev-000001.jsonl"));
     _ = try w.dir.statFile("ev-000002.jsonl");
 
-    // 24h window: nothing else in range.
     try testing.expectEqual(@as(usize, 0), try w.purgeOlderThan(24));
 }

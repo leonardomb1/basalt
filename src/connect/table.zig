@@ -15,7 +15,7 @@ pub const TableWriter = struct {
     gpa: std.mem.Allocator,
     names: []const []const u8,
     ncols: usize,
-    cells: std.array_list.Managed([]const u8), // row-major, ncols per row
+    cells: std.array_list.Managed([]const u8),
     nrows: usize = 0,
 
     pub fn open(gpa: std.mem.Allocator, schema: types.Schema) !*TableWriter {
@@ -44,10 +44,7 @@ pub const TableWriter = struct {
     }
 
     pub fn close(self: *TableWriter) !void {
-        // Free the cells even if a stdout write below fails.
         defer self.deinit();
-        // Capture the allocator locally: `deinit()` destroys `self`, so the
-        // deferred free must not touch `self.gpa` afterwards.
         const gpa = self.gpa;
         const widths = try gpa.alloc(usize, self.ncols);
         defer gpa.free(widths);
@@ -107,7 +104,6 @@ pub const TableWriter = struct {
         return self.close();
     }
     fn vtAbort(ptr: *anyopaque) void {
-        // Failure path: free the accumulated cells without rendering the table.
         const self: *TableWriter = @ptrCast(@alignCast(ptr));
         self.deinit();
     }

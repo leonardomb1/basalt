@@ -100,7 +100,7 @@ pub const PipelinedSink = struct {
         defer self.mtx.unlock();
         while (true) {
             while (self.slot == null and !self.stop) self.cv.wait(&self.mtx);
-            const b = self.slot orelse break; // stop && drained
+            const b = self.slot orelse break;
             self.slot = null;
             self.busy = true;
             self.mtx.unlock();
@@ -111,7 +111,7 @@ pub const PipelinedSink = struct {
             self.cv.broadcast();
             r catch |e| {
                 self.err = e;
-                break; // stop consuming; submit/finish will surface it
+                break;
             };
         }
     }
@@ -156,9 +156,6 @@ fn fail(sh: *Shared, e: anyerror) void {
 }
 
 fn lane(sh: *Shared, lane_idx: usize) void {
-    // Each lane gets its own thread-unsafe allocator (no cross-thread mutex) that
-    // pools pages (no per-alloc syscall). Both extremes serialize the per-row parse
-    // path: a shared GPA on its mutex, a raw page allocator on the kernel mmap lock.
     var lane_gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
     defer _ = lane_gpa.deinit();
     const lane_alloc = lane_gpa.allocator();
@@ -166,11 +163,6 @@ fn lane(sh: *Shared, lane_idx: usize) void {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // A per-lane sink is opened on first use and committed when the lane ends —
-    // unless the run failed, in which case its tail buffer is discarded (abort)
-    // rather than flushed: a failed run must not commit more data on the way out.
-    // (Best-effort: a lane that already closed before another lane failed has
-    // committed its tail; prior flushes are always committed regardless.)
     var own_sink: ?driver.Sink = null;
     defer if (own_sink) |s| {
         if (sh.failed.load(.seq_cst)) {
@@ -258,11 +250,6 @@ pub fn run(
     return sh.rows.load(.seq_cst);
 }
 
-// ---------------------------------------------------------------------------
-// Tests (deterministic only: totals, effective lane counts, and error identity
-// — never per-lane ordering or timing)
-// ---------------------------------------------------------------------------
-
 const testing = std.testing;
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
@@ -324,7 +311,7 @@ const CountSink = struct {
     const vtable = driver.Sink.VTable{ .writeBatch = vtWrite, .close = vtClose, .abort = vtAbort };
     fn vtWrite(ptr: *anyopaque, _: std.mem.Allocator, b: batchmod.Batch) anyerror!void {
         const self: *CountSink = @ptrCast(@alignCast(ptr));
-        self.rows += b.len; // shared-mode writes are serialized under run's mutex
+        self.rows += b.len;
     }
     fn vtClose(ptr: *anyopaque) anyerror!void {
         const self: *CountSink = @ptrCast(@alignCast(ptr));
@@ -417,8 +404,6 @@ test "PipelinedSink: a write failure surfaces on a later submit or on finish" {
     try pw.start();
     defer pw.shutdown();
     const b = batchmod.Batch{ .schema = &test_empty_schema, .columns = &test_no_cols, .len = 1 };
-    // The failure lands on the 2nd write; with one batch in flight it must show
-    // up by the time we have submitted a few more or drained.
     var got: ?anyerror = null;
     for (0..4) |_| pw.submit(b) catch |e| {
         got = e;
@@ -428,7 +413,7 @@ test "PipelinedSink: a write failure surfaces on a later submit or on finish" {
         got = e;
     };
     try std.testing.expectEqual(@as(?anyerror, error.SinkWriteFailed), got);
-    try std.testing.expectEqual(@as(usize, 1), ss.lens.items.len); // only the 1st landed
+    try std.testing.expectEqual(@as(usize, 1), ss.lens.items.len);
 }
 
 test "spawnJoin: worker runs exactly once per effective lane (n, 1, 0 threads)" {
@@ -441,7 +426,6 @@ test "spawnJoin: worker runs exactly once per effective lane (n, 1, 0 threads)" 
     inline for (.{ 4, 1, 0 }) |n| {
         var c = Ctx{};
         const lanes = try spawnJoin(testing.allocator, n, Ctx.worker, &c);
-        // effective count: 1..n even when spawning fails (n=0 → inline as lane 0)
         try testing.expect(lanes >= 1 and lanes <= @max(n, 1));
         try testing.expectEqual(lanes, c.calls.load(.seq_cst));
     }
@@ -459,7 +443,7 @@ test "writeLaneBatch: shared routes to the shared sink, per_lane to the lane's o
 
     try writeLaneBatch(.{ .per_lane = .{ .open = testOpenLaneSink, .ctx = &totals } }, &mtx, own.sink(), testing.allocator, b);
     try testing.expectEqual(@as(usize, 3), own.rows);
-    try testing.expectEqual(@as(usize, 3), shared.rows); // untouched by the per-lane write
+    try testing.expectEqual(@as(usize, 3), shared.rows);
 }
 
 test "run: work-steals uneven splits across fewer lanes than splits (shared sink)" {
@@ -471,20 +455,19 @@ test "run: work-steals uneven splits across fewer lanes than splits (shared sink
     try testing.expectEqual(@as(usize, 13), n);
     try testing.expectEqual(@as(usize, 13), snk.rows);
     try testing.expectEqual(@as(u64, 13), rows_read.load(.seq_cst));
-    // a shared sink is caller-owned: run must neither commit nor abort it
     try testing.expect(!snk.closed and !snk.aborted);
 }
 
 test "run: lane count clamps to the split count; zero threads still runs one lane" {
     var dummy: u8 = 0;
-    { // 1 split, 8 threads → single lane, all rows through
+    {
         var snk = CountSink{};
         var rows_read = std.atomic.Value(u64).init(0);
         const preds = [_][]const u8{"2"};
         try testing.expectEqual(@as(usize, 2), try run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .shared = snk.sink() }, 8, &rows_read));
         try testing.expectEqual(@as(usize, 2), snk.rows);
     }
-    { // nthreads=0 clamps up to 1
+    {
         var snk = CountSink{};
         var rows_read = std.atomic.Value(u64).init(0);
         const preds = [_][]const u8{ "3", "2" };
@@ -518,5 +501,5 @@ test "run: per_lane sinks are opened by lanes and committed (closed) on success"
     try testing.expectEqual(@as(usize, 11), totals.committed.load(.seq_cst));
     try testing.expectEqual(@as(usize, 0), totals.aborted.load(.seq_cst));
     const opened = totals.opened.load(.seq_cst);
-    try testing.expect(opened >= 1 and opened <= 2); // ≤ one sink per lane that took work
+    try testing.expect(opened >= 1 and opened <= 2);
 }

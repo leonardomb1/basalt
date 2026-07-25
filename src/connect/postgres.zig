@@ -27,10 +27,9 @@ pub const Conn = struct {
     write_buf: [SOCK_BUF]u8 = undefined,
     sr: std.net.Stream.Reader = undefined,
     sw: std.net.Stream.Writer = undefined,
-    payload: std.array_list.Managed(u8), // current message payload
+    payload: std.array_list.Managed(u8),
     last_error: []const u8 = "",
     tls: ?*sqlmod.TlsState = null,
-    // streaming cursor state (valid between queryCursor and close)
     meta_arena: std.heap.ArenaAllocator = undefined,
     cols: []PgCol = &.{},
     cur_schema: *types.Schema = undefined,
@@ -87,29 +86,26 @@ pub const Conn = struct {
         return if (self.tls) |t| &t.client.writer else &self.sw.interface;
     }
     fn flushOut(self: *Conn) !void {
-        if (self.tls) |t| try t.client.writer.flush(); // seal TLS records...
-        try self.sw.interface.flush(); // ...then push them down the socket
+        if (self.tls) |t| try t.client.writer.flush();
+        try self.sw.interface.flush();
     }
 
     pub fn sqlConn(self: *Conn) sqlmod.Conn {
         return .{ .ptr = self, .vtable = &sql_vtable };
     }
 
-    // --- handshake ---
-
     fn startup(self: *Conn, user: []const u8, database: []const u8) !void {
         var body = std.array_list.Managed(u8).init(self.gpa);
         defer body.deinit();
-        try writeI32(body.writer(), 0x0003_0000); // protocol 3.0
+        try writeI32(body.writer(), 0x0003_0000);
         try appendCStr(&body, "user");
         try appendCStr(&body, user);
         if (database.len > 0) {
             try appendCStr(&body, "database");
             try appendCStr(&body, database);
         }
-        try body.append(0); // params terminator
+        try body.append(0);
 
-        // startup packet has no type byte: just length + body
         var hdr: [4]u8 = undefined;
         std.mem.writeInt(u32, &hdr, @intCast(body.items.len + 4), .big);
         const w = self.wr();
@@ -123,13 +119,13 @@ pub const Conn = struct {
             const t = try self.readMsg();
             const p = self.payload.items;
             switch (t) {
-                'R' => { // Authentication
+                'R' => {
                     const code = try readI32(p, 0);
                     switch (code) {
-                        0 => {}, // AuthenticationOk
-                        3 => try self.sendPassword(password), // cleartext
-                        5 => try self.sendMd5(user, password, p[4..8]), // md5
-                        10 => try self.scram(password), // SASL SCRAM-SHA-256
+                        0 => {},
+                        3 => try self.sendPassword(password),
+                        5 => try self.sendMd5(user, password, p[4..8]),
+                        10 => try self.scram(password),
                         else => return error.PgAuthUnsupported,
                     }
                 },
@@ -137,8 +133,8 @@ pub const Conn = struct {
                     self.last_error = try self.gpa.dupe(u8, errMessage(p));
                     return error.PgAuthFailed;
                 },
-                'Z' => return, // ReadyForQuery
-                'S', 'K', 'N' => {}, // ParameterStatus / BackendKeyData / Notice
+                'Z' => return,
+                'S', 'K', 'N' => {},
                 else => {},
             }
         }
@@ -184,12 +180,11 @@ pub const Conn = struct {
         const enc = std.base64.standard.Encoder;
         const dec = std.base64.standard.Decoder;
 
-        // client-first
         var raw_nonce: [18]u8 = undefined;
         std.crypto.random.bytes(&raw_nonce);
         var nb: [40]u8 = undefined;
         const client_nonce = enc.encode(&nb, &raw_nonce);
-        const cfb = try std.fmt.allocPrint(a, "n=,r={s}", .{client_nonce}); // client-first-bare
+        const cfb = try std.fmt.allocPrint(a, "n=,r={s}", .{client_nonce});
         const client_first = try std.fmt.allocPrint(a, "n,,{s}", .{cfb});
 
         var init_msg = std.array_list.Managed(u8).init(a);
@@ -198,7 +193,6 @@ pub const Conn = struct {
         try init_msg.appendSlice(client_first);
         try self.writeMsg('p', init_msg.items);
 
-        // server-first (R, code 11)
         if ((try self.readMsg()) != 'R' or (try readI32(self.payload.items, 0)) != 11) return error.PgAuthFailed;
         const server_first = try a.dupe(u8, self.payload.items[4..]);
         const sr = scramAttr(server_first, 'r') orelse return error.PgProtocol;
@@ -211,7 +205,7 @@ pub const Conn = struct {
 
         const keys = try scramKeys(password, salt, iters);
 
-        const cfwp = try std.fmt.allocPrint(a, "c=biws,r={s}", .{sr}); // client-final-without-proof
+        const cfwp = try std.fmt.allocPrint(a, "c=biws,r={s}", .{sr});
         const auth_message = try std.fmt.allocPrint(a, "{s},{s},{s}", .{ cfb, server_first, cfwp });
 
         const proof = scramProof(keys, auth_message);
@@ -221,7 +215,6 @@ pub const Conn = struct {
         const client_final = try std.fmt.allocPrint(a, "{s},p={s}", .{ cfwp, proof_enc });
         try self.writeMsg('p', client_final);
 
-        // server-final (R, code 12) or ErrorResponse
         const t = try self.readMsg();
         if (t == 'E') {
             self.last_error = try self.gpa.dupe(u8, errMessage(self.payload.items));
@@ -229,17 +222,12 @@ pub const Conn = struct {
         }
         if (t != 'R' or (try readI32(self.payload.items, 0)) != 12) return error.PgAuthFailed;
 
-        // Verify the server signature (`v=`): proves the server also knows the
-        // password derivation (mutual auth) — without this, anything that can
-        // intercept the connection can pose as the server past this point.
         const sv = scramAttr(self.payload.items[4..], 'v') orelse return error.PgAuthFailed;
         var server_sig: [32]u8 = undefined;
         if ((dec.calcSizeForSlice(sv) catch return error.PgAuthFailed) != 32) return error.PgAuthFailed;
         dec.decode(&server_sig, sv) catch return error.PgAuthFailed;
         if (!std.mem.eql(u8, &server_sig, &scramServerSig(keys, auth_message))) return error.PgAuthFailed;
     }
-
-    // --- streaming query ---
 
     pub fn queryCursor(self: *Conn, sql: []const u8) !sqlmod.Cursor {
         return sqlmod.openTextCursor(self, sql, &cursor_vtable);
@@ -267,7 +255,7 @@ pub const Conn = struct {
                     self.cur_schema = sch;
                     return;
                 },
-                'C' => {}, // CommandComplete (statement with no result set)
+                'C' => {},
                 'E' => {
                     self.last_error = try self.gpa.dupe(u8, errMessage(p));
                     return error.PgQueryFailed;
@@ -297,7 +285,7 @@ pub const Conn = struct {
                     self.last_error = try self.gpa.dupe(u8, errMessage(p));
                     return error.PgQueryFailed;
                 },
-                else => {}, // CommandComplete, notices, …
+                else => {},
             }
         }
     }
@@ -324,19 +312,17 @@ pub const Conn = struct {
         try self.writeMsg('Q', body.items);
     }
 
-    // --- COPY FROM STDIN (bulk load) ---
-
     /// Send `COPY … FROM STDIN` and wait for the server's CopyInResponse ('G').
     pub fn copyIn(self: *Conn, cmd: []const u8) !void {
         try self.sendQuery(cmd);
         while (true) {
             switch (try self.readMsg()) {
-                'G' => return, // ready to receive CopyData
+                'G' => return,
                 'E' => {
                     self.last_error = try self.gpa.dupe(u8, errMessage(self.payload.items));
                     return error.PgQueryFailed;
                 },
-                'Z' => return error.PgProtocol, // ReadyForQuery without 'G'
+                'Z' => return error.PgProtocol,
                 else => {},
             }
         }
@@ -364,8 +350,6 @@ pub const Conn = struct {
             }
         }
     }
-
-    // --- message framing ---
 
     fn writeMsg(self: *Conn, msg_type: u8, body: []const u8) !void {
         var hdr: [5]u8 = undefined;
@@ -431,14 +415,14 @@ fn parseRowDescription(arena: std.mem.Allocator, p: []const u8) !RowDesc {
     const fields = try arena.alloc(types.Schema.Field, n);
     for (0..n) |k| {
         const name = readCStr(p, &i);
-        i += 4; // table OID
-        i += 2; // column attr number
+        i += 4;
+        i += 2;
         const oid = try readI32(p, i);
         i += 4;
-        i += 2; // type size
+        i += 2;
         const typmod = try readI32(p, i);
         i += 4;
-        i += 2; // format code
+        i += 2;
         const ty = pgType(oid, typmod);
         cols[k] = .{ .name = try arena.dupe(u8, name), .oid = oid, .engine_type = ty };
         fields[k] = .{ .name = cols[k].name, .ty = ty };
@@ -472,9 +456,9 @@ fn parseDataRow(conn: *Conn, arena: std.mem.Allocator, p: []const u8, builders: 
 fn pgType(oid: i32, typmod: i32) types.Type {
     return (switch (oid) {
         16 => types.Type.init(.bool),
-        20, 21, 23 => types.Type.init(.int), // int8/int2/int4
-        700, 701 => types.Type.init(.float), // float4/float8
-        1700 => decimalFromTypmod(typmod), // numeric
+        20, 21, 23 => types.Type.init(.int),
+        700, 701 => types.Type.init(.float),
+        1700 => decimalFromTypmod(typmod),
         1082 => types.Type.init(.date),
         1114, 1184 => types.Type.init(.timestamp),
         else => types.Type.init(.string),
@@ -496,8 +480,6 @@ fn scramAttr(s: []const u8, key: u8) ?[]const u8 {
     }
     return null;
 }
-
-// --- SCRAM-SHA-256 key derivation (RFC 5802/7677), pure and vector-tested ---
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
@@ -534,7 +516,6 @@ fn scramServerSig(keys: ScramKeys, auth_message: []const u8) [32]u8 {
 }
 
 test "SCRAM-SHA-256 proof and server signature match the RFC 7677 vector" {
-    // RFC 7677 §3: user "user", password "pencil", i=4096.
     const dec = std.base64.standard.Decoder;
     const enc = std.base64.standard.Encoder;
 
@@ -556,30 +537,26 @@ test "SCRAM-SHA-256 proof and server signature match the RFC 7677 vector" {
 
 test "pgType maps OIDs; numeric typmod carries precision and scale" {
     try std.testing.expectEqual(types.TypeKind.bool, pgType(16, -1).kind);
-    try std.testing.expectEqual(types.TypeKind.int, pgType(20, -1).kind); // int8
-    try std.testing.expectEqual(types.TypeKind.int, pgType(23, -1).kind); // int4
-    try std.testing.expectEqual(types.TypeKind.float, pgType(701, -1).kind); // float8
+    try std.testing.expectEqual(types.TypeKind.int, pgType(20, -1).kind);
+    try std.testing.expectEqual(types.TypeKind.int, pgType(23, -1).kind);
+    try std.testing.expectEqual(types.TypeKind.float, pgType(701, -1).kind);
     try std.testing.expectEqual(types.TypeKind.date, pgType(1082, -1).kind);
-    try std.testing.expectEqual(types.TypeKind.timestamp, pgType(1184, -1).kind); // timestamptz
-    try std.testing.expectEqual(types.TypeKind.string, pgType(25, -1).kind); // text -> string
-    try std.testing.expect(pgType(23, -1).nullable); // wire types are always nullable
+    try std.testing.expectEqual(types.TypeKind.timestamp, pgType(1184, -1).kind);
+    try std.testing.expectEqual(types.TypeKind.string, pgType(25, -1).kind);
+    try std.testing.expect(pgType(23, -1).nullable);
 
-    // NUMERIC(10,2): typmod = (precision << 16 | scale) + 4
     const d = pgType(1700, (10 << 16 | 2) + 4);
     try std.testing.expectEqual(types.TypeKind.decimal, d.kind);
     try std.testing.expectEqual(@as(u8, 10), d.precision);
     try std.testing.expectEqual(@as(u8, 2), d.scale);
-    // unconstrained NUMERIC (typmod -1) falls back to (38,6)
     const u = pgType(1700, -1);
     try std.testing.expectEqual(@as(u8, 38), u.precision);
     try std.testing.expectEqual(@as(u8, 6), u.scale);
 }
 
 test "ErrorResponse extraction picks the M field" {
-    // (type byte, cstr) pairs: severity, code, then message
     const payload = "SFATAL\x00C28P01\x00Mpassword authentication failed\x00\x00";
     try std.testing.expectEqualStrings("password authentication failed", errMessage(payload));
-    // no M field -> stable fallback
     try std.testing.expectEqualStrings("postgres error", errMessage("SERROR\x00\x00"));
 }
 
@@ -589,7 +566,6 @@ test "scramAttr finds comma-separated attributes exactly" {
     try std.testing.expectEqualStrings("c2FsdA==", scramAttr(server_first, 's').?);
     try std.testing.expectEqualStrings("4096", scramAttr(server_first, 'i').?);
     try std.testing.expect(scramAttr(server_first, 'v') == null);
-    // value containing '=' (base64 padding) is returned whole
     try std.testing.expect(scramAttr("x=,r=a", 'x').?.len == 0);
 }
 
@@ -597,19 +573,18 @@ test "parseRowDescription decodes names, OIDs, and column order" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // 2 columns: id (int4, oid 23) and name (text, oid 25); big-endian fields
     var p = std.array_list.Managed(u8).init(a);
-    try p.appendSlice(&.{ 0, 2 }); // column count
+    try p.appendSlice(&.{ 0, 2 });
     try appendCStr(&p, "id");
-    try p.appendSlice(&.{ 0, 0, 0, 0 }); // table oid
-    try p.appendSlice(&.{ 0, 0 }); // attr number
-    try p.appendSlice(&.{ 0, 0, 0, 23 }); // type oid int4
-    try p.appendSlice(&.{ 0, 4 }); // type size
-    try p.appendSlice(&.{ 0xFF, 0xFF, 0xFF, 0xFF }); // typmod -1
-    try p.appendSlice(&.{ 0, 0 }); // format code
+    try p.appendSlice(&.{ 0, 0, 0, 0 });
+    try p.appendSlice(&.{ 0, 0 });
+    try p.appendSlice(&.{ 0, 0, 0, 23 });
+    try p.appendSlice(&.{ 0, 4 });
+    try p.appendSlice(&.{ 0xFF, 0xFF, 0xFF, 0xFF });
+    try p.appendSlice(&.{ 0, 0 });
     try appendCStr(&p, "name");
     try p.appendSlice(&.{ 0, 0, 0, 0, 0, 0 });
-    try p.appendSlice(&.{ 0, 0, 0, 25 }); // text
+    try p.appendSlice(&.{ 0, 0, 0, 25 });
     try p.appendSlice(&.{ 0xFF, 0xFF });
     try p.appendSlice(&.{ 0xFF, 0xFF, 0xFF, 0xFF });
     try p.appendSlice(&.{ 0, 0 });
@@ -645,16 +620,9 @@ fn readCStr(p: []const u8, i: *usize) []const u8 {
     const start = i.*;
     while (i.* < p.len and p[i.*] != 0) : (i.* += 1) {}
     const s = p[start..i.*];
-    i.* += 1; // skip null
+    i.* += 1;
     return s;
 }
-
-// ---------------------------------------------------------------------------
-// COPY-based bulk sink (append/overwrite). 10-100× faster than row INSERTs:
-// data streams to the server in CopyData chunks instead of per-batch statements.
-// Upsert isn't expressible in COPY — callers route upsert to the generic INSERT
-// sink (a COPY-to-staging + ON CONFLICT path is the follow-up).
-// ---------------------------------------------------------------------------
 
 /// CommandComplete tag for COPY: "COPY <n>". Null on any other tag shape.
 fn parseCopyCount(p: []const u8) ?u64 {
@@ -673,16 +641,14 @@ test "parseCopyCount: COPY tag, other tags, junk" {
 pub const CopySink = struct {
     gpa: std.mem.Allocator,
     conn: *Conn,
-    table: []const u8, // quoted, qualified
+    table: []const u8,
     ncols: usize,
-    buffer: std.array_list.Managed(u8), // current segment's encoded rows (replay unit)
-    copy_cmd: []const u8, // gpa-owned; issued once per segment
+    buffer: std.array_list.Managed(u8),
+    copy_cmd: []const u8,
     seg_rows: u64 = 0,
     redial: ?sqlmod.Redial = null,
 
     pub fn open(gpa: std.mem.Allocator, conn: *Conn, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?sqlmod.Redial) !*CopySink {
-        // On error we free only what we allocate here; the caller keeps `conn`
-        // (so it can read conn.last_error) and closes it on failure.
         const self = try gpa.create(CopySink);
         errdefer gpa.destroy(self);
         const qtable = try sqlmod.quoteIdent(gpa, .postgres, table_name);
@@ -696,7 +662,6 @@ pub const CopySink = struct {
         try conn.exec(try sqlmod.createTableSql(a, .postgres, qtable, schema, mode));
         if (mode == .overwrite) try conn.exec(try std.fmt.allocPrint(a, "DELETE FROM {s}", .{qtable}));
 
-        // COPY <table> ("c1","c2",…) FROM STDIN — issued once per segment.
         var cols = std.array_list.Managed(u8).init(a);
         for (schema.fields, 0..) |f, i| {
             if (i > 0) try cols.append(',');
@@ -711,7 +676,7 @@ pub const CopySink = struct {
     }
 
     fn writeBatch(self: *CopySink, arena: std.mem.Allocator, batch: Batch) !void {
-        try sqlmod.appendBulkText(self.buffer.writer(), arena, batch, .{}); // PG: bool t/f
+        try sqlmod.appendBulkText(self.buffer.writer(), arena, batch, .{});
         self.seg_rows += batch.len;
         if (self.buffer.items.len >= sqlmod.SEGMENT_BYTES) try self.commitSegment();
     }
@@ -729,8 +694,6 @@ pub const CopySink = struct {
             if (!driver.transientNet(e)) return e;
             const fresh = try rd.dial(rd.ctx, self.gpa);
             self.conn.close();
-            // The redial ctx is built for this driver kind, so the vtable ptr is
-            // always a *postgres.Conn.
             self.conn = @ptrCast(@alignCast(fresh.ptr));
             try self.sendSegment();
         };
@@ -750,8 +713,6 @@ pub const CopySink = struct {
     }
 
     fn closeImpl(self: *CopySink) !void {
-        // Release everything even if the final segment fails — otherwise a
-        // failed COPY on close leaks the connection, buffer and sink.
         defer self.teardown();
         try self.commitSegment();
     }
@@ -787,7 +748,6 @@ fn copyAbort(ptr: *anyopaque) void {
 }
 
 fn errMessage(p: []const u8) []const u8 {
-    // ErrorResponse: series of (field-type byte, value cstr), 'M' is the message
     var i: usize = 0;
     while (i < p.len and p[i] != 0) {
         const ft = p[i];

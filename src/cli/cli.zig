@@ -96,8 +96,6 @@ fn loadSource(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8, stderr
         try stderr.print("error: `{s}` requires a <script> path, `-` for stdin, or `-c <script>`\n", .{verb});
         return null;
     }
-    // `-` reads the script from stdin, so any delivery mechanism can pipe it
-    // without a temp file (`cat x.sql | basalt run -`, a control-plane fetch, etc.).
     if (std.mem.eql(u8, args[2], "-")) {
         const text = std.fs.File.stdin().readToEndAlloc(arena, 8 << 20) catch |e| {
             try stderr.print("error: cannot read script from stdin: {s}\n", .{@errorName(e)});
@@ -153,16 +151,13 @@ fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--command")) {
-            i += 1; // skip inline script value
+            i += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--show-plan")) show_plan = true;
         if (std.mem.eql(u8, arg, "--connect")) connect = true;
     }
 
-    // Offline: structure + reference + param validation, plus type-flow where the
-    // schema is local (CSV). `--connect` also reaches DB sources to resolve their
-    // schemas and type-check the full pipeline.
     var galloc = alloc;
     const resolver: ?analyze.Resolver = if (connect) runtime.connectingResolver(&galloc) else null;
     var adiag = analyze.Diag{};
@@ -194,14 +189,9 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     const src = (try loadSource(arena.allocator(), "run", args, stderr)) orelse return 1;
     const prog = (try parseSrc(arena.allocator(), src, stderr)) orelse return 1;
 
-    // collect `-p key=value` params and `--port N`
     var params = std.array_list.Managed(runtime.ParamArg).init(alloc);
     defer params.deinit();
     var port: u16 = 8080;
-    // Default to the core count, but threads are only *used* when the source is
-    // splittable (a SQL table with a discoverable key, or a query with @[split]);
-    // non-splittable sources (CSV, request) run serial regardless, so this never
-    // regresses the local single-stream case.
     var threads: usize = std.Thread.getCpuCount() catch 1;
     var log = runtime.LogConfig{};
     var json_summary = false;
@@ -209,7 +199,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "-c") or std.mem.eql(u8, a, "--command")) {
-            i += 1; // skip inline script value
+            i += 1;
             continue;
         }
         if (threadFlagValue(a, args, &i)) |tv| {
@@ -250,7 +240,6 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         }
     }
 
-    // @http scripts become a server; @batch runs once.
     if (prog.stmts.len > 0 and prog.stmts[0] == .kind and prog.stmts[0].kind.kind == .http) {
         server.serve(alloc, prog, port) catch |e| {
             try stderr.print("{s}: serve error: {s}\n", .{ src.label, @errorName(e) });
@@ -259,8 +248,6 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         return 0;
     }
 
-    // The summary is the run's result: --json emits it to stdout, otherwise it's
-    // rendered on stderr (text on a TTY, NDJSON when piped). run() owns rendering.
     log.summary = if (json_summary) .json_stdout else .stderr;
 
     var diag: runtime.Diag = .{};
@@ -268,22 +255,18 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     defer sink.deinit();
     _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log }, &diag) catch |e| switch (e) {
         error.Aborted => {
-            // Cancelled by the control plane (SIGTERM/SIGINT). 130 = 128 + SIGINT.
             try stderr.print("{s}: aborted\n", .{src.label});
             return 130;
         },
         error.PlanFailed => {
             const tag = if (diag.retryable) " (transient)" else "";
             try stderr.print("{s}: error{s}: {s}\n", .{ src.label, tag, diag.msg });
-            // Exit 75 (EX_TEMPFAIL) on a transient failure so the control plane can
-            // retry; 1 on a permanent failure where a retry would fail identically.
             return if (diag.retryable) 75 else 1;
         },
         error.OutOfMemory => return e,
         else => {
             const transient = diag.retryable or runtime.isTransient(e);
             const tag = if (transient) " (transient)" else "";
-            // run() fills diag.msg with stage/column context for expression errors.
             if (diag.msg.len > 0)
                 try stderr.print("{s}: error{s}: {s}\n", .{ src.label, tag, diag.msg })
             else
@@ -291,9 +274,6 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             return if (transient) 75 else 1;
         },
     };
-    // Continue-mode fan-out (e.g. `for ... @[on_error = continue]`) succeeds as a
-    // run even with per-item failures. Report them and exit non-zero so the control
-    // plane notices: 75 if every failure was transient (retry the batch), else 1.
     const nfail = sink.failures();
     if (nfail > 0) {
         var all_retryable = true;
@@ -369,7 +349,7 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
 
     while (true) {
         if (tty) {
-            try msg.writeAll("\xc2\xbb "); // "» "
+            try msg.writeAll("\xc2\xbb ");
             try msg.flush();
         }
         block.clearRetainingCapacity();
@@ -516,8 +496,6 @@ fn threadFlagValue(a: []const u8, args: [][:0]u8, i: *usize) ?[]const u8 {
     return null;
 }
 
-// --- tests (pure argument/REPL-input parsing) --------------------------------
-
 /// Build a mutable argv ([][:0]u8) from string literals for flag-parsing tests.
 fn testArgv(arena: std.mem.Allocator, strs: []const []const u8) ![][:0]u8 {
     const out = try arena.alloc([:0]u8, strs.len);
@@ -530,7 +508,6 @@ test "threadFlagValue recognizes all four -j/--threads spellings" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // separate value: `-j 4` and `--threads 4` advance the cursor past the value
     var args = try testArgv(a, &.{ "-j", "4" });
     var i: usize = 0;
     try std.testing.expectEqualStrings("4", threadFlagValue(args[0], args, &i).?);
@@ -540,7 +517,6 @@ test "threadFlagValue recognizes all four -j/--threads spellings" {
     try std.testing.expectEqualStrings("8", threadFlagValue(args[0], args, &i).?);
     try std.testing.expectEqual(@as(usize, 1), i);
 
-    // attached value: `-j16` and `--threads=2` leave the cursor alone
     args = try testArgv(a, &.{"-j16"});
     i = 0;
     try std.testing.expectEqualStrings("16", threadFlagValue(args[0], args, &i).?);
@@ -549,12 +525,10 @@ test "threadFlagValue recognizes all four -j/--threads spellings" {
     i = 0;
     try std.testing.expectEqualStrings("2", threadFlagValue(args[0], args, &i).?);
 
-    // trailing `-j` with no value yields "" (caller rejects it as invalid)
     args = try testArgv(a, &.{"-j"});
     i = 0;
     try std.testing.expectEqualStrings("", threadFlagValue(args[0], args, &i).?);
 
-    // non-thread flags don't match (incl. -p, which also starts with '-')
     args = try testArgv(a, &.{ "-p", "k=v" });
     i = 0;
     try std.testing.expect(threadFlagValue(args[0], args, &i) == null);
@@ -593,7 +567,6 @@ test "appendDisplaySinks adds `write stdout` only to sink-less pipelines" {
     }
     try std.testing.expect(found);
 
-    // a pipeline that already writes is left untouched
     const sunk = try parser.parseSource(a,
         \\LOAD INTO 'out.csv' AS SELECT * FROM 'in.csv';
     , &diag);
@@ -602,7 +575,7 @@ test "appendDisplaySinks adds `write stdout` only to sink-less pipelines" {
         if (st != .output) continue;
         const stages = st.output.stages;
         try std.testing.expectEqualStrings("csv", stages[stages.len - 1].node.write.connector);
-        try std.testing.expectEqual(orig.output.stages.len, stages.len); // no stage appended
+        try std.testing.expectEqual(orig.output.stages.len, stages.len);
     }
 }
 

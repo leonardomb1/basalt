@@ -64,10 +64,6 @@ pub fn wrapProjected(arena: std.mem.Allocator, base: []const u8, proj: ?[]const 
     return std.fmt.allocPrint(arena, "SELECT {s} FROM ({s}) _split WHERE {s}", .{ sel, base, pred });
 }
 
-// ---------------------------------------------------------------------------
-// Key discovery (table reads only — arbitrary queries name the key via @[split])
-// ---------------------------------------------------------------------------
-
 /// Discover a single-column int/uuid primary key for `table`, or null (no PK, a
 /// composite PK, or an unsupported key type → caller stays serial). Each dialect's
 /// catalog query returns the same shape: (pk_column_name, type_name, est_rows) —
@@ -105,7 +101,7 @@ pub fn introspectPkCols(arena: std.mem.Allocator, prober: Prober, dialect: Diale
         conn.close();
         return &.{};
     };
-    defer cur.close(); // closes the connection
+    defer cur.close();
     var cols = std.array_list.Managed([]const u8).init(arena);
     while (try cur.nextBatch(arena)) |b| {
         var r: usize = 0;
@@ -118,8 +114,6 @@ pub fn introspectPkCols(arena: std.mem.Allocator, prober: Prober, dialect: Diale
 }
 
 pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, table: []const u8) !?KeyInfo {
-    // One probe returns the single-column PK (name + type) and the engine's row
-    // estimate, so the size gate costs no extra round-trip.
     const sql = switch (dialect) {
         .postgres => try std.fmt.allocPrint(arena,
             \\SELECT a.attname, t.typname, c.reltuples::bigint
@@ -153,9 +147,9 @@ pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect,
         conn.close();
         return null;
     };
-    defer cur.close(); // closes the connection
+    defer cur.close();
     const b = (try cur.nextBatch(arena)) orelse return null;
-    if (b.len != 1) return null; // no PK, or composite PK (>1 key column)
+    if (b.len != 1) return null;
     const name = b.columns[0].getValue(0);
     const typ = b.columns[1].getValue(0);
     if (name.isNull() or typ.isNull()) return null;
@@ -167,25 +161,19 @@ pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect,
 
 fn keyKindFor(typname: []const u8) ?KeyKind {
     const ints = [_][]const u8{
-        "int2",   "int4",      "int8",   "serial", "bigserial", "smallserial", // postgres
-        "int",    "bigint",    "smallint", "tinyint", "mediumint", // sql server / mysql
+        "int2",   "int4",      "int8",   "serial", "bigserial", "smallserial",
+        "int",    "bigint",    "smallint", "tinyint", "mediumint",
     };
     for (ints) |t| if (std.mem.eql(u8, typname, t)) return .int;
     const dates = [_][]const u8{
-        "date",     "timestamp", "timestamptz", // postgres
-        "datetime", // mysql / sql server (mysql `timestamp` matches above)
-        "datetime2", "smalldatetime", // sql server
+        "date",     "timestamp", "timestamptz",
+        "datetime",
+        "datetime2", "smalldatetime",
     };
     for (dates) |t| if (std.mem.eql(u8, typname, t)) return .date;
-    // uuid: postgres `uuid`, sql server `uniqueidentifier` (only postgres splits it —
-    // plan() bails on uuid for other dialects since their sort order isn't lexical).
     if (std.mem.eql(u8, typname, "uuid") or std.mem.eql(u8, typname, "uniqueidentifier")) return .uuid;
     return null;
 }
-
-// ---------------------------------------------------------------------------
-// Plan construction
-// ---------------------------------------------------------------------------
 
 /// Build up to `m` split predicates for `key` over `base` (the unsplit query).
 /// Returns null when the source isn't worth/possible to split (empty, or the key
@@ -200,8 +188,8 @@ pub fn plan(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []
             return Plan{ .key = key, .predicates = preds };
         },
         .uuid => {
-            if (dialect != .postgres) return null; // others order uuids non-lexically
-            if (!(try hasAnyRow(arena, prober, base))) return null; // empty table: don't fan out lanes
+            if (dialect != .postgres) return null;
+            if (!(try hasAnyRow(arena, prober, base))) return null;
             const preds = try uuidSpacePreds(arena, dialect, key.col, m);
             return Plan{ .key = key, .predicates = preds };
         },
@@ -239,13 +227,13 @@ fn intBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: [
         conn.close();
         return null;
     };
-    defer cur.close(); // closes the connection
+    defer cur.close();
     const b = (try cur.nextBatch(arena)) orelse return null;
     if (b.len == 0) return null;
     const lo = b.columns[0].getValue(0);
     const hi = b.columns[1].getValue(0);
-    if (lo.isNull() or hi.isNull() or lo != .int or hi != .int) return null; // empty table or non-int key
-    if (hi.int <= lo.int) return null; // single value: nothing to split
+    if (lo.isNull() or hi.isNull() or lo != .int or hi != .int) return null;
+    if (hi.int <= lo.int) return null;
     return Bounds{ .min = lo.int, .max = hi.int };
 }
 
@@ -255,12 +243,12 @@ fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, mi
     const qcol = quoteIdent(arena, dialect, col) catch col;
     const span: i128 = @as(i128, max) - @as(i128, min) + 1;
     var m: usize = m_in;
-    if (@as(i128, @intCast(m)) > span) m = @intCast(span); // don't make empty slices
+    if (@as(i128, @intCast(m)) > span) m = @intCast(span);
     if (m <= 1) {
         const one = try std.fmt.allocPrint(arena, "{s} >= {d}", .{ qcol, min });
         return try dupeOne(arena, one);
     }
-    const width: i128 = @divTrunc(span + @as(i128, @intCast(m)) - 1, @as(i128, @intCast(m))); // ceil
+    const width: i128 = @divTrunc(span + @as(i128, @intCast(m)) - 1, @as(i128, @intCast(m)));
     var list = std.array_list.Managed([]const u8).init(arena);
     var k: usize = 0;
     while (k < m) : (k += 1) {
@@ -285,12 +273,12 @@ fn dateBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: 
         conn.close();
         return null;
     };
-    defer cur.close(); // closes the connection
+    defer cur.close();
     const b = (try cur.nextBatch(arena)) orelse return null;
     if (b.len == 0) return null;
     const lo = dayOf(b.columns[0].getValue(0)) orelse return null;
     const hi = dayOf(b.columns[1].getValue(0)) orelse return null;
-    if (hi <= lo) return null; // empty table or single-day key: nothing to split
+    if (hi <= lo) return null;
     return Bounds{ .min = lo, .max = hi };
 }
 
@@ -311,12 +299,12 @@ fn dateRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m
     const qcol = quoteIdent(arena, dialect, col) catch col;
     const span: i128 = @as(i128, max_day) - @as(i128, min_day) + 1;
     var m: usize = m_in;
-    if (@as(i128, @intCast(m)) > span) m = @intCast(span); // at least one day per slice
+    if (@as(i128, @intCast(m)) > span) m = @intCast(span);
     if (m <= 1) {
         const one = try std.fmt.allocPrint(arena, "{s} >= '{s}'", .{ qcol, try eval.formatDate(arena, min_day) });
         return try dupeOne(arena, one);
     }
-    const width: i128 = @divTrunc(span + @as(i128, @intCast(m)) - 1, @as(i128, @intCast(m))); // ceil
+    const width: i128 = @divTrunc(span + @as(i128, @intCast(m)) - 1, @as(i128, @intCast(m)));
     var list = std.array_list.Managed([]const u8).init(arena);
     var k: usize = 0;
     while (k < m) : (k += 1) {
@@ -379,16 +367,11 @@ fn dupeOne(arena: std.mem.Allocator, s: []const u8) ![]const []const u8 {
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// Tests (pure: predicate math — coverage & disjointness)
-// ---------------------------------------------------------------------------
-
 test "int range splits are covering and disjoint" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
 
-    // [1, 1000] into 7 slices: every id in range hits exactly one predicate.
     const preds = try intRangePreds(a, .postgres, "id", 1, 1000, 7);
     try std.testing.expect(preds.len == 7);
     var id: i64 = 1;
@@ -399,7 +382,6 @@ test "int range splits are covering and disjoint" {
         };
         try std.testing.expectEqual(@as(usize, 1), hits);
     }
-    // A row inserted past max is still captured by the open-ended last slice.
     var hits_over: usize = 0;
     for (preds) |p| if (intPredHolds(p, 5000)) {
         hits_over += 1;
@@ -421,7 +403,6 @@ test "uuid space splits are ordered and cover the endpoints" {
     const a = ar.allocator();
     const preds = try uuidSpacePreds(a, .postgres, "id", 4);
     try std.testing.expect(preds.len == 4);
-    // First slice is open-below, last is open-above; boundaries are monotonic.
     try std.testing.expect(std.mem.indexOf(u8, preds[0], ">=") == null);
     try std.testing.expect(std.mem.startsWith(u8, preds[3], "\"id\" >= "));
     const b1 = try uuidAt(a, 1, 4);
@@ -434,12 +415,10 @@ test "date range splits are covering, disjoint, and day-aligned" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    // 2024-01-01 (19723) .. 2024-12-31 (20088) into 4 slices.
     const preds = try dateRangePreds(a, .mysql, "updated_at", 19723, 20088, 4);
     try std.testing.expectEqual(@as(usize, 4), preds.len);
     try std.testing.expectEqualStrings("`updated_at` >= '2024-01-01' AND `updated_at` < '2024-04-02'", preds[0]);
-    try std.testing.expect(std.mem.endsWith(u8, preds[3], ">= '2024-10-03'")); // 2024-01-01 + 3*ceil(366/4) days
-    // Boundaries chain: each slice's upper bound is the next slice's lower bound.
+    try std.testing.expect(std.mem.endsWith(u8, preds[3], ">= '2024-10-03'"));
     var k: usize = 0;
     while (k + 1 < preds.len) : (k += 1) {
         const hi_pos = std.mem.lastIndexOf(u8, preds[k], "< '").?;
@@ -469,7 +448,6 @@ test "int range splits handle negative bounds" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    // [-100, 50] into 4 slices: still covering and disjoint across zero.
     const preds = try intRangePreds(a, .mysql, "id", -100, 50, 4);
     try std.testing.expectEqual(@as(usize, 4), preds.len);
     var id: i64 = -100;
@@ -480,7 +458,6 @@ test "int range splits handle negative bounds" {
         };
         try std.testing.expectEqual(@as(usize, 1), hits);
     }
-    // below min is captured by no slice (first slice has a lower bound)
     for (preds) |p| try std.testing.expect(!intPredHolds(p, -101));
 }
 
@@ -488,7 +465,6 @@ test "uuid boundary values are exact space fractions" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // k/m of 2^128, canonical text: 1/2 -> 0x80…, 1/4 -> 0x40…
     try std.testing.expectEqualStrings("80000000-0000-0000-0000-000000000000", try uuidAt(a, 1, 2));
     try std.testing.expectEqualStrings("40000000-0000-0000-0000-000000000000", try uuidAt(a, 1, 4));
     try std.testing.expectEqualStrings("00000000-0000-0000-0000-000000000000", try uuidAt(a, 0, 3));
@@ -498,8 +474,6 @@ test "plan-level guards: m<=1 and non-postgres uuid never split" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // Prober that fails to open: reached only for kinds that probe. m<=1 and
-    // the mysql-uuid case must both bail out BEFORE any connection attempt.
     const failing = Prober{ .ctx = undefined, .openFn = failOpen };
     try std.testing.expectEqual(@as(?Plan, null), try plan(a, failing, .postgres, "SELECT * FROM t", .{ .col = "id", .kind = .int }, 1));
     try std.testing.expectEqual(@as(?Plan, null), try plan(a, failing, .mysql, "SELECT * FROM t", .{ .col = "id", .kind = .uuid }, 4));

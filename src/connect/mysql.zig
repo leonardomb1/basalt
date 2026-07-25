@@ -20,7 +20,7 @@ const Batch = batchmod.Batch;
 
 const CLIENT_LONG_PASSWORD = 0x00000001;
 const CLIENT_CONNECT_WITH_DB = 0x00000008;
-const CLIENT_LOCAL_FILES = 0x00000080; // enables LOAD DATA LOCAL INFILE
+const CLIENT_LOCAL_FILES = 0x00000080;
 const CLIENT_PROTOCOL_41 = 0x00000200;
 const CLIENT_SSL = 0x00000800;
 const CLIENT_SECURE_CONNECTION = 0x00008000;
@@ -43,12 +43,11 @@ pub const Conn = struct {
     buf: std.array_list.Managed(u8),
     last_error: []const u8 = "",
     tls: ?*sqlmod.TlsState = null,
-    // streaming cursor state (valid between queryCursor and close)
     meta_arena: std.heap.ArenaAllocator = undefined,
     cols: []MyCol = &.{},
     cur_schema: *types.Schema = undefined,
     done: bool = false,
-    ld_seq: u8 = 0, // packet sequence during a LOAD DATA exchange
+    ld_seq: u8 = 0,
 
     pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sqlmod.TlsMode) !*Conn {
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
@@ -59,13 +58,9 @@ pub const Conn = struct {
         self.sw = std.net.Stream.Writer.init(stream, &self.write_buf);
         errdefer self.close();
 
-        // 1. server handshake (always plaintext)
         const seq = try self.readPacket();
         const hs = try self.parseHandshake(self.buf.items);
 
-        // 2. TLS upgrade: a short SSLRequest packet (the response's fixed prefix
-        // with CLIENT_SSL set), then the handshake; the rest of the exchange —
-        // including credentials — runs inside the session.
         var rseq = seq + 1;
         if (tls_mode != .off) {
             try self.writeSslRequest(rseq, database);
@@ -76,22 +71,19 @@ pub const Conn = struct {
             rseq += 1;
         }
 
-        // 3. handshake response, with the token for the plugin the server chose
         try self.writeHandshakeResponse(rseq, user, password, database, hs.salt, hs.plugin);
 
-        // 4. auth result loop: OK / ERR / auth-switch / caching_sha2 more-data
         while (true) {
             rseq = try self.readPacket();
             const p = self.buf.items;
             if (p.len == 0) return error.MysqlProtocol;
             switch (p[0]) {
-                0x00 => break, // OK
+                0x00 => break,
                 0xff => {
                     self.last_error = try self.gpa.dupe(u8, errMessage(p));
                     return error.MysqlAuthFailed;
                 },
                 0xfe => {
-                    // auth switch request: payload = 0xfe + plugin(null) + salt
                     const sw = parseAuthSwitch(p);
                     if (password.len == 0) {
                         try self.writePacket(rseq +% 1, "");
@@ -108,11 +100,6 @@ pub const Conn = struct {
                     }
                 },
                 0x01 => {
-                    // caching_sha2_password "more data": 3 = fast-auth ok (an OK
-                    // packet follows), 4 = full auth — the cached entry is cold,
-                    // so the server wants the cleartext password. Only safe (and
-                    // only implemented) inside TLS; the plaintext alternative is
-                    // an RSA exchange we don't speak.
                     if (p.len >= 2 and p[1] == 3) continue;
                     if (p.len >= 2 and p[1] == 4) {
                         if (self.tls == null) {
@@ -138,9 +125,9 @@ pub const Conn = struct {
     pub fn exec(self: *Conn, sql: []const u8) !void {
         const payload = try self.gpa.alloc(u8, sql.len + 1);
         defer self.gpa.free(payload);
-        payload[0] = 0x03; // COM_QUERY
+        payload[0] = 0x03;
         @memcpy(payload[1..], sql);
-        try self.writePacket(0, payload); // COM_QUERY resets sequence to 0
+        try self.writePacket(0, payload);
 
         _ = try self.readPacket();
         const p = self.buf.items;
@@ -148,10 +135,7 @@ pub const Conn = struct {
             self.last_error = try self.gpa.dupe(u8, errMessage(p));
             return error.MysqlQueryFailed;
         }
-        // 0x00 (OK) or a result-set header — DDL yields OK; accept anything non-ERR.
     }
-
-    // --- LOAD DATA LOCAL INFILE (bulk load) ---
 
     /// Send the `LOAD DATA LOCAL INFILE …` query and wait for the server's local
     /// infile request (a packet whose first byte is 0xFB). Data then streams via
@@ -159,7 +143,7 @@ pub const Conn = struct {
     pub fn loadDataStart(self: *Conn, cmd: []const u8) !void {
         const payload = try self.gpa.alloc(u8, cmd.len + 1);
         defer self.gpa.free(payload);
-        payload[0] = 0x03; // COM_QUERY
+        payload[0] = 0x03;
         @memcpy(payload[1..], cmd);
         try self.writePacket(0, payload);
 
@@ -169,7 +153,7 @@ pub const Conn = struct {
             self.last_error = try self.gpa.dupe(u8, errMessage(p));
             return error.MysqlQueryFailed;
         }
-        if (p.len == 0 or p[0] != 0xfb) return error.MysqlProtocol; // expected local-infile request
+        if (p.len == 0 or p[0] != 0xfb) return error.MysqlProtocol;
         self.ld_seq = rseq +% 1;
     }
 
@@ -210,8 +194,8 @@ pub const Conn = struct {
         return if (self.tls) |t| &t.client.writer else &self.sw.interface;
     }
     fn flushOut(self: *Conn) !void {
-        if (self.tls) |t| try t.client.writer.flush(); // seal TLS records...
-        try self.sw.interface.flush(); // ...then push them down the socket
+        if (self.tls) |t| try t.client.writer.flush();
+        try self.sw.interface.flush();
     }
 
     pub fn sqlConn(self: *Conn) sqlmod.Conn {
@@ -227,7 +211,7 @@ pub const Conn = struct {
         const ma = self.meta_arena.allocator();
         const payload = try self.gpa.alloc(u8, sql.len + 1);
         defer self.gpa.free(payload);
-        payload[0] = 0x03; // COM_QUERY
+        payload[0] = 0x03;
         @memcpy(payload[1..], sql);
         try self.writePacket(0, payload);
 
@@ -254,7 +238,7 @@ pub const Conn = struct {
             _ = try self.readPacket();
             self.cols[k] = try parseColDef(ma, self.buf.items);
         }
-        _ = try self.readPacket(); // EOF after column defs
+        _ = try self.readPacket();
 
         const fields = try ma.alloc(types.Schema.Field, ncol);
         for (self.cols, 0..) |c, k| fields[k] = .{ .name = c.name, .ty = c.engine_type };
@@ -269,9 +253,7 @@ pub const Conn = struct {
     pub fn nextRow(self: *Conn, arena: std.mem.Allocator, builders: []column.Builder) !sqlmod.RowStep {
         _ = try self.readPacket();
         const r = self.buf.items;
-        if (r.len > 0 and r[0] == 0xfe and r.len < 9) return .end; // EOF
-        // A mid-stream ERR packet (e.g. a server-side timeout while streaming)
-        // must not be parsed as row data.
+        if (r.len > 0 and r[0] == 0xfe and r.len < 9) return .end;
         if (r.len > 0 and r[0] == 0xff) {
             self.last_error = try self.gpa.dupe(u8, errMessage(r));
             return error.MysqlQueryFailed;
@@ -282,8 +264,6 @@ pub const Conn = struct {
             const v: Value = if (text == null)
                 .null
             else if (c.mtype == 0x10)
-                // BIT columns arrive as raw big-endian bytes even in the text
-                // protocol ("\x05", not "5") — fold them instead of parsing.
                 .{ .int = decodeBits(text.?) }
             else
                 sqlmod.coerceText(arena, text, c.engine_type) catch |e| {
@@ -295,8 +275,6 @@ pub const Conn = struct {
         }
         return .row;
     }
-
-    // --- packet framing ---
 
     fn readPacket(self: *Conn) !u8 {
         const r = self.rd();
@@ -326,24 +304,23 @@ pub const Conn = struct {
         _ = self;
         if (p.len < 1 or p[0] != 10) return error.MysqlProtocol;
         var i: usize = 1;
-        while (i < p.len and p[i] != 0) : (i += 1) {} // server version
+        while (i < p.len and p[i] != 0) : (i += 1) {}
         i += 1;
-        i += 4; // thread id
+        i += 4;
         if (i + 8 > p.len) return error.MysqlProtocol;
         var salt: [20]u8 = undefined;
-        @memcpy(salt[0..8], p[i .. i + 8]); // auth-plugin-data part 1
+        @memcpy(salt[0..8], p[i .. i + 8]);
         i += 8;
-        i += 1; // filler
-        i += 2; // capability lower
-        i += 1; // charset
-        i += 2; // status
-        i += 2; // capability upper
-        i += 1; // auth-plugin-data length
-        i += 10; // reserved
+        i += 1;
+        i += 2;
+        i += 1;
+        i += 2;
+        i += 2;
+        i += 1;
+        i += 10;
         if (i + 12 > p.len) return error.MysqlProtocol;
-        @memcpy(salt[8..20], p[i .. i + 12]); // auth-plugin-data part 2 (first 12)
-        i += 13; // part 2 incl. its null terminator
-        // trailing null-terminated auth plugin name; default to native if absent
+        @memcpy(salt[8..20], p[i .. i + 12]);
+        i += 13;
         var plugin: AuthPlugin = .native;
         if (i < p.len) {
             const end = std.mem.indexOfScalarPos(u8, p, i, 0) orelse p.len;
@@ -367,9 +344,9 @@ pub const Conn = struct {
         defer out.deinit();
         const w = out.writer();
         try w.writeInt(u32, self.capsFor(database) | CLIENT_SSL, .little);
-        try w.writeInt(u32, 0x01000000, .little); // max packet 16M
-        try w.writeByte(33); // utf8_general_ci
-        try w.writeByteNTimes(0, 23); // reserved
+        try w.writeInt(u32, 0x01000000, .little);
+        try w.writeByte(33);
+        try w.writeByteNTimes(0, 23);
         try self.writePacket(seq, out.items);
     }
 
@@ -393,14 +370,14 @@ pub const Conn = struct {
         const w = out.writer();
 
         try w.writeInt(u32, caps, .little);
-        try w.writeInt(u32, 0x01000000, .little); // max packet 16M
-        try w.writeByte(33); // utf8_general_ci
-        try w.writeByteNTimes(0, 23); // reserved
+        try w.writeInt(u32, 0x01000000, .little);
+        try w.writeByte(33);
+        try w.writeByteNTimes(0, 23);
         try w.writeAll(user);
         try w.writeByte(0);
 
         if (password.len == 0) {
-            try w.writeByte(0); // empty auth response
+            try w.writeByte(0);
         } else switch (plugin) {
             .native => {
                 const token = sr.mysqlAuthToken(password, &salt);
@@ -413,8 +390,6 @@ pub const Conn = struct {
                 try w.writeAll(&token);
             },
             .clear => {
-                // cleartext password + null terminator (length-prefixed here for the
-                // initial response; bare in the auth-switch reply, see writeClearPassword)
                 try w.writeByte(@intCast(password.len + 1));
                 try w.writeAll(password);
                 try w.writeByte(0);
@@ -435,7 +410,7 @@ pub const Conn = struct {
 pub const AuthPlugin = enum {
     native,
     caching_sha2,
-    clear, // mysql_clear_password: send the password as cleartext (StarRocks LDAP / external auth)
+    clear,
 
     fn name(self: AuthPlugin) []const u8 {
         return switch (self) {
@@ -458,15 +433,15 @@ fn pluginByName(s: []const u8) ?AuthPlugin {
 /// (note: digest-then-nonce — the opposite order of mysql_native_password).
 pub fn cachingSha2Token(password: []const u8, salt: []const u8) [32]u8 {
     const Sha256 = std.crypto.hash.sha2.Sha256;
-    var h1: [32]u8 = undefined; // SHA256(pw)
+    var h1: [32]u8 = undefined;
     Sha256.hash(password, &h1, .{});
-    var h2: [32]u8 = undefined; // SHA256(SHA256(pw))
+    var h2: [32]u8 = undefined;
     Sha256.hash(&h1, &h2, .{});
 
     var ctx = Sha256.init(.{});
     ctx.update(&h2);
     ctx.update(salt);
-    var h3: [32]u8 = undefined; // SHA256(SHA256(SHA256(pw)) ++ nonce)
+    var h3: [32]u8 = undefined;
     ctx.final(&h3);
 
     var out: [32]u8 = undefined;
@@ -477,7 +452,6 @@ pub fn cachingSha2Token(password: []const u8, salt: []const u8) [32]u8 {
 const AuthSwitch = struct { plugin: ?AuthPlugin, salt: [20]u8 };
 
 fn parseAuthSwitch(p: []const u8) AuthSwitch {
-    // 0xfe, plugin name (null-terminated), then salt
     var i: usize = 1;
     const name_end = std.mem.indexOfScalarPos(u8, p, i, 0) orelse p.len;
     const plugin = pluginByName(p[i..name_end]);
@@ -488,26 +462,17 @@ fn parseAuthSwitch(p: []const u8) AuthSwitch {
     return .{ .plugin = plugin, .salt = salt };
 }
 
-// ---------------------------------------------------------------------------
-// LOAD DATA LOCAL INFILE bulk sink (append/overwrite). Streams the same tab-
-// separated text COPY uses (MySQL LOAD DATA defaults: TERMINATED BY '\t', ESCAPED
-// BY '\\', LINES BY '\n', NULL = \N). Requires server `local_infile=ON`. Upsert
-// routes to the INSERT sink. (Bool literal is 1/0 for MySQL, not t/f.)
-// ---------------------------------------------------------------------------
-
-const LD_FLUSH_BYTES = 1 << 20; // ~1MB per data packet (well under MySQL's 16MB cap)
+const LD_FLUSH_BYTES = 1 << 20;
 
 pub const LoadDataSink = struct {
     gpa: std.mem.Allocator,
     conn: *Conn,
-    buffer: std.array_list.Managed(u8), // current segment's encoded rows (replay unit)
-    load_cmd: []const u8 = "", // gpa-owned; issued once per segment
+    buffer: std.array_list.Managed(u8),
+    load_cmd: []const u8 = "",
     seg_rows: u64 = 0,
     redial: ?sqlmod.Redial = null,
 
     pub fn open(gpa: std.mem.Allocator, conn: *Conn, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?sqlmod.Redial) !*LoadDataSink {
-        // On error we free only what we allocate here; the caller keeps `conn`
-        // (so it can read conn.last_error) and closes it on failure.
         const self = try gpa.create(LoadDataSink);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .conn = conn, .buffer = std.array_list.Managed(u8).init(gpa), .redial = redial };
@@ -550,7 +515,6 @@ pub const LoadDataSink = struct {
             if (!driver.transientNet(e)) return e;
             const fresh = try rd.dial(rd.ctx, self.gpa);
             self.conn.close();
-            // Redial ctx is kind-matched: the vtable ptr is always a *mysql.Conn.
             self.conn = @ptrCast(@alignCast(fresh.ptr));
             try self.sendSegment();
         };
@@ -560,7 +524,7 @@ pub const LoadDataSink = struct {
 
     fn sendSegment(self: *LoadDataSink) !void {
         try self.conn.loadDataStart(self.load_cmd);
-        var off: usize = 0; // ≤1MB data packets, well under the 16MB packet cap
+        var off: usize = 0;
         while (off < self.buffer.items.len) {
             const chunk = @min(self.buffer.items.len - off, LD_FLUSH_BYTES);
             try self.conn.loadDataChunk(self.buffer.items[off .. off + chunk]);
@@ -575,8 +539,6 @@ pub const LoadDataSink = struct {
     }
 
     fn closeImpl(self: *LoadDataSink) !void {
-        // Release everything even if the final segment fails — otherwise a
-        // failed LOAD DATA on close leaks the connection, buffer and sink.
         defer self.teardown();
         try self.commitSegment();
     }
@@ -619,17 +581,15 @@ fn parseOkAffected(p: []const u8) ?u64 {
 
 test "parseOkAffected: small and lenenc counts, non-OK header" {
     try std.testing.expectEqual(@as(?u64, 3), parseOkAffected(&.{ 0x00, 0x03, 0x00, 0x00 }));
-    // 0xfc = 2-byte lenenc: 300 affected rows
     try std.testing.expectEqual(@as(?u64, 300), parseOkAffected(&.{ 0x00, 0xfc, 0x2c, 0x01 }));
     try std.testing.expectEqual(@as(?u64, null), parseOkAffected(&.{ 0xff, 0x03 }));
     try std.testing.expectEqual(@as(?u64, null), parseOkAffected(&.{0x00}));
 }
 
 fn errMessage(p: []const u8) []const u8 {
-    // 0xff, error_code(2), if 41: '#' + sql_state(5), then message
     if (p.len < 3) return "mysql error";
     var i: usize = 3;
-    if (p.len > 3 and p[3] == '#') i = 9; // skip '#XXXXX'
+    if (p.len > 3 and p[3] == '#') i = 9;
     if (i > p.len) return "mysql error";
     return p[i..];
 }
@@ -682,7 +642,6 @@ test "pluginByName round-trips the supported auth plugins" {
 }
 
 test "parseAuthSwitch recognizes mysql_clear_password (StarRocks LDAP/external auth)" {
-    // 0xfe + "mysql_clear_password\0" + (empty salt — the server validates externally)
     const sw = parseAuthSwitch("\xfe" ++ "mysql_clear_password" ++ "\x00");
     try std.testing.expectEqual(AuthPlugin.clear, sw.plugin.?);
 }
@@ -696,8 +655,6 @@ test "decodeBits folds big-endian BIT bytes" {
 }
 
 test "caching_sha2_password token matches a known vector" {
-    // password "foobar", nonce = 20 bytes 0x01..0x14; computed externally
-    // (Python hashlib) — the digest-then-nonce order is the easy bug here.
     var salt: [20]u8 = undefined;
     for (&salt, 0..) |*b, i| b.* = @intCast(i + 1);
     const tok = cachingSha2Token("foobar", &salt);
@@ -719,7 +676,6 @@ test "lenenc integers: inline, 2/3/8-byte forms, truncation errors" {
         @as(u64, 0x0807060504030201),
         try lenencInt("\xfe\x01\x02\x03\x04\x05\x06\x07\x08", &i),
     );
-    // truncated payloads must error, not read past the buffer
     i = 0;
     try std.testing.expectError(error.MysqlProtocol, lenencInt("", &i));
     i = 0;
@@ -732,15 +688,13 @@ test "lenenc strings: value, 0xfb NULL marker, truncation" {
     try std.testing.expectEqual(@as(usize, 4), i);
     i = 0;
     try std.testing.expectEqual(@as(?[]const u8, null), try lenencStrOrNull("\xfb", &i));
-    try std.testing.expectEqual(@as(usize, 1), i); // marker consumed
+    try std.testing.expectEqual(@as(usize, 1), i);
     i = 0;
     try std.testing.expectError(error.MysqlProtocol, lenencStr("\x05ab", &i));
 }
 
 test "ERR packet message extraction, with and without sql-state" {
-    // 0xff, code(2), '#' + 5-char sql state, message
     try std.testing.expectEqualStrings("Access denied", errMessage("\xff\x15\x04#28000Access denied"));
-    // pre-4.1 form: no '#' marker, message directly after the code
     try std.testing.expectEqualStrings("boom", errMessage("\xff\x15\x04boom"));
     try std.testing.expectEqualStrings("mysql error", errMessage("\xff\x15"));
 }
@@ -749,26 +703,23 @@ test "parseColDef decodes a column definition packet" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // catalog/schema/table/org_table/name/org_name as lenenc strings, then
-    // 0x0c fixed block: charset(2) collen(4) type(1) flags(2) decimals(1) filler(2)
     const pkt = "\x03def" ++ "\x02db" ++ "\x01t" ++ "\x01t" ++ "\x06amount" ++ "\x06amount" ++
         "\x0c" ++ "\x21\x00" ++ "\x0b\x00\x00\x00" ++ "\xf6" ++ "\x00\x00" ++ "\x02" ++ "\x00\x00";
     const c = try parseColDef(a, pkt);
     try std.testing.expectEqualStrings("amount", c.name);
-    try std.testing.expectEqual(@as(u8, 0xf6), c.mtype); // NEWDECIMAL
+    try std.testing.expectEqual(@as(u8, 0xf6), c.mtype);
     try std.testing.expectEqual(@as(u8, 2), c.decimals);
     try std.testing.expectEqual(types.TypeKind.decimal, c.engine_type.kind);
     try std.testing.expectEqual(@as(u8, 2), c.engine_type.scale);
 }
 
 test "engineTypeFor maps MySQL wire types to engine types" {
-    try std.testing.expectEqual(types.TypeKind.int, engineTypeFor(0x03, 0).kind); // LONG
-    try std.testing.expectEqual(types.TypeKind.int, engineTypeFor(0x08, 0).kind); // LONGLONG
-    try std.testing.expectEqual(types.TypeKind.float, engineTypeFor(0x05, 0).kind); // DOUBLE
-    try std.testing.expectEqual(types.TypeKind.date, engineTypeFor(0x0a, 0).kind); // DATE
-    try std.testing.expectEqual(types.TypeKind.timestamp, engineTypeFor(0x0c, 0).kind); // DATETIME
-    try std.testing.expectEqual(types.TypeKind.string, engineTypeFor(0xfd, 0).kind); // VAR_STRING
-    // every result-set type is nullable: the wire has no NOT NULL guarantee here
+    try std.testing.expectEqual(types.TypeKind.int, engineTypeFor(0x03, 0).kind);
+    try std.testing.expectEqual(types.TypeKind.int, engineTypeFor(0x08, 0).kind);
+    try std.testing.expectEqual(types.TypeKind.float, engineTypeFor(0x05, 0).kind);
+    try std.testing.expectEqual(types.TypeKind.date, engineTypeFor(0x0a, 0).kind);
+    try std.testing.expectEqual(types.TypeKind.timestamp, engineTypeFor(0x0c, 0).kind);
+    try std.testing.expectEqual(types.TypeKind.string, engineTypeFor(0xfd, 0).kind);
     try std.testing.expect(engineTypeFor(0x03, 0).nullable);
 }
 
@@ -777,7 +728,6 @@ test "parseAuthSwitch extracts the plugin and its trailing salt" {
     const sw = parseAuthSwitch(payload);
     try std.testing.expectEqual(AuthPlugin.native, sw.plugin.?);
     try std.testing.expectEqualStrings("ABCDEFGHIJKLMNOPQRST", &sw.salt);
-    // unknown plugin -> null so the caller can fail auth instead of guessing
     try std.testing.expect(parseAuthSwitch("\xfe" ++ "sha256_password" ++ "\x00").plugin == null);
 }
 
@@ -790,31 +740,31 @@ const MyCol = struct {
 
 fn parseColDef(arena: std.mem.Allocator, p: []const u8) !MyCol {
     var i: usize = 0;
-    _ = try lenencStr(p, &i); // catalog
-    _ = try lenencStr(p, &i); // schema
-    _ = try lenencStr(p, &i); // table
-    _ = try lenencStr(p, &i); // org_table
+    _ = try lenencStr(p, &i);
+    _ = try lenencStr(p, &i);
+    _ = try lenencStr(p, &i);
+    _ = try lenencStr(p, &i);
     const name = try lenencStr(p, &i);
-    _ = try lenencStr(p, &i); // org_name
-    _ = try lenencInt(p, &i); // length of fixed fields (0x0c)
-    if (i + 10 > p.len) return error.MysqlProtocol; // charset(2)+collen(4)+type(1)+flags(2)+decimals(1)
-    i += 2; // charset
-    i += 4; // column length
+    _ = try lenencStr(p, &i);
+    _ = try lenencInt(p, &i);
+    if (i + 10 > p.len) return error.MysqlProtocol;
+    i += 2;
+    i += 4;
     const mtype = p[i];
     i += 1;
-    i += 2; // flags
+    i += 2;
     const decimals = p[i];
     return .{ .name = try arena.dupe(u8, name), .mtype = mtype, .decimals = decimals, .engine_type = engineTypeFor(mtype, decimals) };
 }
 
 fn engineTypeFor(mtype: u8, decimals: u8) types.Type {
     return (switch (mtype) {
-        0x01, 0x02, 0x03, 0x08, 0x09, 0x0d => types.Type.init(.int), // TINY/SHORT/LONG/LONGLONG/INT24/YEAR
-        0x04, 0x05 => types.Type.init(.float), // FLOAT/DOUBLE
-        0x00, 0xf6 => types.Type.decimal(38, decimals), // DECIMAL/NEWDECIMAL
-        0x0a => types.Type.init(.date), // DATE
-        0x07, 0x0c => types.Type.init(.timestamp), // TIMESTAMP/DATETIME
-        0x10 => types.Type.init(.int), // BIT
+        0x01, 0x02, 0x03, 0x08, 0x09, 0x0d => types.Type.init(.int),
+        0x04, 0x05 => types.Type.init(.float),
+        0x00, 0xf6 => types.Type.decimal(38, decimals),
+        0x0a => types.Type.init(.date),
+        0x07, 0x0c => types.Type.init(.timestamp),
+        0x10 => types.Type.init(.int),
         else => types.Type.init(.string),
     }).asNullable();
 }

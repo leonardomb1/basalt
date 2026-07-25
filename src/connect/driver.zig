@@ -11,10 +11,6 @@ const batchmod = @import("../exec/batch.zig");
 
 const Batch = batchmod.Batch;
 
-// --- cooperative cancellation flag -----------------------------------------
-// Lives here (the layer both runtime and connectors can import) so a driver in
-// the middle of a paginated pull can notice an abort between requests instead
-// of only at the engine's batch boundaries.
 var g_abort = std.atomic.Value(bool).init(false);
 
 /// Ask the current run to stop at the next boundary. One atomic store —

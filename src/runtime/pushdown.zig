@@ -51,7 +51,6 @@ fn inSchema(schema: types.Schema, name: []const u8) bool {
 pub fn planAgg(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, prefix: []const ast.Stage, ag: ast.Aggregate) !Plan {
     var plan = Plan{};
 
-    // --- projection: which source columns does the aggregate actually need? ---
     const has_select = for (prefix) |st| {
         if (st.node == .select) break true;
     } else false;
@@ -66,7 +65,6 @@ pub fn planAgg(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Sch
         plan.proj_schema = p.schema;
     }
 
-    // --- predicate: translate each prefix filter; AND the pushable ones ---
     var where = std.array_list.Managed(u8).init(arena);
     for (prefix) |st| {
         if (st.node != .filter) continue;
@@ -104,14 +102,13 @@ pub const MapPlan = struct {
 pub fn planMap(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, middle: []const ast.Stage, out_cols: []const []const u8) !MapPlan {
     var plan = MapPlan{};
 
-    var nf: usize = middle.len; // index of the first non-filter stage
+    var nf: usize = middle.len;
     for (middle, 0..) |st, i| if (st.node != .filter) {
         nf = i;
         break;
     };
     const leading = middle[0..nf];
 
-    // predicate: the leading filters reference source columns directly
     var where = std.array_list.Managed(u8).init(arena);
     for (leading) |st| {
         const frag = (try translateExpr(arena, st.node.filter, dialect, src_schema, true)) orelse continue;
@@ -120,10 +117,6 @@ pub fn planMap(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Sch
     }
     if (where.items.len > 0) plan.where_extra = try where.toOwnedSlice();
 
-    // projection: backward liveness from the output columns to the source columns, with
-    // dead-item elimination — each select keeps only the items still live downstream, so a
-    // wide reconcile narrows to what the final `select` actually emits. (`arena`-backed
-    // maps; intermediates are reclaimed with the arena, not deinit'd.)
     var live = std.StringHashMap(void).init(arena);
     for (out_cols) |c| try live.put(c, {});
     var pruned_rev = std.array_list.Managed(ast.Stage).init(arena);
@@ -133,13 +126,10 @@ pub fn planMap(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Sch
         i -= 1;
         const st = middle[i];
         switch (st.node) {
-            // A filter keeps the schema and reads its predicate's columns.
             .filter => |pred| {
                 try collectFields(pred, &live);
                 try pruned_rev.append(st);
             },
-            // A select redefines the schema: keep each item whose output is still live,
-            // make that item's source reads live, and drop the rest.
             .select => |items| {
                 var kept = std.array_list.Managed(ast.SelectItem).init(arena);
                 var nl = std.StringHashMap(void).init(arena);
@@ -152,7 +142,7 @@ pub fn planMap(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Sch
                         try kept.append(item);
                         try collectFields(c.expr, &nl);
                     },
-                    else => proj_ok = false, // star family: can't attribute precisely
+                    else => proj_ok = false,
                 };
                 try pruned_rev.append(.{ .node = .{ .select = try kept.toOwnedSlice() }, .hints = st.hints, .pos = st.pos });
                 live = nl;
@@ -166,7 +156,7 @@ pub fn planMap(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Sch
             plan.proj_select = p.sel;
             plan.proj_schema = p.schema;
             const pruned = try arena.alloc(ast.Stage, pruned_rev.items.len);
-            for (pruned_rev.items, 0..) |st, k| pruned[pruned_rev.items.len - 1 - k] = st; // reverse to source→sink
+            for (pruned_rev.items, 0..) |st, k| pruned[pruned_rev.items.len - 1 - k] = st;
             plan.stages = pruned;
         }
     }
@@ -224,7 +214,6 @@ pub fn translateExpr(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dial
             const inner = (try translateExpr(arena, n.e, dialect, schema, check_fields)) orelse return null;
             if (n.kind == .is_null)
                 return try std.fmt.allocPrint(arena, "({s} IS {s}NULL)", .{ inner, if (n.negated) "NOT " else "" });
-            // `is empty` == null OR '' — exact, portable
             const test_sql = try std.fmt.allocPrint(arena, "({s} IS NULL OR {s} = '')", .{ inner, inner });
             return if (n.negated) try std.fmt.allocPrint(arena, "(NOT {s})", .{test_sql}) else test_sql;
         },
@@ -238,7 +227,7 @@ pub fn translateExpr(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dial
                 .ge => ">=",
                 .@"and" => "AND",
                 .@"or" => "OR",
-                else => return null, // arithmetic: coercion/division semantics differ — skip
+                else => return null,
             };
             const l = (try translateExpr(arena, b.l, dialect, schema, check_fields)) orelse return null;
             const r = (try translateExpr(arena, b.r, dialect, schema, check_fields)) orelse return null;
@@ -257,7 +246,7 @@ pub fn translateExpr(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dial
             return try std.fmt.allocPrint(arena, "CAST({s} AS {s})", .{ inner, (ty orelse return null) });
         },
         .call => |c| return translateCall(arena, c, dialect, schema, check_fields),
-        else => return null, // let_in (inlined before planning anyway)
+        else => return null,
     }
 }
 
@@ -284,7 +273,6 @@ fn translateMatch(arena: std.mem.Allocator, m: ast.Match, dialect: Dialect, sche
             w.print(" WHEN {s} THEN {s}", .{ g, v }) catch return error.OutOfMemory;
         }
     }
-    // no ELSE -> SQL CASE yields NULL, matching the engine's match semantics
     w.writeAll(" END)") catch return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
@@ -314,7 +302,7 @@ fn sqlTypeName(arena: std.mem.Allocator, dialect: Dialect, ty: types.Type) !?[]c
             .mysql => "DATETIME",
             .postgres => "TIMESTAMP",
         },
-        else => null, // bool/bytes: cast semantics diverge per dialect
+        else => null,
     };
 }
 
@@ -339,7 +327,7 @@ fn translateCall(arena: std.mem.Allocator, c: ast.Expr.Call, dialect: Dialect, s
     }
     if (std.mem.eql(u8, n, "trim") and args.len == 1) {
         return switch (dialect) {
-            .sqlserver => try std.fmt.allocPrint(arena, "LTRIM(RTRIM({s}))", .{args[0]}), // TRIM is 2017+
+            .sqlserver => try std.fmt.allocPrint(arena, "LTRIM(RTRIM({s}))", .{args[0]}),
             else => try std.fmt.allocPrint(arena, "TRIM({s})", .{args[0]}),
         };
     }
@@ -354,8 +342,6 @@ fn translateCall(arena: std.mem.Allocator, c: ast.Expr.Call, dialect: Dialect, s
     }
     if (std.mem.eql(u8, n, "like") and args.len == 2)
         return try std.fmt.allocPrint(arena, "({s} LIKE {s})", .{ args[0], args[1] });
-    // starts_with/ends_with/contains -> LIKE, only for literal patterns free
-    // of wildcard chars (no ESCAPE portability games).
     if ((std.mem.eql(u8, n, "starts_with") or std.mem.eql(u8, n, "ends_with") or
         std.mem.eql(u8, n, "contains")) and c.args.len == 2)
     {
@@ -372,7 +358,7 @@ fn translateCall(arena: std.mem.Allocator, c: ast.Expr.Call, dialect: Dialect, s
             try std.fmt.allocPrint(arena, "%{s}%", .{pat});
         return try std.fmt.allocPrint(arena, "({s} LIKE {s})", .{ args[0], try sqlStr(arena, shaped) });
     }
-    return null; // now()/today() (clock skew!), unknown/user fns: keep engine-side
+    return null;
 }
 
 /// §7 implicit pushdown for a serial pipeline: translate the `filter` stages
@@ -383,7 +369,7 @@ pub fn serialWhere(arena: std.mem.Allocator, dialect: Dialect, stages: []const a
     if (stages.len < 2 or stages[0].node != .read) return null;
     var parts = std.array_list.Managed([]const u8).init(arena);
     for (stages[1..]) |st| {
-        if (st.node != .filter) break; // only the contiguous filter prefix
+        if (st.node != .filter) break;
         if (try translateExpr(arena, st.node.filter, dialect, .{ .fields = &.{} }, false)) |sql_frag| {
             try parts.append(sql_frag);
         }
@@ -435,13 +421,9 @@ fn collectFields(e: *const ast.Expr, set: *std.StringHashMap(void)) !void {
                 try collectFields(arm.value, set);
             }
         },
-        else => {}, // literals reference nothing
+        else => {},
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests (pure: SQL fragment generation — no DB)
-// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -506,13 +488,10 @@ test "translatePred: unknown field and unsupported nodes are not pushed" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // unknown column → null
     const lit = try a.create(ast.Expr);
     lit.* = .{ .int_lit = 1 };
     try testing.expect((try translateExpr(a, try bin(a, .eq, try fld(a, "zzz"), lit), .mysql, testSchema(), true)) == null);
-    // arithmetic → null
     try testing.expect((try translateExpr(a, try bin(a, .add, try fld(a, "a"), lit), .mysql, testSchema(), true)) == null);
-    // an untranslatable function (clock skew) → null
     const call = try a.create(ast.Expr);
     call.* = .{ .call = .{ .name = "now", .args = &.{} } };
     try testing.expect((try translateExpr(a, call, .mysql, testSchema(), true)) == null);
@@ -522,8 +501,6 @@ test "planAgg: projects only referenced columns and pushes the filter" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // prefix: filter a >= 5 ; aggregate sum(c) by b  → needs a, b, c → here all 3, so
-    // use a 4-col schema so projection actually drops one.
     const I = types.Type.init(.int);
     const S = types.Type.init(.string);
     const schema = types.Schema{ .fields = &.{
@@ -539,7 +516,7 @@ test "planAgg: projects only referenced columns and pushes the filter" {
     const ag = ast.Aggregate{ .aggs = aggs, .by = by };
 
     const plan = try planAgg(a, .sqlserver, schema, &.{filt}, ag);
-    try testing.expectEqualStrings("[a], [b], [c]", plan.proj_select.?); // d dropped
+    try testing.expectEqualStrings("[a], [b], [c]", plan.proj_select.?);
     try testing.expectEqual(@as(usize, 3), plan.proj_schema.?.fields.len);
     try testing.expectEqualStrings("([a] >= 5)", plan.where_extra.?);
 }
@@ -567,7 +544,6 @@ test "planMap: a downstream select narrows a wide reconcile (dead items pruned)"
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // reconcile passes a,b,c,d; a downstream select narrows to c,a (the output cols).
     const recon = try a.alloc(ast.SelectItem, 4);
     recon[0] = try fieldItem(a, "a");
     recon[1] = try fieldItem(a, "b");
@@ -580,9 +556,8 @@ test "planMap: a downstream select narrows a wide reconcile (dead items pruned)"
     const out_cols = [_][]const u8{ "c", "a" };
 
     const plan = try planMap(a, .postgres, schema4(), &middle, &out_cols);
-    try testing.expectEqualStrings("\"a\", \"c\"", plan.proj_select.?); // b, d dropped (never reach the sink)
+    try testing.expectEqualStrings("\"a\", \"c\"", plan.proj_select.?);
     try testing.expectEqual(@as(usize, 2), plan.proj_schema.?.fields.len);
-    // the reconcile stage was pruned to its two live items.
     try testing.expectEqual(@as(usize, 2), plan.stages.?[0].node.select.len);
 }
 
@@ -590,7 +565,6 @@ test "planMap: a downstream filter through the reconcile keeps its column live" 
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // reconcile(a,b,c,d) | filter c > 1 | select b  → output b, but c stays live for the filter.
     const recon = try a.alloc(ast.SelectItem, 4);
     recon[0] = try fieldItem(a, "a");
     recon[1] = try fieldItem(a, "b");
@@ -605,8 +579,8 @@ test "planMap: a downstream filter through the reconcile keeps its column live" 
     const out_cols = [_][]const u8{"b"};
 
     const plan = try planMap(a, .mysql, schema4(), &middle, &out_cols);
-    try testing.expect(plan.where_extra == null); // the filter is after the reconcile → not a leading filter
-    try testing.expectEqualStrings("`b`, `c`", plan.proj_select.?); // b (output) + c (filter); a, d dropped
+    try testing.expect(plan.where_extra == null);
+    try testing.expectEqualStrings("`b`, `c`", plan.proj_select.?);
 }
 
 test "planMap: a leading filter is pushed as a predicate" {
@@ -623,7 +597,7 @@ test "planMap: a leading filter is pushed as a predicate" {
 
     const plan = try planMap(a, .mysql, schema4(), &middle, &out_cols);
     try testing.expectEqualStrings("(`a` > 0)", plan.where_extra.?);
-    try testing.expectEqualStrings("`a`", plan.proj_select.?); // only a reaches the sink / filter
+    try testing.expectEqualStrings("`a`", plan.proj_select.?);
 }
 
 test "planMap: a star select disables projection" {
@@ -656,7 +630,6 @@ test "translatePred: `is empty` translates to null-or-'', plain `is null` to IS 
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // `is empty` is now pushable (exact, portable): b IS NULL OR b = ''
     const e = try a.create(ast.Expr);
     e.* = .{ .is_null = .{ .e = try fld(a, "b"), .negated = false, .kind = .is_empty } };
     try testing.expectEqualStrings("(`b` IS NULL OR `b` = '')", (try translateExpr(a, e, .mysql, testSchema(), true)).?);
@@ -669,7 +642,6 @@ test "planAgg: no projection when the aggregate consumes every source column" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // sum(c) by a, b over {a,b,c}: nothing to drop → SELECT * (null halves all round)
     const by = try a.alloc(ast.QualName, 2);
     by[0] = .{ .parts = &.{"a"} };
     by[1] = .{ .parts = &.{"b"} };
@@ -685,8 +657,6 @@ test "planAgg: an untranslatable filter is not pushed but its columns stay proje
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // filter b > now() can't become SQL (clock skew), but the kept filter op still
-    // reads `b` — so the projection must fetch it (the pushed set is a superset).
     const nowc = try a.create(ast.Expr);
     nowc.* = .{ .call = .{ .name = "now", .args = &.{} } };
     const filt = ast.Stage{ .node = .{ .filter = try bin(a, .gt, try fld(a, "b"), nowc) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
@@ -695,8 +665,8 @@ test "planAgg: an untranslatable filter is not pushed but its columns stay proje
     const aggs = try a.alloc(ast.AggItem, 1);
     aggs[0] = .{ .name = "total", .func = .sum, .arg = try fld(a, "c") };
     const plan = try planAgg(a, .mysql, schema4(), &.{filt}, .{ .aggs = aggs, .by = by });
-    try testing.expect(plan.where_extra == null); // call → not translatable
-    try testing.expectEqualStrings("`a`, `b`, `c`", plan.proj_select.?); // b kept live, d dropped
+    try testing.expect(plan.where_extra == null);
+    try testing.expectEqualStrings("`a`, `b`, `c`", plan.proj_select.?);
 }
 
 test "planMap: no projection when every source column reaches the sink" {
@@ -710,8 +680,8 @@ test "planMap: no projection when every source column reaches the sink" {
     const middle = [_]ast.Stage{selectStage(a, items)};
     const out_cols = [_][]const u8{ "a", "b", "c" };
     const plan = try planMap(a, .postgres, testSchema(), &middle, &out_cols);
-    try testing.expect(plan.proj_select == null); // nothing dropped → SELECT *
-    try testing.expect(plan.stages == null); // and the original chain is kept
+    try testing.expect(plan.proj_select == null);
+    try testing.expect(plan.stages == null);
     try testing.expect(plan.where_extra == null);
 }
 
@@ -732,8 +702,8 @@ test "planAgg: a select in the prefix disables projection (filter still pushed)"
     const ag = ast.Aggregate{ .aggs = aggs, .by = by };
 
     const plan = try planAgg(a, .postgres, testSchema(), &.{ filt, sel }, ag);
-    try testing.expect(plan.proj_select == null); // select present → no projection
-    try testing.expectEqualStrings("(\"a\" >= 5)", plan.where_extra.?); // filter still pushed
+    try testing.expect(plan.proj_select == null);
+    try testing.expectEqualStrings("(\"a\" >= 5)", plan.where_extra.?);
 }
 
 test "translateExpr: extended constructs (is empty, CASE, CAST, functions)" {
@@ -758,7 +728,6 @@ test "translateExpr: extended constructs (is empty, CASE, CAST, functions)" {
         .{ .src = "contains(status, 'ab')", .want = "([status] LIKE '%ab%')" },
         .{ .src = "starts_with(status, 'CT2')", .want = "([status] LIKE 'CT2%')" },
         .{ .src = "status LIKE 'a%'", .want = "([status] LIKE 'a%')" },
-        // refusals: wildcards in the pattern, clock functions, arithmetic
         .{ .src = "contains(status, '10%')", .want = null },
         .{ .src = "now() > v", .want = null },
         .{ .src = "v + 1 > 2", .want = null },
@@ -781,10 +750,9 @@ test "serialWhere: contiguous filter prefix, partial translation, stops at non-f
     const a = arn.allocator();
     const sqlp = @import("../lang/sql_parser.zig");
 
-    // read | filter (translatable) | filter (not) | filter (translatable)
     var diag: sqlp.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const f1 = try sqlp.parseExprStr(a, "v > 0", &diag);
-    const f2 = try sqlp.parseExprStr(a, "v + 1 > 2", &diag); // arithmetic: refused
+    const f2 = try sqlp.parseExprStr(a, "v + 1 > 2", &diag);
     const f3 = try sqlp.parseExprStr(a, "status = 'ok'", &diag);
     const rd = ast.Stage{ .node = .{ .read = .{ .connector = "erp", .form = .{ .table = .{ .parts = &.{"T"} } } } }, .hints = &.{}, .pos = .{ .line = 1, .col = 1 } };
     const mk = struct {
@@ -797,7 +765,6 @@ test "serialWhere: contiguous filter prefix, partial translation, stops at non-f
     const w = (try serialWhere(a, .sqlserver, &stages)).?;
     try std.testing.expectEqualStrings("([v] > 0) AND ([status] = 'ok')", w);
 
-    // filter after a select is NOT part of the prefix
     const sel = ast.Stage{ .node = .{ .select = &.{.star} }, .hints = &.{}, .pos = .{ .line = 1, .col = 1 } };
     const stages2 = [_]ast.Stage{ rd, sel, mk(f1) };
     try std.testing.expect((try serialWhere(a, .sqlserver, &stages2)) == null);

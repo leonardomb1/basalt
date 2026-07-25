@@ -149,8 +149,6 @@ fn coercible(v: json.Value, kind: types.TypeKind) bool {
             .string => true,
             else => false,
         },
-        // string / bytes / temporal / decimal / json: stored as text downstream
-        // (a CAST in the query does the strict conversion) — anything passes.
         else => true,
     };
 }
@@ -232,8 +230,6 @@ fn jsonToString(arena: std.mem.Allocator, v: json.Value) ![]const u8 {
         .integer => |x| try std.fmt.allocPrint(arena, "{d}", .{x}),
         .float => |x| try std.fmt.allocPrint(arena, "{d}", .{x}),
         .bool => |x| if (x) "true" else "false",
-        // Objects/arrays ride as canonical JSON text (a declared `payload JSON`
-        // column must not flatten to "").
         .object, .array => try std.json.Stringify.valueAlloc(arena, v, .{}),
         .null => "",
     };
@@ -273,8 +269,6 @@ test "request source: a single object becomes one row" {
 test "request source: schema comes from row 1; later rows coerce or null" {
     const gpa = std.testing.allocator;
     var msg: []const u8 = "";
-    // row 2: id arrives as a string (coerced), name is missing (null),
-    // extra is not in the schema (dropped)
     var s = try RequestSource.open(gpa,
         \\[{"id":1,"name":"a","score":1.5},{"id":"42","extra":true}]
     , null, gpa, &msg);
@@ -284,7 +278,6 @@ test "request source: schema comes from row 1; later rows coerce or null" {
     try std.testing.expectEqual(@as(i64, 42), s.batch.columns[0].getValue(1).int);
     try std.testing.expect(s.batch.columns[1].getValue(1).isNull());
     try std.testing.expect(s.batch.columns[2].getValue(1).isNull());
-    // unparseable numeric text nulls rather than corrupting
     var s2 = try RequestSource.open(gpa,
         \\[{"n":1},{"n":"not-a-number"}]
     , null, gpa, &msg);
@@ -299,7 +292,6 @@ test "request source: non-array/object bodies are rejected by name" {
     try std.testing.expectError(error.ExpectedJsonArrayOrObject, RequestSource.open(gpa,
         \\"just a string"
     , null, gpa, &msg));
-    // malformed JSON surfaces the parser's error, not a crash
     try std.testing.expectError(error.SyntaxError, RequestSource.open(gpa, "{nope", null, gpa, &msg));
 }
 
@@ -331,7 +323,6 @@ test "declared body schema: column order, types, and enforcement" {
     };
     var msg: []const u8 = "";
 
-    // Valid body: schema follows the declaration (order + types), extra keys drop.
     var s = try RequestSource.open(gpa,
         \\[{"value":7,"device_id":"a","extra":true},{"device_id":"b"}]
     , &decl, a, &msg);
@@ -341,14 +332,12 @@ test "declared body schema: column order, types, and enforcement" {
     try std.testing.expectEqual(types.TypeKind.int, s.schema.fields[1].ty.kind);
     try std.testing.expectEqual(@as(i64, 7), s.batch.columns[1].getValue(0).int);
 
-    // NOT NULL violation names the row and column.
     try std.testing.expectError(error.BodySchemaViolation, RequestSource.open(gpa,
         \\[{"device_id":"a"},{"value":3}]
     , &decl, a, &msg));
     try std.testing.expect(std.mem.indexOf(u8, msg, "row 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "device_id") != null);
 
-    // Type violation: "x" is not readable as int.
     try std.testing.expectError(error.BodySchemaViolation, RequestSource.open(gpa,
         \\[{"device_id":"a","value":"x"}]
     , &decl, a, &msg));
@@ -361,7 +350,7 @@ test "JSON-typed columns keep object payloads as JSON text" {
     defer arena.deinit();
 
     const decl = [_]types.BodyCol{
-        .{ .name = "payload", .ty = types.Type.init(.string) }, // JSON rides as text
+        .{ .name = "payload", .ty = types.Type.init(.string) },
     };
     var msg: []const u8 = "";
     var s = try RequestSource.open(gpa,

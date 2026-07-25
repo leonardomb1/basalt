@@ -79,9 +79,6 @@ pub const Logger = struct {
     pub fn summary(self: *Logger, s: Summary) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        // Format into a stack buffer, then one positionless write(2). A fresh
-        // File.Writer per call would pwrite at offset 0 and clobber prior lines when
-        // stderr is a regular file (`2>run.log`) — see `log` below.
         var lbuf: [2048]u8 = undefined;
         var w = std.Io.Writer.fixed(&lbuf);
         if (self.json) {
@@ -99,12 +96,6 @@ pub const Logger = struct {
         const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
         self.mutex.lock();
         defer self.mutex.unlock();
-        // Build the whole line in a stack buffer, then a single `file.writeAll`, which
-        // uses write(2) — the fd offset advances, so successive lines append for both a
-        // pipe and a regular file. A per-call buffered `File.Writer` (re-created here
-        // each time, `.pos` resetting to 0) instead pwrites every line at offset 0, so
-        // a `2>run.log` redirect kept only the last line. Lines too long for `lbuf` are
-        // dropped (same as the old bufPrint cap).
         var lbuf: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&lbuf);
         if (self.json) {
@@ -209,7 +200,6 @@ test "level parse + summary rate" {
 }
 
 test "json log line escapes and is one line" {
-    // Render to a buffer by mimicking the json branch.
     var buf: [256]u8 = undefined;
     var fbw = std.Io.Writer.fixed(&buf);
     const w = &fbw;
@@ -287,9 +277,9 @@ test "CountingSource accumulates emitted rows across batches and forwards EOF" {
     var fake = FakeSource{ .batches = &.{ 2, 3 } };
     var cs = CountingSource{ .inner = fake.source(), .count = &cnt };
     const src = cs.source();
-    try std.testing.expectEqual(@as(usize, 0), src.schema().fields.len); // schema passthrough
+    try std.testing.expectEqual(@as(usize, 0), src.schema().fields.len);
     try std.testing.expectEqual(@as(usize, 2), ((try src.next(std.testing.allocator)) orelse unreachable).len);
     try std.testing.expectEqual(@as(usize, 3), ((try src.next(std.testing.allocator)) orelse unreachable).len);
     try std.testing.expect((try src.next(std.testing.allocator)) == null);
-    try std.testing.expectEqual(@as(u64, 5), cnt.load(.monotonic)); // EOF adds nothing
+    try std.testing.expectEqual(@as(u64, 5), cnt.load(.monotonic));
 }

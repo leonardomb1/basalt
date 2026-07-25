@@ -28,10 +28,6 @@ pub const STREAM_ROWS = 4096;
 /// count check turns silent row drops into hard errors.
 pub const SEGMENT_BYTES = 4 << 20;
 
-// ---------------------------------------------------------------------------
-// TLS (shared by the protocol clients)
-// ---------------------------------------------------------------------------
-
 /// `require` = full verification (system CA bundle + hostname); `insecure` =
 /// encrypt but skip verification (self-signed dev/test servers).
 pub const TlsMode = enum { off, require, insecure };
@@ -89,18 +85,6 @@ pub const Cursor = struct {
         self.vtable.close(self.ptr);
     }
 };
-
-// ---------------------------------------------------------------------------
-// Shared text-protocol cursor skeleton (postgres/mysql)
-//
-// Both drivers keep identical cursor state on their Conn (`meta_arena`,
-// `cols`, `cur_schema`, `done`) and used to duplicate the open-guard and the
-// fetch loop — which drifted once (a mid-stream server error parsed as row
-// data). The skeleton owns the lifecycle and the loop; a driver provides only
-// `nextRow`, which MUST classify every wire packet as a row, the end of the
-// stream, or an error — leaving no place to forget a case. The TDS driver is
-// not covered: it is a token-stream cursor with a different shape.
-// ---------------------------------------------------------------------------
 
 pub const RowStep = enum { row, end };
 
@@ -209,7 +193,6 @@ pub const Dialect = enum {
             .string => switch (self) {
                 .postgres => if (is_key) "VARCHAR(255)" else "TEXT",
                 .mysql => "VARCHAR(255)",
-                // NVARCHAR(MAX) uses PLP encoding our TDS reader doesn't parse; cap at 4000.
                 .sqlserver => if (is_key) "NVARCHAR(255)" else "NVARCHAR(4000)",
             },
             .bytes => switch (self) {
@@ -229,10 +212,6 @@ pub const Dialect = enum {
     }
 
 };
-
-// ---------------------------------------------------------------------------
-// Generic source
-// ---------------------------------------------------------------------------
 
 pub const Source = struct {
     gpa: std.mem.Allocator,
@@ -267,10 +246,6 @@ fn srcClose(ptr: *anyopaque) void {
     self.gpa.destroy(self);
 }
 
-// ---------------------------------------------------------------------------
-// Generic sink: auto-create then batched INSERT / upsert
-// ---------------------------------------------------------------------------
-
 /// Rows per multi-row INSERT. Bigger = fewer round-trips/commits (the dominant
 /// cost of row loading), but SQL Server caps a `VALUES` list at 1000 rows.
 fn flushRowsFor(dialect: Dialect) usize {
@@ -292,21 +267,18 @@ pub const Sink = struct {
     gpa: std.mem.Allocator,
     conn: Conn,
     dialect: Dialect,
-    table: []const u8, // quoted, qualified
-    schema: types.Schema, // field names + types (owned in gpa)
+    table: []const u8,
+    schema: types.Schema,
     mode: ast.WriteMode,
-    rows: std.array_list.Managed([]const u8), // serialized "(...)" tuples (slices into tuple_arena)
-    tuple_arena: std.heap.ArenaAllocator, // backs the tuple bytes; reset per flush (no per-row malloc/free)
-    flush_rows: usize, // rows per INSERT (dialect-dependent cap)
+    rows: std.array_list.Managed([]const u8),
+    tuple_arena: std.heap.ArenaAllocator,
+    flush_rows: usize,
     redial: ?Redial = null,
     conn_alive: bool = true,
 
     pub fn open(gpa: std.mem.Allocator, conn: Conn, dialect: Dialect, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?Redial) !*Sink {
-        // On error we free only what we allocate here; the caller keeps `conn`
-        // (so it can read conn.last_error) and closes it on failure.
         const self = try gpa.create(Sink);
         errdefer gpa.destroy(self);
-        // own copies of schema (field names) + quoted table name
         const fields = try gpa.alloc(types.Schema.Field, schema.fields.len);
         errdefer gpa.free(fields);
         var nf: usize = 0;
@@ -363,11 +335,6 @@ pub const Sink = struct {
         defer aa.deinit();
         const stmt = try buildStatement(aa.allocator(), self.dialect, self.table, self.schema, self.mode, self.rows.items);
         self.conn.exec(stmt) catch |e| {
-            // Retry once over a fresh connection if the socket broke (a SQL
-            // error from the server is permanent — never retried). Ambiguity
-            // note: if the dropped exec actually committed, the retry can
-            // double-insert on append; upsert is idempotent. Same contract as
-            // re-runs (downstream dedup owns exactly-once, per split.zig).
             const rd = self.redial orelse return e;
             if (!driver.transientNet(e)) return e;
             self.conn.close();
@@ -382,8 +349,6 @@ pub const Sink = struct {
     }
 
     fn closeImpl(self: *Sink) !void {
-        // Release everything even if the final flush fails — otherwise a failed
-        // INSERT on close leaks the connection, the tuple buffers and the sink.
         defer self.teardown();
         try self.flush();
     }
@@ -421,10 +386,6 @@ fn sinkAbort(ptr: *anyopaque) void {
     self.abortImpl();
 }
 
-// ---------------------------------------------------------------------------
-// SQL generation
-// ---------------------------------------------------------------------------
-
 pub fn createTableSql(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8, schema: types.Schema, mode: ast.WriteMode) ![]const u8 {
     const keys: []const []const u8 = switch (mode) {
         .upsert => |u| u.keys,
@@ -434,7 +395,6 @@ pub fn createTableSql(arena: std.mem.Allocator, dialect: Dialect, qtable: []cons
     const w = buf.writer();
 
     if (dialect == .sqlserver) {
-        // OBJECT_ID accepts the quoted dotted form ([a].[b]) directly.
         try w.print("IF OBJECT_ID(N'{s}', N'U') IS NULL CREATE TABLE {s} (", .{ qtable, qtable });
     } else {
         try w.print("CREATE TABLE IF NOT EXISTS {s} (", .{qtable});
@@ -448,8 +408,6 @@ pub fn createTableSql(arena: std.mem.Allocator, dialect: Dialect, qtable: []cons
         if (is_key) {
             try w.writeAll(" NOT NULL");
         } else if (dialect == .sqlserver) {
-            // SQL Server defaults unannotated columns to NOT NULL depending on the
-            // session's ANSI_NULL_DFLT setting — be explicit or bulk NULLs bounce.
             try w.writeAll(" NULL");
         }
     }
@@ -605,12 +563,6 @@ fn hexLiteral(w: anytype, dialect: Dialect, s: []const u8) !void {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Bulk-load text format (PostgreSQL COPY / MySQL LOAD DATA share it): tab-separated
-// fields, `\N` for null, newline-terminated rows, `\`-escaped t/n/r/backslash, and
-// dates/timestamps as real text. The only difference is the bool literal.
-// ---------------------------------------------------------------------------
-
 pub const BulkFormat = struct {
     bool_true: []const u8 = "t",
     bool_false: []const u8 = "f",
@@ -678,10 +630,6 @@ pub fn nameIn(names: []const []const u8, n: []const u8) bool {
     }
     return false;
 }
-
-// ---------------------------------------------------------------------------
-// Text-format value parsing (shared by MySQL + Postgres result sets)
-// ---------------------------------------------------------------------------
 
 /// Errors with `UnparseableNumber` when an int/float cell doesn't parse:
 /// silently coercing bad source text to 0 would corrupt the pipeline's output
@@ -753,7 +701,6 @@ fn daysFromCivil(y0: i64, m: u32, d: u32) i64 {
     return era * 146097 + doe - 719468;
 }
 
-
 test "create table + upsert SQL (postgres)" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -784,8 +731,6 @@ test "create table (sqlserver): non-key columns are explicit NULL, keys NOT NULL
     const qt = try quoteIdent(a, .sqlserver, "people");
     const ddl = try createTableSql(a, .sqlserver, qt, schema, .{ .upsert = .{ .keys = &.{"id"} } });
     try std.testing.expect(std.mem.indexOf(u8, ddl, "[id] BIGINT NOT NULL") != null);
-    // ANSI_NULL_DFLT varies per session; an unannotated column silently becomes
-    // NOT NULL and bulk NULLs bounce — the DDL must say NULL explicitly.
     try std.testing.expect(std.mem.indexOf(u8, ddl, "[name] NVARCHAR(4000) NULL") != null);
 }
 
@@ -810,7 +755,7 @@ test "value serialization escapes quotes and formats dates" {
     try std.testing.expectEqualStrings("'O''Brien'", buf.items);
 
     buf.clearRetainingCapacity();
-    try serializeValue(buf.writer(), .postgres, .{ .date = 0 }, a); // 1970-01-01
+    try serializeValue(buf.writer(), .postgres, .{ .date = 0 }, a);
     try std.testing.expectEqualStrings("'1970-01-01'", buf.items);
 }
 
@@ -826,7 +771,6 @@ test "upsert SQL (mysql): ON DUPLICATE KEY UPDATE with VALUES()" {
     const stmt = try buildStatement(a, .mysql, qt, schema, .{ .upsert = .{ .keys = &.{"id"} } }, &.{"(1,'a')"});
     try std.testing.expect(std.mem.indexOf(u8, stmt, "INSERT INTO `people` (`id`,`name`) VALUES (1,'a')") != null);
     try std.testing.expect(std.mem.indexOf(u8, stmt, "ON DUPLICATE KEY UPDATE `name`=VALUES(`name`)") != null);
-    // key columns must not be updated
     try std.testing.expect(std.mem.indexOf(u8, stmt, "`id`=VALUES") == null);
 }
 
@@ -843,7 +787,7 @@ test "upsert SQL (sqlserver): MERGE keyed on T/S join, keys excluded from UPDATE
     try std.testing.expect(std.mem.indexOf(u8, stmt, "MERGE INTO [dbo].[people] AS T USING (VALUES (1,'a')) AS S ([id],[name]) ON T.[id]=S.[id]") != null);
     try std.testing.expect(std.mem.indexOf(u8, stmt, "WHEN MATCHED THEN UPDATE SET [name]=S.[name]") != null);
     try std.testing.expect(std.mem.indexOf(u8, stmt, "WHEN NOT MATCHED THEN INSERT ([id],[name]) VALUES (S.[id],S.[name])") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stmt, "[id]=S.[id],") == null); // key not in UPDATE SET
+    try std.testing.expect(std.mem.indexOf(u8, stmt, "[id]=S.[id],") == null);
 }
 
 test "quoteIdent quotes each dotted part per dialect" {
@@ -862,14 +806,12 @@ test "serializeValue: dialect-specific escaping, bools, bytes, null" {
     const a = ar.allocator();
     var buf = std.array_list.Managed(u8).init(a);
 
-    // MySQL escapes backslashes; postgres leaves them alone
     try serializeValue(buf.writer(), .mysql, .{ .string = "c:\\tmp" }, a);
     try std.testing.expectEqualStrings("'c:\\\\tmp'", buf.items);
     buf.clearRetainingCapacity();
     try serializeValue(buf.writer(), .postgres, .{ .string = "c:\\tmp" }, a);
     try std.testing.expectEqualStrings("'c:\\tmp'", buf.items);
 
-    // bool: BIT 1/0 on sqlserver, TRUE/FALSE elsewhere
     buf.clearRetainingCapacity();
     try serializeValue(buf.writer(), .sqlserver, .{ .bool = true }, a);
     try std.testing.expectEqualStrings("1", buf.items);
@@ -877,7 +819,6 @@ test "serializeValue: dialect-specific escaping, bools, bytes, null" {
     try serializeValue(buf.writer(), .postgres, .{ .bool = false }, a);
     try std.testing.expectEqualStrings("FALSE", buf.items);
 
-    // bytes: postgres '\x…' vs 0x… elsewhere
     buf.clearRetainingCapacity();
     try serializeValue(buf.writer(), .postgres, .{ .bytes = "\x01\xab" }, a);
     try std.testing.expectEqualStrings("'\\x01ab'", buf.items);
@@ -901,14 +842,12 @@ test "coerceText parses bools, dates, timestamps, and decimals" {
     try std.testing.expect(!(try coerceText(a, "false", types.Type.init(.bool))).bool);
     try std.testing.expect(!(try coerceText(a, "0", types.Type.init(.bool))).bool);
 
-    // 2024-01-01 = 19723 days since epoch; leap day 2000-02-29 = 11016
     try std.testing.expectEqual(@as(i64, 19723), (try coerceText(a, "2024-01-01", types.Type.init(.date))).date);
     try std.testing.expectEqual(@as(i64, 11016), (try coerceText(a, "2000-02-29", types.Type.init(.date))).date);
     try std.testing.expectEqual(
         @as(i64, 19723 * 86_400_000_000 + (1 * 3600 + 2 * 60 + 3) * 1_000_000),
         (try coerceText(a, "2024-01-01 01:02:03", types.Type.init(.timestamp))).timestamp,
     );
-    // date-only text in a timestamp column: midnight
     try std.testing.expectEqual(@as(i64, 19723 * 86_400_000_000), (try coerceText(a, "2024-01-01", types.Type.init(.timestamp))).timestamp);
 
     const d = (try coerceText(a, "-12.345", types.Type.decimal(10, 3))).decimal;
@@ -939,10 +878,10 @@ test "bulk text format: tab/newline/backslash escaping and \\N nulls" {
     const batch = Batch{ .schema = &schema, .columns = cols, .len = 2 };
 
     var out = std.array_list.Managed(u8).init(a);
-    try appendBulkText(out.writer(), a, batch, .{}); // postgres t/f bools
+    try appendBulkText(out.writer(), a, batch, .{});
     try std.testing.expectEqualStrings("a\\tb\\nc\\\\d\tt\n\\N\tf\n", out.items);
 
     out.clearRetainingCapacity();
-    try appendBulkText(out.writer(), a, batch, .{ .bool_true = "1", .bool_false = "0" }); // mysql 1/0
+    try appendBulkText(out.writer(), a, batch, .{ .bool_true = "1", .bool_false = "0" });
     try std.testing.expectEqualStrings("a\\tb\\nc\\\\d\t1\n\\N\t0\n", out.items);
 }

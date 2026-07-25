@@ -18,10 +18,6 @@ const Batch = batchmod.Batch;
 pub const TypeError = error{ TypeError, OutOfMemory };
 pub const EvalError = error{ CastFailed, DivByZero, TypeMismatch, OutOfMemory };
 
-// ---------------------------------------------------------------------------
-// Type checking
-// ---------------------------------------------------------------------------
-
 pub const TypeCtx = struct {
     schema: types.Schema,
     arena: std.mem.Allocator,
@@ -35,9 +31,6 @@ pub const TypeCtx = struct {
             .float_lit => return Type.init(.float),
             .str_lit => return Type.init(.string),
             .field => |q| {
-                // `?.` is meaningful only on JSON-param paths, which expansion has
-                // already turned into literals; a `?.` still on a column reference is
-                // a mistake, not a silent no-op.
                 if (q.safe.len > 0) return self.err("`?.` (safe navigation) only applies to JSON-param paths, not column `{s}`", .{lastPart(q)});
                 const idx = fieldIndex(self.schema, q) orelse
                     return self.err("unknown field `{s}`", .{lastPart(q)});
@@ -66,8 +59,6 @@ pub const TypeCtx = struct {
                 return c.ty.withNull(s.nullable);
             },
             .is_null => |n| {
-                // `is empty` (null-or-empty-string) is only meaningful for strings;
-                // on a non-string it would silently collapse to `is null`.
                 if (n.kind == .is_empty) {
                     const t = try self.typeOf(n.e);
                     if (!(t.kind == .string or t.kind == .bytes or t.unknown))
@@ -107,11 +98,11 @@ pub const TypeCtx = struct {
         }
         if (eq(name, "now")) {
             if (c.args.len != 0) return self.err("`now` takes no arguments", .{});
-            return Type.init(.timestamp); // current wall-clock, non-null
+            return Type.init(.timestamp);
         }
         if (eq(name, "today")) {
             if (c.args.len != 0) return self.err("`today` takes no arguments", .{});
-            return Type.init(.date); // current UTC date, non-null
+            return Type.init(.date);
         }
         if (eq(name, "upper") or eq(name, "lower")) {
             const a = try self.argType(c, 0);
@@ -149,8 +140,8 @@ pub const TypeCtx = struct {
         }
         if (eq(name, "substr")) {
             const a = try self.argType(c, 0);
-            _ = try self.argType(c, 1); // start (1-based)
-            if (c.args.len > 2) _ = try self.argType(c, 2); // optional length
+            _ = try self.argType(c, 1);
+            if (c.args.len > 2) _ = try self.argType(c, 2);
             return Type.init(.string).withNull(a.nullable);
         }
         if (eq(name, "replace")) {
@@ -209,10 +200,6 @@ fn comparable(a: Type, b: Type) bool {
     return a.kind == b.kind;
 }
 
-// ---------------------------------------------------------------------------
-// Evaluation
-// ---------------------------------------------------------------------------
-
 /// Evaluate `expr` over every row of `batch` into a new column of type `out_ty`.
 ///
 /// Fast path: a vectorized kernel that works on whole typed column slices (i64 /
@@ -244,17 +231,6 @@ fn evalColumnRowwise(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Bat
     }
     return b.finish();
 }
-
-// ---------------------------------------------------------------------------
-// Vectorized kernels
-//
-// `evalVec` evaluates an expression to a `Vec` — either a full column or a
-// broadcast scalar constant (the DuckDB constant-vector trick: `amount > 100`
-// keeps `100` as a scalar instead of materializing 4096 copies). Binary kernels
-// handle the col×col, col×scalar and scalar×col shapes. Any node the vectorizer
-// does not implement raises `error.Unsupported`, which the caller turns into a
-// row-at-a-time fallback for that whole expression.
-// ---------------------------------------------------------------------------
 
 const Column = column.Column;
 const Bitmap = column.Bitmap;
@@ -304,18 +280,9 @@ fn evalVec(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch) VecErr
         .cond => |c| return condVec(arena, c, batch),
         .call => |c| return callVec(arena, c, batch),
         .match => return error.Unsupported,
-        .let_in => return error.Unsupported, // expanded away at plan time; never vectorized
+        .let_in => return error.Unsupported,
     }
 }
-
-// --- vectorized string/function kernels ---
-//
-// Args are evaluated once per batch (one dispatch per node), then a tight loop
-// runs over the `[]const u8` slices — no per-row tree walk, no `Value` boxing.
-// Functions keep the rowwise null semantics exactly: any null input → null row
-// (except coalesce). Anything not covered (non-string args that rowwise would
-// stringify, `match`) raises Unsupported and the whole expression falls back —
-// results are identical either way, only the path differs.
 
 /// Evaluate an argument to a string operand, or null → Unsupported fallback.
 fn strArg(arena: std.mem.Allocator, e: *const ast.Expr, batch: Batch) VecError!Str {
@@ -327,8 +294,6 @@ fn callVec(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Ve
     const name = c.name;
     const n = batch.len;
 
-    // Per-batch timestamps: rowwise re-reads the clock per row; one consistent
-    // instant per batch is the intended (SQL-like) semantics.
     if (eq(name, "now")) return .{ .scalar = .{ .timestamp = std.time.microTimestamp() } };
     if (eq(name, "today")) return .{ .scalar = .{ .date = @intCast(@divFloor(std.time.microTimestamp(), 86_400_000_000)) } };
 
@@ -576,8 +541,6 @@ fn unaryVec(arena: std.mem.Allocator, u: ast.Expr.Unary, batch: Batch) VecError!
 }
 
 fn isNullVec(arena: std.mem.Allocator, n: ast.Expr.IsNull, batch: Batch) VecError!Vec {
-    // `is empty` (null-or-empty-string) has no vectorized kernel — fall the whole
-    // expression back to the rowwise evaluator, which implements it.
     if (n.kind == .is_empty) return error.Unsupported;
     const v = try evalVec(arena, n.e, batch);
     switch (v) {
@@ -593,7 +556,6 @@ fn isNullVec(arena: std.mem.Allocator, n: ast.Expr.IsNull, batch: Batch) VecErro
                 const isn = !c.validity.get(i);
                 out[i] = if (n.negated) !isn else isn;
             }
-            // `is null` is total — the result is never itself null.
             const bm = try Bitmap.initFull(arena, rows);
             return mkCol(Type.init(.bool), rows, bm, .{ .b = out });
         },
@@ -752,7 +714,6 @@ fn boolOpVec(arena: std.mem.Allocator, op: ast.BinOp, le: *const ast.Expr, re: *
         const lval = boolVal(l, i);
         const rk = boolKnown(r, i);
         const rval = boolVal(r, i);
-        // SQL three-valued logic.
         var res: ?bool = null;
         if (op == .@"and") {
             if ((lk and !lval) or (rk and !rval)) {
@@ -760,7 +721,7 @@ fn boolOpVec(arena: std.mem.Allocator, op: ast.BinOp, le: *const ast.Expr, re: *
             } else if (lk and lval and rk and rval) {
                 res = true;
             }
-        } else { // or
+        } else {
             if ((lk and lval) or (rk and rval)) {
                 res = true;
             } else if (lk and !lval and rk and !rval) {
@@ -854,13 +815,11 @@ fn castColVec(arena: std.mem.Allocator, col: Column, target: types.TypeKind, n: 
             }
             return mkCol(out_ty, n, col.validity, .{ .b = out });
         },
-        else => return error.Unsupported, // to-string / to-decimal fall back to rowwise
+        else => return error.Unsupported,
     }
 }
 
 fn condVec(arena: std.mem.Allocator, c: ast.Expr.Cond, batch: Batch) VecError!Vec {
-    // The condition is evaluated on every row in both paths, so its errors are
-    // genuine; the branches are lazy rowwise and must go through evalVecLazy.
     const cond = try evalVec(arena, c.cond, batch);
     const tv = try evalVecLazy(arena, c.then, batch);
     const ev = try evalVecLazy(arena, c.els, batch);
@@ -934,8 +893,6 @@ fn mergePick(comptime T: type, out: []T, bm: *Bitmap, take: []const bool, ts: []
         }
     }
 }
-
-// --- operand normalization & element accessors ---
 
 fn scalarNull(v: Vec) bool {
     return v == .scalar and v.scalar.isNull();
@@ -1059,7 +1016,7 @@ fn realize(arena: std.mem.Allocator, v: Vec, n: usize) VecError!?Column {
                 .string => Type.init(.string),
                 .bytes => Type.init(.bytes),
                 .decimal => Type.init(.decimal),
-                else => return null, // null/temporal scalar: unknown target kind -> fall back
+                else => return null,
             };
             return try broadcastScalar(arena, s, ty, n);
         },
@@ -1162,9 +1119,6 @@ pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, ro
         },
         .match => |m| return evalMatch(arena, m, batch, row),
         .call => |c| return evalCall(arena, c, batch, row),
-        // `let … in` is inlined away during expansion. It can only reach here in a
-        // raw `${ ... }` interpolation expression (which is not expanded); that is
-        // unsupported — use the function/`coalesce` forms there instead.
         .let_in => return error.TypeMismatch,
     }
 }
@@ -1414,7 +1368,7 @@ pub fn formatTime(arena: std.mem.Allocator, t: i64) ![]const u8 {
 /// pre-epoch instants format correctly).
 pub fn formatTimestamp(arena: std.mem.Allocator, micros: i64) ![]const u8 {
     const days = @divFloor(micros, 86_400_000_000);
-    const us: u64 = @intCast(micros - days * 86_400_000_000); // intraday remainder, ≥ 0
+    const us: u64 = @intCast(micros - days * 86_400_000_000);
     const secs = us / 1_000_000;
     const c = civilFromDays(days);
     return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
@@ -1427,7 +1381,7 @@ pub fn formatTimestamp(arena: std.mem.Allocator, micros: i64) ![]const u8 {
 pub fn civilFromDays(z0: i64) struct { y: i64, m: u32, d: u32 } {
     const z = z0 + 719468;
     const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
-    const doe = z - era * 146097; // [0, 146096]
+    const doe = z - era * 146097;
     const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
     const y = yoe + era * 400;
     const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
@@ -1466,7 +1420,7 @@ pub fn formatDecimal(arena: std.mem.Allocator, unscaled: i128, scale: u8) ![]con
         digits[n] = @intCast('0' + mag % 10);
         n += 1;
     }
-    while (n <= scale) : (n += 1) digits[n] = '0'; // pad so there's an integer digit
+    while (n <= scale) : (n += 1) digits[n] = '0';
 
     var out = std.array_list.Managed(u8).init(arena);
     if (neg) try out.append('-');
@@ -1478,8 +1432,6 @@ pub fn formatDecimal(arena: std.mem.Allocator, unscaled: i128, scale: u8) ![]con
     }
     return out.toOwnedSlice();
 }
-
-// --- small helpers ---
 
 fn fieldIndex(schema: types.Schema, q: ast.QualName) ?usize {
     return schema.indexOf(lastPart(q));
@@ -1569,18 +1521,14 @@ fn likeMatch(s: []const u8, pat: []const u8) bool {
     return pi == pat.len;
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 test "substr (1-based, byte) and like wildcard matcher" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try std.testing.expectEqualStrings("01", try substrBytes(a, "SD1010", 4, 2)); // empresa code
-    try std.testing.expectEqualStrings("SD1", try substrBytes(a, "SD1010", 1, 3)); // prefix
-    try std.testing.expectEqualStrings("010", try substrBytes(a, "SD1010", 4, null)); // to end
-    try std.testing.expectEqualStrings("", try substrBytes(a, "SD1010", 99, 2)); // past end
+    try std.testing.expectEqualStrings("01", try substrBytes(a, "SD1010", 4, 2));
+    try std.testing.expectEqualStrings("SD1", try substrBytes(a, "SD1010", 1, 3));
+    try std.testing.expectEqualStrings("010", try substrBytes(a, "SD1010", 4, null));
+    try std.testing.expectEqualStrings("", try substrBytes(a, "SD1010", 99, 2));
 
     try std.testing.expect(likeMatch("hello, world", "hello%"));
     try std.testing.expect(likeMatch("hello", "h_llo"));
@@ -1632,7 +1580,7 @@ test "type-check and evaluate an if-expression with 3VL" {
     const out = try evalColumn(a, sel, batch, sel_ty);
     try std.testing.expectEqualStrings("no", out.getValue(0).string);
     try std.testing.expectEqualStrings("yes", out.getValue(1).string);
-    try std.testing.expectEqualStrings("no", out.getValue(2).string); // null >= 100 -> null -> else
+    try std.testing.expectEqualStrings("no", out.getValue(2).string);
 }
 
 test "vectorized kernels match the rowwise evaluator" {
@@ -1640,7 +1588,6 @@ test "vectorized kernels match the rowwise evaluator" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    // Two nullable int columns with nulls in different rows.
     const x = try column.intColumn(a, &.{ 10, 20, null, 40, 0 });
     const y = try column.intColumn(a, &.{ 3, null, 7, 8, 5 });
     const schema = types.Schema{ .fields = &.{
@@ -1660,9 +1607,6 @@ test "vectorized kernels match the rowwise evaluator" {
         "if(x > y, x, y)",
         "-x",
         "x is null",
-        // Fallible ops on lazily-evaluated branches: x is 0 on the last row, so
-        // the eager vectorized path hits a div-by-zero the rowwise path never
-        // evaluates — it must fall back instead of raising.
         "if(x != 0, y / x, 0)",
         "x != 0 and y / x > 1",
         "x == 0 or y / x > 1",
@@ -1732,8 +1676,6 @@ test "vectorized string kernels match the rowwise evaluator" {
         var ctx = TypeCtx{ .schema = schema, .arena = a };
         const ty = try ctx.typeOf(e);
 
-        // Every expression here must take the vectorized path for real — a
-        // silent rowwise fallback would make this test vacuous.
         _ = evalVec(a, e, batch) catch |err| {
             std.debug.print("expr de-vectorized: {s}\n", .{body});
             try std.testing.expect(err != error.Unsupported);
@@ -1768,7 +1710,6 @@ test "type errors: unknown field and non-bool not" {
     try std.testing.expectError(error.TypeError, ctx.typeOf(pred));
     try std.testing.expect(std.mem.indexOf(u8, ctx.msg, "unknown field") != null);
 
-    // `not` over an int column must be rejected too (with its own message).
     var fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
     var notx = ast.Expr{ .unary = .{ .op = .not, .e = &fx } };
     try std.testing.expectError(error.TypeError, ctx.typeOf(&notx));
@@ -1782,16 +1723,15 @@ test "castValue: conversions succeed and failures are CastFailed specifically" {
 
     try std.testing.expectEqual(@as(i64, 42), (try castValue(a, .{ .string = " 42 " }, .int)).int);
     try std.testing.expectEqual(@as(i64, 1), (try castValue(a, .{ .bool = true }, .int)).int);
-    try std.testing.expectEqual(@as(i64, -3), (try castValue(a, .{ .float = -3.9 }, .int)).int); // truncates toward zero
+    try std.testing.expectEqual(@as(i64, -3), (try castValue(a, .{ .float = -3.9 }, .int)).int);
     try std.testing.expectEqual(@as(f64, 2.5), (try castValue(a, .{ .string = "2.5" }, .float)).float);
     try std.testing.expect((try castValue(a, .{ .string = " TRUE " }, .bool)).bool);
     try std.testing.expect(!(try castValue(a, .{ .int = 0 }, .bool)).bool);
     try std.testing.expectEqualStrings("123.45", (try castValue(a, .{ .decimal = .{ .unscaled = 12345, .scale = 2 } }, .string)).string);
 
-    // Which error matters: all of these are CastFailed, never TypeMismatch/panic.
     try std.testing.expectError(error.CastFailed, castValue(a, .{ .string = "abc" }, .int));
     try std.testing.expectError(error.CastFailed, castValue(a, .{ .float = std.math.nan(f64) }, .int));
-    try std.testing.expectError(error.CastFailed, castValue(a, .{ .float = 1e19 }, .int)); // beyond i64 range
+    try std.testing.expectError(error.CastFailed, castValue(a, .{ .float = 1e19 }, .int));
     try std.testing.expectError(error.CastFailed, castValue(a, .{ .string = "yes" }, .bool));
     try std.testing.expectError(error.CastFailed, castValue(a, .{ .bool = true }, .float));
 }
@@ -1820,12 +1760,10 @@ test "int division/modulo by zero raise DivByZero; float division yields inf" {
     var zero = ast.Expr{ .int_lit = 0 };
     var div = ast.Expr{ .binary = .{ .op = .div, .l = &fx, .r = &zero } };
     var mod = ast.Expr{ .binary = .{ .op = .mod, .l = &fx, .r = &zero } };
-    // Both the vectorized (whole-column) and rowwise paths must raise, not fall back.
     try std.testing.expectError(error.DivByZero, evalColumn(a, &div, batch, Type.init(.int).asNullable()));
     try std.testing.expectError(error.DivByZero, evalRow(a, &div, batch, 0));
     try std.testing.expectError(error.DivByZero, evalRow(a, &mod, batch, 0));
 
-    // Float lanes follow IEEE: 6 / 0.0 is inf, and null still propagates.
     var fzero = ast.Expr{ .float_lit = 0.0 };
     var fdiv = ast.Expr{ .binary = .{ .op = .div, .l = &fx, .r = &fzero } };
     const out = try evalColumn(a, &fdiv, batch, Type.init(.float).asNullable());

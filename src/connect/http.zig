@@ -81,7 +81,6 @@ pub fn repairBundle(gpa: std.mem.Allocator, bundle: *std.crypto.Certificate.Bund
                 cap.used[i] = true;
                 continue;
             };
-            // Only admit certs whose issuer is already trusted.
             bundle.verify(parsed, now) catch continue;
             const start: u32 = @intCast(bundle.bytes.items.len);
             bundle.bytes.appendSlice(gpa, der) catch return added_any;
@@ -131,17 +130,17 @@ pub const KV = struct { key: []const u8, value: []const u8 };
 pub const ConnConfig = struct {
     base_url: []const u8 = "",
     auth: AuthKind = .none,
-    token: []const u8 = "", // bearer
-    user: []const u8 = "", // basic / oauth2 client_id
-    password: []const u8 = "", // basic / oauth2 client_secret
-    header_name: []const u8 = "", // header kind
+    token: []const u8 = "",
+    user: []const u8 = "",
+    password: []const u8 = "",
+    header_name: []const u8 = "",
     header_value: []const u8 = "",
-    login_url: []const u8 = "", // login_json / oauth2 (absolute or base_url-relative)
-    scope: []const u8 = "", // oauth2, optional
-    body: []const KV = &.{}, // login_json: the POSTed JSON object's fields
-    token_path: []const u8 = "", // dotted path to the token; "" = kind default
+    login_url: []const u8 = "",
+    scope: []const u8 = "",
+    body: []const KV = &.{},
+    token_path: []const u8 = "",
     token_header: []const u8 = "Authorization",
-    token_prefix: ?[]const u8 = null, // null = kind default ("" / "Bearer ")
+    token_prefix: ?[]const u8 = null,
 };
 
 /// Build a ConnConfig from resolved (string) connection attrs. `body_<field>`
@@ -357,22 +356,22 @@ pub fn initClient(gpa: std.mem.Allocator) std.http.Client {
 pub const Mode = enum { none, page, offset, cursor };
 
 pub const Options = struct {
-    bearer: ?[]const u8 = null, // literal token
-    bearer_env: ?[]const u8 = null, // env var holding the token
-    auth: ?[]const u8 = null, // literal raw Authorization header value
-    auth_env: ?[]const u8 = null, // env var holding the raw Authorization value
-    user_env: ?[]const u8 = null, // basic auth env vars
+    bearer: ?[]const u8 = null,
+    bearer_env: ?[]const u8 = null,
+    auth: ?[]const u8 = null,
+    auth_env: ?[]const u8 = null,
+    user_env: ?[]const u8 = null,
     pass_env: ?[]const u8 = null,
-    header: ?[]const u8 = null, // one extra raw "Name: value" header
-    items: ?[]const u8 = null, // dotted path to the row array in the response
+    header: ?[]const u8 = null,
+    items: ?[]const u8 = null,
     method: enum { get, post } = .get,
     /// POST body sent with every page. With page/offset pagination the page
     /// param is appended to the BODY (`&<page_param>=N`), not the URL — the
     /// form-style APIs that want POST paginate in the body.
     body: ?[]const u8 = null,
-    body_type: []const u8 = "form", // form -> x-www-form-urlencoded, json -> application/json
+    body_type: []const u8 = "form",
     paginate: Mode = .none,
-    page_param: []const u8 = "page", // page number (page mode) or offset (offset mode) param
+    page_param: []const u8 = "page",
     start_page: i64 = 1,
     start_offset: i64 = 0,
     size_param: ?[]const u8 = null,
@@ -387,7 +386,7 @@ pub const Options = struct {
     /// Transient failures (429/5xx, connection resets) retry in place with
     /// exponential backoff + jitter, like any robust extraction client. Without
     /// this, one blip at page 400k of a long backfill restarts the whole run.
-    retries: i64 = 2, // extra attempts per request (3 total, matching common practice)
+    retries: i64 = 2,
     retry_base_ms: i64 = 500,
     /// Per-page deadline (ms) for page fetches (both sequential and prefetched
     /// paths); 0 disables. A request
@@ -495,28 +494,28 @@ pub fn optsFromHints(hints: []const ast.Hint) Options {
 }
 
 pub const HttpSource = struct {
-    arena: std.mem.Allocator, // run arena: self, schema, headers, first page
-    gpa: std.mem.Allocator, // worker page bodies (freed after each batch)
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     /// gpa-allocated (not in the run arena): an abandoned worker may still be
     /// using it after the run's arena is freed.
     client: *std.http.Client,
-    zombies: usize = 0, // abandoned (timed-out) workers still in flight
+    zombies: usize = 0,
     base_url: []const u8,
     opts: Options,
     headers: []const std.http.Header,
     schema: *types.Schema,
-    first: ?Batch, // built at open() so the schema is known up front
+    first: ?Batch,
     page_no: i64,
-    next_url: ?[]const u8 = null, // cursor mode: resolved next request URL
+    next_url: ?[]const u8 = null,
     pages_fetched: i64 = 0,
     done: bool = false,
-    repaired: bool = false, // one trust-repair attempt per source
-    auth: ?*AuthState = null, // connection-level auth (read http URL form: null)
-    slots: std.array_list.Managed(*Slot) = undefined, // in-flight prefetched pages, FIFO
+    repaired: bool = false,
+    auth: ?*AuthState = null,
+    slots: std.array_list.Managed(*Slot) = undefined,
     pages_issued: i64 = 0,
     issue_done: bool = false,
-    auth_gen: u32 = 0, // bumped on re-login so stale-token slots retry without a second login
-    total_pages: ?i64 = null, // from total_field on the first response
+    auth_gen: u32 = 0,
+    total_pages: ?i64 = null,
     /// Set by the runtime after open(): heartbeats go through the structured
     /// logger (JSON-safe, level-gated). Null (tests/probes) falls back to stderr.
     logger: ?*obs.Logger = null,
@@ -533,10 +532,10 @@ pub const HttpSource = struct {
     const Slot = struct {
         state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(SlotState.running)),
         gpa: std.mem.Allocator,
-        snap: std.heap.ArenaAllocator, // owns url/req_body/hdrs/body below
+        snap: std.heap.ArenaAllocator,
         client: *std.http.Client,
         method_post: bool,
-        content_type: ?[]const u8, // static string
+        content_type: ?[]const u8,
         url: []const u8,
         req_body: ?[]const u8 = null,
         hdrs: [12]std.http.Header = undefined,
@@ -564,9 +563,6 @@ pub const HttpSource = struct {
     /// connection's base_url, and the connection's auth kind applies (with
     /// mid-run re-login for session kinds).
     pub fn openConn(arena: std.mem.Allocator, gpa: std.mem.Allocator, cc: ConnConfig, path: []const u8, opts: Options) !*HttpSource {
-        // A line break in the URL is always an accident (an editor or terminal
-        // hard-wrapped the script line mid-string); fail with a name that says
-        // so rather than sending a corrupt request.
         if (std.mem.indexOfAny(u8, path, "\r\n") != null) return error.UrlContainsLineBreak;
         const url = try encodeSpaces(arena, try joinUrl(arena, cc.base_url, path));
         const client = try gpa.create(std.http.Client);
@@ -579,8 +575,6 @@ pub const HttpSource = struct {
         self.* = .{
             .arena = arena,
             .gpa = gpa,
-            // The client allocator must be thread-safe (prefetch workers share
-            // the client and its connection pool); the run arena is not.
             .client = client,
             .base_url = url,
             .auth = null,
@@ -594,7 +588,6 @@ pub const HttpSource = struct {
         self.slots = std.array_list.Managed(*Slot).init(gpa);
         if (cc.auth != .none) {
             var rcc = cc;
-            // The login endpoint may be base_url-relative; resolve it once here.
             rcc.login_url = try joinUrl(arena, cc.base_url, cc.login_url);
             const a = try arena.create(AuthState);
             a.* = .{ .arena = arena, .cc = rcc, .logger = opts.logger };
@@ -683,8 +676,6 @@ pub const HttpSource = struct {
                     self.done = true;
                     return;
                 }
-                // Cursor values live in the page arena (freed after the batch), so
-                // the next URL is duped into the run arena to survive the reset.
                 if (std.mem.startsWith(u8, tok, "http://") or std.mem.startsWith(u8, tok, "https://")) {
                     self.next_url = try self.arena.dupe(u8, tok);
                 } else {
@@ -712,7 +703,6 @@ pub const HttpSource = struct {
                 var buf: [32]u8 = undefined;
                 const n = try std.fmt.bufPrint(&buf, "{d}", .{self.page_no});
                 if (self.opts.method == .post) {
-                    // POST APIs paginate in the form body, not the query string.
                     var body = try appendParam(arena, self.opts.body orelse "", self.opts.page_param, n);
                     if (self.opts.size_param) |sp| {
                         const sz = try std.fmt.bufPrint(&buf, "{d}", .{self.opts.page_size});
@@ -745,28 +735,18 @@ pub const HttpSource = struct {
                     std.Thread.sleep(retryDelayNs(self.opts.retry_base_ms, attempt));
                     continue;
                 }
-                // Exhausted: classify HERE, where we know the peer was a network
-                // socket — the run-level classifier must not treat the ambient
-                // std.Io names (WriteFailed et al) as transient globally.
                 return mapTransport(e);
             };
         }
     }
 
     fn fetchOnce(self: *HttpSource, arena: std.mem.Allocator, req: PageReq) ![]const u8 {
-        // Pages on slow APIs run tens of seconds; honoring an abort here caps
-        // cancellation latency at one in-flight request instead of a whole run.
         if (driver.aborting()) return error.Aborted;
         return self.rawOrTimed(arena, req) catch |e| switch (e) {
-            // Likely a misordered server chain: rebuild trust from the chain
-            // itself (repairBundle) and retry once.
             error.TlsInitializationFailed => {
                 if (!self.tryRepair(req.url)) return e;
                 return self.rawOrTimed(arena, req);
             },
-            // Session expired mid-pull: session auth kinds re-login and the
-            // page is retried once; static kinds surface the 401. A 401 in
-            // retry_statuses still maps to transient when auth declines it.
             error.HttpUnauthorized => {
                 const a = self.auth orelse return self.listedFallback(401, e);
                 if (!a.refresh(self.client)) return self.listedFallback(401, e);
@@ -786,7 +766,7 @@ pub const HttpSource = struct {
         const url_copy = arena.dupe(u8, slot.url) catch "";
         self.awaitSlot(slot) catch |e| {
             obs.logOr(self.logger, .warn, "page fetch abandoned ({s}): {s}", .{ @errorName(e), url_copy });
-            return e; // slot now belongs to its worker — do not free or touch
+            return e;
         };
         defer freeSlot(slot);
         if (slot.err) |e| return e;
@@ -813,7 +793,6 @@ pub const HttpSource = struct {
     /// Spawn a worker for the next page; page bookkeeping happens at issue time
     /// (the sequential path does it at consume time via advance()).
     fn issueSlot(self: *HttpSource) !void {
-        // total_field: page 1 came from open(); never issue past page `total`.
         if (self.total_pages) |t| {
             if (1 + self.pages_issued >= t) {
                 self.issue_done = true;
@@ -821,8 +800,6 @@ pub const HttpSource = struct {
             }
         }
         if (self.pages_issued + 1 >= self.opts.max_pages) self.issue_done = true;
-        // Reserve the list space first: once the worker is spawned and detached,
-        // no error path may free the slot (the state CAS owns that decision).
         try self.slots.ensureUnusedCapacity(1);
         const slot = try self.spawnSlot();
         self.slots.appendAssumeCapacity(slot);
@@ -859,7 +836,7 @@ pub const HttpSource = struct {
             .retries = retries,
             .retry_base_ms = self.opts.retry_base_ms,
         };
-        errdefer freeSlot(slot); // safe: fires only before the thread exists
+        errdefer freeSlot(slot);
         const sa = slot.snap.allocator();
         slot.url = try sa.dupe(u8, req.url);
         if (req.body) |b| slot.req_body = try sa.dupe(u8, b);
@@ -912,7 +889,6 @@ pub const HttpSource = struct {
                 break;
             };
             const code = @intFromEnum(res.status);
-            // Retry transient statuses in-thread too (worker = its own backoff).
             if ((code == 429 or code >= 500 or (code != 401 and statusListed(slot.retry_statuses, code))) and attempt < slot.retries and !driver.aborting()) {
                 attempt += 1;
                 std.Thread.sleep(retryDelayNs(slot.retry_base_ms, attempt));
@@ -931,7 +907,6 @@ pub const HttpSource = struct {
             .acq_rel,
             .acquire,
         ) != null) {
-            // Consumer abandoned us at the deadline: nobody else will.
             freeSlot(slot);
         }
     }
@@ -960,7 +935,7 @@ pub const HttpSource = struct {
                     self.zombies += 1;
                     return if (driver.aborting()) error.Aborted else error.ConnectionTimedOut;
                 }
-                return; // raced: the worker just finished — take the result
+                return;
             }
             std.Thread.sleep(25 * std.time.ns_per_ms);
         }
@@ -1001,12 +976,10 @@ pub const HttpSource = struct {
             return null;
         }
         const slot = self.slots.orderedRemove(0);
-        // After an abandon CAS the worker owns (and may free) the slot — only a
-        // pre-made copy of the URL is safe to reference in error reporting.
         const url_copy = arena.dupe(u8, slot.url) catch "";
         self.awaitSlot(slot) catch |e| {
             obs.logOr(self.logger, .warn, "page fetch abandoned ({s}): {s}", .{ @errorName(e), url_copy });
-            return e; // slot now belongs to its worker — do not free or touch
+            return e;
         };
         defer freeSlot(slot);
         if (slot.err) |e| {
@@ -1014,8 +987,6 @@ pub const HttpSource = struct {
             return mapTransport(e);
         }
         if (slot.code == 401) {
-            // Stale token (gen behind) just re-fetches; a current-gen 401 means
-            // the session expired — session auths re-login once.
             const a = self.auth orelse return self.listedFallback(401, error.HttpUnauthorized);
             if (slot.gen >= self.auth_gen) {
                 if (!a.refresh(self.client)) return self.listedFallback(401, error.HttpUnauthorized);
@@ -1027,8 +998,6 @@ pub const HttpSource = struct {
         }
         if (slot.code == 204) return self.finishEmpty();
         if (slot.code != 200) return self.raiseStatus(slot.code, slot.url, slot.body);
-        // Parsed JSON slices into the source text, so the body must move into
-        // the batch arena before the gpa copy is freed.
         return self.consumeBody(arena, try arena.dupe(u8, slot.body));
     }
 
@@ -1042,8 +1011,6 @@ pub const HttpSource = struct {
         self.noteProgress(items.len);
         const batch = try request.batchFromJson(arena, self.schema, items);
         if (self.opts.stop_short and items.len < self.opts.page_size) {
-            // Short page = end of data: stop issuing and discard in-flight pages
-            // (they'd come back empty), but still yield this final batch.
             self.issue_done = true;
             self.drainSlots();
             self.done = true;
@@ -1071,8 +1038,6 @@ pub const HttpSource = struct {
             .response_writer = &aw.writer,
         });
         const code = @intFromEnum(res.status);
-        // 204 = no content: some OData servers (e.g. Ivanti) signal "past the
-        // end of the dataset" this way instead of an empty `value` array.
         if (code == 204) return "";
         if (code != 200) return self.raiseStatus(code, req.url, aw.writer.buffered());
         return aw.writer.buffered();
@@ -1114,8 +1079,6 @@ pub const HttpSource = struct {
             self.client.deinit();
             self.gpa.destroy(self.client);
         } else {
-            // Abandoned workers may still touch the client's pool; leaking it
-            // is the only safe option (the zombies die with the process).
             obs.logOr(self.logger, .warn, "http: {d} timed-out request(s) abandoned; client leaked intentionally", .{self.zombies});
         }
     }
@@ -1255,7 +1218,7 @@ fn retryDelayNs(base_ms: i64, attempt: i64) u64 {
     const d = base * (@as(u64, 1) << shift);
     var x: u64 = @bitCast(std.time.microTimestamp());
     x = x *% 6364136223846793005 +% 1442695040888963407;
-    const j = 70 + (x >> 33) % 61; // 70..130 percent
+    const j = 70 + (x >> 33) % 61;
     return d * j / 100 * std.time.ns_per_ms;
 }
 
@@ -1272,8 +1235,6 @@ fn srcClose(ptr: *anyopaque) void {
     const self: *HttpSource = @ptrCast(@alignCast(ptr));
     self.close();
 }
-
-// --- tests ----------------------------------------------------------------
 
 test "optsFromHints maps hint keys" {
     const hints = [_]ast.Hint{
@@ -1295,9 +1256,9 @@ test "optsFromHints maps hint keys" {
 const TestServer = struct {
     listener: std.net.Server,
     responses: []const []const u8,
-    statuses: ?[]const []const u8 = null, // per-response status lines; null = all "200 OK"
-    route_div: ?i64 = null, // route by $skip/div (prefetch arrives out of order)
-    expected: ?usize = null, // connections to serve; default responses.len
+    statuses: ?[]const []const u8 = null,
+    route_div: ?i64 = null,
+    expected: ?usize = null,
     captured: [4][2048]u8 = undefined,
     captured_len: [4]usize = .{ 0, 0, 0, 0 },
 
@@ -1328,7 +1289,6 @@ const TestServer = struct {
             var body: []const u8 = undefined;
             var status: []const u8 = "200 OK";
             if (self.route_div) |div| {
-                // prefetch issues pages concurrently; route by the $skip value
                 var skip: i64 = 0;
                 if (std.mem.indexOf(u8, req_buf[0..req_len], "$skip=")) |at| {
                     var j = at + "$skip=".len;
@@ -1400,7 +1360,6 @@ test "http source: page pagination stops on empty page" {
     const s = try HttpSource.open(a, std.testing.allocator, url, .{ .items = "data", .paginate = .page });
     defer s.close();
     try std.testing.expectEqual(@as(usize, 3), try drain(s, a));
-    // page numbers advanced in the query string
     try std.testing.expect(std.mem.indexOf(u8, srv.captured[0][0..srv.captured_len[0]], "GET /items?page=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, srv.captured[1][0..srv.captured_len[1]], "GET /items?page=2") != null);
     try std.testing.expect(std.mem.indexOf(u8, srv.captured[2][0..srv.captured_len[2]], "GET /items?page=3") != null);
@@ -1437,7 +1396,6 @@ test "http source: offset pagination advances $skip by page_size, raw auth sent"
     try std.testing.expect(std.mem.indexOf(u8, srv.captured[0][0..srv.captured_len[0]], "$top=2") != null);
     try std.testing.expect(std.mem.indexOf(u8, srv.captured[1][0..srv.captured_len[1]], "$skip=2") != null);
     try std.testing.expect(std.mem.indexOf(u8, srv.captured[2][0..srv.captured_len[2]], "$skip=4") != null);
-    // raw Authorization value, no "Bearer " prefix
     try std.testing.expect(std.mem.indexOf(u8, srv.captured[0][0..srv.captured_len[0]], "Authorization: session-tok-xyz") != null);
 }
 
@@ -1596,7 +1554,7 @@ test "http source: prefetch fetches pages concurrently and stops on empty" {
         "[]",
     });
     srv.route_div = 2;
-    srv.expected = 5; // open(skip0) + slots skip2,4,6 + top-up skip8
+    srv.expected = 5;
     defer srv.deinit();
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
     defer th.join();
@@ -1626,8 +1584,6 @@ test "http source: stop_short ends after a short page (no trailing empty fetch)"
     defer ar.deinit();
     const a = ar.allocator();
 
-    // Only two responses served; without stop_short the source would issue a
-    // third request and this test would hang on the closed listener.
     const srv = try TestServer.start(&.{
         \\[{"id":1},{"id":2}]
         ,
@@ -1664,11 +1620,10 @@ test "abort flag stops pagination between page requests" {
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{ .paginate = .page });
     defer s.close();
-    _ = (try s.next(a)).?; // first page, fetched at open
+    _ = (try s.next(a)).?;
 
     driver.requestAbort();
     defer driver.resetAbort();
-    // would otherwise issue the page-2 request; the abort check fires first
     try std.testing.expectError(error.Aborted, s.next(a));
 }
 
@@ -1704,7 +1659,6 @@ test "http source: POST form body carries pagination, content-type set" {
     try std.testing.expect(std.mem.indexOf(u8, r1, "user=u&token=t&pag=ponto&cmd=get&page=1") != null);
     const r2 = srv.captured[1][0..srv.captured_len[1]];
     try std.testing.expect(std.mem.indexOf(u8, r2, "&page=2") != null);
-    // URL stays clean: pagination went to the body, not the query string
     try std.testing.expect(std.mem.indexOf(u8, r1, "/rest?") == null);
 }
 
@@ -1713,8 +1667,6 @@ test "http source: total_field bounds the page count exactly" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    // Only 2 responses served; the source must not request page 3 even though
-    // page 2 is non-empty (this API style never returns an empty page).
     const srv = try TestServer.start(&.{
         \\{"totalCount":2,"itens":[{"id":1},{"id":2}]}
         ,
@@ -1790,7 +1742,6 @@ test "statusListed parses comma lists with spaces" {
 }
 
 fn serveOneThenHang(listener: *std.net.Server) void {
-    // page 1: normal response; page 2: accept, read, never answer (black hole)
     const body = "[{\"id\":1}]";
     {
         const conn = listener.accept() catch return;
@@ -1804,7 +1755,7 @@ fn serveOneThenHang(listener: *std.net.Server) void {
     const conn = listener.accept() catch return;
     var rb: [2048]u8 = undefined;
     _ = conn.stream.read(&rb) catch return;
-    std.Thread.sleep(10 * std.time.ns_per_s); // hold it open, silent
+    std.Thread.sleep(10 * std.time.ns_per_s);
     conn.stream.close();
 }
 
@@ -1820,8 +1771,6 @@ test "a black-holed page request times out instead of hanging the run" {
     defer th.join();
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{listener.listen_address.getPort()});
-    // page_allocator (not testing.allocator): abandoning the hung worker leaks
-    // its slot + client BY DESIGN; the leak checker would call that a failure.
     const s = try HttpSource.open(a, std.heap.page_allocator, url, .{
         .paginate = .page,
         .prefetch = 2,
@@ -1829,7 +1778,7 @@ test "a black-holed page request times out instead of hanging the run" {
         .timeout_ms = 400,
     });
     defer s.close();
-    _ = (try s.next(a)).?; // page 1, fetched at open
+    _ = (try s.next(a)).?;
     const started = std.time.milliTimestamp();
     try std.testing.expectError(error.ConnectionTimedOut, s.next(a));
     const waited = std.time.milliTimestamp() - started;
@@ -1898,7 +1847,6 @@ test "statusError names each status family distinctly" {
     try std.testing.expectEqual(error.HttpForbidden, statusError(403));
     try std.testing.expectEqual(error.HttpNotFound, statusError(404));
     try std.testing.expectEqual(error.HttpRequestFailed, statusError(418));
-    // transient family: 429 and every 5xx map to the retryable name
     try std.testing.expectEqual(error.HttpServerBusy, statusError(429));
     try std.testing.expectEqual(error.HttpServerBusy, statusError(500));
     try std.testing.expectEqual(error.HttpServerBusy, statusError(503));
@@ -1914,8 +1862,8 @@ test "jsonPath walks dotted paths; null and missing are both absent" {
     try std.testing.expectEqualStrings("tok", jsonPath(root, "meta.next").?.string);
     try std.testing.expectEqual(@as(i64, 3), jsonPath(root, "meta.total").?.integer);
     try std.testing.expect(jsonPath(root, "meta.missing") == null);
-    try std.testing.expect(jsonPath(root, "meta.gone") == null); // JSON null == absent
-    try std.testing.expect(jsonPath(root, "data.next") == null); // array is not an object
+    try std.testing.expect(jsonPath(root, "meta.gone") == null);
+    try std.testing.expect(jsonPath(root, "data.next") == null);
 }
 
 test "itemsOf: bare array, dotted path, and named errors" {
@@ -1933,7 +1881,6 @@ test "itemsOf: bare array, dotted path, and named errors" {
     try std.testing.expectError(error.ItemsFieldMissing, itemsOf(a, wrapped, "result.nope"));
     try std.testing.expectError(error.ItemsFieldNotArray, itemsOf(a, wrapped, "result"));
 
-    // a single object with no path is one row
     const one = try json.parseFromSliceLeaky(json.Value, a, "{\"id\":9}", .{});
     try std.testing.expectEqual(@as(usize, 1), (try itemsOf(a, one, null)).len);
     const scalar = try json.parseFromSliceLeaky(json.Value, a, "5", .{});
@@ -1951,13 +1898,11 @@ test "withParam and appendParam pick the right separator" {
 }
 
 test "retryDelayNs: exponential base doubling within the +-30% jitter band" {
-    // attempt 1 -> base, attempt 3 -> 4x base; jitter stays within 70..130%.
     const base_ms: i64 = 100;
     const a1 = retryDelayNs(base_ms, 1);
     try std.testing.expect(a1 >= 70 * std.time.ns_per_ms and a1 <= 130 * std.time.ns_per_ms);
     const a3 = retryDelayNs(base_ms, 3);
     try std.testing.expect(a3 >= 280 * std.time.ns_per_ms and a3 <= 520 * std.time.ns_per_ms);
-    // the shift is capped, so huge attempt numbers can't overflow into 0
     const a99 = retryDelayNs(base_ms, 99);
     try std.testing.expect(a99 >= 4480 * std.time.ns_per_ms and a99 <= 8320 * std.time.ns_per_ms);
 }

@@ -26,11 +26,6 @@ fn fail(diag: *Diag, comptime fmt: []const u8, args: anytype) error{AnalyzeFaile
     return error.AnalyzeFailed;
 }
 
-// ---------------------------------------------------------------------------
-// Shared per-stage schema resolution (the single source of truth used by both
-// this analyzer and the executor in run.zig, so type/schema semantics can't drift)
-// ---------------------------------------------------------------------------
-
 /// Param name → the literal expression it substitutes to (CLI values for the
 /// executor; declared defaults for offline analysis). Deliberately NOT a `pub`
 /// named alias — re-exporting a StringHashMap type makes `refAllDeclsRecursive`
@@ -48,14 +43,11 @@ fn substRecur(ctx: SubstCtx, e: *const ast.Expr) Error!*ast.Expr {
 
 pub fn substExpr(arena: std.mem.Allocator, expr: *const ast.Expr, params: *const ParamMap) Error!*const ast.Expr {
     if (params.count() == 0) return expr;
-    // Special case: a single-name field that names a param becomes its literal.
     if (expr.* == .field) {
         const q = expr.field;
         if (q.parts.len == 1) if (params.get(q.parts[0])) |lit| return lit;
         return expr;
     }
-    // Everything else: structural recursion shared with the other passes — every
-    // child is itself substituted, every own field copied (see ast.rebuildExpr).
     return ast.rebuildExpr(arena, expr, SubstCtx{ .arena = arena, .params = params }, substRecur);
 }
 
@@ -94,9 +86,6 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
                 return fail(diag, "unknown rename field `{s}`", .{r.from});
             for (in.fields, 0..) |f, idx| {
                 const nm = renameTo(renames, f.name) orelse f.name;
-                // Reject a name that collides with an earlier output column (two
-                // renames to the same target, or a rename onto an existing column) —
-                // duplicates would silently confuse name-keyed writers/upserts.
                 for (in.fields[0..idx]) |g|
                     if (std.mem.eql(u8, nm, renameTo(renames, g.name) orelse g.name))
                         return fail(diag, "`* rename` produces duplicate column `{s}`", .{nm});
@@ -232,13 +221,9 @@ fn typedZero(arena: std.mem.Allocator, ty: types.Type) Error!*const ast.Expr {
     return e;
 }
 
-// ---------------------------------------------------------------------------
-// Plan IR
-// ---------------------------------------------------------------------------
-
 pub const Source = struct {
-    connector: []const u8, // driver type: csv / request / postgres / ...
-    detail: []const u8, // path, `table X`, `query`, or `binding X`
+    connector: []const u8,
+    detail: []const u8,
     /// Resolved column schema, or null when it needs a live connection.
     schema: ?types.Schema = null,
     /// The predicate translated down into the source query (§7 implicit
@@ -250,29 +235,29 @@ pub const Source = struct {
 pub const Sink = struct {
     connector: []const u8,
     target: []const u8,
-    mode: []const u8, // default / append / overwrite / upsert
+    mode: []const u8,
 };
 
 pub const Stage = struct {
-    kind: []const u8, // filter / select / limit / distinct / sort / aggregate / join / explode
+    kind: []const u8,
     detail: []const u8,
-    breaker: bool, // materializes its whole input (sort/aggregate/join/distinct)
+    breaker: bool,
     /// Output schema after this stage — filled by the type-flow layer (later).
     out_schema: ?types.Schema = null,
 };
 
 /// Result of probing a splittable table for its key + estimated size (`--connect`).
 pub const SplitProbe = struct {
-    key: []const u8, // discovered key column, or "" if none
+    key: []const u8,
     est_rows: i64,
-    will_split: bool, // key found AND big enough for the size gate
+    will_split: bool,
 };
 
 pub const Physical = struct {
-    has_breaker: bool, // a materializing stage → not splittable, O(dataset) memory
-    splittable: bool, // SQL source + map-only chain → split-parallel candidate
-    sink_parallel: bool, // StarRocks / SQL sink → per-lane writes under -j
-    split_probe: ?SplitProbe = null, // the real decision, when --connect probed it
+    has_breaker: bool,
+    splittable: bool,
+    sink_parallel: bool,
+    split_probe: ?SplitProbe = null,
 };
 
 pub const Output = struct {
@@ -283,7 +268,7 @@ pub const Output = struct {
 };
 
 pub const Plan = struct {
-    kind: []const u8, // batch / http / stream
+    kind: []const u8,
     outputs: []const Output,
 };
 
@@ -295,10 +280,6 @@ pub const Resolver = struct {
     /// Optional: probe a splittable table for its real key + size (the physical plan).
     splitFn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, read: ast.Read, conn: ?ast.Connection) anyerror!?SplitProbe = null,
 };
-
-// ---------------------------------------------------------------------------
-// Analysis
-// ---------------------------------------------------------------------------
 
 /// Collect every output pipeline reachable in a statement block (a `for` or
 /// `match` arm body), descending through nested `for`/`match` so all branches
@@ -329,20 +310,13 @@ pub fn analyze(arena: std.mem.Allocator, raw_program: ast.Program, resolver: ?Re
         .binding => |b| try bindings.put(b.name, b.pipeline),
         .connection => |c| try connections.put(c.name, c),
         .output => |p| try outputs.append(p),
-        // A for-each contributes the output pipelines in its body for validation;
-        // `${var}` placeholders ride through as literal text (DB source schemas stay
-        // unresolved offline, so they don't false-error — same as a normal DB read).
         .for_each => |fe| try collectStmtOutputs(&outputs, fe.body),
-        // Validate the output pipelines inside match arm bodies. Which arm fires is
-        // plan-time, so all arms' pipelines are checked.
         .match => |m| for (m.arms) |arm| try collectStmtOutputs(&outputs, arm.body),
         .param, .kind, .func => {},
     };
     if (outputs.items.len == 0)
         return fail(diag, "no output pipeline (a pipeline ending in `write`)", .{});
 
-    // Substitution map for type-flow: param name → its default (or a typed zero
-    // for required params — only the type matters for checking).
     var params_map = ParamMap.init(arena);
     for (program.stmts) |s| if (s == .param) {
         const p = s.param;
@@ -373,9 +347,6 @@ const Ctx = struct {
 
         var source = try self.resolveSource(stages[0]);
 
-        // §7 implicit pushdown preview: the contiguous filter prefix that would
-        // descend into a SQL source query (same translator the runtime uses),
-        // AND-ed with any raw PUSHDOWN/@[where] fragment on the read.
         if (stages[0].node == .read) {
             const rd = stages[0].node.read;
             if ((rd.form == .table or rd.form == .query))
@@ -394,13 +365,13 @@ const Ctx = struct {
         var stage_infos = std.array_list.Managed(Stage).init(self.arena);
         var has_breaker = false;
         var map_only = true;
-        var cur: ?types.Schema = source.schema; // type flow; null once unresolvable
+        var cur: ?types.Schema = source.schema;
         for (stages[1 .. stages.len - 1]) |st| {
             var si = try self.stageInfo(st);
             if (si.breaker) has_breaker = true;
             if (!isMapStage(st.node)) map_only = false;
             if (cur) |c| {
-                cur = try self.propagate(c, st.node); // type-checks; fails on a real type error
+                cur = try self.propagate(c, st.node);
                 si.out_schema = cur;
             }
             try stage_infos.append(si);
@@ -413,7 +384,6 @@ const Ctx = struct {
         const sink_is_parallel = isSqlConnector(sink.connector) or std.mem.eql(u8, sink.connector, "starrocks");
         const splittable = src_is_sql and map_only and splittableRead(stages[0].node);
 
-        // Under --connect, probe the real split decision (key + estimated rows).
         var probe: ?SplitProbe = null;
         if (splittable) {
             if (self.resolver) |r| if (r.splitFn) |f| {
@@ -449,7 +419,6 @@ const Ctx = struct {
                     .request => "request",
                     .buffer => |b| try std.fmt.allocPrint(self.arena, "buffer {s}", .{b.name}),
                 };
-                // CSV resolves locally; a resolver (e.g. `--connect`) fills DB sources.
                 var schema = offlineSchema(self.arena, rd);
                 if (schema == null) {
                     if (self.resolver) |r| schema = r.resolveFn(r.ctx, self.arena, rd, conn) catch null;
@@ -459,9 +428,6 @@ const Ctx = struct {
             .ref => |name| {
                 const b = self.bindings.get(name) orelse
                     return fail(self.diag, "unknown binding `{s}`", .{name});
-                // Follow the binding to its own leading source, then flow the binding's
-                // own stages so the referrer sees the binding's OUTPUT schema (not its
-                // raw leading source) — matching what the executor builds.
                 var src = try self.resolveSource(b.stages[0]);
                 if (src.schema) |s0| {
                     var cur: ?types.Schema = s0;
@@ -474,8 +440,6 @@ const Ctx = struct {
                 return src;
             },
             .union_ => |un| {
-                // Reconciliation needs each branch's schema (DB → connect to resolve),
-                // so offline the unified schema is left unresolved for now.
                 const detail = if (un.discover_query.len > 0)
                     try std.fmt.allocPrint(self.arena, "union (tables discovered from {s})", .{un.discover_conn})
                 else
@@ -487,7 +451,6 @@ const Ctx = struct {
     }
 
     fn resolveSink(self: *Ctx, w: ast.Write) !Sink {
-        // Built-in sinks need no `connection` declaration.
         if (std.mem.eql(u8, w.connector, "csv") or std.mem.eql(u8, w.connector, "stdout")) {
             return .{ .connector = w.connector, .target = w.target, .mode = @tagName(w.mode) };
         }
@@ -518,7 +481,7 @@ const Ctx = struct {
             },
             .explode => |ex| return (try explodePlan(self.arena, in, ex, self.diag)).schema,
             .aggregate => |ag| return (try aggregatePlan(self.arena, in, ag, self.params, self.diag)).schema,
-            .join => return null, // right side unresolved in offline analysis
+            .join => return null,
             else => return null,
         }
     }
@@ -559,10 +522,6 @@ const Ctx = struct {
         return buf.toOwnedSlice();
     }
 };
-
-// ---------------------------------------------------------------------------
-// Rendering (for `pipeline check --show-plan`)
-// ---------------------------------------------------------------------------
 
 pub fn render(plan: Plan, w: anytype) !void {
     try w.print("@{s}\n", .{plan.kind});
@@ -617,10 +576,6 @@ fn printSchema(w: anytype, indent: []const u8, schema: ?types.Schema) !void {
     try w.writeAll("\n");
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 fn isBuiltinSource(connector: []const u8) bool {
     return std.mem.eql(u8, connector, "csv") or std.mem.eql(u8, connector, "request") or
         std.mem.eql(u8, connector, "http") or std.mem.eql(u8, connector, "buffer");
@@ -660,7 +615,7 @@ fn splittableRead(node: ast.Stage.Node) bool {
     return switch (node) {
         .read => |rd| switch (rd.form) {
             .table => true,
-            .query => false, // needs @[split] hint — confirmed on the stage at run time
+            .query => false,
             else => false,
         },
         else => false,
@@ -670,8 +625,6 @@ fn splittableRead(node: ast.Stage.Node) bool {
 /// Offline schema resolution: CSV header is local; everything else is unresolved.
 fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read) ?types.Schema {
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
-        // URL CSVs are a network fetch — plain `check` stays offline (schema
-        // unknown, like DB sources without --connect); `check --connect` resolves them.
         if (csv.CsvReader.isUrl(rd.form.path)) return null;
         const reader = csv.CsvReader.open(arena, rd.form.path) catch return null;
         const schema = reader.schema;
@@ -684,10 +637,6 @@ fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read) ?types.Schema {
 fn lastPart(q: ast.QualName) []const u8 {
     return q.parts[q.parts.len - 1];
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 const parser = @import("../lang/sql_parser.zig");
 
@@ -718,13 +667,13 @@ test "analyze a CSV map pipeline: structure, offline schema, physical" {
     try std.testing.expectEqual(@as(usize, 1), plan.outputs.len);
     const o = plan.outputs[0];
     try std.testing.expectEqualStrings("csv", o.source.connector);
-    try std.testing.expect(o.source.schema != null); // CSV resolves offline
+    try std.testing.expect(o.source.schema != null);
     try std.testing.expectEqual(@as(usize, 2), o.source.schema.?.fields.len);
     try std.testing.expectEqual(@as(usize, 2), o.stages.len);
     try std.testing.expectEqualStrings("filter", o.stages[0].kind);
     try std.testing.expectEqualStrings("select", o.stages[1].kind);
     try std.testing.expect(!o.physical.has_breaker);
-    try std.testing.expect(!o.physical.splittable); // CSV is not a SQL source
+    try std.testing.expect(!o.physical.splittable);
 }
 
 test "analyze a SQL table pipeline: unresolved schema offline, split candidate" {
@@ -741,9 +690,8 @@ test "analyze a SQL table pipeline: unresolved schema offline, split candidate" 
     const plan = try analyze(a, prog, null, &diag);
     const o = plan.outputs[0];
     try std.testing.expectEqualStrings("postgres", o.source.connector);
-    try std.testing.expect(o.source.schema == null); // DB needs --connect
-    try std.testing.expect(o.physical.splittable); // SQL table, map-only
-    // §7 implicit pushdown preview: the filter descends into the source query.
+    try std.testing.expect(o.source.schema == null);
+    try std.testing.expect(o.physical.splittable);
     try std.testing.expectEqualStrings("(\"amount\" > 0)", o.source.pushdown);
 }
 
@@ -759,7 +707,6 @@ test "analyze pushdown preview: raw PUSHDOWN AND-ed with the translated filter" 
     );
     var diag = Diag{};
     const plan = try analyze(a, prog, null, &diag);
-    // raw fragment first, then the two translated comparisons AND-ed together
     try std.testing.expectEqualStrings(
         "(D_E_L_E_T_ <> '*') AND ((([valor] > 0) AND ([status] = 'ok')))",
         plan.outputs[0].source.pushdown,
@@ -776,7 +723,7 @@ test "analyze pushdown preview: an untranslatable filter is not pushed (stays en
     );
     var diag = Diag{};
     const plan = try analyze(a, prog, null, &diag);
-    try std.testing.expectEqualStrings("", plan.outputs[0].source.pushdown); // arithmetic: not pushable
+    try std.testing.expectEqualStrings("", plan.outputs[0].source.pushdown);
 }
 
 test "type flow fills out_schema for resolved sources" {
@@ -794,7 +741,7 @@ test "type flow fills out_schema for resolved sources" {
     const sel = plan.outputs[0].stages[0];
     try std.testing.expect(sel.out_schema != null);
     try std.testing.expectEqual(@as(usize, 2), sel.out_schema.?.fields.len);
-    try std.testing.expectEqual(types.TypeKind.int, sel.out_schema.?.fields[1].ty.kind); // d = ... * 2 -> int
+    try std.testing.expectEqual(types.TypeKind.int, sel.out_schema.?.fields[1].ty.kind);
 }
 
 test "type flow catches a type error in an expression" {
@@ -806,7 +753,6 @@ test "type flow catches a type error in an expression" {
     try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,name\n1,x\n" });
     const base = try tmp.dir.realpathAlloc(a, ".");
     const in = try std.fs.path.join(a, &.{ base, "in.csv" });
-    // `NOT name` — `not` on a non-bool string is a type error, caught offline (CSV).
     const src = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS SELECT * FROM '{s}' WHERE NOT name;", .{in});
     var diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, src), null, &diag));
@@ -852,7 +798,6 @@ test "physical plan: a breaker keeps SQL serial; a query read is not split-eligi
     const a = ar.allocator();
     var diag = Diag{};
 
-    // sort is a breaker → not map-only → not splittable
     const p1 = try analyze(a, try parse(a,
         \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');
         \\LOAD INTO '/tmp/x.csv' AS SELECT * FROM pg.orders ORDER BY id;
@@ -860,8 +805,6 @@ test "physical plan: a breaker keeps SQL serial; a query read is not split-eligi
     try std.testing.expect(p1.outputs[0].physical.has_breaker);
     try std.testing.expect(!p1.outputs[0].physical.splittable);
 
-    // a `query` read has no table to introspect a key from → not split-eligible,
-    // even though the chain is map-only
     const p2 = try analyze(a, try parse(a,
         \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');
         \\LOAD INTO '/tmp/x.csv' AS SELECT * FROM pg.QUERY($$SELECT 1 AS x$$);
@@ -893,18 +836,18 @@ test "joinPlan: collision suffix `_r`, left-nullability, semi/anti drop the righ
     try std.testing.expectEqual(@as(usize, 1), inner.lk);
     try std.testing.expectEqual(@as(usize, 0), inner.rk);
     try std.testing.expectEqual(@as(usize, 4), inner.schema.fields.len);
-    try std.testing.expectEqualStrings("code_r", inner.schema.fields[2].name); // right `code` collides
+    try std.testing.expectEqualStrings("code_r", inner.schema.fields[2].name);
     try std.testing.expectEqualStrings("label", inner.schema.fields[3].name);
-    try std.testing.expect(!inner.schema.fields[3].ty.nullable); // inner: right stays non-null
+    try std.testing.expect(!inner.schema.fields[3].ty.nullable);
 
     const lj = try joinPlan(a, left, right, .{ .kind = .left, .binding = "r", .left_key = key, .right_key = key }, &diag);
     try std.testing.expect(lj.right_nullable);
     try std.testing.expect(lj.schema.fields[2].ty.nullable and lj.schema.fields[3].ty.nullable);
-    try std.testing.expect(!lj.schema.fields[0].ty.nullable); // left side untouched
+    try std.testing.expect(!lj.schema.fields[0].ty.nullable);
 
     const semi = try joinPlan(a, left, right, .{ .kind = .semi, .binding = "r", .left_key = key, .right_key = key }, &diag);
     try std.testing.expect(!semi.emit_right);
-    try std.testing.expectEqual(@as(usize, 2), semi.schema.fields.len); // left columns only
+    try std.testing.expectEqual(@as(usize, 2), semi.schema.fields.len);
 
     try std.testing.expectError(error.AnalyzeFailed, joinPlan(a, left, right, .{ .kind = .inner, .binding = "r", .left_key = .{ .parts = &.{"nope"} }, .right_key = key }, &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "unknown left join key") != null);
@@ -933,13 +876,12 @@ test "aggregatePlan: result types per function and group-key passthrough" {
     try std.testing.expectEqual(@as(usize, 0), plan.by[0]);
     const f = plan.schema.fields;
     try std.testing.expectEqual(@as(usize, 5), f.len);
-    try std.testing.expectEqual(types.TypeKind.string, f[0].ty.kind); // g rides through
-    try std.testing.expect(f[1].ty.kind == .int and !f[1].ty.nullable); // count: never null
-    try std.testing.expect(f[2].ty.kind == .int and f[2].ty.nullable); // sum(int) → int?
-    try std.testing.expect(f[3].ty.kind == .float and f[3].ty.nullable); // avg → float?
-    try std.testing.expect(f[4].ty.kind == .string and f[4].ty.nullable); // min(string) → string?
+    try std.testing.expectEqual(types.TypeKind.string, f[0].ty.kind);
+    try std.testing.expect(f[1].ty.kind == .int and !f[1].ty.nullable);
+    try std.testing.expect(f[2].ty.kind == .int and f[2].ty.nullable);
+    try std.testing.expect(f[3].ty.kind == .float and f[3].ty.nullable);
+    try std.testing.expect(f[4].ty.kind == .string and f[4].ty.nullable);
 
-    // unknown group key names the field in the error
     const bad = try a.alloc(ast.QualName, 1);
     bad[0] = .{ .parts = &.{"zzz"} };
     try std.testing.expectError(error.AnalyzeFailed, aggregatePlan(a, in, .{ .aggs = aggs, .by = bad }, &pm, &diag));
@@ -964,26 +906,23 @@ test "selectCols: `* except` drops the named columns and keeps source order" {
     try std.testing.expectEqualStrings("a", cols[0].name);
     try std.testing.expectEqualStrings("c", cols[1].name);
     try std.testing.expectEqual(@as(usize, 0), cols[0].source.passthrough);
-    try std.testing.expectEqual(@as(usize, 2), cols[1].source.passthrough); // original index, not 1
+    try std.testing.expectEqual(@as(usize, 2), cols[1].source.passthrough);
 }
 
 test "analyze rejects `* rename` onto a duplicate column name" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
-    // renaming `id` onto the existing `name` column would emit two `name` columns
     try expectAnalyzeErr(ar.allocator(), "id,name\n1,x\n", "SELECT * RENAME (id AS name) FROM '$IN'");
 }
 
 test "analyze rejects `is empty` on a non-string operand" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
-    // cast(amount as int) is an int — `is empty` only makes sense for strings
     try expectAnalyzeErr(ar.allocator(), "id,amount\n1,100\n", "SELECT * FROM '$IN' WHERE CAST(amount AS INT) IS EMPTY");
 }
 
 test "analyze rejects `?.` safe navigation on a plain column reference" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
-    // `?.` is only for JSON-param paths; on a real column it must be an error, not a no-op
     try expectAnalyzeErr(ar.allocator(), "id,name\n1,x\n", "SELECT name?.foo AS v FROM '$IN'");
 }
