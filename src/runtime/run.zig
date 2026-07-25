@@ -1631,8 +1631,13 @@ const LoopRow = struct {
 /// text (strings/ints; null → ""). The list is small — a table catalog — so it is
 /// fully materialized into the plan arena.
 fn discoverRows(env: *Env, src_read: ast.Read, ncols: usize) ![]const Row {
-    const src = openSource(env, src_read, &.{}) catch |e|
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each discovery failed: {s}", .{@errorName(e)}));
+    const src = openSource(env, src_read, &.{}) catch |e| {
+        // `openSource` already recorded why it failed; reporting only the error
+        // name would replace "sqlserver connect failed: …" with "PlanFailed"
+        // and throw the cause away.
+        const why = if (env.diag.msg.len > 0) env.diag.msg else @errorName(e);
+        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "for-each discovery failed: {s}", .{why}));
+    };
     defer src.close();
     var rows = std.array_list.Managed(Row).init(env.arena);
     var da = std.heap.ArenaAllocator.init(env.gpa);
