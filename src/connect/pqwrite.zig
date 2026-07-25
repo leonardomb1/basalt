@@ -37,6 +37,9 @@ const Mapping = struct {
     converted: ?i32 = null,
     precision: ?i32 = null,
     scale: ?i32 = null,
+    /// REQUIRED columns carry no definition levels at all, which is both smaller
+    /// and truer to the source schema than marking everything OPTIONAL.
+    optional: bool = true,
 };
 
 const conv_utf8 = 0;
@@ -75,6 +78,12 @@ const ColBuf = struct {
     /// BOOLEAN values are bit-packed, so they need their own accumulator.
     bit_buf: u8 = 0,
     bit_n: u3 = 0,
+    /// Column statistics for this row group. Readers use these to skip whole
+    /// row groups without decoding them, so emitting them is what makes a
+    /// basalt-written file efficient for *other* engines.
+    nulls: i64 = 0,
+    min: ?Value = null,
+    max: ?Value = null,
 
     fn init(a: std.mem.Allocator) ColBuf {
         return .{ .values = List(u8).init(a), .defs = List(u8).init(a) };
@@ -85,6 +94,16 @@ const ColBuf = struct {
         self.defs.clearRetainingCapacity();
         self.bit_buf = 0;
         self.bit_n = 0;
+        self.nulls = 0;
+        self.min = null;
+        self.max = null;
+    }
+
+    /// Statistics are per row group, so they track only values since the last
+    /// flush.
+    fn observe(self: *ColBuf, v: Value) void {
+        if (self.min == null or order(v, self.min.?) == .lt) self.min = v;
+        if (self.max == null or order(v, self.max.?) == .gt) self.max = v;
     }
 
     fn pushBit(self: *ColBuf, b: bool) !void {
@@ -110,7 +129,55 @@ const ChunkMeta = struct {
     num_values: i64,
     uncompressed: i64,
     compressed: i64,
+    nulls: i64 = 0,
+    min: ?Value = null,
+    max: ?Value = null,
 };
+
+/// Ordering used for min/max statistics. Only the shapes basalt writes need to
+/// be comparable; mixed kinds cannot occur within one column.
+fn order(a: Value, b: Value) std.math.Order {
+    return switch (a) {
+        .int => std.math.order(a.int, switch (b) {
+            .int => |x| x,
+            else => a.int,
+        }),
+        .float => std.math.order(a.float, switch (b) {
+            .float => |x| x,
+            else => a.float,
+        }),
+        .date => std.math.order(a.date, switch (b) {
+            .date => |x| x,
+            else => a.date,
+        }),
+        .time => std.math.order(a.time, switch (b) {
+            .time => |x| x,
+            else => a.time,
+        }),
+        .timestamp => std.math.order(a.timestamp, switch (b) {
+            .timestamp => |x| x,
+            else => a.timestamp,
+        }),
+        .decimal => std.math.order(a.decimal.unscaled, switch (b) {
+            .decimal => |x| x.unscaled,
+            else => a.decimal.unscaled,
+        }),
+        .bool => std.math.order(@intFromBool(a.bool), switch (b) {
+            .bool => |x| @intFromBool(x),
+            else => @intFromBool(a.bool),
+        }),
+        .string, .bytes => blk: {
+            const sa = if (a == .string) a.string else a.bytes;
+            const sb = switch (b) {
+                .string => |x| x,
+                .bytes => |x| x,
+                else => sa,
+            };
+            break :blk std.mem.order(u8, sa, sb);
+        },
+        .null => .eq,
+    };
+}
 
 const RowGroupMeta = struct {
     chunks: []ChunkMeta,
@@ -142,7 +209,10 @@ pub const Writer = struct {
     ) !*Writer {
         if (!codec.canCompress(compression)) return codec.Error.UnsupportedCodec;
         const maps = try arena.alloc(Mapping, schema.fields.len);
-        for (schema.fields, maps) |f, *m| m.* = try mapType(f.ty);
+        for (schema.fields, maps) |f, *m| {
+        m.* = try mapType(f.ty);
+        m.optional = f.ty.nullable;
+    }
 
         const cols = try arena.alloc(ColBuf, schema.fields.len);
         for (cols) |*c| c.* = ColBuf.init(arena);
@@ -172,7 +242,11 @@ pub const Writer = struct {
             for (batch.columns, self.cols, self.maps) |col, *cb, m| {
                 const v = col.getValue(r);
                 try cb.defs.append(if (v == .null) 0 else 1);
-                if (v == .null) continue;
+                if (v == .null) {
+                    cb.nulls += 1;
+                    continue;
+                }
+                cb.observe(v);
                 try encodePlain(cb, m, v);
             }
             self.rows += 1;
@@ -187,16 +261,19 @@ pub const Writer = struct {
         const chunks = try self.arena.alloc(ChunkMeta, self.cols.len);
         var group_bytes: i64 = 0;
 
-        for (self.cols, chunks) |*cb, *cm| {
+        for (self.cols, chunks, self.maps) |*cb, *cm, m| {
             try cb.flushBits();
 
-            // page body: [4-byte level length][RLE def levels][PLAIN values]
+            // page body: [4-byte level length][RLE def levels][PLAIN values],
+            // with the level section omitted entirely for REQUIRED columns
             var body = List(u8).init(self.arena);
-            const levels = try packLevels(self.arena, cb.defs.items);
-            var len4: [4]u8 = undefined;
-            std.mem.writeInt(u32, &len4, @intCast(levels.len), .little);
-            try body.appendSlice(&len4);
-            try body.appendSlice(levels);
+            if (m.optional) {
+                const levels = try packLevels(self.arena, cb.defs.items);
+                var len4: [4]u8 = undefined;
+                std.mem.writeInt(u32, &len4, @intCast(levels.len), .little);
+                try body.appendSlice(&len4);
+                try body.appendSlice(levels);
+            }
             try body.appendSlice(cb.values.items);
 
             const raw = body.items;
@@ -213,6 +290,9 @@ pub const Writer = struct {
                 .num_values = @intCast(cb.defs.items.len),
                 .uncompressed = @intCast(raw.len),
                 .compressed = @intCast(packed_body.len),
+                .nulls = cb.nulls,
+                .min = cb.min,
+                .max = cb.max,
             };
             group_bytes += @intCast(raw.len);
             cb.reset();
@@ -281,6 +361,7 @@ pub const Writer = struct {
             try w.writeI64(6, c.uncompressed);
             try w.writeI64(7, c.compressed);
             try w.writeI64(9, c.offset); // data_page_offset
+            try writeStatistics(w, self.arena, m, c);
             try w.structEnd();
             try w.structEnd();
         }
@@ -294,6 +375,76 @@ pub const Writer = struct {
     }
 };
 
+/// `Statistics` (ColumnMetaData field 12). Writes the modern `min_value` and
+/// `max_value` fields plus `null_count`; the legacy `min`/`max` are deliberately
+/// omitted, since their signedness rules for byte arrays were never consistent
+/// and readers prefer the newer pair.
+fn writeStatistics(w: *thrift.Writer, arena: std.mem.Allocator, m: Mapping, c: ChunkMeta) !void {
+    try w.fieldBegin(.@"struct", 12);
+    try w.structBegin();
+    try w.writeI64(3, c.nulls); // null_count
+    // parquet.thrift orders Statistics as max(1), min(2), ..., max_value(5),
+    // min_value(6) — max comes *before* min in both pairs. Writing them the
+    // intuitive way round silently inverts every reader's row-group filter.
+    if (c.max) |mx| {
+        if (try statBytes(arena, m, mx)) |b| try w.writeBinary(5, b); // max_value
+    }
+    if (c.min) |mn| {
+        if (try statBytes(arena, m, mn)) |b| try w.writeBinary(6, b); // min_value
+    }
+    try w.structEnd();
+}
+
+/// Statistics values are PLAIN-encoded, but *without* the length prefix that a
+/// byte-array page would carry — the thrift binary field already carries it.
+fn statBytes(arena: std.mem.Allocator, m: Mapping, v: Value) !?[]const u8 {
+    switch (m.phys) {
+        .boolean => {
+            const b = try arena.alloc(u8, 1);
+            b[0] = if (v == .bool and v.bool) 1 else 0;
+            return b;
+        },
+        .int32 => {
+            const b = try arena.alloc(u8, 4);
+            const x: i32 = switch (v) {
+                .date => |d| d,
+                .int => |i| @intCast(i),
+                else => 0,
+            };
+            std.mem.writeInt(i32, b[0..4], x, .little);
+            return b;
+        },
+        .int64 => {
+            const b = try arena.alloc(u8, 8);
+            const x: i64 = switch (v) {
+                .int => |i| i,
+                .time => |i| i,
+                .timestamp => |i| i,
+                .decimal => |d| rescale(d, m.scale orelse 0),
+                else => 0,
+            };
+            std.mem.writeInt(i64, b[0..8], x, .little);
+            return b;
+        },
+        .double => {
+            const b = try arena.alloc(u8, 8);
+            const x: f64 = switch (v) {
+                .float => |f| f,
+                .int => |i| @floatFromInt(i),
+                else => 0,
+            };
+            std.mem.writeInt(u64, b[0..8], @bitCast(x), .little);
+            return b;
+        },
+        .byte_array => return switch (v) {
+            .string => |x| x,
+            .bytes => |x| x,
+            else => null,
+        },
+        else => return null,
+    }
+}
+
 fn writeSchemaRoot(w: *thrift.Writer, children: usize) !void {
     try w.structBegin();
     try w.writeBinary(4, "basalt_schema");
@@ -304,7 +455,7 @@ fn writeSchemaRoot(w: *thrift.Writer, children: usize) !void {
 fn writeSchemaLeaf(w: *thrift.Writer, name: []const u8, m: Mapping) !void {
     try w.structBegin();
     try w.writeI32(1, @intFromEnum(m.phys));
-    try w.writeI32(3, @intFromEnum(pq.Repetition.optional));
+    try w.writeI32(3, @intFromEnum(if (m.optional) pq.Repetition.optional else pq.Repetition.required));
     try w.writeBinary(4, name);
     if (m.converted) |c| try w.writeI32(6, c);
     if (m.scale) |s| try w.writeI32(7, s);
@@ -546,4 +697,118 @@ test "a codec without an encoder is refused at open, before any bytes are writte
     const path = try std.fs.path.join(a, &.{ dir, "x.parquet" });
     const schema = types.Schema{ .fields = &.{.{ .name = "a", .ty = types.Type.init(.int) }} };
     try testing.expectError(codec.Error.UnsupportedCodec, Writer.open(a, path, schema, .zstd));
+}
+
+test "statistics record min, max and null count per row group" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ dir, "s.parquet" });
+
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "n", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "s", .ty = types.Type.init(.string).asNullable() },
+    } };
+    var w = try Writer.open(a, path, schema, .snappy);
+    var ns = try column.Builder.initCapacity(a, schema.fields[0].ty, 4);
+    var ss = try column.Builder.initCapacity(a, schema.fields[1].ty, 4);
+    try ns.append(.{ .int = 5 });
+    try ns.append(.null);
+    try ns.append(.{ .int = -3 });
+    try ns.append(.{ .int = 11 });
+    try ss.append(.{ .string = "pear" });
+    try ss.append(.{ .string = "apple" });
+    try ss.append(.null);
+    try ss.append(.{ .string = "zebra" });
+    var cols = [_]column.Column{ try ns.finish(), try ss.finish() };
+    try w.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 4 });
+    try w.close();
+
+    // read the footer back and check the statistics landed in the right fields
+    const bytes = try std.fs.cwd().readFileAlloc(a, path, 1 << 20);
+    const md = try pq.parseFile(a, bytes);
+    const stats = try readStats(a, bytes, md);
+    try testing.expectEqual(@as(i64, 1), stats[0].nulls);
+    try testing.expectEqual(@as(i64, -3), std.mem.readInt(i64, stats[0].min[0..8], .little));
+    try testing.expectEqual(@as(i64, 11), std.mem.readInt(i64, stats[0].max[0..8], .little));
+    try testing.expectEqual(@as(i64, 1), stats[1].nulls);
+    try testing.expectEqualStrings("apple", stats[1].min);
+    try testing.expectEqualStrings("zebra", stats[1].max);
+}
+
+const Stat = struct { nulls: i64, min: []const u8, max: []const u8 };
+
+/// Minimal Statistics reader, used by the test to prove the writer put max_value
+/// and min_value in the fields readers actually look at.
+fn readStats(arena: std.mem.Allocator, bytes: []const u8, md: pq.FileMetaData) ![]Stat {
+    const r = try pq.footerRange(bytes.len, bytes);
+    var th = thrift.Reader.init(bytes[r.offset..][0..r.len]);
+    var out = std.array_list.Managed(Stat).init(arena);
+    _ = md;
+
+    try th.structBegin();
+    while (true) {
+        const f = try th.readField();
+        if (f.ty == .stop) break;
+        if (f.id != 4) {
+            try th.skip(f.ty);
+            continue;
+        }
+        const groups = try th.readListHeader();
+        for (0..groups.size) |_| {
+            try th.structBegin();
+            while (true) {
+                const gf = try th.readField();
+                if (gf.ty == .stop) break;
+                if (gf.id != 1) {
+                    try th.skip(gf.ty);
+                    continue;
+                }
+                const chunks = try th.readListHeader();
+                for (0..chunks.size) |_| {
+                    try th.structBegin();
+                    while (true) {
+                        const cf = try th.readField();
+                        if (cf.ty == .stop) break;
+                        if (cf.id != 3) {
+                            try th.skip(cf.ty);
+                            continue;
+                        }
+                        try th.structBegin();
+                        var st = Stat{ .nulls = 0, .min = "", .max = "" };
+                        while (true) {
+                            const mf = try th.readField();
+                            if (mf.ty == .stop) break;
+                            if (mf.id != 12) {
+                                try th.skip(mf.ty);
+                                continue;
+                            }
+                            try th.structBegin();
+                            while (true) {
+                                const sf = try th.readField();
+                                if (sf.ty == .stop) break;
+                                switch (sf.id) {
+                                    3 => st.nulls = try th.readZigZag(),
+                                    5 => st.max = try th.readBinary(),
+                                    6 => st.min = try th.readBinary(),
+                                    else => try th.skip(sf.ty),
+                                }
+                            }
+                            try th.structEnd();
+                        }
+                        try th.structEnd();
+                        try out.append(st);
+                    }
+                    try th.structEnd();
+                }
+            }
+            try th.structEnd();
+        }
+        break;
+    }
+    return out.toOwnedSlice();
 }
