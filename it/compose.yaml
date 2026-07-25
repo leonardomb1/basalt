@@ -39,6 +39,21 @@ services:
       timeout: 3s
       retries: 60
 
+  # Azure Blob emulator. ADLS Gen2 data is read through the Blob endpoint, which
+  # is all Azurite implements — it has no DFS endpoint and no hierarchical
+  # namespace, and upstream has rejected PRs adding them.
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    command: azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
+    ports: ["31000:10000"]
+    healthcheck:
+      # 403 = alive and demanding a signature, which is the healthy state here;
+      # an unauthenticated probe never gets 200.
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 10000"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
   starrocks:
     image: starrocks/allin1-ubuntu:3.3-latest
     ports: ["39030:9030", "38040:8040"]
