@@ -427,7 +427,10 @@ pub const Sort = struct {
 
         const idx = try arena.alloc(usize, all.len);
         for (idx, 0..) |*x, i| x.* = i;
-        std.mem.sort(usize, idx, SortCtx{ .b = all, .keys = self.keys }, SortCtx.lessThan);
+        // lift each key column into a flat typed array once, then sort on that
+        const arrs = try arena.alloc(KeyArr, self.keys.len);
+        for (self.keys, arrs) |k, *a| a.* = try KeyArr.prepare(arena, all.columns[k.idx], k.desc);
+        std.mem.sort(usize, idx, SortCtx{ .arrs = arrs }, SortCtx.lessThan);
 
         const outcols = try arena.alloc(column.Column, all.columns.len);
         for (all.columns, 0..) |*col, ci| outcols[ci] = try column.permute(arena, col.*, idx);
@@ -435,13 +438,96 @@ pub const Sort = struct {
     }
 };
 
+/// One sort key lifted out of its column into a comparable typed array.
+///
+/// The comparator runs O(n log n) times; `getValue` boxes a ~32-byte tagged
+/// union and re-switches on the column type on every call, twice per comparison.
+/// Extracting each key once, up front, turns that into a plain typed compare.
+const KeyArr = struct {
+    desc: bool,
+    valid: column.Bitmap,
+    data: Data,
+
+    const Data = union(enum) {
+        ints: []i64,
+        floats: []f64,
+        decs: []i128,
+        strs: [][]const u8,
+        /// Types with no cheap flat form fall back to boxing.
+        boxed: column.Column,
+    };
+
+    fn prepare(arena: std.mem.Allocator, col: column.Column, desc: bool) !KeyArr {
+        const n = col.len;
+        const data: Data = switch (col.ty.kind) {
+            .int, .date, .time, .timestamp, .bool => blk: {
+                const out = try arena.alloc(i64, n);
+                for (out, 0..) |*o, i| o.* = switch (col.getValue(i)) {
+                    .int => |x| x,
+                    .date => |x| x,
+                    .time => |x| x,
+                    .timestamp => |x| x,
+                    .bool => |x| @intFromBool(x),
+                    else => 0,
+                };
+                break :blk .{ .ints = out };
+            },
+            .float => blk: {
+                const out = try arena.alloc(f64, n);
+                for (out, 0..) |*o, i| o.* = switch (col.getValue(i)) {
+                    .float => |x| x,
+                    else => 0,
+                };
+                break :blk .{ .floats = out };
+            },
+            .decimal => blk: {
+                const out = try arena.alloc(i128, n);
+                for (out, 0..) |*o, i| o.* = switch (col.getValue(i)) {
+                    .decimal => |d| d.unscaled,
+                    else => 0,
+                };
+                break :blk .{ .decs = out };
+            },
+            .string, .bytes => blk: {
+                const out = try arena.alloc([]const u8, n);
+                for (out, 0..) |*o, i| o.* = switch (col.getValue(i)) {
+                    .string => |x| x,
+                    .bytes => |x| x,
+                    else => "",
+                };
+                break :blk .{ .strs = out };
+            },
+            else => .{ .boxed = col },
+        };
+        return .{ .desc = desc, .valid = col.validity, .data = data };
+    }
+
+    /// Nulls sort last regardless of direction, matching `keyOrder`.
+    fn order(self: KeyArr, a: usize, c: usize) std.math.Order {
+        const an = !self.valid.get(a);
+        const bn = !self.valid.get(c);
+        if (an or bn) {
+            if (an and bn) return .eq;
+            return if (an) .gt else .lt;
+        }
+        const ord: std.math.Order = switch (self.data) {
+            .ints => |v| std.math.order(v[a], v[c]),
+            .floats => |v| std.math.order(v[a], v[c]),
+            .decs => |v| std.math.order(v[a], v[c]),
+            .strs => |v| std.mem.order(u8, v[a], v[c]),
+            .boxed => |col| return keyOrder(col.getValue(a), col.getValue(c), self.desc),
+        };
+        if (ord == .eq) return .eq;
+        return if (self.desc) (if (ord == .lt) std.math.Order.gt else std.math.Order.lt) else ord;
+    }
+};
+
 const SortCtx = struct {
-    b: Batch,
-    keys: []const Sort.Key,
+    arrs: []const KeyArr,
 
     fn lessThan(self: SortCtx, a: usize, c: usize) bool {
-        for (self.keys) |k| {
-            const o = keyOrder(self.b.columns[k.idx].getValue(a), self.b.columns[k.idx].getValue(c), k.desc);
+        for (self.arrs) |k| {
+            const o = k.order(a, c);
             if (o != .eq) return o == .lt;
         }
         return false;
@@ -1064,6 +1150,7 @@ pub const Join = struct {
     }
 
     fn emitRow(self: *Join, builders: []column.Builder, lb: Batch, lr: usize, bri: usize, emit_right: bool, right_null: bool) anyerror!void {
+        @setEvalBranchQuota(2000);
         var col: usize = 0;
         for (lb.columns) |*c| {
             try builders[col].append(c.getValue(lr));
