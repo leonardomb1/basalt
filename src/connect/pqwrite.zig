@@ -75,6 +75,10 @@ fn mapType(t: types.Type) Error!Mapping {
     };
 }
 
+/// Distinct values a column may hold before dictionary encoding is abandoned.
+/// Past this the dictionary stops paying for itself and the indices get wide.
+pub const dict_max_entries = 1 << 15;
+
 /// A page whose rows are complete, waiting to be written at row-group flush.
 /// Pages of one chunk must land contiguously in the file, so they cannot be
 /// emitted as they fill — they are held until the group is flushed.
@@ -99,12 +103,24 @@ const ColBuf = struct {
     nulls: i64 = 0,
     min: ?Value = null,
     max: ?Value = null,
+    /// Dictionary state for BYTE_ARRAY columns. Strings repeat far more often
+    /// than they do not, and PLAIN stores every copy in full; a dictionary page
+    /// plus RLE indices is what closes the size gap with other writers.
+    dict: std.StringHashMap(u32),
+    dict_order: List([]const u8),
+    /// One index per non-null row, or abandoned once the column proves to have
+    /// too many distinct values.
+    dict_idx: List(u32),
+    dict_ok: bool = false,
 
     fn init(a: std.mem.Allocator) ColBuf {
         return .{
             .values = List(u8).init(a),
             .pages = List(PendingPage).init(a),
             .defs = List(u8).init(a),
+            .dict = std.StringHashMap(u32).init(a),
+            .dict_order = List([]const u8).init(a),
+            .dict_idx = List(u32).init(a),
         };
     }
 
@@ -135,6 +151,30 @@ const ColBuf = struct {
         self.nulls = 0;
         self.min = null;
         self.max = null;
+        self.dict.clearRetainingCapacity();
+        self.dict_order.clearRetainingCapacity();
+        self.dict_idx.clearRetainingCapacity();
+        self.dict_ok = false;
+    }
+
+    /// Records a byte-array value against the dictionary. Returns false once the
+    /// column has too many distinct values to be worth encoding this way.
+    fn dictPut(self: *ColBuf, arena: std.mem.Allocator, v: []const u8) !bool {
+        if (!self.dict_ok) return false;
+        if (self.dict.get(v)) |ix| {
+            try self.dict_idx.append(ix);
+            return true;
+        }
+        if (self.dict.count() >= dict_max_entries) {
+            self.dict_ok = false;
+            return false;
+        }
+        const owned = try arena.dupe(u8, v);
+        const ix: u32 = @intCast(self.dict_order.items.len);
+        try self.dict.put(owned, ix);
+        try self.dict_order.append(owned);
+        try self.dict_idx.append(ix);
+        return true;
     }
 
     /// Statistics are per row group, so they track only values since the last
@@ -177,6 +217,9 @@ fn own(arena: std.mem.Allocator, v: Value) !Value {
 
 const ChunkMeta = struct {
     offset: i64,
+    /// Offset of the dictionary page, when the chunk is dictionary-encoded.
+    dict_offset: i64 = 0,
+    dict: bool = false,
     num_values: i64,
     uncompressed: i64,
     compressed: i64,
@@ -266,7 +309,12 @@ pub const Writer = struct {
     }
 
         const cols = try arena.alloc(ColBuf, schema.fields.len);
-        for (cols) |*c| c.* = ColBuf.init(arena);
+        for (cols, maps) |*c, m| {
+            c.* = ColBuf.init(arena);
+            // only variable-length values gain from a dictionary; fixed-width
+            // types are already as small as the index would be
+            c.dict_ok = m.phys == .byte_array;
+        }
 
         const self = try arena.create(Writer);
         self.* = .{
@@ -298,9 +346,20 @@ pub const Writer = struct {
                     continue;
                 }
                 try cb.observe(self.arena, v);
+                if (m.phys == .byte_array and cb.dict_ok) {
+                    const sv: []const u8 = switch (v) {
+                        .string => |x| x,
+                        .bytes => |x| x,
+                        else => "",
+                    };
+                    _ = try cb.dictPut(self.arena, sv);
+                }
                 try encodePlain(cb, m, v);
             }
             for (self.cols, self.maps) |*cb, m| {
+                // a dictionary is per chunk, so its indices are emitted as one
+                // page at flush; splitting only applies to PLAIN columns
+                if (cb.dict_ok) continue;
                 if (cb.values.items.len >= page_target_bytes) try cb.sealPage(self.arena, m.optional);
             }
             self.rows += 1;
@@ -316,6 +375,16 @@ pub const Writer = struct {
         var group_bytes: i64 = 0;
 
         for (self.cols, chunks, self.maps) |*cb, *cm, m| {
+            // A dictionary-encoded chunk is emitted whole: a dictionary page
+            // followed by one data page of RLE indices.
+            const use_dict = cb.dict_ok and cb.dict_order.items.len > 0 and
+                cb.dict_order.items.len * 2 < cb.dict_idx.items.len;
+            if (use_dict) {
+                cm.* = try self.writeDictChunk(cb, m);
+                group_bytes += cm.uncompressed;
+                cb.reset();
+                continue;
+            }
             try cb.sealPage(self.arena, m.optional);
 
             const start = self.offset;
@@ -368,6 +437,64 @@ pub const Writer = struct {
         self.rows = 0;
     }
 
+    /// Writes a dictionary page followed by an RLE_DICTIONARY data page.
+    fn writeDictChunk(self: *Writer, cb: *ColBuf, m: Mapping) !ChunkMeta {
+        const start = self.offset;
+        var uncompressed: i64 = 0;
+        var compressed: i64 = 0;
+
+        // dictionary page: the distinct values, PLAIN-encoded in index order
+        var dict_body = List(u8).init(self.arena);
+        for (cb.dict_order.items) |v| {
+            var len4: [4]u8 = undefined;
+            std.mem.writeInt(u32, &len4, @intCast(v.len), .little);
+            try dict_body.appendSlice(&len4);
+            try dict_body.appendSlice(v);
+        }
+        const dict_packed = try codec.compress(self.arena, self.compression, dict_body.items);
+        var dhdr = List(u8).init(self.arena);
+        try writeDictPageHeader(&dhdr, dict_body.items.len, dict_packed.len, cb.dict_order.items.len, std.hash.Crc32.hash(dict_packed));
+        try self.emit(dhdr.items);
+        try self.emit(dict_packed);
+        uncompressed += @intCast(dict_body.items.len);
+        compressed += @intCast(dict_packed.len);
+
+        const data_start = self.offset;
+
+        // data page: [levels][bit width][RLE indices]
+        var body = List(u8).init(self.arena);
+        if (m.optional) {
+            const levels = try packLevels(self.arena, cb.defs.items);
+            var len4: [4]u8 = undefined;
+            std.mem.writeInt(u32, &len4, @intCast(levels.len), .little);
+            try body.appendSlice(&len4);
+            try body.appendSlice(levels);
+        }
+        const width = indexWidth(cb.dict_order.items.len);
+        try body.append(width);
+        try packRleIndices(&body, cb.dict_idx.items, width);
+
+        const packed_body = try codec.compress(self.arena, self.compression, body.items);
+        var hdr = List(u8).init(self.arena);
+        try writeDictDataPageHeader(&hdr, body.items.len, packed_body.len, cb.defs.items.len, std.hash.Crc32.hash(packed_body));
+        try self.emit(hdr.items);
+        try self.emit(packed_body);
+        uncompressed += @intCast(body.items.len);
+        compressed += @intCast(packed_body.len);
+
+        return .{
+            .offset = data_start,
+            .dict_offset = start,
+            .num_values = @intCast(cb.defs.items.len),
+            .uncompressed = uncompressed,
+            .compressed = compressed,
+            .nulls = cb.nulls,
+            .min = cb.min,
+            .max = cb.max,
+            .dict = true,
+        };
+    }
+
     pub fn close(self: *Writer) !void {
         try self.flushRowGroup();
 
@@ -414,7 +541,7 @@ pub const Writer = struct {
             try w.structBegin();
             try w.writeI32(1, @intFromEnum(m.phys));
             try w.listBegin(2, .i32, 1);
-            try w.writeZigZag(@intFromEnum(pq.Encoding.plain));
+            try w.writeZigZag(@intFromEnum(if (c.dict) pq.Encoding.rle_dictionary else pq.Encoding.plain));
             try w.listBegin(3, .binary, 1);
             try w.writeVarint(f.name.len);
             try w.out.appendSlice(f.name);
@@ -423,6 +550,7 @@ pub const Writer = struct {
             try w.writeI64(6, c.uncompressed);
             try w.writeI64(7, c.compressed);
             try w.writeI64(9, c.offset); // data_page_offset
+            if (c.dict) try w.writeI64(11, c.dict_offset); // dictionary_page_offset
             try writeStatistics(w, self.arena, m, c);
             try w.structEnd();
             try w.structEnd();
@@ -930,4 +1058,115 @@ fn readStats(arena: std.mem.Allocator, bytes: []const u8, md: pq.FileMetaData) !
         break;
     }
     return out.toOwnedSlice();
+}
+
+/// Bits needed to index a dictionary of `n` entries.
+fn indexWidth(n: usize) u8 {
+    if (n <= 1) return 0;
+    return @intCast(32 - @clz(@as(u32, @intCast(n - 1))));
+}
+
+/// Dictionary indices as an RLE/bit-packed hybrid, always bit-packed in groups
+/// of eight — the same shape the reader's `decodeRleHybrid` expects.
+fn packRleIndices(out: *List(u8), idx: []const u32, width: u8) !void {
+    if (width == 0 or idx.len == 0) return;
+    const groups = (idx.len + 7) / 8;
+    var h: u64 = (@as(u64, groups) << 1) | 1;
+    while (true) {
+        const b: u8 = @intCast(h & 0x7F);
+        h >>= 7;
+        try out.append(if (h != 0) b | 0x80 else b);
+        if (h == 0) break;
+    }
+    var bit_buf: u32 = 0;
+    var bit_n: u6 = 0;
+    for (0..groups * 8) |i| {
+        const v: u32 = if (i < idx.len) idx[i] else 0;
+        bit_buf |= v << @intCast(bit_n);
+        bit_n += @intCast(width);
+        while (bit_n >= 8) {
+            try out.append(@intCast(bit_buf & 0xFF));
+            bit_buf >>= 8;
+            bit_n -= 8;
+        }
+    }
+    if (bit_n > 0) try out.append(@intCast(bit_buf & 0xFF));
+}
+
+fn writeDictPageHeader(out: *List(u8), uncompressed: usize, compressed: usize, values: usize, crc: u32) !void {
+    var w = thrift.Writer.init(out);
+    try w.structBegin();
+    try w.writeI32(1, @intFromEnum(pq.PageType.dictionary_page));
+    try w.writeI32(2, @intCast(uncompressed));
+    try w.writeI32(3, @intCast(compressed));
+    try w.writeI32(4, @bitCast(crc));
+    try w.fieldBegin(.@"struct", 7); // dictionary_page_header
+    try w.structBegin();
+    try w.writeI32(1, @intCast(values));
+    try w.writeI32(2, @intFromEnum(pq.Encoding.plain));
+    try w.structEnd();
+    try w.structEnd();
+}
+
+fn writeDictDataPageHeader(out: *List(u8), uncompressed: usize, compressed: usize, values: usize, crc: u32) !void {
+    var w = thrift.Writer.init(out);
+    try w.structBegin();
+    try w.writeI32(1, @intFromEnum(pq.PageType.data_page));
+    try w.writeI32(2, @intCast(uncompressed));
+    try w.writeI32(3, @intCast(compressed));
+    try w.writeI32(4, @bitCast(crc));
+    try w.fieldBegin(.@"struct", 5);
+    try w.structBegin();
+    try w.writeI32(1, @intCast(values));
+    try w.writeI32(2, @intFromEnum(pq.Encoding.rle_dictionary));
+    try w.writeI32(3, @intFromEnum(pq.Encoding.rle));
+    try w.writeI32(4, @intFromEnum(pq.Encoding.rle));
+    try w.structEnd();
+    try w.structEnd();
+}
+
+test "dictionary encoding round-trips low-cardinality strings" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ dir, "d.parquet" });
+
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "cat", .ty = types.Type.init(.string).asNullable() },
+    } };
+    var w = try Writer.open(a, path, schema, .snappy);
+
+    // 300 rows over three distinct values: comfortably dictionary-worthy
+    var b = try column.Builder.initCapacity(a, schema.fields[0].ty, 300);
+    const vals = [_][]const u8{ "alpha", "beta", "gamma" };
+    for (0..300) |i| {
+        if (i % 37 == 0) try b.append(.null) else try b.append(.{ .string = vals[i % 3] });
+    }
+    var cols = [_]column.Column{try b.finish()};
+    try w.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 300 });
+    try w.close();
+
+    const r = try pqdecode.Reader.open(a, path);
+    const back = (try r.next(a)).?;
+    try testing.expectEqual(@as(usize, 300), back.len);
+    for (0..300) |i| {
+        if (i % 37 == 0) {
+            try testing.expect(back.columns[0].getValue(i).isNull());
+        } else {
+            try testing.expectEqualStrings(vals[i % 3], back.columns[0].getValue(i).string);
+        }
+    }
+}
+
+test "index width covers the dictionary size" {
+    try testing.expectEqual(@as(u8, 0), indexWidth(1));
+    try testing.expectEqual(@as(u8, 1), indexWidth(2));
+    try testing.expectEqual(@as(u8, 2), indexWidth(3));
+    try testing.expectEqual(@as(u8, 2), indexWidth(4));
+    try testing.expectEqual(@as(u8, 3), indexWidth(5));
+    try testing.expectEqual(@as(u8, 8), indexWidth(256));
 }
