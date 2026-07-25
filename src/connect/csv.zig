@@ -11,6 +11,7 @@ const valuemod = @import("../exec/value.zig");
 const eval = @import("../exec/eval.zig");
 const driver = @import("driver.zig");
 const httpx = @import("http.zig");
+const azure = @import("azure.zig");
 
 const Batch = batchmod.Batch;
 const Value = valuemod.Value;
@@ -32,6 +33,12 @@ pub const CsvReader = struct {
     pending_i: usize = 0,
     stream_eof: bool = false,
     done: bool = false,
+    /// Remaining `az://` blob URLs of a prefix read, in listing order. Empty for
+    /// a single blob.
+    rest_urls: []const []const u8 = &.{},
+    /// Header line of the first blob; later blobs must match it, or the read
+    /// would silently splice mismatched columns together.
+    header_line: []const u8 = "",
 
     const Backend = union(enum) {
         file: FileBackend,
@@ -54,7 +61,8 @@ pub const CsvReader = struct {
     };
 
     pub fn isUrl(path: []const u8) bool {
-        return std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://");
+        return std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://") or
+            azure.isUrl(path);
     }
 
     pub fn open(arena: std.mem.Allocator, path: []const u8) !*CsvReader {
@@ -65,17 +73,40 @@ pub const CsvReader = struct {
             .schema = undefined,
             .done = false,
         };
-        if (isUrl(path)) {
+        var first = path;
+        if (azure.isPrefix(path)) {
+            const p = try azure.parsePrefix(path);
+            const client = try arena.create(std.http.Client);
+            client.* = httpx.initClient(arena);
+            defer client.deinit();
+            const names = try azure.listPrefix(arena, client, p.account, p.container, p.prefix, azure.endpointFromEnv(arena));
+            if (names.len == 0) return error.EmptyCsv;
+            const urls = try arena.alloc([]const u8, names.len);
+            for (names, urls) |n, *u| u.* = try std.fmt.allocPrint(arena, "az://{s}/{s}/{s}", .{ p.account, p.container, n });
+            first = urls[0];
+            self.rest_urls = urls[1..];
+        }
+
+        if (isUrl(first)) {
             const hf = try arena.create(HttpFetch);
             hf.* = .{ .client = httpx.initClient(arena), .req = undefined, .response = undefined };
             errdefer hf.client.deinit();
-            const uri = std.Uri.parse(path) catch return error.InvalidUrl;
-            startHttp(hf, uri) catch |e| switch (e) {
+            // az:// resolves to a real endpoint and carries a Shared Key signature;
+            // plain http(s) URLs go out unsigned as before.
+            var req_url = first;
+            var extra: []const std.http.Header = &.{};
+            if (azure.isUrl(first)) {
+                const blob = try azure.parseUrl(arena, first, azure.endpointFromEnv(arena));
+                req_url = blob.url;
+                extra = try azure.getHeaders(arena, blob, "");
+            }
+            const uri = std.Uri.parse(req_url) catch return error.InvalidUrl;
+            startHttp(hf, uri, extra) catch |e| switch (e) {
                 error.TlsInitializationFailed => {
                     const h = httpx.uriHost(uri) orelse return e;
                     if (!httpx.repairBundle(arena, &hf.client.ca_bundle, h, uri.port orelse 443)) return e;
                     hf.client.next_https_rescan_certs = false;
-                    try startHttp(hf, uri);
+                    try startHttp(hf, uri, extra);
                 },
                 else => return e,
             };
@@ -95,6 +126,7 @@ pub const CsvReader = struct {
         }
 
         const header = (try self.readLine()) orelse return error.EmptyCsv;
+        self.header_line = try arena.dupe(u8, std.mem.trim(u8, header, " \t\r"));
         var fields = std.array_list.Managed(types.Schema.Field).init(arena);
         var it = std.mem.splitScalar(u8, header, ',');
         while (it.next()) |name| {
@@ -108,6 +140,9 @@ pub const CsvReader = struct {
         var pending = std.array_list.Managed([]const u8).init(arena);
         while (pending.items.len < SAMPLE_ROWS) {
             const line = (try self.readLine()) orelse {
+                // A prefix read keeps sniffing into the next blob; stopping here
+                // would both truncate the read and infer types from one file.
+                if (try self.advance()) continue;
                 self.stream_eof = true;
                 break;
             };
@@ -137,10 +172,18 @@ pub const CsvReader = struct {
                 self.pending_i += 1;
             } else {
                 if (self.stream_eof) {
-                    self.done = true;
-                    break;
+                    if (!(try self.advance())) {
+                        self.done = true;
+                        break;
+                    }
+                    self.stream_eof = false;
                 }
-                line = (try self.readLine()) orelse {
+                line = (try self.readLine()) orelse blk: {
+                    // End of this blob — a prefix read continues into the next.
+                    if (try self.advance()) break :blk (try self.readLine()) orelse {
+                        self.done = true;
+                        break;
+                    };
                     self.done = true;
                     break;
                 };
@@ -154,6 +197,37 @@ pub const CsvReader = struct {
         const cols = try arena.alloc(column.Column, ncols);
         for (builders, 0..) |*b, i| cols[i] = try b.finish();
         return Batch{ .schema = &self.schema, .columns = cols, .len = rows };
+    }
+
+    /// Opens the next blob of a prefix read and discards its header, which must
+    /// match the first blob's. Returns false when the listing is exhausted.
+    fn advance(self: *CsvReader) !bool {
+        if (self.rest_urls.len == 0) return false;
+        const url = self.rest_urls[0];
+        self.rest_urls = self.rest_urls[1..];
+
+        switch (self.backend) {
+            .http => |hf| hf.req.deinit(),
+            .file => {},
+        }
+        const hf = try self.arena.create(HttpFetch);
+        hf.* = .{ .client = httpx.initClient(self.arena), .req = undefined, .response = undefined };
+        const blob = try azure.parseUrl(self.arena, url, azure.endpointFromEnv(self.arena));
+        const extra = try azure.getHeaders(self.arena, blob, "");
+        const uri = std.Uri.parse(blob.url) catch return error.InvalidUrl;
+        try startHttp(hf, uri, extra);
+        const code = @intFromEnum(hf.response.head.status);
+        if (code != 200) return httpx.statusError(code);
+        self.backend = .{ .http = hf };
+        const ce = hf.response.head.content_encoding;
+        if (ce == .compress) return error.UnsupportedCompressionMethod;
+        const win = ce.minBufferCapacity();
+        const dbuf: []u8 = if (win > 0) try self.arena.alloc(u8, win) else &.{};
+        self.rdr = hf.response.readerDecompressing(&hf.transfer_buf, &hf.decompress, dbuf);
+
+        const hdr = (try self.readLine()) orelse return error.EmptyCsv;
+        if (!std.mem.eql(u8, std.mem.trim(u8, hdr, " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
+        return true;
     }
 
     pub fn close(self: *CsvReader) void {
@@ -170,8 +244,8 @@ pub const CsvReader = struct {
         return .{ .ptr = self, .vtable = &source_vtable };
     }
 
-    fn startHttp(hf: *HttpFetch, uri: std.Uri) !void {
-        hf.req = try hf.client.request(.GET, uri, .{});
+    fn startHttp(hf: *HttpFetch, uri: std.Uri, extra: []const std.http.Header) !void {
+        hf.req = try hf.client.request(.GET, uri, .{ .extra_headers = extra });
         errdefer hf.req.deinit();
         try hf.req.sendBodiless();
         hf.response = try hf.req.receiveHead(&hf.redirect_buf);
@@ -435,16 +509,40 @@ fn srcClose(ptr: *anyopaque) void {
 }
 
 pub const CsvWriter = struct {
-    file: std.fs.File,
+    backend: Backend,
     write_buf: [LINE_BUF]u8 = undefined,
     fw: std.fs.File.Writer = undefined,
 
+    /// A local file, or a block blob staged over HTTP. Both expose a plain
+    /// `*std.Io.Writer`, so row formatting below is identical either way.
+    const Backend = union(enum) {
+        file: std.fs.File,
+        blob: struct { client: *std.http.Client, w: *azure.BlockBlobWriter },
+    };
+
+    fn out(self: *CsvWriter) *std.Io.Writer {
+        return switch (self.backend) {
+            .file => &self.fw.interface,
+            .blob => |b| &b.w.interface,
+        };
+    }
+
     pub fn open(arena: std.mem.Allocator, path: []const u8, schema: types.Schema) !*CsvWriter {
         const self = try arena.create(CsvWriter);
-        self.* = .{ .file = try std.fs.cwd().createFile(path, .{}) };
-        self.fw = self.file.writer(&self.write_buf);
+        if (azure.isUrl(path)) {
+            const client = try arena.create(std.http.Client);
+            client.* = httpx.initClient(arena);
+            const blob = try azure.parseUrl(arena, path, azure.endpointFromEnv(arena));
+            self.* = .{ .backend = .{ .blob = .{
+                .client = client,
+                .w = try azure.BlockBlobWriter.init(arena, client, blob, "text/csv"),
+            } } };
+        } else {
+            self.* = .{ .backend = .{ .file = try std.fs.cwd().createFile(path, .{}) } };
+            self.fw = self.backend.file.writer(&self.write_buf);
+        }
 
-        const w = &self.fw.interface;
+        const w = self.out();
         for (schema.fields, 0..) |f, i| {
             if (i > 0) try w.writeByte(',');
             try writeField(w, f.name);
@@ -454,7 +552,7 @@ pub const CsvWriter = struct {
     }
 
     pub fn writeBatch(self: *CsvWriter, arena: std.mem.Allocator, batch: Batch) !void {
-        const w = &self.fw.interface;
+        const w = self.out();
         var r: usize = 0;
         while (r < batch.len) : (r += 1) {
             for (batch.columns, 0..) |*col, i| {
@@ -475,14 +573,25 @@ pub const CsvWriter = struct {
     }
 
     pub fn close(self: *CsvWriter) !void {
-        try self.fw.interface.flush();
-        self.file.close();
+        switch (self.backend) {
+            .file => |f| {
+                try self.fw.interface.flush();
+                f.close();
+            },
+            // Committing the block list is what makes the blob appear.
+            .blob => |b| try b.w.finish(),
+        }
     }
 
-    /// Failure path: drop the unflushed write buffer and close the file. Rows
-    /// already flushed stay in the file (a CSV has no transaction to roll back).
+    /// Failure path. For a file, rows already flushed stay on disk (a CSV has no
+    /// transaction to roll back). For a blob, skipping the block-list commit is
+    /// the rollback: staged blocks never become a readable object, and Azure
+    /// discards them after a week — so a failed run leaves nothing behind.
     pub fn abort(self: *CsvWriter) void {
-        self.file.close();
+        switch (self.backend) {
+            .file => |f| f.close(),
+            .blob => {},
+        }
     }
 
     pub fn sink(self: *CsvWriter) driver.Sink {
