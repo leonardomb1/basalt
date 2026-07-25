@@ -13,7 +13,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ALL_SUITES="mysql postgres sqlserver starrocks azure"
+ALL_SUITES="mysql postgres sqlserver starrocks azure parquet"
 SUITES="${*:-$ALL_SUITES}"
 
 for s in $SUITES; do
@@ -33,6 +33,7 @@ for s in $SUITES; do
     sqlserver) services="$services mssql" ;;
     starrocks) services="$services starrocks" ;;
     azure)     services="$services azurite" ;;
+    parquet)   ;;  # reads committed fixtures; needs no container
   esac
 done
 
@@ -173,6 +174,30 @@ SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM 'az://devstoreacc
   else
     report "azure-volume (run error)" bad
   fi
+fi
+
+# Parquet: read the committed fixtures through the CLI. The unit tests decode
+# pages directly; this is the only check that the .parquet dispatch, planning and
+# sink path all line up. Reference output comes from DuckDB, so a green run means
+# basalt agrees with another implementation rather than with itself.
+if runs parquet; then
+  if brun run -c "LOAD INTO '$out/parquet.csv' AS
+SELECT id, name, amt, flag FROM 'src/connect/testdata/zstd.parquet' ORDER BY id;"; then
+    check parquet "$out/parquet.csv" it/parquet_expected.csv
+  else
+    report "parquet (run error)" bad
+  fi
+
+  # Same rows, every codec: proves the codec dispatch survives the full pipeline,
+  # not just the decoder unit tests.
+  for c in uncompressed snappy gzip lz4; do
+    if brun run -c "LOAD INTO '$out/parquet_$c.csv' AS
+SELECT id, name, amt, flag FROM 'src/connect/testdata/$c.parquet' ORDER BY id;"; then
+      check "parquet-$c" "$out/parquet_$c.csv" it/parquet_expected.csv
+    else
+      report "parquet-$c (run error)" bad
+    fi
+  done
 fi
 
 echo "==> $pass passed, $fail failed"
