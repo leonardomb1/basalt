@@ -251,18 +251,31 @@ pub const Filter = struct {
     child: Op,
     pred: *const ast.Expr,
     err: ?*ErrCtx = null,
+    /// Input batches are pulled into this arena, not the caller's, and it is
+    /// reset per batch. A selective predicate can otherwise drain the entire
+    /// source inside one `next` call — the caller only resets between calls —
+    /// so a filter that matches nothing used to hold every batch it rejected at
+    /// once. `gather` copies the surviving rows into the caller's arena, so
+    /// nothing returned points into here.
+    scratch: ?std.heap.ArenaAllocator = null,
 
     pub fn next(self: *Filter, arena: std.mem.Allocator) anyerror!?Batch {
-        while (try self.child.next(arena)) |b| {
-            const out = try self.transform(arena, b);
+        if (self.scratch == null) self.scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        while (true) {
+            _ = self.scratch.?.reset(.retain_capacity);
+            const b = (try self.child.next(self.scratch.?.allocator())) orelse return null;
+            const out = try self.filterInto(arena, self.scratch.?.allocator(), b);
             if (out.len > 0) return out;
         }
-        return null;
     }
 
     /// Stateless transform of one input batch (for the parallel driver).
     pub fn transform(self: *Filter, arena: std.mem.Allocator, b: Batch) anyerror!Batch {
-        return applyFilter(arena, b, self.pred) catch |e| {
+        return self.filterInto(arena, arena, b);
+    }
+
+    fn filterInto(self: *Filter, out: std.mem.Allocator, scratch: std.mem.Allocator, b: Batch) anyerror!Batch {
+        return applyFilter(out, scratch, b, self.pred) catch |e| {
             if (self.err) |ec| ec.set("{s}: in filter predicate", .{errLabel(e)});
             return e;
         };
@@ -333,8 +346,8 @@ pub const Limit = struct {
     }
 };
 
-fn applyFilter(arena: std.mem.Allocator, b: Batch, pred: *const ast.Expr) anyerror!Batch {
-    const mask = try eval.evalColumn(arena, pred, b, types.Type.init(.bool));
+fn applyFilter(arena: std.mem.Allocator, scratch: std.mem.Allocator, b: Batch, pred: *const ast.Expr) anyerror!Batch {
+    const mask = try eval.evalColumn(scratch, pred, b, types.Type.init(.bool));
     const keep = mask.data.b;
     var kept: usize = 0;
     if (mask.validity.allSet(b.len)) {
