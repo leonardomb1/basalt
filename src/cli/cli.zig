@@ -5,7 +5,8 @@
 //! `run` executes (HTTP mode when the script declares an endpoint); `check`
 //! validates and plans without running. A
 //! script comes from a file path or, with `-c/--command`, inline. `repl` is an
-//! interactive loop that prints results via the `write stdout` table sink.
+//! interactive loop that runs on `;`, carries declarations across entries, and
+//! prints results via the `write stdout` table sink.
 
 const std = @import("std");
 const parser = @import("../lang/sql_parser.zig");
@@ -344,10 +345,202 @@ fn cmdServe(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     return 0;
 }
 
-/// Interactive read-eval-print loop. Each entry is one or more lines terminated by
-/// a blank line (so multi-clause queries can span lines); a terminal SELECT
-/// prints as a table (a stdout sink is appended when the entry doesn't write).
-/// Reads from stdin (so `echo ... | basalt repl` works); prompts only on a TTY.
+/// Index of the next `;` at statement level — outside `'...'` (with `''`
+/// escapes), `"..."` (with `\` escapes), `$$`/`$tag$` dollar quotes, `--` line
+/// comments and `/* */` block comments. Mirrors the lexer's trivia and string
+/// rules so the REPL agrees with the parser on where a statement ends.
+fn nextTopSemi(s: []const u8, from: usize) ?usize {
+    var i = from;
+    while (i < s.len) {
+        switch (s[i]) {
+            ';' => return i,
+            '\'' => {
+                i += 1;
+                while (i < s.len) : (i += 1) {
+                    if (s[i] != '\'') continue;
+                    if (i + 1 < s.len and s[i + 1] == '\'') {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            },
+            '"' => {
+                i += 1;
+                while (i < s.len) : (i += 1) {
+                    if (s[i] == '\\') {
+                        i += 1;
+                        continue;
+                    }
+                    if (s[i] == '"') break;
+                }
+                i += 1;
+            },
+            '-' => {
+                if (i + 1 < s.len and s[i + 1] == '-') {
+                    i = std.mem.indexOfScalarPos(u8, s, i, '\n') orelse s.len;
+                } else i += 1;
+            },
+            '/' => {
+                if (i + 1 < s.len and s[i + 1] == '*') {
+                    const end = std.mem.indexOfPos(u8, s, i + 2, "*/");
+                    i = if (end) |e| e + 2 else s.len;
+                } else i += 1;
+            },
+            '$' => {
+                if (dollarTagLen(s, i)) |n| {
+                    const end = std.mem.indexOfPos(u8, s, i + n, s[i .. i + n]);
+                    i = if (end) |e| e + n else s.len;
+                } else i += 1;
+            },
+            else => i += 1,
+        }
+    }
+    return null;
+}
+
+/// Length of the dollar-quote opener at `s[i]` (`$$` = 2, `$tag$` = tag+2), or
+/// null when this `$` starts a `$param` reference instead.
+fn dollarTagLen(s: []const u8, i: usize) ?usize {
+    var j = i + 1;
+    while (j < s.len and s[j] != '$') : (j += 1) {
+        const c = s[j];
+        if (!std.ascii.isAlphanumeric(c) and c != '_') return null;
+        if (j == i + 1 and std.ascii.isDigit(c)) return null;
+    }
+    if (j >= s.len) return null;
+    return j + 1 - i;
+}
+
+/// True when the entry is ready to run: its last non-blank character is a
+/// statement-level `;`.
+fn endsComplete(s: []const u8) bool {
+    const t = std.mem.trim(u8, s, " \t\r\n");
+    if (t.len == 0 or t[t.len - 1] != ';') return false;
+    var i: usize = 0;
+    while (nextTopSemi(t, i)) |p| : (i = p + 1) {
+        if (p == t.len - 1) return true;
+    }
+    return false;
+}
+
+/// Split an entry on statement-level `;`, returning trimmed non-empty statement
+/// texts with the terminator stripped. Slices point into `s`.
+fn splitStatements(arena: std.mem.Allocator, s: []const u8) ![]const []const u8 {
+    var out = std.array_list.Managed([]const u8).init(arena);
+    var start: usize = 0;
+    var i: usize = 0;
+    while (nextTopSemi(s, i)) |p| : (i = p + 1) {
+        const seg = std.mem.trim(u8, s[start..p], " \t\r\n");
+        if (seg.len > 0) try out.append(seg);
+        start = p + 1;
+    }
+    const tail = std.mem.trim(u8, s[start..], " \t\r\n");
+    if (tail.len > 0) try out.append(tail);
+    return out.toOwnedSlice();
+}
+
+const DeclKind = enum { connection, function, param, endpoint };
+const DeclId = struct { kind: DeclKind, name: []const u8 };
+
+/// Next whitespace-delimited word at `i.*`, advancing past it.
+fn nextWord(s: []const u8, i: *usize) ?[]const u8 {
+    while (i.* < s.len and std.ascii.isWhitespace(s[i.*])) i.* += 1;
+    if (i.* >= s.len) return null;
+    const start = i.*;
+    while (i.* < s.len and !std.ascii.isWhitespace(s[i.*])) i.* += 1;
+    return s[start..i.*];
+}
+
+/// Leading identifier of a word, so `f(a,` yields `f`.
+/// ponytail: bare identifiers only — the dialect has no quoted decl names.
+fn identPrefix(w: []const u8) []const u8 {
+    var n: usize = 0;
+    while (n < w.len and (std.ascii.isAlphanumeric(w[n]) or w[n] == '_')) n += 1;
+    return w[0..n];
+}
+
+/// Classify a statement as a session declaration and name it:
+/// `CREATE [OR REPLACE] CONNECTION|FUNCTION <name>`, `CREATE ENDPOINT ...`
+/// (unnamed — the REPL rejects it), or `PARAM <name>`. Null for anything else.
+fn declOf(stmt: []const u8) ?DeclId {
+    var i: usize = 0;
+    var w = nextWord(stmt, &i) orelse return null;
+    if (std.ascii.eqlIgnoreCase(w, "param")) {
+        const n = identPrefix(nextWord(stmt, &i) orelse return null);
+        return if (n.len == 0) null else .{ .kind = .param, .name = n };
+    }
+    if (!std.ascii.eqlIgnoreCase(w, "create")) return null;
+    w = nextWord(stmt, &i) orelse return null;
+    if (std.ascii.eqlIgnoreCase(w, "or")) {
+        w = nextWord(stmt, &i) orelse return null;
+        if (!std.ascii.eqlIgnoreCase(w, "replace")) return null;
+        w = nextWord(stmt, &i) orelse return null;
+    }
+    if (std.ascii.eqlIgnoreCase(w, "endpoint")) return .{ .kind = .endpoint, .name = "" };
+    const kind: DeclKind = if (std.ascii.eqlIgnoreCase(w, "connection"))
+        .connection
+    else if (std.ascii.eqlIgnoreCase(w, "function"))
+        .function
+    else
+        return null;
+    const n = identPrefix(nextWord(stmt, &i) orelse return null);
+    return if (n.len == 0) null else .{ .kind = kind, .name = n };
+}
+
+/// Declarations carried across REPL entries, so `CREATE CONNECTION erp ...` in
+/// one entry is still in scope for a `SELECT ... FROM erp.orders` in the next.
+/// Order-preserving (declarations may reference earlier ones); re-declaring a
+/// (kind, name) replaces the stored text in place. Text is duped with the
+/// REPL's gpa because the input buffer is reused every line.
+const DeclStore = struct {
+    const Entry = struct { kind: DeclKind, name: []u8, text: []u8 };
+
+    gpa: std.mem.Allocator,
+    items: std.array_list.Managed(Entry),
+
+    fn init(gpa: std.mem.Allocator) DeclStore {
+        return .{ .gpa = gpa, .items = std.array_list.Managed(Entry).init(gpa) };
+    }
+    fn deinit(self: *DeclStore) void {
+        self.clear();
+        self.items.deinit();
+    }
+    fn clear(self: *DeclStore) void {
+        for (self.items.items) |e| {
+            self.gpa.free(e.name);
+            self.gpa.free(e.text);
+        }
+        self.items.clearRetainingCapacity();
+    }
+    fn put(self: *DeclStore, id: DeclId, text: []const u8) !void {
+        const dup_text = try self.gpa.dupe(u8, text);
+        errdefer self.gpa.free(dup_text);
+        for (self.items.items) |*e| {
+            if (e.kind != id.kind or !std.ascii.eqlIgnoreCase(e.name, id.name)) continue;
+            self.gpa.free(e.text);
+            e.text = dup_text;
+            return;
+        }
+        const dup_name = try self.gpa.dupe(u8, id.name);
+        errdefer self.gpa.free(dup_name);
+        try self.items.append(.{ .kind = id.kind, .name = dup_name, .text = dup_text });
+    }
+};
+
+/// Mutable REPL state: the declaration prelude plus per-session toggles.
+const Session = struct {
+    decls: DeclStore,
+    json: bool = false,
+    tty: bool = false,
+};
+
+/// Interactive read-eval-print loop. An entry runs when a line ends in a
+/// statement-level `;` (a blank line also runs a pending buffer, which is what
+/// `echo ... | basalt repl` relies on). Declarations persist across entries; a
+/// terminal SELECT prints as a table (a stdout sink is appended when the entry
+/// doesn't write). Prompts only on a TTY.
 fn cmdRepl(alloc: std.mem.Allocator) !u8 {
     var in_buf: [64 * 1024]u8 = undefined;
     var in_file = std.fs.File.stdin().reader(&in_buf);
@@ -357,67 +550,142 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
     var msg_file = std.fs.File.stderr().writer(&msg_buf);
     const msg = &msg_file.interface;
 
-    const tty = std.posix.isatty(std.fs.File.stdin().handle);
-    if (tty) {
-        try msg.writeAll("basalt REPL — enter a pipeline, blank line runs it. \\q quits, \\help for help.\n");
+    var sess = Session{ .decls = DeclStore.init(alloc), .tty = std.posix.isatty(std.fs.File.stdin().handle) };
+    defer sess.decls.deinit();
+
+    if (sess.tty) {
+        try msg.writeAll("basalt REPL — end a statement with `;` to run it. \\q quits, \\help for help; `rlwrap basalt repl` adds history.\n");
         try msg.flush();
     }
 
     var block = std.array_list.Managed(u8).init(alloc);
     defer block.deinit();
 
-    while (true) {
-        if (tty) {
-            try msg.writeAll("\xc2\xbb ");
-            try msg.flush();
-        }
+    var quit = false;
+    while (!quit) {
+        // Un-poison the session: a ^C-aborted query leaves the abort flag set.
+        runtime.resetAbort();
         block.clearRetainingCapacity();
-        var eof = false;
         while (true) {
+            if (sess.tty) {
+                const prompt: []const u8 = if (block.items.len == 0) "\xc2\xbb " else "\xe2\x80\xa6 ";
+                try msg.writeAll(prompt);
+                try msg.flush();
+            }
             const maybe = in.takeDelimiter('\n') catch |e| {
                 try msg.print("input error: {s}\n", .{@errorName(e)});
                 try msg.flush();
-                eof = true;
+                quit = true;
                 break;
             };
             const line = maybe orelse {
-                eof = true;
+                quit = true;
                 break;
             };
-            if (isBlank(line)) break;
+            const t = std.mem.trim(u8, line, " \t\r\n");
+            if (t.len == 0) {
+                if (block.items.len == 0) continue;
+                break; // blank line still runs a pending buffer
+            }
+            // Meta commands only lead an entry, so `\` inside a query is untouched.
+            if (block.items.len == 0 and (t[0] == '\\' or isQuit(t) or isHelp(t))) {
+                if (isQuit(t)) {
+                    quit = true;
+                    break;
+                }
+                try metaCommand(t, &sess, msg);
+                continue;
+            }
             try block.appendSlice(line);
             try block.append('\n');
+            if (endsComplete(block.items)) break;
         }
 
         const trimmed = std.mem.trim(u8, block.items, " \t\r\n");
-        if (trimmed.len == 0) {
-            if (eof) break;
-            continue;
-        }
-        if (isQuit(trimmed)) break;
-        if (isHelp(trimmed)) {
-            try replHelp(msg);
-            if (eof) break;
-            continue;
-        }
-
-        try runBlock(alloc, trimmed, msg);
-        if (eof) break;
+        if (trimmed.len == 0) continue;
+        try runBlock(alloc, trimmed, &sess, msg);
     }
-    if (tty) {
+    if (sess.tty) {
         try msg.writeAll("bye\n");
         try msg.flush();
     }
     return 0;
 }
 
+/// Handle a `\...` entry. Unknown ones report themselves instead of reaching
+/// the parser.
+fn metaCommand(t: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
+    defer msg.flush() catch {};
+    if (isHelp(t)) return replHelp(msg);
+
+    var i: usize = 0;
+    const cmd = nextWord(t, &i) orelse return;
+    const rest = std.mem.trim(u8, t[i..], " \t\r\n");
+
+    if (std.mem.eql(u8, cmd, "\\connections") or std.mem.eql(u8, cmd, "\\c")) {
+        if (sess.decls.items.items.len == 0) return msg.writeAll("(no declarations)\n");
+        for (sess.decls.items.items) |e| try msg.print("{s} {s}\n", .{ @tagName(e.kind), e.name });
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "\\clear")) {
+        sess.decls.clear();
+        return msg.writeAll("cleared\n");
+    }
+    if (std.mem.eql(u8, cmd, "\\format") or std.mem.eql(u8, cmd, "\\f")) {
+        if (rest.len == 0) {
+            // fall through to the echo below
+        } else if (std.ascii.eqlIgnoreCase(rest, "json")) {
+            sess.json = true;
+        } else if (std.ascii.eqlIgnoreCase(rest, "table")) {
+            sess.json = false;
+        } else {
+            return msg.print("error: \\format takes `json` or `table`, got `{s}`\n", .{rest});
+        }
+        const mode: []const u8 = if (sess.json) "json" else "table";
+        return msg.print("format {s}\n", .{mode});
+    }
+    try msg.print("error: unknown command `{s}` — \\help for help\n", .{cmd});
+}
+
 /// Parse and run one REPL entry, reporting errors without aborting the loop.
-fn runBlock(alloc: std.mem.Allocator, block: []const u8, msg: *std.Io.Writer) !void {
+/// The entry is prefixed with the session's stored declarations so earlier
+/// connections/functions/params are in scope; new declarations are committed
+/// only once the combined text parses, so a typo can't poison the session.
+fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const text = block;
+    const Pending = struct { id: DeclId, text: []const u8 };
+    var pending = std.array_list.Managed(Pending).init(a);
+    var executable: usize = 0;
+    for (try splitStatements(a, block)) |st| {
+        const id = declOf(st) orelse {
+            executable += 1;
+            continue;
+        };
+        if (id.kind == .endpoint) {
+            try msg.writeAll("error: CREATE ENDPOINT can't run in the REPL — put it in a script and use `basalt serve <dir>`\n");
+            try msg.flush();
+            return;
+        }
+        try pending.append(.{ .id = id, .text = st });
+    }
+
+    // Prelude + entry. A declaration this entry replaces is dropped from the
+    // prelude so the combined text doesn't declare the same name twice.
+    var buf = std.array_list.Managed(u8).init(a);
+    for (sess.decls.items.items) |e| {
+        var shadowed = false;
+        for (pending.items) |p| {
+            if (p.id.kind == e.kind and std.ascii.eqlIgnoreCase(p.id.name, e.name)) shadowed = true;
+        }
+        if (shadowed) continue;
+        try buf.appendSlice(e.text);
+        try buf.appendSlice(";\n");
+    }
+    try buf.appendSlice(block);
+    const text = buf.items;
 
     var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const prog = parser.parseSource(a, text, &diag) catch |e| switch (e) {
@@ -429,17 +697,36 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, msg: *std.Io.Writer) !v
         error.OutOfMemory => return e,
     };
 
+    for (pending.items) |p| try sess.decls.put(p.id, p.text);
+
+    if (executable == 0) {
+        for (pending.items) |p| try msg.print("ok: {s} {s}\n", .{ @tagName(p.id.kind), p.id.name });
+        try msg.flush();
+        return;
+    }
+
     const prepared = try appendDisplaySinks(a, prog);
 
+    const t0 = std.time.milliTimestamp();
     var rdiag: runtime.Diag = .{};
-    _ = runtime.run(alloc, prepared, .{ .log = .{ .summary = .none, .quiet = true } }, &rdiag) catch |e| {
+    _ = runtime.run(alloc, prepared, .{
+        .log = .{ .summary = .none, .quiet = true },
+        .stdout_json = sess.json,
+    }, &rdiag) catch |e| {
         if (e == error.OutOfMemory) return e;
-        if (rdiag.msg.len > 0)
+        if (e == error.Aborted)
+            try msg.writeAll("aborted\n")
+        else if (rdiag.msg.len > 0)
             try msg.print("error: {s}\n", .{rdiag.msg})
         else
             try msg.print("error: {s}\n", .{@errorName(e)});
         try msg.flush();
+        return;
     };
+    if (sess.tty) {
+        try msg.print("({d} ms)\n", .{std.time.milliTimestamp() - t0});
+        try msg.flush();
+    }
 }
 
 /// Append a `write stdout` table sink to any output pipeline that doesn't already
@@ -463,9 +750,6 @@ fn appendDisplaySinks(arena: std.mem.Allocator, prog: ast.Program) !ast.Program 
     return .{ .stmts = stmts };
 }
 
-fn isBlank(s: []const u8) bool {
-    return std.mem.trim(u8, s, " \t\r\n").len == 0;
-}
 fn isQuit(s: []const u8) bool {
     inline for (.{ "\\q", "\\quit", ":q", "quit", "exit" }) |k| {
         if (std.mem.eql(u8, s, k)) return true;
@@ -480,10 +764,20 @@ fn isHelp(s: []const u8) bool {
 }
 fn replHelp(msg: *std.Io.Writer) !void {
     try msg.writeAll(
-        \\REPL — enter a query, then a blank line to run it (results print as a table).
-        \\  • a terminal SELECT prints; LOAD INTO writes to its target.
-        \\  example:  SELECT id, amount FROM 'examples/in.csv' WHERE status = 'paid';
-        \\  \q quit    \help this help
+        \\REPL — end a statement with `;` to run it; a blank line also runs a pending entry.
+        \\  • a terminal SELECT prints as a table; LOAD INTO writes to its target.
+        \\  • CREATE CONNECTION / CREATE FUNCTION / PARAM stay in scope for later entries.
+        \\  example:  CREATE CONNECTION erp TYPE postgres HOST 'db' DATABASE 'erp';
+        \\            SELECT id, amount FROM erp.orders WHERE status = 'paid';
+        \\
+        \\commands:
+        \\  \connections, \c   list the declarations held for this session
+        \\  \clear             forget them all
+        \\  \format json|table set the output format (bare \format shows it); \f is an alias
+        \\  \help, \h, ?       this help
+        \\  \q, \quit, exit    leave
+        \\
+        \\for history and arrow keys, run under rlwrap:  rlwrap basalt repl
         \\
     );
     try msg.flush();
@@ -554,16 +848,70 @@ test "threadFlagValue recognizes all four -j/--threads spellings" {
     try std.testing.expectEqual(@as(usize, 0), i);
 }
 
-test "REPL input classification: blank, quit, help" {
-    try std.testing.expect(isBlank(""));
-    try std.testing.expect(isBlank(" \t\r\n"));
-    try std.testing.expect(!isBlank(" x "));
+test "REPL input classification: quit, help" {
     try std.testing.expect(isQuit("\\q"));
     try std.testing.expect(isQuit("exit"));
     try std.testing.expect(!isQuit("exit()"));
     try std.testing.expect(isHelp("?"));
     try std.testing.expect(isHelp("\\help"));
     try std.testing.expect(!isHelp("help me"));
+}
+
+test "endsComplete sees only statement-level semicolons" {
+    try std.testing.expect(endsComplete("SELECT 1;"));
+    try std.testing.expect(endsComplete("  SELECT 1;\n\n"));
+    try std.testing.expect(!endsComplete(""));
+    try std.testing.expect(!endsComplete("SELECT 1"));
+
+    // a `;` inside a literal or a comment doesn't end the statement
+    try std.testing.expect(!endsComplete("SELECT ';' AS x"));
+    try std.testing.expect(endsComplete("SELECT ';' AS x;"));
+    try std.testing.expect(!endsComplete("SELECT 'it''s;")); // `''` escape, still open
+    try std.testing.expect(endsComplete("SELECT 'it''s;' AS x;"));
+    try std.testing.expect(!endsComplete("SELECT \"a\\\";")); // `\"` escape, still open
+    try std.testing.expect(endsComplete("SELECT \"a;b\" AS x;"));
+    try std.testing.expect(!endsComplete("SELECT 1 -- ;"));
+    try std.testing.expect(!endsComplete("/* ; */"));
+    try std.testing.expect(endsComplete("/* ; */ SELECT 1;"));
+
+    // dollar quotes, both anonymous and tagged
+    try std.testing.expect(!endsComplete("FROM c.QUERY($$a;b$$)"));
+    try std.testing.expect(endsComplete("FROM c.QUERY($$a;b$$);"));
+    try std.testing.expect(!endsComplete("FROM c.QUERY($q$a;b$q$)"));
+    try std.testing.expect(endsComplete("FROM c.QUERY($q$a;b$q$);"));
+    // `$name` is a param reference, not a quote opener
+    try std.testing.expect(endsComplete("SELECT $since;"));
+}
+
+test "splitStatements splits on statement-level semicolons only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const parts = try splitStatements(arena.allocator(),
+        \\CREATE CONNECTION erp TYPE postgres;
+        \\SELECT ';' AS x; -- ; not a split
+        \\SELECT 2
+    );
+    try std.testing.expectEqual(@as(usize, 3), parts.len);
+    try std.testing.expectEqualStrings("CREATE CONNECTION erp TYPE postgres", parts[0]);
+    try std.testing.expectEqualStrings("SELECT ';' AS x", parts[1]);
+    try std.testing.expectEqualStrings("-- ; not a split\nSELECT 2", parts[2]);
+}
+
+test "declOf names session declarations" {
+    try std.testing.expectEqual(DeclKind.connection, declOf("CREATE CONNECTION erp TYPE postgres").?.kind);
+    try std.testing.expectEqualStrings("erp", declOf("CREATE CONNECTION erp TYPE postgres").?.name);
+    try std.testing.expectEqualStrings("erp", declOf("create\n  or replace\n  connection erp TYPE mysql").?.name);
+    try std.testing.expectEqual(DeclKind.function, declOf("CREATE FUNCTION f(a, b) AS a + b").?.kind);
+    try std.testing.expectEqualStrings("f", declOf("CREATE FUNCTION f(a, b) AS a + b").?.name);
+    try std.testing.expectEqual(DeclKind.param, declOf("param since date DEFAULT '2020-01-01'").?.kind);
+    try std.testing.expectEqualStrings("since", declOf("param since date").?.name);
+    try std.testing.expectEqual(DeclKind.endpoint, declOf("CREATE ENDPOINT '/x'").?.kind);
+
+    try std.testing.expect(declOf("SELECT 1") == null);
+    try std.testing.expect(declOf("CREATE TABLE t") == null);
+    try std.testing.expect(declOf("CREATE OR SOMETHING CONNECTION erp") == null);
+    try std.testing.expect(declOf("") == null);
 }
 
 test "appendDisplaySinks adds `write stdout` only to sink-less pipelines" {
