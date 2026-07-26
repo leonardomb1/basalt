@@ -4,11 +4,22 @@ Basalt scripts describe a **columnar data pipeline**: read from a source,
 transform with a query, write to a sink. A script is plan-time static — parsed,
 type-checked, and planned once, then executed as a streaming pull pipeline.
 
-This is the reference for the SQL dialect. It is derived
-from the parser (`src/lang/sql_parser.zig`) and reflects what the engine
-actually accepts. Basalt SQL is the only dialect: the BSL (`.bsl`) parser was
-removed in v0.2.0 — `examples/golden/` holds the frozen plans that gated the
-removal.
+This is the reference for the SQL dialect, derived from the parser
+(`src/lang/sql_parser.zig`); it reflects what the engine actually accepts.
+Basalt SQL is the only dialect: the BSL (`.bsl`) parser was removed in v0.2.0 —
+`examples/golden/` holds the frozen plans that gated the removal.
+
+1. [Program structure](#1-program-structure)
+2. [Parameters](#2-parameters)
+3. [Connections](#3-connections)
+4. [Sink — `LOAD INTO`](#4-sink--load-into)
+5. [Queries](#5-queries)
+6. [`UNION ALL BY NAME`](#6-union-all-by-name--reconciliation-by-name)
+7. [`FOR EACH ROW OF` and the `CASE` statement](#7-for-each-row-of-and-the-case-statement)
+8. [HTTP mode](#8-http-mode)
+9. [Expressions](#9-expressions)
+10. [Running & exit codes](#10-running--exit-codes)
+11. [Designed but not yet implemented](#11-designed-but-not-yet-implemented)
 
 ---
 
@@ -82,8 +93,9 @@ default-instance cloud endpoints, so this never applies there.)
 **Credentials by convention:** connection `erp` resolves `ERP_USER` /
 `ERP_PASS` from the environment at connect time — the common case costs zero
 characters. Explicit `user = ...` / `password = ...` options override the
-convention. Secrets are never literals in the script; always environment
-indirection.
+convention. Azure Blob paths (`az://...`, §5) resolve `AZURE_STORAGE_KEY`, and
+`AZURE_BLOB_ENDPOINT` points them at an emulator. Secrets are never literals
+in the script; always environment indirection.
 
 `CREATE OR REPLACE CONNECTION` re-declares an existing name.
 
@@ -99,7 +111,9 @@ AS
 <query>;
 ```
 
-- File target by path: `LOAD INTO '/out/x.csv' AS ...` (CSV writer).
+- File target by quoted path — the extension picks the writer:
+  `LOAD INTO '/out/x.csv'`, `LOAD INTO '/out/x.parquet'`, or an object-store
+  path `LOAD INTO 'az://account/container/bronze/x.parquet'`.
 - A per-row dynamic target uses `IDENTIFIER(<string-expr>)` over loop vars
   (§7): `LOAD INTO sr.IDENTIFIER('crm_' || lower($name)) ...`.
 - Dispositions: `APPEND` (default, omissible) · `REPLACE` (overwrite) ·
@@ -137,12 +151,17 @@ LIMIT 100 OFFSET 20;
 | SQL table | `FROM erp.dbo.SC5010` |
 | SQL table (per-row name) | `FROM erp.dbo.IDENTIFIER($name)` (§7) — still a table read |
 | raw query | `FROM erp.QUERY($$SELECT ...$$)` (no dialect translation) |
-| CSV file / HTTPS CSV | `FROM 'path-or-url.csv'` |
+| file — CSV or Parquet | `FROM 'path.csv'` / `FROM 'path.parquet'` — the extension picks the reader; local or HTTPS URL |
+| object storage | `FROM 'az://account/container/path.parquet'`; a trailing `/` reads every blob under the prefix as one table |
 | REST (connection) | `FROM crm.'/v1/customers'` (path on the conn's base URL) |
 | REST (bare URL) | `FROM HTTP('https://host/api/x')` |
 | request body | `FROM BODY (col TYPE [NOT NULL], ...)` (§8) |
+| durable buffer | `FROM BUFFER 'name'` (§8) |
 | discovered union | `FROM EACH TABLE OF (...)` (§6) |
 | CTE | `FROM <name>` |
+
+Parquet reads use column projection, row-group skipping from statistics, and
+ranged reads — only the footer and the chunks a query needs are fetched.
 
 Source clauses, in any order after the source:
 
@@ -167,12 +186,25 @@ Source clauses, in any order after the source:
   `size`→`page_size`, `total`→`total_field`, `field`→`cursor_field`,
   `start`→`start_page`, `max`→`max_pages`); unknown keys pass through.
 - **`RETRY n [ON (429, 503)]`** — retries + retryable statuses.
-- **`WITH (k = v, flag, ...)`** — residual source options: `buffer` (drain the
-  source fully before opening the sink), `prefetch`, `timeout_ms`, `auth`
-  forms, `method`/`body` for POST sources, etc.
+- **`WITH (k = v, flag, ...)`** — residual source options: `items` (dotted
+  path to the row array when the response nests it, e.g. `items = 'data.rows'`
+  — a bare array needs nothing), `buffer` (drain the source fully before
+  opening the sink), `prefetch`, `timeout_ms`, `header = 'Name: value'`,
+  `auth` forms, `method`/`body` for POST sources, etc.
 
 `WHERE` on a REST source runs in basalt after the fetch; on a SQL table it is
 pushdown. Same word, different plan — `EXPLAIN` shows which.
+
+A complete REST read, for orientation:
+
+```sql
+SELECT id AS crate, downloads
+FROM HTTP('https://crates.io/api/v1/crates?per_page=100&sort=downloads')
+  PAGINATE BY page (param = 'page', size = 100, total = 'meta.total', max = 5)
+  RETRY 2 ON (429, 503)
+  WITH (items = 'crates')
+WHERE downloads > 0;
+```
 
 ### Operators
 
@@ -185,18 +217,34 @@ pushdown. Same word, different plan — `EXPLAIN` shows which.
 | `COUNT(*) / SUM / AVG / MIN / MAX ... GROUP BY k` | aggregate (non-agg items must be group keys) |
 | `COUNT(DISTINCT x)` | aggregate — combines freely with other aggregates; ignores nulls |
 | `HAVING <expr>` | filter after the aggregate; aggregate calls in it refer to the columns it produced |
-
-Row order without `ORDER BY` is not defined: `GROUP BY` returns groups in hash-partition
-order, and `DISTINCT` and map pipelines reorder under `-j > 1` (which is the default,
-since `-j` defaults to the core count). Add `ORDER BY` whenever the order matters.
 | `ORDER BY a DESC, b` | sort |
 | `LIMIT n [OFFSET m]` | limit |
 | `SELECT DISTINCT` / `DISTINCT ON (a, b)` | distinct |
 | `CROSS JOIN UNNEST(SPLIT(tags, ',')) AS tag` | explode (also `UNNEST(col)`) |
 | `[INNER\|LEFT\|RIGHT\|FULL\|CROSS\|SEMI\|ANTI] JOIN <cte> x ON a = b` | join (right side must be a CTE) |
 
+Row order without `ORDER BY` is not defined: `GROUP BY` returns groups in
+hash-partition order, and `DISTINCT` and map pipelines reorder under `-j > 1`
+(which is the default, since `-j` defaults to the core count). Add `ORDER BY`
+whenever the order matters.
+
 Table aliases (`FROM t a`, `JOIN c b`) are stripped at parse time — the engine
 sees bare column names.
+
+Aggregation end to end:
+
+```sql
+SELECT region,
+       COUNT(*)                AS orders,
+       COUNT(DISTINCT customer) AS customers,
+       SUM(amount)             AS revenue
+FROM 'orders.parquet'
+WHERE placed_at >= '2026-01-01'
+GROUP BY region
+HAVING COUNT(*) > 100
+ORDER BY revenue DESC
+LIMIT 10;
+```
 
 ### Naming, `GROUP BY` and `ORDER BY`
 
@@ -447,7 +495,7 @@ basalt check <script>|-|-c "<inline>" [--connect]
 
 Accepted design not yet in the engine:
 
-- **Whole-CTE / cross-source pushdown** (§7's full Trino model): implicit
+- **Whole-CTE / cross-source pushdown** (§5's full Trino model): implicit
   pushdown currently translates the filter prefix of a *single* SQL read. A
   multi-stage CTE that is entirely one connection isn't yet collapsed into one
   descended query, and a cross-connection join still materializes the smaller
@@ -471,6 +519,3 @@ Deliberately partial:
   quantifiers `* + ?`. Lookaround, lazy quantifiers and `{n,m}` counts are
   **rejected at compile time** rather than read as literal characters, so an
   unsupported pattern is an error and never a silently wrong match.
-
-The golden corpus that gated the BSL parser's removal lives in
-`examples/golden/` — see its README for the comparison rules.
