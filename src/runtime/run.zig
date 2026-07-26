@@ -659,6 +659,8 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     {
         if (classifyAggPipeline(stages)) |shape| {
             if (try runParallelParquetAgg(env, stages[0].node.read, stages[0 .. stages.len - 1], shape.prefix, shape.ag, shape.tail, last.write, opts, stats, lanes_used)) return;
+        } else if (classifyMapPipeline(stages)) |map_stages| {
+            if (try runParallelParquetMap(env, stages[0].node.read, stages[0 .. stages.len - 1], map_stages, last.write, opts, stats, lanes_used)) return;
         }
     }
 
@@ -1080,20 +1082,15 @@ const pq_min_lanes: usize = 4;
 /// group: each lane opens its own reader over a disjoint window and folds into
 /// its own table. Nothing is shared until the radix merge.
 const PqAggCtx = struct {
-    path: []const u8,
-    project: ?[][]const u8,
-    bounds: []const pqdecode.Bound,
-    src_schema: *const types.Schema,
+    morsels: PqMorsels,
     agg_in_schema: *const types.Schema,
     out_schema: *const types.Schema,
     prefix: []const ast.Stage,
     params: *std.StringHashMap(*const ast.Expr),
     by: []const usize,
     aggs: []const op.Aggregate.Agg,
-    queue: WorkQueue,
     lanes: []PqLane,
     rows_read: *std.atomic.Value(u64),
-    per_item: usize,
 };
 
 /// Pulls row-group morsels off the shared queue and presents them as one
@@ -1101,14 +1098,24 @@ const PqAggCtx = struct {
 /// everything it steals: folding per morsel and merging afterwards would walk
 /// the lane's groups an extra time, which at high cardinality costs more than
 /// the parallelism buys.
+/// The shared row-group work list a parallel parquet path hands to its lanes.
+const PqMorsels = struct {
+    path: []const u8,
+    project: ?[][]const u8,
+    bounds: []const pqdecode.Bound,
+    src_schema: *const types.Schema,
+    per_item: usize,
+    queue: WorkQueue,
+};
+
 const MorselSource = struct {
-    ctx: *PqAggCtx,
+    m: *PqMorsels,
     scratch: std.mem.Allocator,
     cur: ?*pqdecode.Reader = null,
 
     fn schemaFn(ptr: *anyopaque) types.Schema {
         const self: *MorselSource = @ptrCast(@alignCast(ptr));
-        return self.ctx.src_schema.*;
+        return self.m.src_schema.*;
     }
     fn nextFn(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?batchmod.Batch {
         const self: *MorselSource = @ptrCast(@alignCast(ptr));
@@ -1117,14 +1124,14 @@ const MorselSource = struct {
                 if (try r.next(arena)) |b| return b;
                 self.cur = null;
             }
-            if (self.ctx.queue.failed.load(.seq_cst)) return null;
-            const i = self.ctx.queue.next.fetchAdd(1, .seq_cst);
-            if (i >= self.ctx.queue.nitems) return null;
-            const r = try pqdecode.Reader.openProjected(self.scratch, self.ctx.path, self.ctx.project);
-            r.bounds = self.ctx.bounds;
-            r.rg = i * self.ctx.per_item;
+            if (self.m.queue.failed.load(.seq_cst)) return null;
+            const i = self.m.queue.next.fetchAdd(1, .seq_cst);
+            if (i >= self.m.queue.nitems) return null;
+            const r = try pqdecode.Reader.openProjected(self.scratch, self.m.path, self.m.project);
+            r.bounds = self.m.bounds;
+            r.rg = i * self.m.per_item;
             if (r.rg >= r.md.row_groups.len) continue;
-            r.rg_end = @min(r.rg + self.ctx.per_item, r.md.row_groups.len);
+            r.rg_end = @min(r.rg + self.m.per_item, r.md.row_groups.len);
             self.cur = r;
         }
     }
@@ -1135,17 +1142,17 @@ const MorselSource = struct {
 };
 
 fn pqAggLane(ctx: *PqAggCtx, lane_idx: usize) void {
-    pqAggLaneRun(ctx, lane_idx) catch |e| ctx.queue.fail(e);
+    pqAggLaneRun(ctx, lane_idx) catch |e| ctx.morsels.queue.fail(e);
 }
 
 fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
     const ls = &ctx.lanes[lane_idx];
     const la = ls.arena.allocator();
 
-    var ms = MorselSource{ .ctx = ctx, .scratch = la };
+    var ms = MorselSource{ .m = &ctx.morsels, .scratch = la };
     var cs = obs.CountingSource{ .inner = .{ .ptr = &ms, .vtable = &MorselSource.vtable }, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const child = try buildMapChain(la, ctx.params, ctx.prefix, &scan, ctx.src_schema);
+    const child = try buildMapChain(la, ctx.params, ctx.prefix, &scan, ctx.morsels.src_schema);
     var agg = op.Aggregate{
         .child = child,
         .in_schema = ctx.agg_in_schema,
@@ -1250,6 +1257,117 @@ fn pqTopNOne(ctx: *PqTopNCtx, p: usize) !void {
     g.shrinkRetainingCapacity(ctx.n);
 }
 
+/// Map-only pipeline (scan -> filter/project/explode -> write) over a local
+/// parquet file. Each lane pulls row-group morsels and writes its own output,
+/// so nothing is shared except the work list and, for a shared sink, the write
+/// lock.
+const PqMapCtx = struct {
+    morsels: PqMorsels,
+    map_stages: []const ast.Stage,
+    params: *std.StringHashMap(*const ast.Expr),
+    sink_mode: parallel.SinkMode,
+    sink_mtx: std.Thread.Mutex = .{},
+    rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    rows_read: *std.atomic.Value(u64),
+};
+
+fn pqMapLane(ctx: *PqMapCtx, lane_idx: usize) void {
+    pqMapLaneRun(ctx, lane_idx) catch |e| ctx.morsels.queue.fail(e);
+}
+
+fn pqMapLaneRun(ctx: *PqMapCtx, lane_idx: usize) !void {
+    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
+    defer _ = wgpa.deinit();
+    const wa = wgpa.allocator();
+    var warena = std.heap.ArenaAllocator.init(wa);
+    defer warena.deinit();
+    var batch_arena = std.heap.ArenaAllocator.init(wa);
+    defer batch_arena.deinit();
+
+    const own_sink: ?driver.Sink = switch (ctx.sink_mode) {
+        .shared => null,
+        .per_lane => |pl| try pl.open(pl.ctx, wa, lane_idx),
+    };
+    var own_sink_open = own_sink != null;
+    defer if (own_sink) |sk| {
+        if (own_sink_open) sk.abort();
+    };
+
+    var ms = MorselSource{ .m = &ctx.morsels, .scratch = warena.allocator() };
+    var cs = obs.CountingSource{ .inner = .{ .ptr = &ms, .vtable = &MorselSource.vtable }, .count = ctx.rows_read };
+    var scan = op.Scan{ .src = cs.source() };
+    const chain = try buildMapChain(warena.allocator(), ctx.params, ctx.map_stages, &scan, ctx.morsels.src_schema);
+
+    var out: u64 = 0;
+    while (try chain.next(batch_arena.allocator())) |b| {
+        try parallel.writeLaneBatch(ctx.sink_mode, &ctx.sink_mtx, own_sink, batch_arena.allocator(), b);
+        out += b.len;
+        _ = batch_arena.reset(.retain_capacity);
+    }
+    _ = ctx.rows_out.fetchAdd(out, .monotonic);
+    if (own_sink) |sk| {
+        own_sink_open = false;
+        try sk.close();
+    }
+}
+
+fn runParallelParquetMap(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, map_stages: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    const arena = env.arena;
+    const path = switch (rd.form) {
+        .path => |p| p,
+        else => return false,
+    };
+    if (std.mem.eql(u8, w.connector, "stdout")) return false;
+    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
+    if (opts.threads < 2) return false;
+
+    const project = try projectedColumns(env, pipeline[1..]);
+    const bounds = try filterBounds(env, pipeline[1..]);
+    const probe = pqdecode.Reader.openProjected(arena, path, project) catch return false;
+    const ngroups = probe.md.row_groups.len;
+    if (ngroups < 2) return false;
+
+    const src_schema = try schemaPtr(arena, probe.schema);
+    const out_schema = try mapChainSchema(env, map_stages, src_schema.*);
+
+    env.src_name = "parquet";
+    env.sink_name = sinkLabel(env, w);
+
+    const wr = try resolveUpsertKeys(env, w);
+    const sink_mode: parallel.SinkMode = (try buildParallelSink(env, wr, out_schema)) orelse
+        .{ .shared = try openSink(env, wr, out_schema) };
+    var shared_open = sink_mode == .shared;
+    errdefer if (shared_open) sink_mode.shared.abort();
+
+    const nthreads = @max(@as(usize, 1), opts.threads);
+    var ctx = PqMapCtx{
+        .morsels = .{
+            .path = path,
+            .project = project,
+            .bounds = bounds,
+            .src_schema = src_schema,
+            .per_item = 1,
+            .queue = .{ .nitems = ngroups },
+        },
+        .map_stages = map_stages,
+        .params = env.params_expr,
+        .sink_mode = sink_mode,
+        .rows_read = env.rows_read,
+    };
+
+    const lanes = try parallel.spawnJoin(arena, nthreads, pqMapLane, &ctx);
+    lanes_used.* = @max(lanes_used.*, lanes);
+    env.log.log(.info, "parallel parquet map: {d} row groups over {d} lanes ({s} sink)", .{ ngroups, lanes, @tagName(sink_mode) });
+
+    if (ctx.morsels.queue.first_err) |e| return e;
+    stats.rows_out += ctx.rows_out.load(.monotonic);
+    if (sink_mode == .shared) {
+        shared_open = false;
+        try sink_mode.shared.close();
+    }
+    return true;
+}
+
 /// Parallel aggregate over a local parquet file, one morsel per row group.
 /// Parallel aggregate over a local parquet file, one morsel per row group.
 /// Two phases, neither of which takes a lock: lanes fold disjoint row groups
@@ -1300,27 +1418,29 @@ fn runParallelParquetAgg(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, p
     defer for (lanes) |*l| l.arena.deinit();
 
     var ctx = PqAggCtx{
-        .path = path,
-        .project = project,
-        .bounds = bounds,
-        .src_schema = src_schema,
+        .morsels = .{
+            .path = path,
+            .project = project,
+            .bounds = bounds,
+            .src_schema = src_schema,
+            .per_item = per_item,
+            .queue = .{ .nitems = nitems },
+        },
         .agg_in_schema = agg_in,
         .out_schema = out_schema,
         .prefix = prefix,
         .params = env.params_expr,
         .by = apl.by,
         .aggs = aggs,
-        .queue = .{ .nitems = nitems },
         .lanes = lanes,
         .rows_read = env.rows_read,
-        .per_item = per_item,
     };
 
     const t_fold0 = std.time.Instant.now() catch unreachable;
     const used = try parallel.spawnJoin(arena, nthreads, pqAggLane, &ctx);
     const t_fold1 = std.time.Instant.now() catch unreachable;
     lanes_used.* = @max(lanes_used.*, used);
-    if (ctx.queue.first_err) |e| return e;
+    if (ctx.morsels.queue.first_err) |e| return e;
 
     const parts = try env.gpa.alloc(PqPart, pq_parts);
     defer env.gpa.free(parts);
