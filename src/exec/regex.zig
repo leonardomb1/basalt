@@ -1,9 +1,9 @@
 //! A small backtracking regular-expression matcher, enough for the pattern
 //! vocabulary SQL queries actually use: anchors, `.`, character classes,
-//! capturing and non-capturing groups, alternation and the three greedy
-//! quantifiers. Deliberately a subset — no lookaround, no backreferences
-//! inside the pattern, no lazy quantifiers — so it stays a few hundred lines
-//! instead of pulling in a regex dependency.
+//! capturing and non-capturing groups, alternation, and quantifiers — `*`,
+//! `+`, `?`, counted `{n}`/`{n,}`/`{n,m}`, each greedy or lazy. Deliberately
+//! a subset — no lookaround, no backreferences inside the pattern — so it
+//! stays a few hundred lines instead of pulling in a regex dependency.
 //!
 //! Compilation takes an allocator so callers can hand it a
 //! `FixedBufferAllocator` over stack memory: matching a column costs no heap
@@ -42,7 +42,7 @@ const Atom = union(enum) {
 
 const Group = struct { alt: []const []const Item, cap: ?u8 };
 
-const Item = struct { atom: Atom, min: u32 = 1, max: u32 = 1 };
+const Item = struct { atom: Atom, min: u32 = 1, max: u32 = 1, lazy: bool = false };
 
 /// Continuation: what remains to be matched once the current atom succeeds.
 /// Modelling it explicitly is what lets a group backtrack into the sequence
@@ -98,9 +98,20 @@ fn resume_(k: *const Cont, s: []const u8, pos: usize, caps: *Captures) ?usize {
 
 /// Match `items[i..]` where the item at `i` has already matched `rep` times.
 /// Greedy: one more repetition is always tried before settling for fewer.
+/// Lazy inverts only that order — the set of reachable matches is the same.
 fn step(items: []const Item, i: usize, rep: u32, s: []const u8, pos: usize, caps: *Captures, cont: *const Cont) ?usize {
     if (i == items.len) return resume_(cont, s, pos, caps);
     const it = items[i];
+    if (it.lazy) {
+        if (rep >= it.min) {
+            if (step(items, i + 1, 0, s, pos, caps, cont)) |e| return e;
+        }
+        if (rep < it.max) {
+            const k = Cont{ .seq = .{ .items = items, .i = i, .rep = rep + 1, .next = cont } };
+            return matchAtom(it.atom, s, pos, caps, &k);
+        }
+        return null;
+    }
     if (rep < it.max) {
         const k = Cont{ .seq = .{ .items = items, .i = i, .rep = rep + 1, .next = cont } };
         if (matchAtom(it.atom, s, pos, caps, &k)) |e| return e;
@@ -150,33 +161,73 @@ const Parser = struct {
         var items = std.array_list.Managed(Item).init(self.gpa);
         while (self.i < self.src.len and self.src[self.i] != '|' and self.src[self.i] != ')') {
             var it = Item{ .atom = try self.parseAtom() };
+            var quantified = false;
             if (self.i < self.src.len) switch (self.src[self.i]) {
                 '*' => {
                     it.min = 0;
                     it.max = std.math.maxInt(u32);
                     self.i += 1;
+                    quantified = true;
                 },
                 '+' => {
                     it.min = 1;
                     it.max = std.math.maxInt(u32);
                     self.i += 1;
+                    quantified = true;
                 },
                 '?' => {
                     it.min = 0;
                     it.max = 1;
                     self.i += 1;
+                    quantified = true;
+                },
+                '{' => {
+                    try self.parseCount(&it);
+                    quantified = true;
                 },
                 else => {},
             };
-            // A `?` directly after a quantifier means lazy matching, which this
-            // engine does not implement. Reject it rather than read it as a
-            // literal `?` and quietly return the wrong rows.
-            if (it.min != 1 or it.max != 1) {
+            if (quantified and self.i < self.src.len and self.src[self.i] == '?') {
+                it.lazy = true;
+                self.i += 1;
+                // A third quantifier char has nothing left to mean; the other
+                // spellings (`a**`, `a*+`) fall out of parseAtom rejecting them.
                 if (self.i < self.src.len and self.src[self.i] == '?') return Error.BadPattern;
             }
             try items.append(it);
         }
         return items.toOwnedSlice();
+    }
+
+    /// `{n}`, `{n,}` or `{n,m}`, positioned on the `{`. Anything else is an
+    /// error rather than a literal brace: quietly misreading a count would
+    /// return wrong rows. `\{` still parses as a literal via the escape path.
+    fn parseCount(self: *Parser, it: *Item) Error!void {
+        self.i += 1;
+        const min = (try self.parseCountNum()) orelse return Error.BadPattern;
+        var max = min;
+        if (self.i < self.src.len and self.src[self.i] == ',') {
+            self.i += 1;
+            max = (try self.parseCountNum()) orelse std.math.maxInt(u32);
+        }
+        if (self.i >= self.src.len or self.src[self.i] != '}') return Error.BadPattern;
+        self.i += 1;
+        if (min > max) return Error.BadPattern;
+        it.min = min;
+        it.max = max;
+    }
+
+    fn parseCountNum(self: *Parser) Error!?u32 {
+        const start = self.i;
+        var n: u64 = 0;
+        while (self.i < self.src.len and self.src[self.i] >= '0' and self.src[self.i] <= '9') : (self.i += 1) {
+            const d: u64 = self.src[self.i] - '0';
+            n = n * 10 + d;
+            if (n > std.math.maxInt(u32)) return Error.BadPattern;
+        }
+        if (self.i == start) return null;
+        const v: u32 = @intCast(n);
+        return v;
     }
 
     fn parseAtom(self: *Parser) Error!Atom {
@@ -205,8 +256,7 @@ const Parser = struct {
                 return .{ .group = .{ .alt = alt, .cap = cap } };
             },
             '[' => return .{ .class = try self.parseClass() },
-            '{' => return Error.BadPattern, // `{n,m}` counts are not implemented
-            '*', '+', '?' => return Error.BadPattern, // quantifier with nothing to repeat
+            '{', '*', '+', '?' => return Error.BadPattern, // quantifier with nothing to repeat
             '\\' => {
                 if (self.i >= self.src.len) return Error.BadPattern;
                 const e = self.src[self.i];
@@ -357,6 +407,60 @@ test "regex: the ClickBench host-extraction pattern" {
     );
     defer std.testing.allocator.free(got2);
     try std.testing.expectEqualStrings("sub.host.org", got2);
+}
+
+test "regex: counted quantifiers" {
+    var buf: [32 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+    var caps: Captures = undefined;
+
+    var re = try Regex.compile(a, "^a{3}$");
+    try std.testing.expect(re.find("aaa", 0, &caps) != null);
+    try std.testing.expect(re.find("aa", 0, &caps) == null);
+
+    re = try Regex.compile(a, "a{2,}");
+    try std.testing.expectEqual([2]usize{ 0, 4 }, re.find("aaaa", 0, &caps).?);
+
+    re = try Regex.compile(a, "a{2,3}");
+    try std.testing.expectEqual([2]usize{ 0, 3 }, re.find("aaaa", 0, &caps).?);
+
+    re = try Regex.compile(a, "(ab){2}");
+    try std.testing.expectEqual([2]usize{ 0, 4 }, re.find("abab", 0, &caps).?);
+    try std.testing.expect(re.find("ab", 0, &caps) == null);
+}
+
+test "regex: lazy quantifiers" {
+    var buf: [32 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+    var caps: Captures = undefined;
+
+    var re = try Regex.compile(a, "a+?");
+    try std.testing.expectEqual([2]usize{ 0, 1 }, re.find("aaa", 0, &caps).?);
+
+    re = try Regex.compile(a, "a*?b");
+    try std.testing.expectEqual([2]usize{ 0, 3 }, re.find("aab", 0, &caps).?);
+
+    re = try Regex.compile(a, "ab??");
+    try std.testing.expectEqual([2]usize{ 0, 1 }, re.find("ab", 0, &caps).?);
+
+    re = try Regex.compile(a, "a{2,4}?");
+    try std.testing.expectEqual([2]usize{ 0, 2 }, re.find("aaaa", 0, &caps).?);
+
+    re = try Regex.compile(a, "<(.*?)>");
+    try std.testing.expectEqual([2]usize{ 0, 3 }, re.find("<x><y>", 0, &caps).?);
+    try std.testing.expectEqual([2]usize{ 1, 2 }, caps[1].?);
+}
+
+test "regex: malformed quantifiers are rejected" {
+    var buf: [16 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+    const bad = [_][]const u8{ "a{", "a{}", "a{2", "a{2,1}", "a{x}", "a{,3}", "a*??", "a**", "a*+", "{2}" };
+    for (bad) |pat| {
+        try std.testing.expectError(Error.BadPattern, Regex.compile(a, pat));
+    }
 }
 
 test "regex: no match leaves the subject alone" {
