@@ -2,9 +2,9 @@
 //!
 //! Convention (matches git/npm/curl for humans, mongod/12-factor for machines):
 //!   - stdout = data only (a sink, or the `--json` run summary).
-//!   - stderr = logs + diagnostics, rendered by context: human text on a TTY,
-//!     NDJSON (one object per line) when piped — so the same run is readable on a
-//!     laptop and collector-friendly in Docker/k8s. `--log-format` forces either.
+//!   - stderr = logs + diagnostics, plain human text. `--log-format json` opts
+//!     into NDJSON (one object per line) for collectors; nothing switches format
+//!     on its own.
 //! Every line and the summary carry the `run_id` for correlation.
 
 const std = @import("std");
@@ -14,6 +14,8 @@ const batchmod = @import("../exec/batch.zig");
 
 const Batch = batchmod.Batch;
 
+/// Stderr log rendering. `auto` is the flag's default and an accepted alias; it
+/// resolves to text, same as `text`.
 pub const Format = enum { auto, text, json };
 
 /// Log through `logger` when a handle is wired (connectors get one from the
@@ -50,8 +52,8 @@ pub const Level = enum(u8) {
     }
 };
 
-/// Stderr logger. `json` is resolved once at init from the format + isatty so the
-/// hot path is just a branch. Thread-safe (lanes log concurrently).
+/// Stderr logger. `json` is resolved once at init from the format so the hot path
+/// is just a branch. Thread-safe (lanes log concurrently).
 pub const Logger = struct {
     file: std.fs.File,
     json: bool,
@@ -61,13 +63,7 @@ pub const Logger = struct {
 
     pub fn init(run_id: u64, format: Format, min: Level) Logger {
         const file = std.fs.File.stderr();
-        const tty = std.posix.isatty(file.handle);
-        const json = switch (format) {
-            .auto => !tty,
-            .text => false,
-            .json => true,
-        };
-        return .{ .file = file, .json = json, .min = min, .run_id = run_id };
+        return .{ .file = file, .json = format == .json, .min = min, .run_id = run_id };
     }
 
     pub fn enabled(self: *Logger, level: Level) bool {
@@ -75,7 +71,7 @@ pub const Logger = struct {
     }
 
     /// Render the end-of-run summary to stderr in the logger's format (human block
-    /// on a TTY, a structured `run_complete` line when piped).
+    /// by default, a structured `run_complete` line under `--log-format json`).
     pub fn summary(self: *Logger, s: Summary) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -237,6 +233,12 @@ test "summary renderText: read≠written shows both; lane count only when parall
     const eq = Summary{ .run_id = 7, .source = "csv", .sink = "csv", .rows_read = 8, .rows_written = 8, .elapsed_ms = 1000 };
     try eq.renderText(&w2);
     try std.testing.expectEqualStrings("✓ csv → csv  wrote 8  (8 rows/s, 1000 ms)  run=7\n", w2.buffered());
+}
+
+test "logger format: only explicit json is NDJSON; auto resolves to text" {
+    try std.testing.expect(!Logger.init(1, .auto, .info).json);
+    try std.testing.expect(!Logger.init(1, .text, .info).json);
+    try std.testing.expect(Logger.init(1, .json, .info).json);
 }
 
 test "logger level gate: err/warn/info pass at min=info, debug is filtered" {
