@@ -28,6 +28,7 @@ const aad = @import("../connect/aad.zig");
 const splitmod = @import("../connect/split.zig");
 const ssrp = @import("../connect/ssrp.zig");
 const walmod = @import("../connect/wal.zig");
+const gen = @import("../connect/gen.zig");
 const parallel = @import("parallel.zig");
 const analyze = @import("analyze.zig");
 const pushdown = @import("pushdown.zig");
@@ -2775,6 +2776,11 @@ fn renderRead(arena: std.mem.Allocator, rd: ast.Read, lr: LoopRow) !ast.Read {
         .query => |s| .{ .query = try interpAll(arena, s, lr) },
         .path => |s| .{ .path = try interpAll(arena, s, lr) },
         .request => |d| .{ .request = d },
+        .unit => .unit,
+        .range => |r| .{ .range = .{
+            .lo = try renderExpr(arena, r.lo, lr),
+            .hi = try renderExpr(arena, r.hi, lr),
+        } },
         .buffer => |b| .{ .buffer = .{
             .name = try interpAll(arena, b.name, lr),
             .dir = try interpAll(arena, b.dir, lr),
@@ -3788,6 +3794,16 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "http read failed for `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
         return s.source();
     }
+    if (std.mem.eql(u8, rd.connector, "unit")) {
+        const s = gen.UnitSource.open(env.gpa) catch return error.OutOfMemory;
+        return s.source();
+    }
+    if (std.mem.eql(u8, rd.connector, "range")) {
+        const r = rd.form.range;
+        const s = gen.RangeSource.open(env.gpa, try rangeBound(env, r.lo), try rangeBound(env, r.hi)) catch
+            return error.OutOfMemory;
+        return s.source();
+    }
     if (std.mem.eql(u8, rd.connector, "csv")) {
         if (rd.form != .path) return planErr(env.diag, "read csv needs a quoted path");
         if (pqdecode.Reader.isPath(rd.form.path)) {
@@ -3840,6 +3856,18 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
         }
     }
     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unsupported source connector `{s}`", .{conn.connector}));
+}
+
+/// Resolve a RANGE bound to an i64 at plan time: params substitute as
+/// literals; a leading `-` is folded here since substExpr doesn't.
+fn rangeBound(env: *Env, e: *const ast.Expr) !i64 {
+    const r = try analyze.substExpr(env.arena, e, env.params_expr);
+    switch (r.*) {
+        .int_lit => |v| return v,
+        .unary => |u| if (u.op == .neg and u.e.* == .int_lit) return -u.e.int_lit,
+        else => {},
+    }
+    return planErr(env.diag, "RANGE bounds must be integer literals or integer params");
 }
 
 const DbConfig = struct {
@@ -5453,4 +5481,30 @@ test "for-each with an empty discovery list is a no-op" {
     const stats = try run(alloc, prog, .{}, &rdiag);
     try std.testing.expectEqual(@as(usize, 0), stats.rows_out);
     try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20));
+}
+
+test "generated sources: SELECT with no FROM and RANGE(lo, hi)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/one.csv' AS SELECT 1 AS x, 'a' AS s;\n" ++
+        "LOAD INTO '{s}/r.csv' AS SELECT range AS i FROM RANGE(2, 5) WHERE range != 3;\n", .{ base, base });
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    _ = try run(alloc, prog, .{}, &rdiag);
+
+    const one = try tmp.dir.readFileAlloc(alloc, "one.csv", 1 << 20);
+    defer alloc.free(one);
+    try std.testing.expectEqualStrings("x,s\n1,a\n", one);
+    const r = try tmp.dir.readFileAlloc(alloc, "r.csv", 1 << 20);
+    defer alloc.free(r);
+    try std.testing.expectEqualStrings("i\n2\n4\n", r);
 }

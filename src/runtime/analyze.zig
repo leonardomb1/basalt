@@ -427,6 +427,8 @@ const Ctx = struct {
                     .path => |p| p,
                     .request => "request",
                     .buffer => |b| try std.fmt.allocPrint(self.arena, "buffer {s}", .{b.name}),
+                    .range => "range",
+                    .unit => "unit",
                 };
                 var schema = offlineSchema(self.arena, rd);
                 if (schema == null) {
@@ -595,7 +597,8 @@ fn printSchema(w: anytype, indent: []const u8, schema: ?types.Schema) !void {
 
 fn isBuiltinSource(connector: []const u8) bool {
     return std.mem.eql(u8, connector, "csv") or std.mem.eql(u8, connector, "request") or
-        std.mem.eql(u8, connector, "http") or std.mem.eql(u8, connector, "buffer");
+        std.mem.eql(u8, connector, "http") or std.mem.eql(u8, connector, "buffer") or
+        std.mem.eql(u8, connector, "range") or std.mem.eql(u8, connector, "unit");
 }
 
 fn isSqlConnector(connector: []const u8) bool {
@@ -642,6 +645,12 @@ fn splittableRead(node: ast.Stage.Node) bool {
 /// Offline schema resolution: a local CSV header or parquet footer is readable
 /// without connecting to anything; everything else stays unresolved.
 fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read) ?types.Schema {
+    if (std.mem.eql(u8, rd.connector, "unit")) return .{ .fields = &.{} };
+    if (std.mem.eql(u8, rd.connector, "range")) {
+        const fields = arena.alloc(types.Schema.Field, 1) catch return null;
+        fields[0] = .{ .name = "range", .ty = .{ .kind = .int } };
+        return .{ .fields = fields };
+    }
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
         if (csv.CsvReader.isUrl(rd.form.path)) return null;
         if (pqdecode.Reader.isPath(rd.form.path)) {

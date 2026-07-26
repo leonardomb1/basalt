@@ -158,6 +158,8 @@ LIMIT 100 OFFSET 20;
 | request body | `FROM BODY (col TYPE [NOT NULL], ...)` (§8) |
 | durable buffer | `FROM BUFFER 'name'` (§8) |
 | discovered union | `FROM EACH TABLE OF (...)` (§6) |
+| generated integers | `FROM RANGE(10)` / `FROM RANGE(2, 5)` — `lo..hi-1` as a `range` column; bounds are int literals or params |
+| no source | `SELECT 1 AS x, now() AS t;` — a `SELECT` with no `FROM` yields one row of computed values |
 | CTE | `FROM <name>` |
 
 Parquet reads use column projection, row-group skipping from statistics, and

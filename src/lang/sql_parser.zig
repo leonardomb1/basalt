@@ -936,10 +936,13 @@ pub const Parser = struct {
             if (!self.eat(.comma)) break;
         }
 
-        try self.expectKw("from");
         var aliases = AliasSet{};
         var read_hints = std.array_list.Managed(ast.Hint).init(self.arena);
-        const src = try self.parseFromSource(&aliases, &read_hints);
+        const src: ast.Stage.Node = if (self.eatKw("from"))
+            try self.parseFromSource(&aliases, &read_hints)
+        else
+            // `SELECT 1;` — no FROM plans a one-row unit source.
+            .{ .read = .{ .connector = "unit", .form = .unit } };
 
         while (true) {
             if (self.eatKw("pushdown")) {
@@ -1302,6 +1305,18 @@ pub const Parser = struct {
             node = .{ .read = .{ .connector = "buffer", .form = .{ .buffer = ref } } };
         } else if (self.isKw("each")) {
             return self.parseEachTableOf(read_hints);
+        } else if (self.isKw("range") and self.peekTag() == .lparen) {
+            _ = self.advance();
+            _ = try self.expect(.lparen);
+            const a = try self.parseExpr();
+            var lo: *ast.Expr = try self.mk(.{ .int_lit = 0 });
+            var hi = a;
+            if (self.eat(.comma)) {
+                lo = a;
+                hi = try self.parseExpr();
+            }
+            _ = try self.expect(.rparen);
+            node = .{ .read = .{ .connector = "range", .form = .{ .range = .{ .lo = lo, .hi = hi } } } };
         } else {
             const pos = self.curPos();
             const head = try self.expectIdent();

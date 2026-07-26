@@ -155,7 +155,14 @@ pub const ReadForm = union(enum) {
     /// `FROM BUFFER 'name' [AT 'dir']` — replay/drain a durable WAL buffer.
     /// An empty `dir` resolves from the program's `INTO BUFFER` declaration.
     buffer: BufferRef,
+    /// `FROM RANGE(lo, hi)` — generated integers lo..hi-1. Bounds must
+    /// resolve to int literals at plan time (params and loop vars allowed).
+    range: RangeSpec,
+    /// A `SELECT` with no FROM — one empty row the projection fills.
+    unit,
 };
+
+pub const RangeSpec = struct { lo: *Expr, hi: *Expr };
 
 pub const BufferRef = struct { name: []const u8, dir: []const u8 = "" };
 
