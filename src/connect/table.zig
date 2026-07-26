@@ -7,6 +7,7 @@ const std = @import("std");
 const types = @import("../lang/types.zig");
 const batchmod = @import("../exec/batch.zig");
 const eval = @import("../exec/eval.zig");
+const valuemod = @import("../exec/value.zig");
 const driver = @import("driver.zig");
 
 const Batch = batchmod.Batch;
@@ -156,7 +157,7 @@ pub const JsonWriter = struct {
         }
     }
 
-    fn writeJsonValue(out: *std.Io.Writer, arena: std.mem.Allocator, v: eval.Value) !void {
+    fn writeJsonValue(out: *std.Io.Writer, arena: std.mem.Allocator, v: valuemod.Value) !void {
         switch (v) {
             .null => try out.writeAll("null"),
             .bool => |b| try out.writeAll(if (b) "true" else "false"),

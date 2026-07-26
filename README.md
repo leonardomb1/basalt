@@ -55,6 +55,7 @@ ranged reads — only the footer and the chunks a query needs are fetched.
 
 ```console
 $ basalt run pipeline.sql -p days=7       # bind a PARAM
+$ basalt run --format json -c "<query>"   # NDJSON rows on stdout, for scripts
 $ basalt check pipeline.sql               # validate without running
 $ basalt run -c "EXPLAIN <query>"         # print the plan
 $ basalt run -c "EXPLAIN ANALYZE <query>" # run it, print the plan with actuals
@@ -62,9 +63,13 @@ $ basalt repl                             # interactive
 $ basalt serve ./endpoints --watch        # host every endpoint script in a dir
 ```
 
-A terminal `SELECT ...;` prints a table. `LOAD INTO <target> AS <query>;`
-writes. A script that declares `CREATE ENDPOINT` runs as HTTP; otherwise it
-runs once and exits.
+A terminal `SELECT ...;` prints a table — or one JSON object per row with
+`--format json`. `LOAD INTO <target> AS <query>;` writes. A script that
+declares `CREATE ENDPOINT` runs as HTTP; otherwise it runs once and exits.
+
+Logging is quiet by default: plain-text errors and warnings on stderr, plus a
+one-line summary when a run loads a sink. `--log-level debug` shows plan
+detail; `--log-format json` switches stderr to NDJSON for collectors.
 
 ## Design
 

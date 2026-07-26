@@ -501,10 +501,16 @@ yet summed into one tree.
 ## 10. Running & exit codes
 
 ```
-basalt run   <script>|-|-c "<inline>" [-p key=value ...] [-j threads]
+basalt run   <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json]
 basalt serve <dir> [--port N] [--watch]
 basalt check <script>|-|-c "<inline>" [--connect]
 ```
+
+`--format json` makes stdout machine-readable: a terminal `SELECT` emits one
+JSON object per row (NDJSON, streamed — decimals as strings, temporals as ISO
+text, bytes as base64), and a `LOAD` run emits one summary object instead.
+Logs are stderr-only, plain text, level `warn` by default (`--log-level`,
+`--log-format json`, `-q`).
 
 | code | meaning |
 |------|---------|

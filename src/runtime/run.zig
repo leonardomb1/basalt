@@ -159,6 +159,8 @@ pub const RunOptions = struct {
     buffer_segment: ?u64 = null,
     /// Print the executed operator tree with measured time and row counts.
     explain: bool = false,
+    /// `--format json`: terminal SELECTs emit NDJSON rows instead of the table.
+    stdout_json: bool = false,
     /// Serve flusher: pin the StarRocks label prefix (the segment label) and
     /// run_id (the segment seq) so a replayed segment produces the SAME labels
     /// — the sink's dedup then makes redelivery effectively-once.
@@ -216,6 +218,8 @@ const Env = struct {
     /// Set once any pipeline writes somewhere other than the stdout table, so a
     /// terminal `SELECT` — whose printed table is its own feedback — gets no summary.
     wrote_sink: bool = false,
+    /// `--format json`: stdout sinks emit NDJSON rows instead of the table.
+    stdout_json: bool = false,
 };
 
 const PipeRes = struct { op: op.Op, schema: types.Schema };
@@ -509,7 +513,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts: RunOptions, d
     for (program.stmts) |s| {
         if (s == .kind) buffer_decl = s.kind.buffer;
     }
-    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .buffer_decl = buffer_decl, .buffer_segment = opts.buffer_segment, .load_label_prefix = opts.load_label_prefix, .load_run_id = opts.load_run_id };
+    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .buffer_decl = buffer_decl, .buffer_segment = opts.buffer_segment, .load_label_prefix = opts.load_label_prefix, .load_run_id = opts.load_run_id, .stdout_json = opts.stdout_json };
 
     var batch_arena = std.heap.ArenaAllocator.init(gpa);
     defer batch_arena.deinit();
@@ -539,14 +543,14 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts: RunOptions, d
         .threads = lanes_used,
     };
     switch (opts.log.summary) {
-        .json_stdout => {
+        // `--format json`: a LOAD run's stdout is the summary object; a SELECT
+        // run's stdout is the NDJSON rows — never both on one stream.
+        .json_stdout => if (env.wrote_sink) {
             var sbuf: [1024]u8 = undefined;
             var sfw = std.fs.File.stdout().writer(&sbuf);
             summary.renderJson(&sfw.interface) catch {};
             sfw.interface.flush() catch {};
         },
-        // `--json` is explicit machine output and always prints; the human summary
-        // is skipped when nothing left the process but a printed table.
         .stderr => if (env.wrote_sink) logger.summary(summary),
         .none => {},
     }
@@ -4202,6 +4206,11 @@ fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
 
 fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (std.mem.eql(u8, w.connector, "stdout")) {
+        if (env.stdout_json) {
+            const writer = tablemod.JsonWriter.open(env.gpa, schema) catch
+                return planErr(env.diag, "could not open stdout json writer");
+            return writer.sink();
+        }
         const writer = tablemod.TableWriter.open(env.gpa, schema) catch
             return planErr(env.diag, "could not open stdout table");
         return writer.sink();

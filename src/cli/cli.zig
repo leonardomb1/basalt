@@ -189,7 +189,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var port: u16 = 8080;
     var threads: usize = std.Thread.getCpuCount() catch 1;
     var log = runtime.LogConfig{};
-    var json_summary = false;
+    var stdout_json = false;
     var explain = false;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
@@ -204,8 +204,12 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
                 return 2;
             };
             if (threads == 0) threads = 1;
-        } else if (std.mem.eql(u8, a, "--json")) {
-            json_summary = true;
+        } else if (std.mem.eql(u8, a, "--format")) {
+            const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
+            stdout_json = if (std.mem.eql(u8, v, "json")) true else if (std.mem.eql(u8, v, "table")) false else {
+                try stderr.print("error: --format must be table|json\n", .{});
+                return 2;
+            };
         } else if (std.mem.eql(u8, a, "--explain")) {
             explain = true;
         } else if (std.mem.eql(u8, a, "--quiet") or std.mem.eql(u8, a, "-q")) {
@@ -263,12 +267,12 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         return 0;
     }
 
-    log.summary = if (json_summary) .json_stdout else .stderr;
+    log.summary = if (stdout_json) .json_stdout else .stderr;
 
     var diag: runtime.Diag = .{};
     var sink = runtime.OutcomeSink.init(alloc);
     defer sink.deinit();
-    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze }, &diag) catch |e| switch (e) {
+    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze, .stdout_json = stdout_json }, &diag) catch |e| switch (e) {
         error.Aborted => {
             try stderr.print("{s}: aborted\n", .{src.label});
             return 130;
@@ -634,7 +638,8 @@ fn usage(w: anytype) !void {
         \\                     (default: CPU count; map output may reorder under -j>1,
         \\                     so -j 1 is the stable-order choice)
         \\  --port N           listen port for HTTP mode
-        \\  --json             emit the run summary as JSON on stdout
+        \\  --format FMT       table|json — stdout as machine-readable JSON: NDJSON
+        \\                     rows for a SELECT, a summary object for a LOAD run
         \\  --log-format FMT   text|json — stderr log format (default text;
         \\                     json is NDJSON, one object per line, for collectors)
         \\  --log-level LVL    error|warn|info|debug (default warn)
