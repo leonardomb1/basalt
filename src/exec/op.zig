@@ -848,10 +848,140 @@ pub const Aggregate = struct {
         return (try self.drainImpl()).groups;
     }
 
+    /// Fold with raw fixed-width keys. Same shape as `drainImpl`, but the probe
+    /// key is a run of `i64` rather than boxed `Value`s, so the record is smaller
+    /// and the hash is over plain words. Groups are boxed back into `Value` once,
+    /// at the end, so everything downstream is unchanged.
+    fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only: bool) anyerror!Drained {
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        const pull = scratch.allocator();
+
+        var ghashes = std.array_list.Managed(u64).init(self.state);
+        const nparts = 64;
+        const part_shift = 58;
+        const tables = try self.state.alloc(GroupTable, nparts);
+        for (tables) |*t| t.* = try GroupTable.init(self.state, 256);
+        const counts = try self.state.alloc(u32, nparts + 1);
+        var store = if (counts_only) CountStore.init(self.state, self.by.len, self.aggs.len) else FixedStore.init(self.state, self.by.len, self.aggs.len);
+        const nk = self.by.len;
+
+        while (try self.child.next(pull)) |b| {
+            const keys = try pull.alloc(i64, b.len * nk);
+            const masks = try pull.alloc(u64, b.len);
+            const hashes = try pull.alloc(u64, b.len);
+            @memset(masks, 0);
+
+            for (self.by, kinds, 0..) |ci, kk, j| {
+                const col = b.columns[ci];
+                const all_valid = col.validity.allSet(b.len);
+                var r: usize = 0;
+                while (r < b.len) : (r += 1) {
+                    if (!all_valid and !col.validity.get(r)) {
+                        masks[r] |= @as(u64, 1) << @intCast(j);
+                        keys[r * nk + j] = 0;
+                        continue;
+                    }
+                    keys[r * nk + j] = switch (kk) {
+                        .i64k => col.data.i64[r],
+                        .i32k => col.data.i32[r],
+                        .boolk => @intFromBool(col.data.b[r]),
+                        .f64k => @bitCast(col.data.f64[r]),
+                    };
+                }
+            }
+            var r: usize = 0;
+            while (r < b.len) : (r += 1) {
+                var hh = std.hash.Wyhash.init(masks[r]);
+                hh.update(std.mem.sliceAsBytes(keys[r * nk ..][0..nk]));
+                hashes[r] = hh.final();
+            }
+
+            const argcols = try pull.alloc(?column.Column, self.aggs.len);
+            for (self.aggs, argcols) |agg, *c| {
+                c.* = if (agg.arg) |e| try self.argColumn(pull, agg, e, b) else null;
+            }
+
+            @memset(counts, 0);
+            for (hashes[0..b.len]) |h| counts[(h >> part_shift) + 1] += 1;
+            for (1..nparts + 1) |ci| counts[ci] += counts[ci - 1];
+            const order = try pull.alloc(u32, b.len);
+            for (hashes[0..b.len], 0..) |h, ri| {
+                const pi = h >> part_shift;
+                order[counts[pi]] = @intCast(ri);
+                counts[pi] += 1;
+            }
+
+            for (order) |ri| {
+                const key = FixedKey{ .vals = keys[ri * nk ..][0..nk], .mask = masks[ri] };
+                const at: u32 = @intCast(store.len);
+                const table = &tables[hashes[ri] >> part_shift];
+                const f = try table.getOrPut(hashes[ri], key, &store, ghashes.items, at);
+                const rec = if (f.found) store.at(f.slot) else blk: {
+                    const nr = try store.push();
+                    @memcpy(nr.keys, key.vals);
+                    nr.mask.* = key.mask;
+                    try ghashes.append(hashes[ri]);
+                    break :blk nr;
+                };
+                if (counts_only) {
+                    for (rec.counts) |*c| c.* += 1;
+                } else {
+                    for (self.aggs, 0..) |agg, j| {
+                        const v = if (argcols[j]) |col| col.getValue(ri) else Value.null;
+                        try updateAcc(self.state, &rec.accs[j], agg, v, agg.arg != null);
+                    }
+                }
+            }
+            _ = scratch.reset(.retain_capacity);
+        }
+
+        const out = try self.state.alloc(Group, store.len);
+        const kv_all = try self.state.alloc(Value, store.len * nk);
+        for (out, 0..) |*g, i| {
+            const rec = store.at(i);
+            const kv = kv_all[i * nk ..][0..nk];
+            for (kv, rec.keys, kinds, 0..) |*o, raw, kk, j| {
+                if (rec.mask.* & (@as(u64, 1) << @intCast(j)) != 0) {
+                    o.* = .null;
+                    continue;
+                }
+                o.* = switch (self.in_schema.fields[self.by[j]].ty.kind) {
+                    .int => .{ .int = raw },
+                    .time => .{ .time = raw },
+                    .timestamp => .{ .timestamp = raw },
+                    .date => .{ .date = @intCast(raw) },
+                    .bool => .{ .bool = raw != 0 },
+                    .float => .{ .float = @bitCast(raw) },
+                    else => unreachable,
+                };
+                _ = kk;
+            }
+            if (counts_only) {
+                const accs = try self.state.alloc(Acc, self.aggs.len);
+                for (accs, rec.counts) |*a, c| a.* = .{ .n = c };
+                g.* = .{ .key_vals = kv, .accs = accs };
+            } else {
+                g.* = .{ .key_vals = kv, .accs = rec.accs };
+            }
+        }
+        return .{ .groups = out, .hashes = ghashes.items };
+    }
+
     fn drainImpl(self: *Aggregate) anyerror!Drained {
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
         const pull = scratch.allocator();
+
+        if (self.by.len != 0) fixed: {
+            const kinds = try self.state.alloc(KeyKind, self.by.len);
+            for (self.by, kinds) |ci, *k| k.* = keyKindOf(self.in_schema.fields[ci].ty.kind) orelse break :fixed;
+            var counts_only = true;
+            for (self.aggs) |a| {
+                if (a.func != .count or a.arg != null or a.distinct) counts_only = false;
+            }
+            return if (counts_only) self.drainFixed(kinds, true) else self.drainFixed(kinds, false);
+        }
 
         if (self.by.len == 0) {
             const accs = try self.state.alloc(Acc, self.aggs.len);
@@ -944,6 +1074,127 @@ pub const Aggregate = struct {
     /// a key, and it exposes the bucket up front so a batch can prefetch its
     /// buckets before probing. At high cardinality the probe is a cache miss, and
     /// hiding that miss is the whole game.
+    /// How a fixed-width key column is read into a raw `i64`.
+    const KeyKind = enum { i64k, i32k, boolk, f64k };
+
+    fn keyKindOf(kind: types.TypeKind) ?KeyKind {
+        return switch (kind) {
+            .int, .time, .timestamp => .i64k,
+            .date => .i32k,
+            .bool => .boolk,
+            .float => .f64k,
+            else => null,
+        };
+    }
+
+    /// Group storage for keys that are all fixed-width. A boxed `Value` costs 32
+    /// bytes to say what eight bytes of `i64` already says, and hashing one walks
+    /// a tagged union per key; here the keys are raw words with a null mask
+    /// beside them, so both the record and the hash get cheaper.
+    const FixedStore = struct {
+        const block_shift = 13;
+        const block = 1 << block_shift;
+        const block_mask = block - 1;
+
+        alloc: std.mem.Allocator,
+        nkeys: usize,
+        naggs: usize,
+        blocks: std.array_list.Managed([]u8),
+        len: usize = 0,
+
+        const Rec = struct { keys: []i64, mask: *u64, accs: []Acc };
+
+        fn init(alloc: std.mem.Allocator, nkeys: usize, naggs: usize) FixedStore {
+            return .{ .alloc = alloc, .nkeys = nkeys, .naggs = naggs, .blocks = std.array_list.Managed([]u8).init(alloc) };
+        }
+
+        fn recSize(self: FixedStore) usize {
+            return self.nkeys * @sizeOf(i64) + @sizeOf(u64) + self.naggs * @sizeOf(Acc);
+        }
+
+        fn at(self: FixedStore, i: usize) Rec {
+            const rec = self.recSize();
+            const base = self.blocks.items[i >> block_shift].ptr + (i & block_mask) * rec;
+            const ksz = self.nkeys * @sizeOf(i64);
+            return .{
+                .keys = @alignCast(std.mem.bytesAsSlice(i64, base[0..ksz])),
+                .mask = @alignCast(@ptrCast(base + ksz)),
+                .accs = @alignCast(std.mem.bytesAsSlice(Acc, (base + ksz + @sizeOf(u64))[0 .. self.naggs * @sizeOf(Acc)])),
+            };
+        }
+
+        fn eqlAt(self: *const FixedStore, i: usize, key: FixedKey) bool {
+            const r = self.at(i);
+            if (r.mask.* != key.mask) return false;
+            return std.mem.eql(i64, r.keys, key.vals);
+        }
+
+        fn push(self: *FixedStore) !Rec {
+            if (self.len & block_mask == 0 and self.len >> block_shift == self.blocks.items.len) {
+                try self.blocks.append(try self.alloc.alignedAlloc(u8, .of(Acc), block * self.recSize()));
+            }
+            const rec = self.at(self.len);
+            self.len += 1;
+            for (rec.accs) |*a| a.* = .{};
+            return rec;
+        }
+    };
+
+    /// `COUNT(*)` needs eight bytes of state, but `Acc` is sixty-four — enough
+    /// for a min/max `Value` this group will never hold. Counting-only folds get
+    /// a record of keys, mask and counters, which for two keys and one count is
+    /// 32 bytes: two groups per cache line instead of one straddling two.
+    const CountStore = struct {
+        const block_shift = 13;
+        const block = 1 << block_shift;
+        const block_mask = block - 1;
+
+        alloc: std.mem.Allocator,
+        nkeys: usize,
+        naggs: usize,
+        blocks: std.array_list.Managed([]u8),
+        len: usize = 0,
+
+        const Rec = struct { keys: []i64, mask: *u64, counts: []i64 };
+
+        fn init(alloc: std.mem.Allocator, nkeys: usize, naggs: usize) CountStore {
+            return .{ .alloc = alloc, .nkeys = nkeys, .naggs = naggs, .blocks = std.array_list.Managed([]u8).init(alloc) };
+        }
+
+        fn recSize(self: CountStore) usize {
+            return (self.nkeys + 1 + self.naggs) * @sizeOf(i64);
+        }
+
+        fn at(self: CountStore, i: usize) Rec {
+            const rec = self.recSize();
+            const base = self.blocks.items[i >> block_shift].ptr + (i & block_mask) * rec;
+            const ksz = self.nkeys * @sizeOf(i64);
+            return .{
+                .keys = @alignCast(std.mem.bytesAsSlice(i64, base[0..ksz])),
+                .mask = @alignCast(@ptrCast(base + ksz)),
+                .counts = @alignCast(std.mem.bytesAsSlice(i64, (base + ksz + @sizeOf(u64))[0 .. self.naggs * @sizeOf(i64)])),
+            };
+        }
+
+        fn eqlAt(self: *const CountStore, i: usize, key: FixedKey) bool {
+            const r = self.at(i);
+            if (r.mask.* != key.mask) return false;
+            return std.mem.eql(i64, r.keys, key.vals);
+        }
+
+        fn push(self: *CountStore) !Rec {
+            if (self.len & block_mask == 0 and self.len >> block_shift == self.blocks.items.len) {
+                try self.blocks.append(try self.alloc.alignedAlloc(u8, .of(i64), block * self.recSize()));
+            }
+            const rec = self.at(self.len);
+            self.len += 1;
+            @memset(rec.counts, 0);
+            return rec;
+        }
+    };
+
+    const FixedKey = struct { vals: []const i64, mask: u64 };
+
     /// Open-addressed group index sized for cache, not for generality.
     ///
     /// Each slot is a single `u32`: a few salt bits from the key's hash plus the
@@ -1008,8 +1259,8 @@ pub const Aggregate = struct {
         fn getOrPut(
             self: *GroupTable,
             h: u64,
-            key: []const Value,
-            store: *const GroupStore,
+            key: anytype,
+            store: anytype,
             hashes: []const u64,
             new_slot: u32,
         ) !Found {
@@ -1026,7 +1277,7 @@ pub const Aggregate = struct {
                 }
                 if ((e >> idx_bits) << idx_bits != want) continue;
                 const idx = (e & max_groups) - 1;
-                if (keyhash.MultiKeyCtx.eql(.{}, key, store.at(idx).keys)) return .{ .slot = idx, .found = true };
+                if (store.eqlAt(idx, key)) return .{ .slot = idx, .found = true };
             }
         }
     };
@@ -1073,6 +1324,10 @@ pub const Aggregate = struct {
                 .keys = @alignCast(std.mem.bytesAsSlice(Value, base[0..ksz])),
                 .accs = @alignCast(std.mem.bytesAsSlice(Acc, base[ksz..][0 .. self.naggs * @sizeOf(Acc)])),
             };
+        }
+
+        fn eqlAt(self: *const GroupStore, i: usize, key: []const Value) bool {
+            return keyhash.MultiKeyCtx.eql(.{}, key, self.at(i).keys);
         }
 
         fn push(self: *GroupStore) !Rec {
