@@ -842,7 +842,16 @@ pub const Aggregate = struct {
 
         var groups = std.array_list.Managed(Group).init(self.state);
         var ghashes = std.array_list.Managed(u64).init(self.state);
-        var table = try GroupTable.init(self.state, 1024);
+        // One table per radix partition. A single table for millions of groups
+        // misses cache on every probe; sixty-four smaller ones stay resident,
+        // the shape DuckDB and ClickHouse both arrived at. The partition comes
+        // from the top hash bits and the bucket from the bottom, so the two
+        // never interfere.
+        const nparts = 64;
+        const part_shift = 58;
+        const tables = try self.state.alloc(GroupTable, nparts);
+        for (tables) |*t| t.* = try GroupTable.init(self.state, 256);
+        const counts = try self.state.alloc(u32, nparts + 1);
         var store = GroupStore{ .alloc = self.state, .nkeys = self.by.len, .naggs = self.aggs.len };
         const hctx = keyhash.MultiKeyCtx{};
         while (try self.child.next(pull)) |b| {
@@ -857,7 +866,6 @@ pub const Aggregate = struct {
                 for (self.by, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
                 hashes[r] = hctx.hash(probe);
             }
-            for (hashes) |h| table.prefetch(h);
 
             // Evaluate each aggregate's argument once for the whole batch.
             // Per row it re-walked the expression tree for every aggregate.
@@ -866,10 +874,24 @@ pub const Aggregate = struct {
                 c.* = if (agg.arg) |e| try self.argColumn(pull, agg, e, b) else null;
             }
 
-            r = 0;
-            while (r < b.len) : (r += 1) {
+            // Counting-sort the batch's rows by partition, then walk one
+            // partition at a time so consecutive probes land in the same small
+            // table instead of scattering across a huge one.
+            @memset(counts, 0);
+            for (hashes[0..b.len]) |h| counts[(h >> part_shift) + 1] += 1;
+            for (1..nparts + 1) |ci| counts[ci] += counts[ci - 1];
+            const order = try pull.alloc(u32, b.len);
+            for (hashes[0..b.len], 0..) |h, ri| {
+                const pi = h >> part_shift;
+                order[counts[pi]] = @intCast(ri);
+                counts[pi] += 1;
+            }
+
+            for (order) |ri| {
+                r = ri;
                 for (self.by, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
                 const at: u32 = @intCast(groups.items.len);
+                const table = &tables[hashes[r] >> part_shift];
                 const f = try table.getOrPut(hashes[r], probe, groups.items, ghashes.items, at);
                 if (!f.found) {
                     const slot = try store.next();
@@ -934,17 +956,20 @@ pub const Aggregate = struct {
             @prefetch(&self.entries[h & self.mask], .{ .rw = .read, .locality = 3 });
         }
 
-        /// Rebuild from the group list in order: the hashes are read
-        /// sequentially, so only the scatter into the new table is random.
+        /// Rebuild from this table's own entries, taking each group's hash from
+        /// `hashes` — so a table owning one radix partition rehomes only the
+        /// groups it holds.
         fn grow(self: *GroupTable, hashes: []const u64) !void {
             const cap = self.entries.len * 2;
             const ne = try self.alloc.alloc(u32, cap);
             @memset(ne, 0);
             const nmask = cap - 1;
-            for (hashes, 0..) |h, idx| {
+            for (self.entries) |e| {
+                if (e == 0) continue;
+                const h = hashes[(e & max_groups) - 1];
                 var i = h & nmask;
                 while (ne[i] != 0) i = (i + 1) & nmask;
-                ne[i] = pack(h, idx);
+                ne[i] = e;
             }
             self.entries = ne;
             self.mask = nmask;

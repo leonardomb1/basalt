@@ -3907,7 +3907,7 @@ test "aggregate: count and sum by group (nulls skipped)" {
     defer tmp.cleanup();
     const out = try runToString(alloc, &tmp,
         "status,amount\npaid,100\npending,50\npaid,200\npaid,\n",
-        "SELECT status, COUNT(*) AS n, SUM(CAST(amount AS INT)) AS total FROM '$IN' GROUP BY status",
+        "SELECT status, COUNT(*) AS n, SUM(CAST(amount AS INT)) AS total FROM '$IN' GROUP BY status ORDER BY status ASC",
     );
     defer alloc.free(out);
     try std.testing.expectEqualStrings("status,n,total\npaid,3,300\npending,1,50\n", out);
