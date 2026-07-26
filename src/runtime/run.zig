@@ -2470,6 +2470,27 @@ const LoopRow = struct {
     }
 };
 
+/// Append one discovery batch's first `ncols` columns to `rows` as text
+/// (strings/ints; null → ""). Shared by every discovery form so they all agree
+/// on the coercion rules and the column-count error.
+fn appendDiscoveryRows(env: *Env, rows: *std.array_list.Managed(Row), b: batchmod.Batch, ncols: usize) !void {
+    if (b.columns.len == 0) return;
+    if (b.columns.len < ncols)
+        return planErr(env.diag, "for-each: the discovery query returns fewer columns than loop variables");
+    for (0..b.len) |r| {
+        const row = try env.arena.alloc([]const u8, ncols);
+        for (0..ncols) |j| {
+            row[j] = switch (b.columns[j].getValue(r)) {
+                .null => "",
+                .string, .bytes => |s| try env.arena.dupe(u8, s),
+                .int => |x| try std.fmt.allocPrint(env.arena, "{d}", .{x}),
+                else => return planErr(env.diag, "for-each values must be string or int"),
+            };
+        }
+        try rows.append(row);
+    }
+}
+
 /// Run the discovery source once and collect its first `ncols` columns as rows of
 /// text (strings/ints; null → ""). The list is small — a table catalog — so it is
 /// fully materialized into the plan arena.
@@ -2488,21 +2509,49 @@ fn discoverRows(env: *Env, src_read: ast.Read, ncols: usize) ![]const Row {
     while (true) {
         _ = da.reset(.retain_capacity);
         const b = (try src.next(da.allocator())) orelse break;
-        if (b.columns.len == 0) continue;
-        if (b.columns.len < ncols)
-            return planErr(env.diag, "for-each: the discovery query returns fewer columns than loop variables");
-        for (0..b.len) |r| {
-            const row = try env.arena.alloc([]const u8, ncols);
-            for (0..ncols) |j| {
-                row[j] = switch (b.columns[j].getValue(r)) {
-                    .null => "",
-                    .string, .bytes => |s| try env.arena.dupe(u8, s),
-                    .int => |x| try std.fmt.allocPrint(env.arena, "{d}", .{x}),
-                    else => return planErr(env.diag, "for-each values must be string or int"),
-                };
-            }
-            try rows.append(row);
-        }
+        try appendDiscoveryRows(env, &rows, b, ncols);
+    }
+    return rows.toOwnedSlice();
+}
+
+/// Discovery from a full basalt query (`FOR EACH ROW OF (SELECT ...)` /
+/// `EACH TABLE OF (SELECT ...)`): plan and execute the sub-pipeline through the
+/// normal machinery, then collect it into the same rows-of-text shape as
+/// `discoverRows`. Predicate/projection pushdown for SQL sources therefore comes
+/// free from `buildPipeline`.
+///
+/// The sub-pipeline's sources are opened into `env.sources` like any other, so
+/// they are closed here rather than left for the enclosing statement; the
+/// per-pipeline scratch fields are restored so discovery cannot influence how the
+/// body pipelines are planned.
+fn discoverRowsPipeline(env: *Env, pipe: ast.Pipeline, ncols: usize) anyerror![]const Row {
+    if (pipe.stages.len == 0) return planErr(env.diag, "for-each: empty discovery query");
+    const src_base = env.sources.items.len;
+    const saved_src_name = env.src_name;
+    const saved_sql_desc = env.sql_desc;
+    const saved_pq_readers = env.pq_readers;
+    const saved_pq_reader = env.pq_reader;
+    defer {
+        for (env.sources.items[src_base..]) |sc| sc.close();
+        env.sources.shrinkRetainingCapacity(src_base);
+        env.src_name = saved_src_name;
+        env.sql_desc = saved_sql_desc;
+        env.pq_readers = saved_pq_readers;
+        env.pq_reader = saved_pq_reader;
+    }
+
+    const res = buildPipeline(env, pipe.stages) catch |e| {
+        const why = if (env.diag.msg.len > 0) env.diag.msg else @errorName(e);
+        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "for-each discovery failed: {s}", .{why}));
+    };
+    var rows = std.array_list.Managed(Row).init(env.arena);
+    var da = std.heap.ArenaAllocator.init(env.gpa);
+    defer da.deinit();
+    while (true) {
+        if (aborting()) return error.Aborted;
+        _ = da.reset(.retain_capacity);
+        const b = (try res.op.next(da.allocator())) orelse break;
+        try appendDiscoveryRows(env, &rows, b, ncols);
     }
     return rows.toOwnedSlice();
 }
@@ -2733,23 +2782,25 @@ fn renderRead(arena: std.mem.Allocator, rd: ast.Read, lr: LoopRow) !ast.Read {
     }, .where = try interpAll(arena, rd.where, lr) };
 }
 
-/// Interpolate `${var}` into a union stage: the discovered form's discovery query,
-/// or each explicit branch's read target + tag. Lets a for-loop drive which tables
-/// a union reconciles (e.g. a per-table discovery query keyed by the loop value).
-fn renderUnion(arena: std.mem.Allocator, u: ast.Union, lr: LoopRow) !ast.Union {
+/// Interpolate `${var}` into a union stage: the discovered form's discovery query
+/// (raw text or in-engine sub-pipeline), or each explicit branch's read target +
+/// tag. Lets a for-loop drive which tables a union reconciles (e.g. a per-table
+/// discovery query keyed by the loop value).
+fn renderUnion(arena: std.mem.Allocator, u: ast.Union, lr: LoopRow) anyerror!ast.Union {
     if (u.branches.len > 0) {
         const branches = try arena.alloc(ast.UnionBranch, u.branches.len);
         for (u.branches, branches) |b, *o| o.* = .{
             .read = try renderRead(arena, b.read, lr),
             .tag = if (b.tag) |t| try interpAll(arena, t, lr) else null,
         };
-        return .{ .branches = branches, .discover_conn = u.discover_conn, .discover_query = u.discover_query, .discover_json = u.discover_json, .pos = u.pos };
+        return .{ .branches = branches, .discover_conn = u.discover_conn, .discover_query = u.discover_query, .discover_json = u.discover_json, .discover_pipeline = u.discover_pipeline, .pos = u.pos };
     }
     return .{
         .branches = u.branches,
         .discover_conn = u.discover_conn,
         .discover_query = try interpAll(arena, u.discover_query, lr),
         .discover_json = try interpAll(arena, u.discover_json, lr),
+        .discover_pipeline = if (u.discover_pipeline) |p| try renderPipeline(arena, p, lr) else null,
         .pos = u.pos,
     };
 }
@@ -2796,8 +2847,7 @@ fn renderHints(arena: std.mem.Allocator, hints: []const ast.Hint, lr: LoopRow) !
     return out;
 }
 
-fn renderPipeline(env: *Env, body: ast.Pipeline, lr: LoopRow) !ast.Pipeline {
-    const arena = env.arena;
+fn renderPipeline(arena: std.mem.Allocator, body: ast.Pipeline, lr: LoopRow) anyerror!ast.Pipeline {
     const stages = try arena.alloc(ast.Stage, body.stages.len);
     for (body.stages, stages) |src, *dst| {
         dst.* = src;
@@ -2936,7 +2986,7 @@ fn runForBody(env: *Env, body: []const ast.Stmt, lr: LoopRow, opts: RunOptions, 
 fn runForStmt(env: *Env, s: *const ast.Stmt, lr: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     switch (s.*) {
         .output => |p| {
-            const pipe = try renderPipeline(env, p, lr);
+            const pipe = try renderPipeline(env.arena, p, lr);
             try runOutput(env, pipe, opts, stats, lanes_used, batch_arena);
         },
         .match => |m| try runForMatch(env, m, lr, opts, stats, lanes_used, batch_arena),
@@ -2979,6 +3029,7 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
     const rows = switch (fe.source) {
         .read => |rd| try discoverRows(env, rd, fe.var_names.len),
         .json_path => |p| try discoverRowsJson(env, p, fe.var_names),
+        .pipeline => |p| try discoverRowsPipeline(env, p, fe.var_names.len),
     };
     env.log.log(.info, "for-each {s}: {d} row(s) [{s}, on_error={s}]", .{ fe.var_names[0], rows.len, @tagName(mode), if (on_error == .continue_) "continue" else "stop" });
     if (rows.len == 0) return;
@@ -3384,6 +3435,12 @@ fn unionSpecs(env: *Env, u: ast.Union, hints: []const ast.Hint) ![]UnionSpec {
                 .tag = tag,
                 .name = tbl,
             });
+        }
+    } else if (u.discover_pipeline) |pipe| {
+        for (try discoverRowsPipeline(env, pipe, 2)) |row| {
+            const parts = try arena.alloc([]const u8, 1);
+            parts[0] = row[0];
+            try specs.append(.{ .read = .{ .connector = u.discover_conn, .form = .{ .table = .{ .parts = parts } }, .where = where }, .tag = row[1], .name = row[0] });
         }
     } else if (u.discover_query.len > 0) {
         const disc = ast.Read{ .connector = u.discover_conn, .form = .{ .query = u.discover_query } };
@@ -4971,6 +5028,72 @@ test "for-each fans out over a discovered list with interpolation" {
     defer alloc.free(b);
     try std.testing.expectEqualStrings("id,v\n1,10\n2,20\n", a);
     try std.testing.expectEqualStrings("id,v\n3,30\n", b);
+}
+
+test "for-each discovers its rows from an in-engine SELECT" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "catalog.csv", .data = "name,active\nALPHA,1\nBETA,1\nGAMMA,0\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "alpha.csv", .data = "id,v\n1,10\n2,20\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "beta.csv", .data = "id,v\n3,30\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "gamma.csv", .data = "id,v\n9,90\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "FOR EACH ROW OF (SELECT name, lower(name) AS slug FROM '{s}/catalog.csv' WHERE active = '1') AS (name, slug)\n  LOAD INTO '{s}/out_${{slug}}.csv' AS SELECT id, v FROM '{s}/${{slug}}.csv';\nEND FOR;",
+        .{ base, base, base },
+    );
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+
+    var rdiag: Diag = .{};
+    const stats = run(alloc, prog, .{}, &rdiag) catch |e| {
+        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+        return e;
+    };
+    try std.testing.expectEqual(@as(u64, 3), stats.rows_out);
+
+    const a = try tmp.dir.readFileAlloc(alloc, "out_alpha.csv", 1 << 20);
+    defer alloc.free(a);
+    const b = try tmp.dir.readFileAlloc(alloc, "out_beta.csv", 1 << 20);
+    defer alloc.free(b);
+    try std.testing.expectEqualStrings("id,v\n1,10\n2,20\n", a);
+    try std.testing.expectEqualStrings("id,v\n3,30\n", b);
+    // `active = 0` never reached the body: the discovery filter ran in-engine.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("out_gamma.csv", .{}));
+}
+
+test "for-each SELECT discovery with fewer columns than loop variables fails to plan" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "catalog.csv", .data = "name\nalpha\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "alpha.csv", .data = "id\n1\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "FOR EACH ROW OF (SELECT name FROM '{s}/catalog.csv') AS (name, slug)\n  LOAD INTO '{s}/out_${{name}}.csv' AS SELECT id FROM '{s}/${{name}}.csv';\nEND FOR;",
+        .{ base, base, base },
+    );
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
+    try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "fewer columns than loop variables") != null);
 }
 
 test "sqlWithWhere: table appends WHERE, query wraps, empty is a no-op" {

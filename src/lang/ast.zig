@@ -238,6 +238,12 @@ pub const Union = struct {
     discover_conn: []const u8 = "",
     discover_query: []const u8 = "",
     discover_json: []const u8 = "",
+    /// `EACH TABLE OF (SELECT ...)`: the branch list comes from a full basalt
+    /// query run in-engine (its first two columns are table_name, tag) rather
+    /// than from raw SQL sent to `discover_conn`. The discovered tables still
+    /// live on `discover_conn` — inferred from the query's leading source, or
+    /// named by a trailing `IN <conn>`.
+    discover_pipeline: ?Pipeline = null,
     pos: Pos,
 };
 
@@ -310,12 +316,15 @@ pub const FnDecl = struct {
 /// a one-statement block — so it may hold `match` statements that branch per row on
 /// the loop variables (e.g. picking an upsert key). `hints` carry `mode`
 /// (sequential|parallel) and `on_error` (stop|continue).
-/// A for-each source: either a discovery `read` (`for x in <conn> query "..."`)
-/// or a JSON-array param path (`for x in job.tables`, with each object element's
-/// fields bound to the loop variables by name).
+/// A for-each source: a discovery `read` (`for x in <conn> query "..."`), a
+/// JSON-array param path (`for x in job.tables`, with each object element's
+/// fields bound to the loop variables by name), or a full basalt query run
+/// in-engine (`FOR EACH ROW OF (SELECT ...)`), whose first N columns map onto
+/// the N loop variables positionally.
 pub const ForSource = union(enum) {
     read: Read,
     json_path: QualName,
+    pipeline: Pipeline,
 };
 
 pub const ForEach = struct {

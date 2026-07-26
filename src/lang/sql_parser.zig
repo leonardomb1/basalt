@@ -1316,10 +1316,24 @@ pub const Parser = struct {
         return node;
     }
 
-    /// `EACH TABLE OF (<conn>.QUERY($$...$$) | $param.path | '<json>' IN <conn>)
-    ///  [AS (table_name, <tag_col>)] [ANCHOR SCHEMA qual]` — the discovered /
-    /// json union forms. One row (or array element) per branch; the second AS
-    /// name is the output tag column.
+    /// A parenthesized discovery sub-query: a full basalt SELECT pipeline with
+    /// no trailing write, planned and executed in-engine by the runtime. CTEs
+    /// are rejected — `parseQuery` hoists those into top-level bindings, and a
+    /// nested query has nowhere to put them.
+    fn parseSubQuery(self: *Parser, pos: Pos) Error!ast.Pipeline {
+        var hoisted = std.array_list.Managed(ast.Stmt).init(self.arena);
+        var stages = std.array_list.Managed(ast.Stage).init(self.arena);
+        try self.parseQuery(&hoisted, &stages);
+        if (hoisted.items.len > 0)
+            return self.fail(pos, "a discovery sub-query may not declare CTEs", .{});
+        return .{ .stages = try stages.toOwnedSlice(), .pos = pos };
+    }
+
+    /// `EACH TABLE OF (SELECT ... | <conn>.QUERY($$...$$) | $param.path
+    ///  | '<json>' IN <conn>) [AS (table_name, <tag_col>)] [ANCHOR SCHEMA qual]`
+    /// — the discovered / json union forms. One row (or array element) per
+    /// branch; the second AS name is the output tag column. The SELECT form is
+    /// a full basalt query planned and run in-engine.
     fn parseEachTableOf(self: *Parser, hints: *std.array_list.Managed(ast.Hint)) Error!ast.Stage.Node {
         const pos = self.curPos();
         try self.expectKw("each");
@@ -1334,6 +1348,16 @@ pub const Parser = struct {
             u.discover_json = try std.fmt.allocPrint(self.arena, "${{{s}}}", .{joined});
         } else if (self.at(.string)) {
             u.discover_json = self.advance().text;
+        } else if (self.isKw("select")) {
+            const pipe = try self.parseSubQuery(pos);
+            u.discover_pipeline = pipe;
+            // The discovered tables live on whatever connection the discovery
+            // query itself reads from, unless a trailing `IN <conn>` says
+            // otherwise.
+            if (pipe.stages.len > 0 and pipe.stages[0].node == .read) {
+                const c = pipe.stages[0].node.read.connector;
+                if (self.isConn(c)) u.discover_conn = c;
+            }
         } else {
             const conn = try self.expectIdent();
             if (!self.isConn(conn))
@@ -1348,13 +1372,15 @@ pub const Parser = struct {
         }
         _ = try self.expect(.rparen);
 
-        if (u.discover_json.len > 0) {
+        if (u.discover_json.len > 0 or (u.discover_pipeline != null and self.isKw("in"))) {
             try self.expectKw("in");
             const conn = try self.expectIdent();
             if (!self.isConn(conn))
                 return self.fail(pos, "unknown connection `{s}` in EACH TABLE OF ... IN", .{conn});
             u.discover_conn = conn;
         }
+        if (u.discover_pipeline != null and u.discover_conn.len == 0)
+            return self.fail(pos, "EACH TABLE OF (SELECT ...): add `IN <conn>` to say where the discovered tables live", .{});
 
         if (self.eatKw("as")) {
             _ = try self.expect(.lparen);
@@ -1480,10 +1506,12 @@ pub const Parser = struct {
             source = .{ .json_path = try self.parseDollarPath() };
         } else if (self.at(.string)) {
             source = .{ .read = .{ .connector = "csv", .form = .{ .path = self.advance().text } } };
+        } else if (self.isKw("select")) {
+            source = .{ .pipeline = try self.parseSubQuery(pos) };
         } else if (self.at(.ident)) {
             const conn = try self.expectIdent();
             if (!self.isConn(conn))
-                return self.fail(pos, "FOR EACH ROW OF: expected `$param.path` or `<conn>.QUERY($$...$$)`", .{});
+                return self.fail(pos, "FOR EACH ROW OF: expected `SELECT ...`, `$param.path`, or `<conn>.QUERY($$...$$)`", .{});
             _ = try self.expect(.dot);
             try self.expectKw("query");
             _ = try self.expect(.lparen);
@@ -1491,7 +1519,7 @@ pub const Parser = struct {
             _ = try self.expect(.rparen);
             source = .{ .read = .{ .connector = conn, .form = .{ .query = q.text } } };
         } else {
-            return self.fail(self.curPos(), "FOR EACH ROW OF: expected `$param.path` or `<conn>.QUERY($$...$$)`", .{});
+            return self.fail(self.curPos(), "FOR EACH ROW OF: expected `SELECT ...`, `$param.path`, or `<conn>.QUERY($$...$$)`", .{});
         }
         _ = try self.expect(.rparen);
 
@@ -2186,6 +2214,77 @@ test "sql: FOR EACH ROW OF json path with CASE dispatch" {
     const arm2 = m.arms[1].body[0].output;
     try testing.expectEqual(@as(usize, 3), arm2.stages.len);
     try testing.expectEqualStrings("crm_${lower(name)}", arm2.stages[2].node.write.target);
+}
+
+test "sql: EACH TABLE OF (SELECT ...) parses an in-engine discovery pipeline" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a,
+        \\CREATE CONNECTION cat TYPE sqlserver OPTIONS (host = 'h', database = 'd');
+        \\LOAD INTO 'out.csv' AS
+        \\SELECT * FROM EACH TABLE OF (
+        \\  SELECT name, substr(name, 4, 2) AS emp FROM cat.tables WHERE name LIKE 'CT2%'
+        \\) AS (table_name, emp);
+    );
+    const pl = prog.stmts[2].output;
+    const u = pl.stages[0].node.union_;
+    try testing.expectEqual(@as(usize, 0), u.discover_query.len);
+    try testing.expectEqual(@as(usize, 0), u.discover_json.len);
+    // The branch connection is inferred from the discovery query's own source.
+    try testing.expectEqualStrings("cat", u.discover_conn);
+    const disc = u.discover_pipeline orelse return error.TestExpectedPipeline;
+    try testing.expect(disc.stages[0].node == .read);
+    try testing.expectEqualStrings("cat", disc.stages[0].node.read.connector);
+    try testing.expect(disc.stages[1].node == .filter);
+    try testing.expect(disc.stages[2].node == .select);
+    try testing.expectEqual(@as(usize, 2), disc.stages[2].node.select.len);
+    try testing.expectEqualStrings("emp", pl.stages[0].hints[0].value.ident);
+}
+
+test "sql: EACH TABLE OF (SELECT ...) over a non-connection source needs IN <conn>" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a,
+        \\CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'h', database = 'd');
+        \\LOAD INTO 'out.csv' AS
+        \\SELECT * FROM EACH TABLE OF (SELECT name, emp FROM 'cat.csv') AS (table_name, emp);
+    , &diag));
+
+    const prog = try parseTest(a,
+        \\CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'h', database = 'd');
+        \\LOAD INTO 'out.csv' AS
+        \\SELECT * FROM EACH TABLE OF (SELECT name, emp FROM 'cat.csv') IN erp AS (table_name, emp);
+    );
+    const u = prog.stmts[2].output.stages[0].node.union_;
+    try testing.expectEqualStrings("erp", u.discover_conn);
+    try testing.expect(u.discover_pipeline != null);
+}
+
+test "sql: FOR EACH ROW OF (SELECT ...) parses an in-engine discovery pipeline" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a,
+        \\FOR EACH ROW OF (SELECT name, lower(name) AS slug FROM 'catalog.csv' WHERE active = '1') AS (name, slug)
+        \\  LOAD INTO 'out_${slug}.csv' AS SELECT * FROM '${slug}.csv';
+        \\END FOR;
+    );
+    const fe = prog.stmts[1].for_each;
+    try testing.expectEqual(@as(usize, 2), fe.var_names.len);
+    try testing.expect(fe.source == .pipeline);
+    const disc = fe.source.pipeline;
+    try testing.expectEqual(@as(usize, 3), disc.stages.len);
+    try testing.expect(disc.stages[0].node == .read);
+    try testing.expectEqualStrings("csv", disc.stages[0].node.read.connector);
+    try testing.expect(disc.stages[1].node == .filter);
+    try testing.expectEqualStrings("slug", disc.stages[2].node.select[1].computed.name);
+    try testing.expectEqual(@as(usize, 1), fe.body.len);
 }
 
 test "sql: connection credential convention injects env calls" {
