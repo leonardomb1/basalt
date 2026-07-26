@@ -196,6 +196,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var threads: usize = std.Thread.getCpuCount() catch 1;
     var log = runtime.LogConfig{};
     var json_summary = false;
+    var explain = false;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -211,6 +212,8 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             if (threads == 0) threads = 1;
         } else if (std.mem.eql(u8, a, "--json")) {
             json_summary = true;
+        } else if (std.mem.eql(u8, a, "--explain")) {
+            explain = true;
         } else if (std.mem.eql(u8, a, "--quiet") or std.mem.eql(u8, a, "-q")) {
             log.quiet = true;
         } else if (std.mem.eql(u8, a, "--log-format")) {
@@ -254,7 +257,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var diag: runtime.Diag = .{};
     var sink = runtime.OutcomeSink.init(alloc);
     defer sink.deinit();
-    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log }, &diag) catch |e| switch (e) {
+    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log, .explain = explain }, &diag) catch |e| switch (e) {
         error.Aborted => {
             try stderr.print("{s}: aborted\n", .{src.label});
             return 130;

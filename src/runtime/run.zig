@@ -155,6 +155,8 @@ pub const RunOptions = struct {
     outcomes: ?*OutcomeSink = null,
     /// Serve flusher: restrict every `FROM BUFFER` source to this one segment.
     buffer_segment: ?u64 = null,
+    /// Print the executed operator tree with measured time and row counts.
+    explain: bool = false,
     /// Serve flusher: pin the StarRocks label prefix (the segment label) and
     /// run_id (the segment seq) so a replayed segment produces the SAME labels
     /// — the sink's dedup then makes redelivery effectively-once.
@@ -773,6 +775,34 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     try pw.finish();
     snk_open = false;
     try snk.close();
+    if (opts.explain) try explainTree(arena, res.op);
+}
+
+/// Print the operator tree with per-stage actuals. Time is *exclusive*: an
+/// operator's own cost with its inputs' subtracted, since a pull pipeline
+/// nests children inside the parent's `next`.
+fn explainTree(arena: std.mem.Allocator, root: op.Op) !void {
+    var buf = std.array_list.Managed(u8).init(arena);
+    try buf.appendSlice("actuals (exclusive time):\n");
+    try explainNode(arena, root, &buf, 1);
+    std.debug.print("{s}", .{buf.items});
+}
+
+fn explainNode(arena: std.mem.Allocator, node: op.Op, buf: *std.array_list.Managed(u8), depth: usize) !void {
+    var kids = std.array_list.Managed(op.Op).init(arena);
+    try node.inputs(&kids);
+    var child_ns: u64 = 0;
+    for (kids.items) |k| child_ns += k.stats().ns;
+    const st = node.stats();
+    const excl: u64 = if (st.ns > child_ns) st.ns - child_ns else 0;
+    try buf.appendNTimes(' ', depth * 2);
+    try buf.writer().print("{s:<10} {d:>9.1}ms {d:>12} rows {d:>8} batches\n", .{
+        @tagName(node),
+        @as(f64, @floatFromInt(excl)) / 1e6,
+        st.rows,
+        st.calls,
+    });
+    for (kids.items) |k| try explainNode(arena, k, buf, depth + 1);
 }
 
 /// Gates the mmap'd parallel-CSV fast paths. A `.parquet` path shares the `csv`

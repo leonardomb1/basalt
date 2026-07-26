@@ -43,6 +43,14 @@ pub fn errLabel(e: anyerror) []const u8 {
     };
 }
 
+/// Per-operator execution counters, filled in as the pipeline is pulled so a
+/// plan can be printed back with actuals beside its estimates.
+pub const Stats = struct {
+    ns: u64 = 0,
+    rows: u64 = 0,
+    calls: u64 = 0,
+};
+
 pub const Op = union(enum) {
     scan: *Scan,
     filter: *Filter,
@@ -56,7 +64,42 @@ pub const Op = union(enum) {
     explode: *Explode,
     union_: *Union,
 
+    /// Accumulated counters for this operator. `inline else` reaches the
+    /// payload pointer without naming all eleven variants.
+    pub fn stats(self: Op) *Stats {
+        return switch (self) {
+            inline else => |o| &o.stats,
+        };
+    }
+
+    /// This operator's inputs, written into `buf` (at most two, plus a union's
+    /// branches). Used to turn inclusive timings into exclusive ones.
+    pub fn inputs(self: Op, buf: *std.array_list.Managed(Op)) !void {
+        switch (self) {
+            .scan => {},
+            .join => |j| {
+                try buf.append(j.probe);
+                try buf.append(j.build);
+            },
+            .union_ => |u| try buf.appendSlice(u.children),
+            inline else => |o| try buf.append(o.child),
+        }
+    }
+
     pub fn next(self: Op, arena: std.mem.Allocator) anyerror!?Batch {
+        const st = self.stats();
+        const t0 = std.time.Instant.now() catch {
+            return self.nextInner(arena);
+        };
+        const r = try self.nextInner(arena);
+        const t1 = std.time.Instant.now() catch return r;
+        st.ns += t1.since(t0);
+        st.calls += 1;
+        if (r) |b| st.rows += b.len;
+        return r;
+    }
+
+    fn nextInner(self: Op, arena: std.mem.Allocator) anyerror!?Batch {
         return switch (self) {
             .scan => |s| s.next(arena),
             .filter => |f| f.next(arena),
@@ -77,6 +120,7 @@ pub const Op = union(enum) {
 /// … Each child is expected to already emit the unified output schema (e.g. a
 /// reconcile-projection over its source), so this op just forwards their batches.
 pub const Union = struct {
+    stats: Stats = .{},
     children: []const Op,
     idx: usize = 0,
 
@@ -141,6 +185,7 @@ pub fn linearize(arena: std.mem.Allocator, top: Op) !?Linear {
 /// Streaming 1→N: split a delimited string column, emitting one row per element
 /// (other columns repeated). Null/missing cells produce zero rows.
 pub const Explode = struct {
+    stats: Stats = .{},
     child: Op,
     field_idx: usize,
     delim: []const u8,
@@ -193,6 +238,7 @@ pub const Explode = struct {
 };
 
 pub const Scan = struct {
+    stats: Stats = .{},
     src: driver.Source,
 
     pub fn next(self: *Scan, arena: std.mem.Allocator) anyerror!?Batch {
@@ -201,6 +247,7 @@ pub const Scan = struct {
 };
 
 pub const Filter = struct {
+    stats: Stats = .{},
     child: Op,
     pred: *const ast.Expr,
     err: ?*ErrCtx = null,
@@ -223,6 +270,7 @@ pub const Filter = struct {
 };
 
 pub const Project = struct {
+    stats: Stats = .{},
     child: Op,
     cols: []const Col,
     out_schema: *const types.Schema,
@@ -257,6 +305,7 @@ pub const Project = struct {
 };
 
 pub const Limit = struct {
+    stats: Stats = .{},
     child: Op,
     remaining: u64,
     to_skip: u64,
@@ -344,6 +393,7 @@ fn materializeAll(arena: std.mem.Allocator, child: Op, schema: *const types.Sche
 /// seen-set (and its key copies) live in `state` (the plan arena), because the
 /// per-pull batch arena is reset between pulls.
 pub const Distinct = struct {
+    stats: Stats = .{},
     child: Op,
     in_schema: *const types.Schema,
     keys: ?[]const usize,
@@ -413,6 +463,7 @@ fn gatherDeep(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usiz
 }
 
 pub const Sort = struct {
+    stats: Stats = .{},
     child: Op,
     in_schema: *const types.Schema,
     keys: []const Key,
@@ -555,6 +606,7 @@ fn keyOrder(va: Value, vb: Value, desc: bool) std.math.Order {
 /// bounded regardless of input size; only the final K rows are emitted into the
 /// caller arena. A plain `sort` (no following `limit`) still uses the full Sort op.
 pub const TopN = struct {
+    stats: Stats = .{},
     child: Op,
     in_schema: *const types.Schema,
     keys: []const Sort.Key,
@@ -690,6 +742,7 @@ fn dupeValueGpa(gpa: std.mem.Allocator, v: Value) !Value {
 /// key values, accumulators) lives in `state` (the plan arena), with string key
 /// values deep-copied there because batch memory dies between pulls.
 pub const Aggregate = struct {
+    stats: Stats = .{},
     child: Op,
     in_schema: *const types.Schema,
     by: []const usize,
@@ -1188,6 +1241,7 @@ fn materializeFull(state: std.mem.Allocator, pull: std.mem.Allocator, child: Op,
 /// per-pull batch arena (the driver resets it before every `next`). They are
 /// allocated in `state` — the plan arena, freed when the run ends.
 pub const Join = struct {
+    stats: Stats = .{},
     probe: Op,
     build: Op,
     left_key: usize,
