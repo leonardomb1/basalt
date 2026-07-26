@@ -841,6 +841,7 @@ pub const Aggregate = struct {
         }
 
         var groups = std.array_list.Managed(Group).init(self.state);
+        var ghashes = std.array_list.Managed(u64).init(self.state);
         var table = try GroupTable.init(self.state, 1024);
         var store = GroupStore{ .alloc = self.state, .nkeys = self.by.len, .naggs = self.aggs.len };
         const hctx = keyhash.MultiKeyCtx{};
@@ -858,19 +859,27 @@ pub const Aggregate = struct {
             }
             for (hashes) |h| table.prefetch(h);
 
+            // Evaluate each aggregate's argument once for the whole batch.
+            // Per row it re-walked the expression tree for every aggregate.
+            const argcols = try pull.alloc(?column.Column, self.aggs.len);
+            for (self.aggs, argcols) |agg, *c| {
+                c.* = if (agg.arg) |e| try self.argColumn(pull, agg, e, b) else null;
+            }
+
             r = 0;
             while (r < b.len) : (r += 1) {
                 for (self.by, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
                 const at: u32 = @intCast(groups.items.len);
-                const f = try table.getOrPut(hashes[r], probe, groups.items, at);
+                const f = try table.getOrPut(hashes[r], probe, groups.items, ghashes.items, at);
                 if (!f.found) {
                     const slot = try store.next();
                     for (probe, slot.keys) |v, *o| o.* = try dupeValue(self.state, v);
                     try groups.append(.{ .key_vals = slot.keys, .accs = slot.accs });
+                    try ghashes.append(hashes[r]);
                 }
                 const g = &groups.items[f.slot];
                 for (self.aggs, 0..) |agg, j| {
-                    const v = try self.argValue(pull, agg, b, r);
+                    const v = if (argcols[j]) |col| col.getValue(r) else Value.null;
                     try updateAcc(self.state, &g.accs[j], agg, v, agg.arg != null);
                 }
             }
@@ -885,65 +894,86 @@ pub const Aggregate = struct {
     /// a key, and it exposes the bucket up front so a batch can prefetch its
     /// buckets before probing. At high cardinality the probe is a cache miss, and
     /// hiding that miss is the whole game.
+    /// Open-addressed group index sized for cache, not for generality.
+    ///
+    /// Each slot is a single `u32`: a few salt bits from the key's hash plus the
+    /// group's index. Storing a salt rather than the whole hash is what makes
+    /// the entry small enough that sixteen share a cache line, and at high
+    /// cardinality the number of lines a probe touches *is* the cost — an
+    /// earlier version kept the full 8-byte hash in one array and the index in
+    /// another, so every probe missed twice. The full hash lives beside the
+    /// group instead, so growing never re-hashes a key (the same trick DuckDB's
+    /// aggregate table uses).
     const GroupTable = struct {
-        hashes: []u64,
-        slots: []u32,
+        const salt_bits = 6;
+        const idx_bits = 32 - salt_bits;
+        const max_groups = (1 << idx_bits) - 1;
+
+        entries: []u32,
         len: usize = 0,
         mask: u64,
         alloc: std.mem.Allocator,
 
-        const empty: u64 = 0;
-
         fn init(alloc: std.mem.Allocator, cap_pow2: usize) !GroupTable {
-            const h = try alloc.alloc(u64, cap_pow2);
-            @memset(h, empty);
-            return .{ .hashes = h, .slots = try alloc.alloc(u32, cap_pow2), .mask = cap_pow2 - 1, .alloc = alloc };
+            const e = try alloc.alloc(u32, cap_pow2);
+            @memset(e, 0);
+            return .{ .entries = e, .mask = cap_pow2 - 1, .alloc = alloc };
         }
 
-        /// Hash of zero is the empty marker, so fold it onto a neighbour.
-        fn norm(h: u64) u64 {
-            return if (h == empty) 1 else h;
+        /// Salt comes from bits the bucket index does not use, so the two stay
+        /// independent as the table grows.
+        fn saltOf(h: u64) u32 {
+            return @intCast((h >> 32) & ((1 << salt_bits) - 1));
+        }
+
+        fn pack(h: u64, idx: usize) u32 {
+            return (saltOf(h) << idx_bits) | @as(u32, @intCast(idx + 1));
         }
 
         fn prefetch(self: *const GroupTable, h: u64) void {
-            @prefetch(&self.hashes[norm(h) & self.mask], .{ .rw = .read, .locality = 3 });
+            @prefetch(&self.entries[h & self.mask], .{ .rw = .read, .locality = 3 });
         }
 
-        fn grow(self: *GroupTable) !void {
-            const cap = self.hashes.len * 2;
-            const nh = try self.alloc.alloc(u64, cap);
-            @memset(nh, empty);
-            const ns = try self.alloc.alloc(u32, cap);
+        /// Rebuild from the group list in order: the hashes are read
+        /// sequentially, so only the scatter into the new table is random.
+        fn grow(self: *GroupTable, hashes: []const u64) !void {
+            const cap = self.entries.len * 2;
+            const ne = try self.alloc.alloc(u32, cap);
+            @memset(ne, 0);
             const nmask = cap - 1;
-            for (self.hashes, self.slots) |h, sl| {
-                if (h == empty) continue;
+            for (hashes, 0..) |h, idx| {
                 var i = h & nmask;
-                while (nh[i] != empty) i = (i + 1) & nmask;
-                nh[i] = h;
-                ns[i] = sl;
+                while (ne[i] != 0) i = (i + 1) & nmask;
+                ne[i] = pack(h, idx);
             }
-            self.hashes = nh;
-            self.slots = ns;
+            self.entries = ne;
             self.mask = nmask;
         }
 
         const Found = struct { slot: u32, found: bool };
 
-        /// Locate `key` (already hashed to `h`), inserting `new_slot` when absent.
-        fn getOrPut(self: *GroupTable, h0: u64, key: []const Value, groups: []const Group, new_slot: u32) !Found {
-            if ((self.len + 1) * 10 >= self.hashes.len * 7) try self.grow();
-            const h = norm(h0);
+        fn getOrPut(
+            self: *GroupTable,
+            h: u64,
+            key: []const Value,
+            groups: []const Group,
+            hashes: []const u64,
+            new_slot: u32,
+        ) !Found {
+            if (new_slot >= max_groups) return error.TooManyGroups;
+            if ((self.len + 1) * 10 >= self.entries.len * 7) try self.grow(hashes);
+            const want = saltOf(h) << idx_bits;
             var i = h & self.mask;
             while (true) : (i = (i + 1) & self.mask) {
-                if (self.hashes[i] == empty) {
-                    self.hashes[i] = h;
-                    self.slots[i] = new_slot;
+                const e = self.entries[i];
+                if (e == 0) {
+                    self.entries[i] = pack(h, new_slot);
                     self.len += 1;
                     return .{ .slot = new_slot, .found = false };
                 }
-                if (self.hashes[i] != h) continue;
-                const cand = groups[self.slots[i]].key_vals;
-                if (keyhash.MultiKeyCtx.eql(.{}, key, cand)) return .{ .slot = self.slots[i], .found = true };
+                if ((e >> idx_bits) << idx_bits != want) continue;
+                const idx = (e & max_groups) - 1;
+                if (keyhash.MultiKeyCtx.eql(.{}, key, groups[idx].key_vals)) return .{ .slot = idx, .found = true };
             }
         }
     };
@@ -1136,6 +1166,27 @@ pub const Aggregate = struct {
     /// expects runtime coercion — the vectorized path gets it via `evalColumn`);
     /// without this a string cell reaching `sum` is a union-access crash, and
     /// unparseable text is a clean CastFailed instead.
+    /// One aggregate's argument evaluated across a whole batch, typed as the
+    /// aggregate expects — which also applies the string-to-number coercion
+    /// `argValue` did per row for `sum`/`avg`.
+    fn argColumn(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, e: *const ast.Expr, b: Batch) anyerror!column.Column {
+        // `sum(x)` and friends name a column the batch already holds; hand it
+        // over instead of materialising a copy. Only when the stored type feeds
+        // the accumulator directly — a text column under a numeric aggregate
+        // still has to go through the coercing path.
+        if (e.* == .field) {
+            if (b.schema.indexOf(e.field.last())) |ci| {
+                const ck = b.columns[ci].ty.kind;
+                const ak = agg.ty.kind;
+                if (ck == ak or (ck.isNumeric() and ak.isNumeric())) return b.columns[ci];
+            }
+        }
+        return eval.evalColumn(arena, e, b, agg.ty) catch |err| {
+            if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
+            return err;
+        };
+    }
+
     fn argValue(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, b: Batch, r: usize) anyerror!Value {
         const e = agg.arg orelse return .null;
         var v = eval.evalRow(arena, e, b, r) catch |err| {
