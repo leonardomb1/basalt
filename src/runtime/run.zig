@@ -92,10 +92,11 @@ pub const ParamArg = struct { key: []const u8, val: []const u8 };
 pub const SummaryMode = enum { none, stderr, json_stdout };
 
 /// Logging/output config (from CLI flags). `format = .auto` picks human text on a
-/// TTY, NDJSON when piped.
+/// TTY, NDJSON when piped. The default level is `warn`, so a healthy run is silent
+/// unless something needs attention; plan shape lives at `debug` (and in EXPLAIN).
 pub const LogConfig = struct {
     format: obs.Format = .auto,
-    level: obs.Level = .info,
+    level: obs.Level = .warn,
     quiet: bool = false,
     summary: SummaryMode = .none,
 };
@@ -212,6 +213,9 @@ const Env = struct {
     pq_readers: usize = 0,
     pq_reader: ?*pqdecode.Reader = null,
     sink_name: []const u8 = "",
+    /// Set once any pipeline writes somewhere other than the stdout table, so a
+    /// terminal `SELECT` — whose printed table is its own feedback — gets no summary.
+    wrote_sink: bool = false,
 };
 
 const PipeRes = struct { op: op.Op, schema: types.Schema };
@@ -541,7 +545,9 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts: RunOptions, d
             summary.renderJson(&sfw.interface) catch {};
             sfw.interface.flush() catch {};
         },
-        .stderr => logger.summary(summary),
+        // `--json` is explicit machine output and always prints; the human summary
+        // is skipped when nothing left the process but a printed table.
+        .stderr => if (env.wrote_sink) logger.summary(summary),
         .none => {},
     }
     return stats;
@@ -624,6 +630,7 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     const last = stages[stages.len - 1].node;
     if (last != .write) return planErr(env.diag, "a top-level pipeline must end in `write`");
     env.sink_name = sinkLabel(env, last.write);
+    if (!std.mem.eql(u8, last.write.connector, "stdout")) env.wrote_sink = true;
 
     if (stages[0].node == .read) implicit: {
         const rd = stages[0].node.read;
@@ -722,7 +729,7 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
                 env.sources.shrinkRetainingCapacity(src_base);
                 var ctx = SplitCtx{ .gpa = gpa, .kind = env.sql_desc.?.kind, .cfg = env.sql_desc.?.cfg, .base_sql = env.sql_desc.?.base_sql, .proj_select = proj_select, .where_extra = where_extra };
                 lanes_used.* = @max(lanes_used.*, @min(opts.threads, sp.predicates.len));
-                env.log.log(.info, "split-parallel: {d} splits over {d} lanes on key range (projection: {s}, filter pushdown: {s})", .{ sp.predicates.len, @min(opts.threads, sp.predicates.len), proj_select orelse "all", if (where_extra != null) "yes" else "no" });
+                env.log.log(.debug, "split-parallel: {d} splits over {d} lanes on key range (projection: {s}, filter pushdown: {s})", .{ sp.predicates.len, @min(opts.threads, sp.predicates.len), proj_select orelse "all", if (where_extra != null) "yes" else "no" });
                 if (try buildParallelSink(env, wr, schema)) |mode| {
                     stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, mode, opts.threads, env.rows_read);
                 } else {
@@ -1385,7 +1392,7 @@ fn runParallelParquetMap(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, m
 
     const lanes = try parallel.spawnJoin(arena, nthreads, pqMapLane, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
-    env.log.log(.info, "parallel parquet map: {d} row groups over {d} lanes ({s} sink)", .{ ngroups, lanes, @tagName(sink_mode) });
+    env.log.log(.debug, "parallel parquet map: {d} row groups over {d} lanes ({s} sink)", .{ ngroups, lanes, @tagName(sink_mode) });
     if (opts.explain) {
         std.debug.print("actuals (parallel map, {d} lanes over {d} row groups): {d} rows out\n", .{
             lanes, ngroups, ctx.rows_out.load(.monotonic),
@@ -1505,7 +1512,7 @@ fn runParallelParquetAgg(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, p
         });
     }
 
-    env.log.log(.info, "parallel parquet aggregate: {d} row groups in {d} morsels over {d} lanes, merged in {d} partitions", .{ ngroups, nitems, used, pq_parts });
+    env.log.log(.debug, "parallel parquet aggregate: {d} row groups in {d} morsels over {d} lanes, merged in {d} partitions", .{ ngroups, nitems, used, pq_parts });
 
     if (topNTail(tail)) |tn| {
         var cols = std.array_list.Managed(usize).init(arena);
@@ -1616,7 +1623,7 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
 
     const lanes = try parallel.spawnJoin(arena, nthreads, aggWorker, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
-    env.log.log(.info, "parallel csv aggregate: {d} chunks over {d} lanes", .{ nthreads, lanes });
+    env.log.log(.debug, "parallel csv aggregate: {d} chunks over {d} lanes", .{ nthreads, lanes });
 
     if (ctx.queue.first_err) |e| return e;
 
@@ -1750,7 +1757,7 @@ fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.S
 
     const lanes = try parallel.spawnJoin(arena, nlanes, sqlAggWorker, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
-    env.log.log(.info, "parallel sql aggregate: {d} splits over {d} lanes on key range (projection: {d}/{d} cols, filter pushdown: {s})", .{
+    env.log.log(.debug, "parallel sql aggregate: {d} splits over {d} lanes on key range (projection: {d}/{d} cols, filter pushdown: {s})", .{
         sp.predicates.len,
         lanes,
         if (pd.proj_schema) |ps| ps.fields.len else src_schema.fields.len,
@@ -1876,7 +1883,7 @@ fn runParallelCsvMap(env: *Env, rd: ast.Read, map_stages: []const ast.Stage, w: 
 
     const lanes = try parallel.spawnJoin(arena, nthreads, mapWorker, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
-    env.log.log(.info, "parallel csv map: {d} chunks over {d} lanes ({s} sink)", .{ nthreads, lanes, @tagName(sink_mode) });
+    env.log.log(.debug, "parallel csv map: {d} chunks over {d} lanes ({s} sink)", .{ nthreads, lanes, @tagName(sink_mode) });
 
     if (ctx.queue.first_err) |e| return e;
     stats.rows_out += ctx.rows_out.load(.monotonic);
@@ -2055,7 +2062,7 @@ fn runParallelParquetTopN(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, 
 
     const lanes = try parallel.spawnJoin(arena, nthreads, pqTopNLane, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
-    env.log.log(.info, "parallel parquet top-n: {d} row groups over {d} lanes", .{ ngroups, lanes });
+    env.log.log(.debug, "parallel parquet top-n: {d} row groups over {d} lanes", .{ ngroups, lanes });
     if (ctx.morsels.queue.first_err) |e| return e;
 
     const cols = try arena.alloc(column.Column, builders.len);
@@ -2126,7 +2133,7 @@ fn runParallelCsvTopN(env: *Env, rd: ast.Read, prefix: []const ast.Stage, srt: a
 
     const lanes = try parallel.spawnJoin(arena, nthreads, topnWorker, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
-    env.log.log(.info, "parallel csv top-n: {d} chunks over {d} lanes", .{ nthreads, lanes });
+    env.log.log(.debug, "parallel csv top-n: {d} chunks over {d} lanes", .{ nthreads, lanes });
     if (ctx.queue.first_err) |e| return e;
 
     const cols = try arena.alloc(column.Column, builders.len);
@@ -2355,7 +2362,7 @@ fn runParallelParquetDistinct(env: *Env, rd: ast.Read, pipeline: []const ast.Sta
 
     const lanes = try parallel.spawnJoin(arena, nthreads, pqDistinctLane, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
-    env.log.log(.info, "parallel parquet distinct: {d} row groups over {d} lanes", .{ ngroups, lanes });
+    env.log.log(.debug, "parallel parquet distinct: {d} row groups over {d} lanes", .{ ngroups, lanes });
     if (ctx.morsels.queue.first_err) |e| return e;
 
     const cols = try arena.alloc(column.Column, builders.len);
@@ -2426,7 +2433,7 @@ fn runParallelCsvDistinct(env: *Env, rd: ast.Read, prefix: []const ast.Stage, di
 
     const lanes = try parallel.spawnJoin(arena, nthreads, distinctWorker, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
-    env.log.log(.info, "parallel csv distinct: {d} chunks over {d} lanes", .{ nthreads, lanes });
+    env.log.log(.debug, "parallel csv distinct: {d} chunks over {d} lanes", .{ nthreads, lanes });
     if (ctx.queue.first_err) |e| return e;
 
     const cols = try arena.alloc(column.Column, builders.len);
@@ -2926,6 +2933,8 @@ const ForCtx = struct {
     next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Workers run on their own Env, so the summary gate has to be carried back.
+    wrote_sink: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     mu: std.Thread.Mutex = .{},
     first_err_buf: [256]u8 = undefined,
@@ -2990,6 +2999,7 @@ fn forWorker(ctx: *ForCtx, _: usize) void {
             }
             forRecordFail(ctx, row[0], @errorName(e), w_diag.msg, isTransient(e) or w_diag.retryable);
         }
+        if (w_env.wrote_sink) ctx.wrote_sink.store(true, .monotonic);
         for (w_sources.items) |sc| sc.close();
     }
 }
@@ -3049,7 +3059,7 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
         .json_path => |p| try discoverRowsJson(env, p, fe.var_names),
         .pipeline => |p| try discoverRowsPipeline(env, p, fe.var_names.len),
     };
-    env.log.log(.info, "for-each {s}: {d} row(s) [{s}, on_error={s}]", .{ fe.var_names[0], rows.len, @tagName(mode), if (on_error == .continue_) "continue" else "stop" });
+    env.log.log(.debug, "for-each {s}: {d} row(s) [{s}, on_error={s}]", .{ fe.var_names[0], rows.len, @tagName(mode), if (on_error == .continue_) "continue" else "stop" });
     if (rows.len == 0) return;
     const needles = fe.var_names;
 
@@ -3094,6 +3104,7 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
             if (aborting()) return error.Aborted;
             stats.rows_out += ctx.rows_out.load(.monotonic);
             lanes_used.* = @max(lanes_used.*, lanes);
+            if (ctx.wrote_sink.load(.monotonic)) env.wrote_sink = true;
             const fails = ctx.failures.load(.monotonic);
             if (fails > 0 and (on_error == .stop or opts.outcomes == null)) {
                 if (ctx.first_retryable.load(.monotonic)) env.diag.retryable = true;
@@ -4183,7 +4194,7 @@ fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
     const keys = splitmod.introspectPkCols(env.arena, prober, desc.dialect, table) catch |e|
         return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read primary key of `{s}`: {s}", .{ table, @errorName(e) }));
     if (keys.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no primary key found on `{s}`; name the key with `upsert on <col>`", .{table}));
-    env.log.log(.info, "upsert: inferred key on {s}: {s}", .{ table, try std.mem.join(env.arena, ", ", keys) });
+    env.log.log(.debug, "upsert: inferred key on {s}: {s}", .{ table, try std.mem.join(env.arena, ", ", keys) });
     var out = w;
     out.mode = .{ .upsert = .{ .keys = keys, .partial = w.mode.upsert.partial } };
     return out;
@@ -5143,6 +5154,10 @@ test "for-each fans out over a discovered list with interpolation" {
     defer alloc.free(b);
     try std.testing.expectEqualStrings("id,v\n1,10\n2,20\n", a);
     try std.testing.expectEqualStrings("id,v\n3,30\n", b);
+}
+
+test "log defaults to warn: a healthy run says nothing" {
+    try std.testing.expectEqual(obs.Level.warn, (LogConfig{}).level);
 }
 
 test "for-each discovers its rows from an in-engine SELECT" {

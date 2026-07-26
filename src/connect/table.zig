@@ -113,3 +113,130 @@ fn padded(out: *std.Io.Writer, s: []const u8, width: usize) !void {
     try out.writeAll(s);
     try out.splatBytesAll(" ", width - s.len);
 }
+
+/// `--format json` sink: one JSON object per row (NDJSON) on stdout, streamed
+/// per batch — unlike the table it never buffers, so memory stays constant.
+/// int/float/bool ride as JSON numbers/booleans (non-finite floats as null),
+/// decimal as a string (a float would lose precision), temporal types as their
+/// ISO text, bytes as base64.
+pub const JsonWriter = struct {
+    gpa: std.mem.Allocator,
+    /// Pre-rendered `"name":` prefixes, escaped once at open.
+    keys: []const []const u8,
+    buf: [8192]u8 = undefined,
+    fw: std.fs.File.Writer = undefined,
+
+    pub fn open(gpa: std.mem.Allocator, schema: types.Schema) !*JsonWriter {
+        const self = try gpa.create(JsonWriter);
+        self.* = .{ .gpa = gpa, .keys = &.{} };
+        self.fw = std.fs.File.stdout().writer(&self.buf);
+        const keys = try gpa.alloc([]const u8, schema.fields.len);
+        for (schema.fields, 0..) |f, i| {
+            var k = std.array_list.Managed(u8).init(gpa);
+            try k.append('"');
+            try appendJsonEscaped(&k, f.name);
+            try k.appendSlice("\":");
+            keys[i] = try k.toOwnedSlice();
+        }
+        self.keys = keys;
+        return self;
+    }
+
+    pub fn writeBatch(self: *JsonWriter, arena: std.mem.Allocator, batch: Batch) !void {
+        const out = &self.fw.interface;
+        var r: usize = 0;
+        while (r < batch.len) : (r += 1) {
+            try out.writeByte('{');
+            for (batch.columns, 0..) |*col, c| {
+                if (c > 0) try out.writeByte(',');
+                try out.writeAll(self.keys[c]);
+                try writeJsonValue(out, arena, col.getValue(r));
+            }
+            try out.writeAll("}\n");
+        }
+    }
+
+    fn writeJsonValue(out: *std.Io.Writer, arena: std.mem.Allocator, v: eval.Value) !void {
+        switch (v) {
+            .null => try out.writeAll("null"),
+            .bool => |b| try out.writeAll(if (b) "true" else "false"),
+            .int => |i| try out.print("{d}", .{i}),
+            .float => |f| if (std.math.isFinite(f)) try out.print("{d}", .{f}) else try out.writeAll("null"),
+            .bytes => |b| {
+                const enc = std.base64.standard.Encoder;
+                const dst = try arena.alloc(u8, enc.calcSize(b.len));
+                try out.writeByte('"');
+                try out.writeAll(enc.encode(dst, b));
+                try out.writeByte('"');
+            },
+            else => {
+                const s = try eval.valueToString(arena, v);
+                try out.writeByte('"');
+                try writeEscapedW(out, s);
+                try out.writeByte('"');
+            },
+        }
+    }
+
+    pub fn close(self: *JsonWriter) !void {
+        try self.fw.interface.flush();
+        self.deinit();
+    }
+
+    fn deinit(self: *JsonWriter) void {
+        for (self.keys) |k| self.gpa.free(k);
+        self.gpa.free(self.keys);
+        self.gpa.destroy(self);
+    }
+
+    pub fn sink(self: *JsonWriter) driver.Sink {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = driver.Sink.VTable{ .writeBatch = vtWrite, .close = vtClose, .abort = vtAbort };
+
+    fn vtWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
+        const self: *JsonWriter = @ptrCast(@alignCast(ptr));
+        return self.writeBatch(arena, b);
+    }
+    fn vtClose(ptr: *anyopaque) anyerror!void {
+        const self: *JsonWriter = @ptrCast(@alignCast(ptr));
+        return self.close();
+    }
+    fn vtAbort(ptr: *anyopaque) void {
+        const self: *JsonWriter = @ptrCast(@alignCast(ptr));
+        self.deinit();
+    }
+};
+
+fn appendJsonEscaped(list: *std.array_list.Managed(u8), s: []const u8) !void {
+    for (s) |c| switch (c) {
+        '"' => try list.appendSlice("\\\""),
+        '\\' => try list.appendSlice("\\\\"),
+        '\n' => try list.appendSlice("\\n"),
+        '\r' => try list.appendSlice("\\r"),
+        '\t' => try list.appendSlice("\\t"),
+        else => if (c < 0x20) {
+            var b: [6]u8 = undefined;
+            try list.appendSlice(std.fmt.bufPrint(&b, "\\u{x:0>4}", .{c}) catch unreachable);
+        } else try list.append(c),
+    };
+}
+
+fn writeEscapedW(out: *std.Io.Writer, s: []const u8) !void {
+    for (s) |c| switch (c) {
+        '"' => try out.writeAll("\\\""),
+        '\\' => try out.writeAll("\\\\"),
+        '\n' => try out.writeAll("\\n"),
+        '\r' => try out.writeAll("\\r"),
+        '\t' => try out.writeAll("\\t"),
+        else => if (c < 0x20) try out.print("\\u{x:0>4}", .{c}) else try out.writeByte(c),
+    };
+}
+
+test "json escape covers quotes, backslash, and control bytes" {
+    var l = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer l.deinit();
+    try appendJsonEscaped(&l, "a\"b\\c\nd\x01");
+    try std.testing.expectEqualStrings("a\\\"b\\\\c\\nd\\u0001", l.items);
+}
