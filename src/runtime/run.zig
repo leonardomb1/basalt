@@ -48,6 +48,7 @@ pub const Diag = struct {
 
 pub const requestAbort = driver.requestAbort;
 pub const aborting = driver.aborting;
+pub const resetAbort = driver.resetAbort;
 
 var g_reload = std.atomic.Value(bool).init(false);
 pub fn requestReload() void {

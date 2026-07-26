@@ -21,9 +21,18 @@ pub fn requestAbort() void {
 pub fn aborting() bool {
     return g_abort.load(.seq_cst);
 }
-/// Tests only: re-arm after exercising abort paths.
+/// Re-arm after an abort: for interactive callers (the REPL) that keep running
+/// after Ctrl-C, and for tests exercising abort paths. A one-shot run never needs it.
 pub fn resetAbort() void {
     g_abort.store(false, .seq_cst);
+}
+
+test "abort flag: requestAbort sets, resetAbort clears" {
+    defer resetAbort(); // never leave the flag set for later tests
+    requestAbort();
+    try std.testing.expect(aborting());
+    resetAbort();
+    try std.testing.expect(!aborting());
 }
 
 /// Tune a freshly connected DB/data-movement socket. TCP_NODELAY: the drivers
