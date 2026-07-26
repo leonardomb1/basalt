@@ -512,6 +512,12 @@ text, bytes as base64), and a `LOAD` run emits one summary object instead.
 Logs are stderr-only, plain text, level `warn` by default (`--log-level`,
 `--log-format json`, `-q`).
 
+`basalt repl` executes on a top-level `;` and carries `CREATE CONNECTION` /
+`CREATE FUNCTION` / `PARAM` declarations across entries (re-declaring a name
+replaces it). Meta commands: `\connections` list the session's declarations ·
+`\clear` drop them · `\format json|table` switch result output · `\help` ·
+`\q`. For history/arrow keys run it under `rlwrap`.
+
 | code | meaning |
 |------|---------|
 | `0`  | success |

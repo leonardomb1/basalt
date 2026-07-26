@@ -59,7 +59,8 @@ $ basalt run --format json -c "<query>"   # NDJSON rows on stdout, for scripts
 $ basalt check pipeline.sql               # validate without running
 $ basalt run -c "EXPLAIN <query>"         # print the plan
 $ basalt run -c "EXPLAIN ANALYZE <query>" # run it, print the plan with actuals
-$ basalt repl                             # interactive
+$ basalt repl                             # interactive: runs on `;`, keeps
+                                          # connections/functions across entries
 $ basalt serve ./endpoints --watch        # host every endpoint script in a dir
 ```
 
