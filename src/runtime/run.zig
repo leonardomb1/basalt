@@ -2820,7 +2820,8 @@ fn renderPipeline(env: *Env, body: ast.Pipeline, lr: LoopRow) !ast.Pipeline {
 }
 
 /// Deep-copy an expression, interpolating `${var}` needles into every string
-/// literal. Non-string leaves are reused as-is (identifiers can't hold needles).
+/// literal and folding bare loop-variable references to this row's value.
+/// Other leaves are reused as-is.
 const RenderCtx = struct { arena: std.mem.Allocator, lr: LoopRow };
 
 fn renderRecur(ctx: RenderCtx, e: *const ast.Expr) anyerror!*ast.Expr {
@@ -2829,6 +2830,17 @@ fn renderRecur(ctx: RenderCtx, e: *const ast.Expr) anyerror!*ast.Expr {
 
 fn renderExpr(arena: std.mem.Allocator, e: *const ast.Expr, lr: LoopRow) anyerror!*ast.Expr {
     if (e.* == .str_lit) return try mk(arena, .{ .str_lit = try interpAll(arena, e.str_lit, lr) });
+    // `$name` parses to a plain single-part field, so a loop variable used as a
+    // value is indistinguishable from a column here — bind it to the row's cell,
+    // shadowing a same-named source column (the rule scalar params already use).
+    // Multi-part paths (`$job.x`) belong to expand.zig and are left alone.
+    if (e.* == .field) {
+        if (e.field.single()) |nm| {
+            for (lr.names, lr.cells, 0..) |n, cell, i| {
+                if (std.mem.eql(u8, n, nm)) return mkLit(arena, loopValue(arena, cell, lr.typeAt(i)));
+            }
+        }
+    }
     return ast.rebuildExpr(arena, e, RenderCtx{ .arena = arena, .lr = lr }, renderRecur);
 }
 
@@ -4590,6 +4602,81 @@ test "for-each loop var interpolates into a select column value" {
     const out = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
     defer alloc.free(out);
     try std.testing.expectEqualStrings("id,EMPRESA\n1,01\n2,01\n", out);
+}
+
+test "for-each loop var used as an expression value binds per row" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "names.csv", .data = "name\nalpha\nbeta\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "alpha.csv", .data = "id\n1\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "beta.csv", .data = "id\n2\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "FOR EACH ROW OF ('{s}/names.csv') AS (name)\n" ++
+            "  LOAD INTO '{s}/out_${{name}}.csv' AS SELECT id, $name AS empresa FROM '{s}/${{name}}.csv';\nEND FOR;",
+        .{ base, base, base });
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    _ = run(alloc, prog, .{}, &rdiag) catch |e| {
+        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+        return e;
+    };
+
+    const a = try tmp.dir.readFileAlloc(alloc, "out_alpha.csv", 1 << 20);
+    defer alloc.free(a);
+    const b = try tmp.dir.readFileAlloc(alloc, "out_beta.csv", 1 << 20);
+    defer alloc.free(b);
+    try std.testing.expectEqualStrings("id,empresa\n1,alpha\n", a);
+    try std.testing.expectEqualStrings("id,empresa\n2,beta\n", b);
+}
+
+test "for-each: a typed loop var used as a value binds as its declared type" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "nums.csv", .data = "n\n5\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n7\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    // `$n * 2` only type-checks (and yields 10) if `n` bound as an int, not text.
+    const script = try std.fmt.allocPrint(alloc,
+        "FOR EACH ROW OF ('{s}/nums.csv') AS (n:INT)\n" ++
+            "  LOAD INTO '{s}/out.csv' AS SELECT id, $n * 2 AS twice FROM '{s}/in.csv';\nEND FOR;",
+        .{ base, base, base });
+    defer alloc.free(script);
+
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id,twice\n7,10\n", out);
+}
+
+test "for-each: a loop var shadows a same-named source column" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "names.csv", .data = "name\nalpha\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,name\n1,from_file\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "FOR EACH ROW OF ('{s}/names.csv') AS (name)\n" ++
+            "  LOAD INTO '{s}/out.csv' AS SELECT id, $name AS who FROM '{s}/in.csv';\nEND FOR;",
+        .{ base, base, base });
+    defer alloc.free(script);
+
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id,who\n1,alpha\n", out);
 }
 
 test "interpAll: bare-var fast path and expression bodies" {
