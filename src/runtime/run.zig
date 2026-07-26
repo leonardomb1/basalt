@@ -1057,10 +1057,11 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
 const PqLane = struct {
     arena: std.heap.ArenaAllocator,
     groups: []op.Aggregate.Group = &.{},
+    hashes: []u64 = &.{},
     /// The lane's groups split by key hash, computed once when the lane runs
     /// dry. The merge then reads a partition's slice directly instead of
     /// rescanning every lane for every partition.
-    buckets: []std.array_list.Managed(op.Aggregate.Group) = &.{},
+    buckets: []std.array_list.Managed(u32) = &.{},
 };
 
 /// One radix partition of the merge: the lanes' groups are split by key hash, so
@@ -1075,8 +1076,10 @@ const PqPart = struct {
 /// stays balanced when key hashes are uneven.
 const pq_parts: usize = 64;
 
-/// Fewest lanes worth splitting an aggregate across — see `runParallelParquetAgg`.
-const pq_min_lanes: usize = 4;
+/// Fewest lanes worth splitting an aggregate across. Two suffices now that the
+/// merge reuses the hashes the fold produced; while it re-hashed every key, the
+/// extra pass cost more than two lanes could win back.
+const pq_min_lanes: usize = 2;
 
 /// Shared state for parallel *parquet* aggregate lanes. The morsel is a row
 /// group: each lane opens its own reader over a disjoint window and folds into
@@ -1163,19 +1166,22 @@ fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
         .state = la,
         .gpa = ls.arena.child_allocator,
     };
-    ls.groups = try agg.drainGroups();
+    const drained = try agg.drainGroupsHashed();
+    ls.groups = drained.groups;
+    ls.hashes = drained.hashes;
     try bucketLane(ls);
 }
 
 /// Split this lane's groups into radix buckets — one hash per group, once.
+/// Split this lane's group indices into radix buckets, reusing the hash the
+/// fold already produced.
 fn bucketLane(ls: *PqLane) !void {
     const a = ls.arena.allocator();
-    ls.buckets = try a.alloc(std.array_list.Managed(op.Aggregate.Group), pq_parts);
-    for (ls.buckets) |*b| b.* = std.array_list.Managed(op.Aggregate.Group).init(a);
-    const hctx = keyhash.MultiKeyCtx{};
-    for (ls.groups) |g| {
-        const p: usize = @intCast((hctx.hash(g.key_vals) >> 32) % pq_parts);
-        try ls.buckets[p].append(g);
+    ls.buckets = try a.alloc(std.array_list.Managed(u32), pq_parts);
+    for (ls.buckets) |*b| b.* = std.array_list.Managed(u32).init(a);
+    for (ls.hashes, 0..) |h, i| {
+        const p: usize = @intCast((h >> 32) % pq_parts);
+        try ls.buckets[p].append(@intCast(i));
     }
 }
 
@@ -1190,9 +1196,26 @@ const pqMergeWorker = dispatchWorker(PqMergeCtx, pqMergeOne);
 
 fn pqMergeOne(ctx: *PqMergeCtx, p: usize) !void {
     const dst = &ctx.parts[p];
+    const da = dst.arena.allocator();
+    var tbl = try op.Aggregate.MergeTable.init(da, 256);
+    var hashes = std.array_list.Managed(u64).init(da);
+    var any_distinct = false;
+    for (ctx.aggs) |a| {
+        if (a.distinct) any_distinct = true;
+    }
     for (ctx.lanes) |*ls| {
         if (ls.buckets.len == 0) continue;
-        try op.Aggregate.adoptGroups(&dst.map, &dst.groups, dst.arena.allocator(), ls.buckets[p].items, ctx.aggs);
+        for (ls.buckets[p].items) |gi| {
+            const g = ls.groups[gi];
+            const h = ls.hashes[gi];
+            if (try tbl.find(h, g.key_vals, dst.groups.items, hashes.items, dst.groups.items.len)) |at| {
+                const cg = &dst.groups.items[at];
+                for (g.accs, ctx.aggs, 0..) |src, agg, j| try op.Aggregate.mergeAcc(da, &cg.accs[j], src, agg);
+            } else {
+                try dst.groups.append(try op.Aggregate.adoptOne(da, g, ctx.aggs, any_distinct));
+                try hashes.append(h);
+            }
+        }
     }
 }
 
@@ -1379,11 +1402,7 @@ fn runParallelParquetMap(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, m
 /// into private tables, then the tables are merged by hash partition.
 ///
 /// Returns false (serial fallback) when the file has too few row groups to
-/// split, or when fewer than `pq_min_lanes` lanes are available: the merge adds
-/// a bucket pass and a partition pass over the groups, and at a cardinality
-/// where groups approach rows that costs more than two lanes can win back
-/// (measured: 5M groups over 5M rows is ~30% slower at two lanes, ~2x faster at
-/// twenty).
+/// split, or when fewer than `pq_min_lanes` lanes are available.
 fn runParallelParquetAgg(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     const arena = env.arena;
     const path = switch (rd.form) {

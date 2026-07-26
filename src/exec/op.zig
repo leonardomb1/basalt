@@ -835,7 +835,20 @@ pub const Aggregate = struct {
     /// input into a partial group set, and `mergeGroups` combines partials across
     /// workers by recombining the *raw* accumulators (so AVG etc. stay correct);
     /// `emit` finalizes once at the end. No-GROUP-BY returns exactly one group.
+    pub const Drained = struct { groups: []Group, hashes: []u64 };
+
+    /// `drainGroups`, but keeping the hash it computed for each group. The
+    /// parallel path partitions and merges by hash afterwards; recomputing it
+    /// there means hashing every key three times instead of once.
+    pub fn drainGroupsHashed(self: *Aggregate) anyerror!Drained {
+        return self.drainImpl();
+    }
+
     pub fn drainGroups(self: *Aggregate) anyerror![]Group {
+        return (try self.drainImpl()).groups;
+    }
+
+    fn drainImpl(self: *Aggregate) anyerror!Drained {
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
         const pull = scratch.allocator();
@@ -849,7 +862,7 @@ pub const Aggregate = struct {
             }
             const one = try self.state.alloc(Group, 1);
             one[0] = .{ .key_vals = &.{}, .accs = accs };
-            return one;
+            return .{ .groups = one, .hashes = &.{} };
         }
 
         var ghashes = std.array_list.Managed(u64).init(self.state);
@@ -922,7 +935,7 @@ pub const Aggregate = struct {
             const rec = store.at(i);
             g.* = .{ .key_vals = rec.keys, .accs = rec.accs };
         }
-        return out;
+        return .{ .groups = out, .hashes = ghashes.items };
     }
 
     /// Open-addressed group index built for the one access pattern aggregation
@@ -1109,6 +1122,85 @@ pub const Aggregate = struct {
     pub fn mergeGroups(map: *GroupMap(), groups: *std.array_list.Managed(Group), dst_alloc: std.mem.Allocator, src_groups: []const Group, aggs: []const Agg) !void {
         return mergeGroupsPart(map, groups, dst_alloc, src_groups, aggs, 0, 1);
     }
+
+    /// Open-addressed index for the merge, keyed on a hash the caller already
+    /// holds. `adoptGroups` went through a general map, which re-hashed every
+    /// key it was handed — the third full hashing pass over the same data.
+    /// Take a lane's group as-is, rebuilding only what cannot be shared — the
+    /// distinct set, whose arena belongs to the producing lane.
+    pub fn adoptOne(dst_alloc: std.mem.Allocator, g: Group, aggs: []const Agg, any_distinct: bool) !Group {
+        if (!any_distinct) return g;
+        var out = g;
+        const accs = try dst_alloc.alloc(Acc, aggs.len);
+        for (g.accs, accs, aggs) |src, *dst, agg| {
+            dst.* = src;
+            if (!agg.distinct) continue;
+            dst.seen = null;
+            dst.n = 0;
+            if (src.seen) |ss| {
+                var it = ss.keyIterator();
+                while (it.next()) |k| try noteDistinct(dst_alloc, dst, k.*[0]);
+            }
+        }
+        out.accs = accs;
+        return out;
+    }
+
+    pub const MergeTable = struct {
+        entries: []u32,
+        len: usize = 0,
+        mask: u64,
+        alloc: std.mem.Allocator,
+
+        const salt_bits = 6;
+        const idx_bits = 32 - salt_bits;
+        const max_groups = (1 << idx_bits) - 1;
+
+        pub fn init(alloc: std.mem.Allocator, cap_pow2: usize) !MergeTable {
+            const e = try alloc.alloc(u32, cap_pow2);
+            @memset(e, 0);
+            return .{ .entries = e, .mask = cap_pow2 - 1, .alloc = alloc };
+        }
+
+        fn saltOf(h: u64) u32 {
+            return @intCast((h >> 32) & ((1 << salt_bits) - 1));
+        }
+
+        fn grow(self: *MergeTable, hashes: []const u64) !void {
+            const cap = self.entries.len * 2;
+            const ne = try self.alloc.alloc(u32, cap);
+            @memset(ne, 0);
+            const nmask = cap - 1;
+            for (self.entries) |e| {
+                if (e == 0) continue;
+                const h = hashes[(e & max_groups) - 1];
+                var i = h & nmask;
+                while (ne[i] != 0) i = (i + 1) & nmask;
+                ne[i] = e;
+            }
+            self.entries = ne;
+            self.mask = nmask;
+        }
+
+        /// Index of the group matching `key`/`h`, or null after recording
+        /// `new_idx` as its slot.
+        pub fn find(self: *MergeTable, h: u64, key: []const Value, groups: []const Group, hashes: []const u64, new_idx: usize) !?usize {
+            if ((self.len + 1) * 10 >= self.entries.len * 7) try self.grow(hashes);
+            const want = saltOf(h) << idx_bits;
+            var i = h & self.mask;
+            while (true) : (i = (i + 1) & self.mask) {
+                const e = self.entries[i];
+                if (e == 0) {
+                    self.entries[i] = want | @as(u32, @intCast(new_idx + 1));
+                    self.len += 1;
+                    return null;
+                }
+                if ((e >> idx_bits) << idx_bits != want) continue;
+                const idx = (e & max_groups) - 1;
+                if (keyhash.MultiKeyCtx.eql(.{}, key, groups[idx].key_vals)) return idx;
+            }
+        }
+    };
 
     /// Merge for the parallel path, where the source groups live in lane arenas
     /// that outlive the merge: a key seen for the first time is *adopted* — its
