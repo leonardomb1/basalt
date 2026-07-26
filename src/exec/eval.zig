@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const regex = @import("regex.zig");
+const sqlmod = @import("../connect/sql.zig");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const column = @import("column.zig");
@@ -776,6 +777,7 @@ fn boolOpVec(arena: std.mem.Allocator, op: ast.BinOp, le: *const ast.Expr, re: *
 fn castVec(arena: std.mem.Allocator, c: ast.Expr.Cast, batch: Batch) VecError!Vec {
     const v = try evalVec(arena, c.e, batch);
     const target = c.ty.kind;
+    if (target == .decimal) return error.Unsupported;
     switch (v) {
         .scalar => |s| {
             if (s.isNull()) return .{ .scalar = .null };
@@ -1169,7 +1171,7 @@ pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, ro
         .cast => |c| {
             const v = try evalRow(arena, c.e, batch, row);
             if (v.isNull()) return .null;
-            return castValue(arena, v, c.ty.kind);
+            return castValueTyped(arena, v, c.ty);
         },
         .match => |m| return evalMatch(arena, m, batch, row),
         .call => |c| return evalCall(arena, c, batch, row),
@@ -1386,6 +1388,50 @@ fn evalCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize
         return .{ .string = out };
     }
     return error.TypeMismatch;
+}
+
+/// Cast honouring the target's scale. `castValue` only sees a `TypeKind`, which
+/// is enough for every type except `DECIMAL(p, s)` — where dropping the scale
+/// left the conversion undefined, so it failed outright.
+pub fn castValueTyped(arena: std.mem.Allocator, v: Value, ty: types.Type) EvalError!Value {
+    if (ty.kind != .decimal) return castValue(arena, v, ty.kind);
+    const d: valuemod.Decimal = switch (v) {
+        .decimal => |x| x,
+        .int => |x| .{ .unscaled = x, .scale = 0 },
+        .bool => |x| .{ .unscaled = if (x) 1 else 0, .scale = 0 },
+        .float => |x| blk: {
+            const p = powTen(ty.scale);
+            const scaled = x * @as(f64, @floatFromInt(p));
+            if (!std.math.isFinite(scaled)) return error.CastFailed;
+            break :blk .{ .unscaled = @intFromFloat(@round(scaled)), .scale = ty.scale };
+        },
+        .string, .bytes => |str| switch (sqlmod.parseDecimalText(trim(str))) {
+            .decimal => |x| x,
+            .int => |x| valuemod.Decimal{ .unscaled = x, .scale = 0 },
+            else => return error.CastFailed,
+        },
+        else => return error.CastFailed,
+    };
+    return .{ .decimal = rescaleTo(d, ty.scale) orelse return error.CastFailed };
+}
+
+fn powTen(n: u8) i128 {
+    var r: i128 = 1;
+    var i: u8 = 0;
+    while (i < n) : (i += 1) r *= 10;
+    return r;
+}
+
+/// Shift a decimal to `want`, truncating toward zero when it loses digits —
+/// the same rule the parquet writer applies.
+fn rescaleTo(d: valuemod.Decimal, want: u8) ?valuemod.Decimal {
+    var unscaled = d.unscaled;
+    var have: i32 = d.scale;
+    while (have < want) : (have += 1) {
+        unscaled = std.math.mul(i128, unscaled, 10) catch return null;
+    }
+    while (have > want) : (have -= 1) unscaled = @divTrunc(unscaled, 10);
+    return .{ .unscaled = unscaled, .scale = want };
 }
 
 pub fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalError!Value {

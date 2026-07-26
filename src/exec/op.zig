@@ -1329,7 +1329,16 @@ pub const Aggregate = struct {
                 } else if (!has_arg or !v.isNull()) acc.n += 1;
             },
             .sum => if (!v.isNull()) {
-                if (agg.ty.kind == .float) acc.sum_f += eval.toF64(v) else acc.sum_i += v.int;
+                switch (agg.ty.kind) {
+                    .float => acc.sum_f += eval.toF64(v),
+                    // Scale is fixed by the column's type, so the unscaled
+                    // integers add directly and `finalizeAcc` reapplies it.
+                    .decimal => acc.sum_i += if (v == .decimal)
+                        (std.math.cast(i64, v.decimal.unscaled) orelse return error.CastFailed)
+                    else
+                        v.int,
+                    else => acc.sum_i += v.int,
+                }
                 acc.n += 1;
             },
             .avg => if (!v.isNull()) {
@@ -1352,7 +1361,11 @@ pub const Aggregate = struct {
     pub fn finalizeAcc(acc: Acc, agg: Agg) Value {
         return switch (agg.func) {
             .count => .{ .int = acc.n },
-            .sum => if (acc.n == 0) .null else if (agg.ty.kind == .float) Value{ .float = acc.sum_f } else Value{ .int = acc.sum_i },
+            .sum => if (acc.n == 0) .null else switch (agg.ty.kind) {
+                .float => Value{ .float = acc.sum_f },
+                .decimal => Value{ .decimal = .{ .unscaled = acc.sum_i, .scale = agg.ty.scale } },
+                else => Value{ .int = acc.sum_i },
+            },
             .avg => if (acc.n == 0) .null else Value{ .float = acc.sum_f / @as(f64, @floatFromInt(acc.n)) },
             .min, .max => acc.ext,
         };

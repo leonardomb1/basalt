@@ -157,7 +157,14 @@ fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const ast.E
             const a = arg orelse return fail(diag, "this aggregate requires an argument", .{});
             const at = try exprType(arena, in, a, diag);
             return switch (func) {
-                .sum => if (at.kind == .float) types.Type.init(.float).withNull(true) else types.Type.init(.int).withNull(true),
+                .sum => switch (at.kind) {
+                    .float => types.Type.init(.float).withNull(true),
+                    // A decimal sum stays a decimal: typing it as an int reported
+                    // the accumulated *unscaled* integer, so 1.5+2.25+3.125 came
+                    // back as 68750.
+                    .decimal => at.withNull(true),
+                    else => types.Type.init(.int).withNull(true),
+                },
                 .avg => types.Type.init(.float).withNull(true),
                 .min, .max => at.withNull(true),
                 .count => unreachable,
