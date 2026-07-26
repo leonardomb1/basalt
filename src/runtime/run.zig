@@ -1358,6 +1358,11 @@ fn runParallelParquetMap(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, m
     const lanes = try parallel.spawnJoin(arena, nthreads, pqMapLane, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
     env.log.log(.info, "parallel parquet map: {d} row groups over {d} lanes ({s} sink)", .{ ngroups, lanes, @tagName(sink_mode) });
+    if (opts.explain) {
+        std.debug.print("actuals (parallel map, {d} lanes over {d} row groups): {d} rows out\n", .{
+            lanes, ngroups, ctx.rows_out.load(.monotonic),
+        });
+    }
 
     if (ctx.morsels.queue.first_err) |e| return e;
     stats.rows_out += ctx.rows_out.load(.monotonic);
@@ -1463,6 +1468,18 @@ fn runParallelParquetAgg(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, p
         t_mrg1.since(t_mrg0) / 1_000_000,
         lane_groups,
     });
+    if (opts.explain) {
+        std.debug.print(
+            \\actuals (parallel aggregate, {d} lanes over {d} row groups):
+            \\  fold+bucket  {d:>8.1}ms {d:>12} groups
+            \\  merge        {d:>8.1}ms {d:>12} partitions
+            \\
+        , .{
+            used,                                                        ngroups,
+            @as(f64, @floatFromInt(t_fold1.since(t_fold0))) / 1e6,        lane_groups,
+            @as(f64, @floatFromInt(t_mrg1.since(t_mrg0))) / 1e6,          pq_parts,
+        });
+    }
 
     env.log.log(.info, "parallel parquet aggregate: {d} row groups in {d} morsels over {d} lanes, merged in {d} partitions", .{ ngroups, nitems, used, pq_parts });
 
@@ -1516,6 +1533,16 @@ fn runParallelParquetAgg(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, p
     env.log.log(.debug, "pq agg tail: emit {d}ms ({d} groups), sort+limit+write {d}ms", .{
         t_emit1.since(t_emit0) / 1_000_000, total, t_tail1.since(t_tail0) / 1_000_000,
     });
+    if (opts.explain) {
+        std.debug.print(
+            \\  emit         {d:>8.1}ms {d:>12} rows
+            \\  sort+write   {d:>8.1}ms
+            \\
+        , .{
+            @as(f64, @floatFromInt(t_emit1.since(t_emit0))) / 1e6, total,
+            @as(f64, @floatFromInt(t_tail1.since(t_tail0))) / 1e6,
+        });
+    }
     snk_open = false;
     try snk.close();
     return true;
