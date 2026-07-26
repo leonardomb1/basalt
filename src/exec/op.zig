@@ -852,7 +852,6 @@ pub const Aggregate = struct {
             return one;
         }
 
-        var groups = std.array_list.Managed(Group).init(self.state);
         var ghashes = std.array_list.Managed(u64).init(self.state);
         // One table per radix partition. A single table for millions of groups
         // misses cache on every probe; sixty-four smaller ones stay resident,
@@ -864,7 +863,7 @@ pub const Aggregate = struct {
         const tables = try self.state.alloc(GroupTable, nparts);
         for (tables) |*t| t.* = try GroupTable.init(self.state, 256);
         const counts = try self.state.alloc(u32, nparts + 1);
-        var store = GroupStore{ .alloc = self.state, .nkeys = self.by.len, .naggs = self.aggs.len };
+        var store = GroupStore.init(self.state, self.by.len, self.aggs.len);
         const hctx = keyhash.MultiKeyCtx{};
         while (try self.child.next(pull)) |b| {
             const probe = try pull.alloc(Value, self.by.len);
@@ -902,24 +901,28 @@ pub const Aggregate = struct {
             for (order) |ri| {
                 r = ri;
                 for (self.by, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
-                const at: u32 = @intCast(groups.items.len);
+                const at: u32 = @intCast(store.len);
                 const table = &tables[hashes[r] >> part_shift];
-                const f = try table.getOrPut(hashes[r], probe, groups.items, ghashes.items, at);
-                if (!f.found) {
-                    const slot = try store.next();
-                    for (probe, slot.keys) |v, *o| o.* = try dupeValue(self.state, v);
-                    try groups.append(.{ .key_vals = slot.keys, .accs = slot.accs });
+                const f = try table.getOrPut(hashes[r], probe, &store, ghashes.items, at);
+                const rec = if (f.found) store.at(f.slot) else blk: {
+                    const nr = try store.push();
+                    for (probe, nr.keys) |v, *o| o.* = try dupeValue(self.state, v);
                     try ghashes.append(hashes[r]);
-                }
-                const g = &groups.items[f.slot];
+                    break :blk nr;
+                };
                 for (self.aggs, 0..) |agg, j| {
                     const v = if (argcols[j]) |col| col.getValue(r) else Value.null;
-                    try updateAcc(self.state, &g.accs[j], agg, v, agg.arg != null);
+                    try updateAcc(self.state, &rec.accs[j], agg, v, agg.arg != null);
                 }
             }
             _ = scratch.reset(.retain_capacity);
         }
-        return groups.toOwnedSlice();
+        const out = try self.state.alloc(Group, store.len);
+        for (out, 0..) |*g, i| {
+            const rec = store.at(i);
+            g.* = .{ .key_vals = rec.keys, .accs = rec.accs };
+        }
+        return out;
     }
 
     /// Open-addressed group index built for the one access pattern aggregation
@@ -993,7 +996,7 @@ pub const Aggregate = struct {
             self: *GroupTable,
             h: u64,
             key: []const Value,
-            groups: []const Group,
+            store: *const GroupStore,
             hashes: []const u64,
             new_slot: u32,
         ) !Found {
@@ -1010,7 +1013,7 @@ pub const Aggregate = struct {
                 }
                 if ((e >> idx_bits) << idx_bits != want) continue;
                 const idx = (e & max_groups) - 1;
-                if (keyhash.MultiKeyCtx.eql(.{}, key, groups[idx].key_vals)) return .{ .slot = idx, .found = true };
+                if (keyhash.MultiKeyCtx.eql(.{}, key, store.at(idx).keys)) return .{ .slot = idx, .found = true };
             }
         }
     };
@@ -1019,29 +1022,54 @@ pub const Aggregate = struct {
     /// `block` groups instead of two per group, and the accumulators of nearby
     /// groups land next to each other. Blocks are never resized, so the slices
     /// handed out stay valid.
+    /// Group records in fixed blocks, addressed by index. A record holds its
+    /// keys immediately followed by its accumulators, so the probe that finds a
+    /// group and the update that follows touch the same run of bytes. Blocks are
+    /// never resized, so an index stays valid for the life of the fold.
     const GroupStore = struct {
-        const block = 8192;
+        const block_shift = 13;
+        const block = 1 << block_shift;
+        const block_mask = block - 1;
 
         alloc: std.mem.Allocator,
         nkeys: usize,
         naggs: usize,
-        keys: []Value = &.{},
-        accs: []Acc = &.{},
-        used: usize = block,
+        blocks: std.array_list.Managed([]u8),
+        len: usize = 0,
 
-        const Slot = struct { keys: []Value, accs: []Acc };
+        const Rec = struct { keys: []Value, accs: []Acc };
 
-        fn next(self: *GroupStore) !Slot {
-            if (self.used == block) {
-                self.keys = try self.alloc.alloc(Value, block * self.nkeys);
-                self.accs = try self.alloc.alloc(Acc, block * self.naggs);
-                self.used = 0;
+        fn init(alloc: std.mem.Allocator, nkeys: usize, naggs: usize) GroupStore {
+            return .{
+                .alloc = alloc,
+                .nkeys = nkeys,
+                .naggs = naggs,
+                .blocks = std.array_list.Managed([]u8).init(alloc),
+            };
+        }
+
+        fn recSize(self: GroupStore) usize {
+            return self.nkeys * @sizeOf(Value) + self.naggs * @sizeOf(Acc);
+        }
+
+        fn at(self: GroupStore, i: usize) Rec {
+            const rec = self.recSize();
+            const base = self.blocks.items[i >> block_shift].ptr + (i & block_mask) * rec;
+            const ksz = self.nkeys * @sizeOf(Value);
+            return .{
+                .keys = @alignCast(std.mem.bytesAsSlice(Value, base[0..ksz])),
+                .accs = @alignCast(std.mem.bytesAsSlice(Acc, base[ksz..][0 .. self.naggs * @sizeOf(Acc)])),
+            };
+        }
+
+        fn push(self: *GroupStore) !Rec {
+            if (self.len & block_mask == 0 and self.len >> block_shift == self.blocks.items.len) {
+                try self.blocks.append(try self.alloc.alignedAlloc(u8, .of(Value), block * self.recSize()));
             }
-            const i = self.used;
-            self.used += 1;
-            const a = self.accs[i * self.naggs ..][0..self.naggs];
-            for (a) |*x| x.* = .{};
-            return .{ .keys = self.keys[i * self.nkeys ..][0..self.nkeys], .accs = a };
+            const rec = self.at(self.len);
+            self.len += 1;
+            for (rec.accs) |*a| a.* = .{};
+            return rec;
         }
     };
 
