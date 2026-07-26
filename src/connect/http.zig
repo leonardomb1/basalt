@@ -261,6 +261,7 @@ pub const AuthState = struct {
             .location = .{ .url = self.cc.login_url },
             .headers = .{ .content_type = .{ .override = content_type } },
             .payload = payload,
+            .decompress_buffer = decompress_direct,
             .response_writer = &aw.writer,
         });
         const code = @intFromEnum(res.status);
@@ -344,6 +345,14 @@ pub fn encodeSpaces(arena: std.mem.Allocator, url: []const u8) ![]const u8 {
 /// the manual override for chains the automatic repair can't fix (e.g. a server
 /// that omits its intermediate entirely — repair can only re-anchor what the
 /// server actually sends).
+/// Decompress straight into the response writer rather than through std's
+/// fixed window buffer. The flate decoder can emit a match up to 258 bytes
+/// past the limit it was handed; on the buffered path that destination is a
+/// fixed writer that cannot rebase, so the process aborted on any gzip body
+/// larger than the window. Streaming direct leaves growth to the caller's
+/// allocating writer, which rebases fine.
+pub const decompress_direct: []u8 = &.{};
+
 pub fn initClient(gpa: std.mem.Allocator) std.http.Client {
     var client = std.http.Client{ .allocator = gpa };
     const path = std.process.getEnvVarOwned(gpa, "BASALT_CA_BUNDLE") catch return client;
@@ -536,6 +545,9 @@ pub const HttpSource = struct {
         client: *std.http.Client,
         method_post: bool,
         content_type: ?[]const u8,
+        /// Sent as the client's User-Agent rather than an extra header, so a
+        /// user-supplied one replaces std's default instead of joining it.
+        user_agent: []const u8,
         url: []const u8,
         req_body: ?[]const u8 = null,
         hdrs: [12]std.http.Header = undefined,
@@ -831,6 +843,7 @@ pub const HttpSource = struct {
             .client = self.client,
             .method_post = self.opts.method == .post,
             .content_type = self.contentType(),
+            .user_agent = userAgentOf(self.opts),
             .url = undefined,
             .gen = self.auth_gen,
             .retries = retries,
@@ -876,8 +889,12 @@ pub const HttpSource = struct {
                 .method = if (slot.method_post) .POST else .GET,
                 .location = .{ .url = slot.url },
                 .extra_headers = slot.hdrs[0..slot.nh],
-                .headers = if (slot.content_type) |ct| .{ .content_type = .{ .override = ct } } else .{},
+                .headers = .{
+                    .user_agent = .{ .override = slot.user_agent },
+                    .content_type = if (slot.content_type) |ct| .{ .override = ct } else .default,
+                },
                 .payload = slot.req_body,
+                .decompress_buffer = decompress_direct,
                 .response_writer = &aw.writer,
             }) catch |e| {
                 attempt += 1;
@@ -1033,8 +1050,12 @@ pub const HttpSource = struct {
             .method = if (self.opts.method == .post) .POST else .GET,
             .location = .{ .url = req.url },
             .extra_headers = hdrs[0..nh],
-            .headers = if (self.contentType()) |ct| .{ .content_type = .{ .override = ct } } else .{},
+            .headers = .{
+                .user_agent = .{ .override = userAgentOf(self.opts) },
+                .content_type = if (self.contentType()) |ct| .{ .override = ct } else .default,
+            },
             .payload = req.body,
+            .decompress_buffer = decompress_direct,
             .response_writer = &aw.writer,
         });
         const code = @intFromEnum(res.status);
@@ -1088,6 +1109,20 @@ pub const HttpSource = struct {
     }
 };
 
+/// Default User-Agent. Naming the tool beats std's generic `zig/x (std.http)`,
+/// which some endpoints filter as an unattended library client.
+pub const user_agent = "basalt/" ++ @import("build_options").version;
+
+/// The User-Agent to send: the one given via `header = 'User-Agent: ...'`, else
+/// our own. Returned separately from `buildHeaders` because it belongs on the
+/// client, not in `extra_headers`.
+pub fn userAgentOf(opts: Options) []const u8 {
+    const h = opts.header orelse return user_agent;
+    const colon = std.mem.indexOfScalar(u8, h, ':') orelse return user_agent;
+    if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, h[0..colon], " "), "user-agent")) return user_agent;
+    return std.mem.trim(u8, h[colon + 1 ..], " ");
+}
+
 fn buildHeaders(arena: std.mem.Allocator, opts: Options) ![]const std.http.Header {
     var hdrs = std.array_list.Managed(std.http.Header).init(arena);
     if (opts.bearer orelse try envOpt(arena, opts.bearer_env)) |tok| {
@@ -1105,10 +1140,15 @@ fn buildHeaders(arena: std.mem.Allocator, opts: Options) ![]const std.http.Heade
     }
     if (opts.header) |h| {
         const colon = std.mem.indexOfScalar(u8, h, ':') orelse return error.BadHeaderHint;
-        try hdrs.append(.{
-            .name = std.mem.trim(u8, h[0..colon], " "),
-            .value = std.mem.trim(u8, h[colon + 1 ..], " "),
-        });
+        const name = std.mem.trim(u8, h[0..colon], " ");
+        // User-Agent is set on the client instead; appending it here would send
+        // two, which several WAFs reject outright (GitHub answers 403).
+        if (!std.ascii.eqlIgnoreCase(name, "user-agent")) {
+            try hdrs.append(.{
+                .name = name,
+                .value = std.mem.trim(u8, h[colon + 1 ..], " "),
+            });
+        }
     }
     try hdrs.append(.{ .name = "Accept", .value = "application/json" });
     return hdrs.toOwnedSlice();

@@ -1218,12 +1218,10 @@ pub const Parser = struct {
         try self.expectKw("by");
         const mode = try self.expectIdent();
         const is_cursor = eqlNoCase(mode, "cursor");
-        if (eqlNoCase(mode, "page")) {
-            try hints.append(.{ .key = "page", .value = .flag, .pos = pos });
-        } else if (eqlNoCase(mode, "offset")) {
-            try hints.append(.{ .key = "offset", .value = .flag, .pos = pos });
-        } else if (is_cursor) {
-            try hints.append(.{ .key = "cursor", .value = .flag, .pos = pos });
+        // http.zig reads the mode off a `paginate` hint; a bare flag key
+        // planned fine but left paginate=.none, so only one page was fetched.
+        if (eqlNoCase(mode, "page") or eqlNoCase(mode, "offset") or is_cursor) {
+            try hints.append(.{ .key = "paginate", .value = .{ .ident = mode }, .pos = pos });
         } else {
             return self.fail(pos, "PAGINATE BY expects page, offset, or cursor (got `{s}`)", .{mode});
         }

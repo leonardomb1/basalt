@@ -5,12 +5,16 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "Omit debug info from the binary") orelse false;
 
+    const opts = b.addOptions();
+    opts.addOption([]const u8, "version", @import("build.zig.zon").version);
+
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
     });
+    root_module.addOptions("build_options", opts);
 
     const exe = b.addExecutable(.{
         .name = "basalt",

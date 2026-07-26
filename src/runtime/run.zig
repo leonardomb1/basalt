@@ -619,7 +619,7 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     if (stages.len == 0) return planErr(env.diag, "empty pipeline");
     const last = stages[stages.len - 1].node;
     if (last != .write) return planErr(env.diag, "a top-level pipeline must end in `write`");
-    env.sink_name = connectorType(env, last.write.connector);
+    env.sink_name = sinkLabel(env, last.write);
 
     if (stages[0].node == .read) implicit: {
         const rd = stages[0].node.read;
@@ -1024,7 +1024,7 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
     const out_schema = try schemaPtr(arena, apl.schema);
 
     env.src_name = "csv";
-    env.sink_name = connectorType(env, w.connector);
+    env.sink_name = sinkLabel(env, w);
 
     const nthreads = @max(@as(usize, 1), opts.threads);
     var cmap = op.Aggregate.GroupMap().init(arena);
@@ -1155,7 +1155,7 @@ fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.S
     for (env.sources.items[src_base..]) |sc| sc.close();
     env.sources.shrinkRetainingCapacity(src_base);
 
-    env.sink_name = connectorType(env, w.connector);
+    env.sink_name = sinkLabel(env, w);
 
     const nlanes = @min(@max(@as(usize, 1), opts.threads), sp.predicates.len);
     var cmap = op.Aggregate.GroupMap().init(arena);
@@ -1286,7 +1286,7 @@ fn runParallelCsvMap(env: *Env, rd: ast.Read, map_stages: []const ast.Stage, w: 
     const out_schema = try mapChainSchema(env, map_stages, mapped.schema);
 
     env.src_name = "csv";
-    env.sink_name = connectorType(env, w.connector);
+    env.sink_name = sinkLabel(env, w);
 
     const wr = try resolveUpsertKeys(env, w);
     const sink_mode: parallel.SinkMode = (try buildParallelSink(env, wr, out_schema)) orelse
@@ -1405,7 +1405,7 @@ fn runParallelCsvTopN(env: *Env, rd: ast.Read, prefix: []const ast.Stage, srt: a
     for (srt.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc };
 
     env.src_name = "csv";
-    env.sink_name = connectorType(env, w.connector);
+    env.sink_name = sinkLabel(env, w);
 
     const nthreads = @max(@as(usize, 1), opts.threads);
     const builders = try arena.alloc(column.Builder, row_schema.fields.len);
@@ -1563,7 +1563,7 @@ fn runParallelCsvDistinct(env: *Env, rd: ast.Read, prefix: []const ast.Stage, di
     }
 
     env.src_name = "csv";
-    env.sink_name = connectorType(env, w.connector);
+    env.sink_name = sinkLabel(env, w);
 
     const nthreads = @max(@as(usize, 1), opts.threads);
     var seen = op.Aggregate.GroupMap().init(arena);
@@ -2197,6 +2197,14 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
 
 /// Resolve a sink/source connector name to its driver type for the summary
 /// (`csv`/`request` are types; a connection name maps to its `connector`).
+/// Label for a *write* target: the `csv` connector covers every file sink, so
+/// the format has to come from the target itself or telemetry reports parquet
+/// writes as csv.
+fn sinkLabel(env: *Env, w: ast.Write) []const u8 {
+    if (std.mem.eql(u8, w.connector, "csv") and pqwrite.Writer.isPath(w.target)) return "parquet";
+    return connectorType(env, w.connector);
+}
+
 fn connectorType(env: *Env, name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "csv") or std.mem.eql(u8, name, "request") or
         std.mem.eql(u8, name, "http") or std.mem.eql(u8, name, "buffer")) return name;

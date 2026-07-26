@@ -13,6 +13,7 @@
 //! The key comes from AZURE_STORAGE_KEY.
 
 const std = @import("std");
+const httpx = @import("http.zig");
 
 /// Civil date from a day count since the epoch (Howard Hinnant's algorithm).
 /// Duplicated from `exec/eval.zig` rather than imported so this module depends
@@ -461,6 +462,7 @@ pub const BlockBlobWriter = struct {
                 .location = .{ .url = url },
                 .extra_headers = hdrs.items,
                 .payload = body,
+                .decompress_buffer = httpx.decompress_direct,
                 .response_writer = &aw.writer,
             });
             const code = @intFromEnum(res.status);
@@ -506,6 +508,7 @@ pub const BlockBlobWriter = struct {
             .location = .{ .url = url },
             .extra_headers = hdrs.items,
             .payload = "",
+            .decompress_buffer = httpx.decompress_direct,
             .response_writer = &aw.writer,
         });
         const code = @intFromEnum(res.status);
@@ -706,6 +709,7 @@ pub fn listPrefix(
             .method = .GET,
             .location = .{ .url = url },
             .extra_headers = hdrs.items,
+            .decompress_buffer = httpx.decompress_direct,
             .response_writer = &aw.writer,
         });
         const code = @intFromEnum(res.status);

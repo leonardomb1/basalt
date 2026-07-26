@@ -13,6 +13,7 @@ const pushdown = @import("pushdown.zig");
 const Dialect = @import("../connect/sql.zig").Dialect;
 const eval = @import("../exec/eval.zig");
 const csv = @import("../connect/csv.zig");
+const pqwrite = @import("../connect/pqwrite.zig");
 
 pub const Diag = struct {
     buf: [512]u8 = undefined,
@@ -538,7 +539,7 @@ pub fn render(plan: Plan, w: anytype) !void {
             }
             try printSchema(w, "        ", st.out_schema);
         }
-        try w.print("  write {s}  {s} ({s})\n", .{ o.sink.connector, o.sink.target, o.sink.mode });
+        try w.print("  write {s}  {s} ({s})\n", .{ sinkKind(o.sink), o.sink.target, o.sink.mode });
 
         try w.writeAll("  physical: ");
         if (o.physical.splittable) {
@@ -561,6 +562,13 @@ pub fn render(plan: Plan, w: anytype) !void {
         }
         try w.writeAll("\n");
     }
+}
+
+/// The `csv` connector backs every file sink, so the plan has to name the
+/// format from the target — otherwise a parquet write reads as `write csv`.
+fn sinkKind(sink: anytype) []const u8 {
+    if (std.mem.eql(u8, sink.connector, "csv") and pqwrite.Writer.isPath(sink.target)) return "parquet";
+    return sink.connector;
 }
 
 fn printSchema(w: anytype, indent: []const u8, schema: ?types.Schema) !void {
