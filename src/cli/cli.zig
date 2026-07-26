@@ -635,10 +635,11 @@ fn usage(w: anytype) !void {
         \\                     so -j 1 is the stable-order choice)
         \\  --port N           listen port for HTTP mode
         \\  --json             emit the run summary as JSON on stdout
-        \\  --log-format FMT   auto|text|json — logs go to stderr
-        \\                     (auto: text on a TTY, NDJSON when piped)
-        \\  --log-level LVL    error|warn|info|debug (default info)
-        \\  -q, --quiet        suppress info/warn logs (the run summary still prints)
+        \\  --log-format FMT   text|json — stderr log format (default text;
+        \\                     json is NDJSON, one object per line, for collectors)
+        \\  --log-level LVL    error|warn|info|debug (default warn)
+        \\  -q, --quiet        suppress warnings too: errors only (the run summary
+        \\                     still prints)
         \\
     );
 }

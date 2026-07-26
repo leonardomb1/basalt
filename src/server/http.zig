@@ -128,7 +128,7 @@ pub fn drainPending(gpa: std.mem.Allocator, bs: *BufState) void {
             .buffer_segment = s,
             .load_label_prefix = label,
             .load_run_id = s,
-            .log = .{ .summary = .stderr },
+            .log = .{ .summary = .stderr, .level = .info },
         }, &diag) catch |e| {
             std.debug.print("buffer {s}: flush of segment {d} failed: {s} ({s}) — will retry\n", .{ bs.decl.name, s, @errorName(e), diag.msg });
             return;
@@ -440,7 +440,7 @@ fn handleConn(gpa: std.mem.Allocator, routes: []const Route, conn: std.net.Serve
         var diag: runtime.Diag = .{};
         var sink = runtime.OutcomeSink.init(gpa);
         defer sink.deinit();
-        const result = runtime.run(gpa, route.program, .{ .params = params.items, .request_body = body, .threads = threads, .outcomes = &sink, .log = .{ .summary = .stderr } }, &diag);
+        const result = runtime.run(gpa, route.program, .{ .params = params.items, .request_body = body, .threads = threads, .outcomes = &sink, .log = .{ .summary = .stderr, .level = .info } }, &diag);
 
         var out = std.array_list.Managed(u8).init(gpa);
         defer out.deinit();
