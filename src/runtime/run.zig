@@ -1189,6 +1189,68 @@ fn pqMergeOne(ctx: *PqMergeCtx, p: usize) !void {
     }
 }
 
+/// The `sort … limit` shape a parallel aggregate can push into its partitions.
+const TopNTail = struct { keys: []const ast.SortKey, n: usize };
+
+/// Recognise a tail that is only sorts and limits, so each partition can drop to
+/// its own best `n` rows before anything is materialised. An `OFFSET` disables
+/// it: the rows a partition discards could be the ones the offset lands on.
+fn topNTail(tail: []const ast.Stage) ?TopNTail {
+    var keys: []const ast.SortKey = &.{};
+    var n: ?usize = null;
+    for (tail) |st| switch (st.node) {
+        .sort => |so| keys = so.keys,
+        .limit => |l| {
+            if (l.offset != 0) return null;
+            n = @intCast(l.count);
+        },
+        else => return null,
+    };
+    if (keys.len == 0) return null;
+    return .{ .keys = keys, .n = n orelse return null };
+}
+
+/// The output value a sort key refers to: the group keys come first in the
+/// aggregate's schema, the aggregates after them.
+fn groupSortValue(g: op.Aggregate.Group, col: usize, by_len: usize, aggs: []const op.Aggregate.Agg) Value {
+    if (col < by_len) return g.key_vals[col];
+    return op.Aggregate.finalizeAcc(g.accs[col - by_len], aggs[col - by_len]);
+}
+
+const GroupOrder = struct {
+    cols: []const usize,
+    desc: []const bool,
+    by_len: usize,
+    aggs: []const op.Aggregate.Agg,
+
+    fn less(self: GroupOrder, a: op.Aggregate.Group, b: op.Aggregate.Group) bool {
+        for (self.cols, self.desc) |c, d| {
+            const av = groupSortValue(a, c, self.by_len, self.aggs);
+            const bv = groupSortValue(b, c, self.by_len, self.aggs);
+            const o = eval.compareValues(av, bv) orelse .eq;
+            if (o != .eq) return if (d) o == .gt else o == .lt;
+        }
+        return false;
+    }
+};
+
+const PqTopNCtx = struct {
+    parts: []PqPart,
+    order: GroupOrder,
+    n: usize,
+    queue: WorkQueue,
+};
+
+const pqTopNWorker = dispatchWorker(PqTopNCtx, pqTopNOne);
+
+fn pqTopNOne(ctx: *PqTopNCtx, p: usize) !void {
+    const g = &ctx.parts[p].groups;
+    if (g.items.len <= ctx.n) return;
+    std.sort.pdq(op.Aggregate.Group, g.items, ctx.order, GroupOrder.less);
+    g.shrinkRetainingCapacity(ctx.n);
+}
+
+/// Parallel aggregate over a local parquet file, one morsel per row group.
 /// Parallel aggregate over a local parquet file, one morsel per row group.
 /// Two phases, neither of which takes a lock: lanes fold disjoint row groups
 /// into private tables, then the tables are merged by hash partition.
@@ -1254,7 +1316,9 @@ fn runParallelParquetAgg(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, p
         .per_item = per_item,
     };
 
+    const t_fold0 = std.time.Instant.now() catch unreachable;
     const used = try parallel.spawnJoin(arena, nthreads, pqAggLane, &ctx);
+    const t_fold1 = std.time.Instant.now() catch unreachable;
     lanes_used.* = @max(lanes_used.*, used);
     if (ctx.queue.first_err) |e| return e;
 
@@ -1268,11 +1332,45 @@ fn runParallelParquetAgg(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, p
     defer for (parts) |*pp| pp.arena.deinit();
 
     var mctx = PqMergeCtx{ .lanes = lanes, .parts = parts, .aggs = aggs, .queue = .{ .nitems = pq_parts } };
+    const t_mrg0 = std.time.Instant.now() catch unreachable;
     _ = try parallel.spawnJoin(arena, nthreads, pqMergeWorker, &mctx);
+    const t_mrg1 = std.time.Instant.now() catch unreachable;
     if (mctx.queue.first_err) |e| return e;
+    var lane_groups: usize = 0;
+    for (lanes) |*l| lane_groups += l.groups.len;
+    env.log.log(.debug, "pq agg phases: fold {d}ms (incl. bucket), merge {d}ms, {d} lane groups", .{
+        t_fold1.since(t_fold0) / 1_000_000,
+        t_mrg1.since(t_mrg0) / 1_000_000,
+        lane_groups,
+    });
 
     env.log.log(.info, "parallel parquet aggregate: {d} row groups in {d} morsels over {d} lanes, merged in {d} partitions", .{ ngroups, nitems, used, pq_parts });
 
+    if (topNTail(tail)) |tn| {
+        var cols = std.array_list.Managed(usize).init(arena);
+        var descs = std.array_list.Managed(bool).init(arena);
+        var ok = true;
+        for (tn.keys) |k| {
+            const idx = out_schema.indexOf(k.field.last()) orelse {
+                ok = false;
+                break;
+            };
+            try cols.append(idx);
+            try descs.append(k.desc);
+        }
+        if (ok) {
+            var tctx = PqTopNCtx{
+                .parts = parts,
+                .order = .{ .cols = cols.items, .desc = descs.items, .by_len = apl.by.len, .aggs = aggs },
+                .n = tn.n,
+                .queue = .{ .nitems = pq_parts },
+            };
+            _ = try parallel.spawnJoin(arena, nthreads, pqTopNWorker, &tctx);
+            if (tctx.queue.first_err) |e| return e;
+        }
+    }
+
+    const t_emit0 = std.time.Instant.now() catch unreachable;
     var total: usize = 0;
     for (parts) |*pp| total += pp.groups.items.len;
     const all = try arena.alloc(op.Aggregate.Group, total);
@@ -1285,13 +1383,19 @@ fn runParallelParquetAgg(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, p
     }
 
     const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, all);
+    const t_emit1 = std.time.Instant.now() catch unreachable;
 
     const wr = try resolveUpsertKeys(env, w);
     const snk = try openSink(env, wr, out_schema.*);
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
 
+    const t_tail0 = std.time.Instant.now() catch unreachable;
     try writeTail(env, snk, batch, out_schema.*, tail, stats);
+    const t_tail1 = std.time.Instant.now() catch unreachable;
+    env.log.log(.debug, "pq agg tail: emit {d}ms ({d} groups), sort+limit+write {d}ms", .{
+        t_emit1.since(t_emit0) / 1_000_000, total, t_tail1.since(t_tail0) / 1_000_000,
+    });
     snk_open = false;
     try snk.close();
     return true;

@@ -1157,7 +1157,7 @@ pub const Aggregate = struct {
         }
     }
 
-    fn finalizeAcc(acc: Acc, agg: Agg) Value {
+    pub fn finalizeAcc(acc: Acc, agg: Agg) Value {
         return switch (agg.func) {
             .count => .{ .int = acc.n },
             .sum => if (acc.n == 0) .null else if (agg.ty.kind == .float) Value{ .float = acc.sum_f } else Value{ .int = acc.sum_i },
