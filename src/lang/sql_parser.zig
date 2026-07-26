@@ -992,7 +992,7 @@ pub const Parser = struct {
                         if (stripped.* == .call) {
                             if (aggFunc(stripped.call.name)) |f| {
                                 const arg: ?*ast.Expr = if (stripped.call.args.len > 0) stripped.call.args[0] else null;
-                                try aggs.append(.{ .name = c.name, .func = f, .arg = arg });
+                                try aggs.append(.{ .name = c.name, .func = f, .arg = arg, .distinct = stripped.call.distinct });
                                 continue;
                             }
                         }
@@ -1009,12 +1009,37 @@ pub const Parser = struct {
         if (aggs.items.len > 0 or group.len > 0) {
             if (aggs.items.len == 0)
                 return self.fail(pos, "GROUP BY without aggregate functions in SELECT", .{});
+            // `COUNT(DISTINCT x)` reuses the existing distinct operator: dedupe on
+            // the group keys plus x, then let the ordinary `count(x)` run. Keeping
+            // the argument is what makes SQL's "DISTINCT ignores NULL" fall out of
+            // the normal count-non-nulls rule instead of needing a special case.
+            var dedupe_on: ?[]ast.QualName = null;
+            for (aggs.items) |a| {
+                if (!a.distinct) continue;
+                if (a.func != .count)
+                    return self.fail(pos, "DISTINCT is only supported inside COUNT", .{});
+                if (aggs.items.len != 1)
+                    return self.fail(pos, "COUNT(DISTINCT ...) cannot be mixed with other aggregates", .{});
+                const arg = a.arg orelse return self.fail(pos, "COUNT(DISTINCT ...) needs a column", .{});
+                if (arg.* != .field)
+                    return self.fail(pos, "COUNT(DISTINCT ...) takes a plain column", .{});
+                const on = try self.arena.alloc(ast.QualName, group.len + 1);
+                @memcpy(on[0..group.len], group);
+                on[group.len] = arg.field;
+                dedupe_on = on;
+            }
+
             var needs_pre = false;
             for (group) |k| {
                 for (items.items) |it| {
                     if (it == .computed and k.parts.len == 1 and std.mem.eql(u8, it.computed.name, k.parts[0]))
                         needs_pre = true;
                 }
+            }
+            if (dedupe_on) |on| {
+                if (needs_pre)
+                    return self.fail(pos, "COUNT(DISTINCT ...) with a computed GROUP BY key is not supported", .{});
+                try stages.append(.{ .node = .{ .distinct = .{ .on = on } }, .hints = &.{}, .pos = pos });
             }
             if (needs_pre) {
                 for (items.items) |it| {
@@ -1691,7 +1716,9 @@ pub const Parser = struct {
                     _ = self.advance();
                     _ = self.advance();
                     var args = std.array_list.Managed(*ast.Expr).init(self.arena);
+                    var call_distinct = false;
                     if (!self.at(.rparen)) {
+                        call_distinct = self.eatKw("distinct");
                         if (self.at(.star) and self.peekTag() == .rparen) {
                             _ = self.advance();
                         } else {
@@ -1701,7 +1728,7 @@ pub const Parser = struct {
                     }
                     _ = try self.expect(.rparen);
                     const lower = try std.ascii.allocLowerString(self.arena, t.text);
-                    return self.mk(.{ .call = .{ .name = lower, .args = try args.toOwnedSlice() } });
+                    return self.mk(.{ .call = .{ .name = lower, .args = try args.toOwnedSlice(), .distinct = call_distinct } });
                 }
                 const q = try self.parseQualNameField();
                 return self.mk(.{ .field = q });

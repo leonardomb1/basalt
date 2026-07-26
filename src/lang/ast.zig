@@ -47,7 +47,7 @@ pub const Expr = union(enum) {
 
     pub const Unary = struct { op: UnOp, e: *Expr };
     pub const Binary = struct { op: BinOp, l: *Expr, r: *Expr };
-    pub const Call = struct { name: []const u8, args: []const *Expr };
+    pub const Call = struct { name: []const u8, args: []const *Expr, distinct: bool = false };
     pub const Cond = struct { cond: *Expr, then: *Expr, els: *Expr };
     /// `let name = value in body`: a local binding inside an expression. Inlined at
     /// plan time (`expand.zig`) by substituting `value` for `name` in `body`, so the
@@ -106,7 +106,7 @@ pub fn rebuildExpr(arena: std.mem.Allocator, e: *const Expr, ctx: anytype, compt
         .call => |c| blk: {
             const args = try arena.alloc(*Expr, c.args.len);
             for (c.args, args) |a, *out| out.* = try recur(ctx, a);
-            break :blk try mkExpr(arena, .{ .call = .{ .name = c.name, .args = args } });
+            break :blk try mkExpr(arena, .{ .call = .{ .name = c.name, .args = args, .distinct = c.distinct } });
         },
         .match => |m| blk: {
             const subject = if (m.subject) |s| try recur(ctx, s) else null;
@@ -196,7 +196,7 @@ pub const SortKey = struct { field: QualName, desc: bool };
 pub const Sort = struct { keys: []const SortKey };
 
 pub const AggFunc = enum { count, sum, avg, min, max };
-pub const AggItem = struct { name: []const u8, func: AggFunc, arg: ?*Expr };
+pub const AggItem = struct { name: []const u8, func: AggFunc, arg: ?*Expr, distinct: bool = false };
 pub const Aggregate = struct { aggs: []const AggItem, by: []const QualName };
 
 pub const JoinKind = enum { inner, left, semi, anti };
