@@ -1886,14 +1886,17 @@ pub const Parser = struct {
                     xargs[1] = src;
                     return self.mk(.{ .call = .{ .name = "extract", .args = xargs } });
                 }
-                if (eqlNoCase(t.text, "cast") and self.peekTag() == .lparen) {
+                if ((eqlNoCase(t.text, "cast") or eqlNoCase(t.text, "try_cast")) and self.peekTag() == .lparen) {
+                    // `TRY_CAST` is `CAST` with the failure mode flipped: same
+                    // syntax, same target types, null instead of an error.
+                    const safe = eqlNoCase(t.text, "try_cast");
                     _ = self.advance();
                     _ = self.advance();
                     const e = try self.parseExpr();
                     try self.expectKw("as");
                     const ty = try self.parseTypeName();
                     _ = try self.expect(.rparen);
-                    return self.mk(.{ .cast = .{ .e = e, .ty = ty } });
+                    return self.mk(.{ .cast = .{ .e = e, .ty = ty, .safe = safe } });
                 }
                 if (eqlNoCase(t.text, "if") and self.peekTag() == .lparen) {
                     _ = self.advance();
