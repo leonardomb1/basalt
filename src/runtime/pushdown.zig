@@ -241,6 +241,10 @@ pub fn translateExpr(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dial
         },
         .match => |m| return translateMatch(arena, m, dialect, schema, check_fields),
         .cast => |c| {
+            // TRY_CAST is engine-only: the dialects' support for a null-on-failure cast is
+            // uneven (no portable spelling on mysql/starrocks), and a plain CAST would raise
+            // on the rows TRY_CAST is there to turn into nulls. Never push it.
+            if (c.safe) return null;
             const inner = (try translateExpr(arena, c.e, dialect, schema, check_fields)) orelse return null;
             const ty = sqlTypeName(arena, dialect, c.ty) catch return error.OutOfMemory;
             return try std.fmt.allocPrint(arena, "CAST({s} AS {s})", .{ inner, (ty orelse return null) });
@@ -307,7 +311,22 @@ fn sqlTypeName(arena: std.mem.Allocator, dialect: Dialect, ty: types.Type) !?[]c
 }
 
 /// Scalar-function translation — only names whose semantics are identical in
-/// all three dialects (or have an exact per-dialect spelling).
+/// all three dialects (or have an exact per-dialect spelling). StarRocks rides
+/// the `.mysql` dialect, so every mysql rendering here must hold there too.
+///
+/// DELIBERATELY NOT TRANSLATED (don't "helpfully" add these — each one can drop a
+/// row the engine's kept filter would keep, which is the one thing pushdown may
+/// never do):
+///   - `round`         — half-even (postgres numeric) vs half-away-from-zero (mysql,
+///                       sqlserver), so .5 cases land on different values.
+///   - `greatest`/`least` — mysql returns NULL if ANY arg is null; postgres (and the
+///                       engine) ignore nulls and return the extreme of the rest.
+///   - `lpad`/`rpad`   — no sqlserver equivalent (and the hand-rolled REPLICATE form
+///                       truncates differently when the input is already too long).
+///   - `split_part`    — postgres-only; no mysql/sqlserver equivalent.
+///   - date functions (`date_add`, `date_diff`, `strftime`, `date_trunc`, …) — divergent
+///                       unit syntax, and month arithmetic clamps end-of-month differently.
+///   - `try_cast` / safe cast — see the `.cast` arm; null-on-failure must stay engine-side.
 fn translateCall(arena: std.mem.Allocator, c: ast.Expr.Call, dialect: Dialect, schema: types.Schema, check_fields: bool) error{OutOfMemory}!?[]const u8 {
     const args = try arena.alloc([]const u8, c.args.len);
     for (c.args, args) |a, *out| out.* = (try translateExpr(arena, a, dialect, schema, check_fields)) orelse return null;
@@ -357,6 +376,72 @@ fn translateCall(arena: std.mem.Allocator, c: ast.Expr.Call, dialect: Dialect, s
         else
             try std.fmt.allocPrint(arena, "%{s}%", .{pat});
         return try std.fmt.allocPrint(arena, "({s} LIKE {s})", .{ args[0], try sqlStr(arena, shaped) });
+    }
+
+    // Builtins spelled and evaluated identically on postgres, mysql/starrocks and
+    // sqlserver. (Domain edges — SQRT of a negative, POWER(0, -n), MOD by zero — raise
+    // on some engines and yield NULL on others; that's a loud query failure rather than
+    // a silently dropped row, and the same input is a degenerate case engine-side too.)
+    const uniform = [_]struct { name: []const u8, sql: []const u8, arity: usize }{
+        .{ .name = "abs", .sql = "ABS", .arity = 1 },
+        .{ .name = "floor", .sql = "FLOOR", .arity = 1 },
+        .{ .name = "sqrt", .sql = "SQRT", .arity = 1 },
+        .{ .name = "sign", .sql = "SIGN", .arity = 1 },
+        .{ .name = "reverse", .sql = "REVERSE", .arity = 1 },
+        .{ .name = "power", .sql = "POWER", .arity = 2 },
+        .{ .name = "nullif", .sql = "NULLIF", .arity = 2 },
+    };
+    for (uniform) |u| {
+        if (std.mem.eql(u8, n, u.name) and args.len == u.arity) {
+            const joined = try std.mem.join(arena, ", ", args);
+            return try std.fmt.allocPrint(arena, "{s}({s})", .{ u.sql, joined });
+        }
+    }
+
+    if (std.mem.eql(u8, n, "ceil") and args.len == 1) {
+        const f = switch (dialect) {
+            .sqlserver => "CEILING", // T-SQL has no CEIL
+            else => "CEIL",
+        };
+        return try std.fmt.allocPrint(arena, "{s}({s})", .{ f, args[0] });
+    }
+    if (std.mem.eql(u8, n, "mod") and args.len == 2) {
+        // sqlserver has no MOD function, only the `%` operator. Both take the sign of
+        // the DIVIDEND (`-7 % 3` = `MOD(-7, 3)` = -1) on all four engines, matching the
+        // engine's own mod — so the two spellings agree on negatives.
+        return switch (dialect) {
+            .sqlserver => try std.fmt.allocPrint(arena, "({s} % {s})", .{ args[0], args[1] }),
+            else => try std.fmt.allocPrint(arena, "MOD({s}, {s})", .{ args[0], args[1] }),
+        };
+    }
+    if ((std.mem.eql(u8, n, "left") or std.mem.eql(u8, n, "right") or
+        std.mem.eql(u8, n, "repeat")) and c.args.len == 2)
+    {
+        // A negative count diverges: postgres LEFT/RIGHT count back from the far end
+        // while mysql/starrocks return '', and sqlserver REPLICATE returns NULL where
+        // the others return ''. Push only a literal count we can see is >= 0.
+        if (c.args[1].* != .int_lit or c.args[1].int_lit < 0) return null;
+        const f: []const u8 = if (std.mem.eql(u8, n, "left"))
+            "LEFT"
+        else if (std.mem.eql(u8, n, "right"))
+            "RIGHT"
+        else if (dialect == .sqlserver)
+            "REPLICATE" // T-SQL's spelling of REPEAT
+        else
+            "REPEAT";
+        return try std.fmt.allocPrint(arena, "{s}({s}, {s})", .{ f, args[0], args[1] });
+    }
+    if (std.mem.eql(u8, n, "strpos") and c.args.len == 2) {
+        // All three are 1-based with 0 for "not found", like the engine — but mysql's
+        // LOCATE and sqlserver's CHARINDEX take (needle, haystack), the reverse of
+        // postgres' STRPOS. An empty needle is the one divergence (postgres 1,
+        // sqlserver 0), so a literal '' isn't pushed.
+        if (c.args[1].* == .str_lit and c.args[1].str_lit.len == 0) return null;
+        return switch (dialect) {
+            .postgres => try std.fmt.allocPrint(arena, "STRPOS({s}, {s})", .{ args[0], args[1] }),
+            .mysql => try std.fmt.allocPrint(arena, "LOCATE({s}, {s})", .{ args[1], args[0] }),
+            .sqlserver => try std.fmt.allocPrint(arena, "CHARINDEX({s}, {s})", .{ args[1], args[0] }),
+        };
     }
     return null;
 }
@@ -768,5 +853,146 @@ test "serialWhere: contiguous filter prefix, partial translation, stops at non-f
     const sel = ast.Stage{ .node = .{ .select = &.{.star} }, .hints = &.{}, .pos = .{ .line = 1, .col = 1 } };
     const stages2 = [_]ast.Stage{ rd, sel, mk(f1) };
     try std.testing.expect((try serialWhere(a, .sqlserver, &stages2)) == null);
+}
+
+fn intLit(arena: std.mem.Allocator, v: i64) !*ast.Expr {
+    const e = try arena.create(ast.Expr);
+    e.* = .{ .int_lit = v };
+    return e;
+}
+
+fn strLit(arena: std.mem.Allocator, s: []const u8) !*ast.Expr {
+    const e = try arena.create(ast.Expr);
+    e.* = .{ .str_lit = s };
+    return e;
+}
+
+fn callExpr(arena: std.mem.Allocator, name: []const u8, args: []const *ast.Expr) !*ast.Expr {
+    const owned = try arena.alloc(*ast.Expr, args.len);
+    @memcpy(owned, args);
+    const e = try arena.create(ast.Expr);
+    e.* = .{ .call = .{ .name = name, .args = owned } };
+    return e;
+}
+
+test "translateCall: same-name numeric builtins render identically everywhere" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const abs_e = try callExpr(a, "abs", &[_]*ast.Expr{try fld(a, "a")});
+    try testing.expectEqualStrings("ABS([a])", (try translateExpr(a, abs_e, .sqlserver, testSchema(), true)).?);
+    try testing.expectEqualStrings("ABS(\"a\")", (try translateExpr(a, abs_e, .postgres, testSchema(), true)).?);
+    try testing.expectEqualStrings("ABS(`a`)", (try translateExpr(a, abs_e, .mysql, testSchema(), true)).?);
+
+    const floor_e = try callExpr(a, "floor", &[_]*ast.Expr{try fld(a, "a")});
+    try testing.expectEqualStrings("FLOOR([a])", (try translateExpr(a, floor_e, .sqlserver, testSchema(), true)).?);
+    const sqrt_e = try callExpr(a, "sqrt", &[_]*ast.Expr{try fld(a, "a")});
+    try testing.expectEqualStrings("SQRT(`a`)", (try translateExpr(a, sqrt_e, .mysql, testSchema(), true)).?);
+    const sign_e = try callExpr(a, "sign", &[_]*ast.Expr{try fld(a, "a")});
+    try testing.expectEqualStrings("SIGN(\"a\")", (try translateExpr(a, sign_e, .postgres, testSchema(), true)).?);
+    const rev_e = try callExpr(a, "reverse", &[_]*ast.Expr{try fld(a, "b")});
+    try testing.expectEqualStrings("REVERSE([b])", (try translateExpr(a, rev_e, .sqlserver, testSchema(), true)).?);
+    const pow_e = try callExpr(a, "power", &[_]*ast.Expr{ try fld(a, "a"), try intLit(a, 2) });
+    try testing.expectEqualStrings("POWER([a], 2)", (try translateExpr(a, pow_e, .sqlserver, testSchema(), true)).?);
+    const nif_e = try callExpr(a, "nullif", &[_]*ast.Expr{ try fld(a, "b"), try strLit(a, "x") });
+    try testing.expectEqualStrings("NULLIF(`b`, 'x')", (try translateExpr(a, nif_e, .mysql, testSchema(), true)).?);
+
+    // Wrong arity is not pushed.
+    const bad = try callExpr(a, "abs", &[_]*ast.Expr{ try fld(a, "a"), try intLit(a, 1) });
+    try testing.expect((try translateExpr(a, bad, .mysql, testSchema(), true)) == null);
+}
+
+test "translateCall: ceil is CEILING on sqlserver, CEIL elsewhere" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const e = try callExpr(a, "ceil", &[_]*ast.Expr{try fld(a, "a")});
+    try testing.expectEqualStrings("CEILING([a])", (try translateExpr(a, e, .sqlserver, testSchema(), true)).?);
+    try testing.expectEqualStrings("CEIL(\"a\")", (try translateExpr(a, e, .postgres, testSchema(), true)).?);
+    try testing.expectEqualStrings("CEIL(`a`)", (try translateExpr(a, e, .mysql, testSchema(), true)).?);
+}
+
+test "translateCall: mod is the % operator on sqlserver, MOD elsewhere" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const e = try callExpr(a, "mod", &[_]*ast.Expr{ try fld(a, "a"), try intLit(a, 3) });
+    try testing.expectEqualStrings("([a] % 3)", (try translateExpr(a, e, .sqlserver, testSchema(), true)).?);
+    try testing.expectEqualStrings("MOD(\"a\", 3)", (try translateExpr(a, e, .postgres, testSchema(), true)).?);
+    try testing.expectEqualStrings("MOD(`a`, 3)", (try translateExpr(a, e, .mysql, testSchema(), true)).?);
+
+    // Comparison context: the fragment stays a well-formed operand.
+    const cmp = try bin(a, .eq, e, try intLit(a, 0));
+    try testing.expectEqualStrings("(([a] % 3) = 0)", (try translateExpr(a, cmp, .sqlserver, testSchema(), true)).?);
+}
+
+test "translateCall: strpos swaps its arguments on mysql and sqlserver" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const e = try callExpr(a, "strpos", &[_]*ast.Expr{ try fld(a, "b"), try strLit(a, "xy") });
+    try testing.expectEqualStrings("STRPOS(\"b\", 'xy')", (try translateExpr(a, e, .postgres, testSchema(), true)).?);
+    try testing.expectEqualStrings("LOCATE('xy', `b`)", (try translateExpr(a, e, .mysql, testSchema(), true)).?);
+    try testing.expectEqualStrings("CHARINDEX('xy', [b])", (try translateExpr(a, e, .sqlserver, testSchema(), true)).?);
+
+    // An empty needle is 1 on postgres and 0 on sqlserver — not pushable.
+    const empty = try callExpr(a, "strpos", &[_]*ast.Expr{ try fld(a, "b"), try strLit(a, "") });
+    try testing.expect((try translateExpr(a, empty, .postgres, testSchema(), true)) == null);
+}
+
+test "translateCall: repeat is REPLICATE on sqlserver; left/right are portable" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const rep = try callExpr(a, "repeat", &[_]*ast.Expr{ try fld(a, "b"), try intLit(a, 3) });
+    try testing.expectEqualStrings("REPLICATE([b], 3)", (try translateExpr(a, rep, .sqlserver, testSchema(), true)).?);
+    try testing.expectEqualStrings("REPEAT(\"b\", 3)", (try translateExpr(a, rep, .postgres, testSchema(), true)).?);
+    try testing.expectEqualStrings("REPEAT(`b`, 3)", (try translateExpr(a, rep, .mysql, testSchema(), true)).?);
+
+    const lf = try callExpr(a, "left", &[_]*ast.Expr{ try fld(a, "b"), try intLit(a, 2) });
+    try testing.expectEqualStrings("LEFT([b], 2)", (try translateExpr(a, lf, .sqlserver, testSchema(), true)).?);
+    const rt = try callExpr(a, "right", &[_]*ast.Expr{ try fld(a, "b"), try intLit(a, 2) });
+    try testing.expectEqualStrings("RIGHT(`b`, 2)", (try translateExpr(a, rt, .mysql, testSchema(), true)).?);
+
+    // A negative or non-literal count diverges across dialects — left engine-side.
+    const neg = try callExpr(a, "left", &[_]*ast.Expr{ try fld(a, "b"), try intLit(a, -2) });
+    try testing.expect((try translateExpr(a, neg, .postgres, testSchema(), true)) == null);
+    const dyn = try callExpr(a, "repeat", &[_]*ast.Expr{ try fld(a, "b"), try fld(a, "a") });
+    try testing.expect((try translateExpr(a, dyn, .postgres, testSchema(), true)) == null);
+}
+
+test "translateCall: excluded builtins fall back to the engine" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const round_e = try callExpr(a, "round", &[_]*ast.Expr{try fld(a, "a")});
+    const greatest_e = try callExpr(a, "greatest", &[_]*ast.Expr{ try fld(a, "a"), try fld(a, "c") });
+    const lpad_e = try callExpr(a, "lpad", &[_]*ast.Expr{ try fld(a, "b"), try intLit(a, 4), try strLit(a, "0") });
+    const split_e = try callExpr(a, "split_part", &[_]*ast.Expr{ try fld(a, "b"), try strLit(a, ","), try intLit(a, 1) });
+    const excluded = [_]*ast.Expr{ round_e, greatest_e, lpad_e, split_e };
+    for (excluded) |e| {
+        try testing.expect((try translateExpr(a, e, .postgres, testSchema(), true)) == null);
+        try testing.expect((try translateExpr(a, e, .mysql, testSchema(), true)) == null);
+        try testing.expect((try translateExpr(a, e, .sqlserver, testSchema(), true)) == null);
+    }
+
+    // …and an excluded function inside a comparison sinks the whole predicate.
+    const cmp = try bin(a, .gt, round_e, try intLit(a, 1));
+    try testing.expect((try translateExpr(a, cmp, .postgres, testSchema(), true)) == null);
+}
+
+test "translateExpr: a safe (TRY_) cast is never pushed" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const plain = try a.create(ast.Expr);
+    plain.* = .{ .cast = .{ .e = try fld(a, "b"), .ty = types.Type.init(.int) } };
+    try testing.expectEqualStrings("CAST(`b` AS SIGNED)", (try translateExpr(a, plain, .mysql, testSchema(), true)).?);
+
+    const safe = try a.create(ast.Expr);
+    safe.* = .{ .cast = .{ .e = try fld(a, "b"), .ty = types.Type.init(.int), .safe = true } };
+    try testing.expect((try translateExpr(a, safe, .mysql, testSchema(), true)) == null);
+    try testing.expect((try translateExpr(a, safe, .postgres, testSchema(), true)) == null);
+    try testing.expect((try translateExpr(a, safe, .sqlserver, testSchema(), true)) == null);
 }
 
