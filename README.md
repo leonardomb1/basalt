@@ -1,10 +1,10 @@
 # basalt
 
-A SQL-driven data pipeline engine. A script describes a columnar pipeline —
-read from a source, transform with a query, write to a sink — which is parsed,
-type-checked and planned once, then executed as a streaming pull pipeline.
+A lightweight SQL data movement engine in a single static binary.
 
-Single static binary, no runtime dependencies.
+A script describes a columnar pipeline — read from a source, transform with a
+query, write to a sink. It is parsed, type-checked and planned once, then
+executed as a streaming pull pipeline.
 
 ```sql
 -- move yesterday's paid orders from SQL Server into the lake
@@ -22,12 +22,21 @@ $ basalt run orders.sql
 
 ## Install
 
+Prebuilt binary (Linux x86-64, ~2.4 MB, statically linked — runs anywhere):
+
+```console
+$ curl -fsSL -o basalt https://github.com/leonardomb1/basalt/releases/latest/download/basalt-x86_64-linux
+$ chmod +x basalt && ./basalt help
+```
+
+From source, with Zig 0.15.2:
+
 ```console
 $ zig build -Doptimize=ReleaseFast
 $ ./zig-out/bin/basalt help
 ```
 
-Needs Zig 0.15.2. `-Dstrip` drops debug info for a smaller binary.
+`-Dstrip` drops debug info for a smaller binary.
 
 ## What it talks to
 
@@ -36,7 +45,7 @@ Needs Zig 0.15.2. `-Dstrip` drops debug info for a smaller binary.
 | **Files** | CSV and Parquet, local or over HTTP — the extension picks the format |
 | **Object storage** | `az://account/container/path` (Azure Blob / ADLS Gen2). A trailing `/` reads every blob under that prefix as one table |
 | **Databases** | PostgreSQL, MySQL, SQL Server, StarRocks |
-| **HTTP** | REST sources and sinks; serve a pipeline as an endpoint |
+| **HTTP** | paginated REST sources; serve a pipeline as an endpoint |
 | **Buffer** | a durable WAL buffer, replayed by a later run |
 
 Parquet reads use column projection, row-group skipping from statistics, and
@@ -45,17 +54,27 @@ ranged reads — only the footer and the chunks a query needs are fetched.
 ## Running things
 
 ```console
-$ basalt run pipeline.sql -p dias=7      # bind a PARAM
-$ basalt check pipeline.sql              # validate without running
-$ basalt run -c "EXPLAIN <query>"        # print the plan
+$ basalt run pipeline.sql -p days=7       # bind a PARAM
+$ basalt check pipeline.sql               # validate without running
+$ basalt run -c "EXPLAIN <query>"         # print the plan
 $ basalt run -c "EXPLAIN ANALYZE <query>" # run it, print the plan with actuals
-$ basalt repl                            # interactive
-$ basalt serve ./endpoints --watch       # host every endpoint script in a dir
+$ basalt repl                             # interactive
+$ basalt serve ./endpoints --watch        # host every endpoint script in a dir
 ```
 
-A terminal `SELECT ...;` prints a table. `LOAD INTO <target> AS <query>;` writes.
-A script that declares `CREATE ENDPOINT` runs as HTTP; otherwise it runs once and
-exits.
+A terminal `SELECT ...;` prints a table. `LOAD INTO <target> AS <query>;`
+writes. A script that declares `CREATE ENDPOINT` runs as HTTP; otherwise it
+runs once and exits.
+
+## Design
+
+- Errors surface at plan time: an unknown column, an incomparable type or a
+  missing credential fails `check`, before a row is read.
+- Execution streams; memory is bounded by batch size, not file size.
+- `WHERE` against a database table runs in the database. The plan shows what
+  was pushed down.
+- Parquet pipelines run in parallel over row-group morsels; `-j` controls it.
+- One process, one allocation strategy, no garbage collector.
 
 ## Credentials
 
@@ -66,8 +85,8 @@ options override that. Azure Blob uses `AZURE_STORAGE_KEY`, and
 
 ## Documentation
 
-- [`language.md`](language.md) — the SQL dialect: sources, sinks, joins, unions,
-  `FOR EACH`, parameters, endpoints
+- [`language.md`](language.md) — the SQL dialect: sources, sinks, joins,
+  unions, `FOR EACH`, parameters, endpoints
 - [`examples/`](examples) — runnable scripts, one per feature
 
 ## Tests
