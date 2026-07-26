@@ -189,6 +189,18 @@ pub const Parser = struct {
         return self.fail(self.curPos(), "expected a column name, found {s}", .{self.curTag().describe()});
     }
 
+    /// Name for a computed item written without `AS`, joined from the source
+    /// tokens so `COUNT(*)` becomes `count(*)`. ORDER BY synthesizes the same
+    /// text for the same expression, which is what binds `ORDER BY COUNT(*)`
+    /// to the SELECT item it repeats.
+    fn synthName(self: *Parser, start: usize) Error![]const u8 {
+        var buf = std.array_list.Managed(u8).init(self.arena);
+        for (self.toks[start..self.i]) |t| {
+            for (t.text) |c| buf.append(std.ascii.toLower(c)) catch return error.OutOfMemory;
+        }
+        return buf.toOwnedSlice() catch return error.OutOfMemory;
+    }
+
     fn fail(self: *Parser, pos: Pos, comptime fmt: []const u8, args: anytype) Error {
         self.diag.* = .{
             .msg = std.fmt.allocPrint(self.arena, fmt, args) catch "out of memory formatting diagnostic",
@@ -718,8 +730,17 @@ pub const Parser = struct {
             try self.expectKw("by");
             var keys = std.array_list.Managed(ast.SortKey).init(self.arena);
             while (true) {
-                var q = try self.parseQualNameTok();
-                q = stripQual(q, &first.aliases);
+                var q: ast.QualName = undefined;
+                if (self.at(.ident) and self.peekTag() == .lparen) {
+                    const start = self.i;
+                    _ = try self.parseExpr();
+                    const parts = try self.arena.alloc([]const u8, 1);
+                    parts[0] = try self.synthName(start);
+                    q = .{ .parts = parts };
+                } else {
+                    q = try self.parseQualNameTok();
+                    q = stripQual(q, &first.aliases);
+                }
                 var desc = false;
                 if (self.eatKw("desc")) {
                     desc = true;
@@ -811,6 +832,7 @@ pub const Parser = struct {
                 _ = self.advance();
                 try raw_items.append(.{ .qstar = alias });
             } else {
+                const start = self.i;
                 const e = try self.parseExpr();
                 var name: ?[]const u8 = null;
                 if (self.eatKw("as")) name = try self.expectColName();
@@ -819,7 +841,7 @@ pub const Parser = struct {
                 } else if (e.* == .field) {
                     try raw_items.append(.{ .item = .{ .field = e.field } });
                 } else {
-                    return self.fail(self.curPos(), "a computed SELECT item needs an alias (`expr AS name`)", .{});
+                    try raw_items.append(.{ .item = .{ .computed = .{ .name = try self.synthName(start), .expr = e } } });
                 }
             }
             if (!self.eat(.comma)) break;
