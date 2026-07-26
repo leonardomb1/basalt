@@ -964,6 +964,39 @@ pub fn groupBeatsThreshold(
     return cmp(lo, t.value) == .lt;
 }
 
+pub const MinMax = struct { min: Value, max: Value };
+
+/// Whole-file min/max for one column, folded from row-group statistics without
+/// reading a single page. Returns null the moment any row group is missing the
+/// statistic, so the caller scans rather than reporting a partial answer.
+pub fn fileMinMax(rdr: *const Reader, name: []const u8) ?MinMax {
+    if (rdr.md.row_groups.len == 0) return null;
+    const lf = findLeaf(rdr.leaves, name) orelse return null;
+    const elem = rdr.md.schema[lf.schema_idx];
+    var lo: ?Value = null;
+    var hi: ?Value = null;
+    for (rdr.md.row_groups) |g| {
+        if (lf.chunk_idx >= g.columns.len) return null;
+        const meta = g.columns[lf.chunk_idx].meta orelse return null;
+        // Writers are allowed to store *truncated* min/max for variable-length
+        // types, flagged by `is_min_value_exact` — which this reader does not
+        // parse. Trusting a truncated bound would answer MIN/MAX with a prefix,
+        // so only fixed-width physical types take the shortcut.
+        switch (meta.ty) {
+            .byte_array, .fixed_len_byte_array => return null,
+            else => {},
+        }
+        // An all-null group carries no min/max; it cannot move the result, but
+        // it also cannot be distinguished here from "statistics absent", so
+        // bail and let the scan decide.
+        const mn = statValue(elem, meta.ty, meta.stats.min) orelse return null;
+        const mx = statValue(elem, meta.ty, meta.stats.max) orelse return null;
+        if (lo == null or cmp(mn, lo.?) == .lt) lo = mn;
+        if (hi == null or cmp(mx, hi.?) == .gt) hi = mx;
+    }
+    return .{ .min = lo orelse return null, .max = hi orelse return null };
+}
+
 fn findLeaf(leaves: []const Leaf, name: []const u8) ?Leaf {
     for (leaves) |lf| {
         if (std.mem.eql(u8, lf.name, name)) return lf;

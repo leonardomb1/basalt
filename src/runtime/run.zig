@@ -2314,8 +2314,89 @@ fn collectBounds(e: *const ast.Expr, out: *std.array_list.Managed(pqdecode.Bound
     try out.append(.{ .column = name, .op = bop, .value = v });
 }
 
+/// A single pre-computed batch, so a metadata answer can enter the pipeline
+/// through the ordinary scan path.
+const ConstSource = struct {
+    batch: batchmod.Batch,
+    out: *const types.Schema,
+    yielded: bool = false,
+
+    fn schemaFn(ptr: *anyopaque) types.Schema {
+        const self: *ConstSource = @ptrCast(@alignCast(ptr));
+        return self.out.*;
+    }
+    fn nextFn(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?batchmod.Batch {
+        _ = arena;
+        const self: *ConstSource = @ptrCast(@alignCast(ptr));
+        if (self.yielded) return null;
+        self.yielded = true;
+        return self.batch;
+    }
+    fn closeFn(ptr: *anyopaque) void {
+        _ = ptr;
+    }
+    const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
+};
+
+/// Answer `COUNT(*)`, `MIN(col)` and `MAX(col)` over a whole Parquet file from
+/// the footer instead of scanning it. Deliberately narrow: an unfiltered,
+/// ungrouped aggregate reading the file directly. Anything else — a filter, a
+/// GROUP BY, a URL, a missing statistic — falls through to the real pipeline,
+/// so the shortcut can only ever be as correct as the scan it replaces.
+fn metaShortcut(env: *Env, stages: []const ast.Stage) anyerror!?PipeRes {
+    if (stages.len != 2) return null;
+    if (stages[0].node != .read or stages[1].node != .aggregate) return null;
+    const rd = stages[0].node.read;
+    if (!std.mem.eql(u8, rd.connector, "csv")) return null;
+    const path = switch (rd.form) {
+        .path => |p| p,
+        else => return null,
+    };
+    if (!pqdecode.Reader.isPath(path) or csv.CsvReader.isUrl(path)) return null;
+    const ag = stages[1].node.aggregate;
+    if (ag.by.len != 0 or ag.aggs.len == 0) return null;
+
+    const rdr = pqdecode.Reader.open(env.arena, path) catch return null;
+    var ad = analyze.Diag{};
+    const ap = analyze.aggregatePlan(env.arena, rdr.schema, ag, env.params_expr, &ad) catch return null;
+
+    const vals = try env.arena.alloc(Value, ap.aggs.len);
+    for (ap.aggs, ag.aggs, vals) |ra, item, *out| {
+        if (item.distinct) return null;
+        switch (ra.func) {
+            .count => {
+                if (ra.arg != null) return null; // COUNT(col) needs null counts
+                out.* = .{ .int = rdr.md.num_rows };
+            },
+            .min, .max => {
+                const arg = ra.arg orelse return null;
+                if (arg.* != .field) return null;
+                const mm = pqdecode.fileMinMax(rdr, arg.field.last()) orelse return null;
+                out.* = try op.dupeValue(env.arena, if (ra.func == .min) mm.min else mm.max);
+            },
+            else => return null,
+        }
+    }
+
+    const out = try schemaPtr(env.arena, ap.schema);
+    const cols = try env.arena.alloc(column.Column, ap.aggs.len);
+    for (ap.aggs, vals, cols) |ra, v, *c| {
+        var bd = column.Builder.init(env.arena, ra.ty);
+        try bd.append(v);
+        c.* = try bd.finish();
+    }
+
+    const cs = try env.arena.create(ConstSource);
+    cs.* = .{ .batch = .{ .schema = out, .columns = cols, .len = 1 }, .out = out };
+    const scan = try env.arena.create(op.Scan);
+    scan.* = .{ .src = .{ .ptr = cs, .vtable = &ConstSource.vtable } };
+    if (env.src_name.len == 0) env.src_name = "parquet";
+    return .{ .op = .{ .scan = scan }, .schema = out.* };
+}
+
 fn buildPipeline(env: *Env, stages: []const ast.Stage) anyerror!PipeRes {
     if (stages.len == 0) return planErr(env.diag, "empty pipeline");
+    if (try metaShortcut(env, stages)) |r| return r;
 
     var current: op.Op = undefined;
     var schema: types.Schema = undefined;
