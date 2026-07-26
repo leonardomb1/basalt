@@ -13,6 +13,7 @@ const pushdown = @import("pushdown.zig");
 const Dialect = @import("../connect/sql.zig").Dialect;
 const eval = @import("../exec/eval.zig");
 const csv = @import("../connect/csv.zig");
+const pqdecode = @import("../connect/pqdecode.zig");
 const pqwrite = @import("../connect/pqwrite.zig");
 
 pub const Diag = struct {
@@ -527,7 +528,7 @@ const Ctx = struct {
 pub fn render(plan: Plan, w: anytype) !void {
     try w.print("@{s}\n", .{plan.kind});
     for (plan.outputs) |o| {
-        try w.print("  read  {s}  {s}\n", .{ o.source.connector, o.source.detail });
+        try w.print("  read  {s}  {s}\n", .{ sinkKind(o.source), o.source.detail });
         if (o.source.pushdown.len > 0)
             try w.print("        pushdown: {s}\n", .{o.source.pushdown});
         try printSchema(w, "        ", o.source.schema);
@@ -566,9 +567,10 @@ pub fn render(plan: Plan, w: anytype) !void {
 
 /// The `csv` connector backs every file sink, so the plan has to name the
 /// format from the target — otherwise a parquet write reads as `write csv`.
-fn sinkKind(sink: anytype) []const u8 {
-    if (std.mem.eql(u8, sink.connector, "csv") and pqwrite.Writer.isPath(sink.target)) return "parquet";
-    return sink.connector;
+fn sinkKind(node: anytype) []const u8 {
+    const path = if (@hasField(@TypeOf(node), "target")) node.target else node.detail;
+    if (std.mem.eql(u8, node.connector, "csv") and pqwrite.Writer.isPath(path)) return "parquet";
+    return node.connector;
 }
 
 fn printSchema(w: anytype, indent: []const u8, schema: ?types.Schema) !void {
@@ -630,10 +632,15 @@ fn splittableRead(node: ast.Stage.Node) bool {
     };
 }
 
-/// Offline schema resolution: CSV header is local; everything else is unresolved.
+/// Offline schema resolution: a local CSV header or parquet footer is readable
+/// without connecting to anything; everything else stays unresolved.
 fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read) ?types.Schema {
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
         if (csv.CsvReader.isUrl(rd.form.path)) return null;
+        if (pqdecode.Reader.isPath(rd.form.path)) {
+            const pr = pqdecode.Reader.open(arena, rd.form.path) catch return null;
+            return pr.schema;
+        }
         const reader = csv.CsvReader.open(arena, rd.form.path) catch return null;
         const schema = reader.schema;
         reader.close();

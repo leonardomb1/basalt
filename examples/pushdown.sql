@@ -5,7 +5,7 @@
 -- (verbatim to the source, dollar-quoted so the '*' needs no escaping).
 -- `WHERE valor > 0` and the projection are implicit-pushdown candidates:
 -- if the translator covers them they descend ANDed / as the column list,
--- otherwise they run in basalt. check -s shows which.
+-- otherwise they run in basalt. EXPLAIN shows which.
 
 CREATE CONNECTION erp TYPE sqlserver OPTIONS (
   host     = 'sql.internal',

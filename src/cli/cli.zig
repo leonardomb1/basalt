@@ -1,6 +1,6 @@
 //! Command-line surface:
 //!   basalt run   <script>|-c <script> [-p k=v ...] [-j N] [--port N]
-//!   basalt check <script>|-c <script> [-s|--show-plan] [--connect]
+//!   basalt check <script>|-c <script> [--connect]
 //!   basalt repl
 //! `run` executes (HTTP mode when the script declares an endpoint); `check`
 //! validates and plans without running. A
@@ -146,7 +146,6 @@ fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     const src = (try loadSource(a, "check", args, stderr)) orelse return 1;
     const prog = (try parseSrc(a, src, stderr)) orelse return 1;
 
-    var show_plan = false;
     var connect = false;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
@@ -155,14 +154,13 @@ fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             i += 1;
             continue;
         }
-        if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--show-plan")) show_plan = true;
         if (std.mem.eql(u8, arg, "--connect")) connect = true;
     }
 
     var galloc = alloc;
     const resolver: ?analyze.Resolver = if (connect) runtime.connectingResolver(&galloc) else null;
     var adiag = analyze.Diag{};
-    const plan = analyze.analyze(a, prog, resolver, &adiag) catch |e| switch (e) {
+    _ = analyze.analyze(a, prog, resolver, &adiag) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.AnalyzeFailed => {
             try stderr.print("{s}: error: {s}\n", .{ src.label, adiag.msg });
@@ -170,11 +168,7 @@ fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         },
     };
 
-    if (show_plan) {
-        try analyze.render(plan, stdout);
-    } else {
-        try stdout.print("ok: {s} checks out\n", .{src.label});
-    }
+    try stdout.print("ok: {s} checks out\n", .{src.label});
     return 0;
 }
 
@@ -252,12 +246,29 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         return 0;
     }
 
+    if (prog.explain == .plan) {
+        var ebuf: [4096]u8 = undefined;
+        var efile = std.fs.File.stdout().writer(&ebuf);
+        const eout = &efile.interface;
+        defer eout.flush() catch {};
+        var adiag2 = analyze.Diag{};
+        const plan = analyze.analyze(arena.allocator(), prog, null, &adiag2) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            error.AnalyzeFailed => {
+                try stderr.print("{s}: error: {s}\n", .{ src.label, adiag2.msg });
+                return 1;
+            },
+        };
+        try analyze.render(plan, eout);
+        return 0;
+    }
+
     log.summary = if (json_summary) .json_stdout else .stderr;
 
     var diag: runtime.Diag = .{};
     var sink = runtime.OutcomeSink.init(alloc);
     defer sink.deinit();
-    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log, .explain = explain }, &diag) catch |e| switch (e) {
+    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze }, &diag) catch |e| switch (e) {
         error.Aborted => {
             try stderr.print("{s}: aborted\n", .{src.label});
             return 130;
@@ -592,7 +603,7 @@ fn usage(w: anytype) !void {
         \\               run a pipeline; HTTP mode when the script declares CREATE ENDPOINT
         \\  basalt serve <dir> [--port N] [--watch]
         \\               host every endpoint script in a dir (SIGHUP or -w reloads)
-        \\  basalt check <script>|-|-c <script> [-s|--show-plan] [--connect]
+        \\  basalt check <script>|-|-c <script> [--connect]
         \\               validate without running; -s prints the plan
         \\  basalt repl  interactive read-eval-print loop
         \\  basalt help  show this help

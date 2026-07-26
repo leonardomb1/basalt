@@ -88,6 +88,7 @@ const reserved_after_source = [_][]const u8{
     "else",     "case",   "select",  "from",   "load",  "for",    "using",
     "upsert",   "append", "replace", "split",  "jobs",  "offset", "paginate",
     "retry",    "create", "param",   "having", "and",   "or",     "not",
+    "explain",  "costs",  "analyze",
 };
 
 fn isReservedAfterSource(name: []const u8) bool {
@@ -237,6 +238,14 @@ pub const Parser = struct {
         self.conn_names = std.array_list.Managed([]const u8).init(self.arena);
         self.let_names = std.array_list.Managed([]const u8).init(self.arena);
 
+        var explain: ast.ExplainMode = .none;
+        if (self.isKw("explain")) {
+            _ = self.advance();
+            if (self.isKw("costs"))
+                return self.fail(self.curPos(), "EXPLAIN COSTS is not supported: basalt has no cost model", .{});
+            explain = if (self.eatKw("analyze")) .analyze else .plan;
+        }
+
         var stmts = std.array_list.Managed(ast.Stmt).init(self.arena);
         while (!self.at(.eof)) {
             try self.parseStatement(&stmts);
@@ -247,7 +256,7 @@ pub const Parser = struct {
         const kind: ast.KindDecl = self.endpoint orelse
             .{ .kind = .batch, .config = &.{}, .pos = .{ .line = 1, .col = 1 } };
         try stmts.insert(0, .{ .kind = kind });
-        return .{ .stmts = try stmts.toOwnedSlice() };
+        return .{ .stmts = try stmts.toOwnedSlice(), .explain = explain };
     }
 
     /// One top-level (or arm-body) statement, appended to `out`.

@@ -159,7 +159,7 @@ Source clauses, in any order after the source:
   functions (`lower upper length trim substr replace concat coalesce
   starts_with ends_with contains`). Untranslatable pieces (arithmetic,
   `now()`/`today()`, user funcs) stay in the engine — the filter is always
-  kept, so results never change, only how much crosses the wire. `check -s`
+  kept, so results never change, only how much crosses the wire. `EXPLAIN`
   prints the descended predicate on a `pushdown:` line.
 - **`PAGINATE BY page|offset|cursor (param = 'page', size = 100,
   total = 'count', field = 'next', start = 2, max = 50)`** — REST pagination.
@@ -172,7 +172,7 @@ Source clauses, in any order after the source:
   forms, `method`/`body` for POST sources, etc.
 
 `WHERE` on a REST source runs in basalt after the fetch; on a SQL table it is
-pushdown. Same word, different plan — `check -s` shows which.
+pushdown. Same word, different plan — `EXPLAIN` shows which.
 
 ### Operators
 
@@ -406,12 +406,30 @@ SQL-ish, Pratt-parsed. Precedence (high→low): unary `- NOT` → `* / %` →
 - `CREATE FUNCTION nome(a) AS <expr>;` — inlined at plan time; recursion and
   arity mismatches are compile errors.
 
+### `EXPLAIN`
+
+`EXPLAIN <statement>` prints the plan instead of running it.
+`EXPLAIN ANALYZE <statement>` runs it and prints the operator tree with the
+time and row count each stage actually cost — time is *exclusive*, so a
+stage's figure excludes its inputs.
+
+```console
+$ basalt run -c "EXPLAIN ANALYZE SELECT g, COUNT(*) AS c FROM 'x.parquet' GROUP BY g;"
+actuals (exclusive time):
+  aggregate      13.1ms          601 rows        2 batches
+    scan          6.2ms       500000 rows        6 batches
+```
+
+`EXPLAIN COSTS` is rejected at parse time — there is no cost model to report.
+Actuals cover the serial pipeline; a parallel run reports per lane and is not
+yet summed into one tree.
+
 ## 10. Running & exit codes
 
 ```
 basalt run   <script>|-|-c "<inline>" [-p key=value ...] [-j threads]
 basalt serve <dir> [--port N] [--watch]
-basalt check <script>|-|-c "<inline>" [-s|--show-plan] [--connect]
+basalt check <script>|-|-c "<inline>" [--connect]
 ```
 
 | code | meaning |

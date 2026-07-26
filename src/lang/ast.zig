@@ -370,7 +370,12 @@ pub const Stmt = union(enum) {
     func: FnDecl,
 };
 
-pub const Program = struct { stmts: []const Stmt };
+/// `EXPLAIN` prefix on a program: print the plan instead of running it, or
+/// (with `ANALYZE`) run it and print the plan back with measured actuals.
+/// `COSTS` is rejected at parse time — there is no cost model to report.
+pub const ExplainMode = enum { none, plan, analyze };
+
+pub const Program = struct { stmts: []const Stmt, explain: ExplainMode = .none };
 
 test "rebuildExpr identity copies every field — no silent drop" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);

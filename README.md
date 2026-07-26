@@ -46,7 +46,9 @@ ranged reads — only the footer and the chunks a query needs are fetched.
 
 ```console
 $ basalt run pipeline.sql -p dias=7      # bind a PARAM
-$ basalt check pipeline.sql -s           # validate and print the plan
+$ basalt check pipeline.sql              # validate without running
+$ basalt run -c "EXPLAIN <query>"        # print the plan
+$ basalt run -c "EXPLAIN ANALYZE <query>" # run it, print the plan with actuals
 $ basalt repl                            # interactive
 $ basalt serve ./endpoints --watch       # host every endpoint script in a dir
 ```
