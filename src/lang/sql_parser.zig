@@ -1867,7 +1867,9 @@ pub const Parser = struct {
                     _ = self.advance();
                     _ = self.advance();
                     const unit = try self.expectColName();
-                    try self.expectKw("from");
+                    // Both spellings: `EXTRACT(minute FROM ts)` and the plain
+                    // two-argument call `extract('minute', ts)`.
+                    if (!self.eatKw("from")) _ = try self.expect(.comma);
                     const src = try self.parseExpr();
                     _ = try self.expect(.rparen);
                     const xargs = try self.arena.alloc(*ast.Expr, 2);

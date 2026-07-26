@@ -183,6 +183,8 @@ pushdown. Same word, different plan — `check -s` shows which.
 | `SELECT * EXCLUDE (a, b)` / `EXCEPT` | all-but projection |
 | `SELECT * RENAME (a AS b)` | rename projection |
 | `COUNT(*) / SUM / AVG / MIN / MAX ... GROUP BY k` | aggregate (non-agg items must be group keys) |
+| `COUNT(DISTINCT x)` | aggregate — combines freely with other aggregates; ignores nulls |
+| `HAVING <expr>` | filter after the aggregate; aggregate calls in it refer to the columns it produced |
 | `ORDER BY a DESC, b` | sort |
 | `LIMIT n [OFFSET m]` | limit |
 | `SELECT DISTINCT` / `DISTINCT ON (a, b)` | distinct |
@@ -191,6 +193,30 @@ pushdown. Same word, different plan — `check -s` shows which.
 
 Table aliases (`FROM t a`, `JOIN c b`) are stripped at parse time — the engine
 sees bare column names.
+
+### Naming, `GROUP BY` and `ORDER BY`
+
+A computed `SELECT` item does not need `AS`. Without one it is named after the
+text of its expression, lowercased and stripped of spaces — `COUNT(*)` becomes
+`count(*)`, `ClientIP - 1` becomes `clientip-1`. An explicit alias always wins.
+
+The same naming is what lets `GROUP BY` and `ORDER BY` repeat an expression
+instead of its alias: both sides render the expression the same way, so they
+bind to the one column the projection already produced.
+
+```sql
+SELECT AdvEngineID, COUNT(*) FROM hits
+GROUP BY AdvEngineID ORDER BY COUNT(*) DESC;      -- binds to count(*)
+
+SELECT DATE_TRUNC('minute', EventTime) AS m, COUNT(*) AS c FROM hits
+GROUP BY DATE_TRUNC('minute', EventTime);          -- binds to m
+```
+
+- `GROUP BY <n>` is positional — it names the *n*-th `SELECT` item.
+- `GROUP BY <expr>` accepts a computed key (`GROUP BY ClientIP - 1`).
+- `ORDER BY` may name a column the `SELECT` list does not project. It is
+  carried through the projection as a hidden column and dropped after the
+  `LIMIT`, so sorting by an unselected column costs nothing in the output.
 
 ## 6. `UNION ALL BY NAME` — reconciliation by name
 
@@ -358,13 +384,25 @@ SQL-ish, Pratt-parsed. Precedence (high→low): unary `- NOT` → `* / %` →
 - `x IS [NOT] NULL` · `x IS [NOT] EMPTY` (true when null **or** `''`; string
   operands only — handy for loop values).
 - `a ?? b` — null-coalesce (sugar for `COALESCE`).
-- `CAST(x AS INT)` / `CAST(x AS DECIMAL(18,2))` — implicit widening is
-  int→float/decimal only.
+- `CAST(x AS INT)` / `CAST(x AS DECIMAL(18,2))` / `CAST(x AS DATE)` /
+  `CAST(x AS TIMESTAMP)` — implicit widening is int→float/decimal only. Text
+  parses as `YYYY-MM-DD[ HH:MM:SS]`.
+- A `DATE`/`TIMESTAMP` column compares directly against an ISO string literal
+  (`WHERE d >= '2013-07-01'`). The literal is coerced to the column's type,
+  never the reverse, and it is validated at plan time — so `'2013-13-01'` and
+  `'01/07/2013'` are errors from `check`, not silent text comparisons.
 - `x LIKE 'a%'`, `x IN (1, 2, 3)` (expands to an OR-chain).
 - `LET x = <val> IN <body>` — local binding, inlined at plan time.
 - Scalar functions (case-insensitive): `now() today() lower() upper() length()
-  trim() substr() replace() concat() coalesce() starts_with() ends_with()
-  contains() like()`.
+  strlen() trim() substr() replace() concat() coalesce() starts_with()
+  ends_with() contains() like() date_trunc() extract() regexp_replace()`.
+- `DATE_TRUNC('minute', ts)` and `EXTRACT(minute FROM ts)` — units `year`,
+  `month`, `day`, `hour`, `minute`, `second`. `EXTRACT` also accepts the
+  ordinary two-argument call form. `STRLEN` is an alias for `LENGTH`.
+- `REGEXP_REPLACE(s, pattern, replacement)` — replaces the first match;
+  `\1`…`\9` in the replacement expand to captured groups (`\0` is the whole
+  match). A literal pattern is compiled at plan time, so a malformed one fails
+  `check`. See §11 for the supported syntax.
 - `CREATE FUNCTION nome(a) AS <expr>;` — inlined at plan time; recursion and
   arity mismatches are compile errors.
 
@@ -401,6 +439,16 @@ Accepted design not yet in the engine:
   (`SELECT '${emp}' AS empresa`), and a dynamic **CSV file path** still uses
   string interpolation inside the quote (`FROM 'dir/${name}.csv'`) — neither
   accepts a bare `$var`/`||` expression yet.
+
+Deliberately partial:
+
+- **The regex engine is a subset** (`exec/regex.zig`), sized for the patterns
+  SQL actually carries rather than for a dependency. It supports `^ $ . |`,
+  character classes with ranges and negation, capturing and non-capturing
+  groups, the escapes `\d \w \s` (and their negations), and the greedy
+  quantifiers `* + ?`. Lookaround, lazy quantifiers and `{n,m}` counts are
+  **rejected at compile time** rather than read as literal characters, so an
+  unsupported pattern is an error and never a silently wrong match.
 
 The golden corpus that gated the BSL parser's removal lives in
 `examples/golden/` — see its README for the comparison rules.

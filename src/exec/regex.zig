@@ -168,6 +168,12 @@ const Parser = struct {
                 },
                 else => {},
             };
+            // A `?` directly after a quantifier means lazy matching, which this
+            // engine does not implement. Reject it rather than read it as a
+            // literal `?` and quietly return the wrong rows.
+            if (it.min != 1 or it.max != 1) {
+                if (self.i < self.src.len and self.src[self.i] == '?') return Error.BadPattern;
+            }
             try items.append(it);
         }
         return items.toOwnedSlice();
@@ -184,6 +190,10 @@ const Parser = struct {
                 var cap: ?u8 = null;
                 if (self.i + 1 < self.src.len and self.src[self.i] == '?' and self.src[self.i + 1] == ':') {
                     self.i += 2;
+                } else if (self.i < self.src.len and self.src[self.i] == '?') {
+                    // `(?=`, `(?!`, `(?<` … — lookaround and friends are out of
+                    // scope; failing loudly beats matching them literally.
+                    return Error.BadPattern;
                 } else {
                     if (self.ngroup >= max_groups) return Error.BadPattern;
                     cap = self.ngroup;
@@ -195,6 +205,8 @@ const Parser = struct {
                 return .{ .group = .{ .alt = alt, .cap = cap } };
             },
             '[' => return .{ .class = try self.parseClass() },
+            '{' => return Error.BadPattern, // `{n,m}` counts are not implemented
+            '*', '+', '?' => return Error.BadPattern, // quantifier with nothing to repeat
             '\\' => {
                 if (self.i >= self.src.len) return Error.BadPattern;
                 const e = self.src[self.i];
