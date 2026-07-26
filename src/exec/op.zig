@@ -760,7 +760,6 @@ pub const Aggregate = struct {
         sum_i: i64 = 0,
         sum_f: f64 = 0,
         ext: Value = .null,
-        has_ext: bool = false,
         /// Values already counted by a `COUNT(DISTINCT x)`, per group. Only
         /// allocated for distinct aggs, so ordinary aggregation keeps its
         /// scalar accumulator.
@@ -1054,13 +1053,11 @@ pub const Aggregate = struct {
                 dst.sum_f += src.sum_f;
                 dst.n += src.n;
             },
-            .min => if (src.has_ext and (!dst.has_ext or lessV(src.ext, dst.ext))) {
+            .min => if (!src.ext.isNull() and (dst.ext.isNull() or lessV(src.ext, dst.ext))) {
                 dst.ext = try dupeValue(dst_alloc, src.ext);
-                dst.has_ext = true;
             },
-            .max => if (src.has_ext and (!dst.has_ext or lessV(dst.ext, src.ext))) {
+            .max => if (!src.ext.isNull() and (dst.ext.isNull() or lessV(dst.ext, src.ext))) {
                 dst.ext = try dupeValue(dst_alloc, src.ext);
-                dst.has_ext = true;
             },
         }
     }
@@ -1143,7 +1140,7 @@ pub const Aggregate = struct {
                 const accs = try dst_alloc.alloc(Acc, aggs.len);
                 for (g.accs, accs, aggs) |src, *dst, agg| {
                     dst.* = src;
-                    if ((agg.func == .min or agg.func == .max) and src.has_ext) dst.ext = try dupeValue(dst_alloc, src.ext);
+                    if ((agg.func == .min or agg.func == .max) and !src.ext.isNull()) dst.ext = try dupeValue(dst_alloc, src.ext);
                     if (agg.distinct) {
                         dst.seen = null;
                         dst.n = 0;
@@ -1270,15 +1267,13 @@ pub const Aggregate = struct {
                 acc.n += @intCast(p.nvalid);
             },
             .min => if (p.ext) |v| {
-                if (!acc.has_ext or lessV(v, acc.ext)) {
+                if (acc.ext.isNull() or lessV(v, acc.ext)) {
                     acc.ext = v;
-                    acc.has_ext = true;
                 }
             },
             .max => if (p.ext) |v| {
-                if (!acc.has_ext or lessV(acc.ext, v)) {
+                if (acc.ext.isNull() or lessV(acc.ext, v)) {
                     acc.ext = v;
-                    acc.has_ext = true;
                 }
             },
         }
@@ -1329,15 +1324,13 @@ pub const Aggregate = struct {
                 acc.n += 1;
             },
             .min => if (!v.isNull()) {
-                if (!acc.has_ext or lessV(v, acc.ext)) {
+                if (acc.ext.isNull() or lessV(v, acc.ext)) {
                     acc.ext = try dupeValue(state, v);
-                    acc.has_ext = true;
                 }
             },
             .max => if (!v.isNull()) {
-                if (!acc.has_ext or lessV(acc.ext, v)) {
+                if (acc.ext.isNull() or lessV(acc.ext, v)) {
                     acc.ext = try dupeValue(state, v);
-                    acc.has_ext = true;
                 }
             },
         }
@@ -1348,7 +1341,7 @@ pub const Aggregate = struct {
             .count => .{ .int = acc.n },
             .sum => if (acc.n == 0) .null else if (agg.ty.kind == .float) Value{ .float = acc.sum_f } else Value{ .int = acc.sum_i },
             .avg => if (acc.n == 0) .null else Value{ .float = acc.sum_f / @as(f64, @floatFromInt(acc.n)) },
-            .min, .max => if (acc.has_ext) acc.ext else .null,
+            .min, .max => acc.ext,
         };
     }
 };
