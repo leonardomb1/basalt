@@ -1239,7 +1239,11 @@ pub const Aggregate = struct {
         /// `hashes` — so a table owning one radix partition rehomes only the
         /// groups it holds.
         fn grow(self: *GroupTable, hashes: []const u64) !void {
-            const cap = self.entries.len * 2;
+            // Doubling is right while the table is small, but every rehash at
+            // size re-scatters the whole table, and a high-cardinality fold pays
+            // that eight or nine times over. Past the point where a resize is
+            // the expensive part, jump further ahead instead.
+            const cap = self.entries.len * @as(usize, if (self.entries.len >= 1 << 14) 8 else 2);
             const ne = try self.alloc.alloc(u32, cap);
             @memset(ne, 0);
             const nmask = cap - 1;
