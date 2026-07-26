@@ -449,7 +449,7 @@ const Ctx = struct {
                 return src;
             },
             .union_ => |un| {
-                const detail = if (un.discover_query.len > 0)
+                const detail = if (un.discover_query.len > 0 or un.discover_pipeline != null)
                     try std.fmt.allocPrint(self.arena, "union (tables discovered from {s})", .{un.discover_conn})
                 else
                     try std.fmt.allocPrint(self.arena, "union of {d} sources", .{un.branches.len});

@@ -68,7 +68,11 @@ fn expandStmt(cx: *Ctx, s: ast.Stmt) Error!ast.Stmt {
                 if (st == .func) continue;
                 try body.append(try expandStmt(cx, st));
             }
-            break :blk .{ .for_each = .{ .var_names = fe.var_names, .var_types = fe.var_types, .source = fe.source, .hints = fe.hints, .body = try body.toOwnedSlice(), .pos = fe.pos } };
+            const source: ast.ForSource = switch (fe.source) {
+                .pipeline => |p| .{ .pipeline = try expandPipeline(cx, p) },
+                else => fe.source,
+            };
+            break :blk .{ .for_each = .{ .var_names = fe.var_names, .var_types = fe.var_types, .source = source, .hints = fe.hints, .body = try body.toOwnedSlice(), .pos = fe.pos } };
         },
         .match => |m| .{ .match = try expandStmtMatch(cx, m) },
         .func => unreachable,
@@ -97,9 +101,9 @@ fn expandNode(cx: *Ctx, n: ast.Stage.Node) Error!ast.Stage.Node {
             break :blk .{ .aggregate = .{ .aggs = aggs, .by = ag.by } };
         },
         .union_ => |u| blk: {
-            const rendered = (try renderDiscoverJson(cx, u.discover_json)) orelse break :blk n;
             var uu = u;
-            uu.discover_json = rendered;
+            if (try renderDiscoverJson(cx, u.discover_json)) |rendered| uu.discover_json = rendered;
+            if (u.discover_pipeline) |p| uu.discover_pipeline = try expandPipeline(cx, p);
             break :blk .{ .union_ = uu };
         },
         else => n,
