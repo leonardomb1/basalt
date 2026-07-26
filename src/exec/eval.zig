@@ -81,7 +81,9 @@ pub const TypeCtx = struct {
                 return Type{ .kind = k, .nullable = nn };
             },
             .eq, .ne, .lt, .le, .gt, .ge => {
-                if (!comparable(lt, rt)) return self.err("incomparable operands", .{});
+                if (!comparable(lt, rt) and
+                    !try self.temporalLit(b.r, lt) and
+                    !try self.temporalLit(b.l, rt)) return self.err("incomparable operands", .{});
                 return Type{ .kind = .bool, .nullable = nn };
             },
             .@"and", .@"or" => {
@@ -89,6 +91,21 @@ pub const TypeCtx = struct {
                 return Type{ .kind = .bool, .nullable = nn };
             },
         }
+    }
+
+    /// A date/timestamp compared against a string *literal*. The literal bends
+    /// to the column's type, never the reverse, so a mistyped `'01/07/2013'`
+    /// stays an error instead of degrading into a text comparison. Validated
+    /// here so a bad literal fails `check` rather than the run.
+    fn temporalLit(self: *TypeCtx, e: *const ast.Expr, other: Type) TypeError!bool {
+        if (e.* != .str_lit) return false;
+        if (other.kind != .date and other.kind != .timestamp) return false;
+        const ok = if (other.kind == .date)
+            parseIsoDate(e.str_lit) != null
+        else
+            parseIsoTimestamp(e.str_lit) != null;
+        if (!ok) return self.err("`{s}` is not a valid {s} literal", .{ e.str_lit, @tagName(other.kind) });
+        return true;
     }
 
     fn typeOfCall(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
@@ -1331,6 +1348,18 @@ pub fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalE
             .string => |s| .{ .float = std.fmt.parseFloat(f64, trim(s)) catch return error.CastFailed },
             else => error.CastFailed,
         },
+        .date => switch (v) {
+            .date => v,
+            .timestamp => |x| .{ .date = @intCast(@divFloor(x, 86_400_000_000)) },
+            .string => |str| .{ .date = @intCast(parseIsoDate(str) orelse return error.CastFailed) },
+            else => error.CastFailed,
+        },
+        .timestamp => switch (v) {
+            .timestamp => v,
+            .date => |x| .{ .timestamp = @as(i64, x) * 86_400_000_000 },
+            .string => |str| .{ .timestamp = parseIsoTimestamp(str) orelse return error.CastFailed },
+            else => error.CastFailed,
+        },
         .string => .{ .string = try valueToString(arena, v) },
         .bool => switch (v) {
             .bool => v,
@@ -1386,6 +1415,53 @@ pub fn formatTimestamp(arena: std.mem.Allocator, micros: i64) ![]const u8 {
     return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
         @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60,
     });
+}
+
+/// Day count since the 1970 epoch for a civil date: the inverse of
+/// `civilFromDays` (Howard Hinnant's algorithm).
+pub fn daysFromCivil(y0: i64, m: u32, d: u32) i64 {
+    const y = if (m <= 2) y0 - 1 else y0;
+    const era = @divFloor(if (y >= 0) y else y - 399, 400);
+    const yoe = y - era * 400;
+    const mp: i64 = @intCast((m + 9) % 12);
+    const doy = @divFloor(153 * mp + 2, 5) + @as(i64, @intCast(d)) - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+fn isoNum(s: []const u8) ?i64 {
+    var v: i64 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return null;
+        v = v * 10 + @as(i64, c - '0');
+    }
+    return v;
+}
+
+/// Parse `YYYY-MM-DD` into a day count. Strict on purpose: a literal that is
+/// not an ISO date must fail rather than coerce, so `date_col = '01/07/2013'`
+/// is an error instead of a silently wrong comparison.
+pub fn parseIsoDate(s0: []const u8) ?i64 {
+    const s = trim(s0);
+    if (s.len != 10 or s[4] != '-' or s[7] != '-') return null;
+    const y = isoNum(s[0..4]) orelse return null;
+    const m = isoNum(s[5..7]) orelse return null;
+    const d = isoNum(s[8..10]) orelse return null;
+    if (m < 1 or m > 12 or d < 1 or d > 31) return null;
+    return daysFromCivil(y, @intCast(m), @intCast(d));
+}
+
+/// Parse `YYYY-MM-DD[ HH:MM:SS]` into microseconds since the epoch.
+pub fn parseIsoTimestamp(s0: []const u8) ?i64 {
+    const s = trim(s0);
+    if (s.len == 10) return (parseIsoDate(s) orelse return null) * 86_400_000_000;
+    if (s.len < 19 or s[13] != ':' or s[16] != ':') return null;
+    const days = parseIsoDate(s[0..10]) orelse return null;
+    const hh = isoNum(s[11..13]) orelse return null;
+    const mm = isoNum(s[14..16]) orelse return null;
+    const ss = isoNum(s[17..19]) orelse return null;
+    if (hh > 23 or mm > 59 or ss > 59) return null;
+    return days * 86_400_000_000 + (hh * 3600 + mm * 60 + ss) * 1_000_000;
 }
 
 /// Civil (Gregorian) date from a day count since the 1970 epoch (Howard Hinnant's
@@ -1477,6 +1553,10 @@ pub fn compareValues(a: Value, b: Value) ?std.math.Order {
     if (a == .bool and b == .bool) return std.math.order(@intFromBool(a.bool), @intFromBool(b.bool));
     if (a == .timestamp and b == .timestamp) return std.math.order(a.timestamp, b.timestamp);
     if (a == .date and b == .date) return std.math.order(a.date, b.date);
+    if (a == .date and b == .string) return std.math.order(@as(i64, a.date), parseIsoDate(b.string) orelse return null);
+    if (a == .string and b == .date) return std.math.order(parseIsoDate(a.string) orelse return null, @as(i64, b.date));
+    if (a == .timestamp and b == .string) return std.math.order(a.timestamp, parseIsoTimestamp(b.string) orelse return null);
+    if (a == .string and b == .timestamp) return std.math.order(parseIsoTimestamp(a.string) orelse return null, b.timestamp);
     if (a == .time and b == .time) return std.math.order(a.time, b.time);
     return null;
 }
