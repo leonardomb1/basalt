@@ -98,6 +98,15 @@ fn isReservedAfterSource(name: []const u8) bool {
     return false;
 }
 
+/// The file format of a path source is sniffed from its extension when the read
+/// opens, so a computed path must still spell that extension out: everything after
+/// the last `${...}` hole has to carry a `.ext`.
+fn hasLiteralExt(tmpl: []const u8) bool {
+    const tail = if (std.mem.lastIndexOfScalar(u8, tmpl, '}')) |i| tmpl[i + 1 ..] else tmpl;
+    const dot = std.mem.lastIndexOfScalar(u8, tail, '.') orelse return false;
+    return dot + 1 < tail.len;
+}
+
 const agg_names = [_]struct { n: []const u8, f: ast.AggFunc }{
     .{ .n = "count", .f = .count },
     .{ .n = "sum", .f = .sum },
@@ -1242,12 +1251,23 @@ pub const Parser = struct {
         });
     }
 
-    /// A FROM source: CSV path, BODY(schema), HTTP('url'), a CTE reference, or
-    /// a connection-qualified table / QUERY($$...$$). Registers the alias.
+    /// A FROM source: CSV path, IDENTIFIER(<expr>) for a computed path,
+    /// BODY(schema), HTTP('url'), a CTE reference, or a connection-qualified
+    /// table / QUERY($$...$$). Registers the alias.
     fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array_list.Managed(ast.Hint)) Error!ast.Stage.Node {
         var node: ast.Stage.Node = undefined;
         if (self.at(.string)) {
             node = .{ .read = .{ .connector = "csv", .form = .{ .path = self.advance().text } } };
+        } else if (self.isKw("identifier") and self.peekTag() == .lparen) {
+            const pos = self.curPos();
+            _ = self.advance();
+            _ = try self.expect(.lparen);
+            const e = try self.parseExpr();
+            _ = try self.expect(.rparen);
+            const tmpl = try self.exprToTemplate(e);
+            if (!hasLiteralExt(tmpl))
+                return self.fail(pos, "dynamic path needs a literal extension (end it with `|| '.csv'`, `|| '.parquet'`, …)", .{});
+            node = .{ .read = .{ .connector = "csv", .form = .{ .path = tmpl } } };
         } else if (self.isKw("body")) {
             _ = self.advance();
             const schema = try self.parseBodySchema();
@@ -2303,6 +2323,29 @@ test "sql: PUSHDOWN($$literal$$) still lowers to a plain fragment (no hole)" {
     );
     const st = prog.stmts[2].output.stages[0];
     try testing.expectEqualStrings("D_E_L_E_T_ <> '*'", st.hints[0].value.str);
+}
+
+test "sql: FROM IDENTIFIER(expr) -> a computed path read" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parseTest(a,
+        \\LOAD INTO '/tmp/o.csv' AS
+        \\SELECT * FROM IDENTIFIER('dir/' || name || '.csv');
+    );
+    const rd = prog.stmts[1].output.stages[0].node.read;
+    try testing.expectEqualStrings("csv", rd.connector);
+    try testing.expectEqualStrings("dir/${name}.csv", rd.form.path);
+}
+
+test "sql: FROM IDENTIFIER without a literal extension is a parse error" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const r = parseSource(a, "LOAD INTO '/tmp/o.csv' AS SELECT * FROM IDENTIFIER('dir/' || name);", &diag);
+    try testing.expectError(error.ParseFailed, r);
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "literal extension") != null);
 }
 
 test "sql: IDENTIFIER in an UPSERT key -> per-row computed key column" {
