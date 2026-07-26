@@ -295,6 +295,18 @@ FROM EACH TABLE OF (erp.QUERY($$SELECT name, SUBSTRING(name,4,2) FROM sys.tables
   ANCHOR SCHEMA erp.dbo.CT2010;
 ```
 
+The discovery source may also be a full basalt `SELECT`, executed in-engine at
+plan time (its translatable `WHERE` prefix still descends to the source as
+usual). The connection the *discovered tables* live in is inferred from the
+query's leading read when it names a connection; `IN <conn>` overrides it:
+
+```sql
+SELECT *
+FROM EACH TABLE OF (SELECT name, substr(name, 4, 2) FROM erp.sys.tables WHERE name LIKE 'CT2%')
+  AS (table_name, CT2_EMPRESA)
+  ANCHOR SCHEMA erp.dbo.CT2010;
+```
+
 JSON form (array of `{table, tag}` objects, e.g. from a request body):
 `FROM EACH TABLE OF ($job.tables) IN erp AS (table_name, tag)` — element keys
 remappable via `WITH (table_field = ..., tag_field = ..., tag_substr = '4,2')`.
@@ -316,9 +328,15 @@ END FOR;
 ```
 
 - Sources: a raw discovery query (`conn.QUERY($$...$$)`, first N columns → N
-  loop vars positionally) or a JSON param path (`$tables`, `$job.tables`, …;
-  object fields bound to the loop vars by name, a missing field ⇒ `""`).
+  loop vars positionally), an in-engine `SELECT` query (any basalt query, run
+  once at plan time; first N columns → N loop vars positionally), or a JSON
+  param path (`$tables`, `$job.tables`, …; object fields bound to the loop
+  vars by name, a missing field ⇒ `""`).
 - Loop variables may be typed: `AS (name, port:INT)`.
+- A loop variable is also an ordinary expression **value**: `SELECT $name AS
+  empresa`, `WHERE $port > 1000` (typed vars compare as their declared type).
+  Inside the loop body a loop var shadows a same-named source column in
+  expression position — the same rule params follow.
 - The `CASE` **statement** (`... THEN <statements> ... END CASE`) dispatches
   whole pipelines per row — subject form (`CASE $env WHEN 'prod', 'staging'
   THEN ... END CASE`) and the guard form. `END CASE` distinguishes it from the
@@ -337,9 +355,11 @@ or object reference (the precedent is Snowflake / Databricks `IDENTIFIER`).
 | you want | write |
 |---|---|
 | a per-row source table | `FROM conn.schema.IDENTIFIER($name)` |
+| a per-row file path | `FROM IDENTIFIER('dir/' \|\| $name \|\| '.csv')` (the extension must be literal) |
 | a computed sink name | `LOAD INTO conn.IDENTIFIER('pre_' \|\| lower($name))` |
 | a raw predicate value | `PUSHDOWN($where)` |
 | a conditional key | `UPSERT ON (IDENTIFIER(if($pk = '', $name \|\| 'id', $pk)))` |
+| a per-row column value | `SELECT $name AS empresa` — a plain expression, no quoting |
 
 `IDENTIFIER($name)` resolves to a **table** read, so bare `UPSERT` still infers
 the PK from source metadata — a raw `QUERY(...)` read cannot. This is why the
@@ -501,21 +521,14 @@ Accepted design not yet in the engine:
   descended query, and a cross-connection join still materializes the smaller
   side in the engine (correct, just not maximally pushed). The predicate
   translator (`runtime/pushdown.zig`) is the reusable core when this lands.
-- **Generalized `EACH TABLE OF (SELECT ...)`** discovery — needs the same
-  query→SQL translation; the raw `QUERY($$...$$)` form covers it meanwhile.
-- **`$var` reflection is wired for names, not values.** `$name` works in
-  `IDENTIFIER()`, `PUSHDOWN`, and target/key positions (§7). A loop var used
-  as a computed `SELECT` **value** still needs the raw form
-  (`SELECT '${emp}' AS empresa`), and a dynamic **CSV file path** still uses
-  string interpolation inside the quote (`FROM 'dir/${name}.csv'`) — neither
-  accepts a bare `$var`/`||` expression yet.
 
 Deliberately partial:
 
 - **The regex engine is a subset** (`exec/regex.zig`), sized for the patterns
   SQL actually carries rather than for a dependency. It supports `^ $ . |`,
   character classes with ranges and negation, capturing and non-capturing
-  groups, the escapes `\d \w \s` (and their negations), and the greedy
-  quantifiers `* + ?`. Lookaround, lazy quantifiers and `{n,m}` counts are
-  **rejected at compile time** rather than read as literal characters, so an
-  unsupported pattern is an error and never a silently wrong match.
+  groups, the escapes `\d \w \s` (and their negations), the quantifiers
+  `* + ?` and counted `{n} {n,} {n,m}` — each greedy, or lazy with a `?`
+  suffix (`*?`, `{2,4}?`). Lookaround and backreferences inside the pattern
+  are **rejected at compile time** rather than read as literal characters, so
+  an unsupported pattern is an error and never a silently wrong match.

@@ -5130,7 +5130,7 @@ test "for-each discovers its rows from an in-engine SELECT" {
 
     const script = try std.fmt.allocPrint(
         alloc,
-        "FOR EACH ROW OF (SELECT name, lower(name) AS slug FROM '{s}/catalog.csv' WHERE active = '1') AS (name, slug)\n  LOAD INTO '{s}/out_${{slug}}.csv' AS SELECT id, v FROM '{s}/${{slug}}.csv';\nEND FOR;",
+        "FOR EACH ROW OF (SELECT name, lower(name) AS slug FROM '{s}/catalog.csv' WHERE active = 1) AS (name, slug)\n  LOAD INTO '{s}/out_${{slug}}.csv' AS SELECT id, v FROM '{s}/${{slug}}.csv';\nEND FOR;",
         .{ base, base, base },
     );
     defer alloc.free(script);
