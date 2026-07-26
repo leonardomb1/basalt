@@ -194,8 +194,12 @@ pub const Parser = struct {
     /// text for the same expression, which is what binds `ORDER BY COUNT(*)`
     /// to the SELECT item it repeats.
     fn synthName(self: *Parser, start: usize) Error![]const u8 {
+        return self.synthRange(start, self.i);
+    }
+
+    fn synthRange(self: *Parser, start: usize, end: usize) Error![]const u8 {
         var buf = std.array_list.Managed(u8).init(self.arena);
-        for (self.toks[start..self.i]) |t| {
+        for (self.toks[start..end]) |t| {
             for (t.text) |c| buf.append(std.ascii.toLower(c)) catch return error.OutOfMemory;
         }
         return buf.toOwnedSlice() catch return error.OutOfMemory;
@@ -726,6 +730,7 @@ pub const Parser = struct {
             try stages.appendSlice(first.stages);
         }
 
+        var hidden_drop: ?[]const ast.SelectItem = null;
         if (self.eatKw("order")) {
             try self.expectKw("by");
             var keys = std.array_list.Managed(ast.SortKey).init(self.arena);
@@ -735,7 +740,7 @@ pub const Parser = struct {
                     const start = self.i;
                     _ = try self.parseExpr();
                     const parts = try self.arena.alloc([]const u8, 1);
-                    parts[0] = try self.synthName(start);
+                    parts[0] = resolveExprAlias(first.expr_aliases, try self.synthName(start));
                     q = .{ .parts = parts };
                 } else {
                     q = try self.parseQualNameTok();
@@ -748,7 +753,45 @@ pub const Parser = struct {
                 try keys.append(.{ .field = q, .desc = desc });
                 if (!self.eat(.comma)) break;
             }
-            try stages.append(.{ .node = .{ .sort = .{ .keys = try keys.toOwnedSlice() } }, .hints = &.{}, .pos = self.curPos() });
+            const sort_keys = try keys.toOwnedSlice();
+
+            // A sort key the SELECT list does not project still has to reach the
+            // sort operator. Carry it as a hidden column and drop it after the
+            // LIMIT — standard SQL allows ordering by an unselected column, and
+            // dropping it last leaves sort+limit adjacent so top-N still fuses.
+            if (lastSelectIdx(stages.items)) |si| {
+                const proj = stages.items[si].node.select;
+                var wildcard = false;
+                var names = std.array_list.Managed([]const u8).init(self.arena);
+                for (proj) |it| switch (it) {
+                    .field => |f| try names.append(f.last()),
+                    .computed => |c| try names.append(c.name),
+                    else => wildcard = true,
+                };
+                if (!wildcard) {
+                    var extended = std.array_list.Managed(ast.SelectItem).init(self.arena);
+                    try extended.appendSlice(proj);
+                    for (sort_keys) |k| {
+                        if (k.field.parts.len != 1) continue;
+                        var have = false;
+                        for (names.items) |m| {
+                            if (std.mem.eql(u8, m, k.field.last())) have = true;
+                        }
+                        if (!have) try extended.append(.{ .field = k.field });
+                    }
+                    if (extended.items.len != proj.len) {
+                        stages.items[si].node.select = try extended.toOwnedSlice();
+                        var keep = std.array_list.Managed(ast.SelectItem).init(self.arena);
+                        for (names.items) |m| {
+                            const parts = try self.arena.alloc([]const u8, 1);
+                            parts[0] = m;
+                            try keep.append(.{ .field = .{ .parts = parts } });
+                        }
+                        hidden_drop = try keep.toOwnedSlice();
+                    }
+                }
+            }
+            try stages.append(.{ .node = .{ .sort = .{ .keys = sort_keys } }, .hints = &.{}, .pos = self.curPos() });
         }
 
         if (self.eatKw("limit")) {
@@ -763,16 +806,39 @@ pub const Parser = struct {
             }
             try stages.append(.{ .node = .{ .limit = .{ .count = count, .offset = offset } }, .hints = &.{}, .pos = self.curPos() });
         }
+
+        if (hidden_drop) |keep|
+            try stages.append(.{ .node = .{ .select = keep }, .hints = &.{}, .pos = self.curPos() });
+    }
+
+    /// Index of the projection a sort would read through, if the pipeline ends
+    /// in one.
+    fn lastSelectIdx(stages: []const ast.Stage) ?usize {
+        if (stages.len == 0) return null;
+        return if (stages[stages.len - 1].node == .select) stages.len - 1 else null;
     }
 
     /// Set when a core is exactly `SELECT ['lit' AS col,] t.* FROM conn.table`
     /// — the only shape a UNION ALL BY NAME branch may take.
     const BranchInfo = struct { read: ast.Read, tag: ?[]const u8, tag_col: ?[]const u8 };
 
+    /// A computed SELECT item indexed by the text of its expression, so that
+    /// `GROUP BY`/`ORDER BY` repeating the expression bind to the column the
+    /// SELECT list already produced instead of asking for a second one.
+    const ExprAlias = struct { synth: []const u8, out: []const u8 };
+
+    fn resolveExprAlias(map: []const ExprAlias, synth: []const u8) []const u8 {
+        for (map) |m| {
+            if (std.mem.eql(u8, m.synth, synth)) return m.out;
+        }
+        return synth;
+    }
+
     const Core = struct {
         stages: []const ast.Stage,
         aliases: AliasSet,
         union_branch: ?BranchInfo,
+        expr_aliases: []const ExprAlias = &.{},
     };
 
     /// SELECT [DISTINCT [ON (cols)]] items FROM source [alias] [PUSHDOWN(...)]
@@ -800,6 +866,7 @@ pub const Parser = struct {
             qstar: []const u8,
         };
         var raw_items = std.array_list.Managed(RawItem).init(self.arena);
+        var expr_aliases = std.array_list.Managed(ExprAlias).init(self.arena);
         while (true) {
             if (self.eat(.star)) {
                 if (self.eatKw("except") or self.eatKw("exclude")) {
@@ -834,14 +901,18 @@ pub const Parser = struct {
             } else {
                 const start = self.i;
                 const e = try self.parseExpr();
+                const synth: ?[]const u8 = if (e.* == .field) null else try self.synthRange(start, self.i);
                 var name: ?[]const u8 = null;
                 if (self.eatKw("as")) name = try self.expectColName();
                 if (name) |n| {
+                    if (synth) |sy| try expr_aliases.append(.{ .synth = sy, .out = n });
                     try raw_items.append(.{ .item = .{ .computed = .{ .name = n, .expr = e } } });
                 } else if (e.* == .field) {
                     try raw_items.append(.{ .item = .{ .field = e.field } });
                 } else {
-                    try raw_items.append(.{ .item = .{ .computed = .{ .name = try self.synthName(start), .expr = e } } });
+                    const sy = synth.?;
+                    try expr_aliases.append(.{ .synth = sy, .out = sy });
+                    try raw_items.append(.{ .item = .{ .computed = .{ .name = sy, .expr = e } } });
                 }
             }
             if (!self.eat(.comma)) break;
@@ -959,13 +1030,43 @@ pub const Parser = struct {
             try self.expectKw("by");
             var keys = std.array_list.Managed(ast.QualName).init(self.arena);
             while (true) {
-                var q = try self.parseQualNameTok();
-                q = stripQual(q, &aliases);
+                const gstart = self.i;
+                const ge = try self.parseExpr();
+                var q: ast.QualName = undefined;
+                if (ge.* == .int_lit) {
+                    // `GROUP BY 1` is positional — it names the first SELECT
+                    // item, the way DuckDB and Postgres read it.
+                    const n = ge.int_lit;
+                    if (n < 1 or n > @as(i64, @intCast(raw_items.items.len)))
+                        return self.fail(pos, "GROUP BY position {d} is out of range", .{n});
+                    const ri = raw_items.items[@intCast(n - 1)];
+                    if (ri != .item) return self.fail(pos, "GROUP BY position {d} refers to `*`", .{n});
+                    q = switch (ri.item) {
+                        .field => |f| stripQual(f, &aliases),
+                        .computed => |c| blk: {
+                            const parts = try self.arena.alloc([]const u8, 1);
+                            parts[0] = c.name;
+                            break :blk ast.QualName{ .parts = parts };
+                        },
+                        else => return self.fail(pos, "GROUP BY position {d} refers to `*`", .{n}),
+                    };
+                } else if (ge.* == .field) {
+                    q = stripQual(ge.field, &aliases);
+                } else {
+                    // A computed key names the expression exactly as the SELECT
+                    // list named it, so both sides bind to the same column.
+                    const parts = try self.arena.alloc([]const u8, 1);
+                    parts[0] = resolveExprAlias(expr_aliases.items, try self.synthName(gstart));
+                    q = .{ .parts = parts };
+                }
                 try keys.append(q);
                 if (!self.eat(.comma)) break;
             }
             group = try keys.toOwnedSlice();
         }
+
+        var having: ?*ast.Expr = null;
+        if (self.eatKw("having")) having = try self.parseExpr();
 
         var items = std.array_list.Managed(ast.SelectItem).init(self.arena);
         var aggs = std.array_list.Managed(ast.AggItem).init(self.arena);
@@ -1009,24 +1110,9 @@ pub const Parser = struct {
         if (aggs.items.len > 0 or group.len > 0) {
             if (aggs.items.len == 0)
                 return self.fail(pos, "GROUP BY without aggregate functions in SELECT", .{});
-            // `COUNT(DISTINCT x)` reuses the existing distinct operator: dedupe on
-            // the group keys plus x, then let the ordinary `count(x)` run. Keeping
-            // the argument is what makes SQL's "DISTINCT ignores NULL" fall out of
-            // the normal count-non-nulls rule instead of needing a special case.
-            var dedupe_on: ?[]ast.QualName = null;
             for (aggs.items) |a| {
-                if (!a.distinct) continue;
-                if (a.func != .count)
+                if (a.distinct and a.func != .count)
                     return self.fail(pos, "DISTINCT is only supported inside COUNT", .{});
-                if (aggs.items.len != 1)
-                    return self.fail(pos, "COUNT(DISTINCT ...) cannot be mixed with other aggregates", .{});
-                const arg = a.arg orelse return self.fail(pos, "COUNT(DISTINCT ...) needs a column", .{});
-                if (arg.* != .field)
-                    return self.fail(pos, "COUNT(DISTINCT ...) takes a plain column", .{});
-                const on = try self.arena.alloc(ast.QualName, group.len + 1);
-                @memcpy(on[0..group.len], group);
-                on[group.len] = arg.field;
-                dedupe_on = on;
             }
 
             var needs_pre = false;
@@ -1036,15 +1122,31 @@ pub const Parser = struct {
                         needs_pre = true;
                 }
             }
-            if (dedupe_on) |on| {
-                if (needs_pre)
-                    return self.fail(pos, "COUNT(DISTINCT ...) with a computed GROUP BY key is not supported", .{});
-                try stages.append(.{ .node = .{ .distinct = .{ .on = on } }, .hints = &.{}, .pos = pos });
-            }
             if (needs_pre) {
                 for (items.items) |it| {
                     if (it == .star or it == .star_except or it == .star_rename)
                         return self.fail(pos, "`*` cannot be combined with a computed GROUP BY key", .{});
+                }
+                // The projection runs before the aggregate, so it has to carry
+                // the columns the aggregate arguments read as well as the ones
+                // the SELECT list asked for.
+                var needed = std.array_list.Managed(ast.QualName).init(self.arena);
+                for (aggs.items) |a| {
+                    if (a.arg) |arg| try self.collectFields(arg, &needed);
+                }
+                for (needed.items) |q| {
+                    if (q.parts.len != 1) continue;
+                    var have = false;
+                    for (items.items) |it| switch (it) {
+                        .field => |f| {
+                            if (std.mem.eql(u8, f.last(), q.last())) have = true;
+                        },
+                        .computed => |cc| {
+                            if (std.mem.eql(u8, cc.name, q.last())) have = true;
+                        },
+                        else => {},
+                    };
+                    if (!have) try items.append(.{ .field = q });
                 }
                 try stages.append(.{ .node = .{ .select = try items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
             } else {
@@ -1058,6 +1160,10 @@ pub const Parser = struct {
                 .hints = &.{},
                 .pos = pos,
             });
+            if (having) |h| {
+                const hf = try self.havingRewrite(h, expr_aliases.items);
+                try stages.append(.{ .node = .{ .filter = hf }, .hints = &.{}, .pos = pos });
+            }
         } else {
             const lone_star = items.items.len == 1 and items.items[0] == .star;
             if (!lone_star) {
@@ -1081,7 +1187,7 @@ pub const Parser = struct {
             }
         }
 
-        return .{ .stages = try stages.toOwnedSlice(), .aliases = aliases, .union_branch = union_branch };
+        return .{ .stages = try stages.toOwnedSlice(), .aliases = aliases, .union_branch = union_branch, .expr_aliases = try expr_aliases.toOwnedSlice() };
     }
 
     /// `UNION ALL BY NAME core... [ANCHOR SCHEMA qual]` — collapse the first core
@@ -1505,6 +1611,77 @@ pub const Parser = struct {
     }
 
     /// Rewrite `alias.x` -> `x` in an expression tree.
+    /// Every column an expression reads. Used to keep a pre-aggregation
+    /// projection from dropping inputs the aggregates still need.
+    fn collectFields(self: *Parser, e: *const ast.Expr, out: *std.array_list.Managed(ast.QualName)) Error!void {
+        switch (e.*) {
+            .field => |q| out.append(q) catch return error.OutOfMemory,
+            .unary => |u| try self.collectFields(u.e, out),
+            .binary => |b| {
+                try self.collectFields(b.l, out);
+                try self.collectFields(b.r, out);
+            },
+            .call => |c| for (c.args) |a| try self.collectFields(a, out),
+            .cond => |c| {
+                try self.collectFields(c.cond, out);
+                try self.collectFields(c.then, out);
+                try self.collectFields(c.els, out);
+            },
+            .cast => |c| try self.collectFields(c.e, out),
+            .is_null => |n| try self.collectFields(n.e, out),
+            .let_in => |l| {
+                try self.collectFields(l.value, out);
+                try self.collectFields(l.body, out);
+            },
+            else => {},
+        }
+    }
+
+    /// Render an expression exactly as `synthName` renders its source tokens,
+    /// so a HAVING term can be matched to the SELECT item that computed it.
+    fn exprKey(self: *Parser, e: *const ast.Expr, buf: *std.array_list.Managed(u8)) Error!void {
+        switch (e.*) {
+            .field => |q| for (q.parts, 0..) |part, i| {
+                if (i != 0) buf.append('.') catch return error.OutOfMemory;
+                for (part) |c| buf.append(std.ascii.toLower(c)) catch return error.OutOfMemory;
+            },
+            .int_lit => |v| buf.writer().print("{d}", .{v}) catch return error.OutOfMemory,
+            .str_lit => |v| for (v) |c| buf.append(std.ascii.toLower(c)) catch return error.OutOfMemory,
+            .call => |c| {
+                for (c.name) |ch| buf.append(std.ascii.toLower(ch)) catch return error.OutOfMemory;
+                buf.append('(') catch return error.OutOfMemory;
+                if (c.args.len == 0) buf.append('*') catch return error.OutOfMemory;
+                for (c.args, 0..) |a, i| {
+                    if (i != 0) buf.append(',') catch return error.OutOfMemory;
+                    try self.exprKey(a, buf);
+                }
+                buf.append(')') catch return error.OutOfMemory;
+            },
+            else => buf.append('?') catch return error.OutOfMemory,
+        }
+    }
+
+    /// HAVING runs after aggregation, so each aggregate call in it is really a
+    /// reference to a column the aggregate already produced. Swap the calls for
+    /// those columns and the clause becomes an ordinary filter stage.
+    fn havingRewrite(self: *Parser, e: *ast.Expr, map: []const ExprAlias) Error!*ast.Expr {
+        const Ctx = struct { p: *Parser, m: []const ExprAlias };
+        const S = struct {
+            fn recur(cx: Ctx, node: *const ast.Expr) Error!*ast.Expr {
+                if (node.* == .call and aggFunc(node.call.name) != null) {
+                    var buf = std.array_list.Managed(u8).init(cx.p.arena);
+                    try cx.p.exprKey(node, &buf);
+                    const key = buf.toOwnedSlice() catch return error.OutOfMemory;
+                    const parts = cx.p.arena.alloc([]const u8, 1) catch return error.OutOfMemory;
+                    parts[0] = resolveExprAlias(cx.m, key);
+                    return cx.p.mk(.{ .field = .{ .parts = parts } });
+                }
+                return ast.rebuildExpr(cx.p.arena, node, cx, recur);
+            }
+        };
+        return S.recur(.{ .p = self, .m = map }, e);
+    }
+
     fn stripExpr(self: *Parser, e: *ast.Expr, aliases: *const AliasSet) Error!*ast.Expr {
         const Ctx = struct { p: *Parser, aliases: *const AliasSet };
         const S = struct {
@@ -1683,6 +1860,21 @@ pub const Parser = struct {
                     return self.mk(.{ .bool_lit = false });
                 }
                 if (eqlNoCase(t.text, "case")) return self.parseCaseExpr();
+                if (eqlNoCase(t.text, "extract") and self.peekTag() == .lparen) {
+                    // `EXTRACT(minute FROM ts)` — SQL spells this argument list
+                    // with a keyword instead of a comma; normalise it to the
+                    // ordinary two-argument call the evaluator knows.
+                    _ = self.advance();
+                    _ = self.advance();
+                    const unit = try self.expectColName();
+                    try self.expectKw("from");
+                    const src = try self.parseExpr();
+                    _ = try self.expect(.rparen);
+                    const xargs = try self.arena.alloc(*ast.Expr, 2);
+                    xargs[0] = try self.mk(.{ .str_lit = unit });
+                    xargs[1] = src;
+                    return self.mk(.{ .call = .{ .name = "extract", .args = xargs } });
+                }
                 if (eqlNoCase(t.text, "cast") and self.peekTag() == .lparen) {
                     _ = self.advance();
                     _ = self.advance();

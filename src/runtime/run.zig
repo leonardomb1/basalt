@@ -1020,7 +1020,7 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
     var ad = analyze.Diag{};
     const apl = analyze.aggregatePlan(arena, agg_in.*, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
     const aggs = try arena.alloc(op.Aggregate.Agg, apl.aggs.len);
-    for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty };
+    for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct };
     const out_schema = try schemaPtr(arena, apl.schema);
 
     env.src_name = "csv";
@@ -1147,7 +1147,7 @@ fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.S
     var ad = analyze.Diag{};
     const apl = analyze.aggregatePlan(arena, agg_in.*, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
     const aggs = try arena.alloc(op.Aggregate.Agg, apl.aggs.len);
-    for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty };
+    for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct };
     const out_schema = try schemaPtr(arena, apl.schema);
 
     const sp = (try planSplit(env, desc, stages[0], opts.threads, w)) orelse return false;
@@ -1971,7 +1971,7 @@ fn renderPipeline(env: *Env, body: ast.Pipeline, lr: LoopRow) !ast.Pipeline {
             .select => |items| dst.node = .{ .select = try renderSelect(arena, items, lr) },
             .aggregate => |ag| {
                 const aggs = try arena.alloc(ast.AggItem, ag.aggs.len);
-                for (ag.aggs, 0..) |a, i| aggs[i] = .{ .name = a.name, .func = a.func, .arg = if (a.arg) |e| try renderExpr(arena, e, lr) else null };
+                for (ag.aggs, 0..) |a, i| aggs[i] = .{ .name = a.name, .func = a.func, .arg = if (a.arg) |e| try renderExpr(arena, e, lr) else null, .distinct = a.distinct };
                 dst.node = .{ .aggregate = .{ .aggs = aggs, .by = ag.by } };
             },
             else => {},
@@ -2700,7 +2700,7 @@ fn buildAggregate(env: *Env, ag: ast.Aggregate, schema: types.Schema, child: op.
     var ad = analyze.Diag{};
     const ap = analyze.aggregatePlan(arena, schema, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
     const aggs = try arena.alloc(op.Aggregate.Agg, ap.aggs.len);
-    for (ap.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty };
+    for (ap.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct };
     const out = try schemaPtr(arena, ap.schema);
     const o = try arena.create(op.Aggregate);
     o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .by = ap.by, .aggs = aggs, .out_schema = out, .err = env.errctx, .state = arena, .gpa = env.gpa };

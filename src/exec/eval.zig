@@ -5,6 +5,7 @@
 //! `and`/`or` use the 3VL truth tables; `is null` is total (never null).
 
 const std = @import("std");
+const regex = @import("regex.zig");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const column = @import("column.zig");
@@ -121,11 +122,35 @@ pub const TypeCtx = struct {
             if (c.args.len != 0) return self.err("`today` takes no arguments", .{});
             return Type.init(.date);
         }
+        if (eq(name, "regexp_replace")) {
+            if (c.args.len != 3) return self.err("`regexp_replace` takes (string, pattern, replacement)", .{});
+            // A literal pattern is compiled here so a bad one fails `check`
+            // rather than partway through a run.
+            if (c.args[1].* == .str_lit) {
+                var pbuf: [16 * 1024]u8 = undefined;
+                var pfba = std.heap.FixedBufferAllocator.init(&pbuf);
+                _ = regex.Regex.compile(pfba.allocator(), c.args[1].str_lit) catch
+                    return self.err("invalid regular expression `{s}`", .{c.args[1].str_lit});
+            }
+            const a = try self.argType(c, 0);
+            return Type.init(.string).withNull(a.nullable);
+        }
+    if (eq(name, "date_trunc") or eq(name, "extract")) {
+            if (c.args.len != 2) return self.err("`{s}` takes (unit, timestamp)", .{name});
+            if (c.args[0].* != .str_lit) return self.err("`{s}` needs a literal unit", .{name});
+            if (timeUnit(c.args[0].str_lit) == null)
+                return self.err("unknown time unit `{s}`", .{c.args[0].str_lit});
+            const a = try self.argType(c, 1);
+            if (a.kind != .date and a.kind != .timestamp and !a.unknown)
+                return self.err("`{s}` needs a date or timestamp", .{name});
+            const out: types.TypeKind = if (eq(name, "extract")) .int else .timestamp;
+            return Type.init(out).withNull(a.nullable);
+        }
         if (eq(name, "upper") or eq(name, "lower")) {
             const a = try self.argType(c, 0);
             return Type.init(.string).withNull(a.nullable);
         }
-        if (eq(name, "length")) {
+        if (eq(name, "length") or eq(name, "strlen")) {
             const a = try self.argType(c, 0);
             return Type.init(.int).withNull(a.nullable);
         }
@@ -354,7 +379,7 @@ fn callVec(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Ve
         return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
     }
 
-    if (eq(name, "length")) {
+    if (eq(name, "length") or eq(name, "strlen")) {
         if (c.args.len < 1) return error.Unsupported;
         const s = try strArg(arena, c.args[0], batch);
         const out = try arena.alloc(i64, n);
@@ -1256,6 +1281,36 @@ fn evalCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize
         const days = @divFloor(std.time.microTimestamp(), 86_400_000_000);
         return .{ .date = @intCast(days) };
     }
+    if (eq(name, "regexp_replace")) {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return .null;
+        const pat = try evalRow(arena, c.args[1], batch, row);
+        const rep = try evalRow(arena, c.args[2], batch, row);
+        if (pat.isNull() or rep.isNull()) return .null;
+        var rbuf: [16 * 1024]u8 = undefined;
+        var rfba = std.heap.FixedBufferAllocator.init(&rbuf);
+        const out = regex.replaceFirst(
+            arena,
+            rfba.allocator(),
+            try valueToString(arena, v),
+            try valueToString(arena, pat),
+            try valueToString(arena, rep),
+        ) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.BadPattern => return error.CastFailed,
+        };
+        return .{ .string = out };
+    }
+    if (eq(name, "date_trunc") or eq(name, "extract")) {
+        const v = try evalRow(arena, c.args[1], batch, row);
+        if (v.isNull()) return .null;
+        const us = temporalMicros(v) orelse return error.TypeMismatch;
+        const u = timeUnit(c.args[0].str_lit) orelse return error.TypeMismatch;
+        return if (eq(name, "extract"))
+            Value{ .int = extractField(us, u) }
+        else
+            Value{ .timestamp = truncMicros(us, u) };
+    }
     if (eq(name, "coalesce")) {
         for (c.args) |a| {
             const v = try evalRow(arena, a, batch, row);
@@ -1270,7 +1325,7 @@ fn evalCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize
         for (out) |*ch| ch.* = if (eq(name, "upper")) std.ascii.toUpper(ch.*) else std.ascii.toLower(ch.*);
         return .{ .string = out };
     }
-    if (eq(name, "length")) {
+    if (eq(name, "length") or eq(name, "strlen")) {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
         return .{ .int = @intCast((try valueToString(arena, v)).len) };
@@ -1415,6 +1470,58 @@ pub fn formatTimestamp(arena: std.mem.Allocator, micros: i64) ![]const u8 {
     return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
         @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60,
     });
+}
+
+/// Field selector shared by `extract` and `date_trunc`.
+pub const TimeUnit = enum { year, month, day, hour, minute, second };
+
+pub fn timeUnit(name: []const u8) ?TimeUnit {
+    var buf: [16]u8 = undefined;
+    if (name.len == 0 or name.len >= buf.len) return null;
+    return std.meta.stringToEnum(TimeUnit, std.ascii.lowerString(buf[0..name.len], name));
+}
+
+/// Microseconds since the epoch for a temporal value, so both `date` and
+/// `timestamp` feed the same field arithmetic.
+fn temporalMicros(v: Value) ?i64 {
+    return switch (v) {
+        .timestamp => |x| x,
+        .date => |x| @as(i64, x) * 86_400_000_000,
+        else => null,
+    };
+}
+
+fn truncMicros(us: i64, u: TimeUnit) i64 {
+    const day = @divFloor(us, 86_400_000_000);
+    const rem = us - day * 86_400_000_000;
+    return switch (u) {
+        .second => us - @mod(rem, 1_000_000),
+        .minute => us - @mod(rem, 60_000_000),
+        .hour => us - @mod(rem, 3_600_000_000),
+        .day => day * 86_400_000_000,
+        .month => blk: {
+            const c = civilFromDays(day);
+            break :blk daysFromCivil(c.y, c.m, 1) * 86_400_000_000;
+        },
+        .year => blk: {
+            const c = civilFromDays(day);
+            break :blk daysFromCivil(c.y, 1, 1) * 86_400_000_000;
+        },
+    };
+}
+
+fn extractField(us: i64, u: TimeUnit) i64 {
+    const day = @divFloor(us, 86_400_000_000);
+    const rem = us - day * 86_400_000_000;
+    const c = civilFromDays(day);
+    return switch (u) {
+        .year => c.y,
+        .month => @intCast(c.m),
+        .day => @intCast(c.d),
+        .hour => @divFloor(rem, 3_600_000_000),
+        .minute => @mod(@divFloor(rem, 60_000_000), 60),
+        .second => @mod(@divFloor(rem, 1_000_000), 60),
+    };
 }
 
 /// Day count since the 1970 epoch for a civil date: the inverse of

@@ -93,7 +93,7 @@ fn expandNode(cx: *Ctx, n: ast.Stage.Node) Error!ast.Stage.Node {
         .select => |items| .{ .select = try expandSelect(cx, items) },
         .aggregate => |ag| blk: {
             const aggs = try cx.arena.alloc(ast.AggItem, ag.aggs.len);
-            for (ag.aggs, 0..) |a, i| aggs[i] = .{ .name = a.name, .func = a.func, .arg = if (a.arg) |e| try expandExpr(cx, e, null, 0) else null };
+            for (ag.aggs, 0..) |a, i| aggs[i] = .{ .name = a.name, .func = a.func, .arg = if (a.arg) |e| try expandExpr(cx, e, null, 0) else null, .distinct = a.distinct };
             break :blk .{ .aggregate = .{ .aggs = aggs, .by = ag.by } };
         },
         .union_ => |u| blk: {

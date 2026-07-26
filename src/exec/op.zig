@@ -700,7 +700,7 @@ pub const Aggregate = struct {
     gpa: std.mem.Allocator,
     done: bool = false,
 
-    pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Type };
+    pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Type, distinct: bool = false };
 
     pub const Acc = struct {
         n: i64 = 0,
@@ -708,7 +708,30 @@ pub const Aggregate = struct {
         sum_f: f64 = 0,
         ext: Value = .null,
         has_ext: bool = false,
+        /// Values already counted by a `COUNT(DISTINCT x)`, per group. Only
+        /// allocated for distinct aggs, so ordinary aggregation keeps its
+        /// scalar accumulator.
+        seen: ?*DistinctSet() = null,
     };
+
+    /// Wrapped in a fn for the same reason as `GroupMap` — see its comment.
+    pub fn DistinctSet() type {
+        return std.HashMap([]const Value, void, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
+    }
+
+    fn noteDistinct(alloc: std.mem.Allocator, acc: *Acc, v: Value) !void {
+        const set = acc.seen orelse blk: {
+            const p = try alloc.create(DistinctSet());
+            p.* = DistinctSet().init(alloc);
+            acc.seen = p;
+            break :blk p;
+        };
+        const key = try alloc.alloc(Value, 1);
+        key[0] = try dupeValue(alloc, v);
+        const gop = try set.getOrPut(key);
+        if (!gop.found_existing) gop.key_ptr.* = key;
+        acc.n = @intCast(set.count());
+    }
 
     pub const Group = struct { key_vals: []Value, accs: []Acc };
 
@@ -797,7 +820,14 @@ pub const Aggregate = struct {
     /// min/max string carried over (the source partial's memory may be freed).
     pub fn mergeAcc(dst_alloc: std.mem.Allocator, dst: *Acc, src: Acc, agg: Agg) !void {
         switch (agg.func) {
-            .count => dst.n += src.n,
+            .count => if (agg.distinct) {
+                if (src.seen) |s| {
+                    var it = s.keyIterator();
+                    while (it.next()) |k| try noteDistinct(dst_alloc, dst, k.*[0]);
+                }
+            } else {
+                dst.n += src.n;
+            },
             .sum => {
                 if (agg.ty.kind == .float) dst.sum_f += src.sum_f else dst.sum_i += src.sum_i;
                 dst.n += src.n;
@@ -847,6 +877,8 @@ pub const Aggregate = struct {
     /// The int/float-only constraint depends on the (fixed) schema, so the same
     /// path is taken for every batch of a run.
     fn foldVectorized(self: *Aggregate, arena: std.mem.Allocator, b: Batch, accs: []Acc) anyerror!bool {
+        // A distinct agg needs every value, not a reduction of the batch.
+        for (self.aggs) |agg| if (agg.distinct) return false;
         const partials = try arena.alloc(Partial, self.aggs.len);
         for (self.aggs, partials) |agg, *p| {
             p.* = (try self.reduceBatch(arena, agg, b)) orelse return false;
@@ -974,7 +1006,9 @@ pub const Aggregate = struct {
     fn updateAcc(state: std.mem.Allocator, acc: *Acc, agg: Agg, v: Value, has_arg: bool) !void {
         switch (agg.func) {
             .count => {
-                if (!has_arg or !v.isNull()) acc.n += 1;
+                if (agg.distinct) {
+                    if (!v.isNull()) try noteDistinct(state, acc, v);
+                } else if (!has_arg or !v.isNull()) acc.n += 1;
             },
             .sum => if (!v.isNull()) {
                 if (agg.ty.kind == .float) acc.sum_f += eval.toF64(v) else acc.sum_i += v.int;

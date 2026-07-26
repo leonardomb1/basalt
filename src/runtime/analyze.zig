@@ -128,7 +128,7 @@ pub fn fieldIndices(arena: std.mem.Allocator, in: types.Schema, names: []const a
     return idxs;
 }
 
-pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Type, name: []const u8 };
+pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Type, name: []const u8, distinct: bool = false };
 pub const AggregatePlan = struct { by: []usize, aggs: []Agg, schema: types.Schema };
 
 pub fn aggregatePlan(arena: std.mem.Allocator, in: types.Schema, ag: ast.Aggregate, params: *const ParamMap, diag: *Diag) Error!AggregatePlan {
@@ -143,7 +143,7 @@ pub fn aggregatePlan(arena: std.mem.Allocator, in: types.Schema, ag: ast.Aggrega
     for (ag.aggs, 0..) |item, i| {
         const arg: ?*const ast.Expr = if (item.arg) |a| try substExpr(arena, a, params) else null;
         const ty = try aggResultType(arena, item.func, arg, in, diag);
-        aggs[i] = .{ .func = item.func, .arg = arg, .ty = ty, .name = item.name };
+        aggs[i] = .{ .func = item.func, .arg = arg, .ty = ty, .name = item.name, .distinct = item.distinct };
         try fields.append(.{ .name = item.name, .ty = ty });
     }
     return .{ .by = by, .aggs = aggs, .schema = .{ .fields = try fields.toOwnedSlice() } };
