@@ -841,23 +841,34 @@ pub const Aggregate = struct {
         }
 
         var groups = std.array_list.Managed(Group).init(self.state);
-        var map = GroupMap().init(self.state);
+        var table = try GroupTable.init(self.state, 1024);
+        var store = GroupStore{ .alloc = self.state, .nkeys = self.by.len, .naggs = self.aggs.len };
+        const hctx = keyhash.MultiKeyCtx{};
         while (try self.child.next(pull)) |b| {
             const probe = try pull.alloc(Value, self.by.len);
+            const hashes = try pull.alloc(u64, b.len);
+
+            // Hash the whole batch first, then walk it again to probe: by the
+            // time a row's bucket is read the prefetch has had the rest of the
+            // batch to land.
             var r: usize = 0;
             while (r < b.len) : (r += 1) {
                 for (self.by, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
-                const gop = try map.getOrPut(probe);
-                if (!gop.found_existing) {
-                    const kv = try self.state.alloc(Value, self.by.len);
-                    for (self.by, 0..) |ci, j| kv[j] = try dupeValue(self.state, b.columns[ci].getValue(r));
-                    gop.key_ptr.* = kv;
-                    gop.value_ptr.* = groups.items.len;
-                    const accs = try self.state.alloc(Acc, self.aggs.len);
-                    for (accs) |*a| a.* = .{};
-                    try groups.append(.{ .key_vals = kv, .accs = accs });
+                hashes[r] = hctx.hash(probe);
+            }
+            for (hashes) |h| table.prefetch(h);
+
+            r = 0;
+            while (r < b.len) : (r += 1) {
+                for (self.by, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
+                const at: u32 = @intCast(groups.items.len);
+                const f = try table.getOrPut(hashes[r], probe, groups.items, at);
+                if (!f.found) {
+                    const slot = try store.next();
+                    for (probe, slot.keys) |v, *o| o.* = try dupeValue(self.state, v);
+                    try groups.append(.{ .key_vals = slot.keys, .accs = slot.accs });
                 }
-                const g = &groups.items[gop.value_ptr.*];
+                const g = &groups.items[f.slot];
                 for (self.aggs, 0..) |agg, j| {
                     const v = try self.argValue(pull, agg, b, r);
                     try updateAcc(self.state, &g.accs[j], agg, v, agg.arg != null);
@@ -867,6 +878,105 @@ pub const Aggregate = struct {
         }
         return groups.toOwnedSlice();
     }
+
+    /// Open-addressed group index built for the one access pattern aggregation
+    /// has: hash a batch of keys, then probe them all. Two things it does that a
+    /// general map cannot — it stores each key's hash, so growing never re-hashes
+    /// a key, and it exposes the bucket up front so a batch can prefetch its
+    /// buckets before probing. At high cardinality the probe is a cache miss, and
+    /// hiding that miss is the whole game.
+    const GroupTable = struct {
+        hashes: []u64,
+        slots: []u32,
+        len: usize = 0,
+        mask: u64,
+        alloc: std.mem.Allocator,
+
+        const empty: u64 = 0;
+
+        fn init(alloc: std.mem.Allocator, cap_pow2: usize) !GroupTable {
+            const h = try alloc.alloc(u64, cap_pow2);
+            @memset(h, empty);
+            return .{ .hashes = h, .slots = try alloc.alloc(u32, cap_pow2), .mask = cap_pow2 - 1, .alloc = alloc };
+        }
+
+        /// Hash of zero is the empty marker, so fold it onto a neighbour.
+        fn norm(h: u64) u64 {
+            return if (h == empty) 1 else h;
+        }
+
+        fn prefetch(self: *const GroupTable, h: u64) void {
+            @prefetch(&self.hashes[norm(h) & self.mask], .{ .rw = .read, .locality = 3 });
+        }
+
+        fn grow(self: *GroupTable) !void {
+            const cap = self.hashes.len * 2;
+            const nh = try self.alloc.alloc(u64, cap);
+            @memset(nh, empty);
+            const ns = try self.alloc.alloc(u32, cap);
+            const nmask = cap - 1;
+            for (self.hashes, self.slots) |h, sl| {
+                if (h == empty) continue;
+                var i = h & nmask;
+                while (nh[i] != empty) i = (i + 1) & nmask;
+                nh[i] = h;
+                ns[i] = sl;
+            }
+            self.hashes = nh;
+            self.slots = ns;
+            self.mask = nmask;
+        }
+
+        const Found = struct { slot: u32, found: bool };
+
+        /// Locate `key` (already hashed to `h`), inserting `new_slot` when absent.
+        fn getOrPut(self: *GroupTable, h0: u64, key: []const Value, groups: []const Group, new_slot: u32) !Found {
+            if ((self.len + 1) * 10 >= self.hashes.len * 7) try self.grow();
+            const h = norm(h0);
+            var i = h & self.mask;
+            while (true) : (i = (i + 1) & self.mask) {
+                if (self.hashes[i] == empty) {
+                    self.hashes[i] = h;
+                    self.slots[i] = new_slot;
+                    self.len += 1;
+                    return .{ .slot = new_slot, .found = false };
+                }
+                if (self.hashes[i] != h) continue;
+                const cand = groups[self.slots[i]].key_vals;
+                if (keyhash.MultiKeyCtx.eql(.{}, key, cand)) return .{ .slot = self.slots[i], .found = true };
+            }
+        }
+    };
+
+    /// Block allocator for group keys and accumulators. One allocation per
+    /// `block` groups instead of two per group, and the accumulators of nearby
+    /// groups land next to each other. Blocks are never resized, so the slices
+    /// handed out stay valid.
+    const GroupStore = struct {
+        const block = 8192;
+
+        alloc: std.mem.Allocator,
+        nkeys: usize,
+        naggs: usize,
+        keys: []Value = &.{},
+        accs: []Acc = &.{},
+        used: usize = block,
+
+        const Slot = struct { keys: []Value, accs: []Acc };
+
+        fn next(self: *GroupStore) !Slot {
+            if (self.used == block) {
+                self.keys = try self.alloc.alloc(Value, block * self.nkeys);
+                self.accs = try self.alloc.alloc(Acc, block * self.naggs);
+                self.used = 0;
+            }
+            const i = self.used;
+            self.used += 1;
+            const a = self.accs[i * self.naggs ..][0..self.naggs];
+            for (a) |*x| x.* = .{};
+            return .{ .keys = self.keys[i * self.nkeys ..][0..self.nkeys], .accs = a };
+        }
+    };
 
     /// Combine a partial accumulator `src` into `dst` for one agg — the dual of
     /// `updateAcc`, but folding two partials instead of a row. `dst_alloc` owns any
