@@ -58,7 +58,9 @@ pub const TypeCtx = struct {
             .match => |m| return self.typeOfMatch(m),
             .cast => |c| {
                 const s = try self.typeOf(c.e);
-                return c.ty.withNull(s.nullable);
+                // `try_cast` turns a failed conversion into null, so its result
+                // is nullable even when the input can never be null.
+                return c.ty.withNull(s.nullable or c.safe);
             },
             .is_null => |n| {
                 if (n.kind == .is_empty) {
@@ -136,7 +138,7 @@ pub const TypeCtx = struct {
             const a = try self.argType(c, 0);
             return Type.init(.string).withNull(a.nullable);
         }
-    if (eq(name, "date_trunc") or eq(name, "extract")) {
+        if (eq(name, "date_trunc") or eq(name, "extract")) {
             if (c.args.len != 2) return self.err("`{s}` takes (unit, timestamp)", .{name});
             if (c.args[0].* != .str_lit) return self.err("`{s}` needs a literal unit", .{name});
             if (timeUnit(c.args[0].str_lit) == null)
@@ -193,7 +195,210 @@ pub const TypeCtx = struct {
             _ = try self.argType(c, 2);
             return Type.init(.string).withNull(a.nullable);
         }
+        if (try self.typeOfMathCall(c)) |t| return t;
+        if (try self.typeOfStringCall(c)) |t| return t;
+        if (try self.typeOfDateCall(c)) |t| return t;
         return self.err("unknown function `{s}`", .{name});
+    }
+
+    /// Numeric builtins plus the null-selecting ones (`nullif`, `greatest`,
+    /// `least`). Returns null when `c` names none of them, so `typeOfCall` can
+    /// keep walking its chain. Split out only to keep `typeOfCall` readable.
+    fn typeOfMathCall(self: *TypeCtx, c: ast.Expr.Call) TypeError!?Type {
+        const name = c.name;
+        if (eq(name, "abs")) {
+            if (c.args.len != 1) return self.err("`abs` takes one argument", .{});
+            const a = try self.argType(c, 0);
+            if (!numericish(a)) return self.err("`abs` needs a numeric argument", .{});
+            return a;
+        }
+        if (eq(name, "floor") or eq(name, "ceil")) {
+            if (c.args.len != 1) return self.err("`{s}` takes one argument", .{name});
+            const a = try self.argType(c, 0);
+            if (!numericish(a)) return self.err("`{s}` needs a numeric argument", .{name});
+            // An int is already whole, so it passes through with its type.
+            if (a.unknown or a.kind == .int) return a;
+            return Type.init(.float).withNull(a.nullable);
+        }
+        if (eq(name, "round")) {
+            if (c.args.len != 1 and c.args.len != 2) return self.err("`round` takes (x) or (x, digits)", .{});
+            const a = try self.argType(c, 0);
+            if (!numericish(a)) return self.err("`round` needs a numeric argument", .{});
+            if (c.args.len == 2) {
+                const d = try self.argType(c, 1);
+                if (!numericish(d)) return self.err("`round` digits must be an integer", .{});
+            }
+            if (a.unknown or (a.kind == .int and c.args.len == 1)) return a;
+            return Type.init(.float).withNull(a.nullable);
+        }
+        if (eq(name, "mod")) {
+            if (c.args.len != 2) return self.err("`mod` takes (a, b)", .{});
+            const a = try self.argType(c, 0);
+            const b = try self.argType(c, 1);
+            if (!(a.kind == .int or a.unknown) or !(b.kind == .int or b.unknown))
+                return self.err("`mod` needs integer arguments", .{});
+            // A zero divisor yields null, so the result is always nullable.
+            return Type.init(.int).asNullable();
+        }
+        if (eq(name, "power")) {
+            if (c.args.len != 2) return self.err("`power` takes (base, exponent)", .{});
+            const a = try self.argType(c, 0);
+            const b = try self.argType(c, 1);
+            if (!numericish(a) or !numericish(b)) return self.err("`power` needs numeric arguments", .{});
+            return Type.init(.float).withNull(a.nullable or b.nullable or a.unknown or b.unknown);
+        }
+        if (eq(name, "sqrt")) {
+            if (c.args.len != 1) return self.err("`sqrt` takes one argument", .{});
+            const a = try self.argType(c, 0);
+            if (!numericish(a)) return self.err("`sqrt` needs a numeric argument", .{});
+            // A negative operand is outside the domain and yields null.
+            return Type.init(.float).asNullable();
+        }
+        if (eq(name, "sign")) {
+            if (c.args.len != 1) return self.err("`sign` takes one argument", .{});
+            const a = try self.argType(c, 0);
+            if (!numericish(a)) return self.err("`sign` needs a numeric argument", .{});
+            return Type.init(.int).withNull(a.nullable or a.unknown);
+        }
+        if (eq(name, "nullif")) {
+            if (c.args.len != 2) return self.err("`nullif` takes (a, b)", .{});
+            const a = try self.argType(c, 0);
+            const b = try self.argType(c, 1);
+            if (!comparable(a, b)) return self.err("`nullif` arguments are not comparable", .{});
+            return a.asNullable();
+        }
+        if (eq(name, "greatest") or eq(name, "least")) {
+            if (c.args.len < 2) return self.err("`{s}` needs at least two arguments", .{name});
+            var result: ?Type = null;
+            for (c.args) |a| {
+                const t = try self.typeOf(a);
+                result = if (result) |r|
+                    (Type.unify(r, t) orelse return self.err("`{s}` arguments have incompatible types", .{name}))
+                else
+                    t;
+            }
+            // Null arguments are ignored (Postgres), so the result is null only
+            // when every argument is — hence nullable regardless of the inputs.
+            return result.?.asNullable();
+        }
+        return null;
+    }
+
+    /// Byte-wise string builtins. Like the existing `substr`/`replace` rules
+    /// these do not insist the operand is already a string — `valueToString`
+    /// renders whatever arrives — they only fix arity and the result type.
+    fn typeOfStringCall(self: *TypeCtx, c: ast.Expr.Call) TypeError!?Type {
+        const name = c.name;
+        if (eq(name, "lpad") or eq(name, "rpad")) {
+            if (c.args.len != 2 and c.args.len != 3) return self.err("`{s}` takes (string, length[, fill])", .{name});
+            const a = try self.argType(c, 0);
+            _ = try self.argType(c, 1);
+            if (c.args.len > 2) _ = try self.argType(c, 2);
+            return Type.init(.string).withNull(a.nullable);
+        }
+        if (eq(name, "left") or eq(name, "right")) {
+            if (c.args.len != 2) return self.err("`{s}` takes (string, n)", .{name});
+            const a = try self.argType(c, 0);
+            _ = try self.argType(c, 1);
+            return Type.init(.string).withNull(a.nullable);
+        }
+        if (eq(name, "split_part")) {
+            if (c.args.len != 3) return self.err("`split_part` takes (string, delimiter, n)", .{});
+            _ = try self.argType(c, 0);
+            _ = try self.argType(c, 1);
+            _ = try self.argType(c, 2);
+            // An empty delimiter yields null, so this is nullable either way.
+            return Type.init(.string).asNullable();
+        }
+        if (eq(name, "strpos")) {
+            if (c.args.len != 2) return self.err("`strpos` takes (string, substring)", .{});
+            const a = try self.argType(c, 0);
+            const b = try self.argType(c, 1);
+            return Type.init(.int).withNull(a.nullable or b.nullable);
+        }
+        if (eq(name, "repeat")) {
+            if (c.args.len != 2) return self.err("`repeat` takes (string, n)", .{});
+            const a = try self.argType(c, 0);
+            _ = try self.argType(c, 1);
+            return Type.init(.string).withNull(a.nullable);
+        }
+        if (eq(name, "reverse")) {
+            if (c.args.len != 1) return self.err("`reverse` takes one argument", .{});
+            const a = try self.argType(c, 0);
+            return Type.init(.string).withNull(a.nullable);
+        }
+        return null;
+    }
+
+    fn typeOfDateCall(self: *TypeCtx, c: ast.Expr.Call) TypeError!?Type {
+        const name = c.name;
+        if (eq(name, "date_add")) {
+            if (c.args.len != 3) return self.err("`date_add` takes (unit, n, timestamp)", .{});
+            if (c.args[0].* != .str_lit) return self.err("`date_add` needs a literal unit", .{});
+            const u = timeUnit(c.args[0].str_lit) orelse
+                return self.err("unknown time unit `{s}`", .{c.args[0].str_lit});
+            const nt = try self.argType(c, 1);
+            if (!numericish(nt)) return self.err("`date_add` needs an integer amount", .{});
+            const a = try self.argType(c, 2);
+            if (a.unknown) return a;
+            const nn = a.nullable or nt.nullable or nt.unknown;
+            if (a.kind == .date) {
+                // A DATE has no time of day, so sub-day units have nowhere to go.
+                if (u == .hour or u == .minute or u == .second)
+                    return self.err("`date_add` cannot add `{s}` to a date; cast it to a timestamp first", .{c.args[0].str_lit});
+                return Type.init(.date).withNull(nn);
+            }
+            if (a.kind != .timestamp) return self.err("`date_add` needs a date or timestamp", .{});
+            return Type.init(.timestamp).withNull(nn);
+        }
+        if (eq(name, "date_diff")) {
+            if (c.args.len != 3) return self.err("`date_diff` takes (unit, start, end)", .{});
+            if (c.args[0].* != .str_lit) return self.err("`date_diff` needs a literal unit", .{});
+            if (timeUnit(c.args[0].str_lit) == null)
+                return self.err("unknown time unit `{s}`", .{c.args[0].str_lit});
+            const a = try self.argType(c, 1);
+            const b = try self.argType(c, 2);
+            if (!temporalish(a) or !temporalish(b))
+                return self.err("`date_diff` needs date or timestamp arguments", .{});
+            return Type.init(.int).withNull(a.nullable or b.nullable or a.unknown or b.unknown);
+        }
+        if (eq(name, "make_date")) {
+            if (c.args.len != 3) return self.err("`make_date` takes (year, month, day)", .{});
+            var nn = false;
+            for (c.args) |a| {
+                const t = try self.typeOf(a);
+                if (!numericish(t)) return self.err("`make_date` needs integer arguments", .{});
+                nn = nn or t.nullable or t.unknown;
+            }
+            return Type.init(.date).withNull(nn);
+        }
+        if (eq(name, "epoch")) {
+            if (c.args.len != 1) return self.err("`epoch` takes one argument", .{});
+            const a = try self.argType(c, 0);
+            if (!temporalish(a)) return self.err("`epoch` needs a date or timestamp", .{});
+            return Type.init(.int).withNull(a.nullable);
+        }
+        if (eq(name, "to_timestamp")) {
+            if (c.args.len != 1) return self.err("`to_timestamp` takes one argument", .{});
+            const a = try self.argType(c, 0);
+            if (!numericish(a)) return self.err("`to_timestamp` needs a numeric argument", .{});
+            return Type.init(.timestamp).withNull(a.nullable);
+        }
+        if (eq(name, "strftime")) {
+            if (c.args.len != 2) return self.err("`strftime` takes (timestamp, format)", .{});
+            const a = try self.argType(c, 0);
+            if (!temporalish(a)) return self.err("`strftime` needs a date or timestamp", .{});
+            const f = try self.argType(c, 1);
+            // A literal format is validated here so an unsupported directive
+            // fails `check` rather than partway through a run — the same
+            // treatment `regexp_replace` gives a literal pattern.
+            if (c.args[1].* == .str_lit) {
+                if (badStrftime(c.args[1].str_lit)) |bad|
+                    return self.err("`strftime` does not support `%{s}` (supported: %Y %m %d %H %M %S %y %%)", .{bad});
+            }
+            return Type.init(.string).withNull(a.nullable or f.nullable);
+        }
+        return null;
     }
 
     fn typeOfMatch(self: *TypeCtx, m: ast.Match) TypeError!Type {
@@ -236,6 +441,9 @@ fn numericish(t: Type) bool {
 }
 fn boolish(t: Type) bool {
     return t.kind == .bool or t.unknown;
+}
+fn temporalish(t: Type) bool {
+    return t.kind == .date or t.kind == .timestamp or t.unknown;
 }
 fn comparable(a: Type, b: Type) bool {
     if (a.unknown or b.unknown) return true;
@@ -775,6 +983,9 @@ fn boolOpVec(arena: std.mem.Allocator, op: ast.BinOp, le: *const ast.Expr, re: *
 }
 
 fn castVec(arena: std.mem.Allocator, c: ast.Expr.Cast, batch: Batch) VecError!Vec {
+    // `try_cast` needs per-row null-on-failure, but the vectorized cast fails
+    // the whole column at the first bad value — hand it to the rowwise path.
+    if (c.safe) return error.Unsupported;
     const v = try evalVec(arena, c.e, batch);
     const target = c.ty.kind;
     if (target == .decimal) return error.Unsupported;
@@ -1171,7 +1382,13 @@ pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, ro
         .cast => |c| {
             const v = try evalRow(arena, c.e, batch, row);
             if (v.isNull()) return .null;
-            return castValueTyped(arena, v, c.ty);
+            if (!c.safe) return castValueTyped(arena, v, c.ty);
+            // `try_cast`: a failed conversion is a null, not an error.
+            const out: Value = castValueTyped(arena, v, c.ty) catch |e| {
+                if (e == error.CastFailed) return .null;
+                return e;
+            };
+            return out;
         },
         .match => |m| return evalMatch(arena, m, batch, row),
         .call => |c| return evalCall(arena, c, batch, row),
@@ -1387,7 +1604,252 @@ fn evalCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize
         _ = std.mem.replace(u8, s, from, to, out);
         return .{ .string = out };
     }
+    if (try evalMathCall(arena, c, batch, row)) |v| return v;
+    if (try evalStringCall(arena, c, batch, row)) |v| return v;
+    if (try evalDateCall(arena, c, batch, row)) |v| return v;
     return error.TypeMismatch;
+}
+
+/// SQL null as a `Value`. The builtin helpers below return `?Value`, where a
+/// bare `null` means "not my function, keep dispatching" — this names the other
+/// null so the two can't be confused at a glance.
+const sql_null: Value = .null;
+
+/// 1 MiB ceiling on a single generated string (`repeat`, `lpad`/`rpad`), so
+/// `repeat(x, 1000000000)` is a clean error instead of an OOM or a stall.
+const max_str_bytes = 1 << 20;
+
+/// Numeric and null-selecting builtins. Null in → null out throughout; a
+/// non-match returns null so `evalCall` can keep dispatching.
+fn evalMathCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!?Value {
+    const name = c.name;
+    if (eq(name, "abs")) {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return sql_null;
+        switch (v) {
+            // `-minInt(i64)` has no i64 representation; refuse rather than wrap.
+            .int => |x| {
+                if (x == std.math.minInt(i64)) return error.CastFailed;
+                return Value{ .int = if (x < 0) -x else x };
+            },
+            .float => |x| return Value{ .float = @abs(x) },
+            .decimal => |d| return Value{ .decimal = .{
+                .unscaled = if (d.unscaled < 0) -d.unscaled else d.unscaled,
+                .scale = d.scale,
+            } },
+            else => return error.TypeMismatch,
+        }
+    }
+    if (eq(name, "floor") or eq(name, "ceil")) {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return sql_null;
+        if (v == .int) return v;
+        if (!isNum(v)) return error.TypeMismatch;
+        const x = toF64(v);
+        return Value{ .float = if (eq(name, "floor")) @floor(x) else @ceil(x) };
+    }
+    if (eq(name, "round")) {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return sql_null;
+        if (!isNum(v)) return error.TypeMismatch;
+        var digits: i64 = 0;
+        if (c.args.len > 1) {
+            const dv = try evalRow(arena, c.args[1], batch, row);
+            if (dv.isNull()) return sql_null;
+            digits = toI64(dv);
+        }
+        if (v == .int and c.args.len == 1) return v;
+        return Value{ .float = roundHalfAway(toF64(v), digits) };
+    }
+    if (eq(name, "mod")) {
+        const a = try evalRow(arena, c.args[0], batch, row);
+        const b = try evalRow(arena, c.args[1], batch, row);
+        if (a.isNull() or b.isNull()) return sql_null;
+        const d = toI64(b);
+        // `mod` is the guarded spelling of `%`: a zero divisor is null here,
+        // where the operator raises DivByZero. Never a crash either way.
+        if (d == 0) return sql_null;
+        // `@rem(minInt, -1)` overflows; the answer is 0 by definition.
+        if (d == -1) return Value{ .int = 0 };
+        // @rem (not @mod) so the result takes the sign of the dividend, as SQL wants.
+        return Value{ .int = @rem(toI64(a), d) };
+    }
+    if (eq(name, "power")) {
+        const a = try evalRow(arena, c.args[0], batch, row);
+        const b = try evalRow(arena, c.args[1], batch, row);
+        if (a.isNull() or b.isNull()) return sql_null;
+        return Value{ .float = std.math.pow(f64, toF64(a), toF64(b)) };
+    }
+    if (eq(name, "sqrt")) {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return sql_null;
+        const x = toF64(v);
+        if (x < 0) return sql_null;
+        return Value{ .float = @sqrt(x) };
+    }
+    if (eq(name, "sign")) {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return sql_null;
+        const x = toF64(v);
+        return Value{ .int = if (x > 0) @as(i64, 1) else if (x < 0) @as(i64, -1) else @as(i64, 0) };
+    }
+    if (eq(name, "nullif")) {
+        const a = try evalRow(arena, c.args[0], batch, row);
+        if (a.isNull()) return sql_null;
+        const b = try evalRow(arena, c.args[1], batch, row);
+        // `a = b` is unknown against a null `b`, so `a` comes back (Postgres).
+        if (b.isNull()) return a;
+        if (compareValues(a, b)) |ord| {
+            if (ord == .eq) return sql_null;
+        }
+        return a;
+    }
+    if (eq(name, "greatest") or eq(name, "least")) {
+        // Postgres semantics: null arguments are IGNORED (unlike the
+        // null-propagating arithmetic above); all-null yields null.
+        const want_gt = eq(name, "greatest");
+        var best: Value = .null;
+        for (c.args) |ae| {
+            const v = try evalRow(arena, ae, batch, row);
+            if (v.isNull()) continue;
+            if (best.isNull()) {
+                best = v;
+                continue;
+            }
+            const ord = compareValues(best, v) orelse return error.TypeMismatch;
+            if (if (want_gt) ord == .lt else ord == .gt) best = v;
+        }
+        return best;
+    }
+    return null;
+}
+
+fn evalStringCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!?Value {
+    const name = c.name;
+    if (eq(name, "lpad") or eq(name, "rpad")) {
+        const sv = try evalRow(arena, c.args[0], batch, row);
+        if (sv.isNull()) return sql_null;
+        const nv = try evalRow(arena, c.args[1], batch, row);
+        if (nv.isNull()) return sql_null;
+        var fill: []const u8 = " ";
+        if (c.args.len > 2) {
+            const fv = try evalRow(arena, c.args[2], batch, row);
+            if (fv.isNull()) return sql_null;
+            fill = try valueToString(arena, fv);
+        }
+        const s = try valueToString(arena, sv);
+        return Value{ .string = try padBytes(arena, s, toI64(nv), fill, eq(name, "lpad")) };
+    }
+    if (eq(name, "left") or eq(name, "right")) {
+        const sv = try evalRow(arena, c.args[0], batch, row);
+        if (sv.isNull()) return sql_null;
+        const nv = try evalRow(arena, c.args[1], batch, row);
+        if (nv.isNull()) return sql_null;
+        const s = try valueToString(arena, sv);
+        return Value{ .string = try arena.dupe(u8, endSlice(s, toI64(nv), eq(name, "left"))) };
+    }
+    if (eq(name, "split_part")) {
+        const sv = try evalRow(arena, c.args[0], batch, row);
+        const dv = try evalRow(arena, c.args[1], batch, row);
+        const nv = try evalRow(arena, c.args[2], batch, row);
+        if (sv.isNull() or dv.isNull() or nv.isNull()) return sql_null;
+        const delim = try valueToString(arena, dv);
+        // An empty delimiter splits into nothing meaningful — null, not a guess.
+        if (delim.len == 0) return sql_null;
+        const want = toI64(nv);
+        if (want < 1) return Value{ .string = "" };
+        var it = std.mem.splitSequence(u8, try valueToString(arena, sv), delim);
+        var k: i64 = 0;
+        while (it.next()) |part| {
+            k += 1;
+            if (k == want) return Value{ .string = try arena.dupe(u8, part) };
+        }
+        return Value{ .string = "" };
+    }
+    if (eq(name, "strpos")) {
+        const sv = try evalRow(arena, c.args[0], batch, row);
+        const pv = try evalRow(arena, c.args[1], batch, row);
+        if (sv.isNull() or pv.isNull()) return sql_null;
+        const s = try valueToString(arena, sv);
+        const sub = try valueToString(arena, pv);
+        if (sub.len == 0) return Value{ .int = 1 };
+        const at = std.mem.indexOf(u8, s, sub) orelse return Value{ .int = 0 };
+        return Value{ .int = @as(i64, @intCast(at)) + 1 };
+    }
+    if (eq(name, "repeat")) {
+        const sv = try evalRow(arena, c.args[0], batch, row);
+        if (sv.isNull()) return sql_null;
+        const nv = try evalRow(arena, c.args[1], batch, row);
+        if (nv.isNull()) return sql_null;
+        const n = toI64(nv);
+        if (n <= 0) return Value{ .string = "" };
+        const s = try valueToString(arena, sv);
+        const total = @as(u128, @intCast(n)) * @as(u128, s.len);
+        if (total > max_str_bytes) return error.CastFailed;
+        const out = try arena.alloc(u8, @intCast(total));
+        var i: usize = 0;
+        while (i < out.len) : (i += s.len) @memcpy(out[i..][0..s.len], s);
+        return Value{ .string = out };
+    }
+    if (eq(name, "reverse")) {
+        const sv = try evalRow(arena, c.args[0], batch, row);
+        if (sv.isNull()) return sql_null;
+        const s = try valueToString(arena, sv);
+        const out = try arena.alloc(u8, s.len);
+        for (s, 0..) |ch, i| out[s.len - 1 - i] = ch;
+        return Value{ .string = out };
+    }
+    return null;
+}
+
+fn evalDateCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!?Value {
+    const name = c.name;
+    if (eq(name, "date_add") or eq(name, "date_diff")) {
+        if (c.args[0].* != .str_lit) return error.TypeMismatch;
+        const u = timeUnit(c.args[0].str_lit) orelse return error.TypeMismatch;
+        const a = try evalRow(arena, c.args[1], batch, row);
+        const b = try evalRow(arena, c.args[2], batch, row);
+        if (a.isNull() or b.isNull()) return sql_null;
+        if (eq(name, "date_add")) return try addUnits(b, u, toI64(a));
+        const a_us = temporalMicros(a) orelse return error.TypeMismatch;
+        const b_us = temporalMicros(b) orelse return error.TypeMismatch;
+        return Value{ .int = dateDiff(a_us, b_us, u) };
+    }
+    if (eq(name, "make_date")) {
+        const yv = try evalRow(arena, c.args[0], batch, row);
+        const mv = try evalRow(arena, c.args[1], batch, row);
+        const dv = try evalRow(arena, c.args[2], batch, row);
+        if (yv.isNull() or mv.isNull() or dv.isNull()) return sql_null;
+        const y = toI64(yv);
+        const m = toI64(mv);
+        const d = toI64(dv);
+        // Fail loud on an impossible date, matching CAST's posture. Wrap the
+        // call in `try_cast`-style validity checks upstream if null is wanted.
+        if (m < 1 or m > 12) return error.CastFailed;
+        if (d < 1 or d > daysInMonth(y, @intCast(m))) return error.CastFailed;
+        const days = daysFromCivil(y, @intCast(m), @intCast(d));
+        return Value{ .date = std.math.cast(i32, days) orelse return error.CastFailed };
+    }
+    if (eq(name, "epoch")) {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return sql_null;
+        const us = temporalMicros(v) orelse return error.TypeMismatch;
+        return Value{ .int = @divFloor(us, 1_000_000) };
+    }
+    if (eq(name, "to_timestamp")) {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return sql_null;
+        return Value{ .timestamp = try mulI64(toI64(v), 1_000_000) };
+    }
+    if (eq(name, "strftime")) {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return sql_null;
+        const fv = try evalRow(arena, c.args[1], batch, row);
+        if (fv.isNull()) return sql_null;
+        const us = temporalMicros(v) orelse return error.TypeMismatch;
+        return Value{ .string = try strftimeFmt(arena, us, try valueToString(arena, fv)) };
+    }
+    return null;
 }
 
 /// Cast honouring the target's scale. `castValue` only sees a `TypeKind`, which
@@ -1570,6 +2032,144 @@ fn extractField(us: i64, u: TimeUnit) i64 {
     };
 }
 
+/// Checked i64 arithmetic for the date builtins — an absurd `n` in
+/// `date_add`/`to_timestamp` becomes a clean error instead of a wrap panic.
+fn mulI64(a: i64, b: i64) EvalError!i64 {
+    return std.math.mul(i64, a, b) catch return error.CastFailed;
+}
+fn addI64(a: i64, b: i64) EvalError!i64 {
+    return std.math.add(i64, a, b) catch return error.CastFailed;
+}
+
+fn isLeapYear(y: i64) bool {
+    return @mod(y, 4) == 0 and (@mod(y, 100) != 0 or @mod(y, 400) == 0);
+}
+
+fn daysInMonth(y: i64, m: u32) u32 {
+    const lens = [_]u32{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (m == 2 and isLeapYear(y)) return 29;
+    return lens[m - 1];
+}
+
+/// Add `n` CALENDAR months to a day count, clamping the day-of-month to the
+/// target month's length: 2024-01-31 plus one month is 2024-02-29, and plus
+/// one more is 2024-03-29 (the clamp is not remembered, matching Postgres).
+fn addMonthsToDays(days: i64, n: i64) i64 {
+    const c = civilFromDays(days);
+    const total = c.y * 12 + @as(i64, c.m) - 1 + n;
+    const y = @divFloor(total, 12);
+    const m: u32 = @intCast(@mod(total, 12) + 1);
+    return daysFromCivil(y, m, @min(c.d, daysInMonth(y, m)));
+}
+
+/// `date_add(unit, n, ts)` for one temporal value. A DATE only accepts day and
+/// coarser units (the type-checker rejects the rest); a TIMESTAMP accepts all
+/// six, and month/year steps preserve the time of day.
+fn addUnits(v: Value, u: TimeUnit, n: i64) EvalError!Value {
+    switch (v) {
+        .date => |d0| {
+            const days: i64 = d0;
+            const nd = switch (u) {
+                .year => addMonthsToDays(days, try mulI64(n, 12)),
+                .month => addMonthsToDays(days, n),
+                .day => try addI64(days, n),
+                .hour, .minute, .second => return error.TypeMismatch,
+            };
+            return .{ .date = std.math.cast(i32, nd) orelse return error.CastFailed };
+        },
+        .timestamp => |us| {
+            const out: i64 = switch (u) {
+                .year, .month => blk: {
+                    const day = @divFloor(us, 86_400_000_000);
+                    const rem = us - day * 86_400_000_000;
+                    const months = if (u == .year) try mulI64(n, 12) else n;
+                    const shifted = try mulI64(addMonthsToDays(day, months), 86_400_000_000);
+                    break :blk try addI64(shifted, rem);
+                },
+                .day => try addI64(us, try mulI64(n, 86_400_000_000)),
+                .hour => try addI64(us, try mulI64(n, 3_600_000_000)),
+                .minute => try addI64(us, try mulI64(n, 60_000_000)),
+                .second => try addI64(us, try mulI64(n, 1_000_000)),
+            };
+            return .{ .timestamp = out };
+        },
+        else => return error.TypeMismatch,
+    }
+}
+
+/// `date_diff(unit, a, b)` with DuckDB's semantics, chosen because it is the
+/// one definition that does not depend on the time of day for calendar units:
+/// `year`/`month` count the unit BOUNDARIES crossed, computed from the civil
+/// components — so 2023-12-31 → 2024-01-01 is one year, and one month — while
+/// `day` and finer are the exact elapsed difference divided by the unit and
+/// truncated toward zero. (Postgres' `age`-style "complete units" would make
+/// that same pair zero years; we deliberately do not use it.)
+fn dateDiff(a_us: i64, b_us: i64, u: TimeUnit) i64 {
+    switch (u) {
+        .year, .month => {
+            const ca = civilFromDays(@divFloor(a_us, 86_400_000_000));
+            const cb = civilFromDays(@divFloor(b_us, 86_400_000_000));
+            if (u == .year) return cb.y - ca.y;
+            return (cb.y * 12 + @as(i64, cb.m)) - (ca.y * 12 + @as(i64, ca.m));
+        },
+        .day => return @divTrunc(b_us - a_us, 86_400_000_000),
+        .hour => return @divTrunc(b_us - a_us, 3_600_000_000),
+        .minute => return @divTrunc(b_us - a_us, 60_000_000),
+        .second => return @divTrunc(b_us - a_us, 1_000_000),
+    }
+}
+
+/// The first unsupported `%` directive in `fmt` (as a one-byte slice), or null
+/// when every directive is one `strftimeFmt` understands. Used at check time on
+/// a literal format so a typo fails the plan, not the run.
+fn badStrftime(fmt: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < fmt.len) : (i += 1) {
+        if (fmt[i] != '%') continue;
+        i += 1;
+        if (i >= fmt.len) return fmt[fmt.len - 1 ..];
+        switch (fmt[i]) {
+            'Y', 'y', 'm', 'd', 'H', 'M', 'S', '%' => {},
+            else => return fmt[i .. i + 1],
+        }
+    }
+    return null;
+}
+
+/// `strftime` over exactly `%Y %m %d %H %M %S %y %%`. Any other directive is an
+/// error, never a silent passthrough — a literal format is already rejected at
+/// check time, so this only fires for a format computed at run time.
+fn strftimeFmt(arena: std.mem.Allocator, us: i64, fmt: []const u8) EvalError![]const u8 {
+    const day = @divFloor(us, 86_400_000_000);
+    const rem: u64 = @intCast(us - day * 86_400_000_000);
+    const secs = rem / 1_000_000;
+    const c = civilFromDays(day);
+    const year: u32 = if (c.y < 0) 0 else @intCast(c.y);
+    var out = std.array_list.Managed(u8).init(arena);
+    const w = out.writer();
+    var i: usize = 0;
+    while (i < fmt.len) : (i += 1) {
+        if (fmt[i] != '%') {
+            try out.append(fmt[i]);
+            continue;
+        }
+        i += 1;
+        if (i >= fmt.len) return error.CastFailed;
+        switch (fmt[i]) {
+            'Y' => try w.print("{d:0>4}", .{year}),
+            'y' => try w.print("{d:0>2}", .{year % 100}),
+            'm' => try w.print("{d:0>2}", .{c.m}),
+            'd' => try w.print("{d:0>2}", .{c.d}),
+            'H' => try w.print("{d:0>2}", .{secs / 3600}),
+            'M' => try w.print("{d:0>2}", .{(secs % 3600) / 60}),
+            'S' => try w.print("{d:0>2}", .{secs % 60}),
+            '%' => try out.append('%'),
+            else => return error.CastFailed,
+        }
+    }
+    return try out.toOwnedSlice();
+}
+
 /// Day count since the 1970 epoch for a civil date: the inverse of
 /// `civilFromDays` (Howard Hinnant's algorithm).
 pub fn daysFromCivil(y0: i64, m: u32, d: u32) i64 {
@@ -1740,6 +2340,48 @@ fn substrBytes(arena: std.mem.Allocator, s: []const u8, start1: i64, len_opt: ?i
         end = @min(start + @as(usize, @intCast(l)), s.len);
     }
     return arena.dupe(u8, s[start..end]);
+}
+
+/// `round` rounds HALF AWAY FROM ZERO (`@round`) — 2.5 → 3, -2.5 → -3 — which
+/// is the SQL-standard / Postgres / SQL Server rule. It is deliberately NOT the
+/// banker's rounding some engines (DuckDB, and IEEE `rint`) use for floats.
+/// Because engines disagree, `round` is kept OUT of the pushdown whitelist in
+/// `runtime/pushdown.zig`: the engine must compute it locally so the answer
+/// cannot change depending on where the query happened to run.
+fn roundHalfAway(x: f64, digits: i64) f64 {
+    if (digits == 0) return @round(x);
+    // 10^22 is the last power of ten f64 holds exactly; past it the scaling
+    // step is meaningless anyway, so clamp rather than drift.
+    const s = pow10f(@intCast(@min(@abs(digits), 22)));
+    return if (digits > 0) @round(x * s) / s else @round(x / s) * s;
+}
+
+/// Postgres `lpad`/`rpad`: pad `s` with repetitions of `fill` out to exactly
+/// `n` bytes, TRUNCATING to the first `n` bytes when `s` is already longer. An
+/// empty `fill` cannot pad, so a short `s` comes back unchanged.
+fn padBytes(arena: std.mem.Allocator, s: []const u8, n: i64, fill: []const u8, left: bool) ![]const u8 {
+    if (n <= 0) return "";
+    const want: usize = @intCast(n);
+    if (want > max_str_bytes) return error.CastFailed;
+    if (s.len >= want) return arena.dupe(u8, s[0..want]);
+    if (fill.len == 0) return arena.dupe(u8, s);
+    const out = try arena.alloc(u8, want);
+    const pad = want - s.len;
+    var i: usize = 0;
+    while (i < pad) : (i += 1) out[if (left) i else s.len + i] = fill[i % fill.len];
+    @memcpy(if (left) out[pad..] else out[0..s.len], s);
+    return out;
+}
+
+/// Postgres `left`/`right`: a NEGATIVE `n` means "all but the last/first |n|
+/// bytes" rather than clamping to empty, so `left(s, -2)` drops the last two.
+fn endSlice(s: []const u8, n: i64, left: bool) []const u8 {
+    const slen: i64 = @intCast(s.len);
+    var take: i64 = if (n >= 0) n else slen + n;
+    if (take < 0) take = 0;
+    if (take > slen) take = slen;
+    const k: usize = @intCast(take);
+    return if (left) s[0..k] else s[s.len - k ..];
 }
 
 /// SQL `LIKE`: `%` matches any run (including empty), `_` matches one byte.
@@ -2042,4 +2684,187 @@ test "evalColumn over an empty batch yields an empty column" {
     var plus = ast.Expr{ .binary = .{ .op = .add, .l = &fx, .r = &one } };
     const out = try evalColumn(a, &plus, batch, Type.init(.int));
     try std.testing.expectEqual(@as(usize, 0), out.len);
+}
+
+/// Parse and fold a constant expression — the shortest path to a builtin's
+/// row-wise semantics, since `constEval` runs the same `evalRow` the batch
+/// evaluator falls back to.
+fn evalLit(a: std.mem.Allocator, src: []const u8) !Value {
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const e = try parser.parseExprStr(a, src, &diag);
+    return constEval(a, e, &[_][]const u8{}, &[_]Value{});
+}
+
+test "math builtins: rounding direction, guarded mod, domain edges" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    try std.testing.expectEqual(@as(i64, 7), (try evalLit(a, "abs(-7)")).int);
+    try std.testing.expectEqual(@as(f64, 2.5), (try evalLit(a, "abs(-2.5)")).float);
+    try std.testing.expect((try evalLit(a, "abs(null)")).isNull());
+
+    // An int is already whole: floor/ceil/round hand it straight back.
+    try std.testing.expectEqual(@as(i64, 5), (try evalLit(a, "floor(5)")).int);
+    try std.testing.expectEqual(@as(i64, 5), (try evalLit(a, "round(5)")).int);
+    try std.testing.expectEqual(@as(f64, 2.0), (try evalLit(a, "floor(2.7)")).float);
+    try std.testing.expectEqual(@as(f64, 3.0), (try evalLit(a, "ceil(2.1)")).float);
+
+    // Half away from zero, both signs — not banker's rounding.
+    try std.testing.expectEqual(@as(f64, 3.0), (try evalLit(a, "round(2.5)")).float);
+    try std.testing.expectEqual(@as(f64, -3.0), (try evalLit(a, "round(-2.5)")).float);
+    try std.testing.expectEqual(@as(f64, 2.13), (try evalLit(a, "round(2.125, 2)")).float);
+
+    try std.testing.expectEqual(@as(i64, 1), (try evalLit(a, "mod(7, 3)")).int);
+    // @rem semantics: the remainder takes the sign of the dividend.
+    try std.testing.expectEqual(@as(i64, -1), (try evalLit(a, "mod(-7, 3)")).int);
+    try std.testing.expect((try evalLit(a, "mod(7, 0)")).isNull());
+
+    try std.testing.expectEqual(@as(f64, 8.0), (try evalLit(a, "power(2, 3)")).float);
+    try std.testing.expectEqual(@as(f64, 3.0), (try evalLit(a, "sqrt(9)")).float);
+    try std.testing.expect((try evalLit(a, "sqrt(-1)")).isNull());
+
+    try std.testing.expectEqual(@as(i64, -1), (try evalLit(a, "sign(-0.5)")).int);
+    try std.testing.expectEqual(@as(i64, 0), (try evalLit(a, "sign(0)")).int);
+    try std.testing.expectEqual(@as(i64, 1), (try evalLit(a, "sign(42)")).int);
+}
+
+test "nullif propagates nulls; greatest/least ignore them" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    try std.testing.expect((try evalLit(a, "nullif(3, 3)")).isNull());
+    try std.testing.expectEqual(@as(i64, 3), (try evalLit(a, "nullif(3, 4)")).int);
+    // `3 = null` is unknown, not true, so `a` survives.
+    try std.testing.expectEqual(@as(i64, 3), (try evalLit(a, "nullif(3, null)")).int);
+    try std.testing.expect((try evalLit(a, "nullif(null, 3)")).isNull());
+
+    try std.testing.expectEqual(@as(i64, 9), (try evalLit(a, "greatest(1, 9, 4)")).int);
+    try std.testing.expectEqual(@as(i64, 1), (try evalLit(a, "least(1, 9, 4)")).int);
+    try std.testing.expectEqual(@as(i64, 9), (try evalLit(a, "greatest(null, 9)")).int);
+    try std.testing.expectEqual(@as(i64, 9), (try evalLit(a, "least(null, 9)")).int);
+    try std.testing.expect((try evalLit(a, "least(null, null)")).isNull());
+    try std.testing.expectEqualStrings("pear", (try evalLit(a, "greatest('apple', 'pear')")).string);
+}
+
+test "try_cast yields null exactly where cast raises" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    try std.testing.expectEqual(@as(i64, 3), (try evalLit(a, "try_cast('3' as int)")).int);
+    try std.testing.expect((try evalLit(a, "try_cast('x' as int)")).isNull());
+    try std.testing.expectError(error.CastFailed, evalLit(a, "cast('x' as int)"));
+
+    // A safe cast is nullable even over a non-nullable input, and the column
+    // path must agree with it (the vectorized cast bails out to rowwise).
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const e = try parser.parseExprStr(a, "try_cast(s as int)", &diag);
+    const schema = types.Schema{ .fields = &.{.{ .name = "s", .ty = Type.init(.string) }} };
+    var ctx = TypeCtx{ .schema = schema, .arena = a };
+    const ty = try ctx.typeOf(e);
+    try std.testing.expectEqual(types.TypeKind.int, ty.kind);
+    try std.testing.expect(ty.nullable);
+
+    var sb = column.Builder.init(a, Type.init(.string));
+    try sb.append(.{ .string = "3" });
+    try sb.append(.{ .string = "x" });
+    var cols = [_]column.Column{try sb.finish()};
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 2 };
+    const out = try evalColumn(a, e, batch, ty);
+    try std.testing.expectEqual(@as(i64, 3), out.getValue(0).int);
+    try std.testing.expect(out.getValue(1).isNull());
+}
+
+test "string builtins: padding truncates, ends take negatives, split_part clamps" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    try std.testing.expectEqualStrings("00042", (try evalLit(a, "lpad('42', 5, '0')")).string);
+    try std.testing.expectEqualStrings("42   ", (try evalLit(a, "rpad('42', 5)")).string);
+    // n shorter than the input truncates rather than padding (Postgres).
+    try std.testing.expectEqualStrings("abc", (try evalLit(a, "lpad('abcdef', 3)")).string);
+    try std.testing.expectEqualStrings("abc", (try evalLit(a, "rpad('abcdef', 3)")).string);
+
+    try std.testing.expectEqualStrings("ab", (try evalLit(a, "left('abcde', 2)")).string);
+    try std.testing.expectEqualStrings("de", (try evalLit(a, "right('abcde', 2)")).string);
+    // A negative n drops that many from the OTHER end.
+    try std.testing.expectEqualStrings("abc", (try evalLit(a, "left('abcde', -2)")).string);
+    try std.testing.expectEqualStrings("cde", (try evalLit(a, "right('abcde', -2)")).string);
+
+    try std.testing.expectEqualStrings("b", (try evalLit(a, "split_part('a,b,c', ',', 2)")).string);
+    try std.testing.expectEqualStrings("", (try evalLit(a, "split_part('a,b,c', ',', 9)")).string);
+    try std.testing.expectEqualStrings("", (try evalLit(a, "split_part('a,b,c', ',', 0)")).string);
+    try std.testing.expect((try evalLit(a, "split_part('a,b,c', '', 1)")).isNull());
+
+    try std.testing.expectEqual(@as(i64, 3), (try evalLit(a, "strpos('abcd', 'cd')")).int);
+    try std.testing.expectEqual(@as(i64, 0), (try evalLit(a, "strpos('abcd', 'z')")).int);
+
+    try std.testing.expectEqualStrings("abab", (try evalLit(a, "repeat('ab', 2)")).string);
+    try std.testing.expectEqualStrings("", (try evalLit(a, "repeat('ab', 0)")).string);
+    // Past the 1 MiB ceiling this is an error, never an unbounded allocation.
+    try std.testing.expectError(error.CastFailed, evalLit(a, "repeat('ab', 1000000)"));
+
+    try std.testing.expectEqualStrings("cba", (try evalLit(a, "reverse('abc')")).string);
+    try std.testing.expect((try evalLit(a, "reverse(null)")).isNull());
+}
+
+test "date builtins: month clamp, boundary diffs, epoch round trip, strftime padding" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // Jan 31 + 1 month clamps to the end of February, leap year or not.
+    try std.testing.expectEqualStrings("2024-02-29", try formatDate(a, (try evalLit(a, "date_add('month', 1, cast('2024-01-31' as date))")).date));
+    try std.testing.expectEqualStrings("2023-02-28", try formatDate(a, (try evalLit(a, "date_add('month', 1, cast('2023-01-31' as date))")).date));
+    try std.testing.expectEqualStrings("2023-12-31", try formatDate(a, (try evalLit(a, "date_add('day', -1, cast('2024-01-01' as date))")).date));
+    try std.testing.expectEqualStrings("2025-03-15", try formatDate(a, (try evalLit(a, "date_add('year', 1, cast('2024-03-15' as date))")).date));
+    // On a timestamp a month step keeps the time of day.
+    try std.testing.expectEqualStrings("2024-02-29 06:30:00", try formatTimestamp(a, (try evalLit(a, "date_add('month', 1, cast('2024-01-31 06:30:00' as timestamp))")).timestamp));
+
+    // Boundary crossings for year/month: one day apart, but a year apart.
+    try std.testing.expectEqual(@as(i64, 1), (try evalLit(a, "date_diff('year', cast('2023-12-31' as date), cast('2024-01-01' as date))")).int);
+    try std.testing.expectEqual(@as(i64, 1), (try evalLit(a, "date_diff('month', cast('2023-12-31' as date), cast('2024-01-01' as date))")).int);
+    // Exact division for day and finer.
+    try std.testing.expectEqual(@as(i64, 60), (try evalLit(a, "date_diff('day', cast('2024-01-01' as date), cast('2024-03-01' as date))")).int);
+    try std.testing.expectEqual(@as(i64, -1), (try evalLit(a, "date_diff('day', cast('2024-01-02' as date), cast('2024-01-01' as date))")).int);
+
+    try std.testing.expectEqualStrings("2024-02-29", try formatDate(a, (try evalLit(a, "make_date(2024, 2, 29)")).date));
+    try std.testing.expectError(error.CastFailed, evalLit(a, "make_date(2023, 2, 29)"));
+    try std.testing.expectError(error.CastFailed, evalLit(a, "make_date(2023, 13, 1)"));
+
+    try std.testing.expectEqual(@as(i64, 1700000000), (try evalLit(a, "epoch(to_timestamp(1700000000))")).int);
+    try std.testing.expectEqual(@as(i64, 0), (try evalLit(a, "epoch(cast('1970-01-01' as date))")).int);
+
+    try std.testing.expectEqualStrings("1970-01-01 00:00:00", (try evalLit(a, "strftime(to_timestamp(0), '%Y-%m-%d %H:%M:%S')")).string);
+    try std.testing.expectEqualStrings("70 01:01:01 %", (try evalLit(a, "strftime(to_timestamp(3661), '%y %H:%M:%S %%')")).string);
+}
+
+test "check-time errors: bad strftime directive, sub-day date_add on a date" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "ts", .ty = Type.init(.timestamp) },
+        .{ .name = "d", .ty = Type.init(.date) },
+    } };
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    var ctx = TypeCtx{ .schema = schema, .arena = a };
+
+    const bad_fmt = try parser.parseExprStr(a, "strftime(ts, '%Q')", &diag);
+    try std.testing.expectError(error.TypeError, ctx.typeOf(bad_fmt));
+    try std.testing.expect(std.mem.indexOf(u8, ctx.msg, "strftime") != null);
+
+    ctx.msg = "";
+    const bad_unit = try parser.parseExprStr(a, "date_add('hour', 1, d)", &diag);
+    try std.testing.expectError(error.TypeError, ctx.typeOf(bad_unit));
+    try std.testing.expect(std.mem.indexOf(u8, ctx.msg, "date_add") != null);
+
+    // A good one still type-checks, and picks up its operand's kind.
+    ctx.msg = "";
+    const ok = try parser.parseExprStr(a, "date_add('day', 7, d)", &diag);
+    try std.testing.expectEqual(types.TypeKind.date, (try ctx.typeOf(ok)).kind);
 }

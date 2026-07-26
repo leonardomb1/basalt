@@ -54,7 +54,10 @@ pub const Expr = union(enum) {
     /// type-checker and evaluator never see it — like a single-use `fn`. Lets a `fn`
     /// body (or any computed column) name an intermediate instead of repeating it.
     pub const LetIn = struct { name: []const u8, value: *Expr, body: *Expr };
-    pub const Cast = struct { e: *Expr, ty: types.Type };
+    /// `CAST(e AS ty)`, and — with `safe` set — `TRY_CAST(e AS ty)`, which has
+    /// identical syntax and type rules except that a failed conversion yields
+    /// null instead of raising. A safe cast is therefore always nullable.
+    pub const Cast = struct { e: *Expr, ty: types.Type, safe: bool = false };
     /// `x is null` / `x is not null` (`.is_null`), and the additive
     /// `x is empty` / `x is not empty` (`.is_empty`) which is true when the
     /// operand is null OR an empty string. Both forms are total (never null).
@@ -100,7 +103,7 @@ pub fn rebuildExpr(arena: std.mem.Allocator, e: *const Expr, ctx: anytype, compt
         .unary => |u| try mkExpr(arena, .{ .unary = .{ .op = u.op, .e = try recur(ctx, u.e) } }),
         .binary => |b| try mkExpr(arena, .{ .binary = .{ .op = b.op, .l = try recur(ctx, b.l), .r = try recur(ctx, b.r) } }),
         .cond => |c| try mkExpr(arena, .{ .cond = .{ .cond = try recur(ctx, c.cond), .then = try recur(ctx, c.then), .els = try recur(ctx, c.els) } }),
-        .cast => |c| try mkExpr(arena, .{ .cast = .{ .e = try recur(ctx, c.e), .ty = c.ty } }),
+        .cast => |c| try mkExpr(arena, .{ .cast = .{ .e = try recur(ctx, c.e), .ty = c.ty, .safe = c.safe } }),
         .is_null => |n| try mkExpr(arena, .{ .is_null = .{ .e = try recur(ctx, n.e), .negated = n.negated, .kind = n.kind } }),
         .let_in => |l| try mkExpr(arena, .{ .let_in = .{ .name = l.name, .value = try recur(ctx, l.value), .body = try recur(ctx, l.body) } }),
         .call => |c| blk: {
