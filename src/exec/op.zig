@@ -851,7 +851,71 @@ pub const Aggregate = struct {
     /// deep-copying keys and min/max values into `dst_alloc` so they survive the
     /// worker's arena being freed. Call under a lock when workers share the combiner.
     pub fn mergeGroups(map: *GroupMap(), groups: *std.array_list.Managed(Group), dst_alloc: std.mem.Allocator, src_groups: []const Group, aggs: []const Agg) !void {
+        return mergeGroupsPart(map, groups, dst_alloc, src_groups, aggs, 0, 1);
+    }
+
+    /// Merge for the parallel path, where the source groups live in lane arenas
+    /// that outlive the merge: a key seen for the first time is *adopted* — its
+    /// key and accumulators are reused in place rather than copied. The
+    /// high-cardinality case is then one hash and one pointer store per group
+    /// instead of two allocations, which is what makes the merge cheap enough
+    /// for the fold to be worth parallelising at all. Only a repeated key pays
+    /// for an accumulator fold.
+    pub fn adoptGroups(
+        map: *GroupMap(),
+        groups: *std.array_list.Managed(Group),
+        dst_alloc: std.mem.Allocator,
+        src_groups: []const Group,
+        aggs: []const Agg,
+    ) !void {
+        var any_distinct = false;
+        for (aggs) |a| {
+            if (a.distinct) any_distinct = true;
+        }
         for (src_groups) |g| {
+            const gop = try map.getOrPut(g.key_vals);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = g.key_vals;
+                gop.value_ptr.* = groups.items.len;
+                var adopted = g;
+                if (any_distinct) {
+                    const accs = try dst_alloc.alloc(Acc, aggs.len);
+                    for (g.accs, accs, aggs) |src, *dst, agg| {
+                        dst.* = src;
+                        if (!agg.distinct) continue;
+                        dst.seen = null;
+                        dst.n = 0;
+                        if (src.seen) |ss| {
+                            var it = ss.keyIterator();
+                            while (it.next()) |k| try noteDistinct(dst_alloc, dst, k.*[0]);
+                        }
+                    }
+                    adopted.accs = accs;
+                }
+                try groups.append(adopted);
+            } else {
+                const cg = &groups.items[gop.value_ptr.*];
+                for (g.accs, aggs, 0..) |src, agg, j| try mergeAcc(dst_alloc, &cg.accs[j], src, agg);
+            }
+        }
+    }
+
+    /// `mergeGroups` restricted to the groups whose key hashes into `part` of
+    /// `nparts`. Partitioning the merge by hash lets one task own each partition
+    /// outright: the key sets are disjoint, so the tasks need no lock between
+    /// them — which is what keeps a high-cardinality merge from serializing.
+    pub fn mergeGroupsPart(
+        map: *GroupMap(),
+        groups: *std.array_list.Managed(Group),
+        dst_alloc: std.mem.Allocator,
+        src_groups: []const Group,
+        aggs: []const Agg,
+        part: usize,
+        nparts: usize,
+    ) !void {
+        const ctx = keyhash.MultiKeyCtx{};
+        for (src_groups) |g| {
+            if (nparts > 1 and (ctx.hash(g.key_vals) >> 32) % nparts != part) continue;
             const gop = try map.getOrPut(g.key_vals);
             if (!gop.found_existing) {
                 const kv = try dst_alloc.alloc(Value, g.key_vals.len);
@@ -862,6 +926,14 @@ pub const Aggregate = struct {
                 for (g.accs, accs, aggs) |src, *dst, agg| {
                     dst.* = src;
                     if ((agg.func == .min or agg.func == .max) and src.has_ext) dst.ext = try dupeValue(dst_alloc, src.ext);
+                    if (agg.distinct) {
+                        dst.seen = null;
+                        dst.n = 0;
+                        if (src.seen) |ss| {
+                            var it = ss.keyIterator();
+                            while (it.next()) |k| try noteDistinct(dst_alloc, dst, k.*[0]);
+                        }
+                    }
                 }
                 try groups.append(.{ .key_vals = kv, .accs = accs });
             } else {
@@ -877,7 +949,6 @@ pub const Aggregate = struct {
     /// The int/float-only constraint depends on the (fixed) schema, so the same
     /// path is taken for every batch of a run.
     fn foldVectorized(self: *Aggregate, arena: std.mem.Allocator, b: Batch, accs: []Acc) anyerror!bool {
-        // A distinct agg needs every value, not a reduction of the batch.
         for (self.aggs) |agg| if (agg.distinct) return false;
         const partials = try arena.alloc(Partial, self.aggs.len);
         for (self.aggs, partials) |agg, *p| {

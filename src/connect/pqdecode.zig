@@ -978,17 +978,10 @@ pub fn fileMinMax(rdr: *const Reader, name: []const u8) ?MinMax {
     for (rdr.md.row_groups) |g| {
         if (lf.chunk_idx >= g.columns.len) return null;
         const meta = g.columns[lf.chunk_idx].meta orelse return null;
-        // Writers are allowed to store *truncated* min/max for variable-length
-        // types, flagged by `is_min_value_exact` — which this reader does not
-        // parse. Trusting a truncated bound would answer MIN/MAX with a prefix,
-        // so only fixed-width physical types take the shortcut.
         switch (meta.ty) {
             .byte_array, .fixed_len_byte_array => return null,
             else => {},
         }
-        // An all-null group carries no min/max; it cannot move the result, but
-        // it also cannot be distinguished here from "statistics absent", so
-        // bail and let the scan decide.
         const mn = statValue(elem, meta.ty, meta.stats.min) orelse return null;
         const mx = statValue(elem, meta.ty, meta.stats.max) orelse return null;
         if (lo == null or cmp(mn, lo.?) == .lt) lo = mn;
@@ -1130,6 +1123,10 @@ pub const Reader = struct {
     /// Row groups skipped on statistics, for reporting.
     groups_skipped: usize = 0,
     rg: usize = 0,
+    /// Exclusive end of the row-group window this reader is confined to. Null
+    /// reads to the end of the file; a parallel worker sets it so each lane owns
+    /// a disjoint slice of the row groups.
+    rg_end: ?usize = null,
 
     pub fn isPath(path: []const u8) bool {
         return std.mem.endsWith(u8, path, ".parquet");
@@ -1218,7 +1215,8 @@ pub const Reader = struct {
     /// One row group per call. Empty groups are skipped rather than returned as
     /// zero-row batches, which downstream operators treat as end-of-stream.
     pub fn next(self: *Reader, arena: std.mem.Allocator) !?Batch {
-        while (self.rg < self.md.row_groups.len) {
+        const last = self.rg_end orelse self.md.row_groups.len;
+        while (self.rg < last) {
             const g = self.md.row_groups[self.rg];
             self.rg += 1;
             const rows: usize = @intCast(g.num_rows);

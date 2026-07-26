@@ -10,6 +10,7 @@ const types = @import("../lang/types.zig");
 const op = @import("../exec/op.zig");
 const batchmod = @import("../exec/batch.zig");
 const column = @import("../exec/column.zig");
+const keyhash = @import("../exec/keyhash.zig");
 const eval = @import("../exec/eval.zig");
 const csv = @import("../connect/csv.zig");
 const pqdecode = @import("../connect/pqdecode.zig");
@@ -652,6 +653,14 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     }
 
     if (opts.threads > 1 and stages.len >= 2 and
+        stages[0].node == .read and stages[0].hints.len == 0 and isLocalParquetRead(stages[0].node.read))
+    {
+        if (classifyAggPipeline(stages)) |shape| {
+            if (try runParallelParquetAgg(env, stages[0].node.read, stages[0 .. stages.len - 1], shape.prefix, shape.ag, shape.tail, last.write, opts, stats, lanes_used)) return;
+        }
+    }
+
+    if (opts.threads > 1 and stages.len >= 2 and
         stages[0].node == .read and stages[0].hints.len == 0 and isLocalCsvRead(stages[0].node.read))
     {
         if (classifyAggPipeline(stages)) |shape| {
@@ -773,6 +782,14 @@ fn isLocalCsvRead(rd: ast.Read) bool {
     if (!std.mem.eql(u8, rd.connector, "csv")) return false;
     return switch (rd.form) {
         .path => |p| !csv.CsvReader.isUrl(p) and !pqdecode.Reader.isPath(p),
+        else => false,
+    };
+}
+
+fn isLocalParquetRead(rd: ast.Read) bool {
+    if (!std.mem.eql(u8, rd.connector, "csv")) return false;
+    return switch (rd.form) {
+        .path => |p| !csv.CsvReader.isUrl(p) and pqdecode.Reader.isPath(p),
         else => false,
     };
 }
@@ -1001,6 +1018,253 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
     ctx.mtx.lock();
     defer ctx.mtx.unlock();
     try op.Aggregate.mergeGroups(ctx.cmap, ctx.cgroups, ctx.plan_arena, groups, ctx.aggs);
+}
+
+/// One parallel-aggregate lane: its own arena and its own group table, so the
+/// fold phase never takes a lock.
+const PqLane = struct {
+    arena: std.heap.ArenaAllocator,
+    groups: []op.Aggregate.Group = &.{},
+    /// The lane's groups split by key hash, computed once when the lane runs
+    /// dry. The merge then reads a partition's slice directly instead of
+    /// rescanning every lane for every partition.
+    buckets: []std.array_list.Managed(op.Aggregate.Group) = &.{},
+};
+
+/// One radix partition of the merge: the lanes' groups are split by key hash, so
+/// each partition is owned outright by one task and needs no lock either.
+const PqPart = struct {
+    arena: std.heap.ArenaAllocator,
+    map: op.Aggregate.GroupMap(),
+    groups: std.array_list.Managed(op.Aggregate.Group),
+};
+
+/// Number of radix partitions. Comfortably above the lane count so the merge
+/// stays balanced when key hashes are uneven.
+const pq_parts: usize = 64;
+
+/// Fewest lanes worth splitting an aggregate across — see `runParallelParquetAgg`.
+const pq_min_lanes: usize = 4;
+
+/// Shared state for parallel *parquet* aggregate lanes. The morsel is a row
+/// group: each lane opens its own reader over a disjoint window and folds into
+/// its own table. Nothing is shared until the radix merge.
+const PqAggCtx = struct {
+    path: []const u8,
+    project: ?[][]const u8,
+    bounds: []const pqdecode.Bound,
+    src_schema: *const types.Schema,
+    agg_in_schema: *const types.Schema,
+    out_schema: *const types.Schema,
+    prefix: []const ast.Stage,
+    params: *std.StringHashMap(*const ast.Expr),
+    by: []const usize,
+    aggs: []const op.Aggregate.Agg,
+    queue: WorkQueue,
+    lanes: []PqLane,
+    rows_read: *std.atomic.Value(u64),
+    per_item: usize,
+};
+
+/// Pulls row-group morsels off the shared queue and presents them as one
+/// continuous stream. This is what lets a lane run a *single* aggregate over
+/// everything it steals: folding per morsel and merging afterwards would walk
+/// the lane's groups an extra time, which at high cardinality costs more than
+/// the parallelism buys.
+const MorselSource = struct {
+    ctx: *PqAggCtx,
+    scratch: std.mem.Allocator,
+    cur: ?*pqdecode.Reader = null,
+
+    fn schemaFn(ptr: *anyopaque) types.Schema {
+        const self: *MorselSource = @ptrCast(@alignCast(ptr));
+        return self.ctx.src_schema.*;
+    }
+    fn nextFn(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?batchmod.Batch {
+        const self: *MorselSource = @ptrCast(@alignCast(ptr));
+        while (true) {
+            if (self.cur) |r| {
+                if (try r.next(arena)) |b| return b;
+                self.cur = null;
+            }
+            if (self.ctx.queue.failed.load(.seq_cst)) return null;
+            const i = self.ctx.queue.next.fetchAdd(1, .seq_cst);
+            if (i >= self.ctx.queue.nitems) return null;
+            const r = try pqdecode.Reader.openProjected(self.scratch, self.ctx.path, self.ctx.project);
+            r.bounds = self.ctx.bounds;
+            r.rg = i * self.ctx.per_item;
+            if (r.rg >= r.md.row_groups.len) continue;
+            r.rg_end = @min(r.rg + self.ctx.per_item, r.md.row_groups.len);
+            self.cur = r;
+        }
+    }
+    fn closeFn(ptr: *anyopaque) void {
+        _ = ptr;
+    }
+    const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
+};
+
+fn pqAggLane(ctx: *PqAggCtx, lane_idx: usize) void {
+    pqAggLaneRun(ctx, lane_idx) catch |e| ctx.queue.fail(e);
+}
+
+fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
+    const ls = &ctx.lanes[lane_idx];
+    const la = ls.arena.allocator();
+
+    var ms = MorselSource{ .ctx = ctx, .scratch = la };
+    var cs = obs.CountingSource{ .inner = .{ .ptr = &ms, .vtable = &MorselSource.vtable }, .count = ctx.rows_read };
+    var scan = op.Scan{ .src = cs.source() };
+    const child = try buildMapChain(la, ctx.params, ctx.prefix, &scan, ctx.src_schema);
+    var agg = op.Aggregate{
+        .child = child,
+        .in_schema = ctx.agg_in_schema,
+        .by = ctx.by,
+        .aggs = ctx.aggs,
+        .out_schema = ctx.out_schema,
+        .err = null,
+        .state = la,
+        .gpa = ls.arena.child_allocator,
+    };
+    ls.groups = try agg.drainGroups();
+    try bucketLane(ls);
+}
+
+/// Split this lane's groups into radix buckets — one hash per group, once.
+fn bucketLane(ls: *PqLane) !void {
+    const a = ls.arena.allocator();
+    ls.buckets = try a.alloc(std.array_list.Managed(op.Aggregate.Group), pq_parts);
+    for (ls.buckets) |*b| b.* = std.array_list.Managed(op.Aggregate.Group).init(a);
+    const hctx = keyhash.MultiKeyCtx{};
+    for (ls.groups) |g| {
+        const p: usize = @intCast((hctx.hash(g.key_vals) >> 32) % pq_parts);
+        try ls.buckets[p].append(g);
+    }
+}
+
+const PqMergeCtx = struct {
+    lanes: []PqLane,
+    parts: []PqPart,
+    aggs: []const op.Aggregate.Agg,
+    queue: WorkQueue,
+};
+
+const pqMergeWorker = dispatchWorker(PqMergeCtx, pqMergeOne);
+
+fn pqMergeOne(ctx: *PqMergeCtx, p: usize) !void {
+    const dst = &ctx.parts[p];
+    for (ctx.lanes) |*ls| {
+        if (ls.buckets.len == 0) continue;
+        try op.Aggregate.adoptGroups(&dst.map, &dst.groups, dst.arena.allocator(), ls.buckets[p].items, ctx.aggs);
+    }
+}
+
+/// Parallel aggregate over a local parquet file, one morsel per row group.
+/// Two phases, neither of which takes a lock: lanes fold disjoint row groups
+/// into private tables, then the tables are merged by hash partition.
+///
+/// Returns false (serial fallback) when the file has too few row groups to
+/// split, or when fewer than `pq_min_lanes` lanes are available: the merge adds
+/// a bucket pass and a partition pass over the groups, and at a cardinality
+/// where groups approach rows that costs more than two lanes can win back
+/// (measured: 5M groups over 5M rows is ~30% slower at two lanes, ~2x faster at
+/// twenty).
+fn runParallelParquetAgg(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    const arena = env.arena;
+    const path = switch (rd.form) {
+        .path => |p| p,
+        else => return false,
+    };
+    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
+    if (opts.threads < pq_min_lanes) return false;
+
+    const project = try projectedColumns(env, pipeline[1..]);
+    const bounds = try filterBounds(env, pipeline[1..]);
+    const probe = pqdecode.Reader.openProjected(arena, path, project) catch return false;
+    const ngroups = probe.md.row_groups.len;
+    if (ngroups < 2) return false;
+
+    const src_schema = try schemaPtr(arena, probe.schema);
+    const agg_in = try schemaPtr(arena, try mapChainSchema(env, prefix, src_schema.*));
+
+    var ad = analyze.Diag{};
+    const apl = analyze.aggregatePlan(arena, agg_in.*, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
+    const aggs = try arena.alloc(op.Aggregate.Agg, apl.aggs.len);
+    for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct };
+    const out_schema = try schemaPtr(arena, apl.schema);
+
+    env.src_name = "parquet";
+    env.sink_name = sinkLabel(env, w);
+
+    const nthreads = @max(@as(usize, 1), opts.threads);
+    const per_item: usize = 1;
+    const nitems = ngroups;
+
+    const lanes = try env.gpa.alloc(PqLane, nthreads);
+    defer env.gpa.free(lanes);
+    for (lanes) |*l| {
+        l.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    }
+    defer for (lanes) |*l| l.arena.deinit();
+
+    var ctx = PqAggCtx{
+        .path = path,
+        .project = project,
+        .bounds = bounds,
+        .src_schema = src_schema,
+        .agg_in_schema = agg_in,
+        .out_schema = out_schema,
+        .prefix = prefix,
+        .params = env.params_expr,
+        .by = apl.by,
+        .aggs = aggs,
+        .queue = .{ .nitems = nitems },
+        .lanes = lanes,
+        .rows_read = env.rows_read,
+        .per_item = per_item,
+    };
+
+    const used = try parallel.spawnJoin(arena, nthreads, pqAggLane, &ctx);
+    lanes_used.* = @max(lanes_used.*, used);
+    if (ctx.queue.first_err) |e| return e;
+
+    const parts = try env.gpa.alloc(PqPart, pq_parts);
+    defer env.gpa.free(parts);
+    for (parts) |*pp| {
+        pp.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator), .map = undefined, .groups = undefined };
+        pp.map = op.Aggregate.GroupMap().init(pp.arena.allocator());
+        pp.groups = std.array_list.Managed(op.Aggregate.Group).init(pp.arena.allocator());
+    }
+    defer for (parts) |*pp| pp.arena.deinit();
+
+    var mctx = PqMergeCtx{ .lanes = lanes, .parts = parts, .aggs = aggs, .queue = .{ .nitems = pq_parts } };
+    _ = try parallel.spawnJoin(arena, nthreads, pqMergeWorker, &mctx);
+    if (mctx.queue.first_err) |e| return e;
+
+    env.log.log(.info, "parallel parquet aggregate: {d} row groups in {d} morsels over {d} lanes, merged in {d} partitions", .{ ngroups, nitems, used, pq_parts });
+
+    var total: usize = 0;
+    for (parts) |*pp| total += pp.groups.items.len;
+    const all = try arena.alloc(op.Aggregate.Group, total);
+    var at: usize = 0;
+    for (parts) |*pp| {
+        for (pp.groups.items) |g| {
+            all[at] = g;
+            at += 1;
+        }
+    }
+
+    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, all);
+
+    const wr = try resolveUpsertKeys(env, w);
+    const snk = try openSink(env, wr, out_schema.*);
+    var snk_open = true;
+    errdefer if (snk_open) snk.abort();
+
+    try writeTail(env, snk, batch, out_schema.*, tail, stats);
+    snk_open = false;
+    try snk.close();
+    return true;
 }
 
 /// Returns true if it handled the pipeline in parallel; false to fall back to serial.
