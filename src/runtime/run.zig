@@ -659,6 +659,10 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     {
         if (classifyAggPipeline(stages)) |shape| {
             if (try runParallelParquetAgg(env, stages[0].node.read, stages[0 .. stages.len - 1], shape.prefix, shape.ag, shape.tail, last.write, opts, stats, lanes_used)) return;
+        } else if (classifyDistinctPipeline(stages)) |ds| {
+            if (try runParallelParquetDistinct(env, stages[0].node.read, stages[0 .. stages.len - 1], ds.prefix, ds.dist, ds.tail, last.write, opts, stats, lanes_used)) return;
+        } else if (classifyTopNPipeline(stages)) |tn| {
+            if (try runParallelParquetTopN(env, stages[0].node.read, stages[0 .. stages.len - 1], tn.prefix, tn.srt, tn.lim, last.write, opts, stats, lanes_used)) return;
         } else if (classifyMapPipeline(stages)) |map_stages| {
             if (try runParallelParquetMap(env, stages[0].node.read, stages[0 .. stages.len - 1], map_stages, last.write, opts, stats, lanes_used)) return;
         }
@@ -1948,6 +1952,138 @@ fn topnWorkOne(ctx: *TopNCtx, i: usize) !void {
 /// Parallel CSV Top-N: each worker keeps its chunk's top `offset+count` rows, then a
 /// global Top-N over the union produces the final sorted, offset/limited output. The
 /// output is small and sorted, so (unlike map-only) it stays deterministic.
+/// Top-N over a local parquet file: each lane keeps its own heap over the row
+/// groups it steals, then the lane winners go through one final top-N. Only
+/// N x lanes rows ever reach the combine step.
+const PqTopNLaneCtx = struct {
+    morsels: PqMorsels,
+    row_schema: *const types.Schema,
+    prefix: []const ast.Stage,
+    params: *std.StringHashMap(*const ast.Expr),
+    keys: []const op.Sort.Key,
+    cap: u64,
+    builders: []column.Builder,
+    mtx: std.Thread.Mutex = .{},
+    rows_read: *std.atomic.Value(u64),
+};
+
+fn pqTopNLane(ctx: *PqTopNLaneCtx, lane_idx: usize) void {
+    _ = lane_idx;
+    pqTopNLaneRun(ctx) catch |e| ctx.morsels.queue.fail(e);
+}
+
+fn pqTopNLaneRun(ctx: *PqTopNLaneCtx) !void {
+    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
+    defer _ = wgpa.deinit();
+    var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
+    defer warena.deinit();
+    var batch_arena = std.heap.ArenaAllocator.init(wgpa.allocator());
+    defer batch_arena.deinit();
+
+    var ms = MorselSource{ .m = &ctx.morsels, .scratch = warena.allocator() };
+    var cs = obs.CountingSource{ .inner = .{ .ptr = &ms, .vtable = &MorselSource.vtable }, .count = ctx.rows_read };
+    var scan = op.Scan{ .src = cs.source() };
+    const child = try buildMapChain(warena.allocator(), ctx.params, ctx.prefix, &scan, ctx.morsels.src_schema);
+    var tn = op.TopN{
+        .child = child,
+        .in_schema = ctx.row_schema,
+        .keys = ctx.keys,
+        .count = ctx.cap,
+        .offset = 0,
+        .state = batch_arena.allocator(),
+        .gpa = wgpa.allocator(),
+    };
+    const local = (try tn.next(batch_arena.allocator())) orelse return;
+
+    ctx.mtx.lock();
+    defer ctx.mtx.unlock();
+    var r: usize = 0;
+    while (r < local.len) : (r += 1) {
+        for (local.columns, ctx.builders) |col, *b| try b.append(col.getValue(r));
+    }
+}
+
+fn runParallelParquetTopN(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, prefix: []const ast.Stage, srt: ast.Sort, lim: ast.Limit, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    const arena = env.arena;
+    const path = switch (rd.form) {
+        .path => |p| p,
+        else => return false,
+    };
+    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
+    if (opts.threads < 2) return false;
+
+    const project = try projectedColumns(env, pipeline[1..]);
+    const bounds = try filterBounds(env, pipeline[1..]);
+    const probe = pqdecode.Reader.openProjected(arena, path, project) catch return false;
+    const ngroups = probe.md.row_groups.len;
+    if (ngroups < 2) return false;
+
+    const src_schema = try schemaPtr(arena, probe.schema);
+    const row_schema = try schemaPtr(arena, try mapChainSchema(env, prefix, src_schema.*));
+
+    const qs = try arena.alloc(ast.QualName, srt.keys.len);
+    for (srt.keys, qs) |sk, *q| q.* = sk.field;
+    var ad = analyze.Diag{};
+    const idxs = analyze.fieldIndices(arena, row_schema.*, qs, &ad) catch |e| return aErr(env, &ad, e);
+    const ks = try arena.alloc(op.Sort.Key, srt.keys.len);
+    for (srt.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc };
+
+    env.src_name = "parquet";
+    env.sink_name = sinkLabel(env, w);
+
+    const nthreads = @max(@as(usize, 1), opts.threads);
+    const builders = try arena.alloc(column.Builder, row_schema.fields.len);
+    for (builders, row_schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
+    var ctx = PqTopNLaneCtx{
+        .morsels = .{
+            .path = path,
+            .project = project,
+            .bounds = bounds,
+            .src_schema = src_schema,
+            .per_item = 1,
+            .queue = .{ .nitems = ngroups },
+        },
+        .row_schema = row_schema,
+        .prefix = prefix,
+        .params = env.params_expr,
+        .keys = ks,
+        .cap = lim.offset + lim.count,
+        .builders = builders,
+        .rows_read = env.rows_read,
+    };
+
+    const lanes = try parallel.spawnJoin(arena, nthreads, pqTopNLane, &ctx);
+    lanes_used.* = @max(lanes_used.*, lanes);
+    env.log.log(.info, "parallel parquet top-n: {d} row groups over {d} lanes", .{ ngroups, lanes });
+    if (ctx.morsels.queue.first_err) |e| return e;
+
+    const cols = try arena.alloc(column.Column, builders.len);
+    for (builders, cols) |*b, *c| c.* = try b.finish();
+    var combined = OneBatch{ .b = .{ .schema = row_schema, .columns = cols, .len = cols[0].len }, .sch = row_schema.* };
+    var gscan = op.Scan{ .src = combined.source() };
+    var global = op.TopN{
+        .child = .{ .scan = &gscan },
+        .in_schema = row_schema,
+        .keys = ks,
+        .count = lim.count,
+        .offset = lim.offset,
+        .state = arena,
+        .gpa = env.gpa,
+    };
+
+    const wr = try resolveUpsertKeys(env, w);
+    const snk = try openSink(env, wr, row_schema.*);
+    var snk_open = true;
+    errdefer if (snk_open) snk.abort();
+    while (try global.next(arena)) |b| {
+        try snk.writeBatch(arena, b);
+        stats.rows_out += b.len;
+    }
+    snk_open = false;
+    try snk.close();
+    return true;
+}
+
 fn runParallelCsvTopN(env: *Env, rd: ast.Read, prefix: []const ast.Stage, srt: ast.Sort, lim: ast.Limit, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     const arena = env.arena;
     const path = switch (rd.form) {
@@ -2094,6 +2230,145 @@ fn distinctWorkOne(ctx: *DistinctCtx, i: usize) !void {
         ctx.mtx.unlock();
         _ = batch_arena.reset(.retain_capacity);
     }
+}
+
+/// Parallel distinct over a local parquet file: each lane dedups the row groups
+/// it steals, then a shared seen-set dedups across lanes. Output order varies
+/// under `-j > 1`.
+const PqDistinctCtx = struct {
+    morsels: PqMorsels,
+    row_schema: *const types.Schema,
+    prefix: []const ast.Stage,
+    params: *std.StringHashMap(*const ast.Expr),
+    local_keys: ?[]const usize,
+    key_idx: []const usize,
+    seen: *op.Aggregate.GroupMap(),
+    builders: []column.Builder,
+    mtx: std.Thread.Mutex = .{},
+    plan_arena: std.mem.Allocator,
+    rows_read: *std.atomic.Value(u64),
+};
+
+fn pqDistinctLane(ctx: *PqDistinctCtx, lane_idx: usize) void {
+    _ = lane_idx;
+    pqDistinctLaneRun(ctx) catch |e| ctx.morsels.queue.fail(e);
+}
+
+fn pqDistinctLaneRun(ctx: *PqDistinctCtx) !void {
+    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
+    defer _ = wgpa.deinit();
+    var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
+    defer warena.deinit();
+    var batch_arena = std.heap.ArenaAllocator.init(wgpa.allocator());
+    defer batch_arena.deinit();
+
+    var ms = MorselSource{ .m = &ctx.morsels, .scratch = warena.allocator() };
+    var cs = obs.CountingSource{ .inner = .{ .ptr = &ms, .vtable = &MorselSource.vtable }, .count = ctx.rows_read };
+    var scan = op.Scan{ .src = cs.source() };
+    const child = try buildMapChain(warena.allocator(), ctx.params, ctx.prefix, &scan, ctx.morsels.src_schema);
+    var d = op.Distinct{ .child = child, .in_schema = ctx.row_schema, .keys = ctx.local_keys, .state = warena.allocator(), .gpa = wgpa.allocator() };
+
+    const probe = try warena.allocator().alloc(Value, ctx.key_idx.len);
+    while (try d.next(batch_arena.allocator())) |b| {
+        ctx.mtx.lock();
+        var r: usize = 0;
+        while (r < b.len) : (r += 1) {
+            for (ctx.key_idx, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
+            const gop = ctx.seen.getOrPut(probe) catch |e| {
+                ctx.mtx.unlock();
+                return e;
+            };
+            if (!gop.found_existing) {
+                const kv = ctx.plan_arena.alloc(Value, ctx.key_idx.len) catch |e| {
+                    ctx.mtx.unlock();
+                    return e;
+                };
+                for (ctx.key_idx, 0..) |ci, j| kv[j] = try op.dupeValue(ctx.plan_arena, b.columns[ci].getValue(r));
+                gop.key_ptr.* = kv;
+                gop.value_ptr.* = 0;
+                for (b.columns, ctx.builders) |*col, *bld| try bld.append(col.getValue(r));
+            }
+        }
+        ctx.mtx.unlock();
+        _ = batch_arena.reset(.retain_capacity);
+    }
+}
+
+fn runParallelParquetDistinct(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, prefix: []const ast.Stage, dist: ast.Distinct, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    const arena = env.arena;
+    const path = switch (rd.form) {
+        .path => |p| p,
+        else => return false,
+    };
+    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
+    if (opts.threads < 2) return false;
+
+    const project = try projectedColumns(env, pipeline[1..]);
+    const bounds = try filterBounds(env, pipeline[1..]);
+    const probe_rdr = pqdecode.Reader.openProjected(arena, path, project) catch return false;
+    const ngroups = probe_rdr.md.row_groups.len;
+    if (ngroups < 2) return false;
+
+    const src_schema = try schemaPtr(arena, probe_rdr.schema);
+    const row_schema = try schemaPtr(arena, try mapChainSchema(env, prefix, src_schema.*));
+
+    var local_keys: ?[]const usize = null;
+    var key_idx: []const usize = undefined;
+    if (dist.on) |fields| {
+        var ad = analyze.Diag{};
+        const ks = analyze.fieldIndices(arena, row_schema.*, fields, &ad) catch |e| return aErr(env, &ad, e);
+        local_keys = ks;
+        key_idx = ks;
+    } else {
+        const all = try arena.alloc(usize, row_schema.fields.len);
+        for (all, 0..) |*x, j| x.* = j;
+        key_idx = all;
+    }
+
+    env.src_name = "parquet";
+    env.sink_name = sinkLabel(env, w);
+
+    const nthreads = @max(@as(usize, 1), opts.threads);
+    var seen = op.Aggregate.GroupMap().init(arena);
+    const builders = try arena.alloc(column.Builder, row_schema.fields.len);
+    for (builders, row_schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
+    var ctx = PqDistinctCtx{
+        .morsels = .{
+            .path = path,
+            .project = project,
+            .bounds = bounds,
+            .src_schema = src_schema,
+            .per_item = 1,
+            .queue = .{ .nitems = ngroups },
+        },
+        .row_schema = row_schema,
+        .prefix = prefix,
+        .params = env.params_expr,
+        .local_keys = local_keys,
+        .key_idx = key_idx,
+        .seen = &seen,
+        .builders = builders,
+        .plan_arena = arena,
+        .rows_read = env.rows_read,
+    };
+
+    const lanes = try parallel.spawnJoin(arena, nthreads, pqDistinctLane, &ctx);
+    lanes_used.* = @max(lanes_used.*, lanes);
+    env.log.log(.info, "parallel parquet distinct: {d} row groups over {d} lanes", .{ ngroups, lanes });
+    if (ctx.morsels.queue.first_err) |e| return e;
+
+    const cols = try arena.alloc(column.Column, builders.len);
+    for (builders, cols) |*b, *c| c.* = try b.finish();
+    const merged = batchmod.Batch{ .schema = row_schema, .columns = cols, .len = cols[0].len };
+
+    const wr = try resolveUpsertKeys(env, w);
+    const snk = try openSink(env, wr, row_schema.*);
+    var snk_open = true;
+    errdefer if (snk_open) snk.abort();
+    try writeTail(env, snk, merged, row_schema.*, tail, stats);
+    snk_open = false;
+    try snk.close();
+    return true;
 }
 
 /// Parallel CSV distinct: each worker dedups its chunk locally, then a global

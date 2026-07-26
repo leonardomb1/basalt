@@ -185,6 +185,10 @@ pushdown. Same word, different plan — `EXPLAIN` shows which.
 | `COUNT(*) / SUM / AVG / MIN / MAX ... GROUP BY k` | aggregate (non-agg items must be group keys) |
 | `COUNT(DISTINCT x)` | aggregate — combines freely with other aggregates; ignores nulls |
 | `HAVING <expr>` | filter after the aggregate; aggregate calls in it refer to the columns it produced |
+
+Row order without `ORDER BY` is not defined: `GROUP BY` returns groups in hash-partition
+order, and `DISTINCT` and map pipelines reorder under `-j > 1` (which is the default,
+since `-j` defaults to the core count). Add `ORDER BY` whenever the order matters.
 | `ORDER BY a DESC, b` | sort |
 | `LIMIT n [OFFSET m]` | limit |
 | `SELECT DISTINCT` / `DISTINCT ON (a, b)` | distinct |
