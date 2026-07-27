@@ -5603,7 +5603,7 @@ fn letScript(alloc: std.mem.Allocator, base: []const u8) ![]u8 {
     , .{ base, base, base, base });
 }
 
-fn runScript(alloc: std.mem.Allocator, script: []const u8, cli: []const ParamArg, rdiag: *Diag) !void {
+fn runLetScript(alloc: std.mem.Allocator, script: []const u8, cli: []const ParamArg, rdiag: *Diag) !void {
     var parena = std.heap.ArenaAllocator.init(alloc);
     defer parena.deinit();
     var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
@@ -5622,7 +5622,7 @@ test "LET folds once at plan time and hands every pipeline the same value" {
     const script = try letScript(alloc, base);
     defer alloc.free(script);
     var rdiag: Diag = .{};
-    try runScript(alloc, script, &[_]ParamArg{}, &rdiag);
+    try runLetScript(alloc, script, &[_]ParamArg{}, &rdiag);
 
     const a = try tmp.dir.readFileAlloc(alloc, "a.csv", 1 << 20);
     defer alloc.free(a);
@@ -5643,7 +5643,7 @@ test "LET reads a param, so `-p` reaches it indirectly" {
     const script = try letScript(alloc, base);
     defer alloc.free(script);
     var rdiag: Diag = .{};
-    try runScript(alloc, script, &[_]ParamArg{.{ .key = "days", .val = "7" }}, &rdiag);
+    try runLetScript(alloc, script, &[_]ParamArg{.{ .key = "days", .val = "7" }}, &rdiag);
 
     const a = try tmp.dir.readFileAlloc(alloc, "a.csv", 1 << 20);
     defer alloc.free(a);
@@ -5661,7 +5661,7 @@ test "a LET is sealed: `-p` naming one is a plan error, not a silent override" {
     const script = try letScript(alloc, base);
     defer alloc.free(script);
     var rdiag: Diag = .{};
-    try std.testing.expectError(error.PlanFailed, runScript(alloc, script, &[_]ParamArg{.{ .key = "span", .val = "99" }}, &rdiag));
+    try std.testing.expectError(error.PlanFailed, runLetScript(alloc, script, &[_]ParamArg{.{ .key = "span", .val = "99" }}, &rdiag));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "`span` is a LET, not a PARAM") != null);
     try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(alloc, "a.csv", 1 << 20));
 }
@@ -5681,6 +5681,6 @@ test "a LET and a PARAM may not share a name" {
     , .{ base, base });
     defer alloc.free(script);
     var rdiag: Diag = .{};
-    try std.testing.expectError(error.PlanFailed, runScript(alloc, script, &[_]ParamArg{}, &rdiag));
+    try std.testing.expectError(error.PlanFailed, runLetScript(alloc, script, &[_]ParamArg{}, &rdiag));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "declared twice") != null);
 }
