@@ -28,15 +28,24 @@ Basalt SQL is the only dialect: the BSL (`.bsl`) parser was removed in v0.2.0 �
 A script is a sequence of `;`-terminated statements:
 
 ```sql
+@include 'lib.sql';               -- top of file only; C-style, relative to this file
 CREATE ENDPOINT '/x' DOC '...';   -- only for HTTP mode; absent = batch
 PARAM ...;                        -- request/CLI inputs
+LET name = <expr>;                -- sealed plan-time constant (§2)
 CREATE CONNECTION ...;            -- named data endpoints
-CREATE FUNCTION f(a) AS <expr>;   -- user scalar functions (inlined at plan time)
+CREATE FUNCTION f(a) AS <expr>;   -- scalar functions (inlined at plan time)
+CREATE FUNCTION p(a) AS ... END;  -- statement functions, invoked with CALL (§9)
 LOAD INTO ... AS <query>;         -- output pipeline(s)
 <query>;                          -- terminal SELECT = print to stdout
+CALL p('x');                      -- run a statement function
 FOR EACH ROW OF (...) ... END FOR;
 CASE ... END CASE;                -- plan-time dispatch
 ```
+
+`@include` splices another script's declarations ahead of this one at plan
+time: each included file is parsed separately (errors report the included
+file's own path and line), includes may nest (depth 16, cycles rejected), and
+paths resolve relative to the including file.
 
 - **Batch is the silent default.** A script with no `CREATE ENDPOINT` runs once
   to completion (exit codes in §10).
@@ -67,6 +76,13 @@ PARAM tenant STRING FROM HEADER('X-Tenant');
   (common synonyms accepted: `INTEGER BIGINT DOUBLE TEXT VARCHAR(n) DATETIME
   NUMERIC ...`).
 - Source defaults: scalars bind from the query string, `JSON` from the body.
+
+**`LET name = <expr>;`** is PARAM's sealed sibling: a script-scoped constant
+folded once at plan time (in declaration order; it may reference `$params` and
+earlier `$lets`) and referenced as `$name`. It can never be bound externally —
+`-p name=...` is an error, HTTP binding ignores it, and it is not part of an
+endpoint's parameter surface. A LET and a PARAM may not share a name. `LET
+run_ts = now();` gives one consistent timestamp across every pipeline of a run.
 
 ## 3. Connections
 
@@ -442,11 +458,19 @@ FROM BUFFER 'eventos'
 
 ## 9. Expressions
 
-SQL-ish, Pratt-parsed. Precedence (high→low): unary `- NOT` → `* / %` →
-`+ - ||` → comparisons `= == != <> < <= > >= LIKE IN IS` → `??` → `AND` → `OR`.
+SQL-ish, Pratt-parsed. Precedence (high→low): unary `- NOT ~` → `* / %` →
+`+ - ||` → `<< >>` → `&` → `^` → `|` → comparisons
+`= == != <> < <= > >= LIKE IN IS` → `??` → `AND` → `OR`.
 
-- `$name` — a reference to a param or (inside `FOR EACH ROW OF`) a loop
-  variable, resolved by name. `$job.a?.b` navigates a JSON param.
+**Scope rule:** `$name` is script/environment scope — a PARAM, a LET, or (in a
+`FOR EACH ROW OF` / statement-function body) a loop variable, resolved at plan
+time. Bare names are row/local scope — columns, `LET … IN` bindings, aliases.
+At a use site the innermost binding wins: loop var > LET/PARAM.
+
+- `$name` — see the scope rule above. `$job.a?.b` navigates a JSON param.
+- Bitwise (INT only, engine-side — never pushed down): `& | ^ << >>`, unary
+  `~`. `^` is xor. `>>` is arithmetic; shift counts `< 0` or `>= 64` yield 0
+  (`-1` for `>>` of a negative). Companions: `bit_count() to_hex() from_hex()`.
 - `a || b` — string concat (ANSI), sugar for `concat(a, b)`.
 - `IDENTIFIER(<string-expr>)` — treat a computed string as a table/object name
   (§7); valid in `FROM`/`LOAD INTO`/upsert-key positions, not general
@@ -469,7 +493,16 @@ SQL-ish, Pratt-parsed. Precedence (high→low): unary `- NOT` → `* / %` →
 - `LET x = <val> IN <body>` — local binding, inlined at plan time.
 - Scalar functions (case-insensitive): `now() today() lower() upper() length()
   strlen() trim() substr() replace() concat() coalesce() starts_with()
-  ends_with() contains() like() date_trunc() extract() regexp_replace()`.
+  ends_with() contains() like() date_trunc() extract() regexp_replace()` ·
+  math `abs() floor() ceil() round(x[,n]) mod() power() sqrt() sign()` (round
+  is half-away-from-zero, deliberately engine-side) · nulls `nullif()
+  greatest() least()` (null args ignored, Postgres-style) · strings `lpad()
+  rpad() left() right() split_part() strpos() repeat() reverse()` · dates
+  `date_add(unit, n, ts) date_diff(unit, a, b) make_date() epoch()
+  to_timestamp() strftime(ts, fmt)` (`%Y %m %d %H %M %S %y %%`; month/year
+  arithmetic clamps the day-of-month).
+- `TRY_CAST(x AS T)` — CAST that yields null instead of failing on a bad
+  value; the workhorse for dirty inputs. Never pushed down.
 - `DATE_TRUNC('minute', ts)` and `EXTRACT(minute FROM ts)` — units `year`,
   `month`, `day`, `hour`, `minute`, `second`. `EXTRACT` also accepts the
   ordinary two-argument call form. `STRLEN` is an alias for `LENGTH`.
@@ -477,8 +510,19 @@ SQL-ish, Pratt-parsed. Precedence (high→low): unary `- NOT` → `* / %` →
   `\1`…`\9` in the replacement expand to captured groups (`\0` is the whole
   match). A literal pattern is compiled at plan time, so a malformed one fails
   `check`. See §11 for the supported syntax.
-- `CREATE FUNCTION nome(a) AS <expr>;` — inlined at plan time; recursion and
-  arity mismatches are compile errors.
+- `CREATE [OR REPLACE] FUNCTION nome(a [TYPE] [DEFAULT <expr>], ...)` — two
+  body forms. `AS <expr>;` is a scalar function, inlined at plan time;
+  recursion and arity mismatches are compile errors, declared types are
+  checked against literal arguments at the call site, defaults fill omitted
+  trailing arguments. A body starting with `LOAD`/`FOR`/`CALL`/`SELECT`/`WITH`
+  is a **statement function** terminated by `END;` and invoked with
+  `CALL nome(args);` — its params bind like loop variables (`$name`,
+  `IDENTIFIER($name)`, `PUSHDOWN($f)`, `${name}` in strings), rendered per
+  call through the same machinery as a `FOR EACH ROW OF` body. CALL nesting is
+  depth-guarded (16); a statement function is not atomic — a mid-body failure
+  leaves earlier loads committed, exactly as if the statements were inline.
+  Plain re-declaration of a name is an error; `OR REPLACE` is the sanctioned
+  overwrite.
 
 ### `EXPLAIN`
 

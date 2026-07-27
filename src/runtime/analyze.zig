@@ -218,6 +218,28 @@ fn renameTo(renames: []const ast.SelectItem.Rename, n: []const u8) ?[]const u8 {
 
 /// A literal of the right type (value irrelevant) to stand in for a param during
 /// type-flow when it has no declared default.
+fn bindBodyVars(arena: std.mem.Allocator, stmts: []const ast.Stmt, map: *ParamMap) Error!void {
+    for (stmts) |s| switch (s) {
+        .for_each => |fe| {
+            for (fe.var_names, 0..) |vn, i| {
+                if (map.contains(vn)) continue;
+                const ty: ?types.Type = if (i < fe.var_types.len) fe.var_types[i] else null;
+                try map.put(vn, if (ty) |t| try typedZero(arena, t) else try mk(arena, .null_lit));
+            }
+            try bindBodyVars(arena, fe.body, map);
+        },
+        .func => |fd| if (fd.body == .stmts) {
+            for (fd.params) |p| {
+                if (map.contains(p.name)) continue;
+                try map.put(p.name, if (p.ty) |t| try typedZero(arena, t) else try mk(arena, .null_lit));
+            }
+            try bindBodyVars(arena, fd.body.stmts, map);
+        },
+        .match => |m| for (m.arms) |arm| try bindBodyVars(arena, arm.body, map),
+        else => {},
+    };
+}
+
 fn typedZero(arena: std.mem.Allocator, ty: types.Type) Error!*const ast.Expr {
     const e = try arena.create(ast.Expr);
     e.* = switch (ty.kind) {
@@ -349,6 +371,10 @@ pub fn analyze(arena: std.mem.Allocator, raw_program: ast.Program, resolver: ?Re
             return fail(diag, "`{s}` is declared twice: LET and PARAM share one name space", .{l.name});
         try params_map.put(l.name, try substExpr(arena, l.expr, &params_map));
     };
+    // Body-scoped variables (for-each loop vars, statement-fn params) bind per
+    // row/call at run time; for checking, a typed placeholder (or unknown-typed
+    // null) keeps `$var`-as-value expressions lenient instead of "unknown field".
+    try bindBodyVars(arena, program.stmts, &params_map);
 
     var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .resolver = resolver, .params = &params_map, .diag = diag };
 
