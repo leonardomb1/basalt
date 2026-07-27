@@ -291,8 +291,7 @@ const RowGroupMeta = struct {
 /// emits at the end of a file.
 const WRITE_BUF = 64 * 1024;
 
-/// The IANA type registered for Parquet. Only metadata on the stored object, but
-/// a reader fetching the blob over plain HTTP gets it right.
+/// The IANA-registered media type for Parquet.
 const parquet_content_type = "application/vnd.apache.parquet";
 
 pub const Writer = struct {
@@ -469,8 +468,13 @@ pub const Writer = struct {
                 try self.emit(packed_body);
 
                 values += @intCast(pgm.rows);
-                uncompressed += @intCast(raw.len);
-                compressed += @intCast(packed_body.len);
+                // Both totals count the page headers, per ColumnMetaData's
+                // "including the headers". A reader that bounds the chunk by
+                // total_compressed_size stops one header short of the last page
+                // otherwise — a truncated-page error in Arrow-based readers, and
+                // silently fine in ones that just walk headers to the row count.
+                uncompressed += @intCast(hdr.items.len + raw.len);
+                compressed += @intCast(hdr.items.len + packed_body.len);
             }
 
             cm.* = .{
@@ -513,8 +517,10 @@ pub const Writer = struct {
         try writeDictPageHeader(&dhdr, dict_body.items.len, dict_packed.len, cb.dict_order.items.len, std.hash.Crc32.hash(dict_packed));
         try self.emit(dhdr.items);
         try self.emit(dict_packed);
-        uncompressed += @intCast(dict_body.items.len);
-        compressed += @intCast(dict_packed.len);
+        // Headers included — see the note in flushRowGroup. A dictionary chunk
+        // carries two of them, so it is short by twice as much when they are not.
+        uncompressed += @intCast(dhdr.items.len + dict_body.items.len);
+        compressed += @intCast(dhdr.items.len + dict_packed.len);
 
         const data_start = self.offset;
 
@@ -536,8 +542,8 @@ pub const Writer = struct {
         try writeDictDataPageHeader(&hdr, body.items.len, packed_body.len, cb.defs.items.len, std.hash.Crc32.hash(packed_body));
         try self.emit(hdr.items);
         try self.emit(packed_body);
-        uncompressed += @intCast(body.items.len);
-        compressed += @intCast(packed_body.len);
+        uncompressed += @intCast(hdr.items.len + body.items.len);
+        compressed += @intCast(hdr.items.len + packed_body.len);
 
         return .{
             .offset = data_start,
@@ -1267,4 +1273,65 @@ test "an az:// target routes to the blob writer, never the local filesystem" {
         return;
     };
     try testing.expect(w.backend == .blob);
+}
+
+// A reader that bounds a column chunk by `total_compressed_size` — Arrow does,
+// and so StarRocks does — must find the chunk's last page whole. It did not:
+// both size totals omitted the page headers, leaving every chunk short by 29
+// bytes per page (58 for a dictionary chunk, which has two), surfacing as
+// "Page was smaller than expected". A lenient reader that just walks page
+// headers to the row count never noticed, which is why a round trip through
+// basalt's own reader stayed green.
+test "chunk size totals account for page headers" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ dir, "sizes.parquet" });
+
+    // `name` repeats, so it takes the dictionary path (two headers per chunk);
+    // `id` stays PLAIN (one). Both accounting sites are covered.
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "id", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "name", .ty = types.Type.init(.string).asNullable() },
+    } };
+
+    var w = try Writer.open(a, path, schema, .snappy);
+    const rows = 500;
+    var ids = try column.Builder.initCapacity(a, schema.fields[0].ty, rows);
+    var names = try column.Builder.initCapacity(a, schema.fields[1].ty, rows);
+    const vals = [_][]const u8{ "alpha", "beta", "gamma" };
+    for (0..rows) |i| {
+        try ids.append(.{ .int = @intCast(i) });
+        try names.append(.{ .string = vals[i % vals.len] });
+    }
+    var cols = [_]column.Column{ try ids.finish(), try names.finish() };
+    try w.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = rows });
+    try w.close();
+
+    const bytes = try std.fs.cwd().readFileAlloc(a, path, 1 << 24);
+    const trailer = bytes[bytes.len - pq.trailer_len ..];
+    const flen = std.mem.readInt(u32, trailer[0..4], .little);
+    const footer_start = bytes.len - pq.trailer_len - flen;
+    const md = try pq.parseFooter(a, bytes[footer_start..][0..flen]);
+
+    // Chunks are written back to back, so the next one's start — or the footer,
+    // for the last — is where this one truly ends.
+    var starts = std.array_list.Managed(i64).init(a);
+    for (md.row_groups) |g| for (g.columns) |c| try starts.append((c.meta.?).startOffset());
+    std.mem.sort(i64, starts.items, {}, std.sort.asc(i64));
+
+    for (md.row_groups) |g| for (g.columns) |c| {
+        const meta = c.meta.?;
+        const start = meta.startOffset();
+        var end: i64 = @intCast(footer_start);
+        for (starts.items) |s| if (s > start) {
+            end = s;
+            break;
+        };
+        try testing.expectEqual(end - start, meta.total_compressed_size);
+    };
 }

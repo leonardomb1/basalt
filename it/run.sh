@@ -264,8 +264,32 @@ SELECT id, name, amt, flag FROM 'src/connect/testdata/$c.parquet' ORDER BY id;";
     else
       report "parquet-interop (duckdb could not read basalt output)" bad
     fi
+
+    # Reading it back is not enough: duckdb walks page headers and so tolerates
+    # chunk sizes that Arrow-based readers (StarRocks, pyarrow) reject. Compare
+    # each chunk's declared total_compressed_size against where the next chunk
+    # actually starts. They were once 29 bytes apart — one uncounted page header
+    # — which surfaced only as "Page was smaller than expected", elsewhere.
+    if brun run -c "LOAD INTO '$out/sizes.parquet' AS SELECT * FROM '$volcsv';"; then
+      mismatch=$("$DUCK" -noheader -list -c "
+        SELECT COUNT(*) FROM (
+          SELECT total_compressed_size AS declared,
+                 LEAD(COALESCE(dictionary_page_offset, data_page_offset))
+                   OVER (ORDER BY COALESCE(dictionary_page_offset, data_page_offset))
+                 - COALESCE(dictionary_page_offset, data_page_offset) AS actual
+          FROM parquet_metadata('$out/sizes.parquet')
+        ) WHERE actual IS NOT NULL AND declared <> actual;" 2>/dev/null)
+      if [ "$mismatch" = "0" ]; then
+        report parquet-chunk-sizes ok
+      else
+        report "parquet-chunk-sizes ($mismatch chunk(s) misdeclared)" bad
+      fi
+    else
+      report "parquet-chunk-sizes (run error)" bad
+    fi
   else
     echo "SKIP parquet-interop (no duckdb)"
+    echo "SKIP parquet-chunk-sizes (no duckdb)"
   fi
 
   # Parquet over plain HTTP. This used to hit `std.fs.cwd().openFile("http://…")`
