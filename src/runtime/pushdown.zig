@@ -227,6 +227,8 @@ pub fn translateExpr(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dial
                 .ge => ">=",
                 .@"and" => "AND",
                 .@"or" => "OR",
+                // Arithmetic and bitwise stay engine-side: `^` is POWER on
+                // Postgres and SQL Server has no shift operators at all.
                 else => return null,
             };
             const l = (try translateExpr(arena, b.l, dialect, schema, check_fields)) orelse return null;
@@ -495,6 +497,28 @@ test "translatePred: unknown field and unsupported nodes are not pushed" {
     const call = try a.create(ast.Expr);
     call.* = .{ .call = .{ .name = "now", .args = &.{} } };
     try testing.expect((try translateExpr(a, call, .mysql, testSchema(), true)) == null);
+}
+
+test "translatePred: bitwise operators are never pushed down" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const four = try a.create(ast.Expr);
+    four.* = .{ .int_lit = 4 };
+
+    // `a & 4 = 4` — the AND is untranslatable, so the whole filter stays engine-side.
+    const masked = try bin(a, .bit_and, try fld(a, "a"), four);
+    const pred = try bin(a, .eq, masked, four);
+    for ([_]Dialect{ .mysql, .postgres, .sqlserver }) |d| {
+        try testing.expect((try translateExpr(a, pred, d, testSchema(), true)) == null);
+        try testing.expect((try translateExpr(a, masked, d, testSchema(), true)) == null);
+    }
+    for ([_]ast.BinOp{ .bit_or, .bit_xor, .shl, .shr }) |op| {
+        try testing.expect((try translateExpr(a, try bin(a, op, try fld(a, "a"), four), .mysql, testSchema(), true)) == null);
+    }
+    const notx = try a.create(ast.Expr);
+    notx.* = .{ .unary = .{ .op = .bit_not, .e = try fld(a, "a") } };
+    try testing.expect((try translateExpr(a, notx, .mysql, testSchema(), true)) == null);
 }
 
 test "planAgg: projects only referenced columns and pushes the filter" {

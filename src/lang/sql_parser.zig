@@ -429,7 +429,11 @@ pub const Parser = struct {
                 try buf.append(')');
             },
             .unary => |u| {
-                try buf.appendSlice(if (u.op == .not) "not " else "-");
+                try buf.appendSlice(switch (u.op) {
+                    .not => "not ",
+                    .neg => "-",
+                    .bit_not => "~",
+                });
                 try self.unparse(buf, u.e);
             },
             .cond => |c| {
@@ -1713,6 +1717,10 @@ pub const Parser = struct {
 
     const BinInfo = struct { op: ast.BinOp, lbp: u8 };
 
+    /// Binding powers, low to high: `or` 10, `and` 20, unary `not` 25, `??` 30,
+    /// comparisons 40, then the bitwise ladder `|` 42 / `^` 44 / `&` 46 /
+    /// shifts 48, then `+ - ||` 50 and `* / %` 60. So `flags & 4 = 4` is a
+    /// comparison of the AND, and `1 | 2 & 3` is `1 | (2 & 3)`.
     fn binInfo(self: *Parser) ?BinInfo {
         switch (self.curTag()) {
             .eq, .assign => return .{ .op = .eq, .lbp = 40 },
@@ -1721,6 +1729,11 @@ pub const Parser = struct {
             .le => return .{ .op = .le, .lbp = 40 },
             .gt => return .{ .op = .gt, .lbp = 40 },
             .ge => return .{ .op = .ge, .lbp = 40 },
+            .bar => return .{ .op = .bit_or, .lbp = 42 },
+            .caret => return .{ .op = .bit_xor, .lbp = 44 },
+            .amp => return .{ .op = .bit_and, .lbp = 46 },
+            .shl => return .{ .op = .shl, .lbp = 48 },
+            .shr => return .{ .op = .shr, .lbp = 48 },
             .plus => return .{ .op = .add, .lbp = 50 },
             .minus => return .{ .op = .sub, .lbp = 50 },
             .star => return .{ .op = .mul, .lbp = 60 },
@@ -1817,6 +1830,10 @@ pub const Parser = struct {
         if (self.eat(.minus)) {
             const e = try self.parseUnary();
             return self.mk(.{ .unary = .{ .op = .neg, .e = e } });
+        }
+        if (self.eat(.tilde)) {
+            const e = try self.parseUnary();
+            return self.mk(.{ .unary = .{ .op = .bit_not, .e = e } });
         }
         if (self.isKw("not") and !self.peekKw("like") and !self.peekKw("in")) {
             _ = self.advance();
@@ -1995,6 +2012,7 @@ fn binOpText(op: ast.BinOp) []const u8 {
         .add => "+",   .sub => "-",  .mul => "*",  .div => "/",  .mod => "%",
         .eq => "==",   .ne => "!=",  .lt => "<",   .le => "<=",  .gt => ">",
         .ge => ">=",   .@"and" => "and", .@"or" => "or",
+        .bit_and => "&", .bit_or => "|", .bit_xor => "^", .shl => "<<", .shr => ">>",
     };
 }
 
@@ -2021,6 +2039,53 @@ fn parseTest(a: std.mem.Allocator, src: []const u8) !ast.Program {
         if (e == error.ParseFailed) std.debug.print("parse error {d}:{d}: {s}\n", .{ diag.line, diag.col, diag.msg });
         return e;
     };
+}
+
+test "sql expr: bitwise precedence slots between comparisons and additive" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+
+    // `1 | 2 & 3` is `1 | (2 & 3)`
+    const or_e = try parseExprStr(a, "1 | 2 & 3", &diag);
+    try testing.expectEqual(ast.BinOp.bit_or, or_e.binary.op);
+    try testing.expectEqual(@as(i64, 1), or_e.binary.l.int_lit);
+    try testing.expectEqual(ast.BinOp.bit_and, or_e.binary.r.binary.op);
+
+    // `flags & 4 = 4` is a comparison of the AND
+    const cmp = try parseExprStr(a, "flags & 4 = 4", &diag);
+    try testing.expectEqual(ast.BinOp.eq, cmp.binary.op);
+    try testing.expectEqual(ast.BinOp.bit_and, cmp.binary.l.binary.op);
+
+    // `1 + 1 << 2` is `(1 + 1) << 2`
+    const sh = try parseExprStr(a, "1 + 1 << 2", &diag);
+    try testing.expectEqual(ast.BinOp.shl, sh.binary.op);
+    try testing.expectEqual(ast.BinOp.add, sh.binary.l.binary.op);
+
+    // `a ^ b | c` is `(a ^ b) | c`; `2 * 3 & 1` is `(2 * 3) & 1`
+    const xo = try parseExprStr(a, "a ^ b | c", &diag);
+    try testing.expectEqual(ast.BinOp.bit_or, xo.binary.op);
+    try testing.expectEqual(ast.BinOp.bit_xor, xo.binary.l.binary.op);
+    const ml = try parseExprStr(a, "2 * 3 & 1", &diag);
+    try testing.expectEqual(ast.BinOp.bit_and, ml.binary.op);
+    try testing.expectEqual(ast.BinOp.mul, ml.binary.l.binary.op);
+
+    // `~` binds like the other unaries; `and` is looser than every bitwise op
+    const bn = try parseExprStr(a, "~x & 1", &diag);
+    try testing.expectEqual(ast.BinOp.bit_and, bn.binary.op);
+    try testing.expectEqual(ast.UnOp.bit_not, bn.binary.l.unary.op);
+    const an = try parseExprStr(a, "x & 1 and y", &diag);
+    try testing.expectEqual(ast.BinOp.@"and", an.binary.op);
+    try testing.expectEqual(ast.BinOp.bit_and, an.binary.l.binary.op);
+
+    // `||` is still concat, not two bitwise ORs
+    const cc = try parseExprStr(a, "a || b", &diag);
+    try testing.expectEqualStrings("concat", cc.call.name);
+
+    try testing.expectEqualStrings("&", binOpText(.bit_and));
+    try testing.expectEqualStrings("<<", binOpText(.shl));
+    try testing.expectEqualStrings(">>", binOpText(.shr));
 }
 
 test "sql: terminal select from csv becomes read+write stdout" {

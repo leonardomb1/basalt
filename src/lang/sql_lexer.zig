@@ -244,12 +244,16 @@ pub const Lexer = struct {
             '-' => return self.make(.minus, self.src[start..self.i], line, col),
             '/' => return self.make(.slash, self.src[start..self.i], line, col),
             '%' => return self.make(.percent, self.src[start..self.i], line, col),
+            '&' => return self.make(.amp, self.src[start..self.i], line, col),
+            '^' => return self.make(.caret, self.src[start..self.i], line, col),
+            '~' => return self.make(.tilde, self.src[start..self.i], line, col),
             '|' => {
+                // `||` (concat) must win over the bitwise `|`.
                 if (self.i < self.src.len and self.src[self.i] == '|') {
                     _ = self.bump();
                     return self.make(.pipe, self.src[start..self.i], line, col);
                 }
-                return self.make(.invalid, self.src[start..self.i], line, col);
+                return self.make(.bar, self.src[start..self.i], line, col);
             },
             '=' => {
                 if (self.i < self.src.len and self.src[self.i] == '=') {
@@ -267,12 +271,20 @@ pub const Lexer = struct {
                     _ = self.bump();
                     return self.make(.ne, self.src[start..self.i], line, col);
                 }
+                if (self.i < self.src.len and self.src[self.i] == '<') {
+                    _ = self.bump();
+                    return self.make(.shl, self.src[start..self.i], line, col);
+                }
                 return self.make(.lt, self.src[start..self.i], line, col);
             },
             '>' => {
                 if (self.i < self.src.len and self.src[self.i] == '=') {
                     _ = self.bump();
                     return self.make(.ge, self.src[start..self.i], line, col);
+                }
+                if (self.i < self.src.len and self.src[self.i] == '>') {
+                    _ = self.bump();
+                    return self.make(.shr, self.src[start..self.i], line, col);
                 }
                 return self.make(.gt, self.src[start..self.i], line, col);
             },
@@ -346,4 +358,19 @@ test "sql lexer: block comments and operators" {
     try testing.expectEqual(tok.Tag.ne, toks[3].tag);
     try testing.expectEqual(tok.Tag.qq, toks[5].tag);
     try testing.expectEqual(tok.Tag.qdot, toks[7].tag);
+}
+
+test "sql lexer: bitwise operators stay distinct from concat and comparisons" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const toks = try tokenize(a, "a & b | c || d ^ ~e << 2 >> 3 < 4 > 5 <= 6 >= 7 <> 8");
+    const want = [_]tok.Tag{
+        .ident, .amp,   .ident, .bar, .ident, .pipe,  .ident, .caret, .tilde, .ident,
+        .shl,   .int,   .shr,   .int, .lt,    .int,   .gt,    .int,   .le,    .int,
+        .ge,    .int,   .ne,    .int, .eof,
+    };
+    try testing.expectEqual(want.len, toks.len);
+    for (want, toks) |w, t| try testing.expectEqual(w, t.tag);
 }
