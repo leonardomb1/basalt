@@ -10,6 +10,7 @@
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
 const parser = @import("../lang/sql_parser.zig");
+const include = @import("../lang/include.zig");
 const runtime = @import("../runtime/run.zig");
 const walmod = @import("../connect/wal.zig");
 const request = @import("../connect/request.zig");
@@ -263,9 +264,11 @@ fn loadDir(gpa: std.mem.Allocator, dir_path: []const u8) !Registry {
             std.debug.print("skip {s}: read failed: {s}\n", .{ entry.name, @errorName(e) });
             continue;
         };
-        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const prog = parser.parseSource(a, text, &pdiag) catch {
-            std.debug.print("skip {s}: {d}:{d}: {s}\n", .{ entry.name, pdiag.line, pdiag.col, pdiag.msg });
+        // `@include` paths in an endpoint script resolve against the served dir.
+        var pdiag: include.Diag = .{};
+        const prog = include.loadProgram(a, text, entry.name, dir_path, &pdiag) catch {
+            const at = if (pdiag.label.len > 0) pdiag.label else entry.name;
+            std.debug.print("skip {s}: {s}:{d}:{d}: {s}\n", .{ entry.name, at, pdiag.parse.line, pdiag.parse.col, pdiag.parse.msg });
             continue;
         };
         if (prog.stmts.len == 0 or prog.stmts[0] != .kind or prog.stmts[0].kind.kind != .http) {

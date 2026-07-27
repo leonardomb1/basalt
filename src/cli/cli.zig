@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const parser = @import("../lang/sql_parser.zig");
+const include = @import("../lang/include.zig");
 const ast = @import("../lang/ast.zig");
 const runtime = @import("../runtime/run.zig");
 const obs = @import("../runtime/obs.zig");
@@ -78,7 +79,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
 }
 
 /// A script source plus a label used in diagnostics (a file path, or `<command>`).
-const Source = struct { label: []const u8, text: []const u8 };
+/// `dir` is what `@include 'p.sql'` resolves against: the script's own directory,
+/// or the cwd for an inline/stdin script.
+const Source = struct { label: []const u8, text: []const u8, dir: []const u8 = "." };
 
 /// Resolve the script source: `-c/--command <text>` for an inline script, else the
 /// positional <script> path read from disk. Prints diagnostics and returns null on
@@ -114,16 +117,20 @@ fn loadSource(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8, stderr
         try stderr.print("error: cannot read `{s}`: {s}\n", .{ path, @errorName(e) });
         return null;
     };
-    return Source{ .label = path, .text = text };
+    return Source{ .label = path, .text = text, .dir = std.fs.path.dirname(path) orelse "." };
 }
 
-/// Parse a resolved source, printing a located diagnostic on failure. The AST is
-/// allocated in `arena` and slices into `src.text`, so both must outlive use.
+/// Parse a resolved source (resolving its `@include` header first), printing a
+/// located diagnostic on failure. The AST is allocated in `arena` and slices into
+/// `src.text` and the included files' texts, so all must outlive use. The
+/// diagnostic names the file it came from — an included file reports its own
+/// path and its own line numbers.
 fn parseSrc(arena: std.mem.Allocator, src: Source, stderr: *std.Io.Writer) !?ast.Program {
-    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    return parser.parseSource(arena, src.text, &diag) catch |e| switch (e) {
+    var diag: include.Diag = .{};
+    return include.loadProgram(arena, src.text, src.label, src.dir, &diag) catch |e| switch (e) {
         error.ParseFailed => {
-            try stderr.print("{s}:{d}:{d}: error: {s}\n", .{ src.label, diag.line, diag.col, diag.msg });
+            const label = if (diag.label.len > 0) diag.label else src.label;
+            try stderr.print("{s}:{d}:{d}: error: {s}\n", .{ label, diag.parse.line, diag.parse.col, diag.parse.msg });
             return null;
         },
         error.OutOfMemory => return e,
@@ -691,10 +698,17 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *s
     try buf.appendSlice(block);
     const text = buf.items;
 
-    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = parser.parseSource(a, text, &diag) catch |e| switch (e) {
+    // An entry may open with `@include 'p.sql';` (paths relative to the cwd): the
+    // file's text is parsed with the entry as one program, so its declarations are
+    // in scope for the statements typed below it. They live as long as the entry —
+    // the REPL keeps no session store.
+    var diag: include.Diag = .{};
+    const prog = include.loadProgram(a, text, "<repl>", ".", &diag) catch |e| switch (e) {
         error.ParseFailed => {
-            try msg.print("error: {d}:{d}: {s}\n", .{ diag.line, diag.col, diag.msg });
+            if (diag.label.len > 0 and !std.mem.eql(u8, diag.label, "<repl>"))
+                try msg.print("error: {s}:{d}:{d}: {s}\n", .{ diag.label, diag.parse.line, diag.parse.col, diag.parse.msg })
+            else
+                try msg.print("error: {d}:{d}: {s}\n", .{ diag.parse.line, diag.parse.col, diag.parse.msg });
             try msg.flush();
             return;
         },
