@@ -26,8 +26,8 @@ pub const QualName = struct {
     }
 };
 
-pub const BinOp = enum { add, sub, mul, div, mod, eq, ne, lt, le, gt, ge, @"and", @"or" };
-pub const UnOp = enum { neg, not };
+pub const BinOp = enum { add, sub, mul, div, mod, bit_and, bit_or, bit_xor, shl, shr, eq, ne, lt, le, gt, ge, @"and", @"or" };
+pub const UnOp = enum { neg, not, bit_not };
 
 pub const Expr = union(enum) {
     null_lit,

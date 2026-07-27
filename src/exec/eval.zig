@@ -43,6 +43,7 @@ pub const TypeCtx = struct {
                 return switch (u.op) {
                     .neg => if (numericish(t)) t else self.err("`-` needs a numeric operand", .{}),
                     .not => if (boolish(t)) Type.init(.bool).withNull(t.nullable) else self.err("`not` needs a bool operand", .{}),
+                    .bit_not => if (intish(t)) Type.init(.int).withNull(t.nullable or t.unknown) else self.err("`~` needs an INT operand", .{}),
                 };
             },
             .binary => |b| return self.typeOfBinary(b),
@@ -83,6 +84,11 @@ pub const TypeCtx = struct {
                 if (!(numericish(lt) and numericish(rt))) return self.err("arithmetic needs numeric operands", .{});
                 const k: types.TypeKind = if (lt.kind == .float or rt.kind == .float or lt.kind == .decimal or rt.kind == .decimal) .float else .int;
                 return Type{ .kind = k, .nullable = nn };
+            },
+            // Bitwise ops are INT-only: no float coercion, no string coercion.
+            .bit_and, .bit_or, .bit_xor, .shl, .shr => {
+                if (!(intish(lt) and intish(rt))) return self.err("bitwise operators need INT operands", .{});
+                return Type{ .kind = .int, .nullable = nn };
             },
             .eq, .ne, .lt, .le, .gt, .ge => {
                 if (!comparable(lt, rt) and
@@ -155,6 +161,18 @@ pub const TypeCtx = struct {
         }
         if (eq(name, "length") or eq(name, "strlen")) {
             const a = try self.argType(c, 0);
+            return Type.init(.int).withNull(a.nullable);
+        }
+        if (eq(name, "bit_count") or eq(name, "to_hex")) {
+            const a = try self.argType(c, 0);
+            if (c.args.len != 1 or !intish(a)) return self.err("`{s}` takes one INT argument", .{name});
+            const out: types.TypeKind = if (eq(name, "to_hex")) .string else .int;
+            return Type.init(out).withNull(a.nullable);
+        }
+        if (eq(name, "from_hex")) {
+            const a = try self.argType(c, 0);
+            if (c.args.len != 1 or !(a.kind == .string or a.kind == .bytes or a.unknown))
+                return self.err("`from_hex` takes one STRING argument", .{});
             return Type.init(.int).withNull(a.nullable);
         }
         if (eq(name, "concat")) {
@@ -444,6 +462,9 @@ fn boolish(t: Type) bool {
 }
 fn temporalish(t: Type) bool {
     return t.kind == .date or t.kind == .timestamp or t.unknown;
+}
+fn intish(t: Type) bool {
+    return t.kind == .int or t.unknown;
 }
 fn comparable(a: Type, b: Type) bool {
     if (a.unknown or b.unknown) return true;
@@ -780,6 +801,8 @@ fn unaryVec(arena: std.mem.Allocator, u: ast.Expr.Unary, batch: Batch) VecError!
                 return mkCol(c.ty, n, c.validity, .{ .b = out });
             },
         },
+        // Handled rowwise, like the binary bitwise ops.
+        .bit_not => return error.Unsupported,
     }
 }
 
@@ -808,6 +831,8 @@ fn isNullVec(arena: std.mem.Allocator, n: ast.Expr.IsNull, batch: Batch) VecErro
 fn binaryVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecError!Vec {
     switch (b.op) {
         .@"and", .@"or" => return boolOpVec(arena, b.op, b.l, b.r, batch),
+        // No vectorized kernel yet — the rowwise evaluator owns bitwise ops.
+        .bit_and, .bit_or, .bit_xor, .shl, .shr => return error.Unsupported,
         .add, .sub, .mul, .div, .mod => {
             const l = try evalVec(arena, b.l, batch);
             const r = try evalVec(arena, b.r, batch);
@@ -1363,6 +1388,10 @@ pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, ro
                     else => error.TypeMismatch,
                 },
                 .not => .{ .bool = !v.bool },
+                .bit_not => switch (v) {
+                    .int => |x| .{ .int = ~x },
+                    else => error.TypeMismatch,
+                },
             };
         },
         .binary => |b| return evalBinary(arena, b, batch, row),
@@ -1420,6 +1449,7 @@ fn evalBinary(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch, row: u
             if (l.isNull() or r.isNull()) return .null;
             return switch (b.op) {
                 .add, .sub, .mul, .div, .mod => arith(b.op, l, r),
+                .bit_and, .bit_or, .bit_xor, .shl, .shr => bitwise(b.op, l, r),
                 .eq, .ne, .lt, .le, .gt, .ge => blk: {
                     const ord = compareValues(l, r) orelse break :blk error.TypeMismatch;
                     break :blk Value{ .bool = cmpResult(b.op, ord) };
@@ -1453,6 +1483,35 @@ fn arith(op: ast.BinOp, l: Value, r: Value) EvalError!Value {
         .mod => .{ .float = @mod(a, b) },
         else => unreachable,
     };
+}
+
+/// INT-only bitwise ops. Null propagation happens in the caller.
+fn bitwise(op: ast.BinOp, l: Value, r: Value) EvalError!Value {
+    if (l != .int or r != .int) return error.TypeMismatch;
+    const a = l.int;
+    const b = r.int;
+    return switch (op) {
+        .bit_and => .{ .int = a & b },
+        .bit_or => .{ .int = a | b },
+        .bit_xor => .{ .int = a ^ b },
+        .shl => .{ .int = shiftLeft(a, b) },
+        .shr => .{ .int = shiftRight(a, b) },
+        else => unreachable,
+    };
+}
+
+/// Shift counts outside 0..63 are defined, never UB: they shift every bit out.
+/// `<<` therefore yields 0, and the arithmetic `>>` yields 0 or -1 depending on
+/// the sign bit — but only for an over-wide count; a negative count is 0 either
+/// way (there is no implied direction flip).
+fn shiftLeft(a: i64, n: i64) i64 {
+    const s = std.math.cast(u6, n) orelse return 0;
+    return @bitCast(@as(u64, @bitCast(a)) << s);
+}
+
+fn shiftRight(a: i64, n: i64) i64 {
+    const s = std.math.cast(u6, n) orelse return if (n > 0 and a < 0) -1 else 0;
+    return a >> s;
 }
 
 fn cmpResult(op: ast.BinOp, ord: std.math.Order) bool {
@@ -1548,6 +1607,23 @@ fn evalCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
         return .{ .int = @intCast((try valueToString(arena, v)).len) };
+    }
+    if (eq(name, "bit_count")) {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return .null;
+        if (v != .int) return error.TypeMismatch;
+        return .{ .int = @intCast(@popCount(v.int)) };
+    }
+    if (eq(name, "to_hex")) {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return .null;
+        if (v != .int) return error.TypeMismatch;
+        return .{ .string = try std.fmt.allocPrint(arena, "{x}", .{@as(u64, @bitCast(v.int))}) };
+    }
+    if (eq(name, "from_hex")) {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return .null;
+        return .{ .int = try parseHexI64(try valueToString(arena, v)) };
     }
     if (eq(name, "concat")) {
         var buf = std.array_list.Managed(u8).init(arena);
@@ -2320,6 +2396,18 @@ fn trim(s: []const u8) []const u8 {
     return std.mem.trim(u8, s, " \t\r\n");
 }
 
+/// `from_hex`: optional `0x` prefix, either case, and 16 digits' worth of range
+/// (so `to_hex` of a negative round-trips). Fail-loud on junk or overflow —
+/// nullability is the caller's to compose, e.g. `if(like(s, '%'), …)`.
+fn parseHexI64(s: []const u8) EvalError!i64 {
+    var t = trim(s);
+    if (t.len >= 2 and t[0] == '0' and (t[1] == 'x' or t[1] == 'X')) t = t[2..];
+    if (t.len == 0) return error.CastFailed;
+    for (t) |ch| if (!std.ascii.isHex(ch)) return error.CastFailed;
+    const u = std.fmt.parseUnsigned(u64, t, 16) catch return error.CastFailed;
+    return @bitCast(u);
+}
+
 fn toI64(v: Value) i64 {
     return switch (v) {
         .int => |x| x,
@@ -2582,6 +2670,109 @@ test "vectorized string kernels match the rowwise evaluator" {
                 } else try std.testing.expect(false);
             }
         }
+    }
+}
+
+test "bitwise operators and hex builtins" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "x", .ty = Type.init(.int).asNullable() },
+        .{ .name = "s", .ty = Type.init(.string) },
+    } };
+    const x = try column.intColumn(a, &.{ -8, null });
+    var sb = column.Builder.init(a, Type.init(.string));
+    try sb.append(.{ .string = "0xFF" });
+    try sb.append(.{ .string = "ff" });
+    var cols = [_]column.Column{ x, try sb.finish() };
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 2 };
+
+    const S = struct {
+        fn checked(al: std.mem.Allocator, sch: types.Schema, src: []const u8) !struct { *ast.Expr, Type } {
+            var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+            const e = try parser.parseExprStr(al, src, &diag);
+            var ctx = TypeCtx{ .schema = sch, .arena = al };
+            return .{ e, try ctx.typeOf(e) };
+        }
+    };
+
+    // Row 0 has x = -8. Every case is INT-typed and evaluated on the rowwise
+    // path (the vectorizer has no bitwise kernel).
+    const ints = [_]struct { src: []const u8, want: i64 }{
+        .{ .src = "1 | 2 & 3", .want = 3 },
+        .{ .src = "6 & 3", .want = 2 },
+        .{ .src = "6 ^ 3", .want = 5 },
+        .{ .src = "1 + 1 << 2", .want = 8 },
+        .{ .src = "~0", .want = -1 },
+        .{ .src = "~x", .want = 7 },
+        .{ .src = "x >> 1", .want = -4 },
+        .{ .src = "1 << 63 >> 63", .want = -1 },
+        // shift edges: never UB, never a panic
+        .{ .src = "1 << 64", .want = 0 },
+        .{ .src = "8 << -1", .want = 0 },
+        .{ .src = "8 >> 100", .want = 0 },
+        .{ .src = "x >> 100", .want = -1 },
+        .{ .src = "x >> -1", .want = 0 },
+        .{ .src = "bit_count(255)", .want = 8 },
+        .{ .src = "bit_count(~0)", .want = 64 },
+        .{ .src = "bit_count(0)", .want = 0 },
+        .{ .src = "from_hex('ff')", .want = 255 },
+        .{ .src = "from_hex('0xFF')", .want = 255 },
+        .{ .src = "from_hex(s)", .want = 255 },
+        .{ .src = "from_hex(to_hex(x))", .want = -8 },
+        .{ .src = "from_hex(to_hex(0))", .want = 0 },
+    };
+    for (ints) |c| {
+        const e, const t = try S.checked(a, schema, c.src);
+        try std.testing.expectEqual(types.TypeKind.int, t.kind);
+        const col = try evalColumn(a, e, batch, t);
+        try std.testing.expectEqual(c.want, col.getValue(0).int);
+        try std.testing.expectEqual(c.want, (try evalRow(a, e, batch, 0)).int);
+    }
+
+    const hex = [_]struct { src: []const u8, want: []const u8 }{
+        .{ .src = "to_hex(255)", .want = "ff" },
+        .{ .src = "to_hex(0)", .want = "0" },
+        .{ .src = "to_hex(-1)", .want = "ffffffffffffffff" },
+        .{ .src = "to_hex(x)", .want = "fffffffffffffff8" },
+    };
+    for (hex) |c| {
+        const e, const t = try S.checked(a, schema, c.src);
+        try std.testing.expectEqual(types.TypeKind.string, t.kind);
+        const col = try evalColumn(a, e, batch, t);
+        try std.testing.expectEqualStrings(c.want, col.getValue(0).string);
+    }
+
+    // Row 1 has x = null: it propagates through every new op.
+    const nulls = [_][]const u8{ "x & 1", "x | 1", "x ^ 1", "x << 1", "x >> 1", "~x", "bit_count(x)", "to_hex(x)", "from_hex(to_hex(x))" };
+    for (nulls) |src| {
+        const e, const t = try S.checked(a, schema, src);
+        try std.testing.expect(t.nullable);
+        try std.testing.expect((try evalColumn(a, e, batch, t)).getValue(1).isNull());
+        try std.testing.expect((try evalRow(a, e, batch, 1)).isNull());
+    }
+
+    // Bitwise ops de-vectorize on purpose, so the rowwise path always runs.
+    {
+        const pair = try S.checked(a, schema, "x & 1");
+        try std.testing.expectError(error.Unsupported, evalVec(a, pair[0], batch));
+    }
+
+    // `from_hex` is fail-loud: junk and overflow raise instead of nulling.
+    for ([_][]const u8{ "from_hex('zz')", "from_hex('')", "from_hex('0x')", "from_hex('1ffffffffffffffff')" }) |src| {
+        const e, const t = try S.checked(a, schema, src);
+        try std.testing.expectError(error.CastFailed, evalRow(a, e, batch, 0));
+        try std.testing.expectError(error.CastFailed, evalColumn(a, e, batch, t));
+    }
+
+    // Anything but INT is a check-time type error.
+    for ([_][]const u8{ "s & 1", "1.5 & 1", "1 << 1.5", "~s", "bit_count(s)", "to_hex(s)", "from_hex(1)" }) |src| {
+        var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const e = try parser.parseExprStr(a, src, &diag);
+        var ctx = TypeCtx{ .schema = schema, .arena = a };
+        try std.testing.expectError(error.TypeError, ctx.typeOf(e));
     }
 }
 
