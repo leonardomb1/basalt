@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const ast = @import("ast.zig");
+const types = @import("types.zig");
 
 pub const Error = error{ OutOfMemory, ExpandFailed };
 
@@ -30,7 +31,13 @@ const Subst = std.StringHashMap(*ast.Expr);
 /// offline `check`).
 pub fn expandProgram(arena: std.mem.Allocator, program: ast.Program, body: ?[]const u8, msg: *[]const u8) Error!ast.Program {
     var fns = std.StringHashMap(ast.FnDecl).init(arena);
-    for (program.stmts) |s| if (s == .func) try fns.put(s.func.name, s.func);
+    for (program.stmts) |s| if (s == .func) {
+        if (!s.func.replace and fns.contains(s.func.name)) {
+            msg.* = std.fmt.allocPrint(arena, "function `{s}` is already defined — use CREATE OR REPLACE FUNCTION", .{s.func.name}) catch "duplicate CREATE FUNCTION";
+            return error.ExpandFailed;
+        }
+        try fns.put(s.func.name, s.func);
+    };
 
     var json = std.StringHashMap(?std.json.Value).init(arena);
     var has_json = false;
@@ -49,7 +56,9 @@ pub fn expandProgram(arena: std.mem.Allocator, program: ast.Program, body: ?[]co
     var cx = Ctx{ .arena = arena, .fns = &fns, .json = &json, .msg = msg };
     var out = std.array_list.Managed(ast.Stmt).init(arena);
     for (program.stmts) |s| {
-        if (s == .func) continue;
+        // Expression-form declarations are inlined at their call sites and dropped;
+        // statement-form ones survive as the macro table `CALL` renders at run time.
+        if (s == .func and s.func.body == .expr) continue;
         try out.append(try expandStmt(&cx, s));
     }
     return .{ .stmts = try out.toOwnedSlice() };
@@ -71,8 +80,48 @@ fn expandStmt(cx: *Ctx, s: ast.Stmt) Error!ast.Stmt {
             break :blk .{ .for_each = .{ .var_names = fe.var_names, .var_types = fe.var_types, .source = fe.source, .hints = fe.hints, .body = try body.toOwnedSlice(), .pos = fe.pos } };
         },
         .match => |m| .{ .match = try expandStmtMatch(cx, m) },
-        .func => unreachable,
+        .call => |c| try expandCallStmt(cx, c),
+        // Only the statement form reaches here (expandProgram drops the expression
+        // form); its block is expanded so nested user fns / JSON params resolve.
+        .func => |fd| .{ .func = .{
+            .name = fd.name,
+            .params = fd.params,
+            .body = .{ .stmts = try expandBlock(cx, fd.body.stmts) },
+            .replace = fd.replace,
+            .pos = fd.pos,
+        } },
     };
+}
+
+/// Expand a statement block, dropping any nested `fn` declaration (only
+/// top-level declarations are collected, as they always have been).
+fn expandBlock(cx: *Ctx, stmts: []const ast.Stmt) Error![]const ast.Stmt {
+    var out = std.array_list.Managed(ast.Stmt).init(cx.arena);
+    for (stmts) |st| {
+        if (st == .func) continue;
+        try out.append(try expandStmt(cx, st));
+    }
+    return try out.toOwnedSlice();
+}
+
+/// Resolve a `CALL f(args)` against the declaration table: the name must exist and
+/// be statement-form, and the argument list must match after defaults are filled.
+/// The arguments themselves stay as expressions — `run.zig` const-evaluates them
+/// against the params / loop variables in scope at the call site.
+fn expandCallStmt(cx: *Ctx, c: ast.CallStmt) Error!ast.Stmt {
+    const fd = cx.fns.get(c.name) orelse {
+        cx.msg.* = std.fmt.allocPrint(cx.arena, "CALL: no function named `{s}`", .{c.name}) catch "CALL: unknown function";
+        return error.ExpandFailed;
+    };
+    if (fd.body == .expr) {
+        cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}` is a scalar function — use it in an expression, not CALL", .{c.name}) catch "CALL of a scalar function";
+        return error.ExpandFailed;
+    }
+    const args = try cx.arena.alloc(*ast.Expr, c.args.len);
+    for (c.args, 0..) |a, i| args[i] = try expandExpr(cx, a, null, 0);
+    const full = try fillDefaults(cx, fd, args);
+    try checkArgTypes(cx, fd, full);
+    return .{ .call = .{ .name = c.name, .args = full, .pos = c.pos } };
 }
 
 fn expandAttrs(cx: *Ctx, attrs: []const ast.Attr) Error![]const ast.Attr {
@@ -256,15 +305,96 @@ fn expandCall(cx: *Ctx, c: ast.Expr.Call, subst: ?*Subst, depth: usize) Error!*a
     for (c.args, 0..) |a, i| args[i] = try expandExpr(cx, a, subst, depth);
 
     if (cx.fns.get(c.name)) |fd| {
-        if (fd.params.len != args.len) {
-            cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}` expects {d} argument(s), got {d}", .{ c.name, fd.params.len, args.len }) catch "fn arity mismatch";
+        if (fd.body == .stmts) {
+            cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}` is a statement function — invoke it with CALL", .{c.name}) catch "statement fn used as an expression";
             return error.ExpandFailed;
         }
+        const full = try fillDefaults(cx, fd, args);
+        try checkArgTypes(cx, fd, full);
         var inner = Subst.init(cx.arena);
-        for (fd.params, args) |pn, av| try inner.put(pn, av);
-        return expandExpr(cx, fd.body, &inner, depth + 1);
+        for (fd.params, full) |p, av| try inner.put(p.name, av);
+        return expandExpr(cx, fd.body.expr, &inner, depth + 1);
     }
     return mk(cx, .{ .call = .{ .name = c.name, .args = args } });
+}
+
+/// Pad a short argument list from the declaration's trailing `DEFAULT` expressions.
+/// A default is expanded scope-free (no caller substitutions in view), so it may
+/// only mention literals and other expression-form functions — never the caller's
+/// columns or the function's own parameters.
+fn fillDefaults(cx: *Ctx, fd: ast.FnDecl, args: []const *ast.Expr) Error![]const *ast.Expr {
+    if (args.len == fd.params.len) return args;
+    fill: {
+        if (args.len > fd.params.len) break :fill;
+        for (fd.params[args.len..]) |p| if (p.default == null) break :fill;
+        const full = try cx.arena.alloc(*ast.Expr, fd.params.len);
+        @memcpy(full[0..args.len], args);
+        for (fd.params[args.len..], args.len..) |p, i| full[i] = try expandExpr(cx, p.default.?, null, 0);
+        return full;
+    }
+    var required: usize = 0;
+    for (fd.params) |p| {
+        if (p.default == null) required += 1;
+    }
+    cx.msg.* = (if (required == fd.params.len)
+        std.fmt.allocPrint(cx.arena, "`{s}` expects {d} argument(s), got {d}", .{ fd.name, fd.params.len, args.len })
+    else
+        std.fmt.allocPrint(cx.arena, "`{s}` expects {d} to {d} argument(s), got {d}", .{ fd.name, required, fd.params.len, args.len })) catch "fn arity mismatch";
+    return error.ExpandFailed;
+}
+
+/// Check declared parameter types against the arguments. Expansion has expressions,
+/// not values, so only a literal argument is decidable — anything else (a column, a
+/// call, a param) passes through and is checked downstream by the type-checker,
+/// exactly as an untyped parameter always was.
+fn checkArgTypes(cx: *Ctx, fd: ast.FnDecl, args: []const *ast.Expr) Error!void {
+    for (fd.params, args, 1..) |p, a, n| {
+        const want = (p.ty orelse continue).kind;
+        const got = literalKind(a) orelse continue;
+        if (acceptsLiteral(want, got)) continue;
+        cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}`: argument {d} (`{s}`) expects {s}, got {s}", .{ fd.name, n, p.name, typeWord(want), typeWord(got) }) catch "fn argument type mismatch";
+        return error.ExpandFailed;
+    }
+}
+
+/// The type of an argument that is a literal, or null when it is anything else.
+/// `null` is a literal but assignable to every type, so it reports null too.
+fn literalKind(e: *const ast.Expr) ?types.TypeKind {
+    return switch (e.*) {
+        .bool_lit => types.TypeKind.bool,
+        .int_lit => types.TypeKind.int,
+        .float_lit => types.TypeKind.float,
+        .str_lit => types.TypeKind.string,
+        else => null,
+    };
+}
+
+fn acceptsLiteral(want: types.TypeKind, got: types.TypeKind) bool {
+    if (want == got) return true;
+    return switch (want) {
+        // Implicit widening, as everywhere else in the type system.
+        .float, .decimal => got == .int or got == .float,
+        // Temporals and bytes are written as string literals ('2026-01-01') and
+        // coerced downstream, so a string argument is not a mistake.
+        .date, .time, .timestamp, .bytes => got == .string,
+        else => false,
+    };
+}
+
+fn typeWord(k: types.TypeKind) []const u8 {
+    return switch (k) {
+        .bool => "BOOL",
+        .int => "INT",
+        .float => "FLOAT",
+        .decimal => "DECIMAL",
+        .string => "STRING",
+        .bytes => "BYTES",
+        .date => "DATE",
+        .time => "TIME",
+        .timestamp => "TIMESTAMP",
+        .array => "ARRAY",
+        .@"struct" => "STRUCT",
+    };
 }
 
 test "expansion preserves is_empty kind and match structure (via rebuildExpr)" {
@@ -321,6 +451,119 @@ test "expandProgram rejects recursion and arity mismatch" {
     var m2: []const u8 = "";
     try std.testing.expectError(error.ExpandFailed, expandProgram(a, p2, null, &m2));
     try std.testing.expect(std.mem.indexOf(u8, m2, "expects 1 argument(s), got 2") != null);
+}
+
+/// Parse + expand, returning the error message instead of the program.
+fn expandErr(a: std.mem.Allocator, src: []const u8) ![]const u8 {
+    const parser = @import("sql_parser.zig");
+    var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const prog = parser.parseSource(a, src, &diag) catch |e| {
+        std.debug.print("parse error {d}:{d}: {s}\n", .{ diag.line, diag.col, diag.msg });
+        return e;
+    };
+    var msg: []const u8 = "";
+    try std.testing.expectError(error.ExpandFailed, expandProgram(a, prog, null, &msg));
+    return msg;
+}
+
+test "expandProgram: DEFAULT parameters fill missing trailing arguments" {
+    const parser = @import("sql_parser.zig");
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a, "CREATE FUNCTION round_to(x, n INT DEFAULT 2) AS round(x, n);\n" ++
+        "SELECT round_to(v) AS r, round_to(v, 4) AS r4 FROM 'x';", &diag);
+    var msg: []const u8 = "";
+    const out = try expandProgram(a, prog, null, &msg);
+    const sel = outputSelect(out);
+    try std.testing.expectEqualStrings("round", sel[0].computed.expr.call.name);
+    try std.testing.expectEqual(@as(i64, 2), sel[0].computed.expr.call.args[1].int_lit);
+    try std.testing.expectEqual(@as(i64, 4), sel[1].computed.expr.call.args[1].int_lit);
+}
+
+test "expandProgram: a declared parameter type rejects a wrong-kind literal" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const m = try expandErr(a, "CREATE FUNCTION margin(rev FLOAT, cost FLOAT) AS (rev - cost) / rev;\n" ++
+        "SELECT margin('x', 1) AS m FROM 'd';");
+    try std.testing.expectEqualStrings("`margin`: argument 1 (`rev`) expects FLOAT, got STRING", m);
+
+    // An int literal widens into a FLOAT parameter, and a non-literal argument is
+    // undecidable here — both pass through to the type-checker as before.
+    const parser = @import("sql_parser.zig");
+    var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a, "CREATE FUNCTION margin(rev FLOAT, cost FLOAT) AS rev - cost;\n" ++
+        "SELECT margin(7, amount) AS m FROM 'd';", &diag);
+    var msg: []const u8 = "";
+    const out = try expandProgram(a, prog, null, &msg);
+    try std.testing.expect(outputSelect(out)[0].computed.expr.* == .binary);
+}
+
+test "expandProgram: duplicate CREATE FUNCTION needs OR REPLACE" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const m = try expandErr(a, "CREATE FUNCTION f(x) AS x + 1;\nCREATE FUNCTION f(x) AS x + 2;\n" ++
+        "SELECT f(id) AS v FROM 'd';");
+    try std.testing.expect(std.mem.indexOf(u8, m, "already defined") != null);
+
+    const parser = @import("sql_parser.zig");
+    var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a, "CREATE FUNCTION f(x) AS x + 1;\nCREATE OR REPLACE FUNCTION f(x) AS x + 2;\n" ++
+        "SELECT f(id) AS v FROM 'd';", &diag);
+    var msg: []const u8 = "";
+    const out = try expandProgram(a, prog, null, &msg);
+    try std.testing.expectEqual(@as(i64, 2), outputSelect(out)[0].computed.expr.binary.r.int_lit);
+}
+
+test "expandProgram: statement functions survive, and the two forms don't cross over" {
+    const parser = @import("sql_parser.zig");
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a, "CREATE FUNCTION inc(x) AS x + 1;\n" ++
+        "CREATE FUNCTION sync(name) AS\n  LOAD INTO 'out_${name}.csv' AS SELECT inc(id) AS id FROM 'in.csv';\nEND;\n" ++
+        "CALL sync('a');", &diag);
+    var msg: []const u8 = "";
+    const out = try expandProgram(a, prog, null, &msg);
+
+    // The scalar declaration is dropped; the statement one is kept, with its body
+    // expanded (the nested `inc` call is already inlined).
+    var fns: usize = 0;
+    var calls: usize = 0;
+    for (out.stmts) |s| switch (s) {
+        .func => |fd| {
+            fns += 1;
+            try std.testing.expect(fd.body == .stmts);
+            const e = fd.body.stmts[0].output.stages[1].node.select[0].computed.expr;
+            try std.testing.expect(e.* == .binary);
+        },
+        .call => |c| {
+            calls += 1;
+            try std.testing.expectEqualStrings("sync", c.name);
+            try std.testing.expectEqualStrings("a", c.args[0].str_lit);
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), fns);
+    try std.testing.expectEqual(@as(usize, 1), calls);
+
+    const m1 = try expandErr(a, "CREATE FUNCTION inc(x) AS x + 1;\nCALL inc(1);\nSELECT id FROM 'd';");
+    try std.testing.expect(std.mem.indexOf(u8, m1, "scalar function") != null);
+
+    const m2 = try expandErr(a, "CREATE FUNCTION sync(n) AS\n  LOAD INTO 'o.csv' AS SELECT * FROM 'i.csv';\nEND;\n" ++
+        "SELECT sync(id) AS v FROM 'd';");
+    try std.testing.expect(std.mem.indexOf(u8, m2, "statement function") != null);
+
+    const m3 = try expandErr(a, "CREATE FUNCTION sync(n, m) AS\n  LOAD INTO 'o.csv' AS SELECT * FROM 'i.csv';\nEND;\n" ++
+        "CALL sync('x');");
+    try std.testing.expectEqualStrings("`sync` expects 2 argument(s), got 1", m3);
 }
 
 test "expandProgram inlines `let … in` away (single-use binding)" {

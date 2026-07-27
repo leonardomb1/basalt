@@ -195,6 +195,12 @@ const Env = struct {
     /// Parsed JSON params (the request body), navigated by `for x in p.path`.
     /// Scalar `p.a.b` path access is substituted at plan time (expand.zig).
     json_params: *std.StringHashMap(std.json.Value),
+    /// Statement-form `CREATE FUNCTION` declarations by name — the macro table
+    /// `CALL` renders through the for-each machinery. Expression-form functions
+    /// never reach here; expand.zig inlined them.
+    fns: *const std.StringHashMap(ast.FnDecl),
+    /// Nesting depth of the `CALL` currently being rendered (recursion guard).
+    call_depth: usize = 0,
     /// The endpoint's `INTO BUFFER` declaration, if any (dir + declared schema
     /// for `FROM BUFFER` reads that don't name them).
     buffer_decl: ?ast.BufferDecl = null,
@@ -481,12 +487,14 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts: RunOptions, d
 
     var bindings = std.StringHashMap(ast.Pipeline).init(arena);
     var connections = std.StringHashMap(ast.Connection).init(arena);
+    var fns = std.StringHashMap(ast.FnDecl).init(arena);
     var runnable: usize = 0;
     for (program.stmts[1..]) |s| switch (s) {
         .binding => |b| try bindings.put(b.name, b.pipeline),
         .connection => |c| try connections.put(c.name, c),
-        .output, .for_each, .match => runnable += 1,
-        .param, .kind, .func => {},
+        .func => |fd| try fns.put(fd.name, fd),
+        .output, .for_each, .match, .call => runnable += 1,
+        .param, .kind => {},
     };
     if (runnable == 0)
         return planErr(diag, "no output pipeline (a pipeline ending in `write`)");
@@ -504,7 +512,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts: RunOptions, d
     for (program.stmts) |s| {
         if (s == .kind) buffer_decl = s.kind.buffer;
     }
-    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .buffer_decl = buffer_decl, .buffer_segment = opts.buffer_segment, .load_label_prefix = opts.load_label_prefix, .load_run_id = opts.load_run_id };
+    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .fns = &fns, .buffer_decl = buffer_decl, .buffer_segment = opts.buffer_segment, .load_label_prefix = opts.load_label_prefix, .load_run_id = opts.load_run_id };
 
     var batch_arena = std.heap.ArenaAllocator.init(gpa);
     defer batch_arena.deinit();
@@ -515,6 +523,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts: RunOptions, d
         .output => |p| try runOutput(&env, p, opts, &stats, &lanes_used, &batch_arena),
         .for_each => |fe| try runForEach(&env, fe, opts, &stats, &lanes_used, &batch_arena),
         .match => |m| try runStmtMatch(&env, m, opts, &stats, &lanes_used, &batch_arena),
+        .call => |c| try runCall(&env, c, no_loop_vars, opts, &stats, &lanes_used, &batch_arena),
         else => {},
     };
     for (sources.items) |sc| sc.close();
@@ -607,6 +616,7 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
         .output => |p| try runOutput(env, p, opts, stats, lanes_used, batch_arena),
         .for_each => |fe| try runForEach(env, fe, opts, stats, lanes_used, batch_arena),
         .match => |mm| try runStmtMatch(env, mm, opts, stats, lanes_used, batch_arena),
+        .call => |c| try runCall(env, c, no_loop_vars, opts, stats, lanes_used, batch_arena),
         .binding => |b| try env.bindings.put(b.name, b.pipeline),
         .connection => |c| try env.connections.put(c.name, c),
         .param, .kind, .func => {},
@@ -2908,6 +2918,8 @@ fn forWorker(ctx: *ForCtx, _: usize) void {
             .errctx = &w_errctx,
             .rows_read = ctx.base.rows_read,
             .json_params = ctx.base.json_params,
+            .fns = ctx.base.fns,
+            .call_depth = ctx.base.call_depth,
         };
         var st = Stats{ .run_id = 0 };
         var lanes: usize = 1;
@@ -2940,8 +2952,68 @@ fn runForStmt(env: *Env, s: *const ast.Stmt, lr: LoopRow, opts: RunOptions, stat
             try runOutput(env, pipe, opts, stats, lanes_used, batch_arena);
         },
         .match => |m| try runForMatch(env, m, lr, opts, stats, lanes_used, batch_arena),
-        else => return planErr(env.diag, "a `for` body may contain only pipelines and `match` statements"),
+        .call => |c| try runCall(env, c, lr, opts, stats, lanes_used, batch_arena),
+        else => return planErr(env.diag, "a `for` or statement-function body may contain only pipelines, `CASE` and `CALL` statements"),
     }
+}
+
+/// A `CALL` renders at most this deep. Statement functions may call each other, but
+/// a cycle would otherwise render forever (there is no value to terminate on, the
+/// way an expression `fn` bottoms out at a literal).
+const max_call_depth = 16;
+
+/// No loop variables in scope — the binding a top-level `CALL` starts from.
+const no_loop_vars = LoopRow{ .names = &[_][]const u8{}, .cells = &[_][]const u8{} };
+
+/// `CALL f(a, b)` — a plan-time statement macro. The declared parameters become
+/// loop variables and the argument values their cells, so the body is rendered and
+/// executed by exactly the machinery one sequential `FOR EACH ROW OF` iteration
+/// uses (`LoopRow` → `renderPipeline` → `runForBody`); a call is one such iteration
+/// over a hand-built row. `outer` is the binding in scope at the call site, so an
+/// argument may be a literal, a `$param`, or an enclosing loop variable.
+fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+    const fd = env.fns.get(c.name) orelse
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "CALL: no function named `{s}`", .{c.name}));
+    const body = switch (fd.body) {
+        .stmts => |b| b,
+        .expr => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`{s}` is a scalar function — use it in an expression, not CALL", .{c.name})),
+    };
+    // expand.zig has already filled defaults and checked the count; a mismatch here
+    // would mean an unexpanded program, so report it rather than index past the end.
+    if (c.args.len != fd.params.len)
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`{s}` expects {d} argument(s), got {d}", .{ c.name, fd.params.len, c.args.len }));
+    if (env.call_depth >= max_call_depth)
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "CALL nesting too deep (recursive?) at `{s}`", .{c.name}));
+
+    // Argument scope: the enclosing loop variables first (they shadow same-named
+    // params, matching `runForMatch`), then the resolved params.
+    var names = std.array_list.Managed([]const u8).init(env.arena);
+    var values = std.array_list.Managed(Value).init(env.arena);
+    for (outer.names, outer.cells, 0..) |nm, cell, i| {
+        try names.append(nm);
+        try values.append(loopValue(env.arena, cell, outer.typeAt(i)));
+    }
+    var it = env.params.iterator();
+    while (it.next()) |kv| {
+        try names.append(kv.key_ptr.*);
+        try values.append(kv.value_ptr.*);
+    }
+
+    const pnames = try env.arena.alloc([]const u8, fd.params.len);
+    const ptypes = try env.arena.alloc(?types.Type, fd.params.len);
+    const cells = try env.arena.alloc([]const u8, fd.params.len);
+    for (fd.params, c.args, 0..) |p, a, i| {
+        pnames[i] = p.name;
+        ptypes[i] = p.ty;
+        const v = eval.constEval(env.arena, a, names.items, values.items) catch |e|
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "CALL {s}: argument `{s}`: {s}", .{ c.name, p.name, @errorName(e) }));
+        cells[i] = try eval.valueToString(env.arena, v);
+    }
+
+    env.log.log(.info, "call {s}: {d} argument(s) [depth {d}]", .{ c.name, cells.len, env.call_depth + 1 });
+    env.call_depth += 1;
+    defer env.call_depth -= 1;
+    try runForBody(env, body, .{ .names = pnames, .types = ptypes, .cells = cells }, opts, stats, lanes_used, batch_arena);
 }
 
 /// A `match` evaluated per row of a `for`: the loop variables are bound (shadowing
@@ -4971,6 +5043,73 @@ test "for-each fans out over a discovered list with interpolation" {
     defer alloc.free(b);
     try std.testing.expectEqualStrings("id,v\n1,10\n2,20\n", a);
     try std.testing.expectEqualStrings("id,v\n3,30\n", b);
+}
+
+test "CALL renders a statement function per call (defaults fill the omitted arg)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "alpha.csv", .data = "id,v\n1,10\n2,20\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "beta.csv", .data = "id,v\n3,30\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "CREATE FUNCTION sync(name, tag DEFAULT 'Z') AS\n" ++
+            "  LOAD INTO '{s}/out_${{name}}.csv' AS SELECT id, v, '${{tag}}' AS tag FROM '{s}/${{name}}.csv';\n" ++
+            "END;\n" ++
+            "CALL sync('alpha', 'A');\n" ++
+            "CALL sync('beta');\n",
+        .{ base, base },
+    );
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+
+    var rdiag: Diag = .{};
+    const stats = run(alloc, prog, .{}, &rdiag) catch |e| {
+        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+        return e;
+    };
+    try std.testing.expectEqual(@as(u64, 3), stats.rows_out);
+
+    const a = try tmp.dir.readFileAlloc(alloc, "out_alpha.csv", 1 << 20);
+    defer alloc.free(a);
+    const b = try tmp.dir.readFileAlloc(alloc, "out_beta.csv", 1 << 20);
+    defer alloc.free(b);
+    try std.testing.expectEqualStrings("id,v,tag\n1,10,A\n2,20,A\n", a);
+    try std.testing.expectEqualStrings("id,v,tag\n3,30,Z\n", b);
+}
+
+test "CALL nesting is depth-guarded (mutual recursion)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n1\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "CREATE FUNCTION ping(n) AS\n  CALL pong($n);\nEND;\n" ++
+            "CREATE FUNCTION pong(n) AS\n  LOAD INTO '{s}/out.csv' AS SELECT id FROM '{s}/in.csv';\n  CALL ping($n);\nEND;\n" ++
+            "CALL ping('x');\n",
+        .{ base, base },
+    );
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
+    try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "too deep") != null);
 }
 
 test "sqlWithWhere: table appends WHERE, query wraps, empty is a no-op" {

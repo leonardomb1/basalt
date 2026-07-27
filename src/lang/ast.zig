@@ -292,14 +292,45 @@ pub const Connection = struct {
 
 pub const Let = struct { name: []const u8, pipeline: Pipeline, pos: Pos };
 
-/// `fn name(a, b) = <expr>`: a user-defined scalar function. Expanded inline at
-/// plan time (`expand.zig`) — each call is replaced by the body with arguments
-/// substituted for the parameters — so the type-checker and evaluator never see
-/// user functions. Recursion is rejected during expansion.
+/// One declared parameter of a `CREATE FUNCTION`. `ty` is the optional declared
+/// type — checked at expansion against *literal* arguments only (nothing else is
+/// decidable there) and, for a statement-form function, used to coerce the
+/// argument cell the way a `for` header's `name:type` does. `default` fills the
+/// argument when the call omits it; defaults may only trail.
+pub const FnParam = struct {
+    name: []const u8,
+    ty: ?types.Type = null,
+    default: ?*Expr = null,
+};
+
+/// The two things a `CREATE FUNCTION` body can be.
+///   * `.expr` — a scalar function, inlined at plan time (`expand.zig`) so the
+///     type-checker and evaluator never see it. Recursion is rejected there.
+///   * `.stmts` — a statement macro, invoked with `CALL f(args)`. The declaration
+///     survives expansion; `run.zig` renders the block per call through the same
+///     `${var}` machinery a `for` body uses, with the parameters as loop vars.
+pub const FnBody = union(enum) {
+    expr: *Expr,
+    stmts: []const Stmt,
+};
+
+/// `CREATE [OR REPLACE] FUNCTION name(params) AS <body>`.
 pub const FnDecl = struct {
     name: []const u8,
-    params: []const []const u8,
-    body: *Expr,
+    params: []const FnParam,
+    body: FnBody,
+    /// `OR REPLACE`: the sanctioned overwrite of an earlier same-name
+    /// declaration. Without it, a duplicate is an expansion error.
+    replace: bool = false,
+    pos: Pos,
+};
+
+/// `CALL name(args);` — invoke a statement-form function. Arguments are resolved
+/// to text cells at plan time (literals, `$params`, or the loop variables in
+/// scope at the call site).
+pub const CallStmt = struct {
+    name: []const u8,
+    args: []const *Expr,
     pos: Pos,
 };
 
@@ -368,6 +399,7 @@ pub const Stmt = union(enum) {
     for_each: ForEach,
     match: StmtMatch,
     func: FnDecl,
+    call: CallStmt,
 };
 
 /// `EXPLAIN` prefix on a program: print the plan instead of running it, or
