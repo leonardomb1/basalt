@@ -276,8 +276,9 @@ pub const Parser = struct {
         if (self.isKw("load")) return self.parseLoadInto(out);
         if (self.isKw("for")) return out.append(.{ .for_each = try self.parseForEach() });
         if (self.isKw("case")) return out.append(.{ .match = try self.parseCaseStmt() });
+        if (self.isKw("call")) return out.append(.{ .call = try self.parseCallStmt() });
         if (self.isKw("with") or self.isKw("select")) return self.parseTerminalQuery(out);
-        return self.fail(self.curPos(), "expected a statement (CREATE / PARAM / LET / LOAD INTO / SELECT / FOR / CASE), found {s}", .{self.curTag().describe()});
+        return self.fail(self.curPos(), "expected a statement (CREATE / PARAM / LET / LOAD INTO / SELECT / FOR / CASE / CALL), found {s}", .{self.curTag().describe()});
     }
 
     /// `LET name = <expr>;` — a script-scoped plan-time constant, referenced as
@@ -297,7 +298,10 @@ pub const Parser = struct {
     fn parseCreate(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
         const pos = self.curPos();
         try self.expectKw("create");
-        if (self.eatKw("or")) try self.expectKw("replace");
+        const replace = if (self.eatKw("or")) blk: {
+            try self.expectKw("replace");
+            break :blk true;
+        } else false;
         if (self.eatKw("endpoint")) {
             const path = try self.expect(.string);
             var attrs = std.array_list.Managed(ast.Attr).init(self.arena);
@@ -320,7 +324,7 @@ pub const Parser = struct {
             return out.append(.{ .connection = conn });
         }
         if (self.eatKw("function")) {
-            return out.append(.{ .func = try self.parseFunction(pos) });
+            return out.append(.{ .func = try self.parseFunction(pos, replace) });
         }
         return self.fail(self.curPos(), "expected ENDPOINT, CONNECTION, or FUNCTION after CREATE", .{});
     }
@@ -522,19 +526,82 @@ pub const Parser = struct {
         return self.mk(.{ .call = .{ .name = "env", .args = args } });
     }
 
-    fn parseFunction(self: *Parser, pos: Pos) Error!ast.FnDecl {
+    /// `CREATE [OR REPLACE] FUNCTION name(params) AS <body>` in both forms:
+    /// an expression body (`AS <expr>;`) or a statement block (`AS <stmts> END;`).
+    fn parseFunction(self: *Parser, pos: Pos, replace: bool) Error!ast.FnDecl {
         const name = try self.expectIdent();
         _ = try self.expect(.lparen);
-        var params = std.array_list.Managed([]const u8).init(self.arena);
+        var params = std.array_list.Managed(ast.FnParam).init(self.arena);
         if (!self.at(.rparen)) {
-            try params.append(try self.expectIdent());
-            while (self.eat(.comma)) try params.append(try self.expectIdent());
+            try params.append(try self.parseFnParam());
+            while (self.eat(.comma)) try params.append(try self.parseFnParam());
         }
         _ = try self.expect(.rparen);
+        var seen_default = false;
+        for (params.items) |p| {
+            if (p.default != null) {
+                seen_default = true;
+            } else if (seen_default) {
+                return self.fail(pos, "`{s}`: parameter `{s}` without DEFAULT follows one with DEFAULT", .{ name, p.name });
+            }
+        }
         try self.expectKw("as");
+
+        if (self.atStmtBody()) {
+            var body = std.array_list.Managed(ast.Stmt).init(self.arena);
+            while (!self.at(.eof) and !self.isKw("end")) {
+                try self.parseStatement(&body);
+            }
+            try self.expectKw("end");
+            _ = try self.expect(.semi);
+            if (body.items.len == 0)
+                return self.fail(pos, "`{s}`: statement function body is empty", .{name});
+            return .{ .name = name, .params = try params.toOwnedSlice(), .body = .{ .stmts = try body.toOwnedSlice() }, .replace = replace, .pos = pos };
+        }
+
         const body = try self.parseExpr();
         _ = try self.expect(.semi);
-        return .{ .name = name, .params = try params.toOwnedSlice(), .body = body, .pos = pos };
+        return .{ .name = name, .params = try params.toOwnedSlice(), .body = .{ .expr = body }, .replace = replace, .pos = pos };
+    }
+
+    /// Does the body after `AS` open a statement block? Exactly the keywords that
+    /// begin a statement and can never begin a scalar expression.
+    ///
+    /// `CASE` is deliberately absent: `AS CASE WHEN ... END` stays the *expression*
+    /// form (a scalar CASE), which is overwhelmingly what a function body means by
+    /// it, and the statement CASE has its own `END CASE`. So a statement body that
+    /// wants to branch has to lead with another statement keyword (or be reached
+    /// through a `FOR` / `CALL`); a leading statement `CASE` is not spellable here.
+    fn atStmtBody(self: *Parser) bool {
+        return self.isKw("load") or self.isKw("for") or self.isKw("call") or
+            self.isKw("select") or self.isKw("with");
+    }
+
+    /// `name [TYPE] [DEFAULT <expr>]`. A bare name is untyped, exactly as before.
+    fn parseFnParam(self: *Parser) Error!ast.FnParam {
+        const name = try self.expectIdent();
+        var ty: ?types.Type = null;
+        if (!self.at(.comma) and !self.at(.rparen) and !self.isKw("default"))
+            ty = try self.parseTypeName();
+        var default: ?*ast.Expr = null;
+        if (self.eatKw("default")) default = try self.parseExpr();
+        return .{ .name = name, .ty = ty, .default = default };
+    }
+
+    /// `CALL name(args);` — invoke a statement-form function.
+    fn parseCallStmt(self: *Parser) Error!ast.CallStmt {
+        const pos = self.curPos();
+        try self.expectKw("call");
+        const name = try self.expectIdent();
+        _ = try self.expect(.lparen);
+        var args = std.array_list.Managed(*ast.Expr).init(self.arena);
+        if (!self.at(.rparen)) {
+            try args.append(try self.parseExpr());
+            while (self.eat(.comma)) try args.append(try self.parseExpr());
+        }
+        _ = try self.expect(.rparen);
+        _ = try self.expect(.semi);
+        return .{ .name = name, .args = try args.toOwnedSlice(), .pos = pos };
     }
 
     fn parseParam(self: *Parser) Error!ast.Param {
@@ -2562,4 +2629,74 @@ test "sql: IDENTIFIER in an UPSERT key -> per-row computed key column" {
     const w = prog.stmts[3].for_each.body[0].output.stages[1].node.write;
     try testing.expectEqual(@as(usize, 1), w.mode.upsert.keys.len);
     try testing.expectEqualStrings("${if((pk == ''), concat(name, 'id'), pk)}", w.mode.upsert.keys[0]);
+}
+
+test "sql: CREATE FUNCTION — expression, typed/DEFAULT params, statement body, CALL" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a,
+        \\CREATE FUNCTION margin(rev FLOAT, cost FLOAT) AS (rev - cost) / rev;
+        \\CREATE OR REPLACE FUNCTION round_to(x, n INT DEFAULT 2) AS round(x, n);
+        \\CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'h', database = 'd');
+        \\CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = 'h', database = 'b');
+        \\CREATE FUNCTION sync_table(name, filter) AS
+        \\  LOAD INTO sr.IDENTIFIER('bronze_' || lower($name)) USING stream_load UPSERT AS
+        \\  SELECT * FROM erp.dbo.IDENTIFIER($name) PUSHDOWN($filter);
+        \\END;
+        \\CALL sync_table('SC5010', $$D_E_L_E_T_ <> '*'$$);
+    );
+
+    const margin = prog.stmts[1].func;
+    try testing.expect(margin.body == .expr);
+    try testing.expect(!margin.replace);
+    try testing.expectEqual(@as(usize, 2), margin.params.len);
+    try testing.expectEqualStrings("rev", margin.params[0].name);
+    try testing.expectEqual(types.TypeKind.float, margin.params[0].ty.?.kind);
+    try testing.expect(margin.params[0].default == null);
+
+    const round_to = prog.stmts[2].func;
+    try testing.expect(round_to.replace);
+    try testing.expect(round_to.params[0].ty == null);
+    try testing.expectEqual(types.TypeKind.int, round_to.params[1].ty.?.kind);
+    try testing.expectEqual(@as(i64, 2), round_to.params[1].default.?.int_lit);
+
+    const sync = prog.stmts[5].func;
+    try testing.expect(sync.body == .stmts);
+    try testing.expectEqual(@as(usize, 1), sync.body.stmts.len);
+    const pipe = sync.body.stmts[0].output;
+    try testing.expectEqualStrings("${name}", pipe.stages[0].node.read.form.table.parts[1]);
+    try testing.expectEqualStrings("${filter}", pipe.stages[0].hints[0].value.str);
+    try testing.expectEqualStrings("bronze_${lower(name)}", pipe.stages[pipe.stages.len - 1].node.write.target);
+
+    const call = prog.stmts[6].call;
+    try testing.expectEqualStrings("sync_table", call.name);
+    try testing.expectEqual(@as(usize, 2), call.args.len);
+    try testing.expectEqualStrings("SC5010", call.args[0].str_lit);
+    try testing.expectEqualStrings("D_E_L_E_T_ <> '*'", call.args[1].str_lit);
+}
+
+test "sql: CREATE FUNCTION AS CASE stays the expression form" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parseTest(a,
+        \\CREATE FUNCTION grade(n) AS CASE WHEN n > 90 THEN 'a' ELSE 'b' END;
+        \\SELECT grade(score) AS g FROM 'x.csv';
+    );
+    try testing.expect(prog.stmts[1].func.body == .expr);
+    try testing.expect(prog.stmts[1].func.body.expr.* == .match);
+}
+
+test "sql: a non-DEFAULT parameter may not follow a defaulted one" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a,
+        \\CREATE FUNCTION f(a INT DEFAULT 1, b INT) AS a + b;
+        \\SELECT f(1) AS v FROM 'x.csv';
+    , &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "without DEFAULT") != null);
 }

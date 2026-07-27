@@ -298,6 +298,12 @@ fn collectStmtOutputs(outputs: *std.array_list.Managed(ast.Pipeline), stmts: []c
         .output => |p| try outputs.append(p),
         .for_each => |fe| try collectStmtOutputs(outputs, fe.body),
         .match => |m| for (m.arms) |arm| try collectStmtOutputs(outputs, arm.body),
+        // A statement function's block is checked where it is *declared*, not per
+        // `CALL`: the pipelines are the same either way, and their `${param}`
+        // placeholders are only resolvable at run time — exactly the deal a `for`
+        // body already gets. So the declaration is descended into and `CALL` (whose
+        // name/arity/types expansion has already validated) is a no-op here.
+        .func => |fd| if (fd.body == .stmts) try collectStmtOutputs(outputs, fd.body.stmts),
         else => {},
     };
 }
@@ -321,7 +327,8 @@ pub fn analyze(arena: std.mem.Allocator, raw_program: ast.Program, resolver: ?Re
         .output => |p| try outputs.append(p),
         .for_each => |fe| try collectStmtOutputs(&outputs, fe.body),
         .match => |m| for (m.arms) |arm| try collectStmtOutputs(&outputs, arm.body),
-        .param, .kind, .func, .let_const => {},
+        .func => |fd| if (fd.body == .stmts) try collectStmtOutputs(&outputs, fd.body.stmts),
+        .param, .kind, .call, .let_const => {},
     };
     if (outputs.items.len == 0)
         return fail(diag, "no output pipeline (a pipeline ending in `write`)", .{});
