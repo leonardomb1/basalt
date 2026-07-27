@@ -235,9 +235,10 @@ WHERE downloads > 0;
 | `SELECT a, expr AS x` | projection |
 | `SELECT * EXCLUDE (a, b)` / `EXCEPT` | all-but projection |
 | `SELECT * RENAME (a AS b)` | rename projection |
-| `COUNT(*) / SUM / AVG / MIN / MAX ... GROUP BY k` | aggregate (non-agg items must be group keys) |
+| `COUNT(*) / SUM / AVG / MIN / MAX ... GROUP BY k` | aggregate (every other item must be a group key, aliased or not) |
+| `ROUND(AVG(x), 2)`, `SUM(a)/COUNT(*)` | an aggregate inside an expression: the calls are computed by the aggregate, the arithmetic around them by a projection after it |
 | `COUNT(DISTINCT x)` | aggregate — combines freely with other aggregates; ignores nulls |
-| `HAVING <expr>` | filter after the aggregate; aggregate calls in it refer to the columns it produced |
+| `HAVING <expr>` | filter after the aggregate; aggregate calls in it refer to the columns it produced, including ones the `SELECT` list never asked for |
 | `ORDER BY a DESC, b` | sort |
 | `LIMIT n [OFFSET m]` | limit |
 | `SELECT DISTINCT` / `DISTINCT ON (a, b)` | distinct |
@@ -492,7 +493,9 @@ At a use site the innermost binding wins: loop var > LET/PARAM.
   (`WHERE d >= '2013-07-01'`). The literal is coerced to the column's type,
   never the reverse, and it is validated at plan time — so `'2013-13-01'` and
   `'01/07/2013'` are errors from `check`, not silent text comparisons.
-- `x LIKE 'a%'`, `x IN (1, 2, 3)` (expands to an OR-chain).
+- `x LIKE 'a%'`, `x IN (1, 2, 3)` (expands to an OR-chain),
+  `x [NOT] BETWEEN a AND b` (inclusive; expands to `x >= a AND x <= b`, so it
+  pushes down like any other pair of comparisons).
 - `LET x = <val> IN <body>` — local binding, inlined at plan time.
 - Scalar functions (case-insensitive): `now() today() lower() upper() length()
   strlen() trim() substr() replace() concat() coalesce() starts_with()

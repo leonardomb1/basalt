@@ -115,6 +115,22 @@ const agg_names = [_]struct { n: []const u8, f: ast.AggFunc }{
     .{ .n = "max", .f = .max },
 };
 
+fn isGroupKey(group: []const ast.QualName, q: ast.QualName) bool {
+    for (group) |k| {
+        if (std.mem.eql(u8, k.last(), q.last())) return true;
+    }
+    return false;
+}
+
+/// What to call a SELECT item in a diagnostic.
+fn itemLabel(it: ast.SelectItem) []const u8 {
+    return switch (it) {
+        .star, .star_except, .star_rename => "*",
+        .field => |q| q.last(),
+        .computed => |c| c.name,
+    };
+}
+
 fn aggFunc(name: []const u8) ?ast.AggFunc {
     for (agg_names) |m| {
         if (eqlNoCase(name, m.n)) return m.f;
@@ -1180,6 +1196,11 @@ pub const Parser = struct {
         var union_tag: ?[]const u8 = null;
         var union_tag_col: ?[]const u8 = null;
         var star_count: usize = 0;
+        // Output items as the SELECT list asked for them, used only when an
+        // aggregate had to be lifted out of a surrounding expression — that is
+        // the one case needing a projection after the aggregate stage.
+        var post = std.array_list.Managed(ast.SelectItem).init(self.arena);
+        var lifted = false;
         for (raw_items.items) |ri| {
             switch (ri) {
                 .qstar => |alias| {
@@ -1191,24 +1212,52 @@ pub const Parser = struct {
                 .item => |it| switch (it) {
                     .star => {
                         try items.append(.star);
+                        try post.append(.star);
                         star_count += 1;
                     },
-                    .star_except, .star_rename => try items.append(it),
-                    .field => |q| try items.append(.{ .field = stripQual(q, &aliases) }),
+                    .star_except, .star_rename => {
+                        try items.append(it);
+                        try post.append(it);
+                    },
+                    .field => |q| {
+                        const stripped_q = stripQual(q, &aliases);
+                        try items.append(.{ .field = stripped_q });
+                        try post.append(.{ .field = try self.singleName(stripped_q.last()) });
+                    },
                     .computed => |c| {
                         const stripped = try self.stripExpr(c.expr, &aliases);
                         if (stripped.* == .call) {
                             if (aggFunc(stripped.call.name)) |f| {
                                 const arg: ?*ast.Expr = if (stripped.call.args.len > 0) stripped.call.args[0] else null;
                                 try aggs.append(.{ .name = c.name, .func = f, .arg = arg, .distinct = stripped.call.distinct });
+                                try post.append(.{ .field = try self.singleName(c.name) });
                                 continue;
                             }
+                        }
+                        // An aggregate buried in a larger expression: the calls
+                        // move to the aggregate stage and what is left becomes a
+                        // projection over its output.
+                        if (containsAgg(stripped)) {
+                            const outer = try self.liftAggs(stripped, &aggs, expr_aliases.items, pos);
+                            try post.append(.{ .computed = .{ .name = c.name, .expr = outer } });
+                            lifted = true;
+                            continue;
+                        }
+                        // `SELECT x AS y ... GROUP BY x` — an aliased grouping
+                        // key. The aggregate emits the key under its own name,
+                        // so the rename belongs after it; renaming beforehand
+                        // would hide `x` from the GROUP BY that names it.
+                        if (group.len > 0 and stripped.* == .field and isGroupKey(group, stripped.field)) {
+                            try post.append(.{ .computed = .{ .name = c.name, .expr = stripped } });
+                            lifted = true;
+                            continue;
                         }
                         if (stripped.* == .str_lit and union_tag == null) {
                             union_tag = stripped.str_lit;
                             union_tag_col = c.name;
                         }
                         try items.append(.{ .computed = .{ .name = c.name, .expr = stripped } });
+                        try post.append(.{ .field = try self.singleName(c.name) });
                     },
                 },
             }
@@ -1259,8 +1308,18 @@ pub const Parser = struct {
             } else {
                 for (items.items) |it| {
                     if (it != .field)
-                        return self.fail(pos, "non-aggregate SELECT items in a GROUP BY query must be plain group-key columns (or aliases the GROUP BY names)", .{});
+                        return self.fail(pos, "`{s}` is neither an aggregate nor a grouping key — wrap it in an aggregate, or name it in GROUP BY", .{itemLabel(it)});
+                    // A plain column that is not a grouping key has no single
+                    // value per group. It used to be dropped from the output
+                    // without a word, which is worse than refusing the query.
+                    if (!isGroupKey(group, it.field))
+                        return self.fail(pos, "`{s}` is neither an aggregate nor a grouping key — wrap it in an aggregate, or name it in GROUP BY", .{it.field.last()});
                 }
+            }
+            // Before the aggregate is sealed, since HAVING may name one that the
+            // SELECT list does not.
+            if (having) |h| {
+                if (try self.addHavingAggs(h, &aggs, expr_aliases.items)) lifted = true;
             }
             try stages.append(.{
                 .node = .{ .aggregate = .{ .aggs = try aggs.toOwnedSlice(), .by = group } },
@@ -1270,6 +1329,15 @@ pub const Parser = struct {
             if (having) |h| {
                 const hf = try self.havingRewrite(h, expr_aliases.items);
                 try stages.append(.{ .node = .{ .filter = hf }, .hints = &.{}, .pos = pos });
+            }
+            // Runs after HAVING, which reads the aggregate's own columns — the
+            // projection would have already replaced them.
+            if (lifted) {
+                for (post.items) |it| {
+                    if (it == .star or it == .star_except or it == .star_rename)
+                        return self.fail(pos, "`*` cannot be combined with an aggregate inside an expression", .{});
+                }
+                try stages.append(.{ .node = .{ .select = try post.toOwnedSlice() }, .hints = &.{}, .pos = pos });
             }
         } else {
             const lone_star = items.items.len == 1 and items.items[0] == .star;
@@ -1819,6 +1887,156 @@ pub const Parser = struct {
         }
     }
 
+    /// Whether an aggregate call appears anywhere inside an expression. A
+    /// SELECT item that is one outright is already handled; this finds the ones
+    /// buried in arithmetic or a scalar call, like `round(avg(x), 2)`.
+    fn containsAgg(e: *const ast.Expr) bool {
+        return switch (e.*) {
+            .call => |c| aggFunc(c.name) != null or blk: {
+                for (c.args) |a| if (containsAgg(a)) break :blk true;
+                break :blk false;
+            },
+            .unary => |u| containsAgg(u.e),
+            .binary => |b| containsAgg(b.l) or containsAgg(b.r),
+            .cond => |c| containsAgg(c.cond) or containsAgg(c.then) or containsAgg(c.els),
+            .cast => |c| containsAgg(c.e),
+            .is_null => |n| containsAgg(n.e),
+            .let_in => |l| containsAgg(l.value) or containsAgg(l.body),
+            .match => |m| blk: {
+                if (m.subject) |s| if (containsAgg(s)) break :blk true;
+                for (m.arms) |arm| {
+                    for (arm.pats) |p| if (containsAgg(p)) break :blk true;
+                    if (arm.guard) |g| if (containsAgg(g)) break :blk true;
+                    if (containsAgg(arm.value)) break :blk true;
+                }
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
+    /// Lifts the aggregate calls out of a scalar expression, the same swap
+    /// `havingRewrite` performs: each call becomes a column the aggregate stage
+    /// produces, and what surrounds it becomes an ordinary projection over
+    /// those columns. That is what lets `round(avg(x), 2)` be written at all —
+    /// the aggregate itself is unchanged, only where the arithmetic runs.
+    ///
+    /// Naming goes through `exprKey`, so two mentions of the same aggregate
+    /// collapse to one column, and a HAVING or ORDER BY naming that aggregate
+    /// still binds to it.
+    fn liftAggs(
+        self: *Parser,
+        e: *ast.Expr,
+        aggs: *std.array_list.Managed(ast.AggItem),
+        map: []const ExprAlias,
+        pos: Pos,
+    ) Error!*ast.Expr {
+        const Ctx = struct {
+            p: *Parser,
+            a: *std.array_list.Managed(ast.AggItem),
+            m: []const ExprAlias,
+            pos: Pos,
+        };
+        const S = struct {
+            fn recur(cx: Ctx, node: *const ast.Expr) Error!*ast.Expr {
+                if (node.* == .call) {
+                    if (aggFunc(node.call.name)) |f| {
+                        for (node.call.args) |a| {
+                            if (containsAgg(a))
+                                return cx.p.fail(cx.pos, "aggregate functions cannot be nested", .{});
+                        }
+                        var buf = std.array_list.Managed(u8).init(cx.p.arena);
+                        try cx.p.exprKey(node, &buf);
+                        // Through the alias map, so `sum(v) as s` and a later
+                        // `sum(v) * 2` resolve to the one column named `s`
+                        // rather than computing the sum twice.
+                        const key = resolveExprAlias(cx.m, buf.toOwnedSlice() catch return error.OutOfMemory);
+
+                        var seen = false;
+                        for (cx.a.items) |it| {
+                            if (std.mem.eql(u8, it.name, key)) seen = true;
+                        }
+                        if (!seen) {
+                            const arg: ?*ast.Expr = if (node.call.args.len > 0) node.call.args[0] else null;
+                            cx.a.append(.{
+                                .name = key,
+                                .func = f,
+                                .arg = arg,
+                                .distinct = node.call.distinct,
+                            }) catch return error.OutOfMemory;
+                        }
+                        const parts = cx.p.arena.alloc([]const u8, 1) catch return error.OutOfMemory;
+                        parts[0] = key;
+                        return cx.p.mk(.{ .field = .{ .parts = parts } });
+                    }
+                }
+                return ast.rebuildExpr(cx.p.arena, node, cx, recur);
+            }
+        };
+        return S.recur(.{ .p = self, .a = aggs, .m = map, .pos = pos }, e);
+    }
+
+    /// HAVING may filter on an aggregate the SELECT list never asked for
+    /// (`... GROUP BY g HAVING COUNT(*) > 1` selecting only `g` and an average).
+    /// That aggregate still has to be computed, so it is added as an ordinary
+    /// output column and the post-aggregate projection drops it again — the
+    /// same projection lifting installs. Returns whether anything was added.
+    fn addHavingAggs(
+        self: *Parser,
+        h: *const ast.Expr,
+        aggs: *std.array_list.Managed(ast.AggItem),
+        map: []const ExprAlias,
+    ) Error!bool {
+        switch (h.*) {
+            .call => |c| {
+                if (aggFunc(c.name)) |f| {
+                    var buf = std.array_list.Managed(u8).init(self.arena);
+                    try self.exprKey(h, &buf);
+                    const key = buf.toOwnedSlice() catch return error.OutOfMemory;
+                    const want = resolveExprAlias(map, key);
+                    for (aggs.items) |it| {
+                        if (std.mem.eql(u8, it.name, want)) return false;
+                    }
+                    const arg: ?*ast.Expr = if (c.args.len > 0) c.args[0] else null;
+                    aggs.append(.{
+                        .name = want,
+                        .func = f,
+                        .arg = arg,
+                        .distinct = c.distinct,
+                    }) catch return error.OutOfMemory;
+                    return true;
+                }
+                var any = false;
+                for (c.args) |a| {
+                    if (try self.addHavingAggs(a, aggs, map)) any = true;
+                }
+                return any;
+            },
+            .unary => |u| return self.addHavingAggs(u.e, aggs, map),
+            .binary => |b| {
+                const l = try self.addHavingAggs(b.l, aggs, map);
+                const r = try self.addHavingAggs(b.r, aggs, map);
+                return l or r;
+            },
+            .cond => |c| {
+                const a = try self.addHavingAggs(c.cond, aggs, map);
+                const b = try self.addHavingAggs(c.then, aggs, map);
+                const d = try self.addHavingAggs(c.els, aggs, map);
+                return a or b or d;
+            },
+            .cast => |c| return self.addHavingAggs(c.e, aggs, map),
+            .is_null => |n| return self.addHavingAggs(n.e, aggs, map),
+            else => return false,
+        }
+    }
+
+    /// A one-part `QualName`, for referring to a column the previous stage named.
+    fn singleName(self: *Parser, name: []const u8) Error!ast.QualName {
+        const parts = self.arena.alloc([]const u8, 1) catch return error.OutOfMemory;
+        parts[0] = name;
+        return .{ .parts = parts };
+    }
+
     /// HAVING runs after aggregation, so each aggregate call in it is really a
     /// reference to a column the aggregate already produced. Swap the calls for
     /// those columns and the clause becomes an ordinary filter stage.
@@ -1942,6 +2160,23 @@ pub const Parser = struct {
                 }
                 _ = try self.expect(.rparen);
                 lhs = if (negated) try self.mk(.{ .unary = .{ .op = .not, .e = alt.? } }) else alt.?;
+                continue;
+            }
+            if ((self.isKw("between") or (self.isKw("not") and self.peekKw("between"))) and min_bp < 40) {
+                const negated = self.isKw("not");
+                if (negated) _ = self.advance();
+                _ = self.advance();
+                // Bounds are parsed above `AND`'s binding power, since BETWEEN
+                // uses AND as its own separator — otherwise the low bound would
+                // swallow `AND <hi>` as a boolean operand.
+                const lo = try self.parseBin(40);
+                if (!self.eatKw("and"))
+                    return self.fail(self.curPos(), "expected `AND` between the bounds of BETWEEN", .{});
+                const hi = try self.parseBin(40);
+                const ge = try self.mk(.{ .binary = .{ .op = .ge, .l = lhs, .r = lo } });
+                const le = try self.mk(.{ .binary = .{ .op = .le, .l = lhs, .r = hi } });
+                const both = try self.mk(.{ .binary = .{ .op = .@"and", .l = ge, .r = le } });
+                lhs = if (negated) try self.mk(.{ .unary = .{ .op = .not, .e = both } }) else both;
                 continue;
             }
             if (self.at(.qq) and min_bp < 30) {
@@ -2699,4 +2934,153 @@ test "sql: a non-DEFAULT parameter may not follow a defaulted one" {
         \\SELECT f(1) AS v FROM 'x.csv';
     , &diag));
     try testing.expect(std.mem.indexOf(u8, diag.msg, "without DEFAULT") != null);
+}
+
+fn firstPipelineStages(prog: ast.Program) []const ast.Stage {
+    for (prog.stmts) |s| {
+        if (s == .output) return s.output.stages;
+    }
+    unreachable;
+}
+
+/// Index of the aggregate stage. A pipeline ends in a write, so counting back
+/// from the end finds that instead.
+fn aggStageIndex(st: []const ast.Stage) usize {
+    for (st, 0..) |s, i| {
+        if (s.node == .aggregate) return i;
+    }
+    unreachable;
+}
+
+// `round(avg(x), 2)` is ordinary SQL that basalt rejected: an item that was not
+// itself an aggregate call fell through to the group-key rule, whose message
+// named a GROUP BY the query did not have. The calls now move to the aggregate
+// stage and the arithmetic around them becomes a projection over its output.
+test "sql: an aggregate inside a scalar expression lifts to the aggregate stage" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a, "SELECT g, ROUND(AVG(v), 2) AS m FROM 'x.csv' GROUP BY g;");
+    const st = firstPipelineStages(prog);
+
+    // read -> aggregate -> select, the projection being what evaluates round()
+    const ai = aggStageIndex(st);
+    const agg = st[ai].node.aggregate;
+    try testing.expectEqual(@as(usize, 1), agg.aggs.len);
+    try testing.expectEqualStrings("avg(v)", agg.aggs[0].name);
+    try testing.expectEqual(ast.AggFunc.avg, agg.aggs[0].func);
+
+    const sel = st[ai + 1].node.select;
+    try testing.expectEqual(@as(usize, 2), sel.len);
+    try testing.expectEqualStrings("g", sel[0].field.last());
+    try testing.expectEqualStrings("m", sel[1].computed.name);
+    // round's first argument is now the column the aggregate produced
+    const arg0 = sel[1].computed.expr.call.args[0];
+    try testing.expectEqualStrings("avg(v)", arg0.field.last());
+}
+
+test "sql: one aggregate mentioned twice becomes a single output column" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a, "SELECT SUM(v) AS s, SUM(v) * 2 AS d FROM 'x.csv';");
+    const st = firstPipelineStages(prog);
+    const agg = st[aggStageIndex(st)].node.aggregate;
+    try testing.expectEqual(@as(usize, 1), agg.aggs.len);
+    try testing.expectEqualStrings("s", agg.aggs[0].name);
+}
+
+// HAVING is allowed to filter on an aggregate the SELECT list never asked for.
+// It was rejected with "unknown field `count(*)`", because nothing computed it.
+test "sql: HAVING may name an aggregate the SELECT list omits" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a, "SELECT g, AVG(v) AS m FROM 'x.csv' GROUP BY g HAVING COUNT(*) > 1;");
+    const st = firstPipelineStages(prog);
+
+    const ai = aggStageIndex(st);
+    const agg = st[ai].node.aggregate;
+    try testing.expectEqual(@as(usize, 2), agg.aggs.len);
+    try testing.expectEqualStrings("count(*)", agg.aggs[1].name);
+
+    // ...and the extra column is projected away again, so it never reaches
+    // output. The filter (HAVING) sits between, hence ai + 2.
+    const sel = st[ai + 2].node.select;
+    try testing.expectEqual(@as(usize, 2), sel.len);
+    try testing.expectEqualStrings("g", sel[0].field.last());
+    try testing.expectEqualStrings("m", sel[1].field.last());
+}
+
+// BETWEEN desugars to the pair of comparisons rather than becoming a node of
+// its own, so everything downstream — the type checker, the evaluator, and
+// above all pushdown — sees a shape it already handles.
+test "sql: BETWEEN lowers to >= AND <=" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a, "SELECT * FROM 'x.csv' WHERE v BETWEEN 10 AND 30;");
+    const st = firstPipelineStages(prog);
+    var f: ?*const ast.Expr = null;
+    for (st) |s| if (s.node == .filter) {
+        f = s.node.filter;
+    };
+    const e = f.?;
+    try testing.expectEqual(ast.BinOp.@"and", e.binary.op);
+    try testing.expectEqual(ast.BinOp.ge, e.binary.l.binary.op);
+    try testing.expectEqual(@as(i64, 10), e.binary.l.binary.r.int_lit);
+    try testing.expectEqual(ast.BinOp.le, e.binary.r.binary.op);
+    try testing.expectEqual(@as(i64, 30), e.binary.r.binary.r.int_lit);
+}
+
+test "sql: NOT BETWEEN negates the whole range" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a, "SELECT * FROM 'x.csv' WHERE v NOT BETWEEN 10 AND 30;");
+    const st = firstPipelineStages(prog);
+    var f: ?*const ast.Expr = null;
+    for (st) |s| if (s.node == .filter) {
+        f = s.node.filter;
+    };
+    try testing.expectEqual(ast.UnOp.not, f.?.unary.op);
+    try testing.expectEqual(ast.BinOp.@"and", f.?.unary.e.binary.op);
+}
+
+// `SELECT x AS y ... GROUP BY x` is ordinary SQL. It was rejected unless the
+// GROUP BY named the alias, because the rename was attempted before the
+// aggregate rather than after it.
+test "sql: a grouping key may be aliased in the SELECT list" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a, "SELECT g AS grp, COUNT(*) AS n FROM 'x.csv' GROUP BY g;");
+    const st = firstPipelineStages(prog);
+    const ai = aggStageIndex(st);
+    try testing.expectEqualSlices(u8, "g", st[ai].node.aggregate.by[0].last());
+
+    const sel = st[ai + 1].node.select;
+    try testing.expectEqualStrings("grp", sel[0].computed.name);
+    try testing.expectEqualStrings("g", sel[0].computed.expr.field.last());
+    try testing.expectEqualStrings("n", sel[1].field.last());
+}
+
+// A column that is neither aggregated nor grouped has no one value per group.
+// It used to be dropped from the output silently, which turns a malformed query
+// into a plausible-looking wrong answer.
+test "sql: an ungrouped column is refused, not silently dropped" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const r = parseSource(a, "SELECT g, v, COUNT(*) AS n FROM 'x.csv' GROUP BY g;", &diag);
+    try testing.expectError(error.ParseFailed, r);
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "`v`") != null);
 }
