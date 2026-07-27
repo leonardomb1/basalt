@@ -436,6 +436,7 @@ fn handleConn(gpa: std.mem.Allocator, routes: []const Route, conn: std.net.Serve
         var hit = req.iterateHeaders();
         while (hit.next()) |h| try hdrs.append(h);
         try bindHeaderParams(&params, route.program, hdrs.items);
+        dropLetParams(&params, route.program);
 
         var diag: runtime.Diag = .{};
         var sink = runtime.OutcomeSink.init(gpa);
@@ -521,6 +522,27 @@ fn bindHeaderParams(
                 try params.append(.{ .key = p.name, .val = h.value });
                 break;
             }
+        }
+    }
+}
+
+/// Drop any binding whose key names a statement-level `LET`. Header binding walks
+/// declared params only, but the query string is whatever the caller typed — and a
+/// LET is sealed: it is not part of the endpoint's parameter surface, so `?cutoff=x`
+/// is ignored here rather than reaching the planner (where `-p cutoff=x` is an
+/// error, the command line having no reason to name one).
+fn dropLetParams(params: *std.array_list.Managed(runtime.ParamArg), program: ast.Program) void {
+    var i: usize = 0;
+    while (i < params.items.len) {
+        var is_let = false;
+        for (program.stmts) |s| {
+            if (s != .let_const) continue;
+            if (std.mem.eql(u8, s.let_const.name, params.items[i].key)) is_let = true;
+        }
+        if (is_let) {
+            _ = params.orderedRemove(i);
+        } else {
+            i += 1;
         }
     }
 }
@@ -769,6 +791,26 @@ test "parseQuery binds k=v pairs and skips malformed ones" {
     params.clearRetainingCapacity();
     try parseQuery(&params, "");
     try std.testing.expectEqual(@as(usize, 0), params.items.len);
+}
+
+test "dropLetParams: a query string cannot bind a sealed LET" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a,
+        \\CREATE ENDPOINT '/r';
+        \\PARAM tenant STRING DEFAULT 'x' FROM QUERY;
+        \\LET cutoff = 5;
+        \\SELECT id FROM 'in.csv' WHERE id > $cutoff;
+    , &diag);
+
+    var params = std.array_list.Managed(runtime.ParamArg).init(a);
+    try parseQuery(&params, "tenant=acme&cutoff=999");
+    dropLetParams(&params, prog);
+    try std.testing.expectEqual(@as(usize, 1), params.items.len);
+    try std.testing.expectEqualStrings("tenant", params.items[0].key);
+    try std.testing.expectEqualStrings("acme", params.items[0].val);
 }
 
 test "writeJsonStr escapes everything that would break the response body" {

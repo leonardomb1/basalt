@@ -263,11 +263,26 @@ pub const Parser = struct {
     fn parseStatement(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
         if (self.isKw("create")) return self.parseCreate(out);
         if (self.isKw("param")) return out.append(.{ .param = try self.parseParam() });
+        if (self.isKw("let")) return out.append(.{ .let_const = try self.parseLetStmt() });
         if (self.isKw("load")) return self.parseLoadInto(out);
         if (self.isKw("for")) return out.append(.{ .for_each = try self.parseForEach() });
         if (self.isKw("case")) return out.append(.{ .match = try self.parseCaseStmt() });
         if (self.isKw("with") or self.isKw("select")) return self.parseTerminalQuery(out);
-        return self.fail(self.curPos(), "expected a statement (CREATE / PARAM / LOAD INTO / SELECT / FOR / CASE), found {s}", .{self.curTag().describe()});
+        return self.fail(self.curPos(), "expected a statement (CREATE / PARAM / LET / LOAD INTO / SELECT / FOR / CASE), found {s}", .{self.curTag().describe()});
+    }
+
+    /// `LET name = <expr>;` — a script-scoped plan-time constant, referenced as
+    /// `$name`. A bare `LET` in statement position is unambiguous: an expression is
+    /// never a statement, so the expression-level `LET x = v IN body` can only be
+    /// reached from inside an expression.
+    fn parseLetStmt(self: *Parser) Error!ast.LetConst {
+        const pos = self.curPos();
+        try self.expectKw("let");
+        const name = try self.expectIdent();
+        _ = try self.expect(.assign);
+        const expr = try self.parseExpr();
+        _ = try self.expect(.semi);
+        return .{ .name = name, .expr = expr, .pos = pos };
     }
 
     fn parseCreate(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {

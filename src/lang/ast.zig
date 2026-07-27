@@ -292,6 +292,14 @@ pub const Connection = struct {
 
 pub const Let = struct { name: []const u8, pipeline: Pipeline, pos: Pos };
 
+/// `LET name = <expr>;` at statement level: a script-scoped constant, folded ONCE
+/// at plan time (in declaration order) and referenced as `$name` through the same
+/// substitution machinery as a PARAM. Sealed — it can never be bound from outside
+/// (`-p`, query string, header) and never joins an endpoint's parameter surface.
+/// Distinct from `Expr.LetIn` (`LET x = v IN body`), which binds a bare name inside
+/// one expression and disappears during expansion.
+pub const LetConst = struct { name: []const u8, expr: *Expr, pos: Pos };
+
 /// `fn name(a, b) = <expr>`: a user-defined scalar function. Expanded inline at
 /// plan time (`expand.zig`) — each call is replaced by the body with arguments
 /// substituted for the parameters — so the type-checker and evaluator never see
@@ -368,6 +376,7 @@ pub const Stmt = union(enum) {
     for_each: ForEach,
     match: StmtMatch,
     func: FnDecl,
+    let_const: LetConst,
 };
 
 /// `EXPLAIN` prefix on a program: print the plan instead of running it, or
