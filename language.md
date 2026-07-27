@@ -560,7 +560,8 @@ Logs are stderr-only, plain text, level `warn` by default (`--log-level`,
 `CREATE FUNCTION` / `PARAM` declarations across entries (re-declaring a name
 replaces it). Meta commands: `\connections` list the session's declarations ·
 `\clear` drop them · `\format json|table` switch result output · `\help` ·
-`\q`. For history/arrow keys run it under `rlwrap`.
+`\q`. Arrow keys edit and browse history (persisted in `~/.basalt_history`);
+`^C` drops the pending entry.
 
 | code | meaning |
 |------|---------|

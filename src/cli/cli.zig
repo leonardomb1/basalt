@@ -11,6 +11,7 @@
 const std = @import("std");
 const parser = @import("../lang/sql_parser.zig");
 const include = @import("../lang/include.zig");
+const linemod = @import("line.zig");
 const ast = @import("../lang/ast.zig");
 const runtime = @import("../runtime/run.zig");
 const obs = @import("../runtime/obs.zig");
@@ -564,8 +565,11 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
     var sess = Session{ .decls = DeclStore.init(alloc), .tty = std.posix.isatty(std.fs.File.stdin().handle) };
     defer sess.decls.deinit();
 
+    var editor: ?linemod.Editor = if (sess.tty) linemod.Editor.init(alloc) else null;
+    defer if (editor) |*e| e.deinit();
+
     if (sess.tty) {
-        try msg.writeAll("basalt REPL — end a statement with `;` to run it. \\q quits, \\help for help; `rlwrap basalt repl` adds history.\n");
+        try msg.writeAll("basalt REPL — end a statement with `;` to run it. \\q quits, \\help for help; arrows recall history.\n");
         try msg.flush();
     }
 
@@ -578,21 +582,43 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
         runtime.resetAbort();
         block.clearRetainingCapacity();
         while (true) {
-            if (sess.tty) {
+            var owned: ?[]u8 = null;
+            defer if (owned) |o| alloc.free(o);
+            var line: []const u8 = undefined;
+            if (editor) |*ed| {
                 const prompt: []const u8 = if (block.items.len == 0) "\xc2\xbb " else "\xe2\x80\xa6 ";
-                try msg.writeAll(prompt);
-                try msg.flush();
+                switch (ed.readLine(prompt) catch |e| blk: {
+                    try msg.print("input error: {s}\n", .{@errorName(e)});
+                    try msg.flush();
+                    break :blk linemod.Result.eof;
+                }) {
+                    .eof => {
+                        quit = true;
+                        break;
+                    },
+                    .interrupt => {
+                        // ^C discards the whole pending block, not just the line.
+                        block.clearRetainingCapacity();
+                        continue;
+                    },
+                    .line => |l| {
+                        owned = l;
+                        line = l;
+                        ed.remember(l);
+                    },
+                }
+            } else {
+                const maybe = in.takeDelimiter('\n') catch |e| {
+                    try msg.print("input error: {s}\n", .{@errorName(e)});
+                    try msg.flush();
+                    quit = true;
+                    break;
+                };
+                line = maybe orelse {
+                    quit = true;
+                    break;
+                };
             }
-            const maybe = in.takeDelimiter('\n') catch |e| {
-                try msg.print("input error: {s}\n", .{@errorName(e)});
-                try msg.flush();
-                quit = true;
-                break;
-            };
-            const line = maybe orelse {
-                quit = true;
-                break;
-            };
             const t = std.mem.trim(u8, line, " \t\r\n");
             if (t.len == 0) {
                 if (block.items.len == 0) continue;
@@ -795,7 +821,7 @@ fn replHelp(msg: *std.Io.Writer) !void {
         \\  \help, \h, ?       this help
         \\  \q, \quit, exit    leave
         \\
-        \\for history and arrow keys, run under rlwrap:  rlwrap basalt repl
+        \\arrows browse history (persisted in ~/.basalt_history); ^A/^E home/end, ^U clears the line, ^C drops the entry
         \\
     );
     try msg.flush();
