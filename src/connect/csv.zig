@@ -80,7 +80,7 @@ pub const CsvReader = struct {
             client.* = httpx.initClient(arena);
             defer client.deinit();
             const names = try azure.listPrefix(arena, client, p.account, p.container, p.prefix, azure.endpointFromEnv(arena));
-            if (names.len == 0) return error.EmptyCsv;
+            if (names.len == 0) return azure.Error.AzureEmptyPrefix;
             const urls = try arena.alloc([]const u8, names.len);
             for (names, urls) |n, *u| u.* = try std.fmt.allocPrint(arena, "az://{s}/{s}/{s}", .{ p.account, p.container, n });
             first = urls[0];
@@ -527,6 +527,18 @@ pub const CsvWriter = struct {
         };
     }
 
+    /// Recovers the error a blob destination actually hit. Staging a block runs
+    /// under `std.Io.Writer`, whose error set is just `WriteFailed`, so the Azure
+    /// code recorded at the point of failure is put back here — otherwise a 403
+    /// and a missing container are the same word to the caller.
+    fn specific(self: *CsvWriter, e: anyerror) anyerror {
+        if (e != error.WriteFailed) return e;
+        return switch (self.backend) {
+            .file => e,
+            .blob => |b| b.w.last_status orelse e,
+        };
+    }
+
     pub fn open(arena: std.mem.Allocator, path: []const u8, schema: types.Schema) !*CsvWriter {
         const self = try arena.create(CsvWriter);
         if (azure.isUrl(path)) {
@@ -552,6 +564,10 @@ pub const CsvWriter = struct {
     }
 
     pub fn writeBatch(self: *CsvWriter, arena: std.mem.Allocator, batch: Batch) !void {
+        self.writeRows(arena, batch) catch |e| return self.specific(e);
+    }
+
+    fn writeRows(self: *CsvWriter, arena: std.mem.Allocator, batch: Batch) !void {
         const w = self.out();
         var r: usize = 0;
         while (r < batch.len) : (r += 1) {
@@ -579,7 +595,7 @@ pub const CsvWriter = struct {
                 f.close();
             },
             // Committing the block list is what makes the blob appear.
-            .blob => |b| try b.w.finish(),
+            .blob => |b| b.w.finish() catch |e| return self.specific(e),
         }
     }
 

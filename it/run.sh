@@ -174,6 +174,40 @@ SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM 'az://devstoreacc
   else
     report "azure-volume (run error)" bad
   fi
+
+  # Parquet out to a blob. The parquet writer used to open its target with
+  # `std.fs.cwd().createFile` unconditionally, so an `az://` path failed with
+  # FileNotFound from a local directory named `az:` — the README's own opening
+  # example. This is the routing guard; the read half already worked.
+  if brun run -c "LOAD INTO 'az://devstoreaccount1/basalt-it/bronze/seed.parquet' AS SELECT * FROM 'it/seed.csv';" &&
+     brun run -c "LOAD INTO '$out/azure_parquet.csv' AS
+SELECT * FROM 'az://devstoreaccount1/basalt-it/bronze/seed.parquet' ORDER BY id;"; then
+    check azure-parquet "$out/azure_parquet.csv" it/expected.csv
+  else
+    report "azure-parquet (run error)" bad
+  fi
+
+  # The same volume rows land at ~4.1MB of Parquet — just past one 4MiB block, so
+  # the footer is written into a second block and the commit has a list to order.
+  # A one-block write would pass even if block sequencing were wrong.
+  if brun run -c "LOAD INTO 'az://devstoreaccount1/basalt-it/bronze/vol.parquet' AS SELECT * FROM '$volcsv';" &&
+     brun run -c "LOAD INTO '$out/vol_azure_parquet.csv' AS
+SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM 'az://devstoreaccount1/basalt-it/bronze/vol.parquet';"; then
+    check azure-parquet-volume "$out/vol_azure_parquet.csv" "$out/vol_expected.csv"
+  else
+    report "azure-parquet-volume (run error)" bad
+  fi
+
+  # A prefix that matches nothing must say so. It used to surface as `EmptyCsv`,
+  # which sent the reader to debug a file rather than the prefix they mistyped.
+  if $B run -c "SELECT * FROM 'az://devstoreaccount1/basalt-it/nothing-here/';" >"$out/empty.log" 2>&1; then
+    report "azure-empty-prefix (expected failure, got success)" bad
+  elif grep -q "no blobs under prefix" "$out/empty.log"; then
+    report azure-empty-prefix ok
+  else
+    report "azure-empty-prefix (wrong message)" bad
+    tail -3 "$out/empty.log"
+  fi
 fi
 
 # Parquet: read the committed fixtures through the CLI. The unit tests decode

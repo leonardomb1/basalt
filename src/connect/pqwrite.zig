@@ -10,12 +10,19 @@
 //! the whole file, which is the closest a Parquet writer can get to streaming:
 //! the format needs a chunk's full size and offset before its metadata can be
 //! written, and the footer needs every row group.
+//!
+//! Output is strictly forward — every byte goes through `emit`, which tracks the
+//! running offset itself and never seeks — so the destination only has to be a
+//! `*std.Io.Writer`. That is what lets the same writer target a local file or an
+//! Azure block blob, and what a future S3/GCS sink would plug into.
 
 const std = @import("std");
 const pq = @import("parquet.zig");
 const thrift = @import("thrift.zig");
 const codec = @import("codec.zig");
 const driver = @import("driver.zig");
+const azure = @import("azure.zig");
+const httpx = @import("http.zig");
 const types = @import("../lang/types.zig");
 const batchmod = @import("../exec/batch.zig");
 const valuemod = @import("../exec/value.zig");
@@ -279,9 +286,20 @@ const RowGroupMeta = struct {
     total_byte_size: i64,
 };
 
+/// Bytes buffered before the local-file destination drains. Pages arrive as
+/// single large slices; this mostly amortizes the small footer/length/magic
+/// emits at the end of a file.
+const WRITE_BUF = 64 * 1024;
+
+/// The IANA type registered for Parquet. Only metadata on the stored object, but
+/// a reader fetching the blob over plain HTTP gets it right.
+const parquet_content_type = "application/vnd.apache.parquet";
+
 pub const Writer = struct {
     arena: std.mem.Allocator,
-    file: std.fs.File,
+    backend: Backend,
+    write_buf: [WRITE_BUF]u8 = undefined,
+    fw: std.fs.File.Writer = undefined,
     schema: types.Schema,
     maps: []Mapping,
     compression: codec.Codec,
@@ -290,6 +308,21 @@ pub const Writer = struct {
     total_rows: i64 = 0,
     offset: i64 = 0,
     groups: List(RowGroupMeta),
+
+    /// A local file, or a block blob staged over HTTP. Both expose a plain
+    /// `*std.Io.Writer`, so page and footer emission below is identical either
+    /// way — mirrors `csv.CsvWriter.Backend`.
+    const Backend = union(enum) {
+        file: std.fs.File,
+        blob: struct { client: *std.http.Client, w: *azure.BlockBlobWriter },
+    };
+
+    fn dest(self: *Writer) *std.Io.Writer {
+        return switch (self.backend) {
+            .file => &self.fw.interface,
+            .blob => |b| &b.w.interface,
+        };
+    }
 
     pub fn isPath(path: []const u8) bool {
         return std.mem.endsWith(u8, path, ".parquet");
@@ -319,20 +352,44 @@ pub const Writer = struct {
         const self = try arena.create(Writer);
         self.* = .{
             .arena = arena,
-            .file = try std.fs.cwd().createFile(path, .{}),
+            .backend = undefined,
             .schema = schema,
             .maps = maps,
             .compression = compression,
             .cols = cols,
             .groups = List(RowGroupMeta).init(arena),
         };
+        if (azure.isUrl(path)) {
+            const client = try arena.create(std.http.Client);
+            client.* = httpx.initClient(arena);
+            const blob = try azure.parseUrl(arena, path, azure.endpointFromEnv(arena));
+            self.backend = .{ .blob = .{
+                .client = client,
+                .w = try azure.BlockBlobWriter.init(arena, client, blob, parquet_content_type),
+            } };
+        } else {
+            self.backend = .{ .file = try std.fs.cwd().createFile(path, .{}) };
+            self.fw = self.backend.file.writer(&self.write_buf);
+        }
         try self.emit(pq.magic);
         return self;
     }
 
     fn emit(self: *Writer, bytes: []const u8) !void {
-        try self.file.writeAll(bytes);
+        self.dest().writeAll(bytes) catch |e| return self.specific(e);
         self.offset += @intCast(bytes.len);
+    }
+
+    /// Recovers the error a blob destination actually hit. Staging a block runs
+    /// under `std.Io.Writer`, whose error set is just `WriteFailed`, so the Azure
+    /// code recorded at the point of failure is put back here — otherwise a 403
+    /// and a missing container are the same word to the caller.
+    fn specific(self: *Writer, e: anyerror) anyerror {
+        if (e != error.WriteFailed) return e;
+        return switch (self.backend) {
+            .file => e,
+            .blob => |b| b.w.last_status orelse e,
+        };
     }
 
     pub fn writeBatch(self: *Writer, arena: std.mem.Allocator, batch: Batch) !void {
@@ -506,13 +563,31 @@ pub const Writer = struct {
         std.mem.writeInt(u32, &len4, @intCast(footer.items.len), .little);
         try self.emit(&len4);
         try self.emit(pq.magic);
-        self.file.close();
+
+        switch (self.backend) {
+            .file => |f| {
+                self.fw.interface.flush() catch |e| {
+                    f.close();
+                    return e;
+                };
+                f.close();
+            },
+            // Committing the block list is what publishes the blob, and it happens
+            // only once the footer is written — so a reader never observes a
+            // Parquet object without one. Atomic publication, for free.
+            .blob => |b| b.w.finish() catch |e| return self.specific(e),
+        }
     }
 
     /// A partial Parquet file has no footer and is unreadable, which is the
-    /// correct outcome for an aborted run — there is nothing to roll back.
+    /// correct outcome for an aborted run — there is nothing to roll back. A blob
+    /// is stronger: skipping the block-list commit means the object never appears
+    /// at all, and Azure discards the staged blocks after a week.
     pub fn abort(self: *Writer) void {
-        self.file.close();
+        switch (self.backend) {
+            .file => |f| f.close(),
+            .blob => {},
+        }
     }
 
     fn writeFileMetaData(self: *Writer, out: *List(u8)) !void {
@@ -1169,4 +1244,27 @@ test "index width covers the dictionary size" {
     try testing.expectEqual(@as(u8, 2), indexWidth(4));
     try testing.expectEqual(@as(u8, 3), indexWidth(5));
     try testing.expectEqual(@as(u8, 8), indexWidth(256));
+}
+
+// The regression this pins: `open` used to call `std.fs.cwd().createFile` for
+// every target, so an `az://` path became an attempt to create a file under a
+// local directory named `az:` and failed with FileNotFound — the error looked
+// like a storage problem and hid the real one for a whole debugging session.
+// Whatever the outcome here without credentials in the environment, it must not
+// come from the filesystem.
+test "an az:// target routes to the blob writer, never the local filesystem" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "x", .ty = types.Type.init(.int).asNullable() },
+    } };
+
+    const w = Writer.open(a, "az://acct/ctr/bronze/t.parquet", schema, .snappy) catch |e| {
+        // No AZURE_STORAGE_KEY set is the expected outcome on a bare test box.
+        try testing.expect(e != error.FileNotFound and e != error.NotDir);
+        return;
+    };
+    try testing.expect(w.backend == .blob);
 }

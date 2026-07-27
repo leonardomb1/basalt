@@ -28,6 +28,7 @@ const aad = @import("../connect/aad.zig");
 const splitmod = @import("../connect/split.zig");
 const ssrp = @import("../connect/ssrp.zig");
 const walmod = @import("../connect/wal.zig");
+const azure = @import("../connect/azure.zig");
 const gen = @import("../connect/gen.zig");
 const parallel = @import("parallel.zig");
 const analyze = @import("analyze.zig");
@@ -3838,7 +3839,7 @@ fn openSourceProjected(
         pqdecode.Reader.isPath(rd.form.path);
     if (is_pq) {
         const pr = pqdecode.Reader.openProjected(env.arena, rd.form.path, project) catch |e|
-            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
+            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
         pr.bounds = bounds;
         env.pq_readers += 1;
         env.pq_reader = pr;
@@ -3900,11 +3901,16 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
         if (rd.form != .path) return planErr(env.diag, "read csv needs a quoted path");
         if (pqdecode.Reader.isPath(rd.form.path)) {
             const pr = pqdecode.Reader.open(env.arena, rd.form.path) catch |e|
-                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
+                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
             return pr.source();
         }
-        const reader = csv.CsvReader.open(env.arena, rd.form.path) catch |e|
-            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open input CSV `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
+        const reader = csv.CsvReader.open(env.arena, rd.form.path) catch |e| {
+            // A mistyped prefix and a truly empty one are the same listing; say
+            // which prefix came back empty rather than blaming the CSV parser.
+            if (e == azure.Error.AzureEmptyPrefix)
+                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no blobs under prefix `{s}`", .{rd.form.path}));
+            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open input CSV `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
+        };
         return reader.source();
     }
     const conn = env.connections.get(rd.connector) orelse
@@ -4297,11 +4303,11 @@ fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         // without this it would be written as CSV text under a .parquet name.
         if (pqwrite.Writer.isPath(w.target)) {
             const pw = pqwrite.Writer.open(env.arena, w.target, schema, .snappy) catch |e|
-                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output parquet `{s}` ({s})", .{ w.target, @errorName(e) }));
+                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output parquet `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
             return pw.sink();
         }
-        const writer = csv.CsvWriter.open(env.arena, w.target, schema) catch
-            return planErr(env.diag, "could not open output CSV");
+        const writer = csv.CsvWriter.open(env.arena, w.target, schema) catch |e|
+            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output CSV `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
         return writer.sink();
     }
     const conn = env.connections.get(w.connector) orelse
@@ -4534,6 +4540,21 @@ fn planErrT(diag: *Diag, e: anyerror, msg: []const u8) error{PlanFailed} {
     if (isTransient(e)) diag.retryable = true;
     setMsg(diag, msg);
     return error.PlanFailed;
+}
+
+/// Which layer a file-shaped path resolves to, for error messages. A bare
+/// `FileNotFound` on an `az://` path reads as a storage-account problem and
+/// sends the reader off to check credentials and containers; naming the layer
+/// that actually failed ends that detour at the first error.
+fn pathLayer(path: []const u8) []const u8 {
+    if (azure.isUrl(path)) return "azure blob";
+    if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://")) return "http";
+    return "local file";
+}
+
+/// `<layer>: <ErrorName>`, the parenthetical every file-shaped open error carries.
+fn pathFail(arena: std.mem.Allocator, path: []const u8, e: anyerror) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}: {s}", .{ pathLayer(path), @errorName(e) });
 }
 
 fn schemaPtr(arena: std.mem.Allocator, schema: types.Schema) !*types.Schema {

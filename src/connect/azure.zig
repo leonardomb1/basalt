@@ -47,6 +47,10 @@ pub const Error = error{
     AzureBlobNotFound,
     AzureAuthFailed,
     AzureThrottled,
+    /// The container exists and is readable; nothing is stored under the prefix.
+    /// Distinct from a genuinely empty object, because the overwhelmingly common
+    /// cause is a mistyped prefix in an otherwise full lake.
+    AzureEmptyPrefix,
 };
 
 pub const Blob = struct {
@@ -322,6 +326,11 @@ pub const BlockBlobWriter = struct {
     content_type: []const u8,
     /// Azure's `<Code>: <Message>` from the last failure, for the caller to log.
     last_error: []const u8 = "",
+    /// The typed error behind that failure. Block staging runs under
+    /// `std.Io.Writer`, whose error set is only `WriteFailed`; keeping the real
+    /// one here lets the sink re-raise it instead of reporting a generic write
+    /// failure for what was really a 403 or a missing container.
+    last_status: ?Error = null,
     rand: std.Random.DefaultPrng,
 
     const vtable = std.Io.Writer.VTable{ .drain = drainFn };
@@ -466,7 +475,12 @@ pub const BlockBlobWriter = struct {
                 .response_writer = &aw.writer,
             });
             const code = @intFromEnum(res.status);
-            if (code == 201 or code == 200) return;
+            // Cleared on success: `stageBlock` retries a missing container, and a
+            // stale code from that first attempt must not be re-raised later.
+            if (code == 201 or code == 200) {
+                self.last_status = null;
+                return;
+            }
 
             const resp = aw.writer.buffered();
             if (retriable(code) and attempt + 1 < max_attempts) {
@@ -474,7 +488,8 @@ pub const BlockBlobWriter = struct {
                 continue;
             }
             self.last_error = describe(self.arena, code, resp) catch "";
-            return statusToError(code, resp);
+            self.last_status = statusToError(code, resp);
+            return self.last_status.?;
         }
     }
 
@@ -513,7 +528,11 @@ pub const BlockBlobWriter = struct {
         });
         const code = @intFromEnum(res.status);
         // 409 = already there, which is success for our purposes.
-        if (code != 201 and code != 409) return Error.AzureRequestFailed;
+        if (code != 201 and code != 409) {
+            self.last_error = describe(self.arena, code, aw.writer.buffered()) catch "";
+            self.last_status = statusToError(code, aw.writer.buffered());
+            return self.last_status.?;
+        }
     }
 };
 
