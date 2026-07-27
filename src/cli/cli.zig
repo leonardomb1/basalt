@@ -1,6 +1,6 @@
 //! Command-line surface:
 //!   basalt run   <script>|-c <script> [-p k=v ...] [-j N] [--port N]
-//!   basalt check <script>|-c <script> [--connect]
+//!   basalt check <script>|-c <script>
 //!   basalt repl
 //! `run` executes (HTTP mode when the script declares an endpoint); `check`
 //! validates and plans without running. A
@@ -155,21 +155,8 @@ fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     const src = (try loadSource(a, "check", args, stderr)) orelse return 1;
     const prog = (try parseSrc(a, src, stderr)) orelse return 1;
 
-    var connect = false;
-    var i: usize = 2;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--command")) {
-            i += 1;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--connect")) connect = true;
-    }
-
-    var galloc = alloc;
-    const resolver: ?analyze.Resolver = if (connect) runtime.connectingResolver(&galloc) else null;
     var adiag = analyze.Diag{};
-    _ = analyze.analyze(a, prog, resolver, &adiag) catch |e| switch (e) {
+    _ = analyze.analyze(a, prog, &adiag) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.AnalyzeFailed => {
             try stderr.print("{s}: error: {s}\n", .{ src.label, adiag.msg });
@@ -265,7 +252,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         const eout = &efile.interface;
         defer eout.flush() catch {};
         var adiag2 = analyze.Diag{};
-        const plan = analyze.analyze(arena.allocator(), prog, null, &adiag2) catch |e| switch (e) {
+        const plan = analyze.analyze(arena.allocator(), prog, &adiag2) catch |e| switch (e) {
             error.OutOfMemory => return e,
             error.AnalyzeFailed => {
                 try stderr.print("{s}: error: {s}\n", .{ src.label, adiag2.msg });
@@ -999,8 +986,8 @@ fn usage(w: anytype) !void {
         \\               run a pipeline; HTTP mode when the script declares CREATE ENDPOINT
         \\  basalt serve <dir> [--port N] [--watch]
         \\               host every endpoint script in a dir (SIGHUP or -w reloads)
-        \\  basalt check <script>|-|-c <script> [--connect]
-        \\               validate without running; -s prints the plan
+        \\  basalt check <script>|-|-c <script>
+        \\               parse and validate without running; `EXPLAIN` prints the plan
         \\  basalt repl  interactive read-eval-print loop
         \\  basalt help  show this help
         \\

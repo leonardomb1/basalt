@@ -1,9 +1,9 @@
 //! Static analysis: parsed program → validated `Plan` IR, without executing or
-//! (by default) connecting. Shared groundwork for `pipeline plan` (render the IR)
-//! and `pipeline check` (validate and report). Offline it does full structural +
-//! reference validation and resolves what it can locally (CSV schema from the
-//! header); DB source schemas + per-stage type flow are filled in only when a
-//! connecting resolver is supplied (`--connect`).
+//! connecting. Shared groundwork for `EXPLAIN` (render the IR) and `basalt
+//! check` (validate and report). It does full structural + reference validation
+//! and resolves what it can read locally — a CSV header, a Parquet footer. A
+//! schema only the source can describe (a database table, a remote object)
+//! stays null and renders as `schema: unresolved`.
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
@@ -277,18 +277,10 @@ pub const Stage = struct {
     out_schema: ?types.Schema = null,
 };
 
-/// Result of probing a splittable table for its key + estimated size (`--connect`).
-pub const SplitProbe = struct {
-    key: []const u8,
-    est_rows: i64,
-    will_split: bool,
-};
-
 pub const Physical = struct {
     has_breaker: bool,
     splittable: bool,
     sink_parallel: bool,
-    split_probe: ?SplitProbe = null,
 };
 
 pub const Output = struct {
@@ -301,15 +293,6 @@ pub const Output = struct {
 pub const Plan = struct {
     kind: []const u8,
     outputs: []const Output,
-};
-
-/// Supplies a source's schema. Offline (null) resolves CSV locally and leaves DB
-/// sources unresolved; `--connect` injects one that connects.
-pub const Resolver = struct {
-    ctx: *anyopaque,
-    resolveFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, read: ast.Read, conn: ?ast.Connection) anyerror!?types.Schema,
-    /// Optional: probe a splittable table for its real key + size (the physical plan).
-    splitFn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, read: ast.Read, conn: ?ast.Connection) anyerror!?SplitProbe = null,
 };
 
 /// Collect every output pipeline reachable in a statement block (a `for` or
@@ -330,7 +313,7 @@ fn collectStmtOutputs(outputs: *std.array_list.Managed(ast.Pipeline), stmts: []c
     };
 }
 
-pub fn analyze(arena: std.mem.Allocator, raw_program: ast.Program, resolver: ?Resolver, diag: *Diag) error{ AnalyzeFailed, OutOfMemory }!Plan {
+pub fn analyze(arena: std.mem.Allocator, raw_program: ast.Program, diag: *Diag) error{ AnalyzeFailed, OutOfMemory }!Plan {
     var expand_msg: []const u8 = "";
     const program = expand.expandProgram(arena, raw_program, null, &expand_msg) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -376,7 +359,7 @@ pub fn analyze(arena: std.mem.Allocator, raw_program: ast.Program, resolver: ?Re
     // null) keeps `$var`-as-value expressions lenient instead of "unknown field".
     try bindBodyVars(arena, program.stmts, &params_map);
 
-    var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .resolver = resolver, .params = &params_map, .diag = diag };
+    var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .diag = diag };
 
     var out_plans = std.array_list.Managed(Output).init(arena);
     for (outputs.items) |pipe| try out_plans.append(try ctx.analyzeOutput(pipe));
@@ -388,7 +371,6 @@ const Ctx = struct {
     arena: std.mem.Allocator,
     bindings: *std.StringHashMap(ast.Pipeline),
     connections: *std.StringHashMap(ast.Connection),
-    resolver: ?Resolver,
     params: *const ParamMap,
     diag: *Diag,
 
@@ -437,14 +419,6 @@ const Ctx = struct {
         const sink_is_parallel = isSqlConnector(sink.connector) or std.mem.eql(u8, sink.connector, "starrocks");
         const splittable = src_is_sql and map_only and splittableRead(stages[0].node);
 
-        var probe: ?SplitProbe = null;
-        if (splittable) {
-            if (self.resolver) |r| if (r.splitFn) |f| {
-                const lead = stages[0].node.read;
-                probe = f(r.ctx, self.arena, lead, self.connections.get(lead.connector)) catch null;
-            };
-        }
-
         return .{
             .source = source,
             .stages = try stage_infos.toOwnedSlice(),
@@ -453,7 +427,6 @@ const Ctx = struct {
                 .has_breaker = has_breaker,
                 .splittable = splittable,
                 .sink_parallel = sink_is_parallel,
-                .split_probe = probe,
             },
         };
     }
@@ -474,10 +447,7 @@ const Ctx = struct {
                     .range => "range",
                     .unit => "unit",
                 };
-                var schema = offlineSchema(self.arena, rd);
-                if (schema == null) {
-                    if (self.resolver) |r| schema = r.resolveFn(r.ctx, self.arena, rd, conn) catch null;
-                }
+                const schema = offlineSchema(self.arena, rd);
                 return .{ .connector = connector, .detail = detail, .schema = schema };
             },
             .ref => |name| {
@@ -578,41 +548,63 @@ const Ctx = struct {
     }
 };
 
+/// Prints the plan as a tree, root first and source deepest — the nesting a
+/// pull pipeline actually has, and the one `EXPLAIN ANALYZE` prints, so the two
+/// read as the same picture with different annotations. Node names are the
+/// operator names `ANALYZE` reports, `scan` included.
 pub fn render(plan: Plan, w: anytype) !void {
-    try w.print("@{s}\n", .{plan.kind});
     for (plan.outputs) |o| {
-        try w.print("  read  {s}  {s}\n", .{ sinkKind(o.source), o.source.detail });
-        if (o.source.pushdown.len > 0)
-            try w.print("        pushdown: {s}\n", .{o.source.pushdown});
-        try printSchema(w, "        ", o.source.schema);
-        for (o.stages) |st| {
-            if (st.detail.len > 0) {
-                try w.print("  → {s}  {s}\n", .{ st.kind, st.detail });
-            } else {
-                try w.print("  → {s}\n", .{st.kind});
-            }
-            try printSchema(w, "        ", st.out_schema);
+        if (std.mem.eql(u8, plan.kind, "batch")) {
+            try w.writeAll("plan\n");
+        } else {
+            try w.print("plan ({s})\n", .{plan.kind});
         }
-        try w.print("  write {s}  {s} ({s})\n", .{ sinkKind(o.sink), o.sink.target, o.sink.mode });
+
+        var depth: usize = 1;
+        try indent(w, depth);
+        if (o.sink.target.len > 0) {
+            try w.print("write  {s}  {s} ({s})\n", .{ sinkKind(o.sink), o.sink.target, o.sink.mode });
+        } else {
+            try w.print("write  {s}  ({s})\n", .{ sinkKind(o.sink), o.sink.mode });
+        }
+
+        // Stages are held in dataflow order; the tree reads the other way.
+        var i = o.stages.len;
+        while (i > 0) {
+            i -= 1;
+            depth += 1;
+            const st = o.stages[i];
+            try indent(w, depth);
+            if (st.detail.len > 0) {
+                try w.print("{s}  {s}\n", .{ st.kind, st.detail });
+            } else {
+                try w.print("{s}\n", .{st.kind});
+            }
+            try printSchema(w, depth + 1, st.out_schema);
+        }
+
+        depth += 1;
+        try indent(w, depth);
+        try w.print("scan  {s}  {s}\n", .{ sinkKind(o.source), o.source.detail });
+        if (o.source.pushdown.len > 0) {
+            try indent(w, depth + 1);
+            try w.print("pushdown: {s}\n", .{o.source.pushdown});
+        }
+        if (o.source.schema == null) {
+            try indent(w, depth + 1);
+            try w.writeAll("schema: unresolved\n");
+        }
+        try printSchema(w, depth + 1, o.source.schema);
 
         try w.writeAll("  physical: ");
         if (o.physical.splittable) {
-            if (o.physical.split_probe) |sp| {
-                if (sp.will_split) {
-                    try w.print("split-parallel on `{s}` (~{d} rows)", .{ sp.key, sp.est_rows });
-                    if (o.physical.sink_parallel) try w.writeAll(" · per-lane sink");
-                } else if (sp.key.len > 0) {
-                    try w.print("serial — key `{s}` but ~{d} rows is below the split gate", .{ sp.key, sp.est_rows });
-                } else {
-                    try w.writeAll("serial — no single-column int/uuid primary key to split on");
-                }
-            } else {
-                try w.writeAll("split-parallel candidate");
-                if (o.physical.sink_parallel) try w.writeAll(" · per-lane sink");
-            }
+            // Whether it *will* split depends on the table's key and size, which
+            // only the source can answer — and analysis does not connect.
+            try w.writeAll("split-parallel candidate");
+            if (o.physical.sink_parallel) try w.writeAll(", per-lane sink");
         } else {
             try w.writeAll("serial");
-            if (o.physical.has_breaker) try w.writeAll(" (has breaker — materializes)");
+            if (o.physical.has_breaker) try w.writeAll(" (has breaker, materializes)");
         }
         try w.writeAll("\n");
     }
@@ -626,12 +618,21 @@ fn sinkKind(node: anytype) []const u8 {
     return node.connector;
 }
 
-fn printSchema(w: anytype, indent: []const u8, schema: ?types.Schema) !void {
-    const s = schema orelse {
-        try w.print("{s}(schema: connect to resolve)\n", .{indent});
-        return;
-    };
-    try w.writeAll(indent);
+fn indent(w: anytype, depth: usize) !void {
+    var n: usize = 0;
+    while (n < depth) : (n += 1) try w.writeAll("  ");
+}
+
+/// An unresolved schema is only worth saying once, at the scan that could not
+/// resolve it: nothing downstream of an unknown source is knowable either, and
+/// repeating the note on every stage buried the plan in it.
+///
+/// Labelled, because an annotation and a child node land at the same depth and
+/// a bare list of columns reads like another operator otherwise.
+fn printSchema(w: anytype, depth: usize, schema: ?types.Schema) !void {
+    const s = schema orelse return;
+    try indent(w, depth);
+    try w.writeAll("schema: ");
     for (s.fields, 0..) |f, i| {
         if (i > 0) try w.writeAll("  ");
         try w.print("{s}:{s}{s}", .{ f.name, @tagName(f.ty.kind), if (f.ty.nullable) "?" else "" });
@@ -736,7 +737,7 @@ test "analyze a CSV map pipeline: structure, offline schema, physical" {
     );
     const prog = try parse(a, src);
     var diag = Diag{};
-    const plan = try analyze(a, prog, null, &diag);
+    const plan = try analyze(a, prog, &diag);
 
     try std.testing.expectEqualStrings("batch", plan.kind);
     try std.testing.expectEqual(@as(usize, 1), plan.outputs.len);
@@ -762,7 +763,7 @@ test "analyze a SQL table pipeline: unresolved schema offline, split candidate" 
         \\LOAD INTO '/tmp/x.csv' AS SELECT * FROM pg.orders WHERE amount > 0;
     );
     var diag = Diag{};
-    const plan = try analyze(a, prog, null, &diag);
+    const plan = try analyze(a, prog, &diag);
     const o = plan.outputs[0];
     try std.testing.expectEqualStrings("postgres", o.source.connector);
     try std.testing.expect(o.source.schema == null);
@@ -781,7 +782,7 @@ test "analyze pushdown preview: raw PUSHDOWN AND-ed with the translated filter" 
         \\WHERE valor > 0 AND status = 'ok';
     );
     var diag = Diag{};
-    const plan = try analyze(a, prog, null, &diag);
+    const plan = try analyze(a, prog, &diag);
     try std.testing.expectEqualStrings(
         "(D_E_L_E_T_ <> '*') AND ((([valor] > 0) AND ([status] = 'ok')))",
         plan.outputs[0].source.pushdown,
@@ -797,7 +798,7 @@ test "analyze pushdown preview: an untranslatable filter is not pushed (stays en
         \\LOAD INTO '/tmp/x.csv' AS SELECT * FROM pg.t WHERE amount + 1 > 5;
     );
     var diag = Diag{};
-    const plan = try analyze(a, prog, null, &diag);
+    const plan = try analyze(a, prog, &diag);
     try std.testing.expectEqualStrings("", plan.outputs[0].source.pushdown);
 }
 
@@ -812,7 +813,7 @@ test "type flow fills out_schema for resolved sources" {
     const in = try std.fs.path.join(a, &.{ base, "in.csv" });
     const src = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS SELECT id, CAST(amount AS INT) * 2 AS d FROM '{s}';", .{in});
     var diag = Diag{};
-    const plan = try analyze(a, try parse(a, src), null, &diag);
+    const plan = try analyze(a, try parse(a, src), &diag);
     const sel = plan.outputs[0].stages[0];
     try std.testing.expect(sel.out_schema != null);
     try std.testing.expectEqual(@as(usize, 2), sel.out_schema.?.fields.len);
@@ -830,7 +831,7 @@ test "type flow catches a type error in an expression" {
     const in = try std.fs.path.join(a, &.{ base, "in.csv" });
     const src = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS SELECT * FROM '{s}' WHERE NOT name;", .{in});
     var diag = Diag{};
-    try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, src), null, &diag));
+    try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, src), &diag));
 }
 
 test "analyze rejects unknown connection" {
@@ -839,7 +840,7 @@ test "analyze rejects unknown connection" {
     const a = ar.allocator();
     const prog = try parse(a, "LOAD INTO '/tmp/x.csv' AS SELECT * FROM nope.t;");
     var diag = Diag{};
-    try std.testing.expectError(error.AnalyzeFailed, analyze(a, prog, null, &diag));
+    try std.testing.expectError(error.AnalyzeFailed, analyze(a, prog, &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "unknown connection") != null);
 }
 
@@ -854,7 +855,7 @@ fn expectAnalyzeErr(a: std.mem.Allocator, csv_data: []const u8, query: []const u
     const q = try std.mem.replaceOwned(u8, a, query, "$IN", in);
     const src = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS {s};", .{q});
     var diag = Diag{};
-    try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, src), null, &diag));
+    try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, src), &diag));
 }
 
 test "analyze rejects a program with no output pipeline" {
@@ -863,7 +864,7 @@ test "analyze rejects a program with no output pipeline" {
     const a = ar.allocator();
     const prog = try parse(a, "PARAM x INT DEFAULT 1;");
     var diag = Diag{};
-    try std.testing.expectError(error.AnalyzeFailed, analyze(a, prog, null, &diag));
+    try std.testing.expectError(error.AnalyzeFailed, analyze(a, prog, &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "no output pipeline") != null);
 }
 
@@ -876,14 +877,14 @@ test "physical plan: a breaker keeps SQL serial; a query read is not split-eligi
     const p1 = try analyze(a, try parse(a,
         \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');
         \\LOAD INTO '/tmp/x.csv' AS SELECT * FROM pg.orders ORDER BY id;
-    ), null, &diag);
+    ), &diag);
     try std.testing.expect(p1.outputs[0].physical.has_breaker);
     try std.testing.expect(!p1.outputs[0].physical.splittable);
 
     const p2 = try analyze(a, try parse(a,
         \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');
         \\LOAD INTO '/tmp/x.csv' AS SELECT * FROM pg.QUERY($$SELECT 1 AS x$$);
-    ), null, &diag);
+    ), &diag);
     try std.testing.expect(!p2.outputs[0].physical.has_breaker);
     try std.testing.expect(!p2.outputs[0].physical.splittable);
 }
@@ -1019,7 +1020,7 @@ test "check accepts a filter over a statement-level LET (and rejects a LET/PARAM
     , .{in});
     const prog = try parse(a, src);
     var diag = Diag{};
-    const plan = try analyze(a, prog, null, &diag);
+    const plan = try analyze(a, prog, &diag);
     try std.testing.expectEqual(@as(usize, 1), plan.outputs.len);
     try std.testing.expectEqualStrings("filter", plan.outputs[0].stages[0].kind);
 
@@ -1030,6 +1031,6 @@ test "check accepts a filter over a statement-level LET (and rejects a LET/PARAM
     , .{in});
     const cprog = try parse(a, clash);
     var cdiag = Diag{};
-    try std.testing.expectError(error.AnalyzeFailed, analyze(a, cprog, null, &cdiag));
+    try std.testing.expectError(error.AnalyzeFailed, analyze(a, cprog, &cdiag));
     try std.testing.expect(std.mem.indexOf(u8, cdiag.msg, "declared twice") != null);
 }

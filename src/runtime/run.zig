@@ -817,7 +817,7 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
 /// nests children inside the parent's `next`.
 fn explainTree(arena: std.mem.Allocator, root: op.Op) !void {
     var buf = std.array_list.Managed(u8).init(arena);
-    try buf.appendSlice("actuals (exclusive time):\n");
+    try buf.appendSlice("plan (actuals, exclusive time)\n");
     try explainNode(arena, root, &buf, 1);
     std.debug.print("{s}", .{buf.items});
 }
@@ -4178,12 +4178,6 @@ fn proberOpen(ctx_ptr: *anyopaque) anyerror!sql.Conn {
     return connectSql(ctx.gpa, ctx.kind, ctx.cfg);
 }
 
-/// An `analyze.Resolver` that connects to DB sources and reads their result-set
-/// schema (CSV is handled offline by the analyzer). `ctx` is a `*std.mem.Allocator`.
-pub fn connectingResolver(gpa_ptr: *std.mem.Allocator) analyze.Resolver {
-    return .{ .ctx = gpa_ptr, .resolveFn = resolveSchema, .splitFn = probeSplit };
-}
-
 const SqlConnInfo = struct { kind: SqlKind, dialect: sql.Dialect, port: u16 };
 
 fn sqlConnInfo(conn: ast.Connection) ?SqlConnInfo {
@@ -4191,57 +4185,6 @@ fn sqlConnInfo(conn: ast.Connection) ?SqlConnInfo {
     if (std.mem.eql(u8, conn.connector, "mysql")) return .{ .kind = .mysql, .dialect = .mysql, .port = 3306 };
     if (std.mem.eql(u8, conn.connector, "sqlserver")) return .{ .kind = .sqlserver, .dialect = .sqlserver, .port = 1433 };
     return null;
-}
-
-fn resolveSchema(ctx_ptr: *anyopaque, arena: std.mem.Allocator, rd: ast.Read, conn_opt: ?ast.Connection) anyerror!?types.Schema {
-    const gpa = @as(*std.mem.Allocator, @ptrCast(@alignCast(ctx_ptr))).*;
-    if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path and pqdecode.Reader.isPath(rd.form.path)) {
-        const pr = pqdecode.Reader.open(arena, rd.form.path) catch return null;
-        return pr.schema;
-    }
-    if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path and csv.CsvReader.isUrl(rd.form.path)) {
-        const r = csv.CsvReader.open(arena, rd.form.path) catch return null;
-        defer r.close();
-        return r.schema;
-    }
-    if (std.mem.eql(u8, rd.connector, "http") and rd.form == .path) {
-        const r = httpsrc.HttpSource.open(arena, gpa, rd.form.path, .{}) catch return null;
-        defer r.close();
-        return r.schema.*;
-    }
-    const conn = conn_opt orelse return null;
-    const info = sqlConnInfo(conn) orelse return null;
-    const cfg = dbConfigOf(arena, conn, info.port) orelse return null;
-    const query = switch (rd.form) {
-        .query => |q| q,
-        .table => |t| try std.fmt.allocPrint(arena, "SELECT * FROM {s}", .{try qualStr(arena, t)}),
-        else => return null,
-    };
-    const c = connectSql(gpa, info.kind, cfg) catch return null;
-    var cur = c.queryCursor(query) catch {
-        c.close();
-        return null;
-    };
-    defer cur.close();
-    return try dupeSchema(arena, cur.schema());
-}
-
-/// `analyze.Resolver.splitFn`: introspect a table's PK + estimated size to report
-/// the real split decision (mirrors the runtime planner's gate).
-fn probeSplit(ctx_ptr: *anyopaque, arena: std.mem.Allocator, rd: ast.Read, conn_opt: ?ast.Connection) anyerror!?analyze.SplitProbe {
-    const gpa = @as(*std.mem.Allocator, @ptrCast(@alignCast(ctx_ptr))).*;
-    const conn = conn_opt orelse return null;
-    const table = switch (rd.form) {
-        .table => |t| try qualStr(arena, t),
-        else => return null,
-    };
-    const info = sqlConnInfo(conn) orelse return null;
-    const cfg = dbConfigOf(arena, conn, info.port) orelse return null;
-    var pctx = SplitCtx{ .gpa = gpa, .kind = info.kind, .cfg = cfg, .base_sql = "" };
-    const prober = splitmod.Prober{ .ctx = &pctx, .openFn = proberOpen };
-    const key = (try splitmod.introspectKey(arena, prober, info.dialect, table)) orelse
-        return analyze.SplitProbe{ .key = "", .est_rows = 0, .will_split = false };
-    return .{ .key = key.key.col, .est_rows = key.est_rows, .will_split = key.est_rows >= splitmod.min_rows_to_split };
 }
 
 /// Resolve a connection's host/port/user/password/database (literals + env()/

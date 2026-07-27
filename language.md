@@ -537,12 +537,29 @@ At a use site the innermost binding wins: loop var > LET/PARAM.
 time and row count each stage actually cost — time is *exclusive*, so a
 stage's figure excludes its inputs.
 
+Both print the same tree: root first, the scan deepest, which is the nesting a
+pull pipeline has. `EXPLAIN` annotates each operator with its detail and output
+schema, `EXPLAIN ANALYZE` with what it measured.
+
 ```console
+$ basalt run -c "EXPLAIN SELECT g, COUNT(*) AS c FROM 'x.parquet' GROUP BY g;"
+plan
+  write  stdout  (default)
+    aggregate  1 agg(s), 1 group(s)
+      schema: g:string?  c:int
+      scan  parquet  x.parquet
+        schema: g:string?  v:int?
+  physical: serial (has breaker — materializes)
+
 $ basalt run -c "EXPLAIN ANALYZE SELECT g, COUNT(*) AS c FROM 'x.parquet' GROUP BY g;"
-actuals (exclusive time):
+plan (actuals — exclusive time)
   aggregate      13.1ms          601 rows        2 batches
     scan          6.2ms       500000 rows        6 batches
 ```
+
+A source whose schema only the source itself can describe — a database table, a
+remote object — reads `schema: unresolved`, said once at the scan rather than
+repeated down the tree. Neither form connects.
 
 `EXPLAIN COSTS` is rejected at parse time — there is no cost model to report.
 Actuals cover the serial pipeline; a parallel run reports per lane and is not
@@ -553,7 +570,7 @@ yet summed into one tree.
 ```
 basalt run   <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json]
 basalt serve <dir> [--port N] [--watch]
-basalt check <script>|-|-c "<inline>" [--connect]
+basalt check <script>|-|-c "<inline>"
 ```
 
 `--format json` makes stdout machine-readable: a terminal `SELECT` emits one
