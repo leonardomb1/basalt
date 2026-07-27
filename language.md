@@ -51,8 +51,12 @@ paths resolve relative to the including file.
   to completion (exit codes in §10).
 - Keywords are case-insensitive; identifiers keep their case.
 - Comments: `--` to end of line, `/* ... */` blocks.
-- Strings are `'...'` (double `''` for a literal quote). `"..."` is also
-  accepted with BSL backslash escapes.
+- Strings are `'...'` (double `''` for a literal quote), and only `'...'`.
+- **Quoted names** are `"..."` (ANSI): `"Exchange rate"` is the column of that
+  name, not the text. It is the only way to name a column containing a space or
+  spelling a keyword — `SELECT "select", "Valor Total" FROM ...` — and a quoted
+  name is never read as a keyword. Double `""` for a literal quote inside one.
+  A misspelled quoted name fails as `unknown field`, at plan time.
 - **Raw SQL literals** use Postgres dollar-quoting: `$$...$$`, or
   `$tag$...$tag$` when the body contains `$$`. No escaping inside; `${...}`
   interpolation of loop vars still applies within them (§7).
@@ -493,6 +497,9 @@ At a use site the innermost binding wins: loop var > LET/PARAM.
   (`WHERE d >= '2013-07-01'`). The literal is coerced to the column's type,
   never the reverse, and it is validated at plan time — so `'2013-13-01'` and
   `'01/07/2013'` are errors from `check`, not silent text comparisons.
+- `"Valor Total"` — a quoted column name (§1), valid anywhere a bare name is:
+  `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, an alias (`AS "Total Geral"`), and
+  after a qualifier (`t."Valor Total"`).
 - `x LIKE 'a%'`, `x IN (1, 2, 3)` (expands to an OR-chain),
   `x [NOT] BETWEEN a AND b` (inclusive; expands to `x >= a AND x <= b`, so it
   pushes down like any other pair of comparisons).

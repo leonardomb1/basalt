@@ -202,8 +202,14 @@ pub const Parser = struct {
         return self.fail(self.curPos(), "expected {s}, found {s}", .{ tag.describe(), self.curTag().describe() });
     }
     fn expectIdent(self: *Parser) Error![]const u8 {
-        if (self.at(.ident)) return self.advance().text;
+        if (self.at(.ident) or self.at(.qident)) return self.advance().text;
         return self.fail(self.curPos(), "expected identifier, found {s}", .{self.curTag().describe()});
+    }
+
+    /// An identifier in either spelling. Not the same as `isKw`, which stays
+    /// bare-`ident` only: `"select"` is a column named select, never a keyword.
+    fn atName(self: *Parser) bool {
+        return self.at(.ident) or self.at(.qident);
     }
     fn expectKw(self: *Parser, kw: []const u8) Error!void {
         if (self.eatKw(kw)) return;
@@ -211,7 +217,7 @@ pub const Parser = struct {
     }
     /// A column name: identifier or quoted string (so '${var}' can build it).
     fn expectColName(self: *Parser) Error![]const u8 {
-        if (self.at(.ident) or self.at(.string)) return self.advance().text;
+        if (self.atName() or self.at(.string)) return self.advance().text;
         return self.fail(self.curPos(), "expected a column name, found {s}", .{self.curTag().describe()});
     }
 
@@ -1487,7 +1493,7 @@ pub const Parser = struct {
                 } else {
                     var parts = std.array_list.Managed([]const u8).init(self.arena);
                     try parts.append(try self.parseNameSegment());
-                    while (self.at(.dot) and self.peekTag() == .ident) {
+                    while (self.at(.dot) and (self.peekTag() == .ident or self.peekTag() == .qident)) {
                         _ = self.advance();
                         try parts.append(try self.parseNameSegment());
                     }
@@ -1829,7 +1835,7 @@ pub const Parser = struct {
     fn parseQualNameTok(self: *Parser) Error!ast.QualName {
         var parts = std.array_list.Managed([]const u8).init(self.arena);
         try parts.append(try self.expectColName());
-        while (self.at(.dot) and (self.peekTag() == .ident or self.peekTag() == .string)) {
+        while (self.at(.dot) and (self.peekTag() == .ident or self.peekTag() == .qident or self.peekTag() == .string)) {
             _ = self.advance();
             try parts.append(try self.expectColName());
         }
@@ -2252,6 +2258,9 @@ pub const Parser = struct {
                 _ = try self.expect(.rparen);
                 return e;
             },
+            // A quoted name is only ever a column — no keyword, literal or
+            // function-call reading applies, which is the whole point of quoting.
+            .qident => return self.mk(.{ .field = try self.parseQualNameField() }),
             .ident => {
                 if (eqlNoCase(t.text, "null")) {
                     _ = self.advance();
@@ -2345,7 +2354,7 @@ pub const Parser = struct {
         var parts = std.array_list.Managed([]const u8).init(self.arena);
         var safes = std.array_list.Managed(bool).init(self.arena);
         try parts.append(try self.expectIdent());
-        while ((self.at(.dot) or self.at(.qdot)) and self.peekTag() == .ident) {
+        while ((self.at(.dot) or self.at(.qdot)) and (self.peekTag() == .ident or self.peekTag() == .qident)) {
             const safe = self.at(.qdot);
             _ = self.advance();
             try parts.append(try self.expectIdent());
@@ -3083,4 +3092,62 @@ test "sql: an ungrouped column is refused, not silently dropped" {
     const r = parseSource(a, "SELECT g, v, COUNT(*) AS n FROM 'x.csv' GROUP BY g;", &diag);
     try testing.expectError(error.ParseFailed, r);
     try testing.expect(std.mem.indexOf(u8, diag.msg, "`v`") != null);
+}
+
+// `"..."` was a second string syntax inherited from BSL, so `SELECT "Exchange
+// rate"` silently produced that constant repeated down the column instead of
+// the column itself — there was no spelling that reached a name with a space in
+// it. It is the ANSI quoted identifier now; `'...'` is the only string.
+test "sql: a double-quoted name is a column reference, not a string" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a, "SELECT \"Exchange rate\" AS taxa FROM 'x.csv';");
+    const st = firstPipelineStages(prog);
+    const sel = st[1].node.select;
+    try testing.expectEqualStrings("taxa", sel[0].computed.name);
+    try testing.expectEqualStrings("Exchange rate", sel[0].computed.expr.field.last());
+}
+
+test "sql: single quotes still make a string" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a, "SELECT 'Exchange rate' AS lit FROM 'x.csv';");
+    const st = firstPipelineStages(prog);
+    const sel = st[1].node.select;
+    try testing.expectEqualStrings("Exchange rate", sel[0].computed.expr.str_lit);
+}
+
+// A quoted name is never read as a keyword, which is the other half of why
+// quoting exists: a column may legitimately be called `select` or `from`.
+test "sql: a quoted name that spells a keyword is still a column" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a, "SELECT \"select\" AS s FROM 'x.csv';");
+    const st = firstPipelineStages(prog);
+    try testing.expectEqualStrings("select", st[1].node.select[0].computed.expr.field.last());
+}
+
+test "sql: a doubled quote inside a name is one literal quote" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a, "SELECT \"a\"\"b\" AS c FROM 'x.csv';");
+    const st = firstPipelineStages(prog);
+    try testing.expectEqualStrings("a\"b", st[1].node.select[0].computed.expr.field.last());
+}
+
+test "sql: an empty quoted name is a lex error, not an empty column" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT \"\" FROM 'x.csv';", &diag));
 }

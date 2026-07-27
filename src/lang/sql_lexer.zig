@@ -88,36 +88,15 @@ pub const Lexer = struct {
         return try out.toOwnedSlice();
     }
 
-    /// Unescape a double-quoted body with the BSL backslash rules (unknown
-    /// escapes kept verbatim, so Windows paths survive).
-    fn unquoteDouble(self: *Lexer, body: []const u8) ![]const u8 {
-        if (std.mem.indexOfScalar(u8, body, '\\') == null) return body;
+    /// Unescape a quoted identifier: ANSI doubles the delimiter, so `"a""b"`
+    /// names the column `a"b`. A backslash is an ordinary character in a name.
+    fn unquoteIdent(self: *Lexer, body: []const u8) ![]const u8 {
+        if (std.mem.indexOfScalar(u8, body, '"') == null) return body;
         var out = try std.array_list.Managed(u8).initCapacity(self.alloc, body.len);
         var k: usize = 0;
         while (k < body.len) : (k += 1) {
-            const c = body[k];
-            if (c == '\\' and k + 1 < body.len) {
-                const n = body[k + 1];
-                switch (n) {
-                    '"', '\\', '\'' => {
-                        out.appendAssumeCapacity(n);
-                        k += 1;
-                    },
-                    'n' => {
-                        out.appendAssumeCapacity('\n');
-                        k += 1;
-                    },
-                    't' => {
-                        out.appendAssumeCapacity('\t');
-                        k += 1;
-                    },
-                    'r' => {
-                        out.appendAssumeCapacity('\r');
-                        k += 1;
-                    },
-                    else => out.appendAssumeCapacity(c),
-                }
-            } else out.appendAssumeCapacity(c);
+            out.appendAssumeCapacity(body[k]);
+            if (body[k] == '"' and k + 1 < body.len and body[k + 1] == '"') k += 1;
         }
         return try out.toOwnedSlice();
     }
@@ -170,22 +149,30 @@ pub const Lexer = struct {
             return self.make(.string, try self.unquoteSingle(body), line, col);
         }
 
+        // ANSI quoted identifier. `"x"` names a column — the only way to reach
+        // one whose name has a space or a keyword in it. It was a second string
+        // syntax before v0.4.6, which made `SELECT "Exchange rate"` a constant
+        // repeated down the column instead of the column itself, silently.
         if (c == '"') {
             _ = self.bump();
             const start = self.i;
             while (self.i < self.src.len) {
-                if (self.src[self.i] == '\\' and self.i + 1 < self.src.len) {
-                    _ = self.bump();
-                    _ = self.bump();
-                    continue;
+                if (self.src[self.i] == '"') {
+                    // A doubled quote is an escaped one, not the end.
+                    if (self.i + 1 < self.src.len and self.src[self.i + 1] == '"') {
+                        _ = self.bump();
+                        _ = self.bump();
+                        continue;
+                    }
+                    break;
                 }
-                if (self.src[self.i] == '"') break;
                 _ = self.bump();
             }
             if (self.i >= self.src.len) return self.make(.invalid, self.src[start - 1 ..], line, col);
             const body = self.src[start..self.i];
             _ = self.bump();
-            return self.make(.string, try self.unquoteDouble(body), line, col);
+            if (body.len == 0) return self.make(.invalid, self.src[start - 1 ..], line, col);
+            return self.make(.qident, try self.unquoteIdent(body), line, col);
         }
 
         if (c == '$') {

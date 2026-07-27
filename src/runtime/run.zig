@@ -2698,21 +2698,23 @@ fn interpAll(arena: std.mem.Allocator, s: []const u8, lr: LoopRow) ![]const u8 {
     return out.toOwnedSlice();
 }
 
-/// The index of the `}` that closes a `${` opened just before `start`. Scanning is
-/// string-aware (a `}` inside a `"..."` does not close) and brace-balanced.
+/// The index of the `}` that closes a `${` opened just before `start`. Scanning
+/// is quote-aware — a `}` inside `'...'` (a string) or `"..."` (a quoted column
+/// name) does not close — and brace-balanced. Both quotes escape by doubling.
 fn interpClose(s: []const u8, start: usize) ?usize {
     var depth: usize = 1;
     var k = start;
     while (k < s.len) {
         switch (s[k]) {
-            '"' => {
+            '\'', '"' => {
+                const q = s[k];
                 k += 1;
                 while (k < s.len) {
-                    if (s[k] == '\\') {
-                        k += 2;
-                        continue;
-                    }
-                    if (s[k] == '"') {
+                    if (s[k] == q) {
+                        if (k + 1 < s.len and s[k + 1] == q) {
+                            k += 2;
+                            continue;
+                        }
                         k += 1;
                         break;
                     }
@@ -4899,13 +4901,13 @@ test "interpAll: bare-var fast path and expression bodies" {
     try std.testing.expectEqualStrings("crm_account", try interpAll(a, "crm_${lower(name)}", empty_row));
     try std.testing.expectEqualStrings("ACCOUNT", try interpAll(a, "${upper(name)}", empty_row));
 
-    const key = "${if(pk == \"\", concat(lower(name), \"id\"), pk)}";
+    const key = "${if(pk == '', concat(lower(name), 'id'), pk)}";
     try std.testing.expectEqualStrings("accountid", try interpAll(a, key, empty_row));
 
     const given = [_][]const u8{ "ListMember", "lm_custom_id" };
     try std.testing.expectEqualStrings("lm_custom_id", try interpAll(a, key, .{ .names = &names, .cells = &given }));
 
-    try std.testing.expectEqualStrings("}", try interpAll(a, "${if(pk == \"\", \"}\", pk)}", empty_row));
+    try std.testing.expectEqualStrings("}", try interpAll(a, "${if(pk == '', '}', pk)}", empty_row));
 }
 
 test "interpAll: malformed bodies error" {
@@ -4924,7 +4926,7 @@ test "interpAll: a typed loop var binds as its type in an expression body" {
     defer ar.deinit();
     const a = ar.allocator();
     const names = [_][]const u8{"port"};
-    const expr = "${if(port >= 1000, \"big\", \"small\")}";
+    const expr = "${if(port >= 1000, 'big', 'small')}";
 
     const typed = [_]?types.Type{types.Type.init(.int)};
     try std.testing.expectEqualStrings("big", try interpAll(a, expr, .{ .names = &names, .types = &typed, .cells = &[_][]const u8{"9030"} }));

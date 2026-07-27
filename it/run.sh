@@ -221,6 +221,20 @@ SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM 'az://devstoreacc
   fi
 fi
 
+# Quoted column names, end to end. Headers with spaces are the rule in
+# corporate CSV ("Data Emissao", "Valor Total"), and `"..."` used to be a second
+# string syntax — so the query below wrote the constant "Valor Total" down the
+# column instead of the values, with no error anywhere.
+{ echo "Data Emissao,Valor Total"; echo "2025-01-01,100"; echo "2025-01-02,250"; } > "$out/spaced.csv"
+printf 'd,total\n2025-01-01,100\n2025-01-02,250\n' > "$out/spaced_expected.csv"
+if brun run -c "LOAD INTO '$out/spaced_out.csv' AS
+SELECT \"Data Emissao\" AS d, SUM(\"Valor Total\") AS total FROM '$out/spaced.csv'
+GROUP BY \"Data Emissao\" ORDER BY d;"; then
+  check quoted-idents "$out/spaced_out.csv" "$out/spaced_expected.csv"
+else
+  report "quoted-idents (run error)" bad
+fi
+
 # Parquet: read the committed fixtures through the CLI. The unit tests decode
 # pages directly; this is the only check that the .parquet dispatch, planning and
 # sink path all line up. Reference output comes from DuckDB, so a green run means

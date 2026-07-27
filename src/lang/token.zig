@@ -7,6 +7,10 @@ const std = @import("std");
 
 pub const Tag = enum {
     ident,
+    /// A double-quoted name: ANSI SQL quoted identifier, so `"Exchange rate"`
+    /// refers to that column and never to the string. Kept distinct from `ident`
+    /// so a quoted word is never read as a keyword.
+    qident,
     string,
     int,
     float,
@@ -57,6 +61,7 @@ pub const Tag = enum {
     pub fn describe(self: Tag) []const u8 {
         return switch (self) {
             .ident => "identifier",
+            .qident => "quoted identifier",
             .string => "string",
             .int => "integer",
             .float => "float",
