@@ -179,7 +179,10 @@ LIMIT 100 OFFSET 20;
 | CTE | `FROM <name>` |
 
 Parquet reads use column projection, row-group skipping from statistics, and
-ranged reads — only the footer and the chunks a query needs are fetched.
+ranged reads — only the footer and the chunks a query needs are fetched. A
+remote `.parquet` (`https://...`, `az://...`) is read the same way, by HTTP
+range request, so a projected query transfers only the chunks it decodes; a
+server that ignores `Range` falls back to one whole-object fetch.
 
 Source clauses, in any order after the source:
 

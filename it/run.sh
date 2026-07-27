@@ -33,7 +33,7 @@ for s in $SUITES; do
     sqlserver) services="$services mssql" ;;
     starrocks) services="$services starrocks" ;;
     azure)     services="$services azurite" ;;
-    parquet)   ;;  # reads committed fixtures; needs no container
+    parquet)   services="$services static static-norange" ;;  # local fixtures, plus HTTP
   esac
 done
 
@@ -198,6 +198,17 @@ SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM 'az://devstoreacc
     report "azure-parquet-volume (run error)" bad
   fi
 
+  # Reading that blob back is now a HEAD plus ranged GETs rather than one
+  # whole-object fetch, and Shared Key signs the Range header — so a signing
+  # mistake shows up here as a 403, not as wrong data. The volume blob is the
+  # one worth reading: at ~4.1MB it spans several ranges.
+  if brun run -c "LOAD INTO '$out/azure_parquet_ranged.csv' AS
+SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM 'az://devstoreaccount1/basalt-it/bronze/vol.parquet';"; then
+    check azure-parquet-ranged "$out/azure_parquet_ranged.csv" "$out/vol_expected.csv"
+  else
+    report "azure-parquet-ranged (run error)" bad
+  fi
+
   # A prefix that matches nothing must say so. It used to surface as `EmptyCsv`,
   # which sent the reader to debug a file rather than the prefix they mistyped.
   if $B run -c "SELECT * FROM 'az://devstoreaccount1/basalt-it/nothing-here/';" >"$out/empty.log" 2>&1; then
@@ -255,6 +266,52 @@ SELECT id, name, amt, flag FROM 'src/connect/testdata/$c.parquet' ORDER BY id;";
     fi
   else
     echo "SKIP parquet-interop (no duckdb)"
+  fi
+
+  # Parquet over plain HTTP. This used to hit `std.fs.cwd().openFile("http://…")`
+  # and fail with FileNotFound — documented as supported, never implemented. The
+  # same fixture read locally is the oracle: identical rows, or the range
+  # arithmetic is wrong.
+  if brun run -c "LOAD INTO '$out/parquet_http.csv' AS
+SELECT id, name, amt, flag FROM 'http://127.0.0.1:38080/snappy.parquet' ORDER BY id;"; then
+    check parquet-http "$out/parquet_http.csv" it/parquet_expected.csv
+  else
+    report "parquet-http (run error)" bad
+  fi
+
+  # Projection over HTTP: two columns of four. Exercises the point of ranged
+  # reads — chunks the query does not touch are never fetched — and would still
+  # pass if the reader silently fell back to pulling the whole object, so it is
+  # a correctness check, not a transfer-volume one.
+  if brun run -c "LOAD INTO '$out/parquet_http_proj.csv' AS
+SELECT id, name FROM 'http://127.0.0.1:38080/snappy.parquet' ORDER BY id;"; then
+    if cut -d, -f1,2 it/parquet_expected.csv > "$out/proj_expected.csv"; then
+      check parquet-http-projection "$out/parquet_http_proj.csv" "$out/proj_expected.csv"
+    fi
+  else
+    report "parquet-http-projection (run error)" bad
+  fi
+
+  # An origin that ignores Range answers 200 with the whole body. The reader has
+  # to keep that body and serve every chunk from it — the rows must come out
+  # identical to the ranged read above. Multiple row groups matter here: the
+  # kept buffer is read again on the next batch, after the batch arena that
+  # carried it has been recycled.
+  if brun run -c "LOAD INTO '$out/parquet_norange.csv' AS
+SELECT id, name, amt, flag FROM 'http://127.0.0.1:38081/snappy.parquet' ORDER BY id;"; then
+    check parquet-http-norange "$out/parquet_norange.csv" it/parquet_expected.csv
+  else
+    report "parquet-http-norange (run error)" bad
+  fi
+
+  # A URL that is not there must report the HTTP fact, not a filesystem one.
+  if $B run -q -c "SELECT * FROM 'http://127.0.0.1:38080/absent.parquet';" >"$out/missing.log" 2>&1; then
+    report "parquet-http-missing (expected failure, got success)" bad
+  elif grep -q "FileNotFound" "$out/missing.log"; then
+    report "parquet-http-missing (reported a filesystem error for a URL)" bad
+    tail -3 "$out/missing.log"
+  else
+    report parquet-http-missing ok
   fi
 fi
 

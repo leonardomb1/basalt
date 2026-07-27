@@ -219,6 +219,18 @@ pub fn authHeader(arena: std.mem.Allocator, account: []const u8, key_b64: []cons
 /// partial read, or empty for the whole object; it participates in the
 /// signature, so it cannot be added to the request afterwards.
 pub fn getHeaders(arena: std.mem.Allocator, b: Blob, range: []const u8) ![]const std.http.Header {
+    return requestHeaders(arena, b, "GET", range);
+}
+
+/// `getHeaders` for any verb. HEAD (Get Blob Properties) is the one other verb
+/// a reader needs — it answers "how big is this object?" without a body — and
+/// Shared Key signs the verb, so it cannot reuse the GET signature.
+pub fn requestHeaders(
+    arena: std.mem.Allocator,
+    b: Blob,
+    method: []const u8,
+    range: []const u8,
+) ![]const std.http.Header {
     const key = try keyFromEnv(arena);
     const date = try rfc1123(arena, std.time.timestamp());
     const ms = [_]MsHeader{
@@ -226,7 +238,7 @@ pub fn getHeaders(arena: std.mem.Allocator, b: Blob, range: []const u8) ![]const
         .{ .name = "x-ms-version", .value = api_version },
     };
     const auth = try authHeader(arena, b.account, key, .{
-        .method = "GET",
+        .method = method,
         .canonical_resource = b.canonical_resource,
         .ms_headers = &ms,
         .range = range,

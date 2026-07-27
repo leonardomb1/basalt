@@ -49,7 +49,11 @@ $ ./zig-out/bin/basalt help
 | **Buffer** | a durable WAL buffer, replayed by a later run |
 
 Parquet reads use column projection, row-group skipping from statistics, and
-ranged reads — only the footer and the chunks a query needs are fetched.
+ranged reads — only the footer and the chunks a query needs are fetched. That
+holds over the network too: a remote `.parquet` is read by HTTP range request,
+so projecting two columns of forty transfers two chunks, not the object. A
+server that ignores `Range` is handled by falling back to a single whole-object
+fetch.
 
 ## Running things
 

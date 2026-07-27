@@ -54,6 +54,36 @@ services:
       timeout: 2s
       retries: 30
 
+  # Static file server for the remote-read tests: serves the committed Parquet
+  # fixtures over plain HTTP. nginx honours `Range`, which is the half of the
+  # reader worth testing — the whole-object fallback is exercised by pointing
+  # the same test at a URL it cannot HEAD.
+  static:
+    image: nginx:alpine
+    volumes:
+      - ../src/connect/testdata:/usr/share/nginx/html:ro
+    ports: ["38080:80"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/snappy.parquet"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # The same fixtures from an origin that refuses ranges (see nginx-norange.conf),
+  # so the reader's whole-object fallback is covered by a test rather than by
+  # hope. It is the path where a stale buffer would go unnoticed.
+  static-norange:
+    image: nginx:alpine
+    volumes:
+      - ../src/connect/testdata:/usr/share/nginx/html:ro
+      - ./nginx-norange.conf:/etc/nginx/conf.d/default.conf:ro
+    ports: ["38081:80"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/snappy.parquet"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
   starrocks:
     image: starrocks/allin1-ubuntu:3.3-latest
     ports: ["39030:9030", "38040:8040"]

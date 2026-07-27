@@ -1064,16 +1064,19 @@ const Batch = batchmod.Batch;
 pub const Bytes = union(enum) {
     memory: []const u8,
     file: struct { f: std.fs.File, size: u64 },
+    remote: *Remote,
 
     pub fn size(self: Bytes) u64 {
         return switch (self) {
             .memory => |m| m.len,
             .file => |x| x.size,
+            .remote => |r| r.total,
         };
     }
 
     /// Reads `len` bytes at `off`. The result is owned by `arena` for the file
-    /// case and borrowed for the memory case; callers treat it as read-only.
+    /// and remote cases and borrowed for the memory case; callers treat it as
+    /// read-only.
     pub fn range(self: Bytes, arena: std.mem.Allocator, off: u64, len: usize) ![]const u8 {
         switch (self) {
             .memory => |m| {
@@ -1087,6 +1090,10 @@ pub const Bytes = union(enum) {
                 if (n != len) return Error.CorruptParquetPage;
                 return buf;
             },
+            .remote => |r| {
+                if (off + len > r.total) return Error.CorruptParquetPage;
+                return r.read(arena, off, len);
+            },
         }
     }
 
@@ -1094,7 +1101,170 @@ pub const Bytes = union(enum) {
         switch (self) {
             .memory => {},
             .file => |x| x.f.close(),
+            .remote => |r| r.client.deinit(),
         }
+    }
+};
+
+/// An object read over HTTP by range request — a plain `http(s)://` URL, or an
+/// `az://` blob, which differs only in that Shared Key signs the Range header
+/// and so must be re-signed per request.
+///
+/// Parquet is what makes this worth the round trips: the footer names the byte
+/// extent of every column chunk, so a projected query over a remote object
+/// fetches the footer and those extents and nothing else. Reading the whole
+/// object to decode two columns of forty is the thing this exists to avoid.
+///
+/// Not every server honours `Range`. One that answers a ranged GET with `200`
+/// has sent the whole body anyway, so it is kept in `whole` and served from
+/// there — correct on any server, fast on the ones that cooperate.
+pub const Remote = struct {
+    /// The reader's arena, not a batch's. `whole` outlives the call that fills
+    /// it, and `range` is handed the batch arena, which is recycled per batch —
+    /// so the fallback body has to be copied somewhere that survives.
+    arena: std.mem.Allocator,
+    client: *std.http.Client,
+    url: []const u8,
+    blob: ?azure.Blob,
+    total: u64,
+    /// Set when the origin ignored `Range` (or could not report a size), which
+    /// makes every later read a slice instead of another full transfer.
+    whole: ?[]const u8 = null,
+    /// A corporate TLS interceptor is repaired once per object, not per range.
+    repaired: bool = false,
+
+    fn open(arena: std.mem.Allocator, path: []const u8) !*Remote {
+        const client = try arena.create(std.http.Client);
+        client.* = httpx.initClient(arena);
+        const self = try arena.create(Remote);
+        self.* = .{ .arena = arena, .client = client, .url = path, .blob = null, .total = 0 };
+        if (azure.isUrl(path)) {
+            const b = try azure.parseUrl(arena, path, azure.endpointFromEnv(arena));
+            self.blob = b;
+            self.url = b.url;
+        }
+
+        // HEAD answers "how big?" without a body. A server that refuses it, or
+        // reports no length, leaves us no way to find the footer — fall back to
+        // fetching the object once, which is what this used to do always.
+        if (self.contentLength(arena)) |n| {
+            self.total = n;
+        } else |_| {
+            const body = try self.fetchWhole(arena);
+            self.whole = body;
+            self.total = body.len;
+        }
+        return self;
+    }
+
+    fn read(self: *Remote, arena: std.mem.Allocator, off: u64, len: usize) ![]const u8 {
+        if (len == 0) return "";
+        if (self.whole) |w| return w[@intCast(off)..][0..len];
+
+        const hdr = try std.fmt.allocPrint(arena, "bytes={d}-{d}", .{ off, off + len - 1 });
+        const res = try self.send(arena, .GET, hdr);
+        switch (res.code) {
+            206 => {
+                if (res.body.len != len) return Error.CorruptParquetPage;
+                return res.body;
+            },
+            // Range ignored: this is the whole object, so keep it and stop
+            // asking. It has to be copied out of the caller's arena first —
+            // that one is a batch's, recycled before the next read.
+            200 => {
+                const kept = try self.arena.dupe(u8, res.body);
+                self.whole = kept;
+                if (off + len > kept.len) return Error.CorruptParquetPage;
+                return kept[@intCast(off)..][0..len];
+            },
+            else => return self.statusError(res.code, res.body),
+        }
+    }
+
+    fn fetchWhole(self: *Remote, arena: std.mem.Allocator) ![]const u8 {
+        const res = try self.send(arena, .GET, "");
+        if (res.code != 200) return self.statusError(res.code, res.body);
+        return res.body;
+    }
+
+    const Resp = struct { code: u16, body: []const u8 };
+
+    fn send(
+        self: *Remote,
+        arena: std.mem.Allocator,
+        method: std.http.Method,
+        range_hdr: []const u8,
+    ) !Resp {
+        const extra = try self.headers(arena, method, range_hdr);
+        return self.once(arena, method, extra) catch |e| switch (e) {
+            // Retried on its own buffer: a partially written response from the
+            // failed attempt must not be prepended to the retry's body.
+            error.TlsInitializationFailed => {
+                if (!self.repair()) return e;
+                return self.once(arena, method, extra);
+            },
+            else => e,
+        };
+    }
+
+    fn once(
+        self: *Remote,
+        arena: std.mem.Allocator,
+        method: std.http.Method,
+        extra: []const std.http.Header,
+    ) !Resp {
+        var aw = std.Io.Writer.Allocating.init(arena);
+        const res = try self.client.fetch(.{
+            .method = method,
+            .location = .{ .url = self.url },
+            .extra_headers = extra,
+            .decompress_buffer = httpx.decompress_direct,
+            .response_writer = &aw.writer,
+        });
+        return .{ .code = @intFromEnum(res.status), .body = aw.writer.buffered() };
+    }
+
+    fn headers(
+        self: *Remote,
+        arena: std.mem.Allocator,
+        method: std.http.Method,
+        range_hdr: []const u8,
+    ) ![]const std.http.Header {
+        if (self.blob) |b| {
+            const verb = if (method == .HEAD) "HEAD" else "GET";
+            return azure.requestHeaders(arena, b, verb, range_hdr);
+        }
+        if (range_hdr.len == 0) return &.{};
+        return arena.dupe(std.http.Header, &.{.{ .name = "Range", .value = range_hdr }});
+    }
+
+    /// The object's size, from a HEAD. Errors (405, no Content-Length, a proxy
+    /// that drops it) send the caller to the whole-object path.
+    fn contentLength(self: *Remote, arena: std.mem.Allocator) !u64 {
+        const extra = try self.headers(arena, .HEAD, "");
+        const uri = std.Uri.parse(self.url) catch return error.InvalidUrl;
+        var req = try self.client.request(.HEAD, uri, .{ .extra_headers = extra });
+        defer req.deinit();
+        try req.sendBodiless();
+        var redirect_buf: [8 * 1024]u8 = undefined;
+        const resp = try req.receiveHead(&redirect_buf);
+        if (@intFromEnum(resp.head.status) != 200) return error.HeadUnsupported;
+        return resp.head.content_length orelse error.HeadUnsupported;
+    }
+
+    fn statusError(self: *Remote, code: u16, body: []const u8) anyerror {
+        if (self.blob != null) return azure.statusToError(code, body);
+        return httpx.statusError(code);
+    }
+
+    fn repair(self: *Remote) bool {
+        if (self.repaired) return false;
+        self.repaired = true;
+        const uri = std.Uri.parse(self.url) catch return false;
+        const h = httpx.uriHost(uri) orelse return false;
+        if (!httpx.repairBundle(self.client.allocator, &self.client.ca_bundle, h, uri.port orelse 443)) return false;
+        self.client.next_https_rescan_certs = false;
+        return true;
     }
 };
 
@@ -1144,10 +1314,11 @@ pub const Reader = struct {
     /// hint, and a stage that truly needs a missing column will fail loudly when
     /// it cannot resolve it.
     pub fn openProjected(arena: std.mem.Allocator, path: []const u8, want: ?[]const []const u8) !*Reader {
-        // Remote objects are fetched whole for now; local files are read by
-        // range, which is where the large-file risk actually lives.
-        const src: Bytes = if (azure.isUrl(path))
-            .{ .memory = try fetchBlob(arena, path) }
+        // Local files read by pread, remote objects by HTTP range — the same
+        // footer-then-chunks access pattern either way, so a projected query
+        // over an object store transfers only what it decodes.
+        const src: Bytes = if (isRemote(path))
+            .{ .remote = try Remote.open(arena, path) }
         else blk: {
             const f = try std.fs.cwd().openFile(path, .{});
             break :blk .{ .file = .{ .f = f, .size = (try f.stat()).size } };
@@ -1326,25 +1497,12 @@ fn parseFooterOf(arena: std.mem.Allocator, src: Bytes, footer_start: *u64) !pq.F
     return pq.parseFooter(arena, footer);
 }
 
-/// Whole-blob GET for `az://` paths. Parquet needs the footer before anything
-/// else, so a ranged fetch of just the metadata would still be followed by
-/// reads of every referenced chunk — worth doing later, not needed for correctness.
-fn fetchBlob(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
-    var client = httpx.initClient(arena);
-    defer client.deinit();
-    const blob = try azure.parseUrl(arena, path, azure.endpointFromEnv(arena));
-    const hdrs = try azure.getHeaders(arena, blob, "");
-
-    var aw = std.Io.Writer.Allocating.init(arena);
-    const res = try client.fetch(.{
-        .method = .GET,
-        .location = .{ .url = blob.url },
-        .extra_headers = hdrs,
-        .response_writer = &aw.writer,
-    });
-    const code = @intFromEnum(res.status);
-    if (code != 200) return azure.statusToError(code, aw.writer.buffered());
-    return aw.writer.buffered();
+/// Paths a `Remote` serves: object storage and plain URLs alike. Everything
+/// else is a local file.
+pub fn isRemote(path: []const u8) bool {
+    return azure.isUrl(path) or
+        std.mem.startsWith(u8, path, "http://") or
+        std.mem.startsWith(u8, path, "https://");
 }
 
 // --- tests -------------------------------------------------------------------
@@ -1726,4 +1884,25 @@ test "top-N threshold skips only groups it can prove cannot contribute" {
     var bare = [_]pq.ColumnChunk{.{ .meta = .{ .ty = .int64 } }};
     const g2 = pq.RowGroup{ .columns = &bare, .num_rows = 10 };
     try testing.expect(groupBeatsThreshold(&schema, &leaves, g2, .{ .column = "v", .desc = true, .full = true, .value = .{ .int = 500 } }));
+}
+
+test "remote paths are recognised, local ones left alone" {
+    try testing.expect(isRemote("https://host/a.parquet"));
+    try testing.expect(isRemote("http://host/a.parquet"));
+    try testing.expect(isRemote("az://acct/ctr/a.parquet"));
+    try testing.expect(!isRemote("/data/a.parquet"));
+    try testing.expect(!isRemote("a.parquet"));
+}
+
+// The regression this pins: `openProjected` used to send everything that was not
+// `az://` to `std.fs.cwd().openFile`, so an `http(s)://` URL failed with
+// FileNotFound having never opened a socket — while the docs advertised it. Port
+// 1 is not listening, so a routed read fails at connect; a filesystem error here
+// means the URL never reached the network at all.
+test "an http parquet source routes to the network, never the local filesystem" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+
+    const r = Reader.open(ar.allocator(), "http://127.0.0.1:1/nope.parquet");
+    try testing.expectError(error.ConnectionRefused, r);
 }
