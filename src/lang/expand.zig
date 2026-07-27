@@ -75,6 +75,7 @@ fn expandStmt(cx: *Ctx, s: ast.Stmt) Error!ast.Stmt {
             break :blk .{ .for_each = .{ .var_names = fe.var_names, .var_types = fe.var_types, .source = source, .hints = fe.hints, .body = try body.toOwnedSlice(), .pos = fe.pos } };
         },
         .match => |m| .{ .match = try expandStmtMatch(cx, m) },
+        .let_const => |l| .{ .let_const = .{ .name = l.name, .expr = try expandExpr(cx, l.expr, null, 0), .pos = l.pos } },
         .func => unreachable,
     };
 }
@@ -479,6 +480,31 @@ test "expandProgram leaves JSON paths null when unbound (offline check)" {
     var msg: []const u8 = "";
     const out = try expandProgram(a, prog, null, &msg);
     try std.testing.expect(outputSelect(out)[0].computed.expr.* == .null_lit);
+}
+
+test "statement-level LET parses to a let_const stmt and its expression expands" {
+    const parser = @import("sql_parser.zig");
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a, "CREATE FUNCTION dbl(x) AS x * 2;\n" ++
+        "LET n = dbl(21);\nSELECT id FROM 'x' WHERE id < $n;", &diag);
+
+    try std.testing.expect(prog.stmts[2] == .let_const);
+    try std.testing.expectEqualStrings("n", prog.stmts[2].let_const.name);
+    try std.testing.expect(prog.stmts[2].let_const.expr.* == .call);
+    try std.testing.expectEqualStrings("dbl", prog.stmts[2].let_const.expr.call.name);
+
+    var msg: []const u8 = "";
+    const out = try expandProgram(a, prog, null, &msg);
+    // The `fn` declaration is dropped, so the LET lands right after the kind tag —
+    // with the user fn inlined into its body.
+    try std.testing.expect(out.stmts[1] == .let_const);
+    const e = out.stmts[1].let_const.expr;
+    try std.testing.expect(e.* == .binary);
+    try std.testing.expectEqual(ast.BinOp.mul, e.binary.op);
+    try std.testing.expectEqual(@as(i64, 21), e.binary.l.int_lit);
 }
 
 test "json-form union: $param.path renders the branch array into discover_json" {

@@ -321,7 +321,7 @@ pub fn analyze(arena: std.mem.Allocator, raw_program: ast.Program, resolver: ?Re
         .output => |p| try outputs.append(p),
         .for_each => |fe| try collectStmtOutputs(&outputs, fe.body),
         .match => |m| for (m.arms) |arm| try collectStmtOutputs(&outputs, arm.body),
-        .param, .kind, .func => {},
+        .param, .kind, .func, .let_const => {},
     };
     if (outputs.items.len == 0)
         return fail(diag, "no output pipeline (a pipeline ending in `write`)", .{});
@@ -330,6 +330,17 @@ pub fn analyze(arena: std.mem.Allocator, raw_program: ast.Program, resolver: ?Re
     for (program.stmts) |s| if (s == .param) {
         const p = s.param;
         try params_map.put(p.name, if (p.default) |d| d else try typedZero(arena, p.ty));
+    };
+    // Statement-level `LET`s bind exactly like params — a `$name` ref substitutes
+    // the bound expression — but after every PARAM and in declaration order, so a
+    // LET body sees all params and only the LETs ahead of it. The executor folds
+    // these to a literal; here they stay expressions, which is all the checker
+    // needs to type a filter that mentions `$let`.
+    for (program.stmts) |s| if (s == .let_const) {
+        const l = s.let_const;
+        if (params_map.contains(l.name))
+            return fail(diag, "`{s}` is declared twice: LET and PARAM share one name space", .{l.name});
+        try params_map.put(l.name, try substExpr(arena, l.expr, &params_map));
     };
 
     var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .resolver = resolver, .params = &params_map, .diag = diag };
@@ -956,4 +967,36 @@ test "analyze rejects `?.` safe navigation on a plain column reference" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     try expectAnalyzeErr(ar.allocator(), "id,name\n1,x\n", "SELECT name?.foo AS v FROM '$IN'");
+}
+
+test "check accepts a filter over a statement-level LET (and rejects a LET/PARAM clash)" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,amount\n1,100\n" });
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const in = try std.fs.path.join(a, &.{ base, "in.csv" });
+
+    const src = try std.fmt.allocPrint(a,
+        \\PARAM floor INT DEFAULT 10;
+        \\LET cutoff = $floor * 5;
+        \\LOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}' WHERE CAST(amount AS INT) >= $cutoff;
+    , .{in});
+    const prog = try parse(a, src);
+    var diag = Diag{};
+    const plan = try analyze(a, prog, null, &diag);
+    try std.testing.expectEqual(@as(usize, 1), plan.outputs.len);
+    try std.testing.expectEqualStrings("filter", plan.outputs[0].stages[0].kind);
+
+    const clash = try std.fmt.allocPrint(a,
+        \\PARAM cutoff INT DEFAULT 10;
+        \\LET cutoff = 5;
+        \\LOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}';
+    , .{in});
+    const cprog = try parse(a, clash);
+    var cdiag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyze(a, cprog, null, &cdiag));
+    try std.testing.expect(std.mem.indexOf(u8, cdiag.msg, "declared twice") != null);
 }

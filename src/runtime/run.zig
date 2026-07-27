@@ -471,6 +471,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts: RunOptions, d
     var params_expr = std.StringHashMap(*const ast.Expr).init(arena);
     var pit = params.iterator();
     while (pit.next()) |kv| try params_expr.put(kv.key_ptr.*, try mkLit(arena, kv.value_ptr.*));
+    try resolveLets(arena, program, &params, &params_expr, diag);
 
     var json_params = std.StringHashMap(std.json.Value).init(arena);
     for (program.stmts) |s| {
@@ -496,7 +497,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts: RunOptions, d
         .binding => |b| try bindings.put(b.name, b.pipeline),
         .connection => |c| try connections.put(c.name, c),
         .output, .for_each, .match => runnable += 1,
-        .param, .kind, .func => {},
+        .param, .kind, .func, .let_const => {},
     };
     if (runnable == 0)
         return planErr(diag, "no output pipeline (a pipeline ending in `write`)");
@@ -621,6 +622,9 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
         .match => |mm| try runStmtMatch(env, mm, opts, stats, lanes_used, batch_arena),
         .binding => |b| try env.bindings.put(b.name, b.pipeline),
         .connection => |c| try env.connections.put(c.name, c),
+        // A LET is folded once, before anything runs; one nested in a branch would
+        // silently miss that pass, so say so instead of resolving to nothing.
+        .let_const => |l| return planErr(env.diag, try std.fmt.allocPrint(env.arena, "LET `{s}` must be declared at the top level of the script", .{l.name})),
         .param, .kind, .func => {},
     }
 }
@@ -4328,6 +4332,15 @@ fn eqlAny(k: []const u8, opts: []const []const u8) bool {
 }
 
 fn resolveParams(arena: std.mem.Allocator, program: ast.Program, cli: []const ParamArg, params: *std.StringHashMap(Value), diag: *Diag) !void {
+    // A LET is sealed: it is computed by the script, never bound from outside.
+    // Naming one on the command line is a mistake worth reporting, not ignoring.
+    for (cli) |kv| {
+        for (program.stmts) |s| {
+            if (s != .let_const) continue;
+            if (std.mem.eql(u8, kv.key, s.let_const.name))
+                return planErr(diag, try std.fmt.allocPrint(arena, "`{s}` is a LET, not a PARAM — it cannot be bound externally", .{kv.key}));
+        }
+    }
     for (program.stmts) |s| {
         if (s != .param) continue;
         const p = s.param;
@@ -4347,6 +4360,46 @@ fn resolveParams(arena: std.mem.Allocator, program: ast.Program, cli: []const Pa
             }
         }
         try params.put(p.name, v.?);
+    }
+}
+
+/// Fold every statement-level `LET name = <expr>;` into a plan-time constant, in
+/// declaration order, and register it under the same two maps a PARAM uses — so
+/// `$name` substitutes through the ordinary machinery and every pipeline in the
+/// script sees one identical value. Each expression is evaluated with the params
+/// and the earlier LETs in scope; a LET is never bound from outside, so this is
+/// the only place its value is decided.
+fn resolveLets(
+    arena: std.mem.Allocator,
+    program: ast.Program,
+    params: *std.StringHashMap(Value),
+    params_expr: *std.StringHashMap(*const ast.Expr),
+    diag: *Diag,
+) !void {
+    var names = std.array_list.Managed([]const u8).init(arena);
+    var values = std.array_list.Managed(Value).init(arena);
+    var it = params.iterator();
+    while (it.next()) |kv| {
+        try names.append(kv.key_ptr.*);
+        try values.append(kv.value_ptr.*);
+    }
+
+    for (program.stmts) |s| {
+        if (s != .let_const) continue;
+        const l = s.let_const;
+        for (program.stmts) |p| {
+            if (p == .param and std.mem.eql(u8, p.param.name, l.name))
+                return planErr(diag, try std.fmt.allocPrint(arena, "`{s}` is declared twice: LET and PARAM share one name space", .{l.name}));
+        }
+        if (params.contains(l.name))
+            return planErr(diag, try std.fmt.allocPrint(arena, "duplicate LET `{s}`", .{l.name}));
+
+        const v = eval.constEval(arena, l.expr, names.items, values.items) catch |e|
+            return planErr(diag, try std.fmt.allocPrint(arena, "LET `{s}`: {s}", .{ l.name, @errorName(e) }));
+        try names.append(l.name);
+        try values.append(v);
+        try params.put(l.name, v);
+        try params_expr.put(l.name, try mkLit(arena, v));
     }
 }
 
@@ -4384,6 +4437,10 @@ fn mkLit(arena: std.mem.Allocator, v: Value) anyerror!*ast.Expr {
         .int => |i| mk(arena, .{ .int_lit = i }),
         .float => |f| mk(arena, .{ .float_lit = f }),
         .string => |s| mk(arena, .{ .str_lit = s }),
+        // The DSL has no date/time literal; comparisons coerce a string against a
+        // temporal column either way, so the ISO text is the faithful literal for
+        // a folded `LET cutoff = date_add('day', -7, today())`.
+        .date, .time, .timestamp => mk(arena, .{ .str_lit = try eval.valueToString(arena, v) }),
         else => mk(arena, .null_lit),
     };
 }
@@ -5532,4 +5589,98 @@ test "generated sources: SELECT with no FROM and RANGE(lo, hi)" {
     const r = try tmp.dir.readFileAlloc(alloc, "r.csv", 1 << 20);
     defer alloc.free(r);
     try std.testing.expectEqualStrings("i\n2\n4\n", r);
+}
+
+/// Build the LET fixture script: a param, a LET over it, a LET over that LET, and
+/// two pipelines that both reference them.
+fn letScript(alloc: std.mem.Allocator, base: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc,
+        \\PARAM days INT DEFAULT 3;
+        \\LET span = $days * 10;
+        \\LET label = concat('n', $span);
+        \\LOAD INTO '{s}/a.csv' AS SELECT id, $span AS s, $label AS l FROM '{s}/in.csv';
+        \\LOAD INTO '{s}/b.csv' AS SELECT $label AS l FROM '{s}/in.csv';
+    , .{ base, base, base, base });
+}
+
+fn runScript(alloc: std.mem.Allocator, script: []const u8, cli: []const ParamArg, rdiag: *Diag) !void {
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    _ = try run(alloc, prog, .{ .params = cli, .log = .{ .summary = .none, .quiet = true } }, rdiag);
+}
+
+test "LET folds once at plan time and hands every pipeline the same value" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n1\n2\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try letScript(alloc, base);
+    defer alloc.free(script);
+    var rdiag: Diag = .{};
+    try runScript(alloc, script, &[_]ParamArg{}, &rdiag);
+
+    const a = try tmp.dir.readFileAlloc(alloc, "a.csv", 1 << 20);
+    defer alloc.free(a);
+    try std.testing.expectEqualStrings("id,s,l\n1,30,n30\n2,30,n30\n", a);
+    const b = try tmp.dir.readFileAlloc(alloc, "b.csv", 1 << 20);
+    defer alloc.free(b);
+    try std.testing.expectEqualStrings("l\nn30\nn30\n", b);
+}
+
+test "LET reads a param, so `-p` reaches it indirectly" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n1\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try letScript(alloc, base);
+    defer alloc.free(script);
+    var rdiag: Diag = .{};
+    try runScript(alloc, script, &[_]ParamArg{.{ .key = "days", .val = "7" }}, &rdiag);
+
+    const a = try tmp.dir.readFileAlloc(alloc, "a.csv", 1 << 20);
+    defer alloc.free(a);
+    try std.testing.expectEqualStrings("id,s,l\n1,70,n70\n", a);
+}
+
+test "a LET is sealed: `-p` naming one is a plan error, not a silent override" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n1\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try letScript(alloc, base);
+    defer alloc.free(script);
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, runScript(alloc, script, &[_]ParamArg{.{ .key = "span", .val = "99" }}, &rdiag));
+    try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "`span` is a LET, not a PARAM") != null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(alloc, "a.csv", 1 << 20));
+}
+
+test "a LET and a PARAM may not share a name" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n1\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(alloc,
+        \\PARAM span INT DEFAULT 1;
+        \\LET span = 5;
+        \\LOAD INTO '{s}/a.csv' AS SELECT id FROM '{s}/in.csv';
+    , .{ base, base });
+    defer alloc.free(script);
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, runScript(alloc, script, &[_]ParamArg{}, &rdiag));
+    try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "declared twice") != null);
 }
