@@ -441,7 +441,7 @@ fn splitStatements(arena: std.mem.Allocator, s: []const u8) ![]const []const u8 
     return out.toOwnedSlice();
 }
 
-const DeclKind = enum { connection, function, param, endpoint };
+const DeclKind = enum { connection, function, param, let, endpoint };
 const DeclId = struct { kind: DeclKind, name: []const u8 };
 
 /// Next whitespace-delimited word at `i.*`, advancing past it.
@@ -470,6 +470,10 @@ fn declOf(stmt: []const u8) ?DeclId {
     if (std.ascii.eqlIgnoreCase(w, "param")) {
         const n = identPrefix(nextWord(stmt, &i) orelse return null);
         return if (n.len == 0) null else .{ .kind = .param, .name = n };
+    }
+    if (std.ascii.eqlIgnoreCase(w, "let")) {
+        const n = identPrefix(nextWord(stmt, &i) orelse return null);
+        return if (n.len == 0) null else .{ .kind = .let, .name = n };
     }
     if (!std.ascii.eqlIgnoreCase(w, "create")) return null;
     w = nextWord(stmt, &i) orelse return null;
