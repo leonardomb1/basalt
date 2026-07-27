@@ -1455,6 +1455,13 @@ fn runParallelParquetAgg(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, p
 
     var ad = analyze.Diag{};
     const apl = analyze.aggregatePlan(arena, agg_in.*, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
+    // An ungrouped aggregate (`SELECT COUNT(*) FROM ...`, no GROUP BY) has no
+    // key to hash, so every lane folds into zero groups and the merge emits the
+    // identity — COUNT(*) came back 0 instead of the row count, silently. The
+    // two-phase fold-then-radix-merge below is grouped-aggregate machinery; the
+    // ungrouped case belongs on the serial path, which is correct.
+    if (apl.by.len == 0) return false;
+
     const aggs = try arena.alloc(op.Aggregate.Agg, apl.aggs.len);
     for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct };
     const out_schema = try schemaPtr(arena, apl.schema);

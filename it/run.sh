@@ -254,6 +254,32 @@ SELECT id, name, amt, flag FROM 'src/connect/testdata/$c.parquet' ORDER BY id;";
     report "parquet-write (run error)" bad
   fi
 
+  # Parallel aggregate over a multi-row-group file. An ungrouped one (no GROUP
+  # BY) returned 0 instead of the row count: lanes fold into a table keyed by
+  # the grouping columns, and with none they folded into nothing at all, so the
+  # merge emitted the identity. Only wrong above -j 1, and nothing else here
+  # combines a local parquet, several row groups and more than one lane.
+  if brun run -c "LOAD INTO '$out/vol.parquet' AS SELECT * FROM '$volcsv';" &&
+     brun run -j 4 -c "LOAD INTO '$out/pq_par_agg.csv' AS
+SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM '$out/vol.parquet';"; then
+    check parquet-parallel-agg "$out/pq_par_agg.csv" "$out/vol_expected.csv"
+  else
+    report "parquet-parallel-agg (run error)" bad
+  fi
+
+  # The grouped form runs through the same lanes and radix merge. Serial is the
+  # oracle: one lane cannot disagree with itself about which group a row joins,
+  # so any difference is a merge bug. ~9973 distinct keys spread across every
+  # lane and partition.
+  if brun run -j 1 -c "LOAD INTO '$out/grp_serial.csv' AS
+SELECT name, COUNT(*) AS n, SUM(val) AS s FROM '$out/vol.parquet' GROUP BY name ORDER BY name;" &&
+     brun run -j 4 -c "LOAD INTO '$out/grp_par.csv' AS
+SELECT name, COUNT(*) AS n, SUM(val) AS s FROM '$out/vol.parquet' GROUP BY name ORDER BY name;"; then
+    check parquet-parallel-agg-grouped "$out/grp_par.csv" "$out/grp_serial.csv"
+  else
+    report "parquet-parallel-agg-grouped (run error)" bad
+  fi
+
   # A file written by basalt must also satisfy a different implementation. Skipped
   # rather than failed when duckdb is absent, so the suite stays runnable anywhere.
   if command -v duckdb >/dev/null 2>&1 || [ -x "$HOME/.duckdb/cli/latest/duckdb" ]; then
