@@ -2505,6 +2505,19 @@ const LoopRow = struct {
     }
 };
 
+/// Identify a for-each row the way the script names it — `n=0`, or
+/// `db=sales, tbl=orders` — so a failure points at a binding rather than an index.
+/// Falls back to the first cell if the label cannot be built.
+fn rowLabel(arena: std.mem.Allocator, names: []const []const u8, row: Row) []const u8 {
+    var out: []const u8 = "";
+    for (names, 0..) |n, i| {
+        if (i >= row.len) break;
+        const sep: []const u8 = if (out.len > 0) ", " else "";
+        out = std.fmt.allocPrint(arena, "{s}{s}{s}={s}", .{ out, sep, n, row[i] }) catch return row[0];
+    }
+    return if (out.len > 0) out else row[0];
+}
+
 /// Append one discovery batch's first `ncols` columns to `rows` as text
 /// (strings/ints; null → ""). Shared by every discovery form so they all agree
 /// on the coercion rules and the column-count error.
@@ -2966,18 +2979,23 @@ const ForCtx = struct {
     wrote_sink: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     mu: std.Thread.Mutex = .{},
-    first_err_buf: [256]u8 = undefined,
+    /// Wide enough to hold a full `Diag` message (512) plus the row label.
+    first_err_buf: [640]u8 = undefined,
     first_err_len: usize = 0,
     first_retryable: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
-fn forRecordFail(ctx: *ForCtx, label: []const u8, ename: []const u8, msg: []const u8, retryable: bool) void {
+/// `item` is the retry identity recorded in the outcome sink (the first cell);
+/// `label` is the human row identity and `msg` the already-resolved diagnostic.
+fn forRecordFail(ctx: *ForCtx, item: []const u8, label: []const u8, msg: []const u8, retryable: bool) void {
     _ = ctx.failures.fetchAdd(1, .monotonic);
-    if (ctx.outcomes) |sink| sink.record(label, false, if (msg.len > 0) msg else ename, retryable);
+    if (ctx.outcomes) |sink| sink.record(item, false, msg, retryable);
     ctx.mu.lock();
     defer ctx.mu.unlock();
     if (ctx.first_err_len == 0) {
-        const s = std.fmt.bufPrint(&ctx.first_err_buf, "{s}: {s} {s}", .{ label, ename, msg }) catch ctx.first_err_buf[0..0];
+        const lab = label[0..@min(label.len, 96)];
+        const why = msg[0..@min(msg.len, 512)];
+        const s = std.fmt.bufPrint(&ctx.first_err_buf, "row {s}: {s}", .{ lab, why }) catch ctx.first_err_buf[0..0];
         ctx.first_err_len = s.len;
         ctx.first_retryable.store(retryable, .monotonic);
     }
@@ -3028,7 +3046,10 @@ fn forWorker(ctx: *ForCtx, _: usize) void {
                 for (w_sources.items) |sc| sc.close();
                 break;
             }
-            forRecordFail(ctx, row[0], @errorName(e), w_diag.msg, isTransient(e) or w_diag.retryable);
+            const emsg = if (w_diag.msg.len > 0) w_diag.msg else @errorName(e);
+            const label = rowLabel(w_arena.allocator(), ctx.needles, row);
+            if (ctx.on_error == .continue_) w_env.log.log(.err, "for-each row {s}: {s}", .{ label, emsg });
+            forRecordFail(ctx, row[0], label, emsg, isTransient(e) or w_diag.retryable);
         }
         if (w_env.wrote_sink) ctx.wrote_sink.store(true, .monotonic);
         for (w_sources.items) |sc| sc.close();
@@ -3161,7 +3182,9 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
             for (rows) |row| {
                 if (aborting()) return error.Aborted;
                 const base = env.sources.items.len;
+                // Cleared per row so a failure never reports the previous row's message.
                 env.diag.retryable = false;
+                env.diag.msg = "";
                 const lr = LoopRow{ .names = needles, .types = fe.var_types, .cells = row };
                 if (runForBody(env, fe.body, lr, opts, stats, lanes_used, batch_arena)) |_| {
                     for (env.sources.items[base..]) |sc| sc.close();
@@ -3173,13 +3196,20 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
                     if (e == error.Aborted) return error.Aborted;
                     failures += 1;
                     const emsg = if (env.diag.msg.len > 0) env.diag.msg else @errorName(e);
+                    const label = rowLabel(env.arena, needles, row);
                     if (opts.outcomes) |sink| sink.record(row[0], false, emsg, isTransient(e) or env.diag.retryable);
-                    env.log.log(.err, "for-each {s} failed: {s}", .{ row[0], @errorName(e) });
+                    // In stop mode the same text comes back out as the run's error, so
+                    // only a loop that carries on logs the row here.
+                    if (on_error == .continue_) env.log.log(.err, "for-each row {s}: {s}", .{ label, emsg });
                     if (first_err == null)
-                        first_err = std.fmt.allocPrint(env.arena, "{s}: {s}", .{ row[0], @errorName(e) }) catch null;
+                        first_err = std.fmt.allocPrint(env.arena, "row {s}: {s}", .{ label, emsg }) catch null;
                     if (on_error == .stop) {
                         if (isTransient(e)) env.diag.retryable = true;
-                        return planErr(env.diag, first_err orelse "for-each failed");
+                        // `emsg` may alias `diag.buf`; rewriting the diag with it would
+                        // be a self-copy, so on an alloc failure keep what is there.
+                        if (first_err) |why|
+                            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each {s}", .{why}));
+                        return error.PlanFailed;
                     }
                 }
             }
@@ -3199,7 +3229,12 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
             const fails = ctx.failures.load(.monotonic);
             if (fails > 0 and (on_error == .stop or opts.outcomes == null)) {
                 if (ctx.first_retryable.load(.monotonic)) env.diag.retryable = true;
-                return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each: {d}/{d} failed (first: {s})", .{ fails, rows.len, ctx.first_err_buf[0..ctx.first_err_len] }));
+                const first = ctx.first_err_buf[0..ctx.first_err_len];
+                const why = if (on_error == .stop)
+                    try std.fmt.allocPrint(env.arena, "for-each {s}", .{first})
+                else
+                    try std.fmt.allocPrint(env.arena, "for-each: {d}/{d} failed (first: {s})", .{ fails, rows.len, first });
+                return planErr(env.diag, why);
             }
         },
     }
