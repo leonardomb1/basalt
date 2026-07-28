@@ -6751,6 +6751,7 @@ test "join kinds allowed on the parallel probe path" {
     try std.testing.expect(joinKindLaneSafe(.left));
     try std.testing.expect(joinKindLaneSafe(.semi));
     try std.testing.expect(joinKindLaneSafe(.anti));
+}
 
 test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hints" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
