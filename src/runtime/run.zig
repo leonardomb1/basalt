@@ -723,6 +723,8 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
             if (try runParallelParquetTopN(env, stages[0].node.read, stages[0 .. stages.len - 1], tn.prefix, tn.srt, tn.lim, last.write, opts, stats, lanes_used)) return;
         } else if (classifyMapPipeline(stages)) |map_stages| {
             if (try runParallelParquetMap(env, stages[0].node.read, stages[0 .. stages.len - 1], map_stages, last.write, opts, stats, lanes_used)) return;
+        } else if (classifyMapJoinPipeline(stages)) |js| {
+            if (try runParallelParquetMapJoin(env, stages[0].node.read, stages[0 .. stages.len - 1], js, last.write, opts, stats, lanes_used)) return;
         }
     }
 
@@ -737,6 +739,8 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
             if (try runParallelCsvTopN(env, stages[0].node.read, tn.prefix, tn.srt, tn.lim, last.write, opts, stats, lanes_used)) return;
         } else if (classifyMapPipeline(stages)) |map_stages| {
             if (try runParallelCsvMap(env, stages[0].node.read, map_stages, last.write, opts, stats, lanes_used)) return;
+        } else if (classifyMapJoinPipeline(stages)) |js| {
+            if (try runParallelCsvMapJoin(env, stages[0].node.read, js, last.write, opts, stats, lanes_used)) return;
         }
     }
 
@@ -915,9 +919,16 @@ fn classifyAggPipeline(stages: []const ast.Stage) ?AggShape {
 /// each worker rebuilds its own prefix chain safely from the shared AST stages — the
 /// resolution is plan-time-cheap and avoids sharing mutable op state across threads.
 fn buildMapChain(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), prefix: []const ast.Stage, scan: *op.Scan, csv_schema: *const types.Schema) !op.Op {
-    var cur: op.Op = .{ .scan = scan };
-    var sch = csv_schema.*;
-    for (prefix) |st| switch (st.node) {
+    return buildChainFrom(ta, params, prefix, .{ .scan = scan }, csv_schema.*);
+}
+
+/// The body of `buildMapChain`, rooted at an arbitrary operator instead of a scan —
+/// the join path reuses it for the stages that sit *after* the join, where the input
+/// is the join's output schema rather than the source's.
+fn buildChainFrom(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), stages: []const ast.Stage, start: op.Op, in_schema: types.Schema) !op.Op {
+    var cur: op.Op = start;
+    var sch = in_schema;
+    for (stages) |st| switch (st.node) {
         .filter => |pred0| {
             var ad = analyze.Diag{};
             const pred = try analyze.checkFilter(ta, sch, pred0, params, &ad);
@@ -1354,6 +1365,8 @@ const PqMapCtx = struct {
     sink_mtx: std.Thread.Mutex = .{},
     rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     rows_read: *std.atomic.Value(u64),
+    /// See `MapCtx.join` — one shared build index, one `op.Join` per lane.
+    join: ?LaneJoin = null,
 };
 
 fn pqMapLane(ctx: *PqMapCtx, lane_idx: usize) void {
@@ -1381,7 +1394,11 @@ fn pqMapLaneRun(ctx: *PqMapCtx, lane_idx: usize) !void {
     var ms = MorselSource{ .m = &ctx.morsels, .scratch = warena.allocator() };
     var cs = obs.CountingSource{ .inner = .{ .ptr = &ms, .vtable = &MorselSource.vtable }, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const chain = try buildMapChain(warena.allocator(), ctx.params, ctx.map_stages, &scan, ctx.morsels.src_schema);
+    const mapped_chain = try buildMapChain(warena.allocator(), ctx.params, ctx.map_stages, &scan, ctx.morsels.src_schema);
+    const chain = if (ctx.join) |lj|
+        try buildLaneJoinChain(warena.allocator(), ctx.params, lj, mapped_chain)
+    else
+        mapped_chain;
 
     var out: u64 = 0;
     while (try chain.next(batch_arena.allocator())) |b| {
@@ -1397,6 +1414,17 @@ fn pqMapLaneRun(ctx: *PqMapCtx, lane_idx: usize) !void {
 }
 
 fn runParallelParquetMap(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, map_stages: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    return runParallelParquetMapImpl(env, rd, pipeline, map_stages, null, w, opts, stats, lanes_used);
+}
+
+/// Row-group fan-out with one hash join hoisted out of it — the parquet twin of
+/// `runParallelCsvMapJoin`.
+fn runParallelParquetMapJoin(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, shape: MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    if (!joinKindLaneSafe(shape.join.kind)) return false;
+    return runParallelParquetMapImpl(env, rd, pipeline, shape.prefix, shape, w, opts, stats, lanes_used);
+}
+
+fn runParallelParquetMapImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, map_stages: []const ast.Stage, jshape: ?MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     const arena = env.arena;
     const path = switch (rd.form) {
         .path => |p| p,
@@ -1406,17 +1434,27 @@ fn runParallelParquetMap(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, m
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
     if (opts.threads < 2) return false;
 
-    const project = try projectedColumns(env, pipeline[1..]);
-    const bounds = try filterBounds(env, pipeline[1..]);
+    // Pushdown is derived from the pre-join stages only: past the join the column
+    // names are the join's, not the source's (`projectedColumns` would bail anyway).
+    const push_stages = pipeline[1..][0..map_stages.len];
+    const project = try projectedColumns(env, push_stages);
+    const bounds = try filterBounds(env, push_stages);
     const probe = pqdecode.Reader.openProjected(arena, path, project) catch return false;
     const ngroups = probe.md.row_groups.len;
     if (ngroups < 2) return false;
 
     const src_schema = try schemaPtr(arena, probe.schema);
-    const out_schema = try mapChainSchema(env, map_stages, src_schema.*);
+    var out_schema = try mapChainSchema(env, map_stages, src_schema.*);
 
     env.src_name = "parquet";
     env.sink_name = sinkLabel(env, w);
+
+    var lane_join: ?LaneJoin = null;
+    if (jshape) |js| {
+        const lp = try resolveLaneJoin(env, js, out_schema);
+        lane_join = lp.lane;
+        out_schema = lp.out_schema;
+    }
 
     const wr = try resolveUpsertKeys(env, w);
     const sink_mode: parallel.SinkMode = (try buildParallelSink(env, wr, out_schema)) orelse
@@ -1438,11 +1476,16 @@ fn runParallelParquetMap(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, m
         .params = env.params_expr,
         .sink_mode = sink_mode,
         .rows_read = env.rows_read,
+        .join = lane_join,
     };
 
     const lanes = try parallel.spawnJoin(arena, nthreads, pqMapLane, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
-    env.log.log(.debug, "parallel parquet map: {d} row groups over {d} lanes ({s} sink)", .{ ngroups, lanes, @tagName(sink_mode) });
+    if (lane_join != null) {
+        env.log.log(.debug, "parallel parquet map+join: {d} row groups over {d} lanes ({s} sink)", .{ ngroups, lanes, @tagName(sink_mode) });
+    } else {
+        env.log.log(.debug, "parallel parquet map: {d} row groups over {d} lanes ({s} sink)", .{ ngroups, lanes, @tagName(sink_mode) });
+    }
     if (opts.explain) {
         std.debug.print("actuals (parallel map, {d} lanes over {d} row groups): {d} rows out\n", .{
             lanes, ngroups, ctx.rows_out.load(.monotonic),
@@ -1848,6 +1891,132 @@ fn classifyMapPipeline(stages: []const ast.Stage) ?[]const ast.Stage {
     return middle;
 }
 
+const MapJoinShape = struct { prefix: []const ast.Stage, join: ast.Join, suffix: []const ast.Stage };
+
+/// Recognize `read … | (filter|select)* | join | (filter|select)* | write` — exactly
+/// one hash join, no breaker anywhere. The build side is materialized once up front
+/// and the probe side then fans out over morsels like a plain map pipeline.
+/// null → not eligible (any other stage, a second join, or no join at all).
+fn classifyMapJoinPipeline(stages: []const ast.Stage) ?MapJoinShape {
+    if (stages.len < 3) return null;
+    if (stages[stages.len - 1].node != .write) return null;
+    const middle = stages[1 .. stages.len - 1];
+    var ji: ?usize = null;
+    for (middle, 0..) |st, i| switch (st.node) {
+        .filter, .select => {},
+        .join => {
+            if (ji != null) return null;
+            ji = i;
+        },
+        else => return null,
+    };
+    const j = ji orelse return null;
+    return .{ .prefix = middle[0..j], .join = middle[j].node.join, .suffix = middle[j + 1 ..] };
+}
+
+/// Join kinds whose probe is a pure lookup into a read-only index, so every lane can
+/// share one index and emit independently. `right`/`full` have to remember which
+/// build rows matched — that state is global to the probe, not per-lane, so they stay
+/// on the serial driver.
+///
+/// Matched by tag name rather than by a switch: the kind set is still growing on
+/// another branch, and an allowlist spelled this way stays correct either way.
+fn joinKindLaneSafe(kind: ast.JoinKind) bool {
+    for ([_][]const u8{ "inner", "left", "semi", "anti", "cross" }) |ok| {
+        if (std.mem.eql(u8, @tagName(kind), ok)) return true;
+    }
+    return false;
+}
+
+/// Read a key-index field off `analyze.JoinPlan` as a slice. The multi-key rework
+/// turns the single `lk`/`rk` index into an array; accepting both spellings and both
+/// arities keeps this path building against either snapshot.
+fn planKeys(a: std.mem.Allocator, jp: analyze.JoinPlan, comptime which: []const u8) ![]const usize {
+    const name: []const u8 = comptime if (@hasField(analyze.JoinPlan, which)) which else if (std.mem.eql(u8, which, "lk")) "left_keys" else "right_keys";
+    const v = @field(jp, name);
+    return if (@TypeOf(v) == usize) try a.dupe(usize, &[_]usize{v}) else v;
+}
+
+/// What a lane needs to rebuild its own `op.Join` over the one shared build index.
+/// Everything here is read-only for the lifetime of the fan-out: `index` is fully
+/// populated before any lane starts, and the schemas/key slices live in the plan
+/// arena. Each lane still allocates its OWN `op.Join` (it carries mutable stats and
+/// per-batch scratch) — only the index is shared.
+const LaneJoin = struct {
+    index: *op.JoinIndex,
+    left_keys: []const usize,
+    right_keys: []const usize,
+    left_schema: *const types.Schema,
+    right_schema: *const types.Schema,
+    out_schema: *const types.Schema,
+    kind: ast.JoinKind,
+    suffix: []const ast.Stage,
+};
+
+const LaneJoinPlan = struct { lane: LaneJoin, out_schema: types.Schema };
+
+/// Hoist the join out of the fan-out: resolve the binding, materialize the build side
+/// once into a shared read-only index, and prevalidate the post-join stages against
+/// the join's output schema so a lane rebuild cannot fail where this succeeded.
+/// Returns the lane recipe plus the pipeline's final output schema (what the sink
+/// gets opened with).
+fn resolveLaneJoin(env: *Env, shape: MapJoinShape, left_schema: types.Schema) anyerror!LaneJoinPlan {
+    const arena = env.arena;
+    const binding = env.bindings.get(shape.join.binding) orelse
+        return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown binding `{s}` in join", .{shape.join.binding}));
+    const build = try buildPipeline(env, binding.stages);
+
+    var ad = analyze.Diag{};
+    const jp = analyze.joinPlan(arena, left_schema, build.schema, shape.join, &ad) catch |e| return aErr(env, &ad, e);
+    const out = try schemaPtr(arena, jp.schema);
+    const right_schema = try schemaPtr(arena, build.schema);
+    const right_keys = try planKeys(arena, jp, "rk");
+
+    // Serial prevalidation of the suffix, exactly as `mapChainSchema` does for the
+    // prefix: any analyze error surfaces here, with a diag, before any lane exists.
+    const final_schema = try mapChainSchema(env, shape.suffix, out.*);
+
+    // The index outlives the fan-out (plan arena); the pulls that fill it are scratch
+    // and go away with `build_arena` — `materializeFull` copies into the state arena.
+    var build_arena = std.heap.ArenaAllocator.init(env.gpa);
+    defer build_arena.deinit();
+    const index = try op.JoinIndex.create(arena, build_arena.allocator(), build.op, right_schema, right_keys);
+
+    return .{
+        .lane = .{
+            .index = index,
+            .left_keys = try planKeys(arena, jp, "lk"),
+            .right_keys = right_keys,
+            .left_schema = try schemaPtr(arena, left_schema),
+            .right_schema = right_schema,
+            .out_schema = out,
+            .kind = shape.join.kind,
+            .suffix = shape.suffix,
+        },
+        .out_schema = final_schema,
+    };
+}
+
+/// Per-lane tail of the operator tree: this lane's own `op.Join` over the shared
+/// index, then the post-join `filter`/`select` stages. `ta` is the lane arena, so
+/// nothing built here is touched by another thread.
+fn buildLaneJoinChain(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), lj: LaneJoin, probe: op.Op) !op.Op {
+    const j = try ta.create(op.Join);
+    j.* = .{
+        .probe = probe,
+        .build = null,
+        .index = lj.index,
+        .left_keys = lj.left_keys,
+        .right_keys = lj.right_keys,
+        .left_schema = lj.left_schema,
+        .right_schema = lj.right_schema,
+        .out_schema = lj.out_schema,
+        .kind = lj.kind,
+        .state = ta,
+    };
+    return buildChainFrom(ta, params, lj.suffix, .{ .join = j }, lj.out_schema.*);
+}
+
 const MapCtx = struct {
     mapped: *csv.MappedCsv,
     csv_schema: *const types.Schema,
@@ -1858,6 +2027,9 @@ const MapCtx = struct {
     sink_mtx: std.Thread.Mutex = .{},
     rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     rows_read: *std.atomic.Value(u64),
+    /// Set when the pipeline carries one hash join: each lane probes the shared
+    /// index with its own `op.Join` and runs the post-join stages itself.
+    join: ?LaneJoin = null,
 };
 
 const mapWorker = dispatchWorker(MapCtx, mapWorkOne);
@@ -1883,7 +2055,11 @@ fn mapWorkOne(ctx: *MapCtx, i: usize) !void {
     var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.queue.nitems), .schema = ctx.csv_schema };
     var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const chain = try buildMapChain(warena.allocator(), ctx.params, ctx.map_stages, &scan, ctx.csv_schema);
+    const mapped_chain = try buildMapChain(warena.allocator(), ctx.params, ctx.map_stages, &scan, ctx.csv_schema);
+    const chain = if (ctx.join) |lj|
+        try buildLaneJoinChain(warena.allocator(), ctx.params, lj, mapped_chain)
+    else
+        mapped_chain;
 
     while (try chain.next(batch_arena.allocator())) |b| {
         if (ctx.queue.failed.load(.seq_cst)) return;
@@ -1905,6 +2081,18 @@ fn mapWorkOne(ctx: *MapCtx, i: usize) !void {
 /// writes batches to a shared sink under a mutex. Row ORDER is not preserved (chunks
 /// interleave); use `-j 1` for a deterministic order. Returns false to fall back.
 fn runParallelCsvMap(env: *Env, rd: ast.Read, map_stages: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    return runParallelCsvMapImpl(env, rd, map_stages, null, w, opts, stats, lanes_used);
+}
+
+/// The same fan-out with one hash join hoisted out of it: the build side is
+/// materialized once here, the lanes share that index read-only and each probes it
+/// with the chunk it stole. Returns false to fall back to the serial driver.
+fn runParallelCsvMapJoin(env: *Env, rd: ast.Read, shape: MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    if (!joinKindLaneSafe(shape.join.kind)) return false;
+    return runParallelCsvMapImpl(env, rd, shape.prefix, shape, w, opts, stats, lanes_used);
+}
+
+fn runParallelCsvMapImpl(env: *Env, rd: ast.Read, map_stages: []const ast.Stage, jshape: ?MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     const arena = env.arena;
     const path = switch (rd.form) {
         .path => |p| p,
@@ -1916,10 +2104,18 @@ fn runParallelCsvMap(env: *Env, rd: ast.Read, map_stages: []const ast.Stage, w: 
     const mapped = csv.MappedCsv.open(arena, path) catch return false;
     defer mapped.close();
 
-    const out_schema = try mapChainSchema(env, map_stages, mapped.schema);
+    var out_schema = try mapChainSchema(env, map_stages, mapped.schema);
 
     env.src_name = "csv";
     env.sink_name = sinkLabel(env, w);
+
+    // Before any lane exists: build side materialized, suffix prevalidated.
+    var lane_join: ?LaneJoin = null;
+    if (jshape) |js| {
+        const lp = try resolveLaneJoin(env, js, out_schema);
+        lane_join = lp.lane;
+        out_schema = lp.out_schema;
+    }
 
     const wr = try resolveUpsertKeys(env, w);
     const sink_mode: parallel.SinkMode = (try buildParallelSink(env, wr, out_schema)) orelse
@@ -1936,11 +2132,16 @@ fn runParallelCsvMap(env: *Env, rd: ast.Read, map_stages: []const ast.Stage, w: 
         .queue = .{ .nitems = nthreads },
         .sink_mode = sink_mode,
         .rows_read = env.rows_read,
+        .join = lane_join,
     };
 
     const lanes = try parallel.spawnJoin(arena, nthreads, mapWorker, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
-    env.log.log(.debug, "parallel csv map: {d} chunks over {d} lanes ({s} sink)", .{ nthreads, lanes, @tagName(sink_mode) });
+    if (lane_join != null) {
+        env.log.log(.debug, "parallel csv map+join: {d} chunks over {d} lanes ({s} sink)", .{ nthreads, lanes, @tagName(sink_mode) });
+    } else {
+        env.log.log(.debug, "parallel csv map: {d} chunks over {d} lanes ({s} sink)", .{ nthreads, lanes, @tagName(sink_mode) });
+    }
 
     if (ctx.queue.first_err) |e| return e;
     stats.rows_out += ctx.rows_out.load(.monotonic);
@@ -6104,4 +6305,142 @@ test "PRINT over an unbound name is a plan error, not a silent blank" {
     var rdiag: Diag = .{};
     try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "PRINT:") != null);
+}
+
+/// Run a join script over `in.csv` (probe) + `lookup.csv` (build) at an explicit
+/// thread count. `$IN`/`$LOOKUP` in `body` are replaced with the two paths; the
+/// result comes back as sorted lines, since lanes interleave the output order.
+fn runJoinThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, body: []const u8, threads: usize) ![]u8 {
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const out_name = try std.fmt.allocPrint(alloc, "out{d}.csv", .{threads});
+    defer alloc.free(out_name);
+    const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
+    defer alloc.free(in_path);
+    const lookup_path = try std.fs.path.join(alloc, &.{ base, "lookup.csv" });
+    defer alloc.free(lookup_path);
+    const out_path = try std.fs.path.join(alloc, &.{ base, out_name });
+    defer alloc.free(out_path);
+
+    const q1 = try std.mem.replaceOwned(u8, alloc, body, "$IN", in_path);
+    defer alloc.free(q1);
+    const q2 = try std.mem.replaceOwned(u8, alloc, q1, "$LOOKUP", lookup_path);
+    defer alloc.free(q2);
+    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS {s};", .{ out_path, q2 });
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+
+    var rdiag: Diag = .{};
+    _ = run(alloc, prog, .{ .threads = threads }, &rdiag) catch |e| {
+        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+        return e;
+    };
+    const raw = try tmp.dir.readFileAlloc(alloc, out_name, 1 << 20);
+    defer alloc.free(raw);
+    return sortedLines(alloc, raw);
+}
+
+/// `in.csv` = 2000 probe rows cycling five codes; `lookup.csv` = labels for three
+/// of them, so two fifths of the probe side stays unmatched.
+fn writeJoinFixtures(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) !void {
+    var in = std.array_list.Managed(u8).init(alloc);
+    defer in.deinit();
+    try in.appendSlice("id,code\n");
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) try in.writer().print("{d},{c}\n", .{ i, "ABCDE"[i % 5] });
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = in.items });
+    try tmp.dir.writeFile(.{ .sub_path = "lookup.csv", .data = "code,label\nA,Apple\nB,Banana\nC,Cherry\n" });
+}
+
+test "parallel join: inner join over CSV chunks matches the serial driver" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeJoinFixtures(alloc, &tmp);
+
+    const body =
+        "WITH labels AS (SELECT * FROM '$LOOKUP') " ++
+        "SELECT t.id, l.label FROM '$IN' t JOIN labels l ON t.code = l.code";
+
+    const serial = try runJoinThreaded(alloc, &tmp, body, 1);
+    defer alloc.free(serial);
+    const par = try runJoinThreaded(alloc, &tmp, body, 4);
+    defer alloc.free(par);
+
+    try std.testing.expectEqualStrings(serial, par);
+    // header + 3 matching codes x 400 rows + the trailing empty line
+    try std.testing.expectEqual(@as(usize, 1202), std.mem.count(u8, par, "\n"));
+}
+
+test "parallel join: left join keeps unmatched probe rows on every lane" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeJoinFixtures(alloc, &tmp);
+
+    const body =
+        "WITH labels AS (SELECT * FROM '$LOOKUP') " ++
+        "SELECT t.id, l.label FROM '$IN' t LEFT JOIN labels l ON t.code = l.code";
+
+    const serial = try runJoinThreaded(alloc, &tmp, body, 1);
+    defer alloc.free(serial);
+    const par = try runJoinThreaded(alloc, &tmp, body, 4);
+    defer alloc.free(par);
+
+    try std.testing.expectEqualStrings(serial, par);
+    try std.testing.expectEqual(@as(usize, 2002), std.mem.count(u8, par, "\n"));
+}
+
+test "parallel join: a suffix filter on a right-side column runs after the join" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeJoinFixtures(alloc, &tmp);
+
+    const body =
+        "WITH labels AS (SELECT * FROM '$LOOKUP') " ++
+        "SELECT t.id, l.label FROM '$IN' t JOIN labels l ON t.code = l.code WHERE l.label = 'Cherry'";
+
+    const serial = try runJoinThreaded(alloc, &tmp, body, 1);
+    defer alloc.free(serial);
+    const par = try runJoinThreaded(alloc, &tmp, body, 4);
+    defer alloc.free(par);
+
+    try std.testing.expectEqualStrings(serial, par);
+    try std.testing.expectEqual(@as(usize, 402), std.mem.count(u8, par, "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, par, "Apple") == null);
+}
+
+test "parallel join: a breaker after the join falls back to the serial driver" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeJoinFixtures(alloc, &tmp);
+
+    // An aggregate past the join fails every classifier, so this runs serially —
+    // the fallback must still produce the same answer at threads > 1. (RIGHT/FULL,
+    // the other serial-only join case, is rejected by the SQL parser today, so it
+    // has no runnable script to compare.)
+    const body =
+        "WITH labels AS (SELECT * FROM '$LOOKUP') " ++
+        "SELECT l.label, COUNT(*) AS n FROM '$IN' t JOIN labels l ON t.code = l.code GROUP BY l.label";
+
+    const serial = try runJoinThreaded(alloc, &tmp, body, 1);
+    defer alloc.free(serial);
+    const par = try runJoinThreaded(alloc, &tmp, body, 4);
+    defer alloc.free(par);
+
+    try std.testing.expectEqualStrings(serial, par);
+    try std.testing.expect(std.mem.indexOf(u8, par, "Cherry,400") != null);
+}
+
+test "join kinds allowed on the parallel probe path" {
+    try std.testing.expect(joinKindLaneSafe(.inner));
+    try std.testing.expect(joinKindLaneSafe(.left));
+    try std.testing.expect(joinKindLaneSafe(.semi));
+    try std.testing.expect(joinKindLaneSafe(.anti));
 }
