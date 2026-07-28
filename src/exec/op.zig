@@ -1963,9 +1963,14 @@ pub const JoinIndex = struct {
         const classes = try pull.alloc(KeyClass, right_keys.len);
         for (right_keys, classes) |k, *c| c.* = classOf(batch.columns[k], batch.columns[k]);
 
-        var r: usize = 0;
-        while (r < n) : (r += 1) {
-            chain[r] = 0;
+        @memset(chain, 0);
+        // Insert in reverse row order: prepending then yields chains in build
+        // order, so duplicate-key fan-out preserves the build side's row order
+        // (the pre-rewrite behavior scripts may rely on).
+        var ri: usize = n;
+        while (ri > 0) {
+            ri -= 1;
+            const r = ri;
             if (anyNullKey(batch.columns, right_keys, r)) continue;
             const h = hashRowKeys(batch.columns, right_keys, r);
             hashes[r] = h;
@@ -2697,8 +2702,8 @@ test "join: inner/left/semi/anti; null keys never match, duplicate build keys fa
 
     const Case = struct { kind: ast.JoinKind, keys: []const ?i64, rvs: []const ?[]const u8 };
     const cases = [_]Case{
-        .{ .kind = .inner, .keys = &.{ 1, 1 }, .rvs = &.{ "y", "x" } },
-        .{ .kind = .left, .keys = &.{ 1, 1, 2, null, 3 }, .rvs = &.{ "y", "x", null, null, null } },
+        .{ .kind = .inner, .keys = &.{ 1, 1 }, .rvs = &.{ "x", "y" } },
+        .{ .kind = .left, .keys = &.{ 1, 1, 2, null, 3 }, .rvs = &.{ "x", "y", null, null, null } },
         .{ .kind = .semi, .keys = &.{1}, .rvs = &.{} },
         .{ .kind = .anti, .keys = &.{ 2, null, 3 }, .rvs = &.{} },
     };
@@ -2721,7 +2726,7 @@ test "join: inner/left/semi/anti; null keys never match, duplicate build keys fa
             .kind = case.kind,
             .state = a,
         };
-        // Duplicates chain most-recent-first, so build row 1 ("y") precedes 0.
+        // Reverse-order insertion keeps duplicate chains in build order.
         const got = try JoinRows.collect(a, .{ .join = &jn }, if (emit_right) @as(?usize, 3) else null);
         try got.expect(case.keys, case.rvs);
     }
