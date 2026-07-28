@@ -263,6 +263,13 @@ Source clauses, in any order after the source:
   `now()`/`today()`, user funcs) stay in the engine — the filter is always
   kept, so results never change, only how much crosses the wire. `EXPLAIN`
   prints the descended predicate on a `pushdown:` line.
+- **Whole-aggregate pushdown** — `read <sql> | filters | GROUP BY` descends as
+  one grouped query when every filter translates, the group keys are bare
+  columns, and the aggregates are `COUNT[(DISTINCT)] SUM MIN MAX` with types
+  the engine can pin via explicit casts (`AVG`, summed floats/decimals, and
+  collation-dependent string extremes deliberately stay engine-side — the
+  result must be bit-identical, not merely close). `HAVING`/sort/limit still
+  run in the engine on the tiny grouped result.
 - **`PAGINATE BY page|offset|cursor (param = 'page', size = 100,
   total = 'count', field = 'next', start = 2, max = 50)`** — REST pagination.
   Friendly keys map to the engine hints (`param`→`page_param`/`cursor_param`,
@@ -318,8 +325,9 @@ expressions in the CTE or a select first), `AND`-combined for composite keys;
 pairs may be written in either order, and a null key never matches. `CROSS
 JOIN <cte>` takes no `ON`. Right-side columns that collide with a left name
 come back suffixed `_r`. A pipeline shaped `read | filters | join | filters |
-write` over a local CSV/Parquet source probes in parallel under `-j` (right
-and full joins stay serial). The build side is fully resident; past 4 GiB the
+write` probes in parallel under `-j` — over local CSV/Parquet morsels, and
+over key-range splits for a splittable SQL source (right and full joins stay
+serial). The build side is fully resident; past 4 GiB the
 run fails fast instead of eating the host — raise the ceiling per join with
 `WITH (max_build = '16GB')` on the join clause, filter the CTE, or flip the
 join.
