@@ -1,8 +1,8 @@
 //! Minimal TDS (SQL Server) client. Packet framing, PRELOGIN, optional TDS 7.x
 //! tunneled TLS (the handshake rides inside PRELOGIN packets; all TDS traffic
-//! then flows inside the session), LOGIN7 with SQL auth, SQLBatch, and a
-//! streaming token-stream reader (PacketReader/TdsCursor) that pulls packets
-//! on demand so ROW tokens may span packet boundaries.
+//! then flows inside the session), LOGIN7 with SQL / federated / NTLMv2 (SSPI)
+//! auth, SQLBatch, and a streaming token-stream reader (PacketReader/TdsCursor)
+//! that pulls packets on demand so ROW tokens may span packet boundaries.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -12,6 +12,7 @@ const batchmod = @import("../exec/batch.zig");
 const valuemod = @import("../exec/value.zig");
 const driver = @import("driver.zig");
 const sqlmod = @import("sql.zig");
+const ntlm = @import("ntlm.zig");
 
 const Value = valuemod.Value;
 const Batch = batchmod.Batch;
@@ -20,6 +21,7 @@ const PKT_PRELOGIN = 0x12;
 const PKT_LOGIN7 = 0x10;
 const PKT_SQLBATCH = 0x01;
 const PKT_BULK = 0x07;
+const PKT_SSPI = 0x11;
 const STATUS_EOM = 0x01;
 const BULK_PKT_PAYLOAD = 4088;
 
@@ -79,6 +81,26 @@ pub const Conn = struct {
             if (self.last_error.len > 0) std.debug.print("[tds] login rejected: {s}\n", .{self.last_error});
             return e;
         };
+        return self;
+    }
+
+    /// Connect with Windows NTLMv2 credentials (`DOMAIN\user` + password), the
+    /// on-prem integrated-security path. Encryption is mandatory: a cleartext
+    /// NTLM exchange hands the challenge/response to any passive observer for
+    /// offline cracking. This is NTLMv2 with an explicit password, not Kerberos
+    /// and not OS single sign-on.
+    pub fn connectNtlm(gpa: std.mem.Allocator, host: []const u8, port: u16, cred: ntlm.Credential, database: []const u8, tls_mode: sqlmod.TlsMode) !*Conn {
+        if (tls_mode == .off) return error.EncryptionRequired;
+        const stream = try std.net.tcpConnectToHost(gpa, host, port);
+        driver.tuneSocket(stream.handle);
+        const self = try gpa.create(Conn);
+        self.* = .{ .gpa = gpa, .stream = stream, .msg = std.array_list.Managed(u8).init(gpa) };
+        self.sr = std.net.Stream.Reader.init(stream, &self.read_buf);
+        self.sw = std.net.Stream.Writer.init(stream, &self.write_buf);
+        errdefer self.close();
+        try self.prelogin(true);
+        try self.startTls(host, tls_mode);
+        try self.loginNtlm(cred, database, host);
         return self;
     }
 
@@ -295,6 +317,56 @@ pub const Conn = struct {
         try self.parseLoginResponse();
     }
 
+    /// Three-leg NTLMv2 handshake (MS-TDS 2.2.6.8): the Type 1 blob rides in the
+    /// LOGIN7 SSPI field, the server answers with an SSPI token carrying the
+    /// Type 2 challenge, and the Type 3 blob goes back in an SSPI Message packet
+    /// (type 0x11); the server's reply to that is an ordinary login response.
+    fn loginNtlm(self: *Conn, cred: ntlm.Credential, database: []const u8, host: []const u8) !void {
+        const neg = try ntlm.negotiate(self.gpa, cred);
+        defer self.gpa.free(neg);
+        const payload = try buildLogin7Sspi(self.gpa, neg, database, host);
+        defer self.gpa.free(payload);
+        try self.writePacket(PKT_LOGIN7, payload);
+        try self.readMessage();
+
+        const challenge = try self.sspiToken();
+        var nonce: [8]u8 = undefined;
+        std.crypto.random.bytes(&nonce);
+        const auth = try ntlm.authenticate(self.gpa, cred, challenge, ntlm.filetimeNow(), nonce);
+        defer self.gpa.free(auth);
+        try self.writePacket(PKT_SSPI, auth);
+        try self.readMessage();
+        self.parseLoginResponse() catch |e| {
+            if (self.last_error.len > 0) std.debug.print("[tds] login rejected: {s}\n", .{self.last_error});
+            return e;
+        };
+    }
+
+    /// The server's SSPI token (0xED) out of the current message: a US_VARBYTE
+    /// (2-byte byte count) carrying the security blob. Returns a slice into
+    /// `self.msg`, valid until the next `readMessage`.
+    fn sspiToken(self: *Conn) ![]const u8 {
+        const p = self.msg.items;
+        var i: usize = 0;
+        while (i < p.len) {
+            const token = p[i];
+            i += 1;
+            if (i + 2 > p.len) return error.TdsProtocol;
+            const len = rdU16(p, i);
+            if (i + 2 + len > p.len) return error.TdsProtocol;
+            switch (token) {
+                0xED => return p[i + 2 .. i + 2 + len],
+                0xAA => {
+                    self.last_error = try self.decodeError(p[i + 2 .. i + 2 + len]);
+                    return error.LoginFailed;
+                },
+                0xAB, 0xE3 => i += 2 + len,
+                else => return error.TdsProtocol,
+            }
+        }
+        return error.TdsProtocol;
+    }
+
     fn parseLoginResponse(self: *Conn) !void {
         const p = self.msg.items;
         var i: usize = 0;
@@ -315,7 +387,7 @@ pub const Conn = struct {
                     self.last_error = try self.decodeError(p[i + 2 .. i + 2 + len]);
                     return error.LoginFailed;
                 },
-                0xAB => {
+                0xAB, 0xED => {
                     if (i + 2 > p.len) return error.TdsProtocol;
                     i += 2 + rdU16(p, i);
                 },
@@ -1521,6 +1593,53 @@ fn buildLogin7Fedauth(gpa: std.mem.Allocator, token: []const u8, database: []con
     return out;
 }
 
+/// LOGIN7 carrying an NTLM Type 1 blob in the SSPI field (MS-TDS 2.2.6.4), with
+/// empty user/password: OptionFlags2 bit fIntSecurity (0x80, byte 25) selects
+/// integrated security, and ibSSPI/cbSSPI (byte 78) point at the blob as raw
+/// bytes rather than UTF-16. cbSSPILong (byte 90) stays 0 — the spec only
+/// consults it when cbSSPI is 0xFFFF, far above any NTLM token's size.
+fn buildLogin7Sspi(gpa: std.mem.Allocator, sspi: []const u8, database: []const u8, host: []const u8) ![]u8 {
+    var fixed = std.mem.zeroes([94]u8);
+    fixed[4] = 0x04;
+    fixed[7] = 0x74;
+    fixed[8] = 0x00;
+    fixed[9] = 0x40;
+    fixed[25] = 0x80;
+
+    var vd = std.array_list.Managed(u8).init(gpa);
+    defer vd.deinit();
+
+    try addField(&fixed, 36, host, &vd, false);
+    try addField(&fixed, 40, "", &vd, false);
+    try addField(&fixed, 44, "", &vd, true);
+    try addField(&fixed, 48, "basalt", &vd, false);
+    try addField(&fixed, 52, host, &vd, false);
+    try addField(&fixed, 56, "", &vd, false);
+    try addField(&fixed, 60, "basalt", &vd, false);
+    try addField(&fixed, 64, "", &vd, false);
+    try addField(&fixed, 68, database, &vd, false);
+    try addRaw(&fixed, 78, sspi, &vd);
+    try addField(&fixed, 82, "", &vd, false);
+    try addField(&fixed, 86, "", &vd, false);
+
+    const total: u32 = @intCast(94 + vd.items.len);
+    std.mem.writeInt(u32, fixed[0..4], total, .little);
+
+    const out = try gpa.alloc(u8, total);
+    @memcpy(out[0..94], &fixed);
+    @memcpy(out[94..], vd.items);
+    return out;
+}
+
+/// Append opaque bytes to var-data and write their (offset, byte-count) into the
+/// fixed block — the SSPI field is a blob, not a string, so no UTF-16 widening.
+fn addRaw(fixed: []u8, ib_pos: usize, bytes: []const u8, vd: *std.array_list.Managed(u8)) !void {
+    const ib: u16 = @intCast(94 + vd.items.len);
+    try vd.appendSlice(bytes);
+    std.mem.writeInt(u16, fixed[ib_pos..][0..2], ib, .little);
+    std.mem.writeInt(u16, fixed[ib_pos + 2 ..][0..2], @intCast(bytes.len), .little);
+}
+
 /// Append a UTF-16LE string to var-data and write its (offset, char-count) into
 /// the fixed offset/length block. ASCII only (sufficient for creds/identifiers).
 fn addField(fixed: []u8, ib_pos: usize, s: []const u8, vd: *std.array_list.Managed(u8), obfuscate: bool) !void {
@@ -1578,6 +1697,24 @@ test "buildLogin7Fedauth: fExtension flag, empty creds, FEDAUTH ext layout" {
     try std.testing.expectEqual(@as(u8, 0xFF), out[out.len - 1]);
     const dlen = std.mem.readInt(u32, out[feat_off + 1 ..][0..4], .little);
     try std.testing.expectEqual(@as(u32, 1 + 4 + token.len * 2), dlen);
+}
+
+test "buildLogin7Sspi: fIntSecurity set, creds empty, blob verbatim at ibSSPI" {
+    const a = std.testing.allocator;
+    const blob = [_]u8{ 'N', 'T', 'L', 'M', 'S', 'S', 'P', 0, 1, 0, 0, 0 };
+    const out = try buildLogin7Sspi(a, &blob, "db", "h");
+    defer a.free(out);
+
+    try std.testing.expectEqual(@as(u32, @intCast(out.len)), std.mem.readInt(u32, out[0..4], .little));
+    try std.testing.expectEqual(@as(u8, 0x80), out[25] & 0x80);
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, out[42..44], .little));
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, out[46..48], .little));
+
+    const ib_sspi = std.mem.readInt(u16, out[78..80], .little);
+    try std.testing.expectEqual(@as(u16, blob.len), std.mem.readInt(u16, out[80..82], .little));
+    try std.testing.expect(ib_sspi >= 94 and ib_sspi + blob.len <= out.len);
+    try std.testing.expectEqualSlices(u8, &blob, out[ib_sspi..][0..blob.len]);
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, out[90..94], .little));
 }
 
 test "buildLogin7Fedauth: nonce appended when echo && nonce present" {

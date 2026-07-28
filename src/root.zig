@@ -24,6 +24,7 @@ pub const postgres = @import("connect/postgres.zig");
 pub const request = @import("connect/request.zig");
 pub const httpsrc = @import("connect/http.zig");
 pub const aad = @import("connect/aad.zig");
+pub const ntlm = @import("connect/ntlm.zig");
 pub const azure = @import("connect/azure.zig");
 pub const codec = @import("connect/codec.zig");
 pub const thrift = @import("connect/thrift.zig");

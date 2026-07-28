@@ -235,6 +235,28 @@ else
   report "quoted-idents (run error)" bad
 fi
 
+# NTLM config surface. The handshake itself needs a domain-joined server, which
+# the mssql container is not — but the plan-time refusals need no server at all,
+# and they are what stops a misconfigured script from ever reaching the wire.
+NTLM_CONN="CREATE CONNECTION c TYPE sqlserver OPTIONS (host='h', database='d', auth='ntlm'"
+if C_USER=u C_PASS=p $B run -q -c "${NTLM_CONN}); SELECT 1 AS x FROM c.QUERY(\$\$SELECT 1\$\$);" >"$out/ntlm_tls.log" 2>&1; then
+  report "ntlm-requires-encryption (accepted plaintext)" bad
+elif grep -q "requires an encrypted channel" "$out/ntlm_tls.log"; then
+  report ntlm-requires-encryption ok
+else
+  report "ntlm-requires-encryption (wrong error)" bad; head -2 "$out/ntlm_tls.log"
+fi
+
+# A mistyped auth mode used to fall back to a SQL login, so the user got an
+# opaque rejection instead of being told the keyword was wrong.
+if $B run -q -c "CREATE CONNECTION c TYPE sqlserver OPTIONS (host='h', database='d', auth='ntlmv2', tls='require'); SELECT 1 AS x FROM c.QUERY(\$\$SELECT 1\$\$);" >"$out/ntlm_typo.log" 2>&1; then
+  report "ntlm-auth-typo (accepted unknown mode)" bad
+elif grep -q 'must be "sql", "aad" or "ntlm"' "$out/ntlm_typo.log"; then
+  report ntlm-auth-typo ok
+else
+  report "ntlm-auth-typo (wrong error)" bad; head -2 "$out/ntlm_typo.log"
+fi
+
 # Write dispositions on a file target. `APPEND` used to truncate like every
 # other disposition — two runs left only the second one's rows, silently, on the
 # keyword documented as the default. A bare `LOAD INTO` and `REPLACE` must still

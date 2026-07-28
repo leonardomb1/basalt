@@ -99,7 +99,7 @@ CREATE CONNECTION erp TYPE sqlserver OPTIONS (
 ```
 
 Connector types and their options are unchanged from BSL: `sqlserver`
-(`host port database user password tls auth tenant client_id resource`),
+(`host port database user password tls auth domain tenant client_id resource`),
 `mysql`, `postgres`, `starrocks` (`fe_host fe_port be_url database buckets
 replication_num auto_create label_prefix ...`), `http`.
 
@@ -109,6 +109,28 @@ instance's TCP port via the SQL Server Browser (UDP 1434) before connecting.
 Give an explicit `port` to skip the lookup — the robust choice where UDP 1434
 is firewalled but the TDS port is open. (`*.dynamics.com` / Azure SQL are
 default-instance cloud endpoints, so this never applies there.)
+
+**Windows authentication (`auth = 'ntlm'`):** authenticates to an on-prem SQL
+Server with a domain account. Give the domain either inline —
+`user = 'CORP\myuser'` — or as its own option, `domain = 'CORP'`; when both
+appear the `domain` option wins and the `CORP\` prefix is stripped off the user
+name. This is **NTLMv2 with an explicit password**. It is *not* Kerberos and
+*not* single sign-on from the host's logged-in identity: basalt runs on Linux,
+holds no ticket, and always needs `password`. A server that mandates Kerberos
+will refuse it.
+
+Encryption is mandatory for `auth = 'ntlm'`: `tls = 'off'` is a plan-time
+error, refused before any socket opens, because an unencrypted NTLM exchange
+hands the challenge/response to any passive observer for offline cracking.
+`tls = 'require'` verifies the server certificate and is the right setting;
+`tls = 'insecure'` encrypts without verifying and is accepted, since on-prem
+instances usually present a self-signed certificate — but an unverified channel
+still leaves an active man-in-the-middle able to relay the handshake. Point
+`BASALT_CA_BUNDLE` at the PEM of your internal CA and use `tls = 'require'` to
+close that gap. Note that NTLMv2 never puts the password on the wire — only a
+challenge-response derived from it — whereas a SQL login sends it under
+LOGIN7's trivially reversible scrambling, so on an unverified channel NTLM is
+the stronger of the two, not the weaker.
 
 **Credentials by convention:** connection `erp` resolves `ERP_USER` /
 `ERP_PASS` from the environment at connect time — the common case costs zero

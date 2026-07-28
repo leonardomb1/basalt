@@ -27,6 +27,7 @@ const httpsrc = @import("../connect/http.zig");
 const aad = @import("../connect/aad.zig");
 const splitmod = @import("../connect/split.zig");
 const ssrp = @import("../connect/ssrp.zig");
+const ntlm = @import("../connect/ntlm.zig");
 const walmod = @import("../connect/wal.zig");
 const azure = @import("../connect/azure.zig");
 const gen = @import("../connect/gen.zig");
@@ -4012,6 +4013,10 @@ fn rangeBound(env: *Env, e: *const ast.Expr) !i64 {
     return planErr(env.diag, "RANGE bounds must be integer literals or integer params");
 }
 
+/// How a SQL Server connection authenticates: a SQL login (default), an Azure AD
+/// token (`auth = 'aad'`), or Windows NTLMv2 (`auth = 'ntlm'`).
+const DbAuth = enum { sql, aad, ntlm };
+
 const DbConfig = struct {
     host: []const u8 = "",
     port: u16,
@@ -4023,14 +4028,15 @@ const DbConfig = struct {
     password: []const u8 = "",
     database: []const u8 = "",
     tls: sql.TlsMode = .off,
-    aad: bool = false,
+    auth: DbAuth = .sql,
+    domain: []const u8 = "",
     client_id: []const u8 = "",
     resource: []const u8 = "",
     token: []const u8 = "",
 };
 
-/// Open a SQL Server connection, using Azure AD (ROPC token -> FEDAUTH) when the
-/// connection declared `auth = aad`, else a normal SQL login.
+/// Open a SQL Server connection: Azure AD (ROPC token -> FEDAUTH) for `auth =
+/// aad`, Windows NTLMv2 (SSPI) for `auth = ntlm`, else a normal SQL login.
 fn tdsConnect(gpa: std.mem.Allocator, cfg_in: DbConfig) !*tds.Conn {
     var cfg = cfg_in;
     const hi = ssrp.splitHostInstance(cfg.host);
@@ -4038,8 +4044,9 @@ fn tdsConnect(gpa: std.mem.Allocator, cfg_in: DbConfig) !*tds.Conn {
         cfg.host = hi.host;
         if (!cfg.port_explicit) cfg.port = try ssrp.resolveInstancePort(gpa, hi.host, inst);
     }
-    if (!cfg.aad) return tds.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls);
+    if (cfg.auth == .sql) return tds.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls);
     const mode: sql.TlsMode = if (cfg.tls == .off) .require else cfg.tls;
+    if (cfg.auth == .ntlm) return tds.Conn.connectNtlm(gpa, cfg.host, cfg.port, ntlmCredential(cfg), cfg.database, mode);
     if (cfg.token.len > 0) return tds.Conn.connectAad(gpa, cfg.host, cfg.port, cfg.token, cfg.database, mode);
     const client_id = if (cfg.client_id.len > 0) cfg.client_id else aad.ado_client_id;
     var rbuf: ?[]u8 = null;
@@ -4053,10 +4060,23 @@ fn tdsConnect(gpa: std.mem.Allocator, cfg_in: DbConfig) !*tds.Conn {
     return tds.Conn.connectAad(gpa, cfg.host, cfg.port, token, cfg.database, mode);
 }
 
-/// One key-dispatch for the shared DB connection attributes. The two resolvers
-/// differ only in how attribute exprs become values (`f`): the run-time path
-/// (`resolveDbConfig`) evaluates strictly and errors via the diag; the offline
-/// path (`dbConfigOf`) is lenient — unresolvable values are skipped/defaulted.
+/// Split a Windows login into domain + user. `user = 'DOMAIN\me'` carries the
+/// domain inline; an explicit `domain` option wins when both are given, but the
+/// `DOMAIN\` prefix is stripped off the user name either way.
+fn ntlmCredential(cfg: DbConfig) ntlm.Credential {
+    var domain = cfg.domain;
+    var user = cfg.user;
+    if (std.mem.indexOfScalar(u8, user, '\\')) |i| {
+        if (domain.len == 0) domain = user[0..i];
+        user = user[i + 1 ..];
+    }
+    return .{ .domain = domain, .user = user, .password = cfg.password };
+}
+
+/// One key-dispatch for the shared DB connection attributes. `f` supplies the
+/// values: `resolveDbConfig` evaluates them strictly and reports through the
+/// diag. It is generic because a second, lenient fetcher used to exist for
+/// offline resolution; the seam is kept so one can return without moving this.
 fn parseDbConfig(conn: ast.Connection, default_port: u16, f: anytype) anyerror!DbConfig {
     var cfg = DbConfig{ .port = default_port };
     for (conn.config) |attr| {
@@ -4068,7 +4088,7 @@ fn parseDbConfig(conn: ast.Connection, default_port: u16, f: anytype) anyerror!D
             }
             continue;
         }
-        if (!eqlAny(k, &.{ "host", "user", "password", "database", "tls", "auth", "client_id", "resource", "token" })) continue;
+        if (!eqlAny(k, &.{ "host", "user", "password", "database", "tls", "auth", "domain", "client_id", "resource", "token" })) continue;
         const v = (try f.str(attr.value)) orelse continue;
         if (std.mem.eql(u8, k, "host")) {
             cfg.host = v;
@@ -4081,7 +4101,9 @@ fn parseDbConfig(conn: ast.Connection, default_port: u16, f: anytype) anyerror!D
         } else if (std.mem.eql(u8, k, "tls")) {
             cfg.tls = try f.tls(v);
         } else if (std.mem.eql(u8, k, "auth")) {
-            cfg.aad = std.mem.eql(u8, v, "aad");
+            cfg.auth = try f.auth(v);
+        } else if (std.mem.eql(u8, k, "domain")) {
+            cfg.domain = v;
         } else if (std.mem.eql(u8, k, "client_id")) {
             cfg.client_id = v;
         } else if (std.mem.eql(u8, k, "resource")) {
@@ -4108,28 +4130,16 @@ const EnvCfg = struct {
         return std.meta.stringToEnum(sql.TlsMode, v) orelse
             planErr(self.env.diag, "connection `tls` must be \"off\", \"require\" or \"insecure\"");
     }
-};
-
-/// Lenient fetcher for `parseDbConfig`: unresolvable or malformed values fall
-/// back to defaults instead of erroring (offline `check`, no run `Env`).
-const OfflineCfg = struct {
-    arena: std.mem.Allocator,
-    fn str(self: OfflineCfg, e: *const ast.Expr) !?[]const u8 {
-        return cfgStr(self.arena, e);
-    }
-    fn port(self: OfflineCfg, e: *const ast.Expr) !?u16 {
-        const v = cfgStr(self.arena, e) orelse return null;
-        return std.fmt.parseInt(u16, v, 10) catch null;
-    }
-    fn tls(self: OfflineCfg, v: []const u8) !sql.TlsMode {
-        _ = self;
-        return std.meta.stringToEnum(sql.TlsMode, v) orelse .off;
+    fn auth(self: EnvCfg, v: []const u8) !DbAuth {
+        return std.meta.stringToEnum(DbAuth, v) orelse
+            planErr(self.env.diag, "connection `auth` must be \"sql\", \"aad\" or \"ntlm\"");
     }
 };
 
 fn resolveDbConfig(env: *Env, conn: ast.Connection, default_port: u16) !DbConfig {
     const cfg = try parseDbConfig(conn, default_port, EnvCfg{ .env = env });
     if (cfg.host.len == 0) return planErr(env.diag, "connection needs a `host`");
+    if (cfg.auth == .ntlm and cfg.tls == .off) return planErr(env.diag, "connection `auth = 'ntlm'` requires an encrypted channel: set `tls = 'require'`, or `tls = 'insecure'` for a self-signed server certificate");
     return cfg;
 }
 
@@ -4222,14 +4232,6 @@ fn sqlConnInfo(conn: ast.Connection) ?SqlConnInfo {
     if (std.mem.eql(u8, conn.connector, "mysql")) return .{ .kind = .mysql, .dialect = .mysql, .port = 3306 };
     if (std.mem.eql(u8, conn.connector, "sqlserver")) return .{ .kind = .sqlserver, .dialect = .sqlserver, .port = 1433 };
     return null;
-}
-
-/// Resolve a connection's host/port/user/password/database (literals + env()/
-/// secret()), independent of the run `Env`. Returns null if `host` is missing.
-fn dbConfigOf(arena: std.mem.Allocator, conn: ast.Connection, default_port: u16) ?DbConfig {
-    const cfg = parseDbConfig(conn, default_port, OfflineCfg{ .arena = arena }) catch return null;
-    if (cfg.host.len == 0) return null;
-    return cfg;
 }
 
 fn cfgStr(arena: std.mem.Allocator, expr: *const ast.Expr) ?[]const u8 {
