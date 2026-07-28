@@ -235,6 +235,22 @@ else
   report "quoted-idents (run error)" bad
 fi
 
+# EXPLAIN ANALYZE must print a plan whatever the pipeline shape, and must move
+# no data. At the default -j it used to print nothing at all for an aggregate or
+# a LOAD — ten parallel paths, only three of which reported — so whether you got
+# output depended on the query. It also used to perform the load.
+printf 'g,v\na,10\na,20\nb,30\n' > "$out/ea.csv"
+rm -f "$out/ea_out.csv"
+ea_ok=1
+for q in "SELECT g, v FROM '$out/ea.csv' WHERE v > 5" "SELECT g, COUNT(*) AS n FROM '$out/ea.csv' GROUP BY g"; do
+  $B run -c "EXPLAIN ANALYZE $q;" >"$out/ea.log" 2>&1
+  grep -q "plan (actuals" "$out/ea.log" || { ea_ok=0; echo "  no plan for: $q"; }
+  grep -qE "^(a|b)  *[0-9]" "$out/ea.log" && { ea_ok=0; echo "  printed rows for: $q"; }
+done
+$B run -c "EXPLAIN ANALYZE LOAD INTO '$out/ea_out.csv' AS SELECT g, v FROM '$out/ea.csv';" >>"$out/ea.log" 2>&1
+[ -e "$out/ea_out.csv" ] && { ea_ok=0; echo "  EXPLAIN ANALYZE wrote the sink"; }
+if [ "$ea_ok" = 1 ]; then report explain-analyze-plan-only ok; else report "explain-analyze-plan-only" bad; fi
+
 # NTLM config surface. The handshake itself needs a domain-joined server, which
 # the mssql container is not — but the plan-time refusals need no server at all,
 # and they are what stops a misconfigured script from ever reaching the wire.

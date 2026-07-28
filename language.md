@@ -589,7 +589,7 @@ plan
   physical: serial (has breaker — materializes)
 
 $ basalt run -c "EXPLAIN ANALYZE SELECT g, COUNT(*) AS c FROM 'x.parquet' GROUP BY g;"
-plan (actuals — exclusive time)
+plan (actuals, exclusive time)
   aggregate      13.1ms          601 rows        2 batches
     scan          6.2ms       500000 rows        6 batches
 ```
@@ -598,9 +598,18 @@ A source whose schema only the source itself can describe — a database table, 
 remote object — reads `schema: unresolved`, said once at the scan rather than
 repeated down the tree. Neither form connects.
 
+`EXPLAIN ANALYZE` moves no data. The pipeline runs — that is where the numbers
+come from — but every sink is discarded: a terminal `SELECT` prints its plan
+instead of its rows, and a `LOAD` writes nothing, creates no table and commits
+no blob. A database can wrap an explained `INSERT` in `BEGIN ... ROLLBACK`; a
+load into a remote lake has no undo, so it is never performed.
+
+It also runs serially, whatever `-j` says, so the tree is one operator tree
+rather than a different report per parallel path. Read the timings as a serial
+profile: the row counts and the shape are exact, the durations are not what the
+same query costs at full parallelism.
+
 `EXPLAIN COSTS` is rejected at parse time — there is no cost model to report.
-Actuals cover the serial pipeline; a parallel run reports per lane and is not
-yet summed into one tree.
 
 ## 10. Running & exit codes
 

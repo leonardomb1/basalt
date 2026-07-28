@@ -476,7 +476,15 @@ fn buildStarrocksSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*Starrock
     return spec;
 }
 
-pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts: RunOptions, diag: *Diag) !Stats {
+pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions, diag: *Diag) !Stats {
+    // `EXPLAIN ANALYZE` runs serially. Ten parallel paths exist and each would
+    // have to report its own lane figures; the one operator tree is the useful
+    // artifact, and a plan is worthless if the shape of the pipeline decides
+    // whether anything prints at all. The timings are therefore a serial
+    // profile, which is what the tree has always claimed to be.
+    var opts = opts_in;
+    if (opts.explain) opts.threads = 1;
+
     var plan_arena = std.heap.ArenaAllocator.init(gpa);
     defer plan_arena.deinit();
     const arena = plan_arena.allocator();
