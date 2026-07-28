@@ -316,6 +316,12 @@ pub const Let = struct { name: []const u8, pipeline: Pipeline, pos: Pos };
 /// one expression and disappears during expansion.
 pub const LetConst = struct { name: []const u8, expr: *Expr, pos: Pos };
 
+/// `PRINT <expr>;` — a script-authored progress line. The expression is evaluated
+/// at plan time against the params, LETs and — inside a `FOR EACH` or statement
+/// function body — the loop variables bound for that row, then written to stderr
+/// through the run logger. Never stdout: that stream is the data contract.
+pub const Print = struct { expr: *Expr, pos: Pos };
+
 /// One declared parameter of a `CREATE FUNCTION`. `ty` is the optional declared
 /// type — checked at expansion against *literal* arguments only (nothing else is
 /// decidable there) and, for a statement-form function, used to coerce the
@@ -355,6 +361,17 @@ pub const FnDecl = struct {
 pub const CallStmt = struct {
     name: []const u8,
     args: []const *Expr,
+    pos: Pos,
+};
+
+/// `THROW <message> [WHEN <condition>];` — a script's own precondition, the half of
+/// validation the engine cannot infer. Both operands are ordinary expressions over
+/// PARAMs and LETs, so they are decidable at plan time: an absent or true condition
+/// aborts before a row is read, with `message` as the error text verbatim. A fired
+/// guard is permanent by construction — it is never classified as transient.
+pub const Throw = struct {
+    message: *Expr,
+    when: ?*Expr = null,
     pos: Pos,
 };
 
@@ -427,7 +444,9 @@ pub const Stmt = union(enum) {
     match: StmtMatch,
     func: FnDecl,
     let_const: LetConst,
+    print: Print,
     call: CallStmt,
+    throw: Throw,
 };
 
 /// `EXPLAIN` prefix on a program: print the plan instead of running it, or

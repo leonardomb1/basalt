@@ -235,6 +235,33 @@ else
   report "quoted-idents (run error)" bad
 fi
 
+# THROW guards the script's own invariants, which basalt cannot infer. It must
+# fire at plan time — so `check` rejects it, not just `run` — carry the author's
+# message verbatim, and be permanent (exit 1), never transient: a scheduler must
+# not retry a script that can never succeed.
+tp_ok=1
+TP="PARAM tbl STRING DEFAULT ''; THROW 'tbl is required' WHEN \$tbl IS EMPTY;
+LOAD INTO '$out/tp.csv' AS SELECT * FROM 'it/seed.csv';"
+if $B check -c "$TP" >"$out/tp.log" 2>&1; then tp_ok=0; echo "  check accepted a firing guard"; fi
+if ! grep -q "tbl is required" "$out/tp.log"; then tp_ok=0; echo "  message not verbatim"; fi
+tp_rc=0
+$B run -q -c "$TP" >"$out/tp2.log" 2>&1 || tp_rc=$?
+if [ "$tp_rc" != 1 ]; then tp_ok=0; echo "  run exit was $tp_rc, want 1 (75 would mean retryable)"; fi
+if ! $B check -c "$TP" -p tbl=SC5 >"$out/tp3.log" 2>&1; then tp_ok=0; echo "  -p did not satisfy the guard"; fi
+if [ "$tp_ok" = 1 ]; then report throw-guard ok; else report "throw-guard" bad; fi
+
+# PRINT is the script's own output, not a diagnostic: visible by default (no
+# --log-level needed), silenced by -q, and on stderr so --format json's stdout
+# contract stays parseable.
+pr_ok=1
+PR="PRINT 'hello from the script'; SELECT id FROM 'it/seed.csv';"
+$B run -c "$PR" 2>"$out/pr_err.log" >"$out/pr_out.log" || true
+if ! grep -q "hello from the script" "$out/pr_err.log"; then pr_ok=0; echo "  not visible by default"; fi
+if grep -q "hello from the script" "$out/pr_out.log"; then pr_ok=0; echo "  leaked onto stdout"; fi
+$B run -q -c "$PR" 2>"$out/pr_q.log" >/dev/null || true
+if grep -q "hello from the script" "$out/pr_q.log"; then pr_ok=0; echo "  -q did not silence it"; fi
+if [ "$pr_ok" = 1 ]; then report print-stmt ok; else report "print-stmt" bad; fi
+
 # EXPLAIN ANALYZE must print a plan whatever the pipeline shape, and must move
 # no data. At the default -j it used to print nothing at all for an aggregate or
 # a LOAD — ten parallel paths, only three of which reported — so whether you got

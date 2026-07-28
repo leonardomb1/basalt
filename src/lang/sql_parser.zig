@@ -295,12 +295,14 @@ pub const Parser = struct {
         if (self.isKw("create")) return self.parseCreate(out);
         if (self.isKw("param")) return out.append(.{ .param = try self.parseParam() });
         if (self.isKw("let")) return out.append(.{ .let_const = try self.parseLetStmt() });
+        if (self.isKw("print")) return out.append(.{ .print = try self.parsePrintStmt() });
         if (self.isKw("load")) return self.parseLoadInto(out);
         if (self.isKw("for")) return out.append(.{ .for_each = try self.parseForEach() });
         if (self.isKw("case")) return out.append(.{ .match = try self.parseCaseStmt() });
+        if (self.isKw("throw")) return out.append(.{ .throw = try self.parseThrowStmt() });
         if (self.isKw("call")) return out.append(.{ .call = try self.parseCallStmt() });
         if (self.isKw("with") or self.isKw("select")) return self.parseTerminalQuery(out);
-        return self.fail(self.curPos(), "expected a statement (CREATE / PARAM / LET / LOAD INTO / SELECT / FOR / CASE / CALL), found {s}", .{self.curTag().describe()});
+        return self.fail(self.curPos(), "expected a statement (CREATE / PARAM / LET / PRINT / THROW / LOAD INTO / SELECT / FOR / CASE / CALL), found {s}", .{self.curTag().describe()});
     }
 
     /// `LET name = <expr>;` — a script-scoped plan-time constant, referenced as
@@ -315,6 +317,17 @@ pub const Parser = struct {
         const expr = try self.parseExpr();
         _ = try self.expect(.semi);
         return .{ .name = name, .expr = expr, .pos = pos };
+    }
+
+    /// `PRINT <expr>;` — one progress line, evaluated where it stands. The argument
+    /// is an ordinary expression, so `||`, `$param` and the loop variables of an
+    /// enclosing `FOR EACH` / statement function body all work with no extra syntax.
+    fn parsePrintStmt(self: *Parser) Error!ast.Print {
+        const pos = self.curPos();
+        try self.expectKw("print");
+        const expr = try self.parseExpr();
+        _ = try self.expect(.semi);
+        return .{ .expr = expr, .pos = pos };
     }
 
     fn parseCreate(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
@@ -619,7 +632,7 @@ pub const Parser = struct {
     /// through a `FOR` / `CALL`); a leading statement `CASE` is not spellable here.
     fn atStmtBody(self: *Parser) bool {
         return self.isKw("load") or self.isKw("for") or self.isKw("call") or
-            self.isKw("select") or self.isKw("with");
+            self.isKw("print") or self.isKw("select") or self.isKw("with");
     }
 
     /// `name [TYPE] [DEFAULT <expr>]`. A bare name is untyped, exactly as before.
@@ -647,6 +660,18 @@ pub const Parser = struct {
         _ = try self.expect(.rparen);
         _ = try self.expect(.semi);
         return .{ .name = name, .args = try args.toOwnedSlice(), .pos = pos };
+    }
+
+    /// `THROW <message> [WHEN <condition>];` — both operands are ordinary
+    /// expressions, so `$param`, `LET`s and every scalar function are available.
+    /// `WHEN` is read greedily, which is what ends the message expression.
+    fn parseThrowStmt(self: *Parser) Error!ast.Throw {
+        const pos = self.curPos();
+        try self.expectKw("throw");
+        const message = try self.parseExpr();
+        const when: ?*ast.Expr = if (self.eatKw("when")) try self.parseExpr() else null;
+        _ = try self.expect(.semi);
+        return .{ .message = message, .when = when, .pos = pos };
     }
 
     fn parseParam(self: *Parser) Error!ast.Param {
@@ -2948,6 +2973,34 @@ test "sql: CREATE FUNCTION AS CASE stays the expression form" {
     try testing.expect(prog.stmts[1].func.body.expr.* == .match);
 }
 
+test "sql: THROW — bare, WHEN-guarded, and inside a CASE arm" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a,
+        \\PARAM tbl STRING DEFAULT '';
+        \\THROW 'tbl is required (e.g. -p tbl=SC5)' WHEN $tbl IS EMPTY;
+        \\THROW 'unreachable branch';
+        \\CASE WHEN $tbl = 'zz' THEN THROW 'no zz allowed'; END CASE;
+        \\SELECT 1 AS n FROM 'x.csv';
+    );
+
+    const guarded = prog.stmts[2].throw;
+    try testing.expectEqualStrings("tbl is required (e.g. -p tbl=SC5)", guarded.message.str_lit);
+    try testing.expect(guarded.when.?.* == .is_null);
+    try testing.expectEqual(ast.Expr.NullTest.is_empty, guarded.when.?.is_null.kind);
+    try testing.expect(!guarded.when.?.is_null.negated);
+
+    const bare = prog.stmts[3].throw;
+    try testing.expectEqualStrings("unreachable branch", bare.message.str_lit);
+    try testing.expect(bare.when == null);
+
+    const armed = prog.stmts[4].match.arms[0].body[0].throw;
+    try testing.expectEqualStrings("no zz allowed", armed.message.str_lit);
+    try testing.expect(armed.when == null);
+}
+
 test "sql: a non-DEFAULT parameter may not follow a defaulted one" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -3217,4 +3270,57 @@ test "sql: ANCHOR SCHEMA before PUSHDOWN parses the same" {
         if (std.mem.eql(u8, h.key, "where") or std.mem.eql(u8, h.key, "canon")) n += 1;
     }
     try testing.expectEqual(@as(usize, 2), n);
+}
+test "sql: PRINT takes a literal or a `||` chain over params" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a,
+        \\PARAM tbl STRING DEFAULT 'sc5';
+        \\PRINT 'starting';
+        \\PRINT 'loading ' || $tbl;
+        \\SELECT id FROM 'x.csv';
+    );
+    try testing.expectEqualStrings("starting", prog.stmts[2].print.expr.str_lit);
+
+    const cat = prog.stmts[3].print.expr;
+    try testing.expect(cat.* == .call);
+    try testing.expectEqualStrings("concat", cat.call.name);
+    try testing.expectEqualStrings("loading ", cat.call.args[0].str_lit);
+    try testing.expectEqualStrings("tbl", cat.call.args[1].field.last());
+}
+
+test "sql: PRINT is a statement inside a FOR EACH body and a statement function" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a,
+        \\CREATE FUNCTION note(msg) AS
+        \\  PRINT 'note: ' || $msg;
+        \\END;
+        \\FOR EACH ROW OF (SELECT name FROM 'catalog.csv') AS (name)
+        \\  PRINT 'company ' || $name;
+        \\  LOAD INTO 'out.csv' AS SELECT id FROM 'x.csv';
+        \\END FOR;
+    );
+    const note = prog.stmts[1].func;
+    try testing.expect(note.body == .stmts);
+    try testing.expect(note.body.stmts[0] == .print);
+
+    const fe = prog.stmts[2].for_each;
+    try testing.expectEqual(@as(usize, 2), fe.body.len);
+    try testing.expect(fe.body[0] == .print);
+    try testing.expectEqualStrings("name", fe.body[0].print.expr.call.args[1].field.last());
+    try testing.expect(fe.body[1] == .output);
+}
+
+test "sql: PRINT without an expression is a parse error" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a, "PRINT;\nSELECT id FROM 'x.csv';", &diag));
 }

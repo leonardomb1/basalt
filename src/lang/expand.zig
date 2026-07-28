@@ -85,7 +85,13 @@ fn expandStmt(cx: *Ctx, s: ast.Stmt) Error!ast.Stmt {
         },
         .match => |m| .{ .match = try expandStmtMatch(cx, m) },
         .let_const => |l| .{ .let_const = .{ .name = l.name, .expr = try expandExpr(cx, l.expr, null, 0), .pos = l.pos } },
+        .print => |p| .{ .print = .{ .expr = try expandExpr(cx, p.expr, null, 0), .pos = p.pos } },
         .call => |c| try expandCallStmt(cx, c),
+        .throw => |t| .{ .throw = .{
+            .message = try expandExpr(cx, t.message, null, 0),
+            .when = if (t.when) |w| try expandExpr(cx, w, null, 0) else null,
+            .pos = t.pos,
+        } },
         // Only the statement form reaches here (expandProgram drops the expression
         // form); its block is expanded so nested user fns / JSON params resolve.
         .func => |fd| .{ .func = .{

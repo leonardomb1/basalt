@@ -155,8 +155,24 @@ fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     const src = (try loadSource(a, "check", args, stderr)) orelse return 1;
     const prog = (try parseSrc(a, src, stderr)) orelse return 1;
 
+    var overrides = std.array_list.Managed(analyze.ParamOverride).init(a);
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        if (!std.mem.eql(u8, args[i], "-p") and !std.mem.eql(u8, args[i], "--param")) continue;
+        i += 1;
+        if (i >= args.len) {
+            try stderr.print("error: missing key=value after `-p`\n", .{});
+            return 2;
+        }
+        const eq = std.mem.indexOfScalar(u8, args[i], '=') orelse {
+            try stderr.print("error: param must be key=value, got `{s}`\n", .{args[i]});
+            return 2;
+        };
+        try overrides.append(.{ .name = args[i][0..eq], .value = args[i][eq + 1 ..] });
+    }
+
     var adiag = analyze.Diag{};
-    _ = analyze.analyze(a, prog, &adiag) catch |e| switch (e) {
+    _ = analyze.analyzeWith(a, prog, overrides.items, &adiag) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.AnalyzeFailed => {
             try stderr.print("{s}: error: {s}\n", .{ src.label, adiag.msg });

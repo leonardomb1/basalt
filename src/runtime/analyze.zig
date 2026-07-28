@@ -314,7 +314,44 @@ fn collectStmtOutputs(outputs: *std.array_list.Managed(ast.Pipeline), stmts: []c
     };
 }
 
+/// Decide one top-level `THROW` against the folded PARAM/LET values: substitute the
+/// bindings into both operands and const-fold them. Only a literal `true` fires (a
+/// null condition is not a failure, as in SQL), and when it does the script's own
+/// message becomes the diagnostic verbatim — so `basalt check` rejects exactly what
+/// a run would, before anything connects.
+fn checkThrow(arena: std.mem.Allocator, t: ast.Throw, params: *const ParamMap, diag: *Diag) Error!void {
+    if (t.when) |w| {
+        const c = eval.constEval(arena, try substExpr(arena, w, params), &.{}, &.{}) catch
+            return fail(diag, "THROW condition is not decidable at plan time", .{});
+        if (!(c == .bool and c.bool)) return;
+    }
+    const m = eval.constEval(arena, try substExpr(arena, t.message, params), &.{}, &.{}) catch
+        return fail(diag, "THROW message is not decidable at plan time", .{});
+    return fail(diag, "{s}", .{try eval.valueToString(arena, m)});
+}
+
+/// A `-p key=value` binding, so `check` decides a `THROW` guard against the same
+/// inputs the run would use instead of always against the declared defaults.
+pub const ParamOverride = struct { name: []const u8, value: []const u8 };
+
+/// The literal a CLI string stands for, typed by the PARAM's declared type.
+/// Anything not scalar keeps the declared default: `check` is offline, and a
+/// half-parsed JSON document would be a worse answer than the default.
+fn overrideExpr(arena: std.mem.Allocator, ty: types.Type, raw: []const u8) Error!?*const ast.Expr {
+    return switch (ty.kind) {
+        .int => mk(arena, .{ .int_lit = std.fmt.parseInt(i64, raw, 10) catch return null }),
+        .float => mk(arena, .{ .float_lit = std.fmt.parseFloat(f64, raw) catch return null }),
+        .bool => mk(arena, .{ .bool_lit = std.mem.eql(u8, raw, "true") }),
+        .string, .date, .time, .timestamp, .decimal, .bytes => mk(arena, .{ .str_lit = raw }),
+        else => null,
+    };
+}
+
 pub fn analyze(arena: std.mem.Allocator, raw_program: ast.Program, diag: *Diag) error{ AnalyzeFailed, OutOfMemory }!Plan {
+    return analyzeWith(arena, raw_program, &.{}, diag);
+}
+
+pub fn analyzeWith(arena: std.mem.Allocator, raw_program: ast.Program, cli: []const ParamOverride, diag: *Diag) error{ AnalyzeFailed, OutOfMemory }!Plan {
     var expand_msg: []const u8 = "";
     const program = expand.expandProgram(arena, raw_program, null, &expand_msg) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -334,7 +371,7 @@ pub fn analyze(arena: std.mem.Allocator, raw_program: ast.Program, diag: *Diag) 
         .for_each => |fe| try collectStmtOutputs(&outputs, fe.body),
         .match => |m| for (m.arms) |arm| try collectStmtOutputs(&outputs, arm.body),
         .func => |fd| if (fd.body == .stmts) try collectStmtOutputs(&outputs, fd.body.stmts),
-        .param, .kind, .call, .let_const => {},
+        .param, .kind, .call, .let_const, .throw, .print => {},
     };
     if (outputs.items.len == 0)
         return fail(diag, "no output pipeline (a pipeline ending in `write`)", .{});
@@ -342,7 +379,11 @@ pub fn analyze(arena: std.mem.Allocator, raw_program: ast.Program, diag: *Diag) 
     var params_map = ParamMap.init(arena);
     for (program.stmts) |s| if (s == .param) {
         const p = s.param;
-        try params_map.put(p.name, if (p.default) |d| d else try typedZero(arena, p.ty));
+        var bound: ?*const ast.Expr = null;
+        for (cli) |o| if (std.mem.eql(u8, o.name, p.name)) {
+            bound = try overrideExpr(arena, p.ty, o.value);
+        };
+        try params_map.put(p.name, bound orelse if (p.default) |d| d else try typedZero(arena, p.ty));
     };
     // Statement-level `LET`s bind exactly like params — a `$name` ref substitutes
     // the bound expression — but after every PARAM and in declaration order, so a
@@ -355,6 +396,9 @@ pub fn analyze(arena: std.mem.Allocator, raw_program: ast.Program, diag: *Diag) 
             return fail(diag, "`{s}` is declared twice: LET and PARAM share one name space", .{l.name});
         try params_map.put(l.name, try substExpr(arena, l.expr, &params_map));
     };
+    // Guards run against params and LETs only, before the body-var placeholders
+    // below can make a `$name` resolve to a stand-in the script never sees.
+    for (program.stmts) |s| if (s == .throw) try checkThrow(arena, s.throw, &params_map, diag);
     // Body-scoped variables (for-each loop vars, statement-fn params) bind per
     // row/call at run time; for checking, a typed placeholder (or unknown-typed
     // null) keeps `$var`-as-value expressions lenient instead of "unknown field".
@@ -1049,4 +1093,42 @@ test "check accepts a filter over a statement-level LET (and rejects a LET/PARAM
     var cdiag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, cprog, &cdiag));
     try std.testing.expect(std.mem.indexOf(u8, cdiag.msg, "declared twice") != null);
+}
+
+test "check rejects a script whose THROW guard fires, and passes one whose WHEN is false" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,amount\n1,100\n" });
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const in = try std.fs.path.join(a, &.{ base, "in.csv" });
+
+    const fires = try std.fmt.allocPrint(a,
+        \\PARAM tbl STRING DEFAULT '';
+        \\THROW 'tbl is required (e.g. -p tbl=SC5)' WHEN $tbl IS EMPTY;
+        \\LOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}';
+    , .{in});
+    var fdiag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, fires), &fdiag));
+    try std.testing.expectEqualStrings("tbl is required (e.g. -p tbl=SC5)", fdiag.msg);
+
+    const holds = try std.fmt.allocPrint(a,
+        \\PARAM tbl STRING DEFAULT 'SC5';
+        \\THROW 'tbl is required (e.g. -p tbl=SC5)' WHEN $tbl IS EMPTY;
+        \\LOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}';
+    , .{in});
+    var hdiag = Diag{};
+    const plan = try analyze(a, try parse(a, holds), &hdiag);
+    try std.testing.expectEqual(@as(usize, 1), plan.outputs.len);
+
+    const bare = try std.fmt.allocPrint(a,
+        \\LET tag = 'zz';
+        \\THROW 'unreachable branch: ' || $tag;
+        \\LOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}';
+    , .{in});
+    var bdiag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, bare), &bdiag));
+    try std.testing.expectEqualStrings("unreachable branch: zz", bdiag.msg);
 }

@@ -32,6 +32,7 @@ A script is a sequence of `;`-terminated statements:
 CREATE ENDPOINT '/x' DOC '...';   -- only for HTTP mode; absent = batch
 PARAM ...;                        -- request/CLI inputs
 LET name = <expr>;                -- sealed plan-time constant (§2)
+THROW 'msg' WHEN <condition>;     -- fail the plan on the script's own invariant
 CREATE CONNECTION ...;            -- named data endpoints
 CREATE FUNCTION f(a) AS <expr>;   -- scalar functions (inlined at plan time)
 CREATE FUNCTION p(a) AS ... END;  -- statement functions, invoked with CALL (§9)
@@ -40,12 +41,27 @@ LOAD INTO ... AS <query>;         -- output pipeline(s)
 CALL p('x');                      -- run a statement function
 FOR EACH ROW OF (...) ... END FOR;
 CASE ... END CASE;                -- plan-time dispatch
+PRINT <expr>;                     -- progress line on stderr, via the run log
 ```
 
 `@include` splices another script's declarations ahead of this one at plan
 time: each included file is parsed separately (errors report the included
 file's own path and line), includes may nest (depth 16, cycles rejected), and
 paths resolve relative to the including file.
+
+`THROW <message> [WHEN <condition>];` asserts what the engine cannot infer.
+Both operands are ordinary expressions over `$params` and `$lets` (§9), so they
+are decided at plan time: an absent or true condition aborts the script before a
+row is read, with `message` as the error text verbatim; a false condition is a
+no-op. `basalt check` rejects a script whose guard fires, so a bad invocation is
+caught without connecting to anything. A fired guard is permanent, never
+transient — exit `1`, never `75` (§10), so a scheduler will not retry it.
+
+```sql
+THROW 'tbl is required (e.g. -p tbl=SC5)' WHEN $tbl IS EMPTY;
+THROW 'since must be an ISO date' WHEN $since <> '' AND length($since) < 10;
+THROW 'unreachable branch';       -- unconditional, e.g. in a CASE arm
+```
 
 - **Batch is the silent default.** A script with no `CREATE ENDPOINT` runs once
   to completion (exit codes in §10).
@@ -62,6 +78,18 @@ paths resolve relative to the including file.
   interpolation of loop vars still applies within them (§7).
 - **Dynamic names** (per-row table/sink names, keys) use `$var` +
   `IDENTIFIER()` + `||`, not raw string interpolation — see §7.
+
+**`PRINT <expr>;`** emits one progress line where it stands — the way a long
+`FOR EACH` or `CALL` says what it is doing. The argument is an ordinary
+expression (literals, `||`, `$params`, `$lets`, and inside a `FOR EACH` or
+statement-function body the loop variables, bound per row); non-strings render
+as they would in a sink. It writes to **stderr through the run log at `info`**,
+never stdout — stdout is the data contract (`--format json` NDJSON rows or the
+summary object), and a progress line there would corrupt it. So `PRINT`
+inherits the log settings: `--log-format json` carries the text as the `msg`
+field of an NDJSON line, and the default level is `warn`, so a `PRINT` only
+appears under `--log-level info` (or `debug`); `-q` silences it. `PRINT` is not
+an output pipeline — a script still needs a `LOAD INTO` or a terminal query.
 
 ## 2. Parameters
 

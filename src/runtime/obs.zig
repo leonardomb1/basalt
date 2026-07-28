@@ -59,6 +59,8 @@ pub const Logger = struct {
     json: bool,
     min: Level,
     run_id: u64,
+    /// `-q`: silences `PRINT` too, which no log level does.
+    quiet: bool = false,
     mutex: std.Thread.Mutex = .{},
 
     pub fn init(run_id: u64, format: Format, min: Level) Logger {
@@ -68,6 +70,26 @@ pub const Logger = struct {
 
     pub fn enabled(self: *Logger, level: Level) bool {
         return @intFromEnum(level) <= @intFromEnum(self.min);
+    }
+
+    /// A line the script itself asked for (`PRINT`). It is output, not a
+    /// diagnostic, so `--log-level` does not gate it and it carries no severity
+    /// prefix — only `-q` silences it. Still stderr: stdout stays the data
+    /// channel that `--format json` makes a parseable contract.
+    pub fn script(self: *Logger, msg: []const u8) void {
+        if (self.quiet) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var lbuf: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&lbuf);
+        if (self.json) {
+            w.print("{{\"ts\":{d},\"level\":\"print\",\"run_id\":{d},\"msg\":\"", .{ std.time.milliTimestamp(), self.run_id }) catch return;
+            writeEscaped(&w, msg) catch return;
+            w.writeAll("\"}\n") catch return;
+        } else {
+            w.print("{s}\n", .{msg}) catch return;
+        }
+        self.file.writeAll(w.buffered()) catch return;
     }
 
     /// Render the end-of-run summary to stderr in the logger's format (human block

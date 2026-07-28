@@ -529,14 +529,16 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         .binding => |b| try bindings.put(b.name, b.pipeline),
         .connection => |c| try connections.put(c.name, c),
         .func => |fd| try fns.put(fd.name, fd),
+        .print => {},
         .output, .for_each, .match, .call => runnable += 1,
-        .param, .kind, .let_const => {},
+        .param, .kind, .let_const, .throw => {},
     };
     if (runnable == 0)
         return planErr(diag, "no output pipeline (a pipeline ending in `write`)");
 
     const run_id: u64 = @intCast(std.time.milliTimestamp());
     var logger = obs.Logger.init(run_id, opts.log.format, if (opts.log.quiet) .err else opts.log.level);
+    logger.quiet = opts.log.quiet;
     const t0 = std.time.milliTimestamp();
     var rows_read = std.atomic.Value(u64).init(0);
 
@@ -559,7 +561,9 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         .output => |p| try runOutput(&env, p, opts, &stats, &lanes_used, &batch_arena),
         .for_each => |fe| try runForEach(&env, fe, opts, &stats, &lanes_used, &batch_arena),
         .match => |m| try runStmtMatch(&env, m, opts, &stats, &lanes_used, &batch_arena),
+        .print => |p| try runPrint(&env, p, no_loop_vars),
         .call => |c| try runCall(&env, c, no_loop_vars, opts, &stats, &lanes_used, &batch_arena),
+        .throw => |t| try runThrow(&env, t, no_loop_vars),
         else => {},
     };
     for (sources.items) |sc| sc.close();
@@ -654,7 +658,9 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
         .output => |p| try runOutput(env, p, opts, stats, lanes_used, batch_arena),
         .for_each => |fe| try runForEach(env, fe, opts, stats, lanes_used, batch_arena),
         .match => |mm| try runStmtMatch(env, mm, opts, stats, lanes_used, batch_arena),
+        .print => |p| try runPrint(env, p, no_loop_vars),
         .call => |c| try runCall(env, c, no_loop_vars, opts, stats, lanes_used, batch_arena),
+        .throw => |t| try runThrow(env, t, no_loop_vars),
         .binding => |b| try env.bindings.put(b.name, b.pipeline),
         .connection => |c| try env.connections.put(c.name, c),
         // A LET is folded once, before anything runs; one nested in a branch would
@@ -3094,8 +3100,10 @@ fn runForStmt(env: *Env, s: *const ast.Stmt, lr: LoopRow, opts: RunOptions, stat
             try runOutput(env, pipe, opts, stats, lanes_used, batch_arena);
         },
         .match => |m| try runForMatch(env, m, lr, opts, stats, lanes_used, batch_arena),
+        .print => |p| try runPrint(env, p, lr),
         .call => |c| try runCall(env, c, lr, opts, stats, lanes_used, batch_arena),
-        else => return planErr(env.diag, "a `for` or statement-function body may contain only pipelines, `CASE` and `CALL` statements"),
+        .throw => |t| try runThrow(env, t, lr),
+        else => return planErr(env.diag, "a `for` or statement-function body may contain only pipelines, `CASE`, `CALL`, `PRINT` and `THROW` statements"),
     }
 }
 
@@ -3156,6 +3164,65 @@ fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, stats: 
     env.call_depth += 1;
     defer env.call_depth -= 1;
     try runForBody(env, body, .{ .names = pnames, .types = ptypes, .cells = cells }, opts, stats, lanes_used, batch_arena);
+}
+
+/// `THROW 'msg' [WHEN cond];` — the script's own precondition. Both operands fold
+/// against the loop variables in scope (they shadow same-named params, as in
+/// `runCall`) and then the resolved params; only a `true` condition fires, and an
+/// absent one always does. The message becomes the run's error text unchanged.
+/// A fired guard is permanent — `retryable` is cleared so no scheduler retries it.
+/// Render a `PRINT` argument to its output text. The loop variables in scope come
+/// first so they shadow a same-named param, matching `runForMatch` and `runCall`;
+/// the result is formatted by the same helper that turns a cell into text
+/// everywhere else, so a non-string renders exactly as it would in a sink.
+fn printText(arena: std.mem.Allocator, e: *const ast.Expr, lr: LoopRow, params: *std.StringHashMap(Value)) ![]const u8 {
+    var names = std.array_list.Managed([]const u8).init(arena);
+    var values = std.array_list.Managed(Value).init(arena);
+    for (lr.names, lr.cells, 0..) |nm, cell, i| {
+        try names.append(nm);
+        try values.append(loopValue(arena, cell, lr.typeAt(i)));
+    }
+    var it = params.iterator();
+    while (it.next()) |kv| {
+        try names.append(kv.key_ptr.*);
+        try values.append(kv.value_ptr.*);
+    }
+    return eval.valueToString(arena, try eval.constEval(arena, e, names.items, values.items));
+}
+
+/// `PRINT <expr>;` — a script's own progress line. It goes to stderr through the
+/// run logger at `info`, so it inherits the level filter, `--log-format json` and
+/// the mutex that keeps parallel lanes from interleaving; stdout stays reserved
+/// for data (`--format json` NDJSON rows or the run summary object).
+fn runPrint(env: *Env, p: ast.Print, lr: LoopRow) anyerror!void {
+    const text = printText(env.arena, p.expr, lr, env.params) catch |e|
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "PRINT: {s}", .{@errorName(e)}));
+    env.log.script(text);
+}
+
+
+fn runThrow(env: *Env, t: ast.Throw, outer: LoopRow) anyerror!void {
+    var names = std.array_list.Managed([]const u8).init(env.arena);
+    var values = std.array_list.Managed(Value).init(env.arena);
+    for (outer.names, outer.cells, 0..) |nm, cell, i| {
+        try names.append(nm);
+        try values.append(loopValue(env.arena, cell, outer.typeAt(i)));
+    }
+    var it = env.params.iterator();
+    while (it.next()) |kv| {
+        try names.append(kv.key_ptr.*);
+        try values.append(kv.value_ptr.*);
+    }
+
+    if (t.when) |w| {
+        const c = eval.constEval(env.arena, w, names.items, values.items) catch |e|
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "THROW condition: {s}", .{@errorName(e)}));
+        if (!(c == .bool and c.bool)) return;
+    }
+    const m = eval.constEval(env.arena, t.message, names.items, values.items) catch |e|
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "THROW message: {s}", .{@errorName(e)}));
+    env.diag.retryable = false;
+    return planErr(env.diag, try eval.valueToString(env.arena, m));
 }
 
 /// A `match` evaluated per row of a `for`: the loop variables are bound (shadowing
@@ -5870,4 +5937,140 @@ test "CALL nesting is depth-guarded (mutual recursion)" {
     var rdiag: Diag = .{};
     try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "too deep") != null);
+}
+
+test "THROW: a fired guard is the verbatim, permanent error; a false WHEN is a no-op" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n1\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+
+    const guarded = try std.fmt.allocPrint(alloc,
+        \\PARAM tbl STRING DEFAULT '';
+        \\THROW 'tbl is required (e.g. -p tbl=SC5)' WHEN $tbl IS EMPTY;
+        \\LOAD INTO '{s}/out.csv' AS SELECT id FROM '{s}/in.csv';
+    , .{ base, base });
+    defer alloc.free(guarded);
+    const gprog = try parser.parseSource(parena.allocator(), guarded, &pdiag);
+
+    var gdiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, run(alloc, gprog, .{}, &gdiag));
+    try std.testing.expectEqualStrings("tbl is required (e.g. -p tbl=SC5)", gdiag.msg);
+    try std.testing.expect(!gdiag.retryable);
+    try std.testing.expect(!isTransient(error.PlanFailed));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20));
+
+    var okdiag: Diag = .{};
+    _ = try run(alloc, gprog, .{ .params = &[_]ParamArg{.{ .key = "tbl", .val = "SC5" }} }, &okdiag);
+    const wrote = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
+    defer alloc.free(wrote);
+    try std.testing.expect(std.mem.indexOf(u8, wrote, "id") != null);
+
+    const bare = try std.fmt.allocPrint(alloc,
+        \\LET tag = 'zz';
+        \\THROW 'unreachable branch: ' || $tag;
+        \\LOAD INTO '{s}/never.csv' AS SELECT id FROM '{s}/in.csv';
+    , .{ base, base });
+    defer alloc.free(bare);
+    const bprog = try parser.parseSource(parena.allocator(), bare, &pdiag);
+
+    var bdiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, run(alloc, bprog, .{}, &bdiag));
+    try std.testing.expectEqualStrings("unreachable branch: zz", bdiag.msg);
+    try std.testing.expect(!bdiag.retryable);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(alloc, "never.csv", 1 << 20));
+}
+
+test "PRINT renders literals, `||` over params, and a loop variable" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var params = std.StringHashMap(Value).init(a);
+    try params.put("since", .{ .string = "2024-01-01" });
+    try params.put("n", .{ .int = 7 });
+
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const lit = try parser.parseExprStr(a, "'loading'", &pdiag);
+    try std.testing.expectEqualStrings("loading", try printText(a, lit, no_loop_vars, &params));
+
+    const cat = try parser.parseExprStr(a, "'since ' || $since", &pdiag);
+    try std.testing.expectEqualStrings("since 2024-01-01", try printText(a, cat, no_loop_vars, &params));
+
+    const num = try parser.parseExprStr(a, "$n", &pdiag);
+    try std.testing.expectEqualStrings("7", try printText(a, num, no_loop_vars, &params));
+
+    const lr = LoopRow{ .names = &[_][]const u8{"name"}, .cells = &[_][]const u8{"acme"} };
+    const row = try parser.parseExprStr(a, "'company ' || $name", &pdiag);
+    try std.testing.expectEqualStrings("company acme", try printText(a, row, lr, &params));
+}
+
+test "PRINT runs at the top level and per row inside a FOR EACH body" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "names.csv", .data = "name\nalpha\nbeta\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "alpha.csv", .data = "id,v\n1,10\n2,20\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "beta.csv", .data = "id,v\n3,30\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "PARAM tag STRING DEFAULT 'nightly';\n" ++
+            "PRINT 'run ' || $tag;\n" ++
+            "FOR EACH ROW OF ('{s}/names.csv') AS (name)\n" ++
+            "  PRINT 'company ' || $name;\n" ++
+            "  LOAD INTO '{s}/out_${{name}}.csv' AS SELECT id, v FROM '{s}/${{name}}.csv';\n" ++
+            "END FOR;",
+        .{ base, base, base },
+    );
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+
+    var rdiag: Diag = .{};
+    const stats = run(alloc, prog, .{}, &rdiag) catch |e| {
+        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+        return e;
+    };
+    try std.testing.expectEqual(@as(u64, 3), stats.rows_out);
+
+    const a = try tmp.dir.readFileAlloc(alloc, "out_alpha.csv", 1 << 20);
+    defer alloc.free(a);
+    try std.testing.expectEqualStrings("id,v\n1,10\n2,20\n", a);
+}
+
+test "PRINT over an unbound name is a plan error, not a silent blank" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n1\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "PRINT 'x ' || $nope;\nLOAD INTO '{s}/a.csv' AS SELECT id FROM '{s}/in.csv';",
+        .{ base, base },
+    );
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
+    try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "PRINT:") != null);
 }
