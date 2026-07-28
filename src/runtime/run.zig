@@ -1932,7 +1932,7 @@ fn joinKindLaneSafe(kind: ast.JoinKind) bool {
 /// turns the single `lk`/`rk` index into an array; accepting both spellings and both
 /// arities keeps this path building against either snapshot.
 fn planKeys(a: std.mem.Allocator, jp: analyze.JoinPlan, comptime which: []const u8) ![]const usize {
-    const name: []const u8 = comptime if (@hasField(analyze.JoinPlan, which)) which else if (std.mem.eql(u8, which, "lk")) "left_keys" else "right_keys";
+    const name: []const u8 = comptime if (@hasField(analyze.JoinPlan, which)) which else if (std.mem.eql(u8, which, "lk")) "lks" else "rks";
     const v = @field(jp, name);
     return if (@TypeOf(v) == usize) try a.dupe(usize, &[_]usize{v}) else v;
 }

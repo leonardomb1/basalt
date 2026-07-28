@@ -305,12 +305,22 @@ WHERE downloads > 0;
 | `LIMIT n [OFFSET m]` | limit |
 | `SELECT DISTINCT` / `DISTINCT ON (a, b)` | distinct |
 | `CROSS JOIN UNNEST(SPLIT(tags, ',')) AS tag` | explode (also `UNNEST(col)`) |
-| `[INNER\|LEFT\|RIGHT\|FULL\|CROSS\|SEMI\|ANTI] JOIN <cte> x ON a = b` | join (right side must be a CTE) |
+| `[INNER\|LEFT\|RIGHT\|FULL\|CROSS\|SEMI\|ANTI] JOIN <cte> x ON a = b [AND c = d ...]` | join (right side must be a CTE) |
 
 Row order without `ORDER BY` is not defined: `GROUP BY` returns groups in
 hash-partition order, and `DISTINCT` and map pipelines reorder under `-j > 1`
 (which is the default, since `-j` defaults to the core count). Add `ORDER BY`
 whenever the order matters.
+
+Joins are hash equi-joins: the CTE (right) side is materialized and indexed
+once, the left side streams through. Keys are plain columns (compute
+expressions in the CTE or a select first), `AND`-combined for composite keys;
+pairs may be written in either order, and a null key never matches. `CROSS
+JOIN <cte>` takes no `ON`. Right-side columns that collide with a left name
+come back suffixed `_r`. A pipeline shaped `read | filters | join | filters |
+write` over a local CSV/Parquet source probes in parallel under `-j` (right
+and full joins stay serial). The build side is capped at 1 GiB — filter the
+CTE or flip the join past that.
 
 Table aliases (`FROM t a`, `JOIN c b`) are stripped at parse time — the engine
 sees bare column names.
