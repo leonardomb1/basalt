@@ -229,6 +229,21 @@ const Env = struct {
     wrote_sink: bool = false,
     /// `--format json`: stdout sinks emit NDJSON rows instead of the table.
     stdout_json: bool = false,
+    /// `EXPLAIN ANALYZE`: run the pipeline for its actuals, write nothing.
+    explain: bool = false,
+};
+
+/// Drains every batch and keeps none: the rows must still be pulled for the
+/// measured counts to be real.
+const DiscardSink = struct {
+    fn writeBatch(_: *anyopaque, _: std.mem.Allocator, _: batchmod.Batch) anyerror!void {}
+    fn close(_: *anyopaque) anyerror!void {}
+    fn abort(_: *anyopaque) void {}
+    const vtable = driver.Sink.VTable{ .writeBatch = writeBatch, .close = close, .abort = abort };
+    var unit: u8 = 0;
+    fn sink() driver.Sink {
+        return .{ .ptr = &unit, .vtable = &vtable };
+    }
 };
 
 const PipeRes = struct { op: op.Op, schema: types.Schema };
@@ -525,7 +540,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts: RunOptions, d
     for (program.stmts) |s| {
         if (s == .kind) buffer_decl = s.kind.buffer;
     }
-    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .buffer_decl = buffer_decl, .buffer_segment = opts.buffer_segment, .load_label_prefix = opts.load_label_prefix, .load_run_id = opts.load_run_id, .stdout_json = opts.stdout_json, .fns = &fns };
+    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .buffer_decl = buffer_decl, .buffer_segment = opts.buffer_segment, .load_label_prefix = opts.load_label_prefix, .load_run_id = opts.load_run_id, .stdout_json = opts.stdout_json, .explain = opts.explain, .fns = &fns };
 
     var batch_arena = std.heap.ArenaAllocator.init(gpa);
     defer batch_arena.deinit();
@@ -651,7 +666,7 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     const last = stages[stages.len - 1].node;
     if (last != .write) return planErr(env.diag, "a top-level pipeline must end in `write`");
     env.sink_name = sinkLabel(env, last.write);
-    if (!std.mem.eql(u8, last.write.connector, "stdout")) env.wrote_sink = true;
+    if (!env.explain and !std.mem.eql(u8, last.write.connector, "stdout")) env.wrote_sink = true;
 
     if (stages[0].node == .read) implicit: {
         const rd = stages[0].node.read;
@@ -4290,6 +4305,7 @@ fn fileWriteMode(env: *Env, w: ast.Write) !driver.FileMode {
 }
 
 fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
+    if (env.explain) return DiscardSink.sink();
     if (std.mem.eql(u8, w.connector, "stdout")) {
         if (env.stdout_json) {
             const writer = tablemod.JsonWriter.open(env.gpa, schema) catch

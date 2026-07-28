@@ -413,6 +413,29 @@ pub const Parser = struct {
     /// `concat(...)` / `||` chain becomes literal text spliced with `${expr}`
     /// holes; a bare string literal stays literal (no hole); anything else is
     /// one `${expr}` hole re-parsed and evaluated per row.
+    /// The trailing clauses a union accepts, in either order: `PUSHDOWN(<expr>)`
+    /// — one raw predicate descended into *every* branch's source query, the
+    /// same `where` hint a plain read produces — and `ANCHOR SCHEMA <table>`,
+    /// naming the branch whose columns are the reconciliation authority.
+    fn parseUnionClauses(self: *Parser, hints: *std.array_list.Managed(ast.Hint), pos: Pos) Error!void {
+        while (true) {
+            if (self.eatKw("pushdown")) {
+                _ = try self.expect(.lparen);
+                const e = try self.parseExpr();
+                _ = try self.expect(.rparen);
+                const frag = try self.exprToTemplate(e);
+                // An empty predicate is no predicate: `PUSHDOWN($f)` with `f`
+                // unset reads the whole table rather than emitting `WHERE `.
+                if (frag.len > 0)
+                    try hints.append(.{ .key = "where", .value = .{ .str = frag }, .pos = pos });
+            } else if (self.eatKw("anchor")) {
+                try self.expectKw("schema");
+                const q = try self.parseQualNameTok();
+                try hints.append(.{ .key = "canon", .value = .{ .ident = q.last() }, .pos = pos });
+            } else break;
+        }
+    }
+
     fn exprToTemplate(self: *Parser, e: *const ast.Expr) Error![]const u8 {
         var buf = std.array_list.Managed(u8).init(self.arena);
         try self.templatePart(&buf, e);
@@ -1401,11 +1424,7 @@ pub const Parser = struct {
         var hints = std.array_list.Managed(ast.Hint).init(self.arena);
         if (tag_col) |tc|
             try hints.append(.{ .key = "tag", .value = .{ .ident = tc }, .pos = pos });
-        if (self.eatKw("anchor")) {
-            try self.expectKw("schema");
-            const q = try self.parseQualNameTok();
-            try hints.append(.{ .key = "canon", .value = .{ .ident = q.last() }, .pos = pos });
-        }
+        try self.parseUnionClauses(&hints, pos);
 
         try stages.append(.{
             .node = .{ .union_ = .{ .branches = try branches.toOwnedSlice(), .pos = pos } },
@@ -1586,11 +1605,7 @@ pub const Parser = struct {
             }
             _ = try self.expect(.rparen);
         }
-        if (self.eatKw("anchor")) {
-            try self.expectKw("schema");
-            const q = try self.parseQualNameTok();
-            try hints.append(.{ .key = "canon", .value = .{ .ident = q.last() }, .pos = pos });
-        }
+        try self.parseUnionClauses(hints, pos);
         return .{ .union_ = u };
     }
 
@@ -3150,4 +3165,56 @@ test "sql: an empty quoted name is a lex error, not an empty column" {
 
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT \"\" FROM 'x.csv';", &diag));
+}
+
+// §6 documents `PUSHDOWN(...)` on a discovered union — one raw predicate
+// descended into every branch — but no clause was ever parsed there, so the
+// documented example was a syntax error. The runtime already applied a `where`
+// hint to each branch; only the spelling was missing.
+test "sql: PUSHDOWN on a discovered union becomes a per-branch where hint" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a,
+        \\CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'h', database = 'd');
+        \\SELECT * FROM EACH TABLE OF (erp.QUERY($$SELECT name, x FROM sys.tables$$))
+        \\  AS (table_name, EMPRESA)
+        \\  PUSHDOWN($$D_E_L_E_T_ <> '*'$$)
+        \\  ANCHOR SCHEMA SC5010;
+    );
+    const st = firstPipelineStages(prog);
+    var saw_where = false;
+    var saw_canon = false;
+    for (st[0].hints) |h| {
+        if (std.mem.eql(u8, h.key, "where")) {
+            saw_where = true;
+            try testing.expectEqualStrings("D_E_L_E_T_ <> '*'", h.value.str);
+        }
+        if (std.mem.eql(u8, h.key, "canon")) saw_canon = true;
+    }
+    try testing.expect(saw_where);
+    try testing.expect(saw_canon);
+}
+
+// The two clauses are order-independent, so a script that names the anchor
+// first is not a syntax error.
+test "sql: ANCHOR SCHEMA before PUSHDOWN parses the same" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a,
+        \\CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'h', database = 'd');
+        \\SELECT * FROM EACH TABLE OF (erp.QUERY($$SELECT name, x FROM sys.tables$$))
+        \\  AS (table_name, EMPRESA)
+        \\  ANCHOR SCHEMA SC5010
+        \\  PUSHDOWN($$1 = 1$$);
+    );
+    const st = firstPipelineStages(prog);
+    var n: usize = 0;
+    for (st[0].hints) |h| {
+        if (std.mem.eql(u8, h.key, "where") or std.mem.eql(u8, h.key, "canon")) n += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), n);
 }
