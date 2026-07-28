@@ -215,7 +215,9 @@ const Env = struct {
     buffer_segment: ?u64 = null,
     load_label_prefix: ?[]const u8 = null,
     load_run_id: ?u64 = null,
-    /// Set by `openSource` to the leading SQL source of the pipeline being built.
+    /// Set by `openSource` to the SQL source of the pipeline being built — the LAST
+    /// one opened, so a join whose build side reads SQL leaves this describing the
+    /// binding, not the probe read (`sqlDescForStage` re-derives one read's own).
     sql_desc: ?SqlDesc = null,
     /// Connector types of the first source/sink, for the run summary.
     src_name: []const u8 = "",
@@ -755,6 +757,10 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
         if (stages[0].node == .read) {
             if (classifyAggPipeline(stages)) |shape| {
                 if (try runParallelSqlAgg(env, stages, shape.prefix, shape.ag, shape.tail, wr, opts, stats, lanes_used, src_base)) return;
+            } else if (classifyMapJoinPipeline(stages)) |js| {
+                // A join is not linearizable, so the map split path below never sees
+                // this shape — it fans out over the same key ranges from here instead.
+                if (try runParallelSqlMapJoin(env, stages, js, wr, opts, stats, lanes_used, src_base)) return;
             }
         }
         if (try op.linearize(arena, res.op)) |lin| {
@@ -2015,6 +2021,172 @@ fn buildLaneJoinChain(ta: std.mem.Allocator, params: *std.StringHashMap(*const a
         .state = ta,
     };
     return buildChainFrom(ta, params, lj.suffix, .{ .join = j }, lj.out_schema.*);
+}
+
+/// One lane of a split-parallel SQL map+join. Everything here is either read-only
+/// for the fan-out (the split recipe, the shared build index, the stage lists) or
+/// atomic/mutex-guarded (`queue`, `rows_out`, the shared sink).
+const SqlMapJoinCtx = struct {
+    split: SplitCtx,
+    predicates: []const []const u8,
+    src_schema: *const types.Schema,
+    prefix: []const ast.Stage,
+    join: LaneJoin,
+    params: *std.StringHashMap(*const ast.Expr),
+    queue: WorkQueue,
+    sink_mode: parallel.SinkMode,
+    sink_mtx: std.Thread.Mutex = .{},
+    rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    rows_read: *std.atomic.Value(u64),
+};
+
+/// A lane's probe source: one key-range query at a time, rolling to the next split
+/// when the current one runs dry. Stealing inside the source is what lets a lane
+/// build its operator chain — and open its sink — once however many splits it takes,
+/// the same deal `parallel.run` gives the map-only split path.
+const SplitSource = struct {
+    ctx: *SqlMapJoinCtx,
+    gpa: std.mem.Allocator,
+    cur: ?driver.Source = null,
+
+    fn schemaFn(ptr: *anyopaque) types.Schema {
+        const self: *SplitSource = @ptrCast(@alignCast(ptr));
+        return self.ctx.src_schema.*;
+    }
+    fn nextFn(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?batchmod.Batch {
+        const self: *SplitSource = @ptrCast(@alignCast(ptr));
+        while (true) {
+            if (self.cur) |src| {
+                if (try src.next(arena)) |b| return b;
+                src.close();
+                self.cur = null;
+            }
+            if (self.ctx.queue.failed.load(.seq_cst)) return null;
+            const i = self.ctx.queue.next.fetchAdd(1, .seq_cst);
+            if (i >= self.ctx.queue.nitems) return null;
+            const q = try splitmod.wrapProjected(self.gpa, self.ctx.split.base_sql, self.ctx.split.proj_select, self.ctx.predicates[i], self.ctx.split.where_extra);
+            defer self.gpa.free(q);
+            self.cur = try openSqlQuery(&self.ctx.split, self.gpa, q);
+        }
+    }
+    fn closeFn(ptr: *anyopaque) void {
+        const self: *SplitSource = @ptrCast(@alignCast(ptr));
+        if (self.cur) |src| src.close();
+        self.cur = null;
+    }
+    const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
+};
+
+fn sqlMapJoinLane(ctx: *SqlMapJoinCtx, lane_idx: usize) void {
+    sqlMapJoinLaneRun(ctx, lane_idx) catch |e| ctx.queue.fail(e);
+}
+
+fn sqlMapJoinLaneRun(ctx: *SqlMapJoinCtx, lane_idx: usize) !void {
+    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
+    defer _ = wgpa.deinit();
+    const wa = wgpa.allocator();
+    var warena = std.heap.ArenaAllocator.init(wa);
+    defer warena.deinit();
+    var batch_arena = std.heap.ArenaAllocator.init(wa);
+    defer batch_arena.deinit();
+
+    const own_sink: ?driver.Sink = switch (ctx.sink_mode) {
+        .shared => null,
+        .per_lane => |pl| try pl.open(pl.ctx, wa, lane_idx),
+    };
+    var own_sink_open = own_sink != null;
+    defer if (own_sink) |sk| {
+        if (own_sink_open) sk.abort();
+    };
+
+    var ss = SplitSource{ .ctx = ctx, .gpa = wa };
+    defer SplitSource.closeFn(&ss);
+    var cs = obs.CountingSource{ .inner = .{ .ptr = &ss, .vtable = &SplitSource.vtable }, .count = ctx.rows_read };
+    var scan = op.Scan{ .src = cs.source() };
+    const probe = try buildMapChain(warena.allocator(), ctx.params, ctx.prefix, &scan, ctx.src_schema);
+    const chain = try buildLaneJoinChain(warena.allocator(), ctx.params, ctx.join, probe);
+
+    var out: u64 = 0;
+    while (try chain.next(batch_arena.allocator())) |b| {
+        try parallel.writeLaneBatch(ctx.sink_mode, &ctx.sink_mtx, own_sink, batch_arena.allocator(), b);
+        out += b.len;
+        _ = batch_arena.reset(.retain_capacity);
+    }
+    _ = ctx.rows_out.fetchAdd(out, .monotonic);
+    if (own_sink) |sk| {
+        own_sink_open = false;
+        try sk.close();
+    }
+}
+
+/// Split-parallel SQL map+join:
+/// `read <sqltable> | (filter|select)* | join | (filter|select)* | write` over a
+/// splittable source. The build side is materialized once here into a shared
+/// read-only index; each lane then opens its own connection per key range, runs the
+/// pre-join chain, probes that index with its own `op.Join`, and runs the post-join
+/// stages. Returns false to fall back to the serial driver (non-splittable source,
+/// no split plan, bare upsert, join kind whose probe carries global state).
+///
+/// NOTE: like `runParallelSqlAgg`, only exercised against a live DB — the local test
+/// suite covers the shared join machinery through the CSV/parquet fan-outs.
+fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, src_base: usize) anyerror!bool {
+    const arena = env.arena;
+    if (stages[0].node != .read) return false;
+    // Not `env.sql_desc`: the build side planned after this read may have replaced it.
+    const desc = (try sqlDescForStage(env, stages[0])) orelse return false;
+    if (!joinKindLaneSafe(shape.join.kind)) return false;
+    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
+    if (src_base >= env.sources.items.len) return false;
+
+    const src_schema = try schemaPtr(arena, try dupeSchema(arena, env.sources.items[src_base].schema()));
+    const probe_schema = try mapChainSchema(env, shape.prefix, src_schema.*);
+
+    const sp = (try planSplit(env, desc, stages[0], opts.threads, w)) orelse return false;
+
+    // Drop the serial plan's sources (this read and the build side's) before the
+    // shared index opens its own, so nothing this path needs gets closed under it.
+    for (env.sources.items[src_base..]) |sc| sc.close();
+    env.sources.shrinkRetainingCapacity(src_base);
+
+    // Before any lane exists: build side materialized, suffix prevalidated.
+    const lp = try resolveLaneJoin(env, shape, probe_schema);
+
+    env.sink_name = sinkLabel(env, w);
+    const sink_mode: parallel.SinkMode = (try buildParallelSink(env, w, lp.out_schema)) orelse
+        .{ .shared = try openSink(env, w, lp.out_schema) };
+    var shared_open = sink_mode == .shared;
+    errdefer if (shared_open) sink_mode.shared.abort();
+
+    // ponytail: no projection narrowing under a join. `pushdown.planMap`'s liveness is
+    // map-shaped; past a join the live set is the left join keys plus whatever the
+    // suffix and the emitted left columns read, which it does not compute — so lanes
+    // select `*`. Leading prefix filters are already folded into `base_sql` by
+    // runOutput's implicit pushdown, so the WHERE half needs nothing here either.
+    // Upgrade: join-aware liveness.
+    var ctx = SqlMapJoinCtx{
+        .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql },
+        .predicates = sp.predicates,
+        .src_schema = src_schema,
+        .prefix = shape.prefix,
+        .join = lp.lane,
+        .params = env.params_expr,
+        .queue = .{ .nitems = sp.predicates.len },
+        .sink_mode = sink_mode,
+        .rows_read = env.rows_read,
+    };
+
+    const nlanes = @min(@max(@as(usize, 1), opts.threads), sp.predicates.len);
+    const lanes = try parallel.spawnJoin(arena, nlanes, sqlMapJoinLane, &ctx);
+    lanes_used.* = @max(lanes_used.*, lanes);
+    env.log.log(.debug, "split-parallel map+join: {d} splits over {d} lanes", .{ sp.predicates.len, lanes });
+
+    if (ctx.queue.first_err) |e| return e;
+    stats.rows_out += ctx.rows_out.load(.monotonic);
+    if (sink_mode == .shared) {
+        shared_open = false;
+        try sink_mode.shared.close();
+    }
+    return true;
 }
 
 const MapCtx = struct {
@@ -4496,6 +4668,30 @@ fn sqlDescFor(env: *Env, kind: SqlKind, dialect: sql.Dialect, cfg: DbConfig, bas
         else => null,
     };
     return .{ .kind = kind, .dialect = dialect, .cfg = cfg, .base_sql = base_sql, .table = table };
+}
+
+/// The `SqlDesc` a read stage would produce, recomputed without opening anything.
+/// `env.sql_desc` is last-writer-wins across every SQL source a plan opens, and a join
+/// plans its build side *after* the probe read — so a pipeline with a SQL binding
+/// leaves `env.sql_desc` describing the binding, not the read. Mirrors
+/// `openSourceProjected`: the `where` hint folds into the read the same way.
+/// Null → not a splittable SQL read.
+fn sqlDescForStage(env: *Env, stage: ast.Stage) !?SqlDesc {
+    if (stage.node != .read) return null;
+    var rd = stage.node.read;
+    if (rd.form != .table and rd.form != .query) return null;
+    const conn = env.connections.get(rd.connector) orelse return null;
+    const info = sqlConnInfo(conn) orelse return null;
+    if (forHintName(stage.hints, "where")) |wh| {
+        if (wh.len > 0) {
+            rd.where = if (rd.where.len > 0)
+                try std.fmt.allocPrint(env.arena, "({s}) AND ({s})", .{ wh, rd.where })
+            else
+                wh;
+        }
+    }
+    const cfg = try resolveDbConfig(env, conn, info.port);
+    return try sqlDescFor(env, info.kind, info.dialect, cfg, try readSql(env, rd), rd);
 }
 
 /// Pull `@[split = col]` / `@[splits = N]` / `@[split_kind = int|uuid|date]`

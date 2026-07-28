@@ -115,6 +115,27 @@ runs mysql     && sqlrt mysql     "$MYSQL_OPTS"
 runs postgres  && sqlrt postgres  "$PG_OPTS"
 runs sqlserver && sqlrt sqlserver "$MSSQL_OPTS"
 
+# Split-parallel probe over a shared join index: the key-range lanes must produce
+# exactly what the serial driver does. The split is forced by hint — basalt_it is
+# three rows, far under the auto-split threshold. Lanes interleave, so both sides
+# are sorted before the compare.
+pgjoin() { # $1 threads, $2 output csv
+  brun run -j "$1" -c "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);
+LOAD INTO '$2' AS
+WITH labels AS (SELECT id, name FROM 'it/seed.csv')
+SELECT t.id, l.name FROM db.basalt_it t WITH (split = id, splits = 4) JOIN labels l ON t.id = l.id;"
+}
+
+if runs postgres; then
+  if pgjoin 4 "$out/pg_join_j4.csv" && pgjoin 1 "$out/pg_join_j1.csv"; then
+    sort "$out/pg_join_j4.csv" >"$out/pg_join_j4.sorted"
+    sort "$out/pg_join_j1.csv" >"$out/pg_join_j1.sorted"
+    check postgres-split-join "$out/pg_join_j4.sorted" "$out/pg_join_j1.sorted"
+  else
+    report "postgres-split-join (run error)" bad
+  fi
+fi
+
 # Volume: ~7MB encoded (300k rows, nulls every 10th val) — crosses the 4MB
 # segment boundary, so each bulk sink commits and count-verifies 2+ segments,
 # and the Azure writer stages more than one block.
