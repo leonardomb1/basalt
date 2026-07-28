@@ -1122,30 +1122,25 @@ pub const Parser = struct {
         try stages.append(.{ .node = src, .hints = try read_hints.toOwnedSlice(), .pos = pos });
 
         while (true) {
-            var is_cross = false;
             const jk: ?ast.JoinKind = blk: {
                 if (self.isKw("inner")) break :blk .inner;
                 if (self.isKw("left")) break :blk .left;
+                if (self.isKw("right")) break :blk .right;
+                if (self.isKw("full")) break :blk .full;
                 if (self.isKw("semi")) break :blk .semi;
                 if (self.isKw("anti")) break :blk .anti;
+                if (self.isKw("cross")) break :blk .cross;
                 if (self.isKw("join")) break :blk .inner;
-                if (self.isKw("cross")) {
-                    is_cross = true;
-                    break :blk null;
-                }
-                if (self.isKw("right") or self.isKw("full"))
-                    return self.fail(self.curPos(), "{s} JOIN is not supported — use LEFT JOIN (swap sides) or restructure", .{self.cur().text});
                 break :blk null;
             };
-            if (jk == null and !is_cross) break;
-            const kind = jk orelse .inner;
+            const kind = jk orelse break;
             if (!self.isKw("join")) _ = self.advance();
             _ = self.eatKw("outer");
             try self.expectKw("join");
             const jpos = self.curPos();
-            if (is_cross) {
-                if (!self.isKw("unnest"))
-                    return self.fail(jpos, "CROSS JOIN is only supported as CROSS JOIN UNNEST(...)", .{});
+            // `CROSS JOIN UNNEST(...)` is the row-expanding form and stays an
+            // explode stage; `CROSS JOIN <cte>` is the cartesian product.
+            if (kind == .cross and self.isKw("unnest")) {
                 _ = self.advance();
                 _ = try self.expect(.lparen);
                 var field: []const u8 = undefined;
@@ -1178,18 +1173,36 @@ pub const Parser = struct {
                 jalias = self.advance().text;
                 aliases.add(jalias.?);
             }
-            try self.expectKw("on");
-            const a = try self.parseQualNameTok();
-            if (!(self.eat(.assign) or self.eat(.eq)))
-                return self.fail(self.curPos(), "expected `=` in join condition, found {s}", .{self.curTag().describe()});
-            const b = try self.parseQualNameTok();
-            const a_right = qualHasPrefix(a, jalias orelse binding);
-            const l = if (a_right) b else a;
-            const r = if (a_right) a else b;
-            const left_key = stripQual(l, &aliases);
-            const right_key = stripPrefix(r, jalias orelse binding);
+            var left_keys = std.array_list.Managed(ast.QualName).init(self.arena);
+            var right_keys = std.array_list.Managed(ast.QualName).init(self.arena);
+            if (kind == .cross) {
+                if (self.isKw("on"))
+                    return self.fail(self.curPos(), "CROSS JOIN takes no ON clause — it pairs every row with every row", .{});
+            } else {
+                if (!self.isKw("on"))
+                    return self.fail(self.curPos(), "expected `ON <column> = <column>` after JOIN {s}", .{binding});
+                _ = self.advance();
+                // `ON a = b AND c = d`: plain column names only. Anything else
+                // (a function call, a literal, a range test) belongs upstream.
+                while (true) {
+                    const a = try self.parseJoinKey();
+                    if (!(self.eat(.assign) or self.eat(.eq))) return self.joinKeyFail();
+                    const b = try self.parseJoinKey();
+                    const a_right = qualHasPrefix(a, jalias orelse binding);
+                    const l = if (a_right) b else a;
+                    const r = if (a_right) a else b;
+                    try left_keys.append(stripQual(l, &aliases));
+                    try right_keys.append(stripPrefix(r, jalias orelse binding));
+                    if (!self.eatKw("and")) break;
+                }
+            }
             try stages.append(.{
-                .node = .{ .join = .{ .kind = kind, .binding = binding, .left_key = left_key, .right_key = right_key } },
+                .node = .{ .join = .{
+                    .kind = kind,
+                    .binding = binding,
+                    .left_keys = try left_keys.toOwnedSlice(),
+                    .right_keys = try right_keys.toOwnedSlice(),
+                } },
                 .hints = &.{},
                 .pos = jpos,
             });
@@ -1870,6 +1883,17 @@ pub const Parser = struct {
         if (arms.items.len == 0)
             return self.fail(pos, "CASE statement needs at least one WHEN arm", .{});
         return .{ .subject = subject, .arms = try arms.toOwnedSlice(), .pos = pos };
+    }
+
+    /// The one shape a join key may take. Kept deliberately narrow: the index is
+    /// built on stored columns, so a computed key has to be computed first.
+    fn joinKeyFail(self: *Parser) Error {
+        return self.fail(self.curPos(), "join keys must be plain columns; compute them in the CTE / a select first", .{});
+    }
+
+    fn parseJoinKey(self: *Parser) Error!ast.QualName {
+        if (!(self.atName() or self.at(.string))) return self.joinKeyFail();
+        return self.parseQualNameTok();
     }
 
     fn parseQualNameTok(self: *Parser) Error!ast.QualName {
@@ -2583,11 +2607,77 @@ test "sql: CTE + LEFT JOIN with alias stripping" {
     const j = pl.stages[1].node.join;
     try testing.expectEqual(ast.JoinKind.left, j.kind);
     try testing.expectEqualStrings("paid", j.binding);
-    try testing.expectEqualStrings("id", j.left_key.parts[0]);
-    try testing.expectEqualStrings("id", j.right_key.parts[0]);
+    try testing.expectEqual(@as(usize, 1), j.left_keys.len);
+    try testing.expectEqualStrings("id", j.left_keys[0].parts[0]);
+    try testing.expectEqualStrings("id", j.right_keys[0].parts[0]);
     const sel = pl.stages[2].node.select;
     try testing.expectEqualStrings("id", sel[0].field.parts[0]);
     try testing.expectEqual(@as(usize, 1), sel[0].field.parts.len);
+}
+
+test "sql: multi-key ON, RIGHT/FULL/CROSS join kinds, and the plain-column rule" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a,
+        \\LOAD INTO 'out.csv' AS
+        \\WITH r AS (SELECT id, day, v FROM 'r.csv')
+        \\SELECT * FROM 'in.csv' t FULL OUTER JOIN r ON t.id = r.id AND r.day = t.day;
+    );
+    const j = prog.stmts[2].output.stages[1].node.join;
+    try testing.expectEqual(ast.JoinKind.full, j.kind);
+    try testing.expectEqual(@as(usize, 2), j.left_keys.len);
+    try testing.expectEqualStrings("id", j.left_keys[0].parts[0]);
+    try testing.expectEqualStrings("id", j.right_keys[0].parts[0]);
+    // Written `r.day = t.day`, so the pair has to be flipped back.
+    try testing.expectEqualStrings("day", j.left_keys[1].parts[0]);
+    try testing.expectEqualStrings("day", j.right_keys[1].parts[0]);
+
+    const rp = try parseTest(a,
+        \\LOAD INTO 'out.csv' AS
+        \\WITH r AS (SELECT id FROM 'r.csv')
+        \\SELECT * FROM 'in.csv' t RIGHT JOIN r ON t.id = r.id;
+    );
+    try testing.expectEqual(ast.JoinKind.right, rp.stmts[2].output.stages[1].node.join.kind);
+
+    const cp = try parseTest(a,
+        \\LOAD INTO 'out.csv' AS
+        \\WITH r AS (SELECT id FROM 'r.csv')
+        \\SELECT * FROM 'in.csv' t CROSS JOIN r;
+    );
+    const cj = cp.stmts[2].output.stages[1].node.join;
+    try testing.expectEqual(ast.JoinKind.cross, cj.kind);
+    try testing.expectEqual(@as(usize, 0), cj.left_keys.len);
+
+    // CROSS JOIN UNNEST still expands rows rather than pairing them.
+    const up = try parseTest(a,
+        \\LOAD INTO 'out.csv' AS
+        \\SELECT * FROM 'in.csv' CROSS JOIN UNNEST(tags) AS tag;
+    );
+    try testing.expect(up.stmts[1].output.stages[1].node == .explode);
+
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a,
+        \\LOAD INTO 'out.csv' AS
+        \\WITH r AS (SELECT id FROM 'r.csv')
+        \\SELECT * FROM 'in.csv' t JOIN r ON lower(t.id) = r.id;
+    , &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "plain columns") != null);
+
+    try testing.expectError(error.ParseFailed, parseSource(a,
+        \\LOAD INTO 'out.csv' AS
+        \\WITH r AS (SELECT id FROM 'r.csv')
+        \\SELECT * FROM 'in.csv' t CROSS JOIN r ON t.id = r.id;
+    , &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "no ON clause") != null);
+
+    try testing.expectError(error.ParseFailed, parseSource(a,
+        \\LOAD INTO 'out.csv' AS
+        \\WITH r AS (SELECT id FROM 'r.csv')
+        \\SELECT * FROM 'in.csv' t JOIN r;
+    , &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "expected `ON") != null);
 }
 
 test "sql: UNION ALL BY NAME with tag literal and anchor" {

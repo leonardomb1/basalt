@@ -39,6 +39,7 @@ pub fn errLabel(e: anyerror) []const u8 {
         error.CastFailed => "cast failed",
         error.DivByZero => "division by zero",
         error.TypeMismatch => "type mismatch",
+        error.JoinBuildTooLarge => "join build side exceeds 1 GiB — filter the CTE or flip the join",
         else => @errorName(e),
     };
 }
@@ -79,7 +80,8 @@ pub const Op = union(enum) {
             .scan => {},
             .join => |j| {
                 try buf.append(j.probe);
-                try buf.append(j.build);
+                // A pre-built (shared) index has no build pipeline to charge.
+                if (j.build) |b| try buf.append(b);
             },
             .union_ => |u| try buf.appendSlice(u.children),
             inline else => |o| try buf.append(o.child),
@@ -1800,12 +1802,19 @@ fn reduceExtreme(col: column.Column, func: ast.AggFunc, n: usize) Value {
 /// build side is empty. The result is built in `state` (which must outlive the
 /// per-pull batch arena: the join probes it across many pulls), while the child
 /// is pulled with the transient `pull` arena.
-fn materializeFull(state: std.mem.Allocator, pull: std.mem.Allocator, child: Op, schema: *const types.Schema) anyerror!Batch {
+///
+/// Fails with `JoinBuildTooLarge` as soon as the drained bytes cross
+/// `join_build_byte_cap`, so an unbounded build side is a diagnostic rather
+/// than an OOM.
+fn materializeFull(state: std.mem.Allocator, pull: std.mem.Allocator, child: Op, schema: *const types.Schema, bytes_out: *usize) anyerror!Batch {
     const ncols = schema.fields.len;
     const builders = try state.alloc(column.Builder, ncols);
     for (builders, schema.fields) |*b, f| b.* = column.Builder.init(state, f.ty);
     var total: usize = 0;
+    var bytes: usize = 0;
     while (try child.next(pull)) |b| {
+        for (b.columns) |*col| bytes += columnBytes(col);
+        if (bytes > join_build_byte_cap) return error.JoinBuildTooLarge;
         var r: usize = 0;
         while (r < b.len) : (r += 1) {
             for (b.columns, 0..) |*col, ci| try builders[ci].append(col.getValue(r));
@@ -1814,116 +1823,411 @@ fn materializeFull(state: std.mem.Allocator, pull: std.mem.Allocator, child: Op,
     }
     const cols = try state.alloc(column.Column, ncols);
     for (builders, 0..) |*bd, i| cols[i] = try bd.finish();
+    bytes_out.* = bytes;
     return Batch{ .schema = schema, .columns = cols, .len = total };
 }
 
-/// Hash equi-join. The build (right) side is materialized into a hash index on
-/// the first `next`; the probe (left) side then streams through. Supports
-/// inner / left / semi / anti.
+/// Heap a column occupies: its typed store plus the validity bitmap. Close
+/// enough to bound a build side; exact accounting would have to reach into the
+/// allocator.
+fn columnBytes(c: *const column.Column) usize {
+    const payload: usize = switch (c.data) {
+        .b => |s| s.len,
+        .i32 => |s| s.len * @sizeOf(i32),
+        .i64 => |s| s.len * @sizeOf(i64),
+        .f64 => |s| s.len * @sizeOf(f64),
+        .dec => |s| s.len * @sizeOf(valuemod.Decimal),
+        .bytes => |b| b.values.len + b.offsets.len * @sizeOf(i32),
+    };
+    return payload + c.validity.bits.len;
+}
+
+// ponytail: one hard-coded 1 GiB ceiling, no knob and no spill. The upgrade
+// path, in order: expose it as a run option, then partition the build side and
+// spill the cold partitions to disk. Neither is worth writing until a real
+// build side gets near a gigabyte.
+/// Ceiling on a materialized join build side. A build side is fully resident
+/// (that is what makes probing O(1)), so without a limit a mis-written CTE
+/// takes the process down instead of reporting. A `var` so tests can lower it;
+/// nothing else writes it.
+pub var join_build_byte_cap: usize = 1 << 30;
+
+/// How key columns compare for one key position. Deciding once per batch keeps
+/// the per-row comparison a direct typed load instead of two boxed `Value`s.
+pub const KeyClass = enum { i64s, bytes, boxed };
+
+fn classOf(a: column.Column, b: column.Column) KeyClass {
+    // Same logical kind is required: `int` and `timestamp` share the i64 store
+    // but are never equal, and `valueEq` (the boxed path) says so.
+    if (a.ty.kind != b.ty.kind) return .boxed;
+    return switch (a.data) {
+        .i64 => if (std.meta.activeTag(b.data) == .i64) .i64s else .boxed,
+        .bytes => if (std.meta.activeTag(b.data) == .bytes) .bytes else .boxed,
+        else => .boxed,
+    };
+}
+
+fn cellEq(cls: KeyClass, a: *const column.Column, ar: usize, b: *const column.Column, br: usize) bool {
+    return switch (cls) {
+        .i64s => a.data.i64[ar] == b.data.i64[br],
+        .bytes => std.mem.eql(u8, a.data.bytes.at(ar), b.data.bytes.at(br)),
+        .boxed => keyhash.valueEq(a.getValue(ar), b.getValue(br)),
+    };
+}
+
+/// Composite key hash for one row. Folds the same way `keyhash.MultiKeyCtx`
+/// does (Wyhash, type tag + payload per value, in key order), so the build and
+/// probe sides agree.
+fn hashRowKeys(cols: []const column.Column, keys: []const usize, row: usize) u64 {
+    var h = std.hash.Wyhash.init(0);
+    for (keys) |k| keyhash.hashValue(&h, cols[k].getValue(row));
+    return h.final();
+}
+
+/// SQL: a null key joins to nothing, on either side.
+fn anyNullKey(cols: []const column.Column, keys: []const usize, row: usize) bool {
+    for (keys) |k| {
+        if (!cols[k].validity.get(row)) return true;
+    }
+    return false;
+}
+
+/// The build side of a hash join: the rows, materialized columnar, plus a flat
+/// chained index over them.
 ///
-/// The build batch and index live across pulls, so they MUST NOT go into the
-/// per-pull batch arena (the driver resets it before every `next`). They are
-/// allocated in `state` — the plan arena, freed when the run ends.
+/// Layout — three arrays, no per-key allocation and no boxed key stored:
+///   * `heads[slot]`  bucket → build row + 1 (0 = empty). Linear probing, and a
+///     slot is claimed by one *distinct* key.
+///   * `next[row]`    build row → the next build row carrying the same key + 1
+///     (0 ends the chain). Duplicate keys are a chain, not a heap list.
+///   * `hashes[row]`  that row's key hash, so a bucket collision costs one u64
+///     compare rather than a column-wise key comparison.
+/// `heads` is sized from the build row count (which bounds the distinct keys)
+/// and never grows, so probing needs no synchronisation.
+///
+/// After `create` the whole structure is read-only: several probe lanes may
+/// share one index. Anything a probe has to *write* (outer-join match tracking)
+/// lives on the `Join`, not here.
+pub const JoinIndex = struct {
+    build_batch: Batch,
+    keys: []const usize,
+    /// All three are const: they are filled through the local slices `create`
+    /// allocates and never written again, which is what makes a shared probe safe.
+    heads: []const u32,
+    next: []const u32,
+    hashes: []const u64,
+    mask: u64,
+
+    /// Runs `build` to completion, materializes it columnar, and indexes
+    /// `right_keys`. `state` must outlive every probe (plan arena); `pull` is
+    /// the transient arena the build child is drained with.
+    pub fn create(
+        state: std.mem.Allocator,
+        pull: std.mem.Allocator,
+        build: Op,
+        right_schema: *const types.Schema,
+        right_keys: []const usize,
+    ) anyerror!*JoinIndex {
+        var bytes: usize = 0;
+        const batch = try materializeFull(state, pull, build, right_schema, &bytes);
+        const n = batch.len;
+        // Rows are addressed as `row + 1` in u32 slots.
+        if (n >= std.math.maxInt(u32)) return error.JoinBuildTooLarge;
+
+        const self = try state.create(JoinIndex);
+        self.* = .{
+            .build_batch = batch,
+            .keys = right_keys,
+            .heads = &.{},
+            .next = &.{},
+            .hashes = &.{},
+            .mask = 0,
+        };
+        // A cross join has no keys and is never looked up.
+        if (right_keys.len == 0) return self;
+
+        var cap: usize = 16;
+        while (cap < n * 2) cap *= 2;
+        bytes += cap * @sizeOf(u32) + n * (@sizeOf(u32) + @sizeOf(u64));
+        if (bytes > join_build_byte_cap) return error.JoinBuildTooLarge;
+
+        const heads = try state.alloc(u32, cap);
+        @memset(heads, 0);
+        const chain = try state.alloc(u32, n);
+        const hashes = try state.alloc(u64, n);
+        self.heads = heads;
+        self.next = chain;
+        self.hashes = hashes;
+        self.mask = cap - 1;
+
+        const classes = try pull.alloc(KeyClass, right_keys.len);
+        for (right_keys, classes) |k, *c| c.* = classOf(batch.columns[k], batch.columns[k]);
+
+        var r: usize = 0;
+        while (r < n) : (r += 1) {
+            chain[r] = 0;
+            if (anyNullKey(batch.columns, right_keys, r)) continue;
+            const h = hashRowKeys(batch.columns, right_keys, r);
+            hashes[r] = h;
+            var slot = h & self.mask;
+            while (heads[slot] != 0) : (slot = (slot + 1) & self.mask) {
+                const hr: usize = heads[slot] - 1;
+                if (hashes[hr] == h and self.rowsEq(classes, hr, r)) break;
+            }
+            // Either an empty slot (a key seen for the first time) or the slot
+            // this key already owns; both prepend, so a chain only ever holds
+            // rows with equal keys.
+            chain[r] = heads[slot];
+            heads[slot] = @intCast(r + 1);
+        }
+        return self;
+    }
+
+    pub fn rows(self: *const JoinIndex) usize {
+        return self.build_batch.len;
+    }
+
+    fn rowsEq(self: *const JoinIndex, classes: []const KeyClass, a_row: usize, b_row: usize) bool {
+        for (self.keys, classes) |k, cls| {
+            const c = &self.build_batch.columns[k];
+            if (!cellEq(cls, c, a_row, c, b_row)) return false;
+        }
+        return true;
+    }
+
+    fn probeEq(self: *const JoinIndex, probe: Batch, probe_keys: []const usize, classes: []const KeyClass, prow: usize, brow: usize) bool {
+        for (self.keys, probe_keys, classes) |bk, pk, cls| {
+            if (!cellEq(cls, &self.build_batch.columns[bk], brow, &probe.columns[pk], prow)) return false;
+        }
+        return true;
+    }
+
+    /// First build row whose keys equal probe row `row`'s, or null. Walk the
+    /// rest with `chainNext`. Read-only, so concurrent probes are safe.
+    /// `classes` comes from `classesFor` and is positional with `probe_keys`.
+    pub fn find(self: *const JoinIndex, probe: Batch, probe_keys: []const usize, classes: []const KeyClass, row: usize) ?usize {
+        if (self.keys.len == 0 or self.build_batch.len == 0) return null;
+        if (anyNullKey(probe.columns, probe_keys, row)) return null;
+        const h = hashRowKeys(probe.columns, probe_keys, row);
+        var slot = h & self.mask;
+        while (self.heads[slot] != 0) : (slot = (slot + 1) & self.mask) {
+            const hr: usize = self.heads[slot] - 1;
+            if (self.hashes[hr] == h and self.probeEq(probe, probe_keys, classes, row, hr)) return hr;
+        }
+        return null;
+    }
+
+    /// Next build row carrying the same key, or null at the end of the chain.
+    pub fn chainNext(self: *const JoinIndex, row: usize) ?usize {
+        const nx = self.next[row];
+        return if (nx == 0) null else nx - 1;
+    }
+
+    /// How each key position compares for this probe batch. Once per batch.
+    pub fn classesFor(self: *const JoinIndex, arena: std.mem.Allocator, probe: Batch, probe_keys: []const usize) ![]KeyClass {
+        const classes = try arena.alloc(KeyClass, probe_keys.len);
+        for (self.keys, probe_keys, classes) |bk, pk, *c|
+            c.* = classOf(probe.columns[pk], self.build_batch.columns[bk]);
+        return classes;
+    }
+};
+
+/// Hash join. The build (right) side is drained into a `JoinIndex`; the probe
+/// (left) side then streams through it. Supports inner / left / semi / anti /
+/// right / full / cross.
+///
+/// Serial plans set `build` and the index is created on the first `next`;
+/// parallel plans create it up front and hand the same one to every lane
+/// through `index`. The index and its batch live across pulls, so they MUST NOT
+/// go into the per-pull batch arena (the driver resets it before every `next`):
+/// they are allocated in `state`, the plan arena.
 pub const Join = struct {
     stats: Stats = .{},
     probe: Op,
-    build: Op,
-    left_key: usize,
-    right_key: usize,
+    /// Serial path: the build pipeline, indexed lazily on first `next`.
+    build: ?Op,
+    /// Parallel path: an index built once and shared across lanes.
+    index: ?*JoinIndex = null,
+    left_keys: []const usize,
+    right_keys: []const usize,
     left_schema: *const types.Schema,
     right_schema: *const types.Schema,
     out_schema: *const types.Schema,
     kind: ast.JoinKind,
     state: std.mem.Allocator,
+    err: ?*ErrCtx = null,
 
-    built: bool = false,
-    build_batch: Batch = undefined,
-    index: Index = undefined,
+    /// right/full: build rows some probe row matched. Lives here rather than in
+    /// `JoinIndex` precisely because it is written on the probe path.
+    matched: ?[]bool = null,
+    drain_pos: usize = 0,
+    probe_done: bool = false,
 
-    const Index = std.HashMap(Value, std.array_list.Managed(usize), keyhash.SingleKeyCtx, std.hash_map.default_max_load_percentage);
-    const empty_match: []const usize = &.{};
+    /// Rows per drain batch, so a large unmatched build side arrives in pieces.
+    const drain_chunk = 4096;
 
     pub fn next(self: *Join, arena: std.mem.Allocator) anyerror!?Batch {
-        if (!self.built) {
-            self.built = true;
-            self.build_batch = try materializeFull(self.state, arena, self.build, self.right_schema);
-            self.index = Index.init(self.state);
-            var r: usize = 0;
-            while (r < self.build_batch.len) : (r += 1) {
-                const k = self.build_batch.columns[self.right_key].getValue(r);
-                if (k.isNull()) continue;
-                const gop = try self.index.getOrPut(k);
-                if (!gop.found_existing) gop.value_ptr.* = std.array_list.Managed(usize).init(self.state);
-                try gop.value_ptr.append(r);
+        const ix = try self.ensureIndex(arena);
+        while (!self.probe_done) {
+            if (try self.probe.next(arena)) |lb| {
+                const out = try self.joinBatch(arena, ix, lb);
+                if (out.len > 0) return out;
+            } else {
+                self.probe_done = true;
             }
         }
-        while (try self.probe.next(arena)) |lb| {
-            const out = try self.joinBatch(arena, lb);
-            if (out.len > 0) return out;
-        }
-        return null;
+        return self.drain(arena, ix);
     }
 
-    fn joinBatch(self: *Join, arena: std.mem.Allocator, lb: Batch) anyerror!Batch {
-        const emit_right = (self.kind == .inner or self.kind == .left);
-        const nout = self.out_schema.fields.len;
-        const builders = try arena.alloc(column.Builder, nout);
-        for (builders, self.out_schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
+    fn ensureIndex(self: *Join, arena: std.mem.Allocator) anyerror!*JoinIndex {
+        const ix = self.index orelse blk: {
+            const build = self.build orelse return error.JoinHasNoBuildSide;
+            const made = JoinIndex.create(self.state, arena, build, self.right_schema, self.right_keys) catch |e| {
+                if (self.err) |ec| ec.set("{s}", .{errLabel(e)});
+                return e;
+            };
+            self.index = made;
+            break :blk made;
+        };
+        if ((self.kind == .right or self.kind == .full) and self.matched == null) {
+            const m = try self.state.alloc(bool, ix.build_batch.len);
+            @memset(m, false);
+            self.matched = m;
+        }
+        return ix;
+    }
 
-        var n: usize = 0;
+    /// One probe batch → one output batch. Row pairs are collected as index
+    /// lists first, then every output column is filled by a single gather.
+    fn joinBatch(self: *Join, arena: std.mem.Allocator, ix: *JoinIndex, lb: Batch) anyerror!Batch {
+        var lidx = std.array_list.Managed(usize).init(arena);
+        var ridx = std.array_list.Managed(usize).init(arena);
+        var rnull = std.array_list.Managed(bool).init(arena);
+        try lidx.ensureTotalCapacity(lb.len);
+
+        if (self.kind == .cross) {
+            var r: usize = 0;
+            while (r < lb.len) : (r += 1) {
+                var b: usize = 0;
+                while (b < ix.build_batch.len) : (b += 1) {
+                    try lidx.append(r);
+                    try ridx.append(b);
+                }
+            }
+            return self.gatherOut(arena, ix, lb, lidx.items, ridx.items, &.{}, lidx.items.len);
+        }
+
+        // Only left/full fill a missing right side; for the others an unmatched
+        // probe row either vanishes or carries no right columns at all.
+        const fill_right = (self.kind == .left or self.kind == .full);
+        const classes = try ix.classesFor(arena, lb, self.left_keys);
+
         var r: usize = 0;
         while (r < lb.len) : (r += 1) {
-            const key = lb.columns[self.left_key].getValue(r);
-            const matches: []const usize = if (key.isNull())
-                empty_match
-            else if (self.index.get(key)) |list|
-                list.items
-            else
-                empty_match;
-
+            const first = ix.find(lb, self.left_keys, classes, r);
             switch (self.kind) {
-                .inner => for (matches) |bri| {
-                    try self.emitRow(builders, lb, r, bri, emit_right, false);
-                    n += 1;
+                .semi => {
+                    if (first != null) try lidx.append(r);
                 },
-                .left => if (matches.len == 0) {
-                    try self.emitRow(builders, lb, r, 0, emit_right, true);
-                    n += 1;
-                } else for (matches) |bri| {
-                    try self.emitRow(builders, lb, r, bri, emit_right, false);
-                    n += 1;
+                .anti => {
+                    if (first == null) try lidx.append(r);
                 },
-                .semi => if (matches.len > 0) {
-                    try self.emitRow(builders, lb, r, 0, false, false);
-                    n += 1;
-                },
-                .anti => if (matches.len == 0) {
-                    try self.emitRow(builders, lb, r, 0, false, false);
-                    n += 1;
+                else => {
+                    if (first == null) {
+                        if (fill_right) {
+                            try lidx.append(r);
+                            try ridx.append(0);
+                            try rnull.append(true);
+                        }
+                        continue;
+                    }
+                    var cur = first;
+                    while (cur) |br| {
+                        try lidx.append(r);
+                        try ridx.append(br);
+                        if (fill_right) try rnull.append(false);
+                        if (self.matched) |m| m[br] = true;
+                        cur = ix.chainNext(br);
+                    }
                 },
             }
         }
-
-        const cols = try arena.alloc(column.Column, nout);
-        for (builders, 0..) |*b, i| cols[i] = try b.finish();
-        return Batch{ .schema = self.out_schema, .columns = cols, .len = n };
+        return self.gatherOut(arena, ix, lb, lidx.items, ridx.items, rnull.items, lidx.items.len);
     }
 
-    fn emitRow(self: *Join, builders: []column.Builder, lb: Batch, lr: usize, bri: usize, emit_right: bool, right_null: bool) anyerror!void {
-        @setEvalBranchQuota(2000);
-        var col: usize = 0;
-        for (lb.columns) |*c| {
-            try builders[col].append(c.getValue(lr));
-            col += 1;
+    /// right/full: once the probe stream ends, every build row nothing matched
+    /// is emitted with the left columns null. Chunked so a large build side does
+    /// not become one enormous batch.
+    fn drain(self: *Join, arena: std.mem.Allocator, ix: *JoinIndex) anyerror!?Batch {
+        if (self.kind != .right and self.kind != .full) return null;
+        var ridx = std.array_list.Managed(usize).init(arena);
+        const matched = self.matched orelse return null;
+        while (self.drain_pos < ix.build_batch.len and ridx.items.len < drain_chunk) : (self.drain_pos += 1) {
+            if (!matched[self.drain_pos]) try ridx.append(self.drain_pos);
+        }
+        if (ridx.items.len == 0) return null;
+        return try self.gatherOut(arena, ix, null, &.{}, ridx.items, &.{}, ridx.items.len);
+    }
+
+    /// Assemble `n` output rows from the index lists: one gather per column,
+    /// never a per-cell boxed append. `lb == null` marks the outer drain, where
+    /// the whole left side is null.
+    fn gatherOut(
+        self: *Join,
+        arena: std.mem.Allocator,
+        ix: *JoinIndex,
+        lb: ?Batch,
+        lidx: []const usize,
+        ridx: []const usize,
+        rnull: []const bool,
+        n: usize,
+    ) anyerror!Batch {
+        const emit_right = (self.kind != .semi and self.kind != .anti);
+        const nleft = if (lb) |b| b.columns.len else self.left_schema.fields.len;
+        const nout = nleft + (if (emit_right) ix.build_batch.columns.len else @as(usize, 0));
+        const cols = try arena.alloc(column.Column, nout);
+
+        var i: usize = 0;
+        while (i < nleft) : (i += 1) {
+            cols[i] = if (lb) |b|
+                try takeCol(arena, b.columns[i], lidx, &.{})
+            else
+                try nullColumn(arena, self.left_schema.fields[i].ty, n);
         }
         if (emit_right) {
-            for (self.build_batch.columns) |*c| {
-                try builders[col].append(if (right_null) .null else c.getValue(bri));
-                col += 1;
+            var k: usize = 0;
+            while (k < ix.build_batch.columns.len) : (k += 1) {
+                cols[nleft + k] = try takeCol(arena, ix.build_batch.columns[k], ridx, rnull);
             }
         }
+        return Batch{ .schema = self.out_schema, .columns = cols, .len = n };
     }
 };
+
+/// Gather rows `idx` out of `c`, then null out the positions flagged in
+/// `null_mask` (the outer-join fill, which gathers a placeholder row and then
+/// discards it via validity). `permute` covers every physical store, so there
+/// is no per-kind fallback; only a source with no rows at all has to be built
+/// as an all-null column instead.
+fn takeCol(arena: std.mem.Allocator, c: column.Column, idx: []const usize, null_mask: []const bool) !column.Column {
+    if (c.len == 0) return nullColumn(arena, c.ty, idx.len);
+    var out = try column.permute(arena, c, idx);
+    if (null_mask.len == idx.len) {
+        out.ty = out.ty.asNullable();
+        for (null_mask, 0..) |is_null, i| {
+            if (is_null) out.validity.setValid(i, false);
+        }
+    }
+    return out;
+}
+
+/// An all-null column of `n` rows.
+fn nullColumn(arena: std.mem.Allocator, ty: types.Type, n: usize) !column.Column {
+    var b = try column.Builder.initCapacity(arena, ty.asNullable(), n);
+    var i: usize = 0;
+    while (i < n) : (i += 1) try b.append(.null);
+    return b.finish();
+}
 
 const testing = std.testing;
 
@@ -2337,72 +2641,209 @@ test "aggregate: global vectorized reductions honor nulls; empty input edge case
     try testing.expect((try gagg.next(a)) == null);
 }
 
-test "join: inner/left/semi/anti; null keys never match on either side" {
+const join_left_schema = types.Schema{ .fields = &.{
+    .{ .name = "lk", .ty = types.Type.init(.int).asNullable() },
+    .{ .name = "lv", .ty = types.Type.init(.string).asNullable() },
+} };
+const join_right_schema = types.Schema{ .fields = &.{
+    .{ .name = "rk", .ty = types.Type.init(.int).asNullable() },
+    .{ .name = "rv", .ty = types.Type.init(.string).asNullable() },
+} };
+const join_both_schema = types.Schema{ .fields = &.{
+    .{ .name = "lk", .ty = types.Type.init(.int).asNullable() },
+    .{ .name = "lv", .ty = types.Type.init(.string).asNullable() },
+    .{ .name = "rk", .ty = types.Type.init(.int).asNullable() },
+    .{ .name = "rv", .ty = types.Type.init(.string).asNullable() },
+} };
+
+/// Drain a join into (column 0 as ?i64, column `rvc` as ?string) pairs. `rvc`
+/// of null collects only the key column (semi/anti, which emit no right side).
+const JoinRows = struct {
+    keys: std.array_list.Managed(?i64),
+    rvs: std.array_list.Managed(?[]const u8),
+
+    fn collect(a: std.mem.Allocator, top: Op, rvc: ?usize) !JoinRows {
+        var out = JoinRows{
+            .keys = std.array_list.Managed(?i64).init(a),
+            .rvs = std.array_list.Managed(?[]const u8).init(a),
+        };
+        while (try top.next(a)) |b| {
+            var r: usize = 0;
+            while (r < b.len) : (r += 1) {
+                const kv = b.columns[0].getValue(r);
+                try out.keys.append(if (kv.isNull()) null else kv.int);
+                if (rvc) |c| {
+                    const rv = b.columns[c].getValue(r);
+                    try out.rvs.append(if (rv.isNull()) null else rv.string);
+                }
+            }
+        }
+        return out;
+    }
+
+    fn expect(self: JoinRows, keys: []const ?i64, rvs: []const ?[]const u8) !void {
+        try testing.expectEqualDeep(keys, @as([]const ?i64, self.keys.items));
+        try testing.expectEqual(rvs.len, self.rvs.items.len);
+        for (rvs, self.rvs.items) |w, g| {
+            if (w) |s| try testing.expectEqualStrings(s, g.?) else try testing.expect(g == null);
+        }
+    }
+};
+
+test "join: inner/left/semi/anti; null keys never match, duplicate build keys fan out" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
 
-    const left_schema = types.Schema{ .fields = &.{
-        .{ .name = "lk", .ty = types.Type.init(.int).asNullable() },
-        .{ .name = "lv", .ty = types.Type.init(.string).asNullable() },
-    } };
-    const right_schema = types.Schema{ .fields = &.{
-        .{ .name = "rk", .ty = types.Type.init(.int).asNullable() },
-        .{ .name = "rv", .ty = types.Type.init(.string).asNullable() },
-    } };
-    const both_schema = types.Schema{ .fields = &.{
-        .{ .name = "lk", .ty = types.Type.init(.int).asNullable() },
-        .{ .name = "lv", .ty = types.Type.init(.string).asNullable() },
-        .{ .name = "rk", .ty = types.Type.init(.int).asNullable() },
-        .{ .name = "rv", .ty = types.Type.init(.string).asNullable() },
-    } };
-
     const Case = struct { kind: ast.JoinKind, keys: []const ?i64, rvs: []const ?[]const u8 };
     const cases = [_]Case{
-        .{ .kind = .inner, .keys = &.{ 1, 1 }, .rvs = &.{ "x", "y" } },
-        .{ .kind = .left, .keys = &.{ 1, 1, 2, null, 3 }, .rvs = &.{ "x", "y", null, null, null } },
+        .{ .kind = .inner, .keys = &.{ 1, 1 }, .rvs = &.{ "y", "x" } },
+        .{ .kind = .left, .keys = &.{ 1, 1, 2, null, 3 }, .rvs = &.{ "y", "x", null, null, null } },
         .{ .kind = .semi, .keys = &.{1}, .rvs = &.{} },
         .{ .kind = .anti, .keys = &.{ 2, null, 3 }, .rvs = &.{} },
     };
     for (cases) |case| {
-        const lb = [_]Batch{try kvBatch(a, &left_schema, &.{ 1, 2, null, 3 }, &.{ "a", "b", "n", "c" })};
-        const rb = [_]Batch{try kvBatch(a, &right_schema, &.{ 1, 1, 4, null }, &.{ "x", "y", "z", "m" })};
-        var lts = TestSource{ .schema_ = left_schema, .batches = &lb };
-        var rts = TestSource{ .schema_ = right_schema, .batches = &rb };
+        const lb = [_]Batch{try kvBatch(a, &join_left_schema, &.{ 1, 2, null, 3 }, &.{ "a", "b", "n", "c" })};
+        const rb = [_]Batch{try kvBatch(a, &join_right_schema, &.{ 1, 1, 4, null }, &.{ "x", "y", "z", "m" })};
+        var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+        var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
         var lscan = Scan{ .src = lts.src() };
         var rscan = Scan{ .src = rts.src() };
         const emit_right = case.kind == .inner or case.kind == .left;
         var jn = Join{
             .probe = .{ .scan = &lscan },
             .build = .{ .scan = &rscan },
-            .left_key = 0,
-            .right_key = 0,
-            .left_schema = &left_schema,
-            .right_schema = &right_schema,
-            .out_schema = if (emit_right) &both_schema else &left_schema,
+            .left_keys = &.{0},
+            .right_keys = &.{0},
+            .left_schema = &join_left_schema,
+            .right_schema = &join_right_schema,
+            .out_schema = if (emit_right) &join_both_schema else &join_left_schema,
             .kind = case.kind,
             .state = a,
         };
-        var keys = std.array_list.Managed(?i64).init(a);
-        var rvs = std.array_list.Managed(?[]const u8).init(a);
-        const top = Op{ .join = &jn };
-        while (try top.next(a)) |b| {
-            var r: usize = 0;
-            while (r < b.len) : (r += 1) {
-                const kv = b.columns[0].getValue(r);
-                try keys.append(if (kv.isNull()) null else kv.int);
-                if (emit_right) {
-                    const rv = b.columns[3].getValue(r);
-                    try rvs.append(if (rv.isNull()) null else rv.string);
-                }
-            }
-        }
-        try testing.expectEqualDeep(case.keys, @as([]const ?i64, keys.items));
-        try testing.expectEqual(case.rvs.len, rvs.items.len);
-        for (case.rvs, rvs.items) |w, g| {
-            if (w) |s| try testing.expectEqualStrings(s, g.?) else try testing.expect(g == null);
+        // Duplicates chain most-recent-first, so build row 1 ("y") precedes 0.
+        const got = try JoinRows.collect(a, .{ .join = &jn }, if (emit_right) @as(?usize, 3) else null);
+        try got.expect(case.keys, case.rvs);
+    }
+}
+
+test "join: right and full drain unmatched build rows with a null left side" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    for ([_]ast.JoinKind{ .right, .full }) |kind| {
+        const lb = [_]Batch{try kvBatch(a, &join_left_schema, &.{ 1, 2, null }, &.{ "a", "b", "n" })};
+        const rb = [_]Batch{try kvBatch(a, &join_right_schema, &.{ 1, 4, null }, &.{ "x", "z", "m" })};
+        var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+        var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+        var lscan = Scan{ .src = lts.src() };
+        var rscan = Scan{ .src = rts.src() };
+        var jn = Join{
+            .probe = .{ .scan = &lscan },
+            .build = .{ .scan = &rscan },
+            .left_keys = &.{0},
+            .right_keys = &.{0},
+            .left_schema = &join_left_schema,
+            .right_schema = &join_right_schema,
+            .out_schema = &join_both_schema,
+            .kind = kind,
+            .state = a,
+        };
+        const got = try JoinRows.collect(a, .{ .join = &jn }, 3);
+        // The drain carries build rows 4 and null (nothing matched them), with
+        // the left key column null. `full` additionally keeps left rows 2/null.
+        if (kind == .right) {
+            try got.expect(&.{ 1, null, null }, &.{ "x", "z", "m" });
+        } else {
+            try got.expect(&.{ 1, 2, null, null, null }, &.{ "x", null, null, "z", "m" });
         }
     }
+}
+
+test "join: multi-key ON (int + string) pairs only fully equal keys" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const lb = [_]Batch{try kvBatch(a, &join_left_schema, &.{ 1, 1, 2, 3 }, &.{ "a", "b", "a", null })};
+    const rb = [_]Batch{try kvBatch(a, &join_right_schema, &.{ 1, 2, 1 }, &.{ "a", "z", "a" })};
+    var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+    var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+    var lscan = Scan{ .src = lts.src() };
+    var rscan = Scan{ .src = rts.src() };
+    var jn = Join{
+        .probe = .{ .scan = &lscan },
+        .build = .{ .scan = &rscan },
+        .left_keys = &.{ 0, 1 },
+        .right_keys = &.{ 0, 1 },
+        .left_schema = &join_left_schema,
+        .right_schema = &join_right_schema,
+        .out_schema = &join_both_schema,
+        .kind = .inner,
+        .state = a,
+    };
+    // Only (1,"a") matches, and it matches both build rows carrying that key.
+    const got = try JoinRows.collect(a, .{ .join = &jn }, 3);
+    try got.expect(&.{ 1, 1 }, &.{ "a", "a" });
+}
+
+test "join: cross pairs every probe row with every build row" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const lb = [_]Batch{try kvBatch(a, &join_left_schema, &.{ 1, 2 }, &.{ "a", "b" })};
+    const rb = [_]Batch{try kvBatch(a, &join_right_schema, &.{ 7, 8, 9 }, &.{ "x", "y", "z" })};
+    var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+    var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+    var lscan = Scan{ .src = lts.src() };
+    var rscan = Scan{ .src = rts.src() };
+    var jn = Join{
+        .probe = .{ .scan = &lscan },
+        .build = .{ .scan = &rscan },
+        .left_keys = &.{},
+        .right_keys = &.{},
+        .left_schema = &join_left_schema,
+        .right_schema = &join_right_schema,
+        .out_schema = &join_both_schema,
+        .kind = .cross,
+        .state = a,
+    };
+    const got = try JoinRows.collect(a, .{ .join = &jn }, 3);
+    try got.expect(&.{ 1, 1, 1, 2, 2, 2 }, &.{ "x", "y", "z", "x", "y", "z" });
+}
+
+test "join: the build-size guard reports instead of exhausting memory" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const rb = [_]Batch{try kvBatch(a, &join_right_schema, &.{ 1, 2, 3 }, &.{ "x", "y", "z" })};
+    const lb = [_]Batch{try kvBatch(a, &join_left_schema, &.{1}, &.{"a"})};
+    var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+    var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+    var lscan = Scan{ .src = lts.src() };
+    var rscan = Scan{ .src = rts.src() };
+    var ec = ErrCtx{};
+    var jn = Join{
+        .probe = .{ .scan = &lscan },
+        .build = .{ .scan = &rscan },
+        .left_keys = &.{0},
+        .right_keys = &.{0},
+        .left_schema = &join_left_schema,
+        .right_schema = &join_right_schema,
+        .out_schema = &join_both_schema,
+        .kind = .inner,
+        .state = a,
+        .err = &ec,
+    };
+    const saved = join_build_byte_cap;
+    join_build_byte_cap = 8;
+    defer join_build_byte_cap = saved;
+    const top = Op{ .join = &jn };
+    try testing.expectError(error.JoinBuildTooLarge, top.next(a));
+    try testing.expect(std.mem.indexOf(u8, ec.msg, "exceeds 1 GiB") != null);
 }
 
 test "union drains children in order, skipping empty ones" {

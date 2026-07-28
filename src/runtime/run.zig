@@ -3942,14 +3942,17 @@ fn buildJoin(env: *Env, j: ast.Join, left_schema: types.Schema, probe: op.Op) an
     const o = try arena.create(op.Join);
     o.* = .{
         .probe = probe,
+        // Serial plan: the index is built from this pipeline on the first pull.
         .build = build.op,
-        .left_key = jp.lk,
-        .right_key = jp.rk,
+        .index = null,
+        .left_keys = jp.lks,
+        .right_keys = jp.rks,
         .left_schema = try schemaPtr(arena, left_schema),
         .right_schema = try schemaPtr(arena, build.schema),
         .out_schema = out,
         .kind = j.kind,
         .state = arena,
+        .err = env.errctx,
     };
     return .{ .op = .{ .join = o }, .schema = out.* };
 }
@@ -5623,6 +5626,34 @@ test "join: an empty build side drops all rows (inner) and null-fills (left)" {
     const left = try tmp.dir.readFileAlloc(alloc, "left.csv", 1 << 20);
     defer alloc.free(left);
     try std.testing.expectEqualStrings("id,label\n1,\n2,\n", left);
+}
+
+test "join: two-key ON matches on both columns" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,day,code\n1,mon,A\n2,tue,A\n3,mon,B\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "lookup.csv", .data = "day,code,label\nmon,A,first\ntue,A,second\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
+    defer alloc.free(in_path);
+    const lookup_path = try std.fs.path.join(alloc, &.{ base, "lookup.csv" });
+    defer alloc.free(lookup_path);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "LOAD INTO '{s}' AS\nWITH labels AS (SELECT * FROM '{s}')\n" ++
+            "SELECT t.id, l.label FROM '{s}' t JOIN labels l ON t.code = l.code AND l.day = t.day;",
+        .{ out_path, lookup_path, in_path },
+    );
+    defer alloc.free(script);
+
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    // Row 3 (mon,B) has no lookup row; row 2 matches only on the (tue,A) pair.
+    try std.testing.expectEqualStrings("id,label\n1,first\n2,second\n", out);
 }
 
 test "join: duplicate build keys fan out (inner); semi/anti reduce to existence" {

@@ -209,12 +209,14 @@ pub const AggFunc = enum { count, sum, avg, min, max };
 pub const AggItem = struct { name: []const u8, func: AggFunc, arg: ?*Expr, distinct: bool = false };
 pub const Aggregate = struct { aggs: []const AggItem, by: []const QualName };
 
-pub const JoinKind = enum { inner, left, semi, anti };
+pub const JoinKind = enum { inner, left, semi, anti, right, full, cross };
+/// `left_keys[i] = right_keys[i]` for every i — the equi-join conjunction.
+/// Both sides are plain (possibly qualified) column names; `cross` carries none.
 pub const Join = struct {
     kind: JoinKind,
     binding: []const u8,
-    left_key: QualName,
-    right_key: QualName,
+    left_keys: []const QualName,
+    right_keys: []const QualName,
 };
 
 pub const Write = struct {
