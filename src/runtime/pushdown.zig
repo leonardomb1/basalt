@@ -77,6 +77,156 @@ pub fn planAgg(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Sch
     return plan;
 }
 
+/// A whole aggregate descended into ONE source query. Unlike `Plan`/`MapPlan` this is
+/// AUTHORITATIVE: the source's GROUP BY result is what the pipeline emits, so there is
+/// no engine-side re-aggregation to correct a rendering that isn't exactly equivalent.
+pub const WholeAgg = struct {
+    /// The complete grouped statement, ready for `sql.Source.open`.
+    sql: []const u8,
+    /// The AND-ed translated prefix filters, or null when the prefix was empty.
+    where_sql: ?[]const u8 = null,
+};
+
+/// Render `read <base> | filter* | aggregate ag` as a single grouped query, or null to
+/// leave the aggregate engine-side. `plan_schema` is what the engine's `aggregatePlan`
+/// decided the output is — group keys first, then one field per `ag.aggs` entry — and
+/// every aggregate is wrapped in a CAST to the dialect spelling of *that* type, so the
+/// source cannot hand back a wider/narrower result than the plan promises.
+///
+/// Null (fall back to scanning + aggregating here) on anything not provably identical
+/// on postgres, mysql/StarRocks and sqlserver alike:
+///   - a non-`filter` stage in the prefix, or a filter `translateExpr` won't take;
+///   - a group key that isn't a bare source column, or whose type doesn't pass through;
+///   - `AVG` (int-avg diverges: engine float vs mysql decimal vs sqlserver int division);
+///   - `SUM` of anything but an int column into an int result — a decimal sum can
+///     overflow the CAST target the engine would have carried in an i64, and postgres
+///     `SUM(real)` accumulates in float4 where the engine uses f64;
+///   - `MIN`/`MAX` outside int/float/decimal/date — string extremes follow the source's
+///     COLLATION (case-insensitive by default on mysql and sqlserver) while the engine
+///     compares bytes, and a timestamp CAST can shift under a session timezone;
+///   - `DISTINCT` on anything but `COUNT` (the engine's `updateAcc` only honours it there);
+///   - a planned output type `sqlTypeName` has no cast target for.
+///
+/// Null handling matches by construction and is verified on the engine side: NULL group
+/// keys collapse into one group (`op.Aggregate.drainFixed`'s null mask / `keyhash.valueEq`),
+/// `COUNT(col)`/`SUM`/`MIN`/`MAX` skip nulls (`op.Aggregate.updateAcc`), and an ungrouped
+/// aggregate over zero rows still emits one row of COUNT 0 / NULL extremes
+/// (`op.Aggregate.drainImpl`'s `by.len == 0` branch always returns one group) — which is
+/// exactly what all three dialects return for an ungrouped aggregate over no rows.
+pub fn planWholeAgg(
+    arena: std.mem.Allocator,
+    dialect: Dialect,
+    base_sql: []const u8,
+    src_schema: types.Schema,
+    prefix: []const ast.Stage,
+    ag: ast.Aggregate,
+    plan_schema: types.Schema,
+) !?WholeAgg {
+    if (ag.by.len == 0 and ag.aggs.len == 0) return null;
+    if (plan_schema.fields.len != ag.by.len + ag.aggs.len) return null;
+
+    // Gate 2: EVERY prefix stage is a filter, and every one translates whole. A
+    // partially pushed predicate would be a superset — fine for advisory pushdown,
+    // wrong here, because nothing re-applies the missing half.
+    var where = std.array_list.Managed(u8).init(arena);
+    for (prefix) |st| {
+        if (st.node != .filter) return null;
+        const frag = (try translateExpr(arena, st.node.filter, dialect, src_schema, true)) orelse return null;
+        if (where.items.len > 0) try where.appendSlice(" AND ");
+        try where.appendSlice(frag);
+    }
+
+    // Gate 3: bare source columns only, carried through with their own type.
+    var sel = std.array_list.Managed(u8).init(arena);
+    var keys = std.array_list.Managed(u8).init(arena);
+    for (ag.by, 0..) |q, i| {
+        if (q.parts.len != 1) return null;
+        const col = q.parts[0];
+        const idx = src_schema.indexOf(col) orelse return null;
+        const out = plan_schema.fields[i];
+        if (!std.mem.eql(u8, out.name, col)) return null;
+        if (out.ty.kind != src_schema.fields[idx].ty.kind) return null;
+        const qc = try splitmod.quoteIdent(arena, dialect, col);
+        if (keys.items.len > 0) try keys.appendSlice(", ");
+        try keys.appendSlice(qc);
+        if (sel.items.len > 0) try sel.appendSlice(", ");
+        try sel.appendSlice(try std.fmt.allocPrint(arena, "{s} AS {s}", .{ qc, qc }));
+    }
+
+    // Gates 4 + 5: an allowed aggregate over a bare column, CAST to the engine's own
+    // planned output type, and aliased to the engine's own column name.
+    for (ag.aggs, 0..) |item, i| {
+        const out = plan_schema.fields[ag.by.len + i];
+        const inner = (try aggExpr(arena, dialect, src_schema, item, out.ty)) orelse return null;
+        const cast_to = (try sqlTypeName(arena, dialect, out.ty)) orelse return null;
+        if (sel.items.len > 0) try sel.appendSlice(", ");
+        try sel.appendSlice(try std.fmt.allocPrint(arena, "CAST({s} AS {s}) AS {s}", .{
+            inner, cast_to, try splitmod.quoteIdent(arena, dialect, out.name),
+        }));
+    }
+
+    // `base_sql` is the read's own statement, raw `PUSHDOWN(...)` predicate included, so
+    // wrapping it as a subquery composes with whatever it already filters — the shape
+    // `sqlWithWhere` and `split.zig` both use for a QUERY-form read.
+    var q = std.array_list.Managed(u8).init(arena);
+    try q.appendSlice(try std.fmt.allocPrint(arena, "SELECT {s} FROM ({s}) _g", .{ sel.items, base_sql }));
+    if (where.items.len > 0) try q.appendSlice(try std.fmt.allocPrint(arena, " WHERE {s}", .{where.items}));
+    if (keys.items.len > 0) try q.appendSlice(try std.fmt.allocPrint(arena, " GROUP BY {s}", .{keys.items}));
+
+    const where_sql: ?[]const u8 = if (where.items.len > 0) where.items else null;
+    return WholeAgg{ .sql = try q.toOwnedSlice(), .where_sql = where_sql };
+}
+
+/// One aggregate's SQL (before the outer result-type CAST), or null when it isn't
+/// provably the engine's own answer. See `planWholeAgg`'s doc comment for the why of
+/// each exclusion.
+fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, item: ast.AggItem, out_ty: types.Type) !?[]const u8 {
+    // T-SQL's COUNT accumulates in a 32-bit int and RAISES past 2^31 rows, where
+    // postgres/mysql already return a 64-bit count; COUNT_BIG is the matching spelling.
+    const count_fn: []const u8 = if (dialect == .sqlserver) "COUNT_BIG" else "COUNT";
+
+    if (item.func == .count and item.arg == null) {
+        if (item.distinct) return null;
+        return try std.fmt.allocPrint(arena, "{s}(*)", .{count_fn});
+    }
+
+    const arg = item.arg orelse return null;
+    if (arg.* != .field or arg.field.parts.len != 1) return null;
+    const name = arg.field.parts[0];
+    const idx = src_schema.indexOf(name) orelse return null;
+    const src_kind = src_schema.fields[idx].ty.kind;
+    const col = try splitmod.quoteIdent(arena, dialect, name);
+
+    switch (item.func) {
+        .count => {
+            if (item.distinct) return try std.fmt.allocPrint(arena, "{s}(DISTINCT {s})", .{ count_fn, col });
+            return try std.fmt.allocPrint(arena, "{s}({s})", .{ count_fn, col });
+        },
+        .sum => {
+            if (item.distinct) return null;
+            if (src_kind != .int or out_ty.kind != .int) return null;
+            // sqlserver sums `int` in `int` and raises on overflow; widening the
+            // ADDEND (not the result) makes it accumulate in bigint like the engine.
+            // postgres (int4→int8, int8→numeric) and mysql (→decimal) already do.
+            if (dialect != .sqlserver) return try std.fmt.allocPrint(arena, "SUM({s})", .{col});
+            return try std.fmt.allocPrint(arena, "SUM(CAST({s} AS BIGINT))", .{col});
+        },
+        .min, .max => {
+            if (item.distinct) return null;
+            if (out_ty.kind != src_kind) return null;
+            switch (src_kind) {
+                .int, .float, .date => {},
+                // A `DECIMAL(0,0)` cast target is not valid SQL anywhere; an
+                // unresolved precision means fall back rather than guess one.
+                .decimal => if (out_ty.precision == 0 or out_ty.scale > out_ty.precision) return null,
+                else => return null,
+            }
+            return try std.fmt.allocPrint(arena, "{s}({s})", .{ if (item.func == .min) "MIN" else "MAX", col });
+        },
+        .avg => return null,
+    }
+}
+
 /// The result of map-only pushdown planning (`read … | (filter|select|…) | write`).
 pub const MapPlan = struct {
     proj_select: ?[]const u8 = null,
@@ -1018,5 +1168,262 @@ test "translateExpr: a safe (TRY_) cast is never pushed" {
     try testing.expect((try translateExpr(a, safe, .mysql, testSchema(), true)) == null);
     try testing.expect((try translateExpr(a, safe, .postgres, testSchema(), true)) == null);
     try testing.expect((try translateExpr(a, safe, .sqlserver, testSchema(), true)) == null);
+}
+
+// --- planWholeAgg: AUTHORITATIVE whole-aggregate descent -------------------
+
+/// a int, b string, c int, f float, m decimal(12,2), t timestamp.
+fn wholeSchema() types.Schema {
+    return .{ .fields = &.{
+        .{ .name = "a", .ty = types.Type.init(.int) },
+        .{ .name = "b", .ty = types.Type.init(.string) },
+        .{ .name = "c", .ty = types.Type.init(.int) },
+        .{ .name = "f", .ty = types.Type.init(.float) },
+        .{ .name = "m", .ty = types.Type.decimal(12, 2) },
+        .{ .name = "t", .ty = types.Type.init(.timestamp) },
+    } };
+}
+
+fn geFilter(arena: std.mem.Allocator, col: []const u8, v: i64) !ast.Stage {
+    const lit = try arena.create(ast.Expr);
+    lit.* = .{ .int_lit = v };
+    return .{ .node = .{ .filter = try bin(arena, .ge, try fld(arena, col), lit) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
+}
+
+fn byList(arena: std.mem.Allocator, names: []const []const u8) ![]ast.QualName {
+    const by = try arena.alloc(ast.QualName, names.len);
+    for (names, by) |n, *q| {
+        const parts = try arena.alloc([]const u8, 1);
+        parts[0] = n;
+        q.* = .{ .parts = parts };
+    }
+    return by;
+}
+
+const base_t = "SELECT * FROM t";
+
+test "planWholeAgg: grouped multi-aggregate renders with a CAST per dialect" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const filt = try geFilter(a, "a", 5);
+    const aggs = try a.alloc(ast.AggItem, 2);
+    aggs[0] = .{ .name = "n", .func = .count, .arg = null };
+    aggs[1] = .{ .name = "total", .func = .sum, .arg = try fld(a, "c") };
+    const ag = ast.Aggregate{ .aggs = aggs, .by = try byList(a, &.{"b"}) };
+    const plan_schema = types.Schema{ .fields = &.{
+        .{ .name = "b", .ty = types.Type.init(.string) },
+        .{ .name = "n", .ty = types.Type.init(.int) },
+        .{ .name = "total", .ty = types.Type.init(.int).withNull(true) },
+    } };
+
+    const pg = (try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{filt}, ag, plan_schema)).?;
+    try testing.expectEqualStrings(
+        "SELECT \"b\" AS \"b\", CAST(COUNT(*) AS BIGINT) AS \"n\", CAST(SUM(\"c\") AS BIGINT) AS \"total\"" ++
+            " FROM (SELECT * FROM t) _g WHERE (\"a\" >= 5) GROUP BY \"b\"",
+        pg.sql,
+    );
+    try testing.expectEqualStrings("(\"a\" >= 5)", pg.where_sql.?);
+
+    const my = (try planWholeAgg(a, .mysql, base_t, wholeSchema(), &.{filt}, ag, plan_schema)).?;
+    try testing.expectEqualStrings(
+        "SELECT `b` AS `b`, CAST(COUNT(*) AS SIGNED) AS `n`, CAST(SUM(`c`) AS SIGNED) AS `total`" ++
+            " FROM (SELECT * FROM t) _g WHERE (`a` >= 5) GROUP BY `b`",
+        my.sql,
+    );
+
+    // T-SQL: COUNT_BIG (COUNT raises past 2^31) and a widened addend (SUM of `int`
+    // otherwise accumulates in `int` and overflows where the engine's i64 would not).
+    const ms = (try planWholeAgg(a, .sqlserver, base_t, wholeSchema(), &.{filt}, ag, plan_schema)).?;
+    try testing.expectEqualStrings(
+        "SELECT [b] AS [b], CAST(COUNT_BIG(*) AS BIGINT) AS [n], CAST(SUM(CAST([c] AS BIGINT)) AS BIGINT) AS [total]" ++
+            " FROM (SELECT * FROM t) _g WHERE ([a] >= 5) GROUP BY [b]",
+        ms.sql,
+    );
+}
+
+test "planWholeAgg: ungrouped COUNT DISTINCT has no GROUP BY and no WHERE" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const aggs = try a.alloc(ast.AggItem, 1);
+    aggs[0] = .{ .name = "u", .func = .count, .arg = try fld(a, "b"), .distinct = true };
+    const ag = ast.Aggregate{ .aggs = aggs, .by = &.{} };
+    const plan_schema = types.Schema{ .fields = &.{.{ .name = "u", .ty = types.Type.init(.int) }} };
+
+    const pg = (try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, ag, plan_schema)).?;
+    try testing.expectEqualStrings(
+        "SELECT CAST(COUNT(DISTINCT \"b\") AS BIGINT) AS \"u\" FROM (SELECT * FROM t) _g",
+        pg.sql,
+    );
+    try testing.expect(pg.where_sql == null);
+
+    const ms = (try planWholeAgg(a, .sqlserver, base_t, wholeSchema(), &.{}, ag, plan_schema)).?;
+    try testing.expectEqualStrings(
+        "SELECT CAST(COUNT_BIG(DISTINCT [b]) AS BIGINT) AS [u] FROM (SELECT * FROM t) _g",
+        ms.sql,
+    );
+}
+
+test "planWholeAgg: a QUERY-form read is wrapped as the subquery, its own WHERE intact" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const aggs = try a.alloc(ast.AggItem, 2);
+    aggs[0] = .{ .name = "lo", .func = .min, .arg = try fld(a, "m") };
+    aggs[1] = .{ .name = "hi", .func = .max, .arg = try fld(a, "f") };
+    const ag = ast.Aggregate{ .aggs = aggs, .by = try byList(a, &.{ "a", "b" }) };
+    const plan_schema = types.Schema{ .fields = &.{
+        .{ .name = "a", .ty = types.Type.init(.int) },
+        .{ .name = "b", .ty = types.Type.init(.string) },
+        .{ .name = "lo", .ty = types.Type.decimal(12, 2).withNull(true) },
+        .{ .name = "hi", .ty = types.Type.init(.float).withNull(true) },
+    } };
+
+    const q = "SELECT * FROM v WHERE D_E_L_E_T_ <> '*'";
+    const got = (try planWholeAgg(a, .mysql, q, wholeSchema(), &.{}, ag, plan_schema)).?;
+    try testing.expectEqualStrings(
+        "SELECT `a` AS `a`, `b` AS `b`, CAST(MIN(`m`) AS DECIMAL(12,2)) AS `lo`, CAST(MAX(`f`) AS DOUBLE) AS `hi`" ++
+            " FROM (SELECT * FROM v WHERE D_E_L_E_T_ <> '*') _g GROUP BY `a`, `b`",
+        got.sql,
+    );
+}
+
+test "planWholeAgg: AVG always falls back (int-avg result types diverge)" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const aggs = try a.alloc(ast.AggItem, 1);
+    aggs[0] = .{ .name = "m", .func = .avg, .arg = try fld(a, "c") };
+    const ag = ast.Aggregate{ .aggs = aggs, .by = try byList(a, &.{"b"}) };
+    const plan_schema = types.Schema{ .fields = &.{
+        .{ .name = "b", .ty = types.Type.init(.string) },
+        .{ .name = "m", .ty = types.Type.init(.float).withNull(true) },
+    } };
+    for ([_]Dialect{ .postgres, .mysql, .sqlserver }) |d|
+        try testing.expect((try planWholeAgg(a, d, base_t, wholeSchema(), &.{}, ag, plan_schema)) == null);
+}
+
+test "planWholeAgg: a qualified or unknown group key falls back" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const aggs = try a.alloc(ast.AggItem, 1);
+    aggs[0] = .{ .name = "n", .func = .count, .arg = null };
+
+    // `t.b` — two parts; the engine groups by `b` but the subquery alias is `_g`,
+    // so the qualified spelling would not resolve there.
+    const by = try a.alloc(ast.QualName, 1);
+    by[0] = .{ .parts = &.{ "t", "b" } };
+    const plan_schema = types.Schema{ .fields = &.{
+        .{ .name = "b", .ty = types.Type.init(.string) },
+        .{ .name = "n", .ty = types.Type.init(.int) },
+    } };
+    try testing.expect((try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = aggs, .by = by }, plan_schema)) == null);
+
+    // A key the source schema doesn't have at all.
+    const missing = try byList(a, &.{"zzz"});
+    const ms_schema = types.Schema{ .fields = &.{
+        .{ .name = "zzz", .ty = types.Type.init(.string) },
+        .{ .name = "n", .ty = types.Type.init(.int) },
+    } };
+    try testing.expect((try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = aggs, .by = missing }, ms_schema)) == null);
+}
+
+test "planWholeAgg: an untranslatable filter falls back instead of pushing a superset" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const nowc = try a.create(ast.Expr);
+    nowc.* = .{ .call = .{ .name = "now", .args = &.{} } };
+    const bad = ast.Stage{ .node = .{ .filter = try bin(a, .gt, try fld(a, "t"), nowc) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
+    const ok = try geFilter(a, "a", 5);
+
+    const aggs = try a.alloc(ast.AggItem, 1);
+    aggs[0] = .{ .name = "n", .func = .count, .arg = null };
+    const ag = ast.Aggregate{ .aggs = aggs, .by = try byList(a, &.{"b"}) };
+    const plan_schema = types.Schema{ .fields = &.{
+        .{ .name = "b", .ty = types.Type.init(.string) },
+        .{ .name = "n", .ty = types.Type.init(.int) },
+    } };
+
+    // One translatable filter alone is fine…
+    try testing.expect((try planWholeAgg(a, .mysql, base_t, wholeSchema(), &.{ok}, ag, plan_schema)) != null);
+    // …but one untranslatable filter anywhere in the prefix sinks the whole descent.
+    try testing.expect((try planWholeAgg(a, .mysql, base_t, wholeSchema(), &.{ ok, bad }, ag, plan_schema)) == null);
+
+    // A `select` in the prefix does too: it renames columns out from under the keys.
+    const items = try a.alloc(ast.SelectItem, 1);
+    items[0] = .star;
+    const sel = ast.Stage{ .node = .{ .select = items }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
+    try testing.expect((try planWholeAgg(a, .mysql, base_t, wholeSchema(), &.{sel}, ag, plan_schema)) == null);
+}
+
+test "planWholeAgg: SUM only descends for an int column into an int result" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const by = try byList(a, &.{"b"});
+    const key = types.Schema.Field{ .name = "b", .ty = types.Type.init(.string) };
+
+    // float: postgres SUM(real) accumulates in float4, the engine in f64.
+    const fa = try a.alloc(ast.AggItem, 1);
+    fa[0] = .{ .name = "s", .func = .sum, .arg = try fld(a, "f") };
+    const fs = types.Schema{ .fields = &.{ key, .{ .name = "s", .ty = types.Type.init(.float).withNull(true) } } };
+    try testing.expect((try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = fa, .by = by }, fs)) == null);
+
+    // decimal: the sum can outgrow the column's own precision, which the CAST would
+    // raise on where the engine's i64 unscaled accumulator would not.
+    const da = try a.alloc(ast.AggItem, 1);
+    da[0] = .{ .name = "s", .func = .sum, .arg = try fld(a, "m") };
+    const ds = types.Schema{ .fields = &.{ key, .{ .name = "s", .ty = types.Type.decimal(12, 2).withNull(true) } } };
+    try testing.expect((try planWholeAgg(a, .mysql, base_t, wholeSchema(), &.{}, .{ .aggs = da, .by = by }, ds)) == null);
+
+    // DISTINCT is honoured by the engine only on COUNT, so never render it elsewhere.
+    const dd = try a.alloc(ast.AggItem, 1);
+    dd[0] = .{ .name = "s", .func = .sum, .arg = try fld(a, "c"), .distinct = true };
+    const is = types.Schema{ .fields = &.{ key, .{ .name = "s", .ty = types.Type.init(.int).withNull(true) } } };
+    try testing.expect((try planWholeAgg(a, .mysql, base_t, wholeSchema(), &.{}, .{ .aggs = dd, .by = by }, is)) == null);
+}
+
+test "planWholeAgg: MIN/MAX falls back on collation- and timezone-sensitive types" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // A string extreme follows the source COLLATION (case-insensitive by default on
+    // mysql and sqlserver); the engine compares bytes.
+    const sa = try a.alloc(ast.AggItem, 1);
+    sa[0] = .{ .name = "lo", .func = .min, .arg = try fld(a, "b") };
+    const ss = types.Schema{ .fields = &.{.{ .name = "lo", .ty = types.Type.init(.string).withNull(true) }} };
+    for ([_]Dialect{ .postgres, .mysql, .sqlserver }) |d|
+        try testing.expect((try planWholeAgg(a, d, base_t, wholeSchema(), &.{}, .{ .aggs = sa, .by = &.{} }, ss)) == null);
+
+    // A timestamp CAST can shift the value under a session timezone.
+    const ta = try a.alloc(ast.AggItem, 1);
+    ta[0] = .{ .name = "hi", .func = .max, .arg = try fld(a, "t") };
+    const ts = types.Schema{ .fields = &.{.{ .name = "hi", .ty = types.Type.init(.timestamp).withNull(true) }} };
+    try testing.expect((try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = ta, .by = &.{} }, ts)) == null);
+
+    // An unresolved decimal precision has no valid cast target either.
+    const ma = try a.alloc(ast.AggItem, 1);
+    ma[0] = .{ .name = "lo", .func = .min, .arg = try fld(a, "m") };
+    const bad = types.Schema{ .fields = &.{.{ .name = "lo", .ty = types.Type.decimal(0, 0).withNull(true) }} };
+    try testing.expect((try planWholeAgg(a, .mysql, base_t, wholeSchema(), &.{}, .{ .aggs = ma, .by = &.{} }, bad)) == null);
+}
+
+test "planWholeAgg: a non-bare aggregate argument falls back" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const two = try a.create(ast.Expr);
+    two.* = .{ .int_lit = 2 };
+    const aggs = try a.alloc(ast.AggItem, 1);
+    aggs[0] = .{ .name = "s", .func = .sum, .arg = try bin(a, .add, try fld(a, "c"), two) };
+    const plan_schema = types.Schema{ .fields = &.{.{ .name = "s", .ty = types.Type.init(.int).withNull(true) }} };
+    try testing.expect((try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = aggs, .by = &.{} }, plan_schema)) == null);
 }
 
