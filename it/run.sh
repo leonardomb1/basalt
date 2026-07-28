@@ -235,6 +235,35 @@ else
   report "quoted-idents (run error)" bad
 fi
 
+# Write dispositions on a file target. `APPEND` used to truncate like every
+# other disposition — two runs left only the second one's rows, silently, on the
+# keyword documented as the default. A bare `LOAD INTO` and `REPLACE` must still
+# truncate; only an explicit `APPEND` accumulates, and only one header.
+printf 'id\n1\n2\n3\n' > "$out/app_expected.csv"
+printf 'id\n3\n' > "$out/trunc_expected.csv"
+rm -f "$out/app.csv" "$out/bare.csv" "$out/rep.csv"
+for i in 1 2 3; do brun run -c "LOAD INTO '$out/app.csv' APPEND AS SELECT $i AS id;" || break; done
+check append-accumulates "$out/app.csv" "$out/app_expected.csv"
+
+for i in 1 2 3; do brun run -c "LOAD INTO '$out/bare.csv' AS SELECT $i AS id;" || break; done
+check append-bare-truncates "$out/bare.csv" "$out/trunc_expected.csv"
+
+for i in 1 2 3; do brun run -c "LOAD INTO '$out/rep.csv' REPLACE AS SELECT $i AS id;" || break; done
+check append-replace-truncates "$out/rep.csv" "$out/trunc_expected.csv"
+
+# A parquet footer is written last, so the file cannot be extended in place.
+# Refusing at plan time beats silently discarding the previous run — and `check`
+# must catch it without touching the filesystem.
+rm -f "$out/never.parquet"
+if $B check -c "LOAD INTO '$out/never.parquet' APPEND AS SELECT 1 AS id;" >"$out/app_pq.log" 2>&1; then
+  report "append-parquet-refused (check accepted it)" bad
+elif grep -q "is not supported" "$out/app_pq.log" && [ ! -e "$out/never.parquet" ]; then
+  report append-parquet-refused ok
+else
+  report "append-parquet-refused (wrong message or file created)" bad
+  head -2 "$out/app_pq.log"
+fi
+
 # Parquet: read the committed fixtures through the CLI. The unit tests decode
 # pages directly; this is the only check that the .parquet dispatch, planning and
 # sink path all line up. Reference output comes from DuckDB, so a green run means

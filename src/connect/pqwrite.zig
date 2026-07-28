@@ -33,6 +33,9 @@ const List = std.array_list.Managed;
 
 pub const Error = error{
     UnsupportedParquetWrite,
+    /// A parquet file cannot be extended: the footer indexes every row group and
+    /// is written last, so adding rows means rewriting the file.
+    AppendNotSupported,
 } || std.mem.Allocator.Error || codec.Error;
 
 /// Rows buffered before a row group is flushed.
@@ -327,12 +330,18 @@ pub const Writer = struct {
         return std.mem.endsWith(u8, path, ".parquet");
     }
 
+    /// `mode` only ever arrives as `.truncate`: the plan layer turns an `APPEND`
+    /// onto a parquet target into an error before opening anything. The check is
+    /// repeated here so a future caller that forgets it fails loudly instead of
+    /// truncating the file it meant to extend.
     pub fn open(
         arena: std.mem.Allocator,
         path: []const u8,
         schema: types.Schema,
         compression: codec.Codec,
+        mode: driver.FileMode,
     ) !*Writer {
+        if (mode == .append) return Error.AppendNotSupported;
         if (!codec.canCompress(compression)) return codec.Error.UnsupportedCodec;
         const maps = try arena.alloc(Mapping, schema.fields.len);
         for (schema.fields, maps) |f, *m| {
@@ -974,7 +983,7 @@ test "written files read back with the values and nulls intact" {
         .{ .name = "ok", .ty = types.Type.init(.bool).asNullable() },
     } };
 
-    var w = try Writer.open(a, path, schema, .snappy);
+    var w = try Writer.open(a, path, schema, .snappy, .truncate);
     // three rows, with a null in every column position at least once
     var ids = try column.Builder.initCapacity(a, schema.fields[0].ty, 3);
     var names = try column.Builder.initCapacity(a, schema.fields[1].ty, 3);
@@ -1024,7 +1033,7 @@ test "a codec without an encoder is refused at open, before any bytes are writte
     const dir = try tmp.dir.realpathAlloc(a, ".");
     const path = try std.fs.path.join(a, &.{ dir, "x.parquet" });
     const schema = types.Schema{ .fields = &.{.{ .name = "a", .ty = types.Type.init(.int) }} };
-    try testing.expectError(codec.Error.UnsupportedCodec, Writer.open(a, path, schema, .zstd));
+    try testing.expectError(codec.Error.UnsupportedCodec, Writer.open(a, path, schema, .zstd, .truncate));
 }
 
 test "statistics record min, max and null count per row group" {
@@ -1041,7 +1050,7 @@ test "statistics record min, max and null count per row group" {
         .{ .name = "n", .ty = types.Type.init(.int).asNullable() },
         .{ .name = "s", .ty = types.Type.init(.string).asNullable() },
     } };
-    var w = try Writer.open(a, path, schema, .snappy);
+    var w = try Writer.open(a, path, schema, .snappy, .truncate);
     var ns = try column.Builder.initCapacity(a, schema.fields[0].ty, 4);
     var ss = try column.Builder.initCapacity(a, schema.fields[1].ty, 4);
     try ns.append(.{ .int = 5 });
@@ -1219,7 +1228,7 @@ test "dictionary encoding round-trips low-cardinality strings" {
     const schema = types.Schema{ .fields = &.{
         .{ .name = "cat", .ty = types.Type.init(.string).asNullable() },
     } };
-    var w = try Writer.open(a, path, schema, .snappy);
+    var w = try Writer.open(a, path, schema, .snappy, .truncate);
 
     // 300 rows over three distinct values: comfortably dictionary-worthy
     var b = try column.Builder.initCapacity(a, schema.fields[0].ty, 300);
@@ -1267,7 +1276,7 @@ test "an az:// target routes to the blob writer, never the local filesystem" {
         .{ .name = "x", .ty = types.Type.init(.int).asNullable() },
     } };
 
-    const w = Writer.open(a, "az://acct/ctr/bronze/t.parquet", schema, .snappy) catch |e| {
+    const w = Writer.open(a, "az://acct/ctr/bronze/t.parquet", schema, .snappy, .truncate) catch |e| {
         // No AZURE_STORAGE_KEY set is the expected outcome on a bare test box.
         try testing.expect(e != error.FileNotFound and e != error.NotDir);
         return;
@@ -1299,7 +1308,7 @@ test "chunk size totals account for page headers" {
         .{ .name = "name", .ty = types.Type.init(.string).asNullable() },
     } };
 
-    var w = try Writer.open(a, path, schema, .snappy);
+    var w = try Writer.open(a, path, schema, .snappy, .truncate);
     const rows = 500;
     var ids = try column.Builder.initCapacity(a, schema.fields[0].ty, rows);
     var names = try column.Builder.initCapacity(a, schema.fields[1].ty, rows);

@@ -136,11 +136,19 @@ AS
   path `LOAD INTO 'az://account/container/bronze/x.parquet'`.
 - A per-row dynamic target uses `IDENTIFIER(<string-expr>)` over loop vars
   (§7): `LOAD INTO sr.IDENTIFIER('crm_' || lower($name)) ...`.
-- Dispositions: `APPEND` (default, omissible) · `REPLACE` (overwrite) ·
-  `UPSERT ON (k1, k2)` · `UPSERT ON (id) PARTIAL COLS (a, b)` · bare `UPSERT`
-  (infer the PK from the source table's metadata at plan time — needs a table
-  read on a SQL source that exposes it). An empty/unresolved upsert key is an
-  error, never a silent no-op.
+- Dispositions on a **table target**: `APPEND` (default, omissible) · `REPLACE`
+  (overwrite) · `UPSERT ON (k1, k2)` · `UPSERT ON (id) PARTIAL COLS (a, b)` ·
+  bare `UPSERT` (infer the PK from the source table's metadata at plan time —
+  needs a table read on a SQL source that exposes it). An empty/unresolved
+  upsert key is an error, never a silent no-op.
+- Dispositions on a **file target** — the omissible default is *not* `APPEND`:
+  a bare `LOAD INTO 'x.csv'`, like `REPLACE`, creates or truncates the file, so
+  a rerun replaces it. Explicit `APPEND` accumulates for CSV only: the file is
+  opened without truncating and the header row is written only when it was
+  absent or empty. Explicit `APPEND` is a plan-time error for `.parquet` (the
+  footer indexes every row group and is written last, so appending means
+  rewriting the file) and for `az://` (a blob is replaced on write, never
+  extended) — use `REPLACE`, a per-run path, or `INTO BUFFER` (§8).
 - `SPLIT BY (col)` parallelizes the load by key ranges; `JOBS n` fixes the
   lane count (otherwise the CLI `-j` applies).
 

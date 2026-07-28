@@ -539,9 +539,15 @@ pub const CsvWriter = struct {
         };
     }
 
-    pub fn open(arena: std.mem.Allocator, path: []const u8, schema: types.Schema) !*CsvWriter {
+    /// `.append` opens the file without truncating and resumes at its end,
+    /// emitting the header only when there was nothing there — appending to a
+    /// populated CSV must not splice a second header into the rows. A block blob
+    /// is committed whole rather than extended, so it takes `.truncate` only.
+    pub fn open(arena: std.mem.Allocator, path: []const u8, schema: types.Schema, mode: driver.FileMode) !*CsvWriter {
         const self = try arena.create(CsvWriter);
+        var header = true;
         if (azure.isUrl(path)) {
+            if (mode == .append) return error.AppendNotSupported;
             const client = try arena.create(std.http.Client);
             client.* = httpx.initClient(arena);
             const blob = try azure.parseUrl(arena, path, azure.endpointFromEnv(arena));
@@ -550,16 +556,23 @@ pub const CsvWriter = struct {
                 .w = try azure.BlockBlobWriter.init(arena, client, blob, "text/csv"),
             } } };
         } else {
-            self.* = .{ .backend = .{ .file = try std.fs.cwd().createFile(path, .{}) } };
+            self.* = .{ .backend = .{ .file = try std.fs.cwd().createFile(path, .{ .truncate = mode == .truncate }) } };
             self.fw = self.backend.file.writer(&self.write_buf);
+            if (mode == .append) {
+                const end = try self.backend.file.getEndPos();
+                try self.fw.seekTo(end);
+                header = end == 0;
+            }
         }
 
-        const w = self.out();
-        for (schema.fields, 0..) |f, i| {
-            if (i > 0) try w.writeByte(',');
-            try writeField(w, f.name);
+        if (header) {
+            const w = self.out();
+            for (schema.fields, 0..) |f, i| {
+                if (i > 0) try w.writeByte(',');
+                try writeField(w, f.name);
+            }
+            try w.writeByte('\n');
         }
-        try w.writeByte('\n');
         return self;
     }
 

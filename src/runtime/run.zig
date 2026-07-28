@@ -4239,6 +4239,19 @@ fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
     return out;
 }
 
+/// Narrows a write disposition to how a file target is opened. A bare `LOAD INTO`
+/// and an explicit `REPLACE` both create-or-truncate — one-shot output is what a
+/// file sink is for, and that is unchanged. Only an explicit `APPEND` accumulates,
+/// and only where bytes can actually be added to what is already there: a parquet
+/// footer indexes the whole file and is written last, and a block blob is committed
+/// as a new object rather than extended, so both are refused here instead of
+/// quietly truncating the target the pipeline meant to grow.
+fn fileWriteMode(env: *Env, w: ast.Write) !driver.FileMode {
+    if (w.mode != .append) return .truncate;
+    const why = analyze.appendUnsupported(w.target) orelse return .append;
+    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`APPEND` into `{s}` is not supported: {s}. Use `REPLACE`, write each run to its own path, or accumulate with `INTO BUFFER` and load the buffer once", .{ w.target, why }));
+}
+
 fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (std.mem.eql(u8, w.connector, "stdout")) {
         if (env.stdout_json) {
@@ -4251,14 +4264,15 @@ fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         return writer.sink();
     }
     if (std.mem.eql(u8, w.connector, "csv")) {
+        const fmode = try fileWriteMode(env, w);
         // A `.parquet` target shares the csv connector but is a different format;
         // without this it would be written as CSV text under a .parquet name.
         if (pqwrite.Writer.isPath(w.target)) {
-            const pw = pqwrite.Writer.open(env.arena, w.target, schema, .snappy) catch |e|
+            const pw = pqwrite.Writer.open(env.arena, w.target, schema, .snappy, fmode) catch |e|
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output parquet `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
             return pw.sink();
         }
-        const writer = csv.CsvWriter.open(env.arena, w.target, schema) catch |e|
+        const writer = csv.CsvWriter.open(env.arena, w.target, schema, fmode) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output CSV `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
         return writer.sink();
     }

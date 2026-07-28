@@ -77,6 +77,13 @@ pub fn transientNet(e: anyerror) bool {
     };
 }
 
+/// How a file sink opens its target. `.truncate` is the one-shot write — a bare
+/// `LOAD INTO` or an explicit `REPLACE`; `.append` adds to whatever is already
+/// there, and only a format that can be extended in place accepts it. The
+/// disposition is narrowed to this before it reaches a writer, so `upsert` (a
+/// table concept) never has to mean anything here.
+pub const FileMode = enum { truncate, append };
+
 pub const Source = struct {
     ptr: *anyopaque,
     vtable: *const VTable,

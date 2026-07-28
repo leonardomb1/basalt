@@ -15,6 +15,7 @@ const eval = @import("../exec/eval.zig");
 const csv = @import("../connect/csv.zig");
 const pqdecode = @import("../connect/pqdecode.zig");
 const pqwrite = @import("../connect/pqwrite.zig");
+const azure = @import("../connect/azure.zig");
 
 pub const Diag = struct {
     buf: [512]u8 = undefined,
@@ -477,6 +478,10 @@ const Ctx = struct {
 
     fn resolveSink(self: *Ctx, w: ast.Write) !Sink {
         if (std.mem.eql(u8, w.connector, "csv") or std.mem.eql(u8, w.connector, "stdout")) {
+            if (w.mode == .append) {
+                if (appendUnsupported(w.target)) |why|
+                    return fail(self.diag, "`APPEND` into `{s}` is not supported: {s}", .{ w.target, why });
+            }
             return .{ .connector = w.connector, .target = w.target, .mode = @tagName(w.mode) };
         }
         const conn = self.connections.get(w.connector) orelse
@@ -608,6 +613,17 @@ pub fn render(plan: Plan, w: anytype) !void {
         }
         try w.writeAll("\n");
     }
+}
+
+/// Why an explicit `APPEND` cannot be honoured for a file target, or null when
+/// it can. Both refusals are about rewriting what is already there: a parquet
+/// footer indexes every row group and is written last, and a block blob is
+/// committed whole rather than extended. One source of truth, so `check` and the
+/// runtime planner cannot drift apart on which targets accumulate.
+pub fn appendUnsupported(target: []const u8) ?[]const u8 {
+    if (azure.isUrl(target)) return "an object-store blob is replaced on write, never extended";
+    if (pqwrite.Writer.isPath(target)) return "a parquet file's footer indexes every row group and is written last, so appending means rewriting the file";
+    return null;
 }
 
 /// The `csv` connector backs every file sink, so the plan has to name the
