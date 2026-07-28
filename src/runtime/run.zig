@@ -749,11 +749,30 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     env.sql_desc = null;
     env.src_name = "";
     const src_base = env.sources.items.len;
-    const res = try buildPipeline(env, stages[0 .. stages.len - 1]);
+    var res = try buildPipeline(env, stages[0 .. stages.len - 1]);
 
     const wr = try resolveUpsertKeys(env, last.write);
 
-    if (opts.threads > 1 and env.sql_desc != null) {
+    // Whole-aggregate descent takes precedence over splitting: one small grouped
+    // result beats N range queries that each ship raw rows here to be folded. The
+    // source schema is only knowable once the read is open, so the plain pipeline is
+    // built first and thrown away when the descent is eligible — the same "open, plan,
+    // reopen" the split path below does.
+    var whole_agg = false;
+    if (env.sql_desc != null and src_base < env.sources.items.len) {
+        if (classifyWholeAgg(stages)) |shape| {
+            if (try wholeAggStages(env, stages, shape, src_base)) |ns| {
+                for (env.sources.items[src_base..]) |sc| sc.close();
+                env.sources.shrinkRetainingCapacity(src_base);
+                env.sql_desc = null;
+                stages = ns;
+                res = try buildPipeline(env, ns[0 .. ns.len - 1]);
+                whole_agg = true;
+            }
+        }
+    }
+
+    if (!whole_agg and opts.threads > 1 and env.sql_desc != null) {
         if (stages[0].node == .read) {
             if (classifyAggPipeline(stages)) |shape| {
                 if (try runParallelSqlAgg(env, stages, shape.prefix, shape.ag, shape.tail, wr, opts, stats, lanes_used, src_base)) return;
@@ -918,6 +937,66 @@ fn classifyAggPipeline(stages: []const ast.Stage) ?AggShape {
     };
     const a = ai orelse return null;
     return .{ .prefix = middle[0..a], .ag = middle[a].node.aggregate, .tail = middle[a + 1 ..] };
+}
+
+/// Recognize `read … | filter* | aggregate | <anything>* | write` — the shape a whole
+/// aggregate can descend into one grouped source query. Two differences from
+/// `classifyAggPipeline`: the prefix is filters ONLY (a `select` renames columns, so the
+/// group keys would no longer be source columns to name in a GROUP BY), and the tail is
+/// unrestricted — `having`, sort, limit and anything else run engine-side over the
+/// grouped result exactly as they did before. Pure: eligibility of the *shape* only;
+/// `pushdown.planWholeAgg` decides whether the aggregate itself is renderable.
+fn classifyWholeAgg(stages: []const ast.Stage) ?AggShape {
+    if (stages.len < 3 or stages[0].node != .read) return null;
+    // A hint on the read is about scanning it (`@[where]`, `@[split…]`, `@[buffer]`),
+    // and none of those survive the rewrite into a grouped query. Leave hinted reads
+    // to the paths that honour them.
+    if (stages[0].hints.len != 0) return null;
+    const middle = stages[1 .. stages.len - 1];
+    for (middle, 0..) |st, i| switch (st.node) {
+        .filter => {},
+        .aggregate => |ag| return .{ .prefix = middle[0..i], .ag = ag, .tail = middle[i + 1 ..] },
+        else => return null,
+    };
+    return null;
+}
+
+/// Try to descend the whole aggregate into the source. On success returns a rewritten
+/// stage list — a QUERY-form read of the grouped SQL, then the untouched post-aggregate
+/// tail, then the write — which the caller rebuilds through the ordinary serial path, so
+/// the result's schema, row counting and sink all come from the existing machinery.
+/// Null means "not eligible": the caller keeps the pipeline it already built.
+fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: AggShape, src_base: usize) !?[]const ast.Stage {
+    const arena = env.arena;
+    const desc = env.sql_desc orelse return null;
+    if (stages[0].node != .read) return null;
+    const rd = stages[0].node.read;
+    if (rd.form != .table and rd.form != .query) return null;
+    for (shape.prefix) |st| if (st.node != .filter) return null;
+
+    const src_schema = try dupeSchema(arena, env.sources.items[src_base].schema());
+
+    // The engine's own output schema for this aggregate — the types every rendered
+    // aggregate is CAST to, and the names the tail and sink already expect.
+    var ad = analyze.Diag{};
+    const apl = analyze.aggregatePlan(arena, src_schema, shape.ag, env.params_expr, &ad) catch return null;
+
+    const wa = (try pushdown.planWholeAgg(arena, desc.dialect, desc.base_sql, src_schema, shape.prefix, shape.ag, apl.schema)) orelse return null;
+
+    const out = try arena.alloc(ast.Stage, shape.tail.len + 2);
+    // No hints: an `@[where = …]` would be re-applied over the grouped result (whose
+    // columns are the aggregate's, not the source's), and `@[split = …]` has nothing
+    // left to split — the read is already one small result set.
+    out[0] = .{
+        .node = .{ .read = .{ .connector = rd.connector, .form = .{ .query = wa.sql } } },
+        .hints = &.{},
+        .pos = stages[0].pos,
+    };
+    for (shape.tail, out[1 .. 1 + shape.tail.len]) |st, *o| o.* = st;
+    out[out.len - 1] = stages[stages.len - 1];
+
+    env.log.log(.debug, "aggregate pushdown: grouped query sent to {s}", .{@tagName(desc.kind)});
+    return out;
 }
 
 /// Build the map-only prefix (`filter`/`select`) onto `scan` using `ta` (a thread
@@ -6672,4 +6751,49 @@ test "join kinds allowed on the parallel probe path" {
     try std.testing.expect(joinKindLaneSafe(.left));
     try std.testing.expect(joinKindLaneSafe(.semi));
     try std.testing.expect(joinKindLaneSafe(.anti));
+
+test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hints" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const p = ast.Pos{ .line = 0, .col = 0 };
+    const pred = try a.create(ast.Expr);
+    pred.* = .{ .bool_lit = true };
+    const items = try a.alloc(ast.SelectItem, 1);
+    items[0] = .star;
+
+    const rd = ast.Stage{ .node = .{ .read = .{ .connector = "db", .form = .{ .table = .{ .parts = &.{"t"} } } } }, .hints = &.{}, .pos = p };
+    const flt = ast.Stage{ .node = .{ .filter = pred }, .hints = &.{}, .pos = p };
+    const sel = ast.Stage{ .node = .{ .select = items }, .hints = &.{}, .pos = p };
+    const agg = ast.Stage{ .node = .{ .aggregate = .{ .aggs = &.{}, .by = &.{} } }, .hints = &.{}, .pos = p };
+    const wrt = ast.Stage{ .node = .{ .write = .{ .connector = "csv", .form = null, .target = "o.csv", .mode = .default } }, .hints = &.{}, .pos = p };
+
+    const simple = [_]ast.Stage{ rd, flt, agg, wrt };
+    const s1 = classifyWholeAgg(&simple).?;
+    try std.testing.expectEqual(@as(usize, 1), s1.prefix.len);
+    try std.testing.expectEqual(@as(usize, 0), s1.tail.len);
+
+    // A post-aggregate filter is HAVING: it stays engine-side, so unlike
+    // `classifyAggPipeline` it must NOT disqualify the descent.
+    const having = [_]ast.Stage{ rd, agg, flt, flt, wrt };
+    const s2 = classifyWholeAgg(&having).?;
+    try std.testing.expectEqual(@as(usize, 0), s2.prefix.len);
+    try std.testing.expectEqual(@as(usize, 2), s2.tail.len);
+    try std.testing.expect(classifyAggPipeline(&having) == null);
+
+    // A `select` in the prefix renames columns out from under the group keys.
+    const selected = [_]ast.Stage{ rd, sel, agg, wrt };
+    try std.testing.expect(classifyWholeAgg(&selected) == null);
+
+    // No aggregate at all, and an aggregate behind a hinted read.
+    const no_agg = [_]ast.Stage{ rd, flt, wrt };
+    try std.testing.expect(classifyWholeAgg(&no_agg) == null);
+
+    const hints = try a.alloc(ast.Hint, 1);
+    hints[0] = .{ .key = "split", .value = .{ .ident = "id" }, .pos = p };
+    var hinted_rd = rd;
+    hinted_rd.hints = hints;
+    const hinted = [_]ast.Stage{ hinted_rd, flt, agg, wrt };
+    try std.testing.expect(classifyWholeAgg(&hinted) == null);
 }
