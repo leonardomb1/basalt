@@ -319,8 +319,10 @@ pairs may be written in either order, and a null key never matches. `CROSS
 JOIN <cte>` takes no `ON`. Right-side columns that collide with a left name
 come back suffixed `_r`. A pipeline shaped `read | filters | join | filters |
 write` over a local CSV/Parquet source probes in parallel under `-j` (right
-and full joins stay serial). The build side is capped at 1 GiB — filter the
-CTE or flip the join past that.
+and full joins stay serial). The build side is fully resident; past 4 GiB the
+run fails fast instead of eating the host — raise the ceiling per join with
+`WITH (max_build = '16GB')` on the join clause, filter the CTE, or flip the
+join.
 
 Table aliases (`FROM t a`, `JOIN c b`) are stripped at parse time — the engine
 sees bare column names.

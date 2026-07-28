@@ -1891,7 +1891,7 @@ fn classifyMapPipeline(stages: []const ast.Stage) ?[]const ast.Stage {
     return middle;
 }
 
-const MapJoinShape = struct { prefix: []const ast.Stage, join: ast.Join, suffix: []const ast.Stage };
+const MapJoinShape = struct { prefix: []const ast.Stage, join: ast.Join, join_hints: []const ast.Hint, suffix: []const ast.Stage };
 
 /// Recognize `read … | (filter|select)* | join | (filter|select)* | write` — exactly
 /// one hash join, no breaker anywhere. The build side is materialized once up front
@@ -1911,7 +1911,7 @@ fn classifyMapJoinPipeline(stages: []const ast.Stage) ?MapJoinShape {
         else => return null,
     };
     const j = ji orelse return null;
-    return .{ .prefix = middle[0..j], .join = middle[j].node.join, .suffix = middle[j + 1 ..] };
+    return .{ .prefix = middle[0..j], .join = middle[j].node.join, .join_hints = middle[j].hints, .suffix = middle[j + 1 ..] };
 }
 
 /// Join kinds whose probe is a pure lookup into a read-only index, so every lane can
@@ -1980,7 +1980,7 @@ fn resolveLaneJoin(env: *Env, shape: MapJoinShape, left_schema: types.Schema) an
     // and go away with `build_arena` — `materializeFull` copies into the state arena.
     var build_arena = std.heap.ArenaAllocator.init(env.gpa);
     defer build_arena.deinit();
-    const index = try op.JoinIndex.create(arena, build_arena.allocator(), build.op, right_schema, right_keys);
+    const index = try op.JoinIndex.create(arena, build_arena.allocator(), build.op, right_schema, right_keys, try joinBuildCap(env, shape.join_hints));
 
     return .{
         .lane = .{
@@ -4086,7 +4086,7 @@ fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schema) a
             return .{ .op = .{ .sort = o }, .schema = schema };
         },
         .aggregate => |ag| return buildAggregate(env, ag, schema, child),
-        .join => |j| return buildJoin(env, j, schema, child),
+        .join => |j| return buildJoin(env, j, stage.hints, schema, child),
         .explode => |ex| {
             var ad = analyze.Diag{};
             const ep = analyze.explodePlan(arena, schema, ex, &ad) catch |e| return aErr(env, &ad, e);
@@ -4131,7 +4131,39 @@ fn buildAggregate(env: *Env, ag: ast.Aggregate, schema: types.Schema, child: op.
     return .{ .op = .{ .aggregate = o }, .schema = out.* };
 }
 
-fn buildJoin(env: *Env, j: ast.Join, left_schema: types.Schema, probe: op.Op) anyerror!PipeRes {
+/// Parse '512MB' / '8GB' / '1024' (bytes) — the value of a join's `max_build` hint.
+fn parseByteSizeText(txt: []const u8) ?usize {
+    const t = std.mem.trim(u8, txt, " \t");
+    var n: usize = 0;
+    while (n < t.len and std.ascii.isDigit(t[n])) n += 1;
+    if (n == 0) return null;
+    const v = std.fmt.parseInt(usize, t[0..n], 10) catch return null;
+    const unit = std.mem.trim(u8, t[n..], " \t");
+    if (unit.len == 0 or std.ascii.eqlIgnoreCase(unit, "b")) return v;
+    if (std.ascii.eqlIgnoreCase(unit, "kb")) return v << 10;
+    if (std.ascii.eqlIgnoreCase(unit, "mb")) return v << 20;
+    if (std.ascii.eqlIgnoreCase(unit, "gb")) return v << 30;
+    return null;
+}
+
+/// The join's build-side byte cap: `WITH (max_build = '8GB')` on the join
+/// clause, else the process default.
+fn joinBuildCap(env: *Env, hints: []const ast.Hint) !usize {
+    for (hints) |h| {
+        if (!std.mem.eql(u8, h.key, "max_build")) continue;
+        const txt: []const u8 = switch (h.value) {
+            .str => |v| v,
+            .ident => |v| v,
+            .int => |v| return if (v > 0) @intCast(v) else planErr(env.diag, "max_build must be positive"),
+            .flag => "",
+        };
+        return parseByteSizeText(txt) orelse
+            planErr(env.diag, try std.fmt.allocPrint(env.arena, "bad max_build `{s}` — use e.g. '512MB' or '8GB'", .{txt}));
+    }
+    return op.join_build_byte_cap;
+}
+
+fn buildJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, left_schema: types.Schema, probe: op.Op) anyerror!PipeRes {
     const arena = env.arena;
     if (env.bindings.get(j.binding) == null)
         return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown binding `{s}` in join", .{j.binding}));
@@ -4154,6 +4186,7 @@ fn buildJoin(env: *Env, j: ast.Join, left_schema: types.Schema, probe: op.Op) an
         .kind = j.kind,
         .state = arena,
         .err = env.errctx,
+        .build_cap = try joinBuildCap(env, hints),
     };
     return .{ .op = .{ .join = o }, .schema = out.* };
 }

@@ -39,7 +39,7 @@ pub fn errLabel(e: anyerror) []const u8 {
         error.CastFailed => "cast failed",
         error.DivByZero => "division by zero",
         error.TypeMismatch => "type mismatch",
-        error.JoinBuildTooLarge => "join build side exceeds 1 GiB — filter the CTE or flip the join",
+        error.JoinBuildTooLarge => "join build side exceeds its cap — raise it with WITH (max_build = '8GB') on the join, filter the CTE, or flip the join",
         else => @errorName(e),
     };
 }
@@ -1803,10 +1803,9 @@ fn reduceExtreme(col: column.Column, func: ast.AggFunc, n: usize) Value {
 /// per-pull batch arena: the join probes it across many pulls), while the child
 /// is pulled with the transient `pull` arena.
 ///
-/// Fails with `JoinBuildTooLarge` as soon as the drained bytes cross
-/// `join_build_byte_cap`, so an unbounded build side is a diagnostic rather
-/// than an OOM.
-fn materializeFull(state: std.mem.Allocator, pull: std.mem.Allocator, child: Op, schema: *const types.Schema, bytes_out: *usize) anyerror!Batch {
+/// Fails with `JoinBuildTooLarge` as soon as the drained bytes cross `cap`,
+/// so an oversized build side is a diagnostic rather than an OOM.
+fn materializeFull(state: std.mem.Allocator, pull: std.mem.Allocator, child: Op, schema: *const types.Schema, bytes_out: *usize, cap: usize) anyerror!Batch {
     const ncols = schema.fields.len;
     const builders = try state.alloc(column.Builder, ncols);
     for (builders, schema.fields) |*b, f| b.* = column.Builder.init(state, f.ty);
@@ -1814,7 +1813,7 @@ fn materializeFull(state: std.mem.Allocator, pull: std.mem.Allocator, child: Op,
     var bytes: usize = 0;
     while (try child.next(pull)) |b| {
         for (b.columns) |*col| bytes += columnBytes(col);
-        if (bytes > join_build_byte_cap) return error.JoinBuildTooLarge;
+        if (bytes > cap) return error.JoinBuildTooLarge;
         var r: usize = 0;
         while (r < b.len) : (r += 1) {
             for (b.columns, 0..) |*col, ci| try builders[ci].append(col.getValue(r));
@@ -1842,15 +1841,13 @@ fn columnBytes(c: *const column.Column) usize {
     return payload + c.validity.bits.len;
 }
 
-// ponytail: one hard-coded 1 GiB ceiling, no knob and no spill. The upgrade
-// path, in order: expose it as a run option, then partition the build side and
-// spill the cold partitions to disk. Neither is worth writing until a real
-// build side gets near a gigabyte.
-/// Ceiling on a materialized join build side. A build side is fully resident
-/// (that is what makes probing O(1)), so without a limit a mis-written CTE
-/// takes the process down instead of reporting. A `var` so tests can lower it;
-/// nothing else writes it.
-pub var join_build_byte_cap: usize = 1 << 30;
+// ponytail: a cap, no spill. If a capped run ever needs the data anyway, the
+// upgrade is partitioning the build side and spilling cold partitions to disk.
+/// Default ceiling on a materialized join build side (fully resident — that is
+/// what makes probing O(1)). Without one a mis-written CTE takes the process
+/// down instead of reporting. Per-join override: `WITH (max_build = '16GB')`
+/// on the join clause. A `var` so tests can lower it; nothing else writes it.
+pub var join_build_byte_cap: usize = 4 << 30;
 
 /// How key columns compare for one key position. Deciding once per batch keeps
 /// the per-row comparison a direct typed load instead of two boxed `Value`s.
@@ -1927,9 +1924,10 @@ pub const JoinIndex = struct {
         build: Op,
         right_schema: *const types.Schema,
         right_keys: []const usize,
+        cap: usize,
     ) anyerror!*JoinIndex {
         var bytes: usize = 0;
-        const batch = try materializeFull(state, pull, build, right_schema, &bytes);
+        const batch = try materializeFull(state, pull, build, right_schema, &bytes, cap);
         const n = batch.len;
         // Rows are addressed as `row + 1` in u32 slots.
         if (n >= std.math.maxInt(u32)) return error.JoinBuildTooLarge;
@@ -1946,19 +1944,19 @@ pub const JoinIndex = struct {
         // A cross join has no keys and is never looked up.
         if (right_keys.len == 0) return self;
 
-        var cap: usize = 16;
-        while (cap < n * 2) cap *= 2;
-        bytes += cap * @sizeOf(u32) + n * (@sizeOf(u32) + @sizeOf(u64));
-        if (bytes > join_build_byte_cap) return error.JoinBuildTooLarge;
+        var cap_slots: usize = 16;
+        while (cap_slots < n * 2) cap_slots *= 2;
+        bytes += cap_slots * @sizeOf(u32) + n * (@sizeOf(u32) + @sizeOf(u64));
+        if (bytes > cap) return error.JoinBuildTooLarge;
 
-        const heads = try state.alloc(u32, cap);
+        const heads = try state.alloc(u32, cap_slots);
         @memset(heads, 0);
         const chain = try state.alloc(u32, n);
         const hashes = try state.alloc(u64, n);
         self.heads = heads;
         self.next = chain;
         self.hashes = hashes;
-        self.mask = cap - 1;
+        self.mask = cap_slots - 1;
 
         const classes = try pull.alloc(KeyClass, right_keys.len);
         for (right_keys, classes) |k, *c| c.* = classOf(batch.columns[k], batch.columns[k]);
@@ -2061,6 +2059,9 @@ pub const Join = struct {
     kind: ast.JoinKind,
     state: std.mem.Allocator,
     err: ?*ErrCtx = null,
+    /// Per-join build-side byte cap (`WITH (max_build = '8GB')`); null = the
+    /// process default `join_build_byte_cap`.
+    build_cap: ?usize = null,
 
     /// right/full: build rows some probe row matched. Lives here rather than in
     /// `JoinIndex` precisely because it is written on the probe path.
@@ -2087,7 +2088,7 @@ pub const Join = struct {
     fn ensureIndex(self: *Join, arena: std.mem.Allocator) anyerror!*JoinIndex {
         const ix = self.index orelse blk: {
             const build = self.build orelse return error.JoinHasNoBuildSide;
-            const made = JoinIndex.create(self.state, arena, build, self.right_schema, self.right_keys) catch |e| {
+            const made = JoinIndex.create(self.state, arena, build, self.right_schema, self.right_keys, self.build_cap orelse join_build_byte_cap) catch |e| {
                 if (self.err) |ec| ec.set("{s}", .{errLabel(e)});
                 return e;
             };
@@ -2848,7 +2849,7 @@ test "join: the build-size guard reports instead of exhausting memory" {
     defer join_build_byte_cap = saved;
     const top = Op{ .join = &jn };
     try testing.expectError(error.JoinBuildTooLarge, top.next(a));
-    try testing.expect(std.mem.indexOf(u8, ec.msg, "exceeds 1 GiB") != null);
+    try testing.expect(std.mem.indexOf(u8, ec.msg, "exceeds its cap") != null);
 }
 
 test "union drains children in order, skipping empty ones" {

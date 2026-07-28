@@ -1196,6 +1196,11 @@ pub const Parser = struct {
                     if (!self.eatKw("and")) break;
                 }
             }
+            var jhints = std.array_list.Managed(ast.Hint).init(self.arena);
+            if (self.isKw("with") and self.peekTag() == .lparen) {
+                _ = self.advance();
+                try self.parseWithHints(&jhints);
+            }
             try stages.append(.{
                 .node = .{ .join = .{
                     .kind = kind,
@@ -1203,7 +1208,7 @@ pub const Parser = struct {
                     .left_keys = try left_keys.toOwnedSlice(),
                     .right_keys = try right_keys.toOwnedSlice(),
                 } },
-                .hints = &.{},
+                .hints = try jhints.toOwnedSlice(),
                 .pos = jpos,
             });
         }
