@@ -358,6 +358,9 @@ pub const Plan = struct {
 fn collectStmtOutputs(outputs: *std.array_list.Managed(ast.Pipeline), stmts: []const ast.Stmt) error{OutOfMemory}!void {
     for (stmts) |st| switch (st) {
         .output => |p| try outputs.append(p),
+        // An EXPLAIN'd query is checked like any other: a plan-time error in it must
+        // fail `check` and `run` whether or not its rows are ever asked for.
+        .explain => |e| try outputs.append(e.pipeline),
         .for_each => |fe| try collectStmtOutputs(outputs, fe.body),
         .match => |m| for (m.arms) |arm| try collectStmtOutputs(outputs, arm.body),
         // A statement function's block is checked where it is *declared*, not per
@@ -424,6 +427,7 @@ pub fn analyzeWith(arena: std.mem.Allocator, raw_program: ast.Program, cli: []co
         .binding => |b| try bindings.put(b.name, b.pipeline),
         .connection => |c| try connections.put(c.name, c),
         .output => |p| try outputs.append(p),
+        .explain => |e| try outputs.append(e.pipeline),
         .for_each => |fe| try collectStmtOutputs(&outputs, fe.body),
         .match => |m| for (m.arms) |arm| try collectStmtOutputs(&outputs, arm.body),
         .func => |fd| if (fd.body == .stmts) try collectStmtOutputs(&outputs, fd.body.stmts),
@@ -466,6 +470,25 @@ pub fn analyzeWith(arena: std.mem.Allocator, raw_program: ast.Program, cli: []co
     for (outputs.items) |pipe| try out_plans.append(try ctx.analyzeOutput(pipe));
 
     return .{ .kind = kind_name, .outputs = try out_plans.toOwnedSlice() };
+}
+
+/// Analyze a single pipeline against declarations already in scope — what the
+/// executor's `EXPLAIN <query>;` statement renders. `analyzeWith` derives the same
+/// context by walking a whole program; the executor is already holding these maps
+/// (with params folded to their bound values), so it hands them over directly.
+pub fn analyzeOne(
+    arena: std.mem.Allocator,
+    kind_name: []const u8,
+    pipe: ast.Pipeline,
+    bindings: *std.StringHashMap(ast.Pipeline),
+    connections: *std.StringHashMap(ast.Connection),
+    params: *const std.StringHashMap(*const ast.Expr),
+    diag: *Diag,
+) Error!Plan {
+    var ctx = Ctx{ .arena = arena, .bindings = bindings, .connections = connections, .params = params, .diag = diag };
+    const outs = try arena.alloc(Output, 1);
+    outs[0] = try ctx.analyzeOutput(pipe);
+    return .{ .kind = kind_name, .outputs = outs };
 }
 
 const Ctx = struct {

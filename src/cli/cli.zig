@@ -754,11 +754,31 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *s
 
     const prepared = try appendDisplaySinks(a, prog);
 
+    // An entry that *opens* with EXPLAIN carries the program-level prefix, which
+    // `basalt run` renders without executing; do the same here rather than silently
+    // running the query. EXPLAIN after anything else (including the session's own
+    // declaration prelude) is an ordinary statement the executor handles.
+    if (prog.explain == .plan) {
+        var adiag: analyze.Diag = .{};
+        const plan = analyze.analyze(a, prepared, &adiag) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            error.AnalyzeFailed => {
+                try msg.print("error: {s}\n", .{adiag.msg});
+                try msg.flush();
+                return;
+            },
+        };
+        try analyze.render(plan, msg);
+        try msg.flush();
+        return;
+    }
+
     const t0 = std.time.milliTimestamp();
     var rdiag: runtime.Diag = .{};
     _ = runtime.run(alloc, prepared, .{
         .log = .{ .summary = .none, .quiet = true },
         .stdout_json = sess.json,
+        .explain = prog.explain == .analyze,
     }, &rdiag) catch |e| {
         if (e == error.OutOfMemory) return e;
         if (e == error.Aborted)

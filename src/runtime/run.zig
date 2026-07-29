@@ -233,6 +233,8 @@ const Env = struct {
     stdout_json: bool = false,
     /// `EXPLAIN ANALYZE`: run the pipeline for its actuals, write nothing.
     explain: bool = false,
+    /// The program's `@kind`, for the header an `EXPLAIN <query>;` statement prints.
+    kind_name: []const u8 = "batch",
 };
 
 /// Drains every batch and keeps none: the rows must still be pulled for the
@@ -532,7 +534,9 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         .connection => |c| try connections.put(c.name, c),
         .func => |fd| try fns.put(fd.name, fd),
         .print => {},
-        .output, .for_each, .match, .call => runnable += 1,
+        // An EXPLAIN counts: a script whose only pipeline is explained is a complete
+        // script, not one that forgot to write anywhere.
+        .output, .for_each, .match, .call, .explain => runnable += 1,
         .param, .kind, .let_const, .throw => {},
     };
     if (runnable == 0)
@@ -552,7 +556,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     for (program.stmts) |s| {
         if (s == .kind) buffer_decl = s.kind.buffer;
     }
-    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .buffer_decl = buffer_decl, .buffer_segment = opts.buffer_segment, .load_label_prefix = opts.load_label_prefix, .load_run_id = opts.load_run_id, .stdout_json = opts.stdout_json, .explain = opts.explain, .fns = &fns };
+    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .buffer_decl = buffer_decl, .buffer_segment = opts.buffer_segment, .load_label_prefix = opts.load_label_prefix, .load_run_id = opts.load_run_id, .stdout_json = opts.stdout_json, .explain = opts.explain, .kind_name = @tagName(program.stmts[0].kind.kind), .fns = &fns };
 
     var batch_arena = std.heap.ArenaAllocator.init(gpa);
     defer batch_arena.deinit();
@@ -561,6 +565,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var lanes_used: usize = 1;
     for (program.stmts[1..]) |s| switch (s) {
         .output => |p| try runOutput(&env, p, opts, &stats, &lanes_used, &batch_arena),
+        .explain => |e| try runExplain(&env, e, opts, &stats, &lanes_used, &batch_arena),
         .for_each => |fe| try runForEach(&env, fe, opts, &stats, &lanes_used, &batch_arena),
         .match => |m| try runStmtMatch(&env, m, opts, &stats, &lanes_used, &batch_arena),
         .print => |p| try runPrint(&env, p, no_loop_vars),
@@ -658,6 +663,7 @@ fn runStmtMatch(env: *Env, m: ast.StmtMatch, opts: RunOptions, stats: *Stats, la
 fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     switch (s.*) {
         .output => |p| try runOutput(env, p, opts, stats, lanes_used, batch_arena),
+        .explain => |e| try runExplain(env, e, opts, stats, lanes_used, batch_arena),
         .for_each => |fe| try runForEach(env, fe, opts, stats, lanes_used, batch_arena),
         .match => |mm| try runStmtMatch(env, mm, opts, stats, lanes_used, batch_arena),
         .print => |p| try runPrint(env, p, no_loop_vars),
@@ -869,6 +875,40 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     snk_open = false;
     try snk.close();
     if (opts.explain) try explainTree(arena, res.op);
+}
+
+/// `EXPLAIN [ANALYZE] <query>;` where it stands — explained against the connections,
+/// CTE bindings, params and LETs the statements above it put in scope, which is the
+/// whole point of the statement form over the program-level prefix.
+///
+/// `ANALYZE` is the ordinary pipeline run with the sink discarded (`env.explain`) and
+/// serially (a plan is worthless if the shape of the pipeline decides what prints), so
+/// it prints exactly the operator tree a whole-script `EXPLAIN ANALYZE` prints. The
+/// plain form executes nothing and renders the static plan — the same IR `basalt
+/// check` builds, through the same `analyze.render`. Both are scoped to this one
+/// statement: everything before and after it runs normally, at full parallelism.
+fn runExplain(env: *Env, e: ast.ExplainStmt, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+    if (e.mode == .analyze) {
+        const outer = env.explain;
+        env.explain = true;
+        defer env.explain = outer;
+        var o = opts;
+        o.explain = true;
+        o.threads = 1;
+        return runOutput(env, e.pipeline, o, stats, lanes_used, batch_arena);
+    }
+
+    var adiag = analyze.Diag{};
+    const plan = analyze.analyzeOne(env.arena, env.kind_name, e.pipeline, env.bindings, env.connections, env.params_expr, &adiag) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        // `adiag`'s message lives in its own stack buffer; copy it out before it goes.
+        error.AnalyzeFailed => return planErr(env.diag, try env.arena.dupe(u8, adiag.msg)),
+    };
+
+    var buf: [4096]u8 = undefined;
+    var out_file = std.fs.File.stdout().writer(&buf);
+    try analyze.render(plan, &out_file.interface);
+    try out_file.interface.flush();
 }
 
 /// Print the operator tree with per-stage actuals. Time is *exclusive*: an
@@ -3551,11 +3591,15 @@ fn runForStmt(env: *Env, s: *const ast.Stmt, lr: LoopRow, opts: RunOptions, stat
             const pipe = try renderPipeline(env.arena, p, lr);
             try runOutput(env, pipe, opts, stats, lanes_used, batch_arena);
         },
+        .explain => |e| {
+            const pipe = try renderPipeline(env.arena, e.pipeline, lr);
+            try runExplain(env, .{ .mode = e.mode, .pipeline = pipe, .pos = e.pos }, opts, stats, lanes_used, batch_arena);
+        },
         .match => |m| try runForMatch(env, m, lr, opts, stats, lanes_used, batch_arena),
         .print => |p| try runPrint(env, p, lr),
         .call => |c| try runCall(env, c, lr, opts, stats, lanes_used, batch_arena),
         .throw => |t| try runThrow(env, t, lr),
-        else => return planErr(env.diag, "a `for` or statement-function body may contain only pipelines, `CASE`, `CALL`, `PRINT` and `THROW` statements"),
+        else => return planErr(env.diag, "a `for` or statement-function body may contain only pipelines, `CASE`, `CALL`, `PRINT`, `EXPLAIN` and `THROW` statements"),
     }
 }
 
@@ -5202,6 +5246,52 @@ fn runToStringP(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []con
         return e;
     };
     return tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
+}
+
+test "EXPLAIN mid-script explains that query without running it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,status\n1,paid\n2,pending\n" });
+
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
+    defer alloc.free(in_path);
+    const ran_path = try std.fs.path.join(alloc, &.{ base, "ran.csv" });
+    defer alloc.free(ran_path);
+    const never_path = try std.fs.path.join(alloc, &.{ base, "never.csv" });
+    defer alloc.free(never_path);
+
+    // The EXPLAIN is not the first statement — the whole point — and its query is
+    // built on a CTE, so it only plans if the binding above it is in scope.
+    const script = try std.fmt.allocPrint(alloc,
+        \\LOAD INTO '{s}' AS SELECT id FROM '{s}';
+        \\EXPLAIN LOAD INTO '{s}' AS
+        \\WITH paid AS (SELECT id FROM '{s}' WHERE status = 'paid')
+        \\SELECT id FROM paid;
+    , .{ ran_path, in_path, never_path, in_path });
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    try std.testing.expectEqual(ast.ExplainMode.none, prog.explain);
+
+    var rdiag: Diag = .{};
+    _ = run(alloc, prog, .{ .log = .{ .quiet = true, .summary = .none } }, &rdiag) catch |e| {
+        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+        return e;
+    };
+
+    // The plan itself goes to stdout (analyze.render), which a test cannot capture;
+    // what is checkable is the half that matters — the statement before it ran, and
+    // the explained load wrote nothing.
+    const ran = try tmp.dir.readFileAlloc(alloc, "ran.csv", 1 << 20);
+    defer alloc.free(ran);
+    try std.testing.expectEqualStrings("id\n1\n2\n", ran);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("never.csv", .{}));
 }
 
 test "CSV -> filter/select -> CSV round-trips" {
