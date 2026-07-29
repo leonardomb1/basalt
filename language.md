@@ -654,6 +654,12 @@ several. A script that *opens* with `EXPLAIN` still explains the whole script,
 offline: no params are bound and nothing runs, which is the form to reach for
 when the point is to inspect a job rather than run one.
 
+A plan printed by an `EXPLAIN` **statement** goes to **stderr**, like the
+`EXPLAIN ANALYZE` tree and `PRINT`: the statements around it may be writing
+rows to stdout, and stdout is the data contract (§10). The whole-script
+`EXPLAIN` prefix prints to stdout instead — there the plan is the invocation's
+only output, so `basalt run -c "EXPLAIN ..." > plan.txt` still captures it.
+
 ```console
 $ basalt run -c "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'db', database = 'erp');
                  EXPLAIN SELECT SUM(v) AS v FROM pg.public.t;"

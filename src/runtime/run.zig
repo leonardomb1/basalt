@@ -905,10 +905,21 @@ fn runExplain(env: *Env, e: ast.ExplainStmt, opts: RunOptions, stats: *Stats, la
         error.AnalyzeFailed => return planErr(env.diag, try env.arena.dupe(u8, adiag.msg)),
     };
 
-    var buf: [4096]u8 = undefined;
-    var out_file = std.fs.File.stdout().writer(&buf);
-    try analyze.render(plan, &out_file.interface);
-    try out_file.interface.flush();
+    // stderr, not stdout: stdout is the data contract (NDJSON rows under
+    // `--format json`, or the summary object), and a script may run pipelines
+    // that write there before or after this statement. The whole-script
+    // `EXPLAIN <script>` prefix still prints to stdout — there it IS the
+    // invocation's only output. This also matches EXPLAIN ANALYZE, whose
+    // operator tree already goes to stderr.
+    //
+    // Rendered into memory and handed to ONE `writeAll`, the way `obs.Logger`
+    // writes: a `File.Writer` opened on stderr mid-run starts its own position
+    // at zero, so when stderr is a regular file it overwrites whatever the
+    // logger already wrote there instead of appending.
+    var aw = std.Io.Writer.Allocating.init(env.gpa);
+    defer aw.deinit();
+    try analyze.render(plan, &aw.writer);
+    std.fs.File.stderr().writeAll(aw.writer.buffered()) catch {};
 }
 
 /// Print the operator tree with per-stage actuals. Time is *exclusive*: an
