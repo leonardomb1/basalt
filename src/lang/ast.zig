@@ -449,12 +449,24 @@ pub const Stmt = union(enum) {
     print: Print,
     call: CallStmt,
     throw: Throw,
+    explain: ExplainStmt,
 };
 
 /// `EXPLAIN` prefix on a program: print the plan instead of running it, or
 /// (with `ANALYZE`) run it and print the plan back with measured actuals.
 /// `COSTS` is rejected at parse time — there is no cost model to report.
 pub const ExplainMode = enum { none, plan, analyze };
+
+/// `EXPLAIN [ANALYZE] <query>;` in statement position: explain one pipeline where
+/// it stands, against whatever the statements above it declared. `plan` renders
+/// the static plan and executes nothing; `analyze` runs the pipeline into a
+/// discarded sink and prints the operator tree with its measured actuals. Never
+/// `.none` — a statement only exists because `EXPLAIN` was written.
+pub const ExplainStmt = struct {
+    mode: ExplainMode,
+    pipeline: Pipeline,
+    pos: Pos,
+};
 
 pub const Program = struct { stmts: []const Stmt, explain: ExplainMode = .none };
 

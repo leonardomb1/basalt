@@ -269,6 +269,10 @@ pub const Parser = struct {
         self.conn_names = std.array_list.Managed([]const u8).init(self.arena);
         self.let_names = std.array_list.Managed([]const u8).init(self.arena);
 
+        // A script that *opens* with EXPLAIN explains the whole script, offline and
+        // without binding params — `basalt run` renders that plan without executing
+        // anything. EXPLAIN anywhere else is a statement (`parseExplainStmt`), which
+        // explains one query against the declarations above it, mid-run.
         var explain: ast.ExplainMode = .none;
         if (self.isKw("explain")) {
             _ = self.advance();
@@ -301,8 +305,44 @@ pub const Parser = struct {
         if (self.isKw("case")) return out.append(.{ .match = try self.parseCaseStmt() });
         if (self.isKw("throw")) return out.append(.{ .throw = try self.parseThrowStmt() });
         if (self.isKw("call")) return out.append(.{ .call = try self.parseCallStmt() });
+        if (self.isKw("explain")) return self.parseExplainStmt(out);
         if (self.isKw("with") or self.isKw("select")) return self.parseTerminalQuery(out);
-        return self.fail(self.curPos(), "expected a statement (CREATE / PARAM / LET / PRINT / THROW / LOAD INTO / SELECT / FOR / CASE / CALL), found {s}", .{self.curTag().describe()});
+        return self.fail(self.curPos(), "expected a statement (CREATE / PARAM / LET / PRINT / THROW / EXPLAIN / LOAD INTO / SELECT / FOR / CASE / CALL), found {s}", .{self.curTag().describe()});
+    }
+
+    /// `EXPLAIN [ANALYZE] <query>;` in statement position — the same query forms a
+    /// terminal statement takes (`SELECT`, `WITH ... SELECT`, `LOAD INTO ... AS`),
+    /// explained against everything declared above it. A leading `EXPLAIN` is still
+    /// consumed by `parseProgram` as the program-level prefix, which explains a whole
+    /// script offline; this is the form that works anywhere else in one.
+    fn parseExplainStmt(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
+        const pos = self.curPos();
+        try self.expectKw("explain");
+        if (self.isKw("costs"))
+            return self.fail(self.curPos(), "EXPLAIN COSTS is not supported: basalt has no cost model", .{});
+        const mode: ast.ExplainMode = if (self.eatKw("analyze")) .analyze else .plan;
+
+        const base = out.items.len;
+        if (self.isKw("load")) {
+            try self.parseLoadInto(out);
+        } else if (self.isKw("with") or self.isKw("select")) {
+            try self.parseTerminalQuery(out);
+        } else {
+            return self.fail(self.curPos(), "expected SELECT, WITH or LOAD INTO after EXPLAIN, found {s}", .{self.curTag().describe()});
+        }
+
+        // A `WITH` hoists its CTEs into `out` as bindings ahead of the pipeline they
+        // feed. Those stay ordinary statements — the query being explained is the one
+        // pipeline the parse ended with.
+        var i = out.items.len;
+        while (i > base) {
+            i -= 1;
+            if (out.items[i] != .output) continue;
+            const pipe = out.items[i].output;
+            out.items[i] = .{ .explain = .{ .mode = mode, .pipeline = pipe, .pos = pos } };
+            return;
+        }
+        return self.fail(pos, "EXPLAIN needs a query to explain", .{});
     }
 
     /// `LET name = <expr>;` — a script-scoped plan-time constant, referenced as
@@ -2566,6 +2606,75 @@ test "sql: terminal select from csv becomes read+write stdout" {
     try testing.expect(pl.stages[3].node == .limit);
     try testing.expect(pl.stages[4].node == .write);
     try testing.expectEqualStrings("stdout", pl.stages[4].node.write.connector);
+}
+
+test "sql: EXPLAIN is a statement anywhere in a script, not only the first" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a,
+        \\CREATE CONNECTION erp TYPE postgres OPTIONS (host = 'h', database = 'erp');
+        \\EXPLAIN WITH paid AS (SELECT id, amount FROM 'in.csv' WHERE status = 'paid')
+        \\SELECT id FROM paid;
+    );
+    // Not the first token, so the program-level prefix stays untouched.
+    try testing.expectEqual(ast.ExplainMode.none, prog.explain);
+    try testing.expectEqual(@as(usize, 4), prog.stmts.len);
+    try testing.expect(prog.stmts[1] == .connection);
+    // The CTE stays an ordinary binding; only the pipeline it feeds is explained.
+    try testing.expect(prog.stmts[2] == .binding);
+    try testing.expectEqualStrings("paid", prog.stmts[2].binding.name);
+    try testing.expect(prog.stmts[3] == .explain);
+    const ex = prog.stmts[3].explain;
+    try testing.expectEqual(ast.ExplainMode.plan, ex.mode);
+    const last = ex.pipeline.stages[ex.pipeline.stages.len - 1];
+    try testing.expect(last.node == .write);
+    try testing.expectEqualStrings("stdout", last.node.write.connector);
+}
+
+test "sql: EXPLAIN ANALYZE and EXPLAIN LOAD INTO as later statements" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a,
+        \\SELECT id FROM 'in.csv';
+        \\EXPLAIN ANALYZE SELECT id FROM 'in.csv';
+        \\EXPLAIN LOAD INTO 'out.csv' AS SELECT id FROM 'in.csv';
+    );
+    try testing.expectEqual(ast.ExplainMode.none, prog.explain);
+    try testing.expectEqual(@as(usize, 4), prog.stmts.len);
+    try testing.expect(prog.stmts[1] == .output);
+    try testing.expect(prog.stmts[2] == .explain);
+    try testing.expectEqual(ast.ExplainMode.analyze, prog.stmts[2].explain.mode);
+    try testing.expect(prog.stmts[3] == .explain);
+    try testing.expectEqual(ast.ExplainMode.plan, prog.stmts[3].explain.mode);
+    const w = prog.stmts[3].explain.pipeline.stages[prog.stmts[3].explain.pipeline.stages.len - 1];
+    try testing.expectEqualStrings("csv", w.node.write.connector);
+    try testing.expectEqualStrings("out.csv", w.node.write.target);
+}
+
+test "sql: EXPLAIN COSTS is rejected in either position" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a, "EXPLAIN COSTS SELECT id FROM 'in.csv';", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "no cost model") != null);
+
+    try testing.expectError(error.ParseFailed, parseSource(a,
+        \\SELECT id FROM 'in.csv';
+        \\EXPLAIN COSTS SELECT id FROM 'in.csv';
+    , &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "no cost model") != null);
+
+    try testing.expectError(error.ParseFailed, parseSource(a,
+        \\SELECT id FROM 'in.csv';
+        \\EXPLAIN CREATE CONNECTION erp TYPE postgres OPTIONS (host = 'h', database = 'erp');
+    , &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "after EXPLAIN") != null);
 }
 
 test "sql: LOAD INTO with GROUP BY becomes aggregate" {

@@ -326,6 +326,23 @@ $B run -c "EXPLAIN ANALYZE LOAD INTO '$out/ea_out.csv' AS SELECT g, v FROM '$out
 [ -e "$out/ea_out.csv" ] && { ea_ok=0; echo "  EXPLAIN ANALYZE wrote the sink"; }
 if [ "$ea_ok" = 1 ]; then report explain-analyze-plan-only ok; else report "explain-analyze-plan-only" bad; fi
 
+# EXPLAIN is a statement, not just a script prefix: it has to be accepted after
+# other statements, explain the query it precedes against the declarations above
+# it, and leave those statements running normally. It used to be a parse error,
+# which made it useless for any query built on a connection or a CTE.
+rm -f "$out/es_ran.csv" "$out/es_never.csv"
+es_ok=1
+$B run -q -c "LOAD INTO '$out/es_ran.csv' AS SELECT g, v FROM '$out/ea.csv';
+              EXPLAIN LOAD INTO '$out/es_never.csv' AS
+              WITH big AS (SELECT g, v FROM '$out/ea.csv' WHERE v > 15)
+              SELECT g FROM big;" >"$out/es.log" 2>&1 || { es_ok=0; echo "  run failed"; cat "$out/es.log"; }
+grep -q "^plan" "$out/es.log" || { es_ok=0; echo "  no plan printed"; }
+[ -e "$out/es_ran.csv" ] || { es_ok=0; echo "  the statement before EXPLAIN did not run"; }
+[ -e "$out/es_never.csv" ] && { es_ok=0; echo "  EXPLAIN executed the query it explained"; }
+$B run -q -c "SELECT g FROM '$out/ea.csv'; EXPLAIN ANALYZE SELECT g, COUNT(*) AS n FROM '$out/ea.csv' GROUP BY g;" >"$out/es2.log" 2>&1
+grep -q "plan (actuals" "$out/es2.log" || { es_ok=0; echo "  no actuals for a mid-script EXPLAIN ANALYZE"; }
+if [ "$es_ok" = 1 ]; then report explain-statement ok; else report "explain-statement" bad; fi
+
 # NTLM config surface. The handshake itself needs a domain-joined server, which
 # the mssql container is not — but the plan-time refusals need no server at all,
 # and they are what stops a misconfigured script from ever reaching the wire.

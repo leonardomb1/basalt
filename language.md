@@ -646,6 +646,19 @@ A source whose schema only the source itself can describe — a database table, 
 remote object — reads `schema: unresolved`, said once at the scan rather than
 repeated down the tree. Neither form connects.
 
+`EXPLAIN` is an ordinary statement: it goes anywhere a terminal `SELECT` or a
+`LOAD INTO` goes, and explains that one query against whatever the statements
+above it declared — connections, CTEs, `PARAM`s, `LET`s, functions. Everything
+before and after it runs normally, at full parallelism, and a script may hold
+several. A script that *opens* with `EXPLAIN` still explains the whole script,
+offline: no params are bound and nothing runs, which is the form to reach for
+when the point is to inspect a job rather than run one.
+
+```console
+$ basalt run -c "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'db', database = 'erp');
+                 EXPLAIN SELECT SUM(v) AS v FROM pg.public.t;"
+```
+
 `EXPLAIN ANALYZE` moves no data. The pipeline runs — that is where the numbers
 come from — but every sink is discarded: a terminal `SELECT` prints its plan
 instead of its rows, and a `LOAD` writes nothing, creates no table and commits

@@ -71,6 +71,7 @@ fn expandStmt(cx: *Ctx, s: ast.Stmt) Error!ast.Stmt {
         .connection => |c| .{ .connection = .{ .name = c.name, .connector = c.connector, .config = try expandAttrs(cx, c.config), .pos = c.pos } },
         .binding => |b| .{ .binding = .{ .name = b.name, .pipeline = try expandPipeline(cx, b.pipeline), .pos = b.pos } },
         .output => |p| .{ .output = try expandPipeline(cx, p) },
+        .explain => |e| .{ .explain = .{ .mode = e.mode, .pipeline = try expandPipeline(cx, e.pipeline), .pos = e.pos } },
         .for_each => |fe| blk: {
             var body = std.array_list.Managed(ast.Stmt).init(cx.arena);
             for (fe.body) |st| {
