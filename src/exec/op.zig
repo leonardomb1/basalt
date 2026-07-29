@@ -1712,12 +1712,21 @@ pub const Aggregate = struct {
             .sum => if (!v.isNull()) {
                 switch (agg.ty.kind) {
                     .float => acc.sum_f += eval.toF64(v),
-                    // Scale is fixed by the column's type, so the unscaled
-                    // integers add directly and `finalizeAcc` reapplies it.
-                    .decimal => acc.sum_i += if (v == .decimal)
-                        (std.math.cast(i64, v.decimal.unscaled) orelse return error.CastFailed)
-                    else
-                        v.int,
+                    // A value's scale is whatever the source sent, which need not
+                    // be the column's declared scale (postgres NUMERIC carries a
+                    // per-value dscale), so every addend is normalized to the
+                    // output scale that `finalizeAcc` will stamp back on. Adding
+                    // raw unscaled integers instead multiplied the sum by
+                    // 10^(declared - actual).
+                    .decimal => {
+                        const d: valuemod.Decimal = if (v == .decimal)
+                            v.decimal
+                        else
+                            .{ .unscaled = v.int, .scale = 0 };
+                        const r = eval.rescaleTo(d, agg.ty.scale) orelse return error.CastFailed;
+                        const addend = std.math.cast(i64, r.unscaled) orelse return error.CastFailed;
+                        acc.sum_i = std.math.add(i64, acc.sum_i, addend) catch return error.CastFailed;
+                    },
                     else => acc.sum_i += v.int,
                 }
                 acc.n += 1;
@@ -2567,6 +2576,41 @@ test "aggregate: sum/avg coerce raw string cells (parallel CSV lane shape); garb
         var agg = Aggregate{ .child = .{ .scan = &scan }, .in_schema = &s_schema, .by = &.{}, .aggs = &aggs, .out_schema = &out_schema, .state = a, .gpa = testing.allocator };
         try testing.expectError(error.CastFailed, agg.next(a));
     }
+}
+
+test "aggregate: a decimal sum normalizes each value's own scale" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // A bare postgres `numeric` has no typmod, so the column is typed
+    // decimal(38,6) while each value arrives at whatever dscale it was stored
+    // with. Summing the raw unscaled integers scaled the answer by
+    // 10^(declared - actual); every addend has to be normalized first.
+    const col_ty = types.Type.decimal(38, 6).asNullable();
+    const in_schema = types.Schema{ .fields = &.{.{ .name = "n", .ty = col_ty }} };
+
+    var bld = column.Builder.init(a, col_ty);
+    try bld.append(.{ .decimal = .{ .unscaled = 15, .scale = 1 } }); // 1.5
+    try bld.append(.{ .decimal = .{ .unscaled = 150, .scale = 2 } }); // 1.50
+    try bld.append(.{ .decimal = .{ .unscaled = 1, .scale = 3 } }); // 0.001
+    try bld.append(.null);
+    const cols = try a.alloc(column.Column, 1);
+    cols[0] = try bld.finish();
+    const batches = [_]Batch{.{ .schema = &in_schema, .columns = cols, .len = 4 }};
+
+    const fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"n"} } };
+    const aggs = [_]Aggregate.Agg{.{ .func = .sum, .arg = &fx, .ty = col_ty }};
+    const out_schema = types.Schema{ .fields = &.{.{ .name = "s", .ty = col_ty }} };
+
+    var ts = TestSource{ .schema_ = in_schema, .batches = &batches };
+    var scan = Scan{ .src = ts.src() };
+    var agg = Aggregate{ .child = .{ .scan = &scan }, .in_schema = &in_schema, .by = &.{}, .aggs = &aggs, .out_schema = &out_schema, .state = a, .gpa = testing.allocator };
+    const out = (try agg.next(a)).?;
+    const d = out.columns[0].getValue(0).decimal;
+    // 1.5 + 1.50 + 0.001 = 3.001, carried at the output scale.
+    try testing.expectEqual(@as(u8, 6), d.scale);
+    try testing.expectEqual(@as(i128, 3_001_000), d.unscaled);
 }
 
 test "aggregate: global vectorized reductions honor nulls; empty input edge cases" {

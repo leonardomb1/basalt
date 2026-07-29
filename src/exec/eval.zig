@@ -1961,8 +1961,14 @@ fn powTen(n: u8) i128 {
 }
 
 /// Shift a decimal to `want`, truncating toward zero when it loses digits —
-/// the same rule the parquet writer applies.
-fn rescaleTo(d: valuemod.Decimal, want: u8) ?valuemod.Decimal {
+/// the same rule the parquet writer applies. Null when scaling up overflows.
+///
+/// Public because a value's scale is NOT guaranteed to match its column's
+/// declared scale: postgres sends a per-value `dscale` on NUMERIC, so a bare
+/// `numeric` column (typed `decimal(38,6)` for want of a typmod) delivers
+/// values at whatever scale each one was stored with. Anything that combines
+/// decimals across rows has to normalize first.
+pub fn rescaleTo(d: valuemod.Decimal, want: u8) ?valuemod.Decimal {
     var unscaled = d.unscaled;
     var have: i32 = d.scale;
     while (have < want) : (have += 1) {

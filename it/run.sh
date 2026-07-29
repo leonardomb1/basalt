@@ -136,6 +136,33 @@ if runs postgres; then
   fi
 fi
 
+# Decimal aggregates against the source's own answer. A bare postgres `numeric`
+# has no typmod, so the column is typed decimal(38,6) while each value arrives at
+# its own dscale — summing raw unscaled integers scaled the total by 10^4, and
+# hashing (unscaled, scale) counted `1.5` and `1.50` as two distinct values.
+# psql computes the expected row, so this stays honest if the engine changes.
+if runs postgres; then
+  pgq() { docker compose -f it/compose.yaml exec -T postgres psql -U postgres -d it -t -A -F, "$@"; }
+  pgq -c "DROP TABLE IF EXISTS it_dec;
+          CREATE TABLE it_dec (k int, n numeric, m numeric(12,2));
+          INSERT INTO it_dec VALUES (1,1.5,1.50),(1,1.50,1.50),(1,0.001,0.10),(2,2.25,2.25);" >/dev/null 2>&1
+  { echo "s,d,mn,mx,fixed";
+    pgq -c "SELECT CAST(SUM(n) AS numeric(20,3)), COUNT(DISTINCT n),
+                   CAST(MIN(n) AS numeric(20,3)), CAST(MAX(n) AS numeric(20,3)),
+                   CAST(SUM(m) AS numeric(20,2)) FROM it_dec;"; } \
+    | sed 's/[[:space:]]*$//' >"$out/pg_dec_expected.csv"
+  if brun run -c "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);
+LOAD INTO '$out/pg_dec.csv' AS
+SELECT CAST(SUM(n) AS DECIMAL(20,3)) AS s, COUNT(DISTINCT n) AS d,
+       CAST(MIN(n) AS DECIMAL(20,3)) AS mn, CAST(MAX(n) AS DECIMAL(20,3)) AS mx,
+       CAST(SUM(m) AS DECIMAL(20,2)) AS fixed
+FROM db.it_dec;"; then
+    check postgres-decimal-aggregates "$out/pg_dec.csv" "$out/pg_dec_expected.csv"
+  else
+    report "postgres-decimal-aggregates (run error)" bad
+  fi
+fi
+
 # Volume: ~7MB encoded (300k rows, nulls every 10th val) — crosses the 4MB
 # segment boundary, so each bulk sink commits and count-verifies 2+ segments,
 # and the Azure writer stages more than one block.

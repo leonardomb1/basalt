@@ -10,8 +10,10 @@
 //! ~30x slower than `getOrPut` with a prebuilt key, so callers materialize a small
 //! key slice per row in the scratch arena instead.
 //!
-//! Invariant: within one key column the value type is fixed, so two values that
-//! compare equal here always hash equal (the hash includes the type tag).
+//! Invariant: two values that compare equal here always hash equal (the hash
+//! includes the type tag, and within one key column the value type is fixed).
+//! Decimals are the case that needs care: they compare NUMERICALLY, so `1.5`
+//! and `1.50` are equal and must hash alike — see `hashValue`.
 
 const std = @import("std");
 const valuemod = @import("value.zig");
@@ -29,8 +31,20 @@ pub fn hashValue(h: *std.hash.Wyhash, v: Value) void {
         .int => |x| h.update(std.mem.asBytes(&x)),
         .float => |x| h.update(std.mem.asBytes(&x)),
         .decimal => |d| {
-            h.update(std.mem.asBytes(&d.unscaled));
-            h.update(std.mem.asBytes(&d.scale));
+            // Hash a trailing-zero-stripped form. `valueEq` compares decimals
+            // numerically, so `1.5` and `1.50` are equal — and a source may well
+            // deliver both (postgres sends a per-value dscale on NUMERIC). Hashing
+            // the raw (unscaled, scale) pair put equal values in different buckets,
+            // which counted them twice in DISTINCT.
+            var u = d.unscaled;
+            var s = d.scale;
+            while (s > 0 and u != 0 and @rem(u, 10) == 0) {
+                u = @divTrunc(u, 10);
+                s -= 1;
+            }
+            if (u == 0) s = 0;
+            h.update(std.mem.asBytes(&u));
+            h.update(std.mem.asBytes(&s));
         },
         .string, .bytes => |s| h.update(s),
         .date => |x| h.update(std.mem.asBytes(&x)),
@@ -141,4 +155,28 @@ test "SingleKeyCtx delegates to hashOne/valueEq" {
     try testing.expectEqual(hashOne(.{ .int = 9 }), ctx.hash(.{ .int = 9 }));
     try testing.expect(ctx.eql(.{ .string = "k" }, .{ .string = "k" }));
     try testing.expect(!ctx.eql(.{ .string = "k" }, .null));
+}
+
+test "hashValue: numerically equal decimals hash alike, so DISTINCT counts them once" {
+    // A source may deliver both spellings of the same number: postgres sends a
+    // per-value dscale on NUMERIC, so `1.5` and `1.50` both arrive from one
+    // column. `valueEq` calls them equal, so the hash has to agree or a hash set
+    // buckets them apart and counts two.
+    const a = Value{ .decimal = .{ .unscaled = 15, .scale = 1 } };
+    const b = Value{ .decimal = .{ .unscaled = 150, .scale = 2 } };
+    try testing.expect(valueEq(a, b));
+    try testing.expectEqual(hashOne(a), hashOne(b));
+
+    // Zero is the case where stripping must not run off the end.
+    try testing.expectEqual(
+        hashOne(.{ .decimal = .{ .unscaled = 0, .scale = 0 } }),
+        hashOne(.{ .decimal = .{ .unscaled = 0, .scale = 4 } }),
+    );
+    // Negatives strip the same way.
+    try testing.expectEqual(
+        hashOne(.{ .decimal = .{ .unscaled = -15, .scale = 1 } }),
+        hashOne(.{ .decimal = .{ .unscaled = -1500, .scale = 3 } }),
+    );
+    // Genuinely different values stay different.
+    try testing.expect(!valueEq(a, .{ .decimal = .{ .unscaled = 151, .scale = 2 } }));
 }
