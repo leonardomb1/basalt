@@ -578,7 +578,9 @@ const KeyArr = struct {
         }
         const ord: std.math.Order = switch (self.data) {
             .ints => |v| std.math.order(v[a], v[c]),
-            .floats => |v| std.math.order(v[a], v[c]),
+            // Total order, NaN last — IEEE leaves NaN unordered and
+            // `std.math.order` answers that with `unreachable`.
+            .floats => |v| eval.orderF64(v[a], v[c]),
             .decs => |v| std.math.order(v[a], v[c]),
             .strs => |v| std.mem.order(u8, v[a], v[c]),
             .boxed => |col| return keyOrder(col.getValue(a), col.getValue(c), self.desc),

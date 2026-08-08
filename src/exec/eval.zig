@@ -925,7 +925,10 @@ inline fn applyOp(comptime T: type, comptime op: ast.BinOp, a: T, d: T) VecError
             (if (d == 0) error.DivByZero else @rem(a, d))
         else
             @mod(a, d),
-        .eq, .ne, .lt, .le, .gt, .ge => cmpResult(op, std.math.order(a, d)),
+        // f64 comparison goes through the total order (NaN equal to itself,
+        // above everything else); `std.math.order` hits `unreachable` on NaN,
+        // and this kernel runs on whole columns.
+        .eq, .ne, .lt, .le, .gt, .ge => cmpResult(op, if (T == f64) orderF64(a, d) else std.math.order(a, d)),
         else => unreachable,
     };
 }
@@ -2379,10 +2382,25 @@ fn pow10f(n: u8) f64 {
     while (k < n) : (k += 1) r *= 10;
     return r;
 }
+/// Total order over f64, postgres' rule: NaN equals NaN and sorts above every
+/// other value. IEEE leaves NaN unordered, which `std.math.order` answers with
+/// `unreachable` — so a NaN anywhere in a float column crashed every compare
+/// (sort, filter, MIN/MAX, group, join). Grouping and hashing need a total
+/// order to be well defined at all, so the choice is postgres', not IEEE's.
+pub fn orderF64(x: f64, y: f64) std.math.Order {
+    const xn = std.math.isNan(x);
+    const yn = std.math.isNan(y);
+    if (xn or yn) {
+        if (xn and yn) return .eq;
+        return if (xn) .gt else .lt;
+    }
+    return std.math.order(x, y);
+}
+
 pub fn compareValues(a: Value, b: Value) ?std.math.Order {
     if (isNum(a) and isNum(b)) {
         if (a == .int and b == .int) return std.math.order(a.int, b.int);
-        return std.math.order(toF64(a), toF64(b));
+        return orderF64(toF64(a), toF64(b));
     }
     if (a == .string and b == .string) return std.mem.order(u8, a.string, b.string);
     if (a == .bool and b == .bool) return std.math.order(@intFromBool(a.bool), @intFromBool(b.bool));
@@ -3064,4 +3082,22 @@ test "check-time errors: bad strftime directive, sub-day date_add on a date" {
     ctx.msg = "";
     const ok = try parser.parseExprStr(a, "date_add('day', 7, d)", &diag);
     try std.testing.expectEqual(types.TypeKind.date, (try ctx.typeOf(ok)).kind);
+}
+
+test "orderF64: a total order over NaN, so comparisons never hit unreachable" {
+    const nan = std.math.nan(f64);
+    // Postgres' rule: NaN equals NaN and is greater than every other value.
+    // IEEE calls these unordered, which `std.math.order` reports by reaching
+    // `unreachable` — that crashed sort/filter/MIN/GROUP BY on any NaN.
+    try std.testing.expectEqual(std.math.Order.eq, orderF64(nan, nan));
+    try std.testing.expectEqual(std.math.Order.gt, orderF64(nan, 1.0));
+    try std.testing.expectEqual(std.math.Order.lt, orderF64(1.0, nan));
+    try std.testing.expectEqual(std.math.Order.gt, orderF64(nan, std.math.inf(f64)));
+    try std.testing.expectEqual(std.math.Order.eq, orderF64(0.0, -0.0));
+    try std.testing.expectEqual(std.math.Order.lt, orderF64(-1.0, 1.0));
+
+    // Reached through the public comparison the operators use.
+    const v_nan = Value{ .float = nan };
+    try std.testing.expectEqual(std.math.Order.eq, compareValues(v_nan, v_nan).?);
+    try std.testing.expectEqual(std.math.Order.gt, compareValues(v_nan, .{ .int = 9 }).?);
 }

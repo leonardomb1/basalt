@@ -12,8 +12,10 @@
 //!
 //! Invariant: two values that compare equal here always hash equal (the hash
 //! includes the type tag, and within one key column the value type is fixed).
-//! Decimals are the case that needs care: they compare NUMERICALLY, so `1.5`
-//! and `1.50` are equal and must hash alike — see `hashValue`.
+//! The numeric kinds are what need care, because they compare NUMERICALLY
+//! while their representations differ: `1.5` and `1.50` are equal decimals,
+//! `0.0` and `-0.0` equal floats, and every NaN equals every other. Each is
+//! canonicalized before hashing — see `hashValue`.
 
 const std = @import("std");
 const valuemod = @import("value.zig");
@@ -29,7 +31,15 @@ pub fn hashValue(h: *std.hash.Wyhash, v: Value) void {
         .null => {},
         .bool => |x| h.update(&[_]u8{@intFromBool(x)}),
         .int => |x| h.update(std.mem.asBytes(&x)),
-        .float => |x| h.update(std.mem.asBytes(&x)),
+        .float => |x| {
+            // Canonicalize before hashing, because `valueEq` compares floats
+            // numerically: `-0.0 == 0.0` (different bit patterns), and every NaN
+            // is `eq` to every other NaN under the total order in `eval`. Hashing
+            // raw bytes split those across buckets, so a join silently dropped a
+            // `-0.0` row that `WHERE f = 0` matched.
+            const c: f64 = if (std.math.isNan(x)) std.math.nan(f64) else if (x == 0) 0 else x;
+            h.update(std.mem.asBytes(&c));
+        },
         .decimal => |d| {
             // Hash a trailing-zero-stripped form. `valueEq` compares decimals
             // numerically, so `1.5` and `1.50` are equal — and a source may well
@@ -179,4 +189,23 @@ test "hashValue: numerically equal decimals hash alike, so DISTINCT counts them 
     );
     // Genuinely different values stay different.
     try testing.expect(!valueEq(a, .{ .decimal = .{ .unscaled = 151, .scale = 2 } }));
+}
+
+test "hashValue: -0.0 and NaN hash by value, matching valueEq" {
+    // `valueEq` compares floats numerically, so `-0.0 == 0.0` despite different
+    // bit patterns, and (postgres' total order) every NaN equals every other.
+    // Hashing raw bytes split those across buckets: a join dropped the `-0.0`
+    // row that `WHERE f = 0` matched, and DISTINCT counted NaNs separately.
+    const zero = Value{ .float = 0.0 };
+    const neg_zero = Value{ .float = -0.0 };
+    try testing.expect(valueEq(zero, neg_zero));
+    try testing.expectEqual(hashOne(zero), hashOne(neg_zero));
+
+    const nan_a = Value{ .float = std.math.nan(f64) };
+    const nan_b = Value{ .float = -std.math.nan(f64) };
+    try testing.expect(valueEq(nan_a, nan_b));
+    try testing.expectEqual(hashOne(nan_a), hashOne(nan_b));
+
+    try testing.expect(!valueEq(nan_a, zero));
+    try testing.expect(hashOne(nan_a) != hashOne(zero));
 }
