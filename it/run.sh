@@ -163,29 +163,31 @@ FROM db.it_dec;"; then
   fi
 fi
 
-# SQL Server money. `money` is a scaled integer of ten-thousandths sent high word
-# first, not a float — decoding it as one turned -0.0001 into NaN — and the
-# fixed-length forms (money NOT NULL) were missing from the type switch entirely.
+# SQL Server money and time. `money` is a scaled integer of ten-thousandths sent
+# high word first, not a float — decoding it as one turned -0.0001 into NaN — and
+# the fixed-length forms (money NOT NULL) were missing from the type switch
+# entirely. `time(n)` was read as CP1252 text, so it came back as mojibake.
 if runs sqlserver; then
   docker compose -f it/compose.yaml exec -T mssql /opt/mssql-tools18/bin/sqlcmd \
     -S localhost -U sa -P It_Passw0rd1 -C -Q \
     "USE master; DROP TABLE IF EXISTS dbo.it_money;
      CREATE TABLE dbo.it_money (k int, a money NULL, b smallmoney NULL,
-                                c money NOT NULL, f smallmoney NOT NULL);
+                                c money NOT NULL, f smallmoney NOT NULL,
+                                t0 time(0) NULL, t7 time(7) NULL);
 GO
      INSERT INTO dbo.it_money VALUES
-       (1, -0.0001, -0.0001, 1.0000, 2.5000),
-       (2, 922337203685477.5807, 214748.3647, -214748.3648, -2.5000),
-       (3, NULL, NULL, 0.0000, 0.0000);" >/dev/null 2>&1
-  { echo "k,a,b,c,f";
-    echo "1,-0.0001,-0.0001,1.0000,2.5000";
-    echo "2,922337203685477.5807,214748.3647,-214748.3648,-2.5000";
-    echo "3,,,0.0000,0.0000"; } >"$out/mssql_money_expected.csv"
+       (1, -0.0001, -0.0001, 1.0000, 2.5000, '12:00:00', '23:59:59.9999999'),
+       (2, 922337203685477.5807, 214748.3647, -214748.3648, -2.5000, '00:00:00', '00:00:00.0000001'),
+       (3, NULL, NULL, 0.0000, 0.0000, NULL, NULL);" >/dev/null 2>&1
+  { echo "k,a,b,c,f,t0,t7";
+    echo "1,-0.0001,-0.0001,1.0000,2.5000,12:00:00.000000,23:59:59.999999";
+    echo "2,922337203685477.5807,214748.3647,-214748.3648,-2.5000,00:00:00.000000,00:00:00.000000";
+    echo "3,,,0.0000,0.0000,,"; } >"$out/mssql_money_expected.csv"
   if brun run -c "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);
 LOAD INTO '$out/mssql_money.csv' AS SELECT * FROM db.it_money ORDER BY k;"; then
-    check sqlserver-money "$out/mssql_money.csv" "$out/mssql_money_expected.csv"
+    check sqlserver-money-time "$out/mssql_money.csv" "$out/mssql_money_expected.csv"
   else
-    report "sqlserver-money (run error)" bad
+    report "sqlserver-money-time (run error)" bad
   fi
 fi
 

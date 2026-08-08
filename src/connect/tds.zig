@@ -901,14 +901,12 @@ const TdsCursor = struct {
             },
             0x29 => {
                 d.scale = try self.reader.readByte();
-                d.engine_type = strT;
+                if (d.scale > 7) return error.InvalidTdsScale;
+                d.engine_type = types.Type.init(.time).asNullable();
             },
-            0x2A => {
+            0x2A, 0x2B => {
                 d.scale = try self.reader.readByte();
-                d.engine_type = tsT;
-            },
-            0x2B => {
-                d.scale = try self.reader.readByte();
+                if (d.scale > 7) return error.InvalidTdsScale;
                 d.engine_type = tsT;
             },
             0xA7, 0xAF => {
@@ -1232,6 +1230,7 @@ fn decodeValue(arena: std.mem.Allocator, d: ColumnDesc, bytes: []const u8) !Valu
         .string => .{ .string = if (d.is_guid) try formatGuid(arena, bytes) else if (d.is_binary) try bytesToHex(arena, bytes) else if (d.is_unicode) try utf16ToUtf8(arena, bytes) else try win1252ToUtf8(arena, bytes) },
         .bytes => .{ .bytes = try arena.dupe(u8, bytes) },
         .date => .{ .date = @intCast(@as(i64, @intCast(readULE(bytes))) - 719162) },
+        .time => .{ .time = decodeTime(d, bytes) },
         .timestamp => .{ .timestamp = decodeDateTime(d, bytes) },
         else => .{ .string = try arena.dupe(u8, bytes) },
     };
@@ -1258,6 +1257,16 @@ fn decodeMoney(bytes: []const u8) Value {
         else => return .null,
     };
     return .{ .decimal = .{ .unscaled = unscaled, .scale = 4 } };
+}
+
+/// TIMENTYPE: 3–5 little-endian bytes counting 10^-scale seconds since midnight.
+fn decodeTime(d: ColumnDesc, bytes: []const u8) i64 {
+    var tu: i64 = 0;
+    for (bytes, 0..) |b, k| {
+        if (k >= 5) break;
+        tu |= @as(i64, b) << @intCast(k * 8);
+    }
+    return @divTrunc(tu * 1_000_000, pow10(d.scale));
 }
 
 fn decodeDateTime(d: ColumnDesc, bytes: []const u8) i64 {
@@ -1485,6 +1494,17 @@ test "decodeMoney: ten-thousandths, high word first for the 8-byte form" {
     try std.testing.expectEqual(@as(i128, std.math.minInt(i32)), decodeMoney(&b4).decimal.unscaled);
 
     try std.testing.expect(decodeMoney(&.{ 1, 2, 3 }) == .null);
+}
+
+test "decodeTime: 10^-scale seconds since midnight to micros" {
+    var d = ColumnDesc{ .tds_type = 0x29, .engine_type = types.Type.init(.time).asNullable(), .kind = .bytelen, .scale = 0 };
+    try std.testing.expectEqual(@as(i64, 12 * 3600 * 1_000_000), decodeTime(d, &.{ 0xC0, 0xA8, 0x00 }));
+
+    d.scale = 7;
+    var b5: [5]u8 = .{ 0, 0, 0, 0, 0 };
+    const tenths_us: u40 = 863_999_999_999; // 23:59:59.9999999
+    inline for (0..5) |k| b5[k] = @intCast((tenths_us >> (k * 8)) & 0xFF);
+    try std.testing.expectEqual(@as(i64, 86_399_999_999), decodeTime(d, &b5));
 }
 
 test "decodeDateTime: DATETIME ticks, SMALLDATETIME minutes, DATETIME2 scale" {
