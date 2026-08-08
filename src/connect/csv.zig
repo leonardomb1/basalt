@@ -39,6 +39,9 @@ pub const CsvReader = struct {
     /// Header line of the first blob; later blobs must match it, or the read
     /// would silently splice mismatched columns together.
     header_line: []const u8 = "",
+    /// Scratch for a record that spans physical lines (quoted newline). Reused,
+    /// so it costs one allocation of the longest such record, not one per row.
+    join_buf: std.array_list.Managed(u8) = undefined,
 
     const Backend = union(enum) {
         file: FileBackend,
@@ -72,6 +75,7 @@ pub const CsvReader = struct {
             .backend = undefined,
             .schema = undefined,
             .done = false,
+            .join_buf = std.array_list.Managed(u8).init(arena),
         };
         var first = path;
         if (azure.isPrefix(path)) {
@@ -251,11 +255,26 @@ pub const CsvReader = struct {
         hf.response = try hf.req.receiveHead(&hf.redirect_buf);
     }
 
+    /// One CSV record, which may span several physical lines: a newline inside a
+    /// quoted field belongs to the value. The common case (balanced quotes) is
+    /// the untouched zero-copy path; only a continued record is joined, into a
+    /// buffer reused across records so a long file does not grow the arena.
     fn readLine(self: *CsvReader) !?[]const u8 {
-        const line = (try self.rdr.takeDelimiter('\n')) orelse return null;
-        var s: []const u8 = line;
+        const first = (try self.rdr.takeDelimiter('\n')) orelse return null;
+        var s: []const u8 = first;
         if (s.len > 0 and s[s.len - 1] == '\r') s = s[0 .. s.len - 1];
-        return s;
+        if (!quotesOpen(s)) return s;
+
+        self.join_buf.clearRetainingCapacity();
+        try self.join_buf.appendSlice(s);
+        while (quotesOpen(self.join_buf.items)) {
+            const more = (try self.rdr.takeDelimiter('\n')) orelse break;
+            var m: []const u8 = more;
+            if (m.len > 0 and m[m.len - 1] == '\r') m = m[0 .. m.len - 1];
+            try self.join_buf.append('\n');
+            try self.join_buf.appendSlice(m);
+        }
+        return self.join_buf.items;
     }
 };
 
@@ -268,6 +287,11 @@ pub const MappedCsv = struct {
     body: []const u8,
     schema: types.Schema,
     file: std.fs.File,
+    /// True when some quoted field contains a newline. Chunk boundaries are
+    /// picked by seeking a newline from a byte offset, and whether that newline
+    /// is inside quotes cannot be known without scanning from the start of the
+    /// file — so callers must not split this file; they fall back to serial.
+    quoted_newlines: bool = false,
 
     pub fn open(arena: std.mem.Allocator, path: []const u8) !*MappedCsv {
         const self = try arena.create(MappedCsv);
@@ -293,17 +317,22 @@ pub const MappedCsv = struct {
         var fed: usize = 0;
         var pos: usize = 0;
         while (fed < SAMPLE_ROWS and pos < body.len) {
-            const k = std.mem.indexOfScalar(u8, body[pos..], '\n');
-            var line = if (k) |j| body[pos .. pos + j] else body[pos..];
-            pos += (k orelse line.len) + 1;
-            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+            const rec = scanRecord(body, pos);
+            const line = rec.line;
+            pos = rec.next;
             if (line.len == 0) continue;
             sniff.feed(line);
             fed += 1;
         }
         for (fields.items, 0..) |*f, j| f.ty = sniff.resolve(j);
 
-        self.* = .{ .data = data, .body = body, .schema = .{ .fields = try fields.toOwnedSlice() }, .file = file };
+        self.* = .{
+            .data = data,
+            .body = body,
+            .schema = .{ .fields = try fields.toOwnedSlice() },
+            .file = file,
+            .quoted_newlines = hasQuotedNewline(body),
+        };
         return self;
     }
 
@@ -313,6 +342,25 @@ pub const MappedCsv = struct {
         const lo = self.lineStart(self.body.len * i / n);
         const hi = self.lineStart(self.body.len * (i + 1) / n);
         return self.body[lo..hi];
+    }
+
+    /// Does any quoted field hold a newline? Skipped entirely when the file has
+    /// no quote at all (the common case), so the scan costs one `memchr`.
+    fn hasQuotedNewline(body: []const u8) bool {
+        if (std.mem.indexOfScalar(u8, body, '"') == null) return false;
+        var in_q = false;
+        var i: usize = 0;
+        while (i < body.len) : (i += 1) {
+            const c = body[i];
+            if (c == '"') {
+                if (in_q and i + 1 < body.len and body[i + 1] == '"') {
+                    i += 1;
+                    continue;
+                }
+                in_q = !in_q;
+            } else if (c == '\n' and in_q) return true;
+        }
+        return false;
     }
 
     /// Smallest line-start offset >= `raw` (0, or just past a '\n').
@@ -345,11 +393,9 @@ pub const CsvSliceReader = struct {
 
         var rows: usize = 0;
         while (rows < BATCH_ROWS and self.pos < self.data.len) {
-            const rest = self.data[self.pos..];
-            const nl = std.mem.indexOfScalar(u8, rest, '\n');
-            var line = if (nl) |k| rest[0..k] else rest;
-            self.pos += (nl orelse rest.len) + 1;
-            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+            const rec = scanRecord(self.data, self.pos);
+            const line = rec.line;
+            self.pos = rec.next;
             if (line.len == 0) continue;
             try splitInto(arena, line, builders);
             rows += 1;
@@ -457,6 +503,45 @@ fn appendCell(b: *column.Builder, raw: []const u8, quoted: bool) !void {
         .float => try b.append(.{ .float = std.fmt.parseFloat(f64, raw) catch return error.CsvTypeMismatch }),
         else => try b.append(.{ .string = raw }),
     }
+}
+
+/// One CSV record starting at `data[start]`, plus where the next one begins.
+///
+/// A `\n` inside a quoted field is part of the value (RFC 4180) — `splitInto`
+/// has always honored quotes when cutting FIELDS, but records used to be cut on
+/// the first raw newline, which split such a row in half. basalt's own CSV
+/// writer quotes embedded newlines, so it emitted files it could not read back.
+fn scanRecord(data: []const u8, start: usize) struct { line: []const u8, next: usize } {
+    var i = start;
+    var in_q = false;
+    while (i < data.len) : (i += 1) {
+        const c = data[i];
+        if (c == '"') {
+            // `""` inside a quoted field is an escaped quote, not a close.
+            if (in_q and i + 1 < data.len and data[i + 1] == '"') {
+                i += 1;
+                continue;
+            }
+            in_q = !in_q;
+        } else if (c == '\n' and !in_q) {
+            var end = i;
+            if (end > start and data[end - 1] == '\r') end -= 1;
+            return .{ .line = data[start..end], .next = i + 1 };
+        }
+    }
+    var end = data.len;
+    if (end > start and data[end - 1] == '\r') end -= 1;
+    return .{ .line = data[start..end], .next = data.len };
+}
+
+/// Whether `line` leaves a quoted field open — i.e. the record continues on the
+/// next physical line. `""` contributes two, so plain parity is the quote state.
+fn quotesOpen(line: []const u8) bool {
+    var n: usize = 0;
+    for (line) |c| {
+        if (c == '"') n += 1;
+    }
+    return n % 2 == 1;
 }
 
 fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Builder) !void {
@@ -922,4 +1007,35 @@ test "CsvSliceReader over a MappedCsv chunk parses only its rows" {
         while (try r.next(a)) |b| rows += b.len;
     }
     try std.testing.expectEqual(@as(usize, 4), rows);
+}
+
+test "scanRecord: a newline inside a quoted field stays in the value" {
+    // RFC 4180 allows it and basalt's own writer emits it, so cutting records on
+    // the first raw newline turned one row into several — silently.
+    const data = "1,\"line A\nline B\"\n2,plain\n";
+    const r1 = scanRecord(data, 0);
+    try std.testing.expectEqualStrings("1,\"line A\nline B\"", r1.line);
+    const r2 = scanRecord(data, r1.next);
+    try std.testing.expectEqualStrings("2,plain", r2.line);
+    try std.testing.expectEqual(data.len, r2.next);
+
+    // An escaped `""` inside a quoted field does not end the quote.
+    const esc = "a,\"he said \"\"hi\"\"\nand left\"\n";
+    try std.testing.expectEqualStrings("a,\"he said \"\"hi\"\"\nand left\"", scanRecord(esc, 0).line);
+
+    // CRLF is still trimmed, and an unterminated final record still returns.
+    try std.testing.expectEqualStrings("x,y", scanRecord("x,y\r\n", 0).line);
+    try std.testing.expectEqualStrings("x,y", scanRecord("x,y", 0).line);
+}
+
+test "quotesOpen / hasQuotedNewline drive the continuation and split decisions" {
+    try std.testing.expect(quotesOpen("1,\"line A"));
+    try std.testing.expect(!quotesOpen("1,\"line A\""));
+    try std.testing.expect(!quotesOpen("plain,row"));
+    // `""` is an escaped quote: two marks, so the field is still closed.
+    try std.testing.expect(!quotesOpen("a,\"he said \"\"hi\"\"\""));
+
+    try std.testing.expect(MappedCsv.hasQuotedNewline("1,\"a\nb\"\n"));
+    try std.testing.expect(!MappedCsv.hasQuotedNewline("1,\"a b\"\n2,c\n"));
+    try std.testing.expect(!MappedCsv.hasQuotedNewline("1,a\n2,b\n"));
 }

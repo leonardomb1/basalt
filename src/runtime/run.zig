@@ -1828,6 +1828,9 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
 
     const mapped = csv.MappedCsv.open(arena, path) catch return false;
+    // A newline inside a quoted field makes chunk boundaries undecidable from a
+    // byte offset, so this file is parsed serially rather than split.
+    if (mapped.quoted_newlines) return false;
     defer mapped.close();
 
     const agg_in = try schemaPtr(arena, try mapChainSchema(env, prefix, mapped.schema));
@@ -2407,6 +2410,9 @@ fn runParallelCsvMapImpl(env: *Env, rd: ast.Read, map_stages: []const ast.Stage,
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
 
     const mapped = csv.MappedCsv.open(arena, path) catch return false;
+    // A newline inside a quoted field makes chunk boundaries undecidable from a
+    // byte offset, so this file is parsed serially rather than split.
+    if (mapped.quoted_newlines) return false;
     defer mapped.close();
 
     var out_schema = try mapChainSchema(env, map_stages, mapped.schema);
@@ -2664,6 +2670,9 @@ fn runParallelCsvTopN(env: *Env, rd: ast.Read, prefix: []const ast.Stage, srt: a
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
 
     const mapped = csv.MappedCsv.open(arena, path) catch return false;
+    // A newline inside a quoted field makes chunk boundaries undecidable from a
+    // byte offset, so this file is parsed serially rather than split.
+    if (mapped.quoted_newlines) return false;
     defer mapped.close();
 
     const row_schema = try schemaPtr(arena, try mapChainSchema(env, prefix, mapped.schema));
@@ -2955,6 +2964,9 @@ fn runParallelCsvDistinct(env: *Env, rd: ast.Read, prefix: []const ast.Stage, di
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
 
     const mapped = csv.MappedCsv.open(arena, path) catch return false;
+    // A newline inside a quoted field makes chunk boundaries undecidable from a
+    // byte offset, so this file is parsed serially rather than split.
+    if (mapped.quoted_newlines) return false;
     defer mapped.close();
 
     const row_schema = try schemaPtr(arena, try mapChainSchema(env, prefix, mapped.schema));
