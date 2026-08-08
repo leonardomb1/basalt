@@ -2810,26 +2810,25 @@ fn distinctWorkOne(ctx: *DistinctCtx, i: usize) !void {
 
     const probe = try warena.allocator().alloc(Value, ctx.key_idx.len);
     while (try d.next(batch_arena.allocator())) |b| {
-        ctx.mtx.lock();
-        var r: usize = 0;
-        while (r < b.len) : (r += 1) {
-            for (ctx.key_idx, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
-            const gop = ctx.seen.getOrPut(probe) catch |e| {
-                ctx.mtx.unlock();
-                return e;
-            };
-            if (!gop.found_existing) {
-                const kv = ctx.plan_arena.alloc(Value, ctx.key_idx.len) catch |e| {
-                    ctx.mtx.unlock();
-                    return e;
-                };
-                for (ctx.key_idx, 0..) |ci, j| kv[j] = try op.dupeValue(ctx.plan_arena, b.columns[ci].getValue(r));
-                gop.key_ptr.* = kv;
-                gop.value_ptr.* = 0;
-                for (b.columns, ctx.builders) |*col, *bld| try bld.append(col.getValue(r));
+        {
+            // `defer`, not hand-unlocking: the dupe and append below can fail,
+            // and returning with this held wedged every other lane on its next
+            // batch — the whole run hung instead of reporting the error.
+            ctx.mtx.lock();
+            defer ctx.mtx.unlock();
+            var r: usize = 0;
+            while (r < b.len) : (r += 1) {
+                for (ctx.key_idx, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
+                const gop = try ctx.seen.getOrPut(probe);
+                if (!gop.found_existing) {
+                    const kv = try ctx.plan_arena.alloc(Value, ctx.key_idx.len);
+                    for (ctx.key_idx, 0..) |ci, j| kv[j] = try op.dupeValue(ctx.plan_arena, b.columns[ci].getValue(r));
+                    gop.key_ptr.* = kv;
+                    gop.value_ptr.* = 0;
+                    for (b.columns, ctx.builders) |*col, *bld| try bld.append(col.getValue(r));
+                }
             }
         }
-        ctx.mtx.unlock();
         _ = batch_arena.reset(.retain_capacity);
     }
 }
@@ -2872,26 +2871,25 @@ fn pqDistinctLaneRun(ctx: *PqDistinctCtx) !void {
 
     const probe = try warena.allocator().alloc(Value, ctx.key_idx.len);
     while (try d.next(batch_arena.allocator())) |b| {
-        ctx.mtx.lock();
-        var r: usize = 0;
-        while (r < b.len) : (r += 1) {
-            for (ctx.key_idx, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
-            const gop = ctx.seen.getOrPut(probe) catch |e| {
-                ctx.mtx.unlock();
-                return e;
-            };
-            if (!gop.found_existing) {
-                const kv = ctx.plan_arena.alloc(Value, ctx.key_idx.len) catch |e| {
-                    ctx.mtx.unlock();
-                    return e;
-                };
-                for (ctx.key_idx, 0..) |ci, j| kv[j] = try op.dupeValue(ctx.plan_arena, b.columns[ci].getValue(r));
-                gop.key_ptr.* = kv;
-                gop.value_ptr.* = 0;
-                for (b.columns, ctx.builders) |*col, *bld| try bld.append(col.getValue(r));
+        {
+            // `defer`, not hand-unlocking: the dupe and append below can fail,
+            // and returning with this held wedged every other lane on its next
+            // batch — the whole run hung instead of reporting the error.
+            ctx.mtx.lock();
+            defer ctx.mtx.unlock();
+            var r: usize = 0;
+            while (r < b.len) : (r += 1) {
+                for (ctx.key_idx, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
+                const gop = try ctx.seen.getOrPut(probe);
+                if (!gop.found_existing) {
+                    const kv = try ctx.plan_arena.alloc(Value, ctx.key_idx.len);
+                    for (ctx.key_idx, 0..) |ci, j| kv[j] = try op.dupeValue(ctx.plan_arena, b.columns[ci].getValue(r));
+                    gop.key_ptr.* = kv;
+                    gop.value_ptr.* = 0;
+                    for (b.columns, ctx.builders) |*col, *bld| try bld.append(col.getValue(r));
+                }
             }
         }
-        ctx.mtx.unlock();
         _ = batch_arena.reset(.retain_capacity);
     }
 }
@@ -3593,23 +3591,18 @@ fn forWorker(ctx: *ForCtx, _: usize) void {
         var w_sources = std.array_list.Managed(driver.Source).init(w_arena.allocator());
         var w_diag = Diag{};
         var w_errctx = op.ErrCtx{};
-        var w_env = Env{
-            .arena = w_arena.allocator(),
-            .gpa = gpa,
-            .params = ctx.base.params,
-            .bindings = ctx.base.bindings,
-            .connections = ctx.base.connections,
-            .sources = &w_sources,
-            .request_body = ctx.base.request_body,
-            .diag = &w_diag,
-            .log = ctx.base.log,
-            .params_expr = ctx.base.params_expr,
-            .errctx = &w_errctx,
-            .rows_read = ctx.base.rows_read,
-            .json_params = ctx.base.json_params,
-            .fns = ctx.base.fns,
-            .call_depth = ctx.base.call_depth,
-        };
+        // Copy the run's Env and override only what is per-worker. Listing the
+        // fields instead silently defaulted every one that was not named — so a
+        // PARALLEL for-each lost `explain` (EXPLAIN ANALYZE then really wrote
+        // its sinks), `stdout_json`, and the buffer-segment / StarRocks label
+        // pinning that makes a replayed flush dedup instead of duplicating.
+        // A copy also cannot rot when a field is added to Env later.
+        var w_env = ctx.base.*;
+        w_env.arena = w_arena.allocator();
+        w_env.gpa = gpa;
+        w_env.sources = &w_sources;
+        w_env.diag = &w_diag;
+        w_env.errctx = &w_errctx;
         var st = Stats{ .run_id = 0 };
         var lanes: usize = 1;
         const lr = LoopRow{ .names = ctx.needles, .types = ctx.fe.var_types, .cells = row };
