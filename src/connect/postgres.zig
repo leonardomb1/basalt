@@ -453,8 +453,10 @@ fn pgType(oid: i32, typmod: i32) types.Type {
 fn decimalFromTypmod(typmod: i32) types.Type {
     if (typmod < 4) return types.Type.decimal(38, 6);
     const m = typmod - 4;
-    const precision: u8 = @intCast((@as(u32, @bitCast(m)) >> 16) & 0xFFFF);
-    const scale: u8 = @intCast(@as(u32, @bitCast(m)) & 0xFFFF);
+    // Postgres allows precision up to 1000, which does not fit a u8 at all — and
+    // the engine's decimal is an i128, so 38 digits is the real ceiling anyway.
+    const precision: u8 = @intCast(@min((@as(u32, @bitCast(m)) >> 16) & 0xFFFF, 38));
+    const scale: u8 = @intCast(@min(@as(u32, @bitCast(m)) & 0xFFFF, 38));
     return types.Type.decimal(precision, scale);
 }
 
@@ -537,6 +539,15 @@ test "pgType maps OIDs; numeric typmod carries precision and scale" {
     const u = pgType(1700, -1);
     try std.testing.expectEqual(@as(u8, 38), u.precision);
     try std.testing.expectEqual(@as(u8, 6), u.scale);
+
+    // Postgres allows precision up to 1000; the engine's decimal is an i128, so
+    // anything past 38 digits is capped rather than truncated into a u8.
+    const wide = pgType(1700, (500 << 16 | 2) + 4);
+    try std.testing.expectEqual(@as(u8, 38), wide.precision);
+    try std.testing.expectEqual(@as(u8, 2), wide.scale);
+    const wide_scale = pgType(1700, (1000 << 16 | 900) + 4);
+    try std.testing.expectEqual(@as(u8, 38), wide_scale.precision);
+    try std.testing.expectEqual(@as(u8, 38), wide_scale.scale);
 }
 
 test "ErrorResponse extraction picks the M field" {

@@ -96,11 +96,13 @@ pub fn decodeRleHybrid(
     while (n < count) {
         const header = try readVarint(src, &pos);
         if (header & 1 == 1) {
-            // bit-packed: header >> 1 groups of eight values
-            const groups: usize = @intCast(header >> 1);
-            const vals = groups * 8;
-            const bytes = groups * @as(usize, width);
-            if (pos + bytes > src.len) return Error.CorruptParquetPage;
+            // bit-packed: header >> 1 groups of eight values. The count comes
+            // straight off the wire, so both products can wrap before anything
+            // is bounds-checked against the page.
+            const groups = std.math.cast(usize, header >> 1) orelse return Error.CorruptParquetPage;
+            const bytes = std.math.mul(usize, groups, width) catch return Error.CorruptParquetPage;
+            if (bytes > src.len - pos) return Error.CorruptParquetPage;
+            const vals = groups * 8; // groups <= src.len here, so this cannot wrap
             var br = BitReader{ .buf = src[pos..][0..bytes] };
             for (0..vals) |_| {
                 if (n >= count) break; // trailing padding in the last group
@@ -213,9 +215,12 @@ pub const PlainCursor = struct {
 
 /// INT96 is a deprecated Spark timestamp: Julian day plus nanoseconds of day.
 /// 2440588 is the Julian day of 1970-01-01.
+/// The Julian day is a full u32 on the wire: 4.29e9 days of microseconds is
+/// 3.7e20, far past i64. Saturating keeps a corrupt file from being undefined
+/// behaviour in a release build, where the overflow is not checked.
 pub fn int96ToMicros(julian_day: u32, nanos_of_day: u64) i64 {
     const days: i64 = @as(i64, julian_day) - 2_440_588;
-    return days * 86_400_000_000 + @as(i64, @intCast(nanos_of_day / 1000));
+    return (days *| 86_400_000_000) +| @as(i64, @intCast(nanos_of_day / 1000));
 }
 
 // --- DELTA encodings ---------------------------------------------------------
@@ -626,7 +631,7 @@ pub fn readColumnChunk(
         switch (pg.header.ty) {
             .dictionary_page => {
                 // dictionary entries are always PLAIN, whatever the data pages use
-                const n: usize = @intCast(pg.header.num_values);
+                const n = std.math.cast(usize, pg.header.num_values) orelse return Error.CorruptParquetPage;
                 const vals = try arena.alloc(Value, n);
                 var cur = PlainCursor.init(meta.ty, elem.type_length orelse 0, pg.data);
                 for (vals) |*v| v.* = try cur.next();
@@ -658,7 +663,8 @@ fn appendDataPage(
     dict: ?[]Value,
     tscale: i64,
 ) Error!usize {
-    const n: usize = @intCast(pg.header.num_values);
+    // A negative count is not a count; @intCast on it is undefined in release.
+    const n = std.math.cast(usize, pg.header.num_values) orelse return Error.CorruptParquetPage;
     var body = pg.data;
 
     var defs: ?[]u32 = null;
@@ -740,7 +746,9 @@ fn appendDataPage(
         .plain_dictionary, .rle_dictionary => {
             const d = dict orelse return Error.CorruptParquetPage;
             if (body.len < 1) return Error.CorruptParquetPage;
-            // the index bit width is a single byte ahead of the hybrid stream
+            // the index bit width is a single byte ahead of the hybrid stream;
+            // parquet caps it at 32, and anything past 63 does not fit the shift
+            if (body[0] > 32) return Error.CorruptParquetPage;
             const width: u6 = @intCast(body[0]);
             const idx = try decodeRleHybrid(arena, body[1..], width, present);
             try emit(b, ty, defs, max_def, n, null, idx, d, tscale);
@@ -1583,6 +1591,20 @@ test "int96 converts Julian day plus nanoseconds to epoch micros" {
     try testing.expectEqual(@as(i64, 1_000_000), int96ToMicros(2_440_588, 1_000_000_000));
     try testing.expectEqual(@as(i64, 86_400_000_000), int96ToMicros(2_440_589, 0));
     try testing.expectEqual(@as(i64, -86_400_000_000), int96ToMicros(2_440_587, 0));
+    // A wire Julian day is a full u32: 4.29e9 days of micros is 3.7e20, past i64.
+    // Saturating keeps a corrupt file from being undefined behaviour in release.
+    try testing.expectEqual(@as(i64, std.math.maxInt(i64)), int96ToMicros(std.math.maxInt(u32), 0));
+    // Julian day 0 is only 2.4e6 days before the epoch, so it still fits.
+    try testing.expectEqual(@as(i64, -210_866_803_200_000_000), int96ToMicros(0, 0));
+}
+
+test "a bit-packed run length from the wire cannot overflow the byte count" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    // varint 0xFFFF_FFFF_FFFF_FFFF: the bit-packed header claims 2^63 groups, so
+    // `groups * width` wrapped before anything checked it against the page.
+    const huge = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01 };
+    try testing.expectError(Error.CorruptParquetPage, decodeRleHybrid(ar.allocator(), &huge, 32, 8));
 }
 
 test "physical plus converted type maps onto a basalt type" {

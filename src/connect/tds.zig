@@ -1240,7 +1240,10 @@ fn decodeDecimal(d: ColumnDesc, bytes: []const u8) Value {
     if (bytes.len < 1) return .null;
     const positive = bytes[0] == 1;
     var mag: i128 = 0;
-    for (bytes[1..], 0..) |b, k| mag |= @as(i128, b) << @intCast(k * 8);
+    for (bytes[1..], 0..) |b, k| {
+        if (k >= 16) break; // shifting past the width of an i128 is UB
+        mag |= @as(i128, b) << @intCast(k * 8);
+    }
     return .{ .decimal = .{ .unscaled = if (positive) mag else -mag, .scale = d.scale } };
 }
 
@@ -1276,7 +1279,10 @@ fn decodeDateTime(d: ColumnDesc, bytes: []const u8) i64 {
             if (bytes.len < 3 + off_bytes) return 0;
             const tlen = bytes.len - 3 - off_bytes;
             var tu: i64 = 0;
-            for (bytes[0..tlen], 0..) |b, k| tu |= @as(i64, b) << @intCast(k * 8);
+            for (bytes[0..tlen], 0..) |b, k| {
+                if (k >= 8) break; // shifting past the width of an i64 is UB
+                tu |= @as(i64, b) << @intCast(k * 8);
+            }
             const days: i64 = @intCast(u24le(bytes[tlen .. tlen + 3]));
             const days1970 = days - 719162;
             const time_micros = @divTrunc(tu * 1_000_000, pow10(d.scale));
@@ -1287,19 +1293,21 @@ fn decodeDateTime(d: ColumnDesc, bytes: []const u8) i64 {
                 const date4 = readIntLE(bytes[0..4]);
                 const ticks: i64 = @intCast(readULE(bytes[4..8]));
                 return (date4 - 25567) * 86_400_000_000 + @divTrunc(ticks * 1_000_000, 300);
-            } else {
+            } else if (bytes.len >= 4) {
                 const days: i64 = @intCast(rdU16(bytes, 0));
                 const mins: i64 = @intCast(rdU16(bytes, 2));
                 return (days - 25567) * 86_400_000_000 + mins * 60_000_000;
-            }
+            } else return 0;
         },
     }
 }
 
+/// 10^18 is the largest power of ten an i64 holds; a wire scale is capped there
+/// rather than allowed to overflow. TDS never sends more than 7.
 fn pow10(n: u8) i64 {
     var r: i64 = 1;
     var k: u8 = 0;
-    while (k < n) : (k += 1) r *= 10;
+    while (k < @min(n, 18)) : (k += 1) r *= 10;
     return r;
 }
 
@@ -1469,6 +1477,28 @@ test "decodeDecimal: sign byte + little-endian magnitude at the column scale" {
     const neg = decodeDecimal(d, &.{ 0, 0x39, 0x30, 0, 0 });
     try std.testing.expectEqual(@as(i128, -12345), neg.decimal.unscaled);
     try std.testing.expect(decodeDecimal(d, &.{}) == .null);
+}
+
+test "short or oversized bodies are refused, not read out of bounds" {
+    // SMALLDATETIME wants 4 bytes; a truncated body read `bytes[2..4]` anyway.
+    const sdt = ColumnDesc{ .tds_type = 0x3A, .engine_type = types.Type.init(.timestamp).asNullable(), .kind = .fixed, .fixed_len = 4 };
+    try std.testing.expectEqual(@as(i64, 0), decodeDateTime(sdt, &.{ 1, 2, 3 }));
+    try std.testing.expectEqual(@as(i64, 0), decodeDateTime(sdt, &.{}));
+
+    // A DATETIME2 wire scale past 7 overflowed pow10 before it was ever divided by.
+    const dt2 = ColumnDesc{ .tds_type = 0x2A, .engine_type = types.Type.init(.timestamp).asNullable(), .kind = .bytelen, .scale = 40 };
+    _ = decodeDateTime(dt2, &.{ 1, 2, 3, 4, 5, 6, 7 });
+    // …and a long body shifted past the width of the i64 it accumulates into.
+    var long_dt: [64]u8 = undefined;
+    @memset(&long_dt, 0xFF);
+    _ = decodeDateTime(dt2, &long_dt);
+
+    // A decimal body longer than 17 bytes shifted past the width of an i128.
+    var long: [40]u8 = undefined;
+    @memset(&long, 0xFF);
+    long[0] = 1;
+    const dec = ColumnDesc{ .tds_type = 0x6C, .engine_type = types.Type.decimal(38, 2).asNullable(), .kind = .bytelen, .scale = 2 };
+    _ = decodeDecimal(dec, &long);
 }
 
 test "decodeMoney: ten-thousandths, high word first for the 8-byte form" {

@@ -157,8 +157,15 @@ pub const Reader = struct {
             .i16, .i32, .i64 => _ = try self.readZigZag(),
             .double => _ = try self.take(8),
             .binary => _ = try self.readBinary(),
+            // Containers recurse per element, so they need the same depth cap as
+            // `structBegin`: one byte of "list of list, size 1" per level makes
+            // a few hundred KB of input a stack overflow otherwise.
             .list, .set => {
                 const h = try self.readListHeader();
+                if (h.size == 0) return;
+                if (self.depth >= max_depth) return Error.CorruptThrift;
+                self.depth += 1;
+                defer self.depth -= 1;
                 for (0..h.size) |_| try self.skip(h.elem);
             },
             .map => {
@@ -167,6 +174,9 @@ pub const Reader = struct {
                     const kv = try self.readByte();
                     const k: Type = @enumFromInt((kv >> 4) & 0x0F);
                     const v: Type = @enumFromInt(kv & 0x0F);
+                    if (self.depth >= max_depth) return Error.CorruptThrift;
+                    self.depth += 1;
+                    defer self.depth -= 1;
                     for (0..@as(usize, @intCast(n))) |_| {
                         try self.skip(k);
                         try self.skip(v);
@@ -341,6 +351,23 @@ test "nesting deeper than max_depth is an error, not a stack overflow" {
     @memset(&buf, 0x1c); // endless "field 1, struct"
     var r = Reader.init(&buf);
     try t.expectError(Error.CorruptThrift, r.skipStruct());
+}
+
+test "nested lists are capped too, not just structs" {
+    // 0x19 is "list of list, size 1" — one byte per level of recursion — and
+    // 0x09 is an empty list, which terminates cleanly. Only `structBegin` was
+    // capped, so this well-formed but absurdly nested value recursed once per
+    // byte; a few hundred KB of 0x19 was a stack overflow.
+    var deep: [max_depth + 8]u8 = undefined;
+    @memset(&deep, 0x19);
+    deep[deep.len - 1] = 0x09;
+    var r = Reader.init(&deep);
+    try t.expectError(Error.CorruptThrift, r.skip(.list));
+
+    // Nesting inside the cap still skips.
+    var ok = [_]u8{ 0x19, 0x19, 0x09 };
+    var r2 = Reader.init(&ok);
+    try r2.skip(.list);
 }
 
 // --- write side --------------------------------------------------------------
