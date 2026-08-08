@@ -2776,6 +2776,87 @@ fn classifyDistinctPipeline(stages: []const ast.Stage) ?DistinctShape {
     return .{ .prefix = middle[0..d], .dist = middle[d].node.distinct, .tail = middle[d + 1 ..] };
 }
 
+/// A surviving distinct row plus where it sat in the input: chunk index (chunks
+/// are handed out in file order) then row ordinal inside that chunk. `DISTINCT`
+/// keeps the *first* row per key, so the merge has to be able to say which of
+/// two candidates came first — otherwise the winner is whichever lane reached
+/// the mutex first and the non-key columns change from run to run.
+const DistinctRow = struct {
+    chunk: usize,
+    ord: u64,
+    vals: []Value,
+
+    fn before(_: void, a: DistinctRow, b: DistinctRow) bool {
+        if (a.chunk != b.chunk) return a.chunk < b.chunk;
+        return a.ord < b.ord;
+    }
+};
+
+/// Cross-lane distinct state. Each lane dedups its own chunk and then folds the
+/// survivors in here; ties are broken by input position, so the result — values
+/// *and* order — is what a serial run would have produced.
+const DistinctMerge = struct {
+    seen: op.Aggregate.GroupMap(),
+    rows: std.array_list.Managed(DistinctRow),
+    key_idx: []const usize,
+    arena: std.mem.Allocator,
+    mtx: std.Thread.Mutex = .{},
+
+    fn init(arena: std.mem.Allocator, key_idx: []const usize) DistinctMerge {
+        return .{
+            .seen = op.Aggregate.GroupMap().init(arena),
+            .rows = std.array_list.Managed(DistinctRow).init(arena),
+            .key_idx = key_idx,
+            .arena = arena,
+        };
+    }
+
+    fn dupeRow(self: *DistinctMerge, b: batchmod.Batch, r: usize) ![]Value {
+        const vals = try self.arena.alloc(Value, b.columns.len);
+        for (b.columns, vals) |*col, *v| v.* = try op.dupeValue(self.arena, col.getValue(r));
+        return vals;
+    }
+
+    /// Folds one lane's already-deduped batch in. `ords` is `op.Distinct.ords`
+    /// for that batch; `chunk` is the work item the lane read.
+    fn absorb(self: *DistinctMerge, chunk: usize, b: batchmod.Batch, ords: []const u64, probe: []Value) !void {
+        self.mtx.lock();
+        defer self.mtx.unlock();
+        var r: usize = 0;
+        while (r < b.len) : (r += 1) {
+            for (self.key_idx, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
+            const gop = try self.seen.getOrPut(probe);
+            if (gop.found_existing) {
+                const slot = &self.rows.items[gop.value_ptr.*];
+                const cand = DistinctRow{ .chunk = chunk, .ord = ords[r], .vals = &.{} };
+                if (!DistinctRow.before({}, cand, slot.*)) continue;
+                slot.chunk = chunk;
+                slot.ord = ords[r];
+                slot.vals = try self.dupeRow(b, r);
+                continue;
+            }
+            const kv = try self.arena.alloc(Value, self.key_idx.len);
+            for (self.key_idx, 0..) |ci, j| kv[j] = try op.dupeValue(self.arena, b.columns[ci].getValue(r));
+            gop.key_ptr.* = kv;
+            gop.value_ptr.* = self.rows.items.len;
+            try self.rows.append(.{ .chunk = chunk, .ord = ords[r], .vals = try self.dupeRow(b, r) });
+        }
+    }
+
+    /// Input order, then one batch. Sorting here is what makes `-j 8` agree with
+    /// `-j 1` byte for byte instead of only row-count for row-count.
+    fn finish(self: *DistinctMerge, row_schema: *const types.Schema) !batchmod.Batch {
+        std.mem.sort(DistinctRow, self.rows.items, {}, DistinctRow.before);
+        const cols = try self.arena.alloc(column.Column, row_schema.fields.len);
+        for (row_schema.fields, cols, 0..) |f, *c, ci| {
+            var bd = column.Builder.init(self.arena, f.ty);
+            for (self.rows.items) |row| try bd.append(row.vals[ci]);
+            c.* = try bd.finish();
+        }
+        return .{ .schema = row_schema, .columns = cols, .len = self.rows.items.len };
+    }
+};
+
 const DistinctCtx = struct {
     mapped: *csv.MappedCsv,
     csv_schema: *const types.Schema,
@@ -2785,10 +2866,7 @@ const DistinctCtx = struct {
     local_keys: ?[]const usize,
     key_idx: []const usize,
     queue: WorkQueue,
-    seen: *op.Aggregate.GroupMap(),
-    builders: []column.Builder,
-    mtx: std.Thread.Mutex = .{},
-    plan_arena: std.mem.Allocator,
+    merge: *DistinctMerge,
     rows_read: *std.atomic.Value(u64),
 };
 
@@ -2806,36 +2884,18 @@ fn distinctWorkOne(ctx: *DistinctCtx, i: usize) !void {
     var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     const child = try buildMapChain(warena.allocator(), ctx.params, ctx.prefix, &scan, ctx.csv_schema);
-    var d = op.Distinct{ .child = child, .in_schema = ctx.row_schema, .keys = ctx.local_keys, .state = warena.allocator(), .gpa = wgpa.allocator() };
+    var d = op.Distinct{ .child = child, .in_schema = ctx.row_schema, .keys = ctx.local_keys, .state = warena.allocator(), .gpa = wgpa.allocator(), .track_ords = true };
 
     const probe = try warena.allocator().alloc(Value, ctx.key_idx.len);
     while (try d.next(batch_arena.allocator())) |b| {
-        {
-            // `defer`, not hand-unlocking: the dupe and append below can fail,
-            // and returning with this held wedged every other lane on its next
-            // batch — the whole run hung instead of reporting the error.
-            ctx.mtx.lock();
-            defer ctx.mtx.unlock();
-            var r: usize = 0;
-            while (r < b.len) : (r += 1) {
-                for (ctx.key_idx, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
-                const gop = try ctx.seen.getOrPut(probe);
-                if (!gop.found_existing) {
-                    const kv = try ctx.plan_arena.alloc(Value, ctx.key_idx.len);
-                    for (ctx.key_idx, 0..) |ci, j| kv[j] = try op.dupeValue(ctx.plan_arena, b.columns[ci].getValue(r));
-                    gop.key_ptr.* = kv;
-                    gop.value_ptr.* = 0;
-                    for (b.columns, ctx.builders) |*col, *bld| try bld.append(col.getValue(r));
-                }
-            }
-        }
+        try ctx.merge.absorb(i, b, d.ords, probe);
         _ = batch_arena.reset(.retain_capacity);
     }
 }
 
-/// Parallel distinct over a local parquet file: each lane dedups the row groups
-/// it steals, then a shared seen-set dedups across lanes. Output order varies
-/// under `-j > 1`.
+/// Parallel distinct over a local parquet file: one row group per work item,
+/// deduped on its own and then folded into the shared merge, which keeps the
+/// row that came first in the file.
 const PqDistinctCtx = struct {
     morsels: PqMorsels,
     row_schema: *const types.Schema,
@@ -2843,19 +2903,17 @@ const PqDistinctCtx = struct {
     params: *std.StringHashMap(*const ast.Expr),
     local_keys: ?[]const usize,
     key_idx: []const usize,
-    seen: *op.Aggregate.GroupMap(),
-    builders: []column.Builder,
-    mtx: std.Thread.Mutex = .{},
-    plan_arena: std.mem.Allocator,
+    queue: WorkQueue,
+    merge: *DistinctMerge,
     rows_read: *std.atomic.Value(u64),
 };
 
-fn pqDistinctLane(ctx: *PqDistinctCtx, lane_idx: usize) void {
-    _ = lane_idx;
-    pqDistinctLaneRun(ctx) catch |e| ctx.morsels.queue.fail(e);
-}
+const pqDistinctWorker = dispatchWorker(PqDistinctCtx, pqDistinctWorkOne);
 
-fn pqDistinctLaneRun(ctx: *PqDistinctCtx) !void {
+/// One row group. Deduping per row group rather than per lane costs a little
+/// extra traffic through the merge mutex, but it is what makes the work item
+/// index a usable position: row group `i` precedes row group `i+1` in the file.
+fn pqDistinctWorkOne(ctx: *PqDistinctCtx, i: usize) !void {
     var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
     defer _ = wgpa.deinit();
     var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
@@ -2863,36 +2921,42 @@ fn pqDistinctLaneRun(ctx: *PqDistinctCtx) !void {
     var batch_arena = std.heap.ArenaAllocator.init(wgpa.allocator());
     defer batch_arena.deinit();
 
-    var ms = MorselSource{ .m = &ctx.morsels, .scratch = warena.allocator() };
-    var cs = obs.CountingSource{ .inner = .{ .ptr = &ms, .vtable = &MorselSource.vtable }, .count = ctx.rows_read };
+    const rdr = try pqdecode.Reader.openProjected(warena.allocator(), ctx.morsels.path, ctx.morsels.project);
+    defer rdr.close();
+    rdr.bounds = ctx.morsels.bounds;
+    rdr.rg = i;
+    if (rdr.rg >= rdr.md.row_groups.len) return;
+    rdr.rg_end = rdr.rg + 1;
+
+    var rs = ReaderSource{ .r = rdr, .schema_ = ctx.morsels.src_schema };
+    var cs = obs.CountingSource{ .inner = .{ .ptr = &rs, .vtable = &ReaderSource.vtable }, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     const child = try buildMapChain(warena.allocator(), ctx.params, ctx.prefix, &scan, ctx.morsels.src_schema);
-    var d = op.Distinct{ .child = child, .in_schema = ctx.row_schema, .keys = ctx.local_keys, .state = warena.allocator(), .gpa = wgpa.allocator() };
+    var d = op.Distinct{ .child = child, .in_schema = ctx.row_schema, .keys = ctx.local_keys, .state = warena.allocator(), .gpa = wgpa.allocator(), .track_ords = true };
 
     const probe = try warena.allocator().alloc(Value, ctx.key_idx.len);
     while (try d.next(batch_arena.allocator())) |b| {
-        {
-            // `defer`, not hand-unlocking: the dupe and append below can fail,
-            // and returning with this held wedged every other lane on its next
-            // batch — the whole run hung instead of reporting the error.
-            ctx.mtx.lock();
-            defer ctx.mtx.unlock();
-            var r: usize = 0;
-            while (r < b.len) : (r += 1) {
-                for (ctx.key_idx, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
-                const gop = try ctx.seen.getOrPut(probe);
-                if (!gop.found_existing) {
-                    const kv = try ctx.plan_arena.alloc(Value, ctx.key_idx.len);
-                    for (ctx.key_idx, 0..) |ci, j| kv[j] = try op.dupeValue(ctx.plan_arena, b.columns[ci].getValue(r));
-                    gop.key_ptr.* = kv;
-                    gop.value_ptr.* = 0;
-                    for (b.columns, ctx.builders) |*col, *bld| try bld.append(col.getValue(r));
-                }
-            }
-        }
+        try ctx.merge.absorb(i, b, d.ords, probe);
         _ = batch_arena.reset(.retain_capacity);
     }
 }
+
+/// A single already-positioned parquet reader as a `Source`.
+const ReaderSource = struct {
+    r: *pqdecode.Reader,
+    schema_: *const types.Schema,
+
+    fn schemaFn(ptr: *anyopaque) types.Schema {
+        const self: *ReaderSource = @ptrCast(@alignCast(ptr));
+        return self.schema_.*;
+    }
+    fn nextFn(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?batchmod.Batch {
+        const self: *ReaderSource = @ptrCast(@alignCast(ptr));
+        return self.r.next(arena);
+    }
+    fn closeFn(_: *anyopaque) void {}
+    const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
+};
 
 fn runParallelParquetDistinct(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, prefix: []const ast.Stage, dist: ast.Distinct, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     const arena = env.arena;
@@ -2929,9 +2993,7 @@ fn runParallelParquetDistinct(env: *Env, rd: ast.Read, pipeline: []const ast.Sta
     env.sink_name = sinkLabel(env, w);
 
     const nthreads = @max(@as(usize, 1), opts.threads);
-    var seen = op.Aggregate.GroupMap().init(arena);
-    const builders = try arena.alloc(column.Builder, row_schema.fields.len);
-    for (builders, row_schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
+    var merge = DistinctMerge.init(arena, key_idx);
     var ctx = PqDistinctCtx{
         .morsels = .{
             .path = path,
@@ -2946,20 +3008,17 @@ fn runParallelParquetDistinct(env: *Env, rd: ast.Read, pipeline: []const ast.Sta
         .params = env.params_expr,
         .local_keys = local_keys,
         .key_idx = key_idx,
-        .seen = &seen,
-        .builders = builders,
-        .plan_arena = arena,
+        .queue = .{ .nitems = ngroups },
+        .merge = &merge,
         .rows_read = env.rows_read,
     };
 
-    const lanes = try parallel.spawnJoin(arena, nthreads, pqDistinctLane, &ctx);
+    const lanes = try parallel.spawnJoin(arena, nthreads, pqDistinctWorker, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
     env.log.log(.debug, "parallel parquet distinct: {d} row groups over {d} lanes", .{ ngroups, lanes });
-    if (ctx.morsels.queue.first_err) |e| return e;
+    if (ctx.queue.first_err) |e| return e;
 
-    const cols = try arena.alloc(column.Column, builders.len);
-    for (builders, cols) |*b, *c| c.* = try b.finish();
-    const merged = batchmod.Batch{ .schema = row_schema, .columns = cols, .len = cols[0].len };
+    const merged = try merge.finish(row_schema);
 
     const wr = try resolveUpsertKeys(env, w);
     const snk = try openSink(env, wr, row_schema.*);
@@ -2971,9 +3030,9 @@ fn runParallelParquetDistinct(env: *Env, rd: ast.Read, pipeline: []const ast.Sta
     return true;
 }
 
-/// Parallel CSV distinct: each worker dedups its chunk locally, then a global
-/// seen-set dedups across workers and collects the surviving rows. Output rows may
-/// reorder under -j>1 (use -j 1 for stable order). Returns false to fall back.
+/// Parallel CSV distinct: each worker dedups its chunk locally, then folds the
+/// survivors into a shared merge that keeps the row which came first in the
+/// file, so the result matches -j 1 exactly. Returns false to fall back.
 fn runParallelCsvDistinct(env: *Env, rd: ast.Read, prefix: []const ast.Stage, dist: ast.Distinct, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     const arena = env.arena;
     const path = switch (rd.form) {
@@ -3013,9 +3072,7 @@ fn runParallelCsvDistinct(env: *Env, rd: ast.Read, prefix: []const ast.Stage, di
     env.sink_name = sinkLabel(env, w);
 
     const nthreads = @max(@as(usize, 1), opts.threads);
-    var seen = op.Aggregate.GroupMap().init(arena);
-    const builders = try arena.alloc(column.Builder, row_schema.fields.len);
-    for (builders, row_schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
+    var merge = DistinctMerge.init(arena, key_idx);
     var ctx = DistinctCtx{
         .mapped = mapped,
         .csv_schema = &mapped.schema,
@@ -3025,9 +3082,7 @@ fn runParallelCsvDistinct(env: *Env, rd: ast.Read, prefix: []const ast.Stage, di
         .local_keys = local_keys,
         .key_idx = key_idx,
         .queue = .{ .nitems = nthreads },
-        .seen = &seen,
-        .builders = builders,
-        .plan_arena = arena,
+        .merge = &merge,
         .rows_read = env.rows_read,
     };
 
@@ -3036,9 +3091,7 @@ fn runParallelCsvDistinct(env: *Env, rd: ast.Read, prefix: []const ast.Stage, di
     env.log.log(.debug, "parallel csv distinct: {d} chunks over {d} lanes", .{ nthreads, lanes });
     if (ctx.queue.first_err) |e| return e;
 
-    const cols = try arena.alloc(column.Column, builders.len);
-    for (builders, cols) |*b, *c| c.* = try b.finish();
-    const merged = batchmod.Batch{ .schema = row_schema, .columns = cols, .len = cols[0].len };
+    const merged = try merge.finish(row_schema);
 
     const wr = try resolveUpsertKeys(env, w);
     const snk = try openSink(env, wr, row_schema.*);

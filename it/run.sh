@@ -557,6 +557,27 @@ SELECT name, COUNT(*) AS n, SUM(val) AS s FROM '$out/vol.parquet' GROUP BY name 
     report "parquet-parallel-agg-grouped (run error)" bad
   fi
 
+  # `DISTINCT ON (k)` keeps the *first* row per key. Under -j>1 each lane
+  # deduped its own chunk and whichever one reached the merge mutex first
+  # supplied the non-key columns, so `v` changed between two -j 8 runs and
+  # disagreed with -j 1. Row counts were always right, which is why it hid.
+  # Each format is its own oracle: a parallel write interleaves row groups, so
+  # dup.parquet is not in dup.csv's row order and "first row per key" is a
+  # different row in each. -j 1 vs -j 8 over the *same* file is the comparison
+  # that means anything.
+  dupcsv="$out/dup.csv"
+  { echo "k,v"; awk 'BEGIN{for(i=0;i<400000;i++) printf "%d,%d\n", i%500, i}'; } > "$dupcsv"
+  if brun run -c "LOAD INTO '$out/dup.parquet' AS SELECT * FROM '$dupcsv';" &&
+     brun run -j 1 -c "LOAD INTO '$out/dist_csv_ser.csv' AS SELECT DISTINCT ON (k) k, v FROM '$dupcsv';" &&
+     brun run -j 8 -c "LOAD INTO '$out/dist_csv_par.csv' AS SELECT DISTINCT ON (k) k, v FROM '$dupcsv';" &&
+     brun run -j 1 -c "LOAD INTO '$out/dist_pq_ser.csv' AS SELECT DISTINCT ON (k) k, v FROM '$out/dup.parquet';" &&
+     brun run -j 8 -c "LOAD INTO '$out/dist_pq_par.csv' AS SELECT DISTINCT ON (k) k, v FROM '$out/dup.parquet';"; then
+    check distinct-on-parallel-csv "$out/dist_csv_par.csv" "$out/dist_csv_ser.csv"
+    check distinct-on-parallel-parquet "$out/dist_pq_par.csv" "$out/dist_pq_ser.csv"
+  else
+    report "distinct-on-parallel (run error)" bad
+  fi
+
   # A file written by basalt must also satisfy a different implementation. Skipped
   # rather than failed when duckdb is absent, so the suite stays runnable anywhere.
   if command -v duckdb >/dev/null 2>&1 || [ -x "$HOME/.duckdb/cli/latest/duckdb" ]; then

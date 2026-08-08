@@ -422,6 +422,16 @@ pub const Distinct = struct {
     state: std.mem.Allocator,
     gpa: std.mem.Allocator,
     seen: ?Seen = null,
+    /// When set, `next` also reports where each surviving row sat in this
+    /// operator's input. The parallel drivers dedup per chunk and then merge,
+    /// and without an ordinal the merge keeps whichever lane reached the mutex
+    /// first — a different row's non-key columns on every run. Off by default:
+    /// the serial path pays nothing for it.
+    track_ords: bool = false,
+    /// Input ordinals of the rows in the batch `next` just returned, allocated
+    /// from the same arena as that batch and valid for exactly as long.
+    ords: []const u64 = &.{},
+    seen_rows: u64 = 0,
 
     const Seen = std.HashMap([]const Value, void, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
 
@@ -460,9 +470,21 @@ pub const Distinct = struct {
                     kept += 1;
                 }
             }
+            const base = self.seen_rows;
+            self.seen_rows += b.len;
             if (kept == 0) {
                 _ = scratch.reset(.retain_capacity);
                 continue;
+            }
+            if (self.track_ords) {
+                const ords = try arena.alloc(u64, kept);
+                var oi: usize = 0;
+                r = 0;
+                while (r < b.len) : (r += 1) if (keep[r]) {
+                    ords[oi] = base + r;
+                    oi += 1;
+                };
+                self.ords = ords;
             }
             return try gatherDeep(arena, b, keep, kept);
         }
@@ -2460,6 +2482,31 @@ test "project passes columns through and computes expressions with null propagat
     try testing.expectEqual(@as(i64, 11), b.columns[1].getValue(0).int);
     try testing.expect(b.columns[0].getValue(1).isNull());
     try testing.expect(b.columns[1].getValue(1).isNull());
+}
+
+test "distinct reports the input ordinal of every surviving row" {
+    // The parallel drivers dedup per chunk and merge; without an ordinal the
+    // merge cannot tell which duplicate came first and the non-key columns of
+    // the emitted row change from run to run.
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const batches = [_]Batch{
+        try intBatch(a, &int_schema, &.{ 7, 7, 4 }), // ordinals 0,1,2 → keep 0, 2
+        try intBatch(a, &int_schema, &.{ 4, 7, 9 }), // ordinals 3,4,5 → keep 5
+    };
+    var ts = TestSource{ .schema_ = int_schema, .batches = &batches };
+    var scan = Scan{ .src = ts.src() };
+    var dst = Distinct{ .child = .{ .scan = &scan }, .in_schema = &int_schema, .keys = null, .state = a, .gpa = testing.allocator, .track_ords = true };
+
+    var ords = std.array_list.Managed(u64).init(a);
+    const top = Op{ .distinct = &dst };
+    while (try top.next(a)) |b| {
+        try testing.expectEqual(b.len, dst.ords.len);
+        try ords.appendSlice(dst.ords);
+    }
+    try testing.expectEqualSlices(u64, &.{ 0, 2, 5 }, ords.items);
 }
 
 test "distinct dedups across batches, groups nulls as one key, deep-copies strings" {

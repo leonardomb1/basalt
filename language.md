@@ -317,9 +317,10 @@ WHERE downloads > 0;
 | `[INNER\|LEFT\|RIGHT\|FULL\|CROSS\|SEMI\|ANTI] JOIN <cte> x ON a = b [AND c = d ...]` | join (right side must be a CTE) |
 
 Row order without `ORDER BY` is not defined: `GROUP BY` returns groups in
-hash-partition order, and `DISTINCT` and map pipelines reorder under `-j > 1`
-(which is the default, since `-j` defaults to the core count). Add `ORDER BY`
-whenever the order matters.
+hash-partition order, and map pipelines reorder under `-j > 1` (which is the
+default, since `-j` defaults to the core count). Add `ORDER BY` whenever the
+order matters. `DISTINCT` is the exception: it keeps the first row per key in
+input order at any `-j`.
 
 Joins are hash equi-joins: the CTE (right) side is materialized and indexed
 once, the left side streams through. Keys are plain columns (compute
