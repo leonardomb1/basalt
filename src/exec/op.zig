@@ -39,6 +39,7 @@ pub fn errLabel(e: anyerror) []const u8 {
         error.CastFailed => "cast failed",
         error.DivByZero => "division by zero",
         error.TypeMismatch => "type mismatch",
+        error.IntOverflow => "integer overflow — the value does not fit a 64-bit integer",
         error.JoinBuildTooLarge => "join build side exceeds its cap — raise it with WITH (max_build = '8GB') on the join, filter the CTE, or flip the join",
         else => @errorName(e),
     };
@@ -1363,7 +1364,11 @@ pub const Aggregate = struct {
                 dst.n += src.n;
             },
             .sum => {
-                if (agg.ty.kind == .float) dst.sum_f += src.sum_f else dst.sum_i += src.sum_i;
+                // Merging per-lane partials can overflow where no single lane did.
+                if (agg.ty.kind == .float)
+                    dst.sum_f += src.sum_f
+                else
+                    dst.sum_i = std.math.add(i64, dst.sum_i, src.sum_i) catch return error.IntOverflow;
                 dst.n += src.n;
             },
             .avg => {
@@ -1729,7 +1734,7 @@ pub const Aggregate = struct {
                         const addend = std.math.cast(i64, r.unscaled) orelse return error.CastFailed;
                         acc.sum_i = std.math.add(i64, acc.sum_i, addend) catch return error.CastFailed;
                     },
-                    else => acc.sum_i += v.int,
+                    else => acc.sum_i = std.math.add(i64, acc.sum_i, v.int) catch return error.IntOverflow,
                 }
                 acc.n += 1;
             },

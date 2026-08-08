@@ -301,7 +301,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             if (diag.msg.len > 0)
                 try stderr.print("{s}: error{s}: {s}\n", .{ src.label, tag, diag.msg })
             else
-                try stderr.print("{s}: runtime error{s}: {s}\n", .{ src.label, tag, @errorName(e) });
+                try stderr.print("{s}: runtime error{s}: {s}\n", .{ src.label, tag, runtime.errLabel(e) });
             return if (transient) 75 else 1;
         },
     };

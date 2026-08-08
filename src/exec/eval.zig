@@ -18,7 +18,7 @@ const Value = valuemod.Value;
 const Batch = batchmod.Batch;
 
 pub const TypeError = error{ TypeError, OutOfMemory };
-pub const EvalError = error{ CastFailed, DivByZero, TypeMismatch, OutOfMemory };
+pub const EvalError = error{ CastFailed, DivByZero, TypeMismatch, IntOverflow, OutOfMemory };
 
 pub const TypeCtx = struct {
     schema: types.Schema,
@@ -485,6 +485,7 @@ pub fn evalColumn(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch,
         error.CastFailed => return error.CastFailed,
         error.DivByZero => return error.DivByZero,
         error.TypeMismatch => return error.TypeMismatch,
+        error.IntOverflow => return error.IntOverflow,
         error.OutOfMemory => return error.OutOfMemory,
     };
     return switch (v) {
@@ -508,7 +509,7 @@ const Column = column.Column;
 const Bitmap = column.Bitmap;
 const Decimal = valuemod.Decimal;
 
-const VecError = error{ Unsupported, CastFailed, DivByZero, TypeMismatch, OutOfMemory };
+const VecError = error{ Unsupported, CastFailed, DivByZero, TypeMismatch, IntOverflow, OutOfMemory };
 
 const Vec = union(enum) {
     col: Column,
@@ -914,9 +915,10 @@ fn OpOut(comptime T: type, comptime op: ast.BinOp) type {
 /// semantics (`/`, `@mod`) — both matching the rowwise evaluator.
 inline fn applyOp(comptime T: type, comptime op: ast.BinOp, a: T, d: T) VecError!OpOut(T, op) {
     return switch (op) {
-        .add => a + d,
-        .sub => a - d,
-        .mul => a * d,
+        // See `arith`: unchecked i64 overflow is UB in the release build.
+        .add => if (T == i64) (std.math.add(i64, a, d) catch return error.IntOverflow) else a + d,
+        .sub => if (T == i64) (std.math.sub(i64, a, d) catch return error.IntOverflow) else a - d,
+        .mul => if (T == i64) (std.math.mul(i64, a, d) catch return error.IntOverflow) else a * d,
         .div => if (T == i64)
             (if (d == 0) error.DivByZero else @divTrunc(a, d))
         else
@@ -1467,10 +1469,14 @@ fn arith(op: ast.BinOp, l: Value, r: Value) EvalError!Value {
     if (l == .int and r == .int) {
         const a = l.int;
         const b = r.int;
+        // Checked: the shipped binary is ReleaseFast, where a bare `+` on
+        // overflow is undefined behavior — a silently wrong (usually negative)
+        // number. i64 is the widest integer basalt carries, so there is nothing
+        // to widen into; the honest answer is to fail the row.
         return switch (op) {
-            .add => .{ .int = a + b },
-            .sub => .{ .int = a - b },
-            .mul => .{ .int = a * b },
+            .add => .{ .int = std.math.add(i64, a, b) catch return error.IntOverflow },
+            .sub => .{ .int = std.math.sub(i64, a, b) catch return error.IntOverflow },
+            .mul => .{ .int = std.math.mul(i64, a, b) catch return error.IntOverflow },
             .div => if (b == 0) error.DivByZero else .{ .int = @divTrunc(a, b) },
             .mod => if (b == 0) error.DivByZero else .{ .int = @rem(a, b) },
             else => unreachable,
@@ -3100,4 +3106,16 @@ test "orderF64: a total order over NaN, so comparisons never hit unreachable" {
     const v_nan = Value{ .float = nan };
     try std.testing.expectEqual(std.math.Order.eq, compareValues(v_nan, v_nan).?);
     try std.testing.expectEqual(std.math.Order.gt, compareValues(v_nan, .{ .int = 9 }).?);
+}
+
+test "integer arithmetic overflow is an error, not a silent wrap" {
+    // The release build is ReleaseFast, where an unchecked `+` past i64 is
+    // undefined behavior — historically a silently negative result. i64 is the
+    // widest integer basalt carries, so overflow has to fail the row.
+    const big = Value{ .int = std.math.maxInt(i64) };
+    const one = Value{ .int = 1 };
+    try std.testing.expectError(error.IntOverflow, arith(.add, big, one));
+    try std.testing.expectError(error.IntOverflow, arith(.mul, big, .{ .int = 2 }));
+    try std.testing.expectError(error.IntOverflow, arith(.sub, .{ .int = std.math.minInt(i64) }, one));
+    try std.testing.expectEqual(@as(i64, 5), (try arith(.add, .{ .int = 2 }, .{ .int = 3 })).int);
 }

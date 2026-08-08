@@ -51,6 +51,9 @@ pub const Diag = struct {
 
 pub const requestAbort = driver.requestAbort;
 pub const aborting = driver.aborting;
+/// Friendly text for an operator error, so the CLI never prints a bare Zig
+/// error name for a condition the engine has a sentence about.
+pub const errLabel = op.errLabel;
 pub const resetAbort = driver.resetAbort;
 
 var g_reload = std.atomic.Value(bool).init(false);
