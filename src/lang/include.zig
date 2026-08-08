@@ -39,6 +39,12 @@ pub const Diag = struct {
 const max_depth: u32 = 16;
 const max_file_bytes: usize = 8 << 20;
 
+/// Depth bounds nesting, not size: an included file's statements are merged into
+/// every file that includes it, so a diamond DAG multiplies rather than adds —
+/// 16 levels of 4 siblings is 4^16 statements out of a few KB of source. This
+/// bounds the merged total, far above any real layering.
+const max_total_stmts: usize = 100_000;
+
 /// Parse `text` (named `label`, with `@include` paths resolved against `base_dir`)
 /// into one program. `base_dir` may be "" or "." for cwd-relative resolution.
 /// Everything is allocated in `arena`, and the AST slices into the include texts
@@ -54,6 +60,7 @@ pub fn loadProgram(
         .arena = arena,
         .diag = diag,
         .stack = std.array_list.Managed(Frame).init(arena),
+        .memo = std.StringHashMap(ast.Program).init(arena),
     };
     // The root only joins the cycle stack when it is a real file (`-c`, stdin and
     // the REPL have no path, and so can never be re-included).
@@ -71,7 +78,14 @@ const Ctx = struct {
     arena: std.mem.Allocator,
     diag: *Diag,
     stack: std.array_list.Managed(Frame),
+    /// Canonical path -> the program it parsed to. The stack only bounds nesting,
+    /// so without this a diamond DAG re-reads and re-parses each file once per
+    /// distinct path through it — 16 levels of 4 siblings is 4^16 loads of a few
+    /// KB of files. A memoised file is never re-entered, so cycle detection is
+    /// unaffected: anything still on the stack has not finished and cannot be here.
+    memo: std.StringHashMap(ast.Program),
     depth: u32 = 0,
+    stmt_budget: usize = max_total_stmts,
 
     fn fail(self: *Ctx, label: []const u8, line: u32, col: u32, comptime fmt: []const u8, args: anytype) Error {
         const msg: []const u8 = std.fmt.allocPrint(self.arena, fmt, args) catch "include error";
@@ -89,23 +103,38 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base_dir: []const u8) Er
     var subs = std.array_list.Managed(ast.Program).init(ctx.arena);
     for (incs.items) |d| {
         const resolved = try resolvePath(ctx, base_dir, d.path);
-        const src = std.fs.cwd().readFileAlloc(ctx.arena, resolved, max_file_bytes) catch |e| {
-            if (e == error.OutOfMemory) return error.OutOfMemory;
-            return ctx.fail(label, d.line, d.col, "cannot read include `{s}`: {s}", .{ resolved, @errorName(e) });
+        var canonical = true;
+        const canon: []const u8 = std.fs.cwd().realpathAlloc(ctx.arena, resolved) catch blk: {
+            canonical = false;
+            break :blk resolved;
         };
-        const canon: []const u8 = std.fs.cwd().realpathAlloc(ctx.arena, resolved) catch resolved;
         for (ctx.stack.items, 0..) |f, i| {
             if (!std.mem.eql(u8, f.canon, canon)) continue;
             return ctx.fail(label, d.line, d.col, "include cycle: {s}", .{try cycleTrail(ctx, i, resolved)});
         }
+        if (canonical) if (ctx.memo.get(canon)) |cached| {
+            try subs.append(cached);
+            continue;
+        };
+        const src = std.fs.cwd().readFileAlloc(ctx.arena, resolved, max_file_bytes) catch |e| {
+            if (e == error.OutOfMemory) return error.OutOfMemory;
+            return ctx.fail(label, d.line, d.col, "cannot read include `{s}`: {s}", .{ resolved, @errorName(e) });
+        };
         if (ctx.depth + 1 > max_depth)
             return ctx.fail(label, d.line, d.col, "include nesting deeper than {d} files at `{s}`", .{ max_depth, resolved });
 
         try ctx.stack.append(.{ .canon = canon, .shown = resolved });
         ctx.depth += 1;
-        try subs.append(try load(ctx, src, resolved, std.fs.path.dirname(resolved) orelse "."));
+        const sub = try load(ctx, src, resolved, std.fs.path.dirname(resolved) orelse ".");
         ctx.depth -= 1;
         _ = ctx.stack.pop();
+        if (canonical) try ctx.memo.put(canon, sub);
+        try subs.append(sub);
+
+        const n = stmtsOf(sub).len;
+        if (n > ctx.stmt_budget)
+            return ctx.fail(label, d.line, d.col, "@include tree expands to more than {d} statements at `{s}`", .{ max_total_stmts, resolved });
+        ctx.stmt_budget -= n;
     }
 
     // A script whose whole body is directives contributes no statements of its
@@ -340,6 +369,56 @@ test "@include cycle is reported with the file trail" {
     try testing.expect(std.mem.indexOf(u8, diag.parse.msg, "b.sql") != null);
     // Reported against the file holding the offending directive.
     try testing.expect(std.mem.endsWith(u8, diag.label, "b.sql"));
+}
+
+test "a diamond @include DAG is parsed once per file, not once per path" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try writeFile(&tmp, "c.sql", "CREATE FUNCTION inc(x) AS x + 1;\n");
+    try writeFile(&tmp, "a.sql", "@include 'c.sql';\n");
+    try writeFile(&tmp, "b.sql", "@include 'c.sql';\n");
+
+    // Both arms of the diamond still contribute c's statements — memoising the
+    // parse must not change what the merged program contains.
+    var diag: Diag = .{};
+    const prog = try loadProgram(a,
+        \\@include 'a.sql';
+        \\@include 'b.sql';
+        \\SELECT inc(id) AS y FROM 'in.csv';
+    , "main.sql", base, &diag);
+
+    try testing.expectEqual(@as(usize, 4), prog.stmts.len);
+    try testing.expect(prog.stmts[0] == .kind);
+    try testing.expectEqualStrings("inc", prog.stmts[1].func.name);
+    try testing.expectEqualStrings("inc", prog.stmts[2].func.name);
+    try testing.expect(prog.stmts[3] == .output);
+}
+
+test "a fan-out @include tree fails on the statement budget instead of hanging" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+
+    // 12 levels of 4 siblings: 4^12 paths through ~1 KB of source. The depth cap
+    // never fires — only the total does.
+    const levels = 12;
+    for (0..levels) |i| {
+        var body = std.array_list.Managed(u8).init(a);
+        for (0..4) |_| try body.writer().print("@include 'b{d}.sql';\n", .{i + 1});
+        try writeFile(&tmp, try std.fmt.allocPrint(a, "b{d}.sql", .{i}), body.items);
+    }
+    try writeFile(&tmp, "b12.sql", "SELECT 1 AS x FROM 'in.csv';\n");
+
+    var diag: Diag = .{};
+    try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'b0.sql';\n", "main.sql", base, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.parse.msg, "statements") != null);
 }
 
 test "@include after a statement is rejected" {

@@ -15,11 +15,17 @@ pub const Error = error{ OutOfMemory, ExpandFailed };
 
 const max_depth = 64;
 
+/// Depth bounds nesting, not work: `f(x) = g(x) + g(x)` doubles per level, so a
+/// 64-deep chain is 2^64 nodes long before the depth cap fires. This bounds the
+/// total, and sits far above any real script (thousands of nodes at most).
+const max_nodes = 250_000;
+
 const Ctx = struct {
     arena: std.mem.Allocator,
     fns: *const std.StringHashMap(ast.FnDecl),
     json: *const std.StringHashMap(?std.json.Value),
     msg: *[]const u8,
+    budget: usize = max_nodes,
 };
 
 const Subst = std.StringHashMap(*ast.Expr);
@@ -279,6 +285,11 @@ fn expandExpr(cx: *Ctx, e: *const ast.Expr, subst: ?*Subst, depth: usize) Error!
         cx.msg.* = "fn expansion too deep (recursive `fn`?)";
         return error.ExpandFailed;
     }
+    if (cx.budget == 0) {
+        cx.msg.* = "fn expansion produced too many nodes (a `fn` that calls another twice per level?)";
+        return error.ExpandFailed;
+    }
+    cx.budget -= 1;
     switch (e.*) {
         .field => |q| {
             if (subst) |s| if (q.single()) |nm| if (s.get(nm)) |arg| return arg;
@@ -463,6 +474,22 @@ test "expandProgram rejects recursion and arity mismatch" {
     var m2: []const u8 = "";
     try std.testing.expectError(error.ExpandFailed, expandProgram(a, p2, null, &m2));
     try std.testing.expect(std.mem.indexOf(u8, m2, "expects 1 argument(s), got 2") != null);
+}
+
+test "expandProgram bounds total nodes, not just nesting depth" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // Each level calls the one below it twice, so the body doubles per level and
+    // 30 levels is 2^30 nodes — well inside the depth cap of 64.
+    var src = std.array_list.Managed(u8).init(a);
+    try src.appendSlice("CREATE FUNCTION f0(x) AS x + 1;\n");
+    for (1..31) |i| try src.writer().print("CREATE FUNCTION f{d}(x) AS f{d}(x) + f{d}(x);\n", .{ i, i - 1, i - 1 });
+    try src.appendSlice("SELECT f30(id) AS y FROM 'x';");
+
+    const msg = try expandErr(a, src.items);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "too many nodes") != null);
 }
 
 /// Parse + expand, returning the error message instead of the program.
