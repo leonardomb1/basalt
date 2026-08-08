@@ -217,6 +217,28 @@ runs mysql     && volrt mysql     "$MYSQL_OPTS"
 runs postgres  && volrt postgres  "$PG_OPTS"
 runs sqlserver && volrt sqlserver "$MSSQL_OPTS"
 
+# A value over 16 MB does not fit one MySQL packet; the server splits it and the
+# client must glue the run back together. `readPacket` took only the first
+# packet, so the query failed *and* left the continuations queued — every later
+# read on that connection was one packet out of step. The second statement runs
+# on the same connection and is the desync half of the check.
+if runs mysql; then
+  docker exec it-mysql-1 mysql -uroot -pit it -e "
+    DROP TABLE IF EXISTS basalt_big;
+    CREATE TABLE basalt_big (id INT, v LONGTEXT);
+    INSERT INTO basalt_big VALUES (1, CONCAT('A', REPEAT('x', 19999998), 'Z'));" >/dev/null 2>&1
+  if brun run -c "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);
+LOAD INTO '$out/mysql_big.csv' AS
+SELECT id, LENGTH(v) AS n, SUBSTR(v, 1, 1) AS a, SUBSTR(v, 20000000, 1) AS z FROM db.basalt_big;
+LOAD INTO '$out/mysql_after.csv' AS SELECT * FROM db.basalt_it ORDER BY id;"; then
+    { echo "id,n,a,z"; echo "1,20000000,A,Z"; } >"$out/mysql_big_expected.csv"
+    check mysql-large-packet "$out/mysql_big.csv" "$out/mysql_big_expected.csv"
+    check mysql-large-packet-no-desync "$out/mysql_after.csv" it/expected.csv
+  else
+    report "mysql-large-packet (run error)" bad
+  fi
+fi
+
 # StarRocks: write via stream load, read back through its MySQL-protocol FE.
 if runs starrocks; then
   if brun run -c "CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');

@@ -86,15 +86,15 @@ pub const Conn = struct {
                 0xfe => {
                     const sw = parseAuthSwitch(p);
                     if (password.len == 0) {
-                        try self.writePacket(rseq +% 1, "");
+                        _ = try self.writePacket(rseq +% 1, "");
                     } else switch (sw.plugin orelse return error.MysqlAuthFailed) {
                         .native => {
                             const token = sr.mysqlAuthToken(password, &sw.salt);
-                            try self.writePacket(rseq +% 1, &token);
+                            _ = try self.writePacket(rseq +% 1, &token);
                         },
                         .caching_sha2 => {
                             const token = cachingSha2Token(password, &sw.salt);
-                            try self.writePacket(rseq +% 1, &token);
+                            _ = try self.writePacket(rseq +% 1, &token);
                         },
                         .clear => try self.writeClearPassword(rseq +% 1, password),
                     }
@@ -110,7 +110,7 @@ pub const Conn = struct {
                         defer self.gpa.free(pw);
                         @memcpy(pw[0..password.len], password);
                         pw[password.len] = 0;
-                        try self.writePacket(rseq +% 1, pw);
+                        _ = try self.writePacket(rseq +% 1, pw);
                         continue;
                     }
                     return error.MysqlProtocol;
@@ -127,7 +127,7 @@ pub const Conn = struct {
         defer self.gpa.free(payload);
         payload[0] = 0x03;
         @memcpy(payload[1..], sql);
-        try self.writePacket(0, payload);
+        _ = try self.writePacket(0, payload);
 
         _ = try self.readPacket();
         const p = self.buf.items;
@@ -145,7 +145,7 @@ pub const Conn = struct {
         defer self.gpa.free(payload);
         payload[0] = 0x03;
         @memcpy(payload[1..], cmd);
-        try self.writePacket(0, payload);
+        _ = try self.writePacket(0, payload);
 
         const rseq = try self.readPacket();
         const p = self.buf.items;
@@ -157,17 +157,18 @@ pub const Conn = struct {
         self.ld_seq = rseq +% 1;
     }
 
-    /// One data packet (must be < 16MB; the sink flushes well under that).
+    /// One chunk of the local-infile stream. The sink flushes well under 16 MB,
+    /// but the sequence number comes back from `writePacket` rather than being
+    /// bumped by one, so an oversized chunk splits without desynchronising.
     pub fn loadDataChunk(self: *Conn, data: []const u8) !void {
         if (data.len == 0) return;
-        try self.writePacket(self.ld_seq, data);
-        self.ld_seq +%= 1;
+        self.ld_seq = try self.writePacket(self.ld_seq, data);
     }
 
     /// Empty packet = end of data; then read the server's OK/ERR. Returns the
     /// OK packet's affected-rows count.
     pub fn loadDataEnd(self: *Conn) !u64 {
-        try self.writePacket(self.ld_seq, "");
+        _ = try self.writePacket(self.ld_seq, "");
         _ = try self.readPacket();
         const p = self.buf.items;
         if (p.len > 0 and p[0] == 0xff) {
@@ -213,7 +214,7 @@ pub const Conn = struct {
         defer self.gpa.free(payload);
         payload[0] = 0x03;
         @memcpy(payload[1..], sql);
-        try self.writePacket(0, payload);
+        _ = try self.writePacket(0, payload);
 
         _ = try self.readPacket();
         const first = self.buf.items;
@@ -276,26 +277,55 @@ pub const Conn = struct {
         return .row;
     }
 
+    /// The three-byte length header caps one packet at 16 MB - 1, so anything
+    /// larger is sent as a run of full packets terminated by a short one.
+    const max_payload: usize = 0xFFFFFF;
+
+    /// One logical packet, reassembled from however many wire packets carry it.
+    /// Reading only the first used to fail *and* leave the continuations
+    /// queued, so every later read on the connection was one packet out of
+    /// step — a 20 MB `longtext` broke the query and then the socket.
     fn readPacket(self: *Conn) !u8 {
         const r = self.rd();
-        var header: [4]u8 = undefined;
-        try r.readSliceAll(&header);
-        const len: usize = @as(usize, header[0]) | (@as(usize, header[1]) << 8) | (@as(usize, header[2]) << 16);
-        try self.buf.resize(len);
-        try r.readSliceAll(self.buf.items[0..len]);
-        return header[3];
+        self.buf.clearRetainingCapacity();
+        while (true) {
+            var header: [4]u8 = undefined;
+            try r.readSliceAll(&header);
+            const len: usize = @as(usize, header[0]) | (@as(usize, header[1]) << 8) | (@as(usize, header[2]) << 16);
+            const base = self.buf.items.len;
+            try self.buf.resize(base + len);
+            try r.readSliceAll(self.buf.items[base..][0..len]);
+            // A full-length packet is always continued, even when the value
+            // ends exactly on the boundary — then the run ends with an empty
+            // packet. A short one is the last.
+            if (len < max_payload) return header[3];
+        }
     }
 
-    fn writePacket(self: *Conn, seq: u8, payload: []const u8) !void {
-        var header: [4]u8 = undefined;
-        header[0] = @intCast(payload.len & 0xff);
-        header[1] = @intCast((payload.len >> 8) & 0xff);
-        header[2] = @intCast((payload.len >> 16) & 0xff);
-        header[3] = seq;
+    /// Writes `payload` as a packet run starting at `seq` and returns the next
+    /// sequence number. Masking the length into three bytes instead of
+    /// splitting desynchronised the *server*, which then read payload bytes as
+    /// a header.
+    fn writePacket(self: *Conn, seq: u8, payload: []const u8) !u8 {
         const w = self.wr();
-        try w.writeAll(&header);
-        try w.writeAll(payload);
+        var off: usize = 0;
+        var s = seq;
+        while (true) {
+            const n = @min(max_payload, payload.len - off);
+            const header = [4]u8{
+                @intCast(n & 0xff),
+                @intCast((n >> 8) & 0xff),
+                @intCast((n >> 16) & 0xff),
+                s,
+            };
+            try w.writeAll(&header);
+            try w.writeAll(payload[off..][0..n]);
+            off += n;
+            s +%= 1;
+            if (n < max_payload) break;
+        }
         try self.flushOut();
+        return s;
     }
 
     const Handshake = struct { salt: [20]u8, plugin: AuthPlugin };
@@ -347,7 +377,7 @@ pub const Conn = struct {
         try w.writeInt(u32, 0x01000000, .little);
         try w.writeByte(33);
         try w.writeByteNTimes(0, 23);
-        try self.writePacket(seq, out.items);
+        _ = try self.writePacket(seq, out.items);
     }
 
     /// mysql_clear_password auth-switch response: the password as a null-terminated
@@ -359,7 +389,7 @@ pub const Conn = struct {
         defer self.gpa.free(pw);
         @memcpy(pw[0..password.len], password);
         pw[password.len] = 0;
-        try self.writePacket(seq, pw);
+        _ = try self.writePacket(seq, pw);
     }
 
     fn writeHandshakeResponse(self: *Conn, seq: u8, user: []const u8, password: []const u8, database: []const u8, salt: [20]u8, plugin: AuthPlugin) !void {
@@ -403,7 +433,7 @@ pub const Conn = struct {
         try w.writeAll(plugin.name());
         try w.writeByte(0);
 
-        try self.writePacket(seq, out.items);
+        _ = try self.writePacket(seq, out.items);
     }
 };
 
