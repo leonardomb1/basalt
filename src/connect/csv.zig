@@ -784,7 +784,11 @@ fn writeField(w: anytype, s: []const u8) !void {
     }
 }
 
+/// An empty value must be quoted. Only the writer knows it is a string rather
+/// than a null — unquoted empty is how the reader spells null — so emitting it
+/// bare turned `""` into NULL on the next read.
 fn needsQuote(s: []const u8) bool {
+    if (s.len == 0) return true;
     for (s) |c| {
         if (c == ',' or c == '"' or c == '\n' or c == '\r') return true;
     }
@@ -927,7 +931,28 @@ test "writeField quotes exactly the fields that need it, doubling quotes" {
     try writeField(buf.writer(), "say \"hi\"");
     try buf.append('|');
     try writeField(buf.writer(), "line\nbreak");
-    try std.testing.expectEqualStrings("plain|\"a,b\"|\"say \"\"hi\"\"\"|\"line\nbreak\"", buf.items);
+    try buf.append('|');
+    try writeField(buf.writer(), "");
+    try std.testing.expectEqualStrings("plain|\"a,b\"|\"say \"\"hi\"\"\"|\"line\nbreak\"|\"\"", buf.items);
+}
+
+test "an empty string survives a write/read round-trip and stays distinct from null" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const schema = try stringSchema(a, &.{ "a", "b" });
+
+    // The writer emits nothing for a null and `""` for an empty string; reading
+    // that back has to reproduce exactly that distinction. Emitting the empty
+    // string bare made every one of them come back as NULL.
+    var line = std.array_list.Managed(u8).init(a);
+    try writeField(line.writer(), "");
+    try line.append(',');
+    try line.append('\n');
+    const b = try parseSlice(a, &schema, line.items);
+    try std.testing.expect(!b.columns[0].getValue(0).isNull());
+    try std.testing.expectEqualStrings("", b.columns[0].getValue(0).string);
+    try std.testing.expect(b.columns[1].getValue(0).isNull());
 }
 
 test "csv write/parse round-trip preserves quoted values" {

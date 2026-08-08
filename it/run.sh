@@ -311,6 +311,20 @@ else
   report "quoted-idents (run error)" bad
 fi
 
+# An empty string is not a NULL. The writer used to emit it bare, which is
+# exactly how the reader spells NULL — so `""` degraded to NULL on every hop and
+# the degradation was invisible until something counted nulls. Two hops, because
+# one would pass on a writer that merely echoed its input.
+printf 'id,s\n1,""\n2,\n3,x\n' > "$out/es.csv"
+printf 'id,s,n\n1,"",false\n2,,true\n3,x,false\n' > "$out/es_expected.csv"
+if brun run -c "LOAD INTO '$out/es1.csv' AS SELECT * FROM '$out/es.csv' ORDER BY id;" &&
+   brun run -c "LOAD INTO '$out/es2.csv' AS
+SELECT id, s, s IS NULL AS n FROM '$out/es1.csv' ORDER BY id;"; then
+  check csv-empty-string-vs-null "$out/es2.csv" "$out/es_expected.csv"
+else
+  report "csv-empty-string-vs-null (run error)" bad
+fi
+
 # THROW guards the script's own invariants, which basalt cannot infer. It must
 # fire at plan time — so `check` rejects it, not just `run` — carry the author's
 # message verbatim, and be permanent (exit 1), never transient: a scheduler must
