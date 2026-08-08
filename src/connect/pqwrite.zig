@@ -20,6 +20,7 @@ const std = @import("std");
 const pq = @import("parquet.zig");
 const thrift = @import("thrift.zig");
 const codec = @import("codec.zig");
+const eval = @import("../exec/eval.zig");
 const driver = @import("driver.zig");
 const azure = @import("azure.zig");
 const httpx = @import("http.zig");
@@ -262,10 +263,11 @@ fn order(a: Value, b: Value) std.math.Order {
             .timestamp => |x| x,
             else => a.timestamp,
         }),
-        .decimal => std.math.order(a.decimal.unscaled, switch (b) {
-            .decimal => |x| x.unscaled,
-            else => a.decimal.unscaled,
-        }),
+        // Compare the NUMBER, not the mantissa: a source sends a per-value scale
+        // (postgres NUMERIC dscale), so `0.5` (unscaled 5) and `0.10` (unscaled
+        // 10) ranked backwards and this wrote min > max into the row group's
+        // statistics. Readers then pruned the group and dropped real rows.
+        .decimal => eval.compareValues(a, b) orelse .eq,
         .bool => std.math.order(@intFromBool(a.bool), switch (b) {
             .bool => |x| @intFromBool(x),
             else => @intFromBool(a.bool),

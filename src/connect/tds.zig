@@ -1281,7 +1281,10 @@ fn readULE(bytes: []const u8) u64 {
 fn readIntLE(bytes: []const u8) i64 {
     return switch (bytes.len) {
         0 => 0,
-        1 => @as(i8, @bitCast(bytes[0])),
+        // SQL Server has no signed 1-byte type: the only producers of a 1-byte
+        // body are INT1TYPE and INTNTYPE(1), both `tinyint`, which is unsigned
+        // 0-255. Sign-extending turned 200 into -56 and 255 into -1.
+        1 => @as(i64, bytes[0]),
         2 => std.mem.readInt(i16, bytes[0..2], .little),
         4 => std.mem.readInt(i32, bytes[0..4], .little),
         8 => std.mem.readInt(i64, bytes[0..8], .little),
@@ -1407,7 +1410,8 @@ test "win1252 transcode to utf8" {
 
 test "readIntLE sign-extends every TDS integer width" {
     try std.testing.expectEqual(@as(i64, 0), readIntLE(&.{}));
-    try std.testing.expectEqual(@as(i64, -1), readIntLE(&.{0xFF}));
+    // `tinyint` is unsigned in T-SQL — a 1-byte body is 0-255, never negative.
+    try std.testing.expectEqual(@as(i64, 255), readIntLE(&.{0xFF}));
     try std.testing.expectEqual(@as(i64, 127), readIntLE(&.{0x7F}));
     try std.testing.expectEqual(@as(i64, -2), readIntLE(&.{ 0xFE, 0xFF }));
     try std.testing.expectEqual(@as(i64, -1), readIntLE(&.{ 0xFF, 0xFF, 0xFF, 0xFF }));
