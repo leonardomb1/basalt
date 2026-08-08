@@ -685,13 +685,19 @@ test "parseColDef decodes a column definition packet" {
 }
 
 test "engineTypeFor maps MySQL wire types to engine types" {
-    try std.testing.expectEqual(types.TypeKind.int, engineTypeFor(0x03, 0).kind);
-    try std.testing.expectEqual(types.TypeKind.int, engineTypeFor(0x08, 0).kind);
-    try std.testing.expectEqual(types.TypeKind.float, engineTypeFor(0x05, 0).kind);
-    try std.testing.expectEqual(types.TypeKind.date, engineTypeFor(0x0a, 0).kind);
-    try std.testing.expectEqual(types.TypeKind.timestamp, engineTypeFor(0x0c, 0).kind);
-    try std.testing.expectEqual(types.TypeKind.string, engineTypeFor(0xfd, 0).kind);
-    try std.testing.expect(engineTypeFor(0x03, 0).nullable);
+    // charset 33 = utf8mb4 (text), 63 = binary; flags 0 = signed, 0x20 = unsigned.
+    try std.testing.expectEqual(types.TypeKind.int, engineTypeFor(0x03, 0, 0, 33).kind);
+    try std.testing.expectEqual(types.TypeKind.int, engineTypeFor(0x08, 0, 0, 33).kind);
+    try std.testing.expectEqual(types.TypeKind.float, engineTypeFor(0x05, 0, 0, 33).kind);
+    try std.testing.expectEqual(types.TypeKind.date, engineTypeFor(0x0a, 0, 0, 33).kind);
+    try std.testing.expectEqual(types.TypeKind.timestamp, engineTypeFor(0x0c, 0, 0, 33).kind);
+    try std.testing.expectEqual(types.TypeKind.string, engineTypeFor(0xfd, 0, 0, 33).kind);
+    try std.testing.expect(engineTypeFor(0x03, 0, 0, 33).nullable);
+    // `bigint unsigned` exceeds i64, so it rides as an exact decimal; a binary
+    // charset makes the string family bytes rather than (mis-declared) UTF-8.
+    try std.testing.expectEqual(types.TypeKind.decimal, engineTypeFor(0x08, 0, 0x0020, 63).kind);
+    try std.testing.expectEqual(types.TypeKind.bytes, engineTypeFor(0xfd, 0, 0, 63).kind);
+    try std.testing.expectEqual(types.TypeKind.bytes, engineTypeFor(0xfc, 0, 0, 63).kind);
 }
 
 test "parseAuthSwitch extracts the plugin and its trailing salt" {
@@ -719,23 +725,38 @@ fn parseColDef(arena: std.mem.Allocator, p: []const u8) !MyCol {
     _ = try lenencStr(p, &i);
     _ = try lenencInt(p, &i);
     if (i + 10 > p.len) return error.MysqlProtocol;
+    // These two were stepped over. They carry the only signals that tell an
+    // unsigned column from a signed one and a binary column from text, so
+    // discarding them made `bigint unsigned` unreadable (it parses as i64 and
+    // fails the whole read) and declared `varbinary` as UTF-8 downstream.
+    const charset = std.mem.readInt(u16, p[i..][0..2], .little);
     i += 2;
     i += 4;
     const mtype = p[i];
     i += 1;
+    const flags = std.mem.readInt(u16, p[i..][0..2], .little);
     i += 2;
     const decimals = p[i];
-    return .{ .name = try arena.dupe(u8, name), .mtype = mtype, .decimals = decimals, .engine_type = engineTypeFor(mtype, decimals) };
+    return .{ .name = try arena.dupe(u8, name), .mtype = mtype, .decimals = decimals, .engine_type = engineTypeFor(mtype, decimals, flags, charset) };
 }
 
-fn engineTypeFor(mtype: u8, decimals: u8) types.Type {
+/// `flags & 0x20` is UNSIGNED_FLAG; charset 63 is `binary`.
+fn engineTypeFor(mtype: u8, decimals: u8, flags: u16, charset: u16) types.Type {
+    const unsigned = flags & 0x0020 != 0;
+    const binary = charset == 63;
     return (switch (mtype) {
-        0x01, 0x02, 0x03, 0x08, 0x09, 0x0d => types.Type.init(.int),
+        // A u64 does not fit i64, so an unsigned BIGINT rides as an exact
+        // decimal rather than failing to parse or wrapping negative.
+        0x08 => if (unsigned) types.Type.decimal(20, 0) else types.Type.init(.int),
+        0x01, 0x02, 0x03, 0x09, 0x0d => types.Type.init(.int),
         0x04, 0x05 => types.Type.init(.float),
         0x00, 0xf6 => types.Type.decimal(38, decimals),
         0x0a => types.Type.init(.date),
         0x07, 0x0c => types.Type.init(.timestamp),
         0x10 => types.Type.init(.int),
+        // BLOB/VAR_STRING/STRING under the binary charset are bytes, not text:
+        // annotating them UTF-8 wrote parquet that Arrow and DuckDB reject.
+        0xfb, 0xfc, 0xfd, 0xfe => if (binary) types.Type.init(.bytes) else types.Type.init(.string),
         else => types.Type.init(.string),
     }).asNullable();
 }

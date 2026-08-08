@@ -481,13 +481,15 @@ pub const Builder = struct {
         };
     }
     fn asBytes(self: *Builder, v: Value) []const u8 {
-        return switch (self.ty.kind) {
-            .bytes => v.bytes,
-            else => switch (v) {
-                .string => |s| s,
-                .bytes => |s| s,
-                else => "",
-            },
+        _ = self;
+        // Both tags carry a byte payload and share this store, and a producer
+        // may hand either one to a bytes-typed column (a text-protocol driver
+        // decodes a binary column into `.string`). Keying off the column's kind
+        // instead panicked on that perfectly valid pairing.
+        return switch (v) {
+            .string => |s| s,
+            .bytes => |s| s,
+            else => "",
         };
     }
 
