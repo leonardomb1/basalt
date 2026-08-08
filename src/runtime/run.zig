@@ -1079,7 +1079,7 @@ fn buildChainFrom(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.E
             var ad = analyze.Diag{};
             const pred = try analyze.checkFilter(ta, sch, pred0, params, &ad);
             const f = try ta.create(op.Filter);
-            f.* = .{ .child = cur, .pred = pred, .err = null };
+            f.* = .{ .child = cur, .pred = pred, .err = null, .back = ta };
             cur = .{ .filter = f };
         },
         .select => |items| {
@@ -4414,7 +4414,7 @@ fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schema) a
             var ad = analyze.Diag{};
             const pred = analyze.checkFilter(arena, schema, pred0, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
             const f = try arena.create(op.Filter);
-            f.* = .{ .child = child, .pred = pred, .err = env.errctx };
+            f.* = .{ .child = child, .pred = pred, .err = env.errctx, .back = arena };
             return .{ .op = .{ .filter = f }, .schema = schema };
         },
         .select => |items| return buildProject(env, items, schema, child),

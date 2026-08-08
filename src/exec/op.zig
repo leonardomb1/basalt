@@ -260,10 +260,16 @@ pub const Filter = struct {
     /// so a filter that matches nothing used to hold every batch it rejected at
     /// once. `gather` copies the surviving rows into the caller's arena, so
     /// nothing returned points into here.
+    ///
+    /// `back` must outlive the filter and is normally the plan arena the filter
+    /// itself was created in: nothing ever destroys a `Filter`, so a scratch
+    /// backed by the page allocator would orphan its pages — one arena per
+    /// filter stage per plan, and a `FOR EACH` mints a plan per row.
+    back: std.mem.Allocator,
     scratch: ?std.heap.ArenaAllocator = null,
 
     pub fn next(self: *Filter, arena: std.mem.Allocator) anyerror!?Batch {
-        if (self.scratch == null) self.scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        if (self.scratch == null) self.scratch = std.heap.ArenaAllocator.init(self.back);
         while (true) {
             _ = self.scratch.?.reset(.retain_capacity);
             const b = (try self.child.next(self.scratch.?.allocator())) orelse return null;
@@ -2376,8 +2382,30 @@ test "filter keeps only known-true rows: null predicate drops the row (3VL)" {
     var fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
     var two = ast.Expr{ .int_lit = 2 };
     var pred = ast.Expr{ .binary = .{ .op = .gt, .l = &fx, .r = &two } };
-    var flt = Filter{ .child = .{ .scan = &scan }, .pred = &pred };
+    var flt = Filter{ .child = .{ .scan = &scan }, .pred = &pred, .back = a };
     try testing.expectEqualDeep(@as([]const ?i64, &.{ 5, 3 }), try drainInts(a, .{ .filter = &flt }));
+}
+
+test "filter scratch is backed by the plan arena, so it dies with the plan" {
+    // Nothing destroys a Filter; a page-allocator scratch would outlive the
+    // plan arena and orphan its pages, one arena per filter stage per plan.
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const batches = [_]Batch{try intBatch(a, &int_schema, &.{ 1, 5, 3 })};
+    var ts = TestSource{ .schema_ = int_schema, .batches = &batches };
+    var scan = Scan{ .src = ts.src() };
+
+    var fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
+    var two = ast.Expr{ .int_lit = 2 };
+    var pred = ast.Expr{ .binary = .{ .op = .gt, .l = &fx, .r = &two } };
+    var flt = Filter{ .child = .{ .scan = &scan }, .pred = &pred, .back = a };
+    _ = try drainInts(a, .{ .filter = &flt });
+
+    const child = flt.scratch.?.child_allocator;
+    try testing.expectEqual(a.ptr, child.ptr);
+    try testing.expectEqual(a.vtable, child.vtable);
 }
 
 test "filter surfaces eval errors through ErrCtx; first error wins" {
@@ -2396,7 +2424,7 @@ test "filter surfaces eval errors through ErrCtx; first error wins" {
     var pred = ast.Expr{ .binary = .{ .op = .gt, .l = &div, .r = &one } };
 
     var ec = ErrCtx{};
-    var flt = Filter{ .child = .{ .scan = &scan }, .pred = &pred, .err = &ec };
+    var flt = Filter{ .child = .{ .scan = &scan }, .pred = &pred, .err = &ec, .back = a };
     const top = Op{ .filter = &flt };
     try testing.expectError(error.DivByZero, top.next(a));
     try testing.expectEqualStrings("division by zero: in filter predicate", ec.msg);
@@ -2977,7 +3005,7 @@ test "linearize decomposes map-only pipelines source-to-sink; breakers refuse" {
     var fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
     var zero = ast.Expr{ .int_lit = 0 };
     var pred = ast.Expr{ .binary = .{ .op = .gt, .l = &fx, .r = &zero } };
-    var flt = Filter{ .child = .{ .scan = &scan }, .pred = &pred };
+    var flt = Filter{ .child = .{ .scan = &scan }, .pred = &pred, .back = a };
     const pcols = [_]Project.Col{.{ .source = .{ .passthrough = 0 }, .ty = types.Type.init(.int).asNullable() }};
     var proj = Project{ .child = .{ .filter = &flt }, .cols = &pcols, .out_schema = &int_schema };
 
