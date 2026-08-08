@@ -326,7 +326,7 @@ once, the left side streams through. Keys are plain columns (compute
 expressions in the CTE or a select first), `AND`-combined for composite keys;
 pairs may be written in either order, and a null key never matches. `CROSS
 JOIN <cte>` takes no `ON`. Right-side columns that collide with a left name
-come back suffixed `_r`. A pipeline shaped `read | filters | join | filters |
+come back suffixed `_r`, and `_r2`, `_r3`, … if that name is taken too. A pipeline shaped `read | filters | join | filters |
 write` probes in parallel under `-j` — over local CSV/Parquet morsels, and
 over key-range splits for a splittable SQL source (right and full joins stay
 serial). The build side is fully resident; past 4 GiB the

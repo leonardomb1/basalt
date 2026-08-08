@@ -248,8 +248,18 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
     var fields = std.array_list.Managed(types.Schema.Field).init(arena);
     for (left.fields) |f| try fields.append(.{ .name = f.name, .ty = if (left_nullable) f.ty.asNullable() else f.ty });
     if (emit_right) for (right.fields) |f| {
+        // The `_r` suffix can collide in turn — a left column literally named
+        // `x_r` beside a right `x`, or two right columns that disambiguate onto
+        // the same name. Two output fields with one name make the second
+        // unreachable, since every lookup goes through `Schema.indexOf`.
         var name = f.name;
-        if (left.indexOf(name) != null) name = try std.fmt.allocPrint(arena, "{s}_r", .{name});
+        var n: usize = 0;
+        while ((types.Schema{ .fields = fields.items }).indexOf(name) != null) : (n += 1) {
+            name = if (n == 0)
+                try std.fmt.allocPrint(arena, "{s}_r", .{f.name})
+            else
+                try std.fmt.allocPrint(arena, "{s}_r{d}", .{ f.name, n + 1 });
+        }
         try fields.append(.{ .name = name, .ty = if (right_nullable) f.ty.asNullable() else f.ty });
     };
     return .{
@@ -1078,6 +1088,35 @@ test "joinPlan: collision suffix `_r`, left-nullability, semi/anti drop the righ
 
     try std.testing.expectError(error.AnalyzeFailed, joinPlan(a, left, right, .{ .kind = .inner, .binding = "r", .left_keys = &.{.{ .parts = &.{"nope"} }}, .right_keys = keys }, &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "unknown left join key") != null);
+}
+
+test "joinPlan: the `_r` suffix keeps bumping until the name is actually free" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const I = types.Type.init(.int);
+    const S = types.Type.init(.string);
+    // `x_r` on the left and `x` on the right used to produce two `x_r` columns,
+    // the second unreachable; `x_r` on the right collides with its own suffix.
+    const left = types.Schema{ .fields = &.{
+        .{ .name = "id", .ty = I },
+        .{ .name = "x", .ty = S },
+        .{ .name = "x_r", .ty = S },
+    } };
+    const right = types.Schema{ .fields = &.{
+        .{ .name = "id", .ty = I },
+        .{ .name = "x", .ty = S },
+        .{ .name = "x_r", .ty = S },
+    } };
+    var diag = Diag{};
+    const keys: []const ast.QualName = &.{.{ .parts = &.{"id"} }};
+    const p = try joinPlan(a, left, right, .{ .kind = .inner, .binding = "r", .left_keys = keys, .right_keys = keys }, &diag);
+    try std.testing.expectEqual(@as(usize, 6), p.schema.fields.len);
+    try std.testing.expectEqualStrings("id_r", p.schema.fields[3].name);
+    try std.testing.expectEqualStrings("x_r2", p.schema.fields[4].name);
+    try std.testing.expectEqualStrings("x_r_r", p.schema.fields[5].name);
+    // Every output name resolves to its own column.
+    for (p.schema.fields, 0..) |f, i| try std.testing.expectEqual(i, p.schema.indexOf(f.name).?);
 }
 
 test "joinPlan: pair orientation, ambiguity, per-pair comparability" {
