@@ -33,34 +33,33 @@ pub fn canonF64(x: f64) f64 {
     return if (x == 0) 0 else x;
 }
 
+/// The tag stamped for every numeric kind. `compareValues` orders int, float
+/// and decimal against EACH OTHER (`1 == 1.0 == 1.00`), so they must share a
+/// tag and a payload encoding — folding the Zig union tag instead meant a join
+/// between an int key and a float key hashed into different buckets and matched
+/// nothing, silently returning zero rows.
+const num_tag: u8 = 0xFF;
+
 /// Fold one value (type tag + payload bytes) into a running hash.
 pub fn hashValue(h: *std.hash.Wyhash, v: Value) void {
+    switch (v) {
+        // One canonical f64 for the whole numeric family. Distinct values that
+        // collapse to the same f64 merely collide (equality then separates
+        // them); what matters is that equal values never split.
+        .int, .float, .decimal => {
+            h.update(&[_]u8{num_tag});
+            const c = canonF64(eval.toF64(v));
+            h.update(std.mem.asBytes(&c));
+            return;
+        },
+        else => {},
+    }
     const tag: u8 = @intFromEnum(std.meta.activeTag(v));
     h.update(&[_]u8{tag});
     switch (v) {
         .null => {},
         .bool => |x| h.update(&[_]u8{@intFromBool(x)}),
-        .int => |x| h.update(std.mem.asBytes(&x)),
-        .float => |x| {
-            const c = canonF64(x);
-            h.update(std.mem.asBytes(&c));
-        },
-        .decimal => |d| {
-            // Hash a trailing-zero-stripped form. `valueEq` compares decimals
-            // numerically, so `1.5` and `1.50` are equal — and a source may well
-            // deliver both (postgres sends a per-value dscale on NUMERIC). Hashing
-            // the raw (unscaled, scale) pair put equal values in different buckets,
-            // which counted them twice in DISTINCT.
-            var u = d.unscaled;
-            var s = d.scale;
-            while (s > 0 and u != 0 and @rem(u, 10) == 0) {
-                u = @divTrunc(u, 10);
-                s -= 1;
-            }
-            if (u == 0) s = 0;
-            h.update(std.mem.asBytes(&u));
-            h.update(std.mem.asBytes(&s));
-        },
+        .int, .float, .decimal => unreachable,
         .string, .bytes => |s| h.update(s),
         .date => |x| h.update(std.mem.asBytes(&x)),
         .time => |x| h.update(std.mem.asBytes(&x)),
@@ -213,4 +212,25 @@ test "hashValue: -0.0 and NaN hash by value, matching valueEq" {
 
     try testing.expect(!valueEq(nan_a, zero));
     try testing.expect(hashOne(nan_a) != hashOne(zero));
+}
+
+test "hashValue: numerically equal values hash alike ACROSS int/float/decimal" {
+    // `compareValues` orders the numeric kinds against each other, so a join
+    // whose build key is `int 1` and whose probe key is `float 1.0` must find
+    // the match. Folding the union tag into the hash put them in different
+    // buckets and the join silently returned zero rows.
+    const one_i = Value{ .int = 1 };
+    const one_f = Value{ .float = 1.0 };
+    const one_d = Value{ .decimal = .{ .unscaled = 100, .scale = 2 } }; // 1.00
+    try testing.expect(valueEq(one_i, one_f));
+    try testing.expect(valueEq(one_i, one_d));
+    try testing.expectEqual(hashOne(one_i), hashOne(one_f));
+    try testing.expectEqual(hashOne(one_i), hashOne(one_d));
+
+    // Different numbers still separate, and a numeric never collides with a
+    // same-looking non-numeric.
+    try testing.expect(hashOne(one_i) != hashOne(.{ .int = 2 }));
+    try testing.expect(!valueEq(one_i, .{ .string = "1" }));
+    try testing.expect(hashOne(one_i) != hashOne(.{ .string = "1" }));
+    try testing.expect(hashOne(one_i) != hashOne(.{ .timestamp = 1 }));
 }
