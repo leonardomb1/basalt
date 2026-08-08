@@ -213,6 +213,29 @@ LOAD INTO '$out/starrocks.csv' AS SELECT * FROM fe.basalt_it ORDER BY id;"; then
   else
     report "starrocks (run error)" bad
   fi
+
+  # `\N` is the Stream Load null marker and StarRocks CSV has no escape for it —
+  # `enclose` does not exempt the field and backslashes are never unescaped — so
+  # a value of exactly those two bytes used to land as NULL. It must fail the
+  # load instead. `\N` inside a longer value is ordinary data and must survive.
+  SR_CONN="CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');"
+  printf 'id,s\n1,\\N\n' > "$out/sr_marker.csv"
+  printf 'id,s\n2,a\\Nb\n' > "$out/sr_embedded.csv"
+  printf 'id,s\n2,a\\Nb\n' > "$out/sr_embedded_expected.csv"
+  if $B run -q -c "$SR_CONN
+LOAD INTO sr.it_nullmark USING stream_load REPLACE AS SELECT * FROM '$out/sr_marker.csv';" >"$out/sr_marker.log" 2>&1; then
+    report "starrocks-null-marker (a literal \\N was accepted)" bad
+  elif ! grep -q "StarRocksNullMarkerInData" "$out/sr_marker.log"; then
+    report "starrocks-null-marker (wrong message)" bad
+    head -3 "$out/sr_marker.log"
+  elif brun run -c "$SR_CONN
+LOAD INTO sr.it_nullmark2 USING stream_load REPLACE AS SELECT * FROM '$out/sr_embedded.csv';" &&
+       brun run -c "CREATE CONNECTION fe TYPE mysql OPTIONS (host = '127.0.0.1', port = 39030, user = 'root', password = '', database = 'it');
+LOAD INTO '$out/sr_embedded_out.csv' AS SELECT id, s FROM fe.it_nullmark2 ORDER BY id;"; then
+    check starrocks-null-marker "$out/sr_embedded_out.csv" "$out/sr_embedded_expected.csv"
+  else
+    report "starrocks-null-marker (run error)" bad
+  fi
 fi
 
 # Azure Blob (Azurite). ADLS Gen2 data is reached through the Blob endpoint —

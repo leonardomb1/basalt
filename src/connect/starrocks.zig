@@ -155,7 +155,11 @@ pub fn columnList(arena: std.mem.Allocator, schema: types.Schema) ![]const u8 {
 /// embedded newlines, which would otherwise split one row into several and break
 /// the column count. ERP text/memo columns do carry stray 0x01/0x02 bytes in
 /// practice (e.g. Protheus memo fields), so values are sanitized: those two
-/// bytes are replaced with a space. Nulls are `\N`.
+/// bytes are replaced with a space. Nulls are `\N`, and a non-null value that
+/// is itself `\N` is an error rather than a silent null.
+/// What Stream Load reads as NULL. Unescapable — see `appendBatchTsv`.
+const NULL_MARKER = "\\N";
+
 pub fn appendBatchTsv(w: anytype, arena: std.mem.Allocator, batch: Batch) !void {
     var r: usize = 0;
     while (r < batch.len) : (r += 1) {
@@ -163,9 +167,17 @@ pub fn appendBatchTsv(w: anytype, arena: std.mem.Allocator, batch: Batch) !void 
             if (i > 0) try w.writeByte(0x01);
             const v = c.getValue(r);
             if (v.isNull()) {
-                try w.writeAll("\\N");
+                try w.writeAll(NULL_MARKER);
             } else {
-                try writeSanitized(w, try eval.valueToString(arena, v));
+                const s = try eval.valueToString(arena, v);
+                // StarRocks CSV has no escape for the null marker: a field whose
+                // bytes are exactly `\N` is NULL whatever we do — `enclose` does
+                // not exempt it, and backslashes are never unescaped, so `\\N`
+                // arrives as three characters. Writing the value through would
+                // silently turn it into NULL, so refuse. The load already runs
+                // at max_filter_ratio=0; this sink does not do partial data.
+                if (std.mem.eql(u8, s, NULL_MARKER)) return error.StarRocksNullMarkerInData;
+                try writeSanitized(w, s);
             }
         }
         try w.writeByte(0x02);
@@ -526,4 +538,33 @@ test "stream-load TSV body: control-byte framing, nulls, sanitized values" {
     var out = std.array_list.Managed(u8).init(a);
     try appendBatchTsv(out.writer(), a, batch);
     try std.testing.expectEqualStrings("1\x01memo with bytes\x02\\N\x01line\nbreak\x02", out.items);
+}
+
+test "a value that is literally the null marker is refused, not written as null" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const columnmod = @import("../exec/column.zig");
+    const str_ty = types.Type.init(.string).asNullable();
+    var b0 = columnmod.Builder.init(a, str_ty);
+    try b0.append(.{ .string = "\\N" });
+    const cols = try a.alloc(columnmod.Column, 1);
+    cols[0] = try b0.finish();
+    var schema = types.Schema{ .fields = &.{.{ .name = "s", .ty = str_ty }} };
+    const batch = Batch{ .schema = &schema, .columns = cols, .len = 1 };
+
+    var out = std.array_list.Managed(u8).init(a);
+    try std.testing.expectError(error.StarRocksNullMarkerInData, appendBatchTsv(out.writer(), a, batch));
+
+    // Only the whole field is ambiguous — `\N` inside a longer value is data,
+    // and StarRocks reads it back verbatim.
+    var b1 = columnmod.Builder.init(a, str_ty);
+    try b1.append(.{ .string = "a\\Nb" });
+    const cols2 = try a.alloc(columnmod.Column, 1);
+    cols2[0] = try b1.finish();
+    const batch2 = Batch{ .schema = &schema, .columns = cols2, .len = 1 };
+    out.clearRetainingCapacity();
+    try appendBatchTsv(out.writer(), a, batch2);
+    try std.testing.expectEqualStrings("a\\Nb\x02", out.items);
 }
