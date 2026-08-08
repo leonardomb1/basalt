@@ -15,7 +15,19 @@ const codec = @import("codec.zig");
 pub const Error = error{
     /// Missing or misplaced `PAR1` magic, or a footer length that does not fit.
     NotParquet,
+    /// A wire value that no enum in the format defines.
+    CorruptParquet,
 } || thrift.Error || std.mem.Allocator.Error;
+
+/// Convert a wire i32 into `E`, or fail. `@enumFromInt` on a value the enum does
+/// not define is illegal behaviour — a corrupt or hostile file must produce an
+/// error, not a trap.
+fn enumFrom(comptime E: type, v: i32) Error!E {
+    inline for (@typeInfo(E).@"enum".fields) |f| {
+        if (f.value == v) return @field(E, f.name);
+    }
+    return Error.CorruptParquet;
+}
 
 pub const magic = "PAR1";
 /// Trailing `u32` footer length plus the magic.
@@ -282,7 +294,7 @@ fn readColumnMetaData(arena: std.mem.Allocator, r: *thrift.Reader) Error!ColumnM
                 for (out) |*e| e.* = try r.readBinary();
                 m.path_in_schema = out;
             },
-            4 => m.compression = @enumFromInt(try r.readI32()),
+            4 => m.compression = try enumFrom(codec.Codec, try r.readI32()),
             5 => m.num_values = try r.readZigZag(),
             6 => m.total_uncompressed_size = try r.readZigZag(),
             7 => m.total_compressed_size = try r.readZigZag(),

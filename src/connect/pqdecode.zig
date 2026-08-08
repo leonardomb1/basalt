@@ -1870,6 +1870,36 @@ test "chunk extents come from the next chunk, never from total_compressed_size" 
     try testing.expectEqual(@as(u64, 900), chunkEnd(&b, 900));
 }
 
+test "a corrupted file errors instead of panicking" {
+    // Every guard in this file is a wire value used as a length, a shift or a
+    // count. Flipping bytes across a real file walks them: the only acceptable
+    // outcomes are a decoded batch or an error, never a trap.
+    const good = @embedFile("testdata/zstd.parquet");
+    var buf: [good.len]u8 = undefined;
+
+    var off: usize = 0;
+    while (off < good.len) : (off += 7) {
+        for ([_]u8{ 0xFF, 0x80, 0x01 }) |bit| {
+            @memcpy(&buf, good);
+            buf[off] ^= bit;
+
+            var ar = std.heap.ArenaAllocator.init(testing.allocator);
+            defer ar.deinit();
+            var tmp = testing.tmpDir(.{});
+            defer tmp.cleanup();
+            try tmp.dir.writeFile(.{ .sub_path = "c.parquet", .data = &buf });
+            const dir = try tmp.dir.realpathAlloc(ar.allocator(), ".");
+            const path = try std.fs.path.join(ar.allocator(), &.{ dir, "c.parquet" });
+
+            const r = Reader.open(ar.allocator(), path) catch continue;
+            defer r.close();
+            while (r.next(ar.allocator()) catch null) |b| {
+                if (b.len == 0) break;
+            }
+        }
+    }
+}
+
 test "ranged reads return the same values as an in-memory file" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
