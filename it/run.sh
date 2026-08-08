@@ -189,6 +189,20 @@ LOAD INTO '$out/mssql_money.csv' AS SELECT * FROM db.it_money ORDER BY k;"; then
   else
     report "sqlserver-money-time (run error)" bad
   fi
+
+  # Non-BMP text. UCS-2 sends it as a surrogate PAIR; the reader encoded each
+  # half on its own, which UTF-8 rejects, so every emoji came back as `??` even
+  # though the writer had always paired them — an asymmetric, silent round-trip.
+  # Written by basalt and read back by basalt, so both halves are on trial.
+  printf 'k,s\n1,a\xf0\x9f\x98\x80b\n2,h\xc3\xa9llo\n3,\xf0\x9d\x84\x9e\xf0\x9d\x95\x8f\n' >"$out/mssql_uni.csv"
+  if brun run -c "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);
+LOAD INTO db.it_uni REPLACE AS SELECT * FROM '$out/mssql_uni.csv';" &&
+     brun run -c "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);
+LOAD INTO '$out/mssql_uni_out.csv' AS SELECT k, s FROM db.it_uni ORDER BY k;"; then
+    check sqlserver-unicode "$out/mssql_uni_out.csv" "$out/mssql_uni.csv"
+  else
+    report "sqlserver-unicode (run error)" bad
+  fi
 fi
 
 # Volume: ~7MB encoded (300k rows, nulls every 10th val) — crosses the 4MB

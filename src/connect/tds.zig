@@ -1413,13 +1413,32 @@ fn formatGuid(arena: std.mem.Allocator, b: []const u8) ![]const u8 {
     });
 }
 
+/// UCS-2 is not UTF-16: a code unit outside the BMP arrives as a surrogate
+/// PAIR, and encoding the halves one at a time (which `utf8Encode` refuses)
+/// turned every emoji into `??` — while the write side has always paired them,
+/// so a round-trip through SQL Server was lossy. `?` is kept for a half with no
+/// partner, which is the only thing that cannot be decoded. The wire buffer is
+/// byte-aligned, so the `[]const u16` helpers in std are not usable here.
 fn utf16ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     var out = std.array_list.Managed(u8).init(arena);
     var k: usize = 0;
     while (k + 1 < bytes.len) : (k += 2) {
-        const cu = @as(u16, bytes[k]) | (@as(u16, bytes[k + 1]) << 8);
+        var cp: u21 = @as(u16, bytes[k]) | (@as(u16, bytes[k + 1]) << 8);
+        if (std.unicode.utf16IsHighSurrogate(@intCast(cp))) {
+            if (k + 3 >= bytes.len) {
+                try out.append('?');
+                continue;
+            }
+            const lo = @as(u16, bytes[k + 2]) | (@as(u16, bytes[k + 3]) << 8);
+            if (!std.unicode.utf16IsLowSurrogate(lo)) {
+                try out.append('?');
+                continue;
+            }
+            cp = 0x10000 + ((cp & 0x03ff) << 10) | (lo & 0x03ff);
+            k += 2;
+        }
         var tmp: [4]u8 = undefined;
-        const n = std.unicode.utf8Encode(cu, &tmp) catch {
+        const n = std.unicode.utf8Encode(cp, &tmp) catch {
             try out.append('?');
             continue;
         };
@@ -1568,6 +1587,33 @@ test "utf16ToUtf8 decodes BMP text and replaces invalid units" {
     const bad = try utf16ToUtf8(alloc, "\x00\xd8");
     defer alloc.free(bad);
     try std.testing.expectEqualStrings("?", bad);
+}
+
+test "utf16ToUtf8 pairs surrogates; only an unpaired half degrades to `?`" {
+    const alloc = std.testing.allocator;
+    // U+1F600, D83D DE00 little-endian, with BMP text on both sides.
+    const emoji = try utf16ToUtf8(alloc, "a\x00\x3d\xd8\x00\xde" ++ "b\x00");
+    defer alloc.free(emoji);
+    try std.testing.expectEqualStrings("a😀b", emoji);
+
+    // Whatever the write side encodes must come back unchanged.
+    const round = try std.unicode.utf8ToUtf16LeAlloc(alloc, "𝄞x𝕏");
+    defer alloc.free(round);
+    const back = try utf16ToUtf8(alloc, std.mem.sliceAsBytes(round));
+    defer alloc.free(back);
+    try std.testing.expectEqualStrings("𝄞x𝕏", back);
+
+    // A high half followed by a non-low unit, and a truncated high half.
+    const orphan = try utf16ToUtf8(alloc, "\x3d\xd8" ++ "a\x00");
+    defer alloc.free(orphan);
+    try std.testing.expectEqualStrings("?a", orphan);
+    const cut = try utf16ToUtf8(alloc, "a\x00\x3d\xd8");
+    defer alloc.free(cut);
+    try std.testing.expectEqualStrings("a?", cut);
+    // A low half with no high half before it.
+    const low = try utf16ToUtf8(alloc, "\x00\xde");
+    defer alloc.free(low);
+    try std.testing.expectEqualStrings("?", low);
 }
 
 /// DONE token body (status u16, curcmd u16, rowcount u64, all LE) → the count
