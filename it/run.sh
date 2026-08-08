@@ -455,6 +455,31 @@ SELECT id, name, amt, flag FROM 'src/connect/testdata/$c.parquet' ORDER BY id;";
     report "parquet-write (run error)" bad
   fi
 
+  # Decimals wider than the INT64 storage must fail, not saturate. `12.5` in a
+  # DECIMAL(38,18) column restates to 1.25e19, and clamping wrote
+  # 9.223372036854775807 into the file; DECIMAL(30,20) clamped its precision to
+  # 18 and emitted scale > precision, which no other reader accepts.
+  printf 'v\n12.5\n' >"$out/dec_in.csv"
+  rm -f "$out/dec_wide.parquet" "$out/dec_badscale.parquet"
+  if $B run -q -c "LOAD INTO '$out/dec_wide.parquet' AS SELECT CAST(v AS DECIMAL(38,18)) AS d FROM '$out/dec_in.csv';" >"$out/dec_wide.log" 2>&1 ||
+     $B run -q -c "LOAD INTO '$out/dec_badscale.parquet' AS SELECT CAST(v AS DECIMAL(30,20)) AS d FROM '$out/dec_in.csv';" >>"$out/dec_wide.log" 2>&1; then
+    report "parquet-decimal-overflow (a lossy write was accepted)" bad
+  elif grep -q "UnsupportedParquetDecimal" "$out/dec_wide.log"; then
+    report parquet-decimal-overflow ok
+  else
+    report "parquet-decimal-overflow (wrong message)" bad
+    head -3 "$out/dec_wide.log"
+  fi
+
+  # …while a decimal that does fit still round-trips unchanged.
+  if brun run -c "LOAD INTO '$out/dec_ok.parquet' AS SELECT CAST(v AS DECIMAL(18,4)) AS d FROM '$out/dec_in.csv';" &&
+     brun run -c "LOAD INTO '$out/dec_ok.csv' AS SELECT * FROM '$out/dec_ok.parquet';"; then
+    { echo "d"; echo "12.5000"; } >"$out/dec_ok_expected.csv"
+    check parquet-decimal-inrange "$out/dec_ok.csv" "$out/dec_ok_expected.csv"
+  else
+    report "parquet-decimal-inrange (run error)" bad
+  fi
+
   # Parallel aggregate over a multi-row-group file. An ungrouped one (no GROUP
   # BY) returned 0 instead of the row count: lanes fold into a table keyed by
   # the grouping columns, and with none they folded into nothing at all, so the
