@@ -382,8 +382,13 @@ pub const Conn = struct {
                     ok = true;
                 },
                 0xAA => {
+                    // Bound the token body, as the sibling 0xAA/0xE3 parsers do:
+                    // only the slice START was checked, so a server-supplied
+                    // length copied adjacent heap into the error text shown to
+                    // the user — a pre-auth disclosure.
                     if (i + 2 > p.len) return error.TdsProtocol;
                     const len = rdU16(p, i);
+                    if (i + 2 + len > p.len) return error.TdsProtocol;
                     self.last_error = try self.decodeError(p[i + 2 .. i + 2 + len]);
                     return error.LoginFailed;
                 },

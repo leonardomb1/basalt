@@ -349,16 +349,28 @@ pub const MappedCsv = struct {
     fn hasQuotedNewline(body: []const u8) bool {
         if (std.mem.indexOfScalar(u8, body, '"') == null) return false;
         var in_q = false;
+        var at_field = true;
         var i: usize = 0;
         while (i < body.len) : (i += 1) {
             const c = body[i];
             if (c == '"') {
-                if (in_q and i + 1 < body.len and body[i + 1] == '"') {
-                    i += 1;
-                    continue;
+                if (in_q) {
+                    if (i + 1 < body.len and body[i + 1] == '"') {
+                        i += 1;
+                        continue;
+                    }
+                    in_q = false;
+                } else if (at_field) {
+                    in_q = true;
                 }
-                in_q = !in_q;
-            } else if (c == '\n' and in_q) return true;
+                at_field = false;
+            } else if (c == '\n' and in_q) {
+                return true;
+            } else if (c == ',' and !in_q) {
+                at_field = true;
+            } else if (c == '\n') {
+                at_field = true;
+            } else at_field = false;
         }
         return false;
     }
@@ -514,19 +526,31 @@ fn appendCell(b: *column.Builder, raw: []const u8, quoted: bool) !void {
 fn scanRecord(data: []const u8, start: usize) struct { line: []const u8, next: usize } {
     var i = start;
     var in_q = false;
+    var at_field = true;
     while (i < data.len) : (i += 1) {
         const c = data[i];
         if (c == '"') {
-            // `""` inside a quoted field is an escaped quote, not a close.
-            if (in_q and i + 1 < data.len and data[i + 1] == '"') {
-                i += 1;
-                continue;
+            // Only a quote at the START of a field opens one — `splitInto` cuts
+            // fields by that same rule. A bare `"` in the middle (`12" pipe`) is
+            // data, and treating it as an opener swallowed every following row.
+            if (in_q) {
+                if (i + 1 < data.len and data[i + 1] == '"') {
+                    i += 1;
+                    continue;
+                }
+                in_q = false;
+            } else if (at_field) {
+                in_q = true;
             }
-            in_q = !in_q;
+            at_field = false;
+        } else if (c == ',' and !in_q) {
+            at_field = true;
         } else if (c == '\n' and !in_q) {
             var end = i;
             if (end > start and data[end - 1] == '\r') end -= 1;
             return .{ .line = data[start..end], .next = i + 1 };
+        } else {
+            at_field = false;
         }
     }
     var end = data.len;
@@ -537,11 +561,27 @@ fn scanRecord(data: []const u8, start: usize) struct { line: []const u8, next: u
 /// Whether `line` leaves a quoted field open — i.e. the record continues on the
 /// next physical line. `""` contributes two, so plain parity is the quote state.
 fn quotesOpen(line: []const u8) bool {
-    var n: usize = 0;
-    for (line) |c| {
-        if (c == '"') n += 1;
+    var in_q = false;
+    var at_field = true;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (c == '"') {
+            if (in_q) {
+                if (i + 1 < line.len and line[i + 1] == '"') {
+                    i += 1;
+                    continue;
+                }
+                in_q = false;
+            } else if (at_field) {
+                in_q = true;
+            }
+            at_field = false;
+        } else if (c == ',' and !in_q) {
+            at_field = true;
+        } else at_field = false;
     }
-    return n % 2 == 1;
+    return in_q;
 }
 
 fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Builder) !void {

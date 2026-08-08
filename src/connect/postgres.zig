@@ -124,7 +124,13 @@ pub const Conn = struct {
                     switch (code) {
                         0 => {},
                         3 => try self.sendPassword(password),
-                        5 => try self.sendMd5(user, password, p[4..8]),
+                        // The salt is 4 bytes at offset 4; `readI32(p, 0)` only
+                        // proved `p.len >= 4`, so a short reply hashed adjacent
+                        // heap into a digest that then went out on the wire.
+                        5 => {
+                            if (p.len < 8) return error.PgProtocol;
+                            try self.sendMd5(user, password, p[4..8]);
+                        },
                         10 => try self.scram(password),
                         else => return error.PgAuthUnsupported,
                     }
@@ -380,7 +386,9 @@ const PgCol = struct { name: []const u8, oid: i32, engine_type: types.Type };
 const RowDesc = struct { cols: []PgCol, fields: []types.Schema.Field };
 
 fn parseRowDescription(arena: std.mem.Allocator, p: []const u8) !RowDesc {
-    const n: usize = @intCast(try readI16(p, 0));
+    const raw_n = try readI16(p, 0);
+    if (raw_n < 0) return error.PgProtocol;
+    const n: usize = @intCast(raw_n);
     var i: usize = 2;
     const cols = try arena.alloc(PgCol, n);
     const fields = try arena.alloc(types.Schema.Field, n);
@@ -402,7 +410,13 @@ fn parseRowDescription(arena: std.mem.Allocator, p: []const u8) !RowDesc {
 }
 
 fn parseDataRow(conn: *Conn, arena: std.mem.Allocator, p: []const u8, builders: []column.Builder) !void {
-    const n: usize = @intCast(try readI16(p, 0));
+    const raw = try readI16(p, 0);
+    // The field count is read fresh off the wire every row, while `builders` was
+    // sized once from the RowDescription. Trusting it indexed `builders` out of
+    // bounds and then CALLED through the resulting bytes; `0xFFFF` read as -1
+    // also made `@intCast` to usize illegal behavior. Both are unreachable now.
+    if (raw < 0 or @as(usize, @intCast(raw)) != builders.len) return error.PgProtocol;
+    const n: usize = @intCast(raw);
     var i: usize = 2;
     for (0..n) |k| {
         const len = try readI32(p, i);

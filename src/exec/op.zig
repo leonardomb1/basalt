@@ -891,7 +891,13 @@ pub const Aggregate = struct {
                         .i64k => col.data.i64[r],
                         .i32k => col.data.i32[r],
                         .boolk => @intFromBool(col.data.b[r]),
-                        .f64k => @bitCast(col.data.f64[r]),
+                        // Group by the NUMBER, not the bit pattern: this path
+                        // compares raw words, so `-0.0` (0x8000…) and `0.0` would
+                        // land in different groups even though every other part
+                        // of the engine — DISTINCT, join, the parallel merge —
+                        // calls them equal. Same canonicalization as
+                        // `keyhash.hashValue`.
+                        .f64k => @bitCast(keyhash.canonF64(col.data.f64[r])),
                     };
                 }
             }

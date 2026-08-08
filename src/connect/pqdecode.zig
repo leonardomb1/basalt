@@ -17,6 +17,7 @@ const pq = @import("parquet.zig");
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
 const valuemod = @import("../exec/value.zig");
+const eval = @import("../exec/eval.zig");
 
 const Value = valuemod.Value;
 
@@ -925,13 +926,14 @@ pub fn groupMayMatch(
         const lo = statValue(elem, meta.ty, meta.stats.min) orelse continue;
         const hi = statValue(elem, meta.ty, meta.stats.max) orelse continue;
 
+        // An unorderable pair is "unknown", which must never exclude.
         const excluded = switch (b.op) {
             // every value is >= lo, so `col < v` is impossible when lo >= v
-            .lt => cmp(lo, b.value) != .lt,
-            .le => cmp(lo, b.value) == .gt,
-            .gt => cmp(hi, b.value) != .gt,
-            .ge => cmp(hi, b.value) == .lt,
-            .eq => cmp(b.value, lo) == .lt or cmp(b.value, hi) == .gt,
+            .lt => (cmp(lo, b.value) orelse .lt) != .lt,
+            .le => (cmp(lo, b.value) orelse .eq) == .gt,
+            .gt => (cmp(hi, b.value) orelse .gt) != .gt,
+            .ge => (cmp(hi, b.value) orelse .eq) == .lt,
+            .eq => (cmp(b.value, lo) orelse .eq) == .lt or (cmp(b.value, hi) orelse .eq) == .gt,
         };
         if (excluded) return false;
     }
@@ -984,8 +986,10 @@ pub fn fileMinMax(rdr: *const Reader, name: []const u8) ?MinMax {
         }
         const mn = statValue(elem, meta.ty, meta.stats.min) orelse return null;
         const mx = statValue(elem, meta.ty, meta.stats.max) orelse return null;
-        if (lo == null or cmp(mn, lo.?) == .lt) lo = mn;
-        if (hi == null or cmp(mx, hi.?) == .gt) hi = mx;
+        // Bail rather than report a wrong extreme when the type cannot be
+        // ordered — this silently returned row group 0's value before.
+        if (lo == null) lo = mn else lo = if ((cmp(mn, lo.?) orelse return null) == .lt) mn else lo;
+        if (hi == null) hi = mx else hi = if ((cmp(mx, hi.?) orelse return null) == .gt) mx else hi;
     }
     return .{ .min = lo orelse return null, .max = hi orelse return null };
 }
@@ -1006,7 +1010,18 @@ fn statValue(elem: pq.SchemaElement, phys: pq.PhysicalType, raw: ?[]const u8) ?V
     return coerce(ty, v, temporalScale(elem));
 }
 
-fn cmp(a: Value, b: Value) std.math.Order {
+/// Order two statistic values, or null when the pair cannot be ordered.
+///
+/// Null means "unknown", and every caller must then KEEP the row group — the
+/// pruning contract is that a missing or unusable statistic never drops rows.
+/// This used to return `.eq` for anything it did not recognize, which inverted
+/// that: a DECIMAL column's stats compared equal to every bound, so `.lt`/`.gt`
+/// proved every group non-matching and a range predicate returned ZERO rows.
+fn cmp(a: Value, b: Value) ?std.math.Order {
+    // Numerics (int/float/decimal, in any mix) order through the engine's own
+    // comparison, so pruning agrees with the filter that re-checks the rows —
+    // including per-value decimal scale and the NaN total order.
+    if (numOrder(a, b)) |o| return o;
     return switch (a) {
         .int => std.math.order(a.int, switch (b) {
             .int => |x| x,
@@ -1042,8 +1057,19 @@ fn cmp(a: Value, b: Value) std.math.Order {
             };
             break :blk std.mem.order(u8, sa, sb);
         },
-        else => .eq,
+        else => null,
     };
+}
+
+fn isNumV(v: Value) bool {
+    return v == .int or v == .float or v == .decimal;
+}
+
+/// Numeric ordering shared with the engine (`eval.compareValues`), used only
+/// when BOTH sides are numeric so the temporal/text arms below still apply.
+fn numOrder(a: Value, b: Value) ?std.math.Order {
+    if (!isNumV(a) or !isNumV(b)) return null;
+    return eval.compareValues(a, b);
 }
 
 // --- source ------------------------------------------------------------------

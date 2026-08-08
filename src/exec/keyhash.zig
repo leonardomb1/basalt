@@ -23,6 +23,16 @@ const eval = @import("eval.zig");
 
 const Value = valuemod.Value;
 
+/// The canonical bit pattern for a float key: `valueEq` compares floats
+/// numerically, so `-0.0 == 0.0` (different bit patterns) and every NaN equals
+/// every other under `eval.orderF64`. Hashing or word-comparing the raw bits
+/// splits those apart — a join dropped `-0.0` rows that `WHERE f = 0` matched,
+/// and a serial GROUP BY made two groups where DISTINCT made one.
+pub fn canonF64(x: f64) f64 {
+    if (std.math.isNan(x)) return std.math.nan(f64);
+    return if (x == 0) 0 else x;
+}
+
 /// Fold one value (type tag + payload bytes) into a running hash.
 pub fn hashValue(h: *std.hash.Wyhash, v: Value) void {
     const tag: u8 = @intFromEnum(std.meta.activeTag(v));
@@ -32,12 +42,7 @@ pub fn hashValue(h: *std.hash.Wyhash, v: Value) void {
         .bool => |x| h.update(&[_]u8{@intFromBool(x)}),
         .int => |x| h.update(std.mem.asBytes(&x)),
         .float => |x| {
-            // Canonicalize before hashing, because `valueEq` compares floats
-            // numerically: `-0.0 == 0.0` (different bit patterns), and every NaN
-            // is `eq` to every other NaN under the total order in `eval`. Hashing
-            // raw bytes split those across buckets, so a join silently dropped a
-            // `-0.0` row that `WHERE f = 0` matched.
-            const c: f64 = if (std.math.isNan(x)) std.math.nan(f64) else if (x == 0) 0 else x;
+            const c = canonF64(x);
             h.update(std.mem.asBytes(&c));
         },
         .decimal => |d| {

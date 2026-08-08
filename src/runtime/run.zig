@@ -555,6 +555,10 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     errdefer if (errctx.msg.len > 0) setMsg(diag, errctx.msg);
 
     var sources = std.array_list.Managed(driver.Source).init(arena);
+    // A source's `close` releases the socket and its gpa allocations — neither
+    // owned by the plan arena — so a failed run used to leak an fd per open
+    // connection. Under `serve` that is one leaked socket per failing request.
+    defer for (sources.items) |sc| sc.close();
     var buffer_decl: ?ast.BufferDecl = null;
     for (program.stmts) |s| {
         if (s == .kind) buffer_decl = s.kind.buffer;
@@ -576,7 +580,6 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         .throw => |t| try runThrow(&env, t, no_loop_vars),
         else => {},
     };
-    for (sources.items) |sc| sc.close();
 
     stats.rows_read = rows_read.load(.monotonic);
     stats.elapsed_ms = @intCast(std.time.milliTimestamp() - t0);
@@ -860,11 +863,15 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
 
+    // Order matters: defers run LIFO, so the arenas must be declared FIRST and
+    // `shutdown` (which joins the writer thread) LAST. Reversed, an error or a
+    // ^C between `submit` and `finish` freed the batch arenas while the writer
+    // was still serializing the batch out of them.
+    var ping_pong: [2]std.heap.ArenaAllocator = .{ std.heap.ArenaAllocator.init(gpa), std.heap.ArenaAllocator.init(gpa) };
+    defer for (&ping_pong) |*a| a.deinit();
     var pw = parallel.PipelinedSink{ .snk = snk, .gpa = gpa };
     try pw.start();
     defer pw.shutdown();
-    var ping_pong: [2]std.heap.ArenaAllocator = .{ std.heap.ArenaAllocator.init(gpa), std.heap.ArenaAllocator.init(gpa) };
-    defer for (&ping_pong) |*a| a.deinit();
     var cur: usize = 0;
     while (true) {
         if (aborting()) return error.Aborted;
@@ -1829,8 +1836,13 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
 
     const mapped = csv.MappedCsv.open(arena, path) catch return false;
     // A newline inside a quoted field makes chunk boundaries undecidable from a
-    // byte offset, so this file is parsed serially rather than split.
-    if (mapped.quoted_newlines) return false;
+    // byte offset, so this file is parsed serially rather than split. Closed
+    // explicitly: this returns before the `defer` below is armed, and leaking
+    // the mmap + fd once per file exhausted the fd limit in a FOR EACH.
+    if (mapped.quoted_newlines) {
+        mapped.close();
+        return false;
+    }
     defer mapped.close();
 
     const agg_in = try schemaPtr(arena, try mapChainSchema(env, prefix, mapped.schema));
@@ -2411,8 +2423,13 @@ fn runParallelCsvMapImpl(env: *Env, rd: ast.Read, map_stages: []const ast.Stage,
 
     const mapped = csv.MappedCsv.open(arena, path) catch return false;
     // A newline inside a quoted field makes chunk boundaries undecidable from a
-    // byte offset, so this file is parsed serially rather than split.
-    if (mapped.quoted_newlines) return false;
+    // byte offset, so this file is parsed serially rather than split. Closed
+    // explicitly: this returns before the `defer` below is armed, and leaking
+    // the mmap + fd once per file exhausted the fd limit in a FOR EACH.
+    if (mapped.quoted_newlines) {
+        mapped.close();
+        return false;
+    }
     defer mapped.close();
 
     var out_schema = try mapChainSchema(env, map_stages, mapped.schema);
@@ -2671,8 +2688,13 @@ fn runParallelCsvTopN(env: *Env, rd: ast.Read, prefix: []const ast.Stage, srt: a
 
     const mapped = csv.MappedCsv.open(arena, path) catch return false;
     // A newline inside a quoted field makes chunk boundaries undecidable from a
-    // byte offset, so this file is parsed serially rather than split.
-    if (mapped.quoted_newlines) return false;
+    // byte offset, so this file is parsed serially rather than split. Closed
+    // explicitly: this returns before the `defer` below is armed, and leaking
+    // the mmap + fd once per file exhausted the fd limit in a FOR EACH.
+    if (mapped.quoted_newlines) {
+        mapped.close();
+        return false;
+    }
     defer mapped.close();
 
     const row_schema = try schemaPtr(arena, try mapChainSchema(env, prefix, mapped.schema));
@@ -2965,8 +2987,13 @@ fn runParallelCsvDistinct(env: *Env, rd: ast.Read, prefix: []const ast.Stage, di
 
     const mapped = csv.MappedCsv.open(arena, path) catch return false;
     // A newline inside a quoted field makes chunk boundaries undecidable from a
-    // byte offset, so this file is parsed serially rather than split.
-    if (mapped.quoted_newlines) return false;
+    // byte offset, so this file is parsed serially rather than split. Closed
+    // explicitly: this returns before the `defer` below is armed, and leaking
+    // the mmap + fd once per file exhausted the fd limit in a FOR EACH.
+    if (mapped.quoted_newlines) {
+        mapped.close();
+        return false;
+    }
     defer mapped.close();
 
     const row_schema = try schemaPtr(arena, try mapChainSchema(env, prefix, mapped.schema));
