@@ -2056,7 +2056,11 @@ pub fn formatDate(arena: std.mem.Allocator, days: i64) ![]const u8 {
 pub fn formatTime(arena: std.mem.Allocator, t: i64) ![]const u8 {
     const us: u64 = @intCast(@mod(t, 86_400_000_000));
     const secs = us / 1_000_000;
-    return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ secs / 3600, (secs % 3600) / 60, secs % 60, us % 1_000_000 });
+    const frac = us % 1_000_000;
+    // Same rule as `formatTimestamp`: `.ffffff` only when there is a fraction,
+    // so a `time(0)` reads as `12:00:00` rather than `12:00:00.000000`.
+    if (frac != 0) return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ secs / 3600, (secs % 3600) / 60, secs % 60, frac });
+    return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2}", .{ secs / 3600, (secs % 3600) / 60, secs % 60 });
 }
 
 /// `YYYY-MM-DD HH:MM:SS` from microseconds since the 1970 epoch (floor-divides so
@@ -3161,4 +3165,14 @@ test "timestamps keep sub-second precision through parse and format" {
     const w = parseIsoTimestamp("2026-08-08 12:34:56").?;
     try std.testing.expectEqualStrings("2026-08-08 12:34:56", try formatTimestamp(ar.allocator(), w));
     try std.testing.expect(parseIsoTimestamp("2026-08-08 12:34:56.12x") == null);
+}
+
+test "formatTime suppresses an all-zero fraction, like formatTimestamp" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("12:00:00", try formatTime(a, 12 * 3600 * 1_000_000));
+    try std.testing.expectEqualStrings("00:00:00", try formatTime(a, 0));
+    try std.testing.expectEqualStrings("23:59:59.999999", try formatTime(a, 86_400_000_000 - 1));
+    try std.testing.expectEqualStrings("00:00:00.000001", try formatTime(a, 1));
 }
