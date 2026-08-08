@@ -245,7 +245,7 @@ fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, mi
     var m: usize = m_in;
     if (@as(i128, @intCast(m)) > span) m = @intCast(span);
     if (m <= 1) {
-        const one = try std.fmt.allocPrint(arena, "{s} >= {d}", .{ qcol, min });
+        const one = try std.fmt.allocPrint(arena, "({s} >= {d} OR {s} IS NULL)", .{ qcol, min, qcol });
         return try dupeOne(arena, one);
     }
     const width: i128 = @divTrunc(span + @as(i128, @intCast(m)) - 1, @as(i128, @intCast(m)));
@@ -255,6 +255,13 @@ fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, mi
         const lo: i128 = @as(i128, min) + @as(i128, @intCast(k)) * width;
         if (k == m - 1) {
             try list.append(try std.fmt.allocPrint(arena, "{s} >= {d}", .{ qcol, lo }));
+        } else if (k == 0) {
+            // Slice 0 also claims NULL keys. Every predicate here is a `>=`/`<`
+            // comparison, which SQL evaluates UNKNOWN for NULL — so a nullable
+            // split column (legal via `WITH (split = col)`) made those rows
+            // match no lane at all and vanish from a `-j > 1` read.
+            const hi: i128 = lo + width;
+            try list.append(try std.fmt.allocPrint(arena, "(({s} >= {d} AND {s} < {d}) OR {s} IS NULL)", .{ qcol, lo, qcol, hi, qcol }));
         } else {
             const hi: i128 = lo + width;
             try list.append(try std.fmt.allocPrint(arena, "{s} >= {d} AND {s} < {d}", .{ qcol, lo, qcol, hi }));
@@ -301,7 +308,7 @@ fn dateRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m
     var m: usize = m_in;
     if (@as(i128, @intCast(m)) > span) m = @intCast(span);
     if (m <= 1) {
-        const one = try std.fmt.allocPrint(arena, "{s} >= '{s}'", .{ qcol, try eval.formatDate(arena, min_day) });
+        const one = try std.fmt.allocPrint(arena, "({s} >= '{s}' OR {s} IS NULL)", .{ qcol, try eval.formatDate(arena, min_day), qcol });
         return try dupeOne(arena, one);
     }
     const width: i128 = @divTrunc(span + @as(i128, @intCast(m)) - 1, @as(i128, @intCast(m)));
@@ -313,7 +320,12 @@ fn dateRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m
             try list.append(try std.fmt.allocPrint(arena, "{s} >= '{s}'", .{ qcol, try eval.formatDate(arena, lo) }));
         } else {
             const hi: i64 = @intCast(@as(i128, lo) + width);
-            try list.append(try std.fmt.allocPrint(arena, "{s} >= '{s}' AND {s} < '{s}'", .{ qcol, try eval.formatDate(arena, lo), qcol, try eval.formatDate(arena, hi) }));
+            if (k == 0) {
+                // Slice 0 claims NULL keys too — see `intRangePreds`.
+                try list.append(try std.fmt.allocPrint(arena, "(({s} >= '{s}' AND {s} < '{s}') OR {s} IS NULL)", .{ qcol, try eval.formatDate(arena, lo), qcol, try eval.formatDate(arena, hi), qcol }));
+            } else {
+                try list.append(try std.fmt.allocPrint(arena, "{s} >= '{s}' AND {s} < '{s}'", .{ qcol, try eval.formatDate(arena, lo), qcol, try eval.formatDate(arena, hi) }));
+            }
         }
     }
     return list.toOwnedSlice();
@@ -329,7 +341,8 @@ fn uuidSpacePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m
         const lo = if (k == 0) null else try uuidAt(arena, k, m);
         const hi = if (k == m - 1) null else try uuidAt(arena, k + 1, m);
         if (lo == null) {
-            try list.append(try std.fmt.allocPrint(arena, "{s} < '{s}'", .{ qcol, hi.? }));
+            // The opening slice claims NULL keys — see `intRangePreds`.
+            try list.append(try std.fmt.allocPrint(arena, "({s} < '{s}' OR {s} IS NULL)", .{ qcol, hi.?, qcol }));
         } else if (hi == null) {
             try list.append(try std.fmt.allocPrint(arena, "{s} >= '{s}'", .{ qcol, lo.? }));
         } else {
@@ -417,7 +430,11 @@ test "date range splits are covering, disjoint, and day-aligned" {
 
     const preds = try dateRangePreds(a, .mysql, "updated_at", 19723, 20088, 4);
     try std.testing.expectEqual(@as(usize, 4), preds.len);
-    try std.testing.expectEqualStrings("`updated_at` >= '2024-01-01' AND `updated_at` < '2024-04-02'", preds[0]);
+    // Slice 0 also claims NULL keys, so it is parenthesized with an OR tail.
+    try std.testing.expectEqualStrings(
+        "((`updated_at` >= '2024-01-01' AND `updated_at` < '2024-04-02') OR `updated_at` IS NULL)",
+        preds[0],
+    );
     try std.testing.expect(std.mem.endsWith(u8, preds[3], ">= '2024-10-03'"));
     var k: usize = 0;
     while (k + 1 < preds.len) : (k += 1) {
@@ -485,17 +502,24 @@ fn failOpen(_: *anyopaque) anyerror!Conn {
 
 /// Minimal evaluator for the int predicates this module emits, for tests only:
 /// `"id" >= LO` or `"id" >= LO AND "id" < HI`.
-fn intPredHolds(pred: []const u8, id: i64) bool {
+/// Evaluate a generated predicate for a NON-NULL id. Slice 0 carries an
+/// `OR <col> IS NULL` tail (so NULL keys land in exactly one lane); that arm is
+/// false for a real id, so it is stripped before parsing the range.
+fn intPredHolds(pred_in: []const u8, id: i64) bool {
+    var pred = pred_in;
+    if (std.mem.indexOf(u8, pred, " OR ")) |o| pred = pred[0..o];
+    pred = std.mem.trim(u8, pred, "()");
     var lo: i64 = std.math.minInt(i64);
     var hi: ?i64 = null;
     var it = std.mem.splitSequence(u8, pred, " AND ");
-    while (it.next()) |part| {
+    while (it.next()) |part_in| {
+        const part = std.mem.trim(u8, part_in, "()");
         const ge = std.mem.indexOf(u8, part, ">= ");
         const lt = std.mem.indexOf(u8, part, "< ");
         if (ge) |i| {
-            lo = std.fmt.parseInt(i64, part[i + 3 ..], 10) catch unreachable;
+            lo = std.fmt.parseInt(i64, std.mem.trim(u8, part[i + 3 ..], "() "), 10) catch unreachable;
         } else if (lt) |i| {
-            hi = std.fmt.parseInt(i64, part[i + 2 ..], 10) catch unreachable;
+            hi = std.fmt.parseInt(i64, std.mem.trim(u8, part[i + 2 ..], "() "), 10) catch unreachable;
         }
     }
     return id >= lo and (hi == null or id < hi.?);
