@@ -4291,7 +4291,25 @@ fn unionCanon(env: *Env, specs: []const UnionSpec, schemas: []const types.Schema
         for (specs, schemas) |s, sch| if (std.mem.eql(u8, s.name, c)) return sch;
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "union canon `{s}` is not one of the source tables", .{c}));
     };
-    return schemas[0];
+    // Widen field-by-field across every branch instead of taking branch 0
+    // verbatim: `synthReconcile` CASTs each branch to this schema, so an int
+    // first branch silently truncated a later float branch's 2.7 to 2 — and
+    // swapping the branches changed the answer. `unify` is SQL's UNION column
+    // type resolution; a pair that cannot unify is an error, not a guess.
+    const canon = try env.arena.alloc(types.Schema.Field, schemas[0].fields.len);
+    @memcpy(canon, schemas[0].fields);
+    for (schemas[1..]) |sch| {
+        for (canon) |*f| {
+            const other = sch.indexOf(f.name) orelse continue;
+            const ot = sch.fields[other].ty;
+            f.ty = types.Type.unify(f.ty, ot) orelse return planErr(env.diag, try std.fmt.allocPrint(
+                env.arena,
+                "union: column `{s}` is {s} in one branch and {s} in another, with no common type",
+                .{ f.name, @tagName(f.ty.kind), @tagName(ot.kind) },
+            ));
+        }
+    }
+    return .{ .fields = canon };
 }
 
 fn unionDownstreamMapOnly(stages: []const ast.Stage) bool {
