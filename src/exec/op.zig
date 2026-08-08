@@ -1570,7 +1570,7 @@ pub const Aggregate = struct {
         for (self.aggs, partials) |agg, *p| {
             p.* = (try self.reduceBatch(arena, agg, b)) orelse return false;
         }
-        for (self.aggs, partials, accs) |agg, p, *acc| mergePartial(acc, agg, p);
+        for (self.aggs, partials, accs) |agg, p, *acc| try mergePartial(acc, agg, p);
         return true;
     }
 
@@ -1644,7 +1644,7 @@ pub const Aggregate = struct {
             .sum, .avg => switch (col.ty.kind) {
                 .float => p.sum_f = simd.sumF(col.data.f64[0..n]),
                 .int => {
-                    p.sum_i = sumIntCol(col.data.i64[0..n]);
+                    p.sum_i = try sumIntCol(col.data.i64[0..n]);
                     p.sum_f = @floatFromInt(p.sum_i);
                 },
                 else => unreachable,
@@ -1656,11 +1656,15 @@ pub const Aggregate = struct {
 
     /// Fold one batch's `Partial` into the running accumulator. Mirrors the
     /// row-wise `updateAcc` semantics (null-skipping, agg.ty-driven sum kind).
-    fn mergePartial(acc: *Acc, agg: Agg, p: Partial) void {
+    fn mergePartial(acc: *Acc, agg: Agg, p: Partial) error{IntOverflow}!void {
         switch (agg.func) {
             .count => acc.n += @intCast(p.nvalid),
             .sum => if (p.nvalid > 0) {
-                if (agg.ty.kind == .float) acc.sum_f += p.sum_f else acc.sum_i += p.sum_i;
+                // Batch partials can overflow on merge even when no batch did.
+                if (agg.ty.kind == .float)
+                    acc.sum_f += p.sum_f
+                else
+                    acc.sum_i = std.math.add(i64, acc.sum_i, p.sum_i) catch return error.IntOverflow;
                 acc.n += @intCast(p.nvalid);
             },
             .avg => if (p.nvalid > 0) {
@@ -1783,10 +1787,14 @@ pub fn dupeValue(state: std.mem.Allocator, v: Value) !Value {
     };
 }
 
-fn sumIntCol(d: []const i64) i64 {
-    var s: i64 = 0;
-    for (d) |x| s +%= x;
-    return s;
+/// Sum an i64 column, erroring rather than wrapping. The accumulator is i128 so
+/// the hot loop stays branch-free — a slice of i64 cannot overflow i128 — and the
+/// single range check happens once at the end. This used to be `+%`, which
+/// silently returned a plausible wrong total (three big values summed to `-1`).
+fn sumIntCol(d: []const i64) error{IntOverflow}!i64 {
+    var s: i128 = 0;
+    for (d) |x| s += x;
+    return std.math.cast(i64, s) orelse error.IntOverflow;
 }
 
 /// MIN/MAX over an int/float column, honoring nulls. SIMD on the all-valid fast
@@ -2967,4 +2975,17 @@ test "linearize decomposes map-only pipelines source-to-sink; breakers refuse" {
 
     var srt = Sort{ .child = .{ .project = &proj }, .in_schema = &int_schema, .keys = &.{} };
     try testing.expect((try linearize(a, .{ .sort = &srt })) == null);
+}
+
+test "sumIntCol: overflow is an error, not a wrapped plausible number" {
+    // Was `+%`: three of these summed to exactly 2^64-1, which wrapped to `-1`
+    // and was reported as the answer. The i64 column path is the one parquet and
+    // database int columns take, so this was a live silent-wrong-answer.
+    const big: i64 = 6148914691236517205;
+    try testing.expectError(error.IntOverflow, sumIntCol(&[_]i64{ big, big, big }));
+    try testing.expectError(error.IntOverflow, sumIntCol(&[_]i64{ std.math.minInt(i64), -1 }));
+    try testing.expectEqual(@as(i64, 6), try sumIntCol(&[_]i64{ 1, 2, 3 }));
+    try testing.expectEqual(@as(i64, 0), try sumIntCol(&[_]i64{}));
+    // Cancelling extremes stay exact: the i128 accumulator never leaves range.
+    try testing.expectEqual(@as(i64, 0), try sumIntCol(&[_]i64{ std.math.maxInt(i64), std.math.minInt(i64), 1 }));
 }
