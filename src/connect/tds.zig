@@ -861,9 +861,24 @@ const TdsCursor = struct {
                 _ = try self.reader.readByte();
                 d.engine_type = boolT;
             },
-            0x6D, 0x6E => {
+            0x6D => {
                 _ = try self.reader.readByte();
                 d.engine_type = floatT;
+            },
+            // MONEYNTYPE. Not a float: a scaled integer of ten-thousandths, and
+            // the 8-byte form is the one TDS type sent high word first.
+            0x6E => {
+                const ml = try self.reader.readByte();
+                d.is_money = true;
+                d.scale = 4;
+                d.engine_type = types.Type.decimal(if (ml == 4) 10 else 19, 4).asNullable();
+            },
+            0x3C, 0x7A => {
+                d.kind = .fixed;
+                d.fixed_len = if (t == 0x7A) 4 else 8;
+                d.is_money = true;
+                d.scale = 4;
+                d.engine_type = types.Type.decimal(if (t == 0x7A) 10 else 19, 4).asNullable();
             },
             0x6F => {
                 _ = try self.reader.readByte();
@@ -1205,6 +1220,7 @@ const ColumnDesc = struct {
     is_unicode: bool = false,
     is_guid: bool = false,
     is_binary: bool = false,
+    is_money: bool = false,
 };
 
 fn decodeValue(arena: std.mem.Allocator, d: ColumnDesc, bytes: []const u8) !Value {
@@ -1212,7 +1228,7 @@ fn decodeValue(arena: std.mem.Allocator, d: ColumnDesc, bytes: []const u8) !Valu
         .int => .{ .int = readIntLE(bytes) },
         .bool => .{ .bool = bytes.len > 0 and bytes[0] != 0 },
         .float => .{ .float = if (bytes.len == 4) @as(f64, @as(f32, @bitCast(@as(u32, @truncate(readULE(bytes))))) ) else @bitCast(readULE(bytes)) },
-        .decimal => decodeDecimal(d, bytes),
+        .decimal => if (d.is_money) decodeMoney(bytes) else decodeDecimal(d, bytes),
         .string => .{ .string = if (d.is_guid) try formatGuid(arena, bytes) else if (d.is_binary) try bytesToHex(arena, bytes) else if (d.is_unicode) try utf16ToUtf8(arena, bytes) else try win1252ToUtf8(arena, bytes) },
         .bytes => .{ .bytes = try arena.dupe(u8, bytes) },
         .date => .{ .date = @intCast(@as(i64, @intCast(readULE(bytes))) - 719162) },
@@ -1227,6 +1243,21 @@ fn decodeDecimal(d: ColumnDesc, bytes: []const u8) Value {
     var mag: i128 = 0;
     for (bytes[1..], 0..) |b, k| mag |= @as(i128, b) << @intCast(k * 8);
     return .{ .decimal = .{ .unscaled = if (positive) mag else -mag, .scale = d.scale } };
+}
+
+/// MONEY/SMALLMONEY: a scaled integer of ten-thousandths, never IEEE-754. The
+/// 8-byte form is the one TDS value sent high word first.
+fn decodeMoney(bytes: []const u8) Value {
+    const unscaled: i64 = switch (bytes.len) {
+        4 => std.mem.readInt(i32, bytes[0..4], .little),
+        8 => blk: {
+            const hi: u64 = @bitCast(@as(i64, std.mem.readInt(i32, bytes[0..4], .little)));
+            const lo: u64 = std.mem.readInt(u32, bytes[4..8], .little);
+            break :blk @bitCast((hi << 32) | lo);
+        },
+        else => return .null,
+    };
+    return .{ .decimal = .{ .unscaled = unscaled, .scale = 4 } };
 }
 
 fn decodeDateTime(d: ColumnDesc, bytes: []const u8) i64 {
@@ -1429,6 +1460,31 @@ test "decodeDecimal: sign byte + little-endian magnitude at the column scale" {
     const neg = decodeDecimal(d, &.{ 0, 0x39, 0x30, 0, 0 });
     try std.testing.expectEqual(@as(i128, -12345), neg.decimal.unscaled);
     try std.testing.expect(decodeDecimal(d, &.{}) == .null);
+}
+
+test "decodeMoney: ten-thousandths, high word first for the 8-byte form" {
+    // -0.0001 is all-ones on the wire in both widths.
+    try std.testing.expectEqual(@as(i128, -1), decodeMoney(&(.{0xFF} ** 8)).decimal.unscaled);
+    try std.testing.expectEqual(@as(i128, -1), decodeMoney(&(.{0xFF} ** 4)).decimal.unscaled);
+    try std.testing.expectEqual(@as(u8, 4), decodeMoney(&(.{0xFF} ** 8)).decimal.scale);
+
+    // 922337203685477.5807 == i64 max: high word first, so 0x7FFFFFFF then 0xFFFFFFFF.
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(i32, b[0..4], 0x7FFFFFFF, .little);
+    std.mem.writeInt(u32, b[4..8], 0xFFFFFFFF, .little);
+    try std.testing.expectEqual(@as(i128, std.math.maxInt(i64)), decodeMoney(&b).decimal.unscaled);
+
+    // 1.0000 -> 10000, which lives entirely in the low word.
+    std.mem.writeInt(i32, b[0..4], 0, .little);
+    std.mem.writeInt(u32, b[4..8], 10000, .little);
+    try std.testing.expectEqual(@as(i128, 10000), decodeMoney(&b).decimal.unscaled);
+
+    // smallmoney -214748.3648 is plain little-endian i32.
+    var b4: [4]u8 = undefined;
+    std.mem.writeInt(i32, &b4, std.math.minInt(i32), .little);
+    try std.testing.expectEqual(@as(i128, std.math.minInt(i32)), decodeMoney(&b4).decimal.unscaled);
+
+    try std.testing.expect(decodeMoney(&.{ 1, 2, 3 }) == .null);
 }
 
 test "decodeDateTime: DATETIME ticks, SMALLDATETIME minutes, DATETIME2 scale" {
