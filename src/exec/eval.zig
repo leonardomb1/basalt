@@ -2065,7 +2065,14 @@ pub fn formatTimestamp(arena: std.mem.Allocator, micros: i64) ![]const u8 {
     const days = @divFloor(micros, 86_400_000_000);
     const us: u64 = @intCast(micros - days * 86_400_000_000);
     const secs = us / 1_000_000;
+    const frac = us % 1_000_000;
     const c = civilFromDays(days);
+    // Emit `.ffffff` only when there is a fraction, so whole-second values keep
+    // their existing spelling and only sub-second data gains digits it would
+    // otherwise lose on every write.
+    if (frac != 0) return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{
+        @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60, frac,
+    });
     return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
         @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60,
     });
@@ -2305,7 +2312,19 @@ pub fn parseIsoTimestamp(s0: []const u8) ?i64 {
     const mm = isoNum(s[14..16]) orelse return null;
     const ss = isoNum(s[17..19]) orelse return null;
     if (hh > 23 or mm > 59 or ss > 59) return null;
-    return days * 86_400_000_000 + (hh * 3600 + mm * 60 + ss) * 1_000_000;
+    // Accept and keep `.ffffff`. `Value.timestamp` is micros, so ignoring the
+    // fraction silently discarded it on every CAST of a sub-second literal.
+    var frac: i64 = 0;
+    if (s.len > 20 and s[19] == '.') {
+        var i: usize = 20;
+        var scale: i64 = 100_000;
+        while (i < s.len and scale > 0 and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+            frac += @as(i64, s[i] - '0') * scale;
+            scale = @divTrunc(scale, 10);
+        }
+        if (i != s.len) return null;
+    } else if (s.len != 19) return null;
+    return days * 86_400_000_000 + (hh * 3600 + mm * 60 + ss) * 1_000_000 + frac;
 }
 
 /// Civil (Gregorian) date from a day count since the 1970 epoch (Howard Hinnant's
@@ -2409,6 +2428,10 @@ pub fn compareValues(a: Value, b: Value) ?std.math.Order {
         return orderF64(toF64(a), toF64(b));
     }
     if (a == .string and b == .string) return std.mem.order(u8, a.string, b.string);
+    // Without this, `compareValues` returned null for bytes and `op.lessV`
+    // folded that to false — so MIN/MAX over a bytes column kept the FIRST
+    // value forever, while ORDER BY on the same column was correct.
+    if (a == .bytes and b == .bytes) return std.mem.order(u8, a.bytes, b.bytes);
     if (a == .bool and b == .bool) return std.math.order(@intFromBool(a.bool), @intFromBool(b.bool));
     if (a == .timestamp and b == .timestamp) return std.math.order(a.timestamp, b.timestamp);
     if (a == .date and b == .date) return std.math.order(a.date, b.date);
@@ -3118,4 +3141,24 @@ test "integer arithmetic overflow is an error, not a silent wrap" {
     try std.testing.expectError(error.IntOverflow, arith(.mul, big, .{ .int = 2 }));
     try std.testing.expectError(error.IntOverflow, arith(.sub, .{ .int = std.math.minInt(i64) }, one));
     try std.testing.expectEqual(@as(i64, 5), (try arith(.add, .{ .int = 2 }, .{ .int = 3 })).int);
+}
+
+test "timestamps keep sub-second precision through parse and format" {
+    // `Value.timestamp` is micros; dropping `.ffffff` made `…56.100` and
+    // `…56.900` byte-identical, collapsing distinct rows on DISTINCT and making
+    // ORDER BY non-deterministic inside a second.
+    const us = parseIsoTimestamp("2026-08-08 12:34:56.123456").?;
+    try std.testing.expectEqual(@as(i64, 123456), @mod(us, 1_000_000));
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    try std.testing.expectEqualStrings(
+        "2026-08-08 12:34:56.123456",
+        try formatTimestamp(ar.allocator(), us),
+    );
+    // Fewer digits right-pad: `.1` is 100000 micros, not 1.
+    try std.testing.expectEqual(@as(i64, 100000), @mod(parseIsoTimestamp("2026-08-08 12:34:56.1").?, 1_000_000));
+    // A whole second still formats without a fraction, and trailing junk fails.
+    const w = parseIsoTimestamp("2026-08-08 12:34:56").?;
+    try std.testing.expectEqualStrings("2026-08-08 12:34:56", try formatTimestamp(ar.allocator(), w));
+    try std.testing.expect(parseIsoTimestamp("2026-08-08 12:34:56.12x") == null);
 }

@@ -724,7 +724,19 @@ fn parseDatetimeText(t: []const u8) i64 {
     const days = parseDateText(t);
     var secs: i64 = 0;
     if (t.len >= 19) secs = atoiN(t[11..13]) * 3600 + atoiN(t[14..16]) * 60 + atoiN(t[17..19]);
-    return days * 86_400_000_000 + secs * 1_000_000;
+    // `Value.timestamp` is already micros, so dropping `.ffffff` was pure loss:
+    // a `datetime(3)` column made `…56.100` and `…56.900` byte-identical, which
+    // collapsed distinct rows and made ORDER BY non-deterministic within a second.
+    var frac: i64 = 0;
+    if (t.len > 20 and t[19] == '.') {
+        var i: usize = 20;
+        var scale: i64 = 100_000;
+        while (i < t.len and scale > 0 and t[i] >= '0' and t[i] <= '9') : (i += 1) {
+            frac += @as(i64, t[i] - '0') * scale;
+            scale = @divTrunc(scale, 10);
+        }
+    }
+    return days * 86_400_000_000 + secs * 1_000_000 + frac;
 }
 
 fn atoiN(s: []const u8) i64 {

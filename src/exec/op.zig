@@ -796,10 +796,18 @@ pub const Aggregate = struct {
             acc.seen = p;
             break :blk p;
         };
-        const key = try alloc.alloc(Value, 1);
-        key[0] = try dupeValue(alloc, v);
-        const gop = try set.getOrPut(key);
-        if (!gop.found_existing) gop.key_ptr.* = key;
+        // Probe with a stack key and only materialize on a MISS. Allocating
+        // first made this O(rows) in an arena that is never reclaimed —
+        // COUNT(DISTINCT) over 200M rows held ~7.6 GB for 200 values,
+        // against the documented streaming envelope. `Distinct.next`
+        // already probes this way.
+        var probe = [_]Value{v};
+        const gop = try set.getOrPut(probe[0..]);
+        if (!gop.found_existing) {
+            const key = try alloc.alloc(Value, 1);
+            key[0] = try dupeValue(alloc, v);
+            gop.key_ptr.* = key;
+        }
         acc.n = @intCast(set.count());
     }
 
