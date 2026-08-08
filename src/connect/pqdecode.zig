@@ -1193,7 +1193,12 @@ pub const Remote = struct {
 
     fn read(self: *Remote, arena: std.mem.Allocator, off: u64, len: usize) ![]const u8 {
         if (len == 0) return "";
-        if (self.whole) |w| return w[@intCast(off)..][0..len];
+        // `total` came from HEAD; `whole` came from a later 200. A server that
+        // disagrees between the two must not slice us past the buffer.
+        if (self.whole) |w| {
+            if (off + len > w.len) return Error.CorruptParquetPage;
+            return w[@intCast(off)..][0..len];
+        }
 
         const hdr = try std.fmt.allocPrint(arena, "bytes={d}-{d}", .{ off, off + len - 1 });
         const res = try self.send(arena, .GET, hdr);
@@ -1930,6 +1935,28 @@ test "a Bytes range refuses to read past the end" {
     try testing.expectEqualStrings("234", try src.range(ar.allocator(), 2, 3));
     try testing.expectError(Error.CorruptParquetPage, src.range(ar.allocator(), 8, 5));
     try testing.expectEqual(@as(u64, 10), src.size());
+}
+
+test "a remote whole-body read refuses to slice past the body it was given" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // HEAD claimed 100000 bytes; the ranged GET came back 200 with 10. The
+    // fast path must not trust `total` over the buffer it actually holds.
+    var client = httpx.initClient(a);
+    defer client.deinit();
+    var r = Remote{
+        .arena = a,
+        .client = &client,
+        .url = "http://example/x.parquet",
+        .blob = null,
+        .total = 100000,
+        .whole = "0123456789",
+    };
+    try testing.expectEqualStrings("234", try r.read(a, 2, 3));
+    try testing.expectError(Error.CorruptParquetPage, r.read(a, 99992, 8));
+    try testing.expectError(Error.CorruptParquetPage, r.read(a, 8, 5));
 }
 
 test "top-N threshold skips only groups it can prove cannot contribute" {
