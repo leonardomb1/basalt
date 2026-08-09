@@ -1179,6 +1179,71 @@ fn dispatchWorker(comptime Ctx: type, comptime workOne: anytype) fn (*Ctx, usize
     }.go;
 }
 
+/// One work item's partial group set, kept alive past the worker that folded it
+/// so the combine can run in item order.
+///
+/// Folding into a per-*item* slot rather than straight into shared state under a
+/// lock is what makes a parallel aggregate reproducible. Which rows land in which
+/// partial is fixed by the item boundaries (a CSV byte range, a key-range
+/// predicate), and `combineAggSlots` walks the slots by index, so a float `SUM`
+/// adds its partials in the same order on every run. Merging as lanes *finished*
+/// made the order depend on thread scheduling, so the same script wrote a
+/// slightly different total each run — see the note in `combineAggSlots`.
+const AggSlot = struct {
+    /// Per-slot and single-threaded: exactly one worker ever folds a given slot,
+    /// and the main thread only touches it after `spawnJoin` has returned.
+    gpa: std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }) = .{},
+    arena: std.heap.ArenaAllocator = undefined,
+    groups: []op.Aggregate.Group = &.{},
+    /// False for a slot no worker reached, which is what an aborted run leaves
+    /// behind. Such a slot holds no groups and is skipped by the combine.
+    done: bool = false,
+
+    fn arm(self: *AggSlot) void {
+        self.arena = std.heap.ArenaAllocator.init(self.gpa.allocator());
+    }
+};
+
+fn allocAggSlots(gpa: std.mem.Allocator, n: usize) ![]AggSlot {
+    const slots = try gpa.alloc(AggSlot, n);
+    for (slots) |*s| s.* = .{};
+    // Armed in a second pass: `arm` takes the address of the slot's own gpa, so
+    // it has to run once the slot is at its final location.
+    for (slots) |*s| s.arm();
+    return slots;
+}
+
+fn freeAggSlots(gpa: std.mem.Allocator, slots: []AggSlot) void {
+    for (slots) |*s| {
+        s.arena.deinit();
+        _ = s.gpa.deinit();
+    }
+    gpa.free(slots);
+}
+
+/// Combine per-item partials into one group set, walking the slots by index.
+///
+/// The order matters for floats and only for floats: `mergeAcc` adds partial
+/// sums, and float addition is not associative, so combining the same partials
+/// in a different order gives a total that differs in the last few bits. Integer
+/// and DECIMAL sums, counts and min/max are exact and order-insensitive. Note
+/// that this pins the result for a *given* item count — `-j` changes how the
+/// input is cut up, so a float total can still differ between `-j 4` and `-j 8`
+/// (as it does between either and the serial path). `CAST`ing to DECIMAL is the
+/// way to get a total that is identical everywhere.
+fn combineAggSlots(
+    map: *op.Aggregate.GroupMap(),
+    groups: *std.array_list.Managed(op.Aggregate.Group),
+    dst_alloc: std.mem.Allocator,
+    slots: []AggSlot,
+    aggs: []const op.Aggregate.Agg,
+) !void {
+    for (slots) |*s| {
+        if (!s.done) continue;
+        try op.Aggregate.mergeGroups(map, groups, dst_alloc, s.groups, aggs);
+    }
+}
+
 /// Finalize merged parallel-aggregate groups into one output batch (a "merger"
 /// Aggregate just for `emit`; it never pulls a child).
 fn emitMergedGroups(env: *Env, agg_in: *const types.Schema, by: []const usize, aggs: []const op.Aggregate.Agg, out_schema: *const types.Schema, groups: []const op.Aggregate.Group) !batchmod.Batch {
@@ -1235,21 +1300,15 @@ const AggCtx = struct {
     by: []const usize,
     aggs: []const op.Aggregate.Agg,
     queue: WorkQueue,
-    cmap: *op.Aggregate.GroupMap(),
-    cgroups: *std.array_list.Managed(op.Aggregate.Group),
-    mtx: std.Thread.Mutex = .{},
-    plan_arena: std.mem.Allocator,
+    slots: []AggSlot,
     rows_read: *std.atomic.Value(u64),
 };
 
 const aggWorker = dispatchWorker(AggCtx, aggWorkOne);
 
 fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
-    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
-    defer _ = wgpa.deinit();
-    var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
-    defer warena.deinit();
-    const wa = warena.allocator();
+    const slot = &ctx.slots[i];
+    const wa = slot.arena.allocator();
 
     var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.queue.nitems), .schema = ctx.csv_schema };
     var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
@@ -1263,13 +1322,11 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
         .out_schema = ctx.out_schema,
         .err = null,
         .state = wa,
-        .gpa = wgpa.allocator(),
+        .gpa = slot.gpa.allocator(),
     };
-    const groups = try agg.drainGroups();
-
-    ctx.mtx.lock();
-    defer ctx.mtx.unlock();
-    try op.Aggregate.mergeGroups(ctx.cmap, ctx.cgroups, ctx.plan_arena, groups, ctx.aggs);
+    // Stays in the slot's arena: the combine reads it after every lane has joined.
+    slot.groups = try agg.drainGroups();
+    slot.done = true;
 }
 
 /// One parallel-aggregate lane: its own arena and its own group table, so the
@@ -1335,6 +1392,27 @@ const MorselSource = struct {
     m: *PqMorsels,
     scratch: std.mem.Allocator,
     cur: ?*pqdecode.Reader = null,
+    /// When set, this source owns a fixed arithmetic slice of the morsels
+    /// (`next`, `next + step`, …) instead of stealing whichever is free.
+    ///
+    /// The aggregate path needs that: a lane folds every morsel it reads into one
+    /// partial group set, so the order its float sums are added in is the order
+    /// morsels reached the lane. Stealing makes that order depend on thread
+    /// timing, and the run's totals wobble in their last bits. Fixed slices cost
+    /// balance only when row groups are uneven, whereas the map path — which
+    /// combines nothing across morsels — keeps stealing and stays balanced.
+    fixed: ?struct { next: usize, step: usize } = null,
+
+    /// The next morsel index this source should read, or null when it is done.
+    fn nextIndex(self: *MorselSource) ?usize {
+        if (self.fixed) |*f| {
+            if (f.next >= self.m.queue.nitems) return null;
+            defer f.next += f.step;
+            return f.next;
+        }
+        const i = self.m.queue.next.fetchAdd(1, .seq_cst);
+        return if (i >= self.m.queue.nitems) null else i;
+    }
 
     fn schemaFn(ptr: *anyopaque) types.Schema {
         const self: *MorselSource = @ptrCast(@alignCast(ptr));
@@ -1348,8 +1426,7 @@ const MorselSource = struct {
                 self.cur = null;
             }
             if (self.m.queue.failed.load(.seq_cst)) return null;
-            const i = self.m.queue.next.fetchAdd(1, .seq_cst);
-            if (i >= self.m.queue.nitems) return null;
+            const i = self.nextIndex() orelse return null;
             const r = try pqdecode.Reader.openProjected(self.scratch, self.m.path, self.m.project);
             r.bounds = self.m.bounds;
             r.rg = i * self.m.per_item;
@@ -1372,7 +1449,11 @@ fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
     const ls = &ctx.lanes[lane_idx];
     const la = ls.arena.allocator();
 
-    var ms = MorselSource{ .m = &ctx.morsels, .scratch = la };
+    var ms = MorselSource{
+        .m = &ctx.morsels,
+        .scratch = la,
+        .fixed = .{ .next = lane_idx, .step = ctx.lanes.len },
+    };
     var cs = obs.CountingSource{ .inner = .{ .ptr = &ms, .vtable = &MorselSource.vtable }, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     const child = try buildMapChain(la, ctx.params, ctx.prefix, &scan, ctx.morsels.src_schema);
@@ -1860,6 +1941,8 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
     const nthreads = @max(@as(usize, 1), opts.threads);
     var cmap = op.Aggregate.GroupMap().init(arena);
     var cgroups = std.array_list.Managed(op.Aggregate.Group).init(arena);
+    const slots = try allocAggSlots(env.gpa, nthreads);
+    defer freeAggSlots(env.gpa, slots);
     var ctx = AggCtx{
         .mapped = mapped,
         .csv_schema = &mapped.schema,
@@ -1870,9 +1953,7 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
         .by = apl.by,
         .aggs = aggs,
         .queue = .{ .nitems = nthreads },
-        .cmap = &cmap,
-        .cgroups = &cgroups,
-        .plan_arena = arena,
+        .slots = slots,
         .rows_read = env.rows_read,
     };
 
@@ -1882,6 +1963,7 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
 
     if (ctx.queue.first_err) |e| return e;
 
+    try combineAggSlots(&cmap, &cgroups, arena, slots, aggs);
     const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, cgroups.items);
 
     const wr = try resolveUpsertKeys(env, w);
@@ -1897,9 +1979,10 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
 
 /// Shared state for parallel SQL-aggregate lanes. Mirrors `AggCtx`, but each lane opens
 /// its own DB connection over one key-range predicate (`openSplitSource`) instead of
-/// reading a CSV byte-range. Each lane folds its range into a thread-local partial group
-/// set, then merges it into the combined set under `mtx` at the raw-`Acc` level (so AVG
-/// stays correct). The merge is O(groups) vs the O(rows) fold, so contention is low.
+/// reading a CSV byte-range. Each lane folds its range into that range's `AggSlot`, and
+/// `combineAggSlots` folds the slots together in key-range order at the raw-`Acc` level
+/// (so AVG stays correct, and a float SUM adds the same way on every run). The combine is
+/// O(groups) vs the O(rows) fold, so it costs little next to the scan.
 const SqlAggCtx = struct {
     split: SplitCtx,
     predicates: []const []const u8,
@@ -1913,24 +1996,18 @@ const SqlAggCtx = struct {
     by: []const usize,
     aggs: []const op.Aggregate.Agg,
     queue: WorkQueue,
-    cmap: *op.Aggregate.GroupMap(),
-    cgroups: *std.array_list.Managed(op.Aggregate.Group),
-    mtx: std.Thread.Mutex = .{},
-    plan_arena: std.mem.Allocator,
+    slots: []AggSlot,
     rows_read: *std.atomic.Value(u64),
 };
 
 const sqlAggWorker = dispatchWorker(SqlAggCtx, sqlAggWorkOne);
 
 fn sqlAggWorkOne(ctx: *SqlAggCtx, i: usize) !void {
-    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
-    defer _ = wgpa.deinit();
-    var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
-    defer warena.deinit();
-    const wa = warena.allocator();
+    const slot = &ctx.slots[i];
+    const wa = slot.arena.allocator();
 
     const q = try splitmod.wrapProjected(wa, ctx.split.base_sql, ctx.proj_select, ctx.predicates[i], ctx.where_extra);
-    const src = try openSqlQuery(&ctx.split, wgpa.allocator(), q);
+    const src = try openSqlQuery(&ctx.split, slot.gpa.allocator(), q);
     defer src.close();
 
     var cs = obs.CountingSource{ .inner = src, .count = ctx.rows_read };
@@ -1944,13 +2021,10 @@ fn sqlAggWorkOne(ctx: *SqlAggCtx, i: usize) !void {
         .out_schema = ctx.out_schema,
         .err = null,
         .state = wa,
-        .gpa = wgpa.allocator(),
+        .gpa = slot.gpa.allocator(),
     };
-    const groups = try agg.drainGroups();
-
-    ctx.mtx.lock();
-    defer ctx.mtx.unlock();
-    try op.Aggregate.mergeGroups(ctx.cmap, ctx.cgroups, ctx.plan_arena, groups, ctx.aggs);
+    slot.groups = try agg.drainGroups();
+    slot.done = true;
 }
 
 /// Parallel SQL aggregate: `read <sqltable> | (filter|select)* | aggregate | (sort|limit)* | write`
@@ -1991,6 +2065,10 @@ fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.S
     const nlanes = @min(@max(@as(usize, 1), opts.threads), sp.predicates.len);
     var cmap = op.Aggregate.GroupMap().init(arena);
     var cgroups = std.array_list.Managed(op.Aggregate.Group).init(arena);
+    // One slot per key range, not per lane: the lanes steal ranges off the queue,
+    // so only the range index is a stable identity to combine in.
+    const slots = try allocAggSlots(env.gpa, sp.predicates.len);
+    defer freeAggSlots(env.gpa, slots);
     var ctx = SqlAggCtx{
         .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql },
         .predicates = sp.predicates,
@@ -2004,9 +2082,7 @@ fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.S
         .by = apl.by,
         .aggs = aggs,
         .queue = .{ .nitems = sp.predicates.len },
-        .cmap = &cmap,
-        .cgroups = &cgroups,
-        .plan_arena = arena,
+        .slots = slots,
         .rows_read = env.rows_read,
     };
 
@@ -2022,6 +2098,7 @@ fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.S
 
     if (ctx.queue.first_err) |e| return e;
 
+    try combineAggSlots(&cmap, &cgroups, arena, slots, aggs);
     const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, cgroups.items);
 
     const snk = try openSink(env, w, out_schema.*);
@@ -5547,6 +5624,50 @@ test "parallel CSV aggregate: grouped agg (threads>1) merges partials by key" {
     try std.testing.expect(std.mem.indexOf(u8, par, "a,90\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, par, "b,60\n") != null);
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, par, "\n"));
+}
+
+// A float SUM whose value depends on the order the chunk partials are added:
+// 1e16 has a spacing of 2, so `1e16 + 1` is 1e16 exactly, and adding the small
+// values first is the only way the ones survive. The big value sits in the last
+// row, hence the last chunk, so combining the chunks in index order sums the
+// eight 1.0s before it and lands on 1e16 + 8 (even, so exact). Combining in
+// completion order would drop some of them.
+const float_order_csv =
+    "g,v\n" ++
+    "a,1\n" ++ "a,1\n" ++ "a,1\n" ++ "a,1\n" ++
+    "a,1\n" ++ "a,1\n" ++ "a,1\n" ++ "a,1\n" ++
+    "a,10000000000000000\n";
+
+test "parallel CSV aggregate: float SUM combines partials in chunk order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try runCsvThreaded(alloc, &tmp, float_order_csv,
+        "SELECT g, SUM(CAST(v AS FLOAT)) AS s FROM '$IN' GROUP BY g",
+        4);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("g,s\na,10000000000000008\n", out);
+}
+
+test "parallel CSV aggregate: float SUM is identical across runs at one -j" {
+    const alloc = std.testing.allocator;
+    // Same input every round; only the thread scheduling can differ. Any run that
+    // disagrees with the first means partials are being combined in arrival order.
+    var first: ?[]u8 = null;
+    defer if (first) |f| alloc.free(f);
+    for (0..8) |_| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const out = try runCsvThreaded(alloc, &tmp, float_order_csv,
+            "SELECT g, SUM(CAST(v AS FLOAT)) AS s FROM '$IN' GROUP BY g",
+            8);
+        if (first) |f| {
+            defer alloc.free(out);
+            try std.testing.expectEqualStrings(f, out);
+        } else {
+            first = out;
+        }
+    }
 }
 
 test "distinct: multi-column key (value-keyed)" {
