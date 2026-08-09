@@ -4692,7 +4692,9 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
         const reader = csv.CsvReader.open(env.arena, rd.form.path) catch |e| {
             // A mistyped prefix and a truly empty one are the same listing; say
             // which prefix came back empty rather than blaming the CSV parser.
-            if (e == azure.Error.AzureEmptyPrefix or e == s3.Error.S3EmptyPrefix)
+            if (e == azure.Error.AzureEmptyPrefix)
+                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no blobs under prefix `{s}`", .{rd.form.path}));
+            if (e == s3.Error.S3EmptyPrefix)
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no objects under prefix `{s}`", .{rd.form.path}));
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open input CSV `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
         };
