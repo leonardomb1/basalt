@@ -265,8 +265,15 @@ Source clauses, in any order after the source:
   surface at the source at runtime (permanent, exit 1).
 - **Implicit pushdown** — the contiguous `WHERE` (filter) prefix directly after
   a SQL table/query read is translated into that source query's `WHERE`
-  automatically. Translatable: comparisons, `AND`/`OR`/`NOT`, `IS [NOT]
-  NULL`/`EMPTY`, `IN`, `LIKE`, `CASE`/`IF`, `CAST`, and the portable string
+  automatically. A join no longer blocks it: a filter naming only columns the probe
+  side already had is moved below the join first, and a filter on a join *key* also
+  gains a twin on the other side's key — so `FROM fact JOIN dim ON fact.k = dim.k
+  WHERE dim.k = '…'` prunes the fact table at the source. Both moves are refused
+  where they would change the answer: never below a `RIGHT`/`FULL` join (there the
+  probe side is the one that gets null-extended), never when a referenced column
+  could have come from the right side, and the key twin only under an inner join.
+  `EXPLAIN` shows where the filter ended up. Translatable: comparisons,
+  `AND`/`OR`/`NOT`, `IS [NOT] NULL`/`EMPTY`, `IN`, `LIKE`, `CASE`/`IF`, `CAST`, and the portable string
   functions (`lower upper length trim substr replace concat coalesce
   starts_with ends_with contains`). Untranslatable pieces (arithmetic,
   `now()`/`today()`, user funcs) stay in the engine — the filter is always
@@ -806,12 +813,15 @@ replaces it). Meta commands: `\connections` list the session's declarations ·
 
 Accepted design not yet in the engine:
 
-- **Whole-CTE / cross-source pushdown** (§5's full Trino model): implicit
-  pushdown currently translates the filter prefix of a *single* SQL read. A
-  multi-stage CTE that is entirely one connection isn't yet collapsed into one
-  descended query, and a cross-connection join still materializes the smaller
-  side in the engine (correct, just not maximally pushed). The predicate
-  translator (`runtime/pushdown.zig`) is the reusable core when this lands.
+- **Whole-CTE / cross-source pushdown** (§5's full Trino model). Filters now move
+  below a join and across an equijoin key (§5), which was the case that mattered
+  most — before it, a join meant *no* predicate descended at all and a query over
+  an 80M-row table read the whole thing. What is still missing: a multi-stage CTE
+  that is entirely one connection is not collapsed into a single descended query,
+  aggregates and joins are never pushed into the source the way Trino's
+  `applyAggregation`/`applyJoin` do, and there is no runtime/dynamic filter — the
+  build side's key values are not sent back to the probe scan, so a selective
+  predicate on a *non-key* dimension column still reads the whole fact table.
 
 Deliberately partial:
 
