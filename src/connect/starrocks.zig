@@ -16,6 +16,7 @@ const driver = @import("driver.zig");
 const mysql = @import("mysql.zig");
 const sqlmod = @import("sql.zig");
 const obs = @import("../runtime/obs.zig");
+const op = @import("../exec/op.zig");
 
 const Batch = batchmod.Batch;
 
@@ -232,6 +233,11 @@ pub const StreamLoadSink = struct {
     /// Set by the runtime after open(): error diagnostics go through the
     /// structured logger; null (tests/embedded) falls back to raw stderr.
     logger: ?*obs.Logger = null,
+    /// Also set by the runtime: carries the reason a load failed into the final
+    /// message. Without it the caller saw `StreamLoadFailed` while the answer —
+    /// StarRocks' own `Message`, e.g. "you need the INSERT privilege" — was only in
+    /// the log above it.
+    errctx: ?*op.ErrCtx = null,
 
     pub fn open(gpa: std.mem.Allocator, cfg: Config, table: []const u8, schema: types.Schema, mode: ast.WriteMode) !*StreamLoadSink {
         const self = try gpa.create(StreamLoadSink);
@@ -367,10 +373,48 @@ pub const StreamLoadSink = struct {
         const body = body_aw.writer.buffered();
         if (!loadSucceeded(body)) {
             obs.logOr(self.logger, .err, "stream load failed (http {d}): {s}", .{ @intFromEnum(res.status), body });
+            if (self.errctx) |ec| {
+                const why = jsonField(body, "Message") orelse jsonField(body, "Status") orelse "no reason given";
+                if (jsonField(body, "ErrorURL")) |u|
+                    ec.set("stream load failed: {s} (rejected rows: {s})", .{ why, u })
+                else
+                    ec.set("stream load failed: {s}", .{why});
+            }
             return error.StreamLoadFailed;
         }
     }
 };
+
+/// One string field of a flat JSON object, unescaped only as far as StarRocks'
+/// own responses need — this runs on the failure path to quote a message back, not
+/// to interpret arbitrary JSON.
+fn jsonField(body: []const u8, name: []const u8) ?[]const u8 {
+    var needle_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{name}) catch return null;
+    const at = std.mem.indexOf(u8, body, needle) orelse return null;
+    var i = at + needle.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == ':')) i += 1;
+    if (i >= body.len or body[i] != '"') return null;
+    i += 1;
+    const start = i;
+    while (i < body.len and body[i] != '"') {
+        if (body[i] == '\\') i += 1;
+        i += 1;
+    }
+    if (i > body.len) return null;
+    return body[start..@min(i, body.len)];
+}
+
+test "jsonField pulls the reason out of a StarRocks failure body" {
+    const body =
+        \\{"Status": "Fail", "Message": "Access denied; you need (at least one of) the INSERT privilege(s)", "ErrorURL": "http://cn:8040/api/_load_error_log?file=x"}
+    ;
+    try std.testing.expectEqualStrings("Fail", jsonField(body, "Status").?);
+    try std.testing.expectEqualStrings("Access denied; you need (at least one of) the INSERT privilege(s)", jsonField(body, "Message").?);
+    try std.testing.expectEqualStrings("http://cn:8040/api/_load_error_log?file=x", jsonField(body, "ErrorURL").?);
+    try std.testing.expect(jsonField(body, "Absent") == null);
+    try std.testing.expect(jsonField("{\"Status\": 7}", "Status") == null);
+}
 
 fn loadSucceeded(body: []const u8) bool {
     return std.mem.indexOf(u8, body, "Success") != null or

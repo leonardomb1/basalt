@@ -357,6 +357,7 @@ const StarrocksSinkSpec = struct {
     schema: types.Schema,
     mode: ast.WriteMode,
     logger: ?*obs.Logger = null,
+    errctx: ?*op.ErrCtx = null,
 };
 
 /// `parallel.OpenSinkFn`: one StarRocks stream-load stream per lane.
@@ -368,6 +369,7 @@ fn openLaneStarrocksSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx: 
     cfg.label_prefix = lp;
     const s = try starrocks.StreamLoadSink.open(gpa, cfg, spec.target, spec.schema, spec.mode);
     s.logger = spec.logger;
+    s.errctx = spec.errctx;
     return s.sink();
 }
 
@@ -489,14 +491,15 @@ fn buildStarrocksSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*Starrock
     cfg.run_id = if (cfg.run_id != 0) cfg.run_id else @intCast(std.time.milliTimestamp());
 
     const setup = starrocks.StreamLoadSink.open(env.gpa, cfg, w.target, schema, w.mode) catch |e|
-        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "starrocks setup failed ({s}) — {s}", .{ @errorName(e), env.diag.msg }));
+        return srOpenErr(env, e, "starrocks setup failed");
     setup.logger = env.log;
+    setup.errctx = env.errctx;
     setup.sink().close() catch |e|
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "starrocks setup close failed: {s}", .{@errorName(e)}));
     cfg.auto_create = false;
 
     const spec = try env.arena.create(StarrocksSinkSpec);
-    spec.* = .{ .cfg = cfg, .target = w.target, .schema = schema, .mode = if (w.mode == .overwrite) .append else w.mode, .logger = env.log };
+    spec.* = .{ .cfg = cfg, .target = w.target, .schema = schema, .mode = if (w.mode == .overwrite) .append else w.mode, .logger = env.log, .errctx = env.errctx };
     return spec;
 }
 
@@ -5391,8 +5394,9 @@ fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (std.mem.eql(u8, conn.connector, "starrocks")) {
         const cfg = try resolveStarrocksConfig(env, conn);
         const s = starrocks.StreamLoadSink.open(env.gpa, cfg, w.target, schema, w.mode) catch |e|
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "starrocks sink open failed ({s}) — {s}", .{ @errorName(e), env.diag.msg }));
+            return srOpenErr(env, e, "starrocks sink open failed");
         s.logger = env.log;
+        s.errctx = env.errctx;
         return s.sink();
     }
     if (sqlConnInfo(conn)) |info| {
@@ -5603,6 +5607,17 @@ fn setMsg(diag: *Diag, msg: []const u8) void {
     const n = @min(msg.len, diag.buf.len);
     @memcpy(diag.buf[0..n], msg[0..n]);
     diag.msg = diag.buf[0..n];
+}
+
+/// A StarRocks open failure. The reason is appended only when there is one: a
+/// dangling em-dash with nothing after it reads as truncated output, which is what
+/// this printed whenever the failure carried no diagnostic of its own.
+fn srOpenErr(env: *Env, e: anyerror, comptime what: []const u8) error{PlanFailed} {
+    const msg = if (env.diag.msg.len == 0)
+        std.fmt.allocPrint(env.arena, what ++ " ({s})", .{@errorName(e)}) catch what
+    else
+        std.fmt.allocPrint(env.arena, what ++ " ({s}) — {s}", .{ @errorName(e), env.diag.msg }) catch what;
+    return planErr(env.diag, msg);
 }
 
 fn planErr(diag: *Diag, msg: []const u8) error{PlanFailed} {
