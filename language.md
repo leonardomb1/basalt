@@ -164,8 +164,11 @@ the stronger of the two, not the weaker.
 `ERP_PASS` from the environment at connect time — the common case costs zero
 characters. Explicit `user = ...` / `password = ...` options override the
 convention. Azure Blob paths (`az://...`, §5) resolve `AZURE_STORAGE_KEY`, and
-`AZURE_BLOB_ENDPOINT` points them at an emulator. Secrets are never literals
-in the script; always environment indirection.
+`AZURE_BLOB_ENDPOINT` points them at an emulator. S3 paths (`s3://...`, §5)
+resolve `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ optional
+`AWS_SESSION_TOKEN`, `AWS_REGION`), and `AWS_ENDPOINT_URL` points them at an
+emulator such as MinIO. Secrets are never literals in the script; always
+environment indirection.
 
 `CREATE OR REPLACE CONNECTION` re-declares an existing name.
 
@@ -183,7 +186,8 @@ AS
 
 - File target by quoted path — the extension picks the writer:
   `LOAD INTO '/out/x.csv'`, `LOAD INTO '/out/x.parquet'`, or an object-store
-  path `LOAD INTO 'az://account/container/bronze/x.parquet'`.
+  path `LOAD INTO 'az://account/container/bronze/x.parquet'` or
+  `LOAD INTO 's3://bucket/bronze/x.parquet'`.
 - A per-row dynamic target uses `IDENTIFIER(<string-expr>)` over loop vars
   (§7): `LOAD INTO sr.IDENTIFIER('crm_' || lower($name)) ...`.
 - Dispositions on a **table target**: `APPEND` (default, omissible) · `REPLACE`
@@ -197,8 +201,8 @@ AS
   opened without truncating and the header row is written only when it was
   absent or empty. Explicit `APPEND` is a plan-time error for `.parquet` (the
   footer indexes every row group and is written last, so appending means
-  rewriting the file) and for `az://` (a blob is replaced on write, never
-  extended) — use `REPLACE`, a per-run path, or `INTO BUFFER` (§8).
+  rewriting the file) and for `az://` / `s3://` (an object is replaced on
+  write, never extended) — use `REPLACE`, a per-run path, or `INTO BUFFER` (§8).
 - `SPLIT BY (col)` parallelizes the load by key ranges; `JOBS n` fixes the
   lane count (otherwise the CLI `-j` applies).
 
@@ -230,7 +234,7 @@ LIMIT 100 OFFSET 20;
 | SQL table (per-row name) | `FROM erp.dbo.IDENTIFIER($name)` (§7) — still a table read |
 | raw query | `FROM erp.QUERY($$SELECT ...$$)` (no dialect translation) |
 | file — CSV or Parquet | `FROM 'path.csv'` / `FROM 'path.parquet'` — the extension picks the reader; local or HTTPS URL |
-| object storage | `FROM 'az://account/container/path.parquet'`; a trailing `/` reads every blob under the prefix as one table |
+| object storage | `FROM 'az://account/container/path.parquet'` or `FROM 's3://bucket/key.parquet'`; a trailing `/` reads every object under the prefix as one table |
 | REST (connection) | `FROM crm.'/v1/customers'` (path on the conn's base URL) |
 | REST (bare URL) | `FROM HTTP('https://host/api/x')` |
 | request body | `FROM BODY (col TYPE [NOT NULL], ...)` (§8) |
@@ -242,7 +246,7 @@ LIMIT 100 OFFSET 20;
 
 Parquet reads use column projection, row-group skipping from statistics, and
 ranged reads — only the footer and the chunks a query needs are fetched. A
-remote `.parquet` (`https://...`, `az://...`) is read the same way, by HTTP
+remote `.parquet` (`https://...`, `az://...`, `s3://...`) is read the same way, by HTTP
 range request, so a projected query transfers only the chunks it decodes; a
 server that ignores `Range` falls back to one whole-object fetch. Parquet writes
 store `DECIMAL` in the narrowest physical type its precision allows — INT32 to 9

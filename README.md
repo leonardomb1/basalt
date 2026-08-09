@@ -43,7 +43,7 @@ $ ./zig-out/bin/basalt help
 | | |
 |---|---|
 | **Files** | CSV and Parquet, local or over HTTP — the extension picks the format |
-| **Object storage** | `az://account/container/path` (Azure Blob / ADLS Gen2). A trailing `/` reads every blob under that prefix as one table |
+| **Object storage** | `az://account/container/path` (Azure Blob / ADLS Gen2) or `s3://bucket/key` (S3, MinIO). A trailing `/` reads every object under that prefix as one table |
 | **Databases** | PostgreSQL, MySQL, SQL Server, StarRocks |
 | **HTTP** | paginated REST sources; serve a pipeline as an endpoint |
 | **Buffer** | a durable WAL buffer, replayed by a later run |
