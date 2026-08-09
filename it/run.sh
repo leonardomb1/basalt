@@ -528,20 +528,33 @@ SELECT id, name, amt, flag FROM 'src/connect/testdata/$c.parquet' ORDER BY id;";
     report "parquet-write (run error)" bad
   fi
 
-  # Decimals wider than the INT64 storage must fail, not saturate. `12.5` in a
-  # DECIMAL(38,18) column restates to 1.25e19, and clamping wrote
-  # 9.223372036854775807 into the file; DECIMAL(30,20) clamped its precision to
-  # 18 and emitted scale > precision, which no other reader accepts.
+  # Decimals past 18 digits need FIXED_LEN_BYTE_ARRAY: `12.5` in a DECIMAL(38,18)
+  # column restates to 1.25e19, which INT64 cannot hold — it was first clamped to
+  # 9.223372036854775807 and then rejected outright. DECIMAL(30,20) additionally
+  # used to emit scale > precision, a schema no reader accepts.
   printf 'v\n12.5\n' >"$out/dec_in.csv"
-  rm -f "$out/dec_wide.parquet" "$out/dec_badscale.parquet"
-  if $B run -q -c "LOAD INTO '$out/dec_wide.parquet' AS SELECT CAST(v AS DECIMAL(38,18)) AS d FROM '$out/dec_in.csv';" >"$out/dec_wide.log" 2>&1 ||
-     $B run -q -c "LOAD INTO '$out/dec_badscale.parquet' AS SELECT CAST(v AS DECIMAL(30,20)) AS d FROM '$out/dec_in.csv';" >>"$out/dec_wide.log" 2>&1; then
-    report "parquet-decimal-overflow (a lossy write was accepted)" bad
-  elif grep -q "UnsupportedParquetDecimal" "$out/dec_wide.log"; then
-    report parquet-decimal-overflow ok
+  if brun run -c "LOAD INTO '$out/dec_wide.parquet' AS SELECT CAST(v AS DECIMAL(38,18)) AS d FROM '$out/dec_in.csv';" &&
+     brun run -c "LOAD INTO '$out/dec_wide.csv' AS SELECT * FROM '$out/dec_wide.parquet';" &&
+     brun run -c "LOAD INTO '$out/dec_badscale.parquet' AS SELECT CAST(v AS DECIMAL(30,20)) AS d FROM '$out/dec_in.csv';" &&
+     brun run -c "LOAD INTO '$out/dec_badscale.csv' AS SELECT * FROM '$out/dec_badscale.parquet';"; then
+    { echo "d"; echo "12.500000000000000000"; } >"$out/dec_wide_expected.csv"
+    check parquet-decimal-wide "$out/dec_wide.csv" "$out/dec_wide_expected.csv"
+    { echo "d"; echo "12.50000000000000000000"; } >"$out/dec_badscale_expected.csv"
+    check parquet-decimal-scale-over-18 "$out/dec_badscale.csv" "$out/dec_badscale_expected.csv"
   else
-    report "parquet-decimal-overflow (wrong message)" bad
-    head -3 "$out/dec_wide.log"
+    report "parquet-decimal-wide (run error)" bad
+  fi
+
+  # scale > precision is still no DECIMAL at all, and must say so rather than
+  # writing a schema Spark and Arrow reject.
+  rm -f "$out/dec_impossible.parquet"
+  if $B run -q -c "LOAD INTO '$out/dec_impossible.parquet' AS SELECT CAST(v AS DECIMAL(10,12)) AS d FROM '$out/dec_in.csv';" >"$out/dec_bad.log" 2>&1; then
+    report "parquet-decimal-impossible (scale > precision was accepted)" bad
+  elif grep -q "UnsupportedParquetDecimal" "$out/dec_bad.log"; then
+    report parquet-decimal-impossible ok
+  else
+    report "parquet-decimal-impossible (wrong message)" bad
+    head -3 "$out/dec_bad.log"
   fi
 
   # …while a decimal that does fit still round-trips unchanged.
@@ -609,6 +622,15 @@ SELECT name, COUNT(*) AS n, SUM(val) AS s FROM '$out/vol.parquet' GROUP BY name 
       check parquet-interop "$out/parquet_duck.csv" it/expected.csv
     else
       report "parquet-interop (duckdb could not read basalt output)" bad
+    fi
+
+    # Our own reader agreeing with our own writer proves little about a
+    # FIXED_LEN_BYTE_ARRAY decimal — the byte order and width are exactly what a
+    # second implementation has to confirm.
+    if "$DUCK" -c "COPY (SELECT d FROM '$out/dec_wide.parquet') TO '$out/dec_duck.csv' (FORMAT CSV, HEADER);" >/dev/null 2>&1; then
+      check parquet-decimal-wide-interop "$out/dec_duck.csv" "$out/dec_wide_expected.csv"
+    else
+      report "parquet-decimal-wide-interop (duckdb could not read the decimal)" bad
     fi
 
     # Reading it back is not enough: duckdb walks page headers and so tolerates

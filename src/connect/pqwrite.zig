@@ -37,9 +37,9 @@ pub const Error = error{
     /// A parquet file cannot be extended: the footer indexes every row group and
     /// is written last, so adding rows means rewriting the file.
     AppendNotSupported,
-    /// A DECIMAL column this writer cannot store: scale above precision (which no
-    /// reader accepts), or a value needing more than the 18 digits INT64 holds.
-    /// Wider decimals need the FIXED_LEN_BYTE_ARRAY physical type, unimplemented.
+    /// A DECIMAL column this writer cannot store: scale above precision (which
+    /// no reader accepts), or a value too wide for the column's own precision —
+    /// 38 digits being the ceiling, since the unscaled value is an i128.
     UnsupportedParquetDecimal,
 } || std.mem.Allocator.Error || codec.Error;
 
@@ -57,6 +57,8 @@ const Mapping = struct {
     converted: ?i32 = null,
     precision: ?i32 = null,
     scale: ?i32 = null,
+    /// Byte width of a FIXED_LEN_BYTE_ARRAY column (schema field 2).
+    type_length: ?i32 = null,
     /// REQUIRED columns carry no definition levels at all, which is both smaller
     /// and truer to the source schema than marking everything OPTIONAL.
     optional: bool = true,
@@ -78,18 +80,38 @@ fn mapType(t: types.Type) Error!Mapping {
         .date => .{ .phys = .int32, .converted = conv_date },
         .time => .{ .phys = .int64, .converted = conv_time_micros },
         .timestamp => .{ .phys = .int64, .converted = conv_timestamp_micros },
-        // DECIMAL as INT64 covers precision up to 18, which is what basalt's
-        // own decimal handling produces in practice.
+        // The physical type follows the real precision, as the spec prescribes:
+        // INT32 to 9 digits, INT64 to 18, FIXED_LEN_BYTE_ARRAY beyond. Storing
+        // everything as INT64 meant a `numeric(38,18)` could not hold its own
+        // values — `12.5` restated to scale 18 is 1.25e19, past i64.
         .decimal => blk: {
-            const p: i32 = @min(18, @as(i32, t.precision));
-            // scale > precision is not a representable DECIMAL — Spark and Arrow
-            // both reject the schema — and clamping precision to 18 is what
-            // produces it from e.g. `numeric(30,20)`.
-            if (@as(i32, t.scale) > p) return Error.UnsupportedParquetDecimal;
-            break :blk .{ .phys = .int64, .converted = conv_decimal, .precision = p, .scale = t.scale };
+            // 38 digits is the engine's ceiling too: the unscaled value is an
+            // i128. Postgres allows more, and clamping is what its driver does.
+            const p: i32 = @max(1, @min(38, @as(i32, t.precision)));
+            // scale > precision is not a representable DECIMAL — Spark and
+            // Arrow both reject the schema.
+            const s: i32 = @as(i32, t.scale);
+            if (s > p) return Error.UnsupportedParquetDecimal;
+            if (p <= 9) break :blk .{ .phys = .int32, .converted = conv_decimal, .precision = p, .scale = s };
+            if (p <= 18) break :blk .{ .phys = .int64, .converted = conv_decimal, .precision = p, .scale = s };
+            break :blk .{ .phys = .fixed_len_byte_array, .converted = conv_decimal, .precision = p, .scale = s, .type_length = flbaLen(p) };
         },
         .array, .@"struct" => Error.UnsupportedParquetWrite,
     };
+}
+
+/// Narrowest two's-complement byte width that holds every `p`-digit decimal —
+/// the width readers expect for a FIXED_LEN_BYTE_ARRAY DECIMAL. 16 at p = 38.
+fn flbaLen(p: i32) i32 {
+    var limit: i128 = 1; // 10^p
+    var k: i32 = 0;
+    while (k < p) : (k += 1) limit *= 10;
+    var n: i32 = 1;
+    while (n < 16) : (n += 1) {
+        const span: i128 = @as(i128, 1) << @intCast(8 * n - 1); // 2^(8n-1)
+        if (span >= limit) return n;
+    }
+    return 16;
 }
 
 /// Distinct values a column may hold before dictionary encoding is abandoned.
@@ -697,6 +719,7 @@ fn statBytes(arena: std.mem.Allocator, m: Mapping, v: Value) !?[]const u8 {
             const x: i32 = switch (v) {
                 .date => |d| d,
                 .int => |i| @intCast(i),
+                .decimal => |d| try rescaleTo(i32, d, m.scale orelse 0),
                 else => 0,
             };
             std.mem.writeInt(i32, b[0..4], x, .little);
@@ -708,10 +731,24 @@ fn statBytes(arena: std.mem.Allocator, m: Mapping, v: Value) !?[]const u8 {
                 .int => |i| i,
                 .time => |i| i,
                 .timestamp => |i| i,
-                .decimal => |d| try rescale(d, m.scale orelse 0),
+                .decimal => |d| try rescaleTo(i64, d, m.scale orelse 0),
                 else => 0,
             };
             std.mem.writeInt(i64, b[0..8], x, .little);
+            return b;
+        },
+        // Decimal FLBA statistics are compared as signed decimals, which is the
+        // order `observe` already tracked them in, so the same big-endian
+        // encoding the pages use is what belongs here.
+        .fixed_len_byte_array => {
+            const len: usize = @intCast(m.type_length orelse return null);
+            const x: i128 = switch (v) {
+                .decimal => |d| try rescale(d, m.scale orelse 0),
+                .int => |i| i,
+                else => return null,
+            };
+            const b = try arena.alloc(u8, len);
+            try decimalBytes(b, x);
             return b;
         },
         .double => {
@@ -743,6 +780,7 @@ fn writeSchemaRoot(w: *thrift.Writer, children: usize) !void {
 fn writeSchemaLeaf(w: *thrift.Writer, name: []const u8, m: Mapping) !void {
     try w.structBegin();
     try w.writeI32(1, @intFromEnum(m.phys));
+    if (m.type_length) |n| try w.writeI32(2, n);
     try w.writeI32(3, @intFromEnum(if (m.optional) pq.Repetition.optional else pq.Repetition.required));
     try w.writeBinary(4, name);
     if (m.converted) |c| try w.writeI32(6, c);
@@ -856,6 +894,7 @@ fn encodePlain(cb: *ColBuf, m: Mapping, v: Value) !void {
             const x: i32 = switch (v) {
                 .date => |d| d,
                 .int => |i| @intCast(i),
+                .decimal => |d| try rescaleTo(i32, d, m.scale orelse 0),
                 else => 0,
             };
             var b: [4]u8 = undefined;
@@ -867,12 +906,24 @@ fn encodePlain(cb: *ColBuf, m: Mapping, v: Value) !void {
                 .int => |i| i,
                 .time => |i| i,
                 .timestamp => |i| i,
-                .decimal => |d| try rescale(d, m.scale orelse 0),
+                .decimal => |d| try rescaleTo(i64, d, m.scale orelse 0),
                 else => 0,
             };
             var b: [8]u8 = undefined;
             std.mem.writeInt(i64, &b, x, .little);
             try cb.values.appendSlice(&b);
+        },
+        .fixed_len_byte_array => {
+            const len: usize = @intCast(m.type_length orelse return Error.UnsupportedParquetDecimal);
+            const x: i128 = switch (v) {
+                .decimal => |d| try rescale(d, m.scale orelse 0),
+                .int => |i| i,
+                else => 0,
+            };
+            var b: [16]u8 = undefined;
+            if (len > b.len) return Error.UnsupportedParquetDecimal;
+            try decimalBytes(b[0..len], x);
+            try cb.values.appendSlice(b[0..len]);
         },
         .double => {
             const x: f64 = switch (v) {
@@ -901,15 +952,38 @@ fn encodePlain(cb: *ColBuf, m: Mapping, v: Value) !void {
 
 /// Decimal values may carry a scale different from the column's; Parquet stores
 /// the unscaled integer against the schema's scale, so it has to be restated.
-/// A value too wide for INT64 is an error, not a saturated one: clamping turned
-/// `12.5` in a `numeric(38,18)` column into `9.223372036854775807`.
-fn rescale(d: valuemod.Decimal, want: i32) Error!i64 {
+/// The result is the full i128 — how many bytes it lands in is the physical
+/// type's business. Overflowing i128 is an error, not a saturated one: clamping
+/// turned `12.5` in a `numeric(38,18)` column into `9.223372036854775807`.
+fn rescale(d: valuemod.Decimal, want: i32) Error!i128 {
     var unscaled: i128 = d.unscaled;
     var have: i32 = d.scale;
     while (have < want) : (have += 1)
         unscaled = std.math.mul(i128, unscaled, 10) catch return Error.UnsupportedParquetDecimal;
     while (have > want) : (have -= 1) unscaled = @divTrunc(unscaled, 10);
-    return std.math.cast(i64, unscaled) orelse Error.UnsupportedParquetDecimal;
+    return unscaled;
+}
+
+/// The restated unscaled value narrowed to the column's storage width.
+fn rescaleTo(comptime T: type, d: valuemod.Decimal, want: i32) Error!T {
+    return std.math.cast(T, try rescale(d, want)) orelse Error.UnsupportedParquetDecimal;
+}
+
+/// Big-endian two's complement in exactly `len` bytes, which is how Parquet
+/// stores a FIXED_LEN_BYTE_ARRAY decimal. Errors rather than truncating a value
+/// the declared precision cannot hold.
+fn decimalBytes(b: []u8, x: i128) Error!void {
+    if (b.len == 0 or b.len > 16) return Error.UnsupportedParquetDecimal;
+    var v = x;
+    var i = b.len;
+    while (i > 0) : (i -= 1) {
+        b[i - 1] = @truncate(@as(u128, @bitCast(v)));
+        v >>= 8;
+    }
+    // Everything above the stored bytes must be pure sign extension, or the
+    // value did not fit.
+    if (v != (if (x < 0) @as(i128, -1) else 0)) return Error.UnsupportedParquetDecimal;
+    if ((b[0] & 0x80 != 0) != (x < 0)) return Error.UnsupportedParquetDecimal;
 }
 
 const sink_vtable = driver.Sink.VTable{
@@ -946,6 +1020,7 @@ test "basalt types map onto Parquet physical and converted types" {
     const dec = try mapType(types.Type.decimal(10, 2));
     try testing.expectEqual(pq.PhysicalType.int64, dec.phys);
     try testing.expectEqual(@as(?i32, 2), dec.scale);
+    try testing.expectEqual(@as(?i32, 10), dec.precision);
 
     // nested types have no representation and must be refused, not guessed
     try testing.expectError(Error.UnsupportedParquetWrite, mapType(types.Type.init(.array)));
@@ -968,31 +1043,77 @@ test "definition levels pack LSB-first into bit-packed groups of eight" {
 }
 
 test "decimal rescaling restates the unscaled value against the column scale" {
-    try testing.expectEqual(@as(i64, 1550), try rescale(.{ .unscaled = 155, .scale = 1 }, 2));
-    try testing.expectEqual(@as(i64, 155), try rescale(.{ .unscaled = 155, .scale = 2 }, 2));
+    try testing.expectEqual(@as(i128, 1550), try rescale(.{ .unscaled = 155, .scale = 1 }, 2));
+    try testing.expectEqual(@as(i128, 155), try rescale(.{ .unscaled = 155, .scale = 2 }, 2));
     // reducing scale truncates, matching the direction Parquet writers take
-    try testing.expectEqual(@as(i64, 15), try rescale(.{ .unscaled = 155, .scale = 2 }, 1));
-}
-
-test "decimal rescaling fails loudly instead of saturating to i64" {
-    // `12.5` in a numeric(38,18) column: 125 at scale 1 restated to scale 18 is
-    // 1.25e19, past i64. Clamping wrote 9.223372036854775807 into the file.
-    try testing.expectError(Error.UnsupportedParquetDecimal, rescale(.{ .unscaled = 125, .scale = 1 }, 18));
-    try testing.expectError(Error.UnsupportedParquetDecimal, rescale(.{ .unscaled = -125, .scale = 1 }, 18));
-    // The intermediate must not overflow i128 either.
+    try testing.expectEqual(@as(i128, 15), try rescale(.{ .unscaled = 155, .scale = 2 }, 1));
+    // `12.5` in a numeric(38,18) column is 1.25e19 unscaled — past i64, which is
+    // exactly why that column is not stored as one.
+    try testing.expectEqual(@as(i128, 12_500_000_000_000_000_000), try rescale(.{ .unscaled = 125, .scale = 1 }, 18));
+    // Overflowing i128 is still an error rather than a saturated value.
     try testing.expectError(Error.UnsupportedParquetDecimal, rescale(.{ .unscaled = std.math.maxInt(i64), .scale = 0 }, 30));
-    // The widest value INT64 does hold still goes through.
-    try testing.expectEqual(@as(i64, std.math.maxInt(i64)), try rescale(.{ .unscaled = std.math.maxInt(i64), .scale = 0 }, 0));
+    // Narrowing to the storage width is the physical type's check.
+    try testing.expectError(Error.UnsupportedParquetDecimal, rescaleTo(i64, .{ .unscaled = 125, .scale = 1 }, 18));
+    try testing.expectEqual(@as(i64, std.math.maxInt(i64)), try rescaleTo(i64, .{ .unscaled = std.math.maxInt(i64), .scale = 0 }, 0));
 }
 
-test "mapType rejects a decimal whose scale exceeds the stored precision" {
-    // numeric(30,20) clamps to precision 18, and DECIMAL(18,20) is not a schema
-    // any reader accepts.
-    try testing.expectError(Error.UnsupportedParquetDecimal, mapType(types.Type.decimal(30, 20)));
+test "the physical type follows the decimal's real precision" {
+    // INT32 to 9 digits, INT64 to 18, FIXED_LEN_BYTE_ARRAY beyond. Everything
+    // used to be INT64 at a precision clamped to 18, which could not hold the
+    // column's own values.
+    const small = try mapType(types.Type.decimal(9, 2));
+    try testing.expectEqual(pq.PhysicalType.int32, small.phys);
+    try testing.expectEqual(@as(?i32, 9), small.precision);
+
+    const mid = try mapType(types.Type.decimal(18, 4));
+    try testing.expectEqual(pq.PhysicalType.int64, mid.phys);
+    try testing.expectEqual(@as(?i32, 18), mid.precision);
+
+    const wide = try mapType(types.Type.decimal(38, 18));
+    try testing.expectEqual(pq.PhysicalType.fixed_len_byte_array, wide.phys);
+    try testing.expectEqual(@as(?i32, 38), wide.precision);
+    try testing.expectEqual(@as(?i32, 18), wide.scale);
+    try testing.expectEqual(@as(?i32, 16), wide.type_length);
+
+    // A precision that no longer gets clamped means scale <= precision holds,
+    // so numeric(30,20) is representable now instead of emitting DECIMAL(18,20).
+    const nc = try mapType(types.Type.decimal(30, 20));
+    try testing.expectEqual(@as(?i32, 30), nc.precision);
+    try testing.expectEqual(@as(?i32, 20), nc.scale);
+
+    // scale > precision is still no schema at all.
     try testing.expectError(Error.UnsupportedParquetDecimal, mapType(types.Type.decimal(10, 12)));
-    const ok = try mapType(types.Type.decimal(38, 6));
-    try testing.expectEqual(@as(?i32, 18), ok.precision);
-    try testing.expectEqual(@as(?i32, 6), ok.scale);
+    try testing.expectError(Error.UnsupportedParquetWrite, mapType(types.Type.init(.array)));
+}
+
+test "flba widths and big-endian two's complement match what readers expect" {
+    try testing.expectEqual(@as(i32, 16), flbaLen(38));
+    try testing.expectEqual(@as(i32, 13), flbaLen(30));
+    try testing.expectEqual(@as(i32, 9), flbaLen(20));
+    try testing.expectEqual(@as(i32, 1), flbaLen(2));
+
+    var b: [4]u8 = undefined;
+    try decimalBytes(&b, 1);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1 }, &b);
+    try decimalBytes(&b, -1);
+    try testing.expectEqualSlices(u8, &.{ 0xFF, 0xFF, 0xFF, 0xFF }, &b);
+    try decimalBytes(&b, -2);
+    try testing.expectEqualSlices(u8, &.{ 0xFF, 0xFF, 0xFF, 0xFE }, &b);
+
+    // and the reader turns them back into the same number
+    var wide: [16]u8 = undefined;
+    const x: i128 = 12_500_000_000_000_000_000;
+    try decimalBytes(&wide, x);
+    var acc: i128 = if (wide[0] & 0x80 != 0) -1 else 0;
+    for (wide) |byte| acc = (acc << 8) | byte;
+    try testing.expectEqual(x, acc);
+
+    // a value the declared width cannot hold is refused, not truncated
+    var one: [1]u8 = undefined;
+    try testing.expectError(Error.UnsupportedParquetDecimal, decimalBytes(&one, 128));
+    try testing.expectError(Error.UnsupportedParquetDecimal, decimalBytes(&one, -129));
+    try decimalBytes(&one, -128);
+    try testing.expectEqual(@as(u8, 0x80), one[0]);
 }
 
 // Writes a file, reads it back with our own reader, and compares. Exercises
