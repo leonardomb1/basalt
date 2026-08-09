@@ -1033,7 +1033,10 @@ fn usage(w: anytype) !void {
         \\  see language.md for the dialect
         \\
         \\sources and sinks:
-        \\  files      CSV and Parquet, by path or URL — the extension picks the format
+        \\  files      CSV and Parquet, by path or URL — the extension picks the format;
+        \\             another extension needs WITH (format = 'csv'|'parquet').
+        \\             WITH (delimiter = ';', encoding = 'latin1') for non-comma,
+        \\             non-UTF-8 CSV (also cp1252; delimiter works on a sink too)
         \\  object     az://<account>/<container>/<path> or s3://<bucket>/<key>, and a
         \\             trailing / reads every object under that prefix as one table
         \\  databases  postgres, mysql, sqlserver, starrocks (CREATE CONNECTION ... TYPE ...)
