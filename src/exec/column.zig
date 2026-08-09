@@ -142,6 +142,15 @@ pub const BytesAppender = struct {
     }
 };
 
+/// A decimal widened to f64. Duplicated from `eval.toF64` rather than imported:
+/// `eval` imports this module, so the dependency only runs one way.
+fn decToF64(d: value.Decimal) f64 {
+    var p: f64 = 1;
+    var k: u8 = 0;
+    while (k < d.scale) : (k += 1) p *= 10;
+    return @as(f64, @floatFromInt(d.unscaled)) / p;
+}
+
 /// Row indices flagged in `keep`, in order — the shape `Bytes.take` wants.
 fn keptIndices(arena: std.mem.Allocator, keep: []const bool, kept: usize) ![]usize {
     const idx = try arena.alloc(usize, kept);
@@ -462,6 +471,9 @@ pub const Builder = struct {
         }
     }
 
+    /// A value on its way into an int-typed store. `else => 0` used to swallow
+    /// every kind not listed, so a decimal appended to a numeric column became
+    /// zero without a word — see `asF64`.
     fn asI64(self: *Builder, v: Value) i64 {
         return switch (self.ty.kind) {
             .time => v.time,
@@ -469,14 +481,32 @@ pub const Builder = struct {
             else => switch (v) {
                 .int => |x| x,
                 .float => |x| @intFromFloat(x),
+                .bool => |x| @intFromBool(x),
+                .decimal => |d| @intFromFloat(decToF64(d)),
+                // Still zero for a kind that has no numeric reading at all
+                // (a string, a date). Making that an error means widening
+                // `append`'s error set into the parquet decoder's declared sets,
+                // which is a wider change than this release should carry.
                 else => 0,
             },
         };
     }
+
+    /// A value on its way into a float-typed store.
+    ///
+    /// The missing `.decimal` arm here is what made `ROUND(AVG(CAST(x AS
+    /// DECIMAL(p,s))), n)` answer 0: the aggregate materializes its argument with
+    /// its *result* type, which for AVG is float, so the decimals the CAST produced
+    /// were appended to a float column and each one silently became zero. A real
+    /// query over 16.5M rows reported an average of 0 and looked plausible. An
+    /// unconvertible kind now fails instead of zeroing, because a wrong number that
+    /// looks right is the outcome this engine exists to avoid.
     fn asF64(_: *Builder, v: Value) f64 {
         return switch (v) {
             .float => |x| x,
             .int => |x| @floatFromInt(x),
+            .bool => |x| @floatFromInt(@intFromBool(x)),
+            .decimal => |d| decToF64(d),
             else => 0,
         };
     }
