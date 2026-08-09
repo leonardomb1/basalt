@@ -1034,8 +1034,8 @@ fn usage(w: anytype) !void {
         \\
         \\sources and sinks:
         \\  files      CSV and Parquet, by path or URL — the extension picks the format
-        \\  object     az://<account>/<container>/<path>, and a trailing / reads every
-        \\             blob under that prefix as one table
+        \\  object     az://<account>/<container>/<path> or s3://<bucket>/<key>, and a
+        \\             trailing / reads every object under that prefix as one table
         \\  databases  postgres, mysql, sqlserver, starrocks (CREATE CONNECTION ... TYPE ...)
         \\  http       REST sources and sinks; `request` for an HTTP request body
         \\  buffer     durable WAL buffer, replayed by a later run
@@ -1043,15 +1043,20 @@ fn usage(w: anytype) !void {
         \\credentials:
         \\  a connection named `erp` reads ERP_USER / ERP_PASS from the environment;
         \\  explicit user = ... / password = ... override it. Azure uses AZURE_STORAGE_KEY
-        \\  (and AZURE_BLOB_ENDPOINT to point at an emulator).
+        \\  (and AZURE_BLOB_ENDPOINT to point at an emulator); S3 uses AWS_ACCESS_KEY_ID /
+        \\  AWS_SECRET_ACCESS_KEY (+ AWS_SESSION_TOKEN, AWS_REGION, and AWS_ENDPOINT_URL
+        \\  for MinIO and friends).
         \\
         \\options:
         \\  -p, --param k=v    bind a PARAM declared by the script (repeatable)
-        \\  -j, --threads N    parallelism: key-range lanes for splittable SQL reads, and
-        \\                     byte-range workers for CSV aggregate / distinct / top-N /
-        \\                     map-only pipelines. Parquet reads are single-threaded.
+        \\  -j, --threads N    parallelism: key-range lanes for a splittable SQL read,
+        \\                     byte-range chunks for a local CSV, and row-group morsels
+        \\                     for a Parquet — over aggregate / distinct / top-N / join /
+        \\                     map-only pipelines. `EXPLAIN` names which one a query gets.
         \\                     (default: CPU count; map output may reorder under -j>1,
-        \\                     so -j 1 is the stable-order choice)
+        \\                     so -j 1 is the stable-order choice. A float SUM is
+        \\                     reproducible for a given -j but not across values of it —
+        \\                     CAST to DECIMAL for a total that never varies.)
         \\  --port N           listen port for HTTP mode
         \\  --format FMT       table|json — stdout as machine-readable JSON: NDJSON
         \\                     rows for a SELECT, a summary object for a LOAD run
