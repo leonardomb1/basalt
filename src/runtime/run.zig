@@ -210,6 +210,10 @@ const Env = struct {
     /// `CALL` renders through the for-each machinery. Expression-form functions
     /// never reach here; expand.zig inlined them.
     fns: *const std.StringHashMap(ast.FnDecl),
+    /// The PARAMs and LETs as `${...}` interpolation bindings — the outer scope of
+    /// every loop row, and the whole scope for a statement outside any loop.
+    /// Empty when the script declares neither.
+    script_scope: LoopRow = no_loop_vars,
     /// Nesting depth of the `CALL` currently being rendered (recursion guard).
     call_depth: usize = 0,
     /// The endpoint's `INTO BUFFER` declaration, if any (dir + declared schema
@@ -569,10 +573,12 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var batch_arena = std.heap.ArenaAllocator.init(gpa);
     defer batch_arena.deinit();
 
+    env.script_scope = try buildScriptScope(arena, &params);
+
     var stats = Stats{ .run_id = run_id };
     var lanes_used: usize = 1;
     for (program.stmts[1..]) |s| switch (s) {
-        .output => |p| try runOutput(&env, p, opts, &stats, &lanes_used, &batch_arena),
+        .output => |p| try runOutput(&env, try renderScriptScope(&env, p), opts, &stats, &lanes_used, &batch_arena),
         .explain => |e| try runExplain(&env, e, opts, &stats, &lanes_used, &batch_arena),
         .for_each => |fe| try runForEach(&env, fe, opts, &stats, &lanes_used, &batch_arena),
         .match => |m| try runStmtMatch(&env, m, opts, &stats, &lanes_used, &batch_arena),
@@ -669,7 +675,7 @@ fn runStmtMatch(env: *Env, m: ast.StmtMatch, opts: RunOptions, stats: *Stats, la
 /// the env and runs output / for-each / nested match.
 fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     switch (s.*) {
-        .output => |p| try runOutput(env, p, opts, stats, lanes_used, batch_arena),
+        .output => |p| try runOutput(env, try renderScriptScope(env, p), opts, stats, lanes_used, batch_arena),
         .explain => |e| try runExplain(env, e, opts, stats, lanes_used, batch_arena),
         .for_each => |fe| try runForEach(env, fe, opts, stats, lanes_used, batch_arena),
         .match => |mm| try runStmtMatch(env, mm, opts, stats, lanes_used, batch_arena),
@@ -3203,9 +3209,41 @@ const LoopRow = struct {
     names: []const []const u8,
     types: []const ?types.Type = &.{},
     cells: Row,
+    /// Script scope — the PARAMs and LETs — searched after this row's own names,
+    /// which is what makes the innermost binding win (§9's scope rule).
+    ///
+    /// It is deliberately consulted by the *string* interpolation only, never by
+    /// `renderExpr`'s bare-name folding: `$p` in an expression is already a folded
+    /// literal by the time a pipeline runs (expand.zig did it), and a bare name
+    /// here is a column, so folding script scope into expressions would let a
+    /// param quietly displace a same-named column. A `${...}` hole is the one
+    /// place the value is still a needle in a string.
+    outer: ?*const LoopRow = null,
 
     fn typeAt(self: LoopRow, i: usize) ?types.Type {
         return if (i < self.types.len) self.types[i] else null;
+    }
+
+    /// This row's bindings followed by every enclosing scope's, in lookup order.
+    fn appendScope(
+        self: LoopRow,
+        arena: std.mem.Allocator,
+        names: *std.array_list.Managed([]const u8),
+        vals: *std.array_list.Managed(Value),
+    ) !void {
+        for (self.names, self.cells, 0..) |nm, cell, i| {
+            try names.append(nm);
+            try vals.append(loopValue(arena, cell, self.typeAt(i)));
+        }
+        if (self.outer) |o| try o.appendScope(arena, names, vals);
+    }
+
+    /// The text bound to a bare `${name}`, searching this row then outwards.
+    fn lookup(self: LoopRow, name: []const u8) ?[]const u8 {
+        for (self.names, self.cells) |nm, val| {
+            if (std.mem.eql(u8, nm, name)) return val;
+        }
+        return if (self.outer) |o| o.lookup(name) else null;
     }
 };
 
@@ -3394,15 +3432,11 @@ fn interpAll(arena: std.mem.Allocator, s: []const u8, lr: LoopRow) ![]const u8 {
             };
             const inner = s[i + 2 .. close];
             if (bareInterp(inner)) {
-                var found = false;
-                for (lr.names, lr.cells) |nm, val| {
-                    if (std.mem.eql(u8, nm, inner)) {
-                        try out.appendSlice(val);
-                        found = true;
-                        break;
-                    }
+                if (lr.lookup(inner)) |val| {
+                    try out.appendSlice(val);
+                } else {
+                    try out.appendSlice(s[i .. close + 1]);
                 }
-                if (!found) try out.appendSlice(s[i .. close + 1]);
             } else {
                 try out.appendSlice(try evalInterpExpr(arena, inner, lr));
             }
@@ -3507,9 +3541,10 @@ fn evalInterpExpr(arena: std.mem.Allocator, text: []const u8, lr: LoopRow) ![]co
         std.debug.print("[interp] ${{{s}}}: {s}\n", .{ text, why });
         return error.InterpFailed;
     }
-    const vals = try arena.alloc(Value, lr.cells.len);
-    for (lr.cells, vals, 0..) |cell, *v, i| v.* = loopValue(arena, cell, lr.typeAt(i));
-    const result = eval.constEval(arena, e, lr.names, vals) catch |err| {
+    var names = std.array_list.Managed([]const u8).init(arena);
+    var vals = std.array_list.Managed(Value).init(arena);
+    try lr.appendScope(arena, &names, &vals);
+    const result = eval.constEval(arena, e, names.items, vals.items) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         std.debug.print("[interp] ${{{s}}}: {s}\n", .{ text, @errorName(err) });
         return error.InterpFailed;
@@ -3736,7 +3771,7 @@ fn forWorker(ctx: *ForCtx, _: usize) void {
         w_env.errctx = &w_errctx;
         var st = Stats{ .run_id = 0 };
         var lanes: usize = 1;
-        const lr = LoopRow{ .names = ctx.needles, .types = ctx.fe.var_types, .cells = row };
+        const lr = LoopRow{ .names = ctx.needles, .types = ctx.fe.var_types, .cells = row, .outer = &w_env.script_scope };
         if (runForBody(&w_env, ctx.fe.body, lr, ctx.worker_opts, &st, &lanes, &w_batch)) |_| {
             _ = ctx.rows_out.fetchAdd(st.rows_out, .monotonic);
             if (ctx.outcomes) |sink| sink.record(row[0], true, "", false);
@@ -3787,6 +3822,39 @@ const max_call_depth = 16;
 
 /// No loop variables in scope — the binding a top-level `CALL` starts from.
 const no_loop_vars = LoopRow{ .names = &[_][]const u8{}, .cells = &[_][]const u8{} };
+
+/// The PARAMs and LETs as interpolation bindings, rendered to text the same way a
+/// discovery cell is. `params` already holds both by the time this runs
+/// (`resolveLets` folds LETs into it), and map order does not matter: names are
+/// unique, so a lookup finds the same binding whatever the order.
+fn buildScriptScope(arena: std.mem.Allocator, params: *std.StringHashMap(Value)) !LoopRow {
+    const n = params.count();
+    if (n == 0) return no_loop_vars;
+    const names = try arena.alloc([]const u8, n);
+    const cells = try arena.alloc([]const u8, n);
+    var i: usize = 0;
+    var it = params.iterator();
+    while (it.next()) |kv| {
+        names[i] = kv.key_ptr.*;
+        cells[i] = try eval.valueToString(arena, kv.value_ptr.*);
+        i += 1;
+    }
+    return .{ .names = names, .cells = cells };
+}
+
+/// Interpolate a statement's `${...}` holes against script scope alone — what a
+/// `LOAD INTO`/`SELECT` outside any `FOR EACH` needs, since `IDENTIFIER(...)` is
+/// lowered to a template string by the parser and a plain script had nothing to
+/// render it. Cheap to skip when the script declares no PARAM or LET, and it
+/// leaves expressions alone (see `LoopRow.outer`).
+fn renderScriptScope(env: *Env, p: ast.Pipeline) !ast.Pipeline {
+    if (env.script_scope.names.len == 0) return p;
+    return renderPipeline(env.arena, p, .{
+        .names = &[_][]const u8{},
+        .cells = &[_][]const u8{},
+        .outer = &env.script_scope,
+    });
+}
 
 /// `CALL f(a, b)` — a plan-time statement macro. The declared parameters become
 /// loop variables and the argument values their cells, so the body is rendered and
@@ -3949,7 +4017,7 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
                 // Cleared per row so a failure never reports the previous row's message.
                 env.diag.retryable = false;
                 env.diag.msg = "";
-                const lr = LoopRow{ .names = needles, .types = fe.var_types, .cells = row };
+                const lr = LoopRow{ .names = needles, .types = fe.var_types, .cells = row, .outer = &env.script_scope };
                 if (runForBody(env, fe.body, lr, opts, stats, lanes_used, batch_arena)) |_| {
                     for (env.sources.items[base..]) |sc| sc.close();
                     env.sources.shrinkRetainingCapacity(base);
@@ -5958,6 +6026,79 @@ test "param substitution filters by a CLI-bound value" {
     const out = try runScript(alloc, &tmp, script, &[_]ParamArg{.{ .key = "min", .val = "100" }});
     defer alloc.free(out);
     try std.testing.expectEqualStrings("id\n1\n2\n", out);
+}
+
+test "IDENTIFIER path: a PARAM resolves outside any FOR EACH" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n1\n2\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    // The parser lowers IDENTIFIER(...) to a `${...}` template, which only the
+    // for-each renderer used to fill in — a plain script opened the literal
+    // path `<dir>/${name}.csv` and failed with FileNotFound.
+    const script = try std.fmt.allocPrint(alloc,
+        "PARAM dir STRING DEFAULT '{s}';\nPARAM name STRING DEFAULT 'in';\n" ++
+            "LOAD INTO '{s}' AS SELECT id FROM IDENTIFIER($dir || '/' || $name || '.csv');",
+        .{ base, out_path },
+    );
+    defer alloc.free(script);
+
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id\n1\n2\n", out);
+}
+
+test "IDENTIFIER path: a LET resolves, and an expression hole sees script scope" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n7\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "LET dir = '{s}';\nPARAM name STRING DEFAULT 'IN';\n" ++
+            "LOAD INTO '{s}' AS SELECT id FROM IDENTIFIER($dir || '/' || lower($name) || '.csv');",
+        .{ base, out_path },
+    );
+    defer alloc.free(script);
+
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id\n7\n", out);
+}
+
+test "IDENTIFIER path: a loop variable shadows a same-named PARAM" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n5\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    // `name` is bound in both scopes; §9's rule is that the innermost wins, so
+    // the read must resolve to in.csv and not to the param's `absent`.
+    const script = try std.fmt.allocPrint(alloc,
+        "PARAM dir STRING DEFAULT '{s}';\nPARAM name STRING DEFAULT 'absent';\n" ++
+            "FOR EACH ROW OF (SELECT 'in' AS name) AS (name)\n" ++
+            "  LOAD INTO '{s}' AS SELECT id FROM IDENTIFIER($dir || '/' || $name || '.csv');\n" ++
+            "END FOR;",
+        .{ base, out_path },
+    );
+    defer alloc.free(script);
+
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id\n5\n", out);
 }
 
 test "explode splits a delimited column into rows" {
