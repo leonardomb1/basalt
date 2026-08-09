@@ -147,6 +147,10 @@ pub const Parser = struct {
     endpoint: ?ast.KindDecl = null,
     conn_names: std.array_list.Managed([]const u8) = undefined,
     let_names: std.array_list.Managed([]const u8) = undefined,
+    /// PARAM and LET names. `$p` parses to a plain single-part field, so this is
+    /// the only way to tell a script constant from a column at parse time — which
+    /// `constItemExpr` needs to allow one beside an aggregate.
+    const_names: std.array_list.Managed([]const u8) = undefined,
 
     fn cur(self: *Parser) Token {
         return self.toks[self.i];
@@ -264,10 +268,17 @@ pub const Parser = struct {
         }
         return false;
     }
+    fn isScriptConst(self: *Parser, name: []const u8) bool {
+        for (self.const_names.items) |c| {
+            if (std.mem.eql(u8, c, name)) return true;
+        }
+        return false;
+    }
 
     pub fn parseProgram(self: *Parser) Error!ast.Program {
         self.conn_names = std.array_list.Managed([]const u8).init(self.arena);
         self.let_names = std.array_list.Managed([]const u8).init(self.arena);
+        self.const_names = std.array_list.Managed([]const u8).init(self.arena);
 
         // A script that *opens* with EXPLAIN explains the whole script, offline and
         // without binding params — `basalt run` renders that plan without executing
@@ -297,8 +308,16 @@ pub const Parser = struct {
     /// One top-level (or arm-body) statement, appended to `out`.
     fn parseStatement(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
         if (self.isKw("create")) return self.parseCreate(out);
-        if (self.isKw("param")) return out.append(.{ .param = try self.parseParam() });
-        if (self.isKw("let")) return out.append(.{ .let_const = try self.parseLetStmt() });
+        if (self.isKw("param")) {
+            const p = try self.parseParam();
+            try self.const_names.append(p.name);
+            return out.append(.{ .param = p });
+        }
+        if (self.isKw("let")) {
+            const l = try self.parseLetStmt();
+            try self.const_names.append(l.name);
+            return out.append(.{ .let_const = l });
+        }
         if (self.isKw("print")) return out.append(.{ .print = try self.parsePrintStmt() });
         if (self.isKw("load")) return self.parseLoadInto(out);
         if (self.isKw("for")) return out.append(.{ .for_each = try self.parseForEach() });
@@ -1434,7 +1453,19 @@ pub const Parser = struct {
                 }
                 try stages.append(.{ .node = .{ .select = try items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
             } else {
+                // A constant item is one value for the whole query, so it belongs
+                // to neither the aggregate nor the grouping — it moves to a
+                // projection after the aggregate, the same place a lifted
+                // `round(avg(x), 2)` puts its arithmetic. This is what lets an
+                // aggregate result carry a run id or a tenant tag:
+                // `SELECT $tag AS tag, region, COUNT(*) ... GROUP BY region`.
+                var kept = std.array_list.Managed(ast.SelectItem).init(self.arena);
                 for (items.items) |it| {
+                    if (it == .computed and self.constItemExpr(it.computed.expr)) {
+                        try self.repointPostItem(&post, it.computed.name, it.computed.expr);
+                        lifted = true;
+                        continue;
+                    }
                     if (it != .field)
                         return self.fail(pos, "`{s}` is neither an aggregate nor a grouping key — wrap it in an aggregate, or name it in GROUP BY", .{itemLabel(it)});
                     // A plain column that is not a grouping key has no single
@@ -1442,7 +1473,9 @@ pub const Parser = struct {
                     // without a word, which is worse than refusing the query.
                     if (!isGroupKey(group, it.field))
                         return self.fail(pos, "`{s}` is neither an aggregate nor a grouping key — wrap it in an aggregate, or name it in GROUP BY", .{it.field.last()});
+                    try kept.append(it);
                 }
+                items = kept;
             }
             // Before the aggregate is sealed, since HAVING may name one that the
             // SELECT list does not.
@@ -2041,6 +2074,61 @@ pub const Parser = struct {
                     if (containsAgg(arm.value)) break :blk true;
                 }
                 break :blk false;
+            },
+            else => false,
+        };
+    }
+
+    /// Point the post-aggregate projection's entry for `name` at `expr` instead of
+    /// at a column of that name. A computed item normally lands in the pre-aggregate
+    /// projection and is referenced by name afterwards; when the item is lifted out
+    /// of the pre-projection entirely, the reference has nothing to read and the
+    /// expression has to be evaluated here instead.
+    fn repointPostItem(
+        self: *Parser,
+        post: *std.array_list.Managed(ast.SelectItem),
+        name: []const u8,
+        expr: *ast.Expr,
+    ) Error!void {
+        for (post.items) |*p| {
+            const p_name = switch (p.*) {
+                .field => |q| q.last(),
+                .computed => |c| c.name,
+                else => continue,
+            };
+            if (!std.mem.eql(u8, p_name, name)) continue;
+            p.* = .{ .computed = .{ .name = name, .expr = expr } };
+            return;
+        }
+        // Every computed item appends its own post entry, so this is unreachable
+        // in practice; append rather than lose the column if that ever changes.
+        try post.append(.{ .computed = .{ .name = name, .expr = expr } });
+        _ = self;
+    }
+
+    /// Whether a SELECT item is one value for the whole query, and so may sit in a
+    /// grouped or ungrouped aggregate's select list without being an aggregate or a
+    /// grouping key. That covers literals, arithmetic and string building over them,
+    /// `now()`-style calls, and the PARAMs and LETs — all folded before a row is
+    /// read. A column reference is not constant: it has no single value per group,
+    /// which is the case the caller still refuses.
+    ///
+    /// `$p` and a bare column are the same single-part field here, so a declared
+    /// PARAM or LET name wins — the same shadowing rule the rest of the language
+    /// applies to `$name`.
+    fn constItemExpr(self: *Parser, e: *const ast.Expr) bool {
+        return switch (e.*) {
+            .int_lit, .float_lit, .str_lit, .bool_lit, .null_lit => true,
+            .field => |q| q.parts.len == 1 and self.isScriptConst(q.parts[0]),
+            .unary => |u| self.constItemExpr(u.e),
+            .binary => |b| self.constItemExpr(b.l) and self.constItemExpr(b.r),
+            .cond => |c| self.constItemExpr(c.cond) and self.constItemExpr(c.then) and self.constItemExpr(c.els),
+            .cast => |c| self.constItemExpr(c.e),
+            .is_null => |n| self.constItemExpr(n.e),
+            .call => |c| {
+                if (aggFunc(c.name) != null) return false;
+                for (c.args) |a| if (!self.constItemExpr(a)) return false;
+                return true;
             },
             else => false,
         };

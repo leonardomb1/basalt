@@ -6136,6 +6136,54 @@ test "LOAD INTO IDENTIFIER: one output file per for-each row" {
     try std.testing.expectEqualStrings("region\nsouth\n", south);
 }
 
+test "aggregate: a literal tag sits beside an aggregate" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try runToString(alloc, &tmp,
+        "id,g\n1,a\n2,b\n3,a\n",
+        "SELECT 'nightly' AS run, COUNT(*) AS c FROM '$IN'",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("run,c\nnightly,3\n", out);
+}
+
+test "aggregate: a PARAM tag sits beside a grouped aggregate, in select order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,g\n1,a\n2,b\n3,a\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
+    defer alloc.free(in_path);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "PARAM tag STRING DEFAULT 'x';\nLOAD INTO '{s}' AS " ++
+            "SELECT $tag AS run, g, COUNT(*) AS c FROM '{s}' GROUP BY g ORDER BY g;",
+        .{ out_path, in_path },
+    );
+    defer alloc.free(script);
+
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{.{ .key = "tag", .val = "nightly" }});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("run,g,c\nnightly,a,2\nnightly,b,1\n", out);
+}
+
+test "aggregate: a bare column beside an aggregate is still refused" {
+    const alloc = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(alloc);
+    defer ar.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    // `g` has no single value per group; only constants get the new pass.
+    const r = parser.parseSource(ar.allocator(),
+        "LOAD INTO '/tmp/o.csv' AS SELECT g, COUNT(*) AS c FROM 'in.csv';", &pdiag);
+    try std.testing.expectError(error.ParseFailed, r);
+    try std.testing.expect(std.mem.indexOf(u8, pdiag.msg, "neither an aggregate nor a grouping key") != null);
+}
+
 test "explode splits a delimited column into rows" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
