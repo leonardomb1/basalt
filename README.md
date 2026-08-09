@@ -91,7 +91,13 @@ detail; `--log-format json` switches stderr to NDJSON for collectors.
 
 - Errors surface at plan time: an unknown column, an incomparable type or a
   missing credential fails `check`, before a row is read.
-- Execution streams; memory is bounded by batch size, not file size.
+- Execution streams: a map pipeline's memory is bounded by batch size, not file
+  size, however large the input. A stage that has to see the whole input first is
+  bounded by its *result* instead — a `GROUP BY` holds one entry per group, and a
+  join holds its build side, failing fast past 4 GiB (`WITH (max_build = '16GB')`
+  to raise it). Aggregating a high-cardinality key is the case to watch: grouping
+  2M distinct ids out of a 98 MB CSV peaks around 1.1 GB, and there is no spill to
+  disk.
 - `WHERE` against a database table runs in the database. The plan shows what
   was pushed down.
 - Parquet pipelines run in parallel over row-group morsels, local CSV pipelines
