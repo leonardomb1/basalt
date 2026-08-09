@@ -1085,6 +1085,7 @@ fn numOrder(a: Value, b: Value) ?std.math.Order {
 const driver = @import("driver.zig");
 const batchmod = @import("../exec/batch.zig");
 const azure = @import("azure.zig");
+const s3 = @import("s3.zig");
 const httpx = @import("http.zig");
 const Batch = batchmod.Batch;
 
@@ -1160,6 +1161,7 @@ pub const Remote = struct {
     client: *std.http.Client,
     url: []const u8,
     blob: ?azure.Blob,
+    s3obj: ?s3.Obj = null,
     total: u64,
     /// Set when the origin ignored `Range` (or could not report a size), which
     /// makes every later read a slice instead of another full transfer.
@@ -1176,6 +1178,10 @@ pub const Remote = struct {
             const b = try azure.parseUrl(arena, path, azure.endpointFromEnv(arena));
             self.blob = b;
             self.url = b.url;
+        } else if (s3.isUrl(path)) {
+            const o = try s3.parseUrl(arena, path, s3.endpointFromEnv(arena));
+            self.s3obj = o;
+            self.url = o.url;
         }
 
         // HEAD answers "how big?" without a body. A server that refuses it, or
@@ -1273,6 +1279,10 @@ pub const Remote = struct {
             const verb = if (method == .HEAD) "HEAD" else "GET";
             return azure.requestHeaders(arena, b, verb, range_hdr);
         }
+        if (self.s3obj) |o| {
+            const verb = if (method == .HEAD) "HEAD" else "GET";
+            return s3.requestHeaders(arena, o, verb, range_hdr);
+        }
         if (range_hdr.len == 0) return &.{};
         return arena.dupe(std.http.Header, &.{.{ .name = "Range", .value = range_hdr }});
     }
@@ -1293,6 +1303,7 @@ pub const Remote = struct {
 
     fn statusError(self: *Remote, code: u16, body: []const u8) anyerror {
         if (self.blob != null) return azure.statusToError(code, body);
+        if (self.s3obj != null) return s3.statusToError(code, body);
         return httpx.statusError(code);
     }
 
@@ -1539,7 +1550,7 @@ fn parseFooterOf(arena: std.mem.Allocator, src: Bytes, footer_start: *u64) !pq.F
 /// Paths a `Remote` serves: object storage and plain URLs alike. Everything
 /// else is a local file.
 pub fn isRemote(path: []const u8) bool {
-    return azure.isUrl(path) or
+    return azure.isUrl(path) or s3.isUrl(path) or
         std.mem.startsWith(u8, path, "http://") or
         std.mem.startsWith(u8, path, "https://");
 }
