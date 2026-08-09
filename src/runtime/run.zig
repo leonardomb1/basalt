@@ -1201,6 +1201,13 @@ const AggSlot = struct {
     gpa: std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }) = .{},
     arena: std.heap.ArenaAllocator = undefined,
     groups: []op.Aggregate.Group = &.{},
+    /// One hash per group, kept from the fold so the combine can partition by it
+    /// without hashing every key again.
+    hashes: []u64 = &.{},
+    /// This slot's group indices split by key hash — the same shape `PqLane`
+    /// carries, so the radix combine can walk slots and lanes alike. Empty for a
+    /// slot no worker reached.
+    buckets: []std.array_list.Managed(u32) = &.{},
     /// False for a slot no worker reached, which is what an aborted run leaves
     /// behind. Such a slot holds no groups and is skipped by the combine.
     done: bool = false,
@@ -1227,6 +1234,11 @@ fn freeAggSlots(gpa: std.mem.Allocator, slots: []AggSlot) void {
     gpa.free(slots);
 }
 
+/// Above this many partial groups the combine is split across threads by key
+/// hash; below it the single pass takes microseconds and the partition arenas
+/// and thread hop cost more than they save.
+const agg_combine_parallel_min: usize = 1 << 14;
+
 /// Combine per-item partials into one group set, walking the slots by index.
 ///
 /// The order matters for floats and only for floats: `mergeAcc` adds partial
@@ -1237,17 +1249,88 @@ fn freeAggSlots(gpa: std.mem.Allocator, slots: []AggSlot) void {
 /// input is cut up, so a float total can still differ between `-j 4` and `-j 8`
 /// (as it does between either and the serial path). `CAST`ing to DECIMAL is the
 /// way to get a total that is identical everywhere.
+///
+/// Two shapes, chosen by how many partial groups there are. One pass is right for
+/// the ordinary case, where a handful of groups come back per slot. But the pass
+/// is O(partials), and with a key of high cardinality that is O(rows): a 2M-row
+/// CSV grouped by a unique id spent longer combining 2M partials than the whole
+/// serial aggregate took, so `-j 16` came in at 1.32s against 0.77s at `-j 1` —
+/// parallelism made it slower. Past the threshold the combine is radix-partitioned
+/// like the parquet path's, so it scales with the fold instead of undoing it.
+///
+/// `parts` is the caller's, because the merged groups live in its arenas and have
+/// to outlive the write. Determinism survives partitioning: keys are disjoint
+/// across partitions, so no group is ever summed across two of them, and each
+/// partition still walks the slots in index order.
 fn combineAggSlots(
-    map: *op.Aggregate.GroupMap(),
-    groups: *std.array_list.Managed(op.Aggregate.Group),
-    dst_alloc: std.mem.Allocator,
+    env: *Env,
     slots: []AggSlot,
     aggs: []const op.Aggregate.Agg,
-) !void {
-    for (slots) |*s| {
-        if (!s.done) continue;
-        try op.Aggregate.mergeGroups(map, groups, dst_alloc, s.groups, aggs);
+    threads: usize,
+    parts: []PqPart,
+) ![]const op.Aggregate.Group {
+    var total: usize = 0;
+    for (slots) |*s| total += s.groups.len;
+
+    if (threads < 2 or total < agg_combine_parallel_min) {
+        var map = op.Aggregate.GroupMap().init(env.arena);
+        var groups = std.array_list.Managed(op.Aggregate.Group).init(env.arena);
+        for (slots) |*s| {
+            if (!s.done) continue;
+            try op.Aggregate.mergeGroups(&map, &groups, env.arena, s.groups, aggs);
+        }
+        return groups.items;
     }
+
+    var mctx = SlotMergeCtx{ .slots = slots, .parts = parts, .aggs = aggs, .queue = .{ .nitems = pq_parts } };
+    _ = try parallel.spawnJoin(env.arena, @min(threads, pq_parts), slotMergeWorker, &mctx);
+    if (mctx.queue.first_err) |e| return e;
+
+    env.log.log(.debug, "parallel agg combine: {d} partial groups over {d} partitions", .{ total, pq_parts });
+
+    var merged: usize = 0;
+    for (parts) |*pp| merged += pp.groups.items.len;
+    const all = try env.arena.alloc(op.Aggregate.Group, merged);
+    var at: usize = 0;
+    for (parts) |*pp| {
+        for (pp.groups.items) |g| {
+            all[at] = g;
+            at += 1;
+        }
+    }
+    return all;
+}
+
+const SlotMergeCtx = struct {
+    slots: []AggSlot,
+    parts: []PqPart,
+    aggs: []const op.Aggregate.Agg,
+    queue: WorkQueue,
+};
+
+const slotMergeWorker = dispatchWorker(SlotMergeCtx, slotMergeOne);
+
+fn slotMergeOne(ctx: *SlotMergeCtx, p: usize) !void {
+    return mergeRadixPart(&ctx.parts[p], ctx.slots, ctx.aggs, p);
+}
+
+/// The radix partitions and their arenas, owned by the caller so that whatever the
+/// combine merges into them outlives the sink write. Initialising one is free —
+/// an arena allocates nothing until used — so the ordinary single-pass combine
+/// pays nothing for these being here.
+fn allocMergeParts(gpa: std.mem.Allocator) ![]PqPart {
+    const parts = try gpa.alloc(PqPart, pq_parts);
+    for (parts) |*pp| {
+        pp.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator), .map = undefined, .groups = undefined };
+        pp.map = op.Aggregate.GroupMap().init(pp.arena.allocator());
+        pp.groups = std.array_list.Managed(op.Aggregate.Group).init(pp.arena.allocator());
+    }
+    return parts;
+}
+
+fn freeMergeParts(gpa: std.mem.Allocator, parts: []PqPart) void {
+    for (parts) |*pp| pp.arena.deinit();
+    gpa.free(parts);
 }
 
 /// Finalize merged parallel-aggregate groups into one output batch (a "merger"
@@ -1331,7 +1414,10 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
         .gpa = slot.gpa.allocator(),
     };
     // Stays in the slot's arena: the combine reads it after every lane has joined.
-    slot.groups = try agg.drainGroups();
+    const drained = try agg.drainGroupsHashed();
+    slot.groups = drained.groups;
+    slot.hashes = drained.hashes;
+    slot.buckets = try bucketByHash(wa, drained.hashes);
     slot.done = true;
 }
 
@@ -1479,17 +1565,20 @@ fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
     try bucketLane(ls);
 }
 
-/// Split this lane's groups into radix buckets — one hash per group, once.
-/// Split this lane's group indices into radix buckets, reusing the hash the
-/// fold already produced.
-fn bucketLane(ls: *PqLane) !void {
-    const a = ls.arena.allocator();
-    ls.buckets = try a.alloc(std.array_list.Managed(u32), pq_parts);
-    for (ls.buckets) |*b| b.* = std.array_list.Managed(u32).init(a);
-    for (ls.hashes, 0..) |h, i| {
+/// Split group indices into radix buckets, reusing the hash the fold already
+/// produced. Shared by the parquet lanes and the CSV/SQL slots.
+fn bucketByHash(a: std.mem.Allocator, hashes: []const u64) ![]std.array_list.Managed(u32) {
+    const buckets = try a.alloc(std.array_list.Managed(u32), pq_parts);
+    for (buckets) |*b| b.* = std.array_list.Managed(u32).init(a);
+    for (hashes, 0..) |h, i| {
         const p: usize = @intCast((h >> 32) % pq_parts);
-        try ls.buckets[p].append(@intCast(i));
+        try buckets[p].append(@intCast(i));
     }
+    return buckets;
+}
+
+fn bucketLane(ls: *PqLane) !void {
+    ls.buckets = try bucketByHash(ls.arena.allocator(), ls.hashes);
 }
 
 const PqMergeCtx = struct {
@@ -1502,24 +1591,33 @@ const PqMergeCtx = struct {
 const pqMergeWorker = dispatchWorker(PqMergeCtx, pqMergeOne);
 
 fn pqMergeOne(ctx: *PqMergeCtx, p: usize) !void {
-    const dst = &ctx.parts[p];
+    return mergeRadixPart(&ctx.parts[p], ctx.lanes, ctx.aggs, p);
+}
+
+/// Merge radix partition `p` of a set of partials into `dst`. `srcs` is a slice of
+/// anything carrying `groups`/`hashes`/`buckets` — parquet lanes or CSV/SQL slots —
+/// and is walked in index order, which is what keeps a float SUM from depending on
+/// thread timing (see `AggSlot`). A partition owns its keys outright, so the tasks
+/// need no lock between them, which is what stops a high-cardinality merge from
+/// serialising behind one table.
+fn mergeRadixPart(dst: *PqPart, srcs: anytype, aggs: []const op.Aggregate.Agg, p: usize) !void {
     const da = dst.arena.allocator();
     var tbl = try op.Aggregate.MergeTable.init(da, 256);
     var hashes = std.array_list.Managed(u64).init(da);
     var any_distinct = false;
-    for (ctx.aggs) |a| {
+    for (aggs) |a| {
         if (a.distinct) any_distinct = true;
     }
-    for (ctx.lanes) |*ls| {
+    for (srcs) |*ls| {
         if (ls.buckets.len == 0) continue;
         for (ls.buckets[p].items) |gi| {
             const g = ls.groups[gi];
             const h = ls.hashes[gi];
             if (try tbl.find(h, g.key_vals, dst.groups.items, hashes.items, dst.groups.items.len)) |at| {
                 const cg = &dst.groups.items[at];
-                for (g.accs, ctx.aggs, 0..) |src, agg, j| try op.Aggregate.mergeAcc(da, &cg.accs[j], src, agg);
+                for (g.accs, aggs, 0..) |src, agg, j| try op.Aggregate.mergeAcc(da, &cg.accs[j], src, agg);
             } else {
-                try dst.groups.append(try op.Aggregate.adoptOne(da, g, ctx.aggs, any_distinct));
+                try dst.groups.append(try op.Aggregate.adoptOne(da, g, aggs, any_distinct));
                 try hashes.append(h);
             }
         }
@@ -1945,10 +2043,10 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
     env.sink_name = sinkLabel(env, w);
 
     const nthreads = @max(@as(usize, 1), opts.threads);
-    var cmap = op.Aggregate.GroupMap().init(arena);
-    var cgroups = std.array_list.Managed(op.Aggregate.Group).init(arena);
     const slots = try allocAggSlots(env.gpa, nthreads);
     defer freeAggSlots(env.gpa, slots);
+    const parts = try allocMergeParts(env.gpa);
+    defer freeMergeParts(env.gpa, parts);
     var ctx = AggCtx{
         .mapped = mapped,
         .csv_schema = &mapped.schema,
@@ -1969,8 +2067,8 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
 
     if (ctx.queue.first_err) |e| return e;
 
-    try combineAggSlots(&cmap, &cgroups, arena, slots, aggs);
-    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, cgroups.items);
+    const cgroups = try combineAggSlots(env, slots, aggs, opts.threads, parts);
+    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, cgroups);
 
     const wr = try resolveUpsertKeys(env, w);
     const snk = try openSink(env, wr, out_schema.*);
@@ -2029,7 +2127,10 @@ fn sqlAggWorkOne(ctx: *SqlAggCtx, i: usize) !void {
         .state = wa,
         .gpa = slot.gpa.allocator(),
     };
-    slot.groups = try agg.drainGroups();
+    const drained = try agg.drainGroupsHashed();
+    slot.groups = drained.groups;
+    slot.hashes = drained.hashes;
+    slot.buckets = try bucketByHash(wa, drained.hashes);
     slot.done = true;
 }
 
@@ -2069,12 +2170,12 @@ fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.S
     env.sink_name = sinkLabel(env, w);
 
     const nlanes = @min(@max(@as(usize, 1), opts.threads), sp.predicates.len);
-    var cmap = op.Aggregate.GroupMap().init(arena);
-    var cgroups = std.array_list.Managed(op.Aggregate.Group).init(arena);
     // One slot per key range, not per lane: the lanes steal ranges off the queue,
     // so only the range index is a stable identity to combine in.
     const slots = try allocAggSlots(env.gpa, sp.predicates.len);
     defer freeAggSlots(env.gpa, slots);
+    const parts = try allocMergeParts(env.gpa);
+    defer freeMergeParts(env.gpa, parts);
     var ctx = SqlAggCtx{
         .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql },
         .predicates = sp.predicates,
@@ -2104,8 +2205,8 @@ fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.S
 
     if (ctx.queue.first_err) |e| return e;
 
-    try combineAggSlots(&cmap, &cgroups, arena, slots, aggs);
-    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, cgroups.items);
+    const cgroups = try combineAggSlots(env, slots, aggs, opts.threads, parts);
+    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, cgroups);
 
     const snk = try openSink(env, w, out_schema.*);
     var snk_open = true;
@@ -5728,6 +5829,71 @@ test "parallel CSV aggregate: float SUM is identical across runs at one -j" {
         defer tmp.cleanup();
         const out = try runCsvThreaded(alloc, &tmp, float_order_csv,
             "SELECT g, SUM(CAST(v AS FLOAT)) AS s FROM '$IN' GROUP BY g",
+            8);
+        if (first) |f| {
+            defer alloc.free(out);
+            try std.testing.expectEqualStrings(f, out);
+        } else {
+            first = out;
+        }
+    }
+}
+
+test "parallel CSV aggregate: high-cardinality combine is partitioned and exact" {
+    const alloc = std.testing.allocator;
+    // Above `agg_combine_parallel_min`, so this takes the radix-partitioned
+    // combine rather than the single pass.
+    const ngroups = (agg_combine_parallel_min * 3) / 2;
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    try input.appendSlice("k,v\n");
+    for (0..ngroups) |k| {
+        // Each key twice, so every group must come back with count 2 and sum 3.
+        try input.writer().print("{d},1\n{d},2\n", .{ k, k });
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try runCsvThreaded(alloc, &tmp, input.items,
+        "SELECT k, COUNT(*) AS c, SUM(CAST(v AS INT)) AS s FROM '$IN' GROUP BY k",
+        4);
+    defer alloc.free(out);
+
+    var seen: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, out, '\n');
+    _ = it.next(); // header
+    while (it.next()) |line| {
+        var f = std.mem.tokenizeScalar(u8, line, ',');
+        const k = f.next().?;
+        try std.testing.expectEqualStrings("2", f.next().?);
+        try std.testing.expectEqualStrings("3", f.next().?);
+        // Every key must be one of the ones written, and appear once.
+        const kv = try std.fmt.parseInt(usize, k, 10);
+        try std.testing.expect(kv < ngroups);
+        seen += 1;
+    }
+    try std.testing.expectEqual(ngroups, seen);
+}
+
+test "parallel CSV aggregate: the partitioned combine is reproducible" {
+    const alloc = std.testing.allocator;
+    const ngroups = (agg_combine_parallel_min * 3) / 2;
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    try input.appendSlice("k,v\n");
+    // Values that only add up the same way if the partials are combined in a
+    // fixed order, as in the low-cardinality test above.
+    for (0..ngroups) |k| {
+        try input.writer().print("{d},1\n{d},1\n{d},10000000000000000\n", .{ k, k, k });
+    }
+
+    var first: ?[]u8 = null;
+    defer if (first) |f| alloc.free(f);
+    for (0..4) |_| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const out = try runCsvThreaded(alloc, &tmp, input.items,
+            "SELECT k, SUM(CAST(v AS FLOAT)) AS s FROM '$IN' GROUP BY k ORDER BY k",
             8);
         if (first) |f| {
             defer alloc.free(out);
