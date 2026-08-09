@@ -17,6 +17,7 @@ const pqdecode = @import("../connect/pqdecode.zig");
 const pqwrite = @import("../connect/pqwrite.zig");
 const azure = @import("../connect/azure.zig");
 const s3 = @import("../connect/s3.zig");
+const zipsrc = @import("../connect/zipsrc.zig");
 
 pub const Diag = struct {
     buf: [512]u8 = undefined,
@@ -594,6 +595,8 @@ const Ctx = struct {
                     const fmt = try formatFromHints(lead.hints, self.diag);
                     if (unreadableTarget(rd.form.path, fmt)) |why|
                         return fail(self.diag, "cannot read `{s}`: {s}", .{ rd.form.path, why });
+                    if (archiveProblem(self.arena, rd.form.path, fmt)) |why|
+                        return fail(self.diag, "cannot read `{s}`: {s}", .{ rd.form.path, why });
                     _ = try dialectFromHints(lead.hints, self.diag);
                 }
                 const schema = offlineSchema(self.arena, rd, lead.hints);
@@ -924,10 +927,13 @@ pub fn formatFromHints(hints: []const ast.Hint, diag: *Diag) Error!?FileFormat {
     return fail(diag, "unknown format `{s}` (csv, parquet)", .{s});
 }
 
-/// The extension basalt reads a path as, ignoring any URL query or fragment, or
-/// null when the path carries no extension it knows.
+/// The extension basalt reads a path as, or null when it carries none it knows.
+///
+/// `csv.dataName` walks the chain first, so `orders.csv.gz` and
+/// `inf.zip :: inf_diario.csv` both answer `.csv` — the name that matters is the
+/// innermost one, not the container's.
 fn formatOfPath(path: []const u8) ?FileFormat {
-    const bare = path[0 .. std.mem.indexOfAny(u8, path, "?#") orelse path.len];
+    const bare = csv.dataName(path);
     if (pqwrite.Writer.isPath(bare)) return .parquet;
     if (std.ascii.endsWithIgnoreCase(bare, ".csv")) return .csv;
     return null;
@@ -941,12 +947,65 @@ fn formatOfPath(path: []const u8) ?FileFormat {
 /// was fine. A wrong number that looks right is the one outcome this engine is
 /// built to avoid, so an extension it does not read is a plan-time error.
 pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
-    if (explicit != null) return null;
     // A trailing `/` is a prefix read: the objects under it carry the extensions,
     // and `parquetPrefix`/the CSV lister decide per object.
     if (std.mem.endsWith(u8, path, "/")) return null;
-    if (formatOfPath(path) != null) return null;
-    return "basalt handles `.csv` and `.parquet`; name the format with `WITH (format = 'csv')` if the extension differs";
+
+    // Everything about an archive is `archiveProblem`'s to judge: the member's own
+    // name is what carries the format, and only opening the archive reveals it.
+    if (csv.splitArchive(path) != null) return null;
+
+    // Parquet is random-access — footer first, then the chunks a query needs. A
+    // compressed stream is sequential, so the reader has nothing to seek in.
+    // Refusing beats decompressing gigabytes into a temp file that nothing in the
+    // plan mentions.
+    const fmt = explicit orelse formatOfPath(path);
+    if (csv.splitCodec(path).codec != .none and fmt == .parquet)
+        return "parquet needs random access, so it cannot be read through compression; decompress it first";
+
+    if (explicit != null) return null;
+    if (fmt != null) return null;
+    return "basalt handles `.csv` and `.parquet`, optionally `.gz`/`.zst` compressed or inside a `.zip`; name the format with `WITH (format = 'csv')` if the extension differs";
+}
+
+/// Why this archive reference cannot be read as one table, or null when it can.
+///
+/// Opens the archive to answer, and stays quiet when it cannot be opened — a script
+/// may legitimately be checked before its data has been fetched, which is what
+/// `offlineSchema` already assumes. Everything archive-shaped is decided here so the
+/// guarantee `unreadableTarget` gives for a loose file also holds inside a
+/// container: a `.json` member is refused exactly like a `.json` file.
+pub fn archiveProblem(arena: std.mem.Allocator, path: []const u8, explicit: ?FileFormat) ?[]const u8 {
+    const ar = csv.splitArchive(path) orelse return null;
+    if (csv.CsvReader.isUrl(ar.archive))
+        return "an archive has its index at the end, so reading one over HTTP needs a ranged fetch that is not wired up yet; download it first";
+
+    const members = zipsrc.names(arena, ar.archive) catch return null;
+    if (members.len == 0) return "the archive holds no files";
+
+    const chosen = if (ar.member) |want| blk: {
+        for (members) |m| if (std.mem.eql(u8, m, want)) break :blk m;
+        return std.fmt.allocPrint(arena, "no file `{s}` in the archive ({s})", .{ want, joinNames(arena, members) }) catch null;
+    } else if (members.len > 1)
+        return std.fmt.allocPrint(arena, "the archive holds {d} files; name one with `:: <name>` ({s})", .{ members.len, joinNames(arena, members) }) catch null
+    else
+        members[0];
+
+    if (explicit == null and formatOfPath(chosen) == null)
+        return std.fmt.allocPrint(arena, "`{s}` inside it is not a `.csv` or `.parquet`; name the format with `WITH (format = 'csv')`", .{chosen}) catch null;
+    if ((explicit orelse formatOfPath(chosen)) == .parquet)
+        return "parquet needs random access, so it cannot be read out of an archive; extract it first";
+    return null;
+}
+
+/// The first few names, for an error that has to name the choices.
+fn joinNames(arena: std.mem.Allocator, items: []const []const u8) []const u8 {
+    var out: []const u8 = "";
+    for (items, 0..) |m, i| {
+        if (i == 3) return std.fmt.allocPrint(arena, "{s}, …", .{out}) catch out;
+        out = std.fmt.allocPrint(arena, "{s}{s}{s}", .{ out, if (i == 0) "" else ", ", m }) catch return out;
+    }
+    return out;
 }
 
 /// Whether a read divides into per-lane morsels at `-j > 1`.
@@ -965,6 +1024,12 @@ fn morselParallelRead(connector: []const u8, node: ast.Stage.Node) bool {
         },
         else => return false,
     };
+    // Splittability, in Hadoop's sense: there is no mapping from a byte offset in a
+    // compressed stream to a row, so a `.csv.gz` is read start to finish however
+    // many lanes are free. An archive member is sequential for the same reason. Both
+    // are `MappedCsv.open`'s `NotMappable`, and the label has to agree with the
+    // runtime or EXPLAIN goes back to overstating what it is about to do.
+    if (csv.splitCodec(path).codec != .none or csv.splitArchive(path) != null) return false;
     if (pqwrite.Writer.isPath(path)) return true;
     return std.mem.indexOf(u8, path, "://") == null;
 }
@@ -980,7 +1045,11 @@ fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.Hint
     }
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
         if (csv.CsvReader.isUrl(rd.form.path)) return null;
-        if (pqdecode.Reader.isPath(rd.form.path)) {
+        // A compressed or archived parquet is refused above, so only a plain path
+        // reaches the parquet reader here.
+        if (csv.splitCodec(rd.form.path).codec == .none and csv.splitArchive(rd.form.path) == null and
+            pqdecode.Reader.isPath(rd.form.path))
+        {
             const pr = pqdecode.Reader.open(arena, rd.form.path) catch return null;
             return pr.schema;
         }
@@ -1052,7 +1121,16 @@ test "unreadableTarget: an extension basalt does not read is refused" {
     // A trailing slash is a prefix read; the objects under it carry extensions.
     try std.testing.expect(unreadableTarget("s3://bkt/bronze/", null) == null);
 
-    try std.testing.expect(unreadableTarget("/data/inf.zip", null) != null);
+    // Compressed and archived names resolve through the chain to their inner name.
+    try std.testing.expect(unreadableTarget("/data/x.csv.gz", null) == null);
+    try std.testing.expect(unreadableTarget("/data/x.csv.zst", null) == null);
+    // An archive is `archiveProblem`'s to judge, since only its members name a
+    // format; `unreadableTarget` deliberately passes it through.
+    try std.testing.expect(unreadableTarget("/data/inf.zip", null) == null);
+    try std.testing.expect(unreadableTarget("/data/inf.zip :: a.csv", null) == null);
+    // Parquet cannot be read through a codec: it needs to seek.
+    try std.testing.expect(unreadableTarget("/data/x.parquet.gz", null) != null);
+
     try std.testing.expect(unreadableTarget("/data/rows.json", null) != null);
     try std.testing.expect(unreadableTarget("/data/book.xlsx", null) != null);
     try std.testing.expect(unreadableTarget("/data/noext", null) != null);

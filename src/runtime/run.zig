@@ -4966,7 +4966,8 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
         try guardFileFormat(env, rd.form.path, want, "read");
         // An explicit `format` decides, so a parquet under an unusual name is not
         // handed to the CSV parser; otherwise the extension does, as before.
-        const rfmt = want orelse (if (pqdecode.Reader.isPath(rd.form.path)) analyze.FileFormat.parquet else analyze.FileFormat.csv);
+        const boxed = csv.splitCodec(rd.form.path).codec != .none or csv.splitArchive(rd.form.path) != null;
+        const rfmt = want orelse (if (!boxed and pqdecode.Reader.isPath(rd.form.path)) analyze.FileFormat.parquet else analyze.FileFormat.csv);
         if (rfmt == .parquet) {
             const pr = pqdecode.Reader.open(env.arena, rd.form.path) catch |e|
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
@@ -4975,6 +4976,10 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
         var ddiag = analyze.Diag{};
         const d = analyze.dialectFromHints(hints, &ddiag) catch
             return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg));
+        // `run` never analyzed the pipeline, so it repeats the plan-time question
+        // here: which member did you mean?
+        if (analyze.archiveProblem(env.arena, rd.form.path, want)) |why|
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot read `{s}`: {s}", .{ rd.form.path, why }));
         const reader = csv.CsvReader.open(env.arena, rd.form.path, d) catch |e| {
             // A mistyped prefix and a truly empty one are the same listing; say
             // which prefix came back empty rather than blaming the CSV parser.
@@ -4982,7 +4987,10 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no blobs under prefix `{s}`", .{rd.form.path}));
             if (e == s3.Error.S3EmptyPrefix)
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no objects under prefix `{s}`", .{rd.form.path}));
-            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open input CSV `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
+            // A malformed container is not a CSV problem, and saying so sends the
+            // reader looking in the wrong place.
+            const what: []const u8 = if (csv.splitArchive(rd.form.path) != null) "archive" else "input CSV";
+            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open {s} `{s}` ({s})", .{ what, rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
         };
         return reader.source();
     }
@@ -6420,10 +6428,10 @@ test "an unreadable extension is refused by run, not just check" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "in.zip", .data = "PK\x03\x04not a csv\nsecond line\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "in.json", .data = "{\"a\":1}\n{\"a\":2}\n" });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
-    const in_path = try std.fs.path.join(alloc, &.{ base, "in.zip" });
+    const in_path = try std.fs.path.join(alloc, &.{ base, "in.json" });
     defer alloc.free(in_path);
     const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
     defer alloc.free(out_path);
@@ -6460,6 +6468,53 @@ test "WITH (format = 'csv') reads a file whose extension says nothing" {
     const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
     defer alloc.free(out);
     try std.testing.expectEqualStrings("id\n1\n2\n", out);
+}
+
+const fx_zip = @embedFile("../connect/testdata/two_members.zip");
+
+test "read a zip member end to end with the :: reference" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "t.zip", .data = fx_zip });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "LOAD INTO '{s}' AS SELECT id, v FROM '{s}/t.zip :: a.csv' ORDER BY id;",
+        .{ out_path, base },
+    );
+    defer alloc.free(script);
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id,v\n1,x\n2,y\n", out);
+}
+
+test "a zip holding several files refuses to guess which one" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "t.zip", .data = fx_zip });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "LOAD INTO '{s}' AS SELECT * FROM '{s}/t.zip';", .{ out_path, base });
+    defer alloc.free(script);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
+    // The message has to name the candidates, or the user has to go find them.
+    try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "a.csv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "b.csv") != null);
 }
 
 test "explode splits a delimited column into rows" {
