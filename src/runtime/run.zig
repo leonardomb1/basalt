@@ -210,6 +210,10 @@ const Env = struct {
     /// `CALL` renders through the for-each machinery. Expression-form functions
     /// never reach here; expand.zig inlined them.
     fns: *const std.StringHashMap(ast.FnDecl),
+    /// The PARAMs and LETs as `${...}` interpolation bindings — the outer scope of
+    /// every loop row, and the whole scope for a statement outside any loop.
+    /// Empty when the script declares neither.
+    script_scope: LoopRow = no_loop_vars,
     /// Nesting depth of the `CALL` currently being rendered (recursion guard).
     call_depth: usize = 0,
     /// The endpoint's `INTO BUFFER` declaration, if any (dir + declared schema
@@ -569,10 +573,12 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var batch_arena = std.heap.ArenaAllocator.init(gpa);
     defer batch_arena.deinit();
 
+    env.script_scope = try buildScriptScope(arena, &params);
+
     var stats = Stats{ .run_id = run_id };
     var lanes_used: usize = 1;
     for (program.stmts[1..]) |s| switch (s) {
-        .output => |p| try runOutput(&env, p, opts, &stats, &lanes_used, &batch_arena),
+        .output => |p| try runOutput(&env, try renderScriptScope(&env, p), opts, &stats, &lanes_used, &batch_arena),
         .explain => |e| try runExplain(&env, e, opts, &stats, &lanes_used, &batch_arena),
         .for_each => |fe| try runForEach(&env, fe, opts, &stats, &lanes_used, &batch_arena),
         .match => |m| try runStmtMatch(&env, m, opts, &stats, &lanes_used, &batch_arena),
@@ -669,7 +675,7 @@ fn runStmtMatch(env: *Env, m: ast.StmtMatch, opts: RunOptions, stats: *Stats, la
 /// the env and runs output / for-each / nested match.
 fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     switch (s.*) {
-        .output => |p| try runOutput(env, p, opts, stats, lanes_used, batch_arena),
+        .output => |p| try runOutput(env, try renderScriptScope(env, p), opts, stats, lanes_used, batch_arena),
         .explain => |e| try runExplain(env, e, opts, stats, lanes_used, batch_arena),
         .for_each => |fe| try runForEach(env, fe, opts, stats, lanes_used, batch_arena),
         .match => |mm| try runStmtMatch(env, mm, opts, stats, lanes_used, batch_arena),
@@ -1179,6 +1185,154 @@ fn dispatchWorker(comptime Ctx: type, comptime workOne: anytype) fn (*Ctx, usize
     }.go;
 }
 
+/// One work item's partial group set, kept alive past the worker that folded it
+/// so the combine can run in item order.
+///
+/// Folding into a per-*item* slot rather than straight into shared state under a
+/// lock is what makes a parallel aggregate reproducible. Which rows land in which
+/// partial is fixed by the item boundaries (a CSV byte range, a key-range
+/// predicate), and `combineAggSlots` walks the slots by index, so a float `SUM`
+/// adds its partials in the same order on every run. Merging as lanes *finished*
+/// made the order depend on thread scheduling, so the same script wrote a
+/// slightly different total each run — see the note in `combineAggSlots`.
+const AggSlot = struct {
+    /// Per-slot and single-threaded: exactly one worker ever folds a given slot,
+    /// and the main thread only touches it after `spawnJoin` has returned.
+    gpa: std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }) = .{},
+    arena: std.heap.ArenaAllocator = undefined,
+    groups: []op.Aggregate.Group = &.{},
+    /// One hash per group, kept from the fold so the combine can partition by it
+    /// without hashing every key again.
+    hashes: []u64 = &.{},
+    /// This slot's group indices split by key hash — the same shape `PqLane`
+    /// carries, so the radix combine can walk slots and lanes alike. Empty for a
+    /// slot no worker reached.
+    buckets: []std.array_list.Managed(u32) = &.{},
+    /// False for a slot no worker reached, which is what an aborted run leaves
+    /// behind. Such a slot holds no groups and is skipped by the combine.
+    done: bool = false,
+
+    fn arm(self: *AggSlot) void {
+        self.arena = std.heap.ArenaAllocator.init(self.gpa.allocator());
+    }
+};
+
+fn allocAggSlots(gpa: std.mem.Allocator, n: usize) ![]AggSlot {
+    const slots = try gpa.alloc(AggSlot, n);
+    for (slots) |*s| s.* = .{};
+    // Armed in a second pass: `arm` takes the address of the slot's own gpa, so
+    // it has to run once the slot is at its final location.
+    for (slots) |*s| s.arm();
+    return slots;
+}
+
+fn freeAggSlots(gpa: std.mem.Allocator, slots: []AggSlot) void {
+    for (slots) |*s| {
+        s.arena.deinit();
+        _ = s.gpa.deinit();
+    }
+    gpa.free(slots);
+}
+
+/// Above this many partial groups the combine is split across threads by key
+/// hash; below it the single pass takes microseconds and the partition arenas
+/// and thread hop cost more than they save.
+const agg_combine_parallel_min: usize = 1 << 14;
+
+/// Combine per-item partials into one group set, walking the slots by index.
+///
+/// The order matters for floats and only for floats: `mergeAcc` adds partial
+/// sums, and float addition is not associative, so combining the same partials
+/// in a different order gives a total that differs in the last few bits. Integer
+/// and DECIMAL sums, counts and min/max are exact and order-insensitive. Note
+/// that this pins the result for a *given* item count — `-j` changes how the
+/// input is cut up, so a float total can still differ between `-j 4` and `-j 8`
+/// (as it does between either and the serial path). `CAST`ing to DECIMAL is the
+/// way to get a total that is identical everywhere.
+///
+/// Two shapes, chosen by how many partial groups there are. One pass is right for
+/// the ordinary case, where a handful of groups come back per slot. But the pass
+/// is O(partials), and with a key of high cardinality that is O(rows): a 2M-row
+/// CSV grouped by a unique id spent longer combining 2M partials than the whole
+/// serial aggregate took, so `-j 16` came in at 1.32s against 0.77s at `-j 1` —
+/// parallelism made it slower. Past the threshold the combine is radix-partitioned
+/// like the parquet path's, so it scales with the fold instead of undoing it.
+///
+/// `parts` is the caller's, because the merged groups live in its arenas and have
+/// to outlive the write. Determinism survives partitioning: keys are disjoint
+/// across partitions, so no group is ever summed across two of them, and each
+/// partition still walks the slots in index order.
+fn combineAggSlots(
+    env: *Env,
+    slots: []AggSlot,
+    aggs: []const op.Aggregate.Agg,
+    threads: usize,
+    parts: []PqPart,
+) ![]const op.Aggregate.Group {
+    var total: usize = 0;
+    for (slots) |*s| total += s.groups.len;
+
+    if (threads < 2 or total < agg_combine_parallel_min) {
+        var map = op.Aggregate.GroupMap().init(env.arena);
+        var groups = std.array_list.Managed(op.Aggregate.Group).init(env.arena);
+        for (slots) |*s| {
+            if (!s.done) continue;
+            try op.Aggregate.mergeGroups(&map, &groups, env.arena, s.groups, aggs);
+        }
+        return groups.items;
+    }
+
+    var mctx = SlotMergeCtx{ .slots = slots, .parts = parts, .aggs = aggs, .queue = .{ .nitems = pq_parts } };
+    _ = try parallel.spawnJoin(env.arena, @min(threads, pq_parts), slotMergeWorker, &mctx);
+    if (mctx.queue.first_err) |e| return e;
+
+    env.log.log(.debug, "parallel agg combine: {d} partial groups over {d} partitions", .{ total, pq_parts });
+
+    var merged: usize = 0;
+    for (parts) |*pp| merged += pp.groups.items.len;
+    const all = try env.arena.alloc(op.Aggregate.Group, merged);
+    var at: usize = 0;
+    for (parts) |*pp| {
+        for (pp.groups.items) |g| {
+            all[at] = g;
+            at += 1;
+        }
+    }
+    return all;
+}
+
+const SlotMergeCtx = struct {
+    slots: []AggSlot,
+    parts: []PqPart,
+    aggs: []const op.Aggregate.Agg,
+    queue: WorkQueue,
+};
+
+const slotMergeWorker = dispatchWorker(SlotMergeCtx, slotMergeOne);
+
+fn slotMergeOne(ctx: *SlotMergeCtx, p: usize) !void {
+    return mergeRadixPart(&ctx.parts[p], ctx.slots, ctx.aggs, p);
+}
+
+/// The radix partitions and their arenas, owned by the caller so that whatever the
+/// combine merges into them outlives the sink write. Initialising one is free —
+/// an arena allocates nothing until used — so the ordinary single-pass combine
+/// pays nothing for these being here.
+fn allocMergeParts(gpa: std.mem.Allocator) ![]PqPart {
+    const parts = try gpa.alloc(PqPart, pq_parts);
+    for (parts) |*pp| {
+        pp.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator), .map = undefined, .groups = undefined };
+        pp.map = op.Aggregate.GroupMap().init(pp.arena.allocator());
+        pp.groups = std.array_list.Managed(op.Aggregate.Group).init(pp.arena.allocator());
+    }
+    return parts;
+}
+
+fn freeMergeParts(gpa: std.mem.Allocator, parts: []PqPart) void {
+    for (parts) |*pp| pp.arena.deinit();
+    gpa.free(parts);
+}
+
 /// Finalize merged parallel-aggregate groups into one output batch (a "merger"
 /// Aggregate just for `emit`; it never pulls a child).
 fn emitMergedGroups(env: *Env, agg_in: *const types.Schema, by: []const usize, aggs: []const op.Aggregate.Agg, out_schema: *const types.Schema, groups: []const op.Aggregate.Group) !batchmod.Batch {
@@ -1235,21 +1389,15 @@ const AggCtx = struct {
     by: []const usize,
     aggs: []const op.Aggregate.Agg,
     queue: WorkQueue,
-    cmap: *op.Aggregate.GroupMap(),
-    cgroups: *std.array_list.Managed(op.Aggregate.Group),
-    mtx: std.Thread.Mutex = .{},
-    plan_arena: std.mem.Allocator,
+    slots: []AggSlot,
     rows_read: *std.atomic.Value(u64),
 };
 
 const aggWorker = dispatchWorker(AggCtx, aggWorkOne);
 
 fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
-    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
-    defer _ = wgpa.deinit();
-    var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
-    defer warena.deinit();
-    const wa = warena.allocator();
+    const slot = &ctx.slots[i];
+    const wa = slot.arena.allocator();
 
     var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.queue.nitems), .schema = ctx.csv_schema };
     var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
@@ -1263,13 +1411,14 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
         .out_schema = ctx.out_schema,
         .err = null,
         .state = wa,
-        .gpa = wgpa.allocator(),
+        .gpa = slot.gpa.allocator(),
     };
-    const groups = try agg.drainGroups();
-
-    ctx.mtx.lock();
-    defer ctx.mtx.unlock();
-    try op.Aggregate.mergeGroups(ctx.cmap, ctx.cgroups, ctx.plan_arena, groups, ctx.aggs);
+    // Stays in the slot's arena: the combine reads it after every lane has joined.
+    const drained = try agg.drainGroupsHashed();
+    slot.groups = drained.groups;
+    slot.hashes = drained.hashes;
+    slot.buckets = try bucketByHash(wa, drained.hashes);
+    slot.done = true;
 }
 
 /// One parallel-aggregate lane: its own arena and its own group table, so the
@@ -1335,6 +1484,27 @@ const MorselSource = struct {
     m: *PqMorsels,
     scratch: std.mem.Allocator,
     cur: ?*pqdecode.Reader = null,
+    /// When set, this source owns a fixed arithmetic slice of the morsels
+    /// (`next`, `next + step`, …) instead of stealing whichever is free.
+    ///
+    /// The aggregate path needs that: a lane folds every morsel it reads into one
+    /// partial group set, so the order its float sums are added in is the order
+    /// morsels reached the lane. Stealing makes that order depend on thread
+    /// timing, and the run's totals wobble in their last bits. Fixed slices cost
+    /// balance only when row groups are uneven, whereas the map path — which
+    /// combines nothing across morsels — keeps stealing and stays balanced.
+    fixed: ?struct { next: usize, step: usize } = null,
+
+    /// The next morsel index this source should read, or null when it is done.
+    fn nextIndex(self: *MorselSource) ?usize {
+        if (self.fixed) |*f| {
+            if (f.next >= self.m.queue.nitems) return null;
+            defer f.next += f.step;
+            return f.next;
+        }
+        const i = self.m.queue.next.fetchAdd(1, .seq_cst);
+        return if (i >= self.m.queue.nitems) null else i;
+    }
 
     fn schemaFn(ptr: *anyopaque) types.Schema {
         const self: *MorselSource = @ptrCast(@alignCast(ptr));
@@ -1348,8 +1518,7 @@ const MorselSource = struct {
                 self.cur = null;
             }
             if (self.m.queue.failed.load(.seq_cst)) return null;
-            const i = self.m.queue.next.fetchAdd(1, .seq_cst);
-            if (i >= self.m.queue.nitems) return null;
+            const i = self.nextIndex() orelse return null;
             const r = try pqdecode.Reader.openProjected(self.scratch, self.m.path, self.m.project);
             r.bounds = self.m.bounds;
             r.rg = i * self.m.per_item;
@@ -1372,7 +1541,11 @@ fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
     const ls = &ctx.lanes[lane_idx];
     const la = ls.arena.allocator();
 
-    var ms = MorselSource{ .m = &ctx.morsels, .scratch = la };
+    var ms = MorselSource{
+        .m = &ctx.morsels,
+        .scratch = la,
+        .fixed = .{ .next = lane_idx, .step = ctx.lanes.len },
+    };
     var cs = obs.CountingSource{ .inner = .{ .ptr = &ms, .vtable = &MorselSource.vtable }, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     const child = try buildMapChain(la, ctx.params, ctx.prefix, &scan, ctx.morsels.src_schema);
@@ -1392,17 +1565,20 @@ fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
     try bucketLane(ls);
 }
 
-/// Split this lane's groups into radix buckets — one hash per group, once.
-/// Split this lane's group indices into radix buckets, reusing the hash the
-/// fold already produced.
-fn bucketLane(ls: *PqLane) !void {
-    const a = ls.arena.allocator();
-    ls.buckets = try a.alloc(std.array_list.Managed(u32), pq_parts);
-    for (ls.buckets) |*b| b.* = std.array_list.Managed(u32).init(a);
-    for (ls.hashes, 0..) |h, i| {
+/// Split group indices into radix buckets, reusing the hash the fold already
+/// produced. Shared by the parquet lanes and the CSV/SQL slots.
+fn bucketByHash(a: std.mem.Allocator, hashes: []const u64) ![]std.array_list.Managed(u32) {
+    const buckets = try a.alloc(std.array_list.Managed(u32), pq_parts);
+    for (buckets) |*b| b.* = std.array_list.Managed(u32).init(a);
+    for (hashes, 0..) |h, i| {
         const p: usize = @intCast((h >> 32) % pq_parts);
-        try ls.buckets[p].append(@intCast(i));
+        try buckets[p].append(@intCast(i));
     }
+    return buckets;
+}
+
+fn bucketLane(ls: *PqLane) !void {
+    ls.buckets = try bucketByHash(ls.arena.allocator(), ls.hashes);
 }
 
 const PqMergeCtx = struct {
@@ -1415,24 +1591,33 @@ const PqMergeCtx = struct {
 const pqMergeWorker = dispatchWorker(PqMergeCtx, pqMergeOne);
 
 fn pqMergeOne(ctx: *PqMergeCtx, p: usize) !void {
-    const dst = &ctx.parts[p];
+    return mergeRadixPart(&ctx.parts[p], ctx.lanes, ctx.aggs, p);
+}
+
+/// Merge radix partition `p` of a set of partials into `dst`. `srcs` is a slice of
+/// anything carrying `groups`/`hashes`/`buckets` — parquet lanes or CSV/SQL slots —
+/// and is walked in index order, which is what keeps a float SUM from depending on
+/// thread timing (see `AggSlot`). A partition owns its keys outright, so the tasks
+/// need no lock between them, which is what stops a high-cardinality merge from
+/// serialising behind one table.
+fn mergeRadixPart(dst: *PqPart, srcs: anytype, aggs: []const op.Aggregate.Agg, p: usize) !void {
     const da = dst.arena.allocator();
     var tbl = try op.Aggregate.MergeTable.init(da, 256);
     var hashes = std.array_list.Managed(u64).init(da);
     var any_distinct = false;
-    for (ctx.aggs) |a| {
+    for (aggs) |a| {
         if (a.distinct) any_distinct = true;
     }
-    for (ctx.lanes) |*ls| {
+    for (srcs) |*ls| {
         if (ls.buckets.len == 0) continue;
         for (ls.buckets[p].items) |gi| {
             const g = ls.groups[gi];
             const h = ls.hashes[gi];
             if (try tbl.find(h, g.key_vals, dst.groups.items, hashes.items, dst.groups.items.len)) |at| {
                 const cg = &dst.groups.items[at];
-                for (g.accs, ctx.aggs, 0..) |src, agg, j| try op.Aggregate.mergeAcc(da, &cg.accs[j], src, agg);
+                for (g.accs, aggs, 0..) |src, agg, j| try op.Aggregate.mergeAcc(da, &cg.accs[j], src, agg);
             } else {
-                try dst.groups.append(try op.Aggregate.adoptOne(da, g, ctx.aggs, any_distinct));
+                try dst.groups.append(try op.Aggregate.adoptOne(da, g, aggs, any_distinct));
                 try hashes.append(h);
             }
         }
@@ -1858,8 +2043,10 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
     env.sink_name = sinkLabel(env, w);
 
     const nthreads = @max(@as(usize, 1), opts.threads);
-    var cmap = op.Aggregate.GroupMap().init(arena);
-    var cgroups = std.array_list.Managed(op.Aggregate.Group).init(arena);
+    const slots = try allocAggSlots(env.gpa, nthreads);
+    defer freeAggSlots(env.gpa, slots);
+    const parts = try allocMergeParts(env.gpa);
+    defer freeMergeParts(env.gpa, parts);
     var ctx = AggCtx{
         .mapped = mapped,
         .csv_schema = &mapped.schema,
@@ -1870,9 +2057,7 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
         .by = apl.by,
         .aggs = aggs,
         .queue = .{ .nitems = nthreads },
-        .cmap = &cmap,
-        .cgroups = &cgroups,
-        .plan_arena = arena,
+        .slots = slots,
         .rows_read = env.rows_read,
     };
 
@@ -1882,7 +2067,8 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
 
     if (ctx.queue.first_err) |e| return e;
 
-    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, cgroups.items);
+    const cgroups = try combineAggSlots(env, slots, aggs, opts.threads, parts);
+    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, cgroups);
 
     const wr = try resolveUpsertKeys(env, w);
     const snk = try openSink(env, wr, out_schema.*);
@@ -1897,9 +2083,10 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
 
 /// Shared state for parallel SQL-aggregate lanes. Mirrors `AggCtx`, but each lane opens
 /// its own DB connection over one key-range predicate (`openSplitSource`) instead of
-/// reading a CSV byte-range. Each lane folds its range into a thread-local partial group
-/// set, then merges it into the combined set under `mtx` at the raw-`Acc` level (so AVG
-/// stays correct). The merge is O(groups) vs the O(rows) fold, so contention is low.
+/// reading a CSV byte-range. Each lane folds its range into that range's `AggSlot`, and
+/// `combineAggSlots` folds the slots together in key-range order at the raw-`Acc` level
+/// (so AVG stays correct, and a float SUM adds the same way on every run). The combine is
+/// O(groups) vs the O(rows) fold, so it costs little next to the scan.
 const SqlAggCtx = struct {
     split: SplitCtx,
     predicates: []const []const u8,
@@ -1913,24 +2100,18 @@ const SqlAggCtx = struct {
     by: []const usize,
     aggs: []const op.Aggregate.Agg,
     queue: WorkQueue,
-    cmap: *op.Aggregate.GroupMap(),
-    cgroups: *std.array_list.Managed(op.Aggregate.Group),
-    mtx: std.Thread.Mutex = .{},
-    plan_arena: std.mem.Allocator,
+    slots: []AggSlot,
     rows_read: *std.atomic.Value(u64),
 };
 
 const sqlAggWorker = dispatchWorker(SqlAggCtx, sqlAggWorkOne);
 
 fn sqlAggWorkOne(ctx: *SqlAggCtx, i: usize) !void {
-    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
-    defer _ = wgpa.deinit();
-    var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
-    defer warena.deinit();
-    const wa = warena.allocator();
+    const slot = &ctx.slots[i];
+    const wa = slot.arena.allocator();
 
     const q = try splitmod.wrapProjected(wa, ctx.split.base_sql, ctx.proj_select, ctx.predicates[i], ctx.where_extra);
-    const src = try openSqlQuery(&ctx.split, wgpa.allocator(), q);
+    const src = try openSqlQuery(&ctx.split, slot.gpa.allocator(), q);
     defer src.close();
 
     var cs = obs.CountingSource{ .inner = src, .count = ctx.rows_read };
@@ -1944,13 +2125,13 @@ fn sqlAggWorkOne(ctx: *SqlAggCtx, i: usize) !void {
         .out_schema = ctx.out_schema,
         .err = null,
         .state = wa,
-        .gpa = wgpa.allocator(),
+        .gpa = slot.gpa.allocator(),
     };
-    const groups = try agg.drainGroups();
-
-    ctx.mtx.lock();
-    defer ctx.mtx.unlock();
-    try op.Aggregate.mergeGroups(ctx.cmap, ctx.cgroups, ctx.plan_arena, groups, ctx.aggs);
+    const drained = try agg.drainGroupsHashed();
+    slot.groups = drained.groups;
+    slot.hashes = drained.hashes;
+    slot.buckets = try bucketByHash(wa, drained.hashes);
+    slot.done = true;
 }
 
 /// Parallel SQL aggregate: `read <sqltable> | (filter|select)* | aggregate | (sort|limit)* | write`
@@ -1989,8 +2170,12 @@ fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.S
     env.sink_name = sinkLabel(env, w);
 
     const nlanes = @min(@max(@as(usize, 1), opts.threads), sp.predicates.len);
-    var cmap = op.Aggregate.GroupMap().init(arena);
-    var cgroups = std.array_list.Managed(op.Aggregate.Group).init(arena);
+    // One slot per key range, not per lane: the lanes steal ranges off the queue,
+    // so only the range index is a stable identity to combine in.
+    const slots = try allocAggSlots(env.gpa, sp.predicates.len);
+    defer freeAggSlots(env.gpa, slots);
+    const parts = try allocMergeParts(env.gpa);
+    defer freeMergeParts(env.gpa, parts);
     var ctx = SqlAggCtx{
         .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql },
         .predicates = sp.predicates,
@@ -2004,9 +2189,7 @@ fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.S
         .by = apl.by,
         .aggs = aggs,
         .queue = .{ .nitems = sp.predicates.len },
-        .cmap = &cmap,
-        .cgroups = &cgroups,
-        .plan_arena = arena,
+        .slots = slots,
         .rows_read = env.rows_read,
     };
 
@@ -2022,7 +2205,8 @@ fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.S
 
     if (ctx.queue.first_err) |e| return e;
 
-    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, cgroups.items);
+    const cgroups = try combineAggSlots(env, slots, aggs, opts.threads, parts);
+    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, cgroups);
 
     const snk = try openSink(env, w, out_schema.*);
     var snk_open = true;
@@ -3126,9 +3310,41 @@ const LoopRow = struct {
     names: []const []const u8,
     types: []const ?types.Type = &.{},
     cells: Row,
+    /// Script scope — the PARAMs and LETs — searched after this row's own names,
+    /// which is what makes the innermost binding win (§9's scope rule).
+    ///
+    /// It is deliberately consulted by the *string* interpolation only, never by
+    /// `renderExpr`'s bare-name folding: `$p` in an expression is already a folded
+    /// literal by the time a pipeline runs (expand.zig did it), and a bare name
+    /// here is a column, so folding script scope into expressions would let a
+    /// param quietly displace a same-named column. A `${...}` hole is the one
+    /// place the value is still a needle in a string.
+    outer: ?*const LoopRow = null,
 
     fn typeAt(self: LoopRow, i: usize) ?types.Type {
         return if (i < self.types.len) self.types[i] else null;
+    }
+
+    /// This row's bindings followed by every enclosing scope's, in lookup order.
+    fn appendScope(
+        self: LoopRow,
+        arena: std.mem.Allocator,
+        names: *std.array_list.Managed([]const u8),
+        vals: *std.array_list.Managed(Value),
+    ) !void {
+        for (self.names, self.cells, 0..) |nm, cell, i| {
+            try names.append(nm);
+            try vals.append(loopValue(arena, cell, self.typeAt(i)));
+        }
+        if (self.outer) |o| try o.appendScope(arena, names, vals);
+    }
+
+    /// The text bound to a bare `${name}`, searching this row then outwards.
+    fn lookup(self: LoopRow, name: []const u8) ?[]const u8 {
+        for (self.names, self.cells) |nm, val| {
+            if (std.mem.eql(u8, nm, name)) return val;
+        }
+        return if (self.outer) |o| o.lookup(name) else null;
     }
 };
 
@@ -3317,15 +3533,11 @@ fn interpAll(arena: std.mem.Allocator, s: []const u8, lr: LoopRow) ![]const u8 {
             };
             const inner = s[i + 2 .. close];
             if (bareInterp(inner)) {
-                var found = false;
-                for (lr.names, lr.cells) |nm, val| {
-                    if (std.mem.eql(u8, nm, inner)) {
-                        try out.appendSlice(val);
-                        found = true;
-                        break;
-                    }
+                if (lr.lookup(inner)) |val| {
+                    try out.appendSlice(val);
+                } else {
+                    try out.appendSlice(s[i .. close + 1]);
                 }
-                if (!found) try out.appendSlice(s[i .. close + 1]);
             } else {
                 try out.appendSlice(try evalInterpExpr(arena, inner, lr));
             }
@@ -3430,9 +3642,10 @@ fn evalInterpExpr(arena: std.mem.Allocator, text: []const u8, lr: LoopRow) ![]co
         std.debug.print("[interp] ${{{s}}}: {s}\n", .{ text, why });
         return error.InterpFailed;
     }
-    const vals = try arena.alloc(Value, lr.cells.len);
-    for (lr.cells, vals, 0..) |cell, *v, i| v.* = loopValue(arena, cell, lr.typeAt(i));
-    const result = eval.constEval(arena, e, lr.names, vals) catch |err| {
+    var names = std.array_list.Managed([]const u8).init(arena);
+    var vals = std.array_list.Managed(Value).init(arena);
+    try lr.appendScope(arena, &names, &vals);
+    const result = eval.constEval(arena, e, names.items, vals.items) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         std.debug.print("[interp] ${{{s}}}: {s}\n", .{ text, @errorName(err) });
         return error.InterpFailed;
@@ -3659,7 +3872,7 @@ fn forWorker(ctx: *ForCtx, _: usize) void {
         w_env.errctx = &w_errctx;
         var st = Stats{ .run_id = 0 };
         var lanes: usize = 1;
-        const lr = LoopRow{ .names = ctx.needles, .types = ctx.fe.var_types, .cells = row };
+        const lr = LoopRow{ .names = ctx.needles, .types = ctx.fe.var_types, .cells = row, .outer = &w_env.script_scope };
         if (runForBody(&w_env, ctx.fe.body, lr, ctx.worker_opts, &st, &lanes, &w_batch)) |_| {
             _ = ctx.rows_out.fetchAdd(st.rows_out, .monotonic);
             if (ctx.outcomes) |sink| sink.record(row[0], true, "", false);
@@ -3710,6 +3923,39 @@ const max_call_depth = 16;
 
 /// No loop variables in scope — the binding a top-level `CALL` starts from.
 const no_loop_vars = LoopRow{ .names = &[_][]const u8{}, .cells = &[_][]const u8{} };
+
+/// The PARAMs and LETs as interpolation bindings, rendered to text the same way a
+/// discovery cell is. `params` already holds both by the time this runs
+/// (`resolveLets` folds LETs into it), and map order does not matter: names are
+/// unique, so a lookup finds the same binding whatever the order.
+fn buildScriptScope(arena: std.mem.Allocator, params: *std.StringHashMap(Value)) !LoopRow {
+    const n = params.count();
+    if (n == 0) return no_loop_vars;
+    const names = try arena.alloc([]const u8, n);
+    const cells = try arena.alloc([]const u8, n);
+    var i: usize = 0;
+    var it = params.iterator();
+    while (it.next()) |kv| {
+        names[i] = kv.key_ptr.*;
+        cells[i] = try eval.valueToString(arena, kv.value_ptr.*);
+        i += 1;
+    }
+    return .{ .names = names, .cells = cells };
+}
+
+/// Interpolate a statement's `${...}` holes against script scope alone — what a
+/// `LOAD INTO`/`SELECT` outside any `FOR EACH` needs, since `IDENTIFIER(...)` is
+/// lowered to a template string by the parser and a plain script had nothing to
+/// render it. Cheap to skip when the script declares no PARAM or LET, and it
+/// leaves expressions alone (see `LoopRow.outer`).
+fn renderScriptScope(env: *Env, p: ast.Pipeline) !ast.Pipeline {
+    if (env.script_scope.names.len == 0) return p;
+    return renderPipeline(env.arena, p, .{
+        .names = &[_][]const u8{},
+        .cells = &[_][]const u8{},
+        .outer = &env.script_scope,
+    });
+}
 
 /// `CALL f(a, b)` — a plan-time statement macro. The declared parameters become
 /// loop variables and the argument values their cells, so the body is rendered and
@@ -3872,7 +4118,7 @@ fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes
                 // Cleared per row so a failure never reports the previous row's message.
                 env.diag.retryable = false;
                 env.diag.msg = "";
-                const lr = LoopRow{ .names = needles, .types = fe.var_types, .cells = row };
+                const lr = LoopRow{ .names = needles, .types = fe.var_types, .cells = row, .outer = &env.script_scope };
                 if (runForBody(env, fe.body, lr, opts, stats, lanes_used, batch_arena)) |_| {
                     for (env.sources.items[base..]) |sc| sc.close();
                     env.sources.shrinkRetainingCapacity(base);
@@ -5549,6 +5795,115 @@ test "parallel CSV aggregate: grouped agg (threads>1) merges partials by key" {
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, par, "\n"));
 }
 
+// A float SUM whose value depends on the order the chunk partials are added:
+// 1e16 has a spacing of 2, so `1e16 + 1` is 1e16 exactly, and adding the small
+// values first is the only way the ones survive. The big value sits in the last
+// row, hence the last chunk, so combining the chunks in index order sums the
+// eight 1.0s before it and lands on 1e16 + 8 (even, so exact). Combining in
+// completion order would drop some of them.
+const float_order_csv =
+    "g,v\n" ++
+    "a,1\n" ++ "a,1\n" ++ "a,1\n" ++ "a,1\n" ++
+    "a,1\n" ++ "a,1\n" ++ "a,1\n" ++ "a,1\n" ++
+    "a,10000000000000000\n";
+
+test "parallel CSV aggregate: float SUM combines partials in chunk order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try runCsvThreaded(alloc, &tmp, float_order_csv,
+        "SELECT g, SUM(CAST(v AS FLOAT)) AS s FROM '$IN' GROUP BY g",
+        4);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("g,s\na,10000000000000008\n", out);
+}
+
+test "parallel CSV aggregate: float SUM is identical across runs at one -j" {
+    const alloc = std.testing.allocator;
+    // Same input every round; only the thread scheduling can differ. Any run that
+    // disagrees with the first means partials are being combined in arrival order.
+    var first: ?[]u8 = null;
+    defer if (first) |f| alloc.free(f);
+    for (0..8) |_| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const out = try runCsvThreaded(alloc, &tmp, float_order_csv,
+            "SELECT g, SUM(CAST(v AS FLOAT)) AS s FROM '$IN' GROUP BY g",
+            8);
+        if (first) |f| {
+            defer alloc.free(out);
+            try std.testing.expectEqualStrings(f, out);
+        } else {
+            first = out;
+        }
+    }
+}
+
+test "parallel CSV aggregate: high-cardinality combine is partitioned and exact" {
+    const alloc = std.testing.allocator;
+    // Above `agg_combine_parallel_min`, so this takes the radix-partitioned
+    // combine rather than the single pass.
+    const ngroups = (agg_combine_parallel_min * 3) / 2;
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    try input.appendSlice("k,v\n");
+    for (0..ngroups) |k| {
+        // Each key twice, so every group must come back with count 2 and sum 3.
+        try input.writer().print("{d},1\n{d},2\n", .{ k, k });
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try runCsvThreaded(alloc, &tmp, input.items,
+        "SELECT k, COUNT(*) AS c, SUM(CAST(v AS INT)) AS s FROM '$IN' GROUP BY k",
+        4);
+    defer alloc.free(out);
+
+    var seen: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, out, '\n');
+    _ = it.next(); // header
+    while (it.next()) |line| {
+        var f = std.mem.tokenizeScalar(u8, line, ',');
+        const k = f.next().?;
+        try std.testing.expectEqualStrings("2", f.next().?);
+        try std.testing.expectEqualStrings("3", f.next().?);
+        // Every key must be one of the ones written, and appear once.
+        const kv = try std.fmt.parseInt(usize, k, 10);
+        try std.testing.expect(kv < ngroups);
+        seen += 1;
+    }
+    try std.testing.expectEqual(ngroups, seen);
+}
+
+test "parallel CSV aggregate: the partitioned combine is reproducible" {
+    const alloc = std.testing.allocator;
+    const ngroups = (agg_combine_parallel_min * 3) / 2;
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    try input.appendSlice("k,v\n");
+    // Values that only add up the same way if the partials are combined in a
+    // fixed order, as in the low-cardinality test above.
+    for (0..ngroups) |k| {
+        try input.writer().print("{d},1\n{d},1\n{d},10000000000000000\n", .{ k, k, k });
+    }
+
+    var first: ?[]u8 = null;
+    defer if (first) |f| alloc.free(f);
+    for (0..4) |_| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const out = try runCsvThreaded(alloc, &tmp, input.items,
+            "SELECT k, SUM(CAST(v AS FLOAT)) AS s FROM '$IN' GROUP BY k ORDER BY k",
+            8);
+        if (first) |f| {
+            defer alloc.free(out);
+            try std.testing.expectEqualStrings(f, out);
+        } else {
+            first = out;
+        }
+    }
+}
+
 test "distinct: multi-column key (value-keyed)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5837,6 +6192,162 @@ test "param substitution filters by a CLI-bound value" {
     const out = try runScript(alloc, &tmp, script, &[_]ParamArg{.{ .key = "min", .val = "100" }});
     defer alloc.free(out);
     try std.testing.expectEqualStrings("id\n1\n2\n", out);
+}
+
+test "IDENTIFIER path: a PARAM resolves outside any FOR EACH" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n1\n2\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    // The parser lowers IDENTIFIER(...) to a `${...}` template, which only the
+    // for-each renderer used to fill in — a plain script opened the literal
+    // path `<dir>/${name}.csv` and failed with FileNotFound.
+    const script = try std.fmt.allocPrint(alloc,
+        "PARAM dir STRING DEFAULT '{s}';\nPARAM name STRING DEFAULT 'in';\n" ++
+            "LOAD INTO '{s}' AS SELECT id FROM IDENTIFIER($dir || '/' || $name || '.csv');",
+        .{ base, out_path },
+    );
+    defer alloc.free(script);
+
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id\n1\n2\n", out);
+}
+
+test "IDENTIFIER path: a LET resolves, and an expression hole sees script scope" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n7\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "LET dir = '{s}';\nPARAM name STRING DEFAULT 'IN';\n" ++
+            "LOAD INTO '{s}' AS SELECT id FROM IDENTIFIER($dir || '/' || lower($name) || '.csv');",
+        .{ base, out_path },
+    );
+    defer alloc.free(script);
+
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id\n7\n", out);
+}
+
+test "IDENTIFIER path: a loop variable shadows a same-named PARAM" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n5\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    // `name` is bound in both scopes; §9's rule is that the innermost wins, so
+    // the read must resolve to in.csv and not to the param's `absent`.
+    const script = try std.fmt.allocPrint(alloc,
+        "PARAM dir STRING DEFAULT '{s}';\nPARAM name STRING DEFAULT 'absent';\n" ++
+            "FOR EACH ROW OF (SELECT 'in' AS name) AS (name)\n" ++
+            "  LOAD INTO '{s}' AS SELECT id FROM IDENTIFIER($dir || '/' || $name || '.csv');\n" ++
+            "END FOR;",
+        .{ base, out_path },
+    );
+    defer alloc.free(script);
+
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id\n5\n", out);
+}
+
+test "LOAD INTO IDENTIFIER: one output file per for-each row" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "cat.csv", .data = "r\nnorth\nsouth\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "LET dir = '{s}';\n" ++
+            "FOR EACH ROW OF (SELECT r FROM '{s}/cat.csv') AS (r)\n" ++
+            "  LOAD INTO IDENTIFIER($dir || '/out_' || $r || '.csv') AS SELECT $r AS region;\n" ++
+            "END FOR;",
+        .{ base, base },
+    );
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    _ = run(alloc, prog, .{}, &rdiag) catch |e| {
+        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+        return e;
+    };
+
+    const north = try tmp.dir.readFileAlloc(alloc, "out_north.csv", 1 << 16);
+    defer alloc.free(north);
+    try std.testing.expectEqualStrings("region\nnorth\n", north);
+    const south = try tmp.dir.readFileAlloc(alloc, "out_south.csv", 1 << 16);
+    defer alloc.free(south);
+    try std.testing.expectEqualStrings("region\nsouth\n", south);
+}
+
+test "aggregate: a literal tag sits beside an aggregate" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try runToString(alloc, &tmp,
+        "id,g\n1,a\n2,b\n3,a\n",
+        "SELECT 'nightly' AS run, COUNT(*) AS c FROM '$IN'",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("run,c\nnightly,3\n", out);
+}
+
+test "aggregate: a PARAM tag sits beside a grouped aggregate, in select order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,g\n1,a\n2,b\n3,a\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
+    defer alloc.free(in_path);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "PARAM tag STRING DEFAULT 'x';\nLOAD INTO '{s}' AS " ++
+            "SELECT $tag AS run, g, COUNT(*) AS c FROM '{s}' GROUP BY g ORDER BY g;",
+        .{ out_path, in_path },
+    );
+    defer alloc.free(script);
+
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{.{ .key = "tag", .val = "nightly" }});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("run,g,c\nnightly,a,2\nnightly,b,1\n", out);
+}
+
+test "aggregate: a bare column beside an aggregate is still refused" {
+    const alloc = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(alloc);
+    defer ar.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    // `g` has no single value per group; only constants get the new pass.
+    const r = parser.parseSource(ar.allocator(),
+        "LOAD INTO '/tmp/o.csv' AS SELECT g, COUNT(*) AS c FROM 'in.csv';", &pdiag);
+    try std.testing.expectError(error.ParseFailed, r);
+    try std.testing.expect(std.mem.indexOf(u8, pdiag.msg, "neither an aggregate nor a grouping key") != null);
 }
 
 test "explode splits a delimited column into rows" {

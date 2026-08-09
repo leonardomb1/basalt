@@ -81,6 +81,54 @@ pub fn isPrefix(url: []const u8) bool {
     return isUrl(url) and std.mem.endsWith(u8, url, "/");
 }
 
+/// Why the bucket in this `s3://` URL cannot name a bucket, or null when it can.
+///
+/// Bucket naming is a property of the URL text, so it is knowable without asking
+/// the service. Left to the service it came back as a bare 400 mapped to
+/// `S3RequestFailed`, which tells an operator nothing — `s3://bt/x.csv` failed
+/// only because a bucket needs three characters. Checked at plan time instead, so
+/// `basalt check` catches it.
+///
+/// These are the DNS-compatible rules AWS requires and MinIO enforces; the
+/// stricter trivia (IP-address-shaped names, `xn--` prefixes) is left to the
+/// service, which rejects those with a message that does name the problem.
+pub fn bucketNameError(url: []const u8) ?[]const u8 {
+    if (!isUrl(url)) return null;
+    const rest = url["s3://".len..];
+    const bucket = std.mem.sliceTo(rest, '/');
+    if (bucket.len < 3 or bucket.len > 63)
+        return "a bucket name is 3 to 63 characters";
+    for (bucket) |c| {
+        if (std.ascii.isUpper(c)) return "a bucket name cannot contain uppercase letters";
+        const ok = std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '-' or c == '.';
+        if (!ok) return "a bucket name may hold only lowercase letters, digits, `-` and `.`";
+    }
+    const first = bucket[0];
+    const last = bucket[bucket.len - 1];
+    if (!(std.ascii.isLower(first) or std.ascii.isDigit(first)) or
+        !(std.ascii.isLower(last) or std.ascii.isDigit(last)))
+        return "a bucket name must start and end with a letter or digit";
+    if (std.mem.indexOf(u8, bucket, "..") != null)
+        return "a bucket name cannot contain two adjacent dots";
+    return null;
+}
+
+test "bucketNameError accepts real names and explains the rejects" {
+    try std.testing.expect(bucketNameError("s3://basalt-it/seed.csv") == null);
+    try std.testing.expect(bucketNameError("s3://a.b.c/k") == null);
+    try std.testing.expect(bucketNameError("s3://bucket/") == null);
+    // Not an s3 URL: not this function's business.
+    try std.testing.expect(bucketNameError("/tmp/x.csv") == null);
+    try std.testing.expect(bucketNameError("az://acct/c/x.csv") == null);
+
+    try std.testing.expect(bucketNameError("s3://bt/x.csv") != null);
+    try std.testing.expect(bucketNameError("s3://Bucket/x.csv") != null);
+    try std.testing.expect(bucketNameError("s3://my_bucket/x.csv") != null);
+    try std.testing.expect(bucketNameError("s3://-lead/x.csv") != null);
+    try std.testing.expect(bucketNameError("s3://trail-/x.csv") != null);
+    try std.testing.expect(bucketNameError("s3://a..b/x.csv") != null);
+}
+
 pub fn endpointFromEnv(arena: std.mem.Allocator) ?[]const u8 {
     return std.process.getEnvVarOwned(arena, env_endpoint) catch null;
 }

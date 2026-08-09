@@ -83,7 +83,12 @@ detail; `--log-format json` switches stderr to NDJSON for collectors.
 - Execution streams; memory is bounded by batch size, not file size.
 - `WHERE` against a database table runs in the database. The plan shows what
   was pushed down.
-- Parquet pipelines run in parallel over row-group morsels; `-j` controls it.
+- Parquet pipelines run in parallel over row-group morsels, local CSV pipelines
+  over byte-range chunks, a splittable database read over key ranges; `-j`
+  controls it and `EXPLAIN` names which one a query gets.
+- A rerun reproduces its output. Parallel aggregates total their slices in a
+  fixed order rather than in completion order, so the same command over the same
+  data writes the same bytes at the same `-j`.
 - One process, one allocation strategy, no garbage collector.
 
 ## Credentials
@@ -91,7 +96,9 @@ detail; `--log-format json` switches stderr to NDJSON for collectors.
 Secrets never appear in a script. A connection named `erp` resolves `ERP_USER`
 and `ERP_PASS` from the environment; explicit `user = ...` / `password = ...`
 options override that. Azure Blob uses `AZURE_STORAGE_KEY`, and
-`AZURE_BLOB_ENDPOINT` points it at an emulator.
+`AZURE_BLOB_ENDPOINT` points it at an emulator. S3 uses `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` (plus `AWS_SESSION_TOKEN` and `AWS_REGION` when they
+apply), with `AWS_ENDPOINT_URL` for MinIO and the like.
 
 ## Documentation
 
