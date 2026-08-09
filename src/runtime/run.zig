@@ -6422,6 +6422,39 @@ test "aggregate: a PARAM tag sits beside a grouped aggregate, in select order" {
     try std.testing.expectEqualStrings("run,g,c\nnightly,a,2\nnightly,b,1\n", out);
 }
 
+test "aggregate: a loop variable and a function parameter count as constants" {
+    const alloc = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(alloc);
+    defer ar.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+
+    // A loop variable is script scope per §9's rule, exactly as a PARAM is, so it
+    // has one value per row and may sit beside an aggregate. This was refused while
+    // the same shape with a PARAM was allowed — `SELECT $tabela, COUNT(*)` over a
+    // discovered catalog is the whole point of a for-each.
+    _ = try parser.parseSource(ar.allocator(),
+        "FOR EACH ROW OF (SELECT 'z' AS x) AS (x)\n" ++
+            "  LOAD INTO '/tmp/o.csv' AS SELECT $x AS a, COUNT(*) AS n FROM 'in.csv';\n" ++
+            "END FOR;", &pdiag);
+
+    // Same for a statement function's parameters, which bind the same way.
+    _ = try parser.parseSource(ar.allocator(),
+        "CREATE FUNCTION f(t) AS\n" ++
+            "  LOAD INTO '/tmp/o.csv' AS SELECT $t AS a, COUNT(*) AS n FROM 'in.csv';\n" ++
+            "END;\nCALL f('x');", &pdiag);
+
+    // Scoped to the body: outside it the name is an ordinary column again, and a
+    // column beside an aggregate is still refused.
+    var d2: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const r = parser.parseSource(ar.allocator(),
+        "FOR EACH ROW OF (SELECT 'z' AS x) AS (x)\n" ++
+            "  LOAD INTO '/tmp/o.csv' AS SELECT $x AS a FROM 'in.csv';\n" ++
+            "END FOR;\n" ++
+            "LOAD INTO '/tmp/p.csv' AS SELECT x, COUNT(*) AS n FROM 'in.csv';", &d2);
+    try std.testing.expectError(error.ParseFailed, r);
+    try std.testing.expect(std.mem.indexOf(u8, d2.msg, "neither an aggregate") != null);
+}
+
 test "aggregate: a bare column beside an aggregate is still refused" {
     const alloc = std.testing.allocator;
     var ar = std.heap.ArenaAllocator.init(alloc);

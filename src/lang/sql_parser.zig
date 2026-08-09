@@ -665,10 +665,15 @@ pub const Parser = struct {
         try self.expectKw("as");
 
         if (self.atStmtBody()) {
+            // A statement function's parameters bind like loop variables (§9), so
+            // they are script-scope constants inside the body for the same reason.
+            const const_base = self.const_names.items.len;
+            for (params.items) |p| try self.const_names.append(p.name);
             var body = std.array_list.Managed(ast.Stmt).init(self.arena);
             while (!self.at(.eof) and !self.isKw("end")) {
                 try self.parseStatement(&body);
             }
+            self.const_names.shrinkRetainingCapacity(const_base);
             try self.expectKw("end");
             _ = try self.expect(.semi);
             if (body.items.len == 0)
@@ -1899,10 +1904,19 @@ pub const Parser = struct {
             } else break;
         }
 
+        // The loop variables are script-scope constants inside the body, exactly as
+        // a PARAM is: `$name` resolves per row before a row is read. Registering them
+        // is what lets one sit beside an aggregate (`SELECT $tabela, COUNT(*)`),
+        // which was refused while the same shape with a PARAM was allowed.
+        const const_base = self.const_names.items.len;
+        for (names.items) |n| try self.const_names.append(n);
+
         var body = std.array_list.Managed(ast.Stmt).init(self.arena);
         while (!self.at(.eof) and !self.isKw("end")) {
             try self.parseStatement(&body);
         }
+        // Scoped to the body: outside it the name is an ordinary column again.
+        self.const_names.shrinkRetainingCapacity(const_base);
         try self.expectKw("end");
         try self.expectKw("for");
         _ = self.eat(.semi);
