@@ -273,7 +273,12 @@ Source clauses, in any order after the source:
   probe side is the one that gets null-extended), never when a referenced column
   could have come from the right side, and the key twin only under an inner join.
   `EXPLAIN` shows where the filter ended up. Translatable: comparisons,
-  `AND`/`OR`/`NOT`, `IS [NOT] NULL`/`EMPTY`, `IN`, `LIKE`, `CASE`/`IF`, `CAST`, and the portable string
+  `AND`/`OR`/`NOT`, `IS [NOT] NULL`/`EMPTY`, `IN`, `LIKE`, `CASE`/`IF`, `CAST` (but
+  not one converting text to a number — the sources disagree about what
+  `CAST('abc' AS INT)` means, NULL in StarRocks and MySQL against an error in
+  Postgres and here, so descending it would make the answer depend on whether it
+  descended; put the expression in a raw `QUERY(...)` to ask for the source's own
+  coercion), and the portable string
   functions (`lower upper length trim substr replace concat coalesce
   starts_with ends_with contains`). Untranslatable pieces (arithmetic,
   `now()`/`today()`, user funcs) stay in the engine — the filter is always
@@ -665,7 +670,12 @@ At a use site the innermost binding wins: loop var > LET/PARAM.
 - `a ?? b` — null-coalesce (sugar for `COALESCE`).
 - `CAST(x AS INT)` / `CAST(x AS DECIMAL(18,2))` / `CAST(x AS DATE)` /
   `CAST(x AS TIMESTAMP)` — implicit widening is int→float/decimal only. Text
-  parses as `YYYY-MM-DD[ HH:MM:SS]`.
+  parses as `YYYY-MM-DD[ HH:MM:SS]`. Text to a number is **strict**: an optional
+  sign, digits and at most one `.`, and anything else fails rather than being
+  guessed at. That matters wherever money is written the Brazilian or European way
+  — `'1000,00'` is not a number basalt will read, and it used to come back as
+  100000.00. Strip the separator first: `CAST(replace(v, ',', '.') AS
+  DECIMAL(18,2))`, or reach for `TRY_CAST` to turn unreadable values into nulls.
 - A `DATE`/`TIMESTAMP` column compares directly against an ISO string literal
   (`WHERE d >= '2013-07-01'`). The literal is coerced to the column's type,
   never the reverse, and it is validated at plan time — so `'2013-13-01'` and
