@@ -541,11 +541,28 @@ const Ctx = struct {
         var stage_infos = std.array_list.Managed(Stage).init(self.arena);
         var has_breaker = false;
         var map_only = true;
+        // Tracks whether the shape is one the runtime fans out over key ranges. It
+        // dispatches three of them for a SQL source: map-only, an aggregate with a
+        // sort/limit tail, and a map+join. Anything else — a DISTINCT, or a sort
+        // with no aggregate under it — falls to the serial driver.
+        var sql_fanout = true;
+        var seen_breaker = false;
         var cur: ?types.Schema = source.schema;
         for (stages[1 .. stages.len - 1]) |st| {
             var si = try self.stageInfo(st);
             if (si.breaker) has_breaker = true;
             if (!isMapStage(st.node)) map_only = false;
+            switch (st.node) {
+                .aggregate, .join => seen_breaker = true,
+                // A sort or a limit is a tail, which both fan-out paths carry; on its
+                // own in front of one it is a top-N, and that runs serially.
+                .sort, .limit => if (!seen_breaker) {
+                    sql_fanout = false;
+                },
+                else => if (si.breaker) {
+                    sql_fanout = false;
+                },
+            }
             if (cur) |c| {
                 cur = try self.propagate(c, st.node);
                 si.out_schema = cur;
@@ -558,7 +575,11 @@ const Ctx = struct {
 
         const src_is_sql = isSqlConnector(source.connector);
         const sink_is_parallel = isSqlConnector(sink.connector) or std.mem.eql(u8, sink.connector, "starrocks");
-        const splittable = src_is_sql and map_only and splittableRead(stages[0].node);
+        // Not `map_only`: that gate said `serial` for every aggregate over a
+        // splittable table, while `runParallelSqlAgg` fans exactly that shape into
+        // key-range lanes. It was the SQL half of the same mislabelling fixed for
+        // file sources — reported as serial, run in parallel.
+        const splittable = src_is_sql and sql_fanout and splittableRead(stages[0].node);
 
         return .{
             .source = source,
@@ -1161,6 +1182,37 @@ test "dialectFromHints: parses, and rejects what cannot work" {
     try std.testing.expectError(error.AnalyzeFailed, dialectFromHints(try mkh.hint(a, "delimiter", ";;"), &d));
     try std.testing.expectError(error.AnalyzeFailed, dialectFromHints(try mkh.hint(a, "delimiter", "\""), &d));
     try std.testing.expectError(error.AnalyzeFailed, dialectFromHints(try mkh.hint(a, "encoding", "latin9"), &d));
+}
+
+test "physical plan: which SQL shapes report a key-range split" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const conn = "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');\n";
+
+    const cases = [_]struct { q: []const u8, split: bool }{
+        // map-only: the original case
+        .{ .q = "SELECT a FROM pg.t WHERE b > 0", .split = true },
+        // an aggregate fans into key-range lanes via runParallelSqlAgg; this is the
+        // shape that used to print `serial` while running in parallel
+        .{ .q = "SELECT g, COUNT(*) AS n FROM pg.t GROUP BY g", .split = true },
+        // ... including with the sort/limit tail both fan-out paths carry
+        .{ .q = "SELECT g, COUNT(*) AS n FROM pg.t GROUP BY g ORDER BY n DESC LIMIT 5", .split = true },
+        // a top-N with nothing to fan out under it stays serial
+        .{ .q = "SELECT a FROM pg.t ORDER BY a DESC LIMIT 10", .split = false },
+        // DISTINCT is a breaker neither path handles
+        .{ .q = "SELECT DISTINCT a FROM pg.t", .split = false },
+        // a raw query read is not divisible by key range whatever its shape
+        .{ .q = "SELECT g, COUNT(*) AS n FROM pg.QUERY($$SELECT * FROM t$$) GROUP BY g", .split = false },
+    };
+
+    for (cases) |c| {
+        const src = try std.fmt.allocPrint(a, "{s}LOAD INTO '/tmp/o.csv' AS {s};", .{ conn, c.q });
+        const prog = try parse(a, src);
+        var diag = Diag{};
+        const plan = try analyze(a, prog, &diag);
+        try std.testing.expectEqual(c.split, plan.outputs[0].physical.splittable);
+    }
 }
 
 test "physical plan: which file reads divide into morsels" {
