@@ -1,7 +1,12 @@
 //! Minimal CSV source and sink. The source reads a header row into an all-string
 //! schema (empty field = null) and produces batches of string columns; the sink
 //! writes a header then serializes each batch. RFC-ish quoting: fields containing
-//! comma/quote/newline are double-quoted with `""` escaping.
+//! the delimiter, a quote or a newline are double-quoted with `""` escaping.
+//!
+//! The delimiter and the source encoding are a `Dialect`, because the CSV a
+//! government statistics office publishes is usually neither comma-separated nor
+//! UTF-8: the Brazilian securities regulator ships `;` and ISO-8859-1, and so
+//! does most of the EU.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -22,8 +27,98 @@ const BATCH_ROWS = 1024;
 /// this yields `error.StreamTooLong`).
 const LINE_BUF = 64 * 1024;
 
+/// How a file's bytes map to text. Only single-byte encodings are here: a
+/// multi-byte one would break the byte-range chunking the parallel reader depends
+/// on, and would need a decoder that spans chunk boundaries.
+pub const Encoding = enum {
+    utf8,
+    /// ISO-8859-1. Byte `b` is codepoint U+00`b`, so decoding is a table-free
+    /// widening and no byte sequence can contain a delimiter or a newline.
+    latin1,
+    /// Windows-1252. Latin-1 except for 0x80–0x9F, where it puts the curly
+    /// quotes, the dashes and the euro sign. Files labelled latin-1 are very
+    /// often really this, and decoding one as latin-1 turns a quote into a
+    /// control character rather than failing.
+    cp1252,
+
+    pub fn parse(s: []const u8) ?Encoding {
+        const norm = struct {
+            fn eq(a: []const u8, b: []const u8) bool {
+                var i: usize = 0;
+                var j: usize = 0;
+                while (true) {
+                    while (i < a.len and (a[i] == '-' or a[i] == '_')) i += 1;
+                    while (j < b.len and (b[j] == '-' or b[j] == '_')) j += 1;
+                    if (i == a.len or j == b.len) return i == a.len and j == b.len;
+                    if (std.ascii.toLower(a[i]) != std.ascii.toLower(b[j])) return false;
+                    i += 1;
+                    j += 1;
+                }
+            }
+        };
+        for ([_]struct { name: []const u8, enc: Encoding }{
+            .{ .name = "utf8", .enc = .utf8 },
+            .{ .name = "latin1", .enc = .latin1 },
+            .{ .name = "iso88591", .enc = .latin1 },
+            .{ .name = "cp1252", .enc = .cp1252 },
+            .{ .name = "windows1252", .enc = .cp1252 },
+        }) |c| if (norm.eq(s, c.name)) return c.enc;
+        return null;
+    }
+};
+
+/// The 0x80–0x9F block of Windows-1252 as codepoints; 0 marks the five slots that
+/// are undefined, which decode to U+FFFD rather than being invented.
+const cp1252_high = [32]u21{
+    0x20AC, 0, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0, 0x017D, 0,
+    0, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0, 0x017E, 0x0178,
+};
+
+pub const Dialect = struct {
+    delim: u8 = ',',
+    encoding: Encoding = .utf8,
+};
+
+/// Re-encode one field as UTF-8. Returns the input untouched when the encoding is
+/// already UTF-8 or when every byte is ASCII — which is true of most fields even
+/// in a latin-1 file (the CVM registry's dates, CNPJs and codes are all ASCII), so
+/// the ordinary field costs one scan and no allocation.
+fn decodeField(arena: std.mem.Allocator, enc: Encoding, s: []const u8) ![]const u8 {
+    if (enc == .utf8) return s;
+    var high = false;
+    for (s) |c| if (c >= 0x80) {
+        high = true;
+        break;
+    };
+    if (!high) return s;
+
+    var out = try std.array_list.Managed(u8).initCapacity(arena, s.len + 8);
+    var buf: [4]u8 = undefined;
+    for (s) |c| {
+        if (c < 0x80) {
+            out.appendAssumeCapacity(c);
+            continue;
+        }
+        const cp: u21 = switch (enc) {
+            .utf8 => unreachable,
+            .latin1 => c,
+            .cp1252 => blk: {
+                if (c > 0x9F) break :blk c;
+                const m = cp1252_high[c - 0x80];
+                break :blk if (m == 0) 0xFFFD else m;
+            },
+        };
+        const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
+        try out.appendSlice(buf[0..n]);
+    }
+    return out.toOwnedSlice();
+}
+
 pub const CsvReader = struct {
     arena: std.mem.Allocator,
+    dialect: Dialect = .{},
     backend: Backend,
     read_buf: [LINE_BUF]u8 = undefined,
     /// Line source, independent of where bytes come from: points at the file
@@ -69,10 +164,11 @@ pub const CsvReader = struct {
             azure.isUrl(path) or s3.isUrl(path);
     }
 
-    pub fn open(arena: std.mem.Allocator, path: []const u8) !*CsvReader {
+    pub fn open(arena: std.mem.Allocator, path: []const u8, dialect: Dialect) !*CsvReader {
         const self = try arena.create(CsvReader);
         self.* = .{
             .arena = arena,
+            .dialect = dialect,
             .backend = undefined,
             .schema = undefined,
             .done = false,
@@ -148,10 +244,10 @@ pub const CsvReader = struct {
         const header = (try self.readLine()) orelse return error.EmptyCsv;
         self.header_line = try arena.dupe(u8, std.mem.trim(u8, header, " \t\r"));
         var fields = std.array_list.Managed(types.Schema.Field).init(arena);
-        var it = std.mem.splitScalar(u8, header, ',');
+        var it = std.mem.splitScalar(u8, header, dialect.delim);
         while (it.next()) |name| {
             try fields.append(.{
-                .name = try arena.dupe(u8, std.mem.trim(u8, name, " \t")),
+                .name = try decodeField(arena, dialect.encoding, try arena.dupe(u8, std.mem.trim(u8, name, " \t"))),
                 .ty = types.Type.init(.string).asNullable(),
             });
         }
@@ -209,7 +305,7 @@ pub const CsvReader = struct {
                 };
             }
             if (line.len == 0) continue;
-            try splitInto(arena, line, builders);
+            try splitInto(arena, line, builders, self.dialect);
             rows += 1;
         }
         if (rows == 0) return null;
@@ -288,11 +384,11 @@ pub const CsvReader = struct {
         const first = (try self.rdr.takeDelimiter('\n')) orelse return null;
         var s: []const u8 = first;
         if (s.len > 0 and s[s.len - 1] == '\r') s = s[0 .. s.len - 1];
-        if (!quotesOpen(s)) return s;
+        if (!quotesOpen(s, self.dialect.delim)) return s;
 
         self.join_buf.clearRetainingCapacity();
         try self.join_buf.appendSlice(s);
-        while (quotesOpen(self.join_buf.items)) {
+        while (quotesOpen(self.join_buf.items, self.dialect.delim)) {
             const more = (try self.rdr.takeDelimiter('\n')) orelse break;
             var m: []const u8 = more;
             if (m.len > 0 and m[m.len - 1] == '\r') m = m[0 .. m.len - 1];
@@ -317,8 +413,9 @@ pub const MappedCsv = struct {
     /// is inside quotes cannot be known without scanning from the start of the
     /// file — so callers must not split this file; they fall back to serial.
     quoted_newlines: bool = false,
+    dialect: Dialect = .{},
 
-    pub fn open(arena: std.mem.Allocator, path: []const u8) !*MappedCsv {
+    pub fn open(arena: std.mem.Allocator, path: []const u8, dialect: Dialect) !*MappedCsv {
         const self = try arena.create(MappedCsv);
         const file = try std.fs.cwd().openFile(path, .{});
         errdefer file.close();
@@ -331,9 +428,9 @@ pub const MappedCsv = struct {
         var header = data[0..nl];
         if (header.len > 0 and header[header.len - 1] == '\r') header = header[0 .. header.len - 1];
         var fields = std.array_list.Managed(types.Schema.Field).init(arena);
-        var it = std.mem.splitScalar(u8, header, ',');
+        var it = std.mem.splitScalar(u8, header, dialect.delim);
         while (it.next()) |name| try fields.append(.{
-            .name = try arena.dupe(u8, std.mem.trim(u8, name, " \t")),
+            .name = try decodeField(arena, dialect.encoding, try arena.dupe(u8, std.mem.trim(u8, name, " \t"))),
             .ty = types.Type.init(.string).asNullable(),
         });
 
@@ -342,7 +439,7 @@ pub const MappedCsv = struct {
         var fed: usize = 0;
         var pos: usize = 0;
         while (fed < SAMPLE_ROWS and pos < body.len) {
-            const rec = scanRecord(body, pos);
+            const rec = scanRecord(body, pos, dialect.delim);
             const line = rec.line;
             pos = rec.next;
             if (line.len == 0) continue;
@@ -356,7 +453,8 @@ pub const MappedCsv = struct {
             .body = body,
             .schema = .{ .fields = try fields.toOwnedSlice() },
             .file = file,
-            .quoted_newlines = hasQuotedNewline(body),
+            .dialect = dialect,
+            .quoted_newlines = hasQuotedNewline(body, dialect.delim),
         };
         return self;
     }
@@ -371,7 +469,7 @@ pub const MappedCsv = struct {
 
     /// Does any quoted field hold a newline? Skipped entirely when the file has
     /// no quote at all (the common case), so the scan costs one `memchr`.
-    fn hasQuotedNewline(body: []const u8) bool {
+    fn hasQuotedNewline(body: []const u8, delim: u8) bool {
         if (std.mem.indexOfScalar(u8, body, '"') == null) return false;
         var in_q = false;
         var at_field = true;
@@ -391,7 +489,7 @@ pub const MappedCsv = struct {
                 at_field = false;
             } else if (c == '\n' and in_q) {
                 return true;
-            } else if (c == ',' and !in_q) {
+            } else if (c == delim and !in_q) {
                 at_field = true;
             } else if (c == '\n') {
                 at_field = true;
@@ -421,6 +519,7 @@ pub const CsvSliceReader = struct {
     data: []const u8,
     pos: usize = 0,
     schema: *const types.Schema,
+    dialect: Dialect = .{},
 
     pub fn next(self: *CsvSliceReader, arena: std.mem.Allocator) !?Batch {
         if (self.pos >= self.data.len) return null;
@@ -430,11 +529,11 @@ pub const CsvSliceReader = struct {
 
         var rows: usize = 0;
         while (rows < BATCH_ROWS and self.pos < self.data.len) {
-            const rec = scanRecord(self.data, self.pos);
+            const rec = scanRecord(self.data, self.pos, self.dialect.delim);
             const line = rec.line;
             self.pos = rec.next;
             if (line.len == 0) continue;
-            try splitInto(arena, line, builders);
+            try splitInto(arena, line, builders, self.dialect);
             rows += 1;
         }
         if (rows == 0) return null;
@@ -548,7 +647,7 @@ fn appendCell(b: *column.Builder, raw: []const u8, quoted: bool) !void {
 /// has always honored quotes when cutting FIELDS, but records used to be cut on
 /// the first raw newline, which split such a row in half. basalt's own CSV
 /// writer quotes embedded newlines, so it emitted files it could not read back.
-fn scanRecord(data: []const u8, start: usize) struct { line: []const u8, next: usize } {
+fn scanRecord(data: []const u8, start: usize, delim: u8) struct { line: []const u8, next: usize } {
     var i = start;
     var in_q = false;
     var at_field = true;
@@ -568,7 +667,7 @@ fn scanRecord(data: []const u8, start: usize) struct { line: []const u8, next: u
                 in_q = true;
             }
             at_field = false;
-        } else if (c == ',' and !in_q) {
+        } else if (c == delim and !in_q) {
             at_field = true;
         } else if (c == '\n' and !in_q) {
             var end = i;
@@ -585,7 +684,7 @@ fn scanRecord(data: []const u8, start: usize) struct { line: []const u8, next: u
 
 /// Whether `line` leaves a quoted field open — i.e. the record continues on the
 /// next physical line. `""` contributes two, so plain parity is the quote state.
-fn quotesOpen(line: []const u8) bool {
+fn quotesOpen(line: []const u8, delim: u8) bool {
     var in_q = false;
     var at_field = true;
     var i: usize = 0;
@@ -602,14 +701,14 @@ fn quotesOpen(line: []const u8) bool {
                 in_q = true;
             }
             at_field = false;
-        } else if (c == ',' and !in_q) {
+        } else if (c == delim and !in_q) {
             at_field = true;
         } else at_field = false;
     }
     return in_q;
 }
 
-fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Builder) !void {
+fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Builder, d: Dialect) !void {
     var i: usize = 0;
     var col: usize = 0;
     while (col < builders.len) : (col += 1) {
@@ -629,13 +728,14 @@ fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Buil
                 try buf.append(line[i]);
                 i += 1;
             }
-            try appendCell(&builders[col], try buf.toOwnedSlice(), true);
-            if (i < line.len and line[i] == ',') i += 1;
+            const raw = try buf.toOwnedSlice();
+            try appendCell(&builders[col], try decodeField(arena, d.encoding, raw), true);
+            if (i < line.len and line[i] == d.delim) i += 1;
         } else {
             const start = i;
-            while (i < line.len and line[i] != ',') i += 1;
-            try appendCell(&builders[col], line[start..i], false);
-            if (i < line.len and line[i] == ',') i += 1;
+            while (i < line.len and line[i] != d.delim) i += 1;
+            try appendCell(&builders[col], try decodeField(arena, d.encoding, line[start..i]), false);
+            if (i < line.len and line[i] == d.delim) i += 1;
         }
     }
 }
@@ -660,6 +760,7 @@ fn srcClose(ptr: *anyopaque) void {
 
 pub const CsvWriter = struct {
     backend: Backend,
+    dialect: Dialect = .{},
     write_buf: [LINE_BUF]u8 = undefined,
     fw: std.fs.File.Writer = undefined,
 
@@ -696,7 +797,7 @@ pub const CsvWriter = struct {
     /// emitting the header only when there was nothing there — appending to a
     /// populated CSV must not splice a second header into the rows. A block blob
     /// is committed whole rather than extended, so it takes `.truncate` only.
-    pub fn open(arena: std.mem.Allocator, path: []const u8, schema: types.Schema, mode: driver.FileMode) !*CsvWriter {
+    pub fn open(arena: std.mem.Allocator, path: []const u8, schema: types.Schema, mode: driver.FileMode, dialect: Dialect) !*CsvWriter {
         const self = try arena.create(CsvWriter);
         var header = true;
         if (azure.isUrl(path)) {
@@ -727,11 +828,13 @@ pub const CsvWriter = struct {
             }
         }
 
+        // Set before the header is written, which is the writer's first output.
+        self.dialect = dialect;
         if (header) {
             const w = self.out();
             for (schema.fields, 0..) |f, i| {
-                if (i > 0) try w.writeByte(',');
-                try writeField(w, f.name);
+                if (i > 0) try w.writeByte(dialect.delim);
+                try writeField(w, f.name, dialect.delim);
             }
             try w.writeByte('\n');
         }
@@ -744,18 +847,19 @@ pub const CsvWriter = struct {
 
     fn writeRows(self: *CsvWriter, arena: std.mem.Allocator, batch: Batch) !void {
         const w = self.out();
+        const d = self.dialect.delim;
         var r: usize = 0;
         while (r < batch.len) : (r += 1) {
             for (batch.columns, 0..) |*col, i| {
-                if (i > 0) try w.writeByte(',');
+                if (i > 0) try w.writeByte(d);
                 switch (col.ty.kind) {
                     // Text columns already hold their bytes: read straight out of
                     // the Arrow buffers rather than boxing into a `Value` only for
                     // `valueToString` to switch back out and hand back the slice.
-                    .string, .bytes => if (col.validity.get(r)) try writeField(w, col.data.bytes.at(r)),
+                    .string, .bytes => if (col.validity.get(r)) try writeField(w, col.data.bytes.at(r), d),
                     else => {
                         const v = col.getValue(r);
-                        if (!v.isNull()) try writeField(w, try eval.valueToString(arena, v));
+                        if (!v.isNull()) try writeField(w, try eval.valueToString(arena, v), d);
                     },
                 }
             }
@@ -813,8 +917,8 @@ fn sinkAbort(ptr: *anyopaque) void {
     self.abort();
 }
 
-fn writeField(w: anytype, s: []const u8) !void {
-    if (needsQuote(s)) {
+fn writeField(w: anytype, s: []const u8, delim: u8) !void {
+    if (needsQuote(s, delim)) {
         try w.writeByte('"');
         for (s) |c| {
             if (c == '"') try w.writeByte('"');
@@ -829,10 +933,10 @@ fn writeField(w: anytype, s: []const u8) !void {
 /// An empty value must be quoted. Only the writer knows it is a string rather
 /// than a null — unquoted empty is how the reader spells null — so emitting it
 /// bare turned `""` into NULL on the next read.
-fn needsQuote(s: []const u8) bool {
+fn needsQuote(s: []const u8, delim: u8) bool {
     if (s.len == 0) return true;
     for (s) |c| {
-        if (c == ',' or c == '"' or c == '\n' or c == '\r') return true;
+        if (c == delim or c == '"' or c == '\n' or c == '\r') return true;
     }
     return false;
 }
@@ -868,7 +972,7 @@ test "CsvReader streams a CSV over http" {
     defer th.join();
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/data.csv", .{listener.listen_address.getPort()});
-    const r = try CsvReader.open(a, url);
+    const r = try CsvReader.open(a, url, .{});
     defer r.close();
     try std.testing.expectEqual(@as(usize, 2), r.schema.fields.len);
     try std.testing.expectEqualStrings("id", r.schema.fields[0].name);
@@ -894,7 +998,7 @@ test "CsvReader maps http status: 4xx permanent, 5xx transient" {
         const th = try std.Thread.spawn(.{}, serveOnce, .{ &listener, "404 Not Found", "nope" });
         defer th.join();
         const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/missing.csv", .{listener.listen_address.getPort()});
-        try std.testing.expectError(error.HttpNotFound, CsvReader.open(a, url));
+        try std.testing.expectError(error.HttpNotFound, CsvReader.open(a, url, .{}));
     }
     {
         const addr = try std.net.Address.parseIp("127.0.0.1", 0);
@@ -903,7 +1007,7 @@ test "CsvReader maps http status: 4xx permanent, 5xx transient" {
         const th = try std.Thread.spawn(.{}, serveOnce, .{ &listener, "503 Service Unavailable", "busy" });
         defer th.join();
         const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/data.csv", .{listener.listen_address.getPort()});
-        try std.testing.expectError(error.HttpServerBusy, CsvReader.open(a, url));
+        try std.testing.expectError(error.HttpServerBusy, CsvReader.open(a, url, .{}));
     }
 }
 
@@ -966,15 +1070,15 @@ test "csv parsing: leading/trailing empty fields and last line without newline" 
 test "writeField quotes exactly the fields that need it, doubling quotes" {
     var buf = std.array_list.Managed(u8).init(std.testing.allocator);
     defer buf.deinit();
-    try writeField(buf.writer(), "plain");
+    try writeField(buf.writer(), "plain", ',');
     try buf.append('|');
-    try writeField(buf.writer(), "a,b");
+    try writeField(buf.writer(), "a,b", ',');
     try buf.append('|');
-    try writeField(buf.writer(), "say \"hi\"");
+    try writeField(buf.writer(), "say \"hi\"", ',');
     try buf.append('|');
-    try writeField(buf.writer(), "line\nbreak");
+    try writeField(buf.writer(), "line\nbreak", ',');
     try buf.append('|');
-    try writeField(buf.writer(), "");
+    try writeField(buf.writer(), "", ',');
     try std.testing.expectEqualStrings("plain|\"a,b\"|\"say \"\"hi\"\"\"|\"line\nbreak\"|\"\"", buf.items);
 }
 
@@ -988,7 +1092,7 @@ test "an empty string survives a write/read round-trip and stays distinct from n
     // that back has to reproduce exactly that distinction. Emitting the empty
     // string bare made every one of them come back as NULL.
     var line = std.array_list.Managed(u8).init(a);
-    try writeField(line.writer(), "");
+    try writeField(line.writer(), "", ',');
     try line.append(',');
     try line.append('\n');
     const b = try parseSlice(a, &schema, line.items);
@@ -1004,9 +1108,9 @@ test "csv write/parse round-trip preserves quoted values" {
     const schema = try stringSchema(a, &.{ "a", "b" });
 
     var line = std.array_list.Managed(u8).init(a);
-    try writeField(line.writer(), "O'Neil, \"Jr\"");
+    try writeField(line.writer(), "O'Neil, \"Jr\"", ',');
     try line.append(',');
-    try writeField(line.writer(), "plain");
+    try writeField(line.writer(), "plain", ',');
     try line.append('\n');
     const b = try parseSlice(a, &schema, line.items);
     try std.testing.expectEqualStrings("O'Neil, \"Jr\"", b.columns[0].getValue(0).string);
@@ -1045,9 +1149,9 @@ test "serial and mapped readers infer the same schema; mismatch past the sample 
     const base = try tmp.dir.realpathAlloc(a, ".");
 
     const ok_path = try std.fs.path.join(a, &.{ base, "ok.csv" });
-    const r = try CsvReader.open(a, ok_path);
+    const r = try CsvReader.open(a, ok_path, .{});
     defer r.close();
-    const m = try MappedCsv.open(a, ok_path);
+    const m = try MappedCsv.open(a, ok_path, .{});
     defer m.close();
     try std.testing.expectEqual(types.TypeKind.int, r.schema.fields[0].ty.kind);
     try std.testing.expectEqual(types.TypeKind.int, m.schema.fields[0].ty.kind);
@@ -1055,7 +1159,7 @@ test "serial and mapped readers infer the same schema; mismatch past the sample 
     try std.testing.expectEqual(types.TypeKind.string, m.schema.fields[1].ty.kind);
 
     const bad_path = try std.fs.path.join(a, &.{ base, "bad.csv" });
-    const rb = try CsvReader.open(a, bad_path);
+    const rb = try CsvReader.open(a, bad_path, .{});
     defer rb.close();
     var err: ?anyerror = null;
     while (rb.next(a) catch |e| blk: {
@@ -1076,7 +1180,7 @@ test "MappedCsv chunks are newline-aligned, disjoint, and covering" {
     try tmp.dir.writeFile(.{ .sub_path = "t.csv", .data = "id,name\n" ++ body });
     const path = try tmp.dir.realpathAlloc(a, "t.csv");
 
-    const m = try MappedCsv.open(a, path);
+    const m = try MappedCsv.open(a, path, .{});
     defer m.close();
     try std.testing.expectEqual(@as(usize, 2), m.schema.fields.len);
     try std.testing.expectEqualStrings("name", m.schema.fields[1].name);
@@ -1105,7 +1209,7 @@ test "CsvSliceReader over a MappedCsv chunk parses only its rows" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "t.csv", .data = "id\n1\n2\n3\n4\n" });
     const path = try tmp.dir.realpathAlloc(a, "t.csv");
-    const m = try MappedCsv.open(a, path);
+    const m = try MappedCsv.open(a, path, .{});
     defer m.close();
 
     var rows: usize = 0;
@@ -1116,33 +1220,128 @@ test "CsvSliceReader over a MappedCsv chunk parses only its rows" {
     try std.testing.expectEqual(@as(usize, 4), rows);
 }
 
+test "Encoding.parse accepts the spellings the wild uses" {
+    try std.testing.expectEqual(Encoding.latin1, Encoding.parse("latin1").?);
+    try std.testing.expectEqual(Encoding.latin1, Encoding.parse("ISO-8859-1").?);
+    try std.testing.expectEqual(Encoding.latin1, Encoding.parse("iso_8859_1").?);
+    try std.testing.expectEqual(Encoding.cp1252, Encoding.parse("cp1252").?);
+    try std.testing.expectEqual(Encoding.cp1252, Encoding.parse("Windows-1252").?);
+    try std.testing.expectEqual(Encoding.utf8, Encoding.parse("UTF8").?);
+    try std.testing.expect(Encoding.parse("latin9") == null);
+    try std.testing.expect(Encoding.parse("") == null);
+}
+
+test "decodeField: latin-1 and cp1252 widen to UTF-8, ASCII is passed through" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // Pure ASCII returns the very same slice — the no-allocation fast path.
+    const ascii = "2020-10-27";
+    try std.testing.expect((try decodeField(a, .latin1, ascii)).ptr == ascii.ptr);
+    // And UTF-8 is never touched whatever the bytes are.
+    try std.testing.expect((try decodeField(a, .utf8, "\xC7\xC3")).len == 2);
+
+    // LIQUIDA<C7><C3>O in latin-1 is LIQUIDAÇÃO.
+    try std.testing.expectEqualStrings("LIQUIDAÇÃO", try decodeField(a, .latin1, "LIQUIDA\xC7\xC3O"));
+    // 0x93/0x94 are undefined in latin-1 (C1 controls) but the curly quotes in
+    // cp1252, which is what a Windows-authored file actually means by them.
+    try std.testing.expectEqualStrings("“hi”", try decodeField(a, .cp1252, "\x93hi\x94"));
+    try std.testing.expectEqualStrings("€", try decodeField(a, .cp1252, "\x80"));
+    // An undefined cp1252 slot is replacement, not an invented codepoint.
+    try std.testing.expectEqualStrings("\u{FFFD}", try decodeField(a, .cp1252, "\x81"));
+}
+
+test "csv dialect: a semicolon latin-1 file reads as UTF-8 columns" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Shaped like the CVM fund registry: `;` separated, ISO-8859-1, CRLF.
+    try tmp.dir.writeFile(.{
+        .sub_path = "cad.csv",
+        .data = "SIT;DENOM\r\nLIQUIDA\xC7\xC3O;A\xC7\xD5ES\r\nCANCELADA;PLAIN\r\n",
+    });
+    const path = try tmp.dir.realpathAlloc(a, "cad.csv");
+
+    const r = try CsvReader.open(a, path, .{ .delim = ';', .encoding = .latin1 });
+    defer r.close();
+    try std.testing.expectEqual(@as(usize, 2), r.schema.fields.len);
+    try std.testing.expectEqualStrings("SIT", r.schema.fields[0].name);
+    try std.testing.expectEqualStrings("DENOM", r.schema.fields[1].name);
+
+    const b = (try r.next(a)).?;
+    try std.testing.expectEqual(@as(usize, 2), b.len);
+    try std.testing.expectEqualStrings("LIQUIDAÇÃO", b.columns[0].data.bytes.at(0));
+    try std.testing.expectEqualStrings("AÇÕES", b.columns[1].data.bytes.at(0));
+    try std.testing.expectEqualStrings("CANCELADA", b.columns[0].data.bytes.at(1));
+}
+
+test "csv dialect: the same file read with the default dialect is one column" {
+    // Not a bug to fix, just the reason the option had to exist: a `;` file holds
+    // no commas, so the comma reader sees one field per row.
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "cad.csv", .data = "SIT;DENOM\nX;Y\n" });
+    const path = try tmp.dir.realpathAlloc(a, "cad.csv");
+    const r = try CsvReader.open(a, path, .{});
+    defer r.close();
+    try std.testing.expectEqual(@as(usize, 1), r.schema.fields.len);
+}
+
+test "csv writer: the delimiter carries to the header, rows and quoting" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ base, "o.csv" });
+
+    var names = [_][]const u8{ "x", "y" };
+    const schema = try stringSchema(a, &names);
+    const w = try CsvWriter.open(a, path, schema, .truncate, .{ .delim = ';' });
+    // A value holding the delimiter must be quoted; one holding a comma must not.
+    const b = try parseSlice(a, &schema, "a;b,c\n");
+    try w.writeBatch(a, b);
+    try w.close();
+
+    const got = try tmp.dir.readFileAlloc(a, "o.csv", 1 << 16);
+    try std.testing.expectEqualStrings("x;y\n\"a;b\";c\n", got);
+}
+
 test "scanRecord: a newline inside a quoted field stays in the value" {
     // RFC 4180 allows it and basalt's own writer emits it, so cutting records on
     // the first raw newline turned one row into several — silently.
     const data = "1,\"line A\nline B\"\n2,plain\n";
-    const r1 = scanRecord(data, 0);
+    const r1 = scanRecord(data, 0, ',');
     try std.testing.expectEqualStrings("1,\"line A\nline B\"", r1.line);
-    const r2 = scanRecord(data, r1.next);
+    const r2 = scanRecord(data, r1.next, ',');
     try std.testing.expectEqualStrings("2,plain", r2.line);
     try std.testing.expectEqual(data.len, r2.next);
 
     // An escaped `""` inside a quoted field does not end the quote.
     const esc = "a,\"he said \"\"hi\"\"\nand left\"\n";
-    try std.testing.expectEqualStrings("a,\"he said \"\"hi\"\"\nand left\"", scanRecord(esc, 0).line);
+    try std.testing.expectEqualStrings("a,\"he said \"\"hi\"\"\nand left\"", scanRecord(esc, 0, ',').line);
 
     // CRLF is still trimmed, and an unterminated final record still returns.
-    try std.testing.expectEqualStrings("x,y", scanRecord("x,y\r\n", 0).line);
-    try std.testing.expectEqualStrings("x,y", scanRecord("x,y", 0).line);
+    try std.testing.expectEqualStrings("x,y", scanRecord("x,y\r\n", 0, ',').line);
+    try std.testing.expectEqualStrings("x,y", scanRecord("x,y", 0, ',').line);
 }
 
 test "quotesOpen / hasQuotedNewline drive the continuation and split decisions" {
-    try std.testing.expect(quotesOpen("1,\"line A"));
-    try std.testing.expect(!quotesOpen("1,\"line A\""));
-    try std.testing.expect(!quotesOpen("plain,row"));
+    try std.testing.expect(quotesOpen("1,\"line A", ','));
+    try std.testing.expect(!quotesOpen("1,\"line A\"", ','));
+    try std.testing.expect(!quotesOpen("plain,row", ','));
     // `""` is an escaped quote: two marks, so the field is still closed.
-    try std.testing.expect(!quotesOpen("a,\"he said \"\"hi\"\"\""));
+    try std.testing.expect(!quotesOpen("a,\"he said \"\"hi\"\"\"", ','));
 
-    try std.testing.expect(MappedCsv.hasQuotedNewline("1,\"a\nb\"\n"));
-    try std.testing.expect(!MappedCsv.hasQuotedNewline("1,\"a b\"\n2,c\n"));
-    try std.testing.expect(!MappedCsv.hasQuotedNewline("1,a\n2,b\n"));
+    try std.testing.expect(MappedCsv.hasQuotedNewline("1,\"a\nb\"\n", ','));
+    try std.testing.expect(!MappedCsv.hasQuotedNewline("1,\"a b\"\n2,c\n", ','));
+    try std.testing.expect(!MappedCsv.hasQuotedNewline("1,a\n2,b\n", ','));
 }

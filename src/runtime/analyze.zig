@@ -553,7 +553,7 @@ const Ctx = struct {
         }
 
         const w = stages[stages.len - 1].node.write;
-        const sink = try self.resolveSink(w);
+        const sink = try self.resolveSink(w, stages[stages.len - 1].hints);
 
         const src_is_sql = isSqlConnector(source.connector);
         const sink_is_parallel = isSqlConnector(sink.connector) or std.mem.eql(u8, sink.connector, "starrocks");
@@ -588,11 +588,15 @@ const Ctx = struct {
                     .range => "range",
                     .unit => "unit",
                 };
-                if (rd.form == .path) {
+                if (rd.form == .path and std.mem.eql(u8, connector, "csv")) {
                     if (s3.bucketNameError(rd.form.path)) |why|
                         return fail(self.diag, "`{s}` is not a valid S3 source: {s}", .{ rd.form.path, why });
+                    const fmt = try formatFromHints(lead.hints, self.diag);
+                    if (unreadableTarget(rd.form.path, fmt)) |why|
+                        return fail(self.diag, "cannot read `{s}`: {s}", .{ rd.form.path, why });
+                    _ = try dialectFromHints(lead.hints, self.diag);
                 }
-                const schema = offlineSchema(self.arena, rd);
+                const schema = offlineSchema(self.arena, rd, lead.hints);
                 return .{ .connector = connector, .detail = detail, .schema = schema };
             },
             .ref => |name| {
@@ -620,10 +624,21 @@ const Ctx = struct {
         }
     }
 
-    fn resolveSink(self: *Ctx, w: ast.Write) !Sink {
+    fn resolveSink(self: *Ctx, w: ast.Write, hints: []const ast.Hint) !Sink {
         if (std.mem.eql(u8, w.connector, "csv") or std.mem.eql(u8, w.connector, "stdout")) {
             if (s3.bucketNameError(w.target)) |why|
                 return fail(self.diag, "`{s}` is not a valid S3 target: {s}", .{ w.target, why });
+            // A `stdout` sink has no target path to name a format for.
+            if (std.mem.eql(u8, w.connector, "csv") and w.target.len > 0) {
+                const fmt = try formatFromHints(hints, self.diag);
+                if (unreadableTarget(w.target, fmt)) |why|
+                    return fail(self.diag, "cannot write `{s}`: {s}", .{ w.target, why });
+            }
+            _ = try dialectFromHints(hints, self.diag);
+            // Accepting it and writing UTF-8 anyway would be the silent kind of
+            // wrong; transcoding on the way out is a separate feature.
+            if (hintText(hints, "encoding") != null)
+                return fail(self.diag, "`encoding` applies to a read; a CSV sink always writes UTF-8", .{});
             if (w.mode == .append) {
                 if (appendUnsupported(w.target)) |why|
                     return fail(self.diag, "`APPEND` into `{s}` is not supported: {s}", .{ w.target, why });
@@ -857,6 +872,83 @@ fn splittableRead(node: ast.Stage.Node) bool {
     };
 }
 
+/// The file format a path is read or written as. `format` in a `WITH (...)` names
+/// it outright; otherwise the extension does.
+pub const FileFormat = enum { csv, parquet };
+
+fn hintText(hints: []const ast.Hint, key: []const u8) ?[]const u8 {
+    for (hints) |h| {
+        if (!std.mem.eql(u8, h.key, key)) continue;
+        return switch (h.value) {
+            .str => |s| s,
+            .ident => |s| s,
+            else => null,
+        };
+    }
+    return null;
+}
+
+/// `WITH (delimiter = ';', encoding = 'latin1')` for a file read or write.
+///
+/// Both are validated here rather than at the reader, so `basalt check` rejects a
+/// typo before anything opens a file — an unknown encoding name is exactly the
+/// kind of mistake that would otherwise be discovered halfway through a load.
+pub fn dialectFromHints(hints: []const ast.Hint, diag: *Diag) Error!csv.Dialect {
+    var d = csv.Dialect{};
+    if (hintText(hints, "delimiter") orelse hintText(hints, "delim")) |s| {
+        // One byte, because the reader compares bytes and the parallel reader cuts
+        // the file on them. A tab is worth spelling out; `'\t'` in a SQL string
+        // literal has no escape processing.
+        const one: ?u8 = if (s.len == 1)
+            s[0]
+        else if (std.mem.eql(u8, s, "\\t") or std.mem.eql(u8, s, "tab"))
+            '\t'
+        else
+            null;
+        d.delim = one orelse return fail(diag, "delimiter must be a single character (or `tab`), got `{s}`", .{s});
+        if (d.delim == '"' or d.delim == '\n' or d.delim == '\r')
+            return fail(diag, "delimiter cannot be a quote or a newline", .{});
+    }
+    if (hintText(hints, "encoding")) |s| {
+        d.encoding = csv.Encoding.parse(s) orelse
+            return fail(diag, "unknown encoding `{s}` (utf8, latin1 / iso-8859-1, cp1252 / windows-1252)", .{s});
+    }
+    return d;
+}
+
+/// The format named by `WITH (format = ...)`, validated. Null when unset.
+pub fn formatFromHints(hints: []const ast.Hint, diag: *Diag) Error!?FileFormat {
+    const s = hintText(hints, "format") orelse return null;
+    if (std.ascii.eqlIgnoreCase(s, "csv")) return .csv;
+    if (std.ascii.eqlIgnoreCase(s, "parquet")) return .parquet;
+    return fail(diag, "unknown format `{s}` (csv, parquet)", .{s});
+}
+
+/// The extension basalt reads a path as, ignoring any URL query or fragment, or
+/// null when the path carries no extension it knows.
+fn formatOfPath(path: []const u8) ?FileFormat {
+    const bare = path[0 .. std.mem.indexOfAny(u8, path, "?#") orelse path.len];
+    if (pqwrite.Writer.isPath(bare)) return .parquet;
+    if (std.ascii.endsWithIgnoreCase(bare, ".csv")) return .csv;
+    return null;
+}
+
+/// Why this path cannot be read or written as a table, or null when it can.
+///
+/// Every unrecognised extension used to fall through to the CSV reader, silently.
+/// A 12 MB zip holding 583k rows answered `SELECT COUNT(*)` with 46204 — the
+/// newlines that happen to occur in deflate output — and `check` said the script
+/// was fine. A wrong number that looks right is the one outcome this engine is
+/// built to avoid, so an extension it does not read is a plan-time error.
+pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
+    if (explicit != null) return null;
+    // A trailing `/` is a prefix read: the objects under it carry the extensions,
+    // and `parquetPrefix`/the CSV lister decide per object.
+    if (std.mem.endsWith(u8, path, "/")) return null;
+    if (formatOfPath(path) != null) return null;
+    return "basalt handles `.csv` and `.parquet`; name the format with `WITH (format = 'csv')` if the extension differs";
+}
+
 /// Whether a read divides into per-lane morsels at `-j > 1`.
 ///
 /// A parquet is cut into row groups wherever it lives, since every lane range-reads
@@ -879,7 +971,7 @@ fn morselParallelRead(connector: []const u8, node: ast.Stage.Node) bool {
 
 /// Offline schema resolution: a local CSV header or parquet footer is readable
 /// without connecting to anything; everything else stays unresolved.
-fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read) ?types.Schema {
+fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.Hint) ?types.Schema {
     if (std.mem.eql(u8, rd.connector, "unit")) return .{ .fields = &.{} };
     if (std.mem.eql(u8, rd.connector, "range")) {
         const fields = arena.alloc(types.Schema.Field, 1) catch return null;
@@ -892,7 +984,11 @@ fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read) ?types.Schema {
             const pr = pqdecode.Reader.open(arena, rd.form.path) catch return null;
             return pr.schema;
         }
-        const reader = csv.CsvReader.open(arena, rd.form.path) catch return null;
+        // The header is split on the script's delimiter, or `check` would report
+        // one column named after the whole header line for a `;` file.
+        var hdiag = Diag{};
+        const d = dialectFromHints(hints, &hdiag) catch return null;
+        const reader = csv.CsvReader.open(arena, rd.form.path, d) catch return null;
         const schema = reader.schema;
         reader.close();
         return schema;
@@ -943,6 +1039,50 @@ test "analyze a CSV map pipeline: structure, offline schema, physical" {
     // Not `splittable` (that is the SQL key-range fan-out) but still parallel:
     // the runtime cuts a local CSV into byte-range chunks.
     try std.testing.expect(o.physical.morsel_parallel);
+}
+
+test "unreadableTarget: an extension basalt does not read is refused" {
+    // The reason this exists: a 12MB zip of 583k rows answered COUNT(*) with 46204
+    // — newlines in its deflate stream — and `check` approved the script.
+    try std.testing.expect(unreadableTarget("/data/x.csv", null) == null);
+    try std.testing.expect(unreadableTarget("/data/X.CSV", null) == null);
+    try std.testing.expect(unreadableTarget("/data/x.parquet", null) == null);
+    // A query string is not part of the name.
+    try std.testing.expect(unreadableTarget("https://h/d.csv?token=abc", null) == null);
+    // A trailing slash is a prefix read; the objects under it carry extensions.
+    try std.testing.expect(unreadableTarget("s3://bkt/bronze/", null) == null);
+
+    try std.testing.expect(unreadableTarget("/data/inf.zip", null) != null);
+    try std.testing.expect(unreadableTarget("/data/rows.json", null) != null);
+    try std.testing.expect(unreadableTarget("/data/book.xlsx", null) != null);
+    try std.testing.expect(unreadableTarget("/data/noext", null) != null);
+    // Naming the format is the escape hatch for an oddly-named file.
+    try std.testing.expect(unreadableTarget("/data/weird.dat", .csv) == null);
+}
+
+test "dialectFromHints: parses, and rejects what cannot work" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const mkh = struct {
+        fn hint(al: std.mem.Allocator, k: []const u8, v: []const u8) ![]const ast.Hint {
+            const h = try al.alloc(ast.Hint, 1);
+            h[0] = .{ .key = k, .value = .{ .str = v }, .pos = .{ .line = 1, .col = 1 } };
+            return h;
+        }
+    };
+
+    var d = Diag{};
+    try std.testing.expectEqual(@as(u8, ','), (try dialectFromHints(&.{}, &d)).delim);
+    try std.testing.expectEqual(@as(u8, ';'), (try dialectFromHints(try mkh.hint(a, "delimiter", ";"), &d)).delim);
+    try std.testing.expectEqual(@as(u8, '\t'), (try dialectFromHints(try mkh.hint(a, "delimiter", "tab"), &d)).delim);
+    try std.testing.expectEqual(@as(u8, '|'), (try dialectFromHints(try mkh.hint(a, "delim", "|"), &d)).delim);
+    try std.testing.expectEqual(csv.Encoding.latin1, (try dialectFromHints(try mkh.hint(a, "encoding", "iso-8859-1"), &d)).encoding);
+
+    try std.testing.expectError(error.AnalyzeFailed, dialectFromHints(try mkh.hint(a, "delimiter", ";;"), &d));
+    try std.testing.expectError(error.AnalyzeFailed, dialectFromHints(try mkh.hint(a, "delimiter", "\""), &d));
+    try std.testing.expectError(error.AnalyzeFailed, dialectFromHints(try mkh.hint(a, "encoding", "latin9"), &d));
 }
 
 test "physical plan: which file reads divide into morsels" {
