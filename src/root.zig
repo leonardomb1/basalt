@@ -26,6 +26,7 @@ pub const httpsrc = @import("connect/http.zig");
 pub const aad = @import("connect/aad.zig");
 pub const ntlm = @import("connect/ntlm.zig");
 pub const azure = @import("connect/azure.zig");
+pub const s3 = @import("connect/s3.zig");
 pub const codec = @import("connect/codec.zig");
 pub const thrift = @import("connect/thrift.zig");
 pub const parquet = @import("connect/parquet.zig");

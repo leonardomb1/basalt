@@ -1,0 +1,462 @@
+//! Amazon S3 (and S3-compatible stores: MinIO, localstack) over the REST API,
+//! authenticated with AWS Signature Version 4.
+//!
+//! URLs are `s3://<bucket>/<key>`. With no endpoint override the real service
+//! is addressed virtual-host style (`https://<bucket>.s3.<region>.amazonaws.com/<key>`,
+//! region from AWS_REGION, default us-east-1). Setting AWS_ENDPOINT_URL selects
+//! path-style (`<endpoint>/<bucket>/<key>`), which is what MinIO and the other
+//! emulators require. Credentials come from AWS_ACCESS_KEY_ID /
+//! AWS_SECRET_ACCESS_KEY (+ optional AWS_SESSION_TOKEN), environment only.
+//!
+//! Every request signs the real payload hash (the empty-body SHA-256 for
+//! bodyless verbs) — no UNSIGNED-PAYLOAD anywhere, so requests are integrity-
+//! protected even over the plain-HTTP endpoints emulators use.
+
+const std = @import("std");
+const httpx = @import("http.zig");
+
+/// Civil date from a day count since the epoch (Howard Hinnant's algorithm).
+/// Duplicated from `exec/eval.zig` rather than imported so this module depends
+/// on nothing but std — same reasoning as azure.zig.
+fn civilFromDays(z0: i64) struct { y: i64, m: u32, d: u32 } {
+    const z = z0 + 719468;
+    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe = z - era * 146097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+    const y = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const d: u32 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
+    const m: u32 = @intCast(if (mp < 10) mp + 3 else mp - 9);
+    return .{ .y = y + (if (m <= 2) @as(i64, 1) else 0), .m = m, .d = d };
+}
+
+pub const env_key_id = "AWS_ACCESS_KEY_ID";
+pub const env_secret = "AWS_SECRET_ACCESS_KEY";
+pub const env_token = "AWS_SESSION_TOKEN";
+pub const env_region = "AWS_REGION";
+pub const env_endpoint = "AWS_ENDPOINT_URL";
+
+pub const default_region = "us-east-1";
+
+pub const Error = error{
+    S3BadUrl,
+    S3MissingKey,
+    S3RequestFailed,
+    S3BucketMissing,
+    S3KeyNotFound,
+    S3AuthFailed,
+    S3Throttled,
+    /// The bucket exists and is readable; nothing is stored under the prefix.
+    /// Distinct from a genuinely empty object, because the overwhelmingly common
+    /// cause is a mistyped prefix in an otherwise full lake.
+    S3EmptyPrefix,
+};
+
+pub const Obj = struct {
+    bucket: []const u8,
+    /// Object key within the bucket, no leading slash, as written (unencoded).
+    key: []const u8,
+    /// Absolute request URL, endpoint style already applied, path segments
+    /// percent-encoded exactly as the canonical URI is — the two must match
+    /// byte-for-byte or the signature check fails.
+    url: []const u8,
+    /// The Host header value std.http.Client will derive from `url` (authority
+    /// including any explicit port). Host participates in the signature.
+    host: []const u8,
+    /// Canonical URI for SigV4: the URL's path component, single-encoded.
+    uri_path: []const u8,
+    region: []const u8,
+};
+
+pub fn isUrl(s: []const u8) bool {
+    return std.mem.startsWith(u8, s, "s3://");
+}
+
+/// A trailing slash means "every object under this prefix", not one object.
+pub fn isPrefix(url: []const u8) bool {
+    return isUrl(url) and std.mem.endsWith(u8, url, "/");
+}
+
+pub fn endpointFromEnv(arena: std.mem.Allocator) ?[]const u8 {
+    return std.process.getEnvVarOwned(arena, env_endpoint) catch null;
+}
+
+pub fn regionFromEnv(arena: std.mem.Allocator) []const u8 {
+    return std.process.getEnvVarOwned(arena, env_region) catch default_region;
+}
+
+pub const Creds = struct {
+    access: []const u8,
+    secret: []const u8,
+    /// AWS_SESSION_TOKEN when present (STS / role credentials); sent and signed
+    /// as x-amz-security-token.
+    token: ?[]const u8 = null,
+};
+
+pub fn credsFromEnv(arena: std.mem.Allocator) !Creds {
+    const access = std.process.getEnvVarOwned(arena, env_key_id) catch return Error.S3MissingKey;
+    const secret = std.process.getEnvVarOwned(arena, env_secret) catch return Error.S3MissingKey;
+    const token = std.process.getEnvVarOwned(arena, env_token) catch null;
+    return .{ .access = access, .secret = secret, .token = token };
+}
+
+/// The authority (host[:port]) of an endpoint URL. std.http.Client emits the
+/// Host header as the URI's authority including any explicit port, so this is
+/// exactly the string that must be signed when a MinIO endpoint carries a port.
+fn authorityOf(endpoint: []const u8) ![]const u8 {
+    const after = if (std.mem.startsWith(u8, endpoint, "https://"))
+        endpoint["https://".len..]
+    else if (std.mem.startsWith(u8, endpoint, "http://"))
+        endpoint["http://".len..]
+    else
+        return Error.S3BadUrl;
+    const host = std.mem.sliceTo(after, '/');
+    if (host.len == 0) return Error.S3BadUrl;
+    return host;
+}
+
+/// Splits `s3://bucket/key...`. The key may contain slashes; the bucket is only
+/// the first segment.
+///
+/// `endpoint` null selects the real service (virtual-host style); non-null
+/// selects path-style against that endpoint (MinIO, localstack). That
+/// distinction changes both the signed Host and the canonical URI.
+pub fn parseUrl(arena: std.mem.Allocator, url: []const u8, endpoint: ?[]const u8) !Obj {
+    if (!isUrl(url)) return Error.S3BadUrl;
+    const rest = url["s3://".len..];
+    const b_end = std.mem.indexOfScalar(u8, rest, '/') orelse return Error.S3BadUrl;
+    const bucket = rest[0..b_end];
+    const key = rest[b_end + 1 ..];
+    if (bucket.len == 0 or key.len == 0) return Error.S3BadUrl;
+
+    const region = regionFromEnv(arena);
+    const enc_key = try uriEncode(arena, key, .keep_slash);
+
+    if (endpoint) |ep| {
+        const base = std.mem.trimRight(u8, ep, "/");
+        const uri_path = try std.fmt.allocPrint(arena, "/{s}/{s}", .{ bucket, enc_key });
+        return .{
+            .bucket = bucket,
+            .key = key,
+            .url = try std.fmt.allocPrint(arena, "{s}{s}", .{ base, uri_path }),
+            .host = try authorityOf(base),
+            .uri_path = uri_path,
+            .region = region,
+        };
+    }
+    const host = try std.fmt.allocPrint(arena, "{s}.s3.{s}.amazonaws.com", .{ bucket, region });
+    const uri_path = try std.fmt.allocPrint(arena, "/{s}", .{enc_key});
+    return .{
+        .bucket = bucket,
+        .key = key,
+        .url = try std.fmt.allocPrint(arena, "https://{s}{s}", .{ host, uri_path }),
+        .host = host,
+        .uri_path = uri_path,
+        .region = region,
+    };
+}
+
+/// Splits a prefix URL (`s3://bucket/some/prefix/`) for listing. The prefix may
+/// be empty (`s3://bucket/`), unlike `parseUrl`, which addresses one object and
+/// requires a key.
+pub fn parsePrefix(url: []const u8) !struct { bucket: []const u8, prefix: []const u8 } {
+    if (!isUrl(url)) return Error.S3BadUrl;
+    const rest = url["s3://".len..];
+    const b_end = std.mem.indexOfScalar(u8, rest, '/') orelse return Error.S3BadUrl;
+    const bucket = rest[0..b_end];
+    if (bucket.len == 0) return Error.S3BadUrl;
+    return .{ .bucket = bucket, .prefix = rest[b_end + 1 ..] };
+}
+
+/// `20130524T000000Z` — the ISO-basic instant SigV4 signs (x-amz-date). The
+/// first 8 characters are the credential-scope date.
+pub fn amzDate(arena: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
+    const days = @divFloor(epoch_secs, 86400);
+    const secs: u32 = @intCast(epoch_secs - days * 86400);
+    const c = civilFromDays(days);
+    return std.fmt.allocPrint(arena, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
+        @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60,
+    });
+}
+
+const EncodeSlash = enum { keep_slash, encode_slash };
+
+/// SigV4 URI encoding: unreserved characters pass, everything else becomes
+/// %XX (uppercase hex). S3 canonical URIs are single-encoded with '/' kept;
+/// query values encode '/' too.
+fn uriEncode(arena: std.mem.Allocator, s: []const u8, slash: EncodeSlash) ![]const u8 {
+    const hex = "0123456789ABCDEF";
+    var out = std.array_list.Managed(u8).init(arena);
+    for (s) |c| {
+        const unreserved = std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_' or c == '~';
+        if (unreserved or (slash == .keep_slash and c == '/')) {
+            try out.append(c);
+        } else {
+            try out.append('%');
+            try out.append(hex[c >> 4]);
+            try out.append(hex[c & 0xF]);
+        }
+    }
+    return out.toOwnedSlice();
+}
+
+/// SHA-256 of the request payload, lowercase hex — the x-amz-content-sha256
+/// value and the last line of the canonical request.
+pub fn payloadHash(arena: std.mem.Allocator, payload: []const u8) ![]const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    return arena.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+}
+
+/// SHA-256 of the empty string: the payload hash of every bodyless request.
+pub const empty_payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// One header participating in the signature. Names must be lowercase; values
+/// are signed verbatim (ours are all machine-built, never needing whitespace
+/// canonicalization).
+pub const SignHeader = struct { name: []const u8, value: []const u8 };
+
+pub const SignParams = struct {
+    method: []const u8,
+    /// Canonical URI: the URL's path, single-encoded, starting with '/'.
+    uri_path: []const u8,
+    /// Query params as pre-encoded `name=value` strings; sorted here. A
+    /// valueless param signs as `name=`.
+    query: []const []const u8 = &.{},
+    /// Signed headers (must include host); sorted here.
+    headers: []const SignHeader,
+    payload_hash: []const u8,
+    /// `20130524T000000Z` — must equal the x-amz-date header value.
+    timestamp: []const u8,
+    region: []const u8,
+    service: []const u8 = "s3",
+};
+
+/// Canonical request text plus the `;`-joined signed-headers list. A named
+/// function because a single byte of drift here yields SignatureDoesNotMatch
+/// with no further hint; the tests pin it to AWS's published examples.
+fn canonicalRequest(arena: std.mem.Allocator, p: SignParams) !struct { text: []const u8, signed: []const u8 } {
+    const hdrs = try arena.dupe(SignHeader, p.headers);
+    std.mem.sort(SignHeader, hdrs, {}, struct {
+        fn lt(_: void, x: SignHeader, y: SignHeader) bool {
+            return std.mem.lessThan(u8, x.name, y.name);
+        }
+    }.lt);
+    const q = try arena.dupe([]const u8, p.query);
+    std.mem.sort([]const u8, q, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+
+    var signed = std.array_list.Managed(u8).init(arena);
+    for (hdrs, 0..) |h, i| {
+        if (i > 0) try signed.append(';');
+        try signed.appendSlice(h.name);
+    }
+
+    var buf = std.array_list.Managed(u8).init(arena);
+    const w = buf.writer();
+    try w.print("{s}\n{s}\n", .{ p.method, p.uri_path });
+    for (q, 0..) |s, i| {
+        if (i > 0) try w.writeAll("&");
+        try w.writeAll(s);
+    }
+    try w.writeAll("\n");
+    for (hdrs) |h| try w.print("{s}:{s}\n", .{ h.name, h.value });
+    try w.writeAll("\n");
+    try w.print("{s}\n{s}", .{ signed.items, p.payload_hash });
+    return .{ .text = try buf.toOwnedSlice(), .signed = try signed.toOwnedSlice() };
+}
+
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+
+/// The derived SigV4 signing key: HMAC chain over date, region, service,
+/// "aws4_request", rooted at "AWS4" + secret.
+pub fn signingKey(arena: std.mem.Allocator, secret: []const u8, date: []const u8, region: []const u8, service: []const u8) ![32]u8 {
+    const seed = try std.fmt.allocPrint(arena, "AWS4{s}", .{secret});
+    var k: [32]u8 = undefined;
+    HmacSha256.create(&k, date, seed);
+    HmacSha256.create(&k, region, &k);
+    HmacSha256.create(&k, service, &k);
+    HmacSha256.create(&k, "aws4_request", &k);
+    return k;
+}
+
+/// Builds the `Authorization: AWS4-HMAC-SHA256 ...` value: canonical request →
+/// string to sign → derived key → signature.
+pub fn authHeader(arena: std.mem.Allocator, access: []const u8, secret: []const u8, p: SignParams) ![]const u8 {
+    const cr = try canonicalRequest(arena, p);
+    var cr_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(cr.text, &cr_hash, .{});
+
+    const date = p.timestamp[0..8];
+    const sts = try std.fmt.allocPrint(arena, "AWS4-HMAC-SHA256\n{s}\n{s}/{s}/{s}/aws4_request\n{s}", .{
+        p.timestamp, date, p.region, p.service, &std.fmt.bytesToHex(cr_hash, .lower),
+    });
+
+    const key = try signingKey(arena, secret, date, p.region, p.service);
+    var mac: [32]u8 = undefined;
+    HmacSha256.create(&mac, sts, &key);
+
+    return std.fmt.allocPrint(
+        arena,
+        "AWS4-HMAC-SHA256 Credential={s}/{s}/{s}/{s}/aws4_request,SignedHeaders={s},Signature={s}",
+        .{ access, date, p.region, p.service, cr.signed, &std.fmt.bytesToHex(mac, .lower) },
+    );
+}
+
+test "amzDate matches the reference instant from the S3 signing docs" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // 2013-05-24T00:00:00Z, the timestamp of every example in the S3 SigV4 docs.
+    try std.testing.expectEqualStrings("20130524T000000Z", try amzDate(a, 1369353600));
+    try std.testing.expectEqualStrings("19700101T000000Z", try amzDate(a, 0));
+    try std.testing.expectEqualStrings("20150830T123600Z", try amzDate(a, 1440938160));
+}
+
+test "signingKey matches the derivation example from the AWS SigV4 docs" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    // "Deriving the signing key" example: secret/date/region/service → this key.
+    const k = try signingKey(ar.allocator(), "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "20150830", "us-east-1", "iam");
+    try std.testing.expectEqualStrings(
+        "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9",
+        &std.fmt.bytesToHex(k, .lower),
+    );
+}
+
+// The next three tests are AWS's published S3 SigV4 examples ("Authenticating
+// Requests: Using the Authorization Header"), signature values verbatim from
+// the docs. They are the ground truth that the signing here is right without a
+// server to test against.
+const example_access = "AKIAIOSFODNN7EXAMPLE";
+const example_secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+
+test "sigv4: AWS example 1 — GET object with a Range header" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const h = try authHeader(a, example_access, example_secret, .{
+        .method = "GET",
+        .uri_path = "/test.txt",
+        .headers = &.{
+            // deliberately unsorted: canonicalization must not depend on order
+            .{ .name = "x-amz-date", .value = "20130524T000000Z" },
+            .{ .name = "host", .value = "examplebucket.s3.amazonaws.com" },
+            .{ .name = "range", .value = "bytes=0-9" },
+            .{ .name = "x-amz-content-sha256", .value = empty_payload_hash },
+        },
+        .payload_hash = empty_payload_hash,
+        .timestamp = "20130524T000000Z",
+        .region = "us-east-1",
+    });
+    try std.testing.expectEqualStrings(
+        "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request," ++
+            "SignedHeaders=host;range;x-amz-content-sha256;x-amz-date," ++
+            "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41",
+        h,
+    );
+}
+
+test "sigv4: AWS example 2 — PUT object with payload hash and extra headers" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const ph = try payloadHash(a, "Welcome to Amazon S3.");
+    try std.testing.expectEqualStrings("44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072", ph);
+    // the docs' key is `test$file.text`; the canonical URI single-encodes the $
+    try std.testing.expectEqualStrings("test%24file.text", try uriEncode(a, "test$file.text", .keep_slash));
+    const h = try authHeader(a, example_access, example_secret, .{
+        .method = "PUT",
+        .uri_path = "/test%24file.text",
+        .headers = &.{
+            .{ .name = "date", .value = "Fri, 24 May 2013 00:00:00 GMT" },
+            .{ .name = "host", .value = "examplebucket.s3.amazonaws.com" },
+            .{ .name = "x-amz-content-sha256", .value = ph },
+            .{ .name = "x-amz-date", .value = "20130524T000000Z" },
+            .{ .name = "x-amz-storage-class", .value = "REDUCED_REDUNDANCY" },
+        },
+        .payload_hash = ph,
+        .timestamp = "20130524T000000Z",
+        .region = "us-east-1",
+    });
+    try std.testing.expect(std.mem.endsWith(u8, h, "Signature=98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd"));
+}
+
+test "sigv4: AWS example 3 — GET bucket listing with query parameters" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const h = try authHeader(a, example_access, example_secret, .{
+        .method = "GET",
+        .uri_path = "/",
+        // deliberately unsorted: the canonical query string must sort them
+        .query = &.{ "prefix=J", "max-keys=2" },
+        .headers = &.{
+            .{ .name = "host", .value = "examplebucket.s3.amazonaws.com" },
+            .{ .name = "x-amz-content-sha256", .value = empty_payload_hash },
+            .{ .name = "x-amz-date", .value = "20130524T000000Z" },
+        },
+        .payload_hash = empty_payload_hash,
+        .timestamp = "20130524T000000Z",
+        .region = "us-east-1",
+    });
+    try std.testing.expect(std.mem.endsWith(u8, h, "Signature=34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7"));
+}
+
+test "parseUrl: path-style endpoint keeps the port in the signed host" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const o = try parseUrl(a, "s3://lake/dir/sub/file.csv", "http://127.0.0.1:9000");
+    try std.testing.expectEqualStrings("lake", o.bucket);
+    try std.testing.expectEqualStrings("dir/sub/file.csv", o.key);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9000/lake/dir/sub/file.csv", o.url);
+    try std.testing.expectEqualStrings("127.0.0.1:9000", o.host);
+    try std.testing.expectEqualStrings("/lake/dir/sub/file.csv", o.uri_path);
+
+    // a trailing slash on the endpoint must not double up
+    const t = try parseUrl(a, "s3://lake/f.csv", "http://127.0.0.1:9000/");
+    try std.testing.expectEqualStrings("http://127.0.0.1:9000/lake/f.csv", t.url);
+
+    // keys with characters needing encoding stay aligned between URL and canonical URI
+    const e = try parseUrl(a, "s3://lake/a b$c.csv", "http://127.0.0.1:9000");
+    try std.testing.expectEqualStrings("/lake/a%20b%24c.csv", e.uri_path);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9000/lake/a%20b%24c.csv", e.url);
+
+    try std.testing.expectError(Error.S3BadUrl, parseUrl(a, "s3://bucketonly", null));
+    try std.testing.expectError(Error.S3BadUrl, parseUrl(a, "s3://b/", null));
+    try std.testing.expectError(Error.S3BadUrl, parseUrl(a, "az://a/c/f.csv", null));
+    try std.testing.expect(!isUrl("az://a/c/f"));
+}
+
+test "parseUrl: virtual-host style for the real service" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const o = try parseUrl(a, "s3://mybucket/dir/f.parquet", null);
+    const host = try std.fmt.allocPrint(a, "mybucket.s3.{s}.amazonaws.com", .{regionFromEnv(a)});
+    try std.testing.expectEqualStrings(host, o.host);
+    try std.testing.expectEqualStrings("/dir/f.parquet", o.uri_path);
+    const url = try std.fmt.allocPrint(a, "https://{s}/dir/f.parquet", .{host});
+    try std.testing.expectEqualStrings(url, o.url);
+}
+
+test "prefix URLs are distinguished from object URLs and may have an empty prefix" {
+    try std.testing.expect(isPrefix("s3://b/dir/"));
+    try std.testing.expect(isPrefix("s3://b/"));
+    try std.testing.expect(!isPrefix("s3://b/f.csv"));
+
+    const p = try parsePrefix("s3://lake/year=2026/");
+    try std.testing.expectEqualStrings("lake", p.bucket);
+    try std.testing.expectEqualStrings("year=2026/", p.prefix);
+
+    const bare = try parsePrefix("s3://lake/");
+    try std.testing.expectEqualStrings("", bare.prefix);
+    try std.testing.expectError(Error.S3BadUrl, parsePrefix("s3://noslash"));
+}
