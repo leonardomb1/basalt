@@ -14,9 +14,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 ALL_SUITES="mysql postgres sqlserver starrocks azure parquet s3"
-# s3 must be asked for by name until the s3:// scheme is wired into the engine;
-# fold it into the default set when that lands.
-DEFAULT_SUITES="mysql postgres sqlserver starrocks azure parquet"
+DEFAULT_SUITES="$ALL_SUITES"
 SUITES="${*:-$DEFAULT_SUITES}"
 
 for s in $SUITES; do
