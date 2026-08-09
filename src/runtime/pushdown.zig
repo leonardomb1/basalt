@@ -1427,3 +1427,461 @@ test "planWholeAgg: a non-bare aggregate argument falls back" {
     try testing.expect((try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = aggs, .by = &.{} }, plan_schema)) == null);
 }
 
+
+// ---------------------------------------------------------------------------
+// Moving a filter below a join
+//
+// `serialWhere` above only reads the *contiguous* filter prefix after a read, so
+// a join between the read and the filter stopped every descent: `FROM fact JOIN
+// dim ON … WHERE fact.d = '…'` pulled the whole fact table over the wire and
+// filtered it here. On an 80M-row table that measured 18ms against 15.7s.
+//
+// Every comparable engine solves this the same way — filter pushdown as a rewrite
+// on a plan tree (DuckDB's `filter_pushdown.cpp`, DataFusion's `push_down_filter`,
+// Polars' `predicate_pushdown`, Trino's `PredicatePushDown`) — and basalt has no
+// tree to rewrite. What it does have is a stage list where a join's right side is
+// always a named binding, so the two rewrites below work locally on that list and
+// need no optimizer framework:
+//
+//   hoist:  read | join | filter(probe cols)  ->  read | filter | join
+//   derive: read | join(l.k = r.k) | filter(r.k = 'x')
+//             ->  read | filter(l.k = 'x') | join | filter(r.k = 'x')
+//
+// The second is DuckDB's equivalence-set trick: a predicate on one side of an
+// equijoin also constrains the other, so a filter naming the dimension's key can
+// prune the fact table at the source.
+//
+// Pushdown is where these engines have shipped *wrong answers* rather than slow
+// ones — ClickHouse generating bad queries against distributed tables, Polars
+// returning wrong rows after join/select/filter — so both rewrites here refuse
+// unless they can prove the move is safe, and refusing only costs the old speed.
+
+/// Join kinds a probe-only filter may move below.
+///
+/// `inner` and `cross` are products, so filtering the probe before or after is the
+/// same rows. `left` keeps every probe row (the right side is null-extended, which
+/// a probe-only predicate cannot see), and `semi`/`anti` emit a subset of probe
+/// rows and no right columns at all.
+///
+/// `right` and `full` are excluded because there the *probe* side is the one that
+/// gets null-extended: a filter above the join sees rows that do not exist below
+/// it, and moving it changes the answer.
+fn hoistableKind(k: ast.JoinKind) bool {
+    return switch (k) {
+        .inner, .cross, .left, .semi, .anti => true,
+        .right, .full => false,
+    };
+}
+
+/// Output column names of a binding, or null when they cannot be known statically —
+/// a `SELECT *` over a source whose schema only the source can describe. Null means
+/// "cannot prove", and every caller treats that as "do not move".
+fn bindingNames(
+    arena: std.mem.Allocator,
+    bindings: *const std.StringHashMap(ast.Pipeline),
+    name: []const u8,
+) !?[]const []const u8 {
+    const pipe = bindings.get(name) orelse return null;
+    var i = pipe.stages.len;
+    while (i > 0) {
+        i -= 1;
+        switch (pipe.stages[i].node) {
+            .select => |items| {
+                const out = try arena.alloc([]const u8, items.len);
+                for (items, out) |it, *o| o.* = switch (it) {
+                    .field => |q| q.last(),
+                    .computed => |c| c.name,
+                    // A star of any kind leaves the name set open.
+                    else => return null,
+                };
+                return out;
+            },
+            // Anything else between the read and here neither adds nor renames a
+            // column, so keep looking for the projection that names them.
+            .filter, .limit, .sort, .distinct => {},
+            else => return null,
+        }
+    }
+    return null;
+}
+
+/// Whether `name` could be a column the join's right side contributed — including
+/// the `_r`, `_r2`, … suffixes a colliding right-side name comes back under.
+fn isRightName(name: []const u8, right: []const []const u8) bool {
+    for (right) |r| {
+        if (std.mem.eql(u8, name, r)) return true;
+        if (!std.mem.startsWith(u8, name, r)) continue;
+        const tail = name[r.len..];
+        if (std.mem.eql(u8, tail, "_r")) return true;
+        if (tail.len > 2 and std.mem.startsWith(u8, tail, "_r")) {
+            var all_digits = true;
+            for (tail[2..]) |c| if (!std.ascii.isDigit(c)) {
+                all_digits = false;
+            };
+            if (all_digits) return true;
+        }
+    }
+    return false;
+}
+
+/// True when every column the predicate names is one the probe side already had.
+/// Aliases are stripped at parse time, so a bare name cannot say which side it came
+/// from — but the only other supplier is the right side, and that one is
+/// enumerable, so "not the right side's" is a proof of "the probe's".
+fn refsOnlyProbe(
+    arena: std.mem.Allocator,
+    e: *const ast.Expr,
+    right: []const []const u8,
+    binding: []const u8,
+) !bool {
+    var list = std.array_list.Managed(ast.QualName).init(arena);
+    try collectQuals(arena, e, &list);
+    for (list.items) |q| {
+        // `r.name` where `r` is the join's binding is the right side, said outright.
+        if (q.parts.len > 1 and std.mem.eql(u8, q.parts[0], binding)) return false;
+        if (isRightName(q.last(), right)) return false;
+    }
+    return true;
+}
+
+
+/// Collect the `QualName` of every column reference, qualifier included.
+///
+/// `collectFields` above keys on `parts[0]`, which for `r.name` is the *qualifier*
+/// `r` and not the column — checking eligibility against that hoisted right-side
+/// filters as if they named probe columns. Both halves are needed here: the
+/// qualifier can name the join's binding outright, and the last part is the column.
+const QualWalk = struct { arena: std.mem.Allocator, list: *std.array_list.Managed(ast.QualName) };
+
+fn collectQualsRecur(cx: QualWalk, e: *const ast.Expr) error{OutOfMemory}!*ast.Expr {
+    if (e.* == .field) {
+        try cx.list.append(e.field);
+        return @constCast(e);
+    }
+    return ast.rebuildExpr(cx.arena, e, cx, collectQualsRecur);
+}
+
+fn collectQuals(arena: std.mem.Allocator, e: *const ast.Expr, list: *std.array_list.Managed(ast.QualName)) !void {
+    _ = try collectQualsRecur(.{ .arena = arena, .list = list }, e);
+}
+
+const KeySwap = struct {
+    arena: std.mem.Allocator,
+    /// right key name -> left key name
+    map: *const std.StringHashMap([]const u8),
+};
+
+fn swapKeysRecur(cx: KeySwap, e: *const ast.Expr) error{OutOfMemory}!*ast.Expr {
+    if (e.* == .field) {
+        {
+            const nm = e.field.last();
+            if (cx.map.get(nm)) |left| {
+                const parts = try cx.arena.alloc([]const u8, 1);
+                parts[0] = left;
+                return mkExpr(cx.arena, .{ .field = .{ .parts = parts } });
+            }
+        }
+        return @constCast(e);
+    }
+    return ast.rebuildExpr(cx.arena, e, cx, swapKeysRecur);
+}
+
+fn mkExpr(arena: std.mem.Allocator, e: ast.Expr) !*ast.Expr {
+    const p = try arena.create(ast.Expr);
+    p.* = e;
+    return p;
+}
+
+/// The probe-side twin of a predicate that names only right-side join keys, or null
+/// when there is none to derive.
+///
+/// Sound because an equijoin never matches a null key: if the surviving rows must
+/// have `r.k = 'x'` and they are paired by `l.k = r.k`, then their `l.k` is `'x'`
+/// too. Restricted to `inner`: under `left`/`anti` a probe row that matches nothing
+/// still reaches the output, so constraining it by the right side's predicate would
+/// drop rows the query asked for.
+fn deriveProbePredicate(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    e: *const ast.Expr,
+    j: ast.Join,
+) !?*ast.Expr {
+    if (j.kind != .inner) return null;
+    if (j.left_keys.len == 0 or j.left_keys.len != j.right_keys.len) return null;
+
+    var map = std.StringHashMap([]const u8).init(gpa);
+    defer map.deinit();
+    for (j.right_keys, j.left_keys) |r, l| try map.put(r.last(), l.last());
+
+    var list = std.array_list.Managed(ast.QualName).init(arena);
+    try collectQuals(arena, e, &list);
+    if (list.items.len == 0) return null;
+    for (list.items) |q| {
+        // Every reference has to be a right key with a left twin; a predicate
+        // mentioning any other column has no probe-side equivalent.
+        if (map.get(q.last()) == null) return null;
+    }
+    return try swapKeysRecur(.{ .arena = arena, .map = &map }, e);
+}
+
+/// Rewrite `stages` so filters sit as early as the join structure allows. Returns
+/// null when nothing moved, so the caller keeps its original slice.
+pub fn hoistThroughJoins(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    stages: []const ast.Stage,
+    bindings: *const std.StringHashMap(ast.Pipeline),
+) !?[]const ast.Stage {
+    if (stages.len < 3) return null;
+    var list = std.array_list.Managed(ast.Stage).init(arena);
+    try list.appendSlice(stages);
+    var changed = false;
+
+    // Hoist: swap a probe-only filter with the join in front of it, repeatedly, so
+    // a filter can cross several joins. Bounded by the stage count squared, which is
+    // a handful — a pipeline is tens of stages, not thousands.
+    var rounds: usize = 0;
+    while (rounds < list.items.len) : (rounds += 1) {
+        var moved_this_round = false;
+        var i: usize = 1;
+        while (i < list.items.len) : (i += 1) {
+            if (list.items[i].node != .filter) continue;
+            if (list.items[i - 1].node != .join) continue;
+            const j = list.items[i - 1].node.join;
+            if (!hoistableKind(j.kind)) continue;
+            const right = (try bindingNames(arena, bindings, j.binding)) orelse continue;
+            if (!try refsOnlyProbe(arena, list.items[i].node.filter, right, j.binding)) continue;
+            const tmp = list.items[i - 1];
+            list.items[i - 1] = list.items[i];
+            list.items[i] = tmp;
+            moved_this_round = true;
+            changed = true;
+        }
+        if (!moved_this_round) break;
+    }
+
+    // Derive: once per join, and only for the filters directly above it, so there is
+    // no chance of deriving the same predicate twice.
+    var k: usize = 0;
+    while (k + 1 < list.items.len) : (k += 1) {
+        if (list.items[k].node != .join) continue;
+        const j = list.items[k].node.join;
+        var m = k + 1;
+        var inserted: usize = 0;
+        while (m < list.items.len and list.items[m].node == .filter) : (m += 1) {
+            const derived = (try deriveProbePredicate(arena, gpa, list.items[m].node.filter, j)) orelse continue;
+            try list.insert(k, .{ .node = .{ .filter = derived }, .hints = &.{}, .pos = list.items[m].pos });
+            inserted += 1;
+            m += 1;
+            changed = true;
+        }
+        k += inserted;
+    }
+
+    if (!changed) return null;
+    return try list.toOwnedSlice();
+}
+
+// --- the join rewrites -----------------------------------------------------
+
+fn qual(arena: std.mem.Allocator, parts: []const []const u8) !ast.QualName {
+    const p = try arena.alloc([]const u8, parts.len);
+    for (parts, p) |src, *dst| dst.* = src;
+    return .{ .parts = p };
+}
+
+fn qfld(arena: std.mem.Allocator, parts: []const []const u8) !*ast.Expr {
+    const e = try arena.create(ast.Expr);
+    e.* = .{ .field = try qual(arena, parts) };
+    return e;
+}
+
+/// `<parts> = <int>` as a filter stage.
+fn eqFilter(arena: std.mem.Allocator, parts: []const []const u8, v: i64) !ast.Stage {
+    const lit = try arena.create(ast.Expr);
+    lit.* = .{ .int_lit = v };
+    return .{ .node = .{ .filter = try bin(arena, .eq, try qfld(arena, parts), lit) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
+}
+
+fn joinStage(arena: std.mem.Allocator, kind: ast.JoinKind, binding: []const u8, lk: []const u8, rk: []const u8) !ast.Stage {
+    const lefts = try arena.alloc(ast.QualName, 1);
+    lefts[0] = try qual(arena, &.{lk});
+    const rights = try arena.alloc(ast.QualName, 1);
+    rights[0] = try qual(arena, &.{rk});
+    return .{ .node = .{ .join = .{ .kind = kind, .binding = binding, .left_keys = lefts, .right_keys = rights } }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
+}
+
+/// A binding whose projection names `rk` and `name`, so its output columns are
+/// statically knowable — which is what the rewrites require before moving anything.
+fn dimBindings(arena: std.mem.Allocator) !std.StringHashMap(ast.Pipeline) {
+    var m = std.StringHashMap(ast.Pipeline).init(arena);
+    const items = try arena.alloc(ast.SelectItem, 2);
+    items[0] = .{ .field = try qual(arena, &.{"rk"}) };
+    items[1] = .{ .field = try qual(arena, &.{"name"}) };
+    const stages = try arena.alloc(ast.Stage, 2);
+    stages[0] = .{ .node = .{ .read = .{ .connector = "csv", .form = .{ .path = "dim.csv" } } }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
+    stages[1] = .{ .node = .{ .select = items }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
+    try m.put("r", .{ .stages = stages, .pos = .{ .line = 0, .col = 0 } });
+    return m;
+}
+
+fn readStage() ast.Stage {
+    return .{ .node = .{ .read = .{ .connector = "mysql", .form = .{ .table = .{ .parts = &.{"t"} } } } }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
+}
+
+fn writeStage() ast.Stage {
+    return .{ .node = .{ .write = .{ .connector = "stdout", .form = null, .target = "", .mode = .default } }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
+}
+
+test "hoist: a probe-only filter moves below an inner join" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var binds = try dimBindings(a);
+    defer binds.deinit();
+
+    // read | join | filter(v = 1) | write
+    const stages = try a.alloc(ast.Stage, 4);
+    stages[0] = readStage();
+    stages[1] = try joinStage(a, .inner, "r", "k", "rk");
+    stages[2] = try eqFilter(a, &.{"v"}, 1);
+    stages[3] = writeStage();
+
+    const out = (try hoistThroughJoins(a, a, stages, &binds)).?;
+    try std.testing.expectEqual(@as(usize, 4), out.len);
+    // The filter now sits directly after the read, which is the prefix `serialWhere`
+    // reads — so the predicate can descend into the source query.
+    try std.testing.expect(out[1].node == .filter);
+    try std.testing.expect(out[2].node == .join);
+
+    const d: Dialect = .postgres;
+    const where = (try serialWhere(a, d, out[0 .. out.len - 1])).?;
+    try std.testing.expectEqualStrings("(\"v\" = 1)", where);
+}
+
+test "hoist: a filter naming a right-side column stays put" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var binds = try dimBindings(a);
+    defer binds.deinit();
+
+    for ([_][]const []const u8{
+        &.{"name"}, // bare right-side column
+        &.{ "r", "name" }, // qualified by the binding
+        &.{"name_r"}, // the suffix a colliding right name comes back under
+    }) |parts| {
+        const stages = try a.alloc(ast.Stage, 4);
+        stages[0] = readStage();
+        stages[1] = try joinStage(a, .inner, "r", "k", "rk");
+        stages[2] = try eqFilter(a, parts, 1);
+        stages[3] = writeStage();
+        // Nothing to move: the predicate cannot be evaluated before the join.
+        try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds)) == null);
+    }
+}
+
+test "hoist: refused for the join kinds that null-extend the probe side" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var binds = try dimBindings(a);
+    defer binds.deinit();
+
+    // A probe row that only exists null-extended cannot be filtered beforehand.
+    for ([_]ast.JoinKind{ .right, .full }) |kind| {
+        const stages = try a.alloc(ast.Stage, 4);
+        stages[0] = readStage();
+        stages[1] = try joinStage(a, kind, "r", "k", "rk");
+        stages[2] = try eqFilter(a, &.{"v"}, 1);
+        stages[3] = writeStage();
+        try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds)) == null);
+    }
+    // Whereas these preserve or subset the probe rows, so it is safe.
+    for ([_]ast.JoinKind{ .inner, .left, .semi, .anti, .cross }) |kind| {
+        const stages = try a.alloc(ast.Stage, 4);
+        stages[0] = readStage();
+        stages[1] = try joinStage(a, kind, "r", "k", "rk");
+        stages[2] = try eqFilter(a, &.{"v"}, 1);
+        stages[3] = writeStage();
+        try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds)) != null);
+    }
+}
+
+test "hoist: a binding with an open name set is left alone" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // `SELECT *` over a source whose columns only the source knows: the right-side
+    // name set cannot be enumerated, so "not the right side's" is unprovable.
+    var binds = std.StringHashMap(ast.Pipeline).init(a);
+    defer binds.deinit();
+    const items = try a.alloc(ast.SelectItem, 1);
+    items[0] = .star;
+    const bs = try a.alloc(ast.Stage, 2);
+    bs[0] = readStage();
+    bs[1] = .{ .node = .{ .select = items }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
+    try binds.put("r", .{ .stages = bs, .pos = .{ .line = 0, .col = 0 } });
+
+    const stages = try a.alloc(ast.Stage, 4);
+    stages[0] = readStage();
+    stages[1] = try joinStage(a, .inner, "r", "k", "rk");
+    stages[2] = try eqFilter(a, &.{"v"}, 1);
+    stages[3] = writeStage();
+    try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds)) == null);
+}
+
+test "derive: a predicate on the join key gains a probe-side twin" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var binds = try dimBindings(a);
+    defer binds.deinit();
+
+    // read | join(k = rk) | filter(rk = 7) | write
+    const stages = try a.alloc(ast.Stage, 4);
+    stages[0] = readStage();
+    stages[1] = try joinStage(a, .inner, "r", "k", "rk");
+    stages[2] = try eqFilter(a, &.{ "r", "rk" }, 7);
+    stages[3] = writeStage();
+
+    const out = (try hoistThroughJoins(a, a, stages, &binds)).?;
+    // The original stays; a twin on the probe key appears ahead of the join, which
+    // is what lets a filter written against the dimension prune the fact table.
+    try std.testing.expectEqual(@as(usize, 5), out.len);
+    try std.testing.expect(out[1].node == .filter);
+    try std.testing.expect(out[2].node == .join);
+    try std.testing.expect(out[3].node == .filter);
+
+    const where = (try serialWhere(a, .postgres, out[0..2])).?;
+    try std.testing.expectEqualStrings("(\"k\" = 7)", where);
+}
+
+test "derive: only for an inner join, and only when every ref is a key" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var binds = try dimBindings(a);
+    defer binds.deinit();
+
+    // Under a left/anti join a probe row that matches nothing still reaches the
+    // output, so constraining the probe by the right side's predicate drops rows the
+    // query asked for.
+    for ([_]ast.JoinKind{ .left, .anti, .semi, .right, .full, .cross }) |kind| {
+        const stages = try a.alloc(ast.Stage, 4);
+        stages[0] = readStage();
+        stages[1] = try joinStage(a, kind, "r", "k", "rk");
+        stages[2] = try eqFilter(a, &.{ "r", "rk" }, 7);
+        stages[3] = writeStage();
+        try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds)) == null);
+    }
+
+    // A predicate touching a non-key right column has no probe-side equivalent.
+    const stages = try a.alloc(ast.Stage, 4);
+    stages[0] = readStage();
+    stages[1] = try joinStage(a, .inner, "r", "k", "rk");
+    stages[2] = try eqFilter(a, &.{ "r", "name" }, 7);
+    stages[3] = writeStage();
+    try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds)) == null);
+}
