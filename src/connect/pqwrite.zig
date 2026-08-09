@@ -23,6 +23,7 @@ const codec = @import("codec.zig");
 const eval = @import("../exec/eval.zig");
 const driver = @import("driver.zig");
 const azure = @import("azure.zig");
+const s3 = @import("s3.zig");
 const httpx = @import("http.zig");
 const types = @import("../lang/types.zig");
 const batchmod = @import("../exec/batch.zig");
@@ -347,12 +348,14 @@ pub const Writer = struct {
     const Backend = union(enum) {
         file: std.fs.File,
         blob: struct { client: *std.http.Client, w: *azure.BlockBlobWriter },
+        s3obj: struct { client: *std.http.Client, w: *s3.MultipartWriter },
     };
 
     fn dest(self: *Writer) *std.Io.Writer {
         return switch (self.backend) {
             .file => &self.fw.interface,
             .blob => |b| &b.w.interface,
+            .s3obj => |b| &b.w.interface,
         };
     }
 
@@ -405,6 +408,14 @@ pub const Writer = struct {
                 .client = client,
                 .w = try azure.BlockBlobWriter.init(arena, client, blob, parquet_content_type),
             } };
+        } else if (s3.isUrl(path)) {
+            const client = try arena.create(std.http.Client);
+            client.* = httpx.initClient(arena);
+            const obj = try s3.parseUrl(arena, path, s3.endpointFromEnv(arena));
+            self.backend = .{ .s3obj = .{
+                .client = client,
+                .w = try s3.MultipartWriter.init(arena, client, obj, parquet_content_type),
+            } };
         } else {
             self.backend = .{ .file = try std.fs.cwd().createFile(path, .{}) };
             self.fw = self.backend.file.writer(&self.write_buf);
@@ -427,6 +438,7 @@ pub const Writer = struct {
         return switch (self.backend) {
             .file => e,
             .blob => |b| b.w.last_status orelse e,
+            .s3obj => |b| b.w.last_status orelse e,
         };
     }
 
@@ -621,6 +633,8 @@ pub const Writer = struct {
             // only once the footer is written — so a reader never observes a
             // Parquet object without one. Atomic publication, for free.
             .blob => |b| b.w.finish() catch |e| return self.specific(e),
+            // Same for the multipart completion (or the single PUT).
+            .s3obj => |b| b.w.finish() catch |e| return self.specific(e),
         }
     }
 
@@ -632,6 +646,9 @@ pub const Writer = struct {
         switch (self.backend) {
             .file => |f| f.close(),
             .blob => {},
+            // An uncompleted multipart upload is invisible to readers; unlike
+            // Azure, S3 only reaps it where the bucket has a lifecycle rule.
+            .s3obj => {},
         }
     }
 

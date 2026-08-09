@@ -16,6 +16,7 @@ const csv = @import("../connect/csv.zig");
 const pqdecode = @import("../connect/pqdecode.zig");
 const pqwrite = @import("../connect/pqwrite.zig");
 const azure = @import("../connect/azure.zig");
+const s3 = @import("../connect/s3.zig");
 
 pub const Diag = struct {
     buf: [512]u8 = undefined,
@@ -754,7 +755,7 @@ pub fn render(plan: Plan, w: anytype) !void {
 /// committed whole rather than extended. One source of truth, so `check` and the
 /// runtime planner cannot drift apart on which targets accumulate.
 pub fn appendUnsupported(target: []const u8) ?[]const u8 {
-    if (azure.isUrl(target)) return "an object-store blob is replaced on write, never extended";
+    if (azure.isUrl(target) or s3.isUrl(target)) return "an object-store blob is replaced on write, never extended";
     if (pqwrite.Writer.isPath(target)) return "a parquet file's footer indexes every row group and is written last, so appending means rewriting the file";
     return null;
 }
