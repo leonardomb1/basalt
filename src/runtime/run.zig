@@ -6101,6 +6101,41 @@ test "IDENTIFIER path: a loop variable shadows a same-named PARAM" {
     try std.testing.expectEqualStrings("id\n5\n", out);
 }
 
+test "LOAD INTO IDENTIFIER: one output file per for-each row" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "cat.csv", .data = "r\nnorth\nsouth\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "LET dir = '{s}';\n" ++
+            "FOR EACH ROW OF (SELECT r FROM '{s}/cat.csv') AS (r)\n" ++
+            "  LOAD INTO IDENTIFIER($dir || '/out_' || $r || '.csv') AS SELECT $r AS region;\n" ++
+            "END FOR;",
+        .{ base, base },
+    );
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    _ = run(alloc, prog, .{}, &rdiag) catch |e| {
+        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+        return e;
+    };
+
+    const north = try tmp.dir.readFileAlloc(alloc, "out_north.csv", 1 << 16);
+    defer alloc.free(north);
+    try std.testing.expectEqualStrings("region\nnorth\n", north);
+    const south = try tmp.dir.readFileAlloc(alloc, "out_south.csv", 1 << 16);
+    defer alloc.free(south);
+    try std.testing.expectEqualStrings("region\nsouth\n", south);
+}
+
 test "explode splits a delimited column into rows" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

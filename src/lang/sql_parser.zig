@@ -807,6 +807,22 @@ pub const Parser = struct {
         var write: ast.Write = undefined;
         if (self.at(.string)) {
             write = .{ .connector = "csv", .form = null, .target = self.advance().text, .mode = .default };
+        } else if (self.isKw("identifier") and self.peekTag() == .lparen) {
+            // A computed *file* target, the sink counterpart of `FROM
+            // IDENTIFIER(...)`: one output file per loop row or per param.
+            // `conn.IDENTIFIER(...)` is a computed table and parses below.
+            const ipos = self.curPos();
+            _ = self.advance();
+            _ = try self.expect(.lparen);
+            const e = try self.parseExpr();
+            _ = try self.expect(.rparen);
+            const tmpl = try self.exprToTemplate(e);
+            // The extension picks the writer, and which dispositions are legal
+            // (`APPEND` accumulates for CSV, never for parquet), both of which are
+            // settled at plan time — so it cannot come from a per-row value.
+            if (!hasLiteralExt(tmpl))
+                return self.fail(ipos, "dynamic target needs a literal extension (end it with `|| '.csv'`, `|| '.parquet'`, …)", .{});
+            write = .{ .connector = "csv", .form = null, .target = tmpl, .mode = .default };
         } else {
             const conn = try self.expectIdent();
             if (!self.isConn(conn))
@@ -3096,6 +3112,32 @@ test "sql: FROM IDENTIFIER without a literal extension is a parse error" {
     const a = ar.allocator();
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const r = parseSource(a, "LOAD INTO '/tmp/o.csv' AS SELECT * FROM IDENTIFIER('dir/' || name);", &diag);
+    try testing.expectError(error.ParseFailed, r);
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "literal extension") != null);
+}
+
+test "sql: LOAD INTO IDENTIFIER(expr) -> a computed path write" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parseTest(a,
+        \\LOAD INTO IDENTIFIER('dir/' || name || '.csv') AS
+        \\SELECT * FROM 'in.csv';
+    );
+    const stages = prog.stmts[1].output.stages;
+    const w = stages[stages.len - 1].node.write;
+    try testing.expectEqualStrings("csv", w.connector);
+    try testing.expectEqualStrings("dir/${name}.csv", w.target);
+}
+
+test "sql: LOAD INTO IDENTIFIER without a literal extension is a parse error" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    // The extension picks the writer and decides which dispositions are legal,
+    // so it has to be known before any row is read.
+    const r = parseSource(a, "LOAD INTO IDENTIFIER('dir/' || name) AS SELECT * FROM 'in.csv';", &diag);
     try testing.expectError(error.ParseFailed, r);
     try testing.expect(std.mem.indexOf(u8, diag.msg, "literal extension") != null);
 }
