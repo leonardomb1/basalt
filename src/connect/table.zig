@@ -49,10 +49,10 @@ pub const TableWriter = struct {
         const gpa = self.gpa;
         const widths = try gpa.alloc(usize, self.ncols);
         defer gpa.free(widths);
-        for (self.names, 0..) |n, i| widths[i] = n.len;
+        for (self.names, 0..) |n, i| widths[i] = displayWidth(n);
         for (0..self.nrows) |r| {
             for (0..self.ncols) |c| {
-                const len = self.cells.items[r * self.ncols + c].len;
+                const len = displayWidth(self.cells.items[r * self.ncols + c]);
                 if (len > widths[c]) widths[c] = len;
             }
         }
@@ -110,9 +110,24 @@ pub const TableWriter = struct {
     }
 };
 
+/// Column width in characters, not bytes. `LIQUIDAÇÃO` is ten characters in
+/// twelve bytes, and padding by the byte count pushed every later column of that
+/// row out of line — which shows up the moment a file is not pure ASCII, i.e. on
+/// most non-English data. Counts UTF-8 lead bytes, so a malformed sequence is
+/// counted rather than rejected: this is output formatting, not validation. East
+/// Asian wide characters still measure one, which is a separate problem.
+fn displayWidth(s: []const u8) usize {
+    var n: usize = 0;
+    for (s) |c| {
+        if (c & 0xC0 != 0x80) n += 1;
+    }
+    return n;
+}
+
 fn padded(out: *std.Io.Writer, s: []const u8, width: usize) !void {
     try out.writeAll(s);
-    try out.splatBytesAll(" ", width - s.len);
+    const w = displayWidth(s);
+    try out.splatBytesAll(" ", if (width > w) width - w else 0);
 }
 
 /// `--format json` sink: one JSON object per row (NDJSON) on stdout, streamed

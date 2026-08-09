@@ -233,7 +233,7 @@ LIMIT 100 OFFSET 20;
 | SQL table | `FROM erp.dbo.SC5010` |
 | SQL table (per-row name) | `FROM erp.dbo.IDENTIFIER($name)` (§7) — still a table read |
 | raw query | `FROM erp.QUERY($$SELECT ...$$)` (no dialect translation) |
-| file — CSV or Parquet | `FROM 'path.csv'` / `FROM 'path.parquet'` — the extension picks the reader; local or HTTPS URL |
+| file — CSV or Parquet | `FROM 'path.csv'` / `FROM 'path.parquet'` — the extension picks the reader; local or HTTPS URL. Any other extension is a plan-time error unless `WITH (format = ...)` names one |
 | object storage | `FROM 'az://account/container/path.parquet'` or `FROM 's3://bucket/key.parquet'`; a trailing `/` reads every object under the prefix as one table |
 | REST (connection) | `FROM crm.'/v1/customers'` (path on the conn's base URL) |
 | REST (bare URL) | `FROM HTTP('https://host/api/x')` |
@@ -283,6 +283,22 @@ Source clauses, in any order after the source:
   `size`→`page_size`, `total`→`total_field`, `field`→`cursor_field`,
   `start`→`start_page`, `max`→`max_pages`); unknown keys pass through.
 - **`RETRY n [ON (429, 503)]`** — retries + retryable statuses.
+- **`WITH (delimiter = ';', encoding = 'latin1')`** — the CSV dialect. The
+  delimiter is one character, or the word `tab`; the encodings are `utf8`
+  (default), `latin1` / `iso-8859-1`, and `cp1252` / `windows-1252`. Non-UTF-8
+  input is decoded to UTF-8 as it is read, so everything downstream — comparisons,
+  `length()`, a parquet sink — sees proper text. Multi-byte encodings are not
+  supported: they would break the byte-range chunking a parallel CSV read depends
+  on. A file whose bytes are not what you claimed does not fail, it just yields
+  mojibake, so prefer the publisher's stated encoding over guessing. The delimiter
+  is also accepted on a `LOAD INTO` file target; `encoding` is not — a CSV sink
+  always writes UTF-8, and being told otherwise is an error rather than ignored.
+- **`WITH (format = 'csv' | 'parquet')`** — read or write a path as this format
+  whatever its extension says. Needed for a file named `.dat` or `.txt`, and for
+  a URL that serves CSV from an extensionless path. Without it, an extension
+  basalt does not know is refused at plan time rather than parsed as CSV: a
+  `.zip` used to be read as text and answer `COUNT(*)` with the number of
+  newlines that happened to occur in its compressed bytes.
 - **`WITH (k = v, flag, ...)`** — residual source options: `items` (dotted
   path to the row array when the response nests it, e.g. `items = 'data.rows'`
   — a bare array needs nothing), `buffer` (drain the source fully before

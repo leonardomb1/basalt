@@ -227,6 +227,18 @@ const Env = struct {
     /// one opened, so a join whose build side reads SQL leaves this describing the
     /// binding, not the probe read (`sqlDescForStage` re-derives one read's own).
     sql_desc: ?SqlDesc = null,
+    /// The CSV dialect of the pipeline currently running, from its `WITH (...)`:
+    /// `csv_in` for the leading read (delimiter + encoding), `csv_out` for the
+    /// sink (delimiter only — a CSV sink always writes UTF-8). Set per pipeline by
+    /// `runOutput`, the same lifecycle as `sink_name` below, so the parallel
+    /// readers and `openSink` can see them without threading hints through every
+    /// call site. A CTE's own read does not use these: `openSource` is handed the
+    /// binding's hints directly.
+    csv_in: csv.Dialect = .{},
+    csv_out: csv.Dialect = .{},
+    /// `WITH (format = ...)` for the same two ends, when the script names it.
+    fmt_in: ?analyze.FileFormat = null,
+    fmt_out: ?analyze.FileFormat = null,
     /// Connector types of the first source/sink, for the run summary.
     src_name: []const u8 = "",
     /// Parquet readers opened for the current pipeline, and the last one — used
@@ -702,6 +714,24 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     if (last != .write) return planErr(env.diag, "a top-level pipeline must end in `write`");
     env.sink_name = sinkLabel(env, last.write);
     if (!env.explain and !std.mem.eql(u8, last.write.connector, "stdout")) env.wrote_sink = true;
+
+    var ddiag = analyze.Diag{};
+    env.csv_in = analyze.dialectFromHints(stages[0].hints, &ddiag) catch
+        return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg));
+    env.csv_out = analyze.dialectFromHints(stages[stages.len - 1].hints, &ddiag) catch
+        return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg));
+    env.fmt_in = analyze.formatFromHints(stages[0].hints, &ddiag) catch
+        return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg));
+    env.fmt_out = analyze.formatFromHints(stages[stages.len - 1].hints, &ddiag) catch
+        return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg));
+    // `run` does not analyze the pipeline the way `check` does, so the guard that
+    // stops an unreadable extension being parsed as CSV has to be applied here
+    // too — this is the path that answered a zip's COUNT(*) with 46204.
+    if (stages[0].node == .read and stages[0].node.read.form == .path and
+        std.mem.eql(u8, stages[0].node.read.connector, "csv"))
+        try guardFileFormat(env, stages[0].node.read.form.path, env.fmt_in, "read");
+    if (std.mem.eql(u8, last.write.connector, "csv") and last.write.target.len > 0)
+        try guardFileFormat(env, last.write.target, env.fmt_out, "write");
 
     if (stages[0].node == .read) implicit: {
         const rd = stages[0].node.read;
@@ -2020,7 +2050,7 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
     };
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
 
-    const mapped = csv.MappedCsv.open(arena, path) catch return false;
+    const mapped = csv.MappedCsv.open(arena, path, env.csv_in) catch return false;
     // A newline inside a quoted field makes chunk boundaries undecidable from a
     // byte offset, so this file is parsed serially rather than split. Closed
     // explicitly: this returns before the `defer` below is armed, and leaking
@@ -2606,7 +2636,7 @@ fn runParallelCsvMapImpl(env: *Env, rd: ast.Read, map_stages: []const ast.Stage,
     if (std.mem.eql(u8, w.connector, "stdout")) return false;
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
 
-    const mapped = csv.MappedCsv.open(arena, path) catch return false;
+    const mapped = csv.MappedCsv.open(arena, path, env.csv_in) catch return false;
     // A newline inside a quoted field makes chunk boundaries undecidable from a
     // byte offset, so this file is parsed serially rather than split. Closed
     // explicitly: this returns before the `defer` below is armed, and leaking
@@ -2871,7 +2901,7 @@ fn runParallelCsvTopN(env: *Env, rd: ast.Read, prefix: []const ast.Stage, srt: a
     };
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
 
-    const mapped = csv.MappedCsv.open(arena, path) catch return false;
+    const mapped = csv.MappedCsv.open(arena, path, env.csv_in) catch return false;
     // A newline inside a quoted field makes chunk boundaries undecidable from a
     // byte offset, so this file is parsed serially rather than split. Closed
     // explicitly: this returns before the `defer` below is armed, and leaking
@@ -3227,7 +3257,7 @@ fn runParallelCsvDistinct(env: *Env, rd: ast.Read, prefix: []const ast.Stage, di
     if (std.mem.eql(u8, w.connector, "stdout")) return false;
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
 
-    const mapped = csv.MappedCsv.open(arena, path) catch return false;
+    const mapped = csv.MappedCsv.open(arena, path, env.csv_in) catch return false;
     // A newline inside a quoted field makes chunk boundaries undecidable from a
     // byte offset, so this file is parsed serially rather than split. Closed
     // explicitly: this returns before the `defer` below is armed, and leaking
@@ -4930,12 +4960,22 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
     }
     if (std.mem.eql(u8, rd.connector, "csv")) {
         if (rd.form != .path) return planErr(env.diag, "read csv needs a quoted path");
-        if (pqdecode.Reader.isPath(rd.form.path)) {
+        var fdiag = analyze.Diag{};
+        const want = analyze.formatFromHints(hints, &fdiag) catch
+            return planErr(env.diag, try env.arena.dupe(u8, fdiag.msg));
+        try guardFileFormat(env, rd.form.path, want, "read");
+        // An explicit `format` decides, so a parquet under an unusual name is not
+        // handed to the CSV parser; otherwise the extension does, as before.
+        const rfmt = want orelse (if (pqdecode.Reader.isPath(rd.form.path)) analyze.FileFormat.parquet else analyze.FileFormat.csv);
+        if (rfmt == .parquet) {
             const pr = pqdecode.Reader.open(env.arena, rd.form.path) catch |e|
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
             return pr.source();
         }
-        const reader = csv.CsvReader.open(env.arena, rd.form.path) catch |e| {
+        var ddiag = analyze.Diag{};
+        const d = analyze.dialectFromHints(hints, &ddiag) catch
+            return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg));
+        const reader = csv.CsvReader.open(env.arena, rd.form.path, d) catch |e| {
             // A mistyped prefix and a truly empty one are the same listing; say
             // which prefix came back empty rather than blaming the CSV parser.
             if (e == azure.Error.AzureEmptyPrefix)
@@ -5301,6 +5341,16 @@ fn fileWriteMode(env: *Env, w: ast.Write) !driver.FileMode {
     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`APPEND` into `{s}` is not supported: {s}. Use `REPLACE`, write each run to its own path, or accumulate with `INTO BUFFER` and load the buffer once", .{ w.target, why }));
 }
 
+/// Refuse a file path whose extension names no format basalt reads.
+///
+/// `check` applies this through `analyze`, but `run` does not analyze the pipeline
+/// first, so without this call the runtime still parsed a `.zip` as CSV and
+/// answered `SELECT COUNT(*)` with the newline count of its deflate stream.
+fn guardFileFormat(env: *Env, path: []const u8, explicit: ?analyze.FileFormat, comptime verb: []const u8) !void {
+    if (analyze.unreadableTarget(path, explicit)) |why|
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot " ++ verb ++ " `{s}`: {s}", .{ path, why }));
+}
+
 fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (env.explain) return DiscardSink.sink();
     if (std.mem.eql(u8, w.connector, "stdout")) {
@@ -5316,13 +5366,15 @@ fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (std.mem.eql(u8, w.connector, "csv")) {
         const fmode = try fileWriteMode(env, w);
         // A `.parquet` target shares the csv connector but is a different format;
-        // without this it would be written as CSV text under a .parquet name.
-        if (pqwrite.Writer.isPath(w.target)) {
+        // without this it would be written as CSV text under a .parquet name. An
+        // explicit `WITH (format = ...)` overrides the extension.
+        const wfmt = env.fmt_out orelse (if (pqwrite.Writer.isPath(w.target)) analyze.FileFormat.parquet else analyze.FileFormat.csv);
+        if (wfmt == .parquet) {
             const pw = pqwrite.Writer.open(env.arena, w.target, schema, .snappy, fmode) catch |e|
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output parquet `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
             return pw.sink();
         }
-        const writer = csv.CsvWriter.open(env.arena, w.target, schema, fmode) catch |e|
+        const writer = csv.CsvWriter.open(env.arena, w.target, schema, fmode, env.csv_out) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output CSV `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
         return writer.sink();
     }
@@ -6348,6 +6400,66 @@ test "aggregate: a bare column beside an aggregate is still refused" {
         "LOAD INTO '/tmp/o.csv' AS SELECT g, COUNT(*) AS c FROM 'in.csv';", &pdiag);
     try std.testing.expectError(error.ParseFailed, r);
     try std.testing.expect(std.mem.indexOf(u8, pdiag.msg, "neither an aggregate nor a grouping key") != null);
+}
+
+test "read a semicolon latin-1 file end to end" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The shape the CVM fund registry ships in.
+    const out = try runToString(alloc, &tmp,
+        "SIT;N\r\nLIQUIDA\xC7\xC3O;2\r\nCANCELADA;1\r\n",
+        "SELECT SIT, N FROM '$IN' WITH (delimiter = ';', encoding = 'latin1') ORDER BY N DESC",
+    );
+    defer alloc.free(out);
+    // Out comes UTF-8, comma-separated, with the columns actually separated.
+    try std.testing.expectEqualStrings("SIT,N\nLIQUIDAÇÃO,2\nCANCELADA,1\n", out);
+}
+
+test "an unreadable extension is refused by run, not just check" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.zip", .data = "PK\x03\x04not a csv\nsecond line\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const in_path = try std.fs.path.join(alloc, &.{ base, "in.zip" });
+    defer alloc.free(in_path);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "LOAD INTO '{s}' AS SELECT COUNT(*) AS c FROM '{s}';", .{ out_path, in_path });
+    defer alloc.free(script);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+
+    // `run` does not analyze the pipeline first, so this is its own guard.
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
+    try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "cannot read") != null);
+}
+
+test "WITH (format = 'csv') reads a file whose extension says nothing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.dat", .data = "id\n1\n2\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const in_path = try std.fs.path.join(alloc, &.{ base, "in.dat" });
+    defer alloc.free(in_path);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    const script = try std.fmt.allocPrint(alloc,
+        "LOAD INTO '{s}' AS SELECT id FROM '{s}' WITH (format = 'csv');", .{ out_path, in_path });
+    defer alloc.free(script);
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id\n1\n2\n", out);
 }
 
 test "explode splits a delimited column into rows" {
