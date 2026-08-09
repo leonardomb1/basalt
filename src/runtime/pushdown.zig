@@ -397,6 +397,20 @@ pub fn translateExpr(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dial
             // uneven (no portable spelling on mysql/starrocks), and a plain CAST would raise
             // on the rows TRY_CAST is there to turn into nulls. Never push it.
             if (c.safe) return null;
+            // Nor a text-to-number cast, for the same reason one step further out:
+            // the sources do not agree with each other on what a string that is not
+            // a number means. `CAST('1000,00' AS DECIMAL)` is NULL in StarRocks and
+            // MySQL, an error in Postgres, and an error in basalt. Pushing it made
+            // the answer depend on whether the predicate happened to descend —
+            // measured at 0 rows against 1 on identical data. So the engine keeps it.
+            //
+            // Provably numeric input still descends; `WHERE CAST(qty AS INT) > 5`
+            // over an int column is unambiguous. Unknown means "cannot prove", which
+            // includes a SQL table read whose schema nobody has asked for yet, and
+            // that is the common case — the cost is the old speed, never a different
+            // answer. `replace(x, ',', '.')` inside a raw `QUERY(...)` is the way to
+            // ask for the source's own coercion on purpose.
+            if (numericKind(c.ty.kind) and !provablyNumeric(c.e, schema)) return null;
             const inner = (try translateExpr(arena, c.e, dialect, schema, check_fields)) orelse return null;
             const ty = sqlTypeName(arena, dialect, c.ty) catch return error.OutOfMemory;
             return try std.fmt.allocPrint(arena, "CAST({s} AS {s})", .{ inner, (ty orelse return null) });
@@ -404,6 +418,29 @@ pub fn translateExpr(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dial
         .call => |c| return translateCall(arena, c, dialect, schema, check_fields),
         else => return null,
     }
+}
+
+
+fn numericKind(k: types.TypeKind) bool {
+    return k == .int or k == .float or k == .decimal;
+}
+
+/// Whether this operand is certainly a number already, so casting it means the
+/// same thing in the engine and at the source. A literal is; a column is only when
+/// the schema is at hand and says so. Everything else is unprovable, including
+/// every column of a SQL table before anyone has read its schema.
+fn provablyNumeric(e: *const ast.Expr, schema: types.Schema) bool {
+    return switch (e.*) {
+        .int_lit, .float_lit => true,
+        .field => |q| blk: {
+            if (schema.fields.len == 0) break :blk false;
+            const idx = schema.indexOf(q.last()) orelse break :blk false;
+            break :blk numericKind(schema.fields[idx].ty.kind);
+        },
+        // A nested cast to a numeric type is itself checked by this same rule when
+        // it is translated, so trusting it here would sidestep the check.
+        else => false,
+    };
 }
 
 fn translateMatch(arena: std.mem.Allocator, m: ast.Match, dialect: Dialect, schema: types.Schema, check_fields: bool) error{OutOfMemory}!?[]const u8 {
@@ -976,8 +1013,16 @@ test "translateExpr: extended constructs (is empty, CASE, CAST, functions)" {
         .{ .src = "status IS NOT EMPTY", .want = "(NOT ([status] IS NULL OR [status] = ''))" },
         .{ .src = "IF(v > 1, 'a', 'b')", .want = "(CASE WHEN ([v] > 1) THEN 'a' ELSE 'b' END)" },
         .{ .src = "CASE status WHEN 'x', 'y' THEN 1 ELSE 0 END", .want = "(CASE [status] WHEN 'x' THEN 1 WHEN 'y' THEN 1 ELSE 0 END)" },
-        .{ .src = "CAST(v AS INT) > 5", .want = "(CAST([v] AS BIGINT) > 5)" },
-        .{ .src = "CAST(v AS INT) > 5", .want = "(CAST(`v` AS SIGNED) > 5)", .d = .mysql },
+        // Cast to a number, over a schema nobody has resolved: unprovable, so it
+        // stays in the engine. The sources disagree about what `CAST('abc' AS INT)`
+        // means (null in StarRocks/MySQL, an error in Postgres), and descending
+        // changed the row count on identical data.
+        .{ .src = "CAST(v AS INT) > 5", .want = null },
+        .{ .src = "CAST(v AS INT) > 5", .want = null, .d = .mysql },
+        // A literal is certainly a number, so this one is unambiguous either side.
+        .{ .src = "CAST(5 AS INT) > 1", .want = "(CAST(5 AS BIGINT) > 1)" },
+        // Cast to a non-numeric type is unaffected by that disagreement.
+        .{ .src = "CAST(v AS STRING) = 'x'", .want = "(CAST([v] AS VARCHAR(MAX)) = 'x')" },
         .{ .src = "lower(status) = 'ok'", .want = "(LOWER([status]) = 'ok')" },
         .{ .src = "length(status) > 2", .want = "(LEN([status]) > 2)" },
         .{ .src = "length(status) > 2", .want = "(CHAR_LENGTH(`status`) > 2)", .d = .mysql },
@@ -1159,12 +1204,19 @@ test "translateExpr: a safe (TRY_) cast is never pushed" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
+    // `b` is a string in `testSchema()`, so a cast of it to a number is exactly the
+    // case that must not descend — the source's text-to-number rules are not ours.
+    const from_text = try a.create(ast.Expr);
+    from_text.* = .{ .cast = .{ .e = try fld(a, "b"), .ty = types.Type.init(.int) } };
+    try testing.expect((try translateExpr(a, from_text, .mysql, testSchema(), true)) == null);
+
+    // `a` is an int there, so casting it is unambiguous and still pushes.
     const plain = try a.create(ast.Expr);
-    plain.* = .{ .cast = .{ .e = try fld(a, "b"), .ty = types.Type.init(.int) } };
-    try testing.expectEqualStrings("CAST(`b` AS SIGNED)", (try translateExpr(a, plain, .mysql, testSchema(), true)).?);
+    plain.* = .{ .cast = .{ .e = try fld(a, "a"), .ty = types.Type.init(.int) } };
+    try testing.expectEqualStrings("CAST(`a` AS SIGNED)", (try translateExpr(a, plain, .mysql, testSchema(), true)).?);
 
     const safe = try a.create(ast.Expr);
-    safe.* = .{ .cast = .{ .e = try fld(a, "b"), .ty = types.Type.init(.int), .safe = true } };
+    safe.* = .{ .cast = .{ .e = try fld(a, "a"), .ty = types.Type.init(.int), .safe = true } };
     try testing.expect((try translateExpr(a, safe, .mysql, testSchema(), true)) == null);
     try testing.expect((try translateExpr(a, safe, .postgres, testSchema(), true)) == null);
     try testing.expect((try translateExpr(a, safe, .sqlserver, testSchema(), true)) == null);
