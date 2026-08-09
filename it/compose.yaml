@@ -54,6 +54,23 @@ services:
       timeout: 2s
       retries: 30
 
+  # S3 emulator. MinIO speaks real S3 — SigV4, ListObjectsV2, ranged GETs — so
+  # it exercises the same surface AWS would. It starts with no buckets; the
+  # suite creates basalt-it itself via the `mc` binary shipped in this image.
+  # Credentials are the stock dev pair, not a secret.
+  minio:
+    image: minio/minio:latest
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["39000:9000"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
   # Static file server for the remote-read tests: serves the committed Parquet
   # fixtures over plain HTTP. nginx honours `Range`, which is the half of the
   # reader worth testing — the whole-object fallback is exercised by pointing

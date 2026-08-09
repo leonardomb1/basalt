@@ -7,14 +7,17 @@
 #   ./it/run.sh mysql postgres  several
 #   KEEP=1 ./it/run.sh azure    leave the stack up afterwards
 #
-# Suite names: mysql postgres sqlserver starrocks azure
+# Suite names: mysql postgres sqlserver starrocks azure parquet s3
 # Scripts are Basalt SQL (the BSL parser was removed in v0.2.0); connection
 # attrs are passed as `OPTIONS(...)` bodies.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ALL_SUITES="mysql postgres sqlserver starrocks azure parquet"
-SUITES="${*:-$ALL_SUITES}"
+ALL_SUITES="mysql postgres sqlserver starrocks azure parquet s3"
+# s3 must be asked for by name until the s3:// scheme is wired into the engine;
+# fold it into the default set when that lands.
+DEFAULT_SUITES="mysql postgres sqlserver starrocks azure parquet"
+SUITES="${*:-$DEFAULT_SUITES}"
 
 for s in $SUITES; do
   case " $ALL_SUITES " in
@@ -33,6 +36,7 @@ for s in $SUITES; do
     sqlserver) services="$services mssql" ;;
     starrocks) services="$services starrocks" ;;
     azure)     services="$services azurite" ;;
+    s3)        services="$services minio" ;;
     parquet)   services="$services static static-norange" ;;  # local fixtures, plus HTTP
   esac
 done
@@ -353,6 +357,72 @@ SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM 'az://devstoreacc
   else
     report "azure-empty-prefix (wrong message)" bad
     tail -3 "$out/empty.log"
+  fi
+fi
+
+# S3 (MinIO). Real SigV4 signing, ListObjectsV2 and ranged GETs against an S3
+# implementation that is not ours. Credentials are the stock dev pair, not a
+# secret. MinIO starts with no buckets and its image ships `mc`, so the suite
+# creates the bucket here rather than via a one-shot init container.
+if runs s3; then
+  export AWS_ENDPOINT_URL="http://127.0.0.1:39000"
+  export AWS_ACCESS_KEY_ID="minioadmin"
+  export AWS_SECRET_ACCESS_KEY="minioadmin"
+  export AWS_REGION="us-east-1"
+
+  docker compose -f it/compose.yaml exec -T minio sh -c \
+    "mc alias set local http://127.0.0.1:9000 minioadmin minioadmin && mc mb -p local/basalt-it" >/dev/null 2>&1
+
+  # Single object: out through the writer, back through the signed reader — a
+  # green run exercises both halves of the SigV4 path.
+  if brun run -c "LOAD INTO 's3://basalt-it/seed.csv' AS SELECT * FROM 'it/seed.csv';" &&
+     brun run -c "LOAD INTO '$out/s3.csv' AS SELECT * FROM 's3://basalt-it/seed.csv' ORDER BY id;"; then
+    check s3 "$out/s3.csv" it/expected.csv
+  else
+    report "s3 (run error)" bad
+  fi
+
+  # Prefix read: two objects under one prefix must read back as a single table,
+  # in listing order. ListObjectsV2 paging or ordering bugs show up here and
+  # nowhere else.
+  if brun run -c "LOAD INTO 's3://basalt-it/parts/a.csv' AS SELECT * FROM 'it/seed.csv' WHERE id <= 1;" &&
+     brun run -c "LOAD INTO 's3://basalt-it/parts/b.csv' AS SELECT * FROM 'it/seed.csv' WHERE id > 1;" &&
+     brun run -c "LOAD INTO '$out/s3_prefix.csv' AS SELECT * FROM 's3://basalt-it/parts/' ORDER BY id;"; then
+    check s3-prefix "$out/s3_prefix.csv" it/expected.csv
+  else
+    report "s3-prefix (run error)" bad
+  fi
+
+  # Parquet out to an object and back — the routing guard, same as azure-parquet:
+  # an s3:// target must not be opened as a local file named `s3:`.
+  if brun run -c "LOAD INTO 's3://basalt-it/bronze/seed.parquet' AS SELECT * FROM 'it/seed.csv';" &&
+     brun run -c "LOAD INTO '$out/s3_parquet.csv' AS
+SELECT * FROM 's3://basalt-it/bronze/seed.parquet' ORDER BY id;"; then
+    check s3-parquet "$out/s3_parquet.csv" it/expected.csv
+  else
+    report "s3-parquet (run error)" bad
+  fi
+
+  # Ranged read: at ~4.1MB the volume parquet spans several ranged GETs, and
+  # SigV4 signs the Range header — a signing mistake surfaces here as a 403,
+  # not as wrong data.
+  if brun run -c "LOAD INTO 's3://basalt-it/bronze/vol.parquet' AS SELECT * FROM '$volcsv';" &&
+     brun run -c "LOAD INTO '$out/s3_parquet_ranged.csv' AS
+SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM 's3://basalt-it/bronze/vol.parquet';"; then
+    check s3-parquet-ranged "$out/s3_parquet_ranged.csv" "$out/vol_expected.csv"
+  else
+    report "s3-parquet-ranged (run error)" bad
+  fi
+
+  # Projection: two columns of three, so the val chunks need never be fetched —
+  # the point of ranged reads. Correctness check, not a transfer-volume one: it
+  # would still pass on a whole-object fallback.
+  printf 'id,name\n1,alpha\n2,"beta, gamma"\n3,delta\n' >"$out/s3_proj_expected.csv"
+  if brun run -c "LOAD INTO '$out/s3_parquet_proj.csv' AS
+SELECT id, name FROM 's3://basalt-it/bronze/seed.parquet' ORDER BY id;"; then
+    check s3-parquet-projection "$out/s3_parquet_proj.csv" "$out/s3_proj_expected.csv"
+  else
+    report "s3-parquet-projection (run error)" bad
   fi
 fi
 
