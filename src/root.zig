@@ -34,6 +34,7 @@ pub const pqdecode = @import("connect/pqdecode.zig");
 pub const pqwrite = @import("connect/pqwrite.zig");
 pub const split = @import("connect/split.zig");
 pub const wal = @import("connect/wal.zig");
+pub const zipsrc = @import("connect/zipsrc.zig");
 pub const ssrp = @import("connect/ssrp.zig");
 pub const http = @import("server/http.zig");
 pub const runtime = @import("runtime/run.zig");
