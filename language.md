@@ -311,7 +311,7 @@ WHERE downloads > 0;
 | `SELECT a, expr AS x` | projection |
 | `SELECT * EXCLUDE (a, b)` / `EXCEPT` | all-but projection |
 | `SELECT * RENAME (a AS b)` | rename projection |
-| `COUNT(*) / SUM / AVG / MIN / MAX ... GROUP BY k` | aggregate (every other item must be a group key, aliased or not) |
+| `COUNT(*) / SUM / AVG / MIN / MAX ... GROUP BY k` | aggregate (every other item must be a group key, aliased or not, or a plan-time constant) |
 | `ROUND(AVG(x), 2)`, `SUM(a)/COUNT(*)` | an aggregate inside an expression: the calls are computed by the aggregate, the arithmetic around them by a projection after it |
 | `COUNT(DISTINCT x)` | aggregate — combines freely with other aggregates; ignores nulls |
 | `HAVING <expr>` | filter after the aggregate; aggregate calls in it refer to the columns it produced, including ones the `SELECT` list never asked for |
@@ -357,6 +357,29 @@ HAVING COUNT(*) > 100
 ORDER BY revenue DESC
 LIMIT 10;
 ```
+
+A **plan-time constant** may sit in the list alongside the aggregates, since it is
+one value for the whole query — a literal, arithmetic or `||` over literals, a
+call like `now()`, or a `$param` / `$let`. That is how an aggregate result carries
+a run id or a tenant tag:
+
+```sql
+LET run_ts = now();
+SELECT $tag AS tenant, $run_ts AS loaded_at, region, COUNT(*) AS orders
+FROM 'orders.parquet' GROUP BY region;
+```
+
+A plain *column* still may not: it has no single value per group, so it must be
+wrapped in an aggregate or named in `GROUP BY`.
+
+**A float `SUM` is reproducible for a given `-j`, not across values of it.** The
+lanes each total their own slice and the slices are added in a fixed order, so
+rerunning the same command writes the same bytes; but `-j` decides how the input
+is cut, and float addition is not associative, so `-j 4` and `-j 8` can differ in
+the last bits (as can either from `-j 1`). `SUM` over an `INT` or a `DECIMAL` is
+exact and identical everywhere — `SUM(CAST(amount AS DECIMAL(18,2)))` is the way
+to total money you intend to compare or checksum. `COUNT`, `MIN` and `MAX` are
+exact too.
 
 ### Naming, `GROUP BY` and `ORDER BY`
 
@@ -469,6 +492,7 @@ or object reference (the precedent is Snowflake / Databricks `IDENTIFIER`).
 | a per-row source table | `FROM conn.schema.IDENTIFIER($name)` |
 | a per-row file path | `FROM IDENTIFIER('dir/' \|\| $name \|\| '.csv')` (the extension must be literal) |
 | a computed sink name | `LOAD INTO conn.IDENTIFIER('pre_' \|\| lower($name))` |
+| a per-row sink file | `LOAD INTO IDENTIFIER('dir/' \|\| $name \|\| '.csv')` (extension literal, as above — it picks the writer) |
 | a raw predicate value | `PUSHDOWN($where)` |
 | a conditional key | `UPSERT ON (IDENTIFIER(if($pk = '', $name \|\| 'id', $pk)))` |
 | a per-row column value | `SELECT $name AS empresa` — a plain expression, no quoting |
@@ -642,13 +666,21 @@ plan
       schema: g:string?  c:int
       scan  parquet  x.parquet
         schema: g:string?  v:int?
-  physical: serial (has breaker — materializes)
+  physical: morsel-parallel candidate (per-lane partials, combined)
 
 $ basalt run -c "EXPLAIN ANALYZE SELECT g, COUNT(*) AS c FROM 'x.parquet' GROUP BY g;"
 plan (actuals, exclusive time)
   aggregate      13.1ms          601 rows        2 batches
     scan          6.2ms       500000 rows        6 batches
 ```
+
+The `physical:` line names the fan-out the plan is eligible for: `split-parallel`
+for a SQL read divided into key ranges, `morsel-parallel` for a local CSV divided
+into byte-range chunks or a parquet divided into row groups, `serial` for
+everything else (a CSV over HTTP is fetched whole, so it parses serially). Both
+stay "candidate" because what settles it is inside the source — a table's key and
+size, a CSV that quotes a newline, a parquet with one row group — and neither
+`EXPLAIN` nor `check` reads that far.
 
 A source whose schema only the source itself can describe — a database table, a
 remote object — reads `schema: unresolved`, said once at the scan rather than
