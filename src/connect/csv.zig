@@ -12,6 +12,7 @@ const eval = @import("../exec/eval.zig");
 const driver = @import("driver.zig");
 const httpx = @import("http.zig");
 const azure = @import("azure.zig");
+const s3 = @import("s3.zig");
 
 const Batch = batchmod.Batch;
 const Value = valuemod.Value;
@@ -33,8 +34,8 @@ pub const CsvReader = struct {
     pending_i: usize = 0,
     stream_eof: bool = false,
     done: bool = false,
-    /// Remaining `az://` blob URLs of a prefix read, in listing order. Empty for
-    /// a single blob.
+    /// Remaining `az://`/`s3://` object URLs of a prefix read, in listing order.
+    /// Empty for a single object.
     rest_urls: []const []const u8 = &.{},
     /// Header line of the first blob; later blobs must match it, or the read
     /// would silently splice mismatched columns together.
@@ -65,7 +66,7 @@ pub const CsvReader = struct {
 
     pub fn isUrl(path: []const u8) bool {
         return std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://") or
-            azure.isUrl(path);
+            azure.isUrl(path) or s3.isUrl(path);
     }
 
     pub fn open(arena: std.mem.Allocator, path: []const u8) !*CsvReader {
@@ -89,13 +90,24 @@ pub const CsvReader = struct {
             for (names, urls) |n, *u| u.* = try std.fmt.allocPrint(arena, "az://{s}/{s}/{s}", .{ p.account, p.container, n });
             first = urls[0];
             self.rest_urls = urls[1..];
+        } else if (s3.isPrefix(path)) {
+            const p = try s3.parsePrefix(path);
+            const client = try arena.create(std.http.Client);
+            client.* = httpx.initClient(arena);
+            defer client.deinit();
+            const names = try s3.listPrefix(arena, client, p.bucket, p.prefix, s3.endpointFromEnv(arena));
+            if (names.len == 0) return s3.Error.S3EmptyPrefix;
+            const urls = try arena.alloc([]const u8, names.len);
+            for (names, urls) |n, *u| u.* = try std.fmt.allocPrint(arena, "s3://{s}/{s}", .{ p.bucket, n });
+            first = urls[0];
+            self.rest_urls = urls[1..];
         }
 
         if (isUrl(first)) {
             const hf = try arena.create(HttpFetch);
             hf.* = .{ .client = httpx.initClient(arena), .req = undefined, .response = undefined };
             errdefer hf.client.deinit();
-            // az:// resolves to a real endpoint and carries a Shared Key signature;
+            // az:// and s3:// resolve to a real endpoint and carry a signature;
             // plain http(s) URLs go out unsigned as before.
             var req_url = first;
             var extra: []const std.http.Header = &.{};
@@ -103,6 +115,10 @@ pub const CsvReader = struct {
                 const blob = try azure.parseUrl(arena, first, azure.endpointFromEnv(arena));
                 req_url = blob.url;
                 extra = try azure.getHeaders(arena, blob, "");
+            } else if (s3.isUrl(first)) {
+                const obj = try s3.parseUrl(arena, first, s3.endpointFromEnv(arena));
+                req_url = obj.url;
+                extra = try s3.getHeaders(arena, obj, "");
             }
             const uri = std.Uri.parse(req_url) catch return error.InvalidUrl;
             startHttp(hf, uri, extra) catch |e| switch (e) {
@@ -216,9 +232,18 @@ pub const CsvReader = struct {
         }
         const hf = try self.arena.create(HttpFetch);
         hf.* = .{ .client = httpx.initClient(self.arena), .req = undefined, .response = undefined };
-        const blob = try azure.parseUrl(self.arena, url, azure.endpointFromEnv(self.arena));
-        const extra = try azure.getHeaders(self.arena, blob, "");
-        const uri = std.Uri.parse(blob.url) catch return error.InvalidUrl;
+        var req_url: []const u8 = undefined;
+        var extra: []const std.http.Header = undefined;
+        if (s3.isUrl(url)) {
+            const obj = try s3.parseUrl(self.arena, url, s3.endpointFromEnv(self.arena));
+            req_url = obj.url;
+            extra = try s3.getHeaders(self.arena, obj, "");
+        } else {
+            const blob = try azure.parseUrl(self.arena, url, azure.endpointFromEnv(self.arena));
+            req_url = blob.url;
+            extra = try azure.getHeaders(self.arena, blob, "");
+        }
+        const uri = std.Uri.parse(req_url) catch return error.InvalidUrl;
         try startHttp(hf, uri, extra);
         const code = @intFromEnum(hf.response.head.status);
         if (code != 200) return httpx.statusError(code);

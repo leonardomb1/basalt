@@ -30,6 +30,7 @@ const ssrp = @import("../connect/ssrp.zig");
 const ntlm = @import("../connect/ntlm.zig");
 const walmod = @import("../connect/wal.zig");
 const azure = @import("../connect/azure.zig");
+const s3 = @import("../connect/s3.zig");
 const gen = @import("../connect/gen.zig");
 const parallel = @import("parallel.zig");
 const analyze = @import("analyze.zig");
@@ -4691,8 +4692,8 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
         const reader = csv.CsvReader.open(env.arena, rd.form.path) catch |e| {
             // A mistyped prefix and a truly empty one are the same listing; say
             // which prefix came back empty rather than blaming the CSV parser.
-            if (e == azure.Error.AzureEmptyPrefix)
-                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no blobs under prefix `{s}`", .{rd.form.path}));
+            if (e == azure.Error.AzureEmptyPrefix or e == s3.Error.S3EmptyPrefix)
+                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no objects under prefix `{s}`", .{rd.form.path}));
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open input CSV `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
         };
         return reader.source();
@@ -5315,6 +5316,7 @@ fn planErrT(diag: *Diag, e: anyerror, msg: []const u8) error{PlanFailed} {
 /// that actually failed ends that detour at the first error.
 fn pathLayer(path: []const u8) []const u8 {
     if (azure.isUrl(path)) return "azure blob";
+    if (s3.isUrl(path)) return "s3 object";
     if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://")) return "http";
     return "local file";
 }
