@@ -516,7 +516,10 @@ const Ctx = struct {
     diag: *Diag,
 
     fn analyzeOutput(self: *Ctx, pipe: ast.Pipeline) !Output {
-        const stages = pipe.stages;
+        // The same rewrite the runtime applies, so the plan `EXPLAIN` prints is the
+        // plan that runs — a filter shown below a join really did descend, and one
+        // shown above it really did not.
+        const stages = (pushdown.hoistThroughJoins(self.arena, self.arena, pipe.stages, self.bindings) catch null) orelse pipe.stages;
         if (stages.len == 0) return fail(self.diag, "empty pipeline", .{});
         if (stages[stages.len - 1].node != .write)
             return fail(self.diag, "a top-level pipeline must end in `write`", .{});

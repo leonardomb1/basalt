@@ -736,6 +736,15 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     if (std.mem.eql(u8, last.write.connector, "csv") and last.write.target.len > 0)
         try guardFileFormat(env, last.write.target, env.fmt_out, "write");
 
+    // Before the descent below: move whatever filters the join structure allows to
+    // sit ahead of the joins, so the contiguous prefix `serialWhere` reads actually
+    // contains them. Without this a join between the read and the WHERE meant no
+    // predicate descended at all.
+    if (try pushdown.hoistThroughJoins(arena, env.gpa, stages, env.bindings)) |hoisted| {
+        env.log.log(.debug, "filter hoisted through join: {d} -> {d} stages", .{ stages.len, hoisted.len });
+        stages = hoisted;
+    }
+
     if (stages[0].node == .read) implicit: {
         const rd = stages[0].node.read;
         if (rd.form != .table and rd.form != .query) break :implicit;
