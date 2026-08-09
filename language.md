@@ -234,6 +234,8 @@ LIMIT 100 OFFSET 20;
 | SQL table (per-row name) | `FROM erp.dbo.IDENTIFIER($name)` (§7) — still a table read |
 | raw query | `FROM erp.QUERY($$SELECT ...$$)` (no dialect translation) |
 | file — CSV or Parquet | `FROM 'path.csv'` / `FROM 'path.parquet'` — the extension picks the reader; local or HTTPS URL. Any other extension is a plan-time error unless `WITH (format = ...)` names one |
+| compressed file | `FROM 'path.csv.gz'` / `.csv.zst` — the inner name picks the reader |
+| file inside a zip | `FROM 'archive.zip :: inner.csv'`, or just `FROM 'archive.zip'` when it holds one file |
 | object storage | `FROM 'az://account/container/path.parquet'` or `FROM 's3://bucket/key.parquet'`; a trailing `/` reads every object under the prefix as one table |
 | REST (connection) | `FROM crm.'/v1/customers'` (path on the conn's base URL) |
 | REST (bare URL) | `FROM HTTP('https://host/api/x')` |
@@ -293,6 +295,44 @@ Source clauses, in any order after the source:
   mojibake, so prefer the publisher's stated encoding over guessing. The delimiter
   is also accepted on a `LOAD INTO` file target; `encoding` is not — a CSV sink
   always writes UTF-8, and being told otherwise is an error rather than ignored.
+### Compressed files and archives
+
+A compression suffix is read through: `FROM 'orders.csv.gz'` and `FROM 'orders.csv.zst'`
+decompress as they stream, and it is the *inner* name that picks the reader. Both
+work over HTTP too. `.xz` is not supported (std's decoder has the wrong shape for
+this reader), nor is bzip2.
+
+A file inside a zip is addressed with `::`, the separator ClickHouse uses for the
+same idea:
+
+```sql
+SELECT COUNT(*) FROM 'inf_diario_fi_202607.zip :: inf_diario_fi_202607.csv'
+  WITH (delimiter = ';');
+
+SELECT * FROM 'cnpj.zip';        -- an archive holding one file needs no `::`
+```
+
+An archive holding **more than one** file and no `::` is a plan-time error naming
+the candidates, rather than a silent pick of the first — the wrong file read
+successfully is worse than no read at all. Stored and deflated members are
+supported, which is every zip in practice.
+
+Members stream: nothing is expanded to memory or to a temp file, so a 59 MB CSV in
+a 12 MB zip costs the same memory as reading it loose.
+
+Two consequences worth knowing:
+
+- **Neither is parallel.** There is no mapping from a byte offset in a compressed
+  stream to a row, so `-j` cannot cut one up — the same reason gzip is not
+  splittable under Hadoop. `EXPLAIN` reports `physical: serial` for both, and a
+  loose CSV is the faster shape if you have the disk for it.
+- **Parquet cannot be read through either.** It needs to seek — footer first, then
+  the chunks the query wants — and neither a codec nor an archive member offers
+  that. Both are refused at plan time rather than quietly expanded somewhere.
+
+Reading an archive over HTTP is not supported yet: a zip's index sits at the end of
+the file, so it needs a ranged fetch before anything else can happen.
+
 - **`WITH (format = 'csv' | 'parquet')`** — read or write a path as this format
   whatever its extension says. Needed for a file named `.dat` or `.txt`, and for
   a URL that serves CSV from an extensionless path. Without it, an extension

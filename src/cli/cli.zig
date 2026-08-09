@@ -1037,6 +1037,10 @@ fn usage(w: anytype) !void {
         \\             another extension needs WITH (format = 'csv'|'parquet').
         \\             WITH (delimiter = ';', encoding = 'latin1') for non-comma,
         \\             non-UTF-8 CSV (also cp1252; delimiter works on a sink too)
+        \\  archives   file.csv.gz / .csv.zst stream through the codec;
+        \\             'archive.zip :: inner.csv' reads one member (`::` optional
+        \\             when the zip holds one file). Neither is splittable, so
+        \\             both read serially whatever -j says
         \\  object     az://<account>/<container>/<path> or s3://<bucket>/<key>, and a
         \\             trailing / reads every object under that prefix as one table
         \\  databases  postgres, mysql, sqlserver, starrocks (CREATE CONNECTION ... TYPE ...)
