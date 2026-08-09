@@ -1034,17 +1034,21 @@ fn cmp(a: Value, b: Value) ?std.math.Order {
         .int => std.math.order(a.int, switch (b) {
             .int => |x| x,
             .float => |x| @as(i64, @intFromFloat(x)),
-            else => a.int,
+            else => return null,
         }),
         .float => std.math.order(a.float, switch (b) {
             .float => |x| x,
             .int => |x| @as(f64, @floatFromInt(x)),
-            else => a.float,
+            else => return null,
         }),
-        .date => std.math.order(a.date, switch (b) {
-            .date => |x| x,
-            .int => |x| @as(i32, @intCast(x)),
-            else => a.date,
+        // A date column against an ISO string literal is an ordinary comparison in
+        // this dialect (§9), so parse it and prune on it. A string that is not a
+        // date is unknown, not equal.
+        .date => std.math.order(@as(i64, a.date), switch (b) {
+            .date => |x| @as(i64, x),
+            .int => |x| x,
+            .string => |x| eval.parseIsoDate(x) orelse return null,
+            else => return null,
         }),
         .time, .timestamp => blk: {
             const av = if (a == .time) a.time else a.timestamp;
@@ -1052,7 +1056,11 @@ fn cmp(a: Value, b: Value) ?std.math.Order {
                 .time => |x| x,
                 .timestamp => |x| x,
                 .int => |x| x,
-                else => av,
+                .string => |x| if (a == .timestamp)
+                    eval.parseIsoTimestamp(x) orelse return null
+                else
+                    return null,
+                else => return null,
             };
             break :blk std.math.order(av, bv);
         },
@@ -1061,12 +1069,31 @@ fn cmp(a: Value, b: Value) ?std.math.Order {
             const sb = switch (b) {
                 .string => |x| x,
                 .bytes => |x| x,
-                else => sa,
+                else => return null,
             };
             break :blk std.mem.order(u8, sa, sb);
         },
         else => null,
     };
+}
+
+test "cmp: an unorderable pair is unknown, never a fabricated equality" {
+    // This is what made a parquet date range return nothing. `cmp` answered `.eq`
+    // for a date against a string, and `groupMayMatch`'s `.lt` rule excludes a group
+    // whenever the order is not `.lt` — so every row group was pruned and
+    // `WHERE l_shipdate < '1995-01-01'` came back empty. `<=`, `>=` and `=` survived
+    // only because their own defaults happen to keep the group.
+    const d: Value = .{ .date = 9131 }; // 1995-01-01
+    try std.testing.expectEqual(std.math.Order.lt, cmp(.{ .date = 9130 }, .{ .string = "1995-01-01" }).?);
+    try std.testing.expectEqual(std.math.Order.eq, cmp(d, .{ .string = "1995-01-01" }).?);
+    try std.testing.expectEqual(std.math.Order.gt, cmp(.{ .date = 9132 }, .{ .string = "1995-01-01" }).?);
+    // Not a date: unknown, so pruning must keep the group.
+    try std.testing.expect(cmp(d, .{ .string = "not-a-date" }) == null);
+    try std.testing.expect(cmp(d, .{ .bool = true }) == null);
+    try std.testing.expect(cmp(.{ .int = 5 }, .{ .string = "5" }) == null);
+    try std.testing.expect(cmp(.{ .string = "a" }, .{ .int = 1 }) == null);
+    // A timestamp column against an ISO literal still orders.
+    try std.testing.expectEqual(std.math.Order.lt, cmp(.{ .timestamp = 0 }, .{ .string = "1970-01-02" }).?);
 }
 
 fn isNumV(v: Value) bool {
