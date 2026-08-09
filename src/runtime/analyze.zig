@@ -349,6 +349,11 @@ pub const Physical = struct {
     has_breaker: bool,
     splittable: bool,
     sink_parallel: bool,
+    /// The source divides into per-lane morsels at `-j > 1` — a local CSV into
+    /// byte-range chunks, a parquet into row groups. Distinct from `splittable`,
+    /// which is the SQL key-range fan-out; a file read reported as neither used to
+    /// print `physical: serial` while the run fanned out over 16 lanes.
+    morsel_parallel: bool,
 };
 
 pub const Output = struct {
@@ -562,6 +567,7 @@ const Ctx = struct {
                 .has_breaker = has_breaker,
                 .splittable = splittable,
                 .sink_parallel = sink_is_parallel,
+                .morsel_parallel = !splittable and morselParallelRead(source.connector, stages[0].node),
             },
         };
     }
@@ -741,6 +747,14 @@ pub fn render(plan: Plan, w: anytype) !void {
             // only the source can answer — and analysis does not connect.
             try w.writeAll("split-parallel candidate");
             if (o.physical.sink_parallel) try w.writeAll(", per-lane sink");
+        } else if (o.physical.morsel_parallel) {
+            // Same hedge as above, for the reasons only the file can settle: a CSV
+            // that quotes a newline cannot be cut on byte boundaries, and a parquet
+            // with a single row group has nothing to divide. A breaker still runs
+            // per lane here — the lanes fold partials and the combine merges them —
+            // so unlike the serial branch it does not mean the fan-out is off.
+            try w.writeAll("morsel-parallel candidate");
+            if (o.physical.has_breaker) try w.writeAll(" (per-lane partials, combined)");
         } else {
             try w.writeAll("serial");
             if (o.physical.has_breaker) try w.writeAll(" (has breaker, materializes)");
@@ -837,6 +851,26 @@ fn splittableRead(node: ast.Stage.Node) bool {
     };
 }
 
+/// Whether a read divides into per-lane morsels at `-j > 1`.
+///
+/// A parquet is cut into row groups wherever it lives, since every lane range-reads
+/// its own chunks. A CSV is cut into byte ranges, which needs the bytes locally —
+/// the runtime memory-maps the file, so a CSV over HTTP or object storage is
+/// fetched whole and parsed serially.
+fn morselParallelRead(connector: []const u8, node: ast.Stage.Node) bool {
+    // Every file read arrives on the `csv` connector; the path decides the format.
+    if (!std.mem.eql(u8, connector, "csv")) return false;
+    const path = switch (node) {
+        .read => |rd| switch (rd.form) {
+            .path => |p| p,
+            else => return false,
+        },
+        else => return false,
+    };
+    if (pqwrite.Writer.isPath(path)) return true;
+    return std.mem.indexOf(u8, path, "://") == null;
+}
+
 /// Offline schema resolution: a local CSV header or parquet footer is readable
 /// without connecting to anything; everything else stays unresolved.
 fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read) ?types.Schema {
@@ -900,6 +934,37 @@ test "analyze a CSV map pipeline: structure, offline schema, physical" {
     try std.testing.expectEqualStrings("select", o.stages[1].kind);
     try std.testing.expect(!o.physical.has_breaker);
     try std.testing.expect(!o.physical.splittable);
+    // Not `splittable` (that is the SQL key-range fan-out) but still parallel:
+    // the runtime cuts a local CSV into byte-range chunks.
+    try std.testing.expect(o.physical.morsel_parallel);
+}
+
+test "physical plan: which file reads divide into morsels" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const cases = [_]struct { from: []const u8, morsel: bool }{
+        // A parquet is cut into row groups wherever it lives — each lane
+        // range-reads its own chunks.
+        .{ .from = "'/data/x.parquet'", .morsel = true },
+        .{ .from = "'https://h/x.parquet'", .morsel = true },
+        .{ .from = "'s3://b/x.parquet'", .morsel = true },
+        // A CSV is cut on byte offsets, which needs the bytes on disk to mmap.
+        .{ .from = "'/data/x.csv'", .morsel = true },
+        .{ .from = "'https://h/x.csv'", .morsel = false },
+        .{ .from = "'az://acct/c/x.csv'", .morsel = false },
+        // Not a file read at all.
+        .{ .from = "RANGE(10)", .morsel = false },
+    };
+
+    for (cases) |c| {
+        const src = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/o.csv' AS SELECT * FROM {s};", .{c.from});
+        const prog = try parse(a, src);
+        var diag = Diag{};
+        const plan = try analyze(a, prog, &diag);
+        try std.testing.expectEqual(c.morsel, plan.outputs[0].physical.morsel_parallel);
+    }
 }
 
 test "analyze a SQL table pipeline: unresolved schema offline, split candidate" {
