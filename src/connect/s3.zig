@@ -307,6 +307,229 @@ pub fn authHeader(arena: std.mem.Allocator, access: []const u8, secret: []const 
     );
 }
 
+/// Signed headers for a plain GET of a whole object. `range` is `bytes=a-b`
+/// for a partial read, or empty for the whole object; it participates in the
+/// signature, so it cannot be added to the request afterwards.
+pub fn getHeaders(arena: std.mem.Allocator, o: Obj, range: []const u8) ![]const std.http.Header {
+    return requestHeaders(arena, o, "GET", range);
+}
+
+/// `getHeaders` for any verb. HEAD is the one other verb a reader needs — it
+/// answers "how big is this object?" without a body — and SigV4 signs the verb,
+/// so it cannot reuse the GET signature. Host is signed but NOT returned:
+/// std.http.Client derives it from the URL, and `Obj.host` is that same
+/// authority by construction.
+pub fn requestHeaders(
+    arena: std.mem.Allocator,
+    o: Obj,
+    method: []const u8,
+    range: []const u8,
+) ![]const std.http.Header {
+    const creds = try credsFromEnv(arena);
+    const ts = try amzDate(arena, std.time.timestamp());
+
+    var sh = std.array_list.Managed(SignHeader).init(arena);
+    try sh.append(.{ .name = "host", .value = o.host });
+    if (range.len > 0) try sh.append(.{ .name = "range", .value = range });
+    try sh.append(.{ .name = "x-amz-content-sha256", .value = empty_payload_hash });
+    try sh.append(.{ .name = "x-amz-date", .value = ts });
+    if (creds.token) |t| try sh.append(.{ .name = "x-amz-security-token", .value = t });
+
+    const auth = try authHeader(arena, creds.access, creds.secret, .{
+        .method = method,
+        .uri_path = o.uri_path,
+        .headers = sh.items,
+        .payload_hash = empty_payload_hash,
+        .timestamp = ts,
+        .region = o.region,
+    });
+
+    var out = std.array_list.Managed(std.http.Header).init(arena);
+    try out.append(.{ .name = "x-amz-date", .value = ts });
+    try out.append(.{ .name = "x-amz-content-sha256", .value = empty_payload_hash });
+    if (creds.token) |t| try out.append(.{ .name = "x-amz-security-token", .value = t });
+    try out.append(.{ .name = "Authorization", .value = auth });
+    if (range.len > 0) try out.append(.{ .name = "Range", .value = range });
+    return out.toOwnedSlice();
+}
+
+/// Pulls `<Code>` and `<Message>` out of an S3 error body. Every failure
+/// response carries them; without this a caller sees only a bare status and the
+/// cause (bad key? clock skew? wrong bucket?) is guesswork.
+pub fn parseError(body: []const u8) ?struct { code: []const u8, message: []const u8 } {
+    const code = extractTag(body, "Code") orelse return null;
+    const msg = extractTag(body, "Message") orelse "";
+    return .{ .code = code, .message = std.mem.sliceTo(msg, '\n') };
+}
+
+fn extractTag(xml: []const u8, name: []const u8) ?[]const u8 {
+    var open_buf: [64]u8 = undefined;
+    var close_buf: [64]u8 = undefined;
+    const open = std.fmt.bufPrint(&open_buf, "<{s}>", .{name}) catch return null;
+    const close = std.fmt.bufPrint(&close_buf, "</{s}>", .{name}) catch return null;
+    const s = std.mem.indexOf(u8, xml, open) orelse return null;
+    const from = s + open.len;
+    const e = std.mem.indexOfPos(u8, xml, from, close) orelse return null;
+    return xml[from..e];
+}
+
+/// Maps a status plus S3's error code onto a distinct Zig error, so callers can
+/// react (and users can read a failure) instead of seeing one catch-all.
+pub fn statusToError(code: u16, body: []const u8) Error {
+    if (parseError(body)) |e| {
+        if (std.mem.eql(u8, e.code, "NoSuchBucket")) return Error.S3BucketMissing;
+        if (std.mem.eql(u8, e.code, "NoSuchKey")) return Error.S3KeyNotFound;
+        if (std.mem.eql(u8, e.code, "AccessDenied")) return Error.S3AuthFailed;
+        if (std.mem.eql(u8, e.code, "SignatureDoesNotMatch")) return Error.S3AuthFailed;
+        if (std.mem.eql(u8, e.code, "InvalidAccessKeyId")) return Error.S3AuthFailed;
+        if (std.mem.eql(u8, e.code, "ExpiredToken")) return Error.S3AuthFailed;
+        if (std.mem.eql(u8, e.code, "SlowDown")) return Error.S3Throttled;
+    }
+    return switch (code) {
+        401, 403 => Error.S3AuthFailed,
+        404 => Error.S3BucketMissing,
+        429, 503 => Error.S3Throttled,
+        else => Error.S3RequestFailed,
+    };
+}
+
+/// S3 throttles with 503 SlowDown (and 429 on some compatibles) and returns 500
+/// on transient internal faults. Every request this module makes is idempotent —
+/// UploadPart is keyed by part number, CompleteMultipartUpload is a full
+/// replace, GET is a read — so retrying is always safe.
+pub fn retriable(code: u16) bool {
+    return code == 429 or code == 500 or code == 503;
+}
+
+pub const max_attempts = 5;
+
+/// Exponential backoff with jitter, same policy as azure.zig: jitter matters
+/// because N parallel lanes throttled at the same instant would otherwise retry
+/// in lockstep and re-throttle each other.
+pub fn backoffMs(attempt: usize, rand: std.Random) u64 {
+    const base = @as(u64, 200) << @intCast(@min(attempt, 5));
+    return base + rand.uintLessThan(u64, base / 2 + 1);
+}
+
+/// `Code: Message (HTTP nnn)` — what a user needs to see instead of a status.
+pub fn describe(arena: std.mem.Allocator, code: u16, body: []const u8) ![]const u8 {
+    if (parseError(body)) |e|
+        return std.fmt.allocPrint(arena, "{s}: {s} (HTTP {d})", .{ e.code, e.message, code });
+    return std.fmt.allocPrint(arena, "HTTP {d}", .{code});
+}
+
+/// The bucket-level base for listing (and bucket creation): URL, signed host,
+/// and canonical URI, in either endpoint style.
+fn bucketBase(arena: std.mem.Allocator, bucket: []const u8, region: []const u8, endpoint: ?[]const u8) !struct {
+    url: []const u8,
+    host: []const u8,
+    uri_path: []const u8,
+} {
+    if (endpoint) |ep| {
+        const base = std.mem.trimRight(u8, ep, "/");
+        const uri_path = try std.fmt.allocPrint(arena, "/{s}", .{bucket});
+        return .{
+            .url = try std.fmt.allocPrint(arena, "{s}{s}", .{ base, uri_path }),
+            .host = try authorityOf(base),
+            .uri_path = uri_path,
+        };
+    }
+    const host = try std.fmt.allocPrint(arena, "{s}.s3.{s}.amazonaws.com", .{ bucket, region });
+    return .{
+        .url = try std.fmt.allocPrint(arena, "https://{s}/", .{host}),
+        .host = host,
+        .uri_path = "/",
+    };
+}
+
+/// Lists object keys under `prefix` (ListObjectsV2), following continuation
+/// tokens to the end. Keys come back bucket-relative, in the lexicographic
+/// order S3 returns them, so a caller reading them in order gets a
+/// deterministic result.
+pub fn listPrefix(
+    arena: std.mem.Allocator,
+    client: *std.http.Client,
+    bucket: []const u8,
+    prefix: []const u8,
+    endpoint: ?[]const u8,
+) ![][]const u8 {
+    const region = regionFromEnv(arena);
+    const creds = try credsFromEnv(arena);
+    const base = try bucketBase(arena, bucket, region, endpoint);
+
+    var out = std.array_list.Managed([]const u8).init(arena);
+    var token: []const u8 = "";
+    while (true) {
+        // Query built pre-sorted (continuation-token < list-type < prefix), so
+        // the request URL and the canonical query string are the same text.
+        var q = std.array_list.Managed([]const u8).init(arena);
+        if (token.len > 0)
+            try q.append(try std.fmt.allocPrint(arena, "continuation-token={s}", .{try uriEncode(arena, token, .encode_slash)}));
+        try q.append("list-type=2");
+        try q.append(try std.fmt.allocPrint(arena, "prefix={s}", .{try uriEncode(arena, prefix, .encode_slash)}));
+
+        const ts = try amzDate(arena, std.time.timestamp());
+        var sh = std.array_list.Managed(SignHeader).init(arena);
+        try sh.append(.{ .name = "host", .value = base.host });
+        try sh.append(.{ .name = "x-amz-content-sha256", .value = empty_payload_hash });
+        try sh.append(.{ .name = "x-amz-date", .value = ts });
+        if (creds.token) |t| try sh.append(.{ .name = "x-amz-security-token", .value = t });
+        const auth = try authHeader(arena, creds.access, creds.secret, .{
+            .method = "GET",
+            .uri_path = base.uri_path,
+            .query = q.items,
+            .headers = sh.items,
+            .payload_hash = empty_payload_hash,
+            .timestamp = ts,
+            .region = region,
+        });
+
+        var hdrs = std.array_list.Managed(std.http.Header).init(arena);
+        try hdrs.append(.{ .name = "x-amz-date", .value = ts });
+        try hdrs.append(.{ .name = "x-amz-content-sha256", .value = empty_payload_hash });
+        if (creds.token) |t| try hdrs.append(.{ .name = "x-amz-security-token", .value = t });
+        try hdrs.append(.{ .name = "Authorization", .value = auth });
+
+        var url = std.array_list.Managed(u8).init(arena);
+        try url.appendSlice(base.url);
+        for (q.items, 0..) |s, i| {
+            try url.append(if (i == 0) '?' else '&');
+            try url.appendSlice(s);
+        }
+
+        var aw = std.Io.Writer.Allocating.init(arena);
+        const res = try client.fetch(.{
+            .method = .GET,
+            .location = .{ .url = url.items },
+            .extra_headers = hdrs.items,
+            .decompress_buffer = httpx.decompress_direct,
+            .response_writer = &aw.writer,
+        });
+        const code = @intFromEnum(res.status);
+        const body = aw.writer.buffered();
+        if (code != 200) return statusToError(code, body);
+
+        try collectKeys(arena, body, &out);
+        const next = extractTag(body, "NextContinuationToken") orelse "";
+        if (next.len == 0) break;
+        token = try arena.dupe(u8, next);
+    }
+    return out.toOwnedSlice();
+}
+
+/// Every `<Key>` in a ListObjectsV2 page. Keys appear only inside `<Contents>`
+/// elements, and a flat listing (no delimiter) returns no CommonPrefixes, so a
+/// plain tag scan cannot pick up anything else.
+fn collectKeys(arena: std.mem.Allocator, xml: []const u8, out: *std.array_list.Managed([]const u8)) !void {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, xml, pos, "<Key>")) |s| {
+        const from = s + "<Key>".len;
+        const e = std.mem.indexOfPos(u8, xml, from, "</Key>") orelse break;
+        try out.append(try arena.dupe(u8, xml[from..e]));
+        pos = e + "</Key>".len;
+    }
+}
+
 test "amzDate matches the reference instant from the S3 signing docs" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -459,4 +682,85 @@ test "prefix URLs are distinguished from object URLs and may have an empty prefi
     const bare = try parsePrefix("s3://lake/");
     try std.testing.expectEqualStrings("", bare.prefix);
     try std.testing.expectError(Error.S3BadUrl, parsePrefix("s3://noslash"));
+}
+
+test "parseError pulls the code and first message line out of an S3 fault" {
+    const body =
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<Error>
+        \\  <Code>SignatureDoesNotMatch</Code>
+        \\  <Message>The request signature we calculated does not match the signature you provided.</Message>
+        \\  <RequestId>4442587FB7D0A2F9</RequestId>
+        \\</Error>
+    ;
+    const e = parseError(body).?;
+    try std.testing.expectEqualStrings("SignatureDoesNotMatch", e.code);
+    try std.testing.expectEqualStrings("The request signature we calculated does not match the signature you provided.", e.message);
+    try std.testing.expect(parseError("not xml") == null);
+}
+
+test "statusToError distinguishes causes instead of one catch-all" {
+    try std.testing.expectEqual(Error.S3BucketMissing, statusToError(404, "<Error><Code>NoSuchBucket</Code></Error>"));
+    try std.testing.expectEqual(Error.S3KeyNotFound, statusToError(404, "<Error><Code>NoSuchKey</Code></Error>"));
+    try std.testing.expectEqual(Error.S3AuthFailed, statusToError(403, "<Error><Code>SignatureDoesNotMatch</Code></Error>"));
+    try std.testing.expectEqual(Error.S3AuthFailed, statusToError(403, "<Error><Code>AccessDenied</Code></Error>"));
+    try std.testing.expectEqual(Error.S3Throttled, statusToError(503, "<Error><Code>SlowDown</Code></Error>"));
+    try std.testing.expectEqual(Error.S3Throttled, statusToError(503, ""));
+    try std.testing.expectEqual(Error.S3RequestFailed, statusToError(418, ""));
+}
+
+test "retry policy: only transient statuses, and jitter stays within its band" {
+    try std.testing.expect(retriable(429) and retriable(500) and retriable(503));
+    try std.testing.expect(!retriable(403) and !retriable(404) and !retriable(200));
+
+    var prng = std.Random.DefaultPrng.init(1);
+    const r = prng.random();
+    for (0..5) |i| {
+        const base = @as(u64, 200) << @intCast(i);
+        const ms = backoffMs(i, r);
+        try std.testing.expect(ms >= base and ms <= base + base / 2 + 1);
+    }
+}
+
+test "collectKeys reads every object key from a ListObjectsV2 page" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var out = std.array_list.Managed([]const u8).init(a);
+    try collectKeys(a,
+        \\<ListBucketResult><Name>lake</Name><Prefix>p/</Prefix><KeyCount>2</KeyCount>
+        \\<Contents><Key>p/a.csv</Key><Size>10</Size></Contents>
+        \\<Contents><Key>p/b.csv</Key><Size>20</Size></Contents>
+        \\</ListBucketResult>
+    , &out);
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expectEqualStrings("p/a.csv", out.items[0]);
+    try std.testing.expectEqualStrings("p/b.csv", out.items[1]);
+}
+
+test "bucketBase covers both endpoint styles" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const p = try bucketBase(a, "lake", "us-east-1", "http://127.0.0.1:9000");
+    try std.testing.expectEqualStrings("http://127.0.0.1:9000/lake", p.url);
+    try std.testing.expectEqualStrings("127.0.0.1:9000", p.host);
+    try std.testing.expectEqualStrings("/lake", p.uri_path);
+
+    const v = try bucketBase(a, "lake", "eu-west-1", null);
+    try std.testing.expectEqualStrings("https://lake.s3.eu-west-1.amazonaws.com/", v.url);
+    try std.testing.expectEqualStrings("lake.s3.eu-west-1.amazonaws.com", v.host);
+    try std.testing.expectEqualStrings("/", v.uri_path);
+}
+
+test "describe renders the code and message a user needs" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings(
+        "NoSuchKey: The specified key does not exist. (HTTP 404)",
+        try describe(a, 404, "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>"),
+    );
+    try std.testing.expectEqualStrings("HTTP 500", try describe(a, 500, ""));
 }
