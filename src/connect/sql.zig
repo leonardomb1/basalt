@@ -685,7 +685,9 @@ pub fn coerceText(arena: std.mem.Allocator, text: ?[]const u8, ty: types.Type) !
     return switch (ty.kind) {
         .int => .{ .int = std.fmt.parseInt(i64, std.mem.trim(u8, t, " "), 10) catch return error.UnparseableNumber },
         .float => .{ .float = std.fmt.parseFloat(f64, t) catch return error.UnparseableNumber },
-        .decimal => parseDecimalText(t),
+        // Symmetric with int/float above: a value the source sent that cannot be
+        // read is an error, not a quietly different number.
+        .decimal => parseDecimalText(t) orelse return error.UnparseableNumber,
         .bool => .{ .bool = t.len > 0 and (t[0] == '1' or t[0] == 't' or t[0] == 'T' or t[0] == 'y' or t[0] == 'Y') },
         .date => .{ .date = @intCast(parseDateText(t)) },
         .timestamp => .{ .timestamp = parseDatetimeText(t) },
@@ -693,26 +695,63 @@ pub fn coerceText(arena: std.mem.Allocator, text: ?[]const u8, ty: types.Type) !
     };
 }
 
-pub fn parseDecimalText(t: []const u8) Value {
-    var neg = false;
+/// A decimal literal: optional sign, digits, at most one `.`, at least one digit.
+/// Null for anything else — the caller decides whether that is an error (`CAST`, a
+/// malformed value on the wire) or a null (`TRY_CAST`).
+///
+/// It used to `continue` past every character it did not recognise, which invented
+/// numbers rather than rejecting them: `'1000,00'` came back as 100000.00 because
+/// the comma was skipped and the digits read as one run, `'1.234,56'` as 1.23456,
+/// and `'abc'` as 0.00. Brazilian and most European data writes money exactly that
+/// way, so every `CAST(x AS DECIMAL)` over it was silently 100x out, and `TRY_CAST`
+/// — the documented tool for dirty input — had nothing to catch. Strip the grouping
+/// separator explicitly (`replace(x, ',', '.')`) and the value parses.
+pub fn parseDecimalText(t: []const u8) ?Value {
     var s = t;
-    if (s.len > 0 and s[0] == '-') {
-        neg = true;
+    var neg = false;
+    if (s.len > 0 and (s[0] == '-' or s[0] == '+')) {
+        neg = s[0] == '-';
         s = s[1..];
     }
+    if (s.len == 0) return null;
+
     var unscaled: i128 = 0;
     var scale: u8 = 0;
+    var digits: usize = 0;
     var after_dot = false;
     for (s) |c| {
         if (c == '.') {
+            if (after_dot) return null; // a second radix point
             after_dot = true;
             continue;
         }
-        if (c < '0' or c > '9') continue;
-        unscaled = unscaled * 10 + (c - '0');
+        if (c < '0' or c > '9') return null;
+        unscaled = std.math.mul(i128, unscaled, 10) catch return null;
+        unscaled = std.math.add(i128, unscaled, c - '0') catch return null;
+        digits += 1;
         if (after_dot) scale += 1;
     }
+    if (digits == 0) return null;
     return .{ .decimal = .{ .unscaled = if (neg) -unscaled else unscaled, .scale = scale } };
+}
+
+test "parseDecimalText rejects what it cannot read instead of inventing a number" {
+    try std.testing.expectEqual(@as(i128, 100000), parseDecimalText("1000.00").?.decimal.unscaled);
+    try std.testing.expectEqual(@as(u8, 2), parseDecimalText("1000.00").?.decimal.scale);
+    try std.testing.expectEqual(@as(i128, -5), parseDecimalText("-5").?.decimal.unscaled);
+    try std.testing.expectEqual(@as(i128, 7), parseDecimalText("+7").?.decimal.unscaled);
+    try std.testing.expectEqual(@as(i128, 25), parseDecimalText(".25").?.decimal.unscaled);
+
+    // Every one of these used to come back as a plausible-looking wrong number.
+    try std.testing.expect(parseDecimalText("1000,00") == null); // 100000.00
+    try std.testing.expect(parseDecimalText("1.234,56") == null); // 1.23456
+    try std.testing.expect(parseDecimalText("1,2,3") == null); // 123
+    try std.testing.expect(parseDecimalText("abc") == null); // 0
+    try std.testing.expect(parseDecimalText("1.2.3") == null);
+    try std.testing.expect(parseDecimalText("12 34") == null);
+    try std.testing.expect(parseDecimalText("") == null);
+    try std.testing.expect(parseDecimalText("-") == null);
+    try std.testing.expect(parseDecimalText("R$ 10") == null);
 }
 
 fn parseDateText(t: []const u8) i64 {

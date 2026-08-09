@@ -1952,7 +1952,9 @@ pub fn castValueTyped(arena: std.mem.Allocator, v: Value, ty: types.Type) EvalEr
             if (!std.math.isFinite(scaled)) return error.CastFailed;
             break :blk .{ .unscaled = @intFromFloat(@round(scaled)), .scale = ty.scale };
         },
-        .string, .bytes => |str| switch (sqlmod.parseDecimalText(trim(str))) {
+        // Null means the text is not a decimal literal: `CAST` fails here and
+        // `TRY_CAST` turns that failure into a null one level up.
+        .string, .bytes => |str| switch (sqlmod.parseDecimalText(trim(str)) orelse return error.CastFailed) {
             .decimal => |x| x,
             .int => |x| valuemod.Decimal{ .unscaled = x, .scale = 0 },
             else => return error.CastFailed,
