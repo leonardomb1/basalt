@@ -588,6 +588,10 @@ const Ctx = struct {
                     .range => "range",
                     .unit => "unit",
                 };
+                if (rd.form == .path) {
+                    if (s3.bucketNameError(rd.form.path)) |why|
+                        return fail(self.diag, "`{s}` is not a valid S3 source: {s}", .{ rd.form.path, why });
+                }
                 const schema = offlineSchema(self.arena, rd);
                 return .{ .connector = connector, .detail = detail, .schema = schema };
             },
@@ -618,6 +622,8 @@ const Ctx = struct {
 
     fn resolveSink(self: *Ctx, w: ast.Write) !Sink {
         if (std.mem.eql(u8, w.connector, "csv") or std.mem.eql(u8, w.connector, "stdout")) {
+            if (s3.bucketNameError(w.target)) |why|
+                return fail(self.diag, "`{s}` is not a valid S3 target: {s}", .{ w.target, why });
             if (w.mode == .append) {
                 if (appendUnsupported(w.target)) |why|
                     return fail(self.diag, "`APPEND` into `{s}` is not supported: {s}", .{ w.target, why });
@@ -949,7 +955,7 @@ test "physical plan: which file reads divide into morsels" {
         // range-reads its own chunks.
         .{ .from = "'/data/x.parquet'", .morsel = true },
         .{ .from = "'https://h/x.parquet'", .morsel = true },
-        .{ .from = "'s3://b/x.parquet'", .morsel = true },
+        .{ .from = "'s3://bkt/x.parquet'", .morsel = true },
         // A CSV is cut on byte offsets, which needs the bytes on disk to mmap.
         .{ .from = "'/data/x.csv'", .morsel = true },
         .{ .from = "'https://h/x.csv'", .morsel = false },
