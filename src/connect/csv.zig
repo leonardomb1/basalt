@@ -728,6 +728,14 @@ fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Buil
                 try buf.append(line[i]);
                 i += 1;
             }
+            // Text between the closing quote and the delimiter, as in the CVM
+            // registry's `"1" é calculado de acordo com…`: a field that opens
+            // quoted and then continues unquoted. RFC 4180 leaves it undefined and
+            // it is plainly a publishing mistake, but ending the field at the quote
+            // made the remainder look like the next column — one such row shifted
+            // its last 19 values by one and dropped the final one, silently. Keep
+            // reading to the delimiter, which is where the field visibly ends.
+            while (i < line.len and line[i] != d.delim) : (i += 1) try buf.append(line[i]);
             const raw = try buf.toOwnedSlice();
             try appendCell(&builders[col], try decodeField(arena, d.encoding, raw), true);
             if (i < line.len and line[i] == d.delim) i += 1;
@@ -1292,6 +1300,26 @@ test "csv dialect: the same file read with the default dialect is one column" {
     const r = try CsvReader.open(a, path, .{});
     defer r.close();
     try std.testing.expectEqual(@as(usize, 1), r.schema.fields.len);
+}
+
+test "csv: text after a closing quote stays in the field" {
+    // From the CVM registry: `"1" é calculado de acordo…`, a field that opens
+    // quoted and continues unquoted. Ending it at the quote made the remainder
+    // look like the next column, shifting every later value of the row.
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "q.csv", .data = "a;b;c\n1;\"2\" and more;3\n" });
+    const path = try tmp.dir.realpathAlloc(a, "q.csv");
+    const r = try CsvReader.open(a, path, .{ .delim = ';' });
+    defer r.close();
+    const b = (try r.next(a)).?;
+    try std.testing.expectEqual(@as(usize, 1), b.len);
+    try std.testing.expectEqualStrings("2 and more", b.columns[1].data.bytes.at(0));
+    // The row's last column must still be its own value, not shifted.
+    try std.testing.expectEqualStrings("3", b.columns[2].data.bytes.at(0));
 }
 
 test "csv writer: the delimiter carries to the header, rows and quoting" {
