@@ -53,6 +53,7 @@ $ ./zig-out/bin/basalt help
 | | |
 |---|---|
 | **Files** | CSV and Parquet, local or over HTTP — the extension picks the format, and an extension basalt does not read is refused rather than guessed at. `WITH (delimiter = ';', encoding = 'latin1')` for the CSV most of the world publishes |
+| **Compressed & archived** | `orders.csv.gz`, `orders.csv.zst`, and `archive.zip :: inner.csv`. Members stream rather than expanding to memory or a temp file |
 | **Object storage** | `az://account/container/path` (Azure Blob / ADLS Gen2) or `s3://bucket/key` (S3, MinIO). A trailing `/` reads every object under that prefix as one table |
 | **Databases** | PostgreSQL, MySQL, SQL Server, StarRocks |
 | **HTTP** | paginated REST sources; serve a pipeline as an endpoint |

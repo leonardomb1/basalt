@@ -18,6 +18,7 @@ const driver = @import("driver.zig");
 const httpx = @import("http.zig");
 const azure = @import("azure.zig");
 const s3 = @import("s3.zig");
+const zipsrc = @import("zipsrc.zig");
 
 const Batch = batchmod.Batch;
 const Value = valuemod.Value;
@@ -75,6 +76,69 @@ const cp1252_high = [32]u21{
     0, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
     0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0, 0x017E, 0x0178,
 };
+
+/// A single-stream compression suffix. Only the ones Zig's std decompresses into a
+/// `*std.Io.Reader`: gzip and zstd via `std.http.Decompress`, which is the same
+/// mechanism this reader already uses for HTTP `Content-Encoding`. `.xz` is absent
+/// deliberately — std's xz decoder is still the old `GenericReader` shape and would
+/// need an adapter, and `.csv.xz` is vanishingly rare in published data.
+pub const Codec = enum { none, gzip, zstd };
+
+/// Splits a trailing compression suffix off a path: `orders.csv.gz` is a gzip
+/// wrapping `orders.csv`, and it is the inner name that picks the format.
+pub fn splitCodec(path: []const u8) struct { codec: Codec, rest: []const u8 } {
+    const bare = path[0 .. std.mem.indexOfAny(u8, path, "?#") orelse path.len];
+    if (std.ascii.endsWithIgnoreCase(bare, ".gz")) return .{ .codec = .gzip, .rest = bare[0 .. bare.len - 3] };
+    if (std.ascii.endsWithIgnoreCase(bare, ".gzip")) return .{ .codec = .gzip, .rest = bare[0 .. bare.len - 5] };
+    if (std.ascii.endsWithIgnoreCase(bare, ".zst")) return .{ .codec = .zstd, .rest = bare[0 .. bare.len - 4] };
+    if (std.ascii.endsWithIgnoreCase(bare, ".zstd")) return .{ .codec = .zstd, .rest = bare[0 .. bare.len - 5] };
+    return .{ .codec = .none, .rest = bare };
+}
+
+/// A path naming a file inside an archive: `inf.zip :: inf_diario.csv`.
+///
+/// `::` is ClickHouse's separator for the same idea, and following it means the
+/// member's own name carries the extension that picks the reader. Whitespace around
+/// it is optional.
+pub const ArchiveRef = struct { archive: []const u8, member: ?[]const u8 };
+
+pub fn splitArchive(path: []const u8) ?ArchiveRef {
+    const at = std.mem.indexOf(u8, path, "::") orelse {
+        // A bare `.zip` is still an archive; it just has to hold one member.
+        if (isArchive(path)) return .{ .archive = path, .member = null };
+        return null;
+    };
+    const archive = std.mem.trim(u8, path[0..at], " \t");
+    const member = std.mem.trim(u8, path[at + 2 ..], " \t");
+    if (archive.len == 0) return null;
+    return .{ .archive = archive, .member = if (member.len == 0) null else member };
+}
+
+pub fn isArchive(path: []const u8) bool {
+    const bare = path[0 .. std.mem.indexOfAny(u8, path, "?#") orelse path.len];
+    return std.ascii.endsWithIgnoreCase(bare, ".zip");
+}
+
+/// The name whose extension decides the format: the member inside an archive, with
+/// any compression suffix taken off.
+pub fn dataName(path: []const u8) []const u8 {
+    const inner = if (splitArchive(path)) |a| (a.member orelse a.archive) else path;
+    return splitCodec(inner).rest;
+}
+
+/// Buffer a decompressor needs, per codec.
+///
+/// Not `std.http.ContentEncoding.minBufferCapacity()`: that returns
+/// `zstd.default_window_len` alone, while `zstd.Decompress` asserts capacity for
+/// the window *plus* `block_size_max` and otherwise fails the stream with
+/// `OutputBufferUndersize`. A real 2.6 MB `.csv.zst` failed exactly that way.
+fn codecBuffer(codec: Codec) usize {
+    return switch (codec) {
+        .none => 0,
+        .gzip => std.compress.flate.max_window_len,
+        .zstd => std.compress.zstd.default_window_len + std.compress.zstd.block_size_max,
+    };
+}
 
 pub const Dialect = struct {
     delim: u8 = ',',
@@ -138,10 +202,15 @@ pub const CsvReader = struct {
     /// Scratch for a record that spans physical lines (quoted newline). Reused,
     /// so it costs one allocation of the longest such record, not one per row.
     join_buf: std.array_list.Managed(u8) = undefined,
+    /// Set when the path carried a compression suffix; holds the decompressor the
+    /// line reader pulls through. Must not move once `rdr` points into it.
+    codec_state: std.http.Decompress = undefined,
 
     const Backend = union(enum) {
         file: FileBackend,
         http: *HttpFetch,
+        /// A member of a local zip, already inflating.
+        member: *zipsrc.Member,
     };
     const FileBackend = struct {
         file: std.fs.File,
@@ -199,7 +268,14 @@ pub const CsvReader = struct {
             self.rest_urls = urls[1..];
         }
 
-        if (isUrl(first)) {
+        if (splitArchive(first)) |ar| {
+            // Local archives only for now; a remote one needs its central directory
+            // fetched from the tail first.
+            if (isUrl(ar.archive)) return error.ArchiveUrlUnsupported;
+            const m = try zipsrc.openMember(arena, ar.archive, ar.member);
+            self.backend = .{ .member = m };
+            self.rdr = m.reader;
+        } else if (isUrl(first)) {
             const hf = try arena.create(HttpFetch);
             hf.* = .{ .client = httpx.initClient(arena), .req = undefined, .response = undefined };
             errdefer hf.client.deinit();
@@ -232,13 +308,33 @@ pub const CsvReader = struct {
             self.backend = .{ .http = hf };
             const ce = hf.response.head.content_encoding;
             if (ce == .compress) return error.UnsupportedCompressionMethod;
-            const win = ce.minBufferCapacity();
+            // Sized here rather than from `minBufferCapacity`, which under-sizes
+            // zstd — see `codecBuffer`.
+            const win = switch (ce) {
+                .zstd => codecBuffer(.zstd),
+                .gzip, .deflate => codecBuffer(.gzip),
+                .compress, .identity => 0,
+            };
             const dbuf: []u8 = if (win > 0) try arena.alloc(u8, win) else &.{};
             self.rdr = hf.response.readerDecompressing(&hf.transfer_buf, &hf.decompress, dbuf);
         } else {
             self.backend = .{ .file = .{ .file = try std.fs.cwd().openFile(path, .{}), .fr = undefined } };
             self.backend.file.fr = self.backend.file.file.reader(&self.read_buf);
             self.rdr = &self.backend.file.fr.interface;
+        }
+
+        // A compression suffix on the name wraps whatever the bytes came from —
+        // file, HTTP body or archive member — in the same decompressor the HTTP
+        // content-encoding path uses.
+        const codec = splitCodec(if (splitArchive(first)) |ar| (ar.member orelse ar.archive) else first).codec;
+        if (codec != .none) {
+            const ce: std.http.ContentEncoding = switch (codec) {
+                .none => .identity,
+                .gzip => .gzip,
+                .zstd => .zstd,
+            };
+            const cbuf = try arena.alloc(u8, codecBuffer(codec));
+            self.rdr = std.http.Decompress.init(&self.codec_state, self.rdr, cbuf, ce);
         }
 
         const header = (try self.readLine()) orelse return error.EmptyCsv;
@@ -324,7 +420,9 @@ pub const CsvReader = struct {
 
         switch (self.backend) {
             .http => |hf| hf.req.deinit(),
-            .file => {},
+            // `rest_urls` is only ever populated by an object-prefix listing, so a
+            // file or archive read never reaches here.
+            .file, .member => {},
         }
         const hf = try self.arena.create(HttpFetch);
         hf.* = .{ .client = httpx.initClient(self.arena), .req = undefined, .response = undefined };
@@ -362,6 +460,7 @@ pub const CsvReader = struct {
                 hf.req.deinit();
                 hf.client.deinit();
             },
+            .member => |m| m.close(),
         }
     }
 
@@ -416,6 +515,11 @@ pub const MappedCsv = struct {
     dialect: Dialect = .{},
 
     pub fn open(arena: std.mem.Allocator, path: []const u8, dialect: Dialect) !*MappedCsv {
+        // Chunking picks boundaries by seeking a newline from a byte offset, which
+        // needs the plain bytes on disk. A compressed stream has no such mapping
+        // from offset to row, and an archive member is not the file itself — both
+        // belong on the serial reader, and the callers fall back on this error.
+        if (splitCodec(path).codec != .none or splitArchive(path) != null) return error.NotMappable;
         const self = try arena.create(MappedCsv);
         const file = try std.fs.cwd().openFile(path, .{});
         errdefer file.close();
@@ -1226,6 +1330,96 @@ test "CsvSliceReader over a MappedCsv chunk parses only its rows" {
         while (try r.next(a)) |b| rows += b.len;
     }
     try std.testing.expectEqual(@as(usize, 4), rows);
+}
+
+test "splitCodec / splitArchive / dataName walk the container chain" {
+    try std.testing.expectEqual(Codec.gzip, splitCodec("a/orders.csv.gz").codec);
+    try std.testing.expectEqualStrings("a/orders.csv", splitCodec("a/orders.csv.gz").rest);
+    try std.testing.expectEqual(Codec.zstd, splitCodec("x.csv.ZST").codec);
+    try std.testing.expectEqual(Codec.none, splitCodec("x.csv").codec);
+    // A query string is not part of the name.
+    try std.testing.expectEqual(Codec.gzip, splitCodec("https://h/x.csv.gz?sig=1").codec);
+
+    try std.testing.expect(splitArchive("plain.csv") == null);
+    const one = splitArchive("inf.zip").?;
+    try std.testing.expectEqualStrings("inf.zip", one.archive);
+    try std.testing.expect(one.member == null);
+    const two = splitArchive("d/inf.zip :: inner/data.csv").?;
+    try std.testing.expectEqualStrings("d/inf.zip", two.archive);
+    try std.testing.expectEqualStrings("inner/data.csv", two.member.?);
+    // No spaces required.
+    try std.testing.expectEqualStrings("a.csv", splitArchive("i.zip::a.csv").?.member.?);
+
+    // The innermost name is the one that carries the format.
+    try std.testing.expectEqualStrings("inner/data.csv", dataName("d/inf.zip :: inner/data.csv"));
+    try std.testing.expectEqualStrings("rows.csv", dataName("rows.csv.gz"));
+    try std.testing.expectEqualStrings("m.csv", dataName("a.zip :: m.csv.gz"));
+    // An s3 URL is not mistaken for an archive reference despite its colons.
+    try std.testing.expect(splitArchive("s3://bucket/key.csv") == null);
+}
+
+const fx_gz = @embedFile("testdata/rows.csv.gz");
+
+test "csv reader: a gzip stream decompresses and types normally" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "rows.csv.gz", .data = fx_gz });
+    const path = try tmp.dir.realpathAlloc(a, "rows.csv.gz");
+
+    const r = try CsvReader.open(a, path, .{});
+    defer r.close();
+    try std.testing.expectEqual(@as(usize, 2), r.schema.fields.len);
+    // Type sniffing runs on the decompressed bytes, so `id` is still an int.
+    try std.testing.expectEqual(types.TypeKind.int, r.schema.fields[0].ty.kind);
+    const b = (try r.next(a)).?;
+    try std.testing.expectEqual(@as(usize, 3), b.len);
+    try std.testing.expectEqualStrings("gamma", b.columns[1].data.bytes.at(2));
+}
+
+const fx_zst = @embedFile("testdata/rows.csv.zst");
+
+test "csv reader: a zstd stream decompresses" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "rows.csv.zst", .data = fx_zst });
+    const path = try tmp.dir.realpathAlloc(a, "rows.csv.zst");
+
+    // Regression: sized from `ContentEncoding.minBufferCapacity()` this failed with
+    // `OutputBufferUndersize`, because zstd needs the window plus a max block.
+    const r = try CsvReader.open(a, path, .{});
+    defer r.close();
+    const b = (try r.next(a)).?;
+    try std.testing.expectEqual(@as(usize, 3), b.len);
+    try std.testing.expectEqualStrings("gamma", b.columns[1].data.bytes.at(2));
+}
+
+test "csv reader: a zip member reads, and MappedCsv refuses both containers" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "t.zip", .data = @embedFile("testdata/two_members.zip") });
+    try tmp.dir.writeFile(.{ .sub_path = "rows.csv.gz", .data = fx_gz });
+    const zpath = try tmp.dir.realpathAlloc(a, "t.zip");
+    const gpath = try tmp.dir.realpathAlloc(a, "rows.csv.gz");
+
+    const ref = try std.fmt.allocPrint(a, "{s} :: a.csv", .{zpath});
+    const r = try CsvReader.open(a, ref, .{});
+    defer r.close();
+    const b = (try r.next(a)).?;
+    try std.testing.expectEqual(@as(usize, 2), b.len);
+
+    // Neither can be cut on byte offsets, so the parallel paths must fall back.
+    try std.testing.expectError(error.NotMappable, MappedCsv.open(a, ref, .{}));
+    try std.testing.expectError(error.NotMappable, MappedCsv.open(a, gpath, .{}));
+    try std.testing.expectError(error.NotMappable, MappedCsv.open(a, zpath, .{}));
 }
 
 test "Encoding.parse accepts the spellings the wild uses" {
