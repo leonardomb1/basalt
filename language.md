@@ -485,6 +485,12 @@ GROUP BY DATE_TRUNC('minute', EventTime);          -- binds to m
 
 ## 6. `UNION ALL BY NAME` — reconciliation by name
 
+A branch may be **any query** — a file, a filter, a projection, an aggregate — not
+only `SELECT ['tag' AS c,] t.* FROM <conn>.<table>`. That shape is the reconciliation
+case the feature was built for (N similar tables aligned by name) and it still gets the
+`tag` column and table discovery; a general branch is built like any other pipeline and
+reconciled the same way.
+
 Alignment is **by column name**: NULL-fill missing, drop extra, cast type
 differences. (ANSI `UNION ALL` is positional — this is the DuckDB
 `UNION ALL BY NAME`.)

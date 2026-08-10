@@ -3913,6 +3913,7 @@ fn renderUnion(arena: std.mem.Allocator, u: ast.Union, lr: LoopRow) anyerror!ast
         for (u.branches, branches) |b, *o| o.* = .{
             .read = try renderRead(arena, b.read, lr),
             .tag = if (b.tag) |t| try interpAll(arena, t, lr) else null,
+            .pipeline = if (b.pipeline) |p| try renderPipeline(arena, p, lr) else null,
         };
         return .{ .branches = branches, .discover_conn = u.discover_conn, .discover_query = u.discover_query, .discover_json = u.discover_json, .discover_pipeline = u.discover_pipeline, .pos = u.pos };
     }
@@ -4725,7 +4726,7 @@ fn synthReconcile(arena: std.mem.Allocator, src: types.Schema, canon: types.Sche
     return items.toOwnedSlice();
 }
 
-const UnionSpec = struct { read: ast.Read, tag: ?[]const u8, name: []const u8 };
+const UnionSpec = struct { read: ast.Read, tag: ?[]const u8, name: []const u8, pipeline: ?ast.Pipeline = null };
 
 /// Resolve a union's branch list — explicit branches, or tables discovered via a
 /// `(table_name, tag)` query.
@@ -4784,7 +4785,12 @@ fn unionSpecs(env: *Env, u: ast.Union, hints: []const ast.Hint) ![]UnionSpec {
     } else for (u.branches) |b| {
         var rd = b.read;
         if (where.len > 0) rd.where = where;
-        try specs.append(.{ .read = rd, .tag = b.tag, .name = readName(b.read) });
+        try specs.append(.{
+            .read = rd,
+            .tag = b.tag,
+            .name = if (b.pipeline != null) "query" else readName(b.read),
+            .pipeline = b.pipeline,
+        });
     }
     return specs.toOwnedSlice();
 }
@@ -4877,6 +4883,16 @@ fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint) anyerror!PipeRes
     const children = try arena.alloc(op.Op, specs.len);
     const schemas = try arena.alloc(types.Schema, specs.len);
     for (specs, 0..) |s, i| {
+        // An arm that carries a pipeline is a general query — a file, a projection, an
+        // aggregate — rather than the bare table the reconciliation case uses. Build it
+        // like any other pipeline; the by-name alignment below works off the arm's
+        // schema either way and does not care which it was.
+        if (s.pipeline) |p| {
+            const r = try buildPipeline(env, p.stages);
+            children[i] = r.op;
+            schemas[i] = r.schema;
+            continue;
+        }
         const raw = try openSource(env, s.read, hints);
         const cs = try arena.create(obs.CountingSource);
         cs.* = .{ .inner = raw, .count = env.rows_read };
@@ -5945,6 +5961,36 @@ test "EXPLAIN mid-script explains that query without running it" {
     defer alloc.free(ran);
     try std.testing.expectEqualStrings("id\n1\n2\n", ran);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access("never.csv", .{}));
+}
+
+test "union all by name: a branch may be any query, not just a table" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.csv", .data = "k,v\na,1\nb,2\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.csv", .data = "k,v,extra\nc,3,x\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const pa = try std.fs.path.join(alloc, &.{ base, "a.csv" });
+    defer alloc.free(pa);
+    const pb = try std.fs.path.join(alloc, &.{ base, "b.csv" });
+    defer alloc.free(pb);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    // A branch used to have to be `SELECT ['tag' AS c,] t.* FROM <conn>.<table>` — the
+    // reconciliation case the feature was built for. A file, a filter or an aggregate
+    // in a branch was refused, which is most of what a UNION is actually written for.
+    // Reconciliation still applies: `extra` is dropped against the first branch's canon.
+    const script = try std.fmt.allocPrint(alloc,
+        "LOAD INTO '{s}' AS SELECT k, v FROM '{s}' WHERE v = 1" ++
+            " UNION ALL BY NAME SELECT k, v, extra FROM '{s}';",
+        .{ out_path, pa, pb },
+    );
+    defer alloc.free(script);
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("k,v\na,1\nc,3\n", out);
 }
 
 test "derived table: a subquery in FROM is an anonymous CTE" {

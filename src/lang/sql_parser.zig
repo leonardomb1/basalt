@@ -1578,6 +1578,28 @@ pub const Parser = struct {
         return .{ .stages = try stages.toOwnedSlice(), .aliases = aliases, .union_branch = union_branch, .expr_aliases = try expr_aliases.toOwnedSlice() };
     }
 
+    /// A `UNION ALL BY NAME` arm that is not a bare source: lower the whole core to a
+    /// binding and hand back a branch that reads it. The union operator aligns arms by
+    /// column name off their schemas, so it does not care whether an arm is a table or
+    /// a query — only the parser used to.
+    fn unionBranchFromCore(self: *Parser, core: Core) Error!ast.UnionBranch {
+        self.derived_n += 1;
+        const name = try std.fmt.allocPrint(self.arena, "__union{d}", .{self.derived_n});
+        try self.let_names.append(name);
+        try self.pending_bindings.append(.{ .binding = .{
+            .name = name,
+            .pipeline = .{ .stages = core.stages, .pos = self.curPos() },
+            .pos = self.curPos(),
+        } });
+        const ref = try self.arena.alloc(ast.Stage, 1);
+        ref[0] = .{ .node = .{ .ref = name }, .hints = &.{}, .pos = self.curPos() };
+        return .{
+            .read = .{ .connector = "csv", .form = .{ .path = "" } },
+            .tag = null,
+            .pipeline = .{ .stages = ref, .pos = self.curPos() },
+        };
+    }
+
     /// `UNION ALL BY NAME core... [ANCHOR SCHEMA qual]` — collapse the first core
     /// and every following core into one union_ stage.
     fn parseUnionTail(self: *Parser, first: Core, stages: *std.array_list.Managed(ast.Stage)) Error!void {
@@ -1585,24 +1607,28 @@ pub const Parser = struct {
         var branches = std.array_list.Managed(ast.UnionBranch).init(self.arena);
         var tag_col: ?[]const u8 = null;
 
-        const fb = first.union_branch orelse
-            return self.fail(pos, "a UNION ALL BY NAME branch must be `SELECT ['tag' AS col,] t.* FROM <conn>.<table>`", .{});
-        try branches.append(.{ .read = fb.read, .tag = fb.tag });
-        tag_col = fb.tag_col;
+        if (first.union_branch) |fb| {
+            try branches.append(.{ .read = fb.read, .tag = fb.tag });
+            tag_col = fb.tag_col;
+        } else {
+            try branches.append(try self.unionBranchFromCore(first));
+        }
 
         while (self.eatKw("union")) {
             try self.expectKw("all");
             try self.expectKw("by");
             try self.expectKw("name");
             const core = try self.parseSelectCore();
-            const b = core.union_branch orelse
-                return self.fail(self.curPos(), "a UNION ALL BY NAME branch must be `SELECT ['tag' AS col,] t.* FROM <conn>.<table>`", .{});
-            if (b.tag_col) |tc| {
-                if (tag_col == null) tag_col = tc;
-                if (!std.mem.eql(u8, tag_col.?, tc))
-                    return self.fail(self.curPos(), "all UNION branches must use the same tag column name (`{s}` vs `{s}`)", .{ tag_col.?, tc });
+            if (core.union_branch) |b| {
+                if (b.tag_col) |tc| {
+                    if (tag_col == null) tag_col = tc;
+                    if (!std.mem.eql(u8, tag_col.?, tc))
+                        return self.fail(self.curPos(), "all UNION branches must use the same tag column name (`{s}` vs `{s}`)", .{ tag_col.?, tc });
+                }
+                try branches.append(.{ .read = b.read, .tag = b.tag });
+            } else {
+                try branches.append(try self.unionBranchFromCore(core));
             }
-            try branches.append(.{ .read = b.read, .tag = b.tag });
         }
 
         var hints = std.array_list.Managed(ast.Hint).init(self.arena);

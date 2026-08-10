@@ -238,7 +238,12 @@ pub const WriteMode = union(enum) {
     };
 };
 
-pub const UnionBranch = struct { read: Read, tag: ?[]const u8 };
+/// One arm of a `UNION ALL BY NAME`. Usually a bare source (`read`), which is the
+/// reconciliation case the feature was built for: N similar tables aligned by column
+/// name. `pipeline` is set instead when the arm is a general query — a file, a
+/// projection, an aggregate — in which case `read` is unused and the arm is built like
+/// any other pipeline.
+pub const UnionBranch = struct { read: Read, tag: ?[]const u8, pipeline: ?Pipeline = null };
 
 /// A leading source that reconciles N tables to a canon schema and concatenates
 /// them. Explicit: `union from <conn> <table|query|path> as "<tag>" ...`. Discovered:
