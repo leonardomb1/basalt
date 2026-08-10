@@ -6158,6 +6158,36 @@ test "union all by name: a branch may be any query, not just a table" {
     try std.testing.expectEqualStrings("k,v\na,1\nc,3\n", out);
 }
 
+test "aggregate: two aggregates over different expressions stay separate" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // `exprKey` rendered every expression kind it did not handle as a single `?`, so
+    // `SUM(v*2)` and `SUM(v+100)` both keyed as `sum(?)` and the second bound to the
+    // first's accumulator: the answer came back as 2 * SUM(v*2), silently. Reported
+    // against 0.6.1. Verified against DuckDB: 120 + 360 = 480.
+    const out = try runToString(alloc, &tmp,
+        "v\n10\n20\n30\n",
+        "SELECT SUM(v * 2) + SUM(v + 100) AS chk, MIN(v * 2) + MIN(v + 100) AS m FROM '$IN'",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("chk,m\n480,130\n", out);
+}
+
+test "aggregate: the same expression twice still shares one accumulator" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The dedup is the point of the key, so an identical argument must still collapse to
+    // one accumulator rather than being computed twice.
+    const out = try runToString(alloc, &tmp,
+        "v\n10\n20\n30\n",
+        "SELECT SUM(v * 2) + SUM(v * 2) AS d, SUM(v) + COUNT(*) AS c FROM '$IN'",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("d,c\n240,63\n", out);
+}
+
 test "window: row_number, rank and dense_rank number within a partition" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

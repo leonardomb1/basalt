@@ -2361,6 +2361,71 @@ pub const Parser = struct {
                 }
                 buf.append(')') catch return error.OutOfMemory;
             },
+            // Every kind below used to fall to the `?` at the end, which made
+            // `sum(v*2)` and `sum(v+100)` both key as `sum(?)` — so the second
+            // aggregate bound to the first's accumulator and the answer was
+            // silently `2 * sum(v*2)`. The key has to carry the argument's
+            // structure, not just its shape.
+            .float_lit => |v| buf.writer().print("{d}", .{v}) catch return error.OutOfMemory,
+            .bool_lit => |v| buf.appendSlice(if (v) "true" else "false") catch return error.OutOfMemory,
+            .null_lit => buf.appendSlice("null") catch return error.OutOfMemory,
+            .unary => |u| {
+                buf.appendSlice(switch (u.op) {
+                    .neg => "-",
+                    .not => "not ",
+                    .bit_not => "~",
+                }) catch return error.OutOfMemory;
+                try self.exprKey(u.e, buf);
+            },
+            .binary => |b| {
+                try self.exprKey(b.l, buf);
+                buf.appendSlice(switch (b.op) {
+                    .add => "+",
+                    .sub => "-",
+                    .mul => "*",
+                    .div => "/",
+                    .mod => "%",
+                    .bit_and => "&",
+                    .bit_or => "|",
+                    .bit_xor => "^",
+                    .shl => "<<",
+                    .shr => ">>",
+                    .eq => "=",
+                    .ne => "<>",
+                    .lt => "<",
+                    .le => "<=",
+                    .gt => ">",
+                    .ge => ">=",
+                    .@"and" => " and ",
+                    .@"or" => " or ",
+                }) catch return error.OutOfMemory;
+                try self.exprKey(b.r, buf);
+            },
+            .cast => |c| {
+                buf.appendSlice("cast(") catch return error.OutOfMemory;
+                try self.exprKey(c.e, buf);
+                buf.appendSlice(" as ") catch return error.OutOfMemory;
+                buf.appendSlice(@tagName(c.ty.kind)) catch return error.OutOfMemory;
+                if (c.safe) buf.append('?') catch return error.OutOfMemory;
+                buf.append(')') catch return error.OutOfMemory;
+            },
+            .is_null => |n| {
+                try self.exprKey(n.e, buf);
+                buf.appendSlice(if (n.negated) " is not " else " is ") catch return error.OutOfMemory;
+                buf.appendSlice(@tagName(n.kind)) catch return error.OutOfMemory;
+            },
+            .cond => |c| {
+                buf.appendSlice("if(") catch return error.OutOfMemory;
+                try self.exprKey(c.cond, buf);
+                buf.append(',') catch return error.OutOfMemory;
+                try self.exprKey(c.then, buf);
+                buf.append(',') catch return error.OutOfMemory;
+                try self.exprKey(c.els, buf);
+                buf.append(')') catch return error.OutOfMemory;
+            },
+            // `match` and `let ... in` still collapse; they cannot appear as an
+            // aggregate argument today, and a distinct key for them would need the
+            // whole arm list rendered.
             else => buf.append('?') catch return error.OutOfMemory,
         }
     }
