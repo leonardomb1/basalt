@@ -1911,13 +1911,6 @@ fn runParallelParquetAgg(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, p
 
     var ad = analyze.Diag{};
     const apl = analyze.aggregatePlan(arena, agg_in.*, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
-    // An ungrouped aggregate (`SELECT COUNT(*) FROM ...`, no GROUP BY) has no
-    // key to hash, so every lane folds into zero groups and the merge emits the
-    // identity — COUNT(*) came back 0 instead of the row count, silently. The
-    // two-phase fold-then-radix-merge below is grouped-aggregate machinery; the
-    // ungrouped case belongs on the serial path, which is correct.
-    if (apl.by.len == 0) return false;
-
     const aggs = try arena.alloc(op.Aggregate.Agg, apl.aggs.len);
     for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct };
     const out_schema = try schemaPtr(arena, apl.schema);
@@ -1970,11 +1963,29 @@ fn runParallelParquetAgg(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, p
     }
     defer for (parts) |*pp| pp.arena.deinit();
 
-    var mctx = PqMergeCtx{ .lanes = lanes, .parts = parts, .aggs = aggs, .queue = .{ .nitems = pq_parts } };
     const t_mrg0 = std.time.Instant.now() catch unreachable;
-    _ = try parallel.spawnJoin(arena, nthreads, pqMergeWorker, &mctx);
+    if (apl.by.len == 0) {
+        // An ungrouped aggregate (`SELECT SUM(x) FROM ...`) folds to one implicit
+        // group per lane and has no key to hash, so the radix merge below had
+        // nothing to partition on and dropped every lane — COUNT(*) came back 0
+        // instead of the row count, silently. That is why this shape used to be
+        // turned away to the serial driver, at 3x the wall clock on 16 threads.
+        //
+        // With no key there is exactly one group, so partitioning buys nothing:
+        // fold the lanes straight into partition 0. Walking them in lane index
+        // order is what keeps a parallel float SUM reproducible, the same rule
+        // `combineAggSlots` follows — and it is the CSV path's behaviour, which
+        // has always run this shape in parallel.
+        const dst = &parts[0];
+        for (lanes) |*l| {
+            try op.Aggregate.mergeGroups(&dst.map, &dst.groups, dst.arena.allocator(), l.groups, aggs);
+        }
+    } else {
+        var mctx = PqMergeCtx{ .lanes = lanes, .parts = parts, .aggs = aggs, .queue = .{ .nitems = pq_parts } };
+        _ = try parallel.spawnJoin(arena, nthreads, pqMergeWorker, &mctx);
+        if (mctx.queue.first_err) |e| return e;
+    }
     const t_mrg1 = std.time.Instant.now() catch unreachable;
-    if (mctx.queue.first_err) |e| return e;
     var lane_groups: usize = 0;
     for (lanes) |*l| lane_groups += l.groups.len;
     env.log.log(.debug, "pq agg phases: fold {d}ms (incl. bucket), merge {d}ms, {d} lane groups", .{
@@ -5875,6 +5886,67 @@ fn runCsvThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []c
         return e;
     };
     return tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
+}
+
+/// A parquet file with three row groups — enough for the parallel scan, which needs
+/// at least `pq_min_lanes` lanes and more than one row group. 5000 rows of
+/// `id = 1..5000` and `f = id * 0.5`, so `SUM(id)` and `SUM(f)` are both exactly
+/// representable and the assertion holds whatever order the lanes add in.
+const fx_rg2 = @embedFile("testdata/rg2.parquet");
+
+/// Run a query over `fx_rg2` at an explicit thread count, returning out.csv.
+fn runParquetThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, query: []const u8, threads: usize) ![]u8 {
+    try tmp.dir.writeFile(.{ .sub_path = "in.parquet", .data = fx_rg2 });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const in_path = try std.fs.path.join(alloc, &.{ base, "in.parquet" });
+    defer alloc.free(in_path);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+    const q = try std.mem.replaceOwned(u8, alloc, query, "$IN", in_path);
+    defer alloc.free(q);
+    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS {s};", .{ out_path, q });
+    defer alloc.free(script);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    _ = run(alloc, prog, .{ .threads = threads }, &rdiag) catch |e| {
+        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+        return e;
+    };
+    return tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
+}
+
+test "parallel parquet aggregate: an ungrouped agg (threads>1) matches serial" {
+    const alloc = std.testing.allocator;
+    // This shape used to be refused by the parallel path and sent to the serial
+    // driver, because folding into zero groups made the radix merge emit the
+    // identity and COUNT(*) came back 0. It is the most common analytical query
+    // there is, and it ran on one core.
+    var t1 = std.testing.tmpDir(.{});
+    defer t1.cleanup();
+    const serial = try runParquetThreaded(alloc, &t1, "SELECT COUNT(*) AS n, SUM(id) AS sid, SUM(f) AS sf FROM '$IN'", 1);
+    defer alloc.free(serial);
+    var t4 = std.testing.tmpDir(.{});
+    defer t4.cleanup();
+    const par = try runParquetThreaded(alloc, &t4, "SELECT COUNT(*) AS n, SUM(id) AS sid, SUM(f) AS sf FROM '$IN'", 4);
+    defer alloc.free(par);
+
+    try std.testing.expectEqualStrings("n,sid,sf\n5000,12502500,6251250\n", serial);
+    try std.testing.expectEqualStrings(serial, par);
+}
+
+test "parallel parquet aggregate: an ungrouped agg under a filter (threads>1)" {
+    const alloc = std.testing.allocator;
+    // A prefix filter is the q06 shape: the lanes must each apply it and still
+    // combine into the single implicit group.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const par = try runParquetThreaded(alloc, &tmp, "SELECT COUNT(*) AS n, SUM(id) AS sid FROM '$IN' WHERE id <= 100", 4);
+    defer alloc.free(par);
+    try std.testing.expectEqualStrings("n,sid\n100,5050\n", par);
 }
 
 test "parallel CSV aggregate: global agg (threads>1) matches serial" {

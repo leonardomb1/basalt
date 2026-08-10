@@ -109,6 +109,23 @@ lanes, so these are CPU not wall):
 - **q06** scan 262 ms, filter 193 ms for a predicate that keeps 1.9% of rows.
 - **q14** scan 265 ms dominates; the join over 76 K surviving rows is 38 ms.
 
+### Since the baseline
+
+- **q06 457 ms → 121 ms** (18.3× → 5.0×). Not a kernel change: the parallel parquet
+  path used to refuse an ungrouped aggregate and hand it to the serial driver, so
+  `SELECT SUM(x) FROM t WHERE ...` ran on one core. `-j 1` and `-j 16` were within
+  a millisecond of each other.
+
+Worth knowing when reading any row above: **q03, q12 and q14 are still serial**, and
+that is most of their gap. `classifyAggPipeline` rejects any pipeline containing a
+join, so join-then-aggregate has no parallel path at all. Compare thread counts
+before concluding anything about a query's per-row cost:
+
+```sh
+for j in 1 4 16; do zig build run -Doptimize=ReleaseFast -- run bench/tpch/q12.sql \
+  -p data=$BASALT_BENCH_DATA -p out=/tmp/q12 -j $j; done
+```
+
 And `m03` versus `m02` isolates the sink: identical input and projection, 2% of the
 rows written, 886 ms against 2809 ms. Roughly 1.9 s of `m02` is materialising and
 serialising rows — about twice what parsing the 773 MB input costs. For the
