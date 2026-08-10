@@ -467,6 +467,10 @@ SELECT DATE_TRUNC('minute', EventTime) AS m, COUNT(*) AS c FROM hits
 GROUP BY DATE_TRUNC('minute', EventTime);          -- binds to m
 ```
 
+- **Column order is the `SELECT` list's**, not the aggregate's. `SELECT k, SUM(x), k2`
+  writes `k, sum, k2`; the engine folds grouping keys before aggregates internally and
+  reorders the projection back on the way out. (Before 0.5.8 that query wrote
+  `k, k2, sum` — the values were right, the columns had moved.)
 - `GROUP BY <n>` is positional — it names the *n*-th `SELECT` item.
 - `GROUP BY <expr>` accepts a computed key (`GROUP BY ClientIP - 1`).
 - `ORDER BY` may name a column the `SELECT` list does not project. It is

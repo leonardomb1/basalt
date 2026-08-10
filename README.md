@@ -87,6 +87,11 @@ Logging is quiet by default: plain-text errors and warnings on stderr, plus a
 one-line summary when a run loads a sink. `--log-level debug` shows plan
 detail; `--log-format json` switches stderr to NDJSON for collectors.
 
+The summary's rate is rows **processed** per second — the volume that moved
+through the pipeline, which for a straight move is also the rows written. (Before
+0.5.8 it divided the *written* count by the clock, so an aggregate folding six
+million rows into four reported `11 rows/s`.)
+
 ## Design
 
 - Errors surface at plan time: an unknown column, an incomparable type or a
