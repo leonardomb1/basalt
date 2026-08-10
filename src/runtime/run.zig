@@ -807,6 +807,8 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     {
         if (classifyAggPipeline(stages)) |shape| {
             if (try runParallelCsvAgg(env, stages[0].node.read, shape.prefix, shape.ag, shape.tail, last.write, opts, stats, lanes_used)) return;
+        } else if (classifyAggJoinPipeline(stages)) |js| {
+            if (try runParallelCsvAggJoin(env, stages[0].node.read, js, last.write, opts, stats, lanes_used)) return;
         } else if (classifyDistinctPipeline(stages)) |ds| {
             if (try runParallelCsvDistinct(env, stages[0].node.read, ds.prefix, ds.dist, ds.tail, last.write, opts, stats, lanes_used)) return;
         } else if (classifyTopNPipeline(stages)) |tn| {
@@ -1444,6 +1446,8 @@ const AggCtx = struct {
     queue: WorkQueue,
     slots: []AggSlot,
     rows_read: *std.atomic.Value(u64),
+    /// Set for the join-then-aggregate shape, exactly as `PqAggCtx.join`.
+    join: ?LaneJoin = null,
 };
 
 const aggWorker = dispatchWorker(AggCtx, aggWorkOne);
@@ -1455,7 +1459,8 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
     var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.queue.nitems), .schema = ctx.csv_schema };
     var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const child = try buildMapChain(wa, ctx.params, ctx.prefix, &scan, ctx.csv_schema);
+    const mapped_chain = try buildMapChain(wa, ctx.params, ctx.prefix, &scan, ctx.csv_schema);
+    const child = if (ctx.join) |lj| try buildLaneJoinChain(wa, ctx.params, lj, mapped_chain) else mapped_chain;
     var agg = op.Aggregate{
         .child = child,
         .in_schema = ctx.agg_in_schema,
@@ -2164,6 +2169,18 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
 
 /// Returns true if it handled the pipeline in parallel; false to fall back to serial.
 fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    return runParallelCsvAggImpl(env, rd, prefix, ag, tail, null, w, opts, stats, lanes_used);
+}
+
+/// The join-then-aggregate shape over a CSV source. The parquet twin is
+/// `runParallelParquetAggJoin`; keeping both means a shape does not silently lose its
+/// parallelism by changing file format, which is how an ungrouped aggregate came to
+/// run on one core for parquet and sixteen for CSV.
+fn runParallelCsvAggJoin(env: *Env, rd: ast.Read, js: AggJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    return runParallelCsvAggImpl(env, rd, js.map_stages, js.ag, js.tail, js, w, opts, stats, lanes_used);
+}
+
+fn runParallelCsvAggImpl(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, jshape: ?AggJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     const arena = env.arena;
     const path = switch (rd.form) {
         .path => |p| p,
@@ -2182,7 +2199,19 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
     }
     defer mapped.close();
 
-    const agg_in = try schemaPtr(arena, try mapChainSchema(env, prefix, mapped.schema));
+    var agg_in_schema = try mapChainSchema(env, prefix, mapped.schema);
+    var lane_join: ?LaneJoin = null;
+    if (jshape) |js| {
+        const lp = try resolveLaneJoin(env, .{
+            .prefix = js.map_stages,
+            .join = js.join,
+            .join_hints = js.join_hints,
+            .suffix = js.suffix,
+        }, agg_in_schema);
+        lane_join = lp.lane;
+        agg_in_schema = lp.out_schema;
+    }
+    const agg_in = try schemaPtr(arena, agg_in_schema);
 
     var ad = analyze.Diag{};
     const apl = analyze.aggregatePlan(arena, agg_in.*, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
@@ -2210,6 +2239,7 @@ fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast
         .queue = .{ .nitems = nthreads },
         .slots = slots,
         .rows_read = env.rows_read,
+        .join = lane_join,
     };
 
     const lanes = try parallel.spawnJoin(arena, nthreads, aggWorker, &ctx);
@@ -6086,6 +6116,27 @@ test "parallel CSV aggregate: global agg (threads>1) matches serial" {
     const par = try runCsvThreaded(alloc, &tmp, input, "SELECT COUNT(*) AS n, SUM(CAST(v AS INT)) AS s FROM '$IN'", 4);
     defer alloc.free(par);
     try std.testing.expectEqualStrings("n,s\n5,150\n", par);
+}
+
+test "parallel CSV aggregate: a join then an agg (threads>1) matches serial" {
+    const alloc = std.testing.allocator;
+    // The CSV twin of the parquet join+aggregate tests above. Both exist on purpose:
+    // the ungrouped aggregate was parallel for CSV and serial for parquet for exactly
+    // this reason — one hand-rolled path grew a capability its twin never did.
+    const input = "id,v\n1,10\n2,20\n3,30\n4,40\n5,50\n";
+    const q = "WITH d AS (SELECT id AS did FROM '$IN' WHERE CAST(id AS INT) <= 3) " ++
+        "SELECT COUNT(*) AS n, SUM(CAST(v AS INT)) AS s FROM '$IN' JOIN d ON id = did";
+    var t1 = std.testing.tmpDir(.{});
+    defer t1.cleanup();
+    const serial = try runCsvThreaded(alloc, &t1, input, q, 1);
+    defer alloc.free(serial);
+    var t4 = std.testing.tmpDir(.{});
+    defer t4.cleanup();
+    const par = try runCsvThreaded(alloc, &t4, input, q, 4);
+    defer alloc.free(par);
+
+    try std.testing.expectEqualStrings("n,s\n3,60\n", serial);
+    try std.testing.expectEqualStrings(serial, par);
 }
 
 test "parallel CSV aggregate: filter/select prefix + sort/limit tail (threads>1)" {
