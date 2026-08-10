@@ -1812,6 +1812,38 @@ fn pqTopNOne(ctx: *PqTopNCtx, p: usize) !void {
 /// parquet file. Each lane pulls row-group morsels and writes its own output,
 /// so nothing is shared except the work list and, for a shared sink, the write
 /// lock.
+/// Where a lane's rows come from. This is the ONLY difference between the parquet and
+/// CSV copies of every lane body: a parquet lane pulls row-group morsels off a queue
+/// shared with its siblings, a CSV lane parses one newline-aligned byte range. Above
+/// this seam the map chain, the join probe, the aggregate fold and the sink writes are
+/// identical — and are written out once per shape per source today.
+///
+/// The two still *distribute* work differently (morsel stealing versus a static chunk
+/// per lane), which is why this unifies the reader and not yet the whole body.
+const LaneRows = union(enum) {
+    /// Borrowed: every lane shares one queue, which is what makes stealing work.
+    parquet: *PqMorsels,
+    csv: struct { mapped: *csv.MappedCsv, schema: *const types.Schema, chunk: usize, of: usize },
+};
+
+/// This lane's row stream. The backing reader is allocated from `scratch` because the
+/// returned `driver.Source` borrows it and has to outlive this call — the reason both
+/// copies held it in a `var` local beside the source.
+fn laneRowSource(rows: LaneRows, scratch: std.mem.Allocator) !driver.Source {
+    switch (rows) {
+        .parquet => |m| {
+            const ms = try scratch.create(MorselSource);
+            ms.* = .{ .m = m, .scratch = scratch };
+            return .{ .ptr = ms, .vtable = &MorselSource.vtable };
+        },
+        .csv => |c| {
+            const rd = try scratch.create(csv.CsvSliceReader);
+            rd.* = .{ .data = c.mapped.chunk(c.chunk, c.of), .schema = c.schema };
+            return rd.source();
+        },
+    }
+}
+
 const PqMapCtx = struct {
     morsels: PqMorsels,
     map_stages: []const ast.Stage,
@@ -1846,8 +1878,8 @@ fn pqMapLaneRun(ctx: *PqMapCtx, lane_idx: usize) !void {
         if (own_sink_open) sk.abort();
     };
 
-    var ms = MorselSource{ .m = &ctx.morsels, .scratch = warena.allocator() };
-    var cs = obs.CountingSource{ .inner = .{ .ptr = &ms, .vtable = &MorselSource.vtable }, .count = ctx.rows_read };
+    const inner = try laneRowSource(.{ .parquet = &ctx.morsels }, warena.allocator());
+    var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     const mapped_chain = try buildMapChain(warena.allocator(), ctx.params, ctx.map_stages, &scan, ctx.morsels.src_schema);
     const chain = if (ctx.join) |lj|
@@ -2825,8 +2857,13 @@ fn mapWorkOne(ctx: *MapCtx, i: usize) !void {
         if (own_sink_open) s.abort();
     };
 
-    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.queue.nitems), .schema = ctx.csv_schema };
-    var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
+    const inner = try laneRowSource(.{ .csv = .{
+        .mapped = ctx.mapped,
+        .schema = ctx.csv_schema,
+        .chunk = i,
+        .of = ctx.queue.nitems,
+    } }, warena.allocator());
+    var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     const mapped_chain = try buildMapChain(warena.allocator(), ctx.params, ctx.map_stages, &scan, ctx.csv_schema);
     const chain = if (ctx.join) |lj|
