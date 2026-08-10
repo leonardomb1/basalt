@@ -2109,6 +2109,92 @@ pub fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalE
     };
 }
 
+/// Render a value straight into a writer, with no intermediate allocation.
+///
+/// `valueToString` allocates from an arena for every non-text value, which is fine
+/// for one-off formatting and ruinous in a sink: a 6M-row CSV move spent most of its
+/// time allocating and copying strings it wrote once and dropped. The renderings here
+/// are byte-identical to `valueToString`'s — that is what the tests assert — so a
+/// caller can pick either without changing its output.
+pub fn writeValue(w: anytype, v: Value) !void {
+    switch (v) {
+        .null => {},
+        .string, .bytes => |x| try w.writeAll(x),
+        .bool => |b| try w.writeAll(if (b) "true" else "false"),
+        .int => |x| try w.print("{d}", .{x}),
+        .float => |x| try w.print("{d}", .{x}),
+        .decimal => |d| try writeDecimal(w, d.unscaled, d.scale),
+        .date => |x| try writeDate(w, x),
+        .time => |x| try writeTime(w, x),
+        .timestamp => |x| try writeTimestamp(w, x),
+    }
+}
+
+/// `YYYY-MM-DD` from a day count since the 1970 epoch.
+pub fn writeDate(w: anytype, days: i64) !void {
+    const c = civilFromDays(days);
+    try w.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u32, @intCast(c.y)), c.m, c.d });
+}
+
+/// `HH:MM:SS[.ffffff]` from microseconds since midnight. (Time parts are unsigned so
+/// `{d:0>2}` zero-pads instead of printing a sign.)
+pub fn writeTime(w: anytype, t: i64) !void {
+    const us: u64 = @intCast(@mod(t, 86_400_000_000));
+    const secs = us / 1_000_000;
+    const frac = us % 1_000_000;
+    // `.ffffff` only when there is a fraction, so a `time(0)` reads as `12:00:00`
+    // rather than `12:00:00.000000`.
+    if (frac != 0) {
+        try w.print("{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ secs / 3600, (secs % 3600) / 60, secs % 60, frac });
+    } else {
+        try w.print("{d:0>2}:{d:0>2}:{d:0>2}", .{ secs / 3600, (secs % 3600) / 60, secs % 60 });
+    }
+}
+
+pub fn writeTimestamp(w: anytype, micros: i64) !void {
+    const days = @divFloor(micros, 86_400_000_000);
+    const us: u64 = @intCast(micros - days * 86_400_000_000);
+    const secs = us / 1_000_000;
+    const frac = us % 1_000_000;
+    const c = civilFromDays(days);
+    if (frac != 0) {
+        try w.print("{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{
+            @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60, frac,
+        });
+    } else {
+        try w.print("{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+            @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60,
+        });
+    }
+}
+
+pub fn writeDecimal(w: anytype, unscaled: i128, scale: u8) !void {
+    const neg = unscaled < 0;
+    var mag: u128 = if (neg) @intCast(-unscaled) else @intCast(unscaled);
+
+    // i128 is at most 39 digits; the padding loop below adds at most `scale` more,
+    // and scale is bounded by the decimal types the engine accepts.
+    var digits: [48]u8 = undefined;
+    var n: usize = 0;
+    if (mag == 0) {
+        digits[0] = '0';
+        n = 1;
+    }
+    while (mag > 0) : (mag /= 10) {
+        digits[n] = @intCast('0' + mag % 10);
+        n += 1;
+    }
+    while (n <= scale) : (n += 1) digits[n] = '0';
+
+    if (neg) try w.writeByte('-');
+    var k: usize = n;
+    while (k > 0) {
+        k -= 1;
+        try w.writeByte(digits[k]);
+        if (scale > 0 and k == scale) try w.writeByte('.');
+    }
+}
+
 pub fn valueToString(arena: std.mem.Allocator, v: Value) ![]const u8 {
     return switch (v) {
         .null => "",
@@ -2124,41 +2210,38 @@ pub fn valueToString(arena: std.mem.Allocator, v: Value) ![]const u8 {
     };
 }
 
-/// `YYYY-MM-DD` from a day count since the 1970 epoch.
+/// `YYYY-MM-DD` from a day count since the 1970 epoch. One rendering shared with
+/// `writeDate`, so the two cannot drift.
+///
+/// The buffer cannot overflow: the widest output is an 11-digit year (i64 days spans
+/// ~±25 billion years) plus `-MM-DD`, so 17 bytes. Writing into a fixed buffer would
+/// otherwise add `error.WriteFailed` to this function's error set, and every caller
+/// declares a set that does not include it. `bound` covers all four formatters.
+const fmt_bound = 128;
+
 pub fn formatDate(arena: std.mem.Allocator, days: i64) ![]const u8 {
-    const c = civilFromDays(days);
-    return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u32, @intCast(c.y)), c.m, c.d });
+    var buf: [fmt_bound]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    writeDate(&w, days) catch unreachable;
+    return arena.dupe(u8, w.buffered());
 }
 
 /// `HH:MM:SS.ffffff` from microseconds since midnight. (Time parts are unsigned so
 /// `{d:0>2}` zero-pads instead of printing a sign.)
 pub fn formatTime(arena: std.mem.Allocator, t: i64) ![]const u8 {
-    const us: u64 = @intCast(@mod(t, 86_400_000_000));
-    const secs = us / 1_000_000;
-    const frac = us % 1_000_000;
-    // Same rule as `formatTimestamp`: `.ffffff` only when there is a fraction,
-    // so a `time(0)` reads as `12:00:00` rather than `12:00:00.000000`.
-    if (frac != 0) return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ secs / 3600, (secs % 3600) / 60, secs % 60, frac });
-    return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2}", .{ secs / 3600, (secs % 3600) / 60, secs % 60 });
+    var buf: [fmt_bound]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    writeTime(&w, t) catch unreachable;
+    return arena.dupe(u8, w.buffered());
 }
 
 /// `YYYY-MM-DD HH:MM:SS` from microseconds since the 1970 epoch (floor-divides so
 /// pre-epoch instants format correctly).
 pub fn formatTimestamp(arena: std.mem.Allocator, micros: i64) ![]const u8 {
-    const days = @divFloor(micros, 86_400_000_000);
-    const us: u64 = @intCast(micros - days * 86_400_000_000);
-    const secs = us / 1_000_000;
-    const frac = us % 1_000_000;
-    const c = civilFromDays(days);
-    // Emit `.ffffff` only when there is a fraction, so whole-second values keep
-    // their existing spelling and only sub-second data gains digits it would
-    // otherwise lose on every write.
-    if (frac != 0) return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{
-        @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60, frac,
-    });
-    return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
-        @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60,
-    });
+    var buf: [fmt_bound]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    writeTimestamp(&w, micros) catch unreachable;
+    return arena.dupe(u8, w.buffered());
 }
 
 /// Field selector shared by `extract` and `date_trunc`.
@@ -2441,30 +2524,10 @@ test "format temporal values for text sinks" {
 
 /// Render an exact decimal `unscaled * 10^-scale`, e.g. (12345, 2) -> "123.45".
 pub fn formatDecimal(arena: std.mem.Allocator, unscaled: i128, scale: u8) ![]const u8 {
-    const neg = unscaled < 0;
-    var mag: u128 = if (neg) @intCast(-unscaled) else @intCast(unscaled);
-
-    var digits: [48]u8 = undefined;
-    var n: usize = 0;
-    if (mag == 0) {
-        digits[0] = '0';
-        n = 1;
-    }
-    while (mag > 0) : (mag /= 10) {
-        digits[n] = @intCast('0' + mag % 10);
-        n += 1;
-    }
-    while (n <= scale) : (n += 1) digits[n] = '0';
-
-    var out = std.array_list.Managed(u8).init(arena);
-    if (neg) try out.append('-');
-    var k: usize = n;
-    while (k > 0) {
-        k -= 1;
-        try out.append(digits[k]);
-        if (scale > 0 and k == scale) try out.append('.');
-    }
-    return out.toOwnedSlice();
+    var buf: [fmt_bound]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    writeDecimal(&w, unscaled, scale) catch unreachable;
+    return arena.dupe(u8, w.buffered());
 }
 
 fn fieldIndex(schema: types.Schema, q: ast.QualName) ?usize {
@@ -3305,6 +3368,67 @@ test "timestamps keep sub-second precision through parse and format" {
     const w = parseIsoTimestamp("2026-08-08 12:34:56").?;
     try std.testing.expectEqualStrings("2026-08-08 12:34:56", try formatTimestamp(ar.allocator(), w));
     try std.testing.expect(parseIsoTimestamp("2026-08-08 12:34:56.12x") == null);
+}
+
+test "writeValue renders exactly what valueToString does, for every kind" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // The CSV sink picks between these two by delimiter, so a single value that
+    // renders differently down the two paths would make output depend on the
+    // delimiter. Extremes are included because `formatX` now writes into a fixed
+    // buffer: if `fmt_bound` were too small these would trip the `unreachable`.
+    const cases = [_]Value{
+        .null,
+        .{ .bool = true },
+        .{ .bool = false },
+        .{ .int = 0 },
+        .{ .int = -1 },
+        .{ .int = std.math.maxInt(i64) },
+        .{ .int = std.math.minInt(i64) },
+        .{ .float = 0 },
+        .{ .float = -0.0 },
+        .{ .float = 0.1 },
+        .{ .float = 1.0 / 3.0 },
+        .{ .float = -2.5e-8 },
+        .{ .float = 1.7976931348623157e308 },
+        .{ .float = 5e-324 },
+        .{ .float = std.math.inf(f64) },
+        .{ .float = -std.math.inf(f64) },
+        .{ .float = std.math.nan(f64) },
+        .{ .decimal = .{ .unscaled = 0, .scale = 0 } },
+        .{ .decimal = .{ .unscaled = 1700, .scale = 2 } },
+        .{ .decimal = .{ .unscaled = -1700, .scale = 2 } },
+        // Scale wider than the digits, so the padding loop runs.
+        .{ .decimal = .{ .unscaled = 5, .scale = 6 } },
+        .{ .decimal = .{ .unscaled = std.math.maxInt(i128), .scale = 0 } },
+        .{ .decimal = .{ .unscaled = std.math.minInt(i128) + 1, .scale = 10 } },
+        .{ .string = "" },
+        .{ .string = "plain" },
+        .{ .bytes = "raw" },
+        .{ .date = 0 },
+        .{ .date = 20000 },
+        .{ .date = 2932896 }, // year 9999
+        .{ .time = 0 },
+        .{ .time = 1 },
+        .{ .time = 86_400_000_000 - 1 },
+        .{ .timestamp = 0 },
+        .{ .timestamp = -1 },
+        .{ .timestamp = 1_754_000_000_000_000 },
+        .{ .timestamp = 1_754_000_000_123_456 },
+    };
+
+    for (cases) |v| {
+        var buf: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try writeValue(&w, v);
+        const want = try valueToString(a, v);
+        std.testing.expectEqualStrings(want, w.buffered()) catch |e| {
+            std.debug.print("mismatch on {s}\n", .{@tagName(v)});
+            return e;
+        };
+    }
 }
 
 test "formatTime suppresses an all-zero fraction, like formatTimestamp" {

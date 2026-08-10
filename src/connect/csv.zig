@@ -960,6 +960,9 @@ pub const CsvWriter = struct {
     fn writeRows(self: *CsvWriter, arena: std.mem.Allocator, batch: Batch) !void {
         const w = self.out();
         const d = self.dialect.delim;
+        // Whether a number or timestamp could need quoting under this dialect —
+        // constant for the whole run, so it is decided once rather than per field.
+        const quote_scalars = scalarCanNeedQuote(d);
         var r: usize = 0;
         while (r < batch.len) : (r += 1) {
             for (batch.columns, 0..) |*col, i| {
@@ -970,8 +973,19 @@ pub const CsvWriter = struct {
                     // `valueToString` to switch back out and hand back the slice.
                     .string, .bytes => if (col.validity.get(r)) try writeField(w, col.data.bytes.at(r), d),
                     else => {
+                        if (!col.validity.get(r)) continue;
                         const v = col.getValue(r);
-                        if (!v.isNull()) try writeField(w, try eval.valueToString(arena, v), d);
+                        // The common case: a number or timestamp cannot contain this
+                        // delimiter, a quote or a newline, so it needs no quoting and
+                        // no scan to discover that — it goes straight into the output
+                        // buffer. `valueToString` would allocate a string per field,
+                        // which on a 6M-row move is tens of millions of allocations
+                        // whose only purpose is to be copied once and dropped.
+                        if (quote_scalars) {
+                            try writeField(w, try eval.valueToString(arena, v), d);
+                        } else {
+                            try eval.writeValue(w, v);
+                        }
                     },
                 }
             }
@@ -1027,6 +1041,20 @@ fn sinkClose(ptr: *anyopaque) anyerror!void {
 fn sinkAbort(ptr: *anyopaque) void {
     const self: *CsvWriter = @ptrCast(@alignCast(ptr));
     self.abort();
+}
+
+/// Could a number or timestamp rendering ever need CSV quoting under this delimiter?
+///
+/// `valueToString`/`writeValue` render non-text values using only digits and
+/// `+-.:eE ` (the space appears in a timestamp), so with an ordinary delimiter — `,`
+/// `;` tab `|` — the answer is no and the quote scan can be skipped entirely. A
+/// pathological delimiter like `.` or `-` would collide, and those take the same
+/// quoted path text does.
+fn scalarCanNeedQuote(delim: u8) bool {
+    return switch (delim) {
+        '0'...'9', '+', '-', '.', ':', 'e', 'E', ' ', '"', '\n', '\r' => true,
+        else => false,
+    };
 }
 
 fn writeField(w: anytype, s: []const u8, delim: u8) !void {
@@ -1535,6 +1563,98 @@ test "csv writer: the delimiter carries to the header, rows and quoting" {
 
     const got = try tmp.dir.readFileAlloc(a, "o.csv", 1 << 16);
     try std.testing.expectEqualStrings("x;y\n\"a;b\";c\n", got);
+}
+
+/// A schema with one field per (name, kind) pair, all nullable — for exercising the
+/// writer's typed paths, which `stringSchema` cannot reach.
+fn typedSchema(a: std.mem.Allocator, names: []const []const u8, kinds: []const types.TypeKind) !types.Schema {
+    const fields = try a.alloc(types.Schema.Field, names.len);
+    for (names, kinds, 0..) |n, k, i| fields[i] = .{ .name = n, .ty = types.Type.init(k).asNullable() };
+    return .{ .fields = fields };
+}
+
+test "csv writer: typed columns render without quoting, and nulls stay empty" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ base, "o.csv" });
+
+    // Numbers take the no-allocation path that formats straight into the output
+    // buffer. This pins the exact bytes it produces, including a null (bare empty,
+    // which is how the reader spells null) and a negative value. The kinds are the
+    // ones a CSV source can actually yield — `TypeSniffer` resolves int, float or
+    // string — while `eval`'s equivalence test covers date/time/decimal rendering.
+    var names = [_][]const u8{ "i", "f", "s" };
+    var kinds = [_]types.TypeKind{ .int, .float, .string };
+    const schema = try typedSchema(a, &names, &kinds);
+    const w = try CsvWriter.open(a, path, schema, .truncate, .{});
+    const b = try parseSlice(a, &schema, "1,2.5,ok\n-7,,\n");
+    try w.writeBatch(a, b);
+    try w.close();
+
+    const got = try tmp.dir.readFileAlloc(a, "o.csv", 1 << 16);
+    try std.testing.expectEqualStrings("i,f,s\n1,2.5,ok\n-7,,\n", got);
+}
+
+test "csv writer: a delimiter that collides with a number still round-trips" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // The fast path skips the quote scan because an ordinary delimiter cannot occur
+    // in a number. These two can: `.` inside a float, `-` in front of a negative.
+    // Getting this wrong writes `2.5` as two fields under `delim = '.'` — a silently
+    // corrupt file that still parses.
+    const cases = [_]struct { delim: u8, kinds: [2]types.TypeKind, csv: []const u8, want: []const u8 }{
+        .{ .delim = '.', .kinds = .{ .float, .int }, .csv = "2.5,7\n", .want = "f.i\n\"2.5\".7\n" },
+        .{ .delim = '-', .kinds = .{ .int, .int }, .csv = "-3,7\n", .want = "f-i\n\"-3\"-7\n" },
+    };
+
+    for (cases) |c| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const base = try tmp.dir.realpathAlloc(a, ".");
+        const path = try std.fs.path.join(a, &.{ base, "o.csv" });
+
+        var names = [_][]const u8{ "f", "i" };
+        var kinds = c.kinds;
+        const schema = try typedSchema(a, &names, &kinds);
+        // The input is comma-separated; only the *output* dialect is exotic.
+        var in_names = [_][]const u8{ "f", "i" };
+        const in_schema = try typedSchema(a, &in_names, &kinds);
+        const b = try parseSlice(a, &in_schema, c.csv);
+
+        const w = try CsvWriter.open(a, path, schema, .truncate, .{ .delim = c.delim });
+        try w.writeBatch(a, b);
+        try w.close();
+
+        const got = try tmp.dir.readFileAlloc(a, "o.csv", 1 << 16);
+        try std.testing.expectEqualStrings(c.want, got);
+
+        // And a reader on the same dialect must see two fields, not three — the
+        // quoting has to survive the round trip, or the file is silently corrupt.
+        var rd = CsvSliceReader{
+            .data = got[std.mem.indexOfScalar(u8, got, '\n').? + 1 ..],
+            .schema = &schema,
+            .dialect = .{ .delim = c.delim },
+        };
+        const back = (try rd.next(a)).?;
+        try std.testing.expectEqual(@as(usize, 1), back.len);
+        try std.testing.expectEqual(@as(usize, 2), back.columns.len);
+        try std.testing.expectEqual(@as(i64, 7), back.columns[1].getValue(0).int);
+    }
+}
+
+test "scalarCanNeedQuote: only a delimiter a number could contain forces the scan" {
+    // The ordinary delimiters, where the fast path applies.
+    for ([_]u8{ ',', ';', '\t', '|', '#', '^' }) |d| try std.testing.expect(!scalarCanNeedQuote(d));
+    // Every character a number, decimal, date, time or timestamp rendering can emit.
+    for ([_]u8{ '0', '9', '+', '-', '.', ':', 'e', 'E', ' ', '"', '\n', '\r' }) |d| {
+        try std.testing.expect(scalarCanNeedQuote(d));
+    }
 }
 
 test "scanRecord: a newline inside a quoted field stays in the value" {
