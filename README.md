@@ -98,9 +98,9 @@ million rows into four reported `11 rows/s`.)
   missing credential fails `check`, before a row is read.
 - Execution streams: a map pipeline's memory is bounded by batch size, not file
   size, however large the input. A stage that has to see the whole input first is
-  bounded by its *result* instead — a `GROUP BY` holds one entry per group, and a
+  bounded by its *result* instead — a `GROUP BY` holds one entry per group, a
   join holds its build side, failing fast past 4 GiB (`WITH (max_build = '16GB')`
-  to raise it). Aggregating a high-cardinality key is the case to watch: grouping
+  to raise it), and a window function holds the input it ranks. Aggregating a high-cardinality key is the case to watch: grouping
   2M distinct ids out of a 98 MB CSV peaks around 1.1 GB, and there is no spill to
   disk.
 - `WHERE` against a database table runs in the database. The plan shows what
