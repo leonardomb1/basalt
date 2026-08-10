@@ -715,6 +715,66 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
     }
 }
 
+/// The pipeline shapes a lane path can run, classified once for every source.
+///
+/// Each source's runner switches exhaustively over this, which is the point: a new
+/// shape does not compile until both sources decide what to do with it. A source that
+/// genuinely cannot fan a shape out returns false and falls back to the serial driver —
+/// explicitly, rather than by omission.
+const LaneShape = union(enum) {
+    agg: AggShape,
+    agg_join: AggJoinShape,
+    distinct: DistinctShape,
+    top_n: TopNShape,
+    map: []const ast.Stage,
+    map_join: MapJoinShape,
+};
+
+/// Order matters: `classifyAggPipeline` rejects a pipeline containing a join, so the
+/// join-carrying variant is tried after it, and the map shapes last — a map+join is
+/// only a map+join once nothing above it matched.
+fn classifyLaneShape(stages: []const ast.Stage) ?LaneShape {
+    if (classifyAggPipeline(stages)) |x| return .{ .agg = x };
+    if (classifyAggJoinPipeline(stages)) |x| return .{ .agg_join = x };
+    if (classifyDistinctPipeline(stages)) |x| return .{ .distinct = x };
+    if (classifyTopNPipeline(stages)) |x| return .{ .top_n = x };
+    if (classifyMapPipeline(stages)) |x| return .{ .map = x };
+    if (classifyMapJoinPipeline(stages)) |x| return .{ .map_join = x };
+    return null;
+}
+
+/// Preconditions every lane path shares. A hinted read is left to the paths that
+/// honour the hint, and one stage plus a write is nothing to split.
+fn laneEligible(stages: []const ast.Stage, opts: RunOptions) bool {
+    return opts.threads > 1 and stages.len >= 2 and
+        stages[0].node == .read and stages[0].hints.len == 0;
+}
+
+fn runParquetLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    const rd = stages[0].node.read;
+    const pipe = stages[0 .. stages.len - 1];
+    return switch (shape) {
+        .agg => |x| runParallelParquetAgg(env, rd, pipe, x.prefix, x.ag, x.tail, w, opts, stats, lanes_used),
+        .agg_join => |x| runParallelParquetAggJoin(env, rd, pipe, x, w, opts, stats, lanes_used),
+        .distinct => |x| runParallelParquetDistinct(env, rd, pipe, x.prefix, x.dist, x.tail, w, opts, stats, lanes_used),
+        .top_n => |x| runParallelParquetTopN(env, rd, pipe, x.prefix, x.srt, x.lim, w, opts, stats, lanes_used),
+        .map => |x| runParallelParquetMap(env, rd, pipe, x, w, opts, stats, lanes_used),
+        .map_join => |x| runParallelParquetMapJoin(env, rd, pipe, x, w, opts, stats, lanes_used),
+    };
+}
+
+fn runCsvLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    const rd = stages[0].node.read;
+    return switch (shape) {
+        .agg => |x| runParallelCsvAgg(env, rd, x.prefix, x.ag, x.tail, w, opts, stats, lanes_used),
+        .agg_join => |x| runParallelCsvAggJoin(env, rd, x, w, opts, stats, lanes_used),
+        .distinct => |x| runParallelCsvDistinct(env, rd, x.prefix, x.dist, x.tail, w, opts, stats, lanes_used),
+        .top_n => |x| runParallelCsvTopN(env, rd, x.prefix, x.srt, x.lim, w, opts, stats, lanes_used),
+        .map => |x| runParallelCsvMap(env, rd, x, w, opts, stats, lanes_used),
+        .map_join => |x| runParallelCsvMapJoin(env, rd, x, w, opts, stats, lanes_used),
+    };
+}
+
 /// Run one output pipeline (ending in `write`): build it, then either split it
 /// into parallel key-range lanes or stream it serially into the sink.
 fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) !void {
@@ -784,39 +844,21 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
         return runUnionSplit(env, stages[0].node.union_, stages[0].hints, stages[1 .. stages.len - 1], stages[stages.len - 1], opts, stats, lanes_used, batch_arena);
     }
 
-    if (opts.threads > 1 and stages.len >= 2 and
-        stages[0].node == .read and stages[0].hints.len == 0 and isLocalParquetRead(stages[0].node.read))
-    {
-        if (classifyAggPipeline(stages)) |shape| {
-            if (try runParallelParquetAgg(env, stages[0].node.read, stages[0 .. stages.len - 1], shape.prefix, shape.ag, shape.tail, last.write, opts, stats, lanes_used)) return;
-        } else if (classifyAggJoinPipeline(stages)) |js| {
-            if (try runParallelParquetAggJoin(env, stages[0].node.read, stages[0 .. stages.len - 1], js, last.write, opts, stats, lanes_used)) return;
-        } else if (classifyDistinctPipeline(stages)) |ds| {
-            if (try runParallelParquetDistinct(env, stages[0].node.read, stages[0 .. stages.len - 1], ds.prefix, ds.dist, ds.tail, last.write, opts, stats, lanes_used)) return;
-        } else if (classifyTopNPipeline(stages)) |tn| {
-            if (try runParallelParquetTopN(env, stages[0].node.read, stages[0 .. stages.len - 1], tn.prefix, tn.srt, tn.lim, last.write, opts, stats, lanes_used)) return;
-        } else if (classifyMapPipeline(stages)) |map_stages| {
-            if (try runParallelParquetMap(env, stages[0].node.read, stages[0 .. stages.len - 1], map_stages, last.write, opts, stats, lanes_used)) return;
-        } else if (classifyMapJoinPipeline(stages)) |js| {
-            if (try runParallelParquetMapJoin(env, stages[0].node.read, stages[0 .. stages.len - 1], js, last.write, opts, stats, lanes_used)) return;
-        }
-    }
-
-    if (opts.threads > 1 and stages.len >= 2 and
-        stages[0].node == .read and stages[0].hints.len == 0 and isLocalCsvRead(stages[0].node.read))
-    {
-        if (classifyAggPipeline(stages)) |shape| {
-            if (try runParallelCsvAgg(env, stages[0].node.read, shape.prefix, shape.ag, shape.tail, last.write, opts, stats, lanes_used)) return;
-        } else if (classifyAggJoinPipeline(stages)) |js| {
-            if (try runParallelCsvAggJoin(env, stages[0].node.read, js, last.write, opts, stats, lanes_used)) return;
-        } else if (classifyDistinctPipeline(stages)) |ds| {
-            if (try runParallelCsvDistinct(env, stages[0].node.read, ds.prefix, ds.dist, ds.tail, last.write, opts, stats, lanes_used)) return;
-        } else if (classifyTopNPipeline(stages)) |tn| {
-            if (try runParallelCsvTopN(env, stages[0].node.read, tn.prefix, tn.srt, tn.lim, last.write, opts, stats, lanes_used)) return;
-        } else if (classifyMapPipeline(stages)) |map_stages| {
-            if (try runParallelCsvMap(env, stages[0].node.read, map_stages, last.write, opts, stats, lanes_used)) return;
-        } else if (classifyMapJoinPipeline(stages)) |js| {
-            if (try runParallelCsvMapJoin(env, stages[0].node.read, js, last.write, opts, stats, lanes_used)) return;
+    // One classification, one eligibility check, one switch per source. This used to
+    // be two structurally identical if-else chains — and a shape wired into one chain
+    // and forgotten in the other is exactly how both 0.5.8 lane bugs happened: an
+    // ungrouped aggregate fanned out over CSV and ran serially over parquet, and the
+    // join-kind guard that three map paths applied was missing from the aggregate one.
+    // `runParquetLane`/`runCsvLane` switch exhaustively over `LaneShape`, so adding a
+    // shape is a compile error until both sources handle it.
+    if (laneEligible(stages, opts)) {
+        if (classifyLaneShape(stages)) |shape| {
+            const rd = stages[0].node.read;
+            if (isLocalParquetRead(rd)) {
+                if (try runParquetLane(env, stages, shape, last.write, opts, stats, lanes_used)) return;
+            } else if (isLocalCsvRead(rd)) {
+                if (try runCsvLane(env, stages, shape, last.write, opts, stats, lanes_used)) return;
+            }
         }
     }
 
