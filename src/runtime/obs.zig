@@ -138,9 +138,18 @@ pub const Summary = struct {
     elapsed_ms: u64 = 0,
     threads: usize = 1,
 
+    /// Throughput on rows **processed**, not rows emitted. Dividing the written count
+    /// by the clock described how fast the answer was printed, not how fast the run
+    /// worked: an aggregate folding 6,001,215 rows into 4 reported `11 rows/s`.
+    ///
+    /// `rows_read` is the volume that actually moved through the pipeline, and for a
+    /// straight move it equals `rows_written`, so this only changes the shapes that
+    /// reduce. It falls back to the written count when nothing was read — a sourceless
+    /// run (`FROM BODY`) still has a meaningful rate.
     pub fn rate(self: Summary) u64 {
-        if (self.elapsed_ms == 0) return self.rows_written;
-        return self.rows_written * 1000 / self.elapsed_ms;
+        const rows = if (self.rows_read > 0) self.rows_read else self.rows_written;
+        if (self.elapsed_ms == 0) return rows;
+        return rows * 1000 / self.elapsed_ms;
     }
 
     pub fn renderText(self: Summary, w: anytype) !void {
@@ -238,7 +247,7 @@ test "summary renderJson: one status-ok object with every metric field" {
     const s = Summary{ .run_id = 7, .source = "csv", .sink = "starrocks", .rows_read = 10, .rows_written = 8, .elapsed_ms = 2000 };
     try s.renderJson(&w);
     try std.testing.expectEqualStrings(
-        "{\"status\":\"ok\",\"run_id\":7,\"source\":\"csv\",\"sink\":\"starrocks\",\"rows_read\":10,\"rows_written\":8,\"elapsed_ms\":2000,\"rows_per_sec\":4}\n",
+        "{\"status\":\"ok\",\"run_id\":7,\"source\":\"csv\",\"sink\":\"starrocks\",\"rows_read\":10,\"rows_written\":8,\"elapsed_ms\":2000,\"rows_per_sec\":5}\n",
         w.buffered(),
     );
 }
@@ -248,13 +257,32 @@ test "summary renderText: read≠written shows both; lane count only when parall
     var w = std.Io.Writer.fixed(&buf);
     const s = Summary{ .run_id = 7, .source = "csv", .sink = "starrocks", .rows_read = 10, .rows_written = 8, .elapsed_ms = 2000, .threads = 2 };
     try s.renderText(&w);
-    try std.testing.expectEqualStrings("✓ csv → starrocks  read 10 → wrote 8  (4 rows/s, 2000 ms, 2 lanes)  run=7\n", w.buffered());
+    try std.testing.expectEqualStrings("✓ csv → starrocks  read 10 → wrote 8  (5 rows/s, 2000 ms, 2 lanes)  run=7\n", w.buffered());
 
     var buf2: [256]u8 = undefined;
     var w2 = std.Io.Writer.fixed(&buf2);
     const eq = Summary{ .run_id = 7, .source = "csv", .sink = "csv", .rows_read = 8, .rows_written = 8, .elapsed_ms = 1000 };
     try eq.renderText(&w2);
     try std.testing.expectEqualStrings("✓ csv → csv  wrote 8  (8 rows/s, 1000 ms)  run=7\n", w2.buffered());
+}
+
+test "summary rate: an aggregate reports the rows it processed, not the rows it wrote" {
+    // 6,001,215 rows folded to 4 in 350ms used to read as `11 rows/s` — the speed the
+    // answer was written at. The run's throughput is the volume it moved.
+    const agg = Summary{ .run_id = 1, .rows_read = 6_001_215, .rows_written = 4, .elapsed_ms = 350 };
+    try std.testing.expectEqual(@as(u64, 17_146_328), agg.rate());
+
+    // A straight move reads and writes the same rows, so nothing changes there.
+    const move = Summary{ .run_id = 1, .rows_read = 1000, .rows_written = 1000, .elapsed_ms = 500 };
+    try std.testing.expectEqual(@as(u64, 2000), move.rate());
+
+    // Nothing read (a sourceless run) still reports a rate, from what it wrote.
+    const sourceless = Summary{ .run_id = 1, .rows_read = 0, .rows_written = 50, .elapsed_ms = 100 };
+    try std.testing.expectEqual(@as(u64, 500), sourceless.rate());
+
+    // A sub-millisecond run divides by nothing; report the raw count.
+    const instant = Summary{ .run_id = 1, .rows_read = 42, .rows_written = 1, .elapsed_ms = 0 };
+    try std.testing.expectEqual(@as(u64, 42), instant.rate());
 }
 
 test "logger format: only explicit json is NDJSON; auto resolves to text" {
