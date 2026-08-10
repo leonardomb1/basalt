@@ -5108,6 +5108,21 @@ fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schema) a
                 var arg: ?usize = null;
                 switch (f.kind) {
                     .row_number, .rank, .dense_rank => {},
+                    // COUNT answers an int; SUM keeps its column's family (int stays
+                    // int, anything else widens to float) and is nullable, because a
+                    // peer group of nothing but nulls sums to null.
+                    .count => {
+                        if (f.arg) |q| {
+                            const ai = analyze.fieldIndices(arena, schema, &[_]ast.QualName{q}, &ad) catch |e| return aErr(env, &ad, e);
+                            arg = ai[0];
+                        }
+                    },
+                    .sum => {
+                        const q = f.arg orelse return planErr(env.diag, "SUM over a window needs a column argument");
+                        const ai = analyze.fieldIndices(arena, schema, &[_]ast.QualName{q}, &ad) catch |e| return aErr(env, &ad, e);
+                        arg = ai[0];
+                        ty = (if (schema.fields[ai[0]].ty.kind == .int) types.Type.init(.int) else types.Type.init(.float)).asNullable();
+                    },
                     .lag, .lead => {
                         const q = f.arg orelse return planErr(env.diag, "LAG/LEAD needs a column argument");
                         const ai = analyze.fieldIndices(arena, schema, &[_]ast.QualName{q}, &ad) catch |e| return aErr(env, &ad, e);
@@ -5122,6 +5137,8 @@ fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schema) a
                         .dense_rank => .dense_rank,
                         .lag => .lag,
                         .lead => .lead,
+                        .sum => .sum,
+                        .count => .count,
                     },
                     .arg = arg,
                     .offset = f.offset,
@@ -6213,6 +6230,55 @@ test "window: a lag result feeds an expression through a derived table" {
     );
     defer alloc.free(out);
     try std.testing.expectEqualStrings("k,delta\na,15\nb,2\n", out);
+}
+
+test "window: an aggregate frame is the partition, or the peers so far" {
+    const alloc = std.testing.allocator;
+    var t1 = std.testing.tmpDir(.{});
+    defer t1.cleanup();
+    // No ORDER BY: every row of the partition is a peer, so the frame is the whole
+    // partition — share-of-total.
+    const tot = try runToString(alloc, &t1,
+        "k,v\na,10\na,20\na,20\nb,5\nb,7\n",
+        "SELECT k, v, SUM(v) OVER (PARTITION BY k) AS tot FROM '$IN'",
+    );
+    defer alloc.free(tot);
+    try std.testing.expectEqualStrings("k,v,tot\na,10,50\na,20,50\na,20,50\nb,5,12\nb,7,12\n", tot);
+
+    var t2 = std.testing.tmpDir(.{});
+    defer t2.cleanup();
+    // With ORDER BY it accumulates peer group by peer group, so the two tied 20s BOTH
+    // read 50 rather than 30 and 50. That is standard RANGE framing, and it matches
+    // DuckDB — getting it row-by-row instead would be a subtle wrong answer.
+    const running = try runToString(alloc, &t2,
+        "k,v\na,10\na,20\na,20\nb,5\nb,7\n",
+        "SELECT k, v, SUM(v) OVER (PARTITION BY k ORDER BY v) AS run FROM '$IN'",
+    );
+    defer alloc.free(running);
+    try std.testing.expectEqualStrings("k,v,run\na,10,10\na,20,50\na,20,50\nb,5,5\nb,7,12\n", running);
+}
+
+test "window: COUNT(*) over a partition, and a plain SUM still aggregates" {
+    const alloc = std.testing.allocator;
+    var t1 = std.testing.tmpDir(.{});
+    defer t1.cleanup();
+    const n = try runToString(alloc, &t1,
+        "k,v\na,10\na,20\nb,5\n",
+        "SELECT k, COUNT(*) OVER (PARTITION BY k) AS n FROM '$IN'",
+    );
+    defer alloc.free(n);
+    try std.testing.expectEqualStrings("k,n\na,2\na,2\nb,1\n", n);
+
+    var t2 = std.testing.tmpDir(.{});
+    defer t2.cleanup();
+    // Without OVER, `SUM` is the ordinary aggregate: the item parser rewinds unless it
+    // sees the whole `name ( .. ) OVER` prefix, so these names stay unreserved.
+    const agg = try runToString(alloc, &t2,
+        "k,v\na,10\na,20\nb,5\n",
+        "SELECT k, SUM(v) AS s FROM '$IN' GROUP BY k ORDER BY k",
+    );
+    defer alloc.free(agg);
+    try std.testing.expectEqualStrings("k,s\na,30\nb,5\n", agg);
 }
 
 test "window: a column named `rank` is still a column" {

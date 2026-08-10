@@ -1730,6 +1730,8 @@ pub const Parser = struct {
             if (std.mem.eql(u8, low, "dense_rank")) break :blk .dense_rank;
             if (std.mem.eql(u8, low, "lag")) break :blk .lag;
             if (std.mem.eql(u8, low, "lead")) break :blk .lead;
+            if (std.mem.eql(u8, low, "sum")) break :blk .sum;
+            if (std.mem.eql(u8, low, "count")) break :blk .count;
             return false;
         };
         // Only commit once the whole `name ( ) OVER` prefix is present, so a column
@@ -1740,7 +1742,21 @@ pub const Parser = struct {
         _ = self.advance();
         var arg: ?ast.QualName = null;
         var offset: i64 = 1;
-        if (kind == .lag or kind == .lead) {
+        if (kind == .sum or kind == .count) {
+            // `COUNT(*)` counts rows; anything else needs a column. Rewind rather than
+            // fail, so a plain `SUM(x)` with no OVER is still an ordinary aggregate.
+            if (self.eat(.star)) {
+                if (kind == .sum) {
+                    self.i = save;
+                    return false;
+                }
+            } else if (self.at(.ident)) {
+                arg = try self.singleName(self.advance().text);
+            } else {
+                self.i = save;
+                return false;
+            }
+        } else if (kind == .lag or kind == .lead) {
             if (!self.at(.ident)) {
                 self.i = save;
                 return false;
@@ -1788,7 +1804,9 @@ pub const Parser = struct {
         _ = try self.expect(.rparen);
         if (funcs.items.len > 0 and (saw_part or saw_ord))
             return self.fail(wpos, "two window functions in one SELECT must share the same OVER (...) window", .{});
-        if (ord.items.len == 0)
+        // Ranking and the offsets need an order to count along. An aggregate does not:
+        // with no ORDER BY its frame is the whole partition, which is share-of-total.
+        if (ord.items.len == 0 and kind != .sum and kind != .count)
             return self.fail(wpos, "a window function needs ORDER BY inside OVER (...) to number by", .{});
 
         _ = self.eatKw("as");

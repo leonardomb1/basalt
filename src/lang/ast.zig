@@ -290,7 +290,7 @@ pub const Stage = struct {
 /// within each `partition_by` group in `order_by` order, and append them as columns.
 /// It is a breaker — the whole partition has to be present before a row's number is
 /// known — so memory is bounded by the largest partition rather than by batch size.
-pub const WinKind = enum { row_number, rank, dense_rank, lag, lead };
+pub const WinKind = enum { row_number, rank, dense_rank, lag, lead, sum, count };
 /// `arg` is the column `LAG`/`LEAD` reads and `offset` how many rows back or forward;
 /// the ranking functions take neither.
 pub const WindowFunc = struct { kind: WinKind, out: []const u8, arg: ?QualName = null, offset: i64 = 1 };

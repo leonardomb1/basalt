@@ -413,8 +413,8 @@ join.
 
 ### Window functions
 
-`ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, and `LAG(col[, n])` / `LEAD(col[, n])` over
-`PARTITION BY` / `ORDER BY`:
+`ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG(col[, n])` / `LEAD(col[, n])`, and
+`SUM(col)` / `COUNT(*|col)` over `PARTITION BY` / `ORDER BY`:
 
 ```sql
 SELECT conta, data, valor,
@@ -422,8 +422,14 @@ SELECT conta, data, valor,
 FROM 'movimentos.csv';
 ```
 
-- `ORDER BY` inside `OVER (...)` is required — it is what the numbering is by.
-  `PARTITION BY` is optional; without it the whole input is one partition.
+- `ORDER BY` inside `OVER (...)` is required for the ranking and offset functions — it
+  is what the numbering is by. An aggregate does not need it: **without `ORDER BY` its
+  frame is the whole partition** (share-of-total), and **with it the frame is everything
+  up to and including the current row's peers** (a running total). Those are the two
+  frames standard SQL defaults to, so no frame syntax is needed to reach either.
+- Ties share a running total: two rows with equal `ORDER BY` values both read the total
+  *including both*, which is what `RANGE` framing specifies.
+- `PARTITION BY` is optional; without it the whole input is one partition.
 - A window function must be the **whole** select item: `ROW_NUMBER() OVER (...) + 1` is
   not accepted, because a window is a stage rather than an expression.
 - Its column is **appended** to the projection, so every partition and order column has

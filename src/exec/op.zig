@@ -251,6 +251,23 @@ pub const Explode = struct {
 /// One sort over (partition keys ++ order keys) does all the work: rows of a partition
 /// land together and in order, so a single pass numbers them, resetting at each
 /// boundary. Nulls in a partition key group together, matching `GROUP BY`.
+/// A window `SUM` accepts anything the engine can read as a number; kinds that are not
+/// numeric contribute nothing rather than erroring, matching how `SUM` ignores nulls.
+fn asF64Opt(v: Value) ?f64 {
+    return switch (v) {
+        .int => |x| @floatFromInt(x),
+        .float => |x| x,
+        .decimal => |d| blk: {
+            var scale: f64 = 1;
+            var i: u8 = 0;
+            while (i < d.scale) : (i += 1) scale *= 10;
+            break :blk @as(f64, @floatFromInt(d.unscaled)) / scale;
+        },
+        .bool => |b| if (b) 1 else 0,
+        else => null,
+    };
+}
+
 pub const Window = struct {
     stats: Stats = .{},
     child: Op,
@@ -261,7 +278,7 @@ pub const Window = struct {
     funcs: []const Func,
     done: bool = false,
 
-    pub const Kind = enum { row_number, rank, dense_rank, lag, lead };
+    pub const Kind = enum { row_number, rank, dense_rank, lag, lead, sum, count };
     /// `arg` is the input column `lag`/`lead` reads; the ranking kinds leave it null.
     pub const Func = struct { kind: Kind, arg: ?usize = null, offset: i64 = 1 };
 
@@ -311,44 +328,121 @@ pub const Window = struct {
         for (builders[0..ncols], self.in_schema.fields) |*bd, f| bd.* = try column.Builder.initCapacity(arena, f.ty, all.len);
         for (builders[ncols..], self.out_schema.fields[ncols..]) |*bd, f| bd.* = try column.Builder.initCapacity(arena, f.ty, all.len);
 
-        // RANK is 1 + the number of rows strictly before this one in the partition, so
-        // a tie holds the rank and the next distinct value jumps to the row number.
-        // DENSE_RANK counts distinct values instead and never leaves a gap.
-        var rn: i64 = 0;
-        var rk: i64 = 0;
-        var dr: i64 = 0;
-        for (idx, 0..) |row, k| {
-            if (k == 0 or !sameOn(parts, idx[k - 1], row)) {
-                rn = 1;
-                rk = 1;
-                dr = 1;
-            } else {
-                rn += 1;
-                if (!sameOn(ords, idx[k - 1], row)) {
-                    rk = rn;
-                    dr += 1;
-                }
-            }
-            for (builders[0..ncols], all.columns) |*bd, *col| try bd.append(col.getValue(row));
-            for (builders[ncols..], self.funcs) |*bd, f| switch (f.kind) {
-                .row_number => try bd.append(.{ .int = rn }),
-                .rank => try bd.append(.{ .int = rk }),
-                .dense_rank => try bd.append(.{ .int = dr }),
-                // Offsets are resolved against the sorted order and clipped to this
-                // row's partition; falling outside it yields null, as SQL does with no
-                // default argument.
-                .lag, .lead => {
-                    const off: i64 = if (f.kind == .lag) -f.offset else f.offset;
-                    const target = @as(i64, @intCast(k)) + off;
-                    const lo = @as(i64, @intCast(pstart[k]));
-                    const hi = @as(i64, @intCast(pend[k]));
-                    if (target < lo or target >= hi) {
-                        try bd.append(.null);
-                    } else {
-                        try bd.append(all.columns[f.arg.?].getValue(idx[@intCast(target)]));
+        // Every function is resolved into a column of values indexed by sorted
+        // position, then emitted in one pass. Ranking needs a running counter, the
+        // offsets need partition bounds, and the aggregates need their peer group's
+        // total before any of its rows can be written — one shape that serves all three.
+        const vals = try arena.alloc([]Value, self.funcs.len);
+        for (self.funcs, vals) |f, *out| {
+            out.* = try arena.alloc(Value, all.len);
+            switch (f.kind) {
+                .row_number, .rank, .dense_rank => {
+                    var rn: i64 = 0;
+                    var rk: i64 = 0;
+                    var dr: i64 = 0;
+                    for (idx, 0..) |row, k| {
+                        if (k == 0 or !sameOn(parts, idx[k - 1], row)) {
+                            rn = 1;
+                            rk = 1;
+                            dr = 1;
+                        } else {
+                            rn += 1;
+                            // RANK is 1 + the rows strictly before, so a tie holds and
+                            // the next distinct value jumps to the row number.
+                            // DENSE_RANK counts distinct values and leaves no gap.
+                            if (!sameOn(ords, idx[k - 1], row)) {
+                                rk = rn;
+                                dr += 1;
+                            }
+                        }
+                        out.*[k] = .{ .int = switch (f.kind) {
+                            .row_number => rn,
+                            .rank => rk,
+                            else => dr,
+                        } };
                     }
                 },
-            };
+                .lag, .lead => {
+                    const dir: i64 = if (f.kind == .lag) -f.offset else f.offset;
+                    for (idx, 0..) |_, k| {
+                        const target = @as(i64, @intCast(k)) + dir;
+                        if (target < @as(i64, @intCast(pstart[k])) or target >= @as(i64, @intCast(pend[k]))) {
+                            out.*[k] = .null;
+                        } else {
+                            out.*[k] = all.columns[f.arg.?].getValue(idx[@intCast(target)]);
+                        }
+                    }
+                },
+                // The default frame: with no ORDER BY every row of the partition is a
+                // peer, so this yields the partition total on every row; with one, it
+                // accumulates peer group by peer group, which is a running total that
+                // ties share. Both are what standard RANGE framing specifies, and both
+                // fall out of the same loop.
+                .sum, .count => {
+                    var i: usize = 0;
+                    while (i < idx.len) {
+                        const stop = pend[i];
+                        var acc_i: i64 = 0;
+                        var acc_f: f64 = 0;
+                        var n: i64 = 0;
+                        var seen_float = false;
+                        var g = i;
+                        while (g < stop) {
+                            var e = g + 1;
+                            while (e < stop and sameOn(ords, idx[e - 1], idx[e])) e += 1;
+                            var m = g;
+                            while (m < e) : (m += 1) {
+                                if (f.arg) |ai| {
+                                    switch (all.columns[ai].getValue(idx[m])) {
+                                        .null => {},
+                                        .int => |x| {
+                                            acc_i += x;
+                                            acc_f += @floatFromInt(x);
+                                            n += 1;
+                                        },
+                                        .float => |x| {
+                                            acc_f += x;
+                                            seen_float = true;
+                                            n += 1;
+                                        },
+                                        else => |v| {
+                                            if (asF64Opt(v)) |x| {
+                                                acc_f += x;
+                                                seen_float = true;
+                                                n += 1;
+                                            }
+                                        },
+                                    }
+                                } else {
+                                    // COUNT(*) counts rows, nulls included.
+                                    n += 1;
+                                }
+                            }
+                            var k = g;
+                            while (k < e) : (k += 1) {
+                                out.*[k] = if (f.kind == .count)
+                                    .{ .int = n }
+                                else if (n == 0)
+                                    // Every row is its own peer, so a null here means
+                                    // every value in the group was null — SQL's SUM
+                                    // answers null for that, not zero.
+                                    .null
+                                else if (seen_float)
+                                    .{ .float = acc_f }
+                                else
+                                    .{ .int = acc_i };
+                            }
+                            g = e;
+                        }
+                        i = stop;
+                    }
+                },
+            }
+        }
+
+        for (idx, 0..) |row, k| {
+            for (builders[0..ncols], all.columns) |*bd, *col| try bd.append(col.getValue(row));
+            for (builders[ncols..], vals) |*bd, v| try bd.append(v[k]);
         }
 
         const cols = try arena.alloc(column.Column, builders.len);
