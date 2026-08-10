@@ -411,6 +411,37 @@ run fails fast instead of eating the host — raise the ceiling per join with
 `WITH (max_build = '16GB')` on the join clause, filter the CTE, or flip the
 join.
 
+### Subqueries in a predicate
+
+There is no `IN (SELECT ...)`, `EXISTS` or scalar-subquery syntax. Each has a direct
+spelling as a join against an inline subquery, which is what the engine would rewrite
+them to anyway:
+
+```sql
+-- x IN (SELECT k FROM t)
+SELECT s.* FROM 'facts.csv' s SEMI JOIN (SELECT k FROM 't.csv') d ON s.x = d.k;
+
+-- x NOT IN (SELECT k FROM t)   -- see the null caveat below
+SELECT s.* FROM 'facts.csv' s ANTI JOIN (SELECT k FROM 't.csv') d ON s.x = d.k;
+
+-- x > (SELECT avg(y) FROM t)   -- a one-row right side broadcasts
+SELECT s.* FROM 'facts.csv' s
+CROSS JOIN (SELECT AVG(y) AS lim FROM 't.csv') a
+WHERE s.x > a.lim;
+```
+
+**The `ANTI JOIN` form is not identical to `NOT IN`.** Standard `NOT IN` yields NULL —
+so no rows at all — when the subquery produces a single NULL, because `x <> NULL` is
+unknown. An anti-join instead keeps rows that match no *non-null* key. Where the
+subquery column is nullable and that distinction matters, filter the nulls out of the
+subquery (`WHERE k IS NOT NULL`) and decide deliberately which answer you want. This
+is the reason the `NOT IN` spelling is absent rather than rewritten for you.
+
+A **correlated** subquery — one referencing a column of the outer query — has no
+equivalent here and is not planned: it needs either decorrelation in an optimiser or
+per-row execution of the inner query, and the second is fatal for a streaming engine.
+Rewrite it as a join.
+
 Table aliases (`FROM t a`, `JOIN c b`) are stripped at parse time — the engine
 sees bare column names.
 
