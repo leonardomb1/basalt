@@ -5947,6 +5947,52 @@ test "EXPLAIN mid-script explains that query without running it" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.access("never.csv", .{}));
 }
 
+test "derived table: a subquery in FROM is an anonymous CTE" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // `FROM (SELECT ...) x` lowers to the binding `WITH x AS (...)` would produce, so
+    // it needs no execution machinery — only a name. Every TPC-DS query that reads a
+    // derived table needed hand-rewriting into a CTE before this.
+    const out = try runToString(alloc, &tmp,
+        "id,status,amount\n1,paid,100\n2,pending,50\n3,paid,200\n",
+        "SELECT id, amount FROM (SELECT id, amount FROM '$IN' WHERE status = 'paid') x",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id,amount\n1,100\n3,200\n", out);
+}
+
+test "derived table: nested, and beside a WITH binding" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The inner query's own bindings used to be drained into the very list the outer
+    // parse was collecting into, which cleared it: this failed with "unknown binding
+    // `a`". A `WITH` inside a derived table hits the same path.
+    const out = try runToString(alloc, &tmp,
+        "id,amount\n1,100\n2,50\n",
+        "SELECT id FROM (WITH w AS (SELECT id FROM '$IN') SELECT id FROM (SELECT id FROM w) a) b ORDER BY id",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id\n1\n2\n", out);
+}
+
+test "derived table: a join right side may be a subquery" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A join's right side is named by binding anyway, so an inline subquery there is
+    // the same lowering. Both positions in one query, to prove they do not clobber
+    // each other's bindings.
+    const out = try runToString(alloc, &tmp,
+        "id,status,amount\n1,paid,100\n2,pending,50\n3,paid,200\n",
+        "SELECT x.id, x.amount FROM (SELECT id, amount FROM '$IN') x " ++
+            "JOIN (SELECT id AS pid FROM '$IN' WHERE status = 'paid') p ON x.id = p.pid ORDER BY x.id",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id,amount\n1,100\n3,200\n", out);
+}
+
 test "CSV -> filter/select -> CSV round-trips" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

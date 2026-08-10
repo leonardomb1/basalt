@@ -178,6 +178,13 @@ pub const Parser = struct {
     /// the only way to tell a script constant from a column at parse time — which
     /// `constItemExpr` needs to allow one beside an aggregate.
     const_names: std.array_list.Managed([]const u8) = undefined,
+    /// Bindings created by a derived table — `FROM (SELECT ...) x`. A derived table is
+    /// an anonymous CTE, so it lowers to exactly what `WITH x AS (...)` produces; but
+    /// it is discovered deep inside `parseSelectCore`, which has no statement list to
+    /// append to. `parseQuery` drains this.
+    pending_bindings: std.array_list.Managed(ast.Stmt) = undefined,
+    /// Counter for naming derived tables that carry no alias.
+    derived_n: usize = 0,
 
     fn cur(self: *Parser) Token {
         return self.toks[self.i];
@@ -305,6 +312,7 @@ pub const Parser = struct {
     pub fn parseProgram(self: *Parser) Error!ast.Program {
         self.conn_names = std.array_list.Managed([]const u8).init(self.arena);
         self.let_names = std.array_list.Managed([]const u8).init(self.arena);
+        self.pending_bindings = std.array_list.Managed(ast.Stmt).init(self.arena);
         self.const_names = std.array_list.Managed([]const u8).init(self.arena);
 
         // A script that *opens* with EXPLAIN explains the whole script, offline and
@@ -1002,6 +1010,12 @@ pub const Parser = struct {
                 if (!self.eat(.comma)) break;
             }
         }
+        // A derived table anywhere below appends its binding to `pending_bindings`;
+        // move them into the program before the statement that references them.
+        defer if (self.pending_bindings.items.len > 0) {
+            out.appendSlice(self.pending_bindings.items) catch {};
+            self.pending_bindings.clearRetainingCapacity();
+        };
 
         const first = try self.parseSelectCore();
 
@@ -1272,7 +1286,9 @@ pub const Parser = struct {
                 });
                 continue;
             }
-            const binding = try self.expectIdent();
+            // `JOIN (SELECT ...) x ON ...` — the same lowering as a FROM-position
+            // derived table, since a join's right side is named by binding anyway.
+            const binding = if (self.at(.lparen)) try self.parseDerivedTable() else try self.expectIdent();
             if (!self.isLet(binding))
                 return self.fail(jpos, "JOIN right side `{s}` must be a WITH-defined CTE", .{binding});
             var jalias: ?[]const u8 = null;
@@ -1604,9 +1620,54 @@ pub const Parser = struct {
     /// A FROM source: CSV path, IDENTIFIER(<expr>) for a computed path,
     /// BODY(schema), HTTP('url'), a CTE reference, or a connection-qualified
     /// table / QUERY($$...$$). Registers the alias.
+    /// `( <query> ) [AS] alias` in a FROM or JOIN position. Lowers to a binding — the
+    /// same statement `WITH alias AS (...)` produces — and returns its name, so the
+    /// caller can reference it as a `.ref` source or as a join's right side. No new
+    /// execution machinery: a derived table *is* a CTE that happened to be written
+    /// inline. An unaliased one gets a generated name that no identifier can collide
+    /// with.
+    fn parseDerivedTable(self: *Parser) Error![]const u8 {
+        const dpos = self.curPos();
+        _ = try self.expect(.lparen);
+        var sub_stages = std.array_list.Managed(ast.Stage).init(self.arena);
+        // Bindings the inner query creates — its own `WITH`, or a derived table nested
+        // inside it — go to a local list, NOT straight to `pending_bindings`. Handing
+        // `parseQuery` the same list it drains into made it append that list to itself
+        // and clear it, losing every binding recorded so far: `FROM (SELECT .. FROM
+        // (SELECT ..) a) b` failed with "unknown binding `a`".
+        var inner_bindings = std.array_list.Managed(ast.Stmt).init(self.arena);
+        try self.parseQuery(&inner_bindings, &sub_stages);
+        _ = try self.expect(.rparen);
+
+        _ = self.eatKw("as");
+        var name: []const u8 = undefined;
+        if (self.at(.ident) and !self.isKw("on") and !self.isKw("join") and !self.isKw("where") and
+            !self.isKw("group") and !self.isKw("order") and !self.isKw("limit") and !self.isKw("having"))
+        {
+            name = self.advance().text;
+        } else {
+            self.derived_n += 1;
+            name = try std.fmt.allocPrint(self.arena, "__derived{d}", .{self.derived_n});
+        }
+
+        try self.let_names.append(name);
+        // Inner bindings first: they are what this one reads from.
+        try self.pending_bindings.appendSlice(inner_bindings.items);
+        try self.pending_bindings.append(.{ .binding = .{
+            .name = name,
+            .pipeline = .{ .stages = try sub_stages.toOwnedSlice(), .pos = dpos },
+            .pos = dpos,
+        } });
+        return name;
+    }
+
     fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array_list.Managed(ast.Hint)) Error!ast.Stage.Node {
         var node: ast.Stage.Node = undefined;
-        if (self.at(.string)) {
+        if (self.at(.lparen)) {
+            const name = try self.parseDerivedTable();
+            aliases.add(name);
+            return .{ .ref = name };
+        } else if (self.at(.string)) {
             node = .{ .read = .{ .connector = "csv", .form = .{ .path = self.advance().text } } };
         } else if (self.isKw("identifier") and self.peekTag() == .lparen) {
             const pos = self.curPos();

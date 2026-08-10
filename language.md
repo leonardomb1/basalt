@@ -470,6 +470,9 @@ SELECT DATE_TRUNC('minute', EventTime) AS m, COUNT(*) AS c FROM hits
 GROUP BY DATE_TRUNC('minute', EventTime);          -- binds to m
 ```
 
+- **A subquery in `FROM` is a derived table** — `FROM (SELECT ...) x` — and works in a
+  join's right side too: `JOIN (SELECT ...) y ON ...`. It lowers to exactly what
+  `WITH x AS (...)` produces, so it costs nothing extra to run; the alias is optional.
 - **Column order is the `SELECT` list's**, not the aggregate's. `SELECT k, SUM(x), k2`
   writes `k, sum, k2`; the engine folds grouping keys before aggregates internally and
   reorders the projection back on the way out. (Before 0.5.8 that query wrote
