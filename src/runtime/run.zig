@@ -590,6 +590,15 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
 
     env.script_scope = try buildScriptScope(arena, &params);
 
+    // CTE bodies are registered by the pre-pass above, before script scope exists,
+    // so a dynamic path inside one (`IDENTIFIER($data || '/t.parquet')`) would reach
+    // the reader as a literal `${data}`. Render every binding with the same scope its
+    // sibling `.output` statements get at the loop below.
+    if (env.script_scope.names.len != 0) {
+        var bit = bindings.iterator();
+        while (bit.next()) |kv| kv.value_ptr.* = try renderScriptScope(&env, kv.value_ptr.*);
+    }
+
     var stats = Stats{ .run_id = run_id };
     var lanes_used: usize = 1;
     for (program.stmts[1..]) |s| switch (s) {
@@ -697,7 +706,7 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
         .print => |p| try runPrint(env, p, no_loop_vars),
         .call => |c| try runCall(env, c, no_loop_vars, opts, stats, lanes_used, batch_arena),
         .throw => |t| try runThrow(env, t, no_loop_vars),
-        .binding => |b| try env.bindings.put(b.name, b.pipeline),
+        .binding => |b| try env.bindings.put(b.name, try renderScriptScope(env, b.pipeline)),
         .connection => |c| try env.connections.put(c.name, c),
         // A LET is folded once, before anything runs; one nested in a branch would
         // silently miss that pass, so say so instead of resolving to nothing.
@@ -6309,6 +6318,33 @@ test "IDENTIFIER path: a PARAM resolves outside any FOR EACH" {
     const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
     defer alloc.free(out);
     try std.testing.expectEqualStrings("id\n1\n2\n", out);
+}
+
+test "IDENTIFIER path: a PARAM resolves inside a CTE body" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n3\n4\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    // CTE bodies are registered by a pre-pass that runs before script scope is
+    // built, so this used to open the literal path `<dir>/${name}.csv` even though
+    // the identical read in a top-level FROM resolved (the test above). Found by
+    // the TPC-H harness, where three of five queries put a dimension in a CTE.
+    const script = try std.fmt.allocPrint(alloc,
+        "PARAM dir STRING DEFAULT '{s}';\nPARAM name STRING DEFAULT 'in';\n" ++
+            "LOAD INTO '{s}' AS WITH src AS (SELECT id FROM IDENTIFIER($dir || '/' || $name || '.csv'))\n" ++
+            "SELECT id FROM src;",
+        .{ base, out_path },
+    );
+    defer alloc.free(script);
+
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id\n3\n4\n", out);
 }
 
 test "IDENTIFIER path: a LET resolves, and an expression hole sees script scope" {
