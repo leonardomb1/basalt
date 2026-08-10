@@ -46,4 +46,21 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench);
     const bench_step = b.step("bench", "Run SIMD microbenchmarks (ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
+
+    // End-to-end harness: times the installed CLI on committed scripts, so it needs
+    // the binary built first. Build with -Doptimize=ReleaseFast or the numbers are
+    // meaningless.
+    const bench_e2e = b.addExecutable(.{
+        .name = "bench-e2e",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_e2e.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const run_bench_e2e = b.addRunArtifact(bench_e2e);
+    run_bench_e2e.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_bench_e2e.addArgs(args);
+    const bench_e2e_step = b.step("bench-e2e", "Run end-to-end query + movement benchmarks");
+    bench_e2e_step.dependOn(&run_bench_e2e.step);
 }
