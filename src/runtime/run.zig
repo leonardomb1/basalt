@@ -5165,6 +5165,7 @@ fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schema) a
                 .part = pk,
                 .ord = ok,
                 .funcs = kinds,
+                .frame = .{ .rows = wd.frame.rows, .unbounded = wd.frame.unbounded, .preceding = wd.frame.preceding },
             };
             return .{ .op = .{ .window = o }, .schema = out };
         },
@@ -6332,6 +6333,43 @@ test "window: two different windows in one SELECT are refused" {
     defer parena.deinit();
     var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     try std.testing.expectError(error.ParseFailed, parser.parseSource(parena.allocator(), script, &pdiag));
+}
+
+test "window: a ROWS frame counts rows where the default counts peers" {
+    const alloc = std.testing.allocator;
+    var t1 = std.testing.tmpDir(.{});
+    defer t1.cleanup();
+    // The whole reason ROWS exists. Same query but for the frame: under ROWS the two
+    // tied 20s read 30 and 50, under the RANGE default they both read 50. Both match
+    // DuckDB; picking one behaviour for both spellings would be a silent wrong answer.
+    const rows = try runToString(alloc, &t1,
+        "v\n10\n20\n20\n30\n",
+        "SELECT v, SUM(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS run FROM '$IN'",
+    );
+    defer alloc.free(rows);
+    try std.testing.expectEqualStrings("v,run\n10,10\n20,30\n20,50\n30,80\n", rows);
+
+    var t2 = std.testing.tmpDir(.{});
+    defer t2.cleanup();
+    const range = try runToString(alloc, &t2,
+        "v\n10\n20\n20\n30\n",
+        "SELECT v, SUM(v) OVER (ORDER BY v) AS run FROM '$IN'",
+    );
+    defer alloc.free(range);
+    try std.testing.expectEqualStrings("v,run\n10,10\n20,50\n20,50\n30,80\n", range);
+}
+
+test "window: a bounded ROWS frame is a moving window" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A moving average over two rows, clipped at the partition's first row.
+    const out = try runToString(alloc, &tmp,
+        "v\n10\n20\n20\n30\n",
+        "SELECT v, AVG(v) OVER (ORDER BY v ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS ma FROM '$IN'",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("v,ma\n10,10\n20,15\n20,20\n30,25\n", out);
 }
 
 test "window: a column named `rank` is still a column" {

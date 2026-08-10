@@ -276,7 +276,12 @@ pub const Window = struct {
     part: []const Sort.Key,
     ord: []const Sort.Key,
     funcs: []const Func,
+    frame: Frame = .{},
     done: bool = false,
+
+    /// A row-counted frame, `[current - preceding, current]`, clipped to the partition.
+    /// `rows` false selects the peer-based default instead.
+    pub const Frame = struct { rows: bool = false, unbounded: bool = false, preceding: i64 = 0 };
 
     pub const Kind = enum { row_number, rank, dense_rank, lag, lead, sum, count, min, max, avg };
     /// `arg` is the input column `lag`/`lead` reads; the ranking kinds leave it null.
@@ -378,7 +383,50 @@ pub const Window = struct {
                 // accumulates peer group by peer group, which is a running total that
                 // ties share. Both are what standard RANGE framing specifies, and both
                 // fall out of the same loop.
-                .sum, .count, .min, .max, .avg => {
+                .sum, .count, .min, .max, .avg => if (self.frame.rows) {
+                    // A ROWS frame is a window over positions, so each row gets its own
+                    // range and ties do NOT share a value — the difference from the
+                    // peer-based default, and the reason a moving average needs ROWS.
+                    for (idx, 0..) |_, k| {
+                        const lo = if (self.frame.unbounded)
+                            pstart[k]
+                        else blk: {
+                            const back = @as(i64, @intCast(k)) - self.frame.preceding;
+                            const floor = @as(i64, @intCast(pstart[k]));
+                            break :blk @as(usize, @intCast(@max(back, floor)));
+                        };
+                        var acc_i: i64 = 0;
+                        var acc_f: f64 = 0;
+                        var n: i64 = 0;
+                        var seen_float = false;
+                        var ext: Value = .null;
+                        var m = lo;
+                        while (m <= k) : (m += 1) {
+                            if (f.arg) |ai| {
+                                const v = all.columns[ai].getValue(idx[m]);
+                                if (v.isNull()) continue;
+                                n += 1;
+                                if (ext.isNull() or (if (f.kind == .max) lessV(ext, v) else lessV(v, ext))) ext = v;
+                                switch (v) {
+                                    .int => |x| {
+                                        acc_i += x;
+                                        acc_f += @floatFromInt(x);
+                                    },
+                                    else => if (asF64Opt(v)) |x| {
+                                        acc_f += x;
+                                        seen_float = true;
+                                    },
+                                }
+                            } else n += 1;
+                        }
+                        out.*[k] = switch (f.kind) {
+                            .count => .{ .int = n },
+                            .min, .max => ext,
+                            .avg => if (n == 0) .null else .{ .float = acc_f / @as(f64, @floatFromInt(n)) },
+                            else => if (n == 0) .null else if (seen_float) .{ .float = acc_f } else .{ .int = acc_i },
+                        };
+                    }
+                } else {
                     var i: usize = 0;
                     while (i < idx.len) {
                         const stop = pend[i];

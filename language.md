@@ -442,8 +442,22 @@ FROM 'movimentos.csv';
 - `MIN`/`MAX` answer a value from the column and keep its type; `AVG` is always a float;
   all of them are nullable, since a peer group of nothing but nulls has no answer.
 - The names are not reserved: a column called `rank` still reads as a column.
-- No frame syntax (`ROWS BETWEEN ...`). A frame only means something to an aggregate
-  over a window, and these functions do not take one.
+- `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` and
+  `ROWS BETWEEN <n> PRECEDING AND CURRENT ROW` set an explicit frame, which counts
+  **rows** rather than peers. That is the difference worth knowing:
+
+  ```sql
+  -- ties do NOT share: 10, 30, 50 over v = 10, 20, 20
+  SUM(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+  -- ties DO share (the default): 10, 50, 50
+  SUM(v) OVER (ORDER BY v)
+  ```
+
+  A bounded frame is a moving window — `AVG(v) OVER (ORDER BY t ROWS BETWEEN 2 PRECEDING
+  AND CURRENT ROW)` is a three-row moving average, clipped at the partition's start. A
+  `FOLLOWING` end bound is not accepted; the frame always ends at the current row.
+- A frame applies to an aggregate. `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG` and `LEAD`
+  do not take one, and writing one is an error rather than being ignored.
 - `LAG`/`LEAD` read a plain column and an optional literal offset (default 1). Looking
   past the edge of the row's own partition yields **null** — there is no third
   `default` argument — so the column is always nullable.

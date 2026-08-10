@@ -1165,12 +1165,13 @@ pub const Parser = struct {
         var win_funcs = std.array_list.Managed(ast.WindowFunc).init(self.arena);
         var win_part = std.array_list.Managed(ast.QualName).init(self.arena);
         var win_ord = std.array_list.Managed(ast.SortKey).init(self.arena);
+        var win_frame: ast.WinFrame = .{};
         while (true) {
             // `ROW_NUMBER() OVER (PARTITION BY .. ORDER BY ..)` is recognised as a whole
             // select item, before the expression parser sees it: a window function is a
             // stage, not an expression, and lifting one out of the middle of an
             // arithmetic expression would need the machinery `IN (SELECT ...)` needs.
-            if (try self.parseWindowItem(&win_funcs, &win_part, &win_ord)) {
+            if (try self.parseWindowItem(&win_funcs, &win_part, &win_ord, &win_frame)) {
                 if (!self.eat(.comma)) break;
                 continue;
             }
@@ -1579,6 +1580,7 @@ pub const Parser = struct {
                 .funcs = try win_funcs.toOwnedSlice(),
                 .partition_by = try win_part.toOwnedSlice(),
                 .order_by = try win_ord.toOwnedSlice(),
+                .frame = win_frame,
             } }, .hints = &.{}, .pos = pos });
         }
 
@@ -1718,6 +1720,7 @@ pub const Parser = struct {
         funcs: *std.array_list.Managed(ast.WindowFunc),
         part: *std.array_list.Managed(ast.QualName),
         ord: *std.array_list.Managed(ast.SortKey),
+        frame: *ast.WinFrame,
     ) Error!bool {
         if (!self.at(.ident)) return false;
         const kind: ast.WinKind = blk: {
@@ -1807,11 +1810,38 @@ pub const Parser = struct {
                 if (!self.eat(.comma)) break;
             }
         }
+        // `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, or `<n> PRECEDING`. The
+        // end bound is always CURRENT ROW in this form; a FOLLOWING bound would need the
+        // frame to look ahead and is not accepted yet.
+        var this_frame: ast.WinFrame = .{};
+        if (self.eatKw("rows")) {
+            const fpos = self.curPos();
+            switch (kind) {
+                .sum, .count, .min, .max, .avg => {},
+                else => return self.fail(fpos, "a frame applies to an aggregate over a window; ROW_NUMBER, RANK, DENSE_RANK, LAG and LEAD do not take one", .{}),
+            }
+            try self.expectKw("between");
+            if (self.eatKw("unbounded")) {
+                try self.expectKw("preceding");
+                this_frame = .{ .rows = true, .unbounded = true };
+            } else {
+                const n = try self.expect(.int);
+                try self.expectKw("preceding");
+                const p2 = std.fmt.parseInt(i64, n.text, 10) catch
+                    return self.fail(fpos, "a frame's PRECEDING count must be an integer", .{});
+                if (p2 < 0) return self.fail(fpos, "a frame's PRECEDING count must not be negative", .{});
+                this_frame = .{ .rows = true, .preceding = p2 };
+            }
+            try self.expectKw("and");
+            try self.expectKw("current");
+            try self.expectKw("row");
+        }
         _ = try self.expect(.rparen);
 
         if (funcs.items.len == 0) {
             try part.appendSlice(this_part.items);
             try ord.appendSlice(this_ord.items);
+            frame.* = this_frame;
         } else {
             var same = this_part.items.len == part.items.len and this_ord.items.len == ord.items.len;
             if (same) {

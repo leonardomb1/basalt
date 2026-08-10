@@ -294,8 +294,15 @@ pub const WinKind = enum { row_number, rank, dense_rank, lag, lead, sum, count, 
 /// `arg` is the column `LAG`/`LEAD` reads and `offset` how many rows back or forward;
 /// the ranking functions take neither.
 pub const WindowFunc = struct { kind: WinKind, out: []const u8, arg: ?QualName = null, offset: i64 = 1 };
+/// An explicit `ROWS BETWEEN <start> AND CURRENT ROW` frame. `rows` false means no
+/// explicit frame was written, and the default applies: the whole partition when there
+/// is no `ORDER BY`, otherwise everything up to and including the current row's peers.
+/// `ROWS` counts rows instead of peers, which is what a moving window needs.
+pub const WinFrame = struct { rows: bool = false, unbounded: bool = false, preceding: i64 = 0 };
+
 pub const Window = struct {
     funcs: []const WindowFunc,
+    frame: WinFrame = .{},
     partition_by: []const QualName = &.{},
     order_by: []const SortKey = &.{},
 };
