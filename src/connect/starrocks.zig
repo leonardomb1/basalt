@@ -128,8 +128,21 @@ const nameIn = sqlmod.nameIn;
 /// assigns them to lanes non-deterministically, so the same (prefix, run_id, seq) can
 /// cover different rows on a re-run. Exactly-once across re-runs is owned by downstream
 /// dedup (a StarRocks primary-key table), per the split.zig contract — not by run_id.
+///
+/// StarRocks validates the label against `^[-\\w]{1,128}$`, so anything the table name
+/// carries that is not a letter, digit, `_` or `-` becomes `_`. A qualified target is the
+/// case that matters: `scratch.cvm_cad_fi` used to produce a label with a dot in it and
+/// the load was rejected outright with "Label format error".
 pub fn genLabel(arena: std.mem.Allocator, prefix: []const u8, table: []const u8, run_id: u64, seq: u64) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{s}_{s}_{d}_{d}", .{ prefix, table, run_id, seq });
+    const raw = try std.fmt.allocPrint(arena, "{s}_{s}_{d}_{d}", .{ prefix, table, run_id, seq });
+    for (raw) |*c| {
+        const ok = std.ascii.isAlphanumeric(c.*) or c.* == '_' or c.* == '-';
+        if (!ok) c.* = '_';
+    }
+    // 128 is the hard ceiling; the tail carries the run id and sequence, which are what
+    // make the label unique, so an over-long table name loses its head rather than them.
+    if (raw.len > 128) return raw[raw.len - 128 ..];
+    return raw;
 }
 
 /// The comma-joined column list for the Stream Load `columns` header. Names are
@@ -521,6 +534,12 @@ test "label and column list" {
     defer ar.deinit();
     const a = ar.allocator();
     try std.testing.expectEqualStrings("basalt_orders_99_3", try genLabel(a, "basalt", "orders", 99, 3));
+    // A qualified target: the dot is not legal in a label, so it is folded to `_`.
+    try std.testing.expectEqualStrings("basalt_scratch_cvm_cad_fi_99_3", try genLabel(a, "basalt", "scratch.cvm_cad_fi", 99, 3));
+    // And the length ceiling keeps the run id and sequence, which carry the uniqueness.
+    const long = try genLabel(a, "basalt", "x" ** 200, 99, 3);
+    try std.testing.expectEqual(@as(usize, 128), long.len);
+    try std.testing.expect(std.mem.endsWith(u8, long, "_99_3"));
 
     const l0 = try genLabel(a, "pipeline_l0", "orders", 99, 1);
     const l1 = try genLabel(a, "pipeline_l1", "orders", 99, 1);
