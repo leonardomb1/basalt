@@ -258,10 +258,12 @@ pub const Window = struct {
     out_schema: *const types.Schema,
     part: []const Sort.Key,
     ord: []const Sort.Key,
-    funcs: []const Kind,
+    funcs: []const Func,
     done: bool = false,
 
-    pub const Kind = enum { row_number, rank, dense_rank };
+    pub const Kind = enum { row_number, rank, dense_rank, lag, lead };
+    /// `arg` is the input column `lag`/`lead` reads; the ranking kinds leave it null.
+    pub const Func = struct { kind: Kind, arg: ?usize = null, offset: i64 = 1 };
 
     /// Do the two rows compare equal on every one of these keys?
     fn sameOn(arrs: []const KeyArr, a: usize, b: usize) bool {
@@ -286,10 +288,28 @@ pub const Window = struct {
         const parts = arrs[0..self.part.len];
         const ords = arrs[self.part.len..];
 
+        // Partition bounds, so `lead` can look forward and `lag` cannot walk off the
+        // front of its own partition into the previous one.
+        const pstart = try arena.alloc(usize, all.len);
+        const pend = try arena.alloc(usize, all.len);
+        {
+            var i: usize = 0;
+            while (i < idx.len) {
+                var j = i + 1;
+                while (j < idx.len and sameOn(parts, idx[j - 1], idx[j])) j += 1;
+                var k = i;
+                while (k < j) : (k += 1) {
+                    pstart[k] = i;
+                    pend[k] = j;
+                }
+                i = j;
+            }
+        }
+
         const ncols = all.columns.len;
         const builders = try arena.alloc(column.Builder, ncols + self.funcs.len);
         for (builders[0..ncols], self.in_schema.fields) |*bd, f| bd.* = try column.Builder.initCapacity(arena, f.ty, all.len);
-        for (builders[ncols..]) |*bd| bd.* = try column.Builder.initCapacity(arena, types.Type.init(.int), all.len);
+        for (builders[ncols..], self.out_schema.fields[ncols..]) |*bd, f| bd.* = try column.Builder.initCapacity(arena, f.ty, all.len);
 
         // RANK is 1 + the number of rows strictly before this one in the partition, so
         // a tie holds the rank and the next distinct value jumps to the row number.
@@ -310,11 +330,25 @@ pub const Window = struct {
                 }
             }
             for (builders[0..ncols], all.columns) |*bd, *col| try bd.append(col.getValue(row));
-            for (builders[ncols..], self.funcs) |*bd, kind| try bd.append(.{ .int = switch (kind) {
-                .row_number => rn,
-                .rank => rk,
-                .dense_rank => dr,
-            } });
+            for (builders[ncols..], self.funcs) |*bd, f| switch (f.kind) {
+                .row_number => try bd.append(.{ .int = rn }),
+                .rank => try bd.append(.{ .int = rk }),
+                .dense_rank => try bd.append(.{ .int = dr }),
+                // Offsets are resolved against the sorted order and clipped to this
+                // row's partition; falling outside it yields null, as SQL does with no
+                // default argument.
+                .lag, .lead => {
+                    const off: i64 = if (f.kind == .lag) -f.offset else f.offset;
+                    const target = @as(i64, @intCast(k)) + off;
+                    const lo = @as(i64, @intCast(pstart[k]));
+                    const hi = @as(i64, @intCast(pend[k]));
+                    if (target < lo or target >= hi) {
+                        try bd.append(.null);
+                    } else {
+                        try bd.append(all.columns[f.arg.?].getValue(idx[@intCast(target)]));
+                    }
+                },
+            };
         }
 
         const cols = try arena.alloc(column.Column, builders.len);

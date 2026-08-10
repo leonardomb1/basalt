@@ -413,7 +413,8 @@ join.
 
 ### Window functions
 
-`ROW_NUMBER()`, `RANK()` and `DENSE_RANK()` over `PARTITION BY` / `ORDER BY`:
+`ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, and `LAG(col[, n])` / `LEAD(col[, n])` over
+`PARTITION BY` / `ORDER BY`:
 
 ```sql
 SELECT conta, data, valor,
@@ -431,7 +432,21 @@ FROM 'movimentos.csv';
   window as a separate query.
 - The names are not reserved: a column called `rank` still reads as a column.
 - No frame syntax (`ROWS BETWEEN ...`). A frame only means something to an aggregate
-  over a window, and the ranking functions do not take one.
+  over a window, and these functions do not take one.
+- `LAG`/`LEAD` read a plain column and an optional literal offset (default 1). Looking
+  past the edge of the row's own partition yields **null** — there is no third
+  `default` argument — so the column is always nullable.
+
+Because a window function cannot sit inside an expression, compose one by wrapping it in
+a derived table. Change detection reads:
+
+```sql
+SELECT conta, valor - anterior AS delta
+FROM (SELECT conta, valor,
+             LAG(valor) OVER (PARTITION BY conta ORDER BY data) AS anterior
+      FROM 'movimentos.csv') m
+WHERE anterior IS NOT NULL;
+```
 
 A window is a **breaker**: a row's number is not known until its whole partition has
 arrived, so memory is bounded by the input, as it already is for `ORDER BY`, `DISTINCT`

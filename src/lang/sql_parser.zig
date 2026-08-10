@@ -1728,6 +1728,8 @@ pub const Parser = struct {
             if (std.mem.eql(u8, low, "row_number")) break :blk .row_number;
             if (std.mem.eql(u8, low, "rank")) break :blk .rank;
             if (std.mem.eql(u8, low, "dense_rank")) break :blk .dense_rank;
+            if (std.mem.eql(u8, low, "lag")) break :blk .lag;
+            if (std.mem.eql(u8, low, "lead")) break :blk .lead;
             return false;
         };
         // Only commit once the whole `name ( ) OVER` prefix is present, so a column
@@ -1736,6 +1738,22 @@ pub const Parser = struct {
         const save = self.i;
         _ = self.advance();
         _ = self.advance();
+        var arg: ?ast.QualName = null;
+        var offset: i64 = 1;
+        if (kind == .lag or kind == .lead) {
+            if (!self.at(.ident)) {
+                self.i = save;
+                return false;
+            }
+            arg = try self.singleName(self.advance().text);
+            if (self.eat(.comma)) {
+                const n = try self.expect(.int);
+                offset = std.fmt.parseInt(i64, n.text, 10) catch
+                    return self.fail(self.curPos(), "LAG/LEAD offset must be an integer", .{});
+                if (offset < 0)
+                    return self.fail(self.curPos(), "LAG/LEAD offset must not be negative — use the other function", .{});
+            }
+        }
         if (!self.eat(.rparen) or !self.isKw("over")) {
             self.i = save;
             return false;
@@ -1775,7 +1793,7 @@ pub const Parser = struct {
 
         _ = self.eatKw("as");
         const name = if (self.at(.ident)) self.advance().text else @tagName(kind);
-        try funcs.append(.{ .kind = kind, .out = name });
+        try funcs.append(.{ .kind = kind, .out = name, .arg = arg, .offset = offset });
         return true;
     }
 

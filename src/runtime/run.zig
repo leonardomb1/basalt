@@ -5097,16 +5097,36 @@ fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schema) a
 
             // The ranking columns are appended, so the input schema is a prefix of the
             // output and every column reference below stays valid.
-            const kinds = try arena.alloc(op.Window.Kind, wd.funcs.len);
+            const kinds = try arena.alloc(op.Window.Func, wd.funcs.len);
             const fields = try arena.alloc(types.Schema.Field, schema.fields.len + wd.funcs.len);
             @memcpy(fields[0..schema.fields.len], schema.fields);
-            for (wd.funcs, kinds, 0..) |f, *kind, i| {
-                kind.* = switch (f.kind) {
-                    .row_number => .row_number,
-                    .rank => .rank,
-                    .dense_rank => .dense_rank,
+            for (wd.funcs, kinds, 0..) |f, *out, i| {
+                // A ranking function counts rows, so it is a non-null int. `lag`/`lead`
+                // carry their source column's type and are always nullable — the first
+                // row of a partition has nothing behind it.
+                var ty = types.Type.init(.int);
+                var arg: ?usize = null;
+                switch (f.kind) {
+                    .row_number, .rank, .dense_rank => {},
+                    .lag, .lead => {
+                        const q = f.arg orelse return planErr(env.diag, "LAG/LEAD needs a column argument");
+                        const ai = analyze.fieldIndices(arena, schema, &[_]ast.QualName{q}, &ad) catch |e| return aErr(env, &ad, e);
+                        arg = ai[0];
+                        ty = schema.fields[ai[0]].ty.asNullable();
+                    },
+                }
+                out.* = .{
+                    .kind = switch (f.kind) {
+                        .row_number => .row_number,
+                        .rank => .rank,
+                        .dense_rank => .dense_rank,
+                        .lag => .lag,
+                        .lead => .lead,
+                    },
+                    .arg = arg,
+                    .offset = f.offset,
                 };
-                fields[schema.fields.len + i] = .{ .name = f.out, .ty = types.Type.init(.int) };
+                fields[schema.fields.len + i] = .{ .name = f.out, .ty = ty };
             }
             const out: types.Schema = .{ .fields = fields };
             const o = try arena.create(op.Window);
@@ -6143,6 +6163,56 @@ test "window: a tie holds rank and skips, dense_rank leaves no gap" {
     );
     defer alloc.free(dr);
     try std.testing.expectEqualStrings("v,dr\n10,1\n20,2\n20,2\n30,3\n30,3\n40,4\n", dr);
+}
+
+test "window: lag and lead stop at the partition edge" {
+    const alloc = std.testing.allocator;
+    var t1 = std.testing.tmpDir(.{});
+    defer t1.cleanup();
+    // The first row of a partition has nothing behind it and the last nothing ahead, so
+    // both yield null rather than reaching into the neighbouring partition. Verified
+    // against DuckDB.
+    const lag = try runToString(alloc, &t1,
+        "k,v\na,10\na,20\na,30\nb,5\nb,7\n",
+        "SELECT k, v, LAG(v) OVER (PARTITION BY k ORDER BY v) AS prev FROM '$IN'",
+    );
+    defer alloc.free(lag);
+    try std.testing.expectEqualStrings("k,v,prev\na,10,\na,20,10\na,30,20\nb,5,\nb,7,5\n", lag);
+
+    var t2 = std.testing.tmpDir(.{});
+    defer t2.cleanup();
+    const lead = try runToString(alloc, &t2,
+        "k,v\na,10\na,20\nb,5\n",
+        "SELECT k, v, LEAD(v) OVER (PARTITION BY k ORDER BY v) AS nxt FROM '$IN'",
+    );
+    defer alloc.free(lead);
+    try std.testing.expectEqualStrings("k,v,nxt\na,10,20\na,20,\nb,5,\n", lead);
+}
+
+test "window: an explicit lag offset skips that many rows" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try runToString(alloc, &tmp,
+        "v\n10\n20\n30\n40\n",
+        "SELECT v, LAG(v, 2) OVER (ORDER BY v) AS prev2 FROM '$IN'",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("v,prev2\n10,\n20,\n30,10\n40,20\n", out);
+}
+
+test "window: a lag result feeds an expression through a derived table" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A window function cannot sit inside an expression, so change detection composes
+    // by wrapping it — which is what derived tables are for.
+    const out = try runToString(alloc, &tmp,
+        "k,v\na,10\na,25\nb,5\nb,7\n",
+        "SELECT k, v - prev AS delta FROM (SELECT k, v, LAG(v) OVER (PARTITION BY k ORDER BY v) AS prev FROM '$IN') x WHERE prev IS NOT NULL",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("k,delta\na,15\nb,2\n", out);
 }
 
 test "window: a column named `rank` is still a column" {
