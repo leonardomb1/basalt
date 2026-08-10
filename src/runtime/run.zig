@@ -5786,6 +5786,36 @@ test "aggregate: count and sum by group (nulls skipped)" {
     try std.testing.expectEqualStrings("status,n,total\npaid,3,300\npending,1,50\n", out);
 }
 
+test "aggregate: an interleaved SELECT list keeps its column order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The aggregate stage emits grouping keys first and aggregates after, so this
+    // used to come out `status,region,n` — the values right, the columns moved.
+    // TPC-H Q3 has exactly this shape, and a positional CSV consumer downstream
+    // would have loaded the wrong columns without a word.
+    const out = try runToString(alloc, &tmp,
+        "status,region,amount\npaid,west,100\npaid,west,50\n",
+        "SELECT status, COUNT(*) AS n, region FROM '$IN' GROUP BY status, region",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("status,n,region\npaid,2,west\n", out);
+}
+
+test "aggregate: keys-then-aggregates adds no projection" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The common order must stay on the shorter plan — the reorder projection is
+    // only for lists that actually interleave.
+    const out = try runToString(alloc, &tmp,
+        "status,region,amount\npaid,west,100\npaid,west,50\n",
+        "SELECT status, region, COUNT(*) AS n FROM '$IN' GROUP BY status, region",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("status,region,n\npaid,west,2\n", out);
+}
+
 test "sort: numeric desc, nulls last" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

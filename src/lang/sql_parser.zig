@@ -122,6 +122,33 @@ fn isGroupKey(group: []const ast.QualName, q: ast.QualName) bool {
     return false;
 }
 
+/// The name the aggregate stage emits a `post` item under: a grouping key keeps its
+/// own column name, a lifted aggregate its alias.
+fn postItemName(it: ast.SelectItem) ?[]const u8 {
+    return switch (it) {
+        .field => |q| q.last(),
+        .computed => |c| c.name,
+        // A star cannot be resolved to names here; the caller declines to reorder.
+        .star, .star_except, .star_rename => null,
+    };
+}
+
+/// Does the SELECT list ask for a different column order than the aggregate stage
+/// naturally emits? The stage writes every grouping key first and every aggregate
+/// after, so `SELECT k1, SUM(x), k2` would silently come out `k1, k2, sum`. When
+/// this returns true the caller adds the projection that puts the SELECT list back
+/// in charge — and when it returns false nothing is added, keeping the common
+/// keys-then-aggregates query one stage shorter.
+fn aggOrderDiffers(post: []const ast.SelectItem, group: []const ast.QualName, aggs: []const ast.AggItem) bool {
+    if (post.len != group.len + aggs.len) return false;
+    for (post, 0..) |it, i| {
+        const want = postItemName(it) orelse return false;
+        const natural = if (i < group.len) group[i].last() else aggs[i - group.len].name;
+        if (!std.mem.eql(u8, want, natural)) return true;
+    }
+    return false;
+}
+
 /// What to call a SELECT item in a diagnostic.
 fn itemLabel(it: ast.SelectItem) []const u8 {
     return switch (it) {
@@ -1487,8 +1514,9 @@ pub const Parser = struct {
             if (having) |h| {
                 if (try self.addHavingAggs(h, &aggs, expr_aliases.items)) lifted = true;
             }
+            const aggs_out = try aggs.toOwnedSlice();
             try stages.append(.{
-                .node = .{ .aggregate = .{ .aggs = try aggs.toOwnedSlice(), .by = group } },
+                .node = .{ .aggregate = .{ .aggs = aggs_out, .by = group } },
                 .hints = &.{},
                 .pos = pos,
             });
@@ -1496,6 +1524,9 @@ pub const Parser = struct {
                 const hf = try self.havingRewrite(h, expr_aliases.items);
                 try stages.append(.{ .node = .{ .filter = hf }, .hints = &.{}, .pos = pos });
             }
+            // An interleaved SELECT list (`SELECT k, SUM(x), k2`) needs the same
+            // projection a lifted aggregate does, for order rather than arithmetic.
+            if (!lifted and aggOrderDiffers(post.items, group, aggs_out)) lifted = true;
             // Runs after HAVING, which reads the aggregate's own columns — the
             // projection would have already replaced them.
             if (lifted) {
