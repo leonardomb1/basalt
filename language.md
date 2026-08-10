@@ -402,8 +402,11 @@ pairs may be written in either order, and a null key never matches. `CROSS
 JOIN <cte>` takes no `ON`. Right-side columns that collide with a left name
 come back suffixed `_r`, and `_r2`, `_r3`, … if that name is taken too. A pipeline shaped `read | filters | join | filters |
 write` probes in parallel under `-j` — over local CSV/Parquet morsels, and
-over key-range splits for a splittable SQL source (right and full joins stay
-serial). The build side is fully resident; past 4 GiB the
+over key-range splits for a splittable SQL source. Since 0.5.8 a chain of joins
+followed by `GROUP BY` fans out the same way (`read | filters | join+ | filters |
+aggregate | sort/limit | write`). Right and full joins stay serial in every case:
+they have to emit the build rows nothing matched, and each lane would emit those
+from its own copy of the match tracking. The build side is fully resident; past 4 GiB the
 run fails fast instead of eating the host — raise the ceiling per join with
 `WITH (max_build = '16GB')` on the join clause, filter the CTE, or flip the
 join.

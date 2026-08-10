@@ -1948,9 +1948,16 @@ fn classifyAggJoinPipeline(stages: []const ast.Stage) ?AggJoinShape {
         // it, and the sink is opened with the schema it produces.
         .filter => if (ai != null) return null,
         .select => {},
-        .join => {
+        .join => |j| {
             // A join chain is fine; a join *fed by* an aggregate is a different shape.
             if (ai != null) return null;
+            // Only kinds whose per-lane join carries no cross-lane state. A right or
+            // full join must emit the build rows that nothing matched, and each lane
+            // tracks matches against its own copy — so every lane emitted the
+            // unmatched rows again. TPC-H-shaped queries never noticed; a `RIGHT JOIN`
+            // under a `COUNT(*)` returned 160 instead of 10 at `-j 16`. The map+join
+            // paths refuse these for the same reason.
+            if (!joinKindLaneSafe(j.kind)) return null;
             if (first_join == null) first_join = i;
         },
         .aggregate => {
@@ -6146,6 +6153,65 @@ test "parallel parquet aggregate: a chain of two joins then an agg (threads>1)" 
 
     try std.testing.expectEqualStrings("n,sf\n50,637.5\n", serial);
     try std.testing.expectEqualStrings(serial, par);
+}
+
+test "parallel parquet aggregate: a right join under an aggregate is not fanned out" {
+    const alloc = std.testing.allocator;
+    // A right or full join must emit the build rows nothing matched. Each lane tracks
+    // matches against its own `op.Join`, so every lane emitted them again: this
+    // returned 160 at -j 4 where the answer is 10. The shape has to decline these
+    // kinds and let the serial driver have them, which is what the map+join paths do.
+    //
+    // `d` is 4996..5005 against ids 1..5000, so five keys match and five do not.
+    const q = "WITH d AS (SELECT (id + 4995) AS did FROM '$IN' WHERE id <= 10) " ++
+        "SELECT COUNT(*) AS n, SUM(id) AS sum_left FROM '$IN' RIGHT JOIN d ON id = did";
+    var t1 = std.testing.tmpDir(.{});
+    defer t1.cleanup();
+    const serial = try runParquetThreaded(alloc, &t1, q, 1);
+    defer alloc.free(serial);
+    var t4 = std.testing.tmpDir(.{});
+    defer t4.cleanup();
+    const par = try runParquetThreaded(alloc, &t4, q, 4);
+    defer alloc.free(par);
+
+    try std.testing.expectEqualStrings("n,sum_left\n10,24990\n", serial);
+    try std.testing.expectEqualStrings(serial, par);
+}
+
+test "parallel parquet aggregate: a full join under an aggregate is not fanned out" {
+    const alloc = std.testing.allocator;
+    const q = "WITH d AS (SELECT (id + 4995) AS did FROM '$IN' WHERE id <= 10) " ++
+        "SELECT COUNT(*) AS n FROM '$IN' FULL JOIN d ON id = did";
+    var t1 = std.testing.tmpDir(.{});
+    defer t1.cleanup();
+    const serial = try runParquetThreaded(alloc, &t1, q, 1);
+    defer alloc.free(serial);
+    var t4 = std.testing.tmpDir(.{});
+    defer t4.cleanup();
+    const par = try runParquetThreaded(alloc, &t4, q, 4);
+    defer alloc.free(par);
+
+    // 5000 left rows, of which 5 match, plus the 5 build rows with no left partner.
+    try std.testing.expectEqualStrings("n\n5005\n", serial);
+    try std.testing.expectEqualStrings(serial, par);
+}
+
+test "parallel parquet aggregate: the lane-safe kinds still fan out under an aggregate" {
+    const alloc = std.testing.allocator;
+    // The guard must not be so broad that it takes the ordinary kinds with it.
+    inline for (.{ "INNER", "LEFT", "SEMI", "ANTI" }) |kind| {
+        const q = "WITH d AS (SELECT (id + 4995) AS did FROM '$IN' WHERE id <= 10) " ++
+            "SELECT COUNT(*) AS n FROM '$IN' " ++ kind ++ " JOIN d ON id = did";
+        var t1 = std.testing.tmpDir(.{});
+        defer t1.cleanup();
+        const serial = try runParquetThreaded(alloc, &t1, q, 1);
+        defer alloc.free(serial);
+        var t4 = std.testing.tmpDir(.{});
+        defer t4.cleanup();
+        const par = try runParquetThreaded(alloc, &t4, q, 4);
+        defer alloc.free(par);
+        try std.testing.expectEqualStrings(serial, par);
+    }
 }
 
 test "parallel parquet aggregate: an interleaved SELECT list still fans out" {
