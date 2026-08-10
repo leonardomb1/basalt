@@ -1050,7 +1050,12 @@ fn classifyAggPipeline(stages: []const ast.Stage) ?AggShape {
     const middle = stages[1 .. stages.len - 1];
     var ai: ?usize = null;
     for (middle, 0..) |st, i| switch (st.node) {
-        .filter, .select => if (ai != null) return null,
+        // A `select` after the aggregate is the reordering projection the parser emits
+        // for an interleaved SELECT list. Rejecting it sent every such query to the
+        // serial driver — 379ms against 88ms on TPC-H q01's shape. `writeTail` applies
+        // it, and the sink is opened with the schema it produces.
+        .filter => if (ai != null) return null,
+        .select => {},
         .aggregate => {
             if (ai != null) return null;
             ai = i;
@@ -1405,6 +1410,19 @@ fn emitMergedGroups(env: *Env, agg_in: *const types.Schema, by: []const usize, a
 
 /// Write a parallel breaker's merged batch to the sink, first running the small
 /// post-breaker `sort`/`limit` tail (which preserves `schema`) serially over it.
+/// The schema the sink is opened with: the aggregate's output as the tail leaves it.
+/// Sort and limit do not change it; a projection does, and one lands in the tail
+/// whenever the SELECT list interleaves grouping keys and aggregates.
+fn tailSchema(env: *Env, tail: []const ast.Stage, in: types.Schema) !types.Schema {
+    var sch = in;
+    for (tail) |st| {
+        if (st.node != .select) continue;
+        const one = [_]ast.Stage{st};
+        sch = try mapChainSchema(env, &one, sch);
+    }
+    return sch;
+}
+
 fn writeTail(env: *Env, snk: driver.Sink, batch: batchmod.Batch, schema: types.Schema, tail: []const ast.Stage, stats: *Stats) !void {
     const arena = env.arena;
     if (tail.len == 0) {
@@ -1446,8 +1464,8 @@ const AggCtx = struct {
     queue: WorkQueue,
     slots: []AggSlot,
     rows_read: *std.atomic.Value(u64),
-    /// Set for the join-then-aggregate shape, exactly as `PqAggCtx.join`.
-    join: ?LaneJoin = null,
+    /// The join-then-aggregate shape, exactly as `PqAggCtx.joins`.
+    joins: []const LaneJoin = &.{},
 };
 
 const aggWorker = dispatchWorker(AggCtx, aggWorkOne);
@@ -1459,8 +1477,8 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
     var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.queue.nitems), .schema = ctx.csv_schema };
     var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const mapped_chain = try buildMapChain(wa, ctx.params, ctx.prefix, &scan, ctx.csv_schema);
-    const child = if (ctx.join) |lj| try buildLaneJoinChain(wa, ctx.params, lj, mapped_chain) else mapped_chain;
+    var child = try buildMapChain(wa, ctx.params, ctx.prefix, &scan, ctx.csv_schema);
+    for (ctx.joins) |lj| child = try buildLaneJoinChain(wa, ctx.params, lj, child);
     var agg = op.Aggregate{
         .child = child,
         .in_schema = ctx.agg_in_schema,
@@ -1521,9 +1539,10 @@ const PqAggCtx = struct {
     aggs: []const op.Aggregate.Agg,
     lanes: []PqLane,
     rows_read: *std.atomic.Value(u64),
-    /// Set for the join-then-aggregate shape: the shared build index plus the
-    /// post-join stages each lane rebuilds over it. Null is the plain aggregate.
-    join: ?LaneJoin = null,
+    /// The join-then-aggregate shape: one shared build index per join, in application
+    /// order, plus the post-join stages each lane rebuilds over them. Empty is the
+    /// plain aggregate.
+    joins: []const LaneJoin = &.{},
 };
 
 /// Pulls row-group morsels off the shared queue and presents them as one
@@ -1609,8 +1628,8 @@ fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
     };
     var cs = obs.CountingSource{ .inner = .{ .ptr = &ms, .vtable = &MorselSource.vtable }, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const mapped = try buildMapChain(la, ctx.params, ctx.prefix, &scan, ctx.morsels.src_schema);
-    const child = if (ctx.join) |lj| try buildLaneJoinChain(la, ctx.params, lj, mapped) else mapped;
+    var child = try buildMapChain(la, ctx.params, ctx.prefix, &scan, ctx.morsels.src_schema);
+    for (ctx.joins) |lj| child = try buildLaneJoinChain(la, ctx.params, lj, child);
     var agg = op.Aggregate{
         .child = child,
         .in_schema = ctx.agg_in_schema,
@@ -1845,7 +1864,7 @@ fn runParallelParquetMapImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
 
     var lane_join: ?LaneJoin = null;
     if (jshape) |js| {
-        const lp = try resolveLaneJoin(env, js, out_schema);
+        const lp = try resolveLaneJoin(env, js.join, js.join_hints, js.suffix, out_schema);
         lane_join = lp.lane;
         out_schema = lp.out_schema;
     }
@@ -1907,9 +1926,11 @@ fn runParallelParquetMapImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
 /// the shape, matching `classifyAggPipeline`).
 const AggJoinShape = struct {
     map_stages: []const ast.Stage,
-    join: ast.Join,
-    join_hints: []const ast.Hint,
-    suffix: []const ast.Stage,
+    /// Every stage from the first join up to the aggregate. Starts with a `.join`, and
+    /// each join is followed by its own `filter`/`select` suffix. Held as a span rather
+    /// than a list of steps so the classifier stays allocation-free;
+    /// `resolveLaneJoins` walks it.
+    join_span: []const ast.Stage,
     ag: ast.Aggregate,
     tail: []const ast.Stage,
 };
@@ -1918,15 +1939,19 @@ fn classifyAggJoinPipeline(stages: []const ast.Stage) ?AggJoinShape {
     if (stages.len < 4) return null;
     if (stages[stages.len - 1].node != .write) return null;
     const middle = stages[1 .. stages.len - 1];
-    var ji: ?usize = null;
+    var first_join: ?usize = null;
     var ai: ?usize = null;
     for (middle, 0..) |st, i| switch (st.node) {
-        .filter, .select => if (ai != null) return null,
+        // A `select` after the aggregate is the reordering projection the parser emits
+        // for an interleaved SELECT list. Rejecting it sent every such query to the
+        // serial driver — 379ms against 88ms on TPC-H q01's shape. `writeTail` applies
+        // it, and the sink is opened with the schema it produces.
+        .filter => if (ai != null) return null,
+        .select => {},
         .join => {
-            // One join, and it has to precede the aggregate: a second one, or a join
-            // fed by an aggregate, is a different (unhandled) shape.
-            if (ji != null or ai != null) return null;
-            ji = i;
+            // A join chain is fine; a join *fed by* an aggregate is a different shape.
+            if (ai != null) return null;
+            if (first_join == null) first_join = i;
         },
         .aggregate => {
             if (ai != null) return null;
@@ -1935,16 +1960,39 @@ fn classifyAggJoinPipeline(stages: []const ast.Stage) ?AggJoinShape {
         .sort, .limit => if (ai == null) return null,
         else => return null,
     };
-    const j = ji orelse return null;
+    const j = first_join orelse return null;
     const a = ai orelse return null;
     return .{
         .map_stages = middle[0..j],
-        .join = middle[j].node.join,
-        .join_hints = middle[j].hints,
-        .suffix = middle[j + 1 .. a],
+        .join_span = middle[j..a],
         .ag = middle[a].node.aggregate,
         .tail = middle[a + 1 ..],
     };
+}
+
+/// Materialize every build side in a join chain, left to right, threading each join's
+/// output schema into the next as its probe schema. Returns the lane recipes in
+/// application order plus the schema the aggregate above them reads.
+///
+/// A single join was the original limit, and it left TPC-H q03 — which joins two
+/// dimensions — on the serial driver while q12 and q14 fanned out.
+const LaneJoinChain = struct { joins: []const LaneJoin, out_schema: types.Schema };
+
+fn resolveLaneJoins(env: *Env, join_span: []const ast.Stage, left_schema: types.Schema) anyerror!LaneJoinChain {
+    var list = std.array_list.Managed(LaneJoin).init(env.arena);
+    var schema = left_schema;
+    var i: usize = 0;
+    while (i < join_span.len) {
+        // The span starts on a join, and `i` only ever advances to the next one.
+        std.debug.assert(join_span[i].node == .join);
+        var k = i + 1;
+        while (k < join_span.len and join_span[k].node != .join) k += 1;
+        const lp = try resolveLaneJoin(env, join_span[i].node.join, join_span[i].hints, join_span[i + 1 .. k], schema);
+        try list.append(lp.lane);
+        schema = lp.out_schema;
+        i = k;
+    }
+    return .{ .joins = list.items, .out_schema = schema };
 }
 
 /// Parallel aggregate over a local parquet file, one morsel per row group.
@@ -1989,16 +2037,11 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
     // The build side is materialized here, once, and every lane probes it read-only.
     // `resolveLaneJoin` also prevalidates the post-join stages and hands back the
     // schema they produce — which is exactly what the aggregate reads.
-    var lane_join: ?LaneJoin = null;
+    var lane_joins: []const LaneJoin = &.{};
     if (jshape) |js| {
-        const lp = try resolveLaneJoin(env, .{
-            .prefix = js.map_stages,
-            .join = js.join,
-            .join_hints = js.join_hints,
-            .suffix = js.suffix,
-        }, agg_in_schema);
-        lane_join = lp.lane;
-        agg_in_schema = lp.out_schema;
+        const chain = try resolveLaneJoins(env, js.join_span, agg_in_schema);
+        lane_joins = chain.joins;
+        agg_in_schema = chain.out_schema;
     }
     const agg_in = try schemaPtr(arena, agg_in_schema);
 
@@ -2039,7 +2082,7 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
         .aggs = aggs,
         .lanes = lanes,
         .rows_read = env.rows_read,
-        .join = lane_join,
+        .joins = lane_joins,
     };
 
     const t_fold0 = std.time.Instant.now() catch unreachable;
@@ -2142,7 +2185,7 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
     const t_emit1 = std.time.Instant.now() catch unreachable;
 
     const wr = try resolveUpsertKeys(env, w);
-    const snk = try openSink(env, wr, out_schema.*);
+    const snk = try openSink(env, wr, try tailSchema(env, tail, out_schema.*));
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
 
@@ -2200,16 +2243,11 @@ fn runParallelCsvAggImpl(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag:
     defer mapped.close();
 
     var agg_in_schema = try mapChainSchema(env, prefix, mapped.schema);
-    var lane_join: ?LaneJoin = null;
+    var lane_joins: []const LaneJoin = &.{};
     if (jshape) |js| {
-        const lp = try resolveLaneJoin(env, .{
-            .prefix = js.map_stages,
-            .join = js.join,
-            .join_hints = js.join_hints,
-            .suffix = js.suffix,
-        }, agg_in_schema);
-        lane_join = lp.lane;
-        agg_in_schema = lp.out_schema;
+        const chain = try resolveLaneJoins(env, js.join_span, agg_in_schema);
+        lane_joins = chain.joins;
+        agg_in_schema = chain.out_schema;
     }
     const agg_in = try schemaPtr(arena, agg_in_schema);
 
@@ -2239,7 +2277,7 @@ fn runParallelCsvAggImpl(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag:
         .queue = .{ .nitems = nthreads },
         .slots = slots,
         .rows_read = env.rows_read,
-        .join = lane_join,
+        .joins = lane_joins,
     };
 
     const lanes = try parallel.spawnJoin(arena, nthreads, aggWorker, &ctx);
@@ -2252,7 +2290,7 @@ fn runParallelCsvAggImpl(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag:
     const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, cgroups);
 
     const wr = try resolveUpsertKeys(env, w);
-    const snk = try openSink(env, wr, out_schema.*);
+    const snk = try openSink(env, wr, try tailSchema(env, tail, out_schema.*));
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
 
@@ -2480,27 +2518,27 @@ const LaneJoinPlan = struct { lane: LaneJoin, out_schema: types.Schema };
 /// the join's output schema so a lane rebuild cannot fail where this succeeded.
 /// Returns the lane recipe plus the pipeline's final output schema (what the sink
 /// gets opened with).
-fn resolveLaneJoin(env: *Env, shape: MapJoinShape, left_schema: types.Schema) anyerror!LaneJoinPlan {
+fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suffix: []const ast.Stage, left_schema: types.Schema) anyerror!LaneJoinPlan {
     const arena = env.arena;
-    const binding = env.bindings.get(shape.join.binding) orelse
-        return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown binding `{s}` in join", .{shape.join.binding}));
+    const binding = env.bindings.get(j.binding) orelse
+        return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown binding `{s}` in join", .{j.binding}));
     const build = try buildPipeline(env, binding.stages);
 
     var ad = analyze.Diag{};
-    const jp = analyze.joinPlan(arena, left_schema, build.schema, shape.join, &ad) catch |e| return aErr(env, &ad, e);
+    const jp = analyze.joinPlan(arena, left_schema, build.schema, j, &ad) catch |e| return aErr(env, &ad, e);
     const out = try schemaPtr(arena, jp.schema);
     const right_schema = try schemaPtr(arena, build.schema);
     const right_keys = try planKeys(arena, jp, "rk");
 
     // Serial prevalidation of the suffix, exactly as `mapChainSchema` does for the
     // prefix: any analyze error surfaces here, with a diag, before any lane exists.
-    const final_schema = try mapChainSchema(env, shape.suffix, out.*);
+    const final_schema = try mapChainSchema(env, suffix, out.*);
 
     // The index outlives the fan-out (plan arena); the pulls that fill it are scratch
     // and go away with `build_arena` — `materializeFull` copies into the state arena.
     var build_arena = std.heap.ArenaAllocator.init(env.gpa);
     defer build_arena.deinit();
-    const index = try op.JoinIndex.create(arena, build_arena.allocator(), build.op, right_schema, right_keys, try joinBuildCap(env, shape.join_hints));
+    const index = try op.JoinIndex.create(arena, build_arena.allocator(), build.op, right_schema, right_keys, try joinBuildCap(env, join_hints));
 
     return .{
         .lane = .{
@@ -2510,8 +2548,8 @@ fn resolveLaneJoin(env: *Env, shape: MapJoinShape, left_schema: types.Schema) an
             .left_schema = try schemaPtr(arena, left_schema),
             .right_schema = right_schema,
             .out_schema = out,
-            .kind = shape.join.kind,
-            .suffix = shape.suffix,
+            .kind = j.kind,
+            .suffix = suffix,
         },
         .out_schema = final_schema,
     };
@@ -2663,7 +2701,7 @@ fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoinSha
     env.sources.shrinkRetainingCapacity(src_base);
 
     // Before any lane exists: build side materialized, suffix prevalidated.
-    const lp = try resolveLaneJoin(env, shape, probe_schema);
+    const lp = try resolveLaneJoin(env, shape.join, shape.join_hints, shape.suffix, probe_schema);
 
     env.sink_name = sinkLabel(env, w);
     const sink_mode: parallel.SinkMode = (try buildParallelSink(env, w, lp.out_schema)) orelse
@@ -2806,7 +2844,7 @@ fn runParallelCsvMapImpl(env: *Env, rd: ast.Read, map_stages: []const ast.Stage,
     // Before any lane exists: build side materialized, suffix prevalidated.
     var lane_join: ?LaneJoin = null;
     if (jshape) |js| {
-        const lp = try resolveLaneJoin(env, js, out_schema);
+        const lp = try resolveLaneJoin(env, js.join, js.join_hints, js.suffix, out_schema);
         lane_join = lp.lane;
         out_schema = lp.out_schema;
     }
@@ -6086,6 +6124,47 @@ test "parallel parquet aggregate: a join then an ungrouped agg (threads>1)" {
     defer alloc.free(par);
 
     try std.testing.expectEqualStrings("n,sf\n50,637.5\n", serial);
+    try std.testing.expectEqualStrings(serial, par);
+}
+
+test "parallel parquet aggregate: a chain of two joins then an agg (threads>1)" {
+    const alloc = std.testing.allocator;
+    // One join was the original limit, which left TPC-H q03 — two dimensions — serial
+    // while q12 and q14 fanned out. Each join's output schema is the next one's probe
+    // schema, so the chain has to resolve left to right.
+    const q = "WITH d1 AS (SELECT id AS did FROM '$IN' WHERE id <= 100), " ++
+        "d2 AS (SELECT id AS eid FROM '$IN' WHERE id <= 50) " ++
+        "SELECT COUNT(*) AS n, SUM(f) AS sf FROM '$IN' JOIN d1 ON id = did JOIN d2 ON id = eid";
+    var t1 = std.testing.tmpDir(.{});
+    defer t1.cleanup();
+    const serial = try runParquetThreaded(alloc, &t1, q, 1);
+    defer alloc.free(serial);
+    var t4 = std.testing.tmpDir(.{});
+    defer t4.cleanup();
+    const par = try runParquetThreaded(alloc, &t4, q, 4);
+    defer alloc.free(par);
+
+    try std.testing.expectEqualStrings("n,sf\n50,637.5\n", serial);
+    try std.testing.expectEqualStrings(serial, par);
+}
+
+test "parallel parquet aggregate: an interleaved SELECT list still fans out" {
+    const alloc = std.testing.allocator;
+    // The reordering projection that keeps an interleaved SELECT list in its declared
+    // order lands in the tail, and rejecting a tail projection sent the whole query to
+    // the serial driver: 379ms against 88ms on q01's shape. Both facts are asserted
+    // here — the column order AND that -j changes nothing about the answer.
+    const q = "SELECT g, COUNT(*) AS n, id FROM '$IN' WHERE id <= 4 GROUP BY g, id ORDER BY id";
+    var t1 = std.testing.tmpDir(.{});
+    defer t1.cleanup();
+    const serial = try runParquetThreaded(alloc, &t1, q, 1);
+    defer alloc.free(serial);
+    var t4 = std.testing.tmpDir(.{});
+    defer t4.cleanup();
+    const par = try runParquetThreaded(alloc, &t4, q, 4);
+    defer alloc.free(par);
+
+    try std.testing.expectEqualStrings("g,n,id\n1,1,1\n2,1,2\n3,1,3\n0,1,4\n", serial);
     try std.testing.expectEqualStrings(serial, par);
 }
 

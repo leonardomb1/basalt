@@ -118,20 +118,25 @@ entirely about which shapes reach a parallel path.
 
 | query | baseline | now | ratio then → now |
 | --- | --- | --- | --- |
-| q06 | 457 ms | **126 ms** | 18.3× → **5.3×** |
-| q12 | 665 ms | **380 ms** | 22.9× → **12.7×** |
-| q14 | 357 ms | **117 ms** | 9.2× → **2.9×** |
+| q03 | 636 ms | **299 ms** | 15.5× → **7.3×** |
+| q06 | 457 ms | **117 ms** | 18.3× → **4.9×** |
+| q12 | 665 ms | **374 ms** | 22.9× → **12.5×** |
+| q14 | 357 ms | **119 ms** | 9.2× → **3.1×** |
 
 - **q06** — the parallel parquet path refused an ungrouped aggregate outright, so
   `SELECT SUM(x) FROM t WHERE ...` went to the serial driver.
 - **q12, q14** — join-then-aggregate matched no classifier: `classifyAggPipeline`
   rejects a `.join`, `classifyMapJoinPipeline` rejects the aggregate because it is a
   breaker. It fell between them and ran serially.
+- **q03** — the same, plus it joins *two* dimensions, so the shape had to accept a
+  join chain rather than a single join.
+- **any interleaved `SELECT` list** — `SELECT k, SUM(x), k2` carries a reordering
+  projection after the aggregate, and a tail projection used to disqualify the shape.
+  That one cost 379 ms against 88 ms on q01's shape without appearing in this table at
+  all, because the TPC-H queries here happen to list their keys first.
 
-**q03 is still serial**, and that is most of its remaining 15.7×: it has *two* joins
-and the classifier admits exactly one. q12's 1.7× is also short of q01's 3.3× because
-its build side — all of `orders.parquet` — is still materialised serially before the
-fan-out starts.
+q12's 1.8× is still short of q01's 3.3× because its build side — all of
+`orders.parquet` — is materialised serially before the fan-out starts.
 
 So: compare thread counts before concluding anything about a query's per-row cost.
 A flat line here means the shape never reached a parallel path, not that the engine
