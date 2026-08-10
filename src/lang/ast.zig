@@ -281,8 +281,21 @@ pub const Stage = struct {
         sort: Sort,
         aggregate: Aggregate,
         join: Join,
+        window: Window,
         write: Write,
     };
+};
+
+/// A window stage: compute one or more ranking functions over the rows, numbered
+/// within each `partition_by` group in `order_by` order, and append them as columns.
+/// It is a breaker — the whole partition has to be present before a row's number is
+/// known — so memory is bounded by the largest partition rather than by batch size.
+pub const WinKind = enum { row_number, rank, dense_rank };
+pub const WindowFunc = struct { kind: WinKind, out: []const u8 };
+pub const Window = struct {
+    funcs: []const WindowFunc,
+    partition_by: []const QualName = &.{},
+    order_by: []const SortKey = &.{},
 };
 
 pub const Pipeline = struct { stages: []const Stage, pos: Pos };

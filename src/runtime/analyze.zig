@@ -714,6 +714,7 @@ const Ctx = struct {
             .sort => |s| .{ .kind = "sort", .detail = try std.fmt.allocPrint(self.arena, "{d} key(s)", .{s.keys.len}), .breaker = true },
             .aggregate => |ag| .{ .kind = "aggregate", .detail = try std.fmt.allocPrint(self.arena, "{d} agg(s), {d} group(s)", .{ ag.aggs.len, ag.by.len }), .breaker = true },
             .join => |j| try self.joinInfo(j),
+            .window => |wd| .{ .kind = "window", .detail = try std.fmt.allocPrint(self.arena, "{d} fn(s), {d} partition key(s)", .{ wd.funcs.len, wd.partition_by.len }), .breaker = true },
             .read, .ref, .write, .union_ => fail(self.diag, "unexpected operator in the middle of a pipeline", .{}),
         };
     }

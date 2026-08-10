@@ -1162,7 +1162,18 @@ pub const Parser = struct {
         };
         var raw_items = std.array_list.Managed(RawItem).init(self.arena);
         var expr_aliases = std.array_list.Managed(ExprAlias).init(self.arena);
+        var win_funcs = std.array_list.Managed(ast.WindowFunc).init(self.arena);
+        var win_part = std.array_list.Managed(ast.QualName).init(self.arena);
+        var win_ord = std.array_list.Managed(ast.SortKey).init(self.arena);
         while (true) {
+            // `ROW_NUMBER() OVER (PARTITION BY .. ORDER BY ..)` is recognised as a whole
+            // select item, before the expression parser sees it: a window function is a
+            // stage, not an expression, and lifting one out of the middle of an
+            // arithmetic expression would need the machinery `IN (SELECT ...)` needs.
+            if (try self.parseWindowItem(&win_funcs, &win_part, &win_ord)) {
+                if (!self.eat(.comma)) break;
+                continue;
+            }
             if (self.eat(.star)) {
                 if (self.eatKw("except") or self.eatKw("exclude")) {
                     _ = try self.expect(.lparen);
@@ -1563,6 +1574,14 @@ pub const Parser = struct {
             try stages.append(.{ .node = .{ .distinct = .{ .on = distinct_on } }, .hints = &.{}, .pos = pos });
         }
 
+        if (win_funcs.items.len > 0) {
+            try stages.append(.{ .node = .{ .window = .{
+                .funcs = try win_funcs.toOwnedSlice(),
+                .partition_by = try win_part.toOwnedSlice(),
+                .order_by = try win_ord.toOwnedSlice(),
+            } }, .hints = &.{}, .pos = pos });
+        }
+
         var union_branch: ?BranchInfo = null;
         const s = stages.items;
         if (s.len <= 2 and s[0].node == .read) {
@@ -1685,6 +1704,79 @@ pub const Parser = struct {
             .pos = dpos,
         } });
         return name;
+    }
+
+    /// `<fn>() OVER (PARTITION BY .. ORDER BY ..) [AS name]` as a complete select item.
+    /// Returns false when the next tokens are not that, having consumed nothing.
+    ///
+    /// Stage one covers the ranking functions, which need no frame: a frame only means
+    /// anything to an aggregate over a window, and `ROWS BETWEEN` syntax is deliberately
+    /// absent until something asks for it. Every partition and order column must also be
+    /// projected — the stage appends its columns to the projection rather than replacing it.
+    fn parseWindowItem(
+        self: *Parser,
+        funcs: *std.array_list.Managed(ast.WindowFunc),
+        part: *std.array_list.Managed(ast.QualName),
+        ord: *std.array_list.Managed(ast.SortKey),
+    ) Error!bool {
+        if (!self.at(.ident)) return false;
+        const kind: ast.WinKind = blk: {
+            var buf: [16]u8 = undefined;
+            const t = self.cur().text;
+            if (t.len >= buf.len) return false;
+            const low = std.ascii.lowerString(buf[0..t.len], t);
+            if (std.mem.eql(u8, low, "row_number")) break :blk .row_number;
+            if (std.mem.eql(u8, low, "rank")) break :blk .rank;
+            if (std.mem.eql(u8, low, "dense_rank")) break :blk .dense_rank;
+            return false;
+        };
+        // Only commit once the whole `name ( ) OVER` prefix is present, so a column
+        // called `rank` still parses as a column.
+        if (self.peekTag() != .lparen) return false;
+        const save = self.i;
+        _ = self.advance();
+        _ = self.advance();
+        if (!self.eat(.rparen) or !self.isKw("over")) {
+            self.i = save;
+            return false;
+        }
+        const wpos = self.curPos();
+        _ = self.advance();
+        _ = try self.expect(.lparen);
+
+        // One window per query in stage one: two functions may share a window, but two
+        // different windows would need a stage each.
+        var saw_part = false;
+        if (self.eatKw("partition")) {
+            try self.expectKw("by");
+            saw_part = true;
+            while (true) {
+                try part.append(try self.singleName(try self.expectIdent()));
+                if (!self.eat(.comma)) break;
+            }
+        }
+        var saw_ord = false;
+        if (self.eatKw("order")) {
+            try self.expectKw("by");
+            saw_ord = true;
+            while (true) {
+                const f = try self.singleName(try self.expectIdent());
+                var desc = false;
+                if (self.eatKw("desc")) desc = true else _ = self.eatKw("asc");
+                try ord.append(.{ .field = f, .desc = desc });
+                if (!self.eat(.comma)) break;
+            }
+        }
+        _ = try self.expect(.rparen);
+        if (funcs.items.len > 0 and (saw_part or saw_ord))
+            return self.fail(wpos, "two window functions in one SELECT must share the same OVER (...) window", .{});
+        if (ord.items.len == 0)
+            return self.fail(wpos, "a window function needs ORDER BY inside OVER (...) to number by", .{});
+
+        _ = self.eatKw("as");
+        const name = if (self.at(.ident)) self.advance().text else @tagName(kind);
+        try funcs.append(.{ .kind = kind, .out = name });
+        return true;
     }
 
     fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array_list.Managed(ast.Hint)) Error!ast.Stage.Node {

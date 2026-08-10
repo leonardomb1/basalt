@@ -60,6 +60,7 @@ pub const Op = union(enum) {
     limit: *Limit,
     distinct: *Distinct,
     sort: *Sort,
+    window: *Window,
     aggregate: *Aggregate,
     top_n: *TopN,
     join: *Join,
@@ -110,6 +111,7 @@ pub const Op = union(enum) {
             .limit => |l| l.next(arena),
             .distinct => |d| d.next(arena),
             .sort => |s| s.next(arena),
+            .window => |w| w.next(arena),
             .aggregate => |a| a.next(arena),
             .top_n => |t| t.next(arena),
             .join => |j| j.next(arena),
@@ -237,6 +239,87 @@ pub const Explode = struct {
         const cols = try arena.alloc(column.Column, ncols);
         for (builders, 0..) |*bd, i| cols[i] = try bd.finish();
         return Batch{ .schema = self.out_schema, .columns = cols, .len = n };
+    }
+};
+
+/// Rank rows within each partition and append the result as a column.
+///
+/// A breaker: a row's number is not known until its whole partition has arrived, so
+/// this holds the input the way `Sort` does. Memory is therefore bounded by the input,
+/// not by batch size — the same trade sort, distinct and aggregate already make.
+///
+/// One sort over (partition keys ++ order keys) does all the work: rows of a partition
+/// land together and in order, so a single pass numbers them, resetting at each
+/// boundary. Nulls in a partition key group together, matching `GROUP BY`.
+pub const Window = struct {
+    stats: Stats = .{},
+    child: Op,
+    in_schema: *const types.Schema,
+    out_schema: *const types.Schema,
+    part: []const Sort.Key,
+    ord: []const Sort.Key,
+    funcs: []const Kind,
+    done: bool = false,
+
+    pub const Kind = enum { row_number, rank, dense_rank };
+
+    /// Do the two rows compare equal on every one of these keys?
+    fn sameOn(arrs: []const KeyArr, a: usize, b: usize) bool {
+        for (arrs) |k| {
+            if (k.order(a, b) != .eq) return false;
+        }
+        return true;
+    }
+
+    pub fn next(self: *Window, arena: std.mem.Allocator) anyerror!?Batch {
+        if (self.done) return null;
+        self.done = true;
+        const all = (try materializeAll(arena, self.child, self.in_schema)) orelse return null;
+
+        const idx = try arena.alloc(usize, all.len);
+        for (idx, 0..) |*x, i| x.* = i;
+
+        const arrs = try arena.alloc(KeyArr, self.part.len + self.ord.len);
+        for (self.part, 0..) |k, i| arrs[i] = try KeyArr.prepare(arena, all.columns[k.idx], k.desc);
+        for (self.ord, 0..) |k, i| arrs[self.part.len + i] = try KeyArr.prepare(arena, all.columns[k.idx], k.desc);
+        std.mem.sort(usize, idx, SortCtx{ .arrs = arrs }, SortCtx.lessThan);
+        const parts = arrs[0..self.part.len];
+        const ords = arrs[self.part.len..];
+
+        const ncols = all.columns.len;
+        const builders = try arena.alloc(column.Builder, ncols + self.funcs.len);
+        for (builders[0..ncols], self.in_schema.fields) |*bd, f| bd.* = try column.Builder.initCapacity(arena, f.ty, all.len);
+        for (builders[ncols..]) |*bd| bd.* = try column.Builder.initCapacity(arena, types.Type.init(.int), all.len);
+
+        // RANK is 1 + the number of rows strictly before this one in the partition, so
+        // a tie holds the rank and the next distinct value jumps to the row number.
+        // DENSE_RANK counts distinct values instead and never leaves a gap.
+        var rn: i64 = 0;
+        var rk: i64 = 0;
+        var dr: i64 = 0;
+        for (idx, 0..) |row, k| {
+            if (k == 0 or !sameOn(parts, idx[k - 1], row)) {
+                rn = 1;
+                rk = 1;
+                dr = 1;
+            } else {
+                rn += 1;
+                if (!sameOn(ords, idx[k - 1], row)) {
+                    rk = rn;
+                    dr += 1;
+                }
+            }
+            for (builders[0..ncols], all.columns) |*bd, *col| try bd.append(col.getValue(row));
+            for (builders[ncols..], self.funcs) |*bd, kind| try bd.append(.{ .int = switch (kind) {
+                .row_number => rn,
+                .rank => rk,
+                .dense_rank => dr,
+            } });
+        }
+
+        const cols = try arena.alloc(column.Column, builders.len);
+        for (builders, 0..) |*bd, i| cols[i] = try bd.finish();
+        return Batch{ .schema = self.out_schema, .columns = cols, .len = all.len };
     }
 };
 

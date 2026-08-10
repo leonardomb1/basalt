@@ -411,6 +411,33 @@ run fails fast instead of eating the host — raise the ceiling per join with
 `WITH (max_build = '16GB')` on the join clause, filter the CTE, or flip the
 join.
 
+### Window functions
+
+`ROW_NUMBER()`, `RANK()` and `DENSE_RANK()` over `PARTITION BY` / `ORDER BY`:
+
+```sql
+SELECT conta, data, valor,
+       ROW_NUMBER() OVER (PARTITION BY conta ORDER BY data DESC) AS recencia
+FROM 'movimentos.csv';
+```
+
+- `ORDER BY` inside `OVER (...)` is required — it is what the numbering is by.
+  `PARTITION BY` is optional; without it the whole input is one partition.
+- A window function must be the **whole** select item: `ROW_NUMBER() OVER (...) + 1` is
+  not accepted, because a window is a stage rather than an expression.
+- Its column is **appended** to the projection, so every partition and order column has
+  to be projected as well.
+- Two window functions in one `SELECT` must share one `OVER (...)`; write the second
+  window as a separate query.
+- The names are not reserved: a column called `rank` still reads as a column.
+- No frame syntax (`ROWS BETWEEN ...`). A frame only means something to an aggregate
+  over a window, and the ranking functions do not take one.
+
+A window is a **breaker**: a row's number is not known until its whole partition has
+arrived, so memory is bounded by the input, as it already is for `ORDER BY`, `DISTINCT`
+and `GROUP BY`. `DISTINCT ON (...)` remains the cheaper way to keep one row per key —
+it streams, where `ROW_NUMBER() ... = 1` would not.
+
 ### Subqueries in a predicate
 
 There is no `IN (SELECT ...)`, `EXISTS` or scalar-subquery syntax. Each has a direct

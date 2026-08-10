@@ -5083,6 +5083,43 @@ fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schema) a
             o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = ks };
             return .{ .op = .{ .sort = o }, .schema = schema };
         },
+        .window => |wd| {
+            var ad = analyze.Diag{};
+            const pidx = analyze.fieldIndices(arena, schema, wd.partition_by, &ad) catch |e| return aErr(env, &ad, e);
+            const oqs = try arena.alloc(ast.QualName, wd.order_by.len);
+            for (wd.order_by, oqs) |sk, *q| q.* = sk.field;
+            const oidx = analyze.fieldIndices(arena, schema, oqs, &ad) catch |e| return aErr(env, &ad, e);
+
+            const pk = try arena.alloc(op.Sort.Key, pidx.len);
+            for (pidx, pk) |idx, *k| k.* = .{ .idx = idx, .desc = false };
+            const ok = try arena.alloc(op.Sort.Key, oidx.len);
+            for (wd.order_by, oidx, ok) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc };
+
+            // The ranking columns are appended, so the input schema is a prefix of the
+            // output and every column reference below stays valid.
+            const kinds = try arena.alloc(op.Window.Kind, wd.funcs.len);
+            const fields = try arena.alloc(types.Schema.Field, schema.fields.len + wd.funcs.len);
+            @memcpy(fields[0..schema.fields.len], schema.fields);
+            for (wd.funcs, kinds, 0..) |f, *kind, i| {
+                kind.* = switch (f.kind) {
+                    .row_number => .row_number,
+                    .rank => .rank,
+                    .dense_rank => .dense_rank,
+                };
+                fields[schema.fields.len + i] = .{ .name = f.out, .ty = types.Type.init(.int) };
+            }
+            const out: types.Schema = .{ .fields = fields };
+            const o = try arena.create(op.Window);
+            o.* = .{
+                .child = child,
+                .in_schema = try schemaPtr(arena, schema),
+                .out_schema = try schemaPtr(arena, out),
+                .part = pk,
+                .ord = ok,
+                .funcs = kinds,
+            };
+            return .{ .op = .{ .window = o }, .schema = out };
+        },
         .aggregate => |ag| return buildAggregate(env, ag, schema, child),
         .join => |j| return buildJoin(env, j, stage.hints, schema, child),
         .explode => |ex| {
@@ -6070,6 +6107,56 @@ test "union all by name: a branch may be any query, not just a table" {
     const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
     defer alloc.free(out);
     try std.testing.expectEqualStrings("k,v\na,1\nc,3\n", out);
+}
+
+test "window: row_number, rank and dense_rank number within a partition" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try runToString(alloc, &tmp,
+        "k,v\na,10\na,20\na,20\nb,5\nb,7\n",
+        "SELECT k, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) AS rn FROM '$IN'",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("k,v,rn\na,10,1\na,20,2\na,20,3\nb,5,1\nb,7,2\n", out);
+}
+
+test "window: a tie holds rank and skips, dense_rank leaves no gap" {
+    const alloc = std.testing.allocator;
+    var t1 = std.testing.tmpDir(.{});
+    defer t1.cleanup();
+    // The case that separates the two: RANK is 1 + the rows strictly before, so after a
+    // two-row tie at 20 the next value jumps to 4 and the last to 6. DENSE_RANK counts
+    // distinct values instead: 1,2,2,3,3,4. Both verified against DuckDB.
+    const rk = try runToString(alloc, &t1,
+        "v\n10\n20\n20\n30\n30\n40\n",
+        "SELECT v, RANK() OVER (ORDER BY v) AS rk FROM '$IN'",
+    );
+    defer alloc.free(rk);
+    try std.testing.expectEqualStrings("v,rk\n10,1\n20,2\n20,2\n30,4\n30,4\n40,6\n", rk);
+
+    var t2 = std.testing.tmpDir(.{});
+    defer t2.cleanup();
+    const dr = try runToString(alloc, &t2,
+        "v\n10\n20\n20\n30\n30\n40\n",
+        "SELECT v, DENSE_RANK() OVER (ORDER BY v) AS dr FROM '$IN'",
+    );
+    defer alloc.free(dr);
+    try std.testing.expectEqualStrings("v,dr\n10,1\n20,2\n20,2\n30,3\n30,3\n40,4\n", dr);
+}
+
+test "window: a column named `rank` is still a column" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The item parser only commits once it has seen `name ( ) OVER`, and rewinds
+    // otherwise — so the function names are not reserved words.
+    const out = try runToString(alloc, &tmp,
+        "rank,v\n7,1\n",
+        "SELECT rank, v FROM '$IN'",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("rank,v\n7,1\n", out);
 }
 
 test "derived table: a subquery in FROM is an anonymous CTE" {
