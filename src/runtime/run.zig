@@ -4234,6 +4234,16 @@ fn sinkLabel(env: *Env, w: ast.Write) []const u8 {
     return connectorType(env, w.connector);
 }
 
+/// The summary label for a source. A file read carries its format in the path (or a
+/// `format` hint), not in the connector name, so it resolves separately; everything
+/// else is named by its connector.
+fn sourceLabel(env: *Env, rd: ast.Read, hints: []const ast.Hint) []const u8 {
+    return switch (rd.form) {
+        .path => |p| analyze.formatLabel(p, hints),
+        else => connectorType(env, rd.connector),
+    };
+}
+
 fn connectorType(env: *Env, name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "csv") or std.mem.eql(u8, name, "request") or
         std.mem.eql(u8, name, "http") or std.mem.eql(u8, name, "buffer")) return name;
@@ -4445,7 +4455,7 @@ fn buildPipeline(env: *Env, stages: []const ast.Stage) anyerror!PipeRes {
             cs.* = .{ .inner = raw, .count = env.rows_read };
             const src = cs.source();
             try env.sources.append(src);
-            if (env.src_name.len == 0) env.src_name = connectorType(env, rd.connector);
+            if (env.src_name.len == 0) env.src_name = sourceLabel(env, rd, stages[0].hints);
             const scan = try env.arena.create(op.Scan);
             scan.* = .{ .src = src };
             current = .{ .scan = scan };
@@ -4697,7 +4707,7 @@ fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint) anyerror!PipeRes
         cs.* = .{ .inner = raw, .count = env.rows_read };
         const src = cs.source();
         try env.sources.append(src);
-        if (env.src_name.len == 0) env.src_name = connectorType(env, s.read.connector);
+        if (env.src_name.len == 0) env.src_name = sourceLabel(env, s.read, hints);
         const scan = try arena.create(op.Scan);
         scan.* = .{ .src = src };
         children[i] = .{ .scan = scan };

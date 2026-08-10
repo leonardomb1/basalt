@@ -963,6 +963,20 @@ fn formatOfPath(path: []const u8) ?FileFormat {
     return null;
 }
 
+/// The label the run summary shows for a file source or sink: the format actually
+/// resolved, not the connector name. A bare path lowers to the `csv` connector
+/// whatever its extension, so reporting the connector announced every serial
+/// parquet scan as `csv` — the summary is the main feedback channel, and it was
+/// naming the wrong reader.
+///
+/// A malformed `format` hint is `analyzeOne`'s error to raise, not a label's, so an
+/// unresolvable format falls back to the extension and then to `csv`.
+pub fn formatLabel(path: []const u8, hints: []const ast.Hint) []const u8 {
+    var d = Diag{};
+    const explicit = formatFromHints(hints, &d) catch null;
+    return @tagName(explicit orelse formatOfPath(path) orelse .csv);
+}
+
 /// Why this path cannot be read or written as a table, or null when it can.
 ///
 /// Every unrecognised extension used to fall through to the CSV reader, silently.
@@ -1588,6 +1602,23 @@ test "analyze rejects `is empty` on a non-string operand" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     try expectAnalyzeErr(ar.allocator(), "id,amount\n1,100\n", "SELECT * FROM '$IN' WHERE CAST(amount AS INT) IS EMPTY");
+}
+
+test "formatLabel names the reader, not the connector" {
+    const no_hints: []const ast.Hint = &.{};
+    // The bug: a bare path lowers to the `csv` connector, so a serial parquet scan
+    // announced itself as csv in the run summary.
+    try std.testing.expectEqualStrings("parquet", formatLabel("t.parquet", no_hints));
+    try std.testing.expectEqualStrings("csv", formatLabel("t.csv", no_hints));
+    // The innermost name wins, so a compressed or archived CSV is still csv.
+    try std.testing.expectEqualStrings("csv", formatLabel("t.csv.gz", no_hints));
+    try std.testing.expectEqualStrings("csv", formatLabel("a.zip :: t.csv", no_hints));
+    // An explicit hint outranks the extension.
+    const as_parquet: []const ast.Hint = &.{.{ .key = "format", .value = .{ .str = "parquet" }, .pos = .{ .line = 1, .col = 1 } }};
+    try std.testing.expectEqualStrings("parquet", formatLabel("t.dat", as_parquet));
+    // An unknown extension is `unreadableTarget`'s error to raise; the label just
+    // must not crash or claim parquet.
+    try std.testing.expectEqualStrings("csv", formatLabel("t.dat", no_hints));
 }
 
 test "analyze rejects `?.` safe navigation on a plain column reference" {
