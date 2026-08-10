@@ -138,6 +138,37 @@ entirely about which shapes reach a parallel path.
 q12's 1.8× is still short of q01's 3.3× because its build side — all of
 `orders.parquet` — is materialised serially before the fan-out starts.
 
+### The movement suite
+
+| query | baseline | now | |
+| --- | --- | --- | --- |
+| move-m01 (parquet→csv) | 1692 ms | **262 ms** | 6.5× |
+| move-m02 (csv→csv) | 2776 ms | **1007 ms** | 2.8× |
+| move-m03 (csv→csv, 2% kept) | 889 ms | 896 ms | — |
+
+Two causes, and neither was the read path:
+
+- **A string allocated per field.** The writer called `valueToString` for every
+  non-text value: allocate, format, copy into the output buffer, drop. Numbers and
+  timestamps now format straight into the buffer, since they can only need CSV
+  quoting when the delimiter is itself one of `[0-9+-.:eE ]`, which is a per-writer
+  constant.
+- **Formatting under the sink lock.** A shared sink held one mutex across the whole
+  of `writeBatch`, so every lane queued behind one thread doing all the formatting.
+  Write-heavy jobs therefore got *slower* with more threads — m01 was 752 ms at
+  `-j 1` and 835 ms at `-j 16`. Lanes now render into their own buffer and hold the
+  lock only for the append.
+
+Scaling, before and after that second change:
+
+```
+m01   before  j1=752  j4=798  j16=835      after  j1=754  j4=368  j16=276
+m02   before  j1=2071 j4=1584 j16=1860     after  j1=2071 j4=1407 j16=997
+```
+
+m03 barely writes, so it was never affected — which is exactly why comparing it
+against m02 located the sink in the first place.
+
 So: compare thread counts before concluding anything about a query's per-row cost.
 A flat line here means the shape never reached a parallel path, not that the engine
 is slow per row.

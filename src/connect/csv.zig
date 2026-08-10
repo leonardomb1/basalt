@@ -958,7 +958,13 @@ pub const CsvWriter = struct {
     }
 
     fn writeRows(self: *CsvWriter, arena: std.mem.Allocator, batch: Batch) !void {
-        const w = self.out();
+        return self.renderRows(self.out(), arena, batch);
+    }
+
+    /// Format `batch` into `w`. Split out from `writeRows` so a parallel lane can
+    /// render into its own buffer and hold the shared sink's lock only for the
+    /// append — see `driver.Sink.VTable.renderBatch`.
+    fn renderRows(self: *CsvWriter, w: *std.Io.Writer, arena: std.mem.Allocator, batch: Batch) !void {
         const d = self.dialect.delim;
         // Whether a number or timestamp could need quoting under this dialect —
         // constant for the whole run, so it is decided once rather than per field.
@@ -991,6 +997,22 @@ pub const CsvWriter = struct {
             }
             try w.writeByte('\n');
         }
+    }
+
+    /// Rows as bytes, allocated from the caller's arena. One allocation per batch,
+    /// versus one per field before the numeric fast path landed.
+    pub fn renderBatch(self: *CsvWriter, arena: std.mem.Allocator, batch: Batch) ![]const u8 {
+        var aw = std.Io.Writer.Allocating.init(arena);
+        // One row of a typical schema is a few dozen bytes; sizing up front keeps the
+        // growth out of the per-batch path. The arena is the lane's, so this is freed
+        // wholesale when the lane resets it.
+        try aw.ensureUnusedCapacity(batch.len * 64 + 64);
+        self.renderRows(&aw.writer, arena, batch) catch |e| return self.specific(e);
+        return aw.writer.buffered();
+    }
+
+    pub fn writeRendered(self: *CsvWriter, bytes: []const u8) !void {
+        self.out().writeAll(bytes) catch |e| return self.specific(e);
     }
 
     pub fn close(self: *CsvWriter) !void {
@@ -1029,7 +1051,17 @@ const sink_vtable = driver.Sink.VTable{
     .writeBatch = sinkWrite,
     .close = sinkClose,
     .abort = sinkAbort,
+    .renderBatch = sinkRender,
+    .writeRendered = sinkWriteRendered,
 };
+fn sinkRender(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror![]const u8 {
+    const self: *CsvWriter = @ptrCast(@alignCast(ptr));
+    return self.renderBatch(arena, b);
+}
+fn sinkWriteRendered(ptr: *anyopaque, bytes: []const u8) anyerror!void {
+    const self: *CsvWriter = @ptrCast(@alignCast(ptr));
+    return self.writeRendered(bytes);
+}
 fn sinkWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
     const self: *CsvWriter = @ptrCast(@alignCast(ptr));
     return self.writeBatch(arena, b);
@@ -1646,6 +1678,43 @@ test "csv writer: a delimiter that collides with a number still round-trips" {
         try std.testing.expectEqual(@as(usize, 2), back.columns.len);
         try std.testing.expectEqual(@as(i64, 7), back.columns[1].getValue(0).int);
     }
+}
+
+test "csv writer: renderBatch produces exactly what writeBatch writes" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+
+    // A parallel lane formats with `renderBatch` and appends with `writeRendered`,
+    // while a serial run calls `writeBatch`. If those two disagree, output silently
+    // depends on `-j`. Same schema, same rows, same dialect — assert the same bytes.
+    var names = [_][]const u8{ "i", "f", "s" };
+    var kinds = [_]types.TypeKind{ .int, .float, .string };
+    const schema = try typedSchema(a, &names, &kinds);
+    const rows = "1,2.5,ok\n-7,,\n0,-0.125,\"has,comma\"\n";
+
+    const direct = try std.fs.path.join(a, &.{ base, "direct.csv" });
+    const wd = try CsvWriter.open(a, direct, schema, .truncate, .{});
+    try wd.writeBatch(a, try parseSlice(a, &schema, rows));
+    try wd.close();
+
+    const staged = try std.fs.path.join(a, &.{ base, "staged.csv" });
+    const ws = try CsvWriter.open(a, staged, schema, .truncate, .{});
+    const bytes = try ws.renderBatch(a, try parseSlice(a, &schema, rows));
+    try ws.writeRendered(bytes);
+    try ws.close();
+
+    const got_direct = try tmp.dir.readFileAlloc(a, "direct.csv", 1 << 16);
+    const got_staged = try tmp.dir.readFileAlloc(a, "staged.csv", 1 << 16);
+    try std.testing.expectEqualStrings(got_direct, got_staged);
+    // And the rendered bytes are the rows alone — the header belongs to `open`.
+    try std.testing.expectEqualStrings("1,2.5,ok\n-7,,\n0,-0.125,\"has,comma\"\n", bytes);
+
+    // The sink must advertise the capability, or the lane path silently never uses it.
+    try std.testing.expect(ws.sink().canRender());
 }
 
 test "scalarCanNeedQuote: only a delimiter a number could contain forces the scan" {

@@ -35,6 +35,16 @@ pub const SinkMode = union(enum) {
 pub fn writeLaneBatch(mode: SinkMode, mtx: *std.Thread.Mutex, own: ?driver.Sink, a: std.mem.Allocator, b: batchmod.Batch) !void {
     switch (mode) {
         .shared => |snk| {
+            // Format first, lock second. Holding the mutex across the whole write made
+            // a write-heavy move *slower* with more lanes — 6M rows of parquet to CSV
+            // took 752ms at -j 1 and 835ms at -j 16, because every lane queued behind
+            // one thread doing all the formatting.
+            if (snk.canRender()) {
+                const bytes = try snk.renderBatch(a, b).?;
+                mtx.lock();
+                defer mtx.unlock();
+                return snk.writeRendered(bytes);
+            }
             mtx.lock();
             defer mtx.unlock();
             try snk.writeBatch(a, b);

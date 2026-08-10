@@ -123,10 +123,35 @@ pub const Sink = struct {
         /// flushes that already happened stays committed (the exactly-once
         /// story is owned by downstream dedup, per split.zig).
         abort: *const fn (*anyopaque) void,
+        /// Format a batch to bytes without writing it.
+        ///
+        /// A `shared` sink is written under one mutex, and holding that mutex across
+        /// `writeBatch` serialises the *formatting* too — which is the expensive part.
+        /// A sink that can split rendering from writing lets every lane format
+        /// concurrently and hold the lock only for the append. Null (the default) for
+        /// sinks with no byte-stream form, or whose writes are already cheap; those
+        /// keep taking the plain `writeBatch` path.
+        renderBatch: ?*const fn (*anyopaque, std.mem.Allocator, Batch) anyerror![]const u8 = null,
+        /// Append bytes produced by `renderBatch`. Only meaningful together with it.
+        writeRendered: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     };
 
     pub fn writeBatch(self: Sink, arena: std.mem.Allocator, b: Batch) anyerror!void {
         return self.vtable.writeBatch(self.ptr, arena, b);
+    }
+
+    /// Non-null only when this sink can format outside a shared lock.
+    pub fn renderBatch(self: Sink, arena: std.mem.Allocator, b: Batch) ?anyerror![]const u8 {
+        const f = self.vtable.renderBatch orelse return null;
+        return f(self.ptr, arena, b);
+    }
+
+    pub fn writeRendered(self: Sink, bytes: []const u8) anyerror!void {
+        return self.vtable.writeRendered.?(self.ptr, bytes);
+    }
+
+    pub fn canRender(self: Sink) bool {
+        return self.vtable.renderBatch != null and self.vtable.writeRendered != null;
     }
     pub fn close(self: Sink) anyerror!void {
         return self.vtable.close(self.ptr);
