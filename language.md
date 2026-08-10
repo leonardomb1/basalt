@@ -433,9 +433,11 @@ FROM 'movimentos.csv';
 - `PARTITION BY` is optional; without it the whole input is one partition.
 - A window function must be the **whole** select item: `ROW_NUMBER() OVER (...) + 1` is
   not accepted, because a window is a stage rather than an expression.
-- Its column is **appended** to the projection, so every column the window touches — the
-  partition keys, the order keys, and the function's own argument — has to be projected
-  as well. The stage adds to the projection rather than reaching behind it.
+- Its column is **appended** to the projection. Columns the window itself names — the
+  partition keys, the order keys and the function's argument — do **not** have to be
+  projected: they are carried through hidden and dropped afterwards, so
+  `SELECT LAG(v) OVER (PARTITION BY k ORDER BY t) AS prev FROM 't.csv'` returns `prev`
+  alone.
 - Several window functions in one `SELECT` may share one `OVER (...)` —
   `MIN(v) OVER (w), MAX(v) OVER (w)` is fine. Two *different* windows are refused; write
   the second as a separate query or wrap the first in a derived table.

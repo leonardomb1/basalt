@@ -1166,12 +1166,14 @@ pub const Parser = struct {
         var win_part = std.array_list.Managed(ast.QualName).init(self.arena);
         var win_ord = std.array_list.Managed(ast.SortKey).init(self.arena);
         var win_frame: ast.WinFrame = .{};
+        var win_outs = std.array_list.Managed([]const u8).init(self.arena);
         while (true) {
             // `ROW_NUMBER() OVER (PARTITION BY .. ORDER BY ..)` is recognised as a whole
             // select item, before the expression parser sees it: a window function is a
             // stage, not an expression, and lifting one out of the middle of an
             // arithmetic expression would need the machinery `IN (SELECT ...)` needs.
             if (try self.parseWindowItem(&win_funcs, &win_part, &win_ord, &win_frame)) {
+                try win_outs.append(win_funcs.items[win_funcs.items.len - 1].out);
                 if (!self.eat(.comma)) break;
                 continue;
             }
@@ -1564,7 +1566,7 @@ pub const Parser = struct {
                 }
                 try stages.append(.{ .node = .{ .select = try post.toOwnedSlice() }, .hints = &.{}, .pos = pos });
             }
-        } else {
+        } else if (win_funcs.items.len == 0) {
             const lone_star = items.items.len == 1 and items.items[0] == .star;
             if (!lone_star) {
                 try stages.append(.{ .node = .{ .select = try items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
@@ -1576,12 +1578,49 @@ pub const Parser = struct {
         }
 
         if (win_funcs.items.len > 0) {
+            // A window's columns are referenced only inside `OVER (...)`, so the
+            // projection above — computed from the ordinary SELECT items — prunes them
+            // and the window operator then cannot resolve them. The error even migrates
+            // as you project more of them by hand. Carry each reference through as a
+            // hidden column and drop it after the window, which is what an outer
+            // `ORDER BY` already does for its own keys.
+            var refs = std.array_list.Managed([]const u8).init(self.arena);
+            for (win_part.items) |q| try refs.append(q.last());
+            for (win_ord.items) |k| try refs.append(k.field.last());
+            for (win_funcs.items) |f| {
+                if (f.arg) |q| try refs.append(q.last());
+            }
+            for (refs.items) |name| {
+                var have = false;
+                for (items.items) |it| switch (it) {
+                    // A star already carries everything.
+                    .star, .star_except, .star_rename => have = true,
+                    .field => |q| {
+                        if (std.ascii.eqlIgnoreCase(q.last(), name)) have = true;
+                    },
+                    .computed => |c| {
+                        if (std.ascii.eqlIgnoreCase(c.name, name)) have = true;
+                    },
+                };
+                if (!have) try items.append(.{ .field = try self.singleName(name) });
+            }
+            // The projection is emitted here rather than by the branch below, since the
+            // hidden columns have to be in it.
+            if (items.items.len > 0) {
+                try stages.append(.{ .node = .{ .select = try items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
+            }
             try stages.append(.{ .node = .{ .window = .{
                 .funcs = try win_funcs.toOwnedSlice(),
                 .partition_by = try win_part.toOwnedSlice(),
                 .order_by = try win_ord.toOwnedSlice(),
                 .frame = win_frame,
             } }, .hints = &.{}, .pos = pos });
+            // Back to what the SELECT asked for: its own items, the hidden columns
+            // gone, the window's outputs after them.
+            var out_items = std.array_list.Managed(ast.SelectItem).init(self.arena);
+            try out_items.appendSlice(post.items);
+            for (win_outs.items) |name| try out_items.append(.{ .field = try self.singleName(name) });
+            try stages.append(.{ .node = .{ .select = try out_items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
         }
 
         var union_branch: ?BranchInfo = null;

@@ -6188,6 +6188,34 @@ test "aggregate: the same expression twice still shares one accumulator" {
     try std.testing.expectEqualStrings("d,c\n240,63\n", out);
 }
 
+test "window: a column only named inside OVER survives the projection" {
+    const alloc = std.testing.allocator;
+    var t1 = std.testing.tmpDir(.{});
+    defer t1.cleanup();
+    // Reported against 0.6.2. The projection was built from the ordinary SELECT items,
+    // so `categoria`, `id` and `valor` were pruned before the window operator ran and
+    // resolution failed — the error even migrated as you projected them by hand. They
+    // are now carried through hidden and dropped afterwards, the way an outer ORDER BY
+    // already treats its own keys. Output is `ant` alone.
+    const out = try runToString(alloc, &t1,
+        "id,categoria,valor\n1,a,10\n2,a,20\n3,b,5\n",
+        "SELECT LAG(valor) OVER (PARTITION BY categoria ORDER BY id) AS ant FROM '$IN'",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("ant\n\n10\n\n", out);
+
+    var t2 = std.testing.tmpDir(.{});
+    defer t2.cleanup();
+    // The shape the reporter's checksums use: the outer query names none of the inner
+    // columns at all.
+    const sub = try runToString(alloc, &t2,
+        "id,categoria,valor\n1,a,10\n2,a,20\n3,b,5\n",
+        "SELECT SUM(ant) AS s FROM (SELECT LAG(valor) OVER (PARTITION BY categoria ORDER BY id) AS ant FROM '$IN') x",
+    );
+    defer alloc.free(sub);
+    try std.testing.expectEqualStrings("s\n10\n", sub);
+}
+
 test "window: row_number, rank and dense_rank number within a partition" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
