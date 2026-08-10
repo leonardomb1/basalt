@@ -2,9 +2,12 @@
 //!
 //! `bench.zig` gates the SIMD kernels; this gates the *engine*. It runs committed
 //! scripts through the real CLI, times the whole pipeline, and — where a DuckDB
-//! reference exists — checks the answer as well as the clock. Two suites:
+//! reference exists — checks the answer as well as the clock. Three suites:
 //!
 //!   tpch-*   compute: scan, filter, join, GROUP BY, sort. What DuckDB is good at.
+//!   ssb-*    star schema: one fact table joined to two, three or four dimensions
+//!            with the filters on the dimensions — the shape most warehouse queries
+//!            actually have, and the one the join-chain fan-out exists for.
 //!   move-*   movement: read every row, serialise every row, write it. What basalt
 //!            is *for*, and what no analytics benchmark measures.
 //!
@@ -21,7 +24,7 @@
 
 const std = @import("std");
 
-const Suite = enum { tpch, movement };
+const Suite = enum { tpch, ssb, tpcds, movement };
 
 const Query = struct {
     name: []const u8,
@@ -38,6 +41,24 @@ const queries = [_]Query{
     .{ .name = "tpch-q06", .suite = .tpch, .script = "bench/tpch/q06.sql", .ref = "bench/reference/q06.sql" },
     .{ .name = "tpch-q12", .suite = .tpch, .script = "bench/tpch/q12.sql", .ref = "bench/reference/q12.sql" },
     .{ .name = "tpch-q14", .suite = .tpch, .script = "bench/tpch/q14.sql", .ref = "bench/reference/q14.sql" },
+    .{ .name = "ssb-q11", .suite = .ssb, .script = "bench/ssb/q11.sql", .ref = "bench/reference/ssb_q11.sql" },
+    .{ .name = "ssb-q12", .suite = .ssb, .script = "bench/ssb/q12.sql", .ref = "bench/reference/ssb_q12.sql" },
+    .{ .name = "ssb-q13", .suite = .ssb, .script = "bench/ssb/q13.sql", .ref = "bench/reference/ssb_q13.sql" },
+    .{ .name = "ssb-q21", .suite = .ssb, .script = "bench/ssb/q21.sql", .ref = "bench/reference/ssb_q21.sql" },
+    .{ .name = "ssb-q22", .suite = .ssb, .script = "bench/ssb/q22.sql", .ref = "bench/reference/ssb_q22.sql" },
+    .{ .name = "ssb-q23", .suite = .ssb, .script = "bench/ssb/q23.sql", .ref = "bench/reference/ssb_q23.sql" },
+    .{ .name = "ssb-q31", .suite = .ssb, .script = "bench/ssb/q31.sql", .ref = "bench/reference/ssb_q31.sql" },
+    .{ .name = "ssb-q32", .suite = .ssb, .script = "bench/ssb/q32.sql", .ref = "bench/reference/ssb_q32.sql" },
+    .{ .name = "ssb-q33", .suite = .ssb, .script = "bench/ssb/q33.sql", .ref = "bench/reference/ssb_q33.sql" },
+    .{ .name = "ssb-q34", .suite = .ssb, .script = "bench/ssb/q34.sql", .ref = "bench/reference/ssb_q34.sql" },
+    .{ .name = "ssb-q41", .suite = .ssb, .script = "bench/ssb/q41.sql", .ref = "bench/reference/ssb_q41.sql" },
+    .{ .name = "ssb-q42", .suite = .ssb, .script = "bench/ssb/q42.sql", .ref = "bench/reference/ssb_q42.sql" },
+    .{ .name = "ssb-q43", .suite = .ssb, .script = "bench/ssb/q43.sql", .ref = "bench/reference/ssb_q43.sql" },
+    .{ .name = "tpcds-q03", .suite = .tpcds, .script = "bench/tpcds/q03.sql", .ref = "bench/reference/tpcds_q03.sql" },
+    .{ .name = "tpcds-q42", .suite = .tpcds, .script = "bench/tpcds/q42.sql", .ref = "bench/reference/tpcds_q42.sql" },
+    .{ .name = "tpcds-q52", .suite = .tpcds, .script = "bench/tpcds/q52.sql", .ref = "bench/reference/tpcds_q52.sql" },
+    .{ .name = "tpcds-q55", .suite = .tpcds, .script = "bench/tpcds/q55.sql", .ref = "bench/reference/tpcds_q55.sql" },
+    .{ .name = "tpcds-q96", .suite = .tpcds, .script = "bench/tpcds/q96.sql", .ref = "bench/reference/tpcds_q96.sql" },
     .{ .name = "move-m01", .suite = .movement, .script = "bench/movement/m01_parquet_to_csv.sql", .ref = null },
     .{ .name = "move-m02", .suite = .movement, .script = "bench/movement/m02_csv_to_csv.sql", .ref = null },
     .{ .name = "move-m03", .suite = .movement, .script = "bench/movement/m03_csv_filtered.sql", .ref = null },

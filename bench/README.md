@@ -42,7 +42,7 @@ timed runs after one warmup; `--filter <s>` selects by name substring.
 and a Debug basalt is 15–170× slower — enough to invent regressions that do not
 exist. The harness cannot detect this, so it is on you.
 
-## The two suites
+## The suites
 
 `tpch-*` — **compute**: scan, filter, join, GROUP BY, sort. What DuckDB is built
 for, and therefore the honest place to measure the gap. Each has a DuckDB
@@ -55,6 +55,32 @@ compute. This is what basalt is *for* and what no analytics benchmark measures. 
 reference: there is no interesting answer to compare, only throughput. `m02` and
 `m03` share a projection so the difference between them is only the filter — the
 line to watch when changing how filtered rows are materialised.
+
+`ssb-*` — **star schema**: one fact table joined to two, three or four dimensions
+with the filters on the dimensions. This is the shape most warehouse queries actually
+have, and the one the join-chain fan-out exists for. Fixtures are SSB derived from
+TPC-H SF1 by `bench/ssb_gen.sql` (the standard derivation: `lineitem`+`orders`
+denormalised into a `lineorder` fact, dimensions widened with region/nation/city, a
+generated date dimension). Not `ssb-dbgen` output, so absolute numbers are not
+comparable to published SSB results — both engines read identical files, which is
+what makes the comparison valid.
+
+`tpcds-*` — **five of the 99 TPC-DS queries**, ported from the spec's comma-join form
+to explicit joins with the dimensions as CTEs. Only five because only **23 of the 99
+are expressible in this dialect at all**; the other 76 need a construct it does not
+have:
+
+| blocker | queries |
+| --- | --- |
+| subqueries (any position) | 70 |
+| window functions | 15 |
+| `ROLLUP` / `GROUPING SETS` | 10 |
+| `EXISTS` | 5 |
+| `INTERSECT` / `EXCEPT` as set operators | 4 |
+
+The expressible 23 are 3, 7, 13, 15, 17, 19, 25, 26, 29, 37, 40, 42, 43, 48, 50, 52,
+55, 72, 82, 84, 85, 91 and 96 — which are, not coincidentally, the star-schema-shaped
+ones. Generate the fixtures with `bench/tpcds_gen.sql`.
 
 Deviations from the TPC-H spec, all applied to both sides equally: `q14` emits its
 two SUMs rather than their ratio, and dimension tables are lifted into CTEs
@@ -137,6 +163,26 @@ entirely about which shapes reach a parallel path.
 
 q12's 1.8× is still short of q01's 3.3× because its build side — all of
 `orders.parquet` — is materialised serially before the fan-out starts.
+
+### Star-schema suites, first run
+
+basalt 0.5.9 against DuckDB 1.5.5, min of 2, same machine. Every query exact.
+
+| suite | queries | ratio range |
+| --- | --- | --- |
+| `tpcds-*` | 5 (of the 23 expressible) | **2.4 – 2.8×** |
+| `ssb-*` | 13 | **3.3 – 5.6×** |
+| `tpch-*` | 5 | 3.0 – 12.7× |
+
+The pattern is consistent: the closer a query is to a pure star-schema aggregation,
+the closer basalt gets. That is the shape the join-chain fan-out handles, and it is
+also the shape the dialect can express — the 23 runnable TPC-DS queries are the
+star-shaped ones.
+
+Every SSB query fans out, including `q4.1`'s four-join chain: 893 ms at `-j 1` against
+291 ms at `-j 16`. On 0.5.7 the whole SSB suite could not run at all — every query puts
+its dimensions in a CTE, and a dynamic path inside a CTE reached the reader as a
+literal `${data}`.
 
 ### The movement suite
 
