@@ -111,15 +111,31 @@ lanes, so these are CPU not wall):
 
 ### Since the baseline
 
-- **q06 457 ms → 121 ms** (18.3× → 5.0×). Not a kernel change: the parallel parquet
-  path used to refuse an ungrouped aggregate and hand it to the serial driver, so
-  `SELECT SUM(x) FROM t WHERE ...` ran on one core. `-j 1` and `-j 16` were within
-  a millisecond of each other.
+Four of the five queries were running on **one core** of sixteen — `-j 1` and `-j 16`
+were within a millisecond of each other — and the one query that did fan out (q01)
+had the smallest gap of the set. None of what follows is a kernel change; it is
+entirely about which shapes reach a parallel path.
 
-Worth knowing when reading any row above: **q03, q12 and q14 are still serial**, and
-that is most of their gap. `classifyAggPipeline` rejects any pipeline containing a
-join, so join-then-aggregate has no parallel path at all. Compare thread counts
-before concluding anything about a query's per-row cost:
+| query | baseline | now | ratio then → now |
+| --- | --- | --- | --- |
+| q06 | 457 ms | **126 ms** | 18.3× → **5.3×** |
+| q12 | 665 ms | **380 ms** | 22.9× → **12.7×** |
+| q14 | 357 ms | **117 ms** | 9.2× → **2.9×** |
+
+- **q06** — the parallel parquet path refused an ungrouped aggregate outright, so
+  `SELECT SUM(x) FROM t WHERE ...` went to the serial driver.
+- **q12, q14** — join-then-aggregate matched no classifier: `classifyAggPipeline`
+  rejects a `.join`, `classifyMapJoinPipeline` rejects the aggregate because it is a
+  breaker. It fell between them and ran serially.
+
+**q03 is still serial**, and that is most of its remaining 15.7×: it has *two* joins
+and the classifier admits exactly one. q12's 1.7× is also short of q01's 3.3× because
+its build side — all of `orders.parquet` — is still materialised serially before the
+fan-out starts.
+
+So: compare thread counts before concluding anything about a query's per-row cost.
+A flat line here means the shape never reached a parallel path, not that the engine
+is slow per row.
 
 ```sh
 for j in 1 4 16; do zig build run -Doptimize=ReleaseFast -- run bench/tpch/q12.sql \

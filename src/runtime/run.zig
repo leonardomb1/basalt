@@ -789,6 +789,8 @@ fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lane
     {
         if (classifyAggPipeline(stages)) |shape| {
             if (try runParallelParquetAgg(env, stages[0].node.read, stages[0 .. stages.len - 1], shape.prefix, shape.ag, shape.tail, last.write, opts, stats, lanes_used)) return;
+        } else if (classifyAggJoinPipeline(stages)) |js| {
+            if (try runParallelParquetAggJoin(env, stages[0].node.read, stages[0 .. stages.len - 1], js, last.write, opts, stats, lanes_used)) return;
         } else if (classifyDistinctPipeline(stages)) |ds| {
             if (try runParallelParquetDistinct(env, stages[0].node.read, stages[0 .. stages.len - 1], ds.prefix, ds.dist, ds.tail, last.write, opts, stats, lanes_used)) return;
         } else if (classifyTopNPipeline(stages)) |tn| {
@@ -1514,6 +1516,9 @@ const PqAggCtx = struct {
     aggs: []const op.Aggregate.Agg,
     lanes: []PqLane,
     rows_read: *std.atomic.Value(u64),
+    /// Set for the join-then-aggregate shape: the shared build index plus the
+    /// post-join stages each lane rebuilds over it. Null is the plain aggregate.
+    join: ?LaneJoin = null,
 };
 
 /// Pulls row-group morsels off the shared queue and presents them as one
@@ -1599,7 +1604,8 @@ fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
     };
     var cs = obs.CountingSource{ .inner = .{ .ptr = &ms, .vtable = &MorselSource.vtable }, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const child = try buildMapChain(la, ctx.params, ctx.prefix, &scan, ctx.morsels.src_schema);
+    const mapped = try buildMapChain(la, ctx.params, ctx.prefix, &scan, ctx.morsels.src_schema);
+    const child = if (ctx.join) |lj| try buildLaneJoinChain(la, ctx.params, lj, mapped) else mapped;
     var agg = op.Aggregate{
         .child = child,
         .in_schema = ctx.agg_in_schema,
@@ -1884,7 +1890,58 @@ fn runParallelParquetMapImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
     return true;
 }
 
-/// Parallel aggregate over a local parquet file, one morsel per row group.
+/// `read … | (filter|select)* | join | (filter|select)* | aggregate | (sort|limit)* | write`
+/// — one hash join whose result is then aggregated. Recognised separately from
+/// `classifyAggPipeline`, which rejects a `.join` outright, and from
+/// `classifyMapJoinPipeline`, which rejects the aggregate (a breaker). Falling between
+/// the two meant join-then-aggregate had no parallel path at all: TPC-H q12 and q14
+/// ran identically at `-j 1` and `-j 16`.
+///
+/// Same restrictions as the two shapes it bridges: exactly one join, and nothing but
+/// a sort/limit tail after the aggregate (a `HAVING` filter lands there and disqualifies
+/// the shape, matching `classifyAggPipeline`).
+const AggJoinShape = struct {
+    map_stages: []const ast.Stage,
+    join: ast.Join,
+    join_hints: []const ast.Hint,
+    suffix: []const ast.Stage,
+    ag: ast.Aggregate,
+    tail: []const ast.Stage,
+};
+
+fn classifyAggJoinPipeline(stages: []const ast.Stage) ?AggJoinShape {
+    if (stages.len < 4) return null;
+    if (stages[stages.len - 1].node != .write) return null;
+    const middle = stages[1 .. stages.len - 1];
+    var ji: ?usize = null;
+    var ai: ?usize = null;
+    for (middle, 0..) |st, i| switch (st.node) {
+        .filter, .select => if (ai != null) return null,
+        .join => {
+            // One join, and it has to precede the aggregate: a second one, or a join
+            // fed by an aggregate, is a different (unhandled) shape.
+            if (ji != null or ai != null) return null;
+            ji = i;
+        },
+        .aggregate => {
+            if (ai != null) return null;
+            ai = i;
+        },
+        .sort, .limit => if (ai == null) return null,
+        else => return null,
+    };
+    const j = ji orelse return null;
+    const a = ai orelse return null;
+    return .{
+        .map_stages = middle[0..j],
+        .join = middle[j].node.join,
+        .join_hints = middle[j].hints,
+        .suffix = middle[j + 1 .. a],
+        .ag = middle[a].node.aggregate,
+        .tail = middle[a + 1 ..],
+    };
+}
+
 /// Parallel aggregate over a local parquet file, one morsel per row group.
 /// Two phases, neither of which takes a lock: lanes fold disjoint row groups
 /// into private tables, then the tables are merged by hash partition.
@@ -1892,6 +1949,17 @@ fn runParallelParquetMapImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
 /// Returns false (serial fallback) when the file has too few row groups to
 /// split, or when fewer than `pq_min_lanes` lanes are available.
 fn runParallelParquetAgg(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    return runParallelParquetAggImpl(env, rd, pipeline, prefix, ag, tail, null, w, opts, stats, lanes_used);
+}
+
+/// The join-then-aggregate shape: the build side is materialized once into a shared
+/// index (exactly as the map+join path does) and each lane probes it, then folds its
+/// own morsels into its own partial group set.
+fn runParallelParquetAggJoin(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, js: AggJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    return runParallelParquetAggImpl(env, rd, pipeline, js.map_stages, js.ag, js.tail, js, w, opts, stats, lanes_used);
+}
+
+fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, jshape: ?AggJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     const arena = env.arena;
     const path = switch (rd.form) {
         .path => |p| p,
@@ -1900,6 +1968,10 @@ fn runParallelParquetAgg(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, p
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
     if (opts.threads < pq_min_lanes) return false;
 
+    // The whole pipeline, join included: `projectedColumns` understands a `.join`
+    // stage (it contributes the left keys) and the serial driver has always derived
+    // the projection this way. Restricting it to the pre-join stages made it bail to
+    // "read every column", which cost q14 more than the parallelism won back.
     const project = try projectedColumns(env, pipeline[1..]);
     const bounds = try filterBounds(env, pipeline[1..]);
     const probe = pqdecode.Reader.openProjected(arena, path, project) catch return false;
@@ -1907,7 +1979,23 @@ fn runParallelParquetAgg(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, p
     if (ngroups < 2) return false;
 
     const src_schema = try schemaPtr(arena, probe.schema);
-    const agg_in = try schemaPtr(arena, try mapChainSchema(env, prefix, src_schema.*));
+    var agg_in_schema = try mapChainSchema(env, prefix, src_schema.*);
+
+    // The build side is materialized here, once, and every lane probes it read-only.
+    // `resolveLaneJoin` also prevalidates the post-join stages and hands back the
+    // schema they produce — which is exactly what the aggregate reads.
+    var lane_join: ?LaneJoin = null;
+    if (jshape) |js| {
+        const lp = try resolveLaneJoin(env, .{
+            .prefix = js.map_stages,
+            .join = js.join,
+            .join_hints = js.join_hints,
+            .suffix = js.suffix,
+        }, agg_in_schema);
+        lane_join = lp.lane;
+        agg_in_schema = lp.out_schema;
+    }
+    const agg_in = try schemaPtr(arena, agg_in_schema);
 
     var ad = analyze.Diag{};
     const apl = analyze.aggregatePlan(arena, agg_in.*, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
@@ -1946,6 +2034,7 @@ fn runParallelParquetAgg(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, p
         .aggs = aggs,
         .lanes = lanes,
         .rows_read = env.rows_read,
+        .join = lane_join,
     };
 
     const t_fold0 = std.time.Instant.now() catch unreachable;
@@ -5890,8 +5979,9 @@ fn runCsvThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []c
 
 /// A parquet file with three row groups — enough for the parallel scan, which needs
 /// at least `pq_min_lanes` lanes and more than one row group. 5000 rows of
-/// `id = 1..5000` and `f = id * 0.5`, so `SUM(id)` and `SUM(f)` are both exactly
-/// representable and the assertion holds whatever order the lanes add in.
+/// `id = 1..5000`, `f = id * 0.5` and `g = id % 4` (a low-cardinality group key), so
+/// `SUM(id)` and `SUM(f)` are both exactly representable and the assertion holds
+/// whatever order the lanes add in.
 const fx_rg2 = @embedFile("testdata/rg2.parquet");
 
 /// Run a query over `fx_rg2` at an explicit thread count, returning out.csv.
@@ -5947,6 +6037,45 @@ test "parallel parquet aggregate: an ungrouped agg under a filter (threads>1)" {
     const par = try runParquetThreaded(alloc, &tmp, "SELECT COUNT(*) AS n, SUM(id) AS sid FROM '$IN' WHERE id <= 100", 4);
     defer alloc.free(par);
     try std.testing.expectEqualStrings("n,sid\n100,5050\n", par);
+}
+
+test "parallel parquet aggregate: a join then an ungrouped agg (threads>1)" {
+    const alloc = std.testing.allocator;
+    // Neither classifier used to admit this: `classifyAggPipeline` rejects a join and
+    // `classifyMapJoinPipeline` rejects the aggregate, so join-then-aggregate had no
+    // parallel path and TPC-H q12/q14 ran the same at -j 1 and -j 16.
+    const q = "WITH d AS (SELECT id AS did FROM '$IN' WHERE id <= 50) " ++
+        "SELECT COUNT(*) AS n, SUM(f) AS sf FROM '$IN' JOIN d ON id = did";
+    var t1 = std.testing.tmpDir(.{});
+    defer t1.cleanup();
+    const serial = try runParquetThreaded(alloc, &t1, q, 1);
+    defer alloc.free(serial);
+    var t4 = std.testing.tmpDir(.{});
+    defer t4.cleanup();
+    const par = try runParquetThreaded(alloc, &t4, q, 4);
+    defer alloc.free(par);
+
+    try std.testing.expectEqualStrings("n,sf\n50,637.5\n", serial);
+    try std.testing.expectEqualStrings(serial, par);
+}
+
+test "parallel parquet aggregate: a join then a grouped agg (threads>1)" {
+    const alloc = std.testing.allocator;
+    // The grouped case goes through the radix merge rather than the single-partition
+    // fold, so it exercises the other half of the merge with a join underneath.
+    const q = "WITH d AS (SELECT id AS did FROM '$IN' WHERE id <= 8) " ++
+        "SELECT g, COUNT(*) AS n, SUM(f) AS sf FROM '$IN' JOIN d ON id = did GROUP BY g ORDER BY g";
+    var t1 = std.testing.tmpDir(.{});
+    defer t1.cleanup();
+    const serial = try runParquetThreaded(alloc, &t1, q, 1);
+    defer alloc.free(serial);
+    var t4 = std.testing.tmpDir(.{});
+    defer t4.cleanup();
+    const par = try runParquetThreaded(alloc, &t4, q, 4);
+    defer alloc.free(par);
+
+    try std.testing.expectEqualStrings("g,n,sf\n0,2,6\n1,2,3\n2,2,4\n3,2,5\n", serial);
+    try std.testing.expectEqualStrings(serial, par);
 }
 
 test "parallel CSV aggregate: global agg (threads>1) matches serial" {
