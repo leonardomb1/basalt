@@ -131,6 +131,48 @@ fn measure(a: std.mem.Allocator, argv: []const []const u8, reps: usize) !Timing 
     return t;
 }
 
+/// Split a CSV line into field *values*, unquoting as it goes.
+///
+/// Comparing raw bytes made two valid spellings of one value look like a mismatch:
+/// DuckDB writes `"MFGR#120"` where basalt writes `MFGR#120`, which reported five SSB
+/// queries as wrong when every value agreed. Splitting on a bare comma was also wrong
+/// for any field that contains one.
+fn csvFields(a: std.mem.Allocator, line: []const u8) ![]const []const u8 {
+    var out = std.array_list.Managed([]const u8).init(a);
+    var i: usize = 0;
+    while (true) {
+        if (i < line.len and line[i] == '"') {
+            i += 1;
+            var v = std.array_list.Managed(u8).init(a);
+            while (i < line.len) {
+                if (line[i] == '"') {
+                    // `""` inside a quoted field is one literal quote.
+                    if (i + 1 < line.len and line[i + 1] == '"') {
+                        try v.append('"');
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                try v.append(line[i]);
+                i += 1;
+            }
+            try out.append(v.items);
+        } else {
+            const start = i;
+            while (i < line.len and line[i] != ',') i += 1;
+            try out.append(line[start..i]);
+        }
+        if (i < line.len and line[i] == ',') {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    return out.items;
+}
+
 /// Compare two CSV files field by field: numeric where both sides parse, exact bytes
 /// otherwise. Returns null when equal, else a caller-owned description of the first
 /// difference — the point being that a fast wrong answer is not a result.
@@ -152,22 +194,17 @@ fn compareCsv(a: std.mem.Allocator, want_path: []const u8, got_path: []const u8)
         if (w == null) return try std.fmt.allocPrint(a, "line {d}: extra output row", .{line});
         if (g == null) return try std.fmt.allocPrint(a, "line {d}: missing output row", .{line});
 
-        var wf = std.mem.splitScalar(u8, std.mem.trimRight(u8, w.?, "\r"), ',');
-        var gf = std.mem.splitScalar(u8, std.mem.trimRight(u8, g.?, "\r"), ',');
-        var col: usize = 0;
-        while (true) {
-            const wv = wf.next();
-            const gv = gf.next();
-            if (wv == null and gv == null) break;
-            col += 1;
-            if (wv == null or gv == null)
-                return try std.fmt.allocPrint(a, "line {d}: column count differs", .{line});
-            if (std.mem.eql(u8, wv.?, gv.?)) continue;
-            const wn = std.fmt.parseFloat(f64, wv.?) catch {
-                return try std.fmt.allocPrint(a, "line {d} col {d}: want `{s}`, got `{s}`", .{ line, col, wv.?, gv.? });
+        const wf = try csvFields(a, std.mem.trimRight(u8, w.?, "\r"));
+        const gf = try csvFields(a, std.mem.trimRight(u8, g.?, "\r"));
+        if (wf.len != gf.len)
+            return try std.fmt.allocPrint(a, "line {d}: column count differs ({d} vs {d})", .{ line, wf.len, gf.len });
+        for (wf, gf, 1..) |wv, gv, col| {
+            if (std.mem.eql(u8, wv, gv)) continue;
+            const wn = std.fmt.parseFloat(f64, wv) catch {
+                return try std.fmt.allocPrint(a, "line {d} col {d}: want `{s}`, got `{s}`", .{ line, col, wv, gv });
             };
-            const gn = std.fmt.parseFloat(f64, gv.?) catch {
-                return try std.fmt.allocPrint(a, "line {d} col {d}: want `{s}`, got `{s}`", .{ line, col, wv.?, gv.? });
+            const gn = std.fmt.parseFloat(f64, gv) catch {
+                return try std.fmt.allocPrint(a, "line {d} col {d}: want `{s}`, got `{s}`", .{ line, col, wv, gv });
             };
             const scale = @max(@abs(wn), @abs(gn));
             const diff = @abs(wn - gn);
