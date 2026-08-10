@@ -414,7 +414,8 @@ join.
 ### Window functions
 
 `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG(col[, n])` / `LEAD(col[, n])`, and
-`SUM(col)` / `COUNT(*|col)` over `PARTITION BY` / `ORDER BY`:
+`SUM(col)` / `COUNT(*|col)` / `MIN(col)` / `MAX(col)` / `AVG(col)` over `PARTITION BY` /
+`ORDER BY`:
 
 ```sql
 SELECT conta, data, valor,
@@ -432,10 +433,14 @@ FROM 'movimentos.csv';
 - `PARTITION BY` is optional; without it the whole input is one partition.
 - A window function must be the **whole** select item: `ROW_NUMBER() OVER (...) + 1` is
   not accepted, because a window is a stage rather than an expression.
-- Its column is **appended** to the projection, so every partition and order column has
-  to be projected as well.
-- Two window functions in one `SELECT` must share one `OVER (...)`; write the second
-  window as a separate query.
+- Its column is **appended** to the projection, so every column the window touches — the
+  partition keys, the order keys, and the function's own argument — has to be projected
+  as well. The stage adds to the projection rather than reaching behind it.
+- Several window functions in one `SELECT` may share one `OVER (...)` —
+  `MIN(v) OVER (w), MAX(v) OVER (w)` is fine. Two *different* windows are refused; write
+  the second as a separate query or wrap the first in a derived table.
+- `MIN`/`MAX` answer a value from the column and keep its type; `AVG` is always a float;
+  all of them are nullable, since a peer group of nothing but nulls has no answer.
 - The names are not reserved: a column called `rank` still reads as a column.
 - No frame syntax (`ROWS BETWEEN ...`). A frame only means something to an aggregate
   over a window, and these functions do not take one.

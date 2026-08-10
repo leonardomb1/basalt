@@ -5117,11 +5117,19 @@ fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schema) a
                             arg = ai[0];
                         }
                     },
-                    .sum => {
-                        const q = f.arg orelse return planErr(env.diag, "SUM over a window needs a column argument");
+                    .sum, .min, .max, .avg => {
+                        const q = f.arg orelse return planErr(env.diag, "this window function needs a column argument");
                         const ai = analyze.fieldIndices(arena, schema, &[_]ast.QualName{q}, &ad) catch |e| return aErr(env, &ad, e);
                         arg = ai[0];
-                        ty = (if (schema.fields[ai[0]].ty.kind == .int) types.Type.init(.int) else types.Type.init(.float)).asNullable();
+                        const src = schema.fields[ai[0]].ty;
+                        // MIN/MAX answer a value from the column, so they keep its type.
+                        // SUM keeps its family; AVG is always a float. All are nullable:
+                        // a peer group of nothing but nulls has no answer.
+                        ty = switch (f.kind) {
+                            .min, .max => src.asNullable(),
+                            .avg => types.Type.init(.float).asNullable(),
+                            else => (if (src.kind == .int) types.Type.init(.int) else types.Type.init(.float)).asNullable(),
+                        };
                     },
                     .lag, .lead => {
                         const q = f.arg orelse return planErr(env.diag, "LAG/LEAD needs a column argument");
@@ -5139,6 +5147,9 @@ fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schema) a
                         .lead => .lead,
                         .sum => .sum,
                         .count => .count,
+                        .min => .min,
+                        .max => .max,
+                        .avg => .avg,
                     },
                     .arg = arg,
                     .offset = f.offset,
@@ -6279,6 +6290,48 @@ test "window: COUNT(*) over a partition, and a plain SUM still aggregates" {
     );
     defer alloc.free(agg);
     try std.testing.expectEqualStrings("k,s\na,30\nb,5\n", agg);
+}
+
+test "window: min, max and avg share one window in a single SELECT" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // `MIN(v) OVER (w), MAX(v) OVER (w)` is the natural pairing, so an identical OVER
+    // clause has to be accepted — the first attempt rejected any repeat of the clause.
+    // MIN/MAX use the same `lessV` ordering the grouped aggregate does, so a window
+    // extreme and a grouped one cannot disagree.
+    const out = try runToString(alloc, &tmp,
+        "k,v\na,10\na,20\nb,5\n",
+        "SELECT k, v, MIN(v) OVER (PARTITION BY k) AS lo, MAX(v) OVER (PARTITION BY k) AS hi, AVG(v) OVER (PARTITION BY k) AS mean FROM '$IN'",
+    );
+    defer alloc.free(out);
+    // `v` has to be projected: the window reads it, and the stage appends to the
+    // projection rather than reaching behind it.
+    try std.testing.expectEqualStrings("k,v,lo,hi,mean\na,10,10,20,15\na,20,10,20,15\nb,5,5,5,5\n", out);
+}
+
+test "window: two different windows in one SELECT are refused" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "k,v\na,1\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
+    defer alloc.free(in_path);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+    // Each distinct window would need its own stage; say so instead of silently using
+    // one of them for both.
+    const script = try std.fmt.allocPrint(alloc,
+        "LOAD INTO '{s}' AS SELECT k, MIN(v) OVER (PARTITION BY k) AS lo, MAX(v) OVER (ORDER BY v) AS hi FROM '{s}';",
+        .{ out_path, in_path },
+    );
+    defer alloc.free(script);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try std.testing.expectError(error.ParseFailed, parser.parseSource(parena.allocator(), script, &pdiag));
 }
 
 test "window: a column named `rank` is still a column" {

@@ -278,7 +278,7 @@ pub const Window = struct {
     funcs: []const Func,
     done: bool = false,
 
-    pub const Kind = enum { row_number, rank, dense_rank, lag, lead, sum, count };
+    pub const Kind = enum { row_number, rank, dense_rank, lag, lead, sum, count, min, max, avg };
     /// `arg` is the input column `lag`/`lead` reads; the ranking kinds leave it null.
     pub const Func = struct { kind: Kind, arg: ?usize = null, offset: i64 = 1 };
 
@@ -378,7 +378,7 @@ pub const Window = struct {
                 // accumulates peer group by peer group, which is a running total that
                 // ties share. Both are what standard RANGE framing specifies, and both
                 // fall out of the same loop.
-                .sum, .count => {
+                .sum, .count, .min, .max, .avg => {
                     var i: usize = 0;
                     while (i < idx.len) {
                         const stop = pend[i];
@@ -386,6 +386,7 @@ pub const Window = struct {
                         var acc_f: f64 = 0;
                         var n: i64 = 0;
                         var seen_float = false;
+                        var ext: Value = .null;
                         var g = i;
                         while (g < stop) {
                             var e = g + 1;
@@ -393,24 +394,22 @@ pub const Window = struct {
                             var m = g;
                             while (m < e) : (m += 1) {
                                 if (f.arg) |ai| {
-                                    switch (all.columns[ai].getValue(idx[m])) {
-                                        .null => {},
+                                    const v = all.columns[ai].getValue(idx[m]);
+                                    if (v.isNull()) continue;
+                                    // COUNT(col) counts non-nulls, of any kind.
+                                    n += 1;
+                                    // `lessV` is the same ordering `Aggregate` uses for
+                                    // MIN/MAX, so a window extreme and a grouped one
+                                    // cannot disagree.
+                                    if (ext.isNull() or (if (f.kind == .max) lessV(ext, v) else lessV(v, ext))) ext = v;
+                                    switch (v) {
                                         .int => |x| {
                                             acc_i += x;
                                             acc_f += @floatFromInt(x);
-                                            n += 1;
                                         },
-                                        .float => |x| {
+                                        else => if (asF64Opt(v)) |x| {
                                             acc_f += x;
                                             seen_float = true;
-                                            n += 1;
-                                        },
-                                        else => |v| {
-                                            if (asF64Opt(v)) |x| {
-                                                acc_f += x;
-                                                seen_float = true;
-                                                n += 1;
-                                            }
                                         },
                                     }
                                 } else {
@@ -420,17 +419,15 @@ pub const Window = struct {
                             }
                             var k = g;
                             while (k < e) : (k += 1) {
-                                out.*[k] = if (f.kind == .count)
-                                    .{ .int = n }
-                                else if (n == 0)
-                                    // Every row is its own peer, so a null here means
-                                    // every value in the group was null — SQL's SUM
-                                    // answers null for that, not zero.
-                                    .null
-                                else if (seen_float)
-                                    .{ .float = acc_f }
-                                else
-                                    .{ .int = acc_i };
+                                out.*[k] = switch (f.kind) {
+                                    .count => .{ .int = n },
+                                    .min, .max => ext,
+                                    // Every row is its own peer, so `n == 0` can only
+                                    // mean every value in the group was null — SQL
+                                    // answers null there, not zero.
+                                    .avg => if (n == 0) .null else .{ .float = acc_f / @as(f64, @floatFromInt(n)) },
+                                    else => if (n == 0) .null else if (seen_float) .{ .float = acc_f } else .{ .int = acc_i },
+                                };
                             }
                             g = e;
                         }

@@ -1732,6 +1732,9 @@ pub const Parser = struct {
             if (std.mem.eql(u8, low, "lead")) break :blk .lead;
             if (std.mem.eql(u8, low, "sum")) break :blk .sum;
             if (std.mem.eql(u8, low, "count")) break :blk .count;
+            if (std.mem.eql(u8, low, "min")) break :blk .min;
+            if (std.mem.eql(u8, low, "max")) break :blk .max;
+            if (std.mem.eql(u8, low, "avg")) break :blk .avg;
             return false;
         };
         // Only commit once the whole `name ( ) OVER` prefix is present, so a column
@@ -1742,11 +1745,12 @@ pub const Parser = struct {
         _ = self.advance();
         var arg: ?ast.QualName = null;
         var offset: i64 = 1;
-        if (kind == .sum or kind == .count) {
+        if (kind == .sum or kind == .count or kind == .min or kind == .max or kind == .avg) {
             // `COUNT(*)` counts rows; anything else needs a column. Rewind rather than
             // fail, so a plain `SUM(x)` with no OVER is still an ordinary aggregate.
             if (self.eat(.star)) {
-                if (kind == .sum) {
+                // Only COUNT(*) is starrable.
+                if (kind != .count) {
                     self.i = save;
                     return false;
                 }
@@ -1780,33 +1784,53 @@ pub const Parser = struct {
 
         // One window per query in stage one: two functions may share a window, but two
         // different windows would need a stage each.
-        var saw_part = false;
+        // Parse this function's window into locals, then either adopt it (first
+        // function) or require that it matches — `MIN(v) OVER (w), MAX(v) OVER (w)` is
+        // the natural pairing and must be allowed, while two *different* windows would
+        // need a stage each.
+        var this_part = std.array_list.Managed(ast.QualName).init(self.arena);
+        var this_ord = std.array_list.Managed(ast.SortKey).init(self.arena);
         if (self.eatKw("partition")) {
             try self.expectKw("by");
-            saw_part = true;
             while (true) {
-                try part.append(try self.singleName(try self.expectIdent()));
+                try this_part.append(try self.singleName(try self.expectIdent()));
                 if (!self.eat(.comma)) break;
             }
         }
-        var saw_ord = false;
         if (self.eatKw("order")) {
             try self.expectKw("by");
-            saw_ord = true;
             while (true) {
                 const f = try self.singleName(try self.expectIdent());
                 var desc = false;
                 if (self.eatKw("desc")) desc = true else _ = self.eatKw("asc");
-                try ord.append(.{ .field = f, .desc = desc });
+                try this_ord.append(.{ .field = f, .desc = desc });
                 if (!self.eat(.comma)) break;
             }
         }
         _ = try self.expect(.rparen);
-        if (funcs.items.len > 0 and (saw_part or saw_ord))
-            return self.fail(wpos, "two window functions in one SELECT must share the same OVER (...) window", .{});
+
+        if (funcs.items.len == 0) {
+            try part.appendSlice(this_part.items);
+            try ord.appendSlice(this_ord.items);
+        } else {
+            var same = this_part.items.len == part.items.len and this_ord.items.len == ord.items.len;
+            if (same) {
+                for (this_part.items, part.items) |a2, b2| {
+                    if (!std.mem.eql(u8, a2.last(), b2.last())) same = false;
+                }
+                for (this_ord.items, ord.items) |a2, b2| {
+                    if (!std.mem.eql(u8, a2.field.last(), b2.field.last()) or a2.desc != b2.desc) same = false;
+                }
+            }
+            if (!same)
+                return self.fail(wpos, "two window functions in one SELECT must share the same OVER (...) window", .{});
+        }
         // Ranking and the offsets need an order to count along. An aggregate does not:
         // with no ORDER BY its frame is the whole partition, which is share-of-total.
-        if (ord.items.len == 0 and kind != .sum and kind != .count)
+        if (this_ord.items.len == 0 and switch (kind) {
+            .sum, .count, .min, .max, .avg => false,
+            else => true,
+        })
             return self.fail(wpos, "a window function needs ORDER BY inside OVER (...) to number by", .{});
 
         _ = self.eatKw("as");
