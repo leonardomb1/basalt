@@ -1823,18 +1823,37 @@ fn pqTopNOne(ctx: *PqTopNCtx, p: usize) !void {
 const LaneRows = union(enum) {
     /// Borrowed: every lane shares one queue, which is what makes stealing work.
     parquet: *PqMorsels,
+    /// One NAMED row group, rather than whichever is free. A shape whose work
+    /// item index has to mean a position in the file needs this — see
+    /// `LaneSplit`.
+    parquet_group: struct { m: *const PqMorsels, group: usize },
     csv: struct { mapped: *csv.MappedCsv, schema: *const types.Schema, chunk: usize, of: usize },
 };
 
-/// This lane's row stream. The backing reader is allocated from `scratch` because the
-/// returned `driver.Source` borrows it and has to outlive this call — the reason both
-/// copies held it in a `var` local beside the source.
-fn laneRowSource(rows: LaneRows, scratch: std.mem.Allocator) !driver.Source {
+/// This lane's row stream, or null when the item holds nothing (a row group past
+/// the end of a file that shrank between plan and read). The backing reader is
+/// allocated from `scratch` because the returned `driver.Source` borrows it and
+/// has to outlive this call — the reason both copies held it in a `var` local
+/// beside the source. Closing the returned source releases the reader.
+fn laneRowSource(rows: LaneRows, scratch: std.mem.Allocator) !?driver.Source {
     switch (rows) {
         .parquet => |m| {
             const ms = try scratch.create(MorselSource);
             ms.* = .{ .m = m, .scratch = scratch };
             return .{ .ptr = ms, .vtable = &MorselSource.vtable };
+        },
+        .parquet_group => |g| {
+            const rdr = try pqdecode.Reader.openProjected(scratch, g.m.path, g.m.project);
+            rdr.bounds = g.m.bounds;
+            rdr.rg = g.group;
+            if (rdr.rg >= rdr.md.row_groups.len) {
+                rdr.close();
+                return null;
+            }
+            rdr.rg_end = rdr.rg + g.m.per_item;
+            const rs = try scratch.create(ReaderSource);
+            rs.* = .{ .r = rdr, .schema_ = g.m.src_schema };
+            return .{ .ptr = rs, .vtable = &ReaderSource.vtable };
         },
         .csv => |c| {
             const rd = try scratch.create(csv.CsvSliceReader);
@@ -1844,23 +1863,165 @@ fn laneRowSource(rows: LaneRows, scratch: std.mem.Allocator) !driver.Source {
     }
 }
 
-const PqMapCtx = struct {
-    morsels: PqMorsels,
+/// Open `rd`'s parquet file as a splittable input, or null when this pipeline
+/// cannot be split across lanes. Shared by every parquet lane path, which all
+/// gate on the same three things: a real path, an upsert that names its keys,
+/// and enough row groups and threads to be worth dividing.
+fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: ast.Write, opts: RunOptions) anyerror!?LaneSplit {
+    const arena = env.arena;
+    const path = switch (rd.form) {
+        .path => |p| p,
+        else => return null,
+    };
+    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return null;
+    if (opts.threads < pq_min_lanes) return null;
+
+    // `push_stages` is the caller's: the aggregate and distinct paths hand over
+    // the whole pipeline, join included, because `projectedColumns` understands a
+    // `.join` stage (it contributes the left keys) and restricting it made those
+    // bail to "read every column". The map path hands over the PRE-join stages
+    // only, since past its join the column names are the join's, not the source's.
+    const project = try projectedColumns(env, push_stages);
+    const bounds = try filterBounds(env, push_stages);
+    const probe = pqdecode.Reader.openProjected(arena, path, project) catch return null;
+    const ngroups = probe.md.row_groups.len;
+    if (ngroups < 2) return null;
+
+    return .{ .parquet = .{
+        .path = path,
+        .project = project,
+        .bounds = bounds,
+        .src_schema = try schemaPtr(arena, probe.schema),
+        .per_item = 1,
+        .queue = .{ .nitems = ngroups },
+    } };
+}
+
+/// Map `rd`'s CSV for splitting, or null when it cannot be split. The caller
+/// owns the result and must `close()` it.
+fn csvSplitFile(env: *Env, rd: ast.Read, w: ast.Write) anyerror!?*csv.MappedCsv {
+    const path = switch (rd.form) {
+        .path => |p| p,
+        else => return null,
+    };
+    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return null;
+
+    const mapped = csv.MappedCsv.open(env.arena, path, env.csv_in) catch return null;
+    // A newline inside a quoted field makes chunk boundaries undecidable from a
+    // byte offset, so this file is parsed serially rather than split. Closed
+    // explicitly: this returns before the caller's `defer` is armed, and leaking
+    // the mmap + fd once per file exhausted the fd limit in a FOR EACH.
+    if (mapped.quoted_newlines) {
+        mapped.close();
+        return null;
+    }
+    return mapped;
+}
+
+/// The input side of a parallel shape whose work items are POSITIONS: item `i`
+/// covers the part of the file that precedes item `i+1`. Distinct needs that (it
+/// resolves ties by first appearance, so the item index has to order rows the
+/// way a serial run would); the map path does not, and keeps stealing morsels.
+///
+/// This is the axis the parallel paths were duplicated along. Each shape had a
+/// `…Csv…` and a `…Parquet…` copy differing only in how many items there are and
+/// how to open one, while the operator chain, the merge and the sink above were
+/// identical — so naming that difference lets a shape have one implementation,
+/// the way the join variants already share one `…Impl`.
+const LaneSplit = union(enum) {
+    csv: struct { mapped: *csv.MappedCsv, schema: *const types.Schema },
+    parquet: PqMorsels,
+
+    /// A CSV is split by byte offset, so its item count is a free choice and one
+    /// chunk per thread is the balanced one; a parquet file is split at row
+    /// groups, which the file itself fixes.
+    fn count(self: LaneSplit, nthreads: usize) usize {
+        return switch (self) {
+            .csv => nthreads,
+            .parquet => |m| m.queue.nitems,
+        };
+    }
+
+    fn schema(self: *const LaneSplit) *const types.Schema {
+        return switch (self.*) {
+            .csv => |c| c.schema,
+            .parquet => |m| m.src_schema,
+        };
+    }
+
+    fn label(self: LaneSplit) []const u8 {
+        return switch (self) {
+            .csv => "csv",
+            .parquet => "parquet",
+        };
+    }
+
+    /// What `laneRowSource` needs to open work item `i` of `nitems`, for a shape
+    /// whose items are positions.
+    fn rows(self: *const LaneSplit, i: usize, nitems: usize) LaneRows {
+        return switch (self.*) {
+            .csv => |c| .{ .csv = .{ .mapped = c.mapped, .schema = c.schema, .chunk = i, .of = nitems } },
+            .parquet => |*m| .{ .parquet_group = .{ .m = m, .group = i } },
+        };
+    }
+
+    /// The same, for a shape that does NOT need its items ordered and can take
+    /// whatever rows are going — top-N re-sorts, so it only cares that every row
+    /// is seen once. A parquet lane then steals row groups off the shared queue
+    /// and keeps ONE heap over all of them, instead of a heap per row group.
+    ///
+    /// `nitems` is still the thread count, and items are still stolen rather than
+    /// indexed by lane: `spawnJoin` may spawn fewer threads than asked, and a
+    /// CSV chunk keyed on lane index would then be silently skipped.
+    fn unorderedRows(self: *LaneSplit, i: usize, nitems: usize) LaneRows {
+        return switch (self.*) {
+            .csv => |c| .{ .csv = .{ .mapped = c.mapped, .schema = c.schema, .chunk = i, .of = nitems } },
+            .parquet => |*m| .{ .parquet = m },
+        };
+    }
+
+    /// Stop the shared morsel queue after a lane has failed, so the others do not
+    /// keep stealing work whose result is about to be thrown away.
+    fn abort(self: *LaneSplit) void {
+        switch (self.*) {
+            .parquet => |*m| m.queue.failed.store(true, .seq_cst),
+            .csv => {},
+        }
+    }
+
+    /// How the item count reads in the debug line: chunks are ours to choose,
+    /// row groups are the file's.
+    fn unitName(self: LaneSplit) []const u8 {
+        return switch (self) {
+            .csv => "chunks",
+            .parquet => "row groups",
+        };
+    }
+};
+
+/// Parallel map-only pipeline (`read <local> | (filter|select)* | write`): the
+/// input is fanned out across lanes, each runs the map chain on its own share and
+/// writes batches to a shared sink under a mutex (or to its own, with a per-lane
+/// sink). Row ORDER is not preserved — lanes interleave; use `-j 1` for a
+/// deterministic order. Optionally carries one hash join, whose build side is
+/// materialized once before any lane exists and probed read-only by all of them.
+const MapCtx = struct {
+    split: LaneSplit,
     map_stages: []const ast.Stage,
     params: *std.StringHashMap(*const ast.Expr),
+    queue: WorkQueue,
     sink_mode: parallel.SinkMode,
     sink_mtx: std.Thread.Mutex = .{},
     rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     rows_read: *std.atomic.Value(u64),
-    /// See `MapCtx.join` — one shared build index, one `op.Join` per lane.
+    /// Set when the pipeline carries one hash join: each lane probes the shared
+    /// index with its own `op.Join` and runs the post-join stages itself.
     join: ?LaneJoin = null,
 };
 
-fn pqMapLane(ctx: *PqMapCtx, lane_idx: usize) void {
-    pqMapLaneRun(ctx, lane_idx) catch |e| ctx.morsels.queue.fail(e);
-}
+const mapWorker = dispatchWorker(MapCtx, mapWorkOne);
 
-fn pqMapLaneRun(ctx: *PqMapCtx, lane_idx: usize) !void {
+fn mapWorkOne(ctx: *MapCtx, i: usize) !void {
     var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
     defer _ = wgpa.deinit();
     const wa = wgpa.allocator();
@@ -1871,17 +2032,20 @@ fn pqMapLaneRun(ctx: *PqMapCtx, lane_idx: usize) !void {
 
     const own_sink: ?driver.Sink = switch (ctx.sink_mode) {
         .shared => null,
-        .per_lane => |pl| try pl.open(pl.ctx, wa, lane_idx),
+        .per_lane => |pl| try pl.open(pl.ctx, wa, i),
     };
     var own_sink_open = own_sink != null;
-    defer if (own_sink) |sk| {
-        if (own_sink_open) sk.abort();
+    defer if (own_sink) |s| {
+        if (own_sink_open) s.abort();
     };
 
-    const inner = try laneRowSource(.{ .parquet = &ctx.morsels }, warena.allocator());
+    const src_schema = ctx.split.schema();
+    const inner = (try laneRowSource(ctx.split.unorderedRows(i, ctx.queue.nitems), warena.allocator())) orelse return;
+    defer inner.close();
+    errdefer ctx.split.abort();
     var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const mapped_chain = try buildMapChain(warena.allocator(), ctx.params, ctx.map_stages, &scan, ctx.morsels.src_schema);
+    const mapped_chain = try buildMapChain(warena.allocator(), ctx.params, ctx.map_stages, &scan, src_schema);
     const chain = if (ctx.join) |lj|
         try buildLaneJoinChain(warena.allocator(), ctx.params, lj, mapped_chain)
     else
@@ -1889,53 +2053,40 @@ fn pqMapLaneRun(ctx: *PqMapCtx, lane_idx: usize) !void {
 
     var out: u64 = 0;
     while (try chain.next(batch_arena.allocator())) |b| {
-        try parallel.writeLaneBatch(ctx.sink_mode, &ctx.sink_mtx, own_sink, batch_arena.allocator(), b);
-        out += b.len;
+        if (ctx.queue.failed.load(.seq_cst)) return;
+        if (b.len > 0) {
+            try parallel.writeLaneBatch(ctx.sink_mode, &ctx.sink_mtx, own_sink, batch_arena.allocator(), b);
+            out += b.len;
+        }
         _ = batch_arena.reset(.retain_capacity);
     }
+    // One add rather than one per batch: the lanes all hit this counter.
     _ = ctx.rows_out.fetchAdd(out, .monotonic);
-    if (own_sink) |sk| {
+
+    if (own_sink) |s| {
         own_sink_open = false;
-        try sk.close();
+        try s.close();
     }
 }
 
-fn runParallelParquetMap(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, map_stages: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    return runParallelParquetMapImpl(env, rd, pipeline, map_stages, null, w, opts, stats, lanes_used);
-}
-
-/// Row-group fan-out with one hash join hoisted out of it — the parquet twin of
-/// `runParallelCsvMapJoin`.
-fn runParallelParquetMapJoin(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, shape: MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    if (!joinKindLaneSafe(shape.join.kind)) return false;
-    return runParallelParquetMapImpl(env, rd, pipeline, shape.prefix, shape, w, opts, stats, lanes_used);
-}
-
-fn runParallelParquetMapImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, map_stages: []const ast.Stage, jshape: ?MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+/// Source-independent — `split` says how the input divides; see `LaneSplit`.
+fn runParallelMapImpl(
+    env: *Env,
+    split: LaneSplit,
+    map_stages: []const ast.Stage,
+    jshape: ?MapJoinShape,
+    w: ast.Write,
+    opts: RunOptions,
+    stats: *Stats,
+    lanes_used: *usize,
+) anyerror!bool {
     const arena = env.arena;
-    const path = switch (rd.form) {
-        .path => |p| p,
-        else => return false,
-    };
-    if (std.mem.eql(u8, w.connector, "stdout")) return false;
-    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
-    if (opts.threads < 2) return false;
+    var out_schema = try mapChainSchema(env, map_stages, split.schema().*);
 
-    // Pushdown is derived from the pre-join stages only: past the join the column
-    // names are the join's, not the source's (`projectedColumns` would bail anyway).
-    const push_stages = pipeline[1..][0..map_stages.len];
-    const project = try projectedColumns(env, push_stages);
-    const bounds = try filterBounds(env, push_stages);
-    const probe = pqdecode.Reader.openProjected(arena, path, project) catch return false;
-    const ngroups = probe.md.row_groups.len;
-    if (ngroups < 2) return false;
-
-    const src_schema = try schemaPtr(arena, probe.schema);
-    var out_schema = try mapChainSchema(env, map_stages, src_schema.*);
-
-    env.src_name = "parquet";
+    env.src_name = split.label();
     env.sink_name = sinkLabel(env, w);
 
+    // Before any lane exists: build side materialized, suffix prevalidated.
     var lane_join: ?LaneJoin = null;
     if (jshape) |js| {
         const lp = try resolveLaneJoin(env, js.join, js.join_hints, js.suffix, out_schema);
@@ -1944,42 +2095,37 @@ fn runParallelParquetMapImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
     }
 
     const wr = try resolveUpsertKeys(env, w);
-    const sink_mode: parallel.SinkMode = (try buildParallelSink(env, wr, out_schema)) orelse
-        .{ .shared = try openSink(env, wr, out_schema) };
+    const sink_mode = (try buildParallelSink(env, wr, out_schema)) orelse
+        parallel.SinkMode{ .shared = try openSink(env, wr, out_schema) };
     var shared_open = sink_mode == .shared;
     errdefer if (shared_open) sink_mode.shared.abort();
 
     const nthreads = @max(@as(usize, 1), opts.threads);
-    var ctx = PqMapCtx{
-        .morsels = .{
-            .path = path,
-            .project = project,
-            .bounds = bounds,
-            .src_schema = src_schema,
-            .per_item = 1,
-            .queue = .{ .nitems = ngroups },
-        },
+    var ctx = MapCtx{
+        .split = split,
         .map_stages = map_stages,
         .params = env.params_expr,
+        .queue = .{ .nitems = nthreads },
         .sink_mode = sink_mode,
         .rows_read = env.rows_read,
         .join = lane_join,
     };
 
-    const lanes = try parallel.spawnJoin(arena, nthreads, pqMapLane, &ctx);
+    const lanes = try parallel.spawnJoin(arena, nthreads, mapWorker, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
-    if (lane_join != null) {
-        env.log.log(.debug, "parallel parquet map+join: {d} row groups over {d} lanes ({s} sink)", .{ ngroups, lanes, @tagName(sink_mode) });
-    } else {
-        env.log.log(.debug, "parallel parquet map: {d} row groups over {d} lanes ({s} sink)", .{ ngroups, lanes, @tagName(sink_mode) });
-    }
-    if (opts.explain) {
+    const units = split.count(nthreads);
+    env.log.log(.debug, "parallel {s} map{s}: {d} {s} over {d} lanes ({s} sink)", .{
+        split.label(), if (lane_join != null) "+join" else "", units, split.unitName(), lanes, @tagName(sink_mode),
+    });
+    // Only the parquet path has ever printed this; left as it was rather than
+    // widened, since `--explain` output is compared against goldens.
+    if (opts.explain and split == .parquet) {
         std.debug.print("actuals (parallel map, {d} lanes over {d} row groups): {d} rows out\n", .{
-            lanes, ngroups, ctx.rows_out.load(.monotonic),
+            lanes, units, ctx.rows_out.load(.monotonic),
         });
     }
 
-    if (ctx.morsels.queue.first_err) |e| return e;
+    if (ctx.queue.first_err) |e| return e;
     stats.rows_out += ctx.rows_out.load(.monotonic);
     if (sink_mode == .shared) {
         shared_open = false;
@@ -1988,16 +2134,22 @@ fn runParallelParquetMapImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
     return true;
 }
 
-/// `read … | (filter|select)* | join | (filter|select)* | aggregate | (sort|limit)* | write`
-/// — one hash join whose result is then aggregated. Recognised separately from
-/// `classifyAggPipeline`, which rejects a `.join` outright, and from
-/// `classifyMapJoinPipeline`, which rejects the aggregate (a breaker). Falling between
-/// the two meant join-then-aggregate had no parallel path at all: TPC-H q12 and q14
-/// ran identically at `-j 1` and `-j 16`.
-///
-/// Same restrictions as the two shapes it bridges: exactly one join, and nothing but
-/// a sort/limit tail after the aggregate (a `HAVING` filter lands there and disqualifies
-/// the shape, matching `classifyAggPipeline`).
+fn runParallelParquetMap(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, map_stages: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    return runParallelParquetMapImpl(env, rd, pipeline, map_stages, null, w, opts, stats, lanes_used);
+}
+
+/// Row-group fan-out with one hash join hoisted out of it.
+fn runParallelParquetMapJoin(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, shape: MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    if (!joinKindLaneSafe(shape.join.kind)) return false;
+    return runParallelParquetMapImpl(env, rd, pipeline, shape.prefix, shape, w, opts, stats, lanes_used);
+}
+
+fn runParallelParquetMapImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, map_stages: []const ast.Stage, jshape: ?MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    if (std.mem.eql(u8, w.connector, "stdout")) return false;
+    const split = (try parquetSplit(env, rd, pipeline[1..][0..map_stages.len], w, opts)) orelse return false;
+    return runParallelMapImpl(env, split, map_stages, jshape, w, opts, stats, lanes_used);
+}
+
 const AggJoinShape = struct {
     map_stages: []const ast.Stage,
     /// Every stage from the first join up to the aggregate. Starts with a `.join`, and
@@ -2095,24 +2247,10 @@ fn runParallelParquetAggJoin(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
 
 fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, jshape: ?AggJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     const arena = env.arena;
-    const path = switch (rd.form) {
-        .path => |p| p,
-        else => return false,
-    };
-    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
-    if (opts.threads < pq_min_lanes) return false;
-
-    // The whole pipeline, join included: `projectedColumns` understands a `.join`
-    // stage (it contributes the left keys) and the serial driver has always derived
-    // the projection this way. Restricting it to the pre-join stages made it bail to
-    // "read every column", which cost q14 more than the parallelism won back.
-    const project = try projectedColumns(env, pipeline[1..]);
-    const bounds = try filterBounds(env, pipeline[1..]);
-    const probe = pqdecode.Reader.openProjected(arena, path, project) catch return false;
-    const ngroups = probe.md.row_groups.len;
-    if (ngroups < 2) return false;
-
-    const src_schema = try schemaPtr(arena, probe.schema);
+    const split = (try parquetSplit(env, rd, pipeline[1..], w, opts)) orelse return false;
+    const morsels = split.parquet;
+    const ngroups = morsels.queue.nitems;
+    const src_schema = morsels.src_schema;
     var agg_in_schema = try mapChainSchema(env, prefix, src_schema.*);
 
     // The build side is materialized here, once, and every lane probes it read-only.
@@ -2132,13 +2270,10 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
     for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct };
     const out_schema = try schemaPtr(arena, apl.schema);
 
-    env.src_name = "parquet";
+    env.src_name = split.label();
     env.sink_name = sinkLabel(env, w);
 
     const nthreads = @max(@as(usize, 1), opts.threads);
-    const per_item: usize = 1;
-    const nitems = ngroups;
-
     const lanes = try env.gpa.alloc(PqLane, nthreads);
     defer env.gpa.free(lanes);
     for (lanes) |*l| {
@@ -2147,14 +2282,7 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
     defer for (lanes) |*l| l.arena.deinit();
 
     var ctx = PqAggCtx{
-        .morsels = .{
-            .path = path,
-            .project = project,
-            .bounds = bounds,
-            .src_schema = src_schema,
-            .per_item = per_item,
-            .queue = .{ .nitems = nitems },
-        },
+        .morsels = morsels,
         .agg_in_schema = agg_in,
         .out_schema = out_schema,
         .prefix = prefix,
@@ -2224,7 +2352,7 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
         });
     }
 
-    env.log.log(.debug, "parallel parquet aggregate: {d} row groups in {d} morsels over {d} lanes, merged in {d} partitions", .{ ngroups, nitems, used, pq_parts });
+    env.log.log(.debug, "parallel parquet aggregate: {d} row groups in {d} morsels over {d} lanes, merged in {d} partitions", .{ ngroups, ngroups, used, pq_parts });
 
     if (topNTail(tail)) |tn| {
         var cols = std.array_list.Managed(usize).init(arena);
@@ -2306,21 +2434,7 @@ fn runParallelCsvAggJoin(env: *Env, rd: ast.Read, js: AggJoinShape, w: ast.Write
 
 fn runParallelCsvAggImpl(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, jshape: ?AggJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     const arena = env.arena;
-    const path = switch (rd.form) {
-        .path => |p| p,
-        else => return false,
-    };
-    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
-
-    const mapped = csv.MappedCsv.open(arena, path, env.csv_in) catch return false;
-    // A newline inside a quoted field makes chunk boundaries undecidable from a
-    // byte offset, so this file is parsed serially rather than split. Closed
-    // explicitly: this returns before the `defer` below is armed, and leaking
-    // the mmap + fd once per file exhausted the fd limit in a FOR EACH.
-    if (mapped.quoted_newlines) {
-        mapped.close();
-        return false;
-    }
+    const mapped = (try csvSplitFile(env, rd, w)) orelse return false;
     defer mapped.close();
 
     var agg_in_schema = try mapChainSchema(env, prefix, mapped.schema);
@@ -2822,152 +2936,21 @@ fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoinSha
     return true;
 }
 
-const MapCtx = struct {
-    mapped: *csv.MappedCsv,
-    csv_schema: *const types.Schema,
-    map_stages: []const ast.Stage,
-    params: *std.StringHashMap(*const ast.Expr),
-    queue: WorkQueue,
-    sink_mode: parallel.SinkMode,
-    sink_mtx: std.Thread.Mutex = .{},
-    rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    rows_read: *std.atomic.Value(u64),
-    /// Set when the pipeline carries one hash join: each lane probes the shared
-    /// index with its own `op.Join` and runs the post-join stages itself.
-    join: ?LaneJoin = null,
-};
-
-const mapWorker = dispatchWorker(MapCtx, mapWorkOne);
-
-fn mapWorkOne(ctx: *MapCtx, i: usize) !void {
-    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
-    defer _ = wgpa.deinit();
-    const wa = wgpa.allocator();
-    var warena = std.heap.ArenaAllocator.init(wa);
-    defer warena.deinit();
-    var batch_arena = std.heap.ArenaAllocator.init(wa);
-    defer batch_arena.deinit();
-
-    const own_sink: ?driver.Sink = switch (ctx.sink_mode) {
-        .shared => null,
-        .per_lane => |pl| try pl.open(pl.ctx, wa, i),
-    };
-    var own_sink_open = own_sink != null;
-    defer if (own_sink) |s| {
-        if (own_sink_open) s.abort();
-    };
-
-    const inner = try laneRowSource(.{ .csv = .{
-        .mapped = ctx.mapped,
-        .schema = ctx.csv_schema,
-        .chunk = i,
-        .of = ctx.queue.nitems,
-    } }, warena.allocator());
-    var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
-    var scan = op.Scan{ .src = cs.source() };
-    const mapped_chain = try buildMapChain(warena.allocator(), ctx.params, ctx.map_stages, &scan, ctx.csv_schema);
-    const chain = if (ctx.join) |lj|
-        try buildLaneJoinChain(warena.allocator(), ctx.params, lj, mapped_chain)
-    else
-        mapped_chain;
-
-    while (try chain.next(batch_arena.allocator())) |b| {
-        if (ctx.queue.failed.load(.seq_cst)) return;
-        if (b.len > 0) {
-            try parallel.writeLaneBatch(ctx.sink_mode, &ctx.sink_mtx, own_sink, batch_arena.allocator(), b);
-            _ = ctx.rows_out.fetchAdd(b.len, .monotonic);
-        }
-        _ = batch_arena.reset(.retain_capacity);
-    }
-
-    if (own_sink) |s| {
-        own_sink_open = false;
-        try s.close();
-    }
-}
-
-/// Parallel map-only CSV pipeline (`read csv <local> | (filter|select)* | write`):
-/// fans the file into byte-range chunks, runs the map chain on each worker, and
-/// writes batches to a shared sink under a mutex. Row ORDER is not preserved (chunks
-/// interleave); use `-j 1` for a deterministic order. Returns false to fall back.
 fn runParallelCsvMap(env: *Env, rd: ast.Read, map_stages: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     return runParallelCsvMapImpl(env, rd, map_stages, null, w, opts, stats, lanes_used);
 }
 
-/// The same fan-out with one hash join hoisted out of it: the build side is
-/// materialized once here, the lanes share that index read-only and each probes it
-/// with the chunk it stole. Returns false to fall back to the serial driver.
+/// The same fan-out with one hash join hoisted out of it.
 fn runParallelCsvMapJoin(env: *Env, rd: ast.Read, shape: MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     if (!joinKindLaneSafe(shape.join.kind)) return false;
     return runParallelCsvMapImpl(env, rd, shape.prefix, shape, w, opts, stats, lanes_used);
 }
 
 fn runParallelCsvMapImpl(env: *Env, rd: ast.Read, map_stages: []const ast.Stage, jshape: ?MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    const arena = env.arena;
-    const path = switch (rd.form) {
-        .path => |p| p,
-        else => return false,
-    };
     if (std.mem.eql(u8, w.connector, "stdout")) return false;
-    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
-
-    const mapped = csv.MappedCsv.open(arena, path, env.csv_in) catch return false;
-    // A newline inside a quoted field makes chunk boundaries undecidable from a
-    // byte offset, so this file is parsed serially rather than split. Closed
-    // explicitly: this returns before the `defer` below is armed, and leaking
-    // the mmap + fd once per file exhausted the fd limit in a FOR EACH.
-    if (mapped.quoted_newlines) {
-        mapped.close();
-        return false;
-    }
+    const mapped = (try csvSplitFile(env, rd, w)) orelse return false;
     defer mapped.close();
-
-    var out_schema = try mapChainSchema(env, map_stages, mapped.schema);
-
-    env.src_name = "csv";
-    env.sink_name = sinkLabel(env, w);
-
-    // Before any lane exists: build side materialized, suffix prevalidated.
-    var lane_join: ?LaneJoin = null;
-    if (jshape) |js| {
-        const lp = try resolveLaneJoin(env, js.join, js.join_hints, js.suffix, out_schema);
-        lane_join = lp.lane;
-        out_schema = lp.out_schema;
-    }
-
-    const wr = try resolveUpsertKeys(env, w);
-    const sink_mode: parallel.SinkMode = (try buildParallelSink(env, wr, out_schema)) orelse
-        .{ .shared = try openSink(env, wr, out_schema) };
-    var shared_open = sink_mode == .shared;
-    errdefer if (shared_open) sink_mode.shared.abort();
-
-    const nthreads = @max(@as(usize, 1), opts.threads);
-    var ctx = MapCtx{
-        .mapped = mapped,
-        .csv_schema = &mapped.schema,
-        .map_stages = map_stages,
-        .params = env.params_expr,
-        .queue = .{ .nitems = nthreads },
-        .sink_mode = sink_mode,
-        .rows_read = env.rows_read,
-        .join = lane_join,
-    };
-
-    const lanes = try parallel.spawnJoin(arena, nthreads, mapWorker, &ctx);
-    lanes_used.* = @max(lanes_used.*, lanes);
-    if (lane_join != null) {
-        env.log.log(.debug, "parallel csv map+join: {d} chunks over {d} lanes ({s} sink)", .{ nthreads, lanes, @tagName(sink_mode) });
-    } else {
-        env.log.log(.debug, "parallel csv map: {d} chunks over {d} lanes ({s} sink)", .{ nthreads, lanes, @tagName(sink_mode) });
-    }
-
-    if (ctx.queue.first_err) |e| return e;
-    stats.rows_out += ctx.rows_out.load(.monotonic);
-    if (sink_mode == .shared) {
-        shared_open = false;
-        try sink_mode.shared.close();
-    }
-    return true;
+    return runParallelMapImpl(env, .{ .csv = .{ .mapped = mapped, .schema = &mapped.schema } }, map_stages, jshape, w, opts, stats, lanes_used);
 }
 
 const TopNShape = struct { prefix: []const ast.Stage, srt: ast.Sort, lim: ast.Limit };
@@ -2986,9 +2969,12 @@ fn classifyTopNPipeline(stages: []const ast.Stage) ?TopNShape {
     return .{ .prefix = prefix, .srt = middle[middle.len - 2].node.sort, .lim = middle[middle.len - 1].node.limit };
 }
 
+/// Parallel top-N: each work item keeps its own top `offset+count` rows, then a
+/// global top-N over the union produces the final sorted, offset/limited output.
+/// Only `cap` rows per item ever reach the combine. The output is small and
+/// sorted, so (unlike map-only) it stays deterministic.
 const TopNCtx = struct {
-    mapped: *csv.MappedCsv,
-    csv_schema: *const types.Schema,
+    split: LaneSplit,
     row_schema: *const types.Schema,
     prefix: []const ast.Stage,
     params: *std.StringHashMap(*const ast.Expr),
@@ -3010,10 +2996,14 @@ fn topnWorkOne(ctx: *TopNCtx, i: usize) !void {
     var batch_arena = std.heap.ArenaAllocator.init(wgpa.allocator());
     defer batch_arena.deinit();
 
-    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.queue.nitems), .schema = ctx.csv_schema };
-    var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
+    const src_schema = ctx.split.schema();
+    const rows = ctx.split.unorderedRows(i, ctx.queue.nitems);
+    const inner = (try laneRowSource(rows, warena.allocator())) orelse return;
+    defer inner.close();
+    errdefer ctx.split.abort();
+    var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const child = try buildMapChain(warena.allocator(), ctx.params, ctx.prefix, &scan, ctx.csv_schema);
+    const child = try buildMapChain(warena.allocator(), ctx.params, ctx.prefix, &scan, src_schema);
     var tn = op.TopN{
         .child = child,
         .in_schema = ctx.row_schema,
@@ -3033,77 +3023,20 @@ fn topnWorkOne(ctx: *TopNCtx, i: usize) !void {
     }
 }
 
-/// Parallel CSV Top-N: each worker keeps its chunk's top `offset+count` rows, then a
-/// global Top-N over the union produces the final sorted, offset/limited output. The
-/// output is small and sorted, so (unlike map-only) it stays deterministic.
-/// Top-N over a local parquet file: each lane keeps its own heap over the row
-/// groups it steals, then the lane winners go through one final top-N. Only
-/// N x lanes rows ever reach the combine step.
-const PqTopNLaneCtx = struct {
-    morsels: PqMorsels,
-    row_schema: *const types.Schema,
+/// Source-independent — `split` says how the input divides; see `LaneSplit`.
+fn runParallelTopN(
+    env: *Env,
+    split: LaneSplit,
     prefix: []const ast.Stage,
-    params: *std.StringHashMap(*const ast.Expr),
-    keys: []const op.Sort.Key,
-    cap: u64,
-    builders: []column.Builder,
-    mtx: std.Thread.Mutex = .{},
-    rows_read: *std.atomic.Value(u64),
-};
-
-fn pqTopNLane(ctx: *PqTopNLaneCtx, lane_idx: usize) void {
-    _ = lane_idx;
-    pqTopNLaneRun(ctx) catch |e| ctx.morsels.queue.fail(e);
-}
-
-fn pqTopNLaneRun(ctx: *PqTopNLaneCtx) !void {
-    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
-    defer _ = wgpa.deinit();
-    var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
-    defer warena.deinit();
-    var batch_arena = std.heap.ArenaAllocator.init(wgpa.allocator());
-    defer batch_arena.deinit();
-
-    var ms = MorselSource{ .m = &ctx.morsels, .scratch = warena.allocator() };
-    var cs = obs.CountingSource{ .inner = .{ .ptr = &ms, .vtable = &MorselSource.vtable }, .count = ctx.rows_read };
-    var scan = op.Scan{ .src = cs.source() };
-    const child = try buildMapChain(warena.allocator(), ctx.params, ctx.prefix, &scan, ctx.morsels.src_schema);
-    var tn = op.TopN{
-        .child = child,
-        .in_schema = ctx.row_schema,
-        .keys = ctx.keys,
-        .count = ctx.cap,
-        .offset = 0,
-        .state = batch_arena.allocator(),
-        .gpa = wgpa.allocator(),
-    };
-    const local = (try tn.next(batch_arena.allocator())) orelse return;
-
-    ctx.mtx.lock();
-    defer ctx.mtx.unlock();
-    var r: usize = 0;
-    while (r < local.len) : (r += 1) {
-        for (local.columns, ctx.builders) |col, *b| try b.append(col.getValue(r));
-    }
-}
-
-fn runParallelParquetTopN(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, prefix: []const ast.Stage, srt: ast.Sort, lim: ast.Limit, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    srt: ast.Sort,
+    lim: ast.Limit,
+    w: ast.Write,
+    opts: RunOptions,
+    stats: *Stats,
+    lanes_used: *usize,
+) anyerror!bool {
     const arena = env.arena;
-    const path = switch (rd.form) {
-        .path => |p| p,
-        else => return false,
-    };
-    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
-    if (opts.threads < 2) return false;
-
-    const project = try projectedColumns(env, pipeline[1..]);
-    const bounds = try filterBounds(env, pipeline[1..]);
-    const probe = pqdecode.Reader.openProjected(arena, path, project) catch return false;
-    const ngroups = probe.md.row_groups.len;
-    if (ngroups < 2) return false;
-
-    const src_schema = try schemaPtr(arena, probe.schema);
-    const row_schema = try schemaPtr(arena, try mapChainSchema(env, prefix, src_schema.*));
+    const row_schema = try schemaPtr(arena, try mapChainSchema(env, prefix, split.schema().*));
 
     const qs = try arena.alloc(ast.QualName, srt.keys.len);
     for (srt.keys, qs) |sk, *q| q.* = sk.field;
@@ -3112,99 +3045,14 @@ fn runParallelParquetTopN(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, 
     const ks = try arena.alloc(op.Sort.Key, srt.keys.len);
     for (srt.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc };
 
-    env.src_name = "parquet";
-    env.sink_name = sinkLabel(env, w);
-
-    const nthreads = @max(@as(usize, 1), opts.threads);
-    const builders = try arena.alloc(column.Builder, row_schema.fields.len);
-    for (builders, row_schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
-    var ctx = PqTopNLaneCtx{
-        .morsels = .{
-            .path = path,
-            .project = project,
-            .bounds = bounds,
-            .src_schema = src_schema,
-            .per_item = 1,
-            .queue = .{ .nitems = ngroups },
-        },
-        .row_schema = row_schema,
-        .prefix = prefix,
-        .params = env.params_expr,
-        .keys = ks,
-        .cap = lim.offset + lim.count,
-        .builders = builders,
-        .rows_read = env.rows_read,
-    };
-
-    const lanes = try parallel.spawnJoin(arena, nthreads, pqTopNLane, &ctx);
-    lanes_used.* = @max(lanes_used.*, lanes);
-    env.log.log(.debug, "parallel parquet top-n: {d} row groups over {d} lanes", .{ ngroups, lanes });
-    if (ctx.morsels.queue.first_err) |e| return e;
-
-    const cols = try arena.alloc(column.Column, builders.len);
-    for (builders, cols) |*b, *c| c.* = try b.finish();
-    var combined = OneBatch{ .b = .{ .schema = row_schema, .columns = cols, .len = cols[0].len }, .sch = row_schema.* };
-    var gscan = op.Scan{ .src = combined.source() };
-    var global = op.TopN{
-        .child = .{ .scan = &gscan },
-        .in_schema = row_schema,
-        .keys = ks,
-        .count = lim.count,
-        .offset = lim.offset,
-        .state = arena,
-        .gpa = env.gpa,
-    };
-
-    const wr = try resolveUpsertKeys(env, w);
-    const snk = try openSink(env, wr, row_schema.*);
-    var snk_open = true;
-    errdefer if (snk_open) snk.abort();
-    while (try global.next(arena)) |b| {
-        try snk.writeBatch(arena, b);
-        stats.rows_out += b.len;
-    }
-    snk_open = false;
-    try snk.close();
-    return true;
-}
-
-fn runParallelCsvTopN(env: *Env, rd: ast.Read, prefix: []const ast.Stage, srt: ast.Sort, lim: ast.Limit, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    const arena = env.arena;
-    const path = switch (rd.form) {
-        .path => |p| p,
-        else => return false,
-    };
-    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
-
-    const mapped = csv.MappedCsv.open(arena, path, env.csv_in) catch return false;
-    // A newline inside a quoted field makes chunk boundaries undecidable from a
-    // byte offset, so this file is parsed serially rather than split. Closed
-    // explicitly: this returns before the `defer` below is armed, and leaking
-    // the mmap + fd once per file exhausted the fd limit in a FOR EACH.
-    if (mapped.quoted_newlines) {
-        mapped.close();
-        return false;
-    }
-    defer mapped.close();
-
-    const row_schema = try schemaPtr(arena, try mapChainSchema(env, prefix, mapped.schema));
-
-    const qs = try arena.alloc(ast.QualName, srt.keys.len);
-    for (srt.keys, qs) |sk, *q| q.* = sk.field;
-    var ad = analyze.Diag{};
-    const idxs = analyze.fieldIndices(arena, row_schema.*, qs, &ad) catch |e| return aErr(env, &ad, e);
-    const ks = try arena.alloc(op.Sort.Key, srt.keys.len);
-    for (srt.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc };
-
-    env.src_name = "csv";
+    env.src_name = split.label();
     env.sink_name = sinkLabel(env, w);
 
     const nthreads = @max(@as(usize, 1), opts.threads);
     const builders = try arena.alloc(column.Builder, row_schema.fields.len);
     for (builders, row_schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
     var ctx = TopNCtx{
-        .mapped = mapped,
-        .csv_schema = &mapped.schema,
+        .split = split,
         .row_schema = row_schema,
         .prefix = prefix,
         .params = env.params_expr,
@@ -3217,7 +3065,7 @@ fn runParallelCsvTopN(env: *Env, rd: ast.Read, prefix: []const ast.Stage, srt: a
 
     const lanes = try parallel.spawnJoin(arena, nthreads, topnWorker, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
-    env.log.log(.debug, "parallel csv top-n: {d} chunks over {d} lanes", .{ nthreads, lanes });
+    env.log.log(.debug, "parallel {s} top-n: {d} {s} over {d} lanes", .{ split.label(), split.count(nthreads), split.unitName(), lanes });
     if (ctx.queue.first_err) |e| return e;
 
     const cols = try arena.alloc(column.Column, builders.len);
@@ -3245,6 +3093,17 @@ fn runParallelCsvTopN(env: *Env, rd: ast.Read, prefix: []const ast.Stage, srt: a
     snk_open = false;
     try snk.close();
     return true;
+}
+
+fn runParallelParquetTopN(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, prefix: []const ast.Stage, srt: ast.Sort, lim: ast.Limit, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    const split = (try parquetSplit(env, rd, pipeline[1..], w, opts)) orelse return false;
+    return runParallelTopN(env, split, prefix, srt, lim, w, opts, stats, lanes_used);
+}
+
+fn runParallelCsvTopN(env: *Env, rd: ast.Read, prefix: []const ast.Stage, srt: ast.Sort, lim: ast.Limit, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    const mapped = (try csvSplitFile(env, rd, w)) orelse return false;
+    defer mapped.close();
+    return runParallelTopN(env, .{ .csv = .{ .mapped = mapped, .schema = &mapped.schema } }, prefix, srt, lim, w, opts, stats, lanes_used);
 }
 
 const DistinctShape = struct { prefix: []const ast.Stage, dist: ast.Distinct, tail: []const ast.Stage };
@@ -3348,8 +3207,7 @@ const DistinctMerge = struct {
 };
 
 const DistinctCtx = struct {
-    mapped: *csv.MappedCsv,
-    csv_schema: *const types.Schema,
+    split: LaneSplit,
     row_schema: *const types.Schema,
     prefix: []const ast.Stage,
     params: *std.StringHashMap(*const ast.Expr),
@@ -3362,6 +3220,10 @@ const DistinctCtx = struct {
 
 const distinctWorker = dispatchWorker(DistinctCtx, distinctWorkOne);
 
+/// One work item — a CSV chunk or a parquet row group. Deduping per item rather
+/// than per lane costs a little extra traffic through the merge mutex, but it is
+/// what makes the item index a usable position: item `i` precedes item `i+1` in
+/// the file, so the merge keeps the same row a serial run would.
 fn distinctWorkOne(ctx: *DistinctCtx, i: usize) !void {
     var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
     defer _ = wgpa.deinit();
@@ -3370,58 +3232,12 @@ fn distinctWorkOne(ctx: *DistinctCtx, i: usize) !void {
     var batch_arena = std.heap.ArenaAllocator.init(wgpa.allocator());
     defer batch_arena.deinit();
 
-    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.queue.nitems), .schema = ctx.csv_schema };
-    var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
+    const src_schema = ctx.split.schema();
+    const inner = (try laneRowSource(ctx.split.rows(i, ctx.queue.nitems), warena.allocator())) orelse return;
+    defer inner.close();
+    var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const child = try buildMapChain(warena.allocator(), ctx.params, ctx.prefix, &scan, ctx.csv_schema);
-    var d = op.Distinct{ .child = child, .in_schema = ctx.row_schema, .keys = ctx.local_keys, .state = warena.allocator(), .gpa = wgpa.allocator(), .track_ords = true };
-
-    const probe = try warena.allocator().alloc(Value, ctx.key_idx.len);
-    while (try d.next(batch_arena.allocator())) |b| {
-        try ctx.merge.absorb(i, b, d.ords, probe);
-        _ = batch_arena.reset(.retain_capacity);
-    }
-}
-
-/// Parallel distinct over a local parquet file: one row group per work item,
-/// deduped on its own and then folded into the shared merge, which keeps the
-/// row that came first in the file.
-const PqDistinctCtx = struct {
-    morsels: PqMorsels,
-    row_schema: *const types.Schema,
-    prefix: []const ast.Stage,
-    params: *std.StringHashMap(*const ast.Expr),
-    local_keys: ?[]const usize,
-    key_idx: []const usize,
-    queue: WorkQueue,
-    merge: *DistinctMerge,
-    rows_read: *std.atomic.Value(u64),
-};
-
-const pqDistinctWorker = dispatchWorker(PqDistinctCtx, pqDistinctWorkOne);
-
-/// One row group. Deduping per row group rather than per lane costs a little
-/// extra traffic through the merge mutex, but it is what makes the work item
-/// index a usable position: row group `i` precedes row group `i+1` in the file.
-fn pqDistinctWorkOne(ctx: *PqDistinctCtx, i: usize) !void {
-    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
-    defer _ = wgpa.deinit();
-    var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
-    defer warena.deinit();
-    var batch_arena = std.heap.ArenaAllocator.init(wgpa.allocator());
-    defer batch_arena.deinit();
-
-    const rdr = try pqdecode.Reader.openProjected(warena.allocator(), ctx.morsels.path, ctx.morsels.project);
-    defer rdr.close();
-    rdr.bounds = ctx.morsels.bounds;
-    rdr.rg = i;
-    if (rdr.rg >= rdr.md.row_groups.len) return;
-    rdr.rg_end = rdr.rg + 1;
-
-    var rs = ReaderSource{ .r = rdr, .schema_ = ctx.morsels.src_schema };
-    var cs = obs.CountingSource{ .inner = .{ .ptr = &rs, .vtable = &ReaderSource.vtable }, .count = ctx.rows_read };
-    var scan = op.Scan{ .src = cs.source() };
-    const child = try buildMapChain(warena.allocator(), ctx.params, ctx.prefix, &scan, ctx.morsels.src_schema);
+    const child = try buildMapChain(warena.allocator(), ctx.params, ctx.prefix, &scan, src_schema);
     var d = op.Distinct{ .child = child, .in_schema = ctx.row_schema, .keys = ctx.local_keys, .state = warena.allocator(), .gpa = wgpa.allocator(), .track_ords = true };
 
     const probe = try warena.allocator().alloc(Value, ctx.key_idx.len);
@@ -3444,27 +3260,33 @@ const ReaderSource = struct {
         const self: *ReaderSource = @ptrCast(@alignCast(ptr));
         return self.r.next(arena);
     }
-    fn closeFn(_: *anyopaque) void {}
+    /// Owns the reader: `laneRowSource` hands this out in place of a reader the
+    /// caller held in a local, so closing the source is what releases it.
+    fn closeFn(ptr: *anyopaque) void {
+        const self: *ReaderSource = @ptrCast(@alignCast(ptr));
+        self.r.close();
+    }
     const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
 };
 
-fn runParallelParquetDistinct(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, prefix: []const ast.Stage, dist: ast.Distinct, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+/// Parallel distinct: each worker dedups its own work item locally, then folds
+/// the survivors into a shared merge that keeps the row which came first in the
+/// input, so the result matches `-j 1` exactly. Returns false to fall back.
+///
+/// Source-independent — `split` says how the input divides; see `LaneSplit`.
+fn runParallelDistinct(
+    env: *Env,
+    split: LaneSplit,
+    prefix: []const ast.Stage,
+    dist: ast.Distinct,
+    tail: []const ast.Stage,
+    w: ast.Write,
+    opts: RunOptions,
+    stats: *Stats,
+    lanes_used: *usize,
+) anyerror!bool {
     const arena = env.arena;
-    const path = switch (rd.form) {
-        .path => |p| p,
-        else => return false,
-    };
-    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
-    if (opts.threads < 2) return false;
-
-    const project = try projectedColumns(env, pipeline[1..]);
-    const bounds = try filterBounds(env, pipeline[1..]);
-    const probe_rdr = pqdecode.Reader.openProjected(arena, path, project) catch return false;
-    const ngroups = probe_rdr.md.row_groups.len;
-    if (ngroups < 2) return false;
-
-    const src_schema = try schemaPtr(arena, probe_rdr.schema);
-    const row_schema = try schemaPtr(arena, try mapChainSchema(env, prefix, src_schema.*));
+    const row_schema = try schemaPtr(arena, try mapChainSchema(env, prefix, split.schema().*));
 
     var local_keys: ?[]const usize = null;
     var key_idx: []const usize = undefined;
@@ -3479,33 +3301,27 @@ fn runParallelParquetDistinct(env: *Env, rd: ast.Read, pipeline: []const ast.Sta
         key_idx = all;
     }
 
-    env.src_name = "parquet";
+    env.src_name = split.label();
     env.sink_name = sinkLabel(env, w);
 
     const nthreads = @max(@as(usize, 1), opts.threads);
+    const nitems = split.count(nthreads);
     var merge = DistinctMerge.init(arena, key_idx);
-    var ctx = PqDistinctCtx{
-        .morsels = .{
-            .path = path,
-            .project = project,
-            .bounds = bounds,
-            .src_schema = src_schema,
-            .per_item = 1,
-            .queue = .{ .nitems = ngroups },
-        },
+    var ctx = DistinctCtx{
+        .split = split,
         .row_schema = row_schema,
         .prefix = prefix,
         .params = env.params_expr,
         .local_keys = local_keys,
         .key_idx = key_idx,
-        .queue = .{ .nitems = ngroups },
+        .queue = .{ .nitems = nitems },
         .merge = &merge,
         .rows_read = env.rows_read,
     };
 
-    const lanes = try parallel.spawnJoin(arena, nthreads, pqDistinctWorker, &ctx);
+    const lanes = try parallel.spawnJoin(arena, nthreads, distinctWorker, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
-    env.log.log(.debug, "parallel parquet distinct: {d} row groups over {d} lanes", .{ ngroups, lanes });
+    env.log.log(.debug, "parallel {s} distinct: {d} {s} over {d} lanes", .{ split.label(), nitems, split.unitName(), lanes });
     if (ctx.queue.first_err) |e| return e;
 
     const merged = try merge.finish(row_schema);
@@ -3520,78 +3336,16 @@ fn runParallelParquetDistinct(env: *Env, rd: ast.Read, pipeline: []const ast.Sta
     return true;
 }
 
-/// Parallel CSV distinct: each worker dedups its chunk locally, then folds the
-/// survivors into a shared merge that keeps the row which came first in the
-/// file, so the result matches -j 1 exactly. Returns false to fall back.
+fn runParallelParquetDistinct(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, prefix: []const ast.Stage, dist: ast.Distinct, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    const split = (try parquetSplit(env, rd, pipeline[1..], w, opts)) orelse return false;
+    return runParallelDistinct(env, split, prefix, dist, tail, w, opts, stats, lanes_used);
+}
+
 fn runParallelCsvDistinct(env: *Env, rd: ast.Read, prefix: []const ast.Stage, dist: ast.Distinct, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    const arena = env.arena;
-    const path = switch (rd.form) {
-        .path => |p| p,
-        else => return false,
-    };
     if (std.mem.eql(u8, w.connector, "stdout")) return false;
-    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
-
-    const mapped = csv.MappedCsv.open(arena, path, env.csv_in) catch return false;
-    // A newline inside a quoted field makes chunk boundaries undecidable from a
-    // byte offset, so this file is parsed serially rather than split. Closed
-    // explicitly: this returns before the `defer` below is armed, and leaking
-    // the mmap + fd once per file exhausted the fd limit in a FOR EACH.
-    if (mapped.quoted_newlines) {
-        mapped.close();
-        return false;
-    }
+    const mapped = (try csvSplitFile(env, rd, w)) orelse return false;
     defer mapped.close();
-
-    const row_schema = try schemaPtr(arena, try mapChainSchema(env, prefix, mapped.schema));
-
-    var local_keys: ?[]const usize = null;
-    var key_idx: []const usize = undefined;
-    if (dist.on) |fields| {
-        var ad = analyze.Diag{};
-        const ks = analyze.fieldIndices(arena, row_schema.*, fields, &ad) catch |e| return aErr(env, &ad, e);
-        local_keys = ks;
-        key_idx = ks;
-    } else {
-        const all = try arena.alloc(usize, row_schema.fields.len);
-        for (all, 0..) |*x, j| x.* = j;
-        key_idx = all;
-    }
-
-    env.src_name = "csv";
-    env.sink_name = sinkLabel(env, w);
-
-    const nthreads = @max(@as(usize, 1), opts.threads);
-    var merge = DistinctMerge.init(arena, key_idx);
-    var ctx = DistinctCtx{
-        .mapped = mapped,
-        .csv_schema = &mapped.schema,
-        .row_schema = row_schema,
-        .prefix = prefix,
-        .params = env.params_expr,
-        .local_keys = local_keys,
-        .key_idx = key_idx,
-        .queue = .{ .nitems = nthreads },
-        .merge = &merge,
-        .rows_read = env.rows_read,
-    };
-
-    const lanes = try parallel.spawnJoin(arena, nthreads, distinctWorker, &ctx);
-    lanes_used.* = @max(lanes_used.*, lanes);
-    env.log.log(.debug, "parallel csv distinct: {d} chunks over {d} lanes", .{ nthreads, lanes });
-    if (ctx.queue.first_err) |e| return e;
-
-    const merged = try merge.finish(row_schema);
-
-    const wr = try resolveUpsertKeys(env, w);
-    const snk = try openSink(env, wr, row_schema.*);
-    var snk_open = true;
-    errdefer if (snk_open) snk.abort();
-
-    try writeTail(env, snk, merged, row_schema.*, tail, stats);
-    snk_open = false;
-    try snk.close();
-    return true;
+    return runParallelDistinct(env, .{ .csv = .{ .mapped = mapped, .schema = &mapped.schema } }, prefix, dist, tail, w, opts, stats, lanes_used);
 }
 
 const ForMode = enum { sequential, parallel };

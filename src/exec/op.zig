@@ -40,6 +40,7 @@ pub fn errLabel(e: anyerror) []const u8 {
         error.DivByZero => "division by zero",
         error.TypeMismatch => "type mismatch",
         error.IntOverflow => "integer overflow — the value does not fit a 64-bit integer",
+        error.PatternTooComplex => "regular expression gave up: too much backtracking — anchor it, or replace a nested quantifier like `(a+)+` with a flat one",
         error.JoinBuildTooLarge => "join build side exceeds its cap — raise it with WITH (max_build = '8GB') on the join, filter the CTE, or flip the join",
         else => @errorName(e),
     };
@@ -1228,11 +1229,11 @@ pub const Aggregate = struct {
                     break :blk nr;
                 };
                 if (counts_only) {
-                    for (rec.counts) |*c| c.* += 1;
+                    for (rec.tail) |*c| c.* += 1;
                 } else {
                     for (self.aggs, 0..) |agg, j| {
                         const v = if (argcols[j]) |col| col.getValue(ri) else Value.null;
-                        try updateAcc(self.state, &rec.accs[j], agg, v, agg.arg != null);
+                        try updateAcc(self.state, &rec.tail[j], agg, v, agg.arg != null);
                     }
                 }
             }
@@ -1262,10 +1263,10 @@ pub const Aggregate = struct {
             }
             if (counts_only) {
                 const accs = try self.state.alloc(Acc, self.aggs.len);
-                for (accs, rec.counts) |*a, c| a.* = .{ .n = c };
+                for (accs, rec.tail) |*a, c| a.* = .{ .n = c };
                 g.* = .{ .key_vals = kv, .accs = accs };
             } else {
-                g.* = .{ .key_vals = kv, .accs = rec.accs };
+                g.* = .{ .key_vals = kv, .accs = rec.tail };
             }
         }
         return .{ .groups = out, .hashes = ghashes.items };
@@ -1394,107 +1395,72 @@ pub const Aggregate = struct {
     /// bytes to say what eight bytes of `i64` already says, and hashing one walks
     /// a tagged union per key; here the keys are raw words with a null mask
     /// beside them, so both the record and the hash get cheaper.
-    const FixedStore = struct {
-        const block_shift = 13;
-        const block = 1 << block_shift;
-        const block_mask = block - 1;
+    ///
+    /// `Tail` is the per-aggregate state each record carries. Two instantiations
+    /// exist and they differ in nothing but that: the general fold stores an
+    /// `Acc`, while a counting-only fold stores a bare `i64`, because `COUNT(*)`
+    /// needs eight bytes of state where `Acc` reserves sixty-four — enough for a
+    /// min/max `Value` the group will never hold. For two keys and one count
+    /// that is a 32-byte record: two groups per cache line instead of one
+    /// straddling two.
+    fn KeyStore(comptime Tail: type) type {
+        return struct {
+            const Self = @This();
 
-        alloc: std.mem.Allocator,
-        nkeys: usize,
-        naggs: usize,
-        blocks: std.array_list.Managed([]u8),
-        len: usize = 0,
+            const block_shift = 13;
+            const block = 1 << block_shift;
+            const block_mask = block - 1;
 
-        const Rec = struct { keys: []i64, mask: *u64, accs: []Acc };
+            /// What a freshly claimed record's aggregate state starts at.
+            const tail_init: Tail = if (Tail == Acc) .{} else 0;
 
-        fn init(alloc: std.mem.Allocator, nkeys: usize, naggs: usize) FixedStore {
-            return .{ .alloc = alloc, .nkeys = nkeys, .naggs = naggs, .blocks = std.array_list.Managed([]u8).init(alloc) };
-        }
+            alloc: std.mem.Allocator,
+            nkeys: usize,
+            naggs: usize,
+            blocks: std.array_list.Managed([]u8),
+            len: usize = 0,
 
-        fn recSize(self: FixedStore) usize {
-            return self.nkeys * @sizeOf(i64) + @sizeOf(u64) + self.naggs * @sizeOf(Acc);
-        }
+            const Rec = struct { keys: []i64, mask: *u64, tail: []Tail };
 
-        fn at(self: FixedStore, i: usize) Rec {
-            const rec = self.recSize();
-            const base = self.blocks.items[i >> block_shift].ptr + (i & block_mask) * rec;
-            const ksz = self.nkeys * @sizeOf(i64);
-            return .{
-                .keys = @alignCast(std.mem.bytesAsSlice(i64, base[0..ksz])),
-                .mask = @alignCast(@ptrCast(base + ksz)),
-                .accs = @alignCast(std.mem.bytesAsSlice(Acc, (base + ksz + @sizeOf(u64))[0 .. self.naggs * @sizeOf(Acc)])),
-            };
-        }
-
-        fn eqlAt(self: *const FixedStore, i: usize, key: FixedKey) bool {
-            const r = self.at(i);
-            if (r.mask.* != key.mask) return false;
-            return std.mem.eql(i64, r.keys, key.vals);
-        }
-
-        fn push(self: *FixedStore) !Rec {
-            if (self.len & block_mask == 0 and self.len >> block_shift == self.blocks.items.len) {
-                try self.blocks.append(try self.alloc.alignedAlloc(u8, .of(Acc), block * self.recSize()));
+            fn init(alloc: std.mem.Allocator, nkeys: usize, naggs: usize) Self {
+                return .{ .alloc = alloc, .nkeys = nkeys, .naggs = naggs, .blocks = std.array_list.Managed([]u8).init(alloc) };
             }
-            const rec = self.at(self.len);
-            self.len += 1;
-            for (rec.accs) |*a| a.* = .{};
-            return rec;
-        }
-    };
 
-    /// `COUNT(*)` needs eight bytes of state, but `Acc` is sixty-four — enough
-    /// for a min/max `Value` this group will never hold. Counting-only folds get
-    /// a record of keys, mask and counters, which for two keys and one count is
-    /// 32 bytes: two groups per cache line instead of one straddling two.
-    const CountStore = struct {
-        const block_shift = 13;
-        const block = 1 << block_shift;
-        const block_mask = block - 1;
-
-        alloc: std.mem.Allocator,
-        nkeys: usize,
-        naggs: usize,
-        blocks: std.array_list.Managed([]u8),
-        len: usize = 0,
-
-        const Rec = struct { keys: []i64, mask: *u64, counts: []i64 };
-
-        fn init(alloc: std.mem.Allocator, nkeys: usize, naggs: usize) CountStore {
-            return .{ .alloc = alloc, .nkeys = nkeys, .naggs = naggs, .blocks = std.array_list.Managed([]u8).init(alloc) };
-        }
-
-        fn recSize(self: CountStore) usize {
-            return (self.nkeys + 1 + self.naggs) * @sizeOf(i64);
-        }
-
-        fn at(self: CountStore, i: usize) Rec {
-            const rec = self.recSize();
-            const base = self.blocks.items[i >> block_shift].ptr + (i & block_mask) * rec;
-            const ksz = self.nkeys * @sizeOf(i64);
-            return .{
-                .keys = @alignCast(std.mem.bytesAsSlice(i64, base[0..ksz])),
-                .mask = @alignCast(@ptrCast(base + ksz)),
-                .counts = @alignCast(std.mem.bytesAsSlice(i64, (base + ksz + @sizeOf(u64))[0 .. self.naggs * @sizeOf(i64)])),
-            };
-        }
-
-        fn eqlAt(self: *const CountStore, i: usize, key: FixedKey) bool {
-            const r = self.at(i);
-            if (r.mask.* != key.mask) return false;
-            return std.mem.eql(i64, r.keys, key.vals);
-        }
-
-        fn push(self: *CountStore) !Rec {
-            if (self.len & block_mask == 0 and self.len >> block_shift == self.blocks.items.len) {
-                try self.blocks.append(try self.alloc.alignedAlloc(u8, .of(i64), block * self.recSize()));
+            fn recSize(self: Self) usize {
+                return self.nkeys * @sizeOf(i64) + @sizeOf(u64) + self.naggs * @sizeOf(Tail);
             }
-            const rec = self.at(self.len);
-            self.len += 1;
-            @memset(rec.counts, 0);
-            return rec;
-        }
-    };
+
+            fn at(self: Self, i: usize) Rec {
+                const rec = self.recSize();
+                const base = self.blocks.items[i >> block_shift].ptr + (i & block_mask) * rec;
+                const ksz = self.nkeys * @sizeOf(i64);
+                return .{
+                    .keys = @alignCast(std.mem.bytesAsSlice(i64, base[0..ksz])),
+                    .mask = @alignCast(@ptrCast(base + ksz)),
+                    .tail = @alignCast(std.mem.bytesAsSlice(Tail, (base + ksz + @sizeOf(u64))[0 .. self.naggs * @sizeOf(Tail)])),
+                };
+            }
+
+            fn eqlAt(self: *const Self, i: usize, key: FixedKey) bool {
+                const r = self.at(i);
+                if (r.mask.* != key.mask) return false;
+                return std.mem.eql(i64, r.keys, key.vals);
+            }
+
+            fn push(self: *Self) !Rec {
+                if (self.len & block_mask == 0 and self.len >> block_shift == self.blocks.items.len) {
+                    try self.blocks.append(try self.alloc.alignedAlloc(u8, .of(Tail), block * self.recSize()));
+                }
+                const rec = self.at(self.len);
+                self.len += 1;
+                @memset(rec.tail, tail_init);
+                return rec;
+            }
+        };
+    }
+
+    const FixedStore = KeyStore(Acc);
+    const CountStore = KeyStore(i64);
 
     const FixedKey = struct { vals: []const i64, mask: u64 };
 

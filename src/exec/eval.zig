@@ -18,7 +18,7 @@ const Value = valuemod.Value;
 const Batch = batchmod.Batch;
 
 pub const TypeError = error{ TypeError, OutOfMemory };
-pub const EvalError = error{ CastFailed, DivByZero, TypeMismatch, IntOverflow, OutOfMemory };
+pub const EvalError = error{ CastFailed, DivByZero, TypeMismatch, IntOverflow, PatternTooComplex, OutOfMemory };
 
 pub const TypeCtx = struct {
     schema: types.Schema,
@@ -486,6 +486,7 @@ pub fn evalColumn(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch,
         error.DivByZero => return error.DivByZero,
         error.TypeMismatch => return error.TypeMismatch,
         error.IntOverflow => return error.IntOverflow,
+        error.PatternTooComplex => return error.PatternTooComplex,
         error.OutOfMemory => return error.OutOfMemory,
     };
     return switch (v) {
@@ -509,7 +510,7 @@ const Column = column.Column;
 const Bitmap = column.Bitmap;
 const Decimal = valuemod.Decimal;
 
-const VecError = error{ Unsupported, CastFailed, DivByZero, TypeMismatch, IntOverflow, OutOfMemory };
+const VecError = error{ Unsupported, CastFailed, DivByZero, TypeMismatch, IntOverflow, PatternTooComplex, OutOfMemory };
 
 const Vec = union(enum) {
     col: Column,
@@ -1213,7 +1214,7 @@ fn asNum(arena: std.mem.Allocator, v: Vec, n: usize) VecError!?Num {
             .float => Num{ .fcol = .{ .d = c.data.f64, .v = c.validity } },
             .decimal => blk: {
                 const out = try arena.alloc(f64, n);
-                for (c.data.dec, 0..) |d, i| out[i] = @as(f64, @floatFromInt(d.unscaled)) / pow10f(d.scale);
+                for (c.data.dec, 0..) |d, i| out[i] = d.toF64();
                 break :blk Num{ .fcol = .{ .d = out, .v = c.validity } };
             },
             else => null,
@@ -1651,17 +1652,20 @@ fn evalCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize
         const pat = try evalRow(arena, c.args[1], batch, row);
         const rep = try evalRow(arena, c.args[2], batch, row);
         if (pat.isNull() or rep.isNull()) return .null;
-        var rbuf: [16 * 1024]u8 = undefined;
-        var rfba = std.heap.FixedBufferAllocator.init(&rbuf);
-        const out = regex.replaceFirst(
+        const re = cachedRegex(try valueToString(arena, pat)) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.BadPattern => return error.CastFailed,
+            error.PatternTooComplex => return error.PatternTooComplex,
+        };
+        const out = regex.replaceFirstRe(
             arena,
-            rfba.allocator(),
+            re,
             try valueToString(arena, v),
-            try valueToString(arena, pat),
             try valueToString(arena, rep),
         ) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.BadPattern => return error.CastFailed,
+            error.PatternTooComplex => return error.PatternTooComplex,
         };
         return .{ .string = out };
     }
@@ -2530,8 +2534,36 @@ pub fn formatDecimal(arena: std.mem.Allocator, unscaled: i128, scale: u8) ![]con
     return arena.dupe(u8, w.buffered());
 }
 
+/// Last resolved column index per name slot. `Schema.indexOf` is a linear scan
+/// comparing names, and `evalRow` resolves every field reference it evaluates —
+/// once per ROW on the row-at-a-time fallback path, where the same handful of
+/// names resolve against the same schema for the whole batch. On a 40-column
+/// schema that scan was a third of the per-row cost.
+///
+/// Direct-mapped and tiny, so an expression naming several columns keeps a slot
+/// for each instead of thrashing one. Thread-local because parallel lanes
+/// evaluate concurrently.
+threadlocal var field_memo: [8]usize = @splat(0);
+
 fn fieldIndex(schema: types.Schema, q: ast.QualName) ?usize {
-    return schema.indexOf(lastPart(q));
+    const name = lastPart(q);
+    if (name.len == 0) return schema.indexOf(name);
+    // Length and first byte alone are not enough to spread real column names:
+    // `col36`…`col39`, or `customer_id`/`customer_city`, share both and would
+    // land in one slot, so an expression naming several of them would evict on
+    // every lookup and never hit. The last byte is what separates them, and
+    // three bytes of mixing stays far cheaper than the scan it avoids.
+    const slot = (name.len *% 31 +% name[0] *% 7 +% name[name.len - 1]) & (field_memo.len - 1);
+    // Verified, not trusted: a remembered slot is accepted only after checking
+    // it still names the field being asked for. That is the same comparison
+    // `indexOf` would make on its way to the answer, so a stale entry — a
+    // different schema, a reordered one — costs one compare and falls through
+    // to the scan rather than resolving to the wrong column.
+    const cached = field_memo[slot];
+    if (cached < schema.fields.len and std.mem.eql(u8, schema.fields[cached].name, name)) return cached;
+    const idx = schema.indexOf(name) orelse return null;
+    field_memo[slot] = idx;
+    return idx;
 }
 fn lastPart(q: ast.QualName) []const u8 {
     return q.parts[q.parts.len - 1];
@@ -2543,15 +2575,45 @@ pub fn toF64(v: Value) f64 {
     return switch (v) {
         .int => |x| @floatFromInt(x),
         .float => |x| x,
-        .decimal => |d| @as(f64, @floatFromInt(d.unscaled)) / pow10f(d.scale),
+        .decimal => |d| d.toF64(),
         else => 0,
     };
 }
-fn pow10f(n: u8) f64 {
-    var r: f64 = 1;
-    var k: u8 = 0;
-    while (k < n) : (k += 1) r *= 10;
-    return r;
+const pow10f = valuemod.pow10f;
+
+/// One compiled pattern, kept across calls. `regexp_replace` is evaluated per
+/// ROW, and recompiling the pattern for each one made a column scan pay for a
+/// parse it had already done — the pattern is almost always a literal, so every
+/// compile after the first is identical work.
+///
+/// Keyed on the pattern's BYTES, not its address: a non-literal pattern comes
+/// out of the batch arena, which is reset between pulls, so a later pattern can
+/// land on the address an earlier one had and a pointer key would hand back the
+/// wrong expression. A short memcmp is cheap next to a compile either way.
+/// Thread-local because parallel lanes evaluate concurrently, and the buffer is
+/// no bigger than the stack one this replaced.
+const RegexCache = struct {
+    buf: [16 * 1024]u8 = undefined,
+    src: []const u8 = &.{},
+    re: regex.Regex = undefined,
+    valid: bool = false,
+};
+threadlocal var regex_cache: RegexCache = .{};
+
+fn cachedRegex(pattern: []const u8) regex.Error!regex.Regex {
+    const c = &regex_cache;
+    if (c.valid and std.mem.eql(u8, c.src, pattern)) return c.re;
+    var fba = std.heap.FixedBufferAllocator.init(&c.buf);
+    // Cleared first: a failed compile must not leave the previous pattern
+    // reachable under the new key.
+    c.valid = false;
+    c.re = try regex.Regex.compile(fba.allocator(), pattern);
+    // `src` has to live as long as the entry it keys. The pattern itself may be
+    // arena memory that dies at the next pull, so keep a copy in the same buffer
+    // the compile allocated from.
+    c.src = fba.allocator().dupe(u8, pattern) catch return error.OutOfMemory;
+    c.valid = true;
+    return c.re;
 }
 /// Total order over f64, postgres' rule: NaN equals NaN and sorts above every
 /// other value. IEEE leaves NaN unordered, which `std.math.order` answers with
@@ -3439,4 +3501,85 @@ test "formatTime suppresses an all-zero fraction, like formatTimestamp" {
     try std.testing.expectEqualStrings("00:00:00", try formatTime(a, 0));
     try std.testing.expectEqualStrings("23:59:59.999999", try formatTime(a, 86_400_000_000 - 1));
     try std.testing.expectEqualStrings("00:00:00.000001", try formatTime(a, 1));
+}
+
+test "regexp_replace: the compiled-pattern cache keys on bytes, not on identity" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // Repeating one pattern is the case the cache exists for: every call after
+    // the first reuses the compile, and must still answer for its own input.
+    try std.testing.expectEqualStrings("X-b-c", (try evalLit(a, "regexp_replace('a-b-c', 'a', 'X')")).string);
+    try std.testing.expectEqualStrings("a-b-X", (try evalLit(a, "regexp_replace('a-b-c', 'c', 'X')")).string);
+    try std.testing.expectEqualStrings("X-b-c", (try evalLit(a, "regexp_replace('a-b-c', 'a', 'X')")).string);
+
+    // Switching patterns must recompile rather than reuse the entry: same
+    // length, same shape, different meaning.
+    try std.testing.expectEqualStrings("Xbc", (try evalLit(a, "regexp_replace('abc', '^a', 'X')")).string);
+    try std.testing.expectEqualStrings("abX", (try evalLit(a, "regexp_replace('abc', 'c$', 'X')")).string);
+
+    // Captures survive the cached entry.
+    try std.testing.expectEqualStrings("b-a", (try evalLit(a, "regexp_replace('a-b', '(a)-(b)', '\\2-\\1')")).string);
+    try std.testing.expectEqualStrings("b-a", (try evalLit(a, "regexp_replace('a-b', '(a)-(b)', '\\2-\\1')")).string);
+
+    // A pattern that fails to compile must not fall back to whatever was
+    // cached before it.
+    try std.testing.expectError(error.CastFailed, evalLit(a, "regexp_replace('abc', '(', 'X')"));
+    try std.testing.expectEqualStrings("Xbc", (try evalLit(a, "regexp_replace('abc', '^a', 'X')")).string);
+
+    // No match leaves the subject untouched.
+    try std.testing.expectEqualStrings("abc", (try evalLit(a, "regexp_replace('abc', 'zzz', 'X')")).string);
+}
+
+test "field resolution: the memo verifies its entry instead of trusting it" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const int = types.Type.init(.int);
+    // Two schemas holding the SAME names at DIFFERENT positions. Resolving
+    // against one and then the other is what a stale cache would get wrong, and
+    // the wrong answer here is a silently wrong column rather than an error.
+    const wide = types.Schema{ .fields = &.{
+        .{ .name = "col36", .ty = int },
+        .{ .name = "col37", .ty = int },
+        .{ .name = "col38", .ty = int },
+        .{ .name = "col39", .ty = int },
+    } };
+    const flipped = types.Schema{ .fields = &.{
+        .{ .name = "col39", .ty = int },
+        .{ .name = "col38", .ty = int },
+        .{ .name = "col37", .ty = int },
+        .{ .name = "col36", .ty = int },
+    } };
+
+    const q = struct {
+        fn of(alloc: std.mem.Allocator, name: []const u8) ast.QualName {
+            const parts = alloc.alloc([]const u8, 1) catch unreachable;
+            parts[0] = name;
+            return .{ .parts = parts };
+        }
+    };
+
+    // Names sharing a length and a first byte must still each keep a slot,
+    // and every one has to resolve to its own index in whichever schema.
+    for (0..3) |_| {
+        for ([_][]const u8{ "col36", "col37", "col38", "col39" }, 0..) |name, i| {
+            try std.testing.expectEqual(i, fieldIndex(wide, q.of(a, name)).?);
+            try std.testing.expectEqual(3 - i, fieldIndex(flipped, q.of(a, name)).?);
+        }
+    }
+
+    // A name in neither schema is null, and asking again after a hit still is —
+    // a miss must not adopt whatever the slot held.
+    try std.testing.expect(fieldIndex(wide, q.of(a, "nope")) == null);
+    try std.testing.expectEqual(@as(usize, 0), fieldIndex(wide, q.of(a, "col36")).?);
+    try std.testing.expect(fieldIndex(wide, q.of(a, "nope")) == null);
+
+    // A schema shorter than a remembered index must not read out of bounds.
+    const tiny = types.Schema{ .fields = &.{.{ .name = "z", .ty = int }} };
+    try std.testing.expectEqual(@as(usize, 3), fieldIndex(wide, q.of(a, "col39")).?);
+    try std.testing.expect(fieldIndex(tiny, q.of(a, "col39")) == null);
+    try std.testing.expectEqual(@as(usize, 0), fieldIndex(tiny, q.of(a, "z")).?);
 }

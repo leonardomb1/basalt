@@ -67,11 +67,17 @@ pub fn maxF(a: []const f64) f64 {
 }
 
 /// Count of set (valid/non-null) bits among the first `n` bits of a validity
-/// bitmap, via byte-wise `@popCount`.
+/// bitmap, via `@popCount` over 64 bits at a time. `popcnt` costs the same on a
+/// word as on a byte, so the byte loop was paying eight instructions for one
+/// instruction's work; the tail keeps the byte-wise form.
 pub fn popcountValid(bits: []const u8, n: usize) usize {
     var count: usize = 0;
     const full = n >> 3;
-    for (bits[0..full]) |byte| count += @popCount(byte);
+    var i: usize = 0;
+    while (i + @sizeOf(u64) <= full) : (i += @sizeOf(u64)) {
+        count += @popCount(std.mem.readInt(u64, bits[i..][0..@sizeOf(u64)], .little));
+    }
+    for (bits[i..full]) |byte| count += @popCount(byte);
     const rem: u3 = @intCast(n & 7);
     if (rem != 0) {
         const mask = (@as(u8, 1) << rem) - 1;
@@ -152,4 +158,30 @@ test "popcountValid honors partial trailing byte" {
     bits[0] &= ~@as(u8, 1);
     bits[2] &= ~@as(u8, 0b0000_1000);
     try testing.expectEqual(@as(usize, 18), popcountValid(bits, 20));
+}
+
+test "popcountValid: word-wise count agrees with a bit-by-bit one" {
+    const alloc = testing.allocator;
+    const n = 200;
+    const bits = try alloc.alloc(u8, (n + 7) / 8);
+    defer alloc.free(bits);
+
+    // A pattern that is neither all-set nor all-clear, so the word path has to
+    // carry real counts rather than a constant.
+    for (bits, 0..) |*b, i| b.* = @truncate(i *% 37 +% 11);
+
+    for (0..n + 1) |k| {
+        var expect: usize = 0;
+        for (0..k) |i| {
+            if ((bits[i >> 3] >> @intCast(i & 7)) & 1 != 0) expect += 1;
+        }
+        try testing.expectEqual(expect, popcountValid(bits, k));
+    }
+
+    // All set and all clear, across and past the word boundary.
+    @memset(bits, 0xFF);
+    try testing.expectEqual(@as(usize, n), popcountValid(bits, n));
+    try testing.expectEqual(@as(usize, 64), popcountValid(bits, 64));
+    @memset(bits, 0);
+    try testing.expectEqual(@as(usize, 0), popcountValid(bits, n));
 }

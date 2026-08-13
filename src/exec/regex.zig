@@ -8,10 +8,14 @@
 //! Compilation takes an allocator so callers can hand it a
 //! `FixedBufferAllocator` over stack memory: matching a column costs no heap
 //! traffic and nothing to free.
+//!
+//! Backtracking is worst-case exponential — `(a|aa)+b` against a run of `a`s is
+//! the classic — so every match runs under a `Budget` and gives up with
+//! `PatternTooComplex` rather than wedging the query. See `Budget`.
 
 const std = @import("std");
 
-pub const Error = error{ BadPattern, OutOfMemory };
+pub const Error = error{ BadPattern, OutOfMemory, PatternTooComplex };
 
 pub const max_groups = 10;
 pub const Captures = [max_groups]?[2]usize;
@@ -53,6 +57,70 @@ const Cont = union(enum) {
     close: struct { cap: u8, start: usize, next: *const Cont },
 };
 
+/// Work allowance for one `find`, and the reason a pathological pattern stops
+/// the query instead of hanging or crashing it.
+///
+/// Two independent failure modes, so two counters:
+///
+/// `steps` bounds total work, for blowup that is WIDE rather than deep.
+/// `(a|aa)+b` against a run of `a`s is the textbook case: every extra `a`
+/// doubles the ways the run can be split and the trailing `b` never matches, so
+/// all of them get tried — 28 characters took 2.5 seconds, 40 would take hours.
+/// The allowance is far above anything the depth cap below can legitimately
+/// reach, plus a per-character term so that scanning a long subject with a
+/// cheap pattern never trips it.
+///
+/// `depth` bounds recursion, for blowup that is DEEP rather than wide. This
+/// matcher recurses once per repetition, so `[a-z]+` against an n-character
+/// subject stands n frames deep no matter how well the pattern behaves. Past
+/// the stack it is a segfault, which no caller can catch — the cap is what
+/// turns that into an error a query can report.
+///
+/// ponytail: the depth cap is a ceiling on SUBJECT LENGTH (~900 characters in
+/// Debug, ~4000 in release), not a safety margin over a limit nothing reaches.
+/// It exists because the matcher is recursive. Rewriting `step`/`resume_` to
+/// carry an explicit continuation stack on the heap removes the cap entirely;
+/// until a query needs to match longer text than that, this is the cheap half.
+const Budget = struct {
+    steps: u64,
+    depth: u32 = 0,
+
+    /// Stack a single match may claim. Well under a thread's, since the caller
+    /// has frames of its own below this.
+    const stack_allowance = 4 << 20;
+
+    /// Bytes of stack one `enter` costs. Measured on this matcher at ~4235
+    /// bytes per subject character in Debug and ~965 in release, over the three
+    /// `enter`s (`step` → `resume_` → `step`) a character consumes — then
+    /// rounded up, so the cap stays conservative if the frames grow a little.
+    const stack_per_level: usize = switch (@import("builtin").mode) {
+        .Debug => 1536,
+        else => 384,
+    };
+
+    const max_depth = stack_allowance / stack_per_level;
+
+    /// The subject length this depth cap actually allows, at the three `enter`s
+    /// a matched character costs. Roughly 900 characters in Debug and 3600 in
+    /// release — see the `ponytail:` note above for why there is a ceiling here
+    /// at all, and what removes it.
+    pub const max_subject_len = max_depth / 3;
+
+    fn init(subject_len: usize) Budget {
+        return .{ .steps = 10_000_000 + 4 * @as(u64, subject_len) };
+    }
+
+    fn enter(self: *Budget) Error!void {
+        if (self.steps == 0 or self.depth >= max_depth) return Error.PatternTooComplex;
+        self.steps -= 1;
+        self.depth += 1;
+    }
+
+    fn leave(self: *Budget) void {
+        self.depth -= 1;
+    }
+};
+
 pub const Regex = struct {
     alt: []const []const Item,
     ngroups: u8,
@@ -64,15 +132,19 @@ pub const Regex = struct {
         return .{ .alt = alt, .ngroups = p.ngroup };
     }
 
-    /// Leftmost match at or after `from`. Returns the matched span; `caps` is
-    /// filled with group spans (index 0 is the whole match).
-    pub fn find(self: Regex, s: []const u8, from: usize, caps: *Captures) ?[2]usize {
+    /// Leftmost match at or after `from`, or null if there is none. Returns the
+    /// matched span; `caps` is filled with group spans (index 0 is the whole
+    /// match). `PatternTooComplex` if the match outruns its `Budget` — that is
+    /// "gave up", NOT "no match", so it is an error rather than a null: a
+    /// pathological pattern must not quietly read as a non-matching one.
+    pub fn find(self: Regex, s: []const u8, from: usize, caps: *Captures) Error!?[2]usize {
+        var budget = Budget.init(s.len);
         var start = from;
         while (start <= s.len) : (start += 1) {
             caps.* = .{null} ** max_groups;
             const done: Cont = .done;
             for (self.alt) |branch| {
-                if (step(branch, 0, 0, s, start, caps, &done)) |end| {
+                if (try step(branch, 0, 0, s, start, caps, &done, &budget)) |end| {
                     caps[0] = .{ start, end };
                     return .{ start, end };
                 }
@@ -82,14 +154,16 @@ pub const Regex = struct {
     }
 };
 
-fn resume_(k: *const Cont, s: []const u8, pos: usize, caps: *Captures) ?usize {
+fn resume_(k: *const Cont, s: []const u8, pos: usize, caps: *Captures, b: *Budget) Error!?usize {
+    try b.enter();
+    defer b.leave();
     switch (k.*) {
         .done => return pos,
-        .seq => |x| return step(x.items, x.i, x.rep, s, pos, caps, x.next),
+        .seq => |x| return step(x.items, x.i, x.rep, s, pos, caps, x.next, b),
         .close => |x| {
             const saved = caps[x.cap];
             caps[x.cap] = .{ x.start, pos };
-            if (resume_(x.next, s, pos, caps)) |e| return e;
+            if (try resume_(x.next, s, pos, caps, b)) |e| return e;
             caps[x.cap] = saved;
             return null;
         },
@@ -99,41 +173,43 @@ fn resume_(k: *const Cont, s: []const u8, pos: usize, caps: *Captures) ?usize {
 /// Match `items[i..]` where the item at `i` has already matched `rep` times.
 /// Greedy: one more repetition is always tried before settling for fewer.
 /// Lazy inverts only that order — the set of reachable matches is the same.
-fn step(items: []const Item, i: usize, rep: u32, s: []const u8, pos: usize, caps: *Captures, cont: *const Cont) ?usize {
-    if (i == items.len) return resume_(cont, s, pos, caps);
+fn step(items: []const Item, i: usize, rep: u32, s: []const u8, pos: usize, caps: *Captures, cont: *const Cont, b: *Budget) Error!?usize {
+    try b.enter();
+    defer b.leave();
+    if (i == items.len) return resume_(cont, s, pos, caps, b);
     const it = items[i];
     if (it.lazy) {
         if (rep >= it.min) {
-            if (step(items, i + 1, 0, s, pos, caps, cont)) |e| return e;
+            if (try step(items, i + 1, 0, s, pos, caps, cont, b)) |e| return e;
         }
         if (rep < it.max) {
             const k = Cont{ .seq = .{ .items = items, .i = i, .rep = rep + 1, .next = cont } };
-            return matchAtom(it.atom, s, pos, caps, &k);
+            return matchAtom(it.atom, s, pos, caps, &k, b);
         }
         return null;
     }
     if (rep < it.max) {
         const k = Cont{ .seq = .{ .items = items, .i = i, .rep = rep + 1, .next = cont } };
-        if (matchAtom(it.atom, s, pos, caps, &k)) |e| return e;
+        if (try matchAtom(it.atom, s, pos, caps, &k, b)) |e| return e;
     }
-    if (rep >= it.min) return step(items, i + 1, 0, s, pos, caps, cont);
+    if (rep >= it.min) return step(items, i + 1, 0, s, pos, caps, cont, b);
     return null;
 }
 
-fn matchAtom(a: Atom, s: []const u8, pos: usize, caps: *Captures, k: *const Cont) ?usize {
+fn matchAtom(a: Atom, s: []const u8, pos: usize, caps: *Captures, k: *const Cont, b: *Budget) Error!?usize {
     switch (a) {
-        .bol => return if (pos == 0) resume_(k, s, pos, caps) else null,
-        .eol => return if (pos == s.len) resume_(k, s, pos, caps) else null,
-        .lit => |c| return if (pos < s.len and s[pos] == c) resume_(k, s, pos + 1, caps) else null,
-        .any => return if (pos < s.len) resume_(k, s, pos + 1, caps) else null,
-        .class => |cl| return if (pos < s.len and cl.has(s[pos])) resume_(k, s, pos + 1, caps) else null,
+        .bol => return if (pos == 0) resume_(k, s, pos, caps, b) else null,
+        .eol => return if (pos == s.len) resume_(k, s, pos, caps, b) else null,
+        .lit => |c| return if (pos < s.len and s[pos] == c) resume_(k, s, pos + 1, caps, b) else null,
+        .any => return if (pos < s.len) resume_(k, s, pos + 1, caps, b) else null,
+        .class => |cl| return if (pos < s.len and cl.has(s[pos])) resume_(k, s, pos + 1, caps, b) else null,
         .group => |g| {
             for (g.alt) |branch| {
                 if (g.cap) |ci| {
                     const closer = Cont{ .close = .{ .cap = ci, .start = pos, .next = k } };
-                    if (step(branch, 0, 0, s, pos, caps, &closer)) |e| return e;
+                    if (try step(branch, 0, 0, s, pos, caps, &closer, b)) |e| return e;
                 } else {
-                    if (step(branch, 0, 0, s, pos, caps, k)) |e| return e;
+                    if (try step(branch, 0, 0, s, pos, caps, k, b)) |e| return e;
                 }
             }
             return null;
@@ -337,6 +413,9 @@ fn escapeAtom(e: u8) Atom {
 /// Replace the first match of `pattern` in `s`, expanding `\1`..`\9` in
 /// `repl` to the corresponding capture (`\0` is the whole match). Mirrors
 /// `regexp_replace` without the global flag.
+///
+/// Compiles on every call, so a caller applying one pattern to a whole column
+/// should compile once and use `replaceFirstRe` instead.
 pub fn replaceFirst(
     out: std.mem.Allocator,
     scratch: std.mem.Allocator,
@@ -344,9 +423,18 @@ pub fn replaceFirst(
     pattern: []const u8,
     repl: []const u8,
 ) Error![]const u8 {
-    const re = try Regex.compile(scratch, pattern);
+    return replaceFirstRe(out, try Regex.compile(scratch, pattern), s, repl);
+}
+
+/// `replaceFirst` against an already-compiled pattern.
+pub fn replaceFirstRe(
+    out: std.mem.Allocator,
+    re: Regex,
+    s: []const u8,
+    repl: []const u8,
+) Error![]const u8 {
     var caps: Captures = undefined;
-    const span = re.find(s, 0, &caps) orelse return s;
+    const span = (try re.find(s, 0, &caps)) orelse return s;
 
     var buf = std.array_list.Managed(u8).init(out);
     try buf.appendSlice(s[0..span[0]]);
@@ -371,15 +459,15 @@ test "regex: literals, classes, anchors, groups" {
     var caps: Captures = undefined;
 
     var re = try Regex.compile(a, "^ab+c$");
-    try std.testing.expect(re.find("abbbc", 0, &caps) != null);
-    try std.testing.expect(re.find("ac", 0, &caps) == null);
+    try std.testing.expect((try re.find("abbbc", 0, &caps)) != null);
+    try std.testing.expect((try re.find("ac", 0, &caps)) == null);
 
     re = try Regex.compile(a, "[a-z]+[0-9]");
-    try std.testing.expect(re.find("xyz7", 0, &caps) != null);
-    try std.testing.expect(re.find("XYZ7", 0, &caps) == null);
+    try std.testing.expect((try re.find("xyz7", 0, &caps)) != null);
+    try std.testing.expect((try re.find("XYZ7", 0, &caps)) == null);
 
     re = try Regex.compile(a, "a|bc");
-    try std.testing.expect(re.find("zzbc", 0, &caps) != null);
+    try std.testing.expect((try re.find("zzbc", 0, &caps)) != null);
 }
 
 test "regex: the ClickBench host-extraction pattern" {
@@ -416,18 +504,18 @@ test "regex: counted quantifiers" {
     var caps: Captures = undefined;
 
     var re = try Regex.compile(a, "^a{3}$");
-    try std.testing.expect(re.find("aaa", 0, &caps) != null);
-    try std.testing.expect(re.find("aa", 0, &caps) == null);
+    try std.testing.expect((try re.find("aaa", 0, &caps)) != null);
+    try std.testing.expect((try re.find("aa", 0, &caps)) == null);
 
     re = try Regex.compile(a, "a{2,}");
-    try std.testing.expectEqual([2]usize{ 0, 4 }, re.find("aaaa", 0, &caps).?);
+    try std.testing.expectEqual([2]usize{ 0, 4 }, (try re.find("aaaa", 0, &caps)).?);
 
     re = try Regex.compile(a, "a{2,3}");
-    try std.testing.expectEqual([2]usize{ 0, 3 }, re.find("aaaa", 0, &caps).?);
+    try std.testing.expectEqual([2]usize{ 0, 3 }, (try re.find("aaaa", 0, &caps)).?);
 
     re = try Regex.compile(a, "(ab){2}");
-    try std.testing.expectEqual([2]usize{ 0, 4 }, re.find("abab", 0, &caps).?);
-    try std.testing.expect(re.find("ab", 0, &caps) == null);
+    try std.testing.expectEqual([2]usize{ 0, 4 }, (try re.find("abab", 0, &caps)).?);
+    try std.testing.expect((try re.find("ab", 0, &caps)) == null);
 }
 
 test "regex: lazy quantifiers" {
@@ -437,19 +525,19 @@ test "regex: lazy quantifiers" {
     var caps: Captures = undefined;
 
     var re = try Regex.compile(a, "a+?");
-    try std.testing.expectEqual([2]usize{ 0, 1 }, re.find("aaa", 0, &caps).?);
+    try std.testing.expectEqual([2]usize{ 0, 1 }, (try re.find("aaa", 0, &caps)).?);
 
     re = try Regex.compile(a, "a*?b");
-    try std.testing.expectEqual([2]usize{ 0, 3 }, re.find("aab", 0, &caps).?);
+    try std.testing.expectEqual([2]usize{ 0, 3 }, (try re.find("aab", 0, &caps)).?);
 
     re = try Regex.compile(a, "ab??");
-    try std.testing.expectEqual([2]usize{ 0, 1 }, re.find("ab", 0, &caps).?);
+    try std.testing.expectEqual([2]usize{ 0, 1 }, (try re.find("ab", 0, &caps)).?);
 
     re = try Regex.compile(a, "a{2,4}?");
-    try std.testing.expectEqual([2]usize{ 0, 2 }, re.find("aaaa", 0, &caps).?);
+    try std.testing.expectEqual([2]usize{ 0, 2 }, (try re.find("aaaa", 0, &caps)).?);
 
     re = try Regex.compile(a, "<(.*?)>");
-    try std.testing.expectEqual([2]usize{ 0, 3 }, re.find("<x><y>", 0, &caps).?);
+    try std.testing.expectEqual([2]usize{ 0, 3 }, (try re.find("<x><y>", 0, &caps)).?);
     try std.testing.expectEqual([2]usize{ 1, 2 }, caps[1].?);
 }
 
@@ -468,4 +556,38 @@ test "regex: no match leaves the subject alone" {
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const got = try replaceFirst(std.testing.allocator, fba.allocator(), "plain", "^x(y)z$", "\\1");
     try std.testing.expectEqualStrings("plain", got);
+}
+
+test "regex: a pathological pattern gives up instead of hanging" {
+    var buf: [32 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+    var caps: Captures = undefined;
+
+    // Wide blowup: every `a` doubles the ways `(a|aa)+` can split the run, and
+    // the trailing `b` never matches, so every one of them is tried. Unbudgeted
+    // this took 2.5s at 28 characters and would take hours at 40.
+    const re = try Regex.compile(a, "(a|aa)+b");
+    try std.testing.expectError(Error.PatternTooComplex, re.find("a" ** 40 ++ "c", 0, &caps));
+
+    // Deep blowup: a counted quantifier recurses once per repetition, and past
+    // the stack that is a segfault no caller can catch.
+    const deep = try Regex.compile(a, "a{1,1000000}b");
+    try std.testing.expectError(Error.PatternTooComplex, deep.find("a" ** 100_000, 0, &caps));
+
+    // The caps must leave ordinary work alone. A subject within the documented
+    // ceiling, scanned by a pattern that backtracks quadratically over every
+    // start position, still has to answer — both when it matches and when it
+    // does not (the miss is the expensive half).
+    const n = Budget.max_subject_len / 2;
+    const plain = try Regex.compile(a, "[a-z]+9");
+    const hit = "a" ** (Budget.max_subject_len / 2) ++ "9";
+    try std.testing.expectEqual([2]usize{ 0, n + 1 }, (try plain.find(hit, 0, &caps)).?);
+    try std.testing.expect((try plain.find(hit[0..n], 0, &caps)) == null);
+
+    // A long subject with a cheap pattern is a linear scan, not deep recursion,
+    // so subject length alone must never exhaust the step budget.
+    const long = "b" ** 200_000 ++ "zq";
+    const lit = try Regex.compile(a, "zq");
+    try std.testing.expectEqual([2]usize{ 200_000, 200_002 }, (try lit.find(long, 0, &caps)).?);
 }

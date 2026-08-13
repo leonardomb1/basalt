@@ -36,11 +36,20 @@ pub const Bitmap = struct {
     }
 
     /// True if the first `n` bits are all set (no nulls) — lets kernels take a
-    /// branch-free fast path. Whole bytes are checked at once.
+    /// branch-free fast path.
+    ///
+    /// Checked eight bytes at a time. This runs ahead of nearly every kernel in
+    /// the executor, over the full length of a column, and answers true for the
+    /// overwhelmingly common null-free case only after reading every byte — so
+    /// the width of the scan is the whole cost.
     pub fn allSet(self: Bitmap, n: usize) bool {
         if (n == 0) return true;
         const full = n >> 3;
         var i: usize = 0;
+        while (i + @sizeOf(u64) <= full) : (i += @sizeOf(u64)) {
+            const word = std.mem.readInt(u64, self.bits[i..][0..@sizeOf(u64)], .little);
+            if (word != std.math.maxInt(u64)) return false;
+        }
         while (i < full) : (i += 1) {
             if (self.bits[i] != 0xFF) return false;
         }
@@ -65,10 +74,6 @@ pub const Bytes = struct {
         const lo: usize = @intCast(self.offsets[i]);
         const hi: usize = @intCast(self.offsets[i + 1]);
         return self.values[lo..hi];
-    }
-
-    pub fn rows(self: Bytes) usize {
-        return if (self.offsets.len == 0) 0 else self.offsets.len - 1;
     }
 
     /// Total bytes spanned by rows `i` where `pick(i)` — sizes the values buffer
@@ -141,15 +146,6 @@ pub const BytesAppender = struct {
         return .{ .offsets = try self.offsets.toOwnedSlice(), .values = try self.values.toOwnedSlice() };
     }
 };
-
-/// A decimal widened to f64. Duplicated from `eval.toF64` rather than imported:
-/// `eval` imports this module, so the dependency only runs one way.
-fn decToF64(d: value.Decimal) f64 {
-    var p: f64 = 1;
-    var k: u8 = 0;
-    while (k < d.scale) : (k += 1) p *= 10;
-    return @as(f64, @floatFromInt(d.unscaled)) / p;
-}
 
 /// Row indices flagged in `keep`, in order — the shape `Bytes.take` wants.
 fn keptIndices(arena: std.mem.Allocator, keep: []const bool, kept: usize) ![]usize {
@@ -343,11 +339,16 @@ pub const Column = struct {
 pub const Builder = struct {
     arena: std.mem.Allocator,
     ty: types.Type,
-    valid: std.array_list.Managed(bool),
+    /// Validity accumulated in its FINAL bit-packed form, one bit per row.
+    ///
+    /// This used to be a `[]bool` shadow array that `finish` folded down into a
+    /// bitmap — a byte per row of scratch, plus a second full pass over it, to
+    /// produce something the appends could write directly. Bytes are appended
+    /// pre-set to all-valid, so a null-free column (the overwhelmingly common
+    /// one) never touches this beyond growing it.
+    bits: std.array_list.Managed(u8),
+    rows: usize = 0,
     store: Store,
-    /// Set the first time a null is appended. Most columns never have one, and
-    /// `finish` can then skip scanning the validity array entirely.
-    has_null: bool = false,
 
     /// Byte payloads accumulate into one growing buffer; `ends` holds each row's
     /// end offset, which `finish` turns into Arrow's leading-zero offsets buffer.
@@ -378,7 +379,26 @@ pub const Builder = struct {
             .decimal => .{ .dec = std.array_list.Managed(value.Decimal).init(arena) },
             .string, .bytes, .array, .@"struct" => bytes_store,
         };
-        return .{ .arena = arena, .ty = ty, .valid = std.array_list.Managed(bool).init(arena), .store = store };
+        return .{ .arena = arena, .ty = ty, .bits = std.array_list.Managed(u8).init(arena), .store = store };
+    }
+
+    /// Record one row's validity. New bytes arrive all-ones, so a valid row is
+    /// nothing but a bump of the counter once the byte exists.
+    fn pushValid(self: *Builder, ok: bool) !void {
+        if (self.rows & 7 == 0) try self.bits.append(0xFF);
+        if (!ok) self.bits.items[self.rows >> 3] &= ~(@as(u8, 1) << @intCast(self.rows & 7));
+        self.rows += 1;
+    }
+
+    /// Record `count` consecutive valid rows. Whole bytes are appended at once
+    /// rather than a bit at a time; bits already covered by the current partial
+    /// byte are set, since nothing clears one except an actual null.
+    fn pushValidRun(self: *Builder, count: usize) !void {
+        const end = self.rows + count;
+        const need = (end + 7) / 8;
+        try self.bits.ensureTotalCapacity(need);
+        while (self.bits.items.len < need) self.bits.appendAssumeCapacity(0xFF);
+        self.rows = end;
     }
 
     /// Starting guess for a byte column's payload, in bytes per row. Only sizes
@@ -390,7 +410,7 @@ pub const Builder = struct {
     /// and each growth memcpys everything appended so far.
     pub fn initCapacity(arena: std.mem.Allocator, ty: types.Type, rows: usize) !Builder {
         var b = init(arena, ty);
-        try b.valid.ensureTotalCapacity(rows);
+        try b.bits.ensureTotalCapacity((rows + 7) / 8);
         switch (b.store) {
             .bytes => |*l| {
                 try l.ends.ensureTotalCapacity(rows);
@@ -415,7 +435,7 @@ pub const Builder = struct {
             },
             .bytes => return error.BulkTypeMismatch,
         }
-        try self.valid.appendNTimes(true, vals.len);
+        try self.pushValidRun(vals.len);
     }
 
     /// Bulk append where only `vals` for present rows are supplied: `defs[i] ==
@@ -435,7 +455,7 @@ pub const Builder = struct {
             inline .b, .i32, .i64, .f64, .dec => |*l| {
                 if (@TypeOf(l.items) != []T) return error.BulkTypeMismatch;
                 try l.ensureUnusedCapacity(defs.len);
-                try self.valid.ensureUnusedCapacity(defs.len);
+                try self.bits.ensureTotalCapacity((self.rows + defs.len + 7) / 8);
                 var j: usize = 0;
                 for (defs) |d| {
                     const present = d == max_def;
@@ -445,9 +465,8 @@ pub const Builder = struct {
                         j += 1;
                     } else {
                         l.appendAssumeCapacity(std.mem.zeroes(T));
-                        self.has_null = true;
                     }
-                    self.valid.appendAssumeCapacity(present);
+                    try self.pushValid(present);
                 }
             },
             .bytes => return error.BulkTypeMismatch,
@@ -456,8 +475,7 @@ pub const Builder = struct {
 
     pub fn append(self: *Builder, v: Value) !void {
         const ok = !v.isNull();
-        if (!ok) self.has_null = true;
-        try self.valid.append(ok);
+        try self.pushValid(ok);
         switch (self.store) {
             .b => |*l| try l.append(if (ok) v.bool else false),
             .i32 => |*l| try l.append(if (ok) v.date else 0),
@@ -482,7 +500,7 @@ pub const Builder = struct {
                 .int => |x| x,
                 .float => |x| @intFromFloat(x),
                 .bool => |x| @intFromBool(x),
-                .decimal => |d| @intFromFloat(decToF64(d)),
+                .decimal => |d| @intFromFloat(d.toF64()),
                 // Still zero for a kind that has no numeric reading at all
                 // (a string, a date). Making that an error means widening
                 // `append`'s error set into the parquet decoder's declared sets,
@@ -506,7 +524,7 @@ pub const Builder = struct {
             .float => |x| x,
             .int => |x| @floatFromInt(x),
             .bool => |x| @floatFromInt(@intFromBool(x)),
-            .decimal => |d| decToF64(d),
+            .decimal => |d| d.toF64(),
             else => 0,
         };
     }
@@ -524,16 +542,9 @@ pub const Builder = struct {
     }
 
     pub fn finish(self: *Builder) !Column {
-        const n = self.valid.items.len;
-        var bm = try Bitmap.initFull(self.arena, n);
-        // `initFull` already marks every row valid, so the per-row scan only
-        // has work to do when a null was actually appended. Skipping it removes
-        // an O(rows) shift/mask pass from every null-free column.
-        if (self.has_null) {
-            for (self.valid.items, 0..) |is_valid, i| {
-                if (!is_valid) bm.setValid(i, false);
-            }
-        }
+        const n = self.rows;
+        // Already in final form — the appends wrote the bits as they went.
+        const bm = Bitmap{ .bits = try self.bits.toOwnedSlice(), .len = n };
         const data: Column.Data = switch (self.store) {
             .b => |*l| .{ .b = try l.toOwnedSlice() },
             .i32 => |*l| .{ .i32 = try l.toOwnedSlice() },
@@ -673,4 +684,67 @@ test "bitmap set/get across byte boundaries" {
     try std.testing.expect(!bm.get(9));
     try std.testing.expect(bm.get(10));
     try std.testing.expect(!bm.get(19));
+}
+
+test "bitmap allSet: word-wise scan agrees with a bit-by-bit one at every length" {
+    const alloc = std.testing.allocator;
+    // Spans several u64 words plus a partial word plus a partial byte, so the
+    // word loop, the byte tail and the bit tail all get exercised.
+    const n = 200;
+    var bm = try Bitmap.initFull(alloc, n);
+    defer alloc.free(bm.bits);
+
+    // No nulls: true at every prefix length.
+    for (0..n + 1) |k| try std.testing.expect(bm.allSet(k));
+
+    // One null at position i must be invisible to every prefix that stops at or
+    // before it, and visible to every prefix past it — including when it sits
+    // inside the first word, on a word boundary, or in the byte tail.
+    for ([_]usize{ 0, 1, 7, 8, 63, 64, 65, 127, 128, 191, 192, 199 }) |i| {
+        bm.setValid(i, false);
+        for (0..n + 1) |k| {
+            const expect = k <= i;
+            try std.testing.expectEqual(expect, bm.allSet(k));
+        }
+        bm.setValid(i, true);
+    }
+}
+
+test "builder validity: nulls, bulk runs and partial bytes interleave correctly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The case the bulk run has to get right: start mid-byte, so the run must
+    // set the bits left in the current byte as well as the whole bytes after
+    // it, without disturbing the null already recorded below it.
+    var b = Builder.init(a, types.Type.init(.int).asNullable());
+    try b.append(.{ .int = 1 });
+    try b.append(.null);
+    try b.append(.{ .int = 3 });
+    try b.appendBulk(i64, &.{ 4, 5, 6, 7, 8, 9, 10, 11, 12 }); // crosses two byte boundaries
+    try b.append(.null);
+    try b.append(.{ .int = 14 });
+
+    const c = try b.finish();
+    try std.testing.expectEqual(@as(usize, 14), c.len);
+    for (0..14) |i| {
+        const is_null = i == 1 or i == 12;
+        try std.testing.expectEqual(is_null, c.getValue(i).isNull());
+        if (!is_null) try std.testing.expectEqual(@as(i64, @intCast(i + 1)), c.getValue(i).int);
+    }
+    try std.testing.expect(!c.validity.allSet(14));
+    try std.testing.expect(c.validity.allSet(1));
+
+    // A null-free column of the same shape must report all-set at every prefix,
+    // including past the byte boundaries the run crossed.
+    var b2 = Builder.init(a, types.Type.init(.int));
+    try b2.appendBulk(i64, &.{ 1, 2, 3 });
+    try b2.append(.{ .int = 4 });
+    try b2.appendBulk(i64, &.{ 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17 });
+    const c2 = try b2.finish();
+    try std.testing.expectEqual(@as(usize, 17), c2.len);
+    for (0..18) |k| try std.testing.expect(c2.validity.allSet(k));
+    // The bitmap is exactly the rows' worth of bytes, no shadow array behind it.
+    try std.testing.expectEqual(@as(usize, 3), c2.validity.bits.len);
 }
