@@ -701,14 +701,18 @@ pub fn collectFields(e: *const ast.Expr, set: *std.StringHashMap(void)) !void {
 
 const testing = std.testing;
 
+// File-scope so the arrays live in static memory. As function locals,
+// `return .{ .fields = &.{…} }` returned the address of a stack temporary —
+// fine in Debug by accident, dangling in release, where the schema lookups
+// read reused stack and three tests failed (one by segfault).
+const test_schema_fields = [_]types.Schema.Field{
+    .{ .name = "a", .ty = types.Type.init(.int) },
+    .{ .name = "b", .ty = types.Type.init(.string) },
+    .{ .name = "c", .ty = types.Type.init(.int) },
+};
+
 fn testSchema() types.Schema {
-    const I = types.Type.init(.int);
-    const S = types.Type.init(.string);
-    return .{ .fields = &.{
-        .{ .name = "a", .ty = I },
-        .{ .name = "b", .ty = S },
-        .{ .name = "c", .ty = I },
-    } };
+    return .{ .fields = &test_schema_fields };
 }
 
 fn fld(arena: std.mem.Allocator, name: []const u8) !*ast.Expr {
@@ -828,12 +832,15 @@ fn selectStage(arena: std.mem.Allocator, items: []const ast.SelectItem) ast.Stag
     return .{ .node = .{ .select = items }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
 }
 
+const schema4_fields = [_]types.Schema.Field{
+    .{ .name = "a", .ty = types.Type.init(.int) },
+    .{ .name = "b", .ty = types.Type.init(.string) },
+    .{ .name = "c", .ty = types.Type.init(.int) },
+    .{ .name = "d", .ty = types.Type.init(.int) },
+};
+
 fn schema4() types.Schema {
-    const I = types.Type.init(.int);
-    const S = types.Type.init(.string);
-    return .{ .fields = &.{
-        .{ .name = "a", .ty = I }, .{ .name = "b", .ty = S }, .{ .name = "c", .ty = I }, .{ .name = "d", .ty = I },
-    } };
+    return .{ .fields = &schema4_fields };
 }
 
 test "planMap: a downstream select narrows a wide reconcile (dead items pruned)" {
@@ -1225,15 +1232,17 @@ test "translateExpr: a safe (TRY_) cast is never pushed" {
 // --- planWholeAgg: AUTHORITATIVE whole-aggregate descent -------------------
 
 /// a int, b string, c int, f float, m decimal(12,2), t timestamp.
+const whole_schema_fields = [_]types.Schema.Field{
+    .{ .name = "a", .ty = types.Type.init(.int) },
+    .{ .name = "b", .ty = types.Type.init(.string) },
+    .{ .name = "c", .ty = types.Type.init(.int) },
+    .{ .name = "f", .ty = types.Type.init(.float) },
+    .{ .name = "m", .ty = types.Type.decimal(12, 2) },
+    .{ .name = "t", .ty = types.Type.init(.timestamp) },
+};
+
 fn wholeSchema() types.Schema {
-    return .{ .fields = &.{
-        .{ .name = "a", .ty = types.Type.init(.int) },
-        .{ .name = "b", .ty = types.Type.init(.string) },
-        .{ .name = "c", .ty = types.Type.init(.int) },
-        .{ .name = "f", .ty = types.Type.init(.float) },
-        .{ .name = "m", .ty = types.Type.decimal(12, 2) },
-        .{ .name = "t", .ty = types.Type.init(.timestamp) },
-    } };
+    return .{ .fields = &whole_schema_fields };
 }
 
 fn geFilter(arena: std.mem.Allocator, col: []const u8, v: i64) !ast.Stage {
