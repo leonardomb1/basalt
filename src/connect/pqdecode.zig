@@ -40,7 +40,10 @@ pub const BitReader = struct {
     buf: []const u8,
     bit_pos: usize = 0,
 
-    pub fn read(self: *BitReader, width: u6) Error!u64 {
+    /// `u7`, not `u6`: delta miniblocks over INT64 may legally use width 64,
+    /// which a `u6` cannot even name — the old signature turned that page into
+    /// an @intCast panic in the caller.
+    pub fn read(self: *BitReader, width: u7) Error!u64 {
         if (width == 0) return 0;
         const end = self.bit_pos + width;
         if ((end + 7) >> 3 > self.buf.len) return Error.CorruptParquetPage;
@@ -49,21 +52,33 @@ pub const BitReader = struct {
         const shift: u6 = @intCast(self.bit_pos & 7);
         self.bit_pos = end;
 
-        // Fast path: the value plus its bit offset fit in one unaligned u64.
-        if (byte + 8 <= self.buf.len) {
-            const word = std.mem.readInt(u64, self.buf[byte..][0..8], .little);
+        // Fast path: offset + width fit one u64, which every hot width does
+        // (dictionary indices and levels are <= 32, so shift + width <= 39).
+        if (@as(usize, shift) + width <= 64) {
+            var word: u64 = 0;
+            if (byte + 8 <= self.buf.len) {
+                word = std.mem.readInt(u64, self.buf[byte..][0..8], .little);
+            } else {
+                // Tail: fewer than 8 bytes remain, so assemble what is there.
+                var k: usize = 0;
+                while (byte + k < self.buf.len and k < 8) : (k += 1) {
+                    word |= @as(u64, self.buf[byte + k]) << @intCast(8 * k);
+                }
+            }
             const v = word >> shift;
-            return if (width == 64) v else v & ((@as(u64, 1) << width) - 1);
+            return if (width == 64) v else v & ((@as(u64, 1) << @intCast(width)) - 1);
         }
 
-        // Tail: fewer than 8 bytes remain, so assemble what is there.
-        var word: u64 = 0;
+        // Wide value at a non-zero bit offset: the bits span two u64 words.
+        // One word used to be masked as if it held them all, so widths above
+        // 64-shift returned a value with its top bits silently zeroed.
+        var word: u128 = 0;
         var k: usize = 0;
-        while (byte + k < self.buf.len and k < 8) : (k += 1) {
-            word |= @as(u64, self.buf[byte + k]) << @intCast(8 * k);
+        while (byte + k < self.buf.len and k < 9) : (k += 1) {
+            word |= @as(u128, self.buf[byte + k]) << @intCast(8 * k);
         }
-        const v = word >> shift;
-        return if (width == 64) v else v & ((@as(u64, 1) << width) - 1);
+        const v: u64 = @truncate(word >> shift);
+        return if (width == 64) v else v & ((@as(u64, 1) << @intCast(width)) - 1);
     }
 };
 
@@ -264,7 +279,10 @@ pub fn decodeDeltaBinaryPacked(
 
         for (widths) |w| {
             if (n >= want) break;
-            const width: u6 = @intCast(w);
+            // A raw page byte: 0..64 are meaningful widths, anything above is
+            // a corrupt page — @intCast here was a crash on hostile input.
+            if (w > 64) return Error.CorruptParquetPage;
+            const width: u7 = @intCast(w);
             const bytes = (per_mini * @as(usize, width) + 7) / 8;
             if (pos + bytes > src.len) return Error.CorruptParquetPage;
             var br = BitReader{ .buf = src[pos..][0..bytes] };
@@ -368,7 +386,10 @@ fn decodeDeltaBinaryPackedTracking(
         const widths = src[pos..][0..miniblocks];
         pos += miniblocks;
         for (widths) |w| {
-            const width: u6 = @intCast(w);
+            // Same guard as `decodeDeltaBinaryPacked`: a raw page byte, valid
+            // only up to 64.
+            if (w > 64) return Error.CorruptParquetPage;
+            const width: u7 = @intCast(w);
             const bytes = (per_mini * @as(usize, width) + 7) / 8;
             if (pos + bytes > src.len) return Error.CorruptParquetPage;
             if (n < want) {
@@ -2048,4 +2069,87 @@ test "an http parquet source routes to the network, never the local filesystem" 
 
     const r = Reader.open(ar.allocator(), "http://127.0.0.1:1/nope.parquet");
     try testing.expectError(error.ConnectionRefused, r);
+}
+
+fn fuzzKernels(_: void, input: []const u8) anyerror!void {
+    // Every kernel here decodes attacker-controlled page bytes. `count` and
+    // `width` come from page headers in real use — also attacker-controlled —
+    // so both are derived from the input; count is bounded only to keep the
+    // harness fast, not because the kernels may assume a bound.
+    if (input.len < 3) return;
+    const width6: u6 = @truncate(input[0]);
+    const count: usize = ((@as(usize, input[1]) << 4) | (input[2] & 0x0F)) & 0x1FF;
+    const src = input[3..];
+    // Fixed buffer, not a heap arena: it makes each iteration allocation-free
+    // (the mutation loop runs thousands), and a decoder talked into a huge
+    // size by hostile bytes gets error.OutOfMemory instead of the memory.
+    var mem: [256 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&mem);
+    var arena = std.heap.ArenaAllocator.init(fba.allocator());
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    _ = decodeRleHybrid(a, src, width6 % 33, count) catch {};
+    _ = decodeDeltaBinaryPacked(a, src, count) catch {};
+    _ = decodeDeltaLengthByteArray(a, src, count) catch {};
+    _ = decodeDeltaByteArray(a, src, count) catch {};
+    _ = decodeByteStreamSplit(a, src, @max(1, @as(usize, width6 % 17)), count) catch {};
+
+    // PLAIN decode across every physical type, including the deprecated int96.
+    inline for (.{ .boolean, .int32, .int64, .int96, .float, .double, .byte_array, .fixed_len_byte_array }) |pt| {
+        var cur = PlainCursor.init(pt, @intCast(width6), src);
+        var n: usize = 0;
+        while (n < count) : (n += 1) {
+            _ = cur.next() catch break;
+        }
+    }
+}
+
+const fuzzKernels_corpus = [_][]const u8{
+    "\x03\x01\x00" ++ "\x03\x88\x01\x02\x03", // small RLE-ish seed
+    "\x02\x00\x08" ++ "\x80\x01\x04\x05\x00\x01\x02\x03\x04", // delta-ish seed
+};
+
+test "fuzz: page decode kernels survive arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzKernels, .{ .corpus = &fuzzKernels_corpus });
+    try @import("fuzzutil.zig").pound(fuzzKernels, &fuzzKernels_corpus);
+}
+
+test "BitReader: wide values at non-zero bit offsets keep their top bits" {
+    // Layout: 3 one-bits, then a 61-bit value, then a 64-bit value. Before the
+    // two-word path, any read whose shift + width crossed 64 bits silently
+    // zeroed the bits beyond the first word — a wrong VALUE, not an error.
+    const v61: u64 = 0x1ABC_DEF0_1234_5678 & ((1 << 61) - 1);
+    const v64: u64 = 0xFEDC_BA98_7654_3210;
+    var bits: [17]u8 = @splat(0);
+    var w = std.io.Writer.fixed(&bits);
+    _ = &w;
+    // Pack by hand, LSB-first: bit 0..2 = 0b111, then v61, then v64.
+    var acc: u128 = 0b111;
+    acc |= @as(u128, v61) << 3;
+    var acc2: u128 = @as(u128, v64) << ((3 + 61) % 8); // second region starts at bit 64
+    _ = &acc2;
+    var all: [16]u8 = undefined;
+    std.mem.writeInt(u128, &all, acc | (@as(u128, v64) << 64), .little);
+    var br = BitReader{ .buf = &all };
+    try std.testing.expectEqual(@as(u64, 0b111), try br.read(3));
+    try std.testing.expectEqual(v61, try br.read(61));
+    try std.testing.expectEqual(v64, try br.read(64));
+
+    // Reading past the buffer is an error, not a partial value.
+    var short = BitReader{ .buf = all[0..8] };
+    _ = try short.read(3);
+    try std.testing.expectError(Error.CorruptParquetPage, short.read(64));
+}
+
+test "decodeDeltaBinaryPacked: a miniblock width above 64 is a corrupt page" {
+    var mem: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&mem);
+    // header: block=128, miniblocks=1, total=2, first=0; then min_delta=0 and
+    // a width byte of 255 — the exact byte the mutation harness found.
+    const page = [_]u8{ 0x80, 0x01, 0x01, 0x02, 0x00, 0x00, 0xFF };
+    try std.testing.expectError(
+        Error.CorruptParquetPage,
+        decodeDeltaBinaryPacked(fba.allocator(), &page, 2),
+    );
 }

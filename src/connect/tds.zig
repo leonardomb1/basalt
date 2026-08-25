@@ -255,10 +255,8 @@ pub const Conn = struct {
             0x00, 0x00, 0x10, 0x00, 0x06,
             0x01, 0x00, 0x16, 0x00, 0x01,
             0x06, 0x00, 0x17, 0x00, 0x01,
-            0xFF,
-            0x11, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x01,
-            0x01,
+            0xFF, 0x11, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0x01,
         };
         try self.writePacket(PKT_PRELOGIN, &payload);
         try self.readMessage();
@@ -287,11 +285,10 @@ pub const Conn = struct {
 
     fn prelogin(self: *Conn, want_tls: bool) !void {
         const payload = [_]u8{
-            0x00, 0x00, 0x0B, 0x00, 0x06,
-            0x01, 0x00, 0x11, 0x00, 0x01,
-            0xFF,
-            0x11, 0x00, 0x00, 0x00, 0x00, 0x00,
-            if (want_tls) @as(u8, 0x01) else 0x02,
+            0x00, 0x00, 0x0B,                                  0x00, 0x06,
+            0x01, 0x00, 0x11,                                  0x00, 0x01,
+            0xFF, 0x11, 0x00,                                  0x00, 0x00,
+            0x00, 0x00, if (want_tls) @as(u8, 0x01) else 0x02,
         };
         try self.writePacket(PKT_PRELOGIN, &payload);
         try self.readMessage();
@@ -438,11 +435,12 @@ pub const Conn = struct {
         var payload = std.array_list.Managed(u8).init(self.gpa);
         defer payload.deinit();
         try payload.appendSlice(&[_]u8{
-            22, 0, 0, 0,
-            18, 0, 0, 0,
-            0x02, 0x00,
-            0, 0, 0, 0, 0, 0, 0, 0,
-            1, 0, 0, 0,
+            22,   0,    0, 0,
+            18,   0,    0, 0,
+            0x02, 0x00, 0, 0,
+            0,    0,    0, 0,
+            0,    0,    1, 0,
+            0,    0,
         });
         const u16s = try std.unicode.utf8ToUtf16LeAlloc(self.gpa, sql);
         defer self.gpa.free(u16s);
@@ -1225,11 +1223,17 @@ fn decodeValue(arena: std.mem.Allocator, d: ColumnDesc, bytes: []const u8) !Valu
     return switch (d.engine_type.kind) {
         .int => .{ .int = readIntLE(bytes) },
         .bool => .{ .bool = bytes.len > 0 and bytes[0] != 0 },
-        .float => .{ .float = if (bytes.len == 4) @as(f64, @as(f32, @bitCast(@as(u32, @truncate(readULE(bytes))))) ) else @bitCast(readULE(bytes)) },
+        .float => .{ .float = if (bytes.len == 4) @as(f64, @as(f32, @bitCast(@as(u32, @truncate(readULE(bytes)))))) else @bitCast(readULE(bytes)) },
         .decimal => if (d.is_money) decodeMoney(bytes) else decodeDecimal(d, bytes),
         .string => .{ .string = if (d.is_guid) try formatGuid(arena, bytes) else if (d.is_binary) try bytesToHex(arena, bytes) else if (d.is_unicode) try utf16ToUtf8(arena, bytes) else try win1252ToUtf8(arena, bytes) },
         .bytes => .{ .bytes = try arena.dupe(u8, bytes) },
-        .date => .{ .date = @intCast(@as(i64, @intCast(readULE(bytes))) - 719162) },
+        // Checked, not @intCast: the day count is raw wire bytes, and a value
+        // past the i32 date range panicked instead of erroring. Out of range
+        // means a corrupt cell, and a corrupt cell reads as null.
+        .date => if (std.math.cast(i32, @as(i64, @bitCast(readULE(bytes))) - 719162)) |days|
+            .{ .date = days }
+        else
+            .null,
         .time => .{ .time = decodeTime(d, bytes) },
         .timestamp => .{ .timestamp = decodeDateTime(d, bytes) },
         else => .{ .string = try arena.dupe(u8, bytes) },
@@ -1285,14 +1289,21 @@ fn decodeDateTime(d: ColumnDesc, bytes: []const u8) i64 {
             }
             const days: i64 = @intCast(u24le(bytes[tlen .. tlen + 3]));
             const days1970 = days - 719162;
-            const time_micros = @divTrunc(tu * 1_000_000, pow10(d.scale));
-            return days1970 * 86_400_000_000 + time_micros;
+            // Saturating: `tu` is up to eight wire bytes, so a corrupt or
+            // hostile value reaches i64 max and ordinary `*`/`+` here was a
+            // server-triggerable panic. A clamped timestamp out of garbage
+            // matches what the short-body paths already do (return 0).
+            const time_micros = @divTrunc(tu *| 1_000_000, pow10(d.scale));
+            return days1970 *| 86_400_000_000 +| time_micros;
         },
         else => {
             if (bytes.len >= 8) {
+                // Same saturation: `date4` is a full signed 32-bit day count
+                // off the wire; ~68 years is day ~25k, but nothing stops a
+                // peer sending 0x7FFFFFFF.
                 const date4 = readIntLE(bytes[0..4]);
                 const ticks: i64 = @intCast(readULE(bytes[4..8]));
-                return (date4 - 25567) * 86_400_000_000 + @divTrunc(ticks * 1_000_000, 300);
+                return (date4 - 25567) *| 86_400_000_000 +| @divTrunc(ticks * 1_000_000, 300);
             } else if (bytes.len >= 4) {
                 const days: i64 = @intCast(rdU16(bytes, 0));
                 const mins: i64 = @intCast(rdU16(bytes, 2));
@@ -1353,12 +1364,33 @@ fn readIntLE(bytes: []const u8) i64 {
 /// the five undefined slots (0x81/0x8D/0x8F/0x90/0x9D) fall back to the byte value.
 fn cp1252High(b: u8) u21 {
     return switch (b) {
-        0x80 => 0x20AC, 0x82 => 0x201A, 0x83 => 0x0192, 0x84 => 0x201E, 0x85 => 0x2026,
-        0x86 => 0x2020, 0x87 => 0x2021, 0x88 => 0x02C6, 0x89 => 0x2030, 0x8A => 0x0160,
-        0x8B => 0x2039, 0x8C => 0x0152, 0x8E => 0x017D, 0x91 => 0x2018, 0x92 => 0x2019,
-        0x93 => 0x201C, 0x94 => 0x201D, 0x95 => 0x2022, 0x96 => 0x2013, 0x97 => 0x2014,
-        0x98 => 0x02DC, 0x99 => 0x2122, 0x9A => 0x0161, 0x9B => 0x203A, 0x9C => 0x0153,
-        0x9E => 0x017E, 0x9F => 0x0178,
+        0x80 => 0x20AC,
+        0x82 => 0x201A,
+        0x83 => 0x0192,
+        0x84 => 0x201E,
+        0x85 => 0x2026,
+        0x86 => 0x2020,
+        0x87 => 0x2021,
+        0x88 => 0x02C6,
+        0x89 => 0x2030,
+        0x8A => 0x0160,
+        0x8B => 0x2039,
+        0x8C => 0x0152,
+        0x8E => 0x017D,
+        0x91 => 0x2018,
+        0x92 => 0x2019,
+        0x93 => 0x201C,
+        0x94 => 0x201D,
+        0x95 => 0x2022,
+        0x96 => 0x2013,
+        0x97 => 0x2014,
+        0x98 => 0x02DC,
+        0x99 => 0x2122,
+        0x9A => 0x0161,
+        0x9B => 0x203A,
+        0x9C => 0x0153,
+        0x9E => 0x017E,
+        0x9F => 0x0178,
         else => b,
     };
 }
@@ -1889,4 +1921,47 @@ test "buildLogin7Fedauth: nonce appended when echo && nonce present" {
     const dlen = std.mem.readInt(u32, out[feat_off + 1 ..][0..4], .little);
     try std.testing.expectEqual(@as(u32, 1 + 4 + 3 * 2 + 32), dlen);
     try std.testing.expectEqualSlices(u8, &nonce, out[out.len - 33 .. out.len - 1]);
+}
+
+fn fuzzCell(_: void, input: []const u8) anyerror!void {
+    // One TOKEN row cell: `decodeValue` dispatches on the column description
+    // negotiated at COLMETADATA time, then reads the raw cell bytes — both of
+    // which the server controls. Sweep the description space from the first
+    // two input bytes, feed the rest as the cell.
+    if (input.len < 2) return;
+    const kinds = [_]types.TypeKind{ .int, .bool, .float, .decimal, .string, .bytes, .date, .time, .timestamp };
+    const kind = kinds[input[0] % kinds.len];
+    const flags = input[1];
+    var ty = types.Type.init(kind);
+    ty.scale = flags % 8;
+    const d = ColumnDesc{
+        .tds_type = input[0],
+        .engine_type = ty,
+        .kind = .bytelen,
+        .scale = flags % 8,
+        .is_unicode = flags & 1 != 0,
+        .is_guid = flags & 2 != 0,
+        .is_binary = flags & 4 != 0,
+        .is_money = flags & 8 != 0,
+    };
+    // Fixed buffer, not a heap arena: it makes each iteration allocation-free
+    // (the mutation loop runs thousands), and a decoder talked into a huge
+    // size by hostile bytes gets error.OutOfMemory instead of the memory.
+    var mem: [256 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&mem);
+    var arena = std.heap.ArenaAllocator.init(fba.allocator());
+    defer arena.deinit();
+    _ = decodeValue(arena.allocator(), d, input[2..]) catch return;
+}
+
+const fuzzCell_corpus = [_][]const u8{
+    "\x00\x00\x2a\x00\x00\x00\x00\x00\x00\x00", // int cell
+    "\x03\x08\x01\x00\xd2\x04", // decimal-shaped
+    "\x04\x01A\x00B\x00", // unicode string
+    "\x06\x00\xda\xb9\x0a\x00", // date-shaped
+};
+
+test "fuzz: row cell decode survives arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzCell, .{ .corpus = &fuzzCell_corpus });
+    try @import("fuzzutil.zig").pound(fuzzCell, &fuzzCell_corpus);
 }

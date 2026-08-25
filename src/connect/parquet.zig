@@ -630,3 +630,29 @@ fn firstPage(a: std.mem.Allocator, file: []const u8, col: usize) ![]const u8 {
     const pg = try readPage(a, file, @intCast(m.startOffset()), m.compression);
     return pg.data;
 }
+
+fn fuzzParse(_: void, input: []const u8) anyerror!void {
+    // Footer metadata is the first thing read from an untrusted file, before
+    // any size or sanity check can exist — errors are the contract, panics
+    // and runaway allocation are findings.
+    // Fixed buffer, not a heap arena: it makes each iteration allocation-free
+    // (the mutation loop runs thousands), and a decoder talked into a huge
+    // size by hostile bytes gets error.OutOfMemory instead of the memory.
+    var mem: [256 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&mem);
+    var arena = std.heap.ArenaAllocator.init(fba.allocator());
+    defer arena.deinit();
+    _ = parseFile(arena.allocator(), input) catch return;
+}
+
+const fuzzParse_corpus = [_][]const u8{
+    @embedFile("testdata/uncompressed.parquet"),
+    @embedFile("testdata/gzip.parquet"),
+    @embedFile("testdata/v2delta.parquet"),
+    @embedFile("testdata/snappy.parquet"),
+};
+
+test "fuzz: file metadata parse survives arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzParse, .{ .corpus = &fuzzParse_corpus });
+    try @import("fuzzutil.zig").pound(fuzzParse, &fuzzParse_corpus);
+}

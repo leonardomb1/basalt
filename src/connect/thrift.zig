@@ -531,3 +531,20 @@ test "nested struct writing restores the outer field id" {
     try t.expectEqual(@as(i16, 2), (try r.readField()).id);
     try t.expectEqual(@as(i32, 99), try r.readI32());
 }
+
+fn fuzzOne(_: void, input: []const u8) anyerror!void {
+    // A decoder over hostile bytes must only ever answer with a value or an
+    // error — any panic here is a bug a malicious parquet footer can trigger.
+    var r = Reader.init(input);
+    r.skipStruct() catch return;
+}
+
+const fuzzOne_corpus = [_][]const u8{
+    // A real footer keeps the fuzzer starting from structurally valid input.
+    @embedFile("testdata/uncompressed.parquet"),
+};
+
+test "fuzz: compact-protocol reader survives arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzOne, .{ .corpus = &fuzzOne_corpus });
+    try @import("fuzzutil.zig").pound(fuzzOne, &fuzzOne_corpus);
+}

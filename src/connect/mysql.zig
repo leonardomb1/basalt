@@ -482,6 +482,11 @@ pub fn cachingSha2Token(password: []const u8, salt: []const u8) [32]u8 {
 const AuthSwitch = struct { plugin: ?AuthPlugin, salt: [20]u8 };
 
 fn parseAuthSwitch(p: []const u8) AuthSwitch {
+    // Byte 0 is the 0xfe marker; the plugin name follows. With no name byte at
+    // all there is nothing to parse — `p[1..name_end]` would underflow to
+    // `p[1..0]`. The caller guards this today, but the parser stays total on
+    // its own so a future caller can't reintroduce the trap.
+    if (p.len < 2) return .{ .plugin = null, .salt = std.mem.zeroes([20]u8) };
     var i: usize = 1;
     const name_end = std.mem.indexOfScalarPos(u8, p, i, 0) orelse p.len;
     const plugin = pluginByName(p[i..name_end]);
@@ -631,7 +636,7 @@ const cursor_vtable = sqlmod.textCursorVTable(Conn);
 /// inputs keep the low 64 bits).
 fn decodeBits(raw: []const u8) i64 {
     var v: u64 = 0;
-    for (raw[raw.len -| 8 ..]) |b| v = (v << 8) | b;
+    for (raw[raw.len -| 8..]) |b| v = (v << 8) | b;
     return @bitCast(v);
 }
 
@@ -819,4 +824,34 @@ fn lenencStrOrNull(buf: []const u8, i: *usize) !?[]const u8 {
         return null;
     }
     return try lenencStr(buf, i);
+}
+
+fn fuzzPackets(_: void, input: []const u8) anyerror!void {
+    // Every one of these parses a packet body as it arrives off the socket,
+    // before authentication has proven anything about the peer.
+    _ = parseOkAffected(input);
+    _ = errMessage(input);
+    _ = parseAuthSwitch(input);
+    _ = decodeBits(input);
+    // Walk the input as a run of length-encoded values, the shape of a text
+    // resultset row. Errors end the row; the cursor must still never leave
+    // the buffer.
+    var i: usize = 0;
+    while (i < input.len) {
+        const before = i;
+        _ = lenencStrOrNull(input, &i) catch break;
+        if (i == before) break;
+    }
+}
+
+const fuzzPackets_corpus = [_][]const u8{
+    "\x00\x05\x00\x02\x00", // OK-shaped
+    "\xff\x28\x04#42000oops", // ERR-shaped
+    "\xfe" ++ "caching_sha2_password" ++ "\x00" ++ "12345678", // auth-switch-shaped
+    "\x03abc\xfb\x02xy", // lenenc row
+};
+
+test "fuzz: wire packet parsers survive arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzPackets, .{ .corpus = &fuzzPackets_corpus });
+    try @import("fuzzutil.zig").pound(fuzzPackets, &fuzzPackets_corpus);
 }

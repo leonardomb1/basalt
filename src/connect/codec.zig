@@ -565,3 +565,38 @@ test "codecs without an encoder are refused before a file is written" {
 
     try t.expectEqualStrings("abc", try decompress(a, .uncompressed, try compress(a, .uncompressed, "abc"), 3));
 }
+
+fn fuzzDecompress(_: void, input: []const u8) anyerror!void {
+    // Page decompression runs on bytes straight out of an untrusted file. The
+    // claimed output length is attacker-controlled too, so it is derived from
+    // the input rather than fixed — bounded to keep the harness fast.
+    if (input.len < 2) return;
+    const ulen: usize = (@as(usize, input[0]) << 8) | input[1];
+    const src = input[2..];
+    // Fixed buffer, not a heap arena: it makes each iteration allocation-free
+    // (the mutation loop runs thousands), and a decoder talked into a huge
+    // size by hostile bytes gets error.OutOfMemory instead of the memory.
+    var mem: [256 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&mem);
+    var arena = std.heap.ArenaAllocator.init(fba.allocator());
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Hand-rolled decoders first (snappy, both lz4 framings), then the
+    // std-backed ones — each sees every input, a failure in one must not
+    // shadow the others.
+    _ = decompress(a, .snappy, src, ulen) catch {};
+    _ = decompress(a, .lz4_raw, src, ulen) catch {};
+    _ = decompress(a, .lz4, src, ulen) catch {};
+    _ = decompress(a, .gzip, src, ulen) catch {};
+    _ = decompress(a, .zstd, src, ulen) catch {};
+}
+
+const fuzzDecompress_corpus = [_][]const u8{
+    "\x00\x33" ++ @embedFile("testdata/rows.csv.gz"),
+    "\x00\x33" ++ @embedFile("testdata/rows.csv.zst"),
+};
+
+test "fuzz: decompressors survive arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzDecompress, .{ .corpus = &fuzzDecompress_corpus });
+    try @import("fuzzutil.zig").pound(fuzzDecompress, &fuzzDecompress_corpus);
+}
