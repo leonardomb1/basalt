@@ -116,6 +116,11 @@ earlier `$lets`) and referenced as `$name`. It can never be bound externally —
 endpoint's parameter surface. A LET and a PARAM may not share a name. `LET
 run_ts = now();` gives one consistent timestamp across every pipeline of a run.
 
+`LET name = (SELECT ...);` binds the single cell of a query instead, run when
+the statement is reached (so it may read anything the script can) — see
+*Subqueries in a predicate* (§5). An expression LET cannot reference a query
+LET: expression LETs fold before any query runs.
+
 ## 3. Connections
 
 ```sql
@@ -482,34 +487,51 @@ it streams, where `ROW_NUMBER() ... = 1` would not.
 
 ### Subqueries in a predicate
 
-There is no `IN (SELECT ...)`, `EXISTS` or scalar-subquery syntax. Each has a direct
-spelling as a join against an inline subquery, which is what the engine would rewrite
-them to anyway:
+`IN (SELECT ...)` and the scalar subquery are supported as sugar over machinery
+that already existed — each is rewritten at parse time into the join or constant
+it always denoted, so nothing here adds a new execution path:
 
 ```sql
--- x IN (SELECT k FROM t)
-SELECT s.* FROM 'facts.csv' s SEMI JOIN (SELECT k FROM 't.csv') d ON s.x = d.k;
+-- Planned as a SEMI JOIN against the (anonymous) subquery binding.
+SELECT * FROM 'facts.csv' WHERE x IN (SELECT k FROM 't.csv');
 
--- x NOT IN (SELECT k FROM t)   -- see the null caveat below
-SELECT s.* FROM 'facts.csv' s ANTI JOIN (SELECT k FROM 't.csv') d ON s.x = d.k;
+-- NOT IN plans as the ANTI JOIN — see the null caveat below.
+SELECT * FROM 'facts.csv' WHERE x NOT IN (SELECT k FROM 't.csv');
 
--- x > (SELECT avg(y) FROM t)   -- a one-row right side broadcasts
-SELECT s.* FROM 'facts.csv' s
-CROSS JOIN (SELECT AVG(y) AS lim FROM 't.csv') a
-WHERE s.x > a.lim;
+-- A scalar subquery runs ONCE, before the outer query, and its single cell is
+-- spliced in as a constant — so the comparison pushes down to the source like
+-- any literal. This is the incremental-extraction idiom:
+SELECT * FROM conn.orders WHERE ts > (SELECT max(ts) FROM 'lake/orders.parquet');
+
+-- The same thing, named — useful when several statements share the value:
+LET hi = (SELECT max(ts) FROM 'lake/orders.parquet');
+SELECT * FROM conn.orders WHERE ts > $hi;
 ```
 
-**The `ANTI JOIN` form is not identical to `NOT IN`.** Standard `NOT IN` yields NULL —
-so no rows at all — when the subquery produces a single NULL, because `x <> NULL` is
-unknown. An anti-join instead keeps rows that match no *non-null* key. Where the
-subquery column is nullable and that distinction matters, filter the nulls out of the
-subquery (`WHERE k IS NOT NULL`) and decide deliberately which answer you want. This
-is the reason the `NOT IN` spelling is absent rather than rewritten for you.
+The subquery of `IN` must produce exactly one named column, and the test must sit
+as a **top-level AND condition of `WHERE`** — under an `OR`, a `NOT` or a `CASE`
+it cannot be lifted into a join without changing what the predicate means, so
+those shapes are parse errors (spell them as an explicit join). The left side
+must be a plain column. The literal-list form `IN (1, 2, 3)` is unchanged.
 
-A **correlated** subquery — one referencing a column of the outer query — has no
-equivalent here and is not planned: it needs either decorrelation in an optimiser or
-per-row execution of the inner query, and the second is fatal for a streaming engine.
-Rewrite it as a join.
+A scalar query — inline or as `LET x = (SELECT ...);` — must produce exactly one
+column; one row is the value, zero rows read as `NULL` (standard SQL), and more
+than one row is an error. The inline form is evaluated per *statement*, not per
+row: it may not reference columns of the outer query.
+
+**`NOT IN` here is the anti join, not standard three-valued `NOT IN`.** Standard
+`NOT IN` yields NULL — so no rows at all — when the subquery produces a single
+NULL, because `x <> NULL` is unknown. The anti join instead keeps rows that match
+no *non-null* key, which is nearly always what an extraction script means. Where
+the subquery column is nullable and the distinction matters, filter the nulls
+(`WHERE k IS NOT NULL`) and decide deliberately which answer you want.
+
+`EXISTS` has no spelling: the uncorrelated form is degenerate (all rows or none)
+and the useful form is correlated. A **correlated** subquery — one referencing a
+column of the outer query — has no equivalent here and is not planned: it needs
+either decorrelation in an optimiser or per-row execution of the inner query, and
+the second is fatal for a streaming engine. Rewrite it as a join — the equality
+correlation `EXISTS` usually carries is exactly `IN` on that key.
 
 Table aliases (`FROM t a`, `JOIN c b`) are stripped at parse time — the engine
 sees bare column names.

@@ -471,7 +471,16 @@ pub fn analyzeWith(arena: std.mem.Allocator, raw_program: ast.Program, cli: []co
         const l = s.let_const;
         if (params_map.contains(l.name))
             return fail(diag, "`{s}` is declared twice: LET and PARAM share one name space", .{l.name});
-        try params_map.put(l.name, try substExpr(arena, l.expr, &params_map));
+        if (l.expr) |le| {
+            try params_map.put(l.name, try substExpr(arena, le, &params_map));
+        } else {
+            // A query LET's value only exists at run time. For checking, an
+            // unknown-typed null stands in — it unifies with any comparison,
+            // which is all the checker needs from it.
+            const ph = try arena.create(ast.Expr);
+            ph.* = .null_lit;
+            try params_map.put(l.name, ph);
+        }
     };
     // Guards run against params and LETs only, before the body-var placeholders
     // below can make a `$name` resolve to a stand-in the script never sees.
@@ -1125,7 +1134,8 @@ test "analyze a CSV map pipeline: structure, offline schema, physical" {
     const base = try tmp.dir.realpathAlloc(a, ".");
     const in = try std.fs.path.join(a, &.{ base, "in.csv" });
 
-    const src = try std.fmt.allocPrint(a,
+    const src = try std.fmt.allocPrint(
+        a,
         "LOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}' WHERE CAST(amount AS INT) >= 50;",
         .{in},
     );

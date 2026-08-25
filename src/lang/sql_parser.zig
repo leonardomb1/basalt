@@ -82,13 +82,13 @@ const AliasSet = struct {
 /// Words that terminate an alias-free position (so `FROM t WHERE ...` doesn't
 /// read WHERE as an alias).
 const reserved_after_source = [_][]const u8{
-    "where",    "group",  "order",   "limit",  "union", "anchor", "join",
-    "inner",    "left",   "right",   "full",   "cross", "semi",   "anti",
-    "on",       "pushdown", "with",  "as",     "end",   "when",   "then",
-    "else",     "case",   "select",  "from",   "load",  "for",    "using",
-    "upsert",   "append", "replace", "split",  "jobs",  "offset", "paginate",
-    "retry",    "create", "param",   "having", "and",   "or",     "not",
-    "explain",  "costs",  "analyze",
+    "where",   "group",    "order",   "limit",  "union", "anchor", "join",
+    "inner",   "left",     "right",   "full",   "cross", "semi",   "anti",
+    "on",      "pushdown", "with",    "as",     "end",   "when",   "then",
+    "else",    "case",     "select",  "from",   "load",  "for",    "using",
+    "upsert",  "append",   "replace", "split",  "jobs",  "offset", "paginate",
+    "retry",   "create",   "param",   "having", "and",   "or",     "not",
+    "explain", "costs",    "analyze",
 };
 
 fn isReservedAfterSource(name: []const u8) bool {
@@ -185,6 +185,27 @@ pub const Parser = struct {
     pending_bindings: std.array_list.Managed(ast.Stmt) = undefined,
     /// Counter for naming derived tables that carry no alias.
     derived_n: usize = 0,
+    /// `IN (SELECT ...)` conjuncts found while parsing the current WHERE. Each
+    /// is lifted into a semi/anti join stage beside the filter; the sentinel is
+    /// the placeholder expression standing where the IN test sat, matched by
+    /// POINTER identity so nothing else in the tree can be mistaken for it.
+    pending_semijoins: std.array_list.Managed(PendingSemiJoin) = undefined,
+    /// True only while the current WHERE clause parses — the one place an
+    /// `IN (SELECT ...)` can be lifted into a join stage.
+    in_where: bool = false,
+    /// Depth of `parseQuery` nesting. A scalar subquery desugars into a query
+    /// LET emitted through `pending_bindings`, which only a surrounding
+    /// `parseQuery` drains — so it is only legal at depth > 0.
+    query_depth: usize = 0,
+
+    const PendingSemiJoin = struct {
+        sentinel: *ast.Expr,
+        lhs: *ast.Expr,
+        binding: []const u8,
+        right_col: []const u8,
+        negated: bool,
+        pos: Pos,
+    };
 
     fn cur(self: *Parser) Token {
         return self.toks[self.i];
@@ -314,6 +335,7 @@ pub const Parser = struct {
         self.let_names = std.array_list.Managed([]const u8).init(self.arena);
         self.pending_bindings = std.array_list.Managed(ast.Stmt).init(self.arena);
         self.const_names = std.array_list.Managed([]const u8).init(self.arena);
+        self.pending_semijoins = std.array_list.Managed(PendingSemiJoin).init(self.arena);
 
         // A script that *opens* with EXPLAIN explains the whole script, offline and
         // without binding params — `basalt run` renders that plan without executing
@@ -351,6 +373,13 @@ pub const Parser = struct {
         if (self.isKw("let")) {
             const l = try self.parseLetStmt();
             try self.const_names.append(l.name);
+            // A query LET may itself contain derived tables or scalar
+            // subqueries; their bindings must precede it. (Ordinary statements
+            // get this from `parseQuery`'s own drain.)
+            if (self.pending_bindings.items.len > 0) {
+                try out.appendSlice(self.pending_bindings.items);
+                self.pending_bindings.clearRetainingCapacity();
+            }
             return out.append(.{ .let_const = l });
         }
         if (self.isKw("print")) return out.append(.{ .print = try self.parsePrintStmt() });
@@ -408,6 +437,14 @@ pub const Parser = struct {
         try self.expectKw("let");
         const name = try self.expectIdent();
         _ = try self.expect(.assign);
+        // `LET x = (SELECT ...);` — the value is the query's single cell,
+        // evaluated at run time in statement order (see `runScalarLet`).
+        if (self.at(.lparen) and (self.peekKw("select") or self.peekKw("with"))) {
+            _ = self.advance();
+            const pipe = try self.parseSubqueryPipeline();
+            _ = try self.expect(.semi);
+            return .{ .name = name, .expr = null, .query = pipe, .pos = pos };
+        }
         const expr = try self.parseExpr();
         _ = try self.expect(.semi);
         return .{ .name = name, .expr = expr, .pos = pos };
@@ -814,15 +851,15 @@ pub const Parser = struct {
         const name = try self.expectIdent();
         const Map = struct { n: []const u8, k: types.TypeKind };
         const simple = [_]Map{
-            .{ .n = "bool", .k = .bool },       .{ .n = "boolean", .k = .bool },
-            .{ .n = "int", .k = .int },         .{ .n = "integer", .k = .int },
-            .{ .n = "bigint", .k = .int },      .{ .n = "smallint", .k = .int },
-            .{ .n = "tinyint", .k = .int },     .{ .n = "float", .k = .float },
-            .{ .n = "real", .k = .float },      .{ .n = "double", .k = .float },
-            .{ .n = "string", .k = .string },   .{ .n = "text", .k = .string },
-            .{ .n = "bytes", .k = .bytes },     .{ .n = "binary", .k = .bytes },
-            .{ .n = "varbinary", .k = .bytes }, .{ .n = "date", .k = .date },
-            .{ .n = "time", .k = .time },       .{ .n = "timestamp", .k = .timestamp },
+            .{ .n = "bool", .k = .bool },          .{ .n = "boolean", .k = .bool },
+            .{ .n = "int", .k = .int },            .{ .n = "integer", .k = .int },
+            .{ .n = "bigint", .k = .int },         .{ .n = "smallint", .k = .int },
+            .{ .n = "tinyint", .k = .int },        .{ .n = "float", .k = .float },
+            .{ .n = "real", .k = .float },         .{ .n = "double", .k = .float },
+            .{ .n = "string", .k = .string },      .{ .n = "text", .k = .string },
+            .{ .n = "bytes", .k = .bytes },        .{ .n = "binary", .k = .bytes },
+            .{ .n = "varbinary", .k = .bytes },    .{ .n = "date", .k = .date },
+            .{ .n = "time", .k = .time },          .{ .n = "timestamp", .k = .timestamp },
             .{ .n = "datetime", .k = .timestamp },
         };
         for (simple) |m| {
@@ -991,6 +1028,8 @@ pub const Parser = struct {
     /// [ORDER BY ...] [LIMIT n [OFFSET m]]`, appending Let stmts for CTEs to
     /// `out` and pipeline stages to `stages`.
     fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages: *std.array_list.Managed(ast.Stage)) Error!void {
+        self.query_depth += 1;
+        defer self.query_depth -= 1;
         if (self.isKw("with") and !(self.peekTag() == .lparen)) {
             _ = self.advance();
             while (true) {
@@ -1352,9 +1391,40 @@ pub const Parser = struct {
 
         if (self.eatKw("where")) {
             const fpos = self.curPos();
-            var e = try self.parseExpr();
-            e = try self.stripExpr(e, &aliases);
-            try stages.append(.{ .node = .{ .filter = e }, .hints = &.{}, .pos = fpos });
+            self.in_where = true;
+            const raw = try self.parseExpr();
+            self.in_where = false;
+            // Lift `IN (SELECT ...)` conjuncts BEFORE stripExpr: the sentinels
+            // are matched by pointer, and a rewritten tree would orphan them.
+            const remaining = if (self.pending_semijoins.items.len > 0)
+                try self.liftSemiJoins(raw, fpos)
+            else
+                raw;
+            if (remaining) |r| {
+                const e = try self.stripExpr(r, &aliases);
+                try stages.append(.{ .node = .{ .filter = e }, .hints = &.{}, .pos = fpos });
+            }
+            for (self.pending_semijoins.items) |sj| {
+                // `lhs` was checked to be a field at parse; strip any alias
+                // qualifier the same way join keys written in ON do.
+                const lk = try self.arena.alloc(ast.QualName, 1);
+                lk[0] = stripQual(sj.lhs.field, &aliases);
+                const rk = try self.arena.alloc(ast.QualName, 1);
+                const rparts = try self.arena.alloc([]const u8, 1);
+                rparts[0] = sj.right_col;
+                rk[0] = .{ .parts = rparts };
+                try stages.append(.{
+                    .node = .{ .join = .{
+                        .kind = if (sj.negated) .anti else .semi,
+                        .binding = sj.binding,
+                        .left_keys = lk,
+                        .right_keys = rk,
+                    } },
+                    .hints = &.{},
+                    .pos = sj.pos,
+                });
+            }
+            self.pending_semijoins.clearRetainingCapacity();
         }
 
         var group: []const ast.QualName = &.{};
@@ -1745,6 +1815,115 @@ pub const Parser = struct {
             .pos = dpos,
         } });
         return name;
+    }
+
+    /// A parenthesized query in expression or LET position, the `(` already
+    /// consumed: parse it into a pipeline and route any bindings it creates to
+    /// `pending_bindings`, exactly the way `parseDerivedTable` does.
+    fn parseSubqueryPipeline(self: *Parser) Error!ast.Pipeline {
+        const qpos = self.curPos();
+        var sub_stages = std.array_list.Managed(ast.Stage).init(self.arena);
+        var inner_bindings = std.array_list.Managed(ast.Stmt).init(self.arena);
+        try self.parseQuery(&inner_bindings, &sub_stages);
+        _ = try self.expect(.rparen);
+        try self.pending_bindings.appendSlice(inner_bindings.items);
+        return .{ .stages = try sub_stages.toOwnedSlice(), .pos = qpos };
+    }
+
+    /// Output name of a pipeline's single column, or null when there is not
+    /// exactly one nameable column — walked back from the last stage the same
+    /// way the schema will resolve at plan time.
+    fn firstOutName(stages: []const ast.Stage) ?[]const u8 {
+        var i = stages.len;
+        while (i > 0) {
+            i -= 1;
+            switch (stages[i].node) {
+                .select => |items| {
+                    if (items.len != 1) return null;
+                    return switch (items[0]) {
+                        .field => |f| f.parts[f.parts.len - 1],
+                        .computed => |c| c.name,
+                        else => null,
+                    };
+                },
+                .aggregate => |ag| {
+                    if (ag.by.len + ag.aggs.len != 1) return null;
+                    if (ag.aggs.len == 1) return ag.aggs[0].name;
+                    return ag.by[0].parts[ag.by[0].parts.len - 1];
+                },
+                // These keep the upstream column set; keep walking.
+                .filter, .sort, .limit, .distinct => {},
+                else => return null,
+            }
+        }
+        return null;
+    }
+
+    /// Does `e` contain `needle` anywhere, by pointer? Used to reject an
+    /// `IN (SELECT ...)` sentinel that sits under OR / NOT / any non-AND node,
+    /// where dropping it would change the predicate's meaning.
+    fn containsExpr(e: *const ast.Expr, needle: *const ast.Expr) bool {
+        if (e == needle) return true;
+        return switch (e.*) {
+            .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit, .field => false,
+            .unary => |u| containsExpr(u.e, needle),
+            .binary => |b| containsExpr(b.l, needle) or containsExpr(b.r, needle),
+            .is_null => |n| containsExpr(n.e, needle),
+            .cast => |c| containsExpr(c.e, needle),
+            .cond => |c| containsExpr(c.cond, needle) or containsExpr(c.then, needle) or containsExpr(c.els, needle),
+            .call => |c| blk: {
+                for (c.args) |a| {
+                    if (containsExpr(a, needle)) break :blk true;
+                }
+                break :blk false;
+            },
+            .match => |m| blk: {
+                if (m.subject) |s| {
+                    if (containsExpr(s, needle)) break :blk true;
+                }
+                for (m.arms) |arm| {
+                    for (arm.pats) |p| {
+                        if (containsExpr(p, needle)) break :blk true;
+                    }
+                    if (arm.guard) |g| {
+                        if (containsExpr(g, needle)) break :blk true;
+                    }
+                    if (containsExpr(arm.value, needle)) break :blk true;
+                }
+                break :blk false;
+            },
+            .let_in => |li| containsExpr(li.value, needle) or containsExpr(li.body, needle),
+        };
+    }
+
+    fn isSentinel(self: *Parser, e: *const ast.Expr) bool {
+        for (self.pending_semijoins.items) |sj| {
+            if (sj.sentinel == e) return true;
+        }
+        return false;
+    }
+
+    /// Remove the pending semi-join sentinels from the top-level AND spine of a
+    /// WHERE predicate. Returns what remains of the predicate (null if the IN
+    /// tests were all of it). A sentinel anywhere BUT the AND spine — under an
+    /// OR, a NOT, a CASE — is an error: dropping it there would change what the
+    /// predicate means, so those shapes stay unsupported rather than wrong.
+    fn liftSemiJoins(self: *Parser, e: *ast.Expr, pos: Pos) Error!?*ast.Expr {
+        if (self.isSentinel(e)) return null;
+        if (e.* == .binary and e.binary.op == .@"and") {
+            const l = try self.liftSemiJoins(e.binary.l, pos);
+            const r = try self.liftSemiJoins(e.binary.r, pos);
+            if (l == null) return r;
+            if (r == null) return l;
+            e.binary.l = l.?;
+            e.binary.r = r.?;
+            return e;
+        }
+        for (self.pending_semijoins.items) |sj| {
+            if (containsExpr(e, sj.sentinel))
+                return self.fail(sj.pos, "IN (SELECT ...) is only supported as a top-level AND condition of WHERE — not under OR, NOT or CASE", .{});
+        }
+        return e;
     }
 
     /// `<fn>() OVER (PARTITION BY .. ORDER BY ..) [AS name]` as a complete select item.
@@ -2786,8 +2965,46 @@ pub const Parser = struct {
             if ((self.isKw("in") or (self.isKw("not") and self.peekKw("in"))) and min_bp < 40) {
                 const negated = self.isKw("not");
                 if (negated) _ = self.advance();
+                const inpos = self.curPos();
                 _ = self.advance();
                 _ = try self.expect(.lparen);
+                // `IN (SELECT ...)`: a semi join (anti when negated) against an
+                // anonymous binding, not a value list. The test itself becomes
+                // a join STAGE, so a sentinel expression stands in for it here
+                // and the WHERE handler lifts it out — which is why the shape
+                // is only accepted as a top-level AND conjunct of WHERE.
+                //
+                // NOT IN follows this engine's anti join, which keeps rows
+                // matching no NON-NULL key — the documented divergence from
+                // SQL's three-valued NOT IN (see language.md on anti joins).
+                if (self.isKw("select") or self.isKw("with")) {
+                    if (!self.in_where)
+                        return self.fail(inpos, "IN (SELECT ...) is only supported in a WHERE clause", .{});
+                    if (lhs.* != .field)
+                        return self.fail(inpos, "the left side of IN (SELECT ...) must be a plain column", .{});
+                    const pipe = try self.parseSubqueryPipeline();
+                    const col = firstOutName(pipe.stages) orelse
+                        return self.fail(inpos, "the subquery of IN must produce exactly one named column", .{});
+                    self.derived_n += 1;
+                    const bname = try std.fmt.allocPrint(self.arena, "__insq{d}", .{self.derived_n});
+                    try self.let_names.append(bname);
+                    try self.pending_bindings.append(.{ .binding = .{
+                        .name = bname,
+                        .pipeline = pipe,
+                        .pos = inpos,
+                    } });
+                    const sentinel = try self.mk(.{ .bool_lit = true });
+                    try self.pending_semijoins.append(.{
+                        .sentinel = sentinel,
+                        .lhs = lhs,
+                        .binding = bname,
+                        .right_col = col,
+                        .negated = negated,
+                        .pos = inpos,
+                    });
+                    lhs = sentinel;
+                    continue;
+                }
                 var alt: ?*ast.Expr = null;
                 while (true) {
                     const v = try self.parseExpr();
@@ -2884,6 +3101,25 @@ pub const Parser = struct {
                 return self.mk(.{ .field = q });
             },
             .lparen => {
+                // `(SELECT ...)` in expression position: a scalar subquery.
+                // Desugars to an anonymous query LET emitted ahead of the
+                // enclosing statement plus a `$name`-style reference here, so
+                // the value is a plain constant by the time the outer pipeline
+                // plans — and the comparison it sits in can push down.
+                if (self.peekKw("select") or self.peekKw("with")) {
+                    const spos = self.curPos();
+                    if (self.query_depth == 0)
+                        return self.fail(spos, "a scalar subquery is only supported inside a query — bind it first with `LET x = (SELECT ...);`", .{});
+                    _ = self.advance();
+                    const pipe = try self.parseSubqueryPipeline();
+                    self.derived_n += 1;
+                    const name = try std.fmt.allocPrint(self.arena, "__scalar{d}", .{self.derived_n});
+                    try self.pending_bindings.append(.{ .let_const = .{ .name = name, .expr = null, .query = pipe, .pos = spos } });
+                    try self.const_names.append(name);
+                    const parts = try self.arena.alloc([]const u8, 1);
+                    parts[0] = name;
+                    return self.mk(.{ .field = .{ .parts = parts } });
+                }
                 _ = self.advance();
                 const e = try self.parseExpr();
                 _ = try self.expect(.rparen);
@@ -3032,10 +3268,24 @@ pub const Parser = struct {
 
 fn binOpText(op: ast.BinOp) []const u8 {
     return switch (op) {
-        .add => "+",   .sub => "-",  .mul => "*",  .div => "/",  .mod => "%",
-        .eq => "==",   .ne => "!=",  .lt => "<",   .le => "<=",  .gt => ">",
-        .ge => ">=",   .@"and" => "and", .@"or" => "or",
-        .bit_and => "&", .bit_or => "|", .bit_xor => "^", .shl => "<<", .shr => ">>",
+        .add => "+",
+        .sub => "-",
+        .mul => "*",
+        .div => "/",
+        .mod => "%",
+        .eq => "==",
+        .ne => "!=",
+        .lt => "<",
+        .le => "<=",
+        .gt => ">",
+        .ge => ">=",
+        .@"and" => "and",
+        .@"or" => "or",
+        .bit_and => "&",
+        .bit_or => "|",
+        .bit_xor => "^",
+        .shl => "<<",
+        .shr => ">>",
     };
 }
 
@@ -4075,4 +4325,78 @@ test "sql: PRINT without an expression is a parse error" {
 
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     try testing.expectError(error.ParseFailed, parseSource(a, "PRINT;\nSELECT id FROM 'x.csv';", &diag));
+}
+
+test "sql: IN (SELECT ...) lifts to a semi join stage beside the filter" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+
+    const prog = try parseSource(a, "SELECT k FROM 'f.csv' WHERE v < 10 AND k IN (SELECT k FROM 'd.csv') AND v > 2;", &diag);
+    // The subquery becomes a binding ahead of the output statement.
+    try testing.expect(prog.stmts[1] == .binding);
+    const bname = prog.stmts[1].binding.name;
+    const stages = prog.stmts[2].output.stages;
+    // read | filter (both remaining conjuncts, IN dropped) | semi join | select
+    try testing.expect(stages[1].node == .filter);
+    try testing.expect(!containsTrueLit(stages[1].node.filter));
+    try testing.expect(stages[2].node == .join);
+    try testing.expectEqual(ast.JoinKind.semi, stages[2].node.join.kind);
+    try testing.expectEqualStrings(bname, stages[2].node.join.binding);
+    try testing.expectEqualStrings("k", stages[2].node.join.left_keys[0].parts[0]);
+    try testing.expectEqualStrings("k", stages[2].node.join.right_keys[0].parts[0]);
+
+    // NOT IN is the anti join; the IN being the whole WHERE leaves no filter.
+    const prog2 = try parseSource(a, "SELECT k FROM 'f.csv' WHERE k NOT IN (SELECT k FROM 'd.csv');", &diag);
+    const st2 = prog2.stmts[2].output.stages;
+    try testing.expect(st2[1].node == .join);
+    try testing.expectEqual(ast.JoinKind.anti, st2[1].node.join.kind);
+}
+
+/// True when a `bool_lit true` survives anywhere in the tree — a leftover
+/// sentinel would read as an always-true conjunct, silently widening a filter.
+fn containsTrueLit(e: *const ast.Expr) bool {
+    return switch (e.*) {
+        .bool_lit => |b| b,
+        .binary => |b| containsTrueLit(b.l) or containsTrueLit(b.r),
+        .unary => |u| containsTrueLit(u.e),
+        else => false,
+    };
+}
+
+test "sql: IN (SELECT ...) under OR / outside WHERE / multi-column are parse errors" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'f.csv' WHERE v = 1 OR k IN (SELECT k FROM 'd.csv');", &diag));
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT (k IN (SELECT k FROM 'd.csv')) AS f FROM 'f.csv';", &diag));
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'f.csv' WHERE k IN (SELECT k, v FROM 'd.csv');", &diag));
+    // The literal-list form is untouched by any of this.
+    const prog = try parseSource(a, "SELECT k FROM 'f.csv' WHERE k IN (1, 2, 3);", &diag);
+    try testing.expect(prog.stmts[1].output.stages[1].node == .filter);
+}
+
+test "sql: scalar subquery desugars to a query LET ahead of the statement" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+
+    const prog = try parseSource(a, "SELECT k FROM 'f.csv' WHERE v > (SELECT max(v) FROM 'f.csv');", &diag);
+    try testing.expect(prog.stmts[1] == .let_const);
+    const l = prog.stmts[1].let_const;
+    try testing.expect(l.expr == null);
+    try testing.expect(l.query != null);
+    // The reference left behind is a field ref carrying the LET's name.
+    const filt = prog.stmts[2].output.stages[1].node.filter;
+    try testing.expectEqualStrings(l.name, filt.binary.r.field.parts[0]);
+
+    // Explicit form: LET x = (SELECT ...);
+    const prog2 = try parseSource(a, "LET hi = (SELECT max(v) FROM 'f.csv');\nSELECT k FROM 'f.csv' WHERE v > $hi;", &diag);
+    try testing.expect(prog2.stmts[1] == .let_const);
+    try testing.expect(prog2.stmts[1].let_const.query != null);
+    try testing.expectEqualStrings("hi", prog2.stmts[1].let_const.name);
 }

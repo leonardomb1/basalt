@@ -343,7 +343,12 @@ pub const Let = struct { name: []const u8, pipeline: Pipeline, pos: Pos };
 /// (`-p`, query string, header) and never joins an endpoint's parameter surface.
 /// Distinct from `Expr.LetIn` (`LET x = v IN body`), which binds a bare name inside
 /// one expression and disappears during expansion.
-pub const LetConst = struct { name: []const u8, expr: *Expr, pos: Pos };
+/// `LET name = <expr>;` — a script constant, folded to a literal before any
+/// pipeline runs. With `query` set instead of `expr`, the value is the single
+/// cell of a query run at that point in the script (`LET x = (SELECT ...);`,
+/// and the desugared form of a scalar subquery in an expression): one column
+/// required, one row expected, zero rows read as NULL.
+pub const LetConst = struct { name: []const u8, expr: ?*Expr, query: ?Pipeline = null, pos: Pos };
 
 /// `PRINT <expr>;` — a script-authored progress line. The expression is evaluated
 /// at plan time against the params, LETs and — inside a `FOR EACH` or statement

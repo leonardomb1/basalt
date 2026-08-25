@@ -91,7 +91,12 @@ fn expandStmt(cx: *Ctx, s: ast.Stmt) Error!ast.Stmt {
             break :blk .{ .for_each = .{ .var_names = fe.var_names, .var_types = fe.var_types, .source = source, .hints = fe.hints, .body = try body.toOwnedSlice(), .pos = fe.pos } };
         },
         .match => |m| .{ .match = try expandStmtMatch(cx, m) },
-        .let_const => |l| .{ .let_const = .{ .name = l.name, .expr = try expandExpr(cx, l.expr, null, 0), .pos = l.pos } },
+        .let_const => |l| .{ .let_const = .{
+            .name = l.name,
+            .expr = if (l.expr) |e| try expandExpr(cx, e, null, 0) else null,
+            .query = if (l.query) |q| try expandPipeline(cx, q) else null,
+            .pos = l.pos,
+        } },
         .print => |p| .{ .print = .{ .expr = try expandExpr(cx, p.expr, null, 0), .pos = p.pos } },
         .call => |c| try expandCallStmt(cx, c),
         .throw => |t| .{ .throw = .{
@@ -426,8 +431,7 @@ test "expansion preserves is_empty kind and match structure (via rebuildExpr)" {
     defer ar.deinit();
     const a = ar.allocator();
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(a,
-        "SELECT CASE status WHEN 'a', 'b' THEN 'y' ELSE 'z' END AS g FROM 'x' WHERE status IS EMPTY;", &diag);
+    const prog = try parser.parseSource(a, "SELECT CASE status WHEN 'a', 'b' THEN 'y' ELSE 'z' END AS g FROM 'x' WHERE status IS EMPTY;", &diag);
     var msg: []const u8 = "";
     const out = try expandProgram(a, prog, null, &msg);
     const stages = out.stmts[1].output.stages;
@@ -611,8 +615,7 @@ test "expandProgram inlines `let … in` away (single-use binding)" {
     defer ar.deinit();
     const a = ar.allocator();
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(a,
-        "SELECT LET d = id + 1 IN d * d AS v FROM 'x';", &diag);
+    const prog = try parser.parseSource(a, "SELECT LET d = id + 1 IN d * d AS v FROM 'x';", &diag);
     var msg: []const u8 = "";
     const out = try expandProgram(a, prog, null, &msg);
     const e = outputSelect(out)[0].computed.expr;
@@ -770,15 +773,15 @@ test "statement-level LET parses to a let_const stmt and its expression expands"
 
     try std.testing.expect(prog.stmts[2] == .let_const);
     try std.testing.expectEqualStrings("n", prog.stmts[2].let_const.name);
-    try std.testing.expect(prog.stmts[2].let_const.expr.* == .call);
-    try std.testing.expectEqualStrings("dbl", prog.stmts[2].let_const.expr.call.name);
+    try std.testing.expect(prog.stmts[2].let_const.expr.?.* == .call);
+    try std.testing.expectEqualStrings("dbl", prog.stmts[2].let_const.expr.?.call.name);
 
     var msg: []const u8 = "";
     const out = try expandProgram(a, prog, null, &msg);
     // The `fn` declaration is dropped, so the LET lands right after the kind tag —
     // with the user fn inlined into its body.
     try std.testing.expect(out.stmts[1] == .let_const);
-    const e = out.stmts[1].let_const.expr;
+    const e = out.stmts[1].let_const.expr.?;
     try std.testing.expect(e.* == .binary);
     try std.testing.expectEqual(ast.BinOp.mul, e.binary.op);
     try std.testing.expectEqual(@as(i64, 21), e.binary.l.int_lit);
