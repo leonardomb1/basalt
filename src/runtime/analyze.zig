@@ -18,16 +18,25 @@ const pqwrite = @import("../connect/pqwrite.zig");
 const azure = @import("../connect/azure.zig");
 const s3 = @import("../connect/s3.zig");
 const zipsrc = @import("../connect/zipsrc.zig");
+const registry = @import("../connect/registry.zig");
 
 pub const Diag = struct {
     buf: [512]u8 = undefined,
     msg: []const u8 = "",
+    /// Where the failing stage/pipeline sits in the script. Cleared by `fail` and
+    /// stamped as the error unwinds through the analyzer, innermost stage first.
+    pos: ?ast.Pos = null,
+
+    pub fn stamp(self: *Diag, pos: ast.Pos) void {
+        if (self.pos == null) self.pos = pos;
+    }
 };
 
 pub const Error = error{ AnalyzeFailed, OutOfMemory };
 
 fn fail(diag: *Diag, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
     diag.msg = std.fmt.bufPrint(&diag.buf, fmt, args) catch "analysis error";
+    diag.pos = null;
     return error.AnalyzeFailed;
 }
 
@@ -525,6 +534,7 @@ const Ctx = struct {
     diag: *Diag,
 
     fn analyzeOutput(self: *Ctx, pipe: ast.Pipeline) !Output {
+        errdefer self.diag.stamp(pipe.pos);
         // The same rewrite the runtime applies, so the plan `EXPLAIN` prints is the
         // plan that runs — a filter shown below a join really did descend, and one
         // shown above it really did not.
@@ -533,7 +543,10 @@ const Ctx = struct {
         if (stages[stages.len - 1].node != .write)
             return fail(self.diag, "a top-level pipeline must end in `write`", .{});
 
-        var source = try self.resolveSource(stages[0]);
+        var source = self.resolveSource(stages[0]) catch |e| {
+            self.diag.stamp(stages[0].pos);
+            return e;
+        };
 
         if (stages[0].node == .read) {
             const rd = stages[0].node.read;
@@ -561,6 +574,7 @@ const Ctx = struct {
         var seen_breaker = false;
         var cur: ?types.Schema = source.schema;
         for (stages[1 .. stages.len - 1]) |st| {
+            errdefer self.diag.stamp(st.pos);
             var si = try self.stageInfo(st);
             if (si.breaker) has_breaker = true;
             if (!isMapStage(st.node)) map_only = false;
@@ -583,7 +597,10 @@ const Ctx = struct {
         }
 
         const w = stages[stages.len - 1].node.write;
-        const sink = try self.resolveSink(w, stages[stages.len - 1].hints);
+        const sink = self.resolveSink(w, stages[stages.len - 1].hints) catch |e| {
+            self.diag.stamp(stages[stages.len - 1].pos);
+            return e;
+        };
 
         const src_is_sql = isSqlConnector(source.connector);
         const sink_is_parallel = isSqlConnector(sink.connector) or std.mem.eql(u8, sink.connector, "starrocks");
@@ -642,6 +659,7 @@ const Ctx = struct {
                 if (src.schema) |s0| {
                     var cur: ?types.Schema = s0;
                     for (b.stages[1..]) |st| {
+                        errdefer self.diag.stamp(st.pos);
                         if (cur) |c| cur = try self.propagate(c, st.node);
                     }
                     src.schema = cur;
@@ -863,21 +881,18 @@ fn printSchema(w: anytype, depth: usize, schema: ?types.Schema) !void {
 }
 
 fn isBuiltinSource(connector: []const u8) bool {
-    return std.mem.eql(u8, connector, "csv") or std.mem.eql(u8, connector, "request") or
-        std.mem.eql(u8, connector, "http") or std.mem.eql(u8, connector, "buffer") or
-        std.mem.eql(u8, connector, "range") or std.mem.eql(u8, connector, "unit");
+    const c = registry.Connector.parse(connector) orelse return false;
+    return c.isBuiltinSource();
 }
 
 fn isSqlConnector(connector: []const u8) bool {
-    return std.mem.eql(u8, connector, "postgres") or std.mem.eql(u8, connector, "mysql") or std.mem.eql(u8, connector, "sqlserver");
+    return registry.SqlKind.parse(connector) != null;
 }
 
 /// The pushdown dialect for a connector, or null if it's not a SQL source.
 fn dialectOf(connector: []const u8) ?Dialect {
-    if (std.mem.eql(u8, connector, "postgres")) return .postgres;
-    if (std.mem.eql(u8, connector, "mysql")) return .mysql;
-    if (std.mem.eql(u8, connector, "sqlserver")) return .sqlserver;
-    return null;
+    const k = registry.SqlKind.parse(connector) orelse return null;
+    return k.dialect();
 }
 
 /// AND a raw `PUSHDOWN`/@[where] fragment with the translated implicit
@@ -1706,4 +1721,55 @@ test "check rejects a script whose THROW guard fires, and passes one whose WHEN 
     var bdiag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, bare), &bdiag));
     try std.testing.expectEqualStrings("unreachable branch: zz", bdiag.msg);
+}
+
+test "analyze: a failing stage reports its line and column" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,amount\n1,100\n" });
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const in = try std.fs.path.join(a, &.{ base, "in.csv" });
+
+    const src = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS\nSELECT id\nFROM '{s}'\nWHERE nosuch > 1;", .{in});
+    const prog = try parse(a, src);
+    var diag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyze(a, prog, &diag));
+    try std.testing.expectEqualStrings("unknown field `nosuch`", diag.msg);
+    try std.testing.expectEqual(@as(u32, 4), diag.pos.?.line);
+    try std.testing.expectEqual(@as(u32, 7), diag.pos.?.col);
+}
+
+test "analyze: string builtins refuse a non-INT position but coerce scalars to text" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,name\n1,ann\n" });
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const in = try std.fs.path.join(a, &.{ base, "in.csv" });
+
+    const bad = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS SELECT substr(id, 'a', 'b') AS s FROM '{s}';", .{in});
+    var diag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, bad), &diag));
+    try std.testing.expectEqualStrings("`substr` start must be an INT, got string", diag.msg);
+
+    const ok = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS SELECT concat(id, '-', name) AS c, lpad(id, 5, '0') AS p, length(id) AS n FROM '{s}';", .{in});
+    var diag2 = Diag{};
+    _ = try analyze(a, try parse(a, ok), &diag2);
+}
+
+test "analyze: CREATE FUNCTION cannot shadow a builtin or an aggregate" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    inline for (.{ "upper", "sum" }) |name| {
+        const src = try std.fmt.allocPrint(a, "CREATE FUNCTION {s}(x) AS 999; SELECT 1 AS a;", .{name});
+        var diag = Diag{};
+        try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, src), &diag));
+        try std.testing.expectEqualStrings("`" ++ name ++ "` is a built-in function and cannot be redefined", diag.msg);
+    }
 }

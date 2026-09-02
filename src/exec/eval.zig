@@ -6,16 +6,16 @@
 
 const std = @import("std");
 const regex = @import("regex.zig");
-const sqlmod = @import("../connect/sql.zig");
+const sql = @import("../connect/sql.zig");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const column = @import("column.zig");
-const valuemod = @import("value.zig");
-const batchmod = @import("batch.zig");
+const Decimal = @import("value.zig").Decimal;
+const Value = @import("value.zig").Value;
+const pow10f = @import("value.zig").pow10f;
+const Batch = @import("batch.zig").Batch;
 
 const Type = types.Type;
-const Value = valuemod.Value;
-const Batch = batchmod.Batch;
 
 pub const TypeError = error{ TypeError, OutOfMemory };
 pub const EvalError = error{ CastFailed, DivByZero, TypeMismatch, IntOverflow, PatternTooComplex, OutOfMemory };
@@ -123,300 +123,8 @@ pub const TypeCtx = struct {
         inline for (.{ "count", "sum", "avg", "min", "max" }) |agg| {
             if (std.mem.eql(u8, name, agg)) return self.err("aggregate `{s}` is only valid inside `aggregate`", .{name});
         }
-        if (eq(name, "now")) {
-            if (c.args.len != 0) return self.err("`now` takes no arguments", .{});
-            return Type.init(.timestamp);
-        }
-        if (eq(name, "today")) {
-            if (c.args.len != 0) return self.err("`today` takes no arguments", .{});
-            return Type.init(.date);
-        }
-        if (eq(name, "regexp_replace")) {
-            if (c.args.len != 3) return self.err("`regexp_replace` takes (string, pattern, replacement)", .{});
-            // A literal pattern is compiled here so a bad one fails `check`
-            // rather than partway through a run.
-            if (c.args[1].* == .str_lit) {
-                var pbuf: [16 * 1024]u8 = undefined;
-                var pfba = std.heap.FixedBufferAllocator.init(&pbuf);
-                _ = regex.Regex.compile(pfba.allocator(), c.args[1].str_lit) catch
-                    return self.err("invalid regular expression `{s}`", .{c.args[1].str_lit});
-            }
-            const a = try self.argType(c, 0);
-            return Type.init(.string).withNull(a.nullable);
-        }
-        if (eq(name, "date_trunc") or eq(name, "extract")) {
-            if (c.args.len != 2) return self.err("`{s}` takes (unit, timestamp)", .{name});
-            if (c.args[0].* != .str_lit) return self.err("`{s}` needs a literal unit", .{name});
-            if (timeUnit(c.args[0].str_lit) == null)
-                return self.err("unknown time unit `{s}`", .{c.args[0].str_lit});
-            const a = try self.argType(c, 1);
-            if (a.kind != .date and a.kind != .timestamp and !a.unknown)
-                return self.err("`{s}` needs a date or timestamp", .{name});
-            const out: types.TypeKind = if (eq(name, "extract")) .int else .timestamp;
-            return Type.init(out).withNull(a.nullable);
-        }
-        if (eq(name, "upper") or eq(name, "lower")) {
-            const a = try self.argType(c, 0);
-            return Type.init(.string).withNull(a.nullable);
-        }
-        if (eq(name, "length") or eq(name, "strlen")) {
-            const a = try self.argType(c, 0);
-            return Type.init(.int).withNull(a.nullable);
-        }
-        if (eq(name, "bit_count") or eq(name, "to_hex")) {
-            const a = try self.argType(c, 0);
-            if (c.args.len != 1 or !intish(a)) return self.err("`{s}` takes one INT argument", .{name});
-            const out: types.TypeKind = if (eq(name, "to_hex")) .string else .int;
-            return Type.init(out).withNull(a.nullable);
-        }
-        if (eq(name, "from_hex")) {
-            const a = try self.argType(c, 0);
-            if (c.args.len != 1 or !(a.kind == .string or a.kind == .bytes or a.unknown))
-                return self.err("`from_hex` takes one STRING argument", .{});
-            return Type.init(.int).withNull(a.nullable);
-        }
-        if (eq(name, "concat")) {
-            if (c.args.len == 0) return self.err("`concat` needs at least one argument", .{});
-            var nn = false;
-            for (c.args) |a| nn = nn or (try self.typeOf(a)).nullable;
-            return Type.init(.string).withNull(nn);
-        }
-        if (eq(name, "coalesce")) {
-            if (c.args.len == 0) return self.err("`coalesce` needs at least one argument", .{});
-            var result: ?Type = null;
-            var all_null = true;
-            for (c.args) |a| {
-                const t = try self.typeOf(a);
-                all_null = all_null and t.nullable;
-                result = if (result) |r| (Type.unify(r, t) orelse return self.err("`coalesce` args have incompatible types", .{})) else t;
-            }
-            return result.?.withNull(all_null);
-        }
-        if (eq(name, "starts_with") or eq(name, "ends_with") or eq(name, "contains") or eq(name, "like")) {
-            const a = try self.argType(c, 0);
-            const b = try self.argType(c, 1);
-            return Type.init(.bool).withNull(a.nullable or b.nullable);
-        }
-        if (eq(name, "trim")) {
-            const a = try self.argType(c, 0);
-            return Type.init(.string).withNull(a.nullable);
-        }
-        if (eq(name, "substr")) {
-            const a = try self.argType(c, 0);
-            _ = try self.argType(c, 1);
-            if (c.args.len > 2) _ = try self.argType(c, 2);
-            return Type.init(.string).withNull(a.nullable);
-        }
-        if (eq(name, "replace")) {
-            const a = try self.argType(c, 0);
-            _ = try self.argType(c, 1);
-            _ = try self.argType(c, 2);
-            return Type.init(.string).withNull(a.nullable);
-        }
-        if (try self.typeOfMathCall(c)) |t| return t;
-        if (try self.typeOfStringCall(c)) |t| return t;
-        if (try self.typeOfDateCall(c)) |t| return t;
-        return self.err("unknown function `{s}`", .{name});
-    }
-
-    /// Numeric builtins plus the null-selecting ones (`nullif`, `greatest`,
-    /// `least`). Returns null when `c` names none of them, so `typeOfCall` can
-    /// keep walking its chain. Split out only to keep `typeOfCall` readable.
-    fn typeOfMathCall(self: *TypeCtx, c: ast.Expr.Call) TypeError!?Type {
-        const name = c.name;
-        if (eq(name, "abs")) {
-            if (c.args.len != 1) return self.err("`abs` takes one argument", .{});
-            const a = try self.argType(c, 0);
-            if (!numericish(a)) return self.err("`abs` needs a numeric argument", .{});
-            return a;
-        }
-        if (eq(name, "floor") or eq(name, "ceil")) {
-            if (c.args.len != 1) return self.err("`{s}` takes one argument", .{name});
-            const a = try self.argType(c, 0);
-            if (!numericish(a)) return self.err("`{s}` needs a numeric argument", .{name});
-            // An int is already whole, so it passes through with its type.
-            if (a.unknown or a.kind == .int) return a;
-            return Type.init(.float).withNull(a.nullable);
-        }
-        if (eq(name, "round")) {
-            if (c.args.len != 1 and c.args.len != 2) return self.err("`round` takes (x) or (x, digits)", .{});
-            const a = try self.argType(c, 0);
-            if (!numericish(a)) return self.err("`round` needs a numeric argument", .{});
-            if (c.args.len == 2) {
-                const d = try self.argType(c, 1);
-                if (!numericish(d)) return self.err("`round` digits must be an integer", .{});
-            }
-            if (a.unknown or (a.kind == .int and c.args.len == 1)) return a;
-            return Type.init(.float).withNull(a.nullable);
-        }
-        if (eq(name, "mod")) {
-            if (c.args.len != 2) return self.err("`mod` takes (a, b)", .{});
-            const a = try self.argType(c, 0);
-            const b = try self.argType(c, 1);
-            if (!(a.kind == .int or a.unknown) or !(b.kind == .int or b.unknown))
-                return self.err("`mod` needs integer arguments", .{});
-            // A zero divisor yields null, so the result is always nullable.
-            return Type.init(.int).asNullable();
-        }
-        if (eq(name, "power")) {
-            if (c.args.len != 2) return self.err("`power` takes (base, exponent)", .{});
-            const a = try self.argType(c, 0);
-            const b = try self.argType(c, 1);
-            if (!numericish(a) or !numericish(b)) return self.err("`power` needs numeric arguments", .{});
-            return Type.init(.float).withNull(a.nullable or b.nullable or a.unknown or b.unknown);
-        }
-        if (eq(name, "sqrt")) {
-            if (c.args.len != 1) return self.err("`sqrt` takes one argument", .{});
-            const a = try self.argType(c, 0);
-            if (!numericish(a)) return self.err("`sqrt` needs a numeric argument", .{});
-            // A negative operand is outside the domain and yields null.
-            return Type.init(.float).asNullable();
-        }
-        if (eq(name, "sign")) {
-            if (c.args.len != 1) return self.err("`sign` takes one argument", .{});
-            const a = try self.argType(c, 0);
-            if (!numericish(a)) return self.err("`sign` needs a numeric argument", .{});
-            return Type.init(.int).withNull(a.nullable or a.unknown);
-        }
-        if (eq(name, "nullif")) {
-            if (c.args.len != 2) return self.err("`nullif` takes (a, b)", .{});
-            const a = try self.argType(c, 0);
-            const b = try self.argType(c, 1);
-            if (!comparable(a, b)) return self.err("`nullif` arguments are not comparable", .{});
-            return a.asNullable();
-        }
-        if (eq(name, "greatest") or eq(name, "least")) {
-            if (c.args.len < 2) return self.err("`{s}` needs at least two arguments", .{name});
-            var result: ?Type = null;
-            for (c.args) |a| {
-                const t = try self.typeOf(a);
-                result = if (result) |r|
-                    (Type.unify(r, t) orelse return self.err("`{s}` arguments have incompatible types", .{name}))
-                else
-                    t;
-            }
-            // Null arguments are ignored (Postgres), so the result is null only
-            // when every argument is — hence nullable regardless of the inputs.
-            return result.?.asNullable();
-        }
-        return null;
-    }
-
-    /// Byte-wise string builtins. Like the existing `substr`/`replace` rules
-    /// these do not insist the operand is already a string — `valueToString`
-    /// renders whatever arrives — they only fix arity and the result type.
-    fn typeOfStringCall(self: *TypeCtx, c: ast.Expr.Call) TypeError!?Type {
-        const name = c.name;
-        if (eq(name, "lpad") or eq(name, "rpad")) {
-            if (c.args.len != 2 and c.args.len != 3) return self.err("`{s}` takes (string, length[, fill])", .{name});
-            const a = try self.argType(c, 0);
-            _ = try self.argType(c, 1);
-            if (c.args.len > 2) _ = try self.argType(c, 2);
-            return Type.init(.string).withNull(a.nullable);
-        }
-        if (eq(name, "left") or eq(name, "right")) {
-            if (c.args.len != 2) return self.err("`{s}` takes (string, n)", .{name});
-            const a = try self.argType(c, 0);
-            _ = try self.argType(c, 1);
-            return Type.init(.string).withNull(a.nullable);
-        }
-        if (eq(name, "split_part")) {
-            if (c.args.len != 3) return self.err("`split_part` takes (string, delimiter, n)", .{});
-            _ = try self.argType(c, 0);
-            _ = try self.argType(c, 1);
-            _ = try self.argType(c, 2);
-            // An empty delimiter yields null, so this is nullable either way.
-            return Type.init(.string).asNullable();
-        }
-        if (eq(name, "strpos")) {
-            if (c.args.len != 2) return self.err("`strpos` takes (string, substring)", .{});
-            const a = try self.argType(c, 0);
-            const b = try self.argType(c, 1);
-            return Type.init(.int).withNull(a.nullable or b.nullable);
-        }
-        if (eq(name, "repeat")) {
-            if (c.args.len != 2) return self.err("`repeat` takes (string, n)", .{});
-            const a = try self.argType(c, 0);
-            _ = try self.argType(c, 1);
-            return Type.init(.string).withNull(a.nullable);
-        }
-        if (eq(name, "reverse")) {
-            if (c.args.len != 1) return self.err("`reverse` takes one argument", .{});
-            const a = try self.argType(c, 0);
-            return Type.init(.string).withNull(a.nullable);
-        }
-        return null;
-    }
-
-    fn typeOfDateCall(self: *TypeCtx, c: ast.Expr.Call) TypeError!?Type {
-        const name = c.name;
-        if (eq(name, "date_add")) {
-            if (c.args.len != 3) return self.err("`date_add` takes (unit, n, timestamp)", .{});
-            if (c.args[0].* != .str_lit) return self.err("`date_add` needs a literal unit", .{});
-            const u = timeUnit(c.args[0].str_lit) orelse
-                return self.err("unknown time unit `{s}`", .{c.args[0].str_lit});
-            const nt = try self.argType(c, 1);
-            if (!numericish(nt)) return self.err("`date_add` needs an integer amount", .{});
-            const a = try self.argType(c, 2);
-            if (a.unknown) return a;
-            const nn = a.nullable or nt.nullable or nt.unknown;
-            if (a.kind == .date) {
-                // A DATE has no time of day, so sub-day units have nowhere to go.
-                if (u == .hour or u == .minute or u == .second)
-                    return self.err("`date_add` cannot add `{s}` to a date; cast it to a timestamp first", .{c.args[0].str_lit});
-                return Type.init(.date).withNull(nn);
-            }
-            if (a.kind != .timestamp) return self.err("`date_add` needs a date or timestamp", .{});
-            return Type.init(.timestamp).withNull(nn);
-        }
-        if (eq(name, "date_diff")) {
-            if (c.args.len != 3) return self.err("`date_diff` takes (unit, start, end)", .{});
-            if (c.args[0].* != .str_lit) return self.err("`date_diff` needs a literal unit", .{});
-            if (timeUnit(c.args[0].str_lit) == null)
-                return self.err("unknown time unit `{s}`", .{c.args[0].str_lit});
-            const a = try self.argType(c, 1);
-            const b = try self.argType(c, 2);
-            if (!temporalish(a) or !temporalish(b))
-                return self.err("`date_diff` needs date or timestamp arguments", .{});
-            return Type.init(.int).withNull(a.nullable or b.nullable or a.unknown or b.unknown);
-        }
-        if (eq(name, "make_date")) {
-            if (c.args.len != 3) return self.err("`make_date` takes (year, month, day)", .{});
-            var nn = false;
-            for (c.args) |a| {
-                const t = try self.typeOf(a);
-                if (!numericish(t)) return self.err("`make_date` needs integer arguments", .{});
-                nn = nn or t.nullable or t.unknown;
-            }
-            return Type.init(.date).withNull(nn);
-        }
-        if (eq(name, "epoch")) {
-            if (c.args.len != 1) return self.err("`epoch` takes one argument", .{});
-            const a = try self.argType(c, 0);
-            if (!temporalish(a)) return self.err("`epoch` needs a date or timestamp", .{});
-            return Type.init(.int).withNull(a.nullable);
-        }
-        if (eq(name, "to_timestamp")) {
-            if (c.args.len != 1) return self.err("`to_timestamp` takes one argument", .{});
-            const a = try self.argType(c, 0);
-            if (!numericish(a)) return self.err("`to_timestamp` needs a numeric argument", .{});
-            return Type.init(.timestamp).withNull(a.nullable);
-        }
-        if (eq(name, "strftime")) {
-            if (c.args.len != 2) return self.err("`strftime` takes (timestamp, format)", .{});
-            const a = try self.argType(c, 0);
-            if (!temporalish(a)) return self.err("`strftime` needs a date or timestamp", .{});
-            const f = try self.argType(c, 1);
-            // A literal format is validated here so an unsupported directive
-            // fails `check` rather than partway through a run — the same
-            // treatment `regexp_replace` gives a literal pattern.
-            if (c.args[1].* == .str_lit) {
-                if (badStrftime(c.args[1].str_lit)) |bad|
-                    return self.err("`strftime` does not support `%{s}` (supported: %Y %m %d %H %M %S %y %%)", .{bad});
-            }
-            return Type.init(.string).withNull(a.nullable or f.nullable);
-        }
-        return null;
+        const b = lookupBuiltin(name) orelse return self.err("unknown function `{s}`", .{name});
+        return b.type_fn(self, c);
     }
 
     fn typeOfMatch(self: *TypeCtx, m: ast.Match) TypeError!Type {
@@ -451,6 +159,23 @@ pub const TypeCtx = struct {
     fn err(self: *TypeCtx, comptime fmt: []const u8, args: anytype) TypeError {
         self.msg = std.fmt.allocPrint(self.arena, fmt, args) catch "out of memory";
         return error.TypeError;
+    }
+
+    /// A text parameter: strings and bytes, plus every scalar the runtime renders
+    /// as text (numbers, bools, temporals) — `concat(id, '-', name)` is too common
+    /// to refuse. Only nested values have no text form.
+    fn wantText(self: *TypeCtx, c: ast.Expr.Call, i: usize) TypeError!Type {
+        const t = try self.argType(c, i);
+        if (t.kind == .array or t.kind == .@"struct")
+            return self.err("`{s}` argument {d} must be text, got {s}", .{ c.name, i + 1, @tagName(t.kind) });
+        return t;
+    }
+
+    /// A position or count parameter: an INT, or an untyped null.
+    fn wantInt(self: *TypeCtx, c: ast.Expr.Call, i: usize, what: []const u8) TypeError!Type {
+        const t = try self.argType(c, i);
+        if (!intish(t)) return self.err("`{s}` {s} must be an INT, got {s}", .{ c.name, what, @tagName(t.kind) });
+        return t;
     }
 };
 
@@ -508,7 +233,6 @@ fn evalColumnRowwise(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Bat
 
 const Column = column.Column;
 const Bitmap = column.Bitmap;
-const Decimal = valuemod.Decimal;
 
 const VecError = error{ Unsupported, CastFailed, DivByZero, TypeMismatch, IntOverflow, PatternTooComplex, OutOfMemory };
 
@@ -565,205 +289,9 @@ fn strArg(arena: std.mem.Allocator, e: *const ast.Expr, batch: Batch) VecError!S
 }
 
 fn callVec(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
-    const name = c.name;
-    const n = batch.len;
-
-    if (eq(name, "now")) return .{ .scalar = .{ .timestamp = std.time.microTimestamp() } };
-    if (eq(name, "today")) return .{ .scalar = .{ .date = @intCast(@divFloor(std.time.microTimestamp(), 86_400_000_000)) } };
-
-    if (eq(name, "upper") or eq(name, "lower")) {
-        if (c.args.len < 1) return error.Unsupported;
-        const s = try strArg(arena, c.args[0], batch);
-        const up = eq(name, "upper");
-        var out = try column.BytesAppender.init(arena, n);
-        var bm = try Bitmap.initFull(arena, n);
-        var any = false;
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const sv = strAt(s, i) orelse {
-                try out.pushNull();
-                bm.setValid(i, false);
-                any = true;
-                continue;
-            };
-            const o = try out.pushMutable(sv);
-            for (o) |*ch| ch.* = if (up) std.ascii.toUpper(ch.*) else std.ascii.toLower(ch.*);
-        }
-        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
-    }
-
-    if (eq(name, "trim")) {
-        if (c.args.len < 1) return error.Unsupported;
-        const s = try strArg(arena, c.args[0], batch);
-        var out = try column.BytesAppender.init(arena, n);
-        var bm = try Bitmap.initFull(arena, n);
-        var any = false;
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const sv = strAt(s, i) orelse {
-                try out.pushNull();
-                bm.setValid(i, false);
-                any = true;
-                continue;
-            };
-            try out.push(trim(sv));
-        }
-        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
-    }
-
-    if (eq(name, "length") or eq(name, "strlen")) {
-        if (c.args.len < 1) return error.Unsupported;
-        const s = try strArg(arena, c.args[0], batch);
-        const out = try arena.alloc(i64, n);
-        var bm = try Bitmap.initFull(arena, n);
-        var any = false;
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            if (strAt(s, i)) |sv| {
-                out[i] = @intCast(sv.len);
-            } else {
-                out[i] = 0;
-                bm.setValid(i, false);
-                any = true;
-            }
-        }
-        return mkCol(Type.init(.int).withNull(any), n, bm, .{ .i64 = out });
-    }
-
-    if (eq(name, "starts_with") or eq(name, "ends_with") or eq(name, "contains") or eq(name, "like")) {
-        if (c.args.len < 2) return error.Unsupported;
-        const s = try strArg(arena, c.args[0], batch);
-        const p = try strArg(arena, c.args[1], batch);
-        const out = try arena.alloc(bool, n);
-        var bm = try Bitmap.initFull(arena, n);
-        var any = false;
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const sv = strAt(s, i);
-            const pv = strAt(p, i);
-            if (sv == null or pv == null) {
-                out[i] = false;
-                bm.setValid(i, false);
-                any = true;
-                continue;
-            }
-            out[i] = if (eq(name, "starts_with"))
-                std.mem.startsWith(u8, sv.?, pv.?)
-            else if (eq(name, "ends_with"))
-                std.mem.endsWith(u8, sv.?, pv.?)
-            else if (eq(name, "contains"))
-                std.mem.indexOf(u8, sv.?, pv.?) != null
-            else
-                likeMatch(sv.?, pv.?);
-        }
-        return mkCol(Type.init(.bool).withNull(any), n, bm, .{ .b = out });
-    }
-
-    if (eq(name, "concat")) {
-        if (c.args.len == 0) return error.Unsupported;
-        const parts = try arena.alloc(Str, c.args.len);
-        for (c.args, parts) |a, *sp| sp.* = try strArg(arena, a, batch);
-        var out = try column.BytesAppender.init(arena, n);
-        var bm = try Bitmap.initFull(arena, n);
-        var any = false;
-        var i: usize = 0;
-        rows: while (i < n) : (i += 1) {
-            for (parts) |sp| {
-                if (strAt(sp, i) == null) {
-                    try out.pushNull();
-                    bm.setValid(i, false);
-                    any = true;
-                    continue :rows;
-                }
-            }
-            for (parts) |sp| try out.append(strAt(sp, i).?);
-            try out.endRow();
-        }
-        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
-    }
-
-    if (eq(name, "coalesce")) {
-        if (c.args.len == 0) return error.Unsupported;
-        const parts = try arena.alloc(Str, c.args.len);
-        for (c.args, parts) |a, *sp| sp.* = try strArg(arena, a, batch);
-        var out = try column.BytesAppender.init(arena, n);
-        var bm = try Bitmap.initFull(arena, n);
-        var any = false;
-        var i: usize = 0;
-        rows: while (i < n) : (i += 1) {
-            for (parts) |sp| {
-                if (strAt(sp, i)) |sv| {
-                    try out.push(sv);
-                    continue :rows;
-                }
-            }
-            try out.pushNull();
-            bm.setValid(i, false);
-            any = true;
-        }
-        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
-    }
-
-    if (eq(name, "substr")) {
-        if (c.args.len < 2) return error.Unsupported;
-        const s = try strArg(arena, c.args[0], batch);
-        const start = (try asNum(arena, try evalVec(arena, c.args[1], batch), n)) orelse return error.Unsupported;
-        if (!isIntNum(start)) return error.Unsupported;
-        var len_num: ?Num = null;
-        if (c.args.len > 2) {
-            len_num = (try asNum(arena, try evalVec(arena, c.args[2], batch), n)) orelse return error.Unsupported;
-            if (!isIntNum(len_num.?)) return error.Unsupported;
-        }
-        var out = try column.BytesAppender.init(arena, n);
-        var bm = try Bitmap.initFull(arena, n);
-        var any = false;
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const sv = strAt(s, i);
-            const start_ok = numValid(start, i);
-            const len_ok = if (len_num) |l| numValid(l, i) else true;
-            if (sv == null or !start_ok or !len_ok) {
-                try out.pushNull();
-                bm.setValid(i, false);
-                any = true;
-                continue;
-            }
-            try out.push(try substrBytes(arena, sv.?, numI(start, i), if (len_num) |l| numI(l, i) else null));
-        }
-        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
-    }
-
-    if (eq(name, "replace")) {
-        if (c.args.len < 3) return error.Unsupported;
-        const s = try strArg(arena, c.args[0], batch);
-        const f = try strArg(arena, c.args[1], batch);
-        const t = try strArg(arena, c.args[2], batch);
-        var out = try column.BytesAppender.init(arena, n);
-        var bm = try Bitmap.initFull(arena, n);
-        var any = false;
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const sv = strAt(s, i);
-            const fv = strAt(f, i);
-            const tv = strAt(t, i);
-            if (sv == null or fv == null or tv == null) {
-                try out.pushNull();
-                bm.setValid(i, false);
-                any = true;
-                continue;
-            }
-            if (fv.?.len == 0) {
-                try out.push(sv.?);
-                continue;
-            }
-            const o = try arena.alloc(u8, std.mem.replacementSize(u8, sv.?, fv.?, tv.?));
-            _ = std.mem.replace(u8, sv.?, fv.?, tv.?, o);
-            try out.push(o);
-        }
-        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
-    }
-
-    return error.Unsupported;
+    const b = lookupBuiltin(c.name) orelse return error.Unsupported;
+    const f = b.vec_fn orelse return error.Unsupported;
+    return f(arena, c, batch);
 }
 
 fn unaryVec(arena: std.mem.Allocator, u: ast.Expr.Unary, batch: Batch) VecError!Vec {
@@ -1222,7 +750,6 @@ fn asNum(arena: std.mem.Allocator, v: Vec, n: usize) VecError!?Num {
     }
 }
 
-
 /// A comparison where one side is temporal, as integer lanes.
 ///
 /// `asNum` covers int/float/decimal only, so every date comparison used to fall out
@@ -1638,15 +1165,422 @@ fn evalMatch(arena: std.mem.Allocator, m: ast.Match, batch: Batch, row: usize) E
 }
 
 fn evalCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-    const name = c.name;
-    if (eq(name, "now")) {
+    const b = lookupBuiltin(c.name) orelse return error.TypeMismatch;
+    return b.eval_fn(arena, c, batch, row);
+}
+
+/// 1 MiB ceiling on a single generated string (`repeat`, `lpad`/`rpad`), so
+/// `repeat(x, 1000000000)` is a clean error instead of an OOM or a stall.
+const max_str_bytes = 1 << 20;
+
+/// One scalar builtin: its plan-time typing, its row-wise evaluator and, when
+/// the vectorized path covers it, its whole-batch kernel. `typeOfCall`,
+/// `evalCall` and `callVec` are each a `lookupBuiltin` on the call's name;
+/// the table itself is `builtins` below (re-exported by `exec/builtins.zig`).
+pub const Builtin = struct {
+    name: []const u8,
+    type_fn: *const fn (*TypeCtx, ast.Expr.Call) TypeError!Type,
+    eval_fn: *const fn (std.mem.Allocator, ast.Expr.Call, Batch, usize) EvalError!Value,
+    vec_fn: ?*const fn (std.mem.Allocator, ast.Expr.Call, Batch) VecError!Vec = null,
+};
+
+/// Every scalar builtin the engine knows, one entry per name. Aliases and
+/// near-twins (`length`/`strlen`, `floor`/`ceil`, …) share handlers that
+/// branch on `c.name` where the two differ.
+pub const builtins = [_]Builtin{
+    .{ .name = "now", .type_fn = typing.now, .eval_fn = per_row.now, .vec_fn = vectorized.now },
+    .{ .name = "today", .type_fn = typing.today, .eval_fn = per_row.today, .vec_fn = vectorized.today },
+    .{ .name = "regexp_replace", .type_fn = typing.regexpReplace, .eval_fn = per_row.regexpReplace },
+    .{ .name = "date_trunc", .type_fn = typing.dateTruncExtract, .eval_fn = per_row.dateTruncExtract },
+    .{ .name = "extract", .type_fn = typing.dateTruncExtract, .eval_fn = per_row.dateTruncExtract },
+    .{ .name = "upper", .type_fn = typing.unaryString, .eval_fn = per_row.upperLower, .vec_fn = vectorized.upperLower },
+    .{ .name = "lower", .type_fn = typing.unaryString, .eval_fn = per_row.upperLower, .vec_fn = vectorized.upperLower },
+    .{ .name = "length", .type_fn = typing.strlen, .eval_fn = per_row.strlen, .vec_fn = vectorized.strlen },
+    .{ .name = "strlen", .type_fn = typing.strlen, .eval_fn = per_row.strlen, .vec_fn = vectorized.strlen },
+    .{ .name = "bit_count", .type_fn = typing.bitCountToHex, .eval_fn = per_row.bitCount },
+    .{ .name = "to_hex", .type_fn = typing.bitCountToHex, .eval_fn = per_row.toHex },
+    .{ .name = "from_hex", .type_fn = typing.fromHex, .eval_fn = per_row.fromHex },
+    .{ .name = "concat", .type_fn = typing.concat, .eval_fn = per_row.concat, .vec_fn = vectorized.concat },
+    .{ .name = "coalesce", .type_fn = typing.coalesce, .eval_fn = per_row.coalesce, .vec_fn = vectorized.coalesce },
+    .{ .name = "starts_with", .type_fn = typing.strPredicate, .eval_fn = per_row.affix, .vec_fn = vectorized.strPredicate },
+    .{ .name = "ends_with", .type_fn = typing.strPredicate, .eval_fn = per_row.affix, .vec_fn = vectorized.strPredicate },
+    .{ .name = "contains", .type_fn = typing.strPredicate, .eval_fn = per_row.affix, .vec_fn = vectorized.strPredicate },
+    .{ .name = "like", .type_fn = typing.strPredicate, .eval_fn = per_row.like, .vec_fn = vectorized.strPredicate },
+    .{ .name = "trim", .type_fn = typing.unaryString, .eval_fn = per_row.trimSpace, .vec_fn = vectorized.trimSpace },
+    .{ .name = "substr", .type_fn = typing.substr, .eval_fn = per_row.substr, .vec_fn = vectorized.substr },
+    .{ .name = "replace", .type_fn = typing.replace, .eval_fn = per_row.replace, .vec_fn = vectorized.replace },
+    .{ .name = "abs", .type_fn = typing.abs, .eval_fn = per_row.abs },
+    .{ .name = "floor", .type_fn = typing.floorCeil, .eval_fn = per_row.floorCeil },
+    .{ .name = "ceil", .type_fn = typing.floorCeil, .eval_fn = per_row.floorCeil },
+    .{ .name = "round", .type_fn = typing.round, .eval_fn = per_row.round },
+    .{ .name = "mod", .type_fn = typing.mod, .eval_fn = per_row.mod },
+    .{ .name = "power", .type_fn = typing.power, .eval_fn = per_row.power },
+    .{ .name = "sqrt", .type_fn = typing.sqrt, .eval_fn = per_row.sqrt },
+    .{ .name = "sign", .type_fn = typing.sign, .eval_fn = per_row.sign },
+    .{ .name = "nullif", .type_fn = typing.nullif, .eval_fn = per_row.nullif },
+    .{ .name = "greatest", .type_fn = typing.greatestLeast, .eval_fn = per_row.greatestLeast },
+    .{ .name = "least", .type_fn = typing.greatestLeast, .eval_fn = per_row.greatestLeast },
+    .{ .name = "lpad", .type_fn = typing.pad, .eval_fn = per_row.pad },
+    .{ .name = "rpad", .type_fn = typing.pad, .eval_fn = per_row.pad },
+    .{ .name = "left", .type_fn = typing.leftRight, .eval_fn = per_row.leftRight },
+    .{ .name = "right", .type_fn = typing.leftRight, .eval_fn = per_row.leftRight },
+    .{ .name = "split_part", .type_fn = typing.splitPart, .eval_fn = per_row.splitPart },
+    .{ .name = "strpos", .type_fn = typing.strpos, .eval_fn = per_row.strpos },
+    .{ .name = "repeat", .type_fn = typing.repeat, .eval_fn = per_row.repeat },
+    .{ .name = "reverse", .type_fn = typing.reverse, .eval_fn = per_row.reverse },
+    .{ .name = "date_add", .type_fn = typing.dateAdd, .eval_fn = per_row.dateAddDiff },
+    .{ .name = "date_diff", .type_fn = typing.dateDiff, .eval_fn = per_row.dateAddDiff },
+    .{ .name = "make_date", .type_fn = typing.makeDate, .eval_fn = per_row.makeDate },
+    .{ .name = "epoch", .type_fn = typing.epoch, .eval_fn = per_row.epoch },
+    .{ .name = "to_timestamp", .type_fn = typing.toTimestamp, .eval_fn = per_row.toTimestamp },
+    .{ .name = "strftime", .type_fn = typing.strftime, .eval_fn = per_row.strftime },
+};
+
+/// The builtin called `name`, or null: unknown names and aggregates
+/// (`count`, `sum`, …, which are not scalar builtins) both come back null.
+pub fn lookupBuiltin(name: []const u8) ?*const Builtin {
+    const map = comptime blk: {
+        var kvs: [builtins.len]struct { []const u8, usize } = undefined;
+        for (builtins, 0..) |b, i| kvs[i] = .{ b.name, i };
+        break :blk std.StaticStringMap(usize).initComptime(kvs);
+    };
+    const i = map.get(name) orelse return null;
+    return &builtins[i];
+}
+
+const typing = struct {
+    fn now(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 0) return self.err("`now` takes no arguments", .{});
+        return Type.init(.timestamp);
+    }
+
+    fn today(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 0) return self.err("`today` takes no arguments", .{});
+        return Type.init(.date);
+    }
+
+    fn regexpReplace(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 3) return self.err("`regexp_replace` takes (string, pattern, replacement)", .{});
+        // A literal pattern is compiled here so a bad one fails `check`
+        // rather than partway through a run.
+        if (c.args[1].* == .str_lit) {
+            var pbuf: [16 * 1024]u8 = undefined;
+            var pfba = std.heap.FixedBufferAllocator.init(&pbuf);
+            _ = regex.Regex.compile(pfba.allocator(), c.args[1].str_lit) catch
+                return self.err("invalid regular expression `{s}`", .{c.args[1].str_lit});
+        }
+        const a = try self.wantText(c, 0);
+        _ = try self.wantText(c, 1);
+        _ = try self.wantText(c, 2);
+        return Type.init(.string).withNull(a.nullable);
+    }
+
+    fn dateTruncExtract(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        const name = c.name;
+        if (c.args.len != 2) return self.err("`{s}` takes (unit, timestamp)", .{name});
+        if (c.args[0].* != .str_lit) return self.err("`{s}` needs a literal unit", .{name});
+        if (timeUnit(c.args[0].str_lit) == null)
+            return self.err("unknown time unit `{s}`", .{c.args[0].str_lit});
+        const a = try self.argType(c, 1);
+        if (a.kind != .date and a.kind != .timestamp and !a.unknown)
+            return self.err("`{s}` needs a date or timestamp", .{name});
+        const out: types.TypeKind = if (eq(name, "extract")) .int else .timestamp;
+        return Type.init(out).withNull(a.nullable);
+    }
+
+    fn unaryString(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 1) return self.err("`{s}` takes one argument", .{c.name});
+        const a = try self.wantText(c, 0);
+        return Type.init(.string).withNull(a.nullable);
+    }
+
+    fn strlen(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 1) return self.err("`{s}` takes one argument", .{c.name});
+        const a = try self.wantText(c, 0);
+        return Type.init(.int).withNull(a.nullable);
+    }
+
+    fn bitCountToHex(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        const name = c.name;
+        const a = try self.argType(c, 0);
+        if (c.args.len != 1 or !intish(a)) return self.err("`{s}` takes one INT argument", .{name});
+        const out: types.TypeKind = if (eq(name, "to_hex")) .string else .int;
+        return Type.init(out).withNull(a.nullable);
+    }
+
+    fn fromHex(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        const a = try self.argType(c, 0);
+        if (c.args.len != 1 or !(a.kind == .string or a.kind == .bytes or a.unknown))
+            return self.err("`from_hex` takes one STRING argument", .{});
+        return Type.init(.int).withNull(a.nullable);
+    }
+
+    fn concat(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len == 0) return self.err("`concat` needs at least one argument", .{});
+        var nn = false;
+        for (c.args, 0..) |_, i| nn = nn or (try self.wantText(c, i)).nullable;
+        return Type.init(.string).withNull(nn);
+    }
+
+    fn coalesce(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len == 0) return self.err("`coalesce` needs at least one argument", .{});
+        var result: ?Type = null;
+        var all_null = true;
+        for (c.args) |a| {
+            const t = try self.typeOf(a);
+            all_null = all_null and t.nullable;
+            result = if (result) |r| (Type.unify(r, t) orelse return self.err("`coalesce` args have incompatible types", .{})) else t;
+        }
+        return result.?.withNull(all_null);
+    }
+
+    fn strPredicate(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 2) return self.err("`{s}` takes (string, string)", .{c.name});
+        const a = try self.wantText(c, 0);
+        const b = try self.wantText(c, 1);
+        return Type.init(.bool).withNull(a.nullable or b.nullable);
+    }
+
+    fn substr(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 2 and c.args.len != 3) return self.err("`substr` takes (string, start[, length])", .{});
+        const a = try self.wantText(c, 0);
+        _ = try self.wantInt(c, 1, "start");
+        if (c.args.len > 2) _ = try self.wantInt(c, 2, "length");
+        return Type.init(.string).withNull(a.nullable);
+    }
+
+    fn replace(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 3) return self.err("`replace` takes (string, from, to)", .{});
+        const a = try self.wantText(c, 0);
+        _ = try self.wantText(c, 1);
+        _ = try self.wantText(c, 2);
+        return Type.init(.string).withNull(a.nullable);
+    }
+
+    fn abs(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 1) return self.err("`abs` takes one argument", .{});
+        const a = try self.argType(c, 0);
+        if (!numericish(a)) return self.err("`abs` needs a numeric argument", .{});
+        return a;
+    }
+
+    fn floorCeil(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        const name = c.name;
+        if (c.args.len != 1) return self.err("`{s}` takes one argument", .{name});
+        const a = try self.argType(c, 0);
+        if (!numericish(a)) return self.err("`{s}` needs a numeric argument", .{name});
+        // An int is already whole, so it passes through with its type.
+        if (a.unknown or a.kind == .int) return a;
+        return Type.init(.float).withNull(a.nullable);
+    }
+
+    fn round(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 1 and c.args.len != 2) return self.err("`round` takes (x) or (x, digits)", .{});
+        const a = try self.argType(c, 0);
+        if (!numericish(a)) return self.err("`round` needs a numeric argument", .{});
+        if (c.args.len == 2) {
+            const d = try self.argType(c, 1);
+            if (!numericish(d)) return self.err("`round` digits must be an integer", .{});
+        }
+        if (a.unknown or (a.kind == .int and c.args.len == 1)) return a;
+        return Type.init(.float).withNull(a.nullable);
+    }
+
+    fn mod(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 2) return self.err("`mod` takes (a, b)", .{});
+        const a = try self.argType(c, 0);
+        const b = try self.argType(c, 1);
+        if (!(a.kind == .int or a.unknown) or !(b.kind == .int or b.unknown))
+            return self.err("`mod` needs integer arguments", .{});
+        // A zero divisor yields null, so the result is always nullable.
+        return Type.init(.int).asNullable();
+    }
+
+    fn power(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 2) return self.err("`power` takes (base, exponent)", .{});
+        const a = try self.argType(c, 0);
+        const b = try self.argType(c, 1);
+        if (!numericish(a) or !numericish(b)) return self.err("`power` needs numeric arguments", .{});
+        return Type.init(.float).withNull(a.nullable or b.nullable or a.unknown or b.unknown);
+    }
+
+    fn sqrt(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 1) return self.err("`sqrt` takes one argument", .{});
+        const a = try self.argType(c, 0);
+        if (!numericish(a)) return self.err("`sqrt` needs a numeric argument", .{});
+        // A negative operand is outside the domain and yields null.
+        return Type.init(.float).asNullable();
+    }
+
+    fn sign(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 1) return self.err("`sign` takes one argument", .{});
+        const a = try self.argType(c, 0);
+        if (!numericish(a)) return self.err("`sign` needs a numeric argument", .{});
+        return Type.init(.int).withNull(a.nullable or a.unknown);
+    }
+
+    fn nullif(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 2) return self.err("`nullif` takes (a, b)", .{});
+        const a = try self.argType(c, 0);
+        const b = try self.argType(c, 1);
+        if (!comparable(a, b)) return self.err("`nullif` arguments are not comparable", .{});
+        return a.asNullable();
+    }
+
+    fn greatestLeast(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        const name = c.name;
+        if (c.args.len < 2) return self.err("`{s}` needs at least two arguments", .{name});
+        var result: ?Type = null;
+        for (c.args) |a| {
+            const t = try self.typeOf(a);
+            result = if (result) |r|
+                (Type.unify(r, t) orelse return self.err("`{s}` arguments have incompatible types", .{name}))
+            else
+                t;
+        }
+        // Null arguments are ignored (Postgres), so the result is null only
+        // when every argument is — hence nullable regardless of the inputs.
+        return result.?.asNullable();
+    }
+
+    fn pad(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        const name = c.name;
+        if (c.args.len != 2 and c.args.len != 3) return self.err("`{s}` takes (string, length[, fill])", .{name});
+        const a = try self.wantText(c, 0);
+        _ = try self.wantInt(c, 1, "length");
+        if (c.args.len > 2) _ = try self.wantText(c, 2);
+        return Type.init(.string).withNull(a.nullable);
+    }
+
+    fn leftRight(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        const name = c.name;
+        if (c.args.len != 2) return self.err("`{s}` takes (string, n)", .{name});
+        const a = try self.wantText(c, 0);
+        _ = try self.wantInt(c, 1, "n");
+        return Type.init(.string).withNull(a.nullable);
+    }
+
+    fn splitPart(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 3) return self.err("`split_part` takes (string, delimiter, n)", .{});
+        _ = try self.wantText(c, 0);
+        _ = try self.wantText(c, 1);
+        _ = try self.wantInt(c, 2, "n");
+        // An empty delimiter yields null, so this is nullable either way.
+        return Type.init(.string).asNullable();
+    }
+
+    fn strpos(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 2) return self.err("`strpos` takes (string, substring)", .{});
+        const a = try self.wantText(c, 0);
+        const b = try self.wantText(c, 1);
+        return Type.init(.int).withNull(a.nullable or b.nullable);
+    }
+
+    fn repeat(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 2) return self.err("`repeat` takes (string, n)", .{});
+        const a = try self.wantText(c, 0);
+        _ = try self.wantInt(c, 1, "n");
+        return Type.init(.string).withNull(a.nullable);
+    }
+
+    fn reverse(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 1) return self.err("`reverse` takes one argument", .{});
+        const a = try self.wantText(c, 0);
+        return Type.init(.string).withNull(a.nullable);
+    }
+
+    fn dateAdd(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 3) return self.err("`date_add` takes (unit, n, timestamp)", .{});
+        if (c.args[0].* != .str_lit) return self.err("`date_add` needs a literal unit", .{});
+        const u = timeUnit(c.args[0].str_lit) orelse
+            return self.err("unknown time unit `{s}`", .{c.args[0].str_lit});
+        const nt = try self.argType(c, 1);
+        if (!numericish(nt)) return self.err("`date_add` needs an integer amount", .{});
+        const a = try self.argType(c, 2);
+        if (a.unknown) return a;
+        const nn = a.nullable or nt.nullable or nt.unknown;
+        if (a.kind == .date) {
+            // A DATE has no time of day, so sub-day units have nowhere to go.
+            if (u == .hour or u == .minute or u == .second)
+                return self.err("`date_add` cannot add `{s}` to a date; cast it to a timestamp first", .{c.args[0].str_lit});
+            return Type.init(.date).withNull(nn);
+        }
+        if (a.kind != .timestamp) return self.err("`date_add` needs a date or timestamp", .{});
+        return Type.init(.timestamp).withNull(nn);
+    }
+
+    fn dateDiff(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 3) return self.err("`date_diff` takes (unit, start, end)", .{});
+        if (c.args[0].* != .str_lit) return self.err("`date_diff` needs a literal unit", .{});
+        if (timeUnit(c.args[0].str_lit) == null)
+            return self.err("unknown time unit `{s}`", .{c.args[0].str_lit});
+        const a = try self.argType(c, 1);
+        const b = try self.argType(c, 2);
+        if (!temporalish(a) or !temporalish(b))
+            return self.err("`date_diff` needs date or timestamp arguments", .{});
+        return Type.init(.int).withNull(a.nullable or b.nullable or a.unknown or b.unknown);
+    }
+
+    fn makeDate(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 3) return self.err("`make_date` takes (year, month, day)", .{});
+        var nn = false;
+        for (c.args) |a| {
+            const t = try self.typeOf(a);
+            if (!numericish(t)) return self.err("`make_date` needs integer arguments", .{});
+            nn = nn or t.nullable or t.unknown;
+        }
+        return Type.init(.date).withNull(nn);
+    }
+
+    fn epoch(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 1) return self.err("`epoch` takes one argument", .{});
+        const a = try self.argType(c, 0);
+        if (!temporalish(a)) return self.err("`epoch` needs a date or timestamp", .{});
+        return Type.init(.int).withNull(a.nullable);
+    }
+
+    fn toTimestamp(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 1) return self.err("`to_timestamp` takes one argument", .{});
+        const a = try self.argType(c, 0);
+        if (!numericish(a)) return self.err("`to_timestamp` needs a numeric argument", .{});
+        return Type.init(.timestamp).withNull(a.nullable);
+    }
+
+    fn strftime(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 2) return self.err("`strftime` takes (timestamp, format)", .{});
+        const a = try self.argType(c, 0);
+        if (!temporalish(a)) return self.err("`strftime` needs a date or timestamp", .{});
+        const f = try self.argType(c, 1);
+        // A literal format is validated here so an unsupported directive
+        // fails `check` rather than partway through a run — the same
+        // treatment `regexp_replace` gives a literal pattern.
+        if (c.args[1].* == .str_lit) {
+            if (badStrftime(c.args[1].str_lit)) |bad|
+                return self.err("`strftime` does not support `%{s}` (supported: %Y %m %d %H %M %S %y %%)", .{bad});
+        }
+        return Type.init(.string).withNull(a.nullable or f.nullable);
+    }
+};
+
+const per_row = struct {
+    fn now(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        _ = arena;
+        _ = c;
+        _ = batch;
+        _ = row;
         return .{ .timestamp = std.time.microTimestamp() };
     }
-    if (eq(name, "today")) {
+
+    fn today(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        _ = arena;
+        _ = c;
+        _ = batch;
+        _ = row;
         const days = @divFloor(std.time.microTimestamp(), 86_400_000_000);
         return .{ .date = @intCast(days) };
     }
-    if (eq(name, "regexp_replace")) {
+
+    fn regexpReplace(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
         const pat = try evalRow(arena, c.args[1], batch, row);
@@ -1669,53 +1603,61 @@ fn evalCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize
         };
         return .{ .string = out };
     }
-    if (eq(name, "date_trunc") or eq(name, "extract")) {
+
+    fn dateTruncExtract(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[1], batch, row);
         if (v.isNull()) return .null;
         const us = temporalMicros(v) orelse return error.TypeMismatch;
         const u = timeUnit(c.args[0].str_lit) orelse return error.TypeMismatch;
-        return if (eq(name, "extract"))
+        return if (eq(c.name, "extract"))
             Value{ .int = extractField(us, u) }
         else
             Value{ .timestamp = truncMicros(us, u) };
     }
-    if (eq(name, "coalesce")) {
+
+    fn coalesce(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         for (c.args) |a| {
             const v = try evalRow(arena, a, batch, row);
             if (!v.isNull()) return v;
         }
         return .null;
     }
-    if (eq(name, "upper") or eq(name, "lower")) {
+
+    fn upperLower(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
         const out = try arena.dupe(u8, try valueToString(arena, v));
-        for (out) |*ch| ch.* = if (eq(name, "upper")) std.ascii.toUpper(ch.*) else std.ascii.toLower(ch.*);
+        for (out) |*ch| ch.* = if (eq(c.name, "upper")) std.ascii.toUpper(ch.*) else std.ascii.toLower(ch.*);
         return .{ .string = out };
     }
-    if (eq(name, "length") or eq(name, "strlen")) {
+
+    fn strlen(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
         return .{ .int = @intCast((try valueToString(arena, v)).len) };
     }
-    if (eq(name, "bit_count")) {
+
+    fn bitCount(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
         if (v != .int) return error.TypeMismatch;
         return .{ .int = @intCast(@popCount(v.int)) };
     }
-    if (eq(name, "to_hex")) {
+
+    fn toHex(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
         if (v != .int) return error.TypeMismatch;
         return .{ .string = try std.fmt.allocPrint(arena, "{x}", .{@as(u64, @bitCast(v.int))}) };
     }
-    if (eq(name, "from_hex")) {
+
+    fn fromHex(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
         return .{ .int = try parseHexI64(try valueToString(arena, v)) };
     }
-    if (eq(name, "concat")) {
+
+    fn concat(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         var buf = std.array_list.Managed(u8).init(arena);
         for (c.args) |a| {
             const v = try evalRow(arena, a, batch, row);
@@ -1724,7 +1666,9 @@ fn evalCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize
         }
         return .{ .string = try buf.toOwnedSlice() };
     }
-    if (eq(name, "starts_with") or eq(name, "ends_with") or eq(name, "contains")) {
+
+    fn affix(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const name = c.name;
         const sv = try evalRow(arena, c.args[0], batch, row);
         const pv = try evalRow(arena, c.args[1], batch, row);
         if (sv.isNull() or pv.isNull()) return .null;
@@ -1733,18 +1677,21 @@ fn evalCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize
         const r = if (eq(name, "starts_with")) std.mem.startsWith(u8, s, p) else if (eq(name, "ends_with")) std.mem.endsWith(u8, s, p) else (std.mem.indexOf(u8, s, p) != null);
         return .{ .bool = r };
     }
-    if (eq(name, "like")) {
+
+    fn like(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const sv = try evalRow(arena, c.args[0], batch, row);
         const pv = try evalRow(arena, c.args[1], batch, row);
         if (sv.isNull() or pv.isNull()) return .null;
         return .{ .bool = likeMatch(try valueToString(arena, sv), try valueToString(arena, pv)) };
     }
-    if (eq(name, "trim")) {
+
+    fn trimSpace(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
         return .{ .string = try arena.dupe(u8, trim(try valueToString(arena, v))) };
     }
-    if (eq(name, "substr")) {
+
+    fn substr(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const sv = try evalRow(arena, c.args[0], batch, row);
         if (sv.isNull()) return .null;
         const startv = try evalRow(arena, c.args[1], batch, row);
@@ -1757,7 +1704,8 @@ fn evalCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize
         }
         return .{ .string = try substrBytes(arena, try valueToString(arena, sv), toI64(startv), len_opt) };
     }
-    if (eq(name, "replace")) {
+
+    fn replace(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const sv = try evalRow(arena, c.args[0], batch, row);
         const fv = try evalRow(arena, c.args[1], batch, row);
         const tv = try evalRow(arena, c.args[2], batch, row);
@@ -1770,28 +1718,10 @@ fn evalCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize
         _ = std.mem.replace(u8, s, from, to, out);
         return .{ .string = out };
     }
-    if (try evalMathCall(arena, c, batch, row)) |v| return v;
-    if (try evalStringCall(arena, c, batch, row)) |v| return v;
-    if (try evalDateCall(arena, c, batch, row)) |v| return v;
-    return error.TypeMismatch;
-}
 
-/// SQL null as a `Value`. The builtin helpers below return `?Value`, where a
-/// bare `null` means "not my function, keep dispatching" — this names the other
-/// null so the two can't be confused at a glance.
-const sql_null: Value = .null;
-
-/// 1 MiB ceiling on a single generated string (`repeat`, `lpad`/`rpad`), so
-/// `repeat(x, 1000000000)` is a clean error instead of an OOM or a stall.
-const max_str_bytes = 1 << 20;
-
-/// Numeric and null-selecting builtins. Null in → null out throughout; a
-/// non-match returns null so `evalCall` can keep dispatching.
-fn evalMathCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!?Value {
-    const name = c.name;
-    if (eq(name, "abs")) {
+    fn abs(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return sql_null;
+        if (v.isNull()) return .null;
         switch (v) {
             // `-minInt(i64)` has no i64 representation; refuse rather than wrap.
             .int => |x| {
@@ -1806,74 +1736,82 @@ fn evalMathCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: u
             else => return error.TypeMismatch,
         }
     }
-    if (eq(name, "floor") or eq(name, "ceil")) {
+
+    fn floorCeil(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return sql_null;
+        if (v.isNull()) return .null;
         if (v == .int) return v;
         if (!isNum(v)) return error.TypeMismatch;
         const x = toF64(v);
-        return Value{ .float = if (eq(name, "floor")) @floor(x) else @ceil(x) };
+        return Value{ .float = if (eq(c.name, "floor")) @floor(x) else @ceil(x) };
     }
-    if (eq(name, "round")) {
+
+    fn round(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return sql_null;
+        if (v.isNull()) return .null;
         if (!isNum(v)) return error.TypeMismatch;
         var digits: i64 = 0;
         if (c.args.len > 1) {
             const dv = try evalRow(arena, c.args[1], batch, row);
-            if (dv.isNull()) return sql_null;
+            if (dv.isNull()) return .null;
             digits = toI64(dv);
         }
         if (v == .int and c.args.len == 1) return v;
         return Value{ .float = roundHalfAway(toF64(v), digits) };
     }
-    if (eq(name, "mod")) {
+
+    fn mod(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const a = try evalRow(arena, c.args[0], batch, row);
         const b = try evalRow(arena, c.args[1], batch, row);
-        if (a.isNull() or b.isNull()) return sql_null;
+        if (a.isNull() or b.isNull()) return .null;
         const d = toI64(b);
         // `mod` is the guarded spelling of `%`: a zero divisor is null here,
         // where the operator raises DivByZero. Never a crash either way.
-        if (d == 0) return sql_null;
+        if (d == 0) return .null;
         // `@rem(minInt, -1)` overflows; the answer is 0 by definition.
         if (d == -1) return Value{ .int = 0 };
         // @rem (not @mod) so the result takes the sign of the dividend, as SQL wants.
         return Value{ .int = @rem(toI64(a), d) };
     }
-    if (eq(name, "power")) {
+
+    fn power(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const a = try evalRow(arena, c.args[0], batch, row);
         const b = try evalRow(arena, c.args[1], batch, row);
-        if (a.isNull() or b.isNull()) return sql_null;
+        if (a.isNull() or b.isNull()) return .null;
         return Value{ .float = std.math.pow(f64, toF64(a), toF64(b)) };
     }
-    if (eq(name, "sqrt")) {
+
+    fn sqrt(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return sql_null;
+        if (v.isNull()) return .null;
         const x = toF64(v);
-        if (x < 0) return sql_null;
+        if (x < 0) return .null;
         return Value{ .float = @sqrt(x) };
     }
-    if (eq(name, "sign")) {
+
+    fn sign(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return sql_null;
+        if (v.isNull()) return .null;
         const x = toF64(v);
         return Value{ .int = if (x > 0) @as(i64, 1) else if (x < 0) @as(i64, -1) else @as(i64, 0) };
     }
-    if (eq(name, "nullif")) {
+
+    fn nullif(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const a = try evalRow(arena, c.args[0], batch, row);
-        if (a.isNull()) return sql_null;
+        if (a.isNull()) return .null;
         const b = try evalRow(arena, c.args[1], batch, row);
         // `a = b` is unknown against a null `b`, so `a` comes back (Postgres).
         if (b.isNull()) return a;
         if (compareValues(a, b)) |ord| {
-            if (ord == .eq) return sql_null;
+            if (ord == .eq) return .null;
         }
         return a;
     }
-    if (eq(name, "greatest") or eq(name, "least")) {
+
+    fn greatestLeast(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         // Postgres semantics: null arguments are IGNORED (unlike the
         // null-propagating arithmetic above); all-null yields null.
-        const want_gt = eq(name, "greatest");
+        const want_gt = eq(c.name, "greatest");
         var best: Value = .null;
         for (c.args) |ae| {
             const v = try evalRow(arena, ae, batch, row);
@@ -1887,41 +1825,39 @@ fn evalMathCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: u
         }
         return best;
     }
-    return null;
-}
 
-fn evalStringCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!?Value {
-    const name = c.name;
-    if (eq(name, "lpad") or eq(name, "rpad")) {
+    fn pad(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const sv = try evalRow(arena, c.args[0], batch, row);
-        if (sv.isNull()) return sql_null;
+        if (sv.isNull()) return .null;
         const nv = try evalRow(arena, c.args[1], batch, row);
-        if (nv.isNull()) return sql_null;
+        if (nv.isNull()) return .null;
         var fill: []const u8 = " ";
         if (c.args.len > 2) {
             const fv = try evalRow(arena, c.args[2], batch, row);
-            if (fv.isNull()) return sql_null;
+            if (fv.isNull()) return .null;
             fill = try valueToString(arena, fv);
         }
         const s = try valueToString(arena, sv);
-        return Value{ .string = try padBytes(arena, s, toI64(nv), fill, eq(name, "lpad")) };
+        return Value{ .string = try padBytes(arena, s, toI64(nv), fill, eq(c.name, "lpad")) };
     }
-    if (eq(name, "left") or eq(name, "right")) {
+
+    fn leftRight(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const sv = try evalRow(arena, c.args[0], batch, row);
-        if (sv.isNull()) return sql_null;
+        if (sv.isNull()) return .null;
         const nv = try evalRow(arena, c.args[1], batch, row);
-        if (nv.isNull()) return sql_null;
+        if (nv.isNull()) return .null;
         const s = try valueToString(arena, sv);
-        return Value{ .string = try arena.dupe(u8, endSlice(s, toI64(nv), eq(name, "left"))) };
+        return Value{ .string = try arena.dupe(u8, endSlice(s, toI64(nv), eq(c.name, "left"))) };
     }
-    if (eq(name, "split_part")) {
+
+    fn splitPart(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const sv = try evalRow(arena, c.args[0], batch, row);
         const dv = try evalRow(arena, c.args[1], batch, row);
         const nv = try evalRow(arena, c.args[2], batch, row);
-        if (sv.isNull() or dv.isNull() or nv.isNull()) return sql_null;
+        if (sv.isNull() or dv.isNull() or nv.isNull()) return .null;
         const delim = try valueToString(arena, dv);
         // An empty delimiter splits into nothing meaningful — null, not a guess.
-        if (delim.len == 0) return sql_null;
+        if (delim.len == 0) return .null;
         const want = toI64(nv);
         if (want < 1) return Value{ .string = "" };
         var it = std.mem.splitSequence(u8, try valueToString(arena, sv), delim);
@@ -1932,21 +1868,23 @@ fn evalStringCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row:
         }
         return Value{ .string = "" };
     }
-    if (eq(name, "strpos")) {
+
+    fn strpos(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const sv = try evalRow(arena, c.args[0], batch, row);
         const pv = try evalRow(arena, c.args[1], batch, row);
-        if (sv.isNull() or pv.isNull()) return sql_null;
+        if (sv.isNull() or pv.isNull()) return .null;
         const s = try valueToString(arena, sv);
         const sub = try valueToString(arena, pv);
         if (sub.len == 0) return Value{ .int = 1 };
         const at = std.mem.indexOf(u8, s, sub) orelse return Value{ .int = 0 };
         return Value{ .int = @as(i64, @intCast(at)) + 1 };
     }
-    if (eq(name, "repeat")) {
+
+    fn repeat(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const sv = try evalRow(arena, c.args[0], batch, row);
-        if (sv.isNull()) return sql_null;
+        if (sv.isNull()) return .null;
         const nv = try evalRow(arena, c.args[1], batch, row);
-        if (nv.isNull()) return sql_null;
+        if (nv.isNull()) return .null;
         const n = toI64(nv);
         if (n <= 0) return Value{ .string = "" };
         const s = try valueToString(arena, sv);
@@ -1957,35 +1895,33 @@ fn evalStringCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row:
         while (i < out.len) : (i += s.len) @memcpy(out[i..][0..s.len], s);
         return Value{ .string = out };
     }
-    if (eq(name, "reverse")) {
+
+    fn reverse(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const sv = try evalRow(arena, c.args[0], batch, row);
-        if (sv.isNull()) return sql_null;
+        if (sv.isNull()) return .null;
         const s = try valueToString(arena, sv);
         const out = try arena.alloc(u8, s.len);
         for (s, 0..) |ch, i| out[s.len - 1 - i] = ch;
         return Value{ .string = out };
     }
-    return null;
-}
 
-fn evalDateCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!?Value {
-    const name = c.name;
-    if (eq(name, "date_add") or eq(name, "date_diff")) {
+    fn dateAddDiff(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         if (c.args[0].* != .str_lit) return error.TypeMismatch;
         const u = timeUnit(c.args[0].str_lit) orelse return error.TypeMismatch;
         const a = try evalRow(arena, c.args[1], batch, row);
         const b = try evalRow(arena, c.args[2], batch, row);
-        if (a.isNull() or b.isNull()) return sql_null;
-        if (eq(name, "date_add")) return try addUnits(b, u, toI64(a));
+        if (a.isNull() or b.isNull()) return .null;
+        if (eq(c.name, "date_add")) return try addUnits(b, u, toI64(a));
         const a_us = temporalMicros(a) orelse return error.TypeMismatch;
         const b_us = temporalMicros(b) orelse return error.TypeMismatch;
         return Value{ .int = dateDiff(a_us, b_us, u) };
     }
-    if (eq(name, "make_date")) {
+
+    fn makeDate(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const yv = try evalRow(arena, c.args[0], batch, row);
         const mv = try evalRow(arena, c.args[1], batch, row);
         const dv = try evalRow(arena, c.args[2], batch, row);
-        if (yv.isNull() or mv.isNull() or dv.isNull()) return sql_null;
+        if (yv.isNull() or mv.isNull() or dv.isNull()) return .null;
         const y = toI64(yv);
         const m = toI64(mv);
         const d = toI64(dv);
@@ -1996,34 +1932,253 @@ fn evalDateCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: u
         const days = daysFromCivil(y, @intCast(m), @intCast(d));
         return Value{ .date = std.math.cast(i32, days) orelse return error.CastFailed };
     }
-    if (eq(name, "epoch")) {
+
+    fn epoch(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return sql_null;
+        if (v.isNull()) return .null;
         const us = temporalMicros(v) orelse return error.TypeMismatch;
         return Value{ .int = @divFloor(us, 1_000_000) };
     }
-    if (eq(name, "to_timestamp")) {
+
+    fn toTimestamp(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return sql_null;
+        if (v.isNull()) return .null;
         return Value{ .timestamp = try mulI64(toI64(v), 1_000_000) };
     }
-    if (eq(name, "strftime")) {
+
+    fn strftime(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return sql_null;
+        if (v.isNull()) return .null;
         const fv = try evalRow(arena, c.args[1], batch, row);
-        if (fv.isNull()) return sql_null;
+        if (fv.isNull()) return .null;
         const us = temporalMicros(v) orelse return error.TypeMismatch;
         return Value{ .string = try strftimeFmt(arena, us, try valueToString(arena, fv)) };
     }
-    return null;
-}
+};
+
+const vectorized = struct {
+    fn now(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
+        _ = arena;
+        _ = c;
+        _ = batch;
+        return .{ .scalar = .{ .timestamp = std.time.microTimestamp() } };
+    }
+
+    fn today(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
+        _ = arena;
+        _ = c;
+        _ = batch;
+        return .{ .scalar = .{ .date = @intCast(@divFloor(std.time.microTimestamp(), 86_400_000_000)) } };
+    }
+
+    fn upperLower(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
+        const n = batch.len;
+        if (c.args.len < 1) return error.Unsupported;
+        const s = try strArg(arena, c.args[0], batch);
+        const up = eq(c.name, "upper");
+        var out = try column.BytesAppender.init(arena, n);
+        var bm = try Bitmap.initFull(arena, n);
+        var any = false;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const sv = strAt(s, i) orelse {
+                try out.pushNull();
+                bm.setValid(i, false);
+                any = true;
+                continue;
+            };
+            const o = try out.pushMutable(sv);
+            for (o) |*ch| ch.* = if (up) std.ascii.toUpper(ch.*) else std.ascii.toLower(ch.*);
+        }
+        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
+    }
+
+    fn trimSpace(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
+        const n = batch.len;
+        if (c.args.len < 1) return error.Unsupported;
+        const s = try strArg(arena, c.args[0], batch);
+        var out = try column.BytesAppender.init(arena, n);
+        var bm = try Bitmap.initFull(arena, n);
+        var any = false;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const sv = strAt(s, i) orelse {
+                try out.pushNull();
+                bm.setValid(i, false);
+                any = true;
+                continue;
+            };
+            try out.push(trim(sv));
+        }
+        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
+    }
+
+    fn strlen(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
+        const n = batch.len;
+        if (c.args.len < 1) return error.Unsupported;
+        const s = try strArg(arena, c.args[0], batch);
+        const out = try arena.alloc(i64, n);
+        var bm = try Bitmap.initFull(arena, n);
+        var any = false;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (strAt(s, i)) |sv| {
+                out[i] = @intCast(sv.len);
+            } else {
+                out[i] = 0;
+                bm.setValid(i, false);
+                any = true;
+            }
+        }
+        return mkCol(Type.init(.int).withNull(any), n, bm, .{ .i64 = out });
+    }
+
+    fn strPredicate(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
+        const name = c.name;
+        const n = batch.len;
+        if (c.args.len < 2) return error.Unsupported;
+        const s = try strArg(arena, c.args[0], batch);
+        const p = try strArg(arena, c.args[1], batch);
+        const out = try arena.alloc(bool, n);
+        var bm = try Bitmap.initFull(arena, n);
+        var any = false;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const sv = strAt(s, i);
+            const pv = strAt(p, i);
+            if (sv == null or pv == null) {
+                out[i] = false;
+                bm.setValid(i, false);
+                any = true;
+                continue;
+            }
+            out[i] = if (eq(name, "starts_with"))
+                std.mem.startsWith(u8, sv.?, pv.?)
+            else if (eq(name, "ends_with"))
+                std.mem.endsWith(u8, sv.?, pv.?)
+            else if (eq(name, "contains"))
+                std.mem.indexOf(u8, sv.?, pv.?) != null
+            else
+                likeMatch(sv.?, pv.?);
+        }
+        return mkCol(Type.init(.bool).withNull(any), n, bm, .{ .b = out });
+    }
+
+    fn concat(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
+        const n = batch.len;
+        if (c.args.len == 0) return error.Unsupported;
+        const parts = try arena.alloc(Str, c.args.len);
+        for (c.args, parts) |a, *sp| sp.* = try strArg(arena, a, batch);
+        var out = try column.BytesAppender.init(arena, n);
+        var bm = try Bitmap.initFull(arena, n);
+        var any = false;
+        var i: usize = 0;
+        rows: while (i < n) : (i += 1) {
+            for (parts) |sp| {
+                if (strAt(sp, i) == null) {
+                    try out.pushNull();
+                    bm.setValid(i, false);
+                    any = true;
+                    continue :rows;
+                }
+            }
+            for (parts) |sp| try out.append(strAt(sp, i).?);
+            try out.endRow();
+        }
+        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
+    }
+
+    fn coalesce(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
+        const n = batch.len;
+        if (c.args.len == 0) return error.Unsupported;
+        const parts = try arena.alloc(Str, c.args.len);
+        for (c.args, parts) |a, *sp| sp.* = try strArg(arena, a, batch);
+        var out = try column.BytesAppender.init(arena, n);
+        var bm = try Bitmap.initFull(arena, n);
+        var any = false;
+        var i: usize = 0;
+        rows: while (i < n) : (i += 1) {
+            for (parts) |sp| {
+                if (strAt(sp, i)) |sv| {
+                    try out.push(sv);
+                    continue :rows;
+                }
+            }
+            try out.pushNull();
+            bm.setValid(i, false);
+            any = true;
+        }
+        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
+    }
+
+    fn substr(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
+        const n = batch.len;
+        if (c.args.len < 2) return error.Unsupported;
+        const s = try strArg(arena, c.args[0], batch);
+        const start = (try asNum(arena, try evalVec(arena, c.args[1], batch), n)) orelse return error.Unsupported;
+        if (!isIntNum(start)) return error.Unsupported;
+        var len_num: ?Num = null;
+        if (c.args.len > 2) {
+            len_num = (try asNum(arena, try evalVec(arena, c.args[2], batch), n)) orelse return error.Unsupported;
+            if (!isIntNum(len_num.?)) return error.Unsupported;
+        }
+        var out = try column.BytesAppender.init(arena, n);
+        var bm = try Bitmap.initFull(arena, n);
+        var any = false;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const sv = strAt(s, i);
+            const start_ok = numValid(start, i);
+            const len_ok = if (len_num) |l| numValid(l, i) else true;
+            if (sv == null or !start_ok or !len_ok) {
+                try out.pushNull();
+                bm.setValid(i, false);
+                any = true;
+                continue;
+            }
+            try out.push(try substrBytes(arena, sv.?, numI(start, i), if (len_num) |l| numI(l, i) else null));
+        }
+        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
+    }
+
+    fn replace(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
+        const n = batch.len;
+        if (c.args.len < 3) return error.Unsupported;
+        const s = try strArg(arena, c.args[0], batch);
+        const f = try strArg(arena, c.args[1], batch);
+        const t = try strArg(arena, c.args[2], batch);
+        var out = try column.BytesAppender.init(arena, n);
+        var bm = try Bitmap.initFull(arena, n);
+        var any = false;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const sv = strAt(s, i);
+            const fv = strAt(f, i);
+            const tv = strAt(t, i);
+            if (sv == null or fv == null or tv == null) {
+                try out.pushNull();
+                bm.setValid(i, false);
+                any = true;
+                continue;
+            }
+            if (fv.?.len == 0) {
+                try out.push(sv.?);
+                continue;
+            }
+            const o = try arena.alloc(u8, std.mem.replacementSize(u8, sv.?, fv.?, tv.?));
+            _ = std.mem.replace(u8, sv.?, fv.?, tv.?, o);
+            try out.push(o);
+        }
+        return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
+    }
+};
 
 /// Cast honouring the target's scale. `castValue` only sees a `TypeKind`, which
 /// is enough for every type except `DECIMAL(p, s)` — where dropping the scale
 /// left the conversion undefined, so it failed outright.
 pub fn castValueTyped(arena: std.mem.Allocator, v: Value, ty: types.Type) EvalError!Value {
     if (ty.kind != .decimal) return castValue(arena, v, ty.kind);
-    const d: valuemod.Decimal = switch (v) {
+    const d: Decimal = switch (v) {
         .decimal => |x| x,
         .int => |x| .{ .unscaled = x, .scale = 0 },
         .bool => |x| .{ .unscaled = if (x) 1 else 0, .scale = 0 },
@@ -2035,9 +2190,9 @@ pub fn castValueTyped(arena: std.mem.Allocator, v: Value, ty: types.Type) EvalEr
         },
         // Null means the text is not a decimal literal: `CAST` fails here and
         // `TRY_CAST` turns that failure into a null one level up.
-        .string, .bytes => |str| switch (sqlmod.parseDecimalText(trim(str)) orelse return error.CastFailed) {
+        .string, .bytes => |str| switch (sql.parseDecimalText(trim(str)) orelse return error.CastFailed) {
             .decimal => |x| x,
-            .int => |x| valuemod.Decimal{ .unscaled = x, .scale = 0 },
+            .int => |x| Decimal{ .unscaled = x, .scale = 0 },
             else => return error.CastFailed,
         },
         else => return error.CastFailed,
@@ -2060,7 +2215,7 @@ fn powTen(n: u8) i128 {
 /// `numeric` column (typed `decimal(38,6)` for want of a typmod) delivers
 /// values at whatever scale each one was stored with. Anything that combines
 /// decimals across rows has to normalize first.
-pub fn rescaleTo(d: valuemod.Decimal, want: u8) ?valuemod.Decimal {
+pub fn rescaleTo(d: Decimal, want: u8) ?Decimal {
     var unscaled = d.unscaled;
     var have: i32 = d.scale;
     while (have < want) : (have += 1) {
@@ -2579,7 +2734,6 @@ pub fn toF64(v: Value) f64 {
         else => 0,
     };
 }
-const pow10f = valuemod.pow10f;
 
 /// One compiled pattern, kept across calls. `regexp_replace` is evaluated per
 /// ROW, and recompiling the pattern for each one made a column scan pay for a

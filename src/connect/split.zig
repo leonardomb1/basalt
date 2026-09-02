@@ -7,14 +7,13 @@
 //! Replacing / Snowflake MERGE) owns exactly-once. See `runtime/parallel.zig`.
 
 const std = @import("std");
-const sqlmod = @import("sql.zig");
+const sql = @import("sql.zig");
 const types = @import("../lang/types.zig");
 const eval = @import("../exec/eval.zig");
-const valuemod = @import("../exec/value.zig");
+const Value = @import("../exec/value.zig").Value;
 
-const Conn = sqlmod.Conn;
-const Dialect = sqlmod.Dialect;
-const Value = valuemod.Value;
+const Conn = sql.Conn;
+const Dialect = sql.Dialect;
 
 /// `.date` covers DATE and DATETIME/TIMESTAMP keys alike: ranges are sliced at
 /// day granularity with date literals, which all three dialects compare against
@@ -73,7 +72,7 @@ pub fn wrapProjected(arena: std.mem.Allocator, base: []const u8, proj: ?[]const 
 /// key). Returns an empty slice when the table has no declared primary key.
 /// Used to infer upsert keys from the source.
 pub fn introspectPkCols(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, table: []const u8) ![]const []const u8 {
-    const sql = switch (dialect) {
+    const query = switch (dialect) {
         .postgres => try std.fmt.allocPrint(arena,
             \\SELECT a.attname
             \\FROM pg_index i
@@ -89,7 +88,7 @@ pub fn introspectPkCols(arena: std.mem.Allocator, prober: Prober, dialect: Diale
             \\WHERE i.object_id = OBJECT_ID('{s}') AND i.is_primary_key = 1
             \\ORDER BY ic.key_ordinal
         , .{table}),
-        .mysql => try std.fmt.allocPrint(arena,
+        .mysql, .starrocks => try std.fmt.allocPrint(arena,
             \\SELECT k.COLUMN_NAME
             \\FROM information_schema.KEY_COLUMN_USAGE k
             \\WHERE k.CONSTRAINT_NAME = 'PRIMARY' AND k.TABLE_SCHEMA = DATABASE() AND k.TABLE_NAME = '{s}'
@@ -97,7 +96,7 @@ pub fn introspectPkCols(arena: std.mem.Allocator, prober: Prober, dialect: Diale
         , .{table}),
     };
     const conn = prober.open() catch return &.{};
-    var cur = conn.queryCursor(sql) catch {
+    var cur = conn.queryCursor(query) catch {
         conn.close();
         return &.{};
     };
@@ -114,7 +113,7 @@ pub fn introspectPkCols(arena: std.mem.Allocator, prober: Prober, dialect: Diale
 }
 
 pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, table: []const u8) !?KeyInfo {
-    const sql = switch (dialect) {
+    const query = switch (dialect) {
         .postgres => try std.fmt.allocPrint(arena,
             \\SELECT a.attname, t.typname, c.reltuples::bigint
             \\FROM pg_index i
@@ -133,7 +132,7 @@ pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect,
             \\WHERE i.object_id = OBJECT_ID('{s}') AND i.is_primary_key = 1
             \\ORDER BY ic.key_ordinal
         , .{table}),
-        .mysql => try std.fmt.allocPrint(arena,
+        .mysql, .starrocks => try std.fmt.allocPrint(arena,
             \\SELECT k.COLUMN_NAME, c.DATA_TYPE, t.TABLE_ROWS
             \\FROM information_schema.KEY_COLUMN_USAGE k
             \\JOIN information_schema.COLUMNS c ON c.TABLE_SCHEMA = k.TABLE_SCHEMA AND c.TABLE_NAME = k.TABLE_NAME AND c.COLUMN_NAME = k.COLUMN_NAME
@@ -143,7 +142,7 @@ pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect,
         , .{table}),
     };
     const conn = prober.open() catch return null;
-    var cur = conn.queryCursor(sql) catch {
+    var cur = conn.queryCursor(query) catch {
         conn.close();
         return null;
     };
@@ -161,14 +160,13 @@ pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect,
 
 fn keyKindFor(typname: []const u8) ?KeyKind {
     const ints = [_][]const u8{
-        "int2",   "int4",      "int8",   "serial", "bigserial", "smallserial",
-        "int",    "bigint",    "smallint", "tinyint", "mediumint",
+        "int2", "int4",   "int8",     "serial",  "bigserial", "smallserial",
+        "int",  "bigint", "smallint", "tinyint", "mediumint",
     };
     for (ints) |t| if (std.mem.eql(u8, typname, t)) return .int;
     const dates = [_][]const u8{
         "date",     "timestamp", "timestamptz",
-        "datetime",
-        "datetime2", "smalldatetime",
+        "datetime", "datetime2", "smalldatetime",
     };
     for (dates) |t| if (std.mem.eql(u8, typname, t)) return .date;
     if (std.mem.eql(u8, typname, "uuid") or std.mem.eql(u8, typname, "uniqueidentifier")) return .uuid;
@@ -221,7 +219,7 @@ fn hasAnyRow(arena: std.mem.Allocator, prober: Prober, base: []const u8) !bool {
 const Bounds = struct { min: i64, max: i64 };
 
 fn intBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, col: []const u8) !?Bounds {
-    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ quoteIdent(arena, dialect, col) catch col, base });
+    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ sql.quoteIdent(arena, dialect, col) catch col, base });
     const conn = prober.open() catch return null;
     var cur = conn.queryCursor(q) catch {
         conn.close();
@@ -240,7 +238,7 @@ fn intBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: [
 /// Equal-width half-open ranges over `[min, max]`. The last range has no upper
 /// bound (`>= lo`), so it also captures rows inserted past `max` after the probe.
 fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, min: i64, max: i64, m_in: usize) ![]const []const u8 {
-    const qcol = quoteIdent(arena, dialect, col) catch col;
+    const qcol = sql.quoteIdent(arena, dialect, col) catch col;
     const span: i128 = @as(i128, max) - @as(i128, min) + 1;
     var m: usize = m_in;
     if (@as(i128, @intCast(m)) > span) m = @intCast(span);
@@ -274,7 +272,7 @@ fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, mi
 /// cursor's text coercion yields `.date` (days) or `.timestamp` (micros);
 /// anything else (e.g. a driver that left the column as text) → no split.
 fn dateBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, col: []const u8) !?Bounds {
-    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ quoteIdent(arena, dialect, col) catch col, base });
+    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ sql.quoteIdent(arena, dialect, col) catch col, base });
     const conn = prober.open() catch return null;
     var cur = conn.queryCursor(q) catch {
         conn.close();
@@ -303,7 +301,7 @@ fn dayOf(v: Value) ?i64 {
 /// day falls in the slice whose half-open range contains its midnight-floored
 /// day, so slices stay disjoint and covering.
 fn dateRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, min_day: i64, max_day: i64, m_in: usize) ![]const []const u8 {
-    const qcol = quoteIdent(arena, dialect, col) catch col;
+    const qcol = sql.quoteIdent(arena, dialect, col) catch col;
     const span: i128 = @as(i128, max_day) - @as(i128, min_day) + 1;
     var m: usize = m_in;
     if (@as(i128, @intCast(m)) > span) m = @intCast(span);
@@ -334,7 +332,7 @@ fn dateRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m
 /// Equal lexicographic slices of the whole 128-bit UUID space. Random (v4) UUIDs
 /// are uniform over this space, so the slices are balanced with no bounds probe.
 fn uuidSpacePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m: usize) ![]const []const u8 {
-    const qcol = quoteIdent(arena, dialect, col) catch col;
+    const qcol = sql.quoteIdent(arena, dialect, col) catch col;
     var list = std.array_list.Managed([]const u8).init(arena);
     var k: usize = 0;
     while (k < m) : (k += 1) {
@@ -366,13 +364,9 @@ fn uuidAt(arena: std.mem.Allocator, k: usize, m: usize) ![]const u8 {
     });
 }
 
-pub fn quoteIdent(arena: std.mem.Allocator, dialect: Dialect, name: []const u8) ![]const u8 {
-    return switch (dialect) {
-        .postgres => std.fmt.allocPrint(arena, "\"{s}\"", .{name}),
-        .mysql => std.fmt.allocPrint(arena, "`{s}`", .{name}),
-        .sqlserver => std.fmt.allocPrint(arena, "[{s}]", .{name}),
-    };
-}
+/// Re-exported for the pushdown translator, which quotes column references the
+/// same way the split predicates do (each dotted part on its own).
+pub const quoteIdent = sql.quoteIdent;
 
 fn dupeOne(arena: std.mem.Allocator, s: []const u8) ![]const []const u8 {
     const out = try arena.alloc([]const u8, 1);

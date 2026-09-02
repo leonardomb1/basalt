@@ -59,6 +59,9 @@ jobs:
       - name: Add Zig to PATH
         run: echo "$HOME/.zig" >> "$GITHUB_PATH"
 
+      - name: Check formatting
+        run: zig fmt --check src build.zig
+
       - name: Build
         run: zig build
 

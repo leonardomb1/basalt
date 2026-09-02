@@ -140,7 +140,7 @@ pub const Options = struct {
     /// When set, the raw DER of every certificate the server presents is copied
     /// here during the handshake (in presentation order). Combine with
     /// `.ca = .no_verification` to harvest a chain for out-of-band path building
-    /// (see http.zig repairBundle) — capture alone grants no trust.
+    /// (see http_client.zig repairBundle) — capture alone grants no trust.
     chain: ?*ChainCapture = null,
 };
 
@@ -851,9 +851,13 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     if (!std.crypto.timing_safe.eql([P.Hmac.mac_length]u8, expected_server_verify_data, hsd.array(P.Hmac.mac_length).*)) return error.TlsDecryptError;
                                     const empty_cert_msg = [8]u8{
                                         @intFromEnum(tls.HandshakeType.certificate),
-                                        0, 0, 4,
                                         0,
-                                        0, 0, 0,
+                                        0,
+                                        4,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
                                     };
                                     const app_hash = p.transcript_hash.peek();
                                     if (client_cert_requested) p.transcript_hash.update(&empty_cert_msg);
@@ -1259,8 +1263,7 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                 if (next_handshake_i > cleartext.len) return failRead(c, error.TlsBadLength);
                 const handshake = cleartext[ct_i..next_handshake_i];
                 switch (handshake_type) {
-                    .new_session_ticket => {
-                    },
+                    .new_session_ticket => {},
                     .key_update => {
                         switch (c.application_cipher) {
                             inline else => |*p| {

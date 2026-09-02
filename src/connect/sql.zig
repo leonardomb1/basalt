@@ -7,15 +7,12 @@
 const std = @import("std");
 const TlsClient = @import("tls_client.zig");
 const types = @import("../lang/types.zig");
-const batchmod = @import("../exec/batch.zig");
-const valuemod = @import("../exec/value.zig");
+const Batch = @import("../exec/batch.zig").Batch;
+const Value = @import("../exec/value.zig").Value;
 const column = @import("../exec/column.zig");
 const eval = @import("../exec/eval.zig");
 const driver = @import("driver.zig");
 const ast = @import("../lang/ast.zig");
-
-const Value = valuemod.Value;
-const Batch = batchmod.Batch;
 
 /// Rows are this many per streamed batch.
 pub const STREAM_ROWS = 4096;
@@ -201,37 +198,43 @@ pub fn textCursorVTable(comptime T: type) Cursor.VTable {
     };
 }
 
+/// `.starrocks` speaks MySQL on the wire (backtick quoting, same catalog
+/// queries) but has its own DDL: type names, and a mandatory table model /
+/// distribution clause emitted by `createTableSqlWith`.
 pub const Dialect = enum {
     postgres,
     mysql,
     sqlserver,
+    starrocks,
 
     fn qOpen(self: Dialect) u8 {
         return switch (self) {
             .postgres => '"',
-            .mysql => '`',
+            .mysql, .starrocks => '`',
             .sqlserver => '[',
         };
     }
     fn qClose(self: Dialect) u8 {
         return switch (self) {
             .postgres => '"',
-            .mysql => '`',
+            .mysql, .starrocks => '`',
             .sqlserver => ']',
         };
     }
 
-    fn ddlType(self: Dialect, arena: std.mem.Allocator, ty: types.Type, is_key: bool) ![]const u8 {
+    /// The column type a CREATE TABLE gets for an engine type. `is_key` shrinks
+    /// unbounded text to something indexable where the database demands it.
+    pub fn ddlType(self: Dialect, arena: std.mem.Allocator, ty: types.Type, is_key: bool) ![]const u8 {
         return switch (ty.kind) {
             .bool => switch (self) {
                 .sqlserver => "BIT",
                 .mysql => "TINYINT(1)",
-                .postgres => "BOOLEAN",
+                .postgres, .starrocks => "BOOLEAN",
             },
             .int => "BIGINT",
             .float => switch (self) {
                 .postgres => "DOUBLE PRECISION",
-                .mysql => "DOUBLE",
+                .mysql, .starrocks => "DOUBLE",
                 .sqlserver => "FLOAT",
             },
             .decimal => try std.fmt.allocPrint(arena, "DECIMAL({d},{d})", .{ ty.precision, ty.scale }),
@@ -239,23 +242,69 @@ pub const Dialect = enum {
                 .postgres => if (is_key) "VARCHAR(255)" else "TEXT",
                 .mysql => "VARCHAR(255)",
                 .sqlserver => if (is_key) "NVARCHAR(255)" else "NVARCHAR(4000)",
+                .starrocks => "VARCHAR(65533)",
             },
             .bytes => switch (self) {
                 .postgres => "BYTEA",
                 .mysql => "BLOB",
                 .sqlserver => "VARBINARY(MAX)",
+                .starrocks => "STRING",
+            },
+            .date => "DATE",
+            .time => switch (self) {
+                .postgres, .mysql, .sqlserver => "TIME",
+                .starrocks => "VARCHAR(32)",
+            },
+            .timestamp => switch (self) {
+                .postgres => "TIMESTAMP",
+                .mysql, .starrocks => "DATETIME",
+                .sqlserver => "DATETIME2",
+            },
+            .array => switch (self) {
+                .postgres, .mysql, .sqlserver => "TEXT",
+                .starrocks => "STRING",
+            },
+            .@"struct" => switch (self) {
+                .postgres, .mysql, .sqlserver => "TEXT",
+                .starrocks => "JSON",
+            },
+        };
+    }
+
+    /// The type name a pushed-down `CAST(x AS ...)` uses, or null when the
+    /// dialect has no CAST target for the kind and the predicate stays in the
+    /// engine. Deliberately not `ddlType`: a column and a CAST take different
+    /// spellings — MySQL casts to SIGNED and CHAR but declares BIGINT and
+    /// VARCHAR; SQL Server casts to VARCHAR(MAX) but a key column is NVARCHAR(255).
+    pub fn castType(self: Dialect, arena: std.mem.Allocator, ty: types.Type) !?[]const u8 {
+        return switch (ty.kind) {
+            .int => switch (self) {
+                .postgres, .sqlserver => "BIGINT",
+                .mysql, .starrocks => "SIGNED",
+            },
+            .float => switch (self) {
+                .postgres => "DOUBLE PRECISION",
+                .mysql, .starrocks => "DOUBLE",
+                .sqlserver => "FLOAT",
+            },
+            .decimal => try std.fmt.allocPrint(arena, "DECIMAL({d},{d})", .{ ty.precision, ty.scale }),
+            .string => switch (self) {
+                .postgres => "TEXT",
+                .mysql, .starrocks => "CHAR",
+                .sqlserver => "VARCHAR(MAX)",
             },
             .date => "DATE",
             .time => "TIME",
             .timestamp => switch (self) {
                 .postgres => "TIMESTAMP",
-                .mysql => "DATETIME",
+                .mysql, .starrocks => "DATETIME",
                 .sqlserver => "DATETIME2",
             },
-            else => "TEXT",
+            // No portable CAST spelling: a bool literal is rendered as a
+            // comparison instead, and the rest never appear in a pushed predicate.
+            .bool, .bytes, .array, .@"struct" => null,
         };
     }
-
 };
 
 pub const Source = struct {
@@ -273,31 +322,47 @@ pub const Source = struct {
     pub fn source(self: *Source) driver.Source {
         return .{ .ptr = self, .vtable = &source_vtable };
     }
+
+    pub fn schema(self: *Source) types.Schema {
+        return self.cursor.schema();
+    }
+    pub fn next(self: *Source, arena: std.mem.Allocator) anyerror!?Batch {
+        return self.cursor.nextBatch(arena);
+    }
+    pub fn close(self: *Source) void {
+        self.cursor.close();
+        self.gpa.destroy(self);
+    }
 };
 
-const source_vtable = driver.Source.VTable{ .schema = srcSchema, .next = srcNext, .close = srcClose };
-
-fn srcSchema(ptr: *anyopaque) types.Schema {
-    const self: *Source = @ptrCast(@alignCast(ptr));
-    return self.cursor.schema();
-}
-fn srcNext(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
-    const self: *Source = @ptrCast(@alignCast(ptr));
-    return self.cursor.nextBatch(arena);
-}
-fn srcClose(ptr: *anyopaque) void {
-    const self: *Source = @ptrCast(@alignCast(ptr));
-    self.cursor.close();
-    self.gpa.destroy(self);
-}
+const source_vtable = driver.sourceVTable(Source);
 
 /// Rows per multi-row INSERT. Bigger = fewer round-trips/commits (the dominant
 /// cost of row loading), but SQL Server caps a `VALUES` list at 1000 rows.
 fn flushRowsFor(dialect: Dialect) usize {
     return switch (dialect) {
         .sqlserver => 1000,
-        .postgres, .mysql => 5000,
+        .postgres, .mysql, .starrocks => 5000,
     };
+}
+
+/// A gpa-owned copy of `schema`'s field list, so a sink outlives the planner's
+/// arena. Released with `freeSchema`.
+fn ownedSchema(gpa: std.mem.Allocator, schema: types.Schema) !types.Schema {
+    const fields = try gpa.alloc(types.Schema.Field, schema.fields.len);
+    errdefer gpa.free(fields);
+    var nf: usize = 0;
+    errdefer for (fields[0..nf]) |f| gpa.free(f.name);
+    for (schema.fields, fields) |f, *o| {
+        o.* = .{ .name = try gpa.dupe(u8, f.name), .ty = f.ty };
+        nf += 1;
+    }
+    return .{ .fields = fields };
+}
+
+fn freeSchema(gpa: std.mem.Allocator, schema: types.Schema) void {
+    for (schema.fields) |f| gpa.free(f.name);
+    gpa.free(schema.fields);
 }
 
 /// Re-establishes a connection for the INSERT sink's transient retry. `ctx`
@@ -324,14 +389,8 @@ pub const Sink = struct {
     pub fn open(gpa: std.mem.Allocator, conn: Conn, dialect: Dialect, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?Redial) !*Sink {
         const self = try gpa.create(Sink);
         errdefer gpa.destroy(self);
-        const fields = try gpa.alloc(types.Schema.Field, schema.fields.len);
-        errdefer gpa.free(fields);
-        var nf: usize = 0;
-        errdefer for (fields[0..nf]) |f| gpa.free(f.name);
-        for (schema.fields, 0..) |f, i| {
-            fields[i] = .{ .name = try gpa.dupe(u8, f.name), .ty = f.ty };
-            nf += 1;
-        }
+        const owned = try ownedSchema(gpa, schema);
+        errdefer freeSchema(gpa, owned);
         const qtable = try quoteIdent(gpa, dialect, table_name);
         errdefer gpa.free(qtable);
         self.* = .{
@@ -339,7 +398,7 @@ pub const Sink = struct {
             .conn = conn,
             .dialect = dialect,
             .table = qtable,
-            .schema = .{ .fields = fields },
+            .schema = owned,
             .mode = mode,
             .rows = std.array_list.Managed([]const u8).init(gpa),
             .tuple_arena = std.heap.ArenaAllocator.init(gpa),
@@ -364,7 +423,7 @@ pub const Sink = struct {
         return .{ .ptr = self, .vtable = &sink_vtable };
     }
 
-    fn writeBatch(self: *Sink, arena: std.mem.Allocator, batch: Batch) !void {
+    pub fn writeBatch(self: *Sink, arena: std.mem.Allocator, batch: Batch) !void {
         var r: usize = 0;
         while (r < batch.len) : (r += 1) {
             const tuple = try serializeRow(self.tuple_arena.allocator(), self.dialect, batch, r);
@@ -393,7 +452,7 @@ pub const Sink = struct {
         _ = self.tuple_arena.reset(.retain_capacity);
     }
 
-    fn closeImpl(self: *Sink) !void {
+    pub fn close(self: *Sink) !void {
         defer self.teardown();
         try self.flush();
     }
@@ -401,7 +460,7 @@ pub const Sink = struct {
     /// Failure path: drop the buffered tuples without a final INSERT. Flushes
     /// that already ran are autocommitted and stay (downstream dedup owns
     /// exactly-once, per split.zig).
-    fn abortImpl(self: *Sink) void {
+    pub fn abort(self: *Sink) void {
         self.teardown();
     }
 
@@ -409,29 +468,148 @@ pub const Sink = struct {
         if (self.conn_alive) self.conn.close();
         self.rows.deinit();
         self.tuple_arena.deinit();
-        for (self.schema.fields) |f| self.gpa.free(f.name);
-        self.gpa.free(self.schema.fields);
+        freeSchema(self.gpa, self.schema);
         self.gpa.free(self.table);
         self.gpa.destroy(self);
     }
 };
 
-const sink_vtable = driver.Sink.VTable{ .writeBatch = sinkWrite, .close = sinkClose, .abort = sinkAbort };
+const sink_vtable = driver.sinkVTable(Sink);
 
-fn sinkWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
-    const self: *Sink = @ptrCast(@alignCast(ptr));
-    return self.writeBatch(arena, b);
+/// The segment-streaming sink shared by every bulk protocol (postgres COPY, mysql
+/// LOAD DATA, tds INSERT BULK): accumulate encoded rows up to `SEGMENT_BYTES`,
+/// transmit the segment as one statement, verify the server's row count, and only
+/// then discard the bytes. `Proto` supplies what differs:
+///   - `Connection`: the driver connection type (`exec`, `close`, `last_error`);
+///   - `dialect` and `stmt`: DDL quoting, and the statement name in count errors;
+///   - `command(arena, qtable, schema)`: the statement that opens a segment;
+///   - `appendBatch(w, arena, batch)`: encode rows into the segment buffer;
+///   - `send(conn, command, segment, rows)`: transmit one segment and return the
+///     server's row count;
+///   - optionally `segmentHeader(w, gpa, schema)`: bytes every segment starts
+///     with (tds COLMETADATA).
+pub fn BulkSink(comptime Proto: type) type {
+    return struct {
+        gpa: std.mem.Allocator,
+        conn: *Proto.Connection,
+        schema: types.Schema,
+        buffer: std.array_list.Managed(u8),
+        command: []const u8,
+        seg_rows: u64 = 0,
+        redial: ?Redial = null,
+
+        const Self = @This();
+        const vtable = driver.sinkVTable(Self);
+
+        pub fn open(gpa: std.mem.Allocator, conn: *Proto.Connection, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?Redial) !*Self {
+            const self = try gpa.create(Self);
+            errdefer gpa.destroy(self);
+            const owned = try ownedSchema(gpa, schema);
+            errdefer freeSchema(gpa, owned);
+
+            var aa = std.heap.ArenaAllocator.init(gpa);
+            defer aa.deinit();
+            const a = aa.allocator();
+            const qtable = try quoteIdent(a, Proto.dialect, table_name);
+            try conn.exec(try createTableSql(a, Proto.dialect, qtable, schema, mode));
+            if (mode == .overwrite) try conn.exec(try std.fmt.allocPrint(a, "DELETE FROM {s}", .{qtable}));
+            const command = try gpa.dupe(u8, try Proto.command(a, qtable, schema));
+            errdefer gpa.free(command);
+
+            self.* = .{ .gpa = gpa, .conn = conn, .schema = owned, .buffer = std.array_list.Managed(u8).init(gpa), .command = command, .redial = redial };
+            errdefer self.buffer.deinit();
+            try self.startSegment();
+            return self;
+        }
+
+        pub fn sink(self: *Self) driver.Sink {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        pub fn writeBatch(self: *Self, arena: std.mem.Allocator, batch: Batch) !void {
+            try Proto.appendBatch(self.buffer.writer(), arena, batch);
+            self.seg_rows += batch.len;
+            if (self.buffer.items.len >= SEGMENT_BYTES) {
+                try self.commitSegment();
+                try self.startSegment();
+            }
+        }
+
+        fn startSegment(self: *Self) !void {
+            if (@hasDecl(Proto, "segmentHeader")) try Proto.segmentHeader(self.buffer.writer(), self.gpa, self.schema);
+        }
+
+        /// Transmit the buffered segment as one statement and verify the server's
+        /// row count. A transient network failure redials once and resends the
+        /// intact segment: a statement that dies mid-stream rolls back
+        /// server-side, so the replay cannot duplicate. (The one unavoidable
+        /// window: if the connection dies AFTER the server committed but before
+        /// its reply arrived, the replay double-writes — same tradeoff as the
+        /// INSERT sink.) A segment holding only a header (no rows) is dropped
+        /// without a round-trip.
+        fn commitSegment(self: *Self) !void {
+            if (self.seg_rows == 0) {
+                self.buffer.clearRetainingCapacity();
+                return;
+            }
+            self.sendSegment() catch |e| {
+                const rd = self.redial orelse return e;
+                if (!driver.transientNet(e)) return e;
+                const fresh = try rd.dial(rd.ctx, self.gpa);
+                self.conn.close();
+                self.conn = @ptrCast(@alignCast(fresh.ptr));
+                try self.sendSegment();
+            };
+            self.buffer.clearRetainingCapacity();
+            self.seg_rows = 0;
+        }
+
+        fn sendSegment(self: *Self) !void {
+            const n = try Proto.send(self.conn, self.command, self.buffer.items, self.seg_rows);
+            if (n != self.seg_rows) {
+                if (self.conn.last_error.len == 0)
+                    self.conn.last_error = try std.fmt.allocPrint(self.gpa, "{s} count mismatch: sent {d} rows, server loaded {d}", .{ Proto.stmt, self.seg_rows, n });
+                return error.BulkCountMismatch;
+            }
+        }
+
+        pub fn close(self: *Self) !void {
+            defer self.teardown();
+            try self.commitSegment();
+        }
+
+        /// Failure path: drop the buffer and close the socket mid-statement. The
+        /// server aborts the in-flight statement when the connection dies, so
+        /// none of it is committed.
+        pub fn abort(self: *Self) void {
+            self.teardown();
+        }
+
+        fn teardown(self: *Self) void {
+            self.conn.close();
+            self.buffer.deinit();
+            self.gpa.free(self.command);
+            freeSchema(self.gpa, self.schema);
+            self.gpa.destroy(self);
+        }
+    };
 }
-fn sinkClose(ptr: *anyopaque) anyerror!void {
-    const self: *Sink = @ptrCast(@alignCast(ptr));
-    return self.closeImpl();
-}
-fn sinkAbort(ptr: *anyopaque) void {
-    const self: *Sink = @ptrCast(@alignCast(ptr));
-    self.abortImpl();
-}
+
+/// Knobs only some dialects' CREATE TABLE need. StarRocks requires a
+/// distribution clause and a replication factor on every table.
+pub const TableOpts = struct {
+    buckets: u32 = 4,
+    replication_num: u32 = 1,
+};
 
 pub fn createTableSql(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8, schema: types.Schema, mode: ast.WriteMode) ![]const u8 {
+    return createTableSqlWith(arena, dialect, qtable, schema, mode, .{});
+}
+
+/// `createTableSql` with per-dialect options. Keys (upsert mode) become the
+/// primary key; StarRocks additionally picks its table model from the mode.
+pub fn createTableSqlWith(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8, schema: types.Schema, mode: ast.WriteMode, opts: TableOpts) ![]const u8 {
+    if (dialect == .starrocks) return starrocksTableSql(arena, qtable, schema, mode, opts);
     const keys: []const []const u8 = switch (mode) {
         .upsert => |u| u.keys,
         else => &.{},
@@ -456,16 +634,55 @@ pub fn createTableSql(arena: std.mem.Allocator, dialect: Dialect, qtable: []cons
             try w.writeAll(" NULL");
         }
     }
-    if (keys.len > 0) {
-        try w.writeAll(", PRIMARY KEY (");
-        for (keys, 0..) |k, i| {
-            if (i > 0) try w.writeByte(',');
-            try w.writeAll(try quoteIdent(arena, dialect, k));
-        }
-        try w.writeByte(')');
-    }
+    if (keys.len > 0) try w.print(", PRIMARY KEY ({s})", .{try quoteNames(arena, dialect, keys)});
     try w.writeByte(')');
     return buf.toOwnedSlice();
+}
+
+/// StarRocks: the write mode selects the table model — `upsert on k` → PRIMARY
+/// KEY (keys reordered first and NOT NULL), append/overwrite → DUPLICATE KEY on
+/// the first column — and the same columns drive DISTRIBUTED BY HASH.
+fn starrocksTableSql(arena: std.mem.Allocator, qtable: []const u8, schema: types.Schema, mode: ast.WriteMode, opts: TableOpts) ![]const u8 {
+    const is_pk = (mode == .upsert);
+    const keys: []const []const u8 = switch (mode) {
+        .upsert => |u| u.keys,
+        else => &.{schema.fields[0].name},
+    };
+    if (is_pk and keys.len == 0) return error.UpsertKeysUnresolved;
+
+    var ordered = std.array_list.Managed(types.Schema.Field).init(arena);
+    if (is_pk) {
+        for (keys) |k| try ordered.append(findField(schema, k) orelse return error.UnknownKeyColumn);
+        for (schema.fields) |f| {
+            if (!nameIn(keys, f.name)) try ordered.append(f);
+        }
+    } else {
+        try ordered.appendSlice(schema.fields);
+    }
+
+    var buf = std.array_list.Managed(u8).init(arena);
+    const w = buf.writer();
+    try w.print("CREATE TABLE IF NOT EXISTS {s} (\n", .{qtable});
+    for (ordered.items, 0..) |f, i| {
+        const is_key = is_pk and nameIn(keys, f.name);
+        const qn = try quoteIdent(arena, .starrocks, f.name);
+        try w.print("  {s} {s}{s}", .{ qn, try Dialect.starrocks.ddlType(arena, f.ty, is_key), if (is_key) " NOT NULL" else "" });
+        if (i + 1 < ordered.items.len) try w.writeByte(',');
+        try w.writeByte('\n');
+    }
+    try w.writeAll(") ENGINE=OLAP\n");
+    const qkeys = try quoteNames(arena, .starrocks, keys);
+    try w.print("{s}({s})\n", .{ if (is_pk) "PRIMARY KEY" else "DUPLICATE KEY", qkeys });
+    try w.print("DISTRIBUTED BY HASH({s}) BUCKETS {d}\n", .{ qkeys, opts.buckets });
+    try w.print("PROPERTIES(\"replication_num\"=\"{d}\");", .{opts.replication_num});
+    return buf.toOwnedSlice();
+}
+
+fn findField(schema: types.Schema, name: []const u8) ?types.Schema.Field {
+    for (schema.fields) |f| {
+        if (std.mem.eql(u8, f.name, name)) return f;
+    }
+    return null;
 }
 
 fn buildStatement(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8, schema: types.Schema, mode: ast.WriteMode, rows: []const []const u8) ![]const u8 {
@@ -483,18 +700,15 @@ fn buildStatement(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8
     switch (mode) {
         .upsert => |u| switch (dialect) {
             .postgres => {
-                try w.writeAll(" ON CONFLICT (");
-                for (u.keys, 0..) |k, i| {
-                    if (i > 0) try w.writeByte(',');
-                    try w.writeAll(try quoteIdent(arena, dialect, k));
-                }
-                try w.writeAll(") DO UPDATE SET ");
+                try w.print(" ON CONFLICT ({s}) DO UPDATE SET ", .{try quoteNames(arena, dialect, u.keys)});
                 try writeUpdateSet(w, arena, dialect, schema, u.keys, "EXCLUDED.");
             },
             .mysql => {
                 try w.writeAll(" ON DUPLICATE KEY UPDATE ");
                 try writeMysqlUpdate(w, arena, dialect, schema, u.keys);
             },
+            // A StarRocks primary-key table upserts on a plain INSERT.
+            .starrocks => {},
             .sqlserver => unreachable,
         },
         else => {},
@@ -544,11 +758,22 @@ fn writeMysqlUpdate(w: anytype, arena: std.mem.Allocator, dialect: Dialect, sche
     }
 }
 
-fn colList(arena: std.mem.Allocator, dialect: Dialect, schema: types.Schema) ![]const u8 {
+/// The schema's columns, quoted and comma-joined — the column list of an INSERT,
+/// COPY, LOAD DATA or Stream Load header.
+pub fn colList(arena: std.mem.Allocator, dialect: Dialect, schema: types.Schema) ![]const u8 {
     var buf = std.array_list.Managed(u8).init(arena);
     for (schema.fields, 0..) |f, i| {
         if (i > 0) try buf.append(',');
         try buf.appendSlice(try quoteIdent(arena, dialect, f.name));
+    }
+    return buf.toOwnedSlice();
+}
+
+fn quoteNames(arena: std.mem.Allocator, dialect: Dialect, names: []const []const u8) ![]const u8 {
+    var buf = std.array_list.Managed(u8).init(arena);
+    for (names, 0..) |n, i| {
+        if (i > 0) try buf.append(',');
+        try buf.appendSlice(try quoteIdent(arena, dialect, n));
     }
     return buf.toOwnedSlice();
 }
@@ -980,4 +1205,97 @@ test "bulk text format: tab/newline/backslash escaping and \\N nulls" {
     out.clearRetainingCapacity();
     try appendBulkText(out.writer(), a, batch, .{ .bool_true = "1", .bool_false = "0" });
     try std.testing.expectEqualStrings("a\\tb\\nc\\\\d\t1\n\\N\t0\n", out.items);
+}
+
+const FakeBulk = struct {
+    const Connection = struct {
+        last_error: []const u8 = "",
+        fail_once: bool = false,
+        sends: usize = 0,
+        closed: bool = false,
+        last_len: usize = 0,
+        fn exec(_: *Connection, _: []const u8) !void {}
+        fn close(self: *Connection) void {
+            self.closed = true;
+        }
+    };
+    const dialect: Dialect = .postgres;
+    const stmt = "FAKE";
+    fn command(_: std.mem.Allocator, _: []const u8, _: types.Schema) ![]const u8 {
+        return "CMD";
+    }
+    fn appendBatch(w: anytype, _: std.mem.Allocator, batch: Batch) !void {
+        for (0..batch.len) |_| try w.writeAll("row\n");
+    }
+    fn send(conn: *Connection, _: []const u8, segment: []const u8, rows: u64) !u64 {
+        conn.sends += 1;
+        if (conn.fail_once) {
+            conn.fail_once = false;
+            return error.ConnectionResetByPeer;
+        }
+        conn.last_len = segment.len;
+        return rows;
+    }
+    fn dial(ctx: *const anyopaque, _: std.mem.Allocator) anyerror!Conn {
+        const fresh: *Connection = @ptrCast(@alignCast(@constCast(ctx)));
+        return .{ .ptr = fresh, .vtable = &conn_vtable };
+    }
+    fn noCursor(_: *anyopaque, _: []const u8) anyerror!Cursor {
+        return error.Unsupported;
+    }
+    fn noExec(_: *anyopaque, _: []const u8) anyerror!void {}
+    fn noClose(_: *anyopaque) void {}
+    const conn_vtable = Conn.VTable{ .queryCursor = noCursor, .exec = noExec, .close = noClose };
+};
+
+test "BulkSink: a transient send failure redials once and resends the intact segment" {
+    const gpa = std.testing.allocator;
+    var first = FakeBulk.Connection{ .fail_once = true };
+    var second = FakeBulk.Connection{};
+    const schema = types.Schema{ .fields = &.{} };
+    const batch = Batch{ .schema = &schema, .columns = &.{}, .len = 3 };
+
+    const s = try BulkSink(FakeBulk).open(gpa, &first, "t", schema, .append, .{ .ctx = &second, .dial = FakeBulk.dial });
+    try s.writeBatch(gpa, batch);
+    try s.close();
+
+    try std.testing.expectEqual(@as(usize, 1), first.sends);
+    try std.testing.expect(first.closed);
+    try std.testing.expectEqual(@as(usize, 1), second.sends);
+    try std.testing.expectEqual(@as(usize, 12), second.last_len);
+    try std.testing.expect(second.closed);
+}
+
+test "BulkSink: without a redial the transient failure is the caller's" {
+    const gpa = std.testing.allocator;
+    var only = FakeBulk.Connection{ .fail_once = true };
+    const schema = types.Schema{ .fields = &.{} };
+    const batch = Batch{ .schema = &schema, .columns = &.{}, .len = 1 };
+
+    const s = try BulkSink(FakeBulk).open(gpa, &only, "t", schema, .append, null);
+    try s.writeBatch(gpa, batch);
+    try std.testing.expectError(error.ConnectionResetByPeer, s.close());
+    try std.testing.expectEqual(@as(usize, 1), only.sends);
+    try std.testing.expect(only.closed);
+}
+
+test "every type kind has a DDL spelling in every dialect, and CAST covers the scalars" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    inline for (std.meta.fields(types.TypeKind)) |kf| {
+        const kind: types.TypeKind = @enumFromInt(kf.value);
+        const ty = types.Type{ .kind = kind, .precision = 10, .scale = 2 };
+        inline for (std.meta.fields(Dialect)) |df| {
+            const d: Dialect = @enumFromInt(df.value);
+            try std.testing.expect((try d.ddlType(a, ty, false)).len > 0);
+            try std.testing.expect((try d.ddlType(a, ty, true)).len > 0);
+            const cast = try d.castType(a, ty);
+            const scalar = switch (kind) {
+                .int, .float, .decimal, .string, .date, .time, .timestamp => true,
+                .bool, .bytes, .array, .@"struct" => false,
+            };
+            try std.testing.expect((cast != null) == scalar);
+        }
+    }
 }

@@ -18,10 +18,8 @@
 //! canonicalized before hashing — see `hashValue`.
 
 const std = @import("std");
-const valuemod = @import("value.zig");
+const Value = @import("value.zig").Value;
 const eval = @import("eval.zig");
-
-const Value = valuemod.Value;
 
 /// The canonical bit pattern for a float key: `valueEq` compares floats
 /// numerically, so `-0.0 == 0.0` (different bit patterns) and every NaN equals

@@ -13,13 +13,12 @@
 //! unsupported rather than guessed at.
 
 const std = @import("std");
-const pq = @import("parquet.zig");
+const parquet = @import("parquet.zig");
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
-const valuemod = @import("../exec/value.zig");
+pub const Threshold = @import("../exec/value.zig").Threshold;
+const Value = @import("../exec/value.zig").Value;
 const eval = @import("../exec/eval.zig");
-
-const Value = valuemod.Value;
 
 pub const Error = error{
     CorruptParquetPage,
@@ -164,12 +163,12 @@ fn readVarint(src: []const u8, pos: *usize) Error!u64 {
 pub const PlainCursor = struct {
     src: []const u8,
     pos: usize = 0,
-    ty: pq.PhysicalType,
+    ty: parquet.PhysicalType,
     type_length: usize = 0,
     /// BOOLEAN is bit-packed, one bit per value, so it needs its own cursor.
     bits: BitReader = .{ .buf = &.{} },
 
-    pub fn init(ty: pq.PhysicalType, type_length: i32, src: []const u8) PlainCursor {
+    pub fn init(ty: parquet.PhysicalType, type_length: i32, src: []const u8) PlainCursor {
         return .{
             .src = src,
             .ty = ty,
@@ -448,7 +447,7 @@ const conv_bson = 20;
 /// depending on the annotation; basalt's `time`/`timestamp` are always micros.
 /// Ignoring this reads a millisecond timestamp as if it were micros — a silent
 /// 1000x error that lands values in 1970.
-pub fn temporalScale(e: pq.SchemaElement) i64 {
+pub fn temporalScale(e: parquet.SchemaElement) i64 {
     const c = e.converted_type orelse return 1;
     return switch (c) {
         conv_time_millis, conv_timestamp_millis => 1000,
@@ -457,7 +456,7 @@ pub fn temporalScale(e: pq.SchemaElement) i64 {
 }
 
 /// basalt type for a leaf schema element, from its physical and converted type.
-pub fn basaltType(e: pq.SchemaElement) Error!types.Type {
+pub fn basaltType(e: parquet.SchemaElement) Error!types.Type {
     const phys = e.ty orelse return Error.UnsupportedParquetSchema;
     const conv = e.converted_type;
 
@@ -496,7 +495,7 @@ pub fn basaltType(e: pq.SchemaElement) Error!types.Type {
     return t;
 }
 
-fn decimalOf(e: pq.SchemaElement) types.Type {
+fn decimalOf(e: parquet.SchemaElement) types.Type {
     const p: u8 = if (e.precision) |x| @intCast(@max(1, @min(38, x))) else 38;
     const s: u8 = if (e.scale) |x| @intCast(@max(0, @min(38, x))) else 0;
     return types.Type.decimal(p, s);
@@ -570,7 +569,7 @@ pub const Leaf = struct {
 /// This is what makes a file with nested columns usable: the flat columns are
 /// still readable, and only the repeated ones are skipped. Rejecting the whole
 /// file because one column is a list would make most real lake files unopenable.
-pub fn collectLeaves(arena: std.mem.Allocator, schema: []const pq.SchemaElement) Error![]Leaf {
+pub fn collectLeaves(arena: std.mem.Allocator, schema: []const parquet.SchemaElement) Error![]Leaf {
     var out = std.array_list.Managed(Leaf).init(arena);
     var pos: usize = 1; // element 0 is the synthetic root
     var chunk: usize = 0;
@@ -583,7 +582,7 @@ pub fn collectLeaves(arena: std.mem.Allocator, schema: []const pq.SchemaElement)
 
 fn walkNode(
     arena: std.mem.Allocator,
-    schema: []const pq.SchemaElement,
+    schema: []const parquet.SchemaElement,
     pos: *usize,
     chunk: *usize,
     out: *std.array_list.Managed(Leaf),
@@ -628,14 +627,14 @@ fn walkNode(
 pub fn readColumnChunk(
     arena: std.mem.Allocator,
     file_bytes: []const u8,
-    meta: pq.ColumnMetaData,
-    elem: pq.SchemaElement,
+    meta: parquet.ColumnMetaData,
+    elem: parquet.SchemaElement,
     rows: usize,
     max_def: u32,
     /// Offset of `file_bytes[0]` within the file. Zero when the caller passed a
     /// slice that already starts at the chunk, as the ranged reader does.
     base_offset: u64,
-) (Error || pq.Error || @import("codec.zig").Error)!column.Column {
+) (Error || parquet.Error || @import("codec.zig").Error)!column.Column {
     const ty = (try basaltType(elem)).asNullable();
     const tscale = temporalScale(elem);
 
@@ -646,7 +645,7 @@ pub fn readColumnChunk(
 
     while (produced < rows) {
         if (offset >= file_bytes.len) return Error.CorruptParquetPage;
-        const pg = try pq.readPage(arena, file_bytes, offset, meta.compression);
+        const pg = try parquet.readPage(arena, file_bytes, offset, meta.compression);
         offset = pg.next_offset;
 
         switch (pg.header.ty) {
@@ -676,9 +675,9 @@ pub fn readColumnChunk(
 fn appendDataPage(
     arena: std.mem.Allocator,
     b: *column.Builder,
-    pg: pq.Page,
-    meta: pq.ColumnMetaData,
-    elem: pq.SchemaElement,
+    pg: parquet.Page,
+    meta: parquet.ColumnMetaData,
+    elem: parquet.SchemaElement,
     ty: types.Type,
     max_def: u32,
     dict: ?[]Value,
@@ -786,7 +785,7 @@ fn bulkPlain(
     arena: std.mem.Allocator,
     b: *column.Builder,
     ty: types.Type,
-    phys: pq.PhysicalType,
+    phys: parquet.PhysicalType,
     body: []const u8,
     present: usize,
     defs: ?[]const u32,
@@ -924,8 +923,6 @@ fn emit(
 // --- row group filtering -----------------------------------------------------
 
 /// A simple `column <op> literal` bound, the shape a row-group filter can use.
-pub const Threshold = valuemod.Threshold;
-
 pub const Bound = struct {
     column: []const u8,
     op: Op,
@@ -941,9 +938,9 @@ pub const Bound = struct {
 /// statistics *prove* no row can match. Missing or unreadable statistics always
 /// mean "keep", so this can never drop matching rows.
 pub fn groupMayMatch(
-    schema: []const pq.SchemaElement,
+    schema: []const parquet.SchemaElement,
     leaves: []const Leaf,
-    g: pq.RowGroup,
+    g: parquet.RowGroup,
     bounds: []const Bound,
 ) bool {
     for (bounds) |b| {
@@ -974,9 +971,9 @@ pub fn groupMayMatch(
 /// Conservative by construction: unknown column, missing statistics, or an
 /// unfilled heap all return true. Only a proven strict miss skips.
 pub fn groupBeatsThreshold(
-    schema: []const pq.SchemaElement,
+    schema: []const parquet.SchemaElement,
     leaves: []const Leaf,
-    g: pq.RowGroup,
+    g: parquet.RowGroup,
     t: Threshold,
 ) bool {
     if (!t.full or t.value == .null) return true;
@@ -1031,7 +1028,7 @@ fn findLeaf(leaves: []const Leaf, name: []const u8) ?Leaf {
 }
 
 /// Decodes one PLAIN-encoded statistics blob into a comparable `Value`.
-fn statValue(elem: pq.SchemaElement, phys: pq.PhysicalType, raw: ?[]const u8) ?Value {
+fn statValue(elem: parquet.SchemaElement, phys: parquet.PhysicalType, raw: ?[]const u8) ?Value {
     const b = raw orelse return null;
     const ty = basaltType(elem) catch return null;
     var cur = PlainCursor.init(phys, elem.type_length orelse 0, b);
@@ -1131,11 +1128,9 @@ fn numOrder(a: Value, b: Value) ?std.math.Order {
 // --- source ------------------------------------------------------------------
 
 const driver = @import("driver.zig");
-const batchmod = @import("../exec/batch.zig");
-const azure = @import("azure.zig");
-const s3 = @import("s3.zig");
-const httpx = @import("http.zig");
-const Batch = batchmod.Batch;
+const Batch = @import("../exec/batch.zig").Batch;
+const http_client = @import("http_client.zig");
+const objstore = @import("objstore.zig");
 
 /// Byte source a reader pulls from: a local file read on demand, or an already
 /// resident buffer.
@@ -1208,8 +1203,7 @@ pub const Remote = struct {
     arena: std.mem.Allocator,
     client: *std.http.Client,
     url: []const u8,
-    blob: ?azure.Blob,
-    s3obj: ?s3.Obj = null,
+    object: ?objstore.Object = null,
     total: u64,
     /// Set when the origin ignored `Range` (or could not report a size), which
     /// makes every later read a slice instead of another full transfer.
@@ -1219,16 +1213,12 @@ pub const Remote = struct {
 
     fn open(arena: std.mem.Allocator, path: []const u8) !*Remote {
         const client = try arena.create(std.http.Client);
-        client.* = httpx.initClient(arena);
+        client.* = http_client.initClient(arena);
         const self = try arena.create(Remote);
-        self.* = .{ .arena = arena, .client = client, .url = path, .blob = null, .total = 0 };
-        if (azure.isUrl(path)) {
-            const b = try azure.parseUrl(arena, path, azure.endpointFromEnv(arena));
-            self.blob = b;
-            self.url = b.url;
-        } else if (s3.isUrl(path)) {
-            const o = try s3.parseUrl(arena, path, s3.endpointFromEnv(arena));
-            self.s3obj = o;
+        self.* = .{ .arena = arena, .client = client, .url = path, .total = 0 };
+        if (objstore.isUrl(path)) {
+            const o = try objstore.parse(arena, path);
+            self.object = o;
             self.url = o.url;
         }
 
@@ -1311,7 +1301,7 @@ pub const Remote = struct {
             .method = method,
             .location = .{ .url = self.url },
             .extra_headers = extra,
-            .decompress_buffer = httpx.decompress_direct,
+            .decompress_buffer = http_client.decompress_direct,
             .response_writer = &aw.writer,
         });
         return .{ .code = @intFromEnum(res.status), .body = aw.writer.buffered() };
@@ -1323,13 +1313,9 @@ pub const Remote = struct {
         method: std.http.Method,
         range_hdr: []const u8,
     ) ![]const std.http.Header {
-        if (self.blob) |b| {
+        if (self.object) |o| {
             const verb = if (method == .HEAD) "HEAD" else "GET";
-            return azure.requestHeaders(arena, b, verb, range_hdr);
-        }
-        if (self.s3obj) |o| {
-            const verb = if (method == .HEAD) "HEAD" else "GET";
-            return s3.requestHeaders(arena, o, verb, range_hdr);
+            return o.requestHeaders(arena, verb, range_hdr);
         }
         if (range_hdr.len == 0) return &.{};
         return arena.dupe(std.http.Header, &.{.{ .name = "Range", .value = range_hdr }});
@@ -1350,17 +1336,16 @@ pub const Remote = struct {
     }
 
     fn statusError(self: *Remote, code: u16, body: []const u8) anyerror {
-        if (self.blob != null) return azure.statusToError(code, body);
-        if (self.s3obj != null) return s3.statusToError(code, body);
-        return httpx.statusError(code);
+        if (self.object) |o| return o.statusToError(code, body);
+        return http_client.statusError(code);
     }
 
     fn repair(self: *Remote) bool {
         if (self.repaired) return false;
         self.repaired = true;
         const uri = std.Uri.parse(self.url) catch return false;
-        const h = httpx.uriHost(uri) orelse return false;
-        if (!httpx.repairBundle(self.client.allocator, &self.client.ca_bundle, h, uri.port orelse 443)) return false;
+        const h = http_client.uriHost(uri) orelse return false;
+        if (!http_client.repairBundle(self.client.allocator, &self.client.ca_bundle, h, uri.port orelse 443)) return false;
         self.client.next_https_rescan_certs = false;
         return true;
     }
@@ -1374,7 +1359,7 @@ pub const Remote = struct {
 pub const Reader = struct {
     arena: std.mem.Allocator,
     src: Bytes,
-    md: pq.FileMetaData,
+    md: parquet.FileMetaData,
     schema: types.Schema,
     /// Readable leaves, in output order. Repeated (list) leaves are excluded but
     /// still occupy a chunk slot, which is why `Leaf.chunk_idx` is carried.
@@ -1567,7 +1552,7 @@ fn chunkEnd(boundaries: []const u64, start: u64) u64 {
 
 /// Every chunk start in the file plus the footer offset, ascending. Built once
 /// so each chunk read knows exactly where it ends.
-fn chunkBoundaries(arena: std.mem.Allocator, md: pq.FileMetaData, footer_start: u64) ![]u64 {
+fn chunkBoundaries(arena: std.mem.Allocator, md: parquet.FileMetaData, footer_start: u64) ![]u64 {
     var out = std.array_list.Managed(u64).init(arena);
     for (md.row_groups) |g| {
         for (g.columns) |c| {
@@ -1582,23 +1567,23 @@ fn chunkBoundaries(arena: std.mem.Allocator, md: pq.FileMetaData, footer_start: 
 }
 
 /// Reads the footer with two small ranged reads instead of the whole file.
-fn parseFooterOf(arena: std.mem.Allocator, src: Bytes, footer_start: *u64) !pq.FileMetaData {
+fn parseFooterOf(arena: std.mem.Allocator, src: Bytes, footer_start: *u64) !parquet.FileMetaData {
     const total = src.size();
-    if (total < pq.trailer_len + pq.magic.len) return pq.Error.NotParquet;
-    const head = try src.range(arena, 0, pq.magic.len);
-    if (!std.mem.eql(u8, head, pq.magic)) return pq.Error.NotParquet;
+    if (total < parquet.trailer_len + parquet.magic.len) return parquet.Error.NotParquet;
+    const head = try src.range(arena, 0, parquet.magic.len);
+    if (!std.mem.eql(u8, head, parquet.magic)) return parquet.Error.NotParquet;
 
-    const trailer = try src.range(arena, total - pq.trailer_len, pq.trailer_len);
-    const r = try pq.footerRange(total, trailer);
+    const trailer = try src.range(arena, total - parquet.trailer_len, parquet.trailer_len);
+    const r = try parquet.footerRange(total, trailer);
     footer_start.* = r.offset;
     const footer = try src.range(arena, r.offset, r.len);
-    return pq.parseFooter(arena, footer);
+    return parquet.parseFooter(arena, footer);
 }
 
 /// Paths a `Remote` serves: object storage and plain URLs alike. Everything
 /// else is a local file.
 pub fn isRemote(path: []const u8) bool {
-    return azure.isUrl(path) or s3.isUrl(path) or
+    return objstore.isUrl(path) or
         std.mem.startsWith(u8, path, "http://") or
         std.mem.startsWith(u8, path, "https://");
 }
@@ -1672,7 +1657,7 @@ test "a bit-packed run length from the wire cannot overflow the byte count" {
 }
 
 test "physical plus converted type maps onto a basalt type" {
-    const opt = pq.Repetition.optional;
+    const opt = parquet.Repetition.optional;
     try testing.expectEqual(types.TypeKind.int, (try basaltType(.{ .ty = .int32, .repetition = opt })).kind);
     try testing.expectEqual(types.TypeKind.date, (try basaltType(.{ .ty = .int32, .converted_type = 6, .repetition = opt })).kind);
     try testing.expectEqual(types.TypeKind.timestamp, (try basaltType(.{ .ty = .int64, .converted_type = 10, .repetition = opt })).kind);
@@ -1696,7 +1681,7 @@ test "decodes real column values from a DuckDB-written file" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    const md = try pq.parseFile(a, fx);
+    const md = try parquet.parseFile(a, fx);
     const g = md.row_groups[0];
     const rows: usize = @intCast(g.num_rows);
 
@@ -1734,7 +1719,7 @@ test "every codec's fixture decodes to the same values" {
         @embedFile("testdata/lz4.parquet"),
     };
     for (files) |f| {
-        const md = try pq.parseFile(a, f);
+        const md = try parquet.parseFile(a, f);
         const g = md.row_groups[0];
         const name = try readColumnChunk(a, f, g.columns[1].meta.?, md.schema[2], @intCast(g.num_rows), 1, 0);
         try testing.expectEqualStrings("row-0", name.getValue(0).string);
@@ -1749,7 +1734,7 @@ test "schema walk resolves levels and dotted names for nested groups" {
 
     // root { id (required int32), addr (optional group { city, zip }),
     //        tags (repeated group { element }) }
-    const schema = [_]pq.SchemaElement{
+    const schema = [_]parquet.SchemaElement{
         .{ .name = "root", .num_children = 3 },
         .{ .name = "id", .ty = .int32, .repetition = .required },
         .{ .name = "addr", .repetition = .optional, .num_children = 2 },
@@ -1881,7 +1866,7 @@ test "projection keeps only the named columns and never drops all of them" {
 }
 
 test "row groups are skipped only when statistics prove no row can match" {
-    const schema = [_]pq.SchemaElement{
+    const schema = [_]parquet.SchemaElement{
         .{ .name = "root", .num_children = 1 },
         .{ .name = "id", .ty = .int64, .repetition = .optional },
     };
@@ -1892,11 +1877,11 @@ test "row groups are skipped only when statistics prove no row can match" {
     var hi: [8]u8 = undefined;
     std.mem.writeInt(i64, &lo, 100, .little);
     std.mem.writeInt(i64, &hi, 200, .little);
-    var chunks = [_]pq.ColumnChunk{.{ .meta = .{
+    var chunks = [_]parquet.ColumnChunk{.{ .meta = .{
         .ty = .int64,
         .stats = .{ .min = &lo, .max = &hi },
     } }};
-    const g = pq.RowGroup{ .columns = &chunks, .num_rows = 10 };
+    const g = parquet.RowGroup{ .columns = &chunks, .num_rows = 10 };
 
     const keep = [_]Bound{.{ .column = "id", .op = .lt, .value = .{ .int = 500 } }};
     const drop = [_]Bound{.{ .column = "id", .op = .lt, .value = .{ .int = 50 } }};
@@ -1915,8 +1900,8 @@ test "row groups are skipped only when statistics prove no row can match" {
     try testing.expect(!groupMayMatch(&schema, &leaves, g, &gt_drop));
 
     // without statistics nothing is provable, so the group is always kept
-    var bare = [_]pq.ColumnChunk{.{ .meta = .{ .ty = .int64 } }};
-    const g2 = pq.RowGroup{ .columns = &bare, .num_rows = 10 };
+    var bare = [_]parquet.ColumnChunk{.{ .meta = .{ .ty = .int64 } }};
+    const g2 = parquet.RowGroup{ .columns = &bare, .num_rows = 10 };
     try testing.expect(groupMayMatch(&schema, &leaves, g2, &drop));
 
     // an unknown column contributes no bound
@@ -2003,13 +1988,12 @@ test "a remote whole-body read refuses to slice past the body it was given" {
 
     // HEAD claimed 100000 bytes; the ranged GET came back 200 with 10. The
     // fast path must not trust `total` over the buffer it actually holds.
-    var client = httpx.initClient(a);
+    var client = http_client.initClient(a);
     defer client.deinit();
     var r = Remote{
         .arena = a,
         .client = &client,
         .url = "http://example/x.parquet",
-        .blob = null,
         .total = 100000,
         .whole = "0123456789",
     };
@@ -2019,7 +2003,7 @@ test "a remote whole-body read refuses to slice past the body it was given" {
 }
 
 test "top-N threshold skips only groups it can prove cannot contribute" {
-    const schema = [_]pq.SchemaElement{
+    const schema = [_]parquet.SchemaElement{
         .{ .name = "root", .num_children = 1 },
         .{ .name = "v", .ty = .int64, .repetition = .optional },
     };
@@ -2028,8 +2012,8 @@ test "top-N threshold skips only groups it can prove cannot contribute" {
     var hi: [8]u8 = undefined;
     std.mem.writeInt(i64, &lo, 100, .little);
     std.mem.writeInt(i64, &hi, 200, .little);
-    var chunks = [_]pq.ColumnChunk{.{ .meta = .{ .ty = .int64, .stats = .{ .min = &lo, .max = &hi } } }};
-    const g = pq.RowGroup{ .columns = &chunks, .num_rows = 10 };
+    var chunks = [_]parquet.ColumnChunk{.{ .meta = .{ .ty = .int64, .stats = .{ .min = &lo, .max = &hi } } }};
+    const g = parquet.RowGroup{ .columns = &chunks, .num_rows = 10 };
 
     // DESC: the group tops out at 200, so a bound of 500 rules it out entirely
     try testing.expect(!groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = true, .full = true, .value = .{ .int = 500 } }));
@@ -2045,8 +2029,8 @@ test "top-N threshold skips only groups it can prove cannot contribute" {
     try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = true, .full = false, .value = .{ .int = 500 } }));
     try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "nosuch", .desc = true, .full = true, .value = .{ .int = 500 } }));
     try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = true, .full = true, .value = .null }));
-    var bare = [_]pq.ColumnChunk{.{ .meta = .{ .ty = .int64 } }};
-    const g2 = pq.RowGroup{ .columns = &bare, .num_rows = 10 };
+    var bare = [_]parquet.ColumnChunk{.{ .meta = .{ .ty = .int64 } }};
+    const g2 = parquet.RowGroup{ .columns = &bare, .num_rows = 10 };
     try testing.expect(groupBeatsThreshold(&schema, &leaves, g2, .{ .column = "v", .desc = true, .full = true, .value = .{ .int = 500 } }));
 }
 

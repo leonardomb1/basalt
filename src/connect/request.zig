@@ -8,18 +8,16 @@
 const std = @import("std");
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
-const batchmod = @import("../exec/batch.zig");
-const valuemod = @import("../exec/value.zig");
+const Batch = @import("../exec/batch.zig").Batch;
+const Value = @import("../exec/value.zig").Value;
 const driver = @import("driver.zig");
 
-const Value = valuemod.Value;
-const Batch = batchmod.Batch;
 const json = std.json;
 
 pub const RequestSource = struct {
     gpa: std.mem.Allocator,
     arena_inst: std.heap.ArenaAllocator,
-    schema: *types.Schema,
+    schema_: *types.Schema,
     batch: Batch,
     yielded: bool = false,
 
@@ -34,7 +32,7 @@ pub const RequestSource = struct {
         msg_out: *[]const u8,
     ) !*RequestSource {
         const self = try gpa.create(RequestSource);
-        self.* = .{ .gpa = gpa, .arena_inst = std.heap.ArenaAllocator.init(gpa), .schema = undefined, .batch = undefined };
+        self.* = .{ .gpa = gpa, .arena_inst = std.heap.ArenaAllocator.init(gpa), .schema_ = undefined, .batch = undefined };
         errdefer {
             self.arena_inst.deinit();
             gpa.destroy(self);
@@ -64,15 +62,29 @@ pub const RequestSource = struct {
 
         if (declared) |cols| {
             try validateBody(items, cols, msg_arena, msg_out);
-            self.schema = try schemaFromBodyCols(arena, cols);
+            self.schema_ = try schemaFromBodyCols(arena, cols);
         } else {
-            self.schema = try inferSchema(arena, items);
+            self.schema_ = try inferSchema(arena, items);
         }
-        self.batch = try batchFromJson(arena, self.schema, items);
+        self.batch = try batchFromJson(arena, self.schema_, items);
     }
 
     pub fn source(self: *RequestSource) driver.Source {
         return .{ .ptr = self, .vtable = &source_vtable };
+    }
+
+    pub fn schema(self: *RequestSource) types.Schema {
+        return self.schema_.*;
+    }
+    pub fn next(self: *RequestSource, arena: std.mem.Allocator) anyerror!?Batch {
+        _ = arena;
+        if (self.yielded) return null;
+        self.yielded = true;
+        return self.batch;
+    }
+    pub fn close(self: *RequestSource) void {
+        self.arena_inst.deinit();
+        self.gpa.destroy(self);
     }
 };
 
@@ -235,24 +247,7 @@ fn jsonToString(arena: std.mem.Allocator, v: json.Value) ![]const u8 {
     };
 }
 
-const source_vtable = driver.Source.VTable{ .schema = srcSchema, .next = srcNext, .close = srcClose };
-
-fn srcSchema(ptr: *anyopaque) types.Schema {
-    const self: *RequestSource = @ptrCast(@alignCast(ptr));
-    return self.schema.*;
-}
-fn srcNext(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
-    _ = arena;
-    const self: *RequestSource = @ptrCast(@alignCast(ptr));
-    if (self.yielded) return null;
-    self.yielded = true;
-    return self.batch;
-}
-fn srcClose(ptr: *anyopaque) void {
-    const self: *RequestSource = @ptrCast(@alignCast(ptr));
-    self.arena_inst.deinit();
-    self.gpa.destroy(self);
-}
+const source_vtable = driver.sourceVTable(RequestSource);
 
 test "request source: a single object becomes one row" {
     const gpa = std.testing.allocator;
@@ -260,7 +255,7 @@ test "request source: a single object becomes one row" {
     var s = try RequestSource.open(gpa,
         \\{"id": 7, "name": "solo"}
     , null, gpa, &msg);
-    defer srcClose(s);
+    defer s.close();
     try std.testing.expectEqual(@as(usize, 1), s.batch.len);
     try std.testing.expectEqual(@as(i64, 7), s.batch.columns[0].getValue(0).int);
     try std.testing.expectEqualStrings("solo", s.batch.columns[1].getValue(0).string);
@@ -272,16 +267,16 @@ test "request source: schema comes from row 1; later rows coerce or null" {
     var s = try RequestSource.open(gpa,
         \\[{"id":1,"name":"a","score":1.5},{"id":"42","extra":true}]
     , null, gpa, &msg);
-    defer srcClose(s);
-    try std.testing.expectEqual(@as(usize, 3), s.schema.fields.len);
-    try std.testing.expectEqual(types.TypeKind.float, s.schema.fields[2].ty.kind);
+    defer s.close();
+    try std.testing.expectEqual(@as(usize, 3), s.schema().fields.len);
+    try std.testing.expectEqual(types.TypeKind.float, s.schema().fields[2].ty.kind);
     try std.testing.expectEqual(@as(i64, 42), s.batch.columns[0].getValue(1).int);
     try std.testing.expect(s.batch.columns[1].getValue(1).isNull());
     try std.testing.expect(s.batch.columns[2].getValue(1).isNull());
     var s2 = try RequestSource.open(gpa,
         \\[{"n":1},{"n":"not-a-number"}]
     , null, gpa, &msg);
-    defer srcClose(s2);
+    defer s2.close();
     try std.testing.expect(s2.batch.columns[0].getValue(1).isNull());
 }
 
@@ -301,11 +296,11 @@ test "request source parses a JSON array of objects" {
     var s = try RequestSource.open(gpa,
         \\[{"id":1,"name":"alice","ok":true},{"id":2,"name":"bob","ok":false}]
     , null, std.testing.allocator, &msg);
-    defer srcClose(s);
+    defer s.close();
     try std.testing.expectEqual(@as(usize, 2), s.batch.len);
-    try std.testing.expectEqualStrings("id", s.schema.fields[0].name);
-    try std.testing.expectEqual(types.TypeKind.int, s.schema.fields[0].ty.kind);
-    try std.testing.expectEqual(types.TypeKind.bool, s.schema.fields[2].ty.kind);
+    try std.testing.expectEqualStrings("id", s.schema().fields[0].name);
+    try std.testing.expectEqual(types.TypeKind.int, s.schema().fields[0].ty.kind);
+    try std.testing.expectEqual(types.TypeKind.bool, s.schema().fields[2].ty.kind);
     try std.testing.expectEqual(@as(i64, 1), s.batch.columns[0].getValue(0).int);
     try std.testing.expectEqualStrings("bob", s.batch.columns[1].getValue(1).string);
     try std.testing.expect(s.batch.columns[2].getValue(0).bool);
@@ -326,10 +321,10 @@ test "declared body schema: column order, types, and enforcement" {
     var s = try RequestSource.open(gpa,
         \\[{"value":7,"device_id":"a","extra":true},{"device_id":"b"}]
     , &decl, a, &msg);
-    defer srcClose(s);
-    try std.testing.expectEqual(@as(usize, 2), s.schema.fields.len);
-    try std.testing.expectEqualStrings("device_id", s.schema.fields[0].name);
-    try std.testing.expectEqual(types.TypeKind.int, s.schema.fields[1].ty.kind);
+    defer s.close();
+    try std.testing.expectEqual(@as(usize, 2), s.schema().fields.len);
+    try std.testing.expectEqualStrings("device_id", s.schema().fields[0].name);
+    try std.testing.expectEqual(types.TypeKind.int, s.schema().fields[1].ty.kind);
     try std.testing.expectEqual(@as(i64, 7), s.batch.columns[1].getValue(0).int);
 
     try std.testing.expectError(error.BodySchemaViolation, RequestSource.open(gpa,
@@ -356,7 +351,7 @@ test "JSON-typed columns keep object payloads as JSON text" {
     var s = try RequestSource.open(gpa,
         \\[{"payload":{"a":1,"b":[true,null]}}]
     , &decl, arena.allocator(), &msg);
-    defer srcClose(s);
+    defer s.close();
     try std.testing.expectEqualStrings(
         \\{"a":1,"b":[true,null]}
     , s.batch.columns[0].getValue(0).string);
@@ -368,8 +363,8 @@ test "inferred schema: object payloads type as string and keep JSON text" {
     var s = try RequestSource.open(gpa,
         \\[{"id":1,"payload":{"a":[1,2]}}]
     , null, std.testing.allocator, &msg);
-    defer srcClose(s);
-    try std.testing.expectEqual(types.TypeKind.string, s.schema.fields[1].ty.kind);
+    defer s.close();
+    try std.testing.expectEqual(types.TypeKind.string, s.schema().fields[1].ty.kind);
     try std.testing.expectEqualStrings(
         \\{"a":[1,2]}
     , s.batch.columns[1].getValue(0).string);

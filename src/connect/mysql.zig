@@ -6,17 +6,13 @@
 //! in starrocks.zig.
 
 const std = @import("std");
-const sr = @import("starrocks.zig");
-const sqlmod = @import("sql.zig");
+const starrocks = @import("starrocks.zig");
+const sql = @import("sql.zig");
 const types = @import("../lang/types.zig");
-const ast = @import("../lang/ast.zig");
 const column = @import("../exec/column.zig");
-const valuemod = @import("../exec/value.zig");
-const batchmod = @import("../exec/batch.zig");
+const Value = @import("../exec/value.zig").Value;
+const Batch = @import("../exec/batch.zig").Batch;
 const driver = @import("driver.zig");
-
-const Value = valuemod.Value;
-const Batch = batchmod.Batch;
 
 const CLIENT_LONG_PASSWORD = 0x00000001;
 const CLIENT_CONNECT_WITH_DB = 0x00000008;
@@ -42,14 +38,14 @@ pub const Conn = struct {
     sw: std.net.Stream.Writer = undefined,
     buf: std.array_list.Managed(u8),
     last_error: []const u8 = "",
-    tls: ?*sqlmod.TlsState = null,
+    tls: ?*sql.TlsState = null,
     meta_arena: std.heap.ArenaAllocator = undefined,
     cols: []MyCol = &.{},
     cur_schema: *types.Schema = undefined,
     done: bool = false,
     ld_seq: u8 = 0,
 
-    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sqlmod.TlsMode) !*Conn {
+    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
         driver.tuneSocket(stream.handle);
         const self = try gpa.create(Conn);
@@ -64,7 +60,7 @@ pub const Conn = struct {
         var rseq = seq + 1;
         if (tls_mode != .off) {
             try self.writeSslRequest(rseq, database);
-            const ts = try gpa.create(sqlmod.TlsState);
+            const ts = try gpa.create(sql.TlsState);
             errdefer gpa.destroy(ts);
             try ts.start(gpa, self.sr.interface(), &self.sw.interface, host, tls_mode);
             self.tls = ts;
@@ -89,7 +85,7 @@ pub const Conn = struct {
                         _ = try self.writePacket(rseq +% 1, "");
                     } else switch (sw.plugin orelse return error.MysqlAuthFailed) {
                         .native => {
-                            const token = sr.mysqlAuthToken(password, &sw.salt);
+                            const token = starrocks.mysqlAuthToken(password, &sw.salt);
                             _ = try self.writePacket(rseq +% 1, &token);
                         },
                         .caching_sha2 => {
@@ -122,11 +118,11 @@ pub const Conn = struct {
     }
 
     /// Run a statement that returns no result set (DDL). Errors on an ERR packet.
-    pub fn exec(self: *Conn, sql: []const u8) !void {
-        const payload = try self.gpa.alloc(u8, sql.len + 1);
+    pub fn exec(self: *Conn, stmt: []const u8) !void {
+        const payload = try self.gpa.alloc(u8, stmt.len + 1);
         defer self.gpa.free(payload);
         payload[0] = 0x03;
-        @memcpy(payload[1..], sql);
+        @memcpy(payload[1..], stmt);
         _ = try self.writePacket(0, payload);
 
         _ = try self.readPacket();
@@ -199,21 +195,21 @@ pub const Conn = struct {
         try self.sw.interface.flush();
     }
 
-    pub fn sqlConn(self: *Conn) sqlmod.Conn {
+    pub fn sqlConn(self: *Conn) sql.Conn {
         return .{ .ptr = self, .vtable = &sql_vtable };
     }
 
     /// Start streaming a query: send it, parse the column-def header.
-    pub fn queryCursor(self: *Conn, sql: []const u8) !sqlmod.Cursor {
-        return sqlmod.openTextCursor(self, sql, &cursor_vtable);
+    pub fn queryCursor(self: *Conn, stmt: []const u8) !sql.Cursor {
+        return sql.openTextCursor(self, stmt, &cursor_vtable);
     }
 
-    pub fn openCursor(self: *Conn, sql: []const u8) !void {
+    pub fn openCursor(self: *Conn, stmt: []const u8) !void {
         const ma = self.meta_arena.allocator();
-        const payload = try self.gpa.alloc(u8, sql.len + 1);
+        const payload = try self.gpa.alloc(u8, stmt.len + 1);
         defer self.gpa.free(payload);
         payload[0] = 0x03;
-        @memcpy(payload[1..], sql);
+        @memcpy(payload[1..], stmt);
         _ = try self.writePacket(0, payload);
 
         _ = try self.readPacket();
@@ -251,7 +247,7 @@ pub const Conn = struct {
 
     /// One result-set packet, classified for `sql.fetchTextBatch`: a row
     /// (values appended), the end of the stream, or a server error.
-    pub fn nextRow(self: *Conn, arena: std.mem.Allocator, builders: []column.Builder) !sqlmod.RowStep {
+    pub fn nextRow(self: *Conn, arena: std.mem.Allocator, builders: []column.Builder) !sql.RowStep {
         _ = try self.readPacket();
         const r = self.buf.items;
         if (r.len > 0 and r[0] == 0xfe and r.len < 9) return .end;
@@ -267,7 +263,7 @@ pub const Conn = struct {
             else if (c.mtype == 0x10)
                 .{ .int = decodeBits(text.?) }
             else
-                sqlmod.coerceText(arena, text, c.engine_type) catch |e| {
+                sql.coerceText(arena, text, c.engine_type) catch |e| {
                     if (e == error.UnparseableNumber)
                         self.last_error = try std.fmt.allocPrint(self.gpa, "column `{s}`: unparseable numeric value \"{s}\"", .{ c.name, text.? });
                     return e;
@@ -410,7 +406,7 @@ pub const Conn = struct {
             try w.writeByte(0);
         } else switch (plugin) {
             .native => {
-                const token = sr.mysqlAuthToken(password, &salt);
+                const token = starrocks.mysqlAuthToken(password, &salt);
                 try w.writeByte(20);
                 try w.writeAll(&token);
             },
@@ -499,113 +495,35 @@ fn parseAuthSwitch(p: []const u8) AuthSwitch {
 
 const LD_FLUSH_BYTES = 1 << 20;
 
-pub const LoadDataSink = struct {
-    gpa: std.mem.Allocator,
-    conn: *Conn,
-    buffer: std.array_list.Managed(u8),
-    load_cmd: []const u8 = "",
-    seg_rows: u64 = 0,
-    redial: ?sqlmod.Redial = null,
+/// LOAD DATA LOCAL INFILE: tab-separated rows streamed as the "file", one
+/// statement per segment, verified against the OK packet's affected-rows count.
+const LoadDataProto = struct {
+    pub const Connection = Conn;
+    pub const dialect: sql.Dialect = .mysql;
+    pub const stmt = "LOAD DATA";
 
-    pub fn open(gpa: std.mem.Allocator, conn: *Conn, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?sqlmod.Redial) !*LoadDataSink {
-        const self = try gpa.create(LoadDataSink);
-        errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .conn = conn, .buffer = std.array_list.Managed(u8).init(gpa), .redial = redial };
-        errdefer self.buffer.deinit();
-
-        var aa = std.heap.ArenaAllocator.init(gpa);
-        defer aa.deinit();
-        const a = aa.allocator();
-        const qtable = try sqlmod.quoteIdent(a, .mysql, table_name);
-        try conn.exec(try sqlmod.createTableSql(a, .mysql, qtable, schema, mode));
-        if (mode == .overwrite) try conn.exec(try std.fmt.allocPrint(a, "DELETE FROM {s}", .{qtable}));
-
-        var cols = std.array_list.Managed(u8).init(a);
-        for (schema.fields, 0..) |f, i| {
-            if (i > 0) try cols.append(',');
-            try cols.appendSlice(try sqlmod.quoteIdent(a, .mysql, f.name));
-        }
-        self.load_cmd = try std.fmt.allocPrint(gpa, "LOAD DATA LOCAL INFILE 'pipe' INTO TABLE {s} ({s})", .{ qtable, cols.items });
-        return self;
+    pub fn command(arena: std.mem.Allocator, qtable: []const u8, schema: types.Schema) ![]const u8 {
+        return std.fmt.allocPrint(arena, "LOAD DATA LOCAL INFILE 'pipe' INTO TABLE {s} ({s})", .{ qtable, try sql.colList(arena, .mysql, schema) });
     }
 
-    pub fn sink(self: *LoadDataSink) driver.Sink {
-        return .{ .ptr = self, .vtable = &ld_vtable };
+    pub fn appendBatch(w: anytype, arena: std.mem.Allocator, batch: Batch) !void {
+        try sql.appendBulkText(w, arena, batch, .{ .bool_true = "1", .bool_false = "0" });
     }
 
-    fn writeBatch(self: *LoadDataSink, arena: std.mem.Allocator, batch: Batch) !void {
-        try sqlmod.appendBulkText(self.buffer.writer(), arena, batch, .{ .bool_true = "1", .bool_false = "0" });
-        self.seg_rows += batch.len;
-        if (self.buffer.items.len >= sqlmod.SEGMENT_BYTES) try self.commitSegment();
-    }
-
-    /// Transmit the buffered segment as one LOAD DATA statement and verify the
-    /// OK packet's affected-rows count. Transient failure → redial once and
-    /// resend the intact segment (a LOAD DATA cut mid-statement rolls back).
-    /// Same lost-reply double-write window as the other bulk sinks.
-    fn commitSegment(self: *LoadDataSink) !void {
-        if (self.seg_rows == 0) return;
-        self.sendSegment() catch |e| {
-            const rd = self.redial orelse return e;
-            if (!driver.transientNet(e)) return e;
-            const fresh = try rd.dial(rd.ctx, self.gpa);
-            self.conn.close();
-            self.conn = @ptrCast(@alignCast(fresh.ptr));
-            try self.sendSegment();
-        };
-        self.buffer.clearRetainingCapacity();
-        self.seg_rows = 0;
-    }
-
-    fn sendSegment(self: *LoadDataSink) !void {
-        try self.conn.loadDataStart(self.load_cmd);
+    pub fn send(conn: *Conn, cmd: []const u8, data: []const u8, rows: u64) !u64 {
+        _ = rows;
+        try conn.loadDataStart(cmd);
         var off: usize = 0;
-        while (off < self.buffer.items.len) {
-            const chunk = @min(self.buffer.items.len - off, LD_FLUSH_BYTES);
-            try self.conn.loadDataChunk(self.buffer.items[off .. off + chunk]);
+        while (off < data.len) {
+            const chunk = @min(data.len - off, LD_FLUSH_BYTES);
+            try conn.loadDataChunk(data[off .. off + chunk]);
             off += chunk;
         }
-        const n = try self.conn.loadDataEnd();
-        if (n != self.seg_rows) {
-            if (self.conn.last_error.len == 0)
-                self.conn.last_error = try std.fmt.allocPrint(self.gpa, "LOAD DATA count mismatch: sent {d} rows, server loaded {d}", .{ self.seg_rows, n });
-            return error.BulkCountMismatch;
-        }
-    }
-
-    fn closeImpl(self: *LoadDataSink) !void {
-        defer self.teardown();
-        try self.commitSegment();
-    }
-
-    /// Failure path: drop the buffer and close the socket mid-LOAD DATA. The
-    /// server aborts the statement when the connection dies.
-    fn abortImpl(self: *LoadDataSink) void {
-        self.teardown();
-    }
-
-    fn teardown(self: *LoadDataSink) void {
-        self.conn.close();
-        self.buffer.deinit();
-        if (self.load_cmd.len > 0) self.gpa.free(self.load_cmd);
-        self.gpa.destroy(self);
+        return conn.loadDataEnd();
     }
 };
 
-const ld_vtable = driver.Sink.VTable{ .writeBatch = ldWrite, .close = ldClose, .abort = ldAbort };
-
-fn ldWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
-    const self: *LoadDataSink = @ptrCast(@alignCast(ptr));
-    return self.writeBatch(arena, b);
-}
-fn ldClose(ptr: *anyopaque) anyerror!void {
-    const self: *LoadDataSink = @ptrCast(@alignCast(ptr));
-    return self.closeImpl();
-}
-fn ldAbort(ptr: *anyopaque) void {
-    const self: *LoadDataSink = @ptrCast(@alignCast(ptr));
-    self.abortImpl();
-}
+pub const LoadDataSink = sql.BulkSink(LoadDataProto);
 
 /// OK packet → affected-rows count (header 0x00, then affected_rows lenenc).
 fn parseOkAffected(p: []const u8) ?u64 {
@@ -629,8 +547,8 @@ fn errMessage(p: []const u8) []const u8 {
     return p[i..];
 }
 
-const sql_vtable = sqlmod.connVTable(Conn);
-const cursor_vtable = sqlmod.textCursorVTable(Conn);
+const sql_vtable = sql.connVTable(Conn);
+const cursor_vtable = sql.textCursorVTable(Conn);
 
 /// Fold a BIT column's raw big-endian bytes into an int (BIT(64) max; longer
 /// inputs keep the low 64 bits).

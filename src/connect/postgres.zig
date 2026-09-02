@@ -5,13 +5,10 @@
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
-const ast = @import("../lang/ast.zig");
 const column = @import("../exec/column.zig");
-const batchmod = @import("../exec/batch.zig");
+const Batch = @import("../exec/batch.zig").Batch;
 const driver = @import("driver.zig");
-const sqlmod = @import("sql.zig");
-
-const Batch = batchmod.Batch;
+const sql = @import("sql.zig");
 
 pub const Error = error{ PgProtocol, PgAuthFailed, PgQueryFailed, PgAuthUnsupported, PgTlsRefused } || std.mem.Allocator.Error;
 
@@ -29,13 +26,13 @@ pub const Conn = struct {
     sw: std.net.Stream.Writer = undefined,
     payload: std.array_list.Managed(u8),
     last_error: []const u8 = "",
-    tls: ?*sqlmod.TlsState = null,
+    tls: ?*sql.TlsState = null,
     meta_arena: std.heap.ArenaAllocator = undefined,
     cols: []PgCol = &.{},
     cur_schema: *types.Schema = undefined,
     done: bool = false,
 
-    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sqlmod.TlsMode) !*Conn {
+    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
         driver.tuneSocket(stream.handle);
         const self = try gpa.create(Conn);
@@ -52,7 +49,7 @@ pub const Conn = struct {
     /// SSLRequest (len=8, code 80877103) → server answers one byte: 'S' starts
     /// the TLS handshake, 'N' means TLS is disabled server-side (we error rather
     /// than silently downgrading to plaintext).
-    fn startTls(self: *Conn, host: []const u8, mode: sqlmod.TlsMode) !void {
+    fn startTls(self: *Conn, host: []const u8, mode: sql.TlsMode) !void {
         var req: [8]u8 = undefined;
         std.mem.writeInt(u32, req[0..4], 8, .big);
         std.mem.writeInt(u32, req[4..8], 80877103, .big);
@@ -63,7 +60,7 @@ pub const Conn = struct {
         try self.sr.interface().readSliceAll(&resp);
         if (resp[0] != 'S') return error.PgTlsRefused;
 
-        const ts = try self.gpa.create(sqlmod.TlsState);
+        const ts = try self.gpa.create(sql.TlsState);
         errdefer self.gpa.destroy(ts);
         try ts.start(self.gpa, self.sr.interface(), &self.sw.interface, host, mode);
         self.tls = ts;
@@ -90,7 +87,7 @@ pub const Conn = struct {
         try self.sw.interface.flush();
     }
 
-    pub fn sqlConn(self: *Conn) sqlmod.Conn {
+    pub fn sqlConn(self: *Conn) sql.Conn {
         return .{ .ptr = self, .vtable = &sql_vtable };
     }
 
@@ -235,14 +232,14 @@ pub const Conn = struct {
         if (!std.mem.eql(u8, &server_sig, &scramServerSig(keys, auth_message))) return error.PgAuthFailed;
     }
 
-    pub fn queryCursor(self: *Conn, sql: []const u8) !sqlmod.Cursor {
-        return sqlmod.openTextCursor(self, sql, &cursor_vtable);
+    pub fn queryCursor(self: *Conn, stmt: []const u8) !sql.Cursor {
+        return sql.openTextCursor(self, stmt, &cursor_vtable);
     }
 
     /// Send the query and read up to RowDescription (the header); leaves the
     /// connection positioned just before the DataRows.
-    pub fn openCursor(self: *Conn, sql: []const u8) !void {
-        try self.sendQuery(sql);
+    pub fn openCursor(self: *Conn, stmt: []const u8) !void {
+        try self.sendQuery(stmt);
         const ma = self.meta_arena.allocator();
         self.cols = &.{};
         self.done = false;
@@ -277,7 +274,7 @@ pub const Conn = struct {
 
     /// One backend message, classified for `sql.fetchTextBatch`: a DataRow
     /// (values appended), ReadyForQuery (end), or a server error.
-    pub fn nextRow(self: *Conn, arena: std.mem.Allocator, builders: []column.Builder) !sqlmod.RowStep {
+    pub fn nextRow(self: *Conn, arena: std.mem.Allocator, builders: []column.Builder) !sql.RowStep {
         while (true) {
             const t = try self.readMsg();
             const p = self.payload.items;
@@ -296,8 +293,8 @@ pub const Conn = struct {
         }
     }
 
-    pub fn exec(self: *Conn, sql: []const u8) !void {
-        try self.sendQuery(sql);
+    pub fn exec(self: *Conn, stmt: []const u8) !void {
+        try self.sendQuery(stmt);
         while (true) {
             const t = try self.readMsg();
             switch (t) {
@@ -311,10 +308,10 @@ pub const Conn = struct {
         }
     }
 
-    fn sendQuery(self: *Conn, sql: []const u8) !void {
+    fn sendQuery(self: *Conn, stmt: []const u8) !void {
         var body = std.array_list.Managed(u8).init(self.gpa);
         defer body.deinit();
-        try appendCStr(&body, sql);
+        try appendCStr(&body, stmt);
         try self.writeMsg('Q', body.items);
     }
 
@@ -379,8 +376,8 @@ pub const Conn = struct {
     }
 };
 
-const sql_vtable = sqlmod.connVTable(Conn);
-const cursor_vtable = sqlmod.textCursorVTable(Conn);
+const sql_vtable = sql.connVTable(Conn);
+const cursor_vtable = sql.textCursorVTable(Conn);
 
 const PgCol = struct { name: []const u8, oid: i32, engine_type: types.Type };
 const RowDesc = struct { cols: []PgCol, fields: []types.Schema.Field };
@@ -427,7 +424,7 @@ fn parseDataRow(conn: *Conn, arena: std.mem.Allocator, p: []const u8, builders: 
             const ulen: usize = @intCast(len);
             if (i + ulen > p.len) return error.PgProtocol;
             const cell = p[i .. i + ulen];
-            const v = sqlmod.coerceText(arena, cell, conn.cols[k].engine_type) catch |e| {
+            const v = sql.coerceText(arena, cell, conn.cols[k].engine_type) catch |e| {
                 if (e == error.UnparseableNumber)
                     conn.last_error = try std.fmt.allocPrint(conn.gpa, "column \"{s}\": unparseable numeric value \"{s}\"", .{ conn.cols[k].name, cell });
                 return e;
@@ -634,114 +631,30 @@ test "parseCopyCount: COPY tag, other tags, junk" {
     try std.testing.expectEqual(@as(?u64, null), parseCopyCount("COPY x"));
 }
 
-pub const CopySink = struct {
-    gpa: std.mem.Allocator,
-    conn: *Conn,
-    table: []const u8,
-    ncols: usize,
-    buffer: std.array_list.Managed(u8),
-    copy_cmd: []const u8,
-    seg_rows: u64 = 0,
-    redial: ?sqlmod.Redial = null,
+/// COPY FROM STDIN: text-format rows, one COPY statement per segment, verified
+/// against the "COPY n" tag.
+const CopyProto = struct {
+    pub const Connection = Conn;
+    pub const dialect: sql.Dialect = .postgres;
+    pub const stmt = "COPY";
 
-    pub fn open(gpa: std.mem.Allocator, conn: *Conn, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?sqlmod.Redial) !*CopySink {
-        const self = try gpa.create(CopySink);
-        errdefer gpa.destroy(self);
-        const qtable = try sqlmod.quoteIdent(gpa, .postgres, table_name);
-        errdefer gpa.free(qtable);
-        self.* = .{ .gpa = gpa, .conn = conn, .table = qtable, .ncols = schema.fields.len, .buffer = std.array_list.Managed(u8).init(gpa), .copy_cmd = "", .redial = redial };
-        errdefer self.buffer.deinit();
-
-        var aa = std.heap.ArenaAllocator.init(gpa);
-        defer aa.deinit();
-        const a = aa.allocator();
-        try conn.exec(try sqlmod.createTableSql(a, .postgres, qtable, schema, mode));
-        if (mode == .overwrite) try conn.exec(try std.fmt.allocPrint(a, "DELETE FROM {s}", .{qtable}));
-
-        var cols = std.array_list.Managed(u8).init(a);
-        for (schema.fields, 0..) |f, i| {
-            if (i > 0) try cols.append(',');
-            try cols.appendSlice(try sqlmod.quoteIdent(a, .postgres, f.name));
-        }
-        self.copy_cmd = try std.fmt.allocPrint(gpa, "COPY {s} ({s}) FROM STDIN", .{ qtable, cols.items });
-        return self;
+    pub fn command(arena: std.mem.Allocator, qtable: []const u8, schema: types.Schema) ![]const u8 {
+        return std.fmt.allocPrint(arena, "COPY {s} ({s}) FROM STDIN", .{ qtable, try sql.colList(arena, .postgres, schema) });
     }
 
-    pub fn sink(self: *CopySink) driver.Sink {
-        return .{ .ptr = self, .vtable = &copy_vtable };
+    pub fn appendBatch(w: anytype, arena: std.mem.Allocator, batch: Batch) !void {
+        try sql.appendBulkText(w, arena, batch, .{});
     }
 
-    fn writeBatch(self: *CopySink, arena: std.mem.Allocator, batch: Batch) !void {
-        try sqlmod.appendBulkText(self.buffer.writer(), arena, batch, .{});
-        self.seg_rows += batch.len;
-        if (self.buffer.items.len >= sqlmod.SEGMENT_BYTES) try self.commitSegment();
-    }
-
-    /// Transmit the buffered segment as one COPY statement and verify the
-    /// server's "COPY n" count. A transient network failure redials once and
-    /// resends the intact segment: a COPY that dies mid-statement rolls back
-    /// server-side, so the replay cannot duplicate. (The one unavoidable window:
-    /// if the connection dies AFTER the server committed but before its reply
-    /// arrived, the replay double-writes — same tradeoff as the INSERT sink.)
-    fn commitSegment(self: *CopySink) !void {
-        if (self.seg_rows == 0) return;
-        self.sendSegment() catch |e| {
-            const rd = self.redial orelse return e;
-            if (!driver.transientNet(e)) return e;
-            const fresh = try rd.dial(rd.ctx, self.gpa);
-            self.conn.close();
-            self.conn = @ptrCast(@alignCast(fresh.ptr));
-            try self.sendSegment();
-        };
-        self.buffer.clearRetainingCapacity();
-        self.seg_rows = 0;
-    }
-
-    fn sendSegment(self: *CopySink) !void {
-        try self.conn.copyIn(self.copy_cmd);
-        try self.conn.copyData(self.buffer.items);
-        const n = try self.conn.copyDone();
-        if (n != self.seg_rows) {
-            if (self.conn.last_error.len == 0)
-                self.conn.last_error = try std.fmt.allocPrint(self.gpa, "COPY count mismatch: sent {d} rows, server loaded {d}", .{ self.seg_rows, n });
-            return error.BulkCountMismatch;
-        }
-    }
-
-    fn closeImpl(self: *CopySink) !void {
-        defer self.teardown();
-        try self.commitSegment();
-    }
-
-    /// Failure path: drop the buffer and close the socket mid-COPY. The server
-    /// aborts the COPY when the connection dies, so none of it is committed.
-    fn abortImpl(self: *CopySink) void {
-        self.teardown();
-    }
-
-    fn teardown(self: *CopySink) void {
-        self.conn.close();
-        self.buffer.deinit();
-        if (self.copy_cmd.len > 0) self.gpa.free(self.copy_cmd);
-        self.gpa.free(self.table);
-        self.gpa.destroy(self);
+    pub fn send(conn: *Conn, cmd: []const u8, data: []const u8, rows: u64) !u64 {
+        _ = rows;
+        try conn.copyIn(cmd);
+        try conn.copyData(data);
+        return conn.copyDone();
     }
 };
 
-const copy_vtable = driver.Sink.VTable{ .writeBatch = copyWrite, .close = copyClose, .abort = copyAbort };
-
-fn copyWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
-    const self: *CopySink = @ptrCast(@alignCast(ptr));
-    return self.writeBatch(arena, b);
-}
-fn copyClose(ptr: *anyopaque) anyerror!void {
-    const self: *CopySink = @ptrCast(@alignCast(ptr));
-    return self.closeImpl();
-}
-fn copyAbort(ptr: *anyopaque) void {
-    const self: *CopySink = @ptrCast(@alignCast(ptr));
-    self.abortImpl();
-}
+pub const CopySink = sql.BulkSink(CopyProto);
 
 fn errMessage(p: []const u8) []const u8 {
     var i: usize = 0;

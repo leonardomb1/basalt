@@ -4,14 +4,15 @@
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
-const col = @import("column.zig");
+const Column = @import("column.zig").Column;
+const intColumn = @import("column.zig").intColumn;
 
 pub const Batch = struct {
     schema: *const types.Schema,
-    columns: []col.Column,
+    columns: []Column,
     len: usize,
 
-    pub fn column(self: Batch, name: []const u8) ?*col.Column {
+    pub fn column(self: Batch, name: []const u8) ?*Column {
         const idx = self.schema.indexOf(name) orelse return null;
         return &self.columns[idx];
     }
@@ -20,7 +21,7 @@ pub const Batch = struct {
 test "batch column lookup by name" {
     const alloc = std.testing.allocator;
 
-    const id_col = try col.intColumn(alloc, &.{ 10, 20 });
+    const id_col = try intColumn(alloc, &.{ 10, 20 });
     defer {
         alloc.free(id_col.validity.bits);
         alloc.free(id_col.data.i64);
@@ -29,7 +30,7 @@ test "batch column lookup by name" {
     const schema = types.Schema{ .fields = &.{
         .{ .name = "id", .ty = types.Type.init(.int) },
     } };
-    var cols = [_]col.Column{id_col};
+    var cols = [_]Column{id_col};
     const b = Batch{ .schema = &schema, .columns = &cols, .len = 2 };
 
     const got = b.column("id").?;
@@ -39,7 +40,7 @@ test "batch column lookup by name" {
 
 test "zero-row batch still resolves columns" {
     const alloc = std.testing.allocator;
-    const c = try col.intColumn(alloc, &.{});
+    const c = try intColumn(alloc, &.{});
     defer {
         alloc.free(c.validity.bits);
         alloc.free(c.data.i64);
@@ -47,7 +48,7 @@ test "zero-row batch still resolves columns" {
     const schema = types.Schema{ .fields = &.{
         .{ .name = "id", .ty = types.Type.init(.int) },
     } };
-    var cols = [_]col.Column{c};
+    var cols = [_]Column{c};
     const b = Batch{ .schema = &schema, .columns = &cols, .len = 0 };
     try std.testing.expectEqual(@as(usize, 0), b.column("id").?.len);
 }

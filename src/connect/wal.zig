@@ -302,7 +302,7 @@ fn segSeqOf(name: []const u8, fname: []const u8) ?u64 {
 const types = @import("../lang/types.zig");
 const driver = @import("driver.zig");
 const request = @import("request.zig");
-const batchmod = @import("../exec/batch.zig");
+const Batch = @import("../exec/batch.zig").Batch;
 
 /// A `driver.Source` over a buffer directory: one batch per JSONL segment,
 /// ascending. Batch mode reads EVERY segment on disk (retained ones included —
@@ -315,7 +315,7 @@ pub const BufferSource = struct {
     arena_inst: std.heap.ArenaAllocator,
     dir: std.fs.Dir,
     name: []const u8,
-    schema: *types.Schema,
+    schema_: *types.Schema,
     segs: []u64,
     idx: usize = 0,
 
@@ -336,7 +336,7 @@ pub const BufferSource = struct {
             .arena_inst = std.heap.ArenaAllocator.init(gpa),
             .dir = undefined,
             .name = undefined,
-            .schema = undefined,
+            .schema_ = undefined,
             .segs = undefined,
         };
         errdefer self.arena_inst.deinit();
@@ -361,18 +361,40 @@ pub const BufferSource = struct {
         if (only != null and self.segs.len == 0) return error.SegmentNotFound;
 
         if (declared) |cols| {
-            self.schema = try request.schemaFromBodyCols(arena, cols);
+            self.schema_ = try request.schemaFromBodyCols(arena, cols);
         } else {
             if (self.segs.len == 0) return error.BufferEmpty;
             const first = try self.readSeg(arena, self.segs[0]);
             const items = try parseLines(arena, first);
-            self.schema = try request.inferSchema(arena, items);
+            self.schema_ = try request.inferSchema(arena, items);
         }
         return self;
     }
 
     pub fn source(self: *BufferSource) driver.Source {
         return .{ .ptr = self, .vtable = &buf_vtable };
+    }
+
+    pub fn schema(self: *BufferSource) types.Schema {
+        return self.schema_.*;
+    }
+
+    pub fn next(self: *BufferSource, arena: std.mem.Allocator) anyerror!?Batch {
+        while (self.idx < self.segs.len) {
+            const s = self.segs[self.idx];
+            self.idx += 1;
+            const text = try self.readSeg(arena, s);
+            const items = try parseLines(arena, text);
+            if (items.len == 0) continue;
+            return try request.batchFromJson(arena, self.schema_, items);
+        }
+        return null;
+    }
+
+    pub fn close(self: *BufferSource) void {
+        self.dir.close();
+        self.arena_inst.deinit();
+        self.gpa.destroy(self);
     }
 
     fn readSeg(self: *BufferSource, alloc: std.mem.Allocator, s: u64) ![]u8 {
@@ -395,32 +417,7 @@ fn parseLines(arena: std.mem.Allocator, text: []const u8) ![]std.json.Value {
     return items.toOwnedSlice();
 }
 
-const buf_vtable = driver.Source.VTable{ .schema = bufSchema, .next = bufNext, .close = bufClose };
-
-fn bufSchema(ptr: *anyopaque) types.Schema {
-    const self: *BufferSource = @ptrCast(@alignCast(ptr));
-    return self.schema.*;
-}
-
-fn bufNext(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?batchmod.Batch {
-    const self: *BufferSource = @ptrCast(@alignCast(ptr));
-    while (self.idx < self.segs.len) {
-        const s = self.segs[self.idx];
-        self.idx += 1;
-        const text = try self.readSeg(arena, s);
-        const items = try parseLines(arena, text);
-        if (items.len == 0) continue;
-        return try request.batchFromJson(arena, self.schema, items);
-    }
-    return null;
-}
-
-fn bufClose(ptr: *anyopaque) void {
-    const self: *BufferSource = @ptrCast(@alignCast(ptr));
-    self.dir.close();
-    self.arena_inst.deinit();
-    self.gpa.destroy(self);
-}
+const buf_vtable = driver.sourceVTable(BufferSource);
 
 fn segmentFileName(buf: []u8, name: []const u8, s: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{s}-{d:0>6}.jsonl", .{ name, s }) catch unreachable;

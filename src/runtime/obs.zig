@@ -10,9 +10,7 @@
 const std = @import("std");
 const driver = @import("../connect/driver.zig");
 const types = @import("../lang/types.zig");
-const batchmod = @import("../exec/batch.zig");
-
-const Batch = batchmod.Batch;
+const Batch = @import("../exec/batch.zig").Batch;
 
 /// Stderr log rendering. `auto` is the flag's default and an accepted alias; it
 /// resolves to text, same as `text`.

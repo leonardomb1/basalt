@@ -14,7 +14,7 @@
 const std = @import("std");
 const driver = @import("../connect/driver.zig");
 const op = @import("../exec/op.zig");
-const batchmod = @import("../exec/batch.zig");
+const Batch = @import("../exec/batch.zig").Batch;
 
 /// Opens a fresh source for one split predicate. `ctx` carries the connection
 /// config; the returned source is owned by the caller (closed by the lane).
@@ -32,7 +32,7 @@ pub const SinkMode = union(enum) {
 
 /// Write one batch through a lane's sink: a `shared` sink serializes on `mtx`;
 /// a `per_lane` sink (`own`, already opened by the lane) writes lock-free.
-pub fn writeLaneBatch(mode: SinkMode, mtx: *std.Thread.Mutex, own: ?driver.Sink, a: std.mem.Allocator, b: batchmod.Batch) !void {
+pub fn writeLaneBatch(mode: SinkMode, mtx: *std.Thread.Mutex, own: ?driver.Sink, a: std.mem.Allocator, b: Batch) !void {
     switch (mode) {
         .shared => |snk| {
             // Format first, lock second. Holding the mutex across the whole write made
@@ -65,7 +65,7 @@ pub const PipelinedSink = struct {
     gpa: std.mem.Allocator,
     mtx: std.Thread.Mutex = .{},
     cv: std.Thread.Condition = .{},
-    slot: ?batchmod.Batch = null,
+    slot: ?Batch = null,
     busy: bool = false,
     stop: bool = false,
     err: ?anyerror = null,
@@ -77,7 +77,7 @@ pub const PipelinedSink = struct {
 
     /// Hand a batch to the writer; blocks until the worker is idle (previous
     /// batch written). Returns the worker's pending error, if any.
-    pub fn submit(self: *PipelinedSink, b: batchmod.Batch) !void {
+    pub fn submit(self: *PipelinedSink, b: Batch) !void {
         self.mtx.lock();
         defer self.mtx.unlock();
         while ((self.slot != null or self.busy) and self.err == null) self.cv.wait(&self.mtx);
@@ -281,13 +281,13 @@ const FakeSplitSource = struct {
     fn vtSchema(_: *anyopaque) types.Schema {
         return test_empty_schema;
     }
-    fn vtNext(ptr: *anyopaque, _: std.mem.Allocator) anyerror!?batchmod.Batch {
+    fn vtNext(ptr: *anyopaque, _: std.mem.Allocator) anyerror!?Batch {
         const self: *FakeSplitSource = @ptrCast(@alignCast(ptr));
         if (self.fail_read) return error.SplitReadFailed;
         if (self.remaining == 0) return null;
         const n = @min(self.remaining, 2);
         self.remaining -= n;
-        return batchmod.Batch{ .schema = &test_empty_schema, .columns = &test_no_cols, .len = n };
+        return Batch{ .schema = &test_empty_schema, .columns = &test_no_cols, .len = n };
     }
     fn vtClose(ptr: *anyopaque) void {
         const self: *FakeSplitSource = @ptrCast(@alignCast(ptr));
@@ -319,7 +319,7 @@ const CountSink = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
     const vtable = driver.Sink.VTable{ .writeBatch = vtWrite, .close = vtClose, .abort = vtAbort };
-    fn vtWrite(ptr: *anyopaque, _: std.mem.Allocator, b: batchmod.Batch) anyerror!void {
+    fn vtWrite(ptr: *anyopaque, _: std.mem.Allocator, b: Batch) anyerror!void {
         const self: *CountSink = @ptrCast(@alignCast(ptr));
         self.rows += b.len;
     }
@@ -350,7 +350,7 @@ const LaneSink = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
     const vtable = driver.Sink.VTable{ .writeBatch = vtWrite, .close = vtClose, .abort = vtAbort };
-    fn vtWrite(ptr: *anyopaque, _: std.mem.Allocator, b: batchmod.Batch) anyerror!void {
+    fn vtWrite(ptr: *anyopaque, _: std.mem.Allocator, b: Batch) anyerror!void {
         const self: *LaneSink = @ptrCast(@alignCast(ptr));
         self.rows += b.len;
     }
@@ -386,7 +386,7 @@ const SeqSink = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
     const vtable = driver.Sink.VTable{ .writeBatch = vtWrite, .close = vtClose, .abort = vtAbort };
-    fn vtWrite(ptr: *anyopaque, _: std.mem.Allocator, b: batchmod.Batch) anyerror!void {
+    fn vtWrite(ptr: *anyopaque, _: std.mem.Allocator, b: Batch) anyerror!void {
         const self: *SeqSink = @ptrCast(@alignCast(ptr));
         self.writes += 1;
         if (self.fail_on != 0 and self.writes == self.fail_on) return error.SinkWriteFailed;
@@ -413,7 +413,7 @@ test "PipelinedSink: a write failure surfaces on a later submit or on finish" {
     var pw = PipelinedSink{ .snk = ss.sinkOf(), .gpa = std.testing.allocator };
     try pw.start();
     defer pw.shutdown();
-    const b = batchmod.Batch{ .schema = &test_empty_schema, .columns = &test_no_cols, .len = 1 };
+    const b = Batch{ .schema = &test_empty_schema, .columns = &test_no_cols, .len = 1 };
     var got: ?anyerror = null;
     for (0..4) |_| pw.submit(b) catch |e| {
         got = e;
@@ -446,7 +446,7 @@ test "writeLaneBatch: shared routes to the shared sink, per_lane to the lane's o
     var own = CountSink{};
     var totals = LaneSink.Totals{};
     var mtx = std.Thread.Mutex{};
-    const b = batchmod.Batch{ .schema = &test_empty_schema, .columns = &test_no_cols, .len = 3 };
+    const b = Batch{ .schema = &test_empty_schema, .columns = &test_no_cols, .len = 3 };
 
     try writeLaneBatch(.{ .shared = shared.sink() }, &mtx, null, testing.allocator, b);
     try testing.expectEqual(@as(usize, 3), shared.rows);

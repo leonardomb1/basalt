@@ -7,9 +7,7 @@
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
-const batchmod = @import("../exec/batch.zig");
-
-const Batch = batchmod.Batch;
+const Batch = @import("../exec/batch.zig").Batch;
 
 var g_abort = std.atomic.Value(bool).init(false);
 
@@ -160,3 +158,48 @@ pub const Sink = struct {
         self.vtable.abort(self.ptr);
     }
 };
+
+/// Builds the `*anyopaque` shims a driver needs to satisfy `Source.VTable`, from
+/// a concrete source type exposing `schema`/`next`/`close`.
+pub fn sourceVTable(comptime T: type) Source.VTable {
+    return .{
+        .schema = struct {
+            fn f(p: *anyopaque) types.Schema {
+                return @as(*T, @ptrCast(@alignCast(p))).schema();
+            }
+        }.f,
+        .next = struct {
+            fn f(p: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
+                return @as(*T, @ptrCast(@alignCast(p))).next(arena);
+            }
+        }.f,
+        .close = struct {
+            fn f(p: *anyopaque) void {
+                @as(*T, @ptrCast(@alignCast(p))).close();
+            }
+        }.f,
+    };
+}
+
+/// The `Sink.VTable` counterpart, from `writeBatch`/`close`/`abort`. The optional
+/// render/writeRendered pair stays null: sinks that split formatting from the
+/// locked append wire those by hand.
+pub fn sinkVTable(comptime T: type) Sink.VTable {
+    return .{
+        .writeBatch = struct {
+            fn f(p: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
+                return @as(*T, @ptrCast(@alignCast(p))).writeBatch(arena, b);
+            }
+        }.f,
+        .close = struct {
+            fn f(p: *anyopaque) anyerror!void {
+                return @as(*T, @ptrCast(@alignCast(p))).close();
+            }
+        }.f,
+        .abort = struct {
+            fn f(p: *anyopaque) void {
+                @as(*T, @ptrCast(@alignCast(p))).abort();
+            }
+        }.f,
+    };
+}

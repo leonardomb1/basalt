@@ -47,13 +47,13 @@
 const std = @import("std");
 const types = @import("../lang/types.zig");
 const ast = @import("../lang/ast.zig");
-const batchmod = @import("../exec/batch.zig");
+const Batch = @import("../exec/batch.zig").Batch;
 const driver = @import("driver.zig");
 const request = @import("request.zig");
-const tlsmod = @import("tls_client.zig");
+const ChainCapture = @import("tls_client.zig").ChainCapture;
+const init = @import("tls_client.zig").init;
 const obs = @import("../runtime/obs.zig");
 
-const Batch = batchmod.Batch;
 const json = std.json;
 
 /// std's verifier does no path building: it walks the server's chain strictly
@@ -66,7 +66,7 @@ const json = std.json;
 /// to an existing root — this only reorders trust the server already earned.
 /// Returns true if the bundle gained at least one certificate.
 pub fn repairBundle(gpa: std.mem.Allocator, bundle: *std.crypto.Certificate.Bundle, host: []const u8, port: u16) bool {
-    var cap = tlsmod.ChainCapture{};
+    var cap = ChainCapture{};
     harvestChain(gpa, host, port, &cap) catch return false;
     const now = std.time.timestamp();
     var added_any = false;
@@ -96,7 +96,7 @@ pub fn repairBundle(gpa: std.mem.Allocator, bundle: *std.crypto.Certificate.Bund
 /// Capture the certificate chain a server presents, trusting nothing: the
 /// hostname is still sent and checked (we need SNI to reach the right vhost)
 /// but the CA path is not verified.
-fn harvestChain(gpa: std.mem.Allocator, host: []const u8, port: u16, cap: *tlsmod.ChainCapture) !void {
+fn harvestChain(gpa: std.mem.Allocator, host: []const u8, port: u16, cap: *ChainCapture) !void {
     const stream = try std.net.tcpConnectToHost(gpa, host, port);
     defer stream.close();
     var in_buf: [std.crypto.tls.max_ciphertext_record_len]u8 = undefined;
@@ -105,7 +105,7 @@ fn harvestChain(gpa: std.mem.Allocator, host: []const u8, port: u16, cap: *tlsmo
     var sw = stream.writer(&out_buf);
     var wbuf: [std.crypto.tls.max_ciphertext_record_len]u8 = undefined;
     var rbuf: [std.crypto.tls.max_ciphertext_record_len * 2]u8 = undefined;
-    _ = try tlsmod.init(sr.interface(), &sw.interface, .{
+    _ = try init(sr.interface(), &sw.interface, .{
         .host = .{ .explicit = host },
         .ca = .no_verification,
         .chain = cap,

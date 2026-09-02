@@ -268,8 +268,8 @@ test "readKey decodes escape sequences, controls, and plain bytes" {
     std.posix.close(w);
 
     const expect = [_]Key{
-        .{ .char = 'a' }, .up,    .down,      .right,     .left, .delete, .home, .end,
-        .backspace,       .enter, .interrupt, .home,      .end,  .kill_end, .kill_line,
+        .{ .char = 'a' }, .up,    .down,      .right, .left, .delete,   .home,      .end,
+        .backspace,       .enter, .interrupt, .home,  .end,  .kill_end, .kill_line,
     };
     for (expect) |want| {
         const got = try readKey(fds[0]);

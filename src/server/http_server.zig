@@ -12,8 +12,25 @@ const ast = @import("../lang/ast.zig");
 const parser = @import("../lang/sql_parser.zig");
 const include = @import("../lang/include.zig");
 const runtime = @import("../runtime/run.zig");
-const walmod = @import("../connect/wal.zig");
+const obs = @import("../runtime/obs.zig");
+const Wal = @import("../connect/wal.zig").Wal;
 const request = @import("../connect/request.zig");
+
+/// The host's own logger, in the format and at the level the CLI asked for, so
+/// `--log-format json` covers route loads, reloads and flush failures — not just
+/// the runs they trigger. One per process: every route and the flusher share it.
+var g_log: obs.Logger = undefined;
+var g_log_cfg: runtime.LogConfig = .{};
+
+fn log(level: obs.Level, comptime fmt: []const u8, args: anytype) void {
+    g_log.log(level, fmt, args);
+}
+
+fn initLog(cfg: runtime.LogConfig) void {
+    g_log_cfg = cfg;
+    g_log = obs.Logger.init(0, cfg.format, if (cfg.quiet) .err else cfg.level);
+    g_log.quiet = cfg.quiet;
+}
 
 pub const Route = struct {
     path: []const u8,
@@ -28,7 +45,7 @@ pub const Route = struct {
 
 /// Shared state of one buffered endpoint (accept loop + flusher thread).
 pub const BufState = struct {
-    wal: walmod.Wal,
+    wal: Wal,
     decl: ast.BufferDecl,
     program: ast.Program,
     flush_secs: u64 = 5,
@@ -57,7 +74,7 @@ pub fn initBufState(gpa: std.mem.Allocator, program: ast.Program) !?*BufState {
     const bs = try gpa.create(BufState);
     errdefer gpa.destroy(bs);
     bs.* = .{
-        .wal = try walmod.Wal.open(gpa, decl.dir, decl.name, decl.segment_bytes),
+        .wal = try Wal.open(gpa, decl.dir, decl.name, decl.segment_bytes),
         .decl = decl,
         .program = program,
         .max_bytes = decl.max_bytes,
@@ -117,7 +134,7 @@ pub fn acceptIntoBuffer(bs: *BufState, arena: std.mem.Allocator, body: []const u
 /// stops the drain (order preserved); it retries on the next flush tick.
 pub fn drainPending(gpa: std.mem.Allocator, bs: *BufState) void {
     const pending = bs.wal.pendingSegments(gpa) catch |e| {
-        std.debug.print("buffer {s}: listing segments failed: {s}\n", .{ bs.decl.name, @errorName(e) });
+        log(.err, "buffer {s}: listing segments failed: {s}", .{ bs.decl.name, @errorName(e) });
         return;
     };
     defer gpa.free(pending);
@@ -129,13 +146,13 @@ pub fn drainPending(gpa: std.mem.Allocator, bs: *BufState) void {
             .buffer_segment = s,
             .load_label_prefix = label,
             .load_run_id = s,
-            .log = .{ .summary = .stderr, .level = .info },
+            .log = g_log_cfg,
         }, &diag) catch |e| {
-            std.debug.print("buffer {s}: flush of segment {d} failed: {s} ({s}) — will retry\n", .{ bs.decl.name, s, @errorName(e), diag.msg });
+            log(.err, "buffer {s}: flush of segment {d} failed: {s} ({s}) — will retry", .{ bs.decl.name, s, @errorName(e), diag.msg });
             return;
         };
         bs.wal.markLoaded(s) catch |e| {
-            std.debug.print("buffer {s}: manifest update failed after segment {d}: {s}\n", .{ bs.decl.name, s, @errorName(e) });
+            log(.err, "buffer {s}: manifest update failed after segment {d}: {s}", .{ bs.decl.name, s, @errorName(e) });
             return;
         };
         if (bs.decl.retain_hours == null) _ = bs.wal.purgeLoaded() catch 0;
@@ -154,7 +171,7 @@ fn flusherMain(gpa: std.mem.Allocator, bs: *BufState) void {
         last = now;
         bs.rows_since.store(0, .seq_cst);
         bs.wal.rotateIfNonEmpty() catch |e| {
-            std.debug.print("buffer {s}: rotate failed: {s}\n", .{ bs.decl.name, @errorName(e) });
+            log(.err, "buffer {s}: rotate failed: {s}", .{ bs.decl.name, @errorName(e) });
             continue;
         };
         drainPending(gpa, bs);
@@ -201,17 +218,18 @@ fn listen(port: u16) !std.net.Server {
 }
 
 fn banner(port: u16, routes: []const Route) void {
-    std.debug.print("basalt serving {d} route(s) on http://0.0.0.0:{d}\n", .{ routes.len, port });
+    log(.info, "basalt serving {d} route(s) on http://0.0.0.0:{d}", .{ routes.len, port });
     for (routes) |r| {
         if (r.doc.len > 0)
-            std.debug.print("  {s}  <- {s}  — {s}\n", .{ r.path, r.label, r.doc })
+            log(.info, "route {s} <- {s} — {s}", .{ r.path, r.label, r.doc })
         else
-            std.debug.print("  {s}  <- {s}\n", .{ r.path, r.label });
+            log(.info, "route {s} <- {s}", .{ r.path, r.label });
     }
 }
 
 /// Serve a single `@http` program.
-pub fn serve(gpa: std.mem.Allocator, program: ast.Program, port: u16) !void {
+pub fn serve(gpa: std.mem.Allocator, program: ast.Program, port: u16, log_cfg: runtime.LogConfig) !void {
+    initLog(log_cfg);
     const bs = try initBufState(gpa, program);
     defer if (bs) |b| {
         b.shutdown();
@@ -261,18 +279,18 @@ fn loadDir(gpa: std.mem.Allocator, dir_path: []const u8) !Registry {
     while (try it.next()) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".sql")) continue;
         const text = dir.readFileAlloc(a, entry.name, 8 << 20) catch |e| {
-            std.debug.print("skip {s}: read failed: {s}\n", .{ entry.name, @errorName(e) });
+            log(.warn, "skip {s}: read failed: {s}", .{ entry.name, @errorName(e) });
             continue;
         };
         // `@include` paths in an endpoint script resolve against the served dir.
         var pdiag: include.Diag = .{};
         const prog = include.loadProgram(a, text, entry.name, dir_path, &pdiag) catch {
             const at = if (pdiag.label.len > 0) pdiag.label else entry.name;
-            std.debug.print("skip {s}: {s}:{d}:{d}: {s}\n", .{ entry.name, at, pdiag.parse.line, pdiag.parse.col, pdiag.parse.msg });
+            log(.warn, "skip {s}: {s}:{d}:{d}: {s}", .{ entry.name, at, pdiag.parse.line, pdiag.parse.col, pdiag.parse.msg });
             continue;
         };
         if (prog.stmts.len == 0 or prog.stmts[0] != .kind or prog.stmts[0].kind.kind != .http) {
-            std.debug.print("skip {s}: not an @http script\n", .{entry.name});
+            log(.warn, "skip {s}: not an @http script", .{entry.name});
             continue;
         }
         const label = try a.dupe(u8, entry.name);
@@ -280,18 +298,18 @@ fn loadDir(gpa: std.mem.Allocator, dir_path: []const u8) !Registry {
         var dup = false;
         for (routes.items) |r| {
             if (std.mem.eql(u8, r.path, path)) {
-                std.debug.print("skip {s}: path `{s}` already served by {s}\n", .{ entry.name, path, r.label });
+                log(.warn, "skip {s}: path `{s}` already served by {s}", .{ entry.name, path, r.label });
                 dup = true;
                 break;
             }
         }
         if (dup) continue;
         const bs = initBufState(gpa, prog) catch |e| {
-            std.debug.print("skip {s}: buffer setup failed: {s}\n", .{ entry.name, @errorName(e) });
+            log(.warn, "skip {s}: buffer setup failed: {s}", .{ entry.name, @errorName(e) });
             continue;
         };
         if (bs) |b| startFlusher(gpa, b) catch |e| {
-            std.debug.print("skip {s}: flusher spawn failed: {s}\n", .{ entry.name, @errorName(e) });
+            log(.warn, "skip {s}: flusher spawn failed: {s}", .{ entry.name, @errorName(e) });
             b.shutdown();
             gpa.destroy(b);
             continue;
@@ -323,13 +341,14 @@ fn dirFingerprint(dir_path: []const u8) u64 {
 /// Serve every `@http` script in a directory, routing by path. Reloads on SIGHUP,
 /// and — when `watch` is set — automatically when the directory's contents change
 /// (e.g. a git-sync sidecar pulled new scripts), checked at most every ~2s.
-pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, port: u16, watch: bool) !void {
+pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, port: u16, watch: bool, log_cfg: runtime.LogConfig) !void {
+    initLog(log_cfg);
     var reg = try loadDir(gpa, dir_path);
     defer reg.deinit();
     var net_server = try listen(port);
     defer net_server.deinit();
     banner(port, reg.routes);
-    if (watch) std.debug.print("watching {s} for changes\n", .{dir_path});
+    if (watch) log(.info, "watching {s} for changes", .{dir_path});
     const threads = std.Thread.getCpuCount() catch 1;
     var read_buf: [64 * 1024]u8 = undefined;
     var fp: u64 = if (watch) dirFingerprint(dir_path) else 0;
@@ -352,9 +371,9 @@ pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, port: u16, watch: 
                 reg.deinit();
                 reg = new_reg;
                 if (watch) fp = dirFingerprint(dir_path);
-                std.debug.print("reloaded {s}\n", .{dir_path});
+                log(.info, "reloaded {s}", .{dir_path});
                 banner(port, reg.routes);
-            } else |e| std.debug.print("reload failed (keeping current routes): {s}\n", .{@errorName(e)});
+            } else |e| log(.err, "reload failed (keeping current routes): {s}", .{@errorName(e)});
         }
         const conn = net_server.accept() catch continue;
         handleConn(gpa, reg.routes, conn, &read_buf, threads) catch {};
@@ -444,7 +463,7 @@ fn handleConn(gpa: std.mem.Allocator, routes: []const Route, conn: std.net.Serve
         var diag: runtime.Diag = .{};
         var sink = runtime.OutcomeSink.init(gpa);
         defer sink.deinit();
-        const result = runtime.run(gpa, route.program, .{ .params = params.items, .request_body = body, .threads = threads, .outcomes = &sink, .log = .{ .summary = .stderr, .level = .info } }, &diag);
+        const result = runtime.run(gpa, route.program, .{ .params = params.items, .request_body = body, .threads = threads, .outcomes = &sink, .log = g_log_cfg }, &diag);
 
         var out = std.array_list.Managed(u8).init(gpa);
         defer out.deinit();
@@ -476,7 +495,9 @@ fn handleConn(gpa: std.mem.Allocator, routes: []const Route, conn: std.net.Serve
             const transient = diag.retryable or runtime.isTransient(err);
             status = if (transient) .service_unavailable else .unprocessable_entity;
             retry_after = transient;
-            try w.print("{{\"status\":\"error\",\"retryable\":{},\"error\":\"", .{transient});
+            try w.print("{{\"status\":\"error\",\"retryable\":{},", .{transient});
+            if (diag.pos) |p| try w.print("\"line\":{d},\"col\":{d},", .{ p.line, p.col });
+            try w.writeAll("\"error\":\"");
             try writeJsonStr(w, @errorName(err));
             try w.writeAll(": ");
             try writeJsonStr(w, diag.msg);

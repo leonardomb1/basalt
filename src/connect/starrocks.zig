@@ -10,15 +10,12 @@
 const std = @import("std");
 const types = @import("../lang/types.zig");
 const ast = @import("../lang/ast.zig");
-const batchmod = @import("../exec/batch.zig");
-const eval = @import("../exec/eval.zig");
+const Batch = @import("../exec/batch.zig").Batch;
 const driver = @import("driver.zig");
 const mysql = @import("mysql.zig");
-const sqlmod = @import("sql.zig");
+const sql = @import("sql.zig");
 const obs = @import("../runtime/obs.zig");
 const op = @import("../exec/op.zig");
-
-const Batch = batchmod.Batch;
 
 const FLUSH_BYTES = 8 * 1024 * 1024;
 
@@ -36,22 +33,13 @@ pub const Config = struct {
     run_id: u64 = 0,
 };
 
+/// The StarRocks column type for an engine type (`sql.Dialect.starrocks.ddlType`).
 pub fn srType(arena: std.mem.Allocator, t: types.Type) ![]const u8 {
-    return switch (t.kind) {
-        .bool => "BOOLEAN",
-        .int => "BIGINT",
-        .float => "DOUBLE",
-        .decimal => try std.fmt.allocPrint(arena, "DECIMAL({d},{d})", .{ t.precision, t.scale }),
-        .string => "VARCHAR(65533)",
-        .bytes => "STRING",
-        .date => "DATE",
-        .time => "VARCHAR(32)",
-        .timestamp => "DATETIME",
-        .array => "STRING",
-        .@"struct" => "JSON",
-    };
+    return sql.Dialect.starrocks.ddlType(arena, t, false);
 }
 
+/// `CREATE TABLE IF NOT EXISTS` for `db`.`table` — the shared DDL builder with
+/// the StarRocks table-model clauses; see `sql.createTableSqlWith`.
 pub fn genCreateTable(
     arena: std.mem.Allocator,
     db: []const u8,
@@ -61,66 +49,9 @@ pub fn genCreateTable(
     buckets: u32,
     replication_num: u32,
 ) ![]const u8 {
-    const is_pk = (mode == .upsert);
-    const keys: []const []const u8 = switch (mode) {
-        .upsert => |u| u.keys,
-        else => &.{schema.fields[0].name},
-    };
-    if (is_pk and keys.len == 0) return error.UpsertKeysUnresolved;
-
-    var ordered = std.array_list.Managed(types.Schema.Field).init(arena);
-    if (is_pk) {
-        for (keys) |k| {
-            const f = findField(schema, k) orelse return error.UnknownKeyColumn;
-            try ordered.append(f);
-        }
-        for (schema.fields) |f| {
-            if (!nameIn(keys, f.name)) try ordered.append(f);
-        }
-    } else {
-        for (schema.fields) |f| try ordered.append(f);
-    }
-
-    var buf = std.array_list.Managed(u8).init(arena);
-    const w = buf.writer();
-    try w.print("CREATE TABLE IF NOT EXISTS `{s}`.`{s}` (\n", .{ db, table });
-    for (ordered.items, 0..) |f, i| {
-        const not_null = is_pk and nameIn(keys, f.name);
-        try w.print("  `{s}` {s}{s}", .{ f.name, try srType(arena, f.ty), if (not_null) " NOT NULL" else "" });
-        if (i + 1 < ordered.items.len) try w.writeByte(',');
-        try w.writeByte('\n');
-    }
-    try w.writeAll(") ENGINE=OLAP\n");
-    if (is_pk) {
-        try w.writeAll("PRIMARY KEY(");
-        for (keys, 0..) |k, i| {
-            if (i > 0) try w.writeByte(',');
-            try w.print("`{s}`", .{k});
-        }
-        try w.writeAll(")\n");
-    } else {
-        try w.print("DUPLICATE KEY(`{s}`)\n", .{keys[0]});
-    }
-    try w.writeAll("DISTRIBUTED BY HASH(");
-    if (is_pk) {
-        for (keys, 0..) |k, i| {
-            if (i > 0) try w.writeByte(',');
-            try w.print("`{s}`", .{k});
-        }
-    } else try w.print("`{s}`", .{keys[0]});
-    try w.print(") BUCKETS {d}\n", .{buckets});
-    try w.print("PROPERTIES(\"replication_num\"=\"{d}\");", .{replication_num});
-    return buf.toOwnedSlice();
+    const qtable = try std.fmt.allocPrint(arena, "`{s}`.`{s}`", .{ db, table });
+    return sql.createTableSqlWith(arena, .starrocks, qtable, schema, mode, .{ .buckets = buckets, .replication_num = replication_num });
 }
-
-fn findField(schema: types.Schema, name: []const u8) ?types.Schema.Field {
-    for (schema.fields) |f| {
-        if (std.mem.eql(u8, f.name, name)) return f;
-    }
-    return null;
-}
-
-const nameIn = sqlmod.nameIn;
 
 /// Stream Load label: `<prefix>_<table>_<run_id>_<seq>`. The label makes each flush
 /// at-most-once within a run (StarRocks rejects a duplicate label). It does NOT give
@@ -150,16 +81,7 @@ pub fn genLabel(arena: std.mem.Allocator, prefix: []const u8, table: []const u8,
 /// payroll APIs emitting keys like "extra noturna 110"), which the header's
 /// SQL-ish parser would otherwise reject.
 pub fn columnList(arena: std.mem.Allocator, schema: types.Schema) ![]const u8 {
-    var buf = std.array_list.Managed(u8).init(arena);
-    for (schema.fields, 0..) |f, i| {
-        if (i > 0) try buf.append(',');
-        try buf.append('`');
-        for (f.name) |c| {
-            if (c != '`') try buf.append(c);
-        }
-        try buf.append('`');
-    }
-    return buf.toOwnedSlice();
+    return sql.colList(arena, .starrocks, schema);
 }
 
 /// Append a batch to the load buffer. Fields are separated by 0x01 (`\x01`, set
@@ -183,7 +105,7 @@ pub fn appendBatchTsv(w: anytype, arena: std.mem.Allocator, batch: Batch) !void 
             if (v.isNull()) {
                 try w.writeAll(NULL_MARKER);
             } else {
-                const s = try eval.valueToString(arena, v);
+                const s = try sql.valueText(arena, v, .{ .bool_true = "true", .bool_false = "false" });
                 // StarRocks CSV has no escape for the null marker: a field whose
                 // bytes are exactly `\N` is NULL whatever we do — `enclose` does
                 // not exempt it, and backslashes are never unescaped, so `\\N`
@@ -295,21 +217,21 @@ pub const StreamLoadSink = struct {
         return .{ .ptr = self, .vtable = &sink_vtable };
     }
 
-    fn runDDL(self: *StreamLoadSink, sql: []const u8) !void {
+    fn runDDL(self: *StreamLoadSink, stmt: []const u8) !void {
         const conn = try mysql.Conn.connect(self.gpa, self.cfg.fe_host, self.cfg.fe_port, self.cfg.user, self.cfg.password, "", .off);
         defer conn.close();
-        conn.exec(sql) catch |e| {
-            obs.logOr(self.logger, .err, "starrocks DDL error: {s} (sql: {s})", .{ conn.last_error, sql });
+        conn.exec(stmt) catch |e| {
+            obs.logOr(self.logger, .err, "starrocks DDL error: {s} (sql: {s})", .{ conn.last_error, stmt });
             return e;
         };
     }
 
-    fn writeBatch(self: *StreamLoadSink, arena: std.mem.Allocator, batch: Batch) !void {
+    pub fn writeBatch(self: *StreamLoadSink, arena: std.mem.Allocator, batch: Batch) !void {
         try appendBatchTsv(self.buffer.writer(), arena, batch);
         if (self.buffer.items.len >= FLUSH_BYTES) try self.flush();
     }
 
-    fn closeImpl(self: *StreamLoadSink) !void {
+    pub fn close(self: *StreamLoadSink) !void {
         defer self.teardown();
         try self.flush();
     }
@@ -317,7 +239,7 @@ pub const StreamLoadSink = struct {
     /// Failure path: drop the buffered TSV without a final Stream Load. Loads
     /// that already went out are committed server-side and stay (downstream
     /// dedup owns exactly-once, per the label scheme above).
-    fn abortImpl(self: *StreamLoadSink) void {
+    pub fn abort(self: *StreamLoadSink) void {
         self.teardown();
     }
 
@@ -442,20 +364,7 @@ test "loadSucceeded accepts success, publish timeout, and duplicate label" {
     try std.testing.expect(!loadSucceeded("{\"Status\": \"Fail\", \"Message\": \"too many filtered rows\"}"));
 }
 
-const sink_vtable = driver.Sink.VTable{ .writeBatch = slWrite, .close = slClose, .abort = slAbort };
-
-fn slWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
-    const self: *StreamLoadSink = @ptrCast(@alignCast(ptr));
-    return self.writeBatch(arena, b);
-}
-fn slClose(ptr: *anyopaque) anyerror!void {
-    const self: *StreamLoadSink = @ptrCast(@alignCast(ptr));
-    return self.closeImpl();
-}
-fn slAbort(ptr: *anyopaque) void {
-    const self: *StreamLoadSink = @ptrCast(@alignCast(ptr));
-    self.abortImpl();
-}
+const sink_vtable = driver.sinkVTable(StreamLoadSink);
 
 test "type mapping" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -476,12 +385,12 @@ test "create table: append -> Duplicate Key" {
         .{ .name = "id", .ty = types.Type.init(.int) },
         .{ .name = "name", .ty = types.Type.init(.string) },
     } };
-    const sql = try genCreateTable(a, "warehouse", "orders", schema, .append, 4, 1);
-    try std.testing.expect(std.mem.indexOf(u8, sql, "CREATE TABLE IF NOT EXISTS `warehouse`.`orders`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sql, "`id` BIGINT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sql, "`name` VARCHAR(65533)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sql, "DUPLICATE KEY(`id`)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sql, "BUCKETS 4") != null);
+    const stmt = try genCreateTable(a, "warehouse", "orders", schema, .append, 4, 1);
+    try std.testing.expect(std.mem.indexOf(u8, stmt, "CREATE TABLE IF NOT EXISTS `warehouse`.`orders`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stmt, "`id` BIGINT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stmt, "`name` VARCHAR(65533)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stmt, "DUPLICATE KEY(`id`)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stmt, "BUCKETS 4") != null);
 }
 
 test "create table: inferred upsert with unresolved (empty) keys errors" {
@@ -503,12 +412,12 @@ test "create table: composite inferred upsert -> multi-col PRIMARY KEY, ordered 
         .{ .name = "recno", .ty = types.Type.init(.int) },
     } };
     const mode = ast.WriteMode{ .upsert = .{ .keys = &.{ "emp", "recno" }, .partial = null } };
-    const sql = try genCreateTable(ar.allocator(), "bronze", "t", schema, mode, 4, 1);
-    try std.testing.expect(std.mem.indexOf(u8, sql, "PRIMARY KEY(`emp`,`recno`)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sql, "`emp` VARCHAR(65533) NOT NULL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sql, "`recno` BIGINT NOT NULL") != null);
-    const epos = std.mem.indexOf(u8, sql, "`emp`").?;
-    const ppos = std.mem.indexOf(u8, sql, "`payload`").?;
+    const stmt = try genCreateTable(ar.allocator(), "bronze", "t", schema, mode, 4, 1);
+    try std.testing.expect(std.mem.indexOf(u8, stmt, "PRIMARY KEY(`emp`,`recno`)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stmt, "`emp` VARCHAR(65533) NOT NULL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stmt, "`recno` BIGINT NOT NULL") != null);
+    const epos = std.mem.indexOf(u8, stmt, "`emp`").?;
+    const ppos = std.mem.indexOf(u8, stmt, "`payload`").?;
     try std.testing.expect(epos < ppos);
 }
 
@@ -521,11 +430,11 @@ test "create table: upsert -> Primary Key, keys first + NOT NULL" {
         .{ .name = "id", .ty = types.Type.init(.int) },
     } };
     const mode = ast.WriteMode{ .upsert = .{ .keys = &.{"id"} } };
-    const sql = try genCreateTable(a, "warehouse", "orders", schema, mode, 4, 1);
-    try std.testing.expect(std.mem.indexOf(u8, sql, "PRIMARY KEY(`id`)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sql, "`id` BIGINT NOT NULL") != null);
-    const ipos = std.mem.indexOf(u8, sql, "`id`").?;
-    const npos = std.mem.indexOf(u8, sql, "`name`").?;
+    const stmt = try genCreateTable(a, "warehouse", "orders", schema, mode, 4, 1);
+    try std.testing.expect(std.mem.indexOf(u8, stmt, "PRIMARY KEY(`id`)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stmt, "`id` BIGINT NOT NULL") != null);
+    const ipos = std.mem.indexOf(u8, stmt, "`id`").?;
+    const npos = std.mem.indexOf(u8, stmt, "`name`").?;
     try std.testing.expect(ipos < npos);
 }
 

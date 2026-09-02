@@ -325,10 +325,9 @@ pub fn main() !void {
 
         const b_out = try std.fmt.allocPrint(a, "{s}/{s}-basalt", .{ opts.out, q.name });
         r.basalt = try measure(a, &.{
-            opts.bin,          "run", q.script,
-            "-p",              try std.fmt.allocPrint(a, "data={s}", .{opts.data}),
-            "-p",              try std.fmt.allocPrint(a, "out={s}", .{b_out}),
-            "--quiet",
+            opts.bin,                                       "run",                                               q.script,
+            "-p",                                           try std.fmt.allocPrint(a, "data={s}", .{opts.data}), "-p",
+            try std.fmt.allocPrint(a, "out={s}", .{b_out}), "--quiet",
         }, opts.reps);
 
         const b_csv = try std.fmt.allocPrint(a, "{s}.csv", .{b_out});

@@ -11,15 +11,16 @@
 const std = @import("std");
 const parser = @import("../lang/sql_parser.zig");
 const include = @import("../lang/include.zig");
-const linemod = @import("line.zig");
+const Editor = @import("line.zig").Editor;
+const LineResult = @import("line.zig").Result;
 const ast = @import("../lang/ast.zig");
 const runtime = @import("../runtime/run.zig");
 const obs = @import("../runtime/obs.zig");
 const analyze = @import("../runtime/analyze.zig");
-const server = @import("../server/http.zig");
+const http_server = @import("../server/http_server.zig");
 
 /// SIGTERM/SIGINT → ask the run to stop at its next boundary (async-signal-safe:
-/// one atomic store). The control plane uses this to cancel a job or roll a server.
+/// one atomic store). The control plane uses this to cancel a job or roll a http_server.
 /// A second signal means "stop being graceful": exit 130 on the spot, so an
 /// interactive ^C ^C isn't held hostage by a slow upstream read.
 fn onTerminate(_: i32) callconv(.c) void {
@@ -65,6 +66,12 @@ pub fn run(alloc: std.mem.Allocator) !void {
         std.process.exit(try cmdServe(alloc, args));
     } else if (std.mem.eql(u8, verb, "repl")) {
         std.process.exit(try cmdRepl(alloc));
+    } else if (std.mem.eql(u8, verb, "version") or std.mem.eql(u8, verb, "--version") or std.mem.eql(u8, verb, "-V")) {
+        var stdout_buf: [256]u8 = undefined;
+        var stdout_file = std.fs.File.stdout().writer(&stdout_buf);
+        try stdout_file.interface.print("basalt {s}\n", .{@import("build_options").version});
+        try stdout_file.interface.flush();
+        return;
     } else if (std.mem.eql(u8, verb, "help") or std.mem.eql(u8, verb, "-h") or std.mem.eql(u8, verb, "--help")) {
         var stdout_buf: [4096]u8 = undefined;
         var stdout_file = std.fs.File.stdout().writer(&stdout_buf);
@@ -121,6 +128,31 @@ fn loadSource(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8, stderr
     return Source{ .label = path, .text = text, .dir = std.fs.path.dirname(path) orelse "." };
 }
 
+/// A dash-prefixed argument no branch claimed. `-` alone is the stdin script,
+/// not an option. Reports it and returns true so the caller can exit 2 — a typo
+/// like `--treads` used to run single-threaded without a word.
+fn unknownOption(arg: []const u8, verb: []const u8, stderr: *std.Io.Writer) !bool {
+    if (arg.len < 2 or arg[0] != '-') return false;
+    try stderr.print("error: unknown option `{s}` for `{s}` — see `basalt help`\n", .{ arg, verb });
+    return true;
+}
+
+fn parseLogFormat(v: []const u8) ?obs.Format {
+    if (std.mem.eql(u8, v, "text")) return .text;
+    if (std.mem.eql(u8, v, "json")) return .json;
+    if (std.mem.eql(u8, v, "auto")) return .auto;
+    return null;
+}
+
+/// `label:line:col: error: msg` when the diagnostic carries a position, else
+/// `label: error: msg` — the same shape parse errors already print.
+fn printDiag(stderr: *std.Io.Writer, label: []const u8, tag: []const u8, pos: ?ast.Pos, msg: []const u8) !void {
+    if (pos) |p|
+        try stderr.print("{s}:{d}:{d}: error{s}: {s}\n", .{ label, p.line, p.col, tag, msg })
+    else
+        try stderr.print("{s}: error{s}: {s}\n", .{ label, tag, msg });
+}
+
 /// Parse a resolved source (resolving its `@include` header first), printing a
 /// located diagnostic on failure. The AST is allocated in `arena` and slices into
 /// `src.text` and the included files' texts, so all must outlive use. The
@@ -158,7 +190,14 @@ fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var overrides = std.array_list.Managed(analyze.ParamOverride).init(a);
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
-        if (!std.mem.eql(u8, args[i], "-p") and !std.mem.eql(u8, args[i], "--param")) continue;
+        if (std.mem.eql(u8, args[i], "-c") or std.mem.eql(u8, args[i], "--command")) {
+            i += 1;
+            continue;
+        }
+        if (!std.mem.eql(u8, args[i], "-p") and !std.mem.eql(u8, args[i], "--param")) {
+            if (try unknownOption(args[i], "check", stderr)) return 2;
+            continue;
+        }
         i += 1;
         if (i >= args.len) {
             try stderr.print("error: missing key=value after `-p`\n", .{});
@@ -175,7 +214,7 @@ fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     _ = analyze.analyzeWith(a, prog, overrides.items, &adiag) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.AnalyzeFailed => {
-            try stderr.print("{s}: error: {s}\n", .{ src.label, adiag.msg });
+            try printDiag(stderr, src.label, "", adiag.pos, adiag.msg);
             return 1;
         },
     };
@@ -201,6 +240,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var port: u16 = 8080;
     var threads: usize = std.Thread.getCpuCount() catch 1;
     var log = runtime.LogConfig{};
+    var level_set = false;
     var stdout_json = false;
     var explain = false;
     var i: usize = 2;
@@ -228,7 +268,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             log.quiet = true;
         } else if (std.mem.eql(u8, a, "--log-format")) {
             const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
-            log.format = if (std.mem.eql(u8, v, "text")) .text else if (std.mem.eql(u8, v, "json")) .json else if (std.mem.eql(u8, v, "auto")) .auto else {
+            log.format = parseLogFormat(v) orelse {
                 try stderr.print("error: --log-format must be auto|text|json\n", .{});
                 return 2;
             };
@@ -238,6 +278,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
                 try stderr.print("error: --log-level must be error|warn|info|debug\n", .{});
                 return 2;
             };
+            level_set = true;
         } else if (std.mem.eql(u8, a, "-p") or std.mem.eql(u8, a, "--param")) {
             const kv = (try nextVal(args, &i, a, stderr)) orelse return 2;
             const eqp = std.mem.indexOfScalar(u8, kv, '=') orelse {
@@ -251,11 +292,11 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
                 try stderr.print("error: invalid --port `{s}`\n", .{v});
                 return 2;
             };
-        }
+        } else if (try unknownOption(a, "run", stderr)) return 2;
     }
 
     if (prog.stmts.len > 0 and prog.stmts[0] == .kind and prog.stmts[0].kind.kind == .http) {
-        server.serve(alloc, prog, port) catch |e| {
+        http_server.serve(alloc, prog, port, .{ .format = log.format, .level = if (level_set) log.level else .info, .quiet = log.quiet, .summary = .stderr }) catch |e| {
             try stderr.print("{s}: serve error: {s}\n", .{ src.label, @errorName(e) });
             return 1;
         };
@@ -271,7 +312,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         const plan = analyze.analyze(arena.allocator(), prog, &adiag2) catch |e| switch (e) {
             error.OutOfMemory => return e,
             error.AnalyzeFailed => {
-                try stderr.print("{s}: error: {s}\n", .{ src.label, adiag2.msg });
+                try printDiag(stderr, src.label, "", adiag2.pos, adiag2.msg);
                 return 1;
             },
         };
@@ -291,7 +332,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         },
         error.PlanFailed => {
             const tag = if (diag.retryable) " (transient)" else "";
-            try stderr.print("{s}: error{s}: {s}\n", .{ src.label, tag, diag.msg });
+            try printDiag(stderr, src.label, tag, diag.pos, diag.msg);
             return if (diag.retryable) 75 else 1;
         },
         error.OutOfMemory => return e,
@@ -299,7 +340,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             const transient = diag.retryable or runtime.isTransient(e);
             const tag = if (transient) " (transient)" else "";
             if (diag.msg.len > 0)
-                try stderr.print("{s}: error{s}: {s}\n", .{ src.label, tag, diag.msg })
+                try printDiag(stderr, src.label, tag, diag.pos, diag.msg)
             else
                 try stderr.print("{s}: runtime error{s}: {s}\n", .{ src.label, tag, runtime.errLabel(e) });
             return if (transient) 75 else 1;
@@ -336,6 +377,9 @@ fn cmdServe(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
 
     var port: u16 = 8080;
     var watch = false;
+    // A host's own lines (routes, reloads, flush failures) are its output, so
+    // the default is `info` where a one-shot run defaults to `warn`.
+    var log = runtime.LogConfig{ .level = .info, .summary = .stderr };
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--port") or std.mem.eql(u8, args[i], "-p")) {
@@ -346,10 +390,24 @@ fn cmdServe(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             };
         } else if (std.mem.eql(u8, args[i], "--watch") or std.mem.eql(u8, args[i], "-w")) {
             watch = true;
-        }
+        } else if (std.mem.eql(u8, args[i], "--log-format")) {
+            const v = (try nextVal(args, &i, "--log-format", stderr)) orelse return 2;
+            log.format = parseLogFormat(v) orelse {
+                try stderr.print("error: --log-format must be auto|text|json\n", .{});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, args[i], "--log-level")) {
+            const v = (try nextVal(args, &i, "--log-level", stderr)) orelse return 2;
+            log.level = obs.Level.parse(v) orelse {
+                try stderr.print("error: --log-level must be error|warn|info|debug\n", .{});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, args[i], "--quiet") or std.mem.eql(u8, args[i], "-q")) {
+            log.quiet = true;
+        } else if (try unknownOption(args[i], "serve", stderr)) return 2;
     }
 
-    server.serveDir(alloc, dir, port, watch) catch |e| {
+    http_server.serveDir(alloc, dir, port, watch, log) catch |e| {
         try stderr.print("serve error: {s}\n", .{@errorName(e)});
         return 1;
     };
@@ -568,7 +626,7 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
     var sess = Session{ .decls = DeclStore.init(alloc), .tty = std.posix.isatty(std.fs.File.stdin().handle) };
     defer sess.decls.deinit();
 
-    var editor: ?linemod.Editor = if (sess.tty) linemod.Editor.init(alloc) else null;
+    var editor: ?Editor = if (sess.tty) Editor.init(alloc) else null;
     defer if (editor) |*e| e.deinit();
 
     if (sess.tty) {
@@ -593,7 +651,7 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
                 switch (ed.readLine(prompt) catch |e| blk: {
                     try msg.print("input error: {s}\n", .{@errorName(e)});
                     try msg.flush();
-                    break :blk linemod.Result.eof;
+                    break :blk LineResult.eof;
                 }) {
                     .eof => {
                         quit = true;
@@ -1020,11 +1078,12 @@ fn usage(w: anytype) !void {
         \\usage:
         \\  basalt run   <script>|-|-c <script> [-p key=value ...] [-j N] [--port N]
         \\               run a pipeline; HTTP mode when the script declares CREATE ENDPOINT
-        \\  basalt serve <dir> [--port N] [--watch]
+        \\  basalt serve <dir> [--port N] [--watch] [--log-format FMT] [--log-level LVL]
         \\               host every endpoint script in a dir (SIGHUP or -w reloads)
         \\  basalt check <script>|-|-c <script>
         \\               parse and validate without running; `EXPLAIN` prints the plan
         \\  basalt repl  interactive read-eval-print loop
+        \\  basalt version  print the version and exit
         \\  basalt help  show this help
         \\
         \\script:

@@ -11,17 +11,13 @@
 const std = @import("std");
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
-const batchmod = @import("../exec/batch.zig");
-const valuemod = @import("../exec/value.zig");
+const Batch = @import("../exec/batch.zig").Batch;
+const Value = @import("../exec/value.zig").Value;
 const eval = @import("../exec/eval.zig");
 const driver = @import("driver.zig");
-const httpx = @import("http.zig");
-const azure = @import("azure.zig");
-const s3 = @import("s3.zig");
+const http_client = @import("http_client.zig");
+const objstore = @import("objstore.zig");
 const zipsrc = @import("zipsrc.zig");
-
-const Batch = batchmod.Batch;
-const Value = valuemod.Value;
 
 const BATCH_ROWS = 1024;
 /// Reader/writer buffer size; also the max CSV line length (a line longer than
@@ -71,10 +67,10 @@ pub const Encoding = enum {
 /// The 0x80–0x9F block of Windows-1252 as codepoints; 0 marks the five slots that
 /// are undefined, which decode to U+FFFD rather than being invented.
 const cp1252_high = [32]u21{
-    0x20AC, 0, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
-    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0, 0x017D, 0,
-    0, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
-    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0, 0x017E, 0x0178,
+    0x20AC, 0,      0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0,      0x017D, 0,
+    0,      0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0,      0x017E, 0x0178,
 };
 
 /// A single-stream compression suffix. Only the ones Zig's std decompresses into a
@@ -230,7 +226,7 @@ pub const CsvReader = struct {
 
     pub fn isUrl(path: []const u8) bool {
         return std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://") or
-            azure.isUrl(path) or s3.isUrl(path);
+            objstore.isUrl(path);
     }
 
     pub fn open(arena: std.mem.Allocator, path: []const u8, dialect: Dialect) !*CsvReader {
@@ -244,26 +240,11 @@ pub const CsvReader = struct {
             .join_buf = std.array_list.Managed(u8).init(arena),
         };
         var first = path;
-        if (azure.isPrefix(path)) {
-            const p = try azure.parsePrefix(path);
+        if (objstore.isPrefix(path)) {
             const client = try arena.create(std.http.Client);
-            client.* = httpx.initClient(arena);
+            client.* = http_client.initClient(arena);
             defer client.deinit();
-            const names = try azure.listPrefix(arena, client, p.account, p.container, p.prefix, azure.endpointFromEnv(arena));
-            if (names.len == 0) return azure.Error.AzureEmptyPrefix;
-            const urls = try arena.alloc([]const u8, names.len);
-            for (names, urls) |n, *u| u.* = try std.fmt.allocPrint(arena, "az://{s}/{s}/{s}", .{ p.account, p.container, n });
-            first = urls[0];
-            self.rest_urls = urls[1..];
-        } else if (s3.isPrefix(path)) {
-            const p = try s3.parsePrefix(path);
-            const client = try arena.create(std.http.Client);
-            client.* = httpx.initClient(arena);
-            defer client.deinit();
-            const names = try s3.listPrefix(arena, client, p.bucket, p.prefix, s3.endpointFromEnv(arena));
-            if (names.len == 0) return s3.Error.S3EmptyPrefix;
-            const urls = try arena.alloc([]const u8, names.len);
-            for (names, urls) |n, *u| u.* = try std.fmt.allocPrint(arena, "s3://{s}/{s}", .{ p.bucket, n });
+            const urls = try objstore.listPrefix(arena, client, path);
             first = urls[0];
             self.rest_urls = urls[1..];
         }
@@ -277,26 +258,22 @@ pub const CsvReader = struct {
             self.rdr = m.reader;
         } else if (isUrl(first)) {
             const hf = try arena.create(HttpFetch);
-            hf.* = .{ .client = httpx.initClient(arena), .req = undefined, .response = undefined };
+            hf.* = .{ .client = http_client.initClient(arena), .req = undefined, .response = undefined };
             errdefer hf.client.deinit();
             // az:// and s3:// resolve to a real endpoint and carry a signature;
             // plain http(s) URLs go out unsigned as before.
             var req_url = first;
             var extra: []const std.http.Header = &.{};
-            if (azure.isUrl(first)) {
-                const blob = try azure.parseUrl(arena, first, azure.endpointFromEnv(arena));
-                req_url = blob.url;
-                extra = try azure.getHeaders(arena, blob, "");
-            } else if (s3.isUrl(first)) {
-                const obj = try s3.parseUrl(arena, first, s3.endpointFromEnv(arena));
+            if (objstore.isUrl(first)) {
+                const obj = try objstore.parse(arena, first);
                 req_url = obj.url;
-                extra = try s3.getHeaders(arena, obj, "");
+                extra = try obj.getHeaders(arena);
             }
             const uri = std.Uri.parse(req_url) catch return error.InvalidUrl;
             startHttp(hf, uri, extra) catch |e| switch (e) {
                 error.TlsInitializationFailed => {
-                    const h = httpx.uriHost(uri) orelse return e;
-                    if (!httpx.repairBundle(arena, &hf.client.ca_bundle, h, uri.port orelse 443)) return e;
+                    const h = http_client.uriHost(uri) orelse return e;
+                    if (!http_client.repairBundle(arena, &hf.client.ca_bundle, h, uri.port orelse 443)) return e;
                     hf.client.next_https_rescan_certs = false;
                     try startHttp(hf, uri, extra);
                 },
@@ -304,7 +281,7 @@ pub const CsvReader = struct {
             };
             errdefer hf.req.deinit();
             const code = @intFromEnum(hf.response.head.status);
-            if (code != 200) return httpx.statusError(code);
+            if (code != 200) return http_client.statusError(code);
             self.backend = .{ .http = hf };
             const ce = hf.response.head.content_encoding;
             if (ce == .compress) return error.UnsupportedCompressionMethod;
@@ -425,22 +402,13 @@ pub const CsvReader = struct {
             .file, .member => {},
         }
         const hf = try self.arena.create(HttpFetch);
-        hf.* = .{ .client = httpx.initClient(self.arena), .req = undefined, .response = undefined };
-        var req_url: []const u8 = undefined;
-        var extra: []const std.http.Header = undefined;
-        if (s3.isUrl(url)) {
-            const obj = try s3.parseUrl(self.arena, url, s3.endpointFromEnv(self.arena));
-            req_url = obj.url;
-            extra = try s3.getHeaders(self.arena, obj, "");
-        } else {
-            const blob = try azure.parseUrl(self.arena, url, azure.endpointFromEnv(self.arena));
-            req_url = blob.url;
-            extra = try azure.getHeaders(self.arena, blob, "");
-        }
-        const uri = std.Uri.parse(req_url) catch return error.InvalidUrl;
+        hf.* = .{ .client = http_client.initClient(self.arena), .req = undefined, .response = undefined };
+        const obj = try objstore.parse(self.arena, url);
+        const extra = try obj.getHeaders(self.arena);
+        const uri = std.Uri.parse(obj.url) catch return error.InvalidUrl;
         try startHttp(hf, uri, extra);
         const code = @intFromEnum(hf.response.head.status);
-        if (code != 200) return httpx.statusError(code);
+        if (code != 200) return http_client.statusError(code);
         self.backend = .{ .http = hf };
         const ce = hf.response.head.content_encoding;
         if (ce == .compress) return error.UnsupportedCompressionMethod;
@@ -876,32 +844,26 @@ pub const CsvWriter = struct {
     write_buf: [LINE_BUF]u8 = undefined,
     fw: std.fs.File.Writer = undefined,
 
-    /// A local file, or a block blob staged over HTTP. Both expose a plain
+    /// A local file, or an object staged over HTTP. Both expose a plain
     /// `*std.Io.Writer`, so row formatting below is identical either way.
     const Backend = union(enum) {
         file: std.fs.File,
-        blob: struct { client: *std.http.Client, w: *azure.BlockBlobWriter },
-        s3obj: struct { client: *std.http.Client, w: *s3.MultipartWriter },
+        object: objstore.Writer,
     };
 
     fn out(self: *CsvWriter) *std.Io.Writer {
         return switch (self.backend) {
             .file => &self.fw.interface,
-            .blob => |b| &b.w.interface,
-            .s3obj => |b| &b.w.interface,
+            .object => |o| o.io,
         };
     }
 
-    /// Recovers the error a blob destination actually hit. Staging a block runs
-    /// under `std.Io.Writer`, whose error set is just `WriteFailed`, so the Azure
-    /// code recorded at the point of failure is put back here — otherwise a 403
-    /// and a missing container are the same word to the caller.
+    /// Recovers the error an object destination actually hit (see
+    /// `objstore.Writer.specific`); a file's error is already the real one.
     fn specific(self: *CsvWriter, e: anyerror) anyerror {
-        if (e != error.WriteFailed) return e;
         return switch (self.backend) {
             .file => e,
-            .blob => |b| b.w.last_status orelse e,
-            .s3obj => |b| b.w.last_status orelse e,
+            .object => |o| o.specific(e),
         };
     }
 
@@ -912,24 +874,12 @@ pub const CsvWriter = struct {
     pub fn open(arena: std.mem.Allocator, path: []const u8, schema: types.Schema, mode: driver.FileMode, dialect: Dialect) !*CsvWriter {
         const self = try arena.create(CsvWriter);
         var header = true;
-        if (azure.isUrl(path)) {
+        if (objstore.isUrl(path)) {
             if (mode == .append) return error.AppendNotSupported;
             const client = try arena.create(std.http.Client);
-            client.* = httpx.initClient(arena);
-            const blob = try azure.parseUrl(arena, path, azure.endpointFromEnv(arena));
-            self.* = .{ .backend = .{ .blob = .{
-                .client = client,
-                .w = try azure.BlockBlobWriter.init(arena, client, blob, "text/csv"),
-            } } };
-        } else if (s3.isUrl(path)) {
-            if (mode == .append) return error.AppendNotSupported;
-            const client = try arena.create(std.http.Client);
-            client.* = httpx.initClient(arena);
-            const obj = try s3.parseUrl(arena, path, s3.endpointFromEnv(arena));
-            self.* = .{ .backend = .{ .s3obj = .{
-                .client = client,
-                .w = try s3.MultipartWriter.init(arena, client, obj, "text/csv"),
-            } } };
+            client.* = http_client.initClient(arena);
+            const obj = try objstore.parse(arena, path);
+            self.* = .{ .backend = .{ .object = try obj.openWriter(arena, client, "text/csv") } };
         } else {
             self.* = .{ .backend = .{ .file = try std.fs.cwd().createFile(path, .{ .truncate = mode == .truncate }) } };
             self.fw = self.backend.file.writer(&self.write_buf);
@@ -1021,10 +971,8 @@ pub const CsvWriter = struct {
                 try self.fw.interface.flush();
                 f.close();
             },
-            // Committing the block list is what makes the blob appear.
-            .blob => |b| b.w.finish() catch |e| return self.specific(e),
-            // Same for the multipart completion (or the single PUT).
-            .s3obj => |b| b.w.finish() catch |e| return self.specific(e),
+            // Committing the staged upload is what makes the object appear.
+            .object => |o| o.finish() catch |e| return self.specific(e),
         }
     }
 
@@ -1035,10 +983,10 @@ pub const CsvWriter = struct {
     pub fn abort(self: *CsvWriter) void {
         switch (self.backend) {
             .file => |f| f.close(),
-            .blob => {},
-            // An uncompleted multipart upload is invisible to readers; unlike
-            // Azure, S3 only reaps it where the bucket has a lifecycle rule.
-            .s3obj => {},
+            // Staged blocks and an uncompleted multipart upload are invisible to
+            // readers. Azure reaps them after a week; S3 only where the bucket has
+            // a lifecycle rule.
+            .object => {},
         }
     }
 

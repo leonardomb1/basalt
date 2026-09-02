@@ -11,25 +11,13 @@
 //! Every request signs the real payload hash (the empty-body SHA-256 for
 //! bodyless verbs) — no UNSIGNED-PAYLOAD anywhere, so requests are integrity-
 //! protected even over the plain-HTTP endpoints emulators use.
+//!
+//! Everything not specific to SigV4 — error bodies, retry policy, the listing
+//! loop, the consumer-facing interface — lives in `objstore.zig`.
 
 const std = @import("std");
-const httpx = @import("http.zig");
-
-/// Civil date from a day count since the epoch (Howard Hinnant's algorithm).
-/// Duplicated from `exec/eval.zig` rather than imported so this module depends
-/// on nothing but std — same reasoning as azure.zig.
-fn civilFromDays(z0: i64) struct { y: i64, m: u32, d: u32 } {
-    const z = z0 + 719468;
-    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
-    const doe = z - era * 146097;
-    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
-    const y = yoe + era * 400;
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153);
-    const d: u32 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
-    const m: u32 = @intCast(if (mp < 10) mp + 3 else mp - 9);
-    return .{ .y = y + (if (m <= 2) @as(i64, 1) else 0), .m = m, .d = d };
-}
+const http_client = @import("http_client.zig");
+const objstore = @import("objstore.zig");
 
 pub const env_key_id = "AWS_ACCESS_KEY_ID";
 pub const env_secret = "AWS_SECRET_ACCESS_KEY";
@@ -216,7 +204,7 @@ pub fn parsePrefix(url: []const u8) !struct { bucket: []const u8, prefix: []cons
 pub fn amzDate(arena: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
     const days = @divFloor(epoch_secs, 86400);
     const secs: u32 = @intCast(epoch_secs - days * 86400);
-    const c = civilFromDays(days);
+    const c = objstore.civilFromDays(days);
     return std.fmt.allocPrint(arena, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
         @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60,
     });
@@ -395,30 +383,10 @@ pub fn requestHeaders(
     return out.toOwnedSlice();
 }
 
-/// Pulls `<Code>` and `<Message>` out of an S3 error body. Every failure
-/// response carries them; without this a caller sees only a bare status and the
-/// cause (bad key? clock skew? wrong bucket?) is guesswork.
-pub fn parseError(body: []const u8) ?struct { code: []const u8, message: []const u8 } {
-    const code = extractTag(body, "Code") orelse return null;
-    const msg = extractTag(body, "Message") orelse "";
-    return .{ .code = code, .message = std.mem.sliceTo(msg, '\n') };
-}
-
-fn extractTag(xml: []const u8, name: []const u8) ?[]const u8 {
-    var open_buf: [64]u8 = undefined;
-    var close_buf: [64]u8 = undefined;
-    const open = std.fmt.bufPrint(&open_buf, "<{s}>", .{name}) catch return null;
-    const close = std.fmt.bufPrint(&close_buf, "</{s}>", .{name}) catch return null;
-    const s = std.mem.indexOf(u8, xml, open) orelse return null;
-    const from = s + open.len;
-    const e = std.mem.indexOfPos(u8, xml, from, close) orelse return null;
-    return xml[from..e];
-}
-
 /// Maps a status plus S3's error code onto a distinct Zig error, so callers can
 /// react (and users can read a failure) instead of seeing one catch-all.
 pub fn statusToError(code: u16, body: []const u8) Error {
-    if (parseError(body)) |e| {
+    if (objstore.parseError(body)) |e| {
         if (std.mem.eql(u8, e.code, "NoSuchBucket")) return Error.S3BucketMissing;
         if (std.mem.eql(u8, e.code, "NoSuchKey")) return Error.S3KeyNotFound;
         if (std.mem.eql(u8, e.code, "AccessDenied")) return Error.S3AuthFailed;
@@ -433,31 +401,6 @@ pub fn statusToError(code: u16, body: []const u8) Error {
         429, 503 => Error.S3Throttled,
         else => Error.S3RequestFailed,
     };
-}
-
-/// S3 throttles with 503 SlowDown (and 429 on some compatibles) and returns 500
-/// on transient internal faults. Every request this module makes is idempotent —
-/// UploadPart is keyed by part number, CompleteMultipartUpload is a full
-/// replace, GET is a read — so retrying is always safe.
-pub fn retriable(code: u16) bool {
-    return code == 429 or code == 500 or code == 503;
-}
-
-pub const max_attempts = 5;
-
-/// Exponential backoff with jitter, same policy as azure.zig: jitter matters
-/// because N parallel lanes throttled at the same instant would otherwise retry
-/// in lockstep and re-throttle each other.
-pub fn backoffMs(attempt: usize, rand: std.Random) u64 {
-    const base = @as(u64, 200) << @intCast(@min(attempt, 5));
-    return base + rand.uintLessThan(u64, base / 2 + 1);
-}
-
-/// `Code: Message (HTTP nnn)` — what a user needs to see instead of a status.
-pub fn describe(arena: std.mem.Allocator, code: u16, body: []const u8) ![]const u8 {
-    if (parseError(body)) |e|
-        return std.fmt.allocPrint(arena, "{s}: {s} (HTTP {d})", .{ e.code, e.message, code });
-    return std.fmt.allocPrint(arena, "HTTP {d}", .{code});
 }
 
 /// The bucket-level base for listing (and bucket creation): URL, signed host,
@@ -484,10 +427,75 @@ fn bucketBase(arena: std.mem.Allocator, bucket: []const u8, region: []const u8, 
     };
 }
 
+const ListPage = struct {
+    arena: std.mem.Allocator,
+    client: *std.http.Client,
+    creds: Creds,
+    region: []const u8,
+    prefix: []const u8,
+    base_url: []const u8,
+    host: []const u8,
+    uri_path: []const u8,
+
+    fn page(c: ListPage, token: []const u8) ![]const u8 {
+        // Query built pre-sorted (continuation-token < list-type < prefix), so
+        // the request URL and the canonical query string are the same text.
+        var q = std.array_list.Managed([]const u8).init(c.arena);
+        if (token.len > 0)
+            try q.append(try std.fmt.allocPrint(c.arena, "continuation-token={s}", .{try uriEncode(c.arena, token, .encode_slash)}));
+        try q.append("list-type=2");
+        try q.append(try std.fmt.allocPrint(c.arena, "prefix={s}", .{try uriEncode(c.arena, c.prefix, .encode_slash)}));
+
+        const ts = try amzDate(c.arena, std.time.timestamp());
+        var sh = std.array_list.Managed(SignHeader).init(c.arena);
+        try sh.append(.{ .name = "host", .value = c.host });
+        try sh.append(.{ .name = "x-amz-content-sha256", .value = empty_payload_hash });
+        try sh.append(.{ .name = "x-amz-date", .value = ts });
+        if (c.creds.token) |t| try sh.append(.{ .name = "x-amz-security-token", .value = t });
+        const auth = try authHeader(c.arena, c.creds.access, c.creds.secret, .{
+            .method = "GET",
+            .uri_path = c.uri_path,
+            .query = q.items,
+            .headers = sh.items,
+            .payload_hash = empty_payload_hash,
+            .timestamp = ts,
+            .region = c.region,
+        });
+
+        var hdrs = std.array_list.Managed(std.http.Header).init(c.arena);
+        try hdrs.append(.{ .name = "x-amz-date", .value = ts });
+        try hdrs.append(.{ .name = "x-amz-content-sha256", .value = empty_payload_hash });
+        if (c.creds.token) |t| try hdrs.append(.{ .name = "x-amz-security-token", .value = t });
+        try hdrs.append(.{ .name = "Authorization", .value = auth });
+
+        var url = std.array_list.Managed(u8).init(c.arena);
+        try url.appendSlice(c.base_url);
+        for (q.items, 0..) |s, i| {
+            try url.append(if (i == 0) '?' else '&');
+            try url.appendSlice(s);
+        }
+
+        var aw = std.Io.Writer.Allocating.init(c.arena);
+        const res = try c.client.fetch(.{
+            .method = .GET,
+            .location = .{ .url = url.items },
+            .extra_headers = hdrs.items,
+            .decompress_buffer = http_client.decompress_direct,
+            .response_writer = &aw.writer,
+        });
+        const code = @intFromEnum(res.status);
+        const body = aw.writer.buffered();
+        if (code != 200) return statusToError(code, body);
+        return body;
+    }
+};
+
 /// Lists object keys under `prefix` (ListObjectsV2), following continuation
 /// tokens to the end. Keys come back bucket-relative, in the lexicographic
 /// order S3 returns them, so a caller reading them in order gets a
-/// deterministic result.
+/// deterministic result. Keys appear only inside `<Contents>` elements, and a
+/// flat listing (no delimiter) returns no CommonPrefixes, so the tag scan cannot
+/// pick up anything else.
 pub fn listPrefix(
     arena: std.mem.Allocator,
     client: *std.http.Client,
@@ -496,80 +504,18 @@ pub fn listPrefix(
     endpoint: ?[]const u8,
 ) ![][]const u8 {
     const region = regionFromEnv(arena);
-    const creds = try credsFromEnv(arena);
     const base = try bucketBase(arena, bucket, region, endpoint);
-
-    var out = std.array_list.Managed([]const u8).init(arena);
-    var token: []const u8 = "";
-    while (true) {
-        // Query built pre-sorted (continuation-token < list-type < prefix), so
-        // the request URL and the canonical query string are the same text.
-        var q = std.array_list.Managed([]const u8).init(arena);
-        if (token.len > 0)
-            try q.append(try std.fmt.allocPrint(arena, "continuation-token={s}", .{try uriEncode(arena, token, .encode_slash)}));
-        try q.append("list-type=2");
-        try q.append(try std.fmt.allocPrint(arena, "prefix={s}", .{try uriEncode(arena, prefix, .encode_slash)}));
-
-        const ts = try amzDate(arena, std.time.timestamp());
-        var sh = std.array_list.Managed(SignHeader).init(arena);
-        try sh.append(.{ .name = "host", .value = base.host });
-        try sh.append(.{ .name = "x-amz-content-sha256", .value = empty_payload_hash });
-        try sh.append(.{ .name = "x-amz-date", .value = ts });
-        if (creds.token) |t| try sh.append(.{ .name = "x-amz-security-token", .value = t });
-        const auth = try authHeader(arena, creds.access, creds.secret, .{
-            .method = "GET",
-            .uri_path = base.uri_path,
-            .query = q.items,
-            .headers = sh.items,
-            .payload_hash = empty_payload_hash,
-            .timestamp = ts,
-            .region = region,
-        });
-
-        var hdrs = std.array_list.Managed(std.http.Header).init(arena);
-        try hdrs.append(.{ .name = "x-amz-date", .value = ts });
-        try hdrs.append(.{ .name = "x-amz-content-sha256", .value = empty_payload_hash });
-        if (creds.token) |t| try hdrs.append(.{ .name = "x-amz-security-token", .value = t });
-        try hdrs.append(.{ .name = "Authorization", .value = auth });
-
-        var url = std.array_list.Managed(u8).init(arena);
-        try url.appendSlice(base.url);
-        for (q.items, 0..) |s, i| {
-            try url.append(if (i == 0) '?' else '&');
-            try url.appendSlice(s);
-        }
-
-        var aw = std.Io.Writer.Allocating.init(arena);
-        const res = try client.fetch(.{
-            .method = .GET,
-            .location = .{ .url = url.items },
-            .extra_headers = hdrs.items,
-            .decompress_buffer = httpx.decompress_direct,
-            .response_writer = &aw.writer,
-        });
-        const code = @intFromEnum(res.status);
-        const body = aw.writer.buffered();
-        if (code != 200) return statusToError(code, body);
-
-        try collectKeys(arena, body, &out);
-        const next = extractTag(body, "NextContinuationToken") orelse "";
-        if (next.len == 0) break;
-        token = try arena.dupe(u8, next);
-    }
-    return out.toOwnedSlice();
-}
-
-/// Every `<Key>` in a ListObjectsV2 page. Keys appear only inside `<Contents>`
-/// elements, and a flat listing (no delimiter) returns no CommonPrefixes, so a
-/// plain tag scan cannot pick up anything else.
-fn collectKeys(arena: std.mem.Allocator, xml: []const u8, out: *std.array_list.Managed([]const u8)) !void {
-    var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, xml, pos, "<Key>")) |s| {
-        const from = s + "<Key>".len;
-        const e = std.mem.indexOfPos(u8, xml, from, "</Key>") orelse break;
-        try out.append(try arena.dupe(u8, xml[from..e]));
-        pos = e + "</Key>".len;
-    }
+    const ctx = ListPage{
+        .arena = arena,
+        .client = client,
+        .creds = try credsFromEnv(arena),
+        .region = region,
+        .prefix = prefix,
+        .base_url = base.url,
+        .host = base.host,
+        .uri_path = base.uri_path,
+    };
+    return objstore.listPages(arena, .{ .item_tag = "Key", .next_tag = "NextContinuationToken" }, ctx, ListPage.page);
 }
 
 /// Part accumulation size. Multipart parts must be at least 5 MiB except the
@@ -667,7 +613,7 @@ pub const MultipartWriter = struct {
     last_status: ?Error = null,
     rand: std.Random.DefaultPrng,
 
-    const vtable = std.Io.Writer.VTable{ .drain = drainFn };
+    const vtable = std.Io.Writer.VTable{ .drain = objstore.drain(MultipartWriter) };
 
     pub fn init(
         arena: std.mem.Allocator,
@@ -685,26 +631,15 @@ pub const MultipartWriter = struct {
             .content_type = content_type,
             .part_buf = try arena.alloc(u8, part_size),
             .etags = std.array_list.Managed([]const u8).init(arena),
-            // Jitter only needs to decorrelate lanes, not be unpredictable.
-            .rand = std.Random.DefaultPrng.init(@bitCast(std.time.milliTimestamp())),
+            .rand = objstore.jitterPrng(),
         };
         return self;
-    }
-
-    fn drainFn(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        const self: *MultipartWriter = @fieldParentPtr("interface", w);
-        var total: usize = 0;
-        total += try self.put(w.buffered());
-        for (data[0 .. data.len - 1]) |d| total += try self.put(d);
-        const last = data[data.len - 1];
-        for (0..splat) |_| total += try self.put(last);
-        return w.consume(total);
     }
 
     /// Copies into the part buffer, shipping each full part. The copy is what
     /// guarantees every non-final part is exactly `part_size` — never under
     /// S3's 5 MiB minimum — regardless of how the writer machinery chunks.
-    fn put(self: *MultipartWriter, bytes: []const u8) std.Io.Writer.Error!usize {
+    pub fn put(self: *MultipartWriter, bytes: []const u8) std.Io.Writer.Error!usize {
         var rest = bytes;
         while (rest.len > 0) {
             const n = @min(part_size - self.part_len, rest.len);
@@ -724,39 +659,34 @@ pub const MultipartWriter = struct {
     fn ensureUpload(self: *MultipartWriter) !void {
         if (self.upload_id != null) return;
         const url = try std.fmt.allocPrint(self.arena, "{s}?uploads", .{self.obj.url});
-        const q = [_][]const u8{"uploads="};
-        var attempt: usize = 0;
-        while (true) : (attempt += 1) {
-            const hdrs = try signedWriteHeaders(self.arena, self.creds, "POST", self.obj, self.obj.uri_path, &q, empty_payload_hash, self.content_type);
-            var aw = std.Io.Writer.Allocating.init(self.arena);
-            const res = try self.client.fetch(.{
-                .method = .POST,
-                .location = .{ .url = url },
-                .extra_headers = hdrs,
-                .headers = .{ .content_type = .{ .override = self.content_type } },
-                .payload = "",
-                .decompress_buffer = httpx.decompress_direct,
-                .response_writer = &aw.writer,
-            });
-            const code = @intFromEnum(res.status);
-            const body = aw.writer.buffered();
-            if (code == 200) {
-                const id = extractTag(body, "UploadId") orelse return self.fail(code, body);
-                self.upload_id = try self.arena.dupe(u8, id);
-                self.upload_id_enc = try uriEncode(self.arena, self.upload_id.?, .encode_slash);
-                return;
+        const Ctx = struct { w: *MultipartWriter, url: []const u8 };
+        try objstore.retry(self.policy(), Ctx{ .w = self, .url = url }, struct {
+            fn attempt(c: Ctx) !objstore.Verdict {
+                const w = c.w;
+                const q = [_][]const u8{"uploads="};
+                const hdrs = try signedWriteHeaders(w.arena, w.creds, "POST", w.obj, w.obj.uri_path, &q, empty_payload_hash, w.content_type);
+                var aw = std.Io.Writer.Allocating.init(w.arena);
+                const res = try w.client.fetch(.{
+                    .method = .POST,
+                    .location = .{ .url = c.url },
+                    .extra_headers = hdrs,
+                    .headers = .{ .content_type = .{ .override = w.content_type } },
+                    .payload = "",
+                    .decompress_buffer = http_client.decompress_direct,
+                    .response_writer = &aw.writer,
+                });
+                const code = @intFromEnum(res.status);
+                const body = aw.writer.buffered();
+                if (code == 200) {
+                    const id = objstore.extractTag(body, "UploadId") orelse return w.failed(code, body);
+                    w.upload_id = try w.arena.dupe(u8, id);
+                    w.upload_id_enc = try uriEncode(w.arena, w.upload_id.?, .encode_slash);
+                    return .done;
+                }
+                if (try w.createBucketIfMissing(code, body)) return .again;
+                return w.failed(code, body);
             }
-            // Fresh destination: create the bucket, then retry the initiation.
-            if (statusToError(code, body) == Error.S3BucketMissing and !self.created_bucket) {
-                try self.createBucket();
-                continue;
-            }
-            if (retriable(code) and attempt + 1 < max_attempts) {
-                std.Thread.sleep(backoffMs(attempt, self.rand.random()) * std.time.ns_per_ms);
-                continue;
-            }
-            return self.fail(code, body);
-        }
+        }.attempt);
     }
 
     /// UploadPart over the lower-level request API: the ETag needed by
@@ -769,27 +699,31 @@ pub const MultipartWriter = struct {
             try std.fmt.allocPrint(self.arena, "partNumber={d}", .{self.etags.items.len + 1}),
             try std.fmt.allocPrint(self.arena, "uploadId={s}", .{self.upload_id_enc}),
         };
-        const url = try std.fmt.allocPrint(self.arena, "{s}?{s}&{s}", .{ self.obj.url, q[0], q[1] });
-        const ph = try payloadHash(self.arena, bytes);
-        var attempt: usize = 0;
-        while (true) : (attempt += 1) {
-            const hdrs = try signedWriteHeaders(self.arena, self.creds, "PUT", self.obj, self.obj.uri_path, &q, ph, null);
-            const r = try self.putWithEtag(url, hdrs, bytes);
-            if (r.code == 200) {
-                if (r.etag.len == 0) {
-                    self.last_error = "UploadPart response carried no ETag";
-                    self.last_status = Error.S3RequestFailed;
-                    return self.last_status.?;
+        const Ctx = struct { w: *MultipartWriter, url: []const u8, q: []const []const u8, ph: []const u8, bytes: []const u8 };
+        const ctx = Ctx{
+            .w = self,
+            .url = try std.fmt.allocPrint(self.arena, "{s}?{s}&{s}", .{ self.obj.url, q[0], q[1] }),
+            .q = try self.arena.dupe([]const u8, &q),
+            .ph = try payloadHash(self.arena, bytes),
+            .bytes = bytes,
+        };
+        try objstore.retry(self.policy(), ctx, struct {
+            fn attempt(c: Ctx) !objstore.Verdict {
+                const w = c.w;
+                const hdrs = try signedWriteHeaders(w.arena, w.creds, "PUT", w.obj, w.obj.uri_path, c.q, c.ph, null);
+                const r = try w.putWithEtag(c.url, hdrs, c.bytes);
+                if (r.code == 200) {
+                    if (r.etag.len == 0) {
+                        w.last_error = "UploadPart response carried no ETag";
+                        w.last_status = Error.S3RequestFailed;
+                        return .{ .failed = .{ .code = r.code, .err = w.last_status.? } };
+                    }
+                    try w.etags.append(r.etag);
+                    return .done;
                 }
-                try self.etags.append(r.etag);
-                return;
+                return w.failed(r.code, r.body);
             }
-            if (retriable(r.code) and attempt + 1 < max_attempts) {
-                std.Thread.sleep(backoffMs(attempt, self.rand.random()) * std.time.ns_per_ms);
-                continue;
-            }
-            return self.fail(r.code, r.body);
-        }
+        }.attempt);
     }
 
     const PutResult = struct { code: u16, etag: []const u8, body: []const u8 };
@@ -823,36 +757,32 @@ pub const MultipartWriter = struct {
     /// Whole object in one PUT — the path taken when everything fit in the part
     /// buffer, so no multipart upload was ever started.
     fn singlePut(self: *MultipartWriter, bytes: []const u8) !void {
-        const ph = try payloadHash(self.arena, bytes);
-        var attempt: usize = 0;
-        while (true) : (attempt += 1) {
-            const hdrs = try signedWriteHeaders(self.arena, self.creds, "PUT", self.obj, self.obj.uri_path, &.{}, ph, self.content_type);
-            var aw = std.Io.Writer.Allocating.init(self.arena);
-            const res = try self.client.fetch(.{
-                .method = .PUT,
-                .location = .{ .url = self.obj.url },
-                .extra_headers = hdrs,
-                .headers = .{ .content_type = .{ .override = self.content_type } },
-                .payload = bytes,
-                .decompress_buffer = httpx.decompress_direct,
-                .response_writer = &aw.writer,
-            });
-            const code = @intFromEnum(res.status);
-            const body = aw.writer.buffered();
-            if (code == 200) {
-                self.last_status = null;
-                return;
+        const Ctx = struct { w: *MultipartWriter, ph: []const u8, bytes: []const u8 };
+        const ctx = Ctx{ .w = self, .ph = try payloadHash(self.arena, bytes), .bytes = bytes };
+        try objstore.retry(self.policy(), ctx, struct {
+            fn attempt(c: Ctx) !objstore.Verdict {
+                const w = c.w;
+                const hdrs = try signedWriteHeaders(w.arena, w.creds, "PUT", w.obj, w.obj.uri_path, &.{}, c.ph, w.content_type);
+                var aw = std.Io.Writer.Allocating.init(w.arena);
+                const res = try w.client.fetch(.{
+                    .method = .PUT,
+                    .location = .{ .url = w.obj.url },
+                    .extra_headers = hdrs,
+                    .headers = .{ .content_type = .{ .override = w.content_type } },
+                    .payload = c.bytes,
+                    .decompress_buffer = http_client.decompress_direct,
+                    .response_writer = &aw.writer,
+                });
+                const code = @intFromEnum(res.status);
+                const body = aw.writer.buffered();
+                if (code == 200) {
+                    w.last_status = null;
+                    return .done;
+                }
+                if (try w.createBucketIfMissing(code, body)) return .again;
+                return w.failed(code, body);
             }
-            if (statusToError(code, body) == Error.S3BucketMissing and !self.created_bucket) {
-                try self.createBucket();
-                continue;
-            }
-            if (retriable(code) and attempt + 1 < max_attempts) {
-                std.Thread.sleep(backoffMs(attempt, self.rand.random()) * std.time.ns_per_ms);
-                continue;
-            }
-            return self.fail(code, body);
-        }
+        }.attempt);
     }
 
     /// Commits the object. Single PUT when the part buffer never filled;
@@ -866,40 +796,53 @@ pub const MultipartWriter = struct {
             self.part_len = 0;
         }
 
-        const body = try completeBody(self.arena, self.etags.items);
         const q = [_][]const u8{
             try std.fmt.allocPrint(self.arena, "uploadId={s}", .{self.upload_id_enc}),
         };
-        const url = try std.fmt.allocPrint(self.arena, "{s}?{s}", .{ self.obj.url, q[0] });
-        const ph = try payloadHash(self.arena, body);
-        var attempt: usize = 0;
-        while (true) : (attempt += 1) {
-            const hdrs = try signedWriteHeaders(self.arena, self.creds, "POST", self.obj, self.obj.uri_path, &q, ph, null);
-            var aw = std.Io.Writer.Allocating.init(self.arena);
-            const res = try self.client.fetch(.{
-                .method = .POST,
-                .location = .{ .url = url },
-                .extra_headers = hdrs,
-                .payload = body,
-                .decompress_buffer = httpx.decompress_direct,
-                .response_writer = &aw.writer,
-            });
-            var code = @intFromEnum(res.status);
-            const resp = aw.writer.buffered();
-            // CompleteMultipartUpload can answer 200 with an error body
-            // (documented behavior under internal faults); that is a retriable
-            // failure, not success.
-            if (code == 200 and std.mem.indexOf(u8, resp, "<Error>") != null) code = 500;
-            if (code == 200) {
-                self.last_status = null;
-                return;
+        const Ctx = struct { w: *MultipartWriter, url: []const u8, q: []const []const u8, ph: []const u8, body: []const u8 };
+        const body = try completeBody(self.arena, self.etags.items);
+        const ctx = Ctx{
+            .w = self,
+            .url = try std.fmt.allocPrint(self.arena, "{s}?{s}", .{ self.obj.url, q[0] }),
+            .q = try self.arena.dupe([]const u8, &q),
+            .ph = try payloadHash(self.arena, body),
+            .body = body,
+        };
+        try objstore.retry(self.policy(), ctx, struct {
+            fn attempt(c: Ctx) !objstore.Verdict {
+                const w = c.w;
+                const hdrs = try signedWriteHeaders(w.arena, w.creds, "POST", w.obj, w.obj.uri_path, c.q, c.ph, null);
+                var aw = std.Io.Writer.Allocating.init(w.arena);
+                const res = try w.client.fetch(.{
+                    .method = .POST,
+                    .location = .{ .url = c.url },
+                    .extra_headers = hdrs,
+                    .payload = c.body,
+                    .decompress_buffer = http_client.decompress_direct,
+                    .response_writer = &aw.writer,
+                });
+                var code = @intFromEnum(res.status);
+                const resp = aw.writer.buffered();
+                // CompleteMultipartUpload can answer 200 with an error body
+                // (documented behavior under internal faults); that is a retriable
+                // failure, not success.
+                if (code == 200 and std.mem.indexOf(u8, resp, "<Error>") != null) code = 500;
+                if (code == 200) {
+                    w.last_status = null;
+                    return .done;
+                }
+                return w.failed(code, resp);
             }
-            if (retriable(code) and attempt + 1 < max_attempts) {
-                std.Thread.sleep(backoffMs(attempt, self.rand.random()) * std.time.ns_per_ms);
-                continue;
-            }
-            return self.fail(code, resp);
-        }
+        }.attempt);
+    }
+
+    /// Fresh destination: creates the bucket on the first NoSuchBucket so the
+    /// caller can go straight round again. False when the failure was anything
+    /// else, or the bucket was already created once.
+    fn createBucketIfMissing(self: *MultipartWriter, code: u16, body: []const u8) !bool {
+        if (statusToError(code, body) != Error.S3BucketMissing or self.created_bucket) return false;
+        try self.createBucket();
+        return true;
     }
 
     /// Create the bucket, ignoring "already exists". Called once after a
@@ -923,7 +866,7 @@ pub const MultipartWriter = struct {
             .location = .{ .url = self.obj.bucket_url },
             .extra_headers = hdrs,
             .payload = body,
-            .decompress_buffer = httpx.decompress_direct,
+            .decompress_buffer = http_client.decompress_direct,
             .response_writer = &aw.writer,
         });
         const code = @intFromEnum(res.status);
@@ -931,10 +874,18 @@ pub const MultipartWriter = struct {
         if (code != 200 and code != 409) return self.fail(code, aw.writer.buffered());
     }
 
+    fn policy(self: *MultipartWriter) objstore.Policy {
+        return .{ .rand = self.rand.random() };
+    }
+
     fn fail(self: *MultipartWriter, code: u16, body: []const u8) Error {
-        self.last_error = describe(self.arena, code, body) catch "";
+        self.last_error = objstore.describe(self.arena, code, body) catch "";
         self.last_status = statusToError(code, body);
         return self.last_status.?;
+    }
+
+    fn failed(self: *MultipartWriter, code: u16, body: []const u8) objstore.Verdict {
+        return .{ .failed = .{ .code = code, .err = self.fail(code, body) } };
     }
 };
 
@@ -1092,21 +1043,6 @@ test "prefix URLs are distinguished from object URLs and may have an empty prefi
     try std.testing.expectError(Error.S3BadUrl, parsePrefix("s3://noslash"));
 }
 
-test "parseError pulls the code and first message line out of an S3 fault" {
-    const body =
-        \\<?xml version="1.0" encoding="UTF-8"?>
-        \\<Error>
-        \\  <Code>SignatureDoesNotMatch</Code>
-        \\  <Message>The request signature we calculated does not match the signature you provided.</Message>
-        \\  <RequestId>4442587FB7D0A2F9</RequestId>
-        \\</Error>
-    ;
-    const e = parseError(body).?;
-    try std.testing.expectEqualStrings("SignatureDoesNotMatch", e.code);
-    try std.testing.expectEqualStrings("The request signature we calculated does not match the signature you provided.", e.message);
-    try std.testing.expect(parseError("not xml") == null);
-}
-
 test "statusToError distinguishes causes instead of one catch-all" {
     try std.testing.expectEqual(Error.S3BucketMissing, statusToError(404, "<Error><Code>NoSuchBucket</Code></Error>"));
     try std.testing.expectEqual(Error.S3KeyNotFound, statusToError(404, "<Error><Code>NoSuchKey</Code></Error>"));
@@ -1115,35 +1051,6 @@ test "statusToError distinguishes causes instead of one catch-all" {
     try std.testing.expectEqual(Error.S3Throttled, statusToError(503, "<Error><Code>SlowDown</Code></Error>"));
     try std.testing.expectEqual(Error.S3Throttled, statusToError(503, ""));
     try std.testing.expectEqual(Error.S3RequestFailed, statusToError(418, ""));
-}
-
-test "retry policy: only transient statuses, and jitter stays within its band" {
-    try std.testing.expect(retriable(429) and retriable(500) and retriable(503));
-    try std.testing.expect(!retriable(403) and !retriable(404) and !retriable(200));
-
-    var prng = std.Random.DefaultPrng.init(1);
-    const r = prng.random();
-    for (0..5) |i| {
-        const base = @as(u64, 200) << @intCast(i);
-        const ms = backoffMs(i, r);
-        try std.testing.expect(ms >= base and ms <= base + base / 2 + 1);
-    }
-}
-
-test "collectKeys reads every object key from a ListObjectsV2 page" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    var out = std.array_list.Managed([]const u8).init(a);
-    try collectKeys(a,
-        \\<ListBucketResult><Name>lake</Name><Prefix>p/</Prefix><KeyCount>2</KeyCount>
-        \\<Contents><Key>p/a.csv</Key><Size>10</Size></Contents>
-        \\<Contents><Key>p/b.csv</Key><Size>20</Size></Contents>
-        \\</ListBucketResult>
-    , &out);
-    try std.testing.expectEqual(@as(usize, 2), out.items.len);
-    try std.testing.expectEqualStrings("p/a.csv", out.items[0]);
-    try std.testing.expectEqualStrings("p/b.csv", out.items[1]);
 }
 
 test "bucketBase covers both endpoint styles" {
@@ -1189,13 +1096,43 @@ test "parseUrl carries the bucket root for CreateBucket in both styles" {
     try std.testing.expect(std.mem.startsWith(u8, v.bucket_url, "https://mybucket.s3."));
 }
 
-test "describe renders the code and message a user needs" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    try std.testing.expectEqualStrings(
-        "NoSuchKey: The specified key does not exist. (HTTP 404)",
-        try describe(a, 404, "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>"),
-    );
-    try std.testing.expectEqualStrings("HTTP 500", try describe(a, 500, ""));
+// --- objstore provider --------------------------------------------------------
+
+/// The `objstore.Provider` for `s3://`.
+pub const provider = objstore.Provider{
+    .scheme = "s3://",
+    .empty_prefix = Error.S3EmptyPrefix,
+    .vtable = &.{
+        .parse = vtParse,
+        .list_prefix = vtListPrefix,
+        .request_headers = vtRequestHeaders,
+        .status_to_error = vtStatusToError,
+        .open_writer = vtOpenWriter,
+    },
+};
+
+fn vtParse(arena: std.mem.Allocator, url: []const u8) anyerror!objstore.Object {
+    const o = try arena.create(Obj);
+    o.* = try parseUrl(arena, url, endpointFromEnv(arena));
+    return .{ .provider = &provider, .url = o.url, .ptr = o };
+}
+
+fn vtListPrefix(arena: std.mem.Allocator, client: *std.http.Client, url: []const u8) anyerror![]const []const u8 {
+    const p = try parsePrefix(url);
+    const keys = try listPrefix(arena, client, p.bucket, p.prefix, endpointFromEnv(arena));
+    const urls = try arena.alloc([]const u8, keys.len);
+    for (keys, urls) |k, *u| u.* = try std.fmt.allocPrint(arena, "s3://{s}/{s}", .{ p.bucket, k });
+    return urls;
+}
+
+fn vtRequestHeaders(ptr: *const anyopaque, arena: std.mem.Allocator, method: []const u8, range: []const u8) anyerror![]const std.http.Header {
+    return requestHeaders(arena, objstore.cast(Obj, ptr).*, method, range);
+}
+
+fn vtStatusToError(code: u16, body: []const u8) anyerror {
+    return statusToError(code, body);
+}
+
+fn vtOpenWriter(ptr: *const anyopaque, arena: std.mem.Allocator, client: *std.http.Client, content_type: []const u8) anyerror!objstore.Writer {
+    return objstore.writer(try MultipartWriter.init(arena, client, objstore.cast(Obj, ptr).*, content_type));
 }

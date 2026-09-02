@@ -17,13 +17,13 @@
 //!   CASE ... THEN <stmts> END CASE  -> StmtMatch (plan-time dispatch)
 
 const std = @import("std");
-const tok = @import("token.zig");
-const lex = @import("sql_lexer.zig");
+const token = @import("token.zig");
+const lexer = @import("sql_lexer.zig");
 const ast = @import("ast.zig");
 const types = @import("types.zig");
 
-const Token = tok.Token;
-const Tag = tok.Tag;
+const Token = token.Token;
+const Tag = token.Tag;
 const Pos = ast.Pos;
 
 pub const Diagnostic = struct { msg: []const u8, line: u32, col: u32 };
@@ -31,7 +31,7 @@ pub const Error = error{ ParseFailed, OutOfMemory };
 
 /// Tokenize and parse a whole Basalt SQL program.
 pub fn parseSource(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic) Error!ast.Program {
-    const toks = lex.tokenize(arena, src) catch return error.OutOfMemory;
+    const toks = lexer.tokenize(arena, src) catch return error.OutOfMemory;
     var p = Parser{ .arena = arena, .toks = toks, .diag = diag };
     for (toks) |t| {
         if (t.tag == .invalid) return p.fail(.{ .line = t.line, .col = t.col }, "invalid token `{s}`", .{t.text});
@@ -42,7 +42,7 @@ pub fn parseSource(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic)
 /// Tokenize and parse a single standalone expression (used to evaluate the
 /// body of a `${ <expr> }` interpolation hole). Fails on trailing input.
 pub fn parseExprStr(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic) Error!*ast.Expr {
-    const toks = lex.tokenize(arena, src) catch return error.OutOfMemory;
+    const toks = lexer.tokenize(arena, src) catch return error.OutOfMemory;
     var p = Parser{ .arena = arena, .toks = toks, .diag = diag };
     for (toks) |t| {
         if (t.tag == .invalid) return p.fail(.{ .line = t.line, .col = t.col }, "invalid token `{s}`", .{t.text});
@@ -114,6 +114,13 @@ const agg_names = [_]struct { n: []const u8, f: ast.AggFunc }{
     .{ .n = "min", .f = .min },
     .{ .n = "max", .f = .max },
 };
+
+/// Whether `name` is an aggregate function — reserved, since it is parsed as
+/// one before any user function could be looked up.
+pub fn isAggName(name: []const u8) bool {
+    for (agg_names) |a| if (std.mem.eql(u8, a.n, name)) return true;
+    return false;
+}
 
 fn isGroupKey(group: []const ast.QualName, q: ast.QualName) bool {
     for (group) |k| {
@@ -2271,7 +2278,7 @@ pub const Parser = struct {
         try self.expectKw("by");
         const mode = try self.expectIdent();
         const is_cursor = eqlNoCase(mode, "cursor");
-        // http.zig reads the mode off a `paginate` hint; a bare flag key
+        // http_client.zig reads the mode off a `paginate` hint; a bare flag key
         // planned fine but left paginate=.none, so only one page was fetched.
         if (eqlNoCase(mode, "page") or eqlNoCase(mode, "offset") or is_cursor) {
             try hints.append(.{ .key = "paginate", .value = .{ .ident = mode }, .pos = pos });

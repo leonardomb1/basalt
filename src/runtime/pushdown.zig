@@ -23,8 +23,9 @@
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
-const splitmod = @import("../connect/split.zig");
+const split = @import("../connect/split.zig");
 const Dialect = @import("../connect/sql.zig").Dialect;
+const builtins = @import("../exec/builtins.zig");
 
 /// The result of planning pushdown for one aggregate pipeline. Empty fields mean
 /// "don't push that half" — the lane query then uses `*` / the bare key range.
@@ -105,7 +106,7 @@ pub const WholeAgg = struct {
 ///     COLLATION (case-insensitive by default on mysql and sqlserver) while the engine
 ///     compares bytes, and a timestamp CAST can shift under a session timezone;
 ///   - `DISTINCT` on anything but `COUNT` (the engine's `updateAcc` only honours it there);
-///   - a planned output type `sqlTypeName` has no cast target for.
+///   - a planned output type `Dialect.castType` has no cast target for.
 ///
 /// Null handling matches by construction and is verified on the engine side: NULL group
 /// keys collapse into one group (`op.Aggregate.drainFixed`'s null mask / `keyhash.valueEq`),
@@ -146,7 +147,7 @@ pub fn planWholeAgg(
         const out = plan_schema.fields[i];
         if (!std.mem.eql(u8, out.name, col)) return null;
         if (out.ty.kind != src_schema.fields[idx].ty.kind) return null;
-        const qc = try splitmod.quoteIdent(arena, dialect, col);
+        const qc = try split.quoteIdent(arena, dialect, col);
         if (keys.items.len > 0) try keys.appendSlice(", ");
         try keys.appendSlice(qc);
         if (sel.items.len > 0) try sel.appendSlice(", ");
@@ -158,10 +159,10 @@ pub fn planWholeAgg(
     for (ag.aggs, 0..) |item, i| {
         const out = plan_schema.fields[ag.by.len + i];
         const inner = (try aggExpr(arena, dialect, src_schema, item, out.ty)) orelse return null;
-        const cast_to = (try sqlTypeName(arena, dialect, out.ty)) orelse return null;
+        const cast_to = (try dialect.castType(arena, out.ty)) orelse return null;
         if (sel.items.len > 0) try sel.appendSlice(", ");
         try sel.appendSlice(try std.fmt.allocPrint(arena, "CAST({s} AS {s}) AS {s}", .{
-            inner, cast_to, try splitmod.quoteIdent(arena, dialect, out.name),
+            inner, cast_to, try split.quoteIdent(arena, dialect, out.name),
         }));
     }
 
@@ -195,7 +196,7 @@ fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema,
     const name = arg.field.parts[0];
     const idx = src_schema.indexOf(name) orelse return null;
     const src_kind = src_schema.fields[idx].ty.kind;
-    const col = try splitmod.quoteIdent(arena, dialect, name);
+    const col = try split.quoteIdent(arena, dialect, name);
 
     switch (item.func) {
         .count => {
@@ -325,7 +326,7 @@ fn buildProjection(arena: std.mem.Allocator, dialect: Dialect, src_schema: types
     for (src_schema.fields) |f| {
         if (!need.contains(f.name)) continue;
         if (sel.items.len > 0) try sel.appendSlice(", ");
-        try sel.appendSlice(try splitmod.quoteIdent(arena, dialect, f.name));
+        try sel.appendSlice(try split.quoteIdent(arena, dialect, f.name));
         try fields.append(f);
     }
     if (fields.items.len > 0 and fields.items.len < src_schema.fields.len)
@@ -353,7 +354,7 @@ pub fn translateExpr(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dial
         .field => |q| {
             if (q.parts.len != 1) return null;
             if (check_fields and !inSchema(schema, q.parts[0])) return null;
-            return try splitmod.quoteIdent(arena, dialect, q.parts[0]);
+            return try split.quoteIdent(arena, dialect, q.parts[0]);
         },
         .unary => |u| {
             if (u.op != .not) return null;
@@ -412,14 +413,13 @@ pub fn translateExpr(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dial
             // ask for the source's own coercion on purpose.
             if (numericKind(c.ty.kind) and !provablyNumeric(c.e, schema)) return null;
             const inner = (try translateExpr(arena, c.e, dialect, schema, check_fields)) orelse return null;
-            const ty = sqlTypeName(arena, dialect, c.ty) catch return error.OutOfMemory;
+            const ty = dialect.castType(arena, c.ty) catch return error.OutOfMemory;
             return try std.fmt.allocPrint(arena, "CAST({s} AS {s})", .{ inner, (ty orelse return null) });
         },
         .call => |c| return translateCall(arena, c, dialect, schema, check_fields),
         else => return null,
     }
 }
-
 
 fn numericKind(k: types.TypeKind) bool {
     return k == .int or k == .float or k == .decimal;
@@ -471,34 +471,6 @@ fn translateMatch(arena: std.mem.Allocator, m: ast.Match, dialect: Dialect, sche
 }
 
 /// Dialect spelling of a CAST target type (null = don't push this cast).
-fn sqlTypeName(arena: std.mem.Allocator, dialect: Dialect, ty: types.Type) !?[]const u8 {
-    return switch (ty.kind) {
-        .int => switch (dialect) {
-            .mysql => "SIGNED",
-            else => "BIGINT",
-        },
-        .float => switch (dialect) {
-            .sqlserver => "FLOAT",
-            .mysql => "DOUBLE",
-            .postgres => "DOUBLE PRECISION",
-        },
-        .string => switch (dialect) {
-            .sqlserver => "VARCHAR(MAX)",
-            .mysql => "CHAR",
-            .postgres => "TEXT",
-        },
-        .decimal => try std.fmt.allocPrint(arena, "DECIMAL({d},{d})", .{ ty.precision, ty.scale }),
-        .date => "DATE",
-        .time => "TIME",
-        .timestamp => switch (dialect) {
-            .sqlserver => "DATETIME2",
-            .mysql => "DATETIME",
-            .postgres => "TIMESTAMP",
-        },
-        else => null,
-    };
-}
-
 /// Scalar-function translation — only names whose semantics are identical in
 /// all three dialects (or have an exact per-dialect spelling). StarRocks rides
 /// the `.mysql` dialect, so every mysql rendering here must hold there too.
@@ -520,81 +492,132 @@ fn translateCall(arena: std.mem.Allocator, c: ast.Expr.Call, dialect: Dialect, s
     const args = try arena.alloc([]const u8, c.args.len);
     for (c.args, args) |a, *out| out.* = (try translateExpr(arena, a, dialect, schema, check_fields)) orelse return null;
 
-    const n = c.name;
-    if (std.mem.eql(u8, n, "lower") and args.len == 1)
-        return try std.fmt.allocPrint(arena, "LOWER({s})", .{args[0]});
-    if (std.mem.eql(u8, n, "upper") and args.len == 1)
-        return try std.fmt.allocPrint(arena, "UPPER({s})", .{args[0]});
-    if (std.mem.eql(u8, n, "length") and args.len == 1) {
+    const p = lookupPushable(c.name) orelse return null;
+    if (args.len < p.min_args or args.len > p.max_args) return null;
+    return p.render(arena, p, c, args, dialect);
+}
+
+/// One pushable builtin: the engine name, the argument counts it is pushed
+/// for, and a renderer. `sql` is the portable spelling used by `render.plain`;
+/// dialect-aware renderers ignore it.
+const Pushable = struct {
+    name: []const u8,
+    sql: []const u8 = "",
+    min_args: usize,
+    max_args: usize,
+    render: *const fn (std.mem.Allocator, *const Pushable, ast.Expr.Call, []const []const u8, Dialect) error{OutOfMemory}!?[]const u8,
+};
+
+const variadic = std.math.maxInt(usize);
+
+/// Every builtin `translateCall` will push. Each name must also be an engine
+/// builtin (`exec/builtins.zig`) — a test below holds the two tables together.
+const pushable = [_]Pushable{
+    .{ .name = "lower", .sql = "LOWER", .min_args = 1, .max_args = 1, .render = render.plain },
+    .{ .name = "upper", .sql = "UPPER", .min_args = 1, .max_args = 1, .render = render.plain },
+    .{ .name = "length", .min_args = 1, .max_args = 1, .render = render.length },
+    .{ .name = "trim", .min_args = 1, .max_args = 1, .render = render.trim },
+    .{ .name = "substr", .sql = "SUBSTRING", .min_args = 3, .max_args = 3, .render = render.plain },
+    .{ .name = "replace", .sql = "REPLACE", .min_args = 3, .max_args = 3, .render = render.plain },
+    .{ .name = "concat", .sql = "CONCAT", .min_args = 2, .max_args = variadic, .render = render.plain },
+    .{ .name = "coalesce", .sql = "COALESCE", .min_args = 2, .max_args = variadic, .render = render.plain },
+    .{ .name = "like", .min_args = 2, .max_args = 2, .render = render.like },
+    .{ .name = "starts_with", .min_args = 2, .max_args = 2, .render = render.affix },
+    .{ .name = "ends_with", .min_args = 2, .max_args = 2, .render = render.affix },
+    .{ .name = "contains", .min_args = 2, .max_args = 2, .render = render.affix },
+    // Builtins spelled and evaluated identically on postgres, mysql/starrocks and
+    // sqlserver. (Domain edges — SQRT of a negative, POWER(0, -n), MOD by zero — raise
+    // on some engines and yield NULL on others; that's a loud query failure rather than
+    // a silently dropped row, and the same input is a degenerate case engine-side too.)
+    .{ .name = "abs", .sql = "ABS", .min_args = 1, .max_args = 1, .render = render.plain },
+    .{ .name = "floor", .sql = "FLOOR", .min_args = 1, .max_args = 1, .render = render.plain },
+    .{ .name = "sqrt", .sql = "SQRT", .min_args = 1, .max_args = 1, .render = render.plain },
+    .{ .name = "sign", .sql = "SIGN", .min_args = 1, .max_args = 1, .render = render.plain },
+    .{ .name = "reverse", .sql = "REVERSE", .min_args = 1, .max_args = 1, .render = render.plain },
+    .{ .name = "power", .sql = "POWER", .min_args = 2, .max_args = 2, .render = render.plain },
+    .{ .name = "nullif", .sql = "NULLIF", .min_args = 2, .max_args = 2, .render = render.plain },
+    .{ .name = "ceil", .min_args = 1, .max_args = 1, .render = render.ceil },
+    .{ .name = "mod", .min_args = 2, .max_args = 2, .render = render.mod },
+    .{ .name = "left", .min_args = 2, .max_args = 2, .render = render.counted },
+    .{ .name = "right", .min_args = 2, .max_args = 2, .render = render.counted },
+    .{ .name = "repeat", .min_args = 2, .max_args = 2, .render = render.counted },
+    .{ .name = "strpos", .min_args = 2, .max_args = 2, .render = render.strpos },
+};
+
+fn lookupPushable(name: []const u8) ?*const Pushable {
+    const map = comptime blk: {
+        var kvs: [pushable.len]struct { []const u8, usize } = undefined;
+        for (pushable, 0..) |p, i| kvs[i] = .{ p.name, i };
+        break :blk std.StaticStringMap(usize).initComptime(kvs);
+    };
+    const i = map.get(name) orelse return null;
+    return &pushable[i];
+}
+
+const render = struct {
+    fn plain(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
+        _ = c;
+        _ = dialect;
+        const joined = try std.mem.join(arena, ", ", args);
+        return try std.fmt.allocPrint(arena, "{s}({s})", .{ p.sql, joined });
+    }
+
+    fn length(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
+        _ = p;
+        _ = c;
         const f = switch (dialect) {
             .sqlserver => "LEN",
-            .mysql => "CHAR_LENGTH",
+            .mysql, .starrocks => "CHAR_LENGTH",
             .postgres => "LENGTH",
         };
         return try std.fmt.allocPrint(arena, "{s}({s})", .{ f, args[0] });
     }
-    if (std.mem.eql(u8, n, "trim") and args.len == 1) {
+
+    fn trim(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
+        _ = p;
+        _ = c;
         return switch (dialect) {
             .sqlserver => try std.fmt.allocPrint(arena, "LTRIM(RTRIM({s}))", .{args[0]}),
             else => try std.fmt.allocPrint(arena, "TRIM({s})", .{args[0]}),
         };
     }
-    if (std.mem.eql(u8, n, "substr") and args.len == 3)
-        return try std.fmt.allocPrint(arena, "SUBSTRING({s}, {s}, {s})", .{ args[0], args[1], args[2] });
-    if (std.mem.eql(u8, n, "replace") and args.len == 3)
-        return try std.fmt.allocPrint(arena, "REPLACE({s}, {s}, {s})", .{ args[0], args[1], args[2] });
-    if ((std.mem.eql(u8, n, "concat") or std.mem.eql(u8, n, "coalesce")) and args.len >= 2) {
-        const f = if (n[0] == 'c' and n[1] == 'o' and n[2] == 'n') "CONCAT" else "COALESCE";
-        const joined = try std.mem.join(arena, ", ", args);
-        return try std.fmt.allocPrint(arena, "{s}({s})", .{ f, joined });
-    }
-    if (std.mem.eql(u8, n, "like") and args.len == 2)
+
+    fn like(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
+        _ = p;
+        _ = c;
+        _ = dialect;
         return try std.fmt.allocPrint(arena, "({s} LIKE {s})", .{ args[0], args[1] });
-    if ((std.mem.eql(u8, n, "starts_with") or std.mem.eql(u8, n, "ends_with") or
-        std.mem.eql(u8, n, "contains")) and c.args.len == 2)
-    {
+    }
+
+    fn affix(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
+        _ = dialect;
         if (c.args[1].* != .str_lit) return null;
         const pat = c.args[1].str_lit;
         for (pat) |ch| {
             if (ch == '%' or ch == '_' or ch == '\\') return null;
         }
-        const shaped = if (std.mem.eql(u8, n, "starts_with"))
+        const shaped = if (std.mem.eql(u8, p.name, "starts_with"))
             try std.fmt.allocPrint(arena, "{s}%", .{pat})
-        else if (std.mem.eql(u8, n, "ends_with"))
+        else if (std.mem.eql(u8, p.name, "ends_with"))
             try std.fmt.allocPrint(arena, "%{s}", .{pat})
         else
             try std.fmt.allocPrint(arena, "%{s}%", .{pat});
         return try std.fmt.allocPrint(arena, "({s} LIKE {s})", .{ args[0], try sqlStr(arena, shaped) });
     }
 
-    // Builtins spelled and evaluated identically on postgres, mysql/starrocks and
-    // sqlserver. (Domain edges — SQRT of a negative, POWER(0, -n), MOD by zero — raise
-    // on some engines and yield NULL on others; that's a loud query failure rather than
-    // a silently dropped row, and the same input is a degenerate case engine-side too.)
-    const uniform = [_]struct { name: []const u8, sql: []const u8, arity: usize }{
-        .{ .name = "abs", .sql = "ABS", .arity = 1 },
-        .{ .name = "floor", .sql = "FLOOR", .arity = 1 },
-        .{ .name = "sqrt", .sql = "SQRT", .arity = 1 },
-        .{ .name = "sign", .sql = "SIGN", .arity = 1 },
-        .{ .name = "reverse", .sql = "REVERSE", .arity = 1 },
-        .{ .name = "power", .sql = "POWER", .arity = 2 },
-        .{ .name = "nullif", .sql = "NULLIF", .arity = 2 },
-    };
-    for (uniform) |u| {
-        if (std.mem.eql(u8, n, u.name) and args.len == u.arity) {
-            const joined = try std.mem.join(arena, ", ", args);
-            return try std.fmt.allocPrint(arena, "{s}({s})", .{ u.sql, joined });
-        }
-    }
-
-    if (std.mem.eql(u8, n, "ceil") and args.len == 1) {
+    fn ceil(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
+        _ = p;
+        _ = c;
         const f = switch (dialect) {
             .sqlserver => "CEILING", // T-SQL has no CEIL
             else => "CEIL",
         };
         return try std.fmt.allocPrint(arena, "{s}({s})", .{ f, args[0] });
     }
-    if (std.mem.eql(u8, n, "mod") and args.len == 2) {
+
+    fn mod(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
+        _ = p;
+        _ = c;
         // sqlserver has no MOD function, only the `%` operator. Both take the sign of
         // the DIVIDEND (`-7 % 3` = `MOD(-7, 3)` = -1) on all four engines, matching the
         // engine's own mod — so the two spellings agree on negatives.
@@ -603,16 +626,15 @@ fn translateCall(arena: std.mem.Allocator, c: ast.Expr.Call, dialect: Dialect, s
             else => try std.fmt.allocPrint(arena, "MOD({s}, {s})", .{ args[0], args[1] }),
         };
     }
-    if ((std.mem.eql(u8, n, "left") or std.mem.eql(u8, n, "right") or
-        std.mem.eql(u8, n, "repeat")) and c.args.len == 2)
-    {
+
+    fn counted(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
         // A negative count diverges: postgres LEFT/RIGHT count back from the far end
         // while mysql/starrocks return '', and sqlserver REPLICATE returns NULL where
         // the others return ''. Push only a literal count we can see is >= 0.
         if (c.args[1].* != .int_lit or c.args[1].int_lit < 0) return null;
-        const f: []const u8 = if (std.mem.eql(u8, n, "left"))
+        const f: []const u8 = if (std.mem.eql(u8, p.name, "left"))
             "LEFT"
-        else if (std.mem.eql(u8, n, "right"))
+        else if (std.mem.eql(u8, p.name, "right"))
             "RIGHT"
         else if (dialect == .sqlserver)
             "REPLICATE" // T-SQL's spelling of REPEAT
@@ -620,7 +642,9 @@ fn translateCall(arena: std.mem.Allocator, c: ast.Expr.Call, dialect: Dialect, s
             "REPEAT";
         return try std.fmt.allocPrint(arena, "{s}({s}, {s})", .{ f, args[0], args[1] });
     }
-    if (std.mem.eql(u8, n, "strpos") and c.args.len == 2) {
+
+    fn strpos(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
+        _ = p;
         // All three are 1-based with 0 for "not found", like the engine — but mysql's
         // LOCATE and sqlserver's CHARINDEX take (needle, haystack), the reverse of
         // postgres' STRPOS. An empty needle is the one divergence (postgres 1,
@@ -628,12 +652,11 @@ fn translateCall(arena: std.mem.Allocator, c: ast.Expr.Call, dialect: Dialect, s
         if (c.args[1].* == .str_lit and c.args[1].str_lit.len == 0) return null;
         return switch (dialect) {
             .postgres => try std.fmt.allocPrint(arena, "STRPOS({s}, {s})", .{ args[0], args[1] }),
-            .mysql => try std.fmt.allocPrint(arena, "LOCATE({s}, {s})", .{ args[1], args[0] }),
+            .mysql, .starrocks => try std.fmt.allocPrint(arena, "LOCATE({s}, {s})", .{ args[1], args[0] }),
             .sqlserver => try std.fmt.allocPrint(arena, "CHARINDEX({s}, {s})", .{ args[1], args[0] }),
         };
     }
-    return null;
-}
+};
 
 /// §7 implicit pushdown for a serial pipeline: translate the `filter` stages
 /// that immediately follow a SQL read into one AND-ed WHERE fragment. The
@@ -1207,6 +1230,15 @@ test "translateCall: excluded builtins fall back to the engine" {
     try testing.expect((try translateExpr(a, cmp, .postgres, testSchema(), true)) == null);
 }
 
+test "translateCall: every pushable name is an engine builtin" {
+    for (pushable) |p| {
+        if (builtins.lookup(p.name) == null) {
+            std.debug.print("pushdown table names `{s}`, which is not a builtin\n", .{p.name});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 test "translateExpr: a safe (TRY_) cast is never pushed" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -1488,7 +1520,6 @@ test "planWholeAgg: a non-bare aggregate argument falls back" {
     try testing.expect((try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = aggs, .by = &.{} }, plan_schema)) == null);
 }
 
-
 // ---------------------------------------------------------------------------
 // Moving a filter below a join
 //
@@ -1604,7 +1635,6 @@ fn refsOnlyProbe(
     }
     return true;
 }
-
 
 /// Collect the `QualName` of every column reference, qualifier included.
 ///

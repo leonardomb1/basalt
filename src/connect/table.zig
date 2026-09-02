@@ -5,12 +5,10 @@
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
-const batchmod = @import("../exec/batch.zig");
+const Batch = @import("../exec/batch.zig").Batch;
 const eval = @import("../exec/eval.zig");
-const valuemod = @import("../exec/value.zig");
+const Value = @import("../exec/value.zig").Value;
 const driver = @import("driver.zig");
-
-const Batch = batchmod.Batch;
 
 pub const TableWriter = struct {
     gpa: std.mem.Allocator,
@@ -82,6 +80,11 @@ pub const TableWriter = struct {
         try out.flush();
     }
 
+    /// Failure path: discard the accumulated rows without printing.
+    pub fn abort(self: *TableWriter) void {
+        self.deinit();
+    }
+
     fn deinit(self: *TableWriter) void {
         for (self.cells.items) |c| self.gpa.free(c);
         self.cells.deinit();
@@ -94,20 +97,7 @@ pub const TableWriter = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable = driver.Sink.VTable{ .writeBatch = vtWrite, .close = vtClose, .abort = vtAbort };
-
-    fn vtWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
-        const self: *TableWriter = @ptrCast(@alignCast(ptr));
-        return self.writeBatch(arena, b);
-    }
-    fn vtClose(ptr: *anyopaque) anyerror!void {
-        const self: *TableWriter = @ptrCast(@alignCast(ptr));
-        return self.close();
-    }
-    fn vtAbort(ptr: *anyopaque) void {
-        const self: *TableWriter = @ptrCast(@alignCast(ptr));
-        self.deinit();
-    }
+    const vtable = driver.sinkVTable(TableWriter);
 };
 
 /// Column width in characters, not bytes. `LIQUIDAÇÃO` is ten characters in
@@ -172,7 +162,7 @@ pub const JsonWriter = struct {
         }
     }
 
-    fn writeJsonValue(out: *std.Io.Writer, arena: std.mem.Allocator, v: valuemod.Value) !void {
+    fn writeJsonValue(out: *std.Io.Writer, arena: std.mem.Allocator, v: Value) !void {
         switch (v) {
             .null => try out.writeAll("null"),
             .bool => |b| try out.writeAll(if (b) "true" else "false"),
@@ -199,6 +189,11 @@ pub const JsonWriter = struct {
         self.deinit();
     }
 
+    /// Failure path: release without flushing the tail of the stream.
+    pub fn abort(self: *JsonWriter) void {
+        self.deinit();
+    }
+
     fn deinit(self: *JsonWriter) void {
         for (self.keys) |k| self.gpa.free(k);
         self.gpa.free(self.keys);
@@ -209,20 +204,7 @@ pub const JsonWriter = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable = driver.Sink.VTable{ .writeBatch = vtWrite, .close = vtClose, .abort = vtAbort };
-
-    fn vtWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
-        const self: *JsonWriter = @ptrCast(@alignCast(ptr));
-        return self.writeBatch(arena, b);
-    }
-    fn vtClose(ptr: *anyopaque) anyerror!void {
-        const self: *JsonWriter = @ptrCast(@alignCast(ptr));
-        return self.close();
-    }
-    fn vtAbort(ptr: *anyopaque) void {
-        const self: *JsonWriter = @ptrCast(@alignCast(ptr));
-        self.deinit();
-    }
+    const vtable = driver.sinkVTable(JsonWriter);
 };
 
 fn appendJsonEscaped(list: *std.array_list.Managed(u8), s: []const u8) !void {

@@ -14,7 +14,7 @@
 //! so no registration is required.
 
 const std = @import("std");
-const httpx = @import("http.zig");
+const http_client = @import("http_client.zig");
 
 /// Microsoft.Data.SqlClient's built-in client id for AAD auth (first-party,
 /// pre-consented) and the Azure SQL resource the Dataverse TDS endpoint accepts.
@@ -51,7 +51,7 @@ const Realm = struct { federated: bool, sts_url: []const u8 };
 /// GET getuserrealm.srf -> {NameSpaceType, AuthURL}. For a federated domain,
 /// derives the WS-Trust 1.3 usernamemixed endpoint from the AuthURL host.
 fn getUserRealm(gpa: std.mem.Allocator, upn: []const u8) !Realm {
-    var client = httpx.initClient(gpa);
+    var client = http_client.initClient(gpa);
     defer client.deinit();
     var login_enc = std.array_list.Managed(u8).init(gpa);
     defer login_enc.deinit();
@@ -76,7 +76,7 @@ fn getUserRealm(gpa: std.mem.Allocator, upn: []const u8) !Realm {
 
 fn hostOf(url: []const u8) ?[]const u8 {
     const uri = std.Uri.parse(url) catch return null;
-    const h = httpx.uriHost(uri) orelse return null;
+    const h = http_client.uriHost(uri) orelse return null;
     return if (h.len == 0) null else h;
 }
 
@@ -102,7 +102,7 @@ fn wsTrustAssertion(gpa: std.mem.Allocator, username: []const u8, password: []co
     , .{ mid, sts_url, created, expires, uid, u_esc, p_esc });
     defer gpa.free(envelope);
 
-    var client = httpx.initClient(gpa);
+    var client = http_client.initClient(gpa);
     defer client.deinit();
     var aw = std.Io.Writer.Allocating.init(gpa);
     defer aw.deinit();
@@ -192,7 +192,7 @@ pub fn ropcToken(
 }
 
 fn postForToken(gpa: std.mem.Allocator, url: []const u8, body: []const u8) ![]const u8 {
-    var client = httpx.initClient(gpa);
+    var client = http_client.initClient(gpa);
     defer client.deinit();
     var aw = std.Io.Writer.Allocating.init(gpa);
     defer aw.deinit();
@@ -222,8 +222,8 @@ fn postForToken(gpa: std.mem.Allocator, url: []const u8, body: []const u8) ![]co
     };
 }
 
-const appendForm = httpx.appendForm;
-const formEncode = httpx.formEncode;
+const appendForm = http_client.appendForm;
+const formEncode = http_client.formEncode;
 
 fn xmlEscape(gpa: std.mem.Allocator, s: []const u8) ![]const u8 {
     var out = std.array_list.Managed(u8).init(gpa);
@@ -245,8 +245,8 @@ fn iso8601(gpa: std.mem.Allocator, secs: i64) ![]const u8 {
     const md = yd.calculateMonthDay();
     const ds = es.getDaySeconds();
     return std.fmt.allocPrint(gpa, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.000Z", .{
-        yd.year,                  md.month.numeric(),        md.day_index + 1,
-        ds.getHoursIntoDay(),     ds.getMinutesIntoHour(),   ds.getSecondsIntoMinute(),
+        yd.year,              md.month.numeric(),      md.day_index + 1,
+        ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
     });
 }
 

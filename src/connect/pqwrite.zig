@@ -17,20 +17,18 @@
 //! Azure block blob, and what a future S3/GCS sink would plug into.
 
 const std = @import("std");
-const pq = @import("parquet.zig");
+const parquet = @import("parquet.zig");
 const thrift = @import("thrift.zig");
 const codec = @import("codec.zig");
 const eval = @import("../exec/eval.zig");
 const driver = @import("driver.zig");
-const azure = @import("azure.zig");
-const s3 = @import("s3.zig");
-const httpx = @import("http.zig");
+const http_client = @import("http_client.zig");
+const objstore = @import("objstore.zig");
 const types = @import("../lang/types.zig");
-const batchmod = @import("../exec/batch.zig");
-const valuemod = @import("../exec/value.zig");
+const Batch = @import("../exec/batch.zig").Batch;
+const Decimal = @import("../exec/value.zig").Decimal;
+const Value = @import("../exec/value.zig").Value;
 
-const Batch = batchmod.Batch;
-const Value = valuemod.Value;
 const List = std.array_list.Managed;
 
 pub const Error = error{
@@ -54,7 +52,7 @@ pub const page_target_bytes = 1 << 20;
 
 /// How a basalt column is stored in Parquet.
 const Mapping = struct {
-    phys: pq.PhysicalType,
+    phys: parquet.PhysicalType,
     converted: ?i32 = null,
     precision: ?i32 = null,
     scale: ?i32 = null,
@@ -342,20 +340,18 @@ pub const Writer = struct {
     offset: i64 = 0,
     groups: List(RowGroupMeta),
 
-    /// A local file, or a block blob staged over HTTP. Both expose a plain
+    /// A local file, or an object staged over HTTP. Both expose a plain
     /// `*std.Io.Writer`, so page and footer emission below is identical either
     /// way — mirrors `csv.CsvWriter.Backend`.
     const Backend = union(enum) {
         file: std.fs.File,
-        blob: struct { client: *std.http.Client, w: *azure.BlockBlobWriter },
-        s3obj: struct { client: *std.http.Client, w: *s3.MultipartWriter },
+        object: objstore.Writer,
     };
 
     fn dest(self: *Writer) *std.Io.Writer {
         return switch (self.backend) {
             .file => &self.fw.interface,
-            .blob => |b| &b.w.interface,
-            .s3obj => |b| &b.w.interface,
+            .object => |o| o.io,
         };
     }
 
@@ -378,9 +374,9 @@ pub const Writer = struct {
         if (!codec.canCompress(compression)) return codec.Error.UnsupportedCodec;
         const maps = try arena.alloc(Mapping, schema.fields.len);
         for (schema.fields, maps) |f, *m| {
-        m.* = try mapType(f.ty);
-        m.optional = f.ty.nullable;
-    }
+            m.* = try mapType(f.ty);
+            m.optional = f.ty.nullable;
+        }
 
         const cols = try arena.alloc(ColBuf, schema.fields.len);
         for (cols, maps) |*c, m| {
@@ -400,27 +396,16 @@ pub const Writer = struct {
             .cols = cols,
             .groups = List(RowGroupMeta).init(arena),
         };
-        if (azure.isUrl(path)) {
+        if (objstore.isUrl(path)) {
             const client = try arena.create(std.http.Client);
-            client.* = httpx.initClient(arena);
-            const blob = try azure.parseUrl(arena, path, azure.endpointFromEnv(arena));
-            self.backend = .{ .blob = .{
-                .client = client,
-                .w = try azure.BlockBlobWriter.init(arena, client, blob, parquet_content_type),
-            } };
-        } else if (s3.isUrl(path)) {
-            const client = try arena.create(std.http.Client);
-            client.* = httpx.initClient(arena);
-            const obj = try s3.parseUrl(arena, path, s3.endpointFromEnv(arena));
-            self.backend = .{ .s3obj = .{
-                .client = client,
-                .w = try s3.MultipartWriter.init(arena, client, obj, parquet_content_type),
-            } };
+            client.* = http_client.initClient(arena);
+            const obj = try objstore.parse(arena, path);
+            self.backend = .{ .object = try obj.openWriter(arena, client, parquet_content_type) };
         } else {
             self.backend = .{ .file = try std.fs.cwd().createFile(path, .{}) };
             self.fw = self.backend.file.writer(&self.write_buf);
         }
-        try self.emit(pq.magic);
+        try self.emit(parquet.magic);
         return self;
     }
 
@@ -429,16 +414,12 @@ pub const Writer = struct {
         self.offset += @intCast(bytes.len);
     }
 
-    /// Recovers the error a blob destination actually hit. Staging a block runs
-    /// under `std.Io.Writer`, whose error set is just `WriteFailed`, so the Azure
-    /// code recorded at the point of failure is put back here — otherwise a 403
-    /// and a missing container are the same word to the caller.
+    /// Recovers the error an object destination actually hit (see
+    /// `objstore.Writer.specific`); a file's error is already the real one.
     fn specific(self: *Writer, e: anyerror) anyerror {
-        if (e != error.WriteFailed) return e;
         return switch (self.backend) {
             .file => e,
-            .blob => |b| b.w.last_status orelse e,
-            .s3obj => |b| b.w.last_status orelse e,
+            .object => |o| o.specific(e),
         };
     }
 
@@ -619,7 +600,7 @@ pub const Writer = struct {
         var len4: [4]u8 = undefined;
         std.mem.writeInt(u32, &len4, @intCast(footer.items.len), .little);
         try self.emit(&len4);
-        try self.emit(pq.magic);
+        try self.emit(parquet.magic);
 
         switch (self.backend) {
             .file => |f| {
@@ -629,12 +610,10 @@ pub const Writer = struct {
                 };
                 f.close();
             },
-            // Committing the block list is what publishes the blob, and it happens
-            // only once the footer is written — so a reader never observes a
-            // Parquet object without one. Atomic publication, for free.
-            .blob => |b| b.w.finish() catch |e| return self.specific(e),
-            // Same for the multipart completion (or the single PUT).
-            .s3obj => |b| b.w.finish() catch |e| return self.specific(e),
+            // Committing the staged upload is what publishes the object, and it
+            // happens only once the footer is written — so a reader never observes
+            // a Parquet object without one. Atomic publication, for free.
+            .object => |o| o.finish() catch |e| return self.specific(e),
         }
     }
 
@@ -645,10 +624,10 @@ pub const Writer = struct {
     pub fn abort(self: *Writer) void {
         switch (self.backend) {
             .file => |f| f.close(),
-            .blob => {},
-            // An uncompleted multipart upload is invisible to readers; unlike
-            // Azure, S3 only reaps it where the bucket has a lifecycle rule.
-            .s3obj => {},
+            // Staged blocks and an uncompleted multipart upload are invisible to
+            // readers. Azure reaps them after a week; S3 only where the bucket has
+            // a lifecycle rule.
+            .object => {},
         }
     }
 
@@ -678,7 +657,7 @@ pub const Writer = struct {
             try w.structBegin();
             try w.writeI32(1, @intFromEnum(m.phys));
             try w.listBegin(2, .i32, 1);
-            try w.writeZigZag(@intFromEnum(if (c.dict) pq.Encoding.rle_dictionary else pq.Encoding.plain));
+            try w.writeZigZag(@intFromEnum(if (c.dict) parquet.Encoding.rle_dictionary else parquet.Encoding.plain));
             try w.listBegin(3, .binary, 1);
             try w.writeVarint(f.name.len);
             try w.out.appendSlice(f.name);
@@ -798,7 +777,7 @@ fn writeSchemaLeaf(w: *thrift.Writer, name: []const u8, m: Mapping) !void {
     try w.structBegin();
     try w.writeI32(1, @intFromEnum(m.phys));
     if (m.type_length) |n| try w.writeI32(2, n);
-    try w.writeI32(3, @intFromEnum(if (m.optional) pq.Repetition.optional else pq.Repetition.required));
+    try w.writeI32(3, @intFromEnum(if (m.optional) parquet.Repetition.optional else parquet.Repetition.required));
     try w.writeBinary(4, name);
     if (m.converted) |c| try w.writeI32(6, c);
     if (m.scale) |s| try w.writeI32(7, s);
@@ -864,7 +843,7 @@ fn writePageHeader(
 ) !void {
     var w = thrift.Writer.init(out);
     try w.structBegin();
-    try w.writeI32(1, @intFromEnum(pq.PageType.data_page));
+    try w.writeI32(1, @intFromEnum(parquet.PageType.data_page));
     try w.writeI32(2, @intCast(uncompressed));
     try w.writeI32(3, @intCast(compressed));
     // CRC32 of the compressed page data, so a reader can detect corruption
@@ -872,9 +851,9 @@ fn writePageHeader(
     try w.fieldBegin(.@"struct", 5); // data_page_header
     try w.structBegin();
     try w.writeI32(1, @intCast(values));
-    try w.writeI32(2, @intFromEnum(pq.Encoding.plain));
-    try w.writeI32(3, @intFromEnum(pq.Encoding.rle)); // definition_level_encoding
-    try w.writeI32(4, @intFromEnum(pq.Encoding.rle)); // repetition_level_encoding
+    try w.writeI32(2, @intFromEnum(parquet.Encoding.plain));
+    try w.writeI32(3, @intFromEnum(parquet.Encoding.rle)); // definition_level_encoding
+    try w.writeI32(4, @intFromEnum(parquet.Encoding.rle)); // repetition_level_encoding
     try w.structEnd();
     try w.structEnd();
 }
@@ -972,7 +951,7 @@ fn encodePlain(cb: *ColBuf, m: Mapping, v: Value) !void {
 /// The result is the full i128 — how many bytes it lands in is the physical
 /// type's business. Overflowing i128 is an error, not a saturated one: clamping
 /// turned `12.5` in a `numeric(38,18)` column into `9.223372036854775807`.
-fn rescale(d: valuemod.Decimal, want: i32) Error!i128 {
+fn rescale(d: Decimal, want: i32) Error!i128 {
     var unscaled: i128 = d.unscaled;
     var have: i32 = d.scale;
     while (have < want) : (have += 1)
@@ -982,7 +961,7 @@ fn rescale(d: valuemod.Decimal, want: i32) Error!i128 {
 }
 
 /// The restated unscaled value narrowed to the column's storage width.
-fn rescaleTo(comptime T: type, d: valuemod.Decimal, want: i32) Error!T {
+fn rescaleTo(comptime T: type, d: Decimal, want: i32) Error!T {
     return std.math.cast(T, try rescale(d, want)) orelse Error.UnsupportedParquetDecimal;
 }
 
@@ -1025,17 +1004,17 @@ const pqdecode = @import("pqdecode.zig");
 const column = @import("../exec/column.zig");
 
 test "basalt types map onto Parquet physical and converted types" {
-    try testing.expectEqual(pq.PhysicalType.boolean, (try mapType(types.Type.init(.bool))).phys);
-    try testing.expectEqual(pq.PhysicalType.int64, (try mapType(types.Type.init(.int))).phys);
-    try testing.expectEqual(pq.PhysicalType.double, (try mapType(types.Type.init(.float))).phys);
-    try testing.expectEqual(pq.PhysicalType.byte_array, (try mapType(types.Type.init(.string))).phys);
+    try testing.expectEqual(parquet.PhysicalType.boolean, (try mapType(types.Type.init(.bool))).phys);
+    try testing.expectEqual(parquet.PhysicalType.int64, (try mapType(types.Type.init(.int))).phys);
+    try testing.expectEqual(parquet.PhysicalType.double, (try mapType(types.Type.init(.float))).phys);
+    try testing.expectEqual(parquet.PhysicalType.byte_array, (try mapType(types.Type.init(.string))).phys);
     try testing.expectEqual(@as(?i32, conv_utf8), (try mapType(types.Type.init(.string))).converted);
-    try testing.expectEqual(pq.PhysicalType.int32, (try mapType(types.Type.init(.date))).phys);
+    try testing.expectEqual(parquet.PhysicalType.int32, (try mapType(types.Type.init(.date))).phys);
     try testing.expectEqual(@as(?i32, conv_date), (try mapType(types.Type.init(.date))).converted);
     try testing.expectEqual(@as(?i32, conv_timestamp_micros), (try mapType(types.Type.init(.timestamp))).converted);
 
     const dec = try mapType(types.Type.decimal(10, 2));
-    try testing.expectEqual(pq.PhysicalType.int64, dec.phys);
+    try testing.expectEqual(parquet.PhysicalType.int64, dec.phys);
     try testing.expectEqual(@as(?i32, 2), dec.scale);
     try testing.expectEqual(@as(?i32, 10), dec.precision);
 
@@ -1079,15 +1058,15 @@ test "the physical type follows the decimal's real precision" {
     // used to be INT64 at a precision clamped to 18, which could not hold the
     // column's own values.
     const small = try mapType(types.Type.decimal(9, 2));
-    try testing.expectEqual(pq.PhysicalType.int32, small.phys);
+    try testing.expectEqual(parquet.PhysicalType.int32, small.phys);
     try testing.expectEqual(@as(?i32, 9), small.precision);
 
     const mid = try mapType(types.Type.decimal(18, 4));
-    try testing.expectEqual(pq.PhysicalType.int64, mid.phys);
+    try testing.expectEqual(parquet.PhysicalType.int64, mid.phys);
     try testing.expectEqual(@as(?i32, 18), mid.precision);
 
     const wide = try mapType(types.Type.decimal(38, 18));
-    try testing.expectEqual(pq.PhysicalType.fixed_len_byte_array, wide.phys);
+    try testing.expectEqual(parquet.PhysicalType.fixed_len_byte_array, wide.phys);
     try testing.expectEqual(@as(?i32, 38), wide.precision);
     try testing.expectEqual(@as(?i32, 18), wide.scale);
     try testing.expectEqual(@as(?i32, 16), wide.type_length);
@@ -1236,7 +1215,7 @@ test "statistics record min, max and null count per row group" {
 
     // read the footer back and check the statistics landed in the right fields
     const bytes = try std.fs.cwd().readFileAlloc(a, path, 1 << 20);
-    const md = try pq.parseFile(a, bytes);
+    const md = try parquet.parseFile(a, bytes);
     const stats = try readStats(a, bytes, md);
     try testing.expectEqual(@as(i64, 1), stats[0].nulls);
     try testing.expectEqual(@as(i64, -3), std.mem.readInt(i64, stats[0].min[0..8], .little));
@@ -1250,8 +1229,8 @@ const Stat = struct { nulls: i64, min: []const u8, max: []const u8 };
 
 /// Minimal Statistics reader, used by the test to prove the writer put max_value
 /// and min_value in the fields readers actually look at.
-fn readStats(arena: std.mem.Allocator, bytes: []const u8, md: pq.FileMetaData) ![]Stat {
-    const r = try pq.footerRange(bytes.len, bytes);
+fn readStats(arena: std.mem.Allocator, bytes: []const u8, md: parquet.FileMetaData) ![]Stat {
+    const r = try parquet.footerRange(bytes.len, bytes);
     var th = thrift.Reader.init(bytes[r.offset..][0..r.len]);
     var out = std.array_list.Managed(Stat).init(arena);
     _ = md;
@@ -1355,14 +1334,14 @@ fn packRleIndices(out: *List(u8), idx: []const u32, width: u8) !void {
 fn writeDictPageHeader(out: *List(u8), uncompressed: usize, compressed: usize, values: usize, crc: u32) !void {
     var w = thrift.Writer.init(out);
     try w.structBegin();
-    try w.writeI32(1, @intFromEnum(pq.PageType.dictionary_page));
+    try w.writeI32(1, @intFromEnum(parquet.PageType.dictionary_page));
     try w.writeI32(2, @intCast(uncompressed));
     try w.writeI32(3, @intCast(compressed));
     try w.writeI32(4, @bitCast(crc));
     try w.fieldBegin(.@"struct", 7); // dictionary_page_header
     try w.structBegin();
     try w.writeI32(1, @intCast(values));
-    try w.writeI32(2, @intFromEnum(pq.Encoding.plain));
+    try w.writeI32(2, @intFromEnum(parquet.Encoding.plain));
     try w.structEnd();
     try w.structEnd();
 }
@@ -1370,16 +1349,16 @@ fn writeDictPageHeader(out: *List(u8), uncompressed: usize, compressed: usize, v
 fn writeDictDataPageHeader(out: *List(u8), uncompressed: usize, compressed: usize, values: usize, crc: u32) !void {
     var w = thrift.Writer.init(out);
     try w.structBegin();
-    try w.writeI32(1, @intFromEnum(pq.PageType.data_page));
+    try w.writeI32(1, @intFromEnum(parquet.PageType.data_page));
     try w.writeI32(2, @intCast(uncompressed));
     try w.writeI32(3, @intCast(compressed));
     try w.writeI32(4, @bitCast(crc));
     try w.fieldBegin(.@"struct", 5);
     try w.structBegin();
     try w.writeI32(1, @intCast(values));
-    try w.writeI32(2, @intFromEnum(pq.Encoding.rle_dictionary));
-    try w.writeI32(3, @intFromEnum(pq.Encoding.rle));
-    try w.writeI32(4, @intFromEnum(pq.Encoding.rle));
+    try w.writeI32(2, @intFromEnum(parquet.Encoding.rle_dictionary));
+    try w.writeI32(3, @intFromEnum(parquet.Encoding.rle));
+    try w.writeI32(4, @intFromEnum(parquet.Encoding.rle));
     try w.structEnd();
     try w.structEnd();
 }
@@ -1450,7 +1429,7 @@ test "an az:// target routes to the blob writer, never the local filesystem" {
         try testing.expect(e != error.FileNotFound and e != error.NotDir);
         return;
     };
-    try testing.expect(w.backend == .blob);
+    try testing.expect(w.backend == .object);
 }
 
 // A reader that bounds a column chunk by `total_compressed_size` — Arrow does,
@@ -1491,10 +1470,10 @@ test "chunk size totals account for page headers" {
     try w.close();
 
     const bytes = try std.fs.cwd().readFileAlloc(a, path, 1 << 24);
-    const trailer = bytes[bytes.len - pq.trailer_len ..];
+    const trailer = bytes[bytes.len - parquet.trailer_len ..];
     const flen = std.mem.readInt(u32, trailer[0..4], .little);
-    const footer_start = bytes.len - pq.trailer_len - flen;
-    const md = try pq.parseFooter(a, bytes[footer_start..][0..flen]);
+    const footer_start = bytes.len - parquet.trailer_len - flen;
+    const md = try parquet.parseFooter(a, bytes[footer_start..][0..flen]);
 
     // Chunks are written back to back, so the next one's start — or the footer,
     // for the last — is where this one truly ends.

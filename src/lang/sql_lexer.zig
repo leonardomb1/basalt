@@ -9,10 +9,10 @@
 //!   - `;` statement terminator, `<>` as not-equal
 
 const std = @import("std");
-const tok = @import("token.zig");
+const token = @import("token.zig");
 
-const Token = tok.Token;
-const Tag = tok.Tag;
+const Token = token.Token;
+const Tag = token.Tag;
 
 pub const Lexer = struct {
     src: []const u8,
@@ -317,22 +317,22 @@ test "sql lexer: keywords, strings, dollar quoting, params" {
     const a = arena.allocator();
 
     const toks = try tokenize(a, "SELECT 'it''s' FROM $job.tables WHERE x <> 1; -- c\n$$D <> '*'$$ $sql$a$$b$sql$");
-    try testing.expectEqual(tok.Tag.ident, toks[0].tag);
-    try testing.expectEqual(tok.Tag.string, toks[1].tag);
+    try testing.expectEqual(token.Tag.ident, toks[0].tag);
+    try testing.expectEqual(token.Tag.string, toks[1].tag);
     try testing.expectEqualStrings("it's", toks[1].text);
-    try testing.expectEqual(tok.Tag.ident, toks[2].tag);
-    try testing.expectEqual(tok.Tag.dollar_ident, toks[3].tag);
+    try testing.expectEqual(token.Tag.ident, toks[2].tag);
+    try testing.expectEqual(token.Tag.dollar_ident, toks[3].tag);
     try testing.expectEqualStrings("job", toks[3].text);
-    try testing.expectEqual(tok.Tag.dot, toks[4].tag);
+    try testing.expectEqual(token.Tag.dot, toks[4].tag);
     try testing.expectEqualStrings("tables", toks[5].text);
-    try testing.expectEqual(tok.Tag.ident, toks[6].tag);
-    try testing.expectEqual(tok.Tag.ne, toks[8].tag);
-    try testing.expectEqual(tok.Tag.semi, toks[10].tag);
-    try testing.expectEqual(tok.Tag.string, toks[11].tag);
+    try testing.expectEqual(token.Tag.ident, toks[6].tag);
+    try testing.expectEqual(token.Tag.ne, toks[8].tag);
+    try testing.expectEqual(token.Tag.semi, toks[10].tag);
+    try testing.expectEqual(token.Tag.string, toks[11].tag);
     try testing.expectEqualStrings("D <> '*'", toks[11].text);
-    try testing.expectEqual(tok.Tag.string, toks[12].tag);
+    try testing.expectEqual(token.Tag.string, toks[12].tag);
     try testing.expectEqualStrings("a$$b", toks[12].text);
-    try testing.expectEqual(tok.Tag.eof, toks[13].tag);
+    try testing.expectEqual(token.Tag.eof, toks[13].tag);
 }
 
 test "sql lexer: block comments and operators" {
@@ -341,10 +341,10 @@ test "sql lexer: block comments and operators" {
     const a = arena.allocator();
 
     const toks = try tokenize(a, "a /* x */ = b != c ?? d ?. e");
-    try testing.expectEqual(tok.Tag.assign, toks[1].tag);
-    try testing.expectEqual(tok.Tag.ne, toks[3].tag);
-    try testing.expectEqual(tok.Tag.qq, toks[5].tag);
-    try testing.expectEqual(tok.Tag.qdot, toks[7].tag);
+    try testing.expectEqual(token.Tag.assign, toks[1].tag);
+    try testing.expectEqual(token.Tag.ne, toks[3].tag);
+    try testing.expectEqual(token.Tag.qq, toks[5].tag);
+    try testing.expectEqual(token.Tag.qdot, toks[7].tag);
 }
 
 test "sql lexer: bitwise operators stay distinct from concat and comparisons" {
@@ -353,10 +353,10 @@ test "sql lexer: bitwise operators stay distinct from concat and comparisons" {
     const a = arena.allocator();
 
     const toks = try tokenize(a, "a & b | c || d ^ ~e << 2 >> 3 < 4 > 5 <= 6 >= 7 <> 8");
-    const want = [_]tok.Tag{
-        .ident, .amp,   .ident, .bar, .ident, .pipe,  .ident, .caret, .tilde, .ident,
-        .shl,   .int,   .shr,   .int, .lt,    .int,   .gt,    .int,   .le,    .int,
-        .ge,    .int,   .ne,    .int, .eof,
+    const want = [_]token.Tag{
+        .ident, .amp, .ident, .bar, .ident, .pipe, .ident, .caret, .tilde, .ident,
+        .shl,   .int, .shr,   .int, .lt,    .int,  .gt,    .int,   .le,    .int,
+        .ge,    .int, .ne,    .int, .eof,
     };
     try testing.expectEqual(want.len, toks.len);
     for (want, toks) |w, t| try testing.expectEqual(w, t.tag);

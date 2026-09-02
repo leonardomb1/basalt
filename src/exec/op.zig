@@ -7,15 +7,14 @@ const std = @import("std");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const column = @import("column.zig");
-const batchmod = @import("batch.zig");
+const Batch = @import("batch.zig").Batch;
 const eval = @import("eval.zig");
 const simd = @import("simd.zig");
-const valuemod = @import("value.zig");
+const Decimal = @import("value.zig").Decimal;
+const Threshold = @import("value.zig").Threshold;
+const Value = @import("value.zig").Value;
 const keyhash = @import("keyhash.zig");
 const driver = @import("../connect/driver.zig");
-
-const Batch = batchmod.Batch;
-const Value = valuemod.Value;
 
 /// Captures context for a runtime expression error (which stage/column), turning
 /// a bare `CastFailed` into something actionable. Inline buffer so it outlives the
@@ -920,7 +919,7 @@ pub const TopN = struct {
     done: bool = false,
     /// When set, the K-th best key is published here so a source can skip
     /// row groups that cannot beat it.
-    threshold: ?*valuemod.Threshold = null,
+    threshold: ?*Threshold = null,
 
     const Entry = []Value;
     const Heap = std.PriorityQueue(Entry, []const Sort.Key, entryWorstFirst);
@@ -1436,7 +1435,7 @@ pub const Aggregate = struct {
                 const ksz = self.nkeys * @sizeOf(i64);
                 return .{
                     .keys = @alignCast(std.mem.bytesAsSlice(i64, base[0..ksz])),
-                    .mask = @alignCast(@ptrCast(base + ksz)),
+                    .mask = @ptrCast(@alignCast(base + ksz)),
                     .tail = @alignCast(std.mem.bytesAsSlice(Tail, (base + ksz + @sizeOf(u64))[0 .. self.naggs * @sizeOf(Tail)])),
                 };
             }
@@ -1994,7 +1993,7 @@ pub const Aggregate = struct {
                     // raw unscaled integers instead multiplied the sum by
                     // 10^(declared - actual).
                     .decimal => {
-                        const d: valuemod.Decimal = if (v == .decimal)
+                        const d: Decimal = if (v == .decimal)
                             v.decimal
                         else
                             .{ .unscaled = v.int, .scale = 0 };
@@ -2123,7 +2122,7 @@ fn columnBytes(c: *const column.Column) usize {
         .i32 => |s| s.len * @sizeOf(i32),
         .i64 => |s| s.len * @sizeOf(i64),
         .f64 => |s| s.len * @sizeOf(f64),
-        .dec => |s| s.len * @sizeOf(valuemod.Decimal),
+        .dec => |s| s.len * @sizeOf(Decimal),
         .bytes => |b| b.values.len + b.offsets.len * @sizeOf(i32),
     };
     return payload + c.validity.bits.len;

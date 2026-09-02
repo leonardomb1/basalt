@@ -11,25 +11,13 @@
 //! `https://<account>.blob.core.windows.net`; set AZURE_BLOB_ENDPOINT to point
 //! at Azurite (which is path-style: `<endpoint>/<account>/<container>/<path>`).
 //! The key comes from AZURE_STORAGE_KEY.
+//!
+//! Everything not specific to Shared Key — error bodies, retry policy, the
+//! listing loop, the consumer-facing interface — lives in `objstore.zig`.
 
 const std = @import("std");
-const httpx = @import("http.zig");
-
-/// Civil date from a day count since the epoch (Howard Hinnant's algorithm).
-/// Duplicated from `exec/eval.zig` rather than imported so this module depends
-/// on nothing but std — it is the one piece reachable before any pipeline exists.
-fn civilFromDays(z0: i64) struct { y: i64, m: u32, d: u32 } {
-    const z = z0 + 719468;
-    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
-    const doe = z - era * 146097;
-    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
-    const y = yoe + era * 400;
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153);
-    const d: u32 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
-    const m: u32 = @intCast(if (mp < 10) mp + 3 else mp - 9);
-    return .{ .y = y + (if (m <= 2) @as(i64, 1) else 0), .m = m, .d = d };
-}
+const http_client = @import("http_client.zig");
+const objstore = @import("objstore.zig");
 
 /// x-ms-version sent on every request. Shared Key signing is stable across
 /// versions; this only needs to be recent enough for the operations used.
@@ -131,7 +119,7 @@ pub fn keyFromEnv(arena: std.mem.Allocator) ![]const u8 {
 pub fn rfc1123(arena: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
     const days = @divFloor(epoch_secs, 86400);
     const secs_of_day = @as(u32, @intCast(epoch_secs - days * 86400));
-    const c = civilFromDays(days);
+    const c = objstore.civilFromDays(days);
     // 1970-01-01 was a Thursday; shift so 0 = Sunday.
     const dow: usize = @intCast(@mod(days + 4, 7));
     const day_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
@@ -252,32 +240,10 @@ pub fn requestHeaders(
     return out.toOwnedSlice();
 }
 
-/// Pulls `<Code>` and `<Message>` out of an Azure error body. Every failure
-/// response carries them; without this a caller sees only a bare status and the
-/// cause (expired key? clock skew? wrong container?) is guesswork.
-pub fn parseError(body: []const u8) ?struct { code: []const u8, message: []const u8 } {
-    const code = extractTag(body, "Code") orelse return null;
-    const msg = extractTag(body, "Message") orelse "";
-    // The message carries RequestId/Time on following lines; the first is enough.
-    const first = std.mem.sliceTo(msg, '\n');
-    return .{ .code = code, .message = first };
-}
-
-fn extractTag(xml: []const u8, name: []const u8) ?[]const u8 {
-    var open_buf: [64]u8 = undefined;
-    var close_buf: [64]u8 = undefined;
-    const open = std.fmt.bufPrint(&open_buf, "<{s}>", .{name}) catch return null;
-    const close = std.fmt.bufPrint(&close_buf, "</{s}>", .{name}) catch return null;
-    const s = std.mem.indexOf(u8, xml, open) orelse return null;
-    const from = s + open.len;
-    const e = std.mem.indexOfPos(u8, xml, from, close) orelse return null;
-    return xml[from..e];
-}
-
 /// Maps a status plus Azure's error code onto a distinct Zig error, so callers
 /// can react (and users can read a failure) instead of seeing one catch-all.
 pub fn statusToError(code: u16, body: []const u8) Error {
-    if (parseError(body)) |e| {
+    if (objstore.parseError(body)) |e| {
         if (std.mem.eql(u8, e.code, "AuthenticationFailed")) return Error.AzureAuthFailed;
         if (std.mem.eql(u8, e.code, "ContainerNotFound")) return Error.AzureContainerMissing;
         if (std.mem.eql(u8, e.code, "BlobNotFound")) return Error.AzureBlobNotFound;
@@ -289,29 +255,6 @@ pub fn statusToError(code: u16, body: []const u8) Error {
         429, 503 => Error.AzureThrottled,
         else => Error.AzureRequestFailed,
     };
-}
-
-/// Azure throttles with 429/503 under load and returns 500 on transient
-/// internal faults. Every request this module makes is idempotent — Put Block
-/// is keyed by block id, Put Block List is a full replace, GET is a read — so
-/// retrying is always safe.
-pub fn retriable(code: u16) bool {
-    return code == 429 or code == 500 or code == 503;
-}
-
-pub const max_attempts = 5;
-
-/// Exponential backoff with jitter. Jitter matters here specifically: N parallel
-/// lanes throttled at the same instant would otherwise retry in lockstep and
-/// re-throttle each other.
-///
-/// Azure also sends `Retry-After` on 503, which would beat guessing — but
-/// `std.http.Client.fetch` does not surface response headers, and dropping to
-/// the lower-level request API for one hint is not worth it until throttling is
-/// observed in practice.
-pub fn backoffMs(attempt: usize, rand: std.Random) u64 {
-    const base = @as(u64, 200) << @intCast(@min(attempt, 5));
-    return base + rand.uintLessThan(u64, base / 2 + 1);
 }
 
 /// Staging block size. Azure allows up to 50,000 blocks per blob, so 4 MiB
@@ -345,7 +288,7 @@ pub const BlockBlobWriter = struct {
     last_status: ?Error = null,
     rand: std.Random.DefaultPrng,
 
-    const vtable = std.Io.Writer.VTable{ .drain = drainFn };
+    const vtable = std.Io.Writer.VTable{ .drain = objstore.drain(BlockBlobWriter) };
 
     pub fn init(
         arena: std.mem.Allocator,
@@ -362,23 +305,12 @@ pub const BlockBlobWriter = struct {
             .key = try keyFromEnv(arena),
             .block_ids = std.array_list.Managed([]const u8).init(arena),
             .content_type = content_type,
-            // Jitter only needs to decorrelate lanes, not be unpredictable.
-            .rand = std.Random.DefaultPrng.init(@bitCast(std.time.milliTimestamp())),
+            .rand = objstore.jitterPrng(),
         };
         return self;
     }
 
-    fn drainFn(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        const self: *BlockBlobWriter = @fieldParentPtr("interface", w);
-        var total: usize = 0;
-        total += try self.put(w.buffered());
-        for (data[0 .. data.len - 1]) |d| total += try self.put(d);
-        const last = data[data.len - 1];
-        for (0..splat) |_| total += try self.put(last);
-        return w.consume(total);
-    }
-
-    fn put(self: *BlockBlobWriter, bytes: []const u8) std.Io.Writer.Error!usize {
+    pub fn put(self: *BlockBlobWriter, bytes: []const u8) std.Io.Writer.Error!usize {
         if (bytes.len == 0) return 0;
         self.stageBlock(bytes) catch return error.WriteFailed;
         return bytes.len;
@@ -461,6 +393,8 @@ pub const BlockBlobWriter = struct {
         });
     }
 
+    const Send = struct { w: *BlockBlobWriter, url: []const u8, hdrs: []const std.http.Header, body: []const u8 };
+
     fn send(
         self: *BlockBlobWriter,
         url: []const u8,
@@ -475,34 +409,27 @@ pub const BlockBlobWriter = struct {
         for (extra) |h| try hdrs.append(h);
         try hdrs.append(.{ .name = "Authorization", .value = auth });
 
-        var attempt: usize = 0;
-        while (true) : (attempt += 1) {
-            var aw = std.Io.Writer.Allocating.init(self.arena);
-            const res = try self.client.fetch(.{
-                .method = .PUT,
-                .location = .{ .url = url },
-                .extra_headers = hdrs.items,
-                .payload = body,
-                .decompress_buffer = httpx.decompress_direct,
-                .response_writer = &aw.writer,
-            });
-            const code = @intFromEnum(res.status);
-            // Cleared on success: `stageBlock` retries a missing container, and a
-            // stale code from that first attempt must not be re-raised later.
-            if (code == 201 or code == 200) {
-                self.last_status = null;
-                return;
+        try objstore.retry(self.policy(), Send{ .w = self, .url = url, .hdrs = hdrs.items, .body = body }, struct {
+            fn attempt(c: Send) !objstore.Verdict {
+                var aw = std.Io.Writer.Allocating.init(c.w.arena);
+                const res = try c.w.client.fetch(.{
+                    .method = .PUT,
+                    .location = .{ .url = c.url },
+                    .extra_headers = c.hdrs,
+                    .payload = c.body,
+                    .decompress_buffer = http_client.decompress_direct,
+                    .response_writer = &aw.writer,
+                });
+                const code = @intFromEnum(res.status);
+                // Cleared on success: `stageBlock` retries a missing container, and a
+                // stale code from that first attempt must not be re-raised later.
+                if (code == 201 or code == 200) {
+                    c.w.last_status = null;
+                    return .done;
+                }
+                return c.w.failed(code, aw.writer.buffered());
             }
-
-            const resp = aw.writer.buffered();
-            if (retriable(code) and attempt + 1 < max_attempts) {
-                std.Thread.sleep(backoffMs(attempt, self.rand.random()) * std.time.ns_per_ms);
-                continue;
-            }
-            self.last_error = describe(self.arena, code, resp) catch "";
-            self.last_status = statusToError(code, resp);
-            return self.last_status.?;
-        }
+        }.attempt);
     }
 
     /// Create the container, ignoring "already exists". Called once after a 404
@@ -535,16 +462,26 @@ pub const BlockBlobWriter = struct {
             .location = .{ .url = url },
             .extra_headers = hdrs.items,
             .payload = "",
-            .decompress_buffer = httpx.decompress_direct,
+            .decompress_buffer = http_client.decompress_direct,
             .response_writer = &aw.writer,
         });
         const code = @intFromEnum(res.status);
         // 409 = already there, which is success for our purposes.
-        if (code != 201 and code != 409) {
-            self.last_error = describe(self.arena, code, aw.writer.buffered()) catch "";
-            self.last_status = statusToError(code, aw.writer.buffered());
-            return self.last_status.?;
-        }
+        if (code != 201 and code != 409) return self.fail(code, aw.writer.buffered());
+    }
+
+    fn policy(self: *BlockBlobWriter) objstore.Policy {
+        return .{ .rand = self.rand.random() };
+    }
+
+    fn fail(self: *BlockBlobWriter, code: u16, body: []const u8) Error {
+        self.last_error = objstore.describe(self.arena, code, body) catch "";
+        self.last_status = statusToError(code, body);
+        return self.last_status.?;
+    }
+
+    fn failed(self: *BlockBlobWriter, code: u16, body: []const u8) objstore.Verdict {
+        return .{ .failed = .{ .code = code, .err = self.fail(code, body) } };
     }
 };
 
@@ -674,16 +611,65 @@ test "authHeader rejects a malformed key rather than signing with garbage" {
     }));
 }
 
-/// `Code: Message (HTTP nnn)` — what a user needs to see instead of a status.
-pub fn describe(arena: std.mem.Allocator, code: u16, body: []const u8) ![]const u8 {
-    if (parseError(body)) |e|
-        return std.fmt.allocPrint(arena, "{s}: {s} (HTTP {d})", .{ e.code, e.message, code });
-    return std.fmt.allocPrint(arena, "HTTP {d}", .{code});
-}
+const ListPage = struct {
+    arena: std.mem.Allocator,
+    client: *std.http.Client,
+    account: []const u8,
+    prefix: []const u8,
+    base: []const u8,
+    canon: []const u8,
+    key: []const u8,
+
+    fn page(c: ListPage, marker: []const u8) ![]const u8 {
+        const url = if (marker.len == 0)
+            try std.fmt.allocPrint(c.arena, "{s}?restype=container&comp=list&prefix={s}", .{ c.base, try urlEncode(c.arena, c.prefix) })
+        else
+            try std.fmt.allocPrint(c.arena, "{s}?restype=container&comp=list&prefix={s}&marker={s}", .{ c.base, try urlEncode(c.arena, c.prefix), try urlEncode(c.arena, marker) });
+
+        const date = try rfc1123(c.arena, std.time.timestamp());
+        const ms = [_]MsHeader{
+            .{ .name = "x-ms-date", .value = date },
+            .{ .name = "x-ms-version", .value = api_version },
+        };
+        // Canonicalized query params sort by name: comp, marker, prefix, restype.
+        var q = std.array_list.Managed([]const u8).init(c.arena);
+        try q.append("comp:list");
+        if (marker.len > 0) try q.append(try std.fmt.allocPrint(c.arena, "marker:{s}", .{marker}));
+        try q.append(try std.fmt.allocPrint(c.arena, "prefix:{s}", .{c.prefix}));
+        try q.append("restype:container");
+
+        const auth = try authHeader(c.arena, c.account, c.key, .{
+            .method = "GET",
+            .canonical_resource = c.canon,
+            .ms_headers = &ms,
+            .query = q.items,
+        });
+
+        var hdrs = std.array_list.Managed(std.http.Header).init(c.arena);
+        try hdrs.append(.{ .name = "x-ms-date", .value = date });
+        try hdrs.append(.{ .name = "x-ms-version", .value = api_version });
+        try hdrs.append(.{ .name = "Authorization", .value = auth });
+
+        var aw = std.Io.Writer.Allocating.init(c.arena);
+        const res = try c.client.fetch(.{
+            .method = .GET,
+            .location = .{ .url = url },
+            .extra_headers = hdrs.items,
+            .decompress_buffer = http_client.decompress_direct,
+            .response_writer = &aw.writer,
+        });
+        const code = @intFromEnum(res.status);
+        const body = aw.writer.buffered();
+        if (code != 200) return statusToError(code, body);
+        return body;
+    }
+};
 
 /// Lists blob names under `prefix`, following continuation markers to the end.
 /// Names come back container-relative, in the lexicographic order Azure returns
-/// them, so a caller reading them in order gets a deterministic result.
+/// them, so a caller reading them in order gets a deterministic result. A flat
+/// listing (no delimiter) returns only blobs, so no BlobPrefix entries can be
+/// confused for one.
 pub fn listPrefix(
     arena: std.mem.Allocator,
     client: *std.http.Client,
@@ -700,87 +686,16 @@ pub fn listPrefix(
         try std.fmt.allocPrint(arena, "{s}{s}", .{ std.mem.trimRight(u8, ep, "/"), url_path })
     else
         try std.fmt.allocPrint(arena, "https://{s}.blob.core.windows.net{s}", .{ account, url_path });
-    const canon = try canonicalResource(arena, account, url_path);
-    const key = try keyFromEnv(arena);
-
-    var out = std.array_list.Managed([]const u8).init(arena);
-    var marker: []const u8 = "";
-    while (true) {
-        const url = if (marker.len == 0)
-            try std.fmt.allocPrint(arena, "{s}?restype=container&comp=list&prefix={s}", .{ base, try urlEncode(arena, prefix) })
-        else
-            try std.fmt.allocPrint(arena, "{s}?restype=container&comp=list&prefix={s}&marker={s}", .{ base, try urlEncode(arena, prefix), try urlEncode(arena, marker) });
-
-        const date = try rfc1123(arena, std.time.timestamp());
-        const ms = [_]MsHeader{
-            .{ .name = "x-ms-date", .value = date },
-            .{ .name = "x-ms-version", .value = api_version },
-        };
-        // Canonicalized query params sort by name: comp, marker, prefix, restype.
-        var q = std.array_list.Managed([]const u8).init(arena);
-        try q.append("comp:list");
-        if (marker.len > 0) try q.append(try std.fmt.allocPrint(arena, "marker:{s}", .{marker}));
-        try q.append(try std.fmt.allocPrint(arena, "prefix:{s}", .{prefix}));
-        try q.append("restype:container");
-
-        const auth = try authHeader(arena, account, key, .{
-            .method = "GET",
-            .canonical_resource = canon,
-            .ms_headers = &ms,
-            .query = q.items,
-        });
-
-        var hdrs = std.array_list.Managed(std.http.Header).init(arena);
-        try hdrs.append(.{ .name = "x-ms-date", .value = date });
-        try hdrs.append(.{ .name = "x-ms-version", .value = api_version });
-        try hdrs.append(.{ .name = "Authorization", .value = auth });
-
-        var aw = std.Io.Writer.Allocating.init(arena);
-        const res = try client.fetch(.{
-            .method = .GET,
-            .location = .{ .url = url },
-            .extra_headers = hdrs.items,
-            .decompress_buffer = httpx.decompress_direct,
-            .response_writer = &aw.writer,
-        });
-        const code = @intFromEnum(res.status);
-        const body = aw.writer.buffered();
-        if (code != 200) return statusToError(code, body);
-
-        try collectNames(arena, body, &out);
-        const next = extractTag(body, "NextMarker") orelse "";
-        if (next.len == 0) break;
-        marker = try arena.dupe(u8, next);
-    }
-    return out.toOwnedSlice();
-}
-
-/// Every `<Name>` inside the `<Blobs>` element. A flat listing (no delimiter)
-/// returns only blobs, so no BlobPrefix entries can be confused for one.
-fn collectNames(arena: std.mem.Allocator, xml: []const u8, out: *std.array_list.Managed([]const u8)) !void {
-    var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, xml, pos, "<Name>")) |s| {
-        const from = s + "<Name>".len;
-        const e = std.mem.indexOfPos(u8, xml, from, "</Name>") orelse break;
-        try out.append(try arena.dupe(u8, xml[from..e]));
-        pos = e + "</Name>".len;
-    }
-}
-
-test "parseError pulls the code and first message line out of an Azure fault" {
-    const body =
-        \\<?xml version="1.0" encoding="UTF-8"?>
-        \\<Error>
-        \\  <Code>AuthorizationFailure</Code>
-        \\  <Message>Server failed to authenticate the request.
-        \\RequestId:abc
-        \\Time:2026-07-25T17:09:10.903Z</Message>
-        \\</Error>
-    ;
-    const e = parseError(body).?;
-    try std.testing.expectEqualStrings("AuthorizationFailure", e.code);
-    try std.testing.expectEqualStrings("Server failed to authenticate the request.", e.message);
-    try std.testing.expect(parseError("not xml") == null);
+    const ctx = ListPage{
+        .arena = arena,
+        .client = client,
+        .account = account,
+        .prefix = prefix,
+        .base = base,
+        .canon = try canonicalResource(arena, account, url_path),
+        .key = try keyFromEnv(arena),
+    };
+    return objstore.listPages(arena, .{ .item_tag = "Name", .next_tag = "NextMarker" }, ctx, ListPage.page);
 }
 
 test "statusToError distinguishes causes instead of one catch-all" {
@@ -789,36 +704,6 @@ test "statusToError distinguishes causes instead of one catch-all" {
     try std.testing.expectEqual(Error.AzureBlobNotFound, statusToError(404, "<Error><Code>BlobNotFound</Code></Error>"));
     try std.testing.expectEqual(Error.AzureThrottled, statusToError(503, ""));
     try std.testing.expectEqual(Error.AzureRequestFailed, statusToError(418, ""));
-}
-
-test "retry policy: only transient statuses, and jitter never collapses to zero spread" {
-    try std.testing.expect(retriable(429) and retriable(500) and retriable(503));
-    try std.testing.expect(!retriable(403) and !retriable(404) and !retriable(201));
-
-    var prng = std.Random.DefaultPrng.init(1);
-    const r = prng.random();
-    // backoff grows with the attempt and stays within [base, base*1.5]
-    var prev: u64 = 0;
-    for (0..5) |i| {
-        const base = @as(u64, 200) << @intCast(i);
-        const ms = backoffMs(i, r);
-        try std.testing.expect(ms >= base and ms <= base + base / 2 + 1);
-        try std.testing.expect(ms > prev);
-        prev = base;
-    }
-}
-
-test "collectNames reads every blob name from a listing page" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    var out = std.array_list.Managed([]const u8).init(a);
-    try collectNames(a,
-        "<Blobs><Blob><Name>p/a.csv</Name></Blob><Blob><Name>p/b.csv</Name></Blob></Blobs><NextMarker/>",
-        &out);
-    try std.testing.expectEqual(@as(usize, 2), out.items.len);
-    try std.testing.expectEqualStrings("p/a.csv", out.items[0]);
-    try std.testing.expectEqualStrings("p/b.csv", out.items[1]);
 }
 
 /// Splits a prefix URL (`az://account/container/some/prefix/`) for listing. The
@@ -853,4 +738,45 @@ test "prefix URLs are distinguished from blob URLs and may have an empty prefix"
 
     const bare = try parsePrefix("az://acct/cont/");
     try std.testing.expectEqualStrings("", bare.prefix);
+}
+
+// --- objstore provider --------------------------------------------------------
+
+/// The `objstore.Provider` for `az://`.
+pub const provider = objstore.Provider{
+    .scheme = "az://",
+    .empty_prefix = Error.AzureEmptyPrefix,
+    .vtable = &.{
+        .parse = vtParse,
+        .list_prefix = vtListPrefix,
+        .request_headers = vtRequestHeaders,
+        .status_to_error = vtStatusToError,
+        .open_writer = vtOpenWriter,
+    },
+};
+
+fn vtParse(arena: std.mem.Allocator, url: []const u8) anyerror!objstore.Object {
+    const b = try arena.create(Blob);
+    b.* = try parseUrl(arena, url, endpointFromEnv(arena));
+    return .{ .provider = &provider, .url = b.url, .ptr = b };
+}
+
+fn vtListPrefix(arena: std.mem.Allocator, client: *std.http.Client, url: []const u8) anyerror![]const []const u8 {
+    const p = try parsePrefix(url);
+    const names = try listPrefix(arena, client, p.account, p.container, p.prefix, endpointFromEnv(arena));
+    const urls = try arena.alloc([]const u8, names.len);
+    for (names, urls) |n, *u| u.* = try std.fmt.allocPrint(arena, "az://{s}/{s}/{s}", .{ p.account, p.container, n });
+    return urls;
+}
+
+fn vtRequestHeaders(ptr: *const anyopaque, arena: std.mem.Allocator, method: []const u8, range: []const u8) anyerror![]const std.http.Header {
+    return requestHeaders(arena, objstore.cast(Blob, ptr).*, method, range);
+}
+
+fn vtStatusToError(code: u16, body: []const u8) anyerror {
+    return statusToError(code, body);
+}
+
+fn vtOpenWriter(ptr: *const anyopaque, arena: std.mem.Allocator, client: *std.http.Client, content_type: []const u8) anyerror!objstore.Writer {
+    return objstore.writer(try BlockBlobWriter.init(arena, client, objstore.cast(Blob, ptr).*, content_type));
 }

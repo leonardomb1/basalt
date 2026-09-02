@@ -8,6 +8,8 @@
 //! and arity mismatches are reported as `ExpandFailed` with a message.
 
 const std = @import("std");
+const builtins = @import("../exec/builtins.zig");
+const parser = @import("sql_parser.zig");
 const ast = @import("ast.zig");
 const types = @import("types.zig");
 
@@ -38,6 +40,10 @@ const Subst = std.StringHashMap(*ast.Expr);
 pub fn expandProgram(arena: std.mem.Allocator, program: ast.Program, body: ?[]const u8, msg: *[]const u8) Error!ast.Program {
     var fns = std.StringHashMap(ast.FnDecl).init(arena);
     for (program.stmts) |s| if (s == .func) {
+        if (builtins.lookup(s.func.name) != null or parser.isAggName(s.func.name)) {
+            msg.* = std.fmt.allocPrint(arena, "`{s}` is a built-in function and cannot be redefined", .{s.func.name}) catch "CREATE FUNCTION shadows a builtin";
+            return error.ExpandFailed;
+        }
         if (!s.func.replace and fns.contains(s.func.name)) {
             msg.* = std.fmt.allocPrint(arena, "function `{s}` is already defined — use CREATE OR REPLACE FUNCTION", .{s.func.name}) catch "duplicate CREATE FUNCTION";
             return error.ExpandFailed;
@@ -426,7 +432,6 @@ fn typeWord(k: types.TypeKind) []const u8 {
 }
 
 test "expansion preserves is_empty kind and match structure (via rebuildExpr)" {
-    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -444,7 +449,6 @@ test "expansion preserves is_empty kind and match structure (via rebuildExpr)" {
 }
 
 test "expandProgram inlines a user fn and drops its declaration" {
-    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -463,7 +467,6 @@ test "expandProgram inlines a user fn and drops its declaration" {
 }
 
 test "expandProgram rejects recursion and arity mismatch" {
-    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -498,7 +501,6 @@ test "expandProgram bounds total nodes, not just nesting depth" {
 
 /// Parse + expand, returning the error message instead of the program.
 fn expandErr(a: std.mem.Allocator, src: []const u8) ![]const u8 {
-    const parser = @import("sql_parser.zig");
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
     const prog = parser.parseSource(a, src, &diag) catch |e| {
         std.debug.print("parse error {d}:{d}: {s}\n", .{ diag.line, diag.col, diag.msg });
@@ -510,7 +512,6 @@ fn expandErr(a: std.mem.Allocator, src: []const u8) ![]const u8 {
 }
 
 test "expandProgram: DEFAULT parameters fill missing trailing arguments" {
-    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -536,7 +537,6 @@ test "expandProgram: a declared parameter type rejects a wrong-kind literal" {
 
     // An int literal widens into a FLOAT parameter, and a non-literal argument is
     // undecidable here — both pass through to the type-checker as before.
-    const parser = @import("sql_parser.zig");
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
     const prog = try parser.parseSource(a, "CREATE FUNCTION margin(rev FLOAT, cost FLOAT) AS rev - cost;\n" ++
         "SELECT margin(7, amount) AS m FROM 'd';", &diag);
@@ -554,7 +554,6 @@ test "expandProgram: duplicate CREATE FUNCTION needs OR REPLACE" {
         "SELECT f(id) AS v FROM 'd';");
     try std.testing.expect(std.mem.indexOf(u8, m, "already defined") != null);
 
-    const parser = @import("sql_parser.zig");
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
     const prog = try parser.parseSource(a, "CREATE FUNCTION f(x) AS x + 1;\nCREATE OR REPLACE FUNCTION f(x) AS x + 2;\n" ++
         "SELECT f(id) AS v FROM 'd';", &diag);
@@ -564,7 +563,6 @@ test "expandProgram: duplicate CREATE FUNCTION needs OR REPLACE" {
 }
 
 test "expandProgram: statement functions survive, and the two forms don't cross over" {
-    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -610,7 +608,6 @@ test "expandProgram: statement functions survive, and the two forms don't cross 
 }
 
 test "expandProgram inlines `let … in` away (single-use binding)" {
-    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -631,7 +628,6 @@ fn outputSelect(prog: ast.Program) []const ast.SelectItem {
 }
 
 test "expandProgram substitutes JSON-param path access from the body" {
-    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -648,7 +644,6 @@ test "expandProgram substitutes JSON-param path access from the body" {
 }
 
 test "?. safe navigation: a missing intermediate resolves to null instead of erroring" {
-    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -676,7 +671,6 @@ test "?. safe navigation: a missing intermediate resolves to null instead of err
 }
 
 test "?. over a scalar intermediate resolves to null" {
-    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -689,7 +683,6 @@ test "?. over a scalar intermediate resolves to null" {
 }
 
 test "json body errors: non-scalar leaf and invalid JSON" {
-    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -710,7 +703,6 @@ test "json body errors: non-scalar leaf and invalid JSON" {
 }
 
 test "nested user fns inline through each other" {
-    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -731,7 +723,6 @@ test "nested user fns inline through each other" {
 }
 
 test "a `let` shadowing a fn param is restored after the let body" {
-    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -750,7 +741,6 @@ test "a `let` shadowing a fn param is restored after the let body" {
 }
 
 test "expandProgram leaves JSON paths null when unbound (offline check)" {
-    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -763,7 +753,6 @@ test "expandProgram leaves JSON paths null when unbound (offline check)" {
 }
 
 test "statement-level LET parses to a let_const stmt and its expression expands" {
-    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -788,7 +777,6 @@ test "statement-level LET parses to a let_const stmt and its expression expands"
 }
 
 test "json-form union: $param.path renders the branch array into discover_json" {
-    const parser = @import("sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
