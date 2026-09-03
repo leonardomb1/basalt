@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
     const strip = b.option(bool, "strip", "Omit debug info from the binary") orelse false;
 
     const opts = b.addOptions();
-    opts.addOption([]const u8, "version", @import("build.zig.zon").version);
+    opts.addOption([]const u8, "version", detectVersion(b));
 
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -63,4 +63,23 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_bench_e2e.addArgs(args);
     const bench_e2e_step = b.step("bench-e2e", "Run end-to-end query + movement benchmarks");
     bench_e2e_step.dependOn(&run_bench_e2e.step);
+}
+
+/// The version a binary reports. From a git checkout it is `git describe`, so a
+/// build between tags says `0.6.5-3-gabc123` and an uncommitted tree says
+/// `-dirty` — a dev binary can never claim a release number. Outside a checkout
+/// (the Docker context ships no .git) it is the version pinned in build.zig.zon;
+/// the release job checks the tag and the pin agree.
+fn detectVersion(b: *std.Build) []const u8 {
+    const pinned: []const u8 = @import("build.zig.zon").version;
+    var code: u8 = 0;
+    const out = b.runAllowFail(
+        &.{ "git", "-C", b.build_root.path orelse ".", "describe", "--tags", "--dirty" },
+        &code,
+        .Ignore,
+    ) catch return pinned;
+    if (code != 0) return pinned;
+    const described = std.mem.trim(u8, out, " \n\r\t");
+    if (described.len < 2 or described[0] != 'v') return pinned;
+    return described[1..];
 }

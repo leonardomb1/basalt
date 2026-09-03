@@ -40,6 +40,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # A release tag must match the version pinned in build.zig.zon: the binary
+      # reports the pin wherever `git describe` is unavailable (the Docker context
+      # ships no .git), so a stale pin would ship a release that misreports itself.
+      - name: Check tag matches build.zig.zon
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          pinned=$(sed -nE 's/^[[:space:]]*\.version = "([^"]+)",/\1/p' build.zig.zon)
+          if [ "v$pinned" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match build.zig.zon version $pinned"
+            exit 1
+          fi
+
       # Install Zig directly from the official release (tarball naming is arch-first
       # since 0.14.1: zig-<arch>-<os>-<version>); avoids stale third-party actions.
       - name: Cache Zig
