@@ -27,7 +27,7 @@ FROM 'https://dados.cvm.gov.br/dados/FI/CAD/DADOS/cad_fi.csv'
 ```
 
 ```console
-$ basalt run orders.sql
+basalt run orders.sql
 ```
 
 ## Install
@@ -131,9 +131,9 @@ apply), with `AWS_ENDPOINT_URL` for MinIO and the like.
 ## Tests
 
 ```console
-$ zig build test                    # unit tests, no services needed
-$ ./it/run.sh                       # integration suite (needs docker)
-$ ./it/run.sh azure parquet         # just those suites
+zig build test                    # unit tests, no services needed
+./it/run.sh                       # integration suite (needs docker)
+./it/run.sh azure parquet         # just those suites
 ```
 
 The integration suite starts only the containers the selected suites need.
