@@ -35,15 +35,15 @@ $ basalt run orders.sql
 Prebuilt binary (Linux x86-64, ~2.4 MB, statically linked — runs anywhere):
 
 ```console
-$ curl -fsSL -o basalt https://github.com/leonardomb1/basalt/releases/latest/download/basalt-x86_64-linux
-$ chmod +x basalt && ./basalt help
+curl -fsSL -o basalt https://github.com/leonardomb1/basalt/releases/latest/download/basalt-x86_64-linux
+chmod +x basalt && ./basalt help
 ```
 
 From source, with Zig 0.15.2:
 
 ```console
-$ zig build -Doptimize=ReleaseFast
-$ ./zig-out/bin/basalt help
+zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dstrip=true
+./zig-out/bin/basalt help
 ```
 
 `-Dstrip` drops debug info for a smaller binary.
