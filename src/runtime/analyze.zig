@@ -177,12 +177,44 @@ fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const ast.E
                     .decimal => at.withNull(true),
                     else => types.Type.init(.int).withNull(true),
                 },
-                .avg => types.Type.init(.float).withNull(true),
+                .avg, .median => types.Type.init(.float).withNull(true),
                 .min, .max => at.withNull(true),
                 .count => unreachable,
             };
         },
     }
+}
+
+/// Result type of one window function over its source column (`int` for the
+/// argument-less ones). Ranking counts rows, so it is a non-null int; MIN/MAX,
+/// LAG and LEAD keep the column's type; AVG is always a float; SUM keeps the
+/// column's family. Everything with an argument is nullable — a peer group of
+/// nothing but nulls has no answer, and a partition's first row has no LAG.
+pub fn windowFuncType(kind: ast.WinKind, src: types.Type) types.Type {
+    return switch (kind) {
+        .row_number, .rank, .dense_rank, .count => types.Type.init(.int),
+        .min, .max, .lag, .lead => src.asNullable(),
+        .avg => types.Type.init(.float).asNullable(),
+        .sum => (if (src.kind == .int) types.Type.init(.int) else types.Type.init(.float)).asNullable(),
+    };
+}
+
+/// Output schema of a window stage: the input, then one appended column per
+/// function. The same rule the planner applies, so `EXPLAIN` can show the
+/// schema past a window instead of `unresolved`.
+pub fn windowSchema(arena: std.mem.Allocator, in: types.Schema, wd: ast.Window, diag: *Diag) Error!types.Schema {
+    _ = try fieldIndices(arena, in, wd.partition_by, diag);
+    const oqs = try arena.alloc(ast.QualName, wd.order_by.len);
+    for (wd.order_by, oqs) |sk, *q| q.* = sk.field;
+    _ = try fieldIndices(arena, in, oqs, diag);
+    const fields = try arena.alloc(types.Schema.Field, in.fields.len + wd.funcs.len);
+    @memcpy(fields[0..in.fields.len], in.fields);
+    for (wd.funcs, 0..) |f, i| {
+        var src = types.Type.init(.int);
+        if (f.arg) |q| src = in.fields[(try fieldIndices(arena, in, &[_]ast.QualName{q}, diag))[0]].ty;
+        fields[in.fields.len + i] = .{ .name = f.out, .ty = windowFuncType(f.kind, src) };
+    }
+    return .{ .fields = fields };
 }
 
 pub const ExplodePlan = struct { idx: usize, schema: types.Schema };
@@ -726,6 +758,7 @@ const Ctx = struct {
             },
             .explode => |ex| return (try explodePlan(self.arena, in, ex, self.diag)).schema,
             .aggregate => |ag| return (try aggregatePlan(self.arena, in, ag, self.params, self.diag)).schema,
+            .window => |wd| return try windowSchema(self.arena, in, wd, self.diag),
             .join => return null,
             else => return null,
         }
@@ -1772,4 +1805,29 @@ test "analyze: CREATE FUNCTION cannot shadow a builtin or an aggregate" {
         try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, src), &diag));
         try std.testing.expectEqualStrings("`" ++ name ++ "` is a built-in function and cannot be redefined", diag.msg);
     }
+}
+
+test "analyze: a window stage resolves its schema — the input plus one typed column per function" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parse(a,
+        \\LOAD INTO '/tmp/x.csv' AS
+        \\SELECT y, LAG(rev) OVER (ORDER BY y) AS prev, SUM(rev) OVER (ORDER BY y) AS run
+        \\FROM (SELECT 'a' AS y, CAST(1 AS DECIMAL(10,2)) AS rev) m;
+    );
+    var diag = Diag{};
+    const plan = try analyze(a, prog, &diag);
+    var found = false;
+    for (plan.outputs[0].stages) |st| {
+        if (!std.mem.eql(u8, st.kind, "window")) continue;
+        found = true;
+        const s = st.out_schema orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 4), s.fields.len);
+        try std.testing.expectEqualStrings("prev", s.fields[2].name);
+        try std.testing.expect(s.fields[2].ty.kind == .decimal and s.fields[2].ty.nullable);
+        try std.testing.expectEqualStrings("run", s.fields[3].name);
+        try std.testing.expect(s.fields[3].ty.kind == .float and s.fields[3].ty.nullable);
+    }
+    try std.testing.expect(found);
 }

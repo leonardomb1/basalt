@@ -473,6 +473,24 @@ pub const Builder = struct {
         }
     }
 
+    /// Typed appends for a producer that already knows the cell's kind — the
+    /// CSV reader — so the hot loop skips boxing a `Value` and re-switching on
+    /// the store. The caller guarantees the store matches.
+    pub fn appendInt(self: *Builder, x: i64) !void {
+        try self.pushValid(true);
+        try self.store.i64.append(x);
+    }
+    pub fn appendFloat(self: *Builder, x: f64) !void {
+        try self.pushValid(true);
+        try self.store.f64.append(x);
+    }
+    pub fn appendStr(self: *Builder, s: []const u8) !void {
+        try self.pushValid(true);
+        const l = &self.store.bytes;
+        try l.values.appendSlice(s);
+        try l.ends.append(@intCast(l.values.items.len));
+    }
+
     pub fn append(self: *Builder, v: Value) !void {
         const ok = !v.isNull();
         try self.pushValid(ok);

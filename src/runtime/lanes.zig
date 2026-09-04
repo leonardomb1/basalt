@@ -567,6 +567,10 @@ const MorselSource = struct {
         while (true) {
             if (self.cur) |r| {
                 if (try r.next(arena)) |b| return b;
+                // Exhausted morsel: release its file handle. A reader was opened
+                // per row group and never closed, so a lane leaked one fd (and
+                // one parsed footer in its arena) per row group it took.
+                r.close();
                 self.cur = null;
             }
             if (self.m.queue.failed.load(.seq_cst)) return null;
@@ -574,13 +578,18 @@ const MorselSource = struct {
             const r = try pqdecode.Reader.openProjected(self.scratch, self.m.path, self.m.project);
             r.bounds = self.m.bounds;
             r.rg = i * self.m.per_item;
-            if (r.rg >= r.md.row_groups.len) continue;
+            if (r.rg >= r.md.row_groups.len) {
+                r.close();
+                continue;
+            }
             r.rg_end = @min(r.rg + self.m.per_item, r.md.row_groups.len);
             self.cur = r;
         }
     }
     fn closeFn(ptr: *anyopaque) void {
-        _ = ptr;
+        const self: *MorselSource = @ptrCast(@alignCast(ptr));
+        if (self.cur) |r| r.close();
+        self.cur = null;
     }
     const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
 };

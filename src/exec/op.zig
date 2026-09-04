@@ -306,7 +306,7 @@ pub const Window = struct {
         const arrs = try arena.alloc(KeyArr, self.part.len + self.ord.len);
         for (self.part, 0..) |k, i| arrs[i] = try KeyArr.prepare(arena, all.columns[k.idx], k.desc);
         for (self.ord, 0..) |k, i| arrs[self.part.len + i] = try KeyArr.prepare(arena, all.columns[k.idx], k.desc);
-        std.mem.sort(usize, idx, SortCtx{ .arrs = arrs }, SortCtx.lessThan);
+        try sortIdx(arena, idx, arrs);
         const parts = arrs[0..self.part.len];
         const ords = arrs[self.part.len..];
 
@@ -329,9 +329,8 @@ pub const Window = struct {
         }
 
         const ncols = all.columns.len;
-        const builders = try arena.alloc(column.Builder, ncols + self.funcs.len);
-        for (builders[0..ncols], self.in_schema.fields) |*bd, f| bd.* = try column.Builder.initCapacity(arena, f.ty, all.len);
-        for (builders[ncols..], self.out_schema.fields[ncols..]) |*bd, f| bd.* = try column.Builder.initCapacity(arena, f.ty, all.len);
+        const builders = try arena.alloc(column.Builder, self.funcs.len);
+        for (builders, self.out_schema.fields[ncols..]) |*bd, f| bd.* = try column.Builder.initCapacity(arena, f.ty, all.len);
 
         // Every function is resolved into a column of values indexed by sorted
         // position, then emitted in one pass. Ranking needs a running counter, the
@@ -387,41 +386,92 @@ pub const Window = struct {
                     // A ROWS frame is a window over positions, so each row gets its own
                     // range and ties do NOT share a value — the difference from the
                     // peer-based default, and the reason a moving average needs ROWS.
+                    //
+                    // The frame only ever slides forward, so every row enters it once
+                    // and leaves it once: sums and counts add on the way in and
+                    // subtract on the way out, and the extreme is the head of a
+                    // monotonic deque of positions (the textbook O(n) sliding min/max).
+                    // Re-walking the frame per row made `ROWS UNBOUNDED PRECEDING`
+                    // O(partition²): 80s for a 100k-row running total.
+                    //
+                    // ponytail: a bounded float frame subtracts what it added, so a
+                    // long moving average can drift by float rounding; the exact
+                    // upgrade is a segment tree over the partition, as DuckDB does.
+                    const vs = try arena.alloc(Value, idx.len);
+                    for (idx, vs) |row, *v| v.* = if (f.arg) |ai| all.columns[ai].getValue(row) else .null;
+                    var dq = std.array_list.Managed(usize).init(arena);
+                    var dq_head: usize = 0;
+                    var lo: usize = 0;
+                    var acc_i: i64 = 0;
+                    var acc_f: f64 = 0;
+                    var n: i64 = 0;
+                    var seen_float = false;
                     for (idx, 0..) |_, k| {
-                        const lo = if (self.frame.unbounded)
+                        if (k == pstart[k]) {
+                            lo = k;
+                            acc_i = 0;
+                            acc_f = 0;
+                            n = 0;
+                            seen_float = false;
+                            dq.clearRetainingCapacity();
+                            dq_head = 0;
+                        }
+                        const start = if (self.frame.unbounded)
                             pstart[k]
                         else blk: {
                             const back = @as(i64, @intCast(k)) - self.frame.preceding;
                             const floor = @as(i64, @intCast(pstart[k]));
                             break :blk @as(usize, @intCast(@max(back, floor)));
                         };
-                        var acc_i: i64 = 0;
-                        var acc_f: f64 = 0;
-                        var n: i64 = 0;
-                        var seen_float = false;
-                        var ext: Value = .null;
-                        var m = lo;
-                        while (m <= k) : (m += 1) {
-                            if (f.arg) |ai| {
-                                const v = all.columns[ai].getValue(idx[m]);
-                                if (v.isNull()) continue;
-                                n += 1;
-                                if (ext.isNull() or (if (f.kind == .max) lessV(ext, v) else lessV(v, ext))) ext = v;
-                                switch (v) {
-                                    .int => |x| {
-                                        acc_i += x;
-                                        acc_f += @floatFromInt(x);
-                                    },
-                                    else => if (asF64Opt(v)) |x| {
-                                        acc_f += x;
-                                        seen_float = true;
-                                    },
+                        while (lo < start) : (lo += 1) {
+                            if (f.arg == null) {
+                                n -= 1;
+                                continue;
+                            }
+                            const v = vs[lo];
+                            if (v.isNull()) continue;
+                            n -= 1;
+                            switch (v) {
+                                .int => |x| {
+                                    acc_i -= x;
+                                    acc_f -= @floatFromInt(x);
+                                },
+                                else => if (asF64Opt(v)) |x| {
+                                    acc_f -= x;
+                                },
+                            }
+                        }
+                        while (dq_head < dq.items.len and dq.items[dq_head] < start) dq_head += 1;
+                        if (f.arg == null) {
+                            n += 1;
+                        } else if (!vs[k].isNull()) {
+                            const v = vs[k];
+                            n += 1;
+                            switch (v) {
+                                .int => |x| {
+                                    acc_i += x;
+                                    acc_f += @floatFromInt(x);
+                                },
+                                else => if (asF64Opt(v)) |x| {
+                                    acc_f += x;
+                                    seen_float = true;
+                                },
+                            }
+                            if (f.kind == .min or f.kind == .max) {
+                                // Drop everything the new value beats (or ties): it can
+                                // never be the extreme again while this row is in frame.
+                                while (dq.items.len > dq_head) {
+                                    const back = vs[dq.items[dq.items.len - 1]];
+                                    const beaten = if (f.kind == .max) !lessV(v, back) else !lessV(back, v);
+                                    if (!beaten) break;
+                                    dq.items.len -= 1;
                                 }
-                            } else n += 1;
+                                try dq.append(k);
+                            }
                         }
                         out.*[k] = switch (f.kind) {
                             .count => .{ .int = n },
-                            .min, .max => ext,
+                            .min, .max => if (dq_head < dq.items.len) vs[dq.items[dq_head]] else .null,
                             .avg => if (n == 0) .null else .{ .float = acc_f / @as(f64, @floatFromInt(n)) },
                             else => if (n == 0) .null else if (seen_float) .{ .float = acc_f } else .{ .int = acc_i },
                         };
@@ -485,13 +535,14 @@ pub const Window = struct {
             }
         }
 
-        for (idx, 0..) |row, k| {
-            for (builders[0..ncols], all.columns) |*bd, *col| try bd.append(col.getValue(row));
-            for (builders[ncols..], vals) |*bd, v| try bd.append(v[k]);
+        // The input columns come back through the same columnar gather `Sort`
+        // uses; only the appended columns are built from boxed values.
+        const cols = try arena.alloc(column.Column, ncols + self.funcs.len);
+        for (all.columns, 0..) |*col, ci| cols[ci] = try column.permute(arena, col.*, idx);
+        for (builders, vals, ncols..) |*bd, v, ci| {
+            for (v) |x| try bd.append(x);
+            cols[ci] = try bd.finish();
         }
-
-        const cols = try arena.alloc(column.Column, builders.len);
-        for (builders, 0..) |*bd, i| cols[i] = try bd.finish();
         return Batch{ .schema = self.out_schema, .columns = cols, .len = all.len };
     }
 };
@@ -688,8 +739,12 @@ pub const Distinct = struct {
     /// from the same arena as that batch and valid for exactly as long.
     ords: []const u64 = &.{},
     seen_rows: u64 = 0,
+    /// The single fixed-width key path (see `next`).
+    seen_words: ?SeenWords = null,
+    seen_null: bool = false,
 
     const Seen = std.HashMap([]const Value, void, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
+    const SeenWords = std.AutoHashMap(u64, void);
 
     pub fn next(self: *Distinct, arena: std.mem.Allocator) anyerror!?Batch {
         if (self.seen == null) self.seen = Seen.init(self.state);
@@ -713,7 +768,25 @@ pub const Distinct = struct {
             const probe = try pull.alloc(Value, key_idx.len);
             var kept: usize = 0;
             var r: usize = 0;
-            while (r < b.len) : (r += 1) {
+            if (key_idx.len == 1 and fixedWord(b.columns[key_idx[0]]) != null) {
+                // One fixed-width key — `DISTINCT id`, `DISTINCT ON (id)` — dedups
+                // on the raw 64-bit word with no boxing, no per-key hash walk and
+                // no key copy; null is a flag beside the set. The boxed path
+                // below took 120ns a row on an int column, the scan 40ns.
+                if (self.seen_words == null) self.seen_words = SeenWords.init(self.state);
+                const words = &self.seen_words.?;
+                const col = b.columns[key_idx[0]];
+                while (r < b.len) : (r += 1) {
+                    if (!col.validity.get(r)) {
+                        keep[r] = !self.seen_null;
+                        self.seen_null = true;
+                    } else {
+                        const gop = try words.getOrPut(fixedWord(col).?[r]);
+                        keep[r] = !gop.found_existing;
+                    }
+                    if (keep[r]) kept += 1;
+                }
+            } else while (r < b.len) : (r += 1) {
                 for (key_idx, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
                 const gop = try seen.getOrPut(probe);
                 if (gop.found_existing) {
@@ -748,6 +821,15 @@ pub const Distinct = struct {
     }
 };
 
+/// The raw 64-bit words of an int-family column (its i64 storage, reinterpreted),
+/// or null for any kind whose bits are not its identity (floats have two zeros).
+fn fixedWord(col: column.Column) ?[]const u64 {
+    return switch (col.ty.kind) {
+        .int, .time, .timestamp => @ptrCast(col.data.i64),
+        else => null,
+    };
+}
+
 /// Deep-copy the `keep`-marked rows of `b` into `arena` via column builders, which
 /// dupe string/bytes payloads (unlike `column.gather`, which aliases them). Used when the
 /// source batch lives in a scratch arena that is about to be freed.
@@ -781,7 +863,7 @@ pub const Sort = struct {
         // lift each key column into a flat typed array once, then sort on that
         const arrs = try arena.alloc(KeyArr, self.keys.len);
         for (self.keys, arrs) |k, *a| a.* = try KeyArr.prepare(arena, all.columns[k.idx], k.desc);
-        std.mem.sort(usize, idx, SortCtx{ .arrs = arrs }, SortCtx.lessThan);
+        try sortIdx(arena, idx, arrs);
 
         const outcols = try arena.alloc(column.Column, all.columns.len);
         for (all.columns, 0..) |*col, ci| outcols[ci] = try column.permute(arena, col.*, idx);
@@ -810,42 +892,30 @@ const KeyArr = struct {
 
     fn prepare(arena: std.mem.Allocator, col: column.Column, desc: bool) !KeyArr {
         const n = col.len;
+        // The typed slices are aliased where the column already holds the flat
+        // form; only a narrower physical type is widened. A null slot holds
+        // whatever the builder left there and is never compared.
         const data: Data = switch (col.ty.kind) {
-            .int, .date, .time, .timestamp, .bool => blk: {
+            .int, .time, .timestamp => .{ .ints = col.data.i64 },
+            .date => blk: {
                 const out = try arena.alloc(i64, n);
-                for (out, 0..) |*o, i| o.* = switch (col.getValue(i)) {
-                    .int => |x| x,
-                    .date => |x| x,
-                    .time => |x| x,
-                    .timestamp => |x| x,
-                    .bool => |x| @intFromBool(x),
-                    else => 0,
-                };
+                for (out, col.data.i32[0..n]) |*o, x| o.* = x;
                 break :blk .{ .ints = out };
             },
-            .float => blk: {
-                const out = try arena.alloc(f64, n);
-                for (out, 0..) |*o, i| o.* = switch (col.getValue(i)) {
-                    .float => |x| x,
-                    else => 0,
-                };
-                break :blk .{ .floats = out };
+            .bool => blk: {
+                const out = try arena.alloc(i64, n);
+                for (out, col.data.b[0..n]) |*o, x| o.* = @intFromBool(x);
+                break :blk .{ .ints = out };
             },
+            .float => .{ .floats = col.data.f64 },
             .decimal => blk: {
                 const out = try arena.alloc(i128, n);
-                for (out, 0..) |*o, i| o.* = switch (col.getValue(i)) {
-                    .decimal => |d| d.unscaled,
-                    else => 0,
-                };
+                for (out, col.data.dec[0..n]) |*o, d| o.* = d.unscaled;
                 break :blk .{ .decs = out };
             },
             .string, .bytes => blk: {
                 const out = try arena.alloc([]const u8, n);
-                for (out, 0..) |*o, i| o.* = switch (col.getValue(i)) {
-                    .string => |x| x,
-                    .bytes => |x| x,
-                    else => "",
-                };
+                for (out, 0..) |*o, i| o.* = col.data.bytes.at(i);
                 break :blk .{ .strs = out };
             },
             else => .{ .boxed = col },
@@ -886,6 +956,99 @@ const SortCtx = struct {
         return false;
     }
 };
+
+/// Sort `idx` (pre-filled 0..n) by `arrs`, first key most significant.
+///
+/// When every key is an all-valid int or float column — the common ORDER BY
+/// and window shape — each key becomes an order-preserving u64 word and the
+/// comparator is a word compare with no type switch and no validity read; a
+/// single key sorts (word, index) pairs in place, so the hot loop touches one
+/// contiguous array instead of chasing an index into the key column. Ties
+/// break on input position, which is exactly what the stable sort answered,
+/// so the two paths agree row for row. Anything else takes the general
+/// comparator: it was 3.5s to order 3M floats, most of it in `KeyArr.order`.
+fn sortIdx(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr) !void {
+    const n = idx.len;
+    if (n == 0) return;
+    fast: {
+        const nk = arrs.len;
+        if (nk == 0 or n > std.math.maxInt(u32)) break :fast;
+        for (arrs) |k| {
+            if (!k.valid.allSet(n)) break :fast;
+            switch (k.data) {
+                .ints, .floats => {},
+                else => break :fast,
+            }
+        }
+        // Stable LSD radix, least significant key first: each key is gathered in
+        // the current order into (word, index) pairs and sorted 16 bits a pass,
+        // so the passes read one contiguous array. `std.sort.pdq` on the same
+        // pairs measured 715ms for 3M rows; this is a few sequential sweeps.
+        const pairs = try arena.alloc(RadixPair, n);
+        const tmp = try arena.alloc(RadixPair, n);
+        const counts = try arena.alloc(u32, 1 << 16);
+        var j = nk;
+        while (j > 0) {
+            j -= 1;
+            for (pairs, idx) |*p, i| p.* = .{ .k = orderedWord(arrs[j], i), .i = @intCast(i) };
+            radixSortPairs(pairs, tmp, counts);
+            for (pairs, idx) |p, *x| x.* = p.i;
+        }
+        return;
+    }
+    std.mem.sort(usize, idx, SortCtx{ .arrs = arrs }, SortCtx.lessThan);
+}
+
+const RadixPair = struct { k: u64, i: u32 };
+
+/// Stable radix sort of `pairs` by `k`, 16 bits a pass, low digit first. A
+/// pass whose digit is the same on every row is skipped, so a key with a
+/// small range (an id, a day count, a flag) costs one or two sweeps, not four.
+fn radixSortPairs(pairs: []RadixPair, tmp: []RadixPair, counts: []u32) void {
+    var src = pairs;
+    var dst = tmp;
+    var pass: u6 = 0;
+    while (pass < 4) : (pass += 1) {
+        const shift: u6 = pass * 16;
+        @memset(counts, 0);
+        for (src) |p| counts[@intCast((p.k >> shift) & 0xffff)] += 1;
+        if (counts[@intCast((src[0].k >> shift) & 0xffff)] == src.len) continue;
+        var sum: u32 = 0;
+        for (counts) |*c| {
+            const v = c.*;
+            c.* = sum;
+            sum += v;
+        }
+        for (src) |p| {
+            const d: usize = @intCast((p.k >> shift) & 0xffff);
+            dst[counts[d]] = p;
+            counts[d] += 1;
+        }
+        const t = src;
+        src = dst;
+        dst = t;
+    }
+    if (src.ptr != pairs.ptr) @memcpy(pairs, src);
+}
+
+/// The u64 whose unsigned order is the key's sort order: ints flip the sign
+/// bit; floats use the IEEE trick (negatives complemented, positives get the
+/// sign bit), with every NaN canonicalized so it sorts last like `orderF64`;
+/// `desc` complements the word.
+fn orderedWord(k: KeyArr, i: usize) u64 {
+    const w: u64 = switch (k.data) {
+        .ints => |v| @as(u64, @bitCast(v[i])) ^ (1 << 63),
+        .floats => |v| blk: {
+            // -0.0 folds into 0.0: `std.math.order` calls them equal, so the
+            // stable sort left them in input order, and the word must too.
+            const x = if (v[i] == 0) 0.0 else v[i];
+            const b: u64 = if (std.math.isNan(x)) 0x7ff8000000000000 else @bitCast(x);
+            break :blk if (b >> 63 != 0) ~b else b | (1 << 63);
+        },
+        else => unreachable,
+    };
+    return if (k.desc) ~w else w;
+}
 
 /// Effective order of two sort-key values: `.lt` means `va` sorts before `vb`.
 /// Nulls always sort last (independent of `desc`); `desc` flips non-null order.
@@ -1066,11 +1229,24 @@ pub const Aggregate = struct {
         /// allocated for distinct aggs, so ordinary aggregation keeps its
         /// scalar accumulator.
         seen: ?*DistinctSet() = null,
+        /// Every value a `MEDIAN(x)` has seen, per group: a median needs the whole
+        /// distribution, so this is the one aggregate that is not O(1) per group.
+        vals: ?*std.array_list.Managed(f64) = null,
     };
 
     /// Wrapped in a fn for the same reason as `GroupMap` — see its comment.
     pub fn DistinctSet() type {
         return std.HashMap([]const Value, void, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
+    }
+
+    fn noteMedian(alloc: std.mem.Allocator, acc: *Acc, x: f64) !void {
+        const l = acc.vals orelse blk: {
+            const p = try alloc.create(std.array_list.Managed(f64));
+            p.* = std.array_list.Managed(f64).init(alloc);
+            acc.vals = p;
+            break :blk p;
+        };
+        try l.append(x);
     }
 
     fn noteDistinct(alloc: std.mem.Allocator, acc: *Acc, v: Value) !void {
@@ -1215,7 +1391,11 @@ pub const Aggregate = struct {
                 counts[pi] += 1;
             }
 
-            for (order) |ri| {
+            for (order, 0..) |ri, oi| {
+                if (oi + prefetch_ahead < order.len) {
+                    const pr = order[oi + prefetch_ahead];
+                    tables[hashes[pr] >> part_shift].prefetch(hashes[pr]);
+                }
                 const key = FixedKey{ .vals = keys[ri * nk ..][0..nk], .mask = masks[ri] };
                 const at: u32 = @intCast(store.len);
                 const table = &tables[hashes[ri] >> part_shift];
@@ -1312,14 +1492,18 @@ pub const Aggregate = struct {
         var store = GroupStore.init(self.state, self.by.len, self.aggs.len);
         const hctx = keyhash.MultiKeyCtx{};
         while (try self.child.next(pull)) |b| {
-            const probe = try pull.alloc(Value, self.by.len);
+            const nk = self.by.len;
+            // Every row's keys are boxed once, into one flat slice, and read
+            // back by the probe pass: it used to box them a second time.
+            const probes = try pull.alloc(Value, b.len * nk);
             const hashes = try pull.alloc(u64, b.len);
 
-            // Hash the whole batch first, then walk it again to probe: by the
-            // time a row's bucket is read the prefetch has had the rest of the
-            // batch to land.
+            // Hash the whole batch first, then walk it again to probe, a few
+            // rows ahead of a prefetch on the bucket, so the miss on a large
+            // table overlaps the rows before it instead of stalling each one.
             var r: usize = 0;
             while (r < b.len) : (r += 1) {
+                const probe = probes[r * nk ..][0..nk];
                 for (self.by, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
                 hashes[r] = hctx.hash(probe);
             }
@@ -1344,9 +1528,13 @@ pub const Aggregate = struct {
                 counts[pi] += 1;
             }
 
-            for (order) |ri| {
+            for (order, 0..) |ri, oi| {
+                if (oi + prefetch_ahead < order.len) {
+                    const pr = order[oi + prefetch_ahead];
+                    tables[hashes[pr] >> part_shift].prefetch(hashes[pr]);
+                }
                 r = ri;
-                for (self.by, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
+                const probe = probes[r * nk ..][0..nk];
                 const at: u32 = @intCast(store.len);
                 const table = &tables[hashes[r] >> part_shift];
                 const f = try table.getOrPut(hashes[r], probe, &store, ghashes.items, at);
@@ -1377,6 +1565,11 @@ pub const Aggregate = struct {
     /// a key, and it exposes the bucket up front so a batch can prefetch its
     /// buckets before probing. At high cardinality the probe is a cache miss, and
     /// hiding that miss is the whole game.
+    /// Rows between a bucket's prefetch and its probe. `GroupTable.prefetch`
+    /// existed for this and had no caller, so the two-pass shape above paid
+    /// for a miss it never hid.
+    const prefetch_ahead = 8;
+
     /// How a fixed-width key column is read into a raw `i64`.
     const KeyKind = enum { i64k, i32k, boolk, f64k };
 
@@ -1637,6 +1830,9 @@ pub const Aggregate = struct {
             .avg => {
                 dst.sum_f += src.sum_f;
                 dst.n += src.n;
+            },
+            .median => if (src.vals) |s| {
+                for (s.items) |x| try noteMedian(dst_alloc, dst, x);
             },
             .min => if (!src.ext.isNull() and (dst.ext.isNull() or lessV(src.ext, dst.ext))) {
                 dst.ext = try dupeValue(dst_alloc, src.ext);
@@ -1904,6 +2100,7 @@ pub const Aggregate = struct {
         if (nvalid == 0) return p;
         switch (agg.func) {
             .count => {},
+            .median => return null,
             .sum, .avg => switch (col.ty.kind) {
                 .float => p.sum_f = simd.sumF(col.data.f64[0..n]),
                 .int => {
@@ -1934,6 +2131,8 @@ pub const Aggregate = struct {
                 acc.sum_f += p.sum_f;
                 acc.n += @intCast(p.nvalid);
             },
+            // `reduceBatch` never covers a median: it folds row-wise.
+            .median => {},
             .min => if (p.ext) |v| {
                 if (acc.ext.isNull() or lessV(v, acc.ext)) {
                     acc.ext = v;
@@ -2009,6 +2208,7 @@ pub const Aggregate = struct {
                 acc.sum_f += eval.toF64(v);
                 acc.n += 1;
             },
+            .median => if (!v.isNull()) try noteMedian(state, acc, eval.toF64(v)),
             .min => if (!v.isNull()) {
                 if (acc.ext.isNull() or lessV(v, acc.ext)) {
                     acc.ext = try dupeValue(state, v);
@@ -2031,6 +2231,22 @@ pub const Aggregate = struct {
                 else => Value{ .int = acc.sum_i },
             },
             .avg => if (acc.n == 0) .null else Value{ .float = acc.sum_f / @as(f64, @floatFromInt(acc.n)) },
+            .median => blk: {
+                const l = acc.vals orelse break :blk Value.null;
+                const xs = l.items;
+                if (xs.len == 0) break :blk Value.null;
+                const mid = xs.len / 2;
+                // Selection, not a sort: O(n) for the middle element. Even
+                // count: the mean of the two middle values, as Postgres's
+                // percentile_cont(0.5) and DuckDB's median both answer; after
+                // selecting `mid`, everything before it is <= it, so the
+                // other middle value is the max of that prefix.
+                const hi = selectNth(xs, mid);
+                if (xs.len % 2 == 1) break :blk Value{ .float = hi };
+                var lo = xs[0];
+                for (xs[1..mid]) |x| lo = @max(lo, x);
+                break :blk Value{ .float = (lo + hi) / 2 };
+            },
             .min, .max => acc.ext,
         };
     }
@@ -2038,6 +2254,43 @@ pub const Aggregate = struct {
 
 fn lessV(a: Value, b: Value) bool {
     return (eval.compareValues(a, b) orelse .eq) == .lt;
+}
+
+/// Quickselect: reorders `xs` so `xs[k]` is the k-th smallest, everything
+/// before it no larger and everything after no smaller, and returns it.
+/// Median-of-three pivot, Hoare partition; expected O(n).
+fn selectNth(xs: []f64, k: usize) f64 {
+    var lo: usize = 0;
+    var hi: usize = xs.len - 1;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        // Median of three into `mid`, which is also the pivot value.
+        if (xs[mid] < xs[lo]) std.mem.swap(f64, &xs[mid], &xs[lo]);
+        if (xs[hi] < xs[lo]) std.mem.swap(f64, &xs[hi], &xs[lo]);
+        if (xs[hi] < xs[mid]) std.mem.swap(f64, &xs[hi], &xs[mid]);
+        const p = xs[mid];
+        var i = lo;
+        var j = hi;
+        while (i <= j) {
+            while (xs[i] < p) i += 1;
+            while (p < xs[j]) j -= 1;
+            if (i <= j) {
+                std.mem.swap(f64, &xs[i], &xs[j]);
+                i += 1;
+                if (j == 0) break;
+                j -= 1;
+            }
+        }
+        // Now xs[lo..=j] <= p <= xs[i..=hi]; recurse into the side holding k.
+        if (k <= j) {
+            hi = j;
+        } else if (k >= i) {
+            lo = i;
+        } else {
+            return xs[k];
+        }
+    }
+    return xs[k];
 }
 
 /// Deep-copy a value into `state` so it survives the batch it was read from.

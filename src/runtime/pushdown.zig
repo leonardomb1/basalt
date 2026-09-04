@@ -224,7 +224,7 @@ fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema,
             }
             return try std.fmt.allocPrint(arena, "{s}({s})", .{ if (item.func == .min) "MIN" else "MAX", col });
         },
-        .avg => return null,
+        .avg, .median => return null,
     }
 }
 

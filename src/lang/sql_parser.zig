@@ -113,6 +113,7 @@ const agg_names = [_]struct { n: []const u8, f: ast.AggFunc }{
     .{ .n = "avg", .f = .avg },
     .{ .n = "min", .f = .min },
     .{ .n = "max", .f = .max },
+    .{ .n = "median", .f = .median },
 };
 
 /// Whether `name` is an aggregate function — reserved, since it is parsed as

@@ -251,6 +251,14 @@ LIMIT 100 OFFSET 20;
 | no source | `SELECT 1 AS x, now() AS t;` — a `SELECT` with no `FROM` yields one row of computed values |
 | CTE | `FROM <name>` |
 
+A CSV column's type is sniffed from the first 1024 rows: int ⊂ float ⊂ string,
+and a column whose every non-empty, unquoted cell is an ISO `YYYY-MM-DD` reads as
+a `DATE` — so `WHERE day >= '2026-01-01'`, `date_add`, `date_diff` and `EXTRACT`
+work on it directly, and a parquet sink stores it as a date. A string function
+on it (`substr(day, 1, 7)`, `day LIKE '2026%'`) still sees the ISO text. A cell
+past the sample that does not parse as the inferred type is an error, never a
+silent coercion. Timestamps are not sniffed; `CAST(ts AS TIMESTAMP)` as before.
+
 Parquet reads use column projection, row-group skipping from statistics, and
 ranged reads — only the footer and the chunks a query needs are fetched. A
 remote `.parquet` (`https://...`, `az://...`, `s3://...`) is read the same way, by HTTP
@@ -387,6 +395,7 @@ WHERE downloads > 0;
 | `COUNT(*) / SUM / AVG / MIN / MAX ... GROUP BY k` | aggregate (every other item must be a group key, aliased or not, or a plan-time constant) |
 | `ROUND(AVG(x), 2)`, `SUM(a)/COUNT(*)` | an aggregate inside an expression: the calls are computed by the aggregate, the arithmetic around them by a projection after it |
 | `COUNT(DISTINCT x)` | aggregate — combines freely with other aggregates; ignores nulls |
+| `MEDIAN(x)` | aggregate — a float; the mean of the two middle values on an even count; ignores nulls. Holds every value of the group until the end, so it is the one aggregate that is not O(1) per group. Engine-side only (never pushed down), and not a window function |
 | `HAVING <expr>` | filter after the aggregate; aggregate calls in it refer to the columns it produced, including ones the `SELECT` list never asked for |
 | `ORDER BY a DESC, b` | sort |
 | `LIMIT n [OFFSET m]` | limit |
@@ -814,6 +823,12 @@ At a use site the innermost binding wins: loop var > LET/PARAM.
   — `'1000,00'` is not a number basalt will read, and it used to come back as
   100000.00. Strip the separator first: `CAST(replace(v, ',', '.') AS
   DECIMAL(18,2))`, or reach for `TRY_CAST` to turn unreadable values into nulls.
+- **DECIMAL arithmetic is exact.** `+` and `-` over two decimals (or a decimal
+  and an int) answer a decimal at the wider operand's scale, `*` one at the
+  summed scale — `CAST(1.1 AS DECIMAL(18,2)) + CAST(0.3 AS DECIMAL(18,2))` is
+  `1.40`, not `1.4000000000000001`, so a `SUM` cast to `DECIMAL` stays exact
+  when this month's total is subtracted from last month's. `/` and `%` have no
+  finite scale and stay float, as does anything with a float operand.
 - A `DATE`/`TIMESTAMP` column compares directly against an ISO string literal
   (`WHERE d >= '2013-07-01'`). The literal is coerced to the column's type,
   never the reverse, and it is validated at plan time — so `'2013-13-01'` and

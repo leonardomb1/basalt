@@ -2831,3 +2831,77 @@ test "a plan failure carries the failing stage's position" {
     try std.testing.expectEqual(@as(u32, 4), rdiag.pos.?.line);
     try std.testing.expectEqual(@as(u32, 7), rdiag.pos.?.col);
 }
+
+test "decimal arithmetic is exact: + - * stay DECIMAL, / is a float" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const got = try runToString(alloc, &tmp, "a,b\n1.1,0.3\n28875360.09,21199414.08\n",
+        \\SELECT CAST(a AS DECIMAL(18,2)) + CAST(b AS DECIMAL(18,2)) AS s,
+        \\       CAST(a AS DECIMAL(18,2)) - CAST(b AS DECIMAL(18,2)) AS d,
+        \\       CAST(a AS DECIMAL(18,2)) * CAST(b AS DECIMAL(18,2)) AS p,
+        \\       CAST(a AS DECIMAL(18,2)) * 3 AS p3,
+        \\       CAST(a AS DECIMAL(18,2)) / 2 AS q
+        \\FROM '$IN'
+    );
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("s,d,p,p3,q\n1.40,0.80,0.3300,3.30,0.55\n50074774.17,7675946.01,612140715257016.0672,86626080.27,14437680.045\n", got);
+}
+
+test "MEDIAN: odd count takes the middle, even count the mean of the two, nulls ignored, empty is null" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const got = try runToString(alloc, &tmp, "k,v\na,3\na,1\na,\na,2\nb,20\nb,10\nc,\n", "SELECT k, MEDIAN(v) AS m FROM '$IN' GROUP BY k ORDER BY k");
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("k,m\na,2\nb,15\nc,\n", got);
+}
+
+test "csv: a column of ISO dates is inferred as DATE (empty cells are null)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const got = try runToString(alloc, &tmp, "d\n2026-01-31\n\n2026-02-01\n", "SELECT date_add('day', 1, d) AS n FROM '$IN' WHERE d >= '2026-01-01'");
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("n\n2026-02-01\n2026-02-02\n", got);
+}
+
+test "window ROWS frame slides: bounded sum/min/max/count per partition, nulls skipped" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const got = try runToString(alloc, &tmp, "k,i,v\n0,0,0\n0,2,4\n0,4,8\n0,6,2\n0,8,6\n1,1,7\n1,3,1\n1,5,\n1,7,9\n1,9,3\n",
+        \\SELECT k, i, v,
+        \\       SUM(v) OVER (PARTITION BY k ORDER BY i ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS s3,
+        \\       MIN(v) OVER (PARTITION BY k ORDER BY i ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS mn3,
+        \\       MAX(v) OVER (PARTITION BY k ORDER BY i ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS mx3,
+        \\       COUNT(v) OVER (PARTITION BY k ORDER BY i ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS c3
+        \\FROM '$IN' ORDER BY k, i
+    );
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("k,i,v,s3,mn3,mx3,c3\n0,0,0,0,0,0,1\n0,2,4,4,0,4,2\n0,4,8,12,0,8,3\n0,6,2,14,2,8,3\n0,8,6,16,2,8,3\n1,1,7,7,7,7,1\n1,3,1,8,1,7,2\n1,5,,8,1,7,2\n1,7,9,10,1,9,2\n1,9,3,12,3,9,2\n", got);
+}
+
+test "sort: the radix fast path keeps input order on ties, honors DESC and multi-key; nulls still sort last" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const desc = try runToString(alloc, &tmp, "i,k\n0,1\n1,0\n2,1\n4,0\n", "SELECT i FROM '$IN' ORDER BY k DESC");
+    defer alloc.free(desc);
+    try std.testing.expectEqualStrings("i\n0\n2\n1\n4\n", desc);
+    const multi = try runToString(alloc, &tmp, "i,k\n0,1\n1,0\n2,1\n4,0\n", "SELECT i FROM '$IN' ORDER BY k, i DESC");
+    defer alloc.free(multi);
+    try std.testing.expectEqualStrings("i\n4\n1\n2\n0\n", multi);
+    const nulls = try runToString(alloc, &tmp, "i,k\n0,1\n1,0\n2,1\n3,\n4,0\n", "SELECT i FROM '$IN' ORDER BY k DESC");
+    defer alloc.free(nulls);
+    try std.testing.expectEqualStrings("i\n0\n2\n1\n4\n3\n", nulls);
+}
+
+test "distinct: the single int-key path keeps first occurrences, null included once" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const got = try runToString(alloc, &tmp, "k,v\n1,2\n2,\n3,1\n4,2\n5,\n6,1\n", "SELECT DISTINCT v FROM '$IN'");
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("v\n2\n\n1\n", got);
+}

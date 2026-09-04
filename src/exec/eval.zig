@@ -82,6 +82,7 @@ pub const TypeCtx = struct {
         switch (b.op) {
             .add, .sub, .mul, .div, .mod => {
                 if (!(numericish(lt) and numericish(rt))) return self.err("arithmetic needs numeric operands", .{});
+                if (decimalArithType(b.op, lt, rt)) |dt| return dt.withNull(nn);
                 const k: types.TypeKind = if (lt.kind == .float or rt.kind == .float or lt.kind == .decimal or rt.kind == .decimal) .float else .int;
                 return Type{ .kind = k, .nullable = nn };
             },
@@ -367,6 +368,7 @@ fn binaryVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecErro
             const l = try evalVec(arena, b.l, batch);
             const r = try evalVec(arena, b.r, batch);
             if (scalarNull(l) or scalarNull(r)) return .{ .scalar = .null };
+            if (try decOpVec(arena, b.op, l, r, batch.len)) |v| return v;
             const ln = (try asNum(arena, l, batch.len)) orelse return error.Unsupported;
             const rn = (try asNum(arena, r, batch.len)) orelse return error.Unsupported;
             return numOpVec(arena, b.op, ln, rn, batch.len);
@@ -750,6 +752,52 @@ fn asNum(arena: std.mem.Allocator, v: Vec, n: usize) VecError!?Num {
     }
 }
 
+/// The exact lane for `decimalArithType`: null when the operands or the op are
+/// not its case, and the float kernels take over as before.
+fn decOpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) VecError!?Vec {
+    const ty = decimalArithType(op, vecType(l) orelse return null, vecType(r) orelse return null) orelse return null;
+    const out = try arena.alloc(Decimal, n);
+    var bm = try Bitmap.initFull(arena, n);
+    var any = false;
+    for (0..n) |i| {
+        if (!vecValid(l, i) or !vecValid(r, i)) {
+            out[i] = .{ .unscaled = 0, .scale = ty.scale };
+            bm.setValid(i, false);
+            any = true;
+            continue;
+        }
+        out[i] = try (decimalOp(op, decAt(l, i), decAt(r, i)) orelse unreachable);
+    }
+    return mkCol(ty.withNull(any), n, bm, .{ .dec = out });
+}
+
+/// The numeric type of an int/decimal operand; null for anything else.
+fn vecType(v: Vec) ?Type {
+    return switch (v) {
+        .scalar => |s| switch (s) {
+            .int => Type.init(.int),
+            .decimal => |d| Type.decimal(0, d.scale),
+            else => null,
+        },
+        .col => |c| if (c.ty.kind == .int or c.ty.kind == .decimal) c.ty else null,
+    };
+}
+
+inline fn vecValid(v: Vec, i: usize) bool {
+    return switch (v) {
+        .scalar => true,
+        .col => |c| c.validity.get(i),
+    };
+}
+
+/// Only for operands `vecType` accepted, at a valid row.
+inline fn decAt(v: Vec, i: usize) Decimal {
+    return switch (v) {
+        .scalar => |s| asDecimal(s).?,
+        .col => |c| if (c.ty.kind == .decimal) c.data.dec[i] else Decimal{ .unscaled = c.data.i64[i], .scale = 0 },
+    };
+}
+
 /// A comparison where one side is temporal, as integer lanes.
 ///
 /// `asNum` covers int/float/decimal only, so every date comparison used to fall out
@@ -1087,6 +1135,9 @@ fn arith(op: ast.BinOp, l: Value, r: Value) EvalError!Value {
             else => unreachable,
         };
     }
+    if (l == .decimal or r == .decimal) {
+        if (asDecimal(l)) |a| if (asDecimal(r)) |b| if (decimalOp(op, a, b)) |d| return .{ .decimal = try d };
+    }
     const a = toF64(l);
     const b = toF64(r);
     return switch (op) {
@@ -1097,6 +1148,52 @@ fn arith(op: ast.BinOp, l: Value, r: Value) EvalError!Value {
         .mod => .{ .float = @mod(a, b) },
         else => unreachable,
     };
+}
+
+/// Exact DECIMAL arithmetic: `+`/`-` at the wider operand's scale, `*` at the
+/// summed scale, both on the i128 unscaled integers. `/` and `%` have no finite
+/// scale and stay float, as does anything with a float operand. Money math
+/// used to go through f64 here, so `CAST(1.1 AS DECIMAL(18,2)) + CAST(0.3 AS
+/// DECIMAL(18,2))` answered 1.4000000000000001 — which defeated the advice to
+/// cast a SUM to DECIMAL the moment the total was subtracted from another.
+fn decimalArithType(op: ast.BinOp, lt: Type, rt: Type) ?Type {
+    if (op != .add and op != .sub and op != .mul) return null;
+    if (lt.kind == .float or rt.kind == .float) return null;
+    if (lt.kind != .decimal and rt.kind != .decimal) return null;
+    // An INT operand is a DECIMAL(19,0); an unresolved precision (0) is the ceiling.
+    const lp: u16 = if (lt.kind != .decimal) 19 else if (lt.precision == 0) 38 else lt.precision;
+    const rp: u16 = if (rt.kind != .decimal) 19 else if (rt.precision == 0) 38 else rt.precision;
+    const ls: u16 = if (lt.kind == .decimal) lt.scale else 0;
+    const rs: u16 = if (rt.kind == .decimal) rt.scale else 0;
+    const scale: u16 = if (op == .mul) ls + rs else @max(ls, rs);
+    const prec: u16 = if (op == .mul) lp + rp else @max(lp -| ls, rp -| rs) + scale + 1;
+    return Type.decimal(@intCast(@min(38, prec)), @intCast(@min(38, scale)));
+}
+
+fn asDecimal(v: Value) ?Decimal {
+    return switch (v) {
+        .decimal => |d| d,
+        .int => |x| .{ .unscaled = x, .scale = 0 },
+        else => null,
+    };
+}
+
+/// Null for an op that is not exact over decimals (see `decimalArithType`).
+fn decimalOp(op: ast.BinOp, a: Decimal, b: Decimal) ?error{IntOverflow}!Decimal {
+    switch (op) {
+        .mul => return .{
+            .unscaled = std.math.mul(i128, a.unscaled, b.unscaled) catch return error.IntOverflow,
+            .scale = a.scale + b.scale,
+        },
+        .add, .sub => {
+            const s = @max(a.scale, b.scale);
+            const x = rescaleTo(a, s) orelse return error.IntOverflow;
+            const y = rescaleTo(b, s) orelse return error.IntOverflow;
+            const u = if (op == .add) std.math.add(i128, x.unscaled, y.unscaled) else std.math.sub(i128, x.unscaled, y.unscaled);
+            return .{ .unscaled = u catch return error.IntOverflow, .scale = s };
+        },
+        else => return null,
+    }
 }
 
 /// INT-only bitwise ops. Null propagation happens in the caller.

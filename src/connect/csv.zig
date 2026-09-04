@@ -639,11 +639,12 @@ fn sliceClose(_: *anyopaque) void {}
 /// paths always agree on a file's schema.
 pub const SAMPLE_ROWS = 1024;
 
-/// Column type inference over sampled lines: int ⊂ float ⊂ string. Quoted cells
-/// force string (quotes mark text), empty cells only mark nullability, and a
-/// leading zero / '+' sign disqualifies int ("007" must round-trip verbatim).
+/// Column type inference over sampled lines: int ⊂ float ⊂ string, and a column
+/// of nothing but `YYYY-MM-DD` cells is a DATE. Quoted cells force string
+/// (quotes mark text), empty cells only mark nullability, and a leading zero /
+/// '+' sign disqualifies int ("007" must round-trip verbatim).
 const TypeSniffer = struct {
-    const ColState = struct { seen: bool = false, all_int: bool = true, all_float: bool = true };
+    const ColState = struct { seen: bool = false, all_int: bool = true, all_float: bool = true, all_date: bool = true };
     cols: []ColState,
 
     fn init(arena: std.mem.Allocator, ncols: usize) !TypeSniffer {
@@ -659,6 +660,7 @@ const TypeSniffer = struct {
                 c.seen = true;
                 c.all_int = false;
                 c.all_float = false;
+                c.all_date = false;
                 i += 1;
                 while (i < line.len) {
                     if (line[i] == '"') {
@@ -677,6 +679,7 @@ const TypeSniffer = struct {
                 const raw = line[start..i];
                 if (raw.len > 0) {
                     c.seen = true;
+                    if (c.all_date and eval.parseIsoDate(raw) == null) c.all_date = false;
                     if (raw[0] == '+' or (raw.len > 1 and (raw[0] == '0' or (raw[0] == '-' and raw[1] == '0')) and std.mem.indexOfScalar(u8, raw, '.') == null)) {
                         c.all_int = false;
                         c.all_float = false;
@@ -696,7 +699,9 @@ const TypeSniffer = struct {
 
     fn resolve(self: *const TypeSniffer, j: usize) types.Type {
         const c = self.cols[j];
-        const k: types.TypeKind = if (!c.seen or !c.all_float) .string else if (c.all_int) .int else .float;
+        // A number never parses as a date and a date never as a number, so the
+        // order here only matters for an unseen column, which stays string.
+        const k: types.TypeKind = if (!c.seen) .string else if (c.all_int) .int else if (c.all_float) .float else if (c.all_date) .date else .string;
         return types.Type.init(k).asNullable();
     }
 };
@@ -707,9 +712,79 @@ const TypeSniffer = struct {
 fn appendCell(b: *column.Builder, raw: []const u8, quoted: bool) !void {
     if (raw.len == 0) return b.append(if (quoted and b.ty.kind == .string) Value{ .string = raw } else .null);
     switch (b.ty.kind) {
-        .int => try b.append(.{ .int = std.fmt.parseInt(i64, raw, 10) catch return error.CsvTypeMismatch }),
-        .float => try b.append(.{ .float = std.fmt.parseFloat(f64, raw) catch return error.CsvTypeMismatch }),
-        else => try b.append(.{ .string = raw }),
+        .int => try b.appendInt(parseIntFast(raw) orelse (std.fmt.parseInt(i64, raw, 10) catch return error.CsvTypeMismatch)),
+        .float => try b.appendFloat(parseFloatFast(raw) orelse (std.fmt.parseFloat(f64, raw) catch return error.CsvTypeMismatch)),
+        .date => try b.append(.{ .date = @intCast(eval.parseIsoDate(raw) orelse return error.CsvTypeMismatch) }),
+        else => try b.appendStr(raw),
+    }
+}
+
+/// `[-]digits`, at most 18 of them, which cannot overflow an i64: the whole
+/// of what `std.fmt.parseInt` does that a CSV cell needs, without the base
+/// prefix, underscore and sign handling it pays for per call. Else null.
+fn parseIntFast(s: []const u8) ?i64 {
+    if (s.len == 0 or s.len > 19) return null;
+    var i: usize = 0;
+    const neg = s[0] == '-';
+    if (neg) i = 1;
+    if (s.len - i == 0 or s.len - i > 18) return null;
+    var v: i64 = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c < '0' or c > '9') return null;
+        v = v * 10 + (c - '0');
+    }
+    return if (neg) -v else v;
+}
+
+test "parseIntFast agrees with std and declines what it cannot prove" {
+    for ([_][]const u8{ "0", "7", "-7", "123456789012345678", "-123456789012345678", "007" }) |s| {
+        try std.testing.expectEqual(try std.fmt.parseInt(i64, s, 10), parseIntFast(s).?);
+    }
+    for ([_][]const u8{ "", "-", "+1", "1_000", "0x10", "1234567890123456789", "1.0", " 1" }) |s| {
+        try std.testing.expect(parseIntFast(s) == null);
+    }
+}
+
+/// The plain decimal most CSV floats are — `[-]digits[.digits]`, no exponent,
+/// at most 15 significant digits and 22 fractional — read as an integer
+/// mantissa divided by a power of ten. Both are exact doubles, so the one
+/// division rounds correctly (Clinger's fast path) and the answer is what
+/// `std.fmt.parseFloat` gives, at a fraction of its cost. Anything else: null.
+fn parseFloatFast(s: []const u8) ?f64 {
+    if (s.len == 0 or s.len > 18) return null;
+    var i: usize = 0;
+    const neg = s[0] == '-';
+    if (neg) i = 1;
+    var mant: u64 = 0;
+    var digits: usize = 0;
+    var frac: usize = 0;
+    var seen_dot = false;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c == '.') {
+            if (seen_dot) return null;
+            seen_dot = true;
+            continue;
+        }
+        if (c < '0' or c > '9') return null;
+        mant = mant * 10 + (c - '0');
+        digits += 1;
+        if (seen_dot) frac += 1;
+    }
+    if (digits == 0 or digits > 15) return null;
+    const pow10 = [_]f64{ 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22 };
+    if (frac >= pow10.len) return null;
+    const v = @as(f64, @floatFromInt(mant)) / pow10[frac];
+    return if (neg) -v else v;
+}
+
+test "parseFloatFast agrees with std on plain decimals and declines the rest" {
+    for ([_][]const u8{ "0", "1", "-1", "3.25", "-0.001", "123456.789", "99.90", "0.1", "1234567890.12345" }) |s| {
+        try std.testing.expectEqual(try std.fmt.parseFloat(f64, s), parseFloatFast(s).?);
+    }
+    for ([_][]const u8{ "", "-", ".", "1e5", "+1", "1.2.3", "abc", "1234567890123456", "nan" }) |s| {
+        try std.testing.expect(parseFloatFast(s) == null);
     }
 }
 
@@ -720,6 +795,16 @@ fn appendCell(b: *column.Builder, raw: []const u8, quoted: bool) !void {
 /// the first raw newline, which split such a row in half. basalt's own CSV
 /// writer quotes embedded newlines, so it emitted files it could not read back.
 fn scanRecord(data: []const u8, start: usize, delim: u8) struct { line: []const u8, next: usize } {
+    // Fast path: the next newline ends the record unless a quote precedes it.
+    // Two SIMD scans instead of the byte walk below, which is what every
+    // quoteless line — nearly all of them — used to pay per byte.
+    if (std.mem.indexOfScalarPos(u8, data, start, '\n')) |nl| {
+        if (std.mem.indexOfScalar(u8, data[start..nl], '"') == null) {
+            var end = nl;
+            if (end > start and data[end - 1] == '\r') end -= 1;
+            return .{ .line = data[start..end], .next = nl + 1 };
+        }
+    }
     var i = start;
     var in_q = false;
     var at_field = true;
@@ -757,9 +842,13 @@ fn scanRecord(data: []const u8, start: usize, delim: u8) struct { line: []const 
 /// Whether `line` leaves a quoted field open — i.e. the record continues on the
 /// next physical line. `""` contributes two, so plain parity is the quote state.
 fn quotesOpen(line: []const u8, delim: u8) bool {
+    // No quote anywhere — nearly every line — is one SIMD scan; the byte walk
+    // below only runs on a line that has one. Walking every byte of every line
+    // here made the serial parse byte-bound at ~75 MB/s whatever the columns.
+    const first_q = std.mem.indexOfScalar(u8, line, '"') orelse return false;
     var in_q = false;
-    var at_field = true;
-    var i: usize = 0;
+    var at_field = first_q == 0 or line[first_q - 1] == delim;
+    var i: usize = first_q;
     while (i < line.len) : (i += 1) {
         const c = line[i];
         if (c == '"') {
@@ -786,20 +875,30 @@ fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Buil
     while (col < builders.len) : (col += 1) {
         if (i < line.len and line[i] == '"') {
             i += 1;
-            var buf = std.array_list.Managed(u8).init(arena);
+            // The common quoted field has no `""` inside and ends right at the
+            // delimiter: it is a slice of the line, no copy. Only an escaped
+            // quote, or text trailing the closing quote, goes through a buffer.
+            // The old path appended byte by byte into a fresh list per cell.
+            const start = i;
+            var buf: ?std.array_list.Managed(u8) = null;
             while (i < line.len) {
-                if (line[i] == '"') {
-                    if (i + 1 < line.len and line[i + 1] == '"') {
-                        try buf.append('"');
-                        i += 2;
-                        continue;
+                const q = std.mem.indexOfScalarPos(u8, line, i, '"') orelse line.len;
+                if (buf) |*b| try b.appendSlice(line[i..q]);
+                i = q;
+                if (i >= line.len) break;
+                if (i + 1 < line.len and line[i + 1] == '"') {
+                    if (buf == null) {
+                        buf = std.array_list.Managed(u8).init(arena);
+                        try buf.?.appendSlice(line[start..i]);
                     }
-                    i += 1;
-                    break;
+                    try buf.?.append('"');
+                    i += 2;
+                    continue;
                 }
-                try buf.append(line[i]);
-                i += 1;
+                break;
             }
+            const end = i; // the closing quote (or end of line)
+            if (i < line.len) i += 1;
             // Text between the closing quote and the delimiter, as in the CVM
             // registry's `"1" é calculado de acordo com…`: a field that opens
             // quoted and then continues unquoted. RFC 4180 leaves it undefined and
@@ -807,13 +906,21 @@ fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Buil
             // made the remainder look like the next column — one such row shifted
             // its last 19 values by one and dropped the final one, silently. Keep
             // reading to the delimiter, which is where the field visibly ends.
-            while (i < line.len and line[i] != d.delim) : (i += 1) try buf.append(line[i]);
-            const raw = try buf.toOwnedSlice();
+            const tail_end = std.mem.indexOfScalarPos(u8, line, i, d.delim) orelse line.len;
+            if (tail_end > i) {
+                if (buf == null) {
+                    buf = std.array_list.Managed(u8).init(arena);
+                    try buf.?.appendSlice(line[start..end]);
+                }
+                try buf.?.appendSlice(line[i..tail_end]);
+            }
+            i = tail_end;
+            const raw = if (buf) |*b| try b.toOwnedSlice() else line[start..end];
             try appendCell(&builders[col], try decodeField(arena, d.encoding, raw), true);
             if (i < line.len and line[i] == d.delim) i += 1;
         } else {
             const start = i;
-            while (i < line.len and line[i] != d.delim) i += 1;
+            i = std.mem.indexOfScalarPos(u8, line, i, d.delim) orelse line.len;
             try appendCell(&builders[col], try decodeField(arena, d.encoding, line[start..i]), false);
             if (i < line.len and line[i] == d.delim) i += 1;
         }

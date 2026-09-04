@@ -205,7 +205,7 @@ pub const Distinct = struct { on: ?[]const QualName };
 pub const SortKey = struct { field: QualName, desc: bool };
 pub const Sort = struct { keys: []const SortKey };
 
-pub const AggFunc = enum { count, sum, avg, min, max };
+pub const AggFunc = enum { count, sum, avg, min, max, median };
 pub const AggItem = struct { name: []const u8, func: AggFunc, arg: ?*Expr, distinct: bool = false };
 pub const Aggregate = struct { aggs: []const AggItem, by: []const QualName };
 

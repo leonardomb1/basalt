@@ -670,15 +670,7 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
                         const q = f.arg orelse return planErr(env.diag, "this window function needs a column argument");
                         const ai = analyze.fieldIndices(arena, schema, &[_]ast.QualName{q}, &ad) catch |e| return aErr(env, &ad, e);
                         arg = ai[0];
-                        const src = schema.fields[ai[0]].ty;
-                        // MIN/MAX answer a value from the column, so they keep its type.
-                        // SUM keeps its family; AVG is always a float. All are nullable:
-                        // a peer group of nothing but nulls has no answer.
-                        ty = switch (f.kind) {
-                            .min, .max => src.asNullable(),
-                            .avg => types.Type.init(.float).asNullable(),
-                            else => (if (src.kind == .int) types.Type.init(.int) else types.Type.init(.float)).asNullable(),
-                        };
+                        ty = analyze.windowFuncType(f.kind, schema.fields[ai[0]].ty);
                     },
                     .lag, .lead => {
                         const q = f.arg orelse return planErr(env.diag, "LAG/LEAD needs a column argument");
