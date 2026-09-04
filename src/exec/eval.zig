@@ -261,7 +261,21 @@ const BoolOp = union(enum) {
     scalar: ?bool,
 };
 
+/// One node of the expression as a vector. A node the kernels do not cover is
+/// evaluated row-wise *by itself* and handed back as a column, so its parent
+/// stays on the vector path: one `round()` in a filter used to send the whole
+/// predicate — every comparison and `AND` around it — to the row evaluator.
+/// An error the row path raises for real (a bad cast, a zero divisor) still
+/// surfaces as `Unsupported` here and is re-raised by `evalColumn`'s own
+/// row-wise pass, which is also the lazy evaluator that untaken branches need.
 fn evalVec(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch) VecError!Vec {
+    return evalVecNode(arena, expr, batch) catch |e| switch (e) {
+        error.Unsupported => rowwiseVec(arena, expr, batch),
+        else => e,
+    };
+}
+
+fn evalVecNode(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch) VecError!Vec {
     switch (expr.*) {
         .null_lit => return .{ .scalar = .null },
         .bool_lit => |b| return .{ .scalar = .{ .bool = b } },
@@ -278,9 +292,100 @@ fn evalVec(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch) VecErr
         .cast => |c| return castVec(arena, c, batch),
         .cond => |c| return condVec(arena, c, batch),
         .call => |c| return callVec(arena, c, batch),
-        .match => return error.Unsupported,
+        .match => |m| return matchVec(arena, m, batch),
         .let_in => return error.Unsupported,
     }
+}
+
+/// Row-wise evaluation of one node as a column. The column's type is read
+/// off the first non-null value; nothing but nulls is a null scalar.
+fn rowwiseVec(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch) VecError!Vec {
+    const n = batch.len;
+    const vals = try arena.alloc(Value, n);
+    var ty: ?Type = null;
+    for (vals, 0..) |*v, i| {
+        v.* = evalRow(arena, expr, batch, i) catch return error.Unsupported;
+        if (ty == null) ty = switch (v.*) {
+            .null => null,
+            .bool => Type.init(.bool),
+            .int => Type.init(.int),
+            .float => Type.init(.float),
+            .string => Type.init(.string),
+            .bytes => Type.init(.bytes),
+            .date => Type.init(.date),
+            .time => Type.init(.time),
+            .timestamp => Type.init(.timestamp),
+            .decimal => |d| Type.decimal(0, d.scale),
+        };
+    }
+    const t = ty orelse return .{ .scalar = .null };
+    var b = column.Builder.init(arena, t.asNullable());
+    for (vals) |v| try b.append(v);
+    return .{ .col = try b.finish() };
+}
+
+/// CASE, both forms: each arm's condition becomes a row mask, and the arms are
+/// folded back to front over the default (or null), an earlier arm's rows
+/// overriding a later one's — the answer the row evaluator gives. Every SQL
+/// CASE used to drag its whole enclosing expression row-wise.
+fn matchVec(arena: std.mem.Allocator, m: ast.Match, batch: Batch) VecError!Vec {
+    const n = batch.len;
+    const takes = try arena.alloc([]bool, m.arms.len);
+    var narms: usize = 0;
+    var acc: Vec = .{ .scalar = .null };
+    for (m.arms) |arm| {
+        if (arm.is_default) {
+            acc = try evalVecLazy(arena, arm.value, batch);
+            break;
+        }
+        const take = try arena.alloc(bool, n);
+        @memset(take, false);
+        if (m.subject) |se| {
+            for (arm.pats) |p| {
+                var same = ast.Expr{ .binary = .{ .op = .eq, .l = se, .r = p } };
+                try orInto(take, try evalVec(arena, &same, batch));
+            }
+        } else {
+            try orInto(take, try evalVec(arena, arm.guard.?, batch));
+        }
+        takes[narms] = take;
+        narms += 1;
+    }
+    var i = narms;
+    while (i > 0) {
+        i -= 1;
+        acc = try pickVec(arena, takes[i], try evalVecLazy(arena, m.arms[i].value, batch), acc);
+    }
+    return acc;
+}
+
+/// OR a bool vector into a row mask; a null is false.
+fn orInto(take: []bool, c: Vec) VecError!void {
+    switch (c) {
+        .scalar => |s| if (s == .bool and s.bool) {
+            @memset(take, true);
+        } else if (s != .bool and s != .null) return error.Unsupported,
+        .col => |cc| {
+            if (cc.ty.kind != .bool) return error.Unsupported;
+            for (take, 0..) |*x, i| x.* = x.* or (cc.validity.get(i) and cc.data.b[i]);
+        },
+    }
+}
+
+/// Per row, `t` where `take[i]` else `e`. A null scalar on either side is an
+/// all-null column of the other's type, so `IF(c, x, NULL)` and a CASE with no
+/// ELSE stay vectorized; two null scalars are null.
+fn pickVec(arena: std.mem.Allocator, take: []const bool, t: Vec, e: Vec) VecError!Vec {
+    const n = take.len;
+    const tn = t == .scalar and t.scalar.isNull();
+    const en = e == .scalar and e.scalar.isNull();
+    if (tn and en) return .{ .scalar = .null };
+    const tc = if (tn) null else (try realize(arena, t, n)) orelse return error.Unsupported;
+    const ec = if (en) null else (try realize(arena, e, n)) orelse return error.Unsupported;
+    const tcol = tc orelse try broadcastScalar(arena, .null, ec.?.ty.asNullable(), n);
+    const ecol = ec orelse try broadcastScalar(arena, .null, tc.?.ty.asNullable(), n);
+    if (tcol.ty.kind != ecol.ty.kind) return error.Unsupported;
+    return mergeCols(arena, take, tcol, ecol);
 }
 
 /// Evaluate an argument to a string operand, or null → Unsupported fallback.
@@ -636,24 +741,10 @@ fn condVec(arena: std.mem.Allocator, c: ast.Expr.Cond, batch: Batch) VecError!Ve
     const cond = try evalVec(arena, c.cond, batch);
     const tv = try evalVecLazy(arena, c.then, batch);
     const ev = try evalVecLazy(arena, c.els, batch);
-    const n = batch.len;
-    const t = (try realize(arena, tv, n)) orelse return error.Unsupported;
-    const e = (try realize(arena, ev, n)) orelse return error.Unsupported;
-    if (t.ty.kind != e.ty.kind) return error.Unsupported;
-
-    const take = try arena.alloc(bool, n);
-    switch (cond) {
-        .scalar => |s| {
-            const all = (s == .bool and s.bool);
-            for (take) |*x| x.* = all;
-        },
-        .col => |cc| {
-            if (cc.ty.kind != .bool) return error.Unsupported;
-            var i: usize = 0;
-            while (i < n) : (i += 1) take[i] = cc.validity.get(i) and cc.data.b[i];
-        },
-    }
-    return mergeCols(arena, take, t, e);
+    const take = try arena.alloc(bool, batch.len);
+    @memset(take, false);
+    try orInto(take, cond);
+    return pickVec(arena, take, tv, ev);
 }
 
 /// Pick, per row, the matching element from `t` (where `take[i]`) or `e`.
@@ -3327,10 +3418,15 @@ test "bitwise operators and hex builtins" {
         try std.testing.expect((try evalRow(a, e, batch, 1)).isNull());
     }
 
-    // Bitwise ops de-vectorize on purpose, so the rowwise path always runs.
+    // Bitwise ops have no kernel, so the node itself is refused — and `evalVec`
+    // then answers it row-wise as a column, keeping the parent vectorized.
     {
         const pair = try S.checked(a, schema, "x & 1");
-        try std.testing.expectError(error.Unsupported, evalVec(a, pair[0], batch));
+        try std.testing.expectError(error.Unsupported, evalVecNode(a, pair[0], batch));
+        const v = try evalVec(a, pair[0], batch);
+        try std.testing.expect(v == .col and v.col.ty.kind == .int);
+        try std.testing.expectEqual(@as(i64, 0), v.col.getValue(0).int);
+        try std.testing.expect(v.col.getValue(1).isNull());
     }
 
     // `from_hex` is fail-loud: junk and overflow raise instead of nulling.

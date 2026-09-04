@@ -2346,22 +2346,35 @@ fn reduceExtreme(col: column.Column, func: ast.AggFunc, n: usize) Value {
 /// Fails with `JoinBuildTooLarge` as soon as the drained bytes cross `cap`,
 /// so an oversized build side is a diagnostic rather than an OOM.
 fn materializeFull(state: std.mem.Allocator, pull: std.mem.Allocator, child: Op, schema: *const types.Schema, bytes_out: *usize, cap: usize) anyerror!Batch {
+    // Chunks are pulled into `state` and concatenated per column — the same
+    // columnar copy `Sort` makes — instead of one boxed append per cell. The
+    // chunks stay in the arena beside the result; a build side is resident
+    // anyway, and the cap above bounds both.
+    _ = pull;
     const ncols = schema.fields.len;
-    const builders = try state.alloc(column.Builder, ncols);
-    for (builders, schema.fields) |*b, f| b.* = column.Builder.init(state, f.ty);
+    var chunks = std.array_list.Managed(Batch).init(state);
     var total: usize = 0;
     var bytes: usize = 0;
-    while (try child.next(pull)) |b| {
+    while (try child.next(state)) |b| {
         for (b.columns) |*col| bytes += columnBytes(col);
         if (bytes > cap) return error.JoinBuildTooLarge;
-        var r: usize = 0;
-        while (r < b.len) : (r += 1) {
-            for (b.columns, 0..) |*col, ci| try builders[ci].append(col.getValue(r));
-        }
+        if (b.len == 0) continue;
+        try chunks.append(b);
         total += b.len;
     }
     const cols = try state.alloc(column.Column, ncols);
-    for (builders, 0..) |*bd, i| cols[i] = try bd.finish();
+    if (total == 0) {
+        for (cols, schema.fields) |*c, f| {
+            var bd = column.Builder.init(state, f.ty);
+            c.* = try bd.finish();
+        }
+    } else {
+        const per = try state.alloc(column.Column, chunks.items.len);
+        for (cols, 0..) |*out, ci| {
+            for (chunks.items, 0..) |b, k| per[k] = b.columns[ci];
+            out.* = try column.concat(state, per, total);
+        }
+    }
     bytes_out.* = bytes;
     return Batch{ .schema = schema, .columns = cols, .len = total };
 }
