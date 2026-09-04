@@ -38,30 +38,45 @@ pub fn canonF64(x: f64) f64 {
 /// nothing, silently returning zero rows.
 const num_tag: u8 = 0xFF;
 
+/// One canonical f64 for the whole numeric family. Distinct values that
+/// collapse to the same f64 merely collide (equality then separates them);
+/// what matters is that equal values never split.
+pub fn hashNum(h: *std.hash.Wyhash, x: f64) void {
+    h.update(&[_]u8{num_tag});
+    const c = canonF64(x);
+    h.update(std.mem.asBytes(&c));
+}
+
+/// An int hashes as the f64 it compares as. That is forced, not chosen:
+/// `compareValues` calls an int and a float equal when they meet in f64, so
+/// `2^53 + 1` joins to `9007199254740992.0` and must share its bucket. The
+/// cost is that ints past 2^53 collide in runs of 2, 4, 8…, walked with a
+/// key compare per step; hashing them exactly instead silently emptied that
+/// join. Removing the run means changing int-versus-float equality first.
+pub fn hashInt(h: *std.hash.Wyhash, x: i64) void {
+    hashNum(h, @floatFromInt(x));
+}
+
+/// A non-numeric value: its type tag then its payload bytes. Exposed so a
+/// column-typed hasher can fold a cell without boxing it into a `Value` and
+/// still agree with `hashValue` bit for bit.
+pub fn hashTagged(h: *std.hash.Wyhash, tag: std.meta.Tag(Value), payload: []const u8) void {
+    h.update(&[_]u8{@intFromEnum(tag)});
+    h.update(payload);
+}
+
 /// Fold one value (type tag + payload bytes) into a running hash.
 pub fn hashValue(h: *std.hash.Wyhash, v: Value) void {
     switch (v) {
-        // One canonical f64 for the whole numeric family. Distinct values that
-        // collapse to the same f64 merely collide (equality then separates
-        // them); what matters is that equal values never split.
-        .int, .float, .decimal => {
-            h.update(&[_]u8{num_tag});
-            const c = canonF64(eval.toF64(v));
-            h.update(std.mem.asBytes(&c));
-            return;
-        },
-        else => {},
-    }
-    const tag: u8 = @intFromEnum(std.meta.activeTag(v));
-    h.update(&[_]u8{tag});
-    switch (v) {
-        .null => {},
-        .bool => |x| h.update(&[_]u8{@intFromBool(x)}),
-        .int, .float, .decimal => unreachable,
-        .string, .bytes => |s| h.update(s),
-        .date => |x| h.update(std.mem.asBytes(&x)),
-        .time => |x| h.update(std.mem.asBytes(&x)),
-        .timestamp => |x| h.update(std.mem.asBytes(&x)),
+        .int => |x| hashInt(h, x),
+        .float, .decimal => hashNum(h, eval.toF64(v)),
+        .null => hashTagged(h, .null, &.{}),
+        .bool => |x| hashTagged(h, .bool, &[_]u8{@intFromBool(x)}),
+        .string => |s| hashTagged(h, .string, s),
+        .bytes => |s| hashTagged(h, .bytes, s),
+        .date => |x| hashTagged(h, .date, std.mem.asBytes(&x)),
+        .time => |x| hashTagged(h, .time, std.mem.asBytes(&x)),
+        .timestamp => |x| hashTagged(h, .timestamp, std.mem.asBytes(&x)),
     }
 }
 

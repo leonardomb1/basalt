@@ -2428,9 +2428,24 @@ fn cellEq(cls: KeyClass, a: *const column.Column, ar: usize, b: *const column.Co
 /// Composite key hash for one row. Folds the same way `keyhash.MultiKeyCtx`
 /// does (Wyhash, type tag + payload per value, in key order), so the build and
 /// probe sides agree.
-fn hashRowKeys(cols: []const column.Column, keys: []const usize, row: usize) u64 {
+fn hashRowKeys(cols: []const column.Column, keys: []const usize, classes: []const KeyClass, row: usize) u64 {
     var h = std.hash.Wyhash.init(0);
-    for (keys) |k| keyhash.hashValue(&h, cols[k].getValue(row));
+    for (keys, classes) |k, cls| {
+        const c = &cols[k];
+        // The classed cases fold the cell straight from the typed store through
+        // the same helpers `hashValue` uses, so no `Value` is boxed per key and
+        // the hash is the one the boxed path would have produced.
+        switch (cls) {
+            .i64s => switch (c.ty.kind) {
+                .int => keyhash.hashInt(&h, c.data.i64[row]),
+                .time => keyhash.hashTagged(&h, .time, std.mem.asBytes(&c.data.i64[row])),
+                .timestamp => keyhash.hashTagged(&h, .timestamp, std.mem.asBytes(&c.data.i64[row])),
+                else => keyhash.hashValue(&h, c.getValue(row)),
+            },
+            .bytes => keyhash.hashTagged(&h, if (c.ty.kind == .string) .string else .bytes, c.data.bytes.at(row)),
+            .boxed => keyhash.hashValue(&h, c.getValue(row)),
+        }
+    }
     return h.final();
 }
 
@@ -2523,7 +2538,7 @@ pub const JoinIndex = struct {
             ri -= 1;
             const r = ri;
             if (anyNullKey(batch.columns, right_keys, r)) continue;
-            const h = hashRowKeys(batch.columns, right_keys, r);
+            const h = hashRowKeys(batch.columns, right_keys, classes, r);
             hashes[r] = h;
             var slot = h & self.mask;
             while (heads[slot] != 0) : (slot = (slot + 1) & self.mask) {
@@ -2564,7 +2579,17 @@ pub const JoinIndex = struct {
     pub fn find(self: *const JoinIndex, probe: Batch, probe_keys: []const usize, classes: []const KeyClass, row: usize) ?usize {
         if (self.keys.len == 0 or self.build_batch.len == 0) return null;
         if (anyNullKey(probe.columns, probe_keys, row)) return null;
-        const h = hashRowKeys(probe.columns, probe_keys, row);
+        return self.findHashed(probe, probe_keys, classes, row, hashRowKeys(probe.columns, probe_keys, classes, row));
+    }
+
+    /// Touch the bucket `h` lands in, so a probe a few rows later finds it in
+    /// cache. At a build side past L2 the bucket read is the probe's cost.
+    pub fn prefetch(self: *const JoinIndex, h: u64) void {
+        @prefetch(&self.heads[h & self.mask], .{ .rw = .read, .locality = 3 });
+    }
+
+    /// `find` for a row whose keys are known non-null and already hashed.
+    pub fn findHashed(self: *const JoinIndex, probe: Batch, probe_keys: []const usize, classes: []const KeyClass, row: usize, h: u64) ?usize {
         var slot = h & self.mask;
         while (self.heads[slot] != 0) : (slot = (slot + 1) & self.mask) {
             const hr: usize = self.heads[slot] - 1;
@@ -2680,10 +2705,25 @@ pub const Join = struct {
         // probe row either vanishes or carries no right columns at all.
         const fill_right = (self.kind == .left or self.kind == .full);
         const classes = try ix.classesFor(arena, lb, self.left_keys);
+        try ridx.ensureTotalCapacity(lb.len);
+        if (fill_right) try rnull.ensureTotalCapacity(lb.len);
+
+        // Hash the whole batch first, then probe it a few rows behind a bucket
+        // prefetch, the way the aggregate does: the bucket miss overlaps the
+        // rows before it instead of stalling each one.
+        const empty = ix.keys.len == 0 or ix.build_batch.len == 0;
+        const hs = try arena.alloc(u64, lb.len);
+        const nulls = try arena.alloc(bool, lb.len);
+        for (hs, nulls, 0..) |*h, *nl, i| {
+            nl.* = empty or anyNullKey(lb.columns, self.left_keys, i);
+            h.* = if (nl.*) 0 else hashRowKeys(lb.columns, self.left_keys, classes, i);
+        }
+        const ahead = 8;
 
         var r: usize = 0;
         while (r < lb.len) : (r += 1) {
-            const first = ix.find(lb, self.left_keys, classes, r);
+            if (r + ahead < lb.len and !nulls[r + ahead]) ix.prefetch(hs[r + ahead]);
+            const first = if (nulls[r]) null else ix.findHashed(lb, self.left_keys, classes, r, hs[r]);
             switch (self.kind) {
                 .semi => {
                     if (first != null) try lidx.append(r);
