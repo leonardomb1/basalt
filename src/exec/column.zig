@@ -438,6 +438,35 @@ pub const Builder = struct {
         try self.pushValidRun(vals.len);
     }
 
+    /// The bytes twin of `appendBulk`/`appendBulkScattered`: one slice per
+    /// present row, `defs` (when given) saying which rows those are. The
+    /// parquet decoder used to box every string into a `Value` for this.
+    pub fn appendBytesScattered(self: *Builder, vals: []const []const u8, defs: ?[]const u32, max_def: u32) !void {
+        if (self.store != .bytes) return error.BulkTypeMismatch;
+        const l = &self.store.bytes;
+        const d = defs orelse {
+            try l.ends.ensureUnusedCapacity(vals.len);
+            for (vals) |s| {
+                try l.values.appendSlice(s);
+                l.ends.appendAssumeCapacity(@intCast(l.values.items.len));
+            }
+            try self.pushValidRun(vals.len);
+            return;
+        };
+        try l.ends.ensureUnusedCapacity(d.len);
+        var j: usize = 0;
+        for (d) |lvl| {
+            const present = lvl == max_def;
+            if (present) {
+                if (j >= vals.len) return error.BulkTypeMismatch;
+                try l.values.appendSlice(vals[j]);
+                j += 1;
+            }
+            l.ends.appendAssumeCapacity(@intCast(l.values.items.len));
+            try self.pushValid(present);
+        }
+    }
+
     /// Bulk append where only `vals` for present rows are supplied: `defs[i] ==
     /// max_def` marks a row present, and nulls consume a slot without a value.
     ///

@@ -18,6 +18,7 @@ const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
 pub const Threshold = @import("../exec/value.zig").Threshold;
 const Value = @import("../exec/value.zig").Value;
+const Decimal = @import("../exec/value.zig").Decimal;
 const eval = @import("../exec/eval.zig");
 
 pub const Error = error{
@@ -771,6 +772,7 @@ fn appendDataPage(
             if (body[0] > 32) return Error.CorruptParquetPage;
             const width: u6 = @intCast(body[0]);
             const idx = try decodeRleHybrid(arena, body[1..], width, present);
+            if (try bulkDict(arena, b, ty, d, idx, defs, max_def, tscale)) return n;
             try emit(b, ty, defs, max_def, n, null, idx, d, tscale);
         },
         else => return Error.UnsupportedParquetEncoding,
@@ -795,23 +797,65 @@ fn bulkPlain(
     const count = present;
     switch (phys) {
         .int64 => {
-            if (ty.kind != .int) return false;
             if (body.len < count * 8) return Error.CorruptParquetPage;
-            const out = try arena.alloc(i64, count);
-            for (out, 0..) |*o, i| o.* = std.mem.readInt(i64, body[i * 8 ..][0..8], .little);
-            if (defs) |d| {
-                b.appendBulkScattered(i64, out, d, max_def) catch return false;
-            } else b.appendBulk(i64, out) catch return false;
-            return true;
+            switch (ty.kind) {
+                // time and timestamp share the i64 store; the caller has already
+                // ruled out a unit conversion (tscale == 1)
+                .int, .time, .timestamp => {
+                    const out = try arena.alloc(i64, count);
+                    for (out, 0..) |*o, i| o.* = std.mem.readInt(i64, body[i * 8 ..][0..8], .little);
+                    if (defs) |d| {
+                        b.appendBulkScattered(i64, out, d, max_def) catch return false;
+                    } else b.appendBulk(i64, out) catch return false;
+                    return true;
+                },
+                .decimal => {
+                    const out = try arena.alloc(Decimal, count);
+                    for (out, 0..) |*o, i| o.* = .{ .unscaled = std.mem.readInt(i64, body[i * 8 ..][0..8], .little), .scale = ty.scale };
+                    if (defs) |d| {
+                        b.appendBulkScattered(Decimal, out, d, max_def) catch return false;
+                    } else b.appendBulk(Decimal, out) catch return false;
+                    return true;
+                },
+                else => return false,
+            }
         },
         .int32 => {
-            if (ty.kind != .int) return false;
             if (body.len < count * 4) return Error.CorruptParquetPage;
-            const out = try arena.alloc(i64, count);
-            for (out, 0..) |*o, i| o.* = std.mem.readInt(i32, body[i * 4 ..][0..4], .little);
-            if (defs) |d| {
-                b.appendBulkScattered(i64, out, d, max_def) catch return false;
-            } else b.appendBulk(i64, out) catch return false;
+            switch (ty.kind) {
+                .int => {
+                    const out = try arena.alloc(i64, count);
+                    for (out, 0..) |*o, i| o.* = std.mem.readInt(i32, body[i * 4 ..][0..4], .little);
+                    if (defs) |d| {
+                        b.appendBulkScattered(i64, out, d, max_def) catch return false;
+                    } else b.appendBulk(i64, out) catch return false;
+                    return true;
+                },
+                .date => {
+                    const out = try arena.alloc(i32, count);
+                    for (out, 0..) |*o, i| o.* = std.mem.readInt(i32, body[i * 4 ..][0..4], .little);
+                    if (defs) |d| {
+                        b.appendBulkScattered(i32, out, d, max_def) catch return false;
+                    } else b.appendBulk(i32, out) catch return false;
+                    return true;
+                },
+                .decimal => {
+                    const out = try arena.alloc(Decimal, count);
+                    for (out, 0..) |*o, i| o.* = .{ .unscaled = std.mem.readInt(i32, body[i * 4 ..][0..4], .little), .scale = ty.scale };
+                    if (defs) |d| {
+                        b.appendBulkScattered(Decimal, out, d, max_def) catch return false;
+                    } else b.appendBulk(Decimal, out) catch return false;
+                    return true;
+                },
+                else => return false,
+            }
+        },
+        .byte_array => {
+            // Strings are slices of the page body: length-prefixed, no copy
+            // until the builder's own payload append.
+            if (ty.kind != .string and ty.kind != .bytes) return false;
+            const vals = try plainByteArrays(arena, body, count);
+            b.appendBytesScattered(vals, defs, max_def) catch return false;
             return true;
         },
         .double => {
@@ -835,6 +879,78 @@ fn bulkPlain(
             if (defs) |d| {
                 b.appendBulkScattered(f64, out, d, max_def) catch return false;
             } else b.appendBulk(f64, out) catch return false;
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// The `count` length-prefixed values of a PLAIN byte-array page, as slices
+/// into the page body.
+fn plainByteArrays(arena: std.mem.Allocator, body: []const u8, count: usize) Error![]const []const u8 {
+    const out = try arena.alloc([]const u8, count);
+    var pos: usize = 0;
+    for (out) |*o| {
+        if (pos + 4 > body.len) return Error.CorruptParquetPage;
+        const len: usize = std.mem.readInt(u32, body[pos..][0..4], .little);
+        pos += 4;
+        if (pos + len > body.len) return Error.CorruptParquetPage;
+        o.* = body[pos..][0..len];
+        pos += len;
+    }
+    return out;
+}
+
+/// Expands a dictionary-encoded page straight into the typed store: the
+/// dictionary is turned into a flat typed array once, the indices gathered
+/// through it. The general `emit` boxed every row's entry into a `Value` —
+/// for a low-cardinality string column, the same handful of strings a
+/// million times over. Returns false for a shape it does not cover.
+fn bulkDict(
+    arena: std.mem.Allocator,
+    b: *column.Builder,
+    ty: types.Type,
+    dict: []const Value,
+    idx: []const u32,
+    defs: ?[]const u32,
+    max_def: u32,
+    tscale: i64,
+) Error!bool {
+    for (idx) |ix| if (ix >= dict.len) return Error.CorruptParquetPage;
+    switch (ty.kind) {
+        .string, .bytes => {
+            for (dict) |v| if (v != .bytes) return false;
+            const vals = try arena.alloc([]const u8, idx.len);
+            for (vals, idx) |*o, ix| o.* = dict[ix].bytes;
+            b.appendBytesScattered(vals, defs, max_def) catch return false;
+            return true;
+        },
+        .int => {
+            for (dict) |v| if (v != .int) return false;
+            const vals = try arena.alloc(i64, idx.len);
+            for (vals, idx) |*o, ix| o.* = dict[ix].int;
+            if (defs) |d| {
+                b.appendBulkScattered(i64, vals, d, max_def) catch return false;
+            } else b.appendBulk(i64, vals) catch return false;
+            return true;
+        },
+        .float => {
+            for (dict) |v| if (v != .float) return false;
+            const vals = try arena.alloc(f64, idx.len);
+            for (vals, idx) |*o, ix| o.* = dict[ix].float;
+            if (defs) |d| {
+                b.appendBulkScattered(f64, vals, d, max_def) catch return false;
+            } else b.appendBulk(f64, vals) catch return false;
+            return true;
+        },
+        .date => {
+            if (tscale != 1) return false;
+            for (dict) |v| if (v != .int) return false;
+            const vals = try arena.alloc(i32, idx.len);
+            for (vals, idx) |*o, ix| o.* = std.math.cast(i32, dict[ix].int) orelse return false;
+            if (defs) |d| {
+                b.appendBulkScattered(i32, vals, d, max_def) catch return false;
+            } else b.appendBulk(i32, vals) catch return false;
             return true;
         },
         else => return false,
@@ -874,6 +990,14 @@ fn emitBytes(
     vals: []const []const u8,
     tscale: i64,
 ) Error!void {
+    if (ty.kind == .string or ty.kind == .bytes) {
+        // A short `vals` is the only non-memory failure: the page lied.
+        b.appendBytesScattered(vals, defs, max_def) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return Error.CorruptParquetPage,
+        };
+        return;
+    }
     var j: usize = 0;
     for (0..n) |i| {
         if (if (defs) |d| d[i] != max_def else false) {
