@@ -2784,13 +2784,16 @@ test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hints" {
     try std.testing.expectEqual(@as(usize, 1), s1.prefix.len);
     try std.testing.expectEqual(@as(usize, 0), s1.tail.len);
 
-    // A post-aggregate filter is HAVING: it stays engine-side, so unlike
-    // `classifyAggPipeline` it must NOT disqualify the descent.
+    // A post-aggregate filter is HAVING: it stays engine-side, so it must NOT
+    // disqualify the descent — nor the lane shape, whose tail runs it over
+    // the merged groups.
     const having = [_]ast.Stage{ rd, agg, flt, flt, wrt };
     const s2 = classifyWholeAgg(&having).?;
     try std.testing.expectEqual(@as(usize, 0), s2.prefix.len);
     try std.testing.expectEqual(@as(usize, 2), s2.tail.len);
-    try std.testing.expect(classifyAggPipeline(&having) == null);
+    const lane = classifyAggPipeline(&having).?;
+    try std.testing.expectEqual(@as(usize, 0), lane.prefix.len);
+    try std.testing.expectEqual(@as(usize, 2), lane.tail.len);
 
     // A `select` in the prefix renames columns out from under the group keys.
     const selected = [_]ast.Stage{ rd, sel, agg, wrt };
@@ -2904,4 +2907,19 @@ test "distinct: the single int-key path keeps first occurrences, null included o
     const got = try runToString(alloc, &tmp, "k,v\n1,2\n2,\n3,1\n4,2\n5,\n6,1\n", "SELECT DISTINCT v FROM '$IN'");
     defer alloc.free(got);
     try std.testing.expectEqualStrings("v\n2\n\n1\n", got);
+}
+
+test "parallel parquet: an aggregate after DISTINCT and a HAVING both fan out and the sink gets the tail's columns" {
+    const alloc = std.testing.allocator;
+    var t1 = std.testing.tmpDir(.{});
+    defer t1.cleanup();
+    const dist = try runParquetThreaded(alloc, &t1, "SELECT COUNT(*) AS n, MIN(g) AS mg FROM (SELECT DISTINCT g FROM '$IN') t", 4);
+    defer alloc.free(dist);
+    try std.testing.expectEqualStrings("n,mg\n4,0\n", dist);
+    var t2 = std.testing.tmpDir(.{});
+    defer t2.cleanup();
+    // g = id % 4 over id = 1..5000: SUM(id) is 3127500, 3123750, 3125000, 3126250 for g = 0..3.
+    const having = try runParquetThreaded(alloc, &t2, "SELECT g, COUNT(*) AS c FROM '$IN' GROUP BY g HAVING SUM(id) > 3125000 ORDER BY g", 4);
+    defer alloc.free(having);
+    try std.testing.expectEqualStrings("g,c\n0,1250\n3,1250\n", having);
 }

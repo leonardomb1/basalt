@@ -418,13 +418,27 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, 
     // join-kind guard that three map paths applied was missing from the aggregate one.
     // `runParquetLane`/`runCsvLane` switch exhaustively over `LaneShape`, so adding a
     // shape is a compile error until both sources handle it.
-    if (laneEligible(stages, opts)) {
-        if (classifyLaneShape(stages)) |shape| {
-            const rd = stages[0].node.read;
+    // A derived table or CTE is a binding reference at the head of the pipeline,
+    // and the lanes want the read it wraps. Inline it, as `buildPipeline` will
+    // anyway, so `COUNT(*) FROM (SELECT DISTINCT …)` and a CTE-fed aggregate fan
+    // out instead of falling to the serial driver on the `.ref`.
+    var head_stages = stages;
+    var inlined: usize = 0;
+    while (head_stages[0].node == .ref and inlined < 16) : (inlined += 1) {
+        const b = env.bindings.get(head_stages[0].node.ref) orelse break;
+        if (b.stages.len == 0) break;
+        const joined = try arena.alloc(ast.Stage, b.stages.len + head_stages.len - 1);
+        @memcpy(joined[0..b.stages.len], b.stages);
+        @memcpy(joined[b.stages.len..], head_stages[1..]);
+        head_stages = joined;
+    }
+    if (laneEligible(head_stages, opts)) {
+        if (classifyLaneShape(head_stages)) |shape| {
+            const rd = head_stages[0].node.read;
             if (isLocalParquetRead(rd)) {
-                if (try runParquetLane(env, stages, shape, last.write, opts, stats, lanes_used)) return;
+                if (try runParquetLane(env, head_stages, shape, last.write, opts, stats, lanes_used)) return;
             } else if (isLocalCsvRead(rd)) {
-                if (try runCsvLane(env, stages, shape, last.write, opts, stats, lanes_used)) return;
+                if (try runCsvLane(env, head_stages, shape, last.write, opts, stats, lanes_used)) return;
             }
         }
     }

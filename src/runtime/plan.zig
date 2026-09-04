@@ -127,11 +127,24 @@ pub fn mapChainSchema(env: *Env, prefix: []const ast.Stage, csv_schema: types.Sc
 /// whenever the SELECT list interleaves grouping keys and aggregates.
 pub fn tailSchema(env: *Env, tail: []const ast.Stage, in: types.Schema) !types.Schema {
     var sch = in;
-    for (tail) |st| {
-        if (st.node != .select) continue;
-        const one = [_]ast.Stage{st};
-        sch = try mapChainSchema(env, &one, sch);
-    }
+    for (tail) |st| switch (st.node) {
+        .select => {
+            const one = [_]ast.Stage{st};
+            sch = try mapChainSchema(env, &one, sch);
+        },
+        // A lane tail may now hold an aggregate or a window (HAVING and
+        // `COUNT(*) FROM (SELECT DISTINCT …)` shapes); the sink must be
+        // opened with the columns they produce, not the breaker's rows.
+        .aggregate => |ag| {
+            var ad = analyze.Diag{};
+            sch = (analyze.aggregatePlan(env.arena, sch, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e)).schema;
+        },
+        .window => |wd| {
+            var ad = analyze.Diag{};
+            sch = analyze.windowSchema(env.arena, sch, wd, &ad) catch |e| return aErr(env, &ad, e);
+        },
+        else => {},
+    };
     return sch;
 }
 

@@ -122,13 +122,15 @@ pub fn classifyAggPipeline(stages: []const ast.Stage) ?AggShape {
         // for an interleaved SELECT list. Rejecting it sent every such query to the
         // serial driver — 379ms against 88ms on TPC-H q01's shape. `writeTail` applies
         // it, and the sink is opened with the schema it produces.
-        .filter => if (ai != null) return null,
-        .select => {},
+        // A filter after the aggregate is HAVING; `writeTail` runs it over the
+        // merged groups like the projection. Rejecting it made every HAVING
+        // query serial.
+        .filter, .select => {},
         .aggregate => {
             if (ai != null) return null;
             ai = i;
         },
-        .sort, .limit => if (ai == null) return null,
+        .sort, .limit, .distinct, .window => if (ai == null) return null,
         else => return null,
     };
     const a = ai orelse return null;
@@ -2051,13 +2053,16 @@ const DistinctShape = struct { prefix: []const ast.Stage, dist: ast.Distinct, ta
 fn classifyDistinctPipeline(stages: []const ast.Stage) ?DistinctShape {
     const middle = stages[1 .. stages.len - 1];
     var di: ?usize = null;
+    // Anything `writeTail` can rebuild over the merged batch may follow the
+    // distinct: an aggregate over it (`COUNT(*) FROM (SELECT DISTINCT …)`)
+    // used to send the whole query to the serial driver.
     for (middle, 0..) |st, i| switch (st.node) {
-        .filter, .select => if (di != null) return null,
+        .filter, .select => {},
         .distinct => {
             if (di != null) return null;
             di = i;
         },
-        .sort, .limit => if (di == null) return null,
+        .sort, .limit, .aggregate, .window => if (di == null) return null,
         else => return null,
     };
     const d = di orelse return null;
@@ -2266,7 +2271,9 @@ fn runParallelDistinct(
     const merged = try merge.finish(row_schema);
 
     const wr = try resolveUpsertKeys(env, w);
-    const snk = try openSink(env, wr, row_schema.*);
+    // The sink takes the tail's schema, not the distinct rows': an aggregate
+    // after the distinct writes its own columns.
+    const snk = try openSink(env, wr, try tailSchema(env, tail, row_schema.*));
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
     try writeTail(env, snk, merged, row_schema.*, tail, stats);
