@@ -688,14 +688,7 @@ const Ctx = struct {
                 const b = self.bindings.get(name) orelse
                     return fail(self.diag, "unknown binding `{s}`", .{name});
                 var src = try self.resolveSource(b.stages[0]);
-                if (src.schema) |s0| {
-                    var cur: ?types.Schema = s0;
-                    for (b.stages[1..]) |st| {
-                        errdefer self.diag.stamp(st.pos);
-                        if (cur) |c| cur = try self.propagate(c, st.node);
-                    }
-                    src.schema = cur;
-                }
+                src.schema = try self.bindingSchema(b);
                 src.detail = try std.fmt.allocPrint(self.arena, "{s} (via binding {s})", .{ src.detail, name });
                 return src;
             },
@@ -736,8 +729,21 @@ const Ctx = struct {
         return .{ .connector = conn.connector, .target = w.target, .mode = @tagName(w.mode) };
     }
 
+    /// The schema a binding's pipeline produces, propagated stage by stage from
+    /// its source; null past anything only the source can describe.
+    fn bindingSchema(self: *Ctx, b: ast.Pipeline) Error!?types.Schema {
+        const src = try self.resolveSource(b.stages[0]);
+        var cur: ?types.Schema = src.schema orelse return null;
+        for (b.stages[1..]) |st| {
+            errdefer self.diag.stamp(st.pos);
+            if (cur) |c| cur = try self.propagate(c, st.node);
+        }
+        return cur;
+    }
+
     /// Output schema after a stage (type-checking expressions along the way).
-    /// Returns null where the flow becomes unresolvable (join's right side).
+    /// Returns null where the flow becomes unresolvable — a source only a
+    /// connection can describe, or a join whose right side is one.
     fn propagate(self: *Ctx, in: types.Schema, node: ast.Stage.Node) Error!?types.Schema {
         switch (node) {
             .filter => |p| {
@@ -759,7 +765,16 @@ const Ctx = struct {
             .explode => |ex| return (try explodePlan(self.arena, in, ex, self.diag)).schema,
             .aggregate => |ag| return (try aggregatePlan(self.arena, in, ag, self.params, self.diag)).schema,
             .window => |wd| return try windowSchema(self.arena, in, wd, self.diag),
-            .join => return null,
+            // The same joinPlan the runtime builds from, over the binding's offline
+            // schema, so an aggregate or filter after the join is checked like any
+            // other stage. It used to stop here, and `check` said ok to a column
+            // that did not exist as long as a join sat in front of it.
+            .join => |j| {
+                const b = self.bindings.get(j.binding) orelse
+                    return fail(self.diag, "unknown binding `{s}` in join", .{j.binding});
+                const right = (try self.bindingSchema(b)) orelse return null;
+                return (try joinPlan(self.arena, in, right, j, self.diag)).schema;
+            },
             else => return null,
         }
     }
@@ -1423,6 +1438,50 @@ fn expectAnalyzeErr(a: std.mem.Allocator, csv_data: []const u8, query: []const u
     const src = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS {s};", .{q});
     var diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, src), &diag));
+}
+
+/// Analyze one CSV-backed query and hand back the plan (or the analyzer's error).
+fn analyzeCsv(a: std.mem.Allocator, csv_data: []const u8, query: []const u8, diag: *Diag) !Plan {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = csv_data });
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const in = try std.fs.path.join(a, &.{ base, "in.csv" });
+    const q = try std.mem.replaceOwned(u8, a, query, "$IN", in);
+    const src = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS {s};", .{q});
+    return analyze(a, try parse(a, src), diag);
+}
+
+test "analyze checks the stages after a join against the joined schema" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const csv_data = "id,name,amount\n1,x,10\n";
+
+    // Used to pass: the schema went unresolved at the join, so nothing after it
+    // was checked and `check` said ok to a column that does not exist.
+    var diag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyzeCsv(a, csv_data, "WITH r AS (SELECT id AS rid, name AS rname FROM '$IN') SELECT SUM(CAST(nope AS INT)) AS x FROM '$IN' JOIN r ON id = rid", &diag));
+    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "nope") != null);
+
+    // A filter after the join is checked the same way.
+    diag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyzeCsv(a, csv_data, "WITH r AS (SELECT id AS rid, name AS rname FROM '$IN') SELECT id FROM '$IN' JOIN r ON id = rid WHERE missing = 'x'", &diag));
+    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "missing") != null);
+
+    // The good query plans, and the join stage carries the joined schema: the
+    // left columns plus the binding's, so a right-side column resolves after it.
+    diag = Diag{};
+    const plan = try analyzeCsv(a, csv_data, "WITH r AS (SELECT id AS rid, name AS rname FROM '$IN') SELECT rname, SUM(CAST(amount AS INT)) AS total FROM '$IN' JOIN r ON id = rid WHERE rname <> '' GROUP BY rname", &diag);
+    const stages = plan.outputs[0].stages;
+    var join_schema: ?types.Schema = null;
+    for (stages) |st| {
+        if (std.mem.eql(u8, st.kind, "join")) join_schema = st.out_schema;
+    }
+    const js = join_schema orelse return error.TestUnexpectedResult;
+    try std.testing.expect(js.indexOf("rname") != null);
+    try std.testing.expect(js.indexOf("amount") != null);
+    try std.testing.expect(stages[stages.len - 1].out_schema != null);
 }
 
 test "analyze rejects a program with no output pipeline" {

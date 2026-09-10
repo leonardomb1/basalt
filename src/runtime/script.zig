@@ -405,7 +405,7 @@ fn forWorker(ctx: *ForCtx, _: usize) void {
         // Copy the run's Env and override only what is per-worker. Listing the
         // fields instead silently defaulted every one that was not named — so a
         // PARALLEL for-each lost `explain` (EXPLAIN ANALYZE then really wrote
-        // its sinks), `stdout_json`, and the buffer-segment / StarRocks label
+        // its sinks), `stdout_format`, and the buffer-segment / StarRocks label
         // pinning that makes a replayed flush dedup instead of duplicating.
         // A copy also cannot rot when a field is added to Env later.
         var w_env = ctx.base.*;

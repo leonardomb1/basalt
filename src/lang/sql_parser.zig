@@ -2563,7 +2563,15 @@ pub const Parser = struct {
                 try self.collectFields(l.value, out);
                 try self.collectFields(l.body, out);
             },
-            else => {},
+            .match => |m| {
+                if (m.subject) |subj| try self.collectFields(subj, out);
+                for (m.arms) |arm| {
+                    for (arm.pats) |pat| try self.collectFields(pat, out);
+                    if (arm.guard) |g| try self.collectFields(g, out);
+                    try self.collectFields(arm.value, out);
+                }
+            },
+            .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit => {},
         }
     }
 
@@ -3904,6 +3912,24 @@ test "sql: LOAD INTO IDENTIFIER without a literal extension is a parse error" {
     const r = parseSource(a, "LOAD INTO IDENTIFIER('dir/' || name) AS SELECT * FROM 'in.csv';", &diag);
     try testing.expectError(error.ParseFailed, r);
     try testing.expect(std.mem.indexOf(u8, diag.msg, "literal extension") != null);
+}
+
+test "sql: a computed GROUP BY key keeps the columns a CASE inside an aggregate reads" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const prog = try parseTest(ar.allocator(),
+        \\SELECT CAST(DATE_TRUNC('month', d) AS DATE) AS m,
+        \\       SUM(CASE WHEN status = 'x' THEN 1 ELSE 0 END) AS c
+        \\FROM 't.csv' GROUP BY CAST(DATE_TRUNC('month', d) AS DATE);
+    );
+    const stages = prog.stmts[1].output.stages;
+    // read | select (pre-aggregation) | aggregate | write
+    try std.testing.expect(stages[1].node == .select);
+    var has_status = false;
+    for (stages[1].node.select) |it| {
+        if (it == .field and std.mem.eql(u8, it.field.last(), "status")) has_status = true;
+    }
+    try std.testing.expect(has_status);
 }
 
 test "sql: IDENTIFIER in an UPSERT key -> per-row computed key column" {

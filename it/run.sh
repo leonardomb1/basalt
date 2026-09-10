@@ -7,13 +7,14 @@
 #   ./it/run.sh mysql postgres  several
 #   KEEP=1 ./it/run.sh azure    leave the stack up afterwards
 #
-# Suite names: mysql postgres sqlserver starrocks azure parquet s3
+# Suite names: mysql postgres sqlserver starrocks azure parquet s3 arrow
+# (arrow needs `uv`: it reads the stream back with pyarrow)
 # Scripts are Basalt SQL (the BSL parser was removed in v0.2.0); connection
 # attrs are passed as `OPTIONS(...)` bodies.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ALL_SUITES="mysql postgres sqlserver starrocks azure parquet s3"
+ALL_SUITES="mysql postgres sqlserver starrocks azure parquet s3 arrow"
 DEFAULT_SUITES="$ALL_SUITES"
 SUITES="${*:-$DEFAULT_SUITES}"
 
@@ -44,10 +45,14 @@ B=./zig-out/bin/basalt
 COMPOSE="docker compose -f it/compose.yaml"
 
 echo "==> suites: $SUITES"
-echo "==> starting:$services"
-# shellcheck disable=SC2086
-$COMPOSE up -d --wait $services
-trap '[ "${KEEP:-}" ] || '"$COMPOSE"' down -v' EXIT
+# A suite with no service (arrow) must not start the whole stack: a bare
+# `compose up` brings every container up, StarRocks included.
+if [ -n "$services" ]; then
+  echo "==> starting:$services"
+  # shellcheck disable=SC2086
+  $COMPOSE up -d --wait $services
+  trap '[ "${KEEP:-}" ] || '"$COMPOSE"' down -v' EXIT
+fi
 
 out=$(mktemp -d)
 pass=0
@@ -772,6 +777,34 @@ SELECT id, name, amt, flag FROM 'http://127.0.0.1:38081/snappy.parquet' ORDER BY
     tail -3 "$out/missing.log"
   else
     report parquet-http-missing ok
+  fi
+fi
+
+# Arrow: the stream on stdout must be what an independent reader decodes, so the
+# seed round-trip goes through pyarrow and is held to the same it/expected.csv as
+# every backend. Rows are re-serialised by hand so the compare is byte-exact.
+if runs arrow; then
+  if ! command -v uv >/dev/null; then
+    report "arrow (uv not installed, skipped)" bad
+  elif $B run -q --format arrow -c "SELECT * FROM 'it/seed.csv' ORDER BY id;" >"$out/seed.arrows" 2>"$out/arrow.log" &&
+       uv run --quiet --with pyarrow python - "$out/seed.arrows" "$out/arrow_rt.csv" <<'PY' 2>>"$out/arrow.log"
+import sys, pyarrow.ipc as ipc
+t = ipc.open_stream(sys.argv[1]).read_all()
+t.validate(full=True)
+def cell(v):
+    if v is None: return ""
+    s = str(v)
+    return '"' + s.replace('"', '""') + '"' if any(c in s for c in ',"\n') else s
+with open(sys.argv[2], "w") as f:
+    f.write(",".join(t.column_names) + "\n")
+    for row in t.to_pylist():
+        f.write(",".join(cell(row[c]) for c in t.column_names) + "\n")
+PY
+  then
+    check arrow "$out/arrow_rt.csv" it/expected.csv
+  else
+    report "arrow (run error)" bad
+    tail -5 "$out/arrow.log"
   fi
 fi
 

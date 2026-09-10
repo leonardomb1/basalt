@@ -947,7 +947,7 @@ same query costs at full parallelism.
 ## 10. Running & exit codes
 
 ```
-basalt run   <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json]
+basalt run   <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json|arrow]
 basalt serve <dir> [--port N] [--watch]
 basalt check <script>|-|-c "<inline>"
 ```
@@ -955,6 +955,11 @@ basalt check <script>|-|-c "<inline>"
 `--format json` makes stdout machine-readable: a terminal `SELECT` emits one
 JSON object per row (NDJSON, streamed — decimals as strings, temporals as ISO
 text, bytes as base64), and a `LOAD` run emits one summary object instead.
+`--format arrow` emits the `SELECT` as an Arrow IPC stream — one record batch
+per engine batch, typed (`DECIMAL` as decimal128, dates as date32, times and
+timestamps in microseconds), readable with `pyarrow.ipc.open_stream`,
+`polars.read_ipc_stream` or Arrow JS `tableFromIPC`. An empty result is still a
+valid stream: the schema followed by the end-of-stream marker.
 Logs are stderr-only, plain text, level `warn` by default (`--log-level`,
 `--log-format json`, `-q`).
 

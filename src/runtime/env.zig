@@ -156,14 +156,18 @@ pub const RunOptions = struct {
     buffer_segment: ?u64 = null,
     /// Print the executed operator tree with measured time and row counts.
     explain: bool = false,
-    /// `--format json`: terminal SELECTs emit NDJSON rows instead of the table.
-    stdout_json: bool = false,
+    /// `--format`: what a terminal SELECT writes to stdout.
+    stdout_format: StdoutFormat = .table,
     /// Serve flusher: pin the StarRocks label prefix (the segment label) and
     /// run_id (the segment seq) so a replayed segment produces the SAME labels
     /// — the sink's dedup then makes redelivery effectively-once.
     load_label_prefix: ?[]const u8 = null,
     load_run_id: ?u64 = null,
 };
+
+/// What a terminal `SELECT` writes to stdout: a text table, NDJSON rows, or
+/// an Arrow IPC stream.
+pub const StdoutFormat = enum { table, json, arrow };
 
 pub const SqlKind = registry.SqlKind;
 
@@ -240,7 +244,7 @@ pub const Env = struct {
     /// terminal `SELECT` — whose printed table is its own feedback — gets no summary.
     wrote_sink: bool = false,
     /// `--format json`: stdout sinks emit NDJSON rows instead of the table.
-    stdout_json: bool = false,
+    stdout_format: StdoutFormat = .table,
     /// `EXPLAIN ANALYZE`: run the pipeline for its actuals, write nothing.
     explain: bool = false,
     /// The program's `@kind`, for the header an `EXPLAIN <query>;` statement prints.

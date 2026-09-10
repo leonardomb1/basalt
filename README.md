@@ -71,6 +71,7 @@ fetch.
 ```console
 $ basalt run pipeline.sql -p days=7       # bind a PARAM
 $ basalt run --format json -c "<query>"   # NDJSON rows on stdout, for scripts
+$ basalt run --format arrow -c "<query>"  # Arrow IPC stream on stdout, for pyarrow/Polars/Arrow JS
 $ basalt check pipeline.sql               # validate without running
 $ basalt run -c "EXPLAIN <query>"         # print the plan
 $ basalt run -c "EXPLAIN ANALYZE <query>" # run it, print the plan with actuals

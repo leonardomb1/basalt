@@ -241,7 +241,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var threads: usize = std.Thread.getCpuCount() catch 1;
     var log = runtime.LogConfig{};
     var level_set = false;
-    var stdout_json = false;
+    var stdout_format: runtime.StdoutFormat = .table;
     var explain = false;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
@@ -258,8 +258,8 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             if (threads == 0) threads = 1;
         } else if (std.mem.eql(u8, a, "--format")) {
             const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
-            stdout_json = if (std.mem.eql(u8, v, "json")) true else if (std.mem.eql(u8, v, "table")) false else {
-                try stderr.print("error: --format must be table|json\n", .{});
+            stdout_format = std.meta.stringToEnum(runtime.StdoutFormat, v) orelse {
+                try stderr.print("error: --format must be table|json|arrow\n", .{});
                 return 2;
             };
         } else if (std.mem.eql(u8, a, "--explain")) {
@@ -320,12 +320,12 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         return 0;
     }
 
-    log.summary = if (stdout_json) .json_stdout else .stderr;
+    log.summary = if (stdout_format == .json) .json_stdout else .stderr;
 
     var diag: runtime.Diag = .{};
     var sink = runtime.OutcomeSink.init(alloc);
     defer sink.deinit();
-    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze, .stdout_json = stdout_json }, &diag) catch |e| switch (e) {
+    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze, .stdout_format = stdout_format }, &diag) catch |e| switch (e) {
         error.Aborted => {
             try stderr.print("{s}: aborted\n", .{src.label});
             return 130;
@@ -835,7 +835,7 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *s
     var rdiag: runtime.Diag = .{};
     _ = runtime.run(alloc, prepared, .{
         .log = .{ .summary = .none, .quiet = true },
-        .stdout_json = sess.json,
+        .stdout_format = if (sess.json) .json else .table,
         .explain = prog.explain == .analyze,
     }, &rdiag) catch |e| {
         if (e == error.OutOfMemory) return e;
@@ -1124,8 +1124,9 @@ fn usage(w: anytype) !void {
         \\                     reproducible for a given -j but not across values of it —
         \\                     CAST to DECIMAL for a total that never varies.)
         \\  --port N           listen port for HTTP mode
-        \\  --format FMT       table|json — stdout as machine-readable JSON: NDJSON
-        \\                     rows for a SELECT, a summary object for a LOAD run
+        \\  --format FMT       table|json|arrow — json: NDJSON rows for a SELECT,
+        \\                     a summary object for a LOAD run; arrow: an Arrow IPC
+        \\                     stream of the SELECT's rows
         \\  --log-format FMT   text|json — stderr log format (default text;
         \\                     json is NDJSON, one object per line, for collectors)
         \\  --log-level LVL    error|warn|info|debug (default warn)

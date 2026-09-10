@@ -11,6 +11,7 @@ const csv = @import("../connect/csv.zig");
 const pqdecode = @import("../connect/pqdecode.zig");
 const pqwrite = @import("../connect/pqwrite.zig");
 const JsonWriter = @import("../connect/table.zig").JsonWriter;
+const ArrowWriter = @import("../connect/arrow.zig").ArrowWriter;
 const TableWriter = @import("../connect/table.zig").TableWriter;
 const driver = @import("../connect/driver.zig");
 const starrocks = @import("../connect/starrocks.zig");
@@ -784,14 +785,25 @@ pub fn guardFileFormat(env: *Env, path: []const u8, explicit: ?analyze.FileForma
 pub fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (env.explain) return DiscardSink.sink();
     if (std.mem.eql(u8, w.connector, "stdout")) {
-        if (env.stdout_json) {
-            const writer = JsonWriter.open(env.gpa, schema) catch
-                return planErr(env.diag, "could not open stdout json writer");
-            return writer.sink();
+        switch (env.stdout_format) {
+            .json => {
+                const writer = JsonWriter.open(env.gpa, schema) catch
+                    return planErr(env.diag, "could not open stdout json writer");
+                return writer.sink();
+            },
+            .arrow => {
+                const writer = ArrowWriter.open(env.gpa, schema) catch |e| switch (e) {
+                    error.ArrowUnsupportedType => return planErr(env.diag, "arrow output cannot carry an array or struct column"),
+                    else => return planErr(env.diag, "could not open stdout arrow writer"),
+                };
+                return writer.sink();
+            },
+            .table => {
+                const writer = TableWriter.open(env.gpa, schema) catch
+                    return planErr(env.diag, "could not open stdout table");
+                return writer.sink();
+            },
         }
-        const writer = TableWriter.open(env.gpa, schema) catch
-            return planErr(env.diag, "could not open stdout table");
-        return writer.sink();
     }
     if (std.mem.eql(u8, w.connector, "csv")) {
         const fmode = try fileWriteMode(env, w);
