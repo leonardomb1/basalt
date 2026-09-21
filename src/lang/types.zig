@@ -116,13 +116,30 @@ pub const BodyCol = struct { name: []const u8, ty: Type, not_null: bool = false 
 pub const Schema = struct {
     fields: []const Field,
 
-    pub const Field = struct { name: []const u8, ty: Type };
+    /// `rel`/`base` are set on the columns a join's right side contributed: the
+    /// side's alias and the column's name there, which `name` no longer is once a
+    /// collision renamed it `x_r`. They are what lets `b.x` find that column.
+    pub const Field = struct { name: []const u8, ty: Type, rel: []const u8 = "", base: []const u8 = "" };
 
     pub fn indexOf(self: Schema, name: []const u8) ?usize {
         for (self.fields, 0..) |f, i| {
             if (std.mem.eql(u8, f.name, name)) return i;
         }
         return null;
+    }
+
+    /// The column a possibly qualified name refers to. `b.x`, where `b` is a join's
+    /// right side, is that side's `x` whatever the join had to rename it; any other
+    /// qualifier is decoration and the last part alone decides.
+    pub fn resolve(self: Schema, parts: []const []const u8) ?usize {
+        const name = parts[parts.len - 1];
+        if (parts.len > 1) {
+            const rel = parts[parts.len - 2];
+            for (self.fields, 0..) |f, i| {
+                if (f.rel.len != 0 and std.mem.eql(u8, f.rel, rel) and std.mem.eql(u8, f.base, name)) return i;
+            }
+        }
+        return self.indexOf(name);
     }
 };
 

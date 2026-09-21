@@ -15,6 +15,7 @@ const ArrowWriter = @import("../connect/arrow.zig").ArrowWriter;
 const TableWriter = @import("../connect/table.zig").TableWriter;
 const driver = @import("../connect/driver.zig");
 const starrocks = @import("../connect/starrocks.zig");
+const registry = @import("../connect/registry.zig");
 const tds = @import("../connect/tds.zig");
 const mysql = @import("../connect/mysql.zig");
 const postgres = @import("../connect/postgres.zig");
@@ -540,16 +541,17 @@ fn parseDbConfig(conn: ast.Connection, default_port: u16, f: anytype) anyerror!D
     var cfg = DbConfig{ .port = default_port };
     for (conn.config) |attr| {
         const k = attr.key;
-        if (std.mem.eql(u8, k, "port")) {
+        // `fe_host`/`fe_port` are the StarRocks spellings of the same two attributes.
+        if (eqlAny(k, &.{ "port", "fe_port" })) {
             if (try f.port(attr.value)) |p| {
                 cfg.port = p;
                 cfg.port_explicit = true;
             }
             continue;
         }
-        if (!eqlAny(k, &.{ "host", "user", "password", "database", "tls", "auth", "domain", "client_id", "resource", "token" })) continue;
+        if (!eqlAny(k, &.{ "host", "fe_host", "user", "password", "database", "tls", "auth", "domain", "client_id", "resource", "token" })) continue;
         const v = (try f.str(attr.value)) orelse continue;
-        if (std.mem.eql(u8, k, "host")) {
+        if (eqlAny(k, &.{ "host", "fe_host" })) {
             cfg.host = v;
         } else if (std.mem.eql(u8, k, "user")) {
             cfg.user = v;
@@ -708,13 +710,15 @@ fn proberOpen(ctx_ptr: *anyopaque) anyerror!sql.Conn {
     return connectSql(ctx.gpa, ctx.kind, ctx.cfg);
 }
 
-pub const SqlConnInfo = struct { kind: SqlKind, dialect: sql.Dialect, port: u16 };
+pub const SqlConnInfo = registry.SqlRead;
 
-/// What a `CREATE CONNECTION` resolves to when its type is a SQL driver; null for
-/// every other connector.
+/// What a `CREATE CONNECTION` resolves to when it can be read over a SQL wire
+/// protocol; null for every other connector. A `starrocks` connection qualifies
+/// (see `Connector.sqlRead`) — its *sink* is stream load, which every write path
+/// checks for before asking this.
 pub fn sqlConnInfo(conn: ast.Connection) ?SqlConnInfo {
-    const k = SqlKind.parse(conn.connector) orelse return null;
-    return .{ .kind = k, .dialect = k.dialect(), .port = k.defaultPort() };
+    const c = registry.Connector.parse(conn.connector) orelse return null;
+    return c.sqlRead();
 }
 
 fn cfgStr(arena: std.mem.Allocator, expr: *const ast.Expr) ?[]const u8 {
@@ -936,3 +940,43 @@ fn obNext(ptr: *anyopaque, _: std.mem.Allocator) anyerror!?Batch {
 }
 
 fn obClose(_: *anyopaque) void {}
+
+const LitCfg = struct {
+    fn str(_: LitCfg, e: *const ast.Expr) !?[]const u8 {
+        return if (e.* == .str_lit) e.str_lit else null;
+    }
+    fn port(_: LitCfg, e: *const ast.Expr) !?u16 {
+        return if (e.* == .int_lit) @intCast(e.int_lit) else null;
+    }
+    fn tls(_: LitCfg, _: []const u8) !sql.TlsMode {
+        return .off;
+    }
+    fn auth(_: LitCfg, _: []const u8) !DbAuth {
+        return .sql;
+    }
+};
+
+test "a starrocks connection reads over MySQL: FE host and port, default 9030" {
+    var host = ast.Expr{ .str_lit = "fe.internal" };
+    var port = ast.Expr{ .int_lit = 9031 };
+    var user = ast.Expr{ .str_lit = "etl" };
+    const pos = ast.Pos{ .line = 0, .col = 0 };
+    const conn = ast.Connection{ .name = "sr", .connector = "starrocks", .pos = pos, .config = &.{
+        .{ .key = "fe_host", .value = &host, .pos = pos },
+        .{ .key = "user", .value = &user, .pos = pos },
+    } };
+    const info = sqlConnInfo(conn).?;
+    try std.testing.expectEqual(SqlKind.mysql, info.kind);
+    try std.testing.expectEqual(sql.Dialect.starrocks, info.dialect);
+
+    const cfg = try parseDbConfig(conn, info.port, LitCfg{});
+    try std.testing.expectEqualStrings("fe.internal", cfg.host);
+    try std.testing.expectEqualStrings("etl", cfg.user);
+    try std.testing.expectEqual(@as(u16, 9030), cfg.port);
+
+    const explicit = ast.Connection{ .name = "sr", .connector = "starrocks", .pos = pos, .config = &.{
+        .{ .key = "host", .value = &host, .pos = pos },
+        .{ .key = "fe_port", .value = &port, .pos = pos },
+    } };
+    try std.testing.expectEqual(@as(u16, 9031), (try parseDbConfig(explicit, info.port, LitCfg{})).port);
+}

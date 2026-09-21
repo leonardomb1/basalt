@@ -215,6 +215,9 @@ pub const JoinKind = enum { inner, left, semi, anti, right, full, cross };
 pub const Join = struct {
     kind: JoinKind,
     binding: []const u8,
+    /// What the query calls the right side — its alias, else the binding's own
+    /// name. `alias.col` keeps this qualifier so it can name the right side's column.
+    alias: []const u8 = "",
     left_keys: []const QualName,
     right_keys: []const QualName,
 };

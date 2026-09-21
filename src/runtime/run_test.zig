@@ -2923,3 +2923,266 @@ test "parallel parquet: an aggregate after DISTINCT and a HAVING both fan out an
     defer alloc.free(having);
     try std.testing.expectEqualStrings("g,c\n0,1250\n3,1250\n", having);
 }
+
+/// Check, then run, a script in which `$B` stands for the tmp dir — so every test
+/// below also asserts that `check` accepts what `run` executes. Fixtures: `a.csv`
+/// and `b.csv` (id, grp, amt), `outer.csv` (name: a, b), `inner.csv` (suffix: one, two).
+fn checkAndRun(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, tmpl: []const u8, threads: usize, cli_params: []const ParamArg) !void {
+    try tmp.dir.writeFile(.{ .sub_path = "a.csv", .data = "id,grp,amt\n1,a,10\n2,a,20\n3,b,5\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.csv", .data = "id,grp,amt\n7,x,1\n8,x,2\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "outer.csv", .data = "name\na\nb\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "inner.csv", .data = "suffix\none\ntwo\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.mem.replaceOwned(u8, alloc, tmpl, "$B", base);
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = parser.parseSource(parena.allocator(), script, &pdiag) catch |e| {
+        std.debug.print("parse error: {s}\n", .{pdiag.msg});
+        return e;
+    };
+    const overrides = try parena.allocator().alloc(analyze.ParamOverride, cli_params.len);
+    for (cli_params, overrides) |kv, *o| o.* = .{ .name = kv.key, .value = kv.val };
+    var adiag = analyze.Diag{};
+    _ = analyze.analyzeWith(parena.allocator(), prog, overrides, &adiag) catch |e| {
+        std.debug.print("check error: {s}\n", .{adiag.msg});
+        return e;
+    };
+    var rdiag: Diag = .{};
+    _ = run(alloc, prog, .{ .threads = threads, .params = cli_params, .log = .{ .quiet = true } }, &rdiag) catch |e| {
+        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+        return e;
+    };
+}
+
+fn expectFile(tmp: *std.testing.TmpDir, name: []const u8, want: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const got = try tmp.dir.readFileAlloc(alloc, name, 1 << 16);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings(want, got);
+}
+
+const nested_loop_script =
+    \\FOR EACH ROW OF ('$B/outer.csv') AS (name) MODE
+    \\  FOR EACH ROW OF ('$B/inner.csv') AS (suffix)
+    \\    THROW 'never ' || $name WHEN $name = 'zzz';
+    \\    CASE $name WHEN 'a' THEN
+    \\      LOAD INTO IDENTIFIER('$B/out_' || $name || '_' || $suffix || '.csv') AS
+    \\      WITH src AS (SELECT grp, amt FROM IDENTIFIER('$B/' || $name || '.csv'))
+    \\      SELECT grp, SUM(amt) AS total, $name AS src_name, $suffix AS sfx FROM src GROUP BY grp ORDER BY grp;
+    \\    END CASE;
+    \\  END FOR;
+    \\END FOR;
+;
+
+test "nested for-each: an outer loop variable is a name, a value, a THROW operand and a CASE subject" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "SEQUENTIAL", "PARALLEL" }) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const script = try std.mem.replaceOwned(u8, alloc, nested_loop_script, "MODE", mode);
+        defer alloc.free(script);
+        try checkAndRun(alloc, &tmp, script, 4, &.{});
+        try expectFile(&tmp, "out_a_one.csv", "grp,total,src_name,sfx\na,30,a,one\nb,5,a,one\n");
+        try expectFile(&tmp, "out_a_two.csv", "grp,total,src_name,sfx\na,30,a,two\nb,5,a,two\n");
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access("out_b_one.csv", .{}));
+    }
+}
+
+test "for-each body WITH: rendered per row, and a same-named top-level WITH is left alone" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "SEQUENTIAL", "PARALLEL" }) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const tmpl =
+            \\LOAD INTO '$B/out_first.csv' AS WITH src AS (SELECT id FROM '$B/a.csv') SELECT COUNT(*) AS n FROM src;
+            \\FOR EACH ROW OF ('$B/outer.csv') AS (name) MODE
+            \\  LOAD INTO IDENTIFIER('$B/out_' || $name || '.csv') AS
+            \\  WITH src AS (SELECT id FROM IDENTIFIER('$B/' || $name || '.csv') WHERE id <> 1)
+            \\  SELECT COUNT(*) AS n FROM src;
+            \\END FOR;
+            \\LOAD INTO '$B/out_last.csv' AS SELECT COUNT(*) AS n FROM src;
+        ;
+        const script = try std.mem.replaceOwned(u8, alloc, tmpl, "MODE", mode);
+        defer alloc.free(script);
+        try checkAndRun(alloc, &tmp, script, 4, &.{});
+        try expectFile(&tmp, "out_first.csv", "n\n3\n");
+        try expectFile(&tmp, "out_a.csv", "n\n2\n");
+        try expectFile(&tmp, "out_b.csv", "n\n2\n");
+        try expectFile(&tmp, "out_last.csv", "n\n3\n");
+    }
+}
+
+test "top-level WITH: two statements reusing a CTE name each read their own" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try checkAndRun(alloc, &tmp,
+        \\LOAD INTO '$B/out_1.csv' AS WITH src AS (SELECT id FROM '$B/a.csv') SELECT COUNT(*) AS n FROM src;
+        \\LOAD INTO '$B/out_2.csv' AS WITH src AS (SELECT id FROM '$B/b.csv') SELECT COUNT(*) AS n FROM src;
+    , 1, &.{});
+    try expectFile(&tmp, "out_1.csv", "n\n3\n");
+    try expectFile(&tmp, "out_2.csv", "n\n2\n");
+}
+
+test "a WITH declared in a for-each body is not visible after it, to check and run alike" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.csv", .data = "id\n1\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "outer.csv", .data = "name\na\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.mem.replaceOwned(u8, alloc,
+        \\FOR EACH ROW OF ('$B/outer.csv') AS (name)
+        \\  LOAD INTO '$B/out.csv' AS WITH src AS (SELECT id FROM '$B/a.csv') SELECT id FROM src;
+        \\END FOR;
+        \\LOAD INTO '$B/out_2.csv' AS SELECT id FROM src;
+    , "$B", base);
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var adiag = analyze.Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyze.analyze(parena.allocator(), prog, &adiag));
+    try std.testing.expect(std.mem.indexOf(u8, adiag.msg, "src") != null);
+    var rdiag: Diag = .{};
+    try std.testing.expect(std.meta.isError(run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag)));
+    try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "src") != null);
+}
+
+test "CALL: a nested FOR EACH in a statement function sees its argument and the script PARAMs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try checkAndRun(alloc, &tmp,
+        \\PARAM tag STRING;
+        \\CREATE FUNCTION fan(src) AS
+        \\  FOR EACH ROW OF ('$B/inner.csv') AS (suffix)
+        \\    LOAD INTO IDENTIFIER('$B/' || $tag || '_' || $src || '_' || $suffix || '.csv') AS
+        \\    SELECT COUNT(*) AS n, $src AS s, $suffix AS sfx FROM IDENTIFIER('$B/' || $src || '.csv');
+        \\  END FOR;
+        \\END;
+        \\FOR EACH ROW OF ('$B/outer.csv') AS (name)
+        \\  CALL fan($name);
+        \\END FOR;
+    , 1, &[_]ParamArg{.{ .key = "tag", .val = "out" }});
+    try expectFile(&tmp, "out_a_one.csv", "n,s,sfx\n3,a,one\n");
+    try expectFile(&tmp, "out_b_two.csv", "n,s,sfx\n2,b,two\n");
+}
+
+test "LET inside a for-each body is refused by check and run with the same message" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "outer.csv", .data = "name\na\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.mem.replaceOwned(u8, alloc,
+        \\FOR EACH ROW OF ('$B/outer.csv') AS (name)
+        \\  LET x = 1;
+        \\  LOAD INTO '$B/out.csv' AS SELECT $name AS n;
+        \\END FOR;
+    , "$B", base);
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    const want = "LET `x` must be declared at the top level of the script";
+    var adiag = analyze.Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyze.analyze(parena.allocator(), prog, &adiag));
+    try std.testing.expectEqualStrings(want, adiag.msg);
+    try std.testing.expectEqual(@as(u32, 2), adiag.pos.?.line);
+    var rdiag: Diag = .{};
+    try std.testing.expect(std.meta.isError(run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag)));
+    try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, want) != null);
+}
+
+test "IDENTIFIER names a column per row: SELECT list, WHERE, GROUP BY, ORDER BY, DISTINCT ON, an expression" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "cols.csv", .data = "c\ngrp\nid\n" });
+    try checkAndRun(alloc, &tmp,
+        \\FOR EACH ROW OF ('$B/cols.csv') AS (c)
+        \\  LOAD INTO IDENTIFIER('$B/agg_' || $c || '.csv') AS
+        \\  SELECT IDENTIFIER($c), COUNT(*) AS n FROM '$B/a.csv'
+        \\  WHERE IDENTIFIER($c) IS NOT NULL GROUP BY IDENTIFIER($c) ORDER BY IDENTIFIER($c) DESC;
+        \\  LOAD INTO IDENTIFIER('$B/dist_' || $c || '.csv') AS
+        \\  SELECT DISTINCT ON (IDENTIFIER($c)) IDENTIFIER($c), upper(CAST(IDENTIFIER($c) AS STRING)) AS u, $c AS col FROM '$B/a.csv';
+        \\END FOR;
+    , 1, &.{});
+    try expectFile(&tmp, "agg_grp.csv", "grp,n\nb,1\na,2\n");
+    try expectFile(&tmp, "agg_id.csv", "id,n\n3,1\n2,1\n1,1\n");
+    try expectFile(&tmp, "dist_grp.csv", "grp,u,col\na,A,grp\nb,B,grp\n");
+}
+
+test "IDENTIFIER names a column from a PARAM outside any loop" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try checkAndRun(alloc, &tmp,
+        \\PARAM col STRING;
+        \\LOAD INTO '$B/out.csv' AS
+        \\SELECT IDENTIFIER($col) AS k, SUM(amt) AS s FROM '$B/a.csv' GROUP BY IDENTIFIER($col) ORDER BY k;
+    , 1, &[_]ParamArg{.{ .key = "col", .val = "grp" }});
+    try expectFile(&tmp, "out.csv", "k,s\na,30\nb,5\n");
+}
+
+test "join: `b.col` names the right side's column even when the join renamed it `col_r`" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 1, 4 }) |threads| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(.{ .sub_path = "r.csv", .data = "id,grp,amt\n1,p,100\n2,q,200\n9,z,900\n" });
+        try checkAndRun(alloc, &tmp,
+            \\LOAD INTO '$B/both.csv' AS
+            \\WITH r AS (SELECT id, grp, amt FROM '$B/r.csv')
+            \\SELECT a.id, a.amt, b.amt FROM '$B/a.csv' a JOIN r b ON a.id = b.id ORDER BY a.id;
+            \\LOAD INTO '$B/filt.csv' AS
+            \\WITH r AS (SELECT id, grp, amt FROM '$B/r.csv')
+            \\SELECT a.id, b.amt AS bamt, a.amt + b.amt AS tot FROM '$B/a.csv' a LEFT JOIN r b ON a.id = b.id
+            \\WHERE b.amt > 150 OR b.amt IS NULL ORDER BY b.amt DESC;
+            \\LOAD INTO '$B/agg.csv' AS
+            \\WITH r AS (SELECT id, grp, amt FROM '$B/r.csv')
+            \\SELECT b.grp, SUM(b.amt) AS sb, SUM(a.amt) AS sa FROM '$B/a.csv' a JOIN r b ON a.id = b.id GROUP BY b.grp ORDER BY b.grp;
+            \\LOAD INTO '$B/chain.csv' AS
+            \\WITH r AS (SELECT id, amt FROM '$B/r.csv'), s AS (SELECT id, amt FROM '$B/r.csv' WHERE amt >= 200)
+            \\SELECT a.id, b.amt, c.amt AS camt FROM '$B/a.csv' a JOIN r b ON a.id = b.id JOIN s c ON b.id = c.id;
+            \\LOAD INTO '$B/unaliased.csv' AS
+            \\WITH r AS (SELECT id, amt FROM '$B/r.csv')
+            \\SELECT a.id, r.amt FROM '$B/a.csv' a JOIN r ON a.id = r.id ORDER BY a.id;
+        , threads, &.{});
+        try expectFile(&tmp, "both.csv", "id,amt,amt_r\n1,10,100\n2,20,200\n");
+        try expectFile(&tmp, "filt.csv", "id,bamt,tot\n2,200,220\n3,,\n");
+        try expectFile(&tmp, "agg.csv", "grp,sb,sa\np,100,10\nq,200,20\n");
+        try expectFile(&tmp, "chain.csv", "id,amt,camt\n2,200,200\n");
+        try expectFile(&tmp, "unaliased.csv", "id,amt\n1,100\n2,200\n");
+    }
+}
+
+test "DISTINCT ON keys are input columns: renamed, unprojected, and beside an ORDER BY on another hidden column" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "d.csv", .data = "id,grp,amt\n1,a,10\n2,a,20\n3,b,5\n4,b,50\n" });
+    try checkAndRun(alloc, &tmp,
+        \\LOAD INTO '$B/renamed.csv' AS SELECT DISTINCT ON (grp) grp AS k, upper(grp) AS u FROM '$B/d.csv' ORDER BY grp DESC;
+        \\LOAD INTO '$B/hidden.csv' AS SELECT DISTINCT ON (grp) id, amt FROM '$B/d.csv';
+        \\LOAD INTO '$B/sorted.csv' AS SELECT DISTINCT ON (grp) id FROM '$B/d.csv' ORDER BY amt DESC;
+        \\LOAD INTO '$B/output.csv' AS SELECT DISTINCT ON (k) grp AS k, id FROM '$B/d.csv';
+        \\LOAD INTO '$B/pair.csv' AS SELECT DISTINCT ON (grp, amt) id FROM '$B/d.csv';
+    , 1, &.{});
+    try expectFile(&tmp, "renamed.csv", "k,u\nb,B\na,A\n");
+    try expectFile(&tmp, "hidden.csv", "id,amt\n1,10\n3,5\n");
+    try expectFile(&tmp, "sorted.csv", "id\n1\n3\n");
+    try expectFile(&tmp, "output.csv", "k,id\na,1\nb,3\n");
+    try expectFile(&tmp, "pair.csv", "id\n1\n2\n3\n4\n");
+}

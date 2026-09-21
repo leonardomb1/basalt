@@ -34,6 +34,8 @@ pub const SqlKind = enum {
     }
 };
 
+pub const SqlRead = struct { kind: SqlKind, dialect: sql.Dialect, port: u16 };
+
 /// Every connector name the runtime and analyzer dispatch on.
 pub const Connector = enum {
     csv,
@@ -61,6 +63,16 @@ pub const Connector = enum {
         };
     }
 
+    /// How the connector is *read*: the wire driver, the dialect rendered for it
+    /// and the port it listens on. StarRocks has no driver of its own — its FE
+    /// speaks the MySQL protocol on 9030 — so one `starrocks` connection is read
+    /// through the MySQL driver and written by stream load.
+    pub fn sqlRead(self: Connector) ?SqlRead {
+        if (self == .starrocks) return .{ .kind = .mysql, .dialect = .starrocks, .port = 9030 };
+        const k = self.sqlKind() orelse return null;
+        return .{ .kind = k, .dialect = k.dialect(), .port = k.defaultPort() };
+    }
+
     /// Sources the engine reads without a `CREATE CONNECTION`.
     pub fn isBuiltinSource(self: Connector) bool {
         return switch (self) {
@@ -82,4 +94,13 @@ test "every SqlKind is a Connector with the same name and the expected port" {
     try std.testing.expect(SqlKind.parse("starrocks") == null);
     try std.testing.expect(Connector.parse("starrocks").?.sqlKind() == null);
     try std.testing.expect(Connector.parse("nope") == null);
+}
+
+test "a starrocks connection is read through the MySQL driver on the FE port" {
+    const r = Connector.parse("starrocks").?.sqlRead().?;
+    try std.testing.expectEqual(SqlKind.mysql, r.kind);
+    try std.testing.expectEqual(sql.Dialect.starrocks, r.dialect);
+    try std.testing.expectEqual(@as(u16, 9030), r.port);
+    try std.testing.expectEqual(sql.Dialect.postgres, Connector.parse("postgres").?.sqlRead().?.dialect);
+    try std.testing.expect(Connector.parse("csv").?.sqlRead() == null);
 }

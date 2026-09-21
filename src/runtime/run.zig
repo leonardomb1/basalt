@@ -29,9 +29,9 @@ pub const isTransient = @import("env.zig").isTransient;
 pub const ItemOutcome = @import("env.zig").ItemOutcome;
 pub const LogConfig = @import("env.zig").LogConfig;
 const LoopRow = @import("env.zig").LoopRow;
-const loopValue = @import("env.zig").loopValue;
 const mkLit = @import("env.zig").mkLit;
 const no_loop_vars = @import("env.zig").no_loop_vars;
+const body_stmt_rule = @import("env.zig").body_stmt_rule;
 pub const OutcomeSink = @import("env.zig").OutcomeSink;
 pub const ParamArg = @import("env.zig").ParamArg;
 const planErr = @import("env.zig").planErr;
@@ -83,6 +83,7 @@ const renderPipeline = @import("script.zig").renderPipeline;
 const renderScriptScope = @import("script.zig").renderScriptScope;
 const runCall = @import("script.zig").runCall;
 const runForEach = @import("script.zig").runForEach;
+const renderForSource = @import("script.zig").renderForSource;
 const runPrint = @import("script.zig").runPrint;
 const runThrow = @import("script.zig").runThrow;
 
@@ -136,10 +137,9 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var fns = std.StringHashMap(ast.FnDecl).init(arena);
     var runnable: usize = 0;
     for (program.stmts[1..]) |s| switch (s) {
-        .binding => |b| try bindings.put(b.name, b.pipeline),
         .connection => |c| try connections.put(c.name, c),
         .func => |fd| try fns.put(fd.name, fd),
-        .print => {},
+        .print, .binding => {},
         // An EXPLAIN counts: a script whose only pipeline is explained is a complete
         // script, not one that forgot to write anywhere.
         .output, .for_each, .match, .call, .explain => runnable += 1,
@@ -177,21 +177,16 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
 
     env.script_scope = try buildScriptScope(arena, &params);
 
-    // CTE bodies are registered by the pre-pass above, before script scope exists,
-    // so a dynamic path inside one (`IDENTIFIER($data || '/t.parquet')`) would reach
-    // the reader as a literal `${data}`. Render every binding with the same scope its
-    // sibling `.output` statements get at the loop below.
-    if (env.script_scope.names.len != 0) {
-        var bit = bindings.iterator();
-        while (bit.next()) |kv| kv.value_ptr.* = try renderScriptScope(&env, kv.value_ptr.*);
-    }
-
     var stats = Stats{ .run_id = run_id };
     var lanes_used: usize = 1;
     for (program.stmts[1..]) |s| switch (s) {
+        // A `WITH` is registered where it stands, rendered with script scope like the
+        // query that reads it: two statements may reuse a CTE name, and each must see
+        // its own — registering them all up front made the last one win for both.
+        .binding => |b| try bindings.put(b.name, try renderScriptScope(&env, b.pipeline)),
         .output => |p| try runOutput(&env, try renderScriptScope(&env, p), opts, &stats, &lanes_used, &batch_arena),
         .explain => |e| try runExplain(&env, e, opts, &stats, &lanes_used, &batch_arena),
-        .for_each => |fe| try runForEach(&env, fe, opts, &stats, &lanes_used, &batch_arena, runForBody),
+        .for_each => |fe| try runForEach(&env, fe, opts, &stats, &lanes_used, &batch_arena, runForBody, &env.script_scope),
         .match => |m| try runStmtMatch(&env, m, opts, &stats, &lanes_used, &batch_arena),
         .print => |p| try runPrint(&env, p, no_loop_vars),
         .call => |c| try runCall(&env, c, no_loop_vars, opts, &stats, &lanes_used, &batch_arena, runForBody),
@@ -293,7 +288,7 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
     switch (s.*) {
         .output => |p| try runOutput(env, try renderScriptScope(env, p), opts, stats, lanes_used, batch_arena),
         .explain => |e| try runExplain(env, e, opts, stats, lanes_used, batch_arena),
-        .for_each => |fe| try runForEach(env, fe, opts, stats, lanes_used, batch_arena, runForBody),
+        .for_each => |fe| try runForEach(env, fe, opts, stats, lanes_used, batch_arena, runForBody, &env.script_scope),
         .match => |mm| try runStmtMatch(env, mm, opts, stats, lanes_used, batch_arena),
         .print => |p| try runPrint(env, p, no_loop_vars),
         .call => |c| try runCall(env, c, no_loop_vars, opts, stats, lanes_used, batch_arena, runForBody),
@@ -458,8 +453,9 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, 
     // reopen" the split path below does.
     var whole_agg = false;
     if (env.sql_desc != null and src_base < env.sources.items.len) {
+        var why: []const u8 = "the pipeline is not read -> filter* -> aggregate";
         if (classifyWholeAgg(stages)) |shape| {
-            if (try wholeAggStages(env, stages, shape, src_base)) |ns| {
+            if (try wholeAggStages(env, stages, shape, src_base, &why)) |ns| {
                 for (env.sources.items[src_base..]) |sc| sc.close();
                 env.sources.shrinkRetainingCapacity(src_base);
                 env.sql_desc = null;
@@ -468,6 +464,10 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, 
                 whole_agg = true;
             }
         }
+        // The single most expensive silent behaviour the engine has: every matching
+        // source row ships here to be grouped. Say so, and why, where the run log is.
+        if (!whole_agg and hasAggregate(stages))
+            env.log.log(.warn, "aggregate over {s} runs engine-side, not in the source ({s}); every matching row is streamed here to be grouped", .{ @tagName(env.sql_desc.?.kind), why });
     }
 
     if (!whole_agg and opts.threads > 1 and env.sql_desc != null) {
@@ -792,10 +792,28 @@ test {
     _ = @import("run_test.zig");
 }
 
+fn hasAggregate(stages: []const ast.Stage) bool {
+    for (stages) |st| if (st.node == .aggregate) return true;
+    return false;
+}
+
 /// Run one row of a `for` body. The body is a statement block (a bare pipeline is a
 /// one-statement block): each pipeline is rendered with the row's `${var}` values and
 /// executed; a `match` branches on the loop variables and runs the winning arm.
 pub fn runForBody(env: *Env, body: []const ast.Stmt, lr: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+    // A body's `WITH`/derived table is scoped to the body: whatever the name meant
+    // outside comes back once the row is done, so the next row (or the top level)
+    // never reads a stale per-row pipeline.
+    var saved = std.array_list.Managed(struct { name: []const u8, prev: ?ast.Pipeline }).init(env.arena);
+    for (body) |st| if (st == .binding) try saved.append(.{ .name = st.binding.name, .prev = env.bindings.get(st.binding.name) });
+    defer {
+        var i = saved.items.len;
+        while (i > 0) {
+            i -= 1;
+            const sv = saved.items[i];
+            if (sv.prev) |p| env.bindings.put(sv.name, p) catch {} else _ = env.bindings.remove(sv.name);
+        }
+    }
     for (body) |*st| try runForStmt(env, st, lr, opts, stats, lanes_used, batch_arena);
 }
 
@@ -813,7 +831,17 @@ fn runForStmt(env: *Env, s: *const ast.Stmt, lr: LoopRow, opts: RunOptions, stat
         .print => |p| try runPrint(env, p, lr),
         .call => |c| try runCall(env, c, lr, opts, stats, lanes_used, batch_arena, runForBody),
         .throw => |t| try runThrow(env, t, lr),
-        else => return planErr(env.diag, "a `for` or statement-function body may contain only pipelines, `CASE`, `CALL`, `PRINT`, `EXPLAIN` and `THROW` statements"),
+        // A `WITH`/derived table inside a body is rendered with the row like the
+        // pipeline that reads it, so a per-row reconciliation can join.
+        .binding => |b| try env.bindings.put(b.name, try renderPipeline(env.arena, b.pipeline, lr)),
+        // A nested loop: its discovery source is rendered with the outer row, and
+        // every inner row chains to it so `${outer}` still resolves in the body.
+        .for_each => |fe| try runForEach(env, try renderForSource(env.arena, fe, lr), opts, stats, lanes_used, batch_arena, runForBody, &lr),
+        .let_const => |l| {
+            env.diag.stamp(l.pos);
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "LET `{s}` must be declared at the top level of the script", .{l.name}));
+        },
+        .param, .kind, .connection, .func => return planErr(env.diag, body_stmt_rule),
     }
 }
 
@@ -824,15 +852,12 @@ fn runForStmt(env: *Env, s: *const ast.Stmt, lr: LoopRow, opts: RunOptions, stat
 fn runForMatch(env: *Env, m: ast.StmtMatch, lr: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     var names = std.array_list.Managed([]const u8).init(env.arena);
     var values = std.array_list.Managed(Value).init(env.arena);
-    for (lr.names, lr.cells, 0..) |nm, cell, i| {
-        try names.append(nm);
-        try values.append(loopValue(env.arena, cell, lr.typeAt(i)));
-    }
+    try lr.appendLoopVars(env.arena, &names, &values);
     var it = env.params.iterator();
     while (it.next()) |kv| {
         try names.append(kv.key_ptr.*);
         try values.append(kv.value_ptr.*);
     }
     const idx = (try matchArmIndex(env, m, names.items, values.items, "for/match")) orelse return;
-    for (m.arms[idx].body) |*st| try runForStmt(env, st, lr, opts, stats, lanes_used, batch_arena);
+    try runForBody(env, m.arms[idx].body, lr, opts, stats, lanes_used, batch_arena);
 }

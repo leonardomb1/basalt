@@ -274,6 +274,9 @@ pub const LoopRow = struct {
     /// param quietly displace a same-named column. A `${...}` hole is the one
     /// place the value is still a needle in a string.
     outer: ?*const LoopRow = null,
+    /// Set on the script-scope row that ends every chain, so a walk over the
+    /// enclosing *loops* knows where to stop.
+    script: bool = false,
 
     pub fn typeAt(self: LoopRow, i: usize) ?types.Type {
         return if (i < self.types.len) self.types[i] else null;
@@ -293,6 +296,31 @@ pub const LoopRow = struct {
         if (self.outer) |o| try o.appendScope(arena, names, vals);
     }
 
+    /// This row's loop variables followed by every enclosing loop's, as typed
+    /// values — what an expression may fold. Stops short of script scope.
+    pub fn appendLoopVars(
+        self: LoopRow,
+        arena: std.mem.Allocator,
+        names: *std.array_list.Managed([]const u8),
+        vals: *std.array_list.Managed(Value),
+    ) !void {
+        if (self.script) return;
+        for (self.names, self.cells, 0..) |nm, cell, i| {
+            try names.append(nm);
+            try vals.append(loopValue(arena, cell, self.typeAt(i)));
+        }
+        if (self.outer) |o| try o.appendLoopVars(arena, names, vals);
+    }
+
+    /// The loop variable `name` as a typed value, innermost loop first.
+    pub fn loopVar(self: LoopRow, arena: std.mem.Allocator, name: []const u8) ?Value {
+        if (self.script) return null;
+        for (self.names, self.cells, 0..) |nm, cell, i| {
+            if (std.mem.eql(u8, nm, name)) return loopValue(arena, cell, self.typeAt(i));
+        }
+        return if (self.outer) |o| o.loopVar(arena, name) else null;
+    }
+
     /// The text bound to a bare `${name}`, searching this row then outwards.
     pub fn lookup(self: LoopRow, name: []const u8) ?[]const u8 {
         for (self.names, self.cells) |nm, val| {
@@ -301,6 +329,9 @@ pub const LoopRow = struct {
         return if (self.outer) |o| o.lookup(name) else null;
     }
 };
+
+/// The one rule `check` and `run` both apply to a `for`/statement-function body.
+pub const body_stmt_rule = "a `for` or statement-function body may contain only pipelines, `WITH`, `FOR EACH`, `CASE`, `CALL`, `PRINT`, `EXPLAIN` and `THROW` statements";
 
 /// No loop variables in scope — the binding a top-level `CALL` starts from.
 pub const no_loop_vars = LoopRow{ .names = &[_][]const u8{}, .cells = &[_][]const u8{} };

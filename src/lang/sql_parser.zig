@@ -63,6 +63,7 @@ const MAX_ALIASES = 8;
 
 const AliasSet = struct {
     names: [MAX_ALIASES][]const u8 = undefined,
+    right: [MAX_ALIASES]bool = @splat(false),
     n: usize = 0,
 
     fn add(self: *AliasSet, name: []const u8) void {
@@ -70,6 +71,18 @@ const AliasSet = struct {
             self.names[self.n] = name;
             self.n += 1;
         }
+    }
+    /// A join's right-side alias: known, but its qualifier is kept on a column
+    /// reference, since `b.x` may be a column the join renamed `x_r`.
+    fn addRight(self: *AliasSet, name: []const u8) void {
+        if (self.n < MAX_ALIASES) self.right[self.n] = true;
+        self.add(name);
+    }
+    fn strips(self: *const AliasSet, name: []const u8) bool {
+        for (self.names[0..self.n], self.right[0..self.n]) |a, r| {
+            if (std.mem.eql(u8, a, name)) return !r;
+        }
+        return false;
     }
     fn has(self: *const AliasSet, name: []const u8) bool {
         for (self.names[0..self.n]) |a| {
@@ -158,6 +171,49 @@ fn aggOrderDiffers(post: []const ast.SelectItem, group: []const ast.QualName, ag
 }
 
 /// What to call a SELECT item in a diagnostic.
+fn sameName(a: ast.QualName, b: ast.QualName) bool {
+    if (a.parts.len != b.parts.len) return false;
+    for (a.parts, b.parts) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
+
+/// Where a SELECT list already carries the column a sort or `DISTINCT ON` key
+/// names: under the key's own name, under an alias the list gave it, or nowhere.
+/// A qualified key (`b.amt`, a join's right side) matches only the same reference —
+/// an output merely *called* `amt` may be the left side's.
+const KeyHome = union(enum) { as_is, renamed: []const u8, missing };
+
+fn keyHome(items: []const ast.SelectItem, k: ast.QualName) KeyHome {
+    for (items) |it| switch (it) {
+        .field => |f| if (sameName(f, k)) return .as_is,
+        .computed => |c| if (k.parts.len == 1 and std.mem.eql(u8, c.name, k.last())) return .as_is,
+        else => {},
+    };
+    if (k.parts.len == 1) for (items) |it| {
+        if (it == .field and std.mem.eql(u8, it.field.last(), k.last())) return .as_is;
+    };
+    for (items) |it| {
+        if (it == .computed and it.computed.expr.* == .field and sameName(it.computed.expr.field, k)) return .{ .renamed = it.computed.name };
+    }
+    return .missing;
+}
+
+/// The projection that keeps `items`' outputs and nothing a key smuggled in beside
+/// them. A plain column is kept by its own reference, so `b.amt` still finds the
+/// right side's column rather than whatever is called `amt`.
+fn keepOutputs(arena: std.mem.Allocator, items: []const ast.SelectItem) ![]const ast.SelectItem {
+    const outs = try arena.alloc(ast.SelectItem, items.len);
+    for (items, outs) |it, *o| o.* = switch (it) {
+        .computed => |c| blk: {
+            const parts = try arena.alloc([]const u8, 1);
+            parts[0] = c.name;
+            break :blk .{ .field = .{ .parts = parts } };
+        },
+        else => it,
+    };
+    return outs;
+}
+
 fn itemLabel(it: ast.SelectItem) []const u8 {
     return switch (it) {
         .star, .star_except, .star_rename => "*",
@@ -546,6 +602,39 @@ pub const Parser = struct {
             return self.exprToTemplate(e);
         }
         return self.expectIdent();
+    }
+
+    /// `DISTINCT ON` runs over the projection, but its keys are written against the
+    /// input, as in Postgres: `DISTINCT ON (grp) grp AS k` and `DISTINCT ON (grp) id`
+    /// are both legal. A key the list renamed is repointed at its output name, in
+    /// place; one it does not project is carried
+    /// through as a hidden column. Returns the projection that drops those again,
+    /// or null when none was added.
+    fn distinctOnOutputs(self: *Parser, items: *std.array_list.Managed(ast.SelectItem), on: []ast.QualName) Error!?[]const ast.SelectItem {
+        for (items.items) |it| switch (it) {
+            .field, .computed => {},
+            // A `*` already carries every input column under its own name.
+            else => return null,
+        };
+        const visible = items.items.len;
+        for (on) |*k| switch (keyHome(items.items[0..visible], k.*)) {
+            .as_is => {},
+            .renamed => |nm| k.* = try self.singleName(nm),
+            .missing => try items.append(.{ .field = k.* }),
+        };
+        if (items.items.len == visible) return null;
+        return keepOutputs(self.arena, items.items[0..visible]) catch return error.OutOfMemory;
+    }
+
+    /// A column in a name position: a (qualified) name, or `IDENTIFIER(<expr>)`
+    /// for one computed per row.
+    fn parseColRef(self: *Parser) Error!ast.QualName {
+        if (self.isKw("identifier") and self.peekTag() == .lparen) {
+            const parts = try self.arena.alloc([]const u8, 1);
+            parts[0] = try self.parseNameSegment();
+            return .{ .parts = parts };
+        }
+        return self.parseQualNameTok();
     }
 
     /// A write-target atom: a name, a quoted string (interpolated as-is), or
@@ -1078,7 +1167,9 @@ pub const Parser = struct {
             var keys = std.array_list.Managed(ast.SortKey).init(self.arena);
             while (true) {
                 var q: ast.QualName = undefined;
-                if (self.at(.ident) and self.peekTag() == .lparen) {
+                if (self.isKw("identifier") and self.peekTag() == .lparen) {
+                    q = try self.parseColRef();
+                } else if (self.at(.ident) and self.peekTag() == .lparen) {
                     const start = self.i;
                     _ = try self.parseExpr();
                     const parts = try self.arena.alloc([]const u8, 1);
@@ -1101,38 +1192,47 @@ pub const Parser = struct {
             // sort operator. Carry it as a hidden column and drop it after the
             // LIMIT — standard SQL allows ordering by an unselected column, and
             // dropping it last leaves sort+limit adjacent so top-N still fuses.
+            // `DISTINCT ON` may already be carrying hidden keys of its own, dropped by
+            // a projection right after it. That drop moves to the end with this one,
+            // so the sort can still read what the SELECT list left out.
+            var visible: ?[]const ast.SelectItem = null;
+            if (distinctDropTail(stages.items)) visible = stages.pop().?.node.select;
             if (lastSelectIdx(stages.items)) |si| {
                 const proj = stages.items[si].node.select;
                 var wildcard = false;
-                var names = std.array_list.Managed([]const u8).init(self.arena);
+                var have_names = std.array_list.Managed([]const u8).init(self.arena);
                 for (proj) |it| switch (it) {
-                    .field => |f| try names.append(f.last()),
-                    .computed => |c| try names.append(c.name),
+                    .field => |f| try have_names.append(f.last()),
+                    .computed => |c| try have_names.append(c.name),
                     else => wildcard = true,
                 };
                 if (!wildcard) {
                     var extended = std.array_list.Managed(ast.SelectItem).init(self.arena);
                     try extended.appendSlice(proj);
-                    for (sort_keys) |k| {
-                        if (k.field.parts.len != 1) continue;
+                    for (sort_keys) |*k| {
+                        if (k.field.parts.len != 1) {
+                            // `ORDER BY b.amt`: a join's right-side column, which an
+                            // output merely called `amt` does not stand in for.
+                            switch (keyHome(proj, k.field)) {
+                                .as_is => {},
+                                .renamed => |nm| k.field = try self.singleName(nm),
+                                .missing => try extended.append(.{ .field = k.field }),
+                            }
+                            continue;
+                        }
                         var have = false;
-                        for (names.items) |m| {
+                        for (have_names.items) |m| {
                             if (std.mem.eql(u8, m, k.field.last())) have = true;
                         }
                         if (!have) try extended.append(.{ .field = k.field });
                     }
                     if (extended.items.len != proj.len) {
                         stages.items[si].node.select = try extended.toOwnedSlice();
-                        var keep = std.array_list.Managed(ast.SelectItem).init(self.arena);
-                        for (names.items) |m| {
-                            const parts = try self.arena.alloc([]const u8, 1);
-                            parts[0] = m;
-                            try keep.append(.{ .field = .{ .parts = parts } });
-                        }
-                        hidden_drop = try keep.toOwnedSlice();
+                        hidden_drop = keepOutputs(self.arena, visible orelse proj) catch return error.OutOfMemory;
                     }
                 }
             }
+            if (hidden_drop == null) hidden_drop = visible;
             try stages.append(.{ .node = .{ .sort = .{ .keys = sort_keys } }, .hints = &.{}, .pos = self.curPos() });
         }
 
@@ -1155,9 +1255,23 @@ pub const Parser = struct {
 
     /// Index of the projection a sort would read through, if the pipeline ends
     /// in one.
+    /// A `DISTINCT ON` between the projection and the sort is looked through: it
+    /// keeps whole rows, so a hidden sort key rides along. A plain `DISTINCT` is
+    /// not — an extra column there would change which rows are duplicates.
     fn lastSelectIdx(stages: []const ast.Stage) ?usize {
         if (stages.len == 0) return null;
-        return if (stages[stages.len - 1].node == .select) stages.len - 1 else null;
+        const n = stages.len;
+        if (stages[n - 1].node == .select) return n - 1;
+        if (n >= 2 and stages[n - 1].node == .distinct and stages[n - 1].node.distinct.on != null and stages[n - 2].node == .select) return n - 2;
+        return null;
+    }
+
+    /// Does the pipeline end in `select, DISTINCT ON, select` — the shape
+    /// `distinctOnOutputs` leaves when it had to carry a hidden key?
+    fn distinctDropTail(stages: []const ast.Stage) bool {
+        const n = stages.len;
+        return n >= 3 and stages[n - 1].node == .select and stages[n - 2].node == .distinct and
+            stages[n - 2].node.distinct.on != null and stages[n - 3].node == .select;
     }
 
     /// Set when a core is exactly `SELECT ['lit' AS col,] t.* FROM conn.table`
@@ -1190,14 +1304,15 @@ pub const Parser = struct {
         try self.expectKw("select");
 
         var distinct = false;
-        var distinct_on: ?[]const ast.QualName = null;
+        var distinct_on: ?[]ast.QualName = null;
+        var distinct_drop: ?[]const ast.SelectItem = null;
         if (self.eatKw("distinct")) {
             distinct = true;
             if (self.eatKw("on")) {
                 _ = try self.expect(.lparen);
                 var cols = std.array_list.Managed(ast.QualName).init(self.arena);
-                try cols.append(try self.parseQualNameTok());
-                while (self.eat(.comma)) try cols.append(try self.parseQualNameTok());
+                try cols.append(try self.parseColRef());
+                while (self.eat(.comma)) try cols.append(try self.parseColRef());
                 _ = try self.expect(.rparen);
                 distinct_on = try cols.toOwnedSlice();
             }
@@ -1355,7 +1470,7 @@ pub const Parser = struct {
             var jalias: ?[]const u8 = null;
             if (self.at(.ident) and !isReservedAfterSource(self.cur().text)) {
                 jalias = self.advance().text;
-                aliases.add(jalias.?);
+                aliases.addRight(jalias.?);
             }
             var left_keys = std.array_list.Managed(ast.QualName).init(self.arena);
             var right_keys = std.array_list.Managed(ast.QualName).init(self.arena);
@@ -1389,6 +1504,7 @@ pub const Parser = struct {
                 .node = .{ .join = .{
                     .kind = kind,
                     .binding = binding,
+                    .alias = jalias orelse binding,
                     .left_keys = try left_keys.toOwnedSlice(),
                     .right_keys = try right_keys.toOwnedSlice(),
                 } },
@@ -1488,6 +1604,9 @@ pub const Parser = struct {
         // the one case needing a projection after the aggregate stage.
         var post = std.array_list.Managed(ast.SelectItem).init(self.arena);
         var lifted = false;
+        if (distinct_on) |on| for (on) |*k| {
+            k.* = stripQual(k.*, &aliases);
+        };
         for (raw_items.items) |ri| {
             switch (ri) {
                 .qstar => |alias| {
@@ -1647,12 +1766,14 @@ pub const Parser = struct {
         } else if (win_funcs.items.len == 0) {
             const lone_star = items.items.len == 1 and items.items[0] == .star;
             if (!lone_star) {
+                if (distinct_on) |on| distinct_drop = try self.distinctOnOutputs(&items, on);
                 try stages.append(.{ .node = .{ .select = try items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
             }
         }
 
         if (distinct) {
             try stages.append(.{ .node = .{ .distinct = .{ .on = distinct_on } }, .hints = &.{}, .pos = pos });
+            if (distinct_drop) |outs| try stages.append(.{ .node = .{ .select = outs }, .hints = &.{}, .pos = pos });
         }
 
         if (win_funcs.items.len > 0) {
@@ -3187,6 +3308,10 @@ pub const Parser = struct {
                     _ = try self.expect(.rparen);
                     return self.mk(.{ .cast = .{ .e = e, .ty = ty, .safe = safe } });
                 }
+                // `IDENTIFIER(<expr>)` names a column computed per row: a field whose
+                // name is a `${...}` template, rendered before the pipeline is planned.
+                if (eqlNoCase(t.text, "identifier") and self.peekTag() == .lparen)
+                    return self.mk(.{ .field = try self.parseColRef() });
                 if (eqlNoCase(t.text, "if") and self.peekTag() == .lparen) {
                     _ = self.advance();
                     _ = self.advance();
@@ -3315,7 +3440,7 @@ fn stripPrefix(q: ast.QualName, prefix: []const u8) ast.QualName {
 }
 
 fn stripQual(q: ast.QualName, aliases: *const AliasSet) ast.QualName {
-    if (q.parts.len > 1 and aliases.has(q.parts[0]))
+    if (q.parts.len > 1 and aliases.strips(q.parts[0]))
         return .{ .parts = q.parts[1..], .safe = if (q.safe.len > 0) q.safe[1..] else &.{} };
     return q;
 }
@@ -3863,6 +3988,34 @@ test "sql: PUSHDOWN($$literal$$) still lowers to a plain fragment (no hole)" {
     );
     const st = prog.stmts[2].output.stages[0];
     try testing.expectEqualStrings("D_E_L_E_T_ <> '*'", st.hints[0].value.str);
+}
+
+test "sql: IDENTIFIER(expr) in a column position -> a field named by a template" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parseSource(a,
+        \\LOAD INTO '/tmp/o.csv' AS
+        \\SELECT IDENTIFIER($c), COUNT(*) AS n FROM 'in.csv'
+        \\GROUP BY IDENTIFIER($c) ORDER BY IDENTIFIER('k_' || $c) DESC;
+    , &diag);
+    const stages = prog.stmts[prog.stmts.len - 1].output.stages;
+    var saw_agg = false;
+    var saw_sort = false;
+    for (stages) |st| switch (st.node) {
+        .aggregate => |ag| {
+            saw_agg = true;
+            try testing.expectEqualStrings("${c}", ag.by[0].parts[0]);
+        },
+        .sort => |so| {
+            saw_sort = true;
+            try testing.expectEqualStrings("k_${c}", so.keys[0].field.parts[0]);
+            try testing.expect(so.keys[0].desc);
+        },
+        else => {},
+    };
+    try testing.expect(saw_agg and saw_sort);
 }
 
 test "sql: FROM IDENTIFIER(expr) -> a computed path read" {

@@ -19,6 +19,7 @@ const azure = @import("../connect/azure.zig");
 const s3 = @import("../connect/s3.zig");
 const zipsrc = @import("../connect/zipsrc.zig");
 const registry = @import("../connect/registry.zig");
+const body_stmt_rule = @import("env.zig").body_stmt_rule;
 
 pub const Diag = struct {
     buf: [512]u8 = undefined,
@@ -85,15 +86,18 @@ pub const Col = struct {
     name: []const u8,
     ty: types.Type,
     source: union(enum) { passthrough: usize, expr: *const ast.Expr },
+    /// A passed-through column keeps the join side it came from (`Schema.Field`).
+    rel: []const u8 = "",
+    base: []const u8 = "",
 };
 
 pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast.SelectItem, params: *const ParamMap, diag: *Diag) Error![]Col {
     var cols = std.array_list.Managed(Col).init(arena);
     for (items) |item| switch (item) {
-        .star => for (in.fields, 0..) |f, idx| try cols.append(.{ .name = f.name, .ty = f.ty, .source = .{ .passthrough = idx } }),
+        .star => for (in.fields, 0..) |f, idx| try cols.append(.{ .name = f.name, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base }),
         .star_except => |names| for (in.fields, 0..) |f, idx| {
             if (nameIn(names, f.name)) continue;
-            try cols.append(.{ .name = f.name, .ty = f.ty, .source = .{ .passthrough = idx } });
+            try cols.append(.{ .name = f.name, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base });
         },
         .star_rename => |renames| {
             for (renames) |r| if (in.indexOf(r.from) == null)
@@ -103,13 +107,19 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
                 for (in.fields[0..idx]) |g|
                     if (std.mem.eql(u8, nm, renameTo(renames, g.name) orelse g.name))
                         return fail(diag, "`* rename` produces duplicate column `{s}`", .{nm});
-                try cols.append(.{ .name = nm, .ty = f.ty, .source = .{ .passthrough = idx } });
+                try cols.append(.{ .name = nm, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base });
             }
         },
         .field => |q| {
-            const nm = lastPart(q);
-            const idx = in.indexOf(nm) orelse return fail(diag, "unknown field `{s}`", .{nm});
-            try cols.append(.{ .name = nm, .ty = in.fields[idx].ty, .source = .{ .passthrough = idx } });
+            const idx = in.resolve(q.parts) orelse return fail(diag, "unknown field `{s}`", .{lastPart(q)});
+            // `b.x` is called `x` in the output, as SQL has it — unless `a.x` is
+            // already there, when it keeps the name the join gave it.
+            var nm = lastPart(q);
+            for (cols.items) |c| if (std.mem.eql(u8, c.name, nm)) {
+                nm = in.fields[idx].name;
+                break;
+            };
+            try cols.append(.{ .name = nm, .ty = in.fields[idx].ty, .source = .{ .passthrough = idx }, .rel = in.fields[idx].rel, .base = in.fields[idx].base });
         },
         .computed => |c| {
             const e = try substExpr(arena, c.expr, params);
@@ -122,7 +132,7 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
 
 pub fn schemaOfCols(arena: std.mem.Allocator, cols: []const Col) Error!types.Schema {
     const fields = try arena.alloc(types.Schema.Field, cols.len);
-    for (cols, fields) |c, *f| f.* = .{ .name = c.name, .ty = c.ty };
+    for (cols, fields) |c, *f| f.* = .{ .name = c.name, .ty = c.ty, .rel = c.rel, .base = c.base };
     return .{ .fields = fields };
 }
 
@@ -137,7 +147,7 @@ pub fn checkFilter(arena: std.mem.Allocator, in: types.Schema, pred0: *const ast
 /// their column indices.
 pub fn fieldIndices(arena: std.mem.Allocator, in: types.Schema, names: []const ast.QualName, diag: *Diag) Error![]usize {
     const idxs = try arena.alloc(usize, names.len);
-    for (names, 0..) |q, i| idxs[i] = in.indexOf(lastPart(q)) orelse return fail(diag, "unknown field `{s}`", .{lastPart(q)});
+    for (names, 0..) |q, i| idxs[i] = in.resolve(q.parts) orelse return fail(diag, "unknown field `{s}`", .{lastPart(q)});
     return idxs;
 }
 
@@ -148,9 +158,9 @@ pub fn aggregatePlan(arena: std.mem.Allocator, in: types.Schema, ag: ast.Aggrega
     var fields = std.array_list.Managed(types.Schema.Field).init(arena);
     const by = try arena.alloc(usize, ag.by.len);
     for (ag.by, 0..) |q, i| {
-        const idx = in.indexOf(lastPart(q)) orelse return fail(diag, "unknown group field `{s}`", .{lastPart(q)});
+        const idx = in.resolve(q.parts) orelse return fail(diag, "unknown group field `{s}`", .{lastPart(q)});
         by[i] = idx;
-        try fields.append(.{ .name = lastPart(q), .ty = in.fields[idx].ty });
+        try fields.append(.{ .name = lastPart(q), .ty = in.fields[idx].ty, .rel = in.fields[idx].rel, .base = in.fields[idx].base });
     }
     const aggs = try arena.alloc(Agg, ag.aggs.len);
     for (ag.aggs, 0..) |item, i| {
@@ -247,9 +257,10 @@ pub const JoinPlan = struct {
 fn joinPair(left: types.Schema, right: types.Schema, lq: ast.QualName, rq: ast.QualName, diag: *Diag) Error![2]usize {
     const ln = lastPart(lq);
     const rn = lastPart(rq);
-    const l_in_l = left.indexOf(ln);
+    // A left key may be qualified by an earlier join's alias (`b.k = c.k`).
+    const l_in_l = left.resolve(lq.parts);
     const l_in_r = right.indexOf(ln);
-    const r_in_l = left.indexOf(rn);
+    const r_in_l = left.resolve(rq.parts);
     const r_in_r = right.indexOf(rn);
 
     const as_written = l_in_l != null and r_in_r != null;
@@ -289,7 +300,7 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
     const left_nullable = (j.kind == .right or j.kind == .full);
 
     var fields = std.array_list.Managed(types.Schema.Field).init(arena);
-    for (left.fields) |f| try fields.append(.{ .name = f.name, .ty = if (left_nullable) f.ty.asNullable() else f.ty });
+    for (left.fields) |f| try fields.append(.{ .name = f.name, .ty = if (left_nullable) f.ty.asNullable() else f.ty, .rel = f.rel, .base = f.base });
     if (emit_right) for (right.fields) |f| {
         // The `_r` suffix can collide in turn — a left column literally named
         // `x_r` beside a right `x`, or two right columns that disambiguate onto
@@ -303,7 +314,12 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
             else
                 try std.fmt.allocPrint(arena, "{s}_r{d}", .{ f.name, n + 1 });
         }
-        try fields.append(.{ .name = name, .ty = if (right_nullable) f.ty.asNullable() else f.ty });
+        try fields.append(.{
+            .name = name,
+            .ty = if (right_nullable) f.ty.asNullable() else f.ty,
+            .rel = if (j.alias.len != 0) j.alias else j.binding,
+            .base = f.name,
+        });
     };
     return .{
         .lks = lks,
@@ -410,27 +426,6 @@ pub const Plan = struct {
     outputs: []const Output,
 };
 
-/// Collect every output pipeline reachable in a statement block (a `for` or
-/// `match` arm body), descending through nested `for`/`match` so all branches
-/// are type-checked offline.
-fn collectStmtOutputs(outputs: *std.array_list.Managed(ast.Pipeline), stmts: []const ast.Stmt) error{OutOfMemory}!void {
-    for (stmts) |st| switch (st) {
-        .output => |p| try outputs.append(p),
-        // An EXPLAIN'd query is checked like any other: a plan-time error in it must
-        // fail `check` and `run` whether or not its rows are ever asked for.
-        .explain => |e| try outputs.append(e.pipeline),
-        .for_each => |fe| try collectStmtOutputs(outputs, fe.body),
-        .match => |m| for (m.arms) |arm| try collectStmtOutputs(outputs, arm.body),
-        // A statement function's block is checked where it is *declared*, not per
-        // `CALL`: the pipelines are the same either way, and their `${param}`
-        // placeholders are only resolvable at run time — exactly the deal a `for`
-        // body already gets. So the declaration is descended into and `CALL` (whose
-        // name/arity/types expansion has already validated) is a no-op here.
-        .func => |fd| if (fd.body == .stmts) try collectStmtOutputs(outputs, fd.body.stmts),
-        else => {},
-    };
-}
-
 /// Decide one top-level `THROW` against the folded PARAM/LET values: substitute the
 /// bindings into both operands and const-fold them. Only a literal `true` fires (a
 /// null condition is not a failure, as in SQL), and when it does the script's own
@@ -480,18 +475,8 @@ pub fn analyzeWith(arena: std.mem.Allocator, raw_program: ast.Program, cli: []co
 
     var bindings = std.StringHashMap(ast.Pipeline).init(arena);
     var connections = std.StringHashMap(ast.Connection).init(arena);
-    var outputs = std.array_list.Managed(ast.Pipeline).init(arena);
-    for (program.stmts[1..]) |s| switch (s) {
-        .binding => |b| try bindings.put(b.name, b.pipeline),
-        .connection => |c| try connections.put(c.name, c),
-        .output => |p| try outputs.append(p),
-        .explain => |e| try outputs.append(e.pipeline),
-        .for_each => |fe| try collectStmtOutputs(&outputs, fe.body),
-        .match => |m| for (m.arms) |arm| try collectStmtOutputs(&outputs, arm.body),
-        .func => |fd| if (fd.body == .stmts) try collectStmtOutputs(&outputs, fd.body.stmts),
-        .param, .kind, .call, .let_const, .throw, .print => {},
-    };
-    if (outputs.items.len == 0)
+    for (program.stmts[1..]) |s| if (s == .connection) try connections.put(s.connection.name, s.connection);
+    if (countOutputs(program.stmts[1..]) == 0)
         return fail(diag, "no output pipeline (a pipeline ending in `write`)", .{});
 
     var params_map = ParamMap.init(arena);
@@ -534,9 +519,100 @@ pub fn analyzeWith(arena: std.mem.Allocator, raw_program: ast.Program, cli: []co
     var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .diag = diag };
 
     var out_plans = std.array_list.Managed(Output).init(arena);
-    for (outputs.items) |pipe| try out_plans.append(try ctx.analyzeOutput(pipe));
+    try ctx.checkStmts(program.stmts[1..], &out_plans, true);
 
     return .{ .kind = kind_name, .outputs = try out_plans.toOwnedSlice() };
+}
+
+/// Does a stage name a column through a `${...}` template — `IDENTIFIER(<expr>)`,
+/// which the parser lowers to a field whose name is the template?
+fn hasDynamicName(node: ast.Stage.Node) bool {
+    return switch (node) {
+        .filter => |e| exprHasDynamicName(e),
+        .select => |items| for (items) |it| {
+            if (switch (it) {
+                .field => |q| isDynamicName(q),
+                .computed => |c| exprHasDynamicName(c.expr),
+                else => false,
+            }) break true;
+        } else false,
+        .distinct => |d| if (d.on) |on| anyDynamicName(on) else false,
+        .sort => |st| for (st.keys) |k| {
+            if (isDynamicName(k.field)) break true;
+        } else false,
+        .aggregate => |ag| anyDynamicName(ag.by) or for (ag.aggs) |a| {
+            if (a.arg) |e| if (exprHasDynamicName(e)) break true;
+        } else false,
+        else => false,
+    };
+}
+
+fn anyDynamicName(names: []const ast.QualName) bool {
+    for (names) |q| if (isDynamicName(q)) return true;
+    return false;
+}
+
+fn exprHasDynamicName(e: *const ast.Expr) bool {
+    return switch (e.*) {
+        .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit => false,
+        .field => |q| isDynamicName(q),
+        .unary => |u| exprHasDynamicName(u.e),
+        .binary => |b| exprHasDynamicName(b.l) or exprHasDynamicName(b.r),
+        .cond => |c| exprHasDynamicName(c.cond) or exprHasDynamicName(c.then) or exprHasDynamicName(c.els),
+        .cast => |c| exprHasDynamicName(c.e),
+        .is_null => |n| exprHasDynamicName(n.e),
+        .let_in => |l| exprHasDynamicName(l.value) or exprHasDynamicName(l.body),
+        .call => |c| for (c.args) |a| {
+            if (exprHasDynamicName(a)) break true;
+        } else false,
+        .match => |m| blk: {
+            if (m.subject) |sub| if (exprHasDynamicName(sub)) break :blk true;
+            for (m.arms) |arm| {
+                for (arm.pats) |p| if (exprHasDynamicName(p)) break :blk true;
+                if (arm.guard) |g| if (exprHasDynamicName(g)) break :blk true;
+                if (exprHasDynamicName(arm.value)) break :blk true;
+            }
+            break :blk false;
+        },
+    };
+}
+
+pub fn isDynamicName(q: ast.QualName) bool {
+    return std.mem.indexOf(u8, lastPart(q), "${") != null;
+}
+
+fn countOutputs(stmts: []const ast.Stmt) usize {
+    var n: usize = 0;
+    for (stmts) |s| n += switch (s) {
+        .output, .explain => 1,
+        .for_each => |fe| countOutputs(fe.body),
+        .match => |m| blk: {
+            var k: usize = 0;
+            for (m.arms) |arm| k += countOutputs(arm.body);
+            break :blk k;
+        },
+        .func => |fd| if (fd.body == .stmts) countOutputs(fd.body.stmts) else 0,
+        else => 0,
+    };
+    return n;
+}
+
+fn stmtPos(s: ast.Stmt) ?ast.Pos {
+    return switch (s) {
+        .kind => |k| k.pos,
+        .param => |p| p.pos,
+        .connection => |c| c.pos,
+        .binding => |b| b.pos,
+        .output => |p| p.pos,
+        .for_each => |fe| fe.pos,
+        .match => |m| m.pos,
+        .func => |fd| fd.pos,
+        .let_const => |l| l.pos,
+        .print => |p| p.pos,
+        .call => |c| c.pos,
+        .throw => |t| t.pos,
+        .explain => |e| e.pos,
+    };
 }
 
 /// Analyze a single pipeline against declarations already in scope — what the
@@ -564,6 +640,55 @@ const Ctx = struct {
     connections: *std.StringHashMap(ast.Connection),
     params: *const ParamMap,
     diag: *Diag,
+
+    /// The statements in the order the executor runs them: a `WITH` is visible to
+    /// what follows it, a body's `WITH` is scoped to that body, and the one rule
+    /// `runForStmt` applies per row is applied here once, with a position — so
+    /// `check` and `run` name the same constraint.
+    fn checkStmts(self: *Ctx, stmts: []const ast.Stmt, outs: *std.array_list.Managed(Output), top: bool) Error!void {
+        for (stmts) |s| switch (s) {
+            .binding => |b| try self.bindings.put(b.name, b.pipeline),
+            .output => |p| try outs.append(try self.analyzeOutput(p)),
+            .explain => |e| try outs.append(try self.analyzeOutput(e.pipeline)),
+            .for_each => |fe| try self.checkBody(fe.body, outs),
+            .match => |m| for (m.arms) |arm| try self.checkStmts(arm.body, outs, false),
+            .func => |fd| if (fd.body == .stmts) try self.checkBody(fd.body.stmts, outs),
+            .let_const => |l| if (!top) return self.failAt(l.pos, "LET `{s}` must be declared at the top level of the script", .{l.name}),
+            .param, .kind, .connection, .call, .throw, .print => {},
+        };
+    }
+
+    fn checkBody(self: *Ctx, stmts: []const ast.Stmt, outs: *std.array_list.Managed(Output)) Error!void {
+        const Saved = struct { name: []const u8, prev: ?ast.Pipeline };
+        var saved = std.array_list.Managed(Saved).init(self.arena);
+        defer {
+            var i = saved.items.len;
+            while (i > 0) {
+                i -= 1;
+                const sv = saved.items[i];
+                if (sv.prev) |p| self.bindings.put(sv.name, p) catch {} else _ = self.bindings.remove(sv.name);
+            }
+        }
+        for (stmts) |s| switch (s) {
+            .binding => |b| {
+                try saved.append(.{ .name = b.name, .prev = self.bindings.get(b.name) });
+                try self.bindings.put(b.name, b.pipeline);
+            },
+            .output => |p| try outs.append(try self.analyzeOutput(p)),
+            .explain => |e| try outs.append(try self.analyzeOutput(e.pipeline)),
+            .for_each => |fe| try self.checkBody(fe.body, outs),
+            .match => |m| for (m.arms) |arm| try self.checkBody(arm.body, outs),
+            .call, .throw, .print => {},
+            .let_const => |l| return self.failAt(l.pos, "LET `{s}` must be declared at the top level of the script", .{l.name}),
+            .param, .kind, .connection, .func => return self.failAt(stmtPos(s).?, "{s}", .{body_stmt_rule}),
+        };
+    }
+
+    fn failAt(self: *Ctx, pos: ast.Pos, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
+        const e = fail(self.diag, fmt, args);
+        self.diag.stamp(pos);
+        return e;
+    }
 
     fn analyzeOutput(self: *Ctx, pipe: ast.Pipeline) !Output {
         errdefer self.diag.stamp(pipe.pos);
@@ -634,7 +759,7 @@ const Ctx = struct {
             return e;
         };
 
-        const src_is_sql = isSqlConnector(source.connector);
+        const src_is_sql = isSqlSource(source.connector);
         const sink_is_parallel = isSqlConnector(sink.connector) or std.mem.eql(u8, sink.connector, "starrocks");
         // Not `map_only`: that gate said `serial` for every aggregate over a
         // splittable table, while `runParallelSqlAgg` fans exactly that shape into
@@ -745,6 +870,10 @@ const Ctx = struct {
     /// Returns null where the flow becomes unresolvable — a source only a
     /// connection can describe, or a join whose right side is one.
     fn propagate(self: *Ctx, in: types.Schema, node: ast.Stage.Node) Error!?types.Schema {
+        // A name computed per row (`IDENTIFIER(...)` in a SELECT list, GROUP BY,
+        // ORDER BY or DISTINCT ON) has no column to type until the row renders it;
+        // from here on the schema is unresolved, as it is behind a live source.
+        if (hasDynamicName(node)) return null;
         switch (node) {
             .filter => |p| {
                 _ = try checkFilter(self.arena, in, p, self.params, self.diag);
@@ -937,10 +1066,14 @@ fn isSqlConnector(connector: []const u8) bool {
     return registry.SqlKind.parse(connector) != null;
 }
 
+fn isSqlSource(connector: []const u8) bool {
+    return dialectOf(connector) != null;
+}
+
 /// The pushdown dialect for a connector, or null if it's not a SQL source.
 fn dialectOf(connector: []const u8) ?Dialect {
-    const k = registry.SqlKind.parse(connector) orelse return null;
-    return k.dialect();
+    const c = registry.Connector.parse(connector) orelse return null;
+    return (c.sqlRead() orelse return null).dialect;
 }
 
 /// AND a raw `PUSHDOWN`/@[where] fragment with the translated implicit

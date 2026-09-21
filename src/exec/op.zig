@@ -2057,7 +2057,7 @@ pub const Aggregate = struct {
         // the accumulator directly — a text column under a numeric aggregate
         // still has to go through the coercing path.
         if (e.* == .field) {
-            if (b.schema.indexOf(e.field.last())) |ci| {
+            if (b.schema.resolve(e.field.parts)) |ci| {
                 const ck = b.columns[ci].ty.kind;
                 const ak = agg.ty.kind;
                 if (ck == ak or (ck.isNumeric() and ak.isNumeric())) return b.columns[ci];

@@ -2889,6 +2889,9 @@ pub fn formatDecimal(arena: std.mem.Allocator, unscaled: i128, scale: u8) ![]con
 threadlocal var field_memo: [8]usize = @splat(0);
 
 fn fieldIndex(schema: types.Schema, q: ast.QualName) ?usize {
+    // A qualifier survives parsing only when it names a join's right side, where
+    // it decides between `x` and the renamed `x_r`; the memo below is by name alone.
+    if (q.parts.len > 1) return schema.resolve(q.parts);
     const name = lastPart(q);
     if (name.len == 0) return schema.indexOf(name);
     // Length and first byte alone are not enough to spread real column names:

@@ -136,6 +136,14 @@ Connector types and their options are unchanged from BSL: `sqlserver`
 `mysql`, `postgres`, `starrocks` (`fe_host fe_port be_url database buckets
 replication_num auto_create label_prefix ...`), `http`.
 
+A `starrocks` connection is both ends: `LOAD INTO sr.t` writes by stream load
+(`be_url`), and `FROM sr.db.t` / `sr.QUERY($$...$$)` reads through the FE's
+MySQL protocol (`fe_host`/`host`, `fe_port`/`port`, default 9030) with the same
+`user`/`password` — no second `mysql` connection pointed at the FE is needed.
+Reads get everything a SQL source gets: `WHERE` and whole-aggregate pushdown in
+the StarRocks dialect, key-range splits under `-j`, and `FOR EACH ROW OF
+(sr.QUERY(...))` discovery.
+
 **Named SQL Server instances:** write `host = '10.110.2.5\WMS'`. When a `host`
 carries a `\INSTANCE` and no explicit `port` is given, basalt resolves the
 instance's TCP port via the SQL Server Browser (UDP 1434) before connecting.
@@ -304,6 +312,11 @@ Source clauses, in any order after the source:
   collation-dependent string extremes deliberately stay engine-side — the
   result must be bit-identical, not merely close). `HAVING`/sort/limit still
   run in the engine on the tiny grouped result.
+  When an aggregate over a SQL source does *not* descend, every matching row
+  is streamed to the engine to be grouped — the run log says so in a `warn`
+  line that names the rule that refused it (`the WHERE predicate does not
+  translate whole to mysql SQL`, ``group key `x` is renamed by the
+  aggregate``, …).
 - **`PAGINATE BY page|offset|cursor (param = 'page', size = 100,
   total = 'count', field = 'next', start = 2, max = 50)`** — REST pagination.
   Friendly keys map to the engine hints (`param`→`page_param`/`cursor_param`,
@@ -399,7 +412,7 @@ WHERE downloads > 0;
 | `HAVING <expr>` | filter after the aggregate; aggregate calls in it refer to the columns it produced, including ones the `SELECT` list never asked for |
 | `ORDER BY a DESC, b` | sort |
 | `LIMIT n [OFFSET m]` | limit |
-| `SELECT DISTINCT` / `DISTINCT ON (a, b)` | distinct |
+| `SELECT DISTINCT` / `DISTINCT ON (a, b)` | distinct — `ON` keys are input columns: they need not be in the SELECT list, and may be ones it renames (`DISTINCT ON (grp) grp AS k`) |
 | `CROSS JOIN UNNEST(SPLIT(tags, ',')) AS tag` | explode (also `UNNEST(col)`) |
 | `[INNER\|LEFT\|RIGHT\|FULL\|CROSS\|SEMI\|ANTI] JOIN <cte> x ON a = b [AND c = d ...]` | join (right side must be a CTE) |
 
@@ -414,7 +427,11 @@ once, the left side streams through. Keys are plain columns (compute
 expressions in the CTE or a select first), `AND`-combined for composite keys;
 pairs may be written in either order, and a null key never matches. `CROSS
 JOIN <cte>` takes no `ON`. Right-side columns that collide with a left name
-come back suffixed `_r`, and `_r2`, `_r3`, … if that name is taken too. A pipeline shaped `read | filters | join | filters |
+come back suffixed `_r`, and `_r2`, `_r3`, … if that name is taken too — that is
+the name `SELECT *` shows. A qualified reference needs no suffix: with `FROM t a
+JOIN r b`, `b.amt` is the right side's `amt` everywhere in the query (`SELECT`,
+`WHERE`, `GROUP BY`, `ORDER BY`, a later join's `ON`), and `SELECT b.amt` calls
+its output `amt` unless `a.amt` is already in the list. A pipeline shaped `read | filters | join | filters |
 write` probes in parallel under `-j` — over local CSV/Parquet morsels, and
 over key-range splits for a splittable SQL source. Since 0.5.8 a chain of joins
 followed by `GROUP BY` fans out the same way (`read | filters | join+ | filters |
@@ -682,6 +699,19 @@ END FOR;
   once at plan time; first N columns → N loop vars positionally), or a JSON
   param path (`$tables`, `$job.tables`, …; object fields bound to the loop
   vars by name, a missing field ⇒ `""`).
+- The body holds queries (`LOAD INTO` / `SELECT`, each with its own `WITH`),
+  nested `FOR EACH ROW OF`, the `CASE` statement, `CALL`, `PRINT`, `EXPLAIN`
+  and `THROW`. Declarations — `PARAM`, `LET`, `CREATE CONNECTION`, `CREATE
+  FUNCTION` — belong at the top level; `check` and `run` refuse one in a body
+  with the same message.
+- Loops nest. The inner loop's discovery source is rendered with the outer
+  row (`FOR EACH ROW OF (erp.QUERY($$SELECT ... WHERE t = '${name}'$$))`), and
+  the inner body sees both rows' variables, the innermost winning a shared
+  name. Each `PARALLEL` loop fans out over its own rows.
+- A `WITH` inside a body is rendered per row like the query that reads it,
+  and is scoped to the body: after the loop the name means whatever it meant
+  before. At the top level a `WITH` is visible from its statement onwards, so
+  two statements may reuse a CTE name and each reads its own.
 - Loop variables may be typed: `AS (name, port:INT)`.
 - A loop variable is also an ordinary expression **value**: `SELECT $name AS
   empresa`, `WHERE $port > 1000` (typed vars compare as their declared type).
@@ -710,7 +740,15 @@ or object reference (the precedent is Snowflake / Databricks `IDENTIFIER`).
 | a per-row sink file | `LOAD INTO IDENTIFIER('dir/' \|\| $name \|\| '.csv')` (extension literal, as above — it picks the writer) |
 | a raw predicate value | `PUSHDOWN($where)` |
 | a conditional key | `UPSERT ON (IDENTIFIER(if($pk = '', $name \|\| 'id', $pk)))` |
+| a per-row column *name* | `SELECT IDENTIFIER($col), COUNT(*) ... GROUP BY IDENTIFIER($col) ORDER BY IDENTIFIER($col)` |
 | a per-row column value | `SELECT $name AS empresa` — a plain expression, no quoting |
+
+In an expression or a name position (`SELECT` list, `WHERE`, `GROUP BY`,
+`ORDER BY`, `DISTINCT ON`) `IDENTIFIER(<string-expr>)` is a **column** whose
+name is computed per row — or once, from a `PARAM`, outside any loop. The
+column is only known when the row renders it, so `check` validates the stages
+before the first dynamic name and leaves the rest to `run`, which reports an
+unknown column per row (``for-each row c=nope: unknown field `nope```).
 
 `IDENTIFIER($name)` resolves to a **table** read, so bare `UPSERT` still infers
 the PK from source metadata — a raw `QUERY(...)` read cannot. This is why the

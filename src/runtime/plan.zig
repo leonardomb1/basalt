@@ -237,8 +237,9 @@ fn collectBounds(e: *const ast.Expr, out: *std.array_list.Managed(pqdecode.Bound
         return;
     }
     // only `field <op> literal` in that order; the mirrored form is left alone
+    // A qualified name is a join's right-side column, never the scanned file's.
     const name = switch (b.l.*) {
-        .field => |q| q.parts[q.parts.len - 1],
+        .field => |q| if (q.parts.len == 1) q.parts[0] else return,
         else => return,
     };
     const v: Value = switch (b.r.*) {
@@ -380,7 +381,7 @@ fn buildTopN(env: *Env, s: ast.Sort, lim: ast.Limit, child: op.Op, schema: types
     // Push the running K-th-best bound into a single parquet source so it can
     // skip row groups its statistics rule out. Requires exactly one parquet
     // reader and one sort key, so the bound is unambiguous.
-    if (env.pq_readers == 1 and s.keys.len == 1) {
+    if (env.pq_readers == 1 and s.keys.len == 1 and s.keys[0].field.parts.len == 1) {
         if (env.pq_reader) |pr| {
             const t = try arena.create(Threshold);
             t.* = .{ .column = s.keys[0].field.last(), .desc = s.keys[0].desc };

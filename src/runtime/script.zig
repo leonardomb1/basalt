@@ -22,7 +22,6 @@ const Env = @import("env.zig").Env;
 const forHintIdent = @import("env.zig").forHintIdent;
 const isTransient = @import("env.zig").isTransient;
 const LoopRow = @import("env.zig").LoopRow;
-const loopValue = @import("env.zig").loopValue;
 const mk = @import("env.zig").mk;
 const mkLit = @import("env.zig").mkLit;
 const no_loop_vars = @import("env.zig").no_loop_vars;
@@ -195,7 +194,12 @@ fn evalInterpExpr(arena: std.mem.Allocator, text: []const u8, lr: LoopRow) ![]co
     return eval.valueToString(arena, result);
 }
 
+/// Render a name whose parts may be `${...}` templates — a computed table, or a
+/// column named by `IDENTIFIER(<expr>)`. A literal name is returned as is.
 fn renderQual(arena: std.mem.Allocator, q: ast.QualName, lr: LoopRow) !ast.QualName {
+    for (q.parts) |p| {
+        if (std.mem.indexOf(u8, p, "${") != null) break;
+    } else return q;
     const parts = try arena.alloc([]const u8, q.parts.len);
     for (q.parts, parts) |s, *dst| dst.* = try interpAll(arena, s, lr);
     return .{ .parts = parts, .safe = q.safe };
@@ -217,6 +221,19 @@ fn renderRead(arena: std.mem.Allocator, rd: ast.Read, lr: LoopRow) !ast.Read {
             .dir = try interpAll(arena, b.dir, lr),
         } },
     }, .where = try interpAll(arena, rd.where, lr) };
+}
+
+/// A nested `FOR EACH`'s discovery source rendered with the enclosing row, so a
+/// loop inside a loop (or inside a `CALL`ed statement function) can discover from
+/// `IDENTIFIER($outer)`. The body is left as is: it renders per inner row.
+pub fn renderForSource(arena: std.mem.Allocator, fe: ast.ForEach, lr: LoopRow) anyerror!ast.ForEach {
+    var out = fe;
+    out.source = switch (fe.source) {
+        .read => |rd| .{ .read = try renderRead(arena, rd, lr) },
+        .pipeline => |p| .{ .pipeline = try renderPipeline(arena, p, lr) },
+        .json_path => |p| .{ .json_path = p },
+    };
+    return out;
 }
 
 /// Interpolate `${var}` into a union stage: the discovered form's discovery query
@@ -299,7 +316,15 @@ pub fn renderPipeline(arena: std.mem.Allocator, body: ast.Pipeline, lr: LoopRow)
             .aggregate => |ag| {
                 const aggs = try arena.alloc(ast.AggItem, ag.aggs.len);
                 for (ag.aggs, 0..) |a, i| aggs[i] = .{ .name = a.name, .func = a.func, .arg = if (a.arg) |e| try renderExpr(arena, e, lr) else null, .distinct = a.distinct };
-                dst.node = .{ .aggregate = .{ .aggs = aggs, .by = ag.by } };
+                dst.node = .{ .aggregate = .{ .aggs = aggs, .by = try renderQuals(arena, ag.by, lr) } };
+            },
+            .distinct => |d| if (d.on) |on| {
+                dst.node = .{ .distinct = .{ .on = try renderQuals(arena, on, lr) } };
+            },
+            .sort => |st| {
+                const keys = try arena.alloc(ast.SortKey, st.keys.len);
+                for (st.keys, keys) |k, *o| o.* = .{ .field = try renderQual(arena, k.field, lr), .desc = k.desc };
+                dst.node = .{ .sort = .{ .keys = keys } };
             },
             else => {},
         }
@@ -324,17 +349,24 @@ fn renderExpr(arena: std.mem.Allocator, e: *const ast.Expr, lr: LoopRow) anyerro
     // Multi-part paths (`$job.x`) belong to expand.zig and are left alone.
     if (e.* == .field) {
         if (e.field.single()) |nm| {
-            for (lr.names, lr.cells, 0..) |n, cell, i| {
-                if (std.mem.eql(u8, n, nm)) return mkLit(arena, loopValue(arena, cell, lr.typeAt(i)));
-            }
+            if (lr.loopVar(arena, nm)) |v| return mkLit(arena, v);
         }
+        const q = try renderQual(arena, e.field, lr);
+        if (q.parts.ptr != e.field.parts.ptr) return mk(arena, .{ .field = q });
     }
     return ast.rebuildExpr(arena, e, RenderCtx{ .arena = arena, .lr = lr }, renderRecur);
+}
+
+fn renderQuals(arena: std.mem.Allocator, qs: []const ast.QualName, lr: LoopRow) ![]const ast.QualName {
+    const out = try arena.alloc(ast.QualName, qs.len);
+    for (qs, out) |q, *o| o.* = try renderQual(arena, q, lr);
+    return out;
 }
 
 fn renderSelect(arena: std.mem.Allocator, items: []const ast.SelectItem, lr: LoopRow) ![]const ast.SelectItem {
     const out = try arena.alloc(ast.SelectItem, items.len);
     for (items, 0..) |it, i| out[i] = switch (it) {
+        .field => |q| .{ .field = try renderQual(arena, q, lr) },
         .computed => |c| .{ .computed = .{
             .name = try interpAll(arena, c.name, lr),
             .expr = try renderExpr(arena, c.expr, lr),
@@ -356,6 +388,8 @@ const ForCtx = struct {
     worker_opts: RunOptions,
     on_error: OnError,
     outcomes: ?*OutcomeSink = null,
+    /// The enclosing scope every row chains to: script scope, or the outer loop's row.
+    outer: *const LoopRow,
     next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -414,9 +448,16 @@ fn forWorker(ctx: *ForCtx, _: usize) void {
         w_env.sources = &w_sources;
         w_env.diag = &w_diag;
         w_env.errctx = &w_errctx;
+        // The bindings map is a pointer in the copy; a body's per-row `WITH` would
+        // otherwise be written by every worker at once, so each gets its own.
+        var w_bindings = ctx.base.bindings.cloneWithAllocator(w_arena.allocator()) catch {
+            forRecordFail(ctx, row[0], rowLabel(w_arena.allocator(), ctx.needles, row), "OutOfMemory", false);
+            break;
+        };
+        w_env.bindings = &w_bindings;
         var st = Stats{ .run_id = 0 };
         var lanes: usize = 1;
-        const lr = LoopRow{ .names = ctx.needles, .types = ctx.fe.var_types, .cells = row, .outer = &w_env.script_scope };
+        const lr = LoopRow{ .names = ctx.needles, .types = ctx.fe.var_types, .cells = row, .outer = ctx.outer };
         if (ctx.body(&w_env, ctx.fe.body, lr, ctx.worker_opts, &st, &lanes, &w_batch)) |_| {
             _ = ctx.rows_out.fetchAdd(st.rows_out, .monotonic);
             if (ctx.outcomes) |sink| sink.record(row[0], true, "", false);
@@ -456,7 +497,7 @@ pub fn buildScriptScope(arena: std.mem.Allocator, params: *std.StringHashMap(Val
         cells[i] = try eval.valueToString(arena, kv.value_ptr.*);
         i += 1;
     }
-    return .{ .names = names, .cells = cells };
+    return .{ .names = names, .cells = cells, .script = true };
 }
 
 /// Interpolate a statement's `${...}` holes against script scope alone — what a
@@ -497,10 +538,7 @@ pub fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, sta
     // params, matching `runForMatch`), then the resolved params.
     var names = std.array_list.Managed([]const u8).init(env.arena);
     var values = std.array_list.Managed(Value).init(env.arena);
-    for (outer.names, outer.cells, 0..) |nm, cell, i| {
-        try names.append(nm);
-        try values.append(loopValue(env.arena, cell, outer.typeAt(i)));
-    }
+    try outer.appendLoopVars(env.arena, &names, &values);
     var it = env.params.iterator();
     while (it.next()) |kv| {
         try names.append(kv.key_ptr.*);
@@ -521,7 +559,7 @@ pub fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, sta
     env.log.log(.info, "call {s}: {d} argument(s) [depth {d}]", .{ c.name, cells.len, env.call_depth + 1 });
     env.call_depth += 1;
     defer env.call_depth -= 1;
-    try run_body(env, body, .{ .names = pnames, .types = ptypes, .cells = cells }, opts, stats, lanes_used, batch_arena);
+    try run_body(env, body, .{ .names = pnames, .types = ptypes, .cells = cells, .outer = &env.script_scope }, opts, stats, lanes_used, batch_arena);
 }
 
 /// `THROW 'msg' [WHEN cond];` — the script's own precondition. Both operands fold
@@ -536,10 +574,7 @@ pub fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, sta
 pub fn printText(arena: std.mem.Allocator, e: *const ast.Expr, lr: LoopRow, params: *std.StringHashMap(Value)) ![]const u8 {
     var names = std.array_list.Managed([]const u8).init(arena);
     var values = std.array_list.Managed(Value).init(arena);
-    for (lr.names, lr.cells, 0..) |nm, cell, i| {
-        try names.append(nm);
-        try values.append(loopValue(arena, cell, lr.typeAt(i)));
-    }
+    try lr.appendLoopVars(arena, &names, &values);
     var it = params.iterator();
     while (it.next()) |kv| {
         try names.append(kv.key_ptr.*);
@@ -561,10 +596,7 @@ pub fn runPrint(env: *Env, p: ast.Print, lr: LoopRow) anyerror!void {
 pub fn runThrow(env: *Env, t: ast.Throw, outer: LoopRow) anyerror!void {
     var names = std.array_list.Managed([]const u8).init(env.arena);
     var values = std.array_list.Managed(Value).init(env.arena);
-    for (outer.names, outer.cells, 0..) |nm, cell, i| {
-        try names.append(nm);
-        try values.append(loopValue(env.arena, cell, outer.typeAt(i)));
-    }
+    try outer.appendLoopVars(env.arena, &names, &values);
     var it = env.params.iterator();
     while (it.next()) |kv| {
         try names.append(kv.key_ptr.*);
@@ -584,7 +616,7 @@ pub fn runThrow(env: *Env, t: ast.Throw, outer: LoopRow) anyerror!void {
 
 /// Expand a `for <vars> in <source>` block, running its body once per discovered row.
 /// `mode` (sequential|parallel) and `on_error` (stop|continue) come from `@[...]`.
-pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, run_body: BodyFn) !void {
+pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, run_body: BodyFn, outer: *const LoopRow) !void {
     const mode: ForMode = if (forHintIdent(fe.hints, "mode")) |m|
         (if (std.mem.eql(u8, m, "parallel")) ForMode.parallel else ForMode.sequential)
     else
@@ -614,7 +646,7 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
                 env.diag.retryable = false;
                 env.diag.msg = "";
                 env.diag.pos = null;
-                const lr = LoopRow{ .names = needles, .types = fe.var_types, .cells = row, .outer = &env.script_scope };
+                const lr = LoopRow{ .names = needles, .types = fe.var_types, .cells = row, .outer = outer };
                 if (run_body(env, fe.body, lr, opts, stats, lanes_used, batch_arena)) |_| {
                     for (env.sources.items[base..]) |sc| sc.close();
                     env.sources.shrinkRetainingCapacity(base);
@@ -649,7 +681,7 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
             var wopts = opts;
             wopts.threads = 1;
             const nworkers = @min(@max(opts.threads, @as(usize, 1)), rows.len);
-            var ctx = ForCtx{ .fe = fe, .needles = needles, .rows = rows, .base = env, .body = run_body, .worker_opts = wopts, .on_error = on_error, .outcomes = opts.outcomes };
+            var ctx = ForCtx{ .fe = fe, .needles = needles, .rows = rows, .base = env, .body = run_body, .worker_opts = wopts, .on_error = on_error, .outcomes = opts.outcomes, .outer = outer };
             const lanes = try parallel.spawnJoin(env.arena, nworkers, forWorker, &ctx);
             if (aborting()) return error.Aborted;
             stats.rows_out += ctx.rows_out.load(.monotonic);

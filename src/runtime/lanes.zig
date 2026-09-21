@@ -164,22 +164,31 @@ pub fn classifyWholeAgg(stages: []const ast.Stage) ?AggShape {
 /// tail, then the write — which the caller rebuilds through the ordinary serial path, so
 /// the result's schema, row counting and sink all come from the existing machinery.
 /// Null means "not eligible": the caller keeps the pipeline it already built.
-pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: AggShape, src_base: usize) !?[]const ast.Stage {
+pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: AggShape, src_base: usize, why: *[]const u8) !?[]const ast.Stage {
     const arena = env.arena;
     const desc = env.sql_desc orelse return null;
     if (stages[0].node != .read) return null;
     const rd = stages[0].node.read;
-    if (rd.form != .table and rd.form != .query) return null;
-    for (shape.prefix) |st| if (st.node != .filter) return null;
+    if (rd.form != .table and rd.form != .query) {
+        why.* = "the read is not a table or query";
+        return null;
+    }
+    for (shape.prefix) |st| if (st.node != .filter) {
+        why.* = "a stage other than WHERE sits between the read and the aggregate";
+        return null;
+    };
 
     const src_schema = try dupeSchema(arena, env.sources.items[src_base].schema());
 
     // The engine's own output schema for this aggregate — the types every rendered
     // aggregate is CAST to, and the names the tail and sink already expect.
     var ad = analyze.Diag{};
-    const apl = analyze.aggregatePlan(arena, src_schema, shape.ag, env.params_expr, &ad) catch return null;
+    const apl = analyze.aggregatePlan(arena, src_schema, shape.ag, env.params_expr, &ad) catch {
+        why.* = ad.msg;
+        return null;
+    };
 
-    const wa = (try pushdown.planWholeAgg(arena, desc.dialect, desc.base_sql, src_schema, shape.prefix, shape.ag, apl.schema)) orelse return null;
+    const wa = (try pushdown.planWholeAggWhy(arena, desc.dialect, desc.base_sql, src_schema, shape.prefix, shape.ag, apl.schema, why)) orelse return null;
 
     const out = try arena.alloc(ast.Stage, shape.tail.len + 2);
     // No hints: an `@[where = …]` would be re-applied over the grouped result (whose
@@ -1300,7 +1309,7 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
         var descs = std.array_list.Managed(bool).init(arena);
         var ok = true;
         for (tn.keys) |k| {
-            const idx = out_schema.indexOf(k.field.last()) orelse {
+            const idx = out_schema.resolve(k.field.parts) orelse {
                 ok = false;
                 break;
             };

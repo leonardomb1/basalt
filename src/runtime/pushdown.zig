@@ -123,16 +123,33 @@ pub fn planWholeAgg(
     ag: ast.Aggregate,
     plan_schema: types.Schema,
 ) !?WholeAgg {
-    if (ag.by.len == 0 and ag.aggs.len == 0) return null;
-    if (plan_schema.fields.len != ag.by.len + ag.aggs.len) return null;
+    var why: []const u8 = "";
+    return planWholeAggWhy(arena, dialect, base_sql, src_schema, prefix, ag, plan_schema, &why);
+}
+
+/// `planWholeAgg` that also says, in one line for the run log, which gate refused —
+/// the answer to "why did this COUNT stream the whole table?".
+pub fn planWholeAggWhy(
+    arena: std.mem.Allocator,
+    dialect: Dialect,
+    base_sql: []const u8,
+    src_schema: types.Schema,
+    prefix: []const ast.Stage,
+    ag: ast.Aggregate,
+    plan_schema: types.Schema,
+    why: *[]const u8,
+) !?WholeAgg {
+    if (ag.by.len == 0 and ag.aggs.len == 0) return refuse(why, "nothing to aggregate");
+    if (plan_schema.fields.len != ag.by.len + ag.aggs.len) return refuse(why, "the planned output does not match the aggregate");
 
     // Gate 2: EVERY prefix stage is a filter, and every one translates whole. A
     // partially pushed predicate would be a superset — fine for advisory pushdown,
     // wrong here, because nothing re-applies the missing half.
     var where = std.array_list.Managed(u8).init(arena);
     for (prefix) |st| {
-        if (st.node != .filter) return null;
-        const frag = (try translateExpr(arena, st.node.filter, dialect, src_schema, true)) orelse return null;
+        if (st.node != .filter) return refuse(why, "a stage other than WHERE sits between the read and the aggregate");
+        const frag = (try translateExpr(arena, st.node.filter, dialect, src_schema, true)) orelse
+            return refuse(why, try std.fmt.allocPrint(arena, "the WHERE predicate does not translate whole to {s} SQL", .{@tagName(dialect)}));
         if (where.items.len > 0) try where.appendSlice(" AND ");
         try where.appendSlice(frag);
     }
@@ -141,12 +158,13 @@ pub fn planWholeAgg(
     var sel = std.array_list.Managed(u8).init(arena);
     var keys = std.array_list.Managed(u8).init(arena);
     for (ag.by, 0..) |q, i| {
-        if (q.parts.len != 1) return null;
+        if (q.parts.len != 1) return refuse(why, "a group key is not a bare source column");
         const col = q.parts[0];
-        const idx = src_schema.indexOf(col) orelse return null;
+        const idx = src_schema.indexOf(col) orelse
+            return refuse(why, try std.fmt.allocPrint(arena, "group key `{s}` is not a source column", .{col}));
         const out = plan_schema.fields[i];
-        if (!std.mem.eql(u8, out.name, col)) return null;
-        if (out.ty.kind != src_schema.fields[idx].ty.kind) return null;
+        if (!std.mem.eql(u8, out.name, col)) return refuse(why, try std.fmt.allocPrint(arena, "group key `{s}` is renamed by the aggregate", .{col}));
+        if (out.ty.kind != src_schema.fields[idx].ty.kind) return refuse(why, try std.fmt.allocPrint(arena, "group key `{s}` changes type through the aggregate", .{col}));
         const qc = try split.quoteIdent(arena, dialect, col);
         if (keys.items.len > 0) try keys.appendSlice(", ");
         try keys.appendSlice(qc);
@@ -158,8 +176,10 @@ pub fn planWholeAgg(
     // planned output type, and aliased to the engine's own column name.
     for (ag.aggs, 0..) |item, i| {
         const out = plan_schema.fields[ag.by.len + i];
-        const inner = (try aggExpr(arena, dialect, src_schema, item, out.ty)) orelse return null;
-        const cast_to = (try dialect.castType(arena, out.ty)) orelse return null;
+        const inner = (try aggExpr(arena, dialect, src_schema, item, out.ty)) orelse
+            return refuse(why, try std.fmt.allocPrint(arena, "`{s}` is not pushed down for this argument and result type (see the pushdown rules in language.md)", .{out.name}));
+        const cast_to = (try dialect.castType(arena, out.ty)) orelse
+            return refuse(why, try std.fmt.allocPrint(arena, "{s} has no cast for the result type of `{s}`", .{ @tagName(dialect), out.name }));
         if (sel.items.len > 0) try sel.appendSlice(", ");
         try sel.appendSlice(try std.fmt.allocPrint(arena, "CAST({s} AS {s}) AS {s}", .{
             inner, cast_to, try split.quoteIdent(arena, dialect, out.name),
@@ -176,6 +196,11 @@ pub fn planWholeAgg(
 
     const where_sql: ?[]const u8 = if (where.items.len > 0) where.items else null;
     return WholeAgg{ .sql = try q.toOwnedSlice(), .where_sql = where_sql };
+}
+
+fn refuse(why: *[]const u8, reason: []const u8) ?WholeAgg {
+    why.* = reason;
+    return null;
 }
 
 /// One aggregate's SQL (before the outer result-type CAST), or null when it isn't
@@ -1426,6 +1451,36 @@ test "planWholeAgg: a qualified or unknown group key falls back" {
     try testing.expect((try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = aggs, .by = missing }, ms_schema)) == null);
 }
 
+test "planWholeAggWhy: a refusal names the gate that refused" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const aggs = try a.alloc(ast.AggItem, 1);
+    aggs[0] = .{ .name = "n", .func = .count, .arg = null };
+    const plan_schema = types.Schema{ .fields = &.{
+        .{ .name = "b", .ty = types.Type.init(.string) },
+        .{ .name = "n", .ty = types.Type.init(.int) },
+    } };
+    var why: []const u8 = "";
+
+    const nowc = try a.create(ast.Expr);
+    nowc.* = .{ .call = .{ .name = "now", .args = &.{} } };
+    const bad = ast.Stage{ .node = .{ .filter = try bin(a, .gt, try fld(a, "t"), nowc) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
+    const ag = ast.Aggregate{ .aggs = aggs, .by = try byList(a, &.{"b"}) };
+    try testing.expect((try planWholeAggWhy(a, .mysql, base_t, wholeSchema(), &.{bad}, ag, plan_schema, &why)) == null);
+    try testing.expectEqualStrings("the WHERE predicate does not translate whole to mysql SQL", why);
+
+    const missing = ast.Aggregate{ .aggs = aggs, .by = try byList(a, &.{"zzz"}) };
+    try testing.expect((try planWholeAggWhy(a, .postgres, base_t, wholeSchema(), &.{}, missing, plan_schema, &why)) == null);
+    try testing.expectEqualStrings("group key `zzz` is not a source column", why);
+
+    const avg = try a.alloc(ast.AggItem, 1);
+    avg[0] = .{ .name = "av", .func = .avg, .arg = try fld(a, "a") };
+    const avg_schema = types.Schema{ .fields = &.{.{ .name = "av", .ty = types.Type.init(.float) }} };
+    try testing.expect((try planWholeAggWhy(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = avg, .by = &.{} }, avg_schema, &why)) == null);
+    try testing.expect(std.mem.startsWith(u8, why, "`av` is not pushed down"));
+}
+
 test "planWholeAgg: an untranslatable filter falls back instead of pushing a superset" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -1624,13 +1679,13 @@ fn refsOnlyProbe(
     arena: std.mem.Allocator,
     e: *const ast.Expr,
     right: []const []const u8,
-    binding: []const u8,
+    j: ast.Join,
 ) !bool {
     var list = std.array_list.Managed(ast.QualName).init(arena);
     try collectQuals(arena, e, &list);
     for (list.items) |q| {
-        // `r.name` where `r` is the join's binding is the right side, said outright.
-        if (q.parts.len > 1 and std.mem.eql(u8, q.parts[0], binding)) return false;
+        // `r.name` where `r` is the join's binding or alias is the right side, said outright.
+        if (q.parts.len > 1 and (std.mem.eql(u8, q.parts[0], j.binding) or std.mem.eql(u8, q.parts[0], j.alias))) return false;
         if (isRightName(q.last(), right)) return false;
     }
     return true;
@@ -1741,7 +1796,7 @@ pub fn hoistThroughJoins(
             const j = list.items[i - 1].node.join;
             if (!hoistableKind(j.kind)) continue;
             const right = (try bindingNames(arena, bindings, j.binding)) orelse continue;
-            if (!try refsOnlyProbe(arena, list.items[i].node.filter, right, j.binding)) continue;
+            if (!try refsOnlyProbe(arena, list.items[i].node.filter, right, j)) continue;
             const tmp = list.items[i - 1];
             list.items[i - 1] = list.items[i];
             list.items[i] = tmp;
