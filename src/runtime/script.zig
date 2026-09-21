@@ -390,6 +390,8 @@ const ForCtx = struct {
     outcomes: ?*OutcomeSink = null,
     /// The enclosing scope every row chains to: script scope, or the outer loop's row.
     outer: *const LoopRow,
+    /// This loop is the one the progress line counts (`Progress.loopBegin`).
+    counted: bool = false,
     next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -405,9 +407,9 @@ const ForCtx = struct {
 
 /// `item` is the retry identity recorded in the outcome sink (the first cell);
 /// `label` is the human row identity and `msg` the already-resolved diagnostic.
-fn forRecordFail(ctx: *ForCtx, item: []const u8, label: []const u8, msg: []const u8, retryable: bool) void {
+fn forRecordFail(ctx: *ForCtx, item: []const u8, label: []const u8, msg: []const u8, retryable: bool, shown: bool) void {
     _ = ctx.failures.fetchAdd(1, .monotonic);
-    if (ctx.outcomes) |sink| sink.record(item, false, msg, retryable);
+    if (ctx.outcomes) |sink| sink.recordShown(item, false, msg, retryable, shown);
     ctx.mu.lock();
     defer ctx.mu.unlock();
     if (ctx.first_err_len == 0) {
@@ -451,7 +453,7 @@ fn forWorker(ctx: *ForCtx, _: usize) void {
         // The bindings map is a pointer in the copy; a body's per-row `WITH` would
         // otherwise be written by every worker at once, so each gets its own.
         var w_bindings = ctx.base.bindings.cloneWithAllocator(w_arena.allocator()) catch {
-            forRecordFail(ctx, row[0], rowLabel(w_arena.allocator(), ctx.needles, row), "OutOfMemory", false);
+            forRecordFail(ctx, row[0], rowLabel(w_arena.allocator(), ctx.needles, row), "OutOfMemory", false, false);
             break;
         };
         w_env.bindings = &w_bindings;
@@ -468,11 +470,12 @@ fn forWorker(ctx: *ForCtx, _: usize) void {
             }
             const emsg = if (w_diag.msg.len > 0) w_diag.msg else @errorName(e);
             const label = rowLabel(w_arena.allocator(), ctx.needles, row);
-            if (ctx.on_error == .continue_) w_env.log.log(.err, "for-each row {s}: {s}", .{ label, emsg });
-            forRecordFail(ctx, row[0], label, emsg, isTransient(e) or w_diag.retryable);
+            if (ctx.on_error == .continue_ and !w_env.item_reported) w_env.log.log(.err, "for-each row {s}: {s}", .{ label, emsg });
+            forRecordFail(ctx, row[0], label, emsg, isTransient(e) or w_diag.retryable, w_env.item_reported);
         }
         if (w_env.wrote_sink) ctx.wrote_sink.store(true, .monotonic);
         for (w_sources.items) |sc| sc.close();
+        if (ctx.base.progress) |p| p.loopTick(ctx.counted);
     }
 }
 
@@ -634,13 +637,16 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
     env.log.log(.debug, "for-each {s}: {d} row(s) [{s}, on_error={s}]", .{ fe.var_names[0], rows.len, @tagName(mode), if (on_error == .continue_) "continue" else "stop" });
     if (rows.len == 0) return;
     const needles = fe.var_names;
+    const counted = if (env.progress) |p| p.loopBegin(rows.len) else false;
+    defer if (env.progress) |p| p.loopEnd();
 
     switch (mode) {
         .sequential => {
             var failures: usize = 0;
             var first_err: ?[]const u8 = null;
-            for (rows) |row| {
+            for (rows, 0..) |row, ri| {
                 if (aborting()) return error.Aborted;
+                if (ri > 0) if (env.progress) |p| p.loopTick(counted);
                 const base = env.sources.items.len;
                 // Cleared per row so a failure never reports the previous row's message.
                 env.diag.retryable = false;
@@ -658,10 +664,11 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
                     failures += 1;
                     const emsg = if (env.diag.msg.len > 0) env.diag.msg else @errorName(e);
                     const label = rowLabel(env.arena, needles, row);
-                    if (opts.outcomes) |sink| sink.record(row[0], false, emsg, isTransient(e) or env.diag.retryable);
+                    if (opts.outcomes) |sink| sink.recordShown(row[0], false, emsg, isTransient(e) or env.diag.retryable, env.item_reported);
                     // In stop mode the same text comes back out as the run's error, so
                     // only a loop that carries on logs the row here.
-                    if (on_error == .continue_) env.log.log(.err, "for-each row {s}: {s}", .{ label, emsg });
+                    if (on_error == .continue_ and !env.item_reported) env.log.log(.err, "for-each row {s}: {s}", .{ label, emsg });
+                    env.item_reported = false;
                     if (first_err == null)
                         first_err = std.fmt.allocPrint(env.arena, "row {s}: {s}", .{ label, emsg }) catch null;
                     if (on_error == .stop) {
@@ -681,7 +688,7 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
             var wopts = opts;
             wopts.threads = 1;
             const nworkers = @min(@max(opts.threads, @as(usize, 1)), rows.len);
-            var ctx = ForCtx{ .fe = fe, .needles = needles, .rows = rows, .base = env, .body = run_body, .worker_opts = wopts, .on_error = on_error, .outcomes = opts.outcomes, .outer = outer };
+            var ctx = ForCtx{ .fe = fe, .needles = needles, .rows = rows, .base = env, .body = run_body, .worker_opts = wopts, .on_error = on_error, .outcomes = opts.outcomes, .outer = outer, .counted = counted };
             const lanes = try parallel.spawnJoin(env.arena, nworkers, forWorker, &ctx);
             if (aborting()) return error.Aborted;
             stats.rows_out += ctx.rows_out.load(.monotonic);

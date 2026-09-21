@@ -60,6 +60,15 @@ pub const Logger = struct {
     /// `-q`: silences `PRINT` too, which no log level does.
     quiet: bool = false,
     mutex: std.Thread.Mutex = .{},
+    /// A `Progress` line currently occupies the terminal row. Guarded by `mutex`;
+    /// every writer below erases it first, so a log line never lands mid-line.
+    progress_drawn: bool = false,
+
+    fn eraseProgress(self: *Logger) void {
+        if (!self.progress_drawn) return;
+        self.file.writeAll("\r\x1b[2K") catch {};
+        self.progress_drawn = false;
+    }
 
     pub fn init(run_id: u64, format: Format, min: Level) Logger {
         const file = std.fs.File.stderr();
@@ -87,6 +96,7 @@ pub const Logger = struct {
         } else {
             w.print("{s}\n", .{msg}) catch return;
         }
+        self.eraseProgress();
         self.file.writeAll(w.buffered()) catch return;
     }
 
@@ -103,6 +113,23 @@ pub const Logger = struct {
         } else {
             s.renderText(&w) catch return;
         }
+        self.eraseProgress();
+        self.file.writeAll(w.buffered()) catch return;
+    }
+
+    /// One finished `LOAD` of a run that has several, in the manner of `uv`'s
+    /// ` + package` lines: printed as each completes, above the live progress line.
+    /// Text only when `items` asked for it; under `--log-format json` it is an
+    /// `info`-level `load_complete` / `load_failed` event instead.
+    pub fn item(self: *Logger, it: Item) void {
+        if (self.quiet) return;
+        if (self.json and !self.enabled(.info)) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var lbuf: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&lbuf);
+        if (self.json) it.renderJson(&w, self.run_id) catch return else it.renderText(&w) catch return;
+        self.eraseProgress();
         self.file.writeAll(w.buffered()) catch return;
     }
 
@@ -121,12 +148,282 @@ pub const Logger = struct {
         } else {
             w.print("{s}: {s}\n", .{ level.label(), msg }) catch return;
         }
+        self.eraseProgress();
         self.file.writeAll(w.buffered()) catch return;
     }
 };
 
-/// End-of-run metrics. Rendered as a human block (stderr) or one JSON object
-/// (stdout `--json`).
+/// A live one-line status on stderr while a `LOAD` moves rows, in the manner of
+/// `uv`/`cargo`: a spinner, what is moving where, rows so far, the rate and the
+/// clock — and `[3/12]` in front when a `FOR EACH` is fanning out.
+///
+/// It is a courtesy for a person at a terminal and nothing else: the caller turns
+/// it on only when stderr is a TTY, it never touches stdout, and it shares the
+/// logger's mutex so a log line erases it rather than colliding with it. Nothing
+/// is drawn for the first `quiet_ms`, so a short run never flickers.
+pub const Progress = struct {
+    logger: *Logger,
+    rows: *std.atomic.Value(u64),
+    thread: ?std.Thread = null,
+    stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Below: guarded by `logger.mutex`.
+    active: usize = 0,
+    label_buf: [192]u8 = undefined,
+    label_len: usize = 0,
+    base_rows: u64 = 0,
+    began_ms: i64 = 0,
+    loop_depth: usize = 0,
+    loop_total: usize = 0,
+    loop_done: usize = 0,
+    loop_began_ms: i64 = 0,
+    frame: usize = 0,
+
+    const quiet_ms = 400;
+    const tick_ns = 100 * std.time.ns_per_ms;
+    const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+
+    pub fn start(self: *Progress) void {
+        self.thread = std.Thread.spawn(.{}, ticker, .{self}) catch null;
+    }
+
+    pub fn stop(self: *Progress) void {
+        self.stop_flag.store(true, .release);
+        if (self.thread) |t| t.join();
+        self.thread = null;
+        self.logger.mutex.lock();
+        defer self.logger.mutex.unlock();
+        self.logger.eraseProgress();
+    }
+
+    /// A pipeline started writing `label` (`source → sink`). Calls nest under a
+    /// parallel `FOR EACH`; the line names the most recent one.
+    pub fn begin(self: *Progress, label: []const u8) void {
+        self.logger.mutex.lock();
+        defer self.logger.mutex.unlock();
+        if (self.active == 0) {
+            self.base_rows = self.rows.load(.monotonic);
+            self.began_ms = std.time.milliTimestamp();
+        }
+        self.active += 1;
+        self.label_len = @min(label.len, self.label_buf.len);
+        @memcpy(self.label_buf[0..self.label_len], label[0..self.label_len]);
+    }
+
+    pub fn end(self: *Progress) void {
+        self.logger.mutex.lock();
+        defer self.logger.mutex.unlock();
+        if (self.active > 0) self.active -= 1;
+        // Inside a loop the line stays up between rows: three hundred quick loads
+        // are one long wait, and a line that blinks per table reads as noise.
+        if (self.active == 0 and self.loop_depth == 0) self.logger.eraseProgress();
+    }
+
+    /// A `FOR EACH` over `total` rows began. Only the outermost loop is counted;
+    /// the result says whether this one is it, and is what `loopTick` takes.
+    pub fn loopBegin(self: *Progress, total: usize) bool {
+        self.logger.mutex.lock();
+        defer self.logger.mutex.unlock();
+        self.loop_depth += 1;
+        if (self.loop_depth != 1) return false;
+        self.loop_total = total;
+        self.loop_done = 0;
+        self.loop_began_ms = std.time.milliTimestamp();
+        return true;
+    }
+
+    pub fn loopTick(self: *Progress, counted: bool) void {
+        if (!counted) return;
+        self.logger.mutex.lock();
+        defer self.logger.mutex.unlock();
+        self.loop_done += 1;
+    }
+
+    pub fn loopEnd(self: *Progress) void {
+        self.logger.mutex.lock();
+        defer self.logger.mutex.unlock();
+        if (self.loop_depth > 0) self.loop_depth -= 1;
+        if (self.loop_depth != 0) return;
+        self.loop_total = 0;
+        if (self.active == 0) self.logger.eraseProgress();
+    }
+
+    fn ticker(self: *Progress) void {
+        while (!self.stop_flag.load(.acquire)) {
+            std.Thread.sleep(tick_ns);
+            self.logger.mutex.lock();
+            defer self.logger.mutex.unlock();
+            const looping = self.loop_depth > 0;
+            if (self.active == 0 and !(looping and self.label_len > 0)) continue;
+            const now = std.time.milliTimestamp();
+            // The wait that matters is the whole loop's, not the current row's.
+            if (now - (if (looping) self.loop_began_ms else self.began_ms) < quiet_ms) continue;
+            var buf: [512]u8 = undefined;
+            var w = std.Io.Writer.fixed(&buf);
+            self.frame +%= 1;
+            render(&w, .{
+                .spinner = frames[self.frame % frames.len],
+                .label = self.label_buf[0..self.label_len],
+                .rows = self.rows.load(.monotonic) -| self.base_rows,
+                .elapsed_ms = @intCast(now - self.began_ms),
+                .clock_ms = @intCast(now - (if (looping) self.loop_began_ms else self.began_ms)),
+                .loop_done = self.loop_done,
+                .loop_total = self.loop_total,
+                .width = termWidth(self.logger.file),
+            }) catch continue;
+            self.logger.file.writeAll("\r\x1b[2K") catch continue;
+            self.logger.file.writeAll(w.buffered()) catch continue;
+            self.logger.progress_drawn = true;
+        }
+    }
+
+    pub const Line = struct {
+        spinner: []const u8,
+        label: []const u8,
+        rows: u64,
+        /// How long this statement has run — what the rate is over.
+        elapsed_ms: u64,
+        /// What the clock shows: the statement's time, or the whole loop's inside a
+        /// `FOR EACH`, where the per-row time keeps snapping back to zero.
+        clock_ms: ?u64 = null,
+        loop_done: usize = 0,
+        loop_total: usize = 0,
+        width: usize = 80,
+    };
+
+    /// One progress line, no newline, never wider than `width` columns — a wrapped
+    /// line cannot be erased with a carriage return. The label gives way first.
+    pub fn render(w: *std.Io.Writer, l: Line) !void {
+        var tail_buf: [96]u8 = undefined;
+        var tw = std.Io.Writer.fixed(&tail_buf);
+        try tw.writeAll("  ");
+        try writeThousands(&tw, l.rows);
+        try tw.writeAll(" rows  ");
+        try writeRate(&tw, if (l.elapsed_ms == 0) l.rows else l.rows * 1000 / l.elapsed_ms);
+        const secs = (l.clock_ms orelse l.elapsed_ms) / 1000;
+        try tw.print(" rows/s  {d}:{d:0>2}", .{ secs / 60, secs % 60 });
+        const tail = tw.buffered();
+
+        var head_buf: [32]u8 = undefined;
+        var hw = std.Io.Writer.fixed(&head_buf);
+        if (l.loop_total > 0) try hw.print("[{d}/{d}] ", .{ @min(l.loop_done + 1, l.loop_total), l.loop_total });
+        const head = hw.buffered();
+
+        const fixed = 2 + head.len + tail.len;
+        const room = if (l.width > fixed + 1) l.width - fixed - 1 else 0;
+        try w.print("{s} {s}", .{ l.spinner, head });
+        try writeFitted(w, l.label, room);
+        try w.writeAll(tail);
+    }
+};
+
+fn termWidth(file: std.fs.File) usize {
+    var ws: std.posix.winsize = undefined;
+    const rc = std.posix.system.ioctl(file.handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
+    if (std.posix.errno(rc) != .SUCCESS or ws.col == 0) return 80;
+    return ws.col;
+}
+
+fn columns(s: []const u8) usize {
+    var n: usize = 0;
+    for (s) |c| {
+        if (c & 0xC0 != 0x80) n += 1;
+    }
+    return n;
+}
+
+/// `s` in at most `room` columns, the middle replaced by `…` when it does not fit:
+/// a path or a qualified table says most at its two ends.
+fn writeFitted(w: *std.Io.Writer, s: []const u8, room: usize) !void {
+    if (columns(s) <= room) return w.writeAll(s);
+    if (room < 4) return;
+    const keep = room - 1;
+    const left = keep / 2;
+    const right = keep - left;
+    var i: usize = 0;
+    var seen: usize = 0;
+    while (i < s.len and seen < left) : (i += 1) {
+        if (i + 1 >= s.len or s[i + 1] & 0xC0 != 0x80) seen += 1;
+    }
+    var j: usize = s.len;
+    seen = 0;
+    while (j > i and seen < right) {
+        j -= 1;
+        if (s[j] & 0xC0 != 0x80) seen += 1;
+    }
+    try w.writeAll(s[0..i]);
+    try w.writeAll("…");
+    try w.writeAll(s[j..]);
+}
+
+fn writeThousands(w: anytype, n: u64) !void {
+    var digits: [24]u8 = undefined;
+    const s = std.fmt.bufPrint(&digits, "{d}", .{n}) catch unreachable;
+    for (s, 0..) |c, i| {
+        if (i != 0 and (s.len - i) % 3 == 0) try w.writeByte(',');
+        try w.writeByte(c);
+    }
+}
+
+/// `412ms`, `8.2s`, `3m 12s` — the precision a person reads at each scale.
+fn writeDuration(w: anytype, ms: u64) !void {
+    if (ms < 1000) return w.print("{d}ms", .{ms});
+    if (ms < 60_000) return w.print("{d}.{d}s", .{ ms / 1000, ms % 1000 / 100 });
+    return w.print("{d}m {d}s", .{ ms / 60_000, ms % 60_000 / 1000 });
+}
+
+fn writeRate(w: anytype, r: u64) !void {
+    if (r >= 1_000_000) return w.print("{d}.{d}M", .{ r / 1_000_000, r % 1_000_000 / 100_000 });
+    if (r >= 10_000) return w.print("{d}.{d}k", .{ r / 1000, r % 1000 / 100 });
+    return writeThousands(w, r);
+}
+
+/// How many `LOAD`s a run finished and how many failed. Shared by pointer, so the
+/// workers of a parallel `FOR EACH` count into the same two numbers.
+pub const LoadTally = struct {
+    ok: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    failed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Rows the finished loads wrote — not the run's `rows_written`, which also
+    /// counts what a terminal SELECT printed.
+    rows: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+};
+
+pub const Item = struct {
+    target: []const u8,
+    rows: u64 = 0,
+    elapsed_ms: u64 = 0,
+    /// Set on a failed load: why.
+    reason: ?[]const u8 = null,
+
+    pub fn renderText(self: Item, w: *std.Io.Writer) !void {
+        if (self.reason) |why| return w.print(" x {s}  {s}\n", .{ self.target, why });
+        try w.print(" + {s}", .{self.target});
+        var pad = columns(self.target);
+        while (pad < 32) : (pad += 1) try w.writeByte(' ');
+        var nbuf: [32]u8 = undefined;
+        var nw = std.Io.Writer.fixed(&nbuf);
+        try writeThousands(&nw, self.rows);
+        try w.print("  {s: >13} rows  ", .{nw.buffered()});
+        var dbuf: [16]u8 = undefined;
+        var dw = std.Io.Writer.fixed(&dbuf);
+        try writeDuration(&dw, self.elapsed_ms);
+        try w.print("{s: >7}\n", .{dw.buffered()});
+    }
+
+    fn renderJson(self: Item, w: *std.Io.Writer, run_id: u64) !void {
+        try w.print("{{\"ts\":{d},\"level\":\"info\",\"run_id\":{d},\"event\":\"{s}\",\"target\":\"", .{ std.time.milliTimestamp(), run_id, if (self.reason == null) "load_complete" else "load_failed" });
+        try writeEscaped(w, self.target);
+        try w.print("\",\"rows_written\":{d},\"elapsed_ms\":{d}", .{ self.rows, self.elapsed_ms });
+        if (self.reason) |why| {
+            try w.writeAll(",\"reason\":\"");
+            try writeEscaped(w, why);
+            try w.writeByte('"');
+        }
+        try w.writeAll("}\n");
+    }
+};
+
+/// End-of-run metrics. Rendered as one sentence for a person (stderr) or one JSON
+/// object for a program (stdout `--format json`, or the `run_complete` log line).
 pub const Summary = struct {
     run_id: u64,
     source: []const u8 = "",
@@ -135,6 +432,16 @@ pub const Summary = struct {
     rows_written: u64 = 0,
     elapsed_ms: u64 = 0,
     threads: usize = 1,
+    /// `LOAD`s finished and failed, and — when the run was exactly one — its target
+    /// as the script spelled it.
+    loads: u64 = 1,
+    loads_failed: u64 = 0,
+    target: []const u8 = "",
+    /// Rows the loads wrote, for the sentence; null falls back to `rows_written`.
+    rows_loaded: ?u64 = null,
+    /// The run was one `LOAD` and nothing else, so `rows_read` is that load's own
+    /// and worth saying when it differs. Beside other statements it is not.
+    lone_load: bool = true,
 
     /// Throughput on rows **processed**, not rows emitted. Dividing the written count
     /// by the clock described how fast the answer was printed, not how fast the run
@@ -150,16 +457,39 @@ pub const Summary = struct {
         return rows * 1000 / self.elapsed_ms;
     }
 
+    /// The run in one sentence, verb first, the way `uv` and `pip` close:
+    /// `Loaded 20,000,000 rows into sr.bronze.orders in 8.2s (2.4M rows/s, 12 lanes)`.
+    /// The run id is deliberately absent — it is for correlating machine logs, and
+    /// both JSON renderings carry it.
     pub fn renderText(self: Summary, w: anytype) !void {
-        try w.print("✓ {s} → {s}  ", .{ self.source, self.sink });
-        if (self.rows_read != self.rows_written) {
-            try w.print("read {d} → wrote {d}", .{ self.rows_read, self.rows_written });
+        const total = self.loads + self.loads_failed;
+        const loaded = self.rows_loaded orelse self.rows_written;
+        if (total > 1 or self.loads_failed > 0) {
+            try w.writeAll("Loaded ");
+            if (self.loads_failed > 0) try w.print("{d} of {d} targets, ", .{ self.loads, total }) else try w.print("{d} targets, ", .{self.loads});
+            try writeThousands(w, loaded);
+            try w.writeAll(" rows");
         } else {
-            try w.print("wrote {d}", .{self.rows_written});
+            if (self.lone_load and self.rows_read != loaded and self.rows_read > 0) {
+                try w.writeAll("Read ");
+                try writeThousands(w, self.rows_read);
+                try w.writeAll(" rows, loaded ");
+                try writeThousands(w, loaded);
+            } else {
+                try w.writeAll("Loaded ");
+                try writeThousands(w, loaded);
+                try w.writeAll(" rows");
+            }
+            try w.print(" into {s}", .{if (self.target.len > 0) self.target else self.sink});
         }
-        try w.print("  ({d} rows/s, {d} ms", .{ self.rate(), self.elapsed_ms });
+        try w.writeAll(" in ");
+        try writeDuration(w, self.elapsed_ms);
+        try w.writeAll(" (");
+        try writeRate(w, self.rate());
+        try w.writeAll(" rows/s");
         if (self.threads > 1) try w.print(", {d} lanes", .{self.threads});
-        try w.print(")  run={d}\n", .{self.run_id});
+        try w.writeAll(")\n");
+        if (self.loads_failed > 0) try w.print("{d} failed\n", .{self.loads_failed});
     }
 
     pub fn renderJson(self: Summary, w: anytype) !void {
@@ -172,8 +502,8 @@ pub const Summary = struct {
     /// stderr line — only their envelope prefixes differ.
     fn renderJsonFields(self: Summary, w: anytype) !void {
         try w.print(
-            "\"source\":\"{s}\",\"sink\":\"{s}\",\"rows_read\":{d},\"rows_written\":{d},\"elapsed_ms\":{d},\"rows_per_sec\":{d}}}\n",
-            .{ self.source, self.sink, self.rows_read, self.rows_written, self.elapsed_ms, self.rate() },
+            "\"source\":\"{s}\",\"sink\":\"{s}\",\"rows_read\":{d},\"rows_written\":{d},\"elapsed_ms\":{d},\"rows_per_sec\":{d},\"loads\":{d},\"loads_failed\":{d}}}\n",
+            .{ self.source, self.sink, self.rows_read, self.rows_written, self.elapsed_ms, self.rate(), self.loads, self.loads_failed },
         );
     }
 };
@@ -217,6 +547,21 @@ fn writeEscaped(w: anytype, s: []const u8) !void {
     };
 }
 
+test "progress line: counts, rate and clock, and a label that gives way to the width" {
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Progress.render(&w, .{ .spinner = "*", .label = "erp.orders → sr.bronze.orders", .rows = 1204112, .elapsed_ms = 24_900, .width = 120 });
+    try std.testing.expectEqualStrings("* erp.orders → sr.bronze.orders  1,204,112 rows  48.3k rows/s  0:24", w.buffered());
+
+    w = std.Io.Writer.fixed(&buf);
+    try Progress.render(&w, .{ .spinner = "*", .label = "erp.dbo.a_very_long_table_name → az://lakeacct/bronze/a_very_long_table_name.parquet", .rows = 950, .elapsed_ms = 61_000, .loop_done = 2, .loop_total = 12, .width = 70 });
+    const line = w.buffered();
+    try std.testing.expect(columns(line) <= 69);
+    try std.testing.expect(std.mem.startsWith(u8, line, "* [3/12] erp.dbo."));
+    try std.testing.expect(std.mem.indexOf(u8, line, "…") != null);
+    try std.testing.expect(std.mem.endsWith(u8, line, ".parquet  950 rows  15 rows/s  1:01"));
+}
+
 test "level parse + summary rate" {
     try std.testing.expectEqual(Level.warn, Level.parse("warn").?);
     try std.testing.expect(Level.parse("nope") == null);
@@ -245,23 +590,39 @@ test "summary renderJson: one status-ok object with every metric field" {
     const s = Summary{ .run_id = 7, .source = "csv", .sink = "starrocks", .rows_read = 10, .rows_written = 8, .elapsed_ms = 2000 };
     try s.renderJson(&w);
     try std.testing.expectEqualStrings(
-        "{\"status\":\"ok\",\"run_id\":7,\"source\":\"csv\",\"sink\":\"starrocks\",\"rows_read\":10,\"rows_written\":8,\"elapsed_ms\":2000,\"rows_per_sec\":5}\n",
+        "{\"status\":\"ok\",\"run_id\":7,\"source\":\"csv\",\"sink\":\"starrocks\",\"rows_read\":10,\"rows_written\":8,\"elapsed_ms\":2000,\"rows_per_sec\":5,\"loads\":1,\"loads_failed\":0}\n",
         w.buffered(),
     );
 }
 
-test "summary renderText: read≠written shows both; lane count only when parallel" {
+test "summary sentence: one load, a load that reduces, and a run of several with failures" {
     var buf: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    const s = Summary{ .run_id = 7, .source = "csv", .sink = "starrocks", .rows_read = 10, .rows_written = 8, .elapsed_ms = 2000, .threads = 2 };
-    try s.renderText(&w);
-    try std.testing.expectEqualStrings("✓ csv → starrocks  read 10 → wrote 8  (5 rows/s, 2000 ms, 2 lanes)  run=7\n", w.buffered());
+    try (Summary{ .run_id = 7, .sink = "starrocks", .target = "sr.bronze.orders", .rows_read = 20_000_000, .rows_written = 20_000_000, .elapsed_ms = 8200, .threads = 12 }).renderText(&w);
+    try std.testing.expectEqualStrings("Loaded 20,000,000 rows into sr.bronze.orders in 8.2s (2.4M rows/s, 12 lanes)\n", w.buffered());
 
-    var buf2: [256]u8 = undefined;
-    var w2 = std.Io.Writer.fixed(&buf2);
-    const eq = Summary{ .run_id = 7, .source = "csv", .sink = "csv", .rows_read = 8, .rows_written = 8, .elapsed_ms = 1000 };
-    try eq.renderText(&w2);
-    try std.testing.expectEqualStrings("✓ csv → csv  wrote 8  (8 rows/s, 1000 ms)  run=7\n", w2.buffered());
+    w = std.Io.Writer.fixed(&buf);
+    try (Summary{ .run_id = 7, .sink = "csv", .target = "agg_out.csv", .rows_read = 4_000_000, .rows_written = 7, .elapsed_ms = 1900 }).renderText(&w);
+    try std.testing.expectEqualStrings("Read 4,000,000 rows, loaded 7 into agg_out.csv in 1.9s (2.1M rows/s)\n", w.buffered());
+
+    // Beside a SELECT, the run's totals are not the load's: say only what it wrote.
+    w = std.Io.Writer.fixed(&buf);
+    try (Summary{ .run_id = 7, .sink = "parquet", .target = "/tmp/h.parquet", .rows_read = 291, .rows_written = 117, .rows_loaded = 112, .lone_load = false, .elapsed_ms = 771 }).renderText(&w);
+    try std.testing.expectEqualStrings("Loaded 112 rows into /tmp/h.parquet in 771ms (377 rows/s)\n", w.buffered());
+
+    w = std.Io.Writer.fixed(&buf);
+    try (Summary{ .run_id = 7, .rows_read = 9_482_004, .rows_written = 9_482_004, .elapsed_ms = 192_000, .threads = 12, .loads = 11, .loads_failed = 1 }).renderText(&w);
+    try std.testing.expectEqualStrings("Loaded 11 of 12 targets, 9,482,004 rows in 3m 12s (49.3k rows/s, 12 lanes)\n1 failed\n", w.buffered());
+}
+
+test "item lines: a finished load is aligned, a failed one says why" {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try (Item{ .target = "sr.bronze.sc5010", .rows = 1_204_112, .elapsed_ms = 24_100 }).renderText(&w);
+    try std.testing.expectEqualStrings(" + sr.bronze.sc5010                      1,204,112 rows    24.1s\n", w.buffered());
+    w = std.Io.Writer.fixed(&buf);
+    try (Item{ .target = "sr.bronze.sb1010", .reason = "connection reset by peer" }).renderText(&w);
+    try std.testing.expectEqualStrings(" x sr.bronze.sb1010  connection reset by peer\n", w.buffered());
 }
 
 test "summary rate: an aggregate reports the rows it processed, not the rows it wrote" {

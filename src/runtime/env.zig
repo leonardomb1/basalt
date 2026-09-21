@@ -107,6 +107,8 @@ pub const ItemOutcome = struct {
     ok: bool,
     err: []const u8 = "",
     retryable: bool = false,
+    /// The failure was already shown as an ` x target` item line.
+    shown: bool = false,
 };
 
 /// A thread-safe collector for per-item outcomes. Strings are duped into the
@@ -123,6 +125,9 @@ pub const OutcomeSink = struct {
         self.list.deinit();
     }
     pub fn record(self: *OutcomeSink, item: []const u8, ok: bool, err: []const u8, retryable: bool) void {
+        self.recordShown(item, ok, err, retryable, false);
+    }
+    pub fn recordShown(self: *OutcomeSink, item: []const u8, ok: bool, err: []const u8, retryable: bool, shown: bool) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.list.append(.{
@@ -130,6 +135,7 @@ pub const OutcomeSink = struct {
             .ok = ok,
             .err = self.alloc.dupe(u8, err) catch err,
             .retryable = retryable,
+            .shown = shown,
         }) catch {};
     }
     pub fn failures(self: *OutcomeSink) usize {
@@ -163,11 +169,17 @@ pub const RunOptions = struct {
     /// — the sink's dedup then makes redelivery effectively-once.
     load_label_prefix: ?[]const u8 = null,
     load_run_id: ?u64 = null,
+    /// Print a ` + target` line as each `LOAD` of a multi-load run finishes. For
+    /// a person at `basalt run` or the REPL; `serve` leaves it off.
+    items: bool = false,
+    /// Draw a live progress line on stderr while a `LOAD` runs. The caller sets it
+    /// only when stderr is a terminal; nothing else ever turns it on.
+    progress: bool = false,
 };
 
-/// What a terminal `SELECT` writes to stdout: a text table, NDJSON rows, or
-/// an Arrow IPC stream.
-pub const StdoutFormat = enum { table, json, arrow };
+/// What a terminal `SELECT` writes to stdout: a text table for a person, or rows
+/// for a program — NDJSON, CSV, TSV, or an Arrow IPC stream.
+pub const StdoutFormat = enum { table, json, csv, tsv, arrow };
 
 pub const SqlKind = registry.SqlKind;
 
@@ -191,6 +203,15 @@ pub const Env = struct {
     request_body: ?[]const u8,
     diag: *Diag,
     log: *obs.Logger,
+    progress: ?*obs.Progress = null,
+    /// Finished/failed `LOAD` counts for the run summary; null in a bare test env.
+    loads: ?*obs.LoadTally = null,
+    /// Report each finished `LOAD` as an item line (`RunOptions.items`, and only
+    /// when the script has more than one to report).
+    items: bool = false,
+    /// A failed `LOAD` already said so in an item line; the `FOR EACH` that catches
+    /// the error reads and clears this rather than logging the same failure twice.
+    item_reported: bool = false,
     /// Param name → literal expr, for substitution in stage expressions.
     params_expr: *std.StringHashMap(*const ast.Expr),
     /// Runtime expression-error context (which stage/column failed).
@@ -240,6 +261,8 @@ pub const Env = struct {
     pq_readers: usize = 0,
     pq_reader: ?*pqdecode.Reader = null,
     sink_name: []const u8 = "",
+    /// The last `LOAD`'s target as the script spelled it, for the run summary.
+    last_target: []const u8 = "",
     /// Set once any pipeline writes somewhere other than the stdout table, so a
     /// terminal `SELECT` — whose printed table is its own feedback — gets no summary.
     wrote_sink: bool = false,

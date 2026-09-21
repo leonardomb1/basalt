@@ -13,6 +13,8 @@ const parser = @import("../lang/sql_parser.zig");
 const include = @import("../lang/include.zig");
 const Editor = @import("line.zig").Editor;
 const LineResult = @import("line.zig").Result;
+const view = @import("view.zig");
+const table = @import("../connect/table.zig");
 const ast = @import("../lang/ast.zig");
 const runtime = @import("../runtime/run.zig");
 const obs = @import("../runtime/obs.zig");
@@ -243,6 +245,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var level_set = false;
     var stdout_format: runtime.StdoutFormat = .table;
     var explain = false;
+    var no_progress = false;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -259,11 +262,13 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         } else if (std.mem.eql(u8, a, "--format")) {
             const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
             stdout_format = std.meta.stringToEnum(runtime.StdoutFormat, v) orelse {
-                try stderr.print("error: --format must be table|json|arrow\n", .{});
+                try stderr.print("error: --format must be table|json|csv|tsv|arrow\n", .{});
                 return 2;
             };
         } else if (std.mem.eql(u8, a, "--explain")) {
             explain = true;
+        } else if (std.mem.eql(u8, a, "--no-progress")) {
+            no_progress = true;
         } else if (std.mem.eql(u8, a, "--quiet") or std.mem.eql(u8, a, "-q")) {
             log.quiet = true;
         } else if (std.mem.eql(u8, a, "--log-format")) {
@@ -325,7 +330,10 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var diag: runtime.Diag = .{};
     var sink = runtime.OutcomeSink.init(alloc);
     defer sink.deinit();
-    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze, .stdout_format = stdout_format }, &diag) catch |e| switch (e) {
+    // A person watching a terminal gets the live line; a pipe, a log file, `-q`
+    // and `--log-format json` never do.
+    const progress = !no_progress and !log.quiet and std.posix.isatty(std.fs.File.stderr().handle);
+    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze, .stdout_format = stdout_format, .progress = progress, .items = true }, &diag) catch |e| switch (e) {
         error.Aborted => {
             try stderr.print("{s}: aborted\n", .{src.label});
             return 130;
@@ -352,6 +360,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         for (sink.list.items) |o| {
             if (o.ok) continue;
             if (!o.retryable) all_retryable = false;
+            if (o.shown) continue;
             const tag = if (o.retryable) " (transient)" else "";
             try stderr.print("{s}: item `{s}` failed{s}: {s}\n", .{ src.label, o.item, tag, o.err });
         }
@@ -482,6 +491,14 @@ fn dollarTagLen(s: []const u8, i: usize) ?usize {
     return j + 1 - i;
 }
 
+/// What the editor asks on Enter: run this, or open another line? A meta command,
+/// a quit word and a blank entry are whole as they stand; SQL is whole at its `;`.
+fn entryComplete(s: []const u8) bool {
+    const t = std.mem.trim(u8, s, " \t\r\n");
+    if (t.len == 0 or t[0] == '\\' or isQuit(t) or isHelp(t)) return true;
+    return endsComplete(s);
+}
+
 /// True when the entry is ready to run: its last non-blank character is a
 /// statement-level `;`.
 fn endsComplete(s: []const u8) bool {
@@ -605,7 +622,7 @@ const DeclStore = struct {
 /// Mutable REPL state: the declaration prelude plus per-session toggles.
 const Session = struct {
     decls: DeclStore,
-    json: bool = false,
+    format: runtime.StdoutFormat = .table,
     tty: bool = false,
 };
 
@@ -629,6 +646,10 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
     var editor: ?Editor = if (sess.tty) Editor.init(alloc) else null;
     defer if (editor) |*e| e.deinit();
 
+    // Only here are tables fitted to the terminal and the last one kept for `\view`.
+    table.interactive = sess.tty;
+    defer table.dropLast();
+
     if (sess.tty) {
         try msg.writeAll("basalt REPL — end a statement with `;` to run it. \\q quits, \\help for help; arrows recall history.\n");
         try msg.flush();
@@ -643,31 +664,31 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
         runtime.resetAbort();
         block.clearRetainingCapacity();
         while (true) {
-            var owned: ?[]u8 = null;
-            defer if (owned) |o| alloc.free(o);
             var line: []const u8 = undefined;
             if (editor) |*ed| {
-                const prompt: []const u8 = if (block.items.len == 0) "\xc2\xbb " else "\xe2\x80\xa6 ";
-                switch (ed.readLine(prompt) catch |e| blk: {
+                // The editor hands back a whole entry, however many lines it took.
+                switch (ed.readEntry(.{ .complete = entryComplete }) catch |e| blk: {
                     try msg.print("input error: {s}\n", .{@errorName(e)});
                     try msg.flush();
                     break :blk LineResult.eof;
                 }) {
-                    .eof => {
-                        quit = true;
-                        break;
-                    },
-                    .interrupt => {
-                        // ^C discards the whole pending block, not just the line.
-                        block.clearRetainingCapacity();
-                        continue;
-                    },
+                    .eof => quit = true,
+                    .interrupt => {},
                     .line => |l| {
-                        owned = l;
-                        line = l;
+                        defer alloc.free(l);
                         ed.remember(l);
+                        const t = std.mem.trim(u8, l, " \t\r\n");
+                        if (t.len > 0 and (t[0] == '\\' or isQuit(t) or isHelp(t))) {
+                            if (isQuit(t)) quit = true else try metaCommand(t, &sess, msg);
+                        } else {
+                            try block.appendSlice(l);
+                            // Run with Alt+Enter or a blank last line, the entry may
+                            // lack its `;` — which is all the parser would say about it.
+                            if (t.len > 0 and !endsComplete(l)) try block.append(';');
+                        }
                     },
                 }
+                break;
             } else {
                 const maybe = in.takeDelimiter('\n') catch |e| {
                     try msg.print("input error: {s}\n", .{@errorName(e)});
@@ -732,17 +753,30 @@ fn metaCommand(t: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
     if (std.mem.eql(u8, cmd, "\\format") or std.mem.eql(u8, cmd, "\\f")) {
         if (rest.len == 0) {
             // fall through to the echo below
-        } else if (std.ascii.eqlIgnoreCase(rest, "json")) {
-            sess.json = true;
-        } else if (std.ascii.eqlIgnoreCase(rest, "table")) {
-            sess.json = false;
+        } else if (parseReplFormat(rest)) |f| {
+            sess.format = f;
         } else {
-            return msg.print("error: \\format takes `json` or `table`, got `{s}`\n", .{rest});
+            return msg.print("error: \\format takes `table`, `json`, `csv` or `tsv`, got `{s}`\n", .{rest});
         }
-        const mode: []const u8 = if (sess.json) "json" else "table";
-        return msg.print("format {s}\n", .{mode});
+        return msg.print("format {s}\n", .{@tagName(sess.format)});
+    }
+    if (std.mem.eql(u8, cmd, "\\view") or std.mem.eql(u8, cmd, "\\v")) {
+        if (!sess.tty or !std.posix.isatty(std.fs.File.stdout().handle))
+            return msg.writeAll("error: \\view needs a terminal\n");
+        const g = table.last() orelse return msg.writeAll("nothing to view yet — run a SELECT first\n");
+        try msg.flush();
+        return view.run(sess.decls.gpa, g);
     }
     try msg.print("error: unknown command `{s}` — \\help for help\n", .{cmd});
+}
+
+/// The formats a REPL session can print in. Arrow is left out: a binary stream in
+/// a terminal is noise, and `basalt run --format arrow` is the way to pipe one.
+fn parseReplFormat(name: []const u8) ?runtime.StdoutFormat {
+    inline for (.{ runtime.StdoutFormat.table, .json, .csv, .tsv }) |f| {
+        if (std.ascii.eqlIgnoreCase(name, @tagName(f))) return f;
+    }
+    return null;
 }
 
 /// Parse and run one REPL entry, reporting errors without aborting the loop.
@@ -834,9 +868,12 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *s
     const t0 = std.time.milliTimestamp();
     var rdiag: runtime.Diag = .{};
     _ = runtime.run(alloc, prepared, .{
-        .log = .{ .summary = .none, .quiet = true },
-        .stdout_format = if (sess.json) .json else .table,
+        // Errors only, but not `quiet`: that would swallow the entry's own `PRINT`s.
+        .log = .{ .summary = .none, .level = .err },
+        .stdout_format = sess.format,
         .explain = prog.explain == .analyze,
+        .progress = sess.tty and std.posix.isatty(std.fs.File.stderr().handle),
+        .items = true,
     }, &rdiag) catch |e| {
         if (e == error.OutOfMemory) return e;
         if (e == error.Aborted)
@@ -898,11 +935,26 @@ fn replHelp(msg: *std.Io.Writer) !void {
         \\commands:
         \\  \connections, \c   list the declarations held for this session
         \\  \clear             forget them all
-        \\  \format json|table set the output format (bare \format shows it); \f is an alias
+        \\  \format table|json|csv|tsv
+        \\                     set the output format (bare \format shows it); \f is an alias
+        \\  \view, \v          scroll the last result: arrows move by column and row, names
+        \\                     stay pinned; for the tables too wide or long to print whole
         \\  \help, \h, ?       this help
         \\  \q, \quit, exit    leave
         \\
-        \\arrows browse history (persisted in ~/.basalt_history); ^A/^E home/end, ^U clears the line, ^C drops the entry
+        \\editing — the entry is a small text editor, not a single line:
+        \\  Enter              a new line (indent kept) until the statement ends in `;`, then run.
+        \\                     Alt+Enter, or Enter on an empty last line, runs it as it stands
+        \\  arrows             travel the entry; Up/Down past its edge recall history, where
+        \\                     an entry comes back whole (~/.basalt_history)
+        \\  Ctrl+arrows        by word (Alt-b/Alt-f too); Home/End the line (Home toggles the
+        \\                     indent); Ctrl+Home/End the whole entry
+        \\  Shift+any of those select; typing, Backspace or Delete replace the selection
+        \\  ^A select all · ^C copy (with a selection) · ^X cut · ^V paste · ^Z undo · ^Y redo
+        \\  ^W/Ctrl+Backspace, Alt-d/Ctrl+Delete delete a word · ^K to line end · ^U the line
+        \\  Tab two spaces · ^L clear the screen · ^C drop the entry · ^D leave when it is empty
+        \\  a paste is inserted as text, never run line by line; copy reaches the system
+        \\  clipboard where the terminal allows it (OSC 52)
         \\
     );
     try msg.flush();
@@ -1124,12 +1176,18 @@ fn usage(w: anytype) !void {
         \\                     reproducible for a given -j but not across values of it —
         \\                     CAST to DECIMAL for a total that never varies.)
         \\  --port N           listen port for HTTP mode
-        \\  --format FMT       table|json|arrow — json: NDJSON rows for a SELECT,
-        \\                     a summary object for a LOAD run; arrow: an Arrow IPC
-        \\                     stream of the SELECT's rows
+        \\  --format FMT       table|json|csv|tsv|arrow — what a SELECT writes to stdout.
+        \\                     table: every row and column, for reading, closed by a
+        \\                     `(N rows)` line. json: NDJSON rows (and a summary object
+        \\                     for a LOAD run). csv, tsv: a header and the rows, quoted
+        \\                     as a .csv sink quotes them, nothing else. arrow: an Arrow
+        \\                     IPC stream
         \\  --log-format FMT   text|json — stderr log format (default text;
         \\                     json is NDJSON, one object per line, for collectors)
         \\  --log-level LVL    error|warn|info|debug (default warn)
+        \\  --no-progress      no live progress line (it is only ever drawn when
+        \\                     stderr is a terminal, and never under -q or
+        \\                     --log-format json)
         \\  -q, --quiet        suppress warnings too: errors only (the run summary
         \\                     still prints)
         \\

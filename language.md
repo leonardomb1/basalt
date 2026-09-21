@@ -985,7 +985,7 @@ same query costs at full parallelism.
 ## 10. Running & exit codes
 
 ```
-basalt run   <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json|arrow]
+basalt run   <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json|csv|tsv|arrow]
 basalt serve <dir> [--port N] [--watch]
 basalt check <script>|-|-c "<inline>"
 ```
@@ -993,6 +993,11 @@ basalt check <script>|-|-c "<inline>"
 `--format json` makes stdout machine-readable: a terminal `SELECT` emits one
 JSON object per row (NDJSON, streamed — decimals as strings, temporals as ISO
 text, bytes as base64), and a `LOAD` run emits one summary object instead.
+`--format csv` and `--format tsv` emit a header line and the rows — quoted exactly as
+a `.csv` sink quotes them, a null as an empty field — and nothing else: no rule,
+no `(N rows)` footer, so `| wc -l`, `| cut` and `| column -t` see only data. The
+default `table` is for reading and does close with `(N rows)`, on stdout, the way
+`psql` does; reach for `csv`, `tsv` or `json` when a program is the reader.
 `--format arrow` emits the `SELECT` as an Arrow IPC stream — one record batch
 per engine batch, typed (`DECIMAL` as decimal128, dates as date32, times and
 timestamps in microseconds), readable with `pyarrow.ipc.open_stream`,
@@ -1001,12 +1006,87 @@ valid stream: the schema followed by the end-of-stream marker.
 Logs are stderr-only, plain text, level `warn` by default (`--log-level`,
 `--log-format json`, `-q`).
 
+While a `LOAD` runs, a terminal gets a live line on stderr — what is moving
+where, rows so far, the rate and the clock, with `[3/12]` in front inside a
+`FOR EACH`:
+
+```
+⠹ [3/12] erp.dbo.SC5010 → sr.bronze.sc5010  1,204,112 rows  48.3k rows/s  0:24
+```
+
+A run that writes closes with one sentence, and one that has several `LOAD`s
+(more than one statement, or a `FOR EACH` / `CASE` / `CALL`) reports each as it
+finishes — ` +` loaded, ` x` failed, with the reason:
+
+```
+ + sr.bronze.sc5010                      1,204,112 rows    24.1s
+ x sr.bronze.sb1010  connection reset by peer
+Loaded 11 of 12 targets, 9,482,004 rows in 3m 12s (49.4k rows/s, 12 lanes)
+1 failed
+```
+
+A single `LOAD` prints only the sentence — `Loaded 20,000,000 rows into
+sr.bronze.orders in 8.2s (2.4M rows/s, 12 lanes)`, or `Read 4,000,000 rows,
+loaded 7 into agg.csv in 1.9s` when the query reduces. The text carries no run
+id; under `--log-format json` the same facts are `load_complete` /
+`load_failed` events (level `info`) and a `run_complete` line, each with
+`run_id`, and `--format json` prints the summary object with `loads` and
+`loads_failed`. Parse those, never the sentence.
+
+The progress line is drawn only when stderr is a TTY, never under `-q` or `--log-format json`,
+not for a terminal `SELECT` (whose rows go to the same screen), and not for the
+first 400 ms, so short runs stay silent. A log or `PRINT` line erases it rather
+than colliding with it, and the run summary replaces it at the end. Piped or
+redirected, stderr carries no control characters at all. `--no-progress` turns
+it off.
+
+`basalt run` prints a terminal `SELECT` whole — every row and every column, in a
+plain left-aligned table — whether stdout is a terminal, a pipe or a file. What
+`-c` returns never depends on who is watching.
+
+The REPL is where a person looks at data, so there the table is fitted to the
+terminal: a row of types under the names, numbers right-aligned, `NULL` spelled
+out, cells cut at 40 columns, and `…` for what does not fit — the middle columns,
+in the manner of pandas, and the middle rows past 40. The footer always gives the
+true size:
+
+```
+ id  customer_name       amount  …  country  last_col
+int  string               float  …  string   string
+---  ------------------  ------  …  -------  --------
+  0  customer number 0        0  …  BR       tail-0
+  …  …                        …  …  …        …
+ 99  customer number 99   148.5  …  BR       tail-99
+(100 rows × 10 columns, 5 shown — \view scrolls it)
+```
+
+A REPL result keeps its first 10,000 rows (and the last 20) rather than all of
+it. Set `NO_COLOR` to drop the dim and bold styling.
+
+In the REPL, `\view` (or `\v`) opens the last result full-screen: arrows scroll
+by column and by row with the names and types pinned, Ctrl-arrows and PgUp/PgDn
+move a screenful, Home/End jump to the first and last columns, `g`/`G` to the
+first and last rows, `q` leaves.
+
 `basalt repl` executes on a top-level `;` and carries `CREATE CONNECTION` /
 `CREATE FUNCTION` / `PARAM` declarations across entries (re-declaring a name
 replaces it). Meta commands: `\connections` list the session's declarations ·
-`\clear` drop them · `\format json|table` switch result output · `\help` ·
-`\q`. Arrow keys edit and browse history (persisted in `~/.basalt_history`);
-`^C` drops the pending entry.
+`\clear` drop them · `\format table|json|csv|tsv` switch result output · `\view` scroll
+the last result · `\help` ·
+`\q`.
+
+The entry is a small text editor rather than a single line. Enter opens a new
+line, keeping the indent, until the statement ends in a top-level `;`, and runs it
+once it does; Alt+Enter, or Enter on an empty last line, runs the entry as it
+stands. Arrows travel the whole entry — Ctrl+arrows by word, Home/End the line,
+Ctrl+Home/End the entry — and Up or Down past its edge recall history, where an
+entry comes back whole however many lines it had (`~/.basalt_history`). Shift
+with any of those selects; typing, Backspace and Delete replace the selection.
+`^A` selects all, `^C` copies a selection (and drops the entry when there is
+none), `^X` cuts, `^V` pastes, `^Z`/`^Y` undo and redo. A paste is inserted as
+text, never run line by line, and a copy reaches the system clipboard where the
+terminal supports OSC 52. Two things a terminal cannot deliver: the mouse, and
+Ctrl+Enter, which arrives as plain Enter.
 
 | code | meaning |
 |------|---------|

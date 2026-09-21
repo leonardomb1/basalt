@@ -275,7 +275,7 @@ pub const ArrowWriter = struct {
         const self = try gpa.create(ArrowWriter);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa };
-        self.fw = std.fs.File.stdout().writer(&self.buf);
+        self.fw = std.fs.File.stdout().writerStreaming(&self.buf);
         self.sw = try StreamWriter.init(gpa, &self.fw.interface, schema);
         return self;
     }

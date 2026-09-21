@@ -950,6 +950,8 @@ pub const CsvWriter = struct {
     dialect: Dialect = .{},
     write_buf: [LINE_BUF]u8 = undefined,
     fw: std.fs.File.Writer = undefined,
+    /// False for stdout, which is the process's to close, not the sink's.
+    owns_file: bool = true,
 
     /// A local file, or an object staged over HTTP. Both expose a plain
     /// `*std.Io.Writer`, so row formatting below is identical either way.
@@ -1007,6 +1009,28 @@ pub const CsvWriter = struct {
             }
             try w.writeByte('\n');
         }
+        return self;
+    }
+
+    /// `--format csv|tsv`: the same rows and quoting a `.csv` sink gets, on stdout.
+    /// Streamed per batch, header first, and nothing else — no footer, no summary.
+    pub fn openStdout(arena: std.mem.Allocator, schema: types.Schema, dialect: Dialect) !*CsvWriter {
+        return openBorrowed(arena, std.fs.File.stdout(), schema, dialect);
+    }
+
+    /// Write to a file someone else owns: it is left open on `close`, and written
+    /// from wherever it currently stands — streaming, so that a second writer on
+    /// the same file carries on after the first instead of starting over at 0.
+    pub fn openBorrowed(arena: std.mem.Allocator, file: std.fs.File, schema: types.Schema, dialect: Dialect) !*CsvWriter {
+        const self = try arena.create(CsvWriter);
+        self.* = .{ .backend = .{ .file = file }, .owns_file = false, .dialect = dialect };
+        self.fw = self.backend.file.writerStreaming(&self.write_buf);
+        const w = self.out();
+        for (schema.fields, 0..) |f, i| {
+            if (i > 0) try w.writeByte(dialect.delim);
+            try writeField(w, f.name, dialect.delim);
+        }
+        try w.writeByte('\n');
         return self;
     }
 
@@ -1076,7 +1100,7 @@ pub const CsvWriter = struct {
         switch (self.backend) {
             .file => |f| {
                 try self.fw.interface.flush();
-                f.close();
+                if (self.owns_file) f.close();
             },
             // Committing the staged upload is what makes the object appear.
             .object => |o| o.finish() catch |e| return self.specific(e),
@@ -1089,7 +1113,7 @@ pub const CsvWriter = struct {
     /// discards them after a week — so a failed run leaves nothing behind.
     pub fn abort(self: *CsvWriter) void {
         switch (self.backend) {
-            .file => |f| f.close(),
+            .file => |f| if (self.owns_file) f.close(),
             // Staged blocks and an uncompleted multipart upload are invisible to
             // readers. Azure reaps them after a week; S3 only where the bucket has
             // a lifecycle rule.
@@ -1650,6 +1674,51 @@ test "csv writer: the delimiter carries to the header, rows and quoting" {
 
     const got = try tmp.dir.readFileAlloc(a, "o.csv", 1 << 16);
     try std.testing.expectEqualStrings("x;y\n\"a;b\";c\n", got);
+}
+
+test "csv writer on a borrowed file: header and rows only, tsv quotes a tab, the file stays open" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile("o.tsv", .{ .read = true });
+    defer file.close();
+
+    var names = [_][]const u8{ "x", "y" };
+    const schema = try stringSchema(a, &names);
+    const w = try CsvWriter.openBorrowed(a, file, schema, .{ .delim = '\t' });
+    try w.writeBatch(a, try parseSlice(a, &schema, "plain,\"has\ttab\"\n\"a,b\",\n"));
+    try w.close();
+
+    // Still open after `close`: the sink borrowed it.
+    try file.writeAll("# still writable\n");
+    const got = try tmp.dir.readFileAlloc(a, "o.tsv", 1 << 16);
+    try std.testing.expectEqualStrings("x\ty\nplain\t\"has\ttab\"\na,b\t\n# still writable\n", got);
+}
+
+test "two borrowed-file writers in a row append: a second SELECT must not overwrite the first" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile("out.csv", .{});
+    defer file.close();
+
+    var first = [_][]const u8{"a"};
+    var second = [_][]const u8{"b"};
+    const s1 = try stringSchema(a, &first);
+    const s2 = try stringSchema(a, &second);
+    const w1 = try CsvWriter.openBorrowed(a, file, s1, .{});
+    try w1.writeBatch(a, try parseSlice(a, &s1, "1\n"));
+    try w1.close();
+    const w2 = try CsvWriter.openBorrowed(a, file, s2, .{});
+    try w2.writeBatch(a, try parseSlice(a, &s2, "2\n"));
+    try w2.close();
+
+    const got = try tmp.dir.readFileAlloc(a, "out.csv", 1 << 16);
+    try std.testing.expectEqualStrings("a\n1\nb\n2\n", got);
 }
 
 /// A schema with one field per (name, kind) pair, all nullable — for exercising the

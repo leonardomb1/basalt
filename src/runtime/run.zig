@@ -175,6 +175,17 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var batch_arena = std.heap.ArenaAllocator.init(gpa);
     defer batch_arena.deinit();
 
+    var loads = obs.LoadTally{};
+    env.loads = &loads;
+    env.items = opts.items and manyLoads(program.stmts[1..]);
+
+    var progress = obs.Progress{ .logger = &logger, .rows = &rows_read };
+    if (opts.progress and opts.log.format != .json) {
+        progress.start();
+        env.progress = &progress;
+    }
+    defer if (env.progress != null) progress.stop();
+
     env.script_scope = try buildScriptScope(arena, &params);
 
     var stats = Stats{ .run_id = run_id };
@@ -211,13 +222,18 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         .rows_written = stats.rows_out,
         .elapsed_ms = stats.elapsed_ms,
         .threads = lanes_used,
+        .loads = loads.ok.load(.monotonic),
+        .loads_failed = loads.failed.load(.monotonic),
+        .target = env.last_target,
+        .rows_loaded = loads.rows.load(.monotonic),
+        .lone_load = runnable == 1,
     };
     switch (opts.log.summary) {
         // `--format json`: a LOAD run's stdout is the summary object; a SELECT
         // run's stdout is the NDJSON rows — never both on one stream.
         .json_stdout => if (env.wrote_sink) {
             var sbuf: [1024]u8 = undefined;
-            var sfw = std.fs.File.stdout().writer(&sbuf);
+            var sfw = std.fs.File.stdout().writerStreaming(&sbuf);
             summary.renderJson(&sfw.interface) catch {};
             sfw.interface.flush() catch {};
         },
@@ -356,6 +372,19 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, 
     if (last != .write) return planErr(env.diag, "a top-level pipeline must end in `write`");
     env.sink_name = sinkLabel(env, last.write);
     if (!env.explain and !std.mem.eql(u8, last.write.connector, "stdout")) env.wrote_sink = true;
+    // Only a real `LOAD`: a terminal SELECT prints rows to the same terminal.
+    const is_load = !env.explain and !std.mem.eql(u8, last.write.connector, "stdout");
+    if (is_load) env.last_target = try targetLabel(arena, last.write);
+    const moving = is_load and env.progress != null;
+    if (moving) env.progress.?.begin(try moveLabel(arena, stages[0], last.write));
+    const load_t0 = std.time.milliTimestamp();
+    const load_rows0 = stats.rows_out;
+    var load_failed = false;
+    defer {
+        if (moving) env.progress.?.end();
+        if (is_load) noteLoad(env, load_failed, stats.rows_out - load_rows0, @intCast(std.time.milliTimestamp() - load_t0));
+    }
+    errdefer load_failed = true;
 
     var ddiag = analyze.Diag{};
     env.csv_in = analyze.dialectFromHints(stages[0].hints, &ddiag) catch
@@ -467,7 +496,7 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, 
         // The single most expensive silent behaviour the engine has: every matching
         // source row ships here to be grouped. Say so, and why, where the run log is.
         if (!whole_agg and hasAggregate(stages))
-            env.log.log(.warn, "aggregate over {s} runs engine-side, not in the source ({s}); every matching row is streamed here to be grouped", .{ @tagName(env.sql_desc.?.kind), why });
+            env.log.log(.warn, "aggregate over {s} runs engine-side, not in the source ({s}); every matching row is streamed here to be grouped", .{ @tagName(env.sql_desc.?.dialect), why });
     }
 
     if (!whole_agg and opts.threads > 1 and env.sql_desc != null) {
@@ -790,6 +819,60 @@ test {
     _ = @import("lanes.zig");
     _ = @import("script.zig");
     _ = @import("run_test.zig");
+}
+
+/// Does the script have more than one `LOAD` to report — several statements, or
+/// anything (`FOR EACH`, `CASE`, `CALL`) that can run one more than once? A lone
+/// `LOAD` is summed up by the closing sentence and needs no item line.
+fn manyLoads(stmts: []const ast.Stmt) bool {
+    var n: usize = 0;
+    for (stmts) |s| switch (s) {
+        .output => n += 1,
+        .for_each, .match, .call => return true,
+        else => {},
+    };
+    return n > 1;
+}
+
+/// Count a finished `LOAD`, and report it when the run is showing item lines.
+fn noteLoad(env: *Env, failed: bool, rows: usize, elapsed_ms: u64) void {
+    // A ^C is not a failed load; the run is about to say `aborted` itself.
+    if (failed and aborting()) return;
+    if (env.loads) |t| {
+        _ = (if (failed) &t.failed else &t.ok).fetchAdd(1, .monotonic);
+        if (!failed) _ = t.rows.fetchAdd(rows, .monotonic);
+    }
+    if (!env.items) return;
+    if (failed) {
+        const why = if (env.errctx.msg.len > 0) env.errctx.msg else if (env.diag.msg.len > 0) env.diag.msg else "failed";
+        env.log.item(.{ .target = env.last_target, .reason = why });
+        env.item_reported = true;
+        return;
+    }
+    env.log.item(.{ .target = env.last_target, .rows = rows, .elapsed_ms = elapsed_ms });
+}
+
+/// The write target as the script spelled it: a path, or `conn.table`.
+fn targetLabel(arena: std.mem.Allocator, w: ast.Write) ![]const u8 {
+    if (std.mem.eql(u8, w.connector, "csv") or w.target.len == 0) return w.target;
+    return std.fmt.allocPrint(arena, "{s}.{s}", .{ w.connector, w.target });
+}
+
+/// `source → sink` for the progress line: the table, path or binding being read,
+/// and the target being written, each as the script spelled it.
+fn moveLabel(arena: std.mem.Allocator, first: ast.Stage, w: ast.Write) ![]const u8 {
+    const src: []const u8 = switch (first.node) {
+        .read => |rd| switch (rd.form) {
+            .table => |q| try std.fmt.allocPrint(arena, "{s}.{s}", .{ rd.connector, try std.mem.join(arena, ".", q.parts) }),
+            .path => |p| p,
+            .query => try std.fmt.allocPrint(arena, "{s} query", .{rd.connector}),
+            else => rd.connector,
+        },
+        .ref => |name| name,
+        .union_ => "union",
+        else => "?",
+    };
+    return std.fmt.allocPrint(arena, "{s} → {s}", .{ src, try targetLabel(arena, w) });
 }
 
 fn hasAggregate(stages: []const ast.Stage) bool {

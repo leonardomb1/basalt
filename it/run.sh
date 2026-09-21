@@ -7,14 +7,14 @@
 #   ./it/run.sh mysql postgres  several
 #   KEEP=1 ./it/run.sh azure    leave the stack up afterwards
 #
-# Suite names: mysql postgres sqlserver starrocks azure parquet s3 arrow
-# (arrow needs `uv`: it reads the stream back with pyarrow)
+# Suite names: mysql postgres sqlserver starrocks azure parquet s3 arrow stdout
+# (arrow needs `uv`: it reads the stream back with pyarrow; stdout needs nothing)
 # Scripts are Basalt SQL (the BSL parser was removed in v0.2.0); connection
 # attrs are passed as `OPTIONS(...)` bodies.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ALL_SUITES="mysql postgres sqlserver starrocks azure parquet s3 arrow"
+ALL_SUITES="mysql postgres sqlserver starrocks azure parquet s3 arrow stdout"
 DEFAULT_SUITES="$ALL_SUITES"
 SUITES="${*:-$DEFAULT_SUITES}"
 
@@ -805,6 +805,73 @@ PY
   else
     report "arrow (run error)" bad
     tail -5 "$out/arrow.log"
+  fi
+fi
+
+# What `basalt run` puts on stdout, per --format. No container: the contract under
+# test is the CLI's own — rows and nothing else for a program, and a result that is
+# the same bytes whether stdout is a pipe or a file.
+if runs stdout; then
+  sel="SELECT * FROM 'it/seed.csv' ORDER BY id;"
+
+  # csv is the seed back again: same quoting as a .csv sink, no rule, no footer.
+  if $B run -q -j 1 --format csv -c "$sel" >"$out/stdout.csv" 2>"$out/stdout.log"; then
+    check "stdout csv" "$out/stdout.csv" it/expected.csv
+  else
+    report "stdout csv (run error)" bad
+    tail -5 "$out/stdout.log"
+  fi
+
+  # tsv carries the same cells; a field holding a comma needs no quotes under a tab.
+  if $B run -q -j 1 --format tsv -c "$sel" >"$out/stdout.tsv" 2>>"$out/stdout.log" &&
+     $B run -q -j 1 --format csv -c "SELECT * FROM '$out/stdout.tsv' WITH (format = 'csv', delimiter = '\t') ORDER BY id;" >"$out/stdout_tsv_rt.csv" 2>>"$out/stdout.log"; then
+    check "stdout tsv" "$out/stdout_tsv_rt.csv" it/expected.csv
+    if grep -q '"beta, gamma"' "$out/stdout.tsv"; then report "stdout tsv quotes only what a tab demands" bad; else report "stdout tsv quotes only what a tab demands" ok; fi
+  else
+    report "stdout tsv (run error)" bad
+    tail -5 "$out/stdout.log"
+  fi
+
+  # Nothing but data on stdout: the summary and the logs stay on stderr.
+  rows=$(($(wc -l <it/expected.csv)))
+  got=$($B run --format csv -c "LOAD INTO '$out/stdout_side.csv' AS SELECT * FROM 'it/seed.csv'; $sel" 2>/dev/null | wc -l)
+  if [ "$got" -eq "$rows" ]; then report "stdout csv carries rows only beside a LOAD" ok; else report "stdout csv carries rows only beside a LOAD ($got lines, want $rows)" bad; fi
+
+  # A second SELECT appends. Redirected to a file it used to start again at offset
+  # 0 and overwrite the first, while the same run through a pipe looked fine.
+  for fmt in table csv json; do
+    two="SELECT 1 AS first_q; SELECT 2 AS second_q;"
+    $B run -q --format "$fmt" -c "$two" >"$out/two_file.$fmt" 2>/dev/null
+    $B run -q --format "$fmt" -c "$two" 2>/dev/null | cat >"$out/two_pipe.$fmt"
+    if grep -q first_q "$out/two_file.$fmt" && grep -q second_q "$out/two_file.$fmt" &&
+       cmp -s "$out/two_file.$fmt" "$out/two_pipe.$fmt"; then
+      report "stdout $fmt: two SELECTs to a file match the pipe" ok
+    else
+      report "stdout $fmt: two SELECTs to a file match the pipe" bad
+      head -8 "$out/two_file.$fmt"
+    fi
+  done
+
+  # `run` prints the whole table however narrow the terminal claims to be; only
+  # the REPL fits one. `script` supplies the terminal, so skip where it is missing.
+  if command -v script >/dev/null; then
+    wide="SELECT range AS id, 'a fairly long value for row ' || range AS a, 'another long value for row ' || range AS b, 'tail-' || range AS last_col FROM RANGE(60);"
+    script -qfc "stty cols 40; $B run -q -c \"$wide\"" /dev/null 2>/dev/null | tr -d '\r' >"$out/tty.txt"
+    $B run -q -c "$wide" >"$out/pipe.txt" 2>/dev/null
+    if cmp -s "$out/tty.txt" "$out/pipe.txt" && grep -q "last_col" "$out/tty.txt" && grep -q "^(60 rows)" "$out/tty.txt"; then
+      report "stdout table: a terminal gets the same full table as a pipe" ok
+    else
+      report "stdout table: a terminal gets the same full table as a pipe" bad
+      diff "$out/pipe.txt" "$out/tty.txt" | head -6
+    fi
+  fi
+
+  if $B run --format xml -c "SELECT 1;" >/dev/null 2>"$out/badfmt.log"; then
+    report "stdout: an unknown --format is refused" bad
+  elif grep -q "table|json|csv|tsv|arrow" "$out/badfmt.log"; then
+    report "stdout: an unknown --format is refused" ok
+  else
+    report "stdout: an unknown --format is refused" bad
   fi
 fi
 

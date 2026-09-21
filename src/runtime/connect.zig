@@ -802,6 +802,12 @@ pub fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
                 };
                 return writer.sink();
             },
+            .csv, .tsv => {
+                const delim: u8 = if (env.stdout_format == .tsv) '\t' else ',';
+                const writer = csv.CsvWriter.openStdout(env.arena, schema, .{ .delim = delim }) catch
+                    return planErr(env.diag, "could not open stdout csv writer");
+                return writer.sink();
+            },
             .table => {
                 const writer = TableWriter.open(env.gpa, schema) catch
                     return planErr(env.diag, "could not open stdout table");
