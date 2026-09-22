@@ -490,7 +490,8 @@ pub const Stmt = union(enum) {
 /// `EXPLAIN` prefix on a program: print the plan instead of running it, or
 /// (with `ANALYZE`) run it and print the plan back with measured actuals.
 /// `COSTS` is rejected at parse time — there is no cost model to report.
-pub const ExplainMode = enum { none, plan, analyze };
+/// `describe` is `DESCRIBE <source|query>`: open it, print its schema as rows.
+pub const ExplainMode = enum { none, plan, analyze, describe };
 
 /// `EXPLAIN [ANALYZE] <query>;` in statement position: explain one pipeline where
 /// it stands, against whatever the statements above it declared. `plan` renders

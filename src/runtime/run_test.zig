@@ -35,6 +35,7 @@ const interpAll = @import("script.zig").interpAll;
 const printText = @import("script.zig").printText;
 
 const run = @import("run.zig").run;
+const describeRows = @import("run.zig").describeRows;
 
 /// Run `LOAD INTO out.csv AS <query>` over `input`. `$IN` in the query is
 /// replaced with the input CSV's path.
@@ -3185,4 +3186,16 @@ test "DISTINCT ON keys are input columns: renamed, unprojected, and beside an OR
     try expectFile(&tmp, "sorted.csv", "id\n1\n3\n");
     try expectFile(&tmp, "output.csv", "k,id\na,1\nb,3\n");
     try expectFile(&tmp, "pair.csv", "id\n1\n2\n3\n4\n");
+}
+
+test "DESCRIBE rows: name, engine type (decimal with its precision), nullable" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const fields = [_]types.Schema.Field{
+        .{ .name = "id", .ty = types.Type.init(.int) },
+        .{ .name = "amt", .ty = types.Type.decimal(10, 2).asNullable() },
+        .{ .name = "a,b", .ty = types.Type.init(.string).asNullable() },
+    };
+    const rows = try describeRows(ar.allocator(), .{ .fields = &fields });
+    try std.testing.expectEqualStrings("id,int,no\namt,decimal(10,2),yes\n\"a,b\",string,yes\n", rows);
 }

@@ -237,6 +237,9 @@ pub const Parser = struct {
 
     endpoint: ?ast.KindDecl = null,
     conn_names: std.array_list.Managed([]const u8) = undefined,
+    /// Parallel to `conn_names`: each connection's connector type, which `SHOW
+    /// TABLES` needs to phrase its catalog query.
+    conn_types: std.array_list.Managed([]const u8) = undefined,
     let_names: std.array_list.Managed([]const u8) = undefined,
     /// PARAM and LET names. `$p` parses to a plain single-part field, so this is
     /// the only way to tell a script constant from a column at parse time — which
@@ -396,6 +399,7 @@ pub const Parser = struct {
 
     pub fn parseProgram(self: *Parser) Error!ast.Program {
         self.conn_names = std.array_list.Managed([]const u8).init(self.arena);
+        self.conn_types = std.array_list.Managed([]const u8).init(self.arena);
         self.let_names = std.array_list.Managed([]const u8).init(self.arena);
         self.pending_bindings = std.array_list.Managed(ast.Stmt).init(self.arena);
         self.const_names = std.array_list.Managed([]const u8).init(self.arena);
@@ -453,8 +457,79 @@ pub const Parser = struct {
         if (self.isKw("throw")) return out.append(.{ .throw = try self.parseThrowStmt() });
         if (self.isKw("call")) return out.append(.{ .call = try self.parseCallStmt() });
         if (self.isKw("explain")) return self.parseExplainStmt(out);
+        if (self.isKw("describe") or self.isKw("desc")) return self.parseDescribe(out);
+        if (self.isKw("show")) return self.parseShow(out);
         if (self.isKw("with") or self.isKw("select")) return self.parseTerminalQuery(out);
-        return self.fail(self.curPos(), "expected a statement (CREATE / PARAM / LET / PRINT / THROW / EXPLAIN / LOAD INTO / SELECT / FOR / CASE / CALL), found {s}", .{self.curTag().describe()});
+        return self.fail(self.curPos(), "expected a statement (CREATE / PARAM / LET / PRINT / THROW / EXPLAIN / DESCRIBE / SHOW / LOAD INTO / SELECT / FOR / CASE / CALL), found {s}", .{self.curTag().describe()});
+    }
+
+    /// `DESCRIBE <source>;` or `DESCRIBE <query>;` — the columns and engine types
+    /// of a file, a table, a `conn.QUERY(...)` or a query, as rows. Lowered to an
+    /// `EXPLAIN` in `describe` mode over `read | write stdout`, so every place that
+    /// already walks an EXPLAIN (check, expand, for-each bodies) carries it too.
+    fn parseDescribe(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
+        const pos = self.curPos();
+        _ = self.advance();
+        var stages = std.array_list.Managed(ast.Stage).init(self.arena);
+        if (self.isKw("select") or self.isKw("with")) {
+            try self.parseQuery(out, &stages);
+        } else {
+            var aliases = AliasSet{};
+            var hints = std.array_list.Managed(ast.Hint).init(self.arena);
+            var node = try self.parseFromSource(&aliases, &hints);
+            if (self.isKw("with") and self.peekTag() == .lparen) {
+                _ = self.advance();
+                try self.parseWithHints(&hints);
+            }
+            // Only the shape is wanted: a table or query read is asked for no rows.
+            if (node == .read and (node.read.form == .table or node.read.form == .query)) node.read.where = "1 = 0";
+            try stages.append(.{ .node = node, .hints = try hints.toOwnedSlice(), .pos = pos });
+        }
+        try stages.append(.{ .node = .{ .write = .{ .connector = "stdout", .form = null, .target = "", .mode = .default } }, .hints = &.{}, .pos = pos });
+        _ = try self.expect(.semi);
+        try out.append(.{ .explain = .{ .mode = .describe, .pipeline = .{ .stages = try stages.toOwnedSlice(), .pos = pos }, .pos = pos } });
+    }
+
+    /// `SHOW TABLES FROM <conn>[.<schema>] [LIKE '<pattern>'];` — one row per table
+    /// or view, from the source's own catalog. Lowered to a terminal query over a
+    /// `conn.QUERY(...)` on `information_schema`, which every SQL connector has.
+    fn parseShow(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
+        const pos = self.curPos();
+        try self.expectKw("show");
+        try self.expectKw("tables");
+        try self.expectKw("from");
+        const conn = try self.expectIdent();
+        const kind = self.connType(conn) orelse
+            return self.fail(pos, "SHOW TABLES FROM: `{s}` is not a connection", .{conn});
+        var schema: ?[]const u8 = null;
+        if (self.eat(.dot)) schema = try self.expectIdent();
+        var like: ?[]const u8 = null;
+        if (self.eatKw("like")) like = (try self.expect(.string)).text;
+        _ = try self.expect(.semi);
+        if (std.mem.eql(u8, kind, "http"))
+            return self.fail(pos, "SHOW TABLES FROM: `{s}` is an http connection, which has no catalog", .{conn});
+
+        var q = std.array_list.Managed(u8).init(self.arena);
+        try q.appendSlice("SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_type IN ('BASE TABLE', 'VIEW')");
+        if (schema) |sc| {
+            try q.writer().print(" AND table_schema = '{s}'", .{sc});
+        } else {
+            try q.appendSlice(" AND table_schema NOT IN ('information_schema', 'pg_catalog', 'mysql', 'performance_schema', 'sys', '_statistics_')");
+        }
+        if (like) |pat| try q.writer().print(" AND table_name LIKE '{s}'", .{pat});
+        try q.appendSlice(" ORDER BY table_schema, table_name");
+
+        const stages = try self.arena.alloc(ast.Stage, 2);
+        stages[0] = .{ .node = .{ .read = .{ .connector = conn, .form = .{ .query = try q.toOwnedSlice() } } }, .hints = &.{}, .pos = pos };
+        stages[1] = .{ .node = .{ .write = .{ .connector = "stdout", .form = null, .target = "", .mode = .default } }, .hints = &.{}, .pos = pos };
+        try out.append(.{ .output = .{ .stages = stages, .pos = pos } });
+    }
+
+    fn connType(self: *Parser, name: []const u8) ?[]const u8 {
+        for (self.conn_names.items, self.conn_types.items) |n, t| {
+            if (std.ascii.eqlIgnoreCase(n, name)) return t;
+        }
+        return null;
     }
 
     /// `EXPLAIN [ANALYZE] <query>;` in statement position — the same query forms a
@@ -551,6 +626,7 @@ pub const Parser = struct {
         if (self.eatKw("connection")) {
             const conn = try self.parseConnection(pos);
             try self.conn_names.append(conn.name);
+            try self.conn_types.append(conn.connector);
             return out.append(.{ .connection = conn });
         }
         if (self.eatKw("function")) {
@@ -4016,6 +4092,34 @@ test "sql: IDENTIFIER(expr) in a column position -> a field named by a template"
         else => {},
     };
     try testing.expect(saw_agg and saw_sort);
+}
+
+test "sql: DESCRIBE lowers to a describe-mode EXPLAIN that asks a table for no rows; SHOW TABLES to a catalog query" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parseSource(a,
+        \\CREATE CONNECTION erp TYPE postgres OPTIONS (host = 'h', database = 'd');
+        \\DESCRIBE erp.public.orders;
+        \\DESCRIBE 'x.csv' WITH (delimiter = ';');
+        \\DESC SELECT 1 AS x;
+        \\SHOW TABLES FROM erp.public LIKE 'ord%';
+    , &diag);
+    const t = prog.stmts[2].explain;
+    try testing.expectEqual(ast.ExplainMode.describe, t.mode);
+    try testing.expectEqualStrings("1 = 0", t.pipeline.stages[0].node.read.where);
+    try testing.expect(t.pipeline.stages[t.pipeline.stages.len - 1].node == .write);
+    try testing.expectEqualStrings("delimiter", prog.stmts[3].explain.pipeline.stages[0].hints[0].key);
+    try testing.expectEqual(ast.ExplainMode.describe, prog.stmts[4].explain.mode);
+    const show = prog.stmts[5].output.stages[0].node.read;
+    try testing.expectEqualStrings("erp", show.connector);
+    try testing.expect(std.mem.indexOf(u8, show.form.query, "information_schema.tables") != null);
+    try testing.expect(std.mem.indexOf(u8, show.form.query, "table_schema = 'public'") != null);
+    try testing.expect(std.mem.indexOf(u8, show.form.query, "LIKE 'ord%'") != null);
+
+    try testing.expectError(error.ParseFailed, parseSource(a, "SHOW TABLES FROM nope;", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "not a connection") != null);
 }
 
 test "sql: FROM IDENTIFIER(expr) -> a computed path read" {

@@ -1168,7 +1168,7 @@ fn scalarCanNeedQuote(delim: u8) bool {
     };
 }
 
-fn writeField(w: anytype, s: []const u8, delim: u8) !void {
+pub fn writeField(w: anytype, s: []const u8, delim: u8) !void {
     if (needsQuote(s, delim)) {
         try w.writeByte('"');
         for (s) |c| {
@@ -1265,7 +1265,7 @@ test "CsvReader maps http status: 4xx permanent, 5xx transient" {
 /// Parse `data` (whole CSV lines, no header) as `ncols` string columns and
 /// return the one resulting batch — the pure-parsing entry shared by every
 /// reader backend (`splitInto` under a `CsvSliceReader`).
-fn parseSlice(a: std.mem.Allocator, schema: *const types.Schema, data: []const u8) !Batch {
+pub fn parseSlice(a: std.mem.Allocator, schema: *const types.Schema, data: []const u8) !Batch {
     var r = CsvSliceReader{ .data = data, .schema = schema };
     return (try r.next(a)).?;
 }

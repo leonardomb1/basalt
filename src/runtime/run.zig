@@ -8,6 +8,7 @@ const expand = @import("../lang/expand.zig");
 const types = @import("../lang/types.zig");
 const op = @import("../exec/op.zig");
 const Batch = @import("../exec/batch.zig").Batch;
+const csv = @import("../connect/csv.zig");
 const column = @import("../exec/column.zig");
 const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
@@ -613,6 +614,7 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, 
 /// check` builds, through the same `analyze.render`. Both are scoped to this one
 /// statement: everything before and after it runs normally, at full parallelism.
 pub fn runExplain(env: *Env, e: ast.ExplainStmt, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+    if (e.mode == .describe) return runDescribe(env, e.pipeline, stats);
     if (e.mode == .analyze) {
         const outer = env.explain;
         env.explain = true;
@@ -819,6 +821,55 @@ test {
     _ = @import("lanes.zig");
     _ = @import("script.zig");
     _ = @import("run_test.zig");
+}
+
+const describe_fields = [_]types.Schema.Field{
+    .{ .name = "column", .ty = types.Type.init(.string) },
+    .{ .name = "type", .ty = types.Type.init(.string) },
+    .{ .name = "nullable", .ty = types.Type.init(.string) },
+};
+
+/// The rows `DESCRIBE` prints for `schema`, as CSV text (no header): one per
+/// column, its engine type spelled the way `EXPLAIN` spells it, `yes`/`no`.
+pub fn describeRows(arena: std.mem.Allocator, schema: types.Schema) ![]const u8 {
+    var text = std.array_list.Managed(u8).init(arena);
+    for (schema.fields) |f| {
+        try csv.writeField(text.writer(), f.name, ',');
+        if (f.ty.kind == .decimal)
+            try text.writer().print(",decimal({d},{d}),{s}\n", .{ f.ty.precision, f.ty.scale, if (f.ty.nullable) "yes" else "no" })
+        else
+            try text.writer().print(",{s},{s}\n", .{ @tagName(f.ty.kind), if (f.ty.nullable) "yes" else "no" });
+    }
+    return text.toOwnedSlice();
+}
+
+/// `DESCRIBE`: open the source for its schema alone — the engine's types, which
+/// are what a sink would receive — and print one row per column through the
+/// ordinary stdout sink, so `--format json|csv` shape it like any result.
+fn runDescribe(env: *Env, pipe: ast.Pipeline, stats: *Stats) anyerror!void {
+    errdefer env.diag.stamp(pipe.pos);
+    const arena = env.arena;
+    const stages = pipe.stages[0 .. pipe.stages.len - 1];
+    var ddiag = analyze.Diag{};
+    env.csv_in = analyze.dialectFromHints(stages[0].hints, &ddiag) catch return planErr(env.diag, try arena.dupe(u8, ddiag.msg));
+    env.fmt_in = analyze.formatFromHints(stages[0].hints, &ddiag) catch return planErr(env.diag, try arena.dupe(u8, ddiag.msg));
+    if (stages[0].node == .read and stages[0].node.read.form == .path and std.mem.eql(u8, stages[0].node.read.connector, "csv"))
+        try guardFileFormat(env, stages[0].node.read.form.path, env.fmt_in, "read");
+
+    const base = env.sources.items.len;
+    defer {
+        for (env.sources.items[base..]) |sc| sc.close();
+        env.sources.shrinkRetainingCapacity(base);
+    }
+    const res = try buildPipeline(env, stages);
+
+    const schema = types.Schema{ .fields = &describe_fields };
+    const batch = try csv.parseSlice(arena, &schema, try describeRows(arena, res.schema));
+    const snk = try openSink(env, pipe.stages[pipe.stages.len - 1].node.write, schema);
+    errdefer snk.abort();
+    try snk.writeBatch(arena, batch);
+    try snk.close();
+    stats.rows_out += batch.len;
 }
 
 /// Does the script have more than one `LOAD` to report — several statements, or
