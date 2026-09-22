@@ -10,21 +10,21 @@ pub const Style = enum(u8) { plain, keyword, string, number, comment, param, pun
 /// The words the parser reads as keywords (`sql_parser.zig`'s `isKw` set), plus
 /// the aggregate and window names that read as keywords to a person.
 pub const keywords = [_][]const u8{
-    "accept",    "all",       "analyze",  "anchor",    "and",      "anti",       "append",    "as",        "asc",
-    "at",        "between",   "body",     "buffer",    "by",       "call",       "case",      "cols",      "connection",
-    "continue",  "costs",     "create",   "cross",     "current",  "default",    "desc",      "distinct",  "doc",
-    "each",      "else",      "empty",    "end",       "endpoint", "error",      "every",     "except",    "exclude",
-    "explain",   "flush",     "for",      "from",      "full",     "function",   "group",     "having",    "header",
-    "hours",     "http",      "identifier", "in",      "inner",    "into",       "is",        "jobs",      "join",
-    "json",      "left",      "let",      "like",      "limit",    "load",       "loaded",    "max",       "name",
-    "not",       "null",      "of",       "offset",    "on",       "options",    "or",        "order",     "outer",
-    "over",      "paginate",  "parallel", "param",     "partial",  "partition",  "preceding", "precision", "print",
-    "pushdown",  "query",     "range",    "rename",    "replace",  "retain",     "retry",     "right",     "row",
-    "rows",      "schema",    "seconds",  "segment",   "select",   "semi",       "sequential", "split",    "stop",
-    "table",     "then",      "throw",    "type",      "unbounded", "union",     "unnest",    "until",     "upsert",
-    "using",     "when",      "where",    "with",      "true",     "false",      "count",     "sum",       "avg",
-    "min",       "median",    "cast",     "try_cast",  "if",       "rank",       "dense_rank", "row_number", "lag",
-    "lead",      "string",    "int",      "float",     "decimal",  "bool",       "date",      "time",      "timestamp",
+    "accept",   "all",      "analyze",    "anchor",   "and",       "anti",      "append",     "as",         "asc",
+    "at",       "between",  "body",       "buffer",   "by",        "call",      "case",       "cols",       "connection",
+    "continue", "costs",    "create",     "cross",    "current",   "default",   "desc",       "distinct",   "doc",
+    "each",     "else",     "empty",      "end",      "endpoint",  "error",     "every",      "except",     "exclude",
+    "explain",  "flush",    "for",        "from",     "full",      "function",  "group",      "having",     "header",
+    "hours",    "http",     "identifier", "in",       "inner",     "into",      "is",         "jobs",       "join",
+    "json",     "left",     "let",        "like",     "limit",     "load",      "loaded",     "max",        "name",
+    "not",      "null",     "of",         "offset",   "on",        "options",   "or",         "order",      "outer",
+    "over",     "paginate", "parallel",   "param",    "partial",   "partition", "preceding",  "precision",  "print",
+    "pushdown", "query",    "range",      "rename",   "replace",   "retain",    "retry",      "right",      "row",
+    "rows",     "schema",   "seconds",    "segment",  "select",    "semi",      "sequential", "split",      "stop",
+    "table",    "then",     "throw",      "type",     "unbounded", "union",     "unnest",     "until",      "upsert",
+    "using",    "when",     "where",      "with",     "true",      "false",     "count",      "sum",        "avg",
+    "min",      "median",   "cast",       "try_cast", "if",        "rank",      "dense_rank", "row_number", "lag",
+    "lead",     "string",   "int",        "float",    "decimal",   "bool",      "date",       "time",       "timestamp",
 };
 
 fn isKeyword(word: []const u8) bool {

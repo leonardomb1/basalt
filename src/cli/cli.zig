@@ -875,7 +875,7 @@ fn suggest(ctx: *anyopaque, arena: std.mem.Allocator, text: []const u8, cursor: 
     var ctes = std.array_list.Managed([]const u8).init(arena);
     var i: usize = 0;
     while (i + 4 < text.len) : (i += 1) {
-        const at_with = std.ascii.eqlIgnoreCase(text[i .. @min(text.len, i + 4)], "with") and (i == 0 or !std.ascii.isAlphanumeric(text[i - 1]));
+        const at_with = std.ascii.eqlIgnoreCase(text[i..@min(text.len, i + 4)], "with") and (i == 0 or !std.ascii.isAlphanumeric(text[i - 1]));
         if (!(at_with or text[i] == ',')) continue;
         var j = if (at_with) i + 4 else i + 1;
         while (j < text.len and (text[j] == ' ' or text[j] == '\n')) j += 1;
