@@ -911,6 +911,18 @@ At a use site the innermost binding wins: loop var > LET/PARAM.
   Plain re-declaration of a name is an error; `OR REPLACE` is the sanctioned
   overwrite.
 
+### `DESCRIBE` and `SHOW TABLES`
+
+`DESCRIBE <source>;` prints one row per column — `column`, `type`, `nullable`
+— for a file, a `conn.schema.table`, a `conn.QUERY($$...$$)` or a whole query
+(`DESCRIBE SELECT ...`, CTEs included). The types are the engine's, i.e. what a
+sink would receive; a table or query is asked for no rows, so it is cheap on a
+large one. `SHOW TABLES FROM <conn>[.<schema>] [LIKE 'pattern'];` lists a SQL
+source's tables and views from its `information_schema` (`table_schema`,
+`table_name`, `table_type`), system schemas left out. Both are ordinary result
+statements: `basalt run --format json -c "DESCRIBE erp.dbo.SC5010;"` gives a
+program the schema, and the REPL's `\d` and `\dt` are the same statements.
+
 ### `EXPLAIN`
 
 `EXPLAIN <statement>` prints the plan instead of running it.
@@ -1071,14 +1083,41 @@ first and last rows, `q` leaves.
 `basalt repl` executes on a top-level `;` and carries `CREATE CONNECTION` /
 `CREATE FUNCTION` / `PARAM` declarations across entries (re-declaring a name
 replaces it). Meta commands: `\connections` list the session's declarations ·
-`\clear` drop them · `\format table|json|csv|tsv` switch result output · `\view` scroll
+`\reset` drop them · `\clear` (or `clear`, `cls`, `^L`) clear the screen · `\format table|json|csv|tsv` switch result output · `\view` scroll
 the last result · `\help` ·
 `\q`.
 
-The entry is a small text editor rather than a single line. Enter opens a new
-line, keeping the indent, until the statement ends in a top-level `;`, and runs it
-once it does; Alt+Enter, or Enter on an empty last line, runs the entry as it
-stands. Arrows travel the whole entry — Ctrl+arrows by word, Home/End the line,
+The entry is a small text editor rather than a single line, with an editor's
+habits. Enter runs the entry when it ends in a top-level `;` and the cursor is at
+its end; anywhere else it opens a line — and after `(` it steps in and puts the
+`)` on a line of its own. Ctrl+J runs the entry as it
+stands, `;` or not (Ctrl+Enter too, where the terminal delivers it). Brackets and quotes close themselves, typing the closer
+steps over it, and over a selection they wrap it; the matching bracket is
+underlined. Alt+Up/Down move the line or selected lines, Shift+Alt+Up/Down
+duplicate them, Tab and Shift+Tab indent and dedent a selection, Ctrl+/ comments
+lines out with `--` and back in, Esc drops the selection. The entry is coloured
+as you type (keywords, strings, numbers, comments, `$params`; `NO_COLOR` turns
+it off), a multi-line entry gets line numbers in its gutter, and a parse error
+is shown with a caret under the column it names.
+
+`^R` searches the history incrementally (type to narrow, `^R` for an older
+match, Enter keeps it). A session starts by running `~/.config/basalt/repl.sql`
+(or `$XDG_CONFIG_HOME/basalt/repl.sql`) when it exists — the place for the
+connections you always want, with `env()` for the secrets — and `\save` writes
+the session's declarations there (or to a named file); `\i <file>` runs any
+file so its declarations join the session; `\connections` shows them as a
+table with host, database and whether the session has reached them (`\c test`
+reaches each now); `\edit` opens the last entry in `$EDITOR` and runs what
+comes back.
+
+Tab completes the word under the cursor: keywords (in the case you are typing),
+the session's connections, functions and `$params`, the entry's CTEs, a path
+inside an unclosed quote, `conn.` followed by that connection's tables, and the
+columns of every table and file the entry names. Tables and columns are asked
+of the source once per session, on first use, through the same
+`information_schema` queries `SHOW TABLES` and `DESCRIBE` run. A lone match is
+taken; several fill in what they share and come up as a row of choices that
+Tab cycles through. Arrows travel the whole entry — Ctrl+arrows by word, Home/End the line,
 Ctrl+Home/End the entry — and Up or Down past its edge recall history, where an
 entry comes back whole however many lines it had (`~/.basalt_history`). Shift
 with any of those selects; typing, Backspace and Delete replace the selection.

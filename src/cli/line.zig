@@ -9,10 +9,13 @@
 //! so query execution and error printing run under normal cooked-mode rules.
 //!
 //! What a terminal cannot give: the mouse (claiming it would take away the
-//! terminal's own selection) and Ctrl+Enter, which arrives as plain Enter —
-//! Alt+Enter runs an entry as it stands instead.
+//! terminal's own selection), multiple cursors, and any run key it keeps for
+//! itself — Windows Terminal owns Alt+Enter and sends Ctrl+Enter as plain Enter.
+//! So an unfinished entry runs with Ctrl+J, which every terminal delivers, and
+//! with Ctrl+Enter where xterm's modifyOtherKeys is spoken.
 
 const std = @import("std");
+const hilite = @import("hilite.zig");
 
 pub const Result = union(enum) { line: []u8, eof, interrupt };
 
@@ -28,12 +31,20 @@ pub const Key = union(enum) {
     char: u8,
     enter,
     alt_enter,
+    ctrl_enter,
     tab,
     backspace,
     delete,
     nav: Nav,
     page_up,
     page_down,
+    escape, // a bare Esc: drop the selection
+    shift_tab,
+    line_up, // Alt-Up: move the line
+    line_down,
+    dup_up, // Shift-Alt-Up: duplicate the line
+    dup_down,
+    comment, // Ctrl-/ (0x1f)
     kill_end, // ^K
     kill_line, // ^U
     word_back, // ^W, Alt-Backspace, Ctrl-Backspace
@@ -45,6 +56,7 @@ pub const Key = union(enum) {
     paste, // ^V, when the terminal passes it through
     paste_begin, // ESC [ 200 ~ : a bracketed paste follows
     clear, // ^L
+    search, // ^R: search the history
     interrupt, // ^C: copy when something is selected, else drop the entry
     eof_or_delete, // ^D: EOF on an empty entry, delete-at-cursor otherwise
     none, // unrecognized escape — ignore
@@ -52,27 +64,69 @@ pub const Key = union(enum) {
 
 /// Decode one keypress from `fd` (one byte, plus the tail of an ESC sequence).
 /// Split out so it is testable over a pipe.
+/// A control byte (`^A` = 1 …) as a key; null where it means nothing here.
+fn controlKey(c: u8) ?Key {
+    return switch (c) {
+        '\r' => .enter,
+        '\n' => .ctrl_enter,
+        '\t' => .tab,
+        0x7f => .backspace,
+        0x08 => .word_back,
+        0x01 => .select_all,
+        0x05 => .{ .nav = .{ .to = .end } },
+        0x0b => .kill_end,
+        0x15 => .kill_line,
+        0x17 => .word_back,
+        0x18 => .cut,
+        0x16 => .paste,
+        0x19 => .redo,
+        0x1a => .undo,
+        0x0c => .clear,
+        0x12 => .search,
+        0x03 => .interrupt,
+        0x04 => .eof_or_delete,
+        0x1f => .comment,
+        else => null,
+    };
+}
+
+/// Is there a byte to read on `fd` within `ms`? A lone Esc is followed by nothing;
+/// the Esc that opens a key sequence is followed at once.
+fn pending(fd: std.posix.fd_t, ms: i32) bool {
+    var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const n = std.posix.poll(&fds, ms) catch return true;
+    return n > 0;
+}
+
+/// A key the terminal reported as a code plus modifiers — the xterm
+/// `CSI 27;mod;code~` and kitty `CSI code;mod u` forms, which are how Ctrl+Enter
+/// arrives when it arrives at all. `mask`: shift 1, alt 2, ctrl 4.
+fn modifiedKey(code: u32, mask: u32) Key {
+    const ctrl = mask & 4 != 0;
+    const alt = mask & 2 != 0;
+    // Ctrl+Enter, Shift+Enter (Jupyter's) and Alt+Enter all run; the plain key is Enter.
+    if (code == 13 or code == 10) return if (ctrl or mask & 1 != 0) .ctrl_enter else if (alt) .alt_enter else .enter;
+    if (code == 27) return .none;
+    if (code > 0x7f) return .none;
+    const c: u8 = @intCast(code);
+    if (alt) return switch (c) {
+        'b' => .{ .nav = .{ .to = .word_left } },
+        'f' => .{ .nav = .{ .to = .word_right } },
+        'd' => .word_fwd_kill,
+        0x7f, 0x08 => .word_back,
+        else => .none,
+    };
+    if (ctrl) return if (std.ascii.isAlphabetic(c)) (controlKey(std.ascii.toLower(c) & 0x1f) orelse .none) else .none;
+    return controlKey(c) orelse if (c >= 0x20) Key{ .char = c } else .none;
+}
+
 pub fn readKey(fd: std.posix.fd_t) !Key {
     var b: [1]u8 = undefined;
     if (try std.posix.read(fd, &b) == 0) return .eof_or_delete;
+    if (controlKey(b[0])) |k| return k;
     switch (b[0]) {
-        '\r', '\n' => return .enter,
-        '\t' => return .tab,
-        0x7f => return .backspace,
-        0x08 => return .word_back,
-        0x01 => return .select_all,
-        0x05 => return .{ .nav = .{ .to = .end } },
-        0x0b => return .kill_end,
-        0x15 => return .kill_line,
-        0x17 => return .word_back,
-        0x18 => return .cut,
-        0x16 => return .paste,
-        0x19 => return .redo,
-        0x1a => return .undo,
-        0x0c => return .clear,
-        0x03 => return .interrupt,
-        0x04 => return .eof_or_delete,
         0x1b => {
+            if (!pending(fd, 40)) return .escape;
             if (try std.posix.read(fd, &b) == 0) return .none;
             switch (b[0]) {
                 '[', 'O' => {},
@@ -88,13 +142,14 @@ pub fn readKey(fd: std.posix.fd_t) !Key {
             // `ESC [ 1 ; 5 C` cut short at the `;` left `5C` to be typed into the line.
             var first: u32 = 0;
             var modifier: u32 = 0;
+            var third: u32 = 0;
             var field: usize = 0;
             while (true) {
                 if (try std.posix.read(fd, &b) == 0) return .none;
                 switch (b[0]) {
                     '0'...'9' => {
                         const d = b[0] - '0';
-                        if (field == 0) first = first *| 10 +| d else if (field == 1) modifier = modifier *| 10 +| d;
+                        if (field == 0) first = first *| 10 +| d else if (field == 1) modifier = modifier *| 10 +| d else if (field == 2) third = third *| 10 +| d;
                     },
                     ';', ':' => field += 1,
                     0x20...0x2f, '<', '=', '>', '?' => {},
@@ -104,15 +159,19 @@ pub fn readKey(fd: std.posix.fd_t) !Key {
             // xterm's modifier parameter is 1 + a bitmask: shift 1, alt 2, ctrl 4.
             const mask = if (modifier > 1) modifier - 1 else 0;
             const shift = mask & 1 != 0;
+            const alt = mask & 2 != 0;
             const word = mask & 0b110 != 0;
             return switch (b[0]) {
-                'A' => .{ .nav = .{ .to = .up, .select = shift } },
-                'B' => .{ .nav = .{ .to = .down, .select = shift } },
+                'u' => modifiedKey(first, mask),
+                'Z' => .shift_tab,
+                'A' => if (alt) (if (shift) Key.dup_up else Key.line_up) else .{ .nav = .{ .to = .up, .select = shift } },
+                'B' => if (alt) (if (shift) Key.dup_down else Key.line_down) else .{ .nav = .{ .to = .down, .select = shift } },
                 'C' => .{ .nav = .{ .to = if (word) .word_right else .right, .select = shift } },
                 'D' => .{ .nav = .{ .to = if (word) .word_left else .left, .select = shift } },
                 'H' => .{ .nav = .{ .to = if (word) .buf_home else .home, .select = shift } },
                 'F' => .{ .nav = .{ .to = if (word) .buf_end else .end, .select = shift } },
                 '~' => switch (first) {
+                    27 => modifiedKey(third, mask),
                     1, 7 => .{ .nav = .{ .to = if (word) .buf_home else .home, .select = shift } },
                     4, 8 => .{ .nav = .{ .to = if (word) .buf_end else .end, .select = shift } },
                     3 => if (word) .word_fwd_kill else .delete,
@@ -124,10 +183,7 @@ pub fn readKey(fd: std.posix.fd_t) !Key {
                 else => .none,
             };
         },
-        else => {
-            if (b[0] >= 0x20 or b[0] >= 0x80) return .{ .char = b[0] };
-            return .none;
-        },
+        else => return if (b[0] >= 0x20) .{ .char = b[0] } else .none,
     }
 }
 
@@ -329,17 +385,37 @@ pub const Buffer = struct {
         self.typing = plain;
     }
 
-    /// A new line that starts where the current one does: the indent carries over.
+    /// A new line, at the line's start — a prompt, not a code editor: an indent
+    /// that followed the cursor down read as the cursor refusing to go home.
+    /// Between `(` and `)` the new line steps in two past the opener's line, and
+    /// the closer moves to a line of its own at that line's indent.
     pub fn newline(self: *Buffer) !void {
         const t = self.text.items;
+        const prev: u8 = if (self.cursor > 0) t[self.cursor - 1] else 0;
+        const next: u8 = if (self.cursor < t.len) t[self.cursor] else 0;
+        const opened = prev == '(' or prev == '[' or prev == '{';
         const ls = self.lineStart(self.cursor);
         var ind = ls;
-        while (ind < self.cursor and (t[ind] == ' ' or t[ind] == '\t')) ind += 1;
+        while (opened and ind < self.cursor and (t[ind] == ' ' or t[ind] == '\t')) ind += 1;
         var buf: [128]u8 = undefined;
-        const n = @min(ind - ls, buf.len - 1);
+        const n = @min(ind - ls, buf.len - 4);
         buf[0] = '\n';
         @memcpy(buf[1 .. 1 + n], t[ls .. ls + n]);
-        try self.insert(buf[0 .. 1 + n]);
+        var len = 1 + n;
+        if (opened) {
+            buf[len] = ' ';
+            buf[len + 1] = ' ';
+            len += 2;
+        }
+        const closes = opened and (next == ')' or next == ']' or next == '}');
+        if (closes) {
+            const tail = try std.mem.concat(self.gpa, u8, &.{ buf[0..len], buf[0 .. 1 + n] });
+            defer self.gpa.free(tail);
+            try self.insert(tail);
+            self.cursor -= 1 + n;
+            return;
+        }
+        try self.insert(buf[0..len]);
     }
 
     /// Delete the selection, or else what `to` would travel over from the cursor.
@@ -424,6 +500,210 @@ pub const Buffer = struct {
         }
     }
 
+    /// The logical lines the selection touches (or the cursor's), as `start..end`
+    /// where `end` is the last line's end, without its newline.
+    fn lineBlock(self: *const Buffer) Range {
+        const sel = self.selection() orelse Range{ .start = self.cursor, .end = self.cursor };
+        // A selection ending at the very start of a line does not include that line.
+        const last = if (sel.end > sel.start and self.text.items[sel.end - 1] == '\n') sel.end - 1 else sel.end;
+        return .{ .start = self.lineStart(sel.start), .end = self.lineEnd(last) };
+    }
+
+    /// Replace `r` with `s`, keeping the selection over the new text when there was
+    /// one; the cursor lands at `cursor` inside it (or the end).
+    fn replaceBlock(self: *Buffer, r: Range, s: []const u8, cursor: ?usize, keep_sel: bool) !void {
+        try self.checkpoint(false);
+        try self.text.replaceRange(r.start, r.end - r.start, s);
+        self.anchor = if (keep_sel) r.start else null;
+        self.cursor = r.start + (cursor orelse s.len);
+    }
+
+    /// Alt-Up / Alt-Down: the current lines swap places with the neighbour.
+    pub fn moveLines(self: *Buffer, down: bool) !void {
+        const t = self.text.items;
+        const blk = self.lineBlock();
+        const had_sel = self.selection() != null;
+        const off = self.cursor - blk.start;
+        const anchor_off = if (self.anchor) |a| a - blk.start else off;
+        if (down) {
+            if (blk.end >= t.len) return;
+            const nb = Range{ .start = blk.end + 1, .end = self.lineEnd(blk.end + 1) };
+            const joined = try std.mem.concat(self.gpa, u8, &.{ t[nb.start..nb.end], "\n", t[blk.start..blk.end] });
+            defer self.gpa.free(joined);
+            const shift = nb.end - nb.start + 1;
+            try self.replaceBlock(.{ .start = blk.start, .end = nb.end }, joined, shift + off, false);
+            if (had_sel) self.anchor = blk.start + shift + anchor_off;
+        } else {
+            if (blk.start == 0) return;
+            const pb = Range{ .start = self.lineStart(blk.start - 1), .end = blk.start - 1 };
+            const joined = try std.mem.concat(self.gpa, u8, &.{ t[blk.start..blk.end], "\n", t[pb.start..pb.end] });
+            defer self.gpa.free(joined);
+            try self.replaceBlock(.{ .start = pb.start, .end = blk.end }, joined, off, false);
+            if (had_sel) self.anchor = pb.start + anchor_off;
+        }
+    }
+
+    /// Shift-Alt-Up / Shift-Alt-Down: a copy of the current lines above or below.
+    pub fn duplicateLines(self: *Buffer, down: bool) !void {
+        const blk = self.lineBlock();
+        const off = self.cursor - blk.start;
+        const lines = try self.gpa.dupe(u8, self.text.items[blk.start..blk.end]);
+        defer self.gpa.free(lines);
+        const joined = try std.mem.concat(self.gpa, u8, &.{ lines, "\n", lines });
+        defer self.gpa.free(joined);
+        try self.replaceBlock(blk, joined, if (down) lines.len + 1 + off else off, false);
+    }
+
+    /// Tab / Shift-Tab over lines: two spaces in or out at the start of each.
+    pub fn indentLines(self: *Buffer, out: bool) !void {
+        const blk = self.lineBlock();
+        const t = self.text.items;
+        var buf = std.array_list.Managed(u8).init(self.gpa);
+        defer buf.deinit();
+        var it = std.mem.splitScalar(u8, t[blk.start..blk.end], '\n');
+        var first = true;
+        var cursor_shift: isize = 0;
+        while (it.next()) |ln| {
+            if (!first) try buf.append('\n');
+            first = false;
+            if (out) {
+                var strip: usize = 0;
+                while (strip < 2 and strip < ln.len and ln[strip] == ' ') strip += 1;
+                try buf.appendSlice(ln[strip..]);
+                cursor_shift -= @intCast(strip);
+            } else {
+                try buf.appendSlice("  ");
+                try buf.appendSlice(ln);
+                cursor_shift += 2;
+            }
+        }
+        const had_sel = self.selection() != null;
+        const new_cursor: usize = @intCast(@max(0, @as(isize, @intCast(self.cursor)) + cursor_shift) - @as(isize, @intCast(blk.start)));
+        try self.replaceBlock(blk, buf.items, @min(new_cursor, buf.items.len), had_sel);
+        if (had_sel) self.cursor = blk.start + buf.items.len;
+    }
+
+    /// Ctrl-/: comment the lines out with `-- `, or back in when they all are.
+    pub fn toggleComment(self: *Buffer) !void {
+        const blk = self.lineBlock();
+        const t = self.text.items;
+        var all = true;
+        var it = std.mem.splitScalar(u8, t[blk.start..blk.end], '\n');
+        while (it.next()) |ln| {
+            const s = std.mem.trimLeft(u8, ln, " \t");
+            if (s.len > 0 and !std.mem.startsWith(u8, s, "--")) all = false;
+        }
+        var buf = std.array_list.Managed(u8).init(self.gpa);
+        defer buf.deinit();
+        it = std.mem.splitScalar(u8, t[blk.start..blk.end], '\n');
+        var first = true;
+        while (it.next()) |ln| {
+            if (!first) try buf.append('\n');
+            first = false;
+            const ind = ln.len - std.mem.trimLeft(u8, ln, " \t").len;
+            const body = ln[ind..];
+            try buf.appendSlice(ln[0..ind]);
+            if (all) {
+                if (std.mem.startsWith(u8, body, "-- ")) try buf.appendSlice(body[3..]) else if (std.mem.startsWith(u8, body, "--")) try buf.appendSlice(body[2..]) else try buf.appendSlice(body);
+            } else {
+                try buf.appendSlice("-- ");
+                try buf.appendSlice(body);
+            }
+        }
+        const had_sel = self.selection() != null;
+        try self.replaceBlock(blk, buf.items, null, had_sel);
+        if (had_sel) self.cursor = blk.start + buf.items.len;
+    }
+
+    fn closerOf(c: u8) ?u8 {
+        return switch (c) {
+            '(' => ')',
+            '[' => ']',
+            '{' => '}',
+            '\'' => '\'',
+            '"' => '"',
+            else => null,
+        };
+    }
+
+    /// A typed character, with an editor's reflexes: an opener over a selection
+    /// wraps it; an opener before a blank is paired with its closer; a closer that
+    /// is already the next character is stepped over; `)` on an empty line takes
+    /// the indent out first.
+    pub fn typeChar(self: *Buffer, c: u8) !void {
+        const t = self.text.items;
+        if (self.selection()) |r| if (closerOf(c)) |cl| {
+            const inner = try self.gpa.dupe(u8, t[r.start..r.end]);
+            defer self.gpa.free(inner);
+            const wrapped = try std.mem.concat(self.gpa, u8, &.{ &[_]u8{c}, inner, &[_]u8{cl} });
+            defer self.gpa.free(wrapped);
+            try self.replaceBlock(r, wrapped, null, false);
+            self.anchor = r.start + 1;
+            self.cursor = r.start + 1 + inner.len;
+            return;
+        };
+        const next: u8 = if (self.cursor < t.len) t[self.cursor] else 0;
+        const prev: u8 = if (self.cursor > 0) t[self.cursor - 1] else 0;
+        if ((c == ')' or c == ']' or c == '}' or c == '\'' or c == '"') and next == c) {
+            self.move(.{ .to = .right });
+            return;
+        }
+        if (c == ')' or c == ']' or c == '}') {
+            const ls = self.lineStart(self.cursor);
+            if (std.mem.trim(u8, t[ls..self.cursor], " ").len == 0 and self.cursor - ls >= 2) {
+                try self.checkpoint(false);
+                self.removeRange(.{ .start = self.cursor - 2, .end = self.cursor });
+            }
+        }
+        if (closerOf(c)) |cl| {
+            const quote = c == '\'' or c == '"';
+            const before_ok = !quote or !isWordByte(prev);
+            const after_ok = next == 0 or next == ' ' or next == '\n' or next == ')' or next == ']' or next == '}' or next == ',' or next == ';';
+            if (before_ok and after_ok) {
+                try self.insert(&[_]u8{ c, cl });
+                self.cursor -= 1;
+                return;
+            }
+        }
+        try self.insert(&[_]u8{c});
+    }
+
+    /// The bracket paired with the one at or just before the cursor, as the two
+    /// byte offsets, for the repaint to underline. Strings are not looked into.
+    pub fn bracketPair(self: *const Buffer) ?[2]usize {
+        const t = self.text.items;
+        const at: usize = if (self.cursor < t.len and isBracket(t[self.cursor])) self.cursor else if (self.cursor > 0 and isBracket(t[self.cursor - 1])) self.cursor - 1 else return null;
+        const c = t[at];
+        const open = c == '(' or c == '[' or c == '{';
+        const mate: u8 = switch (c) {
+            '(' => ')',
+            ')' => '(',
+            '[' => ']',
+            ']' => '[',
+            '{' => '}',
+            else => '{',
+        };
+        var depth: usize = 0;
+        var i = at;
+        while (true) {
+            if (t[i] == c) depth += 1 else if (t[i] == mate) {
+                depth -= 1;
+                if (depth == 0) return .{ @min(at, i), @max(at, i) };
+            }
+            if (open) {
+                i += 1;
+                if (i >= t.len) return null;
+            } else {
+                if (i == 0) return null;
+                i -= 1;
+            }
+        }
+    }
+
+    fn isBracket(c: u8) bool {
+        return c == '(' or c == ')' or c == '[' or c == ']' or c == '{' or c == '}';
+    }
+
     /// Travel. With `select` the anchor stays put and the cursor drags the
     /// selection; without it a selection collapses — and Left or Right collapse to
     /// its near edge rather than stepping past it.
@@ -478,13 +758,22 @@ pub const Editor = struct {
     /// entry taller than the terminal shows a window around the cursor.
     cursor_row: usize = 0,
     top: usize = 0,
+    /// Colour the entry (off under `NO_COLOR`).
+    color: bool = true,
 
     const max_history = 500;
-    /// Both prompts are this wide and wrapped rows are indented to match, so every
-    /// row of an entry has the same room.
-    const gutter = 2;
-    const prompt_first = "\xc2\xbb ";
-    const prompt_more = "\xe2\x80\xa6 ";
+    /// `» ` on the first line and, once there are more, each line's number in
+    /// that same two-column place — the gutter grows only past nine lines, so the
+    /// text never jumps as an entry gains a second line. Wrapped rows are blank there.
+    const prompt_first = "\xc2\xbb";
+
+    fn gutterWidth(text: []const u8) usize {
+        const lines = std.mem.count(u8, text, "\n") + 1;
+        var digits: usize = 1;
+        var n = lines;
+        while (n >= 10) : (n /= 10) digits += 1;
+        return @max(2, digits + 1);
+    }
     /// A newline inside a history entry, on disk: the file stays one entry per line.
     const hist_newline = 0x1f;
 
@@ -492,6 +781,21 @@ pub const Editor = struct {
         /// Is this text a whole entry, so that Enter should run it rather than
         /// open another line?
         complete: *const fn ([]const u8) bool,
+        /// Tab: what the word at `cursor` could become. `items` are owned by
+        /// `arena`; the editor replaces `text[start..cursor]` with one of them.
+        suggest: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, text: []const u8, cursor: usize) anyerror!Suggestions = null,
+        suggest_ctx: *anyopaque = undefined,
+    };
+
+    pub const Suggestions = struct { start: usize = 0, items: []const []const u8 = &.{} };
+
+    /// A completion in progress: the choices, which is lit, and where the word
+    /// they replace begins. Any key but Tab dismisses it.
+    const Menu = struct {
+        arena: std.heap.ArenaAllocator,
+        items: []const []const u8,
+        start: usize,
+        index: ?usize = null,
     };
 
     pub fn init(gpa: std.mem.Allocator) Editor {
@@ -500,6 +804,7 @@ pub const Editor = struct {
             .in_fd = std.fs.File.stdin().handle,
             .out = std.fs.File.stderr(),
             .hist = std.array_list.Managed([]u8).init(gpa),
+            .color = !std.process.hasEnvVarConstant("NO_COLOR"),
         };
         self.loadHistory();
         return self;
@@ -574,7 +879,7 @@ pub const Editor = struct {
         self.write("\x07");
     }
 
-    fn textWidth(size: TermSize) usize {
+    fn textWidth(size: TermSize, gutter: usize) usize {
         return if (size.cols > gutter + 1) size.cols - gutter - 1 else 2;
     }
 
@@ -582,9 +887,18 @@ pub const Editor = struct {
     /// drawn last time and clears everything below, so rows a shorter entry no
     /// longer needs do not linger.
     fn redraw(self: *Editor, buf: *const Buffer) void {
+        self.redrawWith(buf, null);
+    }
+
+    fn redrawWith(self: *Editor, buf: *const Buffer, menu: ?*const Menu) void {
         const size = termSize(self.out);
         const text = buf.bytes();
-        const rows = layoutRows(self.gpa, text, textWidth(size)) catch return;
+        const gutter = gutterWidth(text);
+        const styles = self.gpa.alloc(hilite.Style, text.len) catch return;
+        defer self.gpa.free(styles);
+        hilite.scan(text, styles);
+        const pair = buf.bracketPair();
+        const rows = layoutRows(self.gpa, text, textWidth(size, gutter)) catch return;
         defer self.gpa.free(rows);
         const cur = rowOf(rows, buf.cursor);
         const room = if (size.rows > 1) size.rows - 1 else 1;
@@ -598,31 +912,156 @@ pub const Editor = struct {
         if (self.cursor_row > 0) w.print("\x1b[{d}A", .{self.cursor_row}) catch return;
         w.writeAll("\r\x1b[J") catch return;
         const sel = buf.selection();
-        for (rows[self.top..last], self.top..) |r, ri| {
+        var line_no: usize = 0;
+        for (rows[0..last], 0..) |r, ri| {
+            if (r.head) line_no += 1;
+            if (ri < self.top) continue;
             if (ri > self.top) w.writeAll("\r\n") catch return;
-            w.writeAll(if (!r.head) "  " else if (r.start == 0) prompt_first else prompt_more) catch return;
+            if (!r.head) {
+                w.writeByteNTimes(' ', gutter) catch return;
+            } else if (r.start == 0) {
+                w.writeByteNTimes(' ', gutter - 2) catch return;
+                w.writeAll(prompt_first ++ " ") catch return;
+            } else {
+                if (self.color) w.writeAll("\x1b[2m") catch return;
+                var nbuf: [24]u8 = undefined;
+                const num = std.fmt.bufPrint(&nbuf, "{d}", .{line_no}) catch return;
+                w.writeByteNTimes(' ', gutter - 1 - num.len) catch return;
+                w.writeAll(num) catch return;
+                w.writeAll(" ") catch return;
+                if (self.color) w.writeAll("\x1b[22m") catch return;
+            }
             var i = r.start;
             var lit = false;
+            var style: hilite.Style = .plain;
             while (i < r.end) {
                 const in_sel = if (sel) |s| i >= s.start and i < s.end else false;
                 if (in_sel != lit) {
                     w.writeAll(if (in_sel) "\x1b[7m" else "\x1b[27m") catch return;
                     lit = in_sel;
                 }
+                if (self.color and styles[i] != style) {
+                    style = styles[i];
+                    w.writeAll(hilite.sgr(style)) catch return;
+                }
                 const n = charLen(text, i);
+                const mate = if (pair) |p| (i == p[0] or i == p[1]) else false;
+                if (mate) w.writeAll("\x1b[4m") catch return;
                 w.writeAll(if (text[i] == '\t') "  " else text[i .. i + n]) catch return;
+                if (mate) w.writeAll("\x1b[24m") catch return;
                 i += n;
             }
+            if (self.color and style != .plain) w.writeAll(hilite.sgr_reset) catch return;
             // A selected line break shows as one lit cell past the row's end.
             const nl_sel = if (sel) |s| r.end < text.len and text[r.end] == '\n' and r.end >= s.start and r.end < s.end else false;
             if (nl_sel and !lit) w.writeAll("\x1b[7m") catch return;
             if (nl_sel) w.writeAll(" ") catch return;
             if (lit or nl_sel) w.writeAll("\x1b[27m") catch return;
         }
-        if (last - 1 > cur) w.print("\x1b[{d}A", .{last - 1 - cur}) catch return;
+        // The choices, one row under the entry: as many as fit, the lit one in
+        // reverse video, `…` when there are more.
+        var extra: usize = 0;
+        if (menu) |m| {
+            w.writeAll("\r\n") catch return;
+            var used: usize = 0;
+            for (m.items, 0..) |it, i| {
+                const need = colsBetween(it, 0, it.len) + 2;
+                if (used + need + 1 > size.cols) {
+                    w.writeAll("…") catch return;
+                    break;
+                }
+                if (m.index == i) w.writeAll("\x1b[7m") catch return else if (self.color) w.writeAll("\x1b[2m") catch return;
+                w.writeAll(it) catch return;
+                w.writeAll("\x1b[0m  ") catch return;
+                used += need;
+            }
+            extra = 1;
+        }
+        if (last - 1 + extra > cur) w.print("\x1b[{d}A", .{last - 1 + extra - cur}) catch return;
         w.print("\x1b[{d}G", .{gutter + colsBetween(text, rows[cur].start, buf.cursor) + 1}) catch return;
         self.write(out.items);
         self.cursor_row = cur - self.top;
+    }
+
+    /// Tab. With a menu up, the next choice replaces the word; otherwise the
+    /// provider is asked, a lone answer is taken, and several fill in what they
+    /// share and come up as a menu.
+    fn completeWord(self: *Editor, buf: *Buffer, opts: Options, menu: *?Menu) !void {
+        if (menu.*) |*m| {
+            const i = if (m.index) |i| (i + 1) % m.items.len else 0;
+            m.index = i;
+            try self.replaceWord(buf, m.start, m.items[i]);
+            return;
+        }
+        const suggest = opts.suggest orelse return buf.insert("  ");
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        errdefer arena.deinit();
+        const s = try suggest(opts.suggest_ctx, arena.allocator(), buf.bytes(), buf.cursor);
+        if (s.items.len == 0) {
+            arena.deinit();
+            return;
+        }
+        if (s.items.len == 1) {
+            try self.replaceWord(buf, s.start, s.items[0]);
+            arena.deinit();
+            return;
+        }
+        var n = s.items[0].len;
+        for (s.items[1..]) |it| {
+            var i: usize = 0;
+            while (i < n and i < it.len and std.ascii.toLower(it[i]) == std.ascii.toLower(s.items[0][i])) i += 1;
+            n = i;
+        }
+        if (n > buf.cursor - s.start) try self.replaceWord(buf, s.start, s.items[0][0..n]);
+        menu.* = .{ .arena = arena, .items = s.items, .start = s.start };
+    }
+
+    /// ^R: type to narrow, ^R again for an older match, Enter or an arrow keeps
+    /// the match in the entry, Esc or ^C puts the entry back as it was. The match
+    /// is shown in the entry itself, the query on the row under it.
+    fn searchHistory(self: *Editor, buf: *Buffer) !void {
+        const original = try self.gpa.dupe(u8, buf.bytes());
+        defer self.gpa.free(original);
+        var query = std.array_list.Managed(u8).init(self.gpa);
+        defer query.deinit();
+        var from: usize = self.hist.items.len;
+        var found: ?usize = null;
+        while (true) {
+            var status = std.array_list.Managed(u8).init(self.gpa);
+            defer status.deinit();
+            try status.writer().print("(reverse-i-search) '{s}'{s}", .{ query.items, if (found == null and query.items.len > 0) "  — no match" else "" });
+            const items = [_][]const u8{status.items};
+            const m = Menu{ .arena = std.heap.ArenaAllocator.init(self.gpa), .items = &items, .start = 0 };
+            self.redrawWith(buf, &m);
+            switch (try readKey(self.in_fd)) {
+                .char => |c| {
+                    try query.append(c);
+                    from = self.hist.items.len;
+                },
+                .backspace => {
+                    if (query.items.len == 0) continue;
+                    query.shrinkRetainingCapacity(query.items.len - 1);
+                    from = self.hist.items.len;
+                },
+                .search => if (found) |f| {
+                    from = f;
+                } else continue,
+                .escape, .interrupt => {
+                    try buf.set(original);
+                    return;
+                },
+                .enter, .nav, .tab => return,
+                else => continue,
+            }
+            found = historyMatch(self.hist.items, query.items, from);
+            if (found) |f| try buf.set(self.hist.items[f]);
+        }
+    }
+
+    fn replaceWord(self: *Editor, buf: *Buffer, start: usize, with: []const u8) !void {
+        _ = self;
+        buf.anchor = start;
+        try buf.insert(with);
     }
 
     /// Text arriving between the bracketed-paste markers: taken as typed, never as
@@ -670,12 +1109,20 @@ pub const Editor = struct {
         self.write("\x1b[?2004h");
         defer self.write("\x1b[?2004l");
 
+        // Ask for Ctrl+Enter: xterm's modifyOtherKeys, level 1, which touches only
+        // keys with no control code of their own. A terminal that does not know
+        // it ignores it.
+        self.write("\x1b[>4;1m");
+        defer self.write("\x1b[>4;0m");
+
         var buf = Buffer.init(self.gpa);
         defer buf.deinit();
         var hist_pos: usize = self.hist.items.len;
         var stash: ?[]u8 = null; // the entry in progress while browsing history
         defer if (stash) |s| self.gpa.free(s);
         var goal_col: ?usize = null;
+        var menu: ?Menu = null;
+        defer if (menu) |*m| m.arena.deinit();
 
         self.cursor_row = 0;
         self.top = 0;
@@ -683,13 +1130,20 @@ pub const Editor = struct {
         while (true) {
             const key = try readKey(self.in_fd);
             if (!(key == .nav and (key.nav.to == .up or key.nav.to == .down))) goal_col = null;
+            if (key != .tab) if (menu) |*m| {
+                m.arena.deinit();
+                menu = null;
+            };
             switch (key) {
-                .enter, .alt_enter => {
+                .enter, .alt_enter, .ctrl_enter => {
                     const text = buf.bytes();
-                    // Enter on an empty last line runs the entry too: the way out
-                    // when the statement has no `;` to end on.
-                    const blank_tail = buf.cursor == text.len and text.len > 0 and text[text.len - 1] == '\n';
-                    if (key == .alt_enter or blank_tail or opts.complete(text)) {
+                    // Enter runs a finished entry only from its end; in the middle, or
+                    // with no `;` yet, it is an editor's Enter — a new line. Ctrl+J and
+                    // Ctrl+Enter run whatever is there, from anywhere.
+                    const at_end = buf.cursor == text.len;
+                    const meta = std.mem.startsWith(u8, std.mem.trimLeft(u8, text, " \t"), "\\") and std.mem.indexOfScalar(u8, text, '\n') == null;
+                    const run = key != .enter or meta or (at_end and opts.complete(text));
+                    if (run) {
                         buf.anchor = null;
                         buf.cursor = text.len;
                         self.redraw(&buf);
@@ -715,8 +1169,22 @@ pub const Editor = struct {
                     }
                     try buf.delete(.right);
                 },
-                .char => |c| try buf.insert(&.{c}),
-                .tab => try buf.insert("  "),
+                .char => |c| try buf.typeChar(c),
+                .tab => if (buf.selection() != null and std.mem.indexOfScalar(u8, buf.bytes()[buf.selection().?.start..buf.selection().?.end], '\n') != null) {
+                    try buf.indentLines(false);
+                } else if (buf.cursor > 0 and buf.bytes()[buf.cursor - 1] != ' ' and buf.bytes()[buf.cursor - 1] != '\n') {
+                    try self.completeWord(&buf, opts, &menu);
+                } else try buf.insert("  "),
+                .shift_tab => try buf.indentLines(true),
+                .escape => {
+                    buf.anchor = null;
+                    buf.typing = false;
+                },
+                .line_up => try buf.moveLines(false),
+                .line_down => try buf.moveLines(true),
+                .dup_up => try buf.duplicateLines(false),
+                .dup_down => try buf.duplicateLines(true),
+                .comment => try buf.toggleComment(),
                 .backspace => try buf.delete(.left),
                 .delete => try buf.delete(.right),
                 .word_back => try buf.delete(.word_left),
@@ -738,7 +1206,7 @@ pub const Editor = struct {
                 },
                 .nav => |nav| switch (nav.to) {
                     .up, .down => {
-                        const rows = try layoutRows(self.gpa, buf.bytes(), textWidth(termSize(self.out)));
+                        const rows = try layoutRows(self.gpa, buf.bytes(), textWidth(termSize(self.out), gutterWidth(buf.bytes())));
                         defer self.gpa.free(rows);
                         const down = nav.to == .down;
                         if (!buf.moveVertical(rows, down, nav.select, &goal_col) and !nav.select) {
@@ -755,12 +1223,25 @@ pub const Editor = struct {
                     },
                     else => buf.move(nav),
                 },
+                .search => try self.searchHistory(&buf),
                 .page_up, .page_down, .none => {},
             }
-            self.redraw(&buf);
+            self.redrawWith(&buf, if (menu) |*m| m else null);
         }
     }
 };
+
+/// The newest history entry before `from` that contains `query` (any case), or
+/// null. An empty query matches nothing: ^R alone shows the prompt, not a line.
+pub fn historyMatch(hist: []const []const u8, query: []const u8, from: usize) ?usize {
+    if (query.len == 0) return null;
+    var i = @min(from, hist.len);
+    while (i > 0) {
+        i -= 1;
+        if (std.ascii.indexOfIgnoreCase(hist[i], query) != null) return i;
+    }
+    return null;
+}
 
 pub const TermSize = struct { cols: usize = 80, rows: usize = 24 };
 
@@ -825,20 +1306,20 @@ test "Buffer: word travel stops at punctuation, Home toggles indent and line sta
     try std.testing.expectEqualStrings(" erp.dbo.SC5010", b.bytes());
 }
 
-test "Buffer: newline keeps the indent; undo takes back a run of typing at once, redo returns it" {
+test "Buffer: newline starts at the margin; undo takes back a run of typing at once, redo returns it" {
     var b = try testBuffer("  WHERE x", 9);
     defer b.deinit();
     try b.newline();
-    try std.testing.expectEqualStrings("  WHERE x\n  ", b.bytes());
+    try std.testing.expectEqualStrings("  WHERE x\n", b.bytes());
     for ("AND") |c| try b.insert(&.{c});
-    try std.testing.expectEqualStrings("  WHERE x\n  AND", b.bytes());
+    try std.testing.expectEqualStrings("  WHERE x\nAND", b.bytes());
     try b.undo();
-    try std.testing.expectEqualStrings("  WHERE x\n  ", b.bytes());
+    try std.testing.expectEqualStrings("  WHERE x\n", b.bytes());
     try b.undo();
     try std.testing.expectEqualStrings("  WHERE x", b.bytes());
     try b.redo();
     try b.redo();
-    try std.testing.expectEqualStrings("  WHERE x\n  AND", b.bytes());
+    try std.testing.expectEqualStrings("  WHERE x\nAND", b.bytes());
 }
 
 test "Buffer: a word typed over a selection is one undo step, the selection the next" {
@@ -882,6 +1363,81 @@ test "Buffer: Up and Down keep their column across a short row and report the ed
     try std.testing.expect(b.selection() != null);
 }
 
+test "Buffer: auto-close, skip-over, wrap a selection, and dedent a closer" {
+    var b = try testBuffer("", 0);
+    defer b.deinit();
+    try b.typeChar('(');
+    try std.testing.expectEqualStrings("()", b.bytes());
+    try std.testing.expectEqual(@as(usize, 1), b.cursor);
+    try b.typeChar('x');
+    try b.typeChar(')');
+    try std.testing.expectEqualStrings("(x)", b.bytes());
+    try std.testing.expectEqual(@as(usize, 3), b.cursor);
+    // `it's`: no pairing after a word character.
+    try b.set("it");
+    try b.typeChar('\'');
+    try std.testing.expectEqualStrings("it'", b.bytes());
+    try b.set("SELECT a FROM t");
+    b.cursor = 7;
+    b.move(.{ .to = .word_right, .select = true });
+    try b.typeChar('(');
+    try std.testing.expectEqualStrings("SELECT (a) FROM t", b.bytes());
+    try std.testing.expectEqual(Buffer.Range{ .start = 8, .end = 9 }, b.selection().?);
+    try b.set("f(\n  ");
+    try b.typeChar(')');
+    try std.testing.expectEqualStrings("f(\n)", b.bytes());
+}
+
+test "Buffer: Enter after an opener indents past the opener's line and moves the closer to its own line" {
+    var b = try testBuffer("  WITH t AS ()", 13);
+    defer b.deinit();
+    try b.newline();
+    try std.testing.expectEqualStrings("  WITH t AS (\n    \n  )", b.bytes());
+    try std.testing.expectEqual(@as(usize, 18), b.cursor);
+}
+
+test "Buffer: lines move, duplicate, indent, dedent and comment as a block" {
+    var b = try testBuffer("a\nb\nc", 2);
+    defer b.deinit();
+    try b.moveLines(true);
+    try std.testing.expectEqualStrings("a\nc\nb", b.bytes());
+    try std.testing.expectEqual(@as(usize, 4), b.cursor);
+    try b.moveLines(false);
+    try std.testing.expectEqualStrings("a\nb\nc", b.bytes());
+    try b.duplicateLines(true);
+    try std.testing.expectEqualStrings("a\nb\nb\nc", b.bytes());
+    try std.testing.expectEqual(@as(usize, 4), b.cursor);
+    b.anchor = 0;
+    b.cursor = 3;
+    try b.indentLines(false);
+    try std.testing.expectEqualStrings("  a\n  b\nb\nc", b.bytes());
+    try b.indentLines(true);
+    try std.testing.expectEqualStrings("a\nb\nb\nc", b.bytes());
+    try b.toggleComment();
+    try std.testing.expectEqualStrings("-- a\n-- b\nb\nc", b.bytes());
+    try b.toggleComment();
+    try std.testing.expectEqualStrings("a\nb\nb\nc", b.bytes());
+}
+
+test "Buffer: the bracket under or before the cursor finds its mate" {
+    var b = try testBuffer("f(a, (b))", 9);
+    defer b.deinit();
+    try std.testing.expectEqual([2]usize{ 1, 8 }, b.bracketPair().?);
+    b.cursor = 5;
+    try std.testing.expectEqual([2]usize{ 5, 7 }, b.bracketPair().?);
+    b.cursor = 3;
+    try std.testing.expect(b.bracketPair() == null);
+}
+
+test "historyMatch: newest first, older on repeat, any case, nothing for an empty query" {
+    const hist = [_][]const u8{ "SELECT 1;", "select id FROM orders;", "LOAD INTO x AS SELECT 2;" };
+    try std.testing.expectEqual(@as(?usize, 2), historyMatch(&hist, "select", hist.len));
+    try std.testing.expectEqual(@as(?usize, 1), historyMatch(&hist, "select", 2));
+    try std.testing.expectEqual(@as(?usize, 1), historyMatch(&hist, "ORDERS", hist.len));
+    try std.testing.expectEqual(@as(?usize, null), historyMatch(&hist, "", hist.len));
+    try std.testing.expectEqual(@as(?usize, null), historyMatch(&hist, "nope", hist.len));
+}
+
 test "readKey: modified arrows carry Shift and word, and the editor's control keys decode" {
     const fds = try std.posix.pipe();
     defer std.posix.close(fds[0]);
@@ -889,7 +1445,7 @@ test "readKey: modified arrows carry Shift and word, and the editor's control ke
     // Ctrl-Right, Shift-Left, Ctrl-Shift-Right, Shift-Up, Ctrl-Home, Shift-End,
     // Ctrl-Delete, Alt-b, Alt-Enter, ^A ^Z ^Y ^X, paste marker, an unknown
     // sequence, then a plain byte that must survive it.
-    _ = try std.posix.write(w, "\x1b[1;5C\x1b[1;2D\x1b[1;6C\x1b[1;2A\x1b[1;5H\x1b[1;2F\x1b[3;5~\x1bb\x1b\r\x01\x1a\x19\x18\x1b[200~\x1b[?25;9zq");
+    _ = try std.posix.write(w, "\x1b[1;5C\x1b[1;2D\x1b[1;6C\x1b[1;2A\x1b[1;5H\x1b[1;2F\x1b[3;5~\x1bb\x1b\r\x01\x1a\x19\x18\x1b[200~\x1b[?25;9zq\x1b[27;5;13~\x1b[13;5u\x1b[13;3u\x1b[98;3u\x1b[27u\x1b[13;2u\n\x1b[1;3A\x1b[1;4B\x1b[Z\x1f");
     std.posix.close(w);
     const expect = [_]Key{
         .{ .nav = .{ .to = .word_right } },
@@ -908,6 +1464,18 @@ test "readKey: modified arrows carry Shift and word, and the editor's control ke
         .paste_begin,
         .none,
         .{ .char = 'q' },
+        // Ctrl+Enter in the xterm and kitty forms, Alt+Enter and Alt-b in kitty's, a bare Esc.
+        .ctrl_enter,
+        .ctrl_enter,
+        .alt_enter,
+        .{ .nav = .{ .to = .word_left } },
+        .none,
+        .ctrl_enter, // Shift+Enter, kitty form
+        .ctrl_enter, // ^J
+        .line_up,
+        .dup_down,
+        .shift_tab,
+        .comment,
     };
     for (expect) |want| try std.testing.expectEqualDeep(want, try readKey(fds[0]));
 }

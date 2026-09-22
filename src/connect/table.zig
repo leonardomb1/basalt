@@ -261,7 +261,7 @@ pub fn fitColumns(widths: []const usize, width: usize) ColumnFit {
 /// for the rows and columns that do not fit. The footer always gives the true size.
 pub fn renderFitted(out: *std.Io.Writer, g: Grid, fit: Fit) !void {
     const n = g.ncols();
-    if (n == 0) return out.print("({d} rows)\n", .{g.total_rows});
+    if (n == 0) return out.print("({d} row{s})\n", .{ g.total_rows, if (g.total_rows == 1) "" else "s" });
     const kept = g.kept();
     const elide_rows = g.total_rows > fit.max_rows;
     const head: usize = if (elide_rows) fit.max_rows / 2 else kept;

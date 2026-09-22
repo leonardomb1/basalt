@@ -19,6 +19,7 @@ const ast = @import("../lang/ast.zig");
 const runtime = @import("../runtime/run.zig");
 const obs = @import("../runtime/obs.zig");
 const analyze = @import("../runtime/analyze.zig");
+const complete = @import("complete.zig");
 const http_server = @import("../server/http_server.zig");
 
 /// SIGTERM/SIGINT → ask the run to stop at its next boundary (async-signal-safe:
@@ -67,6 +68,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     } else if (std.mem.eql(u8, verb, "serve")) {
         std.process.exit(try cmdServe(alloc, args));
     } else if (std.mem.eql(u8, verb, "repl")) {
+        for (args[2..]) |a| if (try unknownOption(a, "repl", stderr)) std.process.exit(2);
         std.process.exit(try cmdRepl(alloc));
     } else if (std.mem.eql(u8, verb, "version") or std.mem.eql(u8, verb, "--version") or std.mem.eql(u8, verb, "-V")) {
         var stdout_buf: [256]u8 = undefined;
@@ -495,7 +497,7 @@ fn dollarTagLen(s: []const u8, i: usize) ?usize {
 /// a quit word and a blank entry are whole as they stand; SQL is whole at its `;`.
 fn entryComplete(s: []const u8) bool {
     const t = std.mem.trim(u8, s, " \t\r\n");
-    if (t.len == 0 or t[0] == '\\' or isQuit(t) or isHelp(t)) return true;
+    if (t.len == 0 or t[0] == '\\' or isQuit(t) or isHelp(t) or isClear(t)) return true;
     return endsComplete(s);
 }
 
@@ -624,7 +626,338 @@ const Session = struct {
     decls: DeclStore,
     format: runtime.StdoutFormat = .table,
     tty: bool = false,
+    /// What Tab has learned about the sources so far, for as long as the session.
+    catalog: Catalog,
+    /// The last entry run, for `\edit`.
+    last_entry: ?[]u8 = null,
 };
+
+/// `$XDG_CONFIG_HOME/basalt/repl.sql`, else `~/.config/basalt/repl.sql`: the
+/// declarations a session starts with, and where `\save` writes.
+fn startupPath(gpa: std.mem.Allocator) ?[]u8 {
+    if (std.process.getEnvVarOwned(gpa, "XDG_CONFIG_HOME")) |x| {
+        defer gpa.free(x);
+        return std.fs.path.join(gpa, &.{ x, "basalt", "repl.sql" }) catch null;
+    } else |_| {}
+    const home = std.process.getEnvVarOwned(gpa, "HOME") catch return null;
+    defer gpa.free(home);
+    return std.fs.path.join(gpa, &.{ home, ".config", "basalt", "repl.sql" }) catch null;
+}
+
+/// The value of `key = '...'` in a `CREATE CONNECTION` text, or null.
+fn connAttr(text: []const u8, key: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i + key.len < text.len) : (i += 1) {
+        if (!std.ascii.eqlIgnoreCase(text[i .. i + key.len], key)) continue;
+        if (i > 0 and (std.ascii.isAlphanumeric(text[i - 1]) or text[i - 1] == '_')) continue;
+        var j = i + key.len;
+        while (j < text.len and text[j] == ' ') j += 1;
+        if (j >= text.len or text[j] != '=') continue;
+        j += 1;
+        while (j < text.len and text[j] == ' ') j += 1;
+        if (j >= text.len) return null;
+        if (text[j] == '\'') {
+            const end = std.mem.indexOfScalarPos(u8, text, j + 1, '\'') orelse return null;
+            return text[j + 1 .. end];
+        }
+        var e = j;
+        while (e < text.len and text[e] != ',' and text[e] != ')' and text[e] != ' ') e += 1;
+        return text[j..e];
+    }
+    return null;
+}
+
+/// `\connections`: one row per connection — its type, host and database as
+/// declared, and what the session has learned: how many tables Tab or
+/// `\connections test` found, or that it could not be reached.
+fn listConnections(sess: *Session, msg: *std.Io.Writer, probe: bool) !void {
+    var n: usize = 0;
+    for (sess.decls.items.items) |e| if (e.kind == .connection) {
+        n += 1;
+    };
+    if (n == 0) return msg.writeAll("(no connections — CREATE CONNECTION ... to add one, \\i <file> to load some)\n");
+    try msg.print("{s: <14} {s: <10} {s: <28} {s: <16} {s}\n", .{ "name", "type", "host", "database", "status" });
+    for (sess.decls.items.items) |e| {
+        if (e.kind != .connection) continue;
+        const ty = connTypeOf(e.text) orelse "?";
+        const host = connAttr(e.text, "host") orelse connAttr(e.text, "fe_host") orelse connAttr(e.text, "url") orelse "";
+        const db = connAttr(e.text, "database") orelse "";
+        var status: []const u8 = "not asked yet";
+        if (probe and !std.mem.eql(u8, ty, "http")) _ = connTables(sess, e.name);
+        if (sess.catalog.tables.get(e.name)) |t| {
+            status = if (t.len == 0) "unreachable, or no tables" else try std.fmt.allocPrint(sess.catalog.arena.allocator(), "reached, {d} tables", .{t.len});
+        }
+        try msg.print("{s: <14} {s: <10} {s: <28} {s: <16} {s}\n", .{ e.name, ty, host, db, status });
+    }
+    for (sess.decls.items.items) |e| {
+        if (e.kind == .connection) continue;
+        try msg.print("{s} {s}\n", .{ @tagName(e.kind), e.name });
+    }
+}
+
+/// `\i <file>`: run a file as an entry, so its declarations join the session —
+/// what `@include` inside an entry does not do. Also the startup file's path in.
+fn sourceFile(alloc: std.mem.Allocator, path: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
+    const text = std.fs.cwd().readFileAlloc(alloc, path, 1 << 22) catch |e|
+        return msg.print("error: could not read `{s}`: {s}\n", .{ path, @errorName(e) });
+    defer alloc.free(text);
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return;
+    try runBlock(alloc, trimmed, sess, msg);
+}
+
+/// `\save [file]`: the session's declarations, one statement per line, to the
+/// startup file by default — the way a session's connections become tomorrow's.
+fn saveDecls(alloc: std.mem.Allocator, path_arg: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
+    const path = if (path_arg.len > 0) try alloc.dupe(u8, path_arg) else (startupPath(alloc) orelse return msg.writeAll("error: no HOME to save under\n"));
+    defer alloc.free(path);
+    if (std.fs.path.dirname(path)) |d| std.fs.cwd().makePath(d) catch {};
+    const f = std.fs.cwd().createFile(path, .{}) catch |e|
+        return msg.print("error: could not write `{s}`: {s}\n", .{ path, @errorName(e) });
+    defer f.close();
+    var n: usize = 0;
+    for (sess.decls.items.items) |e| {
+        if (e.kind == .endpoint) continue;
+        try f.writeAll(e.text);
+        try f.writeAll(";\n");
+        n += 1;
+    }
+    try msg.print("saved {d} declaration{s} to {s}\n", .{ n, if (n == 1) "" else "s", path });
+}
+
+/// `\edit [file]`: the last entry (or the file) in `$EDITOR`, then run what
+/// comes back. The terminal is in cooked mode between entries, so the editor
+/// gets it whole.
+fn editAndRun(alloc: std.mem.Allocator, path_arg: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
+    const editor = std.process.getEnvVarOwned(alloc, "EDITOR") catch try alloc.dupe(u8, "vi");
+    defer alloc.free(editor);
+    var tmp_buf: [64]u8 = undefined;
+    const tmp = try std.fmt.bufPrint(&tmp_buf, "/tmp/basalt-edit-{d}.sql", .{std.os.linux.getpid()});
+    const path = if (path_arg.len > 0) path_arg else tmp;
+    if (path_arg.len == 0) {
+        const f = try std.fs.cwd().createFile(tmp, .{});
+        defer f.close();
+        if (sess.last_entry) |l| try f.writeAll(l);
+        try f.writeAll("\n");
+    }
+    defer if (path_arg.len == 0) std.fs.cwd().deleteFile(tmp) catch {};
+    try msg.flush();
+    var child = std.process.Child.init(&.{ editor, path }, alloc);
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    const term = child.spawnAndWait() catch |e| return msg.print("error: could not run `{s}`: {s}\n", .{ editor, @errorName(e) });
+    if (term != .Exited or term.Exited != 0) return msg.print("{s} exited without saving; nothing run\n", .{editor});
+    try sourceFile(alloc, path, sess, msg);
+}
+
+/// Names fetched for completion, once each: a connection's tables, a table's or
+/// a file's columns. A source that could not be asked is remembered as empty, so
+/// a dead connection costs one wait, not one per Tab.
+const Catalog = struct {
+    arena: std.heap.ArenaAllocator,
+    tables: std.StringHashMap([]const []const u8),
+    columns: std.StringHashMap([]const []const u8),
+
+    fn init(gpa: std.mem.Allocator) Catalog {
+        return .{ .arena = std.heap.ArenaAllocator.init(gpa), .tables = std.StringHashMap([]const []const u8).init(gpa), .columns = std.StringHashMap([]const []const u8).init(gpa) };
+    }
+    fn deinit(self: *Catalog) void {
+        self.tables.deinit();
+        self.columns.deinit();
+        self.arena.deinit();
+    }
+};
+
+/// Run `SELECT ...` under the session's declarations into a temporary CSV and
+/// hand back its rows, first column only — how Tab asks a source a question
+/// without printing anything. Errors come back as no rows.
+fn fetchColumn(sess: *Session, select: []const u8) []const []const u8 {
+    const a = sess.catalog.arena.allocator();
+    var scratch = std.heap.ArenaAllocator.init(sess.decls.gpa);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    var path_buf: [96]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/tmp/basalt-tab-{d}-{d}.csv", .{ std.os.linux.getpid(), std.time.milliTimestamp() }) catch return &.{};
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var text = std.array_list.Managed(u8).init(sa);
+    for (sess.decls.items.items) |e| {
+        text.appendSlice(e.text) catch return &.{};
+        text.appendSlice(";\n") catch return &.{};
+    }
+    text.writer().print("LOAD INTO '{s}' AS {s};", .{ path, select }) catch return &.{};
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = parser.parseSource(sa, text.items, &pdiag) catch return &.{};
+    var rdiag: runtime.Diag = .{};
+    _ = runtime.run(sess.decls.gpa, prog, .{ .log = .{ .quiet = true, .summary = .none } }, &rdiag) catch return &.{};
+    const data = std.fs.cwd().readFileAlloc(sa, path, 1 << 22) catch return &.{};
+
+    var out = std.array_list.Managed([]const u8).init(a);
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    _ = lines.next();
+    while (lines.next()) |ln| {
+        if (ln.len == 0) continue;
+        const cell = if (std.mem.indexOfScalar(u8, ln, ',')) |c| ln[0..c] else ln;
+        out.append(a.dupe(u8, std.mem.trim(u8, cell, "\"")) catch return &.{}) catch return &.{};
+    }
+    return out.toOwnedSlice() catch &.{};
+}
+
+/// The tables of `conn` as `schema.table`, fetched on first use.
+fn connTables(sess: *Session, conn: []const u8) []const []const u8 {
+    if (sess.catalog.tables.get(conn)) |t| return t;
+    const a = sess.catalog.arena.allocator();
+    const q = std.fmt.allocPrint(a, "SELECT table_schema || '.' || table_name AS t FROM {s}.QUERY($$SELECT table_schema, table_name FROM information_schema.tables WHERE table_type IN ('BASE TABLE', 'VIEW') AND table_schema NOT IN ('information_schema', 'pg_catalog', 'mysql', 'performance_schema', 'sys', '_statistics_') ORDER BY 1, 2$$)", .{conn}) catch return &.{};
+    const rows = fetchColumn(sess, q);
+    sess.catalog.tables.put(a.dupe(u8, conn) catch return rows, rows) catch {};
+    return rows;
+}
+
+/// The columns of `conn.schema.table`, or of a file path, fetched on first use.
+fn sourceColumns(sess: *Session, key: []const u8) []const []const u8 {
+    if (sess.catalog.columns.get(key)) |c| return c;
+    const a = sess.catalog.arena.allocator();
+    var rows: []const []const u8 = &.{};
+    if (key[0] == '\'') {
+        // A file: the analyzer reads its schema without moving a row.
+        var scratch = std.heap.ArenaAllocator.init(sess.decls.gpa);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        blk: {
+            const text = std.fmt.allocPrint(sa, "SELECT * FROM {s};", .{key}) catch break :blk;
+            var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+            const prog = parser.parseSource(sa, text, &pdiag) catch break :blk;
+            var adiag = analyze.Diag{};
+            const plan = analyze.analyze(sa, prog, &adiag) catch break :blk;
+            const schema = plan.outputs[0].source.schema orelse break :blk;
+            const names = a.alloc([]const u8, schema.fields.len) catch break :blk;
+            for (schema.fields, names) |f, *n| n.* = a.dupe(u8, f.name) catch break :blk;
+            rows = names;
+        }
+    } else {
+        var parts = std.mem.splitScalar(u8, key, '.');
+        const conn = parts.next().?;
+        const schema = parts.next() orelse return rows;
+        const tbl = parts.next() orelse return rows;
+        const q = std.fmt.allocPrint(a, "SELECT column_name FROM {s}.QUERY($$SELECT column_name FROM information_schema.columns WHERE table_schema = '{s}' AND table_name = '{s}' ORDER BY ordinal_position$$)", .{ conn, schema, tbl }) catch return rows;
+        rows = fetchColumn(sess, q);
+    }
+    sess.catalog.columns.put(a.dupe(u8, key) catch return rows, rows) catch {};
+    return rows;
+}
+
+/// The connector type of a declared connection, read off its `CREATE CONNECTION`
+/// text (`TYPE <word>`).
+fn connTypeOf(text: []const u8) ?[]const u8 {
+    var it = std.mem.tokenizeAny(u8, text, " \t\r\n(");
+    while (it.next()) |w| {
+        if (std.ascii.eqlIgnoreCase(w, "type")) return it.next();
+    }
+    return null;
+}
+
+/// Tab's provider: the session's names, plus the columns of every table and
+/// file the entry mentions, handed to the matcher; a path is listed here.
+fn suggest(ctx: *anyopaque, arena: std.mem.Allocator, text: []const u8, cursor: usize) anyerror!Editor.Suggestions {
+    const sess: *Session = @ptrCast(@alignCast(ctx));
+    var conns = std.array_list.Managed([]const u8).init(arena);
+    var fns = std.array_list.Managed([]const u8).init(arena);
+    var params = std.array_list.Managed([]const u8).init(arena);
+    for (sess.decls.items.items) |e| switch (e.kind) {
+        .connection => try conns.append(e.name),
+        .function => try fns.append(e.name),
+        .param, .let => try params.append(e.name),
+        .endpoint => {},
+    };
+
+    // CTEs of the entry: `WITH name AS (` and `, name AS (`.
+    var ctes = std.array_list.Managed([]const u8).init(arena);
+    var i: usize = 0;
+    while (i + 4 < text.len) : (i += 1) {
+        const at_with = std.ascii.eqlIgnoreCase(text[i .. @min(text.len, i + 4)], "with") and (i == 0 or !std.ascii.isAlphanumeric(text[i - 1]));
+        if (!(at_with or text[i] == ',')) continue;
+        var j = if (at_with) i + 4 else i + 1;
+        while (j < text.len and (text[j] == ' ' or text[j] == '\n')) j += 1;
+        const ns = j;
+        while (j < text.len and (std.ascii.isAlphanumeric(text[j]) or text[j] == '_')) j += 1;
+        if (j == ns) continue;
+        var k = j;
+        while (k < text.len and text[k] == ' ') k += 1;
+        if (k + 2 < text.len and std.ascii.eqlIgnoreCase(text[k .. k + 2], "as") and text[k + 2] == ' ') try ctes.append(text[ns..j]);
+    }
+
+    // The tables of every connection the entry names with a dot, and the columns
+    // of every `conn.schema.table` and `'file'` in it.
+    var tables = std.array_list.Managed(complete.ConnTables).init(arena);
+    var columns = std.array_list.Managed([]const u8).init(arena);
+    for (conns.items) |c| {
+        var pos: usize = 0;
+        var wanted = false;
+        while (std.mem.indexOfPos(u8, text, pos, c)) |p| : (pos = p + c.len) {
+            if (p > 0 and (std.ascii.isAlphanumeric(text[p - 1]) or text[p - 1] == '_')) continue;
+            if (p + c.len >= text.len or text[p + c.len] != '.') continue;
+            wanted = true;
+            var e = p + c.len + 1;
+            var dots: usize = 0;
+            while (e < text.len and (std.ascii.isAlphanumeric(text[e]) or text[e] == '_' or text[e] == '.')) : (e += 1) {
+                if (text[e] == '.') dots += 1;
+            }
+            if (dots == 1 and e < text.len and text[e] != '(') for (sourceColumns(sess, text[p..e])) |col| try columns.append(col);
+        }
+        if (wanted) try tables.append(.{ .conn = c, .tables = connTables(sess, c) });
+    }
+    var q: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, text, q, '\'')) |open| {
+        const close = std.mem.indexOfScalarPos(u8, text, open + 1, '\'') orelse break;
+        q = close + 1;
+        if (q >= cursor and open < cursor) continue;
+        const lit = text[open..q];
+        if (std.mem.endsWith(u8, lit, ".csv'") or std.mem.endsWith(u8, lit, ".parquet'") or std.mem.endsWith(u8, lit, ".gz'") or std.mem.endsWith(u8, lit, ".zst'"))
+            for (sourceColumns(sess, lit)) |col| try columns.append(col);
+    }
+
+    const r = try complete.complete(arena, .{
+        .connections = conns.items,
+        .ctes = ctes.items,
+        .functions = fns.items,
+        .params = params.items,
+        .tables = tables.items,
+        .columns = columns.items,
+    }, text, cursor);
+    switch (r) {
+        .none => return .{},
+        .candidates => |c| {
+            const items = try arena.alloc([]const u8, c.items.len);
+            for (c.items, items) |cand, *it| it.* = cand.text;
+            return .{ .start = c.start, .items = items };
+        },
+        .path => |p| return .{ .start = p.start, .items = try listPaths(arena, p.partial) },
+    }
+}
+
+/// The entries of the directory `partial` is in, that begin as it does — a
+/// directory with a `/` after it, so the next Tab goes inside.
+fn listPaths(arena: std.mem.Allocator, partial: []const u8) ![]const []const u8 {
+    const slash = std.mem.lastIndexOfScalar(u8, partial, '/');
+    const dir_part = if (slash) |s| partial[0 .. s + 1] else "";
+    const name_part = if (slash) |s| partial[s + 1 ..] else partial;
+    var dir = std.fs.cwd().openDir(if (dir_part.len == 0) "." else dir_part, .{ .iterate = true }) catch return &.{};
+    defer dir.close();
+    var out = std.array_list.Managed([]const u8).init(arena);
+    var it = dir.iterate();
+    while (try it.next()) |e| {
+        if (name_part.len == 0 and e.name[0] == '.') continue;
+        if (!std.mem.startsWith(u8, e.name, name_part)) continue;
+        try out.append(try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ dir_part, e.name, if (e.kind == .directory) "/" else "" }));
+    }
+    std.mem.sort([]const u8, out.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return out.toOwnedSlice();
+}
 
 /// Interactive read-eval-print loop. An entry runs when a line ends in a
 /// statement-level `;` (a blank line also runs a pending buffer, which is what
@@ -640,8 +973,9 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
     var msg_file = std.fs.File.stderr().writer(&msg_buf);
     const msg = &msg_file.interface;
 
-    var sess = Session{ .decls = DeclStore.init(alloc), .tty = std.posix.isatty(std.fs.File.stdin().handle) };
+    var sess = Session{ .decls = DeclStore.init(alloc), .tty = std.posix.isatty(std.fs.File.stdin().handle), .catalog = Catalog.init(alloc) };
     defer sess.decls.deinit();
+    defer sess.catalog.deinit();
 
     var editor: ?Editor = if (sess.tty) Editor.init(alloc) else null;
     defer if (editor) |*e| e.deinit();
@@ -651,9 +985,20 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
     defer table.dropLast();
 
     if (sess.tty) {
-        try msg.writeAll("basalt REPL — end a statement with `;` to run it. \\q quits, \\help for help; arrows recall history.\n");
+        try msg.writeAll("basalt REPL — Enter runs a statement that ends in `;`, else opens a line. \\q quits, \\help for the editing keys.\n");
         try msg.flush();
     }
+
+    // The startup file, when there is one: connections a session should start with.
+    if (startupPath(alloc)) |sp| {
+        defer alloc.free(sp);
+        if (std.fs.cwd().access(sp, .{})) |_| {
+            try sourceFile(alloc, sp, &sess, msg);
+            if (sess.tty) try msg.print("loaded {s}\n", .{sp});
+            try msg.flush();
+        } else |_| {}
+    }
+    defer if (sess.last_entry) |l| alloc.free(l);
 
     var block = std.array_list.Managed(u8).init(alloc);
     defer block.deinit();
@@ -667,7 +1012,7 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
             var line: []const u8 = undefined;
             if (editor) |*ed| {
                 // The editor hands back a whole entry, however many lines it took.
-                switch (ed.readEntry(.{ .complete = entryComplete }) catch |e| blk: {
+                switch (ed.readEntry(.{ .complete = entryComplete, .suggest = suggest, .suggest_ctx = &sess }) catch |e| blk: {
                     try msg.print("input error: {s}\n", .{@errorName(e)});
                     try msg.flush();
                     break :blk LineResult.eof;
@@ -678,12 +1023,12 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
                         defer alloc.free(l);
                         ed.remember(l);
                         const t = std.mem.trim(u8, l, " \t\r\n");
-                        if (t.len > 0 and (t[0] == '\\' or isQuit(t) or isHelp(t))) {
+                        if (t.len > 0 and (t[0] == '\\' or isQuit(t) or isHelp(t) or isClear(t))) {
                             if (isQuit(t)) quit = true else try metaCommand(t, &sess, msg);
                         } else {
                             try block.appendSlice(l);
-                            // Run with Alt+Enter or a blank last line, the entry may
-                            // lack its `;` — which is all the parser would say about it.
+                            // Run without its `;` (Ctrl+J), the entry
+                            // may lack one — which is all the parser would say about it.
                             if (t.len > 0 and !endsComplete(l)) try block.append(';');
                         }
                     },
@@ -707,7 +1052,7 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
                 break; // blank line still runs a pending buffer
             }
             // Meta commands only lead an entry, so `\` inside a query is untouched.
-            if (block.items.len == 0 and (t[0] == '\\' or isQuit(t) or isHelp(t))) {
+            if (block.items.len == 0 and (t[0] == '\\' or isQuit(t) or isHelp(t) or isClear(t))) {
                 if (isQuit(t)) {
                     quit = true;
                     break;
@@ -722,13 +1067,44 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
 
         const trimmed = std.mem.trim(u8, block.items, " \t\r\n");
         if (trimmed.len == 0) continue;
+        if (sess.last_entry) |l| alloc.free(l);
+        sess.last_entry = try alloc.dupe(u8, trimmed);
         try runBlock(alloc, trimmed, &sess, msg);
+        // Room between one result and the next entry, in either mode.
+        if (sess.tty) {
+            try msg.writeAll("\n");
+            try msg.flush();
+        }
     }
     if (sess.tty) {
         try msg.writeAll("bye\n");
         try msg.flush();
     }
     return 0;
+}
+
+/// The line a parse error names, with a caret under the column — as an editor
+/// marks a squiggle. `text` is prelude + entry; only a position inside the entry
+/// (the part the person typed) is shown.
+fn errorCaret(msg: *std.Io.Writer, text: []const u8, entry: []const u8, line: u32, col: u32) !void {
+    const entry_at = std.mem.lastIndexOf(u8, text, entry) orelse return;
+    const prelude_lines = std.mem.count(u8, text[0..entry_at], "\n");
+    if (line == 0 or line <= prelude_lines) return;
+    var it = std.mem.splitScalar(u8, entry, '\n');
+    var n: usize = prelude_lines + 1;
+    while (it.next()) |ln| : (n += 1) {
+        if (n != line) continue;
+        try msg.print("  {s}\n  ", .{ln});
+        var c: u32 = 1;
+        var i: usize = 0;
+        while (c < col and i < ln.len) : (c += 1) {
+            try msg.writeByte(if (ln[i] == '\t') '\t' else ' ');
+            i += 1;
+            while (i < ln.len and ln[i] & 0xC0 == 0x80) i += 1;
+        }
+        try msg.writeAll("^\n");
+        return;
+    }
 }
 
 /// Handle a `\...` entry. Unknown ones report themselves instead of reaching
@@ -742,13 +1118,21 @@ fn metaCommand(t: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
     const rest = std.mem.trim(u8, t[i..], " \t\r\n");
 
     if (std.mem.eql(u8, cmd, "\\connections") or std.mem.eql(u8, cmd, "\\c")) {
-        if (sess.decls.items.items.len == 0) return msg.writeAll("(no declarations)\n");
-        for (sess.decls.items.items) |e| try msg.print("{s} {s}\n", .{ @tagName(e.kind), e.name });
-        return;
+        return listConnections(sess, msg, std.ascii.eqlIgnoreCase(rest, "test"));
     }
-    if (std.mem.eql(u8, cmd, "\\clear")) {
+    if (std.mem.eql(u8, cmd, "\\i") or std.mem.eql(u8, cmd, "\\source")) {
+        if (rest.len == 0) return msg.writeAll("usage: \\i <file.sql>  — run a file; its declarations join the session\n");
+        return sourceFile(sess.decls.gpa, rest, sess, msg);
+    }
+    if (std.mem.eql(u8, cmd, "\\save")) return saveDecls(sess.decls.gpa, rest, sess, msg);
+    if (std.mem.eql(u8, cmd, "\\edit") or std.mem.eql(u8, cmd, "\\e")) return editAndRun(sess.decls.gpa, rest, sess, msg);
+    if (isClear(t)) {
+        // The whole screen, cursor home; the terminal's scrollback is left alone.
+        return msg.writeAll("\x1b[2J\x1b[H");
+    }
+    if (std.mem.eql(u8, cmd, "\\reset")) {
         sess.decls.clear();
-        return msg.writeAll("cleared\n");
+        return msg.writeAll("reset: declarations forgotten\n");
     }
     if (std.mem.eql(u8, cmd, "\\format") or std.mem.eql(u8, cmd, "\\f")) {
         if (rest.len == 0) {
@@ -759,6 +1143,22 @@ fn metaCommand(t: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
             return msg.print("error: \\format takes `table`, `json`, `csv` or `tsv`, got `{s}`\n", .{rest});
         }
         return msg.print("format {s}\n", .{@tagName(sess.format)});
+    }
+    // psql's spellings, as the statements they stand for.
+    if (std.mem.eql(u8, cmd, "\\d") or std.mem.eql(u8, cmd, "\\dt")) {
+        if (rest.len == 0) return msg.writeAll(if (std.mem.eql(u8, cmd, "\\d")) "usage: \\d <conn.table | 'file' | conn.QUERY($$...$$)>  — the same as DESCRIBE\n" else "usage: \\dt <conn[.schema]> [pattern]  — the same as SHOW TABLES FROM\n");
+        var text = std.array_list.Managed(u8).init(sess.decls.gpa);
+        defer text.deinit();
+        if (std.mem.eql(u8, cmd, "\\d")) {
+            try text.writer().print("DESCRIBE {s};", .{rest});
+        } else {
+            var it = std.mem.tokenizeAny(u8, rest, " \t");
+            const target = it.next().?;
+            try text.writer().print("SHOW TABLES FROM {s}", .{target});
+            if (it.next()) |pat| try text.writer().print(" LIKE '{s}'", .{pat});
+            try text.appendSlice(";");
+        }
+        return runBlock(sess.decls.gpa, text.items, sess, msg);
     }
     if (std.mem.eql(u8, cmd, "\\view") or std.mem.eql(u8, cmd, "\\v")) {
         if (!sess.tty or !std.posix.isatty(std.fs.File.stdout().handle))
@@ -830,6 +1230,7 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *s
                 try msg.print("error: {s}:{d}:{d}: {s}\n", .{ diag.label, diag.parse.line, diag.parse.col, diag.parse.msg })
             else
                 try msg.print("error: {d}:{d}: {s}\n", .{ diag.parse.line, diag.parse.col, diag.parse.msg });
+            if (sess.tty) try errorCaret(msg, text, block, diag.parse.line, diag.parse.col);
             try msg.flush();
             return;
         },
@@ -865,7 +1266,7 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *s
         return;
     }
 
-    const t0 = std.time.milliTimestamp();
+    const t0 = std.time.nanoTimestamp();
     var rdiag: runtime.Diag = .{};
     _ = runtime.run(alloc, prepared, .{
         // Errors only, but not `quiet`: that would swallow the entry's own `PRINT`s.
@@ -886,7 +1287,8 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *s
         return;
     };
     if (sess.tty) {
-        try msg.print("({d} ms)\n", .{std.time.milliTimestamp() - t0});
+        const us: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - t0, std.time.ns_per_us));
+        try msg.print("({d}.{d} ms)\n", .{ us / 1000, us % 1000 / 100 });
         try msg.flush();
     }
 }
@@ -912,6 +1314,15 @@ fn appendDisplaySinks(arena: std.mem.Allocator, prog: ast.Program) !ast.Program 
     return .{ .stmts = stmts };
 }
 
+/// `\clear`, `clear`, `cls`: clear the screen — what a person typing any of them
+/// means, so none of them may do anything else.
+fn isClear(t: []const u8) bool {
+    inline for (.{ "\\clear", "\\cls", "clear", "cls" }) |k| {
+        if (std.ascii.eqlIgnoreCase(t, k)) return true;
+    }
+    return false;
+}
+
 fn isQuit(s: []const u8) bool {
     inline for (.{ "\\q", "\\quit", ":q", "quit", "exit" }) |k| {
         if (std.mem.eql(u8, s, k)) return true;
@@ -933,8 +1344,20 @@ fn replHelp(msg: *std.Io.Writer) !void {
         \\            SELECT id, amount FROM erp.orders WHERE status = 'paid';
         \\
         \\commands:
-        \\  \connections, \c   list the declarations held for this session
-        \\  \clear             forget them all
+        \\  \connections, \c   the connections as a table (name, type, host, database, status);
+        \\                     `\c test` reaches each one now. Functions and params follow
+        \\  \i <file>          run a file; its declarations join the session
+        \\  \save [file]       write the session's declarations to a file — by default the
+        \\                     startup file, ~/.config/basalt/repl.sql, which every session
+        \\                     loads first
+        \\  \edit, \e [file]   open the last entry (or the file) in $EDITOR, run what comes back
+        \\  \dt <conn[.schema]> [pattern]
+        \\                     the source's tables — SHOW TABLES FROM conn[.schema] [LIKE 'p']
+        \\  \d <conn.table | 'file' | query>
+        \\                     its columns and engine types — DESCRIBE <source>
+        \\  \reset             forget them all
+        \\  \clear, \cls, clear, cls
+        \\                     clear the screen (^L does too, mid-entry)
         \\  \format table|json|csv|tsv
         \\                     set the output format (bare \format shows it); \f is an alias
         \\  \view, \v          scroll the last result: arrows move by column and row, names
@@ -943,10 +1366,24 @@ fn replHelp(msg: *std.Io.Writer) !void {
         \\  \q, \quit, exit    leave
         \\
         \\editing — the entry is a small text editor, not a single line:
-        \\  Enter              a new line (indent kept) until the statement ends in `;`, then run.
-        \\                     Alt+Enter, or Enter on an empty last line, runs it as it stands
+        \\  Enter              runs the entry when it ends in `;` and the cursor is at its end;
+        \\                     anywhere else it opens a line (after `(` it steps in and puts the
+        \\                     `)` on its own line). Ctrl+J runs it as it stands,
+        \\                     `;` or not (Ctrl+Enter too, where the terminal delivers it)
+        \\  ( [ { ' \"          close themselves; typing the closer steps over it; over a
+        \\                     selection they wrap it. `)` on a blank line dedents
+        \\  Alt+Up/Down        move the line (or selected lines); Shift+Alt+Up/Down duplicate
+        \\  Tab                complete the word: keywords, connections, CTEs, $params, a
+        \\                     path inside quotes, `conn.` tables and the columns of the
+        \\                     tables and files the entry names (asked once per session);
+        \\                     Tab again cycles the choices. Over selected lines: indent;
+        \\                     Shift+Tab dedents; after a space: two spaces
+        \\  Ctrl+/             comment the line(s) out with `-- `, or back in
+        \\  Esc                drop the selection; the matching bracket is underlined
         \\  arrows             travel the entry; Up/Down past its edge recall history, where
         \\                     an entry comes back whole (~/.basalt_history)
+        \\  ^R                 search the history: type to narrow, ^R for an older match,
+        \\                     Enter keeps it, Esc puts the entry back
         \\  Ctrl+arrows        by word (Alt-b/Alt-f too); Home/End the line (Home toggles the
         \\                     indent); Ctrl+Home/End the whole entry
         \\  Shift+any of those select; typing, Backspace or Delete replace the selection
