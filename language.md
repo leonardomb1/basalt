@@ -1100,7 +1100,11 @@ as you type (keywords, strings, numbers, comments, `$params`; `NO_COLOR` turns
 it off), a multi-line entry gets line numbers in its gutter, and a parse error
 is shown with a caret under the column it names.
 
-`^R` searches the history incrementally (type to narrow, `^R` for an older
+`\connect [type]` makes a connection by asking the few questions its connector
+needs — host with the type's usual port, database, user, password (blank means
+the `env(NAME_USER)` / `env(NAME_PASS)` convention; `env:VAR` names another
+variable) — shows the `CREATE CONNECTION` it built, registers it, and offers to
+reach it and to save it to the startup file. `^R` searches the history incrementally (type to narrow, `^R` for an older
 match, Enter keeps it). A session starts by running `~/.config/basalt/repl.sql`
 (or `$XDG_CONFIG_HOME/basalt/repl.sql`) when it exists — the place for the
 connections you always want, with `env()` for the secrets — and `\save` writes

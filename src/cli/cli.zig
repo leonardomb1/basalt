@@ -630,7 +630,30 @@ const Session = struct {
     catalog: Catalog,
     /// The last entry run, for `\edit`.
     last_entry: ?[]u8 = null,
+    /// Say `ok: connection x` as declarations register — off while the startup
+    /// file loads, which is summed up in one line instead.
+    announce: bool = true,
 };
+
+/// A path with the home directory folded to `~`, for messages.
+fn tilde(buf: []u8, path: []const u8) []const u8 {
+    const home = std.posix.getenv("HOME") orelse return path;
+    if (home.len > 1 and std.mem.startsWith(u8, path, home) and path.len > home.len and path[home.len] == '/')
+        return std.fmt.bufPrint(buf, "~{s}", .{path[home.len..]}) catch path;
+    return path;
+}
+
+/// The REPL's opening: a small mark, the name and version, what the tool is,
+/// and the two things a newcomer needs. Three lines — a prompt, not a splash.
+fn banner(msg: *std.Io.Writer, color: bool) !void {
+    const dim: []const u8 = if (color) "\x1b[2m" else "";
+    const bold: []const u8 = if (color) "\x1b[1m" else "";
+    const mark: []const u8 = if (color) "\x1b[38;5;208m" else "";
+    const off: []const u8 = if (color) "\x1b[0m" else "";
+    try msg.print("{s}  ▄▄▄ {s} {s}basalt{s} {s}{s}{s}\n", .{ mark, off, bold, off, dim, @import("build_options").version, off });
+    try msg.print("{s}  ███ {s} {s}SQL in, rows moved: files, object stores and databases in one binary{s}\n", .{ mark, off, dim, off });
+    try msg.print("{s}  ▀▀▀ {s} {s}\\help keys and commands · \\connect a new source · \\q quit{s}\n\n", .{ mark, off, dim, off });
+}
 
 /// `$XDG_CONFIG_HOME/basalt/repl.sql`, else `~/.config/basalt/repl.sql`: the
 /// declarations a session starts with, and where `\save` writes.
@@ -695,6 +718,161 @@ fn listConnections(sess: *Session, msg: *std.Io.Writer, probe: bool) !void {
     }
 }
 
+/// What each connector needs, for `\connect`: the questions, in order, with the
+/// default a newcomer would want. Mirrors the keys the runtime reads
+/// (`parseDbConfig`, `resolveStarrocksConfig`, `http_client.connFromKvs`).
+const Connector = struct {
+    name: []const u8,
+    blurb: []const u8,
+    fields: []const Field,
+    const Field = struct { key: []const u8, prompt: []const u8, default: []const u8 = "", secret: bool = false, int: bool = false };
+};
+const connectors = [_]Connector{
+    .{ .name = "postgres", .blurb = "PostgreSQL (source and sink)", .fields = &.{
+        .{ .key = "host", .prompt = "host", .default = "localhost" },
+        .{ .key = "port", .prompt = "port", .default = "5432", .int = true },
+        .{ .key = "database", .prompt = "database" },
+        .{ .key = "user", .prompt = "user" },
+        .{ .key = "password", .prompt = "password", .secret = true },
+        .{ .key = "tls", .prompt = "tls (off, require, insecure)", .default = "off" },
+    } },
+    .{ .name = "mysql", .blurb = "MySQL / MariaDB (source and sink)", .fields = &.{
+        .{ .key = "host", .prompt = "host", .default = "localhost" },
+        .{ .key = "port", .prompt = "port", .default = "3306", .int = true },
+        .{ .key = "database", .prompt = "database" },
+        .{ .key = "user", .prompt = "user" },
+        .{ .key = "password", .prompt = "password", .secret = true },
+        .{ .key = "tls", .prompt = "tls (off, require, insecure)", .default = "off" },
+    } },
+    .{ .name = "sqlserver", .blurb = "SQL Server (source and sink; host\\INSTANCE resolves the port)", .fields = &.{
+        .{ .key = "host", .prompt = "host" },
+        .{ .key = "port", .prompt = "port (blank: 1433, or the instance's)", .int = true },
+        .{ .key = "database", .prompt = "database" },
+        .{ .key = "user", .prompt = "user" },
+        .{ .key = "password", .prompt = "password", .secret = true },
+        .{ .key = "tls", .prompt = "tls (off, require, insecure)", .default = "require" },
+    } },
+    .{ .name = "starrocks", .blurb = "StarRocks (read through the FE, write by stream load)", .fields = &.{
+        .{ .key = "host", .prompt = "FE host" },
+        .{ .key = "port", .prompt = "FE query port", .default = "9030", .int = true },
+        .{ .key = "load_url", .prompt = "BE/CN stream-load URL", .default = "http://<be-host>:8040" },
+        .{ .key = "database", .prompt = "database" },
+        .{ .key = "user", .prompt = "user", .default = "root" },
+        .{ .key = "password", .prompt = "password", .secret = true },
+    } },
+    .{ .name = "http", .blurb = "a REST API (paginated sources, an endpoint sink)", .fields = &.{
+        .{ .key = "base_url", .prompt = "base URL" },
+        .{ .key = "auth", .prompt = "auth (blank, bearer, basic)" },
+    } },
+};
+
+/// One answer from the terminal, the default when the line is empty. The terminal
+/// is in cooked mode between entries, so a plain read gets a whole line; a secret
+/// is read with echo off.
+fn ask(msg: *std.Io.Writer, prompt: []const u8, default: []const u8, secret: bool, buf: []u8) ![]const u8 {
+    if (default.len > 0) try msg.print("  {s} [{s}]: ", .{ prompt, default }) else try msg.print("  {s}: ", .{prompt});
+    try msg.flush();
+    const fd = std.fs.File.stdin().handle;
+    var orig: ?std.posix.termios = null;
+    if (secret) {
+        if (std.posix.tcgetattr(fd)) |t| {
+            var raw = t;
+            raw.lflag.ECHO = false;
+            std.posix.tcsetattr(fd, .NOW, raw) catch {};
+            orig = t;
+        } else |_| {}
+    }
+    defer if (orig) |t| {
+        std.posix.tcsetattr(fd, .NOW, t) catch {};
+        msg.writeAll("\n") catch {};
+    };
+    var n: usize = 0;
+    while (n < buf.len) {
+        var b: [1]u8 = undefined;
+        if (try std.posix.read(fd, &b) == 0) break;
+        if (b[0] == '\n') break;
+        if (b[0] == '\r') continue;
+        buf[n] = b[0];
+        n += 1;
+    }
+    const line = std.mem.trim(u8, buf[0..n], " \t");
+    return if (line.len == 0) default else line;
+}
+
+/// `\connect [type]`: ask what the connector needs, show the `CREATE CONNECTION`
+/// it makes, register it, and offer to reach it and to save it — the way a
+/// project scaffolder asks its few questions and writes the file.
+fn connectWizard(alloc: std.mem.Allocator, type_arg: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
+    var buf: [512]u8 = undefined;
+    var which: ?Connector = null;
+    if (type_arg.len > 0) {
+        for (connectors) |c| if (std.ascii.eqlIgnoreCase(c.name, type_arg)) {
+            which = c;
+        };
+        if (which == null) return msg.print("error: no connector `{s}` — one of postgres, mysql, sqlserver, starrocks, http\n", .{type_arg});
+    } else {
+        try msg.writeAll("new connection — the type:\n");
+        for (connectors, 1..) |c, i| try msg.print("  {d}. {s: <10} {s}\n", .{ i, c.name, c.blurb });
+        const a = try ask(msg, "type (number or name)", "", false, &buf);
+        const idx = std.fmt.parseInt(usize, a, 10) catch 0;
+        if (idx >= 1 and idx <= connectors.len) which = connectors[idx - 1];
+        for (connectors) |c| if (std.ascii.eqlIgnoreCase(c.name, a)) {
+            which = c;
+        };
+        if (which == null) return msg.writeAll("no such type; nothing made\n");
+    }
+    const conn = which.?;
+    const name = try alloc.dupe(u8, try ask(msg, "name (how the script refers to it, e.g. erp)", "", false, &buf));
+    defer alloc.free(name);
+    if (name.len == 0 or !std.ascii.isAlphabetic(name[0])) return msg.writeAll("a name starts with a letter; nothing made\n");
+    var upper_buf: [64]u8 = undefined;
+    const up = std.ascii.upperString(&upper_buf, name);
+
+    var stmt = std.array_list.Managed(u8).init(alloc);
+    defer stmt.deinit();
+    try stmt.writer().print("CREATE CONNECTION {s} TYPE {s} OPTIONS (", .{ name, conn.name });
+    var first = true;
+    for (conn.fields) |f| {
+        var default = f.default;
+        var hint_buf: [96]u8 = undefined;
+        var conv_buf: [80]u8 = undefined;
+        const cred = f.secret or std.mem.eql(u8, f.key, "user");
+        // Blank credentials mean the runtime's own convention: env(NAME_USER) / env(NAME_PASS).
+        const conv = try std.fmt.bufPrint(&conv_buf, "{s}_{s}", .{ up, if (f.secret) "PASS" else "USER" });
+        if (cred and f.default.len == 0) default = try std.fmt.bufPrint(&hint_buf, "env:{s}", .{conv});
+        const v = try ask(msg, f.prompt, default, f.secret, &buf);
+        if (v.len == 0 or std.mem.startsWith(u8, v, "<")) continue;
+        if (std.mem.startsWith(u8, v, "env:")) {
+            const var_name = v[4..];
+            if (std.mem.eql(u8, var_name, conv)) continue;
+            try stmt.writer().print("{s}{s} = env('{s}')", .{ if (first) "" else ", ", f.key, var_name });
+        } else if (f.int) {
+            try stmt.writer().print("{s}{s} = {s}", .{ if (first) "" else ", ", f.key, v });
+        } else {
+            try stmt.writer().print("{s}{s} = '{s}'", .{ if (first) "" else ", ", f.key, v });
+        }
+        first = false;
+    }
+    try stmt.appendSlice(");");
+    try msg.print("\n{s}\n", .{stmt.items});
+    try runBlock(alloc, stmt.items, sess, msg);
+    var declared = false;
+    for (sess.decls.items.items) |e| if (e.kind == .connection and std.ascii.eqlIgnoreCase(e.name, name)) {
+        declared = true;
+    };
+    if (!declared) return;
+
+    if (!std.mem.eql(u8, conn.name, "http")) {
+        const t = try ask(msg, "reach it now? (y/n)", "y", false, &buf);
+        if (std.ascii.toLower(t[0]) == 'y') {
+            const reached = connTables(sess, name).len > 0;
+            try msg.print("  {s}\n", .{if (reached) "reached" else "could not reach it (or it has no tables) — \\c test retries; the connection stays declared"});
+        }
+    }
+    const sv = try ask(msg, "save to the startup file, so every session has it? (y/n)", "n", false, &buf);
+    if (std.ascii.toLower(sv[0]) == 'y') try saveDecls(alloc, "", sess, msg);
+}
+
 /// `\i <file>`: run a file as an entry, so its declarations join the session —
 /// what `@include` inside an entry does not do. Also the startup file's path in.
 fn sourceFile(alloc: std.mem.Allocator, path: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
@@ -722,7 +900,8 @@ fn saveDecls(alloc: std.mem.Allocator, path_arg: []const u8, sess: *Session, msg
         try f.writeAll(";\n");
         n += 1;
     }
-    try msg.print("saved {d} declaration{s} to {s}\n", .{ n, if (n == 1) "" else "s", path });
+    var tbuf: [512]u8 = undefined;
+    try msg.print("saved {d} declaration{s} to {s}\n", .{ n, if (n == 1) "" else "s", tilde(&tbuf, path) });
 }
 
 /// `\edit [file]`: the last entry (or the file) in `$EDITOR`, then run what
@@ -985,7 +1164,7 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
     defer table.dropLast();
 
     if (sess.tty) {
-        try msg.writeAll("basalt REPL — Enter runs a statement that ends in `;`, else opens a line. \\q quits, \\help for the editing keys.\n");
+        try banner(msg, !std.process.hasEnvVarConstant("NO_COLOR"));
         try msg.flush();
     }
 
@@ -993,8 +1172,22 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
     if (startupPath(alloc)) |sp| {
         defer alloc.free(sp);
         if (std.fs.cwd().access(sp, .{})) |_| {
+            sess.announce = false;
             try sourceFile(alloc, sp, &sess, msg);
-            if (sess.tty) try msg.print("loaded {s}\n", .{sp});
+            sess.announce = true;
+            if (sess.tty) {
+                var conns: usize = 0;
+                var others: usize = 0;
+                for (sess.decls.items.items) |e| if (e.kind == .connection) {
+                    conns += 1;
+                } else {
+                    others += 1;
+                };
+                var tbuf: [512]u8 = undefined;
+                try msg.print("loaded {s}: {d} connection{s}", .{ tilde(&tbuf, sp), conns, if (conns == 1) "" else "s" });
+                if (others > 0) try msg.print(", {d} other declaration{s}", .{ others, if (others == 1) "" else "s" });
+                try msg.writeAll("\n\n");
+            }
             try msg.flush();
         } else |_| {}
     }
@@ -1125,6 +1318,10 @@ fn metaCommand(t: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
         return sourceFile(sess.decls.gpa, rest, sess, msg);
     }
     if (std.mem.eql(u8, cmd, "\\save")) return saveDecls(sess.decls.gpa, rest, sess, msg);
+    if (std.mem.eql(u8, cmd, "\\connect")) {
+        if (!sess.tty) return msg.writeAll("error: \\connect asks questions; it needs a terminal\n");
+        return connectWizard(sess.decls.gpa, rest, sess, msg);
+    }
     if (std.mem.eql(u8, cmd, "\\edit") or std.mem.eql(u8, cmd, "\\e")) return editAndRun(sess.decls.gpa, rest, sess, msg);
     if (isClear(t)) {
         // The whole screen, cursor home; the terminal's scrollback is left alone.
@@ -1240,7 +1437,7 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *s
     for (pending.items) |p| try sess.decls.put(p.id, p.text);
 
     if (executable == 0) {
-        for (pending.items) |p| try msg.print("ok: {s} {s}\n", .{ @tagName(p.id.kind), p.id.name });
+        if (sess.announce) for (pending.items) |p| try msg.print("ok: {s} {s}\n", .{ @tagName(p.id.kind), p.id.name });
         try msg.flush();
         return;
     }
@@ -1337,64 +1534,61 @@ fn isHelp(s: []const u8) bool {
 }
 fn replHelp(msg: *std.Io.Writer) !void {
     try msg.writeAll(
-        \\REPL — end a statement with `;` to run it; a blank line also runs a pending entry.
-        \\  • a terminal SELECT prints as a table; LOAD INTO writes to its target.
-        \\  • CREATE CONNECTION / CREATE FUNCTION / PARAM stay in scope for later entries.
-        \\  example:  CREATE CONNECTION erp TYPE postgres HOST 'db' DATABASE 'erp';
-        \\            SELECT id, amount FROM erp.orders WHERE status = 'paid';
+        \\A statement ends in `;` and runs on Enter. A terminal SELECT prints a table;
+        \\LOAD INTO writes to its target. Declarations stay for the session.
         \\
-        \\commands:
-        \\  \connections, \c   the connections as a table (name, type, host, database, status);
-        \\                     `\c test` reaches each one now. Functions and params follow
-        \\  \i <file>          run a file; its declarations join the session
-        \\  \save [file]       write the session's declarations to a file — by default the
-        \\                     startup file, ~/.config/basalt/repl.sql, which every session
-        \\                     loads first
-        \\  \edit, \e [file]   open the last entry (or the file) in $EDITOR, run what comes back
-        \\  \dt <conn[.schema]> [pattern]
-        \\                     the source's tables — SHOW TABLES FROM conn[.schema] [LIKE 'p']
-        \\  \d <conn.table | 'file' | query>
-        \\                     its columns and engine types — DESCRIBE <source>
-        \\  \reset             forget them all
-        \\  \clear, \cls, clear, cls
-        \\                     clear the screen (^L does too, mid-entry)
+        \\session
+        \\  \connect [type]         make a connection by answering a few questions
+        \\  \connections, \c        the connections as a table; `\c test` reaches each now
+        \\  \i <file>               run a file; its declarations join the session
+        \\  \save [file]            write the declarations, by default to the startup file
+        \\                          ~/.config/basalt/repl.sql, which every session loads
+        \\  \reset                  forget every declaration
+        \\  \edit, \e [file]        open the last entry (or a file) in $EDITOR, then run it
+        \\
+        \\sources
+        \\  \dt <conn[.schema]> [p] the source's tables        (SHOW TABLES FROM ... [LIKE 'p'])
+        \\  \d <conn.table|'file'>  its columns and types      (DESCRIBE ...)
+        \\
+        \\results
+        \\  \view, \v               scroll the last result: arrows by column and row, q leaves
         \\  \format table|json|csv|tsv
-        \\                     set the output format (bare \format shows it); \f is an alias
-        \\  \view, \v          scroll the last result: arrows move by column and row, names
-        \\                     stay pinned; for the tables too wide or long to print whole
-        \\  \help, \h, ?       this help
-        \\  \q, \quit, exit    leave
+        \\                          the output format (bare \format shows it); \f for short
+        \\  \clear, \cls            clear the screen (Ctrl+L too, mid-entry)
+        \\  \help, \h, ?            this help
+        \\  \q, \quit, exit         leave
         \\
-        \\editing — the entry is a small text editor, not a single line:
-        \\  Enter              runs the entry when it ends in `;` and the cursor is at its end;
-        \\                     anywhere else it opens a line (after `(` it steps in and puts the
-        \\                     `)` on its own line). Ctrl+J runs it as it stands,
-        \\                     `;` or not (Ctrl+Enter too, where the terminal delivers it)
-        \\  ( [ { ' \"          close themselves; typing the closer steps over it; over a
-        \\                     selection they wrap it. `)` on a blank line dedents
-        \\  Alt+Up/Down        move the line (or selected lines); Shift+Alt+Up/Down duplicate
-        \\  Tab                complete the word: keywords, connections, CTEs, $params, a
-        \\                     path inside quotes, `conn.` tables and the columns of the
-        \\                     tables and files the entry names (asked once per session);
-        \\                     Tab again cycles the choices. Over selected lines: indent;
-        \\                     Shift+Tab dedents; after a space: two spaces
-        \\  Ctrl+/             comment the line(s) out with `-- `, or back in
-        \\  Esc                drop the selection; the matching bracket is underlined
-        \\  arrows             travel the entry; Up/Down past its edge recall history, where
-        \\                     an entry comes back whole (~/.basalt_history)
-        \\  ^R                 search the history: type to narrow, ^R for an older match,
-        \\                     Enter keeps it, Esc puts the entry back
-        \\  Ctrl+arrows        by word (Alt-b/Alt-f too); Home/End the line (Home toggles the
-        \\                     indent); Ctrl+Home/End the whole entry
-        \\  Shift+any of those select; typing, Backspace or Delete replace the selection
-        \\  ^A select all · ^C copy (with a selection) · ^X cut · ^V paste · ^Z undo · ^Y redo
-        \\  ^W/Ctrl+Backspace, Alt-d/Ctrl+Delete delete a word · ^K to line end · ^U the line
-        \\  Tab two spaces · ^L clear the screen · ^C drop the entry · ^D leave when it is empty
-        \\  a paste is inserted as text, never run line by line; copy reaches the system
-        \\  clipboard where the terminal allows it (OSC 52)
+        \\editing — the entry is a small text editor
+        \\  Enter                   run when the entry ends in `;` and the cursor is at its end;
+        \\                          otherwise a new line (after `(` it steps in, `)` on its own line)
+        \\  Ctrl+J                  run the entry as it stands, `;` or not (Ctrl+Enter where sent)
+        \\  Tab                     complete: keywords, connections, CTEs, $params, a path in
+        \\                          quotes, `conn.` tables, the columns of tables and files named;
+        \\                          Tab again cycles the choices. On selected lines: indent
+        \\  Shift+Tab               dedent the selected lines
+        \\  Ctrl+R                  search the history; Ctrl+R again for older, Enter keeps it
+        \\  Up / Down               travel the entry; past its edge, recall history whole
+        \\
+        \\  Ctrl+Left / Right       by word (Alt+B / Alt+F too)
+        \\  Home / End              line start (Home toggles the indent) / line end
+        \\  Ctrl+Home / End         start / end of the entry
+        \\  Shift + any move        select; typing, Backspace or Delete replace the selection
+        \\  Alt+Up / Down           move the line or selected lines; with Shift, duplicate them
+        \\
+        \\  Ctrl+A                  select all
+        \\  Ctrl+C                  copy the selection — with none, drop the entry
+        \\  Ctrl+X / Ctrl+V         cut / paste (copy reaches the system clipboard, OSC 52)
+        \\  Ctrl+Z / Ctrl+Y         undo / redo
+        \\  Ctrl+W, Alt+D           delete the word before / after the cursor
+        \\  Ctrl+K / Ctrl+U         delete to the line end / the whole line
+        \\  Ctrl+/                  comment the lines out with `--`, or back in
+        \\  Esc                     drop the selection
+        \\  Ctrl+D                  leave, when the entry is empty
+        \\
+        \\  ( [ { ' "  close themselves; typing the closer steps over it; over a selection
+        \\  they wrap it. A paste is inserted as text, never run line by line.
         \\
     );
-    try msg.flush();
 }
 
 /// Advance past a flag to its value argument; null (after printing the
@@ -1629,4 +1823,35 @@ fn usage(w: anytype) !void {
         \\                     still prints)
         \\
     );
+}
+
+test "every meta command the REPL handles is one Tab offers, and the other way round" {
+    const src = @embedFile("cli.zig");
+    for (complete.meta_commands) |m| {
+        if (std.mem.eql(u8, m, "\\quit") or std.mem.eql(u8, m, "\\h") or std.mem.eql(u8, m, "\\q") or std.mem.eql(u8, m, "\\help") or std.mem.eql(u8, m, "\\cls") or std.mem.eql(u8, m, "\\clear")) continue;
+        var needle_buf: [64]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&needle_buf, "\"\\\\{s}\"", .{m[1..]});
+        if (std.mem.indexOf(u8, src, needle) == null) {
+            std.debug.print("Tab offers `{s}` but metaCommand does not handle it\n", .{m});
+            return error.TestUnexpectedResult;
+        }
+    }
+    // The reverse: each command `metaCommand` compares `cmd` against is offered.
+    const body_start = std.mem.indexOf(u8, src, "\nfn metaCommand(").?;
+    const body_end = std.mem.indexOfPos(u8, src, body_start + 1, "\nfn ").?;
+    var it = std.mem.splitSequence(u8, src[body_start..body_end], "std.mem.eql(u8, cmd, \"\\\\");
+    _ = it.next();
+    while (it.next()) |rest| {
+        const end = std.mem.indexOfScalar(u8, rest, '"') orelse continue;
+        var cmd_buf: [64]u8 = undefined;
+        const cmd = try std.fmt.bufPrint(&cmd_buf, "\\{s}", .{rest[0..end]});
+        var offered = false;
+        for (complete.meta_commands) |m| if (std.mem.eql(u8, m, cmd)) {
+            offered = true;
+        };
+        if (!offered) {
+            std.debug.print("metaCommand handles `{s}` but Tab does not offer it\n", .{cmd});
+            return error.TestUnexpectedResult;
+        }
+    }
 }

@@ -31,7 +31,8 @@ pub const Names = struct {
     columns: []const []const u8 = &.{},
 };
 
-pub const meta_commands = [_][]const u8{ "\\connections", "\\c", "\\reset", "\\clear", "\\cls", "\\format", "\\view", "\\v", "\\d", "\\dt", "\\help", "\\h", "\\q", "\\quit" };
+/// Every meta command the REPL answers to; `cli.zig`'s test checks it stays so.
+pub const meta_commands = [_][]const u8{ "\\connections", "\\c", "\\connect", "\\reset", "\\clear", "\\cls", "\\format", "\\f", "\\view", "\\v", "\\d", "\\dt", "\\i", "\\source", "\\save", "\\edit", "\\e", "\\help", "\\h", "\\q", "\\quit" };
 
 pub const Result = union(enum) {
     /// Replace `text[start..cursor]` with a pick from `items`.
