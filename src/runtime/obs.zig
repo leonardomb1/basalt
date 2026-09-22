@@ -165,7 +165,9 @@ pub const Progress = struct {
     logger: *Logger,
     rows: *std.atomic.Value(u64),
     thread: ?std.Thread = null,
-    stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set to stop: the ticker waits on it between frames, so `stop` returns at
+    /// once instead of after the sleep it was in — which put 100 ms on every run.
+    stop_flag: std.Thread.ResetEvent = .{},
     /// Below: guarded by `logger.mutex`.
     active: usize = 0,
     label_buf: [192]u8 = undefined,
@@ -177,17 +179,21 @@ pub const Progress = struct {
     loop_done: usize = 0,
     loop_began_ms: i64 = 0,
     frame: usize = 0,
+    /// Colour the line (a cyan spinner, a green count, the rest dim), unless
+    /// `NO_COLOR` asks for plain text.
+    color: bool = true,
 
     const quiet_ms = 400;
     const tick_ns = 100 * std.time.ns_per_ms;
     const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 
     pub fn start(self: *Progress) void {
+        self.color = !std.process.hasEnvVarConstant("NO_COLOR");
         self.thread = std.Thread.spawn(.{}, ticker, .{self}) catch null;
     }
 
     pub fn stop(self: *Progress) void {
-        self.stop_flag.store(true, .release);
+        self.stop_flag.set();
         if (self.thread) |t| t.join();
         self.thread = null;
         self.logger.mutex.lock();
@@ -248,8 +254,9 @@ pub const Progress = struct {
     }
 
     fn ticker(self: *Progress) void {
-        while (!self.stop_flag.load(.acquire)) {
-            std.Thread.sleep(tick_ns);
+        while (true) {
+            self.stop_flag.timedWait(tick_ns) catch {};
+            if (self.stop_flag.isSet()) return;
             self.logger.mutex.lock();
             defer self.logger.mutex.unlock();
             const looping = self.loop_depth > 0;
@@ -269,6 +276,7 @@ pub const Progress = struct {
                 .loop_done = self.loop_done,
                 .loop_total = self.loop_total,
                 .width = termWidth(self.logger.file),
+                .color = self.color,
             }) catch continue;
             self.logger.file.writeAll("\r\x1b[2K") catch continue;
             self.logger.file.writeAll(w.buffered()) catch continue;
@@ -288,11 +296,13 @@ pub const Progress = struct {
         loop_done: usize = 0,
         loop_total: usize = 0,
         width: usize = 80,
+        color: bool = false,
     };
 
     /// One progress line, no newline, never wider than `width` columns — a wrapped
     /// line cannot be erased with a carriage return. The label gives way first.
     pub fn render(w: *std.Io.Writer, l: Line) !void {
+        // Measured without its colour codes, which take no columns.
         var tail_buf: [96]u8 = undefined;
         var tw = std.Io.Writer.fixed(&tail_buf);
         try tw.writeAll("  ");
@@ -302,6 +312,15 @@ pub const Progress = struct {
         const secs = (l.clock_ms orelse l.elapsed_ms) / 1000;
         try tw.print(" rows/s  {d}:{d:0>2}", .{ secs / 60, secs % 60 });
         const tail = tw.buffered();
+        var ctail_buf: [160]u8 = undefined;
+        var cw = std.Io.Writer.fixed(&ctail_buf);
+        if (l.color) {
+            try cw.writeAll("  \x1b[32m");
+            try writeThousands(&cw, l.rows);
+            try cw.writeAll(" rows\x1b[0m  \x1b[2m");
+            try cw.writeAll(tail[tail.len - (tail.len - std.mem.indexOf(u8, tail, "rows  ").? - 6) ..]);
+            try cw.writeAll("\x1b[0m");
+        }
 
         var head_buf: [32]u8 = undefined;
         var hw = std.Io.Writer.fixed(&head_buf);
@@ -310,9 +329,9 @@ pub const Progress = struct {
 
         const fixed = 2 + head.len + tail.len;
         const room = if (l.width > fixed + 1) l.width - fixed - 1 else 0;
-        try w.print("{s} {s}", .{ l.spinner, head });
+        if (l.color) try w.print("\x1b[36m{s}\x1b[0m \x1b[1m{s}\x1b[0m", .{ l.spinner, head }) else try w.print("{s} {s}", .{ l.spinner, head });
         try writeFitted(w, l.label, room);
-        try w.writeAll(tail);
+        try w.writeAll(if (l.color) cw.buffered() else tail);
     }
 };
 
@@ -560,6 +579,23 @@ test "progress line: counts, rate and clock, and a label that gives way to the w
     try std.testing.expect(std.mem.startsWith(u8, line, "* [3/12] erp.dbo."));
     try std.testing.expect(std.mem.indexOf(u8, line, "…") != null);
     try std.testing.expect(std.mem.endsWith(u8, line, ".parquet  950 rows  15 rows/s  1:01"));
+
+    // In colour the same text, dressed; stripped of its codes it is byte-identical.
+    w = std.Io.Writer.fixed(&buf);
+    try Progress.render(&w, .{ .spinner = "*", .label = "a → b", .rows = 12, .elapsed_ms = 2000, .loop_done = 0, .loop_total = 3, .width = 80, .color = true });
+    var plain: [256]u8 = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    const c = w.buffered();
+    while (i < c.len) : (i += 1) {
+        if (c[i] == 0x1b) {
+            while (c[i] != 'm') i += 1;
+            continue;
+        }
+        plain[n] = c[i];
+        n += 1;
+    }
+    try std.testing.expectEqualStrings("* [1/3] a → b  12 rows  6 rows/s  0:02", plain[0..n]);
 }
 
 test "level parse + summary rate" {
