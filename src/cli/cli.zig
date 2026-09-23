@@ -529,7 +529,7 @@ fn splitStatements(arena: std.mem.Allocator, s: []const u8) ![]const []const u8 
     return out.toOwnedSlice();
 }
 
-const DeclKind = enum { connection, function, param, let, endpoint };
+const DeclKind = enum { connection, function, param, let, endpoint, resource };
 const DeclId = struct { kind: DeclKind, name: []const u8 };
 
 /// Next whitespace-delimited word at `i.*`, advancing past it.
@@ -550,7 +550,8 @@ fn identPrefix(w: []const u8) []const u8 {
 }
 
 /// Classify a statement as a session declaration and name it:
-/// `CREATE [OR REPLACE] CONNECTION|FUNCTION <name>`, `CREATE ENDPOINT ...`
+/// `CREATE [OR REPLACE] CONNECTION|FUNCTION <name>`, `CREATE RESOURCE <conn>.<name>`,
+/// `CREATE ENDPOINT ...`
 /// (unnamed — the REPL rejects it), or `PARAM <name>`. Null for anything else.
 fn declOf(stmt: []const u8) ?DeclId {
     var i: usize = 0;
@@ -571,6 +572,14 @@ fn declOf(stmt: []const u8) ?DeclId {
         w = nextWord(stmt, &i) orelse return null;
     }
     if (std.ascii.eqlIgnoreCase(w, "endpoint")) return .{ .kind = .endpoint, .name = "" };
+    if (std.ascii.eqlIgnoreCase(w, "resource")) {
+        // Named `conn.name`: two resources of different connections may share a name.
+        const q = nextWord(stmt, &i) orelse return null;
+        const conn = identPrefix(q);
+        if (conn.len == 0 or conn.len + 1 >= q.len or q[conn.len] != '.') return null;
+        const n = identPrefix(q[conn.len + 1 ..]);
+        return if (n.len == 0) null else .{ .kind = .resource, .name = q[0 .. conn.len + 1 + n.len] };
+    }
     const kind: DeclKind = if (std.ascii.eqlIgnoreCase(w, "connection"))
         .connection
     else if (std.ascii.eqlIgnoreCase(w, "function"))
@@ -703,7 +712,7 @@ fn listConnections(sess: *Session, msg: *std.Io.Writer, probe: bool) !void {
     for (sess.decls.items.items) |e| {
         if (e.kind != .connection) continue;
         const ty = connTypeOf(e.text) orelse "?";
-        const host = connAttr(e.text, "host") orelse connAttr(e.text, "fe_host") orelse connAttr(e.text, "url") orelse "";
+        const host = connAttr(e.text, "host") orelse connAttr(e.text, "fe_host") orelse connAttr(e.text, "url") orelse connAttr(e.text, "base_url") orelse "";
         const db = connAttr(e.text, "database") orelse "";
         var status: []const u8 = "not asked yet";
         if (probe and !std.mem.eql(u8, ty, "http")) _ = connTables(sess, e.name);
@@ -983,6 +992,22 @@ fn fetchColumn(sess: *Session, select: []const u8) []const []const u8 {
     return out.toOwnedSlice() catch &.{};
 }
 
+/// The resources declared on `conn` when it is an http connection — its
+/// "tables", known from the session without asking the network — else null.
+fn httpResources(arena: std.mem.Allocator, sess: *Session, conn: []const u8) !?[]const []const u8 {
+    const is_http = for (sess.decls.items.items) |e| {
+        if (e.kind == .connection and std.ascii.eqlIgnoreCase(e.name, conn))
+            break std.ascii.eqlIgnoreCase(connTypeOf(e.text) orelse "", "http");
+    } else false;
+    if (!is_http) return null;
+    var out = std.array_list.Managed([]const u8).init(arena);
+    for (sess.decls.items.items) |e| {
+        if (e.kind != .resource or e.name.len <= conn.len or e.name[conn.len] != '.') continue;
+        if (std.ascii.eqlIgnoreCase(e.name[0..conn.len], conn)) try out.append(e.name[conn.len + 1 ..]);
+    }
+    return try out.toOwnedSlice();
+}
+
 /// The tables of `conn` as `schema.table`, fetched on first use.
 fn connTables(sess: *Session, conn: []const u8) []const []const u8 {
     if (sess.catalog.tables.get(conn)) |t| return t;
@@ -1047,7 +1072,7 @@ fn suggest(ctx: *anyopaque, arena: std.mem.Allocator, text: []const u8, cursor: 
         .connection => try conns.append(e.name),
         .function => try fns.append(e.name),
         .param, .let => try params.append(e.name),
-        .endpoint => {},
+        .endpoint, .resource => {},
     };
 
     // CTEs of the entry: `WITH name AS (` and `, name AS (`.
@@ -1084,7 +1109,7 @@ fn suggest(ctx: *anyopaque, arena: std.mem.Allocator, text: []const u8, cursor: 
             }
             if (dots == 1 and e < text.len and text[e] != '(') for (sourceColumns(sess, text[p..e])) |col| try columns.append(col);
         }
-        if (wanted) try tables.append(.{ .conn = c, .tables = connTables(sess, c) });
+        if (wanted) try tables.append(.{ .conn = c, .tables = try httpResources(arena, sess, c) orelse connTables(sess, c) });
     }
     var q: usize = 0;
     while (std.mem.indexOfScalarPos(u8, text, q, '\'')) |open| {
@@ -1706,6 +1731,28 @@ test "splitStatements splits on statement-level semicolons only" {
     try std.testing.expectEqualStrings("-- ; not a split\nSELECT 2", parts[2]);
 }
 
+test "Tab lists an http connection's resources as its tables" {
+    const gpa = std.testing.allocator;
+    var sess = Session{ .decls = DeclStore.init(gpa), .catalog = Catalog.init(gpa) };
+    defer sess.decls.deinit();
+    defer sess.catalog.deinit();
+    for ([_][]const u8{
+        "CREATE CONNECTION rc TYPE http OPTIONS (base_url = 'u')",
+        "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h')",
+        "CREATE RESOURCE rc.countries AS GET('/all')",
+        "CREATE RESOURCE rc.regions AS GET('/regions')",
+        "CREATE RESOURCE rcx.other AS GET('/o')",
+    }) |t| try sess.decls.put(declOf(t).?, t);
+
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const got = (try httpResources(ar.allocator(), &sess, "rc")).?;
+    try std.testing.expectEqual(@as(usize, 2), got.len);
+    try std.testing.expectEqualStrings("countries", got[0]);
+    try std.testing.expectEqualStrings("regions", got[1]);
+    try std.testing.expect(try httpResources(ar.allocator(), &sess, "pg") == null);
+}
+
 test "declOf names session declarations" {
     try std.testing.expectEqual(DeclKind.connection, declOf("CREATE CONNECTION erp TYPE postgres").?.kind);
     try std.testing.expectEqualStrings("erp", declOf("CREATE CONNECTION erp TYPE postgres").?.name);
@@ -1715,6 +1762,9 @@ test "declOf names session declarations" {
     try std.testing.expectEqual(DeclKind.param, declOf("param since date DEFAULT '2020-01-01'").?.kind);
     try std.testing.expectEqualStrings("since", declOf("param since date").?.name);
     try std.testing.expectEqual(DeclKind.endpoint, declOf("CREATE ENDPOINT '/x'").?.kind);
+    try std.testing.expectEqual(DeclKind.resource, declOf("CREATE RESOURCE rc.countries AS GET('/all')").?.kind);
+    try std.testing.expectEqualStrings("rc.countries", declOf("CREATE RESOURCE rc.countries AS GET('/all')").?.name);
+    try std.testing.expect(declOf("CREATE RESOURCE countries AS GET('/all')") == null);
 
     try std.testing.expect(declOf("SELECT 1") == null);
     try std.testing.expect(declOf("CREATE TABLE t") == null);

@@ -186,6 +186,36 @@ environment indirection.
 
 `CREATE OR REPLACE CONNECTION` re-declares an existing name.
 
+**HTTP connections** hold what every read of an API shares. After `OPTIONS`,
+an `http` connection takes the REST source clauses (§5) — `PAGINATE`, `RETRY`,
+`WITH (...)` — as defaults each read starts from; a read's own clauses win:
+
+```sql
+CREATE CONNECTION gh TYPE http OPTIONS (base_url = 'https://api.github.com',
+    auth = 'bearer', token = env('GH_TOKEN'))
+  RETRY 3 ON (429, 503)
+  WITH (header = 'Accept: application/vnd.github+json');
+```
+
+`auth` is `bearer` (`token`), `basic` (`user`/`password`, which default to the
+`NAME_USER`/`NAME_PASS` convention), `header` (`header_name`/`header_value`,
+for API keys), `login_json` or `oauth2` (`token_url`, `client_id`,
+`client_secret`, `scope`). With no `auth`, no credentials are read at all.
+
+`CREATE RESOURCE conn.name AS GET(...) | POST(...) [PAGINATE ...] [RETRY ...]
+[WITH (...)];` names one endpoint, so it reads like a table:
+
+```sql
+CREATE RESOURCE gh.repos AS GET('/orgs/ziglang/repos', type = 'public')
+  PAGINATE BY page (param = 'page', size = 100);
+
+SELECT name, stargazers_count FROM gh.repos WHERE NOT archived;
+```
+
+`SHOW TABLES FROM gh` lists a connection's resources (`resource`, `method`,
+`path`) and `DESCRIBE gh.repos` fetches it to print its columns. Reading
+`gh.name` that no `CREATE RESOURCE` declared is a plan-time error that says so.
+
 ## 4. Sink — `LOAD INTO`
 
 ```sql
@@ -251,8 +281,9 @@ LIMIT 100 OFFSET 20;
 | compressed file | `FROM 'path.csv.gz'` / `.csv.zst` — the inner name picks the reader |
 | file inside a zip | `FROM 'archive.zip :: inner.csv'`, or just `FROM 'archive.zip'` when it holds one file |
 | object storage | `FROM 'az://account/container/path.parquet'` or `FROM 's3://bucket/key.parquet'`; a trailing `/` reads every object under the prefix as one table |
-| REST (connection) | `FROM crm.'/v1/customers'` (path on the conn's base URL) |
-| REST (bare URL) | `FROM HTTP('https://host/api/x')` |
+| REST (connection) | `FROM crm.GET('/v1/customers', status = 'open')` — path on the conn's base URL; each `name = value` is a URL-encoded query param, and path and values are expressions (`'/v1/customers/' \|\| $id`). `crm.POST('/search', body = $$...$$)` sends a body. `crm.'/v1/customers'` is the older spelling of a bare GET |
+| REST resource | `FROM crm.customers` — an endpoint named with `CREATE RESOURCE` (§3) |
+| REST (raw URL) | `FROM HTTP('https://host/api/x')` — the URL exactly as written, the way `QUERY()` is raw SQL |
 | request body | `FROM BODY (col TYPE [NOT NULL], ...)` (§8) |
 | durable buffer | `FROM BUFFER 'name'` (§8) |
 | discovered union | `FROM EACH TABLE OF (...)` (§6) |
@@ -390,13 +421,21 @@ pushdown. Same word, different plan — `EXPLAIN` shows which.
 A complete REST read, for orientation:
 
 ```sql
-SELECT id AS crate, downloads
-FROM HTTP('https://crates.io/api/v1/crates?per_page=100&sort=downloads')
+CREATE CONNECTION crates TYPE http OPTIONS (base_url = 'https://crates.io/api/v1')
+  RETRY 2 ON (429, 503);
+
+SELECT id AS crate, downloads, json_get(links, 'owners') AS owners
+FROM crates.GET('/crates', sort = 'downloads', per_page = 100)
   PAGINATE BY page (param = 'page', size = 100, total = 'meta.total', max = 5)
-  RETRY 2 ON (429, 503)
   WITH (items = 'crates')
 WHERE downloads > 0;
 ```
+
+The rows are the array at `items` (or the response itself); a single object —
+a detail endpoint's answer — is one row. Columns are typed from the first
+object: numbers, booleans and strings as themselves, nested objects and arrays
+as JSON text, which `json_get` and `JSON_EACH` (§9, and `UNNEST` below) take
+apart.
 
 ### Operators
 
@@ -415,6 +454,7 @@ WHERE downloads > 0;
 | `LIMIT n [OFFSET m]` | limit |
 | `SELECT DISTINCT` / `DISTINCT ON (a, b)` | distinct — `ON` keys are input columns: they need not be in the SELECT list, and may be ones it renames (`DISTINCT ON (grp) grp AS k`) |
 | `CROSS JOIN UNNEST(SPLIT(tags, ',')) AS tag` | explode (also `UNNEST(col)`) |
+| `CROSS JOIN UNNEST(JSON_EACH(tags)) AS tag` | explode a JSON array: one row per element — strings unquoted, objects and arrays as JSON text, a JSON `null` as null. A null or `null` cell gives no rows; an object or scalar is an error |
 | `[INNER\|LEFT\|RIGHT\|FULL\|CROSS\|SEMI\|ANTI] JOIN <cte> x ON a = b [AND c = d ...]` | join (right side must be a CTE) |
 
 Row order without `ORDER BY` is not defined: `GROUP BY` returns groups in
@@ -888,7 +928,12 @@ At a use site the innermost binding wins: loop var > LET/PARAM.
   rpad() left() right() split_part() strpos() repeat() reverse()` · dates
   `date_add(unit, n, ts) date_diff(unit, a, b) make_date() epoch()
   to_timestamp() strftime(ts, fmt)` (`%Y %m %d %H %M %S %y %%`; month/year
-  arithmetic clamps the day-of-month).
+  arithmetic clamps the day-of-month) · json `json_get(doc, path)`.
+- `JSON_GET(doc, path)` — one value out of a JSON document, as text: `path` is
+  `a.b`, `a[0].b` or `a.0.b` (a leading `$.` is allowed). Strings come back
+  unquoted, objects and arrays as JSON text; a missing key, an index past the
+  end or a JSON `null` is null. A cell that is not JSON is an error, not a
+  null. `CAST(json_get(doc, 'n') AS INT)` for a typed value.
 - `TRY_CAST(x AS T)` — CAST that yields null instead of failing on a bad
   value; the workhorse for dirty inputs. Never pushed down.
 - `DATE_TRUNC('minute', ts)` and `EXTRACT(minute FROM ts)` — units `year`,
@@ -920,7 +965,8 @@ At a use site the innermost binding wins: loop var > LET/PARAM.
 sink would receive; a table or query is asked for no rows, so it is cheap on a
 large one. `SHOW TABLES FROM <conn>[.<schema>] [LIKE 'pattern'];` lists a SQL
 source's tables and views from its `information_schema` (`table_schema`,
-`table_name`, `table_type`), system schemas left out. Both are ordinary result
+`table_name`, `table_type`), system schemas left out; on an `http` connection
+it lists the declared resources (§3). Both are ordinary result
 statements: `basalt run --format json -c "DESCRIBE erp.dbo.SC5010;"` gives a
 program the schema, and the REPL's `\d` and `\dt` are the same statements.
 

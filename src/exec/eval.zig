@@ -18,7 +18,7 @@ const Batch = @import("batch.zig").Batch;
 const Type = types.Type;
 
 pub const TypeError = error{ TypeError, OutOfMemory };
-pub const EvalError = error{ CastFailed, DivByZero, TypeMismatch, IntOverflow, PatternTooComplex, OutOfMemory };
+pub const EvalError = error{ CastFailed, DivByZero, TypeMismatch, IntOverflow, PatternTooComplex, InvalidJson, OutOfMemory };
 
 pub const TypeCtx = struct {
     schema: types.Schema,
@@ -213,6 +213,7 @@ pub fn evalColumn(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch,
         error.TypeMismatch => return error.TypeMismatch,
         error.IntOverflow => return error.IntOverflow,
         error.PatternTooComplex => return error.PatternTooComplex,
+        error.InvalidJson => return error.InvalidJson,
         error.OutOfMemory => return error.OutOfMemory,
     };
     return switch (v) {
@@ -235,7 +236,7 @@ fn evalColumnRowwise(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Bat
 const Column = column.Column;
 const Bitmap = column.Bitmap;
 
-const VecError = error{ Unsupported, CastFailed, DivByZero, TypeMismatch, IntOverflow, PatternTooComplex, OutOfMemory };
+const VecError = error{ Unsupported, CastFailed, DivByZero, TypeMismatch, IntOverflow, PatternTooComplex, InvalidJson, OutOfMemory };
 
 const Vec = union(enum) {
     col: Column,
@@ -1357,6 +1358,45 @@ fn evalCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize
     return b.eval_fn(arena, c, batch, row);
 }
 
+pub fn parseJson(arena: std.mem.Allocator, text: []const u8) EvalError!std.json.Value {
+    return std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |e|
+        return if (e == error.OutOfMemory) error.OutOfMemory else error.InvalidJson;
+}
+
+/// Walk `path` — `a.b`, `a[0].b` or `a.0.b`, optionally led by `$.` — through
+/// `v`. Null when a key is missing, an index is out of range, or a step lands
+/// on a scalar.
+pub fn jsonPath(v: std.json.Value, path: []const u8) ?std.json.Value {
+    var p = path;
+    if (std.mem.startsWith(u8, p, "$")) p = p[1..];
+    var cur = v;
+    var it = std.mem.tokenizeAny(u8, p, ".[]");
+    while (it.next()) |step| {
+        cur = switch (cur) {
+            .object => |o| o.get(step) orelse return null,
+            .array => |a| blk: {
+                const i = std.fmt.parseInt(usize, step, 10) catch return null;
+                break :blk if (i < a.items.len) a.items[i] else return null;
+            },
+            else => return null,
+        };
+    }
+    return cur;
+}
+
+/// A JSON value as a cell: strings unquoted, numbers and booleans as their
+/// text, objects and arrays as compact JSON, null as null.
+pub fn jsonToValue(arena: std.mem.Allocator, v: std.json.Value) EvalError!Value {
+    return switch (v) {
+        .null => .null,
+        .string, .number_string => |s| .{ .string = s },
+        .integer => |i| .{ .string = try std.fmt.allocPrint(arena, "{d}", .{i}) },
+        .float => |f| .{ .string = try std.fmt.allocPrint(arena, "{d}", .{f}) },
+        .bool => |b| .{ .string = if (b) "true" else "false" },
+        .object, .array => .{ .string = std.json.Stringify.valueAlloc(arena, v, .{}) catch return error.OutOfMemory },
+    };
+}
+
 /// 1 MiB ceiling on a single generated string (`repeat`, `lpad`/`rpad`), so
 /// `repeat(x, 1000000000)` is a clean error instead of an OOM or a stall.
 const max_str_bytes = 1 << 20;
@@ -1422,6 +1462,7 @@ pub const builtins = [_]Builtin{
     .{ .name = "epoch", .type_fn = typing.epoch, .eval_fn = per_row.epoch },
     .{ .name = "to_timestamp", .type_fn = typing.toTimestamp, .eval_fn = per_row.toTimestamp },
     .{ .name = "strftime", .type_fn = typing.strftime, .eval_fn = per_row.strftime },
+    .{ .name = "json_get", .type_fn = typing.jsonGet, .eval_fn = per_row.jsonGet },
 };
 
 /// The builtin called `name`, or null: unknown names and aggregates
@@ -1654,6 +1695,14 @@ const typing = struct {
         _ = try self.wantText(c, 1);
         _ = try self.wantInt(c, 2, "n");
         // An empty delimiter yields null, so this is nullable either way.
+        return Type.init(.string).asNullable();
+    }
+
+    fn jsonGet(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 2) return self.err("`json_get` takes (json, path)", .{});
+        _ = try self.wantText(c, 0);
+        _ = try self.wantText(c, 1);
+        // A missing key or a JSON null is SQL null.
         return Type.init(.string).asNullable();
     }
 
@@ -2055,6 +2104,15 @@ const per_row = struct {
             if (k == want) return Value{ .string = try arena.dupe(u8, part) };
         }
         return Value{ .string = "" };
+    }
+
+    fn jsonGet(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const dv = try evalRow(arena, c.args[0], batch, row);
+        const pv = try evalRow(arena, c.args[1], batch, row);
+        if (dv.isNull() or pv.isNull()) return .null;
+        const doc = try parseJson(arena, try valueToString(arena, dv));
+        const leaf = jsonPath(doc, try valueToString(arena, pv)) orelse return .null;
+        return jsonToValue(arena, leaf);
     }
 
     fn strpos(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {

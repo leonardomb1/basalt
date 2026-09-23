@@ -80,7 +80,11 @@ fn expandStmt(cx: *Ctx, s: ast.Stmt) Error!ast.Stmt {
     return switch (s) {
         .kind => |k| .{ .kind = .{ .kind = k.kind, .config = try expandAttrs(cx, k.config), .buffer = k.buffer, .pos = k.pos } },
         .param => |p| .{ .param = .{ .name = p.name, .ty = p.ty, .default = if (p.default) |d| try expandExpr(cx, d, null, 0) else null, .source = p.source, .header_name = p.header_name, .pos = p.pos, .is_json = p.is_json } },
-        .connection => |c| .{ .connection = .{ .name = c.name, .connector = c.connector, .config = try expandAttrs(cx, c.config), .pos = c.pos } },
+        .connection => |c| blk: {
+            var out = c;
+            out.config = try expandAttrs(cx, c.config);
+            break :blk .{ .connection = out };
+        },
         .binding => |b| .{ .binding = .{ .name = b.name, .pipeline = try expandPipeline(cx, b.pipeline), .pos = b.pos } },
         .output => |p| .{ .output = try expandPipeline(cx, p) },
         .explain => |e| .{ .explain = .{ .mode = e.mode, .pipeline = try expandPipeline(cx, e.pipeline), .pos = e.pos } },
@@ -625,6 +629,20 @@ test "expandProgram inlines `let … in` away (single-use binding)" {
 fn outputSelect(prog: ast.Program) []const ast.SelectItem {
     for (prog.stmts) |s| if (s == .output) return s.output.stages[1].node.select;
     return &.{};
+}
+
+test "expandProgram keeps an http connection's clauses" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a, "CREATE CONNECTION e TYPE http OPTIONS (base_url = 'u') RETRY 2 WITH (header = 'X: y');", &diag);
+    var msg: []const u8 = "";
+    const out = try expandProgram(a, prog, null, &msg);
+    for (out.stmts) |st| {
+        if (st == .connection) return std.testing.expectEqual(@as(usize, 2), st.connection.hints.len);
+    }
+    return error.TestUnexpectedResult;
 }
 
 test "expandProgram substitutes JSON-param path access from the body" {

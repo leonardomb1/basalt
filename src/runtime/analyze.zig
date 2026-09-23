@@ -233,10 +233,12 @@ pub fn explodePlan(arena: std.mem.Allocator, in: types.Schema, ex: ast.Explode, 
     const idx = in.indexOf(ex.field) orelse return fail(diag, "unknown field `{s}`", .{ex.field});
     const fty = in.fields[idx].ty;
     if (!(fty.kind == .string or fty.kind == .bytes))
-        return fail(diag, "explode needs a string column (it splits a delimited value)", .{});
+        return fail(diag, "explode needs a string column (it splits a delimited value or a JSON array)", .{});
     const fields = try arena.alloc(types.Schema.Field, in.fields.len);
     for (in.fields, fields, 0..) |f, *out, i| {
-        out.* = if (i == idx) .{ .name = ex.as_name orelse f.name, .ty = types.Type.init(.string) } else f;
+        // A JSON array may hold nulls; a split string never yields one.
+        const ty = if (ex.json) types.Type.init(.string).asNullable() else types.Type.init(.string);
+        out.* = if (i == idx) .{ .name = ex.as_name orelse f.name, .ty = ty } else f;
     }
     return .{ .idx = idx, .schema = .{ .fields = fields } };
 }

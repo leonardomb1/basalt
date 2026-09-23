@@ -229,6 +229,9 @@ fn aggFunc(name: []const u8) ?ast.AggFunc {
     return null;
 }
 
+/// One `CREATE RESOURCE conn.name AS GET(...)`: the read it stands for.
+const Resource = struct { conn: []const u8, name: []const u8, path: []const u8, post: bool, hints: []const ast.Hint };
+
 pub const Parser = struct {
     arena: std.mem.Allocator,
     toks: []const Token,
@@ -240,6 +243,8 @@ pub const Parser = struct {
     /// Parallel to `conn_names`: each connection's connector type, which `SHOW
     /// TABLES` needs to phrase its catalog query.
     conn_types: std.array_list.Managed([]const u8) = undefined,
+    /// `CREATE RESOURCE`s declared so far, which `FROM conn.name` expands.
+    resources: std.array_list.Managed(Resource) = undefined,
     let_names: std.array_list.Managed([]const u8) = undefined,
     /// PARAM and LET names. `$p` parses to a plain single-part field, so this is
     /// the only way to tell a script constant from a column at parse time — which
@@ -400,6 +405,7 @@ pub const Parser = struct {
     pub fn parseProgram(self: *Parser) Error!ast.Program {
         self.conn_names = std.array_list.Managed([]const u8).init(self.arena);
         self.conn_types = std.array_list.Managed([]const u8).init(self.arena);
+        self.resources = std.array_list.Managed(Resource).init(self.arena);
         self.let_names = std.array_list.Managed([]const u8).init(self.arena);
         self.pending_bindings = std.array_list.Managed(ast.Stmt).init(self.arena);
         self.const_names = std.array_list.Managed([]const u8).init(self.arena);
@@ -506,8 +512,10 @@ pub const Parser = struct {
         var like: ?[]const u8 = null;
         if (self.eatKw("like")) like = (try self.expect(.string)).text;
         _ = try self.expect(.semi);
-        if (std.mem.eql(u8, kind, "http"))
-            return self.fail(pos, "SHOW TABLES FROM: `{s}` is an http connection, which has no catalog", .{conn});
+        if (std.mem.eql(u8, kind, "http")) {
+            if (schema != null) return self.fail(pos, "SHOW TABLES FROM: `{s}` is an http connection, which has no schemas", .{conn});
+            return out.append(.{ .output = try self.showResources(conn, like, pos) });
+        }
 
         var q = std.array_list.Managed(u8).init(self.arena);
         try q.appendSlice("SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_type IN ('BASE TABLE', 'VIEW')");
@@ -632,7 +640,8 @@ pub const Parser = struct {
         if (self.eatKw("function")) {
             return out.append(.{ .func = try self.parseFunction(pos, replace) });
         }
-        return self.fail(self.curPos(), "expected ENDPOINT, CONNECTION, or FUNCTION after CREATE", .{});
+        if (self.eatKw("resource")) return self.parseResource(pos);
+        return self.fail(self.curPos(), "expected ENDPOINT, CONNECTION, RESOURCE, or FUNCTION after CREATE", .{});
     }
 
     /// `ACCEPT BODY (schema) INTO BUFFER 'name' [AT 'dir'] [SEGMENT n MB|KB|GB]
@@ -762,6 +771,8 @@ pub const Parser = struct {
     fn templatePart(self: *Parser, buf: *std.array_list.Managed(u8), e: *const ast.Expr) Error!void {
         switch (e.*) {
             .str_lit => |s| try buf.appendSlice(s),
+            .int_lit => |v| try buf.writer().print("{d}", .{v}),
+            .bool_lit => |b| try buf.appendSlice(if (b) "true" else "false"),
             .call => |c| {
                 if (std.mem.eql(u8, c.name, "concat")) {
                     for (c.args) |arg| try self.templatePart(buf, arg);
@@ -873,10 +884,144 @@ pub const Parser = struct {
             }
             _ = try self.expect(.rparen);
         }
+        var hints = std.array_list.Managed(ast.Hint).init(self.arena);
+        try self.parseHttpClauses(&hints);
+        if (hints.items.len > 0 and !std.mem.eql(u8, connector, "http"))
+            return self.fail(hints.items[0].pos, "PAGINATE / RETRY / WITH on a connection are for `http` connections only", .{});
         _ = try self.expect(.semi);
         if (!has_user) try attrs.append(.{ .key = "user", .value = try self.envCall(name, "_USER"), .pos = pos });
         if (!has_pass) try attrs.append(.{ .key = "password", .value = try self.envCall(name, "_PASS"), .pos = pos });
-        return .{ .name = name, .connector = connector, .config = try attrs.toOwnedSlice(), .pos = pos };
+        return .{ .name = name, .connector = connector, .config = try attrs.toOwnedSlice(), .pos = pos, .hints = try hints.toOwnedSlice() };
+    }
+
+    /// `[PAGINATE ...] [RETRY ...] [WITH (...)]` in any order — the REST clauses a
+    /// connection or a resource carries for every read of it.
+    fn parseHttpClauses(self: *Parser, hints: *std.array_list.Managed(ast.Hint)) Error!void {
+        while (true) {
+            if (self.isKw("paginate")) {
+                try self.parsePaginate(hints);
+            } else if (self.isKw("retry")) {
+                try self.parseRetry(hints);
+            } else if (self.isKw("with") and self.peekTag() == .lparen) {
+                _ = self.advance();
+                try self.parseWithHints(hints);
+            } else break;
+        }
+    }
+
+    /// `GET(path [, name = value ...])` / `POST(path [, body = value] [, name = value ...])`
+    /// after `conn.`: the path and each value are expressions (so `$params` and
+    /// `||` work); every `name = value` other than `body` is a query parameter,
+    /// URL-encoded when the request is built.
+    fn parseHttpCall(self: *Parser, conn: []const u8, hints: *std.array_list.Managed(ast.Hint)) Error!ast.Read {
+        const pos = self.curPos();
+        const verb = self.advance().text;
+        const post = eqlNoCase(verb, "post");
+        _ = try self.expect(.lparen);
+        const path = try self.exprToTemplate(try self.parseExpr());
+        if (post) try hints.append(.{ .key = "method", .value = .{ .ident = "post" }, .pos = pos });
+        while (self.eat(.comma)) {
+            const apos = self.curPos();
+            const key = try self.expectIdent();
+            _ = try self.expect(.assign);
+            const val = try self.exprToTemplate(try self.parseExpr());
+            if (eqlNoCase(key, "body")) {
+                if (!post) return self.fail(apos, "GET takes no body — use {s}.POST(path, body = ...)", .{conn});
+                try hints.append(.{ .key = "body", .value = .{ .str = val }, .pos = apos });
+            } else {
+                try hints.append(.{ .key = try std.fmt.allocPrint(self.arena, "query:{s}", .{key}), .value = .{ .str = val }, .pos = apos });
+            }
+        }
+        _ = try self.expect(.rparen);
+        return .{ .connector = conn, .form = .{ .path = path } };
+    }
+
+    fn isHttpVerb(self: *Parser) bool {
+        return (self.isKw("get") or self.isKw("post")) and self.peekTag() == .lparen;
+    }
+
+    fn findResource(self: *Parser, conn: []const u8, name: []const u8) ?Resource {
+        for (self.resources.items) |r| {
+            if (std.ascii.eqlIgnoreCase(r.conn, conn) and std.ascii.eqlIgnoreCase(r.name, name)) return r;
+        }
+        return null;
+    }
+
+    /// `CREATE RESOURCE conn.name AS GET(...) | POST(...) [PAGINATE ...] [RETRY ...]
+    /// [WITH (...)];` — names one endpoint of an http connection, so `FROM
+    /// conn.name` reads it like a table. Expanded here; the plan never sees it.
+    fn parseResource(self: *Parser, pos: Pos) Error!void {
+        const conn = try self.expectIdent();
+        const kind = self.connType(conn) orelse
+            return self.fail(pos, "CREATE RESOURCE: `{s}` is not a connection declared above", .{conn});
+        if (!std.mem.eql(u8, kind, "http"))
+            return self.fail(pos, "CREATE RESOURCE: `{s}` is a {s} connection — resources name endpoints of an http one", .{ conn, kind });
+        _ = try self.expect(.dot);
+        const name = try self.expectIdent();
+        try self.expectKw("as");
+        if (!self.isHttpVerb())
+            return self.fail(self.curPos(), "CREATE RESOURCE {s}.{s}: expected GET(...) or POST(...) after AS", .{ conn, name });
+        var hints = std.array_list.Managed(ast.Hint).init(self.arena);
+        const rd = try self.parseHttpCall(conn, &hints);
+        try self.parseHttpClauses(&hints);
+        _ = try self.expect(.semi);
+        const r = Resource{ .conn = conn, .name = name, .path = rd.form.path, .post = self.hasHint(hints.items, "method"), .hints = try hints.toOwnedSlice() };
+        for (self.resources.items) |*old| {
+            if (std.ascii.eqlIgnoreCase(old.conn, conn) and std.ascii.eqlIgnoreCase(old.name, name)) {
+                old.* = r;
+                return;
+            }
+        }
+        try self.resources.append(r);
+    }
+
+    /// `SHOW TABLES FROM <http conn>`: its resources as rows (resource, method,
+    /// path), built from `RANGE(n)` — the parser already holds the whole list.
+    fn showResources(self: *Parser, conn: []const u8, like: ?[]const u8, pos: Pos) Error!ast.Pipeline {
+        var mine = std.array_list.Managed(Resource).init(self.arena);
+        for (self.resources.items) |r| {
+            if (std.ascii.eqlIgnoreCase(r.conn, conn)) try mine.append(r);
+        }
+        const range_col = try self.mk(.{ .field = .{ .parts = try self.arena.dupe([]const u8, &.{"range"}) } });
+        const cols = [_][]const u8{ "resource", "method", "path" };
+        const items = try self.arena.alloc(ast.SelectItem, cols.len);
+        for (cols, items, 0..) |name, *item, c| {
+            var e = try self.mk(.{ .str_lit = "" });
+            var k = mine.items.len;
+            while (k > 0) {
+                k -= 1;
+                const r = mine.items[k];
+                const v = try self.mk(.{ .str_lit = switch (c) {
+                    0 => r.name,
+                    1 => if (r.post) "POST" else "GET",
+                    else => r.path,
+                } });
+                const idx = try self.mk(.{ .int_lit = @intCast(k) });
+                const is_k = try self.mk(.{ .binary = .{ .op = .eq, .l = range_col, .r = idx } });
+                e = try self.mk(.{ .cond = .{ .cond = is_k, .then = v, .els = e } });
+            }
+            item.* = .{ .computed = .{ .name = name, .expr = e } };
+        }
+        var stages = std.array_list.Managed(ast.Stage).init(self.arena);
+        const lo = try self.mk(.{ .int_lit = 0 });
+        const hi = try self.mk(.{ .int_lit = @intCast(mine.items.len) });
+        try stages.append(.{ .node = .{ .read = .{ .connector = "range", .form = .{ .range = .{ .lo = lo, .hi = hi } } } }, .hints = &.{}, .pos = pos });
+        try stages.append(.{ .node = .{ .select = items }, .hints = &.{}, .pos = pos });
+        if (like) |pat| {
+            const args = try self.arena.alloc(*ast.Expr, 2);
+            args[0] = try self.mk(.{ .field = .{ .parts = try self.arena.dupe([]const u8, &.{"resource"}) } });
+            args[1] = try self.mk(.{ .str_lit = pat });
+            try stages.append(.{ .node = .{ .filter = try self.mk(.{ .call = .{ .name = "like", .args = args } }) }, .hints = &.{}, .pos = pos });
+        }
+        try stages.append(.{ .node = .{ .write = .{ .connector = "stdout", .form = null, .target = "", .mode = .default } }, .hints = &.{}, .pos = pos });
+        return .{ .stages = try stages.toOwnedSlice(), .pos = pos };
+    }
+
+    fn hasHint(_: *Parser, hints: []const ast.Hint, key: []const u8) bool {
+        for (hints) |h| {
+            if (std.mem.eql(u8, h.key, key)) return true;
+        }
+        return false;
     }
 
     fn envCall(self: *Parser, conn_name: []const u8, suffix: []const u8) Error!*ast.Expr {
@@ -1518,7 +1663,14 @@ pub const Parser = struct {
                 _ = try self.expect(.lparen);
                 var field: []const u8 = undefined;
                 var delim: ?[]const u8 = null;
-                if (self.isKw("split") and self.peekTag() == .lparen) {
+                var json = false;
+                if (self.isKw("json_each") and self.peekTag() == .lparen) {
+                    _ = self.advance();
+                    _ = try self.expect(.lparen);
+                    field = try self.expectIdent();
+                    _ = try self.expect(.rparen);
+                    json = true;
+                } else if (self.isKw("split") and self.peekTag() == .lparen) {
                     _ = self.advance();
                     _ = try self.expect(.lparen);
                     field = try self.expectIdent();
@@ -1532,7 +1684,7 @@ pub const Parser = struct {
                 var as_name: ?[]const u8 = null;
                 if (self.eatKw("as")) as_name = try self.expectIdent();
                 try stages.append(.{
-                    .node = .{ .explode = .{ .field = field, .as_name = as_name, .delim = delim } },
+                    .node = .{ .explode = .{ .field = field, .as_name = as_name, .delim = delim, .json = json } },
                     .hints = &.{},
                     .pos = jpos,
                 });
@@ -2357,7 +2509,22 @@ pub const Parser = struct {
         } else {
             const pos = self.curPos();
             const head = try self.expectIdent();
-            if (self.at(.dot)) {
+            const http = if (self.connType(head)) |k| std.mem.eql(u8, k, "http") else false;
+            if (self.at(.dot) and http) {
+                _ = self.advance();
+                if (self.isHttpVerb()) {
+                    node = .{ .read = try self.parseHttpCall(head, read_hints) };
+                } else if (self.at(.string)) {
+                    node = .{ .read = .{ .connector = head, .form = .{ .path = self.advance().text } } };
+                } else {
+                    const npos = self.curPos();
+                    const name = try self.expectIdent();
+                    const r = self.findResource(head, name) orelse
+                        return self.fail(npos, "`{s}.{s}`: no such resource — declare it with CREATE RESOURCE {s}.{s} AS GET('/...'), or read {s}.GET('/...')", .{ head, name, head, name, head });
+                    try read_hints.appendSlice(r.hints);
+                    node = .{ .read = .{ .connector = head, .form = .{ .path = r.path } } };
+                }
+            } else if (self.at(.dot)) {
                 _ = self.advance();
                 if (self.isKw("query") and self.peekTag() == .lparen) {
                     _ = self.advance();
@@ -4118,6 +4285,82 @@ test "sql: DESCRIBE lowers to a describe-mode EXPLAIN that asks a table for no r
 
     try testing.expectError(error.ParseFailed, parseSource(a, "SHOW TABLES FROM nope;", &diag));
     try testing.expect(std.mem.indexOf(u8, diag.msg, "not a connection") != null);
+}
+
+fn hintStr(hints: []const ast.Hint, key: []const u8) ?[]const u8 {
+    for (hints) |h| {
+        if (std.mem.eql(u8, h.key, key)) return switch (h.value) {
+            .str, .ident => |s| s,
+            else => null,
+        };
+    }
+    return null;
+}
+
+test "sql: http reads — GET/POST calls, connection clauses, resources" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parseSource(a,
+        \\CREATE CONNECTION rc TYPE http OPTIONS (base_url = 'https://x/v1')
+        \\  RETRY 3 ON (429) WITH (items = 'data');
+        \\PARAM code STRING DEFAULT 'br';
+        \\CREATE RESOURCE rc.countries AS GET('/countries', region = 'europe')
+        \\  PAGINATE BY page (param = 'p');
+        \\SELECT * FROM rc.GET('/alpha/' || $code, fields = 'name');
+        \\SELECT * FROM rc.POST('/search', body = $$ {"q": 1} $$);
+        \\SELECT * FROM rc.countries WITH (items = 'rows');
+        \\SHOW TABLES FROM rc LIKE 'c%';
+    , &diag);
+    const conn = prog.stmts[1].connection;
+    try testing.expectEqual(@as(i64, 3), conn.hints[0].value.int);
+    try testing.expectEqualStrings("data", hintStr(conn.hints, "items").?);
+
+    const get = prog.stmts[3].output.stages[0];
+    try testing.expectEqualStrings("rc", get.node.read.connector);
+    try testing.expectEqualStrings("/alpha/${code}", get.node.read.form.path);
+    try testing.expectEqualStrings("name", hintStr(get.hints, "query:fields").?);
+
+    const post = prog.stmts[4].output.stages[0];
+    try testing.expectEqualStrings("/search", post.node.read.form.path);
+    try testing.expectEqualStrings("post", hintStr(post.hints, "method").?);
+    try testing.expectEqualStrings(" {\"q\": 1} ", hintStr(post.hints, "body").?);
+
+    // A resource expands to its read; the read's own clauses come after, so win.
+    const res = prog.stmts[5].output.stages[0];
+    try testing.expectEqualStrings("/countries", res.node.read.form.path);
+    try testing.expectEqualStrings("europe", hintStr(res.hints, "query:region").?);
+    try testing.expectEqualStrings("page", hintStr(res.hints, "paginate").?);
+    try testing.expectEqualStrings("rows", res.hints[res.hints.len - 1].value.str);
+
+    const show = prog.stmts[6].output.stages;
+    try testing.expectEqualStrings("range", show[0].node.read.connector);
+    try testing.expect(show[1].node == .select);
+    try testing.expect(show[2].node == .filter);
+
+    const bad = [_]struct { src: []const u8, msg: []const u8 }{
+        .{ .src = "CREATE CONNECTION rc TYPE http OPTIONS (base_url = 'u'); SELECT * FROM rc.nope;", .msg = "no such resource" },
+        .{ .src = "CREATE CONNECTION rc TYPE http OPTIONS (base_url = 'u'); SELECT * FROM rc.GET('/x', body = 'b');", .msg = "GET takes no body" },
+        .{ .src = "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h') RETRY 2;", .msg = "http` connections only" },
+        .{ .src = "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h'); CREATE RESOURCE pg.t AS GET('/t');", .msg = "postgres connection" },
+        .{ .src = "CREATE RESOURCE nope.t AS GET('/t');", .msg = "not a connection" },
+    };
+    for (bad) |b| {
+        try testing.expectError(error.ParseFailed, parseSource(a, b.src, &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.msg, b.msg) != null);
+    }
+}
+
+test "sql: UNNEST(JSON_EACH(col)) is a json explode" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parseTest(a, "SELECT id, tag FROM 'x.csv' CROSS JOIN UNNEST(JSON_EACH(tags)) AS tag;");
+    const ex = prog.stmts[1].output.stages[1].node.explode;
+    try testing.expectEqualStrings("tags", ex.field);
+    try testing.expect(ex.json);
+    try testing.expect(ex.delim == null);
 }
 
 test "sql: FROM IDENTIFIER(expr) -> a computed path read" {

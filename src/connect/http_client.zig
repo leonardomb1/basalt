@@ -320,6 +320,23 @@ pub fn joinUrl(arena: std.mem.Allocator, base: []const u8, path: []const u8) ![]
     return std.fmt.allocPrint(arena, "{s}{s}{s}", .{ b, sep, path });
 }
 
+/// `path` with each param appended as `key=value`, both percent-encoded, after a
+/// `?` or — when the path already carries a query string — an `&`.
+pub fn withQuery(arena: std.mem.Allocator, path: []const u8, params: []const KV) ![]const u8 {
+    if (params.len == 0) return path;
+    var buf = std.array_list.Managed(u8).init(arena);
+    try buf.appendSlice(path);
+    var sep: u8 = if (std.mem.indexOfScalar(u8, path, '?') != null) '&' else '?';
+    for (params) |p| {
+        try buf.append(sep);
+        try formEncode(&buf, p.key);
+        try buf.append('=');
+        try formEncode(&buf, p.value);
+        sep = '&';
+    }
+    return buf.toOwnedSlice();
+}
+
 /// Encode the one character that breaks URI parsing but appears constantly in
 /// hand-written query strings (OData filters): the space. Everything else is
 /// the script author's responsibility.
@@ -1161,11 +1178,18 @@ fn envOpt(arena: std.mem.Allocator, name_opt: ?[]const u8) !?[]const u8 {
 
 /// The row array of a response: a bare array, the (dotted) `items` path into an
 /// object, or — with no path — a single object treated as one row.
+/// The rows of a response: the array at `items_path` (or the root), where a
+/// lone object — a detail endpoint's answer — is one row.
 fn itemsOf(arena: std.mem.Allocator, root: json.Value, items_path: ?[]const u8) ![]const json.Value {
     if (items_path) |p| {
         const v = jsonPath(root, p) orelse return error.ItemsFieldMissing;
         return switch (v) {
             .array => |a| a.items,
+            .object => blk: {
+                const one = try arena.alloc(json.Value, 1);
+                one[0] = v;
+                break :blk one;
+            },
             else => error.ItemsFieldNotArray,
         };
     }
@@ -1838,6 +1862,18 @@ test "joinUrl and encodeSpaces" {
     );
 }
 
+test "withQuery encodes keys and values and picks the separator" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("/c", try withQuery(a, "/c", &.{}));
+    try std.testing.expectEqualStrings(
+        "/c?region=S%C3%A3o%20Paulo&fields=name%2Ccca2",
+        try withQuery(a, "/c", &.{ .{ .key = "region", .value = "São Paulo" }, .{ .key = "fields", .value = "name,cca2" } }),
+    );
+    try std.testing.expectEqualStrings("/c?a=1&q=x%26y", try withQuery(a, "/c?a=1", &.{.{ .key = "q", .value = "x&y" }}));
+}
+
 test "http source: cursor pagination follows token then stops" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -1919,7 +1955,9 @@ test "itemsOf: bare array, dotted path, and named errors" {
     , .{});
     try std.testing.expectEqual(@as(usize, 1), (try itemsOf(a, wrapped, "result.rows")).len);
     try std.testing.expectError(error.ItemsFieldMissing, itemsOf(a, wrapped, "result.nope"));
-    try std.testing.expectError(error.ItemsFieldNotArray, itemsOf(a, wrapped, "result"));
+    try std.testing.expectEqual(@as(usize, 1), (try itemsOf(a, wrapped, "result")).len);
+    const scalar_at = try json.parseFromSliceLeaky(json.Value, a, "{\"n\":5}", .{});
+    try std.testing.expectError(error.ItemsFieldNotArray, itemsOf(a, scalar_at, "n"));
 
     const one = try json.parseFromSliceLeaky(json.Value, a, "{\"id\":9}", .{});
     try std.testing.expectEqual(@as(usize, 1), (try itemsOf(a, one, null)).len);

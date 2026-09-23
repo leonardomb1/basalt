@@ -1655,6 +1655,34 @@ test "explode splits a delimited column into rows" {
     try std.testing.expectEqualStrings("id,tag\n1,a\n1,b\n1,c\n2,x\n", out);
 }
 
+test "JSON_EACH explodes a JSON array; json_get walks keys and indexes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const in =
+        \\id,doc
+        \\1,"{""name"":{""common"":""Brazil""},""capital"":[""Brasília""],""tags"":[""a"",1,null,{""k"":true}]}"
+        \\2,"{""name"":{},""tags"":[]}"
+        \\3,"{""tags"":null}"
+        \\
+    ;
+    const got = try runToString(alloc, &tmp, in,
+        \\SELECT id, json_get(doc, 'name.common') AS name, json_get(doc, 'capital[0]') AS cap, json_get(doc, '$.capital.0') AS cap2
+        \\FROM '$IN'
+    );
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("id,name,cap,cap2\n1,Brazil,Brasília,Brasília\n2,,,\n3,,,\n", got);
+
+    var tmp2 = std.testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    const tags = try runToString(alloc, &tmp2, in,
+        \\SELECT id, tag FROM (SELECT id, json_get(doc, 'tags') AS tags FROM '$IN')
+        \\CROSS JOIN UNNEST(JSON_EACH(tags)) AS tag
+    );
+    defer alloc.free(tags);
+    try std.testing.expectEqualStrings("id,tag\n1,a\n1,1\n1,\n1,\"{\"\"k\"\":true}\"\n", tags);
+}
+
 test "parallel driver matches serial output across many batches" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

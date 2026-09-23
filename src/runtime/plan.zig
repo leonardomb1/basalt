@@ -731,7 +731,7 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
             const ep = analyze.explodePlan(arena, schema, ex, &ad) catch |e| return aErr(env, &ad, e);
             const out = try schemaPtr(arena, ep.schema);
             const o = try arena.create(op.Explode);
-            o.* = .{ .child = child, .field_idx = ep.idx, .delim = ex.delim orelse ",", .out_schema = out };
+            o.* = .{ .child = child, .field_idx = ep.idx, .delim = ex.delim orelse ",", .json = ex.json, .out_schema = out };
             return .{ .op = .{ .explode = o }, .schema = out.* };
         },
         .read, .ref, .write, .union_ => return planErr(env.diag, "unexpected operator in the middle of a pipeline"),

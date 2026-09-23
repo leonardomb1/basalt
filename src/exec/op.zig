@@ -39,6 +39,8 @@ pub fn errLabel(e: anyerror) []const u8 {
         error.DivByZero => "division by zero",
         error.TypeMismatch => "type mismatch",
         error.IntOverflow => "integer overflow — the value does not fit a 64-bit integer",
+        error.JsonNotArray => "JSON_EACH needs a JSON array (got an object or a scalar)",
+        error.InvalidJson => "invalid JSON — json_get and JSON_EACH need a JSON document",
         error.PatternTooComplex => "regular expression gave up: too much backtracking — anchor it, or replace a nested quantifier like `(a+)+` with a flat one",
         error.JoinBuildTooLarge => "join build side exceeds its cap — raise it with WITH (max_build = '8GB') on the join, filter the CTE, or flip the join",
         else => @errorName(e),
@@ -187,13 +189,15 @@ pub fn linearize(arena: std.mem.Allocator, top: Op) !?Linear {
     }
 }
 
-/// Streaming 1→N: split a delimited string column, emitting one row per element
-/// (other columns repeated). Null/missing cells produce zero rows.
+/// Streaming 1→N: split a delimited string column — or, with `json`, a JSON array
+/// — emitting one row per element (other columns repeated). Null/missing cells
+/// produce zero rows.
 pub const Explode = struct {
     stats: Stats = .{},
     child: Op,
     field_idx: usize,
     delim: []const u8,
+    json: bool = false,
     out_schema: *const types.Schema,
 
     pub fn next(self: *Explode, arena: std.mem.Allocator) anyerror!?Batch {
@@ -223,6 +227,15 @@ pub const Explode = struct {
                 .bytes => |x| x,
                 else => continue,
             };
+            if (self.json) {
+                for (try jsonElems(arena, s)) |elem| {
+                    for (b.columns, 0..) |*c, ci| {
+                        try builders[ci].append(if (ci == self.field_idx) elem else c.getValue(r));
+                    }
+                    n += 1;
+                }
+                continue;
+            }
             var it = std.mem.splitSequence(u8, s, self.delim);
             while (it.next()) |elem| {
                 for (b.columns, 0..) |*c, ci| {
@@ -241,6 +254,19 @@ pub const Explode = struct {
         return Batch{ .schema = self.out_schema, .columns = cols, .len = n };
     }
 };
+
+/// The elements of the JSON array `text` as cells; a JSON null is no elements.
+fn jsonElems(arena: std.mem.Allocator, text: []const u8) ![]const Value {
+    const doc = try eval.parseJson(arena, text);
+    const items = switch (doc) {
+        .array => |a| a.items,
+        .null => return &.{},
+        else => return error.JsonNotArray,
+    };
+    const out = try arena.alloc(Value, items.len);
+    for (items, out) |it, *o| o.* = try eval.jsonToValue(arena, it);
+    return out;
+}
 
 /// Rank rows within each partition and append the result as a column.
 ///

@@ -196,7 +196,9 @@ pub const SelectItem = union(enum) {
     pub const Rename = struct { from: []const u8, to: []const u8 };
 };
 
-pub const Explode = struct { field: []const u8, as_name: ?[]const u8, delim: ?[]const u8 = null };
+/// `UNNEST(col)` / `UNNEST(SPLIT(col, d))` split a delimited string;
+/// `UNNEST(JSON_EACH(col))` (`json`) yields the elements of a JSON array.
+pub const Explode = struct { field: []const u8, as_name: ?[]const u8, delim: ?[]const u8 = null, json: bool = false };
 
 pub const Limit = struct { count: u64, offset: u64 = 0 };
 
@@ -336,6 +338,9 @@ pub const Connection = struct {
     connector: []const u8,
     config: []const Attr,
     pos: Pos,
+    /// http only: `PAGINATE` / `RETRY` / `WITH (...)` written on the connection,
+    /// the defaults every read of it starts from (its own clauses win).
+    hints: []const Hint = &.{},
 };
 
 pub const Let = struct { name: []const u8, pipeline: Pipeline, pos: Pos };

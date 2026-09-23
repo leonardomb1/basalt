@@ -504,12 +504,11 @@ pub fn buildScriptScope(arena: std.mem.Allocator, params: *std.StringHashMap(Val
 }
 
 /// Interpolate a statement's `${...}` holes against script scope alone — what a
-/// `LOAD INTO`/`SELECT` outside any `FOR EACH` needs, since `IDENTIFIER(...)` is
-/// lowered to a template string by the parser and a plain script had nothing to
-/// render it. Cheap to skip when the script declares no PARAM or LET, and it
+/// `LOAD INTO`/`SELECT` outside any `FOR EACH` needs, since `IDENTIFIER(...)` and
+/// `conn.GET(...)` are lowered to template strings by the parser. Runs even with
+/// no PARAM or LET: a hole may be a constant expression (`since = today()`). It
 /// leaves expressions alone (see `LoopRow.outer`).
 pub fn renderScriptScope(env: *Env, p: ast.Pipeline) !ast.Pipeline {
-    if (env.script_scope.names.len == 0) return p;
     return renderPipeline(env.arena, p, .{
         .names = &[_][]const u8{},
         .cells = &[_][]const u8{},

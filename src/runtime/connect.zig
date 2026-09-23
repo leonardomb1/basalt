@@ -452,7 +452,7 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
         }
     }
     if (std.mem.eql(u8, conn.connector, "http")) {
-        if (rd.form != .path) return planErr(env.diag, "reading an http connection needs a quoted path");
+        if (rd.form != .path) return planErr(env.diag, "reading an http connection needs a path: conn.GET('/path') or a CREATE RESOURCE");
         var auth: []const u8 = "";
         for (conn.config) |attr| {
             if (std.mem.eql(u8, attr.key, "auth")) auth = try evalCfgStr(env, attr.value);
@@ -465,10 +465,12 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
         var errmsg: []const u8 = "";
         const cc = http_client.connFromKvs(env.arena, kvs.items, &errmsg) catch
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "http connection `{s}`: {s}", .{ rd.connector, errmsg }));
-        var hopts = http_client.optsFromHints(hints);
+        const all = try std.mem.concat(env.arena, ast.Hint, &.{ conn.hints, hints });
+        var hopts = http_client.optsFromHints(all);
         hopts.logger = env.log;
-        const s = http_client.HttpSource.openConn(env.arena, env.gpa, cc, rd.form.path, hopts) catch |e|
-            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "http read failed for `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
+        const path = try http_client.withQuery(env.arena, rd.form.path, try queryParams(env.arena, all));
+        const s = http_client.HttpSource.openConn(env.arena, env.gpa, cc, path, hopts) catch |e|
+            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "http read failed for `{s}` ({s})", .{ path, @errorName(e) }));
         return s.source();
     }
     if (sqlConnInfo(conn)) |info| {
@@ -744,6 +746,28 @@ fn httpAttrUsed(conn: ast.Connection, auth: []const u8, key: []const u8) bool {
         if (std.mem.eql(u8, attr.key, alias)) return false;
     }
     return true;
+}
+
+/// The `query:<name>` hints `conn.GET(path, name = value)` leaves, in order;
+/// a name given twice (a resource's, then the read's own) keeps the later value.
+fn queryParams(arena: std.mem.Allocator, hints: []const ast.Hint) ![]const http_client.KV {
+    var out = std.array_list.Managed(http_client.KV).init(arena);
+    for (hints) |h| {
+        if (!std.mem.startsWith(u8, h.key, "query:")) continue;
+        const key = h.key["query:".len..];
+        const val = switch (h.value) {
+            .str, .ident => |s| s,
+            .int => |i| try std.fmt.allocPrint(arena, "{d}", .{i}),
+            .flag => "",
+        };
+        for (out.items) |*kv| {
+            if (std.mem.eql(u8, kv.key, key)) {
+                kv.value = val;
+                break;
+            }
+        } else try out.append(.{ .key = key, .value = val });
+    }
+    return out.toOwnedSlice();
 }
 
 fn cfgStr(arena: std.mem.Allocator, expr: *const ast.Expr) ?[]const u8 {
