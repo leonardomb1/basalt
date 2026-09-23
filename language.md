@@ -176,7 +176,8 @@ the stronger of the two, not the weaker.
 **Credentials by convention:** connection `erp` resolves `ERP_USER` /
 `ERP_PASS` from the environment at connect time — the common case costs zero
 characters. Explicit `user = ...` / `password = ...` options override the
-convention. Azure Blob paths (`az://...`, §5) resolve `AZURE_STORAGE_KEY`, and
+convention. An `http` connection reads them only for `auth = 'basic'` (and
+`oauth2` without `client_id`/`client_secret`), so a public API needs none. Azure Blob paths (`az://...`, §5) resolve `AZURE_STORAGE_KEY`, and
 `AZURE_BLOB_ENDPOINT` points them at an emulator. S3 paths (`s3://...`, §5)
 resolve `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ optional
 `AWS_SESSION_TOKEN`, `AWS_REGION`), and `AWS_ENDPOINT_URL` points them at an

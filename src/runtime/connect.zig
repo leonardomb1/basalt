@@ -453,10 +453,17 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
     }
     if (std.mem.eql(u8, conn.connector, "http")) {
         if (rd.form != .path) return planErr(env.diag, "reading an http connection needs a quoted path");
-        const kvs = try env.arena.alloc(http_client.KV, conn.config.len);
-        for (conn.config, kvs) |attr, *kv| kv.* = .{ .key = attr.key, .value = try evalCfgStr(env, attr.value) };
+        var auth: []const u8 = "";
+        for (conn.config) |attr| {
+            if (std.mem.eql(u8, attr.key, "auth")) auth = try evalCfgStr(env, attr.value);
+        }
+        var kvs = std.array_list.Managed(http_client.KV).init(env.arena);
+        for (conn.config) |attr| {
+            if (!httpAttrUsed(conn, auth, attr.key)) continue;
+            try kvs.append(.{ .key = attr.key, .value = try evalCfgStr(env, attr.value) });
+        }
         var errmsg: []const u8 = "";
-        const cc = http_client.connFromKvs(env.arena, kvs, &errmsg) catch
+        const cc = http_client.connFromKvs(env.arena, kvs.items, &errmsg) catch
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "http connection `{s}`: {s}", .{ rd.connector, errmsg }));
         var hopts = http_client.optsFromHints(hints);
         hopts.logger = env.log;
@@ -721,6 +728,24 @@ pub fn sqlConnInfo(conn: ast.Connection) ?SqlConnInfo {
     return c.sqlRead();
 }
 
+/// Every connection carries `user`/`password` — explicit, or the parser's
+/// env(NAME_USER/NAME_PASS) default — but an http connection reads them only
+/// for basic auth, and for oauth2 where no client_id/client_secret is given.
+fn httpAttrUsed(conn: ast.Connection, auth: []const u8, key: []const u8) bool {
+    const alias: []const u8 = if (std.mem.eql(u8, key, "user"))
+        "client_id"
+    else if (std.mem.eql(u8, key, "password"))
+        "client_secret"
+    else
+        return true;
+    if (std.mem.eql(u8, auth, "basic")) return true;
+    if (!std.mem.eql(u8, auth, "oauth2")) return false;
+    for (conn.config) |attr| {
+        if (std.mem.eql(u8, attr.key, alias)) return false;
+    }
+    return true;
+}
+
 fn cfgStr(arena: std.mem.Allocator, expr: *const ast.Expr) ?[]const u8 {
     return switch (expr.*) {
         .str_lit => |s| s,
@@ -961,6 +986,32 @@ const LitCfg = struct {
         return .sql;
     }
 };
+
+test "an http connection reads user/password only where its auth uses them" {
+    var v = ast.Expr{ .str_lit = "x" };
+    const pos = ast.Pos{ .line = 0, .col = 0 };
+    const plain = ast.Connection{ .name = "rc", .connector = "http", .pos = pos, .config = &.{
+        .{ .key = "base_url", .value = &v, .pos = pos },
+        .{ .key = "user", .value = &v, .pos = pos },
+        .{ .key = "password", .value = &v, .pos = pos },
+    } };
+    try std.testing.expect(httpAttrUsed(plain, "", "base_url"));
+    for ([_][]const u8{ "", "bearer", "header", "login_json" }) |auth| {
+        try std.testing.expect(!httpAttrUsed(plain, auth, "user"));
+        try std.testing.expect(!httpAttrUsed(plain, auth, "password"));
+    }
+    try std.testing.expect(httpAttrUsed(plain, "basic", "user"));
+    try std.testing.expect(httpAttrUsed(plain, "basic", "password"));
+    try std.testing.expect(httpAttrUsed(plain, "oauth2", "user"));
+
+    const oauth = ast.Connection{ .name = "rc", .connector = "http", .pos = pos, .config = &.{
+        .{ .key = "client_id", .value = &v, .pos = pos },
+        .{ .key = "user", .value = &v, .pos = pos },
+        .{ .key = "password", .value = &v, .pos = pos },
+    } };
+    try std.testing.expect(!httpAttrUsed(oauth, "oauth2", "user"));
+    try std.testing.expect(httpAttrUsed(oauth, "oauth2", "password"));
+}
 
 test "a starrocks connection reads over MySQL: FE host and port, default 9030" {
     var host = ast.Expr{ .str_lit = "fe.internal" };
