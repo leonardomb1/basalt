@@ -2002,9 +2002,7 @@ pub const Parser = struct {
 
         _ = self.eatKw("as");
         var name: []const u8 = undefined;
-        if (self.at(.ident) and !self.isKw("on") and !self.isKw("join") and !self.isKw("where") and
-            !self.isKw("group") and !self.isKw("order") and !self.isKw("limit") and !self.isKw("having"))
-        {
+        if (self.at(.ident) and !isReservedAfterSource(self.cur().text)) {
             name = self.advance().text;
         } else {
             self.derived_n += 1;
