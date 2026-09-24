@@ -50,6 +50,7 @@ pub const Conn = struct {
         try self.prelogin(tls_mode != .off);
         if (tls_mode != .off) try self.startTls(host, tls_mode);
         try self.login(user, password, database, host);
+        try self.afterLogin();
         return self;
     }
 
@@ -77,6 +78,7 @@ pub const Conn = struct {
             if (self.last_error.len > 0) std.debug.print("[tds] login rejected: {s}\n", .{self.last_error});
             return e;
         };
+        try self.afterLogin();
         return self;
     }
 
@@ -97,6 +99,7 @@ pub const Conn = struct {
         try self.prelogin(true);
         try self.startTls(host, tls_mode);
         try self.loginNtlm(cred, database, host);
+        try self.afterLogin();
         return self;
     }
 
@@ -167,6 +170,14 @@ pub const Conn = struct {
     }
 
     /// Run a statement with no result set (DDL/INSERT/MERGE); errors on ERROR token.
+    /// What every session needs before its first query. TEXTSIZE: without it SQL
+    /// Server hands a raw TDS client varchar(max)/nvarchar(max)/varbinary(max)
+    /// values cut at 4096 bytes — the server-side default; ODBC and OLEDB set this
+    /// at connect too, which is why nothing else ever shows the cut.
+    fn afterLogin(self: *Conn) !void {
+        try self.exec("SET TEXTSIZE 2147483647");
+    }
+
     pub fn exec(self: *Conn, statement: []const u8) !void {
         try self.sendBatch(statement);
         try self.readMessage();
