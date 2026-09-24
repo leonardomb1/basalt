@@ -1076,17 +1076,36 @@ pub const Parser = struct {
         return .{ .name = name, .params = try params.toOwnedSlice(), .body = .{ .expr = body }, .replace = replace, .pos = pos };
     }
 
-    /// Does the body after `AS` open a statement block? Exactly the keywords that
-    /// begin a statement and can never begin a scalar expression.
-    ///
-    /// `CASE` is deliberately absent: `AS CASE WHEN ... END` stays the *expression*
-    /// form (a scalar CASE), which is overwhelmingly what a function body means by
-    /// it, and the statement CASE has its own `END CASE`. So a statement body that
-    /// wants to branch has to lead with another statement keyword (or be reached
-    /// through a `FOR` / `CALL`); a leading statement `CASE` is not spellable here.
+    /// Does the body after `AS` open a statement block? The keywords that begin a
+    /// statement and can never begin a scalar expression — and `CASE` when it is
+    /// the statement form, which only its closing `END CASE` tells apart from the
+    /// scalar `CASE ... END` a function body usually means by it.
     fn atStmtBody(self: *Parser) bool {
         return self.isKw("load") or self.isKw("for") or self.isKw("call") or
-            self.isKw("print") or self.isKw("select") or self.isKw("with");
+            self.isKw("print") or self.isKw("throw") or self.isKw("select") or self.isKw("with") or
+            (self.isKw("case") and self.atStmtCase());
+    }
+
+    /// At a `CASE`: is it closed by `END CASE`? Walks the tokens ahead, pairing every
+    /// block opener (`case`, `for`) with its `end` — an `END CASE` / `END FOR` closes
+    /// one block, its second word not opening another — until this one's `end`.
+    fn atStmtCase(self: *Parser) bool {
+        var depth: usize = 0;
+        var j = self.i;
+        while (j < self.toks.len) : (j += 1) {
+            const t = self.toks[j];
+            if (t.tag != .ident) continue;
+            if (eqlNoCase(t.text, "case") or eqlNoCase(t.text, "for")) {
+                depth += 1;
+            } else if (eqlNoCase(t.text, "end")) {
+                depth -= 1;
+                const next = if (j + 1 < self.toks.len) self.toks[j + 1] else return false;
+                const closes_named = next.tag == .ident and (eqlNoCase(next.text, "case") or eqlNoCase(next.text, "for"));
+                if (depth == 0) return closes_named and eqlNoCase(next.text, "case");
+                if (closes_named) j += 1;
+            }
+        }
+        return false;
     }
 
     /// `name [TYPE] [DEFAULT <expr>]`. A bare name is untyped, exactly as before.
@@ -1564,8 +1583,10 @@ pub const Parser = struct {
                 if (self.eatKw("except") or self.eatKw("exclude")) {
                     _ = try self.expect(.lparen);
                     var names = std.array_list.Managed([]const u8).init(self.arena);
-                    try names.append(try self.expectIdent());
-                    while (self.eat(.comma)) try names.append(try self.expectIdent());
+                    // A name may be `IDENTIFIER(<expr>)`: a template rendered at run
+                    // time, and a rendered `a, b` is two names.
+                    try names.append(try self.parseNameSegment());
+                    while (self.eat(.comma)) try names.append(try self.parseNameSegment());
                     _ = try self.expect(.rparen);
                     try raw_items.append(.{ .item = .{ .star_except = try names.toOwnedSlice() } });
                 } else if (self.eatKw("rename")) {
@@ -4361,6 +4382,37 @@ test "sql: UNNEST(JSON_EACH(col)) is a json explode" {
     try testing.expectEqualStrings("tags", ex.field);
     try testing.expect(ex.json);
     try testing.expect(ex.delim == null);
+}
+
+test "sql: a statement function may open with the statement CASE; the scalar CASE stays an expression" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parseSource(a,
+        \\CREATE FUNCTION pick(x) AS CASE $x WHEN 'a' THEN 1 ELSE CASE WHEN $x = 'b' THEN 2 ELSE 0 END END;
+        \\CREATE FUNCTION branch(x) AS
+        \\  CASE $x
+        \\    WHEN 'a' THEN PRINT 'a'; FOR EACH ROW OF (SELECT 1 AS n) AS (n) PRINT $n; END FOR;
+        \\    ELSE PRINT CASE WHEN $x = '' THEN 'blank' ELSE $x END;
+        \\  END CASE;
+        \\END;
+        \\SELECT pick('b') AS p;
+    , &diag);
+    try testing.expect(prog.stmts[1].func.body == .expr);
+    try testing.expect(prog.stmts[2].func.body == .stmts);
+    try testing.expect(prog.stmts[2].func.body.stmts[0] == .match);
+}
+
+test "sql: EXCEPT accepts IDENTIFIER(expr), lowered to a template name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parseSource(a, "LOAD INTO '/tmp/o.csv' AS SELECT * EXCEPT (id, IDENTIFIER($ex)) FROM 'in.csv';", &diag);
+    const items = prog.stmts[1].output.stages[1].node.select;
+    try testing.expectEqualStrings("id", items[0].star_except[0]);
+    try testing.expectEqualStrings("${ex}", items[0].star_except[1]);
 }
 
 test "sql: FROM IDENTIFIER(expr) -> a computed path read" {

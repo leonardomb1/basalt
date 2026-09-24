@@ -452,6 +452,7 @@ apart.
 | `HAVING <expr>` | filter after the aggregate; aggregate calls in it refer to the columns it produced, including ones the `SELECT` list never asked for |
 | `ORDER BY a DESC, b` | sort |
 | `LIMIT n [OFFSET m]` | limit |
+| `SELECT * EXCEPT (a, b)` / `EXCLUDE` | every column but those; a name not present is ignored, so one list serves tables that differ. A name may be `IDENTIFIER(<expr>)` — a `$param` or loop variable rendered at run time, `'a, b'` excluding both and `''` nothing |
 | `SELECT DISTINCT` / `DISTINCT ON (a, b)` | distinct — `ON` keys are input columns: they need not be in the SELECT list, and may be ones it renames (`DISTINCT ON (grp) grp AS k`) |
 | `CROSS JOIN UNNEST(SPLIT(tags, ',')) AS tag` | explode (also `UNNEST(col)`) |
 | `CROSS JOIN UNNEST(JSON_EACH(tags)) AS tag` | explode a JSON array: one row per element — strings unquoted, objects and arrays as JSON text, a JSON `null` as null. A null or `null` cell gives no rows; an object or scalar is an error |
@@ -947,7 +948,8 @@ At a use site the innermost binding wins: loop var > LET/PARAM.
   body forms. `AS <expr>;` is a scalar function, inlined at plan time;
   recursion and arity mismatches are compile errors, declared types are
   checked against literal arguments at the call site, defaults fill omitted
-  trailing arguments. A body starting with `LOAD`/`FOR`/`CALL`/`SELECT`/`WITH`
+  trailing arguments. A body starting with `LOAD`/`FOR`/`CALL`/`SELECT`/`WITH`/
+  `PRINT`/`THROW`, or with the statement `CASE` (the one closed by `END CASE`),
   is a **statement function** terminated by `END;` and invoked with
   `CALL nome(args);` — its params bind like loop variables (`$name`,
   `IDENTIFIER($name)`, `PUSHDOWN($f)`, `${name}` in strings), rendered per

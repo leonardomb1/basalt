@@ -3227,3 +3227,20 @@ test "DESCRIBE rows: name, engine type (decimal with its precision), nullable" {
     const rows = try describeRows(ar.allocator(), .{ .fields = &fields });
     try std.testing.expectEqualStrings("id,int,no\namt,decimal(10,2),yes\n\"a,b\",string,yes\n", rows);
 }
+
+test "EXCEPT (IDENTIFIER($cols)): a comma list excludes each name, an empty one excludes nothing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try checkAndRun(alloc, &tmp,
+        \\CREATE FUNCTION slim(ex) AS
+        \\  LOAD INTO IDENTIFIER('$B/out_' || length($ex) || '.csv') AS SELECT * EXCEPT (IDENTIFIER($ex)) FROM '$B/a.csv' WHERE id = 1;
+        \\END;
+        \\CALL slim('grp, amt');
+        \\CALL slim('');
+        \\CALL slim('nope');
+    , 1, &.{});
+    try expectFile(&tmp, "out_8.csv", "id\n1\n");
+    try expectFile(&tmp, "out_0.csv", "id,grp,amt\n1,a,10\n");
+    try expectFile(&tmp, "out_4.csv", "id,grp,amt\n1,a,10\n");
+}

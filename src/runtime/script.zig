@@ -371,6 +371,20 @@ fn renderSelect(arena: std.mem.Allocator, items: []const ast.SelectItem, lr: Loo
             .name = try interpAll(arena, c.name, lr),
             .expr = try renderExpr(arena, c.expr, lr),
         } },
+        // `EXCEPT (IDENTIFIER($cols))`: the rendered text is a comma list, so one
+        // argument can name several columns — or none, when it renders empty.
+        .star_except => |names| blk: {
+            var rendered = std.array_list.Managed([]const u8).init(arena);
+            for (names) |n| {
+                const text = if (std.mem.indexOf(u8, n, "${") != null) try interpAll(arena, n, lr) else n;
+                var parts = std.mem.splitScalar(u8, text, ',');
+                while (parts.next()) |p| {
+                    const nm = std.mem.trim(u8, p, " \t\r\n");
+                    if (nm.len > 0) try rendered.append(nm);
+                }
+            }
+            break :blk .{ .star_except = try rendered.toOwnedSlice() };
+        },
         else => it,
     };
     return out;

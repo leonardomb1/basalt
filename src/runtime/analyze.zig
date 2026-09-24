@@ -535,6 +535,9 @@ fn hasDynamicName(node: ast.Stage.Node) bool {
             if (switch (it) {
                 .field => |q| isDynamicName(q),
                 .computed => |c| exprHasDynamicName(c.expr),
+                .star_except => |names| for (names) |n| {
+                    if (std.mem.indexOf(u8, n, "${") != null) break true;
+                } else false,
                 else => false,
             }) break true;
         } else false,
@@ -599,7 +602,7 @@ fn countOutputs(stmts: []const ast.Stmt) usize {
     return n;
 }
 
-fn stmtPos(s: ast.Stmt) ?ast.Pos {
+pub fn stmtPos(s: ast.Stmt) ?ast.Pos {
     return switch (s) {
         .kind => |k| k.pos,
         .param => |p| p.pos,
