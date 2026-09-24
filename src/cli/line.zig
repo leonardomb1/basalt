@@ -780,7 +780,8 @@ pub const Editor = struct {
     pub const Options = struct {
         /// Is this text a whole entry, so that Enter should run it rather than
         /// open another line?
-        complete: *const fn ([]const u8) bool,
+        complete: *const fn (ctx: *anyopaque, text: []const u8) bool,
+        complete_ctx: *anyopaque = undefined,
         /// Tab: what the word at `cursor` could become. `items` are owned by
         /// `arena`; the editor replaces `text[start..cursor]` with one of them.
         suggest: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, text: []const u8, cursor: usize) anyerror!Suggestions = null,
@@ -917,7 +918,15 @@ pub const Editor = struct {
             if (r.head) line_no += 1;
             if (ri < self.top) continue;
             if (ri > self.top) w.writeAll("\r\n") catch return;
-            if (!r.head) {
+            // The window's edges say when the entry goes on beyond them.
+            const hidden_above = ri == self.top and self.top > 0;
+            const hidden_below = ri == last - 1 and last < rows.len;
+            if (hidden_above or hidden_below) {
+                if (self.color) w.writeAll("\x1b[2m") catch return;
+                w.writeByteNTimes(' ', gutter - 2) catch return;
+                w.writeAll(if (hidden_above) "\xe2\x86\x91 " else "\xe2\x86\x93 ") catch return;
+                if (self.color) w.writeAll("\x1b[22m") catch return;
+            } else if (!r.head) {
                 w.writeByteNTimes(' ', gutter) catch return;
             } else if (r.start == 0) {
                 w.writeByteNTimes(' ', gutter - 2) catch return;
@@ -1129,7 +1138,7 @@ pub const Editor = struct {
         self.redraw(&buf);
         while (true) {
             const key = try readKey(self.in_fd);
-            if (!(key == .nav and (key.nav.to == .up or key.nav.to == .down))) goal_col = null;
+            if (!(key == .page_up or key == .page_down or (key == .nav and (key.nav.to == .up or key.nav.to == .down)))) goal_col = null;
             if (key != .tab) if (menu) |*m| {
                 m.arena.deinit();
                 menu = null;
@@ -1142,7 +1151,7 @@ pub const Editor = struct {
                     // Ctrl+Enter run whatever is there, from anywhere.
                     const at_end = buf.cursor == text.len;
                     const meta = std.mem.startsWith(u8, std.mem.trimLeft(u8, text, " \t"), "\\") and std.mem.indexOfScalar(u8, text, '\n') == null;
-                    const run = key != .enter or meta or (at_end and opts.complete(text));
+                    const run = key != .enter or meta or (at_end and opts.complete(opts.complete_ctx, text));
                     if (run) {
                         buf.anchor = null;
                         buf.cursor = text.len;
@@ -1224,7 +1233,16 @@ pub const Editor = struct {
                     else => buf.move(nav),
                 },
                 .search => try self.searchHistory(&buf),
-                .page_up, .page_down, .none => {},
+                // A screenful up or down, the column kept, the way an editor pages.
+                .page_up, .page_down => {
+                    const size = termSize(self.out);
+                    const rows = try layoutRows(self.gpa, buf.bytes(), textWidth(size, gutterWidth(buf.bytes())));
+                    defer self.gpa.free(rows);
+                    const page = if (size.rows > 2) size.rows - 2 else 1;
+                    var n: usize = 0;
+                    while (n < page and buf.moveVertical(rows, key == .page_down, false, &goal_col)) n += 1;
+                },
+                .none => {},
             }
             self.redrawWith(&buf, if (menu) |*m| m else null);
         }

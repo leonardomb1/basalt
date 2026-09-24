@@ -493,12 +493,30 @@ fn dollarTagLen(s: []const u8, i: usize) ?usize {
     return j + 1 - i;
 }
 
-/// What the editor asks on Enter: run this, or open another line? A meta command,
-/// a quit word and a blank entry are whole as they stand; SQL is whole at its `;`.
-fn entryComplete(s: []const u8) bool {
+/// What the editor asks on Enter, and the piped loop after each line: run this,
+/// or wait for more? A meta command, a quit word and a blank entry are whole as
+/// they stand. SQL is whole at a top-level `;` — unless the parser, given the
+/// session's declarations, runs out of input first: a `CREATE FUNCTION ... AS`
+/// whose body is still open ends in `;` several times before its `END;`.
+fn entryComplete(ctx: *anyopaque, s: []const u8) bool {
     const t = std.mem.trim(u8, s, " \t\r\n");
     if (t.len == 0 or t[0] == '\\' or isQuit(t) or isHelp(t) or isClear(t)) return true;
-    return endsComplete(s);
+    if (!endsComplete(s)) return false;
+    const sess: *Session = @ptrCast(@alignCast(ctx));
+    var arena = std.heap.ArenaAllocator.init(sess.decls.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var text = std.array_list.Managed(u8).init(a);
+    for (sess.decls.items.items) |e| {
+        text.appendSlice(e.text) catch return true;
+        text.appendSlice(";\n") catch return true;
+    }
+    text.appendSlice(s) catch return true;
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    _ = parser.parseSource(a, text.items, &diag) catch {
+        return std.mem.indexOf(u8, diag.msg, "found end of input") == null;
+    };
+    return true;
 }
 
 /// True when the entry is ready to run: its last non-blank character is a
@@ -1230,7 +1248,7 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
             var line: []const u8 = undefined;
             if (editor) |*ed| {
                 // The editor hands back a whole entry, however many lines it took.
-                switch (ed.readEntry(.{ .complete = entryComplete, .suggest = suggest, .suggest_ctx = &sess }) catch |e| blk: {
+                switch (ed.readEntry(.{ .complete = entryComplete, .complete_ctx = &sess, .suggest = suggest, .suggest_ctx = &sess }) catch |e| blk: {
                     try msg.print("input error: {s}\n", .{@errorName(e)});
                     try msg.flush();
                     break :blk LineResult.eof;
@@ -1280,7 +1298,7 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
             }
             try block.appendSlice(line);
             try block.append('\n');
-            if (endsComplete(block.items)) break;
+            if (entryComplete(&sess, block.items)) break;
         }
 
         const trimmed = std.mem.trim(u8, block.items, " \t\r\n");
@@ -1299,6 +1317,87 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
         try msg.flush();
     }
     return 0;
+}
+
+/// One statement of an entry: the declaration it is, or null for something to
+/// run, and its text (a declaration's, without the closing `;`).
+const EntryStmt = struct { id: ?DeclId, text: []const u8 };
+
+fn offsetOf(text: []const u8, pos: ast.Pos) ?usize {
+    if (pos.line == 0) return null;
+    var line: u32 = 1;
+    var i: usize = 0;
+    while (line < pos.line) : (line += 1) i = (std.mem.indexOfScalarPos(u8, text, i, '\n') orelse return null) + 1;
+    return @min(text.len, i + pos.col - 1);
+}
+
+/// The statements of the entry (the part of `text` from `entry_at`), in source
+/// order, each with its text cut at its own last top-level `;` — so a statement
+/// function is one statement however many `;`s its body holds.
+fn entryStatements(arena: std.mem.Allocator, text: []const u8, entry_at: usize, prog: ast.Program) ![]EntryStmt {
+    const Found = struct { off: usize, stmt: ast.Stmt };
+    var found = std.array_list.Managed(Found).init(arena);
+    for (prog.stmts[1..]) |st| {
+        const pos = analyze.stmtPos(st) orelse continue;
+        const off = offsetOf(text, pos) orelse continue;
+        if (off < entry_at) continue;
+        try found.append(.{ .off = off, .stmt = st });
+    }
+    std.mem.sort(Found, found.items, {}, struct {
+        fn lt(_: void, x: Found, y: Found) bool {
+            return x.off < y.off;
+        }
+    }.lt);
+    var out = std.array_list.Managed(EntryStmt).init(arena);
+    for (found.items, 0..) |f, i| {
+        // A hoisted CTE and the query that reads it share a start; keep the query.
+        if (i + 1 < found.items.len and found.items[i + 1].off == f.off) continue;
+        const end = if (i + 1 < found.items.len) found.items[i + 1].off else text.len;
+        var piece = text[f.off..end];
+        var last: ?usize = null;
+        var k: usize = 0;
+        while (nextTopSemi(piece, k)) |p| : (k = p + 1) last = p;
+        if (last) |p| piece = piece[0..p];
+        piece = std.mem.trim(u8, piece, " \t\r\n");
+        const id: ?DeclId = switch (f.stmt) {
+            .connection => |c| .{ .kind = .connection, .name = c.name },
+            .func => |fd| .{ .kind = .function, .name = fd.name },
+            .param => |p| .{ .kind = .param, .name = p.name },
+            .let_const => |l| .{ .kind = .let, .name = l.name },
+            else => null,
+        };
+        try out.append(.{ .id = id, .text = piece });
+    }
+    return out.toOwnedSlice();
+}
+
+test "entryStatements: a statement function is one declaration, its body's `;`s notwithstanding" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prelude = "CREATE CONNECTION sr TYPE starrocks OPTIONS (host = 'h', database = 'd');\n";
+    const entry =
+        \\CREATE FUNCTION f(x) AS x * 2;
+        \\CREATE OR REPLACE FUNCTION load(name) AS
+        \\  PRINT 'loading ' || $name;
+        \\  LOAD INTO sr.IDENTIFIER('t_' || $name) AS SELECT 1 AS v;
+        \\END;
+        \\-- a trailing note
+        \\SELECT f(1) AS y;
+    ;
+    const text = try std.mem.concat(a, u8, &.{ prelude, entry });
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a, text, &diag);
+    const got = try entryStatements(a, text, prelude.len, prog);
+    try std.testing.expectEqual(@as(usize, 3), got.len);
+    try std.testing.expectEqualStrings("f", got[0].id.?.name);
+    try std.testing.expectEqualStrings("CREATE FUNCTION f(x) AS x * 2", got[0].text);
+    try std.testing.expectEqual(DeclKind.function, got[1].id.?.kind);
+    try std.testing.expectEqualStrings("load", got[1].id.?.name);
+    try std.testing.expect(std.mem.startsWith(u8, got[1].text, "CREATE OR REPLACE FUNCTION load(name) AS"));
+    try std.testing.expect(std.mem.endsWith(u8, got[1].text, "END"));
+    try std.testing.expect(std.mem.indexOf(u8, got[1].text, "LOAD INTO") != null);
+    try std.testing.expect(got[2].id == null);
 }
 
 /// The line a parse error names, with a caret under the column — as an editor
@@ -1459,6 +1558,20 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *s
         error.OutOfMemory => return e,
     };
 
+    // The entry's statements as the parser saw them. The pre-scan above only knows
+    // first words and top-level `;`s, and a statement function's body has `;`s of
+    // its own — it would be cut into a truncated declaration and stray fragments.
+    // An `@include` puts other files' positions in the program, so it keeps the
+    // pre-scan's reading.
+    if (std.mem.indexOf(u8, block, "@include") == null) {
+        const parsed = try entryStatements(a, text, text.len - block.len, prog);
+        pending.clearRetainingCapacity();
+        executable = 0;
+        for (parsed) |p| {
+            if (p.id) |id| try pending.append(.{ .id = id, .text = p.text }) else executable += 1;
+        }
+    }
+
     for (pending.items) |p| try sess.decls.put(p.id, p.text);
 
     if (executable == 0) {
@@ -1593,6 +1706,8 @@ fn replHelp(msg: *std.Io.Writer) !void {
         \\  Shift+Tab               dedent the selected lines
         \\  Ctrl+R                  search the history; Ctrl+R again for older, Enter keeps it
         \\  Up / Down               travel the entry; past its edge, recall history whole
+        \\  PgUp / PgDn             a screenful up or down; an entry taller than the terminal
+        \\                          scrolls with the cursor, ↑ ↓ in the gutter mark hidden lines
         \\
         \\  Ctrl+Left / Right       by word (Alt+B / Alt+F too)
         \\  Home / End              line start (Home toggles the indent) / line end
