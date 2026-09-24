@@ -452,7 +452,7 @@ apart.
 | `HAVING <expr>` | filter after the aggregate; aggregate calls in it refer to the columns it produced, including ones the `SELECT` list never asked for |
 | `ORDER BY a DESC, b` | sort |
 | `LIMIT n [OFFSET m]` | limit |
-| `SELECT * EXCEPT (a, b)` / `EXCLUDE` | every column but those; a name not present is ignored, so one list serves tables that differ. A name may be `IDENTIFIER(<expr>)` — a `$param` or loop variable rendered at run time, `'a, b'` excluding both and `''` nothing |
+| `SELECT * EXCEPT (a, b)` / `EXCLUDE` | every column but those; a name not present is ignored, so one list serves tables that differ. Right after a union (`EACH TABLE OF`, `UNION ALL BY NAME`) the names are dropped *before* the branches are reconciled, so a column one table carries with an incompatible type can be excepted instead of failing the load. A name may be `IDENTIFIER(<expr>)` — a `$param` or loop variable rendered at run time, `'a, b'` excluding both and `''` nothing |
 | `SELECT DISTINCT` / `DISTINCT ON (a, b)` | distinct — `ON` keys are input columns: they need not be in the SELECT list, and may be ones it renames (`DISTINCT ON (grp) grp AS k`) |
 | `CROSS JOIN UNNEST(SPLIT(tags, ',')) AS tag` | explode (also `UNNEST(col)`) |
 | `CROSS JOIN UNNEST(JSON_EACH(tags)) AS tag` | explode a JSON array: one row per element — strings unquoted, objects and arrays as JSON text, a JSON `null` as null. A null or `null` cell gives no rows; an object or scalar is an error |

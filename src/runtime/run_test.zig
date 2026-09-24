@@ -3244,3 +3244,31 @@ test "EXCEPT (IDENTIFIER($cols)): a comma list excludes each name, an empty one 
     try expectFile(&tmp, "out_0.csv", "id,grp,amt\n1,a,10\n");
     try expectFile(&tmp, "out_4.csv", "id,grp,amt\n1,a,10\n");
 }
+
+test "union: SELECT * EXCEPT drops a column before the branches are reconciled, so its type never has to agree" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "ua.csv", .data = "id,x\n1,2024-01-01\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "ub.csv", .data = "id,x\n2,7\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const with_u =
+        \\WITH u AS (SELECT id, CAST(x AS DATE) AS x FROM '$B/ua.csv'
+        \\           UNION ALL BY NAME SELECT id, CAST(x AS INT) AS x FROM '$B/ub.csv' ANCHOR SCHEMA first)
+    ;
+    // A date `x` in one branch and an int `x` in the other: no common type.
+    const bad = try std.mem.replaceOwned(u8, alloc, "LOAD INTO '$B/bad.csv' AS " ++ with_u ++ "\nSELECT * FROM u;", "$B", base);
+    defer alloc.free(bad);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const bad_prog = try parser.parseSource(parena.allocator(), bad, &pdiag);
+    var rdiag: Diag = .{};
+    try std.testing.expect(std.meta.isError(run(alloc, bad_prog, .{ .log = .{ .quiet = true } }, &rdiag)));
+    try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "no common type") != null);
+
+    // Excepted, the column is dropped from the canon: neither branch casts it.
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/ok.csv' AS " ++ with_u ++ "\nSELECT * EXCEPT (x) FROM u ORDER BY id;", 1, &.{});
+    try expectFile(&tmp, "ok.csv", "id\n1\n2\n");
+}

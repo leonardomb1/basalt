@@ -65,6 +65,7 @@ const buildPipeline = @import("plan.zig").buildPipeline;
 const rebuildMapStages = @import("plan.zig").rebuildMapStages;
 const synthReconcile = @import("plan.zig").synthReconcile;
 const unionCanon = @import("plan.zig").unionCanon;
+const unionExceptNames = @import("plan.zig").unionExceptNames;
 const unionDownstreamMapOnly = @import("plan.zig").unionDownstreamMapOnly;
 const unionSpecs = @import("plan.zig").unionSpecs;
 
@@ -197,7 +198,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         // its own — registering them all up front made the last one win for both.
         .binding => |b| try bindings.put(b.name, try renderScriptScope(&env, b.pipeline)),
         .output => |p| try runOutput(&env, try renderScriptScope(&env, p), opts, &stats, &lanes_used, &batch_arena),
-        .explain => |e| try runExplain(&env, e, opts, &stats, &lanes_used, &batch_arena),
+        .explain => |e| try runExplain(&env, .{ .mode = e.mode, .pipeline = try renderScriptScope(&env, e.pipeline), .pos = e.pos }, opts, &stats, &lanes_used, &batch_arena),
         .for_each => |fe| try runForEach(&env, fe, opts, &stats, &lanes_used, &batch_arena, runForBody, &env.script_scope),
         .match => |m| try runStmtMatch(&env, m, opts, &stats, &lanes_used, &batch_arena),
         .print => |p| try runPrint(&env, p, no_loop_vars),
@@ -304,7 +305,7 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
     env.diag.pos = null;
     switch (s.*) {
         .output => |p| try runOutput(env, try renderScriptScope(env, p), opts, stats, lanes_used, batch_arena),
-        .explain => |e| try runExplain(env, e, opts, stats, lanes_used, batch_arena),
+        .explain => |e| try runExplain(env, .{ .mode = e.mode, .pipeline = try renderScriptScope(env, e.pipeline), .pos = e.pos }, opts, stats, lanes_used, batch_arena),
         .for_each => |fe| try runForEach(env, fe, opts, stats, lanes_used, batch_arena, runForBody, &env.script_scope),
         .match => |mm| try runStmtMatch(env, mm, opts, stats, lanes_used, batch_arena),
         .print => |p| try runPrint(env, p, no_loop_vars),
@@ -694,7 +695,7 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
         sch.* = try dupeSchema(arena, src.schema());
         src.close();
     }
-    const canon = try unionCanon(env, specs, schemas, canon_opt);
+    const canon = try unionCanon(env, specs, schemas, canon_opt, unionExceptNames(downstream));
 
     var split_hints = std.array_list.Managed(ast.Hint).init(arena);
     for (hints) |h| {

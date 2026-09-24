@@ -338,12 +338,17 @@ pub fn buildPipeline(env: *Env, stages: []const ast.Stage) anyerror!PipeRes {
         .ref => |name| {
             const b = env.bindings.get(name) orelse
                 return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown binding `{s}`", .{name}));
-            const r = try buildPipeline(env, b.stages);
+            // `WITH u AS (<union>) SELECT * EXCEPT (x) FROM u`: the EXCEPT reaches the
+            // union through the binding the same as if it stood right after it.
+            const r = if (b.stages.len == 1 and b.stages[0].node == .union_)
+                try buildUnion(env, b.stages[0].node.union_, b.stages[0].hints, unionExceptNames(stages[1..]))
+            else
+                try buildPipeline(env, b.stages);
             current = r.op;
             schema = r.schema;
         },
         .union_ => |u| {
-            const r = try buildUnion(env, u, stages[0].hints);
+            const r = try buildUnion(env, u, stages[0].hints, unionExceptNames(stages[1..]));
             current = r.op;
             schema = r.schema;
         },
@@ -514,9 +519,9 @@ fn deriveSubstr(s: []const u8, spec: []const u8) ?[]const u8 {
 
 /// Pick the canon schema among the branch schemas: a named source table, or the
 /// first branch.
-pub fn unionCanon(env: *Env, specs: []const UnionSpec, schemas: []const types.Schema, canon_opt: ?[]const u8) !types.Schema {
+pub fn unionCanon(env: *Env, specs: []const UnionSpec, schemas: []const types.Schema, canon_opt: ?[]const u8, except: []const []const u8) !types.Schema {
     if (canon_opt) |c| if (!std.mem.eql(u8, c, "first")) {
-        for (specs, schemas) |s, sch| if (std.mem.eql(u8, s.name, c)) return sch;
+        for (specs, schemas) |s, sch| if (std.mem.eql(u8, s.name, c)) return dropExcept(env.arena, sch, except);
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "union canon `{s}` is not one of the source tables", .{c}));
     };
     // Widen field-by-field across every branch instead of taking branch 0
@@ -524,8 +529,7 @@ pub fn unionCanon(env: *Env, specs: []const UnionSpec, schemas: []const types.Sc
     // first branch silently truncated a later float branch's 2.7 to 2 — and
     // swapping the branches changed the answer. `unify` is SQL's UNION column
     // type resolution; a pair that cannot unify is an error, not a guess.
-    const canon = try env.arena.alloc(types.Schema.Field, schemas[0].fields.len);
-    @memcpy(canon, schemas[0].fields);
+    const canon = @constCast((try dropExcept(env.arena, schemas[0], except)).fields);
     for (schemas[1..]) |sch| {
         for (canon) |*f| {
             const other = sch.indexOf(f.name) orelse continue;
@@ -540,6 +544,20 @@ pub fn unionCanon(env: *Env, specs: []const UnionSpec, schemas: []const types.Sc
     return .{ .fields = canon };
 }
 
+/// `schema` without the columns named in `except` (SQL sources are case-insensitive
+/// about names, so the match is too).
+fn dropExcept(arena: std.mem.Allocator, schema: types.Schema, except: []const []const u8) !types.Schema {
+    var kept = std.array_list.Managed(types.Schema.Field).init(arena);
+    for (schema.fields) |f| {
+        var out = false;
+        for (except) |x| if (std.ascii.eqlIgnoreCase(x, f.name)) {
+            out = true;
+        };
+        if (!out) try kept.append(f);
+    }
+    return .{ .fields = try kept.toOwnedSlice() };
+}
+
 pub fn unionDownstreamMapOnly(stages: []const ast.Stage) bool {
     for (stages) |s| switch (s.node) {
         .filter, .select, .explode => {},
@@ -551,7 +569,19 @@ pub fn unionDownstreamMapOnly(stages: []const ast.Stage) bool {
 /// Build the serial union op: open every branch (kept open, drained in order by
 /// op.Union), reconcile each to the canon, and concatenate. Used when split isn't
 /// applicable (threads=1, a breaker downstream, or non-splittable branches).
-fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint) anyerror!PipeRes {
+/// The columns a `SELECT * EXCEPT (...)` right after a union leaves out. They are
+/// taken out of the canon before the branches are reconciled to it, so a column
+/// that one branch carries with an incompatible type — the reason to except it —
+/// is never cast at all. Applied downstream alone, the EXCEPT would come too late.
+pub fn unionExceptNames(after: []const ast.Stage) []const []const u8 {
+    if (after.len == 0 or after[0].node != .select) return &.{};
+    for (after[0].node.select) |it| {
+        if (it == .star_except) return it.star_except;
+    }
+    return &.{};
+}
+
+fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, except: []const []const u8) anyerror!PipeRes {
     const arena = env.arena;
     const tag_col = forHintIdent(hints, "tag");
     const canon_opt = forHintIdent(hints, "canon");
@@ -582,7 +612,7 @@ fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint) anyerror!PipeRes
         children[i] = .{ .scan = scan };
         schemas[i] = src.schema();
     }
-    const canon = try dupeSchema(arena, try unionCanon(env, specs, schemas, canon_opt));
+    const canon = try dupeSchema(arena, try unionCanon(env, specs, schemas, canon_opt, except));
 
     var out_schema: types.Schema = undefined;
     for (specs, 0..) |s, i| {
