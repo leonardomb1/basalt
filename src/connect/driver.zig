@@ -97,7 +97,11 @@ pub const Source = struct {
     pub fn schema(self: Source) types.Schema {
         return self.vtable.schema(self.ptr);
     }
+    /// Every pull checks the abort flag. A blocking operator (an aggregate, a
+    /// sort, a join build) drains its whole input inside one `next` of its own,
+    /// so the sink loop's check alone let a cancelled GROUP BY run to the end.
     pub fn next(self: Source, arena: std.mem.Allocator) anyerror!?Batch {
+        if (aborting()) return error.Aborted;
         return self.vtable.next(self.ptr, arena);
     }
     pub fn close(self: Source) void {
