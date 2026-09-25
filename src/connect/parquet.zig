@@ -73,10 +73,35 @@ pub const SchemaElement = struct {
     converted_type: ?i32 = null,
     scale: ?i32 = null,
     precision: ?i32 = null,
+    /// Field 10. Supersedes `converted_type` when present: a writer omits the
+    /// legacy annotation for anything it cannot express, notably a naive
+    /// (`isAdjustedToUTC = false`) timestamp and every nanosecond unit.
+    logical_type: ?LogicalType = null,
 
     pub fn isLeaf(self: SchemaElement) bool {
         return self.num_children == 0;
     }
+};
+
+pub const TimeUnit = enum { millis, micros, nanos };
+
+/// The `LogicalType` union, reduced to the members that change how basalt reads
+/// a column. Anything else decodes to `.other` and falls back to the converted
+/// type, exactly as if the field were absent.
+pub const LogicalType = union(enum) {
+    string,
+    @"enum",
+    uuid,
+    json,
+    bson,
+    date,
+    decimal: struct { scale: i32 = 0, precision: i32 = 0 },
+    time: Temporal,
+    timestamp: Temporal,
+    integer: struct { bit_width: i8 = 64, signed: bool = true },
+    other,
+
+    pub const Temporal = struct { adjusted_to_utc: bool = false, unit: TimeUnit = .micros };
 };
 
 /// Per-chunk statistics. `min`/`max` are PLAIN-encoded bytes of the column's
@@ -208,11 +233,151 @@ fn readSchemaElement(arena: std.mem.Allocator, r: *thrift.Reader) Error!SchemaEl
             6 => e.converted_type = try r.readI32(),
             7 => e.scale = try r.readI32(),
             8 => e.precision = try r.readI32(),
+            10 => e.logical_type = if (f.ty == .@"struct") try readLogicalType(r) else blk: {
+                try r.skip(f.ty);
+                break :blk null;
+            },
             else => try r.skip(f.ty),
         }
     }
     try r.structEnd();
     return e;
+}
+
+/// A thrift union is a struct with exactly one field set. Member ids follow
+/// parquet.thrift; the payload structs of members basalt ignores are skipped.
+fn readLogicalType(r: *thrift.Reader) Error!LogicalType {
+    var lt: LogicalType = .other;
+    try r.structBegin();
+    while (true) {
+        const f = try r.readField();
+        if (f.ty == .stop) break;
+        if (f.ty != .@"struct") {
+            try r.skip(f.ty);
+            continue;
+        }
+        lt = switch (f.id) {
+            1 => blk: {
+                try r.skipStruct();
+                break :blk .string;
+            },
+            4 => blk: {
+                try r.skipStruct();
+                break :blk .@"enum";
+            },
+            5 => try readDecimalType(r),
+            6 => blk: {
+                try r.skipStruct();
+                break :blk .date;
+            },
+            7 => .{ .time = try readTemporalType(r) },
+            8 => .{ .timestamp = try readTemporalType(r) },
+            10 => try readIntType(r),
+            12 => blk: {
+                try r.skipStruct();
+                break :blk .json;
+            },
+            13 => blk: {
+                try r.skipStruct();
+                break :blk .bson;
+            },
+            14 => blk: {
+                try r.skipStruct();
+                break :blk .uuid;
+            },
+            else => blk: {
+                try r.skipStruct();
+                break :blk .other;
+            },
+        };
+    }
+    try r.structEnd();
+    return lt;
+}
+
+fn readDecimalType(r: *thrift.Reader) Error!LogicalType {
+    var d: @FieldType(LogicalType, "decimal") = .{};
+    try r.structBegin();
+    while (true) {
+        const f = try r.readField();
+        if (f.ty == .stop) break;
+        switch (f.id) {
+            1 => d.scale = try r.readI32(),
+            2 => d.precision = try r.readI32(),
+            else => try r.skip(f.ty),
+        }
+    }
+    try r.structEnd();
+    return .{ .decimal = d };
+}
+
+fn readTemporalType(r: *thrift.Reader) Error!LogicalType.Temporal {
+    var tt: LogicalType.Temporal = .{};
+    try r.structBegin();
+    while (true) {
+        const f = try r.readField();
+        if (f.ty == .stop) break;
+        switch (f.id) {
+            1 => tt.adjusted_to_utc = try readBool(r, f.ty),
+            2 => tt.unit = if (f.ty == .@"struct") try readTimeUnit(r) else blk: {
+                try r.skip(f.ty);
+                break :blk tt.unit;
+            },
+            else => try r.skip(f.ty),
+        }
+    }
+    try r.structEnd();
+    return tt;
+}
+
+/// `TimeUnit` is itself a union of empty structs: MILLIS=1, MICROS=2, NANOS=3.
+fn readTimeUnit(r: *thrift.Reader) Error!TimeUnit {
+    var u: TimeUnit = .micros;
+    try r.structBegin();
+    while (true) {
+        const f = try r.readField();
+        if (f.ty == .stop) break;
+        switch (f.id) {
+            1 => u = .millis,
+            2 => u = .micros,
+            3 => u = .nanos,
+            else => {},
+        }
+        try r.skip(f.ty);
+    }
+    try r.structEnd();
+    return u;
+}
+
+fn readIntType(r: *thrift.Reader) Error!LogicalType {
+    var it: @FieldType(LogicalType, "integer") = .{};
+    try r.structBegin();
+    while (true) {
+        const f = try r.readField();
+        if (f.ty == .stop) break;
+        switch (f.id) {
+            1 => {
+                if (f.ty != .byte) return Error.CorruptThrift;
+                it.bit_width = @bitCast(try r.readByte());
+            },
+            2 => it.signed = try readBool(r, f.ty),
+            else => try r.skip(f.ty),
+        }
+    }
+    try r.structEnd();
+    return .{ .integer = it };
+}
+
+/// Compact-protocol booleans live in the field type and carry no bytes.
+fn readBool(r: *thrift.Reader, ty: thrift.Type) Error!bool {
+    return switch (ty) {
+        .bool_true => true,
+        .bool_false => false,
+        else => blk: {
+            try r.skip(ty);
+            break :blk false;
+        },
+    };
 }
 
 fn readRowGroup(arena: std.mem.Allocator, r: *thrift.Reader) Error!RowGroup {

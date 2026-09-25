@@ -3283,3 +3283,36 @@ test "a projected SQL read asks for its columns, quoted per dialect; none means 
     try std.testing.expectEqualStrings("\"id\", \"amount\"", try selectListFor(a, .postgres, &.{ "id", "amount" }));
     try std.testing.expectEqualStrings("`id`", try selectListFor(a, .mysql, &.{"id"}));
 }
+
+/// Written by polars 1.44 with no ConvertedType on the temporal columns: `ts` is a
+/// naive microsecond timestamp, `ts_utc` a UTC nanosecond one, `t` a TIME. Two row
+/// groups of two rows, so statistics on the converted units get exercised too.
+const fx_logical = @embedFile("../connect/testdata/logical_types.parquet");
+
+test "LogicalType-only parquet timestamps and times read back as wall-clock values" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "lt.parquet", .data = fx_logical });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "LOAD INTO '{s}' AS SELECT id, ts, ts_utc, t, date_trunc('hour', ts) AS h FROM '{s}/lt.parquet' ORDER BY id;",
+        .{ out_path, base },
+    );
+    defer alloc.free(script);
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "id,ts,ts_utc,t,h\n" ++
+            "1,2025-12-31 23:59:59.999999,2025-06-01 08:30:00,01:02:00,2025-12-31 23:00:00\n" ++
+            "2,2026-01-01 12:00:00,2026-01-01 12:00:00.123456,23:59:59.999999,2026-01-01 12:00:00\n" ++
+            "3,,2026-03-01 00:00:00,00:00:00,\n" ++
+            "4,1969-12-31 23:59:59.500000,,,1969-12-31 23:00:00\n",
+        out,
+    );
+}

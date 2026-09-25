@@ -308,6 +308,17 @@ store `DECIMAL` in the narrowest physical type its precision allows — INT32 to
 digits, INT64 to 18, FIXED_LEN_BYTE_ARRAY up to 38; past 38 digits (the engine's
 own ceiling) a value is refused rather than silently truncated.
 
+A parquet column's type comes from its `LogicalType` annotation when the writer
+set one, else from the legacy `ConvertedType`. That matters for files from
+polars, DuckDB, Spark or pyarrow: they omit the legacy annotation on a naive
+timestamp and on every nanosecond one, so without the logical type those
+columns would read as bare `int`. `TIMESTAMP` and `TIME` in milliseconds,
+microseconds or nanoseconds all read as basalt's microsecond `timestamp`/`time`;
+nanoseconds floor to the microsecond. A UTC-adjusted timestamp reads as its UTC
+wall-clock time: basalt has no zoned timestamp, so `isAdjustedToUTC` is not
+carried. `DATE`, `DECIMAL`, `STRING`/`ENUM`/`JSON` and `INTEGER` map as their
+converted twins do; a `UUID` stays `bytes`.
+
 Source clauses, in any order after the source:
 
 - **`PUSHDOWN(<expr>)`** — a raw predicate sent verbatim into the generated

@@ -442,26 +442,100 @@ const conv_timestamp_micros = 10;
 const conv_json = 19;
 const conv_bson = 20;
 
-/// Multiplier taking a column's stored temporal unit to basalt's microseconds.
+/// Conversion taking a column's stored temporal unit to basalt's microseconds.
 ///
 /// Parquet stores TIME/TIMESTAMP in milliseconds, microseconds or nanoseconds
 /// depending on the annotation; basalt's `time`/`timestamp` are always micros.
 /// Ignoring this reads a millisecond timestamp as if it were micros — a silent
-/// 1000x error that lands values in 1970.
-pub fn temporalScale(e: parquet.SchemaElement) i64 {
-    const c = e.converted_type orelse return 1;
+/// 1000x error that lands values in 1970 — and a nanosecond one 1000x too far
+/// out. Nanoseconds floor-divide, so sub-microsecond digits are dropped and a
+/// pre-1970 value still truncates towards the earlier instant; flooring is
+/// monotone, which keeps statistics-based pruning sound after conversion.
+pub const TemporalScale = struct {
+    mul: i64 = 1,
+    div: i64 = 1,
+
+    pub const identity: TemporalScale = .{};
+
+    pub fn isIdentity(self: TemporalScale) bool {
+        return self.mul == 1 and self.div == 1;
+    }
+
+    pub fn apply(self: TemporalScale, x: i64) i64 {
+        const m = std.math.mul(i64, x, self.mul) catch
+            return if (x < 0) std.math.minInt(i64) else std.math.maxInt(i64);
+        return if (self.div == 1) m else @divFloor(m, self.div);
+    }
+
+    fn of(unit: parquet.TimeUnit) TemporalScale {
+        return switch (unit) {
+            .millis => .{ .mul = 1000 },
+            .micros => .identity,
+            .nanos => .{ .div = 1000 },
+        };
+    }
+};
+
+pub fn temporalScale(e: parquet.SchemaElement) TemporalScale {
+    if (e.logical_type) |lt| switch (lt) {
+        .time, .timestamp => |tt| return TemporalScale.of(tt.unit),
+        else => {},
+    };
+    const c = e.converted_type orelse return .identity;
     return switch (c) {
-        conv_time_millis, conv_timestamp_millis => 1000,
-        else => 1,
+        conv_time_millis, conv_timestamp_millis => .{ .mul = 1000 },
+        else => .identity,
     };
 }
 
-/// basalt type for a leaf schema element, from its physical and converted type.
+/// basalt type for a leaf schema element, from its physical type and its
+/// annotation: the LogicalType when the writer gave one, else the legacy
+/// ConvertedType. Modern writers (polars, DuckDB, Spark, pyarrow) omit the
+/// converted type for naive and nanosecond timestamps, so the logical type is
+/// the only thing that says the int64 is a timestamp at all.
+///
+/// `isAdjustedToUTC` is not carried: basalt has no zoned timestamp, and a UTC
+/// instant and a naive wall-clock time both read as the same `timestamp`
+/// value — the UTC one as its UTC wall-clock.
 pub fn basaltType(e: parquet.SchemaElement) Error!types.Type {
     const phys = e.ty orelse return Error.UnsupportedParquetSchema;
-    const conv = e.converted_type;
+    var t = logicalBasaltType(e, phys) orelse try convertedBasaltType(e, phys);
+    if (e.repetition orelse .required != .required) t = t.asNullable();
+    return t;
+}
 
-    var t: types.Type = switch (phys) {
+/// Null when the logical type is absent or says nothing basalt acts on, which
+/// defers to the converted type. A logical type that does not fit its physical
+/// type (a TIMESTAMP on a byte array) is ignored the same way rather than
+/// trusted.
+fn logicalBasaltType(e: parquet.SchemaElement, phys: parquet.PhysicalType) ?types.Type {
+    const lt = e.logical_type orelse return null;
+    const is_bytes = phys == .byte_array or phys == .fixed_len_byte_array;
+    return switch (lt) {
+        .string, .@"enum", .json, .bson => if (is_bytes) types.Type.init(.string) else null,
+        .date => if (phys == .int32) types.Type.init(.date) else null,
+        .time => |tt| switch (phys) {
+            .int32 => if (tt.unit == .millis) types.Type.init(.time) else null,
+            .int64 => if (tt.unit != .millis) types.Type.init(.time) else null,
+            else => null,
+        },
+        .timestamp => if (phys == .int64) types.Type.init(.timestamp) else null,
+        .decimal => |d| switch (phys) {
+            .int32, .int64, .byte_array, .fixed_len_byte_array => decimalOf(.{
+                .precision = d.precision,
+                .scale = d.scale,
+            }),
+            else => null,
+        },
+        .integer => if (phys == .int32 or phys == .int64) types.Type.init(.int) else null,
+        // basalt has no uuid type; the 16 raw bytes stay `bytes`, as before
+        .uuid, .other => null,
+    };
+}
+
+fn convertedBasaltType(e: parquet.SchemaElement, phys: parquet.PhysicalType) Error!types.Type {
+    const conv = e.converted_type;
+    return switch (phys) {
         .boolean => types.Type.init(.bool),
         .int32 => blk: {
             if (conv) |c| {
@@ -490,10 +564,8 @@ pub fn basaltType(e: parquet.SchemaElement) Error!types.Type {
             }
             break :blk types.Type.init(.bytes);
         },
-        else => return Error.UnsupportedParquetSchema,
+        else => Error.UnsupportedParquetSchema,
     };
-    if (e.repetition orelse .required != .required) t = t.asNullable();
-    return t;
 }
 
 fn decimalOf(e: parquet.SchemaElement) types.Type {
@@ -518,7 +590,7 @@ fn decimalValue(t: types.Type, v: Value) Value {
 
 /// Adapts a decoded physical value to the column's logical type. `scale` carries
 /// the temporal unit conversion from `temporalScale`.
-pub fn coerce(t: types.Type, v: Value, scale: i64) Value {
+pub fn coerce(t: types.Type, v: Value, scale: TemporalScale) Value {
     if (v == .null) return v;
     return switch (t.kind) {
         .string => switch (v) {
@@ -530,12 +602,12 @@ pub fn coerce(t: types.Type, v: Value, scale: i64) Value {
             else => v,
         },
         .time => switch (v) {
-            .int => |x| .{ .time = x * scale },
+            .int => |x| .{ .time = scale.apply(x) },
             else => v,
         },
         .timestamp => switch (v) {
-            // int96 already decodes to micros and carries scale 1
-            .int => |x| .{ .timestamp = x * scale },
+            // int96 already decodes to micros and carries the identity scale
+            .int => |x| .{ .timestamp = scale.apply(x) },
             else => v,
         },
         .decimal => decimalValue(t, v),
@@ -682,7 +754,7 @@ fn appendDataPage(
     ty: types.Type,
     max_def: u32,
     dict: ?[]Value,
-    tscale: i64,
+    tscale: TemporalScale,
 ) Error!usize {
     // A negative count is not a count; @intCast on it is undefined in release.
     const n = std.math.cast(usize, pg.header.num_values) orelse return Error.CorruptParquetPage;
@@ -726,7 +798,7 @@ fn appendDataPage(
             // `present == n` rather than `defs == null`: most writers mark every
             // column OPTIONAL, so levels are present even when no row is null,
             // and keying off their absence would never fire in practice.
-            if (tscale == 1 and try bulkPlain(arena, b, ty, meta.ty, body, present, defs, max_def)) {
+            if (tscale.isIdentity() and try bulkPlain(arena, b, ty, meta.ty, body, present, defs, max_def)) {
                 return n;
             }
             var cur = PlainCursor.init(meta.ty, elem.type_length orelse 0, body);
@@ -800,7 +872,7 @@ fn bulkPlain(
             if (body.len < count * 8) return Error.CorruptParquetPage;
             switch (ty.kind) {
                 // time and timestamp share the i64 store; the caller has already
-                // ruled out a unit conversion (tscale == 1)
+                // ruled out a unit conversion (identity tscale)
                 .int, .time, .timestamp => {
                     const out = try arena.alloc(i64, count);
                     for (out, 0..) |*o, i| o.* = std.mem.readInt(i64, body[i * 8 ..][0..8], .little);
@@ -914,7 +986,7 @@ fn bulkDict(
     idx: []const u32,
     defs: ?[]const u32,
     max_def: u32,
-    tscale: i64,
+    tscale: TemporalScale,
 ) Error!bool {
     for (idx) |ix| if (ix >= dict.len) return Error.CorruptParquetPage;
     switch (ty.kind) {
@@ -944,7 +1016,7 @@ fn bulkDict(
             return true;
         },
         .date => {
-            if (tscale != 1) return false;
+            if (!tscale.isIdentity()) return false;
             for (dict) |v| if (v != .int) return false;
             const vals = try arena.alloc(i32, idx.len);
             for (vals, idx) |*o, ix| o.* = std.math.cast(i32, dict[ix].int) orelse return false;
@@ -965,7 +1037,7 @@ fn emitInts(
     max_def: u32,
     n: usize,
     vals: []const i64,
-    tscale: i64,
+    tscale: TemporalScale,
 ) Error!void {
     var j: usize = 0;
     for (0..n) |i| {
@@ -988,7 +1060,7 @@ fn emitBytes(
     max_def: u32,
     n: usize,
     vals: []const []const u8,
-    tscale: i64,
+    tscale: TemporalScale,
 ) Error!void {
     if (ty.kind == .string or ty.kind == .bytes) {
         // A short `vals` is the only non-memory failure: the page lied.
@@ -1022,7 +1094,7 @@ fn emit(
     cur: ?*PlainCursor,
     idx: ?[]const u32,
     dict: ?[]const Value,
-    tscale: i64,
+    tscale: TemporalScale,
 ) Error!void {
     var j: usize = 0;
     for (0..n) |i| {
@@ -1889,15 +1961,98 @@ test "schema walk resolves levels and dotted names for nested groups" {
 }
 
 test "temporal scale converts millisecond columns and leaves micros alone" {
-    try testing.expectEqual(@as(i64, 1000), temporalScale(.{ .converted_type = 9 })); // TIMESTAMP_MILLIS
-    try testing.expectEqual(@as(i64, 1000), temporalScale(.{ .converted_type = 7 })); // TIME_MILLIS
-    try testing.expectEqual(@as(i64, 1), temporalScale(.{ .converted_type = 10 })); // TIMESTAMP_MICROS
-    try testing.expectEqual(@as(i64, 1), temporalScale(.{})); // no annotation
+    try testing.expectEqual(TemporalScale{ .mul = 1000 }, temporalScale(.{ .converted_type = 9 })); // TIMESTAMP_MILLIS
+    try testing.expectEqual(TemporalScale{ .mul = 1000 }, temporalScale(.{ .converted_type = 7 })); // TIME_MILLIS
+    try testing.expectEqual(TemporalScale.identity, temporalScale(.{ .converted_type = 10 })); // TIMESTAMP_MICROS
+    try testing.expectEqual(TemporalScale.identity, temporalScale(.{})); // no annotation
 
     const ts = types.Type.init(.timestamp);
     // a millisecond value must be scaled up, not read as micros
-    try testing.expectEqual(@as(i64, 1_583_298_367_123_000), coerce(ts, .{ .int = 1_583_298_367_123 }, 1000).timestamp);
-    try testing.expectEqual(@as(i64, 1_583_298_367_123), coerce(ts, .{ .int = 1_583_298_367_123 }, 1).timestamp);
+    try testing.expectEqual(@as(i64, 1_583_298_367_123_000), coerce(ts, .{ .int = 1_583_298_367_123 }, .{ .mul = 1000 }).timestamp);
+    try testing.expectEqual(@as(i64, 1_583_298_367_123), coerce(ts, .{ .int = 1_583_298_367_123 }, .identity).timestamp);
+}
+
+fn logical(phys: parquet.PhysicalType, lt: parquet.LogicalType) parquet.SchemaElement {
+    return .{ .ty = phys, .repetition = .optional, .logical_type = lt };
+}
+
+test "a LogicalType-only TIMESTAMP reads as timestamp in every unit" {
+    // 2026-01-01T12:00:00, as polars/pyarrow write it with no ConvertedType
+    const want: i64 = 1_767_268_800_000_000;
+    const ts = types.Type.init(.timestamp);
+    inline for (.{
+        .{ parquet.TimeUnit.millis, want / 1000 },
+        .{ parquet.TimeUnit.micros, want },
+        .{ parquet.TimeUnit.nanos, want * 1000 },
+    }) |c| {
+        const e = logical(.int64, .{ .timestamp = .{ .unit = c[0] } });
+        try testing.expectEqual(types.TypeKind.timestamp, (try basaltType(e)).kind);
+        try testing.expectEqual(want, coerce(ts, .{ .int = c[1] }, temporalScale(e)).timestamp);
+    }
+    // isAdjustedToUTC reads as the same timestamp: basalt has no zoned type
+    const utc = logical(.int64, .{ .timestamp = .{ .adjusted_to_utc = true, .unit = .nanos } });
+    try testing.expectEqual(types.TypeKind.timestamp, (try basaltType(utc)).kind);
+}
+
+test "nanoseconds floor to micros, including before 1970" {
+    const ns = TemporalScale{ .div = 1000 };
+    try testing.expectEqual(@as(i64, 1), ns.apply(1_999));
+    try testing.expectEqual(@as(i64, -1), ns.apply(-1)); // 1969-12-31T23:59:59.999999
+    try testing.expectEqual(@as(i64, -2), ns.apply(-1_001));
+    // a millisecond value too large for micros saturates rather than wrapping
+    const ms = TemporalScale{ .mul = 1000 };
+    try testing.expectEqual(@as(i64, std.math.maxInt(i64)), ms.apply(std.math.maxInt(i64) / 10));
+}
+
+test "a LogicalType-only TIME reads as time in millis and micros" {
+    const tm = types.Type.init(.time);
+    // 01:02:00 in micros
+    const want: i64 = 3_720_000_000;
+    const ms = logical(.int32, .{ .time = .{ .unit = .millis } });
+    try testing.expectEqual(types.TypeKind.time, (try basaltType(ms)).kind);
+    try testing.expectEqual(want, coerce(tm, .{ .int = want / 1000 }, temporalScale(ms)).time);
+    const us = logical(.int64, .{ .time = .{ .unit = .micros } });
+    try testing.expectEqual(types.TypeKind.time, (try basaltType(us)).kind);
+    try testing.expectEqual(want, coerce(tm, .{ .int = want }, temporalScale(us)).time);
+    const ns = logical(.int64, .{ .time = .{ .unit = .nanos } });
+    try testing.expectEqual(types.TypeKind.time, (try basaltType(ns)).kind);
+    try testing.expectEqual(want, coerce(tm, .{ .int = want * 1000 }, temporalScale(ns)).time);
+}
+
+test "LogicalType DATE, DECIMAL, STRING and INTEGER map without a ConvertedType" {
+    try testing.expectEqual(types.TypeKind.date, (try basaltType(logical(.int32, .date))).kind);
+    const dec = try basaltType(logical(.fixed_len_byte_array, .{ .decimal = .{ .scale = 2, .precision = 12 } }));
+    try testing.expectEqual(types.TypeKind.decimal, dec.kind);
+    try testing.expectEqual(@as(u8, 12), dec.precision);
+    try testing.expectEqual(@as(u8, 2), dec.scale);
+    try testing.expectEqual(types.TypeKind.string, (try basaltType(logical(.byte_array, .string))).kind);
+    try testing.expectEqual(types.TypeKind.string, (try basaltType(logical(.byte_array, .json))).kind);
+    try testing.expectEqual(types.TypeKind.int, (try basaltType(logical(.int32, .{ .integer = .{ .bit_width = 8, .signed = false } }))).kind);
+    // uuid has no basalt type and stays raw bytes
+    try testing.expectEqual(types.TypeKind.bytes, (try basaltType(logical(.fixed_len_byte_array, .uuid))).kind);
+    // a logical type that contradicts its physical type is ignored, not trusted
+    try testing.expectEqual(types.TypeKind.bytes, (try basaltType(logical(.byte_array, .{ .timestamp = .{} }))).kind);
+}
+
+test "LogicalType wins over a ConvertedType, and agreeing annotations stay put" {
+    // both present and agreeing, as a spec-following writer emits for millis
+    var both = logical(.int64, .{ .timestamp = .{ .adjusted_to_utc = true, .unit = .millis } });
+    both.converted_type = 9; // TIMESTAMP_MILLIS
+    try testing.expectEqual(types.TypeKind.timestamp, (try basaltType(both)).kind);
+    try testing.expectEqual(TemporalScale{ .mul = 1000 }, temporalScale(both));
+
+    var dec = logical(.int64, .{ .decimal = .{ .scale = 4, .precision = 18 } });
+    dec.converted_type = 5;
+    dec.scale = 4;
+    dec.precision = 18;
+    const d = try basaltType(dec);
+    try testing.expectEqual(@as(u8, 18), d.precision);
+    try testing.expectEqual(@as(u8, 4), d.scale);
+
+    // an unrecognised logical type falls back to the converted one
+    var other = logical(.int32, .other);
+    other.converted_type = 6; // DATE
+    try testing.expectEqual(types.TypeKind.date, (try basaltType(other)).kind);
 }
 
 const fx_v2 = @embedFile("testdata/v2delta.parquet");
@@ -2031,6 +2186,40 @@ test "row groups are skipped only when statistics prove no row can match" {
     // an unknown column contributes no bound
     const other = [_]Bound{.{ .column = "nosuch", .op = .lt, .value = .{ .int = 0 } }};
     try testing.expect(groupMayMatch(&schema, &leaves, g, &other));
+}
+
+/// polars 1.44, no ConvertedType on the temporal columns: `ts` naive micros,
+/// `ts_utc` UTC nanos, `t` TIME nanos. Two row groups of two rows each.
+const fx_logical = @embedFile("testdata/logical_types.parquet");
+
+test "a polars footer carries the LogicalType, and pruning uses converted units" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const md = try parquet.parseFile(a, fx_logical);
+    const leaves = try collectLeaves(a, md.schema);
+    const ts = md.schema[leaves[1].schema_idx];
+    const utc = md.schema[leaves[2].schema_idx];
+    try testing.expectEqual(@as(?i32, null), ts.converted_type);
+    try testing.expectEqual(parquet.TimeUnit.micros, ts.logical_type.?.timestamp.unit);
+    try testing.expect(!ts.logical_type.?.timestamp.adjusted_to_utc);
+    try testing.expectEqual(parquet.TimeUnit.nanos, utc.logical_type.?.timestamp.unit);
+    try testing.expect(utc.logical_type.?.timestamp.adjusted_to_utc);
+    try testing.expectEqual(types.TypeKind.time, (try basaltType(md.schema[leaves[3].schema_idx])).kind);
+
+    // group 0: ts up to 2026-01-01 12:00, ts_utc from 2025-06-01 08:30
+    // group 1: ts only 1969-12-31,        ts_utc only 2026-03-01
+    try testing.expectEqual(@as(usize, 2), md.row_groups.len);
+    const jan1: i64 = 1_767_225_600_000_000; // 2026-01-01T00:00:00 in micros
+    const ge_jan1 = [_]Bound{.{ .column = "ts", .op = .ge, .value = .{ .timestamp = jan1 } }};
+    try testing.expect(groupMayMatch(md.schema, leaves, md.row_groups[0], &ge_jan1));
+    try testing.expect(!groupMayMatch(md.schema, leaves, md.row_groups[1], &ge_jan1));
+    // raw nanosecond stats would sit 1000x above any micros literal and keep group 0
+    const utc_lt = [_]Bound{.{ .column = "ts_utc", .op = .lt, .value = .{ .timestamp = jan1 } }};
+    try testing.expect(groupMayMatch(md.schema, leaves, md.row_groups[0], &utc_lt));
+    try testing.expect(!groupMayMatch(md.schema, leaves, md.row_groups[1], &utc_lt));
+    const utc_gt = [_]Bound{.{ .column = "ts_utc", .op = .gt, .value = .{ .timestamp = jan1 } }};
+    try testing.expect(groupMayMatch(md.schema, leaves, md.row_groups[1], &utc_gt));
 }
 
 test "chunk extents come from the next chunk, never from total_compressed_size" {
