@@ -25,6 +25,7 @@ const OutcomeSink = @import("env.zig").OutcomeSink;
 const ParamArg = @import("env.zig").ParamArg;
 
 const sqlWithWhere = @import("connect.zig").sqlWithWhere;
+const selectListFor = @import("connect.zig").selectListFor;
 
 const agg_combine_parallel_min = @import("lanes.zig").agg_combine_parallel_min;
 const classifyAggPipeline = @import("lanes.zig").classifyAggPipeline;
@@ -3271,4 +3272,14 @@ test "union: SELECT * EXCEPT drops a column before the branches are reconciled, 
     // Excepted, the column is dropped from the canon: neither branch casts it.
     try checkAndRun(alloc, &tmp, "LOAD INTO '$B/ok.csv' AS " ++ with_u ++ "\nSELECT * EXCEPT (x) FROM u ORDER BY id;", 1, &.{});
     try expectFile(&tmp, "ok.csv", "id\n1\n2\n");
+}
+
+test "a projected SQL read asks for its columns, quoted per dialect; none means *" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("*", try selectListFor(a, .sqlserver, &.{}));
+    try std.testing.expectEqualStrings("[E1_NUM], [E1_VALOR]", try selectListFor(a, .sqlserver, &.{ "E1_NUM", "E1_VALOR" }));
+    try std.testing.expectEqualStrings("\"id\", \"amount\"", try selectListFor(a, .postgres, &.{ "id", "amount" }));
+    try std.testing.expectEqualStrings("`id`", try selectListFor(a, .mysql, &.{"id"}));
 }

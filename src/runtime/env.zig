@@ -191,6 +191,9 @@ pub const SqlDesc = struct {
     cfg: DbConfig,
     base_sql: []const u8,
     table: ?[]const u8,
+    /// The read `base_sql` renders, kept so a split plan can re-render it with
+    /// its key column added when a projection left the key out.
+    read: ast.Read = .{ .connector = "", .form = .unit },
 };
 
 pub const Env = struct {

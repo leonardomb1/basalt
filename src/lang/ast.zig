@@ -145,6 +145,11 @@ pub const Read = struct {
     /// translation). Not surface syntax on `read` itself — set by the runtime
     /// from a union stage's `@[where = "..."]` hint. Empty = no predicate.
     where: []const u8 = "",
+    /// The columns a table read asks the source for, when the stages after it
+    /// provably need only these; empty = every column. Set by the runtime, not
+    /// surface syntax: a `SELECT a, b FROM conn.t` used to fetch all 300 columns
+    /// of a wide table and drop 298 of them here.
+    cols: []const []const u8 = &.{},
 };
 
 pub const ReadForm = union(enum) {

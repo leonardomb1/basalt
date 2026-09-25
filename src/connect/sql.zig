@@ -764,7 +764,7 @@ pub fn colList(arena: std.mem.Allocator, dialect: Dialect, schema: types.Schema)
     var buf = std.array_list.Managed(u8).init(arena);
     for (schema.fields, 0..) |f, i| {
         if (i > 0) try buf.append(',');
-        try buf.appendSlice(try quoteIdent(arena, dialect, f.name));
+        try writeQuoted(&buf, dialect, f.name);
     }
     return buf.toOwnedSlice();
 }
@@ -773,7 +773,7 @@ fn quoteNames(arena: std.mem.Allocator, dialect: Dialect, names: []const []const
     var buf = std.array_list.Managed(u8).init(arena);
     for (names, 0..) |n, i| {
         if (i > 0) try buf.append(',');
-        try buf.appendSlice(try quoteIdent(arena, dialect, n));
+        try writeQuoted(&buf, dialect, n);
     }
     return buf.toOwnedSlice();
 }
@@ -882,6 +882,14 @@ fn bulkEscaped(w: anytype, s: []const u8) !void {
 
 pub fn quoteIdent(arena: std.mem.Allocator, dialect: Dialect, name: []const u8) ![]const u8 {
     var buf = std.array_list.Managed(u8).init(arena);
+    try writeQuoted(&buf, dialect, name);
+    return buf.toOwnedSlice();
+}
+
+/// `quoteIdent` straight into a list — what the column-list builders use, so a
+/// sink opened on a general-purpose allocator does not leave one small
+/// allocation behind per column (a 306-column StarRocks load leaked thousands).
+fn writeQuoted(buf: *std.array_list.Managed(u8), dialect: Dialect, name: []const u8) !void {
     var it = std.mem.splitScalar(u8, name, '.');
     var first = true;
     while (it.next()) |part| {
@@ -891,7 +899,6 @@ pub fn quoteIdent(arena: std.mem.Allocator, dialect: Dialect, name: []const u8) 
         try buf.appendSlice(part);
         try buf.append(dialect.qClose());
     }
-    return buf.toOwnedSlice();
 }
 
 pub fn nameIn(names: []const []const u8, n: []const u8) bool {

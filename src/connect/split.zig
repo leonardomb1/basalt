@@ -43,6 +43,9 @@ pub const Plan = struct {
     /// Each entry is a SQL boolean expression over the key column. Wrap the base
     /// query with `wrap(base, predicates[i])` to get one lane's query.
     predicates: []const []const u8,
+    /// The base query the predicates were planned over — which may carry the key
+    /// column a projection had left out. Lanes wrap this, not the read's own.
+    base_sql: []const u8,
 };
 
 /// `SELECT * FROM (<base>) _split WHERE <pred>` — uniform whether `base` came from
@@ -183,19 +186,19 @@ pub fn plan(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []
             const b = (try intBounds(arena, prober, dialect, base, key.col)) orelse return null;
             const preds = try intRangePreds(arena, dialect, key.col, b.min, b.max, m);
             if (preds.len <= 1) return null;
-            return Plan{ .key = key, .predicates = preds };
+            return Plan{ .key = key, .predicates = preds, .base_sql = base };
         },
         .uuid => {
             if (dialect != .postgres) return null;
             if (!(try hasAnyRow(arena, prober, base))) return null;
             const preds = try uuidSpacePreds(arena, dialect, key.col, m);
-            return Plan{ .key = key, .predicates = preds };
+            return Plan{ .key = key, .predicates = preds, .base_sql = base };
         },
         .date => {
             const b = (try dateBounds(arena, prober, dialect, base, key.col)) orelse return null;
             const preds = try dateRangePreds(arena, dialect, key.col, b.min, b.max, m);
             if (preds.len <= 1) return null;
-            return Plan{ .key = key, .predicates = preds };
+            return Plan{ .key = key, .predicates = preds, .base_sql = base };
         },
     }
 }

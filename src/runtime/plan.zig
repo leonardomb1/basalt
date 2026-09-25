@@ -34,6 +34,8 @@ const dupeSchema = @import("connect.zig").dupeSchema;
 const OneBatch = @import("connect.zig").OneBatch;
 const openSource = @import("connect.zig").openSource;
 const openSourceProjected = @import("connect.zig").openSourceProjected;
+const projectSqlRead = @import("connect.zig").projectSqlRead;
+const exceptColumns = @import("connect.zig").exceptColumns;
 const sourceLabel = @import("connect.zig").sourceLabel;
 
 /// Rebuild a map-only `filter`/`select` chain against the projected source schema and
@@ -315,7 +317,10 @@ fn metaShortcut(env: *Env, stages: []const ast.Stage) anyerror!?PipeRes {
     return .{ .op = .{ .scan = scan }, .schema = out.* };
 }
 
-pub fn buildPipeline(env: *Env, stages: []const ast.Stage) anyerror!PipeRes {
+pub fn buildPipeline(env: *Env, stages_in: []const ast.Stage) anyerror!PipeRes {
+    // A CTE's or a join build side's read gets the same projection a top-level
+    // pipeline's does in `runOutput`.
+    const stages = try projectSqlRead(env, stages_in);
     if (stages.len == 0) return planErr(env.diag, "empty pipeline");
     if (try metaShortcut(env, stages)) |r| return r;
 
@@ -590,6 +595,9 @@ fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, except: []const 
 
     const children = try arena.alloc(op.Op, specs.len);
     const schemas = try arena.alloc(types.Schema, specs.len);
+    for (specs) |*s| if (except.len > 0 and s.pipeline == null) {
+        if (try exceptColumns(env, s.read, hints, except)) |cols| s.read.cols = cols;
+    };
     for (specs, 0..) |s, i| {
         // An arm that carries a pipeline is a general query — a file, a projection, an
         // aggregate — rather than the bare table the reconciliation case uses. Build it

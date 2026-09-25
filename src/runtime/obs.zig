@@ -135,11 +135,13 @@ pub const Logger = struct {
 
     pub fn log(self: *Logger, level: Level, comptime fmt: []const u8, args: anytype) void {
         if (!self.enabled(level)) return;
-        var buf: [2048]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
+        // Wide enough for a debug line carrying a 300-column SELECT; a line that
+        // still does not fit is cut, not dropped.
+        var buf: [16384]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..];
         self.mutex.lock();
         defer self.mutex.unlock();
-        var lbuf: [4096]u8 = undefined;
+        var lbuf: [17408]u8 = undefined;
         var w = std.Io.Writer.fixed(&lbuf);
         if (self.json) {
             w.print("{{\"ts\":{d},\"level\":\"{s}\",\"run_id\":{d},\"msg\":\"", .{ std.time.milliTimestamp(), level.label(), self.run_id }) catch return;

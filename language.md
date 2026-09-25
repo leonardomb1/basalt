@@ -316,6 +316,15 @@ Source clauses, in any order after the source:
   a loop-var value (`PUSHDOWN($where)`), or one built with `||`. ANDed with
   whatever the translated `WHERE` pushes down. Empty ⇒ no clause. Syntax errors
   surface at the source at runtime (permanent, exit 1).
+- **Projection pushdown** — a table read asks the source only for the columns
+  the pipeline provably needs (`SELECT a, b FROM erp.t` is sent as
+  `SELECT [a], [b] FROM t`), so a narrow read of a 300-column table no longer
+  moves 300 columns. `SELECT * EXCEPT (...)` — after a table read or a union of
+  table reads — first asks the source for the table's shape and no rows, then
+  names every column but the excepted ones, so a column nobody wants never
+  leaves the server (that 79 GB XML column stays where it is). A plain
+  `SELECT *` still fetches everything; a split-parallel read adds its key column
+  to the list.
 - **Implicit pushdown** — the contiguous `WHERE` (filter) prefix directly after
   a SQL table/query read is translated into that source query's `WHERE`
   automatically. A join no longer blocks it: a filter naming only columns the probe

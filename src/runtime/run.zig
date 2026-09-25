@@ -56,6 +56,8 @@ const openSink = @import("connect.zig").openSink;
 const openSource = @import("connect.zig").openSource;
 const openSplitSource = @import("connect.zig").openSplitSource;
 const planSplit = @import("connect.zig").planSplit;
+const projectSqlRead = @import("connect.zig").projectSqlRead;
+const exceptColumns = @import("connect.zig").exceptColumns;
 const resolveUpsertKeys = @import("connect.zig").resolveUpsertKeys;
 const sinkLabel = @import("connect.zig").sinkLabel;
 const sqlConnInfo = @import("connect.zig").sqlConnInfo;
@@ -364,8 +366,9 @@ fn runScalarLet(env: *Env, l: ast.LetConst) !void {
     env.log.log(.debug, "LET {s} = scalar query result ({s})", .{ l.name, @tagName(std.meta.activeTag(v)) });
 }
 
-pub fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     errdefer env.diag.stamp(out.pos);
+    var opts = opts_in;
     const arena = env.arena;
     const gpa = env.gpa;
     var stages = out.stages;
@@ -382,9 +385,12 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, 
     const load_t0 = std.time.milliTimestamp();
     const load_rows0 = stats.rows_out;
     var load_failed = false;
+    // A union that fans out runs one `runOutput` per branch, and those report
+    // themselves; this outer call then counts nothing, or the rows count twice.
+    var delegated = false;
     defer {
         if (moving) env.progress.?.end();
-        if (is_load) noteLoad(env, load_failed, stats.rows_out - load_rows0, @intCast(std.time.milliTimestamp() - load_t0));
+        if (is_load and !delegated) noteLoad(env, load_failed, stats.rows_out - load_rows0, @intCast(std.time.milliTimestamp() - load_t0));
     }
     errdefer load_failed = true;
 
@@ -415,6 +421,29 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, 
         stages = hoisted;
     }
 
+    // `LOAD INTO ... SPLIT BY (col) JOBS n` is written on the sink, but the split
+    // is a property of the read: carry the key to the lead's hints — a read's, or
+    // a union's, whose branches inherit them — where the planner looks, and let
+    // JOBS set this pipeline's lane count (also inside a PARALLEL FOR EACH, whose
+    // workers otherwise run single-lane: the person asked for lanes by name).
+    if (stages[0].node == .read or stages[0].node == .union_) {
+        var extra = std.array_list.Managed(ast.Hint).init(arena);
+        for (stages[stages.len - 1].hints) |h| {
+            if (std.mem.eql(u8, h.key, "split")) try extra.append(h);
+            if (std.mem.eql(u8, h.key, "jobs") and h.value == .int and h.value.int > 0) opts.threads = @intCast(h.value.int);
+        }
+        if (extra.items.len > 0) {
+            const with = try arena.dupe(ast.Stage, stages);
+            try extra.appendSlice(stages[0].hints);
+            with[0].hints = try extra.toOwnedSlice();
+            stages = with;
+        }
+    }
+
+    // Narrow a SQL table read to the columns the pipeline needs, before either
+    // path (serial or split lanes) renders its SQL from the stage.
+    stages = try projectSqlRead(env, stages);
+
     if (stages[0].node == .read) implicit: {
         const rd = stages[0].node.read;
         if (rd.form != .table and rd.form != .query) break :implicit;
@@ -435,6 +464,7 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, 
         !std.mem.eql(u8, last.write.connector, "csv") and
         unionDownstreamMapOnly(stages[1 .. stages.len - 1]))
     {
+        delegated = true;
         return runUnionSplit(env, stages[0].node.union_, stages[0].hints, stages[1 .. stages.len - 1], stages[stages.len - 1], opts, stats, lanes_used, batch_arena);
     }
 
@@ -535,7 +565,7 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, 
 
                 for (env.sources.items[src_base..]) |sc| sc.close();
                 env.sources.shrinkRetainingCapacity(src_base);
-                var ctx = SplitCtx{ .gpa = gpa, .kind = env.sql_desc.?.kind, .cfg = env.sql_desc.?.cfg, .base_sql = env.sql_desc.?.base_sql, .proj_select = proj_select, .where_extra = where_extra };
+                var ctx = SplitCtx{ .gpa = gpa, .kind = env.sql_desc.?.kind, .cfg = env.sql_desc.?.cfg, .base_sql = sp.base_sql, .proj_select = proj_select, .where_extra = where_extra };
                 lanes_used.* = @max(lanes_used.*, @min(opts.threads, sp.predicates.len));
                 env.log.log(.debug, "split-parallel: {d} splits over {d} lanes on key range (projection: {s}, filter pushdown: {s})", .{ sp.predicates.len, @min(opts.threads, sp.predicates.len), proj_select orelse "all", if (where_extra != null) "yes" else "no" });
                 if (try buildParallelSink(env, wr, schema)) |mode| {
@@ -689,13 +719,21 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
     const specs = try unionSpecs(env, u, hints);
     if (specs.len == 0) return planErr(env.diag, "union has no source tables");
 
+    const except = unionExceptNames(downstream);
     const schemas = try arena.alloc(types.Schema, specs.len);
-    for (specs, schemas) |s, *sch| {
-        const src = try openSource(env, s.read, hints);
+    for (specs, schemas) |*s, *sch| {
+        // The shape only: no rows are wanted here, and with an EXCEPT in play the
+        // branch is then asked for every column but those, by name.
+        if (except.len > 0) {
+            if (try exceptColumns(env, s.read, hints, except)) |cols| s.read.cols = cols;
+        }
+        var probe = s.read;
+        probe.where = "1 = 0";
+        const src = try openSource(env, probe, hints);
         sch.* = try dupeSchema(arena, src.schema());
         src.close();
     }
-    const canon = try unionCanon(env, specs, schemas, canon_opt, unionExceptNames(downstream));
+    const canon = try unionCanon(env, specs, schemas, canon_opt, except);
 
     var split_hints = std.array_list.Managed(ast.Hint).init(arena);
     for (hints) |h| {

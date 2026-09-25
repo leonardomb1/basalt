@@ -16,6 +16,7 @@ const TableWriter = @import("../connect/table.zig").TableWriter;
 const driver = @import("../connect/driver.zig");
 const starrocks = @import("../connect/starrocks.zig");
 const registry = @import("../connect/registry.zig");
+const projectedColumns = @import("plan.zig").projectedColumns;
 const tds = @import("../connect/tds.zig");
 const mysql = @import("../connect/mysql.zig");
 const postgres = @import("../connect/postgres.zig");
@@ -443,8 +444,10 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
     const conn = env.connections.get(rd.connector) orelse
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown connection `{s}`", .{rd.connector}));
     var rd_eff = rd;
+    // A union puts its `where` hint into each branch read already; folding the
+    // same predicate in twice sent `(p) AND (p)` to the source.
     if (forHintName(hints, "where")) |wh| {
-        if (wh.len > 0) {
+        if (wh.len > 0 and !std.mem.eql(u8, wh, rd.where)) {
             rd_eff.where = if (rd.where.len > 0)
                 try std.fmt.allocPrint(env.arena, "({s}) AND ({s})", .{ wh, rd.where })
             else
@@ -476,6 +479,7 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
     if (sqlConnInfo(conn)) |info| {
         const cfg = try resolveDbConfig(env, conn, info.port);
         const query = try readSql(env, rd_eff);
+        env.log.log(.debug, "sql read ({s}): {s}", .{ rd.connector, query });
         switch (info.kind) {
             inline else => |k| {
                 const c = SqlDriver(k).connect(env.gpa, cfg) catch |e|
@@ -616,10 +620,91 @@ fn resolveDbConfig(env: *Env, conn: ast.Connection, default_port: u16) !DbConfig
 fn readSql(env: *Env, rd: ast.Read) ![]const u8 {
     const base = switch (rd.form) {
         .query => |q| q,
-        .table => |t| try std.fmt.allocPrint(env.arena, "SELECT * FROM {s}", .{try qualStr(env.arena, t)}),
+        .table => |t| try std.fmt.allocPrint(env.arena, "SELECT {s} FROM {s}", .{ try selectList(env, rd), try qualStr(env.arena, t) }),
         else => return planErr(env.diag, "a DB read needs `table <name>` or `query \"...\"`"),
     };
     return sqlWithWhere(env.arena, base, rd.form == .query, rd.where);
+}
+
+/// `*`, or the read's projected columns quoted for the connection's dialect.
+fn selectList(env: *Env, rd: ast.Read) ![]const u8 {
+    if (rd.cols.len == 0) return "*";
+    const conn = env.connections.get(rd.connector) orelse return "*";
+    const info = sqlConnInfo(conn) orelse return "*";
+    return selectListFor(env.arena, info.dialect, rd.cols);
+}
+
+pub fn selectListFor(arena: std.mem.Allocator, dialect: sql.Dialect, cols: []const []const u8) ![]const u8 {
+    if (cols.len == 0) return "*";
+    var out = std.array_list.Managed(u8).init(arena);
+    for (cols, 0..) |c, i| {
+        if (i > 0) try out.appendSlice(", ");
+        try out.appendSlice(try sql.quoteIdent(arena, dialect, c));
+    }
+    return out.toOwnedSlice();
+}
+
+/// A read with `cols` narrowed to what the stages after it need — when that can be
+/// proven and the read is a SQL table; any other read is returned as it is. The
+/// projection is only ever a superset of what the engine reads next, so a wrong
+/// guess fails loudly at the source, never quietly.
+///
+/// `SELECT * EXCEPT (...)` is the one star the source can be spared: the table's
+/// columns are learnt with a metadata-only probe and all but the excepted ones
+/// asked for by name — a 79 GB XML column nobody wants then never leaves the
+/// server, instead of crossing the wire to be dropped here.
+pub fn projectSqlRead(env: *Env, stages: []const ast.Stage) ![]const ast.Stage {
+    if (stages.len == 0 or stages[0].node != .read) return stages;
+    const rd = stages[0].node.read;
+    if (rd.form != .table or rd.cols.len > 0) return stages;
+    const conn = env.connections.get(rd.connector) orelse return stages;
+    if (sqlConnInfo(conn) == null) return stages;
+    const cols = (try projectedColumns(env, stages[1..])) orelse blk: {
+        const except = starExcept(stages[1..]) orelse return stages;
+        break :blk (try exceptColumns(env, rd, stages[0].hints, except)) orelse return stages;
+    };
+    if (cols.len == 0) return stages;
+    for (cols) |c| if (std.mem.indexOfScalar(u8, c, '.') != null) return stages;
+    const out = try env.arena.dupe(ast.Stage, stages);
+    var nrd = rd;
+    nrd.cols = cols;
+    out[0].node = .{ .read = nrd };
+    return out;
+}
+
+/// The names a `SELECT * EXCEPT (...)` directly after the read leaves out, when
+/// that select has no other star (a plain `*` beside it would want everything).
+fn starExcept(after: []const ast.Stage) ?[]const []const u8 {
+    if (after.len == 0 or after[0].node != .select) return null;
+    var found: ?[]const []const u8 = null;
+    for (after[0].node.select) |it| switch (it) {
+        .star_except => |names| found = names,
+        .star, .star_rename => return null,
+        else => {},
+    };
+    return found;
+}
+
+/// Every column of the table `rd` reads, minus `except` — learnt from the source
+/// itself by asking for its shape and no rows. Null when the probe fails: the
+/// read then goes out as `SELECT *`, as before.
+pub fn exceptColumns(env: *Env, rd: ast.Read, hints: []const ast.Hint, except: []const []const u8) !?[]const []const u8 {
+    var probe = rd;
+    probe.where = "1 = 0";
+    probe.cols = &.{};
+    const src = openSourceProjected(env, probe, hints, null, &.{}) catch return null;
+    defer src.close();
+    const schema = src.schema();
+    var out = std.array_list.Managed([]const u8).init(env.arena);
+    for (schema.fields) |f| {
+        var drop = false;
+        for (except) |x| if (std.ascii.eqlIgnoreCase(x, f.name)) {
+            drop = true;
+        };
+        if (!drop) try out.append(try env.arena.dupe(u8, f.name));
+    }
+    if (out.items.len == 0 or out.items.len == schema.fields.len) return null;
+    return try out.toOwnedSlice();
 }
 
 /// Compose a pushed-down predicate into a read's SQL. Table reads get a plain
@@ -638,7 +723,7 @@ fn sqlDescFor(env: *Env, kind: SqlKind, dialect: sql.Dialect, cfg: DbConfig, bas
         .table => |t| try qualStr(env.arena, t),
         else => null,
     };
-    return .{ .kind = kind, .dialect = dialect, .cfg = cfg, .base_sql = base_sql, .table = table };
+    return .{ .kind = kind, .dialect = dialect, .cfg = cfg, .base_sql = base_sql, .table = table, .read = rd };
 }
 
 /// The `SqlDesc` a read stage would produce, recomputed without opening anything.
@@ -654,7 +739,7 @@ pub fn sqlDescForStage(env: *Env, stage: ast.Stage) !?SqlDesc {
     const conn = env.connections.get(rd.connector) orelse return null;
     const info = sqlConnInfo(conn) orelse return null;
     if (forHintName(stage.hints, "where")) |wh| {
-        if (wh.len > 0) {
+        if (wh.len > 0 and !std.mem.eql(u8, wh, rd.where)) {
             rd.where = if (rd.where.len > 0)
                 try std.fmt.allocPrint(env.arena, "({s}) AND ({s})", .{ wh, rd.where })
             else
@@ -711,7 +796,25 @@ pub fn planSplit(env: *Env, desc: SqlDesc, lead: ast.Stage, threads: usize, w: a
     } else {
         return null;
     }
-    return split.plan(env.arena, prober, desc.dialect, desc.base_sql, key, m);
+    // A lane's range predicate is applied over the base query, so a projection
+    // that left the key out has to take it back in.
+    var base = desc.base_sql;
+    if (desc.read.cols.len > 0) {
+        var has = false;
+        for (desc.read.cols) |c| if (std.ascii.eqlIgnoreCase(c, key.col)) {
+            has = true;
+        };
+        if (!has) {
+            var rd = desc.read;
+            const cols = try env.arena.alloc([]const u8, rd.cols.len + 1);
+            @memcpy(cols[0..rd.cols.len], rd.cols);
+            cols[rd.cols.len] = key.col;
+            rd.cols = cols;
+            base = try readSql(env, rd);
+            pctx.base_sql = base;
+        }
+    }
+    return split.plan(env.arena, prober, desc.dialect, base, key, m);
 }
 
 fn proberOpen(ctx_ptr: *anyopaque) anyerror!sql.Conn {

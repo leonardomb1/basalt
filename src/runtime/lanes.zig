@@ -1541,7 +1541,7 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
     const parts = try allocMergeParts(env.gpa);
     defer freeMergeParts(env.gpa, parts);
     var ctx = SqlAggCtx{
-        .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql },
+        .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = sp.base_sql },
         .predicates = sp.predicates,
         .proj_select = pd.proj_select,
         .where_extra = pd.where_extra,
@@ -1861,7 +1861,7 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
     // runOutput's implicit pushdown, so the WHERE half needs nothing here either.
     // Upgrade: join-aware liveness.
     var ctx = SqlMapJoinCtx{
-        .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql },
+        .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = sp.base_sql },
         .predicates = sp.predicates,
         .src_schema = src_schema,
         .prefix = shape.prefix,
