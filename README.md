@@ -77,6 +77,8 @@ $ basalt run -c "EXPLAIN <query>"         # print the plan
 $ basalt run -c "EXPLAIN ANALYZE <query>" # run it, print the plan with actuals
 $ basalt repl                             # interactive: runs on `;`, keeps
                                           # connections/functions across entries
+$ basalt kernel --format arrow            # a session for a notebook: NDJSON requests
+                                          # on stdin, framed results + status on stdout
 $ basalt serve ./endpoints --watch        # host every endpoint script in a dir
 ```
 

@@ -2,6 +2,7 @@
 //!   basalt run   <script>|-c <script> [-p k=v ...] [-j N] [--port N]
 //!   basalt check <script>|-c <script>
 //!   basalt repl
+//!   basalt kernel
 //! `run` executes (HTTP mode when the script declares an endpoint); `check`
 //! validates and plans without running. A
 //! script comes from a file path or, with `-c/--command`, inline. `repl` is an
@@ -21,6 +22,7 @@ const obs = @import("../runtime/obs.zig");
 const analyze = @import("../runtime/analyze.zig");
 const complete = @import("complete.zig");
 const http_server = @import("../server/http_server.zig");
+const kernel = @import("kernel.zig");
 
 /// SIGTERM/SIGINT → ask the run to stop at its next boundary (async-signal-safe:
 /// one atomic store). The control plane uses this to cancel a job or roll a http_server.
@@ -67,6 +69,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
         std.process.exit(try cmdRun(alloc, args));
     } else if (std.mem.eql(u8, verb, "serve")) {
         std.process.exit(try cmdServe(alloc, args));
+    } else if (std.mem.eql(u8, verb, "kernel")) {
+        std.process.exit(try kernel.cmdKernel(alloc, args));
     } else if (std.mem.eql(u8, verb, "repl")) {
         for (args[2..]) |a| if (try unknownOption(a, "repl", stderr)) std.process.exit(2);
         std.process.exit(try cmdRepl(alloc));
@@ -141,7 +145,7 @@ fn unknownOption(arg: []const u8, verb: []const u8, stderr: *std.Io.Writer) !boo
     return true;
 }
 
-fn parseLogFormat(v: []const u8) ?obs.Format {
+pub fn parseLogFormat(v: []const u8) ?obs.Format {
     if (std.mem.eql(u8, v, "text")) return .text;
     if (std.mem.eql(u8, v, "json")) return .json;
     if (std.mem.eql(u8, v, "auto")) return .auto;
@@ -547,8 +551,8 @@ fn splitStatements(arena: std.mem.Allocator, s: []const u8) ![]const []const u8 
     return out.toOwnedSlice();
 }
 
-const DeclKind = enum { connection, function, param, let, endpoint, resource };
-const DeclId = struct { kind: DeclKind, name: []const u8 };
+pub const DeclKind = enum { connection, function, param, let, endpoint, resource };
+pub const DeclId = struct { kind: DeclKind, name: []const u8 };
 
 /// Next whitespace-delimited word at `i.*`, advancing past it.
 fn nextWord(s: []const u8, i: *usize) ?[]const u8 {
@@ -613,27 +617,27 @@ fn declOf(stmt: []const u8) ?DeclId {
 /// Order-preserving (declarations may reference earlier ones); re-declaring a
 /// (kind, name) replaces the stored text in place. Text is duped with the
 /// REPL's gpa because the input buffer is reused every line.
-const DeclStore = struct {
+pub const DeclStore = struct {
     const Entry = struct { kind: DeclKind, name: []u8, text: []u8 };
 
     gpa: std.mem.Allocator,
     items: std.array_list.Managed(Entry),
 
-    fn init(gpa: std.mem.Allocator) DeclStore {
+    pub fn init(gpa: std.mem.Allocator) DeclStore {
         return .{ .gpa = gpa, .items = std.array_list.Managed(Entry).init(gpa) };
     }
-    fn deinit(self: *DeclStore) void {
+    pub fn deinit(self: *DeclStore) void {
         self.clear();
         self.items.deinit();
     }
-    fn clear(self: *DeclStore) void {
+    pub fn clear(self: *DeclStore) void {
         for (self.items.items) |e| {
             self.gpa.free(e.name);
             self.gpa.free(e.text);
         }
         self.items.clearRetainingCapacity();
     }
-    fn put(self: *DeclStore, id: DeclId, text: []const u8) !void {
+    pub fn put(self: *DeclStore, id: DeclId, text: []const u8) !void {
         const dup_text = try self.gpa.dupe(u8, text);
         errdefer self.gpa.free(dup_text);
         for (self.items.items) |*e| {
@@ -1500,16 +1504,31 @@ fn parseReplFormat(name: []const u8) ?runtime.StdoutFormat {
     return null;
 }
 
-/// Parse and run one REPL entry, reporting errors without aborting the loop.
-/// The entry is prefixed with the session's stored declarations so earlier
-/// connections/functions/params are in scope; new declarations are committed
-/// only once the combined text parses, so a typo can't poison the session.
-fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const a = arena.allocator();
+/// A declaration an entry makes, committed to the session once the entry parses.
+pub const Pending = struct { id: DeclId, text: []const u8 };
 
-    const Pending = struct { id: DeclId, text: []const u8 };
+/// An entry ready to run: the session's declarations as a prelude, the entry
+/// after them, parsed as one program.
+pub const Prepared = struct {
+    /// Prelude + entry: what the parser saw, and what diagnostics' lines count in.
+    text: []const u8,
+    /// Where the entry starts in `text`.
+    entry_at: usize,
+    prog: ast.Program,
+    pending: []const Pending,
+    /// Statements that do something beyond declaring.
+    executable: usize,
+};
+
+pub const PrepareError = error{ ParseFailed, EndpointInSession, OutOfMemory };
+
+/// Parse one entry against the session's declarations. The entry is prefixed with
+/// the stored declarations so earlier connections/functions/params are in scope;
+/// nothing is committed here — the caller commits `pending` once it has decided
+/// the entry stands, so a typo can't poison the session. On `ParseFailed`,
+/// `diag` holds the position (in `Prepared.text` lines, or the included file's),
+/// and `text_out`, when given, the prelude + entry text those lines count in.
+pub fn prepareEntry(a: std.mem.Allocator, decls: *const DeclStore, block: []const u8, diag: *include.Diag, text_out: ?*[]const u8) PrepareError!Prepared {
     var pending = std.array_list.Managed(Pending).init(a);
     var executable: usize = 0;
     for (try splitStatements(a, block)) |st| {
@@ -1517,18 +1536,14 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *s
             executable += 1;
             continue;
         };
-        if (id.kind == .endpoint) {
-            try msg.writeAll("error: CREATE ENDPOINT can't run in the REPL — put it in a script and use `basalt serve <dir>`\n");
-            try msg.flush();
-            return;
-        }
+        if (id.kind == .endpoint) return error.EndpointInSession;
         try pending.append(.{ .id = id, .text = st });
     }
 
     // Prelude + entry. A declaration this entry replaces is dropped from the
     // prelude so the combined text doesn't declare the same name twice.
     var buf = std.array_list.Managed(u8).init(a);
-    for (sess.decls.items.items) |e| {
+    for (decls.items.items) |e| {
         var shadowed = false;
         for (pending.items) |p| {
             if (p.id.kind == e.kind and std.ascii.eqlIgnoreCase(p.id.name, e.name)) shadowed = true;
@@ -1537,15 +1552,50 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *s
         try buf.appendSlice(e.text);
         try buf.appendSlice(";\n");
     }
+    const entry_at = buf.items.len;
     try buf.appendSlice(block);
     const text = buf.items;
+    if (text_out) |t| t.* = text;
 
     // An entry may open with `@include 'p.sql';` (paths relative to the cwd): the
     // file's text is parsed with the entry as one program, so its declarations are
     // in scope for the statements typed below it. They live as long as the entry —
-    // the REPL keeps no session store.
+    // the session keeps no include store.
+    const prog = include.loadProgram(a, text, "<repl>", ".", diag) catch |e| switch (e) {
+        error.ParseFailed => return error.ParseFailed,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+
+    // The entry's statements as the parser saw them. The pre-scan above only knows
+    // first words and top-level `;`s, and a statement function's body has `;`s of
+    // its own — it would be cut into a truncated declaration and stray fragments.
+    // An `@include` puts other files' positions in the program, so it keeps the
+    // pre-scan's reading.
+    if (std.mem.indexOf(u8, block, "@include") == null) {
+        const parsed = try entryStatements(a, text, entry_at, prog);
+        pending.clearRetainingCapacity();
+        executable = 0;
+        for (parsed) |p| {
+            if (p.id) |id| try pending.append(.{ .id = id, .text = p.text }) else executable += 1;
+        }
+    }
+    return .{ .text = text, .entry_at = entry_at, .prog = prog, .pending = pending.items, .executable = executable };
+}
+
+/// Parse and run one REPL entry, reporting errors without aborting the loop.
+fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
     var diag: include.Diag = .{};
-    const prog = include.loadProgram(a, text, "<repl>", ".", &diag) catch |e| switch (e) {
+    var text: []const u8 = block;
+    const entry = prepareEntry(a, &sess.decls, block, &diag, &text) catch |e| switch (e) {
+        error.EndpointInSession => {
+            try msg.writeAll("error: CREATE ENDPOINT can't run in the REPL — put it in a script and use `basalt serve <dir>`\n");
+            try msg.flush();
+            return;
+        },
         error.ParseFailed => {
             if (diag.label.len > 0 and !std.mem.eql(u8, diag.label, "<repl>"))
                 try msg.print("error: {s}:{d}:{d}: {s}\n", .{ diag.label, diag.parse.line, diag.parse.col, diag.parse.msg })
@@ -1555,27 +1605,15 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *s
             try msg.flush();
             return;
         },
-        error.OutOfMemory => return e,
+        error.OutOfMemory => return error.OutOfMemory,
     };
+    const prog = entry.prog;
+    const pending = entry.pending;
 
-    // The entry's statements as the parser saw them. The pre-scan above only knows
-    // first words and top-level `;`s, and a statement function's body has `;`s of
-    // its own — it would be cut into a truncated declaration and stray fragments.
-    // An `@include` puts other files' positions in the program, so it keeps the
-    // pre-scan's reading.
-    if (std.mem.indexOf(u8, block, "@include") == null) {
-        const parsed = try entryStatements(a, text, text.len - block.len, prog);
-        pending.clearRetainingCapacity();
-        executable = 0;
-        for (parsed) |p| {
-            if (p.id) |id| try pending.append(.{ .id = id, .text = p.text }) else executable += 1;
-        }
-    }
+    for (pending) |p| try sess.decls.put(p.id, p.text);
 
-    for (pending.items) |p| try sess.decls.put(p.id, p.text);
-
-    if (executable == 0) {
-        if (sess.announce) for (pending.items) |p| try msg.print("ok: {s} {s}\n", .{ @tagName(p.id.kind), p.id.name });
+    if (entry.executable == 0) {
+        if (sess.announce) for (pending) |p| try msg.print("ok: {s} {s}\n", .{ @tagName(p.id.kind), p.id.name });
         try msg.flush();
         return;
     }
@@ -1630,7 +1668,7 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *s
 
 /// Append a `write stdout` table sink to any output pipeline that doesn't already
 /// end in a `write`, so REPL entries show their results.
-fn appendDisplaySinks(arena: std.mem.Allocator, prog: ast.Program) !ast.Program {
+pub fn appendDisplaySinks(arena: std.mem.Allocator, prog: ast.Program) !ast.Program {
     const stmts = try arena.alloc(ast.Stmt, prog.stmts.len);
     for (prog.stmts, 0..) |st, i| {
         stmts[i] = st;
@@ -1931,6 +1969,9 @@ fn usage(w: anytype) !void {
         \\  basalt check <script>|-|-c <script>
         \\               parse and validate without running; `EXPLAIN` prints the plan
         \\  basalt repl  interactive read-eval-print loop
+        \\  basalt kernel [--format FMT] [-j N]
+        \\               a session for a notebook: NDJSON requests on stdin, framed
+        \\               results and a JSON status per script on stdout
         \\  basalt version  print the version and exit
         \\  basalt help  show this help
         \\

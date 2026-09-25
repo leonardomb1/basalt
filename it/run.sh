@@ -7,14 +7,15 @@
 #   ./it/run.sh mysql postgres  several
 #   KEEP=1 ./it/run.sh azure    leave the stack up afterwards
 #
-# Suite names: mysql postgres sqlserver starrocks azure parquet s3 arrow stdout
-# (arrow needs `uv`: it reads the stream back with pyarrow; stdout needs nothing)
+# Suite names: mysql postgres sqlserver starrocks azure parquet s3 arrow stdout kernel
+# (arrow needs `uv`: it reads the stream back with pyarrow; stdout needs nothing;
+# kernel needs python3)
 # Scripts are Basalt SQL (the BSL parser was removed in v0.2.0); connection
 # attrs are passed as `OPTIONS(...)` bodies.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ALL_SUITES="mysql postgres sqlserver starrocks azure parquet s3 arrow stdout"
+ALL_SUITES="mysql postgres sqlserver starrocks azure parquet s3 arrow stdout kernel"
 DEFAULT_SUITES="$ALL_SUITES"
 SUITES="${*:-$DEFAULT_SUITES}"
 
@@ -872,6 +873,20 @@ if runs stdout; then
     report "stdout: an unknown --format is refused" ok
   else
     report "stdout: an unknown --format is refused" bad
+  fi
+fi
+
+# `basalt kernel`: the session protocol a notebook drives. The driver speaks it
+# over pipes to the real binary and prints its own PASS/FAIL lines.
+if runs kernel; then
+  if ! command -v python3 >/dev/null; then
+    report "kernel (python3 not installed, skipped)" bad
+  else
+    python3 it/kernel.py "$B" >"$out/kernel.log" 2>&1 || true
+    grep -E '^(PASS|FAIL) ' "$out/kernel.log" || tail -20 "$out/kernel.log"
+    pass=$((pass + $(grep -c '^PASS ' "$out/kernel.log" || true)))
+    fail=$((fail + $(grep -c '^FAIL ' "$out/kernel.log" || true)))
+    grep -q '^==> kernel:' "$out/kernel.log" || { report "kernel (driver crashed)" bad; tail -20 "$out/kernel.log"; }
   fi
 fi
 

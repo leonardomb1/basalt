@@ -1069,6 +1069,7 @@ same query costs at full parallelism.
 basalt run   <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json|csv|tsv|arrow]
 basalt serve <dir> [--port N] [--watch]
 basalt check <script>|-|-c "<inline>"
+basalt kernel [--format table|json|csv|tsv|arrow] [-j threads]
 ```
 
 `--format json` makes stdout machine-readable: a terminal `SELECT` emits one
@@ -1199,6 +1200,55 @@ none), `^X` cuts, `^V` pastes, `^Z`/`^Y` undo and redo. A paste is inserted as
 text, never run line by line, and a copy reaches the system clipboard where the
 terminal supports OSC 52. Two things a terminal cannot deliver: the mouse, and
 Ctrl+Enter, which arrives as plain Enter.
+
+### `basalt kernel` — a session for a notebook or editor
+
+`basalt kernel` keeps one session alive for a program to drive, the way `repl`
+keeps one for a person. Each script it runs sees every `CREATE CONNECTION`,
+`CREATE FUNCTION`, `CREATE RESOURCE`, `PARAM` and `LET` an earlier script
+declared: they are kept as text and replayed ahead of the next script, so a
+script behaves exactly as it would in one file below them all, and re-declaring
+a name replaces it. A `WITH` belongs to its query and is not kept — two scripts
+may reuse a CTE name. A query `LET` (`LET x = (SELECT ...)`) re-runs its query
+in each later script, since only its text is kept.
+
+Requests are NDJSON on stdin, one object per line:
+
+```
+{"op":"run","id":"c1","script":"SELECT ...;","params":{"days":7},"format":"arrow"}
+{"op":"cancel","id":"c1"}     stop the running script; the session survives
+{"op":"reset"}                forget every declaration
+{"op":"close"}                exit 0 (as does EOF)
+```
+
+`params` binds the script's `PARAM`s for that script only, as `-p` does for a
+run; `format` overrides `--format` (default `arrow`) for that script. A `cancel`
+acts at once, even mid-script; one naming a different `id` than the running
+script's is ignored, and one without an `id` stops whatever runs. SIGINT
+cancels the running script too — however many times it is sent, it never ends
+the process.
+
+Replies are frames on stdout, each a JSON header line. A `data` header is
+followed by exactly `len` raw bytes: what the script wrote to stdout — its
+results in `format`, in order, possibly over several frames. Exactly one
+`status` closes each request, and nothing for that request follows it:
+
+```
+{"type":"data","id":"c1","len":1184}
+<1184 bytes>
+{"type":"status","id":"c1","ok":true,"cancelled":false,"elapsed_ms":42,"declared":[{"kind":"param","name":"days"}]}
+{"type":"status","id":"c2","ok":false,"cancelled":false,"elapsed_ms":3,"declared":[],
+ "error":{"msg":"unknown field `nope`","file":"script","line":3,"col":8,"transient":false}}
+```
+
+`declared` lists what the script added to the session — a script's
+declarations join the session once it parses, whether or not it then runs
+cleanly. An error's `line`/`col` count in the script as sent; `file` is
+`script`, an `@include`d file's path, or `session` when the fault lies in a
+declaration an earlier script made. `transient` is the exit-`75` class below.
+Results written before a failing statement are still delivered. Logs and
+`PRINT` stay on stderr (`--log-level`, `--log-format`), and the per-run summary
+is left out — the status carries it.
 
 | code | meaning |
 |------|---------|
