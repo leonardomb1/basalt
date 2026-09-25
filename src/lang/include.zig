@@ -143,8 +143,14 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base_dir: []const u8) Er
     const has_body = incs.items.len == 0 or std.mem.trim(u8, rest, " \t\r\n").len > 0;
     var main: ?ast.Program = null;
     if (has_body) {
+        // The includer sees the connections its includes declared, as it would
+        // had they been written above it in one file.
+        var known = std.array_list.Managed(ast.Connection).init(ctx.arena);
+        for (subs.items) |sp| for (stmtsOf(sp)) |st| {
+            if (st == .connection) try known.append(st.connection);
+        };
         var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        main = parser.parseSource(ctx.arena, rest, &pdiag) catch |e| switch (e) {
+        main = parser.parseSourceWith(ctx.arena, rest, &pdiag, known.items) catch |e| switch (e) {
             error.OutOfMemory => return e,
             error.ParseFailed => {
                 ctx.diag.* = .{ .parse = pdiag, .label = label };

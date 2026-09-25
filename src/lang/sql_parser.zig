@@ -31,11 +31,19 @@ pub const Error = error{ ParseFailed, OutOfMemory };
 
 /// Tokenize and parse a whole Basalt SQL program.
 pub fn parseSource(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic) Error!ast.Program {
+    return parseSourceWith(arena, src, diag, &.{});
+}
+
+/// `parseSource` for a file that follows others — an includer after its
+/// `@include`s: `known` are the connections those declared, so a `conn.QUERY(...)`
+/// or `EACH TABLE OF (conn...)` here resolves as it would in one file.
+pub fn parseSourceWith(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic, known: []const ast.Connection) Error!ast.Program {
     const toks = lexer.tokenize(arena, src) catch return error.OutOfMemory;
     var p = Parser{ .arena = arena, .toks = toks, .diag = diag };
     for (toks) |t| {
         if (t.tag == .invalid) return p.fail(.{ .line = t.line, .col = t.col }, "invalid token `{s}`", .{t.text});
     }
+    p.known_conns = known;
     return p.parseProgram();
 }
 
@@ -239,6 +247,8 @@ pub const Parser = struct {
     diag: *Diagnostic,
 
     endpoint: ?ast.KindDecl = null,
+    /// Connections declared by files parsed before this one (`@include`).
+    known_conns: []const ast.Connection = &.{},
     conn_names: std.array_list.Managed([]const u8) = undefined,
     /// Parallel to `conn_names`: each connection's connector type, which `SHOW
     /// TABLES` needs to phrase its catalog query.
@@ -405,6 +415,10 @@ pub const Parser = struct {
     pub fn parseProgram(self: *Parser) Error!ast.Program {
         self.conn_names = std.array_list.Managed([]const u8).init(self.arena);
         self.conn_types = std.array_list.Managed([]const u8).init(self.arena);
+        for (self.known_conns) |c| {
+            try self.conn_names.append(c.name);
+            try self.conn_types.append(c.connector);
+        }
         self.resources = std.array_list.Managed(Resource).init(self.arena);
         self.let_names = std.array_list.Managed([]const u8).init(self.arena);
         self.pending_bindings = std.array_list.Managed(ast.Stmt).init(self.arena);
