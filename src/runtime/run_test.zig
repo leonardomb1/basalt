@@ -3316,3 +3316,25 @@ test "LogicalType-only parquet timestamps and times read back as wall-clock valu
         out,
     );
 }
+
+test "a parquet LIST column unnests through JSON_EACH, one row per element" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "l.parquet", .data = @embedFile("../connect/testdata/lists_v2.parquet") });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    // an empty or null list gives no rows; a null element is a null row
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "LOAD INTO '{s}' AS SELECT id, x FROM '{s}/l.parquet' CROSS JOIN UNNEST(JSON_EACH(xs)) AS x ORDER BY id;",
+        .{ out_path, base },
+    );
+    defer alloc.free(script);
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id,x\n1,1\n1,2\n4,\n4,5\n", out);
+}

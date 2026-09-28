@@ -3,9 +3,11 @@
 //! A decompressed page is still encoded. This module turns those bytes into
 //! `Value`s and builds a basalt `Column` from them.
 //!
-//! Scope is flat schemas — every column a leaf, `max_rep_level == 0`. Nested
-//! lists and structs are rejected by name rather than silently flattened, since
-//! basalt's type system cannot represent them anyway.
+//! A struct's fields read as flat dotted columns (`addr.city`). A list of
+//! scalars — any depth, so a list of lists too — reads as one `string` column
+//! of JSON arrays named for the list, assembled from repetition and definition
+//! levels, which `JSON_EACH` and `json_get` take apart. A list whose elements
+//! are structs or maps spreads over several leaves and is left out, by name.
 //!
 //! Encodings handled: PLAIN, and the RLE/bit-packed hybrid used for both
 //! definition levels and dictionary indices (`PLAIN_DICTIONARY` and
@@ -628,13 +630,33 @@ pub const Leaf = struct {
     name: []const u8,
     max_def: u32,
     max_rep: u32,
+    /// Set for a leaf under a repeated group: a list element, read as JSON text
+    /// of the whole list, and `name` is then the list's own (`tags`, not
+    /// `tags.list.element`).
+    list: ?ListShape = null,
 
-    /// A leaf under a repeated group is a list element: many values per row,
-    /// which basalt has no column type for.
+    /// A leaf under a repeated group is a list element: many values per row.
     pub fn isRepeated(self: Leaf) bool {
         return self.max_rep > 0;
     }
 };
+
+/// How a list leaf's levels nest: for each repeated ancestor, outermost first,
+/// the definition level at which it holds an element. One level below that,
+/// the list at that depth exists but is empty; below the outermost one's, the
+/// whole column is null for the row.
+pub const ListShape = struct {
+    rep_def: []const u32,
+};
+
+const PathNode = struct { name: []const u8, def: u32, repeated: bool, list_group: bool };
+
+/// `LIST` / `MAP` annotations on a group, as the legacy converted type or the
+/// logical type carries them.
+fn isListGroup(e: parquet.SchemaElement) bool {
+    if (e.converted_type) |c| if (c == 1 or c == 2 or c == 3) return true;
+    return false;
+}
 
 /// Walks the depth-first schema list, resolving each leaf's definition and
 /// repetition levels from its ancestors.
@@ -644,11 +666,12 @@ pub const Leaf = struct {
 /// file because one column is a list would make most real lake files unopenable.
 pub fn collectLeaves(arena: std.mem.Allocator, schema: []const parquet.SchemaElement) Error![]Leaf {
     var out = std.array_list.Managed(Leaf).init(arena);
+    var path = std.array_list.Managed(PathNode).init(arena);
     var pos: usize = 1; // element 0 is the synthetic root
     var chunk: usize = 0;
     const root_children: usize = @intCast(@max(0, schema[0].num_children));
     for (0..root_children) |_| {
-        try walkNode(arena, schema, &pos, &chunk, &out, "", 0, 0);
+        try walkNode(arena, schema, &pos, &chunk, &out, &path, 0, 0);
     }
     return out.toOwnedSlice();
 }
@@ -659,11 +682,13 @@ fn walkNode(
     pos: *usize,
     chunk: *usize,
     out: *std.array_list.Managed(Leaf),
-    prefix: []const u8,
+    path: *std.array_list.Managed(PathNode),
     def: u32,
     rep: u32,
 ) Error!void {
     if (pos.* >= schema.len) return Error.UnsupportedParquetSchema;
+    // the schema is the file's to describe; a hostile one must not recurse forever
+    if (path.items.len >= 64) return Error.UnsupportedParquetSchema;
     const e = schema[pos.*];
     const idx = pos.*;
     pos.* += 1;
@@ -671,24 +696,50 @@ fn walkNode(
     const r = e.repetition orelse .required;
     const d2 = def + @as(u32, if (r == .required) 0 else 1);
     const r2 = rep + @as(u32, if (r == .repeated) 1 else 0);
-    const name = if (prefix.len == 0)
-        try arena.dupe(u8, e.name)
-    else
-        try std.fmt.allocPrint(arena, "{s}.{s}", .{ prefix, e.name });
+    try path.append(.{ .name = e.name, .def = d2, .repeated = r == .repeated, .list_group = !e.isLeaf() and isListGroup(e) });
+    defer _ = path.pop();
 
     if (e.isLeaf()) {
-        try out.append(.{
+        var leaf = Leaf{
             .schema_idx = idx,
             .chunk_idx = chunk.*,
-            .name = name,
+            .name = try joinPath(arena, path.items),
             .max_def = d2,
             .max_rep = r2,
-        });
+        };
+        if (r2 > 0) {
+            // The list is named where it starts: at a LIST/MAP-annotated group
+            // wrapping the first repeated node (the three-level layout every
+            // modern writer uses), else at that repeated node itself (the
+            // legacy two-level one, `repeated int32 xs`).
+            var first: usize = 0;
+            while (!path.items[first].repeated) first += 1;
+            const root = if (first > 0 and path.items[first - 1].list_group) first - 1 else first;
+            leaf.name = try joinPath(arena, path.items[0 .. root + 1]);
+            const rep_def = try arena.alloc(u32, r2);
+            var k: usize = 0;
+            for (path.items) |pn| if (pn.repeated) {
+                rep_def[k] = pn.def;
+                k += 1;
+            };
+            leaf.list = .{ .rep_def = rep_def };
+        }
+        try out.append(leaf);
         chunk.* += 1;
         return;
     }
     const n: usize = @intCast(@max(0, e.num_children));
-    for (0..n) |_| try walkNode(arena, schema, pos, chunk, out, name, d2, r2);
+    for (0..n) |_| try walkNode(arena, schema, pos, chunk, out, path, d2, r2);
+}
+
+/// `a.b.c` from the names along a path.
+fn joinPath(arena: std.mem.Allocator, nodes: []const PathNode) ![]const u8 {
+    var buf = std.array_list.Managed(u8).init(arena);
+    for (nodes, 0..) |pn, i| {
+        if (i > 0) try buf.append('.');
+        try buf.appendSlice(pn.name);
+    }
+    return buf.toOwnedSlice();
 }
 
 /// Decodes one column chunk into a `Column`.
@@ -708,15 +759,40 @@ pub fn readColumnChunk(
     /// slice that already starts at the chunk, as the ranged reader does.
     base_offset: u64,
 ) (Error || parquet.Error || @import("codec.zig").Error)!column.Column {
+    return readColumnChunkLevels(arena, file_bytes, meta, elem, rows, max_def, 0, null, base_offset);
+}
+
+/// `readColumnChunk` for any leaf, a list element included: with `list` set, the
+/// chunk's entries — one per level pair, not one per row — are assembled into a
+/// JSON array per row.
+pub fn readColumnChunkLevels(
+    arena: std.mem.Allocator,
+    file_bytes: []const u8,
+    meta: parquet.ColumnMetaData,
+    elem: parquet.SchemaElement,
+    rows: usize,
+    max_def: u32,
+    max_rep: u32,
+    list: ?ListShape,
+    base_offset: u64,
+) (Error || parquet.Error || @import("codec.zig").Error)!column.Column {
     const ty = (try basaltType(elem)).asNullable();
     const tscale = temporalScale(elem);
 
-    var b = try column.Builder.initCapacity(arena, ty, rows);
+    // A list's pages count level entries: several per row, or one for an empty
+    // or null list. The chunk's total says when they are all in.
+    const entries = if (list != null) std.math.cast(usize, meta.num_values) orelse return Error.CorruptParquetPage else rows;
+    var levels: ?Levels = if (list != null) .{
+        .reps = std.array_list.Managed(u32).init(arena),
+        .defs = std.array_list.Managed(u32).init(arena),
+    } else null;
+
+    var b = try column.Builder.initCapacity(arena, ty, entries);
     var dict: ?[]Value = null;
     var offset: usize = @intCast(@as(u64, @intCast(meta.startOffset())) - base_offset);
     var produced: usize = 0;
 
-    while (produced < rows) {
+    while (produced < entries) {
         if (offset >= file_bytes.len) return Error.CorruptParquetPage;
         const pg = try parquet.readPage(arena, file_bytes, offset, meta.compression);
         offset = pg.next_offset;
@@ -731,13 +807,122 @@ pub fn readColumnChunk(
                 dict = vals;
             },
             .data_page, .data_page_v2 => {
-                produced += try appendDataPage(arena, &b, pg, meta, elem, ty, max_def, dict, tscale);
+                produced += try appendDataPage(arena, &b, pg, meta, elem, ty, max_def, dict, tscale, max_rep, if (levels) |*l| l else null);
             },
             .index_page => {}, // not data; skip
             else => return Error.CorruptParquetPage,
         }
     }
-    return b.finish();
+    const col = try b.finish();
+    if (list) |shape| return assembleLists(arena, col, levels.?.reps.items, levels.?.defs.items, max_def, shape, rows);
+    return col;
+}
+
+/// Every entry's repetition and definition level, for a list chunk.
+const Levels = struct {
+    reps: std.array_list.Managed(u32),
+    defs: std.array_list.Managed(u32),
+};
+
+/// Rows of JSON arrays from a list leaf's entries: `elems` holds one value per
+/// entry (null where the entry's level is below `max_def`), `reps` and `defs`
+/// its levels. A repetition level of 0 starts a row; `r > 0` is a new element
+/// of the list at depth `r`. Below that depth, each level's definition
+/// threshold decides whether it holds an element, is an empty list, or — the
+/// outermost only, or an element that is itself a list — is null.
+fn assembleLists(
+    arena: std.mem.Allocator,
+    elems: column.Column,
+    reps: []const u32,
+    defs: []const u32,
+    max_def: u32,
+    shape: ListShape,
+    rows: usize,
+) Error!column.Column {
+    if (reps.len != defs.len or reps.len != elems.len) return Error.CorruptParquetPage;
+    const depth = shape.rep_def.len;
+    var out = try column.Builder.initCapacity(arena, types.Type.init(.string).asNullable(), rows);
+    var buf = std.array_list.Managed(u8).init(arena);
+    var open: usize = 0; // arrays open in the current row
+    var in_row = false;
+    var row_null = false;
+    var done: usize = 0;
+
+    for (reps, defs, 0..) |r, d, i| {
+        if (r > depth or d > max_def) return Error.CorruptParquetPage;
+        if (r == 0) {
+            if (in_row) {
+                try finishRow(&out, &buf, &open, row_null);
+                done += 1;
+            }
+            in_row = true;
+            row_null = false;
+            // below the outermost repeated node's own level, the list is null
+            if (d + 1 < shape.rep_def[0]) {
+                row_null = true;
+                continue;
+            }
+            try buf.append('[');
+            open = 1;
+        } else {
+            // a repeated entry is an element of the list at depth `r`, so that
+            // list holds one; a level saying otherwise is a corrupt page
+            if (!in_row or row_null or r > open or d < shape.rep_def[r - 1]) return Error.CorruptParquetPage;
+            while (open > r) : (open -= 1) try buf.append(']');
+            try buf.append(',');
+        }
+        // descend from depth `open` as far as this entry's level reaches
+        var lvl = open;
+        while (true) {
+            // no element at this depth: the list here is empty
+            if (d < shape.rep_def[lvl - 1]) break;
+            if (lvl == depth) {
+                try jsonValue(arena, &buf, if (d < max_def) .null else elems.getValue(i));
+                break;
+            }
+            // the element is itself a list: null, or opened one level down
+            if (d + 1 < shape.rep_def[lvl]) {
+                try buf.appendSlice("null");
+                break;
+            }
+            try buf.append('[');
+            lvl += 1;
+            open = lvl;
+        }
+    }
+    if (in_row) {
+        try finishRow(&out, &buf, &open, row_null);
+        done += 1;
+    }
+    if (done != rows) return Error.CorruptParquetPage;
+    return out.finish();
+}
+
+fn finishRow(out: *column.Builder, buf: *std.array_list.Managed(u8), open: *usize, row_null: bool) Error!void {
+    if (row_null) {
+        try out.append(.null);
+    } else {
+        while (open.* > 0) : (open.* -= 1) try buf.append(']');
+        try out.append(.{ .string = buf.items });
+    }
+    buf.clearRetainingCapacity();
+}
+
+/// One list element as JSON: numbers and booleans bare, decimals as their exact
+/// digits, text and temporal values quoted as their SQL text.
+fn jsonValue(arena: std.mem.Allocator, buf: *std.array_list.Managed(u8), v: Value) Error!void {
+    switch (v) {
+        .null => try buf.appendSlice("null"),
+        .int => |x| try buf.writer().print("{d}", .{x}),
+        .bool => |x| try buf.appendSlice(if (x) "true" else "false"),
+        .float => |x| if (std.math.isFinite(x)) try buf.writer().print("{d}", .{x}) else try buf.appendSlice("null"),
+        .decimal => try buf.appendSlice(eval.valueToString(arena, v) catch return error.OutOfMemory),
+        else => {
+            var aw = std.Io.Writer.Allocating.init(arena);
+            std.json.Stringify.encodeJsonString(eval.valueToString(arena, v) catch return error.OutOfMemory, .{}, &aw.writer) catch return error.OutOfMemory;
+            try buf.appendSlice(aw.written());
+        },
+    }
 }
 
 /// Splits a data page into levels and values, then emits rows.
@@ -755,29 +940,48 @@ fn appendDataPage(
     max_def: u32,
     dict: ?[]Value,
     tscale: TemporalScale,
+    max_rep: u32,
+    /// A list leaf's levels, appended entry by entry; null for a flat column.
+    levels: ?*Levels,
 ) Error!usize {
     // A negative count is not a count; @intCast on it is undefined in release.
     const n = std.math.cast(usize, pg.header.num_values) orelse return Error.CorruptParquetPage;
     var body = pg.data;
 
+    var reps: ?[]u32 = null;
     var defs: ?[]u32 = null;
     if (pg.header.ty == .data_page_v2) {
-        // repetition levels come first and are ignored: repeated columns are
-        // filtered out before a chunk is ever read
-        if (pg.header.rep_levels_len > body.len) return Error.CorruptParquetPage;
-        body = body[pg.header.rep_levels_len..];
+        // v2 keeps both level sections, unprefixed, ahead of the values
+        const rl = pg.header.rep_levels_len;
+        if (rl > body.len) return Error.CorruptParquetPage;
+        if (max_rep > 0 and rl > 0) reps = try decodeRleHybrid(arena, body[0..rl], bitWidth(max_rep), n);
+        body = body[rl..];
         const dl = pg.header.def_levels_len;
         if (dl > body.len) return Error.CorruptParquetPage;
         if (max_def > 0 and dl > 0) {
             defs = try decodeRleHybrid(arena, body[0..dl], bitWidth(max_def), n);
         }
         body = body[dl..];
-    } else if (max_def > 0) {
-        if (body.len < 4) return Error.CorruptParquetPage;
-        const len: usize = std.mem.readInt(u32, body[0..4], .little);
-        if (4 + len > body.len) return Error.CorruptParquetPage;
-        defs = try decodeRleHybrid(arena, body[4..][0..len], bitWidth(max_def), n);
-        body = body[4 + len ..];
+    } else {
+        // v1: repetition levels, then definition levels, each length-prefixed
+        if (max_rep > 0) {
+            if (body.len < 4) return Error.CorruptParquetPage;
+            const len: usize = std.mem.readInt(u32, body[0..4], .little);
+            if (4 + len > body.len) return Error.CorruptParquetPage;
+            reps = try decodeRleHybrid(arena, body[4..][0..len], bitWidth(max_rep), n);
+            body = body[4 + len ..];
+        }
+        if (max_def > 0) {
+            if (body.len < 4) return Error.CorruptParquetPage;
+            const len: usize = std.mem.readInt(u32, body[0..4], .little);
+            if (4 + len > body.len) return Error.CorruptParquetPage;
+            defs = try decodeRleHybrid(arena, body[4..][0..len], bitWidth(max_def), n);
+            body = body[4 + len ..];
+        }
+    }
+    if (levels) |lv| {
+        if (reps) |r| try lv.reps.appendSlice(r) else try lv.reps.appendNTimes(0, n);
+        if (defs) |d| try lv.defs.appendSlice(d) else try lv.defs.appendNTimes(max_def, n);
     }
 
     // how many values are actually stored: nulls occupy a level but no value
@@ -1216,11 +1420,24 @@ pub fn fileMinMax(rdr: *const Reader, name: []const u8) ?MinMax {
     return .{ .min = lo orelse return null, .max = hi orelse return null };
 }
 
+/// The leaf a statistics question is about. A list column is never one: its
+/// chunk statistics describe the elements, not the JSON text the column holds,
+/// so a bound on it proves nothing and must keep every group.
 fn findLeaf(leaves: []const Leaf, name: []const u8) ?Leaf {
     for (leaves) |lf| {
-        if (std.mem.eql(u8, lf.name, name)) return lf;
+        if (std.mem.eql(u8, lf.name, name)) return if (lf.list != null) null else lf;
     }
     return null;
+}
+
+/// The column type a kept leaf reads as: its own, or JSON text for a list.
+pub fn leafType(e: parquet.SchemaElement, lf: Leaf) Error!types.Type {
+    if (lf.list != null) {
+        // the element must still be a type basalt reads
+        _ = try basaltType(e);
+        return types.Type.init(.string).asNullable();
+    }
+    return (try basaltType(e)).asNullable();
 }
 
 /// Decodes one PLAIN-encoded statistics blob into a comparable `Value`.
@@ -1609,17 +1826,14 @@ pub const Reader = struct {
         var footer_start: u64 = 0;
         const md = try parseFooterOf(arena, src, &footer_start);
 
-        // Struct fields read fine as flat dotted columns; only list elements
-        // (repeated) have no representation, so those alone are skipped.
+        // Struct fields read as flat dotted columns, and a list of scalars as one
+        // JSON column. A list whose elements span several leaves — a list of
+        // structs, a map — has no single column to be, so it alone is skipped.
         const all = try collectLeaves(arena, md.schema);
         var keep = std.array_list.Managed(Leaf).init(arena);
         var skipped = std.array_list.Managed([]const u8).init(arena);
         var fields = std.array_list.Managed(types.Schema.Field).init(arena);
-        for (all) |lf| {
-            if (lf.isRepeated()) {
-                try skipped.append(lf.name);
-                continue;
-            }
+        for (all, 0..) |lf, li| {
             if (want) |names| {
                 var hit = false;
                 for (names) |n| {
@@ -1630,11 +1844,20 @@ pub const Reader = struct {
                 }
                 if (!hit) continue;
             }
+            if (lf.isRepeated()) {
+                var shared = false;
+                for (all, 0..) |other, oi| {
+                    if (oi != li and other.isRepeated() and std.mem.eql(u8, other.name, lf.name)) shared = true;
+                }
+                if (shared) {
+                    for (skipped.items) |s| {
+                        if (std.mem.eql(u8, s, lf.name)) break;
+                    } else try skipped.append(lf.name);
+                    continue;
+                }
+            }
             try keep.append(lf);
-            try fields.append(.{
-                .name = lf.name,
-                .ty = (try basaltType(md.schema[lf.schema_idx])).asNullable(),
-            });
+            try fields.append(.{ .name = lf.name, .ty = try leafType(md.schema[lf.schema_idx], lf) });
         }
         // An empty projection (COUNT(*)) still needs batches with a row count,
         // so the narrowest column is kept rather than none.
@@ -1698,13 +1921,15 @@ pub const Reader = struct {
                 const end = chunkEnd(self.boundaries, start);
                 if (end <= start) return Error.CorruptParquetPage;
                 const chunk = try self.src.range(arena, start, @intCast(end - start));
-                cols[ci] = try readColumnChunk(
+                cols[ci] = try readColumnChunkLevels(
                     arena,
                     chunk,
                     meta,
                     self.md.schema[lf.schema_idx],
                     rows,
                     lf.max_def,
+                    lf.max_rep,
+                    lf.list,
                     start,
                 );
             }
@@ -1957,9 +2182,11 @@ test "schema walk resolves levels and dotted names for nested groups" {
     try testing.expectEqualStrings("addr.zip", leaves[2].name);
     try testing.expectEqual(@as(u32, 1), leaves[2].max_def);
 
-    // the list element is repeated, so it is reported and then skipped
-    try testing.expectEqualStrings("tags.element", leaves[3].name);
+    // the list element is repeated: named for the list it makes, with the
+    // definition level at which the (two-level, legacy) list holds an element
+    try testing.expectEqualStrings("tags", leaves[3].name);
     try testing.expect(leaves[3].isRepeated());
+    try testing.expectEqualSlices(u32, &.{1}, leaves[3].list.?.rep_def);
 
     // chunk indices count every leaf, including the skipped one
     try testing.expectEqual(@as(usize, 3), leaves[3].chunk_idx);
@@ -2454,4 +2681,110 @@ test "decodeDeltaBinaryPacked: a miniblock width above 64 is a corrupt page" {
         Error.CorruptParquetPage,
         decodeDeltaBinaryPacked(fba.allocator(), &page, 2),
     );
+}
+
+fn listColumn(a: std.mem.Allocator, vals: []const Value) !column.Column {
+    var b = column.Builder.init(a, types.Type.init(.int).asNullable());
+    for (vals) |v| try b.append(v);
+    return b.finish();
+}
+
+test "assembleLists: null, empty, a null element, and nested lists from levels" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // optional group xs (LIST) { repeated group list { optional int64 element } }
+    // defs: 0 = xs null, 1 = empty, 2 = null element, 3 = value
+    const flat = ListShape{ .rep_def = &.{2} };
+    const vals = [_]Value{ .{ .int = 1 }, .{ .int = 2 }, .null, .null, .null, .{ .int = 5 } };
+    const reps = [_]u32{ 0, 1, 0, 0, 0, 1 };
+    const defs = [_]u32{ 3, 3, 1, 0, 2, 3 };
+    const got = try assembleLists(a, try listColumn(a, &vals), &reps, &defs, 3, flat, 4);
+    try testing.expectEqualStrings("[1,2]", got.getValue(0).string);
+    try testing.expectEqualStrings("[]", got.getValue(1).string);
+    try testing.expect(got.getValue(2) == .null);
+    try testing.expectEqualStrings("[null,5]", got.getValue(3).string);
+
+    // list<list<int>>, both levels optional: rep_def = {2, 4}, max_def = 5
+    const nested = ListShape{ .rep_def = &.{ 2, 4 } };
+    const nvals = [_]Value{ .{ .int = 1 }, .{ .int = 2 }, .{ .int = 3 }, .null, .null, .{ .int = 4 } };
+    const nreps = [_]u32{ 0, 1, 2, 0, 1, 1 };
+    const ndefs = [_]u32{ 5, 5, 5, 3, 2, 5 };
+    const ngot = try assembleLists(a, try listColumn(a, &nvals), &nreps, &ndefs, 5, nested, 2);
+    try testing.expectEqualStrings("[[1],[2,3]]", ngot.getValue(0).string);
+    try testing.expectEqualStrings("[[],null,[4]]", ngot.getValue(1).string);
+
+    // a row count that disagrees with the levels, or a repetition deeper than
+    // the list, is a corrupt page — never a wrong answer
+    try testing.expectError(Error.CorruptParquetPage, assembleLists(a, try listColumn(a, &vals), &reps, &defs, 3, flat, 5));
+    const bad_reps = [_]u32{ 0, 2, 0, 0, 0, 1 };
+    try testing.expectError(Error.CorruptParquetPage, assembleLists(a, try listColumn(a, &vals), &bad_reps, &defs, 3, flat, 4));
+    // a repeated entry below its own level's threshold: an element that is not one
+    const bad_defs = [_]u32{ 3, 1, 1, 0, 2, 3 };
+    try testing.expectError(Error.CorruptParquetPage, assembleLists(a, try listColumn(a, &vals), &reps, &bad_defs, 3, flat, 4));
+}
+
+fn readAllText(a: std.mem.Allocator, bytes: []const u8, name: []const u8) ![]const u8 {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = name, .data = bytes });
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const r = try Reader.open(a, try std.fs.path.join(a, &.{ dir, name }));
+    defer r.close();
+    var out = std.Io.Writer.Allocating.init(a);
+    while (try r.next(a)) |b| {
+        for (0..b.len) |i| {
+            for (b.columns, r.schema.fields, 0..) |c, f, k| {
+                if (k > 0) try out.writer.writeByte(' ');
+                const v = c.getValue(i);
+                try out.writer.print("{s}={s}", .{ f.name, if (v == .null) "null" else try eval.valueToString(a, v) });
+            }
+            try out.writer.writeByte('\n');
+        }
+    }
+    return out.written();
+}
+
+test "parquet LIST columns read as JSON from pyarrow (pages v1 and v2) and polars" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // `recs` (a list of structs) and `m` (a map) span several leaves and are left out
+    const want =
+        \\id=1 xs=[1,2] nest=[[1],[2,3]] ds=["2026-01-01"]
+        \\id=2 xs=[] nest=[[]] ds=null
+        \\id=3 xs=null nest=null ds=[]
+        \\id=4 xs=[null,5] nest=[null,[4]] ds=["1969-12-31",null]
+        \\
+    ;
+    // v1: two row groups of two rows, uncompressed; v2: one group, snappy
+    try testing.expectEqualStrings(want, try readAllText(a, @embedFile("testdata/lists_v1.parquet"), "v1.parquet"));
+    try testing.expectEqualStrings(want, try readAllText(a, @embedFile("testdata/lists_v2.parquet"), "v2.parquet"));
+    try testing.expectEqualStrings(
+        \\id=1 xs=[1,2] ss=["a"]
+        \\id=2 xs=[] ss=["b","c"]
+        \\id=3 xs=null ss=null
+        \\id=4 xs=[null,5] ss=[]
+        \\
+    , try readAllText(a, @embedFile("testdata/lists_polars.parquet"), "p.parquet"));
+}
+
+test "a list column is typed string, its skipped siblings named, and no bound prunes on it" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "l.parquet", .data = @embedFile("testdata/lists_v1.parquet") });
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const r = try Reader.open(a, try std.fs.path.join(a, &.{ dir, "l.parquet" }));
+    defer r.close();
+    try testing.expectEqual(types.TypeKind.string, r.schema.fields[r.schema.indexOf("xs").?].ty.kind);
+    try testing.expectEqual(@as(usize, 2), r.skipped.len);
+    try testing.expectEqualStrings("recs", r.skipped[0]);
+    try testing.expectEqualStrings("m", r.skipped[1]);
+    // the element statistics say 1..5; a bound on the column must not trust them
+    const b = [_]Bound{.{ .column = "xs", .op = .gt, .value = .{ .int = 100 } }};
+    for (r.md.row_groups) |g| try testing.expect(groupMayMatch(r.md.schema, r.leaves, g, &b));
 }
