@@ -1088,7 +1088,8 @@ same query costs at full parallelism.
 ```
 basalt run   <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json|csv|tsv|arrow] [--max-rows N]
 basalt serve <dir> [--port N] [--watch]
-basalt check <script>|-|-c "<inline>"
+basalt check <script>|-|-c "<inline>" [--format json]
+basalt complete <script>|-|-c "<inline>" --pos N [--connect]
 basalt kernel [--format table|json|csv|tsv|arrow] [-j threads] [--max-rows N]
 ```
 
@@ -1149,6 +1150,17 @@ whether a retry could help (`class`, the exit-`75` distinction below):
 
 `event` is `parse_error`, `script_error` or `aborted`; `file` is the script, or
 the `@include`d file the fault is in.
+
+For an editor: `basalt check --format json` prints its diagnostics as a JSON
+array on stdout — `[]` when the script checks out, else one object per error in
+the shape above without `ts`/`event` — and still exits `1` on an error.
+`basalt complete --pos N` prints what Tab would offer at byte offset `N` (the
+end, without `--pos`): `{"start":S,"end":N,"items":[{"text":…,"kind":…}]}`, the
+items replacing `script[S..N]`, with `kind` one of `keyword`, `function`,
+`param`, `cte`, `connection`, `table`, `column`, `path`. It completes against
+the script's own declarations, so a script half typed still has its names;
+local files named in it give their columns; connections are asked for their
+tables and columns only under `--connect`, since that is a round trip to each.
 
 While a `LOAD` runs, a terminal gets a live line on stderr — what is moving
 where, rows so far, the rate and the clock, with `[3/12]` in front inside a
@@ -1294,10 +1306,16 @@ Requests are NDJSON on stdin, one object per line:
 ```
 {"op":"run","id":"c1","script":"SELECT ...;","params":{"days":7},"format":"arrow"}
 {"op":"cancel","id":"c1"}     stop the running script; the session survives
+{"op":"complete","id":"c2","script":"SELECT erp.","pos":11}
 {"op":"reset"}                forget every declaration
 {"op":"close"}                exit 0 (as does EOF)
 ```
 
+`complete` answers what `basalt complete` would, against the session's
+declarations as well as the script's own; its status carries
+`complete: {start, end, items}`. Connections are asked for their tables and
+columns once per session and remembered, as the REPL does (`"connect": false`
+keeps it offline); `reset` forgets that too. `pos` is a byte offset.
 `params` binds the script's `PARAM`s for that script only, as `-p` does for a
 run; `format` overrides `--format` (default `arrow`) and `max_rows` overrides
 `--max-rows` for that script. A `cancel`

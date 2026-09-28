@@ -10,6 +10,9 @@
 //! Protocol. Requests are NDJSON on stdin, one object per line:
 //!
 //!   {"op":"run","id":"c1","script":"SELECT 1;","params":{"k":"v"},"format":"arrow","max_rows":5000}
+//!   {"op":"complete","id":"c2","script":"SELECT erp.","pos":11}
+//!                               what Tab offers there: the status carries
+//!                               `complete: {start, end, items: [{text, kind}]}`
 //!   {"op":"cancel"}             stop the running script; the session survives
 //!   {"op":"reset"}              forget every declaration
 //!   {"op":"close"}              exit (as does EOF on stdin)
@@ -52,6 +55,10 @@ const Request = struct {
     params: ?std.json.Value = null,
     format: ?[]const u8 = null,
     max_rows: ?u64 = null,
+    /// `complete`: the byte offset in `script` to complete at (default: its end),
+    /// and whether connections may be asked for their tables and columns.
+    pos: ?usize = null,
+    connect: bool = true,
 };
 
 /// Requests the stdin thread hands to the main loop. `cancel` never queues: it
@@ -221,6 +228,10 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
 
     var decls = cli.DeclStore.init(alloc);
     defer decls.deinit();
+    // What sources said about their tables and columns, kept for the session as
+    // the REPL keeps it: asked once, on first use.
+    var catalog = cli.Catalog.init(alloc);
+    defer catalog.deinit();
 
     while (queue.pop()) |raw| {
         defer alloc.free(raw);
@@ -233,18 +244,41 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         };
         if (std.mem.eql(u8, req.op, "run")) {
             try runScript(alloc, a, &out, &queue, &decls, req, opts);
+        } else if (std.mem.eql(u8, req.op, "complete")) {
+            try completeScript(alloc, a, &out, &decls, &catalog, req);
         } else if (std.mem.eql(u8, req.op, "reset")) {
             decls.clear();
+            catalog.deinit();
+            catalog = cli.Catalog.init(alloc);
             try reply(a, &out, req.id, .{ .ok = true });
         } else if (std.mem.eql(u8, req.op, "close")) {
             try reply(a, &out, req.id, .{ .ok = true });
             break;
         } else {
-            const m = try std.fmt.allocPrint(a, "unknown op `{s}` — run, cancel, reset or close", .{req.op});
+            const m = try std.fmt.allocPrint(a, "unknown op `{s}` — run, complete, cancel, reset or close", .{req.op});
             try reply(a, &out, req.id, .{ .ok = false, .@"error" = .{ .msg = m } });
         }
     }
     return 0;
+}
+
+/// `{"op":"complete","script":…,"pos":N}`: what Tab would offer at byte `pos`
+/// of a cell, against the session's declarations and the cell's own. Answered
+/// by the status, which carries `complete: {start, end, items}`.
+fn completeScript(gpa: std.mem.Allocator, a: std.mem.Allocator, out: *Out, decls: *const cli.DeclStore, catalog: *cli.Catalog, req: Request) !void {
+    const script = req.script orelse "";
+    const at = req.pos orelse script.len;
+    if (at > script.len)
+        return reply(a, out, req.id, .{ .ok = false, .@"error" = .{ .msg = "`pos` is past the end of `script`" } });
+    var scope = cli.DeclStore.init(gpa);
+    defer scope.deinit();
+    for (decls.items.items) |e| try scope.put(.{ .kind = e.kind, .name = e.name }, e.text);
+    try cli.declareFrom(&scope, a, script);
+    const cx = cli.Completer{ .gpa = gpa, .decls = &scope, .catalog = catalog, .connect = req.connect };
+    const offer = try cli.suggestFor(a, &cx, script, at);
+    var aw = std.Io.Writer.Allocating.init(a);
+    try cli.writeOffer(&aw.writer, offer, at);
+    try reply(a, out, req.id, .{ .ok = true, .complete = aw.written() });
 }
 
 fn usageErr(stderr: *std.Io.Writer, m: []const u8) !u8 {
@@ -317,6 +351,8 @@ const Status = struct {
     declared: ?[]const Declared = null,
     results: ?[]const ResultFrame = null,
     @"error": ?ErrorInfo = null,
+    /// A `complete` answer, already JSON.
+    complete: ?[]const u8 = null,
 };
 
 fn anyTruncated(results: ?[]const ResultFrame) bool {
@@ -338,6 +374,10 @@ fn reply(a: std.mem.Allocator, out: *Out, id: ?[]const u8, st: Status) !void {
     if (st.results) |r| {
         try w.writeAll(",\"results\":");
         try std.json.Stringify.value(r, .{}, w);
+    }
+    if (st.complete) |c| {
+        try w.writeAll(",\"complete\":");
+        try w.writeAll(c);
     }
     if (st.@"error") |e| {
         try w.writeAll(",\"error\":");

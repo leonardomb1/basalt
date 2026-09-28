@@ -958,6 +958,23 @@ if runs stdout; then
   if grep -q '"event":"progress".*"rows":' "$out/progress.log"; then report "stdout: progress events under --log-format json" ok
   else report "stdout: progress events under --log-format json" bad; head -3 "$out/progress.log"; fi
 
+  # Editor support: `check --format json` is an array of placed diagnostics, and
+  # `complete` says what Tab would offer, as JSON.
+  if $B check --format json -c "SELECT range FROM RANGE(2);" >"$out/chk_ok.json" 2>/dev/null &&
+     ! $B check --format json -c "SELECT nope FROM RANGE(2);" >"$out/chk_bad.json" 2>/dev/null &&
+     $B complete -c "SELECT range FROM RANGE(2) ORDER BY ran" >"$out/cmp.json" 2>/dev/null &&
+     python3 - "$out" <<'PY' 2>>"$out/jerr.log"
+import json, sys
+d = sys.argv[1]
+assert json.load(open(d + "/chk_ok.json")) == []
+bad = json.load(open(d + "/chk_bad.json"))
+assert len(bad) == 1 and bad[0]["col"] == 8 and bad[0]["end_col"] == 12, bad
+cmp = json.load(open(d + "/cmp.json"))
+assert {"text": "range", "kind": "keyword"} in cmp["items"] or any(i["text"].lower() == "range" for i in cmp["items"]), cmp
+PY
+  then report "stdout: check --format json and complete speak JSON" ok
+  else report "stdout: check --format json and complete speak JSON" bad; cat "$out/chk_bad.json" "$out/cmp.json" 2>/dev/null | head -5; fi
+
   # --max-rows: the first N rows of an endless source, at once, then a clean end.
   got=$(timeout 10 $B run -q --max-rows 3 --format csv -c "SELECT range FROM RANGE(100000000000);" 2>/dev/null | tr '\n' ' ')
   if [ "$got" = "range 0 1 2 " ]; then report "stdout: --max-rows previews an endless source" ok; else report "stdout: --max-rows previews an endless source (got '$got')" bad; fi

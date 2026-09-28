@@ -69,6 +69,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
         std.process.exit(try cmdRun(alloc, args));
     } else if (std.mem.eql(u8, verb, "serve")) {
         std.process.exit(try cmdServe(alloc, args));
+    } else if (std.mem.eql(u8, verb, "complete")) {
+        std.process.exit(try cmdComplete(alloc, args));
     } else if (std.mem.eql(u8, verb, "kernel")) {
         std.process.exit(try kernel.cmdKernel(alloc, args));
     } else if (std.mem.eql(u8, verb, "repl")) {
@@ -133,7 +135,7 @@ fn loadSource(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8, stderr
 }
 
 /// Flags that take the next argument as their value, across `run` and `check`.
-const valued_flags = [_][]const u8{ "-p", "--param", "-j", "--threads", "--format", "--log-format", "--log-level", "--port", "--max-rows" };
+const valued_flags = [_][]const u8{ "-p", "--param", "-j", "--threads", "--format", "--log-format", "--log-level", "--port", "--max-rows", "--pos" };
 
 /// Index of the script argument: the first that is neither a flag nor a flag's
 /// value, `-` (stdin) included — so `run --format json x.sql` finds `x.sql`, as
@@ -205,6 +207,9 @@ const ErrOut = struct {
     w: *std.Io.Writer,
     json: bool,
     label: []const u8,
+    /// `check --format json`: the object alone, an element of the caller's
+    /// array, without the log envelope (`ts`, `event`).
+    bare: bool = false,
 
     const Located = struct {
         msg: []const u8,
@@ -221,7 +226,10 @@ const ErrOut = struct {
         if (!self.json) {
             return printDiag(self.w, file, if (e.transient) " (transient)" else "", e.pos, e.msg);
         }
-        try self.w.print("{{\"ts\":{d},\"level\":\"error\",\"event\":\"{s}\",\"msg\":", .{ std.time.milliTimestamp(), e.event });
+        if (self.bare)
+            try self.w.writeAll("{\"level\":\"error\",\"msg\":")
+        else
+            try self.w.print("{{\"ts\":{d},\"level\":\"error\",\"event\":\"{s}\",\"msg\":", .{ std.time.milliTimestamp(), e.event });
         try std.json.Stringify.encodeJsonString(e.msg, .{}, self.w);
         try self.w.writeAll(",\"file\":");
         try std.json.Stringify.encodeJsonString(file, .{}, self.w);
@@ -229,7 +237,8 @@ const ErrOut = struct {
             try self.w.print(",\"line\":{d},\"col\":{d}", .{ p.line, p.col });
             if (e.end) |x| try self.w.print(",\"end_line\":{d},\"end_col\":{d}", .{ x.line, x.col });
         }
-        try self.w.print(",\"class\":\"{s}\"}}\n", .{if (e.transient) "transient" else "permanent"});
+        try self.w.print(",\"class\":\"{s}\"}}", .{if (e.transient) "transient" else "permanent"});
+        if (!self.bare) try self.w.writeByte('\n');
     }
 };
 
@@ -284,14 +293,20 @@ fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     const stderr = &err_file.interface;
     defer stderr.flush() catch {};
 
-    const src = (try loadSource(a, "check", args, stderr)) orelse return 1;
-    const prog = (try parseSrc(a, src, stderr)) orelse return 1;
-
     var overrides = std.array_list.Managed(analyze.ParamOverride).init(a);
+    var json = false;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "-c") or std.mem.eql(u8, args[i], "--command")) {
             i += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, args[i], "--format")) {
+            const v = (try nextVal(args, &i, "--format", stderr)) orelse return 2;
+            if (std.mem.eql(u8, v, "json")) json = true else if (!std.mem.eql(u8, v, "text")) {
+                try stderr.print("error: `check --format` must be text|json\n", .{});
+                return 2;
+            }
             continue;
         }
         if (!std.mem.eql(u8, args[i], "-p") and !std.mem.eql(u8, args[i], "--param")) {
@@ -310,17 +325,102 @@ fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         try overrides.append(.{ .name = args[i][0..eq], .value = args[i][eq + 1 ..] });
     }
 
+    const src = (try loadSource(a, "check", args, stderr)) orelse return 1;
+    // `--format json`: stdout is an array of diagnostics — empty when the script
+    // checks out — for an editor to place; the text line stays on stderr.
+    const eo = ErrOut{ .w = if (json) stdout else stderr, .json = json, .bare = true, .label = src.label };
+    if (json) try stdout.writeAll("[");
+    defer if (json) stdout.writeAll("]\n") catch {};
+    const prog = (try parseSrcTo(a, src, eo)) orelse return 1;
+
     var adiag = analyze.Diag{};
     _ = analyze.analyzeWith(a, prog, overrides.items, &adiag) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.AnalyzeFailed => {
-            try printDiag(stderr, src.label, "", adiag.pos, adiag.msg);
+            try eo.report(.{ .msg = adiag.msg, .pos = adiag.pos, .end = adiag.end });
             return 1;
         },
     };
 
-    try stdout.print("ok: {s} checks out\n", .{src.label});
+    if (!json) try stdout.print("ok: {s} checks out\n", .{src.label});
     return 0;
+}
+
+/// `complete <script>|-|-c <script> --pos N [--connect]`: what Tab would offer
+/// at byte offset N, as JSON — `{"start":S,"end":N,"items":[{"text","kind"}]}`,
+/// the candidates replacing `script[S..N]`. Declarations come from the script
+/// itself; local files contribute their columns; connections are asked for
+/// their tables and columns only under `--connect`, since that means a round
+/// trip to each.
+fn cmdComplete(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var out_buf: [8192]u8 = undefined;
+    var out_file = std.fs.File.stdout().writer(&out_buf);
+    const stdout = &out_file.interface;
+    defer stdout.flush() catch {};
+    var err_buf: [4096]u8 = undefined;
+    var err_file = std.fs.File.stderr().writer(&err_buf);
+    const stderr = &err_file.interface;
+    defer stderr.flush() catch {};
+
+    var pos: ?usize = null;
+    var connect = false;
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--command")) {
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--pos")) {
+            const v = (try nextVal(args, &i, "--pos", stderr)) orelse return 2;
+            pos = std.fmt.parseInt(usize, v, 10) catch {
+                try stderr.print("error: invalid --pos `{s}`\n", .{v});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, arg, "--connect")) {
+            connect = true;
+        } else if (try unknownOption(arg, "complete", stderr)) return 2;
+    }
+    const src = (try loadSource(a, "complete", args, stderr)) orelse return 1;
+    const at = pos orelse src.text.len;
+    if (at > src.text.len) {
+        try stderr.print("error: --pos {d} is past the script's {d} bytes\n", .{ at, src.text.len });
+        return 2;
+    }
+
+    var decls = DeclStore.init(alloc);
+    defer decls.deinit();
+    try declareFrom(&decls, a, src.text);
+    var catalog = Catalog.init(alloc);
+    defer catalog.deinit();
+    const cx = Completer{ .gpa = alloc, .decls = &decls, .catalog = &catalog, .connect = connect };
+    const offer = try suggestFor(a, &cx, src.text, at);
+    try writeOffer(stdout, offer, at);
+    try stdout.writeByte('\n');
+    return 0;
+}
+
+/// The declarations a text makes, by its statements' first words — so a script
+/// still being typed, which will not parse, still has its names in scope.
+pub fn declareFrom(decls: *DeclStore, arena: std.mem.Allocator, text: []const u8) !void {
+    for (try splitStatements(arena, text)) |st| {
+        const id = declOf(st) orelse continue;
+        if (id.kind == .endpoint) continue;
+        try decls.put(id, st);
+    }
+}
+
+/// `{"start":S,"end":N,"items":[{"text":…,"kind":…}]}`.
+pub fn writeOffer(w: *std.Io.Writer, offer: Offer, cursor: usize) !void {
+    try w.print("{{\"start\":{d},\"end\":{d},\"items\":[", .{ offer.start, cursor });
+    for (offer.items, 0..) |c, k| {
+        if (k > 0) try w.writeByte(',');
+        try w.writeAll("{\"text\":");
+        try std.json.Stringify.encodeJsonString(c.text, .{}, w);
+        try w.print(",\"kind\":\"{s}\"}}", .{@tagName(c.kind)});
+    }
+    try w.writeAll("]}");
 }
 
 fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
@@ -774,6 +874,10 @@ const Session = struct {
     /// Say `ok: connection x` as declarations register — off while the startup
     /// file loads, which is summed up in one line instead.
     announce: bool = true,
+
+    fn completer(self: *Session) Completer {
+        return .{ .gpa = self.decls.gpa, .decls = &self.decls, .catalog = &self.catalog };
+    }
 };
 
 /// A path with the home directory folded to `~`, for messages.
@@ -847,7 +951,7 @@ fn listConnections(sess: *Session, msg: *std.Io.Writer, probe: bool) !void {
         const host = connAttr(e.text, "host") orelse connAttr(e.text, "fe_host") orelse connAttr(e.text, "url") orelse connAttr(e.text, "base_url") orelse "";
         const db = connAttr(e.text, "database") orelse "";
         var status: []const u8 = "not asked yet";
-        if (probe and !std.mem.eql(u8, ty, "http")) _ = connTables(sess, e.name);
+        if (probe and !std.mem.eql(u8, ty, "http")) _ = connTables(&sess.completer(), e.name);
         if (sess.catalog.tables.get(e.name)) |t| {
             status = if (t.len == 0) "unreachable, or no tables" else try std.fmt.allocPrint(sess.catalog.arena.allocator(), "reached, {d} tables", .{t.len});
         }
@@ -1006,7 +1110,7 @@ fn connectWizard(alloc: std.mem.Allocator, type_arg: []const u8, sess: *Session,
     if (!std.mem.eql(u8, conn.name, "http")) {
         const t = try ask(msg, "reach it now? (y/n)", "y", false, &buf);
         if (std.ascii.toLower(t[0]) == 'y') {
-            const reached = connTables(sess, name).len > 0;
+            const reached = connTables(&sess.completer(), name).len > 0;
             try msg.print("  {s}\n", .{if (reached) "reached" else "could not reach it (or it has no tables) — \\c test retries; the connection stays declared"});
         }
     }
@@ -1074,27 +1178,42 @@ fn editAndRun(alloc: std.mem.Allocator, path_arg: []const u8, sess: *Session, ms
 /// Names fetched for completion, once each: a connection's tables, a table's or
 /// a file's columns. A source that could not be asked is remembered as empty, so
 /// a dead connection costs one wait, not one per Tab.
-const Catalog = struct {
+pub const Catalog = struct {
     arena: std.heap.ArenaAllocator,
     tables: std.StringHashMap([]const []const u8),
     columns: std.StringHashMap([]const []const u8),
 
-    fn init(gpa: std.mem.Allocator) Catalog {
+    pub fn init(gpa: std.mem.Allocator) Catalog {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa), .tables = std.StringHashMap([]const []const u8).init(gpa), .columns = std.StringHashMap([]const []const u8).init(gpa) };
     }
-    fn deinit(self: *Catalog) void {
+    pub fn deinit(self: *Catalog) void {
         self.tables.deinit();
         self.columns.deinit();
         self.arena.deinit();
     }
 };
 
+/// What completion draws on: the declarations in scope, and a cache of what
+/// sources said about their tables and columns. The REPL builds one from its
+/// session; `basalt complete` and the kernel's `complete` build their own.
+pub const Completer = struct {
+    gpa: std.mem.Allocator,
+    decls: *const DeclStore,
+    catalog: *Catalog,
+    /// Ask connections for their tables and columns. Off, only local files
+    /// (whose headers and footers cost no round trip) contribute columns.
+    connect: bool = true,
+};
+
+/// A completion offer: replace `text[start..cursor]` with one of `items`.
+pub const Offer = struct { start: usize = 0, items: []const complete.Candidate = &.{} };
+
 /// Run `SELECT ...` under the session's declarations into a temporary CSV and
 /// hand back its rows, first column only — how Tab asks a source a question
 /// without printing anything. Errors come back as no rows.
-fn fetchColumn(sess: *Session, select: []const u8) []const []const u8 {
-    const a = sess.catalog.arena.allocator();
-    var scratch = std.heap.ArenaAllocator.init(sess.decls.gpa);
+fn fetchColumn(cx: *const Completer, select: []const u8) []const []const u8 {
+    const a = cx.catalog.arena.allocator();
+    var scratch = std.heap.ArenaAllocator.init(cx.gpa);
     defer scratch.deinit();
     const sa = scratch.allocator();
     var path_buf: [96]u8 = undefined;
@@ -1102,7 +1221,7 @@ fn fetchColumn(sess: *Session, select: []const u8) []const []const u8 {
     defer std.fs.cwd().deleteFile(path) catch {};
 
     var text = std.array_list.Managed(u8).init(sa);
-    for (sess.decls.items.items) |e| {
+    for (cx.decls.items.items) |e| {
         text.appendSlice(e.text) catch return &.{};
         text.appendSlice(";\n") catch return &.{};
     }
@@ -1110,7 +1229,7 @@ fn fetchColumn(sess: *Session, select: []const u8) []const []const u8 {
     var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const prog = parser.parseSource(sa, text.items, &pdiag) catch return &.{};
     var rdiag: runtime.Diag = .{};
-    _ = runtime.run(sess.decls.gpa, prog, .{ .log = .{ .quiet = true, .summary = .none } }, &rdiag) catch return &.{};
+    _ = runtime.run(cx.gpa, prog, .{ .log = .{ .quiet = true, .summary = .none } }, &rdiag) catch return &.{};
     const data = std.fs.cwd().readFileAlloc(sa, path, 1 << 22) catch return &.{};
 
     var out = std.array_list.Managed([]const u8).init(a);
@@ -1126,14 +1245,14 @@ fn fetchColumn(sess: *Session, select: []const u8) []const []const u8 {
 
 /// The resources declared on `conn` when it is an http connection — its
 /// "tables", known from the session without asking the network — else null.
-fn httpResources(arena: std.mem.Allocator, sess: *Session, conn: []const u8) !?[]const []const u8 {
-    const is_http = for (sess.decls.items.items) |e| {
+fn httpResources(arena: std.mem.Allocator, cx: *const Completer, conn: []const u8) !?[]const []const u8 {
+    const is_http = for (cx.decls.items.items) |e| {
         if (e.kind == .connection and std.ascii.eqlIgnoreCase(e.name, conn))
             break std.ascii.eqlIgnoreCase(connTypeOf(e.text) orelse "", "http");
     } else false;
     if (!is_http) return null;
     var out = std.array_list.Managed([]const u8).init(arena);
-    for (sess.decls.items.items) |e| {
+    for (cx.decls.items.items) |e| {
         if (e.kind != .resource or e.name.len <= conn.len or e.name[conn.len] != '.') continue;
         if (std.ascii.eqlIgnoreCase(e.name[0..conn.len], conn)) try out.append(e.name[conn.len + 1 ..]);
     }
@@ -1141,23 +1260,24 @@ fn httpResources(arena: std.mem.Allocator, sess: *Session, conn: []const u8) !?[
 }
 
 /// The tables of `conn` as `schema.table`, fetched on first use.
-fn connTables(sess: *Session, conn: []const u8) []const []const u8 {
-    if (sess.catalog.tables.get(conn)) |t| return t;
-    const a = sess.catalog.arena.allocator();
+fn connTables(cx: *const Completer, conn: []const u8) []const []const u8 {
+    if (cx.catalog.tables.get(conn)) |t| return t;
+    if (!cx.connect) return &.{};
+    const a = cx.catalog.arena.allocator();
     const q = std.fmt.allocPrint(a, "SELECT table_schema || '.' || table_name AS t FROM {s}.QUERY($$SELECT table_schema, table_name FROM information_schema.tables WHERE table_type IN ('BASE TABLE', 'VIEW') AND table_schema NOT IN ('information_schema', 'pg_catalog', 'mysql', 'performance_schema', 'sys', '_statistics_') ORDER BY 1, 2$$)", .{conn}) catch return &.{};
-    const rows = fetchColumn(sess, q);
-    sess.catalog.tables.put(a.dupe(u8, conn) catch return rows, rows) catch {};
+    const rows = fetchColumn(cx, q);
+    cx.catalog.tables.put(a.dupe(u8, conn) catch return rows, rows) catch {};
     return rows;
 }
 
 /// The columns of `conn.schema.table`, or of a file path, fetched on first use.
-fn sourceColumns(sess: *Session, key: []const u8) []const []const u8 {
-    if (sess.catalog.columns.get(key)) |c| return c;
-    const a = sess.catalog.arena.allocator();
+fn sourceColumns(cx: *const Completer, key: []const u8) []const []const u8 {
+    if (cx.catalog.columns.get(key)) |c| return c;
+    const a = cx.catalog.arena.allocator();
     var rows: []const []const u8 = &.{};
     if (key[0] == '\'') {
         // A file: the analyzer reads its schema without moving a row.
-        var scratch = std.heap.ArenaAllocator.init(sess.decls.gpa);
+        var scratch = std.heap.ArenaAllocator.init(cx.gpa);
         defer scratch.deinit();
         const sa = scratch.allocator();
         blk: {
@@ -1172,14 +1292,15 @@ fn sourceColumns(sess: *Session, key: []const u8) []const []const u8 {
             rows = names;
         }
     } else {
+        if (!cx.connect) return rows;
         var parts = std.mem.splitScalar(u8, key, '.');
         const conn = parts.next().?;
         const schema = parts.next() orelse return rows;
         const tbl = parts.next() orelse return rows;
         const q = std.fmt.allocPrint(a, "SELECT column_name FROM {s}.QUERY($$SELECT column_name FROM information_schema.columns WHERE table_schema = '{s}' AND table_name = '{s}' ORDER BY ordinal_position$$)", .{ conn, schema, tbl }) catch return rows;
-        rows = fetchColumn(sess, q);
+        rows = fetchColumn(cx, q);
     }
-    sess.catalog.columns.put(a.dupe(u8, key) catch return rows, rows) catch {};
+    cx.catalog.columns.put(a.dupe(u8, key) catch return rows, rows) catch {};
     return rows;
 }
 
@@ -1197,10 +1318,21 @@ fn connTypeOf(text: []const u8) ?[]const u8 {
 /// file the entry mentions, handed to the matcher; a path is listed here.
 fn suggest(ctx: *anyopaque, arena: std.mem.Allocator, text: []const u8, cursor: usize) anyerror!Editor.Suggestions {
     const sess: *Session = @ptrCast(@alignCast(ctx));
+    const cx = sess.completer();
+    const offer = try suggestFor(arena, &cx, text, cursor);
+    const items = try arena.alloc([]const u8, offer.items.len);
+    for (offer.items, items) |cand, *it| it.* = cand.text;
+    return .{ .start = offer.start, .items = items };
+}
+
+/// Completion at `cursor` in `text`: keywords, the declared names in scope, the
+/// entry's CTEs, a path inside an open quote, a connection's tables after
+/// `conn.`, and the columns of every table and file the text names.
+pub fn suggestFor(arena: std.mem.Allocator, cx: *const Completer, text: []const u8, cursor: usize) anyerror!Offer {
     var conns = std.array_list.Managed([]const u8).init(arena);
     var fns = std.array_list.Managed([]const u8).init(arena);
     var params = std.array_list.Managed([]const u8).init(arena);
-    for (sess.decls.items.items) |e| switch (e.kind) {
+    for (cx.decls.items.items) |e| switch (e.kind) {
         .connection => try conns.append(e.name),
         .function => try fns.append(e.name),
         .param, .let => try params.append(e.name),
@@ -1239,9 +1371,9 @@ fn suggest(ctx: *anyopaque, arena: std.mem.Allocator, text: []const u8, cursor: 
             while (e < text.len and (std.ascii.isAlphanumeric(text[e]) or text[e] == '_' or text[e] == '.')) : (e += 1) {
                 if (text[e] == '.') dots += 1;
             }
-            if (dots == 1 and e < text.len and text[e] != '(') for (sourceColumns(sess, text[p..e])) |col| try columns.append(col);
+            if (dots == 1 and e < text.len and text[e] != '(') for (sourceColumns(cx, text[p..e])) |col| try columns.append(col);
         }
-        if (wanted) try tables.append(.{ .conn = c, .tables = try httpResources(arena, sess, c) orelse connTables(sess, c) });
+        if (wanted) try tables.append(.{ .conn = c, .tables = try httpResources(arena, cx, c) orelse connTables(cx, c) });
     }
     var q: usize = 0;
     while (std.mem.indexOfScalarPos(u8, text, q, '\'')) |open| {
@@ -1249,8 +1381,11 @@ fn suggest(ctx: *anyopaque, arena: std.mem.Allocator, text: []const u8, cursor: 
         q = close + 1;
         if (q >= cursor and open < cursor) continue;
         const lit = text[open..q];
-        if (std.mem.endsWith(u8, lit, ".csv'") or std.mem.endsWith(u8, lit, ".parquet'") or std.mem.endsWith(u8, lit, ".gz'") or std.mem.endsWith(u8, lit, ".zst'"))
-            for (sourceColumns(sess, lit)) |col| try columns.append(col);
+        const file_like = for ([_][]const u8{ ".csv'", ".parquet'", ".gz'", ".zst'", ".arrow'", ".arrows'", ".feather'", ".ipc'" }) |ext| {
+            if (std.ascii.endsWithIgnoreCase(lit, ext)) break true;
+        } else false;
+        if (file_like)
+            for (sourceColumns(cx, lit)) |col| try columns.append(col);
     }
 
     const r = try complete.complete(arena, .{
@@ -1263,12 +1398,13 @@ fn suggest(ctx: *anyopaque, arena: std.mem.Allocator, text: []const u8, cursor: 
     }, text, cursor);
     switch (r) {
         .none => return .{},
-        .candidates => |c| {
-            const items = try arena.alloc([]const u8, c.items.len);
-            for (c.items, items) |cand, *it| it.* = cand.text;
-            return .{ .start = c.start, .items = items };
+        .candidates => |c| return .{ .start = c.start, .items = c.items },
+        .path => |p| {
+            const paths = try listPaths(arena, p.partial);
+            const items = try arena.alloc(complete.Candidate, paths.len);
+            for (paths, items) |pth, *it| it.* = .{ .text = pth, .kind = .path };
+            return .{ .start = p.start, .items = items };
         },
-        .path => |p| return .{ .start = p.start, .items = try listPaths(arena, p.partial) },
     }
 }
 
@@ -2009,11 +2145,11 @@ test "Tab lists an http connection's resources as its tables" {
 
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
-    const got = (try httpResources(ar.allocator(), &sess, "rc")).?;
+    const got = (try httpResources(ar.allocator(), &sess.completer(), "rc")).?;
     try std.testing.expectEqual(@as(usize, 2), got.len);
     try std.testing.expectEqualStrings("countries", got[0]);
     try std.testing.expectEqualStrings("regions", got[1]);
-    try std.testing.expect(try httpResources(ar.allocator(), &sess, "pg") == null);
+    try std.testing.expect(try httpResources(ar.allocator(), &sess.completer(), "pg") == null);
 }
 
 test "declOf names session declarations" {
@@ -2076,8 +2212,11 @@ fn usage(w: anytype) !void {
         \\               run a pipeline; HTTP mode when the script declares CREATE ENDPOINT
         \\  basalt serve <dir> [--port N] [--watch] [--log-format FMT] [--log-level LVL]
         \\               host every endpoint script in a dir (SIGHUP or -w reloads)
-        \\  basalt check <script>|-|-c <script>
-        \\               parse and validate without running; `EXPLAIN` prints the plan
+        \\  basalt check <script>|-|-c <script> [--format json]
+        \\               parse and validate without running; `EXPLAIN` prints the plan;
+        \\               json: an array of diagnostics with their ranges
+        \\  basalt complete <script>|-|-c <script> --pos N [--connect]
+        \\               what Tab offers at byte offset N, as JSON (for editors)
         \\  basalt repl  interactive read-eval-print loop
         \\  basalt kernel [--format FMT] [-j N]
         \\               a session for a notebook: NDJSON requests on stdin, framed
@@ -2174,4 +2313,39 @@ test "every meta command the REPL handles is one Tab offers, and the other way r
             return error.TestUnexpectedResult;
         }
     }
+}
+
+test "suggestFor: a half-typed script's own declarations and a local file's columns" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "t.csv", .data = "order_id,order_total\n1,2\n" });
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+
+    var decls = DeclStore.init(std.testing.allocator);
+    defer decls.deinit();
+    var catalog = Catalog.init(std.testing.allocator);
+    defer catalog.deinit();
+    const text = try std.fmt.allocPrint(a, "CREATE FUNCTION tax(x) AS x * 2;\nPARAM since DATE;\nSELECT ta FROM '{s}/t.csv' WHERE order_", .{dir});
+    try declareFrom(&decls, a, text);
+    // offline: no connection is asked anything
+    const cx = Completer{ .gpa = std.testing.allocator, .decls = &decls, .catalog = &catalog, .connect = false };
+
+    const at_fn = std.mem.indexOf(u8, text, "SELECT ta").? + "SELECT ta".len;
+    const fns = try suggestFor(a, &cx, text, at_fn);
+    try std.testing.expectEqualStrings("tax", fns.items[0].text);
+    try std.testing.expectEqual(complete.Kind.function, fns.items[0].kind);
+
+    const cols = try suggestFor(a, &cx, text, text.len);
+    try std.testing.expectEqual(@as(usize, 2), cols.items.len);
+    try std.testing.expectEqualStrings("order_id", cols.items[0].text);
+    try std.testing.expectEqual(complete.Kind.column, cols.items[1].kind);
+    try std.testing.expectEqual(text.len - "order_".len, cols.start);
+
+    var aw = std.Io.Writer.Allocating.init(a);
+    try writeOffer(&aw.writer, cols, text.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, aw.written(), .{});
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("items").?.array.items.len);
 }

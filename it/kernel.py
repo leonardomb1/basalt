@@ -217,6 +217,16 @@ def main(binary):
     data, st = k.run("SELECT 1 AS v;")
     report("the process survives SIGINT", st["ok"] and rows(data) == [{"v": 1}], st)
 
+    # Completion against the session's declarations and the cell's own.
+    k.send(op="complete", id="cmp", script="CREATE FUNCTION tri(x) AS x * 3;\nSELECT tr", pos=41)
+    _, st = k.reply()
+    names = [(i["text"], i["kind"]) for i in (st.get("complete") or {}).get("items", [])]
+    report("complete offers the cell's own function", ("tri", "function") in names, st)
+    k.send(op="complete", id="cmp2", script="SELECT db")
+    _, st = k.reply()
+    names = [(i["text"], i["kind"]) for i in (st.get("complete") or {}).get("items", [])]
+    report("complete offers a function an earlier script declared", ("dbl", "function") in names, st)
+
     # Reset forgets every declaration.
     k.send(op="reset", id="r")
     _, st = k.reply()
