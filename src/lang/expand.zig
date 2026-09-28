@@ -308,7 +308,8 @@ fn expandExpr(cx: *Ctx, e: *const ast.Expr, subst: ?*Subst, depth: usize) Error!
     switch (e.*) {
         .field => |q| {
             if (subst) |s| if (q.single()) |nm| if (s.get(nm)) |arg| return arg;
-            if (q.parts.len >= 1) if (cx.json.get(q.parts[0])) |maybe_val|
+            // `$job.a.b`; a bare `job.a` is a column of a table aliased `job`
+            if (q.dollar and q.parts.len >= 1) if (cx.json.get(q.parts[0])) |maybe_val|
                 return jsonPathLit(cx, maybe_val, q.parts[1..], q.safe);
             return mk(cx, e.*);
         },

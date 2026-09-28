@@ -459,6 +459,8 @@ fn numericKind(k: types.TypeKind) bool {
 fn provablyNumeric(e: *const ast.Expr, schema: types.Schema) bool {
     return switch (e.*) {
         .int_lit, .float_lit => true,
+        // a decimal PARAM or LET's text (`env.mkLit`): strictly a number
+        .str_lit => |s| plainNumber(s),
         .field => |q| blk: {
             if (schema.fields.len == 0) break :blk false;
             const idx = schema.indexOf(q.last()) orelse break :blk false;
@@ -468,6 +470,24 @@ fn provablyNumeric(e: *const ast.Expr, schema: types.Schema) bool {
         // it is translated, so trusting it here would sidestep the check.
         else => false,
     };
+}
+
+/// An optional `-`, digits, and at most one `.` between digits: text every
+/// source and the engine read as the same number.
+fn plainNumber(s: []const u8) bool {
+    var i: usize = 0;
+    if (i < s.len and s[i] == '-') i += 1;
+    var digits: usize = 0;
+    var dot = false;
+    while (i < s.len) : (i += 1) switch (s[i]) {
+        '0'...'9' => digits += 1,
+        '.' => {
+            if (dot or digits == 0 or i + 1 >= s.len) return false;
+            dot = true;
+        },
+        else => return false,
+    };
+    return digits > 0;
 }
 
 /// Printable ASCII only. The order argument for a text range rests on it (at

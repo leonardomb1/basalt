@@ -106,7 +106,12 @@ PARAM tenant STRING FROM HEADER('X-Tenant');
   whole path to `null` instead of erroring.
 - Types: `BOOL INT FLOAT STRING BYTES DATE TIME TIMESTAMP DECIMAL(p,s) JSON`
   (common synonyms accepted: `INTEGER BIGINT DOUBLE TEXT VARCHAR(n) DATETIME
-  NUMERIC ...`).
+  NUMERIC ...`). A value bound from text — `-p`, a kernel's `params`, a
+  default — is read as a `CAST` reads it and keeps the declared type:
+  `-p d=2026-02-01` is a `DATE` (`date_add('day', 1, $d)` works), a date alone
+  bound to a `TIMESTAMP` is its midnight, `TIME` takes `HH:MM[:SS[.ffffff]]`,
+  and a `DECIMAL(10,2)` rounds `12.345` to `12.35`. Text that is not one fails
+  the run, and `check`, with the value named (`PARAM d: 'nope' is not a date`).
 - Source defaults: scalars bind from the query string, `JSON` from the body.
 
 **`LET name = <expr>;`** is PARAM's sealed sibling: a script-scoped constant
@@ -890,8 +895,8 @@ END FOR;
 - Loop variables may be typed: `AS (name, port:INT)`.
 - A loop variable is also an ordinary expression **value**: `SELECT $name AS
   empresa`, `WHERE $port > 1000` (typed vars compare as their declared type).
-  Inside the loop body a loop var shadows a same-named source column in
-  expression position — the same rule params follow.
+  Only `$name` is the loop variable: a bare `name` in the body is still the
+  source column of that name, as it is beside a PARAM.
 - The `CASE` **statement** (`... THEN <statements> ... END CASE`) dispatches
   whole pipelines per row — subject form (`CASE $env WHEN 'prod', 'staging'
   THEN ... END CASE`) and the guard form. `END CASE` distinguishes it from the
@@ -1010,8 +1015,11 @@ SQL-ish, Pratt-parsed. Precedence (high→low): unary `- NOT ~` → `* / %` →
 
 **Scope rule:** `$name` is script/environment scope — a PARAM, a LET, or (in a
 `FOR EACH ROW OF` / statement-function body) a loop variable, resolved at plan
-time. Bare names are row/local scope — columns, `LET … IN` bindings, aliases.
-At a use site the innermost binding wins: loop var > LET/PARAM.
+time. Bare names are row/local scope — columns, `LET … IN` bindings, aliases —
+and a PARAM, LET or loop variable never stands in for one: with `PARAM region`,
+`WHERE region = 'West'` filters on the column and `WHERE region = $region` on
+the parameter. Among `$` names the innermost binding wins: loop var >
+LET/PARAM.
 
 - `$name` — see the scope rule above. `$job.a?.b` navigates a JSON param.
 - Bitwise (INT only, engine-side — never pushed down): `& | ^ << >>`, unary
@@ -1082,7 +1090,12 @@ At a use site the innermost binding wins: loop var > LET/PARAM.
 - `CAST(x AS TIME)` takes `'HH:MM:SS[.ffffff]'` or `'HH:MM'` text, or a
   timestamp (its time of day).
 - `DATE_TRUNC('minute', ts)` and `EXTRACT(minute FROM ts)` — units `year`,
-  `month`, `day`, `hour`, `minute`, `second`. `EXTRACT` also accepts the
+  `month`, `week`, `day`, `hour`, `minute`, `second`, the same for `DATE_ADD`
+  and `DATE_DIFF`. `week` is the ISO week: it starts on Monday
+  (`DATE_TRUNC('week', …)` is that Monday at 00:00), `EXTRACT(week …)` numbers
+  it 1–53 with week 1 holding the year's first Thursday, and `DATE_DIFF`
+  counts the Mondays crossed. `check` rejects an unknown unit even over a SQL
+  table whose columns it has not seen. `EXTRACT` also accepts the
   ordinary two-argument call form. `STRLEN` is an alias for `LENGTH`.
 - `REGEXP_REPLACE(s, pattern, replacement)` — replaces the first match;
   `\1`…`\9` in the replacement expand to captured groups (`\0` is the whole

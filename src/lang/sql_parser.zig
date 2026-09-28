@@ -2969,6 +2969,7 @@ pub const Parser = struct {
             .parts = try parts.toOwnedSlice(),
             .safe = if (any_safe) try safes.toOwnedSlice() else &.{},
             .span = self.spanFrom(start),
+            .dollar = true,
         };
     }
 
@@ -3223,13 +3224,12 @@ pub const Parser = struct {
     /// read. A column reference is not constant: it has no single value per group,
     /// which is the case the caller still refuses.
     ///
-    /// `$p` and a bare column are the same single-part field here, so a declared
-    /// PARAM or LET name wins — the same shadowing rule the rest of the language
-    /// applies to `$name`.
+    /// Only a `$name` is a PARAM or LET; a bare name is a column even when a
+    /// PARAM shares it.
     fn constItemExpr(self: *Parser, e: *const ast.Expr) bool {
         return switch (e.*) {
             .int_lit, .float_lit, .str_lit, .bool_lit, .null_lit => true,
-            .field => |q| q.parts.len == 1 and self.isScriptConst(q.parts[0]),
+            .field => |q| q.dollar and q.parts.len == 1 and self.isScriptConst(q.parts[0]),
             .unary => |u| self.constItemExpr(u.e),
             .binary => |b| self.constItemExpr(b.l) and self.constItemExpr(b.r),
             .cond => |c| self.constItemExpr(c.cond) and self.constItemExpr(c.then) and self.constItemExpr(c.els),
@@ -3631,7 +3631,8 @@ pub const Parser = struct {
                     try self.const_names.append(name);
                     const parts = try self.arena.alloc([]const u8, 1);
                     parts[0] = name;
-                    return self.mk(.{ .field = .{ .parts = parts } });
+                    // the subquery's value, bound as a LET is
+                    return self.mk(.{ .field = .{ .parts = parts, .dollar = true } });
                 }
                 _ = self.advance();
                 const e = try self.parseExpr();
@@ -3820,7 +3821,7 @@ fn stripPrefix(q: ast.QualName, prefix: []const u8) ast.QualName {
 }
 
 fn stripQual(q: ast.QualName, aliases: *const AliasSet) ast.QualName {
-    if (q.parts.len > 1 and aliases.strips(q.parts[0]))
+    if (!q.dollar and q.parts.len > 1 and aliases.strips(q.parts[0]))
         return .{ .parts = q.parts[1..], .safe = if (q.safe.len > 0) q.safe[1..] else &.{} };
     return q;
 }

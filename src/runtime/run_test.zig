@@ -3563,3 +3563,104 @@ test "on_load: every LOAD reports as it finishes — written, failed before writ
         try std.testing.expectEqual(@as(u64, 21_000), summary.rows_read);
     }
 }
+
+test "a bare name is a column even when a PARAM or loop variable shares it; `$name` is the binding" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // a.csv: id,grp,amt — 1,a,10 / 2,a,20 / 3,b,5; outer.csv: name — a / b
+    try checkAndRun(alloc, &tmp,
+        \\PARAM grp STRING DEFAULT 'b';
+        \\LOAD INTO '$B/bare.csv' AS SELECT COUNT(*) AS n FROM '$B/a.csv' WHERE grp = 'a';
+        \\LOAD INTO '$B/dollar.csv' AS SELECT COUNT(*) AS n FROM '$B/a.csv' WHERE grp = $grp;
+        \\LOAD INTO '$B/both.csv' AS SELECT grp, $grp AS p FROM '$B/a.csv' ORDER BY id;
+        \\FOR EACH ROW OF ('$B/outer.csv') AS (grp)
+        \\  LOAD INTO IDENTIFIER('$B/loop_' || $grp || '.csv') AS SELECT COUNT(*) AS n, $grp AS lv FROM '$B/a.csv' WHERE grp = 'b';
+        \\END FOR;
+    , 1, &.{});
+    try expectFile(&tmp, "bare.csv", "n\n2\n");
+    try expectFile(&tmp, "dollar.csv", "n\n1\n");
+    try expectFile(&tmp, "both.csv", "grp,p\na,b\na,b\nb,b\n");
+    try expectFile(&tmp, "loop_a.csv", "n,lv\n1,a\n");
+    try expectFile(&tmp, "loop_b.csv", "n,lv\n1,b\n");
+}
+
+test "DATE, TIMESTAMP, TIME and DECIMAL params bind from text as a CAST reads it, and keep their type" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const script =
+        \\PARAM d DATE DEFAULT '2026-01-01';
+        \\PARAM t TIMESTAMP DEFAULT '2026-01-01 08:00:00';
+        \\PARAM tm TIME DEFAULT '08:00';
+        \\PARAM m DECIMAL(10,2) DEFAULT 1.5;
+        \\LET x = CAST('1.5' AS DECIMAL(10,2));
+        \\LOAD INTO '$B/p.csv' AS SELECT $d AS d, date_add('day', 1, $d) AS d1, $t AS t, $tm AS tm, $m AS m, $x + 1 AS x1;
+    ;
+    // defaults, each its declared type
+    try checkAndRun(alloc, &tmp, script, 1, &.{});
+    try expectFile(&tmp, "p.csv", "d,d1,t,tm,m,x1\n2026-01-01,2026-01-02,2026-01-01 08:00:00,08:00:00,1.50,2.50\n");
+    // bound: a date alone reaches a TIMESTAMP as its midnight; a decimal rounds as a cast does
+    try checkAndRun(alloc, &tmp, script, 1, &.{
+        .{ .key = "d", .val = "2026-02-01" },
+        .{ .key = "t", .val = "2026-02-01" },
+        .{ .key = "tm", .val = "10:30:15" },
+        .{ .key = "m", .val = "12.345" },
+    });
+    try expectFile(&tmp, "p.csv", "d,d1,t,tm,m,x1\n2026-02-01,2026-02-02,2026-02-01 00:00:00,10:30:15,12.35,2.50\n");
+
+    // text that is not one: the run refuses it, and so does the check, in the same words
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), "PARAM d DATE DEFAULT 'nope'; SELECT $d AS d;", &pdiag);
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
+    try std.testing.expectEqualStrings("PARAM `d`: `nope` is not a date", rdiag.msg);
+    var adiag = analyze.Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyze.analyze(parena.allocator(), prog, &adiag));
+    try std.testing.expectEqualStrings("PARAM `d`: `nope` is not a date", adiag.msg);
+    var bdiag: Diag = .{};
+    const bound = try parser.parseSource(parena.allocator(), "PARAM d DATE DEFAULT '2026-01-01'; SELECT $d AS d;", &pdiag);
+    try std.testing.expectError(error.PlanFailed, run(alloc, bound, .{ .params = &.{.{ .key = "d", .val = "01/02/2026" }} }, &bdiag));
+    try std.testing.expect(std.mem.indexOf(u8, bdiag.msg, "expected YYYY-MM-DD") != null);
+}
+
+test "week: ISO weeks from Monday, in date_trunc, extract, date_add and date_diff" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try checkAndRun(alloc, &tmp,
+        \\LOAD INTO '$B/w.csv' AS SELECT
+        \\  date_trunc('week', CAST('2026-09-30' AS DATE)) AS wed,
+        \\  date_trunc('week', CAST('2026-10-04 23:59:59' AS TIMESTAMP)) AS sun,
+        \\  extract('week', CAST('2021-01-01' AS DATE)) AS w53,
+        \\  extract('week', CAST('2024-12-30' AS DATE)) AS w1,
+        \\  date_diff('week', CAST('2024-01-07' AS DATE), CAST('2024-01-08' AS DATE)) AS crossed,
+        \\  date_add('week', 2, CAST('2026-09-30' AS DATE)) AS plus2;
+    , 1, &.{});
+    try expectFile(&tmp, "w.csv", "wed,sun,w53,w1,crossed,plus2\n2026-09-28 00:00:00,2026-09-28 00:00:00,53,1,1,2026-10-14\n");
+}
+
+test "check validates a literal date unit or strftime format where the columns' types are not known" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const cases = [_]struct { sql: []const u8, bad: ?[]const u8 }{
+        .{ .sql = "SELECT date_trunc('fortnight', ts) AS w FROM p.dbo.t;", .bad = "unknown time unit `fortnight`" },
+        .{ .sql = "SELECT * FROM p.dbo.t WHERE date_diff('quarter', a, b) > 1;", .bad = "unknown time unit `quarter`" },
+        .{ .sql = "WITH c AS (SELECT strftime(ts, '%Q') AS s FROM p.dbo.t) SELECT * FROM c;", .bad = "does not support `%Q`" },
+        .{ .sql = "SELECT max(date_add('weeks', 1, ts)) AS m FROM p.dbo.t;", .bad = "unknown time unit `weeks`" },
+        .{ .sql = "SELECT date_trunc('week', ts) AS w FROM p.dbo.t;", .bad = null },
+    };
+    for (cases) |tc| {
+        const src = try std.fmt.allocPrint(a, "CREATE CONNECTION p TYPE sqlserver OPTIONS (host = 'h');\n{s}", .{tc.sql});
+        const prog = try parser.parseSource(a, src, &pdiag);
+        var d = analyze.Diag{};
+        if (tc.bad) |want| {
+            try std.testing.expectError(error.AnalyzeFailed, analyze.analyze(a, prog, &d));
+            try std.testing.expect(std.mem.indexOf(u8, d.msg, want) != null);
+        } else _ = try analyze.analyze(a, prog, &d);
+    }
+}

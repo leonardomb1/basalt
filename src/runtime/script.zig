@@ -203,7 +203,7 @@ fn renderQual(arena: std.mem.Allocator, q: ast.QualName, lr: LoopRow) !ast.QualN
     } else return q;
     const parts = try arena.alloc([]const u8, q.parts.len);
     for (q.parts, parts) |s, *dst| dst.* = try interpAll(arena, s, lr);
-    return .{ .parts = parts, .safe = q.safe, .span = q.span };
+    return .{ .parts = parts, .safe = q.safe, .span = q.span, .dollar = q.dollar };
 }
 
 fn renderRead(arena: std.mem.Allocator, rd: ast.Read, lr: LoopRow) !ast.Read {
@@ -344,14 +344,13 @@ fn renderRecur(ctx: RenderCtx, e: *const ast.Expr) anyerror!*ast.Expr {
 
 fn renderExpr(arena: std.mem.Allocator, e: *const ast.Expr, lr: LoopRow) anyerror!*ast.Expr {
     if (e.* == .str_lit) return try mk(arena, .{ .str_lit = try interpAll(arena, e.str_lit, lr) });
-    // `$name` parses to a plain single-part field, so a loop variable used as a
-    // value is indistinguishable from a column here — bind it to the row's cell,
-    // shadowing a same-named source column (the rule scalar params already use).
-    // Multi-part paths (`$job.x`) belong to expand.zig and are left alone.
+    // A `$name` loop variable used as a value binds to the row's cell. A bare
+    // name is a column, even one a loop variable shares. Multi-part paths
+    // (`$job.x`) belong to expand.zig and are left alone.
     if (e.* == .field) {
-        if (e.field.single()) |nm| {
+        if (e.field.dollar) if (e.field.single()) |nm| {
             if (lr.loopVar(arena, nm)) |v| return mkLit(arena, v);
-        }
+        };
         const q = try renderQual(arena, e.field, lr);
         if (q.parts.ptr != e.field.parts.ptr) return mk(arena, .{ .field = q });
     }

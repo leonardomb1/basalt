@@ -21,6 +21,10 @@ pub const Span = struct { start: Pos, end: Pos };
 pub const QualName = struct {
     parts: []const []const u8,
     safe: []const bool = &.{},
+    /// Written `$name`: a PARAM, LET, loop variable or JSON param — script scope.
+    /// Without it the name is a column (or a `LET … IN` / function binding), and
+    /// nothing script-scoped may stand in for it.
+    dollar: bool = false,
     /// Where the name was written, when it was: what an error about it underlines.
     span: ?Span = null,
 

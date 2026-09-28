@@ -1520,7 +1520,7 @@ const typing = struct {
         if (c.args.len != 2) return self.err("`{s}` takes (unit, timestamp)", .{name});
         if (c.args[0].* != .str_lit) return self.err("`{s}` needs a literal unit", .{name});
         if (timeUnit(c.args[0].str_lit) == null)
-            return self.err("unknown time unit `{s}`", .{c.args[0].str_lit});
+            return self.err("unknown time unit `{s}` (units: year, month, week, day, hour, minute, second)", .{c.args[0].str_lit});
         const a = try self.argType(c, 1);
         if (a.kind != .date and a.kind != .timestamp and !a.unknown)
             return self.err("`{s}` needs a date or timestamp", .{name});
@@ -1741,7 +1741,7 @@ const typing = struct {
         if (c.args.len != 3) return self.err("`date_add` takes (unit, n, timestamp)", .{});
         if (c.args[0].* != .str_lit) return self.err("`date_add` needs a literal unit", .{});
         const u = timeUnit(c.args[0].str_lit) orelse
-            return self.err("unknown time unit `{s}`", .{c.args[0].str_lit});
+            return self.err("unknown time unit `{s}` (units: year, month, week, day, hour, minute, second)", .{c.args[0].str_lit});
         const nt = try self.argType(c, 1);
         if (!numericish(nt)) return self.err("`date_add` needs an integer amount", .{});
         const a = try self.argType(c, 2);
@@ -1761,7 +1761,7 @@ const typing = struct {
         if (c.args.len != 3) return self.err("`date_diff` takes (unit, start, end)", .{});
         if (c.args[0].* != .str_lit) return self.err("`date_diff` needs a literal unit", .{});
         if (timeUnit(c.args[0].str_lit) == null)
-            return self.err("unknown time unit `{s}`", .{c.args[0].str_lit});
+            return self.err("unknown time unit `{s}` (units: year, month, week, day, hour, minute, second)", .{c.args[0].str_lit});
         const a = try self.argType(c, 1);
         const b = try self.argType(c, 2);
         if (!temporalish(a) or !temporalish(b))
@@ -2720,7 +2720,15 @@ pub fn formatTimestamp(arena: std.mem.Allocator, micros: i64) ![]const u8 {
 }
 
 /// Field selector shared by `extract` and `date_trunc`.
-pub const TimeUnit = enum { year, month, day, hour, minute, second };
+/// `week` is the ISO week: it starts on Monday, and `extract` numbers it 1-53
+/// with week 1 the one holding the year's first Thursday (Postgres, DuckDB).
+pub const TimeUnit = enum { year, month, week, day, hour, minute, second };
+
+/// Days since the epoch of the Monday starting `day`'s ISO week. 1970-01-01 was
+/// a Thursday, three days after a Monday.
+fn isoWeekStart(day: i64) i64 {
+    return day - @mod(day + 3, 7);
+}
 
 pub fn timeUnit(name: []const u8) ?TimeUnit {
     var buf: [16]u8 = undefined;
@@ -2746,6 +2754,7 @@ fn truncMicros(us: i64, u: TimeUnit) i64 {
         .minute => us - @mod(rem, 60_000_000),
         .hour => us - @mod(rem, 3_600_000_000),
         .day => day * 86_400_000_000,
+        .week => isoWeekStart(day) * 86_400_000_000,
         .month => blk: {
             const c = civilFromDays(day);
             break :blk daysFromCivil(c.y, c.m, 1) * 86_400_000_000;
@@ -2764,6 +2773,12 @@ fn extractField(us: i64, u: TimeUnit) i64 {
     return switch (u) {
         .year => c.y,
         .month => @intCast(c.m),
+        // the week's Thursday decides its year, and it is that year's nth
+        .week => blk: {
+            const thu = isoWeekStart(day) + 3;
+            const ty = civilFromDays(thu).y;
+            break :blk @divFloor(thu - daysFromCivil(ty, 1, 1), 7) + 1;
+        },
         .day => @intCast(c.d),
         .hour => @divFloor(rem, 3_600_000_000),
         .minute => @mod(@divFloor(rem, 60_000_000), 60),
@@ -2811,6 +2826,7 @@ fn addUnits(v: Value, u: TimeUnit, n: i64) EvalError!Value {
             const nd = switch (u) {
                 .year => addMonthsToDays(days, try mulI64(n, 12)),
                 .month => addMonthsToDays(days, n),
+                .week => try addI64(days, try mulI64(n, 7)),
                 .day => try addI64(days, n),
                 .hour, .minute, .second => return error.TypeMismatch,
             };
@@ -2825,6 +2841,7 @@ fn addUnits(v: Value, u: TimeUnit, n: i64) EvalError!Value {
                     const shifted = try mulI64(addMonthsToDays(day, months), 86_400_000_000);
                     break :blk try addI64(shifted, rem);
                 },
+                .week => try addI64(us, try mulI64(n, 7 * 86_400_000_000)),
                 .day => try addI64(us, try mulI64(n, 86_400_000_000)),
                 .hour => try addI64(us, try mulI64(n, 3_600_000_000)),
                 .minute => try addI64(us, try mulI64(n, 60_000_000)),
@@ -2851,6 +2868,12 @@ fn dateDiff(a_us: i64, b_us: i64, u: TimeUnit) i64 {
             if (u == .year) return cb.y - ca.y;
             return (cb.y * 12 + @as(i64, cb.m)) - (ca.y * 12 + @as(i64, ca.m));
         },
+        // weeks are a calendar unit too: the Mondays crossed, as date_trunc cuts
+        .week => {
+            const wa = isoWeekStart(@divFloor(a_us, 86_400_000_000));
+            const wb = isoWeekStart(@divFloor(b_us, 86_400_000_000));
+            return @divExact(wb - wa, 7);
+        },
         .day => return @divTrunc(b_us - a_us, 86_400_000_000),
         .hour => return @divTrunc(b_us - a_us, 3_600_000_000),
         .minute => return @divTrunc(b_us - a_us, 60_000_000),
@@ -2861,7 +2884,7 @@ fn dateDiff(a_us: i64, b_us: i64, u: TimeUnit) i64 {
 /// The first unsupported `%` directive in `fmt` (as a one-byte slice), or null
 /// when every directive is one `strftimeFmt` understands. Used at check time on
 /// a literal format so a typo fails the plan, not the run.
-fn badStrftime(fmt: []const u8) ?[]const u8 {
+pub fn badStrftime(fmt: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i < fmt.len) : (i += 1) {
         if (fmt[i] != '%') continue;

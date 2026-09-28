@@ -917,7 +917,14 @@ fn resolveParams(arena: std.mem.Allocator, program: ast.Program, cli: []const Pa
         }
         if (v == null) {
             if (p.default) |d| {
-                v = try constEvalDefault(d, diag);
+                // the declared type, as a bound value gets it: `PARAM d DATE
+                // DEFAULT '2026-01-01'` is a DATE, not the text of one
+                const raw = try constEvalDefault(d, diag);
+                v = switch (p.ty.kind) {
+                    .date, .time, .timestamp, .decimal => if (raw == .null) raw else eval.castValueTyped(arena, raw, p.ty) catch
+                        return planErr(diag, try std.fmt.allocPrint(arena, "PARAM `{s}`: `{s}` is not a {s}", .{ p.name, if (raw == .string) raw.string else "its DEFAULT", try p.ty.name(arena) })),
+                    else => raw,
+                };
             } else {
                 return planErr(diag, try std.fmt.allocPrint(arena, "missing required param `{s}`", .{p.name}));
             }
@@ -976,7 +983,17 @@ fn parseParamValue(arena: std.mem.Allocator, ty: types.Type, str: []const u8, di
         .float => .{ .float = std.fmt.parseFloat(f64, str) catch return planErr(diag, "invalid float param value") },
         .string => .{ .string = try arena.dupe(u8, str) },
         .bool => if (std.mem.eql(u8, str, "true")) Value{ .bool = true } else if (std.mem.eql(u8, str, "false")) Value{ .bool = false } else planErr(diag, "invalid bool param value"),
-        else => planErr(diag, "unsupported param type for CLI binding"),
+        // The text a CAST takes, read as a CAST reads it — so `-p d=2026-02-01`
+        // binds exactly what `CAST('2026-02-01' AS DATE)` would, a date alone
+        // reaches a TIMESTAMP as its midnight, and a decimal rounds as a cast does.
+        .date, .time, .timestamp, .decimal => eval.castValueTyped(arena, .{ .string = str }, ty) catch
+            planErr(diag, try std.fmt.allocPrint(arena, "invalid {s} param value `{s}` — expected {s}", .{ try ty.name(arena), str, switch (ty.kind) {
+                .date => "YYYY-MM-DD",
+                .time => "HH:MM[:SS[.ffffff]]",
+                .timestamp => "YYYY-MM-DD[ HH:MM:SS[.ffffff]]",
+                else => "a number",
+            } })),
+        else => planErr(diag, try std.fmt.allocPrint(arena, "a {s} param cannot be bound from text", .{try ty.name(arena)})),
     };
 }
 

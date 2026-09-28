@@ -62,8 +62,9 @@ fn failAt(diag: *Diag, span: ?ast.Span, comptime fmt: []const u8, args: anytype)
 /// `std.StringHashMap(*const ast.Expr)` directly; it's the same type.
 const ParamMap = std.StringHashMap(*const ast.Expr);
 
-/// Deep-copy `expr`, replacing single-name field refs that name a param with its
-/// literal. No params ⇒ returns the original (no copy).
+/// Deep-copy `expr`, replacing each `$name` that names a param or LET with its
+/// literal. A bare name is a column — a PARAM of the same name never stands in
+/// for it. No params ⇒ returns the original (no copy).
 const SubstCtx = struct { arena: std.mem.Allocator, params: *const ParamMap };
 
 fn substRecur(ctx: SubstCtx, e: *const ast.Expr) Error!*ast.Expr {
@@ -74,7 +75,7 @@ pub fn substExpr(arena: std.mem.Allocator, expr: *const ast.Expr, params: *const
     if (params.count() == 0) return expr;
     if (expr.* == .field) {
         const q = expr.field;
-        if (q.parts.len == 1) if (params.get(q.parts[0])) |lit| return lit;
+        if (q.dollar and q.parts.len == 1) if (params.get(q.parts[0])) |lit| return lit;
         return expr;
     }
     return ast.rebuildExpr(arena, expr, SubstCtx{ .arena = arena, .params = params }, substRecur);
@@ -495,8 +496,19 @@ fn overrideExpr(arena: std.mem.Allocator, ty: types.Type, raw: []const u8) Error
         .int => mk(arena, .{ .int_lit = std.fmt.parseInt(i64, raw, 10) catch return null }),
         .float => mk(arena, .{ .float_lit = std.fmt.parseFloat(f64, raw) catch return null }),
         .bool => mk(arena, .{ .bool_lit = std.mem.eql(u8, raw, "true") }),
-        .string, .date, .time, .timestamp, .decimal, .bytes => mk(arena, .{ .str_lit = raw }),
+        .string, .bytes => mk(arena, .{ .str_lit = raw }),
+        .date, .time, .timestamp, .decimal => typedParam(arena, ty, try mk(arena, .{ .str_lit = raw })),
         else => null,
+    };
+}
+
+/// A PARAM's value as the runtime binds it: a DATE, TIME, TIMESTAMP or DECIMAL
+/// is its text CAST to the declared type (`env.mkLit`), so a check types `$d` as
+/// the run does — `date_add('day', 1, $d)` is fine for a DATE param.
+fn typedParam(arena: std.mem.Allocator, ty: types.Type, e: *const ast.Expr) Error!*const ast.Expr {
+    return switch (ty.kind) {
+        .date, .time, .timestamp, .decimal => mk(arena, .{ .cast = .{ .e = @constCast(e), .ty = ty } }),
+        else => e,
     };
 }
 
@@ -506,6 +518,61 @@ pub fn analyze(arena: std.mem.Allocator, raw_program: ast.Program, diag: *Diag) 
 
 pub fn analyzeWith(arena: std.mem.Allocator, raw_program: ast.Program, cli: []const ParamOverride, diag: *Diag) error{ AnalyzeFailed, OutOfMemory }!Plan {
     return analyzeOpts(arena, raw_program, .{ .overrides = cli }, diag);
+}
+
+/// Arguments a builtin takes as syntax rather than data — a date unit, a
+/// `strftime` format — checked wherever a literal one appears. Typing checks
+/// them too, but only where the columns' types are known, which a SQL table's
+/// are not until it is read: `date_trunc('fortnight', ts)` over one checked out
+/// and failed at run time.
+fn checkLiteralArgs(diag: *Diag, e: *const ast.Expr) Error!void {
+    switch (e.*) {
+        .call => |c| {
+            const unit_fn = std.mem.eql(u8, c.name, "date_trunc") or std.mem.eql(u8, c.name, "extract") or
+                std.mem.eql(u8, c.name, "date_add") or std.mem.eql(u8, c.name, "date_diff");
+            if (unit_fn and c.args.len > 0 and c.args[0].* == .str_lit and eval.timeUnit(c.args[0].str_lit) == null)
+                return fail(diag, "unknown time unit `{s}` (units: year, month, week, day, hour, minute, second)", .{c.args[0].str_lit});
+            if (std.mem.eql(u8, c.name, "strftime") and c.args.len == 2 and c.args[1].* == .str_lit)
+                if (eval.badStrftime(c.args[1].str_lit)) |bad|
+                    return fail(diag, "`strftime` does not support `%{s}` (supported: %Y %m %d %H %M %S %y %%)", .{bad});
+            for (c.args) |a| try checkLiteralArgs(diag, a);
+        },
+        .unary => |u| try checkLiteralArgs(diag, u.e),
+        .binary => |b| {
+            try checkLiteralArgs(diag, b.l);
+            try checkLiteralArgs(diag, b.r);
+        },
+        .cond => |c| {
+            try checkLiteralArgs(diag, c.cond);
+            try checkLiteralArgs(diag, c.then);
+            try checkLiteralArgs(diag, c.els);
+        },
+        .cast => |c| try checkLiteralArgs(diag, c.e),
+        .is_null => |n| try checkLiteralArgs(diag, n.e),
+        .let_in => |l| {
+            try checkLiteralArgs(diag, l.value);
+            try checkLiteralArgs(diag, l.body);
+        },
+        .match => |m| {
+            if (m.subject) |s| try checkLiteralArgs(diag, s);
+            for (m.arms) |arm| {
+                for (arm.pats) |p| try checkLiteralArgs(diag, p);
+                if (arm.guard) |g| try checkLiteralArgs(diag, g);
+                try checkLiteralArgs(diag, arm.value);
+            }
+        },
+        else => {},
+    }
+}
+
+fn checkStageLiterals(diag: *Diag, st: ast.Stage) Error!void {
+    errdefer diag.stamp(st.pos);
+    switch (st.node) {
+        .filter => |p| try checkLiteralArgs(diag, p),
+        .select => |items| for (items) |it| if (it == .computed) try checkLiteralArgs(diag, it.computed.expr),
+        .aggregate => |ag| for (ag.aggs) |a| if (a.arg) |x| try checkLiteralArgs(diag, x),
+        else => {},
+    }
 }
 
 /// A table that exists where the script runs but that the script does not
@@ -561,10 +628,23 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
     for (program.stmts) |s| if (s == .param) {
         const p = s.param;
         var bound: ?*const ast.Expr = null;
+        var text: ?[]const u8 = null;
         for (cli) |o| if (std.mem.eql(u8, o.name, p.name)) {
             bound = try overrideExpr(arena, p.ty, o.value);
+            text = o.value;
         };
-        try params_map.put(p.name, bound orelse if (p.default) |d| d else try typedZero(arena, p.ty));
+        if (text == null) if (p.default) |d| if (d.* == .str_lit) {
+            text = d.str_lit;
+        };
+        // what the run's CAST would refuse, refused here with its words
+        switch (p.ty.kind) {
+            .date, .time, .timestamp, .decimal => if (text) |t| {
+                _ = eval.castValueTyped(arena, .{ .string = t }, p.ty) catch
+                    return fail(diag, "PARAM `{s}`: `{s}` is not a {s}", .{ p.name, t, try p.ty.name(arena) });
+            },
+            else => {},
+        }
+        try params_map.put(p.name, bound orelse try typedParam(arena, p.ty, if (p.default) |d| d else try typedZero(arena, p.ty)));
     };
     // Statement-level `LET`s bind exactly like params — a `$name` ref substitutes
     // the bound expression — but after every PARAM and in declaration order, so a
@@ -740,6 +820,12 @@ const Ctx = struct {
         };
     }
 
+    /// A CTE's literal arguments, checked where it is declared: it is only typed
+    /// where it is read, and then only when its source's columns are known.
+    fn checkBindingLiterals(self: *Ctx, p: ast.Pipeline) Error!void {
+        for (p.stages) |st| checkStageLiterals(self.diag, st) catch |e| return self.note(e);
+    }
+
     fn knownTable(self: *Ctx, name: []const u8) ?KnownTable {
         for (self.known) |k| if (std.mem.eql(u8, k.name, name)) return k;
         return null;
@@ -751,7 +837,10 @@ const Ctx = struct {
     /// `check` and `run` name the same constraint.
     fn checkStmts(self: *Ctx, stmts: []const ast.Stmt, outs: *std.array_list.Managed(Output), top: bool) Error!void {
         for (stmts) |s| switch (s) {
-            .binding => |b| try self.bindings.put(b.name, b.pipeline),
+            .binding => |b| {
+                try self.bindings.put(b.name, b.pipeline);
+                try self.checkBindingLiterals(b.pipeline);
+            },
             .output => |p| if (try self.attempt(self.analyzeOutput(p))) |o| try outs.append(o),
             .explain => |e| if (try self.attempt(self.analyzeOutput(e.pipeline))) |o| try outs.append(o),
             .for_each => |fe| try self.checkBody(fe.body, outs),
@@ -777,6 +866,7 @@ const Ctx = struct {
             .binding => |b| {
                 try saved.append(.{ .name = b.name, .prev = self.bindings.get(b.name) });
                 try self.bindings.put(b.name, b.pipeline);
+                try self.checkBindingLiterals(b.pipeline);
             },
             .output => |p| if (try self.attempt(self.analyzeOutput(p))) |o| try outs.append(o),
             .explain => |e| if (try self.attempt(self.analyzeOutput(e.pipeline))) |o| try outs.append(o),
@@ -803,6 +893,7 @@ const Ctx = struct {
         if (stages.len == 0) return fail(self.diag, "empty pipeline", .{});
         if (stages[stages.len - 1].node != .write)
             return fail(self.diag, "a top-level pipeline must end in `write`", .{});
+        for (stages) |st| try checkStageLiterals(self.diag, st);
 
         var source = self.resolveSource(stages[0]) catch |e| {
             self.diag.stamp(stages[0].pos);

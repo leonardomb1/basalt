@@ -612,12 +612,22 @@ pub fn mkLit(arena: std.mem.Allocator, v: Value) anyerror!*ast.Expr {
         .int => |i| mk(arena, .{ .int_lit = i }),
         .float => |f| mk(arena, .{ .float_lit = f }),
         .string => |s| mk(arena, .{ .str_lit = s }),
-        // The DSL has no date/time literal; comparisons coerce a string against a
-        // temporal column either way, so the ISO text is the faithful literal for
-        // a folded `LET cutoff = date_add('day', -7, today())`.
-        .date, .time, .timestamp => mk(arena, .{ .str_lit = try eval.valueToString(arena, v) }),
+        // The DSL has no date, time or decimal literal: the value's text, CAST to
+        // its own type, so `$d` is a DATE where the script uses it — `date_add`
+        // takes it, a parquet column stores it as one — and a decimal keeps its
+        // digits. (Without this a decimal LET became NULL, and a DATE PARAM a
+        // string.)
+        .date => typedLit(arena, v, types.Type.init(.date)),
+        .time => typedLit(arena, v, types.Type.init(.time)),
+        .timestamp => typedLit(arena, v, types.Type.init(.timestamp)),
+        .decimal => |d| typedLit(arena, v, types.Type.decimal(38, d.scale)),
         else => mk(arena, .null_lit),
     };
+}
+
+fn typedLit(arena: std.mem.Allocator, v: Value, ty: types.Type) anyerror!*ast.Expr {
+    const text = try mk(arena, .{ .str_lit = try eval.valueToString(arena, v) });
+    return mk(arena, .{ .cast = .{ .e = text, .ty = ty } });
 }
 
 pub fn forHintName(hints: []const ast.Hint, key: []const u8) ?[]const u8 {
