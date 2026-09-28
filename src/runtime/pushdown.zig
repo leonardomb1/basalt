@@ -683,6 +683,213 @@ const render = struct {
     }
 };
 
+/// `ORDER BY … LIMIT n` / `LIMIT n` descended into a SQL source: the row cap the
+/// source is asked for, and the order it must pick those rows in.
+///
+/// Unlike the aggregate descent this is never authoritative — the engine keeps its
+/// own filter, sort and limit over what arrives, so the final order and cut are
+/// basalt's. The source only has to send a *sufficient* set: every row the engine's
+/// own top-N would keep. That holds when (a) every filter between the read and the
+/// limit ran at the source too, so the source counts the same rows the engine
+/// does, and (b) the source ranks the keys exactly as the engine does, nulls last
+/// in both directions (`op.Sort`). Rows tied on every key at the cut are
+/// interchangeable in either plan — the engine's own pick among them already
+/// depends on arrival order, which a SQL source never promises.
+pub const TopN = struct {
+    /// `limit + offset`: the engine discards the offset itself.
+    rows: u64,
+    /// The source columns to order by, empty for a plain `LIMIT`.
+    keys: []const Key = &.{},
+
+    pub const Key = struct { col: []const u8, desc: bool };
+
+    /// `order by id desc limit 1000`, for EXPLAIN's `pushdown:` line.
+    pub fn describe(self: TopN, arena: std.mem.Allocator) ![]const u8 {
+        var out = std.array_list.Managed(u8).init(arena);
+        for (self.keys, 0..) |k, i| {
+            try out.appendSlice(if (i == 0) "order by " else ", ");
+            try out.appendSlice(k.col);
+            if (k.desc) try out.appendSlice(" desc");
+        }
+        if (out.items.len > 0) try out.append(' ');
+        try out.writer().print("limit {d}", .{self.rows});
+        return out.toOwnedSlice();
+    }
+};
+
+/// The top-N a pipeline asks of its read: `read | filter* | select* | [sort] |
+/// limit | …`, with each sort key traced back through the selects to the source
+/// column it names. Null when the pipeline has no such limit — or, with a reason in
+/// `why`, when it has one this shape cannot carry (then the caller says so, since a
+/// top-N that stays engine-side streams the whole table). `stages` is the pipeline
+/// without its write. No schema is needed: types are checked by `planTopN`.
+pub fn classifyTopN(arena: std.mem.Allocator, stages: []const ast.Stage, why: *[]const u8) !?TopN {
+    if (stages.len < 2 or stages[0].node != .read) return null;
+    const mid = stages[1..];
+    const at = for (mid, 0..) |st, i| {
+        if (st.node == .limit) break i;
+    } else return null;
+    const lim = mid[at].node.limit;
+    var sort: ?ast.Sort = null;
+    var selects_end: usize = at;
+    if (at > 0 and mid[at - 1].node == .sort) {
+        sort = mid[at - 1].node.sort;
+        selects_end = at - 1;
+    }
+    // filters first, then row-preserving projections; anything else changes which
+    // rows reach the limit (or cannot be traced to the source) — not a top-N shape
+    var i: usize = 0;
+    while (i < selects_end and mid[i].node == .filter) i += 1;
+    const sel_start = i;
+    while (i < selects_end) : (i += 1) switch (mid[i].node) {
+        .select => {},
+        .filter => {
+            why.* = "a WHERE follows the projection, so it filters computed columns";
+            return null;
+        },
+        else => return null,
+    };
+    const rows = std.math.add(u64, lim.count, lim.offset) catch {
+        why.* = "LIMIT plus OFFSET overflows";
+        return null;
+    };
+    if (rows > std.math.maxInt(i64)) {
+        why.* = "LIMIT plus OFFSET is past what a SQL LIMIT takes";
+        return null;
+    }
+    const s = sort orelse return .{ .rows = rows };
+    const keys = try arena.alloc(TopN.Key, s.keys.len);
+    for (s.keys, keys) |k, *out| {
+        const col = sourceName(mid[sel_start..selects_end], k.field.last()) orelse {
+            why.* = try std.fmt.allocPrint(arena, "ORDER BY `{s}` is not a plain source column", .{k.field.last()});
+            return null;
+        };
+        out.* = .{ .col = col, .desc = k.desc };
+    }
+    return .{ .rows = rows, .keys = keys };
+}
+
+/// The source column an output `name` carries through `selects` unchanged or
+/// merely renamed, or null when some select computes it or drops it.
+fn sourceName(selects: []const ast.Stage, name_in: []const u8) ?[]const u8 {
+    var name = name_in;
+    var i = selects.len;
+    while (i > 0) {
+        i -= 1;
+        name = selectSource(selects[i].node.select, name) orelse return null;
+    }
+    return name;
+}
+
+fn selectSource(items: []const ast.SelectItem, name: []const u8) ?[]const u8 {
+    for (items) |item| switch (item) {
+        .field => |q| if (std.mem.eql(u8, q.last(), name)) return q.last(),
+        .computed => |c| if (std.mem.eql(u8, c.name, name)) return switch (c.expr.*) {
+            .field => |q| q.last(),
+            else => null,
+        },
+        else => {},
+    };
+    // not produced by name: only a star carries it through
+    for (items) |item| switch (item) {
+        .star => return name,
+        .star_except => |ex| {
+            for (ex) |x| if (std.mem.eql(u8, x, name)) return null;
+            return name;
+        },
+        .star_rename => |rs| {
+            for (rs) |r| if (std.mem.eql(u8, r.to, name)) return r.from;
+            for (rs) |r| if (std.mem.eql(u8, r.from, name)) return null;
+            return name;
+        },
+        else => {},
+    };
+    return null;
+}
+
+/// Whether every filter before the limit also runs at the source: the pushed limit
+/// counts rows after the source's WHERE, so a filter left engine-side would thin
+/// the capped set below what the engine's own limit keeps.
+fn filtersAllTranslate(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage, schema: types.Schema, check_fields: bool) !bool {
+    for (stages[1..]) |st| {
+        if (st.node != .filter) break;
+        if ((try translateExpr(arena, st.node.filter, dialect, schema, check_fields)) == null) return false;
+    }
+    return true;
+}
+
+/// Key kinds every dialect orders exactly as the engine: numbers by value (a float's
+/// NaN greatest, as PostgreSQL sorts it — the others store none), and dates, times
+/// and timestamps by instant. A string's order is its collation's — case- and
+/// accent-folded by default on mysql and sqlserver, padded on a `char(n)` — where
+/// the engine compares bytes, so a string key is refused, as `MIN`/`MAX` refuse one.
+fn orderedAlike(kind: types.TypeKind) bool {
+    return switch (kind) {
+        .int, .float, .decimal, .date, .time, .timestamp => true,
+        else => false,
+    };
+}
+
+/// EXPLAIN's view of the top-N, without a connection: what descends, or null.
+/// Analysis never connects, so a sort key's type is still to be checked when the
+/// statement runs; the text says so.
+pub const ExplainedTopN = struct { text: []const u8, rows: u64, sorted: bool };
+
+pub fn explainTopN(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage) !?ExplainedTopN {
+    var why: []const u8 = "";
+    const t = (try classifyTopN(arena, stages, &why)) orelse return null;
+    if (!try filtersAllTranslate(arena, dialect, stages, .{ .fields = &.{} }, false)) return null;
+    const d = try t.describe(arena);
+    return .{
+        .text = if (t.keys.len == 0) d else try std.fmt.allocPrint(arena, "{s} (if the keys are numeric or temporal)", .{d}),
+        .rows = t.rows,
+        .sorted = t.keys.len > 0,
+    };
+}
+
+/// The statement that asks the source for `t.rows` rows of `base_sql` in the
+/// engine's order, or null (with `why`) when it would not be the engine's answer.
+pub fn planTopN(arena: std.mem.Allocator, dialect: Dialect, base_sql: []const u8, src_schema: types.Schema, stages: []const ast.Stage, t: TopN, why: *[]const u8) !?[]const u8 {
+    if (!try filtersAllTranslate(arena, dialect, stages, src_schema, true)) {
+        why.* = try std.fmt.allocPrint(arena, "a WHERE predicate does not translate whole to {s} SQL", .{@tagName(dialect)});
+        return null;
+    }
+    for (t.keys) |k| {
+        const idx = src_schema.indexOf(k.col) orelse {
+            why.* = try std.fmt.allocPrint(arena, "ORDER BY `{s}` is not a source column", .{k.col});
+            return null;
+        };
+        const kind = src_schema.fields[idx].ty.kind;
+        if (!orderedAlike(kind)) {
+            why.* = try std.fmt.allocPrint(arena, "ORDER BY `{s}` is a {s}, which {s} orders by its collation rather than byte by byte", .{ k.col, @tagName(kind), @tagName(dialect) });
+            return null;
+        }
+    }
+    return try renderTopN(arena, dialect, base_sql, t);
+}
+
+/// `base_sql` as a derived table, ordered nulls-last and capped, in the dialect's
+/// own spelling: `NULLS LAST` on postgres, a leading `k IS NULL` key on
+/// mysql/StarRocks, a `CASE` key and `TOP` on sqlserver.
+pub fn renderTopN(arena: std.mem.Allocator, dialect: Dialect, base_sql: []const u8, t: TopN) ![]const u8 {
+    var ob = std.array_list.Managed(u8).init(arena);
+    for (t.keys, 0..) |k, i| {
+        if (i > 0) try ob.appendSlice(", ");
+        const q = try split.quoteIdent(arena, dialect, k.col);
+        const dir = if (k.desc) " DESC" else "";
+        switch (dialect) {
+            .postgres => try ob.writer().print("{s}{s} NULLS LAST", .{ q, dir }),
+            .mysql, .starrocks => try ob.writer().print("({s} IS NULL), {s}{s}", .{ q, q, dir }),
+            .sqlserver => try ob.writer().print("CASE WHEN {s} IS NULL THEN 1 ELSE 0 END, {s}{s}", .{ q, q, dir }),
+        }
+    }
+    const order: []const u8 = if (ob.items.len > 0) try std.fmt.allocPrint(arena, " ORDER BY {s}", .{ob.items}) else "";
+    return switch (dialect) {
+        .sqlserver => std.fmt.allocPrint(arena, "SELECT TOP ({d}) * FROM ({s}) _t{s}", .{ t.rows, base_sql, order }),
+        else => std.fmt.allocPrint(arena, "SELECT * FROM ({s}) _t{s} LIMIT {d}", .{ base_sql, order, t.rows }),
+    };
+}
+
 /// §7 implicit pushdown for a serial pipeline: translate the `filter` stages
 /// that immediately follow a SQL read into one AND-ed WHERE fragment. The
 /// engine KEEPS the filter stages (superset rule) — the fragment only lets
@@ -2030,4 +2237,106 @@ test "derive: only for an inner join, and only when every ref is a key" {
     stages[2] = try eqFilter(a, &.{ "r", "name" }, 7);
     stages[3] = writeStage();
     try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds)) == null);
+}
+
+/// The stages of `sql`'s one pipeline, without its write — as the planner sees them.
+fn topNStagesOf(arena: std.mem.Allocator, sql: []const u8) ![]const ast.Stage {
+    const parser = @import("../lang/sql_parser.zig");
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const src = try std.fmt.allocPrint(arena, "CREATE CONNECTION db TYPE postgres OPTIONS (host = 'h');\n{s};", .{sql});
+    const prog = try parser.parseSource(arena, src, &pdiag);
+    for (prog.stmts) |s| if (s == .output) return s.output.stages[0 .. s.output.stages.len - 1];
+    return error.TestUnexpectedResult;
+}
+
+fn topNOf(arena: std.mem.Allocator, sql: []const u8, why: *[]const u8) !?TopN {
+    return classifyTopN(arena, try topNStagesOf(arena, sql), why);
+}
+
+test "top-N: which pipelines carry a limit to the source, and with which keys" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var why: []const u8 = "";
+
+    const plain = (try topNOf(a, "SELECT * FROM db.t LIMIT 50 OFFSET 10", &why)).?;
+    try std.testing.expectEqual(@as(u64, 60), plain.rows);
+    try std.testing.expectEqual(@as(usize, 0), plain.keys.len);
+
+    const t = (try topNOf(a, "SELECT id AS k, name FROM db.t WHERE id > 5 ORDER BY k DESC, ts LIMIT 3", &why)).?;
+    try std.testing.expectEqual(@as(u64, 3), t.rows);
+    try std.testing.expectEqual(@as(usize, 2), t.keys.len);
+    // the alias traced back to the source column it renames
+    try std.testing.expectEqualStrings("id", t.keys[0].col);
+    try std.testing.expect(t.keys[0].desc);
+    try std.testing.expectEqualStrings("ts", t.keys[1].col);
+    try std.testing.expectEqualStrings("order by id desc, ts limit 3", try t.describe(a));
+
+    // not a top-N at all: no limit, or something that changes which rows reach it
+    why = "";
+    try std.testing.expect((try topNOf(a, "SELECT * FROM db.t ORDER BY id", &why)) == null);
+    try std.testing.expect((try topNOf(a, "SELECT DISTINCT name FROM db.t LIMIT 3", &why)) == null);
+    try std.testing.expect((try topNOf(a, "SELECT name, count(*) AS n FROM db.t GROUP BY name ORDER BY n LIMIT 3", &why)) == null);
+    try std.testing.expectEqualStrings("", why); // none of those is a refusal worth a warning
+
+    // a top-N the shape cannot carry: said why
+    try std.testing.expect((try topNOf(a, "SELECT id * 2 AS d FROM db.t ORDER BY d LIMIT 3", &why)) == null);
+    try std.testing.expect(std.mem.indexOf(u8, why, "not a plain source column") != null);
+}
+
+test "top-N: key types the source orders as the engine does, and filters that must all descend" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const fields = [_]types.Schema.Field{
+        .{ .name = "id", .ty = types.Type.init(.int) },
+        .{ .name = "ts", .ty = types.Type.init(.timestamp).asNullable() },
+        .{ .name = "amt", .ty = types.Type.decimal(10, 2) },
+        .{ .name = "name", .ty = types.Type.init(.string) },
+    };
+    const schema = types.Schema{ .fields = &fields };
+    var why: []const u8 = "";
+
+    for ([_][]const u8{ "id", "ts", "amt" }) |k| {
+        const sql = try std.fmt.allocPrint(a, "SELECT * FROM db.t ORDER BY {s} LIMIT 5", .{k});
+        const stages = try topNStagesOf(a, sql);
+        const t = (try classifyTopN(a, stages, &why)).?;
+        try std.testing.expect((try planTopN(a, .postgres, "SELECT * FROM t", schema, stages, t, &why)) != null);
+    }
+    // a string's order is its collation's
+    const s_st = try topNStagesOf(a, "SELECT * FROM db.t ORDER BY name LIMIT 5");
+    const s_t = (try classifyTopN(a, s_st, &why)).?;
+    try std.testing.expect((try planTopN(a, .postgres, "SELECT * FROM t", schema, s_st, s_t, &why)) == null);
+    try std.testing.expect(std.mem.indexOf(u8, why, "collation") != null);
+    // a filter the source cannot run would thin the capped rows below the engine's cut
+    const f_st = try topNStagesOf(a, "SELECT * FROM db.t WHERE to_hex(id) = '5' ORDER BY id LIMIT 5");
+    const f_t = (try classifyTopN(a, f_st, &why)).?;
+    try std.testing.expect((try planTopN(a, .postgres, "SELECT * FROM t", schema, f_st, f_t, &why)) == null);
+    try std.testing.expect(std.mem.indexOf(u8, why, "does not translate") != null);
+}
+
+test "top-N: each dialect's spelling of nulls-last ordering and the row cap" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const t = TopN{ .rows = 10, .keys = &.{ .{ .col = "v", .desc = true }, .{ .col = "id", .desc = false } } };
+    const base = "SELECT * FROM t";
+    try std.testing.expectEqualStrings(
+        "SELECT * FROM (SELECT * FROM t) _t ORDER BY \"v\" DESC NULLS LAST, \"id\" NULLS LAST LIMIT 10",
+        try renderTopN(a, .postgres, base, t),
+    );
+    try std.testing.expectEqualStrings(
+        "SELECT * FROM (SELECT * FROM t) _t ORDER BY (`v` IS NULL), `v` DESC, (`id` IS NULL), `id` LIMIT 10",
+        try renderTopN(a, .mysql, base, t),
+    );
+    try std.testing.expectEqualStrings(
+        "SELECT * FROM (SELECT * FROM t) _t ORDER BY (`v` IS NULL), `v` DESC, (`id` IS NULL), `id` LIMIT 10",
+        try renderTopN(a, .starrocks, base, t),
+    );
+    try std.testing.expectEqualStrings(
+        "SELECT TOP (10) * FROM (SELECT * FROM t) _t ORDER BY CASE WHEN [v] IS NULL THEN 1 ELSE 0 END, [v] DESC, CASE WHEN [id] IS NULL THEN 1 ELSE 0 END, [id]",
+        try renderTopN(a, .sqlserver, base, t),
+    );
+    try std.testing.expectEqualStrings("SELECT TOP (5) * FROM (SELECT * FROM t) _t", try renderTopN(a, .sqlserver, base, .{ .rows = 5 }));
+    try std.testing.expectEqualStrings("SELECT * FROM (SELECT * FROM t) _t LIMIT 5", try renderTopN(a, .postgres, base, .{ .rows = 5 }));
 }

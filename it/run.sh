@@ -115,6 +115,51 @@ SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM db.basalt_vol;"; 
   fi
 }
 
+# ORDER BY ... LIMIT and LIMIT descend into the source (pushdown.planTopN). Each
+# pushed query must answer exactly what the engine alone does — the reference
+# adds `to_hex(id) IS NOT NULL`, always true and never pushed, which keeps the
+# whole sort here — and the debug log must show whether it descended. The keys
+# carry nulls, so a source ordering them its own way (postgres DESC puts them
+# first) shows up as a diff.
+topnrt() { # $1 label, $2 CREATE CONNECTION db ..., $3 LOAD target
+  local decl=$2
+  if ! brun run -c "$decl
+LOAD INTO $3 REPLACE AS SELECT CAST(id AS INT) AS id, CAST(v AS INT) AS v, CAST(ts AS TIMESTAMP) AS ts, CAST(amt AS DECIMAL(10,2)) AS amt, name FROM 'it/topn.csv';"; then
+    report "$1-topn (load error)" bad
+    return
+  fi
+  tq() { # label, cols, where, order/limit, pushed|refused, test name
+    local w=$3 ref
+    if [ -n "$w" ]; then ref="WHERE ($w) AND to_hex(id) IS NOT NULL"; w="WHERE $w"; else ref="WHERE to_hex(id) IS NOT NULL"; fi
+    local g="$out/topn_$1_$2"
+    $B run --format csv --log-level debug -c "$decl SELECT $2 FROM db.it_topn $w $4;" >"$g.csv" 2>"$g.log" &&
+      $B run --format csv -q -c "$decl SELECT $2 FROM db.it_topn $ref $4;" >"$g.ref" 2>&1
+    local how=refused
+    grep -q "top-N pushdown" "$g.log" && how=pushed
+    if cmp -s "$g.ref" "$g.csv" && [ -s "$g.csv" ] && [ "$how" = "$5" ]; then
+      report "$1-topn-$6" ok
+    else
+      report "$1-topn-$6 (got $how, want $5)" bad
+      diff "$g.ref" "$g.csv" | head -8
+    fi
+  }
+  tq "$1" "id, v"      ""      "ORDER BY v DESC, id LIMIT 4"            pushed int-desc-nulls-last
+  tq "$1" "id, v"      ""      "ORDER BY v DESC, id LIMIT 8"            pushed int-desc-every-row
+  tq "$1" "id, ts"     ""      "ORDER BY ts, id LIMIT 8"                pushed timestamp-asc-nulls-last
+  tq "$1" "id, amt"    ""      "ORDER BY amt DESC, id LIMIT 3 OFFSET 2" pushed decimal-with-offset
+  tq "$1" "id, v"      "id > 2" "ORDER BY v, id LIMIT 3"                pushed filter-and-topn
+  tq "$1" "id AS k, v" ""      "ORDER BY k DESC LIMIT 2"                pushed renamed-key
+  tq "$1" "id, name"   ""      "ORDER BY name, id LIMIT 3"              refused string-key
+  tq "$1" "id, v"      "to_hex(v) = '5'" "ORDER BY v, id LIMIT 3"       refused untranslatable-filter
+  # a plain LIMIT's rows are the source's pick: count them, and see it descended
+  if $B run --format csv --log-level debug -c "$decl SELECT id FROM db.it_topn LIMIT 3 OFFSET 1;" >"$out/topn_plain.csv" 2>"$out/topn_plain.log" &&
+     [ "$(tail -n +2 "$out/topn_plain.csv" | wc -l)" = 3 ] && grep -q "top-N pushdown: limit 4" "$out/topn_plain.log"; then
+    report "$1-topn-plain-limit-offset" ok
+  else
+    report "$1-topn-plain-limit-offset" bad
+  fi
+}
+
 MYSQL_OPTS="host = '127.0.0.1', port = 33306, user = 'root', password = 'it', database = 'it'"
 PG_OPTS="host = '127.0.0.1', port = 35432, user = 'postgres', password = 'it', database = 'it'"
 MSSQL_OPTS="host = '127.0.0.1', port = 31433, user = 'sa', password = 'It_Passw0rd1', database = 'master', tls = 'insecure'"
@@ -122,6 +167,10 @@ MSSQL_OPTS="host = '127.0.0.1', port = 31433, user = 'sa', password = 'It_Passw0
 runs mysql     && sqlrt mysql     "$MYSQL_OPTS"
 runs postgres  && sqlrt postgres  "$PG_OPTS"
 runs sqlserver && sqlrt sqlserver "$MSSQL_OPTS"
+
+runs mysql     && topnrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"         db.it_topn
+runs postgres  && topnrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"         db.it_topn
+runs sqlserver && topnrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);"    db.it_topn
 
 # Split-parallel probe over a shared join index: the key-range lanes must produce
 # exactly what the serial driver does. The split is forced by hint — basalt_it is
@@ -294,6 +343,9 @@ LOAD INTO '$out/sr_embedded_out.csv' AS SELECT id, s FROM fe.it_nullmark2 ORDER 
   else
     report "starrocks-null-marker (run error)" bad
   fi
+
+  # read back through a starrocks connection, so the starrocks dialect renders it
+  topnrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_topn USING stream_load"
 fi
 
 # Azure Blob (Azurite). ADLS Gen2 data is reached through the Blob endpoint —

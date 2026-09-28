@@ -428,6 +428,9 @@ pub const Physical = struct {
     /// which is the SQL key-range fan-out; a file read reported as neither used to
     /// print `physical: serial` while the run fanned out over 16 lanes.
     morsel_parallel: bool,
+    /// A LIMIT descended into the SQL read, and it caps everything the pipeline
+    /// holds at once: at most this many rows arrive to be sorted and cut.
+    top_n: ?u64 = null,
 };
 
 pub const Output = struct {
@@ -724,6 +727,7 @@ const Ctx = struct {
             return e;
         };
 
+        var top_n: ?pushdown.ExplainedTopN = null;
         if (stages[0].node == .read) {
             const rd = stages[0].node.read;
             if ((rd.form == .table or rd.form == .query))
@@ -735,12 +739,20 @@ const Ctx = struct {
                         }
                         const implicit = pushdown.serialWhere(self.arena, d, stages) catch null;
                         source.pushdown = try composePushdown(self.arena, raw, implicit);
+                        if (try pushdown.explainTopN(self.arena, d, stages[0 .. stages.len - 1])) |t| {
+                            top_n = t;
+                            source.pushdown = if (source.pushdown.len > 0)
+                                try std.fmt.allocPrint(self.arena, "{s}; {s}", .{ source.pushdown, t.text })
+                            else
+                                t.text;
+                        }
                     }
                 };
         }
 
         var stage_infos = std.array_list.Managed(Stage).init(self.arena);
         var has_breaker = false;
+        var breakers: usize = 0;
         var map_only = true;
         // Tracks whether the shape is one the runtime fans out over key ranges. It
         // dispatches three of them for a SQL source: map-only, an aggregate with a
@@ -752,7 +764,10 @@ const Ctx = struct {
         for (stages[1 .. stages.len - 1]) |st| {
             errdefer self.diag.stamp(st.pos);
             var si = try self.stageInfo(st);
-            if (si.breaker) has_breaker = true;
+            if (si.breaker) {
+                has_breaker = true;
+                breakers += 1;
+            }
             if (!isMapStage(st.node)) map_only = false;
             switch (st.node) {
                 .aggregate, .join => seen_breaker = true,
@@ -795,6 +810,8 @@ const Ctx = struct {
                 .splittable = splittable,
                 .sink_parallel = sink_is_parallel,
                 .morsel_parallel = !splittable and morselParallelRead(source.connector, stages[0].node),
+                // the pushed sort is then the only breaker, over the capped rows
+                .top_n = if (top_n) |t| (if (!t.sorted or breakers == 1) t.rows else null) else null,
             },
         };
     }
@@ -1029,7 +1046,9 @@ pub fn render(plan: Plan, w: anytype) !void {
             if (o.physical.has_breaker) try w.writeAll(" (per-lane partials, combined)");
         } else {
             try w.writeAll("serial");
-            if (o.physical.has_breaker) try w.writeAll(" (has breaker, materializes)");
+            if (o.physical.top_n) |n| {
+                if (o.physical.has_breaker) try w.print(" (top-N pushed, sorts at most {d} rows)", .{n}) else try w.print(" (limit pushed, at most {d} rows arrive)", .{n});
+            } else if (o.physical.has_breaker) try w.writeAll(" (has breaker, materializes)");
         }
         try w.writeAll("\n");
     }

@@ -206,6 +206,34 @@ pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: AggShape, src
     return out;
 }
 
+/// Descend a `LIMIT` — with the `ORDER BY` before it, if any — into the SQL read, when
+/// `pushdown.planTopN` shows the source can send a set the engine's own top-N is
+/// drawn from. Returns the stage list with the read replaced by a QUERY-form read
+/// of the capped statement; every other stage stays, so the engine still filters,
+/// sorts and cuts what arrives and the final rows are its own. Null leaves the
+/// pipeline as built; `why` then says why, when the pipeline had a limit to push.
+pub fn topNStages(env: *Env, stages: []const ast.Stage, src_base: usize, why: *[]const u8) !?[]const ast.Stage {
+    const arena = env.arena;
+    const desc = env.sql_desc orelse return null;
+    if (stages[0].node != .read) return null;
+    const rd = stages[0].node.read;
+    if (rd.form != .table and rd.form != .query) return null;
+    const t = (try pushdown.classifyTopN(arena, stages[0 .. stages.len - 1], why)) orelse return null;
+    const src_schema = try dupeSchema(arena, env.sources.items[src_base].schema());
+    const q = (try pushdown.planTopN(arena, desc.dialect, desc.base_sql, src_schema, stages[0 .. stages.len - 1], t, why)) orelse return null;
+
+    const out = try arena.dupe(ast.Stage, stages);
+    // No hints: an `@[where = …]` is already in `base_sql`, and a split has nothing
+    // to gain over a capped set — the read is one small statement now.
+    out[0] = .{
+        .node = .{ .read = .{ .connector = rd.connector, .form = .{ .query = q } } },
+        .hints = &.{},
+        .pos = stages[0].pos,
+    };
+    env.log.log(.debug, "top-N pushdown: {s} sent to {s}", .{ try t.describe(arena), @tagName(desc.kind) });
+    return out;
+}
+
 /// Shared header for the parallel workers: a work-stealing item counter plus the
 /// first-error latch. `failed` flags the other workers to stop (checked lock-free);
 /// `first_err` is what the caller re-raises after the join.

@@ -88,6 +88,7 @@ const runParallelSqlAgg = @import("lanes.zig").runParallelSqlAgg;
 const runParallelSqlMapJoin = @import("lanes.zig").runParallelSqlMapJoin;
 const runParquetLane = @import("lanes.zig").runParquetLane;
 const wholeAggStages = @import("lanes.zig").wholeAggStages;
+const topNStages = @import("lanes.zig").topNStages;
 
 const buildScriptScope = @import("script.zig").buildScriptScope;
 const renderPipeline = @import("script.zig").renderPipeline;
@@ -607,7 +608,26 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
             env.log.log(.warn, "aggregate over {s} runs engine-side, not in the source ({s}); every matching row is streamed here to be grouped", .{ @tagName(env.sql_desc.?.dialect), why });
     }
 
-    if (!whole_agg and opts.threads > 1 and env.sql_desc != null) {
+    // A LIMIT, and the ORDER BY before it, descend the same way — built, checked
+    // against the source schema, rebuilt — so "the latest 1000 rows" asks the
+    // source for 1000 rather than streaming the table here to be sorted. The
+    // pushed read is one capped statement, so the split below is skipped.
+    var top_n = false;
+    if (!whole_agg and env.sql_desc != null and src_base < env.sources.items.len) {
+        var why: []const u8 = "";
+        const dialect = env.sql_desc.?.dialect;
+        if (try topNStages(env, stages, src_base, &why)) |ns| {
+            for (env.sources.items[src_base..]) |sc| sc.close();
+            env.sources.shrinkRetainingCapacity(src_base);
+            env.sql_desc = null;
+            stages = ns;
+            res = try buildPipeline(env, ns[0 .. ns.len - 1]);
+            top_n = true;
+        } else if (why.len > 0 and hasSort(stages))
+            env.log.log(.warn, "ORDER BY ... LIMIT over {s} sorts engine-side, not in the source ({s}); every matching row is streamed here to be sorted", .{ @tagName(dialect), why });
+    }
+
+    if (!whole_agg and !top_n and opts.threads > 1 and env.sql_desc != null) {
         if (stages[0].node == .read) {
             if (classifyAggPipeline(stages)) |shape| {
                 if (try runParallelSqlAgg(env, stages, shape.prefix, shape.ag, shape.tail, wr, opts, stats, lanes_used, src_base)) return;
@@ -1103,6 +1123,11 @@ fn moveLabel(arena: std.mem.Allocator, first: ast.Stage, w: ast.Write) ![]const 
 
 fn hasAggregate(stages: []const ast.Stage) bool {
     for (stages) |st| if (st.node == .aggregate) return true;
+    return false;
+}
+
+fn hasSort(stages: []const ast.Stage) bool {
+    for (stages) |st| if (st.node == .sort) return true;
     return false;
 }
 

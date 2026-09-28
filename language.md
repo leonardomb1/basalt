@@ -402,6 +402,34 @@ Source clauses, in any order after the source:
   line that names the rule that refused it (`the WHERE predicate does not
   translate whole to mysql SQL`, ``group key `x` is renamed by the
   aggregate``, …).
+- **`LIMIT` and top-N pushdown** — `read <sql> | filters | [SELECT] | [ORDER BY]
+  | LIMIT n [OFFSET m]` asks the source for `n + m` rows: `LIMIT` on
+  postgres/mysql/StarRocks, `TOP` on sqlserver. Without `ORDER BY` any `n + m`
+  rows are an answer, so it always descends. With one, the source orders them
+  first — nulls last in both directions, as the engine does (`NULLS LAST`;
+  a leading `k IS NULL` key on mysql/StarRocks; a `CASE` key on sqlserver) —
+  and the engine still sorts, offsets and cuts what arrives, so the final order
+  is its own. It descends only when the answer cannot change:
+  - every `WHERE` before the limit translates (§7's rules) — the source counts
+    rows after its own filter, so one left here would thin the capped set;
+  - each `ORDER BY` key is a source column, as-is or renamed by the `SELECT`
+    (`SELECT id AS k … ORDER BY k`), not a computed one;
+  - each key is a number, date, time or timestamp. A string key stays
+    engine-side: its order is the source's collation — case-folded by default
+    on mysql and sqlserver, space-padded for `char(n)` — where the engine
+    compares bytes, the same reason string `MIN`/`MAX` do not descend.
+
+  Rows tied on every key at the cut are interchangeable either way: which of
+  them the engine keeps already depends on the order rows arrive in, which a
+  SQL source never promises. A `DISTINCT`, a join or an aggregate before the
+  limit is not this shape (the aggregate has its own descent above). The
+  capped read runs as one statement, so it is not split into key ranges under
+  `-j`. A top-N that does not descend streams every matching row here to be
+  sorted, and the run log says so in a `warn` line naming the rule. `EXPLAIN`
+  shows it on the scan's `pushdown:` line — `order by id desc limit 1000 (if
+  the keys are numeric or temporal)`, since analysis does not connect to learn
+  the key's type — and `physical: serial (top-N pushed, sorts at most 1000
+  rows)` in place of `materializes`.
 - **`PAGINATE BY page|offset|cursor (param = 'page', size = 100,
   total = 'count', field = 'next', start = 2, max = 50)`** — REST pagination.
   Friendly keys map to the engine hints (`param`→`page_param`/`cursor_param`,
