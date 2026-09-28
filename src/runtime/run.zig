@@ -489,6 +489,10 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     if (std.mem.eql(u8, last.write.connector, "csv") and last.write.target.len > 0)
         try guardFileFormat(env, last.write.target, env.fmt_out, "write");
 
+    // Every descent below translates filters to SQL, and a `$param` there must be
+    // its value, not a column of that name.
+    stages = try analyze.substFilterParams(arena, stages, env.params_expr);
+
     // Before the descent below: move whatever filters the join structure allows to
     // sit ahead of the joins, so the contiguous prefix `serialWhere` reads actually
     // contains them. Without this a join between the read and the WHERE meant no

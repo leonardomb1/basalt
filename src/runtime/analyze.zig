@@ -80,6 +80,28 @@ pub fn substExpr(arena: std.mem.Allocator, expr: *const ast.Expr, params: *const
     return ast.rebuildExpr(arena, expr, SubstCtx{ .arena = arena, .params = params }, substRecur);
 }
 
+/// `stages` with every `$param` / `$let` in a filter replaced by its value. The
+/// parser reads `$since` as a name, which the engine resolves when it evaluates;
+/// pushdown translates the predicate before that, and sent `[since]` to the
+/// source as a column. Applied ahead of every descent, it hands them literals.
+/// Returns `stages` itself when no filter names a param.
+pub fn substFilterParams(arena: std.mem.Allocator, stages: []const ast.Stage, params: *const ParamMap) Error![]const ast.Stage {
+    if (params.count() == 0) return stages;
+    var out: ?[]ast.Stage = null;
+    for (stages, 0..) |st, i| {
+        if (st.node != .filter) continue;
+        const e = try substExpr(arena, st.node.filter, params);
+        if (e == st.node.filter) continue;
+        const o = out orelse blk: {
+            const copy = try arena.dupe(ast.Stage, stages);
+            out = copy;
+            break :blk copy;
+        };
+        o[i].node = .{ .filter = @constCast(e) };
+    }
+    return out orelse stages;
+}
+
 fn mk(arena: std.mem.Allocator, e: ast.Expr) Error!*const ast.Expr {
     const p = try arena.create(ast.Expr);
     p.* = e;
@@ -797,9 +819,11 @@ const Ctx = struct {
                         for (stages[0].hints) |h| {
                             if (std.mem.eql(u8, h.key, "where") and h.value == .str) raw = h.value.str;
                         }
-                        const implicit = pushdown.serialWhere(self.arena, d, stages) catch null;
+                        // what runs pushes the params' values, so the plan shows them
+                        const bound = try substFilterParams(self.arena, stages, self.params);
+                        const implicit = pushdown.serialWhere(self.arena, d, bound) catch null;
                         source.pushdown = try composePushdown(self.arena, raw, implicit);
-                        if (try pushdown.explainTopN(self.arena, d, stages[0 .. stages.len - 1])) |t| {
+                        if (try pushdown.explainTopN(self.arena, d, bound[0 .. bound.len - 1])) |t| {
                             top_n = t;
                             source.pushdown = if (source.pushdown.len > 0)
                                 try std.fmt.allocPrint(self.arena, "{s}; {s}", .{ source.pushdown, t.text })
@@ -2194,4 +2218,33 @@ test "analyze: a window stage resolves its schema — the input plus one typed c
         try std.testing.expect(s.fields[3].ty.kind == .float and s.fields[3].ty.nullable);
     }
     try std.testing.expect(found);
+}
+
+test "a $param or LET in a filter reaches the pushdown as its value, never as a column" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a,
+        \\CREATE CONNECTION db TYPE sqlserver OPTIONS (host = 'h');
+        \\LET c = '1';
+        \\PARAM n INT DEFAULT 5;
+        \\EXPLAIN SELECT * FROM db.dbo.t WHERE b >= $c AND k < $n;
+    , &pdiag);
+    var diag = Diag{};
+    const plan = try analyze(a, prog, &diag);
+    try std.testing.expectEqualStrings("(([b] >= '1') AND ([k] < 5))", plan.outputs[0].source.pushdown);
+
+    // the rewrite itself: values in, and the stages untouched when none is named
+    var params = ParamMap.init(a);
+    const five = try a.create(ast.Expr);
+    five.* = .{ .int_lit = 5 };
+    try params.put("n", five);
+    const stages = prog.stmts[prog.stmts.len - 1].explain.pipeline.stages;
+    const bound = try substFilterParams(a, stages, &params);
+    try std.testing.expect(bound.ptr != stages.ptr);
+    const sql = (try pushdown.serialWhere(a, .postgres, bound)).?;
+    try std.testing.expect(std.mem.indexOf(u8, sql, "\"k\" < 5") != null);
+    var none = ParamMap.init(a);
+    try std.testing.expect((try substFilterParams(a, stages, &none)).ptr == stages.ptr);
 }

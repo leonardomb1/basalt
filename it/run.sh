@@ -192,6 +192,25 @@ runs mysql     && topnrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MY
 runs postgres  && topnrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"         db.it_topn
 runs sqlserver && topnrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);"    db.it_topn
 
+# A `$param` / LET in a WHERE descends as its value. It used to reach the source
+# as a column of that name — `[since]` — and fail there (serial) or silently not
+# descend (split). The SQL sent must carry the values and no such column.
+paramrt() { # $1 label, $2 CREATE CONNECTION db ...
+  if $B run --format csv --log-level debug -c "$2 PARAM lo INT DEFAULT 5; LET hi = 7;
+SELECT id FROM db.it_topn WHERE id >= \$lo AND id <= \$hi ORDER BY id;" >"$out/param_$1.csv" 2>"$out/param_$1.log" &&
+     [ "$(tr '\n' ' ' <"$out/param_$1.csv")" = "id 5 6 7 " ] &&
+     grep "sql read" "$out/param_$1.log" | grep -q ">= 5" &&
+     ! grep "sql read" "$out/param_$1.log" | grep -qE '[]"`](lo|hi)[]"`]'; then
+    report "$1-param-pushdown" ok
+  else
+    report "$1-param-pushdown" bad; cat "$out/param_$1.csv"; grep "sql read" "$out/param_$1.log" | head -3
+  fi
+}
+
+runs mysql     && paramrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"
+runs postgres  && paramrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"
+runs sqlserver && paramrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);"
+
 runs mysql     && catalogrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"      it
 runs postgres  && catalogrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"      public
 runs sqlserver && catalogrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);" dbo
@@ -385,6 +404,7 @@ LOAD INTO '$out/sr_embedded_out.csv' AS SELECT id, s FROM fe.it_nullmark2 ORDER 
 
   # read back through a starrocks connection, so the starrocks dialect renders it
   topnrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_topn USING stream_load"
+  paramrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');"
   catalogrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" it
 fi
 

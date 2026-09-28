@@ -386,7 +386,9 @@ Source clauses, in any order after the source:
   descended; put the expression in a raw `QUERY(...)` to ask for the source's own
   coercion), and the portable string
   functions (`lower upper length trim substr replace concat coalesce
-  starts_with ends_with contains`). Untranslatable pieces (arithmetic,
+  starts_with ends_with contains`). A `$param`, LET or loop variable descends
+  as its value — `WHERE D2_EMISSAO >= $since` sends `>= '20240105'`, with a
+  query LET's value decided first. Untranslatable pieces (arithmetic,
   `now()`/`today()`, user funcs) stay in the engine — the filter is always
   kept, so results never change, only how much crosses the wire. `EXPLAIN`
   prints the descended predicate on a `pushdown:` line.
