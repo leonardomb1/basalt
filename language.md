@@ -339,16 +339,18 @@ wall-clock time: basalt has no zoned timestamp, so `isAdjustedToUTC` is not
 carried. `DATE`, `DECIMAL`, `STRING`/`ENUM`/`JSON` and `INTEGER` map as their
 converted twins do; a `UUID` stays `bytes`.
 
-A struct's fields read as flat dotted columns (`addr.city`). A `LIST` of
-scalars — at any depth, so a list of lists too — reads as one `string` column
-named for the list, holding each row's list as JSON: `[1,2]`, `[]` for an empty
-list, `NULL` for a null one, `null` for a null element, dates and timestamps as
-quoted text. `CROSS JOIN UNNEST(JSON_EACH(tags)) AS tag` gives a row per element
-and `json_get` reaches into one. A list of structs, or a `MAP`, spans several
-columns in the file and is not read yet: the run says which columns it left out
-(a `warn` line) when the query asked for them. A filter on a list column is
-never used to skip row groups — the file's statistics describe its elements,
-not the JSON.
+A struct's fields read as flat dotted columns (`addr.city`). Everything
+repeated — a `LIST` of scalars or of structs, a `MAP`, and any nesting of them —
+reads as one `string` column named for it, holding each row's value as JSON:
+lists as arrays (`[1,2]`, `[]` when empty), structs as objects, maps as objects
+keyed by each key's text (`{"k1":3}`), `NULL` for a null column value and
+`null` for a null element or field, dates and timestamps as quoted text.
+`CROSS JOIN UNNEST(JSON_EACH(tags)) AS tag` gives a row per element and
+`json_get` reaches into one. No column of the file is left out, so
+`LOAD INTO 'copy.parquet' AS SELECT * FROM 'x.parquet'` carries every one — the
+nested ones as JSON text, since that is how basalt holds them. A filter on a
+nested column is never used to skip row groups: the file's statistics describe
+its leaves, not the JSON.
 
 Source clauses, in any order after the source:
 

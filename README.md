@@ -65,8 +65,9 @@ holds over the network too: a remote `.parquet` is read by HTTP range request,
 so projecting two columns of forty transfers two chunks, not the object. A
 server that ignores `Range` is handled by falling back to a single whole-object
 fetch. Column types follow the file's `LogicalType`, so the naive and nanosecond
-timestamps polars, DuckDB, Spark and pyarrow write read as timestamps, and a
-`LIST` of scalars reads as JSON text that `UNNEST(JSON_EACH(col))` takes apart.
+timestamps polars, DuckDB, Spark and pyarrow write read as timestamps. Nested
+columns — lists, lists of structs, maps, at any depth — read as JSON text that
+`UNNEST(JSON_EACH(col))` and `json_get` take apart; no column is left out.
 
 Arrow IPC is the fast way to hand a dataframe over: the file is memory-mapped
 and copied out, with no encode or decode step. polars' `write_ipc` and pyarrow's

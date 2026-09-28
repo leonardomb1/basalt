@@ -370,21 +370,12 @@ pub fn openSourceProjected(
     return openSourceAll(env, rd, hints);
 }
 
-/// Count a parquet read into the run's pushdown tally, and say which columns
-/// it leaves out: a column that vanishes from `SELECT *` without a word reads as
-/// a column the file never had.
+/// Count a parquet read into the run's pushdown tally.
 pub fn noteParquet(env: *Env, pr: *pqdecode.Reader) void {
-    warnSkipped(env, pr);
     const t = env.scan orelse return;
     pr.tally = t;
     driver.ScanTally.add(&t.columns_read, pr.leaves.len);
     driver.ScanTally.add(&t.columns_total, pr.md.leafCount());
-}
-
-pub fn warnSkipped(env: *Env, pr: *const pqdecode.Reader) void {
-    if (pr.skipped.len == 0) return;
-    const names = std.mem.join(env.arena, ", ", pr.skipped) catch return;
-    env.log.log(.warn, "parquet columns not read: {s} — a list of structs or a map has no single column to be yet", .{names});
 }
 
 fn openArrow(env: *Env, path: []const u8, project: ?[][]const u8) !driver.Source {

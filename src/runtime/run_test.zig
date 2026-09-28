@@ -3338,3 +3338,32 @@ test "a parquet LIST column unnests through JSON_EACH, one row per element" {
     defer alloc.free(out);
     try std.testing.expectEqualStrings("id,x\n1,1\n1,2\n4,\n4,5\n", out);
 }
+
+test "copying a parquet with nested columns keeps every one of them" {
+    // The risk this guards: `SELECT *` into a sink used to drop a list of
+    // structs or a map from the copy without an error.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "src.parquet", .data = @embedFile("../connect/testdata/lists_v1.parquet") });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "LOAD INTO '{s}/copy.parquet' AS SELECT * FROM '{s}/src.parquet';\nLOAD INTO '{s}' AS SELECT id, recs, m FROM '{s}/copy.parquet' ORDER BY id;",
+        .{ base, base, out_path, base },
+    );
+    defer alloc.free(script);
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "id,recs,m\n" ++
+            "1,\"[{\"\"a\"\":1,\"\"b\"\":\"\"x\"\"}]\",\"{\"\"k\"\":1}\"\n" ++
+            "2,,\n" ++
+            "3,[],{}\n" ++
+            "4,\"[{\"\"a\"\":2,\"\"b\"\":\"\"y\"\"}]\",\"{\"\"z\"\":2}\"\n",
+        out,
+    );
+}

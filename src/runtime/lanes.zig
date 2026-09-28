@@ -839,7 +839,6 @@ fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: ast.
     const probe = pqdecode.Reader.openProjected(arena, path, project) catch return null;
     const ngroups = probe.md.row_groups.len;
     if (ngroups < 2) return null;
-    @import("connect.zig").warnSkipped(env, probe);
     if (env.scan) |t| {
         driver.ScanTally.add(&t.columns_read, probe.leaves.len);
         driver.ScanTally.add(&t.columns_total, probe.md.leafCount());

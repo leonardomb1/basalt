@@ -859,6 +859,14 @@ PY
     report "arrow: a pyarrow Feather file reads back as the seed (run error)" bad
     tail -5 "$out/arrow.log"
   fi
+  # Nested parquet columns — lists of structs, maps, any nesting — rebuilt as
+  # JSON, cell by cell against pyarrow's reading, in three page layouts.
+  if command -v uv >/dev/null && uv run --quiet --with pyarrow python it/parquet_nested.py "$B" "$out" >"$out/nested.log" 2>&1; then
+    report "parquet: nested columns match pyarrow cell for cell" ok
+  else
+    report "parquet: nested columns match pyarrow cell for cell" bad
+    tail -8 "$out/nested.log"
+  fi
   if command -v uv >/dev/null &&
      brun run -c "LOAD INTO '$out/seed.arrow' AS SELECT * FROM 'it/seed.csv' ORDER BY id;" &&
      uv run --quiet --with pyarrow python - "$out/seed.arrow" "$out/arrow_sink_rt.csv" <<'PY' 2>>"$out/arrow.log"

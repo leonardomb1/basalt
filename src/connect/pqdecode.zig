@@ -6,8 +6,10 @@
 //! A struct's fields read as flat dotted columns (`addr.city`). A list of
 //! scalars — any depth, so a list of lists too — reads as one `string` column
 //! of JSON arrays named for the list, assembled from repetition and definition
-//! levels, which `JSON_EACH` and `json_get` take apart. A list whose elements
-//! are structs or maps spreads over several leaves and is left out, by name.
+//! levels, which `JSON_EACH` and `json_get` take apart. A list of structs, a
+//! map, and any nesting of them spread over several leaves and are assembled
+//! from all of them into one JSON column — objects for structs and maps,
+//! arrays for lists.
 //!
 //! Encodings handled: PLAIN, and the RLE/bit-packed hybrid used for both
 //! definition levels and dictionary indices (`PLAIN_DICTIONARY` and
@@ -634,6 +636,10 @@ pub const Leaf = struct {
     /// of the whole list, and `name` is then the list's own (`tags`, not
     /// `tags.list.element`).
     list: ?ListShape = null,
+    /// For the same leaves: the schema node their column starts at, and the
+    /// levels above it — what a column spanning several leaves (a list of
+    /// structs, a map) is assembled from.
+    root: ?RootRef = null,
 
     /// A leaf under a repeated group is a list element: many values per row.
     pub fn isRepeated(self: Leaf) bool {
@@ -649,7 +655,11 @@ pub const ListShape = struct {
     rep_def: []const u32,
 };
 
-const PathNode = struct { name: []const u8, def: u32, repeated: bool, list_group: bool };
+/// Where a repeated leaf's column starts in the schema, and the definition and
+/// repetition levels its ancestors above that node contribute.
+pub const RootRef = struct { idx: usize, base_def: u32, base_rep: u32 };
+
+const PathNode = struct { name: []const u8, idx: usize, def: u32, repeated: bool, list_group: bool };
 
 /// `LIST` / `MAP` annotations on a group, as the legacy converted type or the
 /// logical type carries them.
@@ -661,12 +671,13 @@ fn isListGroup(e: parquet.SchemaElement) bool {
 /// Walks the depth-first schema list, resolving each leaf's definition and
 /// repetition levels from its ancestors.
 ///
-/// This is what makes a file with nested columns usable: the flat columns are
-/// still readable, and only the repeated ones are skipped. Rejecting the whole
-/// file because one column is a list would make most real lake files unopenable.
+/// This is what makes a file with nested columns usable: a struct's fields are
+/// flat leaves, and a repeated leaf learns which column — the list or map it
+/// belongs to — it helps rebuild.
 pub fn collectLeaves(arena: std.mem.Allocator, schema: []const parquet.SchemaElement) Error![]Leaf {
     var out = std.array_list.Managed(Leaf).init(arena);
     var path = std.array_list.Managed(PathNode).init(arena);
+    if (schema.len == 0) return Error.UnsupportedParquetSchema;
     var pos: usize = 1; // element 0 is the synthetic root
     var chunk: usize = 0;
     const root_children: usize = @intCast(@max(0, schema[0].num_children));
@@ -696,7 +707,7 @@ fn walkNode(
     const r = e.repetition orelse .required;
     const d2 = def + @as(u32, if (r == .required) 0 else 1);
     const r2 = rep + @as(u32, if (r == .repeated) 1 else 0);
-    try path.append(.{ .name = e.name, .def = d2, .repeated = r == .repeated, .list_group = !e.isLeaf() and isListGroup(e) });
+    try path.append(.{ .name = e.name, .idx = idx, .def = d2, .repeated = r == .repeated, .list_group = !e.isLeaf() and isListGroup(e) });
     defer _ = path.pop();
 
     if (e.isLeaf()) {
@@ -723,6 +734,15 @@ fn walkNode(
                 k += 1;
             };
             leaf.list = .{ .rep_def = rep_def };
+            var base_rep: u32 = 0;
+            for (path.items[0..root]) |pn| if (pn.repeated) {
+                base_rep += 1;
+            };
+            leaf.root = .{
+                .idx = path.items[root].idx,
+                .base_def = if (root > 0) path.items[root - 1].def else 0,
+                .base_rep = base_rep,
+            };
         }
         try out.append(leaf);
         chunk.* += 1;
@@ -789,7 +809,11 @@ pub fn readColumnChunkLevels(
 
     var b = try column.Builder.initCapacity(arena, ty, entries);
     var dict: ?[]Value = null;
-    var offset: usize = @intCast(@as(u64, @intCast(meta.startOffset())) - base_offset);
+    // offsets come from the footer: a negative one, or one before the slice,
+    // is a corrupt file rather than a cast to trap on
+    const at = std.math.cast(u64, meta.startOffset()) orelse return Error.CorruptParquetPage;
+    if (at < base_offset) return Error.CorruptParquetPage;
+    var offset: usize = std.math.cast(usize, at - base_offset) orelse return Error.CorruptParquetPage;
     var produced: usize = 0;
 
     while (produced < entries) {
@@ -816,6 +840,329 @@ pub fn readColumnChunkLevels(
     const col = try b.finish();
     if (list) |shape| return assembleLists(arena, col, levels.?.reps.items, levels.?.defs.items, max_def, shape, rows);
     return col;
+}
+
+/// A repeated leaf's chunk as entries: one value per level pair (null where the
+/// definition level falls short), with the pair itself.
+pub const Entries = struct { vals: column.Column, reps: []const u32, defs: []const u32 };
+
+pub fn readEntries(
+    arena: std.mem.Allocator,
+    file_bytes: []const u8,
+    meta: parquet.ColumnMetaData,
+    elem: parquet.SchemaElement,
+    max_def: u32,
+    max_rep: u32,
+    base_offset: u64,
+) (Error || parquet.Error || @import("codec.zig").Error)!Entries {
+    const ty = (try basaltType(elem)).asNullable();
+    const tscale = temporalScale(elem);
+    const entries = std.math.cast(usize, meta.num_values) orelse return Error.CorruptParquetPage;
+    var levels = Levels{
+        .reps = std.array_list.Managed(u32).init(arena),
+        .defs = std.array_list.Managed(u32).init(arena),
+    };
+    var b = try column.Builder.initCapacity(arena, ty, entries);
+    var dict: ?[]Value = null;
+    // offsets come from the footer: a negative one, or one before the slice,
+    // is a corrupt file rather than a cast to trap on
+    const at = std.math.cast(u64, meta.startOffset()) orelse return Error.CorruptParquetPage;
+    if (at < base_offset) return Error.CorruptParquetPage;
+    var offset: usize = std.math.cast(usize, at - base_offset) orelse return Error.CorruptParquetPage;
+    var produced: usize = 0;
+    while (produced < entries) {
+        if (offset >= file_bytes.len) return Error.CorruptParquetPage;
+        const pg = try parquet.readPage(arena, file_bytes, offset, meta.compression);
+        offset = pg.next_offset;
+        switch (pg.header.ty) {
+            .dictionary_page => {
+                const n = std.math.cast(usize, pg.header.num_values) orelse return Error.CorruptParquetPage;
+                const vals = try arena.alloc(Value, n);
+                var cur = PlainCursor.init(meta.ty, elem.type_length orelse 0, pg.data);
+                for (vals) |*v| v.* = try cur.next();
+                dict = vals;
+            },
+            .data_page, .data_page_v2 => {
+                produced += try appendDataPage(arena, &b, pg, meta, elem, ty, max_def, dict, tscale, max_rep, &levels);
+            },
+            .index_page => {},
+            else => return Error.CorruptParquetPage,
+        }
+    }
+    const vals = try b.finish();
+    if (vals.len != levels.reps.items.len or vals.len != levels.defs.items.len) return Error.CorruptParquetPage;
+    return .{ .vals = vals, .reps = levels.reps.items, .defs = levels.defs.items };
+}
+
+// --- nested columns ----------------------------------------------------------
+//
+// A column that spans several leaves — a list of structs, a map, a struct
+// holding lists — is rebuilt row by row from all of its leaves' entries, as
+// JSON. Within one row every leaf's entries are contiguous (a repetition level
+// of 0 starts the next row), and the schema subtree says how to cut them
+// further: a repeated node at repetition level R starts a new element at every
+// entry whose level is R; a definition level below a node's own says the node
+// is absent — null if it is optional, an empty list if it is the repeated one.
+// Every leaf carries at least one entry for every instance of every ancestor,
+// so the first entry of a node's first leaf answers "is this node here".
+
+/// One node of a nested column's schema subtree.
+pub const NNode = struct {
+    name: []const u8,
+    /// Definition level when this node is present.
+    def: u32,
+    /// Repetition level of this node's elements (for a repeated node).
+    rep: u32,
+    optional: bool,
+    repeated: bool,
+    kind: Kind,
+    children: []NNode = &.{},
+    /// This node's leaves are `first_leaf .. first_leaf + nleaves` of the column's.
+    first_leaf: usize,
+    nleaves: usize,
+    /// For a leaf: the value's declared max definition level.
+    max_def: u32 = 0,
+
+    pub const Kind = enum { leaf, group, list, map };
+};
+
+/// A column assembled from several leaves.
+pub const Nested = struct {
+    name: []const u8,
+    root: NNode,
+    /// Indices into `Reader.leaves`, in the subtree's depth-first order.
+    leaves: []const usize,
+};
+
+/// The subtree at `pos`, levels counted on from `def`/`rep`. Leaves are numbered
+/// in depth-first order, the order their chunks appear in.
+fn buildNode(arena: std.mem.Allocator, schema: []const parquet.SchemaElement, pos: *usize, def: u32, rep: u32, next_leaf: *usize, depth: usize) Error!NNode {
+    if (pos.* >= schema.len or depth > 64) return Error.UnsupportedParquetSchema;
+    const e = schema[pos.*];
+    pos.* += 1;
+    const r = e.repetition orelse .required;
+    const d2 = def + @as(u32, if (r == .required) 0 else 1);
+    const r2 = rep + @as(u32, if (r == .repeated) 1 else 0);
+    var node = NNode{
+        .name = e.name,
+        .def = d2,
+        .rep = r2,
+        .optional = r == .optional,
+        .repeated = r == .repeated,
+        .kind = .leaf,
+        .first_leaf = next_leaf.*,
+        .nleaves = 0,
+    };
+    if (e.isLeaf()) {
+        node.max_def = d2;
+        node.nleaves = 1;
+        next_leaf.* += 1;
+        return node;
+    }
+    const n: usize = @intCast(@max(0, e.num_children));
+    const kids = try arena.alloc(NNode, n);
+    for (kids) |*k| k.* = try buildNode(arena, schema, pos, d2, r2, next_leaf, depth + 1);
+    node.children = kids;
+    node.nleaves = next_leaf.* - node.first_leaf;
+    const conv = e.converted_type orelse -1;
+    // LIST and MAP only as the spec lays them out — a single repeated child —
+    // and otherwise as the plain group the file says they are
+    node.kind = if (n == 1 and kids[0].repeated and conv == 3)
+        .list
+    else if (n == 1 and kids[0].repeated and (conv == 1 or conv == 2) and kids[0].children.len == 2)
+        .map
+    else
+        .group;
+    return node;
+}
+
+/// The subtree a nested column starts at.
+pub fn buildNested(arena: std.mem.Allocator, schema: []const parquet.SchemaElement, root: RootRef) Error!NNode {
+    var pos = root.idx;
+    var next: usize = 0;
+    return buildNode(arena, schema, &pos, root.base_def, root.base_rep, &next, 0);
+}
+
+/// A leaf's entries within one instance of some node: `lo .. hi`.
+const Span = struct { lo: usize, hi: usize };
+
+const Assembler = struct {
+    arena: std.mem.Allocator,
+    entries: []const Entries,
+    out: *std.array_list.Managed(u8),
+
+    fn firstDef(self: *const Assembler, n: *const NNode, spans: []const Span) Error!u32 {
+        const s = spans[n.first_leaf];
+        if (s.lo >= s.hi) return Error.CorruptParquetPage;
+        return self.entries[n.first_leaf].defs[s.lo];
+    }
+
+    /// The node as it appears in its parent: a repeated one as the array of its
+    /// elements, anything else as its value.
+    fn field(self: *Assembler, n: *const NNode, spans: []const Span) anyerror!void {
+        if (n.repeated) return self.array(n, spans, elementOf(n, true));
+        return self.value(n, spans);
+    }
+
+    /// A non-repeated node's value.
+    fn value(self: *Assembler, n: *const NNode, spans: []const Span) anyerror!void {
+        if (n.optional and try self.firstDef(n, spans) < n.def) return self.out.appendSlice("null");
+        switch (n.kind) {
+            .leaf => {
+                const s = spans[n.first_leaf];
+                if (s.hi - s.lo != 1) return Error.CorruptParquetPage;
+                const e = self.entries[n.first_leaf];
+                try jsonValue(self.arena, self.out, if (e.defs[s.lo] < n.max_def) .null else e.vals.getValue(s.lo));
+            },
+            .group => try self.object(n, spans),
+            .list => try self.array(&n.children[0], spans, elementOf(&n.children[0], false)),
+            .map => try self.mapObject(&n.children[0], spans),
+        }
+    }
+
+    fn object(self: *Assembler, n: *const NNode, spans: []const Span) anyerror!void {
+        try self.out.append('{');
+        for (n.children, 0..) |*c, i| {
+            if (i > 0) try self.out.append(',');
+            try appendJsonString(self.arena, self.out, c.name);
+            try self.out.append(':');
+            try self.field(c, spans);
+        }
+        try self.out.append('}');
+    }
+
+    /// What an element of repeated node `rep` is: the node itself for a bare
+    /// repeated field or a list whose repeated group holds several fields (or is
+    /// named `array` / `*_tuple`, the legacy two-level spellings); else, in the
+    /// three-level layout, its one child.
+    fn elementOf(rep: *const NNode, bare: bool) ?*const NNode {
+        if (bare or rep.kind == .leaf or rep.children.len != 1) return null;
+        if (std.mem.eql(u8, rep.name, "array") or std.mem.endsWith(u8, rep.name, "_tuple")) return null;
+        return &rep.children[0];
+    }
+
+    /// The instances of repeated node `rep` within `spans`, as a JSON array: one
+    /// element per entry of its first leaf at `rep.rep` (the first entry opens
+    /// the first), none when that entry's definition stops short of `rep.def`.
+    fn array(self: *Assembler, rep: *const NNode, spans: []const Span, element: ?*const NNode) anyerror!void {
+        if (try self.firstDef(rep, spans) < rep.def) return self.out.appendSlice("[]");
+        try self.out.append('[');
+        var count: ?usize = null;
+        const cut = try self.arena.alloc([]Span, rep.nleaves);
+        for (cut, 0..) |*c, k| {
+            const li = rep.first_leaf + k;
+            c.* = try self.split(li, spans[li], rep.rep);
+            if (count) |n| {
+                if (n != c.len) return Error.CorruptParquetPage;
+            } else count = c.len;
+        }
+        const sub = try self.arena.dupe(Span, spans);
+        for (0..count.?) |i| {
+            if (i > 0) try self.out.append(',');
+            for (cut, 0..) |c, k| sub[rep.first_leaf + k] = c[i];
+            if (element) |el| {
+                try self.field(el, sub);
+            } else {
+                // the repeated node is the element: its value, present by now
+                var as_value = rep.*;
+                as_value.repeated = false;
+                as_value.optional = false;
+                try self.value(&as_value, sub);
+            }
+        }
+        try self.out.append(']');
+    }
+
+    /// A MAP's key_value entries as an object keyed by each key's text.
+    fn mapObject(self: *Assembler, kv: *const NNode, spans: []const Span) anyerror!void {
+        if (try self.firstDef(kv, spans) < kv.def) return self.out.appendSlice("{}");
+        try self.out.append('{');
+        const cut = try self.arena.alloc([]Span, kv.nleaves);
+        var count: ?usize = null;
+        for (cut, 0..) |*c, k| {
+            const li = kv.first_leaf + k;
+            c.* = try self.split(li, spans[li], kv.rep);
+            if (count) |n| {
+                if (n != c.len) return Error.CorruptParquetPage;
+            } else count = c.len;
+        }
+        const sub = try self.arena.dupe(Span, spans);
+        const key = &kv.children[0];
+        for (0..count.?) |i| {
+            if (i > 0) try self.out.append(',');
+            for (cut, 0..) |c, k| sub[kv.first_leaf + k] = c[i];
+            // a key is required by the spec; a key that is a group is rendered
+            // as its JSON and used as text
+            var kbuf = std.array_list.Managed(u8).init(self.arena);
+            var ka = Assembler{ .arena = self.arena, .entries = self.entries, .out = &kbuf };
+            if (key.kind == .leaf and key.nleaves == 1) {
+                const s = sub[key.first_leaf];
+                if (s.hi - s.lo != 1) return Error.CorruptParquetPage;
+                const e = self.entries[key.first_leaf];
+                const kv_val = if (e.defs[s.lo] < key.max_def) Value.null else e.vals.getValue(s.lo);
+                try kbuf.appendSlice(if (kv_val == .null) "null" else try eval.valueToString(self.arena, kv_val));
+            } else try ka.field(key, sub);
+            try appendJsonString(self.arena, self.out, kbuf.items);
+            try self.out.append(':');
+            try self.field(&kv.children[1], sub);
+        }
+        try self.out.append('}');
+    }
+
+    /// Cut `span` of leaf `li` where a new element at repetition level `r`
+    /// begins. Every entry within an instance repeats at `r` or deeper; one
+    /// that repeats shallower would belong to another instance.
+    fn split(self: *Assembler, li: usize, span: Span, r: u32) Error![]Span {
+        const reps = self.entries[li].reps;
+        var out = std.array_list.Managed(Span).init(self.arena);
+        var start = span.lo;
+        var i = span.lo + 1;
+        while (i < span.hi) : (i += 1) {
+            if (reps[i] < r) return Error.CorruptParquetPage;
+            if (reps[i] == r) {
+                try out.append(.{ .lo = start, .hi = i });
+                start = i;
+            }
+        }
+        try out.append(.{ .lo = start, .hi = span.hi });
+        return out.items;
+    }
+};
+
+fn appendJsonString(arena: std.mem.Allocator, buf: *std.array_list.Managed(u8), s: []const u8) Error!void {
+    var aw = std.Io.Writer.Allocating.init(arena);
+    std.json.Stringify.encodeJsonString(s, .{}, &aw.writer) catch return error.OutOfMemory;
+    try buf.appendSlice(aw.written());
+}
+
+/// A nested column's rows as JSON text, from its leaves' entries for one row
+/// group.
+pub fn assembleNested(arena: std.mem.Allocator, root: *const NNode, entries: []const Entries, rows: usize) anyerror!column.Column {
+    if (entries.len != root.nleaves) return Error.CorruptParquetPage;
+    // each leaf's row boundaries: its entries at repetition level 0
+    const starts = try arena.alloc([]usize, entries.len);
+    for (entries, starts) |e, *st| {
+        var list = std.array_list.Managed(usize).init(arena);
+        for (e.reps, 0..) |r, i| if (r == 0) try list.append(i);
+        if (list.items.len != rows or (rows > 0 and list.items[0] != 0)) return Error.CorruptParquetPage;
+        try list.append(e.reps.len);
+        st.* = list.items;
+    }
+    var out = try column.Builder.initCapacity(arena, types.Type.init(.string).asNullable(), rows);
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const spans = try arena.alloc(Span, entries.len);
+    for (0..rows) |row| {
+        _ = scratch.reset(.retain_capacity);
+        const sa = scratch.allocator();
+        for (spans, starts) |*sp, st| sp.* = .{ .lo = st[row], .hi = st[row + 1] };
+        var buf = std.array_list.Managed(u8).init(sa);
+        var asm_ = Assembler{ .arena = sa, .entries = entries, .out = &buf };
+        try asm_.field(root, spans);
+        // a whole-row null reads as a null cell, not the text `null`
+        if (std.mem.eql(u8, buf.items, "null")) try out.append(.null) else try out.append(.{ .string = buf.items });
+    }
+    return out.finish();
 }
 
 /// Every entry's repetition and definition level, for a list chunk.
@@ -1420,6 +1767,12 @@ pub fn fileMinMax(rdr: *const Reader, name: []const u8) ?MinMax {
     return .{ .min = lo orelse return null, .max = hi orelse return null };
 }
 
+fn wanted(want: ?[]const []const u8, name: []const u8) bool {
+    const names = want orelse return true;
+    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
 /// The leaf a statistics question is about. A list column is never one: its
 /// chunk statistics describe the elements, not the JSON text the column holds,
 /// so a bound on it proves nothing and must keep every group.
@@ -1769,6 +2122,11 @@ pub const Remote = struct {
 /// Only the footer and the column chunks a query needs are read; a chunk is
 /// fetched, decoded and released per row group, so resident memory tracks the
 /// widest row group's projected columns rather than the file.
+pub const Output = union(enum) {
+    leaf: usize,
+    nested: *const Nested,
+};
+
 pub const Reader = struct {
     arena: std.mem.Allocator,
     src: Bytes,
@@ -1777,8 +2135,9 @@ pub const Reader = struct {
     /// Readable leaves, in output order. Repeated (list) leaves are excluded but
     /// still occupy a chunk slot, which is why `Leaf.chunk_idx` is carried.
     leaves: []const Leaf,
-    /// Names of columns skipped because they are list elements, for reporting.
-    skipped: []const []const u8,
+    /// The output columns, in schema order: a leaf of `leaves`, or a column
+    /// assembled from several of them.
+    outputs: []const Output = &.{},
     /// Ascending chunk start offsets plus the footer start, used to bound each
     /// ranged read.
     boundaries: []const u64 = &.{},
@@ -1826,37 +2185,47 @@ pub const Reader = struct {
         var footer_start: u64 = 0;
         const md = try parseFooterOf(arena, src, &footer_start);
 
-        // Struct fields read as flat dotted columns, and a list of scalars as one
-        // JSON column. A list whose elements span several leaves — a list of
-        // structs, a map — has no single column to be, so it alone is skipped.
+        // Struct fields read as flat dotted columns; a list of scalars as one JSON
+        // column from its leaf; a list of structs, a map, or anything else that
+        // spans several leaves as one JSON column assembled from all of them.
+        // Nothing in the file is left out.
         const all = try collectLeaves(arena, md.schema);
         var keep = std.array_list.Managed(Leaf).init(arena);
-        var skipped = std.array_list.Managed([]const u8).init(arena);
         var fields = std.array_list.Managed(types.Schema.Field).init(arena);
+        var outputs = std.array_list.Managed(Output).init(arena);
+        var roots_seen = std.array_list.Managed(usize).init(arena);
         for (all, 0..) |lf, li| {
-            if (want) |names| {
-                var hit = false;
-                for (names) |n| {
-                    if (std.mem.eql(u8, n, lf.name)) {
-                        hit = true;
-                        break;
-                    }
+            const shared = if (lf.root) |rt| for (all, 0..) |other, oi| {
+                if (oi != li and other.root != null and other.root.?.idx == rt.idx) break true;
+            } else false else false;
+            if (shared) {
+                // a column spanning several leaves: taken whole at its first leaf
+                const rt = lf.root.?;
+                for (roots_seen.items) |x| {
+                    if (x == rt.idx) break;
+                } else {
+                    try roots_seen.append(rt.idx);
+                    if (!wanted(want, lf.name)) continue;
+                    // a column basalt cannot rebuild fails the read: leaving it
+                    // out would copy a file short of a column without a word
+                    const tree = try buildNested(arena, md.schema, rt);
+                    var ix = std.array_list.Managed(usize).init(arena);
+                    for (all) |o| if (o.root != null and o.root.?.idx == rt.idx) {
+                        _ = try basaltType(md.schema[o.schema_idx]);
+                        try keep.append(o);
+                        try ix.append(keep.items.len - 1);
+                    };
+                    if (ix.items.len != tree.nleaves) return Error.UnsupportedParquetSchema;
+                    const n = try arena.create(Nested);
+                    n.* = .{ .name = lf.name, .root = tree, .leaves = ix.items };
+                    try outputs.append(.{ .nested = n });
+                    try fields.append(.{ .name = lf.name, .ty = types.Type.init(.string).asNullable() });
                 }
-                if (!hit) continue;
+                continue;
             }
-            if (lf.isRepeated()) {
-                var shared = false;
-                for (all, 0..) |other, oi| {
-                    if (oi != li and other.isRepeated() and std.mem.eql(u8, other.name, lf.name)) shared = true;
-                }
-                if (shared) {
-                    for (skipped.items) |s| {
-                        if (std.mem.eql(u8, s, lf.name)) break;
-                    } else try skipped.append(lf.name);
-                    continue;
-                }
-            }
+            if (!wanted(want, lf.name)) continue;
             try keep.append(lf);
+            try outputs.append(.{ .leaf = keep.items.len - 1 });
             try fields.append(.{ .name = lf.name, .ty = try leafType(md.schema[lf.schema_idx], lf) });
         }
         // An empty projection (COUNT(*)) still needs batches with a row count,
@@ -1865,6 +2234,7 @@ pub const Reader = struct {
             for (all) |lf| {
                 if (lf.isRepeated()) continue;
                 try keep.append(lf);
+                try outputs.append(.{ .leaf = keep.items.len - 1 });
                 try fields.append(.{
                     .name = lf.name,
                     .ty = (try basaltType(md.schema[lf.schema_idx])).asNullable(),
@@ -1881,7 +2251,7 @@ pub const Reader = struct {
             .md = md,
             .schema = .{ .fields = try fields.toOwnedSlice() },
             .leaves = try keep.toOwnedSlice(),
-            .skipped = try skipped.toOwnedSlice(),
+            .outputs = try outputs.toOwnedSlice(),
             .boundaries = try chunkBoundaries(arena, md, footer_start),
         };
         return self;
@@ -1894,7 +2264,7 @@ pub const Reader = struct {
         while (self.rg < last) {
             const g = self.md.row_groups[self.rg];
             self.rg += 1;
-            const rows: usize = @intCast(g.num_rows);
+            const rows = std.math.cast(usize, g.num_rows) orelse return Error.CorruptParquetPage;
             if (rows == 0) continue;
             if (self.tally) |t| driver.ScanTally.add(&t.row_groups, 1);
             // statistics can rule a whole group out before any page is touched
@@ -1912,30 +2282,49 @@ pub const Reader = struct {
                     continue;
                 }
             }
-            const cols = try arena.alloc(column.Column, self.leaves.len);
-            for (self.leaves, 0..) |lf, ci| {
-                if (lf.chunk_idx >= g.columns.len) return Error.CorruptParquetPage;
-                const meta = g.columns[lf.chunk_idx].meta orelse return Error.CorruptParquetPage;
-                // fetch just this chunk, bounded by wherever the next one begins
-                const start: u64 = @intCast(meta.startOffset());
-                const end = chunkEnd(self.boundaries, start);
-                if (end <= start) return Error.CorruptParquetPage;
-                const chunk = try self.src.range(arena, start, @intCast(end - start));
-                cols[ci] = try readColumnChunkLevels(
-                    arena,
-                    chunk,
-                    meta,
-                    self.md.schema[lf.schema_idx],
-                    rows,
-                    lf.max_def,
-                    lf.max_rep,
-                    lf.list,
-                    start,
-                );
-            }
+            const cols = try arena.alloc(column.Column, self.outputs.len);
+            for (self.outputs, 0..) |o, ci| switch (o) {
+                .leaf => |li| {
+                    const lf = self.leaves[li];
+                    const chunk = try self.chunkOf(arena, g, lf);
+                    cols[ci] = try readColumnChunkLevels(
+                        arena,
+                        chunk.bytes,
+                        chunk.meta,
+                        self.md.schema[lf.schema_idx],
+                        rows,
+                        lf.max_def,
+                        lf.max_rep,
+                        lf.list,
+                        chunk.start,
+                    );
+                },
+                .nested => |n| {
+                    const entries = try arena.alloc(Entries, n.leaves.len);
+                    for (entries, n.leaves) |*e, li| {
+                        const lf = self.leaves[li];
+                        const chunk = try self.chunkOf(arena, g, lf);
+                        e.* = try readEntries(arena, chunk.bytes, chunk.meta, self.md.schema[lf.schema_idx], lf.max_def, lf.max_rep, chunk.start);
+                    }
+                    cols[ci] = try assembleNested(arena, &n.root, entries, rows);
+                },
+            };
             return Batch{ .schema = &self.schema, .columns = cols, .len = rows };
         }
         return null;
+    }
+
+    const Chunk = struct { bytes: []const u8, meta: parquet.ColumnMetaData, start: u64 };
+
+    /// One leaf's chunk of a row group, fetched alone: bounded by wherever the
+    /// next chunk begins.
+    fn chunkOf(self: *Reader, arena: std.mem.Allocator, g: parquet.RowGroup, lf: Leaf) !Chunk {
+        if (lf.chunk_idx >= g.columns.len) return Error.CorruptParquetPage;
+        const meta = g.columns[lf.chunk_idx].meta orelse return Error.CorruptParquetPage;
+        const start = std.math.cast(u64, meta.startOffset()) orelse return Error.CorruptParquetPage;
+        const end = chunkEnd(self.boundaries, start);
+        if (end <= start) return Error.CorruptParquetPage;
+        return .{ .bytes = try self.src.range(arena, start, @intCast(end - start)), .meta = meta, .start = start };
     }
 
     pub fn close(self: *Reader) void {
@@ -1983,7 +2372,7 @@ fn chunkBoundaries(arena: std.mem.Allocator, md: parquet.FileMetaData, footer_st
     for (md.row_groups) |g| {
         for (g.columns) |c| {
             const m = c.meta orelse continue;
-            try out.append(@intCast(m.startOffset()));
+            try out.append(std.math.cast(u64, m.startOffset()) orelse return Error.CorruptParquetPage);
         }
     }
     try out.append(footer_start);
@@ -2188,7 +2577,7 @@ test "schema walk resolves levels and dotted names for nested groups" {
     try testing.expect(leaves[3].isRepeated());
     try testing.expectEqualSlices(u32, &.{1}, leaves[3].list.?.rep_def);
 
-    // chunk indices count every leaf, including the skipped one
+    // chunk indices count every leaf, list elements included
     try testing.expectEqual(@as(usize, 3), leaves[3].chunk_idx);
 }
 
@@ -2750,12 +3139,13 @@ test "parquet LIST columns read as JSON from pyarrow (pages v1 and v2) and polar
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // `recs` (a list of structs) and `m` (a map) span several leaves and are left out
+    // `recs` (a list of structs) and `m` (a map) span several leaves and are
+    // assembled from all of them: objects in an array, and an object
     const want =
-        \\id=1 xs=[1,2] nest=[[1],[2,3]] ds=["2026-01-01"]
-        \\id=2 xs=[] nest=[[]] ds=null
-        \\id=3 xs=null nest=null ds=[]
-        \\id=4 xs=[null,5] nest=[null,[4]] ds=["1969-12-31",null]
+        \\id=1 xs=[1,2] nest=[[1],[2,3]] ds=["2026-01-01"] recs=[{"a":1,"b":"x"}] m={"k":1}
+        \\id=2 xs=[] nest=[[]] ds=null recs=null m=null
+        \\id=3 xs=null nest=null ds=[] recs=[] m={}
+        \\id=4 xs=[null,5] nest=[null,[4]] ds=["1969-12-31",null] recs=[{"a":2,"b":"y"}] m={"z":2}
         \\
     ;
     // v1: two row groups of two rows, uncompressed; v2: one group, snappy
@@ -2770,7 +3160,7 @@ test "parquet LIST columns read as JSON from pyarrow (pages v1 and v2) and polar
     , try readAllText(a, @embedFile("testdata/lists_polars.parquet"), "p.parquet"));
 }
 
-test "a list column is typed string, its skipped siblings named, and no bound prunes on it" {
+test "a nested column is typed string, read whole, and no bound prunes on it" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -2781,10 +3171,70 @@ test "a list column is typed string, its skipped siblings named, and no bound pr
     const r = try Reader.open(a, try std.fs.path.join(a, &.{ dir, "l.parquet" }));
     defer r.close();
     try testing.expectEqual(types.TypeKind.string, r.schema.fields[r.schema.indexOf("xs").?].ty.kind);
-    try testing.expectEqual(@as(usize, 2), r.skipped.len);
-    try testing.expectEqualStrings("recs", r.skipped[0]);
-    try testing.expectEqualStrings("m", r.skipped[1]);
+    // every column of the file, nothing left out
+    const names = [_][]const u8{ "id", "xs", "nest", "ds", "recs", "m" };
+    try testing.expectEqual(names.len, r.schema.fields.len);
+    for (names, r.schema.fields) |n, f| try testing.expectEqualStrings(n, f.name);
+    try testing.expectEqual(types.TypeKind.string, r.schema.fields[4].ty.kind);
+    // a bound on a nested column's name proves nothing either
+    const rb = [_]Bound{.{ .column = "recs", .op = .eq, .value = .{ .string = "zzz" } }};
+    for (r.md.row_groups) |g| try testing.expect(groupMayMatch(r.md.schema, r.leaves, g, &rb));
     // the element statistics say 1..5; a bound on the column must not trust them
     const b = [_]Bound{.{ .column = "xs", .op = .gt, .value = .{ .int = 100 } }};
     for (r.md.row_groups) |g| try testing.expect(groupMayMatch(r.md.schema, r.leaves, g, &b));
+}
+
+fn entriesOf(a: std.mem.Allocator, vals: []const Value, reps: []const u32, defs: []const u32) !Entries {
+    return .{ .vals = try listColumn(a, vals), .reps = reps, .defs = defs };
+}
+
+test "assembleNested: leaves that disagree, or a row count that does not match, are a corrupt page" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // optional group recs (LIST) { repeated group list { optional group element { optional int a; optional int b } } }
+    const schema = [_]parquet.SchemaElement{
+        .{ .name = "root", .num_children = 1 },
+        .{ .name = "recs", .repetition = .optional, .num_children = 1, .converted_type = 3 },
+        .{ .name = "list", .repetition = .repeated, .num_children = 1 },
+        .{ .name = "element", .repetition = .optional, .num_children = 2 },
+        .{ .name = "a", .ty = .int64, .repetition = .optional },
+        .{ .name = "b", .ty = .int64, .repetition = .optional },
+    };
+    const root = try buildNested(a, &schema, .{ .idx = 1, .base_def = 0, .base_rep = 0 });
+    // row 0: [{a:1,b:2},{a:null,b:3}]; row 1: null; row 2: []; row 3: [null]
+    const ea = try entriesOf(a, &.{ .{ .int = 1 }, .null, .null, .null, .null }, &.{ 0, 1, 0, 0, 0 }, &.{ 4, 3, 0, 1, 2 });
+    const eb = try entriesOf(a, &.{ .{ .int = 2 }, .{ .int = 3 }, .null, .null, .null }, &.{ 0, 1, 0, 0, 0 }, &.{ 4, 4, 0, 1, 2 });
+    const got = try assembleNested(a, &root, &.{ ea, eb }, 4);
+    try testing.expectEqualStrings("[{\"a\":1,\"b\":2},{\"a\":null,\"b\":3}]", got.getValue(0).string);
+    try testing.expect(got.getValue(1) == .null);
+    try testing.expectEqualStrings("[]", got.getValue(2).string);
+    try testing.expectEqualStrings("[null]", got.getValue(3).string);
+
+    // `b` claims a third element in row 0 that `a` does not have
+    const eb3 = try entriesOf(a, &.{ .{ .int = 2 }, .{ .int = 3 }, .{ .int = 9 }, .null, .null, .null }, &.{ 0, 1, 1, 0, 0, 0 }, &.{ 4, 4, 4, 0, 1, 2 });
+    try testing.expectError(Error.CorruptParquetPage, assembleNested(a, &root, &.{ ea, eb3 }, 4));
+    // a row count the levels do not have
+    try testing.expectError(Error.CorruptParquetPage, assembleNested(a, &root, &.{ ea, eb }, 5));
+    // a leaf missing altogether
+    try testing.expectError(Error.CorruptParquetPage, assembleNested(a, &root, &.{ea}, 4));
+}
+
+test "a nested fixture with bytes flipped anywhere errors or reads, never crashes" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    inline for (.{ "testdata/lists_v1.parquet", "testdata/lists_v2.parquet" }) |fixture| {
+        const good = @embedFile(fixture);
+        var buf: [good.len]u8 = undefined;
+        // Every byte, one mask: this sweep found a negative row count, a
+        // negative chunk offset and an empty schema reaching unchecked casts,
+        // and a pre-year-0 date trapping in the formatter.
+        var i: usize = 0;
+        while (i < good.len) : (i += 1) {
+            @memcpy(&buf, good);
+            buf[i] ^= 0x5A;
+            _ = readAllText(a, &buf, "f.parquet") catch continue;
+        }
+    }
 }
