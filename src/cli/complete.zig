@@ -82,11 +82,19 @@ fn cased(arena: std.mem.Allocator, word: []const u8, like: []const u8) ![]const 
     return out;
 }
 
+/// Where the word being typed at `cursor` begins — what a pick replaces from,
+/// and what an empty offer still reports, so an editor never reads "replace
+/// from the top of the cell". `cursor` itself when no word is under way.
+pub fn wordStart(text: []const u8, cursor: usize) usize {
+    var start = cursor;
+    while (start > 0 and (isWordByte(text[start - 1]) or text[start - 1] == '.' or text[start - 1] == '$' or text[start - 1] == '\\')) start -= 1;
+    return start;
+}
+
 pub fn complete(arena: std.mem.Allocator, names: Names, text: []const u8, cursor: usize) !Result {
     if (stringStart(text, cursor)) |q| return .{ .path = .{ .start = q + 1, .partial = text[q + 1 .. cursor] } };
 
-    var start = cursor;
-    while (start > 0 and (isWordByte(text[start - 1]) or text[start - 1] == '.' or text[start - 1] == '$' or text[start - 1] == '\\')) start -= 1;
+    const start = wordStart(text, cursor);
     const word = text[start..cursor];
     if (word.len == 0) return .none;
     var out = std.array_list.Managed(Candidate).init(arena);

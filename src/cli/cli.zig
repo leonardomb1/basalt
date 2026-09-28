@@ -1442,7 +1442,7 @@ pub fn suggestFor(arena: std.mem.Allocator, cx: *const Completer, text: []const 
         .columns = columns.items,
     }, text, cursor);
     switch (r) {
-        .none => return .{},
+        .none => return .{ .start = complete.wordStart(text, cursor) },
         .candidates => |c| return .{ .start = c.start, .items = c.items },
         .path => |p| {
             const paths = try listPaths(arena, p.partial);
@@ -2484,6 +2484,33 @@ test "suggestFor: a half-typed script's own declarations and a local file's colu
     try writeOffer(&aw.writer, cols, text.len);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, aw.written(), .{});
     try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("items").?.array.items.len);
+}
+
+test "an offer with no candidates still starts at the word being typed, not the top of the cell" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var decls = DeclStore.init(std.testing.allocator);
+    defer decls.deinit();
+    var catalog = Catalog.init(std.testing.allocator);
+    defer catalog.deinit();
+    const cx = Completer{ .gpa = std.testing.allocator, .decls = &decls, .catalog = &catalog, .connect = false };
+
+    const text = "SELECT * FROM sal";
+    const none = try suggestFor(a, &cx, text, text.len);
+    try std.testing.expectEqual(@as(usize, 0), none.items.len);
+    try std.testing.expectEqual(@as(usize, 14), none.start);
+
+    const gap = try suggestFor(a, &cx, "SELECT ", 7);
+    try std.testing.expectEqual(@as(usize, 0), gap.items.len);
+    try std.testing.expectEqual(@as(usize, 7), gap.start);
+
+    // UTF-16 offsets too: `é` is two bytes, one unit.
+    const wide = "SELECT 'é' FROM sal";
+    const w = try suggestFor(a, &cx, wide, wide.len);
+    var aw = std.Io.Writer.Allocating.init(a);
+    try writeOfferIn(&aw.writer, w, wide.len, wide, true);
+    try std.testing.expectEqualStrings("{\"start\":16,\"end\":19,\"items\":[]}", aw.written());
 }
 
 test "letLiteral: every value folds back to itself" {
