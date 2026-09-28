@@ -641,6 +641,7 @@ pub fn aErr(env: *Env, ad: *analyze.Diag, e: analyze.Error) anyerror {
         error.AnalyzeFailed => blk: {
             const err = planErr(env.diag, ad.msg);
             env.diag.pos = ad.pos;
+            env.diag.end = ad.end;
             break :blk err;
         },
     };

@@ -27,6 +27,8 @@ pub const Diag = struct {
     /// Where the failing stage/pipeline sits in the script. Cleared by `fail` and
     /// stamped as the error unwinds through the analyzer, innermost stage first.
     pos: ?ast.Pos = null,
+    /// End of the offending text, when the error names a span rather than a stage.
+    end: ?ast.Pos = null,
 
     pub fn stamp(self: *Diag, pos: ast.Pos) void {
         if (self.pos == null) self.pos = pos;
@@ -38,7 +40,18 @@ pub const Error = error{ AnalyzeFailed, OutOfMemory };
 fn fail(diag: *Diag, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
     diag.msg = std.fmt.bufPrint(&diag.buf, fmt, args) catch "analysis error";
     diag.pos = null;
+    diag.end = null;
     return error.AnalyzeFailed;
+}
+
+/// `fail`, underlining `span` when the offending text has one.
+fn failAt(diag: *Diag, span: ?ast.Span, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
+    const e = fail(diag, fmt, args);
+    if (span) |s| {
+        diag.pos = s.start;
+        diag.end = s.end;
+    }
+    return e;
 }
 
 /// Param name → the literal expression it substitutes to (CLI values for the
@@ -76,7 +89,7 @@ fn exprType(arena: std.mem.Allocator, in: types.Schema, e: *const ast.Expr, diag
     var ctx = eval.TypeCtx{ .schema = in, .arena = arena };
     return ctx.typeOf(e) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.TypeError => return fail(diag, "{s}", .{ctx.msg}),
+        error.TypeError => return failAt(diag, ctx.span, "{s}", .{ctx.msg}),
     };
 }
 
@@ -111,7 +124,7 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
             }
         },
         .field => |q| {
-            const idx = in.resolve(q.parts) orelse return fail(diag, "unknown field `{s}`", .{lastPart(q)});
+            const idx = in.resolve(q.parts) orelse return failAt(diag, q.span, "unknown field `{s}`", .{lastPart(q)});
             // `b.x` is called `x` in the output, as SQL has it — unless `a.x` is
             // already there, when it keeps the name the join gave it.
             var nm = lastPart(q);
@@ -147,7 +160,7 @@ pub fn checkFilter(arena: std.mem.Allocator, in: types.Schema, pred0: *const ast
 /// their column indices.
 pub fn fieldIndices(arena: std.mem.Allocator, in: types.Schema, names: []const ast.QualName, diag: *Diag) Error![]usize {
     const idxs = try arena.alloc(usize, names.len);
-    for (names, 0..) |q, i| idxs[i] = in.resolve(q.parts) orelse return fail(diag, "unknown field `{s}`", .{lastPart(q)});
+    for (names, 0..) |q, i| idxs[i] = in.resolve(q.parts) orelse return failAt(diag, q.span, "unknown field `{s}`", .{lastPart(q)});
     return idxs;
 }
 
@@ -1970,6 +1983,38 @@ test "analyze: a failing stage reports its line and column" {
     try std.testing.expectEqualStrings("unknown field `nosuch`", diag.msg);
     try std.testing.expectEqual(@as(u32, 4), diag.pos.?.line);
     try std.testing.expectEqual(@as(u32, 7), diag.pos.?.col);
+    try std.testing.expectEqual(@as(u32, 13), diag.end.?.col);
+}
+
+test "analyze: an unknown name is underlined where it is written, not at its statement" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const Case = struct { src: []const u8, line: u32, col: u32, end_col: u32 };
+    const cases = [_]Case{
+        // a bare select-list column
+        .{ .src = "SELECT nope FROM RANGE(3);", .line = 1, .col = 8, .end_col = 12 },
+        // inside a call, on the second line of the statement
+        .{ .src = "SELECT range,\n       upper(nope) AS u\nFROM RANGE(3);", .line = 2, .col = 14, .end_col = 18 },
+        // an unknown function: its name
+        .{ .src = "SELECT frobnicate(range) AS f FROM RANGE(3);", .line = 1, .col = 8, .end_col = 18 },
+        // a call with the wrong arguments: the call's name, not its first argument
+        .{ .src = "SELECT substr(range) AS s FROM RANGE(3);", .line = 1, .col = 8, .end_col = 14 },
+        // a sort key
+        .{ .src = "SELECT range FROM RANGE(3) ORDER BY zz;", .line = 1, .col = 37, .end_col = 39 },
+        // a quoted name spans its quotes
+        .{ .src = "SELECT \"no such\" FROM RANGE(3);", .line = 1, .col = 8, .end_col = 17 },
+    };
+    for (cases) |c| {
+        var diag = Diag{};
+        try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, c.src), &diag));
+        errdefer std.debug.print("case: {s} -> {s} at {?}..{?}\n", .{ c.src, diag.msg, diag.pos, diag.end });
+        try std.testing.expectEqual(c.line, diag.pos.?.line);
+        try std.testing.expectEqual(c.col, diag.pos.?.col);
+        try std.testing.expectEqual(c.line, diag.end.?.line);
+        try std.testing.expectEqual(c.end_col, diag.end.?.col);
+    }
 }
 
 test "analyze: string builtins refuse a non-INT position but coerce scalars to text" {

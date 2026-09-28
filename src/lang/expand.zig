@@ -353,7 +353,7 @@ fn expandCall(cx: *Ctx, c: ast.Expr.Call, subst: ?*Subst, depth: usize) Error!*a
         for (fd.params, full) |p, av| try inner.put(p.name, av);
         return expandExpr(cx, fd.body.expr, &inner, depth + 1);
     }
-    return mk(cx, .{ .call = .{ .name = c.name, .args = args } });
+    return mk(cx, .{ .call = .{ .name = c.name, .args = args, .distinct = c.distinct, .span = c.span } });
 }
 
 /// Pad a short argument list from the declaration's trailing `DEFAULT` expressions.

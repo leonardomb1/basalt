@@ -7,6 +7,10 @@ const types = @import("types.zig");
 
 pub const Pos = struct { line: u32, col: u32 };
 
+/// A source range: `start` is the first character, `end` just past the last
+/// (both 1-based, as an editor's range takes them).
+pub const Span = struct { start: Pos, end: Pos };
+
 /// A possibly-qualified name: `id`, `public.orders`, `a.b.c`. `safe` (when present)
 /// is parallel to the *separators*: `safe[i]` is true when the separator between
 /// `parts[i]` and `parts[i+1]` was `?.` (safe navigation) rather than `.` — so its
@@ -17,6 +21,8 @@ pub const Pos = struct { line: u32, col: u32 };
 pub const QualName = struct {
     parts: []const []const u8,
     safe: []const bool = &.{},
+    /// Where the name was written, when it was: what an error about it underlines.
+    span: ?Span = null,
 
     pub fn single(self: QualName) ?[]const u8 {
         return if (self.parts.len == 1) self.parts[0] else null;
@@ -47,7 +53,7 @@ pub const Expr = union(enum) {
 
     pub const Unary = struct { op: UnOp, e: *Expr };
     pub const Binary = struct { op: BinOp, l: *Expr, r: *Expr };
-    pub const Call = struct { name: []const u8, args: []const *Expr, distinct: bool = false };
+    pub const Call = struct { name: []const u8, args: []const *Expr, distinct: bool = false, span: ?Span = null };
     pub const Cond = struct { cond: *Expr, then: *Expr, els: *Expr };
     /// `let name = value in body`: a local binding inside an expression. Inlined at
     /// plan time (`expand.zig`) by substituting `value` for `name` in `body`, so the
@@ -109,7 +115,7 @@ pub fn rebuildExpr(arena: std.mem.Allocator, e: *const Expr, ctx: anytype, compt
         .call => |c| blk: {
             const args = try arena.alloc(*Expr, c.args.len);
             for (c.args, args) |a, *out| out.* = try recur(ctx, a);
-            break :blk try mkExpr(arena, .{ .call = .{ .name = c.name, .args = args, .distinct = c.distinct } });
+            break :blk try mkExpr(arena, .{ .call = .{ .name = c.name, .args = args, .distinct = c.distinct, .span = c.span } });
         },
         .match => |m| blk: {
             const subject = if (m.subject) |s| try recur(ctx, s) else null;

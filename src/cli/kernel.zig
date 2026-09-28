@@ -292,6 +292,9 @@ const ErrorInfo = struct {
     file: ?[]const u8 = null,
     line: ?u32 = null,
     col: ?u32 = null,
+    /// Just past the offending text, when the error names a span.
+    end_line: ?u32 = null,
+    end_col: ?u32 = null,
     transient: bool = false,
 };
 
@@ -331,23 +334,26 @@ fn reply(a: std.mem.Allocator, out: *Out, id: ?[]const u8, st: Status) !void {
 
 /// Maps a position in prelude + script back to the script as the frontend sent
 /// it. A position inside the prelude belongs to an earlier script's declaration.
-fn locate(e: *ErrorInfo, prepared_text: []const u8, entry_at: usize, label: []const u8, pos: ?ast.Pos) void {
+fn locate(e: *ErrorInfo, prepared_text: []const u8, entry_at: usize, label: []const u8, pos: ?ast.Pos, end: ?ast.Pos) void {
     const p = pos orelse return;
     if (p.line == 0) return;
+    var base: u32 = 0;
     if (label.len > 0 and !std.mem.eql(u8, label, "<repl>")) {
         e.file = label;
-        e.line = p.line;
-        e.col = p.col;
-        return;
+    } else {
+        base = @intCast(std.mem.count(u8, prepared_text[0..@min(entry_at, prepared_text.len)], "\n"));
+        if (p.line <= base) {
+            e.file = "session";
+            return;
+        }
+        e.file = "script";
     }
-    const prelude_lines: u32 = @intCast(std.mem.count(u8, prepared_text[0..@min(entry_at, prepared_text.len)], "\n"));
-    if (p.line <= prelude_lines) {
-        e.file = "session";
-        return;
-    }
-    e.file = "script";
-    e.line = p.line - prelude_lines;
+    e.line = p.line - base;
     e.col = p.col;
+    if (end) |x| if (x.line > base) {
+        e.end_line = x.line - base;
+        e.end_col = x.col;
+    };
 }
 
 fn paramArgs(a: std.mem.Allocator, v: ?std.json.Value) ![]runtime.ParamArg {
@@ -493,7 +499,8 @@ fn runScript(
         } }),
         error.ParseFailed => {
             var ei = ErrorInfo{ .msg = pdiag.parse.msg };
-            locate(&ei, text, text.len - script.len, pdiag.label, .{ .line = pdiag.parse.line, .col = pdiag.parse.col });
+            const pe = pdiag.parse;
+            locate(&ei, text, text.len - script.len, pdiag.label, .{ .line = pe.line, .col = pe.col }, if (pe.end_line > 0) ast.Pos{ .line = pe.end_line, .col = pe.end_col } else null);
             return reply(a, out, req.id, .{ .ok = false, .@"error" = ei });
         },
         error.OutOfMemory => return error.OutOfMemory,
@@ -535,6 +542,7 @@ fn runScript(
             failed = e;
             rdiag.msg = adiag.msg;
             rdiag.pos = adiag.pos;
+            rdiag.end = adiag.end;
         }
     } else {
         _ = runtime.run(gpa, entry.prog, .{
@@ -569,7 +577,7 @@ fn runScript(
         .msg = if (rdiag.msg.len > 0) try a.dupe(u8, rdiag.msg) else runtime.errLabel(e),
         .transient = rdiag.retryable or runtime.isTransient(e),
     };
-    locate(&ei, entry.text, entry.entry_at, "", rdiag.pos);
+    locate(&ei, entry.text, entry.entry_at, "", rdiag.pos, rdiag.end);
     return reply(a, out, req.id, .{ .ok = false, .elapsed_ms = elapsed, .declared = declared, .results = results, .@"error" = ei });
 }
 
@@ -578,26 +586,28 @@ test "locate: positions count in the script as sent, not the replayed prelude" {
     const entry_at = std.mem.indexOf(u8, text, "SELECT 1").?;
 
     var e = ErrorInfo{ .msg = "" };
-    locate(&e, text, entry_at, "", .{ .line = 4, .col = 8 });
+    locate(&e, text, entry_at, "", .{ .line = 4, .col = 8 }, .{ .line = 4, .col = 12 });
     try std.testing.expectEqualStrings("script", e.file.?);
     try std.testing.expectEqual(@as(?u32, 2), e.line);
     try std.testing.expectEqual(@as(?u32, 8), e.col);
+    try std.testing.expectEqual(@as(?u32, 2), e.end_line);
+    try std.testing.expectEqual(@as(?u32, 12), e.end_col);
 
     // inside the prelude: an earlier script's declaration, with no line to give
     var p = ErrorInfo{ .msg = "" };
-    locate(&p, text, entry_at, "", .{ .line = 1, .col = 1 });
+    locate(&p, text, entry_at, "", .{ .line = 1, .col = 1 }, null);
     try std.testing.expectEqualStrings("session", p.file.?);
     try std.testing.expectEqual(@as(?u32, null), p.line);
 
     // an included file keeps its own path and lines
     var inc = ErrorInfo{ .msg = "" };
-    locate(&inc, text, entry_at, "lib.sql", .{ .line = 7, .col = 3 });
+    locate(&inc, text, entry_at, "lib.sql", .{ .line = 7, .col = 3 }, null);
     try std.testing.expectEqualStrings("lib.sql", inc.file.?);
     try std.testing.expectEqual(@as(?u32, 7), inc.line);
 
     // no position, nothing claimed
     var none = ErrorInfo{ .msg = "" };
-    locate(&none, text, entry_at, "", null);
+    locate(&none, text, entry_at, "", null, null);
     try std.testing.expectEqual(@as(?[]const u8, null), none.file);
 }
 

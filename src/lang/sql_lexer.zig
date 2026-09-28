@@ -64,9 +64,9 @@ pub const Lexer = struct {
         }
     }
 
+    /// Called once the token is consumed, so the lexer's position is its end.
     fn make(self: *Lexer, tag: Tag, text: []const u8, line: u32, col: u32) Token {
-        _ = self;
-        return .{ .tag = tag, .text = text, .line = line, .col = col };
+        return .{ .tag = tag, .text = text, .line = line, .col = col, .end_line = self.line, .end_col = self.col };
     }
 
     fn isIdentStart(c: u8) bool {

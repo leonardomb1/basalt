@@ -130,6 +130,16 @@ def main(binary):
         st,
     )
     report("results before a failing statement are still delivered", rows(data) == [{"a": 1}], data)
+    _, st = k.run("SELECT range,\n       upper(nope) AS u\nFROM RANGE(3);")
+    e = st.get("error") or {}
+    report(
+        "an unknown column is underlined exactly, on its own line",
+        (e.get("line"), e.get("col"), e.get("end_line"), e.get("end_col")) == (2, 14, 2, 18),
+        e,
+    )
+    _, st = k.run("SELECT frobnicate(1) AS x;")
+    e = st.get("error") or {}
+    report("an unknown function underlines its name", (e.get("col"), e.get("end_col")) == (8, 18), e)
     _, st = k.run("SELECT FROM WHERE;")
     report("a parse error fails the script, not the session", not st["ok"] and st["error"].get("line") == 1, st)
     _, st = k.run("SELECT dbl(1) AS v;")

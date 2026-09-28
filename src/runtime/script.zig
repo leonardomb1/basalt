@@ -202,7 +202,7 @@ fn renderQual(arena: std.mem.Allocator, q: ast.QualName, lr: LoopRow) !ast.QualN
     } else return q;
     const parts = try arena.alloc([]const u8, q.parts.len);
     for (q.parts, parts) |s, *dst| dst.* = try interpAll(arena, s, lr);
-    return .{ .parts = parts, .safe = q.safe };
+    return .{ .parts = parts, .safe = q.safe, .span = q.span };
 }
 
 fn renderRead(arena: std.mem.Allocator, rd: ast.Read, lr: LoopRow) !ast.Read {

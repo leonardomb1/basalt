@@ -26,7 +26,14 @@ const Token = token.Token;
 const Tag = token.Tag;
 const Pos = ast.Pos;
 
-pub const Diagnostic = struct { msg: []const u8, line: u32, col: u32 };
+pub const Diagnostic = struct {
+    msg: []const u8,
+    line: u32,
+    col: u32,
+    /// Just past the token the error points at, when it points at one; 0 else.
+    end_line: u32 = 0,
+    end_col: u32 = 0,
+};
 pub const Error = error{ ParseFailed, OutOfMemory };
 
 /// Tokenize and parse a whole Basalt SQL program.
@@ -299,6 +306,11 @@ pub const Parser = struct {
         const t = self.toks[self.i];
         return .{ .line = t.line, .col = t.col };
     }
+    /// From `start` to the end of the last token consumed.
+    fn spanFrom(self: *Parser, start: Pos) ast.Span {
+        const t = self.toks[if (self.i > 0) self.i - 1 else 0];
+        return .{ .start = start, .end = .{ .line = t.end_line, .col = t.end_col } };
+    }
     fn peekTag(self: *Parser) Tag {
         const j = self.i + 1;
         return if (j < self.toks.len) self.toks[j].tag else .eof;
@@ -384,6 +396,16 @@ pub const Parser = struct {
             .line = pos.line,
             .col = pos.col,
         };
+        // The token the error names, when `pos` is the start of one nearby.
+        const lo = if (self.i >= 4) self.i - 4 else 0;
+        const hi = @min(self.toks.len, self.i + 2);
+        for (self.toks[lo..hi]) |t| {
+            if (t.line == pos.line and t.col == pos.col and t.end_line > 0 and t.tag != .eof) {
+                self.diag.end_line = t.end_line;
+                self.diag.end_col = t.end_col;
+                break;
+            }
+        }
         return error.ParseFailed;
     }
 
@@ -2857,6 +2879,7 @@ pub const Parser = struct {
     }
 
     fn parseDollarPath(self: *Parser) Error!ast.QualName {
+        const start = self.curPos();
         const t = try self.expect(.dollar_ident);
         var parts = std.array_list.Managed([]const u8).init(self.arena);
         var safes = std.array_list.Managed(bool).init(self.arena);
@@ -2872,6 +2895,7 @@ pub const Parser = struct {
         return .{
             .parts = try parts.toOwnedSlice(),
             .safe = if (any_safe) try safes.toOwnedSlice() else &.{},
+            .span = self.spanFrom(start),
         };
     }
 
@@ -2930,13 +2954,14 @@ pub const Parser = struct {
     }
 
     fn parseQualNameTok(self: *Parser) Error!ast.QualName {
+        const start = self.curPos();
         var parts = std.array_list.Managed([]const u8).init(self.arena);
         try parts.append(try self.expectColName());
         while (self.at(.dot) and (self.peekTag() == .ident or self.peekTag() == .qident or self.peekTag() == .string)) {
             _ = self.advance();
             try parts.append(try self.expectColName());
         }
-        return .{ .parts = try parts.toOwnedSlice() };
+        return .{ .parts = try parts.toOwnedSlice(), .span = self.spanFrom(start) };
     }
 
     /// Rewrite `alias.x` -> `x` in an expression tree.
@@ -3626,7 +3651,9 @@ pub const Parser = struct {
                     }
                     _ = try self.expect(.rparen);
                     const lower = try std.ascii.allocLowerString(self.arena, t.text);
-                    return self.mk(.{ .call = .{ .name = lower, .args = try args.toOwnedSlice(), .distinct = call_distinct } });
+                    // the name alone: an error about the call is about its name
+                    const name_span = ast.Span{ .start = .{ .line = t.line, .col = t.col }, .end = .{ .line = t.end_line, .col = t.end_col } };
+                    return self.mk(.{ .call = .{ .name = lower, .args = try args.toOwnedSlice(), .distinct = call_distinct, .span = name_span } });
                 }
                 const q = try self.parseQualNameField();
                 return self.mk(.{ .field = q });
@@ -3637,6 +3664,7 @@ pub const Parser = struct {
 
     /// A column reference in an expression: `a`, `t.col`, `a.b.c` (with `?.`).
     fn parseQualNameField(self: *Parser) Error!ast.QualName {
+        const start = self.curPos();
         var parts = std.array_list.Managed([]const u8).init(self.arena);
         var safes = std.array_list.Managed(bool).init(self.arena);
         try parts.append(try self.expectIdent());
@@ -3651,6 +3679,7 @@ pub const Parser = struct {
         return .{
             .parts = try parts.toOwnedSlice(),
             .safe = if (any_safe) try safes.toOwnedSlice() else &.{},
+            .span = self.spanFrom(start),
         };
     }
 

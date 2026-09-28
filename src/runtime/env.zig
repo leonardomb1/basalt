@@ -31,6 +31,8 @@ pub const Diag = struct {
     /// and stamped as the error unwinds, innermost stage first, so the position
     /// always belongs to the message beside it.
     pos: ?ast.Pos = null,
+    /// End of the offending text, set only alongside a span-precise `pos`.
+    end: ?ast.Pos = null,
 
     pub fn stamp(self: *Diag, pos: ast.Pos) void {
         if (self.pos == null) self.pos = pos;
@@ -441,6 +443,7 @@ pub fn setMsg(diag: *Diag, msg: []const u8) void {
     @memcpy(diag.buf[0..n], msg[0..n]);
     diag.msg = diag.buf[0..n];
     diag.pos = null;
+    diag.end = null;
 }
 
 /// A StarRocks open failure. The reason is appended only when there is one: a

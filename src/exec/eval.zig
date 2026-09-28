@@ -24,6 +24,8 @@ pub const TypeCtx = struct {
     schema: types.Schema,
     arena: std.mem.Allocator,
     msg: []const u8 = "",
+    /// The name the error is about, when it is about one.
+    span: ?ast.Span = null,
 
     pub fn typeOf(self: *TypeCtx, expr: *const ast.Expr) TypeError!Type {
         switch (expr.*) {
@@ -33,9 +35,11 @@ pub const TypeCtx = struct {
             .float_lit => return Type.init(.float),
             .str_lit => return Type.init(.string),
             .field => |q| {
+                self.span = q.span;
                 if (q.safe.len > 0) return self.err("`?.` (safe navigation) only applies to JSON-param paths, not column `{s}`", .{lastPart(q)});
                 const idx = fieldIndex(self.schema, q) orelse
                     return self.err("unknown field `{s}`", .{lastPart(q)});
+                self.span = null;
                 return self.schema.fields[idx].ty;
             },
             .unary => |u| {
@@ -121,11 +125,18 @@ pub const TypeCtx = struct {
 
     fn typeOfCall(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
         const name = c.name;
+        self.span = c.span;
         inline for (.{ "count", "sum", "avg", "min", "max" }) |agg| {
             if (std.mem.eql(u8, name, agg)) return self.err("aggregate `{s}` is only valid inside `aggregate`", .{name});
         }
         const b = lookupBuiltin(name) orelse return self.err("unknown function `{s}`", .{name});
-        return b.type_fn(self, c);
+        self.span = null;
+        // An argument's own error names its own span; one about the call as a
+        // whole (arity, argument types) underlines the function name.
+        return b.type_fn(self, c) catch |e| {
+            if (self.span == null) self.span = c.span;
+            return e;
+        };
     }
 
     fn typeOfMatch(self: *TypeCtx, m: ast.Match) TypeError!Type {

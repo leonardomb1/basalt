@@ -111,4 +111,8 @@ pub const Token = struct {
     text: []const u8,
     line: u32,
     col: u32,
+    /// Just past the token's last source byte — where an editor ends its
+    /// underline. Zero when the token was made rather than lexed.
+    end_line: u32 = 0,
+    end_col: u32 = 0,
 };

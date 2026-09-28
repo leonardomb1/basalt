@@ -1101,6 +1101,21 @@ text on stderr, and so is a whole-program `EXPLAIN`.
 Logs are stderr-only, plain text, level `warn` by default (`--log-level`,
 `--log-format json`, `-q`).
 
+Errors point at what is wrong, not at the statement it sits in: an unknown
+column or function is reported at the name itself, on its own line of a
+multi-line query. Under `--log-format json` an error is one NDJSON line in the
+log's shape, with the range an editor underlines — `end_line`/`end_col` are just
+past the offending text, and absent when the error is about a whole stage — and
+whether a retry could help (`class`, the exit-`75` distinction below):
+
+```
+{"ts":1790592941244,"level":"error","event":"script_error","msg":"unknown field `nope`",
+ "file":"orders.sql","line":2,"col":14,"end_line":2,"end_col":18,"class":"permanent"}
+```
+
+`event` is `parse_error`, `script_error` or `aborted`; `file` is the script, or
+the `@include`d file the fault is in.
+
 While a `LOAD` runs, a terminal gets a live line on stderr — what is moving
 where, rows so far, the rate and the clock, with `[3/12]` in front inside a
 `FOR EACH`:
@@ -1264,7 +1279,9 @@ does. `declared` lists what the script added to the session — a script's
 declarations join the session once it parses, whether or not it then runs
 cleanly. An error's `line`/`col` count in the script as sent; `file` is
 `script`, an `@include`d file's path, or `session` when the fault lies in a
-declaration an earlier script made. `transient` is the exit-`75` class below.
+declaration an earlier script made. `end_line`/`end_col`, when present, end
+the offending name, as under `--log-format json`. `transient` is the exit-`75`
+class below.
 Results written before a failing statement are still delivered. Logs and
 `PRINT` stay on stderr (`--log-level`, `--log-format`), and the per-run summary
 is left out — the status carries it.

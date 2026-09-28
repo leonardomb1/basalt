@@ -161,17 +161,72 @@ fn printDiag(stderr: *std.Io.Writer, label: []const u8, tag: []const u8, pos: ?a
         try stderr.print("{s}: error{s}: {s}\n", .{ label, tag, msg });
 }
 
+/// Where a script's errors go: the located text line, or under `--log-format
+/// json` one NDJSON object in the log's own shape, with the span an editor
+/// underlines and whether a retry could help.
+const ErrOut = struct {
+    w: *std.Io.Writer,
+    json: bool,
+    label: []const u8,
+
+    const Located = struct {
+        msg: []const u8,
+        pos: ?ast.Pos = null,
+        end: ?ast.Pos = null,
+        /// A file other than the script itself, e.g. an `@include`d one.
+        file: ?[]const u8 = null,
+        transient: bool = false,
+        event: []const u8 = "script_error",
+    };
+
+    fn report(self: ErrOut, e: Located) !void {
+        const file = e.file orelse self.label;
+        if (!self.json) {
+            return printDiag(self.w, file, if (e.transient) " (transient)" else "", e.pos, e.msg);
+        }
+        try self.w.print("{{\"ts\":{d},\"level\":\"error\",\"event\":\"{s}\",\"msg\":", .{ std.time.milliTimestamp(), e.event });
+        try std.json.Stringify.encodeJsonString(e.msg, .{}, self.w);
+        try self.w.writeAll(",\"file\":");
+        try std.json.Stringify.encodeJsonString(file, .{}, self.w);
+        if (e.pos) |p| {
+            try self.w.print(",\"line\":{d},\"col\":{d}", .{ p.line, p.col });
+            if (e.end) |x| try self.w.print(",\"end_line\":{d},\"end_col\":{d}", .{ x.line, x.col });
+        }
+        try self.w.print(",\"class\":\"{s}\"}}\n", .{if (e.transient) "transient" else "permanent"});
+    }
+};
+
+/// `--log-format json` anywhere on the command line, read before the script is
+/// parsed so a parse error is reported in the same shape as a runtime one.
+fn wantsJsonLog(args: [][:0]u8) bool {
+    var i: usize = 2;
+    while (i + 1 < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--log-format")) return std.mem.eql(u8, args[i + 1], "json");
+    }
+    return false;
+}
+
 /// Parse a resolved source (resolving its `@include` header first), printing a
 /// located diagnostic on failure. The AST is allocated in `arena` and slices into
 /// `src.text` and the included files' texts, so all must outlive use. The
 /// diagnostic names the file it came from — an included file reports its own
 /// path and its own line numbers.
 fn parseSrc(arena: std.mem.Allocator, src: Source, stderr: *std.Io.Writer) !?ast.Program {
+    return parseSrcTo(arena, src, .{ .w = stderr, .json = false, .label = src.label });
+}
+
+fn parseSrcTo(arena: std.mem.Allocator, src: Source, eo: ErrOut) !?ast.Program {
     var diag: include.Diag = .{};
     return include.loadProgram(arena, src.text, src.label, src.dir, &diag) catch |e| switch (e) {
         error.ParseFailed => {
-            const label = if (diag.label.len > 0) diag.label else src.label;
-            try stderr.print("{s}:{d}:{d}: error: {s}\n", .{ label, diag.parse.line, diag.parse.col, diag.parse.msg });
+            const p = diag.parse;
+            try eo.report(.{
+                .msg = p.msg,
+                .pos = .{ .line = p.line, .col = p.col },
+                .end = if (p.end_line > 0) ast.Pos{ .line = p.end_line, .col = p.end_col } else null,
+                .file = if (diag.label.len > 0) diag.label else null,
+                .event = "parse_error",
+            });
             return null;
         },
         error.OutOfMemory => return e,
@@ -241,7 +296,8 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     defer stderr.flush() catch {};
 
     const src = (try loadSource(arena.allocator(), "run", args, stderr)) orelse return 1;
-    const prog = (try parseSrc(arena.allocator(), src, stderr)) orelse return 1;
+    const eo = ErrOut{ .w = stderr, .json = wantsJsonLog(args), .label = src.label };
+    const prog = (try parseSrcTo(arena.allocator(), src, eo)) orelse return 1;
 
     var params = std.array_list.Managed(runtime.ParamArg).init(alloc);
     defer params.deinit();
@@ -323,7 +379,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         const plan = analyze.analyze(arena.allocator(), prog, &adiag2) catch |e| switch (e) {
             error.OutOfMemory => return e,
             error.AnalyzeFailed => {
-                try printDiag(stderr, src.label, "", adiag2.pos, adiag2.msg);
+                try eo.report(.{ .msg = adiag2.msg, .pos = adiag2.pos, .end = adiag2.end });
                 return 1;
             },
         };
@@ -347,22 +403,25 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     const progress = !no_progress and !log.quiet and std.posix.isatty(std.fs.File.stderr().handle);
     _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze, .stdout_format = stdout_format, .progress = progress, .items = true }, &diag) catch |e| switch (e) {
         error.Aborted => {
-            try stderr.print("{s}: aborted\n", .{src.label});
+            if (eo.json)
+                try eo.report(.{ .msg = "aborted", .event = "aborted" })
+            else
+                try stderr.print("{s}: aborted\n", .{src.label});
             return 130;
         },
         error.PlanFailed => {
-            const tag = if (diag.retryable) " (transient)" else "";
-            try printDiag(stderr, src.label, tag, diag.pos, diag.msg);
+            try eo.report(.{ .msg = diag.msg, .pos = diag.pos, .end = diag.end, .transient = diag.retryable });
             return if (diag.retryable) 75 else 1;
         },
         error.OutOfMemory => return e,
         else => {
             const transient = diag.retryable or runtime.isTransient(e);
-            const tag = if (transient) " (transient)" else "";
             if (diag.msg.len > 0)
-                try printDiag(stderr, src.label, tag, diag.pos, diag.msg)
+                try eo.report(.{ .msg = diag.msg, .pos = diag.pos, .end = diag.end, .transient = transient })
+            else if (eo.json)
+                try eo.report(.{ .msg = runtime.errLabel(e), .transient = transient })
             else
-                try stderr.print("{s}: runtime error{s}: {s}\n", .{ src.label, tag, runtime.errLabel(e) });
+                try stderr.print("{s}: runtime error{s}: {s}\n", .{ src.label, if (transient) " (transient)" else "", runtime.errLabel(e) });
             return if (transient) 75 else 1;
         },
     };

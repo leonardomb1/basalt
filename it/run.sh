@@ -904,6 +904,23 @@ if runs stdout; then
     fi
   fi
 
+  # Under --log-format json an error is one NDJSON object an editor can place:
+  # the span of the offending name, on its own line of a multi-line statement.
+  $B run --log-format json -c "SELECT id,
+       upper(nope) AS u
+FROM 'it/seed.csv';" >/dev/null 2>"$out/jerr.log" || true
+  if python3 -c '
+import json, sys
+e = json.loads(open(sys.argv[1]).read().strip().splitlines()[-1])
+assert e["level"] == "error" and e["class"] == "permanent", e
+assert (e["line"], e["col"], e["end_line"], e["end_col"]) == (2, 14, 2, 18), e
+' "$out/jerr.log" 2>>"$out/jerr.log"; then
+    report "stdout: a json-log error carries the offending span" ok
+  else
+    report "stdout: a json-log error carries the offending span" bad
+    tail -3 "$out/jerr.log"
+  fi
+
   if $B run --format xml -c "SELECT 1;" >/dev/null 2>"$out/badfmt.log"; then
     report "stdout: an unknown --format is refused" bad
   elif grep -q "table|json|csv|tsv|arrow" "$out/badfmt.log"; then
