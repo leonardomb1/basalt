@@ -666,7 +666,8 @@ test "stream: a record batch carries validity, repacked bools and decimals, raw 
     try std.testing.expectEqual(@as(usize, 48), valor_data.len);
     try std.testing.expectEqual(@as(i128, 1050), std.mem.readInt(i128, body[valor_data.off..][0..16], .little));
     try std.testing.expectEqual(@as(i128, 300), std.mem.readInt(i128, body[valor_data.off + 16 ..][0..16], .little));
-    try std.testing.expectEqual(@as(i128, -1234), std.mem.readInt(i128, body[valor_data.off + 32 ..][0..16], .little));
+    // -12.345 at the column's scale 2 rounds half away from zero
+    try std.testing.expectEqual(@as(i128, -1235), std.mem.readInt(i128, body[valor_data.off + 32 ..][0..16], .little));
 
     const dia_data = bufAt(rb, bufs.at, 10);
     try std.testing.expectEqual(@as(usize, 12), dia_data.len);
@@ -748,8 +749,8 @@ test "file sink: the IPC file and stream a sink writes read back through the rea
         var rows: usize = 0;
         while (try r.next(a)) |b| {
             // the decimal column as the writer stored it: at its declared scale 2,
-            // so the scale-3 input -12.345 is -12.34 (the writer's own test pins that)
-            const dec_want = [_][]const u8{ "10.50", "3.00", "-12.34" };
+            // so the scale-3 input -12.345 rounds half away from zero to -12.35
+            const dec_want = [_][]const u8{ "10.50", "3.00", "-12.35" };
             for (0..b.len) |i| {
                 const got = b.columns[3].getValue(i);
                 try std.testing.expectEqualStrings(dec_want[i % 3], try @import("../exec/eval.zig").valueToString(a, got));

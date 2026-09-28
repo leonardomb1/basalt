@@ -2439,12 +2439,7 @@ pub fn castValueTyped(arena: std.mem.Allocator, v: Value, ty: types.Type) EvalEr
         .decimal => |x| x,
         .int => |x| .{ .unscaled = x, .scale = 0 },
         .bool => |x| .{ .unscaled = if (x) 1 else 0, .scale = 0 },
-        .float => |x| blk: {
-            const p = powTen(ty.scale);
-            const scaled = x * @as(f64, @floatFromInt(p));
-            if (!std.math.isFinite(scaled)) return error.CastFailed;
-            break :blk .{ .unscaled = @intFromFloat(@round(scaled)), .scale = ty.scale };
-        },
+        .float => |x| floatToDecimal(x) orelse return error.CastFailed,
         // Null means the text is not a decimal literal: `CAST` fails here and
         // `TRY_CAST` turns that failure into a null one level up.
         .string, .bytes => |str| switch (sql.parseDecimalText(trim(str)) orelse return error.CastFailed) {
@@ -2464,8 +2459,55 @@ fn powTen(n: u8) i128 {
     return r;
 }
 
-/// Shift a decimal to `want`, truncating toward zero when it loses digits —
-/// the same rule the parquet writer applies. Null when scaling up overflows.
+/// A float as the decimal its 15 significant digits spell, as PostgreSQL turns
+/// a `float8` into `numeric`: `12.345` is stored as 12.34499999999999886, and
+/// rounding that binary value to two places would give 12.34 where every reader
+/// of the number expects 12.35. Null for a non-finite value, or one too large
+/// for 38 digits.
+pub fn floatToDecimal(x: f64) ?Decimal {
+    if (!std.math.isFinite(x)) return null;
+    if (x == 0) return .{ .unscaled = 0, .scale = 0 };
+    var buf: [48]u8 = undefined;
+    // d.dddddddddddddde±N: fifteen significant digits
+    const s = std.fmt.bufPrint(&buf, "{e:.14}", .{@abs(x)}) catch return null;
+    const e_at = std.mem.indexOfScalar(u8, s, 'e') orelse return null;
+    var m: i128 = 0;
+    for (s[0..e_at]) |c| {
+        if (c == '.') continue;
+        m = m * 10 + (c - '0');
+    }
+    const exp = std.fmt.parseInt(i32, s[e_at + 1 ..], 10) catch return null;
+    if (x < 0) m = -m;
+    // m has 15 digits, so the value is m * 10^(exp - 14)
+    const shift = exp - 14;
+    if (shift >= 0) {
+        if (shift > 23) return null; // past 38 digits
+        return .{ .unscaled = std.math.mul(i128, m, powTen(@intCast(shift))) catch return null, .scale = 0 };
+    }
+    const sc = -shift;
+    if (sc <= 38) return .{ .unscaled = m, .scale = @intCast(sc) };
+    // smaller than 38 places can hold: what 38 places round it to
+    return .{ .unscaled = roundScaleDown(m, @intCast(sc - 38)), .scale = 38 };
+}
+
+/// `u / 10^drop`, rounded half away from zero — PostgreSQL's rule for numeric,
+/// and SQL Server's: 12.345 → 12.35 and -12.345 → -12.35 at two places.
+pub fn roundScaleDown(u: i128, drop: u32) i128 {
+    if (drop == 0) return u;
+    // 10^38 is the largest power of ten an i128 holds; past it every value
+    // basalt can carry is under half a unit
+    if (drop > 38) return 0;
+    const p = powTen(@intCast(drop));
+    const q = @divTrunc(u, p);
+    const r = @rem(u, p);
+    const twice = @abs(r) * 2;
+    if (twice >= @abs(p)) return if (u < 0) q - 1 else q + 1;
+    return q;
+}
+
+/// Shift a decimal to `want`, rounding half away from zero when it loses
+/// digits — one rule for every cast, sink and aggregate, as PostgreSQL applies
+/// it. Null when scaling up overflows.
 ///
 /// Public because a value's scale is NOT guaranteed to match its column's
 /// declared scale: postgres sends a per-value `dscale` on NUMERIC, so a bare
@@ -2478,7 +2520,7 @@ pub fn rescaleTo(d: Decimal, want: u8) ?Decimal {
     while (have < want) : (have += 1) {
         unscaled = std.math.mul(i128, unscaled, 10) catch return null;
     }
-    while (have > want) : (have -= 1) unscaled = @divTrunc(unscaled, 10);
+    if (have > want) unscaled = roundScaleDown(unscaled, @intCast(have - want));
     return .{ .unscaled = unscaled, .scale = want };
 }
 
@@ -2965,6 +3007,43 @@ test "parseIsoTime: the text a time prints as, and nothing out of range" {
     try std.testing.expectEqual(@as(?i64, null), parseIsoTime("24:00:00"));
     try std.testing.expectEqual(@as(?i64, null), parseIsoTime("1:02:03"));
     try std.testing.expectEqual(@as(?i64, null), parseIsoTime("01:02:03 extra"));
+}
+
+test "decimals lose digits by rounding half away from zero, on every path" {
+    // a decimal's own digits
+    const cases = [_]struct { u: i128, s: u8, to: u8, want: i128 }{
+        .{ .u = 12345, .s = 3, .to = 2, .want = 1235 },
+        .{ .u = -12345, .s = 3, .to = 2, .want = -1235 },
+        .{ .u = 12344, .s = 3, .to = 2, .want = 1234 },
+        .{ .u = 5, .s = 3, .to = 2, .want = 1 },
+        .{ .u = -4, .s = 3, .to = 2, .want = 0 },
+        .{ .u = 999, .s = 3, .to = 0, .want = 1 },
+        .{ .u = std.math.maxInt(i128), .s = 38, .to = 0, .want = 2 },
+    };
+    for (cases) |c| try std.testing.expectEqual(c.want, rescaleTo(.{ .unscaled = c.u, .scale = c.s }, c.to).?.unscaled);
+
+    // a float through its fifteen significant digits, as PostgreSQL casts float8
+    // to numeric: the binary 12.345 is 12.34499…, and must still read 12.35
+    const floats = [_]struct { x: f64, to: u8, want: i128 }{
+        .{ .x = 12.345, .to = 2, .want = 1235 },
+        .{ .x = -12.345, .to = 2, .want = -1235 },
+        .{ .x = 1.005, .to = 2, .want = 101 },
+        .{ .x = 2.675, .to = 2, .want = 268 },
+        .{ .x = 0.1 + 0.2, .to = 17, .want = 30000000000000000 },
+        .{ .x = 1e-300, .to = 2, .want = 0 },
+        .{ .x = 123456789012345678.0, .to = 0, .want = 123456789012346000 },
+    };
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    for (floats) |c| {
+        const got = try castValueTyped(ar.allocator(), .{ .float = c.x }, types.Type.decimal(38, c.to));
+        try std.testing.expectEqual(c.want, got.decimal.unscaled);
+    }
+    // too large for 38 digits, or not a number: a failed cast, never a trap
+    try std.testing.expectError(error.CastFailed, castValueTyped(ar.allocator(), .{ .float = 1e300 }, types.Type.decimal(10, 2)));
+    try std.testing.expectError(error.CastFailed, castValueTyped(ar.allocator(), .{ .float = std.math.nan(f64) }, types.Type.decimal(10, 2)));
+    // text rounds the same way
+    try std.testing.expectEqual(@as(i128, -1235), (try castValueTyped(ar.allocator(), .{ .string = "-12.345" }, types.Type.decimal(10, 2))).decimal.unscaled);
 }
 
 test "dates and timestamps before year 0 print with a sign instead of trapping" {

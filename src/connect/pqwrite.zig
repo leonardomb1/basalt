@@ -956,7 +956,8 @@ fn rescale(d: Decimal, want: i32) Error!i128 {
     var have: i32 = d.scale;
     while (have < want) : (have += 1)
         unscaled = std.math.mul(i128, unscaled, 10) catch return Error.UnsupportedParquetDecimal;
-    while (have > want) : (have -= 1) unscaled = @divTrunc(unscaled, 10);
+    // the same rounding every decimal cast and sink applies
+    if (have > want) unscaled = eval.roundScaleDown(unscaled, @intCast(have - want));
     return unscaled;
 }
 
@@ -1041,8 +1042,11 @@ test "definition levels pack LSB-first into bit-packed groups of eight" {
 test "decimal rescaling restates the unscaled value against the column scale" {
     try testing.expectEqual(@as(i128, 1550), try rescale(.{ .unscaled = 155, .scale = 1 }, 2));
     try testing.expectEqual(@as(i128, 155), try rescale(.{ .unscaled = 155, .scale = 2 }, 2));
-    // reducing scale truncates, matching the direction Parquet writers take
-    try testing.expectEqual(@as(i128, 15), try rescale(.{ .unscaled = 155, .scale = 2 }, 1));
+    // reducing scale rounds half away from zero, as every decimal cast does
+    try testing.expectEqual(@as(i128, 16), try rescale(.{ .unscaled = 155, .scale = 2 }, 1));
+    try testing.expectEqual(@as(i128, -16), try rescale(.{ .unscaled = -155, .scale = 2 }, 1));
+    try testing.expectEqual(@as(i128, 15), try rescale(.{ .unscaled = 154, .scale = 2 }, 1));
+    try testing.expectEqual(@as(i128, -1235), try rescale(.{ .unscaled = -12345, .scale = 3 }, 2));
     // `12.5` in a numeric(38,18) column is 1.25e19 unscaled — past i64, which is
     // exactly why that column is not stored as one.
     try testing.expectEqual(@as(i128, 12_500_000_000_000_000_000), try rescale(.{ .unscaled = 125, .scale = 1 }, 18));

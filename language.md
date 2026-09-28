@@ -956,6 +956,15 @@ At a use site the innermost binding wins: loop var > LET/PARAM.
   — `'1000,00'` is not a number basalt will read, and it used to come back as
   100000.00. Strip the separator first: `CAST(replace(v, ',', '.') AS
   DECIMAL(18,2))`, or reach for `TRY_CAST` to turn unreadable values into nulls.
+- **A decimal that loses digits rounds half away from zero**, as PostgreSQL and
+  SQL Server round: `CAST('12.345' AS DECIMAL(10,2))` is `12.35` and `-12.345`
+  is `-12.35`. The rule is the same for a cast, for a value written to a file
+  column of smaller scale (Parquet, Arrow), and for an aggregate's result — one
+  answer whichever path a value takes. A database sink is sent the value whole
+  and its column does its own rounding. A float converts through its
+  15 significant digits, as PostgreSQL converts `float8` to `numeric`: the
+  double nearest `2.675` is `2.67499…`, and it still becomes `2.68`. A float too
+  large for 38 digits fails the cast.
 - **DECIMAL arithmetic is exact.** `+` and `-` over two decimals (or a decimal
   and an int) answer a decimal at the wider operand's scale, `*` one at the
   summed scale — `CAST(1.1 AS DECIMAL(18,2)) + CAST(0.3 AS DECIMAL(18,2))` is
