@@ -1085,6 +1085,19 @@ per engine batch, typed (`DECIMAL` as decimal128, dates as date32, times and
 timestamps in microseconds), readable with `pyarrow.ipc.open_stream`,
 `polars.read_ipc_stream` or Arrow JS `tableFromIPC`. An empty result is still a
 valid stream: the schema followed by the end-of-stream marker.
+
+A script with several results writes one stream per result, back to back, and
+each describes itself. Its schema carries `custom_metadata`:
+`basalt.statement` (the result's ordinal in the run, from `0`), `basalt.kind`
+(`select`, `show`, `describe` or `explain`), and `basalt.line` / `basalt.col`
+where the statement starts. Just before its end-of-stream marker comes a
+zero-row record batch whose message metadata holds `basalt.rows` and
+`basalt.elapsed_ms` — plain Arrow, so a reader that ignores metadata sees the
+same table. pyarrow reads the streams in turn from one file object
+(`ipc.open_stream(f)` until `f` is exhausted; the trailer through
+`read_next_batch_with_custom_metadata`). A statement `EXPLAIN` under arrow is a
+result of its own — one string column, `plan`, a row per line — rather than
+text on stderr, and so is a whole-program `EXPLAIN`.
 Logs are stderr-only, plain text, level `warn` by default (`--log-level`,
 `--log-format json`, `-q`).
 
@@ -1230,18 +1243,24 @@ the process.
 
 Replies are frames on stdout, each a JSON header line. A `data` header is
 followed by exactly `len` raw bytes: what the script wrote to stdout — its
-results in `format`, in order, possibly over several frames. Exactly one
-`status` closes each request, and nothing for that request follows it:
+results in `format`, in order, possibly over several frames. A `result` frame
+follows the last byte of each result, so the data between two `result` frames
+is exactly one result in any format — NDJSON rows of two SELECTs never run
+together, and an Arrow reader that cannot read streams in turn gets one stream
+at a time. Exactly one `status` closes each request, listing the results again,
+and nothing for that request follows it:
 
 ```
 {"type":"data","id":"c1","len":1184}
 <1184 bytes>
-{"type":"status","id":"c1","ok":true,"cancelled":false,"elapsed_ms":42,"declared":[{"kind":"param","name":"days"}]}
+{"type":"result","id":"c1","statement":0,"kind":"select","line":2,"col":1,"rows":12,"elapsed_ms":40}
+{"type":"status","id":"c1","ok":true,"cancelled":false,"elapsed_ms":42,"declared":[{"kind":"param","name":"days"}],"results":[...]}
 {"type":"status","id":"c2","ok":false,"cancelled":false,"elapsed_ms":3,"declared":[],
  "error":{"msg":"unknown field `nope`","file":"script","line":3,"col":8,"transient":false}}
 ```
 
-`declared` lists what the script added to the session — a script's
+A result's `line`/`col` count in the script as sent, as its Arrow metadata
+does. `declared` lists what the script added to the session — a script's
 declarations join the session once it parses, whether or not it then runs
 cleanly. An error's `line`/`col` count in the script as sent; `file` is
 `script`, an `@include`d file's path, or `session` when the fault lies in a

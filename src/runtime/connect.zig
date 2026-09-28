@@ -11,7 +11,8 @@ const csv = @import("../connect/csv.zig");
 const pqdecode = @import("../connect/pqdecode.zig");
 const pqwrite = @import("../connect/pqwrite.zig");
 const JsonWriter = @import("../connect/table.zig").JsonWriter;
-const ArrowWriter = @import("../connect/arrow.zig").ArrowWriter;
+const arrow = @import("../connect/arrow.zig");
+const ArrowWriter = arrow.ArrowWriter;
 const TableWriter = @import("../connect/table.zig").TableWriter;
 const driver = @import("../connect/driver.zig");
 const starrocks = @import("../connect/starrocks.zig");
@@ -38,6 +39,7 @@ const obs = @import("obs.zig");
 const DbAuth = @import("env.zig").DbAuth;
 const DbConfig = @import("env.zig").DbConfig;
 const Env = @import("env.zig").Env;
+const env_mod = @import("env.zig");
 const eqlAny = @import("env.zig").eqlAny;
 const forHintName = @import("env.zig").forHintName;
 const pathFail = @import("env.zig").pathFail;
@@ -938,35 +940,101 @@ pub fn guardFileFormat(env: *Env, path: []const u8, explicit: ?analyze.FileForma
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot " ++ verb ++ " `{s}`: {s}", .{ path, why }));
 }
 
+/// A stdout sink that reports its result once closed. Counts rows on the way
+/// through — atomically, since lanes render outside the shared sink's lock.
+const ResultSink = struct {
+    inner: driver.Sink,
+    gpa: std.mem.Allocator,
+    info: arrow.ResultInfo,
+    hook: env_mod.ResultHook,
+    rows: std.atomic.Value(u64) = .init(0),
+
+    fn wrap(env: *Env, inner: driver.Sink, info: arrow.ResultInfo, hook: env_mod.ResultHook) !driver.Sink {
+        const self = try env.gpa.create(ResultSink);
+        self.* = .{ .inner = inner, .gpa = env.gpa, .info = info, .hook = hook };
+        return .{ .ptr = self, .vtable = if (inner.canRender()) &vt_render else &vt_plain };
+    }
+
+    pub fn writeBatch(self: *ResultSink, arena: std.mem.Allocator, b: Batch) !void {
+        try self.inner.writeBatch(arena, b);
+        _ = self.rows.fetchAdd(b.len, .monotonic);
+    }
+
+    pub fn close(self: *ResultSink) !void {
+        defer self.gpa.destroy(self);
+        try self.inner.close();
+        self.hook.call(.{ .info = self.info, .rows = self.rows.load(.monotonic) });
+    }
+
+    pub fn abort(self: *ResultSink) void {
+        self.inner.abort();
+        self.gpa.destroy(self);
+    }
+
+    const vt_plain = driver.sinkVTable(ResultSink);
+    const vt_render = blk: {
+        var v = driver.sinkVTable(ResultSink);
+        v.renderBatch = struct {
+            fn f(p: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror![]const u8 {
+                const self: *ResultSink = @ptrCast(@alignCast(p));
+                const out = try self.inner.renderBatch(arena, b).?;
+                _ = self.rows.fetchAdd(b.len, .monotonic);
+                return out;
+            }
+        }.f;
+        v.writeRendered = struct {
+            fn f(p: *anyopaque, bytes: []const u8) anyerror!void {
+                const self: *ResultSink = @ptrCast(@alignCast(p));
+                return self.inner.writeRendered(bytes);
+            }
+        }.f;
+        break :blk v;
+    };
+};
+
 pub fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (env.explain) return DiscardSink.sink();
     if (std.mem.eql(u8, w.connector, "stdout")) {
-        switch (env.stdout_format) {
-            .json => {
-                const writer = JsonWriter.open(env.gpa, schema) catch
-                    return planErr(env.diag, "could not open stdout json writer");
-                return writer.sink();
-            },
-            .arrow => {
-                const writer = ArrowWriter.open(env.gpa, schema) catch |e| switch (e) {
-                    error.ArrowUnsupportedType => return planErr(env.diag, "arrow output cannot carry an array or struct column"),
-                    else => return planErr(env.diag, "could not open stdout arrow writer"),
-                };
-                return writer.sink();
-            },
-            .csv, .tsv => {
-                const delim: u8 = if (env.stdout_format == .tsv) '\t' else ',';
-                const writer = csv.CsvWriter.openStdout(env.arena, schema, .{ .delim = delim }) catch
-                    return planErr(env.diag, "could not open stdout csv writer");
-                return writer.sink();
-            },
-            .table => {
-                const writer = TableWriter.open(env.gpa, schema) catch
-                    return planErr(env.diag, "could not open stdout table");
-                return writer.sink();
-            },
+        const info = env.takeResult();
+        const inner = try openStdoutSink(env, schema, info);
+        if (env.on_result) |h| {
+            errdefer inner.abort();
+            return ResultSink.wrap(env, inner, info, h);
         }
+        return inner;
     }
+    return openTargetSink(env, w, schema);
+}
+
+fn openStdoutSink(env: *Env, schema: types.Schema, info: arrow.ResultInfo) !driver.Sink {
+    switch (env.stdout_format) {
+        .json => {
+            const writer = JsonWriter.open(env.gpa, schema) catch
+                return planErr(env.diag, "could not open stdout json writer");
+            return writer.sink();
+        },
+        .arrow => {
+            const writer = ArrowWriter.open(env.gpa, schema, info) catch |e| switch (e) {
+                error.ArrowUnsupportedType => return planErr(env.diag, "arrow output cannot carry an array or struct column"),
+                else => return planErr(env.diag, "could not open stdout arrow writer"),
+            };
+            return writer.sink();
+        },
+        .csv, .tsv => {
+            const delim: u8 = if (env.stdout_format == .tsv) '\t' else ',';
+            const writer = csv.CsvWriter.openStdout(env.arena, schema, .{ .delim = delim }) catch
+                return planErr(env.diag, "could not open stdout csv writer");
+            return writer.sink();
+        },
+        .table => {
+            const writer = TableWriter.open(env.gpa, schema) catch
+                return planErr(env.diag, "could not open stdout table");
+            return writer.sink();
+        },
+    }
+}
+
+fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (std.mem.eql(u8, w.connector, "csv")) {
         const fmode = try fileWriteMode(env, w);
         // A `.parquet` target shares the csv connector but is a different format;

@@ -17,6 +17,14 @@
 //! result from a failed one. Every column is declared nullable, since the
 //! engine's nullability flag is a plan-time promise and the bitmap is the
 //! truth. Arrays and structs are refused; nothing produces them.
+//!
+//! Self-description: a script may print several results back to back, so each
+//! stream says which one it is. The schema message carries `custom_metadata`
+//! (`basalt.statement`, `basalt.kind`, `basalt.line`, `basalt.col`), and just
+//! before the end-of-stream marker a zero-row record batch carries the totals in
+//! its message's `custom_metadata` (`basalt.rows`, `basalt.elapsed_ms`). Both are
+//! plain Arrow: a reader that ignores metadata sees the same table, one empty
+//! batch longer.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -41,17 +49,21 @@ const Header = enum(u8) { schema = 1, record_batch = 3 };
 /// The Arrow `Type` union tags this writer emits.
 const TypeTag = enum(u8) { int = 2, floating_point = 3, binary = 4, utf8 = 5, bool = 6, decimal = 7, date = 8, time = 9, timestamp = 10 };
 
+pub const KeyValue = struct { key: []const u8, value: []const u8 };
+
 pub const StreamWriter = struct {
     out: *std.Io.Writer,
     fb: flatbuf.Builder,
     gpa: std.mem.Allocator,
+    schema: types.Schema,
 
     /// Writes the schema message at once, so the stream is well-formed from
-    /// the first byte even if no batch ever follows.
-    pub fn init(gpa: std.mem.Allocator, out: *std.Io.Writer, schema: types.Schema) !StreamWriter {
-        var self = StreamWriter{ .out = out, .fb = try flatbuf.Builder.init(gpa, 1024), .gpa = gpa };
+    /// the first byte even if no batch ever follows. `meta` becomes the
+    /// schema's `custom_metadata`.
+    pub fn init(gpa: std.mem.Allocator, out: *std.Io.Writer, schema: types.Schema, meta: []const KeyValue) !StreamWriter {
+        var self = StreamWriter{ .out = out, .fb = try flatbuf.Builder.init(gpa, 1024), .gpa = gpa, .schema = schema };
         errdefer self.fb.deinit();
-        try self.writeSchema(schema);
+        try self.writeSchema(schema, meta);
         return self;
     }
 
@@ -66,9 +78,45 @@ pub const StreamWriter = struct {
         try self.out.flush();
     }
 
-    fn writeSchema(self: *StreamWriter, schema: types.Schema) !void {
+    /// A zero-row record batch whose message carries `meta`: the stream's
+    /// trailer. Every column gets a zero-length node and zero-length buffers —
+    /// as many as its layout has, which is what a reader checks.
+    pub fn writeTrailer(self: *StreamWriter, meta: []const KeyValue) !void {
         const fb = &self.fb;
         fb.reset();
+        var nodes = std.array_list.Managed(i64).init(self.gpa);
+        defer nodes.deinit();
+        var bufs = std.array_list.Managed(i64).init(self.gpa);
+        defer bufs.deinit();
+        for (self.schema.fields) |f| {
+            try nodes.appendSlice(&.{ 0, 0 });
+            const nbuf: usize = switch (f.ty.kind) {
+                .string, .bytes => 3,
+                else => 2,
+            };
+            for (0..nbuf) |_| try bufs.appendSlice(&.{ 0, 0 });
+        }
+        const kv = try keyValues(fb, self.gpa, meta);
+        const nodes_vec = try fb.createI64PairVector(nodes.items);
+        const bufs_vec = try fb.createI64PairVector(bufs.items);
+        try fb.startTable(5);
+        try fb.addInt(i64, 0, 0);
+        try fb.addOffset(1, nodes_vec);
+        try fb.addOffset(2, bufs_vec);
+        const rb = try fb.endTable();
+        try fb.startTable(5);
+        try fb.addInt(i16, 0, version_v5);
+        try fb.addUnion(1, @intFromEnum(Header.record_batch), rb);
+        try fb.addInt(i64, 3, 0);
+        if (kv) |o| try fb.addOffset(4, o);
+        const msg = try fb.endTable();
+        try self.frame(try fb.finish(msg));
+    }
+
+    fn writeSchema(self: *StreamWriter, schema: types.Schema, meta: []const KeyValue) !void {
+        const fb = &self.fb;
+        fb.reset();
+        const kv = try keyValues(fb, self.gpa, meta);
         const offs = try self.gpa.alloc(u32, schema.fields.len);
         defer self.gpa.free(offs);
         for (schema.fields, offs) |f, *o| {
@@ -86,6 +134,7 @@ pub const StreamWriter = struct {
         try fb.startTable(4);
         try fb.addInt(i16, 0, 0);
         try fb.addOffset(1, fields);
+        if (kv) |o| try fb.addOffset(2, o);
         const sch = try fb.endTable();
         const msg = try message(fb, .schema, sch, 0);
         try self.frame(try fb.finish(msg));
@@ -141,6 +190,22 @@ const Body = struct {
         self.len += @intCast(pad8(bytes.len));
     }
 };
+
+/// A `[KeyValue]` vector, or null for no metadata at all.
+fn keyValues(fb: *flatbuf.Builder, gpa: std.mem.Allocator, meta: []const KeyValue) !?u32 {
+    if (meta.len == 0) return null;
+    const offs = try gpa.alloc(u32, meta.len);
+    defer gpa.free(offs);
+    for (meta, offs) |m, *o| {
+        const k = try fb.createString(m.key);
+        const v = try fb.createString(m.value);
+        try fb.startTable(2);
+        try fb.addOffset(0, k);
+        try fb.addOffset(1, v);
+        o.* = try fb.endTable();
+    }
+    return try fb.createOffsetVector(offs);
+}
 
 fn pad8(n: usize) usize {
     return (n + 7) & ~@as(usize, 7);
@@ -264,28 +329,57 @@ fn pushData(arena: std.mem.Allocator, body: *Body, col: *const Column, n: usize)
     }
 }
 
+/// Which result a stdout stream is, for its schema metadata.
+pub const ResultInfo = struct {
+    /// Ordinal of the result among those the run printed, from 0.
+    statement: u32 = 0,
+    /// select, describe, show or explain.
+    kind: []const u8 = "select",
+    line: u32 = 0,
+    col: u32 = 0,
+    /// When the statement started, for the trailer's elapsed time.
+    t0_ms: i64 = 0,
+};
+
 /// The stdout sink: an Arrow stream over a buffered stdout writer.
 pub const ArrowWriter = struct {
     gpa: std.mem.Allocator,
     buf: [1 << 16]u8 = undefined,
     fw: std.fs.File.Writer = undefined,
     sw: StreamWriter = undefined,
+    rows: u64 = 0,
+    t0_ms: i64 = 0,
 
-    pub fn open(gpa: std.mem.Allocator, schema: types.Schema) !*ArrowWriter {
+    pub fn open(gpa: std.mem.Allocator, schema: types.Schema, info: ResultInfo) !*ArrowWriter {
         const self = try gpa.create(ArrowWriter);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa };
+        self.* = .{ .gpa = gpa, .t0_ms = info.t0_ms };
         self.fw = std.fs.File.stdout().writerStreaming(&self.buf);
-        self.sw = try StreamWriter.init(gpa, &self.fw.interface, schema);
+        var nb: [3][16]u8 = undefined;
+        const meta = [_]KeyValue{
+            .{ .key = "basalt.statement", .value = try std.fmt.bufPrint(&nb[0], "{d}", .{info.statement}) },
+            .{ .key = "basalt.kind", .value = info.kind },
+            .{ .key = "basalt.line", .value = try std.fmt.bufPrint(&nb[1], "{d}", .{info.line}) },
+            .{ .key = "basalt.col", .value = try std.fmt.bufPrint(&nb[2], "{d}", .{info.col}) },
+        };
+        self.sw = try StreamWriter.init(gpa, &self.fw.interface, schema, &meta);
         return self;
     }
 
     pub fn writeBatch(self: *ArrowWriter, arena: std.mem.Allocator, batch: Batch) !void {
         try self.sw.writeBatch(arena, batch);
+        self.rows += batch.len;
     }
 
     pub fn close(self: *ArrowWriter) !void {
         defer self.deinit();
+        var nb: [2][24]u8 = undefined;
+        const elapsed = @max(0, std.time.milliTimestamp() - self.t0_ms);
+        const meta = [_]KeyValue{
+            .{ .key = "basalt.rows", .value = try std.fmt.bufPrint(&nb[0], "{d}", .{self.rows}) },
+            .{ .key = "basalt.elapsed_ms", .value = try std.fmt.bufPrint(&nb[1], "{d}", .{elapsed}) },
+        };
+        try self.sw.writeTrailer(&meta);
         try self.sw.finish();
     }
 
@@ -354,7 +448,7 @@ fn testBatch(arena: std.mem.Allocator, schema: *const types.Schema) !Batch {
 test "stream: schema message declares every column's arrow type" {
     var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer aw.deinit();
-    var sw = try StreamWriter.init(std.testing.allocator, &aw.writer, testSchema());
+    var sw = try StreamWriter.init(std.testing.allocator, &aw.writer, testSchema(), &.{});
     defer sw.deinit();
     try sw.finish();
 
@@ -406,7 +500,7 @@ test "stream: a record batch carries validity, repacked bools and decimals, raw 
 
     var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer aw.deinit();
-    var sw = try StreamWriter.init(std.testing.allocator, &aw.writer, schema);
+    var sw = try StreamWriter.init(std.testing.allocator, &aw.writer, schema, &.{});
     defer sw.deinit();
     try sw.writeBatch(a, batch);
     try sw.writeBatch(a, .{ .schema = &schema, .columns = batch.columns, .len = 0 });
@@ -466,4 +560,52 @@ test "stream: a record batch carries validity, repacked bools and decimals, raw 
 
     const hora_data = bufAt(rb, bufs.at, 16);
     try std.testing.expectEqual(@as(i64, 86_399_000_000), std.mem.readInt(i64, body[hora_data.off + 16 ..][0..8], .little));
+}
+
+fn metaOf(t: flatbuf.Table, slot: usize, key: []const u8) ?[]const u8 {
+    const v = t.vector(slot) orelse return null;
+    for (0..v.len) |i| {
+        const kv = t.tableAt(v.at, i);
+        if (std.mem.eql(u8, kv.string(0).?, key)) return kv.string(1);
+    }
+    return null;
+}
+
+test "stream: schema metadata says which result it is, a trailer batch carries the totals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = testSchema();
+    const batch = try testBatch(a, &schema);
+
+    var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw.deinit();
+    var sw = try StreamWriter.init(std.testing.allocator, &aw.writer, schema, &.{
+        .{ .key = "basalt.statement", .value = "2" },
+        .{ .key = "basalt.kind", .value = "select" },
+    });
+    defer sw.deinit();
+    try sw.writeBatch(a, batch);
+    try sw.writeTrailer(&.{.{ .key = "basalt.rows", .value = "3" }});
+    try sw.finish();
+
+    const bytes = aw.written();
+    const f0 = readFrame(bytes, 0);
+    const sch = flatbuf.Table.root(f0.meta).table(2).?;
+    try std.testing.expectEqualStrings("2", metaOf(sch, 2, "basalt.statement").?);
+    try std.testing.expectEqualStrings("select", metaOf(sch, 2, "basalt.kind").?);
+
+    const f1 = readFrame(bytes, f0.next);
+    const f2 = readFrame(bytes, f1.next);
+    // the trailer: a record batch of zero rows, zero-length nodes and buffers, no body
+    const msg = flatbuf.Table.root(f2.meta);
+    try std.testing.expectEqual(@intFromEnum(Header.record_batch), msg.int(u8, 1, 0));
+    try std.testing.expectEqual(@as(usize, 0), f2.body.len);
+    try std.testing.expectEqualStrings("3", metaOf(msg, 4, "basalt.rows").?);
+    const rb = msg.table(2).?;
+    try std.testing.expectEqual(@as(i64, 0), rb.int(i64, 0, -1));
+    try std.testing.expectEqual(@as(usize, 8), rb.vector(1).?.len);
+    // one bytes column carries three buffers, every other column two
+    try std.testing.expectEqual(@as(usize, 7 * 2 + 3), rb.vector(2).?.len);
+    try std.testing.expectEqual(bytes.len, f2.next + 8);
 }

@@ -317,7 +317,13 @@ pub const Window = struct {
     order_by: []const SortKey = &.{},
 };
 
-pub const Pipeline = struct { stages: []const Stage, pos: Pos };
+pub const Pipeline = struct {
+    stages: []const Stage,
+    pos: Pos,
+    /// Lowered from `SHOW TABLES`: a query like any other, labelled so a result
+    /// can say what produced it.
+    show: bool = false,
+};
 
 pub const ParamSource = enum { query, body, header };
 

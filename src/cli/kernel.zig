@@ -302,6 +302,7 @@ const Status = struct {
     cancelled: bool = false,
     elapsed_ms: ?u64 = null,
     declared: ?[]const Declared = null,
+    results: ?[]const ResultFrame = null,
     @"error": ?ErrorInfo = null,
 };
 
@@ -315,6 +316,10 @@ fn reply(a: std.mem.Allocator, out: *Out, id: ?[]const u8, st: Status) !void {
     if (st.declared) |d| {
         try w.writeAll(",\"declared\":");
         try std.json.Stringify.value(d, .{}, w);
+    }
+    if (st.results) |r| {
+        try w.writeAll(",\"results\":");
+        try std.json.Stringify.value(r, .{}, w);
     }
     if (st.@"error") |e| {
         try w.writeAll(",\"error\":");
@@ -378,6 +383,89 @@ fn pump(out: *Out, fd: std.posix.fd_t, id: []const u8) void {
     }
 }
 
+/// A finished result, as the `result` frame and the status list it.
+const ResultFrame = struct {
+    statement: u32,
+    kind: []const u8,
+    line: u32,
+    col: u32,
+    rows: u64,
+    elapsed_ms: u64,
+};
+
+/// fd 1 routed into a pipe whose pump frames it. A result's close swaps in a
+/// fresh pipe — the old one then holds exactly that result's bytes — so the
+/// `result` frame can follow them: everything between two `result` frames is
+/// one result, in any format.
+const Capture = struct {
+    out: *Out,
+    id: []const u8,
+    read_fd: std.posix.fd_t = -1,
+    thread: ?std.Thread = null,
+    results: std.array_list.Managed(ResultFrame),
+    /// A failed swap: later bytes still frame, just without a boundary.
+    broken: bool = false,
+
+    fn start(self: *Capture) !void {
+        const pipe = try std.posix.pipe2(.{ .CLOEXEC = true });
+        errdefer std.posix.close(pipe[0]);
+        // replacing fd 1 closes the previous pipe's last write end
+        std.posix.dup2(pipe[1], std.posix.STDOUT_FILENO) catch |e| {
+            std.posix.close(pipe[1]);
+            return e;
+        };
+        std.posix.close(pipe[1]);
+        self.thread = try std.Thread.spawn(.{}, pump, .{ self.out, pipe[0], self.id });
+        self.read_fd = pipe[0];
+    }
+
+    /// Wait for the pump of a pipe whose write end is gone.
+    fn drain(self: *Capture, t: ?std.Thread, fd: std.posix.fd_t) void {
+        _ = self;
+        if (t) |th| th.join();
+        if (fd >= 0) std.posix.close(fd);
+    }
+
+    /// Hand fd 1 back to stderr and drain what the script wrote.
+    fn stop(self: *Capture) void {
+        std.posix.dup2(std.posix.STDERR_FILENO, std.posix.STDOUT_FILENO) catch {};
+        self.drain(self.thread, self.read_fd);
+        self.thread = null;
+        self.read_fd = -1;
+    }
+
+    fn onResult(ctx: *anyopaque, done: runtime.ResultDone) void {
+        const self: *Capture = @ptrCast(@alignCast(ctx));
+        const r = ResultFrame{
+            .statement = done.info.statement,
+            .kind = done.info.kind,
+            .line = done.info.line,
+            .col = done.info.col,
+            .rows = done.rows,
+            .elapsed_ms = @intCast(@max(0, std.time.milliTimestamp() - done.info.t0_ms)),
+        };
+        self.results.append(r) catch {};
+        if (self.broken) return;
+        const old_t = self.thread;
+        const old_fd = self.read_fd;
+        self.start() catch {
+            self.broken = true;
+            return;
+        };
+        self.drain(old_t, old_fd);
+        var hbuf: [640]u8 = undefined;
+        var w = std.Io.Writer.fixed(&hbuf);
+        w.writeAll("{\"type\":\"result\",\"id\":") catch return;
+        std.json.Stringify.encodeJsonString(clip(self.id), .{}, &w) catch return;
+        w.print(",\"statement\":{d},\"kind\":\"{s}\",\"line\":{d},\"col\":{d},\"rows\":{d},\"elapsed_ms\":{d}}}\n", .{ r.statement, r.kind, r.line, r.col, r.rows, r.elapsed_ms }) catch return;
+        self.out.line(w.buffered());
+    }
+
+    fn hook(self: *Capture) runtime.ResultHook {
+        return .{ .ctx = self, .f = onResult };
+    }
+};
+
 fn runScript(
     gpa: std.mem.Allocator,
     a: std.mem.Allocator,
@@ -420,12 +508,9 @@ fn runScript(
 
     // Capture fd 1 for the script's lifetime: every sink that writes stdout
     // lands in the pipe, and the pump turns it into frames as it arrives.
-    const pipe = try std.posix.pipe2(.{ .CLOEXEC = true });
-    try std.posix.dup2(pipe[1], std.posix.STDOUT_FILENO);
-    std.posix.close(pipe[1]);
-    const pumper = std.Thread.spawn(.{}, pump, .{ out, pipe[0], id }) catch |e| {
+    var cap = Capture{ .out = out, .id = id, .results = std.array_list.Managed(ResultFrame).init(a) };
+    cap.start() catch |e| {
         std.posix.dup2(std.posix.STDERR_FILENO, std.posix.STDOUT_FILENO) catch {};
-        std.posix.close(pipe[0]);
         return e;
     };
 
@@ -438,10 +523,14 @@ fn runScript(
         // run` does; it only happens with no declarations ahead of it.
         var adiag: analyze.Diag = .{};
         if (analyze.analyzeWith(a, entry.prog, &.{}, &adiag)) |plan| {
-            var ebuf: [4096]u8 = undefined;
-            var ef = std.fs.File.stdout().writerStreaming(&ebuf);
-            analyze.render(plan, &ef.interface) catch {};
-            ef.interface.flush() catch {};
+            var aw = std.Io.Writer.Allocating.init(a);
+            try analyze.render(plan, &aw.writer);
+            if (format == .arrow) {
+                const info = runtime.ResultInfo{ .kind = "explain", .line = 1, .col = 1, .t0_ms = t0 };
+                if (runtime.printPlanArrow(gpa, aw.written(), info)) |n| {
+                    Capture.onResult(&cap, .{ .info = info, .rows = n });
+                } else |e| failed = e;
+            } else std.fs.File.stdout().writeAll(aw.written()) catch {};
         } else |e| {
             failed = e;
             rdiag.msg = adiag.msg;
@@ -455,6 +544,9 @@ fn runScript(
             .explain = entry.prog.explain == .analyze,
             .stdout_format = format,
             .items = false,
+            // result metadata counts lines in the script as sent
+            .line_base = @intCast(std.mem.count(u8, entry.text[0..entry.entry_at], "\n")),
+            .on_result = cap.hook(),
         }, &rdiag) catch |e| {
             failed = e;
         };
@@ -463,23 +555,22 @@ fn runScript(
 
     // Hand fd 1 back to stderr, which closes the pipe's last write end: the pump
     // drains what the script wrote and stops, and only then does the status go.
-    std.posix.dup2(std.posix.STDERR_FILENO, std.posix.STDOUT_FILENO) catch {};
-    pumper.join();
-    std.posix.close(pipe[0]);
+    cap.stop();
+    const results = cap.results.items;
 
     const elapsed: u64 = @intCast(std.time.milliTimestamp() - t0);
-    const e = failed orelse return reply(a, out, req.id, .{ .ok = true, .elapsed_ms = elapsed, .declared = declared });
+    const e = failed orelse return reply(a, out, req.id, .{ .ok = true, .elapsed_ms = elapsed, .declared = declared, .results = results });
     if (e == error.OutOfMemory) return error.OutOfMemory;
     if (e == error.Aborted) {
         runtime.resetAbort();
-        return reply(a, out, req.id, .{ .ok = false, .cancelled = true, .elapsed_ms = elapsed, .declared = declared });
+        return reply(a, out, req.id, .{ .ok = false, .cancelled = true, .elapsed_ms = elapsed, .declared = declared, .results = results });
     }
     var ei = ErrorInfo{
         .msg = if (rdiag.msg.len > 0) try a.dupe(u8, rdiag.msg) else runtime.errLabel(e),
         .transient = rdiag.retryable or runtime.isTransient(e),
     };
     locate(&ei, entry.text, entry.entry_at, "", rdiag.pos);
-    return reply(a, out, req.id, .{ .ok = false, .elapsed_ms = elapsed, .declared = declared, .@"error" = ei });
+    return reply(a, out, req.id, .{ .ok = false, .elapsed_ms = elapsed, .declared = declared, .results = results, .@"error" = ei });
 }
 
 test "locate: positions count in the script as sent, not the replayed prelude" {

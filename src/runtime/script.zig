@@ -329,7 +329,7 @@ pub fn renderPipeline(arena: std.mem.Allocator, body: ast.Pipeline, lr: LoopRow)
             else => {},
         }
     }
-    return .{ .stages = stages, .pos = body.pos };
+    return .{ .stages = stages, .pos = body.pos, .show = body.show };
 }
 
 /// Deep-copy an expression, interpolating `${var}` needles into every string

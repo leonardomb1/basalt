@@ -17,6 +17,7 @@ const s3 = @import("../connect/s3.zig");
 const analyze = @import("analyze.zig");
 const obs = @import("obs.zig");
 const Value = @import("../exec/value.zig").Value;
+const arrow = @import("../connect/arrow.zig");
 
 /// `msg` points into the inline `buf`, so it outlives the run's plan arena.
 pub const Diag = struct {
@@ -175,6 +176,25 @@ pub const RunOptions = struct {
     /// Draw a live progress line on stderr while a `LOAD` runs. The caller sets it
     /// only when stderr is a terminal; nothing else ever turns it on.
     progress: bool = false,
+    /// Lines ahead of the script proper — a session's replayed declarations —
+    /// subtracted from positions reported in result metadata.
+    line_base: u32 = 0,
+    /// Told as each stdout result closes — after its last byte is written — so
+    /// a caller multiplexing several results on one stream can mark where each
+    /// ends. The session kernel uses it; a plain run leaves it null.
+    on_result: ?ResultHook = null,
+};
+
+/// A stdout result, finished.
+pub const ResultDone = struct { info: arrow.ResultInfo, rows: u64 };
+
+pub const ResultHook = struct {
+    ctx: *anyopaque,
+    f: *const fn (ctx: *anyopaque, done: ResultDone) void,
+
+    pub fn call(self: ResultHook, done: ResultDone) void {
+        self.f(self.ctx, done);
+    }
 };
 
 /// What a terminal `SELECT` writes to stdout: a text table for a person, or rows
@@ -275,6 +295,31 @@ pub const Env = struct {
     explain: bool = false,
     /// The program's `@kind`, for the header an `EXPLAIN <query>;` statement prints.
     kind_name: []const u8 = "batch",
+    /// The statement now running, as the next stdout result describes itself.
+    result: arrow.ResultInfo = .{},
+    /// Results printed so far; the next one's ordinal.
+    results_printed: u32 = 0,
+    line_base: u32 = 0,
+    on_result: ?ResultHook = null,
+
+    /// The next stdout result's description, claiming its ordinal.
+    pub fn takeResult(self: *Env) arrow.ResultInfo {
+        var info = self.result;
+        info.statement = self.results_printed;
+        self.results_printed += 1;
+        return info;
+    }
+
+    /// Record which statement the next stdout result belongs to.
+    pub fn noteResult(self: *Env, kind: []const u8, pos: ?ast.Pos) void {
+        const p = pos orelse ast.Pos{ .line = 0, .col = 0 };
+        self.result = .{
+            .kind = kind,
+            .line = if (p.line > self.line_base) p.line - self.line_base else 0,
+            .col = if (p.line > self.line_base) p.col else 0,
+            .t0_ms = std.time.milliTimestamp(),
+        };
+    }
 };
 
 pub const PipeRes = struct { op: op.Op, schema: types.Schema };

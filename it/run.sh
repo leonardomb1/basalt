@@ -807,6 +807,43 @@ PY
     report "arrow (run error)" bad
     tail -5 "$out/arrow.log"
   fi
+
+  # Several results back to back: each stream names its statement, kind and
+  # position, and ends with a zero-row trailer batch carrying its totals. An
+  # EXPLAIN is a result of its own under arrow, a `plan` column.
+  if command -v uv >/dev/null &&
+     $B run -q --format arrow -c "SELECT id FROM 'it/seed.csv' ORDER BY id;
+  SELECT 'x' AS b FROM RANGE(3);
+EXPLAIN SELECT range FROM RANGE(5) WHERE range > 2;
+DESCRIBE SELECT 1 AS z;" >"$out/multi.arrows" 2>>"$out/arrow.log" &&
+     uv run --quiet --with pyarrow python - "$out/multi.arrows" <<'PY' >"$out/arrow_multi.txt" 2>>"$out/arrow.log"
+import sys, pyarrow as pa, pyarrow.ipc as ipc
+f = pa.OSFile(sys.argv[1])
+while f.tell() < f.size():
+    r = ipc.open_stream(f)
+    md = {k.decode(): v.decode() for k, v in r.schema.metadata.items()}
+    batches, trailer = [], {}
+    while True:
+        try:
+            b, cm = r.read_next_batch_with_custom_metadata()
+        except StopIteration:
+            break
+        if cm is not None:
+            trailer = {k.decode(): v.decode() for k, v in cm.items()}
+        batches.append(b)
+    t = pa.Table.from_batches(batches, r.schema)
+    t.validate(full=True)
+    assert trailer["basalt.rows"] == str(t.num_rows), (trailer, t.num_rows)
+    assert int(trailer["basalt.elapsed_ms"]) >= 0
+    print(md["basalt.statement"], md["basalt.kind"], md["basalt.line"], md["basalt.col"], t.column_names[0], t.num_rows > 0)
+PY
+  then
+    printf '0 select 1 1 id True\n1 select 2 3 b True\n2 explain 3 1 plan True\n3 describe 4 1 column True\n' >"$out/arrow_multi_want.txt"
+    check "arrow: several results describe themselves" "$out/arrow_multi.txt" "$out/arrow_multi_want.txt"
+  else
+    report "arrow: several results describe themselves (run error)" bad
+    tail -5 "$out/arrow.log"
+  fi
 fi
 
 # What `basalt run` puts on stdout, per --format. No container: the contract under

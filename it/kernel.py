@@ -26,15 +26,25 @@ class Kernel:
         self.p.stdin.flush()
 
     def reply(self):
-        """Reads frames until a status: returns (data bytes, status dict)."""
+        """Reads frames until a status: returns (data bytes, status dict).
+
+        The bytes of each finished result, split at its `result` frame, are kept
+        on `self.results` as (frame, bytes)."""
         data = b""
+        self.results = []
+        pending = b""
         while True:
             line = self.p.stdout.readline()
             if not line:
                 raise EOFError("kernel closed stdout")
             h = json.loads(line)
             if h["type"] == "data":
-                data += self.p.stdout.read(h["len"])
+                chunk = self.p.stdout.read(h["len"])
+                data += chunk
+                pending += chunk
+            elif h["type"] == "result":
+                self.results.append((h, pending))
+                pending = b""
             elif h["type"] == "status":
                 return data, h
 
@@ -92,6 +102,19 @@ def main(binary):
     # Several results in one script arrive in order, before the status.
     data, st = k.run("SELECT 1 AS a;\nSELECT 2 AS b;\nSELECT 3 AS c;")
     report("several results in one script", st["ok"] and rows(data) == [{"a": 1}, {"b": 2}, {"c": 3}], data)
+
+    # Each result is closed by a `result` frame, so NDJSON rows of different
+    # results never run together; its line counts in the script as sent, even
+    # with declarations replayed ahead of it.
+    k.run("SELECT 1 AS a;\n\n   SELECT 2 AS b;")
+    got = [(h["statement"], h["kind"], h["line"], h["col"], h["rows"], rows(b)) for h, b in k.results]
+    report(
+        "each result is closed by a result frame with its own position",
+        got == [(0, "select", 1, 1, 1, [{"a": 1}]), (1, "select", 3, 4, 1, [{"b": 2}])],
+        got,
+    )
+    _, st = k.run("DESCRIBE SELECT 1 AS z;")
+    report("the status lists the script's results", [r["kind"] for r in st.get("results", [])] == ["describe"], st)
 
     # The same CTE name in two scripts: each sees its own.
     k.run("WITH t AS (SELECT 1 AS x) SELECT x FROM t;")

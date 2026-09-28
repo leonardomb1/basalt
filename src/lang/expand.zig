@@ -166,7 +166,7 @@ fn expandAttrs(cx: *Ctx, attrs: []const ast.Attr) Error![]const ast.Attr {
 fn expandPipeline(cx: *Ctx, p: ast.Pipeline) Error!ast.Pipeline {
     const stages = try cx.arena.alloc(ast.Stage, p.stages.len);
     for (p.stages, 0..) |st, i| stages[i] = .{ .node = try expandNode(cx, st.node), .hints = st.hints, .pos = st.pos };
-    return .{ .stages = stages, .pos = p.pos };
+    return .{ .stages = stages, .pos = p.pos, .show = p.show };
 }
 
 fn expandNode(cx: *Ctx, n: ast.Stage.Node) Error!ast.Stage.Node {

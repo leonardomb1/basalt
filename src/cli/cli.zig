@@ -327,6 +327,12 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
                 return 1;
             },
         };
+        if (stdout_format == .arrow) {
+            var aw = std.Io.Writer.Allocating.init(arena.allocator());
+            try analyze.render(plan, &aw.writer);
+            _ = try runtime.printPlanArrow(alloc, aw.written(), .{ .kind = "explain", .line = 1, .col = 1, .t0_ms = std.time.milliTimestamp() });
+            return 0;
+        }
         try analyze.render(plan, eout);
         return 0;
     }
@@ -1682,7 +1688,7 @@ pub fn appendDisplaySinks(arena: std.mem.Allocator, prog: ast.Program) !ast.Prog
             .hints = &.{},
             .pos = p.pos,
         };
-        stmts[i] = .{ .output = .{ .stages = stages, .pos = p.pos } };
+        stmts[i] = .{ .output = .{ .stages = stages, .pos = p.pos, .show = p.show } };
     }
     return .{ .stmts = stmts };
 }
@@ -2018,7 +2024,8 @@ fn usage(w: anytype) !void {
         \\                     `(N rows)` line. json: NDJSON rows (and a summary object
         \\                     for a LOAD run). csv, tsv: a header and the rows, quoted
         \\                     as a .csv sink quotes them, nothing else. arrow: an Arrow
-        \\                     IPC stream
+        \\                     IPC stream per result, each naming its statement, kind
+        \\                     and position in schema metadata; EXPLAIN is a result
         \\  --log-format FMT   text|json — stderr log format (default text;
         \\                     json is NDJSON, one object per line, for collectors)
         \\  --log-level LVL    error|warn|info|debug (default warn)

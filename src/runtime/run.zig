@@ -10,6 +10,7 @@ const op = @import("../exec/op.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const csv = @import("../connect/csv.zig");
 const column = @import("../exec/column.zig");
+const arrow = @import("../connect/arrow.zig");
 const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
 const sql = @import("../connect/sql.zig");
@@ -44,6 +45,9 @@ const schemaPtr = @import("env.zig").schemaPtr;
 const setMsg = @import("env.zig").setMsg;
 pub const Stats = @import("env.zig").Stats;
 pub const StdoutFormat = @import("env.zig").StdoutFormat;
+pub const ResultDone = @import("env.zig").ResultDone;
+pub const ResultHook = @import("env.zig").ResultHook;
+pub const ResultInfo = arrow.ResultInfo;
 pub const SummaryMode = @import("env.zig").SummaryMode;
 pub const takeReload = @import("env.zig").takeReload;
 
@@ -174,7 +178,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     for (program.stmts) |s| {
         if (s == .kind) buffer_decl = s.kind.buffer;
     }
-    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .buffer_decl = buffer_decl, .buffer_segment = opts.buffer_segment, .load_label_prefix = opts.load_label_prefix, .load_run_id = opts.load_run_id, .stdout_format = opts.stdout_format, .explain = opts.explain, .kind_name = @tagName(program.stmts[0].kind.kind), .fns = &fns };
+    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .buffer_decl = buffer_decl, .buffer_segment = opts.buffer_segment, .load_label_prefix = opts.load_label_prefix, .load_run_id = opts.load_run_id, .stdout_format = opts.stdout_format, .explain = opts.explain, .line_base = opts.line_base, .on_result = opts.on_result, .kind_name = @tagName(program.stmts[0].kind.kind), .fns = &fns };
 
     var batch_arena = std.heap.ArenaAllocator.init(gpa);
     defer batch_arena.deinit();
@@ -199,8 +203,14 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         // query that reads it: two statements may reuse a CTE name, and each must see
         // its own — registering them all up front made the last one win for both.
         .binding => |b| try bindings.put(b.name, try renderScriptScope(&env, b.pipeline)),
-        .output => |p| try runOutput(&env, try renderScriptScope(&env, p), opts, &stats, &lanes_used, &batch_arena),
-        .explain => |e| try runExplain(&env, .{ .mode = e.mode, .pipeline = try renderScriptScope(&env, e.pipeline), .pos = e.pos }, opts, &stats, &lanes_used, &batch_arena),
+        .output => |p| {
+            env.noteResult(if (p.show) "show" else "select", p.pos);
+            try runOutput(&env, try renderScriptScope(&env, p), opts, &stats, &lanes_used, &batch_arena);
+        },
+        .explain => |e| {
+            env.noteResult(if (e.mode == .describe) "describe" else "explain", e.pos);
+            try runExplain(&env, .{ .mode = e.mode, .pipeline = try renderScriptScope(&env, e.pipeline), .pos = e.pos }, opts, &stats, &lanes_used, &batch_arena);
+        },
         .for_each => |fe| try runForEach(&env, fe, opts, &stats, &lanes_used, &batch_arena, runForBody, &env.script_scope),
         .match => |m| try runStmtMatch(&env, m, opts, &stats, &lanes_used, &batch_arena),
         .print => |p| try runPrint(&env, p, no_loop_vars),
@@ -306,8 +316,14 @@ fn runStmtMatch(env: *Env, m: ast.StmtMatch, opts: RunOptions, stats: *Stats, la
 fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     env.diag.pos = null;
     switch (s.*) {
-        .output => |p| try runOutput(env, try renderScriptScope(env, p), opts, stats, lanes_used, batch_arena),
-        .explain => |e| try runExplain(env, .{ .mode = e.mode, .pipeline = try renderScriptScope(env, e.pipeline), .pos = e.pos }, opts, stats, lanes_used, batch_arena),
+        .output => |p| {
+            env.noteResult(if (p.show) "show" else "select", p.pos);
+            try runOutput(env, try renderScriptScope(env, p), opts, stats, lanes_used, batch_arena);
+        },
+        .explain => |e| {
+            env.noteResult(if (e.mode == .describe) "describe" else "explain", e.pos);
+            try runExplain(env, .{ .mode = e.mode, .pipeline = try renderScriptScope(env, e.pipeline), .pos = e.pos }, opts, stats, lanes_used, batch_arena);
+        },
         .for_each => |fe| try runForEach(env, fe, opts, stats, lanes_used, batch_arena, runForBody, &env.script_scope),
         .match => |mm| try runStmtMatch(env, mm, opts, stats, lanes_used, batch_arena),
         .print => |p| try runPrint(env, p, no_loop_vars),
@@ -677,7 +693,37 @@ pub fn runExplain(env: *Env, e: ast.ExplainStmt, opts: RunOptions, stats: *Stats
     var aw = std.Io.Writer.Allocating.init(env.gpa);
     defer aw.deinit();
     try analyze.render(plan, &aw.writer);
+    // Arrow output is for a program, which cannot read stderr as a result: there
+    // the plan is a result of its own, a `plan` column of one row per line.
+    if (env.stdout_format == .arrow) {
+        const info = env.takeResult();
+        const n = try printPlanArrow(env.gpa, aw.writer.buffered(), info);
+        stats.rows_out += n;
+        if (env.on_result) |h| h.call(.{ .info = info, .rows = n });
+        return;
+    }
     std.fs.File.stderr().writeAll(aw.writer.buffered()) catch {};
+}
+
+/// Writes a rendered plan to stdout as an Arrow stream with one string column,
+/// `plan`, one row per line. Returns the row count.
+pub fn printPlanArrow(gpa: std.mem.Allocator, text: []const u8, info: arrow.ResultInfo) !usize {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const fields = [_]types.Schema.Field{.{ .name = "plan", .ty = .{ .kind = .string } }};
+    const schema = types.Schema{ .fields = &fields };
+    var b = column.Builder.init(a, fields[0].ty);
+    var it = std.mem.splitScalar(u8, std.mem.trimRight(u8, text, "\n"), '\n');
+    var n: usize = 0;
+    while (it.next()) |ln| : (n += 1) try b.append(.{ .string = ln });
+    const cols = try a.alloc(column.Column, 1);
+    cols[0] = try b.finish();
+    const w = try arrow.ArrowWriter.open(gpa, schema, info);
+    errdefer w.abort();
+    try w.writeBatch(a, .{ .schema = &schema, .columns = cols, .len = n });
+    try w.close();
+    return n;
 }
 
 /// Print the operator tree with per-stage actuals. Time is *exclusive*: an

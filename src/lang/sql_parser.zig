@@ -528,7 +528,9 @@ pub const Parser = struct {
         _ = try self.expect(.semi);
         if (std.mem.eql(u8, kind, "http")) {
             if (schema != null) return self.fail(pos, "SHOW TABLES FROM: `{s}` is an http connection, which has no schemas", .{conn});
-            return out.append(.{ .output = try self.showResources(conn, like, pos) });
+            var p = try self.showResources(conn, like, pos);
+            p.show = true;
+            return out.append(.{ .output = p });
         }
 
         var q = std.array_list.Managed(u8).init(self.arena);
@@ -544,7 +546,7 @@ pub const Parser = struct {
         const stages = try self.arena.alloc(ast.Stage, 2);
         stages[0] = .{ .node = .{ .read = .{ .connector = conn, .form = .{ .query = try q.toOwnedSlice() } } }, .hints = &.{}, .pos = pos };
         stages[1] = .{ .node = .{ .write = .{ .connector = "stdout", .form = null, .target = "", .mode = .default } }, .hints = &.{}, .pos = pos };
-        try out.append(.{ .output = .{ .stages = stages, .pos = pos } });
+        try out.append(.{ .output = .{ .stages = stages, .pos = pos, .show = true } });
     }
 
     fn connType(self: *Parser, name: []const u8) ?[]const u8 {
