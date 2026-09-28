@@ -3226,7 +3226,7 @@ test "DESCRIBE rows: name, engine type (decimal with its precision), nullable" {
         .{ .name = "a,b", .ty = types.Type.init(.string).asNullable() },
     };
     const rows = try describeRows(ar.allocator(), .{ .fields = &fields });
-    try std.testing.expectEqualStrings("id,int,no\namt,decimal(10,2),yes\n\"a,b\",string,yes\n", rows);
+    try std.testing.expectEqualStrings("id,int,no\namt,\"decimal(10,2)\",yes\n\"a,b\",string,yes\n", rows);
 }
 
 test "EXCEPT (IDENTIFIER($cols)): a comma list excludes each name, an empty one excludes nothing" {
