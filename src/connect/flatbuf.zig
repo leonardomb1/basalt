@@ -166,6 +166,25 @@ pub const Builder = struct {
         return self.offset();
     }
 
+    /// A vector of Arrow's footer `Block` structs — `offset: i64`,
+    /// `metaDataLength: i32`, four bytes of padding, `bodyLength: i64` — given as
+    /// `[offset, meta_len, body_len]` triples.
+    pub fn createBlockVector(self: *Builder, triples: []const i64) !u32 {
+        const n = triples.len / 3;
+        try self.prep(4, n * 24);
+        try self.prep(8, n * 24);
+        var i = triples.len;
+        while (i > 0) {
+            i -= 3;
+            self.place(i64, triples[i + 2]);
+            self.place(i32, 0);
+            self.place(i32, @intCast(triples[i + 1]));
+            self.place(i64, triples[i]);
+        }
+        self.place(u32, @intCast(n));
+        return self.offset();
+    }
+
     /// Close the buffer with the root offset; the returned slice aliases the
     /// builder and is valid until the next `reset`.
     pub fn finish(self: *Builder, root: u32) ![]const u8 {

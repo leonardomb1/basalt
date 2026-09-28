@@ -33,6 +33,7 @@ pub const codec = @import("connect/codec.zig");
 pub const thrift = @import("connect/thrift.zig");
 pub const parquet = @import("connect/parquet.zig");
 pub const pqdecode = @import("connect/pqdecode.zig");
+pub const arrowread = @import("connect/arrowread.zig");
 pub const pqwrite = @import("connect/pqwrite.zig");
 pub const split = @import("connect/split.zig");
 pub const registry = @import("connect/registry.zig");

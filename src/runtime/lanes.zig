@@ -855,6 +855,8 @@ fn csvSplitFile(env: *Env, rd: ast.Read, w: ast.Write) anyerror!?*csv.MappedCsv 
         else => return null,
     };
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return null;
+    // only a CSV is cut on byte boundaries, whatever route asked
+    if (analyze.readFormat(path, env.fmt_in) != .csv) return null;
 
     const mapped = csv.MappedCsv.open(env.arena, path, env.csv_in) catch return null;
     // A newline inside a quoted field makes chunk boundaries undecidable from a

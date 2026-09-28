@@ -56,12 +56,22 @@ pub const StreamWriter = struct {
     fb: flatbuf.Builder,
     gpa: std.mem.Allocator,
     schema: types.Schema,
+    /// Bytes written so far, counted from `base` — where the stream starts in
+    /// its file — so a file writer can index its record batches.
+    written: u64 = 0,
+    /// When set, each record batch's `[offset, meta_len, body_len]` is appended:
+    /// the footer of the file format.
+    blocks: ?*std.array_list.Managed(i64) = null,
 
     /// Writes the schema message at once, so the stream is well-formed from
     /// the first byte even if no batch ever follows. `meta` becomes the
     /// schema's `custom_metadata`.
     pub fn init(gpa: std.mem.Allocator, out: *std.Io.Writer, schema: types.Schema, meta: []const KeyValue) !StreamWriter {
-        var self = StreamWriter{ .out = out, .fb = try flatbuf.Builder.init(gpa, 1024), .gpa = gpa, .schema = schema };
+        return initAt(gpa, out, schema, meta, 0, null);
+    }
+
+    pub fn initAt(gpa: std.mem.Allocator, out: *std.Io.Writer, schema: types.Schema, meta: []const KeyValue, base: u64, blocks: ?*std.array_list.Managed(i64)) !StreamWriter {
+        var self = StreamWriter{ .out = out, .fb = try flatbuf.Builder.init(gpa, 1024), .gpa = gpa, .schema = schema, .written = base, .blocks = blocks };
         errdefer self.fb.deinit();
         try self.writeSchema(schema, meta);
         return self;
@@ -75,6 +85,7 @@ pub const StreamWriter = struct {
     pub fn finish(self: *StreamWriter) !void {
         try self.out.writeInt(u32, continuation, .little);
         try self.out.writeInt(u32, 0, .little);
+        self.written += 8;
         try self.out.flush();
     }
 
@@ -116,9 +127,16 @@ pub const StreamWriter = struct {
     fn writeSchema(self: *StreamWriter, schema: types.Schema, meta: []const KeyValue) !void {
         const fb = &self.fb;
         fb.reset();
-        const kv = try keyValues(fb, self.gpa, meta);
-        const offs = try self.gpa.alloc(u32, schema.fields.len);
-        defer self.gpa.free(offs);
+        const sch = try schemaTable(fb, self.gpa, schema, meta);
+        const msg = try message(fb, .schema, sch, 0);
+        try self.frame(try fb.finish(msg));
+    }
+
+    /// The `Schema` table, shared by the schema message and a file's footer.
+    fn schemaTable(fb: *flatbuf.Builder, gpa: std.mem.Allocator, schema: types.Schema, meta: []const KeyValue) !u32 {
+        const kv = try keyValues(fb, gpa, meta);
+        const offs = try gpa.alloc(u32, schema.fields.len);
+        defer gpa.free(offs);
         for (schema.fields, offs) |f, *o| {
             const name = try fb.createString(f.name);
             const ty = try typeTable(fb, f.ty);
@@ -135,9 +153,7 @@ pub const StreamWriter = struct {
         try fb.addInt(i16, 0, 0);
         try fb.addOffset(1, fields);
         if (kv) |o| try fb.addOffset(2, o);
-        const sch = try fb.endTable();
-        const msg = try message(fb, .schema, sch, 0);
-        try self.frame(try fb.finish(msg));
+        return fb.endTable();
     }
 
     pub fn writeBatch(self: *StreamWriter, arena: std.mem.Allocator, batch: Batch) !void {
@@ -163,11 +179,36 @@ pub const StreamWriter = struct {
         try fb.addOffset(2, bufs_vec);
         const rb = try fb.endTable();
         const msg = try message(fb, .record_batch, rb, body.len);
+        const at = self.written;
         try self.frame(try fb.finish(msg));
+        if (self.blocks) |bl| try bl.appendSlice(&.{ @intCast(at), @intCast(self.written - at), body.len });
         for (body.bufs.items) |b| {
             try self.out.writeAll(b);
             try self.out.splatByteAll(0, pad8(b.len) - b.len);
         }
+        self.written += @intCast(body.len);
+    }
+
+    /// The file format's closing: end-of-stream, the footer — the schema again
+    /// and every record batch's block — its length, and the magic.
+    pub fn finishFile(self: *StreamWriter) !void {
+        try self.out.writeInt(u32, continuation, .little);
+        try self.out.writeInt(u32, 0, .little);
+        const fb = &self.fb;
+        fb.reset();
+        const sch = try schemaTable(fb, self.gpa, self.schema, &.{});
+        const batches = try fb.createBlockVector(if (self.blocks) |b| b.items else &.{});
+        const dicts = try fb.createBlockVector(&.{});
+        try fb.startTable(5);
+        try fb.addInt(i16, 0, version_v5);
+        try fb.addOffset(1, sch);
+        try fb.addOffset(2, dicts);
+        try fb.addOffset(3, batches);
+        const footer = try fb.finish(try fb.endTable());
+        try self.out.writeAll(footer);
+        try self.out.writeInt(i32, @intCast(footer.len), .little);
+        try self.out.writeAll("ARROW1");
+        try self.out.flush();
     }
 
     fn frame(self: *StreamWriter, meta: []const u8) !void {
@@ -176,6 +217,7 @@ pub const StreamWriter = struct {
         try self.out.writeInt(u32, @intCast(padded), .little);
         try self.out.writeAll(meta);
         try self.out.splatByteAll(0, padded - meta.len);
+        self.written += 8 + padded;
     }
 };
 
@@ -328,6 +370,73 @@ fn pushData(arena: std.mem.Allocator, body: *Body, col: *const Column, n: usize)
         .array, .@"struct" => return error.ArrowUnsupportedType,
     }
 }
+
+/// `LOAD INTO 'x.arrow'` (also `.feather`, `.ipc`): the IPC file format, which
+/// pyarrow's `open_file`, `polars.read_ipc` and Arrow JS read with random access
+/// to its batches. `.arrows` writes the stream format instead. A local path
+/// only; the file is replaced, never appended to — the footer indexes every
+/// batch, as a parquet footer does.
+pub const FileSink = struct {
+    gpa: std.mem.Allocator,
+    file: std.fs.File,
+    buf: [1 << 16]u8 = undefined,
+    fw: std.fs.File.Writer = undefined,
+    sw: StreamWriter = undefined,
+    blocks: std.array_list.Managed(i64),
+    stream: bool,
+
+    pub fn isPath(path: []const u8) bool {
+        inline for (.{ ".arrow", ".arrows", ".feather", ".ipc" }) |ext| {
+            if (std.ascii.endsWithIgnoreCase(path, ext)) return true;
+        }
+        return false;
+    }
+
+    pub fn open(gpa: std.mem.Allocator, path: []const u8, schema: types.Schema) !*FileSink {
+        if (std.mem.indexOf(u8, path, "://") != null) return error.ArrowRemoteSink;
+        const stream = std.ascii.endsWithIgnoreCase(path, ".arrows");
+        const self = try gpa.create(FileSink);
+        errdefer gpa.destroy(self);
+        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        errdefer file.close();
+        self.* = .{ .gpa = gpa, .file = file, .blocks = std.array_list.Managed(i64).init(gpa), .stream = stream };
+        errdefer self.blocks.deinit();
+        self.fw = file.writer(&self.buf);
+        var base: u64 = 0;
+        if (!stream) {
+            try self.fw.interface.writeAll("ARROW1\x00\x00");
+            base = 8;
+        }
+        self.sw = try StreamWriter.initAt(gpa, &self.fw.interface, schema, &.{}, base, if (stream) null else &self.blocks);
+        return self;
+    }
+
+    pub fn writeBatch(self: *FileSink, arena: std.mem.Allocator, batch: Batch) !void {
+        try self.sw.writeBatch(arena, batch);
+    }
+
+    pub fn close(self: *FileSink) !void {
+        defer self.deinit();
+        if (self.stream) try self.sw.finish() else try self.sw.finishFile();
+    }
+
+    pub fn abort(self: *FileSink) void {
+        self.deinit();
+    }
+
+    fn deinit(self: *FileSink) void {
+        self.sw.deinit();
+        self.blocks.deinit();
+        self.file.close();
+        self.gpa.destroy(self);
+    }
+
+    pub fn sink(self: *FileSink) driver.Sink {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = driver.sinkVTable(FileSink);
+};
 
 /// Which result a stdout stream is, for its schema metadata.
 pub const ResultInfo = struct {
@@ -613,4 +722,41 @@ test "stream: schema metadata says which result it is, a trailer batch carries t
     // one bytes column carries three buffers, every other column two
     try std.testing.expectEqual(@as(usize, 7 * 2 + 3), rb.vector(2).?.len);
     try std.testing.expectEqual(bytes.len, f2.next + 8);
+}
+
+test "file sink: the IPC file and stream a sink writes read back through the reader" {
+    const arrowread = @import("arrowread.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const schema = testSchema();
+    const batch = try testBatch(a, &schema);
+
+    inline for (.{ "t.arrow", "t.arrows" }) |name| {
+        const path = try std.fs.path.join(a, &.{ dir, name });
+        const fs = try FileSink.open(std.testing.allocator, path, schema);
+        try fs.writeBatch(a, batch);
+        try fs.writeBatch(a, batch);
+        try fs.close();
+
+        const r = try arrowread.Reader.open(a, path);
+        defer r.close();
+        try std.testing.expectEqual(schema.fields.len, r.schema.fields.len);
+        var rows: usize = 0;
+        while (try r.next(a)) |b| {
+            // the decimal column as the writer stored it: at its declared scale 2,
+            // so the scale-3 input -12.345 is -12.34 (the writer's own test pins that)
+            const dec_want = [_][]const u8{ "10.50", "3.00", "-12.34" };
+            for (0..b.len) |i| {
+                const got = b.columns[3].getValue(i);
+                try std.testing.expectEqualStrings(dec_want[i % 3], try @import("../exec/eval.zig").valueToString(a, got));
+                try std.testing.expectEqual(batch.columns[0].getValue(i % 3) == .null, b.columns[0].getValue(i) == .null);
+            }
+            rows += b.len;
+        }
+        try std.testing.expectEqual(@as(usize, 6), rows);
+    }
 }

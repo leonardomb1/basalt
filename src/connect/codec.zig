@@ -194,8 +194,14 @@ fn copyMatch(out: []u8, pos: *usize, off: usize, len: usize) Error!void {
 /// LZ4 block format: a token per sequence, high nibble literal length, low
 /// nibble match length, each extended by 255-continuation bytes.
 fn lz4Block(src: []const u8, out: []u8) Error!void {
+    if (try lz4BlockAt(src, out, 0) != out.len) return Error.CorruptCompressedData;
+}
+
+/// Decodes one block into `out` from `start`, returning where it ended. A match
+/// may reach back past `start` — into earlier blocks of a linked LZ4 frame.
+fn lz4BlockAt(src: []const u8, out: []u8, start: usize) Error!usize {
     var i: usize = 0;
-    var pos: usize = 0;
+    var pos: usize = start;
     while (i < src.len) {
         const token = src[i];
         i += 1;
@@ -218,7 +224,71 @@ fn lz4Block(src: []const u8, out: []u8) Error!void {
         mlen += 4; // minimum match length is 4
         try copyMatch(out, &pos, off, mlen);
     }
-    if (pos != out.len) return Error.CorruptCompressedData;
+    return pos;
+}
+
+/// The LZ4 frame format (`LZ4F`), as Arrow IPC body compression and the `lz4`
+/// command write it: a magic, a frame descriptor, then size-prefixed blocks —
+/// each LZ4-compressed, or stored when its size word's top bit is set — until a
+/// zero-size end mark. Blocks are decoded into one contiguous buffer, so a
+/// linked frame's matches into earlier blocks resolve. Checksums are skipped,
+/// not verified; the exact output length is what is checked. Frames may follow
+/// one another, and skippable frames are stepped over.
+pub fn lz4Frame(src: []const u8, out: []u8) Error!void {
+    var i: usize = 0;
+    var pos: usize = 0;
+    while (i < src.len) {
+        if (i + 4 > src.len) return Error.CorruptCompressedData;
+        const magic = std.mem.readInt(u32, src[i..][0..4], .little);
+        i += 4;
+        if (magic & 0xFFFFFFF0 == 0x184D2A50) {
+            // a skippable frame: a length, then that many bytes of anything
+            if (i + 4 > src.len) return Error.CorruptCompressedData;
+            const n = std.mem.readInt(u32, src[i..][0..4], .little);
+            i += 4;
+            if (n > src.len - i) return Error.CorruptCompressedData;
+            i += n;
+            continue;
+        }
+        if (magic != 0x184D2204) return Error.CorruptCompressedData;
+        if (i + 2 > src.len) return Error.CorruptCompressedData;
+        const flg = src[i];
+        i += 2; // FLG, BD
+        if (flg >> 6 != 1) return Error.CorruptCompressedData; // version 01
+        const block_checksum = flg & 0x10 != 0;
+        const content_size = flg & 0x08 != 0;
+        const content_checksum = flg & 0x04 != 0;
+        const dict_id = flg & 0x01 != 0;
+        if (dict_id) return Error.UnsupportedCodec; // a preset dictionary nobody ships
+        if (content_size) i += 8;
+        i += 1; // header checksum
+        while (true) {
+            if (i + 4 > src.len) return Error.CorruptCompressedData;
+            const word = std.mem.readInt(u32, src[i..][0..4], .little);
+            i += 4;
+            if (word == 0) break;
+            const stored = word & 0x80000000 != 0;
+            const n: usize = word & 0x7FFFFFFF;
+            if (n > src.len - i) return Error.CorruptCompressedData;
+            const blk = src[i..][0..n];
+            i += n;
+            if (stored) {
+                if (n > out.len - pos) return Error.CorruptCompressedData;
+                @memcpy(out[pos..][0..n], blk);
+                pos += n;
+            } else {
+                pos = try lz4BlockAt(blk, out, pos);
+            }
+            if (block_checksum) i += 4;
+        }
+        if (content_checksum) i += 4;
+    }
+    if (i != src.len or pos != out.len) return Error.CorruptCompressedData;
+}
+
+/// ZSTD for callers outside the Parquet codec switch (Arrow IPC bodies).
+pub fn zstdInto(arena: std.mem.Allocator, src: []const u8, out: []u8) Error!void {
+    return zstdDecode(arena, src, out);
 }
 
 fn readLenExt(src: []const u8, i: *usize) Error!usize {

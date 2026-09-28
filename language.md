@@ -229,7 +229,9 @@ AS
 ```
 
 - File target by quoted path — the extension picks the writer:
-  `LOAD INTO '/out/x.csv'`, `LOAD INTO '/out/x.parquet'`, or an object-store
+  `LOAD INTO '/out/x.csv'`, `LOAD INTO '/out/x.parquet'`,
+  `LOAD INTO '/out/x.arrow'` (Arrow IPC file; also `.feather`, `.ipc`, and
+  `.arrows` for the stream format, local paths only), or an object-store
   path `LOAD INTO 'az://account/container/bronze/x.parquet'` or
   `LOAD INTO 's3://bucket/bronze/x.parquet'`.
 - A per-row dynamic target uses `IDENTIFIER(<string-expr>)` over loop vars
@@ -243,9 +245,9 @@ AS
   a bare `LOAD INTO 'x.csv'`, like `REPLACE`, creates or truncates the file, so
   a rerun replaces it. Explicit `APPEND` accumulates for CSV only: the file is
   opened without truncating and the header row is written only when it was
-  absent or empty. Explicit `APPEND` is a plan-time error for `.parquet` (the
-  footer indexes every row group and is written last, so appending means
-  rewriting the file) and for `az://` / `s3://` (an object is replaced on
+  absent or empty. Explicit `APPEND` is a plan-time error for `.parquet` and
+  Arrow IPC (the footer indexes every row group or batch and is written last,
+  so appending means rewriting the file) and for `az://` / `s3://` (an object is replaced on
   write, never extended) — use `REPLACE`, a per-run path, or `INTO BUFFER` (§8).
 - `SPLIT BY (col)` parallelizes the load by key ranges; `JOBS n` fixes the
   lane count (otherwise the CLI `-j` applies).
@@ -277,7 +279,7 @@ LIMIT 100 OFFSET 20;
 | SQL table | `FROM erp.dbo.SC5010` |
 | SQL table (per-row name) | `FROM erp.dbo.IDENTIFIER($name)` (§7) — still a table read |
 | raw query | `FROM erp.QUERY($$SELECT ...$$)` (no dialect translation) |
-| file — CSV or Parquet | `FROM 'path.csv'` / `FROM 'path.parquet'` — the extension picks the reader; local or HTTPS URL. Any other extension is a plan-time error unless `WITH (format = ...)` names one |
+| file — CSV, Parquet or Arrow IPC | `FROM 'path.csv'` / `FROM 'path.parquet'` / `FROM 'path.arrow'` — the extension picks the reader; local or HTTPS URL (Arrow IPC: local only). Any other extension is a plan-time error unless `WITH (format = 'csv' \| 'parquet' \| 'arrow')` names one |
 | compressed file | `FROM 'path.csv.gz'` / `.csv.zst` — the inner name picks the reader |
 | file inside a zip | `FROM 'archive.zip :: inner.csv'`, or just `FROM 'archive.zip'` when it holds one file |
 | object storage | `FROM 'az://account/container/path.parquet'` or `FROM 's3://bucket/key.parquet'`; a trailing `/` reads every object under the prefix as one table |
@@ -307,6 +309,24 @@ server that ignores `Range` falls back to one whole-object fetch. Parquet writes
 store `DECIMAL` in the narrowest physical type its precision allows — INT32 to 9
 digits, INT64 to 18, FIXED_LEN_BYTE_ARRAY up to 38; past 38 digits (the engine's
 own ceiling) a value is refused rather than silently truncated.
+
+Arrow IPC — `.arrow`, `.feather`, `.ipc` (the file format, Feather v2) or
+`.arrows` (the stream format) — is how a dataframe reaches basalt fastest: the
+file is memory-mapped and its columns copied out, so polars' `write_ipc` or
+pyarrow's `write_feather` hands a frame over with no encode or decode step.
+Both formats read, uncompressed or with LZ4-frame or ZSTD buffers, and only
+the columns a query uses are converted. Every integer width reads as `int` (a
+`UInt64` above 2^63−1 is an error, never a wraparound), floats as `float`,
+all three string layouts (`utf8`, `large_utf8`, polars' default `utf8_view`)
+as `string` and the binary ones as `bytes`, `decimal128` as `decimal`, and
+dates, times, timestamps and durations in any unit as basalt's own
+(nanoseconds floor to the microsecond; a zoned timestamp is its UTC
+wall-clock). Dictionary-encoded columns — a polars `Categorical` — read as
+their values. Lists, structs and maps read as JSON text, so `json_get` and
+`CROSS JOIN UNNEST(JSON_EACH(col))` reach inside them. Unions and run-end or list-view
+encodings are refused with the column named. Only the first stream of a
+`.arrows` holding several is read. An Arrow read is one lane; `-j` does not
+split it yet.
 
 A parquet column's type comes from its `LogicalType` annotation when the writer
 set one, else from the legacy `ConvertedType`. That matters for files from

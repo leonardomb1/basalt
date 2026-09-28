@@ -10,9 +10,11 @@ const column = @import("../exec/column.zig");
 const csv = @import("../connect/csv.zig");
 const pqdecode = @import("../connect/pqdecode.zig");
 const pqwrite = @import("../connect/pqwrite.zig");
+const arrowread = @import("../connect/arrowread.zig");
 const JsonWriter = @import("../connect/table.zig").JsonWriter;
 const arrow = @import("../connect/arrow.zig");
 const ArrowWriter = arrow.ArrowWriter;
+const ArrowFileSink = arrow.FileSink;
 const TableWriter = @import("../connect/table.zig").TableWriter;
 const driver = @import("../connect/driver.zig");
 const starrocks = @import("../connect/starrocks.zig");
@@ -265,7 +267,7 @@ fn buildStarrocksSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*Starrock
 pub fn isLocalCsvRead(rd: ast.Read) bool {
     if (!std.mem.eql(u8, rd.connector, "csv")) return false;
     return switch (rd.form) {
-        .path => |p| !csv.CsvReader.isUrl(p) and !pqdecode.Reader.isPath(p),
+        .path => |p| !csv.CsvReader.isUrl(p) and analyze.readFormat(p, null) == .csv,
         else => false,
     };
 }
@@ -285,6 +287,7 @@ pub fn isLocalParquetRead(rd: ast.Read) bool {
 /// writes as csv.
 pub fn sinkLabel(env: *Env, w: ast.Write) []const u8 {
     if (std.mem.eql(u8, w.connector, "csv") and pqwrite.Writer.isPath(w.target)) return "parquet";
+    if (std.mem.eql(u8, w.connector, "csv") and arrowread.isPath(w.target)) return "arrow";
     return connectorType(env, w.connector);
 }
 
@@ -355,7 +358,28 @@ pub fn openSourceProjected(
         env.pq_reader = pr;
         return pr.source();
     }
+    // An Arrow file converts only the columns asked for, as parquet decodes only
+    // those; the explicit format is honoured the way `openSourceAll` honours it.
+    if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path and project != null) {
+        var fdiag = analyze.Diag{};
+        const want = analyze.formatFromHints(hints, &fdiag) catch null;
+        if (analyze.readFormat(rd.form.path, want) == .arrow and analyze.unreadableTarget(rd.form.path, want) == null)
+            return openArrow(env, rd.form.path, project);
+    }
     return openSourceAll(env, rd, hints);
+}
+
+fn openArrow(env: *Env, path: []const u8, project: ?[][]const u8) !driver.Source {
+    const r = arrowread.Reader.openProjected(env.arena, path, project) catch |e| {
+        const why = switch (e) {
+            error.UnsupportedArrow => "an Arrow type or feature basalt does not read",
+            error.NotArrow => "not an Arrow IPC file or stream",
+            error.CorruptArrow => "the file is truncated or corrupt",
+            else => try pathFail(env.arena, path, e),
+        };
+        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read Arrow IPC `{s}` ({s})", .{ path, why }));
+    };
+    return r.source();
 }
 
 fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
@@ -422,6 +446,7 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
             return pr.source();
         }
+        if (analyze.readFormat(rd.form.path, want) == .arrow) return openArrow(env, rd.form.path, null);
         var ddiag = analyze.Diag{};
         const d = analyze.dialectFromHints(hints, &ddiag) catch
             return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg));
@@ -1074,7 +1099,15 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         // A `.parquet` target shares the csv connector but is a different format;
         // without this it would be written as CSV text under a .parquet name. An
         // explicit `WITH (format = ...)` overrides the extension.
-        const wfmt = env.fmt_out orelse (if (pqwrite.Writer.isPath(w.target)) analyze.FileFormat.parquet else analyze.FileFormat.csv);
+        const wfmt = env.fmt_out orelse (if (pqwrite.Writer.isPath(w.target)) analyze.FileFormat.parquet else if (arrowread.isPath(w.target)) analyze.FileFormat.arrow else analyze.FileFormat.csv);
+        if (wfmt == .arrow) {
+            const aw = ArrowFileSink.open(env.gpa, w.target, schema) catch |e| switch (e) {
+                error.ArrowRemoteSink => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: Arrow IPC is written to a local file", .{w.target})),
+                error.ArrowUnsupportedType => return planErr(env.diag, "Arrow IPC cannot carry an array or struct column"),
+                else => return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output Arrow IPC `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) })),
+            };
+            return aw.sink();
+        }
         if (wfmt == .parquet) {
             const pw = pqwrite.Writer.open(env.arena, w.target, schema, .snappy, fmode) catch |e|
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output parquet `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));

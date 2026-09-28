@@ -15,6 +15,7 @@ const eval = @import("../exec/eval.zig");
 const csv = @import("../connect/csv.zig");
 const pqdecode = @import("../connect/pqdecode.zig");
 const pqwrite = @import("../connect/pqwrite.zig");
+const arrowread = @import("../connect/arrowread.zig");
 const azure = @import("../connect/azure.zig");
 const s3 = @import("../connect/s3.zig");
 const zipsrc = @import("../connect/zipsrc.zig");
@@ -1042,6 +1043,7 @@ pub fn render(plan: Plan, w: anytype) !void {
 pub fn appendUnsupported(target: []const u8) ?[]const u8 {
     if (azure.isUrl(target) or s3.isUrl(target)) return "an object-store blob is replaced on write, never extended";
     if (pqwrite.Writer.isPath(target)) return "a parquet file's footer indexes every row group and is written last, so appending means rewriting the file";
+    if (arrowread.isPath(target)) return "an Arrow IPC file's footer indexes every batch and is written last, so appending means rewriting the file";
     return null;
 }
 
@@ -1049,7 +1051,10 @@ pub fn appendUnsupported(target: []const u8) ?[]const u8 {
 /// format from the target — otherwise a parquet write reads as `write csv`.
 fn sinkKind(node: anytype) []const u8 {
     const path = if (@hasField(@TypeOf(node), "target")) node.target else node.detail;
-    if (std.mem.eql(u8, node.connector, "csv") and pqwrite.Writer.isPath(path)) return "parquet";
+    if (std.mem.eql(u8, node.connector, "csv")) {
+        if (pqwrite.Writer.isPath(path)) return "parquet";
+        if (arrowread.isPath(path)) return "arrow";
+    }
     return node.connector;
 }
 
@@ -1125,7 +1130,19 @@ fn splittableRead(node: ast.Stage.Node) bool {
 
 /// The file format a path is read or written as. `format` in a `WITH (...)` names
 /// it outright; otherwise the extension does.
-pub const FileFormat = enum { csv, parquet };
+pub const FileFormat = enum {
+    csv,
+    parquet,
+    /// Arrow IPC: `.arrow` / `.feather` / `.ipc` (file) or `.arrows` (stream).
+    arrow,
+};
+
+/// The format a file read resolves to: the named one, else the extension's,
+/// else CSV. The one place the CSV fast paths ask, so a binary format is never
+/// memory-mapped and parsed as text.
+pub fn readFormat(path: []const u8, explicit: ?FileFormat) FileFormat {
+    return explicit orelse formatOfPath(path) orelse .csv;
+}
 
 fn hintText(hints: []const ast.Hint, key: []const u8) ?[]const u8 {
     for (hints) |h| {
@@ -1172,7 +1189,8 @@ pub fn formatFromHints(hints: []const ast.Hint, diag: *Diag) Error!?FileFormat {
     const s = hintText(hints, "format") orelse return null;
     if (std.ascii.eqlIgnoreCase(s, "csv")) return .csv;
     if (std.ascii.eqlIgnoreCase(s, "parquet")) return .parquet;
-    return fail(diag, "unknown format `{s}` (csv, parquet)", .{s});
+    inline for (.{ "arrow", "ipc", "feather" }) |n| if (std.ascii.eqlIgnoreCase(s, n)) return .arrow;
+    return fail(diag, "unknown format `{s}` (csv, parquet, arrow)", .{s});
 }
 
 /// The extension basalt reads a path as, or null when it carries none it knows.
@@ -1183,6 +1201,7 @@ pub fn formatFromHints(hints: []const ast.Hint, diag: *Diag) Error!?FileFormat {
 fn formatOfPath(path: []const u8) ?FileFormat {
     const bare = csv.dataName(path);
     if (pqwrite.Writer.isPath(bare)) return .parquet;
+    if (arrowread.isPath(bare)) return .arrow;
     if (std.ascii.endsWithIgnoreCase(bare, ".csv")) return .csv;
     return null;
 }
@@ -1224,10 +1243,16 @@ pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
     const fmt = explicit orelse formatOfPath(path);
     if (csv.splitCodec(path).codec != .none and fmt == .parquet)
         return "parquet needs random access, so it cannot be read through compression; decompress it first";
+    if (fmt == .arrow) {
+        if (csv.splitCodec(path).codec != .none)
+            return "an Arrow IPC file is read memory-mapped, so it cannot be read through compression; decompress it first (IPC compresses its own buffers)";
+        if (std.mem.indexOf(u8, path, "://") != null)
+            return "Arrow IPC is read from a local file; fetch it first";
+    }
 
     if (explicit != null) return null;
     if (fmt != null) return null;
-    return "basalt handles `.csv` and `.parquet`, optionally `.gz`/`.zst` compressed or inside a `.zip`; name the format with `WITH (format = 'csv')` if the extension differs";
+    return "basalt handles `.csv`, `.parquet` and Arrow IPC (`.arrow`, `.feather`, `.ipc`, `.arrows`), a CSV optionally `.gz`/`.zst` compressed or inside a `.zip`; name the format with `WITH (format = 'csv')` if the extension differs";
 }
 
 /// Why this archive reference cannot be read as one table, or null when it can.
@@ -1257,6 +1282,8 @@ pub fn archiveProblem(arena: std.mem.Allocator, path: []const u8, explicit: ?Fil
         return std.fmt.allocPrint(arena, "`{s}` inside it is not a `.csv` or `.parquet`; name the format with `WITH (format = 'csv')`", .{chosen}) catch null;
     if ((explicit orelse formatOfPath(chosen)) == .parquet)
         return "parquet needs random access, so it cannot be read out of an archive; extract it first";
+    if ((explicit orelse formatOfPath(chosen)) == .arrow)
+        return "an Arrow IPC file is read memory-mapped, so it cannot be read out of an archive; extract it first";
     return null;
 }
 
@@ -1293,6 +1320,8 @@ fn morselParallelRead(connector: []const u8, node: ast.Stage.Node) bool {
     // runtime or EXPLAIN goes back to overstating what it is about to do.
     if (csv.splitCodec(path).codec != .none or csv.splitArchive(path) != null) return false;
     if (pqwrite.Writer.isPath(path)) return true;
+    // an Arrow file reads serially: its batches are not independent morsels yet
+    if (arrowread.isPath(path)) return false;
     return std.mem.indexOf(u8, path, "://") == null;
 }
 
@@ -1314,6 +1343,13 @@ fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.Hint
         {
             const pr = pqdecode.Reader.open(arena, rd.form.path) catch return null;
             return pr.schema;
+        }
+        var fdiag = Diag{};
+        const explicit = formatFromHints(hints, &fdiag) catch return null;
+        if (readFormat(rd.form.path, explicit) == .arrow) {
+            const ar = arrowread.Reader.open(arena, rd.form.path) catch return null;
+            defer ar.close();
+            return ar.schema;
         }
         // The header is split on the script's delimiter, or `check` would report
         // one column named after the whole header line for a `;` file.

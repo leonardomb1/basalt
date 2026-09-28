@@ -844,6 +844,42 @@ PY
     report "arrow: several results describe themselves (run error)" bad
     tail -5 "$out/arrow.log"
   fi
+
+  # Arrow IPC as a source and a sink. pyarrow writes the seed as an LZ4-compressed
+  # Feather file, basalt reads it back; basalt writes `.arrow`, pyarrow reads it.
+  # Both must come out as the seed itself.
+  if command -v uv >/dev/null &&
+     uv run --quiet --with pyarrow python - "$out/seed.feather" <<'PY' 2>>"$out/arrow.log" &&
+import sys, pyarrow.csv as pcsv, pyarrow.feather as feather
+feather.write_feather(pcsv.read_csv("it/seed.csv"), sys.argv[1], compression="lz4")
+PY
+     $B run -q -j 1 --format csv -c "SELECT * FROM '$out/seed.feather' ORDER BY id;" >"$out/feather_rt.csv" 2>>"$out/arrow.log"; then
+    check "arrow: a pyarrow Feather file reads back as the seed" "$out/feather_rt.csv" it/expected.csv
+  else
+    report "arrow: a pyarrow Feather file reads back as the seed (run error)" bad
+    tail -5 "$out/arrow.log"
+  fi
+  if command -v uv >/dev/null &&
+     brun run -c "LOAD INTO '$out/seed.arrow' AS SELECT * FROM 'it/seed.csv' ORDER BY id;" &&
+     uv run --quiet --with pyarrow python - "$out/seed.arrow" "$out/arrow_sink_rt.csv" <<'PY' 2>>"$out/arrow.log"
+import sys, pyarrow.ipc as ipc
+t = ipc.open_file(sys.argv[1]).read_all()
+t.validate(full=True)
+def cell(v):
+    if v is None: return ""
+    s = str(v)
+    return '"' + s.replace('"', '""') + '"' if any(c in s for c in ',"\n') else s
+with open(sys.argv[2], "w") as f:
+    f.write(",".join(t.column_names) + "\n")
+    for row in t.to_pylist():
+        f.write(",".join(cell(row[c]) for c in t.column_names) + "\n")
+PY
+  then
+    check "arrow: LOAD INTO .arrow is a file pyarrow reads" "$out/arrow_sink_rt.csv" it/expected.csv
+  else
+    report "arrow: LOAD INTO .arrow is a file pyarrow reads (run error)" bad
+    tail -5 "$out/arrow.log"
+  fi
 fi
 
 # What `basalt run` puts on stdout, per --format. No container: the contract under
