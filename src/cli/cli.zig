@@ -23,6 +23,8 @@ const analyze = @import("../runtime/analyze.zig");
 const complete = @import("complete.zig");
 const http_server = @import("../server/http_server.zig");
 const kernel = @import("kernel.zig");
+const eval = @import("../exec/eval.zig");
+const Value = @import("../exec/value.zig").Value;
 
 /// SIGTERM/SIGINT → ask the run to stop at its next boundary (async-signal-safe:
 /// one atomic store). The control plane uses this to cancel a job or roll a http_server.
@@ -367,6 +369,7 @@ fn cmdComplete(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
 
     var pos: ?usize = null;
     var connect = false;
+    var utf16 = false;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -380,10 +383,12 @@ fn cmdComplete(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             };
         } else if (std.mem.eql(u8, arg, "--connect")) {
             connect = true;
+        } else if (std.mem.eql(u8, arg, "--utf16")) {
+            utf16 = true;
         } else if (try unknownOption(arg, "complete", stderr)) return 2;
     }
     const src = (try loadSource(a, "complete", args, stderr)) orelse return 1;
-    const at = pos orelse src.text.len;
+    const at = if (pos) |p| (if (utf16) utf16ToByte(src.text, p) else p) else src.text.len;
     if (at > src.text.len) {
         try stderr.print("error: --pos {d} is past the script's {d} bytes\n", .{ at, src.text.len });
         return 2;
@@ -396,7 +401,7 @@ fn cmdComplete(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     defer catalog.deinit();
     const cx = Completer{ .gpa = alloc, .decls = &decls, .catalog = &catalog, .connect = connect };
     const offer = try suggestFor(a, &cx, src.text, at);
-    try writeOffer(stdout, offer, at);
+    try writeOfferIn(stdout, offer, at, src.text, utf16);
     try stdout.writeByte('\n');
     return 0;
 }
@@ -409,6 +414,46 @@ pub fn declareFrom(decls: *DeclStore, arena: std.mem.Allocator, text: []const u8
         if (id.kind == .endpoint) continue;
         try decls.put(id, st);
     }
+}
+
+/// Byte offset of UTF-16 offset `u` in `text` — where a JavaScript editor's
+/// cursor is. An offset inside a surrogate pair, or past the end, clamps to the
+/// character boundary before it; bytes that are not UTF-8 count one unit each.
+pub fn utf16ToByte(text: []const u8, u: usize) usize {
+    var i: usize = 0;
+    var units: usize = 0;
+    while (i < text.len) {
+        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        const cp_units: usize = if (n == 4) 2 else 1;
+        if (units + cp_units > u) break;
+        units += cp_units;
+        i = @min(text.len, i + n);
+    }
+    return i;
+}
+
+/// UTF-16 offset of byte `b` in `text`: `utf16ToByte`'s inverse.
+pub fn byteToUtf16(text: []const u8, b: usize) usize {
+    var i: usize = 0;
+    var units: usize = 0;
+    while (i < @min(b, text.len)) {
+        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        units += if (n == 4) 2 else 1;
+        i += n;
+    }
+    return units;
+}
+
+/// `{"start":S,"end":N,"items":[{"text":…,"kind":…}]}`. With `utf16`, the
+/// offsets are counted in UTF-16 units of `text`, as a JavaScript editor counts.
+pub fn writeOfferIn(w: *std.Io.Writer, offer: Offer, cursor: usize, text: []const u8, utf16: bool) !void {
+    var o = offer;
+    var c = cursor;
+    if (utf16) {
+        o.start = byteToUtf16(text, offer.start);
+        c = byteToUtf16(text, cursor);
+    }
+    return writeOffer(w, o, c);
 }
 
 /// `{"start":S,"end":N,"items":[{"text":…,"kind":…}]}`.
@@ -1828,6 +1873,76 @@ pub fn prepareEntry(a: std.mem.Allocator, decls: *const DeclStore, block: []cons
     return .{ .text = text, .entry_at = entry_at, .prog = prog, .pending = pending.items, .executable = executable };
 }
 
+/// The `LET` values a run decided, kept as literal declarations: a session
+/// replays its declarations ahead of every later entry, and replaying
+/// `LET t = now()` or `LET n = (SELECT count(*) ...)` would give each entry a
+/// value of its own — a different instant, a re-run query — where the entry
+/// that declared it saw one.
+pub const LetFreezer = struct {
+    arena: std.mem.Allocator,
+    frozen: std.array_list.Managed(Frozen),
+
+    const Frozen = struct { name: []const u8, text: []const u8 };
+
+    pub fn init(arena: std.mem.Allocator) LetFreezer {
+        return .{ .arena = arena, .frozen = std.array_list.Managed(Frozen).init(arena) };
+    }
+
+    pub fn hook(self: *LetFreezer) runtime.LetHook {
+        return .{ .ctx = self, .f = onLet };
+    }
+
+    fn onLet(ctx: *anyopaque, name: []const u8, v: Value) void {
+        const self: *LetFreezer = @ptrCast(@alignCast(ctx));
+        const lit = letLiteral(self.arena, v) catch return orelse return;
+        const text = std.fmt.allocPrint(self.arena, "LET {s} = {s}", .{ name, lit }) catch return;
+        const n = self.arena.dupe(u8, name) catch return;
+        self.frozen.append(.{ .name = n, .text = text }) catch {};
+    }
+
+    /// Replace each LET's stored text with its value. A LET the session does not
+    /// hold (none, today — every top-level LET is a declaration) is left alone.
+    pub fn commit(self: *const LetFreezer, decls: *DeclStore) !void {
+        for (self.frozen.items) |f| {
+            for (decls.items.items) |e| {
+                if (e.kind == .let and std.ascii.eqlIgnoreCase(e.name, f.name)) break;
+            } else continue;
+            try decls.put(.{ .kind = .let, .name = f.name }, f.text);
+        }
+    }
+};
+
+/// A SQL expression that folds back to exactly `v`, or null for a value with
+/// no literal form (bytes, nested), which then keeps its expression. Text the
+/// lexer has no literal for — a date, an exponent, the one int whose magnitude
+/// overflows — goes through a CAST from its printed form, which reads back exact.
+pub fn letLiteral(arena: std.mem.Allocator, v: Value) !?[]const u8 {
+    return switch (v) {
+        .null => "NULL",
+        .bool => |b| if (b) "TRUE" else "FALSE",
+        .int => |x| if (x == std.math.minInt(i64))
+            "CAST('-9223372036854775808' AS BIGINT)"
+        else
+            try std.fmt.allocPrint(arena, "{d}", .{x}),
+        .float => |x| try std.fmt.allocPrint(arena, "CAST('{e}' AS DOUBLE)", .{x}),
+        .decimal => |d| try std.fmt.allocPrint(arena, "CAST('{s}' AS DECIMAL(38, {d}))", .{ try eval.valueToString(arena, v), d.scale }),
+        .string => |s| blk: {
+            var out = std.array_list.Managed(u8).init(arena);
+            try out.append('\'');
+            for (s) |c| {
+                if (c == '\'') try out.append('\'');
+                try out.append(c);
+            }
+            try out.append('\'');
+            break :blk out.items;
+        },
+        .date => try std.fmt.allocPrint(arena, "CAST('{s}' AS DATE)", .{try eval.valueToString(arena, v)}),
+        .time => try std.fmt.allocPrint(arena, "CAST('{s}' AS TIME)", .{try eval.valueToString(arena, v)}),
+        .timestamp => try std.fmt.allocPrint(arena, "CAST('{s}' AS TIMESTAMP)", .{try eval.valueToString(arena, v)}),
+        else => null,
+    };
+}
+
 /// Parse and run one REPL entry, reporting errors without aborting the loop.
 fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1859,6 +1974,24 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *s
     for (pending) |p| try sess.decls.put(p.id, p.text);
 
     if (entry.executable == 0) {
+        // A LET's value is decided in the entry that declares it, not by the
+        // next one that happens to run something.
+        for (pending) |p| if (p.id.kind == .let) {
+            var freezer = LetFreezer.init(a);
+            var rdiag: runtime.Diag = .{};
+            _ = runtime.run(alloc, prog, .{
+                .log = .{ .summary = .none, .level = .err },
+                .declarations_only = true,
+                .on_let = freezer.hook(),
+            }, &rdiag) catch |e| {
+                if (e == error.OutOfMemory) return e;
+                try msg.print("error: {s}\n", .{if (rdiag.msg.len > 0) rdiag.msg else @errorName(e)});
+                try msg.flush();
+                return;
+            };
+            try freezer.commit(&sess.decls);
+            break;
+        };
         if (sess.announce) for (pending) |p| try msg.print("ok: {s} {s}\n", .{ @tagName(p.id.kind), p.id.name });
         try msg.flush();
         return;
@@ -1887,7 +2020,10 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *s
 
     const t0 = std.time.nanoTimestamp();
     var rdiag: runtime.Diag = .{};
+    var freezer = LetFreezer.init(a);
+    defer freezer.commit(&sess.decls) catch {};
     _ = runtime.run(alloc, prepared, .{
+        .on_let = freezer.hook(),
         // Errors only, but not `quiet`: that would swallow the entry's own `PRINT`s.
         .log = .{ .summary = .none, .level = .err },
         .stdout_format = sess.format,
@@ -2215,8 +2351,8 @@ fn usage(w: anytype) !void {
         \\  basalt check <script>|-|-c <script> [--format json]
         \\               parse and validate without running; `EXPLAIN` prints the plan;
         \\               json: an array of diagnostics with their ranges
-        \\  basalt complete <script>|-|-c <script> --pos N [--connect]
-        \\               what Tab offers at byte offset N, as JSON (for editors)
+        \\  basalt complete <script>|-|-c <script> --pos N [--connect] [--utf16]
+        \\               what Tab offers at offset N (bytes, or UTF-16 units), as JSON
         \\  basalt repl  interactive read-eval-print loop
         \\  basalt kernel [--format FMT] [-j N]
         \\               a session for a notebook: NDJSON requests on stdin, framed
@@ -2348,4 +2484,43 @@ test "suggestFor: a half-typed script's own declarations and a local file's colu
     try writeOffer(&aw.writer, cols, text.len);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, aw.written(), .{});
     try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("items").?.array.items.len);
+}
+
+test "letLiteral: every value folds back to itself" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const values = [_]Value{
+        .null,                                               .{ .bool = true },
+        .{ .int = std.math.minInt(i64) },                    .{ .int = std.math.maxInt(i64) },
+        .{ .int = -7 },                                      .{ .float = 0.1 },
+        .{ .float = -1.5e300 },                              .{ .float = 5e-324 },
+        .{ .decimal = .{ .unscaled = -12345, .scale = 3 } }, .{ .string = "it's\nfine" },
+        .{ .string = "" },                                   .{ .date = -1 },
+        .{ .time = 86_399_999_999 },                         .{ .timestamp = -500_000 },
+        .{ .timestamp = 1_767_268_800_123_456 },
+    };
+    for (values) |v| {
+        const lit = (try letLiteral(a, v)).?;
+        const src = try std.fmt.allocPrint(a, "LET x = {s};", .{lit});
+        var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = try parser.parseSource(a, src, &diag);
+        const back = try eval.constEval(a, prog.stmts[1].let_const.expr.?, &.{}, &.{});
+        errdefer std.debug.print("{s} -> {any}\n", .{ lit, back });
+        try std.testing.expectEqual(std.meta.activeTag(v), std.meta.activeTag(back));
+        if (v != .null) try std.testing.expectEqual(std.math.Order.eq, eval.compareValues(v, back).?);
+    }
+    // bytes have no literal: the LET keeps its expression
+    try std.testing.expect((try letLiteral(a, .{ .bytes = "\x00" })) == null);
+}
+
+test "utf16 offsets: a JavaScript editor's positions map to bytes and back" {
+    const text = "SELECT 'é😀' AS x"; // é: 2 bytes, 1 unit; 😀: 4 bytes, 2 units
+    try std.testing.expectEqual(@as(usize, 8), utf16ToByte(text, 8)); // before é
+    try std.testing.expectEqual(@as(usize, 10), utf16ToByte(text, 9)); // after é
+    try std.testing.expectEqual(@as(usize, 10), utf16ToByte(text, 10)); // inside the pair: clamped
+    try std.testing.expectEqual(@as(usize, 14), utf16ToByte(text, 11)); // after 😀
+    try std.testing.expectEqual(text.len, utf16ToByte(text, 1000));
+    for ([_]usize{ 0, 8, 10, 14, text.len }) |b| try std.testing.expectEqual(b, utf16ToByte(text, byteToUtf16(text, b)));
+    try std.testing.expectEqual(@as(usize, 17), byteToUtf16(text, text.len));
 }

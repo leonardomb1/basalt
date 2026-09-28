@@ -47,6 +47,7 @@ pub const Stats = @import("env.zig").Stats;
 pub const StdoutFormat = @import("env.zig").StdoutFormat;
 pub const ResultDone = @import("env.zig").ResultDone;
 pub const ResultHook = @import("env.zig").ResultHook;
+pub const LetHook = @import("env.zig").LetHook;
 pub const ResultInfo = arrow.ResultInfo;
 pub const SummaryMode = @import("env.zig").SummaryMode;
 pub const takeReload = @import("env.zig").takeReload;
@@ -122,6 +123,10 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var pit = params.iterator();
     while (pit.next()) |kv| try params_expr.put(kv.key_ptr.*, try mkLit(arena, kv.value_ptr.*));
     try resolveLets(arena, program, &params, &params_expr, diag);
+    if (opts.on_let) |h| for (program.stmts) |s| {
+        if (s == .let_const and s.let_const.expr != null)
+            if (params.get(s.let_const.name)) |v| h.f(h.ctx, s.let_const.name, v);
+    };
 
     var json_params = std.StringHashMap(std.json.Value).init(arena);
     for (program.stmts) |s| {
@@ -153,7 +158,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         .output, .for_each, .match, .call, .explain => runnable += 1,
         .param, .kind, .let_const, .throw => {},
     };
-    if (runnable == 0)
+    if (runnable == 0 and !opts.declarations_only)
         return planErr(diag, "no output pipeline (a pipeline ending in `write`)");
 
     const run_id: u64 = @intCast(std.time.milliTimestamp());
@@ -178,7 +183,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     for (program.stmts) |s| {
         if (s == .kind) buffer_decl = s.kind.buffer;
     }
-    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .buffer_decl = buffer_decl, .buffer_segment = opts.buffer_segment, .load_label_prefix = opts.load_label_prefix, .load_run_id = opts.load_run_id, .stdout_format = opts.stdout_format, .explain = opts.explain, .line_base = opts.line_base, .on_result = opts.on_result, .max_rows = opts.max_rows, .kind_name = @tagName(program.stmts[0].kind.kind), .fns = &fns };
+    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .buffer_decl = buffer_decl, .buffer_segment = opts.buffer_segment, .load_label_prefix = opts.load_label_prefix, .load_run_id = opts.load_run_id, .stdout_format = opts.stdout_format, .explain = opts.explain, .line_base = opts.line_base, .on_result = opts.on_result, .max_rows = opts.max_rows, .on_let = opts.on_let, .kind_name = @tagName(program.stmts[0].kind.kind), .fns = &fns };
 
     var batch_arena = std.heap.ArenaAllocator.init(gpa);
     defer batch_arena.deinit();
@@ -397,6 +402,8 @@ fn runScalarLet(env: *Env, l: ast.LetConst) !void {
 
     try env.params.put(l.name, v);
     try env.params_expr.put(l.name, try mkLit(env.arena, v));
+    // a desugared scalar subquery is the statement's own, not a name to keep
+    if (!std.mem.startsWith(u8, l.name, "__scalar")) if (env.on_let) |h| h.f(h.ctx, l.name, v);
     env.log.log(.debug, "LET {s} = scalar query result ({s})", .{ l.name, @tagName(std.meta.activeTag(v)) });
 }
 

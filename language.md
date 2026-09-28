@@ -988,6 +988,8 @@ At a use site the innermost binding wins: loop var > LET/PARAM.
   null. `CAST(json_get(doc, 'n') AS INT)` for a typed value.
 - `TRY_CAST(x AS T)` — CAST that yields null instead of failing on a bad
   value; the workhorse for dirty inputs. Never pushed down.
+- `CAST(x AS TIME)` takes `'HH:MM:SS[.ffffff]'` or `'HH:MM'` text, or a
+  timestamp (its time of day).
 - `DATE_TRUNC('minute', ts)` and `EXTRACT(minute FROM ts)` — units `year`,
   `month`, `day`, `hour`, `minute`, `second`. `EXTRACT` also accepts the
   ordinary two-argument call form. `STRLEN` is an alias for `LENGTH`.
@@ -1166,7 +1168,7 @@ For an editor: `basalt check --format json` prints its diagnostics as a JSON
 array on stdout — `[]` when the script checks out, else one object per error in
 the shape above without `ts`/`event` — and still exits `1` on an error.
 `basalt complete --pos N` prints what Tab would offer at byte offset `N` (the
-end, without `--pos`): `{"start":S,"end":N,"items":[{"text":…,"kind":…}]}`, the
+end, without `--pos`; `--utf16` counts `N` and the answer in UTF-16 units): `{"start":S,"end":N,"items":[{"text":…,"kind":…}]}`, the
 items replacing `script[S..N]`, with `kind` one of `keyword`, `function`,
 `param`, `cte`, `connection`, `table`, `column`, `path`. It completes against
 the script's own declarations, so a script half typed still has its names;
@@ -1309,8 +1311,11 @@ keeps one for a person. Each script it runs sees every `CREATE CONNECTION`,
 declared: they are kept as text and replayed ahead of the next script, so a
 script behaves exactly as it would in one file below them all, and re-declaring
 a name replaces it. A `WITH` belongs to its query and is not kept — two scripts
-may reuse a CTE name. A query `LET` (`LET x = (SELECT ...)`) re-runs its query
-in each later script, since only its text is kept.
+may reuse a CTE name. A `LET` keeps the value it was given in the script that
+declares it (even one that only declares): `LET t = now()` is one instant for
+every later script, and `LET n = (SELECT count(*) ...)` is not queried again,
+however its source changes. Declare it again to recompute it. The REPL keeps
+`LET`s the same way.
 
 Requests are NDJSON on stdin, one object per line:
 
@@ -1326,7 +1331,9 @@ Requests are NDJSON on stdin, one object per line:
 declarations as well as the script's own; its status carries
 `complete: {start, end, items}`. Connections are asked for their tables and
 columns once per session and remembered, as the REPL does (`"connect": false`
-keeps it offline); `reset` forgets that too. `pos` is a byte offset.
+keeps it offline); `reset` forgets that too. `pos` is a byte offset, or — with
+`"utf16": true` — a UTF-16 offset, the unit a JavaScript editor counts in, and
+the answer's `start`/`end` then count the same way.
 `params` binds the script's `PARAM`s for that script only, as `-p` does for a
 run; `format` overrides `--format` (default `arrow`) and `max_rows` overrides
 `--max-rows` for that script. A `cancel`

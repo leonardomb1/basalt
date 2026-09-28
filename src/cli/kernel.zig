@@ -59,6 +59,9 @@ const Request = struct {
     /// and whether connections may be asked for their tables and columns.
     pos: ?usize = null,
     connect: bool = true,
+    /// `pos`, and the `start`/`end` of the answer, count UTF-16 units — what a
+    /// JavaScript editor's offsets are — rather than bytes.
+    utf16: bool = false,
 };
 
 /// Requests the stdin thread hands to the main loop. `cancel` never queues: it
@@ -267,7 +270,7 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
 /// by the status, which carries `complete: {start, end, items}`.
 fn completeScript(gpa: std.mem.Allocator, a: std.mem.Allocator, out: *Out, decls: *const cli.DeclStore, catalog: *cli.Catalog, req: Request) !void {
     const script = req.script orelse "";
-    const at = req.pos orelse script.len;
+    const at = if (req.pos) |p| (if (req.utf16) cli.utf16ToByte(script, p) else p) else script.len;
     if (at > script.len)
         return reply(a, out, req.id, .{ .ok = false, .@"error" = .{ .msg = "`pos` is past the end of `script`" } });
     var scope = cli.DeclStore.init(gpa);
@@ -277,7 +280,7 @@ fn completeScript(gpa: std.mem.Allocator, a: std.mem.Allocator, out: *Out, decls
     const cx = cli.Completer{ .gpa = gpa, .decls = &scope, .catalog = catalog, .connect = req.connect };
     const offer = try cli.suggestFor(a, &cx, script, at);
     var aw = std.Io.Writer.Allocating.init(a);
-    try cli.writeOffer(&aw.writer, offer, at);
+    try cli.writeOfferIn(&aw.writer, offer, at, script, req.utf16);
     try reply(a, out, req.id, .{ .ok = true, .complete = aw.written() });
 }
 
@@ -434,6 +437,11 @@ fn paramArgs(a: std.mem.Allocator, v: ?std.json.Value) ![]runtime.ParamArg {
     return out.items;
 }
 
+fn declaresLet(pending: []const cli.Pending) bool {
+    for (pending) |p| if (p.id.kind == .let) return true;
+    return false;
+}
+
 /// Copies the capture pipe into `data` frames until the write end closes.
 fn pump(out: *Out, fd: std.posix.fd_t, id: []const u8) void {
     var buf: [64 * 1024]u8 = undefined;
@@ -583,8 +591,30 @@ fn runScript(
     const declared = try a.alloc(Declared, entry.pending.len);
     for (declared, entry.pending) |*d, p| d.* = .{ .kind = @tagName(p.id.kind), .name = p.id.name };
 
-    if (entry.executable == 0)
+    if (entry.executable == 0) {
+        // Declarations only — but a LET's value is decided here, in the cell
+        // that declares it, not by whichever later cell first runs.
+        if (declaresLet(entry.pending)) {
+            var freezer = cli.LetFreezer.init(a);
+            var rdiag: runtime.Diag = .{};
+            _ = runtime.run(gpa, entry.prog, .{
+                .params = params,
+                .log = opts.log,
+                .declarations_only = true,
+                .on_let = freezer.hook(),
+            }, &rdiag) catch |e| {
+                if (e == error.OutOfMemory) return error.OutOfMemory;
+                var ei = ErrorInfo{
+                    .msg = if (rdiag.msg.len > 0) try a.dupe(u8, rdiag.msg) else runtime.errLabel(e),
+                    .transient = rdiag.retryable or runtime.isTransient(e),
+                };
+                locate(&ei, entry.text, entry.entry_at, "", rdiag.pos, rdiag.end);
+                return reply(a, out, req.id, .{ .ok = false, .elapsed_ms = @intCast(std.time.milliTimestamp() - t0), .declared = declared, .@"error" = ei });
+            };
+            try freezer.commit(decls);
+        }
         return reply(a, out, req.id, .{ .ok = true, .elapsed_ms = @intCast(std.time.milliTimestamp() - t0), .declared = declared });
+    }
 
     // Capture fd 1 for the script's lifetime: every sink that writes stdout
     // lands in the pipe, and the pump turns it into frames as it arrives.
@@ -593,6 +623,11 @@ fn runScript(
         std.posix.dup2(std.posix.STDERR_FILENO, std.posix.STDOUT_FILENO) catch {};
         return e;
     };
+
+    // LET values this script decides replace their expressions in the session,
+    // whether or not the rest of it succeeds: they were decided either way
+    var freezer = cli.LetFreezer.init(a);
+    defer freezer.commit(decls) catch {};
 
     runtime.resetAbort();
     q.setRunning(id);
@@ -630,6 +665,7 @@ fn runScript(
             .on_result = cap.hook(),
             .progress_hook = .{ .ctx = &cap, .f = Capture.onProgress },
             .max_rows = req.max_rows orelse opts.max_rows,
+            .on_let = freezer.hook(),
         }, &rdiag) catch |e| {
             failed = e;
         };

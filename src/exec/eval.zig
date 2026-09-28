@@ -2509,6 +2509,13 @@ pub fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalE
             .string => |str| .{ .timestamp = parseIsoTimestamp(str) orelse return error.CastFailed },
             else => error.CastFailed,
         },
+        .time => switch (v) {
+            .time => v,
+            // the time of day a timestamp falls at
+            .timestamp => |x| .{ .time = @mod(x, 86_400_000_000) },
+            .string => |str| .{ .time = parseIsoTime(str) orelse return error.CastFailed },
+            else => error.CastFailed,
+        },
         .string => .{ .string = try valueToString(arena, v) },
         .bool => switch (v) {
             .bool => v,
@@ -2885,6 +2892,23 @@ pub fn parseIsoDate(s0: []const u8) ?i64 {
 }
 
 /// Parse `YYYY-MM-DD[ HH:MM:SS]` into microseconds since the epoch.
+/// `HH:MM:SS[.ffffff]` (or `HH:MM`) as microseconds since midnight — the text a
+/// `time` value prints as, so a cast back is exact.
+pub fn parseIsoTime(s0: []const u8) ?i64 {
+    const s = trim(s0);
+    if (s.len == 5 and s[2] == ':') {
+        const hh = isoNum(s[0..2]) orelse return null;
+        const mm = isoNum(s[3..5]) orelse return null;
+        if (hh > 23 or mm > 59) return null;
+        return (hh * 3600 + mm * 60) * 1_000_000;
+    }
+    // reuse the timestamp parser's clock and fraction rules on a fixed date
+    if (s.len < 8 or s.len > 8 + 7) return null;
+    var buf: [32]u8 = undefined;
+    const ts = std.fmt.bufPrint(&buf, "1970-01-01 {s}", .{s}) catch return null;
+    return parseIsoTimestamp(ts);
+}
+
 pub fn parseIsoTimestamp(s0: []const u8) ?i64 {
     const s = trim(s0);
     if (s.len == 10) return (parseIsoDate(s) orelse return null) * 86_400_000_000;
@@ -2922,6 +2946,15 @@ pub fn civilFromDays(z0: i64) struct { y: i64, m: u32, d: u32 } {
     const d: u32 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
     const m: u32 = @intCast(if (mp < 10) mp + 3 else mp - 9);
     return .{ .y = y + (if (m <= 2) @as(i64, 1) else 0), .m = m, .d = d };
+}
+
+test "parseIsoTime: the text a time prints as, and nothing out of range" {
+    try std.testing.expectEqual(@as(?i64, 3_723_000_000), parseIsoTime("01:02:03"));
+    try std.testing.expectEqual(@as(?i64, 86_399_999_999), parseIsoTime("23:59:59.999999"));
+    try std.testing.expectEqual(@as(?i64, 45_000_000_000), parseIsoTime(" 12:30 "));
+    try std.testing.expectEqual(@as(?i64, null), parseIsoTime("24:00:00"));
+    try std.testing.expectEqual(@as(?i64, null), parseIsoTime("1:02:03"));
+    try std.testing.expectEqual(@as(?i64, null), parseIsoTime("01:02:03 extra"));
 }
 
 test "format temporal values for text sinks" {

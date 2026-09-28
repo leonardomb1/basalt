@@ -7,6 +7,7 @@ Prints PASS/FAIL lines; exits non-zero on any failure. Standard library only.
 import json
 import os
 import signal
+import tempfile
 import subprocess
 import sys
 import time
@@ -226,6 +227,26 @@ def main(binary):
     _, st = k.reply()
     names = [(i["text"], i["kind"]) for i in (st.get("complete") or {}).get("items", [])]
     report("complete offers a function an earlier script declared", ("dbl", "function") in names, st)
+
+    # A LET keeps the value the declaring cell decided: later cells never
+    # recompute now() nor re-run the query, even after its source changes.
+    lf = os.path.join(tempfile.mkdtemp(), "let.csv")
+    with open(lf, "w") as f:
+        f.write("v\n1\n2\n")
+    k.run("LET born = now();\nLET cnt = (SELECT COUNT(*) FROM '%s');" % lf)
+    time.sleep(1.1)
+    with open(lf, "w") as f:
+        f.write("v\n1\n2\n3\n4\n")
+    data, st = k.run("SELECT $cnt AS cnt, date_diff('second', CAST($born AS TIMESTAMP), now()) AS age;")
+    os.remove(lf)
+    r = rows(data)
+    report("a LET's value is decided once, in the cell that declares it", st["ok"] and r and r[0]["cnt"] == 2 and r[0]["age"] >= 1, (data, st))
+
+    # UTF-16 offsets for a JavaScript editor: an emoji is two units, four bytes.
+    k.send(op="complete", id="u16", script="SELECT '😀' AS x, dbl(1) AS y ORDER BY d", pos=40, utf16=True)
+    _, st = k.reply()
+    c = st.get("complete") or {}
+    report("complete speaks UTF-16 offsets when asked", c.get("start") == 39 and c.get("end") == 40 and any(i["text"] == "dbl" for i in c.get("items", [])), st)
 
     # Reset forgets every declaration.
     k.send(op="reset", id="r")

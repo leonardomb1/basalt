@@ -191,6 +191,20 @@ pub const RunOptions = struct {
     /// rows — a SELECT included, since a notebook shows one filling. Takes the
     /// place of `progress`'s terminal line.
     progress_hook: ?obs.Progress.EventHook = null,
+    /// Told each top-level `LET`'s value as it is decided — folded before the
+    /// statements run, or queried where a query LET stands. A session keeps the
+    /// value rather than the expression, so a later script sees what this one
+    /// saw instead of recomputing `now()` or re-running the query. The value
+    /// lives only for the call.
+    on_let: ?LetHook = null,
+    /// Run a script with no output pipeline — only declarations — for its
+    /// `LET`s: a session decides their values in the entry that declares them.
+    declarations_only: bool = false,
+};
+
+pub const LetHook = struct {
+    ctx: *anyopaque,
+    f: *const fn (ctx: *anyopaque, name: []const u8, value: Value) void,
 };
 
 /// A stdout result, finished. `truncated`: a row cap cut it short.
@@ -312,6 +326,7 @@ pub const Env = struct {
     scan: ?*driver.ScanTally = null,
     on_result: ?ResultHook = null,
     max_rows: ?u64 = null,
+    on_let: ?LetHook = null,
 
     /// The next stdout result's description, claiming its ordinal.
     pub fn takeResult(self: *Env) arrow.ResultInfo {
