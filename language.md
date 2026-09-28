@@ -1395,9 +1395,9 @@ order they finish — what the CLI's ` + target` and ` x target` lines say:
 
 `load` numbers the loads in the order they finished; `line`/`col` are where
 the `LOAD` stands, as for a result. `target` is the path or `conn.table` as the
-script spelled it, `IDENTIFIER()` and `${...}` rendered. `rows_read` is left out
-when loads ran side by side in a parallel `FOR EACH`, since they share one
-count. A load that fails — before writing a row, too — still reports, with
+script spelled it, `IDENTIFIER()` and `${...}` rendered. `rows_read` is the
+load's own, loads running side by side in a parallel `FOR EACH` included.
+A load that fails — before writing a row, too — still reports, with
 `reason` and `transient`. Inside a `FOR EACH`, each row's load carries
 `loop_row` and `loop_rows` (its row, 1-based, of its own loop) and the
 outermost loop's `loop_done`/`loop_total`; a row that fails under `ON ERROR

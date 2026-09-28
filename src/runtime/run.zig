@@ -167,7 +167,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var logger = obs.Logger.init(run_id, opts.log.format, if (opts.log.quiet) .err else opts.log.level);
     logger.quiet = opts.log.quiet;
     const t0 = std.time.milliTimestamp();
-    var rows_read = std.atomic.Value(u64).init(0);
+    var rows_read = obs.RowCounter.init(0);
 
     var errctx = op.ErrCtx{};
     errdefer if (errctx.msg.len > 0) {
@@ -451,7 +451,7 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
         lanes_used.* = @max(lanes0, lanes);
         if (is_load and !delegated) noteLoad(env, out.pos, load_err, .{
             .rows = stats.rows_out - load_rows0,
-            .rows_read = if (env.rows_shared) null else env.rows_read.load(.monotonic) - read0,
+            .rows_read = env.rows_read.load(.monotonic) - read0,
             .elapsed_ms = @intCast(std.time.milliTimestamp() - load_t0),
             .lanes = lanes,
         });
@@ -1031,7 +1031,7 @@ fn manyLoads(stmts: []const ast.Stmt) bool {
     return n > 1;
 }
 
-const LoadFacts = struct { rows: u64, rows_read: ?u64, elapsed_ms: u64, lanes: usize };
+const LoadFacts = struct { rows: u64, rows_read: u64, elapsed_ms: u64, lanes: usize };
 
 /// Count a finished `LOAD`, report it when the run is showing item lines, and
 /// hand it to the caller's `on_load`.

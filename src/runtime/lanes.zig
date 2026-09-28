@@ -446,7 +446,7 @@ const AggCtx = struct {
     aggs: []const op.Aggregate.Agg,
     queue: WorkQueue,
     slots: []AggSlot,
-    rows_read: *std.atomic.Value(u64),
+    rows_read: *obs.RowCounter,
     /// The join-then-aggregate shape, exactly as `PqAggCtx.joins`.
     joins: []const LaneJoin = &.{},
 };
@@ -521,7 +521,7 @@ const PqAggCtx = struct {
     by: []const usize,
     aggs: []const op.Aggregate.Agg,
     lanes: []PqLane,
-    rows_read: *std.atomic.Value(u64),
+    rows_read: *obs.RowCounter,
     /// The join-then-aggregate shape: one shared build index per join, in application
     /// order, plus the post-join stages each lane rebuilds over them. Empty is the
     /// plain aggregate.
@@ -973,7 +973,7 @@ const MapCtx = struct {
     sink_mode: parallel.SinkMode,
     sink_mtx: std.Thread.Mutex = .{},
     rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    rows_read: *std.atomic.Value(u64),
+    rows_read: *obs.RowCounter,
     /// Set when the pipeline carries one hash join: each lane probes the shared
     /// index with its own `op.Join` and runs the post-join stages itself.
     join: ?LaneJoin = null,
@@ -1475,7 +1475,7 @@ const SqlAggCtx = struct {
     aggs: []const op.Aggregate.Agg,
     queue: WorkQueue,
     slots: []AggSlot,
-    rows_read: *std.atomic.Value(u64),
+    rows_read: *obs.RowCounter,
 };
 
 const sqlAggWorker = dispatchWorker(SqlAggCtx, sqlAggWorkOne);
@@ -1744,7 +1744,7 @@ const SqlMapJoinCtx = struct {
     sink_mode: parallel.SinkMode,
     sink_mtx: std.Thread.Mutex = .{},
     rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    rows_read: *std.atomic.Value(u64),
+    rows_read: *obs.RowCounter,
 };
 
 /// A lane's probe source: one key-range query at a time, rolling to the next split
@@ -1943,7 +1943,7 @@ const TopNCtx = struct {
     queue: WorkQueue,
     builders: []column.Builder,
     mtx: std.Thread.Mutex = .{},
-    rows_read: *std.atomic.Value(u64),
+    rows_read: *obs.RowCounter,
 };
 
 const topnWorker = dispatchWorker(TopNCtx, topnWorkOne);
@@ -2178,7 +2178,7 @@ const DistinctCtx = struct {
     key_idx: []const usize,
     queue: WorkQueue,
     merge: *DistinctMerge,
-    rows_read: *std.atomic.Value(u64),
+    rows_read: *obs.RowCounter,
 };
 
 const distinctWorker = dispatchWorker(DistinctCtx, distinctWorkOne);

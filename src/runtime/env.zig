@@ -222,9 +222,9 @@ pub const LoadDone = struct {
     /// Where the `LOAD` stands, in the script as the caller counts lines.
     line: u32 = 0,
     col: u32 = 0,
-    /// Rows its sources gave it; null when loads ran side by side (a parallel
-    /// `FOR EACH`) and share one count, so no single load's share is known.
-    rows_read: ?u64 = null,
+    /// Rows its sources gave it — its own, even beside the other loads of a
+    /// parallel `FOR EACH`.
+    rows_read: u64 = 0,
     rows_written: u64 = 0,
     elapsed_ms: u64 = 0,
     lanes: usize = 1,
@@ -305,15 +305,14 @@ pub const Env = struct {
     /// The `FOR EACH` row running now (1-based) and its loop's size; 0 outside one.
     loop_row: usize = 0,
     loop_rows: usize = 0,
-    /// Loads are running side by side on this run's shared row counter, so a
-    /// load's own rows read cannot be told apart.
-    rows_shared: bool = false,
+
     /// Param name → literal expr, for substitution in stage expressions.
     params_expr: *std.StringHashMap(*const ast.Expr),
     /// Runtime expression-error context (which stage/column failed).
     errctx: *op.ErrCtx,
-    /// Emitted-row counter shared by every source (via `obs.CountingSource`).
-    rows_read: *std.atomic.Value(u64),
+    /// Emitted-row counter shared by every source (via `obs.CountingSource`):
+    /// the run's, or a parallel `FOR EACH` worker's own, chained to the run's.
+    rows_read: *obs.RowCounter,
     /// Parsed JSON params (the request body), navigated by `for x in p.path`.
     /// Scalar `p.a.b` path access is substituted at plan time (expand.zig).
     json_params: *std.StringHashMap(std.json.Value),

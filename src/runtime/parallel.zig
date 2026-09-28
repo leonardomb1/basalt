@@ -12,6 +12,7 @@
 //! too — N concurrent stream-load streams / INSERT connections.
 
 const std = @import("std");
+const obs = @import("obs.zig");
 const driver = @import("../connect/driver.zig");
 const op = @import("../exec/op.zig");
 const Batch = @import("../exec/batch.zig").Batch;
@@ -148,7 +149,7 @@ const Shared = struct {
     predicates: []const []const u8,
     stages: []const op.Stage,
     sink_mode: SinkMode,
-    rows_read: *std.atomic.Value(u64),
+    rows_read: *obs.RowCounter,
 
     sink_mtx: std.Thread.Mutex = .{},
     next_split: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -241,7 +242,7 @@ pub fn run(
     stages: []const op.Stage,
     sink_mode: SinkMode,
     nthreads: usize,
-    rows_read: *std.atomic.Value(u64),
+    rows_read: *obs.RowCounter,
 ) !usize {
     var sh = Shared{
         .gpa = gpa,
@@ -458,7 +459,7 @@ test "writeLaneBatch: shared routes to the shared sink, per_lane to the lane's o
 
 test "run: work-steals uneven splits across fewer lanes than splits (shared sink)" {
     var snk = CountSink{};
-    var rows_read = std.atomic.Value(u64).init(0);
+    var rows_read = obs.RowCounter.init(0);
     var dummy: u8 = 0;
     const preds = [_][]const u8{ "5", "3", "4", "1" };
     const n = try run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .shared = snk.sink() }, 2, &rows_read);
@@ -472,14 +473,14 @@ test "run: lane count clamps to the split count; zero threads still runs one lan
     var dummy: u8 = 0;
     {
         var snk = CountSink{};
-        var rows_read = std.atomic.Value(u64).init(0);
+        var rows_read = obs.RowCounter.init(0);
         const preds = [_][]const u8{"2"};
         try testing.expectEqual(@as(usize, 2), try run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .shared = snk.sink() }, 8, &rows_read));
         try testing.expectEqual(@as(usize, 2), snk.rows);
     }
     {
         var snk = CountSink{};
-        var rows_read = std.atomic.Value(u64).init(0);
+        var rows_read = obs.RowCounter.init(0);
         const preds = [_][]const u8{ "3", "2" };
         try testing.expectEqual(@as(usize, 5), try run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .shared = snk.sink() }, 0, &rows_read));
         try testing.expectEqual(@as(usize, 5), snk.rows);
@@ -488,7 +489,7 @@ test "run: lane count clamps to the split count; zero threads still runs one lan
 
 test "run: a lane's open or read failure is the run's error" {
     var dummy: u8 = 0;
-    var rows_read = std.atomic.Value(u64).init(0);
+    var rows_read = obs.RowCounter.init(0);
     {
         var snk = CountSink{};
         const preds = [_][]const u8{"fail-open"};
@@ -503,7 +504,7 @@ test "run: a lane's open or read failure is the run's error" {
 
 test "run: per_lane sinks are opened by lanes and committed (closed) on success" {
     var totals = LaneSink.Totals{};
-    var rows_read = std.atomic.Value(u64).init(0);
+    var rows_read = obs.RowCounter.init(0);
     var dummy: u8 = 0;
     const preds = [_][]const u8{ "4", "2", "5" };
     const n = try run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .per_lane = .{ .open = testOpenLaneSink, .ctx = &totals } }, 2, &rows_read);

@@ -177,7 +177,7 @@ pub const Logger = struct {
 /// is drawn for the first `quiet_ms`, so a short run never flickers.
 pub const Progress = struct {
     logger: *Logger,
-    rows: *std.atomic.Value(u64),
+    rows: *RowCounter,
     thread: ?std.Thread = null,
     /// Set to stop: the ticker waits on it between frames, so `stop` returns at
     /// once instead of after the sleep it was in — which put 100 ms on every run.
@@ -457,6 +457,28 @@ fn writeRate(w: anytype, r: u64) !void {
     return writeThousands(w, r);
 }
 
+/// Rows read, counted up a chain: a counter of its own for each worker of a
+/// parallel `FOR EACH`, whose `up` is the run's. One `fetchAdd` credits every
+/// link, so the run total and the live line see all rows while each worker's
+/// load still knows its own. The atomic's method names, so a site that took a
+/// bare counter takes this one unchanged.
+pub const RowCounter = struct {
+    n: std.atomic.Value(u64) = .init(0),
+    up: ?*RowCounter = null,
+
+    pub fn init(v: u64) RowCounter {
+        return .{ .n = .init(v) };
+    }
+    pub fn fetchAdd(self: *RowCounter, k: u64, comptime order: std.builtin.AtomicOrder) u64 {
+        var c = self.up;
+        while (c) |x| : (c = x.up) _ = x.n.fetchAdd(k, order);
+        return self.n.fetchAdd(k, order);
+    }
+    pub fn load(self: *const RowCounter, comptime order: std.builtin.AtomicOrder) u64 {
+        return self.n.load(order);
+    }
+};
+
 /// How many `LOAD`s a run finished and how many failed. Shared by pointer, so the
 /// workers of a parallel `FOR EACH` count into the same two numbers.
 pub const LoadTally = struct {
@@ -616,7 +638,7 @@ pub const Summary = struct {
 /// pipeline gets a "rows read" figure with no per-operator instrumentation.
 pub const CountingSource = struct {
     inner: driver.Source,
-    count: *std.atomic.Value(u64),
+    count: *RowCounter,
 
     pub fn source(self: *CountingSource) driver.Source {
         return .{ .ptr = self, .vtable = &vtable };
@@ -836,7 +858,7 @@ const FakeSource = struct {
 };
 
 test "CountingSource accumulates emitted rows across batches and forwards EOF" {
-    var cnt = std.atomic.Value(u64).init(0);
+    var cnt = RowCounter.init(0);
     var fake = FakeSource{ .batches = &.{ 2, 3 } };
     var cs = CountingSource{ .inner = fake.source(), .count = &cnt };
     const src = cs.source();

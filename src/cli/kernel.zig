@@ -472,14 +472,12 @@ const Loads = struct { list: []const runtime.LoadDone, summary: obs.Summary };
 
 /// One load's fields, without braces: the `load` frame carries them after its
 /// `type`/`id`, and the status's `loads` lists each as an object. Fields a load has no value for are left
-/// out: `rows_read` when loads ran side by side, `reason`/`transient` on
-/// success, the loop's when not in one.
+/// out: `reason`/`transient` on success, the loop's when not in one.
 fn writeLoadFields(w: *std.Io.Writer, l: runtime.LoadDone) !void {
     try w.print("\"load\":{d},\"target\":", .{l.ordinal});
     try std.json.Stringify.encodeJsonString(l.target, .{}, w);
     try w.print(",\"line\":{d},\"col\":{d}", .{ l.line, l.col });
-    if (l.rows_read) |r| try w.print(",\"rows_read\":{d}", .{r});
-    try w.print(",\"rows_written\":{d},\"elapsed_ms\":{d},\"lanes\":{d},\"ok\":{}", .{ l.rows_written, l.elapsed_ms, l.lanes, l.ok });
+    try w.print(",\"rows_read\":{d},\"rows_written\":{d},\"elapsed_ms\":{d},\"lanes\":{d},\"ok\":{}", .{ l.rows_read, l.rows_written, l.elapsed_ms, l.lanes, l.ok });
     if (!l.ok) {
         try w.writeAll(",\"reason\":");
         try std.json.Stringify.encodeJsonString(l.reason, .{}, w);

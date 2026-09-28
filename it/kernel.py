@@ -277,8 +277,8 @@ def main(binary):
     kj = Kernel(binary, "-j", "3")
     _, st = kj.run(f"FOR EACH ROW OF ('{ld}/names.csv') AS (n) PARALLEL ON ERROR CONTINUE\n"
                    f"  LOAD INTO IDENTIFIER('{ld}/' || $n || '/x.csv') AS SELECT range AS v FROM RANGE(4);\nEND FOR;")
-    report("loads side by side leave rows_read out, having no share of their own",
-           len(kj.loads) == 3 and all("rows_read" not in f for f in kj.loads) and st.get("rows_read") == 8, (kj.loads, st))
+    report("loads side by side each count their own rows read",
+           len(kj.loads) == 3 and all(f["rows_read"] == (4 if f["ok"] else 0) for f in kj.loads) and st.get("rows_read") == 8, (kj.loads, st))
     kj.close()
     _, st = k.run("SELECT 1 AS x;")
     report("a run without loads says so", st.get("loads") == [] and st.get("loads_ok") == 0 and not k.loads, st)

@@ -6,6 +6,7 @@ const parser = @import("../lang/sql_parser.zig");
 const ast = @import("../lang/ast.zig");
 const expand = @import("../lang/expand.zig");
 const types = @import("../lang/types.zig");
+const obs = @import("obs.zig");
 const op = @import("../exec/op.zig");
 
 const column = @import("../exec/column.zig");
@@ -417,8 +418,6 @@ const ForCtx = struct {
     first_err_buf: [640]u8 = undefined,
     first_err_len: usize = 0,
     first_retryable: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// More than one worker: their loads share the run's row counter.
-    side_by_side: bool = false,
 };
 
 /// `item` is the retry identity recorded in the outcome sink (the first cell);
@@ -468,7 +467,10 @@ fn forWorker(ctx: *ForCtx, _: usize) void {
         w_env.errctx = &w_errctx;
         w_env.loop_row = i + 1;
         w_env.loop_rows = ctx.rows.len;
-        if (ctx.side_by_side) w_env.rows_shared = true;
+        // This row's own count of rows read, chained to the run's: workers read
+        // side by side, and each load reports only what it read itself.
+        var w_rows = obs.RowCounter{ .up = ctx.base.rows_read };
+        w_env.rows_read = &w_rows;
         // The bindings map is a pointer in the copy; a body's per-row `WITH` would
         // otherwise be written by every worker at once, so each gets its own.
         var w_bindings = ctx.base.bindings.cloneWithAllocator(w_arena.allocator()) catch {
@@ -715,7 +717,7 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
             var wopts = opts;
             wopts.threads = 1;
             const nworkers = @min(@max(opts.threads, @as(usize, 1)), rows.len);
-            var ctx = ForCtx{ .fe = fe, .needles = needles, .rows = rows, .base = env, .body = run_body, .worker_opts = wopts, .on_error = on_error, .outcomes = opts.outcomes, .outer = outer, .counted = counted, .side_by_side = nworkers > 1 };
+            var ctx = ForCtx{ .fe = fe, .needles = needles, .rows = rows, .base = env, .body = run_body, .worker_opts = wopts, .on_error = on_error, .outcomes = opts.outcomes, .outer = outer, .counted = counted };
             const lanes = try parallel.spawnJoin(env.arena, nworkers, forWorker, &ctx);
             if (aborting()) return error.Aborted;
             stats.rows_out += ctx.rows_out.load(.monotonic);

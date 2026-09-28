@@ -3497,7 +3497,7 @@ test "on_load: every LOAD reports as it finishes — written, failed before writ
         try std.testing.expect(ok.ok);
         try std.testing.expectEqual(@as(u64, 0), ok.ordinal);
         try std.testing.expectEqual(@as(u64, 5), ok.rows_written);
-        try std.testing.expectEqual(@as(?u64, 5), ok.rows_read);
+        try std.testing.expectEqual(@as(u64, 5), ok.rows_read);
         try std.testing.expectEqual(@as(u32, 1), ok.line);
         const bad = log.list.items[1];
         try std.testing.expect(!bad.ok);
@@ -3528,5 +3528,38 @@ test "on_load: every LOAD reports as it finishes — written, failed before writ
             try std.testing.expectEqual(@as(usize, 2), l.loop_rows);
             try std.testing.expect(std.mem.endsWith(u8, l.target, if (k == 1) "out_a.csv" else "out_b.csv"));
         }
+    }
+
+    // side by side, each load still counts only its own rows read: row n reads
+    // n thousand rows, so a shared count would give each the others' too
+    {
+        try tmp.dir.writeFile(.{ .sub_path = "sizes.csv", .data = "n\n1\n2\n3\n4\n5\n6\n" });
+        for (1..7) |n| {
+            var body = std.array_list.Managed(u8).init(a);
+            try body.appendSlice("v\n");
+            for (0..n * 1000) |v| try body.writer().print("{d}\n", .{v});
+            try tmp.dir.writeFile(.{ .sub_path = try std.fmt.allocPrint(a, "in_{d}.csv", .{n}), .data = body.items });
+        }
+        var log = LoadLog{ .arena = a, .list = .init(a) };
+        const src = try std.fmt.allocPrint(a,
+            \\FOR EACH ROW OF ('{s}/sizes.csv') AS (n:INT) PARALLEL
+            \\  LOAD INTO IDENTIFIER('{s}/par_' || $n || '.csv') AS SELECT v FROM IDENTIFIER('{s}/in_' || $n || '.csv');
+            \\END FOR;
+        , .{ base, base, base });
+        const prog = try parser.parseSource(a, src, &pdiag);
+        var summary: @import("obs.zig").Summary = .{ .run_id = 0 };
+        var rdiag: Diag = .{};
+        _ = run(alloc, prog, .{ .threads = 4, .on_load = .{ .ctx = &log, .f = LoadLog.f }, .summary_out = &summary }, &rdiag) catch |e| {
+            std.debug.print("parallel on_load run: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+            return e;
+        };
+        try std.testing.expectEqual(@as(usize, 6), log.list.items.len);
+        for (log.list.items) |l| {
+            try std.testing.expect(l.ok);
+            try std.testing.expectEqual(@as(u64, l.loop_row * 1000), l.rows_read);
+            try std.testing.expectEqual(l.rows_read, l.rows_written);
+        }
+        // and the run's total still sees every row
+        try std.testing.expectEqual(@as(u64, 21_000), summary.rows_read);
     }
 }
