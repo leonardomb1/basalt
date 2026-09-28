@@ -904,6 +904,10 @@ if runs stdout; then
     fi
   fi
 
+  # --max-rows: the first N rows of an endless source, at once, then a clean end.
+  got=$(timeout 10 $B run -q --max-rows 3 --format csv -c "SELECT range FROM RANGE(100000000000);" 2>/dev/null | tr '\n' ' ')
+  if [ "$got" = "range 0 1 2 " ]; then report "stdout: --max-rows previews an endless source" ok; else report "stdout: --max-rows previews an endless source (got '$got')" bad; fi
+
   # Under --log-format json an error is one NDJSON object an editor can place:
   # the span of the offending name, on its own line of a multi-line statement.
   $B run --log-format json -c "SELECT id,

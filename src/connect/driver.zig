@@ -25,6 +25,51 @@ pub fn resetAbort() void {
     g_abort.store(false, .seq_cst);
 }
 
+var g_stop = std.atomic.Value(bool).init(false);
+
+/// End the current statement's input early, cleanly: every source reports end
+/// of stream at its next pull, so operators and sinks finish as if the data ran
+/// out. Set by a row cap once its result is known to be cut — only after the
+/// sink holds more rows than it keeps, so a blocking operator (aggregate, sort,
+/// join build) has long since read all it needed for the rows kept.
+pub fn requestStop() void {
+    g_stop.store(true, .seq_cst);
+}
+pub fn stopping() bool {
+    return g_stop.load(.seq_cst);
+}
+pub fn resetStop() void {
+    g_stop.store(false, .seq_cst);
+}
+
+/// `--max-rows`: how many rows a stdout result keeps, and whether it had more.
+pub const RowCap = struct {
+    max: u64,
+    kept: u64 = 0,
+    truncated: bool = false,
+};
+
+test "stop flag: a source reports end of stream while it is set, and only then" {
+    const Endless = struct {
+        fn schemaFn(_: *anyopaque) types.Schema {
+            return .{ .fields = &.{} };
+        }
+        fn nextFn(_: *anyopaque, _: std.mem.Allocator) anyerror!?Batch {
+            return Batch{ .schema = undefined, .columns = &.{}, .len = 1 };
+        }
+        fn closeFn(_: *anyopaque) void {}
+        const vt = Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
+    };
+    var dummy: u8 = 0;
+    const src = Source{ .ptr = &dummy, .vtable = &Endless.vt };
+    defer resetStop();
+    try std.testing.expect((try src.next(std.testing.allocator)) != null);
+    requestStop();
+    try std.testing.expect((try src.next(std.testing.allocator)) == null);
+    resetStop();
+    try std.testing.expect((try src.next(std.testing.allocator)) != null);
+}
+
 test "abort flag: requestAbort sets, resetAbort clears" {
     defer resetAbort(); // never leave the flag set for later tests
     requestAbort();
@@ -102,6 +147,7 @@ pub const Source = struct {
     /// so the sink loop's check alone let a cancelled GROUP BY run to the end.
     pub fn next(self: Source, arena: std.mem.Allocator) anyerror!?Batch {
         if (aborting()) return error.Aborted;
+        if (stopping()) return null;
         return self.vtable.next(self.ptr, arena);
     }
     pub fn close(self: Source) void {

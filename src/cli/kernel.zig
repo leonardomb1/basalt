@@ -9,25 +9,28 @@
 //!
 //! Protocol. Requests are NDJSON on stdin, one object per line:
 //!
-//!   {"op":"run","id":"c1","script":"SELECT 1;","params":{"k":"v"},"format":"arrow"}
+//!   {"op":"run","id":"c1","script":"SELECT 1;","params":{"k":"v"},"format":"arrow","max_rows":5000}
 //!   {"op":"cancel"}             stop the running script; the session survives
 //!   {"op":"reset"}              forget every declaration
 //!   {"op":"close"}              exit (as does EOF on stdin)
 //!
 //! `id` is echoed on every frame the request produces; `params` binds PARAMs for
-//! that script only; `format` overrides `--format` for that script. SIGINT also
-//! cancels the running script rather than killing the process.
+//! that script only; `format` and `max_rows` override `--format` and
+//! `--max-rows` for that script. SIGINT also cancels the running script rather
+//! than killing the process.
 //!
 //! Replies are frames on stdout. Each frame is a JSON header line, and a `data`
 //! header is followed by exactly `len` raw bytes:
 //!
 //!   {"type":"data","id":"c1","len":1234}\n<1234 bytes>
-//!   {"type":"status","id":"c1","ok":true,"elapsed_ms":8,"declared":[...]}\n
+//!   {"type":"result","id":"c1","statement":0,"kind":"select","line":1,"col":1,"rows":3,...}\n
+//!   {"type":"status","id":"c1","ok":true,"elapsed_ms":8,"declared":[...],"results":[...]}\n
 //!
 //! `data` carries whatever the script wrote to stdout — the Arrow IPC streams,
 //! NDJSON or CSV of its results, in order, possibly split over several frames.
-//! Exactly one `status` ends each request; after it, the script wrote nothing
-//! more. A failed script's status carries `error` with the message, the line and
+//! A `result` frame follows each result's last byte, so the data between two of
+//! them is one result. Exactly one `status` ends each request; after it, the
+//! script wrote nothing more. A failed script's status carries `error` with the message, the line and
 //! column in the script as sent (not in the replayed declarations), and whether
 //! it is `transient`. Logs and `PRINT` stay on stderr.
 
@@ -47,6 +50,7 @@ const Request = struct {
     script: ?[]const u8 = null,
     params: ?std.json.Value = null,
     format: ?[]const u8 = null,
+    max_rows: ?u64 = null,
 };
 
 /// Requests the stdin thread hands to the main loop. `cancel` never queues: it
@@ -147,6 +151,7 @@ fn onInterrupt(_: i32) callconv(.c) void {
 
 const Opts = struct {
     format: runtime.StdoutFormat = .arrow,
+    max_rows: ?u64 = null,
     threads: usize = 1,
     log: runtime.LogConfig = .{},
 };
@@ -170,6 +175,10 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             if (i >= args.len) return usageErr(stderr, "missing value after `--format`");
             opts.format = std.meta.stringToEnum(runtime.StdoutFormat, args[i]) orelse
                 return usageErr(stderr, "--format must be table|json|csv|tsv|arrow");
+        } else if (std.mem.eql(u8, a, "--max-rows")) {
+            i += 1;
+            if (i >= args.len) return usageErr(stderr, "missing value after `--max-rows`");
+            opts.max_rows = std.fmt.parseInt(u64, args[i], 10) catch return usageErr(stderr, "invalid --max-rows");
         } else if (std.mem.eql(u8, a, "-j") or std.mem.eql(u8, a, "--threads")) {
             i += 1;
             if (i >= args.len) return usageErr(stderr, "missing value after `--threads`");
@@ -309,12 +318,17 @@ const Status = struct {
     @"error": ?ErrorInfo = null,
 };
 
+fn anyTruncated(results: ?[]const ResultFrame) bool {
+    for (results orelse return false) |r| if (r.truncated) return true;
+    return false;
+}
+
 fn reply(a: std.mem.Allocator, out: *Out, id: ?[]const u8, st: Status) !void {
     var aw = std.Io.Writer.Allocating.init(a);
     const w = &aw.writer;
     try w.writeAll("{\"type\":\"status\",\"id\":");
     if (id) |s| try std.json.Stringify.encodeJsonString(clip(s), .{}, w) else try w.writeAll("null");
-    try w.print(",\"ok\":{},\"cancelled\":{}", .{ st.ok, st.cancelled });
+    try w.print(",\"ok\":{},\"cancelled\":{},\"truncated\":{}", .{ st.ok, st.cancelled, anyTruncated(st.results) });
     if (st.elapsed_ms) |ms| try w.print(",\"elapsed_ms\":{d}", .{ms});
     if (st.declared) |d| {
         try w.writeAll(",\"declared\":");
@@ -397,6 +411,7 @@ const ResultFrame = struct {
     col: u32,
     rows: u64,
     elapsed_ms: u64,
+    truncated: bool,
 };
 
 /// fd 1 routed into a pipe whose pump frames it. A result's close swaps in a
@@ -449,6 +464,7 @@ const Capture = struct {
             .col = done.info.col,
             .rows = done.rows,
             .elapsed_ms = @intCast(@max(0, std.time.milliTimestamp() - done.info.t0_ms)),
+            .truncated = done.truncated,
         };
         self.results.append(r) catch {};
         if (self.broken) return;
@@ -463,7 +479,7 @@ const Capture = struct {
         var w = std.Io.Writer.fixed(&hbuf);
         w.writeAll("{\"type\":\"result\",\"id\":") catch return;
         std.json.Stringify.encodeJsonString(clip(self.id), .{}, &w) catch return;
-        w.print(",\"statement\":{d},\"kind\":\"{s}\",\"line\":{d},\"col\":{d},\"rows\":{d},\"elapsed_ms\":{d}}}\n", .{ r.statement, r.kind, r.line, r.col, r.rows, r.elapsed_ms }) catch return;
+        w.print(",\"statement\":{d},\"kind\":\"{s}\",\"line\":{d},\"col\":{d},\"rows\":{d},\"elapsed_ms\":{d},\"truncated\":{}}}\n", .{ r.statement, r.kind, r.line, r.col, r.rows, r.elapsed_ms, r.truncated }) catch return;
         self.out.line(w.buffered());
     }
 
@@ -555,6 +571,7 @@ fn runScript(
             // result metadata counts lines in the script as sent
             .line_base = @intCast(std.mem.count(u8, entry.text[0..entry.entry_at], "\n")),
             .on_result = cap.hook(),
+            .max_rows = req.max_rows orelse opts.max_rows,
         }, &rdiag) catch |e| {
             failed = e;
         };

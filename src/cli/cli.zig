@@ -308,6 +308,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var stdout_format: runtime.StdoutFormat = .table;
     var explain = false;
     var no_progress = false;
+    var max_rows: ?u64 = null;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -325,6 +326,12 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
             stdout_format = std.meta.stringToEnum(runtime.StdoutFormat, v) orelse {
                 try stderr.print("error: --format must be table|json|csv|tsv|arrow\n", .{});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, a, "--max-rows")) {
+            const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
+            max_rows = std.fmt.parseInt(u64, v, 10) catch {
+                try stderr.print("error: invalid --max-rows `{s}`\n", .{v});
                 return 2;
             };
         } else if (std.mem.eql(u8, a, "--explain")) {
@@ -401,7 +408,7 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     // A person watching a terminal gets the live line; a pipe, a log file, `-q`
     // and `--log-format json` never do.
     const progress = !no_progress and !log.quiet and std.posix.isatty(std.fs.File.stderr().handle);
-    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze, .stdout_format = stdout_format, .progress = progress, .items = true }, &diag) catch |e| switch (e) {
+    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze, .stdout_format = stdout_format, .progress = progress, .items = true, .max_rows = max_rows }, &diag) catch |e| switch (e) {
         error.Aborted => {
             if (eo.json)
                 try eo.report(.{ .msg = "aborted", .event = "aborted" })
@@ -2077,6 +2084,8 @@ fn usage(w: anytype) !void {
         \\                     so -j 1 is the stable-order choice. A float SUM is
         \\                     reproducible for a given -j but not across values of it —
         \\                     CAST to DECIMAL for a total that never varies.)
+        \\  --max-rows N       a SELECT printed to stdout keeps its first N rows and stops
+        \\                     reading there — a preview of a huge source in milliseconds
         \\  --port N           listen port for HTTP mode
         \\  --format FMT       table|json|csv|tsv|arrow — what a SELECT writes to stdout.
         \\                     table: every row and column, for reading, closed by a

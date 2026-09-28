@@ -116,6 +116,24 @@ def main(binary):
     _, st = k.run("DESCRIBE SELECT 1 AS z;")
     report("the status lists the script's results", [r["kind"] for r in st.get("results", [])] == ["describe"], st)
 
+    # A row cap keeps the first rows, stops reading, and says it cut; an
+    # aggregate under it still counts every input row.
+    data, st = k.run("SELECT range FROM RANGE(100000000000);", max_rows=3)
+    report(
+        "max_rows previews an endless source",
+        st["ok"] and st.get("truncated") is True and rows(data) == [{"range": 0}, {"range": 1}, {"range": 2}]
+        and k.results[0][0]["truncated"] is True,
+        st,
+    )
+    data, st = k.run("SELECT range % 3 AS g, COUNT(*) AS n FROM RANGE(30000) GROUP BY g ORDER BY g;", max_rows=2)
+    report("a capped aggregate still counts every row", rows(data) == [{"g": 0, "n": 10000}, {"g": 1, "n": 10000}], data)
+    data, st = k.run("SELECT range FROM RANGE(3); SELECT range AS r FROM RANGE(2);", max_rows=3)
+    report(
+        "a result that fits is not truncated, and a cut does not leak into the next",
+        st["ok"] and st.get("truncated") is False and len(rows(data)) == 5,
+        (data, st),
+    )
+
     # The same CTE name in two scripts: each sees its own.
     k.run("WITH t AS (SELECT 1 AS x) SELECT x FROM t;")
     data, st = k.run("WITH t AS (SELECT 2 AS x) SELECT x FROM t;")

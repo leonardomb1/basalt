@@ -940,43 +940,72 @@ pub fn guardFileFormat(env: *Env, path: []const u8, explicit: ?analyze.FileForma
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot " ++ verb ++ " `{s}`: {s}", .{ path, why }));
 }
 
-/// A stdout sink that reports its result once closed. Counts rows on the way
-/// through — atomically, since lanes render outside the shared sink's lock.
-const ResultSink = struct {
+/// A stdout result's sink, wrapped for whatever the run asked of it: report the
+/// result once closed (the session kernel), and keep only its first rows
+/// (`--max-rows`). Rows are counted atomically, since lanes render outside a
+/// shared sink's lock. A capped result takes the plain write path so each batch
+/// passes through the cap; its render path would format rows it then drops.
+const StdoutSink = struct {
     inner: driver.Sink,
     gpa: std.mem.Allocator,
     info: arrow.ResultInfo,
-    hook: env_mod.ResultHook,
+    hook: ?env_mod.ResultHook,
+    cap: ?*driver.RowCap,
+    log: *obs.Logger,
     rows: std.atomic.Value(u64) = .init(0),
+    mu: std.Thread.Mutex = .{},
 
-    fn wrap(env: *Env, inner: driver.Sink, info: arrow.ResultInfo, hook: env_mod.ResultHook) !driver.Sink {
-        const self = try env.gpa.create(ResultSink);
-        self.* = .{ .inner = inner, .gpa = env.gpa, .info = info, .hook = hook };
-        return .{ .ptr = self, .vtable = if (inner.canRender()) &vt_render else &vt_plain };
+    fn wrap(env: *Env, inner: driver.Sink, info: arrow.ResultInfo, cap: ?*driver.RowCap) !driver.Sink {
+        const self = try env.gpa.create(StdoutSink);
+        self.* = .{ .inner = inner, .gpa = env.gpa, .info = info, .hook = env.on_result, .cap = cap, .log = env.log };
+        return .{ .ptr = self, .vtable = if (cap == null and inner.canRender()) &vt_render else &vt_plain };
     }
 
-    pub fn writeBatch(self: *ResultSink, arena: std.mem.Allocator, b: Batch) !void {
-        try self.inner.writeBatch(arena, b);
-        _ = self.rows.fetchAdd(b.len, .monotonic);
+    pub fn writeBatch(self: *StdoutSink, arena: std.mem.Allocator, b: Batch) !void {
+        const c = self.cap orelse {
+            try self.inner.writeBatch(arena, b);
+            _ = self.rows.fetchAdd(b.len, .monotonic);
+            return;
+        };
+        // Lanes may share this sink; the cap's arithmetic must see them in turn.
+        self.mu.lock();
+        defer self.mu.unlock();
+        const room = c.max - c.kept;
+        if (b.len > room) {
+            // More rows than the cap keeps: the result is cut, and nothing
+            // upstream needs to run any further.
+            c.truncated = true;
+            driver.requestStop();
+        }
+        const take: usize = @intCast(@min(room, b.len));
+        if (take == 0) return;
+        const part = if (take == b.len) b else try op.sliceBatch(arena, b, 0, take);
+        try self.inner.writeBatch(arena, part);
+        c.kept += take;
+        _ = self.rows.fetchAdd(take, .monotonic);
     }
 
-    pub fn close(self: *ResultSink) !void {
+    pub fn close(self: *StdoutSink) !void {
         defer self.gpa.destroy(self);
+        defer driver.resetStop();
         try self.inner.close();
-        self.hook.call(.{ .info = self.info, .rows = self.rows.load(.monotonic) });
+        const truncated = if (self.cap) |c| c.truncated else false;
+        if (truncated) self.log.log(.warn, "result cut at --max-rows {d}", .{self.cap.?.max});
+        if (self.hook) |h| h.call(.{ .info = self.info, .rows = self.rows.load(.monotonic), .truncated = truncated });
     }
 
-    pub fn abort(self: *ResultSink) void {
+    pub fn abort(self: *StdoutSink) void {
+        driver.resetStop();
         self.inner.abort();
         self.gpa.destroy(self);
     }
 
-    const vt_plain = driver.sinkVTable(ResultSink);
+    const vt_plain = driver.sinkVTable(StdoutSink);
     const vt_render = blk: {
-        var v = driver.sinkVTable(ResultSink);
+        var v = driver.sinkVTable(StdoutSink);
         v.renderBatch = struct {
             fn f(p: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror![]const u8 {
-                const self: *ResultSink = @ptrCast(@alignCast(p));
+                const self: *StdoutSink = @ptrCast(@alignCast(p));
                 const out = try self.inner.renderBatch(arena, b).?;
                 _ = self.rows.fetchAdd(b.len, .monotonic);
                 return out;
@@ -984,7 +1013,7 @@ const ResultSink = struct {
         }.f;
         v.writeRendered = struct {
             fn f(p: *anyopaque, bytes: []const u8) anyerror!void {
-                const self: *ResultSink = @ptrCast(@alignCast(p));
+                const self: *StdoutSink = @ptrCast(@alignCast(p));
                 return self.inner.writeRendered(bytes);
             }
         }.f;
@@ -995,13 +1024,18 @@ const ResultSink = struct {
 pub fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (env.explain) return DiscardSink.sink();
     if (std.mem.eql(u8, w.connector, "stdout")) {
-        const info = env.takeResult();
-        const inner = try openStdoutSink(env, schema, info);
-        if (env.on_result) |h| {
-            errdefer inner.abort();
-            return ResultSink.wrap(env, inner, info, h);
+        var info = env.takeResult();
+        var cap: ?*driver.RowCap = null;
+        if (env.max_rows) |n| {
+            cap = try env.arena.create(driver.RowCap);
+            cap.?.* = .{ .max = n };
+            info.cap = cap;
         }
-        return inner;
+        driver.resetStop();
+        const inner = try openStdoutSink(env, schema, info);
+        if (env.on_result == null and cap == null) return inner;
+        errdefer inner.abort();
+        return StdoutSink.wrap(env, inner, info, cap);
     }
     return openTargetSink(env, w, schema);
 }

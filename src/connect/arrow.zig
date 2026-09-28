@@ -339,6 +339,8 @@ pub const ResultInfo = struct {
     col: u32 = 0,
     /// When the statement started, for the trailer's elapsed time.
     t0_ms: i64 = 0,
+    /// The row cap on this result, read at close for `basalt.truncated`.
+    cap: ?*const driver.RowCap = null,
 };
 
 /// The stdout sink: an Arrow stream over a buffered stdout writer.
@@ -349,11 +351,12 @@ pub const ArrowWriter = struct {
     sw: StreamWriter = undefined,
     rows: u64 = 0,
     t0_ms: i64 = 0,
+    cap: ?*const driver.RowCap = null,
 
     pub fn open(gpa: std.mem.Allocator, schema: types.Schema, info: ResultInfo) !*ArrowWriter {
         const self = try gpa.create(ArrowWriter);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .t0_ms = info.t0_ms };
+        self.* = .{ .gpa = gpa, .t0_ms = info.t0_ms, .cap = info.cap };
         self.fw = std.fs.File.stdout().writerStreaming(&self.buf);
         var nb: [3][16]u8 = undefined;
         const meta = [_]KeyValue{
@@ -375,9 +378,11 @@ pub const ArrowWriter = struct {
         defer self.deinit();
         var nb: [2][24]u8 = undefined;
         const elapsed = @max(0, std.time.milliTimestamp() - self.t0_ms);
+        const truncated = if (self.cap) |c| c.truncated else false;
         const meta = [_]KeyValue{
             .{ .key = "basalt.rows", .value = try std.fmt.bufPrint(&nb[0], "{d}", .{self.rows}) },
             .{ .key = "basalt.elapsed_ms", .value = try std.fmt.bufPrint(&nb[1], "{d}", .{elapsed}) },
+            .{ .key = "basalt.truncated", .value = if (truncated) "true" else "false" },
         };
         try self.sw.writeTrailer(&meta);
         try self.sw.finish();

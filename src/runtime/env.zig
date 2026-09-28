@@ -185,10 +185,12 @@ pub const RunOptions = struct {
     /// a caller multiplexing several results on one stream can mark where each
     /// ends. The session kernel uses it; a plain run leaves it null.
     on_result: ?ResultHook = null,
+    /// `--max-rows`: a terminal SELECT keeps its first N rows and stops reading.
+    max_rows: ?u64 = null,
 };
 
-/// A stdout result, finished.
-pub const ResultDone = struct { info: arrow.ResultInfo, rows: u64 };
+/// A stdout result, finished. `truncated`: a row cap cut it short.
+pub const ResultDone = struct { info: arrow.ResultInfo, rows: u64, truncated: bool = false };
 
 pub const ResultHook = struct {
     ctx: *anyopaque,
@@ -303,6 +305,7 @@ pub const Env = struct {
     results_printed: u32 = 0,
     line_base: u32 = 0,
     on_result: ?ResultHook = null,
+    max_rows: ?u64 = null,
 
     /// The next stdout result's description, claiming its ordinal.
     pub fn takeResult(self: *Env) arrow.ResultInfo {

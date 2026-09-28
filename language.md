@@ -1066,10 +1066,10 @@ same query costs at full parallelism.
 ## 10. Running & exit codes
 
 ```
-basalt run   <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json|csv|tsv|arrow]
+basalt run   <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json|csv|tsv|arrow] [--max-rows N]
 basalt serve <dir> [--port N] [--watch]
 basalt check <script>|-|-c "<inline>"
-basalt kernel [--format table|json|csv|tsv|arrow] [-j threads]
+basalt kernel [--format table|json|csv|tsv|arrow] [-j threads] [--max-rows N]
 ```
 
 `--format json` makes stdout machine-readable: a terminal `SELECT` emits one
@@ -1091,8 +1091,8 @@ each describes itself. Its schema carries `custom_metadata`:
 `basalt.statement` (the result's ordinal in the run, from `0`), `basalt.kind`
 (`select`, `show`, `describe` or `explain`), and `basalt.line` / `basalt.col`
 where the statement starts. Just before its end-of-stream marker comes a
-zero-row record batch whose message metadata holds `basalt.rows` and
-`basalt.elapsed_ms` — plain Arrow, so a reader that ignores metadata sees the
+zero-row record batch whose message metadata holds `basalt.rows`,
+`basalt.elapsed_ms` and `basalt.truncated` — plain Arrow, so a reader that ignores metadata sees the
 same table. pyarrow reads the streams in turn from one file object
 (`ipc.open_stream(f)` until `f` is exhausted; the trailer through
 `read_next_batch_with_custom_metadata`). A statement `EXPLAIN` under arrow is a
@@ -1100,6 +1100,16 @@ result of its own — one string column, `plan`, a row per line — rather than
 text on stderr, and so is a whole-program `EXPLAIN`.
 Logs are stderr-only, plain text, level `warn` by default (`--log-level`,
 `--log-format json`, `-q`).
+
+`--max-rows N` keeps the first `N` rows of each result printed to stdout and
+stops the query there: once a result has more rows than it keeps, every source
+reports end of input at its next read, so `SELECT * FROM 'huge.parquet'`
+returns its first rows after decoding one row group, not the file. A blocking
+operator is unaffected — an aggregate, a sort or a join's build side has read
+its whole input before the first row reaches stdout, so what is kept is exactly
+the first `N` rows of the full answer. A cut result logs `result cut at
+--max-rows N` (level `warn`), carries `basalt.truncated = true` in its Arrow
+trailer, and in a kernel status. A `LOAD` is never capped.
 
 Errors point at what is wrong, not at the statement it sits in: an unknown
 column or function is reported at the name itself, on its own line of a
@@ -1250,7 +1260,8 @@ Requests are NDJSON on stdin, one object per line:
 ```
 
 `params` binds the script's `PARAM`s for that script only, as `-p` does for a
-run; `format` overrides `--format` (default `arrow`) for that script. A `cancel`
+run; `format` overrides `--format` (default `arrow`) and `max_rows` overrides
+`--max-rows` for that script. A `cancel`
 acts at once, even mid-script; one naming a different `id` than the running
 script's is ignored, and one without an `id` stops whatever runs. SIGINT
 cancels the running script too — however many times it is sent, it never ends
@@ -1268,14 +1279,15 @@ and nothing for that request follows it:
 ```
 {"type":"data","id":"c1","len":1184}
 <1184 bytes>
-{"type":"result","id":"c1","statement":0,"kind":"select","line":2,"col":1,"rows":12,"elapsed_ms":40}
-{"type":"status","id":"c1","ok":true,"cancelled":false,"elapsed_ms":42,"declared":[{"kind":"param","name":"days"}],"results":[...]}
-{"type":"status","id":"c2","ok":false,"cancelled":false,"elapsed_ms":3,"declared":[],
+{"type":"result","id":"c1","statement":0,"kind":"select","line":2,"col":1,"rows":12,"elapsed_ms":40,"truncated":false}
+{"type":"status","id":"c1","ok":true,"cancelled":false,"truncated":false,"elapsed_ms":42,"declared":[{"kind":"param","name":"days"}],"results":[...]}
+{"type":"status","id":"c2","ok":false,"cancelled":false,"truncated":false,"elapsed_ms":3,"declared":[],
  "error":{"msg":"unknown field `nope`","file":"script","line":3,"col":8,"transient":false}}
 ```
 
 A result's `line`/`col` count in the script as sent, as its Arrow metadata
-does. `declared` lists what the script added to the session — a script's
+does; `truncated` says a row cap cut it, and the status's `truncated` says any
+result was. `declared` lists what the script added to the session — a script's
 declarations join the session once it parses, whether or not it then runs
 cleanly. An error's `line`/`col` count in the script as sent; `file` is
 `script`, an `@include`d file's path, or `session` when the fault lies in a

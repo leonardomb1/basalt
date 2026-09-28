@@ -707,7 +707,7 @@ fn applyFilter(arena: std.mem.Allocator, scratch: std.mem.Allocator, b: Batch, p
     return Batch{ .schema = b.schema, .columns = outcols, .len = kept };
 }
 
-fn sliceBatch(arena: std.mem.Allocator, b: Batch, start: usize, take: usize) anyerror!Batch {
+pub fn sliceBatch(arena: std.mem.Allocator, b: Batch, start: usize, take: usize) anyerror!Batch {
     const outcols = try arena.alloc(column.Column, b.columns.len);
     for (b.columns, 0..) |*col, ci| {
         var bld = column.Builder.init(arena, col.ty);
