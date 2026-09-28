@@ -1140,7 +1140,7 @@ same query costs at full parallelism.
 ```
 basalt run   <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json|csv|tsv|arrow] [--max-rows N]
 basalt serve <dir> [--port N] [--watch]
-basalt check <script>|-|-c "<inline>" [--format json]
+basalt check <script>|-|-c "<inline>" [--format json] [--known t1,t2]
 basalt complete <script>|-|-c "<inline>" --pos N [--connect]
 basalt kernel [--format table|json|csv|tsv|arrow] [-j threads] [--max-rows N]
 ```
@@ -1206,6 +1206,14 @@ the `@include`d file the fault is in.
 For an editor: `basalt check --format json` prints its diagnostics as a JSON
 array on stdout — `[]` when the script checks out, else one object per error in
 the shape above without `ts`/`event` — and still exits `1` on an error.
+`check` does not stop at the first problem: every statement is checked on its
+own and each that fails is listed, in script order. A statement that does not
+parse is skipped to its `;` and parsing resumes after it — except inside a
+`FOR`, `CASE` or `CREATE FUNCTION` body, whose own `;`s make the statement's end
+unknowable, so the problems after a broken block go unreported until it is
+fixed. `--known enrich,daily` names tables the script reads but does not
+declare — a notebook's other cells — so `FROM enrich` is checked as a table
+whose columns are unknown rather than failing as an unknown source.
 `basalt complete --pos N` prints what Tab would offer at byte offset `N` (the
 end, without `--pos`; `--utf16` counts `N` and the answer in UTF-16 units): `{"start":S,"end":N,"items":[{"text":…,"kind":…,"detail":…}]}`, the
 items replacing `script[S..N]`, with `kind` one of `keyword`, `function`,
@@ -1368,6 +1376,7 @@ Requests are NDJSON on stdin, one object per line:
 {"op":"run","id":"c1","script":"SELECT ...;","params":{"days":7},"format":"arrow"}
 {"op":"cancel","id":"c1"}     stop the running script; the session survives
 {"op":"complete","id":"c2","script":"SELECT erp.","pos":11}
+{"op":"check","id":"c3","script":"SELECT ...;","tables":["enrich"]}
 {"op":"reset"}                forget every declaration
 {"op":"close"}                exit 0 (as does EOF)
 ```
@@ -1379,6 +1388,19 @@ columns once per session and remembered, as the REPL does (`"connect": false`
 keeps it offline); `reset` forgets that too. `pos` is a byte offset, or — with
 `"utf16": true` — a UTF-16 offset, the unit a JavaScript editor counts in, and
 the answer's `start`/`end` then count the same way.
+
+`check` lists every problem in a script without running it, against the
+session — its connections, params, LETs and functions — as `basalt check
+--format json` does; its status carries `"diagnostics": [...]`, `[]` when the
+script checks out, each placed in the script as sent (`file` is `session` when
+the fault is in a declaration an earlier script made). `tables` names what
+the script may read that no script declared, such as other cells' results:
+a name alone (`"enrich"`) is checked as a table with unknown columns;
+`{"name": "enrich", "columns": [{"name": "id", "type": "int"}, …]}` types
+everything read from it (any type a `PARAM` takes: `int`, `decimal(10,2)`,
+`varchar(20)`, `timestamp`, …, each column nullable). A script's own `WITH`
+of the same name wins. Nothing runs and nothing connects, and the session is
+left as it was: a `check`ed script's declarations are checked, not kept.
 `params` binds the script's `PARAM`s for that script only, as `-p` does for a
 run; `format` overrides `--format` (default `arrow`) and `max_rows` overrides
 `--max-rows` for that script. A `cancel`

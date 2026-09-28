@@ -45,13 +45,46 @@ pub fn parseSource(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic)
 /// `@include`s: `known` are the connections those declared, so a `conn.QUERY(...)`
 /// or `EACH TABLE OF (conn...)` here resolves as it would in one file.
 pub fn parseSourceWith(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic, known: []const ast.Connection) Error!ast.Program {
+    return parseSourceOpts(arena, src, diag, .{ .known_conns = known });
+}
+
+/// What a parse may know beyond its own text, and how it treats an error.
+pub const Options = struct {
+    /// Connections declared by files parsed before this one (`@include`).
+    known_conns: []const ast.Connection = &.{},
+    /// Tables that exist where the script will run but that it does not declare —
+    /// a notebook's other cells. `FROM name` / `JOIN name` read them as a binding
+    /// reference the analyzer resolves, instead of "unknown source".
+    known_tables: []const []const u8 = &.{},
+    /// Keep going: every statement that fails to parse is recorded here, and
+    /// parsing resumes at the next statement. A statement that opens a block
+    /// (`FOR`, `CASE`, `CREATE`) has `;`s of its own, so an error inside one
+    /// ends the parse — resuming mid-body would report the rest of the block as
+    /// errors it does not have. Null: the first error fails the parse.
+    errors: ?*std.array_list.Managed(Diagnostic) = null,
+};
+
+pub fn parseSourceOpts(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic, opts: Options) Error!ast.Program {
     const toks = lexer.tokenize(arena, src) catch return error.OutOfMemory;
     var p = Parser{ .arena = arena, .toks = toks, .diag = diag };
     for (toks) |t| {
         if (t.tag == .invalid) return p.fail(.{ .line = t.line, .col = t.col }, "invalid token `{s}`", .{t.text});
     }
-    p.known_conns = known;
+    p.known_conns = opts.known_conns;
+    p.known_tables = opts.known_tables;
+    p.errors = opts.errors;
     return p.parseProgram();
+}
+
+/// A type name as a `PARAM` or `CAST` spells it (`int`, `decimal(10,2)`,
+/// `varchar(20)`, `timestamp`), or null when it is none.
+pub fn parseTypeStr(arena: std.mem.Allocator, src: []const u8) ?types.Type {
+    const toks = lexer.tokenize(arena, src) catch return null;
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    var p = Parser{ .arena = arena, .toks = toks, .diag = &diag };
+    const ty = p.parseTypeName() catch return null;
+    if (!p.at(.eof)) return null;
+    return ty;
 }
 
 /// Tokenize and parse a single standalone expression (used to evaluate the
@@ -256,6 +289,8 @@ pub const Parser = struct {
     endpoint: ?ast.KindDecl = null,
     /// Connections declared by files parsed before this one (`@include`).
     known_conns: []const ast.Connection = &.{},
+    known_tables: []const []const u8 = &.{},
+    errors: ?*std.array_list.Managed(Diagnostic) = null,
     conn_names: std.array_list.Managed([]const u8) = undefined,
     /// Parallel to `conn_names`: each connection's connector type, which `SHOW
     /// TABLES` needs to phrase its catalog query.
@@ -425,6 +460,9 @@ pub const Parser = struct {
         for (self.let_names.items) |c| {
             if (std.mem.eql(u8, c, name)) return true;
         }
+        for (self.known_tables) |c| {
+            if (std.mem.eql(u8, c, name)) return true;
+        }
         return false;
     }
     fn isScriptConst(self: *Parser, name: []const u8) bool {
@@ -461,15 +499,46 @@ pub const Parser = struct {
 
         var stmts = std.array_list.Managed(ast.Stmt).init(self.arena);
         while (!self.at(.eof)) {
-            try self.parseStatement(&stmts);
+            const start = self.i;
+            const n0 = stmts.items.len;
+            self.parseStatement(&stmts) catch |e| {
+                const errs = self.errors orelse return e;
+                if (e == error.OutOfMemory) return e;
+                try errs.append(self.diag.*);
+                // what the failed statement half-emitted (a derived table's binding)
+                stmts.shrinkRetainingCapacity(n0);
+                self.pending_bindings.clearRetainingCapacity();
+                if (self.opensBlock(start)) break;
+                while (!self.at(.eof) and !self.at(.semi)) _ = self.advance();
+                _ = self.eat(.semi);
+                continue;
+            };
         }
-        if (stmts.items.len == 0)
-            return self.fail(self.curPos(), "empty program: expected at least one statement", .{});
+        if (stmts.items.len == 0) {
+            // with errors recorded, an empty program is what survived them
+            const recovered = if (self.errors) |errs| errs.items.len > 0 else false;
+            if (!recovered) return self.fail(self.curPos(), "empty program: expected at least one statement", .{});
+        }
 
         const kind: ast.KindDecl = self.endpoint orelse
             .{ .kind = .batch, .config = &.{}, .pos = .{ .line = 1, .col = 1 } };
         try stmts.insert(0, .{ .kind = kind });
         return .{ .stmts = try stmts.toOwnedSlice(), .explain = explain };
+    }
+
+    /// Whether the statement starting at token `i` has a body of statements —
+    /// `;`s inside it that are not its end.
+    fn opensBlock(self: *Parser, i: usize) bool {
+        if (i >= self.toks.len) return false;
+        const t = self.toks[i];
+        if (t.tag != .ident) return false;
+        if (eqlNoCase(t.text, "for") or eqlNoCase(t.text, "case")) return true;
+        if (!eqlNoCase(t.text, "create")) return false;
+        // `CREATE [OR REPLACE] FUNCTION|ENDPOINT` — a connection or resource is one statement
+        for (self.toks[i + 1 .. @min(self.toks.len, i + 4)]) |n| {
+            if (n.tag == .ident and (eqlNoCase(n.text, "function") or eqlNoCase(n.text, "endpoint"))) return true;
+        }
+        return false;
     }
 
     /// One top-level (or arm-body) statement, appended to `out`.
@@ -5032,4 +5101,72 @@ test "sql: scalar subquery desugars to a query LET ahead of the statement" {
     try testing.expect(prog2.stmts[1] == .let_const);
     try testing.expect(prog2.stmts[1].let_const.query != null);
     try testing.expectEqualStrings("hi", prog2.stmts[1].let_const.name);
+}
+
+test "parse with recovery: every statement that fails is recorded, the rest still parse; a broken block ends it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    var errs = std.array_list.Managed(Diagnostic).init(a);
+
+    const prog = try parseSourceOpts(a,
+        \\SELECT 1 AS x;
+        \\SELECT 1 +;
+        \\SELECT 2 AS y;
+        \\SELECT (1 AS w;
+        \\SELECT 3 AS z;
+    , &diag, .{ .errors = &errs });
+    try testing.expectEqual(@as(usize, 2), errs.items.len);
+    try testing.expectEqual(@as(u32, 2), errs.items[0].line);
+    try testing.expectEqual(@as(u32, 4), errs.items[1].line);
+    var outputs: usize = 0;
+    for (prog.stmts) |s| if (s == .output) {
+        outputs += 1;
+    };
+    try testing.expectEqual(@as(usize, 3), outputs);
+
+    // inside a FOR body the next `;` is not the statement's end: stop there
+    errs.clearRetainingCapacity();
+    _ = try parseSourceOpts(a,
+        \\SELECT 1 AS x;
+        \\FOR EACH ROW OF (SELECT 1 AS n) AS (n)
+        \\  SELECT 1 +;
+        \\  SELECT 2 AS y;
+        \\END FOR;
+        \\SELECT 3 +;
+    , &diag, .{ .errors = &errs });
+    try testing.expectEqual(@as(usize, 1), errs.items.len);
+
+    // without an error list, the first error still fails the parse
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT 1 +; SELECT 2 AS y;", &diag));
+}
+
+test "known tables: a name the session holds reads as a binding reference, FROM and JOIN" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT * FROM enrich;", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "unknown source `enrich`") != null);
+
+    const prog = try parseSourceOpts(a,
+        \\WITH r AS (SELECT range AS id FROM RANGE(3))
+        \\SELECT * FROM enrich JOIN r ON enrich.id = r.id;
+        \\SELECT * FROM r JOIN enrich ON r.id = enrich.id;
+    , &diag, .{ .known_tables = &.{"enrich"} });
+    var refs: usize = 0;
+    for (prog.stmts) |s| if (s == .output) {
+        if (s.output.stages[0].node == .ref and std.mem.eql(u8, s.output.stages[0].node.ref, "enrich")) refs += 1;
+        for (s.output.stages) |st| if (st.node == .join and std.mem.eql(u8, st.node.join.binding, "enrich")) {
+            refs += 1;
+        };
+    };
+    try testing.expectEqual(@as(usize, 2), refs);
+
+    try testing.expect(parseTypeStr(a, "decimal(10,2)").?.scale == 2);
+    try testing.expect(parseTypeStr(a, "varchar(20)").?.kind == .string);
+    try testing.expect(parseTypeStr(a, "timestamp").?.kind == .timestamp);
+    try testing.expect(parseTypeStr(a, "nope") == null);
+    try testing.expect(parseTypeStr(a, "int int") == null);
 }

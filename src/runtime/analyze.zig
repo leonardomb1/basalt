@@ -483,6 +483,43 @@ pub fn analyze(arena: std.mem.Allocator, raw_program: ast.Program, diag: *Diag) 
 }
 
 pub fn analyzeWith(arena: std.mem.Allocator, raw_program: ast.Program, cli: []const ParamOverride, diag: *Diag) error{ AnalyzeFailed, OutOfMemory }!Plan {
+    return analyzeOpts(arena, raw_program, .{ .overrides = cli }, diag);
+}
+
+/// A table that exists where the script runs but that the script does not
+/// declare — a notebook's other cells. `FROM name` reads it; `schema`, when the
+/// caller knows it, types what follows, and null leaves it unresolved (as a live
+/// SQL table is to an analysis that does not connect).
+pub const KnownTable = struct { name: []const u8, schema: ?types.Schema = null };
+
+/// One problem the analysis found.
+pub const Issue = struct { msg: []const u8, pos: ?ast.Pos = null, end: ?ast.Pos = null };
+
+pub const Options = struct {
+    overrides: []const ParamOverride = &.{},
+    known_tables: []const KnownTable = &.{},
+    /// Report every problem: each statement is checked on its own, a failure is
+    /// recorded here, and the rest are still checked. Null: the first one fails.
+    issues: ?*std.array_list.Managed(Issue) = null,
+    /// A script of declarations alone is whole — a notebook cell that only
+    /// declares — rather than "no output pipeline".
+    declarations_only: bool = false,
+};
+
+pub fn analyzeOpts(arena: std.mem.Allocator, raw_program: ast.Program, opts: Options, diag: *Diag) error{ AnalyzeFailed, OutOfMemory }!Plan {
+    var p = analyzeInner(arena, raw_program, opts, diag);
+    // With an issue list, a failure before the statements (an expansion, a
+    // parameter) is one more issue — there is nothing after it to go on with.
+    if (opts.issues) |list| if (p) |_| {} else |e| {
+        if (e == error.OutOfMemory) return e;
+        try list.append(.{ .msg = try arena.dupe(u8, diag.msg), .pos = diag.pos, .end = diag.end });
+        p = .{ .kind = "batch", .outputs = &.{} };
+    };
+    return p;
+}
+
+fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Options, diag: *Diag) error{ AnalyzeFailed, OutOfMemory }!Plan {
+    const cli = opts.overrides;
     var expand_msg: []const u8 = "";
     const program = expand.expandProgram(arena, raw_program, null, &expand_msg) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -495,7 +532,7 @@ pub fn analyzeWith(arena: std.mem.Allocator, raw_program: ast.Program, cli: []co
     var bindings = std.StringHashMap(ast.Pipeline).init(arena);
     var connections = std.StringHashMap(ast.Connection).init(arena);
     for (program.stmts[1..]) |s| if (s == .connection) try connections.put(s.connection.name, s.connection);
-    if (countOutputs(program.stmts[1..]) == 0)
+    if (!opts.declarations_only and countOutputs(program.stmts[1..]) == 0)
         return fail(diag, "no output pipeline (a pipeline ending in `write`)", .{});
 
     var params_map = ParamMap.init(arena);
@@ -535,7 +572,7 @@ pub fn analyzeWith(arena: std.mem.Allocator, raw_program: ast.Program, cli: []co
     // null) keeps `$var`-as-value expressions lenient instead of "unknown field".
     try bindBodyVars(arena, program.stmts, &params_map);
 
-    var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .diag = diag };
+    var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .diag = diag, .known = opts.known_tables, .issues = opts.issues };
 
     var out_plans = std.array_list.Managed(Output).init(arena);
     try ctx.checkStmts(program.stmts[1..], &out_plans, true);
@@ -662,6 +699,29 @@ const Ctx = struct {
     connections: *std.StringHashMap(ast.Connection),
     params: *const ParamMap,
     diag: *Diag,
+    known: []const KnownTable = &.{},
+    issues: ?*std.array_list.Managed(Issue) = null,
+
+    /// A statement's failure: recorded, and the caller goes on to the next
+    /// statement — or, without an issue list, returned as the analysis's error.
+    fn note(self: *Ctx, e: Error) Error!void {
+        if (e == error.OutOfMemory) return e;
+        const list = self.issues orelse return e;
+        try list.append(.{ .msg = try self.arena.dupe(u8, self.diag.msg), .pos = self.diag.pos, .end = self.diag.end });
+        self.diag.* = .{};
+    }
+
+    fn attempt(self: *Ctx, r: Error!Output) Error!?Output {
+        return r catch |e| {
+            try self.note(e);
+            return null;
+        };
+    }
+
+    fn knownTable(self: *Ctx, name: []const u8) ?KnownTable {
+        for (self.known) |k| if (std.mem.eql(u8, k.name, name)) return k;
+        return null;
+    }
 
     /// The statements in the order the executor runs them: a `WITH` is visible to
     /// what follows it, a body's `WITH` is scoped to that body, and the one rule
@@ -670,12 +730,12 @@ const Ctx = struct {
     fn checkStmts(self: *Ctx, stmts: []const ast.Stmt, outs: *std.array_list.Managed(Output), top: bool) Error!void {
         for (stmts) |s| switch (s) {
             .binding => |b| try self.bindings.put(b.name, b.pipeline),
-            .output => |p| try outs.append(try self.analyzeOutput(p)),
-            .explain => |e| try outs.append(try self.analyzeOutput(e.pipeline)),
+            .output => |p| if (try self.attempt(self.analyzeOutput(p))) |o| try outs.append(o),
+            .explain => |e| if (try self.attempt(self.analyzeOutput(e.pipeline))) |o| try outs.append(o),
             .for_each => |fe| try self.checkBody(fe.body, outs),
             .match => |m| for (m.arms) |arm| try self.checkStmts(arm.body, outs, false),
             .func => |fd| if (fd.body == .stmts) try self.checkBody(fd.body.stmts, outs),
-            .let_const => |l| if (!top) return self.failAt(l.pos, "LET `{s}` must be declared at the top level of the script", .{l.name}),
+            .let_const => |l| if (!top) try self.note(self.failAt(l.pos, "LET `{s}` must be declared at the top level of the script", .{l.name})),
             .param, .kind, .connection, .call, .throw, .print => {},
         };
     }
@@ -696,13 +756,13 @@ const Ctx = struct {
                 try saved.append(.{ .name = b.name, .prev = self.bindings.get(b.name) });
                 try self.bindings.put(b.name, b.pipeline);
             },
-            .output => |p| try outs.append(try self.analyzeOutput(p)),
-            .explain => |e| try outs.append(try self.analyzeOutput(e.pipeline)),
+            .output => |p| if (try self.attempt(self.analyzeOutput(p))) |o| try outs.append(o),
+            .explain => |e| if (try self.attempt(self.analyzeOutput(e.pipeline))) |o| try outs.append(o),
             .for_each => |fe| try self.checkBody(fe.body, outs),
             .match => |m| for (m.arms) |arm| try self.checkBody(arm.body, outs),
             .call, .throw, .print => {},
-            .let_const => |l| return self.failAt(l.pos, "LET `{s}` must be declared at the top level of the script", .{l.name}),
-            .param, .kind, .connection, .func => return self.failAt(stmtPos(s).?, "{s}", .{body_stmt_rule}),
+            .let_const => |l| try self.note(self.failAt(l.pos, "LET `{s}` must be declared at the top level of the script", .{l.name})),
+            .param, .kind, .connection, .func => try self.note(self.failAt(stmtPos(s).?, "{s}", .{body_stmt_rule})),
         };
     }
 
@@ -846,8 +906,12 @@ const Ctx = struct {
                 return .{ .connector = connector, .detail = detail, .schema = schema };
             },
             .ref => |name| {
-                const b = self.bindings.get(name) orelse
+                const b = self.bindings.get(name) orelse {
+                    // a script's own CTE shadows a table the session knows
+                    if (self.knownTable(name)) |k|
+                        return .{ .connector = "session", .detail = try std.fmt.allocPrint(self.arena, "session table {s}", .{name}), .schema = k.schema };
                     return fail(self.diag, "unknown binding `{s}`", .{name});
+                };
                 var src = try self.resolveSource(b.stages[0]);
                 src.schema = try self.bindingSchema(b);
                 src.detail = try std.fmt.allocPrint(self.arena, "{s} (via binding {s})", .{ src.detail, name });
@@ -935,9 +999,12 @@ const Ctx = struct {
             // other stage. It used to stop here, and `check` said ok to a column
             // that did not exist as long as a join sat in front of it.
             .join => |j| {
-                const b = self.bindings.get(j.binding) orelse
+                const right = if (self.bindings.get(j.binding)) |b|
+                    (try self.bindingSchema(b)) orelse return null
+                else if (self.knownTable(j.binding)) |k|
+                    k.schema orelse return null
+                else
                     return fail(self.diag, "unknown binding `{s}` in join", .{j.binding});
-                const right = (try self.bindingSchema(b)) orelse return null;
                 return (try joinPlan(self.arena, in, right, j, self.diag)).schema;
             },
             else => return null,
@@ -960,7 +1027,7 @@ const Ctx = struct {
     }
 
     fn joinInfo(self: *Ctx, j: ast.Join) !Stage {
-        if (self.bindings.get(j.binding) == null)
+        if (self.bindings.get(j.binding) == null and self.knownTable(j.binding) == null)
             return fail(self.diag, "unknown binding `{s}` in join", .{j.binding});
         const d = try std.fmt.allocPrint(self.arena, "{s} {s}", .{ @tagName(j.kind), j.binding });
         return .{ .kind = "join", .detail = d, .breaker = true };

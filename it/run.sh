@@ -1089,6 +1089,20 @@ PY
   then report "stdout: check --format json and complete speak JSON" ok
   else report "stdout: check --format json and complete speak JSON" bad; cat "$out/chk_bad.json" "$out/cmp.json" 2>/dev/null | head -5; fi
 
+  # `check` goes past its first error, parse and analysis alike, and `--known`
+  # names tables the script reads without declaring.
+  if ! $B check --format json --known enrich -c "SELECT nope FROM RANGE(2);
+SELECT x FROM enrich WHERE y > 1;
+SELECT 1 +;
+SELECT alsonope FROM RANGE(2);" >"$out/chk_many.json" 2>/dev/null &&
+     python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert [(e["line"], e["msg"].split("`")[1] if "`" in e["msg"] else "syntax") for e in d] == [(1, "nope"), (3, "syntax"), (4, "alsonope")], d
+' "$out/chk_many.json"
+  then report "stdout: check reports every problem, known tables included" ok
+  else report "stdout: check reports every problem, known tables included" bad; cat "$out/chk_many.json"; fi
+
   # --max-rows: the first N rows of an endless source, at once, then a clean end.
   got=$(timeout 10 $B run -q --max-rows 3 --format csv -c "SELECT range FROM RANGE(100000000000);" 2>/dev/null | tr '\n' ' ')
   if [ "$got" = "range 0 1 2 " ]; then report "stdout: --max-rows previews an endless source" ok; else report "stdout: --max-rows previews an endless source (got '$got')" bad; fi

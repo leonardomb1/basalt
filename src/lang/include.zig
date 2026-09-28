@@ -56,11 +56,27 @@ pub fn loadProgram(
     base_dir: []const u8,
     diag: *Diag,
 ) Error!ast.Program {
+    return loadProgramOpts(arena, text, label, base_dir, diag, .{});
+}
+
+/// `loadProgram` with the root script's parse options: `known_tables` apply
+/// throughout, `errors` (keep parsing past an error) to the root script alone —
+/// an included file is a library, and one that does not parse fails outright.
+pub fn loadProgramOpts(
+    arena: std.mem.Allocator,
+    text: []const u8,
+    label: []const u8,
+    base_dir: []const u8,
+    diag: *Diag,
+    opts: parser.Options,
+) Error!ast.Program {
     var ctx = Ctx{
         .arena = arena,
         .diag = diag,
         .stack = std.array_list.Managed(Frame).init(arena),
         .memo = std.StringHashMap(ast.Program).init(arena),
+        .known_tables = opts.known_tables,
+        .errors = opts.errors,
     };
     // The root only joins the cycle stack when it is a real file (`-c`, stdin and
     // the REPL have no path, and so can never be re-included).
@@ -86,6 +102,8 @@ const Ctx = struct {
     memo: std.StringHashMap(ast.Program),
     depth: u32 = 0,
     stmt_budget: usize = max_total_stmts,
+    known_tables: []const []const u8 = &.{},
+    errors: ?*std.array_list.Managed(parser.Diagnostic) = null,
 
     fn fail(self: *Ctx, label: []const u8, line: u32, col: u32, comptime fmt: []const u8, args: anytype) Error {
         const msg: []const u8 = std.fmt.allocPrint(self.arena, fmt, args) catch "include error";
@@ -150,7 +168,11 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base_dir: []const u8) Er
             if (st == .connection) try known.append(st.connection);
         };
         var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        main = parser.parseSourceWith(ctx.arena, rest, &pdiag, known.items) catch |e| switch (e) {
+        main = parser.parseSourceOpts(ctx.arena, rest, &pdiag, .{
+            .known_conns = known.items,
+            .known_tables = ctx.known_tables,
+            .errors = if (ctx.depth == 0) ctx.errors else null,
+        }) catch |e| switch (e) {
             error.OutOfMemory => return e,
             error.ParseFailed => {
                 ctx.diag.* = .{ .parse = pdiag, .label = label };

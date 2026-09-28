@@ -25,6 +25,7 @@ const http_server = @import("../server/http_server.zig");
 const kernel = @import("kernel.zig");
 const eval = @import("../exec/eval.zig");
 const Value = @import("../exec/value.zig").Value;
+const types = @import("../lang/types.zig");
 
 /// SIGTERM/SIGINT → ask the run to stop at its next boundary (async-signal-safe:
 /// one atomic store). The control plane uses this to cancel a job or roll a http_server.
@@ -281,6 +282,57 @@ fn parseSrcTo(arena: std.mem.Allocator, src: Source, eo: ErrOut) !?ast.Program {
     };
 }
 
+/// One problem `check` found, located in the file it names (null: the script).
+pub const CheckIssue = struct { msg: []const u8, pos: ?ast.Pos = null, end: ?ast.Pos = null, file: ?[]const u8 = null };
+
+pub const CheckOpts = struct {
+    overrides: []const analyze.ParamOverride = &.{},
+    known: []const analyze.KnownTable = &.{},
+    /// A script of declarations alone checks out — a notebook cell.
+    declarations_only: bool = false,
+};
+
+/// Every problem in `text`, in script order: each statement that does not parse
+/// (parsing resumes at the next one), then each that does not check. Nothing
+/// runs and nothing is connected to.
+pub fn checkText(a: std.mem.Allocator, text: []const u8, label: []const u8, dir: []const u8, opts: CheckOpts) ![]CheckIssue {
+    var issues = std.array_list.Managed(CheckIssue).init(a);
+    var names = std.array_list.Managed([]const u8).init(a);
+    for (opts.known) |k| try names.append(k.name);
+    var perrs = std.array_list.Managed(parser.Diagnostic).init(a);
+    var idiag: include.Diag = .{};
+    const prog = include.loadProgramOpts(a, text, label, dir, &idiag, .{ .known_tables = names.items, .errors = &perrs }) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        // what recovery cannot pass: an unlexable token, an `@include` that fails
+        error.ParseFailed => {
+            const p = idiag.parse;
+            try issues.append(.{ .msg = p.msg, .pos = .{ .line = p.line, .col = p.col }, .end = if (p.end_line > 0) ast.Pos{ .line = p.end_line, .col = p.end_col } else null, .file = if (idiag.label.len > 0 and !std.mem.eql(u8, idiag.label, label)) idiag.label else null });
+            return issues.toOwnedSlice();
+        },
+    };
+    for (perrs.items) |p| try issues.append(.{ .msg = p.msg, .pos = .{ .line = p.line, .col = p.col }, .end = if (p.end_line > 0) ast.Pos{ .line = p.end_line, .col = p.end_col } else null });
+
+    var found = std.array_list.Managed(analyze.Issue).init(a);
+    var adiag = analyze.Diag{};
+    _ = try analyze.analyzeOpts(a, prog, .{
+        .overrides = opts.overrides,
+        .known_tables = opts.known,
+        .issues = &found,
+        // statements that did not parse are gone; "no output" would be about them
+        .declarations_only = opts.declarations_only or perrs.items.len > 0,
+    }, &adiag);
+    for (found.items) |f| try issues.append(.{ .msg = f.msg, .pos = f.pos, .end = f.end });
+
+    std.mem.sort(CheckIssue, issues.items, {}, struct {
+        fn lt(_: void, x: CheckIssue, y: CheckIssue) bool {
+            const px = x.pos orelse ast.Pos{ .line = 0, .col = 0 };
+            const py = y.pos orelse ast.Pos{ .line = 0, .col = 0 };
+            return px.line < py.line or (px.line == py.line and px.col < py.col);
+        }
+    }.lt);
+    return issues.toOwnedSlice();
+}
+
 fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -296,6 +348,7 @@ fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     defer stderr.flush() catch {};
 
     var overrides = std.array_list.Managed(analyze.ParamOverride).init(a);
+    var known = std.array_list.Managed(analyze.KnownTable).init(a);
     var json = false;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
@@ -308,6 +361,16 @@ fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             if (std.mem.eql(u8, v, "json")) json = true else if (!std.mem.eql(u8, v, "text")) {
                 try stderr.print("error: `check --format` must be text|json\n", .{});
                 return 2;
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, args[i], "--known")) {
+            // tables that exist where the script runs, which it does not declare
+            const v = (try nextVal(args, &i, "--known", stderr)) orelse return 2;
+            var it = std.mem.splitScalar(u8, v, ',');
+            while (it.next()) |n| {
+                const name = std.mem.trim(u8, n, " ");
+                if (name.len > 0) try known.append(.{ .name = name });
             }
             continue;
         }
@@ -329,21 +392,16 @@ fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
 
     const src = (try loadSource(a, "check", args, stderr)) orelse return 1;
     // `--format json`: stdout is an array of diagnostics — empty when the script
-    // checks out — for an editor to place; the text line stays on stderr.
+    // checks out — for an editor to place; the text lines stay on stderr.
     const eo = ErrOut{ .w = if (json) stdout else stderr, .json = json, .bare = true, .label = src.label };
+    const issues = try checkText(a, src.text, src.label, src.dir, .{ .overrides = overrides.items, .known = known.items });
     if (json) try stdout.writeAll("[");
-    defer if (json) stdout.writeAll("]\n") catch {};
-    const prog = (try parseSrcTo(a, src, eo)) orelse return 1;
-
-    var adiag = analyze.Diag{};
-    _ = analyze.analyzeWith(a, prog, overrides.items, &adiag) catch |e| switch (e) {
-        error.OutOfMemory => return e,
-        error.AnalyzeFailed => {
-            try eo.report(.{ .msg = adiag.msg, .pos = adiag.pos, .end = adiag.end });
-            return 1;
-        },
-    };
-
+    for (issues, 0..) |is, k| {
+        if (json and k > 0) try stdout.writeByte(',');
+        try eo.report(.{ .msg = is.msg, .pos = is.pos, .end = is.end, .file = is.file });
+    }
+    if (json) try stdout.writeAll("]\n");
+    if (issues.len > 0) return 1;
     if (!json) try stdout.print("ok: {s} checks out\n", .{src.label});
     return 0;
 }
@@ -1872,6 +1930,36 @@ pub const PrepareError = error{ ParseFailed, EndpointInSession, OutOfMemory };
 /// the entry stands, so a typo can't poison the session. On `ParseFailed`,
 /// `diag` holds the position (in `Prepared.text` lines, or the included file's),
 /// and `text_out`, when given, the prelude + entry text those lines count in.
+/// The session's declarations, then `block`: the text an entry runs as, and
+/// where the entry starts in it. A declaration the entry makes again is left
+/// out of the prelude, so the text never declares one name twice.
+fn withPrelude(a: std.mem.Allocator, decls: *const DeclStore, pending: []const Pending, block: []const u8) !struct { text: []const u8, entry_at: usize } {
+    var buf = std.array_list.Managed(u8).init(a);
+    for (decls.items.items) |e| {
+        var shadowed = false;
+        for (pending) |p| {
+            if (p.id.kind == e.kind and std.ascii.eqlIgnoreCase(p.id.name, e.name)) shadowed = true;
+        }
+        if (shadowed) continue;
+        try buf.appendSlice(e.text);
+        try buf.appendSlice(";\n");
+    }
+    const entry_at = buf.items.len;
+    try buf.appendSlice(block);
+    return .{ .text = buf.items, .entry_at = entry_at };
+}
+
+/// `withPrelude` for a block not yet split into its declarations: what `check`
+/// reads a cell against, without touching the session.
+pub fn sessionText(a: std.mem.Allocator, decls: *const DeclStore, block: []const u8) !struct { text: []const u8, entry_at: usize } {
+    var pending = std.array_list.Managed(Pending).init(a);
+    for (try splitStatements(a, block)) |st| {
+        if (declOf(st)) |id| try pending.append(.{ .id = id, .text = st });
+    }
+    const j = try withPrelude(a, decls, pending.items, block);
+    return .{ .text = j.text, .entry_at = j.entry_at };
+}
+
 pub fn prepareEntry(a: std.mem.Allocator, decls: *const DeclStore, block: []const u8, diag: *include.Diag, text_out: ?*[]const u8) PrepareError!Prepared {
     var pending = std.array_list.Managed(Pending).init(a);
     var executable: usize = 0;
@@ -1884,21 +1972,9 @@ pub fn prepareEntry(a: std.mem.Allocator, decls: *const DeclStore, block: []cons
         try pending.append(.{ .id = id, .text = st });
     }
 
-    // Prelude + entry. A declaration this entry replaces is dropped from the
-    // prelude so the combined text doesn't declare the same name twice.
-    var buf = std.array_list.Managed(u8).init(a);
-    for (decls.items.items) |e| {
-        var shadowed = false;
-        for (pending.items) |p| {
-            if (p.id.kind == e.kind and std.ascii.eqlIgnoreCase(p.id.name, e.name)) shadowed = true;
-        }
-        if (shadowed) continue;
-        try buf.appendSlice(e.text);
-        try buf.appendSlice(";\n");
-    }
-    const entry_at = buf.items.len;
-    try buf.appendSlice(block);
-    const text = buf.items;
+    const joined = try withPrelude(a, decls, pending.items, block);
+    const text = joined.text;
+    const entry_at = joined.entry_at;
     if (text_out) |t| t.* = text;
 
     // An entry may open with `@include 'p.sql';` (paths relative to the cwd): the
@@ -2401,9 +2477,10 @@ fn usage(w: anytype) !void {
         \\               run a pipeline; HTTP mode when the script declares CREATE ENDPOINT
         \\  basalt serve <dir> [--port N] [--watch] [--log-format FMT] [--log-level LVL]
         \\               host every endpoint script in a dir (SIGHUP or -w reloads)
-        \\  basalt check <script>|-|-c <script> [--format json]
-        \\               parse and validate without running; `EXPLAIN` prints the plan;
-        \\               json: an array of diagnostics with their ranges
+        \\  basalt check <script>|-|-c <script> [--format json] [--known t1,t2]
+        \\               parse and validate without running, reporting every problem;
+        \\               `EXPLAIN` prints the plan; json: an array of diagnostics with
+        \\               their ranges; --known: tables the script reads, undeclared
         \\  basalt complete <script>|-|-c <script> --pos N [--connect] [--utf16]
         \\               what Tab offers at offset N (bytes, or UTF-16 units), as JSON
         \\  basalt repl  interactive read-eval-print loop
@@ -2672,4 +2749,40 @@ test "utf16 offsets: a JavaScript editor's positions map to bytes and back" {
     try std.testing.expectEqual(text.len, utf16ToByte(text, 1000));
     for ([_]usize{ 0, 8, 10, 14, text.len }) |b| try std.testing.expectEqual(b, utf16ToByte(text, byteToUtf16(text, b)));
     try std.testing.expectEqual(@as(usize, 17), byteToUtf16(text, text.len));
+}
+
+test "checkText: every problem in script order, known tables typed or not, nothing stops at the first" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const text =
+        \\SELECT nope FROM RANGE(3);
+        \\SELECT id, amt * 2 AS a2 FROM enrich WHERE day >= '2024-01-01';
+        \\SELECT 1 +;
+        \\SELECT missing FROM enrich;
+        \\SELECT whatever FROM loose;
+    ;
+    const fields = [_]types.Schema.Field{
+        .{ .name = "id", .ty = types.Type.init(.int) },
+        .{ .name = "amt", .ty = types.Type.decimal(10, 2) },
+        .{ .name = "day", .ty = types.Type.init(.date) },
+    };
+    const known = [_]analyze.KnownTable{ .{ .name = "enrich", .schema = .{ .fields = &fields } }, .{ .name = "loose" } };
+    const issues = try checkText(a, text, "t.sql", ".", .{ .known = &known });
+    try std.testing.expectEqual(@as(usize, 3), issues.len);
+    try std.testing.expectEqual(@as(u32, 1), issues[0].pos.?.line);
+    try std.testing.expect(std.mem.indexOf(u8, issues[0].msg, "`nope`") != null);
+    try std.testing.expectEqual(@as(u32, 3), issues[1].pos.?.line);
+    try std.testing.expectEqual(@as(u32, 4), issues[2].pos.?.line);
+    try std.testing.expect(std.mem.indexOf(u8, issues[2].msg, "`missing`") != null);
+
+    // not known: the name is the one problem on its line, and the rest still check
+    const unknown = try checkText(a, "SELECT * FROM enrich;\nSELECT nope FROM RANGE(1);", "t.sql", ".", .{});
+    try std.testing.expectEqual(@as(usize, 2), unknown.len);
+    try std.testing.expect(std.mem.indexOf(u8, unknown[0].msg, "unknown source `enrich`") != null);
+
+    // a cell that only declares is whole when asked; a script, not
+    try std.testing.expectEqual(@as(usize, 0), (try checkText(a, "PARAM n INT DEFAULT 1;", "t.sql", ".", .{ .declarations_only = true })).len);
+    try std.testing.expectEqual(@as(usize, 1), (try checkText(a, "PARAM n INT DEFAULT 1;", "t.sql", ".", .{})).len);
 }

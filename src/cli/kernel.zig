@@ -13,6 +13,11 @@
 //!   {"op":"complete","id":"c2","script":"SELECT erp.","pos":11}
 //!                               what Tab offers there: the status carries
 //!                               `complete: {start, end, items: [{text, kind}]}`
+//!   {"op":"check","id":"c3","script":"…","tables":["enrich"]}
+//!                               every problem in the script, against the session
+//!                               and tables other cells hold; nothing runs, the
+//!                               session is untouched: the status carries
+//!                               `diagnostics: [...]`, as `check --format json`
 //!   {"op":"cancel"}             stop the running script; the session survives
 //!   {"op":"reset"}              forget every declaration
 //!   {"op":"close"}              exit (as does EOF on stdin)
@@ -47,6 +52,8 @@ const include = @import("../lang/include.zig");
 const ast = @import("../lang/ast.zig");
 const runtime = @import("../runtime/run.zig");
 const analyze = @import("../runtime/analyze.zig");
+const types = @import("../lang/types.zig");
+const parser = @import("../lang/sql_parser.zig");
 const obs = @import("../runtime/obs.zig");
 
 /// One request line. Unknown fields are ignored, so a newer frontend can talk to
@@ -65,6 +72,9 @@ const Request = struct {
     /// `pos`, and the `start`/`end` of the answer, count UTF-16 units — what a
     /// JavaScript editor's offsets are — rather than bytes.
     utf16: bool = false,
+    /// `check`: tables that exist where the script will run but that no script
+    /// declared — each a name, or `{"name":…,"columns":[{"name":…,"type":…}]}`.
+    tables: ?std.json.Value = null,
 };
 
 /// Requests the stdin thread hands to the main loop. `cancel` never queues: it
@@ -252,6 +262,8 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             try runScript(alloc, a, &out, &queue, &decls, req, opts);
         } else if (std.mem.eql(u8, req.op, "complete")) {
             try completeScript(alloc, a, &out, &decls, &catalog, req);
+        } else if (std.mem.eql(u8, req.op, "check")) {
+            try checkScript(a, &out, &decls, req);
         } else if (std.mem.eql(u8, req.op, "reset")) {
             decls.clear();
             catalog.deinit();
@@ -261,11 +273,99 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             try reply(a, &out, req.id, .{ .ok = true });
             break;
         } else {
-            const m = try std.fmt.allocPrint(a, "unknown op `{s}` — run, complete, cancel, reset or close", .{req.op});
+            const m = try std.fmt.allocPrint(a, "unknown op `{s}` — run, check, complete, cancel, reset or close", .{req.op});
             try reply(a, &out, req.id, .{ .ok = false, .@"error" = .{ .msg = m } });
         }
     }
     return 0;
+}
+
+/// `{"op":"check","script":…,"tables":[…]}`: every problem in a cell, as
+/// `basalt check --format json` lists them, read against the session — its
+/// connections, params, LETs and functions — and the `tables` other cells hold.
+/// Nothing runs, nothing connects, and the session is left as it was: the
+/// cell's own declarations are checked, not kept.
+fn checkScript(a: std.mem.Allocator, out: *Out, decls: *const cli.DeclStore, req: Request) !void {
+    const script = req.script orelse
+        return reply(a, out, req.id, .{ .ok = false, .@"error" = .{ .msg = "`check` needs a `script`" } });
+    const known = knownTables(a, req.tables) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.BadTables => return reply(a, out, req.id, .{ .ok = false, .@"error" = .{ .msg = "`tables` must be a list of names, or of {\"name\": …, \"columns\": [{\"name\": …, \"type\": …}]}" } }),
+        error.BadType => return reply(a, out, req.id, .{ .ok = false, .@"error" = .{ .msg = "a `tables` column has a type basalt does not know (int, float, decimal(p,s), string, bool, date, time, timestamp, bytes)" } }),
+    };
+    const params = paramArgs(a, req.params) catch
+        return reply(a, out, req.id, .{ .ok = false, .@"error" = .{ .msg = "`params` must be an object of scalar values" } });
+    const overrides = try a.alloc(analyze.ParamOverride, params.len);
+    for (params, overrides) |p, *o| o.* = .{ .name = p.key, .value = p.val };
+
+    const st = try cli.sessionText(a, decls, script);
+    const issues = try cli.checkText(a, st.text, "<repl>", ".", .{ .overrides = overrides, .known = known, .declarations_only = true });
+
+    var aw = std.Io.Writer.Allocating.init(a);
+    const w = &aw.writer;
+    try w.writeByte('[');
+    for (issues, 0..) |is, k| {
+        var e = ErrorInfo{ .msg = is.msg };
+        locate(&e, st.text, st.entry_at, is.file orelse "", is.pos, is.end);
+        if (k > 0) try w.writeByte(',');
+        // `basalt check --format json`'s shape, placed in the script as sent
+        try w.writeAll("{\"level\":\"error\",\"msg\":");
+        try std.json.Stringify.encodeJsonString(e.msg, .{}, w);
+        try w.writeAll(",\"file\":");
+        try std.json.Stringify.encodeJsonString(e.file orelse "script", .{}, w);
+        if (e.line) |ln| try w.print(",\"line\":{d},\"col\":{d}", .{ ln, e.col.? });
+        if (e.end_line) |ln| try w.print(",\"end_line\":{d},\"end_col\":{d}", .{ ln, e.end_col.? });
+        try w.writeAll(",\"class\":\"permanent\"}");
+    }
+    try w.writeByte(']');
+    try reply(a, out, req.id, .{ .ok = true, .diagnostics = aw.written() });
+}
+
+/// `tables` as the analysis takes them: a name alone leaves the table's columns
+/// unresolved; given columns type everything read from it.
+fn knownTables(a: std.mem.Allocator, v: ?std.json.Value) error{ OutOfMemory, BadTables, BadType }![]const analyze.KnownTable {
+    const list = switch (v orelse return &.{}) {
+        .array => |arr| arr.items,
+        .null => return &.{},
+        else => return error.BadTables,
+    };
+    const out = try a.alloc(analyze.KnownTable, list.len);
+    for (list, out) |item, *k| switch (item) {
+        .string => |n| k.* = .{ .name = n },
+        .object => |o| {
+            const name = switch (o.get("name") orelse return error.BadTables) {
+                .string => |n| n,
+                else => return error.BadTables,
+            };
+            k.* = .{ .name = name };
+            const cols = switch (o.get("columns") orelse continue) {
+                .array => |arr| arr.items,
+                .null => continue,
+                else => return error.BadTables,
+            };
+            const fields = try a.alloc(types.Schema.Field, cols.len);
+            for (cols, fields) |c, *f| {
+                const co = switch (c) {
+                    .object => |x| x,
+                    else => return error.BadTables,
+                };
+                const cn = switch (co.get("name") orelse return error.BadTables) {
+                    .string => |n| n,
+                    else => return error.BadTables,
+                };
+                const tn = switch (co.get("type") orelse return error.BadTables) {
+                    .string => |t| t,
+                    else => return error.BadTables,
+                };
+                // a notebook's column may hold nulls whatever its type
+                const ty = parser.parseTypeStr(a, tn) orelse return error.BadType;
+                f.* = .{ .name = cn, .ty = ty.asNullable() };
+            }
+            k.schema = .{ .fields = fields };
+        },
+        else => return error.BadTables,
+    };
+    return out;
 }
 
 /// `{"op":"complete","script":…,"pos":N}`: what Tab would offer at byte `pos`
@@ -361,6 +461,8 @@ const Status = struct {
     @"error": ?ErrorInfo = null,
     /// A `complete` answer, already JSON.
     complete: ?[]const u8 = null,
+    /// A `check` answer: the JSON array of diagnostics.
+    diagnostics: ?[]const u8 = null,
 };
 
 fn anyTruncated(results: ?[]const ResultFrame) bool {
@@ -396,6 +498,10 @@ fn reply(a: std.mem.Allocator, out: *Out, id: ?[]const u8, st: Status) !void {
     if (st.complete) |c| {
         try w.writeAll(",\"complete\":");
         try w.writeAll(c);
+    }
+    if (st.diagnostics) |d| {
+        try w.writeAll(",\"diagnostics\":");
+        try w.writeAll(d);
     }
     if (st.@"error") |e| {
         try w.writeAll(",\"error\":");

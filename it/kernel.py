@@ -283,6 +283,28 @@ def main(binary):
     _, st = k.run("SELECT 1 AS x;")
     report("a run without loads says so", st.get("loads") == [] and st.get("loads_ok") == 0 and not k.loads, st)
 
+    # `check` reads a cell against the session and the tables other cells hold,
+    # lists every problem, and changes nothing.
+    k.run("PARAM since DATE DEFAULT '2024-01-01';\nCREATE FUNCTION dbl(v) AS v * 2;")
+    k.send(op="check", id="ck", script="SELECT id, dbl(amt) AS a FROM enrich WHERE day >= $since;\n"
+           "SELECT nope FROM enrich;\nSELECT 1 +;\nPARAM fresh INT DEFAULT 1;",
+           tables=[{"name": "enrich", "columns": [{"name": "id", "type": "int"},
+                                                   {"name": "amt", "type": "decimal(10,2)"},
+                                                   {"name": "day", "type": "date"}]}])
+    _, st = k.reply()
+    diags = st.get("diagnostics")
+    report("check lists every problem in a cell, placed in the cell",
+           st["ok"] and [(d["file"], d["line"]) for d in diags or []] == [("script", 2), ("script", 3)]
+           and "`nope`" in diags[0]["msg"], st)
+    k.send(op="check", id="ck2", script="SELECT anything FROM enrich;", tables=["enrich"])
+    _, st = k.reply()
+    report("check takes a table by name alone, its columns unresolved", st.get("diagnostics") == [], st)
+    _, st = k.run("SELECT $fresh AS f;")
+    report("check leaves the session as it was", not st["ok"] and "fresh" in st["error"]["msg"], st)
+    k.send(op="check", id="ck3", script="SELECT 1 AS x;", tables=[{"name": "t", "columns": [{"name": "x", "type": "nope"}]}])
+    _, st = k.reply()
+    report("check refuses a column type it does not know", not st["ok"] and "type" in st["error"]["msg"], st)
+
     # Reset forgets every declaration.
     k.send(op="reset", id="r")
     _, st = k.reply()
