@@ -50,6 +50,11 @@ fn inSchema(schema: types.Schema, name: []const u8) bool {
 /// caller's classifier). A `select` in the prefix disables projection (its renames make
 /// source-column attribution ambiguous); filters are still translated for the WHERE.
 pub fn planAgg(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, prefix: []const ast.Stage, ag: ast.Aggregate) !Plan {
+    return planAggWith(arena, dialect, src_schema, prefix, ag, null);
+}
+
+/// `planAgg` with the source's catalog facts, which decide text comparisons.
+pub fn planAggWith(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, prefix: []const ast.Stage, ag: ast.Aggregate, facts: ?*const Facts) !Plan {
     var plan = Plan{};
 
     const has_select = for (prefix) |st| {
@@ -69,7 +74,7 @@ pub fn planAgg(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Sch
     var where = std.array_list.Managed(u8).init(arena);
     for (prefix) |st| {
         if (st.node != .filter) continue;
-        const frag = (try translateExpr(arena, st.node.filter, dialect, src_schema, true)) orelse continue;
+        const frag = (try translatePred(arena, st.node.filter, dialect, .{ .schema = src_schema, .check_fields = true, .facts = facts })) orelse continue;
         if (where.items.len > 0) try where.appendSlice(" AND ");
         try where.appendSlice(frag);
     }
@@ -124,7 +129,7 @@ pub fn planWholeAgg(
     plan_schema: types.Schema,
 ) !?WholeAgg {
     var why: []const u8 = "";
-    return planWholeAggWhy(arena, dialect, base_sql, src_schema, prefix, ag, plan_schema, &why);
+    return planWholeAggWhy(arena, dialect, base_sql, src_schema, prefix, ag, plan_schema, null, &why);
 }
 
 /// `planWholeAgg` that also says, in one line for the run log, which gate refused —
@@ -137,6 +142,7 @@ pub fn planWholeAggWhy(
     prefix: []const ast.Stage,
     ag: ast.Aggregate,
     plan_schema: types.Schema,
+    facts: ?*const Facts,
     why: *[]const u8,
 ) !?WholeAgg {
     if (ag.by.len == 0 and ag.aggs.len == 0) return refuse(why, "nothing to aggregate");
@@ -148,8 +154,10 @@ pub fn planWholeAggWhy(
     var where = std.array_list.Managed(u8).init(arena);
     for (prefix) |st| {
         if (st.node != .filter) return refuse(why, "a stage other than WHERE sits between the read and the aggregate");
-        const frag = (try translateExpr(arena, st.node.filter, dialect, src_schema, true)) orelse
-            return refuse(why, try std.fmt.allocPrint(arena, "the WHERE predicate does not translate whole to {s} SQL", .{@tagName(dialect)}));
+        // nothing re-applies it over the grouped rows: the source must keep exactly
+        // the engine's rows, which on text depends on the column's collation
+        const frag = (try translatePred(arena, st.node.filter, dialect, .{ .schema = src_schema, .check_fields = true, .facts = facts, .need = .exact })) orelse
+            return refuse(why, try std.fmt.allocPrint(arena, "the WHERE predicate does not translate exactly to {s} SQL (a text comparison the column's collation decides differently, or an untranslatable piece)", .{@tagName(dialect)}));
         if (where.items.len > 0) try where.appendSlice(" AND ");
         try where.appendSlice(frag);
     }
@@ -276,6 +284,11 @@ pub const MapPlan = struct {
 /// so projection is dropped (the caller keeps the full `SELECT *` chain). The caller
 /// rebuilds its stage chain against `proj_schema` so the narrower indices line up.
 pub fn planMap(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, middle: []const ast.Stage, out_cols: []const []const u8) !MapPlan {
+    return planMapWith(arena, dialect, src_schema, middle, out_cols, null);
+}
+
+/// `planMap` with the source's catalog facts, which decide text comparisons.
+pub fn planMapWith(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, middle: []const ast.Stage, out_cols: []const []const u8, facts: ?*const Facts) !MapPlan {
     var plan = MapPlan{};
 
     var nf: usize = middle.len;
@@ -287,7 +300,7 @@ pub fn planMap(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Sch
 
     var where = std.array_list.Managed(u8).init(arena);
     for (leading) |st| {
-        const frag = (try translateExpr(arena, st.node.filter, dialect, src_schema, true)) orelse continue;
+        const frag = (try translatePred(arena, st.node.filter, dialect, .{ .schema = src_schema, .check_fields = true, .facts = facts })) orelse continue;
         if (where.items.len > 0) try where.appendSlice(" AND ");
         try where.appendSlice(frag);
     }
@@ -359,91 +372,80 @@ fn buildProjection(arena: std.mem.Allocator, dialect: Dialect, src_schema: types
     return .{};
 }
 
-/// Translate a filter predicate to an equivalent SQL boolean expression, or null if
-/// any part isn't faithfully translatable (the caller keeps the filter op regardless,
-/// so a null here just forgoes the wire saving). Only single-part fields that exist in
-/// `schema` are emitted — a param, a nested/JSON path, or a typo yields null, never a
-/// guess.
-/// ast.Expr -> source-dialect SQL, or null for anything whose semantics
-/// aren't guaranteed identical at the source (the caller then keeps that
-/// part engine-side — pushing is always optional). `schema` null means
-/// "trust bare field names" — safe for filters DIRECTLY after a read, whose
-/// fields the type-checker already resolved against the source schema.
-pub fn translateExpr(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dialect, schema: types.Schema, check_fields: bool) error{OutOfMemory}!?[]const u8 {
-    switch (e.*) {
-        .bool_lit => |b| return try arena.dupe(u8, if (b) "(1=1)" else "(1=0)"),
-        .int_lit => |v| return try std.fmt.allocPrint(arena, "{d}", .{v}),
-        .float_lit => |v| return try std.fmt.allocPrint(arena, "{d}", .{v}),
-        .null_lit => return try arena.dupe(u8, "NULL"),
-        .str_lit => |s| return try sqlStr(arena, s),
-        .field => |q| {
-            if (q.parts.len != 1) return null;
-            if (check_fields and !inSchema(schema, q.parts[0])) return null;
-            return try split.quoteIdent(arena, dialect, q.parts[0]);
-        },
-        .unary => |u| {
-            if (u.op != .not) return null;
-            const inner = (try translateExpr(arena, u.e, dialect, schema, check_fields)) orelse return null;
-            return try std.fmt.allocPrint(arena, "(NOT ({s}))", .{inner});
-        },
-        .is_null => |n| {
-            const inner = (try translateExpr(arena, n.e, dialect, schema, check_fields)) orelse return null;
-            if (n.kind == .is_null)
-                return try std.fmt.allocPrint(arena, "({s} IS {s}NULL)", .{ inner, if (n.negated) "NOT " else "" });
-            const test_sql = try std.fmt.allocPrint(arena, "({s} IS NULL OR {s} = '')", .{ inner, inner });
-            return if (n.negated) try std.fmt.allocPrint(arena, "(NOT {s})", .{test_sql}) else test_sql;
-        },
-        .binary => |b| {
-            const op = switch (b.op) {
-                .eq => "=",
-                .ne => "<>",
-                .lt => "<",
-                .le => "<=",
-                .gt => ">",
-                .ge => ">=",
-                .@"and" => "AND",
-                .@"or" => "OR",
-                // Arithmetic and bitwise stay engine-side: `^` is POWER on
-                // Postgres and SQL Server has no shift operators at all.
-                else => return null,
-            };
-            const l = (try translateExpr(arena, b.l, dialect, schema, check_fields)) orelse return null;
-            const r = (try translateExpr(arena, b.r, dialect, schema, check_fields)) orelse return null;
-            return try std.fmt.allocPrint(arena, "({s} {s} {s})", .{ l, op, r });
-        },
-        .cond => |c| {
-            const cnd = (try translateExpr(arena, c.cond, dialect, schema, check_fields)) orelse return null;
-            const t = (try translateExpr(arena, c.then, dialect, schema, check_fields)) orelse return null;
-            const f = (try translateExpr(arena, c.els, dialect, schema, check_fields)) orelse return null;
-            return try std.fmt.allocPrint(arena, "(CASE WHEN {s} THEN {s} ELSE {s} END)", .{ cnd, t, f });
-        },
-        .match => |m| return translateMatch(arena, m, dialect, schema, check_fields),
-        .cast => |c| {
-            // TRY_CAST is engine-only: the dialects' support for a null-on-failure cast is
-            // uneven (no portable spelling on mysql/starrocks), and a plain CAST would raise
-            // on the rows TRY_CAST is there to turn into nulls. Never push it.
-            if (c.safe) return null;
-            // Nor a text-to-number cast, for the same reason one step further out:
-            // the sources do not agree with each other on what a string that is not
-            // a number means. `CAST('1000,00' AS DECIMAL)` is NULL in StarRocks and
-            // MySQL, an error in Postgres, and an error in basalt. Pushing it made
-            // the answer depend on whether the predicate happened to descend —
-            // measured at 0 rows against 1 on identical data. So the engine keeps it.
-            //
-            // Provably numeric input still descends; `WHERE CAST(qty AS INT) > 5`
-            // over an int column is unambiguous. Unknown means "cannot prove", which
-            // includes a SQL table read whose schema nobody has asked for yet, and
-            // that is the common case — the cost is the old speed, never a different
-            // answer. `replace(x, ',', '.')` inside a raw `QUERY(...)` is the way to
-            // ask for the source's own coercion on purpose.
-            if (numericKind(c.ty.kind) and !provablyNumeric(c.e, schema)) return null;
-            const inner = (try translateExpr(arena, c.e, dialect, schema, check_fields)) orelse return null;
-            const ty = dialect.castType(arena, c.ty) catch return error.OutOfMemory;
-            return try std.fmt.allocPrint(arena, "CAST({s} AS {s})", .{ inner, (ty orelse return null) });
-        },
-        .call => |c| return translateCall(arena, c, dialect, schema, check_fields),
-        else => return null,
+/// How the rows a translated predicate keeps at the source relate to the rows the
+/// engine keeps evaluating the same predicate. `superset`: every row the engine
+/// keeps, perhaps more — enough where the engine re-applies the filter to what
+/// arrives. `exact`: the same rows — needed where the source's answer is taken as
+/// it is (an aggregate or a top-N descended whole). `subset`: only rows the engine
+/// keeps — what a predicate under NOT must be for the NOT to be a superset.
+pub const Need = enum {
+    superset,
+    subset,
+    exact,
+
+    fn flip(n: Need) Need {
+        return switch (n) {
+            .superset => .subset,
+            .subset => .superset,
+            .exact => .exact,
+        };
     }
+};
+
+/// What a source's catalog says of one column, for how a text comparison on it
+/// behaves there (see `connect.columnFacts`).
+pub const ColFacts = struct {
+    text: bool,
+    /// Compares by byte (code point): a binary collation, `C` on postgres, or
+    /// StarRocks, which has no collations.
+    byte_order: bool = false,
+    /// Ignores trailing spaces when comparing: every SQL Server string, a PAD
+    /// SPACE collation on mysql, a `char(n)` on postgres.
+    pads: bool = true,
+    /// Two or more bytes a character (`nvarchar`, a utf16 charset): its byte
+    /// length is not its character count, even for ASCII.
+    wide: bool = false,
+};
+
+pub const Facts = std.StringHashMap(ColFacts);
+
+pub const Opts = struct {
+    /// The source's schema, when known; with `check_fields`, only its columns are
+    /// translated.
+    schema: types.Schema = .{ .fields = &.{} },
+    check_fields: bool = false,
+    facts: ?*const Facts = null,
+    need: Need = .superset,
+    /// Set when a comparison stayed engine-side, or went in a looser form, only
+    /// because a column's collation was not known — asking the catalog could
+    /// change the answer.
+    wants_facts: ?*bool = null,
+};
+
+/// A predicate as SQL for `dialect` that keeps the rows `opts.need` asks for, or
+/// null when no rendering is sure to. Pushing is always optional: null keeps the
+/// work in the engine and never changes an answer.
+pub fn translatePred(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dialect, opts: Opts) error{OutOfMemory}!?[]const u8 {
+    const tx = Tx{ .arena = arena, .dialect = dialect, .o = opts };
+    return tx.pred(e, opts.need);
+}
+
+/// Whether knowing the source columns' collations could change how any filter in
+/// `stages` descends at `need` — asked before paying a catalog round trip.
+pub fn wantsFacts(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage, schema: types.Schema, check_fields: bool, need: Need) !bool {
+    var w = false;
+    for (stages) |st| {
+        if (st.node != .filter) continue;
+        _ = try translatePred(arena, st.node.filter, dialect, .{ .schema = schema, .check_fields = check_fields, .need = need, .wants_facts = &w });
+        if (w) return true;
+    }
+    return false;
+}
+
+/// `translatePred` for a filter the engine re-applies (`need = superset`), with no
+/// catalog facts: what EXPLAIN and the unit tests use.
+pub fn translateExpr(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dialect, schema: types.Schema, check_fields: bool) error{OutOfMemory}!?[]const u8 {
+    return translatePred(arena, e, dialect, .{ .schema = schema, .check_fields = check_fields });
 }
 
 fn numericKind(k: types.TypeKind) bool {
@@ -468,59 +470,460 @@ fn provablyNumeric(e: *const ast.Expr, schema: types.Schema) bool {
     };
 }
 
-fn translateMatch(arena: std.mem.Allocator, m: ast.Match, dialect: Dialect, schema: types.Schema, check_fields: bool) error{OutOfMemory}!?[]const u8 {
-    var out = std.array_list.Managed(u8).init(arena);
-    const w = out.writer();
-    if (m.subject) |subj| {
-        const s = (try translateExpr(arena, subj, dialect, schema, check_fields)) orelse return null;
-        w.print("(CASE {s}", .{s}) catch return error.OutOfMemory;
-    } else {
-        w.writeAll("(CASE") catch return error.OutOfMemory;
+/// Printable ASCII only. The order argument for a text range rests on it (at
+/// the first byte two strings differ, a non-ASCII byte sorts above an ASCII one
+/// in every encoding and every binary collation alike), a control character
+/// would sort below the pad space SQL Server compares with, and SQL Server needs
+/// it for another reason: a literal without `N` is read in the column's code
+/// page, where a character outside it becomes `?`.
+fn asciiPrintable(s: []const u8) bool {
+    for (s) |c| if (c < 0x20 or c > 0x7e) return false;
+    return true;
+}
+
+/// Text-valued builtins whose result, compared equal to a printable-ASCII
+/// literal, the source finds wherever the engine does: the engine's result can
+/// only be that literal when the input is ASCII too, where every dialect
+/// computes the same. (`substr` only from position 1, `replace` only under a
+/// byte-order collation — see `textFnFacts`.)
+const text_fns = [_][]const u8{ "lower", "upper", "trim", "substr", "replace", "concat", "coalesce", "left", "right", "repeat", "reverse" };
+
+fn isTextFn(name: []const u8) bool {
+    for (text_fns) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+fn isLikeFn(name: []const u8) bool {
+    return std.mem.eql(u8, name, "like") or std.mem.eql(u8, name, "starts_with") or
+        std.mem.eql(u8, name, "ends_with") or std.mem.eql(u8, name, "contains");
+}
+
+const Tx = struct {
+    arena: std.mem.Allocator,
+    dialect: Dialect,
+    o: Opts,
+
+    const Err = error{OutOfMemory};
+
+    /// What a comparison operand is. `text` carries the column's facts when the
+    /// catalog gave them; `fn_` marks a builtin's result rather than a column.
+    const Kind = union(enum) {
+        other,
+        unknown,
+        text: struct { facts: ?ColFacts, fn_: bool = false },
+    };
+
+    fn fmt(self: Tx, comptime f: []const u8, args: anytype) Err![]const u8 {
+        return std.fmt.allocPrint(self.arena, f, args);
     }
-    for (m.arms) |arm| {
-        const v = (try translateExpr(arena, arm.value, dialect, schema, check_fields)) orelse return null;
-        if (arm.is_default) {
-            w.print(" ELSE {s}", .{v}) catch return error.OutOfMemory;
-        } else if (m.subject != null) {
-            for (arm.pats) |p| {
-                const ps = (try translateExpr(arena, p, dialect, schema, check_fields)) orelse return null;
-                w.print(" WHEN {s} THEN {s}", .{ ps, v }) catch return error.OutOfMemory;
-            }
-        } else {
-            const g = (try translateExpr(arena, arm.guard orelse return null, dialect, schema, check_fields)) orelse return null;
-            w.print(" WHEN {s} THEN {s}", .{ g, v }) catch return error.OutOfMemory;
+
+    fn want(self: Tx) void {
+        if (self.o.wants_facts) |w| w.* = true;
+    }
+
+    fn factsOf(self: Tx, name: []const u8) ?ColFacts {
+        const f = self.o.facts orelse return null;
+        if (f.get(name)) |c| return c;
+        var it = f.iterator();
+        while (it.next()) |kv| if (std.ascii.eqlIgnoreCase(kv.key_ptr.*, name)) return kv.value_ptr.*;
+        return null;
+    }
+
+    fn kind(self: Tx, e: *const ast.Expr) Kind {
+        return switch (e.*) {
+            .str_lit => .{ .text = .{ .facts = null } },
+            .int_lit, .float_lit, .bool_lit, .null_lit => .other,
+            .field => |q| blk: {
+                if (q.parts.len != 1) break :blk .unknown;
+                if (self.factsOf(q.parts[0])) |f| break :blk if (f.text) Kind{ .text = .{ .facts = f } } else .other;
+                if (self.o.schema.indexOf(q.parts[0])) |i| {
+                    const k = self.o.schema.fields[i].ty.kind;
+                    break :blk if (k == .string) Kind{ .text = .{ .facts = null } } else .other;
+                }
+                break :blk .unknown;
+            },
+            .cast => |c| if (c.ty.kind == .string) Kind{ .text = .{ .facts = null } } else .other,
+            .call => |c| blk: {
+                if (!isTextFn(c.name)) break :blk .other;
+                break :blk .{ .text = .{ .facts = self.textFnFacts(c), .fn_ = true } };
+            },
+            else => .unknown,
+        };
+    }
+
+    /// The facts of the column a text builtin reads, its first column argument.
+    fn textFnFacts(self: Tx, c: ast.Expr.Call) ?ColFacts {
+        for (c.args) |a| if (a.* == .field and a.field.parts.len == 1) return self.factsOf(a.field.parts[0]);
+        return null;
+    }
+
+    fn pred(self: Tx, e: *const ast.Expr, need: Need) Err!?[]const u8 {
+        switch (e.*) {
+            .binary => |b| switch (b.op) {
+                .@"and", .@"or" => {
+                    const l = try self.pred(b.l, need);
+                    const r = try self.pred(b.r, need);
+                    // `A` alone keeps every row `A AND B` does: where a superset is
+                    // enough, the half that translates still goes
+                    if (b.op == .@"and" and need == .superset) {
+                        if (l == null) return r;
+                        if (r == null) return l;
+                    }
+                    return try self.fmt("({s} {s} {s})", .{ l orelse return null, if (b.op == .@"and") "AND" else "OR", r orelse return null });
+                },
+                .eq, .ne, .lt, .le, .gt, .ge => return self.compare(b.op, b.l, b.r, need),
+                else => return null,
+            },
+            .unary => |u| {
+                if (u.op != .not) return null;
+                const inner = (try self.pred(u.e, need.flip())) orelse return null;
+                return try self.fmt("(NOT ({s}))", .{inner});
+            },
+            .is_null => |n| {
+                const v = (try self.value(n.e)) orelse return null;
+                if (n.kind == .is_null)
+                    return try self.fmt("({s} IS {s}NULL)", .{ v, if (n.negated) "NOT " else "" });
+                // EMPTY is null or '': the '' test is a text comparison like any other
+                const blank = (try self.textCompare(.eq, n.e, "", if (n.negated) need.flip() else need)) orelse return null;
+                const t = try self.fmt("({s} IS NULL OR {s})", .{ v, blank });
+                return if (n.negated) try self.fmt("(NOT {s})", .{t}) else t;
+            },
+            .call => |c| {
+                if (isLikeFn(c.name)) return self.likePred(c, need);
+                return self.value(e);
+            },
+            // a condition decides which branch holds, so it must hold exactly
+            .cond => |c| {
+                const cnd = (try self.pred(c.cond, .exact)) orelse return null;
+                const t = (try self.value(c.then)) orelse return null;
+                const f = (try self.value(c.els)) orelse return null;
+                return try self.fmt("(CASE WHEN {s} THEN {s} ELSE {s} END)", .{ cnd, t, f });
+            },
+            .match => |m| return self.match(m),
+            else => return self.value(e),
         }
     }
-    w.writeAll(" END)") catch return error.OutOfMemory;
-    return try out.toOwnedSlice();
-}
 
-/// Dialect spelling of a CAST target type (null = don't push this cast).
-/// Scalar-function translation — only names whose semantics are identical in
-/// all three dialects (or have an exact per-dialect spelling). StarRocks rides
-/// the `.mysql` dialect, so every mysql rendering here must hold there too.
-///
-/// DELIBERATELY NOT TRANSLATED (don't "helpfully" add these — each one can drop a
-/// row the engine's kept filter would keep, which is the one thing pushdown may
-/// never do):
-///   - `round`         — half-even (postgres numeric) vs half-away-from-zero (mysql,
-///                       sqlserver), so .5 cases land on different values.
-///   - `greatest`/`least` — mysql returns NULL if ANY arg is null; postgres (and the
-///                       engine) ignore nulls and return the extreme of the rest.
-///   - `lpad`/`rpad`   — no sqlserver equivalent (and the hand-rolled REPLICATE form
-///                       truncates differently when the input is already too long).
-///   - `split_part`    — postgres-only; no mysql/sqlserver equivalent.
-///   - date functions (`date_add`, `date_diff`, `strftime`, `date_trunc`, …) — divergent
-///                       unit syntax, and month arithmetic clamps end-of-month differently.
-///   - `try_cast` / safe cast — see the `.cast` arm; null-on-failure must stay engine-side.
-fn translateCall(arena: std.mem.Allocator, c: ast.Expr.Call, dialect: Dialect, schema: types.Schema, check_fields: bool) error{OutOfMemory}!?[]const u8 {
-    const args = try arena.alloc([]const u8, c.args.len);
-    for (c.args, args) |a, *out| out.* = (try translateExpr(arena, a, dialect, schema, check_fields)) orelse return null;
+    fn value(self: Tx, e: *const ast.Expr) Err!?[]const u8 {
+        switch (e.*) {
+            .bool_lit => |b| return try self.arena.dupe(u8, if (b) "(1=1)" else "(1=0)"),
+            .int_lit => |v| return try self.fmt("{d}", .{v}),
+            .float_lit => |v| return try self.fmt("{d}", .{v}),
+            .null_lit => return try self.arena.dupe(u8, "NULL"),
+            .str_lit => |s| {
+                // SQL Server reads a literal without N in the column's code page,
+                // and N'' would turn a varchar column's index seek into a scan
+                if (self.dialect == .sqlserver and !asciiPrintable(s)) return null;
+                // a backslash is an escape inside a mysql string literal
+                if ((self.dialect == .mysql or self.dialect == .starrocks) and std.mem.indexOfScalar(u8, s, '\\') != null) return null;
+                return try sqlStr(self.arena, s);
+            },
+            .field => |q| {
+                if (q.parts.len != 1) return null;
+                if (self.o.check_fields and !inSchema(self.o.schema, q.parts[0])) return null;
+                return try split.quoteIdent(self.arena, self.dialect, q.parts[0]);
+            },
+            .cast => |c| {
+                // TRY_CAST is engine-only: the dialects' support for a null-on-failure cast is
+                // uneven (no portable spelling on mysql/starrocks), and a plain CAST would raise
+                // on the rows TRY_CAST is there to turn into nulls. Never push it.
+                if (c.safe) return null;
+                // Nor a text-to-number cast: the sources do not agree with each other on
+                // what a string that is not a number means (`CAST('1000,00' AS DECIMAL)`
+                // is NULL in StarRocks and MySQL, an error in Postgres and in basalt), so
+                // pushing it made the answer depend on whether the predicate descended.
+                // Provably numeric input still descends; unknown means "cannot prove".
+                if (numericKind(c.ty.kind) and !provablyNumeric(c.e, self.o.schema)) return null;
+                const inner = (try self.value(c.e)) orelse return null;
+                const ty = (try self.dialect.castType(self.arena, c.ty)) orelse return null;
+                return try self.fmt("CAST({s} AS {s})", .{ inner, ty });
+            },
+            .call => |c| return self.call(c),
+            .cond => |c| {
+                const cnd = (try self.pred(c.cond, .exact)) orelse return null;
+                const t = (try self.value(c.then)) orelse return null;
+                const f = (try self.value(c.els)) orelse return null;
+                return try self.fmt("(CASE WHEN {s} THEN {s} ELSE {s} END)", .{ cnd, t, f });
+            },
+            .match => |m| return self.match(m),
+            // a boolean used as a value must be exactly the engine's
+            .unary, .binary, .is_null => return self.pred(e, .exact),
+            else => return null,
+        }
+    }
 
-    const p = lookupPushable(c.name) orelse return null;
-    if (args.len < p.min_args or args.len > p.max_args) return null;
-    return p.render(arena, p, c, args, dialect);
-}
+    fn call(self: Tx, c: ast.Expr.Call) Err!?[]const u8 {
+        if (isLikeFn(c.name)) return self.likePred(c, .exact);
+        const p = lookupPushable(c.name) orelse return null;
+        if (c.args.len < p.min_args or c.args.len > p.max_args) return null;
+        if (std.mem.eql(u8, c.name, "substr")) {
+            // the engine counts bytes and the sources characters: past a
+            // non-ASCII character the two starts differ
+            if (c.args[1].* != .int_lit or c.args[1].int_lit != 1) return null;
+        }
+        if (std.mem.eql(u8, c.name, "replace")) {
+            // a case-insensitive collation replaces case-insensitively
+            const f = self.textFnFacts(c) orelse {
+                self.want();
+                return null;
+            };
+            if (!f.byte_order) return null;
+        }
+        const args = try self.arena.alloc([]const u8, c.args.len);
+        for (c.args, args) |a, *out| out.* = (try self.value(a)) orelse return null;
+        return p.render(self.arena, p, c, args, self.dialect);
+    }
+
+    /// `CASE x WHEN p …` compares by equality, which is exact only off text;
+    /// the guard form's conditions must hold exactly.
+    fn match(self: Tx, m: ast.Match) Err!?[]const u8 {
+        var out = std.array_list.Managed(u8).init(self.arena);
+        const w = out.writer();
+        if (m.subject) |subj| {
+            // numeric patterns make it a numeric comparison even when the subject's
+            // type is not known; a text one compares by collation
+            const sk = self.kind(subj);
+            if (sk == .text) return null;
+            if (sk == .unknown) for (m.arms) |arm| for (arm.pats) |p| switch (p.*) {
+                .int_lit, .float_lit => {},
+                else => return null,
+            };
+            const s = (try self.value(subj)) orelse return null;
+            try w.print("(CASE {s}", .{s});
+        } else {
+            try w.writeAll("(CASE");
+        }
+        for (m.arms) |arm| {
+            const v = (try self.value(arm.value)) orelse return null;
+            if (arm.is_default) {
+                try w.print(" ELSE {s}", .{v});
+            } else if (m.subject != null) {
+                for (arm.pats) |p| {
+                    if (self.kind(p) == .text) return null;
+                    const ps = (try self.value(p)) orelse return null;
+                    try w.print(" WHEN {s} THEN {s}", .{ ps, v });
+                }
+            } else {
+                const g = (try self.pred(arm.guard orelse return null, .exact)) orelse return null;
+                try w.print(" WHEN {s} THEN {s}", .{ g, v });
+            }
+        }
+        try w.writeAll(" END)");
+        return try out.toOwnedSlice();
+    }
+
+    fn mirror(op: ast.BinOp) ast.BinOp {
+        return switch (op) {
+            .lt => .gt,
+            .le => .ge,
+            .gt => .lt,
+            .ge => .le,
+            else => op,
+        };
+    }
+
+    fn opSql(op: ast.BinOp) []const u8 {
+        return switch (op) {
+            .eq => "=",
+            .ne => "<>",
+            .lt => "<",
+            .le => "<=",
+            .gt => ">",
+            .ge => ">=",
+            else => unreachable,
+        };
+    }
+
+    fn isLit(e: *const ast.Expr) bool {
+        return switch (e.*) {
+            .str_lit, .int_lit, .float_lit, .bool_lit, .null_lit => true,
+            else => false,
+        };
+    }
+
+    fn compare(self: Tx, op_in: ast.BinOp, l_in: *const ast.Expr, r_in: *const ast.Expr, need: Need) Err!?[]const u8 {
+        var l = l_in;
+        var r = r_in;
+        var op = op_in;
+        if (isLit(l) and !isLit(r)) {
+            l = r_in;
+            r = l_in;
+            op = mirror(op_in);
+        }
+        const lk = self.kind(l);
+        const rk = self.kind(r);
+        if (r.* == .str_lit and !isLit(l)) return self.textCompare(op, l, r.str_lit, need);
+        const texty = lk == .text or rk == .text;
+        const unknown = lk == .unknown or rk == .unknown;
+        if (!texty and !(unknown and !isLit(r))) {
+            // numbers, dates and times order and equal alike everywhere
+            const ls = (try self.value(l)) orelse return null;
+            const rs = (try self.value(r)) orelse return null;
+            return try self.fmt("({s} {s} {s})", .{ ls, opSql(op), rs });
+        }
+        // two text expressions (or ones not yet known not to be): equality only
+        // widens under a folding collation, inequality only narrows; an order is
+        // the same only where both compare bytes without padding
+        const lf: ?ColFacts = if (lk == .text) lk.text.facts else null;
+        const rf: ?ColFacts = if (rk == .text) rk.text.facts else null;
+        const settled = (op == .eq and need == .superset) or (op == .ne and need == .subset);
+        if ((lf == null or rf == null) and !settled) self.want();
+        const bytes = if (lf) |a| (if (rf) |b| a.byte_order and b.byte_order and !a.pads and !b.pads and !(lk == .text and lk.text.fn_) and !(rk == .text and rk.text.fn_) else false) else false;
+        const ok = bytes or switch (op) {
+            .eq => need == .superset,
+            .ne => need == .subset,
+            else => false,
+        };
+        if (!ok) return null;
+        const ls = (try self.value(l)) orelse return null;
+        const rs = (try self.value(r)) orelse return null;
+        return try self.fmt("({s} {s} {s})", .{ ls, opSql(op), rs });
+    }
+
+    /// `col op 'L'` over text. See `ColFacts` and the padded forms below.
+    fn textCompare(self: Tx, op: ast.BinOp, col: *const ast.Expr, lit: []const u8, need: Need) Err!?[]const u8 {
+        const k = self.kind(col);
+        if (k == .other) {
+            // a date, number or time column: the literal converts to its type at
+            // the source as it does here
+            const cs = (try self.value(col)) orelse return null;
+            const ls = (try self.value(&.{ .str_lit = lit })) orelse return null;
+            return try self.fmt("({s} {s} {s})", .{ cs, opSql(op), ls });
+        }
+        const known: ?ColFacts = if (k == .text) k.text.facts else null;
+        const f = known orelse ColFacts{ .text = true };
+        const is_fn = k == .text and k.text.fn_;
+        // equality as a superset and inequality as a subset hold under any
+        // collation; everything else is the collation's to decide
+        const settled = (op == .eq and need == .superset) or (op == .ne and need == .subset);
+        if (known == null and !is_fn and !settled) self.want();
+        const cs = (try self.value(col)) orelse return null;
+        const ls = (try self.value(&.{ .str_lit = lit })) orelse return null;
+        const plain = try self.fmt("({s} {s} {s})", .{ cs, opSql(op), ls });
+        const ascii = asciiPrintable(lit);
+
+        if (is_fn) {
+            // a builtin's result: equality with a printable ASCII literal only
+            if (!ascii) return null;
+            return switch (op) {
+                .eq => if (need == .superset) plain else null,
+                .ne => if (need == .subset) plain else null,
+                else => null,
+            };
+        }
+        if (f.byte_order and !f.pads and ascii) return plain;
+        switch (op) {
+            .eq => {
+                if (need == .superset) return plain;
+                return self.padExact(.eq, cs, ls, lit, f);
+            },
+            .ne => {
+                if (need == .subset) return plain;
+                return self.padExact(.ne, cs, ls, lit, f);
+            },
+            .lt, .le, .gt, .ge => {
+                if (!f.byte_order or !ascii) return null;
+                if (!f.pads) return plain;
+                if (need == .superset) {
+                    // padding compares a value and the literal as if the shorter were
+                    // filled with spaces: `>` may equal, and a control character
+                    // after the literal's bytes sorts below the fill — both kept by
+                    // the prefix test. `<` may equal only.
+                    if (op == .lt or op == .le) return try self.fmt("({s} <= {s})", .{ cs, ls });
+                    const pre = (try self.prefixLike(lit)) orelse return null;
+                    return try self.fmt("({s} >= {s} OR {s} LIKE {s})", .{ cs, ls, cs, pre });
+                }
+                return self.padExact(op, cs, ls, lit, f);
+            },
+            else => return null,
+        }
+    }
+
+    /// Exact text comparisons under a binary, space-padding collation, where a
+    /// byte length separates `'abc'` from `'abc  '`. Printable ASCII literals with
+    /// no trailing space only; null when the dialect has no byte length for it.
+    fn padExact(self: Tx, op: ast.BinOp, cs: []const u8, ls: []const u8, lit: []const u8, f: ColFacts) Err!?[]const u8 {
+        if (!f.byte_order or f.wide or !asciiPrintable(lit)) return null;
+        if (lit.len > 0 and lit[lit.len - 1] == ' ') return null;
+        const len_fn: []const u8 = switch (self.dialect) {
+            .sqlserver => "DATALENGTH",
+            .mysql, .starrocks => "LENGTH",
+            // a char(n)'s byte length leaves its padding out
+            .postgres => return null,
+        };
+        const n = lit.len;
+        const eq = try self.fmt("({s} = {s} AND {s}({s}) = {d})", .{ cs, ls, len_fn, cs, n });
+        if (op == .eq) return eq;
+        if (op == .ne) return try self.fmt("(NOT {s})", .{eq});
+        const pre = (try self.prefixLike(lit)) orelse return null;
+        const ge = try self.fmt("({s} >= {s} OR {s} LIKE {s})", .{ cs, ls, cs, pre });
+        const gt = try self.fmt("({s} > {s} OR ({s} LIKE {s} AND {s}({s}) > {d}))", .{ cs, ls, cs, pre, len_fn, cs, n });
+        return switch (op) {
+            .ge => ge,
+            .gt => gt,
+            .lt => try self.fmt("(NOT {s})", .{ge}),
+            .le => try self.fmt("(NOT {s})", .{gt}),
+            else => null,
+        };
+    }
+
+    /// `'lit%'`, the literal's own characters escaped for the dialect's LIKE.
+    fn prefixLike(self: Tx, lit: []const u8) Err!?[]const u8 {
+        var out = std.array_list.Managed(u8).init(self.arena);
+        for (lit) |c| switch (self.dialect) {
+            .sqlserver => switch (c) {
+                '%', '_', '[' => try out.writer().print("[{c}]", .{c}),
+                else => try out.append(c),
+            },
+            // backslash is both the LIKE escape and, on mysql, a string escape
+            else => switch (c) {
+                '%', '_', '\\' => return null,
+                else => try out.append(c),
+            },
+        };
+        try out.append('%');
+        return try sqlStr(self.arena, out.items);
+    }
+
+    /// `like` / `starts_with` / `ends_with` / `contains` against a literal
+    /// pattern. A folding collation and SQL Server's padding only let the source
+    /// match more; the source's `_` is a character where the engine's is a byte,
+    /// SQL Server reads `[` as a class, and mysql `\` as an escape.
+    fn likePred(self: Tx, c: ast.Expr.Call, need: Need) Err!?[]const u8 {
+        if (c.args.len != 2 or c.args[1].* != .str_lit) return null;
+        const raw = c.args[1].str_lit;
+        if (!asciiPrintable(raw) and self.dialect == .sqlserver) return null;
+        for (raw) |ch| {
+            if (ch == '_' or ch == '\\') return null;
+            if (!std.mem.eql(u8, c.name, "like") and ch == '%') return null;
+        }
+        var body = std.array_list.Managed(u8).init(self.arena);
+        for (raw) |ch| {
+            if (self.dialect == .sqlserver and ch == '[') try body.appendSlice("[[]") else try body.append(ch);
+        }
+        const pat = if (std.mem.eql(u8, c.name, "starts_with"))
+            try self.fmt("{s}%", .{body.items})
+        else if (std.mem.eql(u8, c.name, "ends_with"))
+            try self.fmt("%{s}", .{body.items})
+        else if (std.mem.eql(u8, c.name, "contains"))
+            try self.fmt("%{s}%", .{body.items})
+        else
+            body.items;
+        const k = self.kind(c.args[0]);
+        if (k != .text and k != .unknown) return null;
+        const known: ?ColFacts = if (k == .text) k.text.facts else null;
+        if (need != .superset) {
+            const f = known orelse {
+                self.want();
+                return null;
+            };
+            if (!f.byte_order or f.pads or (k == .text and k.text.fn_)) return null;
+        }
+        const target = (try self.value(c.args[0])) orelse return null;
+        return try self.fmt("({s} LIKE {s})", .{ target, try sqlStr(self.arena, pat) });
+    }
+};
+
 
 /// One pushable builtin: the engine name, the argument counts it is pushed
 /// for, and a renderer. `sql` is the portable spelling used by `render.plain`;
@@ -540,16 +943,16 @@ const variadic = std.math.maxInt(usize);
 const pushable = [_]Pushable{
     .{ .name = "lower", .sql = "LOWER", .min_args = 1, .max_args = 1, .render = render.plain },
     .{ .name = "upper", .sql = "UPPER", .min_args = 1, .max_args = 1, .render = render.plain },
-    .{ .name = "length", .min_args = 1, .max_args = 1, .render = render.length },
     .{ .name = "trim", .min_args = 1, .max_args = 1, .render = render.trim },
     .{ .name = "substr", .sql = "SUBSTRING", .min_args = 3, .max_args = 3, .render = render.plain },
     .{ .name = "replace", .sql = "REPLACE", .min_args = 3, .max_args = 3, .render = render.plain },
     .{ .name = "concat", .sql = "CONCAT", .min_args = 2, .max_args = variadic, .render = render.plain },
     .{ .name = "coalesce", .sql = "COALESCE", .min_args = 2, .max_args = variadic, .render = render.plain },
-    .{ .name = "like", .min_args = 2, .max_args = 2, .render = render.like },
-    .{ .name = "starts_with", .min_args = 2, .max_args = 2, .render = render.affix },
-    .{ .name = "ends_with", .min_args = 2, .max_args = 2, .render = render.affix },
-    .{ .name = "contains", .min_args = 2, .max_args = 2, .render = render.affix },
+    // rendered by `Tx.likePred`, which knows each dialect's pattern syntax
+    .{ .name = "like", .min_args = 2, .max_args = 2, .render = render.none },
+    .{ .name = "starts_with", .min_args = 2, .max_args = 2, .render = render.none },
+    .{ .name = "ends_with", .min_args = 2, .max_args = 2, .render = render.none },
+    .{ .name = "contains", .min_args = 2, .max_args = 2, .render = render.none },
     // Builtins spelled and evaluated identically on postgres, mysql/starrocks and
     // sqlserver. (Domain edges — SQRT of a negative, POWER(0, -n), MOD by zero — raise
     // on some engines and yield NULL on others; that's a loud query failure rather than
@@ -566,7 +969,6 @@ const pushable = [_]Pushable{
     .{ .name = "left", .min_args = 2, .max_args = 2, .render = render.counted },
     .{ .name = "right", .min_args = 2, .max_args = 2, .render = render.counted },
     .{ .name = "repeat", .min_args = 2, .max_args = 2, .render = render.counted },
-    .{ .name = "strpos", .min_args = 2, .max_args = 2, .render = render.strpos },
 };
 
 fn lookupPushable(name: []const u8) ?*const Pushable {
@@ -580,22 +982,16 @@ fn lookupPushable(name: []const u8) ?*const Pushable {
 }
 
 const render = struct {
+    fn none(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
+        _ = .{ arena, p, c, args, dialect };
+        return null;
+    }
+
     fn plain(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
         _ = c;
         _ = dialect;
         const joined = try std.mem.join(arena, ", ", args);
         return try std.fmt.allocPrint(arena, "{s}({s})", .{ p.sql, joined });
-    }
-
-    fn length(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
-        _ = p;
-        _ = c;
-        const f = switch (dialect) {
-            .sqlserver => "LEN",
-            .mysql, .starrocks => "CHAR_LENGTH",
-            .postgres => "LENGTH",
-        };
-        return try std.fmt.allocPrint(arena, "{s}({s})", .{ f, args[0] });
     }
 
     fn trim(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
@@ -605,29 +1001,6 @@ const render = struct {
             .sqlserver => try std.fmt.allocPrint(arena, "LTRIM(RTRIM({s}))", .{args[0]}),
             else => try std.fmt.allocPrint(arena, "TRIM({s})", .{args[0]}),
         };
-    }
-
-    fn like(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
-        _ = p;
-        _ = c;
-        _ = dialect;
-        return try std.fmt.allocPrint(arena, "({s} LIKE {s})", .{ args[0], args[1] });
-    }
-
-    fn affix(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
-        _ = dialect;
-        if (c.args[1].* != .str_lit) return null;
-        const pat = c.args[1].str_lit;
-        for (pat) |ch| {
-            if (ch == '%' or ch == '_' or ch == '\\') return null;
-        }
-        const shaped = if (std.mem.eql(u8, p.name, "starts_with"))
-            try std.fmt.allocPrint(arena, "{s}%", .{pat})
-        else if (std.mem.eql(u8, p.name, "ends_with"))
-            try std.fmt.allocPrint(arena, "%{s}", .{pat})
-        else
-            try std.fmt.allocPrint(arena, "%{s}%", .{pat});
-        return try std.fmt.allocPrint(arena, "({s} LIKE {s})", .{ args[0], try sqlStr(arena, shaped) });
     }
 
     fn ceil(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
@@ -668,19 +1041,6 @@ const render = struct {
         return try std.fmt.allocPrint(arena, "{s}({s}, {s})", .{ f, args[0], args[1] });
     }
 
-    fn strpos(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
-        _ = p;
-        // All three are 1-based with 0 for "not found", like the engine — but mysql's
-        // LOCATE and sqlserver's CHARINDEX take (needle, haystack), the reverse of
-        // postgres' STRPOS. An empty needle is the one divergence (postgres 1,
-        // sqlserver 0), so a literal '' isn't pushed.
-        if (c.args[1].* == .str_lit and c.args[1].str_lit.len == 0) return null;
-        return switch (dialect) {
-            .postgres => try std.fmt.allocPrint(arena, "STRPOS({s}, {s})", .{ args[0], args[1] }),
-            .mysql, .starrocks => try std.fmt.allocPrint(arena, "LOCATE({s}, {s})", .{ args[1], args[0] }),
-            .sqlserver => try std.fmt.allocPrint(arena, "CHARINDEX({s}, {s})", .{ args[1], args[0] }),
-        };
-    }
 };
 
 /// `ORDER BY … LIMIT n` / `LIMIT n` descended into a SQL source: the row cap the
@@ -810,10 +1170,12 @@ fn selectSource(items: []const ast.SelectItem, name: []const u8) ?[]const u8 {
 /// Whether every filter before the limit also runs at the source: the pushed limit
 /// counts rows after the source's WHERE, so a filter left engine-side would thin
 /// the capped set below what the engine's own limit keeps.
-fn filtersAllTranslate(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage, schema: types.Schema, check_fields: bool) !bool {
+fn filtersAllTranslate(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage, schema: types.Schema, check_fields: bool, facts: ?*const Facts) !bool {
+    // exactly: a looser source filter would let rows the engine then drops take
+    // places under the cap, leaving fewer than the limit
     for (stages[1..]) |st| {
         if (st.node != .filter) break;
-        if ((try translateExpr(arena, st.node.filter, dialect, schema, check_fields)) == null) return false;
+        if ((try translatePred(arena, st.node.filter, dialect, .{ .schema = schema, .check_fields = check_fields, .facts = facts, .need = .exact })) == null) return false;
     }
     return true;
 }
@@ -838,7 +1200,7 @@ pub const ExplainedTopN = struct { text: []const u8, rows: u64, sorted: bool };
 pub fn explainTopN(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage) !?ExplainedTopN {
     var why: []const u8 = "";
     const t = (try classifyTopN(arena, stages, &why)) orelse return null;
-    if (!try filtersAllTranslate(arena, dialect, stages, .{ .fields = &.{} }, false)) return null;
+    if (!try filtersAllTranslate(arena, dialect, stages, .{ .fields = &.{} }, false, null)) return null;
     const d = try t.describe(arena);
     return .{
         .text = if (t.keys.len == 0) d else try std.fmt.allocPrint(arena, "{s} (if the keys are numeric or temporal)", .{d}),
@@ -849,9 +1211,9 @@ pub fn explainTopN(arena: std.mem.Allocator, dialect: Dialect, stages: []const a
 
 /// The statement that asks the source for `t.rows` rows of `base_sql` in the
 /// engine's order, or null (with `why`) when it would not be the engine's answer.
-pub fn planTopN(arena: std.mem.Allocator, dialect: Dialect, base_sql: []const u8, src_schema: types.Schema, stages: []const ast.Stage, t: TopN, why: *[]const u8) !?[]const u8 {
-    if (!try filtersAllTranslate(arena, dialect, stages, src_schema, true)) {
-        why.* = try std.fmt.allocPrint(arena, "a WHERE predicate does not translate whole to {s} SQL", .{@tagName(dialect)});
+pub fn planTopN(arena: std.mem.Allocator, dialect: Dialect, base_sql: []const u8, src_schema: types.Schema, stages: []const ast.Stage, t: TopN, facts: ?*const Facts, why: *[]const u8) !?[]const u8 {
+    if (!try filtersAllTranslate(arena, dialect, stages, src_schema, true, facts)) {
+        why.* = try std.fmt.allocPrint(arena, "a WHERE predicate does not translate exactly to {s} SQL (a text comparison the column's collation decides differently, or an untranslatable piece)", .{@tagName(dialect)});
         return null;
     }
     for (t.keys) |k| {
@@ -895,11 +1257,17 @@ pub fn renderTopN(arena: std.mem.Allocator, dialect: Dialect, base_sql: []const 
 /// engine KEEPS the filter stages (superset rule) — the fragment only lets
 /// the source pre-narrow, so an untranslatable piece just isn't pushed.
 pub fn serialWhere(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage) !?[]const u8 {
+    return serialWhereWith(arena, dialect, stages, null, null);
+}
+
+/// `serialWhere` with the source's catalog facts; `wants` is set when having
+/// them could push more.
+pub fn serialWhereWith(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage, facts: ?*const Facts, wants: ?*bool) !?[]const u8 {
     if (stages.len < 2 or stages[0].node != .read) return null;
     var parts = std.array_list.Managed([]const u8).init(arena);
     for (stages[1..]) |st| {
         if (st.node != .filter) break;
-        if (try translateExpr(arena, st.node.filter, dialect, .{ .fields = &.{} }, false)) |sql_frag| {
+        if (try translatePred(arena, st.node.filter, dialect, .{ .facts = facts, .wants_facts = wants })) |sql_frag| {
             try parts.append(sql_frag);
         }
     }
@@ -1190,7 +1558,7 @@ test "translatePred: `is empty` translates to null-or-'', plain `is null` to IS 
     const a = ar.allocator();
     const e = try a.create(ast.Expr);
     e.* = .{ .is_null = .{ .e = try fld(a, "b"), .negated = false, .kind = .is_empty } };
-    try testing.expectEqualStrings("(`b` IS NULL OR `b` = '')", (try translateExpr(a, e, .mysql, testSchema(), true)).?);
+    try testing.expectEqualStrings("(`b` IS NULL OR (`b` = ''))", (try translateExpr(a, e, .mysql, testSchema(), true)).?);
     const n = try a.create(ast.Expr);
     n.* = .{ .is_null = .{ .e = try fld(a, "b"), .negated = false, .kind = .is_null } };
     try testing.expectEqualStrings("(`b` IS NULL)", (try translateExpr(a, n, .mysql, testSchema(), true)).?);
@@ -1271,10 +1639,14 @@ test "translateExpr: extended constructs (is empty, CASE, CAST, functions)" {
     const sqlp = @import("../lang/sql_parser.zig");
 
     const cases = [_]struct { src: []const u8, want: ?[]const u8, d: Dialect = .sqlserver }{
-        .{ .src = "status IS EMPTY", .want = "([status] IS NULL OR [status] = '')" },
-        .{ .src = "status IS NOT EMPTY", .want = "(NOT ([status] IS NULL OR [status] = ''))" },
+        .{ .src = "status IS EMPTY", .want = "([status] IS NULL OR ([status] = ''))" },
+        // SQL Server holds '  ' = '': under NOT that equality would drop a row the
+        // engine keeps, so it waits for the column's collation
+        .{ .src = "status IS NOT EMPTY", .want = null },
         .{ .src = "IF(v > 1, 'a', 'b')", .want = "(CASE WHEN ([v] > 1) THEN 'a' ELSE 'b' END)" },
-        .{ .src = "CASE status WHEN 'x', 'y' THEN 1 ELSE 0 END", .want = "(CASE [status] WHEN 'x' THEN 1 WHEN 'y' THEN 1 ELSE 0 END)" },
+        // a text subject compares by collation: 'X' would take the 'x' arm
+        .{ .src = "CASE status WHEN 'x', 'y' THEN 1 ELSE 0 END", .want = null },
+        .{ .src = "CASE v WHEN 1 THEN 1 ELSE 0 END > 0", .want = "((CASE [v] WHEN 1 THEN 1 ELSE 0 END) > 0)" },
         // Cast to a number, over a schema nobody has resolved: unprovable, so it
         // stays in the engine. The sources disagree about what `CAST('abc' AS INT)`
         // means (null in StarRocks/MySQL, an error in Postgres), and descending
@@ -1286,8 +1658,10 @@ test "translateExpr: extended constructs (is empty, CASE, CAST, functions)" {
         // Cast to a non-numeric type is unaffected by that disagreement.
         .{ .src = "CAST(v AS STRING) = 'x'", .want = "(CAST([v] AS VARCHAR(MAX)) = 'x')" },
         .{ .src = "lower(status) = 'ok'", .want = "(LOWER([status]) = 'ok')" },
-        .{ .src = "length(status) > 2", .want = "(LEN([status]) > 2)" },
-        .{ .src = "length(status) > 2", .want = "(CHAR_LENGTH(`status`) > 2)", .d = .mysql },
+        // the engine counts bytes, the sources characters (and LEN drops trailing spaces)
+        .{ .src = "length(status) > 2", .want = null },
+        .{ .src = "length(status) > 2", .want = null, .d = .mysql },
+        .{ .src = "strpos(status, 'a') = 2", .want = null },
         .{ .src = "trim(status) = 'x'", .want = "(LTRIM(RTRIM([status])) = 'x')" },
         .{ .src = "substr(status, 1, 2) = 'AB'", .want = "(SUBSTRING([status], 1, 2) = 'AB')" },
         .{ .src = "coalesce(status, 'n') = 'n'", .want = "(COALESCE([status], 'n') = 'n')" },
@@ -1295,6 +1669,20 @@ test "translateExpr: extended constructs (is empty, CASE, CAST, functions)" {
         .{ .src = "starts_with(status, 'CT2')", .want = "([status] LIKE 'CT2%')" },
         .{ .src = "status LIKE 'a%'", .want = "([status] LIKE 'a%')" },
         .{ .src = "contains(status, '10%')", .want = null },
+        // a byte in the engine, a character at the source
+        .{ .src = "status LIKE 'a_b'", .want = null },
+        // SQL Server reads `[` as a character class
+        .{ .src = "contains(status, '[x]')", .want = "([status] LIKE '%[[]x]%')" },
+        .{ .src = "contains(status, '[x]')", .want = "(`status` LIKE '%[x]%')", .d = .mysql },
+        .{ .src = "substr(status, 2, 2) = 'AB'", .want = null },
+        // without the column's collation, an order or a negated equality on text stays here
+        .{ .src = "status >= 'B'", .want = null },
+        .{ .src = "status <> 'x'", .want = null },
+        .{ .src = "NOT (status = 'x')", .want = null },
+        // ...while the half of an AND that translates still goes
+        .{ .src = "status >= 'B' AND v > 1", .want = "([v] > 1)" },
+        .{ .src = "status = '\u{e9}'", .want = null },
+        .{ .src = "status = 'a\\b'", .want = null, .d = .mysql },
         .{ .src = "now() > v", .want = null },
         .{ .src = "v + 1 > 2", .want = null },
     };
@@ -1303,9 +1691,13 @@ test "translateExpr: extended constructs (is empty, CASE, CAST, functions)" {
         const e = try sqlp.parseExprStr(a, tc.src, &diag);
         const got = try translateExpr(a, e, tc.d, .{ .fields = &.{} }, false);
         if (tc.want) |w| {
-            try std.testing.expectEqualStrings(w, got orelse return error.TestUnexpectedResult);
-        } else {
-            try std.testing.expect(got == null);
+            std.testing.expectEqualStrings(w, got orelse "<null>") catch |err| {
+                std.debug.print("case: {s}\n", .{tc.src});
+                return err;
+            };
+        } else if (got) |g| {
+            std.debug.print("case {s}: want null, got {s}\n", .{ tc.src, g });
+            return error.TestUnexpectedResult;
         }
     }
 }
@@ -1407,18 +1799,16 @@ test "translateCall: mod is the % operator on sqlserver, MOD elsewhere" {
     try testing.expectEqualStrings("(([a] % 3) = 0)", (try translateExpr(a, cmp, .sqlserver, testSchema(), true)).?);
 }
 
-test "translateCall: strpos swaps its arguments on mysql and sqlserver" {
+test "translateCall: strpos and length stay in the engine, which counts bytes where the sources count characters" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const e = try callExpr(a, "strpos", &[_]*ast.Expr{ try fld(a, "b"), try strLit(a, "xy") });
-    try testing.expectEqualStrings("STRPOS(\"b\", 'xy')", (try translateExpr(a, e, .postgres, testSchema(), true)).?);
-    try testing.expectEqualStrings("LOCATE('xy', `b`)", (try translateExpr(a, e, .mysql, testSchema(), true)).?);
-    try testing.expectEqualStrings("CHARINDEX('xy', [b])", (try translateExpr(a, e, .sqlserver, testSchema(), true)).?);
-
-    // An empty needle is 1 on postgres and 0 on sqlserver — not pushable.
-    const empty = try callExpr(a, "strpos", &[_]*ast.Expr{ try fld(a, "b"), try strLit(a, "") });
-    try testing.expect((try translateExpr(a, empty, .postgres, testSchema(), true)) == null);
+    for ([_]Dialect{ .postgres, .mysql, .sqlserver }) |d| {
+        const sp = try callExpr(a, "strpos", &[_]*ast.Expr{ try fld(a, "b"), try strLit(a, "x") });
+        try testing.expect((try translateExpr(a, sp, d, testSchema(), true)) == null);
+        const ln = try callExpr(a, "length", &[_]*ast.Expr{try fld(a, "b")});
+        try testing.expect((try translateExpr(a, ln, d, testSchema(), true)) == null);
+    }
 }
 
 test "translateCall: repeat is REPLICATE on sqlserver; left/right are portable" {
@@ -1674,17 +2064,17 @@ test "planWholeAggWhy: a refusal names the gate that refused" {
     nowc.* = .{ .call = .{ .name = "now", .args = &.{} } };
     const bad = ast.Stage{ .node = .{ .filter = try bin(a, .gt, try fld(a, "t"), nowc) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
     const ag = ast.Aggregate{ .aggs = aggs, .by = try byList(a, &.{"b"}) };
-    try testing.expect((try planWholeAggWhy(a, .mysql, base_t, wholeSchema(), &.{bad}, ag, plan_schema, &why)) == null);
-    try testing.expectEqualStrings("the WHERE predicate does not translate whole to mysql SQL", why);
+    try testing.expect((try planWholeAggWhy(a, .mysql, base_t, wholeSchema(), &.{bad}, ag, plan_schema, null, &why)) == null);
+    try testing.expectEqualStrings("the WHERE predicate does not translate exactly to mysql SQL (a text comparison the column's collation decides differently, or an untranslatable piece)", why);
 
     const missing = ast.Aggregate{ .aggs = aggs, .by = try byList(a, &.{"zzz"}) };
-    try testing.expect((try planWholeAggWhy(a, .postgres, base_t, wholeSchema(), &.{}, missing, plan_schema, &why)) == null);
+    try testing.expect((try planWholeAggWhy(a, .postgres, base_t, wholeSchema(), &.{}, missing, plan_schema, null, &why)) == null);
     try testing.expectEqualStrings("group key `zzz` is not a source column", why);
 
     const avg = try a.alloc(ast.AggItem, 1);
     avg[0] = .{ .name = "av", .func = .avg, .arg = try fld(a, "a") };
     const avg_schema = types.Schema{ .fields = &.{.{ .name = "av", .ty = types.Type.init(.float) }} };
-    try testing.expect((try planWholeAggWhy(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = avg, .by = &.{} }, avg_schema, &why)) == null);
+    try testing.expect((try planWholeAggWhy(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = avg, .by = &.{} }, avg_schema, null, &why)) == null);
     try testing.expect(std.mem.startsWith(u8, why, "`av` is not pushed down"));
 }
 
@@ -2301,17 +2691,17 @@ test "top-N: key types the source orders as the engine does, and filters that mu
         const sql = try std.fmt.allocPrint(a, "SELECT * FROM db.t ORDER BY {s} LIMIT 5", .{k});
         const stages = try topNStagesOf(a, sql);
         const t = (try classifyTopN(a, stages, &why)).?;
-        try std.testing.expect((try planTopN(a, .postgres, "SELECT * FROM t", schema, stages, t, &why)) != null);
+        try std.testing.expect((try planTopN(a, .postgres, "SELECT * FROM t", schema, stages, t, null, &why)) != null);
     }
     // a string's order is its collation's
     const s_st = try topNStagesOf(a, "SELECT * FROM db.t ORDER BY name LIMIT 5");
     const s_t = (try classifyTopN(a, s_st, &why)).?;
-    try std.testing.expect((try planTopN(a, .postgres, "SELECT * FROM t", schema, s_st, s_t, &why)) == null);
+    try std.testing.expect((try planTopN(a, .postgres, "SELECT * FROM t", schema, s_st, s_t, null, &why)) == null);
     try std.testing.expect(std.mem.indexOf(u8, why, "collation") != null);
     // a filter the source cannot run would thin the capped rows below the engine's cut
     const f_st = try topNStagesOf(a, "SELECT * FROM db.t WHERE to_hex(id) = '5' ORDER BY id LIMIT 5");
     const f_t = (try classifyTopN(a, f_st, &why)).?;
-    try std.testing.expect((try planTopN(a, .postgres, "SELECT * FROM t", schema, f_st, f_t, &why)) == null);
+    try std.testing.expect((try planTopN(a, .postgres, "SELECT * FROM t", schema, f_st, f_t, null, &why)) == null);
     try std.testing.expect(std.mem.indexOf(u8, why, "does not translate") != null);
 }
 
@@ -2339,4 +2729,69 @@ test "top-N: each dialect's spelling of nulls-last ordering and the row cap" {
     );
     try std.testing.expectEqualStrings("SELECT TOP (5) * FROM (SELECT * FROM t) _t", try renderTopN(a, .sqlserver, base, .{ .rows = 5 }));
     try std.testing.expectEqualStrings("SELECT * FROM (SELECT * FROM t) _t LIMIT 5", try renderTopN(a, .postgres, base, .{ .rows = 5 }));
+}
+
+test "text comparisons against the column's collation: exact where it compares bytes, widened where it pads, refused where it folds" {
+    var arn = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arn.deinit();
+    const a = arn.allocator();
+    const sqlp = @import("../lang/sql_parser.zig");
+
+    var facts = Facts.init(a);
+    try facts.put("d", .{ .text = true, .byte_order = true, .pads = true }); // Protheus: Latin1_General_BIN
+    try facts.put("ci", .{ .text = true, .byte_order = false, .pads = true }); // Latin1_General_CI_AS
+    try facts.put("c", .{ .text = true, .byte_order = true, .pads = false }); // postgres COLLATE "C"
+    try facts.put("n", .{ .text = false });
+
+    const cases = [_]struct { src: []const u8, need: Need, want: ?[]const u8, d: Dialect = .sqlserver }{
+        // binary and padded: as a superset, the range is widened and the prefix kept
+        .{ .src = "d >= '20240105'", .need = .superset, .want = "([d] >= '20240105' OR [d] LIKE '20240105%')" },
+        .{ .src = "d > '000123'", .need = .superset, .want = "([d] >= '000123' OR [d] LIKE '000123%')" },
+        .{ .src = "d < 'Z'", .need = .superset, .want = "([d] <= 'Z')" },
+        .{ .src = "d = '01'", .need = .superset, .want = "([d] = '01')" },
+        // exact: a byte length separates '01' from '01 '
+        .{ .src = "d = '01'", .need = .exact, .want = "([d] = '01' AND DATALENGTH([d]) = 2)" },
+        .{ .src = "d > '000123'", .need = .exact, .want = "([d] > '000123' OR ([d] LIKE '000123%' AND DATALENGTH([d]) > 6))" },
+        .{ .src = "d < '2024'", .need = .exact, .want = "(NOT ([d] >= '2024' OR [d] LIKE '2024%'))" },
+        .{ .src = "NOT (d = 'x')", .need = .superset, .want = "(NOT (([d] = 'x' AND DATALENGTH([d]) = 1)))" },
+        .{ .src = "d >= 'a b'", .need = .superset, .want = "([d] >= 'a b' OR [d] LIKE 'a b%')" },
+        .{ .src = "d >= '10%'", .need = .superset, .want = "([d] >= '10%' OR [d] LIKE '10[%]%')" },
+        .{ .src = "d = 'x '", .need = .exact, .want = null },
+        // case-insensitive: equality may only widen, and there is no exact form
+        .{ .src = "ci = 'x'", .need = .superset, .want = "([ci] = 'x')" },
+        .{ .src = "ci = 'x'", .need = .exact, .want = null },
+        .{ .src = "ci >= 'B'", .need = .superset, .want = null },
+        .{ .src = "ci <> 'x'", .need = .superset, .want = null },
+        .{ .src = "ci LIKE 'a%'", .need = .superset, .want = "([ci] LIKE 'a%')" },
+        .{ .src = "ci LIKE 'a%'", .need = .exact, .want = null },
+        // bytes, no padding: every comparison as it is
+        .{ .src = "c >= 'b'", .need = .exact, .want = "(\"c\" >= 'b')", .d = .postgres },
+        .{ .src = "c <> 'b'", .need = .exact, .want = "(\"c\" <> 'b')", .d = .postgres },
+        // postgres has no byte length that sees char(n) padding
+        .{ .src = "d = 'x'", .need = .exact, .want = null, .d = .postgres },
+        // not text: the literal converts at the source as it does here
+        .{ .src = "n >= '2024-01-01'", .need = .exact, .want = "([n] >= '2024-01-01')" },
+        .{ .src = "d = '01'", .need = .exact, .want = "(`d` = '01' AND LENGTH(`d`) = 2)", .d = .mysql },
+    };
+    for (cases) |tc| {
+        var diag: sqlp.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const e = try sqlp.parseExprStr(a, tc.src, &diag);
+        const got = try translatePred(a, e, tc.d, .{ .facts = &facts, .need = tc.need });
+        if (tc.want) |w| {
+            std.testing.expectEqualStrings(w, got orelse "<null>") catch |err| {
+                std.debug.print("case: {s}\n", .{tc.src});
+                return err;
+            };
+        } else if (got) |g| {
+            std.debug.print("case {s}: want null, got {s}\n", .{ tc.src, g });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // without facts, a text order says it would like them
+    var wants = false;
+    var diag: sqlp.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const e = try sqlp.parseExprStr(a, "x >= 'B'", &diag);
+    try std.testing.expect((try translatePred(a, e, .sqlserver, .{ .wants_facts = &wants })) == null);
+    try std.testing.expect(wants);
 }

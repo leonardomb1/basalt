@@ -385,13 +385,39 @@ Source clauses, in any order after the source:
   Postgres and here, so descending it would make the answer depend on whether it
   descended; put the expression in a raw `QUERY(...)` to ask for the source's own
   coercion), and the portable string
-  functions (`lower upper length trim substr replace concat coalesce
-  starts_with ends_with contains`). A `$param`, LET or loop variable descends
+  functions (`lower upper trim substr replace concat coalesce starts_with
+  ends_with contains`). A `$param`, LET or loop variable descends
   as its value — `WHERE D2_EMISSAO >= $since` sends `>= '20240105'`, with a
   query LET's value decided first. Untranslatable pieces (arithmetic,
   `now()`/`today()`, user funcs) stay in the engine — the filter is always
   kept, so results never change, only how much crosses the wire. `EXPLAIN`
   prints the descended predicate on a `pushdown:` line.
+- **Text comparisons follow the column's collation**, so the source never keeps
+  fewer rows than basalt would. basalt compares text byte by byte; a source
+  compares by collation — case-insensitive by default on SQL Server and MySQL,
+  and SQL Server ignores trailing spaces (`'ab   ' = 'ab'`) under every
+  collation, binary ones too. Sent as written, `code >= 'B'` lost `'a…'` rows on
+  a case-insensitive server, and `D2_DOC > '000123'` lost the padded
+  `'000123   '` on a Protheus `char(n)`. So, asking the source's catalog once
+  per run and table, and only when a text comparison is in play:
+  - `=`, `IN`, `LIKE` and the prefix/suffix/contains tests descend under any
+    collation — folding and padding only let the source match more, and the
+    engine re-applies the filter.
+  - `<`, `<=`, `>`, `>=` on text descend only where the column compares bytes (a
+    `_BIN`/`_BIN2` collation on SQL Server, `_bin` on MySQL, `C` on Postgres,
+    StarRocks always) and the literal is printable ASCII; where the collation
+    also pads, `>` is sent as `>= 'x' OR col LIKE 'x%'` and `<` as `<=`,
+    which keeps every row basalt keeps. Elsewhere they stay in the engine.
+  - `<>`, `NOT (… = …)` and `IS NOT EMPTY` on text negate an equality the
+    collation widens, so they descend only where it compares bytes — on
+    SQL Server with an exact form, `NOT (col = 'x' AND DATALENGTH(col) = 1)`.
+  - `length()` and `strpos()` never descend (basalt counts bytes, the sources
+    characters), nor a `LIKE` pattern holding `_` (a byte here, a character
+    there); SQL Server's `[` is escaped, and on SQL Server a literal outside
+    printable ASCII stays in the engine.
+
+  `EXPLAIN` does not connect, so it says `text comparisons decided by the
+  collation at run time` where the catalog will decide.
 - **Whole-aggregate pushdown** — `read <sql> | filters | GROUP BY` descends as
   one grouped query when every filter translates, the group keys are bare
   columns, and the aggregates are `COUNT[(DISTINCT)] SUM MIN MAX` with types
@@ -399,6 +425,11 @@ Source clauses, in any order after the source:
   collation-dependent string extremes deliberately stay engine-side — the
   result must be bit-identical, not merely close). `HAVING`/sort/limit still
   run in the engine on the tiny grouped result.
+  Nothing re-applies the `WHERE` over a grouped result, so each filter must
+  keep *exactly* basalt's rows: a text comparison descends only where the
+  column's collation compares bytes — on a Protheus binary collation as
+  `D2_FILIAL = '01' AND DATALENGTH(D2_FILIAL) = 2`, since SQL Server would also
+  count `'01 '`. The top-N descent below holds its filters to the same rule.
   When an aggregate over a SQL source does *not* descend, every matching row
   is streamed to the engine to be grouped — the run log says so in a `warn`
   line that names the rule that refused it (`the WHERE predicate does not

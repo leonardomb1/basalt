@@ -140,7 +140,7 @@ LOAD INTO $3 REPLACE AS SELECT CAST(id AS INT) AS id, CAST(v AS INT) AS v, CAST(
       report "$1-topn-$6" ok
     else
       report "$1-topn-$6 (got $how, want $5)" bad
-      diff "$g.ref" "$g.csv" | head -8
+      diff "$g.ref" "$g.csv" | head -8 || true
     fi
   }
   tq "$1" "id, v"      ""      "ORDER BY v DESC, id LIMIT 4"            pushed int-desc-nulls-last
@@ -207,6 +207,43 @@ SELECT id FROM db.it_topn WHERE id >= \$lo AND id <= \$hi ORDER BY id;" >"$out/p
   fi
 }
 
+# Text comparisons against collations that disagree with basalt's byte order:
+# case-insensitive, space-padding, `[` as a LIKE class, character-counting
+# length(). Every query must answer what the engine alone answers from a parquet
+# copy of the same rows — pushed down as far as that stays true, and no further.
+collrt() { # $1 label, $2 CREATE CONNECTION db ..., $3 LOAD target
+  local decl=$2 pq="$out/coll_$1.parquet"
+  printf 'n,code\n1,a\n2,B\n3,b\n4,000123\n5,000123   \n6,Z\n7,x[1]\n8,\n9,a\303\251\n10,  \n' >"$out/coll.csv"
+  if ! brun run -c "$decl
+LOAD INTO $3 REPLACE AS SELECT CAST(n AS INT) AS n, CAST(code AS STRING) AS code FROM '$out/coll.csv' WITH (null = '');" ||
+     ! brun run -c "$decl
+LOAD INTO '$pq' AS SELECT n, code FROM db.it_coll;"; then
+    report "$1-collation (setup error)" bad
+    return
+  fi
+  local bad=0 q
+  for q in "code >= 'B'" "code > '000123'" "code < 'b'" "code <> 'b'" "NOT (code = 'b')" "code = 'b'" \
+           "contains(code, '[1]')" "code IS NOT EMPTY" "length(code) = 2" "code >= 'B' AND n > 1"; do
+    $B run --format csv -q -c "$decl SELECT n FROM db.it_coll WHERE $q ORDER BY n;" >"$out/coll_got.csv" 2>&1
+    $B run --format csv -q -c "SELECT n FROM '$pq' WHERE $q ORDER BY n;" >"$out/coll_want.csv" 2>&1
+    if ! cmp -s "$out/coll_got.csv" "$out/coll_want.csv"; then
+      bad=1; echo "  $1: WHERE $q"; diff "$out/coll_want.csv" "$out/coll_got.csv" | head -4 || true
+    fi
+  done
+  # descended whole: an aggregate and a top-N take the source's rows as they are
+  $B run --format csv -q -c "$decl SELECT count(*) AS c FROM db.it_coll WHERE code = 'b';" >"$out/coll_got.csv" 2>&1
+  $B run --format csv -q -c "SELECT count(*) AS c FROM '$pq' WHERE code = 'b';" >"$out/coll_want.csv" 2>&1
+  cmp -s "$out/coll_got.csv" "$out/coll_want.csv" || { bad=1; echo "  $1: count where code = 'b'"; diff "$out/coll_want.csv" "$out/coll_got.csv" | head -4 || true; }
+  $B run --format csv -q -c "$decl SELECT n FROM db.it_coll WHERE code >= 'B' ORDER BY n DESC LIMIT 2;" >"$out/coll_got.csv" 2>&1
+  $B run --format csv -q -c "SELECT n FROM '$pq' WHERE code >= 'B' ORDER BY n DESC LIMIT 2;" >"$out/coll_want.csv" 2>&1
+  cmp -s "$out/coll_got.csv" "$out/coll_want.csv" || { bad=1; echo "  $1: top-N over code >= 'B'"; diff "$out/coll_want.csv" "$out/coll_got.csv" | head -4 || true; }
+  if [ $bad = 0 ]; then report "$1-collation" ok; else report "$1-collation" bad; fi
+}
+
+runs mysql     && collrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"      db.it_coll
+runs postgres  && collrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"      db.it_coll
+runs sqlserver && collrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);" db.it_coll
+
 runs mysql     && paramrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"
 runs postgres  && paramrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"
 runs sqlserver && paramrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);"
@@ -225,6 +262,43 @@ SELECT * FROM m.QUERY(\$\$IF DB_ID('it_bin') IS NULL EXEC('CREATE DATABASE it_bi
      brun run -c "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_BIN);
 LOAD INTO db.dbo.it_topn REPLACE AS SELECT CAST(id AS INT) AS id, CAST(amt AS DECIMAL(10,2)) AS amt FROM 'it/topn.csv';"; then
     catalogrt sqlserver-binary-collation "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_BIN);" dbo
+    collrt sqlserver-binary "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_BIN);" db.it_coll
+
+    # Protheus-shaped: char/varchar under a binary collation, where a char(n) comes
+    # back space-padded and SQL Server compares padded — `c > 'ab'` is false there
+    # for 'ab      ' and true here. The pushed forms (widened where re-filtered,
+    # exact through DATALENGTH where not) must still answer as the engine does.
+    PX="CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_BIN);"
+    # one statement per QUERY: only a batch's first statement is sure to run
+    # before the reader takes its result and closes. Columns say NULL outright —
+    # this session's default for a new column is NOT NULL.
+    if brun run -c "$PX SELECT * FROM db.QUERY(\$\$IF OBJECT_ID('dbo.it_prot') IS NOT NULL DROP TABLE dbo.it_prot\$\$);" &&
+       brun run -c "$PX SELECT * FROM db.QUERY(\$\$CREATE TABLE dbo.it_prot (n int NULL, c char(8) NULL, v varchar(10) NULL, p char(8) NOT NULL)\$\$);" &&
+       brun run -c "$PX SELECT * FROM db.QUERY(\$\$INSERT INTO dbo.it_prot VALUES (1, 'ab', 'ab', 'ab'), (2, 'ab' + CHAR(9), 'aB', 'ab'), (3, 'abc', 'b', 'abc'), (4, 'aa', '000123', 'aa'), (5, NULL, NULL, 'zz'), (6, 'B', 'Z', 'B')\$\$);" &&
+       [ "$($B run --format csv -q -c "$PX SELECT count(*) AS k FROM db.dbo.it_prot;" | tail -1)" = 6 ] &&
+       brun run -c "$PX LOAD INTO '$out/prot.parquet' AS SELECT n, c, v, p FROM db.dbo.it_prot;"; then
+      pbad=0
+      # p is a NOT NULL char(8): it comes back padded, 'ab      '
+      for q in "c > 'ab'" "c >= 'ab'" "c < 'ab'" "c <= 'ab'" "c = 'ab'" "c <> 'ab'" "v >= 'b'" "v > '000123'" "c IS NOT EMPTY" \
+               "p > 'ab'" "p >= 'ab'" "p < 'ab'" "p = 'ab'" "p <> 'ab'" "NOT (p = 'ab')"; do
+        $B run --format csv -q -c "$PX SELECT n FROM db.dbo.it_prot WHERE $q ORDER BY n;" >"$out/p_got.csv" 2>&1
+        $B run --format csv -q -c "SELECT n FROM '$out/prot.parquet' WHERE $q ORDER BY n;" >"$out/p_want.csv" 2>&1
+        cmp -s "$out/p_got.csv" "$out/p_want.csv" || { pbad=1; echo "  protheus: WHERE $q"; diff "$out/p_want.csv" "$out/p_got.csv" | head -4 || true; }
+      done
+      for q in "count(*) AS k FROM %T WHERE c = 'ab'" "count(*) AS k FROM %T WHERE c > 'ab'" "n FROM %T WHERE c >= 'ab' ORDER BY n DESC LIMIT 2" \
+               "count(*) AS k FROM %T WHERE p = 'ab'" "count(*) AS k FROM %T WHERE p > 'ab'" "n FROM %T WHERE p > 'ab' ORDER BY n LIMIT 3"; do
+        $B run --format csv -q -c "$PX SELECT ${q//%T/db.dbo.it_prot};" >"$out/p_got.csv" 2>&1
+        $B run --format csv -q -c "SELECT ${q//%T/\'$out/prot.parquet\'};" >"$out/p_want.csv" 2>&1
+        cmp -s "$out/p_got.csv" "$out/p_want.csv" || { pbad=1; echo "  protheus: SELECT $q"; diff "$out/p_want.csv" "$out/p_got.csv" | head -4 || true; }
+      done
+      # and it still descends: the range reaches SQL Server
+      $B run --format csv --log-level debug -c "$PX SELECT n FROM db.dbo.it_prot WHERE c >= 'ab';" >"$out/p_log.txt" 2>&1 || true
+      grep -q "LIKE 'ab%'" "$out/p_log.txt" || { pbad=1; echo "  protheus: the range did not descend"; }
+      if [ $pbad = 0 ]; then report "sqlserver-protheus-padding" ok; else report "sqlserver-protheus-padding" bad; fi
+    else
+      report "sqlserver-protheus-padding (setup error)" bad
+    fi
+
   else
     report "sqlserver-binary-collation (setup error)" bad
   fi
@@ -405,6 +479,7 @@ LOAD INTO '$out/sr_embedded_out.csv' AS SELECT id, s FROM fe.it_nullmark2 ORDER 
   # read back through a starrocks connection, so the starrocks dialect renders it
   topnrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_topn USING stream_load"
   paramrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');"
+  collrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_coll USING stream_load"
   catalogrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" it
 fi
 
@@ -1070,7 +1145,7 @@ if runs stdout; then
       report "stdout table: a terminal gets the same full table as a pipe" ok
     else
       report "stdout table: a terminal gets the same full table as a pipe" bad
-      diff "$out/pipe.txt" "$out/tty.txt" | head -6
+      diff "$out/pipe.txt" "$out/tty.txt" | head -6 || true
     fi
   fi
 

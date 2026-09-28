@@ -24,6 +24,8 @@ const tds = @import("../connect/tds.zig");
 const mysql = @import("../connect/mysql.zig");
 const postgres = @import("../connect/postgres.zig");
 const sql = @import("../connect/sql.zig");
+const pushdown = @import("pushdown.zig");
+const Value = @import("../exec/value.zig").Value;
 const request = @import("../connect/request.zig");
 const http_client = @import("../connect/http_client.zig");
 const aad = @import("../connect/aad.zig");
@@ -962,6 +964,172 @@ pub fn dupeSchema(arena: std.mem.Allocator, s: types.Schema) !types.Schema {
     const fields = try arena.alloc(types.Schema.Field, s.fields.len);
     for (s.fields, fields) |f, *o| o.* = .{ .name = try arena.dupe(u8, f.name), .ty = f.ty };
     return .{ .fields = fields };
+}
+
+/// What the source's catalog says of each column of a SQL table read — whether
+/// it is text, and how its collation compares — for deciding which text
+/// comparisons can descend (`pushdown.ColFacts`). Asked once per run and table,
+/// and only when a comparison would descend differently for knowing. Null for a
+/// read that is not a SQL table. A catalog that cannot be asked (no permission, an
+/// old server) answers nothing, which keeps every text comparison in the engine.
+pub fn columnFacts(env: *Env, rd: ast.Read) !?*const pushdown.Facts {
+    if (rd.form != .table) return null;
+    const conn = env.connections.get(rd.connector) orelse return null;
+    const info = sqlConnInfo(conn) orelse return null;
+    const cache = env.facts_cache orelse return null;
+    cache.mu.lock();
+    defer cache.mu.unlock();
+    const ca = cache.arena.allocator();
+    const key = try std.fmt.allocPrint(ca, "{s}\x00{s}", .{ rd.connector, try qualStr(ca, rd.form.table) });
+    if (cache.map.get(key)) |f| return f;
+
+    const facts = try ca.create(pushdown.Facts);
+    facts.* = pushdown.Facts.init(ca);
+    try cache.map.put(key, facts);
+    probeFacts(env, ca, conn, info, rd.form.table.parts, facts) catch |e| {
+        if (e == error.OutOfMemory) return e;
+        facts.clearRetainingCapacity();
+        env.log.log(.debug, "catalog facts for {s}: not available ({s}); text comparisons stay in the engine", .{ key[rd.connector.len + 1 ..], @errorName(e) });
+    };
+    return facts;
+}
+
+/// `columnFacts`, but only when some filter in `stages` would descend differently
+/// for them — most pipelines never pay the catalog round trip.
+pub fn factsIfWanted(env: *Env, rd: ast.Read, dialect: sql.Dialect, stages: []const ast.Stage, schema: types.Schema, check_fields: bool, need: pushdown.Need) !?*const pushdown.Facts {
+    if (rd.form != .table) return null;
+    if (!try pushdown.wantsFacts(env.arena, dialect, stages, schema, check_fields, need)) return null;
+    return columnFacts(env, rd);
+}
+
+fn probeFacts(env: *Env, ca: std.mem.Allocator, conn: ast.Connection, info: SqlConnInfo, parts: []const []const u8, out: *pushdown.Facts) !void {
+    // the diag is the run's: a failed probe must not leave a message behind
+    const saved = env.diag.*;
+    defer env.diag.* = saved;
+    const cfg = try resolveDbConfig(env, conn, info.port);
+    const q = try factsQuery(env.arena, info.dialect, parts);
+    const c = try connectSql(env.gpa, info.kind, cfg);
+    var cur = c.queryCursor(q) catch |e| {
+        c.close();
+        return e;
+    };
+    defer cur.close();
+    var scratch = std.heap.ArenaAllocator.init(env.gpa);
+    defer scratch.deinit();
+    while (try cur.nextBatch(scratch.allocator())) |b| {
+        var r: usize = 0;
+        while (r < b.len) : (r += 1) {
+            const name = b.columns[0].getValue(r);
+            if (name.isNull()) continue;
+            try out.put(try ca.dupe(u8, name.string), .{
+                .text = flag(b.columns[1].getValue(r)),
+                .byte_order = flag(b.columns[2].getValue(r)),
+                .pads = flag(b.columns[3].getValue(r)),
+                .wide = flag(b.columns[4].getValue(r)),
+            });
+        }
+    }
+}
+
+fn flag(v: Value) bool {
+    return switch (v) {
+        .int => |i| i != 0,
+        .bool => |x| x,
+        .string => |s| std.mem.eql(u8, std.mem.trim(u8, s, " "), "1"),
+        else => false,
+    };
+}
+
+/// One row per column: its name, then whether it is text, compares by byte,
+/// ignores trailing spaces, and is two or more bytes a character.
+fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []const u8) ![]const u8 {
+    const table = parts[parts.len - 1];
+    switch (dialect) {
+        // A `_BIN2` collation compares code points; `_BIN` does too on a single-byte
+        // type (on nchar it compares the rest of a string little-endian). Every
+        // SQL Server string comparison pads with spaces.
+        .sqlserver => {
+            var obj = std.array_list.Managed(u8).init(arena);
+            for (parts, 0..) |p, i| {
+                if (i > 0) try obj.append('.');
+                try obj.append('[');
+                for (p) |ch| if (ch == ']') try obj.appendSlice("]]") else try obj.append(ch);
+                try obj.append(']');
+            }
+            return std.fmt.allocPrint(arena,
+                \\SELECT c.name,
+                \\ CASE WHEN c.collation_name IS NULL THEN 0 ELSE 1 END,
+                \\ CASE WHEN c.collation_name LIKE '%[_]BIN2%' THEN 1
+                \\      WHEN c.collation_name LIKE '%[_]BIN' AND TYPE_NAME(c.system_type_id) IN ('char', 'varchar', 'text') THEN 1 ELSE 0 END,
+                \\ 1,
+                \\ CASE WHEN TYPE_NAME(c.system_type_id) IN ('nchar', 'nvarchar', 'ntext') THEN 1 ELSE 0 END
+                \\FROM sys.columns c WHERE c.object_id = OBJECT_ID({s})
+            , .{try sqlLit(arena, obj.items)});
+        },
+        // `C`, `POSIX` and `ucs_basic` compare bytes (code points). The database
+        // default does too only when its locale is C and no ICU provider stands in
+        // for it — `'B' < 'a'` holds under byte order and under no linguistic one.
+        // citext compares case-insensitively whatever its collation.
+        .postgres => {
+            var obj = std.array_list.Managed(u8).init(arena);
+            for (parts, 0..) |p, i| {
+                if (i > 0) try obj.append('.');
+                try obj.append('"');
+                for (p) |ch| if (ch == '"') try obj.appendSlice("\"\"") else try obj.append(ch);
+                try obj.append('"');
+            }
+            return std.fmt.allocPrint(arena,
+                \\SELECT a.attname,
+                \\ CASE WHEN t.typcategory = 'S' THEN 1 ELSE 0 END,
+                \\ CASE WHEN t.typcategory <> 'S' OR t.typname = 'citext' THEN 0
+                \\      WHEN co.collname IN ('C', 'POSIX', 'ucs_basic') THEN 1
+                \\      WHEN co.collname = 'default' AND (SELECT datcollate FROM pg_database WHERE datname = current_database()) IN ('C', 'POSIX', 'C.UTF-8', 'C.utf8') AND 'B' < 'a' THEN 1
+                \\      ELSE 0 END,
+                \\ CASE WHEN t.typname = 'bpchar' THEN 1 ELSE 0 END,
+                \\ 0
+                \\FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid LEFT JOIN pg_collation co ON co.oid = a.attcollation
+                \\WHERE a.attrelid = {s}::regclass AND a.attnum > 0 AND NOT a.attisdropped
+            , .{try sqlLit(arena, obj.items)});
+        },
+        // A `_bin` collation (or `binary`) compares bytes; PAD SPACE is mysql's
+        // default pad attribute, NO PAD only the 0900 family's.
+        .mysql => {
+            const schema = if (parts.len >= 2) try sqlLit(arena, parts[parts.len - 2]) else "DATABASE()";
+            return std.fmt.allocPrint(arena,
+                \\SELECT c.COLUMN_NAME,
+                \\ CASE WHEN c.COLLATION_NAME IS NULL THEN 0 ELSE 1 END,
+                \\ CASE WHEN c.COLLATION_NAME = 'binary' OR RIGHT(c.COLLATION_NAME, 4) = '_bin' THEN 1 ELSE 0 END,
+                \\ CASE WHEN co.PAD_ATTRIBUTE = 'NO PAD' THEN 0 ELSE 1 END,
+                \\ CASE WHEN c.CHARACTER_SET_NAME IN ('ucs2', 'utf16', 'utf16le', 'utf32') THEN 1 ELSE 0 END
+                \\FROM information_schema.COLUMNS c LEFT JOIN information_schema.COLLATIONS co ON co.COLLATION_NAME = c.COLLATION_NAME
+                \\WHERE c.TABLE_SCHEMA = {s} AND c.TABLE_NAME = {s}
+            , .{ schema, try sqlLit(arena, table) });
+        },
+        // StarRocks has no collations: strings compare by byte. A CHAR is taken
+        // as padding, to be safe.
+        .starrocks => {
+            const schema = if (parts.len >= 2) try sqlLit(arena, parts[parts.len - 2]) else "DATABASE()";
+            return std.fmt.allocPrint(arena,
+                \\SELECT COLUMN_NAME,
+                \\ CASE WHEN LOWER(DATA_TYPE) IN ('varchar', 'char', 'string') THEN 1 ELSE 0 END,
+                \\ 1,
+                \\ CASE WHEN LOWER(DATA_TYPE) = 'char' THEN 1 ELSE 0 END,
+                \\ 0
+                \\FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = {s} AND TABLE_NAME = {s}
+            , .{ schema, try sqlLit(arena, table) });
+        },
+    }
+}
+
+fn sqlLit(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(arena);
+    try out.append('\'');
+    for (s) |c| {
+        if (c == '\'') try out.append('\'');
+        try out.append(c);
+    }
+    try out.append('\'');
+    return out.toOwnedSlice();
 }
 
 fn qualStr(arena: std.mem.Allocator, q: ast.QualName) ![]const u8 {

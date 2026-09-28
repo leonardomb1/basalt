@@ -16,6 +16,7 @@ const azure = @import("../connect/azure.zig");
 const s3 = @import("../connect/s3.zig");
 const analyze = @import("analyze.zig");
 const obs = @import("obs.zig");
+const pushdown = @import("pushdown.zig");
 const Value = @import("../exec/value.zig").Value;
 const arrow = @import("../connect/arrow.zig");
 
@@ -211,6 +212,22 @@ pub const RunOptions = struct {
     summary_out: ?*obs.Summary = null,
 };
 
+/// Catalog facts per `connection` + table, for the run; shared by the workers of a
+/// parallel `FOR EACH`, so guarded.
+pub const FactsCache = struct {
+    mu: std.Thread.Mutex = .{},
+    arena: std.heap.ArenaAllocator,
+    map: std.StringHashMap(*const pushdown.Facts),
+
+    pub fn init(gpa: std.mem.Allocator) FactsCache {
+        return .{ .arena = std.heap.ArenaAllocator.init(gpa), .map = std.StringHashMap(*const pushdown.Facts).init(gpa) };
+    }
+    pub fn deinit(self: *FactsCache) void {
+        self.map.deinit();
+        self.arena.deinit();
+    }
+};
+
 /// One finished `LOAD`.
 pub const LoadDone = struct {
     /// This load's place among the run's loads, 0-based, in the order they
@@ -310,6 +327,8 @@ pub const Env = struct {
     params_expr: *std.StringHashMap(*const ast.Expr),
     /// Runtime expression-error context (which stage/column failed).
     errctx: *op.ErrCtx,
+    /// What each SQL table's catalog said of its columns, asked once per run.
+    facts_cache: ?*FactsCache = null,
     /// Emitted-row counter shared by every source (via `obs.CountingSource`):
     /// the run's, or a parallel `FOR EACH` worker's own, chained to the run's.
     rows_read: *obs.RowCounter,

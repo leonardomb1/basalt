@@ -821,8 +821,15 @@ const Ctx = struct {
                         }
                         // what runs pushes the params' values, so the plan shows them
                         const bound = try substFilterParams(self.arena, stages, self.params);
-                        const implicit = pushdown.serialWhere(self.arena, d, bound) catch null;
+                        var wants = false;
+                        const implicit = pushdown.serialWhereWith(self.arena, d, bound, null, &wants) catch null;
                         source.pushdown = try composePushdown(self.arena, raw, implicit);
+                        // analysis does not connect, and a text comparison's descent
+                        // is the column's collation's to decide
+                        if (wants) source.pushdown = if (source.pushdown.len > 0)
+                            try std.fmt.allocPrint(self.arena, "{s}; text comparisons decided by the collation at run time", .{source.pushdown})
+                        else
+                            "text comparisons decided by the collation at run time";
                         if (try pushdown.explainTopN(self.arena, d, bound[0 .. bound.len - 1])) |t| {
                             top_n = t;
                             source.pushdown = if (source.pushdown.len > 0)
@@ -2227,13 +2234,13 @@ test "a $param or LET in a filter reaches the pushdown as its value, never as a 
     var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const prog = try parser.parseSource(a,
         \\CREATE CONNECTION db TYPE sqlserver OPTIONS (host = 'h');
-        \\LET c = '1';
+        \\LET c = 1;
         \\PARAM n INT DEFAULT 5;
         \\EXPLAIN SELECT * FROM db.dbo.t WHERE b >= $c AND k < $n;
     , &pdiag);
     var diag = Diag{};
     const plan = try analyze(a, prog, &diag);
-    try std.testing.expectEqualStrings("(([b] >= '1') AND ([k] < 5))", plan.outputs[0].source.pushdown);
+    try std.testing.expectEqualStrings("(([b] >= 1) AND ([k] < 5))", plan.outputs[0].source.pushdown);
 
     // the rewrite itself: values in, and the stages untouched when none is named
     var params = ParamMap.init(a);

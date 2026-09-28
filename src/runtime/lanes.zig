@@ -26,6 +26,7 @@ const RunOptions = @import("env.zig").RunOptions;
 const schemaPtr = @import("env.zig").schemaPtr;
 const Stats = @import("env.zig").Stats;
 
+const connect_mod = @import("connect.zig");
 const buildParallelSink = @import("connect.zig").buildParallelSink;
 const dupeSchema = @import("connect.zig").dupeSchema;
 const OneBatch = @import("connect.zig").OneBatch;
@@ -188,7 +189,8 @@ pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: AggShape, src
         return null;
     };
 
-    const wa = (try pushdown.planWholeAggWhy(arena, desc.dialect, desc.base_sql, src_schema, shape.prefix, shape.ag, apl.schema, why)) orelse return null;
+    const facts = try connect_mod.factsIfWanted(env, rd, desc.dialect, shape.prefix, src_schema, true, .exact);
+    const wa = (try pushdown.planWholeAggWhy(arena, desc.dialect, desc.base_sql, src_schema, shape.prefix, shape.ag, apl.schema, facts, why)) orelse return null;
 
     const out = try arena.alloc(ast.Stage, shape.tail.len + 2);
     // No hints: an `@[where = …]` would be re-applied over the grouped result (whose
@@ -220,7 +222,8 @@ pub fn topNStages(env: *Env, stages: []const ast.Stage, src_base: usize, why: *[
     if (rd.form != .table and rd.form != .query) return null;
     const t = (try pushdown.classifyTopN(arena, stages[0 .. stages.len - 1], why)) orelse return null;
     const src_schema = try dupeSchema(arena, env.sources.items[src_base].schema());
-    const q = (try pushdown.planTopN(arena, desc.dialect, desc.base_sql, src_schema, stages[0 .. stages.len - 1], t, why)) orelse return null;
+    const facts = try connect_mod.factsIfWanted(env, rd, desc.dialect, stages[1 .. stages.len - 1], src_schema, true, .exact);
+    const q = (try pushdown.planTopN(arena, desc.dialect, desc.base_sql, src_schema, stages[0 .. stages.len - 1], t, facts, why)) orelse return null;
 
     const out = try arena.dupe(ast.Stage, stages);
     // No hints: an `@[where = …]` is already in `base_sql`, and a split has nothing
@@ -1553,7 +1556,8 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
 
     const src_schema = try schemaPtr(arena, try dupeSchema(arena, env.sources.items[src_base].schema()));
 
-    const pd = try pushdown.planAgg(arena, desc.dialect, src_schema.*, prefix, ag);
+    const facts = try connect_mod.factsIfWanted(env, stages[0].node.read, desc.dialect, prefix, src_schema.*, true, .superset);
+    const pd = try pushdown.planAggWith(arena, desc.dialect, src_schema.*, prefix, ag, facts);
     const eff = if (pd.proj_schema) |ps| try schemaPtr(arena, ps) else src_schema;
 
     const agg_in = try schemaPtr(arena, try mapChainSchema(env, prefix, eff.*));

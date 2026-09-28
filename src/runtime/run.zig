@@ -68,6 +68,8 @@ const exceptColumns = @import("connect.zig").exceptColumns;
 const resolveUpsertKeys = @import("connect.zig").resolveUpsertKeys;
 const sinkLabel = @import("connect.zig").sinkLabel;
 const sqlConnInfo = @import("connect.zig").sqlConnInfo;
+const factsIfWanted = @import("connect.zig").factsIfWanted;
+const env_mod = @import("env.zig");
 const SplitCtx = @import("connect.zig").SplitCtx;
 
 const buildPipeline = @import("plan.zig").buildPipeline;
@@ -194,6 +196,9 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var scan = driver.ScanTally{};
     env.scan = &scan;
     var loads = obs.LoadTally{};
+    var facts_cache = env_mod.FactsCache.init(gpa);
+    defer facts_cache.deinit();
+    env.facts_cache = &facts_cache;
     env.loads = &loads;
     env.items = opts.items and manyLoads(program.stmts[1..]);
 
@@ -530,7 +535,8 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         if (rd.form != .table and rd.form != .query) break :implicit;
         const conn = env.connections.get(rd.connector) orelse break :implicit;
         const d = (sqlConnInfo(conn) orelse break :implicit).dialect;
-        const extra = (try pushdown.serialWhere(arena, d, stages)) orelse break :implicit;
+        const facts = try factsIfWanted(env, rd, d, stages[1..], .{ .fields = &.{} }, false, .superset);
+        const extra = (try pushdown.serialWhereWith(arena, d, stages, facts, null)) orelse break :implicit;
         const new_stages = try arena.dupe(ast.Stage, stages);
         var nrd = rd;
         nrd.where = if (rd.where.len > 0)
@@ -653,7 +659,8 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                     const src_schema = try dupeSchema(arena, env.sources.items[src_base].schema());
                     const out_cols = try arena.alloc([]const u8, schema.fields.len);
                     for (schema.fields, out_cols) |f, *o| o.* = f.name;
-                    const mp = try pushdown.planMap(arena, env.sql_desc.?.dialect, src_schema, middle, out_cols);
+                    const facts = try factsIfWanted(env, stages[0].node.read, env.sql_desc.?.dialect, middle, src_schema, true, .superset);
+                    const mp = try pushdown.planMapWith(arena, env.sql_desc.?.dialect, src_schema, middle, out_cols, facts);
                     where_extra = mp.where_extra;
                     if (mp.proj_schema) |ps| {
                         if (rebuildMapStages(env, mp.stages orelse middle, try schemaPtr(arena, ps))) |rs| {
