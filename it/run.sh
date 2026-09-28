@@ -940,6 +940,24 @@ if runs stdout; then
     fi
   fi
 
+  # Flags may come before the script, and `-` reads it from stdin wherever it sits.
+  printf 'SELECT 1 AS a;\n' >"$out/flags_first.sql"
+  got=$($B run -q --format csv "$out/flags_first.sql" 2>&1 | tr '\n' ' ')
+  got2=$(printf 'SELECT 2 AS b;\n' | $B run -q --format csv - 2>&1 | tr '\n' ' ')
+  if [ "$got" = "a 1 " ] && [ "$got2" = "b 2 " ]; then report "stdout: flags before the script path, and - after flags" ok
+  else report "stdout: flags before the script path, and - after flags (got '$got' / '$got2')" bad; fi
+
+  # Under --log-format json a SELECT reports its run too, on stderr, with what the
+  # parquet reader was spared; stdout keeps only the rows.
+  $B run -q --log-format json --format csv -c "SELECT id FROM '$out/stdout_side.csv';" >/dev/null 2>"$out/sel_summary.log" || true
+  if grep -q '"event":"run_complete"' "$out/sel_summary.log"; then report "stdout: a SELECT's run_complete under --log-format json" ok
+  else report "stdout: a SELECT's run_complete under --log-format json" bad; tail -3 "$out/sel_summary.log"; fi
+
+  # A long LOAD under --log-format json says how it is going, once a second.
+  timeout 3 $B run --log-format json -c "LOAD INTO '$out/endless.csv' AS SELECT range FROM RANGE(100000000000);" >/dev/null 2>"$out/progress.log" || true
+  if grep -q '"event":"progress".*"rows":' "$out/progress.log"; then report "stdout: progress events under --log-format json" ok
+  else report "stdout: progress events under --log-format json" bad; head -3 "$out/progress.log"; fi
+
   # --max-rows: the first N rows of an endless source, at once, then a clean end.
   got=$(timeout 10 $B run -q --max-rows 3 --format csv -c "SELECT range FROM RANGE(100000000000);" 2>/dev/null | tr '\n' ' ')
   if [ "$got" = "range 0 1 2 " ]; then report "stdout: --max-rows previews an endless source" ok; else report "stdout: --max-rows previews an endless source (got '$got')" bad; fi

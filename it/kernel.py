@@ -189,6 +189,23 @@ def main(binary):
     data, st = k.reply()
     report("a cancel for another id is ignored", st["ok"] and rows(data) == [{"n": 3000000}], st)
 
+    # A long statement sends progress frames while it runs.
+    k.send(op="run", id="prog", script="SELECT COUNT(*) AS n FROM RANGE(100000000000);")
+    seen = None
+    t0 = time.time()
+    while time.time() - t0 < 10:
+        h = json.loads(k.p.stdout.readline())
+        if h["type"] == "progress":
+            seen = h
+            break
+    k.send(op="cancel", id="prog")
+    _, st = k.reply()
+    report(
+        "a long statement sends progress frames",
+        seen is not None and seen["id"] == "prog" and seen["rows"] > 0 and "range" in seen["target"],
+        seen,
+    )
+
     # SIGINT cancels, never kills — even twice.
     k.send(op="run", id="long2", script="SELECT COUNT(*) AS n FROM RANGE(100000000000);")
     time.sleep(0.5)

@@ -113,27 +113,64 @@ fn loadSource(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8, stderr
             return Source{ .label = "<command>", .text = args[i + 1] };
         }
     }
-    if (args.len < 3) {
+    const at = scriptArg(args) orelse {
         try stderr.print("error: `{s}` requires a <script> path, `-` for stdin, or `-c <script>`\n", .{verb});
         return null;
-    }
-    if (std.mem.eql(u8, args[2], "-")) {
+    };
+    if (std.mem.eql(u8, args[at], "-")) {
         const text = std.fs.File.stdin().readToEndAlloc(arena, 8 << 20) catch |e| {
             try stderr.print("error: cannot read script from stdin: {s}\n", .{@errorName(e)});
             return null;
         };
         return Source{ .label = "<stdin>", .text = text };
     }
-    if (args[2].len > 0 and args[2][0] == '-') {
-        try stderr.print("error: `{s}` requires a <script> path, `-` for stdin, or `-c <script>`\n", .{verb});
-        return null;
-    }
-    const path = args[2];
+    const path = args[at];
     const text = std.fs.cwd().readFileAlloc(arena, path, 8 << 20) catch |e| {
         try stderr.print("error: cannot read `{s}`: {s}\n", .{ path, @errorName(e) });
         return null;
     };
     return Source{ .label = path, .text = text, .dir = std.fs.path.dirname(path) orelse "." };
+}
+
+/// Flags that take the next argument as their value, across `run` and `check`.
+const valued_flags = [_][]const u8{ "-p", "--param", "-j", "--threads", "--format", "--log-format", "--log-level", "--port", "--max-rows" };
+
+/// Index of the script argument: the first that is neither a flag nor a flag's
+/// value, `-` (stdin) included — so `run --format json x.sql` finds `x.sql`, as
+/// `run x.sql --format json` always did.
+fn scriptArg(args: [][:0]u8) ?usize {
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "-")) return i;
+        if (a.len > 0 and a[0] == '-') {
+            for (valued_flags) |f| if (std.mem.eql(u8, a, f)) {
+                i += 1;
+                break;
+            };
+            continue;
+        }
+        return i;
+    }
+    return null;
+}
+
+test "scriptArg: the script is found whatever order flags and it come in" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const Case = struct { argv: []const []const u8, want: ?usize };
+    const cases = [_]Case{
+        .{ .argv = &.{ "basalt", "run", "x.sql", "--format", "json" }, .want = 2 },
+        .{ .argv = &.{ "basalt", "run", "--format", "json", "x.sql" }, .want = 4 },
+        .{ .argv = &.{ "basalt", "run", "--format", "json", "-" }, .want = 4 },
+        .{ .argv = &.{ "basalt", "run", "-p", "k=v", "-j", "4", "--quiet", "x.sql" }, .want = 7 },
+        .{ .argv = &.{ "basalt", "run", "-j8", "x.sql" }, .want = 3 },
+        .{ .argv = &.{ "basalt", "run", "--format", "json" }, .want = null },
+        // a flag's value that happens to look like a path is still its value
+        .{ .argv = &.{ "basalt", "check", "-p", "out.sql" }, .want = null },
+    };
+    for (cases) |c| try std.testing.expectEqual(c.want, scriptArg(try testArgv(a, c.argv)));
 }
 
 /// A dash-prefixed argument no branch claimed. `-` alone is the stdin script,
@@ -405,9 +442,10 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var diag: runtime.Diag = .{};
     var sink = runtime.OutcomeSink.init(alloc);
     defer sink.deinit();
-    // A person watching a terminal gets the live line; a pipe, a log file, `-q`
-    // and `--log-format json` never do.
-    const progress = !no_progress and !log.quiet and std.posix.isatty(std.fs.File.stderr().handle);
+    // A person watching a terminal gets the live line; under `--log-format json`
+    // a reader of the log gets a `progress` event a second instead, terminal or
+    // not. A plain pipe or file and `-q` get neither.
+    const progress = !no_progress and !log.quiet and (log.format == .json or std.posix.isatty(std.fs.File.stderr().handle));
     _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze, .stdout_format = stdout_format, .progress = progress, .items = true, .max_rows = max_rows }, &diag) catch |e| switch (e) {
         error.Aborted => {
             if (eo.json)

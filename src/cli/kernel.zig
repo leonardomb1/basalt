@@ -29,7 +29,8 @@
 //! `data` carries whatever the script wrote to stdout — the Arrow IPC streams,
 //! NDJSON or CSV of its results, in order, possibly split over several frames.
 //! A `result` frame follows each result's last byte, so the data between two of
-//! them is one result. Exactly one `status` ends each request; after it, the
+//! them is one result. A statement that runs past 400 ms sends a `progress`
+//! frame a second (`target`, `rows`, `rows_per_sec`, `elapsed_ms`). Exactly one `status` ends each request; after it, the
 //! script wrote nothing more. A failed script's status carries `error` with the message, the line and
 //! column in the script as sent (not in the replayed declarations), and whether
 //! it is `transient`. Logs and `PRINT` stay on stderr.
@@ -486,6 +487,22 @@ const Capture = struct {
     fn hook(self: *Capture) runtime.ResultHook {
         return .{ .ctx = self, .f = onResult };
     }
+
+    /// A statement still moving rows: what the terminal's progress line says,
+    /// as a `progress` frame, once a second once it has run 400 ms.
+    fn onProgress(ctx: *anyopaque, ev: obs.Progress.Event) void {
+        const self: *Capture = @ptrCast(@alignCast(ctx));
+        var hbuf: [768]u8 = undefined;
+        var w = std.Io.Writer.fixed(&hbuf);
+        w.writeAll("{\"type\":\"progress\",\"id\":") catch return;
+        std.json.Stringify.encodeJsonString(clip(self.id), .{}, &w) catch return;
+        w.writeAll(",\"target\":") catch return;
+        std.json.Stringify.encodeJsonString(ev.target, .{}, &w) catch return;
+        w.print(",\"rows\":{d},\"rows_per_sec\":{d},\"elapsed_ms\":{d}", .{ ev.rows, ev.rows_per_sec, ev.elapsed_ms }) catch return;
+        if (ev.loop_total > 0) w.print(",\"loop_done\":{d},\"loop_total\":{d}", .{ ev.loop_done, ev.loop_total }) catch return;
+        w.writeAll("}\n") catch return;
+        self.out.line(w.buffered());
+    }
 };
 
 fn runScript(
@@ -571,6 +588,7 @@ fn runScript(
             // result metadata counts lines in the script as sent
             .line_base = @intCast(std.mem.count(u8, entry.text[0..entry.entry_at], "\n")),
             .on_result = cap.hook(),
+            .progress_hook = .{ .ctx = &cap, .f = Capture.onProgress },
             .max_rows = req.max_rows orelse opts.max_rows,
         }, &rdiag) catch |e| {
             failed = e;

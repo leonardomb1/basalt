@@ -354,6 +354,7 @@ pub fn openSourceProjected(
         const pr = pqdecode.Reader.openProjected(env.arena, rd.form.path, project) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
         pr.bounds = bounds;
+        noteParquet(env, pr);
         env.pq_readers += 1;
         env.pq_reader = pr;
         return pr.source();
@@ -369,6 +370,14 @@ pub fn openSourceProjected(
     return openSourceAll(env, rd, hints);
 }
 
+/// Count a parquet read into the run's pushdown tally.
+pub fn noteParquet(env: *Env, pr: *pqdecode.Reader) void {
+    const t = env.scan orelse return;
+    pr.tally = t;
+    driver.ScanTally.add(&t.columns_read, pr.leaves.len);
+    driver.ScanTally.add(&t.columns_total, pr.md.leafCount());
+}
+
 fn openArrow(env: *Env, path: []const u8, project: ?[][]const u8) !driver.Source {
     const r = arrowread.Reader.openProjected(env.arena, path, project) catch |e| {
         const why = switch (e) {
@@ -379,6 +388,10 @@ fn openArrow(env: *Env, path: []const u8, project: ?[][]const u8) !driver.Source
         };
         return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read Arrow IPC `{s}` ({s})", .{ path, why }));
     };
+    if (env.scan) |t| {
+        driver.ScanTally.add(&t.columns_read, r.keep.len);
+        driver.ScanTally.add(&t.columns_total, r.fields.len);
+    }
     return r.source();
 }
 
@@ -444,6 +457,7 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
         if (rfmt == .parquet) {
             const pr = pqdecode.Reader.open(env.arena, rd.form.path) catch |e|
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
+            noteParquet(env, pr);
             return pr.source();
         }
         if (analyze.readFormat(rd.form.path, want) == .arrow) return openArrow(env, rd.form.path, null);
@@ -481,6 +495,8 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
                 wh;
         }
     }
+    if (rd_eff.where.len > 0 and !std.mem.eql(u8, conn.connector, "http"))
+        if (env.scan) |t| driver.ScanTally.add(&t.sql_filters, 1);
     if (std.mem.eql(u8, conn.connector, "http")) {
         if (rd.form != .path) return planErr(env.diag, "reading an http connection needs a path: conn.GET('/path') or a CREATE RESOURCE");
         var auth: []const u8 = "";

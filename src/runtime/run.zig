@@ -183,12 +183,21 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var batch_arena = std.heap.ArenaAllocator.init(gpa);
     defer batch_arena.deinit();
 
+    var scan = driver.ScanTally{};
+    env.scan = &scan;
     var loads = obs.LoadTally{};
     env.loads = &loads;
     env.items = opts.items and manyLoads(program.stmts[1..]);
 
     var progress = obs.Progress{ .logger = &logger, .rows = &rows_read };
-    if (opts.progress and opts.log.format != .json) {
+    if (opts.progress_hook) |h| {
+        progress.mode = .hook;
+        progress.hook = h;
+        progress.start();
+        env.progress = &progress;
+    } else if (opts.progress) {
+        // Under `--log-format json` the line becomes a once-a-second event.
+        progress.mode = if (opts.log.format == .json) .json else .line;
         progress.start();
         env.progress = &progress;
     }
@@ -241,17 +250,26 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         .target = env.last_target,
         .rows_loaded = loads.rows.load(.monotonic),
         .lone_load = runnable == 1,
+        .pushdown = .{
+            .row_groups = scan.row_groups.load(.monotonic),
+            .row_groups_skipped = scan.row_groups_skipped.load(.monotonic),
+            .columns_read = scan.columns_read.load(.monotonic),
+            .columns_total = scan.columns_total.load(.monotonic),
+            .sql_filtered_reads = scan.sql_filters.load(.monotonic),
+        },
     };
     switch (opts.log.summary) {
         // `--format json`: a LOAD run's stdout is the summary object; a SELECT
-        // run's stdout is the NDJSON rows — never both on one stream.
+        // run's stdout is the NDJSON rows — never both on one stream, so a
+        // SELECT's summary goes to the log, and only a JSON log: the terminal's
+        // printed table is a SELECT's own feedback.
         .json_stdout => if (env.wrote_sink) {
             var sbuf: [1024]u8 = undefined;
             var sfw = std.fs.File.stdout().writerStreaming(&sbuf);
             summary.renderJson(&sfw.interface) catch {};
             sfw.interface.flush() catch {};
-        },
-        .stderr => if (env.wrote_sink) logger.summary(summary),
+        } else if (opts.log.format == .json) logger.summary(summary),
+        .stderr => if (env.wrote_sink or opts.log.format == .json) logger.summary(summary),
         .none => {},
     }
     return stats;
@@ -396,7 +414,9 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
     // Only a real `LOAD`: a terminal SELECT prints rows to the same terminal.
     const is_load = !env.explain and !std.mem.eql(u8, last.write.connector, "stdout");
     if (is_load) env.last_target = try targetLabel(arena, last.write);
-    const moving = is_load and env.progress != null;
+    // A terminal SELECT draws no line — its rows go to the same screen — but a
+    // caller taking events wants to see one fill.
+    const moving = env.progress != null and (is_load or env.progress.?.mode == .hook);
     if (moving) env.progress.?.begin(try moveLabel(arena, stages[0], last.write));
     const load_t0 = std.time.milliTimestamp();
     const load_rows0 = stats.rows_out;
@@ -1008,7 +1028,8 @@ fn moveLabel(arena: std.mem.Allocator, first: ast.Stage, w: ast.Write) ![]const 
         .union_ => "union",
         else => "?",
     };
-    return std.fmt.allocPrint(arena, "{s} → {s}", .{ src, try targetLabel(arena, w) });
+    const dst = if (std.mem.eql(u8, w.connector, "stdout")) "stdout" else try targetLabel(arena, w);
+    return std.fmt.allocPrint(arena, "{s} → {s}", .{ src, dst });
 }
 
 fn hasAggregate(stages: []const ast.Stage) bool {

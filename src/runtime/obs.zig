@@ -64,6 +64,18 @@ pub const Logger = struct {
     /// every writer below erases it first, so a log line never lands mid-line.
     progress_drawn: bool = false,
 
+    /// One `progress` event as an NDJSON log line. Caller holds `mutex`.
+    fn progressEvent(self: *Logger, ev: Progress.Event) void {
+        var buf: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        w.print("{{\"ts\":{d},\"level\":\"info\",\"run_id\":{d},\"event\":\"progress\",\"target\":", .{ std.time.milliTimestamp(), self.run_id }) catch return;
+        std.json.Stringify.encodeJsonString(ev.target, .{}, &w) catch return;
+        w.print(",\"rows\":{d},\"rows_per_sec\":{d},\"elapsed_ms\":{d}", .{ ev.rows, ev.rows_per_sec, ev.elapsed_ms }) catch return;
+        if (ev.loop_total > 0) w.print(",\"loop_done\":{d},\"loop_total\":{d}", .{ ev.loop_done, ev.loop_total }) catch return;
+        w.writeAll("}\n") catch return;
+        self.file.writeAll(w.buffered()) catch {};
+    }
+
     fn eraseProgress(self: *Logger) void {
         if (!self.progress_drawn) return;
         self.file.writeAll("\r\x1b[2K") catch {};
@@ -184,8 +196,32 @@ pub const Progress = struct {
     /// Colour the line (a cyan spinner, a green count, the rest dim), unless
     /// `NO_COLOR` asks for plain text.
     color: bool = true,
+    /// `line` draws for a person at a terminal. `json` writes a `progress` event
+    /// to the log instead, once a second — what a UI reading the log shows in
+    /// place of the line — and `hook` hands the same event to a caller (the
+    /// session kernel frames it).
+    mode: Mode = .line,
+    hook: ?EventHook = null,
+    last_event_ms: i64 = 0,
+
+    pub const Mode = enum { line, json, hook };
+
+    pub const Event = struct {
+        target: []const u8,
+        rows: u64,
+        rows_per_sec: u64,
+        elapsed_ms: u64,
+        loop_done: usize = 0,
+        loop_total: usize = 0,
+    };
+
+    pub const EventHook = struct {
+        ctx: *anyopaque,
+        f: *const fn (ctx: *anyopaque, ev: Event) void,
+    };
 
     const quiet_ms = 400;
+    const event_ms = 1000;
     const tick_ns = 100 * std.time.ns_per_ms;
     const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 
@@ -266,6 +302,22 @@ pub const Progress = struct {
             const now = std.time.milliTimestamp();
             // The wait that matters is the whole loop's, not the current row's.
             if (now - (if (looping) self.loop_began_ms else self.began_ms) < quiet_ms) continue;
+            if (self.mode != .line) {
+                if (now - self.last_event_ms < event_ms) continue;
+                self.last_event_ms = now;
+                const rows = self.rows.load(.monotonic) -| self.base_rows;
+                const elapsed: u64 = @intCast(@max(1, now - self.began_ms));
+                const ev = Event{
+                    .target = self.label_buf[0..self.label_len],
+                    .rows = rows,
+                    .rows_per_sec = rows * 1000 / elapsed,
+                    .elapsed_ms = elapsed,
+                    .loop_done = self.loop_done,
+                    .loop_total = self.loop_total,
+                };
+                if (self.hook) |h| h.f(h.ctx, ev) else self.logger.progressEvent(ev);
+                continue;
+            }
             var buf: [512]u8 = undefined;
             var w = std.Io.Writer.fixed(&buf);
             self.frame +%= 1;
@@ -463,6 +515,22 @@ pub const Summary = struct {
     /// The run was one `LOAD` and nothing else, so `rows_read` is that load's own
     /// and worth saying when it differs. Beside other statements it is not.
     lone_load: bool = true,
+    pushdown: Pushdown = .{},
+
+    /// What the sources were spared: parquet row groups skipped on statistics
+    /// (of those considered), columns decoded (of those the files hold), and
+    /// SQL reads that carried a pushed filter.
+    pub const Pushdown = struct {
+        row_groups: u64 = 0,
+        row_groups_skipped: u64 = 0,
+        columns_read: u64 = 0,
+        columns_total: u64 = 0,
+        sql_filtered_reads: u64 = 0,
+
+        fn any(self: Pushdown) bool {
+            return self.row_groups > 0 or self.columns_total > 0 or self.sql_filtered_reads > 0;
+        }
+    };
 
     /// Throughput on rows **processed**, not rows emitted. Dividing the written count
     /// by the clock described how fast the answer was printed, not how fast the run
@@ -523,9 +591,15 @@ pub const Summary = struct {
     /// stderr line — only their envelope prefixes differ.
     fn renderJsonFields(self: Summary, w: anytype) !void {
         try w.print(
-            "\"source\":\"{s}\",\"sink\":\"{s}\",\"rows_read\":{d},\"rows_written\":{d},\"elapsed_ms\":{d},\"rows_per_sec\":{d},\"loads\":{d},\"loads_failed\":{d}}}\n",
+            "\"source\":\"{s}\",\"sink\":\"{s}\",\"rows_read\":{d},\"rows_written\":{d},\"elapsed_ms\":{d},\"rows_per_sec\":{d},\"loads\":{d},\"loads_failed\":{d}",
             .{ self.source, self.sink, self.rows_read, self.rows_written, self.elapsed_ms, self.rate(), self.loads, self.loads_failed },
         );
+        const p = self.pushdown;
+        if (p.any()) try w.print(
+            ",\"pushdown\":{{\"row_groups\":{d},\"row_groups_skipped\":{d},\"columns_read\":{d},\"columns_total\":{d},\"sql_filtered_reads\":{d}}}",
+            .{ p.row_groups, p.row_groups_skipped, p.columns_read, p.columns_total, p.sql_filtered_reads },
+        );
+        try w.writeAll("}\n");
     }
 };
 
@@ -631,6 +705,37 @@ test "summary renderJson: one status-ok object with every metric field" {
         "{\"status\":\"ok\",\"run_id\":7,\"source\":\"csv\",\"sink\":\"starrocks\",\"rows_read\":10,\"rows_written\":8,\"elapsed_ms\":2000,\"rows_per_sec\":5,\"loads\":1,\"loads_failed\":0}\n",
         w.buffered(),
     );
+}
+
+test "summary renderJson: a pushdown object only when a source was spared something" {
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const s = Summary{ .run_id = 7, .source = "parquet", .sink = "stdout", .rows_read = 10, .rows_written = 1, .elapsed_ms = 1, .pushdown = .{ .row_groups = 4, .row_groups_skipped = 3, .columns_read = 1, .columns_total = 5 } };
+    try s.renderJson(&w);
+    try std.testing.expect(std.mem.endsWith(u8, w.buffered(), ",\"pushdown\":{\"row_groups\":4,\"row_groups_skipped\":3,\"columns_read\":1,\"columns_total\":5,\"sql_filtered_reads\":0}}\n"));
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, w.buffered(), .{});
+    parsed.deinit();
+}
+
+test "progress event: one NDJSON line with the target and the counts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile("log", .{ .read = true });
+    defer f.close();
+    var lg = Logger{ .file = f, .json = true, .min = .info, .run_id = 9 };
+    lg.progressEvent(.{ .target = "a.csv → \"b\"", .rows = 1200, .rows_per_sec = 600, .elapsed_ms = 2000, .loop_done = 1, .loop_total = 3 });
+    try f.seekTo(0);
+    var rb: [512]u8 = undefined;
+    const n = try f.readAll(&rb);
+    const line = rb[0..n];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "\n"));
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try std.testing.expectEqualStrings("progress", o.get("event").?.string);
+    try std.testing.expectEqualStrings("a.csv → \"b\"", o.get("target").?.string);
+    try std.testing.expectEqual(@as(i64, 1200), o.get("rows").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), o.get("loop_total").?.integer);
 }
 
 test "summary sentence: one load, a load that reduces, and a run of several with failures" {

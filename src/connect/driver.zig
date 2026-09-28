@@ -42,6 +42,21 @@ pub fn resetStop() void {
     g_stop.store(false, .seq_cst);
 }
 
+/// What reached the sources of a run beyond the rows: row groups a parquet
+/// read could skip on statistics, columns it did not have to decode, and filters
+/// a SQL source took. Atomic, since parallel lanes open readers of their own.
+pub const ScanTally = struct {
+    row_groups: std.atomic.Value(u64) = .init(0),
+    row_groups_skipped: std.atomic.Value(u64) = .init(0),
+    columns_read: std.atomic.Value(u64) = .init(0),
+    columns_total: std.atomic.Value(u64) = .init(0),
+    sql_filters: std.atomic.Value(u64) = .init(0),
+
+    pub fn add(v: *std.atomic.Value(u64), n: u64) void {
+        _ = v.fetchAdd(n, .monotonic);
+    }
+};
+
 /// `--max-rows`: how many rows a stdout result keeps, and whether it had more.
 pub const RowCap = struct {
     max: u64,

@@ -1092,6 +1092,10 @@ basalt check <script>|-|-c "<inline>"
 basalt kernel [--format table|json|csv|tsv|arrow] [-j threads] [--max-rows N]
 ```
 
+Options may come before or after the script path, and `-` (the script on
+stdin) may sit anywhere among them: `basalt run --format json job.sql` and
+`basalt run job.sql --format json` are the same run.
+
 `--format json` makes stdout machine-readable: a terminal `SELECT` emits one
 JSON object per row (NDJSON, streamed — decimals as strings, temporals as ISO
 text, bytes as base64), and a `LOAD` run emits one summary object instead.
@@ -1171,11 +1175,26 @@ loaded 7 into agg.csv in 1.9s` when the query reduces. The text carries no run
 id; under `--log-format json` the same facts are `load_complete` /
 `load_failed` events (level `info`) and a `run_complete` line, each with
 `run_id`, and `--format json` prints the summary object with `loads` and
-`loads_failed`. Parse those, never the sentence.
+`loads_failed`. Parse those, never the sentence. A run of `SELECT`s writes no
+sentence — the printed rows are its feedback — but under `--log-format json` it
+too closes with a `run_complete` line on stderr (never on stdout, which holds
+the rows). Every `run_complete` carries a `pushdown` object when a source was
+spared anything: parquet `row_groups` considered and `row_groups_skipped` on
+statistics, `columns_read` of `columns_total` (parquet or Arrow), and
+`sql_filtered_reads`, the SQL reads that carried a pushed filter.
 
 The progress line is drawn only when stderr is a TTY, never under `-q` or `--log-format json`,
 not for a terminal `SELECT` (whose rows go to the same screen), and not for the
-first 400 ms, so short runs stay silent. A log or `PRINT` line erases it rather
+first 400 ms, so short runs stay silent. Under `--log-format json` the line
+becomes an event instead, once a second after those 400 ms, terminal or not —
+what a UI reading the log shows in its place (`--no-progress` and `-q` still
+turn it off):
+
+```
+{"ts":…,"level":"info","run_id":…,"event":"progress","target":"erp.dbo.SC5010 → sr.bronze.sc5010","rows":1204112,"rows_per_sec":48300,"elapsed_ms":24930}
+```
+
+`loop_done`/`loop_total` join it inside a `FOR EACH`. A log or `PRINT` line erases it rather
 than colliding with it, and the run summary replaces it at the end. Piped or
 redirected, stderr carries no control characters at all. `--no-progress` turns
 it off.
@@ -1305,6 +1324,9 @@ and nothing for that request follows it:
  "error":{"msg":"unknown field `nope`","file":"script","line":3,"col":8,"transient":false}}
 ```
 
+A statement that runs past 400 ms also sends a `progress` frame a second —
+`{"type":"progress","id":…,"target":"…","rows":…,"rows_per_sec":…,"elapsed_ms":…}`
+— for a `SELECT` as well as a `LOAD`, since a notebook shows either filling.
 A result's `line`/`col` count in the script as sent, as its Arrow metadata
 does; `truncated` says a row cap cut it, and the status's `truncated` says any
 result was. `declared` lists what the script added to the session — a script's

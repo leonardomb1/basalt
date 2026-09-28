@@ -187,6 +187,10 @@ pub const RunOptions = struct {
     on_result: ?ResultHook = null,
     /// `--max-rows`: a terminal SELECT keeps its first N rows and stops reading.
     max_rows: ?u64 = null,
+    /// Progress as events handed to a caller, for every statement that moves
+    /// rows — a SELECT included, since a notebook shows one filling. Takes the
+    /// place of `progress`'s terminal line.
+    progress_hook: ?obs.Progress.EventHook = null,
 };
 
 /// A stdout result, finished. `truncated`: a row cap cut it short.
@@ -304,6 +308,8 @@ pub const Env = struct {
     /// Results printed so far; the next one's ordinal.
     results_printed: u32 = 0,
     line_base: u32 = 0,
+    /// The run's pushdown tally, for the summary.
+    scan: ?*driver.ScanTally = null,
     on_result: ?ResultHook = null,
     max_rows: ?u64 = null,
 

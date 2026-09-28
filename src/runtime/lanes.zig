@@ -541,6 +541,7 @@ const PqMorsels = struct {
     src_schema: *const types.Schema,
     per_item: usize,
     queue: WorkQueue,
+    tally: ?*driver.ScanTally = null,
 };
 
 const MorselSource = struct {
@@ -588,6 +589,7 @@ const MorselSource = struct {
             const i = self.nextIndex() orelse return null;
             const r = try pqdecode.Reader.openProjected(self.scratch, self.m.path, self.m.project);
             r.bounds = self.m.bounds;
+            r.tally = self.m.tally;
             r.rg = i * self.m.per_item;
             if (r.rg >= r.md.row_groups.len) {
                 r.close();
@@ -795,6 +797,7 @@ fn laneRowSource(rows: LaneRows, scratch: std.mem.Allocator) !?driver.Source {
         .parquet_group => |g| {
             const rdr = try pqdecode.Reader.openProjected(scratch, g.m.path, g.m.project);
             rdr.bounds = g.m.bounds;
+            rdr.tally = g.m.tally;
             rdr.rg = g.group;
             if (rdr.rg >= rdr.md.row_groups.len) {
                 rdr.close();
@@ -836,8 +839,13 @@ fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: ast.
     const probe = pqdecode.Reader.openProjected(arena, path, project) catch return null;
     const ngroups = probe.md.row_groups.len;
     if (ngroups < 2) return null;
+    if (env.scan) |t| {
+        driver.ScanTally.add(&t.columns_read, probe.leaves.len);
+        driver.ScanTally.add(&t.columns_total, probe.md.leafCount());
+    }
 
     return .{ .parquet = .{
+        .tally = env.scan,
         .path = path,
         .project = project,
         .bounds = bounds,

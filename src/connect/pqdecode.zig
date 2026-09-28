@@ -1571,6 +1571,8 @@ pub const Reader = struct {
     threshold: ?*const Threshold = null,
     /// Row groups skipped on statistics, for reporting.
     groups_skipped: usize = 0,
+    /// The run's pushdown tally, when it keeps one: groups seen and skipped.
+    tally: ?*driver.ScanTally = null,
     rg: usize = 0,
     /// Exclusive end of the row-group window this reader is confined to. Null
     /// reads to the end of the file; a parallel worker sets it so each lane owns
@@ -1671,16 +1673,19 @@ pub const Reader = struct {
             self.rg += 1;
             const rows: usize = @intCast(g.num_rows);
             if (rows == 0) continue;
+            if (self.tally) |t| driver.ScanTally.add(&t.row_groups, 1);
             // statistics can rule a whole group out before any page is touched
             if (self.bounds.len > 0 and
                 !groupMayMatch(self.md.schema, self.leaves, g, self.bounds))
             {
                 self.groups_skipped += 1;
+                if (self.tally) |t| driver.ScanTally.add(&t.row_groups_skipped, 1);
                 continue;
             }
             if (self.threshold) |t| {
                 if (!groupBeatsThreshold(self.md.schema, self.leaves, g, t.*)) {
                     self.groups_skipped += 1;
+                    if (self.tally) |ty| driver.ScanTally.add(&ty.row_groups_skipped, 1);
                     continue;
                 }
             }
