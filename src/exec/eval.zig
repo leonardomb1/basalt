@@ -2556,7 +2556,16 @@ pub fn writeValue(w: anytype, v: Value) !void {
 /// `YYYY-MM-DD` from a day count since the 1970 epoch.
 pub fn writeDate(w: anytype, days: i64) !void {
     const c = civilFromDays(days);
-    try w.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u32, @intCast(c.y)), c.m, c.d });
+    try writeYear(w, c.y);
+    try w.print("-{d:0>2}-{d:0>2}", .{ c.m, c.d });
+}
+
+/// Four digits, zero-padded; a year before astronomical year 0 carries a
+/// leading `-`, as ISO 8601's expanded form does. Files hold such dates — a
+/// `date32` of any value is valid — and printing one used to trap on the cast.
+fn writeYear(w: anytype, y: i64) !void {
+    if (y < 0) try w.writeByte('-');
+    try w.print("{d:0>4}", .{@abs(y)});
 }
 
 /// `HH:MM:SS[.ffffff]` from microseconds since midnight. (Time parts are unsigned so
@@ -2580,13 +2589,14 @@ pub fn writeTimestamp(w: anytype, micros: i64) !void {
     const secs = us / 1_000_000;
     const frac = us % 1_000_000;
     const c = civilFromDays(days);
+    try writeYear(w, c.y);
     if (frac != 0) {
-        try w.print("{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{
-            @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60, frac,
+        try w.print("-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{
+            c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60, frac,
         });
     } else {
-        try w.print("{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
-            @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60,
+        try w.print("-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+            c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60,
         });
     }
 }
@@ -2955,6 +2965,17 @@ test "parseIsoTime: the text a time prints as, and nothing out of range" {
     try std.testing.expectEqual(@as(?i64, null), parseIsoTime("24:00:00"));
     try std.testing.expectEqual(@as(?i64, null), parseIsoTime("1:02:03"));
     try std.testing.expectEqual(@as(?i64, null), parseIsoTime("01:02:03 extra"));
+}
+
+test "dates and timestamps before year 0 print with a sign instead of trapping" {
+    var buf: [96]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeDate(&w, -1_000_000);
+    try w.writeByte(' ');
+    try writeTimestamp(&w, -1_000_000 * 86_400_000_000 + 1);
+    const got = w.buffered();
+    try std.testing.expect(got[0] == '-');
+    try std.testing.expect(std.mem.endsWith(u8, got, " 00:00:00.000001"));
 }
 
 test "format temporal values for text sinks" {
