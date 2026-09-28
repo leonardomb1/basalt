@@ -69,6 +69,7 @@ const resolveUpsertKeys = @import("connect.zig").resolveUpsertKeys;
 const sinkLabel = @import("connect.zig").sinkLabel;
 const sqlConnInfo = @import("connect.zig").sqlConnInfo;
 const factsIfWanted = @import("connect.zig").factsIfWanted;
+const readReport = @import("connect.zig").readReport;
 const env_mod = @import("env.zig");
 const SplitCtx = @import("connect.zig").SplitCtx;
 
@@ -672,7 +673,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
 
                 for (env.sources.items[src_base..]) |sc| sc.close();
                 env.sources.shrinkRetainingCapacity(src_base);
-                var ctx = SplitCtx{ .gpa = gpa, .kind = env.sql_desc.?.kind, .cfg = env.sql_desc.?.cfg, .base_sql = sp.base_sql, .proj_select = proj_select, .where_extra = where_extra };
+                var ctx = SplitCtx{ .gpa = gpa, .kind = env.sql_desc.?.kind, .cfg = env.sql_desc.?.cfg, .base_sql = sp.base_sql, .proj_select = proj_select, .where_extra = where_extra, .report = try readReport(env, @tagName(env.sql_desc.?.kind)) };
                 lanes_used.* = @max(lanes_used.*, @min(opts.threads, sp.predicates.len));
                 env.log.log(.debug, "split-parallel: {d} splits over {d} lanes on key range (projection: {s}, filter pushdown: {s})", .{ sp.predicates.len, @min(opts.threads, sp.predicates.len), proj_select orelse "all", if (where_extra != null) "yes" else "no" });
                 if (try buildParallelSink(env, wr, schema)) |mode| {

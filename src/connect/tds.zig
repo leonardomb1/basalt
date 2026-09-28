@@ -170,12 +170,26 @@ pub const Conn = struct {
     }
 
     /// Run a statement with no result set (DDL/INSERT/MERGE); errors on ERROR token.
-    /// What every session needs before its first query. TEXTSIZE: without it SQL
-    /// Server hands a raw TDS client varchar(max)/nvarchar(max)/varbinary(max)
-    /// values cut at 4096 bytes — the server-side default; ODBC and OLEDB set this
-    /// at connect too, which is why nothing else ever shows the cut.
+    /// What every session needs before its first query — what the ODBC, OLE DB,
+    /// JDBC and .NET drivers (and so SSMS) set at connect, where a bare TDS login
+    /// gets the server's legacy defaults, every one of them off:
+    ///   - TEXTSIZE: otherwise varchar(max)/nvarchar(max)/varbinary(max) values
+    ///     arrive cut at 4096 bytes.
+    ///   - ANSI_WARNINGS: otherwise a value too long for its column is truncated
+    ///     on insert instead of refused, and a division by zero or an overflow
+    ///     becomes NULL — data changed without a word.
+    ///   - ANSI_NULLS: `x = NULL` is unknown, never true — the three-valued logic
+    ///     the engine and every translated predicate assume.
+    ///   - ANSI_PADDING: a varchar keeps the trailing spaces it was given.
+    ///   - ANSI_NULL_DFLT_ON: a column created without NULL / NOT NULL allows nulls.
+    ///   - QUOTED_IDENTIFIER, CONCAT_NULL_YIELDS_NULL, ARITHABORT: with the ones
+    ///     above, what SQL Server requires to write a table that has a filtered
+    ///     index, an indexed view or an indexed computed column; without them the
+    ///     write is refused.
     fn afterLogin(self: *Conn) !void {
-        try self.exec("SET TEXTSIZE 2147483647");
+        try self.exec("SET TEXTSIZE 2147483647; SET ANSI_WARNINGS ON; SET ANSI_NULLS ON; SET ANSI_PADDING ON; " ++
+            "SET ANSI_NULL_DFLT_ON ON; SET QUOTED_IDENTIFIER ON; SET CONCAT_NULL_YIELDS_NULL ON; SET ARITHABORT ON; " ++
+            "SET NUMERIC_ROUNDABORT OFF; SET IMPLICIT_TRANSACTIONS OFF");
     }
 
     pub fn exec(self: *Conn, statement: []const u8) !void {
@@ -579,7 +593,12 @@ const sql_vtable = sql.connVTable(Conn);
 
 /// Hand-written: the tds cursor is a separate `TdsCursor` with its own batch
 /// reader, so it does not fit `sql.textCursorVTable`.
-const cursor_vtable = sql.Cursor.VTable{ .schema = curSchema, .nextBatch = curNext, .close = curClose };
+const cursor_vtable = sql.Cursor.VTable{ .schema = curSchema, .nextBatch = curNext, .close = curClose, .last_error = curLastError };
+
+fn curLastError(ptr: *anyopaque) []const u8 {
+    const self: *TdsCursor = @ptrCast(@alignCast(ptr));
+    return self.conn.last_error;
+}
 
 fn curSchema(ptr: *anyopaque) types.Schema {
     const self: *TdsCursor = @ptrCast(@alignCast(ptr));
@@ -725,8 +744,10 @@ const TdsCursor = struct {
                 0xAA => try self.handleError(),
                 0xAB, 0xE3, 0xA9, 0xA4, 0xA5 => try self.reader.skip(try self.reader.readU16()),
                 0x79 => try self.reader.skip(4),
+                // A statement ahead of the rowset finished — a DELETE, an INSERT, a
+                // SET. Unless it was the batch's last, the rowset may still come.
                 0xFD, 0xFE, 0xFF => {
-                    try self.reader.skip(12);
+                    if (try self.doneMore()) continue;
                     self.done = true;
                     return;
                 },
@@ -765,8 +786,11 @@ const TdsCursor = struct {
                 },
                 0xAB, 0xE3, 0xA9, 0xA4, 0xA5 => try self.reader.skip(try self.reader.readU16()),
                 0x79 => try self.reader.skip(4),
+                // The rowset ended. The batch may go on: run it to its end, so a
+                // statement after the SELECT executes and its error is seen —
+                // closing here would have SQL Server abandon it without a word.
                 0xFD, 0xFE, 0xFF => {
-                    try self.reader.skip(12);
+                    if (try self.doneMore()) try self.drain();
                     self.done = true;
                     break;
                 },
@@ -781,6 +805,38 @@ const TdsCursor = struct {
         const out = try arena.alloc(column.Column, ncol);
         for (builders, 0..) |*b, k| out[k] = try b.finish();
         return .{ .schema = self.schema, .columns = out, .len = n };
+    }
+
+    /// Read a DONE / DONEPROC / DONEINPROC body: whether more results follow in
+    /// the batch (the DONE_MORE bit of its status).
+    fn doneMore(self: *TdsCursor) !bool {
+        const status = try self.reader.readU16();
+        try self.reader.skip(10);
+        return status & 0x0001 != 0;
+    }
+
+    /// The rest of the batch after the rowset: statements with no rows run to
+    /// their end; an error in one fails the read; a second rowset is refused
+    /// (`sql.one_result_set`).
+    fn drain(self: *TdsCursor) !void {
+        while (true) {
+            const token = self.reader.readByte() catch |e| {
+                if (e == error.EndOfMessage) return;
+                return e;
+            };
+            switch (token) {
+                0xFD, 0xFE, 0xFF => if (!try self.doneMore()) return,
+                0xAA => try self.handleError(),
+                0xAB, 0xE3, 0xA9, 0xA4, 0xA5 => try self.reader.skip(try self.reader.readU16()),
+                0x79 => try self.reader.skip(4),
+                0x81 => {
+                    if (self.conn.last_error.len > 0) self.gpa.free(self.conn.last_error);
+                    self.conn.last_error = try self.gpa.dupe(u8, sql.one_result_set);
+                    return error.QueryFailed;
+                },
+                else => return error.TdsProtocol,
+            }
+        }
     }
 
     fn parseColMeta(self: *TdsCursor, ma: std.mem.Allocator) !void {

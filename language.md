@@ -293,6 +293,23 @@ LIMIT 100 OFFSET 20;
 | no source | `SELECT 1 AS x, now() AS t;` — a `SELECT` with no `FROM` yields one row of computed values |
 | CTE | `FROM <name>` |
 
+A raw `QUERY($$…$$)` is sent as it is and may hold several statements — a
+`DELETE` and an `INSERT` before its `SELECT`, a statement after it. The batch runs
+to its end: every statement executes, and an error in any of them fails the
+read with the server's message. It may return one result set; a second is an
+error (`the query returned more than one result set`) rather than dropped or,
+if it has the same columns, appended as if it were more rows. A read that stops
+early — a `LIMIT`, a row cap — cancels whatever of the batch had not run yet.
+MySQL and StarRocks refuse a multi-statement `QUERY` outright.
+
+A SQL Server session is opened as SSMS and the ODBC, JDBC and .NET drivers open
+one: `ANSI_WARNINGS`, `ANSI_NULLS`, `ANSI_PADDING`, `ANSI_NULL_DFLT_ON`,
+`QUOTED_IDENTIFIER`, `CONCAT_NULL_YIELDS_NULL` and `ARITHABORT` on. So a value too
+long for its column is refused (`String or binary data would be truncated`)
+rather than cut, a division by zero is an error rather than NULL, a `varchar`
+keeps its trailing spaces, a column created without `NULL` / `NOT NULL` allows
+nulls, and a table with a filtered index or an indexed view can be written.
+
 A CSV column's type is sniffed from the first 1024 rows: int ⊂ float ⊂ string,
 and a column whose every non-empty, unquoted cell is an ISO `YYYY-MM-DD` reads as
 a `DATE` — so `WHERE day >= '2026-01-01'`, `date_add`, `date_diff` and `EXTRACT`
@@ -404,7 +421,9 @@ Source clauses, in any order after the source:
     collation — folding and padding only let the source match more, and the
     engine re-applies the filter.
   - `<`, `<=`, `>`, `>=` on text descend only where the column compares bytes (a
-    `_BIN`/`_BIN2` collation on SQL Server, `_bin` on MySQL, `C` on Postgres,
+    `_BIN2` collation on SQL Server, or `_BIN` on a `char`/`varchar`; `_bin`
+    on MySQL; on Postgres `C`, `POSIX`, the builtin provider, or any libc
+    collation on a musl build — as the server reports it, never an ICU one;
     StarRocks always) and the literal is printable ASCII; where the collation
     also pads, `>` is sent as `>= 'x' OR col LIKE 'x%'` and `<` as `<=`,
     which keeps every row basalt keeps. Elsewhere they stay in the engine.

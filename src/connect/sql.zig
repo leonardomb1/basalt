@@ -70,10 +70,16 @@ pub const Cursor = struct {
         schema: *const fn (*anyopaque) types.Schema,
         nextBatch: *const fn (*anyopaque, std.mem.Allocator) anyerror!?Batch,
         close: *const fn (*anyopaque) void,
+        /// The server's own words for the last failure, when it sent some.
+        last_error: ?*const fn (*anyopaque) []const u8 = null,
     };
 
     pub fn schema(self: Cursor) types.Schema {
         return self.vtable.schema(self.ptr);
+    }
+    pub fn lastError(self: Cursor) []const u8 {
+        const f = self.vtable.last_error orelse return "";
+        return f(self.ptr);
     }
     pub fn nextBatch(self: Cursor, arena: std.mem.Allocator) anyerror!?Batch {
         return self.vtable.nextBatch(self.ptr, arena) catch |e| return onWire(e);
@@ -84,6 +90,11 @@ pub const Cursor = struct {
 };
 
 pub const RowStep = enum { row, end };
+
+/// Why a `QUERY(...)` whose batch returns a second result set fails: a read has
+/// one schema, and taking the first while dropping the rest — or appending the
+/// second's rows to the first's — would answer something the batch never said.
+pub const one_result_set = "the query returned more than one result set; a read takes one — keep a single SELECT in the batch (statements before or after it are fine)";
 
 /// Name a failed database operation for what it means on the wire. A driver
 /// reads and writes its socket through `std.Io`, so a server that closed the
@@ -211,6 +222,11 @@ pub fn textCursorVTable(comptime T: type) Cursor.VTable {
                 closeTextCursor(@as(*T, @ptrCast(@alignCast(p))));
             }
         }.f,
+        .last_error = struct {
+            fn f(p: *anyopaque) []const u8 {
+                return @as(*T, @ptrCast(@alignCast(p))).last_error;
+            }
+        }.f,
     };
 }
 
@@ -323,9 +339,17 @@ pub const Dialect = enum {
     }
 };
 
+/// Where a read that fails mid-stream says why: the server's message, which
+/// the error name alone (`QueryFailed`) does not carry.
+pub const Report = struct {
+    ctx: *anyopaque,
+    f: *const fn (ctx: *anyopaque, e: anyerror, msg: []const u8) void,
+};
+
 pub const Source = struct {
     gpa: std.mem.Allocator,
     cursor: Cursor,
+    report: ?Report = null,
 
     /// Start streaming `sql` on `conn`. The cursor owns `conn` from here on.
     pub fn open(gpa: std.mem.Allocator, conn: Conn, sql: []const u8) !*Source {
@@ -343,7 +367,13 @@ pub const Source = struct {
         return self.cursor.schema();
     }
     pub fn next(self: *Source, arena: std.mem.Allocator) anyerror!?Batch {
-        return self.cursor.nextBatch(arena);
+        return self.cursor.nextBatch(arena) catch |e| {
+            if (self.report) |r| {
+                const msg = self.cursor.lastError();
+                if (msg.len > 0) r.f(r.ctx, e, msg);
+            }
+            return e;
+        };
     }
     pub fn close(self: *Source) void {
         self.cursor.close();

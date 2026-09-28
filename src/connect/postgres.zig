@@ -288,6 +288,13 @@ pub const Conn = struct {
                     self.last_error = try self.gpa.dupe(u8, errMessage(p));
                     return error.PgQueryFailed;
                 },
+                // A second statement's rows: never appended to the first's — the
+                // schema is the first's, and a same-shaped second set went in as
+                // if it were more of it.
+                'T' => {
+                    self.last_error = try self.gpa.dupe(u8, sql.one_result_set);
+                    return error.PgQueryFailed;
+                },
                 else => {},
             }
         }

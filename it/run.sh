@@ -237,12 +237,54 @@ LOAD INTO '$pq' AS SELECT n, code FROM db.it_coll;"; then
   $B run --format csv -q -c "$decl SELECT n FROM db.it_coll WHERE code >= 'B' ORDER BY n DESC LIMIT 2;" >"$out/coll_got.csv" 2>&1
   $B run --format csv -q -c "SELECT n FROM '$pq' WHERE code >= 'B' ORDER BY n DESC LIMIT 2;" >"$out/coll_want.csv" 2>&1
   cmp -s "$out/coll_got.csv" "$out/coll_want.csv" || { bad=1; echo "  $1: top-N over code >= 'B'"; diff "$out/coll_want.csv" "$out/coll_got.csv" | head -4 || true; }
+  # where the catalog proves byte order, the text range reaches the source
+  if [ -n "${4:-}" ]; then
+    $B run --format csv --log-level debug -c "$decl SELECT n FROM db.it_coll WHERE code >= 'B';" >"$out/coll_log.txt" 2>&1 || true
+    grep "sql read" "$out/coll_log.txt" | grep -q ">= 'B'" || { bad=1; echo "  $1: the text range did not descend"; }
+  fi
   if [ $bad = 0 ]; then report "$1-collation" ok; else report "$1-collation" bad; fi
 }
 
 runs mysql     && collrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"      db.it_coll
-runs postgres  && collrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"      db.it_coll
+runs postgres  && collrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"      db.it_coll descends  # 16-alpine: musl, byte order
 runs sqlserver && collrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);" db.it_coll
+
+# A QUERY batch runs to its end: statements before the SELECT and after it both
+# run, a second result set is refused rather than dropped or appended, and an
+# error after the rows fails the read with the server's message.
+batchrt() { # $1 label, $2 CREATE CONNECTION db ..., $3 table name, $4 its create statement
+  local decl=$2 t=$3 bad=0 got
+  brun run -c "$decl SELECT * FROM db.QUERY(\$\$$4\$\$);" >/dev/null 2>&1 || true
+  got=$($B run --format csv -q -c "$decl SELECT * FROM db.QUERY(\$\$DELETE FROM $t; INSERT INTO $t (n) VALUES (1), (2); SELECT count(*) AS c FROM $t\$\$);" 2>&1 | tail -1)
+  [ "$got" = 2 ] || { bad=1; echo "  $1: DELETE; INSERT; SELECT gave '$got'"; }
+  $B run --format csv -q -c "$decl SELECT * FROM db.QUERY(\$\$SELECT 1 AS a; INSERT INTO $t (n) VALUES (3)\$\$);" >/dev/null 2>&1 || true
+  got=$($B run --format csv -q -c "$decl SELECT * FROM db.QUERY(\$\$SELECT count(*) AS c FROM $t\$\$);" 2>&1 | tail -1)
+  [ "$got" = 3 ] || { bad=1; echo "  $1: the INSERT after the SELECT did not run (count '$got')"; }
+  if $B run --format csv -q -c "$decl SELECT * FROM db.QUERY(\$\$SELECT 1 AS a; SELECT 2 AS a\$\$);" >"$out/b_two.txt" 2>&1 ||
+     ! grep -q "more than one result set" "$out/b_two.txt"; then bad=1; echo "  $1: two result sets were not refused"; cat "$out/b_two.txt"; fi
+  if [ $bad = 0 ]; then report "$1-query-batch" ok; else report "$1-query-batch" bad; fi
+}
+
+runs postgres  && batchrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"      it_multi "CREATE TABLE IF NOT EXISTS it_multi (n int)"
+runs sqlserver && batchrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);" dbo.it_multi "IF OBJECT_ID('dbo.it_multi') IS NULL CREATE TABLE dbo.it_multi (n int, s varchar(3))"
+
+# The SQL Server session is the one SSMS and the ODBC/JDBC/.NET drivers open:
+# a value too long for its column is refused, not truncated; a varchar keeps its
+# trailing spaces; a column declared without NULL allows nulls; and an error
+# after a SELECT's rows fails the read with SQL Server's words.
+if runs sqlserver; then
+  MX="CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);"
+  sbad=0
+  got=$($B run --format csv -q -c "$MX SELECT * FROM db.QUERY(\$\$SELECT CAST(SESSIONPROPERTY('ANSI_WARNINGS') AS int) + CAST(SESSIONPROPERTY('ANSI_NULLS') AS int) + CAST(SESSIONPROPERTY('ANSI_PADDING') AS int) + CAST(SESSIONPROPERTY('QUOTED_IDENTIFIER') AS int) + CAST(SESSIONPROPERTY('CONCAT_NULL_YIELDS_NULL') AS int) + CAST(SESSIONPROPERTY('ARITHABORT') AS int) + SIGN(@@OPTIONS & 1024) AS k\$\$);" 2>&1 | tail -1)
+  [ "$got" = 7 ] || { sbad=1; echo "  session options on: $got of 7"; }
+  if $B run -q -c "$MX SELECT * FROM db.QUERY(\$\$INSERT INTO dbo.it_multi (n, s) VALUES (9, 'abcdef')\$\$);" >"$out/s_trunc.txt" 2>&1 ||
+     ! grep -q "would be truncated" "$out/s_trunc.txt"; then sbad=1; echo "  a too-long value was not refused"; fi
+  if $B run -q -c "$MX SELECT * FROM db.QUERY(\$\$SELECT 1 AS a; INSERT INTO dbo.it_multi (n, s) VALUES (9, 'abcdef')\$\$);" >"$out/s_after.txt" 2>&1 ||
+     ! grep -q "read failed (QueryFailed): String or binary data would be truncated" "$out/s_after.txt"; then sbad=1; echo "  an error after the rows did not fail the read with its message"; cat "$out/s_after.txt"; fi
+  got=$($B run --format csv -q -c "$MX SELECT * FROM db.QUERY(\$\$IF OBJECT_ID('dbo.it_sess') IS NOT NULL DROP TABLE dbo.it_sess; CREATE TABLE dbo.it_sess (n int, v varchar(10)); INSERT INTO dbo.it_sess VALUES (NULL, 'ab  '); SELECT DATALENGTH(v) AS dl FROM dbo.it_sess\$\$);" 2>&1 | tail -1)
+  [ "$got" = 4 ] || { sbad=1; echo "  a varchar's trailing spaces, or a null into an undeclared column: '$got'"; }
+  if [ $sbad = 0 ]; then report "sqlserver-session-options" ok; else report "sqlserver-session-options" bad; fi
+fi
 
 runs mysql     && paramrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"
 runs postgres  && paramrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"
@@ -269,13 +311,8 @@ LOAD INTO db.dbo.it_topn REPLACE AS SELECT CAST(id AS INT) AS id, CAST(amt AS DE
     # for 'ab      ' and true here. The pushed forms (widened where re-filtered,
     # exact through DATALENGTH where not) must still answer as the engine does.
     PX="CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_BIN);"
-    # one statement per QUERY: only a batch's first statement is sure to run
-    # before the reader takes its result and closes. Columns say NULL outright —
-    # this session's default for a new column is NOT NULL.
-    if brun run -c "$PX SELECT * FROM db.QUERY(\$\$IF OBJECT_ID('dbo.it_prot') IS NOT NULL DROP TABLE dbo.it_prot\$\$);" &&
-       brun run -c "$PX SELECT * FROM db.QUERY(\$\$CREATE TABLE dbo.it_prot (n int NULL, c char(8) NULL, v varchar(10) NULL, p char(8) NOT NULL)\$\$);" &&
-       brun run -c "$PX SELECT * FROM db.QUERY(\$\$INSERT INTO dbo.it_prot VALUES (1, 'ab', 'ab', 'ab'), (2, 'ab' + CHAR(9), 'aB', 'ab'), (3, 'abc', 'b', 'abc'), (4, 'aa', '000123', 'aa'), (5, NULL, NULL, 'zz'), (6, 'B', 'Z', 'B')\$\$);" &&
-       [ "$($B run --format csv -q -c "$PX SELECT count(*) AS k FROM db.dbo.it_prot;" | tail -1)" = 6 ] &&
+    # one batch, run to its end
+    if [ "$($B run --format csv -q -c "$PX SELECT * FROM db.QUERY(\$\$IF OBJECT_ID('dbo.it_prot') IS NOT NULL DROP TABLE dbo.it_prot; CREATE TABLE dbo.it_prot (n int, c char(8), v varchar(10), p char(8) NOT NULL); INSERT INTO dbo.it_prot VALUES (1, 'ab', 'ab', 'ab'), (2, 'ab' + CHAR(9), 'aB', 'ab'), (3, 'abc', 'b', 'abc'), (4, 'aa', '000123', 'aa'), (5, NULL, NULL, 'zz'), (6, 'B', 'Z', 'B'); SELECT count(*) AS k FROM dbo.it_prot\$\$);" | tail -1)" = 6 ] &&
        brun run -c "$PX LOAD INTO '$out/prot.parquet' AS SELECT n, c, v, p FROM db.dbo.it_prot;"; then
       pbad=0
       # p is a NOT NULL char(8): it comes back padded, 'ab      '

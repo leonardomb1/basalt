@@ -74,7 +74,27 @@ pub const SplitCtx = struct {
     base_sql: []const u8,
     proj_select: ?[]const u8 = null,
     where_extra: ?[]const u8 = null,
+    /// Where a lane's read that fails mid-stream says why.
+    report: ?sql.Report = null,
 };
+
+/// A read's mid-stream failure, in the run's error context, worded as a failure
+/// to open one is: `sqlserver read failed (QueryFailed): <the server's message>`.
+const ReadReport = struct {
+    errctx: *op.ErrCtx,
+    connector: []const u8,
+
+    fn f(ctx: *anyopaque, e: anyerror, msg: []const u8) void {
+        const self: *ReadReport = @ptrCast(@alignCast(ctx));
+        self.errctx.set("{s} read failed ({s}): {s}", .{ self.connector, @errorName(e), msg });
+    }
+};
+
+pub fn readReport(env: *Env, connector: []const u8) !sql.Report {
+    const r = try env.arena.create(ReadReport);
+    r.* = .{ .errctx = env.errctx, .connector = connector };
+    return .{ .ctx = r, .f = ReadReport.f };
+}
 
 /// The concrete driver for one `SqlKind`: `connect` opens the driver connection
 /// (sqlserver routes through `tdsConnect` for AAD) and `Bulk` is its bulk write
@@ -122,6 +142,7 @@ pub fn openSqlQuery(ctx: *const SplitCtx, gpa: std.mem.Allocator, query: []const
     const conn = try connectSql(gpa, ctx.kind, ctx.cfg);
     errdefer conn.close();
     const s = try sql.Source.open(gpa, conn, query);
+    s.report = ctx.report;
     return s.source();
 }
 
@@ -535,6 +556,7 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
                     defer c.close();
                     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} read failed ({s}): {s}", .{ conn.connector, @errorName(e), c.last_error }));
                 };
+                s.report = try readReport(env, conn.connector);
                 env.sql_desc = try sqlDescFor(env, info.kind, info.dialect, cfg, query, rd_eff);
                 return s.source();
             },
@@ -858,7 +880,7 @@ pub fn planSplit(env: *Env, desc: SqlDesc, lead: ast.Stage, threads: usize, w: a
     if (m < 2) return null;
     if (!forced and isPostgresCopySink(env, w)) return null;
 
-    var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql };
+    var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql, .report = try readReport(env, @tagName(desc.kind)) };
     const prober = split.Prober{ .ctx = &pctx, .openFn = proberOpen };
 
     var key: split.Key = undefined;
@@ -1066,9 +1088,13 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\FROM sys.columns c WHERE c.object_id = OBJECT_ID({s})
             , .{try sqlLit(arena, obj.items)});
         },
-        // `C`, `POSIX` and `ucs_basic` compare bytes (code points). The database
-        // default does too only when its locale is C and no ICU provider stands in
-        // for it — `'B' < 'a'` holds under byte order and under no linguistic one.
+        // Byte (code point) order, from what the server says rather than a
+        // locale's name: `C`, `POSIX` and `ucs_basic`; the builtin provider
+        // (PG 17), which sorts by code point; never an ICU collation; and a libc
+        // one only where libc compares bytes — a C locale, or any locale on a
+        // musl build, whose strcoll is strcmp (an Alpine `en_US.utf8` sorts
+        // 'B' < 'a'). `to_jsonb` reads the provider columns without failing on
+        // a server too old to have them (libc then, the only provider it had).
         // citext compares case-insensitively whatever its collation.
         .postgres => {
             var obj = std.array_list.Managed(u8).init(arena);
@@ -1083,12 +1109,21 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\ CASE WHEN t.typcategory = 'S' THEN 1 ELSE 0 END,
                 \\ CASE WHEN t.typcategory <> 'S' OR t.typname = 'citext' THEN 0
                 \\      WHEN co.collname IN ('C', 'POSIX', 'ucs_basic') THEN 1
-                \\      WHEN co.collname = 'default' AND (SELECT datcollate FROM pg_database WHERE datname = current_database()) IN ('C', 'POSIX', 'C.UTF-8', 'C.utf8') AND 'B' < 'a' THEN 1
+                \\      WHEN prov = 'b' THEN 1
+                \\      WHEN prov <> 'c' THEN 0
+                \\      WHEN version() LIKE '%-musl%' THEN 1
+                \\      WHEN locale IN ('C', 'POSIX', 'C.UTF-8', 'C.utf8') THEN 1
                 \\      ELSE 0 END,
                 \\ CASE WHEN t.typname = 'bpchar' THEN 1 ELSE 0 END,
                 \\ 0
-                \\FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid LEFT JOIN pg_collation co ON co.oid = a.attcollation
-                \\WHERE a.attrelid = {s}::regclass AND a.attnum > 0 AND NOT a.attisdropped
+                \\FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+                \\LEFT JOIN pg_collation co ON co.oid = a.attcollation
+                \\CROSS JOIN pg_database d
+                \\CROSS JOIN LATERAL (SELECT
+                \\   CASE WHEN co.collname = 'default' THEN coalesce(to_jsonb(d) ->> 'datlocprovider', 'c')
+                \\        ELSE coalesce(to_jsonb(co) ->> 'collprovider', 'c') END AS prov,
+                \\   CASE WHEN co.collname = 'default' THEN d.datcollate ELSE to_jsonb(co) ->> 'collcollate' END AS locale) x
+                \\WHERE a.attrelid = {s}::regclass AND a.attnum > 0 AND NOT a.attisdropped AND d.datname = current_database()
             , .{try sqlLit(arena, obj.items)});
         },
         // A `_bin` collation (or `binary`) compares bytes; PAD SPACE is mysql's
@@ -1145,7 +1180,7 @@ pub fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
     if (w.mode != .upsert or w.mode.upsert.keys.len > 0) return w;
     const desc = env.sql_desc orelse return planErr(env.diag, "`upsert` without `on <key>` infers the primary key from the source, which needs a SQL `table` read — this pipeline's source can't be introspected; name the key with `upsert on <col>`");
     const table = desc.table orelse return planErr(env.diag, "`upsert` key inference needs `read <conn> table <name>` (a `query` source has no single table to introspect); name the key with `upsert on <col>`");
-    var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql };
+    var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql, .report = try readReport(env, @tagName(desc.kind)) };
     const prober = split.Prober{ .ctx = &pctx, .openFn = proberOpen };
     const keys = split.introspectPkCols(env.arena, prober, desc.dialect, table) catch |e|
         return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read primary key of `{s}`: {s}", .{ table, @errorName(e) }));
