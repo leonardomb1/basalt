@@ -76,7 +76,7 @@ pub const Cursor = struct {
         return self.vtable.schema(self.ptr);
     }
     pub fn nextBatch(self: Cursor, arena: std.mem.Allocator) anyerror!?Batch {
-        return self.vtable.nextBatch(self.ptr, arena);
+        return self.vtable.nextBatch(self.ptr, arena) catch |e| return onWire(e);
     }
     pub fn close(self: Cursor) void {
         self.vtable.close(self.ptr);
@@ -84,6 +84,22 @@ pub const Cursor = struct {
 };
 
 pub const RowStep = enum { row, end };
+
+/// Name a failed database operation for what it means on the wire. A driver
+/// reads and writes its socket through `std.Io`, so a server that closed the
+/// connection (a login refused under load, a session killed mid-query) surfaces
+/// as the ambient `EndOfStream`/`ReadFailed`/`WriteFailed` — names a local file
+/// shares, so they cannot be transient everywhere. At this boundary the peer is
+/// known to be a database socket, and they become names the exit code treats as
+/// transient. Applied where an operation leaves a driver: connect, query,
+/// cursor pull, exec and the bulk loaders.
+pub fn onWire(e: anyerror) anyerror {
+    return switch (e) {
+        error.EndOfStream, error.TlsConnectionTruncated => error.ServerClosedConnection,
+        error.ReadFailed, error.WriteFailed => error.ConnectionIoFailed,
+        else => e,
+    };
+}
 
 /// `conn` requires: `meta_arena`, `openCursor(sql)`, and `last_error`
 /// conventions. On open failure the connection is left open so the caller can
@@ -143,10 +159,10 @@ pub const Conn = struct {
     };
 
     pub fn queryCursor(self: Conn, sql: []const u8) anyerror!Cursor {
-        return self.vtable.queryCursor(self.ptr, sql);
+        return self.vtable.queryCursor(self.ptr, sql) catch |e| return onWire(e);
     }
     pub fn exec(self: Conn, sql: []const u8) anyerror!void {
-        return self.vtable.exec(self.ptr, sql);
+        return self.vtable.exec(self.ptr, sql) catch |e| return onWire(e);
     }
     pub fn close(self: Conn) void {
         self.vtable.close(self.ptr);
@@ -511,8 +527,8 @@ pub fn BulkSink(comptime Proto: type) type {
             defer aa.deinit();
             const a = aa.allocator();
             const qtable = try quoteIdent(a, Proto.dialect, table_name);
-            try conn.exec(try createTableSql(a, Proto.dialect, qtable, schema, mode));
-            if (mode == .overwrite) try conn.exec(try std.fmt.allocPrint(a, "DELETE FROM {s}", .{qtable}));
+            conn.exec(try createTableSql(a, Proto.dialect, qtable, schema, mode)) catch |e| return onWire(e);
+            if (mode == .overwrite) conn.exec(try std.fmt.allocPrint(a, "DELETE FROM {s}", .{qtable})) catch |e| return onWire(e);
             const command = try gpa.dupe(u8, try Proto.command(a, qtable, schema));
             errdefer gpa.free(command);
 
@@ -565,7 +581,7 @@ pub fn BulkSink(comptime Proto: type) type {
         }
 
         fn sendSegment(self: *Self) !void {
-            const n = try Proto.send(self.conn, self.command, self.buffer.items, self.seg_rows);
+            const n = Proto.send(self.conn, self.command, self.buffer.items, self.seg_rows) catch |e| return onWire(e);
             if (n != self.seg_rows) {
                 if (self.conn.last_error.len == 0)
                     self.conn.last_error = try std.fmt.allocPrint(self.gpa, "{s} count mismatch: sent {d} rows, server loaded {d}", .{ Proto.stmt, self.seg_rows, n });

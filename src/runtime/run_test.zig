@@ -3367,3 +3367,87 @@ test "copying a parquet with nested columns keeps every one of them" {
         out,
     );
 }
+
+/// Accepts every connection and closes it at once — a database refusing logins
+/// under load. `done` plus one last connect ends the loop.
+const SlamServer = struct {
+    server: std.net.Server,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn loop(self: *SlamServer) void {
+        while (true) {
+            const c = self.server.accept() catch return;
+            c.stream.close();
+            if (self.done.load(.acquire)) return;
+        }
+    }
+};
+
+test "a database that closes the connection is a transient failure (exit 75), at top level and per for-each item" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "names.csv", .data = "name\nalpha\nbeta\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    var slam = SlamServer{ .server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true }) };
+    defer slam.server.deinit();
+    const port = slam.server.listen_address.getPort();
+    const th = try std.Thread.spawn(.{}, SlamServer.loop, .{&slam});
+    defer {
+        slam.done.store(true, .release);
+        if (std.net.tcpConnectToAddress(slam.server.listen_address)) |s| s.close() else |_| {}
+        th.join();
+    }
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+
+    for ([_][]const u8{ "postgres", "mysql", "sqlserver" }) |kind| {
+        const top = try std.fmt.allocPrint(parena.allocator(),
+            \\CREATE CONNECTION db TYPE {s} OPTIONS (host = '127.0.0.1', port = {d}, user = 'u', password = 'p', database = 'd');
+            \\LOAD INTO '{s}/out.csv' AS SELECT * FROM db.t;
+        , .{ kind, port, base });
+        const tprog = try parser.parseSource(parena.allocator(), top, &pdiag);
+        var tdiag: Diag = .{};
+        const te = if (run(alloc, tprog, .{}, &tdiag)) |_| return error.TestUnexpectedResult else |e| e;
+        if (!(tdiag.retryable or isTransient(te))) {
+            std.debug.print("{s}: {s} ({s}) not transient\n", .{ kind, @errorName(te), tdiag.msg });
+            return error.TestUnexpectedResult;
+        }
+
+        const each = try std.fmt.allocPrint(parena.allocator(),
+            \\CREATE CONNECTION db TYPE {s} OPTIONS (host = '127.0.0.1', port = {d}, user = 'u', password = 'p', database = 'd');
+            \\FOR EACH ROW OF ('{s}/names.csv') AS (name)
+            \\  LOAD INTO '{s}/out_${{name}}.csv' AS SELECT * FROM db.t;
+            \\END FOR;
+        , .{ kind, port, base, base });
+        const eprog = try parser.parseSource(parena.allocator(), each, &pdiag);
+        var sink = OutcomeSink.init(parena.allocator());
+        var ediag: Diag = .{};
+        _ = run(alloc, eprog, .{ .outcomes = &sink }, &ediag) catch {};
+        try std.testing.expect(sink.failures() > 0);
+        for (sink.list.items) |o| {
+            if (!o.ok and !o.retryable) {
+                std.debug.print("{s}: a for-each item failed as permanent\n", .{kind});
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
+test "onWire names a closed or failed database socket as transient, and leaves the rest alone" {
+    const sql = @import("../connect/sql.zig");
+    try std.testing.expectEqual(error.ServerClosedConnection, sql.onWire(error.EndOfStream));
+    try std.testing.expectEqual(error.ServerClosedConnection, sql.onWire(error.TlsConnectionTruncated));
+    try std.testing.expectEqual(error.ConnectionIoFailed, sql.onWire(error.ReadFailed));
+    try std.testing.expectEqual(error.ConnectionIoFailed, sql.onWire(error.WriteFailed));
+    try std.testing.expectEqual(error.TdsProtocol, sql.onWire(error.TdsProtocol));
+    try std.testing.expect(isTransient(sql.onWire(error.EndOfStream)));
+    try std.testing.expect(isTransient(sql.onWire(error.ReadFailed)));
+    // Untouched outside a driver: a truncated local file stays permanent.
+    try std.testing.expect(!isTransient(error.EndOfStream));
+    try std.testing.expect(!isTransient(error.WriteFailed));
+}

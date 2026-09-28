@@ -83,18 +83,20 @@ fn SqlDriver(comptime kind: SqlKind) type {
         .postgres => struct {
             const Bulk = postgres.CopySink;
             fn connect(gpa: std.mem.Allocator, cfg: DbConfig) !*postgres.Conn {
-                return postgres.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls);
+                return postgres.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls) catch |e| return sql.onWire(e);
             }
         },
         .mysql => struct {
             const Bulk = mysql.LoadDataSink;
             fn connect(gpa: std.mem.Allocator, cfg: DbConfig) !*mysql.Conn {
-                return mysql.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls);
+                return mysql.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls) catch |e| return sql.onWire(e);
             }
         },
         .sqlserver => struct {
             const Bulk = tds.BulkSink;
-            const connect = tdsConnect;
+            fn connect(gpa: std.mem.Allocator, cfg: DbConfig) !*tds.Conn {
+                return tdsConnect(gpa, cfg) catch |e| return sql.onWire(e);
+            }
         },
     };
 }

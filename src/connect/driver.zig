@@ -130,6 +130,8 @@ pub fn transientNet(e: anyerror) bool {
         error.WriteFailed,
         error.UnexpectedConnectFailure,
         error.TemporaryNameServerFailure,
+        error.ServerClosedConnection,
+        error.ConnectionIoFailed,
         => true,
         else => false,
     };

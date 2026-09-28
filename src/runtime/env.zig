@@ -73,6 +73,8 @@ pub fn isTransient(e: anyerror) bool {
         error.HostLacksNetworkAddresses,
         error.HttpServerBusy,
         error.HttpTransportFailed,
+        error.ServerClosedConnection,
+        error.ConnectionIoFailed,
         => true,
         else => false,
     };

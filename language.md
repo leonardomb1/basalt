@@ -1394,6 +1394,15 @@ is left out — the status carries it.
 | `75` | transient (`EX_TEMPFAIL`) — safe to retry — maps to HTTP 503 |
 | `130`| aborted (SIGINT) |
 
+Transient means the network or the peer failed, not the script: a refused,
+reset or timed-out connection, a failed name lookup, an HTTP 429/5xx, and a
+database that closed the connection or failed on its socket — during login
+(a server turning connections away under a burst of parallel logins) or
+mid-query (`ServerClosedConnection`, `ConnectionIoFailed`). Past an HTTP
+source's in-place backoff and a SQL sink's one reconnect mid-write, basalt does
+not retry: the exit code hands the decision to whatever scheduled the run. A `FOR EACH` whose failed items are all transient exits `75` too. The same
+end-of-file or write failure on a local file stays permanent.
+
 ## 11. Designed but not yet implemented
 
 Accepted design not yet in the engine:
