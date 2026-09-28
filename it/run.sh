@@ -36,7 +36,7 @@ for s in $SUITES; do
     sqlserver) services="$services mssql" ;;
     starrocks) services="$services starrocks" ;;
     azure)     services="$services azurite" ;;
-    s3)        services="$services minio" ;;
+    s3)        services="$services s3" ;;
     parquet)   services="$services static static-norange" ;;  # local fixtures, plus HTTP
   esac
 done
@@ -364,18 +364,18 @@ SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM 'az://devstoreacc
   fi
 fi
 
-# S3 (MinIO). Real SigV4 signing, ListObjectsV2 and ranged GETs against an S3
+# S3 (SeaweedFS). Real SigV4 signing, ListObjectsV2 and ranged GETs against an S3
 # implementation that is not ours. Credentials are the stock dev pair, not a
-# secret. MinIO starts with no buckets and its image ships `mc`, so the suite
-# creates the bucket here rather than via a one-shot init container.
+# secret. The store starts with no buckets and its image ships `weed shell`, so
+# the suite creates the bucket here rather than via a one-shot init container.
 if runs s3; then
   export AWS_ENDPOINT_URL="http://127.0.0.1:39000"
   export AWS_ACCESS_KEY_ID="minioadmin"
   export AWS_SECRET_ACCESS_KEY="minioadmin"
   export AWS_REGION="us-east-1"
 
-  docker compose -f it/compose.yaml exec -T minio sh -c \
-    "mc alias set local http://127.0.0.1:9000 minioadmin minioadmin && mc mb -p local/basalt-it" >/dev/null 2>&1
+  docker compose -f it/compose.yaml exec -T s3 sh -c \
+    "echo 's3.bucket.create -name basalt-it' | weed shell" >/dev/null 2>&1
 
   # Single object: out through the writer, back through the signed reader — a
   # green run exercises both halves of the SigV4 path.
