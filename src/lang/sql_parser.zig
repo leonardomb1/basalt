@@ -535,6 +535,10 @@ pub const Parser = struct {
     /// `SHOW TABLES FROM <conn>[.<schema>] [LIKE '<pattern>'];` — one row per table
     /// or view, from the source's own catalog. Lowered to a terminal query over a
     /// `conn.QUERY(...)` on `information_schema`, which every SQL connector has.
+    /// Spelled in upper case and aliased back: on a SQL Server database with a
+    /// case-sensitive or binary collation (Protheus uses `Latin1_General_BIN`) only
+    /// `INFORMATION_SCHEMA.TABLES` and `TABLE_NAME` resolve, and upper case is
+    /// what postgres folds an unquoted name from and what mysql ignores.
     fn parseShow(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
         const pos = self.curPos();
         try self.expectKw("show");
@@ -556,14 +560,14 @@ pub const Parser = struct {
         }
 
         var q = std.array_list.Managed(u8).init(self.arena);
-        try q.appendSlice("SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_type IN ('BASE TABLE', 'VIEW')");
+        try q.appendSlice("SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, TABLE_TYPE AS table_type FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE IN ('BASE TABLE', 'VIEW')");
         if (schema) |sc| {
-            try q.writer().print(" AND table_schema = '{s}'", .{sc});
+            try q.writer().print(" AND TABLE_SCHEMA = '{s}'", .{sc});
         } else {
-            try q.appendSlice(" AND table_schema NOT IN ('information_schema', 'pg_catalog', 'mysql', 'performance_schema', 'sys', '_statistics_')");
+            try q.appendSlice(" AND TABLE_SCHEMA NOT IN ('information_schema', 'pg_catalog', 'mysql', 'performance_schema', 'sys', '_statistics_')");
         }
-        if (like) |pat| try q.writer().print(" AND table_name LIKE '{s}'", .{pat});
-        try q.appendSlice(" ORDER BY table_schema, table_name");
+        if (like) |pat| try q.writer().print(" AND TABLE_NAME LIKE '{s}'", .{pat});
+        try q.appendSlice(" ORDER BY 1, 2");
 
         const stages = try self.arena.alloc(ast.Stage, 2);
         stages[0] = .{ .node = .{ .read = .{ .connector = conn, .form = .{ .query = try q.toOwnedSlice() } } }, .hints = &.{}, .pos = pos };
@@ -4345,8 +4349,8 @@ test "sql: DESCRIBE lowers to a describe-mode EXPLAIN that asks a table for no r
     try testing.expectEqual(ast.ExplainMode.describe, prog.stmts[4].explain.mode);
     const show = prog.stmts[5].output.stages[0].node.read;
     try testing.expectEqualStrings("erp", show.connector);
-    try testing.expect(std.mem.indexOf(u8, show.form.query, "information_schema.tables") != null);
-    try testing.expect(std.mem.indexOf(u8, show.form.query, "table_schema = 'public'") != null);
+    try testing.expect(std.mem.indexOf(u8, show.form.query, "INFORMATION_SCHEMA.TABLES") != null);
+    try testing.expect(std.mem.indexOf(u8, show.form.query, "TABLE_SCHEMA = 'public'") != null);
     try testing.expect(std.mem.indexOf(u8, show.form.query, "LIKE 'ord%'") != null);
 
     try testing.expectError(error.ParseFailed, parseSource(a, "SHOW TABLES FROM nope;", &diag));

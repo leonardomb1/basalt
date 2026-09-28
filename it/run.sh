@@ -160,6 +160,26 @@ LOAD INTO $3 REPLACE AS SELECT CAST(id AS INT) AS id, CAST(v AS INT) AS v, CAST(
   fi
 }
 
+# The source's catalog, as basalt asks it: SHOW TABLES lists a table, and Tab
+# offers the columns of a table named at the very end of the script, with their
+# type. Runs after topnrt, whose it_topn table it looks for.
+catalogrt() { # $1 label, $2 CREATE CONNECTION db ..., $3 schema holding it_topn
+  if $B run --format csv -c "$2 SHOW TABLES FROM db.$3 LIKE 'it_topn';" >"$out/cat_$1.csv" 2>&1 &&
+     grep -q "^$3,it_topn," "$out/cat_$1.csv"; then
+    report "$1-show-tables" ok
+  else
+    report "$1-show-tables" bad; head -5 "$out/cat_$1.csv"
+  fi
+  local s="$2 SELECT amt FROM db.$3.it_topn"
+  local at=$(( ${#2} + 11 ))
+  if $B complete --connect --pos "$at" -c "$s" >"$out/cmp_$1.json" 2>/dev/null &&
+     python3 -c 'import json,sys; o=json.load(open(sys.argv[1])); sys.exit(0 if any(i["text"]=="amt" and i["kind"]=="column" and i.get("detail") for i in o["items"]) else 1)' "$out/cmp_$1.json"; then
+    report "$1-complete-columns" ok
+  else
+    report "$1-complete-columns" bad; cat "$out/cmp_$1.json"
+  fi
+}
+
 MYSQL_OPTS="host = '127.0.0.1', port = 33306, user = 'root', password = 'it', database = 'it'"
 PG_OPTS="host = '127.0.0.1', port = 35432, user = 'postgres', password = 'it', database = 'it'"
 MSSQL_OPTS="host = '127.0.0.1', port = 31433, user = 'sa', password = 'It_Passw0rd1', database = 'master', tls = 'insecure'"
@@ -171,6 +191,25 @@ runs sqlserver && sqlrt sqlserver "$MSSQL_OPTS"
 runs mysql     && topnrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"         db.it_topn
 runs postgres  && topnrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"         db.it_topn
 runs sqlserver && topnrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);"    db.it_topn
+
+runs mysql     && catalogrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"      it
+runs postgres  && catalogrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"      public
+runs sqlserver && catalogrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);" dbo
+
+# A SQL Server database with a binary collation, as Protheus runs on: there only
+# `INFORMATION_SCHEMA.TABLES` and `TABLE_NAME` resolve, not their lower case.
+if runs sqlserver; then
+  MSSQL_BIN=$(printf '%s' "$MSSQL_OPTS" | sed "s/database = 'master'/database = 'it_bin'/")
+  case $MSSQL_BIN in *"'it_bin'"*) ;; *) echo "MSSQL_BIN did not take the it_bin database" >&2; exit 2 ;; esac
+  if brun run -c "CREATE CONNECTION m TYPE sqlserver OPTIONS ($MSSQL_OPTS);
+SELECT * FROM m.QUERY(\$\$IF DB_ID('it_bin') IS NULL EXEC('CREATE DATABASE it_bin COLLATE Latin1_General_BIN'); SELECT 1 AS ok\$\$);" &&
+     brun run -c "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_BIN);
+LOAD INTO db.dbo.it_topn REPLACE AS SELECT CAST(id AS INT) AS id, CAST(amt AS DECIMAL(10,2)) AS amt FROM 'it/topn.csv';"; then
+    catalogrt sqlserver-binary-collation "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_BIN);" dbo
+  else
+    report "sqlserver-binary-collation (setup error)" bad
+  fi
+fi
 
 # Split-parallel probe over a shared join index: the key-range lanes must produce
 # exactly what the serial driver does. The split is forced by hint — basalt_it is
@@ -346,6 +385,7 @@ LOAD INTO '$out/sr_embedded_out.csv' AS SELECT id, s FROM fe.it_nullmark2 ORDER 
 
   # read back through a starrocks connection, so the starrocks dialect renders it
   topnrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_topn USING stream_load"
+  catalogrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" it
 fi
 
 # Azure Blob (Azurite). ADLS Gen2 data is reached through the Blob endpoint —

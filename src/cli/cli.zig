@@ -1349,7 +1349,7 @@ fn connTables(cx: *const Completer, conn: []const u8) []const []const u8 {
     if (cx.catalog.tables.get(conn)) |t| return t;
     if (!cx.connect) return &.{};
     const a = cx.catalog.arena.allocator();
-    const q = std.fmt.allocPrint(a, "SELECT table_schema || '.' || table_name AS t FROM {s}.QUERY($$SELECT table_schema, table_name FROM information_schema.tables WHERE table_type IN ('BASE TABLE', 'VIEW') AND table_schema NOT IN ('information_schema', 'pg_catalog', 'mysql', 'performance_schema', 'sys', '_statistics_') ORDER BY 1, 2$$)", .{conn}) catch return &.{};
+    const q = std.fmt.allocPrint(a, "SELECT table_schema || '.' || table_name AS t FROM {s}.QUERY($$SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE IN ('BASE TABLE', 'VIEW') AND TABLE_SCHEMA NOT IN ('information_schema', 'pg_catalog', 'mysql', 'performance_schema', 'sys', '_statistics_') ORDER BY 1, 2$$)", .{conn}) catch return &.{};
     const rows = fetchColumn(cx, q);
     cx.catalog.tables.put(a.dupe(u8, conn) catch return rows, rows) catch {};
     return rows;
@@ -1385,8 +1385,9 @@ fn sourceColumns(cx: *const Completer, key: []const u8) []const complete.Column 
         const conn = parts.next().?;
         const schema = parts.next() orelse return rows;
         const tbl = parts.next() orelse return rows;
-        // Aliased: MySQL answers information_schema in upper case otherwise.
-        const q = std.fmt.allocPrint(a, "SELECT col_name, col_type FROM {s}.QUERY($$SELECT column_name AS col_name, data_type AS col_type FROM information_schema.columns WHERE table_schema = '{s}' AND table_name = '{s}' ORDER BY ordinal_position$$)", .{ conn, schema, tbl }) catch return rows;
+        // Upper case, as `SHOW TABLES` spells it (a case-sensitive SQL Server
+        // resolves nothing else), aliased so every dialect answers the same names.
+        const q = std.fmt.allocPrint(a, "SELECT col_name, col_type FROM {s}.QUERY($$SELECT COLUMN_NAME AS col_name, DATA_TYPE AS col_type FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = '{s}' AND TABLE_NAME = '{s}' ORDER BY ORDINAL_POSITION$$)", .{ conn, schema, tbl }) catch return rows;
         const got = fetchRows(cx, q);
         const cols = a.alloc(complete.Column, got.len) catch return rows;
         for (got, cols) |r, *c| c.* = .{ .name = r[0], .type = if (r.len > 1) r[1] else "" };
@@ -1463,7 +1464,12 @@ pub fn suggestFor(arena: std.mem.Allocator, cx: *const Completer, text: []const 
             while (e < text.len and (std.ascii.isAlphanumeric(text[e]) or text[e] == '_' or text[e] == '.')) : (e += 1) {
                 if (text[e] == '.') dots += 1;
             }
-            if (dots == 1 and e < text.len and text[e] != '(') for (sourceColumns(cx, text[p..e])) |col| try columns.append(col);
+            // `conn.QUERY(` is no table; a name at the very end of the text is
+            // (`SELECT a FROM erp.dbo.t`), unless the cursor is still typing it —
+            // then it is half a name, and asking for its columns would send a
+            // catalog query on every keystroke.
+            const typing = cursor > p and cursor <= e;
+            if (dots == 1 and !typing and (e == text.len or text[e] != '(')) for (sourceColumns(cx, text[p..e])) |col| try columns.append(col);
         }
         if (wanted) try tables.append(.{ .conn = c, .tables = try httpResources(arena, cx, c) orelse connTables(cx, c) });
     }
