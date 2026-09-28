@@ -708,11 +708,39 @@ pub fn projectSqlRead(env: *Env, stages: []const ast.Stage) ![]const ast.Stage {
     };
     if (cols.len == 0) return stages;
     for (cols) |c| if (std.mem.indexOfScalar(u8, c, '.') != null) return stages;
+    // After a join an unqualified name may be the other side's, and a column
+    // list naming one the table lacks is a query the database refuses. Keep
+    // only the table's own columns, learnt from a zero-row probe; when the
+    // probe fails, read every column rather than guess.
+    var own = cols;
+    for (stages[1..]) |st| if (st.node == .join) {
+        own = (try tableColumnsAmong(env, rd, stages[0].hints, cols)) orelse return stages;
+        break;
+    };
+    if (own.len == 0) return stages;
     const out = try env.arena.dupe(ast.Stage, stages);
     var nrd = rd;
-    nrd.cols = cols;
+    nrd.cols = own;
     out[0].node = .{ .read = nrd };
     return out;
+}
+
+/// Those of `names` the table `rd` reads has, in its own spelling. Null when the
+/// probe fails.
+fn tableColumnsAmong(env: *Env, rd: ast.Read, hints: []const ast.Hint, names: []const []const u8) !?[]const []const u8 {
+    var probe = rd;
+    probe.where = "1 = 0";
+    probe.cols = &.{};
+    const src = openSourceProjected(env, probe, hints, null, &.{}) catch return null;
+    defer src.close();
+    var out = std.array_list.Managed([]const u8).init(env.arena);
+    for (src.schema().fields) |f| {
+        for (names) |n| if (std.ascii.eqlIgnoreCase(n, f.name)) {
+            try out.append(try env.arena.dupe(u8, f.name));
+            break;
+        };
+    }
+    return try out.toOwnedSlice();
 }
 
 /// The names a `SELECT * EXCEPT (...)` directly after the read leaves out, when

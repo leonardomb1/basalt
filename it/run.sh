@@ -142,6 +142,20 @@ if runs postgres; then
   else
     report "postgres-split-join (run error)" bad
   fi
+
+  # A column pushed to the table must be the table's: `l.label` is the joined
+  # side's, and so is a bare `label` the table does not have. Asking the table
+  # for either — or for a column named after the qualifier `l` — is a query
+  # the database refuses.
+  if brun run -c "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);
+LOAD INTO '$out/pg_join_cols.csv' AS
+WITH labels AS (SELECT id AS lid, name AS label FROM 'it/seed.csv')
+SELECT id, l.label AS a, upper(label) AS b FROM db.basalt_it t JOIN labels l ON t.id = l.lid ORDER BY id;"; then
+    printf 'id,a,b\n1,alpha,ALPHA\n2,"beta, gamma","BETA, GAMMA"\n3,delta,DELTA\n' >"$out/pg_join_cols_want.csv"
+    check postgres-join-projects-own-columns "$out/pg_join_cols.csv" "$out/pg_join_cols_want.csv"
+  else
+    report "postgres-join-projects-own-columns (run error)" bad
+  fi
 fi
 
 # Decimal aggregates against the source's own answer. A bare postgres `numeric`

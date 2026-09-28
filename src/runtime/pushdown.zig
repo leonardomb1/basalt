@@ -1707,7 +1707,7 @@ fn collectQualsRecur(cx: QualWalk, e: *const ast.Expr) error{OutOfMemory}!*ast.E
     return ast.rebuildExpr(cx.arena, e, cx, collectQualsRecur);
 }
 
-fn collectQuals(arena: std.mem.Allocator, e: *const ast.Expr, list: *std.array_list.Managed(ast.QualName)) !void {
+pub fn collectQuals(arena: std.mem.Allocator, e: *const ast.Expr, list: *std.array_list.Managed(ast.QualName)) !void {
     _ = try collectQualsRecur(.{ .arena = arena, .list = list }, e);
 }
 

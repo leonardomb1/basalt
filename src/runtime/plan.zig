@@ -158,22 +158,26 @@ pub fn tailSchema(env: *Env, tail: []const ast.Stage, in: types.Schema) !types.S
 /// wrong rows, which is what makes the optimisation safe to attempt.
 pub fn projectedColumns(env: *Env, stages: []const ast.Stage) !?[][]const u8 {
     var set = std.StringHashMap(void).init(env.arena);
+    // The right sides joined so far, by the name the query calls them: a field
+    // qualified by one (`l.name`) is that side's column, never the read's, and
+    // taking its qualifier for a column name asked the source for a column `l`.
+    var right = std.array_list.Managed([]const u8).init(env.arena);
     // Projection is only sound once some stage *defines* the output columns.
     // With no such stage the read's own columns are the result — an empty
     // reference set then means "everything", not "nothing".
     var defines_output = false;
     for (stages) |st| {
         switch (st.node) {
-            .filter => |e| try pushdown.collectFields(e, &set),
-            .sort => |so| for (so.keys) |k| try set.put(k.field.parts[0], {}),
+            .filter => |e| try exprFields(env, e, &set, right.items),
+            .sort => |so| for (so.keys) |k| try putField(&set, k.field, right.items),
             .distinct => |d| {
                 // `distinct` with no key list looks at every column
                 const on = d.on orelse return null;
-                for (on) |q| try set.put(q.parts[0], {});
+                for (on) |q| try putField(&set, q, right.items);
             },
             .aggregate => |ag| {
-                for (ag.by) |q| try set.put(q.parts[0], {});
-                for (ag.aggs) |a| if (a.arg) |e| try pushdown.collectFields(e, &set);
+                for (ag.by) |q| try putField(&set, q, right.items);
+                for (ag.aggs) |a| if (a.arg) |e| try exprFields(env, e, &set, right.items);
                 defines_output = true;
                 break;
             },
@@ -182,8 +186,8 @@ pub fn projectedColumns(env: *Env, stages: []const ast.Stage) !?[][]const u8 {
                     // a star keeps every column, and after it names are no
                     // longer the source's, so nothing further can be proven
                     .star, .star_except, .star_rename => return null,
-                    .field => |q| try set.put(q.parts[0], {}),
-                    .computed => |c| try pushdown.collectFields(c.expr, &set),
+                    .field => |q| try putField(&set, q, right.items),
+                    .computed => |c| try exprFields(env, c.expr, &set, right.items),
                 };
                 // downstream stages refer to this select's outputs, not the
                 // source's columns, so the set is complete here
@@ -198,7 +202,10 @@ pub fn projectedColumns(env: *Env, stages: []const ast.Stage) !?[][]const u8 {
             // the `else` below and the projection was abandoned entirely — a joined
             // query decoded all 17 columns of TPC-H lineitem instead of the 4 it
             // read, measured at 1174ms of scan against 263ms.
-            .join => |j| for (j.left_keys) |q| try set.put(q.parts[q.parts.len - 1], {}),
+            .join => |j| {
+                for (j.left_keys) |q| try set.put(q.parts[q.parts.len - 1], {});
+                try right.append(if (j.alias.len > 0) j.alias else j.binding);
+            },
             // anything else may reference columns in ways not modelled here
             else => return null,
         }
@@ -208,6 +215,22 @@ pub fn projectedColumns(env: *Env, stages: []const ast.Stage) !?[][]const u8 {
     var it = set.keyIterator();
     while (it.next()) |k| try out.append(k.*);
     return try out.toOwnedSlice();
+}
+
+/// Add the source column `q` names, unless it is qualified by a joined right
+/// side — then it is that side's column, not one the read could supply.
+fn putField(set: *std.StringHashMap(void), q: ast.QualName, right: []const []const u8) !void {
+    if (q.parts.len > 1) for (right) |r| {
+        if (std.ascii.eqlIgnoreCase(r, q.parts[0])) return;
+    };
+    try set.put(q.parts[0], {});
+}
+
+fn exprFields(env: *Env, e: *const ast.Expr, set: *std.StringHashMap(void), right: []const []const u8) !void {
+    if (right.len == 0) return pushdown.collectFields(e, set);
+    var quals = std.array_list.Managed(ast.QualName).init(env.arena);
+    try pushdown.collectQuals(env.arena, e, &quals);
+    for (quals.items) |q| try putField(set, q, right);
 }
 
 /// Simple `column <op> literal` conjuncts of a filter, usable to skip whole
