@@ -950,11 +950,7 @@ pub fn describeRows(arena: std.mem.Allocator, schema: types.Schema) ![]const u8 
         try text.append(',');
         // `decimal(p,s)` holds the delimiter: quoted like the name, or its scale
         // lands in the `nullable` column.
-        const ty = if (f.ty.kind == .decimal)
-            try std.fmt.allocPrint(arena, "decimal({d},{d})", .{ f.ty.precision, f.ty.scale })
-        else
-            @tagName(f.ty.kind);
-        try csv.writeField(text.writer(), ty, ',');
+        try csv.writeField(text.writer(), try f.ty.name(arena), ',');
         try text.writer().print(",{s}\n", .{if (f.ty.nullable) "yes" else "no"});
     }
     return text.toOwnedSlice();

@@ -8,18 +8,28 @@
 //!   - inside an unclosed `'…'`: a file path, asked of the caller;
 //!   - `$…`: params and LETs;
 //!   - `conn.…`: that connection's tables, `schema.table`; `x.…` otherwise: columns;
-//!   - a bare word: CTEs, connections, functions, the columns of the tables and
-//!     files the entry names, then keywords — spelled in the case of the prefix.
+//!   - a bare word: CTEs, connections, declared functions, the columns of the
+//!     tables and files the entry names, the built-in functions, then keywords —
+//!     spelled in the case of the prefix.
+//!
+//! A word is offered once: the first kind to claim it wins, so a column called
+//! `name` is not offered again as the keyword `name`.
 
 const std = @import("std");
 const hilite = @import("hilite.zig");
 
 pub const Kind = enum { meta, param, cte, connection, function, table, column, keyword, path };
 
-pub const Candidate = struct { text: []const u8, kind: Kind };
+/// `detail` is what an editor shows beside the pick: a built-in function's
+/// signature, a column's type. Empty when there is nothing to add.
+pub const Candidate = struct { text: []const u8, kind: Kind, detail: []const u8 = "" };
 
 /// One connection's tables, as `schema.table`.
 pub const ConnTables = struct { conn: []const u8, tables: []const []const u8 };
+
+/// A column and its type as its source names it — the engine's type for a file,
+/// the database's `data_type` for a table; empty when unknown.
+pub const Column = struct { name: []const u8, type: []const u8 = "" };
 
 pub const Names = struct {
     connections: []const []const u8 = &.{},
@@ -28,7 +38,82 @@ pub const Names = struct {
     params: []const []const u8 = &.{},
     tables: []const ConnTables = &.{},
     /// The columns of every table and file the entry names, pooled.
-    columns: []const []const u8 = &.{},
+    columns: []const Column = &.{},
+};
+
+/// A built-in function and how it is called.
+pub const Builtin = struct { name: []const u8, sig: []const u8 };
+
+/// Every function the engine answers to by name: the scalar builtins, the
+/// aggregates, the window functions, and the call-shaped `CAST`/`TRY_CAST`/`IF`.
+/// `cli.zig`'s test holds it to the engine's registries both ways, so a
+/// builtin added there cannot go missing from Tab.
+pub const builtin_functions = [_]Builtin{
+    // scalar
+    .{ .name = "now", .sig = "now()" },
+    .{ .name = "today", .sig = "today()" },
+    .{ .name = "regexp_replace", .sig = "regexp_replace(s, pattern, replacement)" },
+    .{ .name = "date_trunc", .sig = "date_trunc(unit, ts)" },
+    .{ .name = "extract", .sig = "extract(unit FROM ts)" },
+    .{ .name = "upper", .sig = "upper(s)" },
+    .{ .name = "lower", .sig = "lower(s)" },
+    .{ .name = "length", .sig = "length(s)" },
+    .{ .name = "strlen", .sig = "strlen(s)" },
+    .{ .name = "bit_count", .sig = "bit_count(n)" },
+    .{ .name = "to_hex", .sig = "to_hex(n)" },
+    .{ .name = "from_hex", .sig = "from_hex(s)" },
+    .{ .name = "concat", .sig = "concat(a, …)" },
+    .{ .name = "coalesce", .sig = "coalesce(a, …)" },
+    .{ .name = "starts_with", .sig = "starts_with(s, prefix)" },
+    .{ .name = "ends_with", .sig = "ends_with(s, suffix)" },
+    .{ .name = "contains", .sig = "contains(s, sub)" },
+    .{ .name = "like", .sig = "like(s, pattern)" },
+    .{ .name = "trim", .sig = "trim(s)" },
+    .{ .name = "substr", .sig = "substr(s, start[, length])" },
+    .{ .name = "replace", .sig = "replace(s, from, to)" },
+    .{ .name = "abs", .sig = "abs(x)" },
+    .{ .name = "floor", .sig = "floor(x)" },
+    .{ .name = "ceil", .sig = "ceil(x)" },
+    .{ .name = "round", .sig = "round(x[, digits])" },
+    .{ .name = "mod", .sig = "mod(a, b)" },
+    .{ .name = "power", .sig = "power(base, exponent)" },
+    .{ .name = "sqrt", .sig = "sqrt(x)" },
+    .{ .name = "sign", .sig = "sign(x)" },
+    .{ .name = "nullif", .sig = "nullif(a, b)" },
+    .{ .name = "greatest", .sig = "greatest(a, b, …)" },
+    .{ .name = "least", .sig = "least(a, b, …)" },
+    .{ .name = "lpad", .sig = "lpad(s, length[, fill])" },
+    .{ .name = "rpad", .sig = "rpad(s, length[, fill])" },
+    .{ .name = "left", .sig = "left(s, n)" },
+    .{ .name = "right", .sig = "right(s, n)" },
+    .{ .name = "split_part", .sig = "split_part(s, delimiter, n)" },
+    .{ .name = "strpos", .sig = "strpos(s, sub)" },
+    .{ .name = "repeat", .sig = "repeat(s, n)" },
+    .{ .name = "reverse", .sig = "reverse(s)" },
+    .{ .name = "date_add", .sig = "date_add(unit, n, ts)" },
+    .{ .name = "date_diff", .sig = "date_diff(unit, start, end)" },
+    .{ .name = "make_date", .sig = "make_date(year, month, day)" },
+    .{ .name = "epoch", .sig = "epoch(ts)" },
+    .{ .name = "to_timestamp", .sig = "to_timestamp(seconds)" },
+    .{ .name = "strftime", .sig = "strftime(ts, format)" },
+    .{ .name = "json_get", .sig = "json_get(json, path)" },
+    // aggregate (the five that also run over a window say so)
+    .{ .name = "count", .sig = "count(* | x) [OVER (…)]" },
+    .{ .name = "sum", .sig = "sum(x) [OVER (…)]" },
+    .{ .name = "avg", .sig = "avg(x) [OVER (…)]" },
+    .{ .name = "min", .sig = "min(x) [OVER (…)]" },
+    .{ .name = "max", .sig = "max(x) [OVER (…)]" },
+    .{ .name = "median", .sig = "median(x)" },
+    // window
+    .{ .name = "row_number", .sig = "row_number() OVER (…)" },
+    .{ .name = "rank", .sig = "rank() OVER (…)" },
+    .{ .name = "dense_rank", .sig = "dense_rank() OVER (…)" },
+    .{ .name = "lag", .sig = "lag(x[, n]) OVER (…)" },
+    .{ .name = "lead", .sig = "lead(x[, n]) OVER (…)" },
+    // call-shaped syntax
+    .{ .name = "cast", .sig = "cast(x AS type)" },
+    .{ .name = "try_cast", .sig = "try_cast(x AS type)" },
+    .{ .name = "if", .sig = "if(cond, a, b)" },
 };
 
 /// Every meta command the REPL answers to; `cli.zig`'s test checks it stays so.
@@ -121,19 +206,25 @@ pub fn complete(arena: std.mem.Allocator, names: Names, text: []const u8, cursor
             return finish(&out, start);
         }
         for (names.columns) |c| {
-            if (startsWithFold(c, rest)) try out.append(.{ .text = try std.fmt.allocPrint(arena, "{s}.{s}", .{ head, c }), .kind = .column });
+            if (startsWithFold(c.name, rest)) try add(&out, .{ .text = try std.fmt.allocPrint(arena, "{s}.{s}", .{ head, c.name }), .kind = .column, .detail = c.type });
         }
         return finish(&out, start);
     }
 
-    for (names.ctes) |n| if (startsWithFold(n, word)) try out.append(.{ .text = n, .kind = .cte });
-    for (names.connections) |n| if (startsWithFold(n, word)) try out.append(.{ .text = n, .kind = .connection });
-    for (names.functions) |n| if (startsWithFold(n, word)) try out.append(.{ .text = n, .kind = .function });
-    for (names.columns) |n| if (startsWithFold(n, word)) try out.append(.{ .text = n, .kind = .column });
-    if (word.len > 0) {
-        for (hilite.keywords) |k| if (startsWithFold(k, word)) try out.append(.{ .text = try cased(arena, k, word), .kind = .keyword });
-    }
+    for (names.ctes) |n| if (startsWithFold(n, word)) try add(&out, .{ .text = n, .kind = .cte });
+    for (names.connections) |n| if (startsWithFold(n, word)) try add(&out, .{ .text = n, .kind = .connection });
+    for (names.functions) |n| if (startsWithFold(n, word)) try add(&out, .{ .text = n, .kind = .function });
+    for (names.columns) |c| if (startsWithFold(c.name, word)) try add(&out, .{ .text = c.name, .kind = .column, .detail = c.type });
+    for (builtin_functions) |f| if (startsWithFold(f.name, word)) try add(&out, .{ .text = try cased(arena, f.name, word), .kind = .function, .detail = f.sig });
+    for (hilite.keywords) |k| if (startsWithFold(k, word)) try add(&out, .{ .text = try cased(arena, k, word), .kind = .keyword });
     return finish(&out, start);
+}
+
+/// Append `c` unless a candidate with the same text (ignoring case) is already
+/// there: the earlier, more specific kind keeps the word.
+fn add(out: *std.array_list.Managed(Candidate), c: Candidate) !void {
+    for (out.items) |have| if (std.ascii.eqlIgnoreCase(have.text, c.text)) return;
+    try out.append(c);
 }
 
 fn finish(out: *std.array_list.Managed(Candidate), start: usize) !Result {
@@ -158,18 +249,20 @@ test "complete: keywords in the typer's case, names first, and nothing for an em
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const names = Names{ .ctes = &.{"sales"}, .connections = &.{"sr"}, .columns = &.{ "customer", "cents" } };
+    const names = Names{ .ctes = &.{"sales"}, .connections = &.{"sr"}, .columns = &.{ .{ .name = "customer" }, .{ .name = "cents" } } };
     const r = try complete(a, names, "SELECT c", 8);
     const items = r.candidates.items;
     try std.testing.expectEqual(@as(usize, 7), r.candidates.start);
     try std.testing.expectEqualStrings("customer", items[0].text);
     try std.testing.expectEqual(Kind.column, items[0].kind);
     try std.testing.expectEqualStrings("cents", items[1].text);
-    try std.testing.expectEqual(Kind.keyword, items[2].kind);
-    try std.testing.expectEqualStrings("call", items[2].text);
+    // then the built-in functions, then keywords
+    try std.testing.expectEqual(Kind.function, items[2].kind);
+    try std.testing.expectEqualStrings("concat", items[2].text);
+    try std.testing.expectEqual(Kind.keyword, items[items.len - 1].kind);
     try std.testing.expectEqualStrings("SELECT", (try complete(a, names, "SEL", 3)).candidates.items[0].text);
     // `co` could be a column or several keywords: what they share is `co` itself.
-    const co = (try complete(a, .{ .columns = &.{"color"} }, "WHERE co", 8)).candidates.items;
+    const co = (try complete(a, .{ .columns = &.{.{ .name = "color" }} }, "WHERE co", 8)).candidates.items;
     try std.testing.expectEqualStrings("color", co[0].text);
     try std.testing.expect(co.len > 1);
     try std.testing.expectEqualStrings("co", commonPrefix(co));
@@ -184,7 +277,7 @@ test "complete: conn.table from the catalog, alias.column from the pool, $param,
         .connections = &.{"sr"},
         .params = &.{ "since", "tag" },
         .tables = &.{.{ .conn = "sr", .tables = &.{ "bronze.kimai_tags", "bronze.kimai_users" } }},
-        .columns = &.{ "id", "name" },
+        .columns = &.{ .{ .name = "id" }, .{ .name = "name" } },
     };
     const t = (try complete(a, names, "FROM sr.bronze.kimai_t", 22)).candidates;
     try std.testing.expectEqual(@as(usize, 5), t.start);
@@ -202,4 +295,40 @@ test "complete: conn.table from the catalog, alias.column from the pool, $param,
     try std.testing.expectEqual(@as(usize, 6), path.start);
     // A closed string is not a path.
     try std.testing.expect((try complete(a, names, "FROM 'a.csv' WHERE ", 19)) == .none);
+}
+
+test "complete: built-in functions by prefix with their signature, columns with their type, each word once" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const text = "SELECT * FROM RANGE(3) WHERE date_";
+    const d = (try complete(a, .{}, text, text.len)).candidates;
+    try std.testing.expectEqual(@as(usize, text.len - "date_".len), d.start);
+    try std.testing.expectEqual(@as(usize, 3), d.items.len);
+    for (d.items) |c| try std.testing.expectEqual(Kind.function, c.kind);
+    try std.testing.expectEqualStrings("date_trunc", d.items[0].text);
+    try std.testing.expectEqualStrings("date_add", d.items[1].text);
+    try std.testing.expectEqualStrings("date_add(unit, n, ts)", d.items[1].detail);
+    try std.testing.expectEqualStrings("date_diff", d.items[2].text);
+    // in the typer's case, like a keyword
+    try std.testing.expectEqualStrings("DATE_ADD", (try complete(a, .{}, "DATE_A", 6)).candidates.items[0].text);
+    try std.testing.expectEqualStrings("row_number() OVER (…)", (try complete(a, .{}, "row_n", 5)).candidates.items[0].detail);
+
+    const names = Names{ .columns = &.{ .{ .name = "name", .type = "string" }, .{ .name = "amount", .type = "decimal(10,2)" }, .{ .name = "NAME", .type = "int" } } };
+    const n = (try complete(a, names, "SELECT na", 9)).candidates.items;
+    try std.testing.expectEqual(@as(usize, 1), n.len); // not the keyword `name` too, nor the second source's `NAME`
+    try std.testing.expectEqual(Kind.column, n[0].kind);
+    try std.testing.expectEqualStrings("string", n[0].detail);
+    const q = (try complete(a, names, "SELECT t.am", 11)).candidates.items;
+    try std.testing.expectEqualStrings("t.amount", q[0].text);
+    try std.testing.expectEqualStrings("decimal(10,2)", q[0].detail);
+    // a column shadows the function of the same name, and keeps its type
+    const cnt = (try complete(a, .{ .columns = &.{.{ .name = "count", .type = "int" }} }, "cou", 3)).candidates.items;
+    try std.testing.expectEqual(@as(usize, 1), cnt.len);
+    try std.testing.expectEqual(Kind.column, cnt[0].kind);
+    // a function with no column in the way is a function, not the keyword `count`
+    const fnc = (try complete(a, .{}, "cou", 3)).candidates.items;
+    try std.testing.expectEqual(@as(usize, 1), fnc.len);
+    try std.testing.expectEqual(Kind.function, fnc[0].kind);
 }

@@ -444,7 +444,7 @@ pub fn byteToUtf16(text: []const u8, b: usize) usize {
     return units;
 }
 
-/// `{"start":S,"end":N,"items":[{"text":…,"kind":…}]}`. With `utf16`, the
+/// `{"start":S,"end":N,"items":[{"text":…,"kind":…[,"detail":…]}]}`. With `utf16`, the
 /// offsets are counted in UTF-16 units of `text`, as a JavaScript editor counts.
 pub fn writeOfferIn(w: *std.Io.Writer, offer: Offer, cursor: usize, text: []const u8, utf16: bool) !void {
     var o = offer;
@@ -456,14 +456,20 @@ pub fn writeOfferIn(w: *std.Io.Writer, offer: Offer, cursor: usize, text: []cons
     return writeOffer(w, o, c);
 }
 
-/// `{"start":S,"end":N,"items":[{"text":…,"kind":…}]}`.
+/// `{"start":S,"end":N,"items":[{"text":…,"kind":…[,"detail":…]}]}` — `detail` only
+/// when there is one: a built-in function's signature, a column's type.
 pub fn writeOffer(w: *std.Io.Writer, offer: Offer, cursor: usize) !void {
     try w.print("{{\"start\":{d},\"end\":{d},\"items\":[", .{ offer.start, cursor });
     for (offer.items, 0..) |c, k| {
         if (k > 0) try w.writeByte(',');
         try w.writeAll("{\"text\":");
         try std.json.Stringify.encodeJsonString(c.text, .{}, w);
-        try w.print(",\"kind\":\"{s}\"}}", .{@tagName(c.kind)});
+        try w.print(",\"kind\":\"{s}\"", .{@tagName(c.kind)});
+        if (c.detail.len > 0) {
+            try w.writeAll(",\"detail\":");
+            try std.json.Stringify.encodeJsonString(c.detail, .{}, w);
+        }
+        try w.writeByte('}');
     }
     try w.writeAll("]}");
 }
@@ -1226,10 +1232,10 @@ fn editAndRun(alloc: std.mem.Allocator, path_arg: []const u8, sess: *Session, ms
 pub const Catalog = struct {
     arena: std.heap.ArenaAllocator,
     tables: std.StringHashMap([]const []const u8),
-    columns: std.StringHashMap([]const []const u8),
+    columns: std.StringHashMap([]const complete.Column),
 
     pub fn init(gpa: std.mem.Allocator) Catalog {
-        return .{ .arena = std.heap.ArenaAllocator.init(gpa), .tables = std.StringHashMap([]const []const u8).init(gpa), .columns = std.StringHashMap([]const []const u8).init(gpa) };
+        return .{ .arena = std.heap.ArenaAllocator.init(gpa), .tables = std.StringHashMap([]const []const u8).init(gpa), .columns = std.StringHashMap([]const complete.Column).init(gpa) };
     }
     pub fn deinit(self: *Catalog) void {
         self.tables.deinit();
@@ -1258,6 +1264,17 @@ pub const Offer = struct { start: usize = 0, items: []const complete.Candidate =
 /// without printing anything. Errors come back as no rows.
 fn fetchColumn(cx: *const Completer, select: []const u8) []const []const u8 {
     const a = cx.catalog.arena.allocator();
+    const rows = fetchRows(cx, select);
+    const out = a.alloc([]const u8, rows.len) catch return &.{};
+    for (rows, out) |r, *o| o.* = r[0];
+    return out;
+}
+
+/// Every row of `SELECT ...`, as its cells (each row has at least one). The
+/// temporary file is basalt's own CSV, so a cell is split on commas outside
+/// quotes and a doubled quote read as one.
+fn fetchRows(cx: *const Completer, select: []const u8) []const []const []const u8 {
+    const a = cx.catalog.arena.allocator();
     var scratch = std.heap.ArenaAllocator.init(cx.gpa);
     defer scratch.deinit();
     const sa = scratch.allocator();
@@ -1277,15 +1294,38 @@ fn fetchColumn(cx: *const Completer, select: []const u8) []const []const u8 {
     _ = runtime.run(cx.gpa, prog, .{ .log = .{ .quiet = true, .summary = .none } }, &rdiag) catch return &.{};
     const data = std.fs.cwd().readFileAlloc(sa, path, 1 << 22) catch return &.{};
 
-    var out = std.array_list.Managed([]const u8).init(a);
+    var out = std.array_list.Managed([]const []const u8).init(a);
     var lines = std.mem.splitScalar(u8, data, '\n');
     _ = lines.next();
     while (lines.next()) |ln| {
         if (ln.len == 0) continue;
-        const cell = if (std.mem.indexOfScalar(u8, ln, ',')) |c| ln[0..c] else ln;
-        out.append(a.dupe(u8, std.mem.trim(u8, cell, "\"")) catch return &.{}) catch return &.{};
+        out.append(csvCells(a, ln) catch return &.{}) catch return &.{};
     }
     return out.toOwnedSlice() catch &.{};
+}
+
+fn csvCells(a: std.mem.Allocator, line: []const u8) ![]const []const u8 {
+    var cells = std.array_list.Managed([]const u8).init(a);
+    var cell = std.array_list.Managed(u8).init(a);
+    var quoted = false;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (quoted) {
+            if (c != '"') {
+                try cell.append(c);
+            } else if (i + 1 < line.len and line[i + 1] == '"') {
+                try cell.append('"');
+                i += 1;
+            } else quoted = false;
+        } else if (c == '"') {
+            quoted = true;
+        } else if (c == ',') {
+            try cells.append(try cell.toOwnedSlice());
+        } else if (c != '\r') try cell.append(c);
+    }
+    try cells.append(try cell.toOwnedSlice());
+    return cells.toOwnedSlice();
 }
 
 /// The resources declared on `conn` when it is an http connection — its
@@ -1316,10 +1356,10 @@ fn connTables(cx: *const Completer, conn: []const u8) []const []const u8 {
 }
 
 /// The columns of `conn.schema.table`, or of a file path, fetched on first use.
-fn sourceColumns(cx: *const Completer, key: []const u8) []const []const u8 {
+fn sourceColumns(cx: *const Completer, key: []const u8) []const complete.Column {
     if (cx.catalog.columns.get(key)) |c| return c;
     const a = cx.catalog.arena.allocator();
-    var rows: []const []const u8 = &.{};
+    var rows: []const complete.Column = &.{};
     if (key[0] == '\'') {
         // A file: the analyzer reads its schema without moving a row.
         var scratch = std.heap.ArenaAllocator.init(cx.gpa);
@@ -1332,9 +1372,12 @@ fn sourceColumns(cx: *const Completer, key: []const u8) []const []const u8 {
             var adiag = analyze.Diag{};
             const plan = analyze.analyze(sa, prog, &adiag) catch break :blk;
             const schema = plan.outputs[0].source.schema orelse break :blk;
-            const names = a.alloc([]const u8, schema.fields.len) catch break :blk;
-            for (schema.fields, names) |f, *n| n.* = a.dupe(u8, f.name) catch break :blk;
-            rows = names;
+            const cols = a.alloc(complete.Column, schema.fields.len) catch break :blk;
+            for (schema.fields, cols) |f, *c| c.* = .{
+                .name = a.dupe(u8, f.name) catch break :blk,
+                .type = f.ty.name(a) catch break :blk,
+            };
+            rows = cols;
         }
     } else {
         if (!cx.connect) return rows;
@@ -1342,8 +1385,12 @@ fn sourceColumns(cx: *const Completer, key: []const u8) []const []const u8 {
         const conn = parts.next().?;
         const schema = parts.next() orelse return rows;
         const tbl = parts.next() orelse return rows;
-        const q = std.fmt.allocPrint(a, "SELECT column_name FROM {s}.QUERY($$SELECT column_name FROM information_schema.columns WHERE table_schema = '{s}' AND table_name = '{s}' ORDER BY ordinal_position$$)", .{ conn, schema, tbl }) catch return rows;
-        rows = fetchColumn(cx, q);
+        // Aliased: MySQL answers information_schema in upper case otherwise.
+        const q = std.fmt.allocPrint(a, "SELECT col_name, col_type FROM {s}.QUERY($$SELECT column_name AS col_name, data_type AS col_type FROM information_schema.columns WHERE table_schema = '{s}' AND table_name = '{s}' ORDER BY ordinal_position$$)", .{ conn, schema, tbl }) catch return rows;
+        const got = fetchRows(cx, q);
+        const cols = a.alloc(complete.Column, got.len) catch return rows;
+        for (got, cols) |r, *c| c.* = .{ .name = r[0], .type = if (r.len > 1) r[1] else "" };
+        rows = cols;
     }
     cx.catalog.columns.put(a.dupe(u8, key) catch return rows, rows) catch {};
     return rows;
@@ -1403,7 +1450,7 @@ pub fn suggestFor(arena: std.mem.Allocator, cx: *const Completer, text: []const 
     // The tables of every connection the entry names with a dot, and the columns
     // of every `conn.schema.table` and `'file'` in it.
     var tables = std.array_list.Managed(complete.ConnTables).init(arena);
-    var columns = std.array_list.Managed([]const u8).init(arena);
+    var columns = std.array_list.Managed(complete.Column).init(arena);
     for (conns.items) |c| {
         var pos: usize = 0;
         var wanted = false;
@@ -2511,6 +2558,75 @@ test "an offer with no candidates still starts at the word being typed, not the 
     var aw = std.Io.Writer.Allocating.init(a);
     try writeOfferIn(&aw.writer, w, wide.len, wide, true);
     try std.testing.expectEqualStrings("{\"start\":16,\"end\":19,\"items\":[]}", aw.written());
+}
+
+test "Tab's built-in functions are exactly the engine's: every scalar, aggregate and window function, nothing else" {
+    const listed = struct {
+        fn has(n: []const u8) bool {
+            for (complete.builtin_functions) |f| if (std.mem.eql(u8, f.name, n)) return true;
+            return false;
+        }
+    };
+    for (eval.builtins) |b| if (!listed.has(b.name)) {
+        std.debug.print("scalar builtin `{s}` is missing from complete.builtin_functions\n", .{b.name});
+        return error.TestUnexpectedResult;
+    };
+    inline for (@typeInfo(ast.AggFunc).@"enum".fields) |f| try std.testing.expect(listed.has(f.name));
+    inline for (@typeInfo(ast.WinKind).@"enum".fields) |f| try std.testing.expect(listed.has(f.name));
+    const syntax = [_][]const u8{ "cast", "try_cast", "if" };
+    for (complete.builtin_functions, 0..) |f, i| {
+        for (complete.builtin_functions[0..i]) |prev| try std.testing.expect(!std.mem.eql(u8, prev.name, f.name));
+        try std.testing.expect(std.mem.startsWith(u8, f.sig, f.name) and f.sig[f.name.len] == '(');
+        const known = eval.lookupBuiltin(f.name) != null or
+            std.meta.stringToEnum(ast.AggFunc, f.name) != null or
+            std.meta.stringToEnum(ast.WinKind, f.name) != null or
+            for (syntax) |x| (if (std.mem.eql(u8, x, f.name)) break true) else false;
+        if (!known) {
+            std.debug.print("complete.builtin_functions lists `{s}`, which the engine does not know\n", .{f.name});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "a file's columns are offered with their type, and each word once" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "t.csv", .data = "name,amount,when_at\nx,1.5,2024-01-02\n" });
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+
+    var decls = DeclStore.init(std.testing.allocator);
+    defer decls.deinit();
+    var catalog = Catalog.init(std.testing.allocator);
+    defer catalog.deinit();
+    const cx = Completer{ .gpa = std.testing.allocator, .decls = &decls, .catalog = &catalog, .connect = false };
+
+    const text = try std.fmt.allocPrint(a, "SELECT * FROM '{s}/t.csv' WHERE na", .{dir});
+    const n = try suggestFor(a, &cx, text, text.len);
+    try std.testing.expectEqual(@as(usize, 1), n.items.len);
+    try std.testing.expectEqual(complete.Kind.column, n.items[0].kind);
+    try std.testing.expectEqualStrings("string", n.items[0].detail);
+
+    var aw = std.Io.Writer.Allocating.init(a);
+    try writeOffer(&aw.writer, n, text.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, aw.written(), .{});
+    const item = parsed.value.object.get("items").?.array.items[0].object;
+    try std.testing.expectEqualStrings("string", item.get("detail").?.string);
+
+    const w = try suggestFor(a, &cx, text[0 .. text.len - 2], text.len - 2);
+    for (w.items) |c| if (std.mem.eql(u8, c.text, "when_at")) try std.testing.expect(c.detail.len > 0);
+}
+
+test "csvCells: quoted cells keep their commas and doubled quotes" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const c = try csvCells(ar.allocator(), "amt,\"numeric(10,2)\",\"say \"\"hi\"\"\"\r");
+    try std.testing.expectEqual(@as(usize, 3), c.len);
+    try std.testing.expectEqualStrings("amt", c[0]);
+    try std.testing.expectEqualStrings("numeric(10,2)", c[1]);
+    try std.testing.expectEqualStrings("say \"hi\"", c[2]);
 }
 
 test "letLiteral: every value folds back to itself" {

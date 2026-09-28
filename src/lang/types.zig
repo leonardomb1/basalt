@@ -58,6 +58,13 @@ pub const Type = struct {
         return t;
     }
 
+    /// The type as `DESCRIBE` and Tab name it: the kind, and a decimal's
+    /// precision and scale. Nullability is not part of the name.
+    pub fn name(self: Type, arena: std.mem.Allocator) ![]const u8 {
+        if (self.kind == .decimal) return std.fmt.allocPrint(arena, "decimal({d},{d})", .{ self.precision, self.scale });
+        return @tagName(self.kind);
+    }
+
     pub fn withNull(self: Type, n: bool) Type {
         var t = self;
         t.nullable = n;

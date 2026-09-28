@@ -1179,9 +1179,14 @@ For an editor: `basalt check --format json` prints its diagnostics as a JSON
 array on stdout — `[]` when the script checks out, else one object per error in
 the shape above without `ts`/`event` — and still exits `1` on an error.
 `basalt complete --pos N` prints what Tab would offer at byte offset `N` (the
-end, without `--pos`; `--utf16` counts `N` and the answer in UTF-16 units): `{"start":S,"end":N,"items":[{"text":…,"kind":…}]}`, the
+end, without `--pos`; `--utf16` counts `N` and the answer in UTF-16 units): `{"start":S,"end":N,"items":[{"text":…,"kind":…,"detail":…}]}`, the
 items replacing `script[S..N]`, with `kind` one of `keyword`, `function`,
-`param`, `cte`, `connection`, `table`, `column`, `path`. It completes against
+`param`, `cte`, `connection`, `table`, `column`, `path`. `S` is where the word
+under the cursor begins even when nothing matches. `detail`, present only when
+there is one, is a built-in function's signature (`date_add(unit, n, ts)`) or
+a column's type — the engine's for a file, the database's `data_type` for a
+table. A word comes back once: a column named `name` is not offered again as
+the keyword `name`, and a column shadows a function of its name. It completes against
 the script's own declarations, so a script half typed still has its names;
 local files named in it give their columns; connections are asked for their
 tables and columns only under `--connect`, since that is a round trip to each.
@@ -1299,8 +1304,9 @@ comes back.
 
 Tab completes the word under the cursor: keywords (in the case you are typing),
 the session's connections, functions and `$params`, the entry's CTEs, a path
-inside an unclosed quote, `conn.` followed by that connection's tables, and the
-columns of every table and file the entry names. Tables and columns are asked
+inside an unclosed quote, `conn.` followed by that connection's tables, the
+columns of every table and file the entry names, and the built-in functions —
+scalar, aggregate and window. Tables and columns are asked
 of the source once per session, on first use, through the same
 `information_schema` queries `SHOW TABLES` and `DESCRIBE` run. A lone match is
 taken; several fill in what they share and come up as a row of choices that
