@@ -32,7 +32,7 @@ basalt run orders.sql
 
 ## Install
 
-Prebuilt binary (Linux x86-64, ~2.4 MB, statically linked — runs anywhere):
+Prebuilt binary (Linux x86-64, ~3.7 MB, statically linked — runs anywhere):
 
 ```console
 curl -fsSL -o basalt https://github.com/leonardomb1/basalt/releases/latest/download/basalt-x86_64-linux
@@ -52,7 +52,7 @@ zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dstrip=true
 
 | | |
 |---|---|
-| **Files** | CSV and Parquet, local or over HTTP, and Arrow IPC (`.arrow`/`.feather`, local) — the extension picks the format, and an extension basalt does not read is refused rather than guessed at. `WITH (delimiter = ';', encoding = 'latin1')` for the CSV most of the world publishes |
+| **Files** | CSV and Parquet, local or over HTTP; Arrow IPC (`.arrow`, `.feather`, `.ipc`, `.arrows`), local, read and written — the extension picks the format, and an extension basalt does not read is refused rather than guessed at. `WITH (delimiter = ';', encoding = 'latin1')` for the CSV most of the world publishes |
 | **Compressed & archived** | `orders.csv.gz`, `orders.csv.zst`, and `archive.zip :: inner.csv`. Members stream rather than expanding to memory or a temp file |
 | **Object storage** | `az://account/container/path` (Azure Blob / ADLS Gen2) or `s3://bucket/key` (S3, MinIO). A trailing `/` reads every object under that prefix as one table |
 | **Databases** | PostgreSQL, MySQL, SQL Server, StarRocks |
@@ -64,14 +64,22 @@ ranged reads — only the footer and the chunks a query needs are fetched. That
 holds over the network too: a remote `.parquet` is read by HTTP range request,
 so projecting two columns of forty transfers two chunks, not the object. A
 server that ignores `Range` is handled by falling back to a single whole-object
-fetch.
+fetch. Column types follow the file's `LogicalType`, so the naive and nanosecond
+timestamps polars, DuckDB, Spark and pyarrow write read as timestamps, and a
+`LIST` of scalars reads as JSON text that `UNNEST(JSON_EACH(col))` takes apart.
+
+Arrow IPC is the fast way to hand a dataframe over: the file is memory-mapped
+and copied out, with no encode or decode step. polars' `write_ipc` and pyarrow's
+`write_feather` both read as written, compressed or not, categoricals and
+nested columns included.
 
 ## Running things
 
 ```console
 $ basalt run pipeline.sql -p days=7       # bind a PARAM
 $ basalt run --format json -c "<query>"   # NDJSON rows on stdout, for scripts
-$ basalt run --format arrow -c "<query>"  # Arrow IPC stream on stdout, for pyarrow/Polars/Arrow JS
+$ basalt run --format arrow -c "<query>"  # Arrow IPC stream per result, for pyarrow/Polars/Arrow JS
+$ basalt run --max-rows 500 -c "<query>"  # first 500 rows, and stop reading there
 $ basalt check pipeline.sql               # validate without running
 $ basalt run -c "EXPLAIN <query>"         # print the plan
 $ basalt run -c "EXPLAIN ANALYZE <query>" # run it, print the plan with actuals
@@ -85,10 +93,36 @@ $ basalt serve ./endpoints --watch        # host every endpoint script in a dir
 A terminal `SELECT ...;` prints a table — or one JSON object per row with
 `--format json`. `LOAD INTO <target> AS <query>;` writes. A script that
 declares `CREATE ENDPOINT` runs as HTTP; otherwise it runs once and exits.
+Options go before or after the script path, and `-` reads the script from stdin.
 
 Logging is quiet by default: plain-text errors and warnings on stderr, plus a
 one-line summary when a run loads a sink. `--log-level debug` shows plan
-detail; `--log-format json` switches stderr to NDJSON for collectors.
+detail; `--log-format json` switches stderr to NDJSON for collectors — errors
+with the exact range of the offending name and whether a retry could help,
+a `progress` event a second for long statements, and a `run_complete` summary
+for every run, with what the sources were spared (row groups skipped, columns
+not decoded, filters pushed).
+
+## Notebooks and editors
+
+`basalt kernel` keeps one session alive for a frontend. Each script sees the
+connections, functions, params and `LET`s earlier scripts declared; a request
+can bind params, pick a format and cap rows for that script alone, and a
+`cancel` (or SIGINT) stops the running script without ending the session.
+Results come back framed — a `result` frame after each one, `progress` frames
+while a statement runs, and one JSON `status` per script — so several results
+in one cell never run together.
+
+```console
+$ basalt kernel --format arrow --max-rows 5000
+{"op":"run","id":"c1","script":"CREATE CONNECTION erp TYPE postgres OPTIONS (host = 'db', database = 'erp'); PARAM since DATE;"}
+{"op":"run","id":"c2","script":"SELECT * FROM erp.orders WHERE day >= $since;","params":{"since":"2026-01-01"}}
+{"op":"complete","id":"c3","script":"SELECT * FROM erp.","pos":18}
+```
+
+For an editor without a session, `basalt check --format json` prints
+diagnostics as a JSON array with their ranges, and `basalt complete --pos N`
+prints what Tab would offer at byte `N`.
 
 The summary's rate is rows **processed** per second — the volume that moved
 through the pipeline, which for a straight move is also the rows written. (Before
@@ -137,9 +171,11 @@ apply), with `AWS_ENDPOINT_URL` for MinIO and the like.
 zig build test                    # unit tests, no services needed
 ./it/run.sh                       # integration suite (needs docker)
 ./it/run.sh azure parquet         # just those suites
+./it/run.sh stdout kernel arrow   # the CLI's own contracts: no containers
 ```
 
-The integration suite starts only the containers the selected suites need.
+The integration suite starts only the containers the selected suites need;
+`kernel` needs `python3`, `arrow` needs `uv` (it checks results with pyarrow).
 `KEEP=1` leaves the stack up afterwards.
 
 ## License
