@@ -924,7 +924,6 @@ const Tx = struct {
     }
 };
 
-
 /// One pushable builtin: the engine name, the argument counts it is pushed
 /// for, and a renderer. `sql` is the portable spelling used by `render.plain`;
 /// dialect-aware renderers ignore it.
@@ -1040,7 +1039,6 @@ const render = struct {
             "REPEAT";
         return try std.fmt.allocPrint(arena, "{s}({s}, {s})", .{ f, args[0], args[1] });
     }
-
 };
 
 /// `ORDER BY … LIMIT n` / `LIMIT n` descended into a SQL source: the row cap the
