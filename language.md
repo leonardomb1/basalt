@@ -1380,6 +1380,35 @@ and nothing for that request follows it:
 A statement that runs past 400 ms also sends a `progress` frame a second —
 `{"type":"progress","id":…,"target":"…","rows":…,"rows_per_sec":…,"elapsed_ms":…}`
 — for a `SELECT` as well as a `LOAD`, since a notebook shows either filling.
+Inside a `FOR EACH` it adds `loop_done` and `loop_total`: rows of the
+outermost loop finished, and rows in all — the terminal's `[3/12]`.
+
+Each `LOAD` sends a `load` frame as it finishes, written or failed, in the
+order they finish — what the CLI's ` + target` and ` x target` lines say:
+
+```
+{"type":"load","id":"c3","load":0,"target":"/tmp/a.parquet","line":1,"col":1,"rows_read":30000000,
+ "rows_written":30000000,"elapsed_ms":3270,"lanes":12,"ok":true}
+{"type":"load","id":"c3","load":1,"target":"sr.bronze.x","line":2,"col":1,"rows_read":0,"rows_written":0,
+ "elapsed_ms":4,"lanes":1,"ok":false,"reason":"sqlserver connect failed: ServerClosedConnection","transient":true}
+```
+
+`load` numbers the loads in the order they finished; `line`/`col` are where
+the `LOAD` stands, as for a result. `target` is the path or `conn.table` as the
+script spelled it, `IDENTIFIER()` and `${...}` rendered. `rows_read` is left out
+when loads ran side by side in a parallel `FOR EACH`, since they share one
+count. A load that fails — before writing a row, too — still reports, with
+`reason` and `transient`. Inside a `FOR EACH`, each row's load carries
+`loop_row` and `loop_rows` (its row, 1-based, of its own loop) and the
+outermost loop's `loop_done`/`loop_total`; a row that fails under `ON ERROR
+CONTINUE` reports and the loop goes on.
+
+The status of a `run` repeats them, so a reader that skips frames still has
+them — `"loads":[…]` (the frames' fields, without `type`/`id`) — with the
+run's totals: `loads_ok`, `loads_failed`, `rows_read`, `rows_loaded` and
+`lanes`, the facts of the CLI's closing sentence (`Loaded 11 of 12 targets,
+9,482,004 rows in 3m 12s (49.3k rows/s, 12 lanes)`). A failed or cancelled
+run carries them too, for the loads that ran before it stopped.
 A result's `line`/`col` count in the script as sent, as its Arrow metadata
 does; `truncated` says a row cap cut it, and the status's `truncated` says any
 result was. `declared` lists what the script added to the session — a script's
@@ -1390,8 +1419,9 @@ declaration an earlier script made. `end_line`/`end_col`, when present, end
 the offending name, as under `--log-format json`. `transient` is the exit-`75`
 class below.
 Results written before a failing statement are still delivered. Logs and
-`PRINT` stay on stderr (`--log-level`, `--log-format`), and the per-run summary
-is left out — the status carries it.
+`PRINT` stay on stderr (`--log-level`, `--log-format`); the item lines and
+the per-run summary are left out — the `load` frames and the status carry
+them.
 
 | code | meaning |
 |------|---------|

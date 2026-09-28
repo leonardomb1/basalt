@@ -202,6 +202,48 @@ pub const RunOptions = struct {
     /// Run a script with no output pipeline — only declarations — for its
     /// `LET`s: a session decides their values in the entry that declares them.
     declarations_only: bool = false,
+    /// Told as each `LOAD` finishes, written or failed, in the order they
+    /// finish — from the worker threads of a parallel `FOR EACH` too, so the
+    /// callee must be thread-safe. What the CLI's ` + target` lines say.
+    on_load: ?LoadHook = null,
+    /// Filled with the run's summary as it ends, failed or not: the totals the
+    /// closing sentence is made of.
+    summary_out: ?*obs.Summary = null,
+};
+
+/// One finished `LOAD`.
+pub const LoadDone = struct {
+    /// This load's place among the run's loads, 0-based, in the order they
+    /// finished.
+    ordinal: u64,
+    /// As the CLI prints it: the path, or `conn.table`, after `IDENTIFIER()`
+    /// and `${...}` are rendered.
+    target: []const u8,
+    /// Where the `LOAD` stands, in the script as the caller counts lines.
+    line: u32 = 0,
+    col: u32 = 0,
+    /// Rows its sources gave it; null when loads ran side by side (a parallel
+    /// `FOR EACH`) and share one count, so no single load's share is known.
+    rows_read: ?u64 = null,
+    rows_written: u64 = 0,
+    elapsed_ms: u64 = 0,
+    lanes: usize = 1,
+    ok: bool = true,
+    reason: []const u8 = "",
+    transient: bool = false,
+    /// Inside a `FOR EACH`: the row this load ran for, 1-based, and how many
+    /// rows its loop has (the innermost loop's). 0 outside a loop.
+    loop_row: usize = 0,
+    loop_rows: usize = 0,
+    /// The outermost loop's progress, as `progress` frames count it: rows
+    /// finished when this load did (not counting its own) and rows in all.
+    loop_done: usize = 0,
+    loop_total: usize = 0,
+};
+
+pub const LoadHook = struct {
+    ctx: *anyopaque,
+    f: *const fn (ctx: *anyopaque, done: LoadDone) void,
 };
 
 pub const LetHook = struct {
@@ -259,6 +301,13 @@ pub const Env = struct {
     /// A failed `LOAD` already said so in an item line; the `FOR EACH` that catches
     /// the error reads and clears this rather than logging the same failure twice.
     item_reported: bool = false,
+    on_load: ?LoadHook = null,
+    /// The `FOR EACH` row running now (1-based) and its loop's size; 0 outside one.
+    loop_row: usize = 0,
+    loop_rows: usize = 0,
+    /// Loads are running side by side on this run's shared row counter, so a
+    /// load's own rows read cannot be told apart.
+    rows_shared: bool = false,
     /// Param name → literal expr, for substitution in stage expressions.
     params_expr: *std.StringHashMap(*const ast.Expr),
     /// Runtime expression-error context (which stage/column failed).

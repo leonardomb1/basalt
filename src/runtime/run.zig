@@ -48,6 +48,8 @@ pub const StdoutFormat = @import("env.zig").StdoutFormat;
 pub const ResultDone = @import("env.zig").ResultDone;
 pub const ResultHook = @import("env.zig").ResultHook;
 pub const LetHook = @import("env.zig").LetHook;
+pub const LoadDone = @import("env.zig").LoadDone;
+pub const LoadHook = @import("env.zig").LoadHook;
 pub const ResultInfo = arrow.ResultInfo;
 pub const SummaryMode = @import("env.zig").SummaryMode;
 pub const takeReload = @import("env.zig").takeReload;
@@ -183,7 +185,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     for (program.stmts) |s| {
         if (s == .kind) buffer_decl = s.kind.buffer;
     }
-    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .buffer_decl = buffer_decl, .buffer_segment = opts.buffer_segment, .load_label_prefix = opts.load_label_prefix, .load_run_id = opts.load_run_id, .stdout_format = opts.stdout_format, .explain = opts.explain, .line_base = opts.line_base, .on_result = opts.on_result, .max_rows = opts.max_rows, .on_let = opts.on_let, .kind_name = @tagName(program.stmts[0].kind.kind), .fns = &fns };
+    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .buffer_decl = buffer_decl, .buffer_segment = opts.buffer_segment, .load_label_prefix = opts.load_label_prefix, .load_run_id = opts.load_run_id, .stdout_format = opts.stdout_format, .explain = opts.explain, .line_base = opts.line_base, .on_result = opts.on_result, .max_rows = opts.max_rows, .on_let = opts.on_let, .on_load = opts.on_load, .kind_name = @tagName(program.stmts[0].kind.kind), .fns = &fns };
 
     var batch_arena = std.heap.ArenaAllocator.init(gpa);
     defer batch_arena.deinit();
@@ -212,6 +214,11 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
 
     var stats = Stats{ .run_id = run_id };
     var lanes_used: usize = 1;
+    // On every way out, a failed run's included: the loads before the failure
+    // happened, and a caller showing them wants their totals.
+    defer if (opts.summary_out) |so| {
+        so.* = runSummary(&env, run_id, stats.rows_out, rows_read.load(.monotonic), @intCast(std.time.milliTimestamp() - t0), lanes_used, &loads, &scan, runnable == 1);
+    };
     for (program.stmts[1..]) |s| switch (s) {
         // A `WITH` is registered where it stands, rendered with script scope like the
         // query that reads it: two statements may reuse a CTE name, and each must see
@@ -242,27 +249,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     stats.source = env.src_name;
     stats.sink = env.sink_name;
 
-    const summary = obs.Summary{
-        .run_id = run_id,
-        .source = stats.source,
-        .sink = stats.sink,
-        .rows_read = stats.rows_read,
-        .rows_written = stats.rows_out,
-        .elapsed_ms = stats.elapsed_ms,
-        .threads = lanes_used,
-        .loads = loads.ok.load(.monotonic),
-        .loads_failed = loads.failed.load(.monotonic),
-        .target = env.last_target,
-        .rows_loaded = loads.rows.load(.monotonic),
-        .lone_load = runnable == 1,
-        .pushdown = .{
-            .row_groups = scan.row_groups.load(.monotonic),
-            .row_groups_skipped = scan.row_groups_skipped.load(.monotonic),
-            .columns_read = scan.columns_read.load(.monotonic),
-            .columns_total = scan.columns_total.load(.monotonic),
-            .sql_filtered_reads = scan.sql_filters.load(.monotonic),
-        },
-    };
+    const summary = runSummary(&env, run_id, stats.rows_out, stats.rows_read, stats.elapsed_ms, lanes_used, &loads, &scan, runnable == 1);
     switch (opts.log.summary) {
         // `--format json`: a LOAD run's stdout is the summary object; a SELECT
         // run's stdout is the NDJSON rows — never both on one stream, so a
@@ -278,6 +265,30 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         .none => {},
     }
     return stats;
+}
+
+fn runSummary(env: *const Env, run_id: u64, rows_written: u64, rows_read: u64, elapsed_ms: u64, lanes: usize, loads: *obs.LoadTally, scan: *driver.ScanTally, lone_load: bool) obs.Summary {
+    return .{
+        .run_id = run_id,
+        .source = env.src_name,
+        .sink = env.sink_name,
+        .rows_read = rows_read,
+        .rows_written = rows_written,
+        .elapsed_ms = elapsed_ms,
+        .threads = lanes,
+        .loads = loads.ok.load(.monotonic),
+        .loads_failed = loads.failed.load(.monotonic),
+        .target = env.last_target,
+        .rows_loaded = loads.rows.load(.monotonic),
+        .lone_load = lone_load,
+        .pushdown = .{
+            .row_groups = scan.row_groups.load(.monotonic),
+            .row_groups_skipped = scan.row_groups_skipped.load(.monotonic),
+            .columns_read = scan.columns_read.load(.monotonic),
+            .columns_total = scan.columns_total.load(.monotonic),
+            .sql_filtered_reads = scan.sql_filters.load(.monotonic),
+        },
+    };
 }
 
 /// Equality for plan-time `match`: numbers/strings/bools/temporals compare by value;
@@ -409,10 +420,8 @@ fn runScalarLet(env: *Env, l: ast.LetConst) !void {
 
 pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     errdefer env.diag.stamp(out.pos);
-    var opts = opts_in;
     const arena = env.arena;
-    const gpa = env.gpa;
-    var stages = out.stages;
+    const stages = out.stages;
     if (stages.len == 0) return planErr(env.diag, "empty pipeline");
     const last = stages[stages.len - 1].node;
     if (last != .write) return planErr(env.diag, "a top-level pipeline must end in `write`");
@@ -427,15 +436,39 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
     if (moving) env.progress.?.begin(try moveLabel(arena, stages[0], last.write));
     const load_t0 = std.time.milliTimestamp();
     const load_rows0 = stats.rows_out;
-    var load_failed = false;
+    const read0 = env.rows_read.load(.monotonic);
+    // Lanes are a running maximum; counted from 1 here, this load's own show,
+    // and the maximum is restored on the way out.
+    const lanes0 = lanes_used.*;
+    lanes_used.* = 1;
+    var load_err: ?anyerror = null;
     // A union that fans out runs one `runOutput` per branch, and those report
     // themselves; this outer call then counts nothing, or the rows count twice.
     var delegated = false;
     defer {
         if (moving) env.progress.?.end();
-        if (is_load and !delegated) noteLoad(env, load_failed, stats.rows_out - load_rows0, @intCast(std.time.milliTimestamp() - load_t0));
+        const lanes = lanes_used.*;
+        lanes_used.* = @max(lanes0, lanes);
+        if (is_load and !delegated) noteLoad(env, out.pos, load_err, .{
+            .rows = stats.rows_out - load_rows0,
+            .rows_read = if (env.rows_shared) null else env.rows_read.load(.monotonic) - read0,
+            .elapsed_ms = @intCast(std.time.milliTimestamp() - load_t0),
+            .lanes = lanes,
+        });
     }
-    errdefer load_failed = true;
+    runOutputBody(env, opts_in, stages, last, stats, lanes_used, batch_arena, &delegated) catch |e| {
+        load_err = e;
+        return e;
+    };
+}
+
+/// `runOutput` past the bookkeeping: plan and move the rows. Split off so the
+/// caller sees the error a load failed with, for its report.
+fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, last: @FieldType(ast.Stage, "node"), stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, delegated: *bool) anyerror!void {
+    var opts = opts_in;
+    const arena = env.arena;
+    const gpa = env.gpa;
+    var stages = stages_in;
 
     var ddiag = analyze.Diag{};
     env.csv_in = analyze.dialectFromHints(stages[0].hints, &ddiag) catch
@@ -507,7 +540,7 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
         !std.mem.eql(u8, last.write.connector, "csv") and
         unionDownstreamMapOnly(stages[1 .. stages.len - 1]))
     {
-        delegated = true;
+        delegated.* = true;
         return runUnionSplit(env, stages[0].node.union_, stages[0].hints, stages[1 .. stages.len - 1], stages[stages.len - 1], opts, stats, lanes_used, batch_arena);
     }
 
@@ -998,22 +1031,50 @@ fn manyLoads(stmts: []const ast.Stmt) bool {
     return n > 1;
 }
 
-/// Count a finished `LOAD`, and report it when the run is showing item lines.
-fn noteLoad(env: *Env, failed: bool, rows: usize, elapsed_ms: u64) void {
+const LoadFacts = struct { rows: u64, rows_read: ?u64, elapsed_ms: u64, lanes: usize };
+
+/// Count a finished `LOAD`, report it when the run is showing item lines, and
+/// hand it to the caller's `on_load`.
+fn noteLoad(env: *Env, pos: ?ast.Pos, err: ?anyerror, f: LoadFacts) void {
+    const failed = err != null;
     // A ^C is not a failed load; the run is about to say `aborted` itself.
     if (failed and aborting()) return;
     if (env.loads) |t| {
         _ = (if (failed) &t.failed else &t.ok).fetchAdd(1, .monotonic);
-        if (!failed) _ = t.rows.fetchAdd(rows, .monotonic);
+        if (!failed) _ = t.rows.fetchAdd(f.rows, .monotonic);
+    }
+    const why: []const u8 = if (err) |e|
+        (if (env.errctx.msg.len > 0) env.errctx.msg else if (env.diag.msg.len > 0) env.diag.msg else errLabel(e))
+    else
+        "";
+    if (env.on_load) |h| {
+        const p = pos orelse ast.Pos{ .line = 0, .col = 0 };
+        const loop: @TypeOf(env.progress.?.loopState()) = if (env.progress) |pr| pr.loopState() else .{ .done = 0, .total = 0 };
+        h.f(h.ctx, .{
+            .ordinal = if (env.loads) |t| t.seq.fetchAdd(1, .monotonic) else 0,
+            .target = env.last_target,
+            .line = if (p.line > env.line_base) p.line - env.line_base else 0,
+            .col = if (p.line > env.line_base) p.col else 0,
+            .rows_read = f.rows_read,
+            .rows_written = if (failed) 0 else f.rows,
+            .elapsed_ms = f.elapsed_ms,
+            .lanes = f.lanes,
+            .ok = !failed,
+            .reason = why,
+            .transient = if (err) |e| isTransient(e) or env.diag.retryable else false,
+            .loop_row = env.loop_row,
+            .loop_rows = env.loop_rows,
+            .loop_done = loop.done,
+            .loop_total = loop.total,
+        });
     }
     if (!env.items) return;
     if (failed) {
-        const why = if (env.errctx.msg.len > 0) env.errctx.msg else if (env.diag.msg.len > 0) env.diag.msg else "failed";
         env.log.item(.{ .target = env.last_target, .reason = why });
         env.item_reported = true;
         return;
     }
-    env.log.item(.{ .target = env.last_target, .rows = rows, .elapsed_ms = elapsed_ms });
+    env.log.item(.{ .target = env.last_target, .rows = f.rows, .elapsed_ms = f.elapsed_ms });
 }
 
 /// The write target as the script spelled it: a path, or `conn.table`.

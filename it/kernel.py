@@ -30,9 +30,10 @@ class Kernel:
         """Reads frames until a status: returns (data bytes, status dict).
 
         The bytes of each finished result, split at its `result` frame, are kept
-        on `self.results` as (frame, bytes)."""
+        on `self.results` as (frame, bytes), and `load` frames on `self.loads`."""
         data = b""
         self.results = []
+        self.loads = []
         pending = b""
         while True:
             line = self.p.stdout.readline()
@@ -46,6 +47,8 @@ class Kernel:
             elif h["type"] == "result":
                 self.results.append((h, pending))
                 pending = b""
+            elif h["type"] == "load":
+                self.loads.append(h)
             elif h["type"] == "status":
                 return data, h
 
@@ -247,6 +250,38 @@ def main(binary):
     _, st = k.reply()
     c = st.get("complete") or {}
     report("complete speaks UTF-16 offsets when asked", c.get("start") == 39 and c.get("end") == 40 and any(i["text"] == "dbl" for i in c.get("items", [])), st)
+
+    # Each LOAD reports as it finishes, and the status carries them with the totals.
+    ld = tempfile.mkdtemp()
+    with open(os.path.join(ld, "names.csv"), "w") as f:
+        f.write("n\na\nb\nc\n")
+    os.mkdir(os.path.join(ld, "a"))
+    os.mkdir(os.path.join(ld, "c"))
+    _, st = k.run(f"LOAD INTO '{ld}/one.csv' AS SELECT range AS v FROM RANGE(7);\n"
+                  f"LOAD INTO '{ld}/none/x.csv' AS SELECT 1 AS v;")
+    fr = k.loads
+    report("a load frame per LOAD, a failed one before writing too",
+           [f["ok"] for f in fr] == [True, False] and fr[0]["rows_written"] == 7 and fr[0]["rows_read"] == 7
+           and fr[0]["target"] == f"{ld}/one.csv" and fr[1]["line"] == 2 and "FileNotFound" in fr[1]["reason"]
+           and fr[1]["transient"] is False, fr)
+    report("the status lists the loads with the run's totals, failed run included",
+           not st["ok"] and st.get("loads") == [{k2: v for k2, v in f.items() if k2 not in ("type", "id")} for f in fr]
+           and st.get("loads_ok") == 1 and st.get("loads_failed") == 1 and st.get("rows_loaded") == 7, st)
+    _, st = k.run(f"FOR EACH ROW OF ('{ld}/names.csv') AS (n) PARALLEL ON ERROR CONTINUE\n"
+                  f"  LOAD INTO IDENTIFIER('{ld}/' || $n || '/x.csv') AS SELECT range AS v FROM RANGE(4);\nEND FOR;")
+    fr = sorted(k.loads, key=lambda f: f["loop_row"])
+    report("a for-each row's load says which row, and a failed row does not stop the rest",
+           [f["ok"] for f in fr] == [True, False, True] and all(f["loop_rows"] == 3 and f["loop_total"] == 3 for f in fr)
+           and fr[1]["target"] == f"{ld}/b/x.csv" and st.get("loads_ok") == 2 and st.get("loads_failed") == 1, (k.loads, st))
+    report("a load run one at a time counts its own rows read", all(f["rows_read"] == (4 if f["ok"] else 0) for f in fr), fr)
+    kj = Kernel(binary, "-j", "3")
+    _, st = kj.run(f"FOR EACH ROW OF ('{ld}/names.csv') AS (n) PARALLEL ON ERROR CONTINUE\n"
+                   f"  LOAD INTO IDENTIFIER('{ld}/' || $n || '/x.csv') AS SELECT range AS v FROM RANGE(4);\nEND FOR;")
+    report("loads side by side leave rows_read out, having no share of their own",
+           len(kj.loads) == 3 and all("rows_read" not in f for f in kj.loads) and st.get("rows_read") == 8, (kj.loads, st))
+    kj.close()
+    _, st = k.run("SELECT 1 AS x;")
+    report("a run without loads says so", st.get("loads") == [] and st.get("loads_ok") == 0 and not k.loads, st)
 
     # Reset forgets every declaration.
     k.send(op="reset", id="r")

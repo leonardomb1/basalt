@@ -417,6 +417,8 @@ const ForCtx = struct {
     first_err_buf: [640]u8 = undefined,
     first_err_len: usize = 0,
     first_retryable: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// More than one worker: their loads share the run's row counter.
+    side_by_side: bool = false,
 };
 
 /// `item` is the retry identity recorded in the outcome sink (the first cell);
@@ -464,6 +466,9 @@ fn forWorker(ctx: *ForCtx, _: usize) void {
         w_env.sources = &w_sources;
         w_env.diag = &w_diag;
         w_env.errctx = &w_errctx;
+        w_env.loop_row = i + 1;
+        w_env.loop_rows = ctx.rows.len;
+        if (ctx.side_by_side) w_env.rows_shared = true;
         // The bindings map is a pointer in the copy; a body's per-row `WITH` would
         // otherwise be written by every worker at once, so each gets its own.
         var w_bindings = ctx.base.bindings.cloneWithAllocator(w_arena.allocator()) catch {
@@ -653,12 +658,21 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
     const counted = if (env.progress) |p| p.loopBegin(rows.len) else false;
     defer if (env.progress) |p| p.loopEnd();
 
+    // A load reports the row it ran for; a nested loop puts back its outer's.
+    const outer_row = env.loop_row;
+    const outer_rows = env.loop_rows;
+    defer {
+        env.loop_row = outer_row;
+        env.loop_rows = outer_rows;
+    }
     switch (mode) {
         .sequential => {
             var failures: usize = 0;
             var first_err: ?[]const u8 = null;
             for (rows, 0..) |row, ri| {
                 if (aborting()) return error.Aborted;
+                env.loop_row = ri + 1;
+                env.loop_rows = rows.len;
                 if (ri > 0) if (env.progress) |p| p.loopTick(counted);
                 const base = env.sources.items.len;
                 // Cleared per row so a failure never reports the previous row's message.
@@ -701,7 +715,7 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
             var wopts = opts;
             wopts.threads = 1;
             const nworkers = @min(@max(opts.threads, @as(usize, 1)), rows.len);
-            var ctx = ForCtx{ .fe = fe, .needles = needles, .rows = rows, .base = env, .body = run_body, .worker_opts = wopts, .on_error = on_error, .outcomes = opts.outcomes, .outer = outer, .counted = counted };
+            var ctx = ForCtx{ .fe = fe, .needles = needles, .rows = rows, .base = env, .body = run_body, .worker_opts = wopts, .on_error = on_error, .outcomes = opts.outcomes, .outer = outer, .counted = counted, .side_by_side = nworkers > 1 };
             const lanes = try parallel.spawnJoin(env.arena, nworkers, forWorker, &ctx);
             if (aborting()) return error.Aborted;
             stats.rows_out += ctx.rows_out.load(.monotonic);

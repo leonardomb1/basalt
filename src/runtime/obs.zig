@@ -275,6 +275,13 @@ pub const Progress = struct {
         return true;
     }
 
+    /// The outermost loop's rows finished and rows in all; 0 and 0 outside one.
+    pub fn loopState(self: *Progress) struct { done: usize, total: usize } {
+        self.logger.mutex.lock();
+        defer self.logger.mutex.unlock();
+        return .{ .done = self.loop_done, .total = self.loop_total };
+    }
+
     pub fn loopTick(self: *Progress, counted: bool) void {
         if (!counted) return;
         self.logger.mutex.lock();
@@ -458,6 +465,8 @@ pub const LoadTally = struct {
     /// Rows the finished loads wrote — not the run's `rows_written`, which also
     /// counts what a terminal SELECT printed.
     rows: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// The next finished load's ordinal.
+    seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
 pub const Item = struct {

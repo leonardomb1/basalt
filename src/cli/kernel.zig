@@ -33,7 +33,10 @@
 //! NDJSON or CSV of its results, in order, possibly split over several frames.
 //! A `result` frame follows each result's last byte, so the data between two of
 //! them is one result. A statement that runs past 400 ms sends a `progress`
-//! frame a second (`target`, `rows`, `rows_per_sec`, `elapsed_ms`). Exactly one `status` ends each request; after it, the
+//! frame a second (`target`, `rows`, `rows_per_sec`, `elapsed_ms`, and
+//! `loop_done`/`loop_total` inside a `FOR EACH`). Each `LOAD` sends a `load`
+//! frame as it finishes, written or failed; the status lists them again with
+//! the run's totals. Exactly one `status` ends each request; after it, the
 //! script wrote nothing more. A failed script's status carries `error` with the message, the line and
 //! column in the script as sent (not in the replayed declarations), and whether
 //! it is `transient`. Logs and `PRINT` stay on stderr.
@@ -353,6 +356,8 @@ const Status = struct {
     elapsed_ms: ?u64 = null,
     declared: ?[]const Declared = null,
     results: ?[]const ResultFrame = null,
+    /// The loads the script ran and the run's totals; null when nothing ran.
+    loads: ?Loads = null,
     @"error": ?ErrorInfo = null,
     /// A `complete` answer, already JSON.
     complete: ?[]const u8 = null,
@@ -377,6 +382,16 @@ fn reply(a: std.mem.Allocator, out: *Out, id: ?[]const u8, st: Status) !void {
     if (st.results) |r| {
         try w.writeAll(",\"results\":");
         try std.json.Stringify.value(r, .{}, w);
+    }
+    if (st.loads) |l| {
+        try w.writeAll(",\"loads\":[");
+        for (l.list, 0..) |ld, k| {
+            try w.writeAll(if (k > 0) ",{" else "{");
+            try writeLoadFields(w, ld);
+            try w.writeByte('}');
+        }
+        const s = l.summary;
+        try w.print("],\"loads_ok\":{d},\"loads_failed\":{d},\"rows_read\":{d},\"rows_loaded\":{d},\"lanes\":{d}", .{ s.loads, s.loads_failed, s.rows_read, s.rows_loaded orelse 0, s.threads });
     }
     if (st.complete) |c| {
         try w.writeAll(",\"complete\":");
@@ -452,6 +467,28 @@ fn pump(out: *Out, fd: std.posix.fd_t, id: []const u8) void {
     }
 }
 
+/// What the status says of a run's loads: each one, and the summary's totals.
+const Loads = struct { list: []const runtime.LoadDone, summary: obs.Summary };
+
+/// One load's fields, without braces: the `load` frame carries them after its
+/// `type`/`id`, and the status's `loads` lists each as an object. Fields a load has no value for are left
+/// out: `rows_read` when loads ran side by side, `reason`/`transient` on
+/// success, the loop's when not in one.
+fn writeLoadFields(w: *std.Io.Writer, l: runtime.LoadDone) !void {
+    try w.print("\"load\":{d},\"target\":", .{l.ordinal});
+    try std.json.Stringify.encodeJsonString(l.target, .{}, w);
+    try w.print(",\"line\":{d},\"col\":{d}", .{ l.line, l.col });
+    if (l.rows_read) |r| try w.print(",\"rows_read\":{d}", .{r});
+    try w.print(",\"rows_written\":{d},\"elapsed_ms\":{d},\"lanes\":{d},\"ok\":{}", .{ l.rows_written, l.elapsed_ms, l.lanes, l.ok });
+    if (!l.ok) {
+        try w.writeAll(",\"reason\":");
+        try std.json.Stringify.encodeJsonString(l.reason, .{}, w);
+        try w.print(",\"transient\":{}", .{l.transient});
+    }
+    if (l.loop_rows > 0) try w.print(",\"loop_row\":{d},\"loop_rows\":{d}", .{ l.loop_row, l.loop_rows });
+    if (l.loop_total > 0) try w.print(",\"loop_done\":{d},\"loop_total\":{d}", .{ l.loop_done, l.loop_total });
+}
+
 /// A finished result, as the `result` frame and the status list it.
 const ResultFrame = struct {
     statement: u32,
@@ -475,6 +512,11 @@ const Capture = struct {
     results: std.array_list.Managed(ResultFrame),
     /// A failed swap: later bytes still frame, just without a boundary.
     broken: bool = false,
+    /// Finished loads, copied out of the run's arena. Appended from the worker
+    /// threads of a parallel `FOR EACH`, hence the lock (the arena is not
+    /// thread-safe either).
+    loads: std.array_list.Managed(runtime.LoadDone),
+    loads_mu: std.Thread.Mutex = .{},
 
     fn start(self: *Capture) !void {
         const pipe = try std.posix.pipe2(.{ .CLOEXEC = true });
@@ -534,6 +576,26 @@ const Capture = struct {
 
     fn hook(self: *Capture) runtime.ResultHook {
         return .{ .ctx = self, .f = onResult };
+    }
+
+    /// A `LOAD` finished: its `load` frame now, and a copy for the status.
+    fn onLoad(ctx: *anyopaque, done: runtime.LoadDone) void {
+        const self: *Capture = @ptrCast(@alignCast(ctx));
+        self.loads_mu.lock();
+        defer self.loads_mu.unlock();
+        const a = self.loads.allocator;
+        var l = done;
+        l.target = a.dupe(u8, done.target) catch "";
+        l.reason = a.dupe(u8, done.reason) catch "";
+        self.loads.append(l) catch {};
+        var aw = std.Io.Writer.Allocating.init(a);
+        const w = &aw.writer;
+        w.writeAll("{\"type\":\"load\",\"id\":") catch return;
+        std.json.Stringify.encodeJsonString(clip(self.id), .{}, w) catch return;
+        w.writeByte(',') catch return;
+        writeLoadFields(w, l) catch return;
+        w.writeAll("}\n") catch return;
+        self.out.line(aw.written());
     }
 
     /// A statement still moving rows: what the terminal's progress line says,
@@ -618,7 +680,9 @@ fn runScript(
 
     // Capture fd 1 for the script's lifetime: every sink that writes stdout
     // lands in the pipe, and the pump turns it into frames as it arrives.
-    var cap = Capture{ .out = out, .id = id, .results = std.array_list.Managed(ResultFrame).init(a) };
+    var cap = Capture{ .out = out, .id = id, .results = std.array_list.Managed(ResultFrame).init(a), .loads = std.array_list.Managed(runtime.LoadDone).init(a) };
+    var summary: obs.Summary = .{ .run_id = 0, .loads = 0 };
+    var ran = false;
     cap.start() catch |e| {
         std.posix.dup2(std.posix.STDERR_FILENO, std.posix.STDOUT_FILENO) catch {};
         return e;
@@ -666,9 +730,12 @@ fn runScript(
             .progress_hook = .{ .ctx = &cap, .f = Capture.onProgress },
             .max_rows = req.max_rows orelse opts.max_rows,
             .on_let = freezer.hook(),
+            .on_load = .{ .ctx = &cap, .f = Capture.onLoad },
+            .summary_out = &summary,
         }, &rdiag) catch |e| {
             failed = e;
         };
+        ran = true;
     }
     q.setRunning(null);
 
@@ -676,20 +743,21 @@ fn runScript(
     // drains what the script wrote and stops, and only then does the status go.
     cap.stop();
     const results = cap.results.items;
+    const loads: ?Loads = if (ran) .{ .list = cap.loads.items, .summary = summary } else null;
 
     const elapsed: u64 = @intCast(std.time.milliTimestamp() - t0);
-    const e = failed orelse return reply(a, out, req.id, .{ .ok = true, .elapsed_ms = elapsed, .declared = declared, .results = results });
+    const e = failed orelse return reply(a, out, req.id, .{ .ok = true, .elapsed_ms = elapsed, .declared = declared, .results = results, .loads = loads });
     if (e == error.OutOfMemory) return error.OutOfMemory;
     if (e == error.Aborted) {
         runtime.resetAbort();
-        return reply(a, out, req.id, .{ .ok = false, .cancelled = true, .elapsed_ms = elapsed, .declared = declared, .results = results });
+        return reply(a, out, req.id, .{ .ok = false, .cancelled = true, .elapsed_ms = elapsed, .declared = declared, .results = results, .loads = loads });
     }
     var ei = ErrorInfo{
         .msg = if (rdiag.msg.len > 0) try a.dupe(u8, rdiag.msg) else runtime.errLabel(e),
         .transient = rdiag.retryable or runtime.isTransient(e),
     };
     locate(&ei, entry.text, entry.entry_at, "", rdiag.pos, rdiag.end);
-    return reply(a, out, req.id, .{ .ok = false, .elapsed_ms = elapsed, .declared = declared, .results = results, .@"error" = ei });
+    return reply(a, out, req.id, .{ .ok = false, .elapsed_ms = elapsed, .declared = declared, .results = results, .loads = loads, .@"error" = ei });
 }
 
 test "locate: positions count in the script as sent, not the replayed prelude" {
