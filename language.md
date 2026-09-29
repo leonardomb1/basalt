@@ -701,7 +701,7 @@ it always denoted, so nothing here adds a new execution path:
 -- Planned as a SEMI JOIN against the (anonymous) subquery binding.
 SELECT * FROM 'facts.csv' WHERE x IN (SELECT k FROM 't.csv');
 
--- NOT IN plans as the ANTI JOIN — see the null caveat below.
+-- NOT IN plans as an ANTI JOIN with SQL's NULL rule — see below.
 SELECT * FROM 'facts.csv' WHERE x NOT IN (SELECT k FROM 't.csv');
 
 -- A scalar subquery runs ONCE, before the outer query, and its single cell is
@@ -725,12 +725,11 @@ column; one row is the value, zero rows read as `NULL` (standard SQL), and more
 than one row is an error. The inline form is evaluated per *statement*, not per
 row: it may not reference columns of the outer query.
 
-**`NOT IN` here is the anti join, not standard three-valued `NOT IN`.** Standard
-`NOT IN` yields NULL — so no rows at all — when the subquery produces a single
-NULL, because `x <> NULL` is unknown. The anti join instead keeps rows that match
-no *non-null* key, which is nearly always what an extraction script means. Where
-the subquery column is nullable and the distinction matters, filter the nulls
-(`WHERE k IS NOT NULL`) and decide deliberately which answer you want.
+**`NOT IN` is standard three-valued `NOT IN`.** A single NULL from the subquery
+makes `x NOT IN (...)` unknown for every row, so no row survives; a NULL `x`
+survives only an empty subquery. To keep the rows that match no *non-null* key —
+what an extraction script usually means — say so in the subquery:
+`WHERE k IS NOT NULL`.
 
 `EXISTS` has no spelling: the uncorrelated form is degenerate (all rows or none)
 and the useful form is correlated. A **correlated** subquery — one referencing a
