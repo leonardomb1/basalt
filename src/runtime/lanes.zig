@@ -1695,6 +1695,7 @@ const LaneJoin = struct {
     right_schema: *const types.Schema,
     out_schema: *const types.Schema,
     kind: ast.JoinKind,
+    null_aware: bool,
     suffix: []const ast.Stage,
 };
 
@@ -1736,6 +1737,7 @@ fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suffix:
             .right_schema = right_schema,
             .out_schema = out,
             .kind = j.kind,
+            .null_aware = j.null_aware,
             .suffix = suffix,
         },
         .out_schema = final_schema,
@@ -1757,6 +1759,7 @@ fn buildLaneJoinChain(ta: std.mem.Allocator, params: *std.StringHashMap(*const a
         .right_schema = lj.right_schema,
         .out_schema = lj.out_schema,
         .kind = lj.kind,
+        .null_aware = lj.null_aware,
         .state = ta,
     };
     return buildChainFrom(ta, params, lj.suffix, .{ .join = j }, lj.out_schema.*);

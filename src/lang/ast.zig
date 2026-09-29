@@ -237,6 +237,10 @@ pub const Join = struct {
     alias: []const u8 = "",
     left_keys: []const QualName,
     right_keys: []const QualName,
+    /// `x NOT IN (SELECT ...)` lowered to an anti join. Unlike `NOT EXISTS`, a NULL
+    /// on either side makes the comparison unknown: no row survives a subquery that
+    /// returned a NULL, and a NULL `x` survives only an empty one.
+    null_aware: bool = false,
 };
 
 pub const Write = struct {

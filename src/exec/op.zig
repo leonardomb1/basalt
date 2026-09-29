@@ -2508,6 +2508,8 @@ pub const JoinIndex = struct {
     next: []const u32,
     hashes: []const u64,
     mask: u64,
+    /// A build row had a NULL key — which empties a `NOT IN`.
+    has_null_key: bool = false,
 
     /// Runs `build` to completion, materializes it columnar, and indexes
     /// `right_keys`. `state` must outlive every probe (plan arena); `pull` is
@@ -2563,7 +2565,10 @@ pub const JoinIndex = struct {
         while (ri > 0) {
             ri -= 1;
             const r = ri;
-            if (anyNullKey(batch.columns, right_keys, r)) continue;
+            if (anyNullKey(batch.columns, right_keys, r)) {
+                self.has_null_key = true;
+                continue;
+            }
             const h = hashRowKeys(batch.columns, right_keys, classes, r);
             hashes[r] = h;
             var slot = h & self.mask;
@@ -2661,6 +2666,8 @@ pub const Join = struct {
     right_schema: *const types.Schema,
     out_schema: *const types.Schema,
     kind: ast.JoinKind,
+    /// `NOT IN` semantics on an anti join; see `ast.Join.null_aware`.
+    null_aware: bool = false,
     state: std.mem.Allocator,
     err: ?*ErrCtx = null,
     /// Per-join build-side byte cap (`WITH (max_build = '8GB')`); null = the
@@ -2755,6 +2762,9 @@ pub const Join = struct {
                     if (first != null) try lidx.append(r);
                 },
                 .anti => {
+                    // NOT IN: against a non-empty subquery a NULL on either side is
+                    // unknown, and unknown filters the row out.
+                    if (self.null_aware and !empty and (ix.has_null_key or nulls[r])) continue;
                     if (first == null) try lidx.append(r);
                 },
                 else => {
@@ -3431,6 +3441,46 @@ test "join: inner/left/semi/anti; null keys never match, duplicate build keys fa
         // Reverse-order insertion keeps duplicate chains in build order.
         const got = try JoinRows.collect(a, .{ .join = &jn }, if (emit_right) @as(?usize, 3) else null);
         try got.expect(case.keys, case.rvs);
+    }
+}
+
+test "join: a null-aware anti join is NOT IN — a NULL on either side is unknown" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // A plain anti join is NOT EXISTS and kept `2, null, 3` against a build side
+    // holding a NULL; `NOT IN` must keep nothing there, and drop a NULL probe key
+    // unless the subquery is empty.
+    const Case = struct { build: []const ?i64, keys: []const ?i64 };
+    const cases = [_]Case{
+        .{ .build = &.{ 1, 4, null }, .keys = &.{} },
+        .{ .build = &.{ 1, 4 }, .keys = &.{ 2, 3 } },
+        .{ .build = &.{}, .keys = &.{ 1, 2, null, 3 } },
+    };
+    for (cases) |case| {
+        const lb = [_]Batch{try kvBatch(a, &join_left_schema, &.{ 1, 2, null, 3 }, &.{ "a", "b", "n", "c" })};
+        const rvs = try a.alloc(?[]const u8, case.build.len);
+        @memset(rvs, "r");
+        const rb = [_]Batch{try kvBatch(a, &join_right_schema, case.build, rvs)};
+        var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+        var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+        var lscan = Scan{ .src = lts.src() };
+        var rscan = Scan{ .src = rts.src() };
+        var jn = Join{
+            .probe = .{ .scan = &lscan },
+            .build = .{ .scan = &rscan },
+            .left_keys = &.{0},
+            .right_keys = &.{0},
+            .left_schema = &join_left_schema,
+            .right_schema = &join_right_schema,
+            .out_schema = &join_left_schema,
+            .kind = .anti,
+            .null_aware = true,
+            .state = a,
+        };
+        const got = try JoinRows.collect(a, .{ .join = &jn }, null);
+        try got.expect(case.keys, &.{});
     }
 }
 

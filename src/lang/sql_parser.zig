@@ -1933,6 +1933,7 @@ pub const Parser = struct {
                         .binding = sj.binding,
                         .left_keys = lk,
                         .right_keys = rk,
+                        .null_aware = sj.negated,
                     } },
                     .hints = &.{},
                     .pos = sj.pos,

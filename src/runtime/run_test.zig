@@ -234,6 +234,35 @@ test "union: plain UNION [ALL] lines branches up by position" {
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "branch 2 has 2 columns") != null);
 }
 
+test "NOT IN (SELECT ...): a NULL in the subquery keeps no row, a NULL probe survives only an empty one" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Two columns, so an empty `k` is a NULL rather than a skipped blank line.
+    try tmp.dir.writeFile(.{ .sub_path = "l.csv", .data = "k,v\n1,a\n,b\n2,c\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "r.csv", .data = "k,v\n2,x\n,y\n3,z\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    // Lowered to a plain anti join, this returned `1` and the NULL row: `NOT IN`
+    // against a set holding a NULL is never true. Verified against DuckDB.
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT k FROM '$B/l.csv' WHERE k NOT IN (SELECT k FROM '$B/r.csv')", .want = "k\n" },
+        .{ .q = "SELECT k FROM '$B/l.csv' WHERE k NOT IN (SELECT k FROM '$B/r.csv' WHERE k IS NOT NULL)", .want = "k\n1\n" },
+        .{ .q = "SELECT k FROM '$B/l.csv' WHERE k NOT IN (SELECT k FROM '$B/r.csv' WHERE k > 100)", .want = "k\n1\n\n2\n" },
+        .{ .q = "SELECT k FROM '$B/l.csv' WHERE k IN (SELECT k FROM '$B/r.csv')", .want = "k\n2\n" },
+    };
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+}
+
 test "aggregate: two aggregates over different expressions stay separate" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -929,6 +929,7 @@ fn buildJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, left_schema: types
         .right_schema = try schemaPtr(arena, build.schema),
         .out_schema = out,
         .kind = j.kind,
+        .null_aware = j.null_aware,
         .state = arena,
         .err = env.errctx,
         .build_cap = try joinBuildCap(env, hints),
