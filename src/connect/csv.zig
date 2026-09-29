@@ -325,7 +325,7 @@ pub const CsvReader = struct {
             });
         }
 
-        var sniff = try TypeSniffer.init(arena, fields.items.len);
+        var sniff = try TypeSniffer.init(arena, fields.items.len, dialect.delim);
         var pending = std.array_list.Managed([]const u8).init(arena);
         while (pending.items.len < SAMPLE_ROWS) {
             const line = (try self.readLine()) orelse {
@@ -507,7 +507,7 @@ pub const MappedCsv = struct {
         });
 
         const body = data[nl + 1 ..];
-        var sniff = try TypeSniffer.init(arena, fields.items.len);
+        var sniff = try TypeSniffer.init(arena, fields.items.len, dialect.delim);
         var fed: usize = 0;
         var pos: usize = 0;
         while (fed < SAMPLE_ROWS and pos < body.len) {
@@ -646,11 +646,12 @@ pub const SAMPLE_ROWS = 1024;
 const TypeSniffer = struct {
     const ColState = struct { seen: bool = false, all_int: bool = true, all_float: bool = true, all_date: bool = true };
     cols: []ColState,
+    delim: u8,
 
-    fn init(arena: std.mem.Allocator, ncols: usize) !TypeSniffer {
+    fn init(arena: std.mem.Allocator, ncols: usize, delim: u8) !TypeSniffer {
         const cols = try arena.alloc(ColState, ncols);
         for (cols) |*c| c.* = .{};
-        return .{ .cols = cols };
+        return .{ .cols = cols, .delim = delim };
     }
 
     fn feed(self: *TypeSniffer, line: []const u8) void {
@@ -675,7 +676,7 @@ const TypeSniffer = struct {
                 }
             } else {
                 const start = i;
-                while (i < line.len and line[i] != ',') i += 1;
+                while (i < line.len and line[i] != self.delim) i += 1;
                 const raw = line[start..i];
                 if (raw.len > 0) {
                     c.seen = true;
@@ -693,7 +694,7 @@ const TypeSniffer = struct {
                     }
                 }
             }
-            if (i < line.len and line[i] == ',') i += 1;
+            if (i < line.len and line[i] == self.delim) i += 1;
         }
     }
 
@@ -1371,7 +1372,7 @@ test "csv write/parse round-trip preserves quoted values" {
 test "TypeSniffer: int/float promotion, leading zeros and quoted cells force string, empties only mark nulls" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
-    var s = try TypeSniffer.init(ar.allocator(), 6);
+    var s = try TypeSniffer.init(ar.allocator(), 6, ',');
     s.feed("1,1.5,abc,007,\"9\",");
     s.feed("-2,2,x,12,3,");
     try std.testing.expectEqual(types.TypeKind.int, s.resolve(0).kind);
@@ -1381,6 +1382,20 @@ test "TypeSniffer: int/float promotion, leading zeros and quoted cells force str
     try std.testing.expectEqual(types.TypeKind.string, s.resolve(4).kind);
     try std.testing.expectEqual(types.TypeKind.string, s.resolve(5).kind);
     try std.testing.expect(s.resolve(0).nullable);
+}
+
+test "TypeSniffer: cells split on the dialect's delimiter, not always a comma" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    // A `;` file sniffed on `,` saw one text column and left the rest unseen, so
+    // every column came out string and SUM over a numeric one failed its cast.
+    var s = try TypeSniffer.init(ar.allocator(), 4, ';');
+    s.feed("2026-07-01;1140469.50;1;1,5");
+    s.feed("2026-07-02;0.00;12;2,25");
+    try std.testing.expectEqual(types.TypeKind.date, s.resolve(0).kind);
+    try std.testing.expectEqual(types.TypeKind.float, s.resolve(1).kind);
+    try std.testing.expectEqual(types.TypeKind.int, s.resolve(2).kind);
+    try std.testing.expectEqual(types.TypeKind.string, s.resolve(3).kind);
 }
 
 test "serial and mapped readers infer the same schema; mismatch past the sample errors" {
