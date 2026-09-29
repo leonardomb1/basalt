@@ -342,6 +342,33 @@ test "SUM/AVG over an outer join's null fill, and integer sums that leave i64" {
     try std.testing.expectError(error.IntOverflow, run(alloc, prog, .{}, &rdiag));
 }
 
+test "CASE / COALESCE / greatest mixing int and float are float on every row, not the first row's kind" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "m.csv", .data = "id,k,f\n1,3,3.75\n2,5,1.5\n3,,2.5\n4,7,\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    // Row 0 took the int arm, so the column was built as int and 2.5 truncated to
+    // 2 — in the output, in a WHERE, and in a SUM, which then disagreed with -j 8.
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT id, CASE WHEN id < 3 THEN 1 ELSE 2.5 END AS c FROM '$B/m.csv'", .want = "id,c\n1,1\n2,1\n3,2.5\n4,2.5\n" },
+        .{ .q = "SELECT id FROM '$B/m.csv' WHERE CASE WHEN id < 3 THEN 1 ELSE 2.5 END > 2.2", .want = "id\n3\n4\n" },
+        .{ .q = "SELECT greatest(id, 1.5) AS g FROM '$B/m.csv' WHERE id < 3", .want = "g\n1.5\n2\n" },
+        .{ .q = "SELECT SUM(COALESCE(k, f)) AS s FROM '$B/m.csv'", .want = "s\n17.5\n" },
+    };
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+}
+
 test "aggregate: two aggregates over different expressions stay separate" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

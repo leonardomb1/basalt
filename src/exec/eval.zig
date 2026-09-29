@@ -309,16 +309,21 @@ fn evalVecNode(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch) Ve
     }
 }
 
-/// Row-wise evaluation of one node as a column. The column's type is read
-/// off the first non-null value; nothing but nulls is a null scalar.
+/// Row-wise evaluation of one node as a column, typed by widening every
+/// non-null value's type; nothing but nulls is a null scalar.
+///
+/// The type used to be the first value's alone, so `CASE WHEN .. THEN 1 ELSE
+/// 2.5 END` built an int column when row 0 took the int arm and truncated 2.5
+/// to 2 — and the answer changed with where a batch or lane began. Kinds with
+/// no common type decline, and the caller evaluates with the analyzer's type.
 fn rowwiseVec(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch) VecError!Vec {
     const n = batch.len;
     const vals = try arena.alloc(Value, n);
     var ty: ?Type = null;
     for (vals, 0..) |*v, i| {
         v.* = evalRow(arena, expr, batch, i) catch return error.Unsupported;
-        if (ty == null) ty = switch (v.*) {
-            .null => null,
+        const vt: Type = switch (v.*) {
+            .null => continue,
             .bool => Type.init(.bool),
             .int => Type.init(.int),
             .float => Type.init(.float),
@@ -329,6 +334,7 @@ fn rowwiseVec(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch) Vec
             .timestamp => Type.init(.timestamp),
             .decimal => |d| Type.decimal(0, d.scale),
         };
+        ty = if (ty) |t| Type.unify(t, vt) orelse return error.Unsupported else vt;
     }
     const t = ty orelse return .{ .scalar = .null };
     var b = column.Builder.init(arena, t.asNullable());
