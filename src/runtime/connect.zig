@@ -491,7 +491,7 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
             return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg));
         // `run` never analyzed the pipeline, so it repeats the plan-time question
         // here: which member did you mean?
-        if (analyze.archiveProblem(env.arena, rd.form.path, want)) |why|
+        if (analyze.archiveProblem(env.arena, rd.form.path, want, true)) |why|
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot read `{s}`: {s}", .{ rd.form.path, why }));
         const reader = csv.CsvReader.open(env.arena, rd.form.path, d) catch |e| {
             // A mistyped prefix and a truly empty one are the same listing; say

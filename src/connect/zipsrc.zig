@@ -1,4 +1,4 @@
-//! One member of a local zip archive, as a byte stream.
+//! One member of a zip archive, as a byte stream.
 //!
 //! The member is inflated on demand and never materialized. That is the whole
 //! point: the comparable implementations hold it in memory — duckdb-zipfs
@@ -8,13 +8,14 @@
 //! registry ships about 7.6 GB a month and CVM's monthly `inf_diario` holds a
 //! 59 MB CSV in a 12 MB zip.
 //!
-//! Local files only. A zip's central directory lives at the *end*, so a remote
-//! archive needs a tail range request before anything else can be read;
-//! `pqdecode` already does exactly that for a parquet footer, so the machinery
-//! exists when this grows a URL path.
+//! A remote archive is read the same way, by range: a HEAD for the size, one GET
+//! for the tail holding the central directory, one for the member's local header,
+//! then a single ranged GET streamed through inflate. The rest of the archive —
+//! other members — is never transferred.
 
 const std = @import("std");
 const zip = std.zip;
+const pqdecode = @import("pqdecode.zig");
 
 pub const Error = error{
     ZipMemberNotFound,
@@ -25,6 +26,10 @@ pub const Error = error{
     /// Stored and deflated are the two methods a zip in the wild uses. The rest
     /// (bzip2, lzma, ppmd, xz) are legal in the container and essentially unseen.
     ZipMemberCompression,
+    ZipNoEndRecord,
+    ZipMultiDiskUnsupported,
+    ZipBadCentralDirectory,
+    ZipBadFileOffset,
 };
 
 /// Everything the stream borrows, kept together so it can live in the caller's
@@ -33,40 +38,143 @@ pub const Member = struct {
     name: []const u8,
     /// The member's uncompressed bytes.
     reader: *std.Io.Reader,
-    file: std.fs.File,
-    fr: std.fs.File.Reader,
+    src: pqdecode.Bytes,
+    body: union(enum) {
+        file: std.fs.File.Reader,
+        /// A server that ignored `Range` already sent the whole archive.
+        fixed: std.Io.Reader,
+        http: struct {
+            req: std.http.Client.Request,
+            response: std.http.Client.Response,
+            redirect_buf: [8 * 1024]u8,
+        },
+    },
     limited: std.Io.Reader.Limited,
     inflate: std.compress.flate.Decompress,
 
     pub fn close(self: *Member) void {
-        self.file.close();
+        switch (self.body) {
+            .http => |*h| h.req.deinit(),
+            .file, .fixed => {},
+        }
+        self.src.close();
     }
 };
 
-/// Read one central-directory entry's filename into `arena`.
-fn entryName(arena: std.mem.Allocator, fr: *std.fs.File.Reader, e: zip.Iterator.Entry) ![]const u8 {
-    const name = try arena.alloc(u8, e.filename_len);
-    try fr.seekTo(e.header_zip_offset + @sizeOf(zip.CentralDirectoryFileHeader));
-    try fr.interface.readSliceAll(name);
-    return name;
+const Entry = struct {
+    name: []const u8,
+    method: zip.CompressionMethod,
+    compressed_size: u64,
+    local_offset: u64,
+};
+
+fn isMax(v: anytype) bool {
+    return v == std.math.maxInt(@TypeOf(v));
+}
+
+/// The archive's bytes, by range: a local file or an HTTP(S)/object-store URL.
+fn openBytes(arena: std.mem.Allocator, path: []const u8) !pqdecode.Bytes {
+    if (pqdecode.isRemote(path)) return .{ .remote = try pqdecode.Remote.open(arena, path) };
+    const f = try std.fs.cwd().openFile(path, .{});
+    errdefer f.close();
+    return .{ .file = .{ .f = f, .size = (try f.stat()).size } };
+}
+
+/// Every data member in central-directory order; directory entries are
+/// structure, not data, and are dropped.
+fn directory(arena: std.mem.Allocator, src: pqdecode.Bytes) ![]const Entry {
+    const eocd_len = @sizeOf(zip.EndRecord);
+    const total = src.size();
+    if (total < eocd_len) return Error.ZipNoEndRecord;
+    // The end record is followed only by its comment, at most 64 KiB.
+    const tail_len: usize = @intCast(@min(total, eocd_len + std.math.maxInt(u16)));
+    const tail_off = total - tail_len;
+    const tail = try src.range(arena, tail_off, tail_len);
+
+    const pos = blk: {
+        var i = tail.len - eocd_len;
+        while (true) : (i -= 1) {
+            if (std.mem.eql(u8, tail[i..][0..4], &zip.end_record_sig) and
+                i + eocd_len + std.mem.readInt(u16, tail[i + 20 ..][0..2], .little) == tail.len)
+                break :blk i;
+            if (i == 0) return Error.ZipNoEndRecord;
+        }
+    };
+    var er = std.Io.Reader.fixed(tail[pos..]);
+    const end = try er.takeStruct(zip.EndRecord, .little);
+    if (end.disk_number != 0 or end.central_directory_disk_number != 0) return Error.ZipMultiDiskUnsupported;
+
+    var count: u64 = end.record_count_total;
+    var cd_size: u64 = end.central_directory_size;
+    var cd_off: u64 = end.central_directory_offset;
+    if (end.need_zip64()) {
+        const loc_len = @sizeOf(zip.EndLocator64);
+        if (pos < loc_len) return Error.ZipBadCentralDirectory;
+        var lr = std.Io.Reader.fixed(tail[pos - loc_len .. pos]);
+        const loc = try lr.takeStruct(zip.EndLocator64, .little);
+        if (!std.mem.eql(u8, &loc.signature, &zip.end_locator64_sig)) return Error.ZipBadCentralDirectory;
+        if (loc.total_disk_count != 1) return Error.ZipMultiDiskUnsupported;
+        if (loc.record_file_offset + @sizeOf(zip.EndRecord64) > total) return Error.ZipBadCentralDirectory;
+        var rr = std.Io.Reader.fixed(try src.range(arena, loc.record_file_offset, @sizeOf(zip.EndRecord64)));
+        const end64 = try rr.takeStruct(zip.EndRecord64, .little);
+        if (!std.mem.eql(u8, &end64.signature, &zip.end_record64_sig)) return Error.ZipBadCentralDirectory;
+        count = end64.record_count_total;
+        cd_size = end64.central_directory_size;
+        cd_off = end64.central_directory_offset;
+    }
+    if (cd_off + cd_size > total) return Error.ZipBadCentralDirectory;
+
+    // Usually the directory sits inside the tail already fetched.
+    const cd = if (cd_off >= tail_off)
+        tail[@intCast(cd_off - tail_off)..][0..@intCast(cd_size)]
+    else
+        try src.range(arena, cd_off, @intCast(cd_size));
+
+    var r = std.Io.Reader.fixed(cd);
+    var out = std.array_list.Managed(Entry).init(arena);
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        const h = r.takeStruct(zip.CentralDirectoryFileHeader, .little) catch return Error.ZipBadCentralDirectory;
+        if (!std.mem.eql(u8, &h.signature, &zip.central_file_header_sig)) return Error.ZipBadCentralDirectory;
+        const name = r.take(h.filename_len) catch return Error.ZipBadCentralDirectory;
+        const extra = r.take(h.extra_len) catch return Error.ZipBadCentralDirectory;
+        r.discardAll(h.comment_len) catch return Error.ZipBadCentralDirectory;
+
+        var e = Entry{
+            .name = name,
+            .method = h.compression_method,
+            .compressed_size = h.compressed_size,
+            .local_offset = h.local_file_header_offset,
+        };
+        // Zip64 widens only the fields that overflowed, in this fixed order.
+        if (isMax(h.uncompressed_size) or isMax(h.compressed_size) or isMax(h.local_file_header_offset)) {
+            var xr = std.Io.Reader.fixed(extra);
+            while (xr.takeInt(u16, .little)) |id| {
+                const len = xr.takeInt(u16, .little) catch return Error.ZipBadCentralDirectory;
+                const body = xr.take(len) catch return Error.ZipBadCentralDirectory;
+                if (id != @intFromEnum(zip.ExtraHeader.zip64_info)) continue;
+                var zr = std.Io.Reader.fixed(body);
+                if (isMax(h.uncompressed_size)) _ = zr.takeInt(u64, .little) catch return Error.ZipBadCentralDirectory;
+                if (isMax(h.compressed_size)) e.compressed_size = zr.takeInt(u64, .little) catch return Error.ZipBadCentralDirectory;
+                if (isMax(h.local_file_header_offset)) e.local_offset = zr.takeInt(u64, .little) catch return Error.ZipBadCentralDirectory;
+                break;
+            } else |_| {}
+        }
+        if (name.len > 0 and name[name.len - 1] == '/') continue;
+        try out.append(e);
+    }
+    return out.toOwnedSlice();
 }
 
 /// Every member name in the archive, in central-directory order. Used to name the
 /// choices when a script has to pick one.
 pub fn names(arena: std.mem.Allocator, path: []const u8) ![]const []const u8 {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    const buf = try arena.alloc(u8, 64 * 1024);
-    var fr = file.reader(buf);
-    var it = try zip.Iterator.init(&fr);
-    var out = std.array_list.Managed([]const u8).init(arena);
-    while (try it.next()) |e| {
-        const name = try entryName(arena, &fr, e);
-        // Directory entries are structure, not data.
-        if (name.len > 0 and name[name.len - 1] == '/') continue;
-        try out.append(name);
-    }
-    return out.toOwnedSlice();
+    const src = try openBytes(arena, path);
+    defer src.close();
+    const entries = try directory(arena, src);
+    const out = try arena.alloc([]const u8, entries.len);
+    for (entries, out) |e, *n| n.* = e.name;
+    return out;
 }
 
 /// Open `want` inside `path`, or the archive's only member when `want` is null.
@@ -75,33 +183,19 @@ pub fn names(arena: std.mem.Allocator, path: []const u8) ![]const []const u8 {
 /// other; moving it by value would dangle those pointers.
 pub fn openMember(arena: std.mem.Allocator, path: []const u8, want: ?[]const u8) !*Member {
     const m = try arena.create(Member);
-    m.file = try std.fs.cwd().openFile(path, .{});
-    errdefer m.file.close();
+    m.src = try openBytes(arena, path);
+    errdefer m.src.close();
 
-    const buf = try arena.alloc(u8, 64 * 1024);
-    m.fr = m.file.reader(buf);
-    var it = try zip.Iterator.init(&m.fr);
-
-    var found: ?zip.Iterator.Entry = null;
-    var found_name: []const u8 = "";
-    var data_members: usize = 0;
-    while (try it.next()) |e| {
-        const name = try entryName(arena, &m.fr, e);
-        if (name.len > 0 and name[name.len - 1] == '/') continue;
-        data_members += 1;
-        if (want) |w| {
-            if (std.mem.eql(u8, name, w)) {
-                found = e;
-                found_name = name;
-            }
-        } else if (found == null) {
-            found = e;
-            found_name = name;
-        }
-    }
-    if (want == null and data_members > 1) return Error.ZipMemberAmbiguous;
-    const e = found orelse return Error.ZipMemberNotFound;
-    switch (e.compression_method) {
+    const entries = try directory(arena, m.src);
+    const e = if (want) |w| blk: {
+        for (entries) |e| if (std.mem.eql(u8, e.name, w)) break :blk e;
+        return Error.ZipMemberNotFound;
+    } else switch (entries.len) {
+        0 => return Error.ZipMemberNotFound,
+        1 => entries[0],
+        else => return Error.ZipMemberAmbiguous,
+    };
+    switch (e.method) {
         .store, .deflate => {},
         else => return Error.ZipMemberCompression,
     }
@@ -109,20 +203,40 @@ pub fn openMember(arena: std.mem.Allocator, path: []const u8, want: ?[]const u8)
     // The central directory's copy of the sizes is authoritative, but the data
     // itself begins after the *local* header, whose name and extra fields have
     // their own lengths — a zip may pad the local extra field differently.
-    try m.fr.seekTo(e.file_offset);
-    const lh = try m.fr.interface.takeStruct(zip.LocalFileHeader, .little);
-    if (!std.mem.eql(u8, &lh.signature, &zip.local_file_header_sig)) return error.ZipBadFileOffset;
-    const data_off = e.file_offset + @sizeOf(zip.LocalFileHeader) + lh.filename_len + lh.extra_len;
-    try m.fr.seekTo(data_off);
+    const lh_len = @sizeOf(zip.LocalFileHeader);
+    if (e.local_offset + lh_len > m.src.size()) return Error.ZipBadFileOffset;
+    var hr = std.Io.Reader.fixed(try m.src.range(arena, e.local_offset, lh_len));
+    const lh = try hr.takeStruct(zip.LocalFileHeader, .little);
+    if (!std.mem.eql(u8, &lh.signature, &zip.local_file_header_sig)) return Error.ZipBadFileOffset;
+    const data_off = e.local_offset + lh_len + lh.filename_len + lh.extra_len;
+    if (data_off + e.compressed_size > m.src.size()) return Error.ZipBadFileOffset;
+
+    const inner: *std.Io.Reader = switch (m.src) {
+        .memory => unreachable,
+        .file => |x| blk: {
+            m.body = .{ .file = x.f.reader(try arena.alloc(u8, 64 * 1024)) };
+            try m.body.file.seekTo(data_off);
+            break :blk &m.body.file.interface;
+        },
+        .remote => |rm| blk: {
+            if (rm.whole != null or e.compressed_size == 0) {
+                const w = rm.whole orelse "";
+                if (e.compressed_size > 0 and data_off + e.compressed_size > w.len) return Error.ZipBadFileOffset;
+                m.body = .{ .fixed = .fixed(if (e.compressed_size == 0) "" else w[@intCast(data_off)..][0..@intCast(e.compressed_size)]) };
+                break :blk &m.body.fixed;
+            }
+            break :blk try streamRange(arena, m, rm, data_off, e.compressed_size);
+        },
+    };
 
     // Stop at the member's end: the compressed stream is followed by the next
     // member, then the central directory. Inflate would stop on its own, but a
     // stored member has no terminator of its own.
     const lim_buf = try arena.alloc(u8, 64 * 1024);
-    m.limited = std.Io.Reader.Limited.init(&m.fr.interface, .limited64(e.compressed_size), lim_buf);
+    m.limited = std.Io.Reader.Limited.init(inner, .limited64(e.compressed_size), lim_buf);
 
-    m.name = found_name;
-    switch (e.compression_method) {
+    m.name = e.name;
+    switch (e.method) {
         .store => m.reader = &m.limited.interface,
         .deflate => {
             const window = try arena.alloc(u8, std.compress.flate.max_window_len);
@@ -134,6 +248,29 @@ pub fn openMember(arena: std.mem.Allocator, path: []const u8, want: ?[]const u8)
         else => unreachable,
     }
     return m;
+}
+
+/// One GET for the member's compressed extent, streamed rather than buffered, so
+/// a multi-gigabyte member costs a window of memory, not its size.
+fn streamRange(arena: std.mem.Allocator, m: *Member, rm: *pqdecode.Remote, off: u64, len: u64) !*std.Io.Reader {
+    const range = try std.fmt.allocPrint(arena, "bytes={d}-{d}", .{ off, off + len - 1 });
+    const extra = try rm.headers(arena, .GET, range);
+    const uri = std.Uri.parse(rm.url) catch return error.InvalidUrl;
+    m.body = .{ .http = .{ .req = undefined, .response = undefined, .redirect_buf = undefined } };
+    const h = &m.body.http;
+    // Identity only: a range of a content-encoded body is a range of the encoding.
+    h.req = try rm.client.request(.GET, uri, .{ .extra_headers = extra, .headers = .{ .accept_encoding = .omit } });
+    errdefer h.req.deinit();
+    try h.req.sendBodiless();
+    h.response = try h.req.receiveHead(&h.redirect_buf);
+    const rdr = h.response.reader(try arena.alloc(u8, 64 * 1024));
+    switch (@intFromEnum(h.response.head.status)) {
+        206 => {},
+        // Range ignored between the tail fetch and now: skip to the member.
+        200 => try rdr.discardAll64(off),
+        else => |code| return rm.statusError(code, ""),
+    }
+    return rdr;
 }
 
 /// Committed fixtures, alongside the parquet ones. `two_members.zip` holds `a.csv`

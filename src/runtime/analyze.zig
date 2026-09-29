@@ -1020,7 +1020,7 @@ const Ctx = struct {
                     const fmt = try formatFromHints(lead.hints, self.diag);
                     if (unreadableTarget(rd.form.path, fmt)) |why|
                         return fail(self.diag, "cannot read `{s}`: {s}", .{ rd.form.path, why });
-                    if (archiveProblem(self.arena, rd.form.path, fmt)) |why|
+                    if (archiveProblem(self.arena, rd.form.path, fmt, false)) |why|
                         return fail(self.diag, "cannot read `{s}`: {s}", .{ rd.form.path, why });
                     _ = try dialectFromHints(lead.hints, self.diag);
                 }
@@ -1470,10 +1470,15 @@ pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
 /// `offlineSchema` already assumes. Everything archive-shaped is decided here so the
 /// guarantee `unreadableTarget` gives for a loose file also holds inside a
 /// container: a `.json` member is refused exactly like a `.json` file.
-pub fn archiveProblem(arena: std.mem.Allocator, path: []const u8, explicit: ?FileFormat) ?[]const u8 {
+///
+/// A remote archive is opened only when `online`: `check` stays off the network,
+/// and judges just the member name the script wrote.
+pub fn archiveProblem(arena: std.mem.Allocator, path: []const u8, explicit: ?FileFormat, online: bool) ?[]const u8 {
     const ar = csv.splitArchive(path) orelse return null;
-    if (csv.CsvReader.isUrl(ar.archive))
-        return "an archive has its index at the end, so reading one over HTTP needs a ranged fetch that is not wired up yet; download it first";
+    if (!online and csv.CsvReader.isUrl(ar.archive)) {
+        const m = ar.member orelse return null;
+        return memberProblem(arena, m, explicit);
+    }
 
     const members = zipsrc.names(arena, ar.archive) catch return null;
     if (members.len == 0) return "the archive holds no files";
@@ -1486,6 +1491,11 @@ pub fn archiveProblem(arena: std.mem.Allocator, path: []const u8, explicit: ?Fil
     else
         members[0];
 
+    return memberProblem(arena, chosen, explicit);
+}
+
+/// Why the chosen member cannot be streamed as a table, or null when it can.
+fn memberProblem(arena: std.mem.Allocator, chosen: []const u8, explicit: ?FileFormat) ?[]const u8 {
     if (explicit == null and formatOfPath(chosen) == null)
         return std.fmt.allocPrint(arena, "`{s}` inside it is not a `.csv` or `.parquet`; name the format with `WITH (format = 'csv')`", .{chosen}) catch null;
     if ((explicit orelse formatOfPath(chosen)) == .parquet)

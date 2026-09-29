@@ -205,7 +205,7 @@ pub const CsvReader = struct {
     const Backend = union(enum) {
         file: FileBackend,
         http: *HttpFetch,
-        /// A member of a local zip, already inflating.
+        /// A member of a zip, local or fetched by range, already inflating.
         member: *zipsrc.Member,
     };
     const FileBackend = struct {
@@ -250,9 +250,6 @@ pub const CsvReader = struct {
         }
 
         if (splitArchive(first)) |ar| {
-            // Local archives only for now; a remote one needs its central directory
-            // fetched from the tail first.
-            if (isUrl(ar.archive)) return error.ArchiveUrlUnsupported;
             const m = try zipsrc.openMember(arena, ar.archive, ar.member);
             self.backend = .{ .member = m };
             self.rdr = m.reader;

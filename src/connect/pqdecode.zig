@@ -1977,7 +1977,7 @@ pub const Remote = struct {
     /// A corporate TLS interceptor is repaired once per object, not per range.
     repaired: bool = false,
 
-    fn open(arena: std.mem.Allocator, path: []const u8) !*Remote {
+    pub fn open(arena: std.mem.Allocator, path: []const u8) !*Remote {
         const client = try arena.create(std.http.Client);
         client.* = http_client.initClient(arena);
         const self = try arena.create(Remote);
@@ -2001,7 +2001,7 @@ pub const Remote = struct {
         return self;
     }
 
-    fn read(self: *Remote, arena: std.mem.Allocator, off: u64, len: usize) ![]const u8 {
+    pub fn read(self: *Remote, arena: std.mem.Allocator, off: u64, len: usize) ![]const u8 {
         if (len == 0) return "";
         // `total` came from HEAD; `whole` came from a later 200. A server that
         // disagrees between the two must not slice us past the buffer.
@@ -2073,7 +2073,7 @@ pub const Remote = struct {
         return .{ .code = @intFromEnum(res.status), .body = aw.writer.buffered() };
     }
 
-    fn headers(
+    pub fn headers(
         self: *Remote,
         arena: std.mem.Allocator,
         method: std.http.Method,
@@ -2101,7 +2101,7 @@ pub const Remote = struct {
         return resp.head.content_length orelse error.HeadUnsupported;
     }
 
-    fn statusError(self: *Remote, code: u16, body: []const u8) anyerror {
+    pub fn statusError(self: *Remote, code: u16, body: []const u8) anyerror {
         if (self.object) |o| return o.statusToError(code, body);
         return http_client.statusError(code);
     }
