@@ -1840,12 +1840,23 @@ pub const Parser = struct {
             // derived table, since a join's right side is named by binding anyway.
             if (self.at(.string))
                 return self.fail(jpos, "JOIN right side must be a WITH-defined CTE or a `(SELECT ...)`, not a path; read it in one: `WITH b AS (SELECT * FROM '{s}')`", .{self.cur().text});
-            const binding = if (self.at(.lparen)) try self.parseDerivedTable() else try self.expectIdent();
-            const bpos = self.prevPos();
-            if (!self.isLet(binding))
-                return self.fail(jpos, "JOIN right side `{s}` must be a WITH-defined CTE", .{binding});
             var jalias: ?[]const u8 = null;
-            if (self.at(.ident) and !isReservedAfterSource(self.cur().text)) {
+            var binding: []const u8 = undefined;
+            var bpos: Pos = undefined;
+            if (self.at(.lparen)) {
+                const d = try self.parseDerivedTable();
+                binding = d.binding;
+                jalias = d.alias;
+                bpos = d.alias_pos;
+            } else {
+                binding = try self.expectIdent();
+                bpos = self.prevPos();
+                if (!self.isLet(binding))
+                    return self.fail(jpos, "JOIN right side `{s}` must be a WITH-defined CTE", .{binding});
+            }
+            if (jalias) |ja| {
+                try self.claimAlias(&aliases, ja, bpos, .right);
+            } else if (self.at(.ident) and !isReservedAfterSource(self.cur().text)) {
                 jalias = self.advance().text;
                 try self.claimAlias(&aliases, jalias.?, self.prevPos(), .right);
             } else try self.claimAlias(&aliases, binding, bpos, .reserved);
@@ -2283,12 +2294,15 @@ pub const Parser = struct {
     /// BODY(schema), HTTP('url'), a CTE reference, or a connection-qualified
     /// table / QUERY($$...$$). Registers the alias.
     /// `( <query> ) [AS] alias` in a FROM or JOIN position. Lowers to a binding — the
-    /// same statement `WITH alias AS (...)` produces — and returns its name, so the
-    /// caller can reference it as a `.ref` source or as a join's right side. No new
-    /// execution machinery: a derived table *is* a CTE that happened to be written
-    /// inline. An unaliased one gets a generated name that no identifier can collide
-    /// with.
-    fn parseDerivedTable(self: *Parser) Error![]const u8 {
+    /// same statement `WITH alias AS (...)` produces — so the caller can reference it
+    /// as a `.ref` source or as a join's right side. No new execution machinery: a
+    /// derived table *is* a CTE that happened to be written inline.
+    ///
+    /// The binding always gets a generated name no identifier can collide with; the
+    /// alias names it only inside the query that wrote it. Bindings share one
+    /// namespace per script, so binding under the alias let a second `r` anywhere
+    /// replace the first — silently, when the two had the same columns.
+    fn parseDerivedTable(self: *Parser) Error!Derived {
         const dpos = self.curPos();
         _ = try self.expect(.lparen);
         var sub_stages = std.array_list.Managed(ast.Stage).init(self.arena);
@@ -2302,13 +2316,17 @@ pub const Parser = struct {
         _ = try self.expect(.rparen);
 
         _ = self.eatKw("as");
-        var name: []const u8 = undefined;
+        var alias: ?[]const u8 = null;
+        var alias_pos = dpos;
         if (self.at(.ident) and !isReservedAfterSource(self.cur().text)) {
-            name = self.advance().text;
-        } else {
-            self.derived_n += 1;
-            name = try std.fmt.allocPrint(self.arena, "__derived{d}", .{self.derived_n});
+            alias = self.advance().text;
+            alias_pos = self.prevPos();
         }
+        self.derived_n += 1;
+        const name = if (alias) |al|
+            try std.fmt.allocPrint(self.arena, "__derived{d}_{s}", .{ self.derived_n, al })
+        else
+            try std.fmt.allocPrint(self.arena, "__derived{d}", .{self.derived_n});
 
         try self.let_names.append(name);
         // Inner bindings first: they are what this one reads from.
@@ -2318,8 +2336,10 @@ pub const Parser = struct {
             .pipeline = .{ .stages = try sub_stages.toOwnedSlice(), .pos = dpos },
             .pos = dpos,
         } });
-        return name;
+        return .{ .binding = name, .alias = alias, .alias_pos = alias_pos };
     }
+
+    const Derived = struct { binding: []const u8, alias: ?[]const u8, alias_pos: Pos };
 
     /// A parenthesized query in expression or LET position, the `(` already
     /// consumed: parse it into a pipeline and route any bindings it creates to
@@ -2594,9 +2614,9 @@ pub const Parser = struct {
     fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array_list.Managed(ast.Hint)) Error!ast.Stage.Node {
         var node: ast.Stage.Node = undefined;
         if (self.at(.lparen)) {
-            const name = try self.parseDerivedTable();
-            try self.claimAlias(aliases, name, self.prevPos(), .left);
-            return .{ .ref = name };
+            const d = try self.parseDerivedTable();
+            if (d.alias) |a| try self.claimAlias(aliases, a, d.alias_pos, .left);
+            return .{ .ref = d.binding };
         } else if (self.at(.string)) {
             node = .{ .read = .{ .connector = "csv", .form = .{ .path = self.advance().text } } };
         } else if (self.isKw("identifier") and self.peekTag() == .lparen) {

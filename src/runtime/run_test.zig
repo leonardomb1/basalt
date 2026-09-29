@@ -148,6 +148,48 @@ test "union all by name: a branch may be any query, not just a table" {
     try std.testing.expectEqualStrings("k,v\na,1\nc,3\n", out);
 }
 
+test "derived tables: an alias names its table only inside its own query" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "t1.csv", .data = "k\n1\n2\n3\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "t2.csv", .data = "k\n2\n3\n4\n5\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    // A derived table was bound under its alias, in one namespace for the whole
+    // script: the last `r` replaced every other, so `a` read t2's rows with no
+    // warning, and `(… (…) r) r` read itself until the stack gave out.
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{
+            .q = "WITH a AS (SELECT k FROM (SELECT k FROM '$B/t1.csv' WHERE k = 1) r)," ++
+                " b AS (SELECT k FROM (SELECT k FROM '$B/t2.csv' WHERE k = 5) r)" ++
+                " SELECT 'a' AS src, k FROM a UNION ALL BY NAME SELECT 'b' AS src, k FROM b",
+            .want = "src,k\na,1\nb,5\n",
+        },
+        .{
+            .q = "SELECT COUNT(*) AS n FROM (SELECT k2 FROM (SELECT k AS k2 FROM '$B/t1.csv') r) r",
+            .want = "n\n3\n",
+        },
+        .{
+            // An alias equal to a CTE's name does not shadow the CTE.
+            .q = "WITH b AS (SELECT k AS k2 FROM '$B/t2.csv')," ++
+                " a AS (SELECT k1 FROM (SELECT k AS k1 FROM '$B/t1.csv') b)" ++
+                " SELECT COUNT(*) AS n FROM a JOIN b ON a.k1 = b.k2",
+            .want = "n\n2\n",
+        },
+    };
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+}
+
 test "aggregate: two aggregates over different expressions stay separate" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
