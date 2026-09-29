@@ -299,6 +299,49 @@ test "INTERSECT / EXCEPT: NULLs compare equal, results are deduplicated, INTERSE
     }
 }
 
+test "SUM/AVG over an outer join's null fill, and integer sums that leave i64" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "l.csv", .data = "k,v\n1,a\n2,b\n3,c\n4,d\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "r.csv", .data = "k,n\n1,100\n2,7\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "big.csv", .data = "g,x\n1,9223372036854775807\n1,9223372036854775807\n1,-9223372036854775807\n1,-9223372036854775807\n2,5\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    // The unmatched rows' `n` is null by validity, but the fill gathers a
+    // placeholder row, so its slot held 100: an ungrouped SUM added every slot
+    // and answered 307 / 153.5. Verified against DuckDB.
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{
+            .q = "SELECT SUM(r.n) AS s, AVG(r.n) AS a FROM '$B/l.csv' l LEFT JOIN (SELECT * FROM '$B/r.csv') r ON l.k = r.k",
+            .want = "s,a\n107,53.5\n",
+        },
+        // The running total leaves i64 on the way to 5; the answer must not depend
+        // on where batches or lanes split the rows.
+        .{ .q = "SELECT SUM(x) AS s FROM '$B/big.csv'", .want = "s\n5\n" },
+    };
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+
+    // A window SUM whose running value leaves i64 wrapped to a plausible 2.
+    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT g, x, SUM(x) OVER (ORDER BY g, x) AS s FROM '{s}/big.csv';", .{ base, base });
+    defer alloc.free(script);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.IntOverflow, run(alloc, prog, .{}, &rdiag));
+}
+
 test "aggregate: two aggregates over different expressions stay separate" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

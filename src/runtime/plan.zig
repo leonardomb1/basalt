@@ -884,6 +884,7 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
                 .ord = ok,
                 .funcs = kinds,
                 .frame = .{ .rows = wd.frame.rows, .unbounded = wd.frame.unbounded, .preceding = wd.frame.preceding },
+                .err = env.errctx,
             };
             return .{ .op = .{ .window = o }, .schema = out };
         },

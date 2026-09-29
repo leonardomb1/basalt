@@ -304,6 +304,7 @@ pub const Window = struct {
     funcs: []const Func,
     frame: Frame = .{},
     done: bool = false,
+    err: ?*ErrCtx = null,
 
     /// A row-counted frame, `[current - preceding, current]`, clipped to the partition.
     /// `rows` false selects the peer-based default instead.
@@ -319,6 +320,16 @@ pub const Window = struct {
             if (k.order(a, b) != .eq) return false;
         }
         return true;
+    }
+
+    /// A window SUM's value for one row. It used to wrap: a running total past
+    /// i64 came back as a small plausible number.
+    fn intSum(self: *Window, acc: i128) error{IntOverflow}!Value {
+        const v = std.math.cast(i64, acc) orelse {
+            if (self.err) |ec| ec.set("{s}: in window SUM", .{errLabel(error.IntOverflow)});
+            return error.IntOverflow;
+        };
+        return .{ .int = v };
     }
 
     pub fn next(self: *Window, arena: std.mem.Allocator) anyerror!?Batch {
@@ -428,7 +439,9 @@ pub const Window = struct {
                     var dq = std.array_list.Managed(usize).init(arena);
                     var dq_head: usize = 0;
                     var lo: usize = 0;
-                    var acc_i: i64 = 0;
+                    // i128, as `Aggregate` sums: exact under the frame's adds and
+                    // subtracts, with the range checked on each row's output.
+                    var acc_i: i128 = 0;
                     var acc_f: f64 = 0;
                     var n: i64 = 0;
                     var seen_float = false;
@@ -499,14 +512,14 @@ pub const Window = struct {
                             .count => .{ .int = n },
                             .min, .max => if (dq_head < dq.items.len) vs[dq.items[dq_head]] else .null,
                             .avg => if (n == 0) .null else .{ .float = acc_f / @as(f64, @floatFromInt(n)) },
-                            else => if (n == 0) .null else if (seen_float) .{ .float = acc_f } else .{ .int = acc_i },
+                            else => if (n == 0) .null else if (seen_float) .{ .float = acc_f } else try self.intSum(acc_i),
                         };
                     }
                 } else {
                     var i: usize = 0;
                     while (i < idx.len) {
                         const stop = pend[i];
-                        var acc_i: i64 = 0;
+                        var acc_i: i128 = 0;
                         var acc_f: f64 = 0;
                         var n: i64 = 0;
                         var seen_float = false;
@@ -550,7 +563,7 @@ pub const Window = struct {
                                     // mean every value in the group was null — SQL
                                     // answers null there, not zero.
                                     .avg => if (n == 0) .null else .{ .float = acc_f / @as(f64, @floatFromInt(n)) },
-                                    else => if (n == 0) .null else if (seen_float) .{ .float = acc_f } else .{ .int = acc_i },
+                                    else => if (n == 0) .null else if (seen_float) .{ .float = acc_f } else try self.intSum(acc_i),
                                 };
                             }
                             g = e;
@@ -1248,7 +1261,11 @@ pub const Aggregate = struct {
 
     pub const Acc = struct {
         n: i64 = 0,
-        sum_i: i64 = 0,
+        /// Exact: a total that fits i64 must not fail on a partial that does not,
+        /// or the answer would depend on how rows were split across batches and
+        /// lanes. `finalizeAcc` checks the range once. `align(8)`, as
+        /// `Decimal.unscaled`: `GroupStore` packs accumulators after 8-aligned keys.
+        sum_i: i128 align(8) = 0,
         sum_f: f64 = 0,
         ext: Value = .null,
         /// Values already counted by a `COUNT(DISTINCT x)`, per group. Only
@@ -1316,7 +1333,7 @@ pub const Aggregate = struct {
     /// accumulator by `mergePartial`.
     const Partial = struct {
         nvalid: usize,
-        sum_i: i64 = 0,
+        sum_i: i128 = 0,
         sum_f: f64 = 0,
         ext: ?Value = null,
     };
@@ -1846,11 +1863,10 @@ pub const Aggregate = struct {
                 dst.n += src.n;
             },
             .sum => {
-                // Merging per-lane partials can overflow where no single lane did.
                 if (agg.ty.kind == .float)
                     dst.sum_f += src.sum_f
                 else
-                    dst.sum_i = std.math.add(i64, dst.sum_i, src.sum_i) catch return error.IntOverflow;
+                    dst.sum_i = std.math.add(i128, dst.sum_i, src.sum_i) catch return error.IntOverflow;
                 dst.n += src.n;
             },
             .avg => {
@@ -2127,10 +2143,13 @@ pub const Aggregate = struct {
         switch (agg.func) {
             .count => {},
             .median => return null,
+            // A null slot holds whatever its producer left there — an outer join's
+            // fill keeps the placeholder row's value — so only an all-valid batch
+            // may be summed without looking at the bitmap.
             .sum, .avg => switch (col.ty.kind) {
-                .float => p.sum_f = simd.sumF(col.data.f64[0..n]),
+                .float => p.sum_f = if (nvalid == n) simd.sumF(col.data.f64[0..n]) else validSumF(col, n),
                 .int => {
-                    p.sum_i = try sumIntCol(col.data.i64[0..n]);
+                    p.sum_i = if (nvalid == n) sumIntCol(col.data.i64[0..n]) else validSumI(col, n);
                     p.sum_f = @floatFromInt(p.sum_i);
                 },
                 else => unreachable,
@@ -2150,7 +2169,7 @@ pub const Aggregate = struct {
                 if (agg.ty.kind == .float)
                     acc.sum_f += p.sum_f
                 else
-                    acc.sum_i = std.math.add(i64, acc.sum_i, p.sum_i) catch return error.IntOverflow;
+                    acc.sum_i = std.math.add(i128, acc.sum_i, p.sum_i) catch return error.IntOverflow;
                 acc.n += @intCast(p.nvalid);
             },
             .avg => if (p.nvalid > 0) {
@@ -2178,7 +2197,7 @@ pub const Aggregate = struct {
         for (builders, self.out_schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
 
         if (groups.len == 0 and self.by.len == 0) {
-            for (self.aggs, 0..) |agg, j| try builders[j].append(finalizeAcc(.{}, agg));
+            for (self.aggs, 0..) |agg, j| try builders[j].append(try finalizeAcc(.{}, agg));
         } else {
             for (groups) |g| {
                 var col: usize = 0;
@@ -2187,7 +2206,10 @@ pub const Aggregate = struct {
                     col += 1;
                 }
                 for (self.aggs, 0..) |agg, j| {
-                    try builders[col].append(finalizeAcc(g.accs[j], agg));
+                    try builders[col].append(finalizeAcc(g.accs[j], agg) catch |err| {
+                        if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
+                        return err;
+                    });
                     col += 1;
                 }
             }
@@ -2223,10 +2245,9 @@ pub const Aggregate = struct {
                         else
                             .{ .unscaled = v.int, .scale = 0 };
                         const r = eval.rescaleTo(d, agg.ty.scale) orelse return error.CastFailed;
-                        const addend = std.math.cast(i64, r.unscaled) orelse return error.CastFailed;
-                        acc.sum_i = std.math.add(i64, acc.sum_i, addend) catch return error.CastFailed;
+                        acc.sum_i = std.math.add(i128, acc.sum_i, r.unscaled) catch return error.CastFailed;
                     },
-                    else => acc.sum_i = std.math.add(i64, acc.sum_i, v.int) catch return error.IntOverflow,
+                    else => acc.sum_i = std.math.add(i128, acc.sum_i, v.int) catch return error.IntOverflow,
                 }
                 acc.n += 1;
             },
@@ -2248,13 +2269,13 @@ pub const Aggregate = struct {
         }
     }
 
-    pub fn finalizeAcc(acc: Acc, agg: Agg) Value {
+    pub fn finalizeAcc(acc: Acc, agg: Agg) error{IntOverflow}!Value {
         return switch (agg.func) {
             .count => .{ .int = acc.n },
             .sum => if (acc.n == 0) .null else switch (agg.ty.kind) {
                 .float => Value{ .float = acc.sum_f },
                 .decimal => Value{ .decimal = .{ .unscaled = acc.sum_i, .scale = agg.ty.scale } },
-                else => Value{ .int = acc.sum_i },
+                else => Value{ .int = std.math.cast(i64, acc.sum_i) orelse return error.IntOverflow },
             },
             .avg => if (acc.n == 0) .null else Value{ .float = acc.sum_f / @as(f64, @floatFromInt(acc.n)) },
             .median => blk: {
@@ -2329,14 +2350,30 @@ pub fn dupeValue(state: std.mem.Allocator, v: Value) !Value {
     };
 }
 
-/// Sum an i64 column, erroring rather than wrapping. The accumulator is i128 so
-/// the hot loop stays branch-free — a slice of i64 cannot overflow i128 — and the
-/// single range check happens once at the end. This used to be `+%`, which
-/// silently returned a plausible wrong total (three big values summed to `-1`).
-fn sumIntCol(d: []const i64) error{IntOverflow}!i64 {
+/// Sum an i64 column exactly. The accumulator is i128 so the hot loop stays
+/// branch-free — a slice of i64 cannot overflow i128 — and the range check waits
+/// for `finalizeAcc`. This used to be `+%`, which silently returned a plausible
+/// wrong total (three big values summed to `-1`).
+fn sumIntCol(d: []const i64) i128 {
     var s: i128 = 0;
     for (d) |x| s += x;
-    return std.math.cast(i64, s) orelse error.IntOverflow;
+    return s;
+}
+
+fn validSumI(col: column.Column, n: usize) i128 {
+    var s: i128 = 0;
+    for (col.data.i64[0..n], 0..) |x, i| {
+        if (col.validity.get(i)) s += x;
+    }
+    return s;
+}
+
+fn validSumF(col: column.Column, n: usize) f64 {
+    var s: f64 = 0;
+    for (col.data.f64[0..n], 0..) |x, i| {
+        if (col.validity.get(i)) s += x;
+    }
+    return s;
 }
 
 /// MIN/MAX over an int/float column, honoring nulls. SIMD on the all-valid fast
@@ -3669,15 +3706,21 @@ test "linearize decomposes map-only pipelines source-to-sink; breakers refuse" {
     try testing.expect((try linearize(a, .{ .sort = &srt })) == null);
 }
 
-test "sumIntCol: overflow is an error, not a wrapped plausible number" {
+test "integer SUM: exact across batches, an error only when the total leaves i64" {
     // Was `+%`: three of these summed to exactly 2^64-1, which wrapped to `-1`
     // and was reported as the answer. The i64 column path is the one parquet and
     // database int columns take, so this was a live silent-wrong-answer.
     const big: i64 = 6148914691236517205;
-    try testing.expectError(error.IntOverflow, sumIntCol(&[_]i64{ big, big, big }));
-    try testing.expectError(error.IntOverflow, sumIntCol(&[_]i64{ std.math.minInt(i64), -1 }));
-    try testing.expectEqual(@as(i64, 6), try sumIntCol(&[_]i64{ 1, 2, 3 }));
-    try testing.expectEqual(@as(i64, 0), try sumIntCol(&[_]i64{}));
-    // Cancelling extremes stay exact: the i128 accumulator never leaves range.
-    try testing.expectEqual(@as(i64, 0), try sumIntCol(&[_]i64{ std.math.maxInt(i64), std.math.minInt(i64), 1 }));
+    const agg = Aggregate.Agg{ .func = .sum, .arg = null, .ty = types.Type.init(.int) };
+    try testing.expectError(error.IntOverflow, Aggregate.finalizeAcc(.{ .n = 3, .sum_i = sumIntCol(&[_]i64{ big, big, big }) }, agg));
+    try testing.expectError(error.IntOverflow, Aggregate.finalizeAcc(.{ .n = 2, .sum_i = sumIntCol(&[_]i64{ std.math.minInt(i64), -1 }) }, agg));
+    try testing.expectEqual(@as(i128, 6), sumIntCol(&[_]i64{ 1, 2, 3 }));
+
+    // A running total may leave i64 on the way to one that fits. Checked per
+    // batch or per lane merge, the answer depended on where the rows were split:
+    // 5 at -j 1, an overflow error at -j 8.
+    const max = std.math.maxInt(i64);
+    var acc = Aggregate.Acc{ .n = 5 };
+    for ([_][]const i64{ &.{ max, max }, &.{ -max, -max }, &.{5} }) |part| acc.sum_i += sumIntCol(part);
+    try testing.expectEqual(Value{ .int = 5 }, try Aggregate.finalizeAcc(acc, agg));
 }

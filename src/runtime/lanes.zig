@@ -755,7 +755,8 @@ fn topNTail(tail: []const ast.Stage) ?TopNTail {
 /// aggregate's schema, the aggregates after them.
 fn groupSortValue(g: op.Aggregate.Group, col: usize, by_len: usize, aggs: []const op.Aggregate.Agg) Value {
     if (col < by_len) return g.key_vals[col];
-    return op.Aggregate.finalizeAcc(g.accs[col - by_len], aggs[col - by_len]);
+    // Only orders the groups: a sum out of range fails the query when it is emitted.
+    return op.Aggregate.finalizeAcc(g.accs[col - by_len], aggs[col - by_len]) catch .null;
 }
 
 const GroupOrder = struct {
