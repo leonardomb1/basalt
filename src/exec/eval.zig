@@ -424,7 +424,7 @@ fn unaryVec(arena: std.mem.Allocator, u: ast.Expr.Unary, batch: Batch) VecError!
         .neg => switch (v) {
             .scalar => |s| return .{ .scalar = switch (s) {
                 .null => .null,
-                .int => |x| .{ .int = -x },
+                .int => |x| .{ .int = std.math.negate(x) catch return error.IntOverflow },
                 .float => |x| .{ .float = -x },
                 else => return error.Unsupported,
             } },
@@ -433,7 +433,9 @@ fn unaryVec(arena: std.mem.Allocator, u: ast.Expr.Unary, batch: Batch) VecError!
                 switch (c.ty.kind) {
                     .int => {
                         const out = try arena.alloc(i64, n);
-                        for (c.data.i64, 0..) |x, i| out[i] = -x;
+                        for (c.data.i64, 0..) |x, i| {
+                            out[i] = if (c.validity.get(i)) std.math.negate(x) catch return error.IntOverflow else 0;
+                        }
                         return mkCol(c.ty, n, c.validity, .{ .i64 = out });
                     },
                     .float => {
@@ -578,14 +580,8 @@ inline fn applyOp(comptime T: type, comptime op: ast.BinOp, a: T, d: T) VecError
         .add => if (T == i64) (std.math.add(i64, a, d) catch return error.IntOverflow) else a + d,
         .sub => if (T == i64) (std.math.sub(i64, a, d) catch return error.IntOverflow) else a - d,
         .mul => if (T == i64) (std.math.mul(i64, a, d) catch return error.IntOverflow) else a * d,
-        .div => if (T == i64)
-            (if (d == 0) error.DivByZero else @divTrunc(a, d))
-        else
-            a / d,
-        .mod => if (T == i64)
-            (if (d == 0) error.DivByZero else @rem(a, d))
-        else
-            @mod(a, d),
+        .div => if (T == i64) intDiv(a, d) else a / d,
+        .mod => if (T == i64) intRem(a, d) else @mod(a, d),
         // f64 comparison goes through the total order (NaN equal to itself,
         // above everything else); `std.math.order` hits `unreachable` on NaN,
         // and this kernel runs on whole columns.
@@ -1150,7 +1146,8 @@ pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, ro
             if (v.isNull()) return .null;
             return switch (u.op) {
                 .neg => switch (v) {
-                    .int => |x| .{ .int = -x },
+                    // `-minInt(i64)` wrapped back to itself.
+                    .int => |x| .{ .int = std.math.negate(x) catch return error.IntOverflow },
                     .float => |x| .{ .float = -x },
                     else => error.TypeMismatch,
                 },
@@ -1227,6 +1224,20 @@ fn evalBinary(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch, row: u
     }
 }
 
+/// `minInt(i64) / -1` is the one quotient i64 cannot hold, and the hardware
+/// traps on it: the process died of SIGFPE. The remainder is 0 by definition.
+fn intDiv(a: i64, b: i64) error{ DivByZero, IntOverflow }!i64 {
+    if (b == 0) return error.DivByZero;
+    if (b == -1) return std.math.negate(a) catch error.IntOverflow;
+    return @divTrunc(a, b);
+}
+
+fn intRem(a: i64, b: i64) error{DivByZero}!i64 {
+    if (b == 0) return error.DivByZero;
+    if (b == -1) return 0;
+    return @rem(a, b);
+}
+
 fn arith(op: ast.BinOp, l: Value, r: Value) EvalError!Value {
     if (l == .int and r == .int) {
         const a = l.int;
@@ -1239,8 +1250,8 @@ fn arith(op: ast.BinOp, l: Value, r: Value) EvalError!Value {
             .add => .{ .int = std.math.add(i64, a, b) catch return error.IntOverflow },
             .sub => .{ .int = std.math.sub(i64, a, b) catch return error.IntOverflow },
             .mul => .{ .int = std.math.mul(i64, a, b) catch return error.IntOverflow },
-            .div => if (b == 0) error.DivByZero else .{ .int = @divTrunc(a, b) },
-            .mod => if (b == 0) error.DivByZero else .{ .int = @rem(a, b) },
+            .div => .{ .int = try intDiv(a, b) },
+            .mod => .{ .int = try intRem(a, b) },
             else => unreachable,
         };
     }
@@ -1979,7 +1990,7 @@ const per_row = struct {
         switch (v) {
             // `-minInt(i64)` has no i64 representation; refuse rather than wrap.
             .int => |x| {
-                if (x == std.math.minInt(i64)) return error.CastFailed;
+                if (x == std.math.minInt(i64)) return error.IntOverflow;
                 return Value{ .int = if (x < 0) -x else x };
             },
             .float => |x| return Value{ .float = @abs(x) },
@@ -4001,6 +4012,16 @@ test "integer arithmetic overflow is an error, not a silent wrap" {
     try std.testing.expectError(error.IntOverflow, arith(.mul, big, .{ .int = 2 }));
     try std.testing.expectError(error.IntOverflow, arith(.sub, .{ .int = std.math.minInt(i64) }, one));
     try std.testing.expectEqual(@as(i64, 5), (try arith(.add, .{ .int = 2 }, .{ .int = 3 })).int);
+
+    // minInt / -1 trapped in the CPU (SIGFPE), and -minInt wrapped to itself.
+    const min = Value{ .int = std.math.minInt(i64) };
+    try std.testing.expectError(error.IntOverflow, arith(.div, min, .{ .int = -1 }));
+    try std.testing.expectEqual(@as(i64, 0), (try arith(.mod, min, .{ .int = -1 })).int);
+    try std.testing.expectEqual(@as(i64, -7), (try arith(.div, .{ .int = 7 }, .{ .int = -1 })).int);
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    try std.testing.expectError(error.IntOverflow, evalLit(ar.allocator(), "-(-9223372036854775807 - 1)"));
+    try std.testing.expectError(error.IntOverflow, evalLit(ar.allocator(), "abs(-9223372036854775807 - 1)"));
 }
 
 test "timestamps keep sub-second precision through parse and format" {
