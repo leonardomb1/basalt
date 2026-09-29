@@ -3304,18 +3304,21 @@ fn endSlice(s: []const u8, n: i64, left: bool) []const u8 {
 }
 
 /// SQL `LIKE`: `%` matches any run (including empty), `_` matches one byte.
+///
+/// `%` is tested before the literal compare: a `%` in the text equal to a `%` in
+/// the pattern was taken as a literal match, so `'50% off' LIKE '50%'` was false.
 fn likeMatch(s: []const u8, pat: []const u8) bool {
     var si: usize = 0;
     var pi: usize = 0;
     var star: ?usize = null;
     var smark: usize = 0;
     while (si < s.len) {
-        if (pi < pat.len and (pat[pi] == '_' or pat[pi] == s[si])) {
-            si += 1;
-            pi += 1;
-        } else if (pi < pat.len and pat[pi] == '%') {
+        if (pi < pat.len and pat[pi] == '%') {
             star = pi;
             smark = si;
+            pi += 1;
+        } else if (pi < pat.len and (pat[pi] == '_' or pat[pi] == s[si])) {
+            si += 1;
             pi += 1;
         } else if (star) |st| {
             pi = st + 1;
@@ -3341,6 +3344,13 @@ test "substr (1-based, byte) and like wildcard matcher" {
     try std.testing.expect(likeMatch("anything", "%"));
     try std.testing.expect(!likeMatch("hello", "h_l"));
     try std.testing.expect(!likeMatch("paid", "pending%"));
+
+    // A `%` in the text is still just a character to a pattern's `%`.
+    try std.testing.expect(likeMatch("%%", "%"));
+    try std.testing.expect(likeMatch("50% off", "50%"));
+    try std.testing.expect(likeMatch("ab%c", "ab%"));
+    try std.testing.expect(likeMatch("a%b", "a%b"));
+    try std.testing.expect(!likeMatch("a%b", "a%c"));
 }
 
 test "constEval folds an expression over plan-time bindings" {
