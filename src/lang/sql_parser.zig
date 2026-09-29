@@ -104,37 +104,38 @@ fn eqlNoCase(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
 
-/// One registered FROM/JOIN alias: references `alias.x` are rewritten to `x`.
-const Alias = struct { name: []const u8 };
+const MAX_ALIASES = 32;
 
-const MAX_ALIASES = 8;
-
+/// The FROM/JOIN names of one query. A left alias is stripped from `alias.x`; a
+/// join's right alias is kept, since `b.x` may be a column the join renamed `x_r`;
+/// an unaliased join side only reserves its binding name.
+///
+/// Resolution happens here, at parse time, by name — so two tables sharing a name
+/// cannot be told apart later, and every `r.x` would silently go to the first `r`.
+/// A repeated name is refused where it is written instead.
 const AliasSet = struct {
+    const Kind = enum { left, right, reserved };
+
     names: [MAX_ALIASES][]const u8 = undefined,
-    right: [MAX_ALIASES]bool = @splat(false),
+    kinds: [MAX_ALIASES]Kind = undefined,
     n: usize = 0,
 
-    fn add(self: *AliasSet, name: []const u8) void {
-        if (self.n < MAX_ALIASES) {
-            self.names[self.n] = name;
-            self.n += 1;
-        }
-    }
-    /// A join's right-side alias: known, but its qualifier is kept on a column
-    /// reference, since `b.x` may be a column the join renamed `x_r`.
-    fn addRight(self: *AliasSet, name: []const u8) void {
-        if (self.n < MAX_ALIASES) self.right[self.n] = true;
-        self.add(name);
+    fn put(self: *AliasSet, name: []const u8, kind: Kind) error{ AliasTaken, TooManyAliases }!void {
+        for (self.names[0..self.n]) |a| if (std.mem.eql(u8, a, name)) return error.AliasTaken;
+        if (self.n == MAX_ALIASES) return error.TooManyAliases;
+        self.names[self.n] = name;
+        self.kinds[self.n] = kind;
+        self.n += 1;
     }
     fn strips(self: *const AliasSet, name: []const u8) bool {
-        for (self.names[0..self.n], self.right[0..self.n]) |a, r| {
-            if (std.mem.eql(u8, a, name)) return !r;
+        for (self.names[0..self.n], self.kinds[0..self.n]) |a, k| {
+            if (std.mem.eql(u8, a, name)) return k == .left;
         }
         return false;
     }
     fn has(self: *const AliasSet, name: []const u8) bool {
-        for (self.names[0..self.n]) |a| {
-            if (std.mem.eql(u8, a, name)) return true;
+        for (self.names[0..self.n], self.kinds[0..self.n]) |a, k| {
+            if (std.mem.eql(u8, a, name)) return k != .reserved;
         }
         return false;
     }
@@ -392,6 +393,19 @@ pub const Parser = struct {
     fn expectIdent(self: *Parser) Error![]const u8 {
         if (self.at(.ident) or self.at(.qident)) return self.advance().text;
         return self.fail(self.curPos(), "expected identifier, found {s}", .{self.curTag().describe()});
+    }
+
+    /// Where the token just consumed starts.
+    fn prevPos(self: *Parser) Pos {
+        const t = self.toks[if (self.i > 0) self.i - 1 else 0];
+        return .{ .line = t.line, .col = t.col };
+    }
+
+    fn claimAlias(self: *Parser, aliases: *AliasSet, name: []const u8, pos: Pos, kind: AliasSet.Kind) Error!void {
+        aliases.put(name, kind) catch |e| return switch (e) {
+            error.AliasTaken => self.fail(pos, "`{s}` names two tables in this FROM; give one of them a different alias", .{name}),
+            error.TooManyAliases => self.fail(pos, "more than {d} tables in one FROM", .{MAX_ALIASES}),
+        };
     }
 
     /// An identifier in either spelling. Not the same as `isKw`, which stays
@@ -1824,14 +1838,17 @@ pub const Parser = struct {
             }
             // `JOIN (SELECT ...) x ON ...` — the same lowering as a FROM-position
             // derived table, since a join's right side is named by binding anyway.
+            if (self.at(.string))
+                return self.fail(jpos, "JOIN right side must be a WITH-defined CTE or a `(SELECT ...)`, not a path; read it in one: `WITH b AS (SELECT * FROM '{s}')`", .{self.cur().text});
             const binding = if (self.at(.lparen)) try self.parseDerivedTable() else try self.expectIdent();
+            const bpos = self.prevPos();
             if (!self.isLet(binding))
                 return self.fail(jpos, "JOIN right side `{s}` must be a WITH-defined CTE", .{binding});
             var jalias: ?[]const u8 = null;
             if (self.at(.ident) and !isReservedAfterSource(self.cur().text)) {
                 jalias = self.advance().text;
-                aliases.addRight(jalias.?);
-            }
+                try self.claimAlias(&aliases, jalias.?, self.prevPos(), .right);
+            } else try self.claimAlias(&aliases, binding, bpos, .reserved);
             var left_keys = std.array_list.Managed(ast.QualName).init(self.arena);
             var right_keys = std.array_list.Managed(ast.QualName).init(self.arena);
             if (kind == .cross) {
@@ -2578,7 +2595,7 @@ pub const Parser = struct {
         var node: ast.Stage.Node = undefined;
         if (self.at(.lparen)) {
             const name = try self.parseDerivedTable();
-            aliases.add(name);
+            try self.claimAlias(aliases, name, self.prevPos(), .left);
             return .{ .ref = name };
         } else if (self.at(.string)) {
             node = .{ .read = .{ .connector = "csv", .form = .{ .path = self.advance().text } } };
@@ -2682,7 +2699,7 @@ pub const Parser = struct {
             }
         }
         if (self.at(.ident) and !isReservedAfterSource(self.cur().text)) {
-            aliases.add(self.advance().text);
+            try self.claimAlias(aliases, self.advance().text, self.prevPos(), .left);
         }
         return node;
     }
@@ -4021,6 +4038,38 @@ test "sql: CTE + LEFT JOIN with alias stripping" {
     const sel = pl.stages[2].node.select;
     try testing.expectEqualStrings("id", sel[0].field.parts[0]);
     try testing.expectEqual(@as(usize, 1), sel[0].field.parts.len);
+}
+
+test "sql: a name used for two tables in one FROM is refused where it repeats" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+
+    // Aliases resolve by name at parse time, so a second `r` sent every `r.x` to
+    // the first one, and the error named a column that exists — in the other `r`.
+    try testing.expectError(error.ParseFailed, parseSource(a,
+        \\SELECT r.b FROM (SELECT a FROM 'x.csv') r JOIN (SELECT b FROM 'y.csv') r ON r.a = r.b;
+    , &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "`r` names two tables") != null);
+    try testing.expectEqual(@as(u32, 72), diag.col);
+
+    try testing.expectError(error.ParseFailed, parseSource(a,
+        \\WITH p AS (SELECT a FROM 'x.csv') SELECT a FROM 'x.csv' p JOIN p ON a = a;
+    , &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "`p` names two tables") != null);
+
+    // An unaliased self-join has one name per side and keeps working.
+    _ = try parseTest(a, "WITH p AS (SELECT a FROM 'x.csv') SELECT a FROM p JOIN p ON a = a;");
+}
+
+test "sql: a path on a JOIN's right side says to read it in a CTE" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT * FROM 'x.csv' a JOIN 'y.csv' b ON a.id = b.id;", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "WITH b AS (SELECT * FROM 'y.csv')") != null);
 }
 
 test "sql: multi-key ON, RIGHT/FULL/CROSS join kinds, and the plain-column rule" {
