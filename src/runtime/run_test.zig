@@ -190,6 +190,50 @@ test "derived tables: an alias names its table only inside its own query" {
     }
 }
 
+test "union: plain UNION [ALL] lines branches up by position" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "t1.csv", .data = "k\n1\n2\n3\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "t2.csv", .data = "k,v\n2,x\n3,y\n4,z\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    // Written as BY NAME, differently named columns do not line up: `b` was
+    // dropped and its rows came back as NULLs under `a`.
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT k AS a FROM '$B/t1.csv' UNION ALL SELECT k AS b FROM '$B/t2.csv'", .want = "a\n1\n2\n3\n2\n3\n4\n" },
+        .{ .q = "SELECT k FROM '$B/t1.csv' UNION SELECT k FROM '$B/t2.csv' ORDER BY k", .want = "k\n1\n2\n3\n4\n" },
+        // Widened like BY NAME: an int column meeting a float one becomes float.
+        .{ .q = "SELECT k FROM '$B/t1.csv' WHERE k = 1 UNION ALL SELECT 2.5 AS x FROM '$B/t2.csv' WHERE k = 2", .want = "k\n1\n2.5\n" },
+        // Deduplication covers everything to the left of the last plain UNION only.
+        .{
+            .q = "SELECT k FROM '$B/t1.csv' UNION SELECT k FROM '$B/t2.csv' UNION ALL SELECT k FROM '$B/t1.csv' WHERE k = 1 ORDER BY k",
+            .want = "k\n1\n1\n2\n3\n4\n",
+        },
+    };
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+
+    // A branch with another column count is refused, not padded.
+    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT k FROM '{s}/t1.csv' UNION ALL SELECT k, v FROM '{s}/t2.csv';", .{ base, base, base });
+    defer alloc.free(script);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
+    try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "branch 2 has 2 columns") != null);
+}
+
 test "aggregate: two aggregates over different expressions stay separate" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

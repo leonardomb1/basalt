@@ -281,6 +281,10 @@ pub const Union = struct {
     /// live on `discover_conn` — inferred from the query's leading source, or
     /// named by a trailing `IN <conn>`.
     discover_pipeline: ?Pipeline = null,
+    /// Plain `UNION ALL`: branches line up by column position under the first
+    /// branch's names, and must have as many columns each — every branch is then
+    /// a general query, never a bare read reconciled by name.
+    positional: bool = false,
     pos: Pos,
 };
 

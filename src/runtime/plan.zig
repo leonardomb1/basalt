@@ -572,6 +572,41 @@ pub fn unionCanon(env: *Env, specs: []const UnionSpec, schemas: []const types.Sc
     return .{ .fields = canon };
 }
 
+/// A positional `UNION`: the first branch's names, each column widened across the
+/// branches the way the by-name canon is. Branches must agree on the column count,
+/// as in SQL — padding a short one would line every later column up wrong.
+fn positionalCanon(env: *Env, schemas: []const types.Schema) !types.Schema {
+    const canon = try dupeSchema(env.arena, schemas[0]);
+    const fields = @constCast(canon.fields);
+    for (schemas[1..], 2..) |sch, n| {
+        if (sch.fields.len != fields.len) return planErr(env.diag, try std.fmt.allocPrint(
+            env.arena,
+            "UNION: branch {d} has {d} columns and the first has {d}; a UNION lines columns up by position (`UNION ALL BY NAME` matches them by name)",
+            .{ n, sch.fields.len, fields.len },
+        ));
+        for (fields, sch.fields, 1..) |*f, of, col| {
+            f.ty = types.Type.unify(f.ty, of.ty) orelse return planErr(env.diag, try std.fmt.allocPrint(
+                env.arena,
+                "UNION: column {d} (`{s}`) is {s} in the first branch and {s} in branch {d}, with no common type",
+                .{ col, f.name, @tagName(f.ty.kind), @tagName(of.ty.kind), n },
+            ));
+        }
+    }
+    return canon;
+}
+
+/// Column `i` of `src`, cast to canon column `i`'s type under its name.
+fn positionalReconcile(arena: std.mem.Allocator, src: types.Schema, canon: types.Schema) ![]const ast.SelectItem {
+    const items = try arena.alloc(ast.SelectItem, canon.fields.len);
+    for (items, src.fields, canon.fields) |*it, sf, cf| {
+        const parts = try arena.alloc([]const u8, 1);
+        parts[0] = sf.name;
+        const e = try mk(arena, .{ .cast = .{ .e = try mk(arena, .{ .field = .{ .parts = parts } }), .ty = cf.ty } });
+        it.* = .{ .computed = .{ .name = cf.name, .expr = e } };
+    }
+    return items;
+}
+
 /// `schema` without the columns named in `except` (SQL sources are case-insensitive
 /// about names, so the match is too).
 fn dropExcept(arena: std.mem.Allocator, schema: types.Schema, except: []const []const u8) !types.Schema {
@@ -609,8 +644,11 @@ pub fn unionExceptNames(after: []const ast.Stage) []const []const u8 {
     return &.{};
 }
 
-fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, except: []const []const u8) anyerror!PipeRes {
+fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, except_names: []const []const u8) anyerror!PipeRes {
     const arena = env.arena;
+    // By position, dropping a name from every branch would shift the columns after
+    // it; the EXCEPT downstream removes it from the result instead.
+    const except: []const []const u8 = if (u.positional) &.{} else except_names;
     const tag_col = forHintIdent(hints, "tag");
     const canon_opt = forHintIdent(hints, "canon");
     const specs = try unionSpecs(env, u, hints);
@@ -643,11 +681,17 @@ fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, except: []const 
         children[i] = .{ .scan = scan };
         schemas[i] = src.schema();
     }
-    const canon = try dupeSchema(arena, try unionCanon(env, specs, schemas, canon_opt, except));
+    const canon = if (u.positional)
+        try positionalCanon(env, schemas)
+    else
+        try dupeSchema(arena, try unionCanon(env, specs, schemas, canon_opt, except));
 
     var out_schema: types.Schema = undefined;
     for (specs, 0..) |s, i| {
-        const items = try synthReconcile(arena, schemas[i], canon, tag_col, s.tag);
+        const items = if (u.positional)
+            try positionalReconcile(arena, schemas[i], canon)
+        else
+            try synthReconcile(arena, schemas[i], canon, tag_col, s.tag);
         const proj = try buildProject(env, items, schemas[i], children[i]);
         children[i] = proj.op;
         out_schema = proj.schema;

@@ -249,7 +249,7 @@ fn renderUnion(arena: std.mem.Allocator, u: ast.Union, lr: LoopRow) anyerror!ast
             .tag = if (b.tag) |t| try interpAll(arena, t, lr) else null,
             .pipeline = if (b.pipeline) |p| try renderPipeline(arena, p, lr) else null,
         };
-        return .{ .branches = branches, .discover_conn = u.discover_conn, .discover_query = u.discover_query, .discover_json = u.discover_json, .discover_pipeline = u.discover_pipeline, .pos = u.pos };
+        return .{ .branches = branches, .discover_conn = u.discover_conn, .discover_query = u.discover_query, .discover_json = u.discover_json, .discover_pipeline = u.discover_pipeline, .positional = u.positional, .pos = u.pos };
     }
     return .{
         .branches = u.branches,

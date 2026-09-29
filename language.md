@@ -14,7 +14,7 @@ Basalt SQL is the only dialect: the BSL (`.bsl`) parser was removed in v0.2.0 �
 3. [Connections](#3-connections)
 4. [Sink — `LOAD INTO`](#4-sink--load-into)
 5. [Queries](#5-queries)
-6. [`UNION ALL BY NAME`](#6-union-all-by-name--reconciliation-by-name)
+6. [`UNION` and `UNION ALL BY NAME`](#6-union-and-union-all-by-name)
 7. [`FOR EACH ROW OF` and the `CASE` statement](#7-for-each-row-of-and-the-case-statement)
 8. [HTTP mode](#8-http-mode)
 9. [Expressions](#9-expressions)
@@ -811,17 +811,33 @@ GROUP BY DATE_TRUNC('minute', EventTime);          -- binds to m
   carried through the projection as a hidden column and dropped after the
   `LIMIT`, so sorting by an unselected column costs nothing in the output.
 
-## 6. `UNION ALL BY NAME` — reconciliation by name
+## 6. `UNION` and `UNION ALL BY NAME`
 
-A branch may be **any query** — a file, a filter, a projection, an aggregate — not
-only `SELECT ['tag' AS c,] t.* FROM <conn>.<table>`. That shape is the reconciliation
+`UNION ALL` is SQL's: branches line up **by position**, under the first branch's
+column names, and must have the same number of columns. Types widen per column
+(an int meeting a float is a float); a pair with no common type is an error.
+`UNION` without `ALL` also removes duplicate rows — from everything to its left, so
+`a UNION b UNION ALL c` deduplicates `a ∪ b` and then appends `c`.
+
+```sql
+SELECT id, amount FROM 'eu.csv'
+UNION ALL
+SELECT id, total FROM 'us.csv'      -- `total` lands under `amount`
+ORDER BY id;
+```
+
+`BY NAME` lines branches up by column name instead, and is what reconciling N
+similar tables needs. A chain is one or the other. `EXCEPT` and `INTERSECT` are not
+supported.
+
+A `BY NAME` branch may be **any query** — a file, a filter, a projection, an
+aggregate — not only `SELECT ['tag' AS c,] t.* FROM <conn>.<table>`. That shape is the reconciliation
 case the feature was built for (N similar tables aligned by name) and it still gets the
 `tag` column and table discovery; a general branch is built like any other pipeline and
 reconciled the same way.
 
 Alignment is **by column name**: NULL-fill missing, drop extra, cast type
-differences. (ANSI `UNION ALL` is positional — this is the DuckDB
-`UNION ALL BY NAME`.)
+differences — DuckDB's `UNION ALL BY NAME`. `UNION BY NAME` also deduplicates.
 
 ```sql
 -- explicit branches: the tag is just a literal column
@@ -830,8 +846,6 @@ UNION ALL BY NAME
 SELECT '02' AS CT2_EMPRESA, t.* FROM erp.dbo.CT2020 t
 ANCHOR SCHEMA erp.dbo.CT2010;          -- schema authority (optional)
 ```
-
-Each branch must be exactly `SELECT ['lit' AS col,] t.* FROM <conn>.<table>`.
 
 ```sql
 -- discovered: one branch per row of a raw 2-column query (table, tag)

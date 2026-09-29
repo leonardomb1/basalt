@@ -12,7 +12,7 @@
 //!   WITH name AS (...)              -> Let binding (+ ref stage when sourced)
 //!   FROM conn.tbl PUSHDOWN($$..$$)  -> read stage with a `where` hint
 //!   WHERE / GROUP BY / ORDER BY ... -> filter / aggregate / sort / limit stages
-//!   UNION ALL BY NAME + ANCHOR      -> union_ stage (tag col = literal-as-alias)
+//!   UNION [ALL] [BY NAME] + ANCHOR  -> union_ stage (+ distinct; tag col = literal-as-alias)
 //!   FOR EACH ROW OF (...) AS (...)  -> ForEach (PARALLEL / ON ERROR -> hints)
 //!   CASE ... THEN <stmts> END CASE  -> StmtMatch (plan-time dispatch)
 
@@ -144,13 +144,13 @@ const AliasSet = struct {
 /// Words that terminate an alias-free position (so `FROM t WHERE ...` doesn't
 /// read WHERE as an alias).
 const reserved_after_source = [_][]const u8{
-    "where",   "group",    "order",   "limit",  "union", "anchor", "join",
-    "inner",   "left",     "right",   "full",   "cross", "semi",   "anti",
-    "on",      "pushdown", "with",    "as",     "end",   "when",   "then",
-    "else",    "case",     "select",  "from",   "load",  "for",    "using",
-    "upsert",  "append",   "replace", "split",  "jobs",  "offset", "paginate",
-    "retry",   "create",   "param",   "having", "and",   "or",     "not",
-    "explain", "costs",    "analyze",
+    "where",   "group",    "order",   "limit",  "union",     "anchor", "join",
+    "inner",   "left",     "right",   "full",   "cross",     "semi",   "anti",
+    "on",      "pushdown", "with",    "as",     "end",       "when",   "then",
+    "else",    "case",     "select",  "from",   "load",      "for",    "using",
+    "upsert",  "append",   "replace", "split",  "jobs",      "offset", "paginate",
+    "retry",   "create",   "param",   "having", "and",       "or",     "not",
+    "explain", "costs",    "analyze", "except", "intersect",
 };
 
 fn isReservedAfterSource(name: []const u8) bool {
@@ -1486,7 +1486,7 @@ pub const Parser = struct {
         _ = try self.expect(.rparen);
     }
 
-    /// Parse `[WITH ctes] core [UNION ALL BY NAME core]* [ANCHOR SCHEMA q]
+    /// Parse `[WITH ctes] core [UNION [ALL] [BY NAME] core]* [ANCHOR SCHEMA q]
     /// [ORDER BY ...] [LIMIT n [OFFSET m]]`, appending Let stmts for CTEs to
     /// `out` and pipeline stages to `stages`.
     fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages: *std.array_list.Managed(ast.Stage)) Error!void {
@@ -1520,6 +1520,8 @@ pub const Parser = struct {
 
         const first = try self.parseSelectCore();
 
+        if (self.isKw("except") or self.isKw("intersect"))
+            return self.fail(self.curPos(), "`{s}` is not supported; basalt has `UNION [ALL]` and `UNION [ALL] BY NAME`", .{self.cur().text});
         if (self.isKw("union")) {
             try self.parseUnionTail(first, stages);
         } else {
@@ -2225,17 +2227,17 @@ pub const Parser = struct {
         return .{ .stages = try stages.toOwnedSlice(), .aliases = aliases, .union_branch = union_branch, .expr_aliases = try expr_aliases.toOwnedSlice() };
     }
 
-    /// A `UNION ALL BY NAME` arm that is not a bare source: lower the whole core to a
-    /// binding and hand back a branch that reads it. The union operator aligns arms by
-    /// column name off their schemas, so it does not care whether an arm is a table or
-    /// a query — only the parser used to.
-    fn unionBranchFromCore(self: *Parser, core: Core) Error!ast.UnionBranch {
+    /// A union arm that is not a bare source: lower its stages to a binding and hand
+    /// back a branch that reads it. The union operator aligns arms off their schemas,
+    /// so it does not care whether an arm is a table or a query — only the parser
+    /// used to.
+    fn unionBranchFromStages(self: *Parser, branch_stages: []const ast.Stage) Error!ast.UnionBranch {
         self.derived_n += 1;
         const name = try std.fmt.allocPrint(self.arena, "__union{d}", .{self.derived_n});
         try self.let_names.append(name);
         try self.pending_bindings.append(.{ .binding = .{
             .name = name,
-            .pipeline = .{ .stages = core.stages, .pos = self.curPos() },
+            .pipeline = .{ .stages = branch_stages, .pos = self.curPos() },
             .pos = self.curPos(),
         } });
         const ref = try self.arena.alloc(ast.Stage, 1);
@@ -2247,47 +2249,95 @@ pub const Parser = struct {
         };
     }
 
-    /// `UNION ALL BY NAME core... [ANCHOR SCHEMA qual]` — collapse the first core
-    /// and every following core into one union_ stage.
+    /// `core (UNION [ALL | DISTINCT] [BY NAME] core)... [ANCHOR SCHEMA qual]` —
+    /// collapse the cores into one union_ stage.
+    ///
+    /// Plain `UNION` lines branches up by position, `BY NAME` by column name; a chain
+    /// is one or the other. A `UNION` without `ALL` removes duplicate rows from
+    /// everything to its left, as in SQL: the prefix up to the last one is unioned
+    /// and deduplicated, and any `UNION ALL` after it appends to that.
     fn parseUnionTail(self: *Parser, first: Core, stages: *std.array_list.Managed(ast.Stage)) Error!void {
         const pos = self.curPos();
+        var cores = std.array_list.Managed(Core).init(self.arena);
+        try cores.append(first);
+        var by_name: ?bool = null;
+        var last_distinct: usize = 0;
+
+        while (self.isKw("union")) {
+            const opos = self.curPos();
+            _ = self.advance();
+            const all = self.eatKw("all");
+            if (!all) _ = self.eatKw("distinct");
+            var named = false;
+            if (self.eatKw("by")) {
+                try self.expectKw("name");
+                named = true;
+            }
+            if (by_name) |b| if (b != named)
+                return self.fail(opos, "a chain of UNIONs lines its branches up one way: all `BY NAME` or all by position", .{});
+            by_name = named;
+            try cores.append(try self.parseSelectCore());
+            if (!all) last_distinct = cores.items.len - 1;
+        }
+        if (self.isKw("except") or self.isKw("intersect"))
+            return self.fail(self.curPos(), "`{s}` is not supported; basalt has `UNION [ALL]` and `UNION [ALL] BY NAME`", .{self.cur().text});
+
+        const positional = !by_name.?;
+        const cs = cores.items;
+        if (positional) {
+            if (self.isKw("anchor") or self.isKw("pushdown"))
+                return self.fail(self.curPos(), "`{s}` applies to `UNION ALL BY NAME`; a plain UNION lines branches up by position", .{self.cur().text});
+            if (last_distinct == 0) return self.appendUnion(cs, false, true, stages, pos);
+            if (last_distinct == cs.len - 1) return self.appendUnion(cs, true, true, stages, pos);
+            // `a UNION b UNION ALL c`: deduplicate a ∪ b, then append c.
+            var prefix = std.array_list.Managed(ast.Stage).init(self.arena);
+            try self.appendUnion(cs[0 .. last_distinct + 1], true, true, &prefix, pos);
+            var branches = std.array_list.Managed(ast.UnionBranch).init(self.arena);
+            try branches.append(try self.unionBranchFromStages(try prefix.toOwnedSlice()));
+            for (cs[last_distinct + 1 ..]) |c| try branches.append(try self.unionBranchFromStages(c.stages));
+            try stages.append(.{
+                .node = .{ .union_ = .{ .branches = try branches.toOwnedSlice(), .positional = true, .pos = pos } },
+                .hints = &.{},
+                .pos = pos,
+            });
+            return;
+        }
+        if (last_distinct != 0 and last_distinct != cs.len - 1)
+            return self.fail(pos, "`UNION BY NAME` followed by `UNION ALL BY NAME` is not supported; deduplicate the first part in a CTE", .{});
+        return self.appendUnion(cs, last_distinct != 0, false, stages, pos);
+    }
+
+    /// One union_ stage over `cores`, then a whole-row DISTINCT when `distinct`.
+    fn appendUnion(self: *Parser, cores: []const Core, distinct: bool, positional: bool, stages: *std.array_list.Managed(ast.Stage), pos: Pos) Error!void {
         var branches = std.array_list.Managed(ast.UnionBranch).init(self.arena);
         var tag_col: ?[]const u8 = null;
-
-        if (first.union_branch) |fb| {
-            try branches.append(.{ .read = fb.read, .tag = fb.tag });
-            tag_col = fb.tag_col;
-        } else {
-            try branches.append(try self.unionBranchFromCore(first));
-        }
-
-        while (self.eatKw("union")) {
-            try self.expectKw("all");
-            try self.expectKw("by");
-            try self.expectKw("name");
-            const core = try self.parseSelectCore();
-            if (core.union_branch) |b| {
-                if (b.tag_col) |tc| {
+        for (cores) |core| {
+            // A positional branch is always a general query: its tag literal is a
+            // column like any other, not a by-name reconciliation tag.
+            const b = if (positional) null else core.union_branch;
+            if (b) |fb| {
+                if (fb.tag_col) |tc| {
                     if (tag_col == null) tag_col = tc;
                     if (!std.mem.eql(u8, tag_col.?, tc))
                         return self.fail(self.curPos(), "all UNION branches must use the same tag column name (`{s}` vs `{s}`)", .{ tag_col.?, tc });
                 }
-                try branches.append(.{ .read = b.read, .tag = b.tag });
+                try branches.append(.{ .read = fb.read, .tag = fb.tag });
             } else {
-                try branches.append(try self.unionBranchFromCore(core));
+                try branches.append(try self.unionBranchFromStages(core.stages));
             }
         }
 
         var hints = std.array_list.Managed(ast.Hint).init(self.arena);
         if (tag_col) |tc|
             try hints.append(.{ .key = "tag", .value = .{ .ident = tc }, .pos = pos });
-        try self.parseUnionClauses(&hints, pos);
+        if (!positional) try self.parseUnionClauses(&hints, pos);
 
         try stages.append(.{
-            .node = .{ .union_ = .{ .branches = try branches.toOwnedSlice(), .pos = pos } },
+            .node = .{ .union_ = .{ .branches = try branches.toOwnedSlice(), .positional = positional, .pos = pos } },
             .hints = try hints.toOwnedSlice(),
             .pos = pos,
         });
+        if (distinct) try stages.append(.{ .node = .{ .distinct = .{ .on = null } }, .hints = &.{}, .pos = pos });
     }
 
     /// A FROM source: CSV path, IDENTIFIER(<expr>) for a computed path,
@@ -4155,6 +4205,37 @@ test "sql: multi-key ON, RIGHT/FULL/CROSS join kinds, and the plain-column rule"
         \\SELECT * FROM 'in.csv' t JOIN r;
     , &diag));
     try testing.expect(std.mem.indexOf(u8, diag.msg, "expected `ON") != null);
+}
+
+test "sql: plain UNION [ALL] lines up by position; EXCEPT and INTERSECT say they are missing" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // Every positional branch is a general query — a bound pipeline — and a plain
+    // UNION deduplicates with a whole-row DISTINCT after the union.
+    const all = try parseTest(a, "SELECT k FROM 'x.csv' UNION ALL SELECT k FROM 'y.csv';");
+    const ua = all.stmts[all.stmts.len - 1].output.stages;
+    try testing.expect(ua[0].node.union_.positional);
+    try testing.expect(ua[0].node.union_.branches[0].pipeline != null);
+    try testing.expect(ua[1].node != .distinct);
+
+    const dis = try parseTest(a, "SELECT k FROM 'x.csv' UNION SELECT k FROM 'y.csv';");
+    const ud = dis.stmts[dis.stmts.len - 1].output.stages;
+    try testing.expect(ud[1].node == .distinct);
+
+    // `a UNION b UNION ALL c`: a ∪ b is deduplicated first, and c appended to it.
+    const mixed = try parseTest(a, "SELECT k FROM 'x.csv' UNION SELECT k FROM 'y.csv' UNION ALL SELECT k FROM 'z.csv';");
+    const um = mixed.stmts[mixed.stmts.len - 1].output.stages;
+    try testing.expectEqual(@as(usize, 2), um[0].node.union_.branches.len);
+    try testing.expect(um[1].node != .distinct);
+
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'x.csv' EXCEPT SELECT k FROM 'y.csv';", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "`EXCEPT` is not supported") != null);
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'x.csv' UNION ALL BY NAME SELECT k FROM 'y.csv' UNION ALL SELECT k FROM 'z.csv';", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "all `BY NAME` or all by position") != null);
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'x.csv' UNION ALL SELECT k FROM 'y.csv' ANCHOR SCHEMA first;", &diag));
 }
 
 test "sql: UNION ALL BY NAME with tag literal and anchor" {
