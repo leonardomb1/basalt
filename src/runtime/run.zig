@@ -548,8 +548,11 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         stages = new_stages;
     }
 
+    // Split lanes re-read each branch's source by key range, so an arm that is a
+    // query rather than a table read has nothing to split; the serial union builds it.
     if (stages[0].node == .union_ and opts.threads > 1 and
         !std.mem.eql(u8, last.write.connector, "csv") and
+        unionBranchesAreReads(stages[0].node.union_) and
         unionDownstreamMapOnly(stages[1 .. stages.len - 1]))
     {
         delegated.* = true;
@@ -843,6 +846,11 @@ fn explainNode(arena: std.mem.Allocator, node: op.Op, buf: *std.array_list.Manag
         st.calls,
     });
     for (kids.items) |k| try explainNode(arena, k, buf, depth + 1);
+}
+
+fn unionBranchesAreReads(u: ast.Union) bool {
+    for (u.branches) |b| if (b.pipeline != null) return false;
+    return true;
 }
 
 /// Split-parallel union: expand each branch into a `read | select(reconcile) |

@@ -1263,6 +1263,17 @@ assert (e["line"], e["col"], e["end_line"], e["end_col"]) == (2, 14, 2, 18), e
   else
     report "stdout: an unknown --format is refused" bad
   fi
+
+  # The split-parallel union re-reads each branch's table by key range; a branch that
+  # is a query has none, and at -j > 1 it opened an empty path instead.
+  printf 'k\n1\n2\n' >"$out/ua.csv"; printf 'k\n3\n' >"$out/ub.csv"
+  if $B run -q -j 4 --format csv -c "SELECT k FROM '$out/ua.csv' WHERE k > 1 UNION ALL BY NAME SELECT k FROM '$out/ub.csv';" >"$out/uq.csv" 2>"$out/uq.log" &&
+     [ "$(tr -d '\r' <"$out/uq.csv" | paste -sd' ')" = "k 2 3" ]; then
+    report "stdout: a union of queries runs at -j 4" ok
+  else
+    report "stdout: a union of queries runs at -j 4" bad
+    cat "$out/uq.log" "$out/uq.csv"
+  fi
 fi
 
 # `basalt kernel`: the session protocol a notebook drives. The driver speaks it
