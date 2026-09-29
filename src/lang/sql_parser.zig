@@ -1520,9 +1520,7 @@ pub const Parser = struct {
 
         const first = try self.parseSelectCore();
 
-        if (self.isKw("except") or self.isKw("intersect"))
-            return self.fail(self.curPos(), "`{s}` is not supported; basalt has `UNION [ALL]` and `UNION [ALL] BY NAME`", .{self.cur().text});
-        if (self.isKw("union")) {
+        if (self.isKw("union") or self.isKw("intersect") or self.isKw("except")) {
             try self.parseUnionTail(first, stages);
         } else {
             try stages.appendSlice(first.stages);
@@ -2261,10 +2259,10 @@ pub const Parser = struct {
         const pos = self.curPos();
         var cores = std.array_list.Managed(Core).init(self.arena);
         try cores.append(first);
-        var by_name: ?bool = null;
-        var last_distinct: usize = 0;
+        var ops = std.array_list.Managed(SetOpTok).init(self.arena);
 
-        while (self.isKw("union")) {
+        while (true) {
+            const kind: SetOpTok.Kind = if (self.isKw("union")) .union_ else if (self.isKw("intersect")) .intersect else if (self.isKw("except")) .except else break;
             const opos = self.curPos();
             _ = self.advance();
             const all = self.eatKw("all");
@@ -2274,18 +2272,22 @@ pub const Parser = struct {
                 try self.expectKw("name");
                 named = true;
             }
-            if (by_name) |b| if (b != named)
-                return self.fail(opos, "a chain of UNIONs lines its branches up one way: all `BY NAME` or all by position", .{});
-            by_name = named;
+            try ops.append(.{ .kind = kind, .all = all, .named = named, .pos = opos });
             try cores.append(try self.parseSelectCore());
-            if (!all) last_distinct = cores.items.len - 1;
         }
-        if (self.isKw("except") or self.isKw("intersect"))
-            return self.fail(self.curPos(), "`{s}` is not supported; basalt has `UNION [ALL]` and `UNION [ALL] BY NAME`", .{self.cur().text});
 
-        const positional = !by_name.?;
+        for (ops.items) |o| if (o.kind != .union_) return self.parseSetOps(cores.items, ops.items, stages, pos);
+
+        const by_name = ops.items[0].named;
+        var last_distinct: usize = 0;
+        for (ops.items, 1..) |o, i| {
+            if (o.named != by_name)
+                return self.fail(o.pos, "a chain of UNIONs lines its branches up one way: all `BY NAME` or all by position", .{});
+            if (!o.all) last_distinct = i;
+        }
+
         const cs = cores.items;
-        if (positional) {
+        if (!by_name) {
             if (self.isKw("anchor") or self.isKw("pushdown"))
                 return self.fail(self.curPos(), "`{s}` applies to `UNION ALL BY NAME`; a plain UNION lines branches up by position", .{self.cur().text});
             if (last_distinct == 0) return self.appendUnion(cs, false, true, stages, pos);
@@ -2306,6 +2308,64 @@ pub const Parser = struct {
         if (last_distinct != 0 and last_distinct != cs.len - 1)
             return self.fail(pos, "`UNION BY NAME` followed by `UNION ALL BY NAME` is not supported; deduplicate the first part in a CTE", .{});
         return self.appendUnion(cs, last_distinct != 0, false, stages, pos);
+    }
+
+    const SetOpTok = struct {
+        const Kind = enum { union_, intersect, except };
+        kind: Kind,
+        all: bool,
+        named: bool,
+        pos: Pos,
+    };
+
+    /// A chain holding `INTERSECT` or `EXCEPT`, all by position. `INTERSECT` binds
+    /// tighter than `UNION` and `EXCEPT`, which then apply left to right — SQL's
+    /// precedence, so `a UNION b INTERSECT c` is `a UNION (b INTERSECT c)`. Each step
+    /// lowers to a two-branch union_ whose result the next step reads as a branch.
+    fn parseSetOps(self: *Parser, cores: []const Core, ops: []const SetOpTok, stages: *std.array_list.Managed(ast.Stage), pos: Pos) Error!void {
+        for (ops) |o| {
+            if (o.named)
+                return self.fail(o.pos, "`BY NAME` applies to a chain of UNIONs only; INTERSECT and EXCEPT line columns up by position", .{});
+            if (o.all and o.kind != .union_) {
+                const kw = if (o.kind == .intersect) "INTERSECT" else "EXCEPT";
+                return self.fail(o.pos, "`{s} ALL` is not supported yet; `{s}` removes duplicates", .{ kw, kw });
+            }
+        }
+        if (self.isKw("anchor") or self.isKw("pushdown"))
+            return self.fail(self.curPos(), "`{s}` applies to `UNION ALL BY NAME`", .{self.cur().text});
+
+        var terms = std.array_list.Managed([]const ast.Stage).init(self.arena);
+        var joins = std.array_list.Managed(SetOpTok).init(self.arena);
+        try terms.append(cores[0].stages);
+        for (ops, cores[1..]) |o, c| {
+            if (o.kind == .intersect) {
+                const last = &terms.items[terms.items.len - 1];
+                last.* = try self.setOpStages(last.*, c.stages, .intersect, false, pos);
+            } else {
+                try joins.append(o);
+                try terms.append(c.stages);
+            }
+        }
+        var acc = terms.items[0];
+        for (joins.items, terms.items[1..]) |o, t| {
+            acc = if (o.kind == .except)
+                try self.setOpStages(acc, t, .except, false, pos)
+            else
+                try self.setOpStages(acc, t, .union_all, !o.all, pos);
+        }
+        try stages.appendSlice(acc);
+    }
+
+    /// `left <op> right` as a two-branch positional union_ stage, plus a DISTINCT for
+    /// a plain UNION; intersect/except deduplicate on their own.
+    fn setOpStages(self: *Parser, left: []const ast.Stage, right: []const ast.Stage, set: ast.SetOp, distinct: bool, pos: Pos) Error![]const ast.Stage {
+        const branches = try self.arena.alloc(ast.UnionBranch, 2);
+        branches[0] = try self.unionBranchFromStages(left);
+        branches[1] = try self.unionBranchFromStages(right);
+        var out = std.array_list.Managed(ast.Stage).init(self.arena);
+        try out.append(.{ .node = .{ .union_ = .{ .branches = branches, .positional = true, .set = set, .pos = pos } }, .hints = &.{}, .pos = pos });
+        if (distinct) try out.append(.{ .node = .{ .distinct = .{ .on = null } }, .hints = &.{}, .pos = pos });
+        return out.toOwnedSlice();
     }
 
     /// One union_ stage over `cores`, then a whole-row DISTINCT when `distinct`.
@@ -4208,7 +4268,7 @@ test "sql: multi-key ON, RIGHT/FULL/CROSS join kinds, and the plain-column rule"
     try testing.expect(std.mem.indexOf(u8, diag.msg, "expected `ON") != null);
 }
 
-test "sql: plain UNION [ALL] lines up by position; EXCEPT and INTERSECT say they are missing" {
+test "sql: plain UNION [ALL] lines up by position; INTERSECT binds tighter than UNION and EXCEPT" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -4231,9 +4291,23 @@ test "sql: plain UNION [ALL] lines up by position; EXCEPT and INTERSECT say they
     try testing.expectEqual(@as(usize, 2), um[0].node.union_.branches.len);
     try testing.expect(um[1].node != .distinct);
 
+    // `a UNION b INTERSECT c` is `a UNION (b INTERSECT c)`: the outer step is the
+    // union, and its right branch reads the intersect.
+    const prec = try parseTest(a, "SELECT k FROM 'x.csv' UNION SELECT k FROM 'y.csv' INTERSECT SELECT k FROM 'z.csv';");
+    const up = prec.stmts[prec.stmts.len - 1].output.stages;
+    try testing.expectEqual(ast.SetOp.union_all, up[0].node.union_.set);
+    try testing.expect(up[1].node == .distinct);
+    const inner = up[0].node.union_.branches[1].pipeline.?.stages[0].node.ref;
+    const right = for (prec.stmts) |st| {
+        if (st == .binding and std.mem.eql(u8, st.binding.name, inner)) break st.binding.pipeline.stages;
+    } else return error.TestUnexpectedResult;
+    try testing.expectEqual(ast.SetOp.intersect, right[0].node.union_.set);
+
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'x.csv' EXCEPT SELECT k FROM 'y.csv';", &diag));
-    try testing.expect(std.mem.indexOf(u8, diag.msg, "`EXCEPT` is not supported") != null);
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'x.csv' EXCEPT ALL SELECT k FROM 'y.csv';", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "`EXCEPT ALL` is not supported yet") != null);
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'x.csv' INTERSECT BY NAME SELECT k FROM 'y.csv';", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "`BY NAME` applies to a chain of UNIONs only") != null);
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'x.csv' UNION ALL BY NAME SELECT k FROM 'y.csv' UNION ALL SELECT k FROM 'z.csv';", &diag));
     try testing.expect(std.mem.indexOf(u8, diag.msg, "all `BY NAME` or all by position") != null);
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'x.csv' UNION ALL SELECT k FROM 'y.csv' ANCHOR SCHEMA first;", &diag));

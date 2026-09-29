@@ -263,6 +263,42 @@ test "NOT IN (SELECT ...): a NULL in the subquery keeps no row, a NULL probe sur
     }
 }
 
+test "INTERSECT / EXCEPT: NULLs compare equal, results are deduplicated, INTERSECT binds tighter" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "s1.csv", .data = "k,v\n1,a\n,b\n,b\n2,\n2,\n4,d\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "s2.csv", .data = "k,v\n,b\n2,\n3,c\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "s3.csv", .data = "k,v\n4,d\n9,z\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    // A semi/anti join on every column would get these wrong: join keys never match
+    // a NULL, set operations treat two NULLs as the same value. Verified against
+    // DuckDB; ORDER BY only makes the comparison stable.
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT k, v FROM '$B/s1.csv' INTERSECT SELECT k, v FROM '$B/s2.csv' ORDER BY k", .want = "k,v\n2,\n,b\n" },
+        .{ .q = "SELECT k, v FROM '$B/s1.csv' EXCEPT SELECT k, v FROM '$B/s2.csv' ORDER BY k", .want = "k,v\n1,a\n4,d\n" },
+        .{
+            .q = "SELECT k, v FROM '$B/s2.csv' UNION SELECT k, v FROM '$B/s1.csv' INTERSECT SELECT k, v FROM '$B/s3.csv' ORDER BY k",
+            .want = "k,v\n2,\n3,c\n4,d\n,b\n",
+        },
+        .{
+            .q = "SELECT k, v FROM '$B/s1.csv' EXCEPT SELECT k, v FROM '$B/s2.csv' EXCEPT SELECT k, v FROM '$B/s3.csv'",
+            .want = "k,v\n1,a\n",
+        },
+    };
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+}
+
 test "aggregate: two aggregates over different expressions stay separate" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

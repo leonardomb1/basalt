@@ -14,7 +14,7 @@ Basalt SQL is the only dialect: the BSL (`.bsl`) parser was removed in v0.2.0 �
 3. [Connections](#3-connections)
 4. [Sink — `LOAD INTO`](#4-sink--load-into)
 5. [Queries](#5-queries)
-6. [`UNION` and `UNION ALL BY NAME`](#6-union-and-union-all-by-name)
+6. [`UNION`, `INTERSECT`, `EXCEPT` and `UNION ALL BY NAME`](#6-union-intersect-except-and-union-all-by-name)
 7. [`FOR EACH ROW OF` and the `CASE` statement](#7-for-each-row-of-and-the-case-statement)
 8. [HTTP mode](#8-http-mode)
 9. [Expressions](#9-expressions)
@@ -811,7 +811,7 @@ GROUP BY DATE_TRUNC('minute', EventTime);          -- binds to m
   carried through the projection as a hidden column and dropped after the
   `LIMIT`, so sorting by an unselected column costs nothing in the output.
 
-## 6. `UNION` and `UNION ALL BY NAME`
+## 6. `UNION`, `INTERSECT`, `EXCEPT` and `UNION ALL BY NAME`
 
 `UNION ALL` is SQL's: branches line up **by position**, under the first branch's
 column names, and must have the same number of columns. Types widen per column
@@ -826,9 +826,14 @@ SELECT id, total FROM 'us.csv'      -- `total` lands under `amount`
 ORDER BY id;
 ```
 
+`INTERSECT` keeps the rows found in both branches, `EXCEPT` those of the first
+found nowhere in the second; both line columns up by position and remove
+duplicates. Two NULLs count as the same value there, unlike in a join's `ON`.
+`INTERSECT` binds tighter than `UNION` and `EXCEPT` (`a UNION b INTERSECT c` is
+`a UNION (b INTERSECT c)`). `INTERSECT ALL` and `EXCEPT ALL` are not supported.
+
 `BY NAME` lines branches up by column name instead, and is what reconciling N
-similar tables needs. A chain is one or the other. `EXCEPT` and `INTERSECT` are not
-supported.
+similar tables needs. It applies to `UNION` only, and a chain is one or the other.
 
 A `BY NAME` branch may be **any query** — a file, a filter, a projection, an
 aggregate — not only `SELECT ['tag' AS c,] t.* FROM <conn>.<table>`. That shape is the reconciliation

@@ -1043,7 +1043,11 @@ const Ctx = struct {
                 const detail = if (un.discover_query.len > 0 or un.discover_pipeline != null)
                     try std.fmt.allocPrint(self.arena, "union (tables discovered from {s})", .{un.discover_conn})
                 else
-                    try std.fmt.allocPrint(self.arena, "union of {d} sources", .{un.branches.len});
+                    try std.fmt.allocPrint(self.arena, "{s} of {d} sources", .{ switch (un.set) {
+                        .union_all => "union",
+                        .intersect => "intersect",
+                        .except => "except",
+                    }, un.branches.len });
                 return .{ .connector = "union", .detail = detail, .schema = null };
             },
             else => return fail(self.diag, "a pipeline must start with `read`, `union`, or a binding reference", .{}),

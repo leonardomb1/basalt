@@ -289,8 +289,14 @@ pub const Union = struct {
     /// branch's names, and must have as many columns each — every branch is then
     /// a general query, never a bare read reconciled by name.
     positional: bool = false,
+    /// `INTERSECT` / `EXCEPT`: two positional branches, deduplicated, keeping the
+    /// rows found in both / in the first only. NULLs compare equal, as in SQL's
+    /// set operations — unlike a join's keys.
+    set: SetOp = .union_all,
     pos: Pos,
 };
+
+pub const SetOp = enum { union_all, intersect, except };
 
 pub const Stage = struct {
     node: Node,

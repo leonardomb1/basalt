@@ -575,24 +575,34 @@ pub fn unionCanon(env: *Env, specs: []const UnionSpec, schemas: []const types.Sc
 /// A positional `UNION`: the first branch's names, each column widened across the
 /// branches the way the by-name canon is. Branches must agree on the column count,
 /// as in SQL — padding a short one would line every later column up wrong.
-fn positionalCanon(env: *Env, schemas: []const types.Schema) !types.Schema {
+fn positionalCanon(env: *Env, schemas: []const types.Schema, set: ast.SetOp) !types.Schema {
+    const op_name = setOpName(set);
+    const hint: []const u8 = if (set == .union_all) " (`UNION ALL BY NAME` matches them by name)" else "";
     const canon = try dupeSchema(env.arena, schemas[0]);
     const fields = @constCast(canon.fields);
     for (schemas[1..], 2..) |sch, n| {
         if (sch.fields.len != fields.len) return planErr(env.diag, try std.fmt.allocPrint(
             env.arena,
-            "UNION: branch {d} has {d} columns and the first has {d}; a UNION lines columns up by position (`UNION ALL BY NAME` matches them by name)",
-            .{ n, sch.fields.len, fields.len },
+            "{s}: branch {d} has {d} columns and the first has {d}; {s} lines columns up by position{s}",
+            .{ op_name, n, sch.fields.len, fields.len, op_name, hint },
         ));
         for (fields, sch.fields, 1..) |*f, of, col| {
             f.ty = types.Type.unify(f.ty, of.ty) orelse return planErr(env.diag, try std.fmt.allocPrint(
                 env.arena,
-                "UNION: column {d} (`{s}`) is {s} in the first branch and {s} in branch {d}, with no common type",
-                .{ col, f.name, @tagName(f.ty.kind), @tagName(of.ty.kind), n },
+                "{s}: column {d} (`{s}`) is {s} in the first branch and {s} in branch {d}, with no common type",
+                .{ op_name, col, f.name, @tagName(f.ty.kind), @tagName(of.ty.kind), n },
             ));
         }
     }
     return canon;
+}
+
+pub fn setOpName(set: ast.SetOp) []const u8 {
+    return switch (set) {
+        .union_all => "UNION",
+        .intersect => "INTERSECT",
+        .except => "EXCEPT",
+    };
 }
 
 /// Column `i` of `src`, cast to canon column `i`'s type under its name.
@@ -682,23 +692,70 @@ fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, except_names: []
         schemas[i] = src.schema();
     }
     const canon = if (u.positional)
-        try positionalCanon(env, schemas)
+        try positionalCanon(env, schemas, u.set)
     else
         try dupeSchema(arena, try unionCanon(env, specs, schemas, canon_opt, except));
 
     var out_schema: types.Schema = undefined;
     for (specs, 0..) |s, i| {
-        const items = if (u.positional)
+        var items = if (u.positional)
             try positionalReconcile(arena, schemas[i], canon)
         else
             try synthReconcile(arena, schemas[i], canon, tag_col, s.tag);
+        if (u.set != .union_all) items = try withSideMarks(arena, items, i);
         const proj = try buildProject(env, items, schemas[i], children[i]);
         children[i] = proj.op;
         out_schema = proj.schema;
     }
     const un = try arena.create(op.Union);
     un.* = .{ .children = children };
-    return .{ .op = .{ .union_ = un }, .schema = out_schema };
+    if (u.set == .union_all) return .{ .op = .{ .union_ = un }, .schema = out_schema };
+    return buildSetOp(env, u.set, canon, .{ .union_ = un }, out_schema);
+}
+
+const side_cols = [2][]const u8{ "__set_left", "__set_right" };
+
+/// Each branch row counts 1 toward its own side and 0 toward the other.
+fn withSideMarks(arena: std.mem.Allocator, items: []const ast.SelectItem, branch: usize) ![]const ast.SelectItem {
+    const out = try arena.alloc(ast.SelectItem, items.len + 2);
+    @memcpy(out[0..items.len], items);
+    for (side_cols, 0..) |name, side| {
+        const v: i64 = if (side == branch) 1 else 0;
+        out[items.len + side] = .{ .computed = .{ .name = name, .expr = try mk(arena, .{ .int_lit = v }) } };
+    }
+    return out;
+}
+
+/// INTERSECT / EXCEPT over the marked union: group on every column — which, unlike
+/// a join key, puts NULLs together — count each side, and keep the groups found on
+/// both sides / on the left only. Grouping is also the deduplication both require.
+fn buildSetOp(env: *Env, set: ast.SetOp, canon: types.Schema, child: op.Op, schema: types.Schema) anyerror!PipeRes {
+    const arena = env.arena;
+    const by = try arena.alloc(ast.QualName, canon.fields.len);
+    const keep = try arena.alloc(ast.SelectItem, canon.fields.len);
+    for (canon.fields, by, keep) |f, *q, *k| {
+        const parts = try arena.alloc([]const u8, 1);
+        parts[0] = f.name;
+        q.* = .{ .parts = parts };
+        k.* = .{ .field = q.* };
+    }
+    const aggs = try arena.alloc(ast.AggItem, 2);
+    var counted: [2]*ast.Expr = undefined;
+    for (side_cols, aggs, &counted) |name, *a, *c| {
+        const parts = try arena.alloc([]const u8, 1);
+        parts[0] = name;
+        a.* = .{ .name = name, .func = .sum, .arg = try mk(arena, .{ .field = .{ .parts = parts } }) };
+        c.* = try mk(arena, .{ .field = .{ .parts = parts } });
+    }
+    const zero = try mk(arena, .{ .int_lit = 0 });
+    const left_has = try mk(arena, .{ .binary = .{ .op = .gt, .l = counted[0], .r = zero } });
+    const right_has = try mk(arena, .{ .binary = .{ .op = if (set == .intersect) .gt else .eq, .l = counted[1], .r = zero } });
+    const pred = try mk(arena, .{ .binary = .{ .op = .@"and", .l = left_has, .r = right_has } });
+
+    const at: ast.Pos = .{ .line = 0, .col = 0 };
+    var r = try buildStage(env, .{ .node = .{ .aggregate = .{ .aggs = aggs, .by = by } }, .hints = &.{}, .pos = at }, child, schema);
+    r = try buildStage(env, .{ .node = .{ .filter = pred }, .hints = &.{}, .pos = at }, r.op, r.schema);
+    return buildStage(env, .{ .node = .{ .select = keep }, .hints = &.{}, .pos = at }, r.op, r.schema);
 }
 
 /// Bridge an analyze-layer error (which writes `ad.msg`) into a plan error.
