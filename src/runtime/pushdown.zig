@@ -677,8 +677,8 @@ const Tx = struct {
         const p = lookupPushable(c.name) orelse return null;
         if (c.args.len < p.min_args or c.args.len > p.max_args) return null;
         if (std.mem.eql(u8, c.name, "substr")) {
-            // the engine counts bytes and the sources characters: past a
-            // non-ASCII character the two starts differ
+            // a SQL Server `varchar` under a UTF-8 collation counts bytes: past
+            // a non-ASCII character its start and the engine's differ
             if (c.args[1].* != .int_lit or c.args[1].int_lit != 1) return null;
         }
         if (std.mem.eql(u8, c.name, "replace")) {
@@ -1676,7 +1676,7 @@ test "translateExpr: extended constructs (is empty, CASE, CAST, functions)" {
         // Cast to a non-numeric type is unaffected by that disagreement.
         .{ .src = "CAST(v AS STRING) = 'x'", .want = "(CAST([v] AS VARCHAR(MAX)) = 'x')" },
         .{ .src = "lower(status) = 'ok'", .want = "(LOWER([status]) = 'ok')" },
-        // the engine counts bytes, the sources characters (and LEN drops trailing spaces)
+        // MySQL's LENGTH counts bytes, and SQL Server's LEN drops trailing spaces
         .{ .src = "length(status) > 2", .want = null },
         .{ .src = "length(status) > 2", .want = null, .d = .mysql },
         .{ .src = "strpos(status, 'a') = 2", .want = null },
@@ -1817,7 +1817,7 @@ test "translateCall: mod is the % operator on sqlserver, MOD elsewhere" {
     try testing.expectEqualStrings("(([a] % 3) = 0)", (try translateExpr(a, cmp, .sqlserver, testSchema(), true)).?);
 }
 
-test "translateCall: strpos and length stay in the engine, which counts bytes where the sources count characters" {
+test "translateCall: strpos and length stay in the engine, where the sources disagree on what they count" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();

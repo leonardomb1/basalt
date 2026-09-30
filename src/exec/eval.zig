@@ -1891,15 +1891,18 @@ const per_row = struct {
     fn upperLower(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
-        const out = try arena.dupe(u8, try valueToString(arena, v));
-        for (out) |*ch| ch.* = if (eq(c.name, "upper")) std.ascii.toUpper(ch.*) else std.ascii.toLower(ch.*);
-        return .{ .string = out };
+        var out = std.array_list.Managed(u8).init(arena);
+        try caseMapInto(&out, try valueToString(arena, v), eq(c.name, "upper"));
+        return .{ .string = out.items };
     }
 
+    /// `length` counts characters, `strlen` bytes — DuckDB's split; a BYTES
+    /// value is bytes either way.
     fn strlen(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
-        return .{ .int = @intCast((try valueToString(arena, v)).len) };
+        const s = try valueToString(arena, v);
+        return .{ .int = @intCast(if (eq(c.name, "length") and v != .bytes) charCount(s) else s.len) };
     }
 
     fn bitCount(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
@@ -1967,7 +1970,7 @@ const per_row = struct {
             if (lv.isNull()) return .null;
             len_opt = toI64(lv);
         }
-        return .{ .string = try substrBytes(arena, try valueToString(arena, sv), toI64(startv), len_opt) };
+        return .{ .string = try substrChars(arena, try valueToString(arena, sv), toI64(startv), len_opt) };
     }
 
     fn replace(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
@@ -2103,7 +2106,7 @@ const per_row = struct {
             fill = try valueToString(arena, fv);
         }
         const s = try valueToString(arena, sv);
-        return Value{ .string = try padBytes(arena, s, toI64(nv), fill, eq(c.name, "lpad")) };
+        return Value{ .string = try padChars(arena, s, toI64(nv), fill, eq(c.name, "lpad")) };
     }
 
     fn leftRight(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
@@ -2151,7 +2154,7 @@ const per_row = struct {
         const sub = try valueToString(arena, pv);
         if (sub.len == 0) return Value{ .int = 1 };
         const at = std.mem.indexOf(u8, s, sub) orelse return Value{ .int = 0 };
-        return Value{ .int = @as(i64, @intCast(at)) + 1 };
+        return Value{ .int = @as(i64, @intCast(charCount(s[0..at]))) + 1 };
     }
 
     fn repeat(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
@@ -2173,10 +2176,7 @@ const per_row = struct {
     fn reverse(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const sv = try evalRow(arena, c.args[0], batch, row);
         if (sv.isNull()) return .null;
-        const s = try valueToString(arena, sv);
-        const out = try arena.alloc(u8, s.len);
-        for (s, 0..) |ch, i| out[s.len - 1 - i] = ch;
-        return Value{ .string = out };
+        return Value{ .string = try reverseChars(arena, try valueToString(arena, sv)) };
     }
 
     fn dateAddDiff(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
@@ -2250,6 +2250,7 @@ const vectorized = struct {
         if (c.args.len < 1) return error.Unsupported;
         const s = try strArg(arena, c.args[0], batch);
         const up = eq(c.name, "upper");
+        var scratch = std.array_list.Managed(u8).init(arena);
         var out = try column.BytesAppender.init(arena, n);
         var bm = try Bitmap.initFull(arena, n);
         var any = false;
@@ -2261,8 +2262,14 @@ const vectorized = struct {
                 any = true;
                 continue;
             };
-            const o = try out.pushMutable(sv);
-            for (o) |*ch| ch.* = if (up) std.ascii.toUpper(ch.*) else std.ascii.toLower(ch.*);
+            if (isAscii(sv)) {
+                const o = try out.pushMutable(sv);
+                for (o) |*ch| ch.* = if (up) std.ascii.toUpper(ch.*) else std.ascii.toLower(ch.*);
+            } else {
+                scratch.clearRetainingCapacity();
+                try caseMapInto(&scratch, sv, up);
+                try out.push(scratch.items);
+            }
         }
         return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
     }
@@ -2290,14 +2297,21 @@ const vectorized = struct {
     fn strlen(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
         const n = batch.len;
         if (c.args.len < 1) return error.Unsupported;
-        const s = try strArg(arena, c.args[0], batch);
+        const v = try evalVec(arena, c.args[0], batch);
+        const s = asStr(v) orelse return error.Unsupported;
+        // A BYTES value counts bytes under either name, as the row path does.
+        const is_bytes = switch (v) {
+            .col => |col| col.ty.kind == .bytes,
+            .scalar => |sc| sc == .bytes,
+        };
+        const chars = eq(c.name, "length") and !is_bytes;
         const out = try arena.alloc(i64, n);
         var bm = try Bitmap.initFull(arena, n);
         var any = false;
         var i: usize = 0;
         while (i < n) : (i += 1) {
             if (strAt(s, i)) |sv| {
-                out[i] = @intCast(sv.len);
+                out[i] = @intCast(if (chars) charCount(sv) else sv.len);
             } else {
                 out[i] = 0;
                 bm.setValid(i, false);
@@ -2410,7 +2424,7 @@ const vectorized = struct {
                 any = true;
                 continue;
             }
-            try out.push(try substrBytes(arena, sv.?, numI(start, i), if (len_num) |l| numI(l, i) else null));
+            try out.push(try substrChars(arena, sv.?, numI(start, i), if (len_num) |l| numI(l, i) else null));
         }
         return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
     }
@@ -3265,15 +3279,57 @@ fn toI64(v: Value) i64 {
     };
 }
 
-/// Byte-based substring with a 1-based start (SQL `substr`); `len` null = to end.
-fn substrBytes(arena: std.mem.Allocator, s: []const u8, start1: i64, len_opt: ?i64) ![]const u8 {
-    const slen: i64 = @intCast(s.len);
+/// Text functions count characters, as Postgres and DuckDB do — and as the
+/// sources a pushed-down `substr` or `left` runs on do. A character is one UTF-8
+/// sequence; a byte that does not start a valid one counts as a character of its
+/// own, so text that is not UTF-8 degrades to byte semantics instead of failing a
+/// load. They counted bytes: `length('naïve')` was 6 and `reverse('日本')` was
+/// invalid UTF-8.
+inline fn charWidth(s: []const u8, i: usize) usize {
+    const b = s[i];
+    if (b < 0x80) return 1;
+    const n = std.unicode.utf8ByteSequenceLength(b) catch return 1;
+    if (i + n > s.len) return 1;
+    _ = std.unicode.utf8Decode(s[i..][0..n]) catch return 1;
+    return n;
+}
+
+/// Eight bytes at a time: every string function asks this first.
+fn isAscii(s: []const u8) bool {
+    var i: usize = 0;
+    while (i + 8 <= s.len) : (i += 8) {
+        if (std.mem.readInt(u64, s[i..][0..8], .little) & 0x8080808080808080 != 0) return false;
+    }
+    while (i < s.len) : (i += 1) {
+        if (s[i] >= 0x80) return false;
+    }
+    return true;
+}
+
+fn charCount(s: []const u8) usize {
+    if (isAscii(s)) return s.len;
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i < s.len) : (n += 1) i += charWidth(s, i);
+    return n;
+}
+
+/// Byte offset just past the first `k` characters of `s`, clamped to its end.
+fn charOffset(s: []const u8, k: usize) usize {
+    var i: usize = 0;
+    var c: usize = 0;
+    while (c < k and i < s.len) : (c += 1) i += charWidth(s, i);
+    return i;
+}
+
+/// SQL `substr` with a 1-based start, in characters; `len` null = to end.
+fn substrChars(arena: std.mem.Allocator, s: []const u8, start1: i64, len_opt: ?i64) ![]const u8 {
     var start: usize = 0;
-    if (start1 > 1) start = @intCast(@min(start1 - 1, slen));
+    if (start1 > 1) start = charOffset(s, @intCast(start1 - 1));
     var end: usize = s.len;
     if (len_opt) |l| {
         if (l <= 0) return "";
-        end = @min(start + @as(usize, @intCast(l)), s.len);
+        end = start + charOffset(s[start..], @intCast(l));
     }
     return arena.dupe(u8, s[start..end]);
 }
@@ -3293,34 +3349,116 @@ fn roundHalfAway(x: f64, digits: i64) f64 {
 }
 
 /// Postgres `lpad`/`rpad`: pad `s` with repetitions of `fill` out to exactly
-/// `n` bytes, TRUNCATING to the first `n` bytes when `s` is already longer. An
+/// `n` characters, TRUNCATING to the first `n` when `s` is already longer. An
 /// empty `fill` cannot pad, so a short `s` comes back unchanged.
-fn padBytes(arena: std.mem.Allocator, s: []const u8, n: i64, fill: []const u8, left: bool) ![]const u8 {
+fn padChars(arena: std.mem.Allocator, s: []const u8, n: i64, fill: []const u8, left: bool) ![]const u8 {
     if (n <= 0) return "";
     const want: usize = @intCast(n);
     if (want > max_str_bytes) return error.CastFailed;
-    if (s.len >= want) return arena.dupe(u8, s[0..want]);
+    const have = charCount(s);
+    if (have >= want) return arena.dupe(u8, s[0..charOffset(s, want)]);
     if (fill.len == 0) return arena.dupe(u8, s);
-    const out = try arena.alloc(u8, want);
-    const pad = want - s.len;
-    var i: usize = 0;
-    while (i < pad) : (i += 1) out[if (left) i else s.len + i] = fill[i % fill.len];
-    @memcpy(if (left) out[pad..] else out[0..s.len], s);
-    return out;
+    var pad = std.array_list.Managed(u8).init(arena);
+    var fi: usize = 0;
+    var k: usize = 0;
+    while (k < want - have) : (k += 1) {
+        if (fi == fill.len) fi = 0;
+        const w = charWidth(fill, fi);
+        try pad.appendSlice(fill[fi..][0..w]);
+        fi += w;
+    }
+    if (pad.items.len + s.len > max_str_bytes) return error.CastFailed;
+    return std.mem.concat(arena, u8, if (left) &.{ pad.items, s } else &.{ s, pad.items });
 }
 
 /// Postgres `left`/`right`: a NEGATIVE `n` means "all but the last/first |n|
-/// bytes" rather than clamping to empty, so `left(s, -2)` drops the last two.
+/// characters" rather than clamping to empty, so `left(s, -2)` drops the last two.
 fn endSlice(s: []const u8, n: i64, left: bool) []const u8 {
-    const slen: i64 = @intCast(s.len);
+    const slen: i64 = @intCast(charCount(s));
     var take: i64 = if (n >= 0) n else slen + n;
     if (take < 0) take = 0;
     if (take > slen) take = slen;
     const k: usize = @intCast(take);
-    return if (left) s[0..k] else s[s.len - k ..];
+    return if (left) s[0..charOffset(s, k)] else s[charOffset(s, @intCast(slen - take))..];
 }
 
-/// SQL `LIKE`: `%` matches any run (including empty), `_` matches one byte.
+/// `s` in reverse character order.
+fn reverseChars(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    const out = try arena.alloc(u8, s.len);
+    var i: usize = 0;
+    while (i < s.len) {
+        const w = charWidth(s, i);
+        @memcpy(out[s.len - i - w ..][0..w], s[i..][0..w]);
+        i += w;
+    }
+    return out;
+}
+
+/// Simple case mapping, one code point to one, for the scripts data in the wild
+/// is written in: ASCII, Latin-1, Latin Extended-A, Greek and Cyrillic. Anything
+/// else — and a mapping that changes length, like `ß` to `SS` — is left as is.
+fn caseMap(cp: u21, up: bool) u21 {
+    if (cp < 0x80) return if (up) std.ascii.toUpper(@intCast(cp)) else std.ascii.toLower(@intCast(cp));
+    if (up) {
+        if ((cp >= 0xE0 and cp <= 0xFE and cp != 0xF7)) return cp - 0x20;
+        if (cp == 0xFF) return 0x178;
+        if (cp >= 0x100 and cp <= 0x17F) return latinExtA(cp, true);
+        if (cp >= 0x3B1 and cp <= 0x3C9 and cp != 0x3C2) return cp - 0x20;
+        if (cp == 0x3C2) return 0x3A3;
+        // Greek vowels with tonos
+        if (cp == 0x3AC) return 0x386;
+        if (cp >= 0x3AD and cp <= 0x3AF) return cp - 0x25;
+        if (cp == 0x3CC) return 0x38C;
+        if (cp == 0x3CD or cp == 0x3CE) return cp - 0x3F;
+        if (cp >= 0x430 and cp <= 0x44F) return cp - 0x20;
+        if (cp >= 0x450 and cp <= 0x45F) return cp - 0x50;
+    } else {
+        if ((cp >= 0xC0 and cp <= 0xDE and cp != 0xD7)) return cp + 0x20;
+        if (cp == 0x178) return 0xFF;
+        if (cp >= 0x100 and cp <= 0x17F) return latinExtA(cp, false);
+        if (cp >= 0x391 and cp <= 0x3A9 and cp != 0x3A2) return cp + 0x20;
+        if (cp == 0x386) return 0x3AC;
+        if (cp >= 0x388 and cp <= 0x38A) return cp + 0x25;
+        if (cp == 0x38C) return 0x3CC;
+        if (cp == 0x38E or cp == 0x38F) return cp + 0x3F;
+        if (cp >= 0x410 and cp <= 0x42F) return cp + 0x20;
+        if (cp >= 0x400 and cp <= 0x40F) return cp + 0x50;
+    }
+    return cp;
+}
+
+/// Latin Extended-A pairs upper/lower on adjacent code points: even/odd through
+/// U+0137 and from U+014A, odd/even across U+0139–U+0148 and U+0179–U+017E.
+/// U+0130/U+0131 (Turkish dotted/dotless I), U+0138, U+0149 and U+017F have no
+/// one-to-one partner and stay.
+fn latinExtA(cp: u21, up: bool) u21 {
+    if (cp == 0x130 or cp == 0x131 or cp == 0x138 or cp == 0x149 or cp == 0x17F or cp == 0x178) return cp;
+    const odd_upper = (cp >= 0x139 and cp <= 0x148) or (cp >= 0x179 and cp <= 0x17E);
+    const is_upper = if (odd_upper) cp % 2 == 1 else cp % 2 == 0;
+    if (up and !is_upper) return if (odd_upper) cp - 1 else cp - 1;
+    if (!up and is_upper) return cp + 1;
+    return cp;
+}
+
+/// `upper`/`lower` over a string. ASCII maps in place; otherwise each character
+/// is decoded, mapped and re-encoded, and a byte that is not UTF-8 is copied.
+fn caseMapInto(out: *std.array_list.Managed(u8), s: []const u8, up: bool) !void {
+    var i: usize = 0;
+    while (i < s.len) {
+        const w = charWidth(s, i);
+        if (w == 1) {
+            try out.append(if (s[i] < 0x80) (if (up) std.ascii.toUpper(s[i]) else std.ascii.toLower(s[i])) else s[i]);
+        } else {
+            const cp = std.unicode.utf8Decode(s[i..][0..w]) catch unreachable;
+            var buf: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(caseMap(cp, up), &buf) catch unreachable;
+            try out.appendSlice(buf[0..n]);
+        }
+        i += w;
+    }
+}
+
+/// SQL `LIKE`: `%` matches any run (including empty), `_` matches one character.
 ///
 /// `%` is tested before the literal compare: a `%` in the text equal to a `%` in
 /// the pattern was taken as a literal match, so `'50% off' LIKE '50%'` was false.
@@ -3334,12 +3472,15 @@ fn likeMatch(s: []const u8, pat: []const u8) bool {
             star = pi;
             smark = si;
             pi += 1;
-        } else if (pi < pat.len and (pat[pi] == '_' or pat[pi] == s[si])) {
+        } else if (pi < pat.len and pat[pi] == '_') {
+            si += charWidth(s, si);
+            pi += 1;
+        } else if (pi < pat.len and pat[pi] == s[si]) {
             si += 1;
             pi += 1;
         } else if (star) |st| {
             pi = st + 1;
-            smark += 1;
+            smark += charWidth(s, smark);
             si = smark;
         } else return false;
     }
@@ -3347,14 +3488,14 @@ fn likeMatch(s: []const u8, pat: []const u8) bool {
     return pi == pat.len;
 }
 
-test "substr (1-based, byte) and like wildcard matcher" {
+test "substr (1-based, in characters) and like wildcard matcher" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try std.testing.expectEqualStrings("01", try substrBytes(a, "SD1010", 4, 2));
-    try std.testing.expectEqualStrings("SD1", try substrBytes(a, "SD1010", 1, 3));
-    try std.testing.expectEqualStrings("010", try substrBytes(a, "SD1010", 4, null));
-    try std.testing.expectEqualStrings("", try substrBytes(a, "SD1010", 99, 2));
+    try std.testing.expectEqualStrings("01", try substrChars(a, "SD1010", 4, 2));
+    try std.testing.expectEqualStrings("SD1", try substrChars(a, "SD1010", 1, 3));
+    try std.testing.expectEqualStrings("010", try substrChars(a, "SD1010", 4, null));
+    try std.testing.expectEqualStrings("", try substrChars(a, "SD1010", 99, 2));
 
     try std.testing.expect(likeMatch("hello, world", "hello%"));
     try std.testing.expect(likeMatch("hello", "h_llo"));
@@ -3368,6 +3509,25 @@ test "substr (1-based, byte) and like wildcard matcher" {
     try std.testing.expect(likeMatch("ab%c", "ab%"));
     try std.testing.expect(likeMatch("a%b", "a%b"));
     try std.testing.expect(!likeMatch("a%b", "a%c"));
+
+    // Characters, not bytes; a byte that is not UTF-8 counts as one character.
+    try std.testing.expectEqualStrings("ïv", try substrChars(a, "naïve", 3, 2));
+    try std.testing.expectEqual(@as(usize, 5), charCount("naïve"));
+    try std.testing.expectEqual(@as(usize, 3), charCount("a\xe9b"));
+    try std.testing.expectEqualStrings("本日", try reverseChars(a, "日本"));
+    try std.testing.expectEqualStrings("aç", endSlice("ação", -2, true));
+    try std.testing.expectEqualStrings("ão", endSlice("ação", 2, false));
+    try std.testing.expectEqualStrings("çã", endSlice("çãoo", 2, true));
+    try std.testing.expectEqualStrings("ñ-ñ-a", try padChars(a, "a", 5, "ñ-", true));
+    try std.testing.expectEqualStrings("日", try padChars(a, "日本", 1, " ", false));
+    try std.testing.expect(likeMatch("ünï", "_n_"));
+    try std.testing.expect(!likeMatch("ü", "__"));
+    var out = std.array_list.Managed(u8).init(a);
+    try caseMapInto(&out, "café ação ÿ łódź πσς ελληνικά ώ жё", true);
+    try std.testing.expectEqualStrings("CAFÉ AÇÃO Ÿ ŁÓDŹ ΠΣΣ ΕΛΛΗΝΙΚΆ Ώ ЖЁ", out.items);
+    out.clearRetainingCapacity();
+    try caseMapInto(&out, "CAFÉ AÇÃO Ÿ ŁÓDŹ ΠΣ ЖЁ ß", false);
+    try std.testing.expectEqualStrings("café ação ÿ łódź πσ жё ß", out.items);
 }
 
 test "constEval folds an expression over plan-time bindings" {

@@ -435,10 +435,11 @@ Source clauses, in any order after the source:
   - `<>`, `NOT (… = …)` and `IS NOT EMPTY` on text negate an equality the
     collation widens, so they descend only where it compares bytes — on
     SQL Server with an exact form, `NOT (col = 'x' AND DATALENGTH(col) = 1)`.
-  - `length()` and `strpos()` never descend (basalt counts bytes, the sources
-    characters), nor a `LIKE` pattern holding `_` (a byte here, a character
-    there); SQL Server's `[` is escaped, and on SQL Server a literal outside
-    printable ASCII stays in the engine.
+  - `length()` and `strpos()` never descend (MySQL's `LENGTH` counts bytes, SQL
+    Server's `LEN` drops trailing spaces), nor a `LIKE` pattern holding `_` (a
+    byte in a SQL Server `varchar` under a UTF-8 collation); SQL Server's `[` is
+    escaped, and on SQL Server a literal outside printable ASCII stays in the
+    engine.
 
   `EXPLAIN` does not connect, so it says `text comparisons decided by the
   collation at run time` where the catalog will decide.
@@ -1094,7 +1095,12 @@ LET/PARAM.
   math `abs() floor() ceil() round(x[,n]) mod() power() sqrt() sign()` (round
   is half-away-from-zero, deliberately engine-side) · nulls `nullif()
   greatest() least()` (null args ignored, Postgres-style) · strings `lpad()
-  rpad() left() right() split_part() strpos() repeat() reverse()` · dates
+  rpad() left() right() split_part() strpos() repeat() reverse()` — these,
+  `length()`, `substr()`, `upper()`/`lower()` and `LIKE`'s `_` count
+  characters, as Postgres and DuckDB do; `strlen()` counts bytes. A byte that is
+  not UTF-8 counts as one character, so mis-encoded text never fails a load.
+  `upper`/`lower` map Latin, Greek and Cyrillic, one character to one (`ß`
+  stays) · dates
   `date_add(unit, n, ts) date_diff(unit, a, b) make_date() epoch()
   to_timestamp() strftime(ts, fmt)` (`%Y %m %d %H %M %S %y %%`; month/year
   arithmetic clamps the day-of-month) · json `json_get(doc, path)`.
