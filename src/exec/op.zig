@@ -1292,6 +1292,23 @@ pub const Aggregate = struct {
         try l.append(x);
     }
 
+    /// Fold another lane's distinct values into `acc`. The destination is sized
+    /// for both first: iterating a set yields keys in slot — that is, hash — order,
+    /// and inserting that run into a smaller table under the same hash packs it
+    /// into ever-longer probe runs. A global COUNT(DISTINCT) over 10M ids took
+    /// 292s at -j 8 against 8s at -j 1.
+    fn mergeDistinct(alloc: std.mem.Allocator, acc: *Acc, src: *const DistinctSet()) !void {
+        const set = acc.seen orelse blk: {
+            const p = try alloc.create(DistinctSet());
+            p.* = DistinctSet().init(alloc);
+            acc.seen = p;
+            break :blk p;
+        };
+        try set.ensureTotalCapacity(std.math.cast(u32, set.count() + src.count()) orelse return error.OutOfMemory);
+        var it = src.keyIterator();
+        while (it.next()) |k| try noteDistinct(alloc, acc, k.*[0]);
+    }
+
     fn noteDistinct(alloc: std.mem.Allocator, acc: *Acc, v: Value) !void {
         const set = acc.seen orelse blk: {
             const p = try alloc.create(DistinctSet());
@@ -1855,10 +1872,7 @@ pub const Aggregate = struct {
     pub fn mergeAcc(dst_alloc: std.mem.Allocator, dst: *Acc, src: Acc, agg: Agg) !void {
         switch (agg.func) {
             .count => if (agg.distinct) {
-                if (src.seen) |s| {
-                    var it = s.keyIterator();
-                    while (it.next()) |k| try noteDistinct(dst_alloc, dst, k.*[0]);
-                }
+                if (src.seen) |s| try mergeDistinct(dst_alloc, dst, s);
             } else {
                 dst.n += src.n;
             },
@@ -1906,10 +1920,7 @@ pub const Aggregate = struct {
             if (!agg.distinct) continue;
             dst.seen = null;
             dst.n = 0;
-            if (src.seen) |ss| {
-                var it = ss.keyIterator();
-                while (it.next()) |k| try noteDistinct(dst_alloc, dst, k.*[0]);
-            }
+            if (src.seen) |ss| try mergeDistinct(dst_alloc, dst, ss);
         }
         out.accs = accs;
         return out;
@@ -2002,10 +2013,7 @@ pub const Aggregate = struct {
                         if (!agg.distinct) continue;
                         dst.seen = null;
                         dst.n = 0;
-                        if (src.seen) |ss| {
-                            var it = ss.keyIterator();
-                            while (it.next()) |k| try noteDistinct(dst_alloc, dst, k.*[0]);
-                        }
+                        if (src.seen) |ss| try mergeDistinct(dst_alloc, dst, ss);
                     }
                     adopted.accs = accs;
                 }
@@ -2046,10 +2054,7 @@ pub const Aggregate = struct {
                     if (agg.distinct) {
                         dst.seen = null;
                         dst.n = 0;
-                        if (src.seen) |ss| {
-                            var it = ss.keyIterator();
-                            while (it.next()) |k| try noteDistinct(dst_alloc, dst, k.*[0]);
-                        }
+                        if (src.seen) |ss| try mergeDistinct(dst_alloc, dst, ss);
                     }
                 }
                 try groups.append(.{ .key_vals = kv, .accs = accs });
