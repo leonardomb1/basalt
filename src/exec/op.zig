@@ -1479,6 +1479,9 @@ pub const Aggregate = struct {
     /// Set by a parallel lane: one allocator per radix partition, each holding that
     /// partition's groups — see `drainParts`.
     part_state: ?[]const std.mem.Allocator = null,
+    /// Where a lane's group tables live, when not in `gpa`: a thread-safe
+    /// allocator, since the merge that frees them runs on other threads.
+    table_gpa: ?std.mem.Allocator = null,
     done: bool = false,
 
     pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Type, distinct: bool = false };
@@ -1565,13 +1568,16 @@ pub const Aggregate = struct {
     /// fixed-width fold needed. The parallel path paid it again for its merge.
     pub const GroupSet = struct {
         store: Store,
-        hashes: []const u64,
         len: usize,
         /// The key columns' types, which the fixed stores need to box a raw word.
         key_kinds: []const types.TypeKind,
-        /// A lane partition's own index and hash list, for `GroupMerge.adopt`.
+        /// A lane partition's own index, for `GroupMerge.adopt`. Its entries are
+        /// the caller's to free (`freeTable`).
         table: ?*GroupTable = null,
-        hash_list: ?*std.array_list.Managed(u64) = null,
+
+        pub fn freeTable(self: *const GroupSet) void {
+            if (self.table) |t| t.deinit();
+        }
 
         pub const Store = union(enum) {
             fixed: *FixedStore,
@@ -1623,7 +1629,6 @@ pub const Aggregate = struct {
         own: bool = false,
         set: GroupSet,
         table: GroupTable,
-        hashes: std.array_list.Managed(u64),
 
         fn anyDistinct(aggs: []const Agg) bool {
             for (aggs) |a| {
@@ -1632,20 +1637,29 @@ pub const Aggregate = struct {
             return false;
         }
 
-        /// Merge into `set` itself — its store, index and hash list, growing in the
-        /// allocator that holds them — instead of copying it into a new one. Null for
-        /// a set that carries no index of its own (a serial fold's).
+        /// Merge into `set` itself — its store and index — instead of copying it
+        /// into a new one. New records land in the store's own allocator. The index
+        /// moves here (`deinit` frees it); null for a set without one of its own (a
+        /// serial fold's).
         pub fn adopt(set: *const GroupSet, aggs: []const Agg) ?GroupMerge {
             const table = set.table orelse return null;
-            const hs = set.hash_list orelse return null;
+            const alloc = switch (set.store) {
+                .fixed => |st| st.recs.alloc,
+                .boxed => |st| st.recs.alloc,
+                .single => return null,
+            };
+            defer table.entries = &.{};
             return .{
-                .alloc = table.alloc,
+                .alloc = alloc,
                 .aggs = aggs,
                 .any_distinct = anyDistinct(aggs),
                 .set = set.*,
                 .table = table.*,
-                .hashes = hs.*,
             };
+        }
+
+        pub fn deinit(self: *GroupMerge) void {
+            self.table.deinit();
         }
 
         pub fn init(alloc: std.mem.Allocator, like: *const GroupSet, aggs: []const Agg) !GroupMerge {
@@ -1671,9 +1685,8 @@ pub const Aggregate = struct {
                 .alloc = alloc,
                 .aggs = aggs,
                 .any_distinct = any_distinct,
-                .set = .{ .store = store, .hashes = &.{}, .len = if (store == .single) 1 else 0, .key_kinds = like.key_kinds },
+                .set = .{ .store = store, .len = if (store == .single) 1 else 0, .key_kinds = like.key_kinds },
                 .table = try GroupTable.init(alloc, 256),
-                .hashes = std.array_list.Managed(u64).init(alloc),
             };
         }
 
@@ -1683,8 +1696,9 @@ pub const Aggregate = struct {
                 .single => |dst| for (dst, self.aggs, 0..) |*d, agg, j| try mergeAcc(self.alloc, d, src.acc(i, j), agg),
                 .fixed => |dst| {
                     const sr = src.store.fixed.at(i);
-                    const rec = try self.find(dst, src.hashes[i], FixedKey{ .vals = sr.keys, .mask = sr.mask.* }) orelse {
-                        const nr = try dst.push();
+                    const h = src.store.fixed.hashAt(i);
+                    const rec = try self.find(dst, h, FixedKey{ .vals = sr.keys, .mask = sr.mask.* }) orelse {
+                        const nr = try dst.push(h);
                         @memcpy(nr.keys, sr.keys);
                         nr.mask.* = sr.mask.*;
                         try self.adoptTail(dst.layout, nr.tail, sr.tail);
@@ -1694,8 +1708,9 @@ pub const Aggregate = struct {
                 },
                 .boxed => |dst| {
                     const sr = src.store.boxed.at(i);
-                    const rec = try self.find(dst, src.hashes[i], @as([]const Value, sr.keys)) orelse {
-                        const nr = try dst.push();
+                    const h = src.store.boxed.hashAt(i);
+                    const rec = try self.find(dst, h, @as([]const Value, sr.keys)) orelse {
+                        const nr = try dst.push(h);
                         if (self.own) {
                             for (nr.keys, sr.keys) |*o, v| o.* = try dupeValue(self.alloc, v);
                         } else @memcpy(nr.keys, sr.keys);
@@ -1710,9 +1725,8 @@ pub const Aggregate = struct {
         /// The record for `key`, or null after reserving a slot for it — the caller
         /// then pushes the record that slot names.
         fn find(self: *GroupMerge, dst: anytype, h: u64, key: anytype) !?@TypeOf(dst.at(0)) {
-            const f = try self.table.getOrPut(h, key, dst, self.hashes.items, @intCast(dst.len));
+            const f = try self.table.getOrPut(h, key, dst, @intCast(dst.len));
             if (f.found) return dst.at(f.slot);
-            try self.hashes.append(h);
             self.set.len += 1;
             return null;
         }
@@ -1745,8 +1759,9 @@ pub const Aggregate = struct {
         }
 
         pub fn result(self: *GroupMerge) GroupSet {
-            self.set.hashes = self.hashes.items;
-            return self.set;
+            var set = self.set;
+            set.table = null;
+            return set;
         }
     };
 
@@ -1785,7 +1800,7 @@ pub const Aggregate = struct {
     /// input into a partial `GroupSet`, `GroupMerge` combines partials across
     /// workers by recombining the *raw* accumulators (so AVG etc. stay correct), and
     /// `emitSets` finalizes once at the end. No GROUP BY is exactly one group. The
-    /// hashes stay with the set: the parallel path partitions and merges by them.
+    /// hashes stay in the records: the parallel path partitions and merges by them.
     pub fn drainSet(self: *Aggregate) anyerror!GroupSet {
         std.debug.assert(self.part_state == null);
         return (try self.drainImpl())[0];
@@ -1811,33 +1826,37 @@ pub const Aggregate = struct {
         return @intCast(h >> part_shift);
     }
 
-    /// Where one partition's groups go: its table, and the store and hash list the
-    /// table indexes. A serial fold shares one store between its partitions, so its
-    /// groups keep the order they were first seen in; a lane's partitions each own
-    /// theirs.
+    /// Where one partition's groups go: its table and the store the table indexes.
+    /// A serial fold shares one store between its partitions, so its groups keep
+    /// the order they were first seen in; a lane's partitions each own theirs.
     fn FoldPart(comptime Store: type) type {
         return struct {
             table: GroupTable,
             store: *Store,
-            hashes: *std.array_list.Managed(u64),
             alloc: std.mem.Allocator,
         };
     }
 
+    /// The tables live in a real allocator, not the arena, so a growing table frees
+    /// what it outgrew: a serial fold frees them when it is done, and a lane's go
+    /// with its sets (`GroupSet.freeTable`).
     fn foldParts(self: *Aggregate, comptime Store: type, layout: *const Layout) ![]FoldPart(Store) {
         const parts = try self.state.alloc(FoldPart(Store), fold_parts);
+        const tg = self.table_gpa orelse self.gpa;
+        var made: usize = 0;
+        errdefer for (parts[0..made]) |*p| p.table.deinit();
         if (self.part_state) |ps| {
-            for (parts, ps) |*p, a| p.* = .{
-                .table = try GroupTable.init(a, 256),
-                .store = try newIn(a, Store.init(a, self.by.len, layout)),
-                .hashes = try newIn(a, std.array_list.Managed(u64).init(a)),
-                .alloc = a,
-            };
+            for (parts, ps) |*p, a| {
+                p.* = .{ .table = try GroupTable.init(tg, 16), .store = try newIn(a, Store.init(a, self.by.len, layout)), .alloc = a };
+                made += 1;
+            }
         } else {
             const a = self.state;
             const st = try newIn(a, Store.init(a, self.by.len, layout));
-            const hs = try newIn(a, std.array_list.Managed(u64).init(a));
-            for (parts) |*p| p.* = .{ .table = try GroupTable.init(a, 256), .store = st, .hashes = hs, .alloc = a };
+            for (parts) |*p| {
+                p.* = .{ .table = try GroupTable.init(tg, 16), .store = st, .alloc = a };
+                made += 1;
+            }
         }
         return parts;
     }
@@ -1854,12 +1873,11 @@ pub const Aggregate = struct {
         const out = try self.state.alloc(GroupSet, if (own) fold_parts else 1);
         for (out, parts[0..out.len]) |*o, *p| o.* = .{
             .store = @unionInit(GroupSet.Store, @tagName(tag), p.store),
-            .hashes = p.hashes.items,
             .len = p.store.len,
             .key_kinds = kinds,
             .table = if (own) &p.table else null,
-            .hash_list = if (own) p.hashes else null,
         };
+        if (!own) for (parts) |*p| p.table.deinit();
         return out;
     }
 
@@ -1881,6 +1899,7 @@ pub const Aggregate = struct {
         const counts = try self.state.alloc(u32, nparts + 1);
         const layout = try newIn(self.state, try Layout.init(self.state, self.aggs));
         const parts = try self.foldParts(FixedStore, layout);
+        errdefer for (parts) |*p| p.table.deinit();
         const nk = self.by.len;
 
         while (try self.child.next(pull)) |b| {
@@ -1943,12 +1962,11 @@ pub const Aggregate = struct {
                 const key = FixedKey{ .vals = keys[ri * nk ..][0..nk], .mask = masks[ri] };
                 const part = &parts[hashes[ri] >> part_shift];
                 const at: u32 = @intCast(part.store.len);
-                const f = try part.table.getOrPut(hashes[ri], key, part.store, part.hashes.items, at);
+                const f = try part.table.getOrPut(hashes[ri], key, part.store, at);
                 const rec = if (f.found) part.store.at(f.slot) else blk: {
-                    const nr = try part.store.push();
+                    const nr = try part.store.push(hashes[ri]);
                     @memcpy(nr.keys, key.vals);
                     nr.mask.* = key.mask;
-                    try part.hashes.append(hashes[ri]);
                     break :blk nr;
                 };
                 if (counts_only) {
@@ -1989,7 +2007,7 @@ pub const Aggregate = struct {
                 _ = scratch.reset(.retain_capacity);
             }
             const one = try self.state.alloc(GroupSet, 1);
-            one[0] = .{ .store = .{ .single = accs }, .hashes = &.{}, .len = 1, .key_kinds = &.{} };
+            one[0] = .{ .store = .{ .single = accs }, .len = 1, .key_kinds = &.{} };
             return one;
         }
 
@@ -1997,6 +2015,7 @@ pub const Aggregate = struct {
         const counts = try self.state.alloc(u32, nparts + 1);
         const layout = try newIn(self.state, try Layout.init(self.state, self.aggs));
         const parts = try self.foldParts(GroupStore, layout);
+        errdefer for (parts) |*p| p.table.deinit();
         const hctx = keyhash.MultiKeyCtx{};
         while (try self.child.next(pull)) |b| {
             const nk = self.by.len;
@@ -2044,11 +2063,10 @@ pub const Aggregate = struct {
                 const probe = probes[r * nk ..][0..nk];
                 const part = &parts[hashes[r] >> part_shift];
                 const at: u32 = @intCast(part.store.len);
-                const f = try part.table.getOrPut(hashes[r], probe, part.store, part.hashes.items, at);
+                const f = try part.table.getOrPut(hashes[r], probe, part.store, at);
                 const rec = if (f.found) part.store.at(f.slot) else blk: {
-                    const nr = try part.store.push();
+                    const nr = try part.store.push(hashes[r]);
                     for (probe, nr.keys) |v, *o| o.* = try dupeValue(part.alloc, v);
-                    try part.hashes.append(hashes[r]);
                     break :blk nr;
                 };
                 for (self.aggs, 0..) |agg, j| {
@@ -2136,8 +2154,10 @@ pub const Aggregate = struct {
     /// bytes to say what eight bytes of `i64` already says, and hashing one walks
     /// a tagged union per key; here the keys are raw words with a null mask
     /// beside them, so both the record and the hash get cheaper. The aggregates'
-    /// state follows, laid out by `Layout` — for two keys and one count, a
-    /// 32-byte record: two groups per cache line instead of one straddling two.
+    /// state follows, laid out by `Layout`. The key's hash leads the record, so a
+    /// probe rejects a different key on it and a growing table re-homes groups
+    /// without a hash list beside the store — which an arena, growing it, held
+    /// three times over.
     const FixedStore = struct {
         nkeys: usize,
         layout: *const Layout,
@@ -2147,11 +2167,15 @@ pub const Aggregate = struct {
         const Rec = struct { keys: []i64, mask: *u64, tail: [*]u8 };
 
         fn init(alloc: std.mem.Allocator, nkeys: usize, layout: *const Layout) FixedStore {
-            return .{ .nkeys = nkeys, .layout = layout, .recs = .init(alloc, nkeys * @sizeOf(i64) + @sizeOf(u64) + layout.size) };
+            return .{ .nkeys = nkeys, .layout = layout, .recs = .init(alloc, @sizeOf(u64) + nkeys * @sizeOf(i64) + @sizeOf(u64) + layout.size) };
+        }
+
+        fn hashAt(self: *const FixedStore, i: usize) u64 {
+            return @as(*const u64, @ptrCast(@alignCast(self.recs.base(i)))).*;
         }
 
         fn at(self: FixedStore, i: usize) Rec {
-            const base = self.recs.base(i);
+            const base = self.recs.base(i) + @sizeOf(u64);
             const ksz = self.nkeys * @sizeOf(i64);
             return .{
                 .keys = @alignCast(std.mem.bytesAsSlice(i64, base[0..ksz])),
@@ -2160,14 +2184,16 @@ pub const Aggregate = struct {
             };
         }
 
-        fn eqlAt(self: *const FixedStore, i: usize, key: FixedKey) bool {
+        fn eqlAt(self: *const FixedStore, i: usize, h: u64, key: FixedKey) bool {
+            if (self.hashAt(i) != h) return false;
             const r = self.at(i);
             if (r.mask.* != key.mask) return false;
             return std.mem.eql(i64, r.keys, key.vals);
         }
 
-        fn push(self: *FixedStore) !Rec {
+        fn push(self: *FixedStore, h: u64) !Rec {
             try self.recs.reserve(self.len);
+            @as(*u64, @ptrCast(@alignCast(self.recs.base(self.len)))).* = h;
             const rec = self.at(self.len);
             self.len += 1;
             self.layout.clear(rec.tail);
@@ -2217,28 +2243,35 @@ pub const Aggregate = struct {
             @prefetch(&self.entries[h & self.mask], .{ .rw = .read, .locality = 3 });
         }
 
+        /// Free the entries. Safe to repeat: a table handed on by `GroupMerge.adopt`
+        /// is left empty, and its owner's cleanup still runs.
+        fn deinit(self: *GroupTable) void {
+            self.alloc.free(self.entries);
+            self.entries = &.{};
+        }
+
         /// Rebuild from this table's own entries, taking each group's hash from
-        /// `hashes` — so a table owning one radix partition rehomes only the
-        /// groups it holds.
-        fn grow(self: *GroupTable, hashes: []const u64) !void {
-            // Doubling is right while the table is small, but every rehash at
-            // size re-scatters the whole table, and a high-cardinality fold pays
-            // that eight or nine times over. Past the point where a resize is
-            // the expensive part, jump further ahead instead.
-            const cap = self.entries.len * @as(usize, if (self.entries.len >= 1 << 14) 8 else 2);
+        /// its record — so a table owning one radix partition rehomes only the
+        /// groups it holds. The outgrown entries are freed: `alloc` is a real
+        /// allocator, since an arena kept every outgrown table.
+        fn grow(self: *GroupTable, store: anytype) !void {
+            const cap = self.entries.len * growth;
             const ne = try self.alloc.alloc(u32, cap);
             @memset(ne, 0);
             const nmask = cap - 1;
             for (self.entries) |e| {
                 if (e == 0) continue;
-                const h = hashes[(e & max_groups) - 1];
+                const h = store.hashAt((e & max_groups) - 1);
                 var i = h & nmask;
                 while (ne[i] != 0) i = (i + 1) & nmask;
                 ne[i] = e;
             }
+            self.alloc.free(self.entries);
             self.entries = ne;
             self.mask = nmask;
         }
+
+        const growth = 2;
 
         const Found = struct { slot: u32, found: bool };
 
@@ -2247,11 +2280,10 @@ pub const Aggregate = struct {
             h: u64,
             key: anytype,
             store: anytype,
-            hashes: []const u64,
             new_slot: u32,
         ) !Found {
             if (new_slot >= max_groups) return error.TooManyGroups;
-            if ((self.len + 1) * 10 >= self.entries.len * 7) try self.grow(hashes);
+            if ((self.len + 1) * 10 >= self.entries.len * 7) try self.grow(store);
             const want = saltOf(h) << idx_bits;
             var i = h & self.mask;
             while (true) : (i = (i + 1) & self.mask) {
@@ -2263,13 +2295,14 @@ pub const Aggregate = struct {
                 }
                 if ((e >> idx_bits) << idx_bits != want) continue;
                 const idx = (e & max_groups) - 1;
-                if (store.eqlAt(idx, key)) return .{ .slot = idx, .found = true };
+                if (store.eqlAt(idx, h, key)) return .{ .slot = idx, .found = true };
             }
         }
     };
 
     /// Group records, keys immediately followed by accumulators, so the probe that
-    /// finds a group and the update that follows touch the same run of bytes.
+    /// finds a group and the update that follows touch the same run of bytes. The
+    /// hash leads, as in `FixedStore`.
     const GroupStore = struct {
         nkeys: usize,
         layout: *const Layout,
@@ -2279,11 +2312,15 @@ pub const Aggregate = struct {
         const Rec = struct { keys: []Value, tail: [*]u8 };
 
         fn init(alloc: std.mem.Allocator, nkeys: usize, layout: *const Layout) GroupStore {
-            return .{ .nkeys = nkeys, .layout = layout, .recs = .init(alloc, nkeys * @sizeOf(Value) + layout.size) };
+            return .{ .nkeys = nkeys, .layout = layout, .recs = .init(alloc, @sizeOf(u64) + nkeys * @sizeOf(Value) + layout.size) };
+        }
+
+        fn hashAt(self: *const GroupStore, i: usize) u64 {
+            return @as(*const u64, @ptrCast(@alignCast(self.recs.base(i)))).*;
         }
 
         fn at(self: GroupStore, i: usize) Rec {
-            const base = self.recs.base(i);
+            const base = self.recs.base(i) + @sizeOf(u64);
             const ksz = self.nkeys * @sizeOf(Value);
             return .{
                 .keys = @alignCast(std.mem.bytesAsSlice(Value, base[0..ksz])),
@@ -2291,12 +2328,14 @@ pub const Aggregate = struct {
             };
         }
 
-        fn eqlAt(self: *const GroupStore, i: usize, key: []const Value) bool {
+        fn eqlAt(self: *const GroupStore, i: usize, h: u64, key: []const Value) bool {
+            if (self.hashAt(i) != h) return false;
             return keyhash.MultiKeyCtx.eql(.{}, key, self.at(i).keys);
         }
 
-        fn push(self: *GroupStore) !Rec {
+        fn push(self: *GroupStore, h: u64) !Rec {
             try self.recs.reserve(self.len);
+            @as(*u64, @ptrCast(@alignCast(self.recs.base(self.len)))).* = h;
             const rec = self.at(self.len);
             self.len += 1;
             self.layout.clear(rec.tail);

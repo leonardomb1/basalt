@@ -326,9 +326,12 @@ const LaneParts = struct {
     /// Release partition `p` once the merge is done with it. Left as a fresh,
     /// empty arena, so `deinit` stays unconditional.
     fn free(self: *LaneParts, p: usize) void {
-        const child = self.arenas[p].child_allocator;
         self.arenas[p].deinit();
-        self.arenas[p] = std.heap.ArenaAllocator.init(child);
+        self.arenas[p] = std.heap.ArenaAllocator.init(self.backing());
+    }
+
+    fn backing(self: *const LaneParts) std.mem.Allocator {
+        return self.arenas[0].child_allocator;
     }
 };
 
@@ -343,6 +346,7 @@ fn allocAggSlots(gpa: std.mem.Allocator, n: usize) ![]AggSlot {
 
 fn freeAggSlots(gpa: std.mem.Allocator, slots: []AggSlot) void {
     for (slots) |*s| {
+        for (s.sets) |*st| st.freeTable();
         s.parts.deinit();
         s.arena.deinit();
         _ = s.gpa.deinit();
@@ -445,7 +449,10 @@ fn allocMergeParts(gpa: std.mem.Allocator) ![]PqPart {
 }
 
 fn freeMergeParts(gpa: std.mem.Allocator, parts: []PqPart) void {
-    for (parts) |*pp| pp.arena.deinit();
+    for (parts) |*pp| {
+        if (pp.merge) |*m| m.deinit();
+        pp.arena.deinit();
+    }
     gpa.free(parts);
 }
 
@@ -537,6 +544,7 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
         .state = wa,
         .gpa = slot.gpa.allocator(),
         .part_state = &slot.parts.allocs,
+        .table_gpa = slot.parts.backing(),
     };
     // Stays in the slot's arenas: the combine reads it after every lane has joined.
     slot.sets = try agg.drainParts();
@@ -694,6 +702,7 @@ fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
         .state = la,
         .gpa = ls.arena.child_allocator,
         .part_state = &ls.parts.allocs,
+        .table_gpa = ls.parts.backing(),
     };
     ls.sets = try agg.drainParts();
 }
@@ -740,8 +749,11 @@ fn mergeRadixPart(dst: *PqPart, srcs: anytype, aggs: []const op.Aggregate.Agg, p
         if (i == bi or ls.sets.len <= p) continue;
         const st = &ls.sets[p];
         for (0..st.len) |gi| try dst.merge.?.add(st, gi);
+        st.freeTable();
         ls.parts.free(p);
     }
+    // The index is done with once every lane is in: the emit walks the store.
+    dst.merge.?.deinit();
 }
 
 /// The `sort … limit` shape a parallel aggregate can push into its partitions.
@@ -1536,6 +1548,7 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
         l.parts.init(env.gpa);
     }
     defer for (lanes) |*l| {
+        for (l.sets) |*st| st.freeTable();
         l.parts.deinit();
         l.arena.deinit();
     };
@@ -1562,7 +1575,10 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
     const parts = try env.gpa.alloc(PqPart, pq_parts);
     defer env.gpa.free(parts);
     for (parts) |*pp| pp.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
-    defer for (parts) |*pp| pp.arena.deinit();
+    defer for (parts) |*pp| {
+        if (pp.merge) |*m| m.deinit();
+        pp.arena.deinit();
+    };
 
     const t_mrg0 = std.time.Instant.now() catch unreachable;
     if (apl.by.len == 0) {
@@ -1803,6 +1819,7 @@ fn sqlAggWorkOne(ctx: *SqlAggCtx, i: usize) !void {
         .state = wa,
         .gpa = slot.gpa.allocator(),
         .part_state = &slot.parts.allocs,
+        .table_gpa = slot.parts.backing(),
     };
     slot.sets = try agg.drainParts();
 }
