@@ -290,19 +290,37 @@ const AggSlot = struct {
     /// and the main thread only touches it after `spawnJoin` has returned.
     gpa: std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }) = .{},
     arena: std.heap.ArenaAllocator = undefined,
-    /// The slot's groups as the fold stored them, with the hash of each, so the
-    /// combine can partition without hashing every key again.
-    set: ?op.Aggregate.GroupSet = null,
-    /// This slot's group indices split by key hash — the same shape `PqLane`
-    /// carries, so the radix combine can walk slots and lanes alike. Empty for a
-    /// slot no worker reached.
-    buckets: []std.array_list.Managed(u32) = &.{},
-    /// False for a slot no worker reached, which is what an aborted run leaves
-    /// behind. Such a slot holds no groups and is skipped by the combine.
-    done: bool = false,
+    parts: LaneParts = undefined,
+    /// The slot's groups as the fold stored them, one set per radix partition
+    /// (`op.Aggregate.drainParts`). Empty for a slot no worker reached, which is
+    /// what an aborted run leaves behind; the combine skips it.
+    sets: []const op.Aggregate.GroupSet = &.{},
 
-    fn arm(self: *AggSlot) void {
+    fn arm(self: *AggSlot, shared: std.mem.Allocator) void {
         self.arena = std.heap.ArenaAllocator.init(self.gpa.allocator());
+        self.parts.init(shared);
+    }
+};
+
+/// A lane's (or slot's) groups split by key hash, one arena per radix partition,
+/// so the merge of partition `p` reads only what it needs. Backed by the run's
+/// thread-safe gpa, not the slot's: the merge tasks run on other threads. Not the
+/// page allocator either — 64 arenas a lane each mapping small buffers made a
+/// 100-group aggregate 12% slower at -j 8.
+const LaneParts = struct {
+    arenas: [pq_parts]std.heap.ArenaAllocator,
+    allocs: [pq_parts]std.mem.Allocator,
+
+    /// In place: each allocator points at its arena.
+    fn init(self: *LaneParts, child: std.mem.Allocator) void {
+        for (&self.arenas, &self.allocs) |*a, *al| {
+            a.* = std.heap.ArenaAllocator.init(child);
+            al.* = a.allocator();
+        }
+    }
+
+    fn deinit(self: *LaneParts) void {
+        for (&self.arenas) |*a| a.deinit();
     }
 };
 
@@ -311,12 +329,13 @@ fn allocAggSlots(gpa: std.mem.Allocator, n: usize) ![]AggSlot {
     for (slots) |*s| s.* = .{};
     // Armed in a second pass: `arm` takes the address of the slot's own gpa, so
     // it has to run once the slot is at its final location.
-    for (slots) |*s| s.arm();
+    for (slots) |*s| s.arm(gpa);
     return slots;
 }
 
 fn freeAggSlots(gpa: std.mem.Allocator, slots: []AggSlot) void {
     for (slots) |*s| {
+        s.parts.deinit();
         s.arena.deinit();
         _ = s.gpa.deinit();
     }
@@ -360,16 +379,16 @@ fn combineAggSlots(
 ) ![]const op.Aggregate.GroupSet {
     var total: usize = 0;
     for (slots) |*s| {
-        if (s.set) |st| total += st.len;
+        for (s.sets) |st| total += st.len;
     }
 
     if (threads < 2 or total < agg_combine_parallel_min) {
         var m: ?op.Aggregate.GroupMerge = null;
         for (slots) |*s| {
-            if (!s.done) continue;
-            const st = if (s.set) |*x| x else continue;
-            if (m == null) m = try op.Aggregate.GroupMerge.init(env.arena, st, aggs);
-            for (0..st.len) |i| try m.?.add(st, i);
+            for (s.sets) |*st| {
+                if (m == null) m = try op.Aggregate.GroupMerge.init(env.arena, st, aggs);
+                for (0..st.len) |i| try m.?.add(st, i);
+            }
         }
         const one = try env.arena.alloc(op.Aggregate.GroupSet, if (m == null) 0 else 1);
         if (m) |*mm| one[0] = mm.result();
@@ -509,23 +528,19 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
         .err = null,
         .state = wa,
         .gpa = slot.gpa.allocator(),
+        .part_state = &slot.parts.allocs,
     };
-    // Stays in the slot's arena: the combine reads it after every lane has joined.
-    const set = try agg.drainSet();
-    slot.set = set;
-    slot.buckets = try bucketByHash(wa, set.hashes);
-    slot.done = true;
+    // Stays in the slot's arenas: the combine reads it after every lane has joined.
+    slot.sets = try agg.drainParts();
 }
 
 /// One parallel-aggregate lane: its own arena and its own group table, so the
 /// fold phase never takes a lock.
 const PqLane = struct {
     arena: std.heap.ArenaAllocator,
-    set: ?op.Aggregate.GroupSet = null,
-    /// The lane's groups split by key hash, computed once when the lane runs
-    /// dry. The merge then reads a partition's slice directly instead of
-    /// rescanning every lane for every partition.
-    buckets: []std.array_list.Managed(u32) = &.{},
+    parts: LaneParts = undefined,
+    /// One set per radix partition, as `AggSlot.sets`.
+    sets: []const op.Aggregate.GroupSet = &.{},
 };
 
 /// One radix partition of the merge: the lanes' groups are split by key hash, so
@@ -536,9 +551,10 @@ const PqPart = struct {
     merge: ?op.Aggregate.GroupMerge = null,
 };
 
-/// Number of radix partitions. Comfortably above the lane count so the merge
-/// stays balanced when key hashes are uneven.
-const pq_parts: usize = 64;
+/// Number of radix partitions: the fold's own, so a lane's partition `p` is the
+/// merge's. Comfortably above the lane count so the merge stays balanced when key
+/// hashes are uneven.
+const pq_parts: usize = op.Aggregate.fold_parts;
 
 /// Fewest lanes worth splitting an aggregate across. Two suffices now that the
 /// merge reuses the hashes the fold produced; while it re-hashed every key, the
@@ -669,25 +685,9 @@ fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
         .err = null,
         .state = la,
         .gpa = ls.arena.child_allocator,
+        .part_state = &ls.parts.allocs,
     };
-    ls.set = try agg.drainSet();
-    try bucketLane(ls);
-}
-
-/// Split group indices into radix buckets, reusing the hash the fold already
-/// produced. Shared by the parquet lanes and the CSV/SQL slots.
-fn bucketByHash(a: std.mem.Allocator, hashes: []const u64) ![]std.array_list.Managed(u32) {
-    const buckets = try a.alloc(std.array_list.Managed(u32), pq_parts);
-    for (buckets) |*b| b.* = std.array_list.Managed(u32).init(a);
-    for (hashes, 0..) |h, i| {
-        const p: usize = @intCast((h >> 32) % pq_parts);
-        try buckets[p].append(@intCast(i));
-    }
-    return buckets;
-}
-
-fn bucketLane(ls: *PqLane) !void {
-    ls.buckets = try bucketByHash(ls.arena.allocator(), ls.set.?.hashes);
+    ls.sets = try agg.drainParts();
 }
 
 const PqMergeCtx = struct {
@@ -704,17 +704,18 @@ fn pqMergeOne(ctx: *PqMergeCtx, p: usize) !void {
 }
 
 /// Merge radix partition `p` of a set of partials into `dst`. `srcs` is a slice of
-/// anything carrying `groups`/`hashes`/`buckets` — parquet lanes or CSV/SQL slots —
+/// anything carrying per-partition `sets` — parquet lanes or CSV/SQL slots —
 /// and is walked in index order, which is what keeps a float SUM from depending on
 /// thread timing (see `AggSlot`). A partition owns its keys outright, so the tasks
 /// need no lock between them, which is what stops a high-cardinality merge from
 /// serialising behind one table.
 fn mergeRadixPart(dst: *PqPart, srcs: anytype, aggs: []const op.Aggregate.Agg, p: usize) !void {
     for (srcs) |*ls| {
-        if (ls.buckets.len == 0) continue;
-        const st = if (ls.set) |*x| x else continue;
+        if (ls.sets.len <= p) continue;
+        const st = &ls.sets[p];
+        if (st.len == 0) continue;
         if (dst.merge == null) dst.merge = try op.Aggregate.GroupMerge.init(dst.arena.allocator(), st, aggs);
-        for (ls.buckets[p].items) |gi| try dst.merge.?.add(st, gi);
+        for (0..st.len) |gi| try dst.merge.?.add(st, gi);
     }
 }
 
@@ -1507,8 +1508,12 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
     defer env.gpa.free(lanes);
     for (lanes) |*l| {
         l.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+        l.parts.init(env.gpa);
     }
-    defer for (lanes) |*l| l.arena.deinit();
+    defer for (lanes) |*l| {
+        l.parts.deinit();
+        l.arena.deinit();
+    };
 
     var ctx = PqAggCtx{
         .morsels = morsels,
@@ -1549,9 +1554,10 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
         // has always run this shape in parallel.
         const dst = &parts[0];
         for (lanes) |*l| {
-            const st = if (l.set) |*x| x else continue;
-            if (dst.merge == null) dst.merge = try op.Aggregate.GroupMerge.init(dst.arena.allocator(), st, aggs);
-            for (0..st.len) |i| try dst.merge.?.add(st, i);
+            for (l.sets) |*st| {
+                if (dst.merge == null) dst.merge = try op.Aggregate.GroupMerge.init(dst.arena.allocator(), st, aggs);
+                for (0..st.len) |i| try dst.merge.?.add(st, i);
+            }
         }
     } else {
         var mctx = PqMergeCtx{ .lanes = lanes, .parts = parts, .aggs = aggs, .queue = .{ .nitems = pq_parts } };
@@ -1561,9 +1567,9 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
     const t_mrg1 = std.time.Instant.now() catch unreachable;
     var lane_groups: usize = 0;
     for (lanes) |*l| {
-        if (l.set) |st| lane_groups += st.len;
+        for (l.sets) |st| lane_groups += st.len;
     }
-    env.log.log(.debug, "pq agg phases: fold {d}ms (incl. bucket), merge {d}ms, {d} lane groups", .{
+    env.log.log(.debug, "pq agg phases: fold {d}ms, merge {d}ms, {d} lane groups", .{
         t_fold1.since(t_fold0) / 1_000_000,
         t_mrg1.since(t_mrg0) / 1_000_000,
         lane_groups,
@@ -1571,7 +1577,7 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
     if (opts.explain) {
         std.debug.print(
             \\actuals (parallel aggregate, {d} lanes over {d} row groups):
-            \\  fold+bucket  {d:>8.1}ms {d:>12} groups
+            \\  fold         {d:>8.1}ms {d:>12} groups
             \\  merge        {d:>8.1}ms {d:>12} partitions
             \\
         , .{
@@ -1771,11 +1777,9 @@ fn sqlAggWorkOne(ctx: *SqlAggCtx, i: usize) !void {
         .err = null,
         .state = wa,
         .gpa = slot.gpa.allocator(),
+        .part_state = &slot.parts.allocs,
     };
-    const set = try agg.drainSet();
-    slot.set = set;
-    slot.buckets = try bucketByHash(wa, set.hashes);
-    slot.done = true;
+    slot.sets = try agg.drainParts();
 }
 
 /// Parallel SQL aggregate: `read <sqltable> | (filter|select)* | aggregate | (sort|limit)* | write`

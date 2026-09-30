@@ -1476,6 +1476,9 @@ pub const Aggregate = struct {
     err: ?*ErrCtx = null,
     state: std.mem.Allocator,
     gpa: std.mem.Allocator,
+    /// Set by a parallel lane: one allocator per radix partition, each holding that
+    /// partition's groups — see `drainParts`.
+    part_state: ?[]const std.mem.Allocator = null,
     done: bool = false,
 
     pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Type, distinct: bool = false };
@@ -1743,7 +1746,77 @@ pub const Aggregate = struct {
     /// `emitSets` finalizes once at the end. No GROUP BY is exactly one group. The
     /// hashes stay with the set: the parallel path partitions and merges by them.
     pub fn drainSet(self: *Aggregate) anyerror!GroupSet {
+        std.debug.assert(self.part_state == null);
+        return (try self.drainImpl())[0];
+    }
+
+    /// Fold as `drainSet`, but a parallel lane's way: one set per radix partition
+    /// (`partOf`), each in its own `part_state` allocator, so the merge takes the
+    /// lanes' partition `p` without walking the rest and can free it once folded.
+    /// An ungrouped aggregate is still one set.
+    pub fn drainParts(self: *Aggregate) anyerror![]GroupSet {
+        std.debug.assert(self.part_state.?.len == fold_parts);
         return self.drainImpl();
+    }
+
+    /// Radix partitions a fold splits its groups over, by the top bits of the hash.
+    /// A single table for millions of groups misses cache on every probe; sixty-four
+    /// smaller ones stay resident, the shape DuckDB and ClickHouse both arrived at.
+    /// The bucket comes from the bottom bits, so the two never interfere.
+    pub const fold_parts = 64;
+    const part_shift = 58;
+
+    pub fn partOf(h: u64) usize {
+        return @intCast(h >> part_shift);
+    }
+
+    /// Where one partition's groups go: its table, and the store and hash list the
+    /// table indexes. A serial fold shares one store between its partitions, so its
+    /// groups keep the order they were first seen in; a lane's partitions each own
+    /// theirs.
+    fn FoldPart(comptime Store: type) type {
+        return struct {
+            table: GroupTable,
+            store: *Store,
+            hashes: *std.array_list.Managed(u64),
+            alloc: std.mem.Allocator,
+        };
+    }
+
+    fn foldParts(self: *Aggregate, comptime Store: type, layout: *const Layout) ![]FoldPart(Store) {
+        const parts = try self.state.alloc(FoldPart(Store), fold_parts);
+        if (self.part_state) |ps| {
+            for (parts, ps) |*p, a| p.* = .{
+                .table = try GroupTable.init(a, 256),
+                .store = try newIn(a, Store.init(a, self.by.len, layout)),
+                .hashes = try newIn(a, std.array_list.Managed(u64).init(a)),
+                .alloc = a,
+            };
+        } else {
+            const a = self.state;
+            const st = try newIn(a, Store.init(a, self.by.len, layout));
+            const hs = try newIn(a, std.array_list.Managed(u64).init(a));
+            for (parts) |*p| p.* = .{ .table = try GroupTable.init(a, 256), .store = st, .hashes = hs, .alloc = a };
+        }
+        return parts;
+    }
+
+    fn newIn(a: std.mem.Allocator, v: anytype) !*@TypeOf(v) {
+        const p = try a.create(@TypeOf(v));
+        p.* = v;
+        return p;
+    }
+
+    fn foldSets(self: *Aggregate, comptime tag: std.meta.Tag(GroupSet.Store), parts: anytype) ![]GroupSet {
+        const kinds = try self.keyKinds();
+        const out = try self.state.alloc(GroupSet, if (self.part_state == null) 1 else fold_parts);
+        for (out, parts[0..out.len]) |*o, p| o.* = .{
+            .store = @unionInit(GroupSet.Store, @tagName(tag), p.store),
+            .hashes = p.hashes.items,
+            .len = p.store.len,
+            .key_kinds = kinds,
+        };
+        return out;
     }
 
     fn keyKinds(self: *Aggregate) ![]types.TypeKind {
@@ -1755,20 +1828,15 @@ pub const Aggregate = struct {
     /// Fold with raw fixed-width keys. Same shape as `drainImpl`, but the probe
     /// key is a run of `i64` rather than boxed `Value`s, so the record is smaller
     /// and the hash is over plain words.
-    fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only: bool) anyerror!GroupSet {
+    fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only: bool) anyerror![]GroupSet {
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
         const pull = scratch.allocator();
 
-        var ghashes = std.array_list.Managed(u64).init(self.state);
-        const nparts = 64;
-        const part_shift = 58;
-        const tables = try self.state.alloc(GroupTable, nparts);
-        for (tables) |*t| t.* = try GroupTable.init(self.state, 256);
+        const nparts = fold_parts;
         const counts = try self.state.alloc(u32, nparts + 1);
-        const layout = try self.state.create(Layout);
-        layout.* = try Layout.init(self.state, self.aggs);
-        var store = FixedStore.init(self.state, self.by.len, layout);
+        const layout = try newIn(self.state, try Layout.init(self.state, self.aggs));
+        const parts = try self.foldParts(FixedStore, layout);
         const nk = self.by.len;
 
         while (try self.child.next(pull)) |b| {
@@ -1826,17 +1894,17 @@ pub const Aggregate = struct {
             for (order, 0..) |ri, oi| {
                 if (oi + prefetch_ahead < order.len) {
                     const pr = order[oi + prefetch_ahead];
-                    tables[hashes[pr] >> part_shift].prefetch(hashes[pr]);
+                    parts[hashes[pr] >> part_shift].table.prefetch(hashes[pr]);
                 }
                 const key = FixedKey{ .vals = keys[ri * nk ..][0..nk], .mask = masks[ri] };
-                const at: u32 = @intCast(store.len);
-                const table = &tables[hashes[ri] >> part_shift];
-                const f = try table.getOrPut(hashes[ri], key, &store, ghashes.items, at);
-                const rec = if (f.found) store.at(f.slot) else blk: {
-                    const nr = try store.push();
+                const part = &parts[hashes[ri] >> part_shift];
+                const at: u32 = @intCast(part.store.len);
+                const f = try part.table.getOrPut(hashes[ri], key, part.store, part.hashes.items, at);
+                const rec = if (f.found) part.store.at(f.slot) else blk: {
+                    const nr = try part.store.push();
                     @memcpy(nr.keys, key.vals);
                     nr.mask.* = key.mask;
-                    try ghashes.append(hashes[ri]);
+                    try part.hashes.append(hashes[ri]);
                     break :blk nr;
                 };
                 if (counts_only) {
@@ -1845,24 +1913,16 @@ pub const Aggregate = struct {
                 } else {
                     for (self.aggs, 0..) |agg, j| {
                         const v = if (argcols[j]) |col| col.getValue(ri) else Value.null;
-                        try layout.update(self.state, rec.tail, j, agg, v);
+                        try layout.update(part.alloc, rec.tail, j, agg, v);
                     }
                 }
             }
             _ = scratch.reset(.retain_capacity);
         }
-
-        const sp = try self.state.create(FixedStore);
-        sp.* = store;
-        return .{
-            .store = .{ .fixed = sp },
-            .hashes = ghashes.items,
-            .len = store.len,
-            .key_kinds = try self.keyKinds(),
-        };
+        return self.foldSets(.fixed, parts);
     }
 
-    fn drainImpl(self: *Aggregate) anyerror!GroupSet {
+    fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
         const pull = scratch.allocator();
@@ -1884,23 +1944,15 @@ pub const Aggregate = struct {
                 if (b.len != 0 and !(try self.foldVectorized(pull, b, accs))) try self.foldRowwise(pull, b, accs);
                 _ = scratch.reset(.retain_capacity);
             }
-            return .{ .store = .{ .single = accs }, .hashes = &.{}, .len = 1, .key_kinds = &.{} };
+            const one = try self.state.alloc(GroupSet, 1);
+            one[0] = .{ .store = .{ .single = accs }, .hashes = &.{}, .len = 1, .key_kinds = &.{} };
+            return one;
         }
 
-        var ghashes = std.array_list.Managed(u64).init(self.state);
-        // One table per radix partition. A single table for millions of groups
-        // misses cache on every probe; sixty-four smaller ones stay resident,
-        // the shape DuckDB and ClickHouse both arrived at. The partition comes
-        // from the top hash bits and the bucket from the bottom, so the two
-        // never interfere.
-        const nparts = 64;
-        const part_shift = 58;
-        const tables = try self.state.alloc(GroupTable, nparts);
-        for (tables) |*t| t.* = try GroupTable.init(self.state, 256);
+        const nparts = fold_parts;
         const counts = try self.state.alloc(u32, nparts + 1);
-        const layout = try self.state.create(Layout);
-        layout.* = try Layout.init(self.state, self.aggs);
-        var store = GroupStore.init(self.state, self.by.len, layout);
+        const layout = try newIn(self.state, try Layout.init(self.state, self.aggs));
+        const parts = try self.foldParts(GroupStore, layout);
         const hctx = keyhash.MultiKeyCtx{};
         while (try self.child.next(pull)) |b| {
             const nk = self.by.len;
@@ -1942,29 +1994,27 @@ pub const Aggregate = struct {
             for (order, 0..) |ri, oi| {
                 if (oi + prefetch_ahead < order.len) {
                     const pr = order[oi + prefetch_ahead];
-                    tables[hashes[pr] >> part_shift].prefetch(hashes[pr]);
+                    parts[hashes[pr] >> part_shift].table.prefetch(hashes[pr]);
                 }
                 r = ri;
                 const probe = probes[r * nk ..][0..nk];
-                const at: u32 = @intCast(store.len);
-                const table = &tables[hashes[r] >> part_shift];
-                const f = try table.getOrPut(hashes[r], probe, &store, ghashes.items, at);
-                const rec = if (f.found) store.at(f.slot) else blk: {
-                    const nr = try store.push();
-                    for (probe, nr.keys) |v, *o| o.* = try dupeValue(self.state, v);
-                    try ghashes.append(hashes[r]);
+                const part = &parts[hashes[r] >> part_shift];
+                const at: u32 = @intCast(part.store.len);
+                const f = try part.table.getOrPut(hashes[r], probe, part.store, part.hashes.items, at);
+                const rec = if (f.found) part.store.at(f.slot) else blk: {
+                    const nr = try part.store.push();
+                    for (probe, nr.keys) |v, *o| o.* = try dupeValue(part.alloc, v);
+                    try part.hashes.append(hashes[r]);
                     break :blk nr;
                 };
                 for (self.aggs, 0..) |agg, j| {
                     const v = if (argcols[j]) |col| col.getValue(r) else Value.null;
-                    try layout.update(self.state, rec.tail, j, agg, v);
+                    try layout.update(part.alloc, rec.tail, j, agg, v);
                 }
             }
             _ = scratch.reset(.retain_capacity);
         }
-        const sp = try self.state.create(GroupStore);
-        sp.* = store;
-        return .{ .store = .{ .boxed = sp }, .hashes = ghashes.items, .len = store.len, .key_kinds = try self.keyKinds() };
+        return self.foldSets(.boxed, parts);
     }
 
     /// Open-addressed group index built for the one access pattern aggregation
@@ -1991,6 +2041,53 @@ pub const Aggregate = struct {
         };
     }
 
+    /// Fixed-size group records in blocks, addressed by index. One allocation per
+    /// block instead of one per group, and blocks never move, so an index stays
+    /// valid for the life of the store. The first blocks are small and double up
+    /// to `block` records: a parallel lane splits its groups over 64 stores, and
+    /// at low cardinality each holds a handful.
+    const RecBlocks = struct {
+        const first_shift = 4;
+        const block_shift = 13;
+        const block = 1 << block_shift;
+        /// Blocks 0..small-1 hold 16, 16, 32, … 4096 records: `block` in all.
+        const small = block_shift - first_shift + 1;
+
+        alloc: std.mem.Allocator,
+        rec_size: usize,
+        blocks: std.array_list.Managed([]u8),
+
+        fn init(alloc: std.mem.Allocator, rec_size: usize) RecBlocks {
+            return .{ .alloc = alloc, .rec_size = rec_size, .blocks = .init(alloc) };
+        }
+
+        const Loc = struct { b: usize, off: usize };
+
+        fn locate(i: usize) Loc {
+            if (i >= block) return .{ .b = small - 1 + (i >> block_shift), .off = i & (block - 1) };
+            if (i < 1 << first_shift) return .{ .b = 0, .off = i };
+            const k = std.math.log2_int(usize, i >> first_shift);
+            return .{ .b = k + 1, .off = i - (@as(usize, 1) << first_shift << k) };
+        }
+
+        fn capOf(b: usize) usize {
+            if (b >= small) return block;
+            return @as(usize, 1) << @intCast(first_shift + @max(b, 1) - 1);
+        }
+
+        fn base(self: RecBlocks, i: usize) [*]u8 {
+            const l = locate(i);
+            return self.blocks.items[l.b].ptr + l.off * self.rec_size;
+        }
+
+        /// Make room for record `i`, the one after the last.
+        fn reserve(self: *RecBlocks, i: usize) !void {
+            const l = locate(i);
+            if (l.b < self.blocks.items.len) return;
+            try self.blocks.append(try self.alloc.alignedAlloc(u8, .of(Value), capOf(l.b) * self.rec_size));
+        }
+    };
+
     /// Group storage for keys that are all fixed-width. A boxed `Value` costs 32
     /// bytes to say what eight bytes of `i64` already says, and hashing one walks
     /// a tagged union per key; here the keys are raw words with a null mask
@@ -1998,29 +2095,19 @@ pub const Aggregate = struct {
     /// state follows, laid out by `Layout` — for two keys and one count, a
     /// 32-byte record: two groups per cache line instead of one straddling two.
     const FixedStore = struct {
-        const block_shift = 13;
-        const block = 1 << block_shift;
-        const block_mask = block - 1;
-
-        alloc: std.mem.Allocator,
         nkeys: usize,
         layout: *const Layout,
-        blocks: std.array_list.Managed([]u8),
+        recs: RecBlocks,
         len: usize = 0,
 
         const Rec = struct { keys: []i64, mask: *u64, tail: [*]u8 };
 
         fn init(alloc: std.mem.Allocator, nkeys: usize, layout: *const Layout) FixedStore {
-            return .{ .alloc = alloc, .nkeys = nkeys, .layout = layout, .blocks = std.array_list.Managed([]u8).init(alloc) };
-        }
-
-        fn recSize(self: FixedStore) usize {
-            return self.nkeys * @sizeOf(i64) + @sizeOf(u64) + self.layout.size;
+            return .{ .nkeys = nkeys, .layout = layout, .recs = .init(alloc, nkeys * @sizeOf(i64) + @sizeOf(u64) + layout.size) };
         }
 
         fn at(self: FixedStore, i: usize) Rec {
-            const rec = self.recSize();
-            const base = self.blocks.items[i >> block_shift].ptr + (i & block_mask) * rec;
+            const base = self.recs.base(i);
             const ksz = self.nkeys * @sizeOf(i64);
             return .{
                 .keys = @alignCast(std.mem.bytesAsSlice(i64, base[0..ksz])),
@@ -2036,9 +2123,7 @@ pub const Aggregate = struct {
         }
 
         fn push(self: *FixedStore) !Rec {
-            if (self.len & block_mask == 0 and self.len >> block_shift == self.blocks.items.len) {
-                try self.blocks.append(try self.alloc.alignedAlloc(u8, .of(Value), block * self.recSize()));
-            }
+            try self.recs.reserve(self.len);
             const rec = self.at(self.len);
             self.len += 1;
             self.layout.clear(rec.tail);
@@ -2139,43 +2224,22 @@ pub const Aggregate = struct {
         }
     };
 
-    /// Block allocator for group keys and accumulators. One allocation per
-    /// `block` groups instead of two per group, and the accumulators of nearby
-    /// groups land next to each other. Blocks are never resized, so the slices
-    /// handed out stay valid.
-    /// Group records in fixed blocks, addressed by index. A record holds its
-    /// keys immediately followed by its accumulators, so the probe that finds a
-    /// group and the update that follows touch the same run of bytes. Blocks are
-    /// never resized, so an index stays valid for the life of the fold.
+    /// Group records, keys immediately followed by accumulators, so the probe that
+    /// finds a group and the update that follows touch the same run of bytes.
     const GroupStore = struct {
-        const block_shift = 13;
-        const block = 1 << block_shift;
-        const block_mask = block - 1;
-
-        alloc: std.mem.Allocator,
         nkeys: usize,
         layout: *const Layout,
-        blocks: std.array_list.Managed([]u8),
+        recs: RecBlocks,
         len: usize = 0,
 
         const Rec = struct { keys: []Value, tail: [*]u8 };
 
         fn init(alloc: std.mem.Allocator, nkeys: usize, layout: *const Layout) GroupStore {
-            return .{
-                .alloc = alloc,
-                .nkeys = nkeys,
-                .layout = layout,
-                .blocks = std.array_list.Managed([]u8).init(alloc),
-            };
-        }
-
-        fn recSize(self: GroupStore) usize {
-            return self.nkeys * @sizeOf(Value) + self.layout.size;
+            return .{ .nkeys = nkeys, .layout = layout, .recs = .init(alloc, nkeys * @sizeOf(Value) + layout.size) };
         }
 
         fn at(self: GroupStore, i: usize) Rec {
-            const rec = self.recSize();
-            const base = self.blocks.items[i >> block_shift].ptr + (i & block_mask) * rec;
+            const base = self.recs.base(i);
             const ksz = self.nkeys * @sizeOf(Value);
             return .{
                 .keys = @alignCast(std.mem.bytesAsSlice(Value, base[0..ksz])),
@@ -2188,9 +2252,7 @@ pub const Aggregate = struct {
         }
 
         fn push(self: *GroupStore) !Rec {
-            if (self.len & block_mask == 0 and self.len >> block_shift == self.blocks.items.len) {
-                try self.blocks.append(try self.alloc.alignedAlloc(u8, .of(Value), block * self.recSize()));
-            }
+            try self.recs.reserve(self.len);
             const rec = self.at(self.len);
             self.len += 1;
             self.layout.clear(rec.tail);
