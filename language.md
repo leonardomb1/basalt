@@ -651,8 +651,10 @@ FROM 'movimentos.csv';
   `SELECT LAG(v) OVER (PARTITION BY k ORDER BY t) AS prev FROM 't.csv'` returns `prev`
   alone.
 - Several window functions in one `SELECT` may share one `OVER (...)` —
-  `MIN(v) OVER (w), MAX(v) OVER (w)` is fine. Two *different* windows are refused; write
-  the second as a separate query or wrap the first in a derived table.
+  `MIN(v) OVER (w), MAX(v) OVER (w)` is fine, and each may frame it its own way (a
+  moving sum beside a running total). A different `PARTITION BY` or `ORDER BY` is
+  refused; write the second as a separate query or wrap the first in a derived table.
+  A window function's argument is a plain column: compute an expression in a CTE first.
 - `MIN`/`MAX` answer a value from the column and keep its type; `AVG` is always a float;
   all of them are nullable, since a peer group of nothing but nulls has no answer.
 - The names are not reserved: a column called `rank` still reads as a column.

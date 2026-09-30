@@ -871,6 +871,7 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
                     },
                     .arg = arg,
                     .offset = f.offset,
+                    .frame = .{ .rows = f.frame.rows, .unbounded = f.frame.unbounded, .preceding = f.frame.preceding },
                 };
                 fields[schema.fields.len + i] = .{ .name = f.out, .ty = ty };
             }
@@ -883,7 +884,6 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
                 .part = pk,
                 .ord = ok,
                 .funcs = kinds,
-                .frame = .{ .rows = wd.frame.rows, .unbounded = wd.frame.unbounded, .preceding = wd.frame.preceding },
                 .err = env.errctx,
             };
             return .{ .op = .{ .window = o }, .schema = out };

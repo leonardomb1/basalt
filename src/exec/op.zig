@@ -302,7 +302,6 @@ pub const Window = struct {
     part: []const Sort.Key,
     ord: []const Sort.Key,
     funcs: []const Func,
-    frame: Frame = .{},
     done: bool = false,
     err: ?*ErrCtx = null,
 
@@ -312,7 +311,7 @@ pub const Window = struct {
 
     pub const Kind = enum { row_number, rank, dense_rank, lag, lead, sum, count, min, max, avg };
     /// `arg` is the input column `lag`/`lead` reads; the ranking kinds leave it null.
-    pub const Func = struct { kind: Kind, arg: ?usize = null, offset: i64 = 1 };
+    pub const Func = struct { kind: Kind, arg: ?usize = null, offset: i64 = 1, frame: Frame = .{} };
 
     /// Do the two rows compare equal on every one of these keys?
     fn sameOn(arrs: []const KeyArr, a: usize, b: usize) bool {
@@ -419,7 +418,7 @@ pub const Window = struct {
                 // accumulates peer group by peer group, which is a running total that
                 // ties share. Both are what standard RANGE framing specifies, and both
                 // fall out of the same loop.
-                .sum, .count, .min, .max, .avg => if (self.frame.rows) {
+                .sum, .count, .min, .max, .avg => if (f.frame.rows) {
                     // A ROWS frame is a window over positions, so each row gets its own
                     // range and ties do NOT share a value — the difference from the
                     // peer-based default, and the reason a moving average needs ROWS.
@@ -455,10 +454,10 @@ pub const Window = struct {
                             dq.clearRetainingCapacity();
                             dq_head = 0;
                         }
-                        const start = if (self.frame.unbounded)
+                        const start = if (f.frame.unbounded)
                             pstart[k]
                         else blk: {
-                            const back = @as(i64, @intCast(k)) - self.frame.preceding;
+                            const back = @as(i64, @intCast(k)) - f.frame.preceding;
                             const floor = @as(i64, @intCast(pstart[k]));
                             break :blk @as(usize, @intCast(@max(back, floor)));
                         };

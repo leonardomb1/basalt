@@ -422,6 +422,43 @@ test "several IN (SELECT ...) conditions, each subquery with its own WHERE" {
     }
 }
 
+test "windows: each function keeps its own frame; DISTINCT and * see the window's output once" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "f.csv", .data = "id,v\n1,10\n2,20\n3,30\n4,40\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "m.csv", .data = "k,v\na,1\na,2\nb,3\n,4\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    // Verified against DuckDB. The frame was taken from the first function only,
+    // DISTINCT ran before the window filled its column, and `*` re-listed the
+    // window's outputs after itself.
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{
+            .q = "SELECT id, SUM(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s, SUM(v) OVER (ORDER BY id) AS r FROM '$B/f.csv' ORDER BY id",
+            .want = "id,s,r\n1,10,10\n2,30,30\n3,50,60\n4,70,100\n",
+        },
+        .{ .q = "SELECT DISTINCT k, SUM(v) OVER (PARTITION BY k) AS s FROM '$B/m.csv' ORDER BY k", .want = "k,s\na,3\nb,3\n,4\n" },
+        .{ .q = "SELECT *, ROW_NUMBER() OVER (ORDER BY v) AS rn FROM '$B/m.csv' ORDER BY rn", .want = "k,v,rn\na,1,1\na,2,2\nb,3,3\n,4,4\n" },
+        .{ .q = "SELECT * EXCEPT (v), SUM(v) OVER (ORDER BY v) AS rs FROM '$B/m.csv' ORDER BY rs", .want = "k,rs\na,1\na,3\nb,6\n,10\n" },
+    };
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try std.testing.expectError(error.ParseFailed, parser.parseSource(parena.allocator(), "SELECT k, SUM(v * 2) OVER (PARTITION BY k) AS a FROM 'm.csv';", &pdiag));
+    try std.testing.expect(std.mem.indexOf(u8, pdiag.msg, "a window function takes a plain column") != null);
+}
+
 test "aggregate: two aggregates over different expressions stay separate" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -1716,14 +1716,13 @@ pub const Parser = struct {
         var win_funcs = std.array_list.Managed(ast.WindowFunc).init(self.arena);
         var win_part = std.array_list.Managed(ast.QualName).init(self.arena);
         var win_ord = std.array_list.Managed(ast.SortKey).init(self.arena);
-        var win_frame: ast.WinFrame = .{};
         var win_outs = std.array_list.Managed([]const u8).init(self.arena);
         while (true) {
             // `ROW_NUMBER() OVER (PARTITION BY .. ORDER BY ..)` is recognised as a whole
             // select item, before the expression parser sees it: a window function is a
             // stage, not an expression, and lifting one out of the middle of an
             // arithmetic expression would need the machinery `IN (SELECT ...)` needs.
-            if (try self.parseWindowItem(&win_funcs, &win_part, &win_ord, &win_frame)) {
+            if (try self.parseWindowItem(&win_funcs, &win_part, &win_ord)) {
                 try win_outs.append(win_funcs.items[win_funcs.items.len - 1].out);
                 if (!self.eat(.comma)) break;
                 continue;
@@ -2189,7 +2188,10 @@ pub const Parser = struct {
             }
         }
 
-        if (distinct) {
+        // With a window, DISTINCT waits for its output: deduplicating before it
+        // compared rows the window had not yet filled, and `SELECT DISTINCT k,
+        // SUM(v) OVER (PARTITION BY k)` came back one row per input row.
+        if (distinct and win_funcs.items.len == 0) {
             try stages.append(.{ .node = .{ .distinct = .{ .on = distinct_on } }, .hints = &.{}, .pos = pos });
             if (distinct_drop) |outs| try stages.append(.{ .node = .{ .select = outs }, .hints = &.{}, .pos = pos });
         }
@@ -2210,8 +2212,23 @@ pub const Parser = struct {
             for (refs.items) |name| {
                 var have = false;
                 for (items.items) |it| switch (it) {
-                    // A star already carries everything.
-                    .star, .star_except, .star_rename => have = true,
+                    // A star already carries everything — except what it leaves
+                    // out or renames away, which the window still has to read.
+                    .star => have = true,
+                    .star_except => |ex| {
+                        var dropped = false;
+                        for (ex) |x| {
+                            if (std.ascii.eqlIgnoreCase(x, name)) dropped = true;
+                        }
+                        if (!dropped) have = true;
+                    },
+                    .star_rename => |rs| {
+                        var moved = false;
+                        for (rs) |r| {
+                            if (std.ascii.eqlIgnoreCase(r.from, name)) moved = true;
+                        }
+                        if (!moved) have = true;
+                    },
                     .field => |q| {
                         if (std.ascii.eqlIgnoreCase(q.last(), name)) have = true;
                     },
@@ -2230,14 +2247,20 @@ pub const Parser = struct {
                 .funcs = try win_funcs.toOwnedSlice(),
                 .partition_by = try win_part.toOwnedSlice(),
                 .order_by = try win_ord.toOwnedSlice(),
-                .frame = win_frame,
             } }, .hints = &.{}, .pos = pos });
             // Back to what the SELECT asked for: its own items, the hidden columns
             // gone, the window's outputs after them.
+            // A `*` here already sees the window's outputs, which are then named again
+            // after it: `SELECT *, ROW_NUMBER() ... AS rn` came out `k, v, rn, rn`.
             var out_items = std.array_list.Managed(ast.SelectItem).init(self.arena);
-            try out_items.appendSlice(post.items);
+            for (post.items) |it| try out_items.append(switch (it) {
+                .star => .{ .star_except = win_outs.items },
+                .star_except => |ex| .{ .star_except = try std.mem.concat(self.arena, []const u8, &.{ ex, win_outs.items }) },
+                else => it,
+            });
             for (win_outs.items) |name| try out_items.append(.{ .field = try self.singleName(name) });
             try stages.append(.{ .node = .{ .select = try out_items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
+            if (distinct) try stages.append(.{ .node = .{ .distinct = .{ .on = distinct_on } }, .hints = &.{}, .pos = pos });
         }
 
         var union_branch: ?BranchInfo = null;
@@ -2602,7 +2625,6 @@ pub const Parser = struct {
         funcs: *std.array_list.Managed(ast.WindowFunc),
         part: *std.array_list.Managed(ast.QualName),
         ord: *std.array_list.Managed(ast.SortKey),
-        frame: *ast.WinFrame,
     ) Error!bool {
         if (!self.at(.ident)) return false;
         const kind: ast.WinKind = blk: {
@@ -2636,19 +2658,16 @@ pub const Parser = struct {
             if (self.eat(.star)) {
                 // Only COUNT(*) is starrable.
                 if (kind != .count) {
-                    self.i = save;
-                    return false;
+                    return self.notWindow(save);
                 }
             } else if (self.at(.ident)) {
                 arg = try self.singleName(self.advance().text);
             } else {
-                self.i = save;
-                return false;
+                return self.notWindow(save);
             }
         } else if (kind == .lag or kind == .lead) {
             if (!self.at(.ident)) {
-                self.i = save;
-                return false;
+                return self.notWindow(save);
             }
             arg = try self.singleName(self.advance().text);
             if (self.eat(.comma)) {
@@ -2659,10 +2678,7 @@ pub const Parser = struct {
                     return self.fail(self.curPos(), "LAG/LEAD offset must not be negative — use the other function", .{});
             }
         }
-        if (!self.eat(.rparen) or !self.isKw("over")) {
-            self.i = save;
-            return false;
-        }
+        if (!self.eat(.rparen) or !self.isKw("over")) return self.notWindow(save);
         const wpos = self.curPos();
         _ = self.advance();
         _ = try self.expect(.lparen);
@@ -2720,10 +2736,12 @@ pub const Parser = struct {
         }
         _ = try self.expect(.rparen);
 
+        // Only PARTITION BY and ORDER BY have to match: a frame is per function.
+        // Comparing just those two let a second frame through and then ignored it,
+        // so a running total beside a moving sum came back as the moving sum.
         if (funcs.items.len == 0) {
             try part.appendSlice(this_part.items);
             try ord.appendSlice(this_ord.items);
-            frame.* = this_frame;
         } else {
             var same = this_part.items.len == part.items.len and this_ord.items.len == ord.items.len;
             if (same) {
@@ -2747,8 +2765,32 @@ pub const Parser = struct {
 
         _ = self.eatKw("as");
         const name = if (self.at(.ident)) self.advance().text else @tagName(kind);
-        try funcs.append(.{ .kind = kind, .out = name, .arg = arg, .offset = offset });
+        try funcs.append(.{ .kind = kind, .out = name, .arg = arg, .offset = offset, .frame = this_frame });
         return true;
+    }
+
+    /// Rewind a `name(...)` that `parseWindowItem` does not take — unless an `OVER`
+    /// follows its closing parenthesis. Then it is a window function whose argument
+    /// is not a plain column, and parsing it as an ordinary aggregate blamed a
+    /// GROUP BY the query never had.
+    fn notWindow(self: *Parser, save: usize) Error!bool {
+        self.i = save;
+        var j = save + 1;
+        var depth: usize = 0;
+        while (j < self.toks.len) : (j += 1) {
+            switch (self.toks[j].tag) {
+                .lparen => depth += 1,
+                .rparen => {
+                    depth -= 1;
+                    if (depth == 0) break;
+                },
+                .eof => return false,
+                else => {},
+            }
+        }
+        if (j + 1 < self.toks.len and self.toks[j + 1].tag == .ident and eqlNoCase(self.toks[j + 1].text, "over"))
+            return self.fail(self.curPos(), "a window function takes a plain column (or `*` for COUNT) — compute `{s}(...)`'s argument in a CTE or derived table first", .{self.toks[save].text});
+        return false;
     }
 
     fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array_list.Managed(ast.Hint)) Error!ast.Stage.Node {
