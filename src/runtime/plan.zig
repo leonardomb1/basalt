@@ -20,6 +20,7 @@ const Value = @import("../exec/value.zig").Value;
 
 const aborting = @import("env.zig").aborting;
 const Env = @import("env.zig").Env;
+const MemSource = @import("env.zig").MemSource;
 const forHintIdent = @import("env.zig").forHintIdent;
 const forHintName = @import("env.zig").forHintName;
 const mk = @import("env.zig").mk;
@@ -364,16 +365,25 @@ pub fn buildPipeline(env: *Env, stages_in: []const ast.Stage) anyerror!PipeRes {
             schema = src.schema();
         },
         .ref => |name| {
-            const b = env.bindings.get(name) orelse
-                return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown binding `{s}`", .{name}));
-            // `WITH u AS (<union>) SELECT * EXCEPT (x) FROM u`: the EXCEPT reaches the
-            // union through the binding the same as if it stood right after it.
-            const r = if (b.stages.len == 1 and b.stages[0].node == .union_)
-                try buildUnion(env, b.stages[0].node.union_, b.stages[0].hints, unionExceptNames(stages[1..]))
-            else
-                try buildPipeline(env, (try windowTopK(env.arena, b.stages, stages[1..])) orelse b.stages);
-            current = r.op;
-            schema = r.schema;
+            if (env.materialized.get(name)) |m| {
+                const ms = try env.arena.create(MemSource);
+                ms.* = .{ .m = m };
+                const scan = try env.arena.create(op.Scan);
+                scan.* = .{ .src = ms.source() };
+                current = .{ .scan = scan };
+                schema = m.schema;
+            } else {
+                const b = env.bindings.get(name) orelse
+                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown binding `{s}`", .{name}));
+                // `WITH u AS (<union>) SELECT * EXCEPT (x) FROM u`: the EXCEPT reaches the
+                // union through the binding the same as if it stood right after it.
+                const r = if (b.stages.len == 1 and b.stages[0].node == .union_)
+                    try buildUnion(env, b.stages[0].node.union_, b.stages[0].hints, unionExceptNames(stages[1..]))
+                else
+                    try buildPipeline(env, (try windowTopK(env.arena, b.stages, stages[1..])) orelse b.stages);
+                current = r.op;
+                schema = r.schema;
+            }
         },
         .union_ => |u| {
             const r = try buildUnion(env, u, stages[0].hints, unionExceptNames(stages[1..]));

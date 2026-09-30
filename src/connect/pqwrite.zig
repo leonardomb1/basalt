@@ -782,7 +782,7 @@ const UnitEnc = struct {
 
     fn write(self: *UnitEnc, b: Batch) !void {
         if (self.enc) |e| return e.writeBatch(self.arena, b);
-        try self.held.append(try copyBatch(self.arena, b));
+        try self.held.append(try b.deepCopy(self.arena));
         self.held_rows += b.len;
         if (self.held_rows < unit_min_rows) return;
         const e = try self.parent.openEncoder(self.arena);
@@ -829,16 +829,6 @@ const UnitEnc = struct {
         }.f,
     };
 };
-
-/// A batch copied out of the caller's per-batch arena, which is reset before a
-/// small unit's rows are handed on.
-fn copyBatch(a: std.mem.Allocator, b: Batch) !Batch {
-    const idx = try a.alloc(usize, b.len);
-    for (idx, 0..) |*x, i| x.* = i;
-    const cols = try a.alloc(column.Column, b.columns.len);
-    for (cols, b.columns) |*o, c| o.* = try column.permute(a, c, idx);
-    return .{ .schema = b.schema, .columns = cols, .len = b.len };
-}
 
 /// `Statistics` (ColumnMetaData field 12). Writes the modern `min_value` and
 /// `max_value` fields plus `null_count`; the legacy `min`/`max` are deliberately

@@ -10,6 +10,7 @@ const eval = @import("../exec/eval.zig");
 const csv = @import("../connect/csv.zig");
 const pqdecode = @import("../connect/pqdecode.zig");
 const driver = @import("../connect/driver.zig");
+const Batch = @import("../exec/batch.zig").Batch;
 const sql = @import("../connect/sql.zig");
 const registry = @import("../connect/registry.zig");
 const azure = @import("../connect/azure.zig");
@@ -339,6 +340,12 @@ pub const Env = struct {
     /// `CALL` renders through the for-each machinery. Expression-form functions
     /// never reach here; expand.zig inlined them.
     fns: *const std.StringHashMap(ast.FnDecl),
+    /// Bindings the run already computed for the pipeline about to be planned —
+    /// an aggregate CTE run on the parallel paths. The planner reads these rather
+    /// than rebuilding the binding serially. See `run.materializeBinding`.
+    materialized: std.StringHashMapUnmanaged(Materialized) = .{},
+    /// Where a `__memory` write lands while a binding is materialized.
+    mem_sink: ?*MemSink = null,
     /// The PARAMs and LETs as `${...}` interpolation bindings — the outer scope of
     /// every loop row, and the whole scope for a statement outside any loop.
     /// Empty when the script declares neither.
@@ -418,6 +425,66 @@ pub const Env = struct {
 };
 
 pub const PipeRes = struct { op: op.Op, schema: types.Schema };
+
+/// A binding's rows, computed ahead of the pipeline that reads them.
+pub const Materialized = struct { schema: types.Schema, batches: []const Batch };
+
+/// Collects a pipeline's output in memory. Writes arrive one at a time (a shared
+/// sink is serialized), and each batch is copied out of the arena it came in.
+pub const MemSink = struct {
+    arena: std.mem.Allocator,
+    batches: std.array_list.Managed(Batch),
+    /// Set when the sink is opened, so an empty result still has columns.
+    schema: types.Schema = .{ .fields = &.{} },
+
+    pub fn sink(self: *MemSink) driver.Sink {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = driver.Sink.VTable{
+        .writeBatch = struct {
+            fn f(p: *anyopaque, _: std.mem.Allocator, b: Batch) anyerror!void {
+                const self: *MemSink = @ptrCast(@alignCast(p));
+                try self.batches.append(try b.deepCopy(self.arena));
+            }
+        }.f,
+        .close = struct {
+            fn f(_: *anyopaque) anyerror!void {}
+        }.f,
+        .abort = struct {
+            fn f(_: *anyopaque) void {}
+        }.f,
+    };
+};
+
+/// Hands back materialized batches as a source.
+pub const MemSource = struct {
+    m: Materialized,
+    next_i: usize = 0,
+
+    pub fn source(self: *MemSource) driver.Source {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = driver.Source.VTable{
+        .schema = struct {
+            fn f(p: *anyopaque) types.Schema {
+                return @as(*MemSource, @ptrCast(@alignCast(p))).m.schema;
+            }
+        }.f,
+        .next = struct {
+            fn f(p: *anyopaque, _: std.mem.Allocator) anyerror!?Batch {
+                const self: *MemSource = @ptrCast(@alignCast(p));
+                if (self.next_i >= self.m.batches.len) return null;
+                defer self.next_i += 1;
+                return self.m.batches[self.next_i];
+            }
+        }.f,
+        .close = struct {
+            fn f(_: *anyopaque) void {}
+        }.f,
+    };
+};
 
 /// One discovery row: the first `var_names.len` columns coerced to text.
 pub const Row = []const []const u8;

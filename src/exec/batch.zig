@@ -6,6 +6,7 @@ const std = @import("std");
 const types = @import("../lang/types.zig");
 const Column = @import("column.zig").Column;
 const intColumn = @import("column.zig").intColumn;
+const permute = @import("column.zig").permute;
 
 pub const Batch = struct {
     schema: *const types.Schema,
@@ -15,6 +16,16 @@ pub const Batch = struct {
     pub fn column(self: Batch, name: []const u8) ?*Column {
         const idx = self.schema.indexOf(name) orelse return null;
         return &self.columns[idx];
+    }
+
+    /// Every column copied into `a`, for a batch that must outlive the per-batch
+    /// arena it was produced in.
+    pub fn deepCopy(self: Batch, a: std.mem.Allocator) !Batch {
+        const idx = try a.alloc(usize, self.len);
+        for (idx, 0..) |*x, i| x.* = i;
+        const cols = try a.alloc(Column, self.columns.len);
+        for (cols, self.columns) |*o, c| o.* = try permute(a, c, idx);
+        return .{ .schema = self.schema, .columns = cols, .len = self.len };
     }
 };
 

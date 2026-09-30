@@ -310,7 +310,11 @@ pub fn isLocalParquetRead(rd: ast.Read) bool {
 /// Label for a *write* target: the `csv` connector covers every file sink, so
 /// the format has to come from the target itself or telemetry reports parquet
 /// writes as csv.
+/// The write target of a binding materialized for the pipeline that reads it.
+pub const mem_connector = "__memory";
+
 pub fn sinkLabel(env: *Env, w: ast.Write) []const u8 {
+    if (std.mem.eql(u8, w.connector, mem_connector)) return "memory";
     if (std.mem.eql(u8, w.connector, "csv") and pqwrite.Writer.isPath(w.target)) return "parquet";
     if (std.mem.eql(u8, w.connector, "csv") and arrowread.isPath(w.target)) return "arrow";
     return connectorType(env, w.connector);
@@ -1296,6 +1300,10 @@ const StdoutSink = struct {
 };
 
 pub fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
+    if (std.mem.eql(u8, w.connector, mem_connector)) {
+        env.mem_sink.?.schema = try dupeSchema(env.arena, schema);
+        return env.mem_sink.?.sink();
+    }
     if (env.explain) return DiscardSink.sink();
     if (std.mem.eql(u8, w.connector, "stdout")) {
         var info = env.takeResult();

@@ -1148,16 +1148,6 @@ const OrderedOut = struct {
     }
 };
 
-/// A batch copied out of the lane's per-batch arena, which is reset before the
-/// unit it belongs to is written.
-fn copyBatch(a: std.mem.Allocator, b: Batch) !Batch {
-    const idx = try a.alloc(usize, b.len);
-    for (idx, 0..) |*x, i| x.* = i;
-    const cols = try a.alloc(column.Column, b.columns.len);
-    for (cols, b.columns) |*o, c| o.* = try column.permute(a, c, idx);
-    return .{ .schema = b.schema, .columns = cols, .len = b.len };
-}
-
 const mapWorker = dispatchWorker(MapCtx, mapWorkOne);
 
 /// An ordered map lane: unlike `mapWorker`, one set of arenas for the lane's whole
@@ -1276,7 +1266,7 @@ fn mapOrderedUnit(ctx: *MapCtx, ord: *OrderedOut, i: usize, warena: *std.heap.Ar
                 } else try unit.parts.append(if (render)
                     .{ .bytes = try snk.renderBatch(ua, b).? }
                 else
-                    .{ .batch = try copyBatch(ua, b) });
+                    .{ .batch = try b.deepCopy(ua) });
                 out += b.len;
             }
             _ = batch_arena.reset(.retain_capacity);

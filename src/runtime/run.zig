@@ -71,6 +71,7 @@ const sqlConnInfo = @import("connect.zig").sqlConnInfo;
 const factsIfWanted = @import("connect.zig").factsIfWanted;
 const readReport = @import("connect.zig").readReport;
 const env_mod = @import("env.zig");
+const mem_connector = @import("connect.zig").mem_connector;
 const SplitCtx = @import("connect.zig").SplitCtx;
 
 const buildPipeline = @import("plan.zig").buildPipeline;
@@ -471,11 +472,48 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
 
 /// `runOutput` past the bookkeeping: plan and move the rows. Split off so the
 /// caller sees the error a load failed with, for its report.
+/// `SELECT ... FROM (SELECT k, SUM(v) FROM t GROUP BY k) x` — or the same through
+/// a CTE: the binding is an aggregate over a file or table, which the parallel
+/// paths only take when it is the pipeline itself. Built where it is read, it ran on
+/// one thread whatever `-j` said. So it is run first, on those paths, into memory,
+/// and the pipeline reads the rows back; an aggregate holds all its groups anyway,
+/// so this keeps nothing a serial run would not. Returns the binding's name when it
+/// was materialized, for the caller to drop afterwards.
+fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!?[]const u8 {
+    if (opts.threads < 2 or env.explain or stages[0].node != .ref) return null;
+    const name = stages[0].node.ref;
+    if (env.materialized.contains(name)) return null;
+    const b = env.bindings.get(name) orelse return null;
+    if (b.stages.len < 2 or b.stages[0].node != .read) return null;
+    for (b.stages) |st| {
+        if (st.node == .aggregate) break;
+    } else return null;
+
+    const inner = try env.arena.alloc(ast.Stage, b.stages.len + 1);
+    @memcpy(inner[0..b.stages.len], b.stages);
+    const w = ast.Write{ .connector = mem_connector, .form = null, .target = "", .mode = .overwrite };
+    inner[b.stages.len] = .{ .node = .{ .write = w }, .hints = &.{}, .pos = b.pos };
+    var ms = env_mod.MemSink{ .arena = env.arena, .batches = std.array_list.Managed(Batch).init(env.arena) };
+    const outer_sink = env.mem_sink;
+    env.mem_sink = &ms;
+    defer env.mem_sink = outer_sink;
+    var scratch: Stats = .{};
+    var delegated = false;
+    try runOutputBody(env, opts, inner, inner[b.stages.len].node, &scratch, lanes_used, batch_arena, &delegated);
+    try env.materialized.put(env.arena, name, .{ .schema = ms.schema, .batches = ms.batches.items });
+    return name;
+}
+
 fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, last: @FieldType(ast.Stage, "node"), stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, delegated: *bool) anyerror!void {
     var opts = opts_in;
     const arena = env.arena;
     const gpa = env.gpa;
     var stages = stages_in;
+
+    const mat = try materializeBinding(env, opts, stages, lanes_used, batch_arena);
+    defer if (mat) |name| {
+        _ = env.materialized.remove(name);
+    };
 
     var ddiag = analyze.Diag{};
     env.csv_in = analyze.dialectFromHints(stages[0].hints, &ddiag) catch
