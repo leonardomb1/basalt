@@ -600,8 +600,10 @@ apart.
 Row order without `ORDER BY` is not defined in SQL, and `GROUP BY` returns groups
 in hash-partition order. A pipeline that only filters, projects or joins keeps the
 source's order at any `-j` — to the terminal, a CSV, a parquet or an Arrow file —
-so the same run writes the same bytes; lanes still read in parallel, and their
-output is put back in order before it is written. Loading into a database table
+so the same run writes the same rows in the same order; lanes still read in
+parallel, and their output is put back in order before it is written. A parquet
+file's row groups follow those lanes' units (each lane encodes its own), so its
+layout, not its rows, can differ from a `-j 1` run. Loading into a database table
 does not order its rows (a table has none). `DISTINCT` keeps the first row per
 key in input order at any `-j`. Add `ORDER BY` whenever the order is part of
 the answer.

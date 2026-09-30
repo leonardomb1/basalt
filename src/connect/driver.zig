@@ -199,7 +199,18 @@ pub const Sink = struct {
         renderBatch: ?*const fn (*anyopaque, std.mem.Allocator, Batch) anyerror![]const u8 = null,
         /// Append bytes produced by `renderBatch`. Only meaningful together with it.
         writeRendered: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
+        /// An encoder for one ordered unit of a parallel run, for a sink whose
+        /// expensive part spans many batches — a parquet row group. A lane feeds it
+        /// and seals it outside any lock; the unit's turn then only appends.
+        openUnit: ?*const fn (*anyopaque, std.mem.Allocator) anyerror!UnitEncoder = null,
     };
+
+    /// Null when the sink has no unit form; `arena` holds the encoder's work and
+    /// must outlive `commit`.
+    pub fn openUnit(self: Sink, arena: std.mem.Allocator) ?anyerror!UnitEncoder {
+        const f = self.vtable.openUnit orelse return null;
+        return f(self.ptr, arena);
+    }
 
     pub fn writeBatch(self: Sink, arena: std.mem.Allocator, b: Batch) anyerror!void {
         return self.vtable.writeBatch(self.ptr, arena, b);
@@ -223,6 +234,35 @@ pub const Sink = struct {
     }
     pub fn abort(self: Sink) void {
         self.vtable.abort(self.ptr);
+    }
+};
+
+/// One unit's rows, encoded by a lane for the sink that opened it. `write` and
+/// `seal` run on the lane, concurrently with other units; `commit` appends the
+/// result to the sink, in unit order and one at a time. `discard` releases an
+/// encoder that will not be committed.
+pub const UnitEncoder = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        write: *const fn (*anyopaque, std.mem.Allocator, Batch) anyerror!void,
+        seal: *const fn (*anyopaque) anyerror!void,
+        commit: *const fn (*anyopaque) anyerror!void,
+        discard: *const fn (*anyopaque) void,
+    };
+
+    pub fn write(self: UnitEncoder, arena: std.mem.Allocator, b: Batch) anyerror!void {
+        return self.vtable.write(self.ptr, arena, b);
+    }
+    pub fn seal(self: UnitEncoder) anyerror!void {
+        return self.vtable.seal(self.ptr);
+    }
+    pub fn commit(self: UnitEncoder) anyerror!void {
+        return self.vtable.commit(self.ptr);
+    }
+    pub fn discard(self: UnitEncoder) void {
+        self.vtable.discard(self.ptr);
     }
 };
 

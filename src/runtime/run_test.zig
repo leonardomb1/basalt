@@ -978,6 +978,38 @@ test "parallel map keeps file order: a threaded load writes the rows a serial on
     }
 }
 
+test "parallel load into parquet: lanes encode row groups, the file keeps every row in order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    try input.appendSlice("id,s\n");
+    // Four lanes cut this into four units of 60k rows: each over the size at which
+    // a lane encodes its own row group rather than handing the rows on.
+    for (0..240_000) |i| try input.writer().print("{d},s{d}\n", .{ i, i % 1000 });
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = input.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    // Written with four lanes, read back serially: the same rows in file order,
+    // with chunk offsets that point at real pages — a misplaced one fails to decode.
+    const script = try std.fmt.allocPrint(alloc,
+        \\LOAD INTO '{s}/out.parquet' AS SELECT id, s FROM '{s}/in.csv';
+        \\LOAD INTO '{s}/back.csv' AS SELECT id, s FROM '{s}/out.parquet';
+    , .{ base, base, base, base });
+    defer alloc.free(script);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    _ = try run(alloc, prog, .{ .threads = 4 }, &rdiag);
+    const got = try tmp.dir.readFileAlloc(alloc, "back.csv", 64 << 20);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings(input.items, got);
+}
+
 /// A parquet file with three row groups — enough for the parallel scan, which needs
 /// at least `pq_min_lanes` lanes and more than one row group. 5000 rows of
 /// `id = 1..5000`, `f = id * 0.5` and `g = id % 4` (a low-cardinality group key), so

@@ -26,6 +26,7 @@ const http_client = @import("http_client.zig");
 const objstore = @import("objstore.zig");
 const types = @import("../lang/types.zig");
 const Batch = @import("../exec/batch.zig").Batch;
+const column = @import("../exec/column.zig");
 const Decimal = @import("../exec/value.zig").Decimal;
 const Value = @import("../exec/value.zig").Value;
 
@@ -350,6 +351,9 @@ pub const Writer = struct {
     total_rows: i64 = 0,
     offset: i64 = 0,
     groups: List(RowGroupMeta),
+    /// Rows per row group. A unit encoder takes a larger cap: its group is one
+    /// unit's worth of rows, already bounded by the unit.
+    group_rows: usize = row_group_rows,
 
     /// A local file, or an object staged over HTTP. Both expose a plain
     /// `*std.Io.Writer`, so page and footer emission below is identical either
@@ -357,12 +361,15 @@ pub const Writer = struct {
     const Backend = union(enum) {
         file: std.fs.File,
         object: objstore.Writer,
+        /// A unit encoder's row groups, before `appendEncoded` places them.
+        memory: *std.Io.Writer.Allocating,
     };
 
     fn dest(self: *Writer) *std.Io.Writer {
         return switch (self.backend) {
             .file => &self.fw.interface,
             .object => |o| o.io,
+            .memory => |m| &m.writer,
         };
     }
 
@@ -430,7 +437,7 @@ pub const Writer = struct {
     /// `objstore.Writer.specific`); a file's error is already the real one.
     fn specific(self: *Writer, e: anyerror) anyerror {
         return switch (self.backend) {
-            .file => e,
+            .file, .memory => e,
             .object => |o| o.specific(e),
         };
     }
@@ -465,7 +472,7 @@ pub const Writer = struct {
             }
             self.rows += 1;
             self.total_rows += 1;
-            if (self.rows >= row_group_rows) try self.flushRowGroup();
+            if (self.rows >= self.group_rows) try self.flushRowGroup();
         }
     }
 
@@ -631,13 +638,11 @@ pub const Writer = struct {
             // happens only once the footer is written — so a reader never observes
             // a Parquet object without one. Atomic publication, for free.
             .object => |o| o.finish() catch |e| return self.specific(e),
+            // an encoder's bytes are placed by `appendEncoded`, never closed
+            .memory => {},
         }
     }
 
-    /// A partial Parquet file has no footer and is unreadable, which is the
-    /// correct outcome for an aborted run — there is nothing to roll back. A blob
-    /// is stronger: skipping the block-list commit means the object never appears
-    /// at all, and Azure discards the staged blocks after a week.
     /// Once only: `abort` may follow a `close` that failed after freeing it.
     fn freeScratch(self: *Writer) void {
         if (!self.scratch_live) return;
@@ -645,6 +650,10 @@ pub const Writer = struct {
         self.scratch_live = false;
     }
 
+    /// A partial Parquet file has no footer and is unreadable, which is the
+    /// correct outcome for an aborted run — there is nothing to roll back. A blob
+    /// is stronger: skipping the block-list commit means the object never appears
+    /// at all, and Azure discards the staged blocks after a week.
     pub fn abort(self: *Writer) void {
         self.freeScratch();
         switch (self.backend) {
@@ -652,7 +661,7 @@ pub const Writer = struct {
             // Staged blocks and an uncompleted multipart upload are invisible to
             // readers. Azure reaps them after a week; S3 only where the bucket has
             // a lifecycle rule.
-            .object => {},
+            .object, .memory => {},
         }
     }
 
@@ -704,7 +713,132 @@ pub const Writer = struct {
     pub fn sink(self: *Writer) driver.Sink {
         return .{ .ptr = self, .vtable = &sink_vtable };
     }
+
+    /// A writer into memory for one unit of a parallel run: the same schema and
+    /// encoding, no magic, offsets from zero. `appendEncoded` moves its row groups
+    /// into this one.
+    fn openEncoder(self: *Writer, arena: std.mem.Allocator) !*Writer {
+        const cols = try arena.alloc(ColBuf, self.cols.len);
+        for (cols, self.maps) |*c, m| {
+            c.* = ColBuf.init(arena);
+            c.dict_ok = m.phys == .byte_array;
+        }
+        const mem = try arena.create(std.Io.Writer.Allocating);
+        mem.* = std.Io.Writer.Allocating.init(arena);
+        const e = try arena.create(Writer);
+        e.* = .{
+            .arena = arena,
+            .scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .backend = .{ .memory = mem },
+            .schema = self.schema,
+            .maps = self.maps,
+            .compression = self.compression,
+            .cols = cols,
+            .groups = List(RowGroupMeta).init(arena),
+            .group_rows = unit_group_rows,
+        };
+        return e;
+    }
+
+    /// Place an encoder's row groups after everything written so far. Rows this
+    /// writer still buffers came first, so they are flushed as a group of their own.
+    fn appendEncoded(self: *Writer, enc: *Writer) !void {
+        try self.flushRowGroup();
+        const base = self.offset;
+        try self.emit(enc.backend.memory.written());
+        for (enc.groups.items) |g| {
+            const chunks = try self.arena.alloc(ChunkMeta, g.chunks.len);
+            for (g.chunks, chunks) |c, *o| {
+                o.* = c;
+                o.offset += base;
+                if (c.dict) o.dict_offset += base;
+                o.min = try ownOpt(self.arena, c.min);
+                o.max = try ownOpt(self.arena, c.max);
+            }
+            try self.groups.append(.{ .chunks = chunks, .num_rows = g.num_rows, .total_byte_size = g.total_byte_size });
+            self.total_rows += g.num_rows;
+        }
+    }
 };
+
+/// A unit encoder's cap per row group. Units are a few MB of input or one source
+/// row group, so this is rarely reached; it bounds a unit that is not.
+const unit_group_rows = 4 * row_group_rows;
+
+/// Below this many rows a unit is not worth a row group of its own: a selective
+/// filter would leave the file a string of tiny groups. Its rows are handed to the
+/// writer instead, which gathers them with the next into full-size groups.
+const unit_min_rows = row_group_rows / 2;
+
+/// One ordered unit's rows, encoded to row groups on the lane that read them.
+/// Encoding and compression were the whole cost of a parallel load into parquet,
+/// and they ran on whichever lane held the writer, one row group at a time.
+const UnitEnc = struct {
+    parent: *Writer,
+    arena: std.mem.Allocator,
+    held: List(Batch),
+    held_rows: usize = 0,
+    enc: ?*Writer = null,
+
+    fn write(self: *UnitEnc, b: Batch) !void {
+        if (self.enc) |e| return e.writeBatch(self.arena, b);
+        try self.held.append(try copyBatch(self.arena, b));
+        self.held_rows += b.len;
+        if (self.held_rows < unit_min_rows) return;
+        const e = try self.parent.openEncoder(self.arena);
+        self.enc = e;
+        for (self.held.items) |hb| try e.writeBatch(self.arena, hb);
+        self.held.clearRetainingCapacity();
+    }
+
+    fn seal(self: *UnitEnc) !void {
+        const e = self.enc orelse return;
+        defer e.freeScratch();
+        try e.flushRowGroup();
+    }
+
+    fn commit(self: *UnitEnc) !void {
+        if (self.enc) |e| return self.parent.appendEncoded(e);
+        for (self.held.items) |b| try self.parent.writeBatch(self.arena, b);
+    }
+
+    fn discard(self: *UnitEnc) void {
+        if (self.enc) |e| e.freeScratch();
+    }
+
+    const vtable = driver.UnitEncoder.VTable{
+        .write = struct {
+            fn f(p: *anyopaque, _: std.mem.Allocator, b: Batch) anyerror!void {
+                return @as(*UnitEnc, @ptrCast(@alignCast(p))).write(b);
+            }
+        }.f,
+        .seal = struct {
+            fn f(p: *anyopaque) anyerror!void {
+                return @as(*UnitEnc, @ptrCast(@alignCast(p))).seal();
+            }
+        }.f,
+        .commit = struct {
+            fn f(p: *anyopaque) anyerror!void {
+                return @as(*UnitEnc, @ptrCast(@alignCast(p))).commit();
+            }
+        }.f,
+        .discard = struct {
+            fn f(p: *anyopaque) void {
+                @as(*UnitEnc, @ptrCast(@alignCast(p))).discard();
+            }
+        }.f,
+    };
+};
+
+/// A batch copied out of the caller's per-batch arena, which is reset before a
+/// small unit's rows are handed on.
+fn copyBatch(a: std.mem.Allocator, b: Batch) !Batch {
+    const idx = try a.alloc(usize, b.len);
+    for (idx, 0..) |*x, i| x.* = i;
+    const cols = try a.alloc(column.Column, b.columns.len);
+    for (cols, b.columns) |*o, c| o.* = try column.permute(a, c, idx);
+    return .{ .schema = b.schema, .columns = cols, .len = b.len };
+}
 
 /// `Statistics` (ColumnMetaData field 12). Writes the modern `min_value` and
 /// `max_value` fields plus `null_count`; the legacy `min`/`max` are deliberately
@@ -1012,7 +1146,13 @@ const sink_vtable = driver.Sink.VTable{
     .writeBatch = sinkWrite,
     .close = sinkClose,
     .abort = sinkAbort,
+    .openUnit = sinkOpenUnit,
 };
+fn sinkOpenUnit(p: *anyopaque, arena: std.mem.Allocator) anyerror!driver.UnitEncoder {
+    const u = try arena.create(UnitEnc);
+    u.* = .{ .parent = @ptrCast(@alignCast(p)), .arena = arena, .held = List(Batch).init(arena) };
+    return .{ .ptr = u, .vtable = &UnitEnc.vtable };
+}
 fn sinkWrite(p: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
     return @as(*Writer, @ptrCast(@alignCast(p))).writeBatch(arena, b);
 }
@@ -1027,7 +1167,6 @@ fn sinkAbort(p: *anyopaque) void {
 
 const testing = std.testing;
 const pqdecode = @import("pqdecode.zig");
-const column = @import("../exec/column.zig");
 
 test "basalt types map onto Parquet physical and converted types" {
     try testing.expectEqual(parquet.PhysicalType.boolean, (try mapType(types.Type.init(.bool))).phys);

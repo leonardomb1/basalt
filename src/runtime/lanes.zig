@@ -1046,7 +1046,7 @@ const OrderedOut = struct {
     /// time faulted in every output byte again, a third of a parquet-to-CSV move.
     free: ?*Unit = null,
 
-    const Part = union(enum) { bytes: []const u8, batch: Batch };
+    const Part = union(enum) { bytes: []const u8, batch: Batch, encoded: driver.UnitEncoder };
     const Unit = struct { arena: std.heap.ArenaAllocator, parts: std.array_list.Managed(Part), next_free: ?*Unit = null };
 
     fn init(arena: std.mem.Allocator, nunits: usize, window: usize, snk: driver.Sink) !OrderedOut {
@@ -1107,6 +1107,7 @@ const OrderedOut = struct {
         for (u.parts.items) |part| switch (part) {
             .bytes => |b| try snk.writeRendered(b),
             .batch => |b| try snk.writeBatch(u.arena.allocator(), b),
+            .encoded => |e| try e.commit(),
         };
     }
 
@@ -1250,6 +1251,9 @@ fn mapOrderedUnit(ctx: *MapCtx, ord: *OrderedOut, i: usize, warena: *std.heap.Ar
     const ua = unit.arena.allocator();
     const snk = ord.snk;
     const render = snk.canRender();
+    // A sink with a unit form (parquet) encodes the whole unit here, on the lane.
+    const enc: ?driver.UnitEncoder = if (snk.openUnit(ua)) |r| try r else null;
+    errdefer if (enc) |e| e.discard();
 
     var out: u64 = 0;
     if (try laneRowSource(ctx.split.rows(i, ctx.queue.nitems), warena.allocator())) |inner| {
@@ -1262,9 +1266,14 @@ fn mapOrderedUnit(ctx: *MapCtx, ord: *OrderedOut, i: usize, warena: *std.heap.Ar
         else
             mapped_chain;
         while (try chain.next(batch_arena.allocator())) |b| {
-            if (ctx.queue.failed.load(.seq_cst)) return;
+            if (ctx.queue.failed.load(.seq_cst)) {
+                if (enc) |e| e.discard();
+                return;
+            }
             if (b.len > 0) {
-                try unit.parts.append(if (render)
+                if (enc) |e| {
+                    try e.write(batch_arena.allocator(), b);
+                } else try unit.parts.append(if (render)
                     .{ .bytes = try snk.renderBatch(ua, b).? }
                 else
                     .{ .batch = try copyBatch(ua, b) });
@@ -1272,6 +1281,10 @@ fn mapOrderedUnit(ctx: *MapCtx, ord: *OrderedOut, i: usize, warena: *std.heap.Ar
             }
             _ = batch_arena.reset(.retain_capacity);
         }
+    }
+    if (enc) |e| {
+        try e.seal();
+        try unit.parts.append(.{ .encoded = e });
     }
     _ = ctx.rows_out.fetchAdd(out, .monotonic);
     handed = true;
