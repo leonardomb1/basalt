@@ -369,6 +369,31 @@ test "CASE / COALESCE / greatest mixing int and float are float on every row, no
     }
 }
 
+test "DISTINCT ON with ORDER BY keeps the first row per key in ORDER BY order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "d.csv", .data = "k,v,t\n1,10,3\n1,20,1\n1,30,2\n2,5,9\n2,6,8\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    // Sorted after the distinct, the first row in INPUT order was kept: the
+    // "latest row per key" idiom returned the wrong rows. Verified against DuckDB.
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT DISTINCT ON (k) k, v, t FROM '$B/d.csv' ORDER BY k, t", .want = "k,v,t\n1,20,1\n2,6,8\n" },
+        .{ .q = "SELECT DISTINCT ON (k) k, v FROM '$B/d.csv' ORDER BY k, t DESC", .want = "k,v\n1,10\n2,5\n" },
+        .{ .q = "SELECT DISTINCT ON (k) k, v, t FROM '$B/d.csv'", .want = "k,v,t\n1,10,3\n2,5,9\n" },
+    };
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+}
+
 test "aggregate: two aggregates over different expressions stay separate" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3433,7 +3458,9 @@ test "DISTINCT ON keys are input columns: renamed, unprojected, and beside an OR
     , 1, &.{});
     try expectFile(&tmp, "renamed.csv", "k,u\nb,B\na,A\n");
     try expectFile(&tmp, "hidden.csv", "id,amt\n1,10\n3,5\n");
-    try expectFile(&tmp, "sorted.csv", "id\n1\n3\n");
+    // The highest `amt` per group, in `amt DESC` order (DuckDB/Postgres); it was
+    // the first row per group in input order, sorted afterwards.
+    try expectFile(&tmp, "sorted.csv", "id\n4\n2\n");
     try expectFile(&tmp, "output.csv", "k,id\na,1\nb,3\n");
     try expectFile(&tmp, "pair.csv", "id\n1\n2\n3\n4\n");
 }

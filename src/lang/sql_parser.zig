@@ -1607,7 +1607,17 @@ pub const Parser = struct {
                 }
             }
             if (hidden_drop == null) hidden_drop = visible;
-            try stages.append(.{ .node = .{ .sort = .{ .keys = sort_keys } }, .hints = &.{}, .pos = self.curPos() });
+            const sort_stage: ast.Stage = .{ .node = .{ .sort = .{ .keys = sort_keys } }, .hints = &.{}, .pos = self.curPos() };
+            // `DISTINCT ON (k) ... ORDER BY k, t` keeps the first row per key in
+            // ORDER BY order, as Postgres and DuckDB do: sorted after, the distinct
+            // had already kept the first in input order, and "latest row per key"
+            // silently returned the wrong rows. The distinct keeps first occurrences
+            // in order, so its output stays sorted.
+            const last = stages.items.len - 1;
+            if (stages.items[last].node == .distinct and stages.items[last].node.distinct.on != null)
+                try stages.insert(last, sort_stage)
+            else
+                try stages.append(sort_stage);
         }
 
         if (self.eatKw("limit")) {

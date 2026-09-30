@@ -591,7 +591,7 @@ apart.
 | `ORDER BY a DESC, b` | sort |
 | `LIMIT n [OFFSET m]` | limit |
 | `SELECT * EXCEPT (a, b)` / `EXCLUDE` | every column but those; a name not present is ignored, so one list serves tables that differ. Right after a union (`EACH TABLE OF`, `UNION ALL BY NAME`) the names are dropped *before* the branches are reconciled, so a column one table carries with an incompatible type can be excepted instead of failing the load. A name may be `IDENTIFIER(<expr>)` — a `$param` or loop variable rendered at run time, `'a, b'` excluding both and `''` nothing |
-| `SELECT DISTINCT` / `DISTINCT ON (a, b)` | distinct — `ON` keys are input columns: they need not be in the SELECT list, and may be ones it renames (`DISTINCT ON (grp) grp AS k`) |
+| `SELECT DISTINCT` / `DISTINCT ON (a, b)` | distinct — `ON` keys are input columns: they need not be in the SELECT list, and may be ones it renames (`DISTINCT ON (grp) grp AS k`). `DISTINCT ON` keeps the first row per key in `ORDER BY` order when there is one (`ORDER BY k, ts DESC` keeps the latest), else the first in input order |
 | `CROSS JOIN UNNEST(SPLIT(tags, ',')) AS tag` | explode (also `UNNEST(col)`) |
 | `CROSS JOIN UNNEST(JSON_EACH(tags)) AS tag` | explode a JSON array: one row per element — strings unquoted, objects and arrays as JSON text, a JSON `null` as null. A null or `null` cell gives no rows; an object or scalar is an error |
 | `[INNER\|LEFT\|RIGHT\|FULL\|CROSS\|SEMI\|ANTI] JOIN <cte> x ON a = b [AND c = d ...]` | join (right side must be a CTE) |
@@ -689,7 +689,7 @@ WHERE anterior IS NOT NULL;
 A window is a **breaker**: a row's number is not known until its whole partition has
 arrived, so memory is bounded by the input, as it already is for `ORDER BY`, `DISTINCT`
 and `GROUP BY`. `DISTINCT ON (...)` remains the cheaper way to keep one row per key —
-it streams, where `ROW_NUMBER() ... = 1` would not.
+without an `ORDER BY` it streams, where `ROW_NUMBER() ... = 1` would not.
 
 ### Subqueries in a predicate
 
