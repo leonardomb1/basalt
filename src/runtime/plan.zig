@@ -371,7 +371,7 @@ pub fn buildPipeline(env: *Env, stages_in: []const ast.Stage) anyerror!PipeRes {
             const r = if (b.stages.len == 1 and b.stages[0].node == .union_)
                 try buildUnion(env, b.stages[0].node.union_, b.stages[0].hints, unionExceptNames(stages[1..]))
             else
-                try buildPipeline(env, b.stages);
+                try buildPipeline(env, (try windowTopK(env.arena, b.stages, stages[1..])) orelse b.stages);
             current = r.op;
             schema = r.schema;
         },
@@ -639,6 +639,78 @@ pub fn unionDownstreamMapOnly(stages: []const ast.Stage) bool {
     return true;
 }
 
+/// `SELECT ... FROM (SELECT ..., ROW_NUMBER() OVER (...) AS rn ...) WHERE rn <= k`:
+/// the binding's window only has to rank each partition's first `k` rows, so it is
+/// rebuilt with `top_k` and keeps those as they stream by. Holding and sorting every
+/// row took 2 GB and six seconds over 10M rows for a dedup that keeps a handful.
+///
+/// Only when the window's one function is `ROW_NUMBER`, the stages after it are
+/// projections that keep its column, and the reading query's first stage filters
+/// it from above (`rn <= k`, `rn < k`, `rn = k` — the filter still runs, so any
+/// `AND` beside it is unaffected). A binding is rebuilt for each reference, so
+/// another reader of the same CTE still gets every row. Null otherwise.
+fn windowTopK(arena: std.mem.Allocator, bstages: []const ast.Stage, after: []const ast.Stage) !?[]const ast.Stage {
+    if (after.len == 0 or after[0].node != .filter) return null;
+    var wi = bstages.len;
+    while (wi > 0) {
+        wi -= 1;
+        if (bstages[wi].node == .window) break;
+    } else return null;
+    if (bstages[wi].node != .window) return null;
+    const wd = bstages[wi].node.window;
+    if (wd.funcs.len != 1 or wd.funcs[0].kind != .row_number) return null;
+    const rn = wd.funcs[0].out;
+    for (bstages[wi + 1 ..]) |st| {
+        if (st.node != .select) return null;
+        var kept = false;
+        for (st.node.select) |it| switch (it) {
+            .star => kept = true,
+            .field => |q| {
+                if (std.mem.eql(u8, q.last(), rn)) kept = true;
+            },
+            else => {},
+        };
+        if (!kept) return null;
+    }
+    const k = rankBound(after[0].node.filter, rn) orelse return null;
+    const out = try arena.dupe(ast.Stage, bstages);
+    var w = wd;
+    w.top_k = k;
+    out[wi].node = .{ .window = w };
+    return out;
+}
+
+/// The highest rank a filter keeps, from an AND-conjunct `rn <= c`, `rn < c`,
+/// `rn = c` or the same written the other way round. Null when none bounds it.
+fn rankBound(e: *const ast.Expr, rn: []const u8) ?u64 {
+    if (e.* != .binary) return null;
+    const b = e.binary;
+    if (b.op == .@"and") {
+        const l = rankBound(b.l, rn);
+        const r = rankBound(b.r, rn);
+        if (l != null and r != null) return @min(l.?, r.?);
+        return l orelse r;
+    }
+    const field_left = b.l.* == .field and b.l.field.parts.len == 1 and std.mem.eql(u8, b.l.field.last(), rn);
+    const field_right = b.r.* == .field and b.r.field.parts.len == 1 and std.mem.eql(u8, b.r.field.last(), rn);
+    const lit = if (field_left) b.r else if (field_right) b.l else return null;
+    if (lit.* != .int_lit) return null;
+    const c = lit.int_lit;
+    // with the field on the right, `c >= rn` is `rn <= c`
+    const cmp: ast.BinOp = if (field_left) b.op else switch (b.op) {
+        .ge => .le,
+        .gt => .lt,
+        .le => .ge,
+        .lt => .gt,
+        else => b.op,
+    };
+    return switch (cmp) {
+        .le, .eq => if (c < 0) 0 else @intCast(c),
+        .lt => if (c <= 0) 0 else @intCast(c - 1),
+        else => null,
+    };
+}
+
 /// Build the serial union op: open every branch (kept open, drained in order by
 /// op.Union), reconcile each to the canon, and concatenate. Used when split isn't
 /// applicable (threads=1, a breaker downstream, or non-splittable branches).
@@ -885,6 +957,8 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
                 .ord = ok,
                 .funcs = kinds,
                 .err = env.errctx,
+                .top_k = wd.top_k,
+                .gpa = env.gpa,
             };
             return .{ .op = .{ .window = o }, .schema = out };
         },

@@ -338,6 +338,9 @@ pub const WinFrame = struct { rows: bool = false, unbounded: bool = false, prece
 
 pub const Window = struct {
     funcs: []const WindowFunc,
+    /// Planner-set: an enclosing query keeps only `ROW_NUMBER <= top_k` — see
+    /// `plan.windowTopK`. Never written by the parser.
+    top_k: ?u64 = null,
     partition_by: []const QualName = &.{},
     order_by: []const SortKey = &.{},
 };

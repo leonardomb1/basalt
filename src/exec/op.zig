@@ -304,6 +304,12 @@ pub const Window = struct {
     funcs: []const Func,
     done: bool = false,
     err: ?*ErrCtx = null,
+    /// `ROW_NUMBER` read only up to this rank (an enclosing `WHERE rn <= k`): each
+    /// partition then keeps its best `k` rows as they stream by, in `gpa`, instead
+    /// of the whole input being held and sorted. Set by the planner, and only for
+    /// a window whose one function is `ROW_NUMBER`.
+    top_k: ?u64 = null,
+    gpa: ?std.mem.Allocator = null,
 
     /// A row-counted frame, `[current - preceding, current]`, clipped to the partition.
     /// `rows` false selects the peer-based default instead.
@@ -321,6 +327,99 @@ pub const Window = struct {
         return true;
     }
 
+    const Kept = std.ArrayListUnmanaged([]Value);
+    const Parts = std.HashMap([]const Value, *Kept, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
+
+    /// Whether row `a` ranks before row `b` under the window's ORDER BY.
+    fn ranksBefore(self: *const Window, a: []const Value, b: []const Value) bool {
+        for (self.ord) |k| {
+            const o = keyOrder(a[k.idx], b[k.idx], k.desc);
+            if (o != .eq) return o == .lt;
+        }
+        return false;
+    }
+
+    /// `ROW_NUMBER` up to rank `k`: per partition, the best `k` rows so far, best
+    /// first. A newcomer goes after every row it does not rank before, so ties keep
+    /// input order — the stable sort's answer — and one that would land past `k` is
+    /// never copied. The output is what the full window gives for those rows:
+    /// partitions in key order, each in rank order, numbered from 1.
+    fn nextTopK(self: *Window, arena: std.mem.Allocator, k: u64, gpa: std.mem.Allocator) anyerror!?Batch {
+        var parts = Parts.init(gpa);
+        defer {
+            var it = parts.iterator();
+            while (it.next()) |e| {
+                freeRowGpa(gpa, @constCast(e.key_ptr.*));
+                for (e.value_ptr.*.items) |r| freeRowGpa(gpa, r);
+                e.value_ptr.*.deinit(gpa);
+                gpa.destroy(e.value_ptr.*);
+            }
+            parts.deinit();
+        }
+        var pull = std.heap.ArenaAllocator.init(gpa);
+        defer pull.deinit();
+        const ncols = self.in_schema.fields.len;
+        const row = try arena.alloc(Value, ncols);
+        const key = try arena.alloc(Value, self.part.len);
+
+        if (k > 0) while (try self.child.next(pull.allocator())) |b| {
+            var r: usize = 0;
+            while (r < b.len) : (r += 1) {
+                for (row, b.columns) |*v, c| v.* = c.getValue(r);
+                for (key, self.part) |*v, pk| v.* = row[pk.idx];
+                const gop = try parts.getOrPut(key);
+                if (!gop.found_existing) {
+                    gop.key_ptr.* = try dupeRowGpa(gpa, key);
+                    gop.value_ptr.* = try gpa.create(Kept);
+                    gop.value_ptr.*.* = .{};
+                }
+                const kept = gop.value_ptr.*;
+                // first position whose row the newcomer ranks before
+                var lo: usize = 0;
+                var hi: usize = kept.items.len;
+                while (lo < hi) {
+                    const mid = (lo + hi) / 2;
+                    if (self.ranksBefore(row, kept.items[mid])) hi = mid else lo = mid + 1;
+                }
+                if (lo >= k) continue;
+                try kept.insert(gpa, lo, try dupeRowGpa(gpa, row));
+                if (kept.items.len > k) freeRowGpa(gpa, kept.pop().?);
+            }
+            _ = pull.reset(.retain_capacity);
+        };
+
+        const order = try arena.alloc(Parts.Entry, parts.count());
+        var it = parts.iterator();
+        var n: usize = 0;
+        var total: usize = 0;
+        while (it.next()) |e| : (n += 1) {
+            order[n] = e;
+            total += e.value_ptr.*.items.len;
+        }
+        if (total == 0) return null;
+        std.mem.sort(Parts.Entry, order, {}, struct {
+            fn lt(_: void, a: Parts.Entry, b: Parts.Entry) bool {
+                for (a.key_ptr.*, b.key_ptr.*) |x, y| {
+                    const o = keyOrder(x, y, false);
+                    if (o != .eq) return o == .lt;
+                }
+                return false;
+            }
+        }.lt);
+
+        const builders = try arena.alloc(column.Builder, self.out_schema.fields.len);
+        for (builders, self.out_schema.fields) |*bd, f| bd.* = try column.Builder.initCapacity(arena, f.ty, total);
+        for (order) |e| {
+            for (e.value_ptr.*.items, 1..) |kr, rn| {
+                for (kr, builders[0..ncols]) |v, *bd| try bd.append(v);
+                try builders[ncols].append(.{ .int = @intCast(rn) });
+            }
+        }
+        const cols = try arena.alloc(column.Column, builders.len);
+        for (builders, cols) |*bd, *c| c.* = try bd.finish();
+        return Batch{ .schema = self.out_schema, .columns = cols, .len = total };
+    }
+
     /// A window SUM's value for one row. It used to wrap: a running total past
     /// i64 came back as a small plausible number.
     fn intSum(self: *Window, acc: i128) error{IntOverflow}!Value {
@@ -334,6 +433,7 @@ pub const Window = struct {
     pub fn next(self: *Window, arena: std.mem.Allocator) anyerror!?Batch {
         if (self.done) return null;
         self.done = true;
+        if (self.top_k) |k| return self.nextTopK(arena, k, self.gpa.?);
         const all = (try materializeAll(arena, self.child, self.in_schema)) orelse return null;
 
         const idx = try arena.alloc(usize, all.len);
@@ -1338,6 +1438,20 @@ fn entryWorstFirst(keys: []const Sort.Key, a: TopN.Entry, b: TopN.Entry) std.mat
         if (o != .eq) return o.invert();
     }
     return .eq;
+}
+
+fn dupeRowGpa(gpa: std.mem.Allocator, row: []const Value) ![]Value {
+    const out = try gpa.alloc(Value, row.len);
+    for (out, row) |*o, v| o.* = try dupeValueGpa(gpa, v);
+    return out;
+}
+
+fn freeRowGpa(gpa: std.mem.Allocator, row: []Value) void {
+    for (row) |v| switch (v) {
+        .string, .bytes => |x| gpa.free(x),
+        else => {},
+    };
+    gpa.free(row);
 }
 
 fn dupeValueGpa(gpa: std.mem.Allocator, v: Value) !Value {
