@@ -955,6 +955,29 @@ fn runCsvThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []c
     return tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
 }
 
+test "parallel map keeps file order: a threaded load writes the rows a serial one does" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    var want = std.array_list.Managed(u8).init(alloc);
+    defer want.deinit();
+    try input.appendSlice("id,v\n");
+    try want.appendSlice("id\n");
+    for (0..4000) |i| {
+        try input.writer().print("{d},{d}\n", .{ i, i % 7 });
+        if (i % 7 != 3) try want.writer().print("{d}\n", .{i});
+    }
+    // Lanes finish in any order; the rows used to be written as they did, so the
+    // output changed from run to run. Several runs, since one could get lucky.
+    for (0..5) |_| {
+        const out = try runCsvThreaded(alloc, &tmp, input.items, "SELECT id FROM '$IN' WHERE v <> 3", 4);
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(want.items, out);
+    }
+}
+
 /// A parquet file with three row groups — enough for the parallel scan, which needs
 /// at least `pq_min_lanes` lanes and more than one row group. 5000 rows of
 /// `id = 1..5000`, `f = id * 0.5` and `g = id % 4` (a low-cardinality group key), so

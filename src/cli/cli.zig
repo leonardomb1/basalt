@@ -2524,8 +2524,8 @@ fn usage(w: anytype) !void {
         \\                     byte-range chunks for a local CSV, and row-group morsels
         \\                     for a Parquet — over aggregate / distinct / top-N / join /
         \\                     map-only pipelines. `EXPLAIN` names which one a query gets.
-        \\                     (default: CPU count; map output may reorder under -j>1,
-        \\                     so -j 1 is the stable-order choice. A float SUM is
+        \\                     (default: CPU count; a map pipeline keeps file order at
+        \\                     any -j, except into a table, which has none. A float SUM is
         \\                     reproducible for a given -j but not across values of it —
         \\                     CAST to DECIMAL for a total that never varies.)
         \\  --max-rows N       a SELECT printed to stdout keeps its first N rows and stops

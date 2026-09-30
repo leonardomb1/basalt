@@ -1000,11 +1000,12 @@ const LaneSplit = union(enum) {
 };
 
 /// Parallel map-only pipeline (`read <local> | (filter|select)* | write`): the
-/// input is fanned out across lanes, each runs the map chain on its own share and
-/// writes batches to a shared sink under a mutex (or to its own, with a per-lane
-/// sink). Row ORDER is not preserved — lanes interleave; use `-j 1` for a
-/// deterministic order. Optionally carries one hash join, whose build side is
-/// materialized once before any lane exists and probed read-only by all of them.
+/// input is fanned out across lanes, each runs the map chain on its own share.
+/// With a shared sink the rows keep file order (see `OrderedOut`), so a run gives
+/// the same output at any `-j`; per-lane sinks — a table load, where rows have no
+/// order — write lock-free as they go. Optionally carries one hash join, whose
+/// build side is materialized once before any lane exists and probed read-only by
+/// all of them.
 const MapCtx = struct {
     split: LaneSplit,
     map_stages: []const ast.Stage,
@@ -1017,9 +1018,171 @@ const MapCtx = struct {
     /// Set when the pipeline carries one hash join: each lane probes the shared
     /// index with its own `op.Join` and runs the post-join stages itself.
     join: ?LaneJoin = null,
+    /// Set with a shared sink: work items are positions, written in order.
+    ordered: ?*OrderedOut = null,
 };
 
+/// Keeps a shared sink's rows in file order across lanes. Work items are small
+/// positional units (a CSV byte range, a parquet row group); a lane formats its
+/// unit's rows outside any lock, then hands them over, and whichever lane
+/// completes the next unit due writes it and every finished unit queued behind
+/// it. A lane may run at most `window` units ahead of the writer, so what waits
+/// in memory is bounded by the window, not the file.
+///
+/// Before this, lanes wrote as they finished: output order changed from run to
+/// run, and a plain SELECT to the terminal stayed serial to keep its rows in
+/// order — the reason it was left off the parallel path at all.
+const OrderedOut = struct {
+    mtx: std.Thread.Mutex = .{},
+    cv: std.Thread.Condition = .{},
+    next: usize = 0,
+    window: usize,
+    done: []?*Unit,
+    snk: driver.Sink,
+    /// A lane is writing units out. The sink is only ever written by that lane,
+    /// and never under `mtx`, so the others keep formatting their next unit.
+    writing: bool = false,
+    /// Written units, arenas reset but kept: formatting into fresh pages each
+    /// time faulted in every output byte again, a third of a parquet-to-CSV move.
+    free: ?*Unit = null,
+
+    const Part = union(enum) { bytes: []const u8, batch: Batch };
+    const Unit = struct { arena: std.heap.ArenaAllocator, parts: std.array_list.Managed(Part), next_free: ?*Unit = null };
+
+    fn init(arena: std.mem.Allocator, nunits: usize, window: usize, snk: driver.Sink) !OrderedOut {
+        const done = try arena.alloc(?*Unit, nunits);
+        @memset(done, null);
+        return .{ .window = window, .done = done, .snk = snk };
+    }
+
+    /// Block until unit `i` is within the window, or the run has failed.
+    fn waitTurn(self: *OrderedOut, i: usize, failed: *std.atomic.Value(bool)) void {
+        self.mtx.lock();
+        defer self.mtx.unlock();
+        while (i >= self.next + self.window and !failed.load(.seq_cst)) self.cv.wait(&self.mtx);
+    }
+
+    fn wake(self: *OrderedOut) void {
+        self.mtx.lock();
+        self.cv.broadcast();
+        self.mtx.unlock();
+    }
+
+    /// Hand over unit `i`. When no lane is writing, this one becomes the writer
+    /// and writes every consecutive finished unit from `next` on — one at a time,
+    /// outside `mtx`, so a lane handing over its unit never waits on the sink.
+    /// Writing under the lock stalled every lane behind it, and a parquet-to-CSV
+    /// move got 50% slower than when lanes wrote unordered.
+    fn deposit(self: *OrderedOut, i: usize, u: *Unit) !void {
+        self.mtx.lock();
+        self.done[i] = u;
+        if (self.writing) {
+            self.mtx.unlock();
+            return;
+        }
+        self.writing = true;
+        while (self.next < self.done.len) {
+            const head = self.done[self.next] orelse break;
+            self.done[self.next] = null;
+            self.next += 1;
+            self.cv.broadcast();
+            self.mtx.unlock();
+            const r = writeUnit(self.snk, head);
+            _ = head.arena.reset(.retain_capacity);
+            head.parts = std.array_list.Managed(Part).init(head.arena.allocator());
+            self.mtx.lock();
+            head.next_free = self.free;
+            self.free = head;
+            r catch |e| {
+                self.writing = false;
+                self.mtx.unlock();
+                return e;
+            };
+        }
+        self.writing = false;
+        self.mtx.unlock();
+    }
+
+    fn writeUnit(snk: driver.Sink, u: *Unit) !void {
+        for (u.parts.items) |part| switch (part) {
+            .bytes => |b| try snk.writeRendered(b),
+            .batch => |b| try snk.writeBatch(u.arena.allocator(), b),
+        };
+    }
+
+    fn takeUnit(self: *OrderedOut) !*Unit {
+        self.mtx.lock();
+        const reused = self.free;
+        if (reused) |u| self.free = u.next_free;
+        self.mtx.unlock();
+        if (reused) |u| {
+            u.next_free = null;
+            return u;
+        }
+        return newUnit();
+    }
+
+    fn newUnit() !*Unit {
+        const u = try std.heap.page_allocator.create(Unit);
+        u.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator), .parts = undefined };
+        u.parts = std.array_list.Managed(Part).init(u.arena.allocator());
+        return u;
+    }
+
+    fn freeUnit(u: *Unit) void {
+        u.arena.deinit();
+        std.heap.page_allocator.destroy(u);
+    }
+
+    /// Units a failed run left behind, and the pool.
+    fn freeRest(self: *OrderedOut) void {
+        for (self.done) |*d| if (d.*) |u| {
+            freeUnit(u);
+            d.* = null;
+        };
+        while (self.free) |u| {
+            self.free = u.next_free;
+            freeUnit(u);
+        }
+    }
+};
+
+/// A batch copied out of the lane's per-batch arena, which is reset before the
+/// unit it belongs to is written.
+fn copyBatch(a: std.mem.Allocator, b: Batch) !Batch {
+    const idx = try a.alloc(usize, b.len);
+    for (idx, 0..) |*x, i| x.* = i;
+    const cols = try a.alloc(column.Column, b.columns.len);
+    for (cols, b.columns) |*o, c| o.* = try column.permute(a, c, idx);
+    return .{ .schema = b.schema, .columns = cols, .len = b.len };
+}
+
 const mapWorker = dispatchWorker(MapCtx, mapWorkOne);
+
+/// An ordered map lane: unlike `mapWorker`, one set of arenas for the lane's whole
+/// run, reset between units. Units are small, and building them per unit left
+/// every one decoding and formatting into cold pages.
+fn orderedMapWorker(ctx: *MapCtx, _: usize) void {
+    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
+    defer _ = wgpa.deinit();
+    var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
+    defer warena.deinit();
+    var batch_arena = std.heap.ArenaAllocator.init(wgpa.allocator());
+    defer batch_arena.deinit();
+    const ord = ctx.ordered.?;
+    while (true) {
+        if (ctx.queue.failed.load(.seq_cst)) return;
+        const i = ctx.queue.next.fetchAdd(1, .seq_cst);
+        if (i >= ctx.queue.nitems) break;
+        mapOrderedUnit(ctx, ord, i, &warena, &batch_arena) catch |e| {
+            ctx.queue.fail(e);
+            ord.wake();
+            return;
+        };
+        _ = warena.reset(.retain_capacity);
+        _ = batch_arena.reset(.retain_capacity);
+    }
+}
 
 fn mapWorkOne(ctx: *MapCtx, i: usize) !void {
     var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
@@ -1069,6 +1232,52 @@ fn mapWorkOne(ctx: *MapCtx, i: usize) !void {
     }
 }
 
+/// One positional unit of an ordered map: its rows, formatted for the shared sink
+/// where it can format outside the lock, else copied, then handed to `ord`. A unit
+/// with no rows is still handed over — the writer waits on every position.
+fn mapOrderedUnit(ctx: *MapCtx, ord: *OrderedOut, i: usize, warena: *std.heap.ArenaAllocator, batch_arena: *std.heap.ArenaAllocator) !void {
+    errdefer {
+        ctx.split.abort();
+        ctx.queue.failed.store(true, .seq_cst);
+        ord.wake();
+    }
+    ord.waitTurn(i, &ctx.queue.failed);
+    if (ctx.queue.failed.load(.seq_cst)) return;
+
+    const unit = try ord.takeUnit();
+    var handed = false;
+    defer if (!handed) OrderedOut.freeUnit(unit);
+    const ua = unit.arena.allocator();
+    const snk = ord.snk;
+    const render = snk.canRender();
+
+    var out: u64 = 0;
+    if (try laneRowSource(ctx.split.rows(i, ctx.queue.nitems), warena.allocator())) |inner| {
+        defer inner.close();
+        var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
+        var scan = op.Scan{ .src = cs.source() };
+        const mapped_chain = try buildMapChain(warena.allocator(), ctx.params, ctx.map_stages, &scan, ctx.split.schema());
+        const chain = if (ctx.join) |lj|
+            try buildLaneJoinChain(warena.allocator(), ctx.params, lj, mapped_chain)
+        else
+            mapped_chain;
+        while (try chain.next(batch_arena.allocator())) |b| {
+            if (ctx.queue.failed.load(.seq_cst)) return;
+            if (b.len > 0) {
+                try unit.parts.append(if (render)
+                    .{ .bytes = try snk.renderBatch(ua, b).? }
+                else
+                    .{ .batch = try copyBatch(ua, b) });
+                out += b.len;
+            }
+            _ = batch_arena.reset(.retain_capacity);
+        }
+    }
+    _ = ctx.rows_out.fetchAdd(out, .monotonic);
+    handed = true;
+    try ord.deposit(i, unit);
+}
+
 /// Source-independent — `split` says how the input divides; see `LaneSplit`.
 fn runParallelMapImpl(
     env: *Env,
@@ -1110,10 +1319,21 @@ fn runParallelMapImpl(
         .rows_read = env.rows_read,
         .join = lane_join,
     };
+    var ordered: OrderedOut = undefined;
+    if (sink_mode == .shared) {
+        const nunits = orderedUnits(split, nthreads);
+        ordered = try OrderedOut.init(arena, nunits, 2 * nthreads, sink_mode.shared);
+        ctx.queue.nitems = nunits;
+        ctx.ordered = &ordered;
+    }
+    defer if (ctx.ordered) |o| o.freeRest();
 
-    const lanes = try parallel.spawnJoin(arena, nthreads, mapWorker, &ctx);
+    const lanes = if (ctx.ordered != null)
+        try parallel.spawnJoin(arena, nthreads, orderedMapWorker, &ctx)
+    else
+        try parallel.spawnJoin(arena, nthreads, mapWorker, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
-    const units = split.count(nthreads);
+    const units = ctx.queue.nitems;
     env.log.log(.debug, "parallel {s} map{s}: {d} {s} over {d} lanes ({s} sink)", .{
         split.label(), if (lane_join != null) "+join" else "", units, split.unitName(), lanes, @tagName(sink_mode),
     });
@@ -1134,6 +1354,18 @@ fn runParallelMapImpl(
     return true;
 }
 
+/// Work items for an ordered map. A row group is a parquet file's own unit; a CSV is
+/// cut into ranges of about `ordered_chunk_bytes`, at least one per lane, so the
+/// reorder window holds a few MB per lane rather than a lane's whole share.
+fn orderedUnits(split: LaneSplit, nthreads: usize) usize {
+    return switch (split) {
+        .csv => |c| std.math.clamp(c.mapped.body.len / ordered_chunk_bytes + 1, nthreads, 1 << 16),
+        .parquet => split.count(nthreads),
+    };
+}
+
+const ordered_chunk_bytes = 4 << 20;
+
 fn runParallelParquetMap(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, map_stages: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     return runParallelParquetMapImpl(env, rd, pipeline, map_stages, null, w, opts, stats, lanes_used);
 }
@@ -1145,7 +1377,6 @@ fn runParallelParquetMapJoin(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
 }
 
 fn runParallelParquetMapImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, map_stages: []const ast.Stage, jshape: ?MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    if (std.mem.eql(u8, w.connector, "stdout")) return false;
     const split = (try parquetSplit(env, rd, pipeline[1..][0..map_stages.len], w, opts)) orelse return false;
     return runParallelMapImpl(env, split, map_stages, jshape, w, opts, stats, lanes_used);
 }
@@ -1951,7 +2182,6 @@ fn runParallelCsvMapJoin(env: *Env, rd: ast.Read, shape: MapJoinShape, w: ast.Wr
 }
 
 fn runParallelCsvMapImpl(env: *Env, rd: ast.Read, map_stages: []const ast.Stage, jshape: ?MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    if (std.mem.eql(u8, w.connector, "stdout")) return false;
     const mapped = (try csvSplitFile(env, rd, w)) orelse return false;
     defer mapped.close();
     return runParallelMapImpl(env, .{ .csv = .{ .mapped = mapped, .schema = &mapped.schema } }, map_stages, jshape, w, opts, stats, lanes_used);

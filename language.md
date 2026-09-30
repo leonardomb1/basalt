@@ -597,11 +597,14 @@ apart.
 | `CROSS JOIN UNNEST(JSON_EACH(tags)) AS tag` | explode a JSON array: one row per element — strings unquoted, objects and arrays as JSON text, a JSON `null` as null. A null or `null` cell gives no rows; an object or scalar is an error |
 | `[INNER\|LEFT\|RIGHT\|FULL\|CROSS\|SEMI\|ANTI] JOIN <cte> x ON a = b [AND c = d ...]` | join (right side must be a CTE) |
 
-Row order without `ORDER BY` is not defined: `GROUP BY` returns groups in
-hash-partition order, and map pipelines reorder under `-j > 1` (which is the
-default, since `-j` defaults to the core count). Add `ORDER BY` whenever the
-order matters. `DISTINCT` is the exception: it keeps the first row per key in
-input order at any `-j`.
+Row order without `ORDER BY` is not defined in SQL, and `GROUP BY` returns groups
+in hash-partition order. A pipeline that only filters, projects or joins keeps the
+source's order at any `-j` — to the terminal, a CSV, a parquet or an Arrow file —
+so the same run writes the same bytes; lanes still read in parallel, and their
+output is put back in order before it is written. Loading into a database table
+does not order its rows (a table has none). `DISTINCT` keeps the first row per
+key in input order at any `-j`. Add `ORDER BY` whenever the order is part of
+the answer.
 
 Joins are hash equi-joins: the CTE (right) side is materialized and indexed
 once, the left side streams through. Keys are plain columns (compute
