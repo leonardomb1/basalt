@@ -946,9 +946,19 @@ const KeyArr = struct {
                 break :blk .{ .ints = out };
             },
             .float => .{ .floats = col.data.f64 },
+            // A value's scale need not be the column's (postgres NUMERIC carries
+            // one per value), so the unscaled integers are brought to the widest
+            // scale present before they are compared: 0.5 (5) against 0.10 (10)
+            // compared the raw integers and sorted backwards.
             .decimal => blk: {
+                var scale: u8 = 0;
+                for (col.data.dec[0..n], 0..) |d, i| {
+                    if (col.validity.get(i)) scale = @max(scale, d.scale);
+                }
                 const out = try arena.alloc(i128, n);
-                for (out, col.data.dec[0..n]) |*o, d| o.* = d.unscaled;
+                for (out, col.data.dec[0..n], 0..) |*o, d, i| {
+                    o.* = if (!col.validity.get(i)) 0 else (eval.rescaleTo(d, scale) orelse break :blk Data{ .boxed = col }).unscaled;
+                }
                 break :blk .{ .decs = out };
             },
             .string, .bytes => blk: {
@@ -995,46 +1005,144 @@ const SortCtx = struct {
     }
 };
 
-/// Sort `idx` (pre-filled 0..n) by `arrs`, first key most significant.
+/// Sort `idx` (pre-filled 0..n) by `arrs`, first key most significant, stably.
 ///
-/// When every key is an all-valid int or float column — the common ORDER BY
-/// and window shape — each key becomes an order-preserving u64 word and the
-/// comparator is a word compare with no type switch and no validity read; a
-/// single key sorts (word, index) pairs in place, so the hot loop touches one
-/// contiguous array instead of chasing an index into the key column. Ties
-/// break on input position, which is exactly what the stable sort answered,
-/// so the two paths agree row for row. Anything else takes the general
-/// comparator: it was 3.5s to order 3M floats, most of it in `KeyArr.order`.
+/// Every key becomes order-preserving u64 words and the rows are LSD-radix sorted
+/// on them, 16 bits a pass. Ints and floats are one word, decimals two, a string
+/// up to 31 bytes long is its bytes zero-padded with the length in the last byte
+/// (so `ab` < `ab\0` < `abc`), and a key with nulls gets a flag word above its
+/// value, so nulls sort last whatever the direction. A longer string is ordered
+/// by its first 24 bytes, and runs the words cannot tell apart are then sorted
+/// with the comparator.
+///
+/// Strings and nulls used to take `std.mem.sort` with a comparator: ORDER BY a
+/// string over 10M rows was 22 comparator-bound seconds, 10x DuckDB.
 fn sortIdx(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr) !void {
     const n = idx.len;
-    if (n == 0) return;
-    fast: {
-        const nk = arrs.len;
-        if (nk == 0 or n > std.math.maxInt(u32)) break :fast;
-        for (arrs) |k| {
-            if (!k.valid.allSet(n)) break :fast;
-            switch (k.data) {
-                .ints, .floats => {},
-                else => break :fast,
-            }
-        }
-        // Stable LSD radix, least significant key first: each key is gathered in
-        // the current order into (word, index) pairs and sorted 16 bits a pass,
-        // so the passes read one contiguous array. `std.sort.pdq` on the same
-        // pairs measured 715ms for 3M rows; this is a few sequential sweeps.
-        const pairs = try arena.alloc(RadixPair, n);
-        const tmp = try arena.alloc(RadixPair, n);
-        const counts = try arena.alloc(u32, 1 << 16);
-        var j = nk;
-        while (j > 0) {
-            j -= 1;
-            for (pairs, idx) |*p, i| p.* = .{ .k = orderedWord(arrs[j], i), .i = @intCast(i) };
-            radixSortPairs(pairs, tmp, counts);
-            for (pairs, idx) |p, *x| x.* = p.i;
-        }
+    if (n == 0 or arrs.len == 0) return;
+    const plans = try arena.alloc(KeyPlan, arrs.len);
+    var exact = true;
+    for (arrs, plans) |k, *p| {
+        p.* = KeyPlan.of(k, n) orelse {
+            std.mem.sort(usize, idx, SortCtx{ .arrs = arrs }, SortCtx.lessThan);
+            return;
+        };
+        if (!p.exact) exact = false;
+    }
+    if (n > std.math.maxInt(u32)) {
+        std.mem.sort(usize, idx, SortCtx{ .arrs = arrs }, SortCtx.lessThan);
         return;
     }
-    std.mem.sort(usize, idx, SortCtx{ .arrs = arrs }, SortCtx.lessThan);
+
+    const pairs = try arena.alloc(RadixPair, n);
+    const tmp = try arena.alloc(RadixPair, n);
+    const counts = try arena.alloc(u32, 1 << 16);
+    // Each word is encoded once, in row order, then gathered by the current order:
+    // encoding straight from the permutation read every string at random.
+    const words = try arena.alloc(u64, n);
+    var j = arrs.len;
+    while (j > 0) {
+        j -= 1;
+        const k = arrs[j];
+        const p = plans[j];
+        var w = p.words;
+        while (w > 0) {
+            w -= 1;
+            for (words, 0..) |*x, i| x.* = encWord(k, p, w, i);
+            for (pairs, idx) |*pr, i| pr.* = .{ .k = words[i], .i = @intCast(i) };
+            radixSortPairs(pairs, tmp, counts);
+            for (pairs, idx) |pr, *x| x.* = pr.i;
+        }
+        if (p.nulls) {
+            for (pairs, idx) |*pr, i| pr.* = .{ .k = @intFromBool(!k.valid.get(i)), .i = @intCast(i) };
+            radixSortPairs(pairs, tmp, counts);
+            for (pairs, idx) |pr, *x| x.* = pr.i;
+        }
+    }
+    if (!exact) fixTies(idx, arrs, plans);
+}
+
+/// How one key is laid out in radix words.
+const KeyPlan = struct {
+    words: u8,
+    /// The words order the key completely; false for a string past 31 bytes.
+    exact: bool,
+    nulls: bool,
+
+    const max_exact_str = 31;
+    const prefix_words = 3;
+
+    /// Null when the key has no word form and the comparator must sort.
+    fn of(k: KeyArr, n: usize) ?KeyPlan {
+        const nulls = !k.valid.allSet(n);
+        return switch (k.data) {
+            .ints, .floats => .{ .words = 1, .exact = true, .nulls = nulls },
+            .decs => .{ .words = 2, .exact = true, .nulls = nulls },
+            .strs => |v| blk: {
+                var longest: usize = 0;
+                for (v[0..n], 0..) |x, i| {
+                    if (k.valid.get(i)) longest = @max(longest, x.len);
+                }
+                if (longest > max_exact_str) break :blk .{ .words = prefix_words, .exact = false, .nulls = nulls };
+                break :blk .{ .words = @intCast(longest / 8 + 1), .exact = true, .nulls = nulls };
+            },
+            .boxed => null,
+        };
+    }
+};
+
+/// Word `w` (0 most significant) of row `i`'s key. A null row's words are 0: its
+/// place is decided by the flag word, and among nulls the key is all equal.
+fn encWord(k: KeyArr, p: KeyPlan, w: usize, i: usize) u64 {
+    if (p.nulls and !k.valid.get(i)) return 0;
+    const word: u64 = switch (k.data) {
+        .ints, .floats => return orderedWord(k, i),
+        .decs => |v| blk: {
+            const u: u128 = @as(u128, @bitCast(v[i])) ^ (@as(u128, 1) << 127);
+            break :blk if (w == 0) @intCast(u >> 64) else @truncate(u);
+        },
+        .strs => |v| blk: {
+            const str = v[i];
+            var b: [8]u8 = @splat(0);
+            const lo = w * 8;
+            if (lo < str.len) {
+                const take = @min(8, str.len - lo);
+                @memcpy(b[0..take], str[lo..][0..take]);
+            }
+            // The length sits in the last byte, which no exact string reaches.
+            if (p.exact and w + 1 == p.words) b[7] = @intCast(str.len);
+            break :blk std.mem.readInt(u64, &b, .big);
+        },
+        .boxed => unreachable,
+    };
+    return if (k.desc) ~word else word;
+}
+
+/// After a radix sort on string prefixes: re-sort, with the comparator, each run of
+/// rows the prefixes could not order. A run is equal on every key's words up to
+/// and including the first inexact key — not on all keys: two rows whose prefixes
+/// tie may still differ in that key, and a later key must not decide between them.
+fn fixTies(idx: []usize, arrs: []const KeyArr, plans: []const KeyPlan) void {
+    var m: usize = 0;
+    while (plans[m].exact) m += 1;
+    var start: usize = 0;
+    while (start < idx.len) {
+        var end = start + 1;
+        while (end < idx.len and sameWords(arrs[0 .. m + 1], plans[0 .. m + 1], idx[start], idx[end])) end += 1;
+        if (end - start > 1) std.mem.sort(usize, idx[start..end], SortCtx{ .arrs = arrs }, SortCtx.lessThan);
+        start = end;
+    }
+}
+
+fn sameWords(arrs: []const KeyArr, plans: []const KeyPlan, a: usize, b: usize) bool {
+    for (arrs, plans) |k, p| {
+        if (k.valid.get(a) != k.valid.get(b)) return false;
+        var w: usize = 0;
+        while (w < p.words) : (w += 1) {
+            if (encWord(k, p, w, a) != encWord(k, p, w, b)) return false;
+        }
+    }
+    return true;
 }
 
 const RadixPair = struct { k: u64, i: u32 };
@@ -3727,4 +3835,66 @@ test "integer SUM: exact across batches, an error only when the total leaves i64
     var acc = Aggregate.Acc{ .n = 5 };
     for ([_][]const i64{ &.{ max, max }, &.{ -max, -max }, &.{5} }) |part| acc.sum_i += sumIntCol(part);
     try testing.expectEqual(Value{ .int = 5 }, try Aggregate.finalizeAcc(acc, agg));
+}
+
+test "sortIdx: the radix words order rows exactly as the comparator does" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var prng = std.Random.DefaultPrng.init(0xba5a17);
+    const rnd = prng.random();
+
+    // Short strings (exact words) and long ones sharing a 24-byte prefix (ties the
+    // comparator settles), NaN and -0.0, decimals of mixed scale, and nulls in all.
+    const long_base = "a-long-prefix-shared-by-many-";
+    for (0..60) |round| {
+        const n = 1 + rnd.uintLessThan(usize, 400);
+        const nkeys = 1 + rnd.uintLessThan(usize, 3);
+        const arrs = try a.alloc(KeyArr, nkeys);
+        for (arrs) |*k| {
+            const kind = rnd.uintLessThan(u8, 4);
+            const ty: types.Type = switch (kind) {
+                0 => types.Type.init(.int),
+                1 => types.Type.init(.float),
+                2 => types.Type.decimal(18, 3),
+                else => types.Type.init(.string),
+            };
+            var b = column.Builder.init(a, ty.asNullable());
+            for (0..n) |_| {
+                if (rnd.uintLessThan(u8, 8) == 0) {
+                    try b.append(.null);
+                    continue;
+                }
+                try b.append(switch (kind) {
+                    0 => Value{ .int = rnd.intRangeAtMost(i64, -5, 5) * @as(i64, if (rnd.boolean()) 1 else std.math.maxInt(i64) / 7) },
+                    1 => Value{ .float = switch (rnd.uintLessThan(u8, 6)) {
+                        0 => std.math.nan(f64),
+                        1 => -0.0,
+                        2 => 0.0,
+                        else => @as(f64, @floatFromInt(rnd.intRangeAtMost(i64, -3, 3))) / 2,
+                    } },
+                    2 => Value{ .decimal = .{ .unscaled = rnd.intRangeAtMost(i128, -30, 30), .scale = rnd.uintLessThan(u8, 3) } },
+                    else => Value{ .string = blk: {
+                        const len = rnd.uintLessThan(usize, 4);
+                        const tail = try a.alloc(u8, len);
+                        for (tail) |*c| c.* = "ab\x00"[rnd.uintLessThan(usize, 3)];
+                        break :blk if (rnd.boolean()) try std.mem.concat(a, u8, &.{ long_base, tail }) else tail;
+                    } },
+                });
+            }
+            k.* = try KeyArr.prepare(a, try b.finish(), rnd.boolean());
+        }
+        const want = try a.alloc(usize, n);
+        const got = try a.alloc(usize, n);
+        for (want, got, 0..) |*x, *y, i| {
+            x.* = i;
+            y.* = i;
+        }
+        std.mem.sort(usize, want, SortCtx{ .arrs = arrs }, SortCtx.lessThan);
+        try sortIdx(a, got, arrs);
+        testing.expectEqualSlices(usize, want, got) catch |e| {
+            std.debug.print("sortIdx mismatch in round {d}\n", .{round});
+            return e;
+        };
+    }
 }
