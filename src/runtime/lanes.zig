@@ -456,10 +456,9 @@ fn freeMergeParts(gpa: std.mem.Allocator, parts: []PqPart) void {
     gpa.free(parts);
 }
 
-/// Finalize merged parallel-aggregate groups into one output batch (a "merger"
-/// Aggregate just for `emit`; it never pulls a child).
-fn emitMergedGroups(env: *Env, agg_in: *const types.Schema, by: []const usize, aggs: []const op.Aggregate.Agg, out_schema: *const types.Schema, sets: []const op.Aggregate.GroupSet, sel: ?[]const []const u32) !Batch {
-    var merger = op.Aggregate{
+/// An Aggregate that only finalizes merged groups (`emitSets`); it never pulls a child.
+fn groupEmitter(env: *Env, agg_in: *const types.Schema, by: []const usize, aggs: []const op.Aggregate.Agg, out_schema: *const types.Schema) op.Aggregate {
+    return .{
         .child = undefined,
         .in_schema = agg_in,
         .by = by,
@@ -468,7 +467,119 @@ fn emitMergedGroups(env: *Env, agg_in: *const types.Schema, by: []const usize, a
         .state = env.arena,
         .gpa = env.gpa,
     };
-    return merger.emitSets(env.arena, sets, sel);
+}
+
+/// Emit merged groups and write them through `tail`. Many groups under a tail that
+/// only filters and projects are emitted, formatted and encoded a partition at a
+/// time across lanes (`GroupWriteCtx`); anything else — a top-N's selection, a sort,
+/// a handful of groups — goes out as one batch.
+///
+/// Emitting into one batch and writing it on one thread was a third of a
+/// high-cardinality GROUP BY at -j 8, and the batch held every output row at once.
+fn writeGroups(
+    env: *Env,
+    snk: driver.Sink,
+    emitter: op.Aggregate,
+    sets: []const op.Aggregate.GroupSet,
+    sel: ?[]const []const u32,
+    tail: []const ast.Stage,
+    threads: usize,
+    stats: *Stats,
+) !void {
+    var total: usize = 0;
+    for (sets) |st| total += st.len;
+    const rowwise = for (tail) |st| switch (st.node) {
+        .filter, .select => {},
+        else => break false,
+    } else true;
+    if (sel != null or emitter.by.len == 0 or threads < 2 or sets.len < 2 or total < agg_combine_parallel_min or !rowwise) {
+        var em = emitter;
+        const batch = try em.emitSets(env.arena, sets, sel);
+        return writeTail(env, snk, batch, emitter.out_schema.*, tail, stats);
+    }
+
+    var ord = try OrderedOut.init(env.arena, sets.len, 2 * threads, snk);
+    defer ord.freeRest();
+    var ctx = GroupWriteCtx{
+        .emitter = emitter,
+        .sets = sets,
+        .tail = tail,
+        .params = env.params_expr,
+        .queue = .{ .nitems = sets.len },
+        .ord = &ord,
+    };
+    _ = try parallel.spawnJoin(env.arena, @min(threads, sets.len), groupWriteWorker, &ctx);
+    if (ctx.queue.first_err) |e| return e;
+    stats.rows_out += ctx.rows_out.load(.monotonic);
+}
+
+/// Shared state for writing merged groups a partition at a time. Units are the
+/// partitions, written in order by `OrderedOut`: the order one serial emit gives.
+const GroupWriteCtx = struct {
+    emitter: op.Aggregate,
+    sets: []const op.Aggregate.GroupSet,
+    tail: []const ast.Stage,
+    params: *std.StringHashMap(*const ast.Expr),
+    queue: WorkQueue,
+    ord: *OrderedOut,
+    rows_out: std.atomic.Value(u64) = .init(0),
+};
+
+fn groupWriteWorker(ctx: *GroupWriteCtx, _: usize) void {
+    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
+    defer _ = wgpa.deinit();
+    var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
+    defer warena.deinit();
+    while (true) {
+        if (ctx.queue.failed.load(.seq_cst)) return;
+        const i = ctx.queue.next.fetchAdd(1, .seq_cst);
+        if (i >= ctx.queue.nitems) break;
+        groupWriteUnit(ctx, i, warena.allocator()) catch |e| {
+            ctx.queue.fail(e);
+            ctx.ord.wake();
+            return;
+        };
+        _ = warena.reset(.retain_capacity);
+    }
+}
+
+fn groupWriteUnit(ctx: *GroupWriteCtx, i: usize, wa: std.mem.Allocator) !void {
+    const ord = ctx.ord;
+    ord.waitTurn(i, &ctx.queue.failed);
+    if (ctx.queue.failed.load(.seq_cst)) return;
+
+    const unit = try ord.takeUnit();
+    var handed = false;
+    defer if (!handed) OrderedOut.freeUnit(unit);
+    const ua = unit.arena.allocator();
+    const snk = ord.snk;
+    const enc: ?driver.UnitEncoder = if (snk.openUnit(ua)) |r| try r else null;
+    errdefer if (enc) |e| e.discard();
+
+    var em = ctx.emitter;
+    em.state = wa;
+    const out_schema = ctx.emitter.out_schema;
+    var ob = OneBatch{ .b = try em.emitSets(wa, ctx.sets[i..][0..1], null), .sch = out_schema.* };
+    var scan = op.Scan{ .src = ob.source() };
+    const chain = try buildMapChain(wa, ctx.params, ctx.tail, &scan, out_schema);
+    var out: u64 = 0;
+    while (try chain.next(wa)) |b| {
+        if (b.len == 0) continue;
+        if (enc) |e| {
+            try e.write(wa, b);
+        } else try unit.parts.append(if (snk.canRender())
+            .{ .bytes = try snk.renderBatch(ua, b).? }
+        else
+            .{ .batch = try b.deepCopy(ua) });
+        out += b.len;
+    }
+    if (enc) |e| {
+        try e.seal();
+        try unit.parts.append(.{ .encoded = e });
+    }
+    _ = ctx.rows_out.fetchAdd(out, .monotonic);
+    handed = true;
+    try ord.deposit(i, unit);
 }
 
 fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema, tail: []const ast.Stage, stats: *Stats) !void {
@@ -1663,34 +1774,24 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
         }
     }
 
-    const t_emit0 = std.time.Instant.now() catch unreachable;
     const sets = try partSets(arena, parts);
     var total: usize = 0;
     for (sets) |st| total += st.len;
-
-    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, sets, sel);
-    const t_emit1 = std.time.Instant.now() catch unreachable;
 
     const wr = try resolveUpsertKeys(env, w);
     const snk = try openSink(env, wr, try tailSchema(env, tail, out_schema.*));
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
 
-    const t_tail0 = std.time.Instant.now() catch unreachable;
-    try writeTail(env, snk, batch, out_schema.*, tail, stats);
-    const t_tail1 = std.time.Instant.now() catch unreachable;
-    env.log.log(.debug, "pq agg tail: emit {d}ms ({d} groups), sort+limit+write {d}ms", .{
-        t_emit1.since(t_emit0) / 1_000_000, total, t_tail1.since(t_tail0) / 1_000_000,
-    });
+    const t_emit0 = std.time.Instant.now() catch unreachable;
+    try writeGroups(env, snk, groupEmitter(env, agg_in, apl.by, aggs, out_schema), sets, sel, tail, nthreads, stats);
+    const t_emit1 = std.time.Instant.now() catch unreachable;
+    env.log.log(.debug, "pq agg tail: emit+write {d}ms ({d} groups)", .{ t_emit1.since(t_emit0) / 1_000_000, total });
     if (opts.explain) {
         std.debug.print(
-            \\  emit         {d:>8.1}ms {d:>12} rows
-            \\  sort+write   {d:>8.1}ms
+            \\  emit+write   {d:>8.1}ms {d:>12} rows
             \\
-        , .{
-            @as(f64, @floatFromInt(t_emit1.since(t_emit0))) / 1e6, total,
-            @as(f64, @floatFromInt(t_tail1.since(t_tail0))) / 1e6,
-        });
+        , .{ @as(f64, @floatFromInt(t_emit1.since(t_emit0))) / 1e6, total });
     }
     snk_open = false;
     try snk.close();
@@ -1760,14 +1861,13 @@ fn runParallelCsvAggImpl(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag:
     if (ctx.queue.first_err) |e| return e;
 
     const csets = try combineAggSlots(env, slots, aggs, opts.threads, parts);
-    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, csets, null);
 
     const wr = try resolveUpsertKeys(env, w);
     const snk = try openSink(env, wr, try tailSchema(env, tail, out_schema.*));
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
 
-    try writeTail(env, snk, batch, out_schema.*, tail, stats);
+    try writeGroups(env, snk, groupEmitter(env, agg_in, apl.by, aggs, out_schema), csets, null, tail, opts.threads, stats);
     snk_open = false;
     try snk.close();
     return true;
@@ -1897,13 +1997,12 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
     if (ctx.queue.first_err) |e| return e;
 
     const csets = try combineAggSlots(env, slots, aggs, opts.threads, parts);
-    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, csets, null);
 
     const snk = try openSink(env, w, out_schema.*);
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
 
-    try writeTail(env, snk, batch, out_schema.*, tail, stats);
+    try writeGroups(env, snk, groupEmitter(env, agg_in, apl.by, aggs, out_schema), csets, null, tail, opts.threads, stats);
     snk_open = false;
     try snk.close();
     return true;
