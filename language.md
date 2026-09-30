@@ -1072,12 +1072,16 @@ LET/PARAM.
   15 significant digits, as PostgreSQL converts `float8` to `numeric`: the
   double nearest `2.675` is `2.67499…`, and it still becomes `2.68`. A float too
   large for 38 digits fails the cast.
-- **DECIMAL arithmetic is exact.** `+` and `-` over two decimals (or a decimal
-  and an int) answer a decimal at the wider operand's scale, `*` one at the
-  summed scale — `CAST(1.1 AS DECIMAL(18,2)) + CAST(0.3 AS DECIMAL(18,2))` is
+- **DECIMAL arithmetic is exact.** `+`, `-` and `%` over two decimals (or a
+  decimal and an int) answer a decimal at the wider operand's scale, `*` one at
+  the summed scale — `CAST(1.1 AS DECIMAL(18,2)) + CAST(0.3 AS DECIMAL(18,2))` is
   `1.40`, not `1.4000000000000001`, so a `SUM` cast to `DECIMAL` stays exact
-  when this month's total is subtracted from last month's. `/` and `%` have no
-  finite scale and stay float, as does anything with a float operand.
+  when this month's total is subtracted from last month's. `/` has no finite
+  scale and stays float, as does anything with a float operand (a literal like
+  `0.3` is a float). `round(x, n)` on a decimal is exact too, and with a literal
+  `n` answers `DECIMAL(p, n)`; `-x` stays a decimal, and `CAST(x AS INT)` rounds
+  half away from zero. `%` takes the dividend's sign for every numeric kind:
+  `-5.5 % 2` is `-1.5`.
 - A `DATE`/`TIMESTAMP` column compares directly against an ISO string literal
   (`WHERE d >= '2013-07-01'`). The literal is coerced to the column's type,
   never the reverse, and it is validated at plan time — so `'2013-13-01'` and

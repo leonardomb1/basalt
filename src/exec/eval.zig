@@ -426,6 +426,7 @@ fn unaryVec(arena: std.mem.Allocator, u: ast.Expr.Unary, batch: Batch) VecError!
                 .null => .null,
                 .int => |x| .{ .int = std.math.negate(x) catch return error.IntOverflow },
                 .float => |x| .{ .float = -x },
+                .decimal => |d| .{ .decimal = .{ .unscaled = -d.unscaled, .scale = d.scale } },
                 else => return error.Unsupported,
             } },
             .col => |c| {
@@ -581,7 +582,8 @@ inline fn applyOp(comptime T: type, comptime op: ast.BinOp, a: T, d: T) VecError
         .sub => if (T == i64) (std.math.sub(i64, a, d) catch return error.IntOverflow) else a - d,
         .mul => if (T == i64) (std.math.mul(i64, a, d) catch return error.IntOverflow) else a * d,
         .div => if (T == i64) intDiv(a, d) else a / d,
-        .mod => if (T == i64) intRem(a, d) else @mod(a, d),
+        // `@rem`, as the int path: SQL's remainder takes the dividend's sign.
+        .mod => if (T == i64) intRem(a, d) else @rem(a, d),
         // f64 comparison goes through the total order (NaN equal to itself,
         // above everything else); `std.math.order` hits `unreachable` on NaN,
         // and this kernel runs on whole columns.
@@ -1149,6 +1151,7 @@ pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, ro
                     // `-minInt(i64)` wrapped back to itself.
                     .int => |x| .{ .int = std.math.negate(x) catch return error.IntOverflow },
                     .float => |x| .{ .float = -x },
+                    .decimal => |d| .{ .decimal = .{ .unscaled = -d.unscaled, .scale = d.scale } },
                     else => error.TypeMismatch,
                 },
                 .not => .{ .bool = !v.bool },
@@ -1265,19 +1268,22 @@ fn arith(op: ast.BinOp, l: Value, r: Value) EvalError!Value {
         .sub => .{ .float = a - b },
         .mul => .{ .float = a * b },
         .div => .{ .float = a / b },
-        .mod => .{ .float = @mod(a, b) },
+        // Truncated, the dividend's sign — `-5.0 % 3` is -2, as for ints; `@mod`
+        // floored it to 1.
+        .mod => .{ .float = @rem(a, b) },
         else => unreachable,
     };
 }
 
-/// Exact DECIMAL arithmetic: `+`/`-` at the wider operand's scale, `*` at the
-/// summed scale, both on the i128 unscaled integers. `/` and `%` have no finite
-/// scale and stay float, as does anything with a float operand. Money math
+/// Exact DECIMAL arithmetic: `+`/`-`/`%` at the wider operand's scale, `*` at the
+/// summed scale, all on the i128 unscaled integers. `/` has no finite scale and
+/// stays float, as does anything with a float operand. A remainder is no wider
+/// than either operand, so it keeps the narrower integer part. Money math
 /// used to go through f64 here, so `CAST(1.1 AS DECIMAL(18,2)) + CAST(0.3 AS
 /// DECIMAL(18,2))` answered 1.4000000000000001 — which defeated the advice to
 /// cast a SUM to DECIMAL the moment the total was subtracted from another.
 fn decimalArithType(op: ast.BinOp, lt: Type, rt: Type) ?Type {
-    if (op != .add and op != .sub and op != .mul) return null;
+    if (op != .add and op != .sub and op != .mul and op != .mod) return null;
     if (lt.kind == .float or rt.kind == .float) return null;
     if (lt.kind != .decimal and rt.kind != .decimal) return null;
     // An INT operand is a DECIMAL(19,0); an unresolved precision (0) is the ceiling.
@@ -1286,7 +1292,11 @@ fn decimalArithType(op: ast.BinOp, lt: Type, rt: Type) ?Type {
     const ls: u16 = if (lt.kind == .decimal) lt.scale else 0;
     const rs: u16 = if (rt.kind == .decimal) rt.scale else 0;
     const scale: u16 = if (op == .mul) ls + rs else @max(ls, rs);
-    const prec: u16 = if (op == .mul) lp + rp else @max(lp -| ls, rp -| rs) + scale + 1;
+    const prec: u16 = switch (op) {
+        .mul => lp + rp,
+        .mod => @max(1, @min(lp -| ls, rp -| rs) + scale),
+        else => @max(lp -| ls, rp -| rs) + scale + 1,
+    };
     return Type.decimal(@intCast(@min(38, prec)), @intCast(@min(38, scale)));
 }
 
@@ -1299,7 +1309,7 @@ fn asDecimal(v: Value) ?Decimal {
 }
 
 /// Null for an op that is not exact over decimals (see `decimalArithType`).
-fn decimalOp(op: ast.BinOp, a: Decimal, b: Decimal) ?error{IntOverflow}!Decimal {
+fn decimalOp(op: ast.BinOp, a: Decimal, b: Decimal) ?error{ IntOverflow, DivByZero }!Decimal {
     switch (op) {
         .mul => return .{
             .unscaled = std.math.mul(i128, a.unscaled, b.unscaled) catch return error.IntOverflow,
@@ -1311,6 +1321,13 @@ fn decimalOp(op: ast.BinOp, a: Decimal, b: Decimal) ?error{IntOverflow}!Decimal 
             const y = rescaleTo(b, s) orelse return error.IntOverflow;
             const u = if (op == .add) std.math.add(i128, x.unscaled, y.unscaled) else std.math.sub(i128, x.unscaled, y.unscaled);
             return .{ .unscaled = u catch return error.IntOverflow, .scale = s };
+        },
+        .mod => {
+            const s = @max(a.scale, b.scale);
+            const x = rescaleTo(a, s) orelse return error.IntOverflow;
+            const y = rescaleTo(b, s) orelse return error.IntOverflow;
+            if (y.unscaled == 0) return error.DivByZero;
+            return .{ .unscaled = @rem(x.unscaled, y.unscaled), .scale = s };
         },
         else => return null,
     }
@@ -1640,6 +1657,7 @@ const typing = struct {
             if (!numericish(d)) return self.err("`round` digits must be an integer", .{});
         }
         if (a.unknown or (a.kind == .int and c.args.len == 1)) return a;
+        if (a.kind == .decimal) return Type.decimal(a.precision, roundOutScale(c, a.scale)).withNull(a.nullable);
         return Type.init(.float).withNull(a.nullable);
     }
 
@@ -2025,6 +2043,7 @@ const per_row = struct {
             digits = toI64(dv);
         }
         if (v == .int and c.args.len == 1) return v;
+        if (v == .decimal) return Value{ .decimal = roundDecimal(v.decimal, digits, roundOutScale(c, v.decimal.scale)) orelse return error.IntOverflow };
         return Value{ .float = roundHalfAway(toF64(v), digits) };
     }
 
@@ -2523,6 +2542,31 @@ pub fn floatToDecimal(x: f64) ?Decimal {
 
 /// `u / 10^drop`, rounded half away from zero — PostgreSQL's rule for numeric,
 /// and SQL Server's: 12.345 → 12.35 and -12.345 → -12.35 at two places.
+/// The scale `round(decimal, digits)` answers in: the digits when they are a
+/// literal (`round(x, 2)` is a DECIMAL(p,2), as DuckDB types it), else the
+/// input's own. The type and every value must agree on it.
+fn roundOutScale(c: ast.Expr.Call, in_scale: u8) u8 {
+    if (c.args.len < 2) return 0;
+    if (c.args[1].* != .int_lit) return in_scale;
+    return @intCast(std.math.clamp(c.args[1].int_lit, 0, in_scale));
+}
+
+/// `round` on a DECIMAL, exact and half away from zero. It went through f64,
+/// where 1.005 is 1.00499…, so `round(1.005, 2)` answered 1.
+fn roundDecimal(d: Decimal, digits: i64, out_scale: u8) ?Decimal {
+    var r = d;
+    if (digits < d.scale) {
+        const drop = @as(i64, d.scale) - digits;
+        if (drop > 38) return .{ .unscaled = 0, .scale = out_scale };
+        var q = roundScaleDown(d.unscaled, @intCast(drop));
+        if (digits < 0) {
+            q = std.math.mul(i128, q, powTen(@intCast(@min(-digits, 38)))) catch return null;
+            r = .{ .unscaled = q, .scale = 0 };
+        } else r = .{ .unscaled = q, .scale = @intCast(digits) };
+    }
+    return rescaleTo(r, out_scale);
+}
+
 pub fn roundScaleDown(u: i128, drop: u32) i128 {
     if (drop == 0) return u;
     // 10^38 is the largest power of ten an i128 holds; past it every value
@@ -2560,6 +2604,9 @@ pub fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalE
         .int => switch (v) {
             .int => v,
             .float => |x| .{ .int = try floatToInt(x) },
+            // Rounded half away from zero, as PostgreSQL and DuckDB cast a
+            // numeric; a decimal used to fail every numeric cast.
+            .decimal => |d| .{ .int = std.math.cast(i64, (rescaleTo(d, 0) orelse return error.IntOverflow).unscaled) orelse return error.IntOverflow },
             .bool => |x| .{ .int = if (x) 1 else 0 },
             .string => |s| .{ .int = std.fmt.parseInt(i64, trim(s), 10) catch return error.CastFailed },
             else => error.CastFailed,
@@ -2567,6 +2614,7 @@ pub fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalE
         .float => switch (v) {
             .float => v,
             .int => |x| .{ .float = @floatFromInt(x) },
+            .decimal => |d| .{ .float = d.toF64() },
             .string => |s| .{ .float = std.fmt.parseFloat(f64, trim(s)) catch return error.CastFailed },
             else => error.CastFailed,
         },
@@ -4182,6 +4230,33 @@ test "integer arithmetic overflow is an error, not a silent wrap" {
     defer ar.deinit();
     try std.testing.expectError(error.IntOverflow, evalLit(ar.allocator(), "-(-9223372036854775807 - 1)"));
     try std.testing.expectError(error.IntOverflow, evalLit(ar.allocator(), "abs(-9223372036854775807 - 1)"));
+}
+
+test "numeric semantics: % truncates for every kind; decimals round, negate and cast exactly" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // `%` takes the dividend's sign for floats and decimals too, as for ints:
+    // the float path floored (`-5.0 % 3` was 1), decimals went through it.
+    try std.testing.expectEqual(@as(f64, -2), (try evalLit(a, "-5.0 % 3")).float);
+    try std.testing.expectEqual(@as(f64, -1.5), (try evalLit(a, "-5.5 % 2")).float);
+    const m = (try evalLit(a, "CAST(-1.005 AS DECIMAL(10,3)) % 2")).decimal;
+    try std.testing.expectEqual(@as(i128, -1005), m.unscaled);
+    try std.testing.expectEqual(@as(u8, 3), m.scale);
+
+    // round on a decimal is exact: through f64, 1.005 was 1.00499… and rounded to 1.
+    const r = (try evalLit(a, "round(CAST(-1.005 AS DECIMAL(10,3)), 2)")).decimal;
+    try std.testing.expectEqual(@as(i128, -101), r.unscaled);
+    try std.testing.expectEqual(@as(u8, 2), r.scale);
+    try std.testing.expectEqual(@as(i128, 3), (try evalLit(a, "round(CAST(2.5 AS DECIMAL(4,1)))")).decimal.unscaled);
+    // `-2` is not a literal digit count, so the value keeps the input's scale: 100.0.
+    try std.testing.expectEqual(@as(i128, 1000), (try evalLit(a, "round(CAST(149.9 AS DECIMAL(5,1)), -2)")).decimal.unscaled);
+
+    // Negation and numeric casts used to be a type mismatch / cast failure.
+    try std.testing.expectEqual(@as(i128, -25), (try evalLit(a, "-CAST(2.5 AS DECIMAL(4,1))")).decimal.unscaled);
+    try std.testing.expectEqual(@as(i64, 3), (try evalLit(a, "CAST(CAST(2.5 AS DECIMAL(4,1)) AS INT)")).int);
+    try std.testing.expectEqual(@as(i64, -3), (try evalLit(a, "CAST(CAST(-2.5 AS DECIMAL(4,1)) AS INT)")).int);
+    try std.testing.expectEqual(@as(f64, 2.5), (try evalLit(a, "CAST(CAST(2.5 AS DECIMAL(4,1)) AS DOUBLE)")).float);
 }
 
 test "timestamps keep sub-second precision through parse and format" {
