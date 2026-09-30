@@ -1569,6 +1569,9 @@ pub const Aggregate = struct {
         len: usize,
         /// The key columns' types, which the fixed stores need to box a raw word.
         key_kinds: []const types.TypeKind,
+        /// A lane partition's own index and hash list, for `GroupMerge.adopt`.
+        table: ?*GroupTable = null,
+        hash_list: ?*std.array_list.Managed(u64) = null,
 
         pub const Store = union(enum) {
             fixed: *FixedStore,
@@ -1607,23 +1610,46 @@ pub const Aggregate = struct {
         }
     };
 
-    /// Folds groups from several sets into one new set of the same kind. A key seen
-    /// for the first time costs its record — raw words and accumulators, copied as
-    /// they are — and a repeated one an accumulator merge. Keys and extremes are not
-    /// deep-copied: the sets merged from outlive the merged set's emit.
+    /// Folds groups from several sets into one set of the same kind. A key seen for
+    /// the first time costs its record — raw words and accumulators, copied as they
+    /// are — and a repeated one an accumulator merge.
     pub const GroupMerge = struct {
         alloc: std.mem.Allocator,
         aggs: []const Agg,
         any_distinct: bool,
+        /// Deep-copy what a new record borrows — string keys and extremes, a MEDIAN's
+        /// values — so the set it came from can be freed as soon as it is merged.
+        /// Otherwise the sets merged from must outlive the merged set's emit.
+        own: bool = false,
         set: GroupSet,
         table: GroupTable,
         hashes: std.array_list.Managed(u64),
 
-        pub fn init(alloc: std.mem.Allocator, like: *const GroupSet, aggs: []const Agg) !GroupMerge {
-            var any_distinct = false;
+        fn anyDistinct(aggs: []const Agg) bool {
             for (aggs) |a| {
-                if (a.distinct) any_distinct = true;
+                if (a.distinct) return true;
             }
+            return false;
+        }
+
+        /// Merge into `set` itself — its store, index and hash list, growing in the
+        /// allocator that holds them — instead of copying it into a new one. Null for
+        /// a set that carries no index of its own (a serial fold's).
+        pub fn adopt(set: *const GroupSet, aggs: []const Agg) ?GroupMerge {
+            const table = set.table orelse return null;
+            const hs = set.hash_list orelse return null;
+            return .{
+                .alloc = table.alloc,
+                .aggs = aggs,
+                .any_distinct = anyDistinct(aggs),
+                .set = set.*,
+                .table = table.*,
+                .hashes = hs.*,
+            };
+        }
+
+        pub fn init(alloc: std.mem.Allocator, like: *const GroupSet, aggs: []const Agg) !GroupMerge {
+            const any_distinct = anyDistinct(aggs);
             const store: GroupSet.Store = switch (like.store) {
                 .fixed => |st| blk: {
                     const n = try alloc.create(FixedStore);
@@ -1670,7 +1696,9 @@ pub const Aggregate = struct {
                     const sr = src.store.boxed.at(i);
                     const rec = try self.find(dst, src.hashes[i], @as([]const Value, sr.keys)) orelse {
                         const nr = try dst.push();
-                        @memcpy(nr.keys, sr.keys);
+                        if (self.own) {
+                            for (nr.keys, sr.keys) |*o, v| o.* = try dupeValue(self.alloc, v);
+                        } else @memcpy(nr.keys, sr.keys);
                         try self.adoptTail(dst.layout, nr.tail, sr.tail);
                         return;
                     };
@@ -1690,16 +1718,29 @@ pub const Aggregate = struct {
         }
 
         /// A new group's aggregate state, copied — except a DISTINCT set, which
-        /// belongs to the producing fold's arena and is rebuilt in this one.
+        /// belongs to the producing fold's arena and is rebuilt in this one, and
+        /// with `own` whatever else points into the source.
         fn adoptTail(self: *GroupMerge, layout: *const Layout, dst: [*]u8, src: [*]u8) !void {
             @memcpy(dst[0..layout.size], src[0..layout.size]);
-            if (!self.any_distinct) return;
-            for (self.aggs, 0..) |agg, j| {
-                if (!agg.distinct) continue;
+            if (!self.any_distinct and !self.own) return;
+            for (self.aggs, layout.slots, 0..) |agg, sl, j| {
+                if (sl != .full) continue;
                 const d = layout.ptr(Acc, dst, j);
-                d.seen = null;
-                d.n = 0;
-                if (layout.ptr(Acc, src, j).seen) |ss| try mergeDistinct(self.alloc, d, ss);
+                if (agg.distinct) {
+                    d.seen = null;
+                    d.n = 0;
+                    if (layout.ptr(Acc, src, j).seen) |ss| try mergeDistinct(self.alloc, d, ss);
+                } else if (self.own) switch (agg.func) {
+                    .min, .max => d.ext = try dupeValue(self.alloc, d.ext),
+                    .median => if (d.vals) |sv| {
+                        d.vals = null;
+                        const l = try self.alloc.create(std.array_list.Managed(f64));
+                        l.* = try .initCapacity(self.alloc, sv.items.len);
+                        l.appendSliceAssumeCapacity(sv.items);
+                        d.vals = l;
+                    },
+                    else => {},
+                };
             }
         }
 
@@ -1809,12 +1850,15 @@ pub const Aggregate = struct {
 
     fn foldSets(self: *Aggregate, comptime tag: std.meta.Tag(GroupSet.Store), parts: anytype) ![]GroupSet {
         const kinds = try self.keyKinds();
-        const out = try self.state.alloc(GroupSet, if (self.part_state == null) 1 else fold_parts);
-        for (out, parts[0..out.len]) |*o, p| o.* = .{
+        const own = self.part_state != null;
+        const out = try self.state.alloc(GroupSet, if (own) fold_parts else 1);
+        for (out, parts[0..out.len]) |*o, *p| o.* = .{
             .store = @unionInit(GroupSet.Store, @tagName(tag), p.store),
             .hashes = p.hashes.items,
             .len = p.store.len,
             .key_kinds = kinds,
+            .table = if (own) &p.table else null,
+            .hash_list = if (own) p.hashes else null,
         };
         return out;
     }

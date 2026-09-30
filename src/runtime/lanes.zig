@@ -322,6 +322,14 @@ const LaneParts = struct {
     fn deinit(self: *LaneParts) void {
         for (&self.arenas) |*a| a.deinit();
     }
+
+    /// Release partition `p` once the merge is done with it. Left as a fresh,
+    /// empty arena, so `deinit` stays unconditional.
+    fn free(self: *LaneParts, p: usize) void {
+        const child = self.arenas[p].child_allocator;
+        self.arenas[p].deinit();
+        self.arenas[p] = std.heap.ArenaAllocator.init(child);
+    }
 };
 
 fn allocAggSlots(gpa: std.mem.Allocator, n: usize) ![]AggSlot {
@@ -704,18 +712,35 @@ fn pqMergeOne(ctx: *PqMergeCtx, p: usize) !void {
 }
 
 /// Merge radix partition `p` of a set of partials into `dst`. `srcs` is a slice of
-/// anything carrying per-partition `sets` — parquet lanes or CSV/SQL slots —
-/// and is walked in index order, which is what keeps a float SUM from depending on
-/// thread timing (see `AggSlot`). A partition owns its keys outright, so the tasks
-/// need no lock between them, which is what stops a high-cardinality merge from
-/// serialising behind one table.
+/// anything carrying per-partition `sets` and `parts` — parquet lanes or CSV/SQL
+/// slots. A partition owns its keys outright, so the tasks need no lock between
+/// them, which is what stops a high-cardinality merge from serialising behind one
+/// table.
+///
+/// The largest source is merged into in place rather than copied, and every other
+/// one is freed as soon as it is folded in: copying every lane into a new set held
+/// each group twice, so -j 8 took twice the memory of -j 1. The rest are walked in
+/// index order, which with a largest source fixed by the input split keeps a float
+/// SUM from depending on thread timing (see `AggSlot`).
 fn mergeRadixPart(dst: *PqPart, srcs: anytype, aggs: []const op.Aggregate.Agg, p: usize) !void {
-    for (srcs) |*ls| {
-        if (ls.sets.len <= p) continue;
+    var big: ?usize = null;
+    for (srcs, 0..) |*ls, i| {
+        if (ls.sets.len <= p or ls.sets[p].len == 0) continue;
+        if (big == null or ls.sets[p].len > srcs[big.?].sets[p].len) big = i;
+    }
+    const bi = big orelse return;
+    const into = &srcs[bi].sets[p];
+    dst.merge = op.Aggregate.GroupMerge.adopt(into, aggs) orelse blk: {
+        var m = try op.Aggregate.GroupMerge.init(dst.arena.allocator(), into, aggs);
+        for (0..into.len) |gi| try m.add(into, gi);
+        break :blk m;
+    };
+    dst.merge.?.own = true;
+    for (srcs, 0..) |*ls, i| {
+        if (i == bi or ls.sets.len <= p) continue;
         const st = &ls.sets[p];
-        if (st.len == 0) continue;
-        if (dst.merge == null) dst.merge = try op.Aggregate.GroupMerge.init(dst.arena.allocator(), st, aggs);
         for (0..st.len) |gi| try dst.merge.?.add(st, gi);
+        ls.parts.free(p);
     }
 }
 
