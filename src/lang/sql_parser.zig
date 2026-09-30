@@ -1501,6 +1501,11 @@ pub const Parser = struct {
             return self.fail(self.curPos(), "queries nest more than {d} levels deep", .{max_query_depth});
         self.query_depth += 1;
         defer self.query_depth -= 1;
+        // A nested query is a fresh scope: its own WHERE decides where its IN
+        // (SELECT ...) may stand, and the enclosing one's is restored after it.
+        const outer_in_where = self.in_where;
+        self.in_where = false;
+        defer self.in_where = outer_in_where;
         if (self.isKw("with") and !(self.peekTag() == .lparen)) {
             _ = self.advance();
             while (true) {
@@ -1922,12 +1927,17 @@ pub const Parser = struct {
 
         if (self.eatKw("where")) {
             const fpos = self.curPos();
+            // Semi joins this WHERE owns start here: a subquery inside it registers
+            // and lifts its own, and one already pending belongs to an enclosing
+            // WHERE. Taking them all turned the outer `k IN (...)` into a join
+            // inside the subquery, where `k` does not exist.
+            const sj_base = self.pending_semijoins.items.len;
             self.in_where = true;
             const raw = try self.parseExpr();
             self.in_where = false;
             // Lift `IN (SELECT ...)` conjuncts BEFORE stripExpr: the sentinels
             // are matched by pointer, and a rewritten tree would orphan them.
-            const remaining = if (self.pending_semijoins.items.len > 0)
+            const remaining = if (self.pending_semijoins.items.len > sj_base)
                 try self.liftSemiJoins(raw, fpos)
             else
                 raw;
@@ -1935,7 +1945,7 @@ pub const Parser = struct {
                 const e = try self.stripExpr(r, &aliases);
                 try stages.append(.{ .node = .{ .filter = e }, .hints = &.{}, .pos = fpos });
             }
-            for (self.pending_semijoins.items) |sj| {
+            for (self.pending_semijoins.items[sj_base..]) |sj| {
                 // `lhs` was checked to be a field at parse; strip any alias
                 // qualifier the same way join keys written in ON do.
                 const lk = try self.arena.alloc(ast.QualName, 1);
@@ -1956,7 +1966,7 @@ pub const Parser = struct {
                     .pos = sj.pos,
                 });
             }
-            self.pending_semijoins.clearRetainingCapacity();
+            self.pending_semijoins.shrinkRetainingCapacity(sj_base);
         }
 
         var group: []const ast.QualName = &.{};

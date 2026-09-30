@@ -394,6 +394,34 @@ test "DISTINCT ON with ORDER BY keeps the first row per key in ORDER BY order" {
     }
 }
 
+test "several IN (SELECT ...) conditions, each subquery with its own WHERE" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "m.csv", .data = "k,x\n1,a\n2,b\n3,c\n4,d\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "pa.csv", .data = "p,q\n1,0\n2,1\n3,1\n9,1\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "pb.csv", .data = "p,q\n2,0\n3,0\n4,0\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    // The subquery's WHERE ended the "inside a WHERE" state for the outer one,
+    // and lifted every pending IN — the outer `k IN` became a join inside the
+    // subquery, where `k` does not exist. Verified against DuckDB.
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT k FROM '$B/m.csv' WHERE k IN (SELECT p FROM '$B/pa.csv' WHERE q > 0) AND k IN (SELECT p FROM '$B/pb.csv') ORDER BY k", .want = "k\n2\n3\n" },
+        .{ .q = "SELECT k FROM '$B/m.csv' WHERE k IN (SELECT p FROM '$B/pa.csv') AND k IN (SELECT p FROM '$B/pb.csv' WHERE q = 0) ORDER BY k", .want = "k\n2\n3\n" },
+        .{ .q = "SELECT k FROM '$B/m.csv' WHERE k IN (SELECT p FROM '$B/pa.csv' WHERE p NOT IN (SELECT p FROM '$B/pb.csv')) AND k IN (SELECT p FROM '$B/pa.csv')", .want = "k\n1\n" },
+    };
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+}
+
 test "aggregate: two aggregates over different expressions stay separate" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
