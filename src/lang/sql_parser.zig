@@ -322,6 +322,11 @@ pub const Parser = struct {
     /// LET emitted through `pending_bindings`, which only a surrounding
     /// `parseQuery` drains — so it is only legal at depth > 0.
     query_depth: usize = 0,
+    /// `parseExpr` nesting: the outermost call checks the finished tree's depth.
+    expr_nest: usize = 0,
+    /// `parseUnary` nesting — parentheses, calls, unary operators: the parser's
+    /// own recursion, bounded before it can exhaust the stack.
+    unary_nest: usize = 0,
 
     const PendingSemiJoin = struct {
         sentinel: *ast.Expr,
@@ -1490,6 +1495,10 @@ pub const Parser = struct {
     /// [ORDER BY ...] [LIMIT n [OFFSET m]]`, appending Let stmts for CTEs to
     /// `out` and pipeline stages to `stages`.
     fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages: *std.array_list.Managed(ast.Stage)) Error!void {
+        // Each level is a `parseSelectCore` frame, which is large: a hundred nested
+        // derived tables overflowed the stack.
+        if (self.query_depth >= max_query_depth)
+            return self.fail(self.curPos(), "queries nest more than {d} levels deep", .{max_query_depth});
         self.query_depth += 1;
         defer self.query_depth -= 1;
         if (self.isKw("with") and !(self.peekTag() == .lparen)) {
@@ -3552,7 +3561,68 @@ pub const Parser = struct {
     }
 
     fn parseExpr(self: *Parser) Error!*ast.Expr {
-        return self.parseBin(0);
+        const pos = self.curPos();
+        self.expr_nest += 1;
+        defer self.expr_nest -= 1;
+        const e = try self.parseBin(0);
+        if (self.expr_nest == 1 and deeperThan(e, max_expr_depth))
+            return self.fail(pos, "expression nests more than {d} levels deep — a long chain of `+`, `||` or comparisons; split it, or build the value in steps", .{max_expr_depth});
+        return e;
+    }
+
+    /// Every pass over an expression — typing, evaluation, pushdown — recurses on
+    /// the tree, so a deep enough one overflowed the stack: a 4000-element `IN`
+    /// list passed `check` and then segfaulted in `run`. AND/OR chains and IN
+    /// lists are balanced (`balanceChain`), so this limit only meets a chain of an
+    /// operator that cannot be regrouped.
+    const max_expr_depth = 1000;
+    const max_paren_depth = 256;
+    const max_query_depth = 32;
+
+    /// Whether `e` is more than `limit` levels deep. Stops descending at the limit,
+    /// so the check cannot itself exhaust the stack.
+    fn deeperThan(e: *const ast.Expr, limit: usize) bool {
+        if (limit == 0) return true;
+        return switch (e.*) {
+            .binary => |b| deeperThan(b.l, limit - 1) or deeperThan(b.r, limit - 1),
+            .unary => |u| deeperThan(u.e, limit - 1),
+            .is_null => |n| deeperThan(n.e, limit - 1),
+            .cast => |c| deeperThan(c.e, limit - 1),
+            .call => |c| for (c.args) |a| {
+                if (deeperThan(a, limit - 1)) break true;
+            } else false,
+            .cond => |c| deeperThan(c.cond, limit - 1) or deeperThan(c.then, limit - 1) or deeperThan(c.els, limit - 1),
+            else => false,
+        };
+    }
+
+    /// A left-deep run of one AND or OR, rebuilt balanced: `a OR b OR c OR d` is
+    /// `(a OR b) OR (c OR d)`. Both are associative under SQL's three-valued logic,
+    /// and the operands stay in order, so results and short-circuiting are
+    /// unchanged; the depth drops from n to log n.
+    fn balanceChain(self: *Parser, e: *ast.Expr) Error!*ast.Expr {
+        if (e.* != .binary) return e;
+        const op = e.binary.op;
+        if (op != .@"and" and op != .@"or") return e;
+        var n: usize = 1;
+        var node = e;
+        while (node.* == .binary and node.binary.op == op) : (node = node.binary.l) n += 1;
+        if (n <= 4) return e;
+        const items = try self.arena.alloc(*ast.Expr, n);
+        node = e;
+        var i = n - 1;
+        while (node.* == .binary and node.binary.op == op) : (node = node.binary.l) {
+            items[i] = node.binary.r;
+            i -= 1;
+        }
+        items[0] = node;
+        return self.buildBalanced(op, items);
+    }
+
+    fn buildBalanced(self: *Parser, op: ast.BinOp, items: []const *ast.Expr) Error!*ast.Expr {
+        if (items.len == 1) return items[0];
+        const mid = items.len / 2;
+        return self.mk(.{ .binary = .{ .op = op, .l = try self.buildBalanced(op, items[0..mid]), .r = try self.buildBalanced(op, items[mid..]) } });
     }
 
     const BinInfo = struct { op: ast.BinOp, lbp: u8 };
@@ -3635,9 +3705,7 @@ pub const Parser = struct {
                 // and the WHERE handler lifts it out — which is why the shape
                 // is only accepted as a top-level AND conjunct of WHERE.
                 //
-                // NOT IN follows this engine's anti join, which keeps rows
-                // matching no NON-NULL key — the documented divergence from
-                // SQL's three-valued NOT IN (see language.md on anti joins).
+                // NOT IN is a null-aware anti join: SQL's three-valued NOT IN.
                 if (self.isKw("select") or self.isKw("with")) {
                     if (!self.in_where)
                         return self.fail(inpos, "IN (SELECT ...) is only supported in a WHERE clause", .{});
@@ -3674,6 +3742,7 @@ pub const Parser = struct {
                     if (!self.eat(.comma)) break;
                 }
                 _ = try self.expect(.rparen);
+                alt = try self.balanceChain(alt.?);
                 lhs = if (negated) try self.mk(.{ .unary = .{ .op = .not, .e = alt.? } }) else alt.?;
                 continue;
             }
@@ -3718,10 +3787,14 @@ pub const Parser = struct {
             const rhs = try self.parseBin(info.lbp);
             lhs = try self.mk(.{ .binary = .{ .op = info.op, .l = lhs, .r = rhs } });
         }
-        return lhs;
+        return self.balanceChain(lhs);
     }
 
     fn parseUnary(self: *Parser) Error!*ast.Expr {
+        if (self.unary_nest >= max_paren_depth)
+            return self.fail(self.curPos(), "expression nests more than {d} levels of parentheses, calls or unary operators", .{max_paren_depth});
+        self.unary_nest += 1;
+        defer self.unary_nest -= 1;
         if (self.eat(.minus)) {
             const e = try self.parseUnary();
             return self.mk(.{ .unary = .{ .op = .neg, .e = e } });
@@ -4311,6 +4384,50 @@ test "sql: plain UNION [ALL] lines up by position; INTERSECT binds tighter than 
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'x.csv' UNION ALL BY NAME SELECT k FROM 'y.csv' UNION ALL SELECT k FROM 'z.csv';", &diag));
     try testing.expect(std.mem.indexOf(u8, diag.msg, "all `BY NAME` or all by position") != null);
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'x.csv' UNION ALL SELECT k FROM 'y.csv' ANCHOR SCHEMA first;", &diag));
+}
+
+test "sql: long IN lists and AND/OR chains are balanced; deeper nesting is an error, not a stack overflow" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // A 5000-element IN list was a 5000-deep OR chain: `check` passed, and every
+    // recursive pass in `run` then overflowed the stack.
+    var src = std.array_list.Managed(u8).init(a);
+    try src.appendSlice("SELECT id FROM 'x.csv' WHERE id IN (");
+    for (0..5000) |i| try src.writer().print("{s}{d}", .{ if (i == 0) "" else ",", i });
+    try src.appendSlice(") AND (");
+    for (0..5000) |i| try src.writer().print("{s}v = {d}", .{ if (i == 0) "" else " OR ", i });
+    try src.appendSlice(");");
+    const prog = try parseTest(a, src.items);
+    const pred = prog.stmts[prog.stmts.len - 1].output.stages[1].node.filter;
+    try testing.expect(!Parser.deeperThan(pred, 40));
+
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    src.clearRetainingCapacity();
+    try src.appendSlice("SELECT v");
+    for (0..2000) |_| try src.appendSlice(" + v");
+    try src.appendSlice(" AS s FROM 'x.csv';");
+    try testing.expectError(error.ParseFailed, parseSource(a, src.items, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "more than 1000 levels deep") != null);
+
+    src.clearRetainingCapacity();
+    try src.appendSlice("SELECT ");
+    for (0..5000) |_| try src.append('(');
+    try src.append('v');
+    for (0..5000) |_| try src.append(')');
+    try src.appendSlice(" FROM 'x.csv';");
+    try testing.expectError(error.ParseFailed, parseSource(a, src.items, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "levels of parentheses") != null);
+
+    src.clearRetainingCapacity();
+    try src.appendSlice("SELECT COUNT(*) AS c FROM ");
+    for (0..200) |_| try src.appendSlice("(SELECT * FROM ");
+    try src.appendSlice("'x.csv'");
+    for (0..200) |_| try src.appendSlice(") q");
+    try src.append(';');
+    try testing.expectError(error.ParseFailed, parseSource(a, src.items, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "queries nest more than") != null);
 }
 
 test "sql: UNION ALL BY NAME with tag literal and anchor" {
