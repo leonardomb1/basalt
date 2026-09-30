@@ -244,6 +244,10 @@ const ColBuf = struct {
     }
 };
 
+fn ownOpt(arena: std.mem.Allocator, v: ?Value) !?Value {
+    return if (v) |x| try own(arena, x) else null;
+}
+
 /// Copies any value that borrows memory, so it can outlive the batch it came from.
 fn own(arena: std.mem.Allocator, v: Value) !Value {
     return switch (v) {
@@ -327,7 +331,14 @@ const WRITE_BUF = 64 * 1024;
 const parquet_content_type = "application/vnd.apache.parquet";
 
 pub const Writer = struct {
+    /// Lives as long as the plan: the footer's per-group metadata goes here.
     arena: std.mem.Allocator,
+    /// Everything that only matters until the row group is written — sealed
+    /// pages, compressed bodies, dictionary strings, statistics candidates —
+    /// reset after each flush. On the plan arena, a 10M-row write held 1.4 GB
+    /// where a row group needs a few MB.
+    scratch: std.heap.ArenaAllocator,
+    scratch_live: bool = true,
     backend: Backend,
     write_buf: [WRITE_BUF]u8 = undefined,
     fw: std.fs.File.Writer = undefined,
@@ -389,6 +400,7 @@ pub const Writer = struct {
         const self = try arena.create(Writer);
         self.* = .{
             .arena = arena,
+            .scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator),
             .backend = undefined,
             .schema = schema,
             .maps = maps,
@@ -425,6 +437,7 @@ pub const Writer = struct {
 
     pub fn writeBatch(self: *Writer, arena: std.mem.Allocator, batch: Batch) !void {
         _ = arena;
+        const sa = self.scratch.allocator();
         for (0..batch.len) |r| {
             for (batch.columns, self.cols, self.maps) |col, *cb, m| {
                 const v = col.getValue(r);
@@ -433,14 +446,14 @@ pub const Writer = struct {
                     cb.nulls += 1;
                     continue;
                 }
-                try cb.observe(self.arena, v);
+                try cb.observe(sa, v);
                 if (m.phys == .byte_array and cb.dict_ok) {
                     const sv: []const u8 = switch (v) {
                         .string => |x| x,
                         .bytes => |x| x,
                         else => "",
                     };
-                    _ = try cb.dictPut(self.arena, sv);
+                    _ = try cb.dictPut(sa, sv);
                 }
                 try encodePlain(cb, m, v);
             }
@@ -448,7 +461,7 @@ pub const Writer = struct {
                 // a dictionary is per chunk, so its indices are emitted as one
                 // page at flush; splitting only applies to PLAIN columns
                 if (cb.dict_ok) continue;
-                if (cb.values.items.len >= page_target_bytes) try cb.sealPage(self.arena, m.optional);
+                if (cb.values.items.len >= page_target_bytes) try cb.sealPage(sa, m.optional);
             }
             self.rows += 1;
             self.total_rows += 1;
@@ -460,6 +473,7 @@ pub const Writer = struct {
     fn flushRowGroup(self: *Writer) !void {
         if (self.rows == 0) return;
         const chunks = try self.arena.alloc(ChunkMeta, self.cols.len);
+        const sa = self.scratch.allocator();
         var group_bytes: i64 = 0;
 
         for (self.cols, chunks, self.maps) |*cb, *cm, m| {
@@ -473,7 +487,7 @@ pub const Writer = struct {
                 cb.reset();
                 continue;
             }
-            try cb.sealPage(self.arena, m.optional);
+            try cb.sealPage(sa, m.optional);
 
             const start = self.offset;
             var values: i64 = 0;
@@ -483,7 +497,7 @@ pub const Writer = struct {
             for (cb.pages.items) |pgm| {
                 // page body: [4-byte level length][RLE def levels][values],
                 // with the level section omitted for REQUIRED columns
-                var body = List(u8).init(self.arena);
+                var body = List(u8).init(sa);
                 if (m.optional) {
                     var len4: [4]u8 = undefined;
                     std.mem.writeInt(u32, &len4, @intCast(pgm.defs.len), .little);
@@ -493,8 +507,8 @@ pub const Writer = struct {
                 try body.appendSlice(pgm.values);
 
                 const raw = body.items;
-                const packed_body = try codec.compress(self.arena, self.compression, raw);
-                var hdr = List(u8).init(self.arena);
+                const packed_body = try codec.compress(sa, self.compression, raw);
+                var hdr = List(u8).init(sa);
                 try writePageHeader(&hdr, raw.len, packed_body.len, pgm.rows, std.hash.Crc32.hash(packed_body));
                 try self.emit(hdr.items);
                 try self.emit(packed_body);
@@ -515,8 +529,8 @@ pub const Writer = struct {
                 .uncompressed = uncompressed,
                 .compressed = compressed,
                 .nulls = cb.nulls,
-                .min = cb.min,
-                .max = cb.max,
+                .min = try ownOpt(self.arena, cb.min),
+                .max = try ownOpt(self.arena, cb.max),
             };
             group_bytes += uncompressed;
             cb.reset();
@@ -528,24 +542,26 @@ pub const Writer = struct {
             .total_byte_size = group_bytes,
         });
         self.rows = 0;
+        _ = self.scratch.reset(.retain_capacity);
     }
 
     /// Writes a dictionary page followed by an RLE_DICTIONARY data page.
     fn writeDictChunk(self: *Writer, cb: *ColBuf, m: Mapping) !ChunkMeta {
+        const sa = self.scratch.allocator();
         const start = self.offset;
         var uncompressed: i64 = 0;
         var compressed: i64 = 0;
 
         // dictionary page: the distinct values, PLAIN-encoded in index order
-        var dict_body = List(u8).init(self.arena);
+        var dict_body = List(u8).init(sa);
         for (cb.dict_order.items) |v| {
             var len4: [4]u8 = undefined;
             std.mem.writeInt(u32, &len4, @intCast(v.len), .little);
             try dict_body.appendSlice(&len4);
             try dict_body.appendSlice(v);
         }
-        const dict_packed = try codec.compress(self.arena, self.compression, dict_body.items);
-        var dhdr = List(u8).init(self.arena);
+        const dict_packed = try codec.compress(sa, self.compression, dict_body.items);
+        var dhdr = List(u8).init(sa);
         try writeDictPageHeader(&dhdr, dict_body.items.len, dict_packed.len, cb.dict_order.items.len, std.hash.Crc32.hash(dict_packed));
         try self.emit(dhdr.items);
         try self.emit(dict_packed);
@@ -557,9 +573,9 @@ pub const Writer = struct {
         const data_start = self.offset;
 
         // data page: [levels][bit width][RLE indices]
-        var body = List(u8).init(self.arena);
+        var body = List(u8).init(sa);
         if (m.optional) {
-            const levels = try packLevels(self.arena, cb.defs.items);
+            const levels = try packLevels(sa, cb.defs.items);
             var len4: [4]u8 = undefined;
             std.mem.writeInt(u32, &len4, @intCast(levels.len), .little);
             try body.appendSlice(&len4);
@@ -569,8 +585,8 @@ pub const Writer = struct {
         try body.append(width);
         try packRleIndices(&body, cb.dict_idx.items, width);
 
-        const packed_body = try codec.compress(self.arena, self.compression, body.items);
-        var hdr = List(u8).init(self.arena);
+        const packed_body = try codec.compress(sa, self.compression, body.items);
+        var hdr = List(u8).init(sa);
         try writeDictDataPageHeader(&hdr, body.items.len, packed_body.len, cb.defs.items.len, std.hash.Crc32.hash(packed_body));
         try self.emit(hdr.items);
         try self.emit(packed_body);
@@ -584,14 +600,15 @@ pub const Writer = struct {
             .uncompressed = uncompressed,
             .compressed = compressed,
             .nulls = cb.nulls,
-            .min = cb.min,
-            .max = cb.max,
+            .min = try ownOpt(self.arena, cb.min),
+            .max = try ownOpt(self.arena, cb.max),
             .dict = true,
         };
     }
 
     pub fn close(self: *Writer) !void {
         try self.flushRowGroup();
+        self.freeScratch();
 
         var footer = List(u8).init(self.arena);
         try self.writeFileMetaData(&footer);
@@ -621,7 +638,15 @@ pub const Writer = struct {
     /// correct outcome for an aborted run — there is nothing to roll back. A blob
     /// is stronger: skipping the block-list commit means the object never appears
     /// at all, and Azure discards the staged blocks after a week.
+    /// Once only: `abort` may follow a `close` that failed after freeing it.
+    fn freeScratch(self: *Writer) void {
+        if (!self.scratch_live) return;
+        self.scratch.deinit();
+        self.scratch_live = false;
+    }
+
     pub fn abort(self: *Writer) void {
+        self.freeScratch();
         switch (self.backend) {
             .file => |f| f.close(),
             // Staged blocks and an uncompleted multipart upload are invisible to
