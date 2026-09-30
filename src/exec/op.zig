@@ -1569,7 +1569,6 @@ pub const Aggregate = struct {
 
         pub const Store = union(enum) {
             fixed: *FixedStore,
-            count: *CountStore,
             boxed: *GroupStore,
             /// No GROUP BY: one group, no key.
             single: []Acc,
@@ -1579,7 +1578,7 @@ pub const Aggregate = struct {
             switch (self.store) {
                 .boxed => |st| return st.at(i).keys[j],
                 .single => unreachable,
-                inline .fixed, .count => |st| {
+                .fixed => |st| {
                     const rec = st.at(i);
                     if (rec.mask.* & (@as(u64, 1) << @intCast(j)) != 0) return .null;
                     const raw = rec.keys[j];
@@ -1598,9 +1597,8 @@ pub const Aggregate = struct {
 
         pub fn acc(self: *const GroupSet, i: usize, j: usize) Acc {
             return switch (self.store) {
-                .fixed => |st| st.at(i).tail[j],
-                .count => |st| .{ .n = st.at(i).tail[j] },
-                .boxed => |st| st.at(i).accs[j],
+                .fixed => |st| st.layout.acc(st.at(i).tail, j),
+                .boxed => |st| st.layout.acc(st.at(i).tail, j),
                 .single => |accs| accs[j],
             };
         }
@@ -1626,17 +1624,12 @@ pub const Aggregate = struct {
             const store: GroupSet.Store = switch (like.store) {
                 .fixed => |st| blk: {
                     const n = try alloc.create(FixedStore);
-                    n.* = FixedStore.init(alloc, st.nkeys, st.naggs);
+                    n.* = FixedStore.init(alloc, st.nkeys, st.layout);
                     break :blk .{ .fixed = n };
-                },
-                .count => |st| blk: {
-                    const n = try alloc.create(CountStore);
-                    n.* = CountStore.init(alloc, st.nkeys, st.naggs);
-                    break :blk .{ .count = n };
                 },
                 .boxed => |st| blk: {
                     const n = try alloc.create(GroupStore);
-                    n.* = GroupStore.init(alloc, st.nkeys, st.naggs);
+                    n.* = GroupStore.init(alloc, st.nkeys, st.layout);
                     break :blk .{ .boxed = n };
                 },
                 .single => blk: {
@@ -1659,37 +1652,26 @@ pub const Aggregate = struct {
         pub fn add(self: *GroupMerge, src: *const GroupSet, i: usize) !void {
             switch (self.set.store) {
                 .single => |dst| for (dst, self.aggs, 0..) |*d, agg, j| try mergeAcc(self.alloc, d, src.acc(i, j), agg),
-                .count => |dst| {
-                    const sr = src.store.count.at(i);
-                    const rec = try self.find(dst, src.hashes[i], FixedKey{ .vals = sr.keys, .mask = sr.mask.* }) orelse {
-                        const nr = try dst.push();
-                        @memcpy(nr.keys, sr.keys);
-                        nr.mask.* = sr.mask.*;
-                        @memcpy(nr.tail, sr.tail);
-                        return;
-                    };
-                    for (rec.tail, sr.tail) |*d, c| d.* += c;
-                },
                 .fixed => |dst| {
                     const sr = src.store.fixed.at(i);
                     const rec = try self.find(dst, src.hashes[i], FixedKey{ .vals = sr.keys, .mask = sr.mask.* }) orelse {
                         const nr = try dst.push();
                         @memcpy(nr.keys, sr.keys);
                         nr.mask.* = sr.mask.*;
-                        try self.adoptAccs(nr.tail, sr.tail);
+                        try self.adoptTail(dst.layout, nr.tail, sr.tail);
                         return;
                     };
-                    for (rec.tail, sr.tail, self.aggs) |*d, a, agg| try mergeAcc(self.alloc, d, a, agg);
+                    for (self.aggs, 0..) |agg, j| try dst.layout.merge(self.alloc, rec.tail, sr.tail, j, agg);
                 },
                 .boxed => |dst| {
                     const sr = src.store.boxed.at(i);
                     const rec = try self.find(dst, src.hashes[i], @as([]const Value, sr.keys)) orelse {
                         const nr = try dst.push();
                         @memcpy(nr.keys, sr.keys);
-                        try self.adoptAccs(nr.accs, sr.accs);
+                        try self.adoptTail(dst.layout, nr.tail, sr.tail);
                         return;
                     };
-                    for (rec.accs, sr.accs, self.aggs) |*d, a, agg| try mergeAcc(self.alloc, d, a, agg);
+                    for (self.aggs, 0..) |agg, j| try dst.layout.merge(self.alloc, rec.tail, sr.tail, j, agg);
                 },
             }
         }
@@ -1704,16 +1686,17 @@ pub const Aggregate = struct {
             return null;
         }
 
-        /// A new group's accumulators, copied — except a DISTINCT set, which belongs
-        /// to the producing fold's arena and is rebuilt in this one.
-        fn adoptAccs(self: *GroupMerge, dst: []Acc, src: []const Acc) !void {
-            @memcpy(dst, src);
+        /// A new group's aggregate state, copied — except a DISTINCT set, which
+        /// belongs to the producing fold's arena and is rebuilt in this one.
+        fn adoptTail(self: *GroupMerge, layout: *const Layout, dst: [*]u8, src: [*]u8) !void {
+            @memcpy(dst[0..layout.size], src[0..layout.size]);
             if (!self.any_distinct) return;
-            for (dst, src, self.aggs) |*d, a, agg| {
+            for (self.aggs, 0..) |agg, j| {
                 if (!agg.distinct) continue;
+                const d = layout.ptr(Acc, dst, j);
                 d.seen = null;
                 d.n = 0;
-                if (a.seen) |ss| try mergeDistinct(self.alloc, d, ss);
+                if (layout.ptr(Acc, src, j).seen) |ss| try mergeDistinct(self.alloc, d, ss);
             }
         }
 
@@ -1783,7 +1766,9 @@ pub const Aggregate = struct {
         const tables = try self.state.alloc(GroupTable, nparts);
         for (tables) |*t| t.* = try GroupTable.init(self.state, 256);
         const counts = try self.state.alloc(u32, nparts + 1);
-        var store = if (counts_only) CountStore.init(self.state, self.by.len, self.aggs.len) else FixedStore.init(self.state, self.by.len, self.aggs.len);
+        const layout = try self.state.create(Layout);
+        layout.* = try Layout.init(self.state, self.aggs);
+        var store = FixedStore.init(self.state, self.by.len, layout);
         const nk = self.by.len;
 
         while (try self.child.next(pull)) |b| {
@@ -1855,21 +1840,22 @@ pub const Aggregate = struct {
                     break :blk nr;
                 };
                 if (counts_only) {
-                    for (rec.tail) |*c| c.* += 1;
+                    const cs: [*]i64 = @ptrCast(@alignCast(rec.tail));
+                    for (cs[0..self.aggs.len]) |*c| c.* += 1;
                 } else {
                     for (self.aggs, 0..) |agg, j| {
                         const v = if (argcols[j]) |col| col.getValue(ri) else Value.null;
-                        try updateAcc(self.state, &rec.tail[j], agg, v, agg.arg != null);
+                        try layout.update(self.state, rec.tail, j, agg, v);
                     }
                 }
             }
             _ = scratch.reset(.retain_capacity);
         }
 
-        const sp = try self.state.create(@TypeOf(store));
+        const sp = try self.state.create(FixedStore);
         sp.* = store;
         return .{
-            .store = if (counts_only) .{ .count = sp } else .{ .fixed = sp },
+            .store = .{ .fixed = sp },
             .hashes = ghashes.items,
             .len = store.len,
             .key_kinds = try self.keyKinds(),
@@ -1912,7 +1898,9 @@ pub const Aggregate = struct {
         const tables = try self.state.alloc(GroupTable, nparts);
         for (tables) |*t| t.* = try GroupTable.init(self.state, 256);
         const counts = try self.state.alloc(u32, nparts + 1);
-        var store = GroupStore.init(self.state, self.by.len, self.aggs.len);
+        const layout = try self.state.create(Layout);
+        layout.* = try Layout.init(self.state, self.aggs);
+        var store = GroupStore.init(self.state, self.by.len, layout);
         const hctx = keyhash.MultiKeyCtx{};
         while (try self.child.next(pull)) |b| {
             const nk = self.by.len;
@@ -1969,7 +1957,7 @@ pub const Aggregate = struct {
                 };
                 for (self.aggs, 0..) |agg, j| {
                     const v = if (argcols[j]) |col| col.getValue(r) else Value.null;
-                    try updateAcc(self.state, &rec.accs[j], agg, v, agg.arg != null);
+                    try layout.update(self.state, rec.tail, j, agg, v);
                 }
             }
             _ = scratch.reset(.retain_capacity);
@@ -2006,73 +1994,57 @@ pub const Aggregate = struct {
     /// Group storage for keys that are all fixed-width. A boxed `Value` costs 32
     /// bytes to say what eight bytes of `i64` already says, and hashing one walks
     /// a tagged union per key; here the keys are raw words with a null mask
-    /// beside them, so both the record and the hash get cheaper.
-    ///
-    /// `Tail` is the per-aggregate state each record carries. Two instantiations
-    /// exist and they differ in nothing but that: the general fold stores an
-    /// `Acc`, while a counting-only fold stores a bare `i64`, because `COUNT(*)`
-    /// needs eight bytes of state where `Acc` reserves sixty-four — enough for a
-    /// min/max `Value` the group will never hold. For two keys and one count
-    /// that is a 32-byte record: two groups per cache line instead of one
-    /// straddling two.
-    fn KeyStore(comptime Tail: type) type {
-        return struct {
-            const Self = @This();
+    /// beside them, so both the record and the hash get cheaper. The aggregates'
+    /// state follows, laid out by `Layout` — for two keys and one count, a
+    /// 32-byte record: two groups per cache line instead of one straddling two.
+    const FixedStore = struct {
+        const block_shift = 13;
+        const block = 1 << block_shift;
+        const block_mask = block - 1;
 
-            const block_shift = 13;
-            const block = 1 << block_shift;
-            const block_mask = block - 1;
+        alloc: std.mem.Allocator,
+        nkeys: usize,
+        layout: *const Layout,
+        blocks: std.array_list.Managed([]u8),
+        len: usize = 0,
 
-            /// What a freshly claimed record's aggregate state starts at.
-            const tail_init: Tail = if (Tail == Acc) .{} else 0;
+        const Rec = struct { keys: []i64, mask: *u64, tail: [*]u8 };
 
-            alloc: std.mem.Allocator,
-            nkeys: usize,
-            naggs: usize,
-            blocks: std.array_list.Managed([]u8),
-            len: usize = 0,
+        fn init(alloc: std.mem.Allocator, nkeys: usize, layout: *const Layout) FixedStore {
+            return .{ .alloc = alloc, .nkeys = nkeys, .layout = layout, .blocks = std.array_list.Managed([]u8).init(alloc) };
+        }
 
-            const Rec = struct { keys: []i64, mask: *u64, tail: []Tail };
+        fn recSize(self: FixedStore) usize {
+            return self.nkeys * @sizeOf(i64) + @sizeOf(u64) + self.layout.size;
+        }
 
-            fn init(alloc: std.mem.Allocator, nkeys: usize, naggs: usize) Self {
-                return .{ .alloc = alloc, .nkeys = nkeys, .naggs = naggs, .blocks = std.array_list.Managed([]u8).init(alloc) };
+        fn at(self: FixedStore, i: usize) Rec {
+            const rec = self.recSize();
+            const base = self.blocks.items[i >> block_shift].ptr + (i & block_mask) * rec;
+            const ksz = self.nkeys * @sizeOf(i64);
+            return .{
+                .keys = @alignCast(std.mem.bytesAsSlice(i64, base[0..ksz])),
+                .mask = @ptrCast(@alignCast(base + ksz)),
+                .tail = base + ksz + @sizeOf(u64),
+            };
+        }
+
+        fn eqlAt(self: *const FixedStore, i: usize, key: FixedKey) bool {
+            const r = self.at(i);
+            if (r.mask.* != key.mask) return false;
+            return std.mem.eql(i64, r.keys, key.vals);
+        }
+
+        fn push(self: *FixedStore) !Rec {
+            if (self.len & block_mask == 0 and self.len >> block_shift == self.blocks.items.len) {
+                try self.blocks.append(try self.alloc.alignedAlloc(u8, .of(Value), block * self.recSize()));
             }
-
-            fn recSize(self: Self) usize {
-                return self.nkeys * @sizeOf(i64) + @sizeOf(u64) + self.naggs * @sizeOf(Tail);
-            }
-
-            fn at(self: Self, i: usize) Rec {
-                const rec = self.recSize();
-                const base = self.blocks.items[i >> block_shift].ptr + (i & block_mask) * rec;
-                const ksz = self.nkeys * @sizeOf(i64);
-                return .{
-                    .keys = @alignCast(std.mem.bytesAsSlice(i64, base[0..ksz])),
-                    .mask = @ptrCast(@alignCast(base + ksz)),
-                    .tail = @alignCast(std.mem.bytesAsSlice(Tail, (base + ksz + @sizeOf(u64))[0 .. self.naggs * @sizeOf(Tail)])),
-                };
-            }
-
-            fn eqlAt(self: *const Self, i: usize, key: FixedKey) bool {
-                const r = self.at(i);
-                if (r.mask.* != key.mask) return false;
-                return std.mem.eql(i64, r.keys, key.vals);
-            }
-
-            fn push(self: *Self) !Rec {
-                if (self.len & block_mask == 0 and self.len >> block_shift == self.blocks.items.len) {
-                    try self.blocks.append(try self.alloc.alignedAlloc(u8, .of(Tail), block * self.recSize()));
-                }
-                const rec = self.at(self.len);
-                self.len += 1;
-                @memset(rec.tail, tail_init);
-                return rec;
-            }
-        };
-    }
-
-    const FixedStore = KeyStore(Acc);
-    const CountStore = KeyStore(i64);
+            const rec = self.at(self.len);
+            self.len += 1;
+            self.layout.clear(rec.tail);
+            return rec;
+        }
+    };
 
     const FixedKey = struct { vals: []const i64, mask: u64 };
 
@@ -2182,23 +2154,23 @@ pub const Aggregate = struct {
 
         alloc: std.mem.Allocator,
         nkeys: usize,
-        naggs: usize,
+        layout: *const Layout,
         blocks: std.array_list.Managed([]u8),
         len: usize = 0,
 
-        const Rec = struct { keys: []Value, accs: []Acc };
+        const Rec = struct { keys: []Value, tail: [*]u8 };
 
-        fn init(alloc: std.mem.Allocator, nkeys: usize, naggs: usize) GroupStore {
+        fn init(alloc: std.mem.Allocator, nkeys: usize, layout: *const Layout) GroupStore {
             return .{
                 .alloc = alloc,
                 .nkeys = nkeys,
-                .naggs = naggs,
+                .layout = layout,
                 .blocks = std.array_list.Managed([]u8).init(alloc),
             };
         }
 
         fn recSize(self: GroupStore) usize {
-            return self.nkeys * @sizeOf(Value) + self.naggs * @sizeOf(Acc);
+            return self.nkeys * @sizeOf(Value) + self.layout.size;
         }
 
         fn at(self: GroupStore, i: usize) Rec {
@@ -2207,7 +2179,7 @@ pub const Aggregate = struct {
             const ksz = self.nkeys * @sizeOf(Value);
             return .{
                 .keys = @alignCast(std.mem.bytesAsSlice(Value, base[0..ksz])),
-                .accs = @alignCast(std.mem.bytesAsSlice(Acc, base[ksz..][0 .. self.naggs * @sizeOf(Acc)])),
+                .tail = base + ksz,
             };
         }
 
@@ -2221,7 +2193,7 @@ pub const Aggregate = struct {
             }
             const rec = self.at(self.len);
             self.len += 1;
-            for (rec.accs) |*a| a.* = .{};
+            self.layout.clear(rec.tail);
             return rec;
         }
     };
@@ -2438,24 +2410,7 @@ pub const Aggregate = struct {
                 } else if (!has_arg or !v.isNull()) acc.n += 1;
             },
             .sum => if (!v.isNull()) {
-                switch (agg.ty.kind) {
-                    .float => acc.sum_f += eval.toF64(v),
-                    // A value's scale is whatever the source sent, which need not
-                    // be the column's declared scale (postgres NUMERIC carries a
-                    // per-value dscale), so every addend is normalized to the
-                    // output scale that `finalizeAcc` will stamp back on. Adding
-                    // raw unscaled integers instead multiplied the sum by
-                    // 10^(declared - actual).
-                    .decimal => {
-                        const d: Decimal = if (v == .decimal)
-                            v.decimal
-                        else
-                            .{ .unscaled = v.int, .scale = 0 };
-                        const r = eval.rescaleTo(d, agg.ty.scale) orelse return error.CastFailed;
-                        acc.sum_i = std.math.add(i128, acc.sum_i, r.unscaled) catch return error.CastFailed;
-                    },
-                    else => acc.sum_i = std.math.add(i128, acc.sum_i, v.int) catch return error.IntOverflow,
-                }
+                if (agg.ty.kind == .float) acc.sum_f += eval.toF64(v) else try addExact(&acc.sum_i, agg, v);
                 acc.n += 1;
             },
             .avg => if (!v.isNull()) {
@@ -2475,6 +2430,145 @@ pub const Aggregate = struct {
             },
         }
     }
+
+    /// Add a non-null value to an int or DECIMAL `SUM`. A value's scale is whatever
+    /// the source sent, which need not be the column's declared scale (postgres
+    /// NUMERIC carries a per-value dscale), so every addend is normalized to the
+    /// output scale that `finalizeAcc` will stamp back on. Adding raw unscaled
+    /// integers instead multiplied the sum by 10^(declared - actual).
+    fn addExact(sum: *align(8) i128, agg: Agg, v: Value) !void {
+        if (agg.ty.kind == .decimal) {
+            const d: Decimal = if (v == .decimal) v.decimal else .{ .unscaled = v.int, .scale = 0 };
+            const r = eval.rescaleTo(d, agg.ty.scale) orelse return error.CastFailed;
+            sum.* = std.math.add(i128, sum.*, r.unscaled) catch return error.CastFailed;
+        } else sum.* = std.math.add(i128, sum.*, v.int) catch return error.IntOverflow;
+    }
+
+    /// How one aggregate's state sits in a group record. `Acc` reserves room for
+    /// every kind — a MIN/MAX value, a DISTINCT set, a MEDIAN list — so a SUM paid
+    /// 80 bytes a group for the 24 it uses. The common aggregates get a slot of
+    /// just their own state; the rest keep an `Acc`.
+    pub const Slot = enum {
+        /// COUNT(*) / COUNT(x): the count.
+        count,
+        /// SUM of ints or DECIMALs: rows summed, and the exact total.
+        sum_i,
+        /// SUM of floats, AVG: rows summed, and the float total.
+        sum_f,
+        full,
+
+        fn of(agg: Agg) Slot {
+            if (agg.distinct) return .full;
+            return switch (agg.func) {
+                .count => .count,
+                .sum => if (agg.ty.kind == .float) .sum_f else .sum_i,
+                .avg => .sum_f,
+                else => .full,
+            };
+        }
+
+        fn size(self: Slot) usize {
+            return switch (self) {
+                .count => @sizeOf(i64),
+                .sum_i => @sizeOf(SumI),
+                .sum_f => @sizeOf(SumF),
+                .full => @sizeOf(Acc),
+            };
+        }
+    };
+    const SumI = struct { n: i64, s: i128 align(8) };
+    const SumF = struct { n: i64, s: f64 };
+
+    /// Where each aggregate's slot sits in a record's tail, and the tail's size.
+    pub const Layout = struct {
+        slots: []const Slot,
+        offs: []const usize,
+        size: usize,
+        all_count: bool,
+
+        fn init(a: std.mem.Allocator, aggs: []const Agg) !Layout {
+            const slots = try a.alloc(Slot, aggs.len);
+            const offs = try a.alloc(usize, aggs.len);
+            var at: usize = 0;
+            var all_count = true;
+            for (aggs, slots, offs) |agg, *sl, *o| {
+                sl.* = Slot.of(agg);
+                if (sl.* != .count or agg.arg != null) all_count = false;
+                o.* = at;
+                at += sl.size();
+            }
+            return .{ .slots = slots, .offs = offs, .size = at, .all_count = all_count };
+        }
+
+        fn ptr(self: Layout, comptime T: type, tail: [*]u8, j: usize) *T {
+            return @ptrCast(@alignCast(tail + self.offs[j]));
+        }
+
+        fn clear(self: Layout, tail: [*]u8) void {
+            for (self.slots, 0..) |sl, j| switch (sl) {
+                .count => self.ptr(i64, tail, j).* = 0,
+                .sum_i => self.ptr(SumI, tail, j).* = .{ .n = 0, .s = 0 },
+                .sum_f => self.ptr(SumF, tail, j).* = .{ .n = 0, .s = 0 },
+                .full => self.ptr(Acc, tail, j).* = .{},
+            };
+        }
+
+        /// Slot `j` as an `Acc`, for finalizing and ordering.
+        fn acc(self: Layout, tail: [*]u8, j: usize) Acc {
+            return switch (self.slots[j]) {
+                .count => .{ .n = self.ptr(i64, tail, j).* },
+                .sum_i => blk: {
+                    const x = self.ptr(SumI, tail, j).*;
+                    break :blk .{ .n = x.n, .sum_i = x.s };
+                },
+                .sum_f => blk: {
+                    const x = self.ptr(SumF, tail, j).*;
+                    break :blk .{ .n = x.n, .sum_f = x.s };
+                },
+                .full => self.ptr(Acc, tail, j).*,
+            };
+        }
+
+        /// Fold one row's value in: `updateAcc` for the slot's kind.
+        fn update(self: Layout, state: std.mem.Allocator, tail: [*]u8, j: usize, agg: Agg, v: Value) !void {
+            switch (self.slots[j]) {
+                .count => if (agg.arg == null or !v.isNull()) {
+                    self.ptr(i64, tail, j).* += 1;
+                },
+                .sum_i => if (!v.isNull()) {
+                    const x = self.ptr(SumI, tail, j);
+                    try addExact(&x.s, agg, v);
+                    x.n += 1;
+                },
+                .sum_f => if (!v.isNull()) {
+                    const x = self.ptr(SumF, tail, j);
+                    x.s += eval.toF64(v);
+                    x.n += 1;
+                },
+                .full => try updateAcc(state, self.ptr(Acc, tail, j), agg, v, agg.arg != null),
+            }
+        }
+
+        /// Fold another partial's slot in: `mergeAcc` for the slot's kind.
+        fn merge(self: Layout, alloc: std.mem.Allocator, dst: [*]u8, src: [*]u8, j: usize, agg: Agg) !void {
+            switch (self.slots[j]) {
+                .count => self.ptr(i64, dst, j).* += self.ptr(i64, src, j).*,
+                .sum_i => {
+                    const d = self.ptr(SumI, dst, j);
+                    const x = self.ptr(SumI, src, j).*;
+                    d.s = std.math.add(i128, d.s, x.s) catch return error.IntOverflow;
+                    d.n += x.n;
+                },
+                .sum_f => {
+                    const d = self.ptr(SumF, dst, j);
+                    const x = self.ptr(SumF, src, j).*;
+                    d.s += x.s;
+                    d.n += x.n;
+                },
+                .full => try mergeAcc(alloc, self.ptr(Acc, dst, j), self.ptr(Acc, src, j).*, agg),
+            }
+        }
+    };
 
     pub fn finalizeAcc(acc: Acc, agg: Agg) error{IntOverflow}!Value {
         return switch (agg.func) {
