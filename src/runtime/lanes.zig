@@ -43,6 +43,7 @@ const buildChainFrom = @import("plan.zig").buildChainFrom;
 const buildMapChain = @import("plan.zig").buildMapChain;
 const buildPipeline = @import("plan.zig").buildPipeline;
 const buildStage = @import("plan.zig").buildStage;
+const buildTopN = @import("plan.zig").buildTopN;
 const filterBounds = @import("plan.zig").filterBounds;
 const joinBuildCap = @import("plan.zig").joinBuildCap;
 const mapChainSchema = @import("plan.zig").mapChainSchema;
@@ -450,8 +451,15 @@ fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema, ta
     var scan = op.Scan{ .src = ob.source() };
     var cur: op.Op = .{ .scan = &scan };
     var sch = schema;
-    for (tail) |st| {
-        const r = try buildStage(env, st, cur, sch);
+    var i: usize = 0;
+    while (i < tail.len) : (i += 1) {
+        // ORDER BY + LIMIT fuse into a top-N, as the serial planner does: built as
+        // two stages, the merged groups were fully sorted to keep a handful, 3x
+        // slower at -j 8 than the serial run.
+        const r = if (tail[i].node == .sort and i + 1 < tail.len and tail[i + 1].node == .limit) blk: {
+            i += 1;
+            break :blk try buildTopN(env, tail[i - 1].node.sort, tail[i].node.limit, cur, sch);
+        } else try buildStage(env, tail[i], cur, sch);
         cur = r.op;
         sch = r.schema;
     }

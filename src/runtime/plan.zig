@@ -400,7 +400,7 @@ pub fn buildPipeline(env: *Env, stages_in: []const ast.Stage) anyerror!PipeRes {
     return .{ .op = current, .schema = schema };
 }
 
-fn buildTopN(env: *Env, s: ast.Sort, lim: ast.Limit, child: op.Op, schema: types.Schema) anyerror!PipeRes {
+pub fn buildTopN(env: *Env, s: ast.Sort, lim: ast.Limit, child: op.Op, schema: types.Schema) anyerror!PipeRes {
     const arena = env.arena;
     const qs = try arena.alloc(ast.QualName, s.keys.len);
     for (s.keys, qs) |sk, *q| q.* = sk.field;
