@@ -1552,7 +1552,176 @@ pub const Aggregate = struct {
         acc.n = @intCast(set.count());
     }
 
-    pub const Group = struct { key_vals: []Value, accs: []Acc };
+    /// A fold's groups as the fold stored them: typed records in blocks, never boxed
+    /// per group, plus the hash each group was placed by. The emit, the parallel
+    /// merge and a top-N read it through `keyValue` and `acc`.
+    ///
+    /// The fold used to hand back a `Group` per group — a boxed 32-byte `Value` per
+    /// key and an 80-byte `Acc` per aggregate, on top of the record it had just built
+    /// — so a GROUP BY over 10M ids held 280 bytes a group, three times what the
+    /// fixed-width fold needed. The parallel path paid it again for its merge.
+    pub const GroupSet = struct {
+        store: Store,
+        hashes: []const u64,
+        len: usize,
+        /// The key columns' types, which the fixed stores need to box a raw word.
+        key_kinds: []const types.TypeKind,
+
+        pub const Store = union(enum) {
+            fixed: *FixedStore,
+            count: *CountStore,
+            boxed: *GroupStore,
+            /// No GROUP BY: one group, no key.
+            single: []Acc,
+        };
+
+        pub fn keyValue(self: *const GroupSet, i: usize, j: usize) Value {
+            switch (self.store) {
+                .boxed => |st| return st.at(i).keys[j],
+                .single => unreachable,
+                inline .fixed, .count => |st| {
+                    const rec = st.at(i);
+                    if (rec.mask.* & (@as(u64, 1) << @intCast(j)) != 0) return .null;
+                    const raw = rec.keys[j];
+                    return switch (self.key_kinds[j]) {
+                        .int => .{ .int = raw },
+                        .time => .{ .time = raw },
+                        .timestamp => .{ .timestamp = raw },
+                        .date => .{ .date = @intCast(raw) },
+                        .bool => .{ .bool = raw != 0 },
+                        .float => .{ .float = @bitCast(raw) },
+                        else => unreachable,
+                    };
+                },
+            }
+        }
+
+        pub fn acc(self: *const GroupSet, i: usize, j: usize) Acc {
+            return switch (self.store) {
+                .fixed => |st| st.at(i).tail[j],
+                .count => |st| .{ .n = st.at(i).tail[j] },
+                .boxed => |st| st.at(i).accs[j],
+                .single => |accs| accs[j],
+            };
+        }
+    };
+
+    /// Folds groups from several sets into one new set of the same kind. A key seen
+    /// for the first time costs its record — raw words and accumulators, copied as
+    /// they are — and a repeated one an accumulator merge. Keys and extremes are not
+    /// deep-copied: the sets merged from outlive the merged set's emit.
+    pub const GroupMerge = struct {
+        alloc: std.mem.Allocator,
+        aggs: []const Agg,
+        any_distinct: bool,
+        set: GroupSet,
+        table: GroupTable,
+        hashes: std.array_list.Managed(u64),
+
+        pub fn init(alloc: std.mem.Allocator, like: *const GroupSet, aggs: []const Agg) !GroupMerge {
+            var any_distinct = false;
+            for (aggs) |a| {
+                if (a.distinct) any_distinct = true;
+            }
+            const store: GroupSet.Store = switch (like.store) {
+                .fixed => |st| blk: {
+                    const n = try alloc.create(FixedStore);
+                    n.* = FixedStore.init(alloc, st.nkeys, st.naggs);
+                    break :blk .{ .fixed = n };
+                },
+                .count => |st| blk: {
+                    const n = try alloc.create(CountStore);
+                    n.* = CountStore.init(alloc, st.nkeys, st.naggs);
+                    break :blk .{ .count = n };
+                },
+                .boxed => |st| blk: {
+                    const n = try alloc.create(GroupStore);
+                    n.* = GroupStore.init(alloc, st.nkeys, st.naggs);
+                    break :blk .{ .boxed = n };
+                },
+                .single => blk: {
+                    const accs = try alloc.alloc(Acc, aggs.len);
+                    @memset(accs, .{});
+                    break :blk .{ .single = accs };
+                },
+            };
+            return .{
+                .alloc = alloc,
+                .aggs = aggs,
+                .any_distinct = any_distinct,
+                .set = .{ .store = store, .hashes = &.{}, .len = if (store == .single) 1 else 0, .key_kinds = like.key_kinds },
+                .table = try GroupTable.init(alloc, 256),
+                .hashes = std.array_list.Managed(u64).init(alloc),
+            };
+        }
+
+        /// Fold group `i` of `src` in.
+        pub fn add(self: *GroupMerge, src: *const GroupSet, i: usize) !void {
+            switch (self.set.store) {
+                .single => |dst| for (dst, self.aggs, 0..) |*d, agg, j| try mergeAcc(self.alloc, d, src.acc(i, j), agg),
+                .count => |dst| {
+                    const sr = src.store.count.at(i);
+                    const rec = try self.find(dst, src.hashes[i], FixedKey{ .vals = sr.keys, .mask = sr.mask.* }) orelse {
+                        const nr = try dst.push();
+                        @memcpy(nr.keys, sr.keys);
+                        nr.mask.* = sr.mask.*;
+                        @memcpy(nr.tail, sr.tail);
+                        return;
+                    };
+                    for (rec.tail, sr.tail) |*d, c| d.* += c;
+                },
+                .fixed => |dst| {
+                    const sr = src.store.fixed.at(i);
+                    const rec = try self.find(dst, src.hashes[i], FixedKey{ .vals = sr.keys, .mask = sr.mask.* }) orelse {
+                        const nr = try dst.push();
+                        @memcpy(nr.keys, sr.keys);
+                        nr.mask.* = sr.mask.*;
+                        try self.adoptAccs(nr.tail, sr.tail);
+                        return;
+                    };
+                    for (rec.tail, sr.tail, self.aggs) |*d, a, agg| try mergeAcc(self.alloc, d, a, agg);
+                },
+                .boxed => |dst| {
+                    const sr = src.store.boxed.at(i);
+                    const rec = try self.find(dst, src.hashes[i], @as([]const Value, sr.keys)) orelse {
+                        const nr = try dst.push();
+                        @memcpy(nr.keys, sr.keys);
+                        try self.adoptAccs(nr.accs, sr.accs);
+                        return;
+                    };
+                    for (rec.accs, sr.accs, self.aggs) |*d, a, agg| try mergeAcc(self.alloc, d, a, agg);
+                },
+            }
+        }
+
+        /// The record for `key`, or null after reserving a slot for it — the caller
+        /// then pushes the record that slot names.
+        fn find(self: *GroupMerge, dst: anytype, h: u64, key: anytype) !?@TypeOf(dst.at(0)) {
+            const f = try self.table.getOrPut(h, key, dst, self.hashes.items, @intCast(dst.len));
+            if (f.found) return dst.at(f.slot);
+            try self.hashes.append(h);
+            self.set.len += 1;
+            return null;
+        }
+
+        /// A new group's accumulators, copied — except a DISTINCT set, which belongs
+        /// to the producing fold's arena and is rebuilt in this one.
+        fn adoptAccs(self: *GroupMerge, dst: []Acc, src: []const Acc) !void {
+            @memcpy(dst, src);
+            if (!self.any_distinct) return;
+            for (dst, src, self.aggs) |*d, a, agg| {
+                if (!agg.distinct) continue;
+                d.seen = null;
+                d.n = 0;
+                if (a.seen) |ss| try mergeDistinct(self.alloc, d, ss);
+            }
+        }
+
+        pub fn result(self: *GroupMerge) GroupSet {
+            self.set.hashes = self.hashes.items;
+            return self.set;
+        }
+    };
 
     /// Group-key hash map (value-keyed). Used by `drainGroups` and by `mergeGroups`
     /// when combining partial group sets from parallel workers.
@@ -1579,34 +1748,31 @@ pub const Aggregate = struct {
     pub fn next(self: *Aggregate, arena: std.mem.Allocator) anyerror!?Batch {
         if (self.done) return null;
         self.done = true;
-        const groups = try self.drainGroups();
-        if (self.by.len != 0 and groups.len == 0) return null;
-        return try self.emit(arena, groups);
+        const set = try self.drainSet();
+        if (self.by.len != 0 and set.len == 0) return null;
+        return try self.emitSets(arena, &.{set}, null);
     }
 
     /// Fold the entire child into raw per-group accumulators (kept in `state`). This
     /// is the parallelizable half of aggregation: a worker drains its slice of the
-    /// input into a partial group set, and `mergeGroups` combines partials across
-    /// workers by recombining the *raw* accumulators (so AVG etc. stay correct);
-    /// `emit` finalizes once at the end. No-GROUP-BY returns exactly one group.
-    pub const Drained = struct { groups: []Group, hashes: []u64 };
-
-    /// `drainGroups`, but keeping the hash it computed for each group. The
-    /// parallel path partitions and merges by hash afterwards; recomputing it
-    /// there means hashing every key three times instead of once.
-    pub fn drainGroupsHashed(self: *Aggregate) anyerror!Drained {
+    /// input into a partial `GroupSet`, `GroupMerge` combines partials across
+    /// workers by recombining the *raw* accumulators (so AVG etc. stay correct), and
+    /// `emitSets` finalizes once at the end. No GROUP BY is exactly one group. The
+    /// hashes stay with the set: the parallel path partitions and merges by them.
+    pub fn drainSet(self: *Aggregate) anyerror!GroupSet {
         return self.drainImpl();
     }
 
-    pub fn drainGroups(self: *Aggregate) anyerror![]Group {
-        return (try self.drainImpl()).groups;
+    fn keyKinds(self: *Aggregate) ![]types.TypeKind {
+        const kinds = try self.state.alloc(types.TypeKind, self.by.len);
+        for (self.by, kinds) |ci, *k| k.* = self.in_schema.fields[ci].ty.kind;
+        return kinds;
     }
 
     /// Fold with raw fixed-width keys. Same shape as `drainImpl`, but the probe
     /// key is a run of `i64` rather than boxed `Value`s, so the record is smaller
-    /// and the hash is over plain words. Groups are boxed back into `Value` once,
-    /// at the end, so everything downstream is unchanged.
-    fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only: bool) anyerror!Drained {
+    /// and the hash is over plain words.
+    fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only: bool) anyerror!GroupSet {
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
         const pull = scratch.allocator();
@@ -1700,39 +1866,17 @@ pub const Aggregate = struct {
             _ = scratch.reset(.retain_capacity);
         }
 
-        const out = try self.state.alloc(Group, store.len);
-        const kv_all = try self.state.alloc(Value, store.len * nk);
-        for (out, 0..) |*g, i| {
-            const rec = store.at(i);
-            const kv = kv_all[i * nk ..][0..nk];
-            for (kv, rec.keys, kinds, 0..) |*o, raw, kk, j| {
-                if (rec.mask.* & (@as(u64, 1) << @intCast(j)) != 0) {
-                    o.* = .null;
-                    continue;
-                }
-                o.* = switch (self.in_schema.fields[self.by[j]].ty.kind) {
-                    .int => .{ .int = raw },
-                    .time => .{ .time = raw },
-                    .timestamp => .{ .timestamp = raw },
-                    .date => .{ .date = @intCast(raw) },
-                    .bool => .{ .bool = raw != 0 },
-                    .float => .{ .float = @bitCast(raw) },
-                    else => unreachable,
-                };
-                _ = kk;
-            }
-            if (counts_only) {
-                const accs = try self.state.alloc(Acc, self.aggs.len);
-                for (accs, rec.tail) |*a, c| a.* = .{ .n = c };
-                g.* = .{ .key_vals = kv, .accs = accs };
-            } else {
-                g.* = .{ .key_vals = kv, .accs = rec.tail };
-            }
-        }
-        return .{ .groups = out, .hashes = ghashes.items };
+        const sp = try self.state.create(@TypeOf(store));
+        sp.* = store;
+        return .{
+            .store = if (counts_only) .{ .count = sp } else .{ .fixed = sp },
+            .hashes = ghashes.items,
+            .len = store.len,
+            .key_kinds = try self.keyKinds(),
+        };
     }
 
-    fn drainImpl(self: *Aggregate) anyerror!Drained {
+    fn drainImpl(self: *Aggregate) anyerror!GroupSet {
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
         const pull = scratch.allocator();
@@ -1754,9 +1898,7 @@ pub const Aggregate = struct {
                 if (b.len != 0 and !(try self.foldVectorized(pull, b, accs))) try self.foldRowwise(pull, b, accs);
                 _ = scratch.reset(.retain_capacity);
             }
-            const one = try self.state.alloc(Group, 1);
-            one[0] = .{ .key_vals = &.{}, .accs = accs };
-            return .{ .groups = one, .hashes = &.{} };
+            return .{ .store = .{ .single = accs }, .hashes = &.{}, .len = 1, .key_kinds = &.{} };
         }
 
         var ghashes = std.array_list.Managed(u64).init(self.state);
@@ -1832,12 +1974,9 @@ pub const Aggregate = struct {
             }
             _ = scratch.reset(.retain_capacity);
         }
-        const out = try self.state.alloc(Group, store.len);
-        for (out, 0..) |*g, i| {
-            const rec = store.at(i);
-            g.* = .{ .key_vals = rec.keys, .accs = rec.accs };
-        }
-        return .{ .groups = out, .hashes = ghashes.items };
+        const sp = try self.state.create(GroupStore);
+        sp.* = store;
+        return .{ .store = .{ .boxed = sp }, .hashes = ghashes.items, .len = store.len, .key_kinds = try self.keyKinds() };
     }
 
     /// Open-addressed group index built for the one access pattern aggregation
@@ -2120,172 +2259,6 @@ pub const Aggregate = struct {
         }
     }
 
-    /// Merge a worker's partial `src_groups` into a combined (`map`, `groups`) set,
-    /// deep-copying keys and min/max values into `dst_alloc` so they survive the
-    /// worker's arena being freed. Call under a lock when workers share the combiner.
-    pub fn mergeGroups(map: *GroupMap(), groups: *std.array_list.Managed(Group), dst_alloc: std.mem.Allocator, src_groups: []const Group, aggs: []const Agg) !void {
-        return mergeGroupsPart(map, groups, dst_alloc, src_groups, aggs, 0, 1);
-    }
-
-    /// Open-addressed index for the merge, keyed on a hash the caller already
-    /// holds. `adoptGroups` went through a general map, which re-hashed every
-    /// key it was handed — the third full hashing pass over the same data.
-    /// Take a lane's group as-is, rebuilding only what cannot be shared — the
-    /// distinct set, whose arena belongs to the producing lane.
-    pub fn adoptOne(dst_alloc: std.mem.Allocator, g: Group, aggs: []const Agg, any_distinct: bool) !Group {
-        if (!any_distinct) return g;
-        var out = g;
-        const accs = try dst_alloc.alloc(Acc, aggs.len);
-        for (g.accs, accs, aggs) |src, *dst, agg| {
-            dst.* = src;
-            if (!agg.distinct) continue;
-            dst.seen = null;
-            dst.n = 0;
-            if (src.seen) |ss| try mergeDistinct(dst_alloc, dst, ss);
-        }
-        out.accs = accs;
-        return out;
-    }
-
-    pub const MergeTable = struct {
-        entries: []u32,
-        len: usize = 0,
-        mask: u64,
-        alloc: std.mem.Allocator,
-
-        const salt_bits = 6;
-        const idx_bits = 32 - salt_bits;
-        const max_groups = (1 << idx_bits) - 1;
-
-        pub fn init(alloc: std.mem.Allocator, cap_pow2: usize) !MergeTable {
-            const e = try alloc.alloc(u32, cap_pow2);
-            @memset(e, 0);
-            return .{ .entries = e, .mask = cap_pow2 - 1, .alloc = alloc };
-        }
-
-        fn saltOf(h: u64) u32 {
-            return @intCast((h >> 32) & ((1 << salt_bits) - 1));
-        }
-
-        fn grow(self: *MergeTable, hashes: []const u64) !void {
-            const cap = self.entries.len * 2;
-            const ne = try self.alloc.alloc(u32, cap);
-            @memset(ne, 0);
-            const nmask = cap - 1;
-            for (self.entries) |e| {
-                if (e == 0) continue;
-                const h = hashes[(e & max_groups) - 1];
-                var i = h & nmask;
-                while (ne[i] != 0) i = (i + 1) & nmask;
-                ne[i] = e;
-            }
-            self.entries = ne;
-            self.mask = nmask;
-        }
-
-        /// Index of the group matching `key`/`h`, or null after recording
-        /// `new_idx` as its slot.
-        pub fn find(self: *MergeTable, h: u64, key: []const Value, groups: []const Group, hashes: []const u64, new_idx: usize) !?usize {
-            if ((self.len + 1) * 10 >= self.entries.len * 7) try self.grow(hashes);
-            const want = saltOf(h) << idx_bits;
-            var i = h & self.mask;
-            while (true) : (i = (i + 1) & self.mask) {
-                const e = self.entries[i];
-                if (e == 0) {
-                    self.entries[i] = want | @as(u32, @intCast(new_idx + 1));
-                    self.len += 1;
-                    return null;
-                }
-                if ((e >> idx_bits) << idx_bits != want) continue;
-                const idx = (e & max_groups) - 1;
-                if (keyhash.MultiKeyCtx.eql(.{}, key, groups[idx].key_vals)) return idx;
-            }
-        }
-    };
-
-    /// Merge for the parallel path, where the source groups live in lane arenas
-    /// that outlive the merge: a key seen for the first time is *adopted* — its
-    /// key and accumulators are reused in place rather than copied. The
-    /// high-cardinality case is then one hash and one pointer store per group
-    /// instead of two allocations, which is what makes the merge cheap enough
-    /// for the fold to be worth parallelising at all. Only a repeated key pays
-    /// for an accumulator fold.
-    pub fn adoptGroups(
-        map: *GroupMap(),
-        groups: *std.array_list.Managed(Group),
-        dst_alloc: std.mem.Allocator,
-        src_groups: []const Group,
-        aggs: []const Agg,
-    ) !void {
-        var any_distinct = false;
-        for (aggs) |a| {
-            if (a.distinct) any_distinct = true;
-        }
-        for (src_groups) |g| {
-            const gop = try map.getOrPut(g.key_vals);
-            if (!gop.found_existing) {
-                gop.key_ptr.* = g.key_vals;
-                gop.value_ptr.* = groups.items.len;
-                var adopted = g;
-                if (any_distinct) {
-                    const accs = try dst_alloc.alloc(Acc, aggs.len);
-                    for (g.accs, accs, aggs) |src, *dst, agg| {
-                        dst.* = src;
-                        if (!agg.distinct) continue;
-                        dst.seen = null;
-                        dst.n = 0;
-                        if (src.seen) |ss| try mergeDistinct(dst_alloc, dst, ss);
-                    }
-                    adopted.accs = accs;
-                }
-                try groups.append(adopted);
-            } else {
-                const cg = &groups.items[gop.value_ptr.*];
-                for (g.accs, aggs, 0..) |src, agg, j| try mergeAcc(dst_alloc, &cg.accs[j], src, agg);
-            }
-        }
-    }
-
-    /// `mergeGroups` restricted to the groups whose key hashes into `part` of
-    /// `nparts`. Partitioning the merge by hash lets one task own each partition
-    /// outright: the key sets are disjoint, so the tasks need no lock between
-    /// them — which is what keeps a high-cardinality merge from serializing.
-    pub fn mergeGroupsPart(
-        map: *GroupMap(),
-        groups: *std.array_list.Managed(Group),
-        dst_alloc: std.mem.Allocator,
-        src_groups: []const Group,
-        aggs: []const Agg,
-        part: usize,
-        nparts: usize,
-    ) !void {
-        const ctx = keyhash.MultiKeyCtx{};
-        for (src_groups) |g| {
-            if (nparts > 1 and (ctx.hash(g.key_vals) >> 32) % nparts != part) continue;
-            const gop = try map.getOrPut(g.key_vals);
-            if (!gop.found_existing) {
-                const kv = try dst_alloc.alloc(Value, g.key_vals.len);
-                for (g.key_vals, kv) |v, *o| o.* = try dupeValue(dst_alloc, v);
-                gop.key_ptr.* = kv;
-                gop.value_ptr.* = groups.items.len;
-                const accs = try dst_alloc.alloc(Acc, aggs.len);
-                for (g.accs, accs, aggs) |src, *dst, agg| {
-                    dst.* = src;
-                    if ((agg.func == .min or agg.func == .max) and !src.ext.isNull()) dst.ext = try dupeValue(dst_alloc, src.ext);
-                    if (agg.distinct) {
-                        dst.seen = null;
-                        dst.n = 0;
-                        if (src.seen) |ss| try mergeDistinct(dst_alloc, dst, ss);
-                    }
-                }
-                try groups.append(.{ .key_vals = kv, .accs = accs });
-            } else {
-                const cg = &groups.items[gop.value_ptr.*];
-                for (g.accs, aggs, 0..) |src, agg, j| try mergeAcc(dst_alloc, &cg.accs[j], src, agg);
-            }
-        }
-    }
-
     /// Try the vectorized path for one batch: every agg's argument evaluated as
     /// a column once and SIMD-reduced to a `Partial`. Returns false (touching
     /// nothing) if any agg isn't covered, so the caller folds the batch row-wise.
@@ -2417,34 +2390,42 @@ pub const Aggregate = struct {
         }
     }
 
-    pub fn emit(self: *Aggregate, arena: std.mem.Allocator, groups: []const Group) anyerror!Batch {
+    /// One output row per group of `sets`, in order — or, with `sel`, only the
+    /// groups `sel[i]` lists for set `i` (a top-N's survivors).
+    pub fn emitSets(self: *Aggregate, arena: std.mem.Allocator, sets: []const GroupSet, sel: ?[]const []const u32) anyerror!Batch {
         const nfields = self.out_schema.fields.len;
+        var n: usize = 0;
+        for (sets, 0..) |*st, si| n += if (sel) |sl| sl[si].len else st.len;
         const builders = try arena.alloc(column.Builder, nfields);
-        for (builders, self.out_schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
+        for (builders, self.out_schema.fields) |*b, f| b.* = try column.Builder.initCapacity(arena, f.ty, @max(n, 1));
 
-        if (groups.len == 0 and self.by.len == 0) {
+        if (n == 0 and self.by.len == 0) {
             for (self.aggs, 0..) |agg, j| try builders[j].append(try finalizeAcc(.{}, agg));
+            n = 1;
         } else {
-            for (groups) |g| {
-                var col: usize = 0;
-                for (g.key_vals) |kv| {
-                    try builders[col].append(kv);
-                    col += 1;
-                }
-                for (self.aggs, 0..) |agg, j| {
-                    try builders[col].append(finalizeAcc(g.accs[j], agg) catch |err| {
-                        if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
-                        return err;
-                    });
-                    col += 1;
+            for (sets, 0..) |*st, si| {
+                if (sel) |sl| {
+                    for (sl[si]) |gi| try self.emitGroup(builders, st, gi);
+                } else {
+                    for (0..st.len) |gi| try self.emitGroup(builders, st, gi);
                 }
             }
         }
 
         const cols = try arena.alloc(column.Column, nfields);
         for (builders, 0..) |*b, i| cols[i] = try b.finish();
-        const n: usize = if (groups.len == 0 and self.by.len == 0) 1 else groups.len;
         return Batch{ .schema = self.out_schema, .columns = cols, .len = n };
+    }
+
+    fn emitGroup(self: *Aggregate, builders: []column.Builder, st: *const GroupSet, gi: usize) !void {
+        const nk = self.by.len;
+        for (builders[0..nk], 0..) |*b, j| try b.append(st.keyValue(gi, j));
+        for (self.aggs, builders[nk..], 0..) |agg, *b, j| {
+            try b.append(finalizeAcc(st.acc(gi, j), agg) catch |err| {
+                if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
+                return err;
+            });
+        }
     }
 
     /// `state` owns any string extremum copied into the accumulator: the value

@@ -290,10 +290,9 @@ const AggSlot = struct {
     /// and the main thread only touches it after `spawnJoin` has returned.
     gpa: std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }) = .{},
     arena: std.heap.ArenaAllocator = undefined,
-    groups: []op.Aggregate.Group = &.{},
-    /// One hash per group, kept from the fold so the combine can partition by it
-    /// without hashing every key again.
-    hashes: []u64 = &.{},
+    /// The slot's groups as the fold stored them, with the hash of each, so the
+    /// combine can partition without hashing every key again.
+    set: ?op.Aggregate.GroupSet = null,
     /// This slot's group indices split by key hash — the same shape `PqLane`
     /// carries, so the radix combine can walk slots and lanes alike. Empty for a
     /// slot no worker reached.
@@ -358,18 +357,23 @@ fn combineAggSlots(
     aggs: []const op.Aggregate.Agg,
     threads: usize,
     parts: []PqPart,
-) ![]const op.Aggregate.Group {
+) ![]const op.Aggregate.GroupSet {
     var total: usize = 0;
-    for (slots) |*s| total += s.groups.len;
+    for (slots) |*s| {
+        if (s.set) |st| total += st.len;
+    }
 
     if (threads < 2 or total < agg_combine_parallel_min) {
-        var map = op.Aggregate.GroupMap().init(env.arena);
-        var groups = std.array_list.Managed(op.Aggregate.Group).init(env.arena);
+        var m: ?op.Aggregate.GroupMerge = null;
         for (slots) |*s| {
             if (!s.done) continue;
-            try op.Aggregate.mergeGroups(&map, &groups, env.arena, s.groups, aggs);
+            const st = if (s.set) |*x| x else continue;
+            if (m == null) m = try op.Aggregate.GroupMerge.init(env.arena, st, aggs);
+            for (0..st.len) |i| try m.?.add(st, i);
         }
-        return groups.items;
+        const one = try env.arena.alloc(op.Aggregate.GroupSet, if (m == null) 0 else 1);
+        if (m) |*mm| one[0] = mm.result();
+        return one;
     }
 
     var mctx = SlotMergeCtx{ .slots = slots, .parts = parts, .aggs = aggs, .queue = .{ .nitems = pq_parts } };
@@ -378,17 +382,16 @@ fn combineAggSlots(
 
     env.log.log(.debug, "parallel agg combine: {d} partial groups over {d} partitions", .{ total, pq_parts });
 
-    var merged: usize = 0;
-    for (parts) |*pp| merged += pp.groups.items.len;
-    const all = try env.arena.alloc(op.Aggregate.Group, merged);
-    var at: usize = 0;
+    return partSets(env.arena, parts);
+}
+
+/// Each partition's merged groups, in partition order.
+fn partSets(a: std.mem.Allocator, parts: []PqPart) ![]const op.Aggregate.GroupSet {
+    var sets = std.array_list.Managed(op.Aggregate.GroupSet).init(a);
     for (parts) |*pp| {
-        for (pp.groups.items) |g| {
-            all[at] = g;
-            at += 1;
-        }
+        if (pp.merge) |*m| try sets.append(m.result());
     }
-    return all;
+    return sets.items;
 }
 
 const SlotMergeCtx = struct {
@@ -410,11 +413,7 @@ fn slotMergeOne(ctx: *SlotMergeCtx, p: usize) !void {
 /// pays nothing for these being here.
 fn allocMergeParts(gpa: std.mem.Allocator) ![]PqPart {
     const parts = try gpa.alloc(PqPart, pq_parts);
-    for (parts) |*pp| {
-        pp.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator), .map = undefined, .groups = undefined };
-        pp.map = op.Aggregate.GroupMap().init(pp.arena.allocator());
-        pp.groups = std.array_list.Managed(op.Aggregate.Group).init(pp.arena.allocator());
-    }
+    for (parts) |*pp| pp.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
     return parts;
 }
 
@@ -425,7 +424,7 @@ fn freeMergeParts(gpa: std.mem.Allocator, parts: []PqPart) void {
 
 /// Finalize merged parallel-aggregate groups into one output batch (a "merger"
 /// Aggregate just for `emit`; it never pulls a child).
-fn emitMergedGroups(env: *Env, agg_in: *const types.Schema, by: []const usize, aggs: []const op.Aggregate.Agg, out_schema: *const types.Schema, groups: []const op.Aggregate.Group) !Batch {
+fn emitMergedGroups(env: *Env, agg_in: *const types.Schema, by: []const usize, aggs: []const op.Aggregate.Agg, out_schema: *const types.Schema, sets: []const op.Aggregate.GroupSet, sel: ?[]const []const u32) !Batch {
     var merger = op.Aggregate{
         .child = undefined,
         .in_schema = agg_in,
@@ -435,7 +434,7 @@ fn emitMergedGroups(env: *Env, agg_in: *const types.Schema, by: []const usize, a
         .state = env.arena,
         .gpa = env.gpa,
     };
-    return merger.emit(env.arena, groups);
+    return merger.emitSets(env.arena, sets, sel);
 }
 
 fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema, tail: []const ast.Stage, stats: *Stats) !void {
@@ -512,10 +511,9 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
         .gpa = slot.gpa.allocator(),
     };
     // Stays in the slot's arena: the combine reads it after every lane has joined.
-    const drained = try agg.drainGroupsHashed();
-    slot.groups = drained.groups;
-    slot.hashes = drained.hashes;
-    slot.buckets = try bucketByHash(wa, drained.hashes);
+    const set = try agg.drainSet();
+    slot.set = set;
+    slot.buckets = try bucketByHash(wa, set.hashes);
     slot.done = true;
 }
 
@@ -523,8 +521,7 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
 /// fold phase never takes a lock.
 const PqLane = struct {
     arena: std.heap.ArenaAllocator,
-    groups: []op.Aggregate.Group = &.{},
-    hashes: []u64 = &.{},
+    set: ?op.Aggregate.GroupSet = null,
     /// The lane's groups split by key hash, computed once when the lane runs
     /// dry. The merge then reads a partition's slice directly instead of
     /// rescanning every lane for every partition.
@@ -535,8 +532,8 @@ const PqLane = struct {
 /// each partition is owned outright by one task and needs no lock either.
 const PqPart = struct {
     arena: std.heap.ArenaAllocator,
-    map: op.Aggregate.GroupMap(),
-    groups: std.array_list.Managed(op.Aggregate.Group),
+    /// Built on the first group the partition receives, of the same kind as it.
+    merge: ?op.Aggregate.GroupMerge = null,
 };
 
 /// Number of radix partitions. Comfortably above the lane count so the merge
@@ -673,9 +670,7 @@ fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
         .state = la,
         .gpa = ls.arena.child_allocator,
     };
-    const drained = try agg.drainGroupsHashed();
-    ls.groups = drained.groups;
-    ls.hashes = drained.hashes;
+    ls.set = try agg.drainSet();
     try bucketLane(ls);
 }
 
@@ -692,7 +687,7 @@ fn bucketByHash(a: std.mem.Allocator, hashes: []const u64) ![]std.array_list.Man
 }
 
 fn bucketLane(ls: *PqLane) !void {
-    ls.buckets = try bucketByHash(ls.arena.allocator(), ls.hashes);
+    ls.buckets = try bucketByHash(ls.arena.allocator(), ls.set.?.hashes);
 }
 
 const PqMergeCtx = struct {
@@ -715,26 +710,11 @@ fn pqMergeOne(ctx: *PqMergeCtx, p: usize) !void {
 /// need no lock between them, which is what stops a high-cardinality merge from
 /// serialising behind one table.
 fn mergeRadixPart(dst: *PqPart, srcs: anytype, aggs: []const op.Aggregate.Agg, p: usize) !void {
-    const da = dst.arena.allocator();
-    var tbl = try op.Aggregate.MergeTable.init(da, 256);
-    var hashes = std.array_list.Managed(u64).init(da);
-    var any_distinct = false;
-    for (aggs) |a| {
-        if (a.distinct) any_distinct = true;
-    }
     for (srcs) |*ls| {
         if (ls.buckets.len == 0) continue;
-        for (ls.buckets[p].items) |gi| {
-            const g = ls.groups[gi];
-            const h = ls.hashes[gi];
-            if (try tbl.find(h, g.key_vals, dst.groups.items, hashes.items, dst.groups.items.len)) |at| {
-                const cg = &dst.groups.items[at];
-                for (g.accs, aggs, 0..) |src, agg, j| try op.Aggregate.mergeAcc(da, &cg.accs[j], src, agg);
-            } else {
-                try dst.groups.append(try op.Aggregate.adoptOne(da, g, aggs, any_distinct));
-                try hashes.append(h);
-            }
-        }
+        const st = if (ls.set) |*x| x else continue;
+        if (dst.merge == null) dst.merge = try op.Aggregate.GroupMerge.init(dst.arena.allocator(), st, aggs);
+        for (ls.buckets[p].items) |gi| try dst.merge.?.add(st, gi);
     }
 }
 
@@ -761,10 +741,10 @@ fn topNTail(tail: []const ast.Stage) ?TopNTail {
 
 /// The output value a sort key refers to: the group keys come first in the
 /// aggregate's schema, the aggregates after them.
-fn groupSortValue(g: op.Aggregate.Group, col: usize, by_len: usize, aggs: []const op.Aggregate.Agg) Value {
-    if (col < by_len) return g.key_vals[col];
+fn groupSortValue(set: *const op.Aggregate.GroupSet, gi: usize, col: usize, by_len: usize, aggs: []const op.Aggregate.Agg) Value {
+    if (col < by_len) return set.keyValue(gi, col);
     // Only orders the groups: a sum out of range fails the query when it is emitted.
-    return op.Aggregate.finalizeAcc(g.accs[col - by_len], aggs[col - by_len]) catch .null;
+    return op.Aggregate.finalizeAcc(set.acc(gi, col - by_len), aggs[col - by_len]) catch .null;
 }
 
 const GroupOrder = struct {
@@ -772,11 +752,12 @@ const GroupOrder = struct {
     desc: []const bool,
     by_len: usize,
     aggs: []const op.Aggregate.Agg,
+    set: *const op.Aggregate.GroupSet = undefined,
 
-    fn less(self: GroupOrder, a: op.Aggregate.Group, b: op.Aggregate.Group) bool {
+    fn less(self: GroupOrder, a: u32, b: u32) bool {
         for (self.cols, self.desc) |c, d| {
-            const av = groupSortValue(a, c, self.by_len, self.aggs);
-            const bv = groupSortValue(b, c, self.by_len, self.aggs);
+            const av = groupSortValue(self.set, a, c, self.by_len, self.aggs);
+            const bv = groupSortValue(self.set, b, c, self.by_len, self.aggs);
             const o = eval.compareValues(av, bv) orelse .eq;
             if (o != .eq) return if (d) o == .gt else o == .lt;
         }
@@ -789,15 +770,29 @@ const PqTopNCtx = struct {
     order: GroupOrder,
     n: usize,
     queue: WorkQueue,
+    /// Per partition, the groups that survive: its best `n`, in order.
+    sel: [][]const u32,
 };
 
 const pqTopNWorker = dispatchWorker(PqTopNCtx, pqTopNOne);
 
 fn pqTopNOne(ctx: *PqTopNCtx, p: usize) !void {
-    const g = &ctx.parts[p].groups;
-    if (g.items.len <= ctx.n) return;
-    std.sort.pdq(op.Aggregate.Group, g.items, ctx.order, GroupOrder.less);
-    g.shrinkRetainingCapacity(ctx.n);
+    const pp = &ctx.parts[p];
+    const m = if (pp.merge) |*x| x else {
+        ctx.sel[p] = &.{};
+        return;
+    };
+    const set = m.result();
+    const idx = try pp.arena.allocator().alloc(u32, set.len);
+    for (idx, 0..) |*x, i| x.* = @intCast(i);
+    if (set.len > ctx.n) {
+        const set_ptr = try pp.arena.allocator().create(op.Aggregate.GroupSet);
+        set_ptr.* = set;
+        var order = ctx.order;
+        order.set = set_ptr;
+        std.sort.pdq(u32, idx, order, GroupOrder.less);
+    }
+    ctx.sel[p] = idx[0..@min(idx.len, ctx.n)];
 }
 
 /// Map-only pipeline (scan -> filter/project/explode -> write) over a local
@@ -1536,11 +1531,7 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
 
     const parts = try env.gpa.alloc(PqPart, pq_parts);
     defer env.gpa.free(parts);
-    for (parts) |*pp| {
-        pp.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator), .map = undefined, .groups = undefined };
-        pp.map = op.Aggregate.GroupMap().init(pp.arena.allocator());
-        pp.groups = std.array_list.Managed(op.Aggregate.Group).init(pp.arena.allocator());
-    }
+    for (parts) |*pp| pp.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
     defer for (parts) |*pp| pp.arena.deinit();
 
     const t_mrg0 = std.time.Instant.now() catch unreachable;
@@ -1558,7 +1549,9 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
         // has always run this shape in parallel.
         const dst = &parts[0];
         for (lanes) |*l| {
-            try op.Aggregate.mergeGroups(&dst.map, &dst.groups, dst.arena.allocator(), l.groups, aggs);
+            const st = if (l.set) |*x| x else continue;
+            if (dst.merge == null) dst.merge = try op.Aggregate.GroupMerge.init(dst.arena.allocator(), st, aggs);
+            for (0..st.len) |i| try dst.merge.?.add(st, i);
         }
     } else {
         var mctx = PqMergeCtx{ .lanes = lanes, .parts = parts, .aggs = aggs, .queue = .{ .nitems = pq_parts } };
@@ -1567,7 +1560,9 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
     }
     const t_mrg1 = std.time.Instant.now() catch unreachable;
     var lane_groups: usize = 0;
-    for (lanes) |*l| lane_groups += l.groups.len;
+    for (lanes) |*l| {
+        if (l.set) |st| lane_groups += st.len;
+    }
     env.log.log(.debug, "pq agg phases: fold {d}ms (incl. bucket), merge {d}ms, {d} lane groups", .{
         t_fold1.since(t_fold0) / 1_000_000,
         t_mrg1.since(t_mrg0) / 1_000_000,
@@ -1588,6 +1583,7 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
 
     env.log.log(.debug, "parallel parquet aggregate: {d} row groups in {d} morsels over {d} lanes, merged in {d} partitions", .{ ngroups, ngroups, used, pq_parts });
 
+    var sel: ?[]const []const u32 = null;
     if (topNTail(tail)) |tn| {
         var cols = std.array_list.Managed(usize).init(arena);
         var descs = std.array_list.Managed(bool).init(arena);
@@ -1606,25 +1602,26 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
                 .order = .{ .cols = cols.items, .desc = descs.items, .by_len = apl.by.len, .aggs = aggs },
                 .n = tn.n,
                 .queue = .{ .nitems = pq_parts },
+                .sel = try arena.alloc([]const u32, pq_parts),
             };
             _ = try parallel.spawnJoin(arena, nthreads, pqTopNWorker, &tctx);
             if (tctx.queue.first_err) |e| return e;
+            // `sel` lines up with the sets `partSets` returns: one per partition that
+            // received a group, in order.
+            var kept = std.array_list.Managed([]const u32).init(arena);
+            for (parts, tctx.sel) |*pp, sl| {
+                if (pp.merge != null) try kept.append(sl);
+            }
+            sel = kept.items;
         }
     }
 
     const t_emit0 = std.time.Instant.now() catch unreachable;
+    const sets = try partSets(arena, parts);
     var total: usize = 0;
-    for (parts) |*pp| total += pp.groups.items.len;
-    const all = try arena.alloc(op.Aggregate.Group, total);
-    var at: usize = 0;
-    for (parts) |*pp| {
-        for (pp.groups.items) |g| {
-            all[at] = g;
-            at += 1;
-        }
-    }
+    for (sets) |st| total += st.len;
 
-    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, all);
+    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, sets, sel);
     const t_emit1 = std.time.Instant.now() catch unreachable;
 
     const wr = try resolveUpsertKeys(env, w);
@@ -1715,8 +1712,8 @@ fn runParallelCsvAggImpl(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag:
 
     if (ctx.queue.first_err) |e| return e;
 
-    const cgroups = try combineAggSlots(env, slots, aggs, opts.threads, parts);
-    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, cgroups);
+    const csets = try combineAggSlots(env, slots, aggs, opts.threads, parts);
+    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, csets, null);
 
     const wr = try resolveUpsertKeys(env, w);
     const snk = try openSink(env, wr, try tailSchema(env, tail, out_schema.*));
@@ -1775,10 +1772,9 @@ fn sqlAggWorkOne(ctx: *SqlAggCtx, i: usize) !void {
         .state = wa,
         .gpa = slot.gpa.allocator(),
     };
-    const drained = try agg.drainGroupsHashed();
-    slot.groups = drained.groups;
-    slot.hashes = drained.hashes;
-    slot.buckets = try bucketByHash(wa, drained.hashes);
+    const set = try agg.drainSet();
+    slot.set = set;
+    slot.buckets = try bucketByHash(wa, set.hashes);
     slot.done = true;
 }
 
@@ -1788,7 +1784,7 @@ fn sqlAggWorkOne(ctx: *SqlAggCtx, i: usize) !void {
 /// post-aggregate tail serially over the merged batch. Returns false to fall back to the
 /// serial path (non-splittable source, no split plan, bare upsert). NOTE: exercised only
 /// against a live DB — there is no local DB in the test suite, so this path is covered by
-/// the shared CSV-aggregate machinery (`drainGroups`/`mergeGroups`/`emit`) it reuses, not
+/// the shared CSV-aggregate machinery (`drainSet`/`GroupMerge`/`emitSets`) it reuses, not
 /// by a direct test.
 pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, src_base: usize) anyerror!bool {
     const arena = env.arena;
@@ -1854,8 +1850,8 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
 
     if (ctx.queue.first_err) |e| return e;
 
-    const cgroups = try combineAggSlots(env, slots, aggs, opts.threads, parts);
-    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, cgroups);
+    const csets = try combineAggSlots(env, slots, aggs, opts.threads, parts);
+    const batch = try emitMergedGroups(env, agg_in, apl.by, aggs, out_schema, csets, null);
 
     const snk = try openSink(env, w, out_schema.*);
     var snk_open = true;
