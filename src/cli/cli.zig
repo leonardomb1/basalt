@@ -17,6 +17,7 @@ const LineResult = @import("line.zig").Result;
 const view = @import("view.zig");
 const table = @import("../connect/table.zig");
 const ast = @import("../lang/ast.zig");
+const aggregates = @import("../lang/aggregates.zig");
 const runtime = @import("../runtime/run.zig");
 const obs = @import("../runtime/obs.zig");
 const analyze = @import("../runtime/analyze.zig");
@@ -2654,14 +2655,17 @@ test "Tab's built-in functions are exactly the engine's: every scalar, aggregate
         std.debug.print("scalar builtin `{s}` is missing from complete.builtin_functions\n", .{b.name});
         return error.TestUnexpectedResult;
     };
-    inline for (@typeInfo(ast.AggFunc).@"enum".fields) |f| try std.testing.expect(listed.has(f.name));
+    for (aggregates.specs) |sp| for (sp.names) |n| if (!listed.has(n)) {
+        std.debug.print("aggregate `{s}` is missing from complete.builtin_functions\n", .{n});
+        return error.TestUnexpectedResult;
+    };
     inline for (@typeInfo(ast.WinKind).@"enum".fields) |f| try std.testing.expect(listed.has(f.name));
     const syntax = [_][]const u8{ "cast", "try_cast", "if" };
     for (complete.builtin_functions, 0..) |f, i| {
         for (complete.builtin_functions[0..i]) |prev| try std.testing.expect(!std.mem.eql(u8, prev.name, f.name));
         try std.testing.expect(std.mem.startsWith(u8, f.sig, f.name) and f.sig[f.name.len] == '(');
         const known = eval.lookupBuiltin(f.name) != null or
-            std.meta.stringToEnum(ast.AggFunc, f.name) != null or
+            aggregates.lookup(f.name) != null or
             std.meta.stringToEnum(ast.WinKind, f.name) != null or
             for (syntax) |x| (if (std.mem.eql(u8, x, f.name)) break true) else false;
         if (!known) {

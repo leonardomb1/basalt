@@ -3256,6 +3256,80 @@ test "MEDIAN: odd count takes the middle, even count the mean of the two, nulls 
     try std.testing.expectEqualStrings("k,m\na,2\nb,15\nc,\n", got);
 }
 
+test "a numeric aggregate casts a text argument, grouped or not, and refuses text that is no number" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Grouped, a text argument reached SUM's accumulator as a panic and AVG's
+    // and MEDIAN's as a silent 0; ungrouped, MEDIAN read it as 0 too.
+    const grouped = try runToString(alloc, &tmp, "k,v\na,1\na,2\nb,3\n", "SELECT k, SUM(CAST(v AS STRING)) AS s, AVG(CAST(v AS STRING)) AS a, MEDIAN(CAST(v AS STRING)) AS m FROM '$IN' GROUP BY k ORDER BY k");
+    defer alloc.free(grouped);
+    try std.testing.expectEqualStrings("k,s,a,m\na,3,1.5,1.5\nb,3,3,3\n", grouped);
+    const whole = try runToString(alloc, &tmp, "k,v\na,1\na,2\nb,3\n", "SELECT SUM(CAST(v AS STRING)) AS s, MEDIAN(CAST(v AS STRING)) AS m FROM '$IN'");
+    defer alloc.free(whole);
+    try std.testing.expectEqualStrings("s,m\n6,2\n", whole);
+    try std.testing.expectError(error.CastFailed, runToString(alloc, &tmp, "k,v\na,1\nb,x\n", "SELECT k, SUM(v) AS s FROM '$IN' GROUP BY k"));
+}
+
+test "count_if, bool_and/or, bit_and/or/xor: grouped and not, nulls skipped, empty groups as the engines answer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // `ok` is text in a CSV, cast per row; `c` holds only nulls.
+    const input = "k,ok,v\na,true,6\na,false,3\na,,\nb,true,5\nc,,\n";
+    const grouped = try runToString(alloc, &tmp, input,
+        \\SELECT k, count_if(ok) AS ci, count_if(v > 4) AS big, bool_and(ok) AS ba, bool_or(ok) AS bo,
+        \\       bit_and(v) AS an, bit_or(v) AS o, bit_xor(v) AS x
+        \\FROM '$IN' GROUP BY k ORDER BY k
+    );
+    defer alloc.free(grouped);
+    try std.testing.expectEqualStrings("k,ci,big,ba,bo,an,o,x\na,1,1,false,true,2,7,5\nb,1,1,true,true,5,5,5\nc,0,0,,,,,\n", grouped);
+    const whole = try runToString(alloc, &tmp, input, "SELECT count_if(ok) AS ci, bool_and(ok) AS ba, bit_or(v) AS o FROM '$IN'");
+    defer alloc.free(whole);
+    try std.testing.expectEqualStrings("ci,ba,o\n2,false,7\n", whole);
+    // No rows at all: a count is 0, the rest null.
+    const none = try runToString(alloc, &tmp, input, "SELECT count_if(ok) AS ci, bool_or(ok) AS bo, bit_and(v) AS an FROM '$IN' WHERE k = 'zz'");
+    defer alloc.free(none);
+    try std.testing.expectEqualStrings("ci,bo,an\n0,,\n", none);
+    // A constant condition, and one built row-wise (`abs` has no vector kernel),
+    // are BOOL columns even though `count_if` answers an INT: grouped, the
+    // constant used to be broadcast as INT and counted nothing.
+    const built = try runToString(alloc, &tmp, input, "SELECT k, count_if(true) AS t, count_if(abs(v) > 4) AS a FROM '$IN' GROUP BY k ORDER BY k");
+    defer alloc.free(built);
+    try std.testing.expectEqualStrings("k,t,a\na,3,1\nb,1,1\nc,1,0\n", built);
+    // Across lanes: each lane folds its own slice and the partials merge.
+    const lanes = try runCsvThreaded(alloc, &tmp, input,
+        \\SELECT k, count_if(ok) AS ci, count_if(v > 4) AS big, bool_and(ok) AS ba, bool_or(ok) AS bo,
+        \\       bit_and(v) AS an, bit_or(v) AS o, bit_xor(v) AS x
+        \\FROM '$IN' GROUP BY k ORDER BY k
+    , 4);
+    defer alloc.free(lanes);
+    try std.testing.expectEqualStrings(grouped, lanes);
+}
+
+test "variance and standard deviation: sample by default, population on request, the same across lanes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const input = "k,v\na,2\na,4\na,4\na,4\na,5\na,5\na,7\na,9\nb,3\nb,\nc,\n";
+    const q =
+        \\SELECT k, var_pop(v) AS vp, stddev_pop(v) AS sp, round(variance(v), 6) AS vs, round(stddev(v), 6) AS ss,
+        \\       round(var_samp(v), 6) AS vs2, round(stddev_samp(v), 6) AS ss2
+        \\FROM '$IN' GROUP BY k ORDER BY k
+    ;
+    const want = "k,vp,sp,vs,ss,vs2,ss2\na,4,2,4.571429,2.13809,4.571429,2.13809\nb,0,0,,,,\nc,,,,,,\n";
+    const serial = try runToString(alloc, &tmp, input, q);
+    defer alloc.free(serial);
+    try std.testing.expectEqualStrings(want, serial);
+    const threaded = try runCsvThreaded(alloc, &tmp, input,
+        \\SELECT k, round(var_pop(v), 9) AS vp, round(stddev_pop(v), 9) AS sp, round(variance(v), 6) AS vs, round(stddev(v), 6) AS ss,
+        \\       round(var_samp(v), 6) AS vs2, round(stddev_samp(v), 6) AS ss2
+        \\FROM '$IN' GROUP BY k ORDER BY k
+    , 4);
+    defer alloc.free(threaded);
+    try std.testing.expectEqualStrings(want, threaded);
+}
+
 test "csv: a column of ISO dates is inferred as DATE (empty cells are null)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

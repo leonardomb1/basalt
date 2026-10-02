@@ -3,6 +3,7 @@
 pub const types = @import("lang/types.zig");
 pub const token = @import("lang/token.zig");
 pub const ast = @import("lang/ast.zig");
+pub const aggregates = @import("lang/aggregates.zig");
 pub const sql_lexer = @import("lang/sql_lexer.zig");
 pub const sql_parser = @import("lang/sql_parser.zig");
 pub const include = @import("lang/include.zig");

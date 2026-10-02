@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
+const aggregates = @import("../lang/aggregates.zig");
 const types = @import("../lang/types.zig");
 const column = @import("column.zig");
 const Batch = @import("batch.zig").Batch;
@@ -1486,6 +1487,20 @@ pub const Aggregate = struct {
 
     pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Type, distinct: bool = false };
 
+    /// One aggregate's running state. The fields are shared, and each aggregate
+    /// reads them its own way:
+    ///   * COUNT, `count_if` — `n`, the rows counted.
+    ///   * SUM, AVG — `n` rows summed into `sum_i` (int, DECIMAL) or `sum_f` (float).
+    ///   * MIN, MAX — `ext`, the extreme so far.
+    ///   * MEDIAN — `vals`; COUNT(DISTINCT) — `seen`.
+    ///   * `bool_and`, `bool_or` — `n` non-null rows, `sum_i` of them true.
+    ///   * `bit_and`, `bit_or`, `bit_xor` — `n` non-null rows, `sum_i` the bits so
+    ///     far (an i64, sign-extended); `n == 0` means none yet, since a zero
+    ///     start is the identity for OR and XOR but not for AND.
+    ///   * the variances and deviations — Welford's running moments: `n` rows,
+    ///     `sum_f` their mean, `ext` (a float) the sum of squared deviations
+    ///     from it. Reusing `ext` keeps `Acc` at 80 bytes; a field of its own
+    ///     would cost every MIN/MAX group 8 more.
     pub const Acc = struct {
         n: i64 = 0,
         /// Exact: a total that fits i64 must not fail on a partial that does not,
@@ -2367,6 +2382,16 @@ pub const Aggregate = struct {
             .median => if (src.vals) |s| {
                 for (s.items) |x| try noteMedian(dst_alloc, dst, x);
             },
+            .count_if => dst.n += src.n,
+            .bool_and, .bool_or => {
+                dst.n += src.n;
+                dst.sum_i += src.sum_i;
+            },
+            .bit_and, .bit_or, .bit_xor => if (src.n > 0) {
+                dst.sum_i = if (dst.n == 0) src.sum_i else bitFold(agg.func, dst.sum_i, src.sum_i);
+                dst.n += src.n;
+            },
+            .var_samp, .var_pop, .stddev_samp, .stddev_pop => mergeMoments(dst, src),
             .min => if (!src.ext.isNull() and (dst.ext.isNull() or lessV(src.ext, dst.ext))) {
                 dst.ext = try dupeValue(dst_alloc, src.ext);
             },
@@ -2401,51 +2426,77 @@ pub const Aggregate = struct {
         }
     }
 
-    /// One agg argument for one row, coerced to the planned type. The parallel
-    /// CSV lanes carry raw string columns (the planner types sum/avg numeric and
-    /// expects runtime coercion — the vectorized path gets it via `evalColumn`);
-    /// without this a string cell reaching `sum` is a union-access crash, and
-    /// unparseable text is a clean CastFailed instead.
-    /// One aggregate's argument evaluated across a whole batch, typed as the
-    /// aggregate expects — which also applies the string-to-number coercion
-    /// `argValue` did per row for `sum`/`avg`.
+    /// What a text argument is cast to before it reaches the accumulator, or
+    /// null for an aggregate that takes its argument as it comes (COUNT, MIN,
+    /// MAX). Text passes the plan-time check under every rule — the parallel CSV
+    /// lanes carry raw text columns — so this is where it becomes the number or
+    /// bool the aggregate folds; unparseable text is a clean CastFailed.
+    fn argCast(agg: Agg) ?types.Type {
+        return switch (aggregates.spec(agg.func).arg) {
+            .star_or_any, .any => null,
+            .numeric => agg.ty.asNullable(),
+            .int => types.Type.init(.int).asNullable(),
+            .bool => types.Type.init(.bool).asNullable(),
+        };
+    }
+
+    /// One aggregate's argument evaluated across a whole batch, a text column
+    /// cast as `argCast` says. Without the cast a text cell reached `SUM`'s
+    /// accumulator as a union-access panic, and `AVG`'s as a silent 0.
     fn argColumn(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, e: *const ast.Expr, b: Batch) anyerror!column.Column {
         // `sum(x)` and friends name a column the batch already holds; hand it
         // over instead of materialising a copy. Only when the stored type feeds
         // the accumulator directly — a text column under a numeric aggregate
         // still has to go through the coercing path.
+        // The type the accumulator reads, which is not always the result's:
+        // `count_if` folds BOOLs into an INT. A constant or row-wise argument is
+        // built as this type, so `count_if(true)` must not become a column of 1s.
+        const want = argCast(agg) orelse agg.ty;
         if (e.* == .field) {
             if (b.schema.resolve(e.field.parts)) |ci| {
                 const ck = b.columns[ci].ty.kind;
-                const ak = agg.ty.kind;
+                const ak = want.kind;
                 if (ck == ak or (ck.isNumeric() and ak.isNumeric())) return b.columns[ci];
             }
         }
-        return eval.evalColumn(arena, e, b, agg.ty) catch |err| {
+        const col = eval.evalColumn(arena, e, b, want) catch |err| {
             if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
             return err;
         };
+        if (col.ty.kind != .string) return col;
+        const to = argCast(agg) orelse return col;
+        if (to.kind == .string) return col;
+        var out = try column.Builder.initCapacity(arena, to, b.len);
+        for (0..b.len) |r| try out.append(try self.castArg(arena, to, col.getValue(r)));
+        return out.finish();
     }
 
+    /// One agg argument for one row, a text value cast as `argCast` says.
     fn argValue(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, b: Batch, r: usize) anyerror!Value {
         const e = agg.arg orelse return .null;
-        var v = eval.evalRow(arena, e, b, r) catch |err| {
+        const v = eval.evalRow(arena, e, b, r) catch |err| {
             if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
             return err;
         };
-        if (v == .string and (agg.func == .sum or agg.func == .avg)) {
-            v = eval.castValue(arena, v, agg.ty.kind) catch |err| {
-                if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
-                return err;
-            };
-        }
-        return v;
+        if (v != .string) return v;
+        const to = argCast(agg) orelse return v;
+        if (to.kind == .string) return v;
+        return self.castArg(arena, to, v);
+    }
+
+    fn castArg(self: *Aggregate, arena: std.mem.Allocator, to: types.Type, v: Value) anyerror!Value {
+        if (v.isNull()) return v;
+        return eval.castValueTyped(arena, v, to) catch |err| {
+            if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
+            return err;
+        };
     }
 
     /// Vectorized reduce of one agg over one batch. `null` means "not covered,
     /// fold row-wise" (non-numeric arg); the constraint is schema-dependent.
     fn reduceBatch(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, b: Batch) anyerror!?Partial {
         if (agg.func == .count and agg.arg == null) return Partial{ .nvalid = b.len };
+        if (foldsRowwise(agg.func)) return null;
         const e = agg.arg orelse return null;
         const col = eval.evalColumn(arena, e, b, agg.ty) catch |err| {
             if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
@@ -2458,7 +2509,7 @@ pub const Aggregate = struct {
         if (nvalid == 0) return p;
         switch (agg.func) {
             .count => {},
-            .median => return null,
+            .median, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .var_samp, .var_pop, .stddev_samp, .stddev_pop => unreachable,
             // A null slot holds whatever its producer left there — an outer join's
             // fill keeps the placeholder row's value — so only an all-valid batch
             // may be summed without looking at the bitmap.
@@ -2473,6 +2524,15 @@ pub const Aggregate = struct {
             .min, .max => p.ext = reduceExtreme(col, agg.func, n),
         }
         return p;
+    }
+
+    /// Whether `reduceBatch` leaves an aggregate to the row-wise fold, decided
+    /// before it evaluates a column it would only discard.
+    fn foldsRowwise(func: ast.AggFunc) bool {
+        return switch (func) {
+            .count, .sum, .avg, .min, .max => false,
+            .median, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .var_samp, .var_pop, .stddev_samp, .stddev_pop => true,
+        };
     }
 
     /// Fold one batch's `Partial` into the running accumulator. Mirrors the
@@ -2492,8 +2552,7 @@ pub const Aggregate = struct {
                 acc.sum_f += p.sum_f;
                 acc.n += @intCast(p.nvalid);
             },
-            // `reduceBatch` never covers a median: it folds row-wise.
-            .median => {},
+            .median, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .var_samp, .var_pop, .stddev_samp, .stddev_pop => unreachable,
             .min => if (p.ext) |v| {
                 if (acc.ext.isNull() or lessV(v, acc.ext)) {
                     acc.ext = v;
@@ -2563,6 +2622,19 @@ pub const Aggregate = struct {
                 acc.n += 1;
             },
             .median => if (!v.isNull()) try noteMedian(state, acc, eval.toF64(v)),
+            .count_if => if (v == .bool and v.bool) {
+                acc.n += 1;
+            },
+            .bool_and, .bool_or => if (!v.isNull()) {
+                acc.n += 1;
+                if (v == .bool and v.bool) acc.sum_i += 1;
+            },
+            .bit_and, .bit_or, .bit_xor => if (!v.isNull()) {
+                if (v != .int) return error.TypeMismatch;
+                acc.sum_i = if (acc.n == 0) v.int else bitFold(agg.func, acc.sum_i, v.int);
+                acc.n += 1;
+            },
+            .var_samp, .var_pop, .stddev_samp, .stddev_pop => if (!v.isNull()) noteMoment(acc, eval.toF64(v)),
             .min => if (!v.isNull()) {
                 if (acc.ext.isNull() or lessV(v, acc.ext)) {
                     acc.ext = try dupeValue(state, v);
@@ -2741,7 +2813,69 @@ pub const Aggregate = struct {
                 break :blk Value{ .float = (lo + hi) / 2 };
             },
             .min, .max => acc.ext,
+            .count_if => .{ .int = acc.n },
+            .bool_and => if (acc.n == 0) .null else Value{ .bool = acc.sum_i == acc.n },
+            .bool_or => if (acc.n == 0) .null else Value{ .bool = acc.sum_i > 0 },
+            // `sum_i` only ever holds an i64's bits, sign-extended.
+            .bit_and, .bit_or, .bit_xor => if (acc.n == 0) .null else Value{ .int = @intCast(acc.sum_i) },
+            .var_samp, .stddev_samp => if (acc.n < 2) .null else spread(agg.func, sqDev(acc) / @as(f64, @floatFromInt(acc.n - 1))),
+            .var_pop, .stddev_pop => if (acc.n == 0) .null else spread(agg.func, sqDev(acc) / @as(f64, @floatFromInt(acc.n))),
         };
+    }
+
+    fn bitFold(func: ast.AggFunc, a: i128, b: i128) i128 {
+        return switch (func) {
+            .bit_and => a & b,
+            .bit_or => a | b,
+            .bit_xor => a ^ b,
+            else => unreachable,
+        };
+    }
+
+    /// The sum of squared deviations from the mean — see `Acc`.
+    fn sqDev(acc: Acc) f64 {
+        return if (acc.ext == .float) acc.ext.float else 0;
+    }
+
+    /// Welford's update: one value into the running mean and squared deviations,
+    /// without the cancellation a sum of squares suffers on large values.
+    fn noteMoment(acc: *Acc, x: f64) void {
+        // Read `ext` before assigning it: `acc.ext = .{ .float = f(acc) }` may
+        // set the union's tag first, and `f` would then read a garbage float.
+        const m2 = sqDev(acc.*);
+        acc.n += 1;
+        const delta = x - acc.sum_f;
+        acc.sum_f += delta / @as(f64, @floatFromInt(acc.n));
+        acc.ext = .{ .float = m2 + delta * (x - acc.sum_f) };
+    }
+
+    /// Chan et al.'s pairwise combination of two Welford states. Lanes merge in
+    /// a fixed order, so the result is reproducible for a given `-j`, like a
+    /// float SUM — and, like it, may differ in the last bits across `-j`.
+    fn mergeMoments(dst: *Acc, src: Acc) void {
+        if (src.n == 0) return;
+        if (dst.n == 0) {
+            dst.n = src.n;
+            dst.sum_f = src.sum_f;
+            dst.ext = .{ .float = sqDev(src) };
+            return;
+        }
+        const na: f64 = @floatFromInt(dst.n);
+        const nb: f64 = @floatFromInt(src.n);
+        const n = na + nb;
+        const delta = src.sum_f - dst.sum_f;
+        const m2 = sqDev(dst.*) + sqDev(src) + delta * delta * na * nb / n;
+        dst.ext = .{ .float = m2 };
+        dst.sum_f += delta * nb / n;
+        dst.n += src.n;
+    }
+
+    /// A variance as itself, or a deviation as its square root.
+    fn spread(func: ast.AggFunc, variance: f64) Value {
+        return .{ .float = switch (func) {
+            .stddev_samp, .stddev_pop => @sqrt(variance),
+            else => variance,
+        } };
     }
 };
 
@@ -3726,6 +3860,61 @@ test "aggregate: sum/avg coerce raw string cells (parallel CSV lane shape); garb
         var agg = Aggregate{ .child = .{ .scan = &scan }, .in_schema = &s_schema, .by = &.{}, .aggs = &aggs, .out_schema = &out_schema, .state = a, .gpa = testing.allocator };
         try testing.expectError(error.CastFailed, agg.next(a));
     }
+}
+
+test "aggregate: variance folded in two halves and merged matches one fold, and holds up far from zero" {
+    const A = Aggregate;
+    const fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
+    const xs = [_]f64{ 2, 4, 4, 4, 5, 5, 7, 9, 1.5, 12.25 };
+    inline for (.{ ast.AggFunc.var_samp, .var_pop, .stddev_samp, .stddev_pop }) |func| {
+        const agg = A.Agg{ .func = func, .arg = &fx, .ty = types.Type.init(.float).asNullable() };
+        var whole = A.Acc{};
+        for (xs) |x| try A.updateAcc(testing.allocator, &whole, agg, .{ .float = x }, true);
+        // Every split point, including the empty halves `mergeMoments` must skip or adopt.
+        for (0..xs.len + 1) |cut| {
+            var lo = A.Acc{};
+            var hi = A.Acc{};
+            for (xs[0..cut]) |x| try A.updateAcc(testing.allocator, &lo, agg, .{ .float = x }, true);
+            for (xs[cut..]) |x| try A.updateAcc(testing.allocator, &hi, agg, .{ .float = x }, true);
+            try A.mergeAcc(testing.allocator, &lo, hi, agg);
+            try testing.expectApproxEqAbs((try A.finalizeAcc(whole, agg)).float, (try A.finalizeAcc(lo, agg)).float, 1e-9);
+        }
+    }
+    // 2, 4, 4, 4, 5, 5, 7, 9: population variance 4, sample 32/7.
+    const pop = A.Agg{ .func = .var_pop, .arg = &fx, .ty = types.Type.init(.float).asNullable() };
+    const samp = A.Agg{ .func = .var_samp, .arg = &fx, .ty = types.Type.init(.float).asNullable() };
+    var p = A.Acc{};
+    var q = A.Acc{};
+    for (xs[0..8]) |x| {
+        try A.updateAcc(testing.allocator, &p, pop, .{ .float = x + 1e9 }, true);
+        try A.updateAcc(testing.allocator, &q, samp, .{ .int = @intFromFloat(x) }, true);
+    }
+    // Shifted by 1e9 the squares are ~1e18, where a sum of squares minus the
+    // squared sum is off by thousands; Welford stays within float noise.
+    try testing.expectApproxEqAbs(@as(f64, 4), (try A.finalizeAcc(p, pop)).float, 1e-6);
+    try testing.expectApproxEqAbs(@as(f64, 32.0 / 7.0), (try A.finalizeAcc(q, samp)).float, 1e-12);
+    // One value: no sample variance, a population variance of exactly 0.
+    var one = A.Acc{};
+    try A.updateAcc(testing.allocator, &one, samp, .{ .float = 3 }, true);
+    try testing.expect((try A.finalizeAcc(one, samp)) == .null);
+    try testing.expectEqual(@as(f64, 0), (try A.finalizeAcc(one, pop)).float);
+    try testing.expect((try A.finalizeAcc(.{}, pop)) == .null);
+}
+
+test "aggregate: bit_and starts from its first value, not zero, through a merge too" {
+    const A = Aggregate;
+    const fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
+    const agg = A.Agg{ .func = .bit_and, .arg = &fx, .ty = types.Type.init(.int).asNullable() };
+    var empty = A.Acc{};
+    var some = A.Acc{};
+    for ([_]i64{ 0b1110, 0b0111, -1 }) |x| try A.updateAcc(testing.allocator, &some, agg, .{ .int = x }, true);
+    try A.updateAcc(testing.allocator, &some, agg, .null, true);
+    try A.mergeAcc(testing.allocator, &empty, some, agg);
+    try testing.expectEqual(@as(i64, 0b0110), (try A.finalizeAcc(empty, agg)).int);
+    var neg = A.Acc{};
+    try A.updateAcc(testing.allocator, &neg, agg, .{ .int = std.math.minInt(i64) }, true);
+    try testing.expectEqual(@as(i64, std.math.minInt(i64)), (try A.finalizeAcc(neg, agg)).int);
+    try testing.expect((try A.finalizeAcc(.{}, agg)) == .null);
 }
 
 test "aggregate: a decimal sum normalizes each value's own scale" {

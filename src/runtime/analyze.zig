@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
+const aggregates = @import("../lang/aggregates.zig");
 const expand = @import("../lang/expand.zig");
 const types = @import("../lang/types.zig");
 const pushdown = @import("pushdown.zig");
@@ -210,26 +211,27 @@ pub fn aggregatePlan(arena: std.mem.Allocator, in: types.Schema, ag: ast.Aggrega
 }
 
 fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const ast.Expr, in: types.Schema, diag: *Diag) Error!types.Type {
-    switch (func) {
-        .count => return types.Type.init(.int),
-        else => {
-            const a = arg orelse return fail(diag, "this aggregate requires an argument", .{});
-            const at = try exprType(arena, in, a, diag);
-            return switch (func) {
-                .sum => switch (at.kind) {
-                    .float => types.Type.init(.float).withNull(true),
-                    // A decimal sum stays a decimal: typing it as an int reported
-                    // the accumulated *unscaled* integer, so 1.5+2.25+3.125 came
-                    // back as 68750.
-                    .decimal => at.withNull(true),
-                    else => types.Type.init(.int).withNull(true),
-                },
-                .avg, .median => types.Type.init(.float).withNull(true),
-                .min, .max => at.withNull(true),
-                .count => unreachable,
-            };
+    const sp = aggregates.spec(func);
+    if (sp.arg == .star_or_any) return types.Type.init(.int);
+    const a = arg orelse return fail(diag, "this aggregate requires an argument", .{});
+    const at = try exprType(arena, in, a, diag);
+    if (!sp.arg.accepts(at))
+        return fail(diag, "`{s}` needs a {s} argument, got {s}", .{ sp.names[0], sp.arg.word(), try at.name(arena) });
+    return switch (sp.result) {
+        .count => types.Type.init(.int),
+        .sum => switch (at.kind) {
+            .float => types.Type.init(.float).withNull(true),
+            // A decimal sum stays a decimal: typing it as an int reported
+            // the accumulated *unscaled* integer, so 1.5+2.25+3.125 came
+            // back as 68750.
+            .decimal => at.withNull(true),
+            else => types.Type.init(.int).withNull(true),
         },
-    }
+        .float => types.Type.init(.float).withNull(true),
+        .same => at.withNull(true),
+        .bool => types.Type.init(.bool).withNull(true),
+        .int => types.Type.init(.int).withNull(true),
+    };
 }
 
 /// Result type of one window function over its source column (`int` for the
@@ -2129,6 +2131,19 @@ test "analyze rejects `is empty` on a non-string operand" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     try expectAnalyzeErr(ar.allocator(), "id,amount\n1,100\n", "SELECT * FROM '$IN' WHERE CAST(amount AS INT) IS EMPTY");
+}
+
+test "analyze: a numeric aggregate refuses a non-numeric argument at plan time" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // `SUM(date)` used to reach the accumulator and panic on the union access.
+    var diag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyzeCsv(a, "id,d\n1,2024-01-01\n", "SELECT SUM(d) AS s FROM '$IN'", &diag));
+    try std.testing.expectEqualStrings("`sum` needs a numeric argument, got date", diag.msg);
+    // Text still passes: it is coerced per row, as the parallel CSV lanes need.
+    var ok = Diag{};
+    _ = try analyzeCsv(a, "id,s\n1,x\n", "SELECT SUM(s) AS n, MIN(s) AS lo FROM '$IN'", &ok);
 }
 
 test "formatLabel names the reader, not the connector" {

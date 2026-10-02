@@ -20,6 +20,7 @@ const std = @import("std");
 const token = @import("token.zig");
 const lexer = @import("sql_lexer.zig");
 const ast = @import("ast.zig");
+const aggregates = @import("aggregates.zig");
 const types = @import("types.zig");
 
 const Token = token.Token;
@@ -169,20 +170,10 @@ fn hasLiteralExt(tmpl: []const u8) bool {
     return dot + 1 < tail.len;
 }
 
-const agg_names = [_]struct { n: []const u8, f: ast.AggFunc }{
-    .{ .n = "count", .f = .count },
-    .{ .n = "sum", .f = .sum },
-    .{ .n = "avg", .f = .avg },
-    .{ .n = "min", .f = .min },
-    .{ .n = "max", .f = .max },
-    .{ .n = "median", .f = .median },
-};
-
 /// Whether `name` is an aggregate function — reserved, since it is parsed as
 /// one before any user function could be looked up.
 pub fn isAggName(name: []const u8) bool {
-    for (agg_names) |a| if (std.mem.eql(u8, a.n, name)) return true;
-    return false;
+    return aggregates.lookup(name) != null;
 }
 
 fn isGroupKey(group: []const ast.QualName, q: ast.QualName) bool {
@@ -272,10 +263,7 @@ fn itemLabel(it: ast.SelectItem) []const u8 {
 }
 
 fn aggFunc(name: []const u8) ?ast.AggFunc {
-    for (agg_names) |m| {
-        if (eqlNoCase(name, m.n)) return m.f;
-    }
-    return null;
+    return aggregates.lookup(name);
 }
 
 /// One `CREATE RESOURCE conn.name AS GET(...)`: the read it stands for.

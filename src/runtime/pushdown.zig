@@ -257,7 +257,7 @@ fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema,
             }
             return try std.fmt.allocPrint(arena, "{s}({s})", .{ if (item.func == .min) "MIN" else "MAX", col });
         },
-        .avg, .median => return null,
+        .avg, .median, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .var_samp, .var_pop, .stddev_samp, .stddev_pop => return null,
     }
 }
 
@@ -2038,6 +2038,31 @@ test "planWholeAgg: AVG always falls back (int-avg result types diverge)" {
     } };
     for ([_]Dialect{ .postgres, .mysql, .sqlserver }) |d|
         try testing.expect((try planWholeAgg(a, d, base_t, wholeSchema(), &.{}, ag, plan_schema)) == null);
+}
+
+test "planWholeAgg: only COUNT, SUM, MIN and MAX descend — every other aggregate stays engine-side" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const plan_schema = types.Schema{ .fields = &.{
+        .{ .name = "b", .ty = types.Type.init(.string) },
+        .{ .name = "m", .ty = types.Type.init(.float).withNull(true) },
+    } };
+    // A new aggregate falls back until `aggExpr` is taught a rendering that every
+    // dialect answers bit-identically to the engine.
+    inline for (@typeInfo(ast.AggFunc).@"enum".fields) |f| {
+        const func: ast.AggFunc = @enumFromInt(f.value);
+        switch (func) {
+            .count, .sum, .min, .max => {},
+            else => {
+                const aggs = try a.alloc(ast.AggItem, 1);
+                aggs[0] = .{ .name = "m", .func = func, .arg = try fld(a, "c") };
+                const ag = ast.Aggregate{ .aggs = aggs, .by = try byList(a, &.{"b"}) };
+                for ([_]Dialect{ .postgres, .mysql, .sqlserver }) |d|
+                    try testing.expect((try planWholeAgg(a, d, base_t, wholeSchema(), &.{}, ag, plan_schema)) == null);
+            },
+        }
+    }
 }
 
 test "planWholeAgg: a qualified or unknown group key falls back" {

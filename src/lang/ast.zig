@@ -222,7 +222,25 @@ pub const Distinct = struct { on: ?[]const QualName };
 pub const SortKey = struct { field: QualName, desc: bool };
 pub const Sort = struct { keys: []const SortKey };
 
-pub const AggFunc = enum { count, sum, avg, min, max, median };
+/// Every aggregate; `aggregates.zig` holds each one's names and typing, in this order.
+pub const AggFunc = enum {
+    count,
+    sum,
+    avg,
+    min,
+    max,
+    median,
+    count_if,
+    bool_and,
+    bool_or,
+    bit_and,
+    bit_or,
+    bit_xor,
+    var_samp,
+    var_pop,
+    stddev_samp,
+    stddev_pop,
+};
 pub const AggItem = struct { name: []const u8, func: AggFunc, arg: ?*Expr, distinct: bool = false };
 pub const Aggregate = struct { aggs: []const AggItem, by: []const QualName };
 

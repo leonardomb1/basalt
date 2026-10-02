@@ -104,6 +104,18 @@ pub const builtin_functions = [_]Builtin{
     .{ .name = "min", .sig = "min(x) [OVER (…)]" },
     .{ .name = "max", .sig = "max(x) [OVER (…)]" },
     .{ .name = "median", .sig = "median(x)" },
+    .{ .name = "count_if", .sig = "count_if(condition)" },
+    .{ .name = "bool_and", .sig = "bool_and(condition)" },
+    .{ .name = "bool_or", .sig = "bool_or(condition)" },
+    .{ .name = "bit_and", .sig = "bit_and(x)" },
+    .{ .name = "bit_or", .sig = "bit_or(x)" },
+    .{ .name = "bit_xor", .sig = "bit_xor(x)" },
+    .{ .name = "var_samp", .sig = "var_samp(x)" },
+    .{ .name = "variance", .sig = "variance(x)" },
+    .{ .name = "var_pop", .sig = "var_pop(x)" },
+    .{ .name = "stddev_samp", .sig = "stddev_samp(x)" },
+    .{ .name = "stddev", .sig = "stddev(x)" },
+    .{ .name = "stddev_pop", .sig = "stddev_pop(x)" },
     // window
     .{ .name = "row_number", .sig = "row_number() OVER (…)" },
     .{ .name = "rank", .sig = "rank() OVER (…)" },
@@ -324,11 +336,14 @@ test "complete: built-in functions by prefix with their signature, columns with 
     try std.testing.expectEqualStrings("t.amount", q[0].text);
     try std.testing.expectEqualStrings("decimal(10,2)", q[0].detail);
     // a column shadows the function of the same name, and keeps its type
+    // (`count_if` shares the prefix and is still offered)
     const cnt = (try complete(a, .{ .columns = &.{.{ .name = "count", .type = "int" }} }, "cou", 3)).candidates.items;
-    try std.testing.expectEqual(@as(usize, 1), cnt.len);
+    try std.testing.expectEqual(@as(usize, 2), cnt.len);
     try std.testing.expectEqual(Kind.column, cnt[0].kind);
+    try std.testing.expectEqualStrings("count", cnt[0].text);
+    try std.testing.expectEqualStrings("count_if", cnt[1].text);
     // a function with no column in the way is a function, not the keyword `count`
     const fnc = (try complete(a, .{}, "cou", 3)).candidates.items;
-    try std.testing.expectEqual(@as(usize, 1), fnc.len);
-    try std.testing.expectEqual(Kind.function, fnc[0].kind);
+    try std.testing.expectEqual(@as(usize, 2), fnc.len);
+    for (fnc) |c| try std.testing.expectEqual(Kind.function, c.kind);
 }

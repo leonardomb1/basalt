@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const eval = @import("eval.zig");
+const aggregates = @import("../lang/aggregates.zig");
 
 /// One entry of the registry; see `eval.Builtin`.
 pub const Builtin = eval.Builtin;
@@ -33,8 +34,8 @@ test "builtins: every entry has a unique name and resolves through lookup" {
 }
 
 test "builtins: aggregates and unknown names are not scalar builtins" {
-    for ([_][]const u8{ "count", "sum", "avg", "min", "max", "no_such_fn", "" }) |n|
-        try std.testing.expect(lookup(n) == null);
+    for (aggregates.specs) |s| for (s.names) |n| try std.testing.expect(lookup(n) == null);
+    for ([_][]const u8{ "no_such_fn", "" }) |n| try std.testing.expect(lookup(n) == null);
 }
 
 test "builtins: exactly these lack a vectorized kernel" {

@@ -591,10 +591,14 @@ apart.
 | `SELECT a, expr AS x` | projection |
 | `SELECT * EXCLUDE (a, b)` / `EXCEPT` | all-but projection |
 | `SELECT * RENAME (a AS b)` | rename projection |
-| `COUNT(*) / SUM / AVG / MIN / MAX ... GROUP BY k` | aggregate (every other item must be a group key, aliased or not, or a plan-time constant) |
+| `COUNT(*) / SUM / AVG / MIN / MAX ... GROUP BY k` | aggregate (every other item must be a group key, aliased or not, or a plan-time constant). A numeric aggregate refuses a non-numeric argument at plan time, and casts text per row — so a CSV column read as text still sums, and text that is not a number fails the run |
 | `ROUND(AVG(x), 2)`, `SUM(a)/COUNT(*)` | an aggregate inside an expression: the calls are computed by the aggregate, the arithmetic around them by a projection after it |
 | `COUNT(DISTINCT x)` | aggregate — combines freely with other aggregates; ignores nulls |
 | `MEDIAN(x)` | aggregate — a float; the mean of the two middle values on an even count; ignores nulls. Holds every value of the group until the end, so it is the one aggregate that is not O(1) per group. Engine-side only (never pushed down), and not a window function |
+| `count_if(cond)` | aggregate — the rows where `cond` is true, as an `INT`; `0` for no rows, never null |
+| `bool_and(cond)` / `bool_or(cond)` | aggregate — whether `cond` held for every row / for any row; nulls ignored, null when the group has no non-null value |
+| `bit_and(x)` / `bit_or(x)` / `bit_xor(x)` | aggregate — the bitwise fold of an `INT` column; nulls ignored, null when there is nothing to fold |
+| `var_samp(x)` / `var_pop(x)`, `stddev_samp(x)` / `stddev_pop(x)` | aggregate — the sample and population variance and standard deviation, as floats; nulls ignored. `variance` and `stddev` are the **sample** ones, as in Postgres, DuckDB, Trino and SQL Server (MySQL and StarRocks read them as population). A sample statistic of fewer than two values is null; a population one of a single value is `0` |
 | `HAVING <expr>` | filter after the aggregate; aggregate calls in it refer to the columns it produced, including ones the `SELECT` list never asked for |
 | `ORDER BY a DESC, b` | sort |
 | `LIMIT n [OFFSET m]` | limit |
@@ -792,7 +796,9 @@ is cut, and float addition is not associative, so `-j 4` and `-j 8` can differ i
 the last bits (as can either from `-j 1`). `SUM` over an `INT` or a `DECIMAL` is
 exact and identical everywhere — `SUM(CAST(amount AS DECIMAL(18,2)))` is the way
 to total money you intend to compare or checksum. `COUNT`, `MIN` and `MAX` are
-exact too.
+exact too, as are `count_if`, `bool_and`/`bool_or` and the `bit_*` aggregates.
+The variances and deviations combine their lanes the same fixed way, so they
+share `SUM`'s float caveat: `ROUND` them before comparing runs at different `-j`.
 
 ### Naming, `GROUP BY` and `ORDER BY`
 
