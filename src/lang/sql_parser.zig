@@ -2630,6 +2630,10 @@ pub const Parser = struct {
             if (std.mem.eql(u8, low, "min")) break :blk .min;
             if (std.mem.eql(u8, low, "max")) break :blk .max;
             if (std.mem.eql(u8, low, "avg")) break :blk .avg;
+            // An aggregate with no window form — `median(x) OVER (...)` — was parsed
+            // as a plain aggregate, and the error blamed a GROUP BY the query never had.
+            if (aggFunc(low) != null and self.peekTag() == .lparen and self.overFollows(self.i))
+                return self.fail(self.curPos(), "`{s}` is not a window function — over a window, basalt computes sum, count, min, max, avg, row_number, rank, dense_rank, lag and lead", .{low});
             return false;
         };
         // Only commit once the whole `name ( ) OVER` prefix is present, so a column
@@ -2763,7 +2767,15 @@ pub const Parser = struct {
     /// GROUP BY the query never had.
     fn notWindow(self: *Parser, save: usize) Error!bool {
         self.i = save;
-        var j = save + 1;
+        if (self.overFollows(save))
+            return self.fail(self.curPos(), "a window function takes a plain column (or `*` for COUNT) — compute `{s}(...)`'s argument in a CTE or derived table first", .{self.toks[save].text});
+        return false;
+    }
+
+    /// Whether the call whose name is token `name_at` is followed, past its closing
+    /// parenthesis, by `OVER`.
+    fn overFollows(self: *Parser, name_at: usize) bool {
+        var j = name_at + 1;
         var depth: usize = 0;
         while (j < self.toks.len) : (j += 1) {
             switch (self.toks[j].tag) {
@@ -2776,9 +2788,7 @@ pub const Parser = struct {
                 else => {},
             }
         }
-        if (j + 1 < self.toks.len and self.toks[j + 1].tag == .ident and eqlNoCase(self.toks[j + 1].text, "over"))
-            return self.fail(self.curPos(), "a window function takes a plain column (or `*` for COUNT) — compute `{s}(...)`'s argument in a CTE or derived table first", .{self.toks[save].text});
-        return false;
+        return j + 1 < self.toks.len and self.toks[j + 1].tag == .ident and eqlNoCase(self.toks[j + 1].text, "over");
     }
 
     fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array_list.Managed(ast.Hint)) Error!ast.Stage.Node {
@@ -3436,7 +3446,11 @@ pub const Parser = struct {
     fn constItemExpr(self: *Parser, e: *const ast.Expr) bool {
         return switch (e.*) {
             .int_lit, .float_lit, .str_lit, .bool_lit, .null_lit => true,
-            .field => |q| q.dollar and q.parts.len == 1 and self.isScriptConst(q.parts[0]),
+            // Every `$name` is script scope — a PARAM, a LET, a loop variable or a
+            // JSON-param path — so one value per query. Not only the ones declared
+            // in this file: an `@include`d PARAM is parsed elsewhere, and a name
+            // nothing binds is refused by name at plan time.
+            .field => |q| q.dollar,
             .unary => |u| self.constItemExpr(u.e),
             .binary => |b| self.constItemExpr(b.l) and self.constItemExpr(b.r),
             .cond => |c| self.constItemExpr(c.cond) and self.constItemExpr(c.then) and self.constItemExpr(c.els),
@@ -3996,6 +4010,10 @@ pub const Parser = struct {
                     }
                     _ = try self.expect(.rparen);
                     const lower = try std.ascii.allocLowerString(self.arena, t.text);
+                    // An aggregate folds one argument; a second used to be dropped
+                    // without a word, so `SUM(x, id)` answered `SUM(x)`.
+                    if (aggregates.lookup(lower)) |f| if (args.items.len > aggregates.spec(f).max_args)
+                        return self.fail(.{ .line = t.line, .col = t.col }, "`{s}` takes one argument, not {d}", .{ lower, args.items.len });
                     // the name alone: an error about the call is about its name
                     const name_span = ast.Span{ .start = .{ .line = t.line, .col = t.col }, .end = .{ .line = t.end_line, .col = t.end_col } };
                     return self.mk(.{ .call = .{ .name = lower, .args = try args.toOwnedSlice(), .distinct = call_distinct, .span = name_span } });
@@ -4218,6 +4236,35 @@ test "sql: EXPLAIN ANALYZE and EXPLAIN LOAD INTO as later statements" {
     const w = prog.stmts[3].explain.pipeline.stages[prog.stmts[3].explain.pipeline.stages.len - 1];
     try testing.expectEqualStrings("csv", w.node.write.connector);
     try testing.expectEqualStrings("out.csv", w.node.write.target);
+}
+
+test "sql: an aggregate refuses a second argument instead of dropping it" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT SUM(x, id) AS s FROM 'in.csv';", &diag));
+    try testing.expectEqualStrings("`sum` takes one argument, not 2", diag.msg);
+    try testing.expectEqual(@as(u32, 8), diag.col);
+    // Inside an expression too, where the call is lifted out of it.
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT round(stddev(x, 2), 2) AS s FROM 'in.csv';", &diag));
+    try testing.expectEqualStrings("`stddev` takes one argument, not 2", diag.msg);
+    _ = try parseSource(a, "SELECT COUNT(*) AS a, COUNT(DISTINCT x) AS b, SUM(x) AS c FROM 'in.csv';", &diag);
+}
+
+test "sql: an aggregate with no window form says so before OVER" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    // It used to parse as a plain aggregate and blame a GROUP BY the query never had.
+    inline for (.{ "median", "stddev" }) |f| {
+        try testing.expectError(error.ParseFailed, parseSource(a, "SELECT g, " ++ f ++ "(x) OVER (PARTITION BY g) AS s FROM 'in.csv';", &diag));
+        try testing.expect(std.mem.startsWith(u8, diag.msg, "`" ++ f ++ "` is not a window function"));
+        try testing.expectEqual(@as(u32, 11), diag.col);
+    }
+    _ = try parseSource(a, "SELECT g, median(x) AS m FROM 'in.csv' GROUP BY g;", &diag);
+    _ = try parseSource(a, "SELECT g, x, SUM(x) OVER (PARTITION BY g ORDER BY x) AS s FROM 'in.csv';", &diag);
 }
 
 test "sql: EXPLAIN COSTS is rejected in either position" {

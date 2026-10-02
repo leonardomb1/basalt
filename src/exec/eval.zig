@@ -36,6 +36,9 @@ pub const TypeCtx = struct {
             .str_lit => return Type.init(.string),
             .field => |q| {
                 self.span = q.span;
+                // Every bound `$name` was replaced by its value before typing; one
+                // still here names nothing, and is never read as the column it spells.
+                if (q.dollar) return self.err("unknown `${s}`: no PARAM, LET or loop variable of that name", .{q.parts[0]});
                 if (q.safe.len > 0) return self.err("`?.` (safe navigation) only applies to JSON-param paths, not column `{s}`", .{lastPart(q)});
                 const idx = fieldIndex(self.schema, q) orelse
                     return self.err("unknown field `{s}`", .{lastPart(q)});

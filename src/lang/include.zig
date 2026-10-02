@@ -327,6 +327,26 @@ test "@include prepends a decls file to the including script" {
     try testing.expect(prog.stmts[2] == .output);
 }
 
+test "@include: an included PARAM may sit beside an aggregate, as a local one may" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try writeFile(&tmp, "lib/params.sql", "PARAM tag STRING DEFAULT 'x';\n");
+
+    // The main file is parsed without the included declarations, and used to
+    // call `$tag` "neither an aggregate nor a grouping key".
+    var diag: Diag = .{};
+    const prog = try loadProgram(a,
+        \\@include 'lib/params.sql';
+        \\SELECT $tag AS t, g, COUNT(*) AS n FROM 'in.csv' GROUP BY g;
+    , "main.sql", base, &diag);
+    try testing.expect(prog.stmts[1] == .param);
+    try testing.expect(prog.stmts[2] == .output);
+}
+
 test "@include keeps a leading CREATE ENDPOINT at stmts[0]" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

@@ -74,6 +74,8 @@ pub const Spec = struct {
     names: []const []const u8,
     arg: Arg,
     result: Result,
+    /// How many arguments the call may pass; the parser refuses more.
+    max_args: u8 = 1,
 };
 
 /// In `AggFunc` order — `spec` indexes it by the enum's value.

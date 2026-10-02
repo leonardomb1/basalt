@@ -967,7 +967,7 @@ const Ctx = struct {
             if (cur) |c| {
                 cur = try self.propagate(c, st.node);
                 si.out_schema = cur;
-            }
+            } else try self.checkUnbound(st.node);
             try stage_infos.append(si);
         }
 
@@ -1089,9 +1089,46 @@ const Ctx = struct {
         var cur: ?types.Schema = src.schema orelse return null;
         for (b.stages[1..]) |st| {
             errdefer self.diag.stamp(st.pos);
-            if (cur) |c| cur = try self.propagate(c, st.node);
+            if (cur) |c| {
+                cur = try self.propagate(c, st.node);
+            } else try self.checkUnbound(st.node);
         }
         return cur;
+    }
+
+    /// A stage past the point the schema is known is not typed, but a `$name`
+    /// that no PARAM, LET or loop variable binds is wrong whatever the columns
+    /// turn out to be — so `check` says so offline too, not only the run.
+    fn checkUnbound(self: *Ctx, node: ast.Stage.Node) Error!void {
+        switch (node) {
+            .filter => |p| try self.unboundIn(p),
+            .select => |items| for (items) |it| if (it == .computed) try self.unboundIn(it.computed.expr),
+            .aggregate => |ag| for (ag.aggs) |a| if (a.arg) |e| try self.unboundIn(e),
+            else => {},
+        }
+    }
+
+    fn unboundIn(self: *Ctx, e: *const ast.Expr) Error!void {
+        const Find = struct {
+            arena: std.mem.Allocator,
+            found: *?ast.QualName,
+            fn recur(f: @This(), x: *const ast.Expr) Error!*ast.Expr {
+                if (x.* == .field) {
+                    if (x.field.dollar and f.found.* == null) f.found.* = x.field;
+                    return @constCast(x);
+                }
+                return ast.rebuildExpr(f.arena, x, f, recur);
+            }
+        };
+        var found: ?ast.QualName = null;
+        _ = try Find.recur(.{ .arena = self.arena, .found = &found }, try substExpr(self.arena, e, self.params));
+        const q = found orelse return;
+        const err = fail(self.diag, "unknown `${s}`: no PARAM, LET or loop variable of that name", .{q.parts[0]});
+        if (q.span) |sp| {
+            self.diag.pos = sp.start;
+            self.diag.end = sp.end;
+        }
+        return err;
     }
 
     /// Output schema after a stage (type-checking expressions along the way).
@@ -2131,6 +2168,36 @@ test "analyze rejects `is empty` on a non-string operand" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     try expectAnalyzeErr(ar.allocator(), "id,amount\n1,100\n", "SELECT * FROM '$IN' WHERE CAST(amount AS INT) IS EMPTY");
+}
+
+test "analyze: an undeclared `$name` is refused by name, never read as the column it spells" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // The file has a `tag` column; `$tag` used to read it.
+    var diag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyzeCsv(a, "id,tag\n1,x\n", "SELECT $tag AS t FROM '$IN'", &diag));
+    try std.testing.expectEqualStrings("unknown `$tag`: no PARAM, LET or loop variable of that name", diag.msg);
+    // Beside an aggregate the parser lifts it as a constant; the name is still refused.
+    var grouped = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyzeCsv(a, "id,g\n1,x\n", "SELECT $tag AS t, g, COUNT(*) AS n FROM '$IN' GROUP BY g", &grouped));
+    try std.testing.expectEqualStrings("unknown `$tag`: no PARAM, LET or loop variable of that name", grouped.msg);
+    // Over a SQL table `check` cannot type the stages, but an unbound name is
+    // wrong whatever the columns are — while a PARAM, a query LET and a loop
+    // variable all stay fine.
+    const conn = "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', user = 'u', password = 'p', database = 'd');\n";
+    var sql_diag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, conn ++ "LOAD INTO '/tmp/x.csv' AS SELECT id FROM pg.orders WHERE day >= $since;"), &sql_diag));
+    try std.testing.expectEqualStrings("unknown `$since`: no PARAM, LET or loop variable of that name", sql_diag.msg);
+    var ok = Diag{};
+    _ = try analyze(a, try parse(a, conn ++
+        \\PARAM since DATE DEFAULT '2026-01-01';
+        \\LET hi = (SELECT max(id) AS m FROM pg.orders);
+        \\LOAD INTO '/tmp/x.csv' AS SELECT id, $since AS s FROM pg.orders WHERE day >= $since AND id <= $hi;
+        \\FOR EACH ROW OF (SELECT 'a' AS r) AS (r)
+        \\  LOAD INTO '/tmp/y.csv' AS SELECT id FROM pg.orders WHERE region = $r;
+        \\END FOR;
+    ), &ok);
 }
 
 test "analyze: a numeric aggregate refuses a non-numeric argument at plan time" {

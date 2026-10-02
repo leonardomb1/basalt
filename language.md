@@ -272,10 +272,12 @@ mini-DuckDB.
 
 ```sql
 WITH pedidos AS (                          -- CTE = named binding
-  SELECT filial, num, valor
+  SELECT filial, num, valor, obra
   FROM erp.dbo.SC5010
     PUSHDOWN($$D_E_L_E_T_ <> '*'$$)        -- raw predicate, verbatim to the source
   WHERE valor > 0                          -- translated predicate
+), obras AS (                              -- a join's right side is a CTE
+  SELECT codigo_obra, nome_obra FROM erp.dbo.obras
 )
 SELECT p.filial, p.num, o.nome_obra
 FROM pedidos p
@@ -781,6 +783,7 @@ call like `now()`, or a `$param` / `$let`. That is how an aggregate result carri
 a run id or a tenant tag:
 
 ```sql
+PARAM tag STRING DEFAULT 'acme';
 LET run_ts = now();
 SELECT $tag AS tenant, $run_ts AS loaded_at, region, COUNT(*) AS orders
 FROM 'orders.parquet' GROUP BY region;
@@ -1058,7 +1061,9 @@ time. Bare names are row/local scope — columns, `LET … IN` bindings, aliases
 and a PARAM, LET or loop variable never stands in for one: with `PARAM region`,
 `WHERE region = 'West'` filters on the column and `WHERE region = $region` on
 the parameter. Among `$` names the innermost binding wins: loop var >
-LET/PARAM.
+LET/PARAM. A `$name` that nothing binds is a plan-time error naming it — never
+the column it happens to spell — and `check` reports it even over a table whose
+columns it has not seen.
 
 - `$name` — see the scope rule above. `$job.a?.b` navigates a JSON param.
 - Bitwise (INT only, engine-side — never pushed down): `& | ^ << >>`, unary
