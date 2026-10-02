@@ -435,8 +435,12 @@ Source clauses, in any order after the source:
   selecting `C5_NUM AS num`, sends `"C5_NUM" > 5`. A conjunct naming a computed
   column (`x * 2 AS y`) stays above the list, the others still move. Rows a
   moved filter removes are no longer evaluated by the list, so a computed column
-  that would have failed on one of them no longer fails the query. Every filter
-  of a binding read as a `JOIN`'s right side stays in the engine (§11).
+  that would have failed on one of them no longer fails the query. A CTE,
+  derived table or table function read as a `JOIN`'s right side is readied the
+  same way — its own WHERE descends into its read and only the columns it uses
+  are asked for — so `JOIN itens($filial) i` reads that branch's rows, not the
+  table. A filter written *after* the join on the right side's columns (`WHERE
+  i.valor > 0`) stays above the join (§11).
 - **Text comparisons follow the column's collation**, so the source never keeps
   fewer rows than basalt would. basalt compares text byte by byte; a source
   compares by collation — case-insensitive by default on SQL Server and MySQL,
@@ -1658,9 +1662,8 @@ Accepted design not yet in the engine:
   `applyAggregation`/`applyJoin` do, and there is no runtime/dynamic filter — the
   build side's key values are not sent back to the probe scan, so a selective
   predicate on a *non-key* dimension column still reads the whole fact table.
-  And a CTE, derived table or table function used as a `JOIN`'s right side is
-  read without its own `WHERE` descending — only the one a query starts from
-  descends (§5).
+  And a filter written after a join on the right side's columns is not moved
+  into the right side's read; only the right side's own WHERE descends (§5).
 
 Deliberately partial:
 

@@ -75,6 +75,8 @@ const mem_connector = @import("connect.zig").mem_connector;
 const SplitCtx = @import("connect.zig").SplitCtx;
 
 const buildPipeline = @import("plan.zig").buildPipeline;
+const descendLeadingWhere = @import("plan.zig").descendLeadingWhere;
+const inlineHeadBindings = @import("plan.zig").inlineHeadBindings;
 const rebuildMapStages = @import("plan.zig").rebuildMapStages;
 const synthReconcile = @import("plan.zig").synthReconcile;
 const unionCanon = @import("plan.zig").unionCanon;
@@ -470,29 +472,6 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
     };
 }
 
-/// `stages` with the binding chain at its head replaced by the stages it stands
-/// for, while each link starts with a read. Not a binding already materialized
-/// (it is read back from memory), nor one holding a window: `windowTopK` needs
-/// to see that binding apart from the filter after it.
-pub fn inlineHeadBindings(env: *Env, stages_in: []const ast.Stage) ![]const ast.Stage {
-    var stages = stages_in;
-    var n: usize = 0;
-    while (stages[0].node == .ref and n < 16) : (n += 1) {
-        const name = stages[0].node.ref;
-        if (env.materialized.contains(name)) break;
-        const b = env.bindings.get(name) orelse break;
-        if (b.stages.len == 0 or b.stages[0].node != .read) break;
-        for (b.stages) |st| {
-            if (st.node == .window) return stages;
-        }
-        const joined = try env.arena.alloc(ast.Stage, b.stages.len + stages.len - 1);
-        @memcpy(joined[0..b.stages.len], b.stages);
-        @memcpy(joined[b.stages.len..], stages[1..]);
-        stages = joined;
-    }
-    return stages;
-}
-
 /// `runOutput` past the bookkeeping: plan and move the rows. Split off so the
 /// caller sees the error a load failed with, for its report.
 /// `SELECT ... FROM (SELECT k, SUM(v) FROM t GROUP BY k) x` — or the same through
@@ -598,22 +577,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     // path (serial or split lanes) renders its SQL from the stage.
     stages = try projectSqlRead(env, stages);
 
-    if (stages[0].node == .read) implicit: {
-        const rd = stages[0].node.read;
-        if (rd.form != .table and rd.form != .query) break :implicit;
-        const conn = env.connections.get(rd.connector) orelse break :implicit;
-        const d = (sqlConnInfo(conn) orelse break :implicit).dialect;
-        const facts = try factsIfWanted(env, rd, d, stages[1..], .{ .fields = &.{} }, false, .superset);
-        const extra = (try pushdown.serialWhereWith(arena, d, stages, facts, null)) orelse break :implicit;
-        const new_stages = try arena.dupe(ast.Stage, stages);
-        var nrd = rd;
-        nrd.where = if (rd.where.len > 0)
-            try std.fmt.allocPrint(arena, "({s}) AND ({s})", .{ rd.where, extra })
-        else
-            extra;
-        new_stages[0].node = .{ .read = nrd };
-        stages = new_stages;
-    }
+    stages = try descendLeadingWhere(env, stages);
 
     // Split lanes re-read each branch's source by key range, so an arm that is a
     // query rather than a table read has nothing to split; the serial union builds it.

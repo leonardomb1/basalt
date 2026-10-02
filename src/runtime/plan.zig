@@ -36,6 +36,8 @@ const OneBatch = @import("connect.zig").OneBatch;
 const openSource = @import("connect.zig").openSource;
 const openSourceProjected = @import("connect.zig").openSourceProjected;
 const projectSqlRead = @import("connect.zig").projectSqlRead;
+const factsIfWanted = @import("connect.zig").factsIfWanted;
+const sqlConnInfo = @import("connect.zig").sqlConnInfo;
 const exceptColumns = @import("connect.zig").exceptColumns;
 const sourceLabel = @import("connect.zig").sourceLabel;
 
@@ -1050,11 +1052,69 @@ pub fn joinBuildCap(env: *Env, hints: []const ast.Hint) !usize {
     return op.join_build_byte_cap;
 }
 
+/// `stages` with the binding chain at its head replaced by the stages it stands
+/// for, while each link starts with a read. Not a binding already materialized
+/// (it is read back from memory), nor one holding a window: `windowTopK` needs
+/// to see that binding apart from the filter after it.
+pub fn inlineHeadBindings(env: *Env, stages_in: []const ast.Stage) ![]const ast.Stage {
+    var stages = stages_in;
+    var n: usize = 0;
+    while (stages[0].node == .ref and n < 16) : (n += 1) {
+        const name = stages[0].node.ref;
+        if (env.materialized.contains(name)) break;
+        const b = env.bindings.get(name) orelse break;
+        if (b.stages.len == 0 or b.stages[0].node != .read) break;
+        for (b.stages) |st| {
+            if (st.node == .window) return stages;
+        }
+        const joined = try env.arena.alloc(ast.Stage, b.stages.len + stages.len - 1);
+        @memcpy(joined[0..b.stages.len], b.stages);
+        @memcpy(joined[b.stages.len..], stages[1..]);
+        stages = joined;
+    }
+    return stages;
+}
+
+/// The implicit pushdown: the contiguous WHERE right after a SQL read, translated
+/// into that read's own query. `stages` as they were when nothing descends.
+pub fn descendLeadingWhere(env: *Env, stages: []const ast.Stage) ![]const ast.Stage {
+    if (stages[0].node != .read) return stages;
+    const arena = env.arena;
+    const rd = stages[0].node.read;
+    if (rd.form != .table and rd.form != .query) return stages;
+    const conn = env.connections.get(rd.connector) orelse return stages;
+    const d = (sqlConnInfo(conn) orelse return stages).dialect;
+    const facts = try factsIfWanted(env, rd, d, stages[1..], .{ .fields = &.{} }, false, .superset);
+    const extra = (try pushdown.serialWhereWith(arena, d, stages, facts, null)) orelse return stages;
+    const out = try arena.dupe(ast.Stage, stages);
+    var nrd = rd;
+    nrd.where = if (rd.where.len > 0)
+        try std.fmt.allocPrint(arena, "({s}) AND ({s})", .{ rd.where, extra })
+    else
+        extra;
+    out[0].node = .{ .read = nrd };
+    return out;
+}
+
+/// A join's right side, readied the way the pipeline a query starts from is
+/// (`runOutputBody`): its binding chain laid out, `$params` bound, filters moved
+/// as early as projections and joins allow, the SQL read narrowed to the columns
+/// used and handed its WHERE. Without it, a CTE or table function joined in read
+/// its whole table and filtered it here.
+pub fn prepareJoinSide(env: *Env, stages_in: []const ast.Stage) ![]const ast.Stage {
+    if (stages_in.len == 0) return stages_in;
+    var stages = try inlineHeadBindings(env, stages_in);
+    stages = try analyze.substFilterParams(env.arena, stages, env.params_expr);
+    if (try pushdown.hoistFilters(env.arena, env.gpa, stages, env.bindings)) |h| stages = h;
+    stages = try projectSqlRead(env, stages);
+    return descendLeadingWhere(env, stages);
+}
+
 fn buildJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, left_schema: types.Schema, probe: op.Op) anyerror!PipeRes {
     const arena = env.arena;
     if (env.bindings.get(j.binding) == null)
         return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown binding `{s}` in join", .{j.binding}));
-    const build = try buildPipeline(env, env.bindings.get(j.binding).?.stages);
+    const build = try buildPipeline(env, try prepareJoinSide(env, env.bindings.get(j.binding).?.stages));
 
     var ad = analyze.Diag{};
     const jp = analyze.joinPlan(arena, left_schema, build.schema, j, &ad) catch |e| return aErr(env, &ad, e);
@@ -1212,4 +1272,44 @@ fn jsonToStr(arena: std.mem.Allocator, v: std.json.Value) ![]const u8 {
         .number_string, .string => |s| s,
         .array, .object => try std.json.Stringify.valueAlloc(arena, v, .{}),
     };
+}
+
+test "prepareJoinSide: a CTE joined in reads its table with its own WHERE, its columns narrowed" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const parser = @import("../lang/sql_parser.zig");
+    const env_mod = @import("env.zig");
+
+    // A join's right side was built from its binding's stages as they stood, so the
+    // SQL read under it carried no WHERE and the whole table crossed the wire.
+    var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a,
+        \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');
+        \\WITH c AS (SELECT cid, name AS nm FROM pg.public.customers WHERE active = 1)
+        \\SELECT o.id, c.nm FROM 'o.csv' o JOIN c ON o.id = c.cid;
+    , &pd);
+    var params = std.StringHashMap(Value).init(a);
+    var bindings = std.StringHashMap(ast.Pipeline).init(a);
+    var connections = std.StringHashMap(ast.Connection).init(a);
+    for (prog.stmts) |st| switch (st) {
+        .connection => |c| try connections.put(c.name, c),
+        .binding => |b| try bindings.put(b.name, b.pipeline),
+        else => {},
+    };
+    var sources = std.array_list.Managed(@import("../connect/driver.zig").Source).init(a);
+    var diag = env_mod.Diag{};
+    var log = obs.Logger.init(0, .text, .err);
+    var params_expr = std.StringHashMap(*const ast.Expr).init(a);
+    var errctx = op.ErrCtx{};
+    var rows = obs.RowCounter.init(0);
+    var json = std.StringHashMap(std.json.Value).init(a);
+    const fns = std.StringHashMap(ast.FnDecl).init(a);
+    var env = Env{ .arena = a, .gpa = a, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = null, .diag = &diag, .log = &log, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows, .json_params = &json, .fns = &fns };
+
+    const side = [_]ast.Stage{.{ .node = .{ .ref = "c" }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } }};
+    const out = try prepareJoinSide(&env, &side);
+    const rd = out[0].node.read;
+    try std.testing.expectEqualStrings("(\"active\" = 1)", rd.where);
+    try std.testing.expectEqual(@as(usize, 3), rd.cols.len);
 }
