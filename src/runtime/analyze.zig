@@ -440,6 +440,10 @@ pub const Stage = struct {
     kind: []const u8,
     detail: []const u8,
     breaker: bool,
+    /// A join's right side, when it is a SQL read: what it scans and the WHERE it
+    /// sends (`plan.prepareJoinSide`), shown under the join.
+    right_scan: ?[]const u8 = null,
+    right_pushdown: []const u8 = "",
     /// Output schema after this stage — filled by the type-flow layer (later).
     out_schema: ?types.Schema = null,
 };
@@ -892,24 +896,9 @@ const Ctx = struct {
         // plan that runs — a filter shown below a join really did descend, and one
         // shown above it really did not.
         if (pipe.stages.len == 0) return fail(self.diag, "empty pipeline", .{});
-        // As the runtime does (`run.inlineHeadBindings`): a binding at the head is
-        // laid out in front of the rest, so its WHERE is shown descending.
-        var via: ?[]const u8 = null;
-        var head = pipe.stages;
-        var n: usize = 0;
-        while (head[0].node == .ref and n < 16) : (n += 1) {
-            const b = self.bindings.get(head[0].node.ref) orelse break;
-            if (b.stages.len == 0 or b.stages[0].node != .read) break;
-            if (for (b.stages) |st| {
-                if (st.node == .window) break true;
-            } else false) break;
-            via = via orelse head[0].node.ref;
-            const joined = try self.arena.alloc(ast.Stage, b.stages.len + head.len - 1);
-            @memcpy(joined[0..b.stages.len], b.stages);
-            @memcpy(joined[b.stages.len..], head[1..]);
-            head = joined;
-        }
-        const stages = (pushdown.hoistFilters(self.arena, self.arena, head, self.bindings) catch null) orelse head;
+        const head = try self.inlineHead(pipe.stages);
+        const via = head.via;
+        const stages = (pushdown.hoistFilters(self.arena, self.arena, head.stages, self.bindings) catch null) orelse head.stages;
         if (stages[stages.len - 1].node != .write)
             return fail(self.diag, "a top-level pipeline must end in `write`", .{});
         for (stages) |st| try checkStageLiterals(self.diag, st);
@@ -921,35 +910,15 @@ const Ctx = struct {
         if (via) |name| source.detail = try std.fmt.allocPrint(self.arena, "{s} (via binding {s})", .{ source.detail, name });
 
         var top_n: ?pushdown.ExplainedTopN = null;
-        if (stages[0].node == .read) {
-            const rd = stages[0].node.read;
-            if ((rd.form == .table or rd.form == .query))
-                if (self.connections.get(rd.connector)) |conn| {
-                    if (dialectOf(conn.connector)) |d| {
-                        var raw: []const u8 = rd.where;
-                        for (stages[0].hints) |h| {
-                            if (std.mem.eql(u8, h.key, "where") and h.value == .str) raw = h.value.str;
-                        }
-                        // what runs pushes the params' values, so the plan shows them
-                        const bound = try substFilterParams(self.arena, stages, self.params);
-                        var wants = false;
-                        const implicit = pushdown.serialWhereWith(self.arena, d, bound, null, &wants) catch null;
-                        source.pushdown = try composePushdown(self.arena, raw, implicit);
-                        // analysis does not connect, and a text comparison's descent
-                        // is the column's collation's to decide
-                        if (wants) source.pushdown = if (source.pushdown.len > 0)
-                            try std.fmt.allocPrint(self.arena, "{s}; text comparisons decided by the collation at run time", .{source.pushdown})
-                        else
-                            "text comparisons decided by the collation at run time";
-                        if (try pushdown.explainTopN(self.arena, d, bound[0 .. bound.len - 1])) |t| {
-                            top_n = t;
-                            source.pushdown = if (source.pushdown.len > 0)
-                                try std.fmt.allocPrint(self.arena, "{s}; {s}", .{ source.pushdown, t.text })
-                            else
-                                t.text;
-                        }
-                    }
-                };
+        if (try self.previewPushdown(stages)) |pv| {
+            source.pushdown = pv.where;
+            if (try pushdown.explainTopN(self.arena, pv.dialect, pv.bound[0 .. pv.bound.len - 1])) |t| {
+                top_n = t;
+                source.pushdown = if (source.pushdown.len > 0)
+                    try std.fmt.allocPrint(self.arena, "{s}; {s}", .{ source.pushdown, t.text })
+                else
+                    t.text;
+            }
         }
 
         var stage_infos = std.array_list.Managed(Stage).init(self.arena);
@@ -1213,7 +1182,67 @@ const Ctx = struct {
         if (self.bindings.get(j.binding) == null and self.knownTable(j.binding) == null)
             return fail(self.diag, "unknown binding `{s}` in join", .{j.binding});
         const d = try std.fmt.allocPrint(self.arena, "{s} {s}", .{ @tagName(j.kind), j.binding });
-        return .{ .kind = "join", .detail = d, .breaker = true };
+        var st = Stage{ .kind = "join", .detail = d, .breaker = true };
+        // The right side's read, readied as the runtime readies it
+        // (`plan.prepareJoinSide`), so the WHERE it sends is on the plan too.
+        const b = self.bindings.get(j.binding) orelse return st;
+        if (b.stages.len == 0) return st;
+        const head = try self.inlineHead(b.stages);
+        const stages = (pushdown.hoistFilters(self.arena, self.arena, head.stages, self.bindings) catch null) orelse head.stages;
+        if (stages[0].node != .read) return st;
+        var src = self.resolveSource(stages[0]) catch return st;
+        st.right_scan = try std.fmt.allocPrint(self.arena, "{s}  {s} (via binding {s})", .{ sinkKind(src), src.detail, head.via orelse j.binding });
+        if (try self.previewPushdown(stages)) |pv| src.pushdown = pv.where;
+        st.right_pushdown = src.pushdown;
+        return st;
+    }
+
+    /// The binding chain at the head of `stages` laid out in front of the rest, as
+    /// the runtime does (`plan.inlineHeadBindings`) — so a binding's WHERE is shown
+    /// descending. `via` is the first binding laid out, if any.
+    fn inlineHead(self: *Ctx, stages_in: []const ast.Stage) !struct { stages: []const ast.Stage, via: ?[]const u8 } {
+        var via: ?[]const u8 = null;
+        var head = stages_in;
+        var n: usize = 0;
+        while (head[0].node == .ref and n < 16) : (n += 1) {
+            const b = self.bindings.get(head[0].node.ref) orelse break;
+            if (b.stages.len == 0 or b.stages[0].node != .read) break;
+            if (for (b.stages) |st| {
+                if (st.node == .window) break true;
+            } else false) break;
+            via = via orelse head[0].node.ref;
+            const joined = try self.arena.alloc(ast.Stage, b.stages.len + head.len - 1);
+            @memcpy(joined[0..b.stages.len], b.stages);
+            @memcpy(joined[b.stages.len..], head[1..]);
+            head = joined;
+        }
+        return .{ .stages = head, .via = via };
+    }
+
+    /// What the SQL read leading `stages` would be sent as its WHERE — a raw
+    /// `PUSHDOWN`, AND the contiguous filters after it — with the params' values
+    /// in, as the run sends them. Null when the lead is no SQL read.
+    fn previewPushdown(self: *Ctx, stages: []const ast.Stage) !?struct { where: []const u8, dialect: Dialect, bound: []const ast.Stage } {
+        if (stages[0].node != .read) return null;
+        const rd = stages[0].node.read;
+        if (rd.form != .table and rd.form != .query) return null;
+        const conn = self.connections.get(rd.connector) orelse return null;
+        const d = dialectOf(conn.connector) orelse return null;
+        var raw: []const u8 = rd.where;
+        for (stages[0].hints) |h| {
+            if (std.mem.eql(u8, h.key, "where") and h.value == .str) raw = h.value.str;
+        }
+        const bound = try substFilterParams(self.arena, stages, self.params);
+        var wants = false;
+        const implicit = pushdown.serialWhereWith(self.arena, d, bound, null, &wants) catch null;
+        var where = try composePushdown(self.arena, raw, implicit);
+        // analysis does not connect, and a text comparison's descent is the
+        // column's collation's to decide
+        if (wants) where = if (where.len > 0)
+            try std.fmt.allocPrint(self.arena, "{s}; text comparisons decided by the collation at run time", .{where})
+        else
+            "text comparisons decided by the collation at run time";
+        return .{ .where = where, .dialect = d, .bound = bound };
     }
 
     fn selectDetail(self: *Ctx, items: []const ast.SelectItem) ![]const u8 {
@@ -1265,6 +1294,14 @@ pub fn render(plan: Plan, w: anytype) !void {
                 try w.print("{s}\n", .{st.kind});
             }
             try printSchema(w, depth + 1, st.out_schema);
+            if (st.right_scan) |rs| {
+                try indent(w, depth + 1);
+                try w.print("right  scan  {s}\n", .{rs});
+                if (st.right_pushdown.len > 0) {
+                    try indent(w, depth + 2);
+                    try w.print("pushdown: {s}\n", .{st.right_pushdown});
+                }
+            }
         }
 
         depth += 1;
@@ -1845,6 +1882,27 @@ test "analyze pushdown preview: a CTE, derived table or table function at the he
     const w = try analyze(a, try parse(a, conn ++
         "LOAD INTO '/tmp/x.csv' AS WITH r AS (SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM pg.orders WHERE amount > 0) SELECT id FROM r WHERE rn = 1;"), &diag);
     try std.testing.expectEqualStrings("", w.outputs[0].source.pushdown);
+}
+
+test "analyze: EXPLAIN shows the WHERE a join's right side sends, under the join" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag = Diag{};
+    const plan = try analyze(a, try parse(a,
+        \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', user = 'u', password = 'p', database = 'd');
+        \\CREATE FUNCTION active(flag INT) RETURNS TABLE AS SELECT cid, name AS nm FROM pg.customers WHERE active = $flag;
+        \\LOAD INTO '/tmp/x.csv' AS SELECT o.id, c.nm FROM pg.orders o JOIN active(1) c ON o.cid = c.cid;
+    ), &diag);
+    var join: ?Stage = null;
+    for (plan.outputs[0].stages) |st| {
+        if (std.mem.eql(u8, st.kind, "join")) join = st;
+    }
+    try std.testing.expectEqualStrings("(\"active\" = 1)", join.?.right_pushdown);
+    var out = std.Io.Writer.Allocating.init(a);
+    try render(plan, &out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "right  scan  postgres  table customers (via binding __tvf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "pushdown: (\"active\" = 1)") != null);
 }
 
 test "analyze pushdown preview: raw PUSHDOWN AND-ed with the translated filter" {

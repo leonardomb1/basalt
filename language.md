@@ -1263,6 +1263,24 @@ A source whose schema only the source itself can describe — a database table, 
 remote object — reads `schema: unresolved`, said once at the scan rather than
 repeated down the tree. Neither form connects.
 
+A SQL read prints the WHERE it will send on a `pushdown:` line under its scan
+(§5). A join prints its right side's read on a `right` line under it, with that
+read's own `pushdown:` — so a CTE or table function joined in shows that it
+filters at the source:
+
+```console
+$ basalt run -c "... EXPLAIN SELECT o.id, c.nm FROM pg.orders o JOIN active(1) c ON o.cid = c.cid;"
+plan
+  write  stdout  (default)
+    select  id, nm
+      join  inner __tvf1_active
+        right  scan  postgres  table customers (via binding __tvf1_active)
+          pushdown: ("active" = 1)
+        scan  postgres  table orders
+          schema: unresolved
+  physical: split-parallel candidate
+```
+
 `EXPLAIN` is an ordinary statement: it goes anywhere a terminal `SELECT` or a
 `LOAD INTO` goes, and explains that one query against whatever the statements
 above it declared — connections, CTEs, `PARAM`s, `LET`s, functions. Everything
