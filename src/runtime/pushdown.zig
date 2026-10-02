@@ -1311,6 +1311,8 @@ fn sqlStr(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
 pub fn collectFields(e: *const ast.Expr, set: *std.StringHashMap(void)) !void {
     switch (e.*) {
         .field => |q| try set.put(q.parts[0], {}),
+        // the body's columns are the row's; its parameter is not one
+        .lambda => |l| try collectFields(l.body, set),
         .unary => |u| try collectFields(u.e, set),
         .binary => |b| {
             try collectFields(b.l, set);

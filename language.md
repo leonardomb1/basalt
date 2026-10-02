@@ -1156,6 +1156,37 @@ columns it has not seen.
   unquoted, objects and arrays as JSON text; a missing key, an index past the
   end or a JSON `null` is null. A cell that is not JSON is an error, not a
   null. `CAST(json_get(doc, 'n') AS INT)` for a typed value.
+- `JSON_FILTER(arr, x -> cond)`, `JSON_TRANSFORM(arr, x -> value)`,
+  `JSON_ANY(arr, x -> cond)`, `JSON_ALL(arr, x -> cond)` — work on a JSON array
+  in place, without `UNNEST` and re-aggregating: the lambda's body is evaluated
+  once per element with its parameter bound to it. `json_filter` keeps the
+  elements whose condition is true, as written; `json_transform` returns the
+  array of the body's values; `json_any` / `json_all` whether the condition is
+  true for some / every element (an empty array: false / true). A nested
+  Parquet list reads as exactly such an array.
+
+  ```sql
+  SELECT id,
+         json_filter(tags, t -> t LIKE 'vip%')                    AS vip_tags,
+         json_transform(items, i -> json_get(i, 'sku'))           AS skus,
+         json_any(items, i -> CAST(json_get(i, 'qty') AS INT) = 0) AS has_empty_line
+  FROM 'orders.parquet'
+  WHERE json_any(tags, t -> t = 'new');
+  ```
+
+  An element is the parameter as itself — a number is a number (`x > 5`), a
+  string a string, `true`/`false` a BOOL — and an object or array is its JSON
+  text, which `json_get` and these functions take apart (lambdas nest). The body
+  may name the row's columns too (`t -> t = region`); the parameter shadows a
+  column of its name. In `json_transform`'s result, text that is a JSON object
+  or array (what `json_get` returns for one) goes in as that object or array,
+  any other text as a string. An element the body cannot compare — a number
+  against text, in an array that mixes kinds — counts as null (the condition is
+  not true; `json_transform` puts `null`); a failing `CAST` still fails the run.
+  A null cell is null; a cell that is JSON but not an array is an error. A
+  lambda is an argument of these four functions only, and never descends to a
+  SQL source — the row is filtered here, while the rest of its WHERE still
+  descends.
 - `TRY_CAST(x AS T)` — CAST that yields null instead of failing on a bad
   value; the workhorse for dirty inputs. Never pushed down.
 - `CAST(x AS TIME)` takes `'HH:MM:SS[.ffffff]'` or `'HH:MM'` text, or a

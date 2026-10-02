@@ -559,6 +559,7 @@ fn checkLiteralArgs(diag: *Diag, e: *const ast.Expr) Error!void {
             try checkLiteralArgs(diag, l.value);
             try checkLiteralArgs(diag, l.body);
         },
+        .lambda => |l| try checkLiteralArgs(diag, l.body),
         .match => |m| {
             if (m.subject) |s| try checkLiteralArgs(diag, s);
             for (m.arms) |arm| {
@@ -721,7 +722,8 @@ fn anyDynamicName(names: []const ast.QualName) bool {
 
 fn exprHasDynamicName(e: *const ast.Expr) bool {
     return switch (e.*) {
-        .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit => false,
+        .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit, .lambda_var => false,
+        .lambda => |l| exprHasDynamicName(l.body),
         .field => |q| isDynamicName(q),
         .unary => |u| exprHasDynamicName(u.e),
         .binary => |b| exprHasDynamicName(b.l) or exprHasDynamicName(b.r),

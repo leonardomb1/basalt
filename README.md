@@ -67,7 +67,9 @@ server that ignores `Range` is handled by falling back to a single whole-object
 fetch. Column types follow the file's `LogicalType`, so the naive and nanosecond
 timestamps polars, DuckDB, Spark and pyarrow write read as timestamps. Nested
 columns — lists, lists of structs, maps, at any depth — read as JSON text that
-`UNNEST(JSON_EACH(col))` and `json_get` take apart; no column is left out.
+`UNNEST(JSON_EACH(col))` and `json_get` take apart, or that `json_filter(col, x ->
+…)`, `json_transform`, `json_any` and `json_all` work on in place; no column is
+left out.
 
 Arrow IPC is the fast way to hand a dataframe over: the file is memory-mapped
 and copied out, with no encode or decode step. polars' `write_ipc` and pyarrow's

@@ -228,7 +228,13 @@ pub const Lexer = struct {
             ';' => return self.make(.semi, self.src[start..self.i], line, col),
             '*' => return self.make(.star, self.src[start..self.i], line, col),
             '+' => return self.make(.plus, self.src[start..self.i], line, col),
-            '-' => return self.make(.minus, self.src[start..self.i], line, col),
+            '-' => {
+                if (self.i < self.src.len and self.src[self.i] == '>') {
+                    self.i += 1;
+                    return self.make(.arrow, self.src[start..self.i], line, col);
+                }
+                return self.make(.minus, self.src[start..self.i], line, col);
+            },
             '/' => return self.make(.slash, self.src[start..self.i], line, col),
             '%' => return self.make(.percent, self.src[start..self.i], line, col),
             '&' => return self.make(.amp, self.src[start..self.i], line, col),

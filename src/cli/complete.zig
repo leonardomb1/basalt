@@ -97,6 +97,10 @@ pub const builtin_functions = [_]Builtin{
     .{ .name = "to_timestamp", .sig = "to_timestamp(seconds)" },
     .{ .name = "strftime", .sig = "strftime(ts, format)" },
     .{ .name = "json_get", .sig = "json_get(json, path)" },
+    .{ .name = "json_filter", .sig = "json_filter(array, x -> condition)" },
+    .{ .name = "json_transform", .sig = "json_transform(array, x -> value)" },
+    .{ .name = "json_any", .sig = "json_any(array, x -> condition)" },
+    .{ .name = "json_all", .sig = "json_all(array, x -> condition)" },
     // aggregate (the five that also run over a window say so)
     .{ .name = "count", .sig = "count(* | x) [OVER (…)]" },
     .{ .name = "sum", .sig = "sum(x) [OVER (…)]" },

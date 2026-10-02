@@ -33,6 +33,8 @@ pub const Tag = enum {
 
     assign,
     fat_arrow,
+    /// `->`: a lambda's parameter from its body, `t -> t LIKE 'vip%'`.
+    arrow,
     eq,
     ne,
     lt,
@@ -80,6 +82,7 @@ pub const Tag = enum {
             .star => "'*'",
             .assign => "'='",
             .fat_arrow => "'=>'",
+            .arrow => "'->'",
             .eq => "'=='",
             .ne => "'!='",
             .lt => "'<'",

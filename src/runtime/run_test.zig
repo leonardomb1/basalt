@@ -3376,6 +3376,40 @@ test "table functions: defaults, a join side, two calls with their own CTEs, one
     }
 }
 
+test "JSON array lambdas: filter, transform, any, all — elements as themselves, mixed kinds null, nested" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const input =
+        \\id|tags|items
+        \\1|["vip-gold","new","vip-silver"]|[{"sku":"A1","qty":2,"dims":{"w":1}},{"sku":"B2","qty":0}]
+        \\2|["new"]|[]
+        \\3||[{"sku":"C3","qty":5}]
+        \\4|[1,7,12]|[{"sku":"D4","qty":1}]
+        \\
+    ;
+    const got = try runToString(alloc, &tmp, input,
+        \\SELECT id,
+        \\       json_filter(tags, t -> t LIKE 'vip%') AS vip,
+        \\       json_transform(items, i -> json_get(i, 'sku')) AS skus,
+        \\       json_transform(items, i -> json_get(i, 'dims')) AS dims,
+        \\       json_any(items, i -> CAST(json_get(i, 'qty') AS INT) = 0) AS zero,
+        \\       json_all(tags, t -> t = 'new') AS only_new,
+        \\       json_filter(tags, t -> t > id + 5) AS big,
+        \\       json_transform(items, i -> json_any(tags, t -> t LIKE 'vip%')) AS nested
+        \\FROM '$IN' WITH (delimiter = '|') ORDER BY id
+    );
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings(
+        \\id,vip,skus,dims,zero,only_new,big,nested
+        \\1,"[""vip-gold"",""vip-silver""]","[""A1"",""B2""]","[{""w"":1},null]",true,false,[],"[true,true]"
+        \\2,[],[],[],false,true,[],[]
+        \\3,,"[""C3""]",[null],false,,,[null]
+        \\4,[],"[""D4""]",[null],false,false,[12],[false]
+        \\
+    , got);
+}
+
 test "csv: a column of ISO dates is inferred as DATE (empty cells are null)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

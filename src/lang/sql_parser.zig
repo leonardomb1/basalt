@@ -318,6 +318,9 @@ pub const Parser = struct {
     /// The table-function call whose body is being parsed, if any.
     tvf: ?*TableFrame = null,
     tvf_depth: usize = 0,
+    /// The parameters of the lambdas whose bodies are being parsed, innermost last.
+    lambda_names: [8][]const u8 = undefined,
+    lambda_n: usize = 0,
     conn_names: std.array_list.Managed([]const u8) = undefined,
     /// Parallel to `conn_names`: each connection's connector type, which `SHOW
     /// TABLES` needs to phrase its catalog query.
@@ -2719,7 +2722,8 @@ pub const Parser = struct {
     fn containsExpr(e: *const ast.Expr, needle: *const ast.Expr) bool {
         if (e == needle) return true;
         return switch (e.*) {
-            .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit, .field => false,
+            .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit, .field, .lambda_var => false,
+            .lambda => |l| containsExpr(l.body, needle),
             .unary => |u| containsExpr(u.e, needle),
             .binary => |b| containsExpr(b.l, needle) or containsExpr(b.r, needle),
             .is_null => |n| containsExpr(n.e, needle),
@@ -3456,6 +3460,8 @@ pub const Parser = struct {
     fn collectFields(self: *Parser, e: *const ast.Expr, out: *std.array_list.Managed(ast.QualName)) Error!void {
         switch (e.*) {
             .field => |q| out.append(q) catch return error.OutOfMemory,
+            .lambda => |l| try self.collectFields(l.body, out),
+            .lambda_var => {},
             .unary => |u| try self.collectFields(u.e, out),
             .binary => |b| {
                 try self.collectFields(b.l, out);
@@ -3567,6 +3573,14 @@ pub const Parser = struct {
                 try self.exprKey(c.els, buf);
                 buf.append(')') catch return error.OutOfMemory;
             },
+            // Rendered, not collapsed: `count_if(json_any(a, t -> t = 1))` and the
+            // same over `t = 2` are two aggregates, and one key would merge them.
+            .lambda => |l| {
+                buf.appendSlice(l.param) catch return error.OutOfMemory;
+                buf.appendSlice("->") catch return error.OutOfMemory;
+                try self.exprKey(l.body, buf);
+            },
+            .lambda_var => |n| buf.appendSlice(n) catch return error.OutOfMemory,
             // `match` and `let ... in` still collapse; they cannot appear as an
             // aggregate argument today, and a distinct key for them would need the
             // whole arm list rendered.
@@ -3646,6 +3660,9 @@ pub const Parser = struct {
             // in this file: an `@include`d PARAM is parsed elsewhere, and a name
             // nothing binds is refused by name at plan time.
             .field => |q| q.dollar,
+            // a lambda is constant when its body is, its parameter included
+            .lambda => |l| self.constItemExpr(l.body),
+            .lambda_var => true,
             .unary => |u| self.constItemExpr(u.e),
             .binary => |b| self.constItemExpr(b.l) and self.constItemExpr(b.r),
             .cond => |c| self.constItemExpr(c.cond) and self.constItemExpr(c.then) and self.constItemExpr(c.els),
@@ -3817,6 +3834,32 @@ pub const Parser = struct {
             }
         };
         return S.recur(.{ .p = self, .aliases = aliases }, e);
+    }
+
+    /// One argument of a call: an expression, or a lambda `param -> body` — which
+    /// only the JSON array functions accept; anywhere else the type-checker says so.
+    fn parseCallArg(self: *Parser) Error!*ast.Expr {
+        if (!(self.at(.ident) and self.peekTag() == .arrow)) return self.parseExpr();
+        const pos = self.curPos();
+        const param = self.advance().text;
+        _ = self.advance();
+        if (self.lambda_n == self.lambda_names.len)
+            return self.fail(pos, "lambdas nest more than {d} deep", .{self.lambda_names.len});
+        self.lambda_names[self.lambda_n] = param;
+        self.lambda_n += 1;
+        defer self.lambda_n -= 1;
+        const body = try self.parseExpr();
+        return self.mk(.{ .lambda = .{ .param = param, .body = body } });
+    }
+
+    /// The lambda parameter `name` refers to, innermost first, if any is in scope.
+    fn lambdaParam(self: *Parser, name: []const u8) ?[]const u8 {
+        var i = self.lambda_n;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.lambda_names[i], name)) return self.lambda_names[i];
+        }
+        return null;
     }
 
     fn parseExpr(self: *Parser) Error!*ast.Expr {
@@ -4201,8 +4244,8 @@ pub const Parser = struct {
                         if (self.at(.star) and self.peekTag() == .rparen) {
                             _ = self.advance();
                         } else {
-                            try args.append(try self.parseExpr());
-                            while (self.eat(.comma)) try args.append(try self.parseExpr());
+                            try args.append(try self.parseCallArg());
+                            while (self.eat(.comma)) try args.append(try self.parseCallArg());
                         }
                     }
                     _ = try self.expect(.rparen);
@@ -4215,6 +4258,11 @@ pub const Parser = struct {
                     const name_span = ast.Span{ .start = .{ .line = t.line, .col = t.col }, .end = .{ .line = t.end_line, .col = t.end_col } };
                     return self.mk(.{ .call = .{ .name = lower, .args = try args.toOwnedSlice(), .distinct = call_distinct, .span = name_span } });
                 }
+                // inside a lambda's body, its parameter — not a column of that name
+                if (self.peekTag() != .dot) if (self.lambdaParam(t.text)) |name| {
+                    _ = self.advance();
+                    return self.mk(.{ .lambda_var = name });
+                };
                 const q = try self.parseQualNameField();
                 return self.mk(.{ .field = q });
             },
@@ -4526,6 +4574,26 @@ test "sql: a table function call is checked where it is written" {
     try testing.expectEqual(@as(u32, 1), diag.line);
     try testing.expectError(error.ParseFailed, parseSource(a, "CREATE FUNCTION bad() RETURNS TABLE AS 1 + 1;", &diag));
     try testing.expectEqualStrings("`bad`: a table function's body is a query — SELECT ... or WITH ...", diag.msg);
+}
+
+test "sql: a lambda's parameter is its own node in the body, never a column" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parseSource(a, "SELECT json_filter(tags, t -> t = name AND t <> 'x') AS v FROM 'in.csv';", &diag);
+    const call = prog.stmts[1].output.stages[1].node.select[0].computed.expr.call;
+    const l = call.args[1].lambda;
+    try testing.expectEqualStrings("t", l.param);
+    const lhs = l.body.binary.l.binary;
+    try testing.expectEqualStrings("t", lhs.l.lambda_var);
+    // a column named in the body stays a column
+    try testing.expectEqualStrings("name", lhs.r.field.parts[0]);
+    // outside the lambda, `t` is a column again
+    const p2 = try parseSource(a, "SELECT json_any(tags, t -> t = 1) AS v, t FROM 'in.csv';", &diag);
+    try testing.expect(p2.stmts[1].output.stages[1].node.select[1] == .field);
+    // `->` was a syntax error before; `a - > b` still is
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT a - > b AS z FROM 'in.csv';", &diag));
 }
 
 test "sql: EXPLAIN COSTS is rejected in either position" {

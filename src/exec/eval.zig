@@ -79,6 +79,9 @@ pub const TypeCtx = struct {
                 return Type.init(.bool);
             },
             .let_in => return self.err("internal: `let … in` should have been expanded before type-checking", .{}),
+            .lambda => return self.err("a lambda (`x -> …`) is only an argument of json_filter, json_transform, json_any or json_all", .{}),
+            // The JSON array functions bind their parameter before typing the body.
+            .lambda_var => |n| return self.err("internal: lambda parameter `{s}` typed outside its function", .{n}),
         }
     }
 
@@ -308,7 +311,7 @@ fn evalVecNode(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch) Ve
         .cond => |c| return condVec(arena, c, batch),
         .call => |c| return callVec(arena, c, batch),
         .match => |m| return matchVec(arena, m, batch),
-        .let_in => return error.Unsupported,
+        .let_in, .lambda, .lambda_var => return error.Unsupported,
     }
 }
 
@@ -1191,7 +1194,9 @@ pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, ro
         },
         .match => |m| return evalMatch(arena, m, batch, row),
         .call => |c| return evalCall(arena, c, batch, row),
-        .let_in => return error.TypeMismatch,
+        // a lambda is evaluated only through the function it is an argument of,
+        // which binds its parameter first
+        .let_in, .lambda, .lambda_var => return error.TypeMismatch,
     }
 }
 
@@ -1445,6 +1450,71 @@ pub fn jsonToValue(arena: std.mem.Allocator, v: std.json.Value) EvalError!Value 
     };
 }
 
+/// A JSON array element as a lambda's parameter: numbers, booleans and strings as
+/// themselves — so `x > 5` compares numbers — and an object or array as its JSON
+/// text, which `json_get` and the array functions take apart.
+fn jsonElementValue(arena: std.mem.Allocator, v: std.json.Value) EvalError!Value {
+    return switch (v) {
+        .null => .null,
+        .bool => |b| .{ .bool = b },
+        .integer => |i| .{ .int = i },
+        .float => |f| .{ .float = f },
+        .string, .number_string => |s| .{ .string = s },
+        .object, .array => .{ .string = std.json.Stringify.valueAlloc(arena, v, .{}) catch return error.OutOfMemory },
+    };
+}
+
+/// A value `json_transform` puts in its array. Text that is a JSON object or array
+/// — what `json_get` returns for one — goes in as that object or array, not as a
+/// string holding its text; any other text is a JSON string.
+fn valueToJson(arena: std.mem.Allocator, v: Value) EvalError!std.json.Value {
+    return switch (v) {
+        .null => .null,
+        .bool => |b| .{ .bool = b },
+        .int => |i| .{ .integer = i },
+        .float => |f| .{ .float = f },
+        .decimal => .{ .number_string = try valueToString(arena, v) },
+        .string => |s| blk: {
+            const t = std.mem.trim(u8, s, " \t\r\n");
+            if (t.len > 0 and (t[0] == '{' or t[0] == '[')) {
+                if (std.json.parseFromSliceLeaky(std.json.Value, arena, t, .{})) |parsed| {
+                    if (parsed == .object or parsed == .array) break :blk parsed;
+                } else |_| {}
+            }
+            break :blk .{ .string = s };
+        },
+        else => .{ .string = try valueToString(arena, v) },
+    };
+}
+
+/// `body` with the lambda parameter `name` replaced by `v`, as a literal — how an
+/// element reaches the body. An inner lambda with the same parameter shadows it.
+pub fn bindLambda(arena: std.mem.Allocator, body: *const ast.Expr, name: []const u8, v: Value) error{OutOfMemory}!*ast.Expr {
+    const Bind = struct {
+        arena: std.mem.Allocator,
+        name: []const u8,
+        lit: *ast.Expr,
+        fn recur(b: @This(), e: *const ast.Expr) error{OutOfMemory}!*ast.Expr {
+            switch (e.*) {
+                .lambda_var => |n| if (std.mem.eql(u8, n, b.name)) return b.lit,
+                .lambda => |l| if (std.mem.eql(u8, l.param, b.name)) return @constCast(e),
+                else => {},
+            }
+            return ast.rebuildExpr(b.arena, e, b, recur);
+        }
+    };
+    const lit = try arena.create(ast.Expr);
+    lit.* = switch (v) {
+        .null => .null_lit,
+        .bool => |x| .{ .bool_lit = x },
+        .int => |x| .{ .int_lit = x },
+        .float => |x| .{ .float_lit = x },
+        .string => |x| .{ .str_lit = x },
+        else => .{ .str_lit = try valueToString(arena, v) },
+    };
+    return Bind.recur(.{ .arena = arena, .name = name, .lit = lit }, body);
+}
+
 /// 1 MiB ceiling on a single generated string (`repeat`, `lpad`/`rpad`), so
 /// `repeat(x, 1000000000)` is a clean error instead of an OOM or a stall.
 const max_str_bytes = 1 << 20;
@@ -1511,6 +1581,10 @@ pub const builtins = [_]Builtin{
     .{ .name = "to_timestamp", .type_fn = typing.toTimestamp, .eval_fn = per_row.toTimestamp },
     .{ .name = "strftime", .type_fn = typing.strftime, .eval_fn = per_row.strftime },
     .{ .name = "json_get", .type_fn = typing.jsonGet, .eval_fn = per_row.jsonGet },
+    .{ .name = "json_filter", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
+    .{ .name = "json_transform", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
+    .{ .name = "json_any", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
+    .{ .name = "json_all", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
 };
 
 /// The builtin called `name`, or null: unknown names and aggregates
@@ -1745,6 +1819,22 @@ const typing = struct {
         _ = try self.wantInt(c, 2, "n");
         // An empty delimiter yields null, so this is nullable either way.
         return Type.init(.string).asNullable();
+    }
+
+    /// `json_filter` / `json_transform` / `json_any` / `json_all`: a JSON array and
+    /// a lambda. The body is typed with its parameter as an untyped null — what an
+    /// element is, the data decides — and, but for `json_transform`, must be a
+    /// condition.
+    fn jsonLambda(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 2 or c.args[1].* != .lambda)
+            return self.err("`{s}` takes (json array, x -> {s})", .{ c.name, if (eq(c.name, "json_transform")) "value" else "condition" });
+        const a = try self.wantText(c, 0);
+        const l = c.args[1].lambda;
+        const bt = try self.typeOf(try bindLambda(self.arena, l.body, l.param, .null));
+        if (eq(c.name, "json_transform")) return Type.init(.string).asNullable();
+        if (!boolish(bt)) return self.err("`{s}`: the lambda must be a condition (BOOL), not {s}", .{ c.name, @tagName(bt.kind) });
+        if (eq(c.name, "json_filter")) return Type.init(.string).asNullable();
+        return Type.init(.bool).withNull(a.nullable or a.unknown);
     }
 
     fn jsonGet(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
@@ -2157,6 +2247,50 @@ const per_row = struct {
             if (k == want) return Value{ .string = try arena.dupe(u8, part) };
         }
         return Value{ .string = "" };
+    }
+
+    /// The JSON array functions: the body evaluated once per element, with the
+    /// parameter bound to it. `json_filter` keeps the elements whose condition is
+    /// true, as they were written; `json_transform` makes an array of the body's
+    /// values; `json_any` / `json_all` ask whether it holds for some / every one
+    /// (a null condition is not true). A null cell is null; a cell that is JSON
+    /// but not an array is an error, as a cell that is not JSON is to `json_get`.
+    /// An element the body cannot compare (a number against text) counts as null.
+    fn jsonLambda(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        if (c.args.len != 2 or c.args[1].* != .lambda) return error.TypeMismatch;
+        const dv = try evalRow(arena, c.args[0], batch, row);
+        if (dv.isNull()) return .null;
+        const doc = try parseJson(arena, try valueToString(arena, dv));
+        const items = switch (doc) {
+            .array => |arr| arr.items,
+            else => return error.InvalidJson,
+        };
+        const l = c.args[1].lambda;
+        const Kind = enum { filter, transform, any, all };
+        const kind: Kind = if (eq(c.name, "json_filter")) .filter else if (eq(c.name, "json_transform")) .transform else if (eq(c.name, "json_any")) .any else .all;
+        var out = std.json.Array.init(arena);
+        for (items) |el| {
+            const body = try bindLambda(arena, l.body, l.param, try jsonElementValue(arena, el));
+            // A JSON array may mix kinds: an element the body cannot compare — a
+            // number against text — is null there, not a failed query. A CAST that
+            // fails still fails, as it does anywhere else.
+            const r = evalRow(arena, body, batch, row) catch |e| switch (e) {
+                error.TypeMismatch => Value.null,
+                else => return e,
+            };
+            const holds = r == .bool and r.bool;
+            switch (kind) {
+                .filter => if (holds) try out.append(el),
+                .transform => try out.append(try valueToJson(arena, r)),
+                .any => if (holds) return Value{ .bool = true },
+                .all => if (!holds) return Value{ .bool = false },
+            }
+        }
+        return switch (kind) {
+            .any => Value{ .bool = false },
+            .all => Value{ .bool = true },
+            .filter, .transform => Value{ .string = std.json.Stringify.valueAlloc(arena, std.json.Value{ .array = out }, .{}) catch return error.OutOfMemory },
+        };
     }
 
     fn jsonGet(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {

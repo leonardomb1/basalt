@@ -41,7 +41,7 @@ pub fn errLabel(e: anyerror) []const u8 {
         error.TypeMismatch => "type mismatch",
         error.IntOverflow => "integer overflow — the value does not fit a 64-bit integer",
         error.JsonNotArray => "JSON_EACH needs a JSON array (got an object or a scalar)",
-        error.InvalidJson => "invalid JSON — json_get and JSON_EACH need a JSON document",
+        error.InvalidJson => "invalid JSON — json_get and JSON_EACH need a JSON document, and the json_* array functions a JSON array",
         error.PatternTooComplex => "regular expression gave up: too much backtracking — anchor it, or replace a nested quantifier like `(a+)+` with a flat one",
         error.JoinBuildTooLarge => "join build side exceeds its cap — raise it with WITH (max_build = '8GB') on the join, filter the CTE, or flip the join",
         else => @errorName(e),
