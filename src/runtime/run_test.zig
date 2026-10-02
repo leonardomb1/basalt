@@ -3330,6 +3330,52 @@ test "variance and standard deviation: sample by default, population on request,
     try std.testing.expectEqualStrings(want, threaded);
 }
 
+test "table functions: defaults, a join side, two calls with their own CTEs, one calling another" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const input = "id,g,x,status\n1,a,10,paid\n2,a,20,open\n3,b,30,paid\n4,b,5,paid\n5,c,7,open\n";
+    const decls =
+        \\CREATE FUNCTION paid(minx INT DEFAULT 0) RETURNS TABLE AS
+        \\  SELECT id, g, x FROM '$IN' WHERE status = 'paid' AND x >= $minx;
+        \\CREATE FUNCTION byg(k STRING) RETURNS TABLE AS
+        \\  WITH s AS (SELECT g, SUM(x) AS t FROM '$IN' GROUP BY g) SELECT t FROM s WHERE g = $k;
+        \\CREATE FUNCTION per_g(n INT) RETURNS TABLE AS
+        \\  SELECT g, COUNT(*) AS c FROM paid($n) GROUP BY g;
+        \\
+    ;
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT id, x FROM paid(8) ORDER BY id", .want = "id,x\n1,10\n3,30\n" },
+        .{ .q = "SELECT id FROM paid() p WHERE p.g = 'b' ORDER BY id", .want = "id\n3\n4\n" },
+        .{ .q = "SELECT a.id, b.id AS bid FROM paid(8) a JOIN paid(25) b ON a.g = b.g", .want = "id,bid\n3,3\n" },
+        .{ .q = "SELECT * FROM byg('a') x CROSS JOIN byg('b') y", .want = "t,t_r\n30,35\n" },
+        .{ .q = "SELECT * FROM per_g(6) ORDER BY g", .want = "g,c\na,1\nb,1\n" },
+    };
+    for (cases) |c| {
+        const base = try tmp.dir.realpathAlloc(alloc, ".");
+        defer alloc.free(base);
+        try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = input });
+        const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
+        defer alloc.free(in_path);
+        const d = try std.mem.replaceOwned(u8, alloc, decls, "$IN", in_path);
+        defer alloc.free(d);
+        const script = try std.fmt.allocPrint(alloc, "{s}LOAD INTO '{s}/out.csv' AS {s};", .{ d, base, c.q });
+        defer alloc.free(script);
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+        var rdiag: Diag = .{};
+        _ = run(alloc, prog, .{}, &rdiag) catch |e| {
+            std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+            return e;
+        };
+        const got = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
+}
+
 test "csv: a column of ISO dates is inferred as DATE (empty cells are null)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

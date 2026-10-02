@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const token = @import("token.zig");
 
 pub const Pos = struct { line: u32, col: u32 };
 
@@ -432,15 +433,20 @@ pub const FnParam = struct {
     default: ?*Expr = null,
 };
 
-/// The two things a `CREATE FUNCTION` body can be.
+/// The three things a `CREATE FUNCTION` body can be.
 ///   * `.expr` — a scalar function, inlined at plan time (`expand.zig`) so the
 ///     type-checker and evaluator never see it. Recursion is rejected there.
 ///   * `.stmts` — a statement macro, invoked with `CALL f(args)`. The declaration
 ///     survives expansion; `run.zig` renders the block per call through the same
 ///     `${var}` machinery a `for` body uses, with the parameters as loop vars.
+///   * `.table` — `RETURNS TABLE AS <query>;`, a table function. The parser keeps
+///     the query's tokens (ending in an `eof`) and re-parses them at every
+///     `FROM f(args)` with the parameters bound, so a call lowers to an ordinary
+///     derived table and nothing downstream sees the function or the call.
 pub const FnBody = union(enum) {
     expr: *Expr,
     stmts: []const Stmt,
+    table: []const token.Token,
 };
 
 /// `CREATE [OR REPLACE] FUNCTION name(params) AS <body>`.

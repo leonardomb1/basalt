@@ -548,6 +548,7 @@ pub fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, sta
     const body = switch (fd.body) {
         .stmts => |b| b,
         .expr => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`{s}` is a scalar function — use it in an expression, not CALL", .{c.name})),
+        .table => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`{s}` is a table function — read it with FROM {s}(...), not CALL", .{ c.name, c.name })),
     };
     // expand.zig has already filled defaults and checked the count; a mismatch here
     // would mean an unexpanded program, so report it rather than index past the end.

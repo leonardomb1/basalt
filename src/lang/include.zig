@@ -164,12 +164,16 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base_dir: []const u8) Er
         // The includer sees the connections its includes declared, as it would
         // had they been written above it in one file.
         var known = std.array_list.Managed(ast.Connection).init(ctx.arena);
+        var known_fns = std.array_list.Managed(ast.FnDecl).init(ctx.arena);
         for (subs.items) |sp| for (stmtsOf(sp)) |st| {
             if (st == .connection) try known.append(st.connection);
+            // A table function is expanded where it is called, while parsing.
+            if (st == .func and st.func.body == .table) try known_fns.append(st.func);
         };
         var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
         main = parser.parseSourceOpts(ctx.arena, rest, &pdiag, .{
             .known_conns = known.items,
+            .known_fns = known_fns.items,
             .known_tables = ctx.known_tables,
             .errors = if (ctx.depth == 0) ctx.errors else null,
         }) catch |e| switch (e) {
@@ -345,6 +349,27 @@ test "@include: an included PARAM may sit beside an aggregate, as a local one ma
     , "main.sql", base, &diag);
     try testing.expect(prog.stmts[1] == .param);
     try testing.expect(prog.stmts[2] == .output);
+}
+
+test "@include: a table function declared in a library is called in the includer" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try writeFile(&tmp, "lib/tables.sql", "CREATE FUNCTION paid(minx INT) RETURNS TABLE AS SELECT id FROM 'o.csv' WHERE x >= $minx;\n");
+
+    // The call is expanded while the includer is parsed, so the declaration has
+    // to reach that parse the way an included connection does.
+    var diag: Diag = .{};
+    const prog = try loadProgram(a,
+        \\@include 'lib/tables.sql';
+        \\SELECT id FROM paid(8);
+    , "main.sql", base, &diag);
+    try testing.expect(prog.stmts[1].func.body == .table);
+    try testing.expect(prog.stmts[2] == .binding);
+    try testing.expect(prog.stmts[3] == .output);
 }
 
 test "@include keeps a leading CREATE ENDPOINT at stmts[0]" {

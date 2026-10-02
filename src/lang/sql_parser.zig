@@ -21,6 +21,7 @@ const token = @import("token.zig");
 const lexer = @import("sql_lexer.zig");
 const ast = @import("ast.zig");
 const aggregates = @import("aggregates.zig");
+const expand = @import("expand.zig");
 const types = @import("types.zig");
 
 const Token = token.Token;
@@ -53,6 +54,9 @@ pub fn parseSourceWith(arena: std.mem.Allocator, src: []const u8, diag: *Diagnos
 pub const Options = struct {
     /// Connections declared by files parsed before this one (`@include`).
     known_conns: []const ast.Connection = &.{},
+    /// Table functions declared by files parsed before this one (`@include`):
+    /// a call is expanded while parsing, so the declaration must be in hand.
+    known_fns: []const ast.FnDecl = &.{},
     /// Tables that exist where the script will run but that it does not declare —
     /// a notebook's other cells. `FROM name` / `JOIN name` read them as a binding
     /// reference the analyzer resolves, instead of "unknown source".
@@ -72,6 +76,7 @@ pub fn parseSourceOpts(arena: std.mem.Allocator, src: []const u8, diag: *Diagnos
         if (t.tag == .invalid) return p.fail(.{ .line = t.line, .col = t.col }, "invalid token `{s}`", .{t.text});
     }
     p.known_conns = opts.known_conns;
+    p.known_fns = opts.known_fns;
     p.known_tables = opts.known_tables;
     p.errors = opts.errors;
     return p.parseProgram();
@@ -266,6 +271,32 @@ fn aggFunc(name: []const u8) ?ast.AggFunc {
     return aggregates.lookup(name);
 }
 
+/// One table-function call being expanded: its parameters bound to the call's
+/// argument expressions, and the body's own `WITH` names mapped to names unique
+/// to this call, so two calls in one query do not share a binding. While a
+/// declaration is only being checked, `args` is empty and every `$param` stays
+/// a plain reference.
+const TableFrame = struct {
+    names: []const []const u8,
+    args: []const *ast.Expr,
+    ctes: std.array_list.Managed([2][]const u8),
+    id: usize,
+
+    fn arg(self: *const TableFrame, name: []const u8) ?*ast.Expr {
+        for (self.names, self.args) |n, a| if (std.mem.eql(u8, n, name)) return a;
+        return null;
+    }
+
+    fn cte(self: *const TableFrame, name: []const u8) ?[]const u8 {
+        for (self.ctes.items) |m| if (std.mem.eql(u8, m[0], name)) return m[1];
+        return null;
+    }
+};
+
+/// How deep table functions may call one another — and where a function that
+/// reaches itself (through `OR REPLACE`) stops.
+const max_tvf_depth = 16;
+
 /// One `CREATE RESOURCE conn.name AS GET(...)`: the read it stands for.
 const Resource = struct { conn: []const u8, name: []const u8, path: []const u8, post: bool, hints: []const ast.Hint };
 
@@ -278,8 +309,15 @@ pub const Parser = struct {
     endpoint: ?ast.KindDecl = null,
     /// Connections declared by files parsed before this one (`@include`).
     known_conns: []const ast.Connection = &.{},
+    known_fns: []const ast.FnDecl = &.{},
     known_tables: []const []const u8 = &.{},
     errors: ?*std.array_list.Managed(Diagnostic) = null,
+    /// `CREATE FUNCTION ... RETURNS TABLE` declarations so far — this file's and
+    /// its includes'. A call takes the last of a name, as `OR REPLACE` means.
+    table_fns: std.array_list.Managed(ast.FnDecl) = undefined,
+    /// The table-function call whose body is being parsed, if any.
+    tvf: ?*TableFrame = null,
+    tvf_depth: usize = 0,
     conn_names: std.array_list.Managed([]const u8) = undefined,
     /// Parallel to `conn_names`: each connection's connector type, which `SHOW
     /// TABLES` needs to phrase its catalog query.
@@ -487,6 +525,8 @@ pub const Parser = struct {
             try self.conn_types.append(c.connector);
         }
         self.resources = std.array_list.Managed(Resource).init(self.arena);
+        self.table_fns = std.array_list.Managed(ast.FnDecl).init(self.arena);
+        try self.table_fns.appendSlice(self.known_fns);
         self.let_names = std.array_list.Managed([]const u8).init(self.arena);
         self.pending_bindings = std.array_list.Managed(ast.Stmt).init(self.arena);
         self.const_names = std.array_list.Managed([]const u8).init(self.arena);
@@ -1170,6 +1210,15 @@ pub const Parser = struct {
                 return self.fail(pos, "`{s}`: parameter `{s}` without DEFAULT follows one with DEFAULT", .{ name, p.name });
             }
         }
+        if (self.eatKw("returns")) {
+            try self.expectKw("table");
+            try self.expectKw("as");
+            if (!self.isKw("select") and !self.isKw("with"))
+                return self.fail(self.curPos(), "`{s}`: a table function's body is a query — SELECT ... or WITH ...", .{name});
+            const fd = ast.FnDecl{ .name = name, .params = try params.toOwnedSlice(), .body = .{ .table = try self.checkTableBody() }, .replace = replace, .pos = pos };
+            try self.table_fns.append(fd);
+            return fd;
+        }
         try self.expectKw("as");
 
         if (self.atStmtBody()) {
@@ -1498,7 +1547,7 @@ pub const Parser = struct {
             _ = self.advance();
             while (true) {
                 const lpos = self.curPos();
-                const name = try self.expectIdent();
+                const name = try self.cteName(try self.expectIdent());
                 try self.expectKw("as");
                 _ = try self.expect(.lparen);
                 var cte_stages = std.array_list.Managed(ast.Stage).init(self.arena);
@@ -1862,7 +1911,18 @@ pub const Parser = struct {
             } else {
                 binding = try self.expectIdent();
                 bpos = self.prevPos();
-                if (!self.isLet(binding))
+                const written = binding;
+                const has_alias = self.at(.lparen) or (self.at(.ident) and !isReservedAfterSource(self.cur().text));
+                if (self.at(.lparen)) {
+                    const fd = self.findTableFn(binding) orelse
+                        return self.fail(bpos, "unknown table function `{s}` — declare it with CREATE FUNCTION {s}(...) RETURNS TABLE AS SELECT ...", .{ binding, binding });
+                    binding = try self.callTableFn(fd, bpos);
+                    // The call's own name qualifies its columns unless an alias follows.
+                    if (!(self.at(.ident) and !isReservedAfterSource(self.cur().text))) jalias = written;
+                } else if (if (self.tvf) |f| f.cte(binding) else null) |bname| {
+                    binding = bname;
+                    if (!has_alias) jalias = written;
+                } else if (!self.isLet(binding))
                     return self.fail(jpos, "JOIN right side `{s}` must be a WITH-defined CTE", .{binding});
             }
             if (jalias) |ja| {
@@ -2453,6 +2513,125 @@ pub const Parser = struct {
     /// alias names it only inside the query that wrote it. Bindings share one
     /// namespace per script, so binding under the alias let a second `r` anywhere
     /// replace the first — silently, when the two had the same columns.
+    /// The table function called `name`, the latest declaration winning.
+    fn findTableFn(self: *Parser, name: []const u8) ?ast.FnDecl {
+        var i = self.table_fns.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (eqlNoCase(self.table_fns.items[i].name, name)) return self.table_fns.items[i];
+        }
+        return null;
+    }
+
+    /// A `WITH` name as bound: itself, or — inside a table function's body — a name
+    /// unique to this call, which the body's own `FROM name` maps back to.
+    fn cteName(self: *Parser, name: []const u8) Error![]const u8 {
+        const f = self.tvf orelse return name;
+        const bname = try std.fmt.allocPrint(self.arena, "__tvf{d}_{s}", .{ f.id, name });
+        try f.ctes.append(.{ name, bname });
+        return bname;
+    }
+
+    /// Parse a table function's body once where it is declared, so a mistake in it
+    /// is reported there and not at the first call, and hand back its tokens for
+    /// every call to re-parse. Nothing it would bind is kept.
+    fn checkTableBody(self: *Parser) Error![]const Token {
+        const start = self.i;
+        const let_base = self.let_names.items.len;
+        defer self.let_names.shrinkRetainingCapacity(let_base);
+        var frame = TableFrame{ .names = &.{}, .args = &.{}, .ctes = .init(self.arena), .id = 0 };
+        const outer = self.tvf;
+        self.tvf = &frame;
+        defer self.tvf = outer;
+        var discard = std.array_list.Managed(ast.Stmt).init(self.arena);
+        var stages = std.array_list.Managed(ast.Stage).init(self.arena);
+        try self.parseQuery(&discard, &stages);
+        _ = try self.expect(.semi);
+        const body = self.toks[start..self.i];
+        const toks = try self.arena.alloc(Token, body.len + 1);
+        @memcpy(toks[0..body.len], body);
+        const last = body[body.len - 1];
+        toks[body.len] = .{ .tag = .eof, .text = "", .line = last.line, .col = last.col };
+        return toks;
+    }
+
+    /// `f(args)` in FROM or JOIN, the name already consumed: bind the arguments,
+    /// re-parse the body with them, and lower the result to a binding exactly as a
+    /// derived table is — so a filter on the call still descends to the source.
+    fn callTableFn(self: *Parser, fd: ast.FnDecl, pos: Pos) Error![]const u8 {
+        _ = try self.expect(.lparen);
+        var args = std.array_list.Managed(*ast.Expr).init(self.arena);
+        if (!self.at(.rparen)) {
+            try args.append(try self.parseExpr());
+            while (self.eat(.comma)) try args.append(try self.parseExpr());
+        }
+        _ = try self.expect(.rparen);
+
+        var required: usize = 0;
+        for (fd.params) |p| {
+            if (p.default == null) required += 1;
+        }
+        const n = args.items.len;
+        if (n < required or n > fd.params.len) {
+            if (required == fd.params.len)
+                return self.fail(pos, "`{s}` expects {d} argument(s), got {d}", .{ fd.name, fd.params.len, n });
+            return self.fail(pos, "`{s}` expects {d} to {d} argument(s), got {d}", .{ fd.name, required, fd.params.len, n });
+        }
+        for (fd.params[n..]) |p| try args.append(p.default.?);
+        const names = try self.arena.alloc([]const u8, fd.params.len);
+        for (fd.params, args.items, names, 1..) |p, a, *nm, i| {
+            nm.* = p.name;
+            if (!self.constItemExpr(a))
+                return self.fail(pos, "`{s}`: argument {d} (`{s}`) must be a constant — a literal, a `$param`, or an expression over them", .{ fd.name, i, p.name });
+            const want = (p.ty orelse continue).kind;
+            const got = expand.literalKind(a) orelse continue;
+            if (!expand.acceptsLiteral(want, got))
+                return self.fail(pos, "`{s}`: argument {d} (`{s}`) expects {s}, got {s}", .{ fd.name, i, p.name, expand.typeWord(want), expand.typeWord(got) });
+        }
+        if (self.tvf_depth >= max_tvf_depth)
+            return self.fail(pos, "table function `{s}` nests more than {d} calls deep — does it reach itself?", .{ fd.name, max_tvf_depth });
+
+        self.derived_n += 1;
+        var frame = TableFrame{ .names = names, .args = args.items, .ctes = .init(self.arena), .id = self.derived_n };
+        const saved_toks = self.toks;
+        const saved_i = self.i;
+        const outer = self.tvf;
+        self.toks = fd.body.table;
+        self.i = 0;
+        self.tvf = &frame;
+        self.tvf_depth += 1;
+        defer {
+            self.toks = saved_toks;
+            self.i = saved_i;
+            self.tvf = outer;
+            self.tvf_depth -= 1;
+        }
+        var inner = std.array_list.Managed(ast.Stmt).init(self.arena);
+        var stages = std.array_list.Managed(ast.Stage).init(self.arena);
+        self.parseQuery(&inner, &stages) catch |e| return self.inTableFn(e, fd.name, pos);
+        _ = self.expect(.semi) catch |e| return self.inTableFn(e, fd.name, pos);
+
+        const bname = try std.fmt.allocPrint(self.arena, "__tvf{d}_{s}", .{ frame.id, fd.name });
+        try self.let_names.append(bname);
+        try self.pending_bindings.appendSlice(inner.items);
+        try self.pending_bindings.append(.{ .binding = .{
+            .name = bname,
+            .pipeline = .{ .stages = try stages.toOwnedSlice(), .pos = pos },
+            .pos = pos,
+        } });
+        return bname;
+    }
+
+    /// An error inside a table function's body is positioned in its declaration;
+    /// say which call reached it.
+    fn inTableFn(self: *Parser, e: Error, name: []const u8, pos: Pos) Error {
+        // Named once, at the call the script wrote — not again at every level a
+        // runaway `OR REPLACE` recursion went through (the defers have not run yet).
+        if (e == error.ParseFailed and self.tvf_depth == 1)
+            self.diag.msg = std.fmt.allocPrint(self.arena, "in `{s}` called at {d}:{d}: {s}", .{ name, pos.line, pos.col, self.diag.msg }) catch self.diag.msg;
+        return e;
+    }
+
     fn parseDerivedTable(self: *Parser) Error!Derived {
         const dpos = self.curPos();
         _ = try self.expect(.lparen);
@@ -2858,6 +3037,22 @@ pub const Parser = struct {
         } else {
             const pos = self.curPos();
             const head = try self.expectIdent();
+            if (self.at(.lparen)) {
+                const fd = self.findTableFn(head) orelse
+                    return self.fail(pos, "unknown table function `{s}` — declare it with CREATE FUNCTION {s}(...) RETURNS TABLE AS SELECT ...", .{ head, head });
+                const bname = try self.callTableFn(fd, pos);
+                _ = self.eatKw("as");
+                if (self.at(.ident) and !isReservedAfterSource(self.cur().text)) {
+                    try self.claimAlias(aliases, self.advance().text, self.prevPos(), .left);
+                } else try self.claimAlias(aliases, head, pos, .left);
+                return .{ .ref = bname };
+            }
+            if (self.tvf) |f| if (f.cte(head)) |bname| {
+                node = .{ .ref = bname };
+                if (self.at(.ident) and !isReservedAfterSource(self.cur().text))
+                    try self.claimAlias(aliases, self.advance().text, self.prevPos(), .left);
+                return node;
+            };
             const http = if (self.connType(head)) |k| std.mem.eql(u8, k, "http") else false;
             if (self.at(.dot) and http) {
                 _ = self.advance();
@@ -3896,6 +4091,8 @@ pub const Parser = struct {
             },
             .dollar_ident => {
                 const q = try self.parseDollarPath();
+                // Inside a table function's body, its parameters are the call's arguments.
+                if (self.tvf) |f| if (q.parts.len == 1) if (f.arg(q.parts[0])) |a| return a;
                 return self.mk(.{ .field = q });
             },
             .lparen => {
@@ -4265,6 +4462,70 @@ test "sql: an aggregate with no window form says so before OVER" {
     }
     _ = try parseSource(a, "SELECT g, median(x) AS m FROM 'in.csv' GROUP BY g;", &diag);
     _ = try parseSource(a, "SELECT g, x, SUM(x) OVER (PARTITION BY g ORDER BY x) AS s FROM 'in.csv';", &diag);
+}
+
+test "sql: a table function lowers each call to a binding, its parameters bound to the arguments" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parseSource(a,
+        \\CREATE FUNCTION paid(minx INT DEFAULT 0) RETURNS TABLE AS
+        \\  SELECT id, x FROM 'o.csv' WHERE x >= $minx;
+        \\SELECT id FROM paid(8);
+    , &diag);
+    try testing.expect(prog.stmts[1].func.body == .table);
+    const b = prog.stmts[2].binding;
+    try testing.expect(std.mem.startsWith(u8, b.name, "__tvf") and std.mem.endsWith(u8, b.name, "_paid"));
+    // `$minx` is the argument itself, not a reference left for later.
+    const f = b.pipeline.stages[1].node.filter;
+    try testing.expectEqual(@as(i64, 8), f.binary.r.int_lit);
+    try testing.expectEqualStrings(b.name, prog.stmts[3].output.stages[0].node.ref);
+}
+
+test "sql: two calls in one query get their own bindings, the body's CTEs included" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parseSource(a,
+        \\CREATE FUNCTION byg(k STRING) RETURNS TABLE AS
+        \\  WITH s AS (SELECT g, x FROM 'o.csv') SELECT x FROM s WHERE g = $k;
+        \\SELECT * FROM byg('a') l JOIN byg('b') r ON l.x = r.x;
+    , &diag);
+    var names = std.array_list.Managed([]const u8).init(a);
+    for (prog.stmts) |st| if (st == .binding) try names.append(st.binding.name);
+    // two `s`es and two calls, every one distinct; the plain name `s` is never bound
+    try testing.expectEqual(@as(usize, 4), names.items.len);
+    for (names.items, 0..) |n, i| {
+        try testing.expect(!std.mem.eql(u8, n, "s"));
+        for (names.items[0..i]) |m| try testing.expect(!std.mem.eql(u8, m, n));
+    }
+}
+
+test "sql: a table function call is checked where it is written" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const decl = "CREATE FUNCTION paid(minx INT DEFAULT 0) RETURNS TABLE AS SELECT id, x FROM 'o.csv' WHERE x >= $minx;\n";
+    const cases = [_]struct { q: []const u8, msg: []const u8 }{
+        .{ .q = "SELECT * FROM paid(1, 2);", .msg = "`paid` expects 0 to 1 argument(s), got 2" },
+        .{ .q = "SELECT * FROM paid('x');", .msg = "`paid`: argument 1 (`minx`) expects INT, got STRING" },
+        .{ .q = "SELECT * FROM paid(id);", .msg = "`paid`: argument 1 (`minx`) must be a constant — a literal, a `$param`, or an expression over them" },
+        .{ .q = "SELECT * FROM nope(1);", .msg = "unknown table function `nope` — declare it with CREATE FUNCTION nope(...) RETURNS TABLE AS SELECT ..." },
+        .{ .q = "CREATE OR REPLACE FUNCTION paid(minx INT DEFAULT 0) RETURNS TABLE AS SELECT * FROM paid($minx);\nSELECT * FROM paid(1);", .msg = "in `paid` called at 3:15: table function `paid` nests more than 16 calls deep — does it reach itself?" },
+    };
+    for (cases) |c| {
+        var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        try testing.expectError(error.ParseFailed, parseSource(a, try std.mem.concat(a, u8, &.{ decl, c.q }), &diag));
+        try testing.expectEqualStrings(c.msg, diag.msg);
+    }
+    // The body is checked at its declaration, not at the first call.
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a, "CREATE FUNCTION bad() RETURNS TABLE AS SELECT id FROM 'o.csv' WHERE;", &diag));
+    try testing.expectEqual(@as(u32, 1), diag.line);
+    try testing.expectError(error.ParseFailed, parseSource(a, "CREATE FUNCTION bad() RETURNS TABLE AS 1 + 1;", &diag));
+    try testing.expectEqualStrings("`bad`: a table function's body is a query — SELECT ... or WITH ...", diag.msg);
 }
 
 test "sql: EXPLAIN COSTS is rejected in either position" {

@@ -36,6 +36,7 @@ THROW 'msg' WHEN <condition>;     -- fail the plan on the script's own invariant
 CREATE CONNECTION ...;            -- named data endpoints
 CREATE FUNCTION f(a) AS <expr>;   -- scalar functions (inlined at plan time)
 CREATE FUNCTION p(a) AS ... END;  -- statement functions, invoked with CALL (§9)
+CREATE FUNCTION t(a) RETURNS TABLE AS SELECT ...;  -- table functions, read with FROM t('x') (§9)
 LOAD INTO ... AS <query>;         -- output pipeline(s)
 <query>;                          -- terminal SELECT = print to stdout
 CALL p('x');                      -- run a statement function
@@ -306,6 +307,7 @@ LIMIT 100 OFFSET 20;
 | generated integers | `FROM RANGE(10)` / `FROM RANGE(2, 5)` — `lo..hi-1` as a `range` column; bounds are int literals or params |
 | no source | `SELECT 1 AS x, now() AS t;` — a `SELECT` with no `FROM` yields one row of computed values |
 | CTE | `FROM <name>` |
+| table function | `FROM paid_orders($since) p` — a `CREATE FUNCTION ... RETURNS TABLE` (§9), also as a `JOIN`'s right side |
 
 A raw `QUERY($$…$$)` is sent as it is and may hold several statements — a
 `DELETE` and an `INSERT` before its `SELECT`, a statement after it. The batch runs
@@ -1168,6 +1170,30 @@ columns it has not seen.
   leaves earlier loads committed, exactly as if the statements were inline.
   Plain re-declaration of a name is an error; `OR REPLACE` is the sanctioned
   overwrite.
+- `CREATE [OR REPLACE] FUNCTION nome(a [TYPE] [DEFAULT <expr>], ...) RETURNS
+  TABLE AS <query>;` is a **table function**: a query with parameters, read
+  wherever a CTE could be — `FROM nome(args) [alias]`, or the right side of a
+  `JOIN`. Each call is the body with every `$a` replaced by its argument, lowered
+  to a derived table at plan time, so it behaves exactly as if the query were
+  written inline; two calls in one query (even of one function) are independent,
+  `WITH` clauses inside the body included. Without an alias, the function's name
+  qualifies its columns (`paid.id`). Arguments are plan-time constants —
+  literals, `$params`, loop variables, and expressions over them — never a
+  column. Arity, defaults and literal-argument types are checked as for a scalar
+  function, the body is checked where it is declared, and an `@include`d table
+  function is called like a local one. A body may call table functions declared
+  before it; a call that reaches its own function (possible only through `OR
+  REPLACE`) stops at 16 levels. Like a derived table, a call cannot be the source
+  of a `FOR EACH ROW OF (...)` or `EACH TABLE OF (...)` discovery query.
+
+  ```sql
+  CREATE FUNCTION paid_orders(since DATE, branch STRING DEFAULT '01') RETURNS TABLE AS
+    SELECT C5_NUM AS num, C5_CLIENTE AS cliente, C5_EMISSAO AS emissao
+    FROM erp.dbo.SC5010 PUSHDOWN($$D_E_L_E_T_ <> '*'$$)
+    WHERE C5_FILIAL = $branch AND C5_EMISSAO >= $since;
+
+  SELECT num, cliente FROM paid_orders($desde) WHERE cliente <> '000001';
+  ```
 
 ### `DESCRIBE` and `SHOW TABLES`
 

@@ -68,9 +68,10 @@ pub fn expandProgram(arena: std.mem.Allocator, program: ast.Program, body: ?[]co
     var cx = Ctx{ .arena = arena, .fns = &fns, .json = &json, .msg = msg };
     var out = std.array_list.Managed(ast.Stmt).init(arena);
     for (program.stmts) |s| {
-        // Expression-form declarations are inlined at their call sites and dropped;
+        // Expression-form declarations are inlined at their call sites and dropped,
+        // as are table functions, which the parser already expanded at theirs;
         // statement-form ones survive as the macro table `CALL` renders at run time.
-        if (s == .func and s.func.body == .expr) continue;
+        if (s == .func and s.func.body != .stmts) continue;
         try out.append(try expandStmt(&cx, s));
     }
     return .{ .stmts = try out.toOwnedSlice() };
@@ -146,9 +147,16 @@ fn expandCallStmt(cx: *Ctx, c: ast.CallStmt) Error!ast.Stmt {
         cx.msg.* = std.fmt.allocPrint(cx.arena, "CALL: no function named `{s}`", .{c.name}) catch "CALL: unknown function";
         return error.ExpandFailed;
     };
-    if (fd.body == .expr) {
-        cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}` is a scalar function — use it in an expression, not CALL", .{c.name}) catch "CALL of a scalar function";
-        return error.ExpandFailed;
+    switch (fd.body) {
+        .stmts => {},
+        .expr => {
+            cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}` is a scalar function — use it in an expression, not CALL", .{c.name}) catch "CALL of a scalar function";
+            return error.ExpandFailed;
+        },
+        .table => {
+            cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}` is a table function — read it with FROM {s}(...), not CALL", .{ c.name, c.name }) catch "CALL of a table function";
+            return error.ExpandFailed;
+        },
     }
     const args = try cx.arena.alloc(*ast.Expr, c.args.len);
     for (c.args, 0..) |a, i| args[i] = try expandExpr(cx, a, null, 0);
@@ -344,9 +352,16 @@ fn expandCall(cx: *Ctx, c: ast.Expr.Call, subst: ?*Subst, depth: usize) Error!*a
     for (c.args, 0..) |a, i| args[i] = try expandExpr(cx, a, subst, depth);
 
     if (cx.fns.get(c.name)) |fd| {
-        if (fd.body == .stmts) {
-            cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}` is a statement function — invoke it with CALL", .{c.name}) catch "statement fn used as an expression";
-            return error.ExpandFailed;
+        switch (fd.body) {
+            .expr => {},
+            .stmts => {
+                cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}` is a statement function — invoke it with CALL", .{c.name}) catch "statement fn used as an expression";
+                return error.ExpandFailed;
+            },
+            .table => {
+                cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}` is a table function — read it with FROM {s}(...), not in an expression", .{ c.name, c.name }) catch "table fn used as an expression";
+                return error.ExpandFailed;
+            },
         }
         const full = try fillDefaults(cx, fd, args);
         try checkArgTypes(cx, fd, full);
@@ -398,7 +413,7 @@ fn checkArgTypes(cx: *Ctx, fd: ast.FnDecl, args: []const *ast.Expr) Error!void {
 
 /// The type of an argument that is a literal, or null when it is anything else.
 /// `null` is a literal but assignable to every type, so it reports null too.
-fn literalKind(e: *const ast.Expr) ?types.TypeKind {
+pub fn literalKind(e: *const ast.Expr) ?types.TypeKind {
     return switch (e.*) {
         .bool_lit => types.TypeKind.bool,
         .int_lit => types.TypeKind.int,
@@ -408,7 +423,7 @@ fn literalKind(e: *const ast.Expr) ?types.TypeKind {
     };
 }
 
-fn acceptsLiteral(want: types.TypeKind, got: types.TypeKind) bool {
+pub fn acceptsLiteral(want: types.TypeKind, got: types.TypeKind) bool {
     if (want == got) return true;
     return switch (want) {
         // Implicit widening, as everywhere else in the type system.
@@ -420,7 +435,7 @@ fn acceptsLiteral(want: types.TypeKind, got: types.TypeKind) bool {
     };
 }
 
-fn typeWord(k: types.TypeKind) []const u8 {
+pub fn typeWord(k: types.TypeKind) []const u8 {
     return switch (k) {
         .bool => "BOOL",
         .int => "INT",
@@ -548,6 +563,22 @@ test "expandProgram: a declared parameter type rejects a wrong-kind literal" {
     var msg: []const u8 = "";
     const out = try expandProgram(a, prog, null, &msg);
     try std.testing.expect(outputSelect(out)[0].computed.expr.* == .binary);
+}
+
+test "expandProgram: a table function is read with FROM, not called as a scalar or with CALL" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const decl = "CREATE FUNCTION paid() RETURNS TABLE AS SELECT id FROM 'o.csv';\n";
+    const m1 = try expandErr(a, decl ++ "SELECT paid() AS z FROM 'o.csv';");
+    try std.testing.expectEqualStrings("`paid` is a table function — read it with FROM paid(...), not in an expression", m1);
+    const m2 = try expandErr(a, decl ++ "CALL paid();\nSELECT 1 AS a;");
+    try std.testing.expectEqualStrings("`paid` is a table function — read it with FROM paid(...), not CALL", m2);
+    // The declaration itself is gone once expanded; the call is an ordinary binding.
+    var msg: []const u8 = "";
+    var d: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try expandProgram(a, try parser.parseSource(a, decl ++ "SELECT * FROM paid();", &d), null, &msg);
+    for (prog.stmts) |st| try std.testing.expect(st != .func);
 }
 
 test "expandProgram: duplicate CREATE FUNCTION needs OR REPLACE" {
