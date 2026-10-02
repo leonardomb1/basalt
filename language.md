@@ -428,9 +428,15 @@ Source clauses, in any order after the source:
   table function the query *starts from* counts as that read: its own `WHERE`
   descends as if written inline (`(via binding …)` in `EXPLAIN`), except a binding
   holding a window function, which stays apart so a `WHERE rn = 1` over it can run
-  as a top-N. A filter written after the binding's `SELECT` list stays in the
-  engine, as it would inline; so does every filter of a binding read as a
-  `JOIN`'s right side (below).
+  as a top-N. A filter written after a `SELECT` list — the query's own `WHERE`
+  over a CTE, derived table or table function — moves in front of it when every
+  column it names is one that list passes through or renames, rewritten in the
+  source's names: `SELECT num FROM paid_orders($d) WHERE num > 5`, with the body
+  selecting `C5_NUM AS num`, sends `"C5_NUM" > 5`. A conjunct naming a computed
+  column (`x * 2 AS y`) stays above the list, the others still move. Rows a
+  moved filter removes are no longer evaluated by the list, so a computed column
+  that would have failed on one of them no longer fails the query. Every filter
+  of a binding read as a `JOIN`'s right side stays in the engine (§11).
 - **Text comparisons follow the column's collation**, so the source never keeps
   fewer rows than basalt would. basalt compares text byte by byte; a source
   compares by collation — case-insensitive by default on SQL Server and MySQL,

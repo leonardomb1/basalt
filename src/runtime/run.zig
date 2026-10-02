@@ -570,8 +570,8 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     // sit ahead of the joins, so the contiguous prefix `serialWhere` reads actually
     // contains them. Without this a join between the read and the WHERE meant no
     // predicate descended at all.
-    if (try pushdown.hoistThroughJoins(arena, env.gpa, stages, env.bindings)) |hoisted| {
-        env.log.log(.debug, "filter hoisted through join: {d} -> {d} stages", .{ stages.len, hoisted.len });
+    if (try pushdown.hoistFilters(arena, env.gpa, stages, env.bindings)) |hoisted| {
+        env.log.log(.debug, "filter hoisted through a projection or join: {d} -> {d} stages", .{ stages.len, hoisted.len });
         stages = hoisted;
     }
 

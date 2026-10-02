@@ -909,7 +909,7 @@ const Ctx = struct {
             @memcpy(joined[b.stages.len..], head[1..]);
             head = joined;
         }
-        const stages = (pushdown.hoistThroughJoins(self.arena, self.arena, head, self.bindings) catch null) orelse head;
+        const stages = (pushdown.hoistFilters(self.arena, self.arena, head, self.bindings) catch null) orelse head;
         if (stages[stages.len - 1].node != .write)
             return fail(self.diag, "a top-level pipeline must end in `write`", .{});
         for (stages) |st| try checkStageLiterals(self.diag, st);
@@ -1829,6 +1829,8 @@ test "analyze pushdown preview: a CTE, derived table or table function at the he
         "LOAD INTO '/tmp/x.csv' AS WITH o AS (SELECT id, amount FROM pg.orders WHERE amount > 0) SELECT id FROM o;",
         "LOAD INTO '/tmp/x.csv' AS SELECT id FROM (SELECT id, amount FROM pg.orders WHERE amount > 0) d;",
         "CREATE FUNCTION pos(lo INT) RETURNS TABLE AS SELECT id, amount FROM pg.orders WHERE amount > $lo;\nLOAD INTO '/tmp/x.csv' AS SELECT id FROM pos(0);",
+        // the query's own WHERE, over a renamed column, crosses the binding's SELECT
+        "LOAD INTO '/tmp/x.csv' AS SELECT id FROM (SELECT id, amount AS amt FROM pg.orders) d WHERE amt > 0;",
     };
     for (queries) |q| {
         var diag = Diag{};
