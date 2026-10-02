@@ -149,6 +149,13 @@ Reads get everything a SQL source gets: `WHERE` and whole-aggregate pushdown in
 the StarRocks dialect, key-range splits under `-j`, and `FOR EACH ROW OF
 (sr.QUERY(...))` discovery.
 
+Before a load, the target's database and table are created only if
+`information_schema` does not list them (`auto_create = false` skips this
+altogether). A role allowed to load into an existing table therefore needs no
+CREATE privilege; one that does lack a privilege it needs gets StarRocks' own
+message in the error (`starrocks refused 'CREATE TABLE …': Access denied; you
+need …`), not only in the log.
+
 **Named SQL Server instances:** write `host = '10.110.2.5\WMS'`. When a `host`
 carries a `\INSTANCE` and no explicit `port` is given, basalt resolves the
 instance's TCP port via the SQL Server Browser (UDP 1434) before connecting.

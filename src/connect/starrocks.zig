@@ -31,7 +31,22 @@ pub const Config = struct {
     auto_create: bool = true,
     label_prefix: []const u8 = "basalt",
     run_id: u64 = 0,
+    /// Where a refused DDL says why — StarRocks' own words, e.g. the privilege
+    /// it needs — so the run's error carries them, not only the log.
+    errctx: ?*op.ErrCtx = null,
 };
+
+/// A single-quoted string literal for StarRocks' MySQL protocol: `'` doubled,
+/// and `\\` doubled since it is an escape there.
+fn appendStrLit(out: *std.array_list.Managed(u8), s: []const u8) !void {
+    try out.append('\'');
+    for (s) |c| switch (c) {
+        '\'' => try out.appendSlice("''"),
+        '\\' => try out.appendSlice("\\\\"),
+        else => try out.append(c),
+    };
+    try out.append('\'');
+}
 
 /// The StarRocks column type for an engine type (`sql.Dialect.starrocks.ddlType`).
 pub fn srType(arena: std.mem.Allocator, t: types.Type) ![]const u8 {
@@ -196,13 +211,22 @@ pub const StreamLoadSink = struct {
         errdefer self.buffer.deinit();
         errdefer self.client.deinit();
         if (cfg.auto_create) {
-            const cdb = try std.fmt.allocPrint(gpa, "CREATE DATABASE IF NOT EXISTS `{s}`", .{cfg.database});
-            defer gpa.free(cdb);
-            try self.runDDL(cdb);
-
-            const ddl = try genCreateTable(gpa, cfg.database, table, schema, mode, cfg.buckets, cfg.replication_num);
-            defer gpa.free(ddl);
-            try self.runDDL(ddl);
+            // Create only what is missing. A role that may load into an existing
+            // table need hold no CREATE privilege — StarRocks checks it before
+            // `IF NOT EXISTS` can make the statement a no-op, so asking anyway
+            // refused the load. The table is looked for first: when it is there
+            // the database is too, and a role granted only the table may not see
+            // the database in `schemata` at all.
+            if (!try self.exists("information_schema.tables", "TABLE_SCHEMA", cfg.database, table)) {
+                if (!try self.exists("information_schema.schemata", "SCHEMA_NAME", cfg.database, null)) {
+                    const cdb = try std.fmt.allocPrint(gpa, "CREATE DATABASE IF NOT EXISTS `{s}`", .{cfg.database});
+                    defer gpa.free(cdb);
+                    try self.runDDL(cdb);
+                }
+                const ddl = try genCreateTable(gpa, cfg.database, table, schema, mode, cfg.buckets, cfg.replication_num);
+                defer gpa.free(ddl);
+                try self.runDDL(ddl);
+            }
 
             if (mode == .overwrite) {
                 const trunc = try std.fmt.allocPrint(gpa, "TRUNCATE TABLE `{s}`.`{s}`", .{ cfg.database, table });
@@ -222,7 +246,39 @@ pub const StreamLoadSink = struct {
         defer conn.close();
         conn.exec(stmt) catch |e| {
             obs.logOr(self.logger, .err, "starrocks DDL error: {s} (sql: {s})", .{ conn.last_error, stmt });
+            if (self.cfg.errctx) |ec| ec.set("starrocks refused `{s}`: {s}", .{ stmt, conn.last_error });
             return e;
+        };
+    }
+
+    /// Whether `information_schema` lists the database (`table` null) or the
+    /// table, matched by equality — `_` in a name is a LIKE wildcard. A catalog
+    /// that cannot be asked answers "no", which leaves the `IF NOT EXISTS` DDL to
+    /// decide, as it always did.
+    fn exists(self: *StreamLoadSink, view: []const u8, schema_col: []const u8, db: []const u8, table: ?[]const u8) !bool {
+        var q = std.array_list.Managed(u8).init(self.gpa);
+        defer q.deinit();
+        try q.writer().print("SELECT COUNT(*) FROM {s} WHERE {s} = ", .{ view, schema_col });
+        try appendStrLit(&q, db);
+        if (table) |t| {
+            try q.appendSlice(" AND TABLE_NAME = ");
+            try appendStrLit(&q, t);
+        }
+        const conn = mysql.Conn.connect(self.gpa, self.cfg.fe_host, self.cfg.fe_port, self.cfg.user, self.cfg.password, "", .off) catch return false;
+        // the cursor owns the connection from here and closes it
+        var cur = conn.sqlConn().queryCursor(q.items) catch {
+            conn.close();
+            return false;
+        };
+        defer cur.close();
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const b = (cur.nextBatch(arena.allocator()) catch return false) orelse return false;
+        if (b.len == 0) return false;
+        return switch (b.columns[0].getValue(0)) {
+            .int => |n| n > 0,
+            .string => |s| !std.mem.eql(u8, std.mem.trim(u8, s, " "), "0"),
+            else => false,
         };
     }
 

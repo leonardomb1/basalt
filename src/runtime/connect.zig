@@ -1401,7 +1401,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
 }
 
 fn resolveStarrocksConfig(env: *Env, conn: ast.Connection) !starrocks.Config {
-    var cfg = starrocks.Config{ .database = "" };
+    var cfg = starrocks.Config{ .database = "", .errctx = env.errctx };
     for (conn.config) |attr| {
         const k = attr.key;
         if (eqlAny(k, &.{ "host", "fe_host" })) {
