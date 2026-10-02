@@ -470,6 +470,29 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
     };
 }
 
+/// `stages` with the binding chain at its head replaced by the stages it stands
+/// for, while each link starts with a read. Not a binding already materialized
+/// (it is read back from memory), nor one holding a window: `windowTopK` needs
+/// to see that binding apart from the filter after it.
+pub fn inlineHeadBindings(env: *Env, stages_in: []const ast.Stage) ![]const ast.Stage {
+    var stages = stages_in;
+    var n: usize = 0;
+    while (stages[0].node == .ref and n < 16) : (n += 1) {
+        const name = stages[0].node.ref;
+        if (env.materialized.contains(name)) break;
+        const b = env.bindings.get(name) orelse break;
+        if (b.stages.len == 0 or b.stages[0].node != .read) break;
+        for (b.stages) |st| {
+            if (st.node == .window) return stages;
+        }
+        const joined = try env.arena.alloc(ast.Stage, b.stages.len + stages.len - 1);
+        @memcpy(joined[0..b.stages.len], b.stages);
+        @memcpy(joined[b.stages.len..], stages[1..]);
+        stages = joined;
+    }
+    return stages;
+}
+
 /// `runOutput` past the bookkeeping: plan and move the rows. Split off so the
 /// caller sees the error a load failed with, for its report.
 /// `SELECT ... FROM (SELECT k, SUM(v) FROM t GROUP BY k) x` — or the same through
@@ -514,6 +537,12 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     defer if (mat) |name| {
         _ = env.materialized.remove(name);
     };
+    // A CTE, derived table or table-function call at the head reads through its
+    // binding, which `buildPipeline` builds from the binding's own stages and then
+    // the rest — the same rows as the stages laid end to end. Laid out here, the
+    // read leads, so the descent below sends the binding's WHERE to the source:
+    // through a binding, a SQL table used to be read whole and filtered here.
+    stages = try inlineHeadBindings(env, stages);
 
     var ddiag = analyze.Diag{};
     env.csv_in = analyze.dialectFromHints(stages[0].hints, &ddiag) catch

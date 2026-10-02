@@ -424,7 +424,13 @@ Source clauses, in any order after the source:
   query LET's value decided first. Untranslatable pieces (arithmetic,
   `now()`/`today()`, user funcs) stay in the engine — the filter is always
   kept, so results never change, only how much crosses the wire. `EXPLAIN`
-  prints the descended predicate on a `pushdown:` line.
+  prints the descended predicate on a `pushdown:` line. A CTE, derived table or
+  table function the query *starts from* counts as that read: its own `WHERE`
+  descends as if written inline (`(via binding …)` in `EXPLAIN`), except a binding
+  holding a window function, which stays apart so a `WHERE rn = 1` over it can run
+  as a top-N. A filter written after the binding's `SELECT` list stays in the
+  engine, as it would inline; so does every filter of a binding read as a
+  `JOIN`'s right side (below).
 - **Text comparisons follow the column's collation**, so the source never keeps
   fewer rows than basalt would. basalt compares text byte by byte; a source
   compares by collation — case-insensitive by default on SQL Server and MySQL,
@@ -1646,6 +1652,9 @@ Accepted design not yet in the engine:
   `applyAggregation`/`applyJoin` do, and there is no runtime/dynamic filter — the
   build side's key values are not sent back to the probe scan, so a selective
   predicate on a *non-key* dimension column still reads the whole fact table.
+  And a CTE, derived table or table function used as a `JOIN`'s right side is
+  read without its own `WHERE` descending — only the one a query starts from
+  descends (§5).
 
 Deliberately partial:
 

@@ -891,8 +891,25 @@ const Ctx = struct {
         // The same rewrite the runtime applies, so the plan `EXPLAIN` prints is the
         // plan that runs — a filter shown below a join really did descend, and one
         // shown above it really did not.
-        const stages = (pushdown.hoistThroughJoins(self.arena, self.arena, pipe.stages, self.bindings) catch null) orelse pipe.stages;
-        if (stages.len == 0) return fail(self.diag, "empty pipeline", .{});
+        if (pipe.stages.len == 0) return fail(self.diag, "empty pipeline", .{});
+        // As the runtime does (`run.inlineHeadBindings`): a binding at the head is
+        // laid out in front of the rest, so its WHERE is shown descending.
+        var via: ?[]const u8 = null;
+        var head = pipe.stages;
+        var n: usize = 0;
+        while (head[0].node == .ref and n < 16) : (n += 1) {
+            const b = self.bindings.get(head[0].node.ref) orelse break;
+            if (b.stages.len == 0 or b.stages[0].node != .read) break;
+            if (for (b.stages) |st| {
+                if (st.node == .window) break true;
+            } else false) break;
+            via = via orelse head[0].node.ref;
+            const joined = try self.arena.alloc(ast.Stage, b.stages.len + head.len - 1);
+            @memcpy(joined[0..b.stages.len], b.stages);
+            @memcpy(joined[b.stages.len..], head[1..]);
+            head = joined;
+        }
+        const stages = (pushdown.hoistThroughJoins(self.arena, self.arena, head, self.bindings) catch null) orelse head;
         if (stages[stages.len - 1].node != .write)
             return fail(self.diag, "a top-level pipeline must end in `write`", .{});
         for (stages) |st| try checkStageLiterals(self.diag, st);
@@ -901,6 +918,7 @@ const Ctx = struct {
             self.diag.stamp(stages[0].pos);
             return e;
         };
+        if (via) |name| source.detail = try std.fmt.allocPrint(self.arena, "{s} (via binding {s})", .{ source.detail, name });
 
         var top_n: ?pushdown.ExplainedTopN = null;
         if (stages[0].node == .read) {
@@ -1799,6 +1817,32 @@ test "analyze a SQL table pipeline: unresolved schema offline, split candidate" 
     try std.testing.expect(o.source.schema == null);
     try std.testing.expect(o.physical.splittable);
     try std.testing.expectEqualStrings("(\"amount\" > 0)", o.source.pushdown);
+}
+
+test "analyze pushdown preview: a CTE, derived table or table function at the head sends its WHERE to the source" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const conn = "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', user = 'u', password = 'p', database = 'd');\n";
+    // Through a binding, the table used to be read whole and filtered in the engine.
+    const queries = [_][]const u8{
+        "LOAD INTO '/tmp/x.csv' AS WITH o AS (SELECT id, amount FROM pg.orders WHERE amount > 0) SELECT id FROM o;",
+        "LOAD INTO '/tmp/x.csv' AS SELECT id FROM (SELECT id, amount FROM pg.orders WHERE amount > 0) d;",
+        "CREATE FUNCTION pos(lo INT) RETURNS TABLE AS SELECT id, amount FROM pg.orders WHERE amount > $lo;\nLOAD INTO '/tmp/x.csv' AS SELECT id FROM pos(0);",
+    };
+    for (queries) |q| {
+        var diag = Diag{};
+        const plan = try analyze(a, try parse(a, try std.mem.concat(a, u8, &.{ conn, q })), &diag);
+        const src = plan.outputs[0].source;
+        try std.testing.expectEqualStrings("postgres", src.connector);
+        try std.testing.expectEqualStrings("(\"amount\" > 0)", src.pushdown);
+        try std.testing.expect(std.mem.indexOf(u8, src.detail, "(via binding ") != null);
+    }
+    // A window in the binding keeps it apart: the top-N over `rn` needs to see it so.
+    var diag = Diag{};
+    const w = try analyze(a, try parse(a, conn ++
+        "LOAD INTO '/tmp/x.csv' AS WITH r AS (SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM pg.orders WHERE amount > 0) SELECT id FROM r WHERE rn = 1;"), &diag);
+    try std.testing.expectEqualStrings("", w.outputs[0].source.pushdown);
 }
 
 test "analyze pushdown preview: raw PUSHDOWN AND-ed with the translated filter" {
