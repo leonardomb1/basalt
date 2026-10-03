@@ -178,6 +178,23 @@ fn decodeField(arena: std.mem.Allocator, enc: Encoding, s: []const u8) ![]const 
     return out.items;
 }
 
+/// The CSV-looking files of a folder listing, in order — a server's folder also
+/// holds PDFs and images, and reading one as CSV fails far from its name.
+fn keepCsvs(urls: []const []const u8) ![]const []const u8 {
+    const exts = [_][]const u8{ ".csv", ".tsv", ".txt", ".csv.gz", ".tsv.gz", ".txt.gz", ".csv.zst", ".tsv.zst", ".txt.zst" };
+    const kept: [][]const u8 = @constCast(urls);
+    var n: usize = 0;
+    for (urls) |u| {
+        for (exts) |x| if (std.ascii.endsWithIgnoreCase(u, x)) {
+            kept[n] = u;
+            n += 1;
+            break;
+        };
+    }
+    if (urls.len > 0 and n == 0) return error.NoCsvInFolder;
+    return kept[0..n];
+}
+
 pub const CsvReader = struct {
     arena: std.mem.Allocator,
     dialect: Dialect = .{},
@@ -245,7 +262,7 @@ pub const CsvReader = struct {
         };
         var first = path;
         if (sftp.isUrl(path) and std.mem.endsWith(u8, path, "/")) {
-            const urls = try sftp.listPrefix(arena, path);
+            const urls = try keepCsvs(try sftp.listPrefix(arena, path));
             if (urls.len == 0) return error.SftpEmptyFolder;
             first = urls[0];
             self.rest_urls = urls[1..];
@@ -253,7 +270,7 @@ pub const CsvReader = struct {
             const client = try arena.create(std.http.Client);
             client.* = http_client.initClient(arena);
             defer client.deinit();
-            const urls = try objstore.listPrefix(arena, client, path);
+            const urls = try keepCsvs(try objstore.listPrefix(arena, client, path));
             first = urls[0];
             self.rest_urls = urls[1..];
         }
@@ -1609,6 +1626,15 @@ test "Encoding.parse accepts the spellings the wild uses" {
     try std.testing.expectEqual(Encoding.utf8, Encoding.parse("UTF8").?);
     try std.testing.expect(Encoding.parse("latin9") == null);
     try std.testing.expect(Encoding.parse("") == null);
+}
+
+test "keepCsvs: a folder read takes its CSV-looking files, in order" {
+    var urls = [_][]const u8{ "sftp://b/in/a.csv", "sftp://b/in/logo.PNG", "sftp://b/in/b.TXT", "sftp://b/in/c.csv.gz" };
+    const got = try keepCsvs(&urls);
+    try std.testing.expectEqual(@as(usize, 3), got.len);
+    try std.testing.expectEqualStrings("sftp://b/in/b.TXT", got[1]);
+    var pics = [_][]const u8{ "sftp://b/in/x.png", "sftp://b/in/y.exe" };
+    try std.testing.expectError(error.NoCsvInFolder, keepCsvs(&pics));
 }
 
 test "decodeField: latin-1 and cp1252 widen to UTF-8, ASCII is passed through" {

@@ -528,6 +528,10 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
             // which prefix came back empty rather than blaming the CSV parser.
             if (e == azure.Error.AzureEmptyPrefix)
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no blobs under prefix `{s}`", .{rd.form.path}));
+            if (e == error.NoCsvInFolder)
+                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no .csv, .tsv or .txt file in folder `{s}`", .{rd.form.path}));
+            if (e == error.SftpEmptyFolder)
+                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no files in folder `{s}`", .{rd.form.path}));
             if (e == s3.Error.S3EmptyPrefix)
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no objects under prefix `{s}`", .{rd.form.path}));
             // A malformed container is not a CSV problem, and saying so sends the

@@ -545,6 +545,8 @@ if runs sftp; then
   docker cp src/connect/testdata/openpyxl.xlsx $SC:/config/in/book.xlsx
   printf 'id,v\n1,a\n' | docker exec -i $SC sh -c 'cat > /config/in/parts/p2.csv'
   printf 'id,v\n0,z\n' | docker exec -i $SC sh -c 'cat > /config/in/parts/p1.csv'
+  # a folder read skips what is not a CSV
+  head -c 4096 /dev/urandom | docker exec -i $SC sh -c 'cat > /config/in/parts/logo.png'
   docker exec $SC sh -c 'chown -R 1000:1000 /config/in'
   PW="CREATE CONNECTION box TYPE sftp OPTIONS (host = '127.0.0.1', port = 42222, user = 'basalt', password = 'it', known_hosts = '$out/known_hosts');"
   KEY="CREATE CONNECTION box TYPE sftp OPTIONS (host = '127.0.0.1', port = 42222, user = 'basalt', key_file = '$keydir/id_ed25519', known_hosts = '$out/known_hosts');"
