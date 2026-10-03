@@ -1300,8 +1300,8 @@ columns it has not seen.
   written inline; two calls in one query (even of one function) are independent,
   `WITH` clauses inside the body included. Without an alias, the function's name
   qualifies its columns (`paid.id`). Arguments are plan-time constants —
-  literals, `$params`, loop variables, and expressions over them — never a
-  column. Arity, defaults and literal-argument types are checked as for a scalar
+  literals, `$params`, loop variables, and expressions over them — except
+  under `JOIN LATERAL` (below). Arity, defaults and literal-argument types are checked as for a scalar
   function, the body is checked where it is declared, and an `@include`d table
   function is called like a local one. A body may call table functions declared
   before it; a call that reaches its own function (possible only through `OR
@@ -1316,6 +1316,31 @@ columns it has not seen.
     WHERE C5_FILIAL = $branch AND C5_EMISSAO >= $since;
 
   SELECT num, cliente FROM paid_orders($desde) WHERE cliente <> '000001';
+  ```
+
+  `CROSS JOIN LATERAL f(o.col) x` (or `JOIN LATERAL`, or `LEFT JOIN LATERAL …
+  ON TRUE` to keep rows with no match) passes each row's column. It is not a
+  query per row: where the body says `column = $param`, that conjunct leaves the
+  body and the call becomes an ordinary hash join `ON o.col = x.column` — the
+  table is read once, its other conditions still reach the source, and lanes
+  apply as to any join. So the body has to be one the join can stand for: a
+  read, joins, filters and a SELECT list, with the parameter only in `column =
+  $param` conjuncts of its WHERE (or on its own as a SELECT item, which is then
+  that column). A `LIMIT`, `DISTINCT`, `GROUP BY`, window or set operation, a
+  parameter compared any other way, or one never compared at all is refused at
+  plan time, naming it: a join could not apply them per row. A body that does
+  not select the column joins on it under the parameter's name, which `x.*`
+  then shows. Constant arguments in the same call stay constants.
+
+  ```sql
+  CREATE FUNCTION itens(pedido) RETURNS TABLE AS
+    SELECT C6_ITEM AS item, C6_PRODUTO AS produto, C6_QTDVEN AS qtd
+    FROM erp.dbo.SC6010 PUSHDOWN($$D_E_L_E_T_ <> '*'$$)
+    WHERE C6_NUM = $pedido;
+
+  -- one read of SC6010, joined on C6_NUM = p.num
+  SELECT p.num, p.cliente, i.produto, i.qtd
+  FROM paid_orders($desde) p CROSS JOIN LATERAL itens(p.num) i;
   ```
 
 ### `DESCRIBE` and `SHOW TABLES`

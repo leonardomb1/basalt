@@ -224,6 +224,7 @@ fn comparable(a: Type, b: Type) bool {
 /// vectorizer does not cover (string functions, `match`) transparently fall back
 /// to the row-at-a-time evaluator below.
 pub fn evalColumn(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, out_ty: Type) EvalError!column.Column {
+    forgetFailure();
     const v = evalVec(arena, expr, batch) catch |e| switch (e) {
         error.Unsupported => return evalColumnRowwise(arena, expr, batch, out_ty),
         error.CastFailed => return error.CastFailed,
@@ -1140,6 +1141,7 @@ fn isEmptyVal(v: Value) bool {
 }
 
 pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, row: usize) EvalError!Value {
+    forgetFailure();
     switch (expr.*) {
         .null_lit => return .null,
         .bool_lit => |b| return .{ .bool = b },
@@ -4103,6 +4105,13 @@ fn failWith(e: EvalError, comptime fmt: []const u8, args: anytype) EvalError {
     n.len = msg.len;
     n.err = e;
     return e;
+}
+
+/// Drop a note nobody reported. Evaluation starting again means the failure it
+/// explained was swallowed — by a TRY_CAST, a json_transform element, the
+/// vectorized path falling back — and a later error must not inherit it.
+inline fn forgetFailure() void {
+    if (fail_note.err != null) fail_note.err = null;
 }
 
 /// The note for `e`, once: null when the last failure was not `e`.

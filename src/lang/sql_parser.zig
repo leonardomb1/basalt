@@ -1865,11 +1865,17 @@ pub const Parser = struct {
                 if (self.isKw("join")) break :blk .inner;
                 break :blk null;
             };
-            const kind = jk orelse break;
+            var kind = jk orelse break;
             if (!self.isKw("join")) _ = self.advance();
             _ = self.eatKw("outer");
             try self.expectKw("join");
             const jpos = self.curPos();
+            const lateral = self.eatKw("lateral");
+            if (lateral and (kind != .cross and kind != .inner and kind != .left))
+                return self.fail(jpos, "LATERAL joins are CROSS, INNER or LEFT", .{});
+            if (lateral and !(self.at(.ident) and self.peekTag() == .lparen))
+                return self.fail(self.curPos(), "JOIN LATERAL takes a table function call — `JOIN LATERAL f(o.col) x`", .{});
+            var lateral_keys: []const LateralKey = &.{};
             // `CROSS JOIN UNNEST(...)` is the row-expanding form and stays an
             // explode stage; `CROSS JOIN <cte>` is the cartesian product.
             if (kind == .cross and self.isKw("unnest")) {
@@ -1924,7 +1930,9 @@ pub const Parser = struct {
                 if (self.at(.lparen)) {
                     const fd = self.findTableFn(binding) orelse
                         return self.fail(bpos, "unknown table function `{s}` — declare it with CREATE FUNCTION {s}(...) RETURNS TABLE AS SELECT ...", .{ binding, binding });
-                    binding = try self.callTableFn(fd, bpos);
+                    const call = try self.callTableFn(fd, bpos, if (lateral) .lateral else .join);
+                    binding = call.binding;
+                    lateral_keys = call.keys;
                     // The call's own name qualifies its columns unless an alias follows.
                     if (!(self.at(.ident) and !isReservedAfterSource(self.cur().text))) jalias = written;
                 } else if (if (self.tvf) |f| f.cte(binding) else null) |bname| {
@@ -1941,7 +1949,21 @@ pub const Parser = struct {
             } else try self.claimAlias(&aliases, binding, bpos, .reserved);
             var left_keys = std.array_list.Managed(ast.QualName).init(self.arena);
             var right_keys = std.array_list.Managed(ast.QualName).init(self.arena);
-            if (kind == .cross) {
+            for (lateral_keys) |lk| {
+                try left_keys.append(stripQual(lk.left, &aliases));
+                const rp = try self.arena.alloc([]const u8, 1);
+                rp[0] = lk.right;
+                try right_keys.append(.{ .parts = rp });
+            }
+            // A LATERAL call's keys come from its arguments: CROSS is then an inner
+            // join on them, and ON is optional (`ON TRUE` is Postgres' spelling).
+            if (lateral and lateral_keys.len > 0 and kind == .cross) kind = .inner;
+            if (lateral and self.isKw("on") and self.peekTag() == .ident and eqlNoCase(self.peekTok().text, "true")) {
+                _ = self.advance();
+                _ = self.advance();
+            } else if (lateral and lateral_keys.len > 0 and !self.isKw("on")) {
+                // keys from the call alone
+            } else if (kind == .cross) {
                 if (self.isKw("on"))
                     return self.fail(self.curPos(), "CROSS JOIN takes no ON clause — it pairs every row with every row", .{});
             } else {
@@ -2563,10 +2585,19 @@ pub const Parser = struct {
         return toks;
     }
 
+    /// A `JOIN LATERAL f(o.col)` argument that names a column of the left side:
+    /// where the body says `x = $param`, the join says `o.col = <x as output>`.
+    const LateralKey = struct { left: ast.QualName, right: []const u8 };
+
+    const TableCall = struct { binding: []const u8, keys: []const LateralKey = &.{} };
+
     /// `f(args)` in FROM or JOIN, the name already consumed: bind the arguments,
     /// re-parse the body with them, and lower the result to a binding exactly as a
     /// derived table is — so a filter on the call still descends to the source.
-    fn callTableFn(self: *Parser, fd: ast.FnDecl, pos: Pos) Error![]const u8 {
+    /// `lateral` (a `JOIN LATERAL`) lets an argument be a left-side column; see
+    /// `decorrelate`.
+    fn callTableFn(self: *Parser, fd: ast.FnDecl, pos: Pos, place: enum { from, join, lateral }) Error!TableCall {
+        const lateral = place == .lateral;
         _ = try self.expect(.lparen);
         var args = std.array_list.Managed(*ast.Expr).init(self.arena);
         if (!self.at(.rparen)) {
@@ -2587,12 +2618,24 @@ pub const Parser = struct {
         }
         for (fd.params[n..]) |p| try args.append(p.default.?);
         const names = try self.arena.alloc([]const u8, fd.params.len);
-        for (fd.params, args.items, names, 1..) |p, a, *nm, i| {
+        var correlated = std.array_list.Managed(Correlated).init(self.arena);
+        for (fd.params, args.items, names, 1..) |p, *a, *nm, i| {
             nm.* = p.name;
-            if (!self.constItemExpr(a))
+            if (!self.constItemExpr(a.*)) {
+                const column = a.*.* == .field and !a.*.field.dollar;
+                if (lateral and column) {
+                    // The body sees a marker in its place, found again by pointer.
+                    const marker = try self.mk(.{ .field = .{ .parts = try self.arena.dupe([]const u8, &.{ "\x00lateral", p.name }) } });
+                    try correlated.append(.{ .param = p.name, .left = a.*.field, .marker = marker });
+                    a.* = marker;
+                    continue;
+                }
+                if (column and place == .join)
+                    return self.fail(pos, "`{s}`: argument {d} (`{s}`) names a column — pass a row's value with `JOIN LATERAL {s}(...)`", .{ fd.name, i, p.name, fd.name });
                 return self.fail(pos, "`{s}`: argument {d} (`{s}`) must be a constant — a literal, a `$param`, or an expression over them", .{ fd.name, i, p.name });
+            }
             const want = (p.ty orelse continue).kind;
-            const got = expand.literalKind(a) orelse continue;
+            const got = expand.literalKind(a.*) orelse continue;
             if (!expand.acceptsLiteral(want, got))
                 return self.fail(pos, "`{s}`: argument {d} (`{s}`) expects {s}, got {s}", .{ fd.name, i, p.name, expand.typeWord(want), expand.typeWord(got) });
         }
@@ -2618,6 +2661,7 @@ pub const Parser = struct {
         var stages = std.array_list.Managed(ast.Stage).init(self.arena);
         self.parseQuery(&inner, &stages) catch |e| return self.inTableFn(e, fd.name, pos);
         _ = self.expect(.semi) catch |e| return self.inTableFn(e, fd.name, pos);
+        const keys = if (correlated.items.len == 0) &.{} else try self.decorrelate(fd.name, pos, &stages, inner.items, correlated.items);
 
         const bname = try std.fmt.allocPrint(self.arena, "__tvf{d}_{s}", .{ frame.id, fd.name });
         try self.let_names.append(bname);
@@ -2627,7 +2671,111 @@ pub const Parser = struct {
             .pipeline = .{ .stages = try stages.toOwnedSlice(), .pos = pos },
             .pos = pos,
         } });
-        return bname;
+        return .{ .binding = bname, .keys = keys };
+    }
+
+    const Correlated = struct { param: []const u8, left: ast.QualName, marker: *ast.Expr };
+
+    /// Turn a body that a `JOIN LATERAL` passes a column into one the join can read
+    /// once: each `x = $param` conjunct leaves the WHERE, `x` is made an output of
+    /// the body (under its output name, or the parameter's when the SELECT list
+    /// leaves it out), and the join matches it against the row's column. One read
+    /// of the source and a hash join, instead of a query per row.
+    ///
+    /// Only where that changes nothing: the body is a read, joins, filters and a
+    /// SELECT list. A LIMIT, DISTINCT, GROUP BY or window would see every row the
+    /// equality used to keep out — "first item of the order" would become every
+    /// item — so they are refused, as is any use of `$param` but `x = $param`
+    /// (and the parameter echoed as a SELECT item, which is then `x`).
+    fn decorrelate(self: *Parser, name: []const u8, pos: Pos, stages: *std.array_list.Managed(ast.Stage), inner: []const ast.Stmt, cor: []const Correlated) Error![]const LateralKey {
+        const p0 = cor[0].param;
+        for (stages.items) |st| switch (st.node) {
+            .read, .ref, .join, .filter, .select => {},
+            else => return self.fail(pos, "`{s}`: a row's column passed as `${s}` needs a body that is a plain SELECT ... FROM ... WHERE — this one has {s}, which the join could not apply per row", .{ name, p0, stageWord(st.node) }),
+        };
+        for (inner) |stmt| {
+            if (stmt != .binding) continue;
+            for (stmt.binding.pipeline.stages) |st| {
+                if (stageMentions(st, cor)) |pn|
+                    return self.fail(pos, "`{s}`: `${s}` reaches a WITH or a table function inside the body — with a row's column, it may only appear as `column = ${s}` in the body's WHERE", .{ name, pn, pn });
+            }
+        }
+
+        var eqs = std.array_list.Managed(struct { cor: usize, col: ast.QualName }).init(self.arena);
+        var k: usize = 0;
+        while (k < stages.items.len) {
+            const st = &stages.items[k];
+            if (st.node != .filter) {
+                k += 1;
+                continue;
+            }
+            var parts = std.array_list.Managed(*ast.Expr).init(self.arena);
+            try splitConj(st.node.filter, &parts);
+            var keep = std.array_list.Managed(*ast.Expr).init(self.arena);
+            for (parts.items) |cj| {
+                if (eqOfMarker(cj, cor)) |m| {
+                    try eqs.append(.{ .cor = m.cor, .col = m.col });
+                    continue;
+                }
+                for (cor) |c| if (containsExpr(cj, c.marker))
+                    return self.fail(pos, "`{s}`: with a row's column, `${s}` may only appear as `column = ${s}` in the body's WHERE", .{ name, c.param, c.param });
+                try keep.append(cj);
+            }
+            if (keep.items.len == 0) {
+                _ = stages.orderedRemove(k);
+                continue;
+            }
+            var e = keep.items[0];
+            for (keep.items[1..]) |r| e = try self.mk(.{ .binary = .{ .op = .@"and", .l = e, .r = r } });
+            st.node = .{ .filter = e };
+            k += 1;
+        }
+        for (cor, 0..) |c, ci| {
+            for (eqs.items) |q| {
+                if (q.cor == ci) break;
+            } else return self.fail(pos, "`{s}`: `${s}` gets a row's column, but the body never says `column = ${s}` in its WHERE — that is what the join matches on", .{ name, c.param, c.param });
+        }
+
+        // The SELECT list: a parameter echoed back is its column, and each
+        // matched column needs an output name to join on.
+        var sel_at: ?usize = null;
+        for (stages.items, 0..) |st, i| if (st.node == .select) {
+            sel_at = i;
+        };
+        var items = std.array_list.Managed(ast.SelectItem).init(self.arena);
+        if (sel_at) |si| try items.appendSlice(stages.items[si].node.select) else try items.append(.star);
+        for (items.items) |*it| {
+            if (it.* != .computed) continue;
+            for (cor, 0..) |c, ci| {
+                if (it.computed.expr == c.marker) {
+                    const q = for (eqs.items) |e| {
+                        if (e.cor == ci) break e.col;
+                    } else unreachable;
+                    it.computed.expr = try self.mk(.{ .field = q });
+                } else if (containsExpr(it.computed.expr, c.marker))
+                    return self.fail(pos, "`{s}`: with a row's column, `${s}` may only be a SELECT item on its own (it is then the column it equals)", .{ name, c.param });
+            }
+        }
+        const keys = try self.arena.alloc(LateralKey, eqs.items.len);
+        for (eqs.items, keys) |q, *key| {
+            const out = outputNameOf(items.items, q.col) orelse blk: {
+                const pn = cor[q.cor].param;
+                for (items.items) |it| {
+                    const taken = switch (it) {
+                        .field => |f| std.mem.eql(u8, f.last(), pn),
+                        .computed => |cc| std.mem.eql(u8, cc.name, pn),
+                        else => false,
+                    };
+                    if (taken) return self.fail(pos, "`{s}`: the body's output already has a column `{s}`; select `{s}` so the join can match on it", .{ name, pn, q.col.last() });
+                }
+                try items.append(.{ .computed = .{ .name = pn, .expr = try self.mk(.{ .field = q.col }) } });
+                break :blk pn;
+            };
+            key.* = .{ .left = cor[q.cor].left, .right = out };
+        }
+        const sel = ast.Stage{ .node = .{ .select = try items.toOwnedSlice() }, .hints = &.{}, .pos = pos };
+        if (sel_at) |si| stages.items[si] = sel else try stages.append(sel);
+        return keys;
     }
 
     /// An error inside a table function's body is positioned in its declaration;
@@ -2718,6 +2866,78 @@ pub const Parser = struct {
                 else => return null,
             }
         }
+        return null;
+    }
+
+    /// What a stage is, for an error that refuses it.
+    fn stageWord(n: ast.Stage.Node) []const u8 {
+        return switch (n) {
+            .aggregate => "a GROUP BY or an aggregate",
+            .distinct => "DISTINCT",
+            .limit => "a LIMIT",
+            .sort => "an ORDER BY",
+            .window => "a window function",
+            .union_ => "a UNION, INTERSECT or EXCEPT",
+            .explode => "an UNNEST",
+            else => @tagName(n),
+        };
+    }
+
+    /// The parameter a stage passes a `JOIN LATERAL` marker to, if any.
+    fn stageMentions(st: ast.Stage, cor: []const Correlated) ?[]const u8 {
+        for (cor) |c| {
+            const hit = switch (st.node) {
+                .filter => |e| containsExpr(e, c.marker),
+                .select => |items| for (items) |it| {
+                    if (it == .computed and containsExpr(it.computed.expr, c.marker)) break true;
+                } else false,
+                else => false,
+            };
+            if (hit) return c.param;
+        }
+        return null;
+    }
+
+    fn splitConj(e: *ast.Expr, out: *std.array_list.Managed(*ast.Expr)) Error!void {
+        if (e.* == .binary and e.binary.op == .@"and") {
+            try splitConj(e.binary.l, out);
+            try splitConj(e.binary.r, out);
+        } else try out.append(e);
+    }
+
+    /// `col = $p` or `$p = col` for a `JOIN LATERAL` marker: which one, and `col`.
+    fn eqOfMarker(e: *const ast.Expr, cor: []const Correlated) ?struct { cor: usize, col: ast.QualName } {
+        if (e.* != .binary or e.binary.op != .eq) return null;
+        const b = e.binary;
+        for (cor, 0..) |c, i| {
+            const other = if (b.l == c.marker) b.r else if (b.r == c.marker) b.l else continue;
+            if (other.* != .field or other.field.dollar) return null;
+            return .{ .cor = i, .col = other.field };
+        }
+        return null;
+    }
+
+    /// The name `col` leaves the SELECT list under, when the list passes it
+    /// through — as itself, renamed by `AS`, or in a `*` — and null otherwise. A
+    /// computed item that only shares the name (`trim(c) AS c`) is not it.
+    fn outputNameOf(items: []const ast.SelectItem, col: ast.QualName) ?[]const u8 {
+        const nm = col.last();
+        for (items) |it| switch (it) {
+            .field => |f| if (std.mem.eql(u8, f.last(), nm)) return nm,
+            .computed => |cc| if (cc.expr.* == .field and std.mem.eql(u8, cc.expr.field.last(), nm)) return cc.name,
+            .star => return nm,
+            .star_except => |ex| {
+                for (ex) |x| {
+                    if (std.mem.eql(u8, x, nm)) break;
+                } else return nm;
+            },
+            .star_rename => |rn| {
+                for (rn) |r| {
+                    if (std.mem.eql(u8, r.from, nm)) return r.to;
+                }
+                return nm;
+            },
+        };
         return null;
     }
 
@@ -3049,7 +3269,7 @@ pub const Parser = struct {
             if (self.at(.lparen)) {
                 const fd = self.findTableFn(head) orelse
                     return self.fail(pos, "unknown table function `{s}` — declare it with CREATE FUNCTION {s}(...) RETURNS TABLE AS SELECT ...", .{ head, head });
-                const bname = try self.callTableFn(fd, pos);
+                const bname = (try self.callTableFn(fd, pos, .from)).binding;
                 _ = self.eatKw("as");
                 if (self.at(.ident) and !isReservedAfterSource(self.cur().text)) {
                     try self.claimAlias(aliases, self.advance().text, self.prevPos(), .left);
@@ -4654,6 +4874,34 @@ test "sql: a lambda's parameter is its own node in the body, never a column" {
     const p5 = try parseSource(a, "SELECT coalesce((a), b) AS v FROM 'in.csv';", &diag);
     try testing.expect(p5.stmts[1].output.stages[1].node.select[0].computed.expr.call.args[0].* == .field);
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT json_reduce(tags, 0, (x, x) -> x) AS v FROM 'in.csv';", &diag));
+}
+
+test "sql: JOIN LATERAL refuses a body the join could not apply per row" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const cases = [_]struct { body: []const u8, says: []const u8 }{
+        .{ .body = "SELECT x FROM 't.csv' WHERE k = $p LIMIT 1", .says = "a LIMIT" },
+        .{ .body = "SELECT DISTINCT x FROM 't.csv' WHERE k = $p", .says = "DISTINCT" },
+        .{ .body = "SELECT k, COUNT(*) AS n FROM 't.csv' WHERE k = $p GROUP BY k", .says = "GROUP BY" },
+        .{ .body = "SELECT x FROM 't.csv' WHERE k > $p", .says = "may only appear as `column = $p`" },
+        .{ .body = "SELECT x FROM 't.csv' WHERE k = $p OR x = 1", .says = "may only appear as `column = $p`" },
+        .{ .body = "SELECT x, upper($p) AS u FROM 't.csv' WHERE k = $p", .says = "SELECT item on its own" },
+        .{ .body = "SELECT x FROM 't.csv'", .says = "never says `column = $p`" },
+    };
+    for (cases) |c| {
+        var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const src = try std.fmt.allocPrint(a, "CREATE FUNCTION f(p) RETURNS TABLE AS {s}; SELECT o.id FROM 'o.csv' o CROSS JOIN LATERAL f(o.id) i;", .{c.body});
+        try testing.expectError(error.ParseFailed, parseSource(a, src, &diag));
+        if (std.mem.indexOf(u8, diag.msg, c.says) == null) {
+            std.debug.print("for `{s}` got: {s}\n", .{ c.body, diag.msg });
+            return error.TestUnexpectedResult;
+        }
+    }
+    // Without LATERAL, a column argument says how to pass one.
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a, "CREATE FUNCTION f(p) RETURNS TABLE AS SELECT x FROM 't.csv' WHERE k = $p; SELECT o.id FROM 'o.csv' o CROSS JOIN f(o.id) i;", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "JOIN LATERAL") != null);
 }
 
 test "sql: EXPLAIN COSTS is rejected in either position" {

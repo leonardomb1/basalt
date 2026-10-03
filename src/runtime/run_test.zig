@@ -3430,6 +3430,59 @@ test "a CSV read with a delimiter and an encoding fans out over lanes and reads 
     try std.testing.expectEqualStrings(want, lanes);
 }
 
+test "JOIN LATERAL passes a row's column to a table function as a join on it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Orders (kind o) and their items (kind i) in one file; order 4 has no items
+    // and one order number is empty.
+    const input = "kind,num,prod,qty\no,1,,\no,2,,\no,,,\no,4,,\ni,1,X,5\ni,1,Y,2\ni,2,Z,1\ni,,N,9\n";
+    const fns =
+        \\CREATE FUNCTION itens(pedido, minq INT DEFAULT 0) RETURNS TABLE AS
+        \\  SELECT num AS item_num, prod, qty, $pedido AS eco FROM '$IN' WHERE kind = 'i' AND qty > $minq AND num = $pedido;
+        \\CREATE FUNCTION nomes(pedido) RETURNS TABLE AS
+        \\  SELECT prod FROM '$IN' WHERE num = $pedido AND kind = 'i';
+        \\
+    ;
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        // CROSS: an inner join on the argument; a null order matches nothing; the
+        // echoed parameter is the row's value; a constant argument still filters.
+        .{ .q = "SELECT o.num, i.prod, i.eco FROM (SELECT num FROM '$IN' WHERE kind = 'o') o CROSS JOIN LATERAL itens(o.num, 1) i ORDER BY o.num, i.prod", .want = "num,prod,eco\n1,X,1\n1,Y,1\n" },
+        // LEFT ... ON TRUE keeps an order with no items.
+        .{ .q = "SELECT o.num, i.prod FROM (SELECT num FROM '$IN' WHERE kind = 'o') o LEFT JOIN LATERAL itens(o.num) i ON TRUE ORDER BY o.num, i.prod", .want = "num,prod\n1,X\n1,Y\n2,Z\n4,\n,\n" },
+        // A body that does not select the column joins on it under the parameter's name.
+        .{ .q = "SELECT o.num, n.prod, n.pedido FROM (SELECT num FROM '$IN' WHERE kind = 'o') o JOIN LATERAL nomes(o.num) n ORDER BY n.prod", .want = "num,prod,pedido\n1,X,1\n1,Y,1\n2,Z,2\n" },
+    };
+    for (cases) |c| {
+        const q = try std.fmt.allocPrint(alloc, "{s}", .{c.q});
+        defer alloc.free(q);
+        try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = input });
+        const base = try tmp.dir.realpathAlloc(alloc, ".");
+        defer alloc.free(base);
+        const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
+        defer alloc.free(in_path);
+        const raw = try std.fmt.allocPrint(alloc, "{s}LOAD INTO '{s}/out.csv' AS {s};", .{ fns, base, c.q });
+        defer alloc.free(raw);
+        const script = try std.mem.replaceOwned(u8, alloc, raw, "$IN", in_path);
+        defer alloc.free(script);
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = parser.parseSource(parena.allocator(), script, &pdiag) catch |e| {
+            std.debug.print("parse error: {s}\n", .{pdiag.msg});
+            return e;
+        };
+        var rdiag: Diag = .{};
+        _ = run(alloc, prog, .{}, &rdiag) catch |e| {
+            std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+            return e;
+        };
+        const got = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
+}
+
 test "a FOR EACH discovery query may read a table function, a derived table or a CTE" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
