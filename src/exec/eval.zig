@@ -684,12 +684,21 @@ fn castVec(arena: std.mem.Allocator, c: ast.Expr.Cast, batch: Batch) VecError!Ve
     const v = try evalVec(arena, c.e, batch);
     const target = c.ty.kind;
     if (target == .decimal) return error.Unsupported;
+    // A value that does not convert sends the expression to the rowwise path,
+    // which stops at that row and names it; the column kernel only knows that
+    // one failed somewhere.
     switch (v) {
         .scalar => |s| {
             if (s.isNull()) return .{ .scalar = .null };
-            return .{ .scalar = try castValue(arena, s, target) };
+            return .{ .scalar = castValue(arena, s, target) catch |e| switch (e) {
+                error.CastFailed => return error.Unsupported,
+                else => return e,
+            } };
         },
-        .col => |col| return castColVec(arena, col, target, batch.len),
+        .col => |col| return castColVec(arena, col, target, batch.len) catch |e| switch (e) {
+            error.CastFailed => return error.Unsupported,
+            else => return e,
+        },
     }
 }
 
@@ -1187,7 +1196,10 @@ pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, ro
         .cast => |c| {
             const v = try evalRow(arena, c.e, batch, row);
             if (v.isNull()) return .null;
-            if (!c.safe) return castValueTyped(arena, v, c.ty);
+            if (!c.safe) return castValueTyped(arena, v, c.ty) catch |e| switch (e) {
+                error.CastFailed => return castFailure(arena, v, c.ty),
+                else => return e,
+            };
             // `try_cast`: a failed conversion is a null, not an error.
             const out: Value = castValueTyped(arena, v, c.ty) catch |e| {
                 if (e == error.CastFailed) return .null;
@@ -4107,6 +4119,26 @@ fn failWith(e: EvalError, comptime fmt: []const u8, args: anytype) EvalError {
     return e;
 }
 
+/// A CAST that failed, saying which value and to what — `'31/12/2026' is not a
+/// DATE` — with the format a date or time is read in, since that is what a
+/// file in another convention trips over.
+fn castFailure(arena: std.mem.Allocator, v: Value, ty: Type) EvalError {
+    const text = clip(valueToString(arena, v) catch "?");
+    const want: []const u8 = switch (ty.kind) {
+        .int => "an INT",
+        .float => "a FLOAT",
+        .bool => "a BOOL",
+        .decimal => "a DECIMAL",
+        .date => "a DATE (YYYY-MM-DD; strptime reads other formats)",
+        .timestamp => "a TIMESTAMP (YYYY-MM-DD HH:MM:SS; strptime reads other formats)",
+        .time => "a TIME (HH:MM[:SS])",
+        else => @tagName(ty.kind),
+    };
+    if (ty.kind == .decimal)
+        return failWith(error.CastFailed, "CAST: '{s}' is not a DECIMAL({d},{d})", .{ text, ty.precision, ty.scale });
+    return failWith(error.CastFailed, "CAST: '{s}' is not {s}", .{ text, want });
+}
+
 /// Drop a note nobody reported. Evaluation starting again means the failure it
 /// explained was swallowed — by a TRY_CAST, a json_transform element, the
 /// vectorized path falling back — and a later error must not inherit it.
@@ -5286,6 +5318,18 @@ test "array helpers: chars, json_range, json_length, json_slice, json_concat" {
     try std.testing.expect((try evalLit(a, "json_concat('[1]', NULL)")) == .null);
     // The CNPJ check digit, as language.md writes it.
     try std.testing.expectEqual(@as(i64, 8), (try evalLit(a, "11 - json_reduce(chars('112223330001'), 0, (acc, c, i) -> acc + (ascii(c) - 48) * CAST(json_get('[5,4,3,2,9,8,7,6,5,4,3,2]', CAST(i AS STRING)) AS INT)) % 11")).int);
+}
+
+test "a failed CAST names its value and type, and TRY_CAST leaves no note" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectError(error.CastFailed, evalLit(a, "CAST('03/10/2026' AS DATE)"));
+    try std.testing.expectEqualStrings("CAST: '03/10/2026' is not a DATE (YYYY-MM-DD; strptime reads other formats)", takeFailure(error.CastFailed).?);
+    try std.testing.expectError(error.CastFailed, evalLit(a, "CAST('1,5' AS DECIMAL(10,2))"));
+    try std.testing.expectEqualStrings("CAST: '1,5' is not a DECIMAL(10,2)", takeFailure(error.CastFailed).?);
+    try std.testing.expect((try evalLit(a, "TRY_CAST('x' AS INT)")) == .null);
+    try std.testing.expect(takeFailure(error.CastFailed) == null);
 }
 
 test "check-time errors: bad strftime directive, sub-day date_add on a date" {
