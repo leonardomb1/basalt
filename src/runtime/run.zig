@@ -57,6 +57,7 @@ pub const takeReload = @import("env.zig").takeReload;
 const buildParallelSink = @import("connect.zig").buildParallelSink;
 const dupeSchema = @import("connect.zig").dupeSchema;
 const guardFileFormat = @import("connect.zig").guardFileFormat;
+const registerSftp = @import("connect.zig").registerSftp;
 const isLocalCsvRead = @import("connect.zig").isLocalCsvRead;
 const isLocalParquetRead = @import("connect.zig").isLocalParquetRead;
 const openSink = @import("connect.zig").openSink;
@@ -193,6 +194,9 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         if (s == .kind) buffer_decl = s.kind.buffer;
     }
     var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .buffer_decl = buffer_decl, .buffer_segment = opts.buffer_segment, .load_label_prefix = opts.load_label_prefix, .load_run_id = opts.load_run_id, .stdout_format = opts.stdout_format, .explain = opts.explain, .line_base = opts.line_base, .on_result = opts.on_result, .max_rows = opts.max_rows, .on_let = opts.on_let, .on_load = opts.on_load, .kind_name = @tagName(program.stmts[0].kind.kind), .fns = &fns };
+
+    var cit = connections.valueIterator();
+    while (cit.next()) |c| try registerSftp(&env, c.*);
 
     var batch_arena = std.heap.ArenaAllocator.init(gpa);
     defer batch_arena.deinit();
@@ -374,7 +378,10 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
         .call => |c| try runCall(env, c, no_loop_vars, opts, stats, lanes_used, batch_arena, runForBody),
         .throw => |t| try runThrow(env, t, no_loop_vars),
         .binding => |b| try env.bindings.put(b.name, try renderScriptScope(env, b.pipeline)),
-        .connection => |c| try env.connections.put(c.name, c),
+        .connection => |c| {
+            try env.connections.put(c.name, c);
+            try registerSftp(env, c);
+        },
         // A LET is folded once, before anything runs; one nested in a branch would
         // silently miss that pass, so say so instead of resolving to nothing.
         .let_const => |l| return planErr(env.diag, try std.fmt.allocPrint(env.arena, "LET `{s}` must be declared at the top level of the script", .{l.name})),

@@ -1908,6 +1908,7 @@ const driver = @import("driver.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const http_client = @import("http_client.zig");
 const objstore = @import("objstore.zig");
+const sftp = @import("sftp.zig");
 
 /// Byte source a reader pulls from: a local file read on demand, or an already
 /// resident buffer.
@@ -1920,12 +1921,24 @@ pub const Bytes = union(enum) {
     memory: []const u8,
     file: struct { f: std.fs.File, size: u64 },
     remote: *Remote,
+    /// A file on an SFTP server, read by offset.
+    sftp: *sftp.File,
+
+    /// Where `path` is read from: an SFTP server, an HTTP range, or the disk.
+    pub fn open(arena: std.mem.Allocator, path: []const u8) !Bytes {
+        if (sftp.isUrl(path)) return .{ .sftp = try sftp.File.open(arena, path) };
+        if (isRemote(path)) return .{ .remote = try Remote.open(arena, path) };
+        const f = try std.fs.cwd().openFile(path, .{});
+        errdefer f.close();
+        return .{ .file = .{ .f = f, .size = (try f.stat()).size } };
+    }
 
     pub fn size(self: Bytes) u64 {
         return switch (self) {
             .memory => |m| m.len,
             .file => |x| x.size,
             .remote => |r| r.total,
+            .sftp => |f| f.size,
         };
     }
 
@@ -1949,6 +1962,13 @@ pub const Bytes = union(enum) {
                 if (off + len > r.total) return Error.CorruptParquetPage;
                 return r.read(arena, off, len);
             },
+            .sftp => |f| {
+                if (off + len > f.size) return Error.CorruptParquetPage;
+                return f.read(arena, off, len) catch |e| switch (e) {
+                    error.EndOfStream => Error.CorruptParquetPage,
+                    else => e,
+                };
+            },
         }
     }
 
@@ -1957,6 +1977,7 @@ pub const Bytes = union(enum) {
             .memory => {},
             .file => |x| x.f.close(),
             .remote => |r| r.client.deinit(),
+            .sftp => |f| f.close(),
         }
     }
 };
@@ -2185,12 +2206,7 @@ pub const Reader = struct {
         // Local files read by pread, remote objects by HTTP range — the same
         // footer-then-chunks access pattern either way, so a projected query
         // over an object store transfers only what it decodes.
-        const src: Bytes = if (isRemote(path))
-            .{ .remote = try Remote.open(arena, path) }
-        else blk: {
-            const f = try std.fs.cwd().openFile(path, .{});
-            break :blk .{ .file = .{ .f = f, .size = (try f.stat()).size } };
-        };
+        const src = try Bytes.open(arena, path);
         errdefer src.close();
 
         var footer_start: u64 = 0;

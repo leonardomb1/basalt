@@ -64,6 +64,19 @@ pub const Config = struct {
 
 const client_version = "SSH-2.0-basalt";
 
+/// Why the last session on this thread failed, kept past the session: a failed
+/// `connect` frees it before the caller could ask.
+threadlocal var failure_buf: [512]u8 = undefined;
+threadlocal var failure_len: usize = 0;
+
+pub fn lastFailure() []const u8 {
+    return failure_buf[0..failure_len];
+}
+
+pub fn clearFailure() void {
+    failure_len = 0;
+}
+
 // message numbers (RFC 4250 §4.1)
 const msg = struct {
     const disconnect = 1;
@@ -412,6 +425,9 @@ pub const Session = struct {
     fn fail(self: *Session, e: Error, comptime fmt: []const u8, args: anytype) Error {
         self.why.clearRetainingCapacity();
         self.why.writer().print(fmt, args) catch {};
+        const n = @min(self.why.items.len, failure_buf.len);
+        @memcpy(failure_buf[0..n], self.why.items[0..n]);
+        failure_len = n;
         return e;
     }
 

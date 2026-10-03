@@ -12,6 +12,7 @@ const pqdecode = @import("../connect/pqdecode.zig");
 const pqwrite = @import("../connect/pqwrite.zig");
 const arrowread = @import("../connect/arrowread.zig");
 const xlsx = @import("../connect/xlsx.zig");
+const sftp = @import("../connect/sftp.zig");
 const JsonWriter = @import("../connect/table.zig").JsonWriter;
 const arrow = @import("../connect/arrow.zig");
 const ArrowWriter = arrow.ArrowWriter;
@@ -1459,6 +1460,50 @@ fn resolveStreamLoadConfig(env: *Env, conn: ast.Connection, flavor: streamload.F
     if (env.load_label_prefix) |lp| cfg.label_prefix = lp;
     if (env.load_run_id) |rid| cfg.run_id = rid;
     return cfg;
+}
+
+/// Make a `CREATE CONNECTION name TYPE sftp` reachable as `sftp://name/…`.
+/// A password is optional (a key logs in without one), so the convention's
+/// `NAME_PASS` default may be unset; an option it does not know is an error
+/// naming the ones it does.
+pub fn registerSftp(env: *Env, conn: ast.Connection) !void {
+    if (!std.mem.eql(u8, conn.connector, "sftp")) return;
+    var c = sftp.Conn{ .host = "" };
+    for (conn.config) |attr| {
+        const k = attr.key;
+        if (std.mem.eql(u8, k, "port")) {
+            c.port = std.math.cast(u16, try evalCfgInt(env, attr.value)) orelse return planErr(env.diag, "sftp connection `port` is out of range");
+            continue;
+        }
+        const v = optCfgStr(env, attr.value) catch |e| return e;
+        if (std.mem.eql(u8, k, "host")) {
+            c.host = v orelse "";
+        } else if (std.mem.eql(u8, k, "user")) {
+            c.user = v;
+        } else if (std.mem.eql(u8, k, "password")) {
+            c.password = v;
+        } else if (std.mem.eql(u8, k, "key_file")) {
+            c.key_file = v;
+        } else if (std.mem.eql(u8, k, "key_passphrase")) {
+            c.key_passphrase = v;
+        } else if (std.mem.eql(u8, k, "known_hosts")) {
+            c.known_hosts = v;
+        } else if (std.mem.eql(u8, k, "host_key")) {
+            c.host_key = v;
+        } else return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sftp connection `{s}`: unknown option `{s}` (host, port, user, password, key_file, key_passphrase, known_hosts, host_key)", .{ conn.name, k }));
+    }
+    if (c.host.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sftp connection `{s}` needs a `host`", .{conn.name}));
+    try sftp.register(conn.name, c);
+}
+
+/// A config string, or null for an `env(...)` that is not set.
+fn optCfgStr(env: *Env, expr: *const ast.Expr) !?[]const u8 {
+    if (expr.* == .call) {
+        const c = expr.call;
+        if ((std.mem.eql(u8, c.name, "env") or std.mem.eql(u8, c.name, "secret")) and c.args.len == 1 and c.args[0].* == .str_lit)
+            return std.process.getEnvVarOwned(env.arena, c.args[0].str_lit) catch null;
+    }
+    return try evalCfgStr(env, expr);
 }
 
 fn evalCfgStr(env: *Env, expr: *const ast.Expr) ![]const u8 {

@@ -17,6 +17,7 @@ const eval = @import("../exec/eval.zig");
 const driver = @import("driver.zig");
 const http_client = @import("http_client.zig");
 const objstore = @import("objstore.zig");
+const sftp = @import("sftp.zig");
 const zipsrc = @import("zipsrc.zig");
 
 const BATCH_ROWS = 1024;
@@ -207,6 +208,8 @@ pub const CsvReader = struct {
         http: *HttpFetch,
         /// A member of a zip, local or fetched by range, already inflating.
         member: *zipsrc.Member,
+        /// A file on an SFTP server, streamed.
+        sftp: *sftp.Stream,
     };
     const FileBackend = struct {
         file: std.fs.File,
@@ -226,7 +229,7 @@ pub const CsvReader = struct {
 
     pub fn isUrl(path: []const u8) bool {
         return std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://") or
-            objstore.isUrl(path);
+            objstore.isUrl(path) or sftp.isUrl(path);
     }
 
     pub fn open(arena: std.mem.Allocator, path: []const u8, dialect: Dialect) !*CsvReader {
@@ -240,7 +243,12 @@ pub const CsvReader = struct {
             .join_buf = std.array_list.Managed(u8).init(arena),
         };
         var first = path;
-        if (objstore.isPrefix(path)) {
+        if (sftp.isUrl(path) and std.mem.endsWith(u8, path, "/")) {
+            const urls = try sftp.listPrefix(arena, path);
+            if (urls.len == 0) return error.SftpEmptyFolder;
+            first = urls[0];
+            self.rest_urls = urls[1..];
+        } else if (objstore.isPrefix(path)) {
             const client = try arena.create(std.http.Client);
             client.* = http_client.initClient(arena);
             defer client.deinit();
@@ -253,6 +261,10 @@ pub const CsvReader = struct {
             const m = try zipsrc.openMember(arena, ar.archive, ar.member);
             self.backend = .{ .member = m };
             self.rdr = m.reader;
+        } else if (sftp.isUrl(first)) {
+            const st = try sftp.Stream.open(arena, first);
+            self.backend = .{ .sftp = st };
+            self.rdr = &st.interface;
         } else if (isUrl(first)) {
             const hf = try arena.create(HttpFetch);
             hf.* = .{ .client = http_client.initClient(arena), .req = undefined, .response = undefined };
@@ -394,8 +406,17 @@ pub const CsvReader = struct {
 
         switch (self.backend) {
             .http => |hf| hf.req.deinit(),
-            // `rest_urls` is only ever populated by an object-prefix listing, so a
-            // file or archive read never reaches here.
+            .sftp => |st| {
+                st.close();
+                const st2 = try sftp.Stream.open(self.arena, url);
+                self.backend = .{ .sftp = st2 };
+                self.rdr = &st2.interface;
+                const hdr = (try self.readLine()) orelse return error.EmptyCsv;
+                if (!std.mem.eql(u8, std.mem.trim(u8, hdr, " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
+                return true;
+            },
+            // `rest_urls` is only ever populated by a prefix listing, so a file or
+            // archive read never reaches here.
             .file, .member => {},
         }
         const hf = try self.arena.create(HttpFetch);
@@ -426,6 +447,7 @@ pub const CsvReader = struct {
                 hf.client.deinit();
             },
             .member => |m| m.close(),
+            .sftp => |st| st.close(),
         }
     }
 

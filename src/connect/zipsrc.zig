@@ -16,6 +16,7 @@
 const std = @import("std");
 const zip = std.zip;
 const pqdecode = @import("pqdecode.zig");
+const sftp = @import("sftp.zig");
 
 pub const Error = error{
     ZipMemberNotFound,
@@ -48,6 +49,8 @@ pub const Member = struct {
             response: std.http.Client.Response,
             redirect_buf: [8 * 1024]u8,
         },
+        /// Streamed through an `sftp.Stream` window on `src`, which owns the file.
+        sftp,
     },
     limited: std.Io.Reader.Limited,
     inflate: std.compress.flate.Decompress,
@@ -55,7 +58,7 @@ pub const Member = struct {
     pub fn close(self: *Member) void {
         switch (self.body) {
             .http => |*h| h.req.deinit(),
-            .file, .fixed => {},
+            .file, .fixed, .sftp => {},
         }
         self.src.close();
     }
@@ -74,10 +77,7 @@ fn isMax(v: anytype) bool {
 
 /// The archive's bytes, by range: a local file or an HTTP(S)/object-store URL.
 fn openBytes(arena: std.mem.Allocator, path: []const u8) !pqdecode.Bytes {
-    if (pqdecode.isRemote(path)) return .{ .remote = try pqdecode.Remote.open(arena, path) };
-    const f = try std.fs.cwd().openFile(path, .{});
-    errdefer f.close();
-    return .{ .file = .{ .f = f, .size = (try f.stat()).size } };
+    return pqdecode.Bytes.open(arena, path);
 }
 
 /// Every data member in central-directory order; directory entries are
@@ -226,6 +226,10 @@ pub fn openMember(arena: std.mem.Allocator, path: []const u8, want: ?[]const u8)
                 break :blk &m.body.fixed;
             }
             break :blk try streamRange(arena, m, rm, data_off, e.compressed_size);
+        },
+        .sftp => |f| blk: {
+            m.body = .sftp;
+            break :blk &(try sftp.Stream.window(arena, f, data_off, e.compressed_size)).interface;
         },
     };
 

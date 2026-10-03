@@ -47,6 +47,8 @@ pub const Connector = enum {
     range,
     starrocks,
     doris,
+    /// Files on an SFTP server, read and written by path (`sftp://name/…`).
+    sftp,
     postgres,
     mysql,
     sqlserver,

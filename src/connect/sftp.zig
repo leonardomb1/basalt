@@ -540,6 +540,8 @@ fn poolKey(buf: []u8, cfg: ssh.Config) []const u8 {
 
 /// A session to the server `cfg` names, the caller's alone until `checkin`.
 pub fn checkout(cfg: ssh.Config) !*Client {
+    ssh.clearFailure();
+    last_error_len = 0;
     var kb: [512]u8 = undefined;
     const key = poolKey(&kb, cfg);
     {
@@ -638,6 +640,10 @@ pub const File = struct {
 pub const Stream = struct {
     file: *File,
     at: u64 = 0,
+    /// Where the stream stops: the file's end, or a window's.
+    end: u64,
+    /// Opened by `open`, closed with the stream; a window borrows its file.
+    owns_file: bool,
     chunk: []u8,
     interface: std.Io.Reader,
 
@@ -646,9 +652,22 @@ pub const Stream = struct {
     pub fn open(arena: std.mem.Allocator, url: []const u8) !*Stream {
         const f = try File.open(arena, url);
         errdefer f.close();
+        return make(arena, f, 0, f.size, true);
+    }
+
+    /// `len` bytes of an open file from `off` — a zip member inside a remote
+    /// archive.
+    pub fn window(arena: std.mem.Allocator, f: *File, off: u64, len: u64) !*Stream {
+        return make(arena, f, off, off + len, false);
+    }
+
+    fn make(arena: std.mem.Allocator, f: *File, start: u64, end: u64, owns: bool) !*Stream {
         const self = try arena.create(Stream);
         self.* = .{
             .file = f,
+            .at = start,
+            .end = end,
+            .owns_file = owns,
             .chunk = try arena.alloc(u8, chunk_size),
             .interface = .{
                 .buffer = try arena.alloc(u8, 64 * 1024),
@@ -661,13 +680,13 @@ pub const Stream = struct {
     }
 
     pub fn close(self: *Stream) void {
-        self.file.close();
+        if (self.owns_file) self.file.close();
     }
 
     fn streamFn(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const self: *Stream = @fieldParentPtr("interface", r);
-        if (self.at >= self.file.size) return error.EndOfStream;
-        const want: usize = @intCast(@min(@as(u64, self.chunk.len), self.file.size - self.at));
+        if (self.at >= self.end) return error.EndOfStream;
+        const want: usize = @intCast(@min(@as(u64, self.chunk.len), self.end - self.at));
         const take = limit.minInt(want);
         const n = self.file.client.readRange(self.file.handle, self.at, self.chunk[0..take]) catch {
             self.file.healthy = false;
@@ -808,6 +827,8 @@ threadlocal var why_buf: [600]u8 = undefined;
 /// An SSH failure in words. A failed connect leaves no session to ask, so the
 /// session's reason is unavailable; the error and the server name it.
 fn sshWhy(e: anyerror, cfg: ssh.Config) []const u8 {
+    const said = ssh.lastFailure();
+    if (said.len > 0) return said;
     return std.fmt.bufPrint(&why_buf, "{s} connecting to {s}:{d} as {s}", .{ @errorName(e), cfg.host, cfg.port, cfg.user }) catch @errorName(e);
 }
 
