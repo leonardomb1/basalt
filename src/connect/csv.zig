@@ -245,6 +245,8 @@ pub const CsvReader = struct {
     gunzip: Gunzip = undefined,
     /// The decompressor's buffers, allocated once and reused for each file of a folder.
     codec_bufs: ?CodecBufs = null,
+    /// The file columns kept, when the query reads only some (`project`).
+    slot: ?[]const i16 = null,
 
     const CodecBufs = struct { window: []u8, buf: []u8 };
 
@@ -271,6 +273,14 @@ pub const CsvReader = struct {
         redirect_buf: [8 * 1024]u8 = undefined,
         transfer_buf: [LINE_BUF]u8 = undefined,
     };
+
+    /// Convert only the columns `names` lists; the schema becomes those, in file
+    /// order. Before the first `next`.
+    pub fn project(self: *CsvReader, names: []const []const u8) !void {
+        const p = (try Projection.of(self.arena, self.schema, names)) orelse return;
+        self.slot = p.slot;
+        self.schema = p.schema;
+    }
 
     /// Put the decompressor `codec` needs between the file's bytes and the line reader.
     fn decodeAs(self: *CsvReader, codec: Codec) !void {
@@ -457,7 +467,7 @@ pub const CsvReader = struct {
                 };
             }
             if (line.len == 0) continue;
-            try splitInto(arena, line, builders, self.dialect);
+            try splitInto(arena, line, builders, self.dialect, self.slot);
             rows += 1;
         }
         if (rows == 0) return null;
@@ -581,6 +591,15 @@ pub const MappedCsv = struct {
     /// file — so callers must not split this file; they fall back to serial.
     quoted_newlines: bool = false,
     dialect: Dialect = .{},
+    /// The file columns kept, when the query reads only some (`project`).
+    slot: ?[]const i16 = null,
+
+    /// Convert only the columns `names` lists; `schema` becomes those.
+    pub fn project(self: *MappedCsv, arena: std.mem.Allocator, names: []const []const u8) !void {
+        const p = (try Projection.of(arena, self.schema, names)) orelse return;
+        self.slot = p.slot;
+        self.schema = p.schema;
+    }
 
     pub fn open(arena: std.mem.Allocator, path: []const u8, dialect: Dialect) !*MappedCsv {
         // Chunking picks boundaries by seeking a newline from a byte offset, which
@@ -692,6 +711,8 @@ pub const CsvSliceReader = struct {
     pos: usize = 0,
     schema: *const types.Schema,
     dialect: Dialect = .{},
+    /// The file columns kept, when the query reads only some (`Projection`).
+    slot: ?[]const i16 = null,
 
     pub fn next(self: *CsvSliceReader, arena: std.mem.Allocator) !?Batch {
         if (self.pos >= self.data.len) return null;
@@ -705,7 +726,7 @@ pub const CsvSliceReader = struct {
             const line = rec.line;
             self.pos = rec.next;
             if (line.len == 0) continue;
-            try splitInto(arena, line, builders, self.dialect);
+            try splitInto(arena, line, builders, self.dialect, self.slot);
             rows += 1;
         }
         if (rows == 0) return null;
@@ -970,29 +991,63 @@ fn quotesOpen(line: []const u8, delim: u8) bool {
     return in_q;
 }
 
-fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Builder, d: Dialect) !void {
+/// The columns a read converts, for a query that names only some: `slot[i]`
+/// is the builder field `i` of a line goes to, or -1 for a column nothing
+/// reads — cut past, never parsed. The schema is the kept columns, in file order.
+pub const Projection = struct {
+    slot: []const i16,
+    schema: types.Schema,
+
+    /// Null when every column is wanted. A query naming none of them (a
+    /// `COUNT(*)`) keeps the first, as a batch still needs a column to count.
+    pub fn of(arena: std.mem.Allocator, full: types.Schema, names: []const []const u8) !?Projection {
+        const slot = try arena.alloc(i16, full.fields.len);
+        var fields = std.array_list.Managed(types.Schema.Field).init(arena);
+        for (full.fields, slot) |f, *sl| {
+            sl.* = -1;
+            for (names) |n| if (std.mem.eql(u8, n, f.name)) {
+                sl.* = @intCast(fields.items.len);
+                try fields.append(f);
+                break;
+            };
+        }
+        if (fields.items.len == full.fields.len) return null;
+        if (fields.items.len == 0 and full.fields.len > 0) {
+            slot[0] = 0;
+            try fields.append(full.fields[0]);
+        }
+        return .{ .slot = slot, .schema = .{ .fields = try fields.toOwnedSlice() } };
+    }
+};
+
+/// Cut `line` into its fields and append the ones `slot` keeps (all when null)
+/// to `builders`. Missing trailing fields are null; extra ones are ignored.
+fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Builder, d: Dialect, slot: ?[]const i16) !void {
+    const ncols = if (slot) |sl| sl.len else builders.len;
+    // no quote anywhere — nearly every line — is cut on a delimiter bitmask
+    if (std.mem.indexOfScalar(u8, line, '"') == null) return splitPlain(arena, line, builders, d, slot, ncols);
     var i: usize = 0;
     var col: usize = 0;
-    while (col < builders.len) : (col += 1) {
+    while (col < ncols) : (col += 1) {
+        const dest: ?*column.Builder = if (slot) |sl| (if (sl[col] >= 0) &builders[@intCast(sl[col])] else null) else &builders[col];
         if (i < line.len and line[i] == '"') {
             i += 1;
             // The common quoted field has no `""` inside and ends right at the
             // delimiter: it is a slice of the line, no copy. Only an escaped
             // quote, or text trailing the closing quote, goes through a buffer.
-            // The old path appended byte by byte into a fresh list per cell.
             const start = i;
             var buf: ?std.array_list.Managed(u8) = null;
             while (i < line.len) {
                 const q = std.mem.indexOfScalarPos(u8, line, i, '"') orelse line.len;
-                if (buf) |*b| try b.appendSlice(line[i..q]);
+                if (buf) |*bb| try bb.appendSlice(line[i..q]);
                 i = q;
                 if (i >= line.len) break;
                 if (i + 1 < line.len and line[i + 1] == '"') {
-                    if (buf == null) {
+                    if (buf == null and dest != null) {
                         buf = std.array_list.Managed(u8).init(arena);
                         try buf.?.appendSlice(line[start..i]);
                     }
-                    try buf.?.append('"');
+                    if (buf) |*bb| try bb.append('"');
                     i += 2;
                     continue;
                 }
@@ -1008,7 +1063,7 @@ fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Buil
             // its last 19 values by one and dropped the final one, silently. Keep
             // reading to the delimiter, which is where the field visibly ends.
             const tail_end = std.mem.indexOfScalarPos(u8, line, i, d.delim) orelse line.len;
-            if (tail_end > i) {
+            if (tail_end > i and dest != null) {
                 if (buf == null) {
                     buf = std.array_list.Managed(u8).init(arena);
                     try buf.?.appendSlice(line[start..end]);
@@ -1016,16 +1071,62 @@ fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Buil
                 try buf.?.appendSlice(line[i..tail_end]);
             }
             i = tail_end;
-            const raw = if (buf) |*b| try b.toOwnedSlice() else line[start..end];
-            try appendCell(&builders[col], try decodeField(arena, d.encoding, raw), true);
+            if (dest) |bld| {
+                const raw = if (buf) |*bb| try bb.toOwnedSlice() else line[start..end];
+                try putCell(arena, bld, raw, true, d.encoding);
+            }
             if (i < line.len and line[i] == d.delim) i += 1;
         } else {
             const start = i;
             i = std.mem.indexOfScalarPos(u8, line, i, d.delim) orelse line.len;
-            try appendCell(&builders[col], try decodeField(arena, d.encoding, line[start..i]), false);
+            if (dest) |bld| try putCell(arena, bld, line[start..i], false, d.encoding);
             if (i < line.len and line[i] == d.delim) i += 1;
         }
     }
+}
+
+/// A quoteless line: its delimiters found 32 bytes at a time, as a bitmask
+/// walked lowest bit first, instead of a search per field.
+fn splitPlain(arena: std.mem.Allocator, line: []const u8, builders: []column.Builder, d: Dialect, slot: ?[]const i16, ncols: usize) !void {
+    const V = 32;
+    const Vec = @Vector(V, u8);
+    const dv: Vec = @splat(d.delim);
+    var col: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    scan: {
+        while (i + V <= line.len) : (i += V) {
+            var m: u32 = @bitCast(@as(Vec, line[i..][0..V].*) == dv);
+            while (m != 0) : (m &= m - 1) {
+                const p = i + @ctz(m);
+                try putField(arena, builders, slot, col, line[start..p], d.encoding);
+                start = p + 1;
+                col += 1;
+                if (col == ncols) break :scan;
+            }
+        }
+        while (i < line.len) : (i += 1) if (line[i] == d.delim) {
+            try putField(arena, builders, slot, col, line[start..i], d.encoding);
+            start = i + 1;
+            col += 1;
+            if (col == ncols) break :scan;
+        };
+        try putField(arena, builders, slot, col, line[start..], d.encoding);
+        col += 1;
+        while (col < ncols) : (col += 1) try putField(arena, builders, slot, col, "", d.encoding);
+    }
+}
+
+inline fn putField(arena: std.mem.Allocator, builders: []column.Builder, slot: ?[]const i16, col: usize, raw: []const u8, enc: Encoding) !void {
+    if (slot) |sl| {
+        if (sl[col] < 0) return;
+        return putCell(arena, &builders[@intCast(sl[col])], raw, false, enc);
+    }
+    return putCell(arena, &builders[col], raw, false, enc);
+}
+
+inline fn putCell(arena: std.mem.Allocator, b: *column.Builder, raw: []const u8, quoted: bool, enc: Encoding) !void {
+    return appendCell(b, if (enc == .utf8) raw else try decodeField(arena, enc, raw), quoted);
 }
 
 const source_vtable = driver.Source.VTable{
@@ -2050,4 +2151,44 @@ test "CsvReader reads every member of a multi-member .csv.gz, as pigz and an app
     var rows: usize = 0;
     while (try r.next(a)) |b| rows += b.len;
     try std.testing.expectEqual(@as(usize, 2), rows);
+}
+
+test "splitInto: delimiter bitmask across chunk edges, missing and extra fields, a projection" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const S = types.Type.init(.string).asNullable();
+    const I = types.Type.init(.int).asNullable();
+
+    // fields straddling the 32-byte chunk boundary, then a short line padded with nulls
+    var bs = [_]column.Builder{ column.Builder.init(a, I), column.Builder.init(a, S), column.Builder.init(a, S), column.Builder.init(a, I) };
+    try splitInto(a, "12345678901,abcdefghijklmnopqrstu,vwxyzABCDEFGHIJKLMNOP,42,extra,more", &bs, .{}, null);
+    try splitInto(a, "7,x", &bs, .{}, null);
+    try splitInto(a, "8,\"q,\"\"t\"\"\",,9", &bs, .{}, null);
+    const c0 = try bs[0].finish();
+    const c1 = try bs[1].finish();
+    const c2 = try bs[2].finish();
+    const c3 = try bs[3].finish();
+    try std.testing.expectEqual(@as(i64, 12345678901), c0.getValue(0).int);
+    try std.testing.expectEqualStrings("abcdefghijklmnopqrstu", c1.getValue(0).string);
+    try std.testing.expectEqualStrings("vwxyzABCDEFGHIJKLMNOP", c2.getValue(0).string);
+    try std.testing.expectEqual(@as(i64, 42), c3.getValue(0).int);
+    try std.testing.expect(c2.getValue(1).isNull() and c3.getValue(1).isNull());
+    try std.testing.expectEqualStrings("q,\"t\"", c1.getValue(2).string);
+    try std.testing.expect(c2.getValue(2).isNull());
+    try std.testing.expectEqual(@as(i64, 9), c3.getValue(2).int);
+
+    // only the second and fourth columns converted, plain and quoted lines alike
+    const full = types.Schema{ .fields = &.{ .{ .name = "a", .ty = I }, .{ .name = "b", .ty = S }, .{ .name = "c", .ty = S }, .{ .name = "d", .ty = I } } };
+    const p = (try Projection.of(a, full, &.{ "d", "b" })).?;
+    try std.testing.expectEqualStrings("b", p.schema.fields[0].name);
+    var ps = [_]column.Builder{ column.Builder.init(a, S), column.Builder.init(a, I) };
+    try splitInto(a, "not-an-int,bee,\"skipped \"\"x\"\"\",5", &ps, .{}, p.slot);
+    try splitInto(a, "x,b2,c,6", &ps, .{}, p.slot);
+    const pb = try ps[0].finish();
+    const pd = try ps[1].finish();
+    try std.testing.expectEqualStrings("bee", pb.getValue(0).string);
+    try std.testing.expectEqual(@as(i64, 6), pd.getValue(1).int);
+    try std.testing.expect((try Projection.of(a, full, &.{ "a", "b", "c", "d" })) == null);
+    try std.testing.expectEqualStrings("a", (try Projection.of(a, full, &.{"zz"})).?.schema.fields[0].name);
 }

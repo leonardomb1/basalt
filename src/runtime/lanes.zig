@@ -105,7 +105,17 @@ pub fn runParquetLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w:
 }
 
 pub fn runCsvLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    const rd = stages[0].node.read;
+    // The columns the lanes convert, as `parquetSplit` asks for them: past a
+    // map path's join the names are the join's, so it hands over the stages
+    // before it.
+    const pipe = stages[0 .. stages.len - 1];
+    const push = switch (shape) {
+        .map => |x| pipe[1..][0..x.len],
+        .map_join => |x| pipe[1..][0..x.prefix.len],
+        else => pipe[1..],
+    };
+    var rd = stages[0].node.read;
+    if (try projectedColumns(env, push)) |cols| rd.cols = cols;
     return switch (shape) {
         .agg => |x| runParallelCsvAgg(env, rd, x.prefix, x.ag, x.tail, w, opts, stats, lanes_used),
         .agg_join => |x| runParallelCsvAggJoin(env, rd, x, w, opts, stats, lanes_used),
@@ -668,7 +678,7 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
     const slot = &ctx.slots[i];
     const wa = slot.arena.allocator();
 
-    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.queue.nitems), .schema = ctx.csv_schema, .dialect = ctx.mapped.dialect };
+    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.queue.nitems), .schema = ctx.csv_schema, .dialect = ctx.mapped.dialect, .slot = ctx.mapped.slot };
     var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     var child = try buildMapChain(wa, ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.csv_schema);
@@ -1050,7 +1060,7 @@ fn laneRowSource(rows: LaneRows, scratch: std.mem.Allocator) !?driver.Source {
         },
         .csv => |c| {
             const rd = try scratch.create(csv.CsvSliceReader);
-            rd.* = .{ .data = c.mapped.chunk(c.chunk, c.of), .schema = c.schema, .dialect = c.mapped.dialect };
+            rd.* = .{ .data = c.mapped.chunk(c.chunk, c.of), .schema = c.schema, .dialect = c.mapped.dialect, .slot = c.mapped.slot };
             return rd.source();
         },
     }
@@ -1160,6 +1170,8 @@ fn csvSplitFile(env: *Env, rd: ast.Read, w: ast.Write) anyerror!?*csv.MappedCsv 
         mapped.close();
         return null;
     }
+    // `runCsvLane` named the columns the pipeline reads
+    if (rd.cols.len > 0) try mapped.project(env.arena, rd.cols);
     return mapped;
 }
 

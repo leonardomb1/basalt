@@ -415,7 +415,7 @@ pub fn openSourceProjected(
         if (analyze.readFormat(rd.form.path, want) == .arrow and analyze.unreadableTarget(rd.form.path, want) == null)
             return openArrow(env, rd.form.path, project);
     }
-    return openSourceAll(env, rd, hints);
+    return openSourceCols(env, rd, hints, project);
 }
 
 /// A folder read (`path` ending in `/`): its format and the files it takes, or
@@ -522,6 +522,11 @@ fn openXlsx(env: *Env, path: []const u8, hints: []const ast.Hint) !driver.Source
 }
 
 fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
+    return openSourceCols(env, rd, hints, null);
+}
+
+/// `openSourceAll`, a CSV converting only the columns `project` names.
+fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[][]const u8) !driver.Source {
     if (std.mem.eql(u8, rd.connector, "request")) {
         const body = env.request_body orelse
             return planErr(env.diag, "`read request` is only available when serving HTTP (@http)");
@@ -615,6 +620,7 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
             const what: []const u8 = if (csv.splitArchive(rd.form.path) != null) "archive" else "input CSV";
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open {s} `{s}` ({s})", .{ what, rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
         };
+        if (project) |p| try reader.project(p);
         return reader.source();
     }
     const conn = env.connections.get(rd.connector) orelse
