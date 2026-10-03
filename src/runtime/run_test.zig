@@ -3483,6 +3483,48 @@ test "JOIN LATERAL passes a row's column to a table function as a join on it" {
     }
 }
 
+test "an Excel workbook reads as a table: typed columns, a named sheet and range, and no writing one" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "f.xlsx", .data = @embedFile("../connect/testdata/openpyxl.xlsx") });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT id, nome, dia FROM '$X' WHERE dia >= '2024-01-01' AND valor > 0 ORDER BY id", .want = "id,nome,dia\n1,São Paulo,2026-10-03\n" },
+        .{ .q = "SELECT codigo, qtd * 2 AS q2 FROM '$X' WITH (sheet = 'Notas', range = 'A3:B5')", .want = "codigo,q2\nx1,10\nx2,14\n" },
+    };
+    for (cases) |c| {
+        const xp = try std.fs.path.join(alloc, &.{ base, "f.xlsx" });
+        defer alloc.free(xp);
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$X", xp);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+        var rdiag: Diag = .{};
+        _ = run(alloc, prog, .{}, &rdiag) catch |e| {
+            std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+            return e;
+        };
+        const got = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
+    // writing one is refused, not done as CSV under a workbook's name
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const w = try std.fmt.allocPrint(parena.allocator(), "LOAD INTO '{s}/out.xlsx' AS SELECT 1 AS a;", .{base});
+    const prog = try parser.parseSource(parena.allocator(), w, &pdiag);
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
+    try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "does not write them") != null);
+}
+
 test "a FOR EACH discovery query may read a table function, a derived table or a CTE" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

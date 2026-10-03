@@ -20,6 +20,7 @@ const arrowread = @import("../connect/arrowread.zig");
 const azure = @import("../connect/azure.zig");
 const s3 = @import("../connect/s3.zig");
 const zipsrc = @import("../connect/zipsrc.zig");
+const xlsx = @import("../connect/xlsx.zig");
 const registry = @import("../connect/registry.zig");
 const body_stmt_rule = @import("env.zig").body_stmt_rule;
 
@@ -1014,6 +1015,7 @@ const Ctx = struct {
                         return fail(self.diag, "cannot read `{s}`: {s}", .{ rd.form.path, why });
                     if (archiveProblem(self.arena, rd.form.path, fmt, false)) |why|
                         return fail(self.diag, "cannot read `{s}`: {s}", .{ rd.form.path, why });
+                    if (readFormat(rd.form.path, fmt) == .xlsx) _ = try xlsxOptions(lead.hints, self.diag);
                     _ = try dialectFromHints(lead.hints, self.diag);
                 }
                 const schema = offlineSchema(self.arena, rd, lead.hints);
@@ -1055,6 +1057,8 @@ const Ctx = struct {
                 const fmt = try formatFromHints(hints, self.diag);
                 if (unreadableTarget(w.target, fmt)) |why|
                     return fail(self.diag, "cannot write `{s}`: {s}", .{ w.target, why });
+                if ((fmt orelse formatOfPath(w.target)) == .xlsx)
+                    return fail(self.diag, "cannot write `{s}`: basalt reads Excel workbooks but does not write them; write a `.csv` or `.parquet`", .{w.target});
             }
             _ = try dialectFromHints(hints, self.diag);
             // Accepting it and writing UTF-8 anyway would be the silent kind of
@@ -1363,6 +1367,7 @@ fn sinkKind(node: anytype) []const u8 {
     if (std.mem.eql(u8, node.connector, "csv")) {
         if (pqwrite.Writer.isPath(path)) return "parquet";
         if (arrowread.isPath(path)) return "arrow";
+        if (xlsx.isPath(path)) return "xlsx";
     }
     return node.connector;
 }
@@ -1444,6 +1449,8 @@ pub const FileFormat = enum {
     parquet,
     /// Arrow IPC: `.arrow` / `.feather` / `.ipc` (file) or `.arrows` (stream).
     arrow,
+    /// An Excel workbook, `.xlsx` / `.xlsm` — read only.
+    xlsx,
 };
 
 /// The format a file read resolves to: the named one, else the extension's,
@@ -1499,7 +1506,26 @@ pub fn formatFromHints(hints: []const ast.Hint, diag: *Diag) Error!?FileFormat {
     if (std.ascii.eqlIgnoreCase(s, "csv")) return .csv;
     if (std.ascii.eqlIgnoreCase(s, "parquet")) return .parquet;
     inline for (.{ "arrow", "ipc", "feather" }) |n| if (std.ascii.eqlIgnoreCase(s, n)) return .arrow;
-    return fail(diag, "unknown format `{s}` (csv, parquet, arrow)", .{s});
+    inline for (.{ "xlsx", "excel" }) |n| if (std.ascii.eqlIgnoreCase(s, n)) return .xlsx;
+    return fail(diag, "unknown format `{s}` (csv, parquet, arrow, xlsx)", .{s});
+}
+
+/// `WITH (sheet = 'Vendas', header = false, range = 'B3:F200')` for a workbook
+/// read, validated here so `check` turns away a malformed range before a run.
+pub fn xlsxOptions(hints: []const ast.Hint, diag: *Diag) Error!xlsx.Options {
+    var o = xlsx.Options{};
+    o.sheet = hintText(hints, "sheet");
+    if (hintText(hints, "range")) |r| o.range = xlsx.parseRange(r) orelse
+        return fail(diag, "`range = '{s}'` is not a cell range like `A1:F100`, `B3` or `B3:F`", .{r});
+    for (hints) |h| {
+        if (!std.mem.eql(u8, h.key, "header")) continue;
+        o.header = switch (h.value) {
+            .flag => true,
+            .int => |n| n != 0,
+            .str, .ident => |s| if (std.ascii.eqlIgnoreCase(s, "true")) true else if (std.ascii.eqlIgnoreCase(s, "false")) false else return fail(diag, "`header` is true or false, not `{s}`", .{s}),
+        };
+    }
+    return o;
 }
 
 /// The extension basalt reads a path as, or null when it carries none it knows.
@@ -1511,6 +1537,7 @@ fn formatOfPath(path: []const u8) ?FileFormat {
     const bare = csv.dataName(path);
     if (pqwrite.Writer.isPath(bare)) return .parquet;
     if (arrowread.isPath(bare)) return .arrow;
+    if (xlsx.isPath(bare)) return .xlsx;
     if (std.ascii.endsWithIgnoreCase(bare, ".csv")) return .csv;
     return null;
 }
@@ -1552,6 +1579,8 @@ pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
     const fmt = explicit orelse formatOfPath(path);
     if (csv.splitCodec(path).codec != .none and fmt == .parquet)
         return "parquet needs random access, so it cannot be read through compression; decompress it first";
+    if (fmt == .xlsx and csv.splitCodec(path).codec != .none)
+        return "an Excel workbook is a zip archive already, so it is read uncompressed; decompress it first";
     if (fmt == .arrow) {
         if (csv.splitCodec(path).codec != .none)
             return "an Arrow IPC file is read memory-mapped, so it cannot be read through compression; decompress it first (IPC compresses its own buffers)";
@@ -1561,7 +1590,7 @@ pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
 
     if (explicit != null) return null;
     if (fmt != null) return null;
-    return "basalt handles `.csv`, `.parquet` and Arrow IPC (`.arrow`, `.feather`, `.ipc`, `.arrows`), a CSV optionally `.gz`/`.zst` compressed or inside a `.zip`; name the format with `WITH (format = 'csv')` if the extension differs";
+    return "basalt handles `.csv`, `.parquet`, Arrow IPC (`.arrow`, `.feather`, `.ipc`, `.arrows`) and Excel (`.xlsx`, read only), a CSV optionally `.gz`/`.zst` compressed or inside a `.zip`; name the format with `WITH (format = 'csv')` if the extension differs";
 }
 
 /// Why this archive reference cannot be read as one table, or null when it can.
@@ -1603,6 +1632,8 @@ fn memberProblem(arena: std.mem.Allocator, chosen: []const u8, explicit: ?FileFo
         return "parquet needs random access, so it cannot be read out of an archive; extract it first";
     if ((explicit orelse formatOfPath(chosen)) == .arrow)
         return "an Arrow IPC file is read memory-mapped, so it cannot be read out of an archive; extract it first";
+    if ((explicit orelse formatOfPath(chosen)) == .xlsx)
+        return "an Excel workbook is itself a zip archive, so it cannot be read out of another; extract it first";
     return null;
 }
 
@@ -1661,6 +1692,8 @@ fn morselParallelRead(connector: []const u8, node: ast.Stage.Node) bool {
     if (pqwrite.Writer.isPath(path)) return true;
     // an Arrow file reads serially: its batches are not independent morsels yet
     if (arrowread.isPath(path)) return false;
+    // nor does a workbook: a sheet is one stream of XML
+    if (xlsx.isPath(path)) return false;
     return std.mem.indexOf(u8, path, "://") == null;
 }
 
@@ -1689,6 +1722,14 @@ fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.Hint
             const ar = arrowread.Reader.open(arena, rd.form.path) catch return null;
             defer ar.close();
             return ar.schema;
+        }
+        if (readFormat(rd.form.path, explicit) == .xlsx) {
+            // the same first pass the run makes, so `check` and the run agree
+            var odiag = Diag{};
+            const opts = xlsxOptions(hints, &odiag) catch return null;
+            const xr = xlsx.Reader.open(arena, arena, rd.form.path, opts) catch return null;
+            defer xr.close();
+            return xr.schema;
         }
         // The header is split on the script's delimiter, or `check` would report
         // one column named after the whole header line for a `;` file.
@@ -1770,7 +1811,10 @@ test "unreadableTarget: an extension basalt does not read is refused" {
     try std.testing.expect(unreadableTarget("/data/x.parquet.gz", null) != null);
 
     try std.testing.expect(unreadableTarget("/data/rows.json", null) != null);
-    try std.testing.expect(unreadableTarget("/data/book.xlsx", null) != null);
+    // a workbook is read; the old binary `.xls` and a compressed one are not
+    try std.testing.expect(unreadableTarget("/data/book.xlsx", null) == null);
+    try std.testing.expect(unreadableTarget("/data/book.xlsx.gz", null) != null);
+    try std.testing.expect(unreadableTarget("/data/book.xls", null) != null);
     try std.testing.expect(unreadableTarget("/data/noext", null) != null);
     // Naming the format is the escape hatch for an oddly-named file.
     try std.testing.expect(unreadableTarget("/data/weird.dat", .csv) == null);

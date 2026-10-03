@@ -310,7 +310,7 @@ LIMIT 100 OFFSET 20;
 | SQL table | `FROM erp.dbo.SC5010` |
 | SQL table (per-row name) | `FROM erp.dbo.IDENTIFIER($name)` (§7) — still a table read |
 | raw query | `FROM erp.QUERY($$SELECT ...$$)` (no dialect translation) |
-| file — CSV, Parquet or Arrow IPC | `FROM 'path.csv'` / `FROM 'path.parquet'` / `FROM 'path.arrow'` — the extension picks the reader; local or HTTPS URL (Arrow IPC: local only). Any other extension is a plan-time error unless `WITH (format = 'csv' \| 'parquet' \| 'arrow')` names one |
+| file — CSV, Parquet, Arrow IPC or Excel | `FROM 'path.csv'` / `FROM 'path.parquet'` / `FROM 'path.arrow'` / `FROM 'path.xlsx'` — the extension picks the reader; local or HTTPS URL (Arrow IPC: local only). Any other extension is a plan-time error unless `WITH (format = 'csv' \| 'parquet' \| 'arrow' \| 'xlsx')` names one |
 | compressed file | `FROM 'path.csv.gz'` / `.csv.zst` — the inner name picks the reader |
 | file inside a zip | `FROM 'archive.zip :: inner.csv'`, or just `FROM 'archive.zip'` when it holds one file |
 | object storage | `FROM 'az://account/container/path.parquet'` or `FROM 's3://bucket/key.parquet'`; a trailing `/` reads every object under the prefix as one table |
@@ -358,6 +358,28 @@ server that ignores `Range` falls back to one whole-object fetch. Parquet writes
 store `DECIMAL` in the narrowest physical type its precision allows — INT32 to 9
 digits, INT64 to 18, FIXED_LEN_BYTE_ARRAY up to 38; past 38 digits (the engine's
 own ceiling) a value is refused rather than silently truncated.
+
+An Excel workbook — `.xlsx` or `.xlsm`, local, by URL or in object storage — reads
+its first worksheet; `WITH (sheet = 'Vendas')` names another (case does not
+matter, and a name that is not there is an error listing the ones that are).
+The first non-empty row is the header — an empty header cell is named by its
+column letter, a repeated one numbered (`total_2`) — or, with `header = false`,
+every row is data and the columns are `A`, `B`, …. `range = 'B3:F200'` reads
+that block, its first row the header, for a sheet with a title above its table;
+`B3:F` reads to the last row. Excel is read, never written.
+
+A workbook's cells carry their own types, so a column's type is decided from
+every row, not a sample (a CSV's first 1024): numbers are `INT` when each is an
+integer below 2^53 and `FLOAT` otherwise; numbers in a date or time format are
+`DATE`, `TIMESTAMP` or `TIME` (to the millisecond, as Excel keeps them; a
+1904-based workbook is read as such, and serials before 1 March 1900 are a day
+late, as in Excel); booleans are `BOOL`; and any text in a column makes it
+`STRING`, a number there keeping the digits the file stored — so a "Total" row
+of text at the bottom turns its column to text instead of failing the load.
+Empty cells and error values (`#N/A`, `#DIV/0!`) are null; a formula reads as
+the value Excel last saved, and a merged cell only in its first cell. Rows
+stream; what stays in memory is the workbook's shared-string table (up to 512
+MB). The old binary `.xls`, `.xlsb` and `.ods` are not read.
 
 Arrow IPC — `.arrow`, `.feather`, `.ipc` (the file format, Feather v2) or
 `.arrows` (the stream format) — is how a dataframe reaches basalt fastest: the

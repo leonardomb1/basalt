@@ -2505,9 +2505,10 @@ fn usage(w: anytype) !void {
         \\  see language.md for the dialect
         \\
         \\sources and sinks:
-        \\  files      CSV and Parquet, by path or URL, and Arrow IPC (.arrow, .feather,
-        \\             .ipc, .arrows; local) — the extension picks the format;
-        \\             another extension needs WITH (format = 'csv'|'parquet'|'arrow').
+        \\  files      CSV and Parquet, by path or URL, Arrow IPC (.arrow, .feather,
+        \\             .ipc, .arrows; local) and Excel (.xlsx, read; WITH (sheet =
+        \\             'Name', range = 'B3:F200', header = false)) — the extension picks
+        \\             the format; another needs WITH (format = 'csv'|'parquet'|'arrow').
         \\             WITH (delimiter = ';', encoding = 'latin1') for non-comma,
         \\             non-UTF-8 CSV (also cp1252; delimiter works on a sink too)
         \\  archives   file.csv.gz / .csv.zst stream through the codec;

@@ -11,6 +11,7 @@ const csv = @import("../connect/csv.zig");
 const pqdecode = @import("../connect/pqdecode.zig");
 const pqwrite = @import("../connect/pqwrite.zig");
 const arrowread = @import("../connect/arrowread.zig");
+const xlsx = @import("../connect/xlsx.zig");
 const JsonWriter = @import("../connect/table.zig").JsonWriter;
 const arrow = @import("../connect/arrow.zig");
 const ArrowWriter = arrow.ArrowWriter;
@@ -424,6 +425,29 @@ fn openArrow(env: *Env, path: []const u8, project: ?[][]const u8) !driver.Source
     return r.source();
 }
 
+fn openXlsx(env: *Env, path: []const u8, hints: []const ast.Hint) !driver.Source {
+    var odiag = analyze.Diag{};
+    const opts = analyze.xlsxOptions(hints, &odiag) catch return planErr(env.diag, odiag.msg);
+    const r = xlsx.Reader.open(env.arena, env.gpa, path, opts) catch |e| {
+        const why = switch (e) {
+            error.XlsxSheetNotFound => blk: {
+                const names = xlsx.sheetNames(env.arena, env.gpa, path) catch &.{};
+                const list = try std.mem.join(env.arena, ", ", names);
+                break :blk if (opts.sheet) |w|
+                    try std.fmt.allocPrint(env.arena, "no sheet `{s}` (sheets: {s})", .{ w, list })
+                else
+                    "the workbook has no worksheet";
+            },
+            error.NotXlsx, error.ZipNoEndRecord, error.ZipMemberNotFound => "not an Excel workbook (.xlsx)",
+            error.BadXml, error.XmlTokenTooLong => "the workbook's XML is malformed",
+            error.XlsxTooManyStrings => "its shared strings pass 512 MB",
+            else => try pathFail(env.arena, path, e),
+        };
+        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read Excel workbook `{s}` ({s})", .{ path, why }));
+    };
+    return r.source();
+}
+
 fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
     if (std.mem.eql(u8, rd.connector, "request")) {
         const body = env.request_body orelse
@@ -490,6 +514,7 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
             return pr.source();
         }
         if (analyze.readFormat(rd.form.path, want) == .arrow) return openArrow(env, rd.form.path, null);
+        if (analyze.readFormat(rd.form.path, want) == .xlsx) return openXlsx(env, rd.form.path, hints);
         var ddiag = analyze.Diag{};
         const d = analyze.dialectFromHints(hints, &ddiag) catch
             return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg));
@@ -1356,6 +1381,9 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         // A `.parquet` target shares the csv connector but is a different format;
         // without this it would be written as CSV text under a .parquet name. An
         // explicit `WITH (format = ...)` overrides the extension.
+        // Nor as CSV under a workbook's name: Excel is read, not written.
+        if ((env.fmt_out == null and xlsx.isPath(w.target)) or env.fmt_out == .xlsx)
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: basalt reads Excel workbooks but does not write them; write a `.csv` or `.parquet`", .{w.target}));
         const wfmt = env.fmt_out orelse (if (pqwrite.Writer.isPath(w.target)) analyze.FileFormat.parquet else if (arrowread.isPath(w.target)) analyze.FileFormat.arrow else analyze.FileFormat.csv);
         if (wfmt == .arrow) {
             const aw = ArrowFileSink.open(env.gpa, w.target, schema) catch |e| switch (e) {
