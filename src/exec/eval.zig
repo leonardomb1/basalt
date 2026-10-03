@@ -80,7 +80,7 @@ pub const TypeCtx = struct {
                 return Type.init(.bool);
             },
             .let_in => return self.err("internal: `let … in` should have been expanded before type-checking", .{}),
-            .lambda => return self.err("a lambda (`x -> …`) is only an argument of json_filter, json_transform, json_any or json_all", .{}),
+            .lambda => return self.err("a lambda (`x -> …`) is only an argument of json_filter, json_transform, json_any, json_all or json_reduce", .{}),
             // The JSON array functions bind their parameter before typing the body.
             .lambda_var => |n| return self.err("internal: lambda parameter `{s}` typed outside its function", .{n}),
         }
@@ -1526,13 +1526,65 @@ fn bindLambdaTo(arena: std.mem.Allocator, body: *const ast.Expr, name: []const u
         fn recur(b: @This(), e: *const ast.Expr) error{OutOfMemory}!*ast.Expr {
             switch (e.*) {
                 .lambda_var => |n| if (std.mem.eql(u8, n, b.name)) return b.lit,
-                .lambda => |l| if (std.mem.eql(u8, l.param, b.name)) return @constCast(e),
+                .lambda => |l| for (l.params) |pp| {
+                    if (std.mem.eql(u8, pp, b.name)) return @constCast(e);
+                },
                 else => {},
             }
             return ast.rebuildExpr(b.arena, e, b, recur);
         }
     };
     return Bind.recur(.{ .arena = arena, .name = name, .lit = lit }, body);
+}
+
+/// `l`'s body with each parameter bound to its node in `slots`, in order.
+fn bindParams(arena: std.mem.Allocator, l: ast.Expr.Lambda, slots: []const *ast.Expr) error{OutOfMemory}!*ast.Expr {
+    var body = l.body;
+    for (l.params, slots[0..l.params.len]) |pp, slot| body = try bindLambdaTo(arena, body, pp, slot);
+    return body;
+}
+
+/// Fresh nodes holding `vals`, one per slot a lambda's parameters bind to.
+fn lambdaSlots(arena: std.mem.Allocator, vals: []const ast.Expr) error{OutOfMemory}![]*ast.Expr {
+    const slots = try arena.alloc(*ast.Expr, vals.len);
+    for (slots, vals) |*sl, v| {
+        sl.* = try arena.create(ast.Expr);
+        sl.*.* = v;
+    }
+    return slots;
+}
+
+/// The accumulator as the node `json_reduce` binds `acc` to. A value with no
+/// literal of its own — a DECIMAL, a date — is its text cast back to the
+/// accumulator's type, so a running DECIMAL total stays one from element to
+/// element instead of turning into text after the first.
+fn accNode(arena: std.mem.Allocator, acc: Value, ty: Type) error{OutOfMemory}!ast.Expr {
+    switch (acc) {
+        .null, .bool, .int, .float, .string => return literalOf(arena, acc),
+        else => {
+            if (ty.unknown) return literalOf(arena, acc);
+            const text = try arena.create(ast.Expr);
+            text.* = .{ .str_lit = try valueToString(arena, acc) };
+            return .{ .cast = .{ .e = text, .ty = ty } };
+        },
+    }
+}
+
+/// The accumulator type `json_reduce` plans, worked out again where a batch is
+/// evaluated — the evaluator sees only the call — and kept for the call it was
+/// worked out for, so a column pays for it once per batch at most.
+threadlocal var reduce_memo: struct { args: ?[*]const *ast.Expr = null, schema: ?*const types.Schema = null, ty: Type = undefined } = .{};
+
+fn reduceTypeAt(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) EvalError!Type {
+    const m = &reduce_memo;
+    if (m.args == c.args.ptr and m.schema == batch.schema) return m.ty;
+    var tc = TypeCtx{ .schema = batch.schema.*, .arena = arena };
+    const ty = typing.reduceAcc(&tc, c) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.TypeError => return error.TypeMismatch,
+    };
+    m.* = .{ .args = c.args.ptr, .schema = batch.schema, .ty = ty };
+    return ty;
 }
 
 /// 1 MiB ceiling on a single generated string (`repeat`, `lpad`/`rpad`), so
@@ -1619,6 +1671,7 @@ pub const builtins = [_]Builtin{
     .{ .name = "json_transform", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
     .{ .name = "json_any", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
     .{ .name = "json_all", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
+    .{ .name = "json_reduce", .type_fn = typing.jsonReduce, .eval_fn = per_row.jsonReduce },
     .{ .name = "json_object", .type_fn = typing.jsonBuild, .eval_fn = per_row.jsonObject },
     .{ .name = "json_array", .type_fn = typing.jsonBuild, .eval_fn = per_row.jsonArray },
     .{ .name = "to_base64", .type_fn = typing.unaryString, .eval_fn = per_row.toBase64 },
@@ -1923,11 +1976,45 @@ const typing = struct {
             return self.err("`{s}` takes (json array, x -> {s})", .{ c.name, if (eq(c.name, "json_transform")) "value" else "condition" });
         const a = try self.wantText(c, 0);
         const l = c.args[1].lambda;
-        const bt = try self.typeOf(try bindLambda(self.arena, l.body, l.param, .null));
+        if (l.params.len > 2) return self.err("`{s}`'s lambda takes (x) or (x, i), not {d} parameters", .{ c.name, l.params.len });
+        const bt = try self.typeOf(try bindParams(self.arena, l, try lambdaSlots(self.arena, &.{ .null_lit, .{ .int_lit = 0 } })));
         if (eq(c.name, "json_transform")) return Type.init(.string).asNullable();
         if (!boolish(bt)) return self.err("`{s}`: the lambda must be a condition (BOOL), not {s}", .{ c.name, @tagName(bt.kind) });
         if (eq(c.name, "json_filter")) return Type.init(.string).asNullable();
         return Type.init(.bool).withNull(a.nullable or a.unknown);
+    }
+
+    fn jsonReduce(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 3 or c.args[2].* != .lambda)
+            return self.err("`json_reduce` takes (json array, initial, (acc, x) -> value)", .{});
+        _ = try self.wantText(c, 0);
+        const l = c.args[2].lambda;
+        if (l.params.len < 2 or l.params.len > 3)
+            return self.err("`json_reduce`'s lambda takes (acc, x) or (acc, x, i), not {d} parameter{s}", .{ l.params.len, if (l.params.len == 1) "" else "s" });
+        return (try reduceAcc(self, c)).asNullable();
+    }
+
+    /// The accumulator's type: the initial value's, widened to hold what the
+    /// lambda returns from it — an INT start summing floats is a FLOAT — and
+    /// settled before the run, so an empty array gives the same type a long one does.
+    fn reduceAcc(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        const l = c.args[2].lambda;
+        var acc = try self.typeOf(c.args[1]);
+        var pass: usize = 0;
+        while (pass < 3) : (pass += 1) {
+            const null_node = try self.arena.create(ast.Expr);
+            null_node.* = .null_lit;
+            const acc_node: ast.Expr = if (acc.unknown) .null_lit else .{ .cast = .{ .e = null_node, .ty = acc } };
+            const body = try bindParams(self.arena, l, try lambdaSlots(self.arena, &.{ acc_node, .null_lit, .{ .int_lit = 0 } }));
+            const bt = try self.typeOf(body);
+            var u = Type.unify(acc, bt) orelse
+                return self.err("`json_reduce`: the lambda returns {s}, which an accumulator of {s} cannot hold", .{ @tagName(bt.kind), @tagName(acc.kind) });
+            // A running DECIMAL sum keeps its scale; its precision is the widest.
+            if (u.kind == .decimal) u.precision = 38;
+            if (u.kind == acc.kind and u.unknown == acc.unknown and u.scale == acc.scale and u.precision == acc.precision) return u;
+            acc = u;
+        }
+        return self.err("`json_reduce`: the accumulator's type keeps changing — give the initial value the type the lambda returns", .{});
     }
 
     fn jsonGet(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
@@ -2521,14 +2608,15 @@ const per_row = struct {
         const w = &out.writer;
         w.writeByte('[') catch return error.OutOfMemory;
         var n: usize = 0;
-        // The body is bound once, to a literal each element then overwrites:
+        // The body is bound once, to literals each element then overwrites:
         // rebuilding it per element was most of what a lambda cost.
-        const slot = try arena.create(ast.Expr);
-        slot.* = .null_lit;
-        const body = try bindLambdaTo(arena, l.body, l.param, slot);
+        const slots = try lambdaSlots(arena, &.{ .null_lit, .{ .int_lit = 0 } });
+        const body = try bindParams(arena, l, slots);
         var items = json.Elements.root(doc);
-        while (items.next()) |el| {
-            slot.* = try literalOf(arena, try jsonElementValue(arena, el));
+        var idx: i64 = 0;
+        while (items.next()) |el| : (idx += 1) {
+            slots[0].* = try literalOf(arena, try jsonElementValue(arena, el));
+            slots[1].* = .{ .int_lit = idx };
             // A JSON array may mix kinds: an element the body cannot compare — a
             // number against text — is null there, not a failed query. A CAST that
             // fails still fails, as it does anywhere else.
@@ -2555,6 +2643,38 @@ const per_row = struct {
                 break :blk Value{ .string = out.written() };
             },
         };
+    }
+
+    /// A fold: the accumulator starts at `initial` and becomes the body's value at
+    /// each element, in order. An empty array is `initial`; a null array is null.
+    /// Unlike `json_transform`, an element the body cannot compare fails the
+    /// statement — a null there would quietly wipe out everything folded so far.
+    fn jsonReduce(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        if (c.args.len != 3 or c.args[2].* != .lambda) return error.TypeMismatch;
+        const dv = try evalRow(arena, c.args[0], batch, row);
+        if (dv.isNull()) return .null;
+        const doc = try valueToString(arena, dv);
+        try json.validate(arena, doc);
+        if (json.rootKind(doc) != .array) return error.InvalidJson;
+        const ty = try reduceTypeAt(arena, c, batch);
+        var acc = try evalRow(arena, c.args[1], batch, row);
+        if (!ty.unknown and !acc.isNull()) acc = try castValueTyped(arena, acc, ty);
+        const slots = try lambdaSlots(arena, &.{ .null_lit, .null_lit, .{ .int_lit = 0 } });
+        const body = try bindParams(arena, c.args[2].lambda, slots);
+        var items = json.Elements.root(doc);
+        var idx: i64 = 0;
+        while (items.next()) |el| : (idx += 1) {
+            slots[0].* = try accNode(arena, acc, ty);
+            slots[1].* = try literalOf(arena, try jsonElementValue(arena, el));
+            slots[2].* = .{ .int_lit = idx };
+            const r = try evalRow(arena, body, batch, row);
+            // Element types are the data's, so a plan from an INT start cannot know
+            // the array holds floats; cutting 1.5 to 1 would be a silent wrong sum.
+            if (r == .float and (ty.kind == .int or ty.kind == .decimal) and !ty.unknown)
+                return failWith(error.CastFailed, "json_reduce: the lambda returned {d} into {s} accumulator — start from a FLOAT (0.0)", .{ r.float, if (ty.kind == .int) "an INT" else "a DECIMAL" });
+            acc = if (r.isNull() or ty.unknown) r else try castValueTyped(arena, r, ty);
+        }
+        return acc;
     }
 
     fn jsonGet(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
@@ -4954,6 +5074,31 @@ test "json builders and encodings: json_object, json_array, base64, url" {
     try std.testing.expectEqualStrings("a%20b%26c%3Dd%2F%C3%A9", try str(a, "url_encode('a b&c=d/é')"));
     try std.testing.expectEqualStrings("a+b cé", try str(a, "url_decode('a+b%20c%C3%A9')"));
     try std.testing.expectEqualStrings("%zz%4", try str(a, "url_decode('%zz%4')"));
+}
+
+test "json_reduce: folds, typed accumulators, positions, shadowing" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    try std.testing.expectEqual(@as(i64, 6), (try evalLit(a, "json_reduce('[1,2,3]', 0, (acc, x) -> acc + x)")).int);
+    try std.testing.expectEqual(@as(i64, 0), (try evalLit(a, "json_reduce('[]', 0, (acc, x) -> acc + x)")).int);
+    try std.testing.expect((try evalLit(a, "json_reduce(NULL, 0, (acc, x) -> acc + x)")) == .null);
+    try std.testing.expectEqual(@as(f64, 3.5), (try evalLit(a, "json_reduce('[1.5,2]', 0.0, (acc, x) -> acc + x)")).float);
+    // An INT total cannot take a float without cutting it.
+    try std.testing.expectError(error.CastFailed, evalLit(a, "json_reduce('[1.5,2]', 0, (acc, x) -> acc + x)"));
+
+    // A DECIMAL total stays one, scale and all; a date stays a date.
+    const d = try evalLit(a, "json_reduce('[\"0.10\",\"0.25\"]', CAST(0 AS DECIMAL(10,2)), (acc, x) -> acc + CAST(x AS DECIMAL(10,2)))");
+    try std.testing.expectEqualStrings("0.35", try valueToString(a, d));
+    try std.testing.expectEqualStrings("2026-01-04", try formatDate(a, (try evalLit(a, "json_reduce('[1,2]', CAST('2026-01-01' AS DATE), (dt, x) -> date_add('day', x, dt))")).date));
+
+    // Positions from 0, as a json_get path counts them.
+    try std.testing.expectEqual(@as(i64, 22), (try evalLit(a, "json_reduce('[1,2,3]', 0, (acc, x, i) -> acc + x * CAST(json_get('[5,4,3]', CAST(i AS STRING)) AS INT))")).int);
+    try std.testing.expectEqualStrings("[10,21]", (try evalLit(a, "json_transform('[10,20]', (x, i) -> x + i)")).string);
+
+    // An inner lambda's `x` is its own, not the outer one's.
+    try std.testing.expect((try evalLit(a, "json_any('[[1,2],[3]]', x -> json_reduce(x, 0, (acc, x) -> acc + x) = 3)")).bool);
 }
 
 test "check-time errors: bad strftime directive, sub-day date_add on a date" {

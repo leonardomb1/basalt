@@ -102,6 +102,7 @@ pub const builtin_functions = [_]Builtin{
     .{ .name = "epoch", .sig = "epoch(ts)" },
     .{ .name = "to_timestamp", .sig = "to_timestamp(seconds)" },
     .{ .name = "strftime", .sig = "strftime(ts, format)" },
+    .{ .name = "json_reduce", .sig = "json_reduce(arr, initial, (acc, x) -> value)" },
     .{ .name = "json_object", .sig = "json_object(key, value, …)" },
     .{ .name = "json_array", .sig = "json_array(value, …)" },
     .{ .name = "to_base64", .sig = "to_base64(s)" },

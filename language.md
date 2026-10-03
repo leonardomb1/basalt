@@ -1226,9 +1226,26 @@ columns it has not seen.
   against text, in an array that mixes kinds — counts as null (the condition is
   not true; `json_transform` puts `null`); a failing `CAST` still fails the run.
   A null cell is null; a cell that is JSON but not an array is an error. A
-  lambda is an argument of these four functions only, and never descends to a
-  SQL source — the row is filtered here, while the rest of its WHERE still
-  descends.
+  lambda is an argument of these functions and `json_reduce` only, and never
+  descends to a SQL source — the row is filtered here, while the rest of its
+  WHERE still descends. Written `(x, i) -> …`, the lambda also gets the
+  element's position, from 0 as in a `json_get` path.
+- `JSON_REDUCE(arr, initial, (acc, x) -> value)` — a fold: `acc` starts at
+  `initial` and becomes the body's value at each element in turn; the result is
+  the last one, `initial` for an empty array and null for a null cell.
+  `(acc, x, i) -> …` adds the position. The accumulator keeps `initial`'s type,
+  widened to what the body returns from it (a DECIMAL total stays a DECIMAL, a
+  date a date); a FLOAT element arriving in an INT or DECIMAL total stops the
+  statement rather than being cut short — start from `0.0` to sum floats. An
+  element the body cannot compare stops it too, where `json_transform` would
+  put null: a null mid-fold would quietly undo everything folded before it.
+
+  ```sql
+  -- a weighted sum over digits, as a check digit needs
+  SELECT json_reduce(digits, 0, (acc, d, i) ->
+           acc + CAST(d AS INT) * CAST(json_get('[5,4,3,2,9,8,7,6,5,4,3,2]', CAST(i AS STRING)) AS INT)) AS s
+  FROM ...
+  ```
 - `TRY_CAST(x AS T)` — CAST that yields null instead of failing on a bad
   value; the workhorse for dirty inputs. Never pushed down.
 - `CAST(x AS TIME)` takes `'HH:MM:SS[.ffffff]'` or `'HH:MM'` text, or a

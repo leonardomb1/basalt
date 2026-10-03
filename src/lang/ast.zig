@@ -69,10 +69,11 @@ pub const Expr = union(enum) {
     /// type-checker and evaluator never see it — like a single-use `fn`. Lets a `fn`
     /// body (or any computed column) name an intermediate instead of repeating it.
     pub const LetIn = struct { name: []const u8, value: *Expr, body: *Expr };
-    /// `param -> body`: an argument of the JSON array functions (`json_filter`,
-    /// `json_transform`, `json_any`, `json_all`), which evaluate `body` once per
-    /// element with `param` bound to it. Nowhere else is a lambda a value.
-    pub const Lambda = struct { param: []const u8, body: *Expr };
+    /// `x -> body` or `(acc, x, i) -> body`: an argument of the JSON array
+    /// functions (`json_filter`, `json_transform`, `json_any`, `json_all`,
+    /// `json_reduce`), which evaluate `body` once per element with the parameters
+    /// bound to it. Nowhere else is a lambda a value.
+    pub const Lambda = struct { params: []const []const u8, body: *Expr };
     /// `CAST(e AS ty)`, and — with `safe` set — `TRY_CAST(e AS ty)`, which has
     /// identical syntax and type rules except that a failed conversion yields
     /// null instead of raising. A safe cast is therefore always nullable.
@@ -119,7 +120,7 @@ fn mkExpr(arena: std.mem.Allocator, e: Expr) !*Expr {
 pub fn rebuildExpr(arena: std.mem.Allocator, e: *const Expr, ctx: anytype, comptime recur: anytype) !*Expr {
     return switch (e.*) {
         .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit, .field, .lambda_var => @constCast(e),
-        .lambda => |l| try mkExpr(arena, .{ .lambda = .{ .param = l.param, .body = try recur(ctx, l.body) } }),
+        .lambda => |l| try mkExpr(arena, .{ .lambda = .{ .params = l.params, .body = try recur(ctx, l.body) } }),
         .unary => |u| try mkExpr(arena, .{ .unary = .{ .op = u.op, .e = try recur(ctx, u.e) } }),
         .binary => |b| try mkExpr(arena, .{ .binary = .{ .op = b.op, .l = try recur(ctx, b.l), .r = try recur(ctx, b.r) } }),
         .cond => |c| try mkExpr(arena, .{ .cond = .{ .cond = try recur(ctx, c.cond), .then = try recur(ctx, c.then), .els = try recur(ctx, c.els) } }),

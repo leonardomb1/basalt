@@ -319,7 +319,7 @@ pub const Parser = struct {
     tvf: ?*TableFrame = null,
     tvf_depth: usize = 0,
     /// The parameters of the lambdas whose bodies are being parsed, innermost last.
-    lambda_names: [8][]const u8 = undefined,
+    lambda_names: [24][]const u8 = undefined,
     lambda_n: usize = 0,
     conn_names: std.array_list.Managed([]const u8) = undefined,
     /// Parallel to `conn_names`: each connection's connector type, which `SHOW
@@ -3588,7 +3588,10 @@ pub const Parser = struct {
             // Rendered, not collapsed: `count_if(json_any(a, t -> t = 1))` and the
             // same over `t = 2` are two aggregates, and one key would merge them.
             .lambda => |l| {
-                buf.appendSlice(l.param) catch return error.OutOfMemory;
+                for (l.params, 0..) |pp, k| {
+                    if (k > 0) buf.append(',') catch return error.OutOfMemory;
+                    buf.appendSlice(pp) catch return error.OutOfMemory;
+                }
                 buf.appendSlice("->") catch return error.OutOfMemory;
                 try self.exprKey(l.body, buf);
             },
@@ -3848,20 +3851,52 @@ pub const Parser = struct {
         return S.recur(.{ .p = self, .aliases = aliases }, e);
     }
 
-    /// One argument of a call: an expression, or a lambda `param -> body` — which
-    /// only the JSON array functions accept; anywhere else the type-checker says so.
+    /// One argument of a call: an expression, or a lambda `x -> body` /
+    /// `(acc, x) -> body` — which only the JSON array functions accept; anywhere
+    /// else the type-checker says so.
     fn parseCallArg(self: *Parser) Error!*ast.Expr {
-        if (!(self.at(.ident) and self.peekTag() == .arrow)) return self.parseExpr();
+        const n = self.lambdaHead() orelse return self.parseExpr();
         const pos = self.curPos();
-        const param = self.advance().text;
-        _ = self.advance();
-        if (self.lambda_n == self.lambda_names.len)
-            return self.fail(pos, "lambdas nest more than {d} deep", .{self.lambda_names.len});
-        self.lambda_names[self.lambda_n] = param;
-        self.lambda_n += 1;
-        defer self.lambda_n -= 1;
+        const paren = self.at(.lparen);
+        if (paren) _ = self.advance();
+        const params = try self.arena.alloc([]const u8, n);
+        for (params, 0..) |*pp, k| {
+            if (k > 0) _ = self.advance(); // `,`
+            const t = self.advance();
+            for (params[0..k]) |prev| {
+                if (std.mem.eql(u8, prev, t.text)) return self.fail(.{ .line = t.line, .col = t.col }, "lambda parameter `{s}` is named twice", .{t.text});
+            }
+            pp.* = t.text;
+        }
+        if (paren) _ = self.advance(); // `)`
+        _ = self.advance(); // `->`
+        if (self.lambda_n + n > self.lambda_names.len)
+            return self.fail(pos, "lambdas nest too deep ({d} parameters in scope at most)", .{self.lambda_names.len});
+        for (params) |pp| {
+            self.lambda_names[self.lambda_n] = pp;
+            self.lambda_n += 1;
+        }
+        defer self.lambda_n -= n;
         const body = try self.parseExpr();
-        return self.mk(.{ .lambda = .{ .param = param, .body = body } });
+        return self.mk(.{ .lambda = .{ .params = params, .body = body } });
+    }
+
+    /// The parameter count when the tokens ahead open a lambda — `x ->` or
+    /// `(a, b, …) ->` — else null, and an ordinary argument follows.
+    fn lambdaHead(self: *Parser) ?usize {
+        if (self.at(.ident)) return if (self.peekTag() == .arrow) 1 else null;
+        if (!self.at(.lparen)) return null;
+        var j = self.i + 1;
+        var n: usize = 0;
+        while (j + 1 < self.toks.len and self.toks[j].tag == .ident) : (j += 2) {
+            n += 1;
+            switch (self.toks[j + 1].tag) {
+                .comma => continue,
+                .rparen => return if (j + 2 < self.toks.len and self.toks[j + 2].tag == .arrow) n else null,
+                else => return null,
+            }
+        }
+        return null;
     }
 
     /// The lambda parameter `name` refers to, innermost first, if any is in scope.
@@ -4596,7 +4631,7 @@ test "sql: a lambda's parameter is its own node in the body, never a column" {
     const prog = try parseSource(a, "SELECT json_filter(tags, t -> t = name AND t <> 'x') AS v FROM 'in.csv';", &diag);
     const call = prog.stmts[1].output.stages[1].node.select[0].computed.expr.call;
     const l = call.args[1].lambda;
-    try testing.expectEqualStrings("t", l.param);
+    try testing.expectEqualStrings("t", l.params[0]);
     const lhs = l.body.binary.l.binary;
     try testing.expectEqualStrings("t", lhs.l.lambda_var);
     // a column named in the body stays a column
@@ -4606,6 +4641,19 @@ test "sql: a lambda's parameter is its own node in the body, never a column" {
     try testing.expect(p2.stmts[1].output.stages[1].node.select[1] == .field);
     // `->` was a syntax error before; `a - > b` still is
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT a - > b AS z FROM 'in.csv';", &diag));
+
+    // several parameters in parentheses, one in parentheses, and a parenthesised
+    // argument that is not a lambda
+    const p3 = try parseSource(a, "SELECT json_reduce(tags, 0, (acc, t, i) -> acc + t + i) AS v FROM 'in.csv';", &diag);
+    const l3 = p3.stmts[1].output.stages[1].node.select[0].computed.expr.call.args[2].lambda;
+    try testing.expectEqual(@as(usize, 3), l3.params.len);
+    try testing.expectEqualStrings("acc", l3.body.binary.l.binary.l.lambda_var);
+    try testing.expectEqualStrings("i", l3.body.binary.r.lambda_var);
+    const p4 = try parseSource(a, "SELECT json_any(tags, (t) -> t = 1) AS v FROM 'in.csv';", &diag);
+    try testing.expectEqual(@as(usize, 1), p4.stmts[1].output.stages[1].node.select[0].computed.expr.call.args[1].lambda.params.len);
+    const p5 = try parseSource(a, "SELECT coalesce((a), b) AS v FROM 'in.csv';", &diag);
+    try testing.expect(p5.stmts[1].output.stages[1].node.select[0].computed.expr.call.args[0].* == .field);
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT json_reduce(tags, 0, (x, x) -> x) AS v FROM 'in.csv';", &diag));
 }
 
 test "sql: EXPLAIN COSTS is rejected in either position" {
