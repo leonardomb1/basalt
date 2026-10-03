@@ -1614,6 +1614,12 @@ pub const builtins = [_]Builtin{
     .{ .name = "json_transform", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
     .{ .name = "json_any", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
     .{ .name = "json_all", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
+    .{ .name = "json_object", .type_fn = typing.jsonBuild, .eval_fn = per_row.jsonObject },
+    .{ .name = "json_array", .type_fn = typing.jsonBuild, .eval_fn = per_row.jsonArray },
+    .{ .name = "to_base64", .type_fn = typing.unaryString, .eval_fn = per_row.toBase64 },
+    .{ .name = "from_base64", .type_fn = typing.fromBase64, .eval_fn = per_row.fromBase64 },
+    .{ .name = "url_encode", .type_fn = typing.unaryString, .eval_fn = per_row.urlCode },
+    .{ .name = "url_decode", .type_fn = typing.unaryString, .eval_fn = per_row.urlCode },
 };
 
 /// The builtin called `name`, or null: unknown names and aggregates
@@ -1686,6 +1692,20 @@ const typing = struct {
         if (c.args.len != 1) return self.err("`{s}` takes one argument", .{c.name});
         const a = try self.wantText(c, 0);
         return Type.init(if (eq(c.name, "xxhash64")) .int else .string).withNull(a.nullable);
+    }
+
+    /// Never null: a null value is JSON's `null` in the document built.
+    fn jsonBuild(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (eq(c.name, "json_object") and c.args.len % 2 != 0)
+            return self.err("`json_object` takes key, value pairs", .{});
+        for (c.args, 0..) |_, i| _ = try self.wantText(c, i);
+        return Type.init(.string);
+    }
+
+    fn fromBase64(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 1) return self.err("`from_base64` takes one argument", .{});
+        const a = try self.wantText(c, 0);
+        return Type.init(.bytes).withNull(a.nullable);
     }
 
     fn concatWs(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
@@ -2102,6 +2122,88 @@ const per_row = struct {
         var d: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(data, &d, .{});
         return .{ .string = try std.fmt.allocPrint(arena, "{x}", .{&d}) };
+    }
+
+    /// `{"k": v, …}` from key, value pairs. Values are written as `json_transform`
+    /// writes its elements, so a nested `json_object`/`json_array` — or a
+    /// `json_get` that returned an object — goes in as JSON, not as a string.
+    fn jsonObject(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        var out = std.Io.Writer.Allocating.init(arena);
+        const w = &out.writer;
+        w.writeByte('{') catch return error.OutOfMemory;
+        var i: usize = 0;
+        while (i < c.args.len) : (i += 2) {
+            const k = try evalRow(arena, c.args[i], batch, row);
+            // A JSON key cannot be null; a missing name is a broken document.
+            if (k.isNull()) return error.CastFailed;
+            if (i > 0) w.writeByte(',') catch return error.OutOfMemory;
+            std.json.Stringify.encodeJsonString(try valueToString(arena, k), .{}, w) catch return error.OutOfMemory;
+            w.writeByte(':') catch return error.OutOfMemory;
+            try writeJsonValue(arena, try evalRow(arena, c.args[i + 1], batch, row), w);
+        }
+        w.writeByte('}') catch return error.OutOfMemory;
+        return .{ .string = out.written() };
+    }
+
+    fn jsonArray(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        var out = std.Io.Writer.Allocating.init(arena);
+        const w = &out.writer;
+        w.writeByte('[') catch return error.OutOfMemory;
+        for (c.args, 0..) |e, i| {
+            if (i > 0) w.writeByte(',') catch return error.OutOfMemory;
+            try writeJsonValue(arena, try evalRow(arena, e, batch, row), w);
+        }
+        w.writeByte(']') catch return error.OutOfMemory;
+        return .{ .string = out.written() };
+    }
+
+    fn toBase64(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return .null;
+        const data = try valueToString(arena, v);
+        const enc = std.base64.standard.Encoder;
+        const out = try arena.alloc(u8, enc.calcSize(data.len));
+        return .{ .string = enc.encode(out, data) };
+    }
+
+    fn fromBase64(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return .null;
+        const text = std.mem.trim(u8, try valueToString(arena, v), " \t\r\n");
+        const dec = std.base64.standard.Decoder;
+        const out = try arena.alloc(u8, dec.calcSizeForSlice(text) catch return error.CastFailed);
+        dec.decode(out, text) catch return error.CastFailed;
+        return .{ .bytes = out };
+    }
+
+    /// Percent-encoding as RFC 3986 has it: everything but letters, digits and
+    /// `-._~` becomes `%XX` of its UTF-8 bytes. Decoding leaves `+` alone and
+    /// passes a `%` not followed by two hex digits through, as DuckDB does.
+    fn urlCode(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return .null;
+        const str = try valueToString(arena, v);
+        var out = try std.array_list.Managed(u8).initCapacity(arena, str.len);
+        if (eq(c.name, "url_encode")) {
+            for (str) |b| {
+                if (std.ascii.isAlphanumeric(b) or b == '-' or b == '.' or b == '_' or b == '~') {
+                    try out.append(b);
+                } else try out.writer().print("%{X:0>2}", .{b});
+            }
+        } else {
+            var i: usize = 0;
+            while (i < str.len) : (i += 1) {
+                if (str[i] == '%' and i + 2 < str.len) {
+                    if (std.fmt.parseInt(u8, str[i + 1 .. i + 3], 16)) |b| {
+                        try out.append(b);
+                        i += 2;
+                        continue;
+                    } else |_| {}
+                }
+                try out.append(str[i]);
+            }
+        }
+        return .{ .string = out.items };
     }
 
     /// Postgres' `concat_ws`: the values joined by the separator, nulls skipped —
@@ -4768,6 +4870,39 @@ test "check-time errors: a regexp_extract group past the pattern's" {
     try std.testing.expectError(error.TypeError, ctx.typeOf(try parser.parseExprStr(a, "regexp_extract('x', '(a)', 2)", &diag)));
     try std.testing.expectError(error.TypeError, ctx.typeOf(try parser.parseExprStr(a, "regexp_matches('x', '(')", &diag)));
     _ = try ctx.typeOf(try parser.parseExprStr(a, "regexp_extract('x', '(a)', 1)", &diag));
+}
+
+test "json builders and encodings: json_object, json_array, base64, url" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const str = struct {
+        fn f(al: std.mem.Allocator, src: []const u8) ![]const u8 {
+            return (try evalLit(al, src)).string;
+        }
+    }.f;
+
+    try std.testing.expectEqualStrings(
+        \\{"a":1,"b":"x \"q\"","c":null,"d":[1,"two"],"e":true}
+    , try str(a, "json_object('a', 1, 'b', 'x \"q\"', 'c', NULL, 'd', json_array(1, 'two'), 'e', 1 = 1)"));
+    try std.testing.expectEqualStrings("{}", try str(a, "json_object()"));
+    try std.testing.expectEqualStrings("[]", try str(a, "json_array()"));
+    try std.testing.expectEqualStrings(
+        \\{"k":{"y":1}}
+    , try str(a, "json_object('k', json_get('{\"x\": {\"y\": 1}}', 'x'))"));
+    // Text that only looks like JSON stays a string.
+    try std.testing.expectEqualStrings(
+        \\["[not json"]
+    , try str(a, "json_array('[not json')"));
+    try std.testing.expectError(error.CastFailed, evalLit(a, "json_object(NULL, 1)"));
+
+    try std.testing.expectEqualStrings("aGVsbG8=", try str(a, "to_base64('hello')"));
+    try std.testing.expectEqualStrings("hello", (try evalLit(a, "from_base64('aGVsbG8=')")).bytes);
+    try std.testing.expectError(error.CastFailed, evalLit(a, "from_base64('!!')"));
+
+    try std.testing.expectEqualStrings("a%20b%26c%3Dd%2F%C3%A9", try str(a, "url_encode('a b&c=d/é')"));
+    try std.testing.expectEqualStrings("a+b cé", try str(a, "url_decode('a+b%20c%C3%A9')"));
+    try std.testing.expectEqualStrings("%zz%4", try str(a, "url_decode('%zz%4')"));
 }
 
 test "check-time errors: bad strftime directive, sub-day date_add on a date" {

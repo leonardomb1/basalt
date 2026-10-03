@@ -48,7 +48,8 @@ test "builtins: exactly these lack a vectorized kernel" {
         "strftime",       "json_get",   "json_filter", "json_transform", "json_any", "json_all",
         "strptime",       "try_strptime", "unaccent",  "strip_accents",  "translate", "initcap",
         "ascii",          "chr",        "regexp_matches", "regexp_extract", "md5",    "sha256",
-        "xxhash64",       "concat_ws",
+        "xxhash64",       "concat_ws",  "json_object", "json_array",    "to_base64", "from_base64",
+        "url_encode",     "url_decode",
     };
     for (rowwise_only) |n| try std.testing.expect(lookup(n) != null);
     for (table) |b| {

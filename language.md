@@ -1179,7 +1179,16 @@ columns it has not seen.
   '%d/%m/%Y')` — taking a number short of its width (`3/1/2026`) and pivoting
   `%y` at 69; text that does not fit the format, or a day that does not exist,
   fails the row, and `try_strptime` makes it null instead · json
-  `json_get(doc, path)`.
+  `json_get(doc, path) json_object(key, value, …) json_array(value, …)` ·
+  encoding `to_base64(s) from_base64(s)` (to BYTES) `url_encode(s)
+  url_decode(s)` (RFC 3986; `+` is left alone).
+- `JSON_OBJECT(k1, v1, …)`, `JSON_ARRAY(v1, …)` — build a JSON document, for a
+  request body or a nested column: numbers and booleans as themselves, text
+  as a JSON string, a null as `null` (the result itself is never null). Text
+  that is a JSON object or array — another `json_object`, or what `json_get`
+  returned — goes in as that object or array, so
+  `json_object('id', id, 'tags', json_array(a, b))` nests. A null key fails
+  the row.
 - `JSON_GET(doc, path)` — one value out of a JSON document, as text: `path` is
   `a.b`, `a[0].b` or `a.0.b` (a leading `$.` is allowed). Strings come back
   unquoted, objects and arrays as JSON text; a missing key, an index past the
