@@ -159,6 +159,11 @@ const reserved_after_source = [_][]const u8{
     "explain", "costs",    "analyze", "except", "intersect",
 };
 
+fn isKwIn(name: []const u8, kws: []const []const u8) bool {
+    for (kws) |k| if (eqlNoCase(name, k)) return true;
+    return false;
+}
+
 fn isReservedAfterSource(name: []const u8) bool {
     for (reserved_after_source) |k| {
         if (eqlNoCase(name, k)) return true;
@@ -452,6 +457,16 @@ pub const Parser = struct {
         return self.fail(self.curPos(), "expected `{s}`, found {s}", .{ kw, self.curTag().describe() });
     }
     /// A column name: identifier or quoted string (so '${var}' can build it).
+    /// A select item's alias: `AS name`, or a bare name as SQL allows —
+    /// `SUM(v) total` — unless the word is what comes after the item (`FROM`).
+    fn itemAlias(self: *Parser) Error!?[]const u8 {
+        if (self.eatKw("as")) return try self.expectColName();
+        if (self.at(.qident)) return self.advance().text;
+        if (self.at(.ident) and !isReservedAfterSource(self.toks[self.i].text) and !isKwIn(self.toks[self.i].text, &.{ "into", "over", "filter", "window", "qualify", "fetch" }))
+            return self.advance().text;
+        return null;
+    }
+
     fn expectColName(self: *Parser) Error![]const u8 {
         if (self.atName() or self.at(.string)) return self.advance().text;
         return self.fail(self.curPos(), "expected a column name, found {s}", .{self.curTag().describe()});
@@ -1809,7 +1824,7 @@ pub const Parser = struct {
                 const e = try self.parseExpr();
                 const synth: ?[]const u8 = if (e.* == .field) null else try self.synthRange(start, self.i);
                 var name: ?[]const u8 = null;
-                if (self.eatKw("as")) name = try self.expectColName();
+                name = try self.itemAlias();
                 if (name) |n| {
                     if (synth) |sy| try expr_aliases.append(.{ .synth = sy, .out = n });
                     try raw_items.append(.{ .item = .{ .computed = .{ .name = n, .expr = e } } });
@@ -3163,8 +3178,7 @@ pub const Parser = struct {
         })
             return self.fail(wpos, "a window function needs ORDER BY inside OVER (...) to number by", .{});
 
-        _ = self.eatKw("as");
-        const name = if (self.at(.ident)) self.advance().text else @tagName(kind);
+        const name = (try self.itemAlias()) orelse @tagName(kind);
         try funcs.append(.{ .kind = kind, .out = name, .arg = arg, .offset = offset, .frame = this_frame });
         return true;
     }
@@ -6246,4 +6260,16 @@ test "known tables: a name the session holds reads as a binding reference, FROM 
     try testing.expect(parseTypeStr(a, "timestamp").?.kind == .timestamp);
     try testing.expect(parseTypeStr(a, "nope") == null);
     try testing.expect(parseTypeStr(a, "int int") == null);
+}
+
+test "sql: a select item's alias may omit AS, but not swallow the clause after it" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a, "SELECT category, SUM(value) total, MAX(value) \"top\" FROM 'in.csv' GROUP BY category;");
+    try testing.expect(prog.stmts.len == 2);
+    // `FROM`, `WHERE`, `GROUP` after an item are clauses, not names
+    _ = try parseTest(a, "SELECT id FROM 'in.csv' WHERE id > 1 ORDER BY id LIMIT 2;");
+    _ = try parseTest(a, "SELECT 1 x, 'a' y;");
 }
