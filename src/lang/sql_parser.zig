@@ -613,7 +613,12 @@ pub const Parser = struct {
         }
         if (self.isKw("print")) return out.append(.{ .print = try self.parsePrintStmt() });
         if (self.isKw("load")) return self.parseLoadInto(out);
-        if (self.isKw("for")) return out.append(.{ .for_each = try self.parseForEach() });
+        if (self.isKw("for")) {
+            var pre = std.array_list.Managed(ast.Stmt).init(self.arena);
+            const fe = try self.parseForEach(&pre);
+            try out.appendSlice(pre.items);
+            return out.append(.{ .for_each = fe });
+        }
         if (self.isKw("case")) return out.append(.{ .match = try self.parseCaseStmt() });
         if (self.isKw("throw")) return out.append(.{ .throw = try self.parseThrowStmt() });
         if (self.isKw("call")) return out.append(.{ .call = try self.parseCallStmt() });
@@ -3111,8 +3116,11 @@ pub const Parser = struct {
         var hoisted = std.array_list.Managed(ast.Stmt).init(self.arena);
         var stages = std.array_list.Managed(ast.Stage).init(self.arena);
         try self.parseQuery(&hoisted, &stages);
-        if (hoisted.items.len > 0)
-            return self.fail(pos, "a discovery sub-query may not declare CTEs", .{});
+        // Its CTEs, derived tables and table-function calls become bindings like
+        // any query's, placed ahead of the statement that discovers through them
+        // (`parseForEach` / the enclosing `parseQuery`). They used to be refused —
+        // "may not declare CTEs" even of a query that only called a function.
+        try self.pending_bindings.appendSlice(hoisted.items);
         return .{ .stages = try stages.toOwnedSlice(), .pos = pos };
     }
 
@@ -3276,7 +3284,9 @@ pub const Parser = struct {
         return cols.toOwnedSlice();
     }
 
-    fn parseForEach(self: *Parser) Error!ast.ForEach {
+    /// `pre` receives the bindings the discovery source needs, which run ahead of
+    /// the loop — not inside its body, where the body's first query would take them.
+    fn parseForEach(self: *Parser, pre: *std.array_list.Managed(ast.Stmt)) Error!ast.ForEach {
         const pos = self.curPos();
         try self.expectKw("for");
         try self.expectKw("each");
@@ -3289,8 +3299,10 @@ pub const Parser = struct {
             source = .{ .json_path = try self.parseDollarPath() };
         } else if (self.at(.string)) {
             source = .{ .read = .{ .connector = "csv", .form = .{ .path = self.advance().text } } };
-        } else if (self.isKw("select")) {
+        } else if (self.isKw("select") or self.isKw("with")) {
             source = .{ .pipeline = try self.parseSubQuery(pos) };
+            try pre.appendSlice(self.pending_bindings.items);
+            self.pending_bindings.clearRetainingCapacity();
         } else if (self.at(.ident)) {
             const conn = try self.expectIdent();
             if (!self.isConn(conn))

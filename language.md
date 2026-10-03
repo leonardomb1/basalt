@@ -1236,8 +1236,9 @@ columns it has not seen.
   function, the body is checked where it is declared, and an `@include`d table
   function is called like a local one. A body may call table functions declared
   before it; a call that reaches its own function (possible only through `OR
-  REPLACE`) stops at 16 levels. Like a derived table, a call cannot be the source
-  of a `FOR EACH ROW OF (...)` or `EACH TABLE OF (...)` discovery query.
+  REPLACE`) stops at 16 levels. A discovery query — `FOR EACH ROW OF (...)`,
+  `EACH TABLE OF (SELECT ...)` — may call one too, as it may read a derived table
+  or open with `WITH`: their bindings run ahead of the loop.
 
   ```sql
   CREATE FUNCTION paid_orders(since DATE, branch STRING DEFAULT '01') RETURNS TABLE AS

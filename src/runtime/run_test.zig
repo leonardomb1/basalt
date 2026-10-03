@@ -3430,6 +3430,47 @@ test "a CSV read with a delimiter and an encoding fans out over lanes and reads 
     try std.testing.expectEqualStrings(want, lanes);
 }
 
+test "a FOR EACH discovery query may read a table function, a derived table or a CTE" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "o.csv", .data = "id,g,x\n1,a,10\n2,a,20\n3,b,30\n4,c,5\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    // The discovery query's bindings run ahead of the loop. It used to be refused —
+    // "may not declare CTEs" even of a query that only called a function.
+    const script = try std.fmt.allocPrint(alloc,
+        \\CREATE FUNCTION groups(minx INT) RETURNS TABLE AS SELECT DISTINCT g FROM '{0s}/o.csv' WHERE x >= $minx;
+        \\FOR EACH ROW OF (WITH s AS (SELECT g FROM groups(10)) SELECT g FROM (SELECT g FROM s) d) AS (gg)
+        \\  LOAD INTO '{0s}/out_${{gg}}.csv' AS SELECT id FROM '{0s}/o.csv' WHERE g = $gg;
+        \\END FOR;
+    , .{base});
+    defer alloc.free(script);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    // the bindings sit before the loop, none inside its body
+    var loop: ?ast.ForEach = null;
+    for (prog.stmts) |st| if (st == .for_each) {
+        loop = st.for_each;
+    };
+    for (loop.?.body) |st| try std.testing.expect(st != .binding);
+    var rdiag: Diag = .{};
+    _ = run(alloc, prog, .{}, &rdiag) catch |e| {
+        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
+        return e;
+    };
+    const a = try tmp.dir.readFileAlloc(alloc, "out_a.csv", 1 << 16);
+    defer alloc.free(a);
+    try std.testing.expectEqualStrings("id\n1\n2\n", a);
+    const b = try tmp.dir.readFileAlloc(alloc, "out_b.csv", 1 << 16);
+    defer alloc.free(b);
+    try std.testing.expectEqualStrings("id\n3\n", b);
+    // `c` has no x >= 10, so the function's WHERE kept it out of the loop
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("out_c.csv", .{}));
+}
+
 test "csv: a column of ISO dates is inferred as DATE (empty cells are null)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
