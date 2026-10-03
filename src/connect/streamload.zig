@@ -1,8 +1,10 @@
-//! StarRocks sink. Two channels:
+//! Stream Load sink, for the databases that load this way — StarRocks, and the
+//! project it forked from. Two channels:
 //!   - MySQL protocol -> FE (9030): DDL (CREATE TABLE IF NOT EXISTS, TRUNCATE).
 //!   - HTTP Stream Load -> BE/FE: the actual data load.
 //! The write mode selects the table model: append/overwrite -> Duplicate Key,
-//! `upsert on k` -> Primary Key (keys reordered first + NOT NULL).
+//! `upsert on k` -> Primary Key (keys reordered first + NOT NULL). What differs
+//! between the databases — DDL, a header's spelling — is the `Flavor`.
 //!
 //! This file's pure logic (type mapping, DDL generation, TSV body, labels, auth)
 //! is unit-tested. The network paths require a live StarRocks to exercise.
@@ -19,7 +21,43 @@ const op = @import("../exec/op.zig");
 
 const FLUSH_BYTES = 8 * 1024 * 1024;
 
+/// Which database a Stream Load connection talks to.
+pub const Flavor = enum {
+    starrocks,
+
+    /// The flavor a connection's `TYPE` names, or null for any other connector.
+    pub fn of(connector: []const u8) ?Flavor {
+        return std.meta.stringToEnum(Flavor, connector);
+    }
+
+    pub fn name(self: Flavor) []const u8 {
+        return @tagName(self);
+    }
+
+    /// The dialect its FE is read and its DDL written in.
+    pub fn dialect(self: Flavor) sql.Dialect {
+        return switch (self) {
+            .starrocks => .starrocks,
+        };
+    }
+
+    /// The Stream Load headers that carry the row delimiter and a partial
+    /// update.
+    fn rowDelimiterHeader(self: Flavor) []const u8 {
+        return switch (self) {
+            .starrocks => "row_delimiter",
+        };
+    }
+
+    fn partialHeader(self: Flavor) []const u8 {
+        return switch (self) {
+            .starrocks => "partial_update",
+        };
+    }
+};
+
 pub const Config = struct {
+    flavor: Flavor = .starrocks,
     fe_host: []const u8 = "127.0.0.1",
     fe_port: u16 = 9030,
     load_url: []const u8 = "http://127.0.0.1:8040",
@@ -36,7 +74,7 @@ pub const Config = struct {
     errctx: ?*op.ErrCtx = null,
 };
 
-/// A single-quoted string literal for StarRocks' MySQL protocol: `'` doubled,
+/// A single-quoted string literal for the FE's MySQL protocol: `'` doubled,
 /// and `\\` doubled since it is an escape there.
 fn appendStrLit(out: *std.array_list.Managed(u8), s: []const u8) !void {
     try out.append('\'');
@@ -54,9 +92,10 @@ pub fn srType(arena: std.mem.Allocator, t: types.Type) ![]const u8 {
 }
 
 /// `CREATE TABLE IF NOT EXISTS` for `db`.`table` — the shared DDL builder with
-/// the StarRocks table-model clauses; see `sql.createTableSqlWith`.
+/// the flavor's table-model clauses; see `sql.createTableSqlWith`.
 pub fn genCreateTable(
     arena: std.mem.Allocator,
+    flavor: Flavor,
     db: []const u8,
     table: []const u8,
     schema: types.Schema,
@@ -65,7 +104,7 @@ pub fn genCreateTable(
     replication_num: u32,
 ) ![]const u8 {
     const qtable = try std.fmt.allocPrint(arena, "`{s}`.`{s}`", .{ db, table });
-    return sql.createTableSqlWith(arena, .starrocks, qtable, schema, mode, .{ .buckets = buckets, .replication_num = replication_num });
+    return sql.createTableSqlWith(arena, flavor.dialect(), qtable, schema, mode, .{ .buckets = buckets, .replication_num = replication_num });
 }
 
 /// Stream Load label: `<prefix>_<table>_<run_id>_<seq>`. The label makes each flush
@@ -96,6 +135,7 @@ pub fn genLabel(arena: std.mem.Allocator, prefix: []const u8, table: []const u8,
 /// payroll APIs emitting keys like "extra noturna 110"), which the header's
 /// SQL-ish parser would otherwise reject.
 pub fn columnList(arena: std.mem.Allocator, schema: types.Schema) ![]const u8 {
+    // backtick quoting, as every flavor's FE takes it
     return sql.colList(arena, .starrocks, schema);
 }
 
@@ -127,7 +167,7 @@ pub fn appendBatchTsv(w: anytype, arena: std.mem.Allocator, batch: Batch) !void 
                 // arrives as three characters. Writing the value through would
                 // silently turn it into NULL, so refuse. The load already runs
                 // at max_filter_ratio=0; this sink does not do partial data.
-                if (std.mem.eql(u8, s, NULL_MARKER)) return error.StarRocksNullMarkerInData;
+                if (std.mem.eql(u8, s, NULL_MARKER)) return error.StreamLoadNullMarkerInData;
                 try writeSanitized(w, s);
             }
         }
@@ -147,26 +187,6 @@ fn writeSanitized(w: anytype, s: []const u8) !void {
         }
     }
     try w.writeAll(s[start..]);
-}
-
-/// mysql_native_password auth token:
-///   SHA1(pw) XOR SHA1( salt ++ SHA1(SHA1(pw)) )
-pub fn mysqlAuthToken(password: []const u8, salt: []const u8) [20]u8 {
-    const Sha1 = std.crypto.hash.Sha1;
-    var h1: [20]u8 = undefined;
-    Sha1.hash(password, &h1, .{});
-    var h2: [20]u8 = undefined;
-    Sha1.hash(&h1, &h2, .{});
-
-    var ctx = Sha1.init(.{});
-    ctx.update(salt);
-    ctx.update(&h2);
-    var h3: [20]u8 = undefined;
-    ctx.final(&h3);
-
-    var out: [20]u8 = undefined;
-    for (&out, 0..) |*b, i| b.* = h1[i] ^ h3[i];
-    return out;
 }
 
 pub const StreamLoadSink = struct {
@@ -223,7 +243,7 @@ pub const StreamLoadSink = struct {
                     defer gpa.free(cdb);
                     try self.runDDL(cdb);
                 }
-                const ddl = try genCreateTable(gpa, cfg.database, table, schema, mode, cfg.buckets, cfg.replication_num);
+                const ddl = try genCreateTable(gpa, cfg.flavor, cfg.database, table, schema, mode, cfg.buckets, cfg.replication_num);
                 defer gpa.free(ddl);
                 try self.runDDL(ddl);
             }
@@ -245,8 +265,8 @@ pub const StreamLoadSink = struct {
         const conn = try mysql.Conn.connect(self.gpa, self.cfg.fe_host, self.cfg.fe_port, self.cfg.user, self.cfg.password, "", .off);
         defer conn.close();
         conn.exec(stmt) catch |e| {
-            obs.logOr(self.logger, .err, "starrocks DDL error: {s} (sql: {s})", .{ conn.last_error, stmt });
-            if (self.cfg.errctx) |ec| ec.set("starrocks refused `{s}`: {s}", .{ stmt, conn.last_error });
+            obs.logOr(self.logger, .err, "{s} DDL error: {s} (sql: {s})", .{ self.cfg.flavor.name(), conn.last_error, stmt });
+            if (self.cfg.errctx) |ec| ec.set("{s} refused `{s}`: {s}", .{ self.cfg.flavor.name(), stmt, conn.last_error });
             return e;
         };
     }
@@ -342,11 +362,11 @@ pub const StreamLoadSink = struct {
         try hdrs.append(.{ .name = "label", .value = label });
         try hdrs.append(.{ .name = "format", .value = "CSV" });
         try hdrs.append(.{ .name = "column_separator", .value = "\\x01" });
-        try hdrs.append(.{ .name = "row_delimiter", .value = "\\x02" });
+        try hdrs.append(.{ .name = self.cfg.flavor.rowDelimiterHeader(), .value = "\\x02" });
         try hdrs.append(.{ .name = "columns", .value = self.columns });
         try hdrs.append(.{ .name = "max_filter_ratio", .value = "0" });
         if (self.mode == .upsert and self.mode.upsert.partial != null) {
-            try hdrs.append(.{ .name = "partial_update", .value = "true" });
+            try hdrs.append(.{ .name = self.cfg.flavor.partialHeader(), .value = "true" });
         }
 
         var body_aw = std.Io.Writer.Allocating.init(self.gpa);
@@ -441,7 +461,7 @@ test "create table: append -> Duplicate Key" {
         .{ .name = "id", .ty = types.Type.init(.int) },
         .{ .name = "name", .ty = types.Type.init(.string) },
     } };
-    const stmt = try genCreateTable(a, "warehouse", "orders", schema, .append, 4, 1);
+    const stmt = try genCreateTable(a, .starrocks, "warehouse", "orders", schema, .append, 4, 1);
     try std.testing.expect(std.mem.indexOf(u8, stmt, "CREATE TABLE IF NOT EXISTS `warehouse`.`orders`") != null);
     try std.testing.expect(std.mem.indexOf(u8, stmt, "`id` BIGINT") != null);
     try std.testing.expect(std.mem.indexOf(u8, stmt, "`name` VARCHAR(65533)") != null);
@@ -456,7 +476,7 @@ test "create table: inferred upsert with unresolved (empty) keys errors" {
         .{ .name = "id", .ty = types.Type.init(.int) },
     } };
     const mode = ast.WriteMode{ .upsert = .{ .keys = &.{}, .partial = null } };
-    try std.testing.expectError(error.UpsertKeysUnresolved, genCreateTable(ar.allocator(), "db", "t", schema, mode, 4, 1));
+    try std.testing.expectError(error.UpsertKeysUnresolved, genCreateTable(ar.allocator(), .starrocks, "db", "t", schema, mode, 4, 1));
 }
 
 test "create table: composite inferred upsert -> multi-col PRIMARY KEY, ordered first" {
@@ -468,7 +488,7 @@ test "create table: composite inferred upsert -> multi-col PRIMARY KEY, ordered 
         .{ .name = "recno", .ty = types.Type.init(.int) },
     } };
     const mode = ast.WriteMode{ .upsert = .{ .keys = &.{ "emp", "recno" }, .partial = null } };
-    const stmt = try genCreateTable(ar.allocator(), "bronze", "t", schema, mode, 4, 1);
+    const stmt = try genCreateTable(ar.allocator(), .starrocks, "bronze", "t", schema, mode, 4, 1);
     try std.testing.expect(std.mem.indexOf(u8, stmt, "PRIMARY KEY(`emp`,`recno`)") != null);
     try std.testing.expect(std.mem.indexOf(u8, stmt, "`emp` VARCHAR(65533) NOT NULL") != null);
     try std.testing.expect(std.mem.indexOf(u8, stmt, "`recno` BIGINT NOT NULL") != null);
@@ -486,7 +506,7 @@ test "create table: upsert -> Primary Key, keys first + NOT NULL" {
         .{ .name = "id", .ty = types.Type.init(.int) },
     } };
     const mode = ast.WriteMode{ .upsert = .{ .keys = &.{"id"} } };
-    const stmt = try genCreateTable(a, "warehouse", "orders", schema, mode, 4, 1);
+    const stmt = try genCreateTable(a, .starrocks, "warehouse", "orders", schema, mode, 4, 1);
     try std.testing.expect(std.mem.indexOf(u8, stmt, "PRIMARY KEY(`id`)") != null);
     try std.testing.expect(std.mem.indexOf(u8, stmt, "`id` BIGINT NOT NULL") != null);
     const ipos = std.mem.indexOf(u8, stmt, "`id`").?;
@@ -526,18 +546,6 @@ test "writeSanitized replaces separator bytes embedded in data" {
     buf.clearRetainingCapacity();
     try writeSanitized(buf.writer(), "clean value");
     try std.testing.expectEqualStrings("clean value", buf.items);
-}
-
-test "mysql_native_password token matches a known vector" {
-    var salt: [20]u8 = undefined;
-    for (&salt, 0..) |*b, i| b.* = @intCast(i + 1);
-    const tok = mysqlAuthToken("foobar", &salt);
-    var expect: [20]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&expect, "e419caeec63ade5aeb8e0f8bbb2ac2d86b183350");
-    try std.testing.expectEqualSlices(u8, &expect, &tok);
-    var salt2 = salt;
-    salt2[0] ^= 0xFF;
-    try std.testing.expect(!std.mem.eql(u8, &tok, &mysqlAuthToken("foobar", &salt2)));
 }
 
 test "stream-load TSV body: control-byte framing, nulls, sanitized values" {
@@ -583,7 +591,7 @@ test "a value that is literally the null marker is refused, not written as null"
     const batch = Batch{ .schema = &schema, .columns = cols, .len = 1 };
 
     var out = std.array_list.Managed(u8).init(a);
-    try std.testing.expectError(error.StarRocksNullMarkerInData, appendBatchTsv(out.writer(), a, batch));
+    try std.testing.expectError(error.StreamLoadNullMarkerInData, appendBatchTsv(out.writer(), a, batch));
 
     // Only the whole field is ambiguous — `\N` inside a longer value is data,
     // and StarRocks reads it back verbatim.

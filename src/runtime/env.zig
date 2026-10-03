@@ -609,11 +609,11 @@ pub fn setMsg(diag: *Diag, msg: []const u8) void {
 /// A StarRocks open failure. The reason is appended only when there is one: a
 /// dangling em-dash with nothing after it reads as truncated output, which is what
 /// this printed whenever the failure carried no diagnostic of its own.
-pub fn srOpenErr(env: *Env, e: anyerror, comptime what: []const u8) error{PlanFailed} {
+pub fn srOpenErr(env: *Env, e: anyerror, what: []const u8) error{PlanFailed} {
     const msg = if (env.diag.msg.len == 0)
-        std.fmt.allocPrint(env.arena, what ++ " ({s})", .{@errorName(e)}) catch what
+        std.fmt.allocPrint(env.arena, "{s} ({s})", .{ what, @errorName(e) }) catch what
     else
-        std.fmt.allocPrint(env.arena, what ++ " ({s}) — {s}", .{ @errorName(e), env.diag.msg }) catch what;
+        std.fmt.allocPrint(env.arena, "{s} ({s}) — {s}", .{ what, @errorName(e), env.diag.msg }) catch what;
     return planErr(env.diag, msg);
 }
 

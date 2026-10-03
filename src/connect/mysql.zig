@@ -3,10 +3,9 @@
 //! result sets). Used by the StarRocks sink for CREATE TABLE / TRUNCATE.
 //!
 //! Network-tested only against a live server; the auth token math is unit-tested
-//! in starrocks.zig.
+//! below.
 
 const std = @import("std");
-const starrocks = @import("starrocks.zig");
 const sql = @import("sql.zig");
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
@@ -85,7 +84,7 @@ pub const Conn = struct {
                         _ = try self.writePacket(rseq +% 1, "");
                     } else switch (sw.plugin orelse return error.MysqlAuthFailed) {
                         .native => {
-                            const token = starrocks.mysqlAuthToken(password, &sw.salt);
+                            const token = mysqlAuthToken(password, &sw.salt);
                             _ = try self.writePacket(rseq +% 1, &token);
                         },
                         .caching_sha2 => {
@@ -406,7 +405,7 @@ pub const Conn = struct {
             try w.writeByte(0);
         } else switch (plugin) {
             .native => {
-                const token = starrocks.mysqlAuthToken(password, &salt);
+                const token = mysqlAuthToken(password, &salt);
                 try w.writeByte(20);
                 try w.writeAll(&token);
             },
@@ -772,4 +771,36 @@ const fuzzPackets_corpus = [_][]const u8{
 test "fuzz: wire packet parsers survive arbitrary bytes" {
     try std.testing.fuzz({}, fuzzPackets, .{ .corpus = &fuzzPackets_corpus });
     try @import("fuzzutil.zig").pound(fuzzPackets, &fuzzPackets_corpus);
+}
+
+/// mysql_native_password auth token:
+///   SHA1(pw) XOR SHA1( salt ++ SHA1(SHA1(pw)) )
+pub fn mysqlAuthToken(password: []const u8, salt: []const u8) [20]u8 {
+    const Sha1 = std.crypto.hash.Sha1;
+    var h1: [20]u8 = undefined;
+    Sha1.hash(password, &h1, .{});
+    var h2: [20]u8 = undefined;
+    Sha1.hash(&h1, &h2, .{});
+
+    var ctx = Sha1.init(.{});
+    ctx.update(salt);
+    ctx.update(&h2);
+    var h3: [20]u8 = undefined;
+    ctx.final(&h3);
+
+    var out: [20]u8 = undefined;
+    for (&out, 0..) |*b, i| b.* = h1[i] ^ h3[i];
+    return out;
+}
+
+test "mysql_native_password token matches a known vector" {
+    var salt: [20]u8 = undefined;
+    for (&salt, 0..) |*b, i| b.* = @intCast(i + 1);
+    const tok = mysqlAuthToken("foobar", &salt);
+    var expect: [20]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expect, "e419caeec63ade5aeb8e0f8bbb2ac2d86b183350");
+    try std.testing.expectEqualSlices(u8, &expect, &tok);
+    var salt2 = salt;
+    salt2[0] ^= 0xFF;
+    try std.testing.expect(!std.mem.eql(u8, &tok, &mysqlAuthToken("foobar", &salt2)));
 }

@@ -1075,7 +1075,7 @@ fn listConnections(sess: *Session, msg: *std.Io.Writer, probe: bool) !void {
 
 /// What each connector needs, for `\connect`: the questions, in order, with the
 /// default a newcomer would want. Mirrors the keys the runtime reads
-/// (`parseDbConfig`, `resolveStarrocksConfig`, `http_client.connFromKvs`).
+/// (`parseDbConfig`, `resolveStreamLoadConfig`, `http_client.connFromKvs`).
 const Connector = struct {
     name: []const u8,
     blurb: []const u8,

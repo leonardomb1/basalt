@@ -501,7 +501,7 @@ LOAD INTO '$out/starrocks.csv' AS SELECT * FROM fe.basalt_it ORDER BY id;"; then
   if $B run -q -c "$SR_CONN
 LOAD INTO sr.it_nullmark USING stream_load REPLACE AS SELECT * FROM '$out/sr_marker.csv';" >"$out/sr_marker.log" 2>&1; then
     report "starrocks-null-marker (a literal \\N was accepted)" bad
-  elif ! grep -q "StarRocksNullMarkerInData" "$out/sr_marker.log"; then
+  elif ! grep -q "StreamLoadNullMarkerInData" "$out/sr_marker.log"; then
     report "starrocks-null-marker (wrong message)" bad
     head -3 "$out/sr_marker.log"
   elif brun run -c "$SR_CONN

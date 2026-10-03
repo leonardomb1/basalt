@@ -17,7 +17,7 @@ const ArrowWriter = arrow.ArrowWriter;
 const ArrowFileSink = arrow.FileSink;
 const TableWriter = @import("../connect/table.zig").TableWriter;
 const driver = @import("../connect/driver.zig");
-const starrocks = @import("../connect/starrocks.zig");
+const streamload = @import("../connect/streamload.zig");
 const registry = @import("../connect/registry.zig");
 const projectedColumns = @import("plan.zig").projectedColumns;
 const tds = @import("../connect/tds.zig");
@@ -146,10 +146,10 @@ pub fn openSqlQuery(ctx: *const SplitCtx, gpa: std.mem.Allocator, query: []const
     return s.source();
 }
 
-/// Resolved config for a per-lane StarRocks sink (DDL already done once at plan
+/// Resolved config for a per-lane Stream Load sink (DDL already done once at plan
 /// time; lanes just stream-load with a shared run_id and lane-distinct labels).
-const StarrocksSinkSpec = struct {
-    cfg: starrocks.Config,
+const StreamLoadSpec = struct {
+    cfg: streamload.Config,
     target: []const u8,
     schema: types.Schema,
     mode: ast.WriteMode,
@@ -157,14 +157,14 @@ const StarrocksSinkSpec = struct {
     errctx: ?*op.ErrCtx = null,
 };
 
-/// `parallel.OpenSinkFn`: one StarRocks stream-load stream per lane.
-fn openLaneStarrocksSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize) anyerror!driver.Sink {
-    const spec: *StarrocksSinkSpec = @ptrCast(@alignCast(ctx_ptr));
+/// `parallel.OpenSinkFn`: one stream-load stream per lane.
+fn openLaneStreamLoadSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize) anyerror!driver.Sink {
+    const spec: *StreamLoadSpec = @ptrCast(@alignCast(ctx_ptr));
     var cfg = spec.cfg;
     const lp = try std.fmt.allocPrint(gpa, "{s}_l{d}", .{ spec.cfg.label_prefix, lane_idx });
     defer gpa.free(lp);
     cfg.label_prefix = lp;
-    const s = try starrocks.StreamLoadSink.open(gpa, cfg, spec.target, spec.schema, spec.mode);
+    const s = try streamload.StreamLoadSink.open(gpa, cfg, spec.target, spec.schema, spec.mode);
     s.logger = spec.logger;
     s.errctx = spec.errctx;
     return s.sink();
@@ -229,8 +229,8 @@ fn openLaneSqlSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize)
 /// Build the parallel-sink mode for a split pipeline: a per-lane StarRocks or SQL
 /// sink, or null to fall back to the shared-mutex path (CSV).
 pub fn buildParallelSink(env: *Env, w: ast.Write, schema: types.Schema) !?parallel.SinkMode {
-    if (try buildStarrocksSpec(env, w, schema)) |spec|
-        return parallel.SinkMode{ .per_lane = .{ .open = openLaneStarrocksSink, .ctx = spec } };
+    if (try buildStreamLoadSpec(env, w, schema)) |spec|
+        return parallel.SinkMode{ .per_lane = .{ .open = openLaneStreamLoadSink, .ctx = spec } };
     if (try buildSqlSinkSpec(env, w, schema)) |spec|
         return parallel.SinkMode{ .per_lane = .{ .open = openLaneSqlSink, .ctx = spec } };
     return null;
@@ -263,25 +263,25 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
     return spec;
 }
 
-/// If `w` writes to StarRocks, run the one-time DDL/truncate now and return a spec
-/// the lanes use to open their own stream-load streams. Returns null for any other
-/// sink (those use the shared mutex path).
-fn buildStarrocksSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*StarrocksSinkSpec {
+/// If `w` writes to a Stream Load database, run the one-time DDL/truncate now and
+/// return a spec the lanes use to open their own stream-load streams. Returns null
+/// for any other sink (those use the shared mutex path).
+fn buildStreamLoadSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*StreamLoadSpec {
     const conn = env.connections.get(w.connector) orelse return null;
-    if (!std.mem.eql(u8, conn.connector, "starrocks")) return null;
+    const flavor = streamload.Flavor.of(conn.connector) orelse return null;
 
-    var cfg = try resolveStarrocksConfig(env, conn);
+    var cfg = try resolveStreamLoadConfig(env, conn, flavor);
     cfg.run_id = if (cfg.run_id != 0) cfg.run_id else @intCast(std.time.milliTimestamp());
 
-    const setup = starrocks.StreamLoadSink.open(env.gpa, cfg, w.target, schema, w.mode) catch |e|
-        return srOpenErr(env, e, "starrocks setup failed");
+    const setup = streamload.StreamLoadSink.open(env.gpa, cfg, w.target, schema, w.mode) catch |e|
+        return srOpenErr(env, e, try std.fmt.allocPrint(env.arena, "{s} setup failed", .{flavor.name()}));
     setup.logger = env.log;
     setup.errctx = env.errctx;
     setup.sink().close() catch |e|
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "starrocks setup close failed: {s}", .{@errorName(e)}));
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} setup close failed: {s}", .{ flavor.name(), @errorName(e) }));
     cfg.auto_create = false;
 
-    const spec = try env.arena.create(StarrocksSinkSpec);
+    const spec = try env.arena.create(StreamLoadSpec);
     spec.* = .{ .cfg = cfg, .target = w.target, .schema = schema, .mode = if (w.mode == .overwrite) .append else w.mode, .logger = env.log, .errctx = env.errctx };
     return spec;
 }
@@ -1376,10 +1376,10 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     }
     const conn = env.connections.get(w.connector) orelse
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown connection `{s}`", .{w.connector}));
-    if (std.mem.eql(u8, conn.connector, "starrocks")) {
-        const cfg = try resolveStarrocksConfig(env, conn);
-        const s = starrocks.StreamLoadSink.open(env.gpa, cfg, w.target, schema, w.mode) catch |e|
-            return srOpenErr(env, e, "starrocks sink open failed");
+    if (streamload.Flavor.of(conn.connector)) |flavor| {
+        const cfg = try resolveStreamLoadConfig(env, conn, flavor);
+        const s = streamload.StreamLoadSink.open(env.gpa, cfg, w.target, schema, w.mode) catch |e|
+            return srOpenErr(env, e, try std.fmt.allocPrint(env.arena, "{s} sink open failed", .{flavor.name()}));
         s.logger = env.log;
         s.errctx = env.errctx;
         return s.sink();
@@ -1400,8 +1400,8 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unsupported sink connector `{s}`", .{conn.connector}));
 }
 
-fn resolveStarrocksConfig(env: *Env, conn: ast.Connection) !starrocks.Config {
-    var cfg = starrocks.Config{ .database = "", .errctx = env.errctx };
+fn resolveStreamLoadConfig(env: *Env, conn: ast.Connection, flavor: streamload.Flavor) !streamload.Config {
+    var cfg = streamload.Config{ .flavor = flavor, .database = "", .errctx = env.errctx };
     for (conn.config) |attr| {
         const k = attr.key;
         if (eqlAny(k, &.{ "host", "fe_host" })) {
@@ -1426,7 +1426,7 @@ fn resolveStarrocksConfig(env: *Env, conn: ast.Connection) !starrocks.Config {
             cfg.label_prefix = try evalCfgStr(env, attr.value);
         }
     }
-    if (cfg.database.len == 0) return planErr(env.diag, "starrocks connection needs a `database`");
+    if (cfg.database.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} connection needs a `database`", .{flavor.name()}));
     if (env.load_label_prefix) |lp| cfg.label_prefix = lp;
     if (env.load_run_id) |rid| cfg.run_id = rid;
     return cfg;
