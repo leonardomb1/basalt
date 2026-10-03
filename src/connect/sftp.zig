@@ -466,7 +466,7 @@ pub const Client = struct {
         return self.statusOf(try self.replyFor(id));
     }
 
-    pub const Entry = struct { name: []const u8, size: u64, regular: bool };
+    pub const Entry = struct { name: []const u8, size: u64, regular: bool, dir: bool = false };
 
     /// The entries of a directory, names copied into `arena`.
     fn listDir(self: *Client, arena: std.mem.Allocator, path: []const u8) ![]Entry {
@@ -504,6 +504,7 @@ pub const Client = struct {
                     .name = try arena.dupe(u8, name),
                     .size = a.size orelse 0,
                     .regular = if (a.perms) |p| (p & 0o170000) == 0o100000 else true,
+                    .dir = if (a.perms) |p| (p & 0o170000) == 0o040000 else false,
                 });
             }
         }
@@ -841,8 +842,9 @@ pub const Upload = struct {
     }
 };
 
-/// The objects under `url` (ending in `/`) as `sftp://` URLs of regular files,
-/// sorted by name — a server lists in whatever order it keeps.
+/// The regular files under `url` (ending in `/`), subfolders included but not
+/// those starting `_` or `.`, as `sftp://` URLs sorted by name — a server lists
+/// in whatever order it keeps.
 pub fn listPrefix(arena: std.mem.Allocator, url: []const u8) ![]const []const u8 {
     const t = try resolve(arena, url);
     const c = checkout(t.cfg) catch |e| {
@@ -851,14 +853,26 @@ pub fn listPrefix(arena: std.mem.Allocator, url: []const u8) ![]const []const u8
     };
     var healthy = true;
     defer checkin(c, healthy);
-    const dir = if (t.path.len > 1 and t.path[t.path.len - 1] == '/') t.path[0 .. t.path.len - 1] else t.path;
-    const entries = c.listDir(arena, if (dir.len == 0) "." else dir) catch |e| {
-        noteError(c.lastError());
-        healthy = isProtocolOk(e);
-        return e;
-    };
+    const top = if (t.path.len > 1 and t.path[t.path.len - 1] == '/') t.path[0 .. t.path.len - 1] else t.path;
     var names = std.array_list.Managed([]const u8).init(arena);
-    for (entries) |en| if (en.regular) try names.append(en.name);
+    // relative folders still to list, "" the top one
+    var todo = std.array_list.Managed([]const u8).init(arena);
+    try todo.append("");
+    while (todo.pop()) |rel| {
+        const dir = if (rel.len == 0) (if (top.len == 0) "." else top) else try std.fmt.allocPrint(arena, "{s}/{s}", .{ top, rel });
+        const entries = c.listDir(arena, dir) catch |e| {
+            noteError(c.lastError());
+            healthy = isProtocolOk(e);
+            return e;
+        };
+        for (entries) |en| {
+            const sub = if (rel.len == 0) en.name else try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, en.name });
+            if (en.dir) {
+                if (en.name[0] != '_' and en.name[0] != '.') try todo.append(sub);
+            } else if (en.regular) try names.append(sub);
+        }
+        if (names.items.len > 1_000_000) return error.FolderTooLarge;
+    }
     std.mem.sort([]const u8, names.items, {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.lessThan(u8, a, b);

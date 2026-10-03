@@ -429,10 +429,11 @@ pub fn buildTopN(env: *Env, s: ast.Sort, lim: ast.Limit, child: op.Op, schema: t
     // skip row groups its statistics rule out. Requires exactly one parquet
     // reader and one sort key, so the bound is unambiguous.
     if (env.pq_readers == 1 and s.keys.len == 1 and s.keys[0].field.parts.len == 1) {
-        if (env.pq_reader) |pr| {
+        if (env.pq_reader != null or env.pq_folder != null) {
             const t = try arena.create(Threshold);
             t.* = .{ .column = s.keys[0].field.last(), .desc = s.keys[0].desc };
-            pr.threshold = t;
+            if (env.pq_reader) |pr| pr.threshold = t;
+            if (env.pq_folder) |f| f.threshold = t;
             o.threshold = t;
         }
     }
@@ -1202,6 +1203,7 @@ pub fn discoverRowsPipeline(env: *Env, pipe: ast.Pipeline, ncols: usize) anyerro
     const saved_sql_desc = env.sql_desc;
     const saved_pq_readers = env.pq_readers;
     const saved_pq_reader = env.pq_reader;
+    const saved_pq_folder = env.pq_folder;
     defer {
         for (env.sources.items[src_base..]) |sc| sc.close();
         env.sources.shrinkRetainingCapacity(src_base);
@@ -1209,6 +1211,7 @@ pub fn discoverRowsPipeline(env: *Env, pipe: ast.Pipeline, ncols: usize) anyerro
         env.sql_desc = saved_sql_desc;
         env.pq_readers = saved_pq_readers;
         env.pq_reader = saved_pq_reader;
+        env.pq_folder = saved_pq_folder;
     }
 
     const res = buildPipeline(env, pipe.stages) catch |e| {

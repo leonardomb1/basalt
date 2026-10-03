@@ -40,6 +40,7 @@ pub const xlsx = @import("connect/xlsx.zig");
 pub const xml = @import("connect/xml.zig");
 pub const ssh = @import("connect/ssh.zig");
 pub const sftp = @import("connect/sftp.zig");
+pub const folder = @import("connect/folder.zig");
 pub const pqwrite = @import("connect/pqwrite.zig");
 pub const split = @import("connect/split.zig");
 pub const registry = @import("connect/registry.zig");

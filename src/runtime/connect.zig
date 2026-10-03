@@ -9,6 +9,7 @@ const Batch = @import("../exec/batch.zig").Batch;
 const column = @import("../exec/column.zig");
 const csv = @import("../connect/csv.zig");
 const pqdecode = @import("../connect/pqdecode.zig");
+const folder = @import("../connect/folder.zig");
 const pqwrite = @import("../connect/pqwrite.zig");
 const arrowread = @import("../connect/arrowread.zig");
 const xlsx = @import("../connect/xlsx.zig");
@@ -294,7 +295,7 @@ fn buildStreamLoadSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*StreamL
 pub fn isLocalCsvRead(rd: ast.Read) bool {
     if (!std.mem.eql(u8, rd.connector, "csv")) return false;
     return switch (rd.form) {
-        .path => |p| !csv.CsvReader.isUrl(p) and analyze.readFormat(p, null) == .csv,
+        .path => |p| !csv.CsvReader.isUrl(p) and !folder.isFolder(p) and analyze.readFormat(p, null) == .csv,
         else => false,
     };
 }
@@ -379,6 +380,16 @@ pub fn openSourceProjected(
     // Track parquet readers so a top-N bound is only ever pushed into a pipeline
     // with exactly one of them; with two the single slot would be ambiguous and
     // could skip groups of the wrong file.
+    if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
+        if (try resolveFolder(env, rd.form.path, hints)) |fr| if (fr.kind == .parquet) {
+            env.folder_memo = null;
+            const pf = try openParquetFolder(env, rd.form.path, fr.files, project);
+            pf.bounds = bounds;
+            env.pq_readers += 1;
+            env.pq_folder = pf;
+            return pf.source();
+        };
+    }
     const is_pq = std.mem.eql(u8, rd.connector, "csv") and rd.form == .path and
         pqdecode.Reader.isPath(rd.form.path);
     if (is_pq) {
@@ -399,6 +410,55 @@ pub fn openSourceProjected(
             return openArrow(env, rd.form.path, project);
     }
     return openSourceAll(env, rd, hints);
+}
+
+/// A folder read (`path` ending in `/`): its format and the files it takes, or
+/// null when `path` is not a folder. Without `format` the listing decides — a
+/// folder of both Parquet and CSVs is refused, naming one of each; one of
+/// neither says so. Remembered until the source is open: the read is resolved
+/// twice on its way there, and each listing is a round trip.
+pub fn resolveFolder(env: *Env, path: []const u8, hints: []const ast.Hint) !?FolderRead {
+    if (!folder.isFolder(path)) return null;
+    if (env.folder_memo) |m| if (std.mem.eql(u8, m.path, path)) return m.read;
+    var fdiag = analyze.Diag{};
+    const want = analyze.formatFromHints(hints, &fdiag) catch
+        return planErr(env.diag, try env.arena.dupe(u8, fdiag.msg));
+    const all = folder.list(env.arena, path) catch |e| {
+        // a mistyped prefix and an empty one are the same listing: say which came back empty
+        if (e == azure.Error.AzureEmptyPrefix)
+            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no blobs under prefix `{s}`", .{path}));
+        if (e == s3.Error.S3EmptyPrefix)
+            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no objects under prefix `{s}`", .{path}));
+        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not list folder `{s}` ({s})", .{ path, try pathFail(env.arena, path, e) }));
+    };
+    if (all.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no files in folder `{s}`", .{path}));
+    const kind: folder.Kind = if (want) |w| switch (w) {
+        .parquet => .parquet,
+        .csv => .csv,
+        else => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "folder `{s}`: a folder reads Parquet or CSV files", .{path})),
+    } else switch (folder.kindOf(all)) {
+        .kind => |k| k,
+        .mixed => |m| return planErr(env.diag, try std.fmt.allocPrint(env.arena, "folder `{s}` holds both Parquet (`{s}`) and CSV (`{s}`) files; one table reads one format — name it with WITH (format = 'parquet') or 'csv'", .{ path, folder.below(m.parquet, path), folder.below(m.csv, path) })),
+        .empty => unreachable,
+        .neither => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no .parquet, .csv, .tsv or .txt file in folder `{s}`", .{path})),
+    };
+    const files = try folder.only(env.arena, all, kind);
+    if (files.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no {s} file in folder `{s}`", .{ if (kind == .parquet) ".parquet" else ".csv, .tsv or .txt", path }));
+    const read = FolderRead{ .kind = kind, .files = files };
+    env.folder_memo = .{ .path = try env.arena.dupe(u8, path), .read = read };
+    return read;
+}
+
+pub const FolderRead = env_mod.FolderRead;
+
+fn openParquetFolder(env: *Env, path: []const u8, files: []const []const u8, project: ?[][]const u8) !*pqdecode.Folder {
+    const pf = pqdecode.Folder.open(env.arena, path, files, project) catch |e|
+        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` in folder `{s}` ({s})", .{ files[0], path, try pathFail(env.arena, files[0], e) }));
+    if (pf.firstReader()) |first| {
+        noteParquet(env, first);
+        pf.tally = first.tally;
+    }
+    return pf;
 }
 
 /// Count a parquet read into the run's pushdown tally.
@@ -504,6 +564,9 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
         const want = analyze.formatFromHints(hints, &fdiag) catch
             return planErr(env.diag, try env.arena.dupe(u8, fdiag.msg));
         try guardFileFormat(env, rd.form.path, want, "read");
+        const fr = try resolveFolder(env, rd.form.path, hints);
+        env.folder_memo = null;
+        if (fr) |f| if (f.kind == .parquet) return (try openParquetFolder(env, rd.form.path, f.files, null)).source();
         // An explicit `format` decides, so a parquet under an unusual name is not
         // handed to the CSV parser; otherwise the extension does, as before.
         const boxed = csv.splitCodec(rd.form.path).codec != .none or csv.splitArchive(rd.form.path) != null;
@@ -523,14 +586,15 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
         // here: which member did you mean?
         if (analyze.archiveProblem(env.arena, rd.form.path, want, true)) |why|
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot read `{s}`: {s}", .{ rd.form.path, why }));
-        const reader = csv.CsvReader.open(env.arena, rd.form.path, d) catch |e| {
+        const opened = if (fr) |f| csv.CsvReader.openList(env.arena, f.files, d) else csv.CsvReader.open(env.arena, rd.form.path, d);
+        const reader = opened catch |e| {
             // A mistyped prefix and a truly empty one are the same listing; say
             // which prefix came back empty rather than blaming the CSV parser.
             if (e == azure.Error.AzureEmptyPrefix)
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no blobs under prefix `{s}`", .{rd.form.path}));
             if (e == error.NoCsvInFolder)
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no .csv, .tsv or .txt file in folder `{s}`", .{rd.form.path}));
-            if (e == error.SftpEmptyFolder)
+            if (e == error.EmptyFolder)
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no files in folder `{s}`", .{rd.form.path}));
             if (e == s3.Error.S3EmptyPrefix)
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no objects under prefix `{s}`", .{rd.form.path}));

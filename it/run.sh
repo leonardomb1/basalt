@@ -591,6 +591,15 @@ if runs sftp; then
   $B run -q -c "CREATE CONNECTION box TYPE sftp OPTIONS (host = '127.0.0.1', port = 42222, user = 'basalt', password = 'it', host_key = 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'); SELECT * FROM 'sftp://box/~/in/seed.csv';" >"$out/sftp_pin.txt" 2>&1 || true
   if grep -q "SshHostKeyChanged" "$out/sftp_pin.txt"; then report "sftp-changed-key-refused" ok; else report "sftp-changed-key-refused" bad; cat "$out/sftp_pin.txt"; fi
 
+  # a folder of Parquet, nested as Spark writes it, with a marker file beside the data
+  docker exec $SC sh -c 'mkdir -p /config/out/pq/day=2 /config/out/pq/_temporary && chown -R 1000:1000 /config/out'
+  if brun run -c "$KEY LOAD INTO 'sftp://box/~/out/pq/part-0.parquet' AS SELECT * FROM 'it/seed.csv' WHERE id <= 1;" &&
+     brun run -c "$KEY LOAD INTO 'sftp://box/~/out/pq/day=2/part-1.parquet' AS SELECT * FROM 'it/seed.csv' WHERE id > 1;" &&
+     brun run -c "$KEY LOAD INTO 'sftp://box/~/out/pq/_temporary/x.csv' AS SELECT 1 AS done;" &&
+     brun run -c "$KEY LOAD INTO '$out/sftp_pq_dir.csv' AS SELECT * FROM 'sftp://box/~/out/pq/' ORDER BY id;"; then
+    check sftp-parquet-folder "$out/sftp_pq_dir.csv" it/expected.csv
+  else report "sftp-parquet-folder (run error)" bad; fi
+
   # a rename that cannot happen (the target is a folder) fails the load and leaves no .part
   docker exec $SC sh -c 'mkdir -p /config/out/isdir/x && chown -R 1000:1000 /config/out'
   if $B run -q -c "$KEY LOAD INTO 'sftp://box/~/out/isdir' AS SELECT * FROM 'it/seed.csv';" >/dev/null 2>&1 ||
@@ -785,6 +794,16 @@ if runs s3; then
     check s3-prefix "$out/s3_prefix.csv" it/expected.csv
   else
     report "s3-prefix (run error)" bad
+  fi
+
+  # a prefix of Parquet objects, one nested, reads as one table; a marker object is skipped
+  if brun run -c "LOAD INTO 's3://basalt-it/pq/part-0.parquet' AS SELECT * FROM 'it/seed.csv' WHERE id <= 1;" &&
+     brun run -c "LOAD INTO 's3://basalt-it/pq/day=2/part-1.parquet' AS SELECT * FROM 'it/seed.csv' WHERE id > 1;" &&
+     brun run -c "LOAD INTO 's3://basalt-it/pq/_temporary/x.csv' AS SELECT 1 AS done;" &&
+     brun run -c "LOAD INTO '$out/s3_pq_prefix.csv' AS SELECT * FROM 's3://basalt-it/pq/' ORDER BY id;"; then
+    check s3-parquet-prefix "$out/s3_pq_prefix.csv" it/expected.csv
+  else
+    report "s3-parquet-prefix (run error)" bad
   fi
 
   # Parquet out to an object and back — the routing guard, same as azure-parquet:

@@ -674,9 +674,9 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             if (diag.msg.len > 0)
                 try eo.report(.{ .msg = diag.msg, .pos = diag.pos, .end = diag.end, .transient = transient })
             else if (eo.json)
-                try eo.report(.{ .msg = runtime.errLabel(e), .transient = transient })
+                try eo.report(.{ .msg = runtime.failLabel(e), .transient = transient })
             else
-                try stderr.print("{s}: runtime error{s}: {s}\n", .{ src.label, if (transient) " (transient)" else "", runtime.errLabel(e) });
+                try stderr.print("{s}: runtime error{s}: {s}\n", .{ src.label, if (transient) " (transient)" else "", runtime.failLabel(e) });
             return if (transient) 75 else 1;
         },
     };

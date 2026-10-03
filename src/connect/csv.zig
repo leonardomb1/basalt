@@ -19,6 +19,7 @@ const http_client = @import("http_client.zig");
 const objstore = @import("objstore.zig");
 const sftp = @import("sftp.zig");
 const zipsrc = @import("zipsrc.zig");
+const folder = @import("folder.zig");
 
 const BATCH_ROWS = 1024;
 /// Reader/writer buffer size; also the max CSV line length (a line longer than
@@ -178,23 +179,6 @@ fn decodeField(arena: std.mem.Allocator, enc: Encoding, s: []const u8) ![]const 
     return out.items;
 }
 
-/// The CSV-looking files of a folder listing, in order — a server's folder also
-/// holds PDFs and images, and reading one as CSV fails far from its name.
-fn keepCsvs(urls: []const []const u8) ![]const []const u8 {
-    const exts = [_][]const u8{ ".csv", ".tsv", ".txt", ".csv.gz", ".tsv.gz", ".txt.gz", ".csv.zst", ".tsv.zst", ".txt.zst" };
-    const kept: [][]const u8 = @constCast(urls);
-    var n: usize = 0;
-    for (urls) |u| {
-        for (exts) |x| if (std.ascii.endsWithIgnoreCase(u, x)) {
-            kept[n] = u;
-            n += 1;
-            break;
-        };
-    }
-    if (urls.len > 0 and n == 0) return error.NoCsvInFolder;
-    return kept[0..n];
-}
-
 pub const CsvReader = struct {
     arena: std.mem.Allocator,
     dialect: Dialect = .{},
@@ -260,20 +244,34 @@ pub const CsvReader = struct {
             .done = false,
             .join_buf = std.array_list.Managed(u8).init(arena),
         };
-        var first = path;
-        if (sftp.isUrl(path) and std.mem.endsWith(u8, path, "/")) {
-            const urls = try keepCsvs(try sftp.listPrefix(arena, path));
-            if (urls.len == 0) return error.SftpEmptyFolder;
-            first = urls[0];
-            self.rest_urls = urls[1..];
-        } else if (objstore.isPrefix(path)) {
-            const client = try arena.create(std.http.Client);
-            client.* = http_client.initClient(arena);
-            defer client.deinit();
-            const urls = try keepCsvs(try objstore.listPrefix(arena, client, path));
-            first = urls[0];
-            self.rest_urls = urls[1..];
+        if (folder.isFolder(path)) {
+            const all = try folder.list(arena, path);
+            if (all.len == 0) return error.EmptyFolder;
+            const urls = try folder.only(arena, all, .csv);
+            if (urls.len == 0) return error.NoCsvInFolder;
+            return openList(arena, urls, dialect);
         }
+        return self.openFirst(path);
+    }
+
+    /// The files of a folder, read as one CSV: the rest must repeat the first's header.
+    pub fn openList(arena: std.mem.Allocator, files: []const []const u8, dialect: Dialect) !*CsvReader {
+        if (files.len == 0) return error.EmptyFolder;
+        const self = try arena.create(CsvReader);
+        self.* = .{
+            .arena = arena,
+            .dialect = dialect,
+            .backend = undefined,
+            .schema = undefined,
+            .done = false,
+            .join_buf = std.array_list.Managed(u8).init(arena),
+            .rest_urls = files[1..],
+        };
+        return self.openFirst(files[0]);
+    }
+
+    fn openFirst(self: *CsvReader, first: []const u8) !*CsvReader {
+        const arena = self.arena;
 
         if (splitArchive(first)) |ar| {
             const m = try zipsrc.openMember(arena, ar.archive, ar.member);
@@ -322,7 +320,7 @@ pub const CsvReader = struct {
             const dbuf: []u8 = if (win > 0) try arena.alloc(u8, win) else &.{};
             self.rdr = hf.response.readerDecompressing(&hf.transfer_buf, &hf.decompress, dbuf);
         } else {
-            self.backend = .{ .file = .{ .file = try std.fs.cwd().openFile(path, .{}), .fr = undefined } };
+            self.backend = .{ .file = .{ .file = try std.fs.cwd().openFile(first, .{}), .fr = undefined } };
             self.backend.file.fr = self.backend.file.file.reader(&self.read_buf);
             self.rdr = &self.backend.file.fr.interface;
         }
@@ -344,15 +342,15 @@ pub const CsvReader = struct {
         const header = (try self.readLine()) orelse return error.EmptyCsv;
         self.header_line = try arena.dupe(u8, std.mem.trim(u8, header, " \t\r"));
         var fields = std.array_list.Managed(types.Schema.Field).init(arena);
-        var it = std.mem.splitScalar(u8, header, dialect.delim);
+        var it = std.mem.splitScalar(u8, header, self.dialect.delim);
         while (it.next()) |name| {
             try fields.append(.{
-                .name = try decodeField(arena, dialect.encoding, try arena.dupe(u8, std.mem.trim(u8, name, " \t"))),
+                .name = try decodeField(arena, self.dialect.encoding, try arena.dupe(u8, std.mem.trim(u8, name, " \t"))),
                 .ty = types.Type.init(.string).asNullable(),
             });
         }
 
-        var sniff = try TypeSniffer.init(arena, fields.items.len, dialect.delim);
+        var sniff = try TypeSniffer.init(arena, fields.items.len, self.dialect.delim);
         var pending = std.array_list.Managed([]const u8).init(arena);
         while (pending.items.len < SAMPLE_ROWS) {
             const line = (try self.readLine()) orelse {
@@ -433,9 +431,17 @@ pub const CsvReader = struct {
                 if (!std.mem.eql(u8, std.mem.trim(u8, hdr, " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
                 return true;
             },
-            // `rest_urls` is only ever populated by a prefix listing, so a file or
-            // archive read never reaches here.
-            .file, .member => {},
+            .file => |*f| {
+                f.file.close();
+                f.file = try std.fs.cwd().openFile(url, .{});
+                f.fr = f.file.reader(&self.read_buf);
+                self.rdr = &f.fr.interface;
+                const hdr = (try self.readLine()) orelse return error.EmptyCsv;
+                if (!std.mem.eql(u8, std.mem.trim(u8, hdr, " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
+                return true;
+            },
+            // an archive member is one file, never a folder's
+            .member => {},
         }
         const hf = try self.arena.create(HttpFetch);
         hf.* = .{ .client = http_client.initClient(self.arena), .req = undefined, .response = undefined };
@@ -1626,15 +1632,6 @@ test "Encoding.parse accepts the spellings the wild uses" {
     try std.testing.expectEqual(Encoding.utf8, Encoding.parse("UTF8").?);
     try std.testing.expect(Encoding.parse("latin9") == null);
     try std.testing.expect(Encoding.parse("") == null);
-}
-
-test "keepCsvs: a folder read takes its CSV-looking files, in order" {
-    var urls = [_][]const u8{ "sftp://b/in/a.csv", "sftp://b/in/logo.PNG", "sftp://b/in/b.TXT", "sftp://b/in/c.csv.gz" };
-    const got = try keepCsvs(&urls);
-    try std.testing.expectEqual(@as(usize, 3), got.len);
-    try std.testing.expectEqualStrings("sftp://b/in/b.TXT", got[1]);
-    var pics = [_][]const u8{ "sftp://b/in/x.png", "sftp://b/in/y.exe" };
-    try std.testing.expectError(error.NoCsvInFolder, keepCsvs(&pics));
 }
 
 test "decodeField: latin-1 and cp1252 widen to UTF-8, ASCII is passed through" {

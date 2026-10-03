@@ -21,6 +21,7 @@ const azure = @import("../connect/azure.zig");
 const s3 = @import("../connect/s3.zig");
 const zipsrc = @import("../connect/zipsrc.zig");
 const xlsx = @import("../connect/xlsx.zig");
+const folder = @import("../connect/folder.zig");
 const registry = @import("../connect/registry.zig");
 const body_stmt_rule = @import("env.zig").body_stmt_rule;
 
@@ -1564,8 +1565,8 @@ pub fn formatLabel(path: []const u8, hints: []const ast.Hint) []const u8 {
 /// was fine. A wrong number that looks right is the one outcome this engine is
 /// built to avoid, so an extension it does not read is a plan-time error.
 pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
-    // A trailing `/` is a prefix read: the objects under it carry the extensions,
-    // and `parquetPrefix`/the CSV lister decide per object.
+    // A trailing `/` is a folder read: the files under it carry the extensions,
+    // and `connect.resolveFolder` decides from the listing.
     if (std.mem.endsWith(u8, path, "/")) return null;
 
     // Everything about an archive is `archiveProblem`'s to judge: the member's own
@@ -1708,6 +1709,19 @@ fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.Hint
     }
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
         if (csv.CsvReader.isUrl(rd.form.path)) return null;
+        // a local folder of Parquet: its first file's columns, as the run reads them
+        if (folder.isFolder(rd.form.path)) {
+            var fdiag = Diag{};
+            const explicit = formatFromHints(hints, &fdiag) catch return null;
+            if (explicit != null and explicit.? != .parquet) return null;
+            const all = folder.list(arena, rd.form.path) catch return null;
+            if (explicit == null and !std.meta.eql(folder.kindOf(all), folder.Verdict{ .kind = .parquet })) return null;
+            const files = folder.only(arena, all, .parquet) catch return null;
+            if (files.len == 0) return null;
+            const pf = pqdecode.Folder.open(arena, rd.form.path, files, null) catch return null;
+            defer pf.close();
+            return pf.schema;
+        }
         // A compressed or archived parquet is refused above, so only a plain path
         // reaches the parquet reader here.
         if (csv.splitCodec(rd.form.path).codec == .none and csv.splitArchive(rd.form.path) == null and

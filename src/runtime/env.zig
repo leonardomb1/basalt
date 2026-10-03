@@ -301,6 +301,9 @@ pub const SqlDesc = struct {
     read: ast.Read = .{ .connector = "", .form = .unit },
 };
 
+/// A folder read resolved: the format it is read as and its files, sorted.
+pub const FolderRead = struct { kind: @import("../connect/folder.zig").Kind, files: []const []const u8 };
+
 pub const Env = struct {
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -382,6 +385,10 @@ pub const Env = struct {
     /// to push a top-N bound only when there is exactly one.
     pq_readers: usize = 0,
     pq_reader: ?*pqdecode.Reader = null,
+    /// The same, when the one parquet read is a folder.
+    pq_folder: ?*pqdecode.Folder = null,
+    /// The last folder read resolved, by path (`connect.resolveFolder`).
+    folder_memo: ?struct { path: []const u8, read: FolderRead } = null,
     sink_name: []const u8 = "",
     /// The last `LOAD`'s target as the script spelled it, for the run summary.
     last_target: []const u8 = "",

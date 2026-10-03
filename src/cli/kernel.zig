@@ -771,7 +771,7 @@ fn runScript(
             }, &rdiag) catch |e| {
                 if (e == error.OutOfMemory) return error.OutOfMemory;
                 var ei = ErrorInfo{
-                    .msg = if (rdiag.msg.len > 0) try a.dupe(u8, rdiag.msg) else runtime.errLabel(e),
+                    .msg = if (rdiag.msg.len > 0) try a.dupe(u8, rdiag.msg) else runtime.failLabel(e),
                     .transient = rdiag.retryable or runtime.isTransient(e),
                 };
                 locate(&ei, entry.text, entry.entry_at, "", rdiag.pos, rdiag.end);
@@ -857,7 +857,7 @@ fn runScript(
         return reply(a, out, req.id, .{ .ok = false, .cancelled = true, .elapsed_ms = elapsed, .declared = declared, .results = results, .loads = loads });
     }
     var ei = ErrorInfo{
-        .msg = if (rdiag.msg.len > 0) try a.dupe(u8, rdiag.msg) else runtime.errLabel(e),
+        .msg = if (rdiag.msg.len > 0) try a.dupe(u8, rdiag.msg) else runtime.failLabel(e),
         .transient = rdiag.retryable or runtime.isTransient(e),
     };
     locate(&ei, entry.text, entry.entry_at, "", rdiag.pos, rdiag.end);

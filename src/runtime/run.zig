@@ -25,6 +25,8 @@ pub const aborting = @import("env.zig").aborting;
 pub const Diag = @import("env.zig").Diag;
 const Env = @import("env.zig").Env;
 pub const errLabel = @import("env.zig").errLabel;
+/// `errLabel`, or the account the failing code left of it (`eval.explain`).
+pub const failLabel = op.failLabel;
 const forHintIdent = @import("env.zig").forHintIdent;
 const hasFlagHint = @import("env.zig").hasFlagHint;
 pub const isTransient = @import("env.zig").isTransient;
@@ -1139,7 +1141,7 @@ fn noteLoad(env: *Env, pos: ?ast.Pos, err: ?anyerror, f: LoadFacts) void {
         if (!failed) _ = t.rows.fetchAdd(f.rows, .monotonic);
     }
     const why: []const u8 = if (err) |e|
-        (if (env.errctx.msg.len > 0) env.errctx.msg else if (env.diag.msg.len > 0) env.diag.msg else errLabel(e))
+        (if (env.errctx.msg.len > 0) env.errctx.msg else if (env.diag.msg.len > 0) env.diag.msg else failLabel(e))
     else
         "";
     if (env.on_load) |h| {

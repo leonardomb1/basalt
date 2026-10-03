@@ -4105,7 +4105,18 @@ threadlocal var regex_cache: RegexCache = .{};
 /// reports the error: the error code alone only says `cast failed`. Tied to the
 /// code it explains, so a note left by an error something swallowed cannot
 /// describe a different one.
-threadlocal var fail_note: struct { err: ?anyerror = null, buf: [240]u8 = undefined, len: usize = 0 } = .{};
+threadlocal var fail_note: struct { err: ?anyerror = null, buf: [480]u8 = undefined, len: usize = 0 } = .{};
+
+/// Record `msg` as why `e` is being returned, and return it: for a source whose
+/// error code alone cannot say which file or what about it.
+pub fn explain(e: anyerror, msg: []const u8) anyerror {
+    const n = &fail_note;
+    const k = @min(msg.len, n.buf.len);
+    @memcpy(n.buf[0..k], msg[0..k]);
+    n.len = k;
+    n.err = e;
+    return e;
+}
 
 /// Record why `e` is being returned, and return it.
 fn failWith(e: EvalError, comptime fmt: []const u8, args: anytype) EvalError {

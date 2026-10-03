@@ -2363,6 +2363,119 @@ pub const Reader = struct {
     }
 };
 
+/// A folder of Parquet files read as one table, file after file in the order
+/// given. The first file's columns are the table's; every other file must have
+/// the same ones — names, order and types, nullability aside — among those the
+/// query reads, or the read fails naming it: a file with a column missing or
+/// moved would otherwise put values under the wrong name.
+pub const Folder = struct {
+    arena: std.mem.Allocator,
+    /// The folder, ending in `/`, which messages name files below.
+    root: []const u8,
+    files: []const []const u8,
+    project: ?[]const []const u8,
+    schema: types.Schema,
+    bounds: []const Bound = &.{},
+    threshold: ?*const Threshold = null,
+    tally: ?*driver.ScanTally = null,
+    /// The file being read and the index of the next one.
+    cur: ?*Reader = null,
+    i: usize = 0,
+
+    pub fn open(arena: std.mem.Allocator, root: []const u8, files: []const []const u8, project: ?[]const []const u8) !*Folder {
+        if (files.len == 0) return error.EmptyFolder;
+        const first = try Reader.openProjected(arena, files[0], project);
+        const fields = try arena.alloc(types.Schema.Field, first.schema.fields.len);
+        for (fields, first.schema.fields) |*f, src| f.* = .{ .name = src.name, .ty = src.ty.asNullable() };
+        const self = try arena.create(Folder);
+        self.* = .{ .arena = arena, .root = root, .files = files, .project = project, .schema = .{ .fields = fields }, .cur = first, .i = 1 };
+        return self;
+    }
+
+    /// The first file, as opened for the schema: what a plan-time look needs.
+    pub fn firstReader(self: *const Folder) ?*Reader {
+        return if (self.i == 1) self.cur else null;
+    }
+
+    pub fn next(self: *Folder, arena: std.mem.Allocator) !?Batch {
+        while (true) {
+            if (self.cur) |r| {
+                r.bounds = self.bounds;
+                r.threshold = self.threshold;
+                r.tally = self.tally;
+                if (try r.next(arena)) |b| {
+                    var out = b;
+                    out.schema = &self.schema;
+                    return out;
+                }
+                r.close();
+                self.cur = null;
+            }
+            if (self.i >= self.files.len) return null;
+            const path = self.files[self.i];
+            self.i += 1;
+            const r = try Reader.openProjected(self.arena, path, self.project);
+            if (self.mismatch(r.schema)) |why| {
+                r.close();
+                const msg = try std.fmt.allocPrint(self.arena, "`{s}` in folder `{s}` does not match `{s}`, its first file: {s}", .{ self.rel(path), self.root, self.rel(self.files[0]), why });
+                return eval.explain(error.ParquetFolderMismatch, msg);
+            }
+            self.cur = r;
+        }
+    }
+
+    fn rel(self: *const Folder, path: []const u8) []const u8 {
+        return if (std.mem.startsWith(u8, path, self.root)) path[self.root.len..] else path;
+    }
+
+    fn mismatch(self: *Folder, got: types.Schema) ?[]const u8 {
+        const want = self.schema.fields;
+        for (want, 0..) |w, k| {
+            if (k >= got.fields.len) return std.fmt.allocPrint(self.arena, "it has no column `{s}`", .{w.name}) catch "a column is missing";
+            const g = got.fields[k];
+            if (!std.mem.eql(u8, w.name, g.name)) {
+                for (got.fields) |o| if (std.mem.eql(u8, o.name, w.name))
+                    return std.fmt.allocPrint(self.arena, "its columns are in another order (`{s}` where `{s}` is expected)", .{ g.name, w.name }) catch "columns in another order";
+                return std.fmt.allocPrint(self.arena, "it has no column `{s}`", .{w.name}) catch "a column is missing";
+            }
+            const a = w.ty;
+            const b = g.ty;
+            if (a.kind != b.kind or a.precision != b.precision or a.scale != b.scale)
+                return std.fmt.allocPrint(self.arena, "column `{s}` is {s} there, not {s}", .{ w.name, @tagName(b.kind), @tagName(a.kind) }) catch "a column has another type";
+        }
+        if (got.fields.len > want.len)
+            return std.fmt.allocPrint(self.arena, "it has a column `{s}` the first file lacks", .{got.fields[want.len].name}) catch "an extra column";
+        return null;
+    }
+
+    pub fn close(self: *Folder) void {
+        if (self.cur) |r| r.close();
+        self.cur = null;
+    }
+
+    pub fn source(self: *Folder) driver.Source {
+        return .{ .ptr = self, .vtable = &folder_vtable };
+    }
+
+    const folder_vtable = driver.Source.VTable{
+        .schema = struct {
+            fn f(p: *anyopaque) types.Schema {
+                return @as(*Folder, @ptrCast(@alignCast(p))).schema;
+            }
+        }.f,
+        .next = struct {
+            fn f(p: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
+                return @as(*Folder, @ptrCast(@alignCast(p))).next(arena);
+            }
+        }.f,
+        .close = struct {
+            fn f(p: *anyopaque) void {
+                @as(*Folder, @ptrCast(@alignCast(p))).close();
+            }
+        }.f,
+    };
+};
+
 const source_vtable = driver.Source.VTable{
     .schema = srcSchema,
     .next = srcNext,
