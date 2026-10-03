@@ -56,7 +56,7 @@ pub fn rebuildMapStages(env: *Env, middle: []const ast.Stage, proj_schema: *cons
     ob.* = .{ .b = null, .sch = proj_schema.* };
     const scan = env.arena.create(op.Scan) catch return null;
     scan.* = .{ .src = ob.source() };
-    const chain = buildMapChain(env.arena, env.params_expr, middle, scan, proj_schema) catch return null;
+    const chain = buildMapChain(env.arena, env.params_expr, env.errctx, middle, scan, proj_schema) catch return null;
     const lin = (op.linearize(env.arena, chain) catch return null) orelse return null;
     return lin.stages;
 }
@@ -65,14 +65,16 @@ pub fn rebuildMapStages(env: *Env, middle: []const ast.Stage, proj_schema: *cons
 /// arena). `checkFilter`/`selectCols` are pure (arena + read-only schema/params), so
 /// each worker rebuilds its own prefix chain safely from the shared AST stages — the
 /// resolution is plan-time-cheap and avoids sharing mutable op state across threads.
-pub fn buildMapChain(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), prefix: []const ast.Stage, scan: *op.Scan, csv_schema: *const types.Schema) !op.Op {
-    return buildChainFrom(ta, params, prefix, .{ .scan = scan }, csv_schema.*);
+pub fn buildMapChain(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), errctx: ?*op.ErrCtx, prefix: []const ast.Stage, scan: *op.Scan, csv_schema: *const types.Schema) !op.Op {
+    return buildChainFrom(ta, params, errctx, prefix, .{ .scan = scan }, csv_schema.*);
 }
 
 /// The body of `buildMapChain`, rooted at an arbitrary operator instead of a scan —
 /// the join path reuses it for the stages that sit *after* the join, where the input
 /// is the join's output schema rather than the source's.
-pub fn buildChainFrom(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), stages: []const ast.Stage, start: op.Op, in_schema: types.Schema) !op.Op {
+/// `errctx` (shared and locked, so lanes may all hold it) says where a row failed:
+/// without it a lane's error reached the user as a bare `cast failed`.
+pub fn buildChainFrom(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), errctx: ?*op.ErrCtx, stages: []const ast.Stage, start: op.Op, in_schema: types.Schema) !op.Op {
     var cur: op.Op = start;
     var sch = in_schema;
     for (stages) |st| switch (st.node) {
@@ -80,7 +82,7 @@ pub fn buildChainFrom(ta: std.mem.Allocator, params: *std.StringHashMap(*const a
             var ad = analyze.Diag{};
             const pred = try analyze.checkFilter(ta, sch, pred0, params, &ad);
             const f = try ta.create(op.Filter);
-            f.* = .{ .child = cur, .pred = pred, .err = null, .back = ta };
+            f.* = .{ .child = cur, .pred = pred, .err = errctx, .back = ta };
             cur = .{ .filter = f };
         },
         .select => |items| {
@@ -94,7 +96,7 @@ pub fn buildChainFrom(ta: std.mem.Allocator, params: *std.StringHashMap(*const a
             const out = try ta.create(types.Schema);
             out.* = try analyze.schemaOfCols(ta, rcols);
             const p = try ta.create(op.Project);
-            p.* = .{ .child = cur, .cols = cols, .out_schema = out, .err = null };
+            p.* = .{ .child = cur, .cols = cols, .out_schema = out, .err = errctx };
             cur = .{ .project = p };
             sch = out.*;
         },

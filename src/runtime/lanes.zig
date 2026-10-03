@@ -508,6 +508,7 @@ fn writeGroups(
         .sets = sets,
         .tail = tail,
         .params = env.params_expr,
+        .errctx = env.errctx,
         .queue = .{ .nitems = sets.len },
         .ord = &ord,
     };
@@ -523,6 +524,7 @@ const GroupWriteCtx = struct {
     sets: []const op.Aggregate.GroupSet,
     tail: []const ast.Stage,
     params: *std.StringHashMap(*const ast.Expr),
+    errctx: ?*op.ErrCtx = null,
     queue: WorkQueue,
     ord: *OrderedOut,
     rows_out: std.atomic.Value(u64) = .init(0),
@@ -564,7 +566,7 @@ fn groupWriteUnit(ctx: *GroupWriteCtx, i: usize, wa: std.mem.Allocator) !void {
     const out_schema = ctx.emitter.out_schema;
     var ob = OneBatch{ .b = try em.emitSets(wa, ctx.sets[i..][0..1], null), .sch = out_schema.* };
     var scan = op.Scan{ .src = ob.source() };
-    const chain = try buildMapChain(wa, ctx.params, ctx.tail, &scan, out_schema);
+    const chain = try buildMapChain(wa, ctx.params, ctx.errctx, ctx.tail, &scan, out_schema);
     var out: u64 = 0;
     while (try chain.next(wa)) |b| {
         if (b.len == 0) continue;
@@ -628,6 +630,7 @@ const AggCtx = struct {
     out_schema: *const types.Schema,
     prefix: []const ast.Stage,
     params: *std.StringHashMap(*const ast.Expr),
+    errctx: ?*op.ErrCtx = null,
     by: []const usize,
     aggs: []const op.Aggregate.Agg,
     queue: WorkQueue,
@@ -646,8 +649,8 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
     var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.queue.nitems), .schema = ctx.csv_schema, .dialect = ctx.mapped.dialect };
     var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    var child = try buildMapChain(wa, ctx.params, ctx.prefix, &scan, ctx.csv_schema);
-    for (ctx.joins) |lj| child = try buildLaneJoinChain(wa, ctx.params, lj, child);
+    var child = try buildMapChain(wa, ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.csv_schema);
+    for (ctx.joins) |lj| child = try buildLaneJoinChain(wa, ctx.params, ctx.errctx, lj, child);
     var agg = op.Aggregate{
         .child = child,
         .in_schema = ctx.agg_in_schema,
@@ -700,6 +703,7 @@ const PqAggCtx = struct {
     out_schema: *const types.Schema,
     prefix: []const ast.Stage,
     params: *std.StringHashMap(*const ast.Expr),
+    errctx: ?*op.ErrCtx = null,
     by: []const usize,
     aggs: []const op.Aggregate.Agg,
     lanes: []PqLane,
@@ -804,8 +808,8 @@ fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
     };
     var cs = obs.CountingSource{ .inner = .{ .ptr = &ms, .vtable = &MorselSource.vtable }, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    var child = try buildMapChain(la, ctx.params, ctx.prefix, &scan, ctx.morsels.src_schema);
-    for (ctx.joins) |lj| child = try buildLaneJoinChain(la, ctx.params, lj, child);
+    var child = try buildMapChain(la, ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.morsels.src_schema);
+    for (ctx.joins) |lj| child = try buildLaneJoinChain(la, ctx.params, ctx.errctx, lj, child);
     var agg = op.Aggregate{
         .child = child,
         .in_schema = ctx.agg_in_schema,
@@ -1157,6 +1161,7 @@ const MapCtx = struct {
     split: LaneSplit,
     map_stages: []const ast.Stage,
     params: *std.StringHashMap(*const ast.Expr),
+    errctx: ?*op.ErrCtx = null,
     queue: WorkQueue,
     sink_mode: parallel.SinkMode,
     sink_mtx: std.Thread.Mutex = .{},
@@ -1346,9 +1351,9 @@ fn mapWorkOne(ctx: *MapCtx, i: usize) !void {
     errdefer ctx.split.abort();
     var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const mapped_chain = try buildMapChain(warena.allocator(), ctx.params, ctx.map_stages, &scan, src_schema);
+    const mapped_chain = try buildMapChain(warena.allocator(), ctx.params, ctx.errctx, ctx.map_stages, &scan, src_schema);
     const chain = if (ctx.join) |lj|
-        try buildLaneJoinChain(warena.allocator(), ctx.params, lj, mapped_chain)
+        try buildLaneJoinChain(warena.allocator(), ctx.params, ctx.errctx, lj, mapped_chain)
     else
         mapped_chain;
 
@@ -1397,9 +1402,9 @@ fn mapOrderedUnit(ctx: *MapCtx, ord: *OrderedOut, i: usize, warena: *std.heap.Ar
         defer inner.close();
         var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
         var scan = op.Scan{ .src = cs.source() };
-        const mapped_chain = try buildMapChain(warena.allocator(), ctx.params, ctx.map_stages, &scan, ctx.split.schema());
+        const mapped_chain = try buildMapChain(warena.allocator(), ctx.params, ctx.errctx, ctx.map_stages, &scan, ctx.split.schema());
         const chain = if (ctx.join) |lj|
-            try buildLaneJoinChain(warena.allocator(), ctx.params, lj, mapped_chain)
+            try buildLaneJoinChain(warena.allocator(), ctx.params, ctx.errctx, lj, mapped_chain)
         else
             mapped_chain;
         while (try chain.next(batch_arena.allocator())) |b| {
@@ -1464,6 +1469,7 @@ fn runParallelMapImpl(
         .split = split,
         .map_stages = map_stages,
         .params = env.params_expr,
+        .errctx = env.errctx,
         .queue = .{ .nitems = nthreads },
         .sink_mode = sink_mode,
         .rows_read = env.rows_read,
@@ -1673,6 +1679,7 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
         .out_schema = out_schema,
         .prefix = prefix,
         .params = env.params_expr,
+        .errctx = env.errctx,
         .by = apl.by,
         .aggs = aggs,
         .lanes = lanes,
@@ -1849,6 +1856,7 @@ fn runParallelCsvAggImpl(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag:
         .out_schema = out_schema,
         .prefix = prefix,
         .params = env.params_expr,
+        .errctx = env.errctx,
         .by = apl.by,
         .aggs = aggs,
         .queue = .{ .nitems = nthreads },
@@ -1892,6 +1900,7 @@ const SqlAggCtx = struct {
     out_schema: *const types.Schema,
     prefix: []const ast.Stage,
     params: *std.StringHashMap(*const ast.Expr),
+    errctx: ?*op.ErrCtx = null,
     by: []const usize,
     aggs: []const op.Aggregate.Agg,
     queue: WorkQueue,
@@ -1911,7 +1920,7 @@ fn sqlAggWorkOne(ctx: *SqlAggCtx, i: usize) !void {
 
     var cs = obs.CountingSource{ .inner = src, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const child = try buildMapChain(wa, ctx.params, ctx.prefix, &scan, ctx.src_schema);
+    const child = try buildMapChain(wa, ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.src_schema);
     var agg = op.Aggregate{
         .child = child,
         .in_schema = ctx.agg_in_schema,
@@ -1980,6 +1989,7 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
         .out_schema = out_schema,
         .prefix = prefix,
         .params = env.params_expr,
+        .errctx = env.errctx,
         .by = apl.by,
         .aggs = aggs,
         .queue = .{ .nitems = sp.predicates.len },
@@ -2134,7 +2144,7 @@ fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suffix:
 /// Per-lane tail of the operator tree: this lane's own `op.Join` over the shared
 /// index, then the post-join `filter`/`select` stages. `ta` is the lane arena, so
 /// nothing built here is touched by another thread.
-fn buildLaneJoinChain(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), lj: LaneJoin, probe: op.Op) !op.Op {
+fn buildLaneJoinChain(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), errctx: ?*op.ErrCtx, lj: LaneJoin, probe: op.Op) !op.Op {
     const j = try ta.create(op.Join);
     j.* = .{
         .probe = probe,
@@ -2149,7 +2159,7 @@ fn buildLaneJoinChain(ta: std.mem.Allocator, params: *std.StringHashMap(*const a
         .null_aware = lj.null_aware,
         .state = ta,
     };
-    return buildChainFrom(ta, params, lj.suffix, .{ .join = j }, lj.out_schema.*);
+    return buildChainFrom(ta, params, errctx, lj.suffix, .{ .join = j }, lj.out_schema.*);
 }
 
 /// One lane of a split-parallel SQL map+join. Everything here is either read-only
@@ -2162,6 +2172,7 @@ const SqlMapJoinCtx = struct {
     prefix: []const ast.Stage,
     join: LaneJoin,
     params: *std.StringHashMap(*const ast.Expr),
+    errctx: ?*op.ErrCtx = null,
     queue: WorkQueue,
     sink_mode: parallel.SinkMode,
     sink_mtx: std.Thread.Mutex = .{},
@@ -2232,8 +2243,8 @@ fn sqlMapJoinLaneRun(ctx: *SqlMapJoinCtx, lane_idx: usize) !void {
     defer SplitSource.closeFn(&ss);
     var cs = obs.CountingSource{ .inner = .{ .ptr = &ss, .vtable = &SplitSource.vtable }, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const probe = try buildMapChain(warena.allocator(), ctx.params, ctx.prefix, &scan, ctx.src_schema);
-    const chain = try buildLaneJoinChain(warena.allocator(), ctx.params, ctx.join, probe);
+    const probe = try buildMapChain(warena.allocator(), ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.src_schema);
+    const chain = try buildLaneJoinChain(warena.allocator(), ctx.params, ctx.errctx, ctx.join, probe);
 
     var out: u64 = 0;
     while (try chain.next(batch_arena.allocator())) |b| {
@@ -2299,6 +2310,7 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
         .prefix = shape.prefix,
         .join = lp.lane,
         .params = env.params_expr,
+        .errctx = env.errctx,
         .queue = .{ .nitems = sp.predicates.len },
         .sink_mode = sink_mode,
         .rows_read = env.rows_read,
@@ -2359,6 +2371,7 @@ const TopNCtx = struct {
     row_schema: *const types.Schema,
     prefix: []const ast.Stage,
     params: *std.StringHashMap(*const ast.Expr),
+    errctx: ?*op.ErrCtx = null,
     keys: []const op.Sort.Key,
     cap: u64,
     queue: WorkQueue,
@@ -2384,7 +2397,7 @@ fn topnWorkOne(ctx: *TopNCtx, i: usize) !void {
     errdefer ctx.split.abort();
     var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const child = try buildMapChain(warena.allocator(), ctx.params, ctx.prefix, &scan, src_schema);
+    const child = try buildMapChain(warena.allocator(), ctx.params, ctx.errctx, ctx.prefix, &scan, src_schema);
     var tn = op.TopN{
         .child = child,
         .in_schema = ctx.row_schema,
@@ -2437,6 +2450,7 @@ fn runParallelTopN(
         .row_schema = row_schema,
         .prefix = prefix,
         .params = env.params_expr,
+        .errctx = env.errctx,
         .keys = ks,
         .cap = lim.offset + lim.count,
         .queue = .{ .nitems = nthreads },
@@ -2595,6 +2609,7 @@ const DistinctCtx = struct {
     row_schema: *const types.Schema,
     prefix: []const ast.Stage,
     params: *std.StringHashMap(*const ast.Expr),
+    errctx: ?*op.ErrCtx = null,
     local_keys: ?[]const usize,
     key_idx: []const usize,
     queue: WorkQueue,
@@ -2621,7 +2636,7 @@ fn distinctWorkOne(ctx: *DistinctCtx, i: usize) !void {
     defer inner.close();
     var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const child = try buildMapChain(warena.allocator(), ctx.params, ctx.prefix, &scan, src_schema);
+    const child = try buildMapChain(warena.allocator(), ctx.params, ctx.errctx, ctx.prefix, &scan, src_schema);
     var d = op.Distinct{ .child = child, .in_schema = ctx.row_schema, .keys = ctx.local_keys, .state = warena.allocator(), .gpa = wgpa.allocator(), .track_ords = true };
 
     const probe = try warena.allocator().alloc(Value, ctx.key_idx.len);
@@ -2696,6 +2711,7 @@ fn runParallelDistinct(
         .row_schema = row_schema,
         .prefix = prefix,
         .params = env.params_expr,
+        .errctx = env.errctx,
         .local_keys = local_keys,
         .key_idx = key_idx,
         .queue = .{ .nitems = nitems },

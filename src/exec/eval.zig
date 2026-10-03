@@ -2140,7 +2140,7 @@ const per_row = struct {
         while (i < c.args.len) : (i += 2) {
             const k = try evalRow(arena, c.args[i], batch, row);
             // A JSON key cannot be null; a missing name is a broken document.
-            if (k.isNull()) return error.CastFailed;
+            if (k.isNull()) return failWith(error.CastFailed, "json_object: key {d} is null", .{i / 2 + 1});
             if (i > 0) w.writeByte(',') catch return error.OutOfMemory;
             std.json.Stringify.encodeJsonString(try valueToString(arena, k), .{}, w) catch return error.OutOfMemory;
             w.writeByte(':') catch return error.OutOfMemory;
@@ -2176,8 +2176,9 @@ const per_row = struct {
         if (v.isNull()) return .null;
         const text = std.mem.trim(u8, try valueToString(arena, v), " \t\r\n");
         const dec = std.base64.standard.Decoder;
-        const out = try arena.alloc(u8, dec.calcSizeForSlice(text) catch return error.CastFailed);
-        dec.decode(out, text) catch return error.CastFailed;
+        const bad = "from_base64: '{s}' is not base64";
+        const out = try arena.alloc(u8, dec.calcSizeForSlice(text) catch return failWith(error.CastFailed, bad, .{clip(text)}));
+        dec.decode(out, text) catch return failWith(error.CastFailed, bad, .{clip(text)});
         return .{ .bytes = out };
     }
 
@@ -2659,8 +2660,12 @@ const per_row = struct {
         if (v.isNull()) return .null;
         const fv = try evalRow(arena, c.args[1], batch, row);
         if (fv.isNull()) return .null;
-        const us = strptimeFmt(try valueToString(arena, v), try valueToString(arena, fv)) orelse
-            return if (eq(c.name, "try_strptime")) .null else error.CastFailed;
+        const text = try valueToString(arena, v);
+        const fmt = try valueToString(arena, fv);
+        const us = strptimeFmt(text, fmt) orelse {
+            if (eq(c.name, "try_strptime")) return .null;
+            return failWith(error.CastFailed, "strptime: '{s}' is not a date in '{s}' (try_strptime gives null)", .{ clip(text), clip(fmt) });
+        };
         return .{ .timestamp = us };
     }
 
@@ -2757,10 +2762,11 @@ const per_row = struct {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
         if (v != .int) return error.TypeMismatch;
-        const cp = std.math.cast(u21, v.int) orelse return error.CastFailed;
+        const bad = "chr: {d} is not a character";
+        const cp = std.math.cast(u21, v.int) orelse return failWith(error.CastFailed, bad, .{v.int});
         var buf: [4]u8 = undefined;
-        if (cp == 0) return error.CastFailed;
-        const n = std.unicode.utf8Encode(cp, &buf) catch return error.CastFailed;
+        if (cp == 0) return failWith(error.CastFailed, bad, .{v.int});
+        const n = std.unicode.utf8Encode(cp, &buf) catch return failWith(error.CastFailed, bad, .{v.int});
         return .{ .string = try arena.dupe(u8, buf[0..n]) };
     }
 };
@@ -3809,6 +3815,38 @@ const RegexCache = struct {
 };
 threadlocal var regex_cache: RegexCache = .{};
 
+/// Why the last builtin to fail on this thread failed, for the operator that
+/// reports the error: the error code alone only says `cast failed`. Tied to the
+/// code it explains, so a note left by an error something swallowed cannot
+/// describe a different one.
+threadlocal var fail_note: struct { err: ?anyerror = null, buf: [240]u8 = undefined, len: usize = 0 } = .{};
+
+/// Record why `e` is being returned, and return it.
+fn failWith(e: EvalError, comptime fmt: []const u8, args: anytype) EvalError {
+    const n = &fail_note;
+    const msg = std.fmt.bufPrint(&n.buf, fmt, args) catch blk: {
+        @memcpy(n.buf[n.buf.len - 3 ..], "...");
+        break :blk n.buf[0..];
+    };
+    n.len = msg.len;
+    n.err = e;
+    return e;
+}
+
+/// The note for `e`, once: null when the last failure was not `e`.
+pub fn takeFailure(e: anyerror) ?[]const u8 {
+    const n = &fail_note;
+    if (n.err == null or n.err.? != e) return null;
+    n.err = null;
+    return n.buf[0..n.len];
+}
+
+/// At most `max` bytes of `s`, for quoting a value in a message.
+fn clip(s: []const u8) []const u8 {
+    const max = 80;
+    return if (s.len <= max) s else s[0..max];
+}
+
 const RegexMatch = struct { s: []const u8, span: ?[2]usize, caps: regex.Captures };
 
 /// The first match of `c`'s pattern (argument 1) in its string (argument 0), or
@@ -4810,6 +4848,11 @@ test "strptime: widths, %y pivot, impossible days, try_ form" {
     try std.testing.expectError(error.CastFailed, evalLit(a, "strptime('2026-10-03', '%d/%m/%Y')"));
     try std.testing.expectError(error.CastFailed, evalLit(a, "strptime('03/10/2026 24:00:00', '%d/%m/%Y %H:%M:%S')"));
     try std.testing.expect((try evalLit(a, "try_strptime('31/02/2026', '%d/%m/%Y')")) == .null);
+    // The failure says which value and format, once, and only for its own error.
+    _ = evalLit(a, "strptime('31/02/2026', '%d/%m/%Y')") catch {};
+    try std.testing.expect(takeFailure(error.DivByZero) == null);
+    try std.testing.expectEqualStrings("strptime: '31/02/2026' is not a date in '%d/%m/%Y' (try_strptime gives null)", takeFailure(error.CastFailed).?);
+    try std.testing.expect(takeFailure(error.CastFailed) == null);
     try std.testing.expect((try evalLit(a, "try_strptime('', '%d/%m/%Y')")) == .null);
 }
 

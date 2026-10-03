@@ -22,17 +22,29 @@ const driver = @import("../connect/driver.zig");
 /// a bare `CastFailed` into something actionable. Inline buffer so it outlives the
 /// per-batch arena; mutex + first-wins so concurrent lanes report deterministically.
 pub const ErrCtx = struct {
-    buf: [256]u8 = undefined,
+    buf: [512]u8 = undefined,
     msg: []const u8 = "",
     mutex: std.Thread.Mutex = .{},
 
+    /// Cut short rather than dropped when it does not fit: a dropped message
+    /// left the user a bare `cast failed`.
     pub fn set(self: *ErrCtx, comptime fmt: []const u8, args: anytype) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.msg.len > 0) return;
-        self.msg = std.fmt.bufPrint(&self.buf, fmt, args) catch return;
+        self.msg = std.fmt.bufPrint(&self.buf, fmt, args) catch blk: {
+            @memcpy(self.buf[self.buf.len - 3 ..], "...");
+            break :blk self.buf[0..];
+        };
     }
 };
+
+/// The label for an evaluation error, or the builtin's own account of it when the
+/// failing function left one (`eval.takeFailure`): `strptime: '31/02/2026' is not
+/// a date in '%d/%m/%Y'` rather than a bare `cast failed`.
+pub fn failLabel(e: anyerror) []const u8 {
+    return eval.takeFailure(e) orelse errLabel(e);
+}
 
 /// Human label for an evaluation error.
 pub fn errLabel(e: anyerror) []const u8 {
@@ -736,7 +748,7 @@ pub const Filter = struct {
 
     fn filterInto(self: *Filter, out: std.mem.Allocator, scratch: std.mem.Allocator, b: Batch) anyerror!Batch {
         return applyFilter(out, scratch, b, self.pred) catch |e| {
-            if (self.err) |ec| ec.set("{s}: in filter predicate", .{errLabel(e)});
+            if (self.err) |ec| ec.set("{s}: in filter predicate", .{failLabel(e)});
             return e;
         };
     }
@@ -768,7 +780,7 @@ pub const Project = struct {
             outcols[i] = switch (c.source) {
                 .passthrough => |idx| b.columns[idx],
                 .expr => |e| eval.evalColumn(arena, e, b, c.ty) catch |err| {
-                    if (self.err) |ec| ec.set("{s}: computing column `{s}` in select", .{ errLabel(err), self.out_schema.fields[i].name });
+                    if (self.err) |ec| ec.set("{s}: computing column `{s}` in select", .{ failLabel(err), self.out_schema.fields[i].name });
                     return err;
                 },
             };
@@ -2465,7 +2477,7 @@ pub const Aggregate = struct {
             }
         }
         const col = eval.evalColumn(arena, e, b, want) catch |err| {
-            if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
+            if (self.err) |ec| ec.set("{s}: in aggregate", .{failLabel(err)});
             return err;
         };
         if (col.ty.kind != .string) return col;
@@ -2480,7 +2492,7 @@ pub const Aggregate = struct {
     fn argValue(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, b: Batch, r: usize) anyerror!Value {
         const e = agg.arg orelse return .null;
         const v = eval.evalRow(arena, e, b, r) catch |err| {
-            if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
+            if (self.err) |ec| ec.set("{s}: in aggregate", .{failLabel(err)});
             return err;
         };
         if (v != .string) return v;
@@ -2492,7 +2504,7 @@ pub const Aggregate = struct {
     fn castArg(self: *Aggregate, arena: std.mem.Allocator, to: types.Type, v: Value) anyerror!Value {
         if (v.isNull()) return v;
         return eval.castValueTyped(arena, v, to) catch |err| {
-            if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
+            if (self.err) |ec| ec.set("{s}: in aggregate", .{failLabel(err)});
             return err;
         };
     }
@@ -2504,7 +2516,7 @@ pub const Aggregate = struct {
         if (foldsRowwise(agg.func)) return null;
         const e = agg.arg orelse return null;
         const col = eval.evalColumn(arena, e, b, agg.ty) catch |err| {
-            if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
+            if (self.err) |ec| ec.set("{s}: in aggregate", .{failLabel(err)});
             return err;
         };
         if (col.ty.kind != .int and col.ty.kind != .float) return null;
@@ -2603,7 +2615,7 @@ pub const Aggregate = struct {
         for (builders[0..nk], 0..) |*b, j| try b.append(st.keyValue(gi, j));
         for (self.aggs, builders[nk..], 0..) |agg, *b, j| {
             try b.append(finalizeAcc(st.acc(gi, j), agg) catch |err| {
-                if (self.err) |ec| ec.set("{s}: in aggregate", .{errLabel(err)});
+                if (self.err) |ec| ec.set("{s}: in aggregate", .{failLabel(err)});
                 return err;
             });
         }
@@ -3322,7 +3334,7 @@ pub const Join = struct {
         const ix = self.index orelse blk: {
             const build = self.build orelse return error.JoinHasNoBuildSide;
             const made = JoinIndex.create(self.state, arena, build, self.right_schema, self.right_keys, self.build_cap orelse join_build_byte_cap) catch |e| {
-                if (self.err) |ec| ec.set("{s}", .{errLabel(e)});
+                if (self.err) |ec| ec.set("{s}", .{failLabel(e)});
                 return e;
             };
             self.index = made;
