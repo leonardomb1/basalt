@@ -51,6 +51,7 @@ COMPOSE="docker compose -f it/compose.yaml"
 # The sftp suite logs in with a key made here, for this run only.
 keydir=$(mktemp -d)
 ssh-keygen -q -t ed25519 -N '' -C basalt-it -f "$keydir/id_ed25519"
+ssh-keygen -q -t ed25519 -N 'it-pp' -C basalt-it-pp -f "$keydir/id_pp"
 SFTP_PUBKEY=$(cat "$keydir/id_ed25519.pub")
 export SFTP_PUBKEY
 
@@ -587,6 +588,35 @@ if runs sftp; then
   if grep -q "not in known_hosts: ssh-ed25519 SHA256:" "$out/sftp_unknown.txt"; then report "sftp-unknown-host-refused" ok; else report "sftp-unknown-host-refused" bad; cat "$out/sftp_unknown.txt"; fi
   $B run -q -c "CREATE CONNECTION box TYPE sftp OPTIONS (host = '127.0.0.1', port = 42222, user = 'basalt', password = 'it', host_key = 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'); SELECT * FROM 'sftp://box/~/in/seed.csv';" >"$out/sftp_pin.txt" 2>&1 || true
   if grep -q "SshHostKeyChanged" "$out/sftp_pin.txt"; then report "sftp-changed-key-refused" ok; else report "sftp-changed-key-refused" bad; cat "$out/sftp_pin.txt"; fi
+
+  # a rename that cannot happen (the target is a folder) fails the load and leaves no .part
+  docker exec $SC sh -c 'mkdir -p /config/out/isdir/x && chown -R 1000:1000 /config/out'
+  if $B run -q -c "$KEY LOAD INTO 'sftp://box/~/out/isdir' AS SELECT * FROM 'it/seed.csv';" >/dev/null 2>&1 ||
+     docker exec $SC sh -c 'ls /config/out' | grep -q "isdir.part"; then
+    report "sftp-failed-rename-leaves-nothing" bad
+  else report "sftp-failed-rename-leaves-nothing" ok; fi
+
+  # a second connection to the same server with a wrong pin is refused, not handed the first one's session
+  $B run -q -c "$PW CREATE CONNECTION pinned TYPE sftp OPTIONS (host = '127.0.0.1', port = 42222, user = 'basalt', password = 'it', host_key = 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
+SELECT COUNT(*) FROM 'sftp://box/~/in/seed.csv'; SELECT COUNT(*) FROM 'sftp://pinned/~/in/seed.csv';" >"$out/sftp_pool.txt" 2>&1 || true
+  if grep -q "SshHostKeyChanged" "$out/sftp_pool.txt"; then report "sftp-pool-keeps-trust-apart" ok; else report "sftp-pool-keeps-trust-apart" bad; cat "$out/sftp_pool.txt"; fi
+
+  # known_hosts with only the server's ECDSA key: that is the key asked for; a passphrase-protected key logs in
+  grep ecdsa-sha2-nistp256 "$out/known_hosts" >"$out/known_hosts_ecdsa"
+  docker exec -i $SC sh -c 'cat >> /config/.ssh/authorized_keys' <"$keydir/id_pp.pub"
+  if brun run -c "CREATE CONNECTION box TYPE sftp OPTIONS (host = '127.0.0.1', port = 42222, user = 'basalt', key_file = '$keydir/id_pp', key_passphrase = 'it-pp', known_hosts = '$out/known_hosts_ecdsa');
+LOAD INTO '$out/sftp_ecdsa.csv' AS SELECT * FROM 'sftp://box/~/in/seed.csv' ORDER BY id;"; then
+    check sftp-ecdsa-host-passphrase-key "$out/sftp_ecdsa.csv" it/expected.csv
+  else report "sftp-ecdsa-host-passphrase-key (run error)" bad; fi
+
+  # keyboard-interactive only, over AES-CTR with HMAC and the server's RSA host key
+  docker exec $SC sh -c 'printf "PasswordAuthentication no\nKbdInteractiveAuthentication yes\nCiphers aes128-ctr\nMACs hmac-sha2-256\nHostKeyAlgorithms rsa-sha2-512\n" | cat - /config/sshd/sshd_config > /tmp/c && cp /tmp/c /config/sshd/sshd_config'
+  docker restart $SC >/dev/null
+  for _ in $(seq 1 30); do docker exec $SC pgrep -f sshd >/dev/null 2>&1 && break; sleep 1; done
+  sleep 2
+  if brun run -c "$PW LOAD INTO '$out/sftp_kbd.csv' AS SELECT * FROM 'sftp://box/~/in/seed.csv' ORDER BY id;"; then
+    check sftp-kbd-interactive-ctr-rsa "$out/sftp_kbd.csv" it/expected.csv
+  else report "sftp-kbd-interactive-ctr-rsa (run error)" bad; fi
 fi
 
 # Doris: the same arrangement as StarRocks, which forked from it — stream load in,
