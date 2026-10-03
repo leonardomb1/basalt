@@ -155,7 +155,8 @@ fn decodeField(arena: std.mem.Allocator, enc: Encoding, s: []const u8) ![]const 
     };
     if (!high) return s;
 
-    var out = try std.array_list.Managed(u8).initCapacity(arena, s.len + 8);
+    // a byte becomes at most three: U+0080..U+FFFF, the replacement char included
+    var out = try std.array_list.Managed(u8).initCapacity(arena, s.len * 3);
     var buf: [4]u8 = undefined;
     for (s) |c| {
         if (c < 0x80) {
@@ -172,9 +173,9 @@ fn decodeField(arena: std.mem.Allocator, enc: Encoding, s: []const u8) ![]const 
             },
         };
         const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
-        try out.appendSlice(buf[0..n]);
+        out.appendSliceAssumeCapacity(buf[0..n]);
     }
-    return out.toOwnedSlice();
+    return out.items;
 }
 
 pub const CsvReader = struct {
@@ -1629,6 +1630,9 @@ test "decodeField: latin-1 and cp1252 widen to UTF-8, ASCII is passed through" {
     try std.testing.expectEqualStrings("€", try decodeField(a, .cp1252, "\x80"));
     // An undefined cp1252 slot is replacement, not an invented codepoint.
     try std.testing.expectEqualStrings("\u{FFFD}", try decodeField(a, .cp1252, "\x81"));
+    // many widened bytes before ASCII: the output outgrows the input by more than a little
+    try std.testing.expectEqualStrings("ção éáíóúâêô x", try decodeField(a, .latin1, "\xe7\xe3o \xe9\xe1\xed\xf3\xfa\xe2\xea\xf4 x"));
+    try std.testing.expectEqualStrings("€€€€€€€€€€ ok", try decodeField(a, .cp1252, "\x80" ** 10 ++ " ok"));
 }
 
 test "csv dialect: a semicolon latin-1 file reads as UTF-8 columns" {
