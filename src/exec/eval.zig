@@ -1552,6 +1552,12 @@ pub const builtins = [_]Builtin{
     .{ .name = "now", .type_fn = typing.now, .eval_fn = per_row.now, .vec_fn = vectorized.now },
     .{ .name = "today", .type_fn = typing.today, .eval_fn = per_row.today, .vec_fn = vectorized.today },
     .{ .name = "regexp_replace", .type_fn = typing.regexpReplace, .eval_fn = per_row.regexpReplace },
+    .{ .name = "regexp_matches", .type_fn = typing.regexpMatches, .eval_fn = per_row.regexpMatches },
+    .{ .name = "regexp_extract", .type_fn = typing.regexpExtract, .eval_fn = per_row.regexpExtract },
+    .{ .name = "md5", .type_fn = typing.digest, .eval_fn = per_row.digest },
+    .{ .name = "sha256", .type_fn = typing.digest, .eval_fn = per_row.digest },
+    .{ .name = "xxhash64", .type_fn = typing.digest, .eval_fn = per_row.digest },
+    .{ .name = "concat_ws", .type_fn = typing.concatWs, .eval_fn = per_row.concatWs },
     .{ .name = "date_trunc", .type_fn = typing.dateTruncExtract, .eval_fn = per_row.dateTruncExtract },
     .{ .name = "extract", .type_fn = typing.dateTruncExtract, .eval_fn = per_row.dateTruncExtract },
     .{ .name = "upper", .type_fn = typing.unaryString, .eval_fn = per_row.upperLower, .vec_fn = vectorized.upperLower },
@@ -1635,18 +1641,57 @@ const typing = struct {
 
     fn regexpReplace(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
         if (c.args.len != 3) return self.err("`regexp_replace` takes (string, pattern, replacement)", .{});
-        // A literal pattern is compiled here so a bad one fails `check`
-        // rather than partway through a run.
-        if (c.args[1].* == .str_lit) {
-            var pbuf: [16 * 1024]u8 = undefined;
-            var pfba = std.heap.FixedBufferAllocator.init(&pbuf);
-            _ = regex.Regex.compile(pfba.allocator(), c.args[1].str_lit) catch
-                return self.err("invalid regular expression `{s}`", .{c.args[1].str_lit});
-        }
+        _ = try literalPattern(self, c);
         const a = try self.wantText(c, 0);
         _ = try self.wantText(c, 1);
         _ = try self.wantText(c, 2);
         return Type.init(.string).withNull(a.nullable);
+    }
+
+    /// A literal pattern's group count, group 0 included, compiled here so a bad pattern fails
+    /// `check` rather than partway through a run; null for a computed one.
+    fn literalPattern(self: *TypeCtx, c: ast.Expr.Call) TypeError!?u8 {
+        if (c.args[1].* != .str_lit) return null;
+        var pbuf: [16 * 1024]u8 = undefined;
+        var pfba = std.heap.FixedBufferAllocator.init(&pbuf);
+        const re = regex.Regex.compile(pfba.allocator(), c.args[1].str_lit) catch
+            return self.err("invalid regular expression `{s}`", .{c.args[1].str_lit});
+        return re.ngroups;
+    }
+
+    fn regexpMatches(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 2) return self.err("`regexp_matches` takes (string, pattern)", .{});
+        _ = try literalPattern(self, c);
+        const a = try self.wantText(c, 0);
+        const p = try self.wantText(c, 1);
+        return Type.init(.bool).withNull(a.nullable or p.nullable);
+    }
+
+    fn regexpExtract(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 2 and c.args.len != 3) return self.err("`regexp_extract` takes (string, pattern[, group])", .{});
+        const groups = try literalPattern(self, c);
+        _ = try self.wantText(c, 0);
+        _ = try self.wantText(c, 1);
+        if (c.args.len == 3) {
+            if (c.args[2].* != .int_lit) return self.err("`regexp_extract` needs a literal group number", .{});
+            const g = c.args[2].int_lit;
+            if (g < 0 or g >= regex.max_groups or (groups != null and g >= groups.?))
+                return self.err("`regexp_extract` group {d} is not in the pattern", .{g});
+        }
+        // Null where the pattern does not match, whatever the input.
+        return Type.init(.string).withNull(true);
+    }
+
+    fn digest(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 1) return self.err("`{s}` takes one argument", .{c.name});
+        const a = try self.wantText(c, 0);
+        return Type.init(if (eq(c.name, "xxhash64")) .int else .string).withNull(a.nullable);
+    }
+
+    fn concatWs(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len < 2) return self.err("`concat_ws` takes (separator, value, ...)", .{});
+        for (c.args, 0..) |_, i| _ = try self.wantText(c, i);
+        return Type.init(.string).withNull((try self.argType(c, 0)).nullable);
     }
 
     fn dateTruncExtract(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
@@ -2025,6 +2070,57 @@ const per_row = struct {
             error.PatternTooComplex => return error.PatternTooComplex,
         };
         return .{ .string = out };
+    }
+
+    /// True when the pattern matches anywhere in the string; anchor it with `^`
+    /// and `$` for the whole of it.
+    fn regexpMatches(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const m = try regexpFind(arena, c, batch, row) orelse return .null;
+        return .{ .bool = m.span != null };
+    }
+
+    /// The match, or with a group number that group; null where the pattern does
+    /// not match (DuckDB answers '', which a load cannot tell from an empty field).
+    fn regexpExtract(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const m = try regexpFind(arena, c, batch, row) orelse return .null;
+        if (m.span == null) return .null;
+        const g: usize = if (c.args.len == 3) @intCast(c.args[2].int_lit) else 0;
+        const span = m.caps[g] orelse return .null;
+        return .{ .string = m.s[span[0]..span[1]] };
+    }
+
+    fn digest(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return .null;
+        const data = try valueToString(arena, v);
+        if (eq(c.name, "xxhash64")) return .{ .int = @bitCast(std.hash.XxHash64.hash(0, data)) };
+        if (eq(c.name, "md5")) {
+            var d: [std.crypto.hash.Md5.digest_length]u8 = undefined;
+            std.crypto.hash.Md5.hash(data, &d, .{});
+            return .{ .string = try std.fmt.allocPrint(arena, "{x}", .{&d}) };
+        }
+        var d: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(data, &d, .{});
+        return .{ .string = try std.fmt.allocPrint(arena, "{x}", .{&d}) };
+    }
+
+    /// Postgres' `concat_ws`: the values joined by the separator, nulls skipped —
+    /// where `concat` is null when any value is, which hashed a row with one empty
+    /// column to null.
+    fn concatWs(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const sv = try evalRow(arena, c.args[0], batch, row);
+        if (sv.isNull()) return .null;
+        const sep = try valueToString(arena, sv);
+        var buf = std.array_list.Managed(u8).init(arena);
+        var first = true;
+        for (c.args[1..]) |e| {
+            const v = try evalRow(arena, e, batch, row);
+            if (v.isNull()) continue;
+            if (!first) try buf.appendSlice(sep);
+            first = false;
+            try buf.appendSlice(try valueToString(arena, v));
+        }
+        return .{ .string = buf.items };
     }
 
     fn dateTruncExtract(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
@@ -3606,6 +3702,29 @@ const RegexCache = struct {
 };
 threadlocal var regex_cache: RegexCache = .{};
 
+const RegexMatch = struct { s: []const u8, span: ?[2]usize, caps: regex.Captures };
+
+/// The first match of `c`'s pattern (argument 1) in its string (argument 0), or
+/// null when either is null. A match with no span is "no match".
+fn regexpFind(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!?RegexMatch {
+    const v = try evalRow(arena, c.args[0], batch, row);
+    if (v.isNull()) return null;
+    const pat = try evalRow(arena, c.args[1], batch, row);
+    if (pat.isNull()) return null;
+    const re = cachedRegex(try valueToString(arena, pat)) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.BadPattern => return error.CastFailed,
+        error.PatternTooComplex => return error.PatternTooComplex,
+    };
+    var m = RegexMatch{ .s = try valueToString(arena, v), .span = null, .caps = undefined };
+    m.span = re.find(m.s, 0, &m.caps) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.BadPattern => return error.CastFailed,
+        error.PatternTooComplex => return error.PatternTooComplex,
+    };
+    return m;
+}
+
 fn cachedRegex(pattern: []const u8) regex.Error!regex.Regex {
     const c = &regex_cache;
     if (c.valid and std.mem.eql(u8, c.src, pattern)) return c.re;
@@ -4615,6 +4734,40 @@ test "text cleanup: translate, initcap, unaccent, ascii, chr" {
     try std.testing.expectEqualStrings("ã", try str(a, "chr(227)"));
     try std.testing.expectError(error.CastFailed, evalLit(a, "chr(0)"));
     try std.testing.expectError(error.CastFailed, evalLit(a, "chr(1114112)"));
+}
+
+test "regex and hashes: regexp_matches, regexp_extract, md5, sha256, xxhash64, concat_ws" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    try std.testing.expect((try evalLit(a, "regexp_matches('abc123', '[0-9]+')")).bool);
+    try std.testing.expect(!(try evalLit(a, "regexp_matches('abc', '^[0-9]+$')")).bool);
+    try std.testing.expectEqualStrings("123", (try evalLit(a, "regexp_extract('abc123', '[0-9]+')")).string);
+    try std.testing.expectEqualStrings("12", (try evalLit(a, "regexp_extract('ab-12', '([a-z]+)-([0-9]+)', 2)")).string);
+    try std.testing.expect((try evalLit(a, "regexp_extract('abc', '[0-9]+')")) == .null);
+    // A group that took no part in the match is null too.
+    try std.testing.expect((try evalLit(a, "regexp_extract('b', '(a)?b', 1)")) == .null);
+
+    try std.testing.expectEqualStrings("900150983cd24fb0d6963f7d28e17f72", (try evalLit(a, "md5('abc')")).string);
+    try std.testing.expectEqualStrings("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", (try evalLit(a, "sha256('abc')")).string);
+    try std.testing.expectEqual(@as(i64, 4952883123889572249), (try evalLit(a, "xxhash64('abc')")).int);
+    try std.testing.expect((try evalLit(a, "md5(NULL)")) == .null);
+
+    try std.testing.expectEqualStrings("a|c", (try evalLit(a, "concat_ws('|', 'a', NULL, 'c')")).string);
+    try std.testing.expectEqualStrings("", (try evalLit(a, "concat_ws('|', NULL, NULL)")).string);
+    try std.testing.expect((try evalLit(a, "concat_ws(NULL, 'a')")) == .null);
+}
+
+test "check-time errors: a regexp_extract group past the pattern's" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    var ctx = TypeCtx{ .schema = .{ .fields = &.{} }, .arena = a };
+    try std.testing.expectError(error.TypeError, ctx.typeOf(try parser.parseExprStr(a, "regexp_extract('x', '(a)', 2)", &diag)));
+    try std.testing.expectError(error.TypeError, ctx.typeOf(try parser.parseExprStr(a, "regexp_matches('x', '(')", &diag)));
+    _ = try ctx.typeOf(try parser.parseExprStr(a, "regexp_extract('x', '(a)', 1)", &diag));
 }
 
 test "check-time errors: bad strftime directive, sub-day date_add on a date" {

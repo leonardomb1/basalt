@@ -47,7 +47,8 @@ test "builtins: exactly these lack a vectorized kernel" {
         "reverse",        "date_add",   "date_diff",   "make_date",      "epoch",    "to_timestamp",
         "strftime",       "json_get",   "json_filter", "json_transform", "json_any", "json_all",
         "strptime",       "try_strptime", "unaccent",  "strip_accents",  "translate", "initcap",
-        "ascii",          "chr",
+        "ascii",          "chr",        "regexp_matches", "regexp_extract", "md5",    "sha256",
+        "xxhash64",       "concat_ws",
     };
     for (rowwise_only) |n| try std.testing.expect(lookup(n) != null);
     for (table) |b| {

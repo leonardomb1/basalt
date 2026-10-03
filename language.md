@@ -1147,7 +1147,16 @@ columns it has not seen.
 - `LET x = <val> IN <body>` — local binding, inlined at plan time.
 - Scalar functions (case-insensitive): `now() today() lower() upper() length()
   strlen() trim() substr() replace() concat() coalesce() starts_with()
-  ends_with() contains() like() date_trunc() extract() regexp_replace()` ·
+  ends_with() contains() like() date_trunc() extract() regexp_replace()
+  regexp_matches(s, pattern) regexp_extract(s, pattern[, group])
+  concat_ws(sep, ...)` — `regexp_matches` is true when the pattern matches
+  anywhere (anchor with `^…$` for the whole string); `regexp_extract` returns
+  the match, or the numbered group, and null where nothing matches;
+  `concat_ws` joins its values with `sep`, skipping nulls, where `concat` is
+  null when any value is · hashes `md5(s) sha256(s)` (lowercase hex) and
+  `xxhash64(s)` (a BIGINT) over the value's text — for a row's change key,
+  `md5(concat_ws('|', a, b, c))`, since `concat` would make it null whenever a
+  column is ·
   math `abs() floor() ceil() round(x[,n]) mod() power() sqrt() sign()` (round
   is half-away-from-zero, deliberately engine-side) · nulls `nullif()
   greatest() least()` (null args ignored, Postgres-style) · strings `lpad()
