@@ -16,6 +16,7 @@
 //! The server may rekey at any moment; that is handled where it is met.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const crypto = std.crypto;
 const Sha256 = crypto.hash.sha2.Sha256;
 const Sha512 = crypto.hash.sha2.Sha512;
@@ -275,7 +276,14 @@ const MacKind = enum {
     }
 };
 
-const cipher_prefs = [_]CipherKind{ .chacha, .gcm256, .gcm128, .ctr256, .ctr128 };
+/// AES first where the build has the CPU's AES instructions: there AES-GCM runs
+/// at five times the standard library's chacha20-poly1305 (about 900 MB/s
+/// against 180 on one core), and SFTP throughput is the cipher's. Without them
+/// AES is a table-free software cipher, slower than chacha, which leads.
+const cipher_prefs = if (builtin.cpu.arch == .x86_64 and builtin.cpu.has(.x86, .aes) and builtin.cpu.has(.x86, .pclmul))
+    [_]CipherKind{ .gcm128, .gcm256, .chacha, .ctr128, .ctr256 }
+else
+    [_]CipherKind{ .chacha, .gcm256, .gcm128, .ctr256, .ctr128 };
 const mac_prefs = [_]MacKind{ .sha256_etm, .sha512_etm, .sha256, .sha512 };
 
 /// One direction's keys and counters.

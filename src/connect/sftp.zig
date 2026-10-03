@@ -175,7 +175,7 @@ pub const Client = struct {
     key: []const u8,
     next_id: u32 = 1,
     inbuf: std.array_list.Managed(u8),
-    /// The reply `reply` last returned starts here in `inbuf`.
+    /// Bytes of `inbuf` already handed out by `reply`.
     consumed: usize = 0,
     out: ssh.Buf,
     max_read: u32 = 32 * 1024,
@@ -259,19 +259,25 @@ pub const Client = struct {
 
     /// The next whole SFTP packet (type byte first), reassembled across channel
     /// data; valid until the next call.
+    ///
+    /// `consumed` marks where unread bytes start. They are moved to the front only
+    /// once the read part outweighs them: moving whatever was pending on every
+    /// reply copied megabytes per reply with reads pipelined, and a Parquet read
+    /// over SFTP ran at a seventh of what the link carries.
     fn reply(self: *Client) ![]const u8 {
-        if (self.consumed > 0) {
-            const rest = self.inbuf.items.len - self.consumed;
-            std.mem.copyForwards(u8, self.inbuf.items[0..rest], self.inbuf.items[self.consumed..]);
-            self.inbuf.shrinkRetainingCapacity(rest);
+        const pending = self.inbuf.items.len - self.consumed;
+        if (self.consumed > 0 and self.consumed >= pending) {
+            std.mem.copyForwards(u8, self.inbuf.items[0..pending], self.inbuf.items[self.consumed..]);
+            self.inbuf.shrinkRetainingCapacity(pending);
             self.consumed = 0;
         }
-        while (self.inbuf.items.len < 4) try self.ssh.recv(&self.inbuf);
-        const n = std.mem.readInt(u32, self.inbuf.items[0..4], .big);
+        const at = self.consumed;
+        while (self.inbuf.items.len - at < 4) try self.ssh.recv(&self.inbuf);
+        const n = std.mem.readInt(u32, self.inbuf.items[at..][0..4], .big);
         if (n == 0 or n > 512 * 1024) return error.SftpProtocol;
-        while (self.inbuf.items.len < 4 + n) try self.ssh.recv(&self.inbuf);
-        self.consumed = 4 + n;
-        return self.inbuf.items[4 .. 4 + n];
+        while (self.inbuf.items.len - at < 4 + n) try self.ssh.recv(&self.inbuf);
+        self.consumed = at + 4 + n;
+        return self.inbuf.items[at + 4 .. at + 4 + n];
     }
 
     fn replyFor(self: *Client, id: u32) ![]const u8 {
