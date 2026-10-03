@@ -20,6 +20,7 @@ const objstore = @import("objstore.zig");
 const sftp = @import("sftp.zig");
 const zipsrc = @import("zipsrc.zig");
 const folder = @import("folder.zig");
+const deflate = @import("deflate.zig");
 
 const BATCH_ROWS = 1024;
 /// Reader/writer buffer size; also the max CSV line length (a line longer than
@@ -179,6 +180,43 @@ fn decodeField(arena: std.mem.Allocator, enc: Encoding, s: []const u8) ![]const 
     return out.items;
 }
 
+/// gzip members one after another, read as one stream: `pigz`, `bgzip` and a
+/// `.csv.gz` appended to write several, and std's decompressor stops at the
+/// end of the first.
+const Gunzip = struct {
+    src: *std.Io.Reader,
+    dec: std.compress.flate.Decompress,
+    window: []u8,
+    interface: std.Io.Reader,
+
+    fn init(self: *Gunzip, src: *std.Io.Reader, window: []u8, buf: []u8) void {
+        self.* = .{
+            .src = src,
+            .dec = .init(src, .gzip, window),
+            .window = window,
+            .interface = .{ .vtable = &.{ .stream = streamFn }, .buffer = buf, .seek = 0, .end = 0 },
+        };
+    }
+
+    fn streamFn(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *Gunzip = @fieldParentPtr("interface", r);
+        while (true) {
+            return self.dec.reader.stream(w, limit) catch |e| switch (e) {
+                error.EndOfStream => {
+                    // another member follows, or the stream is done
+                    _ = self.src.peekByte() catch |e2| return switch (e2) {
+                        error.EndOfStream => error.EndOfStream,
+                        error.ReadFailed => error.ReadFailed,
+                    };
+                    self.dec = .init(self.src, .gzip, self.window);
+                    continue;
+                },
+                else => |x| return x,
+            };
+        }
+    }
+};
+
 pub const CsvReader = struct {
     arena: std.mem.Allocator,
     dialect: Dialect = .{},
@@ -204,6 +242,11 @@ pub const CsvReader = struct {
     /// Set when the path carried a compression suffix; holds the decompressor the
     /// line reader pulls through. Must not move once `rdr` points into it.
     codec_state: std.http.Decompress = undefined,
+    gunzip: Gunzip = undefined,
+    /// The decompressor's buffers, allocated once and reused for each file of a folder.
+    codec_bufs: ?CodecBufs = null,
+
+    const CodecBufs = struct { window: []u8, buf: []u8 };
 
     const Backend = union(enum) {
         file: FileBackend,
@@ -228,6 +271,26 @@ pub const CsvReader = struct {
         redirect_buf: [8 * 1024]u8 = undefined,
         transfer_buf: [LINE_BUF]u8 = undefined,
     };
+
+    /// Put the decompressor `codec` needs between the file's bytes and the line reader.
+    fn decodeAs(self: *CsvReader, codec: Codec) !void {
+        switch (codec) {
+            .none => {},
+            .gzip => {
+                const b = self.codec_bufs orelse blk: {
+                    const nb = CodecBufs{ .window = try self.arena.alloc(u8, codecBuffer(.gzip)), .buf = try self.arena.alloc(u8, LINE_BUF) };
+                    self.codec_bufs = nb;
+                    break :blk nb;
+                };
+                self.gunzip.init(self.rdr, b.window, b.buf);
+                self.rdr = &self.gunzip.interface;
+            },
+            .zstd => {
+                const cbuf = try self.arena.alloc(u8, codecBuffer(.zstd));
+                self.rdr = std.http.Decompress.init(&self.codec_state, self.rdr, cbuf, .zstd);
+            },
+        }
+    }
 
     pub fn isUrl(path: []const u8) bool {
         return std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://") or
@@ -328,16 +391,7 @@ pub const CsvReader = struct {
         // A compression suffix on the name wraps whatever the bytes came from —
         // file, HTTP body or archive member — in the same decompressor the HTTP
         // content-encoding path uses.
-        const codec = splitCodec(if (splitArchive(first)) |ar| (ar.member orelse ar.archive) else first).codec;
-        if (codec != .none) {
-            const ce: std.http.ContentEncoding = switch (codec) {
-                .none => .identity,
-                .gzip => .gzip,
-                .zstd => .zstd,
-            };
-            const cbuf = try arena.alloc(u8, codecBuffer(codec));
-            self.rdr = std.http.Decompress.init(&self.codec_state, self.rdr, cbuf, ce);
-        }
+        try self.decodeAs(splitCodec(if (splitArchive(first)) |ar| (ar.member orelse ar.archive) else first).codec);
 
         const header = (try self.readLine()) orelse return error.EmptyCsv;
         self.header_line = try arena.dupe(u8, std.mem.trim(u8, header, " \t\r"));
@@ -427,6 +481,7 @@ pub const CsvReader = struct {
                 const st2 = try sftp.Stream.open(self.arena, url);
                 self.backend = .{ .sftp = st2 };
                 self.rdr = &st2.interface;
+                try self.decodeAs(splitCodec(url).codec);
                 const hdr = (try self.readLine()) orelse return error.EmptyCsv;
                 if (!std.mem.eql(u8, std.mem.trim(u8, hdr, " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
                 return true;
@@ -436,6 +491,7 @@ pub const CsvReader = struct {
                 f.file = try std.fs.cwd().openFile(url, .{});
                 f.fr = f.file.reader(&self.read_buf);
                 self.rdr = &f.fr.interface;
+                try self.decodeAs(splitCodec(url).codec);
                 const hdr = (try self.readLine()) orelse return error.EmptyCsv;
                 if (!std.mem.eql(u8, std.mem.trim(u8, hdr, " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
                 return true;
@@ -458,6 +514,7 @@ pub const CsvReader = struct {
         const dbuf: []u8 = if (win > 0) try self.arena.alloc(u8, win) else &.{};
         self.rdr = hf.response.readerDecompressing(&hf.transfer_buf, &hf.decompress, dbuf);
 
+        try self.decodeAs(splitCodec(url).codec);
         const hdr = (try self.readLine()) orelse return error.EmptyCsv;
         if (!std.mem.eql(u8, std.mem.trim(u8, hdr, " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
         return true;
@@ -996,6 +1053,8 @@ pub const CsvWriter = struct {
     fw: std.fs.File.Writer = undefined,
     /// False for stdout, which is the process's to close, not the sink's.
     owns_file: bool = true,
+    /// A `.gz` target: rows go through this, which writes to the backend.
+    gz: ?*deflate.Gzip = null,
 
     /// A local file, or an object staged over HTTP. Both expose a plain
     /// `*std.Io.Writer`, so row formatting below is identical either way.
@@ -1005,6 +1064,11 @@ pub const CsvWriter = struct {
     };
 
     fn out(self: *CsvWriter) *std.Io.Writer {
+        if (self.gz) |g| return &g.interface;
+        return self.raw();
+    }
+
+    fn raw(self: *CsvWriter) *std.Io.Writer {
         return switch (self.backend) {
             .file => &self.fw.interface,
             .object => |o| o.io,
@@ -1045,6 +1109,14 @@ pub const CsvWriter = struct {
                 try self.fw.seekTo(end);
                 header = end == 0;
             }
+        }
+
+        // a .gz name is compressed; appending adds a gzip member, which readers
+        // take as the continuation of the stream
+        switch (splitCodec(path).codec) {
+            .none => {},
+            .gzip => self.gz = try deflate.Gzip.init(std.heap.page_allocator, self.raw()),
+            .zstd => return error.ZstdWriteUnsupported,
         }
 
         // Set before the header is written, which is the writer's first output.
@@ -1145,6 +1217,13 @@ pub const CsvWriter = struct {
     }
 
     pub fn close(self: *CsvWriter) !void {
+        if (self.gz) |g| {
+            defer {
+                g.deinit(std.heap.page_allocator);
+                self.gz = null;
+            }
+            g.finish() catch |e| return self.specific(e);
+        }
         switch (self.backend) {
             .file => |f| {
                 try self.fw.interface.flush();
@@ -1160,6 +1239,10 @@ pub const CsvWriter = struct {
     /// the rollback: staged blocks never become a readable object, and Azure
     /// discards them after a week — so a failed run leaves nothing behind.
     pub fn abort(self: *CsvWriter) void {
+        if (self.gz) |g| {
+            g.deinit(std.heap.page_allocator);
+            self.gz = null;
+        }
         switch (self.backend) {
             .file => |f| if (self.owns_file) f.close(),
             // Staged blocks and an uncompleted multipart upload are invisible to
@@ -1944,4 +2027,27 @@ test "quotesOpen / hasQuotedNewline drive the continuation and split decisions" 
     try std.testing.expect(MappedCsv.hasQuotedNewline("1,\"a\nb\"\n", ','));
     try std.testing.expect(!MappedCsv.hasQuotedNewline("1,\"a b\"\n2,c\n", ','));
     try std.testing.expect(!MappedCsv.hasQuotedNewline("1,a\n2,b\n", ','));
+}
+
+test "CsvReader reads every member of a multi-member .csv.gz, as pigz and an append write it" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file: std.Io.Writer.Allocating = .init(a);
+    for ([_][]const u8{ "id,name\n1,alpha\n", "2,beta\n" }) |part| {
+        const gz = try deflate.Gzip.init(std.testing.allocator, &file.writer);
+        defer gz.deinit(std.testing.allocator);
+        try gz.interface.writeAll(part);
+        try gz.finish();
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "two.csv.gz", .data = file.written() });
+    const path = try tmp.dir.realpathAlloc(a, "two.csv.gz");
+    const r = try CsvReader.open(a, path, .{});
+    defer r.close();
+    var rows: usize = 0;
+    while (try r.next(a)) |b| rows += b.len;
+    try std.testing.expectEqual(@as(usize, 2), rows);
 }

@@ -627,8 +627,13 @@ Source clauses, in any order after the source:
 
 A compression suffix is read through: `FROM 'orders.csv.gz'` and `FROM 'orders.csv.zst'`
 decompress as they stream, and it is the *inner* name that picks the reader. Both
-work over HTTP too. `.xz` is not supported (std's decoder has the wrong shape for
-this reader), nor is bzip2.
+work over HTTP too. A `.gz` of several gzip members — what `pigz`, `bgzip` and an
+append write — reads whole. `.xz` is not supported (std's decoder has the wrong
+shape for this reader), nor is bzip2.
+
+`LOAD INTO 'orders.csv.gz'` writes gzip, at about `gzip -6`'s size, and `APPEND`
+adds a member to an existing one. Other codecs are refused at plan time: zstd
+output is not supported, and Parquet and Arrow compress their own pages.
 
 A file inside a zip is addressed with `::`, the separator ClickHouse uses for the
 same idea:

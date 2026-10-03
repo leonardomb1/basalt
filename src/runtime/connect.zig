@@ -1320,7 +1320,8 @@ fn fileWriteMode(env: *Env, w: ast.Write) !driver.FileMode {
 /// first, so without this call the runtime still parsed a `.zip` as CSV and
 /// answered `SELECT COUNT(*)` with the newline count of its deflate stream.
 pub fn guardFileFormat(env: *Env, path: []const u8, explicit: ?analyze.FileFormat, comptime verb: []const u8) !void {
-    if (analyze.unreadableTarget(path, explicit)) |why|
+    const unwritable = if (comptime std.mem.eql(u8, verb, "write")) analyze.unwritableTarget(path, explicit) else null;
+    if (unwritable orelse analyze.unreadableTarget(path, explicit)) |why|
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot " ++ verb ++ " `{s}`: {s}", .{ path, why }));
 }
 

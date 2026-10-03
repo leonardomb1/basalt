@@ -976,6 +976,20 @@ check append-bare-truncates "$out/bare.csv" "$out/trunc_expected.csv"
 for i in 1 2 3; do brun run -c "LOAD INTO '$out/rep.csv' REPLACE AS SELECT $i AS id;" || break; done
 check append-replace-truncates "$out/rep.csv" "$out/trunc_expected.csv"
 
+# A .csv.gz target is gzip that the system gzip reads back byte for byte, and so is
+# one appended to: a second gzip member continues the stream.
+rm -f "$out/out.csv.gz" "$out/out_gz_want.csv"
+if brun run -c "LOAD INTO '$out/out.csv.gz' AS SELECT * FROM 'it/seed.csv';" &&
+   brun run -c "LOAD INTO '$out/out.csv' AS SELECT * FROM 'it/seed.csv';" &&
+   gzip -t "$out/out.csv.gz" && gzip -cd "$out/out.csv.gz" | cmp -s - "$out/out.csv"; then
+  report csv-gzip-output ok
+else report csv-gzip-output bad; fi
+printf 'id\n1\n2\n' >"$out/gz_app_want.csv"
+rm -f "$out/app.csv.gz"
+brun run -c "LOAD INTO '$out/app.csv.gz' APPEND AS SELECT 1 AS id;" && brun run -c "LOAD INTO '$out/app.csv.gz' APPEND AS SELECT 2 AS id;"
+gzip -cd "$out/app.csv.gz" >"$out/gz_app.csv" 2>/dev/null
+check csv-gzip-append "$out/gz_app.csv" "$out/gz_app_want.csv"
+
 # A parquet footer is written last, so the file cannot be extended in place.
 # Refusing at plan time beats silently discarding the previous run — and `check`
 # must catch it without touching the filesystem.

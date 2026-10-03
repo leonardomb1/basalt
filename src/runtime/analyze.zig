@@ -1056,7 +1056,7 @@ const Ctx = struct {
             // A `stdout` sink has no target path to name a format for.
             if (std.mem.eql(u8, w.connector, "csv") and w.target.len > 0) {
                 const fmt = try formatFromHints(hints, self.diag);
-                if (unreadableTarget(w.target, fmt)) |why|
+                if (unwritableTarget(w.target, fmt) orelse unreadableTarget(w.target, fmt)) |why|
                     return fail(self.diag, "cannot write `{s}`: {s}", .{ w.target, why });
                 if ((fmt orelse formatOfPath(w.target)) == .xlsx)
                     return fail(self.diag, "cannot write `{s}`: basalt reads Excel workbooks but does not write them; write a `.csv` or `.parquet`", .{w.target});
@@ -1564,6 +1564,17 @@ pub fn formatLabel(path: []const u8, hints: []const ast.Hint) []const u8 {
 /// newlines that happen to occur in deflate output — and `check` said the script
 /// was fine. A wrong number that looks right is the one outcome this engine is
 /// built to avoid, so an extension it does not read is a plan-time error.
+/// Why `path` cannot be written, beyond what `unreadableTarget` says; null when
+/// it can. A CSV is gzip-compressed for a `.gz` name; nothing else is.
+pub fn unwritableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
+    const codec = csv.splitCodec(path).codec;
+    if (codec == .none) return null;
+    const fmt = explicit orelse formatOfPath(path) orelse .csv;
+    if (fmt != .csv) return "Parquet and Arrow compress their own pages, so they are written without a `.gz`/`.zst` suffix";
+    if (codec == .zstd) return "basalt compresses CSV output as gzip; name it `.csv.gz`, as zstd output is not supported";
+    return null;
+}
+
 pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
     // A trailing `/` is a folder read: the files under it carry the extensions,
     // and `connect.resolveFolder` decides from the listing.
