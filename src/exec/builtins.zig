@@ -40,16 +40,16 @@ test "builtins: aggregates and unknown names are not scalar builtins" {
 
 test "builtins: exactly these lack a vectorized kernel" {
     const rowwise_only = [_][]const u8{
-        "regexp_replace", "date_trunc", "extract",     "bit_count",      "to_hex",   "from_hex",
-        "abs",            "floor",      "ceil",        "round",          "mod",      "power",
-        "sqrt",           "sign",       "nullif",      "greatest",       "least",    "lpad",
-        "rpad",           "left",       "right",       "split_part",     "strpos",   "repeat",
-        "reverse",        "date_add",   "date_diff",   "make_date",      "epoch",    "to_timestamp",
-        "strftime",       "json_get",   "json_filter", "json_transform", "json_any", "json_all",
-        "strptime",       "try_strptime", "unaccent",  "strip_accents",  "translate", "initcap",
-        "ascii",          "chr",        "regexp_matches", "regexp_extract", "md5",    "sha256",
-        "xxhash64",       "concat_ws",  "json_object", "json_array",    "to_base64", "from_base64",
-        "url_encode",     "url_decode", "json_reduce", "chars",         "json_range", "json_length",
+        "regexp_replace", "date_trunc",   "extract",        "bit_count",      "to_hex",     "from_hex",
+        "abs",            "floor",        "ceil",           "round",          "mod",        "power",
+        "sqrt",           "sign",         "nullif",         "greatest",       "least",      "lpad",
+        "rpad",           "left",         "right",          "split_part",     "strpos",     "repeat",
+        "reverse",        "date_add",     "date_diff",      "make_date",      "epoch",      "to_timestamp",
+        "strftime",       "json_get",     "json_filter",    "json_transform", "json_any",   "json_all",
+        "strptime",       "try_strptime", "unaccent",       "strip_accents",  "translate",  "initcap",
+        "ascii",          "chr",          "regexp_matches", "regexp_extract", "md5",        "sha256",
+        "xxhash64",       "concat_ws",    "json_object",    "json_array",     "to_base64",  "from_base64",
+        "url_encode",     "url_decode",   "json_reduce",    "chars",          "json_range", "json_length",
         "json_slice",     "json_concat",
     };
     for (rowwise_only) |n| try std.testing.expect(lookup(n) != null);
