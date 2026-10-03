@@ -12,6 +12,7 @@ const types = @import("../lang/types.zig");
 const column = @import("column.zig");
 const Decimal = @import("value.zig").Decimal;
 const Value = @import("value.zig").Value;
+const json = @import("json.zig");
 const pow10f = @import("value.zig").pow10f;
 const Batch = @import("batch.zig").Batch;
 
@@ -1453,38 +1454,41 @@ pub fn jsonToValue(arena: std.mem.Allocator, v: std.json.Value) EvalError!Value 
 /// A JSON array element as a lambda's parameter: numbers, booleans and strings as
 /// themselves — so `x > 5` compares numbers — and an object or array as its JSON
 /// text, which `json_get` and the array functions take apart.
-fn jsonElementValue(arena: std.mem.Allocator, v: std.json.Value) EvalError!Value {
-    return switch (v) {
-        .null => .null,
-        .bool => |b| .{ .bool = b },
-        .integer => |i| .{ .int = i },
-        .float => |f| .{ .float = f },
-        .string, .number_string => |s| .{ .string = s },
-        .object, .array => .{ .string = std.json.Stringify.valueAlloc(arena, v, .{}) catch return error.OutOfMemory },
+fn jsonElementValue(arena: std.mem.Allocator, raw: []const u8) EvalError!Value {
+    return switch (raw[0]) {
+        '"' => .{ .string = try json.decodeString(arena, raw[1 .. raw.len - 1]) },
+        't' => .{ .bool = true },
+        'f' => .{ .bool = false },
+        'n' => .null,
+        '{', '[' => .{ .string = try json.compact(arena, raw) },
+        else => switch (json.number(raw)) {
+            .int => |i| .{ .int = i },
+            .float => |f| .{ .float = f },
+            .text => |t| .{ .string = t },
+        },
     };
 }
 
 /// A value `json_transform` puts in its array. Text that is a JSON object or array
 /// — what `json_get` returns for one — goes in as that object or array, not as a
 /// string holding its text; any other text is a JSON string.
-fn valueToJson(arena: std.mem.Allocator, v: Value) EvalError!std.json.Value {
-    return switch (v) {
-        .null => .null,
-        .bool => |b| .{ .bool = b },
-        .int => |i| .{ .integer = i },
-        .float => |f| .{ .float = f },
-        .decimal => .{ .number_string = try valueToString(arena, v) },
-        .string => |s| blk: {
+fn writeJsonValue(arena: std.mem.Allocator, v: Value, w: *std.Io.Writer) EvalError!void {
+    switch (v) {
+        .null => w.writeAll("null") catch return error.OutOfMemory,
+        .bool => |b| w.writeAll(if (b) "true" else "false") catch return error.OutOfMemory,
+        .int => |i| w.print("{d}", .{i}) catch return error.OutOfMemory,
+        // as `std.json.Stringify` writes a float
+        .float => |f| w.print("{}", .{f}) catch return error.OutOfMemory,
+        .decimal => w.writeAll(try valueToString(arena, v)) catch return error.OutOfMemory,
+        .string => |s| {
             const t = std.mem.trim(u8, s, " \t\r\n");
             if (t.len > 0 and (t[0] == '{' or t[0] == '[')) {
-                if (std.json.parseFromSliceLeaky(std.json.Value, arena, t, .{})) |parsed| {
-                    if (parsed == .object or parsed == .array) break :blk parsed;
-                } else |_| {}
+                if (json.validate(arena, t)) |_| return json.compactInto(arena, t, w) else |_| {}
             }
-            break :blk .{ .string = s };
+            std.json.Stringify.encodeJsonString(s, .{}, w) catch return error.OutOfMemory;
         },
-        else => .{ .string = try valueToString(arena, v) },
-    };
+        else => std.json.Stringify.encodeJsonString(try valueToString(arena, v), .{}, w) catch return error.OutOfMemory,
+    }
 }
 
 /// `body` with the lambda parameter `name` replaced by `v`, as a literal — how an
@@ -2260,16 +2264,18 @@ const per_row = struct {
         if (c.args.len != 2 or c.args[1].* != .lambda) return error.TypeMismatch;
         const dv = try evalRow(arena, c.args[0], batch, row);
         if (dv.isNull()) return .null;
-        const doc = try parseJson(arena, try valueToString(arena, dv));
-        const items = switch (doc) {
-            .array => |arr| arr.items,
-            else => return error.InvalidJson,
-        };
+        const doc = try valueToString(arena, dv);
+        try json.validate(arena, doc);
+        if (json.rootKind(doc) != .array) return error.InvalidJson;
         const l = c.args[1].lambda;
         const Kind = enum { filter, transform, any, all };
         const kind: Kind = if (eq(c.name, "json_filter")) .filter else if (eq(c.name, "json_transform")) .transform else if (eq(c.name, "json_any")) .any else .all;
-        var out = std.json.Array.init(arena);
-        for (items) |el| {
+        var out = std.Io.Writer.Allocating.init(arena);
+        const w = &out.writer;
+        w.writeByte('[') catch return error.OutOfMemory;
+        var n: usize = 0;
+        var items = json.Elements.root(doc);
+        while (items.next()) |el| {
             const body = try bindLambda(arena, l.body, l.param, try jsonElementValue(arena, el));
             // A JSON array may mix kinds: an element the body cannot compare — a
             // number against text — is null there, not a failed query. A CAST that
@@ -2280,8 +2286,11 @@ const per_row = struct {
             };
             const holds = r == .bool and r.bool;
             switch (kind) {
-                .filter => if (holds) try out.append(el),
-                .transform => try out.append(try valueToJson(arena, r)),
+                .filter, .transform => if (kind == .transform or holds) {
+                    if (n > 0) w.writeByte(',') catch return error.OutOfMemory;
+                    n += 1;
+                    if (kind == .filter) try json.compactInto(arena, el, w) else try writeJsonValue(arena, r, w);
+                },
                 .any => if (holds) return Value{ .bool = true },
                 .all => if (!holds) return Value{ .bool = false },
             }
@@ -2289,7 +2298,10 @@ const per_row = struct {
         return switch (kind) {
             .any => Value{ .bool = false },
             .all => Value{ .bool = true },
-            .filter, .transform => Value{ .string = std.json.Stringify.valueAlloc(arena, std.json.Value{ .array = out }, .{}) catch return error.OutOfMemory },
+            .filter, .transform => blk: {
+                w.writeByte(']') catch return error.OutOfMemory;
+                break :blk Value{ .string = out.written() };
+            },
         };
     }
 
@@ -2297,9 +2309,13 @@ const per_row = struct {
         const dv = try evalRow(arena, c.args[0], batch, row);
         const pv = try evalRow(arena, c.args[1], batch, row);
         if (dv.isNull() or pv.isNull()) return .null;
-        const doc = try parseJson(arena, try valueToString(arena, dv));
-        const leaf = jsonPath(doc, try valueToString(arena, pv)) orelse return .null;
-        return jsonToValue(arena, leaf);
+        const doc = try valueToString(arena, dv);
+        try json.validate(arena, doc);
+        const leaf = (try json.path(arena, doc, try valueToString(arena, pv))) orelse return .null;
+        return switch (try json.cell(arena, leaf)) {
+            .null => .null,
+            .text => |t| .{ .string = t },
+        };
     }
 
     fn strpos(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {

@@ -6,6 +6,7 @@
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
 const aggregates = @import("../lang/aggregates.zig");
+const json = @import("json.zig");
 const types = @import("../lang/types.zig");
 const column = @import("column.zig");
 const Batch = @import("batch.zig").Batch;
@@ -258,15 +259,19 @@ pub const Explode = struct {
 
 /// The elements of the JSON array `text` as cells; a JSON null is no elements.
 fn jsonElems(arena: std.mem.Allocator, text: []const u8) ![]const Value {
-    const doc = try eval.parseJson(arena, text);
-    const items = switch (doc) {
-        .array => |a| a.items,
+    try json.validate(arena, text);
+    switch (json.rootKind(text)) {
+        .array => {},
         .null => return &.{},
-        else => return error.JsonNotArray,
-    };
-    const out = try arena.alloc(Value, items.len);
-    for (items, out) |it, *o| o.* = try eval.jsonToValue(arena, it);
-    return out;
+        .other => return error.JsonNotArray,
+    }
+    var out = std.array_list.Managed(Value).init(arena);
+    var it = json.Elements.root(text);
+    while (it.next()) |raw| try out.append(switch (try json.cell(arena, raw)) {
+        .null => .null,
+        .text => |t| .{ .string = t },
+    });
+    return out.items;
 }
 
 /// Rank rows within each partition and append the result as a column.
