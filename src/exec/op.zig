@@ -1935,11 +1935,23 @@ pub const Aggregate = struct {
         errdefer for (parts) |*p| p.table.deinit();
         const nk = self.by.len;
 
+        // One integer key: a group seen before is found by the key itself, in
+        // an array over a range of its values, with no hash or probe — the
+        // common `GROUP BY status`, `year`, `category`. Keys outside the range,
+        // and nulls, take the table.
+        const direct: ?Direct = if (nk == 1 and kinds[0] != .f64k and kinds[0] != .boolk) try Direct.init(self.gpa) else null;
+        defer if (direct) |d| d.deinit(self.gpa);
+        var direct_base: ?i64 = null;
+
         while (try self.child.next(pull)) |b| {
             const keys = try pull.alloc(i64, b.len * nk);
             const masks = try pull.alloc(u64, b.len);
             const hashes = try pull.alloc(u64, b.len);
+            // each row's group record, and the partition holding it
+            const tails = try pull.alloc(?[*]u8, b.len);
+            const pidx = try pull.alloc(u8, b.len);
             @memset(masks, 0);
+            @memset(tails, null);
 
             for (self.by, kinds, 0..) |ci, kk, j| {
                 const col = b.columns[ci];
@@ -1969,8 +1981,20 @@ pub const Aggregate = struct {
                     keys[r * nk + j] = 0;
                 };
             }
+            if (direct) |d| {
+                if (direct_base == null) direct_base = Direct.baseFor(keys, masks);
+                const base = direct_base.?;
+                for (keys, masks, tails, pidx) |k, m, *t, *pi| {
+                    if (m != 0) continue;
+                    const off = k -% base;
+                    if (off < 0 or off >= Direct.len) continue;
+                    const e = d.recs[@intCast(off)] orelse continue;
+                    t.* = e;
+                    pi.* = d.parts[@intCast(off)];
+                }
+            }
             var r: usize = 0;
-            while (r < b.len) : (r += 1) hashes[r] = fixedHash(keys[r * nk ..][0..nk], masks[r]);
+            while (r < b.len) : (r += 1) hashes[r] = if (tails[r] != null) 0 else fixedHash(keys[r * nk ..][0..nk], masks[r]);
 
             const argcols = try pull.alloc(?column.Column, self.aggs.len);
             const fast = try pull.alloc(Fast, self.aggs.len);
@@ -2001,13 +2025,16 @@ pub const Aggregate = struct {
                 }
             }
 
+            // Pass 1: every row's group, found or added.
             for (order, 0..) |ri, oi| {
+                if (tails[ri] != null) continue;
                 if (oi + prefetch_ahead < order.len) {
                     const pr = order[oi + prefetch_ahead];
                     parts[hashes[pr] >> part_shift].table.prefetch(hashes[pr]);
                 }
                 const key = FixedKey{ .vals = keys[ri * nk ..][0..nk], .mask = masks[ri] };
-                const part = &parts[hashes[ri] >> part_shift];
+                const pi = hashes[ri] >> part_shift;
+                const part = &parts[pi];
                 const at: u32 = @intCast(part.store.len);
                 const f = try part.table.getOrPut(hashes[ri], key, part.store, at);
                 const rec = if (f.found) part.store.at(f.slot) else blk: {
@@ -2016,35 +2043,58 @@ pub const Aggregate = struct {
                     nr.mask.* = key.mask;
                     break :blk nr;
                 };
-                if (counts_only) {
-                    const cs: [*]i64 = @ptrCast(@alignCast(rec.tail));
-                    for (cs[0..self.aggs.len]) |*c| c.* += 1;
-                } else {
-                    for (self.aggs, fast, 0..) |agg, fk, j| switch (fk) {
-                        .count_star => layout.ptr(i64, rec.tail, j).* += 1,
-                        .count_all_valid => layout.ptr(i64, rec.tail, j).* += 1,
-                        .sum_i64 => {
-                            const x = layout.ptr(SumI, rec.tail, j);
-                            x.s += argcols[j].?.data.i64[ri];
-                            x.n += 1;
-                        },
-                        .sum_f64 => {
-                            const x = layout.ptr(SumF, rec.tail, j);
-                            x.s += argcols[j].?.data.f64[ri];
-                            x.n += 1;
-                        },
-                        .sum_f_of_i64 => {
-                            const x = layout.ptr(SumF, rec.tail, j);
-                            x.s += @floatFromInt(argcols[j].?.data.i64[ri]);
-                            x.n += 1;
-                        },
-                        .generic => {
-                            const v = if (argcols[j]) |col| col.getValue(ri) else Value.null;
-                            try layout.update(part.alloc, rec.tail, j, agg, v);
-                        },
-                    };
-                }
+                tails[ri] = rec.tail;
+                pidx[ri] = @intCast(pi);
+                if (direct) |d| if (key.mask == 0) {
+                    const off = key.vals[0] -% direct_base.?;
+                    if (off >= 0 and off < Direct.len) {
+                        d.recs[@intCast(off)] = rec.tail;
+                        d.parts[@intCast(off)] = @intCast(pi);
+                    }
+                };
             }
+
+            // Pass 2: each aggregate over the batch in row order — the type's
+            // branch taken once, not per row, and a group's values added in the
+            // order the rows came, as a float sum needs to stay the same.
+            if (counts_only) {
+                for (tails[0..b.len]) |t| {
+                    const cs: [*]i64 = @ptrCast(@alignCast(t.?));
+                    for (cs[0..self.aggs.len]) |*c| c.* += 1;
+                }
+            } else for (self.aggs, fast, 0..) |agg, fk, j| switch (fk) {
+                .count_star, .count_all_valid => for (tails[0..b.len]) |t| {
+                    layout.ptr(i64, t.?, j).* += 1;
+                },
+                .sum_i64 => {
+                    const col = argcols[j].?.data.i64;
+                    for (tails[0..b.len], col[0..b.len]) |t, v| {
+                        const x = layout.ptr(SumI, t.?, j);
+                        x.s += v;
+                        x.n += 1;
+                    }
+                },
+                .sum_f64 => {
+                    const col = argcols[j].?.data.f64;
+                    for (tails[0..b.len], col[0..b.len]) |t, v| {
+                        const x = layout.ptr(SumF, t.?, j);
+                        x.s += v;
+                        x.n += 1;
+                    }
+                },
+                .sum_f_of_i64 => {
+                    const col = argcols[j].?.data.i64;
+                    for (tails[0..b.len], col[0..b.len]) |t, v| {
+                        const x = layout.ptr(SumF, t.?, j);
+                        x.s += @floatFromInt(v);
+                        x.n += 1;
+                    }
+                },
+                .generic => for (tails[0..b.len], pidx[0..b.len], 0..) |t, pi, ri| {
+                    const v = if (argcols[j]) |col| col.getValue(ri) else Value.null;
+                    try layout.update(parts[pi].alloc, t.?, j, agg, v);
+                },
+            };
             _ = scratch.reset(.retain_capacity);
         }
         return self.foldSets(.fixed, parts);
@@ -2155,6 +2205,37 @@ pub const Aggregate = struct {
     /// existed for this and had no caller, so the two-pass shape above paid
     /// for a miss it never hid.
     const prefetch_ahead = 8;
+
+    /// The direct index of `drainFixed`: group records by key value, over
+    /// `len` values from a base taken from the first batch.
+    const Direct = struct {
+        recs: []?[*]u8,
+        parts: []u8,
+
+        const len = 1 << 14;
+
+        fn init(gpa: std.mem.Allocator) !Direct {
+            const recs = try gpa.alloc(?[*]u8, len);
+            @memset(recs, null);
+            const parts = try gpa.alloc(u8, len);
+            return .{ .recs = recs, .parts = parts };
+        }
+
+        fn deinit(self: Direct, gpa: std.mem.Allocator) void {
+            gpa.free(self.recs);
+            gpa.free(self.parts);
+        }
+
+        /// The smallest non-null key, so a range starting at 0 or 1 — a status
+        /// code, a year's months — sits wholly inside.
+        fn baseFor(keys: []const i64, masks: []const u64) i64 {
+            var lo: i64 = std.math.maxInt(i64);
+            for (keys, masks) |k, m| if (m == 0 and k < lo) {
+                lo = k;
+            };
+            return if (lo == std.math.maxInt(i64)) 0 else lo;
+        }
+    };
 
     /// Below this many groups a fold walks a batch in row order (see `drainFixed`).
     const few_groups = 1 << 12;
