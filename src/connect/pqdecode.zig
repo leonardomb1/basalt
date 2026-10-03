@@ -122,12 +122,23 @@ pub fn decodeRleHybrid(
             const bytes = std.math.mul(usize, groups, width) catch return Error.CorruptParquetPage;
             if (bytes > src.len - pos) return Error.CorruptParquetPage;
             const vals = groups * 8; // groups <= src.len here, so this cannot wrap
-            var br = BitReader{ .buf = src[pos..][0..bytes] };
-            for (0..vals) |_| {
-                if (n >= count) break; // trailing padding in the last group
-                out[n] = @intCast(try br.read(width));
-                n += 1;
+            const run = src[pos..][0..bytes];
+            const take = @min(vals, count - n); // trailing padding in the last group
+            // The run's bytes are checked above, so values with a whole u64 after
+            // their first byte unpack without a check apiece; reading them one at a
+            // time through `BitReader` was a fifth of a 100-group GROUP BY. The
+            // last few go through it.
+            const mask = (@as(u64, 1) << width) - 1;
+            var i: usize = 0;
+            while (width <= 32 and i < take) : (i += 1) {
+                const bit = i * width;
+                const byte = bit >> 3;
+                if (byte + 8 > run.len) break;
+                out[n + i] = @intCast((std.mem.readInt(u64, run[byte..][0..8], .little) >> @intCast(bit & 7)) & mask);
             }
+            var br = BitReader{ .buf = run, .bit_pos = i * width };
+            while (i < take) : (i += 1) out[n + i] = @intCast(try br.read(width));
+            n += take;
             pos += bytes;
         } else {
             const run: usize = @intCast(header >> 1);
