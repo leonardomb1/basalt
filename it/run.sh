@@ -7,7 +7,8 @@
 #   ./it/run.sh mysql postgres  several
 #   KEEP=1 ./it/run.sh azure    leave the stack up afterwards
 #
-# Suite names: mysql postgres sqlserver starrocks doris azure parquet s3 arrow stdout kernel
+# Suite names: mysql postgres sqlserver starrocks doris sftp azure parquet s3 arrow
+# stdout kernel
 # (arrow needs `uv`: it reads the stream back with pyarrow; stdout needs nothing;
 # kernel needs python3)
 # Scripts are Basalt SQL (the BSL parser was removed in v0.2.0); connection
@@ -15,7 +16,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ALL_SUITES="mysql postgres sqlserver starrocks doris azure parquet s3 arrow stdout kernel"
+ALL_SUITES="mysql postgres sqlserver starrocks doris sftp azure parquet s3 arrow stdout kernel"
 DEFAULT_SUITES="$ALL_SUITES"
 SUITES="${*:-$DEFAULT_SUITES}"
 
@@ -36,6 +37,7 @@ for s in $SUITES; do
     sqlserver) services="$services mssql" ;;
     starrocks) services="$services starrocks" ;;
     doris)     services="$services doris" ;;
+    sftp)      services="$services sftp" ;;
     azure)     services="$services azurite" ;;
     s3)        services="$services s3" ;;
     parquet)   services="$services static static-norange" ;;  # local fixtures, plus HTTP
@@ -45,6 +47,12 @@ done
 zig build
 B=./zig-out/bin/basalt
 COMPOSE="docker compose -f it/compose.yaml"
+
+# The sftp suite logs in with a key made here, for this run only.
+keydir=$(mktemp -d)
+ssh-keygen -q -t ed25519 -N '' -C basalt-it -f "$keydir/id_ed25519"
+SFTP_PUBKEY=$(cat "$keydir/id_ed25519.pub")
+export SFTP_PUBKEY
 
 echo "==> suites: $SUITES"
 # A suite with no service (arrow) must not start the whole stack: a bare
@@ -519,6 +527,66 @@ LOAD INTO '$out/sr_embedded_out.csv' AS SELECT id, s FROM fe.it_nullmark2 ORDER 
   paramrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');"
   collrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_coll USING stream_load"
   catalogrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" it
+fi
+
+# SFTP: an OpenSSH server, reached with a password and with an Ed25519 key, its
+# host keys taken from the container itself rather than trusted on first connect.
+if runs sftp; then
+  SC=it-sftp-1
+  docker exec $SC sh -c 'cat /config/ssh_host_keys/*.pub' | awk '{print "[127.0.0.1]:42222 "$1" "$2}' >"$out/known_hosts"
+  # the server rekeys every megabyte, so the larger files cross several key exchanges
+  docker exec $SC sh -c 'printf "RekeyLimit 1M\n" | cat - /config/sshd/sshd_config > /tmp/c && cp /tmp/c /config/sshd/sshd_config'
+  docker restart $SC >/dev/null
+  for _ in $(seq 1 30); do docker exec $SC pgrep -f sshd >/dev/null 2>&1 && break; sleep 1; done
+  sleep 2
+  docker exec $SC sh -c 'mkdir -p /config/in/parts /config/out && chown -R 1000:1000 /config/in /config/out'
+  docker cp it/seed.csv $SC:/config/in/seed.csv
+  docker cp src/connect/testdata/openpyxl.xlsx $SC:/config/in/book.xlsx
+  printf 'id,v\n1,a\n' | docker exec -i $SC sh -c 'cat > /config/in/parts/p2.csv'
+  printf 'id,v\n0,z\n' | docker exec -i $SC sh -c 'cat > /config/in/parts/p1.csv'
+  docker exec $SC sh -c 'chown -R 1000:1000 /config/in'
+  PW="CREATE CONNECTION box TYPE sftp OPTIONS (host = '127.0.0.1', port = 42222, user = 'basalt', password = 'it', known_hosts = '$out/known_hosts');"
+  KEY="CREATE CONNECTION box TYPE sftp OPTIONS (host = '127.0.0.1', port = 42222, user = 'basalt', key_file = '$keydir/id_ed25519', known_hosts = '$out/known_hosts');"
+
+  # a CSV read with a password, the same through a key
+  if brun run -c "$PW LOAD INTO '$out/sftp_pw.csv' AS SELECT * FROM 'sftp://box/~/in/seed.csv' ORDER BY id;" &&
+     brun run -c "$KEY LOAD INTO '$out/sftp_key.csv' AS SELECT * FROM 'sftp://box/~/in/seed.csv' ORDER BY id;"; then
+    check sftp-password "$out/sftp_pw.csv" it/expected.csv
+    check sftp-key "$out/sftp_key.csv" it/expected.csv
+  else
+    report "sftp (run error)" bad
+  fi
+
+  # Parquet written through a .part and read back by range, past several rekeys
+  awk 'BEGIN{print "id,name,val"; for(i=1;i<=200000;i++) printf "%d,name_%d,%d\n", i, i, i*7}' >"$out/sftp_big.csv"
+  if brun run -c "$KEY LOAD INTO 'sftp://box/~/out/big.parquet' AS SELECT * FROM '$out/sftp_big.csv';" &&
+     brun run -c "$KEY LOAD INTO '$out/sftp_big_got.csv' AS SELECT COUNT(*) AS n, SUM(val) AS s FROM 'sftp://box/~/out/big.parquet';"; then
+    brun run -c "LOAD INTO '$out/sftp_big_want.csv' AS SELECT COUNT(*) AS n, SUM(val) AS s FROM '$out/sftp_big.csv';"
+    check sftp-parquet-roundtrip "$out/sftp_big_got.csv" "$out/sftp_big_want.csv"
+  else
+    report "sftp-parquet-roundtrip (run error)" bad
+  fi
+
+  # an Excel workbook, read through the zip by range; a folder, files in name order
+  if brun run -c "$KEY LOAD INTO '$out/sftp_xlsx.csv' AS SELECT codigo, qtd FROM 'sftp://box/~/in/book.xlsx' WITH (sheet = 'Notas', range = 'A3:B5');" &&
+     brun run -c "$KEY LOAD INTO '$out/sftp_dir.csv' AS SELECT * FROM 'sftp://box/~/in/parts/';"; then
+    printf 'codigo,qtd\nx1,5\nx2,7\n' >"$out/sftp_xlsx_want.csv"
+    printf 'id,v\n0,z\n1,a\n' >"$out/sftp_dir_want.csv"
+    check sftp-xlsx "$out/sftp_xlsx.csv" "$out/sftp_xlsx_want.csv"
+    check sftp-folder "$out/sftp_dir.csv" "$out/sftp_dir_want.csv"
+  else
+    report "sftp-xlsx-folder (run error)" bad
+  fi
+
+  # a failed load takes its .part back and leaves no target
+  $B run -q -c "$KEY LOAD INTO 'sftp://box/~/out/bad.csv' AS SELECT CAST(name AS INT) AS x FROM 'it/seed.csv';" >/dev/null 2>&1 || true
+  if docker exec $SC sh -c 'ls /config/out' | grep -q "bad"; then report "sftp-aborted-load-leaves-nothing" bad; else report "sftp-aborted-load-leaves-nothing" ok; fi
+
+  # an unknown host is refused with its fingerprint; a wrong pin is a changed key
+  $B run -q -c "CREATE CONNECTION box TYPE sftp OPTIONS (host = '127.0.0.1', port = 42222, user = 'basalt', password = 'it', known_hosts = '/dev/null'); SELECT * FROM 'sftp://box/~/in/seed.csv';" >"$out/sftp_unknown.txt" 2>&1 || true
+  if grep -q "not in known_hosts: ssh-ed25519 SHA256:" "$out/sftp_unknown.txt"; then report "sftp-unknown-host-refused" ok; else report "sftp-unknown-host-refused" bad; cat "$out/sftp_unknown.txt"; fi
+  $B run -q -c "CREATE CONNECTION box TYPE sftp OPTIONS (host = '127.0.0.1', port = 42222, user = 'basalt', password = 'it', host_key = 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'); SELECT * FROM 'sftp://box/~/in/seed.csv';" >"$out/sftp_pin.txt" 2>&1 || true
+  if grep -q "SshHostKeyChanged" "$out/sftp_pin.txt"; then report "sftp-changed-key-refused" ok; else report "sftp-changed-key-refused" bad; cat "$out/sftp_pin.txt"; fi
 fi
 
 # Doris: the same arrangement as StarRocks, which forked from it — stream load in,

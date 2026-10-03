@@ -162,6 +162,42 @@ CREATE privilege; one that does lack a privilege it needs gets StarRocks' own
 message in the error (`starrocks refused 'CREATE TABLE …': Access denied; you
 need …`), not only in the log.
 
+An `sftp` connection names a file server, and paths reach it as
+`sftp://name/path` — absolute, or `sftp://name/~/path` under the login's home:
+
+```sql
+CREATE CONNECTION bank TYPE sftp OPTIONS (
+  host = 'sftp.banco.com.br', user = 'empresa',
+  key_file = '/etc/basalt/bank_ed25519'          -- or a password (BANK_PASS)
+);
+LOAD INTO IDENTIFIER('retornos/' || $dia || '.parquet') AS
+SELECT * FROM IDENTIFIER('sftp://bank/retorno/' || $dia || '.csv');
+LOAD INTO 'sftp://bank/remessa/pagamentos.csv' AS SELECT * FROM pagamentos;
+```
+
+Options are `host port user password key_file key_passphrase known_hosts
+host_key`; `user`/`password` follow the `NAME_USER`/`NAME_PASS` convention, and
+the password is optional when a `key_file` logs in. The key is an OpenSSH Ed25519
+key, passphrase-protected or not; an RSA key file is refused with that advice.
+Password and keyboard-interactive logins both work. Without a connection,
+`sftp://user@host/path` logs in with `~/.ssh/id_ed25519` or `SFTP_PASSWORD`.
+
+The server's host key is checked before anything is sent, against
+`known_hosts` (`~/.ssh/known_hosts` by default, hashed entries and `[host]:port`
+included) or a pinned `host_key = 'SHA256:…'`. An unknown key is refused with
+its fingerprint and the option that pins it, a changed or `@revoked` one is
+refused outright — never trusted on first use, as a transfer to the wrong host
+is a leak. Ciphers are chacha20-poly1305, AES-GCM and AES-CTR with HMAC-SHA2,
+with OpenSSH's strict key exchange.
+
+Reads are by offset, so a Parquet file or an Excel workbook on the server is
+read without fetching what the query does not need, and a parallel read gets a
+session per lane; sessions are pooled per server and user. A write goes to
+`name.part` and is renamed over `name` once complete, so a partner polling the
+folder never picks up half a file; a failed load removes the `.part`. `APPEND`
+is not supported, and a missing folder is an error rather than created on
+someone else's server.
+
 A `doris` connection is the same in every respect — Doris is the project
 StarRocks forked from, read through its FE and loaded by stream load — except
 for the tables it creates. Doris takes no FLOAT, DOUBLE or STRING column as a
@@ -314,6 +350,7 @@ LIMIT 100 OFFSET 20;
 | compressed file | `FROM 'path.csv.gz'` / `.csv.zst` — the inner name picks the reader |
 | file inside a zip | `FROM 'archive.zip :: inner.csv'`, or just `FROM 'archive.zip'` when it holds one file |
 | object storage | `FROM 'az://account/container/path.parquet'` or `FROM 's3://bucket/key.parquet'`; a trailing `/` reads every object under the prefix as one table |
+| SFTP | `FROM 'sftp://bank/retorno/2026-10.csv'` — `bank` a `CREATE CONNECTION bank TYPE sftp` (below), or `sftp://user@host[:port]/path`; any file format, a trailing `/` a folder of CSVs; `LOAD INTO 'sftp://…'` writes |
 | REST (connection) | `FROM crm.GET('/v1/customers', status = 'open')` — path on the conn's base URL; each `name = value` is a URL-encoded query param, and path and values are expressions (`'/v1/customers/' \|\| $id`). `crm.POST('/search', body = $$...$$)` sends a body. `crm.'/v1/customers'` is the older spelling of a bare GET |
 | REST resource | `FROM crm.customers` — an endpoint named with `CREATE RESOURCE` (§3) |
 | REST (raw URL) | `FROM HTTP('https://host/api/x')` — the URL exactly as written, the way `QUERY()` is raw SQL |

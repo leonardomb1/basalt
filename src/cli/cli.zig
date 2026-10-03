@@ -1123,6 +1123,14 @@ const connectors = [_]Connector{
         .{ .key = "user", .prompt = "user", .default = "root" },
         .{ .key = "password", .prompt = "password", .secret = true },
     } },
+    .{ .name = "sftp", .blurb = "an SFTP server (files read and written as sftp://<name>/path)", .fields = &.{
+        .{ .key = "host", .prompt = "host" },
+        .{ .key = "port", .prompt = "port", .default = "22", .int = true },
+        .{ .key = "user", .prompt = "user" },
+        .{ .key = "key_file", .prompt = "key file (blank for a password)" },
+        .{ .key = "password", .prompt = "password", .secret = true },
+        .{ .key = "host_key", .prompt = "pinned host key (blank for ~/.ssh/known_hosts)" },
+    } },
     .{ .name = "http", .blurb = "a REST API (paginated sources, an endpoint sink)", .fields = &.{
         .{ .key = "base_url", .prompt = "base URL" },
         .{ .key = "auth", .prompt = "auth (blank, bearer, basic)" },
@@ -2517,7 +2525,10 @@ fn usage(w: anytype) !void {
         \\             both read serially whatever -j says
         \\  object     az://<account>/<container>/<path> or s3://<bucket>/<key>, and a
         \\             trailing / reads every object under that prefix as one table
-        \\  databases  postgres, mysql, sqlserver, starrocks (CREATE CONNECTION ... TYPE ...)
+        \\  sftp       sftp://<conn>/<path> through CREATE CONNECTION <conn> TYPE sftp
+        \\             (or sftp://user@host/path), read and written; the host key is
+        \\             checked against known_hosts or a pinned host_key, never trusted
+        \\  databases  postgres, mysql, sqlserver, starrocks, doris (CREATE CONNECTION ... TYPE ...)
         \\  http       REST sources and sinks; `request` for an HTTP request body
         \\  buffer     durable WAL buffer, replayed by a later run
         \\
