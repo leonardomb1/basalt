@@ -82,8 +82,10 @@ pub fn classifyLaneShape(stages: []const ast.Stage) ?LaneShape {
 /// Preconditions every lane path shares. A hinted read is left to the paths that
 /// honour the hint, and one stage plus a write is nothing to split.
 pub fn laneEligible(stages: []const ast.Stage, opts: RunOptions) bool {
+    // Any hint used to keep a read serial — a `delimiter = ';'` file ran on one
+    // thread at any `-j` while EXPLAIN called it morsel-parallel.
     return opts.threads > 1 and stages.len >= 2 and
-        stages[0].node == .read and stages[0].hints.len == 0;
+        stages[0].node == .read and analyze.laneHints(stages[0]);
 }
 
 pub fn runParquetLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
@@ -641,7 +643,7 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
     const slot = &ctx.slots[i];
     const wa = slot.arena.allocator();
 
-    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.queue.nitems), .schema = ctx.csv_schema };
+    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.queue.nitems), .schema = ctx.csv_schema, .dialect = ctx.mapped.dialect };
     var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     var child = try buildMapChain(wa, ctx.params, ctx.prefix, &scan, ctx.csv_schema);
@@ -995,7 +997,7 @@ fn laneRowSource(rows: LaneRows, scratch: std.mem.Allocator) !?driver.Source {
         },
         .csv => |c| {
             const rd = try scratch.create(csv.CsvSliceReader);
-            rd.* = .{ .data = c.mapped.chunk(c.chunk, c.of), .schema = c.schema };
+            rd.* = .{ .data = c.mapped.chunk(c.chunk, c.of), .schema = c.schema, .dialect = c.mapped.dialect };
             return rd.source();
         },
     }

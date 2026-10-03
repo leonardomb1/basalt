@@ -982,7 +982,7 @@ const Ctx = struct {
                 .has_breaker = has_breaker,
                 .splittable = splittable,
                 .sink_parallel = sink_is_parallel,
-                .morsel_parallel = !splittable and morselParallelRead(source.connector, stages[0].node),
+                .morsel_parallel = !splittable and laneHints(stages[0]) and morselParallelRead(source.connector, stages[0].node),
                 // the pushed sort is then the only breaker, over the capped rows
                 .top_n = if (top_n) |t| (if (!t.sorted or breakers == 1) t.rows else null) else null,
             },
@@ -1621,6 +1621,26 @@ fn joinNames(arena: std.mem.Allocator, items: []const []const u8) []const u8 {
 /// its own chunks. A CSV is cut into byte ranges, which needs the bytes locally —
 /// the runtime memory-maps the file, so a CSV over HTTP or object storage is
 /// fetched whole and parsed serially.
+/// Whether a file read's hints still let it fan out over lanes: its CSV dialect
+/// (`delimiter`, `encoding`), which every lane reads its chunk with, and a
+/// `format` naming what the path's extension already says. Any other hint keeps
+/// the read on the serial reader. The runtime (`lanes.laneEligible`) and EXPLAIN
+/// both ask this, so the plan cannot claim a fan-out the run does not take.
+pub fn laneHints(st: ast.Stage) bool {
+    for (st.hints) |h| {
+        if (std.mem.eql(u8, h.key, "delimiter") or std.mem.eql(u8, h.key, "delim") or std.mem.eql(u8, h.key, "encoding")) continue;
+        if (std.mem.eql(u8, h.key, "format")) {
+            if (st.node != .read or st.node.read.form != .path) return false;
+            var d = Diag{};
+            const f = (formatFromHints(st.hints, &d) catch return false) orelse return false;
+            if (f != readFormat(st.node.read.form.path, null)) return false;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 fn morselParallelRead(connector: []const u8, node: ast.Stage.Node) bool {
     // Every file read arrives on the `csv` connector; the path decides the format.
     if (!std.mem.eql(u8, connector, "csv")) return false;
@@ -2317,6 +2337,21 @@ test "analyze: a numeric aggregate refuses a non-numeric argument at plan time" 
     // Text still passes: it is coerced per row, as the parallel CSV lanes need.
     var ok = Diag{};
     _ = try analyzeCsv(a, "id,s\n1,x\n", "SELECT SUM(s) AS n, MIN(s) AS lo FROM '$IN'", &ok);
+}
+
+test "laneHints: a CSV dialect and an agreeing format fan out; anything else stays serial" {
+    const rd = ast.Stage.Node{ .read = .{ .connector = "csv", .form = .{ .path = "x.csv" } } };
+    const pos = ast.Pos{ .line = 1, .col = 1 };
+    const Case = struct { hints: []const ast.Hint, ok: bool };
+    const cases = [_]Case{
+        .{ .hints = &.{}, .ok = true },
+        .{ .hints = &.{ .{ .key = "delimiter", .value = .{ .str = ";" }, .pos = pos }, .{ .key = "encoding", .value = .{ .str = "latin1" }, .pos = pos } }, .ok = true },
+        .{ .hints = &.{.{ .key = "format", .value = .{ .str = "csv" }, .pos = pos }}, .ok = true },
+        // a format the extension does not say is read by another reader than the lanes'
+        .{ .hints = &.{.{ .key = "format", .value = .{ .str = "parquet" }, .pos = pos }}, .ok = false },
+        .{ .hints = &.{.{ .key = "split", .value = .{ .str = "id" }, .pos = pos }}, .ok = false },
+    };
+    for (cases) |c| try std.testing.expectEqual(c.ok, laneHints(.{ .node = rd, .hints = c.hints, .pos = pos }));
 }
 
 test "formatLabel names the reader, not the connector" {

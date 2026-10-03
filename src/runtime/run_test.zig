@@ -3410,6 +3410,26 @@ test "JSON array lambdas: filter, transform, any, all — elements as themselves
     , got);
 }
 
+test "a CSV read with a delimiter and an encoding fans out over lanes and reads each chunk in that dialect" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // `;`-separated latin-1, as the CVM publishes: any hint used to keep the read
+    // serial, and the lanes' chunk readers ignored the dialect when they did run.
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    try input.appendSlice("cidade;valor\n");
+    for (0..3000) |i| try input.writer().print("{s};{d}\n", .{ if (i % 3 == 0) "Bel\xe9m" else if (i % 3 == 1) "Goi\xe2nia" else "Macei\xf3", i % 7 });
+    const q = "SELECT cidade, COUNT(*) AS n, SUM(valor) AS s FROM '$IN' WITH (delimiter = ';', encoding = 'latin1') GROUP BY cidade ORDER BY cidade";
+    const want = "cidade,n,s\nBelém,1000,2999\nGoiânia,1000,2998\nMaceió,1000,2997\n";
+    const serial = try runToString(alloc, &tmp, input.items, q);
+    defer alloc.free(serial);
+    try std.testing.expectEqualStrings(want, serial);
+    const lanes = try runCsvThreaded(alloc, &tmp, input.items, q, 4);
+    defer alloc.free(lanes);
+    try std.testing.expectEqualStrings(want, lanes);
+}
+
 test "csv: a column of ISO dates is inferred as DATE (empty cells are null)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
