@@ -1942,48 +1942,62 @@ pub const Aggregate = struct {
 
             for (self.by, kinds, 0..) |ci, kk, j| {
                 const col = b.columns[ci];
-                const all_valid = col.validity.allSet(b.len);
-                var r: usize = 0;
-                while (r < b.len) : (r += 1) {
-                    if (!all_valid and !col.validity.get(r)) {
-                        masks[r] |= @as(u64, 1) << @intCast(j);
-                        keys[r * nk + j] = 0;
-                        continue;
-                    }
-                    keys[r * nk + j] = switch (kk) {
-                        .i64k => col.data.i64[r],
-                        .i32k => col.data.i32[r],
-                        .boolk => @intFromBool(col.data.b[r]),
-                        // Group by the NUMBER, not the bit pattern: this path
-                        // compares raw words, so `-0.0` (0x8000…) and `0.0` would
-                        // land in different groups even though every other part
-                        // of the engine — DISTINCT, join, the parallel merge —
-                        // calls them equal. Same canonicalization as
-                        // `keyhash.hashValue`.
-                        .f64k => @bitCast(keyhash.canonF64(col.data.f64[r])),
-                    };
+                // One loop per kind: a switch inside the row loop ran per row.
+                switch (kk) {
+                    .i64k => for (0..b.len) |r| {
+                        keys[r * nk + j] = col.data.i64[r];
+                    },
+                    .i32k => for (0..b.len) |r| {
+                        keys[r * nk + j] = col.data.i32[r];
+                    },
+                    .boolk => for (0..b.len) |r| {
+                        keys[r * nk + j] = @intFromBool(col.data.b[r]);
+                    },
+                    // Group by the NUMBER, not the bit pattern: this path compares
+                    // raw words, so `-0.0` (0x8000…) and `0.0` would land in
+                    // different groups even though every other part of the engine —
+                    // DISTINCT, join, the parallel merge — calls them equal. Same
+                    // canonicalization as `keyhash.hashValue`.
+                    .f64k => for (0..b.len) |r| {
+                        keys[r * nk + j] = @bitCast(keyhash.canonF64(col.data.f64[r]));
+                    },
                 }
+                if (!col.validity.allSet(b.len)) for (0..b.len) |r| {
+                    if (col.validity.get(r)) continue;
+                    masks[r] |= @as(u64, 1) << @intCast(j);
+                    keys[r * nk + j] = 0;
+                };
             }
             var r: usize = 0;
-            while (r < b.len) : (r += 1) {
-                var hh = std.hash.Wyhash.init(masks[r]);
-                hh.update(std.mem.sliceAsBytes(keys[r * nk ..][0..nk]));
-                hashes[r] = hh.final();
-            }
+            while (r < b.len) : (r += 1) hashes[r] = fixedHash(keys[r * nk ..][0..nk], masks[r]);
 
             const argcols = try pull.alloc(?column.Column, self.aggs.len);
-            for (self.aggs, argcols) |agg, *c| {
+            const fast = try pull.alloc(Fast, self.aggs.len);
+            for (self.aggs, argcols, fast, layout.slots) |agg, *c, *f, sl| {
                 c.* = if (agg.arg) |e| try self.argColumn(pull, agg, e, b) else null;
+                f.* = Fast.of(sl, agg, c.*, b.len);
             }
 
-            @memset(counts, 0);
-            for (hashes[0..b.len]) |h| counts[(h >> part_shift) + 1] += 1;
-            for (1..nparts + 1) |ci| counts[ci] += counts[ci - 1];
+            // Rows are walked a partition at a time so consecutive probes share a
+            // table — which pays only once the tables outgrow the cache. While the
+            // groups are few, the reorder and the scattered reads it costs were
+            // most of a 100-group GROUP BY, so rows go in the order they came.
+            var groups: usize = 0;
+            if (self.part_state == null) groups = parts[0].store.len else for (parts) |*pp| {
+                groups += pp.store.len;
+            }
             const order = try pull.alloc(u32, b.len);
-            for (hashes[0..b.len], 0..) |h, ri| {
-                const pi = h >> part_shift;
-                order[counts[pi]] = @intCast(ri);
-                counts[pi] += 1;
+            if (groups < few_groups) {
+                for (order, 0..) |*o, ri| o.* = @intCast(ri);
+            } else {
+                @memset(counts, 0);
+                for (hashes[0..b.len]) |h| counts[(h >> part_shift) + 1] += 1;
+                for (1..nparts + 1) |ci| counts[ci] += counts[ci - 1];
+                for (hashes[0..b.len], 0..) |h, ri| {
+                    const pi = h >> part_shift;
+                    order[counts[pi]] = @intCast(ri);
+                    counts[pi] += 1;
+                }
             }
 
             for (order, 0..) |ri, oi| {
@@ -2005,10 +2019,29 @@ pub const Aggregate = struct {
                     const cs: [*]i64 = @ptrCast(@alignCast(rec.tail));
                     for (cs[0..self.aggs.len]) |*c| c.* += 1;
                 } else {
-                    for (self.aggs, 0..) |agg, j| {
-                        const v = if (argcols[j]) |col| col.getValue(ri) else Value.null;
-                        try layout.update(part.alloc, rec.tail, j, agg, v);
-                    }
+                    for (self.aggs, fast, 0..) |agg, fk, j| switch (fk) {
+                        .count_star => layout.ptr(i64, rec.tail, j).* += 1,
+                        .count_all_valid => layout.ptr(i64, rec.tail, j).* += 1,
+                        .sum_i64 => {
+                            const x = layout.ptr(SumI, rec.tail, j);
+                            x.s += argcols[j].?.data.i64[ri];
+                            x.n += 1;
+                        },
+                        .sum_f64 => {
+                            const x = layout.ptr(SumF, rec.tail, j);
+                            x.s += argcols[j].?.data.f64[ri];
+                            x.n += 1;
+                        },
+                        .sum_f_of_i64 => {
+                            const x = layout.ptr(SumF, rec.tail, j);
+                            x.s += @floatFromInt(argcols[j].?.data.i64[ri]);
+                            x.n += 1;
+                        },
+                        .generic => {
+                            const v = if (argcols[j]) |col| col.getValue(ri) else Value.null;
+                            try layout.update(part.alloc, rec.tail, j, agg, v);
+                        },
+                    };
                 }
             }
             _ = scratch.reset(.retain_capacity);
@@ -2122,6 +2155,58 @@ pub const Aggregate = struct {
     /// for a miss it never hid.
     const prefetch_ahead = 8;
 
+    /// Below this many groups a fold walks a batch in row order (see `drainFixed`).
+    const few_groups = 1 << 12;
+
+    /// The hash of a fixed-width key: each word through murmur3's 64-bit
+    /// finalizer. Wyhash's streaming form, copying eight bytes into its buffer per
+    /// key, was a fifth of a 100-group GROUP BY; this mixes as well in the bits
+    /// that matter here — the top six pick the partition, the bottom the bucket,
+    /// 32–37 the salt.
+    fn fixedHash(vals: []const i64, mask: u64) u64 {
+        var h: u64 = 0x9E3779B97F4A7C15 ^ mask;
+        for (vals) |v| h = fmix64(h ^ (@as(u64, @bitCast(v)) *% 0xC2B2AE3D27D4EB4F));
+        return h;
+    }
+
+    fn fmix64(x0: u64) u64 {
+        var x = x0;
+        x ^= x >> 33;
+        x *%= 0xff51afd7ed558ccd;
+        x ^= x >> 33;
+        x *%= 0xc4ceb9fe1a85ec53;
+        x ^= x >> 33;
+        return x;
+    }
+
+    /// An aggregate the fold can update straight from its argument's typed column,
+    /// for one batch: an INT or FLOAT column with no nulls under COUNT, SUM or AVG.
+    /// Everything else boxes the cell into a `Value` and takes `Layout.update`,
+    /// which at 100 groups cost as much as finding the group.
+    const Fast = enum {
+        count_star,
+        count_all_valid,
+        sum_i64,
+        sum_f64,
+        sum_f_of_i64,
+        generic,
+
+        fn of(slot: Slot, agg: Agg, col: ?column.Column, n: usize) Fast {
+            const c = col orelse return if (slot == .count) .count_star else .generic;
+            if (!c.validity.allSet(n)) return .generic;
+            return switch (slot) {
+                .count => .count_all_valid,
+                .sum_i => if (agg.ty.kind != .decimal and c.ty.kind == .int) .sum_i64 else .generic,
+                .sum_f => switch (c.ty.kind) {
+                    .float => .sum_f64,
+                    .int => .sum_f_of_i64,
+                    else => .generic,
+                },
+                .full => .generic,
+            };
+        }
+    };
+
     /// How a fixed-width key column is read into a raw `i64`.
     const KeyKind = enum { i64k, i32k, boolk, f64k };
 
@@ -2216,11 +2301,15 @@ pub const Aggregate = struct {
             };
         }
 
+        /// One address computation for the hash, the mask and the keys: going
+        /// through `hashAt` and `at` located the record twice per probe.
         fn eqlAt(self: *const FixedStore, i: usize, h: u64, key: FixedKey) bool {
-            if (self.hashAt(i) != h) return false;
-            const r = self.at(i);
-            if (r.mask.* != key.mask) return false;
-            return std.mem.eql(i64, r.keys, key.vals);
+            const base = self.recs.base(i);
+            const words: [*]const u64 = @ptrCast(@alignCast(base));
+            if (words[0] != h) return false;
+            const vals: [*]const i64 = @ptrCast(@alignCast(base + @sizeOf(u64)));
+            for (key.vals, 0..) |v, j| if (vals[j] != v) return false;
+            return words[1 + key.vals.len] == key.mask;
         }
 
         fn push(self: *FixedStore, h: u64) !Rec {
@@ -2307,7 +2396,7 @@ pub const Aggregate = struct {
 
         const Found = struct { slot: u32, found: bool };
 
-        fn getOrPut(
+        inline fn getOrPut(
             self: *GroupTable,
             h: u64,
             key: anytype,
