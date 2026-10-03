@@ -1177,8 +1177,10 @@ columns it has not seen.
   fmt)` (`%Y %m %d %H %M %S %y %%`; month/year arithmetic clamps the
   day-of-month). `strptime` reads a timestamp out of text — `strptime(dt,
   '%d/%m/%Y')` — taking a number short of its width (`3/1/2026`) and pivoting
-  `%y` at 69; text that does not fit the format, or a day that does not exist,
-  fails the row, and `try_strptime` makes it null instead · json
+  `%y` at 69. Text that does not fit the format, or a day that does not exist,
+  is an error that stops the statement, as a failed `CAST` does — one bad date
+  in a file loads nothing; `try_strptime` makes it null instead and the load
+  goes on · json
   `json_get(doc, path) json_object(key, value, …) json_array(value, …)` ·
   encoding `to_base64(s) from_base64(s)` (to BYTES; `CAST(… AS STRING)` for
   text) `url_encode(s)
@@ -1190,7 +1192,7 @@ columns it has not seen.
   that is a JSON object or array — another `json_object`, or what `json_get`
   returned — goes in as that object or array, so
   `json_object('id', id, 'tags', json_array(a, b))` nests. A null key fails
-  the row.
+  the statement.
 - `JSON_GET(doc, path)` — one value out of a JSON document, as text: `path` is
   `a.b`, `a[0].b` or `a.0.b` (a leading `$.` is allowed). Strings come back
   unquoted, objects and arrays as JSON text; a missing key, an index past the

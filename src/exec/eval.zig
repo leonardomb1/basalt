@@ -2652,8 +2652,8 @@ const per_row = struct {
         return Value{ .string = try strftimeFmt(arena, us, try valueToString(arena, fv)) };
     }
 
-    /// `strptime` fails a row that does not fit the format; `try_strptime` makes it
-    /// null, for files where a bad date is data to keep, not a reason to stop.
+    /// `strptime` stops the statement at text that does not fit the format;
+    /// `try_strptime` makes it null, for files where a bad date is data to keep.
     fn strptime(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
