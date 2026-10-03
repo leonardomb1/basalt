@@ -173,6 +173,8 @@ pub const Client = struct {
     gpa: std.mem.Allocator,
     ssh: *ssh.Session,
     key: []const u8,
+    /// When it last went back to the pool, in ms.
+    idle_since: i64 = 0,
     next_id: u32 = 1,
     inbuf: std.array_list.Managed(u8),
     /// Bytes of `inbuf` already handed out by `reply`.
@@ -540,8 +542,18 @@ fn readAttrs(c: *ssh.Cursor) !Attrs {
 var pool_mtx: std.Thread.Mutex = .{};
 var pool: std.ArrayListUnmanaged(*Client) = .empty;
 
+/// A session is reused only for the same login and the same trust: a second
+/// connection to the server with another key or pin must not inherit a session
+/// the first one's checks let through.
 fn poolKey(buf: []u8, cfg: ssh.Config) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}@{s}:{d}", .{ cfg.user, cfg.host, cfg.port }) catch cfg.host;
+    var h = std.hash.Wyhash.init(0);
+    inline for (.{ "password", "key_file", "key_passphrase", "known_hosts", "host_key" }) |f| {
+        const v = @field(cfg, f) orelse "";
+        h.update(std.mem.asBytes(&v.len));
+        h.update(v);
+        h.update(&[_]u8{@intFromBool(@field(cfg, f) != null)});
+    }
+    return std.fmt.bufPrint(buf, "{s}@{s}:{d}#{x}", .{ cfg.user, cfg.host, cfg.port, h.final() }) catch cfg.host;
 }
 
 /// A session to the server `cfg` names, the caller's alone until `checkin`.
@@ -550,16 +562,33 @@ pub fn checkout(cfg: ssh.Config) !*Client {
     last_error_len = 0;
     var kb: [512]u8 = undefined;
     const key = poolKey(&kb, cfg);
-    {
-        pool_mtx.lock();
-        defer pool_mtx.unlock();
-        var i = pool.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (std.mem.eql(u8, pool.items[i].key, key)) return pool.swapRemove(i);
-        }
+    while (takePooled(key)) |c| {
+        if (alive(c)) return c;
+        c.destroy();
     }
     return Client.open(std.heap.page_allocator, cfg, key);
+}
+
+fn takePooled(key: []const u8) ?*Client {
+    pool_mtx.lock();
+    defer pool_mtx.unlock();
+    var i = pool.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (std.mem.eql(u8, pool.items[i].key, key)) return pool.swapRemove(i);
+    }
+    return null;
+}
+
+/// A session idle for a while may have been dropped by the server or a NAT on
+/// the way; one stat of the home directory tells before a load trips on it.
+fn alive(c: *Client) bool {
+    if (std.time.milliTimestamp() - c.idle_since < 15_000) return true;
+    const id = c.begin(fxp.stat) catch return false;
+    c.out.str(".") catch return false;
+    c.finish() catch return false;
+    const r = c.replyFor(id) catch return false;
+    return r[0] == fxp.attrs or r[0] == fxp.status;
 }
 
 /// Hand a session back for the next opener; a broken one is closed instead.
@@ -569,6 +598,7 @@ pub fn checkin(c: *Client, healthy: bool) void {
         return;
     }
     c.why.clearRetainingCapacity();
+    c.idle_since = std.time.milliTimestamp();
     pool_mtx.lock();
     defer pool_mtx.unlock();
     pool.append(std.heap.page_allocator, c) catch c.destroy();
@@ -716,6 +746,8 @@ pub const Upload = struct {
     interface: std.Io.Writer,
     last_status: ?anyerror = null,
     last_error: []const u8 = "",
+    err_buf: [256]u8 = undefined,
+    closed: bool = false,
     done: bool = false,
 
     pub fn open(arena: std.mem.Allocator, url: []const u8) !*Upload {
@@ -745,7 +777,7 @@ pub const Upload = struct {
         if (bytes.len == 0) return 0;
         self.client.writeRange(self.handle, self.at, bytes) catch |e| {
             self.last_status = e;
-            self.last_error = self.client.lastError();
+            self.keepError();
             return error.WriteFailed;
         };
         self.at += bytes.len;
@@ -762,31 +794,50 @@ pub const Upload = struct {
         return w.consume(total);
     }
 
-    /// Write what is buffered, close, and rename `path.part` to `path`.
+    /// Write what is buffered, close, and rename `path.part` to `path`. On any
+    /// failure the `.part` is removed, as by `abort`.
     pub fn finish(self: *Upload) !void {
-        defer self.release();
-        self.interface.flush() catch |e| return self.last_status orelse e;
-        try self.client.closeHandle(self.handle);
-        self.client.rename(self.part, self.path) catch |e| {
-            self.last_error = self.client.lastError();
+        if (self.done) return;
+        self.commit() catch |e| {
+            self.abort();
             return e;
         };
-        self.done = true;
+        self.release();
+    }
+
+    fn commit(self: *Upload) !void {
+        self.interface.flush() catch |e| return self.last_status orelse e;
+        self.client.closeHandle(self.handle) catch |e| return self.fail(e);
+        self.closed = true;
+        self.client.rename(self.part, self.path) catch |e| return self.fail(e);
+    }
+
+    fn fail(self: *Upload, e: anyerror) anyerror {
+        self.last_status = e;
+        self.keepError();
+        return e;
+    }
+
+    /// The client's reason, copied: its buffer is reused once the session goes back.
+    fn keepError(self: *Upload) void {
+        const why = self.client.lastError();
+        const n = @min(why.len, self.err_buf.len);
+        @memcpy(self.err_buf[0..n], why[0..n]);
+        self.last_error = self.err_buf[0..n];
     }
 
     /// Drop the upload: the `.part` is removed, `path` untouched.
     pub fn abort(self: *Upload) void {
         if (self.done) return;
-        self.client.closeHandle(self.handle) catch {};
+        if (!self.closed) self.client.closeHandle(self.handle) catch {};
         self.client.remove(self.part) catch {};
         self.release();
     }
 
     fn release(self: *Upload) void {
-        if (self.done) return;
         self.done = true;
         self.client.gpa.free(self.handle);
-        checkin(self.client, self.last_status == null);
+        checkin(self.client, if (self.last_status) |e| isProtocolOk(e) else true);
     }
 };
 
