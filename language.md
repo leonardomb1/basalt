@@ -1240,11 +1240,27 @@ columns it has not seen.
   element the body cannot compare stops it too, where `json_transform` would
   put null: a null mid-fold would quietly undo everything folded before it.
 
+- `CHARS(s)` is a string's characters as a JSON array, `JSON_RANGE([start,]
+  stop)` the integers `start` (default 0) up to but not including `stop`,
+  `JSON_LENGTH(arr)` an array's element count, `JSON_SLICE(arr, start[, stop])`
+  its elements from `start` to before `stop` (from 0; a negative bound counts
+  from the end, as in Python) and `JSON_CONCAT(a, b, …)` the arrays joined (null
+  when any is). Together with `json_reduce` they make a per-character algorithm
+  a function — a CNPJ check digit, letters included (the July 2026
+  alphanumeric CNPJ counts a character as its code point minus 48):
+
   ```sql
-  -- a weighted sum over digits, as a check digit needs
-  SELECT json_reduce(digits, 0, (acc, d, i) ->
-           acc + CAST(d AS INT) * CAST(json_get('[5,4,3,2,9,8,7,6,5,4,3,2]', CAST(i AS STRING)) AS INT)) AS s
-  FROM ...
+  CREATE FUNCTION cnpj_dv(base, weights) AS
+    LET s = json_reduce(chars(base), 0, (acc, c, i) ->
+              acc + (ascii(c) - 48) * CAST(json_get(weights, CAST(i AS STRING)) AS INT))
+    IN CASE WHEN s % 11 < 2 THEN 0 ELSE 11 - s % 11 END;
+
+  CREATE FUNCTION cnpj_valid(raw) AS
+    LET d = translate(upper(raw), './-', '')
+    IN length(d) = 14
+       AND cnpj_dv(left(d, 12), '[5,4,3,2,9,8,7,6,5,4,3,2]') = ascii(substr(d, 13, 1)) - 48
+       AND cnpj_dv(left(d, 13), '[6,5,4,3,2,9,8,7,6,5,4,3,2]') = ascii(substr(d, 14, 1)) - 48;
+  -- cnpj_valid('11.222.333/0001-81') and cnpj_valid('12.ABC.345/01DE-35') are true
   ```
 - `TRY_CAST(x AS T)` — CAST that yields null instead of failing on a bad
   value; the workhorse for dirty inputs. Never pushed down.

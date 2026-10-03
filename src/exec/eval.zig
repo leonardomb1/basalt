@@ -1537,6 +1537,17 @@ fn bindLambdaTo(arena: std.mem.Allocator, body: *const ast.Expr, name: []const u
     return Bind.recur(.{ .arena = arena, .name = name, .lit = lit }, body);
 }
 
+/// A JSON array argument's text, or null for a null cell. JSON that is not an
+/// array is an error, as it is to the array functions.
+fn jsonArrayArg(arena: std.mem.Allocator, e: *const ast.Expr, batch: Batch, row: usize) EvalError!?[]const u8 {
+    const v = try evalRow(arena, e, batch, row);
+    if (v.isNull()) return null;
+    const doc = try valueToString(arena, v);
+    try json.validate(arena, doc);
+    if (json.rootKind(doc) != .array) return error.InvalidJson;
+    return doc;
+}
+
 /// `l`'s body with each parameter bound to its node in `slots`, in order.
 fn bindParams(arena: std.mem.Allocator, l: ast.Expr.Lambda, slots: []const *ast.Expr) error{OutOfMemory}!*ast.Expr {
     var body = l.body;
@@ -1672,6 +1683,11 @@ pub const builtins = [_]Builtin{
     .{ .name = "json_any", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
     .{ .name = "json_all", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
     .{ .name = "json_reduce", .type_fn = typing.jsonReduce, .eval_fn = per_row.jsonReduce },
+    .{ .name = "chars", .type_fn = typing.chars, .eval_fn = per_row.chars },
+    .{ .name = "json_range", .type_fn = typing.jsonRange, .eval_fn = per_row.jsonRange },
+    .{ .name = "json_length", .type_fn = typing.jsonLength, .eval_fn = per_row.jsonLength },
+    .{ .name = "json_slice", .type_fn = typing.jsonSlice, .eval_fn = per_row.jsonSlice },
+    .{ .name = "json_concat", .type_fn = typing.jsonConcat, .eval_fn = per_row.jsonConcat },
     .{ .name = "json_object", .type_fn = typing.jsonBuild, .eval_fn = per_row.jsonObject },
     .{ .name = "json_array", .type_fn = typing.jsonBuild, .eval_fn = per_row.jsonArray },
     .{ .name = "to_base64", .type_fn = typing.unaryString, .eval_fn = per_row.toBase64 },
@@ -2015,6 +2031,39 @@ const typing = struct {
             acc = u;
         }
         return self.err("`json_reduce`: the accumulator's type keeps changing — give the initial value the type the lambda returns", .{});
+    }
+
+    fn chars(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 1) return self.err("`chars` takes one argument", .{});
+        const a = try self.wantText(c, 0);
+        return Type.init(.string).withNull(a.nullable);
+    }
+
+    fn jsonRange(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 1 and c.args.len != 2) return self.err("`json_range` takes (n) or (start, stop)", .{});
+        var nn = false;
+        for (0..c.args.len) |i| nn = nn or (try self.wantInt(c, i, if (i + 1 == c.args.len) "stop" else "start")).nullable;
+        return Type.init(.string).withNull(nn);
+    }
+
+    fn jsonLength(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 1) return self.err("`json_length` takes one argument", .{});
+        const a = try self.wantText(c, 0);
+        return Type.init(.int).withNull(a.nullable or a.unknown);
+    }
+
+    fn jsonSlice(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 2 and c.args.len != 3) return self.err("`json_slice` takes (json array, start[, stop])", .{});
+        var nn = (try self.wantText(c, 0)).nullable;
+        for (1..c.args.len) |i| nn = nn or (try self.wantInt(c, i, if (i == 1) "start" else "stop")).nullable;
+        return Type.init(.string).withNull(nn);
+    }
+
+    fn jsonConcat(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len < 2) return self.err("`json_concat` takes two or more JSON arrays", .{});
+        var nn = false;
+        for (0..c.args.len) |i| nn = nn or (try self.wantText(c, i)).nullable;
+        return Type.init(.string).withNull(nn);
     }
 
     fn jsonGet(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
@@ -2675,6 +2724,109 @@ const per_row = struct {
             acc = if (r.isNull() or ty.unknown) r else try castValueTyped(arena, r, ty);
         }
         return acc;
+    }
+
+    /// A string's characters as a JSON array of one-character strings — what
+    /// `json_reduce` and the other array functions walk.
+    fn chars(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return .null;
+        const str = try valueToString(arena, v);
+        var out = std.Io.Writer.Allocating.init(arena);
+        const w = &out.writer;
+        w.writeByte('[') catch return error.OutOfMemory;
+        var i: usize = 0;
+        while (i < str.len) {
+            const cw = charWidth(str, i);
+            if (i > 0) w.writeByte(',') catch return error.OutOfMemory;
+            std.json.Stringify.encodeJsonString(str[i..][0..cw], .{}, w) catch return error.OutOfMemory;
+            i += cw;
+            if (out.written().len > max_str_bytes) return failWith(error.CastFailed, "chars: the array passes {d} bytes", .{max_str_bytes});
+        }
+        w.writeByte(']') catch return error.OutOfMemory;
+        return .{ .string = out.written() };
+    }
+
+    /// `[start, …, stop - 1]`, `start` 0 when only `stop` is given: an index to
+    /// walk with the array functions. Empty when `stop` is not past `start`.
+    fn jsonRange(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        var bounds = [2]i64{ 0, 0 };
+        for (c.args, bounds[2 - c.args.len ..]) |e, *b| {
+            const v = try evalRow(arena, e, batch, row);
+            if (v.isNull()) return .null;
+            if (v != .int) return error.TypeMismatch;
+            b.* = v.int;
+        }
+        var out = std.Io.Writer.Allocating.init(arena);
+        const w = &out.writer;
+        w.writeByte('[') catch return error.OutOfMemory;
+        var k = bounds[0];
+        while (k < bounds[1]) : (k += 1) {
+            if (k > bounds[0]) w.writeByte(',') catch return error.OutOfMemory;
+            w.print("{d}", .{k}) catch return error.OutOfMemory;
+            if (out.written().len > max_str_bytes) return failWith(error.CastFailed, "json_range: the array passes {d} bytes", .{max_str_bytes});
+        }
+        w.writeByte(']') catch return error.OutOfMemory;
+        return .{ .string = out.written() };
+    }
+
+    fn jsonLength(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const doc = try jsonArrayArg(arena, c.args[0], batch, row) orelse return .null;
+        var items = json.Elements.root(doc);
+        var n: i64 = 0;
+        while (items.next()) |_| n += 1;
+        return .{ .int = n };
+    }
+
+    /// Elements `start` up to (not including) `stop`, from 0; a negative bound
+    /// counts from the end, as Python's slices do, and bounds past either end
+    /// are clamped.
+    fn jsonSlice(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const doc = try jsonArrayArg(arena, c.args[0], batch, row) orelse return .null;
+        var len: i64 = 0;
+        var count = json.Elements.root(doc);
+        while (count.next()) |_| len += 1;
+        var bounds = [2]i64{ 0, len };
+        for (c.args[1..], bounds[0 .. c.args.len - 1]) |e, *b| {
+            const v = try evalRow(arena, e, batch, row);
+            if (v.isNull()) return .null;
+            if (v != .int) return error.TypeMismatch;
+            b.* = std.math.clamp(if (v.int < 0) len + v.int else v.int, 0, len);
+        }
+        var out = std.Io.Writer.Allocating.init(arena);
+        const w = &out.writer;
+        w.writeByte('[') catch return error.OutOfMemory;
+        var items = json.Elements.root(doc);
+        var k: i64 = 0;
+        var n: usize = 0;
+        while (items.next()) |el| : (k += 1) {
+            if (k < bounds[0] or k >= bounds[1]) continue;
+            if (n > 0) w.writeByte(',') catch return error.OutOfMemory;
+            n += 1;
+            try json.compactInto(arena, el, w);
+        }
+        w.writeByte(']') catch return error.OutOfMemory;
+        return .{ .string = out.written() };
+    }
+
+    /// The arrays' elements, in order, as one array; null when any is null.
+    fn jsonConcat(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        var out = std.Io.Writer.Allocating.init(arena);
+        const w = &out.writer;
+        w.writeByte('[') catch return error.OutOfMemory;
+        var n: usize = 0;
+        for (c.args) |e| {
+            const doc = try jsonArrayArg(arena, e, batch, row) orelse return .null;
+            var items = json.Elements.root(doc);
+            while (items.next()) |el| {
+                if (n > 0) w.writeByte(',') catch return error.OutOfMemory;
+                n += 1;
+                try json.compactInto(arena, el, w);
+            }
+            if (out.written().len > max_str_bytes) return failWith(error.CastFailed, "json_concat: the array passes {d} bytes", .{max_str_bytes});
+        }
+        w.writeByte(']') catch return error.OutOfMemory;
+        return .{ .string = out.written() };
     }
 
     fn jsonGet(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
@@ -5099,6 +5251,32 @@ test "json_reduce: folds, typed accumulators, positions, shadowing" {
 
     // An inner lambda's `x` is its own, not the outer one's.
     try std.testing.expect((try evalLit(a, "json_any('[[1,2],[3]]', x -> json_reduce(x, 0, (acc, x) -> acc + x) = 3)")).bool);
+}
+
+test "array helpers: chars, json_range, json_length, json_slice, json_concat" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const str = struct {
+        fn f(al: std.mem.Allocator, src: []const u8) ![]const u8 {
+            return (try evalLit(al, src)).string;
+        }
+    }.f;
+
+    try std.testing.expectEqualStrings("[\"a\",\"ã\",\"\\\"\"]", try str(a, "chars('aã\"')"));
+    try std.testing.expectEqualStrings("[]", try str(a, "chars('')"));
+    try std.testing.expectEqualStrings("[0,1,2]", try str(a, "json_range(3)"));
+    try std.testing.expectEqualStrings("[2,3,4]", try str(a, "json_range(2, 5)"));
+    try std.testing.expectEqualStrings("[]", try str(a, "json_range(3, 1)"));
+    try std.testing.expectEqual(@as(i64, 3), (try evalLit(a, "json_length('[1, [2, 3], {}]')")).int);
+    try std.testing.expectError(error.InvalidJson, evalLit(a, "json_length('{}')"));
+    try std.testing.expectEqualStrings("[2,3]", try str(a, "json_slice('[1,2,3,4]', 1, 3)"));
+    try std.testing.expectEqualStrings("[3,4]", try str(a, "json_slice('[1,2,3,4]', -2)"));
+    try std.testing.expectEqualStrings("[]", try str(a, "json_slice('[1,2,3,4]', 9)"));
+    try std.testing.expectEqualStrings("[1,{\"k\":2},3]", try str(a, "json_concat('[1]', '[{\"k\": 2}, 3]')"));
+    try std.testing.expect((try evalLit(a, "json_concat('[1]', NULL)")) == .null);
+    // The CNPJ check digit, as language.md writes it.
+    try std.testing.expectEqual(@as(i64, 8), (try evalLit(a, "11 - json_reduce(chars('112223330001'), 0, (acc, c, i) -> acc + (ascii(c) - 48) * CAST(json_get('[5,4,3,2,9,8,7,6,5,4,3,2]', CAST(i AS STRING)) AS INT)) % 11")).int);
 }
 
 test "check-time errors: bad strftime directive, sub-day date_add on a date" {
