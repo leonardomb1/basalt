@@ -164,6 +164,30 @@ fn customFmt(code: []const u8) Fmt {
     return .number;
 }
 
+/// A cell's `t`: what its `<v>` holds.
+const CellType = enum {
+    number,
+    shared,
+    formula_text,
+    inline_text,
+    boolean,
+    err,
+    iso_date,
+
+    /// Parsed where the tag is read: the attribute's bytes live in the
+    /// tokenizer's buffer, which the next read may move.
+    fn of(t: ?[]const u8) CellType {
+        const v = t orelse return .number;
+        if (std.mem.eql(u8, v, "s")) return .shared;
+        if (std.mem.eql(u8, v, "str")) return .formula_text;
+        if (std.mem.eql(u8, v, "inlineStr")) return .inline_text;
+        if (std.mem.eql(u8, v, "b")) return .boolean;
+        if (std.mem.eql(u8, v, "e")) return .err;
+        if (std.mem.eql(u8, v, "d")) return .iso_date;
+        return .number;
+    }
+};
+
 /// One parsed cell.
 const Cell = struct {
     col: u32,
@@ -679,7 +703,7 @@ fn nextRow(tk: *xml.Tokenizer, out: *std.array_list.Managed(Cell), scratch: std.
                 started = true;
                 col = at;
                 var cell = Cell{ .col = at, .kind = .empty };
-                const ty = c.attr("t") orelse "n";
+                const ty = CellType.of(c.attr("t"));
                 if (c.attr("s")) |sv| {
                     const si = std.fmt.parseInt(usize, sv, 10) catch 0;
                     if (si < rd.styles.len) cell.fmt = rd.styles[si];
@@ -703,31 +727,36 @@ fn nextRow(tk: *xml.Tokenizer, out: *std.array_list.Managed(Cell), scratch: std.
 
 /// The body of a `<c>`: its `<v>` or `<is>`, read as its `t` says. A formula
 /// (`<f>`) is skipped — its cached `<v>` is the value.
-fn readCell(tk: *xml.Tokenizer, cell: *Cell, ty: []const u8, scratch: std.mem.Allocator, rd: *const Reader) !void {
+fn readCell(tk: *xml.Tokenizer, cell: *Cell, ty: CellType, scratch: std.mem.Allocator, rd: *const Reader) !void {
     while (try tk.next()) |t| switch (t) {
         .open => |o| {
             if (std.mem.eql(u8, o.name, "v")) {
+                // entities decoded; the OOXML escapes are for text only
                 const v = try collectText(tk, o, scratch, false);
-                if (std.mem.eql(u8, ty, "s")) {
-                    const i = std.fmt.parseInt(usize, std.mem.trim(u8, v, " "), 10) catch return error.BadXml;
-                    if (i >= rd.strings.len) return error.BadXml;
-                    cell.* = .{ .col = cell.col, .kind = .text, .text = rd.strings[i] };
-                } else if (std.mem.eql(u8, ty, "str") or std.mem.eql(u8, ty, "inlineStr")) {
-                    cell.* = .{ .col = cell.col, .kind = .text, .text = try decodeOoxml(scratch, v) };
-                } else if (std.mem.eql(u8, ty, "b")) {
-                    cell.* = .{ .col = cell.col, .kind = .boolean, .num = if (std.mem.eql(u8, std.mem.trim(u8, v, " "), "1")) 1 else 0 };
-                } else if (std.mem.eql(u8, ty, "e")) {
-                    cell.kind = .err;
-                } else if (std.mem.eql(u8, ty, "d")) {
+                switch (ty) {
+                    .shared => {
+                        const i = std.fmt.parseInt(usize, std.mem.trim(u8, v, " "), 10) catch return error.BadXml;
+                        if (i >= rd.strings.len) return error.BadXml;
+                        cell.* = .{ .col = cell.col, .kind = .text, .text = rd.strings[i] };
+                    },
+                    .formula_text, .inline_text => {
+                        var out = std.array_list.Managed(u8).init(scratch);
+                        try out.appendSlice(v);
+                        xml.unescapeOoxml(&out, 0);
+                        cell.* = .{ .col = cell.col, .kind = .text, .text = out.items };
+                    },
+                    .boolean => cell.* = .{ .col = cell.col, .kind = .boolean, .num = if (std.mem.eql(u8, std.mem.trim(u8, v, " "), "1")) 1 else 0 },
+                    .err => cell.kind = .err,
                     // an ISO 8601 date, as strict OOXML writes it: kept as text
-                    cell.* = .{ .col = cell.col, .kind = .text, .text = try scratch.dupe(u8, v) };
-                } else {
-                    const digits = std.mem.trim(u8, v, " \t\r\n");
-                    if (digits.len == 0) continue;
-                    const num = std.fmt.parseFloat(f64, digits) catch return error.BadXml;
-                    cell.kind = .number;
-                    cell.num = num;
-                    cell.text = try scratch.dupe(u8, digits);
+                    .iso_date => cell.* = .{ .col = cell.col, .kind = .text, .text = v },
+                    .number => {
+                        const digits = std.mem.trim(u8, v, " \t\r\n");
+                        if (digits.len == 0) continue;
+                        const num = std.fmt.parseFloat(f64, digits) catch return error.BadXml;
+                        cell.kind = .number;
+                        cell.num = num;
+                        cell.text = digits;
+                    },
                 }
             } else if (std.mem.eql(u8, o.name, "is")) {
                 cell.* = .{ .col = cell.col, .kind = .text, .text = try collectText(tk, o, scratch, true) };
@@ -737,12 +766,6 @@ fn readCell(tk: *xml.Tokenizer, cell: *Cell, ty: []const u8, scratch: std.mem.Al
         else => {},
     };
     return error.BadXml;
-}
-
-fn decodeOoxml(arena: std.mem.Allocator, raw: []const u8) ![]const u8 {
-    var out = std.array_list.Managed(u8).init(arena);
-    try xml.decodeInto(&out, raw, true);
-    return out.items;
 }
 
 /// The text inside `open` up to its close, decoded. With `runs`, only `<t>`
@@ -953,13 +976,14 @@ test "edge workbook: prefixes, rows and cells without r, escapes, 1904 dates, a 
     // header: a number, an empty cell (named by its letter), a duplicate; a column
     // past the header; rich text without its phonetic hint; `_x000D_` a carriage
     // return and `_x005F_` an escaped underscore; #N/A null; a number past 2^53 kept
-    // as written beside a boolean; the left-out row 4 empty; a styled empty tail gone
+    // as written beside a boolean; a formula's text decoded once (`&amp;lt;` is
+    // `&lt;`); the left-out row 4 empty; a styled empty tail gone
     try std.testing.expectEqualStrings(
-        "nome:string,2026:date,C:string,total:string,total_2:string,F:float\n" ++
-            "rich|1904-01-01|∅|9007199254740993|merged|∅\n" ++
-            "line\rtwo|2027-01-02|in_x0041_line|1|∅|0.1\n" ++
-            "∅|∅|∅|∅|∅|∅\n" ++
-            "nome!|∅|∅|true|∅|∅\n",
+        "nome:string,2026:date,C:string,total:string,total_2:string,F:float,G:string\n" ++
+            "rich|1904-01-01|∅|9007199254740993|merged|∅|∅\n" ++
+            "line\rtwo|2027-01-02|in_x0041_line|1|∅|0.1|Silva & Filhos\r&lt;\n" ++
+            "∅|∅|∅|∅|∅|∅|∅\n" ++
+            "nome!|∅|∅|true|∅|∅|∅\n",
         got,
     );
 }

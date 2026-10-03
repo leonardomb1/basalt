@@ -106,9 +106,11 @@ pub const Tokenizer = struct {
             if (have[0] != '<') {
                 const lt = std.mem.indexOfScalar(u8, have, '<') orelse {
                     if (try self.fill()) continue;
-                    // trailing text after the root element
+                    // trailing text after the root element — taken after `fill`,
+                    // which may have moved what `have` pointed at
+                    const rest = self.buf.items[self.lo..];
                     self.lo = self.buf.items.len;
-                    return .{ .text = have };
+                    return .{ .text = rest };
                 };
                 self.lo += lt;
                 return .{ .text = have[0..lt] };
@@ -240,8 +242,13 @@ pub fn decodeInto(out: *std.array_list.Managed(u8), raw: []const u8, ooxml: bool
             try out.append('\'');
         } else return error.BadXml;
     }
-    if (!ooxml or std.mem.indexOf(u8, out.items[start..], "_x") == null) return;
-    // `_xHHHH_` over what was just decoded, in place
+    if (ooxml) unescapeOoxml(out, start);
+}
+
+/// OOXML's `_xHHHH_` escapes over `out[start..]`, in place: for text whose XML
+/// entities are already decoded.
+pub fn unescapeOoxml(out: *std.array_list.Managed(u8), start: usize) void {
+    if (std.mem.indexOf(u8, out.items[start..], "_x") == null) return;
     const s = out.items[start..];
     var w: usize = 0;
     var j: usize = 0;
