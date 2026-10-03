@@ -1151,15 +1151,26 @@ columns it has not seen.
   math `abs() floor() ceil() round(x[,n]) mod() power() sqrt() sign()` (round
   is half-away-from-zero, deliberately engine-side) · nulls `nullif()
   greatest() least()` (null args ignored, Postgres-style) · strings `lpad()
-  rpad() left() right() split_part() strpos() repeat() reverse()` — these,
+  rpad() left() right() split_part() strpos() repeat() reverse() translate(s,
+  from, to) initcap() unaccent() ascii() chr()` — these,
   `length()`, `substr()`, `upper()`/`lower()` and `LIKE`'s `_` count
   characters, as Postgres and DuckDB do; `strlen()` counts bytes. A byte that is
   not UTF-8 counts as one character, so mis-encoded text never fails a load.
   `upper`/`lower` map Latin, Greek and Cyrillic, one character to one (`ß`
-  stays) · dates
+  stays). `translate` maps each character of `from` to the one at the same place
+  in `to`, deleting it when `to` is shorter (`translate(cnpj, './-', '')` keeps
+  the digits); `initcap` capitalizes each run of letters and digits;
+  `unaccent` (also `strip_accents`) drops the accents of Latin letters (`São` →
+  `Sao`, `Æ` → `AE`, `ß` → `ss`); `ascii` is the first character's code point
+  and `chr` its inverse · dates
   `date_add(unit, n, ts) date_diff(unit, a, b) make_date() epoch()
-  to_timestamp() strftime(ts, fmt)` (`%Y %m %d %H %M %S %y %%`; month/year
-  arithmetic clamps the day-of-month) · json `json_get(doc, path)`.
+  to_timestamp() strftime(ts, fmt) strptime(text, fmt) try_strptime(text,
+  fmt)` (`%Y %m %d %H %M %S %y %%`; month/year arithmetic clamps the
+  day-of-month). `strptime` reads a timestamp out of text — `strptime(dt,
+  '%d/%m/%Y')` — taking a number short of its width (`3/1/2026`) and pivoting
+  `%y` at 69; text that does not fit the format, or a day that does not exist,
+  fails the row, and `try_strptime` makes it null instead · json
+  `json_get(doc, path)`.
 - `JSON_GET(doc, path)` — one value out of a JSON document, as text: `path` is
   `a.b`, `a[0].b` or `a.0.b` (a leading `$.` is allowed). Strings come back
   unquoted, objects and arrays as JSON text; a missing key, an index past the

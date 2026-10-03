@@ -1595,6 +1595,14 @@ pub const builtins = [_]Builtin{
     .{ .name = "epoch", .type_fn = typing.epoch, .eval_fn = per_row.epoch },
     .{ .name = "to_timestamp", .type_fn = typing.toTimestamp, .eval_fn = per_row.toTimestamp },
     .{ .name = "strftime", .type_fn = typing.strftime, .eval_fn = per_row.strftime },
+    .{ .name = "strptime", .type_fn = typing.strptime, .eval_fn = per_row.strptime },
+    .{ .name = "try_strptime", .type_fn = typing.strptime, .eval_fn = per_row.strptime },
+    .{ .name = "unaccent", .type_fn = typing.unaryString, .eval_fn = per_row.unaccent },
+    .{ .name = "strip_accents", .type_fn = typing.unaryString, .eval_fn = per_row.unaccent },
+    .{ .name = "translate", .type_fn = typing.translate, .eval_fn = per_row.translate },
+    .{ .name = "initcap", .type_fn = typing.unaryString, .eval_fn = per_row.initcap },
+    .{ .name = "ascii", .type_fn = typing.strlen, .eval_fn = per_row.ascii },
+    .{ .name = "chr", .type_fn = typing.chr, .eval_fn = per_row.chr },
     .{ .name = "json_get", .type_fn = typing.jsonGet, .eval_fn = per_row.jsonGet },
     .{ .name = "json_filter", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
     .{ .name = "json_transform", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
@@ -1950,6 +1958,30 @@ const typing = struct {
                 return self.err("`strftime` does not support `%{s}` (supported: %Y %m %d %H %M %S %y %%)", .{bad});
         }
         return Type.init(.string).withNull(a.nullable or f.nullable);
+    }
+
+    fn strptime(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 2) return self.err("`{s}` takes (text, format)", .{c.name});
+        const a = try self.wantText(c, 0);
+        const f = try self.wantText(c, 1);
+        if (c.args[1].* == .str_lit) {
+            if (badStrftime(c.args[1].str_lit)) |bad|
+                return self.err("`{s}` does not support `%{s}` (supported: %Y %m %d %H %M %S %y %%)", .{ c.name, bad });
+        }
+        return Type.init(.timestamp).withNull(eq(c.name, "try_strptime") or a.nullable or f.nullable);
+    }
+
+    fn translate(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 3) return self.err("`translate` takes (string, from, to)", .{});
+        var nn = false;
+        for (0..3) |i| nn = nn or (try self.wantText(c, i)).nullable;
+        return Type.init(.string).withNull(nn);
+    }
+
+    fn chr(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        const a = try self.argType(c, 0);
+        if (c.args.len != 1 or !intish(a)) return self.err("`chr` takes one INT argument", .{});
+        return Type.init(.string).withNull(a.nullable);
     }
 };
 
@@ -2415,6 +2447,118 @@ const per_row = struct {
         if (fv.isNull()) return .null;
         const us = temporalMicros(v) orelse return error.TypeMismatch;
         return Value{ .string = try strftimeFmt(arena, us, try valueToString(arena, fv)) };
+    }
+
+    /// `strptime` fails a row that does not fit the format; `try_strptime` makes it
+    /// null, for files where a bad date is data to keep, not a reason to stop.
+    fn strptime(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return .null;
+        const fv = try evalRow(arena, c.args[1], batch, row);
+        if (fv.isNull()) return .null;
+        const us = strptimeFmt(try valueToString(arena, v), try valueToString(arena, fv)) orelse
+            return if (eq(c.name, "try_strptime")) .null else error.CastFailed;
+        return .{ .timestamp = us };
+    }
+
+    fn unaccent(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return .null;
+        const str = try valueToString(arena, v);
+        if (isAscii(str)) return .{ .string = str };
+        var out = try std.array_list.Managed(u8).initCapacity(arena, str.len);
+        var i: usize = 0;
+        while (i < str.len) {
+            const w = charWidth(str, i);
+            const base = if (w == 1) null else unaccentCp(std.unicode.utf8Decode(str[i..][0..w]) catch unreachable);
+            try out.appendSlice(base orelse str[i..][0..w]);
+            i += w;
+        }
+        return .{ .string = out.items };
+    }
+
+    /// Postgres' `translate`: each character of `from` becomes the character at the
+    /// same place in `to`, or is deleted when `to` is shorter. Characters, not
+    /// bytes, so `translate(s, 'ãç', 'ac')` works on UTF-8.
+    fn translate(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        var args: [3][]const u8 = undefined;
+        for (&args, c.args) |*o, e| {
+            const v = try evalRow(arena, e, batch, row);
+            if (v.isNull()) return .null;
+            o.* = try valueToString(arena, v);
+        }
+        const str, const from, const to = args;
+        var out = try std.array_list.Managed(u8).initCapacity(arena, str.len);
+        var i: usize = 0;
+        while (i < str.len) {
+            const w = charWidth(str, i);
+            const ch = str[i..][0..w];
+            i += w;
+            var at: usize = 0;
+            var k: usize = 0;
+            const hit = while (k < from.len) {
+                const fw = charWidth(from, k);
+                if (std.mem.eql(u8, from[k..][0..fw], ch)) break at;
+                k += fw;
+                at += 1;
+            } else null;
+            const idx = hit orelse {
+                try out.appendSlice(ch);
+                continue;
+            };
+            const off = charOffset(to, idx);
+            if (off < to.len) try out.appendSlice(to[off..][0..charWidth(to, off)]);
+        }
+        return .{ .string = out.items };
+    }
+
+    /// Postgres' `initcap`: the first letter or digit of each run of them upper,
+    /// the rest lower.
+    fn initcap(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return .null;
+        const str = try valueToString(arena, v);
+        var out = try std.array_list.Managed(u8).initCapacity(arena, str.len);
+        var in_word = false;
+        var i: usize = 0;
+        while (i < str.len) {
+            const w = charWidth(str, i);
+            const ch = str[i..][0..w];
+            i += w;
+            const cp: u21 = if (w == 1) ch[0] else std.unicode.utf8Decode(ch) catch unreachable;
+            const word = isWordChar(cp, w);
+            if (!word) {
+                try out.appendSlice(ch);
+            } else {
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(caseMap(cp, !in_word), &buf) catch unreachable;
+                try out.appendSlice(buf[0..n]);
+            }
+            in_word = word;
+        }
+        return .{ .string = out.items };
+    }
+
+    /// The first character's code point, as Postgres answers on UTF-8; 0 for an
+    /// empty string, and a byte that is not UTF-8 is its own value.
+    fn ascii(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return .null;
+        const str = try valueToString(arena, v);
+        if (str.len == 0) return .{ .int = 0 };
+        const w = charWidth(str, 0);
+        return .{ .int = if (w == 1) str[0] else std.unicode.utf8Decode(str[0..w]) catch unreachable };
+    }
+
+    fn chr(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v.isNull()) return .null;
+        if (v != .int) return error.TypeMismatch;
+        const cp = std.math.cast(u21, v.int) orelse return error.CastFailed;
+        var buf: [4]u8 = undefined;
+        if (cp == 0) return error.CastFailed;
+        const n = std.unicode.utf8Encode(cp, &buf) catch return error.CastFailed;
+        return .{ .string = try arena.dupe(u8, buf[0..n]) };
     }
 };
 
@@ -3180,6 +3324,50 @@ fn strftimeFmt(arena: std.mem.Allocator, us: i64, fmt: []const u8) EvalError![]c
     return try out.toOwnedSlice();
 }
 
+/// `strptime` over the directives `strftime` writes. A number takes up to its
+/// width in digits (so `3/1/2026` reads under `%d/%m/%Y`), `%y` pivots as POSIX
+/// does (69–99 the 1900s, 00–68 the 2000s), other characters match themselves,
+/// and the whole text must be consumed. Null when the text does not fit, or
+/// names a date that does not exist (`31/02/2026`).
+fn strptimeFmt(text: []const u8, fmt: []const u8) ?i64 {
+    var y: i64 = 1970;
+    var mo: u32 = 1;
+    var d: u32 = 1;
+    var h: i64 = 0;
+    var mi: i64 = 0;
+    var sec: i64 = 0;
+    var t: usize = 0;
+    var i: usize = 0;
+    while (i < fmt.len) : (i += 1) {
+        if (fmt[i] != '%' or (i + 1 < fmt.len and fmt[i + 1] == '%')) {
+            if (fmt[i] == '%') i += 1;
+            if (t >= text.len or text[t] != fmt[i]) return null;
+            t += 1;
+            continue;
+        }
+        i += 1;
+        if (i >= fmt.len) return null;
+        const width: usize = if (fmt[i] == 'Y') 4 else 2;
+        const start = t;
+        var n: i64 = 0;
+        while (t < text.len and t - start < width and std.ascii.isDigit(text[t])) : (t += 1) n = n * 10 + (text[t] - '0');
+        if (t == start) return null;
+        switch (fmt[i]) {
+            'Y' => y = n,
+            'y' => y = if (n >= 69) 1900 + n else 2000 + n,
+            'm' => mo = std.math.cast(u32, n) orelse return null,
+            'd' => d = std.math.cast(u32, n) orelse return null,
+            'H' => h = n,
+            'M' => mi = n,
+            'S' => sec = n,
+            else => return null,
+        }
+    }
+    if (t != text.len) return null;
+    if (mo < 1 or mo > 12 or d < 1 or d > daysInMonth(y, mo) or h > 23 or mi > 59 or sec > 59) return null;
+    return (daysFromCivil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec) * 1_000_000;
+}
+
 /// Day count since the 1970 epoch for a civil date: the inverse of
 /// `civilFromDays` (Howard Hinnant's algorithm).
 pub fn daysFromCivil(y0: i64, m: u32, d: u32) i64 {
@@ -3655,6 +3843,46 @@ fn latinExtA(cp: u21, up: bool) u21 {
     if (up and !is_upper) return if (odd_upper) cp - 1 else cp - 1;
     if (!up and is_upper) return cp + 1;
     return cp;
+}
+
+/// Latin-1 and Latin Extended-A letters with their accents dropped, one byte a code
+/// point from U+00C0: `*` is a ligature or a letter spelled with two (`unaccentCp`),
+/// `-` is not a letter (× ÷) and stays.
+const unaccent_base = "AAAAAA*CEEEEIIIIDNOOOOO-OUUUUY**" ++ "aaaaaa*ceeeeiiiidnooooo-ouuuuy*y" ++
+    "AaAaAaCcCcCcCcDdDdEeEeEeEeEeGgGgGgGgHhHhIiIiIiIiIi**JjKkkLlLlLlLlLlNnNnNnnNnOoOoOo**RrRrRrSsSsSsSsTtTtTtUuUuUuUuUuUuWwYyYZzZzZzs";
+
+comptime {
+    std.debug.assert(unaccent_base.len == 0x180 - 0xC0);
+}
+
+/// What `unaccent` writes for code point `cp`, or null to keep it. A combining
+/// accent (U+0300–U+036F, from decomposed text) is dropped.
+fn unaccentCp(cp: u21) ?[]const u8 {
+    if (cp >= 0x300 and cp <= 0x36F) return "";
+    if (cp < 0xC0 or cp >= 0x180) return null;
+    const b = unaccent_base[cp - 0xC0];
+    if (b == '-') return null;
+    if (b != '*') return unaccent_base[cp - 0xC0 ..][0..1];
+    return switch (cp) {
+        0xC6 => "AE",
+        0xE6 => "ae",
+        0xDE => "TH",
+        0xFE => "th",
+        0xDF => "ss",
+        0x132 => "IJ",
+        0x133 => "ij",
+        0x152 => "OE",
+        0x153 => "oe",
+        else => unreachable,
+    };
+}
+
+/// A letter or digit, for `initcap`: ASCII alphanumerics, and above ASCII any
+/// code point the case mapping knows. A byte that is not UTF-8 is not one.
+fn isWordChar(cp: u21, w: usize) bool {
+    if (cp < 0x80) return std.ascii.isAlphanumeric(@intCast(cp));
+    if (w == 1) return false;
+    return cp == 0xDF or caseMap(cp, true) != cp or caseMap(cp, false) != cp;
 }
 
 /// `upper`/`lower` over a string. ASCII maps in place; otherwise each character
@@ -4332,6 +4560,61 @@ test "date builtins: month clamp, boundary diffs, epoch round trip, strftime pad
 
     try std.testing.expectEqualStrings("1970-01-01 00:00:00", (try evalLit(a, "strftime(to_timestamp(0), '%Y-%m-%d %H:%M:%S')")).string);
     try std.testing.expectEqualStrings("70 01:01:01 %", (try evalLit(a, "strftime(to_timestamp(3661), '%y %H:%M:%S %%')")).string);
+}
+
+test "strptime: widths, %y pivot, impossible days, try_ form" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const ts = struct {
+        fn f(al: std.mem.Allocator, src: []const u8) ![]const u8 {
+            return formatTimestamp(al, (try evalLit(al, src)).timestamp);
+        }
+    }.f;
+
+    try std.testing.expectEqualStrings("2026-10-03 00:00:00", try ts(a, "strptime('03/10/2026', '%d/%m/%Y')"));
+    try std.testing.expectEqualStrings("2026-01-03 00:00:00", try ts(a, "strptime('3/1/2026', '%d/%m/%Y')"));
+    try std.testing.expectEqualStrings("2024-02-29 13:05:09", try ts(a, "strptime('2024-02-29 13:05:09', '%Y-%m-%d %H:%M:%S')"));
+    try std.testing.expectEqualStrings("1969-10-03 00:00:00", try ts(a, "strptime('03/10/69', '%d/%m/%y')"));
+    try std.testing.expectEqualStrings("2068-10-03 00:00:00", try ts(a, "strptime('03/10/68', '%d/%m/%y')"));
+    try std.testing.expectEqualStrings("2026-10-03 00:00:00", try ts(a, "strptime('100% 03/10/2026', '100%% %d/%m/%Y')"));
+
+    try std.testing.expectError(error.CastFailed, evalLit(a, "strptime('31/02/2026', '%d/%m/%Y')"));
+    try std.testing.expectError(error.CastFailed, evalLit(a, "strptime('03/10/2026 x', '%d/%m/%Y')"));
+    try std.testing.expectError(error.CastFailed, evalLit(a, "strptime('2026-10-03', '%d/%m/%Y')"));
+    try std.testing.expectError(error.CastFailed, evalLit(a, "strptime('03/10/2026 24:00:00', '%d/%m/%Y %H:%M:%S')"));
+    try std.testing.expect((try evalLit(a, "try_strptime('31/02/2026', '%d/%m/%Y')")) == .null);
+    try std.testing.expect((try evalLit(a, "try_strptime('', '%d/%m/%Y')")) == .null);
+}
+
+test "text cleanup: translate, initcap, unaccent, ascii, chr" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const str = struct {
+        fn f(al: std.mem.Allocator, src: []const u8) ![]const u8 {
+            return (try evalLit(al, src)).string;
+        }
+    }.f;
+
+    try std.testing.expectEqualStrings("12345678000190", try str(a, "translate('12.345.678/0001-90', './-', '')"));
+    try std.testing.expectEqualStrings("xc", try str(a, "translate('abc', 'ab', 'x')"));
+    try std.testing.expectEqualStrings("acao", try str(a, "translate('ação', 'ãç', 'ac')"));
+
+    try std.testing.expectEqualStrings("Hello World-Foo Bar_Baz 2nd", try str(a, "initcap('hello wORLD-foo bar_baz 2ND')"));
+    try std.testing.expectEqualStrings("São Paulo Élan", try str(a, "initcap('SÃO PAULO élan')"));
+
+    try std.testing.expectEqualStrings("Sao Paulo Acao U n", try str(a, "unaccent('São Paulo Ação Ü ñ')"));
+    try std.testing.expectEqualStrings("AEther strasse Lodz OEuvre ×", try str(a, "strip_accents('Æther straße Łódź Œuvre ×')"));
+    // A combining accent (decomposed text) is dropped; a non-UTF-8 byte stays.
+    try std.testing.expectEqualStrings("Sao", try str(a, "unaccent('Sa\u{0303}o')"));
+
+    try std.testing.expectEqual(@as(i64, 65), (try evalLit(a, "ascii('ABC')")).int);
+    try std.testing.expectEqual(@as(i64, 0xE3), (try evalLit(a, "ascii('ã')")).int);
+    try std.testing.expectEqual(@as(i64, 0), (try evalLit(a, "ascii('')")).int);
+    try std.testing.expectEqualStrings("ã", try str(a, "chr(227)"));
+    try std.testing.expectError(error.CastFailed, evalLit(a, "chr(0)"));
+    try std.testing.expectError(error.CastFailed, evalLit(a, "chr(1114112)"));
 }
 
 test "check-time errors: bad strftime directive, sub-day date_add on a date" {
