@@ -21,9 +21,10 @@ RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${Z
 WORKDIR /src
 COPY build.zig build.zig.zon ./
 COPY src ./src
-# Static musl link so the binary runs in a scratch/distroless image; -Dstrip drops
-# debug info for a smaller release binary.
-RUN zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dstrip=true
+# Static musl link so the binary runs in a scratch/distroless image; AVX2 and
+# AES-NI (x86-64-v3, Haswell/Zen on), as a cross target defaults to 2003's SSE2;
+# -Dstrip drops debug info for a smaller release binary.
+RUN zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dcpu=x86_64_v3+aes+pclmul -Dstrip=true
 
 # --- runtime: just the binary (ca-certs, nonroot, no shell) ---------------
 FROM gcr.io/distroless/static-debian12:nonroot

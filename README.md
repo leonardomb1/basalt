@@ -42,11 +42,14 @@ chmod +x basalt && ./basalt help
 From source, with Zig 0.15.2:
 
 ```console
-zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dstrip=true
+zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dcpu=x86_64_v3+aes+pclmul -Dstrip=true
 ./zig-out/bin/basalt help
 ```
 
-`-Dstrip` drops debug info for a smaller binary.
+`-Dstrip` drops debug info for a smaller binary. `-Dcpu=x86_64_v3+aes+pclmul`
+builds for AVX2 and AES-NI — any x86-64 CPU since Intel Haswell (2013) or AMD
+Zen; drop it for an older machine, or a plain `zig build` targets the CPU it
+runs on.
 
 ## What it talks to
 

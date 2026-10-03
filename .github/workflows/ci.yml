@@ -71,7 +71,7 @@ jobs:
       # The exact bytes tested here are what `image` ships and `release` attaches.
       - name: Release cross-build
         run: |
-          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dstrip=true
+          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dcpu=x86_64_v3+aes+pclmul -Dstrip=true
           cp zig-out/bin/basalt basalt-x86_64-linux
           sha256sum basalt-x86_64-linux > basalt-x86_64-linux.sha256
 
