@@ -40,6 +40,8 @@ pub const Error = error{
     SshHostKeyUnknown,
     SshHostKeyChanged,
     SshHostKeyRevoked,
+    /// A bare fingerprint pin did not match this key; another of the server's may.
+    SshHostKeyRetry,
     SshBadHostSignature,
     SshAuthFailed,
     SshKeyUnsupported,
@@ -368,6 +370,14 @@ pub const Session = struct {
     /// pin) has a key of for this server first, as OpenSSH does — else a server
     /// with an ECDSA key on file would be asked for its Ed25519 one, and refused.
     hk_order: [host_key_algs.len][]const u8 = host_key_algs,
+    hk_n: usize = host_key_algs.len,
+    /// The methods the server's last USERAUTH_FAILURE listed.
+    auth_methods: [128]u8 = undefined,
+    auth_methods_len: usize = 0,
+    /// Across the connects one bare `SHA256:` pin may take: the key types tried.
+    pin_try: ?*PinTry = null,
+    /// The server offers a host key type not yet tried against the pin.
+    hk_more: bool = false,
     tx: Dir = .{},
     rx: Dir = .{},
     /// The last payload read; valid until the next read.
@@ -392,7 +402,18 @@ pub const Session = struct {
     /// OpenSSH's own channel packet size.
     const local_max_packet: u32 = 32 * 1024;
 
+    /// A bare fingerprint names no key type, and a server has several keys: one
+    /// that does not match is followed by a connect asking for the next type, so
+    /// any of the fingerprints `ssh-keyscan` prints pins the server.
     pub fn connect(gpa: std.mem.Allocator, cfg: Config) !*Session {
+        var pt = PinTry{};
+        while (true) return connectOnce(gpa, cfg, &pt) catch |e| {
+            if (e == error.SshHostKeyRetry) continue;
+            return e;
+        };
+    }
+
+    fn connectOnce(gpa: std.mem.Allocator, cfg: Config, pt: *PinTry) !*Session {
         const self = try gpa.create(Session);
         errdefer gpa.destroy(self);
         const stream = std.net.tcpConnectToHost(gpa, cfg.host, cfg.port) catch |e| return e;
@@ -406,6 +427,7 @@ pub const Session = struct {
             .out = .init(gpa),
             .why = .init(gpa),
             .held = .init(gpa),
+            .pin_try = pt,
         };
         self.sr = stream.reader(&self.rbuf);
         self.sw = stream.writer(&self.wbuf);
@@ -630,7 +652,7 @@ pub const Session = struct {
         try out.str("curve25519-sha256,curve25519-sha256@libssh.org,ext-info-c,kex-strict-c-v00@openssh.com");
         var hks: [128]u8 = undefined;
         var hw = std.Io.Writer.fixed(&hks);
-        for (self.hk_order, 0..) |a, i| hw.print("{s}{s}", .{ if (i > 0) "," else "", a }) catch unreachable;
+        for (self.hk_order[0..self.hk_n], 0..) |a, i| hw.print("{s}{s}", .{ if (i > 0) "," else "", a }) catch unreachable;
         try out.str(hw.buffered());
         var ciphers: [256]u8 = undefined;
         var cw = std.Io.Writer.fixed(&ciphers);
@@ -687,8 +709,11 @@ pub const Session = struct {
         }
         _ = pick(&.{ "curve25519-sha256", "curve25519-sha256@libssh.org" }, kex_algs) orelse
             return self.fail(error.SshNoCommonAlgorithm, "the server offers no curve25519 key exchange (it offers {s})", .{kex_algs});
-        const hk_alg = pick(&self.hk_order, hostkey_offer) orelse
+        const hk_alg = pick(self.hk_order[0..self.hk_n], hostkey_offer) orelse
             return self.fail(error.SshNoCommonAlgorithm, "no host key algorithm in common (the server offers {s})", .{hostkey_offer});
+        for (self.hk_order[0..self.hk_n]) |a| {
+            if (!std.mem.eql(u8, keyTypeOfAlg(a), keyTypeOfAlg(hk_alg)) and listHas(hostkey_offer, a)) self.hk_more = true;
+        }
         if (!listHas(comp_cs, "none") or !listHas(comp_sc, "none")) return self.fail(error.SshNoCommonAlgorithm, "the server requires compression", .{});
         var next_tx = Dir{};
         var next_rx = Dir{};
@@ -873,10 +898,12 @@ pub const Session = struct {
         var n: usize = 0;
         for ([_]bool{ true, false }) |want| {
             for (host_key_algs, known) |a, k| if (k == want) {
+                if (self.pin_try) |pt| if (pt.tried(a)) continue;
                 self.hk_order[n] = a;
                 n += 1;
             };
         }
+        self.hk_n = n;
     }
 
     fn checkHostKey(self: *Session, blob: []const u8, alg: []const u8) !void {
@@ -888,6 +915,11 @@ pub const Session = struct {
             const p = std.mem.trim(u8, pin, " \t");
             if (std.mem.startsWith(u8, p, "SHA256:")) {
                 if (std.mem.eql(u8, p, fp)) return;
+                if (self.pin_try) |pt| {
+                    pt.note(key_type, fp);
+                    if (self.hk_more) return error.SshHostKeyRetry;
+                    if (pt.n > 1) return self.fail(error.SshHostKeyChanged, "none of the host keys of {s} ({s}) is the pinned {s} — someone may be intercepting the connection, or the key was replaced", .{ self.cfg.host, pt.seen(), p });
+                }
             } else if (keyLineMatches(self.gpa, p, blob)) return;
             return self.fail(error.SshHostKeyChanged, "the host key of {s} is {s} {s}, not the pinned one — someone may be intercepting the connection, or the key was replaced", .{ self.cfg.host, key_type, fp });
         }
@@ -921,7 +953,7 @@ pub const Session = struct {
         }
         if (self.cfg.key_file == null and self.cfg.password == null)
             return self.fail(error.SshAuthFailed, "no password or key_file to log in to {s} as {s}", .{ self.cfg.host, self.cfg.user });
-        return self.fail(error.SshAuthFailed, "the server refused the login for {s}@{s}", .{ self.cfg.user, self.cfg.host });
+        return self.fail(error.SshAuthFailed, "the server refused the login for {s}@{s} (it accepts: {s})", .{ self.cfg.user, self.cfg.host, self.auth_methods[0..self.auth_methods_len] });
     }
 
     /// The answer to a userauth request: true on success, false on failure.
@@ -930,10 +962,20 @@ pub const Session = struct {
             const p = try self.next();
             switch (p[0]) {
                 msg.userauth_success => return true,
-                msg.userauth_failure => return false,
+                msg.userauth_failure => return self.authRefused(p),
                 else => return p[0] == msg.userauth_success,
             }
         }
+    }
+
+    /// Keeps the methods a USERAUTH_FAILURE says can continue, for the message.
+    fn authRefused(self: *Session, p: []const u8) bool {
+        var c = Cursor{ .s = p[1..] };
+        const methods = c.str() catch "";
+        const n = @min(methods.len, self.auth_methods.len);
+        @memcpy(self.auth_methods[0..n], methods[0..n]);
+        self.auth_methods_len = n;
+        return false;
     }
 
     fn authHeader(self: *Session, b: *Buf, method: []const u8) !void {
@@ -970,7 +1012,7 @@ pub const Session = struct {
             const p = try self.next();
             switch (p[0]) {
                 msg.userauth_success => return true,
-                msg.userauth_failure => return false,
+                msg.userauth_failure => return self.authRefused(p),
                 msg.userauth_info_request => {
                     var c = Cursor{ .s = p[1..] };
                     _ = try c.str();
@@ -1239,6 +1281,31 @@ const Verdict = enum { ok, unknown, changed, revoked };
 /// hashed `|1|salt|hash` (HMAC-SHA1 of the name). `@revoked` refuses the key;
 /// `@cert-authority` is not supported and skipped. Only entries of the
 /// negotiated key type count, as OpenSSH counts them.
+/// The host keys a bare fingerprint pin was checked against, connect to connect.
+const PinTry = struct {
+    types: [host_key_algs.len][]const u8 = undefined,
+    n: usize = 0,
+    buf: [512]u8 = undefined,
+    len: usize = 0,
+
+    fn tried(self: *const PinTry, alg: []const u8) bool {
+        for (self.types[0..self.n]) |t| if (std.mem.eql(u8, t, keyTypeOfAlg(alg))) return true;
+        return false;
+    }
+
+    fn note(self: *PinTry, key_type: []const u8, fp: []const u8) void {
+        if (self.n == self.types.len) return;
+        self.types[self.n] = keyTypeOfAlg(key_type);
+        self.n += 1;
+        const add = std.fmt.bufPrint(self.buf[self.len..], "{s}{s} {s}", .{ if (self.len > 0) ", " else "", key_type, fp }) catch return;
+        self.len += add.len;
+    }
+
+    fn seen(self: *const PinTry) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
 const host_key_algs = [_][]const u8{ "ssh-ed25519", "ecdsa-sha2-nistp256", "rsa-sha2-512", "rsa-sha2-256" };
 
 /// Which of `host_key_algs` `known_hosts` holds a key type of for the server.
