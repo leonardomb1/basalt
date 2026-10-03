@@ -48,7 +48,12 @@ PRINT <expr>;                     -- progress line on stderr, via the run log
 `@include` splices another script's declarations ahead of this one at plan
 time: each included file is parsed separately (errors report the included
 file's own path and line), includes may nest (depth 16, cycles rejected), and
-paths resolve relative to the including file.
+paths resolve relative to the including file. A file is spliced in **once**, at
+its first include, like C's `#pragma once`: when `outliers.sql` and
+`dispersion.sql` both include `stats.sql` and a script includes both, `stats.sql`
+is in the program one time — its `CREATE FUNCTION`s are not defined twice — and
+each library still sees what it declares. That holds for every statement in it,
+so an included file's `LOAD INTO` runs once however many paths reach it.
 
 `THROW <message> [WHEN <condition>];` asserts what the engine cannot infer.
 Both operands are ordinary expressions over `$params` and `$lets` (§9), so they

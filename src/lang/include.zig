@@ -5,7 +5,9 @@
 //! relative to the INCLUDING file's directory — for `-c` scripts, stdin and the
 //! REPL that is the process cwd. Each included file is parsed on its own, so a
 //! syntax error inside it reports ITS line numbers under ITS name; the resulting
-//! statements are prepended to the includer's, in include order.
+//! statements are prepended to the includer's, in include order. A file is
+//! spliced in once, at its first include — two libraries that both include a
+//! third share one copy of it, as `#pragma once` would have it.
 //!
 //! Nothing is filtered: an included file may declare connections, params,
 //! functions or whole pipelines, and they all become part of the program. The one
@@ -39,10 +41,9 @@ pub const Diag = struct {
 const max_depth: u32 = 16;
 const max_file_bytes: usize = 8 << 20;
 
-/// Depth bounds nesting, not size: an included file's statements are merged into
-/// every file that includes it, so a diamond DAG multiplies rather than adds —
-/// 16 levels of 4 siblings is 4^16 statements out of a few KB of source. This
-/// bounds the merged total, far above any real layering.
+/// Depth bounds nesting, not size. Each file is spliced in once, so the merged
+/// total is the sum of the files, not of the paths through them — this bounds it
+/// all the same, far above any real layering.
 const max_total_stmts: usize = 100_000;
 
 /// Parse `text` (named `label`, with `@include` paths resolved against `base_dir`)
@@ -94,11 +95,10 @@ const Ctx = struct {
     arena: std.mem.Allocator,
     diag: *Diag,
     stack: std.array_list.Managed(Frame),
-    /// Canonical path -> the program it parsed to. The stack only bounds nesting,
-    /// so without this a diamond DAG re-reads and re-parses each file once per
-    /// distinct path through it — 16 levels of 4 siblings is 4^16 loads of a few
-    /// KB of files. A memoised file is never re-entered, so cycle detection is
-    /// unaffected: anything still on the stack has not finished and cannot be here.
+    /// Canonical path -> the program it parsed to: every file already spliced into
+    /// the program, which a later include of it skips (`load`). A memoised file is
+    /// never re-entered, so cycle detection is unaffected: anything still on the
+    /// stack has not finished and cannot be here.
     memo: std.StringHashMap(ast.Program),
     depth: u32 = 0,
     stmt_budget: usize = max_total_stmts,
@@ -118,7 +118,10 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base_dir: []const u8) Er
     const skipped: u32 = @intCast(std.mem.count(u8, text[0..body_at], "\n"));
     try rejectLateIncludes(ctx, text[body_at..], label, skipped + 1);
 
+    // `subs` are spliced into this file's program; `seen` are every include it
+    // names, whose declarations it may use either way.
     var subs = std.array_list.Managed(ast.Program).init(ctx.arena);
+    var seen = std.array_list.Managed(ast.Program).init(ctx.arena);
     for (incs.items) |d| {
         const resolved = try resolvePath(ctx, base_dir, d.path);
         var canonical = true;
@@ -130,8 +133,12 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base_dir: []const u8) Er
             if (!std.mem.eql(u8, f.canon, canon)) continue;
             return ctx.fail(label, d.line, d.col, "include cycle: {s}", .{try cycleTrail(ctx, i, resolved)});
         }
+        // Included once, like `#pragma once`: a file already in the program —
+        // through this includer or another, as when two libraries share a third —
+        // is not spliced in again, where its `CREATE FUNCTION`s would be defined
+        // twice. Its declarations are still this file's to use.
         if (canonical) if (ctx.memo.get(canon)) |cached| {
-            try subs.append(cached);
+            try seen.append(cached);
             continue;
         };
         const src = std.fs.cwd().readFileAlloc(ctx.arena, resolved, max_file_bytes) catch |e| {
@@ -148,6 +155,7 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base_dir: []const u8) Er
         _ = ctx.stack.pop();
         if (canonical) try ctx.memo.put(canon, sub);
         try subs.append(sub);
+        try seen.append(sub);
 
         const n = stmtsOf(sub).len;
         if (n > ctx.stmt_budget)
@@ -165,7 +173,7 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base_dir: []const u8) Er
         // had they been written above it in one file.
         var known = std.array_list.Managed(ast.Connection).init(ctx.arena);
         var known_fns = std.array_list.Managed(ast.FnDecl).init(ctx.arena);
-        for (subs.items) |sp| for (stmtsOf(sp)) |st| {
+        for (seen.items) |sp| for (stmtsOf(sp)) |st| {
             if (st == .connection) try known.append(st.connection);
             // A table function is expanded where it is called, while parsing.
             if (st == .func and st.func.body == .table) try known_fns.append(st.func);
@@ -444,7 +452,7 @@ test "@include cycle is reported with the file trail" {
     try testing.expect(std.mem.endsWith(u8, diag.label, "b.sql"));
 }
 
-test "a diamond @include DAG is parsed once per file, not once per path" {
+test "a diamond @include DAG is parsed and spliced once per file, not once per path" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -455,8 +463,8 @@ test "a diamond @include DAG is parsed once per file, not once per path" {
     try writeFile(&tmp, "a.sql", "@include 'c.sql';\n");
     try writeFile(&tmp, "b.sql", "@include 'c.sql';\n");
 
-    // Both arms of the diamond still contribute c's statements — memoising the
-    // parse must not change what the merged program contains.
+    // c is spliced in once, through a, the first arm that reaches it. Both arms
+    // splicing it defined `inc` twice, and the script failed as a duplicate.
     var diag: Diag = .{};
     const prog = try loadProgram(a,
         \\@include 'a.sql';
@@ -464,14 +472,13 @@ test "a diamond @include DAG is parsed once per file, not once per path" {
         \\SELECT inc(id) AS y FROM 'in.csv';
     , "main.sql", base, &diag);
 
-    try testing.expectEqual(@as(usize, 4), prog.stmts.len);
+    try testing.expectEqual(@as(usize, 3), prog.stmts.len);
     try testing.expect(prog.stmts[0] == .kind);
     try testing.expectEqualStrings("inc", prog.stmts[1].func.name);
-    try testing.expectEqualStrings("inc", prog.stmts[2].func.name);
-    try testing.expect(prog.stmts[3] == .output);
+    try testing.expect(prog.stmts[2] == .output);
 }
 
-test "a fan-out @include tree fails on the statement budget instead of hanging" {
+test "a fan-out @include tree is spliced once per file, so it neither hangs nor blows the budget" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -479,8 +486,8 @@ test "a fan-out @include tree fails on the statement budget instead of hanging" 
     defer tmp.cleanup();
     const base = try tmp.dir.realpathAlloc(a, ".");
 
-    // 12 levels of 4 siblings: 4^12 paths through ~1 KB of source. The depth cap
-    // never fires — only the total does.
+    // 12 levels of 4 siblings: 4^12 paths through ~1 KB of source, which used to
+    // be spliced once per path until the statement budget refused it.
     const levels = 12;
     for (0..levels) |i| {
         var body = std.array_list.Managed(u8).init(a);
@@ -490,8 +497,38 @@ test "a fan-out @include tree fails on the statement budget instead of hanging" 
     try writeFile(&tmp, "b12.sql", "SELECT 1 AS x FROM 'in.csv';\n");
 
     var diag: Diag = .{};
-    try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'b0.sql';\n", "main.sql", base, &diag));
-    try testing.expect(std.mem.indexOf(u8, diag.parse.msg, "statements") != null);
+    const prog = try loadProgram(a, "@include 'b0.sql';\n", "main.sql", base, &diag);
+    try testing.expectEqual(@as(usize, 2), prog.stmts.len);
+    try testing.expect(prog.stmts[1] == .output);
+}
+
+test "@include: two libraries sharing a third may both be included" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try writeFile(&tmp, "lib/stats.sql", "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');\nCREATE FUNCTION sd(x) AS x * 2;\n");
+    // each library uses what stats.sql declares — dispersion.sql too, though by
+    // the time it is read stats.sql is already in the program and not spliced again
+    try writeFile(&tmp, "lib/outliers.sql", "@include 'stats.sql';\nCREATE FUNCTION outl(x) AS sd(x) + 1;\n");
+    try writeFile(&tmp, "lib/dispersion.sql", "@include 'stats.sql';\nLET n = (SELECT COUNT(*) AS n FROM pg.public.t);\n");
+
+    var diag: Diag = .{};
+    const prog = try loadProgram(a,
+        \\@include 'lib/outliers.sql';
+        \\@include 'lib/dispersion.sql';
+        \\SELECT outl(1) AS a;
+    , "main.sql", base, &diag);
+    var sds: usize = 0;
+    var conns: usize = 0;
+    for (prog.stmts) |st| {
+        if (st == .func and std.mem.eql(u8, st.func.name, "sd")) sds += 1;
+        if (st == .connection) conns += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), sds);
+    try testing.expectEqual(@as(usize, 1), conns);
 }
 
 test "@include after a statement is rejected" {
