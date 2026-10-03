@@ -24,6 +24,7 @@ const eval = @import("../exec/eval.zig");
 const driver = @import("driver.zig");
 const http_client = @import("http_client.zig");
 const objstore = @import("objstore.zig");
+const sftp = @import("sftp.zig");
 const types = @import("../lang/types.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const column = @import("../exec/column.zig");
@@ -415,7 +416,9 @@ pub const Writer = struct {
             .cols = cols,
             .groups = List(RowGroupMeta).init(arena),
         };
-        if (objstore.isUrl(path)) {
+        if (sftp.isUrl(path)) {
+            self.backend = .{ .object = objstore.writer(try sftp.Upload.open(arena, path)) };
+        } else if (objstore.isUrl(path)) {
             const client = try arena.create(std.http.Client);
             client.* = http_client.initClient(arena);
             const obj = try objstore.parse(arena, path);
@@ -660,8 +663,9 @@ pub const Writer = struct {
             .file => |f| f.close(),
             // Staged blocks and an uncompleted multipart upload are invisible to
             // readers. Azure reaps them after a week; S3 only where the bucket has
-            // a lifecycle rule.
-            .object, .memory => {},
+            // a lifecycle rule. An SFTP `.part` is removed.
+            .object => |o| o.abort(),
+            .memory => {},
         }
     }
 

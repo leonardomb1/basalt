@@ -252,10 +252,18 @@ pub const Writer = struct {
         finish: *const fn (*anyopaque) anyerror!void,
         last_status: *const fn (*anyopaque) ?anyerror,
         last_error: *const fn (*anyopaque) []const u8,
+        /// For a destination where an unfinished write is visible — an SFTP
+        /// `.part` file — and has to be taken back. Null where dropping it is
+        /// enough.
+        abort: ?*const fn (*anyopaque) void = null,
     };
 
     pub fn finish(self: Writer) !void {
         return self.vtable.finish(self.ptr);
+    }
+
+    pub fn abort(self: Writer) void {
+        if (self.vtable.abort) |f| f(self.ptr);
     }
 
     /// Recovers the error the upload actually hit. Staging runs under
@@ -290,7 +298,11 @@ pub fn writer(w: anytype) Writer {
             const self: *T = @ptrCast(@alignCast(p));
             return self.last_error;
         }
-        const vt = Writer.VTable{ .finish = finish, .last_status = lastStatus, .last_error = lastError };
+        fn abort(p: *anyopaque) void {
+            const self: *T = @ptrCast(@alignCast(p));
+            self.abort();
+        }
+        const vt = Writer.VTable{ .finish = finish, .last_status = lastStatus, .last_error = lastError, .abort = if (@hasDecl(T, "abort")) abort else null };
     };
     return .{ .io = &w.interface, .ptr = w, .vtable = &Adapter.vt };
 }

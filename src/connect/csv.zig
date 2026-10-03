@@ -1003,7 +1003,11 @@ pub const CsvWriter = struct {
     pub fn open(arena: std.mem.Allocator, path: []const u8, schema: types.Schema, mode: driver.FileMode, dialect: Dialect) !*CsvWriter {
         const self = try arena.create(CsvWriter);
         var header = true;
-        if (objstore.isUrl(path)) {
+        if (sftp.isUrl(path)) {
+            // written whole through a `.part`, so there is nothing to extend
+            if (mode == .append) return error.AppendNotSupported;
+            self.* = .{ .backend = .{ .object = objstore.writer(try sftp.Upload.open(arena, path)) } };
+        } else if (objstore.isUrl(path)) {
             if (mode == .append) return error.AppendNotSupported;
             const client = try arena.create(std.http.Client);
             client.* = http_client.initClient(arena);
@@ -1136,8 +1140,8 @@ pub const CsvWriter = struct {
             .file => |f| if (self.owns_file) f.close(),
             // Staged blocks and an uncompleted multipart upload are invisible to
             // readers. Azure reaps them after a week; S3 only where the bucket has
-            // a lifecycle rule.
-            .object => {},
+            // a lifecycle rule. An SFTP `.part` is removed.
+            .object => |o| o.abort(),
         }
     }
 
