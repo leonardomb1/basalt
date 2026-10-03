@@ -635,7 +635,7 @@ const Tx = struct {
                 // and N'' would turn a varchar column's index seek into a scan
                 if (self.dialect == .sqlserver and !asciiPrintable(s)) return null;
                 // a backslash is an escape inside a mysql string literal
-                if ((self.dialect == .mysql or self.dialect == .starrocks) and std.mem.indexOfScalar(u8, s, '\\') != null) return null;
+                if (self.dialect.mysqlWire() and std.mem.indexOfScalar(u8, s, '\\') != null) return null;
                 return try sqlStr(self.arena, s);
             },
             .field => |q| {
@@ -867,7 +867,7 @@ const Tx = struct {
         if (lit.len > 0 and lit[lit.len - 1] == ' ') return null;
         const len_fn: []const u8 = switch (self.dialect) {
             .sqlserver => "DATALENGTH",
-            .mysql, .starrocks => "LENGTH",
+            .mysql, .starrocks, .doris => "LENGTH",
             // a char(n)'s byte length leaves its padding out
             .postgres => return null,
         };
@@ -1259,7 +1259,7 @@ pub fn renderTopN(arena: std.mem.Allocator, dialect: Dialect, base_sql: []const 
         const dir = if (k.desc) " DESC" else "";
         switch (dialect) {
             .postgres => try ob.writer().print("{s}{s} NULLS LAST", .{ q, dir }),
-            .mysql, .starrocks => try ob.writer().print("({s} IS NULL), {s}{s}", .{ q, q, dir }),
+            .mysql, .starrocks, .doris => try ob.writer().print("({s} IS NULL), {s}{s}", .{ q, q, dir }),
             .sqlserver => try ob.writer().print("CASE WHEN {s} IS NULL THEN 1 ELSE 0 END, {s}{s}", .{ q, q, dir }),
         }
     }

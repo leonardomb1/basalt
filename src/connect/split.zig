@@ -91,7 +91,7 @@ pub fn introspectPkCols(arena: std.mem.Allocator, prober: Prober, dialect: Diale
             \\WHERE i.object_id = OBJECT_ID('{s}') AND i.is_primary_key = 1
             \\ORDER BY ic.key_ordinal
         , .{table}),
-        .mysql, .starrocks => try std.fmt.allocPrint(arena,
+        .mysql, .starrocks, .doris => try std.fmt.allocPrint(arena,
             \\SELECT k.COLUMN_NAME
             \\FROM information_schema.KEY_COLUMN_USAGE k
             \\WHERE k.CONSTRAINT_NAME = 'PRIMARY' AND k.TABLE_SCHEMA = DATABASE() AND k.TABLE_NAME = '{s}'
@@ -135,7 +135,7 @@ pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect,
             \\WHERE i.object_id = OBJECT_ID('{s}') AND i.is_primary_key = 1
             \\ORDER BY ic.key_ordinal
         , .{table}),
-        .mysql, .starrocks => try std.fmt.allocPrint(arena,
+        .mysql, .starrocks, .doris => try std.fmt.allocPrint(arena,
             \\SELECT k.COLUMN_NAME, c.DATA_TYPE, t.TABLE_ROWS
             \\FROM information_schema.KEY_COLUMN_USAGE k
             \\JOIN information_schema.COLUMNS c ON c.TABLE_SCHEMA = k.TABLE_SCHEMA AND c.TABLE_NAME = k.TABLE_NAME AND c.COLUMN_NAME = k.COLUMN_NAME

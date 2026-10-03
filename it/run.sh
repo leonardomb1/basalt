@@ -7,7 +7,7 @@
 #   ./it/run.sh mysql postgres  several
 #   KEEP=1 ./it/run.sh azure    leave the stack up afterwards
 #
-# Suite names: mysql postgres sqlserver starrocks azure parquet s3 arrow stdout kernel
+# Suite names: mysql postgres sqlserver starrocks doris azure parquet s3 arrow stdout kernel
 # (arrow needs `uv`: it reads the stream back with pyarrow; stdout needs nothing;
 # kernel needs python3)
 # Scripts are Basalt SQL (the BSL parser was removed in v0.2.0); connection
@@ -15,7 +15,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ALL_SUITES="mysql postgres sqlserver starrocks azure parquet s3 arrow stdout kernel"
+ALL_SUITES="mysql postgres sqlserver starrocks doris azure parquet s3 arrow stdout kernel"
 DEFAULT_SUITES="$ALL_SUITES"
 SUITES="${*:-$DEFAULT_SUITES}"
 
@@ -35,6 +35,7 @@ for s in $SUITES; do
     postgres)  services="$services postgres" ;;
     sqlserver) services="$services mssql" ;;
     starrocks) services="$services starrocks" ;;
+    doris)     services="$services doris" ;;
     azure)     services="$services azurite" ;;
     s3)        services="$services s3" ;;
     parquet)   services="$services static static-norange" ;;  # local fixtures, plus HTTP
@@ -518,6 +519,57 @@ LOAD INTO '$out/sr_embedded_out.csv' AS SELECT id, s FROM fe.it_nullmark2 ORDER 
   paramrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');"
   collrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_coll USING stream_load"
   catalogrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" it
+fi
+
+# Doris: the same arrangement as StarRocks, which forked from it — stream load in,
+# its MySQL-protocol FE out — with what Doris does differently checked by name.
+if runs doris; then
+  DR="CREATE CONNECTION dr TYPE doris OPTIONS (host = '127.0.0.1', port = 49030, load_url = 'http://127.0.0.1:48040', database = 'it', user = 'root', password = '');"
+  DB="CREATE CONNECTION db TYPE doris OPTIONS (host = '127.0.0.1', port = 49030, load_url = 'http://127.0.0.1:48040', database = 'it', user = 'root', password = '');"
+  if brun run -c "$DR
+LOAD INTO dr.basalt_it USING stream_load REPLACE AS SELECT * FROM 'it/seed.csv';" &&
+     brun run -c "$DR
+LOAD INTO '$out/doris.csv' AS SELECT * FROM dr.basalt_it ORDER BY id;"; then
+    check doris "$out/doris.csv" it/expected.csv
+  else
+    report "doris (run error)" bad
+  fi
+
+  # Doris reads the row delimiter from `line_delimiter` and ignores StarRocks'
+  # `row_delimiter`, splitting rows on newlines instead: a value with one in it
+  # came back as two broken rows, and the load said Success. A table opening with
+  # a DOUBLE also checks the DDL — Doris takes no FLOAT, DOUBLE or STRING key.
+  printf 'score,note,at\n1.5,"line one\nline two",2026-10-03 10:11:12.123456\n2.25,plain,\n' > "$out/dr_nl.csv"
+  if brun run -c "$DR
+LOAD INTO dr.it_newline USING stream_load REPLACE AS SELECT CAST(score AS DOUBLE) AS score, note, CAST(at AS TIMESTAMP) AS at FROM '$out/dr_nl.csv';" &&
+     brun run -c "$DR
+LOAD INTO '$out/dr_nl_out.csv' AS SELECT score, note, at FROM dr.it_newline ORDER BY score;"; then
+    brun run -c "LOAD INTO '$out/dr_nl_want.csv' AS SELECT CAST(score AS DOUBLE) AS score, note, CAST(at AS TIMESTAMP) AS at FROM '$out/dr_nl.csv' ORDER BY score;"
+    check doris-embedded-newline "$out/dr_nl_out.csv" "$out/dr_nl_want.csv"
+  else
+    report "doris-embedded-newline (run error)" bad
+  fi
+
+  # an upsert creates a merge-on-write unique-key table: a second load replaces a
+  # key's row and adds the new one
+  printf 'k,v\na,1\nb,2\n' > "$out/dr_up1.csv"
+  printf 'k,v\nb,20\nc,3\n' > "$out/dr_up2.csv"
+  printf 'k,v\na,1\nb,20\nc,3\n' > "$out/dr_up_want.csv"
+  if brun run -c "$DR
+LOAD INTO dr.it_upsert USING stream_load UPSERT ON (k) AS SELECT k, CAST(v AS INT) AS v FROM '$out/dr_up1.csv';" &&
+     brun run -c "$DR
+LOAD INTO dr.it_upsert USING stream_load UPSERT ON (k) AS SELECT k, CAST(v AS INT) AS v FROM '$out/dr_up2.csv';" &&
+     brun run -c "$DR
+LOAD INTO '$out/dr_up_out.csv' AS SELECT k, v FROM dr.it_upsert ORDER BY k;"; then
+    check doris-upsert "$out/dr_up_out.csv" "$out/dr_up_want.csv"
+  else
+    report "doris-upsert (run error)" bad
+  fi
+
+  topnrt doris "$DB" "db.it_topn USING stream_load"
+  paramrt doris "$DB"
+  collrt doris "$DB" "db.it_coll USING stream_load"
+  catalogrt doris "$DB" it
 fi
 
 # Azure Blob (Azurite). ADLS Gen2 data is reached through the Blob endpoint —

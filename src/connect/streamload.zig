@@ -24,6 +24,7 @@ const FLUSH_BYTES = 8 * 1024 * 1024;
 /// Which database a Stream Load connection talks to.
 pub const Flavor = enum {
     starrocks,
+    doris,
 
     /// The flavor a connection's `TYPE` names, or null for any other connector.
     pub fn of(connector: []const u8) ?Flavor {
@@ -38,6 +39,7 @@ pub const Flavor = enum {
     pub fn dialect(self: Flavor) sql.Dialect {
         return switch (self) {
             .starrocks => .starrocks,
+            .doris => .doris,
         };
     }
 
@@ -46,13 +48,23 @@ pub const Flavor = enum {
     fn rowDelimiterHeader(self: Flavor) []const u8 {
         return switch (self) {
             .starrocks => "row_delimiter",
+            // Doris ignores `row_delimiter` and splits rows on newlines — a load
+            // that "succeeds" with every embedded newline cutting a row in two.
+            .doris => "line_delimiter",
         };
     }
 
     fn partialHeader(self: Flavor) []const u8 {
         return switch (self) {
             .starrocks => "partial_update",
+            .doris => "partial_columns",
         };
+    }
+
+    /// Doris loads in non-strict mode by default, where a value that does not
+    /// convert lands as NULL and the load still reports success.
+    fn strict(self: Flavor) bool {
+        return self == .doris;
     }
 };
 
@@ -365,6 +377,7 @@ pub const StreamLoadSink = struct {
         try hdrs.append(.{ .name = self.cfg.flavor.rowDelimiterHeader(), .value = "\\x02" });
         try hdrs.append(.{ .name = "columns", .value = self.columns });
         try hdrs.append(.{ .name = "max_filter_ratio", .value = "0" });
+        if (self.cfg.flavor.strict()) try hdrs.append(.{ .name = "strict_mode", .value = "true" });
         if (self.mode == .upsert and self.mode.upsert.partial != null) {
             try hdrs.append(.{ .name = self.cfg.flavor.partialHeader(), .value = "true" });
         }
@@ -512,6 +525,32 @@ test "create table: upsert -> Primary Key, keys first + NOT NULL" {
     const ipos = std.mem.indexOf(u8, stmt, "`id`").?;
     const npos = std.mem.indexOf(u8, stmt, "`name`").?;
     try std.testing.expect(ipos < npos);
+}
+
+test "create table: Doris appends to a keyless duplicate table and upserts into a merge-on-write unique key" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // A DOUBLE or STRING first column is no key Doris accepts, so append takes none.
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "score", .ty = types.Type.init(.float) },
+        .{ .name = "name", .ty = types.Type.init(.string) },
+        .{ .name = "at", .ty = types.Type.init(.timestamp) },
+    } };
+    const app = try genCreateTable(a, .doris, "it", "t", schema, .append, 4, 1);
+    try std.testing.expect(std.mem.indexOf(u8, app, "KEY(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "DISTRIBUTED BY RANDOM BUCKETS 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "\"enable_duplicate_without_keys_by_default\"=\"true\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "`name` STRING") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "`at` DATETIME(6)") != null);
+
+    const mode = ast.WriteMode{ .upsert = .{ .keys = &.{"name"} } };
+    const up = try genCreateTable(a, .doris, "it", "t", schema, mode, 4, 1);
+    try std.testing.expect(std.mem.indexOf(u8, up, "UNIQUE KEY(`name`)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, up, "`name` VARCHAR(65533) NOT NULL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, up, "DISTRIBUTED BY HASH(`name`) BUCKETS 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, up, "\"enable_unique_key_merge_on_write\"=\"true\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, up, "`name`").? < std.mem.indexOf(u8, up, "`score`").?);
 }
 
 test "label and column list" {

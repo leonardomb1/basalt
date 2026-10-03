@@ -230,26 +230,36 @@ pub fn textCursorVTable(comptime T: type) Cursor.VTable {
     };
 }
 
-/// `.starrocks` speaks MySQL on the wire (backtick quoting, same catalog
-/// queries) but has its own DDL: type names, and a mandatory table model /
-/// distribution clause emitted by `createTableSqlWith`.
+/// `.starrocks` and `.doris` speak MySQL on the wire (backtick quoting, same
+/// catalog queries) but have their own DDL: type names, and a mandatory table
+/// model / distribution clause emitted by `createTableSqlWith`.
 pub const Dialect = enum {
     postgres,
     mysql,
     sqlserver,
     starrocks,
+    doris,
+
+    /// Read over the MySQL protocol and written as MySQL writes SQL: backticks,
+    /// `\` an escape inside a string literal.
+    pub fn mysqlWire(self: Dialect) bool {
+        return switch (self) {
+            .mysql, .starrocks, .doris => true,
+            .postgres, .sqlserver => false,
+        };
+    }
 
     fn qOpen(self: Dialect) u8 {
         return switch (self) {
             .postgres => '"',
-            .mysql, .starrocks => '`',
+            .mysql, .starrocks, .doris => '`',
             .sqlserver => '[',
         };
     }
     fn qClose(self: Dialect) u8 {
         return switch (self) {
             .postgres => '"',
-            .mysql, .starrocks => '`',
+            .mysql, .starrocks, .doris => '`',
             .sqlserver => ']',
         };
     }
@@ -261,17 +271,19 @@ pub const Dialect = enum {
             .bool => switch (self) {
                 .sqlserver => "BIT",
                 .mysql => "TINYINT(1)",
-                .postgres, .starrocks => "BOOLEAN",
+                .postgres, .starrocks, .doris => "BOOLEAN",
             },
             .int => "BIGINT",
             .float => switch (self) {
                 .postgres => "DOUBLE PRECISION",
-                .mysql, .starrocks => "DOUBLE",
+                .mysql, .starrocks, .doris => "DOUBLE",
                 .sqlserver => "FLOAT",
             },
             .decimal => try std.fmt.allocPrint(arena, "DECIMAL({d},{d})", .{ ty.precision, ty.scale }),
             .string => switch (self) {
                 .postgres => if (is_key) "VARCHAR(255)" else "TEXT",
+                // a Doris key cannot be STRING
+                .doris => if (is_key) "VARCHAR(65533)" else "STRING",
                 .mysql => "VARCHAR(255)",
                 .sqlserver => if (is_key) "NVARCHAR(255)" else "NVARCHAR(4000)",
                 .starrocks => "VARCHAR(65533)",
@@ -280,25 +292,27 @@ pub const Dialect = enum {
                 .postgres => "BYTEA",
                 .mysql => "BLOB",
                 .sqlserver => "VARBINARY(MAX)",
-                .starrocks => "STRING",
+                .starrocks, .doris => "STRING",
             },
             .date => "DATE",
             .time => switch (self) {
                 .postgres, .mysql, .sqlserver => "TIME",
-                .starrocks => "VARCHAR(32)",
+                .starrocks, .doris => "VARCHAR(32)",
             },
             .timestamp => switch (self) {
                 .postgres => "TIMESTAMP",
                 .mysql, .starrocks => "DATETIME",
+                // Doris' DATETIME keeps whole seconds unless asked for more
+                .doris => "DATETIME(6)",
                 .sqlserver => "DATETIME2",
             },
             .array => switch (self) {
                 .postgres, .mysql, .sqlserver => "TEXT",
-                .starrocks => "STRING",
+                .starrocks, .doris => "STRING",
             },
             .@"struct" => switch (self) {
                 .postgres, .mysql, .sqlserver => "TEXT",
-                .starrocks => "JSON",
+                .starrocks, .doris => "JSON",
             },
         };
     }
@@ -312,24 +326,24 @@ pub const Dialect = enum {
         return switch (ty.kind) {
             .int => switch (self) {
                 .postgres, .sqlserver => "BIGINT",
-                .mysql, .starrocks => "SIGNED",
+                .mysql, .starrocks, .doris => "SIGNED",
             },
             .float => switch (self) {
                 .postgres => "DOUBLE PRECISION",
-                .mysql, .starrocks => "DOUBLE",
+                .mysql, .starrocks, .doris => "DOUBLE",
                 .sqlserver => "FLOAT",
             },
             .decimal => try std.fmt.allocPrint(arena, "DECIMAL({d},{d})", .{ ty.precision, ty.scale }),
             .string => switch (self) {
                 .postgres => "TEXT",
-                .mysql, .starrocks => "CHAR",
+                .mysql, .starrocks, .doris => "CHAR",
                 .sqlserver => "VARCHAR(MAX)",
             },
             .date => "DATE",
             .time => "TIME",
             .timestamp => switch (self) {
                 .postgres => "TIMESTAMP",
-                .mysql, .starrocks => "DATETIME",
+                .mysql, .starrocks, .doris => "DATETIME",
                 .sqlserver => "DATETIME2",
             },
             // No portable CAST spelling: a bool literal is rendered as a
@@ -388,7 +402,7 @@ const source_vtable = driver.sourceVTable(Source);
 fn flushRowsFor(dialect: Dialect) usize {
     return switch (dialect) {
         .sqlserver => 1000,
-        .postgres, .mysql, .starrocks => 5000,
+        .postgres, .mysql, .starrocks, .doris => 5000,
     };
 }
 
@@ -656,6 +670,7 @@ pub fn createTableSql(arena: std.mem.Allocator, dialect: Dialect, qtable: []cons
 /// primary key; StarRocks additionally picks its table model from the mode.
 pub fn createTableSqlWith(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8, schema: types.Schema, mode: ast.WriteMode, opts: TableOpts) ![]const u8 {
     if (dialect == .starrocks) return starrocksTableSql(arena, qtable, schema, mode, opts);
+    if (dialect == .doris) return dorisTableSql(arena, qtable, schema, mode, opts);
     const keys: []const []const u8 = switch (mode) {
         .upsert => |u| u.keys,
         else => &.{},
@@ -724,6 +739,45 @@ fn starrocksTableSql(arena: std.mem.Allocator, qtable: []const u8, schema: types
     return buf.toOwnedSlice();
 }
 
+/// Doris: `upsert on k` → a UNIQUE KEY table with merge-on-write, keys first and
+/// NOT NULL. Append and overwrite → a duplicate table with no sort key at all:
+/// Doris refuses a FLOAT, DOUBLE or STRING key column, so StarRocks' "first column
+/// is the key" would turn away any table that starts with one.
+fn dorisTableSql(arena: std.mem.Allocator, qtable: []const u8, schema: types.Schema, mode: ast.WriteMode, opts: TableOpts) ![]const u8 {
+    const keys: []const []const u8 = switch (mode) {
+        .upsert => |u| u.keys,
+        else => &.{},
+    };
+    if (mode == .upsert and keys.len == 0) return error.UpsertKeysUnresolved;
+
+    var ordered = std.array_list.Managed(types.Schema.Field).init(arena);
+    for (keys) |k| try ordered.append(findField(schema, k) orelse return error.UnknownKeyColumn);
+    for (schema.fields) |f| {
+        if (!nameIn(keys, f.name)) try ordered.append(f);
+    }
+
+    var buf = std.array_list.Managed(u8).init(arena);
+    const w = buf.writer();
+    try w.print("CREATE TABLE IF NOT EXISTS {s} (\n", .{qtable});
+    for (ordered.items, 0..) |f, i| {
+        const is_key = nameIn(keys, f.name);
+        const qn = try quoteIdent(arena, .doris, f.name);
+        try w.print("  {s} {s}{s}", .{ qn, try Dialect.doris.ddlType(arena, f.ty, is_key), if (is_key) " NOT NULL" else "" });
+        if (i + 1 < ordered.items.len) try w.writeByte(',');
+        try w.writeByte('\n');
+    }
+    try w.writeAll(") ENGINE=OLAP\n");
+    if (keys.len > 0) {
+        const qkeys = try quoteNames(arena, .doris, keys);
+        try w.print("UNIQUE KEY({s})\nDISTRIBUTED BY HASH({s}) BUCKETS {d}\n", .{ qkeys, qkeys, opts.buckets });
+        try w.print("PROPERTIES(\"replication_num\"=\"{d}\", \"enable_unique_key_merge_on_write\"=\"true\");", .{opts.replication_num});
+    } else {
+        try w.print("DISTRIBUTED BY RANDOM BUCKETS {d}\n", .{opts.buckets});
+        try w.print("PROPERTIES(\"replication_num\"=\"{d}\", \"enable_duplicate_without_keys_by_default\"=\"true\");", .{opts.replication_num});
+    }
+    return buf.toOwnedSlice();
+}
+
 fn findField(schema: types.Schema, name: []const u8) ?types.Schema.Field {
     for (schema.fields) |f| {
         if (std.mem.eql(u8, f.name, name)) return f;
@@ -753,8 +807,9 @@ fn buildStatement(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8
                 try w.writeAll(" ON DUPLICATE KEY UPDATE ");
                 try writeMysqlUpdate(w, arena, dialect, schema, u.keys);
             },
-            // A StarRocks primary-key table upserts on a plain INSERT.
-            .starrocks => {},
+            // A StarRocks primary-key or Doris unique-key table upserts on a
+            // plain INSERT.
+            .starrocks, .doris => {},
             .sqlserver => unreachable,
         },
         else => {},

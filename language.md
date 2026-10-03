@@ -144,8 +144,8 @@ CREATE CONNECTION erp TYPE sqlserver OPTIONS (
 
 Connector types and their options are unchanged from BSL: `sqlserver`
 (`host port database user password tls auth domain tenant client_id resource`),
-`mysql`, `postgres`, `starrocks` (`fe_host fe_port be_url database buckets
-replication_num auto_create label_prefix ...`), `http`.
+`mysql`, `postgres`, `starrocks` and `doris` (`fe_host fe_port be_url database
+buckets replication_num auto_create label_prefix ...`), `http`.
 
 A `starrocks` connection is both ends: `LOAD INTO sr.t` writes by stream load
 (`be_url`), and `FROM sr.db.t` / `sr.QUERY($$...$$)` reads through the FE's
@@ -161,6 +161,17 @@ altogether). A role allowed to load into an existing table therefore needs no
 CREATE privilege; one that does lack a privilege it needs gets StarRocks' own
 message in the error (`starrocks refused 'CREATE TABLE …': Access denied; you
 need …`), not only in the log.
+
+A `doris` connection is the same in every respect — Doris is the project
+StarRocks forked from, read through its FE and loaded by stream load — except
+for the tables it creates. Doris takes no FLOAT, DOUBLE or STRING column as a
+key, so an `APPEND` or `REPLACE` target is a duplicate table with no sort key
+(`DISTRIBUTED BY RANDOM`), where StarRocks keys on the first column; an `UPSERT
+ON (k)` target is a `UNIQUE KEY` table with merge-on-write, its text keys
+`VARCHAR(65533)`, and `PARTIAL COLS` loads as Doris' `partial_columns`.
+Timestamps are `DATETIME(6)`, to keep microseconds. Loads run in Doris' strict
+mode, so a value that does not convert fails the load instead of landing as
+NULL.
 
 **Named SQL Server instances:** write `host = '10.110.2.5\WMS'`. When a `host`
 carries a `\INSTANCE` and no explicit `port` is given, basalt resolves the

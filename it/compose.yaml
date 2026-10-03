@@ -115,3 +115,13 @@ services:
       interval: 5s
       timeout: 5s
       retries: 120
+
+  doris:
+    image: apache/doris:all-in-one-4.1.3
+    ports: ["49030:9030", "48040:8040"]
+    healthcheck:
+# As StarRocks: the FE takes queries before its BE is alive to load.
+      test: ["CMD-SHELL", "mysql -h127.0.0.1 -P9030 -uroot -e 'show backends\\G' | grep -q 'Alive: true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 120

@@ -1115,6 +1115,14 @@ const connectors = [_]Connector{
         .{ .key = "user", .prompt = "user", .default = "root" },
         .{ .key = "password", .prompt = "password", .secret = true },
     } },
+    .{ .name = "doris", .blurb = "Apache Doris (read through the FE, write by stream load)", .fields = &.{
+        .{ .key = "host", .prompt = "FE host" },
+        .{ .key = "port", .prompt = "FE query port", .default = "9030", .int = true },
+        .{ .key = "load_url", .prompt = "BE stream-load URL", .default = "http://<be-host>:8040" },
+        .{ .key = "database", .prompt = "database" },
+        .{ .key = "user", .prompt = "user", .default = "root" },
+        .{ .key = "password", .prompt = "password", .secret = true },
+    } },
     .{ .name = "http", .blurb = "a REST API (paginated sources, an endpoint sink)", .fields = &.{
         .{ .key = "base_url", .prompt = "base URL" },
         .{ .key = "auth", .prompt = "auth (blank, bearer, basic)" },

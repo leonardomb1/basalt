@@ -46,12 +46,18 @@ pub const Connector = enum {
     unit,
     range,
     starrocks,
+    doris,
     postgres,
     mysql,
     sqlserver,
 
     pub fn parse(name: []const u8) ?Connector {
         return std.meta.stringToEnum(Connector, name);
+    }
+
+    /// Written by HTTP Stream Load rather than SQL INSERTs (`streamload.zig`).
+    pub fn streamLoad(self: Connector) bool {
+        return self == .starrocks or self == .doris;
     }
 
     pub fn sqlKind(self: Connector) ?SqlKind {
@@ -66,9 +72,11 @@ pub const Connector = enum {
     /// How the connector is *read*: the wire driver, the dialect rendered for it
     /// and the port it listens on. StarRocks has no driver of its own — its FE
     /// speaks the MySQL protocol on 9030 — so one `starrocks` connection is read
-    /// through the MySQL driver and written by stream load.
+    /// through the MySQL driver and written by stream load. Doris, which StarRocks
+    /// forked from, is the same arrangement.
     pub fn sqlRead(self: Connector) ?SqlRead {
         if (self == .starrocks) return .{ .kind = .mysql, .dialect = .starrocks, .port = 9030 };
+        if (self == .doris) return .{ .kind = .mysql, .dialect = .doris, .port = 9030 };
         const k = self.sqlKind() orelse return null;
         return .{ .kind = k, .dialect = k.dialect(), .port = k.defaultPort() };
     }
@@ -94,6 +102,16 @@ test "every SqlKind is a Connector with the same name and the expected port" {
     try std.testing.expect(SqlKind.parse("starrocks") == null);
     try std.testing.expect(Connector.parse("starrocks").?.sqlKind() == null);
     try std.testing.expect(Connector.parse("nope") == null);
+}
+
+test "a doris connection is read through the MySQL driver on the FE port, written by stream load" {
+    const c = Connector.parse("doris").?;
+    const r = c.sqlRead().?;
+    try std.testing.expectEqual(SqlKind.mysql, r.kind);
+    try std.testing.expectEqual(sql.Dialect.doris, r.dialect);
+    try std.testing.expectEqual(@as(u16, 9030), r.port);
+    try std.testing.expect(c.streamLoad() and Connector.parse("starrocks").?.streamLoad());
+    try std.testing.expect(!Connector.parse("mysql").?.streamLoad());
 }
 
 test "a starrocks connection is read through the MySQL driver on the FE port" {

@@ -967,7 +967,8 @@ const Ctx = struct {
         };
 
         const src_is_sql = isSqlSource(source.connector);
-        const sink_is_parallel = isSqlConnector(sink.connector) or std.mem.eql(u8, sink.connector, "starrocks");
+        const sink_is_parallel = isSqlConnector(sink.connector) or
+            (if (registry.Connector.parse(sink.connector)) |c| c.streamLoad() else false);
         // Not `map_only`: that gate said `serial` for every aggregate over a
         // splittable table, while `runParallelSqlAgg` fans exactly that shape into
         // key-range lanes. It was the SQL half of the same mislabelling fixed for

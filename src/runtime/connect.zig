@@ -1144,9 +1144,9 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\WHERE c.TABLE_SCHEMA = {s} AND c.TABLE_NAME = {s}
             , .{ schema, try sqlLit(arena, table) });
         },
-        // StarRocks has no collations: strings compare by byte. A CHAR is taken
-        // as padding, to be safe.
-        .starrocks => {
+        // StarRocks and Doris have no collations: strings compare by byte. A
+        // CHAR is taken as padding, to be safe.
+        .starrocks, .doris => {
             const schema = if (parts.len >= 2) try sqlLit(arena, parts[parts.len - 2]) else "DATABASE()";
             return std.fmt.allocPrint(arena,
                 \\SELECT COLUMN_NAME,
@@ -1406,7 +1406,8 @@ fn resolveStreamLoadConfig(env: *Env, conn: ast.Connection, flavor: streamload.F
         const k = attr.key;
         if (eqlAny(k, &.{ "host", "fe_host" })) {
             cfg.fe_host = try evalCfgStr(env, attr.value);
-        } else if (std.mem.eql(u8, k, "fe_port")) {
+        } else if (eqlAny(k, &.{ "port", "fe_port" })) {
+            // `port`, as the read side and the connection wizard spell it, too
             cfg.fe_port = @intCast(try evalCfgInt(env, attr.value));
         } else if (eqlAny(k, &.{ "be_url", "load_url" })) {
             cfg.load_url = try evalCfgStr(env, attr.value);
