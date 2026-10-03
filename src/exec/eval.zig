@@ -1477,8 +1477,13 @@ fn writeJsonValue(arena: std.mem.Allocator, v: Value, w: *std.Io.Writer) EvalErr
         .null => w.writeAll("null") catch return error.OutOfMemory,
         .bool => |b| w.writeAll(if (b) "true" else "false") catch return error.OutOfMemory,
         .int => |i| w.print("{d}", .{i}) catch return error.OutOfMemory,
-        // as `std.json.Stringify` writes a float
-        .float => |f| w.print("{}", .{f}) catch return error.OutOfMemory,
+        // as `std.json.Stringify` writes a float; JSON has no NaN or infinity, and
+        // writing `nan` made the whole document unreadable, so they are `null`
+        // as JavaScript's JSON.stringify has them
+        .float => |f| if (std.math.isFinite(f))
+            w.print("{}", .{f}) catch return error.OutOfMemory
+        else
+            w.writeAll("null") catch return error.OutOfMemory,
         .decimal => w.writeAll(try valueToString(arena, v)) catch return error.OutOfMemory,
         .string => |s| {
             const t = std.mem.trim(u8, s, " \t\r\n");
@@ -4895,6 +4900,9 @@ test "json builders and encodings: json_object, json_array, base64, url" {
         \\["[not json"]
     , try str(a, "json_array('[not json')"));
     try std.testing.expectError(error.CastFailed, evalLit(a, "json_object(NULL, 1)"));
+    try std.testing.expectEqualStrings(
+        \\[1.5,null,null,12.30,"2026-10-03"]
+    , try str(a, "json_array(1.5, CAST('nan' AS DOUBLE), -CAST('inf' AS DOUBLE), CAST('12.30' AS DECIMAL(10,2)), CAST('2026-10-03' AS DATE))"));
 
     try std.testing.expectEqualStrings("aGVsbG8=", try str(a, "to_base64('hello')"));
     try std.testing.expectEqualStrings("hello", (try evalLit(a, "from_base64('aGVsbG8=')")).bytes);
