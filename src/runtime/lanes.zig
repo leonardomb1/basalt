@@ -11,6 +11,8 @@ const column = @import("../exec/column.zig");
 const eval = @import("../exec/eval.zig");
 const csv = @import("../connect/csv.zig");
 const pqdecode = @import("../connect/pqdecode.zig");
+const folder = @import("../connect/folder.zig");
+const sftp = @import("../connect/sftp.zig");
 const driver = @import("../connect/driver.zig");
 const sql = @import("../connect/sql.zig");
 const wrapProjected = @import("../connect/split.zig").wrapProjected;
@@ -22,6 +24,7 @@ const Value = @import("../exec/value.zig").Value;
 
 const Env = @import("env.zig").Env;
 const planErr = @import("env.zig").planErr;
+const planErrT = @import("env.zig").planErrT;
 const RunOptions = @import("env.zig").RunOptions;
 const schemaPtr = @import("env.zig").schemaPtr;
 const Stats = @import("env.zig").Stats;
@@ -250,12 +253,31 @@ const WorkQueue = struct {
     err_mtx: std.Thread.Mutex = .{},
     first_err: ?anyerror = null,
     failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// The first error's account, taken on the lane that raised it: the notes
+    /// that explain an error are per thread, and the run reports on another.
+    note_buf: [480]u8 = undefined,
+    note_len: usize = 0,
 
     fn fail(q: *WorkQueue, e: anyerror) void {
         q.err_mtx.lock();
-        if (q.first_err == null) q.first_err = e;
+        if (q.first_err == null) {
+            q.first_err = e;
+            const name = @errorName(e);
+            if (eval.takeFailure(e)) |why| {
+                q.note_len = @min(why.len, q.note_buf.len);
+                @memcpy(q.note_buf[0..q.note_len], why[0..q.note_len]);
+            } else if ((std.mem.startsWith(u8, name, "Sftp") or std.mem.startsWith(u8, name, "Ssh")) and sftp.lastError().len > 0) {
+                q.note_len = (std.fmt.bufPrint(&q.note_buf, "sftp: {s}: {s}", .{ name, sftp.lastError() }) catch q.note_buf[0..0]).len;
+            }
+        }
         q.err_mtx.unlock();
         q.failed.store(true, .seq_cst);
+    }
+
+    /// The first error, with the account the failing lane left of it.
+    fn failure(q: *WorkQueue) ?anyerror {
+        const e = q.first_err orelse return null;
+        return if (q.note_len > 0) eval.explain(e, q.note_buf[0..q.note_len]) else e;
     }
 };
 
@@ -412,7 +434,7 @@ fn combineAggSlots(
 
     var mctx = SlotMergeCtx{ .slots = slots, .parts = parts, .aggs = aggs, .queue = .{ .nitems = pq_parts } };
     _ = try parallel.spawnJoin(env.arena, @min(threads, pq_parts), slotMergeWorker, &mctx);
-    if (mctx.queue.first_err) |e| return e;
+    if (mctx.queue.failure()) |e| return e;
 
     env.log.log(.debug, "parallel agg combine: {d} partial groups over {d} partitions", .{ total, pq_parts });
 
@@ -513,7 +535,7 @@ fn writeGroups(
         .ord = &ord,
     };
     _ = try parallel.spawnJoin(env.arena, @min(threads, sets.len), groupWriteWorker, &ctx);
-    if (ctx.queue.first_err) |e| return e;
+    if (ctx.queue.failure()) |e| return e;
     stats.rows_out += ctx.rows_out.load(.monotonic);
 }
 
@@ -721,18 +743,61 @@ const PqAggCtx = struct {
 /// the parallelism buys.
 /// The shared row-group work list a parallel parquet path hands to its lanes.
 const PqMorsels = struct {
-    path: []const u8,
+    /// One file, or a folder's files in order.
+    files: []const []const u8,
+    /// The folder `files` are under, which a mismatch message names; null for one file.
+    root: ?[]const u8 = null,
+    /// What each work item reads: a row group of a local file, a whole remote one.
+    items: []const PqItem,
     project: ?[][]const u8,
     bounds: []const pqdecode.Bound,
     src_schema: *const types.Schema,
-    per_item: usize,
     queue: WorkQueue,
     tally: ?*driver.ScanTally = null,
+    /// Lanes beyond this take nothing: a remote folder's lanes each hold a
+    /// session to one server, and OpenSSH refuses past ten at once by default.
+    max_lanes: usize = std.math.maxInt(usize),
+    /// The files after the first are checked against it as lanes open them, as
+    /// a remote folder's footers are not all read up front.
+    check_in_lane: bool = false,
 };
+
+const PqItem = struct { file: u32, rg: u32, rg_end: ?u32 };
+
+/// A lane's open file, kept across the items it takes from it: reopening it
+/// per row group re-read and re-parsed the footer each time.
+const HeldFile = struct { file: u32, r: *pqdecode.Reader };
+
+/// The reader positioned on item `i`, reusing `held` when it is the same file;
+/// null when the item holds nothing (a file that shrank since it was planned).
+fn openItem(m: *const PqMorsels, scratch: std.mem.Allocator, held: *?HeldFile, i: usize) !?*pqdecode.Reader {
+    const it = m.items[i];
+    if (held.*) |h| if (h.file != it.file) {
+        h.r.close();
+        held.* = null;
+    };
+    if (held.* == null) {
+        const path = m.files[it.file];
+        const r = try pqdecode.Reader.openProjected(scratch, path, m.project);
+        if (m.check_in_lane and it.file != 0) if (pqdecode.schemaMismatch(scratch, m.src_schema.*, r.schema)) |why| {
+            r.close();
+            return eval.explain(error.ParquetFolderMismatch, pqdecode.mismatchMessage(scratch, m.root orelse "", path, m.files[0], why));
+        };
+        held.* = .{ .file = it.file, .r = r };
+    }
+    const r = held.*.?.r;
+    r.bounds = m.bounds;
+    r.tally = m.tally;
+    r.rg = it.rg;
+    r.rg_end = if (it.rg_end) |e| e else null;
+    if (r.rg >= r.md.row_groups.len) return null;
+    return r;
+}
 
 const MorselSource = struct {
     m: *PqMorsels,
     scratch: std.mem.Allocator,
+    held: ?HeldFile = null,
     cur: ?*pqdecode.Reader = null,
     /// When set, this source owns a fixed arithmetic slice of the morsels
     /// (`next`, `next + step`, …) instead of stealing whichever is free.
@@ -765,29 +830,17 @@ const MorselSource = struct {
         while (true) {
             if (self.cur) |r| {
                 if (try r.next(arena)) |b| return b;
-                // Exhausted morsel: release its file handle. A reader was opened
-                // per row group and never closed, so a lane leaked one fd (and
-                // one parsed footer in its arena) per row group it took.
-                r.close();
                 self.cur = null;
             }
             if (self.m.queue.failed.load(.seq_cst)) return null;
             const i = self.nextIndex() orelse return null;
-            const r = try pqdecode.Reader.openProjected(self.scratch, self.m.path, self.m.project);
-            r.bounds = self.m.bounds;
-            r.tally = self.m.tally;
-            r.rg = i * self.m.per_item;
-            if (r.rg >= r.md.row_groups.len) {
-                r.close();
-                continue;
-            }
-            r.rg_end = @min(r.rg + self.m.per_item, r.md.row_groups.len);
-            self.cur = r;
+            self.cur = try openItem(self.m, self.scratch, &self.held, i);
         }
     }
     fn closeFn(ptr: *anyopaque) void {
         const self: *MorselSource = @ptrCast(@alignCast(ptr));
-        if (self.cur) |r| r.close();
+        if (self.held) |h| h.r.close();
+        self.held = null;
         self.cur = null;
     }
     const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
@@ -986,15 +1039,11 @@ fn laneRowSource(rows: LaneRows, scratch: std.mem.Allocator) !?driver.Source {
             return .{ .ptr = ms, .vtable = &MorselSource.vtable };
         },
         .parquet_group => |g| {
-            const rdr = try pqdecode.Reader.openProjected(scratch, g.m.path, g.m.project);
-            rdr.bounds = g.m.bounds;
-            rdr.tally = g.m.tally;
-            rdr.rg = g.group;
-            if (rdr.rg >= rdr.md.row_groups.len) {
-                rdr.close();
+            var held: ?HeldFile = null;
+            const rdr = (try openItem(g.m, scratch, &held, g.group)) orelse {
+                if (held) |h| h.r.close();
                 return null;
-            }
-            rdr.rg_end = rdr.rg + g.m.per_item;
+            };
             const rs = try scratch.create(ReaderSource);
             rs.* = .{ .r = rdr, .schema_ = g.m.src_schema };
             return .{ .ptr = rs, .vtable = &ReaderSource.vtable };
@@ -1020,6 +1069,23 @@ fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: ast.
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return null;
     if (opts.threads < pq_min_lanes) return null;
 
+    // A folder's files, local or remote; a single remote file stays serial, as
+    // each lane would fetch its footer again.
+    var files: []const []const u8 = &.{};
+    var root: ?[]const u8 = null;
+    if (folder.isFolder(path)) {
+        const fr = (try connect_mod.resolveFolderFmt(env, path, env.fmt_in)) orelse return null;
+        if (fr.kind != .parquet) return null;
+        files = fr.files;
+        root = path;
+    } else {
+        if (csv.CsvReader.isUrl(path)) return null;
+        const one = try arena.alloc([]const u8, 1);
+        one[0] = path;
+        files = one;
+    }
+    const remote = csv.CsvReader.isUrl(path);
+
     // `push_stages` is the caller's: the aggregate and distinct paths hand over
     // the whole pipeline, join included, because `projectedColumns` understands a
     // `.join` stage (it contributes the left keys) and restricting it made those
@@ -1027,9 +1093,34 @@ fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: ast.
     // only, since past its join the column names are the join's, not the source's.
     const project = try projectedColumns(env, push_stages);
     const bounds = try filterBounds(env, push_stages);
-    const probe = pqdecode.Reader.openProjected(arena, path, project) catch return null;
-    const ngroups = probe.md.row_groups.len;
-    if (ngroups < 2) return null;
+    const probe = pqdecode.Reader.openProjected(arena, files[0], project) catch return null;
+    defer probe.close();
+    var schema = probe.schema;
+    if (root != null) {
+        const fields = try arena.alloc(types.Schema.Field, schema.fields.len);
+        for (fields, schema.fields) |*f, x| f.* = .{ .name = x.name, .ty = x.ty.asNullable() };
+        schema = .{ .fields = fields };
+    }
+
+    // A local file splits at row groups, each footer read here, which also checks
+    // every file against the first before a lane starts. A remote folder splits
+    // at files: its footers are fetched by the lanes that read them.
+    var items = std.array_list.Managed(PqItem).init(arena);
+    if (remote) {
+        if (files.len < 2) return null;
+        for (0..files.len) |k| try items.append(.{ .file = @intCast(k), .rg = 0, .rg_end = null });
+    } else {
+        for (files, 0..) |f, k| {
+            const r = if (k == 0) probe else pqdecode.Reader.openProjected(arena, f, project) catch |e|
+                return planErrT(env.diag, e, try std.fmt.allocPrint(arena, "could not read parquet `{s}` ({s})", .{ f, @errorName(e) }));
+            defer if (k != 0) r.close();
+            if (k != 0) if (pqdecode.schemaMismatch(arena, schema, r.schema)) |why|
+                return planErr(env.diag, pqdecode.mismatchMessage(arena, root.?, f, files[0], why));
+            for (0..r.md.row_groups.len) |g| try items.append(.{ .file = @intCast(k), .rg = @intCast(g), .rg_end = @intCast(g + 1) });
+        }
+        if (items.items.len < 2) return null;
+    }
+    if (root != null) env.folder_memo = null;
     if (env.scan) |t| {
         driver.ScanTally.add(&t.columns_read, probe.leaves.len);
         driver.ScanTally.add(&t.columns_total, probe.md.leafCount());
@@ -1037,12 +1128,15 @@ fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: ast.
 
     return .{ .parquet = .{
         .tally = env.scan,
-        .path = path,
+        .files = files,
+        .root = root,
+        .items = items.items,
         .project = project,
         .bounds = bounds,
-        .src_schema = try schemaPtr(arena, probe.schema),
-        .per_item = 1,
-        .queue = .{ .nitems = ngroups },
+        .src_schema = try schemaPtr(arena, schema),
+        .queue = .{ .nitems = items.items.len },
+        .max_lanes = if (!remote) std.math.maxInt(usize) else if (sftp.isUrl(path)) 4 else 8,
+        .check_in_lane = remote and root != null,
     } };
 }
 
@@ -1090,6 +1184,15 @@ const LaneSplit = union(enum) {
         return switch (self) {
             .csv => nthreads,
             .parquet => |m| m.queue.nitems,
+        };
+    }
+
+    /// The lanes worth starting for `threads`: a remote folder's are capped.
+    fn lanes(self: *const LaneSplit, threads: usize) usize {
+        const n = @max(@as(usize, 1), threads);
+        return switch (self.*) {
+            .csv => n,
+            .parquet => |m| @min(n, m.max_lanes),
         };
     }
 
@@ -1145,7 +1248,7 @@ const LaneSplit = union(enum) {
     fn unitName(self: LaneSplit) []const u8 {
         return switch (self) {
             .csv => "chunks",
-            .parquet => "row groups",
+            .parquet => |m| if (m.items.len > 0 and m.items[0].rg_end == null) "files" else "row groups",
         };
     }
 };
@@ -1464,7 +1567,7 @@ fn runParallelMapImpl(
     var shared_open = sink_mode == .shared;
     errdefer if (shared_open) sink_mode.shared.abort();
 
-    const nthreads = @max(@as(usize, 1), opts.threads);
+    const nthreads = split.lanes(opts.threads);
     var ctx = MapCtx{
         .split = split,
         .map_stages = map_stages,
@@ -1501,7 +1604,7 @@ fn runParallelMapImpl(
         });
     }
 
-    if (ctx.queue.first_err) |e| return e;
+    if (ctx.queue.failure()) |e| return e;
     stats.rows_out += ctx.rows_out.load(.monotonic);
     if (sink_mode == .shared) {
         shared_open = false;
@@ -1660,7 +1763,7 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
     env.src_name = split.label();
     env.sink_name = sinkLabel(env, w);
 
-    const nthreads = @max(@as(usize, 1), opts.threads);
+    const nthreads = split.lanes(opts.threads);
     const lanes = try env.gpa.alloc(PqLane, nthreads);
     defer env.gpa.free(lanes);
     for (lanes) |*l| {
@@ -1691,7 +1794,7 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
     const used = try parallel.spawnJoin(arena, nthreads, pqAggLane, &ctx);
     const t_fold1 = std.time.Instant.now() catch unreachable;
     lanes_used.* = @max(lanes_used.*, used);
-    if (ctx.morsels.queue.first_err) |e| return e;
+    if (ctx.morsels.queue.failure()) |e| return e;
 
     const parts = try env.gpa.alloc(PqPart, pq_parts);
     defer env.gpa.free(parts);
@@ -1724,7 +1827,7 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
     } else {
         var mctx = PqMergeCtx{ .lanes = lanes, .parts = parts, .aggs = aggs, .queue = .{ .nitems = pq_parts } };
         _ = try parallel.spawnJoin(arena, nthreads, pqMergeWorker, &mctx);
-        if (mctx.queue.first_err) |e| return e;
+        if (mctx.queue.failure()) |e| return e;
     }
     const t_mrg1 = std.time.Instant.now() catch unreachable;
     var lane_groups: usize = 0;
@@ -1773,7 +1876,7 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
                 .sel = try arena.alloc([]const u32, pq_parts),
             };
             _ = try parallel.spawnJoin(arena, nthreads, pqTopNWorker, &tctx);
-            if (tctx.queue.first_err) |e| return e;
+            if (tctx.queue.failure()) |e| return e;
             // `sel` lines up with the sets `partSets` returns: one per partition that
             // received a group, in order.
             var kept = std.array_list.Managed([]const u32).init(arena);
@@ -1869,7 +1972,7 @@ fn runParallelCsvAggImpl(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag:
     lanes_used.* = @max(lanes_used.*, lanes);
     env.log.log(.debug, "parallel csv aggregate: {d} chunks over {d} lanes", .{ nthreads, lanes });
 
-    if (ctx.queue.first_err) |e| return e;
+    if (ctx.queue.failure()) |e| return e;
 
     const csets = try combineAggSlots(env, slots, aggs, opts.threads, parts);
 
@@ -2007,7 +2110,7 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
         if (pd.where_extra != null) "yes" else "no",
     });
 
-    if (ctx.queue.first_err) |e| return e;
+    if (ctx.queue.failure()) |e| return e;
 
     const csets = try combineAggSlots(env, slots, aggs, opts.threads, parts);
 
@@ -2321,7 +2424,7 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
     lanes_used.* = @max(lanes_used.*, lanes);
     env.log.log(.debug, "split-parallel map+join: {d} splits over {d} lanes", .{ sp.predicates.len, lanes });
 
-    if (ctx.queue.first_err) |e| return e;
+    if (ctx.queue.failure()) |e| return e;
     stats.rows_out += ctx.rows_out.load(.monotonic);
     if (sink_mode == .shared) {
         shared_open = false;
@@ -2442,7 +2545,7 @@ fn runParallelTopN(
     env.src_name = split.label();
     env.sink_name = sinkLabel(env, w);
 
-    const nthreads = @max(@as(usize, 1), opts.threads);
+    const nthreads = split.lanes(opts.threads);
     const builders = try arena.alloc(column.Builder, row_schema.fields.len);
     for (builders, row_schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
     var ctx = TopNCtx{
@@ -2461,7 +2564,7 @@ fn runParallelTopN(
     const lanes = try parallel.spawnJoin(arena, nthreads, topnWorker, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
     env.log.log(.debug, "parallel {s} top-n: {d} {s} over {d} lanes", .{ split.label(), split.count(nthreads), split.unitName(), lanes });
-    if (ctx.queue.first_err) |e| return e;
+    if (ctx.queue.failure()) |e| return e;
 
     const cols = try arena.alloc(column.Column, builders.len);
     for (builders, cols) |*b, *c| c.* = try b.finish();
@@ -2703,7 +2806,7 @@ fn runParallelDistinct(
     env.src_name = split.label();
     env.sink_name = sinkLabel(env, w);
 
-    const nthreads = @max(@as(usize, 1), opts.threads);
+    const nthreads = split.lanes(opts.threads);
     const nitems = split.count(nthreads);
     var merge = DistinctMerge.init(arena, key_idx);
     var ctx = DistinctCtx{
@@ -2722,7 +2825,7 @@ fn runParallelDistinct(
     const lanes = try parallel.spawnJoin(arena, nthreads, distinctWorker, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
     env.log.log(.debug, "parallel {s} distinct: {d} {s} over {d} lanes", .{ split.label(), nitems, split.unitName(), lanes });
-    if (ctx.queue.first_err) |e| return e;
+    if (ctx.queue.failure()) |e| return e;
 
     const merged = try merge.finish(row_schema);
 

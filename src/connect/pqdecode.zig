@@ -2363,6 +2363,36 @@ pub const Reader = struct {
     }
 };
 
+/// How `got` — a folder file's columns — differs from `want`, the first file's,
+/// in words; null when it does not. Nullability is not compared: the folder's
+/// columns are all nullable.
+pub fn schemaMismatch(arena: std.mem.Allocator, want: types.Schema, got: types.Schema) ?[]const u8 {
+    for (want.fields, 0..) |w, k| {
+        if (k >= got.fields.len) return std.fmt.allocPrint(arena, "it has no column `{s}`", .{w.name}) catch "a column is missing";
+        const g = got.fields[k];
+        if (!std.mem.eql(u8, w.name, g.name)) {
+            for (got.fields) |o| if (std.mem.eql(u8, o.name, w.name))
+                return std.fmt.allocPrint(arena, "its columns are in another order (`{s}` where `{s}` is expected)", .{ g.name, w.name }) catch "columns in another order";
+            return std.fmt.allocPrint(arena, "it has no column `{s}`", .{w.name}) catch "a column is missing";
+        }
+        if (w.ty.kind != g.ty.kind or w.ty.precision != g.ty.precision or w.ty.scale != g.ty.scale)
+            return std.fmt.allocPrint(arena, "column `{s}` is {s} there, not {s}", .{ w.name, @tagName(g.ty.kind), @tagName(w.ty.kind) }) catch "a column has another type";
+    }
+    if (got.fields.len > want.fields.len)
+        return std.fmt.allocPrint(arena, "it has a column `{s}` the first file lacks", .{got.fields[want.fields.len].name}) catch "an extra column";
+    return null;
+}
+
+/// The message for a folder file refused by `schemaMismatch`.
+pub fn mismatchMessage(arena: std.mem.Allocator, root: []const u8, path: []const u8, first: []const u8, why: []const u8) []const u8 {
+    const rel = struct {
+        fn f(r: []const u8, x: []const u8) []const u8 {
+            return if (std.mem.startsWith(u8, x, r)) x[r.len..] else x;
+        }
+    }.f;
+    return std.fmt.allocPrint(arena, "`{s}` in folder `{s}` does not match `{s}`, its first file: {s}", .{ rel(root, path), root, rel(root, first), why }) catch why;
+}
+
 /// A folder of Parquet files read as one table, file after file in the order
 /// given. The first file's columns are the table's; every other file must have
 /// the same ones — names, order and types, nullability aside — among those the
@@ -2417,35 +2447,14 @@ pub const Folder = struct {
             const r = try Reader.openProjected(self.arena, path, self.project);
             if (self.mismatch(r.schema)) |why| {
                 r.close();
-                const msg = try std.fmt.allocPrint(self.arena, "`{s}` in folder `{s}` does not match `{s}`, its first file: {s}", .{ self.rel(path), self.root, self.rel(self.files[0]), why });
-                return eval.explain(error.ParquetFolderMismatch, msg);
+                return eval.explain(error.ParquetFolderMismatch, mismatchMessage(self.arena, self.root, path, self.files[0], why));
             }
             self.cur = r;
         }
     }
 
-    fn rel(self: *const Folder, path: []const u8) []const u8 {
-        return if (std.mem.startsWith(u8, path, self.root)) path[self.root.len..] else path;
-    }
-
     fn mismatch(self: *Folder, got: types.Schema) ?[]const u8 {
-        const want = self.schema.fields;
-        for (want, 0..) |w, k| {
-            if (k >= got.fields.len) return std.fmt.allocPrint(self.arena, "it has no column `{s}`", .{w.name}) catch "a column is missing";
-            const g = got.fields[k];
-            if (!std.mem.eql(u8, w.name, g.name)) {
-                for (got.fields) |o| if (std.mem.eql(u8, o.name, w.name))
-                    return std.fmt.allocPrint(self.arena, "its columns are in another order (`{s}` where `{s}` is expected)", .{ g.name, w.name }) catch "columns in another order";
-                return std.fmt.allocPrint(self.arena, "it has no column `{s}`", .{w.name}) catch "a column is missing";
-            }
-            const a = w.ty;
-            const b = g.ty;
-            if (a.kind != b.kind or a.precision != b.precision or a.scale != b.scale)
-                return std.fmt.allocPrint(self.arena, "column `{s}` is {s} there, not {s}", .{ w.name, @tagName(b.kind), @tagName(a.kind) }) catch "a column has another type";
-        }
-        if (got.fields.len > want.len)
-            return std.fmt.allocPrint(self.arena, "it has a column `{s}` the first file lacks", .{got.fields[want.len].name}) catch "an extra column";
-        return null;
+        return schemaMismatch(self.arena, self.schema, got);
     }
 
     pub fn close(self: *Folder) void {

@@ -599,6 +599,17 @@ if runs sftp; then
      brun run -c "$KEY LOAD INTO '$out/sftp_pq_dir.csv' AS SELECT * FROM 'sftp://box/~/out/pq/' ORDER BY id;"; then
     check sftp-parquet-folder "$out/sftp_pq_dir.csv" it/expected.csv
   else report "sftp-parquet-folder (run error)" bad; fi
+  # the same folder folded in parallel, a file per lane, against the local file
+  if $B run -j 4 --log-level debug -c "$KEY LOAD INTO '$out/sftp_pq_agg.csv' AS SELECT COUNT(*) AS n, SUM(id) AS s FROM 'sftp://box/~/out/pq/';" 2>"$out/sftp_pq_agg.log" &&
+     grep -q "parallel parquet aggregate" "$out/sftp_pq_agg.log"; then
+    brun run -c "LOAD INTO '$out/sftp_pq_agg_want.csv' AS SELECT COUNT(*) AS n, SUM(id) AS s FROM 'it/seed.csv';"
+    check sftp-parquet-folder-parallel "$out/sftp_pq_agg.csv" "$out/sftp_pq_agg_want.csv"
+  else report "sftp-parquet-folder-parallel (run error or not parallel)" bad; cat "$out/sftp_pq_agg.log"; fi
+  # a file whose columns differ fails the read by name, though a lane found it
+  brun run -c "$KEY LOAD INTO 'sftp://box/~/out/pq/zz.parquet' AS SELECT 'x' AS other;" >/dev/null
+  $B run -q -j 4 -c "$KEY SELECT * FROM 'sftp://box/~/out/pq/';" >"$out/sftp_pq_bad.txt" 2>&1 || true
+  if grep -q "zz.parquet. in folder .* does not match" "$out/sftp_pq_bad.txt"; then report "sftp-parquet-folder-mismatch-named" ok
+  else report "sftp-parquet-folder-mismatch-named" bad; cat "$out/sftp_pq_bad.txt"; fi
 
   # a rename that cannot happen (the target is a folder) fails the load and leaves no .part
   docker exec $SC sh -c 'mkdir -p /config/out/isdir/x && chown -R 1000:1000 /config/out'

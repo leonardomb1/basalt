@@ -300,6 +300,12 @@ pub fn isLocalCsvRead(rd: ast.Read) bool {
     };
 }
 
+/// A folder read, local or remote: the parquet lanes take it when it holds Parquet.
+pub fn isFolderRead(rd: ast.Read) bool {
+    if (!std.mem.eql(u8, rd.connector, "csv")) return false;
+    return rd.form == .path and folder.isFolder(rd.form.path);
+}
+
 pub fn isLocalParquetRead(rd: ast.Read) bool {
     if (!std.mem.eql(u8, rd.connector, "csv")) return false;
     return switch (rd.form) {
@@ -419,10 +425,16 @@ pub fn openSourceProjected(
 /// twice on its way there, and each listing is a round trip.
 pub fn resolveFolder(env: *Env, path: []const u8, hints: []const ast.Hint) !?FolderRead {
     if (!folder.isFolder(path)) return null;
-    if (env.folder_memo) |m| if (std.mem.eql(u8, m.path, path)) return m.read;
     var fdiag = analyze.Diag{};
     const want = analyze.formatFromHints(hints, &fdiag) catch
         return planErr(env.diag, try env.arena.dupe(u8, fdiag.msg));
+    return resolveFolderFmt(env, path, want);
+}
+
+/// `resolveFolder` with the read's `format` already taken from its hints.
+pub fn resolveFolderFmt(env: *Env, path: []const u8, want: ?analyze.FileFormat) !?FolderRead {
+    if (!folder.isFolder(path)) return null;
+    if (env.folder_memo) |m| if (std.mem.eql(u8, m.path, path)) return m.read;
     const all = folder.list(env.arena, path) catch |e| {
         // a mistyped prefix and an empty one are the same listing: say which came back empty
         if (e == azure.Error.AzureEmptyPrefix)

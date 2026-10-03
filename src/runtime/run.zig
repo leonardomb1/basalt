@@ -62,6 +62,7 @@ const guardFileFormat = @import("connect.zig").guardFileFormat;
 const registerSftp = @import("connect.zig").registerSftp;
 const isLocalCsvRead = @import("connect.zig").isLocalCsvRead;
 const isLocalParquetRead = @import("connect.zig").isLocalParquetRead;
+const isFolderRead = @import("connect.zig").isFolderRead;
 const openSink = @import("connect.zig").openSink;
 const openSource = @import("connect.zig").openSource;
 const openSplitSource = @import("connect.zig").openSplitSource;
@@ -623,7 +624,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     if (laneEligible(head_stages, opts)) {
         if (classifyLaneShape(head_stages)) |shape| {
             const rd = head_stages[0].node.read;
-            if (isLocalParquetRead(rd)) {
+            if (isLocalParquetRead(rd) or isFolderRead(rd)) {
                 if (try runParquetLane(env, head_stages, shape, last.write, opts, stats, lanes_used)) return;
             } else if (isLocalCsvRead(rd)) {
                 if (try runCsvLane(env, head_stages, shape, last.write, opts, stats, lanes_used)) return;
