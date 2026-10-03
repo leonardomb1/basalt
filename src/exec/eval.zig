@@ -1494,6 +1494,26 @@ fn writeJsonValue(arena: std.mem.Allocator, v: Value, w: *std.Io.Writer) EvalErr
 /// `body` with the lambda parameter `name` replaced by `v`, as a literal — how an
 /// element reaches the body. An inner lambda with the same parameter shadows it.
 pub fn bindLambda(arena: std.mem.Allocator, body: *const ast.Expr, name: []const u8, v: Value) error{OutOfMemory}!*ast.Expr {
+    const lit = try arena.create(ast.Expr);
+    lit.* = try literalOf(arena, v);
+    return bindLambdaTo(arena, body, name, lit);
+}
+
+/// A value as the literal expression that stands for it.
+fn literalOf(arena: std.mem.Allocator, v: Value) error{OutOfMemory}!ast.Expr {
+    return switch (v) {
+        .null => .null_lit,
+        .bool => |x| .{ .bool_lit = x },
+        .int => |x| .{ .int_lit = x },
+        .float => |x| .{ .float_lit = x },
+        .string => |x| .{ .str_lit = x },
+        else => .{ .str_lit = try valueToString(arena, v) },
+    };
+}
+
+/// `body` with the lambda parameter `name` replaced by the node `lit` — one node
+/// for every mention, so a caller can rebind it by overwriting `lit`.
+fn bindLambdaTo(arena: std.mem.Allocator, body: *const ast.Expr, name: []const u8, lit: *ast.Expr) error{OutOfMemory}!*ast.Expr {
     const Bind = struct {
         arena: std.mem.Allocator,
         name: []const u8,
@@ -1506,15 +1526,6 @@ pub fn bindLambda(arena: std.mem.Allocator, body: *const ast.Expr, name: []const
             }
             return ast.rebuildExpr(b.arena, e, b, recur);
         }
-    };
-    const lit = try arena.create(ast.Expr);
-    lit.* = switch (v) {
-        .null => .null_lit,
-        .bool => |x| .{ .bool_lit = x },
-        .int => |x| .{ .int_lit = x },
-        .float => |x| .{ .float_lit = x },
-        .string => |x| .{ .str_lit = x },
-        else => .{ .str_lit = try valueToString(arena, v) },
     };
     return Bind.recur(.{ .arena = arena, .name = name, .lit = lit }, body);
 }
@@ -2274,9 +2285,14 @@ const per_row = struct {
         const w = &out.writer;
         w.writeByte('[') catch return error.OutOfMemory;
         var n: usize = 0;
+        // The body is bound once, to a literal each element then overwrites:
+        // rebuilding it per element was most of what a lambda cost.
+        const slot = try arena.create(ast.Expr);
+        slot.* = .null_lit;
+        const body = try bindLambdaTo(arena, l.body, l.param, slot);
         var items = json.Elements.root(doc);
         while (items.next()) |el| {
-            const body = try bindLambda(arena, l.body, l.param, try jsonElementValue(arena, el));
+            slot.* = try literalOf(arena, try jsonElementValue(arena, el));
             // A JSON array may mix kinds: an element the body cannot compare — a
             // number against text — is null there, not a failed query. A CAST that
             // fails still fails, as it does anywhere else.
