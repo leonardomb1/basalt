@@ -1189,7 +1189,7 @@ const Ctx = struct {
         // (`plan.prepareJoinSide`), so the WHERE it sends is on the plan too.
         const b = self.bindings.get(j.binding) orelse return st;
         if (b.stages.len == 0) return st;
-        const head = try self.inlineHead(b.stages);
+        const head = try self.inlineHead(try j.rightStages(self.arena, b.stages));
         const stages = (pushdown.hoistFilters(self.arena, self.arena, head.stages, self.bindings) catch null) orelse head.stages;
         if (stages[0].node != .read) return st;
         var src = self.resolveSource(stages[0]) catch return st;

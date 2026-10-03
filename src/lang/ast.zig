@@ -269,6 +269,19 @@ pub const Join = struct {
     /// on either side makes the comparison unknown: no row survives a subquery that
     /// returned a NULL, and a NULL `x` survives only an empty one.
     null_aware: bool = false,
+    /// A filter on the right side's own columns, applied where that side is read
+    /// so it descends into its source — moved here from a WHERE after an inner
+    /// join (`pushdown.pushIntoJoinSides`), in the right side's names.
+    right_filter: ?*Expr = null,
+
+    /// The right side's stages with `right_filter` appended, for building it.
+    pub fn rightStages(self: Join, arena: std.mem.Allocator, stages: []const Stage) ![]const Stage {
+        const f = self.right_filter orelse return stages;
+        const out = try arena.alloc(Stage, stages.len + 1);
+        @memcpy(out[0..stages.len], stages);
+        out[stages.len] = .{ .node = .{ .filter = f }, .hints = &.{}, .pos = if (stages.len > 0) stages[0].pos else .{ .line = 0, .col = 0 } };
+        return out;
+    }
 };
 
 pub const Write = struct {

@@ -2491,7 +2491,108 @@ pub fn hoistFilters(
         changed = true;
         if (try hoistThroughSelects(arena, cur)) |t| cur = t;
     }
+    // after the key twins are derived from these filters, not before
+    if (try pushIntoJoinSides(arena, cur)) |s| {
+        cur = s;
+        changed = true;
+    }
     return if (changed) cur else null;
+}
+
+/// Rewrite `stages` so a filter after an inner or cross join that names only the
+/// right side's columns, each by the join's alias (`WHERE i.valor > 0`), becomes
+/// that join's `right_filter`: applied where the right side is read, it descends
+/// into the right side's source instead of every row of it crossing the wire to be
+/// joined and dropped. Conjunct by conjunct; it may pass other inner joins and
+/// filters to reach its join. Never a LEFT, RIGHT or FULL join: there a filter on
+/// the right side also removes or keeps the unmatched rows, which moving it would
+/// change. A bare name stays put — with the left schema unknown, it could be
+/// either side's. Returns null when nothing moved.
+pub fn pushIntoJoinSides(arena: std.mem.Allocator, stages: []const ast.Stage) !?[]const ast.Stage {
+    var list = std.array_list.Managed(ast.Stage).init(arena);
+    try list.appendSlice(stages);
+    var changed = false;
+    var i: usize = 1;
+    while (i < list.items.len) {
+        if (list.items[i].node != .filter) {
+            i += 1;
+            continue;
+        }
+        var parts = std.array_list.Managed(*ast.Expr).init(arena);
+        try splitAnd(list.items[i].node.filter, &parts);
+        var stay: ?*ast.Expr = null;
+        var moved = false;
+        for (parts.items) |c| {
+            const target = (try rightAliasOf(arena, c)) orelse {
+                stay = try andWith(arena, stay, c);
+                continue;
+            };
+            var k = i;
+            const at: ?usize = while (k > 0) {
+                k -= 1;
+                switch (list.items[k].node) {
+                    .filter => {},
+                    .join => |j| {
+                        if (j.kind != .inner and j.kind != .cross) break null;
+                        if (std.mem.eql(u8, j.alias, target) or std.mem.eql(u8, j.binding, target)) break k;
+                    },
+                    else => break null,
+                }
+            } else null;
+            const jk = at orelse {
+                stay = try andWith(arena, stay, c);
+                continue;
+            };
+            var j = list.items[jk].node.join;
+            j.right_filter = try andWith(arena, j.right_filter, try unqualify(arena, c, target));
+            list.items[jk].node = .{ .join = j };
+            moved = true;
+        }
+        if (!moved) {
+            i += 1;
+            continue;
+        }
+        changed = true;
+        if (stay) |rest| {
+            list.items[i].node = .{ .filter = rest };
+            i += 1;
+        } else _ = list.orderedRemove(i);
+    }
+    if (!changed) return null;
+    return try list.toOwnedSlice();
+}
+
+/// The qualifier every column `e` names shares — `i` for `i.valor > 0 AND i.qty
+/// <> 0` — or null when one is bare, they differ, or there is none.
+fn rightAliasOf(arena: std.mem.Allocator, e: *const ast.Expr) !?[]const u8 {
+    var refs = std.array_list.Managed(ast.QualName).init(arena);
+    try collectQuals(arena, e, &refs);
+    var alias: ?[]const u8 = null;
+    for (refs.items) |q| {
+        if (q.dollar) continue;
+        if (q.parts.len != 2) return null;
+        if (alias) |a| {
+            if (!std.mem.eql(u8, a, q.parts[0])) return null;
+        } else alias = q.parts[0];
+    }
+    return alias;
+}
+
+const Unqualify = struct { arena: std.mem.Allocator, alias: []const u8 };
+
+fn unqualifyRecur(cx: Unqualify, e: *const ast.Expr) error{OutOfMemory}!*ast.Expr {
+    if (e.* == .field) {
+        const q = e.field;
+        if (!q.dollar and q.parts.len == 2 and std.mem.eql(u8, q.parts[0], cx.alias))
+            return mkExpr(cx.arena, .{ .field = try qual(cx.arena, q.parts[1..]) });
+        return @constCast(e);
+    }
+    return ast.rebuildExpr(cx.arena, e, cx, unqualifyRecur);
+}
+
+/// `e` with `alias.col` written `col`, the right side's own name for it.
+fn unqualify(arena: std.mem.Allocator, e: *ast.Expr, alias: []const u8) !*ast.Expr {
+    return unqualifyRecur(.{ .arena = arena, .alias = alias }, e);
 }
 
 /// Rewrite `stages` so a filter written after a projection sits before it, when
@@ -2723,6 +2824,46 @@ test "hoist: a projection keeps a filter it computes, or names per row, and a qu
     const star = [_]ast.SelectItem{ .star, .{ .computed = .{ .name = "y", .expr = try bin(a, .add, try fld(a, "x"), try intLit(a, 1)) } } };
     const s5 = [_]ast.Stage{ readStage(), projStage(&star), filterStage(try bin(a, .eq, try fld(a, "k"), try intLit(a, 1))), writeStage() };
     try std.testing.expect((try hoistThroughSelects(a, &s5)).?[1].node == .filter);
+}
+
+test "push: a filter on an inner join's right side by its alias becomes the join's, in the right side's names" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // read | join r | filter(r.v > 0 AND x > 1) | write
+    const stages = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), filterStage(try bin(a, .@"and", try bin(a, .gt, try qfld(a, &.{ "r", "v" }), try intLit(a, 0)), try bin(a, .gt, try fld(a, "x"), try intLit(a, 1)))), writeStage() };
+    const out = (try pushIntoJoinSides(a, &stages)).?;
+    // the `r.v` half moved onto the join, unqualified; the bare `x` half stayed
+    const rf = out[1].node.join.right_filter.?;
+    try std.testing.expectEqual(@as(usize, 1), rf.binary.l.field.parts.len);
+    try std.testing.expectEqualStrings("v", rf.binary.l.field.parts[0]);
+    try std.testing.expectEqualStrings("x", out[2].node.filter.binary.l.field.parts[0]);
+    // a filter that moved whole leaves no stage behind
+    const whole = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), filterStage(try bin(a, .gt, try qfld(a, &.{ "r", "v" }), try intLit(a, 0))), writeStage() };
+    try std.testing.expectEqual(@as(usize, 3), (try pushIntoJoinSides(a, &whole)).?.len);
+    // it passes another inner join to reach its own
+    const two = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), try joinStage(a, .inner, "s", "k", "sk"), filterStage(try bin(a, .gt, try qfld(a, &.{ "r", "v" }), try intLit(a, 0))), writeStage() };
+    const o2 = (try pushIntoJoinSides(a, &two)).?;
+    try std.testing.expect(o2[1].node.join.right_filter != null and o2[2].node.join.right_filter == null);
+}
+
+test "push: a filter stays after a LEFT join, across sides, on a bare name, or past a LEFT join" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const rv = try bin(a, .gt, try qfld(a, &.{ "r", "v" }), try intLit(a, 0));
+    // after a LEFT join a filter on the right side also drops the unmatched rows
+    const left = [_]ast.Stage{ readStage(), try joinStage(a, .left, "r", "k", "rk"), filterStage(rv), writeStage() };
+    try std.testing.expect((try pushIntoJoinSides(a, &left)) == null);
+    // one conjunct naming both sides is not the right side's alone
+    const across = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), filterStage(try bin(a, .@"or", rv, try bin(a, .eq, try fld(a, "x"), try intLit(a, 1)))), writeStage() };
+    try std.testing.expect((try pushIntoJoinSides(a, &across)) == null);
+    // a bare `v` could be the left side's, the right one renamed `v_r`
+    const bare = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), filterStage(try bin(a, .gt, try fld(a, "v"), try intLit(a, 0))), writeStage() };
+    try std.testing.expect((try pushIntoJoinSides(a, &bare)) == null);
+    // a LEFT join between the filter and its own join is not crossed
+    const past = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), try joinStage(a, .left, "s", "k", "sk"), filterStage(rv), writeStage() };
+    try std.testing.expect((try pushIntoJoinSides(a, &past)) == null);
 }
 
 test "hoist: a probe-only filter moves below an inner join" {

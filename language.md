@@ -444,8 +444,11 @@ Source clauses, in any order after the source:
   derived table or table function read as a `JOIN`'s right side is readied the
   same way — its own WHERE descends into its read and only the columns it uses
   are asked for — so `JOIN itens($filial) i` reads that branch's rows, not the
-  table. A filter written *after* the join on the right side's columns (`WHERE
-  i.valor > 0`) stays above the join (§11).
+  table. A filter written *after* an inner join that names only the right side's
+  columns, each by its alias (`WHERE i.valor > 0`), joins that read too — and
+  descends with it. After a `LEFT`, `RIGHT` or `FULL` join it stays above the
+  join, since there it also decides the unmatched rows; so does a condition
+  naming both sides, or a bare column name, which could be either side's.
 - **Text comparisons follow the column's collation**, so the source never keeps
   fewer rows than basalt would. basalt compares text byte by byte; a source
   compares by collation — case-insensitive by default on SQL Server and MySQL,
@@ -1718,8 +1721,8 @@ Accepted design not yet in the engine:
   `applyAggregation`/`applyJoin` do, and there is no runtime/dynamic filter — the
   build side's key values are not sent back to the probe scan, so a selective
   predicate on a *non-key* dimension column still reads the whole fact table.
-  And a filter written after a join on the right side's columns is not moved
-  into the right side's read; only the right side's own WHERE descends (§5).
+  And a filter on a join's right side by a bare name (`WHERE valor > 0` rather
+  than `i.valor`) stays above the join, as does one after an outer join (§5).
 
 Deliberately partial:
 

@@ -1114,7 +1114,7 @@ fn buildJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, left_schema: types
     const arena = env.arena;
     if (env.bindings.get(j.binding) == null)
         return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown binding `{s}` in join", .{j.binding}));
-    const build = try buildPipeline(env, try prepareJoinSide(env, env.bindings.get(j.binding).?.stages));
+    const build = try buildPipeline(env, try prepareJoinSide(env, try j.rightStages(env.arena, env.bindings.get(j.binding).?.stages)));
 
     var ad = analyze.Diag{};
     const jp = analyze.joinPlan(arena, left_schema, build.schema, j, &ad) catch |e| return aErr(env, &ad, e);

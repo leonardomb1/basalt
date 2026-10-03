@@ -2097,7 +2097,7 @@ fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suffix:
     const arena = env.arena;
     const binding = env.bindings.get(j.binding) orelse
         return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown binding `{s}` in join", .{j.binding}));
-    const build = try buildPipeline(env, try prepareJoinSide(env, binding.stages));
+    const build = try buildPipeline(env, try prepareJoinSide(env, try j.rightStages(arena, binding.stages)));
 
     var ad = analyze.Diag{};
     const jp = analyze.joinPlan(arena, left_schema, build.schema, j, &ad) catch |e| return aErr(env, &ad, e);
