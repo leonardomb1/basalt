@@ -364,6 +364,10 @@ pub const Session = struct {
     session_id: [32]u8 = undefined,
     have_session_id: bool = false,
     strict: bool = false,
+    /// Host key algorithms in the order offered: those `known_hosts` (or the
+    /// pin) has a key of for this server first, as OpenSSH does — else a server
+    /// with an ECDSA key on file would be asked for its Ed25519 one, and refused.
+    hk_order: [host_key_algs.len][]const u8 = host_key_algs,
     tx: Dir = .{},
     rx: Dir = .{},
     /// The last payload read; valid until the next read.
@@ -406,6 +410,7 @@ pub const Session = struct {
         self.sr = stream.reader(&self.rbuf);
         self.sw = stream.writer(&self.wbuf);
         errdefer self.release();
+        self.orderHostKeys();
         try self.handshake();
         try self.authenticate();
         return self;
@@ -618,13 +623,15 @@ pub const Session = struct {
     }
 
     fn kexinitPayload(self: *Session, out: *Buf) !void {
-        _ = self;
         try out.byte(msg.kexinit);
         var cookie: [16]u8 = undefined;
         crypto.random.bytes(&cookie);
         try out.list.appendSlice(&cookie);
         try out.str("curve25519-sha256,curve25519-sha256@libssh.org,ext-info-c,kex-strict-c-v00@openssh.com");
-        try out.str("ssh-ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256");
+        var hks: [128]u8 = undefined;
+        var hw = std.Io.Writer.fixed(&hks);
+        for (self.hk_order, 0..) |a, i| hw.print("{s}{s}", .{ if (i > 0) "," else "", a }) catch unreachable;
+        try out.str(hw.buffered());
         var ciphers: [256]u8 = undefined;
         var cw = std.Io.Writer.fixed(&ciphers);
         for (cipher_prefs, 0..) |c, i| cw.print("{s}{s}", .{ if (i > 0) "," else "", c.name() }) catch unreachable;
@@ -662,21 +669,26 @@ pub const Session = struct {
             try is_owned.appendSlice(p);
         }
         const is = is_owned.items;
+        if (is.len < 17) return self.fail(error.SshProtocol, "a short KEXINIT", .{});
 
         var c = Cursor{ .s = is[17..] };
         const kex_algs = try c.str();
-        const hostkey_algs = try c.str();
+        const hostkey_offer = try c.str();
         const enc_cs = try c.str();
         const enc_sc = try c.str();
         const mac_cs = try c.str();
         const mac_sc = try c.str();
         const comp_cs = try c.str();
         const comp_sc = try c.str();
-        if (first and listHas(kex_algs, "kex-strict-s-v00@openssh.com")) self.strict = true;
+        if (first and listHas(kex_algs, "kex-strict-s-v00@openssh.com")) {
+            self.strict = true;
+            // strict kex (the Terrapin fix) wants the server's KEXINIT as its first packet
+            if (self.rx.seq != 1) return self.fail(error.SshProtocol, "packets before the server's KEXINIT in a strict key exchange", .{});
+        }
         _ = pick(&.{ "curve25519-sha256", "curve25519-sha256@libssh.org" }, kex_algs) orelse
             return self.fail(error.SshNoCommonAlgorithm, "the server offers no curve25519 key exchange (it offers {s})", .{kex_algs});
-        const hk_alg = pick(&.{ "ssh-ed25519", "ecdsa-sha2-nistp256", "rsa-sha2-512", "rsa-sha2-256" }, hostkey_algs) orelse
-            return self.fail(error.SshNoCommonAlgorithm, "no host key algorithm in common (the server offers {s})", .{hostkey_algs});
+        const hk_alg = pick(&self.hk_order, hostkey_offer) orelse
+            return self.fail(error.SshNoCommonAlgorithm, "no host key algorithm in common (the server offers {s})", .{hostkey_offer});
         if (!listHas(comp_cs, "none") or !listHas(comp_sc, "none")) return self.fail(error.SshNoCommonAlgorithm, "the server requires compression", .{});
         var next_tx = Dir{};
         var next_rx = Dir{};
@@ -837,6 +849,36 @@ pub const Session = struct {
 
     // --- host keys ---------------------------------------------------------------
 
+    /// The `known_hosts` file's text, owned; empty when there is none.
+    fn knownHostsText(self: *Session) ![]const u8 {
+        const path = self.cfg.known_hosts orelse blk: {
+            const home = std.posix.getenv("HOME") orelse return "";
+            break :blk try std.fmt.allocPrint(self.gpa, "{s}/.ssh/known_hosts", .{home});
+        };
+        defer if (self.cfg.known_hosts == null) self.gpa.free(path);
+        return std.fs.cwd().readFileAlloc(self.gpa, path, 16 << 20) catch "";
+    }
+
+    fn orderHostKeys(self: *Session) void {
+        var known = [_]bool{false} ** host_key_algs.len;
+        if (self.cfg.host_key) |pin| {
+            var it = std.mem.tokenizeAny(u8, pin, " \t");
+            const t = it.next() orelse "";
+            for (host_key_algs, 0..) |a, i| known[i] = std.mem.eql(u8, keyTypeOfAlg(a), t);
+        } else {
+            const text = self.knownHostsText() catch return;
+            defer if (text.len > 0) self.gpa.free(text);
+            knownKeyTypes(text, self.cfg.host, self.cfg.port, &known);
+        }
+        var n: usize = 0;
+        for ([_]bool{ true, false }) |want| {
+            for (host_key_algs, known) |a, k| if (k == want) {
+                self.hk_order[n] = a;
+                n += 1;
+            };
+        }
+    }
+
     fn checkHostKey(self: *Session, blob: []const u8, alg: []const u8) !void {
         var fp_buf: [64]u8 = undefined;
         const fp = fingerprint(blob, &fp_buf);
@@ -849,15 +891,7 @@ pub const Session = struct {
             } else if (keyLineMatches(self.gpa, p, blob)) return;
             return self.fail(error.SshHostKeyChanged, "the host key of {s} is {s} {s}, not the pinned one — someone may be intercepting the connection, or the key was replaced", .{ self.cfg.host, key_type, fp });
         }
-        const path = self.cfg.known_hosts orelse blk: {
-            const home = std.posix.getenv("HOME") orelse break :blk null;
-            break :blk std.fmt.allocPrint(self.gpa, "{s}/.ssh/known_hosts", .{home}) catch return error.OutOfMemory;
-        };
-        defer if (self.cfg.known_hosts == null) if (path) |p| self.gpa.free(p);
-        const text: []const u8 = if (path) |p|
-            std.fs.cwd().readFileAlloc(self.gpa, p, 16 << 20) catch ""
-        else
-            "";
+        const text = try self.knownHostsText();
         defer if (text.len > 0) self.gpa.free(text);
         switch (try knownHostsVerdict(self.gpa, text, self.cfg.host, self.cfg.port, key_type, blob)) {
             .ok => return,
@@ -1205,6 +1239,26 @@ const Verdict = enum { ok, unknown, changed, revoked };
 /// hashed `|1|salt|hash` (HMAC-SHA1 of the name). `@revoked` refuses the key;
 /// `@cert-authority` is not supported and skipped. Only entries of the
 /// negotiated key type count, as OpenSSH counts them.
+const host_key_algs = [_][]const u8{ "ssh-ed25519", "ecdsa-sha2-nistp256", "rsa-sha2-512", "rsa-sha2-256" };
+
+/// Which of `host_key_algs` `known_hosts` holds a key type of for the server.
+fn knownKeyTypes(text: []const u8, host: []const u8, port: u16, known: *[host_key_algs.len]bool) void {
+    var name_buf: [300]u8 = undefined;
+    const name = if (port == 22) host else (std.fmt.bufPrint(&name_buf, "[{s}]:{d}", .{ host, port }) catch return);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#' or line[0] == '@') continue;
+        var it = std.mem.tokenizeAny(u8, line, " \t");
+        const hosts = it.next() orelse continue;
+        const ktype = it.next() orelse continue;
+        if (!hostsMatch(hosts, name)) continue;
+        for (host_key_algs, 0..) |a, i| if (std.mem.eql(u8, keyTypeOfAlg(a), ktype)) {
+            known[i] = true;
+        };
+    }
+}
+
 pub fn knownHostsVerdict(gpa: std.mem.Allocator, text: []const u8, host: []const u8, port: u16, key_type: []const u8, blob: []const u8) !Verdict {
     var name_buf: [300]u8 = undefined;
     const name = if (port == 22) host else (std.fmt.bufPrint(&name_buf, "[{s}]:{d}", .{ host, port }) catch return .unknown);
@@ -1447,6 +1501,16 @@ test "known_hosts: plain, bracketed port, lists, wildcards, hashed, revoked, cha
     const ht = try std.fmt.bufPrint(&buf, "|1|{s}|{s} ssh-ed25519 {s}\n", .{ enc.encode(&s64, salt), enc.encode(&m64, &mac), k64 });
     try std.testing.expectEqual(Verdict.ok, try knownHostsVerdict(a, ht, "hidden.example", 22, "ssh-ed25519", blob));
     try std.testing.expectEqual(Verdict.unknown, try knownHostsVerdict(a, ht, "other.example", 22, "ssh-ed25519", blob));
+}
+
+test "known_hosts: key types on file for the server lead the offer" {
+    const text = "[h.example]:2222 ecdsa-sha2-nistp256 AAAA\n@revoked [h.example]:2222 ssh-ed25519 AAAA\nother ssh-rsa AAAA\n";
+    var known = [_]bool{false} ** host_key_algs.len;
+    knownKeyTypes(text, "h.example", 2222, &known);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false, false }, &known);
+    known = @splat(false);
+    knownKeyTypes(text, "other", 22, &known);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, true, true }, &known);
 }
 
 test "fingerprint as OpenSSH prints it" {
