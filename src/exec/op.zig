@@ -1155,7 +1155,7 @@ fn sortIdx(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr) !void {
 
     const pairs = try arena.alloc(RadixPair, n);
     const tmp = try arena.alloc(RadixPair, n);
-    const counts = try arena.alloc(u32, 1 << 16);
+    const counts = try arena.alloc(u32, 1 << 11);
     // Each word is encoded once, in row order, then gathered by the current order:
     // encoding straight from the permutation read every string at random.
     const words = try arena.alloc(u64, n);
@@ -1269,25 +1269,40 @@ const RadixPair = struct { k: u64, i: u32 };
 /// Stable radix sort of `pairs` by `k`, 16 bits a pass, low digit first. A
 /// pass whose digit is the same on every row is skipped, so a key with a
 /// small range (an id, a day count, a flag) costs one or two sweeps, not four.
+/// Stable LSD radix sort on `k`, in 11-bit digits of the key less its minimum,
+/// over only as many digits as the keys' range needs. 2048 buckets keep each
+/// scatter in cache, where 65536 put every write in a different line and page
+/// — a 17-bit `user_id` was two passes over 65536 buckets, now two over 2048.
 fn radixSortPairs(pairs: []RadixPair, tmp: []RadixPair, counts: []u32) void {
+    if (pairs.len < 2) return;
+    var lo: u64 = std.math.maxInt(u64);
+    var hi: u64 = 0;
+    for (pairs) |p| {
+        lo = @min(lo, p.k);
+        hi = @max(hi, p.k);
+    }
+    if (lo == hi) return;
+    const bits: u32 = 64 - @clz(hi - lo);
+    const digit = 11;
+    const nb = 1 << digit;
+    const cs = counts[0..nb];
     var src = pairs;
     var dst = tmp;
-    var pass: u6 = 0;
-    while (pass < 4) : (pass += 1) {
-        const shift: u6 = pass * 16;
-        @memset(counts, 0);
-        for (src) |p| counts[@intCast((p.k >> shift) & 0xffff)] += 1;
-        if (counts[@intCast((src[0].k >> shift) & 0xffff)] == src.len) continue;
+    var shift: u32 = 0;
+    while (shift < bits) : (shift += digit) {
+        const sh: u6 = @intCast(shift);
+        @memset(cs, 0);
+        for (src) |p| cs[@intCast(((p.k - lo) >> sh) & (nb - 1))] += 1;
         var sum: u32 = 0;
-        for (counts) |*c| {
+        for (cs) |*c| {
             const v = c.*;
             c.* = sum;
             sum += v;
         }
         for (src) |p| {
-            const d: usize = @intCast((p.k >> shift) & 0xffff);
-            dst[counts[d]] = p;
-            counts[d] += 1;
+            const d: usize = @intCast(((p.k - lo) >> sh) & (nb - 1));
+            dst[cs[d]] = p;
+            cs[d] += 1;
         }
         const t = src;
         src = dst;
