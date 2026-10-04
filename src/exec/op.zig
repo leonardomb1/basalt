@@ -1771,7 +1771,71 @@ pub const Aggregate = struct {
     /// Where a lane's group tables live, when not in `gpa`: a thread-safe
     /// allocator, since the merge that frees them runs on other threads.
     table_gpa: ?std.mem.Allocator = null,
+    /// String group keys as ids, shared by the lanes of one aggregate so their
+    /// partials agree on them; a serial fold makes its own in `state`.
+    strs: ?*StrTable = null,
+    /// This fold's strings already interned: their id and content hash, without
+    /// the table's lock.
+    str_cache: std.StringHashMapUnmanaged(StrId) = .empty,
     done: bool = false,
+
+    const StrId = struct { id: u32, h: u64 };
+
+    /// Interned strings for string group keys: a key is stored as its id, so the
+    /// fixed-width fold — typed records, the direct index — takes it. An id says
+    /// which entry, never where a group goes: ids follow which lane got there
+    /// first, so placement hashes the string itself, or the output order would
+    /// move with thread timing.
+    pub const StrTable = struct {
+        mtx: std.Thread.Mutex = .{},
+        arena: std.heap.ArenaAllocator,
+        map: std.StringHashMapUnmanaged(u32) = .empty,
+        strs: std.ArrayListUnmanaged([]const u8) = .empty,
+
+        pub fn init(child: std.mem.Allocator) StrTable {
+            return .{ .arena = std.heap.ArenaAllocator.init(child) };
+        }
+
+        pub fn deinit(self: *StrTable) void {
+            self.arena.deinit();
+        }
+
+        fn intern(self: *StrTable, s: []const u8) !u32 {
+            self.mtx.lock();
+            defer self.mtx.unlock();
+            const a = self.arena.allocator();
+            const gop = try self.map.getOrPut(a, s);
+            if (!gop.found_existing) {
+                const own = try a.dupe(u8, s);
+                gop.key_ptr.* = own;
+                gop.value_ptr.* = @intCast(self.strs.items.len);
+                try self.strs.append(a, own);
+            }
+            return gop.value_ptr.*;
+        }
+
+        /// Read once the folds are done: interning may still grow the list before.
+        pub fn at(self: *const StrTable, id: u32) []const u8 {
+            return self.strs.items[id];
+        }
+    };
+
+    fn strId(self: *Aggregate, table: *StrTable, s: []const u8) !StrId {
+        const gop = try self.str_cache.getOrPut(self.state, s);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.state.dupe(u8, s);
+            gop.value_ptr.* = .{ .id = try table.intern(s), .h = std.hash.Wyhash.hash(0x5bd1e995, s) };
+        }
+        return gop.value_ptr.*;
+    }
+
+    fn strTable(self: *Aggregate) !*StrTable {
+        if (self.strs) |t| return t;
+        const t = try self.state.create(StrTable);
+        t.* = StrTable.init(self.state);
+        self.strs = t;
+        return t;
+    }
 
     pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Type, distinct: bool = false };
 
@@ -1877,6 +1941,8 @@ pub const Aggregate = struct {
         /// A lane partition's own index, for `GroupMerge.adopt`. Its entries are
         /// the caller's to free (`freeTable`).
         table: ?*GroupTable = null,
+        /// The strings a string key's ids name.
+        strs: ?*const StrTable = null,
 
         pub fn freeTable(self: *const GroupSet) void {
             if (self.table) |t| t.deinit();
@@ -1904,6 +1970,7 @@ pub const Aggregate = struct {
                         .date => .{ .date = @intCast(raw) },
                         .bool => .{ .bool = raw != 0 },
                         .float => .{ .float = @bitCast(raw) },
+                        .string => .{ .string = self.strs.?.at(@intCast(raw)) },
                         else => unreachable,
                     };
                 },
@@ -1988,7 +2055,7 @@ pub const Aggregate = struct {
                 .alloc = alloc,
                 .aggs = aggs,
                 .any_distinct = any_distinct,
-                .set = .{ .store = store, .len = if (store == .single) 1 else 0, .key_kinds = like.key_kinds },
+                .set = .{ .store = store, .len = if (store == .single) 1 else 0, .key_kinds = like.key_kinds, .strs = like.strs },
                 .table = try GroupTable.init(alloc, 256),
             };
         }
@@ -2179,6 +2246,7 @@ pub const Aggregate = struct {
             .len = p.store.len,
             .key_kinds = kinds,
             .table = if (own) &p.table else null,
+            .strs = self.strs,
         };
         if (!own) for (parts) |*p| p.table.deinit();
         return out;
@@ -2210,11 +2278,17 @@ pub const Aggregate = struct {
         // common `GROUP BY status`, `year`, `category`. Keys outside the range,
         // and nulls, take the table.
         const direct: ?Direct = if (nk == 1 and kinds[0] != .f64k and kinds[0] != .boolk) try Direct.init(self.gpa) else null;
+        var has_str = false;
+        for (kinds) |k| if (k == .strk) {
+            has_str = true;
+        };
         defer if (direct) |d| d.deinit(self.gpa);
         var direct_base: ?i64 = null;
 
         while (try self.child.next(pull)) |b| {
             const keys = try pull.alloc(i64, b.len * nk);
+            // the words a row is hashed by: its keys, a string's hash for its id
+            const hkeys = if (has_str) try pull.alloc(i64, b.len * nk) else keys;
             const masks = try pull.alloc(u64, b.len);
             const hashes = try pull.alloc(u64, b.len);
             // each row's group record, and the partition holding it
@@ -2244,11 +2318,25 @@ pub const Aggregate = struct {
                     .f64k => for (0..b.len) |r| {
                         keys[r * nk + j] = @bitCast(keyhash.canonF64(col.data.f64[r]));
                     },
+                    // the id is the key; its string's own hash is what places it
+                    .strk => {
+                        const table = try self.strTable();
+                        for (0..b.len) |r| {
+                            if (!col.validity.get(r)) continue;
+                            const e = try self.strId(table, col.data.bytes.at(r));
+                            keys[r * nk + j] = e.id;
+                            hkeys[r * nk + j] = @bitCast(e.h);
+                        }
+                    },
                 }
                 if (!col.validity.allSet(b.len)) for (0..b.len) |r| {
                     if (col.validity.get(r)) continue;
                     masks[r] |= @as(u64, 1) << @intCast(j);
                     keys[r * nk + j] = 0;
+                    if (has_str) hkeys[r * nk + j] = 0;
+                };
+                if (has_str and kk != .strk) for (0..b.len) |r| {
+                    hkeys[r * nk + j] = keys[r * nk + j];
                 };
             }
             if (direct) |d| {
@@ -2264,7 +2352,7 @@ pub const Aggregate = struct {
                 }
             }
             var r: usize = 0;
-            while (r < b.len) : (r += 1) hashes[r] = if (tails[r] != null) 0 else fixedHash(keys[r * nk ..][0..nk], masks[r]);
+            while (r < b.len) : (r += 1) hashes[r] = if (tails[r] != null) 0 else fixedHash(hkeys[r * nk ..][0..nk], masks[r]);
 
             const argcols = try pull.alloc(?column.Column, self.aggs.len);
             const fast = try pull.alloc(Fast, self.aggs.len);
@@ -2560,7 +2648,7 @@ pub const Aggregate = struct {
     };
 
     /// How a fixed-width key column is read into a raw `i64`.
-    const KeyKind = enum { i64k, i32k, boolk, f64k };
+    const KeyKind = enum { i64k, i32k, boolk, f64k, strk };
 
     fn keyKindOf(kind: types.TypeKind) ?KeyKind {
         return switch (kind) {
@@ -2568,6 +2656,7 @@ pub const Aggregate = struct {
             .date => .i32k,
             .bool => .boolk,
             .float => .f64k,
+            .string => .strk,
             else => null,
         };
     }

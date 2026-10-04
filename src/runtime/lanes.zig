@@ -656,6 +656,8 @@ fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema, ta
 /// (deep-copying keys/min-max into the plan arena, so its own arena can be freed).
 /// The merge is small (O(groups)) vs the fold (O(rows)), so lock contention is low.
 const AggCtx = struct {
+    /// String group keys' ids, one table for every lane so their partials agree.
+    strs: *op.Aggregate.StrTable,
     mapped: *csv.MappedCsv,
     csv_schema: *const types.Schema,
     agg_in_schema: *const types.Schema,
@@ -684,6 +686,7 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
     var child = try buildMapChain(wa, ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.csv_schema);
     for (ctx.joins) |lj| child = try buildLaneJoinChain(wa, ctx.params, ctx.errctx, lj, child);
     var agg = op.Aggregate{
+        .strs = ctx.strs,
         .child = child,
         .in_schema = ctx.agg_in_schema,
         .by = ctx.by,
@@ -730,6 +733,8 @@ const pq_min_lanes: usize = 2;
 /// group: each lane opens its own reader over a disjoint window and folds into
 /// its own table. Nothing is shared until the radix merge.
 const PqAggCtx = struct {
+    /// String group keys' ids, one table for every lane so their partials agree.
+    strs: *op.Aggregate.StrTable,
     morsels: PqMorsels,
     agg_in_schema: *const types.Schema,
     out_schema: *const types.Schema,
@@ -877,6 +882,7 @@ fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
     var child = try buildMapChain(la, ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.morsels.src_schema);
     for (ctx.joins) |lj| child = try buildLaneJoinChain(la, ctx.params, ctx.errctx, lj, child);
     var agg = op.Aggregate{
+        .strs = ctx.strs,
         .child = child,
         .in_schema = ctx.agg_in_schema,
         .by = ctx.by,
@@ -1791,7 +1797,10 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
         l.arena.deinit();
     };
 
+    var strs = op.Aggregate.StrTable.init(std.heap.page_allocator);
+    defer strs.deinit();
     var ctx = PqAggCtx{
+        .strs = &strs,
         .morsels = morsels,
         .agg_in_schema = agg_in,
         .out_schema = out_schema,
@@ -1967,7 +1976,10 @@ fn runParallelCsvAggImpl(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag:
     defer freeAggSlots(env.gpa, slots);
     const parts = try allocMergeParts(env.gpa);
     defer freeMergeParts(env.gpa, parts);
+    var strs = op.Aggregate.StrTable.init(std.heap.page_allocator);
+    defer strs.deinit();
     var ctx = AggCtx{
+        .strs = &strs,
         .mapped = mapped,
         .csv_schema = &mapped.schema,
         .agg_in_schema = agg_in,
@@ -2009,6 +2021,8 @@ fn runParallelCsvAggImpl(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag:
 /// (so AVG stays correct, and a float SUM adds the same way on every run). The combine is
 /// O(groups) vs the O(rows) fold, so it costs little next to the scan.
 const SqlAggCtx = struct {
+    /// String group keys' ids, one table for every lane so their partials agree.
+    strs: *op.Aggregate.StrTable,
     split: SplitCtx,
     predicates: []const []const u8,
     proj_select: ?[]const u8,
@@ -2040,6 +2054,7 @@ fn sqlAggWorkOne(ctx: *SqlAggCtx, i: usize) !void {
     var scan = op.Scan{ .src = cs.source() };
     const child = try buildMapChain(wa, ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.src_schema);
     var agg = op.Aggregate{
+        .strs = ctx.strs,
         .child = child,
         .in_schema = ctx.agg_in_schema,
         .by = ctx.by,
@@ -2097,7 +2112,10 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
     defer freeAggSlots(env.gpa, slots);
     const parts = try allocMergeParts(env.gpa);
     defer freeMergeParts(env.gpa, parts);
+    var strs = op.Aggregate.StrTable.init(std.heap.page_allocator);
+    defer strs.deinit();
     var ctx = SqlAggCtx{
+        .strs = &strs,
         .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = sp.base_sql, .report = try connect_mod.readReport(env, @tagName(desc.kind)) },
         .predicates = sp.predicates,
         .proj_select = pd.proj_select,
