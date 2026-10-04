@@ -1390,11 +1390,32 @@ pub const TopN = struct {
     /// When set, the K-th best key is published here so a source can skip
     /// row groups that cannot beat it.
     threshold: ?*Threshold = null,
+    /// Input position of the first row this top-N reads; each row after is one
+    /// more. Ties rank by it, so the rows kept and their order are a stable
+    /// sort's, whatever path — heap, lanes — produced them.
+    seq_base: u64 = 0,
+    seen: u64 = 0,
+    /// The input item a stealing source is reading — a row group — when rows
+    /// arrive from several in no fixed order: positions are then that item's
+    /// place, then the row's within it. A batch never spans two items.
+    item: ?*const usize = null,
+    last_item: usize = std.math.maxInt(usize),
 
-    const Entry = []Value;
+    /// A kept row: its values, then its input position as one more `.int`.
+    pub const Entry = []Value;
     const Heap = std.PriorityQueue(Entry, []const Sort.Key, entryWorstFirst);
 
     pub fn next(self: *TopN, arena: std.mem.Allocator) anyerror!?Batch {
+        const kept = (try self.nextEntries(arena)) orelse return null;
+        const start = @min(self.offset, kept.len);
+        const end = @min(self.offset + self.count, kept.len);
+        if (start >= end) return null;
+        return try self.emit(arena, kept[start..end]);
+    }
+
+    /// Every row kept, best first, positions included, copied into `arena` —
+    /// for a combine across lanes, which ranks them with `entryLess`.
+    pub fn nextEntries(self: *TopN, arena: std.mem.Allocator) anyerror!?[]Entry {
         if (self.done) return null;
         self.done = true;
         if (self.count == 0) return null;
@@ -1410,8 +1431,16 @@ pub const TopN = struct {
         const pull = scratch.allocator();
 
         while (try self.child.next(pull)) |b| {
+            if (self.item) |it| if (it.* != self.last_item) {
+                self.last_item = it.*;
+                self.seq_base = @as(u64, it.*) << 40;
+                self.seen = 0;
+            };
             var r: usize = 0;
-            while (r < b.len) : (r += 1) {
+            while (r < b.len) : ({
+                r += 1;
+                self.seen += 1;
+            }) {
                 if (heap.count() < cap) {
                     try heap.add(try self.cloneRow(b, r));
                     if (heap.count() >= cap) self.publish(heap.items[0]);
@@ -1426,10 +1455,9 @@ pub const TopN = struct {
         if (heap.items.len == 0) return null;
 
         std.mem.sort(Entry, heap.items, self.keys, entryLessCtx);
-        const start = @min(self.offset, heap.items.len);
-        const end = @min(self.offset + self.count, heap.items.len);
-        if (start >= end) return null;
-        return try self.emit(arena, heap.items[start..end]);
+        const out = try arena.alloc(Entry, heap.items.len);
+        for (heap.items, out) |e, *o| o.* = try dupeRowArena(arena, e);
+        return out;
     }
 
     /// Publishes the worst kept entry's first key. Only a single sort key is
@@ -1445,8 +1473,9 @@ pub const TopN = struct {
     }
 
     fn cloneRow(self: *TopN, b: Batch, r: usize) !Entry {
-        const vals = try self.gpa.alloc(Value, b.columns.len);
-        for (b.columns, vals) |*col, *out| out.* = try dupeValueGpa(self.gpa, col.getValue(r));
+        const vals = try self.gpa.alloc(Value, b.columns.len + 1);
+        for (b.columns, vals[0..b.columns.len]) |*col, *out| out.* = try dupeValueGpa(self.gpa, col.getValue(r));
+        vals[b.columns.len] = .{ .int = @bitCast(self.seq_base + self.seen) };
         return vals;
     }
 
@@ -1467,7 +1496,7 @@ pub const TopN = struct {
         return false;
     }
 
-    fn emit(self: *TopN, arena: std.mem.Allocator, entries: []const Entry) !Batch {
+    pub fn emit(self: *TopN, arena: std.mem.Allocator, entries: []const Entry) !Batch {
         const cols = try arena.alloc(column.Column, self.in_schema.fields.len);
         for (self.in_schema.fields, 0..) |f, ci| {
             var bd = column.Builder.init(arena, f.ty);
@@ -1478,12 +1507,22 @@ pub const TopN = struct {
     }
 };
 
-fn entryLess(a: TopN.Entry, b: TopN.Entry, keys: []const Sort.Key) bool {
+pub fn entryLess(a: TopN.Entry, b: TopN.Entry, keys: []const Sort.Key) bool {
     for (keys) |k| {
         const o = keyOrder(a[k.idx], b[k.idx], k.desc);
         if (o != .eq) return o == .lt;
     }
-    return false;
+    return entrySeq(a) < entrySeq(b);
+}
+
+fn entrySeq(e: TopN.Entry) u64 {
+    return @bitCast(e[e.len - 1].int);
+}
+
+fn dupeRowArena(arena: std.mem.Allocator, row: []const Value) ![]Value {
+    const out = try arena.alloc(Value, row.len);
+    for (out, row) |*o, v| o.* = try dupeValue(arena, v);
+    return out;
 }
 
 fn entryLessCtx(keys: []const Sort.Key, a: TopN.Entry, b: TopN.Entry) bool {
@@ -1498,6 +1537,8 @@ fn entryWorstFirst(keys: []const Sort.Key, a: TopN.Entry, b: TopN.Entry) std.mat
         const o = keyOrder(a[k.idx], b[k.idx], k.desc);
         if (o != .eq) return o.invert();
     }
+    // the later of two equal rows is the worse: a stable sort keeps the earlier
+    if (entrySeq(a) != entrySeq(b)) return std.math.order(entrySeq(b), entrySeq(a));
     return .eq;
 }
 

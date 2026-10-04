@@ -809,6 +809,8 @@ const MorselSource = struct {
     scratch: std.mem.Allocator,
     held: ?HeldFile = null,
     cur: ?*pqdecode.Reader = null,
+    /// The item `cur` reads, for a consumer that numbers rows by input position.
+    cur_item: usize = 0,
     /// When set, this source owns a fixed arithmetic slice of the morsels
     /// (`next`, `next + step`, …) instead of stealing whichever is free.
     ///
@@ -845,6 +847,7 @@ const MorselSource = struct {
             if (self.m.queue.failed.load(.seq_cst)) return null;
             const i = self.nextIndex() orelse return null;
             self.cur = try openItem(self.m, self.scratch, &self.held, i);
+            self.cur_item = i;
         }
     }
     fn closeFn(ptr: *anyopaque) void {
@@ -2491,7 +2494,9 @@ const TopNCtx = struct {
     keys: []const op.Sort.Key,
     cap: u64,
     queue: WorkQueue,
-    builders: []column.Builder,
+    /// Every item's kept rows, positions included, for the combine to rank.
+    kept: std.array_list.Managed(op.TopN.Entry),
+    kept_arena: std.mem.Allocator,
     mtx: std.Thread.Mutex = .{},
     rows_read: *obs.RowCounter,
 };
@@ -2507,8 +2512,18 @@ fn topnWorkOne(ctx: *TopNCtx, i: usize) !void {
     defer batch_arena.deinit();
 
     const src_schema = ctx.split.schema();
-    const rows = ctx.split.unorderedRows(i, ctx.queue.nitems);
-    const inner = (try laneRowSource(rows, warena.allocator())) orelse return;
+    // Rows are numbered by input position: a CSV lane's chunk is chunk `i`; a
+    // parquet lane steals row groups, and says which one each batch is from.
+    var item_ptr: ?*const usize = null;
+    const inner: driver.Source = switch (ctx.split) {
+        .parquet => |*m| blk: {
+            const ms = try warena.allocator().create(MorselSource);
+            ms.* = .{ .m = m, .scratch = warena.allocator() };
+            item_ptr = &ms.cur_item;
+            break :blk .{ .ptr = ms, .vtable = &MorselSource.vtable };
+        },
+        .csv => (try laneRowSource(ctx.split.unorderedRows(i, ctx.queue.nitems), warena.allocator())) orelse return,
+    };
     defer inner.close();
     errdefer ctx.split.abort();
     var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
@@ -2522,14 +2537,17 @@ fn topnWorkOne(ctx: *TopNCtx, i: usize) !void {
         .offset = 0,
         .state = batch_arena.allocator(),
         .gpa = wgpa.allocator(),
+        .seq_base = @as(u64, i) << 40,
+        .item = item_ptr,
     };
-    const local = (try tn.next(batch_arena.allocator())) orelse return;
+    const local = (try tn.nextEntries(batch_arena.allocator())) orelse return;
 
     ctx.mtx.lock();
     defer ctx.mtx.unlock();
-    var r: usize = 0;
-    while (r < local.len) : (r += 1) {
-        for (local.columns, ctx.builders) |*col, *bld| try bld.append(col.getValue(r));
+    for (local) |e| {
+        const row = try ctx.kept_arena.alloc(Value, e.len);
+        for (row, e) |*o, v| o.* = try op.dupeValue(ctx.kept_arena, v);
+        try ctx.kept.append(row);
     }
 }
 
@@ -2559,8 +2577,8 @@ fn runParallelTopN(
     env.sink_name = sinkLabel(env, w);
 
     const nthreads = split.lanes(opts.threads);
-    const builders = try arena.alloc(column.Builder, row_schema.fields.len);
-    for (builders, row_schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);
+    var kept_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer kept_arena.deinit();
     var ctx = TopNCtx{
         .split = split,
         .row_schema = row_schema,
@@ -2570,34 +2588,34 @@ fn runParallelTopN(
         .keys = ks,
         .cap = lim.offset + lim.count,
         .queue = .{ .nitems = nthreads },
-        .builders = builders,
+        .kept = .init(env.gpa),
+        .kept_arena = kept_arena.allocator(),
         .rows_read = env.rows_read,
     };
+    defer ctx.kept.deinit();
 
     const lanes = try parallel.spawnJoin(arena, nthreads, topnWorker, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
     env.log.log(.debug, "parallel {s} top-n: {d} {s} over {d} lanes", .{ split.label(), split.count(nthreads), split.unitName(), lanes });
     if (ctx.queue.failure()) |e| return e;
 
-    const cols = try arena.alloc(column.Column, builders.len);
-    for (builders, cols) |*b, *c| c.* = try b.finish();
-    var combined = OneBatch{ .b = .{ .schema = row_schema, .columns = cols, .len = cols[0].len }, .sch = row_schema.* };
-    var gscan = op.Scan{ .src = combined.source() };
-    var global = op.TopN{
-        .child = .{ .scan = &gscan },
-        .in_schema = row_schema,
-        .keys = ks,
-        .count = lim.count,
-        .offset = lim.offset,
-        .state = arena,
-        .gpa = env.gpa,
-    };
+    // the combine ranks every item's best by key, then input position: what a
+    // stable sort of the whole input would put first
+    std.mem.sort(op.TopN.Entry, ctx.kept.items, ks, struct {
+        fn lt(keys: []const op.Sort.Key, x: op.TopN.Entry, y: op.TopN.Entry) bool {
+            return op.entryLess(x, y, keys);
+        }
+    }.lt);
+    var global = op.TopN{ .child = undefined, .in_schema = row_schema, .keys = ks, .count = lim.count, .offset = lim.offset, .state = arena, .gpa = env.gpa };
+    const start = @min(lim.offset, ctx.kept.items.len);
+    const end = @min(lim.offset +| lim.count, ctx.kept.items.len);
 
     const wr = try resolveUpsertKeys(env, w);
     const snk = try openSink(env, wr, row_schema.*);
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
-    while (try global.next(arena)) |b| {
+    if (start < end) {
+        const b = try global.emit(arena, ctx.kept.items[start..end]);
         try snk.writeBatch(arena, b);
         stats.rows_out += b.len;
     }
