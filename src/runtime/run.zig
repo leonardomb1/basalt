@@ -519,8 +519,8 @@ fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, la
 
 const window_input = "__window_input";
 
-/// `read → (filter|select)* → window → …` over a file: the window holds every row before
-/// it numbers one, so its input is read first, on the parallel paths, into memory
+/// `read → (filter|select)* → window → …` over a file, or `… → ORDER BY → …`
+/// past the top-N: the window, as the sort, holds every row before it emits one, so its input is read first, on the parallel paths, into memory
 /// — the columns it and the stages after it use, in file order, as the shared
 /// sink keeps it — and the window runs over that. Built in place, the read ran on
 /// one thread whatever `-j` said. Not when a filter follows the window: that may
@@ -549,8 +549,16 @@ fn windowInput(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_
         .select => narrowed = true,
         else => break,
     };
-    if (stages[wi].node != .window or stages[wi].node.window.top_k != null) return null;
-    for (stages[wi + 1 ..]) |st| if (st.node == .filter) return null;
+    switch (stages[wi].node) {
+        .window => |w| {
+            if (w.top_k != null) return null;
+            for (stages[wi + 1 ..]) |st| if (st.node == .filter) return null;
+        },
+        // a full sort holds every row too; ORDER BY with a small LIMIT is the
+        // parallel top-N's already
+        .sort => if (wi + 1 < stages.len and stages[wi + 1].node == .limit and op.TopN.fits(stages[wi + 1].node.limit)) return null,
+        else => return null,
+    }
     if (env.materialized.contains(window_input)) return null;
 
     // the source columns read past here: the names the window adds are its own
@@ -558,7 +566,7 @@ fn windowInput(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_
     var keep = std.array_list.Managed(ast.SelectItem).init(env.arena);
     if (!narrowed) if (try projectedColumns(env, stages[1..])) |cols| {
         names: for (cols) |c| {
-            for (stages[wi].node.window.funcs) |f| if (std.mem.eql(u8, f.out, c)) continue :names;
+            if (stages[wi].node == .window) for (stages[wi].node.window.funcs) |f| if (std.mem.eql(u8, f.out, c)) continue :names;
             const parts = try env.arena.alloc([]const u8, 1);
             parts[0] = c;
             try keep.append(.{ .field = .{ .parts = parts } });
