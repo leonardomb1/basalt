@@ -140,7 +140,10 @@ fn snappyBlock(src: []const u8, out: []u8) Error!void {
                 }
                 len += 1;
                 if (i + len > src.len or pos + len > out.len) return Error.CorruptCompressedData;
-                @memcpy(out[pos..][0..len], src[i..][0..len]);
+                // a short literal with room past it on both sides is one 16-byte move
+                if (len <= 16 and i + 16 <= src.len and pos + 16 <= out.len) {
+                    out[pos..][0..16].* = src[i..][0..16].*;
+                } else @memcpy(out[pos..][0..len], src[i..][0..len]);
                 i += len;
                 pos += len;
             },
@@ -177,16 +180,27 @@ fn snappyBlock(src: []const u8, out: []u8) Error!void {
 /// When `off >= len` the regions are disjoint and `@memcpy` is both legal and
 /// materially faster: measured 1.3-2.2x on real column data, where matches
 /// average ~7 bytes and the byte loop's per-iteration overhead dominates.
-fn copyMatch(out: []u8, pos: *usize, off: usize, len: usize) Error!void {
+///
+/// With room past the match, it is copied in fixed chunks that may run past its
+/// end — the excess is overwritten by what follows — so a ~7-byte match is one
+/// move, not a call into memcpy. A chunk never reads a byte it has not yet
+/// written: 16 at a time for an offset of 16 or more, 8 for 8 or more.
+inline fn copyMatch(out: []u8, pos: *usize, off: usize, len: usize) Error!void {
     if (off == 0 or off > pos.* or pos.* + len > out.len) return Error.CorruptCompressedData;
     const s = pos.* - off;
     const d = pos.*;
-    if (off >= len) {
+    pos.* = d + len;
+    if (off >= 16 and d + len + 16 <= out.len) {
+        var k: usize = 0;
+        while (k < len) : (k += 16) out[d + k ..][0..16].* = out[s + k ..][0..16].*;
+    } else if (off >= 8 and d + len + 8 <= out.len) {
+        var k: usize = 0;
+        while (k < len) : (k += 8) out[d + k ..][0..8].* = out[s + k ..][0..8].*;
+    } else if (off >= len) {
         @memcpy(out[d..][0..len], out[s..][0..len]);
     } else {
         for (0..len) |k| out[d + k] = out[s + k];
     }
-    pos.* = d + len;
 }
 
 // --- LZ4 --------------------------------------------------------------------
@@ -669,4 +683,46 @@ const fuzzDecompress_corpus = [_][]const u8{
 test "fuzz: decompressors survive arbitrary bytes" {
     try std.testing.fuzz({}, fuzzDecompress, .{ .corpus = &fuzzDecompress_corpus });
     try @import("fuzzutil.zig").pound(fuzzDecompress, &fuzzDecompress_corpus);
+}
+
+test "snappy: chunked copies agree with a byte-at-a-time decode on random streams" {
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(42);
+    const rnd = prng.random();
+    for (0..200) |_| {
+        // a valid stream: literals and copies of every form, near the end too
+        var stream: std.ArrayList(u8) = .empty;
+        defer stream.deinit(a);
+        var want: std.ArrayList(u8) = .empty;
+        defer want.deinit(a);
+        const n_ops = rnd.intRangeAtMost(usize, 1, 60);
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(a);
+        for (0..n_ops) |_| {
+            if (want.items.len == 0 or rnd.boolean()) {
+                const len = rnd.intRangeAtMost(usize, 1, 40);
+                try body.append(a, @intCast((len - 1) << 2));
+                for (0..len) |_| {
+                    const c = rnd.int(u8);
+                    try body.append(a, c);
+                    try want.append(a, c);
+                }
+            } else {
+                const off = rnd.intRangeAtMost(usize, 1, @min(want.items.len, 64));
+                const len = rnd.intRangeAtMost(usize, 1, 64);
+                try body.append(a, @intCast(((len - 1) << 2) | 2));
+                try body.append(a, @intCast(off & 0xff));
+                try body.append(a, @intCast(off >> 8));
+                for (0..len) |_| try want.append(a, want.items[want.items.len - off]);
+            }
+        }
+        var v = want.items.len;
+        while (v >= 0x80) : (v >>= 7) try stream.append(a, @intCast((v & 0x7f) | 0x80));
+        try stream.append(a, @intCast(v));
+        try stream.appendSlice(a, body.items);
+        const out = try a.alloc(u8, want.items.len);
+        defer a.free(out);
+        try snappyBlock(stream.items, out);
+        try std.testing.expectEqualSlices(u8, want.items, out);
+    }
 }
