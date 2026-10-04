@@ -1436,20 +1436,93 @@ pub const TopN = struct {
                 self.seq_base = @as(u64, it.*) << 40;
                 self.seen = 0;
             };
+            // Once full, a row whose first key is strictly worse than the worst
+            // kept row's cannot get in: that is read off the typed column, and
+            // only a row that could beat it, or tie it, is boxed and compared
+            // in full. Nearly every row of a large input is the first kind, and
+            // boxing each was two thousand instructions a row.
+            const k0 = if (self.keys.len > 0) self.keys[0] else Sort.Key{ .idx = 0, .desc = false };
+            const kc = &b.columns[k0.idx];
+            const typed: enum { none, int, float } = if (self.keys.len == 0) .none else switch (kc.ty.kind) {
+                .int, .time, .timestamp => .int,
+                .float => .float,
+                else => .none,
+            };
+            const base = self.seen;
             var r: usize = 0;
-            while (r < b.len) : ({
-                r += 1;
-                self.seen += 1;
-            }) {
-                if (heap.count() < cap) {
-                    try heap.add(try self.cloneRow(b, r));
-                    if (heap.count() >= cap) self.publish(heap.items[0]);
-                } else if (self.rowLess(b, r, heap.items[0])) {
+            while (r < b.len and heap.count() < cap) : (r += 1) {
+                self.seen = base + r;
+                try heap.add(try self.cloneRow(b, r));
+                if (heap.count() >= cap) self.publish(heap.items[0]);
+            }
+            // Full: the batch's candidates — every row not strictly worse than the
+            // worst kept — best first, each going in while it beats the worst.
+            // Rising input under a descending order makes every row a candidate,
+            // and inserting them one by one cloned and freed each; now at most the
+            // rows that stay are cloned.
+            if (r < b.len) {
+                const cand = try pull.alloc(u32, b.len - r);
+                var nc: usize = 0;
+                const w = heap.items[0][k0.idx];
+                while (r < b.len) : (r += 1) {
+                    if (typed != .none and !w.isNull()) {
+                        const worse = if (!kc.validity.get(r)) true else switch (typed) {
+                            .int => switch (w) {
+                                .int, .time, .timestamp => |y| if (k0.desc) kc.data.i64[r] < y else kc.data.i64[r] > y,
+                                else => false,
+                            },
+                            .float => switch (w) {
+                                .float => |y| if (k0.desc) kc.data.f64[r] < y else kc.data.f64[r] > y,
+                                else => false,
+                            },
+                            .none => false,
+                        };
+                        if (worse) continue;
+                    }
+                    cand[nc] = @intCast(r);
+                    nc += 1;
+                }
+                const Ctx = struct {
+                    top: *TopN,
+                    b: Batch,
+                    kc: *const column.Column,
+                    typed: @TypeOf(typed),
+                    fn lt(c: @This(), x: u32, y: u32) bool {
+                        var rest = c.top.keys;
+                        // the first key off its typed column, nulls last
+                        if (c.typed != .none) {
+                            const k = c.top.keys[0];
+                            const xn = !c.kc.validity.get(x);
+                            const yn = !c.kc.validity.get(y);
+                            if (xn != yn) return yn;
+                            const nan = c.typed == .float and (std.math.isNan(c.kc.data.f64[x]) or std.math.isNan(c.kc.data.f64[y]));
+                            if (!xn and !nan) {
+                                const o = switch (c.typed) {
+                                    .int => std.math.order(c.kc.data.i64[x], c.kc.data.i64[y]),
+                                    .float => std.math.order(c.kc.data.f64[x], c.kc.data.f64[y]),
+                                    .none => unreachable,
+                                };
+                                if (o != .eq) return if (k.desc) o == .gt else o == .lt;
+                            }
+                            if (!nan) rest = rest[1..];
+                        }
+                        for (rest) |k| {
+                            const o = keyOrder(c.b.columns[k.idx].getValue(x), c.b.columns[k.idx].getValue(y), k.desc);
+                            if (o != .eq) return o == .lt;
+                        }
+                        return x < y;
+                    }
+                };
+                std.mem.sort(u32, cand[0..nc], Ctx{ .top = self, .b = b, .kc = kc, .typed = typed }, Ctx.lt);
+                for (cand[0..nc]) |ri| {
+                    self.seen = base + ri;
+                    if (!self.rowLess(b, ri, heap.items[0])) break;
                     self.freeEntry(heap.remove());
-                    try heap.add(try self.cloneRow(b, r));
+                    try heap.add(try self.cloneRow(b, ri));
                     self.publish(heap.items[0]);
                 }
             }
+            self.seen = base + b.len;
             _ = scratch.reset(.retain_capacity);
         }
         if (heap.items.len == 0) return null;
@@ -1488,12 +1561,14 @@ pub const TopN = struct {
     }
 
     /// Does row `r` of `b` rank before stored entry `e` (i.e. belongs above it)?
+    /// Equal keys rank by position (`self.seen` is row `r`'s): a lane reading
+    /// row groups out of order meets rows earlier than some it already keeps.
     fn rowLess(self: *TopN, b: Batch, r: usize, e: Entry) bool {
         for (self.keys) |k| {
             const o = keyOrder(b.columns[k.idx].getValue(r), e[k.idx], k.desc);
             if (o != .eq) return o == .lt;
         }
-        return false;
+        return self.seq_base + self.seen < entrySeq(e);
     }
 
     pub fn emit(self: *TopN, arena: std.mem.Allocator, entries: []const Entry) !Batch {
@@ -4691,4 +4766,54 @@ test "sortIdx: the radix words order rows exactly as the comparator does" {
             return e;
         };
     }
+}
+
+test "top_n: equal keys rank by input position, also when a lane reads items out of order" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "x", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "s", .ty = types.Type.init(.string).asNullable() },
+    } };
+    // item 5 arrives before item 2, every key equal: item 2's rows come first
+    // in the input, so they are the ones a stable sort keeps
+    const Src = struct {
+        batches: []const Batch,
+        items: []const usize,
+        i: usize = 0,
+        cur: usize = 0,
+        sch: types.Schema,
+        fn schemaFn(p: *anyopaque) types.Schema {
+            return @as(*@This(), @ptrCast(@alignCast(p))).sch;
+        }
+        fn nextFn(p: *anyopaque, _: std.mem.Allocator) anyerror!?Batch {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            if (self.i == self.batches.len) return null;
+            defer self.i += 1;
+            self.cur = self.items[self.i];
+            return self.batches[self.i];
+        }
+        fn closeFn(_: *anyopaque) void {}
+        const vt = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
+    };
+    const batches = [_]Batch{
+        try kvBatch(a, &schema, &.{ 7, 7, 7 }, &.{ "five-a", "five-b", "five-c" }),
+        try kvBatch(a, &schema, &.{ 7, 7, 7 }, &.{ "two-a", "two-b", "two-c" }),
+    };
+    var src = Src{ .batches = &batches, .items = &.{ 5, 2 }, .sch = schema };
+    var scan = Scan{ .src = .{ .ptr = &src, .vtable = &Src.vt } };
+    var tn = TopN{
+        .child = .{ .scan = &scan },
+        .in_schema = &schema,
+        .keys = &[_]Sort.Key{.{ .idx = 0, .desc = true }},
+        .count = 2,
+        .offset = 0,
+        .state = a,
+        .gpa = testing.allocator,
+        .item = &src.cur,
+    };
+    const b = (try tn.next(a)).?;
+    try testing.expectEqualStrings("two-a", b.columns[1].getValue(0).string);
+    try testing.expectEqualStrings("two-b", b.columns[1].getValue(1).string);
 }
