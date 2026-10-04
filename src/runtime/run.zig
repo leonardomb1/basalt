@@ -93,6 +93,7 @@ const classifyLaneShape = @import("lanes.zig").classifyLaneShape;
 const classifyMapJoinPipeline = @import("lanes.zig").classifyMapJoinPipeline;
 const classifyWholeAgg = @import("lanes.zig").classifyWholeAgg;
 const laneEligible = @import("lanes.zig").laneEligible;
+const projectedColumns = @import("plan.zig").projectedColumns;
 const runCsvLane = @import("lanes.zig").runCsvLane;
 const runParallelSqlAgg = @import("lanes.zig").runParallelSqlAgg;
 const runParallelSqlMapJoin = @import("lanes.zig").runParallelSqlMapJoin;
@@ -516,6 +517,74 @@ fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, la
     return name;
 }
 
+const window_input = "__window_input";
+
+/// `read → (filter|select)* → window → …` over a file: the window holds every row before
+/// it numbers one, so its input is read first, on the parallel paths, into memory
+/// — the columns it and the stages after it use, in file order, as the shared
+/// sink keeps it — and the window runs over that. Built in place, the read ran on
+/// one thread whatever `-j` said. Not when a filter follows the window: that may
+/// be `WHERE rn <= k`, whose window keeps only `k` rows a partition as they stream.
+fn windowInput(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!?[]const ast.Stage {
+    // A window in a derived table or CTE (`… FROM (SELECT …, ROW_NUMBER() OVER …)`)
+    // is a binding `inlineHeadBindings` keeps whole, as a filter must not cross
+    // the window; laid end to end here only to be split at the window, nothing moves.
+    var stages = stages_in;
+    if (stages.len > 0 and stages[0].node == .ref) {
+        if (env.materialized.contains(stages[0].node.ref)) return null;
+        const b = env.bindings.get(stages[0].node.ref) orelse return null;
+        if (b.stages.len == 0 or b.stages[0].node != .read) return null;
+        const joined = try env.arena.alloc(ast.Stage, b.stages.len + stages.len - 1);
+        @memcpy(joined[0..b.stages.len], b.stages);
+        @memcpy(joined[b.stages.len..], stages[1..]);
+        stages = joined;
+    }
+    if (opts.threads < 2 or env.explain or stages.len < 3 or !laneEligible(stages, opts)) return null;
+    const rd = stages[0].node.read;
+    if (!isLocalCsvRead(rd) and !isLocalParquetRead(rd) and !isFolderRead(rd)) return null;
+    var wi: usize = 1;
+    var narrowed = false;
+    while (wi < stages.len - 1) : (wi += 1) switch (stages[wi].node) {
+        .filter => {},
+        .select => narrowed = true,
+        else => break,
+    };
+    if (stages[wi].node != .window or stages[wi].node.window.top_k != null) return null;
+    for (stages[wi + 1 ..]) |st| if (st.node == .filter) return null;
+    if (env.materialized.contains(window_input)) return null;
+
+    // the source columns read past here: the names the window adds are its own
+    // (the parser puts a `select` of exactly those ahead of the window already)
+    var keep = std.array_list.Managed(ast.SelectItem).init(env.arena);
+    if (!narrowed) if (try projectedColumns(env, stages[1..])) |cols| {
+        names: for (cols) |c| {
+            for (stages[wi].node.window.funcs) |f| if (std.mem.eql(u8, f.out, c)) continue :names;
+            const parts = try env.arena.alloc([]const u8, 1);
+            parts[0] = c;
+            try keep.append(.{ .field = .{ .parts = parts } });
+        }
+    };
+    const inner = try env.arena.alloc(ast.Stage, wi + @as(usize, if (keep.items.len > 0) 2 else 1));
+    @memcpy(inner[0..wi], stages[0..wi]);
+    if (keep.items.len > 0) inner[wi] = .{ .node = .{ .select = keep.items }, .hints = &.{}, .pos = stages[wi].pos };
+    const w = ast.Write{ .connector = mem_connector, .form = null, .target = "", .mode = .overwrite };
+    inner[inner.len - 1] = .{ .node = .{ .write = w }, .hints = &.{}, .pos = stages[wi].pos };
+
+    var ms = env_mod.MemSink{ .arena = env.arena, .batches = std.array_list.Managed(Batch).init(env.arena) };
+    const outer_sink = env.mem_sink;
+    env.mem_sink = &ms;
+    defer env.mem_sink = outer_sink;
+    var scratch: Stats = .{};
+    var delegated = false;
+    try runOutputBody(env, opts, inner, inner[inner.len - 1].node, &scratch, lanes_used, batch_arena, &delegated);
+    try env.materialized.put(env.arena, window_input, .{ .schema = ms.schema, .batches = ms.batches.items });
+
+    const outer = try env.arena.alloc(ast.Stage, stages.len - wi + 1);
+    outer[0] = .{ .node = .{ .ref = window_input }, .hints = &.{}, .pos = stages[0].pos };
+    @memcpy(outer[1..], stages[wi..]);
+    return outer;
+}
+
 fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, last: @FieldType(ast.Stage, "node"), stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, delegated: *bool) anyerror!void {
     var opts = opts_in;
     const arena = env.arena;
@@ -532,6 +601,11 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     // read leads, so the descent below sends the binding's WHERE to the source:
     // through a binding, a SQL table used to be read whole and filtered here.
     stages = try inlineHeadBindings(env, stages);
+    const win = try windowInput(env, opts, stages, lanes_used, batch_arena);
+    defer if (win != null) {
+        _ = env.materialized.remove(window_input);
+    };
+    if (win) |w| stages = w;
 
     var ddiag = analyze.Diag{};
     env.csv_in = analyze.dialectFromHints(stages[0].hints, &ddiag) catch
