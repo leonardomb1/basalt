@@ -2859,7 +2859,6 @@ fn runParallelParquetDistinct(env: *Env, rd: ast.Read, pipeline: []const ast.Sta
 }
 
 fn runParallelCsvDistinct(env: *Env, rd: ast.Read, prefix: []const ast.Stage, dist: ast.Distinct, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    if (std.mem.eql(u8, w.connector, "stdout")) return false;
     const mapped = (try csvSplitFile(env, rd, w)) orelse return false;
     defer mapped.close();
     return runParallelDistinct(env, .{ .csv = .{ .mapped = mapped, .schema = &mapped.schema } }, prefix, dist, tail, w, opts, stats, lanes_used);
