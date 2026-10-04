@@ -519,6 +519,7 @@ fn binaryVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecErro
             if (try temporalPair(arena, l, r, batch.len)) |tp| {
                 return numOpVec(arena, b.op, tp[0], tp[1], batch.len);
             }
+            if (try dictCmpVec(arena, b.op, l, r, batch.len)) |v| return v;
             if (asStr(l)) |ls| {
                 if (asStr(r)) |rs| return cmpStrVec(arena, b.op, ls, rs, batch.len);
             }
@@ -602,6 +603,29 @@ inline fn applyOp(comptime T: type, comptime op: ast.BinOp, a: T, d: T) VecError
 
 inline fn outData(comptime Out: type, out: []Out) Column.Data {
     return if (Out == bool) .{ .b = out } else if (Out == i64) .{ .i64 = out } else .{ .f64 = out };
+}
+
+/// A dictionary column against a string literal: each entry compared once and
+/// the answer gathered through the codes, as `cmpStrVec` would give row by row
+/// — 20 comparisons for a 20-value column, not a batch's worth. Null otherwise.
+fn dictCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) VecError!?Vec {
+    const col, const lit, const flip = blk: {
+        if (l == .col and r == .scalar) if (l.col.dict != null and r.scalar == .string) break :blk .{ l.col, r.scalar.string, false };
+        if (r == .col and l == .scalar) if (r.col.dict != null and l.scalar == .string) break :blk .{ r.col, l.scalar.string, true };
+        return null;
+    };
+    const d = col.dict.?;
+    const per = try arena.alloc(bool, d.values.len);
+    for (d.values, per) |v, *o| o.* = cmpResult(op, if (flip) std.mem.order(u8, lit, v) else std.mem.order(u8, v, lit));
+    const out = try arena.alloc(bool, n);
+    for (out, d.codes[0..n]) |*o, c| o.* = per[c];
+    if (col.validity.allSet(n)) return mkCol(Type.init(.bool), n, try Bitmap.initFull(arena, n), .{ .b = out });
+    var bm = try Bitmap.initFull(arena, n);
+    for (0..n) |i| if (!col.validity.get(i)) {
+        out[i] = false;
+        bm.setValid(i, false);
+    };
+    return mkCol(Type.init(.bool).withNull(true), n, bm, .{ .b = out });
 }
 
 fn cmpStrVec(arena: std.mem.Allocator, op: ast.BinOp, l: Str, r: Str, n: usize) VecError!Vec {

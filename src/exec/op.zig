@@ -2321,7 +2321,17 @@ pub const Aggregate = struct {
                     // the id is the key; its string's own hash is what places it
                     .strk => {
                         const table = try self.strTable();
-                        for (0..b.len) |r| {
+                        if (col.dict) |d| {
+                            // a dictionary's entries are interned, not every row
+                            const ents = try pull.alloc(StrId, d.values.len);
+                            for (ents, d.values) |*e, v| e.* = try self.strId(table, v);
+                            for (0..b.len) |r| {
+                                if (!col.validity.get(r)) continue;
+                                const e = ents[d.codes[r]];
+                                keys[r * nk + j] = e.id;
+                                hkeys[r * nk + j] = @bitCast(e.h);
+                            }
+                        } else for (0..b.len) |r| {
                             if (!col.validity.get(r)) continue;
                             const e = try self.strId(table, col.data.bytes.at(r));
                             keys[r * nk + j] = e.id;

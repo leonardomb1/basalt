@@ -1557,6 +1557,10 @@ fn bulkDict(
             const vals = try arena.alloc([]const u8, idx.len);
             for (vals, idx) |*o, ix| o.* = dict[ix].bytes;
             b.appendBytesScattered(vals, defs, max_def) catch return false;
+            // and the codes, so a filter or GROUP BY can work on the entries
+            const entries = try arena.alloc([]const u8, dict.len);
+            for (entries, dict) |*o, v| o.* = v.bytes;
+            try b.noteDict(@intFromPtr(dict.ptr), entries, idx, defs, max_def);
             return true;
         },
         .int => {

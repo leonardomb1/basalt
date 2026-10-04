@@ -304,6 +304,14 @@ pub const Column = struct {
     len: usize,
     validity: Bitmap,
     data: Data,
+    /// A string column read from a dictionary keeps it: row `i` is
+    /// `dict.values[dict.codes[i]]` (a null row's code is 0 and means nothing).
+    /// The bytes are there too, so a reader that ignores this loses nothing;
+    /// a filter or a GROUP BY works on the handful of entries instead of every
+    /// row. Anything that makes a new column from this one leaves it behind.
+    dict: ?*const Dict = null,
+
+    pub const Dict = struct { values: []const []const u8, codes: []const u32 };
 
     /// Physical backing store, keyed by storage width rather than logical kind
     /// (e.g. int/time/timestamp all share `i64`, string/bytes share `bytes`).
@@ -339,6 +347,10 @@ pub const Column = struct {
 pub const Builder = struct {
     arena: std.mem.Allocator,
     ty: types.Type,
+    /// The dictionary the rows came from, while every append has (`noteDict`).
+    dict_src: ?usize = null,
+    dict_vals: ?[]const []const u8 = null,
+    dict_codes: std.ArrayListUnmanaged(u32) = .empty,
     /// Validity accumulated in its FINAL bit-packed form, one bit per row.
     ///
     /// This used to be a `[]bool` shadow array that `finish` folded down into a
@@ -605,7 +617,36 @@ pub const Builder = struct {
                 break :blk .{ .bytes = .{ .offsets = offsets, .values = try l.values.toOwnedSlice() } };
             },
         };
-        return .{ .ty = self.ty, .len = n, .validity = bm, .data = data };
+        var dict: ?*const Column.Dict = null;
+        if (self.dict_vals) |vals| if (self.dict_codes.items.len == n) {
+            const d = try self.arena.create(Column.Dict);
+            d.* = .{ .values = vals, .codes = self.dict_codes.items };
+            dict = d;
+        };
+        return .{ .ty = self.ty, .len = n, .validity = bm, .data = data, .dict = dict };
+    }
+
+    /// Record the dictionary the rows just appended came from: `codes` for the
+    /// present ones, in order, a null row taking 0. Rows appended any other way,
+    /// or from another dictionary, leave the count short or the source different,
+    /// and `finish` then attaches none.
+    pub fn noteDict(self: *Builder, src: usize, vals: []const []const u8, codes: []const u32, defs: ?[]const u32, max_def: u32) !void {
+        if (self.dict_src) |prev| if (prev != src) {
+            self.dict_vals = null;
+            return;
+        };
+        if (self.dict_src == null and self.rows != codes.len + (if (defs) |d| d.len - codes.len else 0)) return;
+        self.dict_src = src;
+        self.dict_vals = vals;
+        if (defs) |d| {
+            var j: usize = 0;
+            for (d) |lvl| {
+                if (lvl == max_def) {
+                    try self.dict_codes.append(self.arena, codes[j]);
+                    j += 1;
+                } else try self.dict_codes.append(self.arena, 0);
+            }
+        } else try self.dict_codes.appendSlice(self.arena, codes);
     }
 };
 
