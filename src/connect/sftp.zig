@@ -681,7 +681,10 @@ pub const Stream = struct {
     end: u64,
     /// Opened by `open`, closed with the stream; a window borrows its file.
     owns_file: bool,
+    /// Fetched ahead, `chunk[pos..len]` not yet handed out.
     chunk: []u8,
+    pos: usize = 0,
+    len: usize = 0,
     interface: std.Io.Reader,
 
     const chunk_size = 1 << 20;
@@ -720,18 +723,27 @@ pub const Stream = struct {
         if (self.owns_file) self.file.close();
     }
 
+    /// The file is fetched a whole chunk at a time — 32 reads in flight — and
+    /// handed out in the sizes asked for. Fetching only what each call asked,
+    /// the reader's 64 KiB, kept two reads in flight and waited a round trip
+    /// per refill: a CSV streamed at a quarter of what a Parquet read got.
     fn streamFn(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const self: *Stream = @fieldParentPtr("interface", r);
-        if (self.at >= self.end) return error.EndOfStream;
-        const want: usize = @intCast(@min(@as(u64, self.chunk.len), self.end - self.at));
-        const take = limit.minInt(want);
-        const n = self.file.client.readRange(self.file.handle, self.at, self.chunk[0..take]) catch {
-            self.file.healthy = false;
-            return error.ReadFailed;
-        };
-        if (n == 0) return error.EndOfStream;
-        self.at += n;
-        w.writeAll(self.chunk[0..n]) catch return error.WriteFailed;
+        if (self.pos == self.len) {
+            if (self.at >= self.end) return error.EndOfStream;
+            const want: usize = @intCast(@min(@as(u64, self.chunk.len), self.end - self.at));
+            const n = self.file.client.readRange(self.file.handle, self.at, self.chunk[0..want]) catch {
+                self.file.healthy = false;
+                return error.ReadFailed;
+            };
+            if (n == 0) return error.EndOfStream;
+            self.at += n;
+            self.pos = 0;
+            self.len = n;
+        }
+        const n = limit.minInt(self.len - self.pos);
+        w.writeAll(self.chunk[self.pos..][0..n]) catch return error.WriteFailed;
+        self.pos += n;
         return n;
     }
 };
