@@ -387,6 +387,8 @@ pub const Env = struct {
     pq_reader: ?*pqdecode.Reader = null,
     /// The same, when the one parquet read is a folder.
     pq_folder: ?*pqdecode.Folder = null,
+    /// Threads a full sort or a window's sort may use: the run's lane count.
+    sort_threads: usize = 1,
     /// The last folder read resolved, by path (`connect.resolveFolder`).
     folder_memo: ?struct { path: []const u8, read: FolderRead } = null,
     sink_name: []const u8 = "",

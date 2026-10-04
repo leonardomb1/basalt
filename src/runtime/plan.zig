@@ -900,7 +900,7 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
             const ks = try arena.alloc(op.Sort.Key, s.keys.len);
             for (s.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc };
             const o = try arena.create(op.Sort);
-            o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = ks };
+            o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = ks, .threads = env.sort_threads };
             return .{ .op = .{ .sort = o }, .schema = schema };
         },
         .window => |wd| {
@@ -981,6 +981,7 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
                 .err = env.errctx,
                 .top_k = wd.top_k,
                 .gpa = env.gpa,
+                .threads = env.sort_threads,
             };
             return .{ .op = .{ .window = o }, .schema = out };
         },

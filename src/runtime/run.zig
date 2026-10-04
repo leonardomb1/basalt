@@ -598,6 +598,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     const arena = env.arena;
     const gpa = env.gpa;
     var stages = stages_in;
+    env.sort_threads = opts.threads;
 
     const mat = try materializeBinding(env, opts, stages, lanes_used, batch_arena);
     defer if (mat) |name| {
@@ -655,7 +656,10 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         var extra = std.array_list.Managed(ast.Hint).init(arena);
         for (stages[stages.len - 1].hints) |h| {
             if (std.mem.eql(u8, h.key, "split")) try extra.append(h);
-            if (std.mem.eql(u8, h.key, "jobs") and h.value == .int and h.value.int > 0) opts.threads = @intCast(h.value.int);
+            if (std.mem.eql(u8, h.key, "jobs") and h.value == .int and h.value.int > 0) {
+                opts.threads = @intCast(h.value.int);
+                env.sort_threads = opts.threads;
+            }
         }
         if (extra.items.len > 0) {
             const with = try arena.dupe(ast.Stage, stages);

@@ -329,6 +329,8 @@ pub const Window = struct {
     /// a window whose one function is `ROW_NUMBER`.
     top_k: ?u64 = null,
     gpa: ?std.mem.Allocator = null,
+    /// Threads the sort may use (`sortIdxThreads`).
+    threads: usize = 1,
 
     /// A row-counted frame, `[current - preceding, current]`, clipped to the partition.
     /// `rows` false selects the peer-based default instead.
@@ -461,7 +463,7 @@ pub const Window = struct {
         const arrs = try arena.alloc(KeyArr, self.part.len + self.ord.len);
         for (self.part, 0..) |k, i| arrs[i] = try KeyArr.prepare(arena, all.columns[k.idx], k.desc);
         for (self.ord, 0..) |k, i| arrs[self.part.len + i] = try KeyArr.prepare(arena, all.columns[k.idx], k.desc);
-        try sortIdx(arena, idx, arrs);
+        try sortIdxThreads(arena, idx, arrs, self.threads);
         const parts = arrs[0..self.part.len];
         const ords = arrs[self.part.len..];
 
@@ -1019,6 +1021,8 @@ pub const Sort = struct {
     in_schema: *const types.Schema,
     keys: []const Key,
     done: bool = false,
+    /// Threads the sort may use (`sortIdxThreads`).
+    threads: usize = 1,
 
     pub const Key = struct { idx: usize, desc: bool };
 
@@ -1032,7 +1036,7 @@ pub const Sort = struct {
         // lift each key column into a flat typed array once, then sort on that
         const arrs = try arena.alloc(KeyArr, self.keys.len);
         for (self.keys, arrs) |k, *a| a.* = try KeyArr.prepare(arena, all.columns[k.idx], k.desc);
-        try sortIdx(arena, idx, arrs);
+        try sortIdxThreads(arena, idx, arrs, self.threads);
 
         const outcols = try arena.alloc(column.Column, all.columns.len);
         for (all.columns, 0..) |*col, ci| outcols[ci] = try column.permute(arena, col.*, idx);
@@ -1149,6 +1153,11 @@ const SortCtx = struct {
 /// Strings and nulls used to take `std.mem.sort` with a comparator: ORDER BY a
 /// string over 10M rows was 22 comparator-bound seconds, 10x DuckDB.
 fn sortIdx(out_arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr) !void {
+    return sortIdxThreads(out_arena, idx, arrs, 1);
+}
+
+/// `sortIdx` on up to `threads` threads: see `sortIdxParallel`.
+fn sortIdxThreads(out_arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, threads: usize) !void {
     _ = out_arena;
     const n = idx.len;
     if (n == 0 or arrs.len == 0) return;
@@ -1170,13 +1179,21 @@ fn sortIdx(out_arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr) !vo
         std.mem.sort(usize, idx, SortCtx{ .arrs = arrs }, SortCtx.lessThan);
         return;
     }
+    if (try sortIdxParallel(arena, idx, arrs, plans, exact, threads)) return;
+    try sortRows(arena, idx, arrs, plans, exact, true);
+}
 
+/// A stable LSD radix sort of `idx` by `arrs`. `all` says `idx` holds every row,
+/// each once: a key's words are then encoded once in row order and gathered;
+/// a subset — one range of a parallel sort — encodes each of its rows' words.
+fn sortRows(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, plans: []const KeyPlan, exact: bool, all: bool) !void {
+    const n = idx.len;
     const pairs = try arena.alloc(RadixPair, n);
     const tmp = try arena.alloc(RadixPair, n);
     const counts = try arena.alloc(u32, 1 << 11);
     // Each word is encoded once, in row order, then gathered by the current order:
     // encoding straight from the permutation read every string at random.
-    const words = try arena.alloc(u64, n);
+    const words: []u64 = if (all) try arena.alloc(u64, n) else &.{};
     var j = arrs.len;
     while (j > 0) {
         j -= 1;
@@ -1185,8 +1202,12 @@ fn sortIdx(out_arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr) !vo
         var w = p.words;
         while (w > 0) {
             w -= 1;
-            for (words, 0..) |*x, i| x.* = encWord(k, p, w, i);
-            for (pairs, idx) |*pr, i| pr.* = .{ .k = words[i], .i = @intCast(i) };
+            if (all) {
+                for (words, 0..) |*x, i| x.* = encWord(k, p, w, i);
+                for (pairs, idx) |*pr, i| pr.* = .{ .k = words[i], .i = @intCast(i) };
+            } else {
+                for (pairs, idx) |*pr, i| pr.* = .{ .k = encWord(k, p, w, i), .i = @intCast(i) };
+            }
             radixSortPairs(pairs, tmp, counts);
             for (pairs, idx) |pr, *x| x.* = pr.i;
         }
@@ -1197,6 +1218,97 @@ fn sortIdx(out_arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr) !vo
         }
     }
     if (!exact) fixTies(idx, arrs, plans);
+}
+
+/// A parallel sort of every row: the rows are dealt, in input order, into
+/// ranges of the first key — split on its leading bits where a histogram puts
+/// about one thread's share — with nulls, which sort last, in a range of their
+/// own; each range is then sorted on its own thread. The ranges follow one
+/// another in key order and each sort is stable, so the result is the serial
+/// sort's. False when it is not worth it, or the first key cannot split.
+fn sortIdxParallel(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, plans: []const KeyPlan, exact: bool, threads: usize) !bool {
+    const n = idx.len;
+    if (threads < 2 or n < 1 << 17) return false;
+    const k0 = arrs[0];
+    const p0 = plans[0];
+    const isnull = struct {
+        fn f(k: KeyArr, p: KeyPlan, row: usize) bool {
+            return p.nulls and !k.valid.get(row);
+        }
+    }.f;
+    var lo: u64 = std.math.maxInt(u64);
+    var hi: u64 = 0;
+    for (0..n) |row| {
+        if (isnull(k0, p0, row)) continue;
+        const w = encWord(k0, p0, 0, row);
+        lo = @min(lo, w);
+        hi = @max(hi, w);
+    }
+    if (lo >= hi) return false;
+    const bits: u32 = 64 - @clz(hi - lo);
+    const shift: u6 = @intCast(if (bits > 11) bits - 11 else 0);
+    var hist = [_]u32{0} ** (1 << 11);
+    var nonnull: usize = 0;
+    for (0..n) |row| {
+        if (isnull(k0, p0, row)) continue;
+        hist[@intCast((encWord(k0, p0, 0, row) - lo) >> shift)] += 1;
+        nonnull += 1;
+    }
+    // digits to ranges, about `threads` of equal size; null rows take the last
+    const nthreads = @min(threads, 64);
+    var of_digit: [1 << 11]u8 = undefined;
+    var cur: usize = 0;
+    var acc: usize = 0;
+    for (hist, &of_digit) |h, *d| {
+        d.* = @intCast(cur);
+        acc += h;
+        if (cur + 1 < nthreads and acc * nthreads >= nonnull * (cur + 1)) cur += 1;
+    }
+    const null_range = cur + 1;
+    const nranges = null_range + 1;
+    var size = [_]usize{0} ** 66;
+    var range_of = try arena.alloc(u8, n);
+    for (0..n) |row| {
+        const r: u8 = if (isnull(k0, p0, row)) @intCast(null_range) else of_digit[@intCast((encWord(k0, p0, 0, row) - lo) >> shift)];
+        range_of[row] = r;
+        size[r] += 1;
+    }
+    var start = [_]usize{0} ** 66;
+    for (1..nranges) |r| start[r] = start[r - 1] + size[r - 1];
+    var fill = start;
+    for (0..n) |row| {
+        const r = range_of[row];
+        idx[fill[r]] = row;
+        fill[r] += 1;
+    }
+
+    const Job = struct {
+        rows: []usize,
+        arrs: []const KeyArr,
+        plans: []const KeyPlan,
+        exact: bool,
+        err: ?anyerror = null,
+        fn run(job: *@This()) void {
+            var ar = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer ar.deinit();
+            sortRows(ar.allocator(), job.rows, job.arrs, job.plans, job.exact, false) catch |e| {
+                job.err = e;
+            };
+        }
+    };
+    var jobs: [66]Job = undefined;
+    var handles: [66]?std.Thread = @splat(null);
+    for (0..nranges) |r| {
+        jobs[r] = .{ .rows = idx[start[r]..][0..size[r]], .arrs = arrs, .plans = plans, .exact = exact };
+        if (size[r] < 2) continue;
+        handles[r] = std.Thread.spawn(.{}, Job.run, .{&jobs[r]}) catch blk: {
+            jobs[r].run();
+            break :blk null;
+        };
+    }
+    for (handles[0..nranges]) |h| if (h) |t| t.join();
+    for (jobs[0..nranges]) |jb| if (jb.err) |e| return e;
+    return true;
 }
 
 /// How one key is laid out in radix words.
