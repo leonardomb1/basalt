@@ -1369,6 +1369,15 @@ fn keyOrder(va: Value, vb: Value, desc: bool) std.math.Order {
 /// bounded regardless of input size; only the final K rows are emitted into the
 /// caller arena. A plain `sort` (no following `limit`) still uses the full Sort op.
 pub const TopN = struct {
+    /// The most rows (`OFFSET` + `LIMIT`) a top-N keeps. Past it a heap holding
+    /// them all costs more than sorting everything: `OFFSET 5000000` over 10M
+    /// rows was ten seconds in the heap, against a radix sort's fraction of that.
+    pub const max_rows: u64 = 1 << 16;
+
+    pub fn fits(lim: anytype) bool {
+        return lim.count +| lim.offset <= max_rows;
+    }
+
     stats: Stats = .{},
     child: Op,
     in_schema: *const types.Schema,

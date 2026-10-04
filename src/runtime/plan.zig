@@ -407,7 +407,7 @@ pub fn buildPipeline(env: *Env, stages_in: []const ast.Stage) anyerror!PipeRes {
     var si: usize = 1;
     while (si < stages.len) : (si += 1) {
         const stage = stages[si];
-        if (stage.node == .sort and si + 1 < stages.len and stages[si + 1].node == .limit) {
+        if (stage.node == .sort and si + 1 < stages.len and stages[si + 1].node == .limit and op.TopN.fits(stages[si + 1].node.limit)) {
             const r = try buildTopN(env, stage.node.sort, stages[si + 1].node.limit, current, schema);
             current = r.op;
             schema = r.schema;

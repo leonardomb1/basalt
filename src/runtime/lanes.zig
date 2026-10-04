@@ -2469,6 +2469,7 @@ fn classifyTopNPipeline(stages: []const ast.Stage) ?TopNShape {
     const middle = stages[1 .. stages.len - 1];
     if (middle.len < 2) return null;
     if (middle[middle.len - 1].node != .limit or middle[middle.len - 2].node != .sort) return null;
+    if (!op.TopN.fits(middle[middle.len - 1].node.limit)) return null;
     const prefix = middle[0 .. middle.len - 2];
     for (prefix) |st| switch (st.node) {
         .filter, .select => {},
