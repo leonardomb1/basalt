@@ -466,18 +466,25 @@ pub const Window = struct {
         const ords = arrs[self.part.len..];
 
         // Partition bounds, so `lead` can look forward and `lag` cannot walk off the
-        // front of its own partition into the previous one.
-        const pstart = try arena.alloc(usize, all.len);
-        const pend = try arena.alloc(usize, all.len);
-        {
+        // front of its own partition into the previous one. Only the offsets and the
+        // aggregates read them; a ranking walks the partitions as it numbers.
+        var bounds_needed = false;
+        for (self.funcs) |f| switch (f.kind) {
+            .row_number, .rank, .dense_rank => {},
+            else => bounds_needed = true,
+        };
+        const nb = if (bounds_needed) all.len else 0;
+        const pstart = try arena.alloc(u32, nb);
+        const pend = try arena.alloc(u32, nb);
+        if (bounds_needed) {
             var i: usize = 0;
             while (i < idx.len) {
                 var j = i + 1;
                 while (j < idx.len and sameOn(parts, idx[j - 1], idx[j])) j += 1;
                 var k = i;
                 while (k < j) : (k += 1) {
-                    pstart[k] = i;
-                    pend[k] = j;
+                    pstart[k] = @intCast(i);
+                    pend[k] = @intCast(j);
                 }
                 i = j;
             }
@@ -492,8 +499,13 @@ pub const Window = struct {
         // offsets need partition bounds, and the aggregates need their peer group's
         // total before any of its rows can be written — one shape that serves all three.
         const vals = try arena.alloc([]Value, self.funcs.len);
-        for (self.funcs, vals) |f, *out| {
-            out.* = try arena.alloc(Value, all.len);
+        for (self.funcs, vals, builders) |f, *out, *bd| {
+            // a ranking is written straight into its INT column, in sorted order
+            const ranking = switch (f.kind) {
+                .row_number, .rank, .dense_rank => true,
+                else => false,
+            };
+            out.* = if (ranking) &.{} else try arena.alloc(Value, all.len);
             switch (f.kind) {
                 .row_number, .rank, .dense_rank => {
                     var rn: i64 = 0;
@@ -514,11 +526,11 @@ pub const Window = struct {
                                 dr += 1;
                             }
                         }
-                        out.*[k] = .{ .int = switch (f.kind) {
+                        try bd.appendInt(switch (f.kind) {
                             .row_number => rn,
                             .rank => rk,
                             else => dr,
-                        } };
+                        });
                     }
                 },
                 .lag, .lead => {
@@ -1136,9 +1148,15 @@ const SortCtx = struct {
 ///
 /// Strings and nulls used to take `std.mem.sort` with a comparator: ORDER BY a
 /// string over 10M rows was 22 comparator-bound seconds, 10x DuckDB.
-fn sortIdx(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr) !void {
+fn sortIdx(out_arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr) !void {
+    _ = out_arena;
     const n = idx.len;
     if (n == 0 or arrs.len == 0) return;
+    // The radix buffers — 40 bytes a row — are dropped once the order is known,
+    // not held to the end of the query in the caller's arena.
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
     const plans = try arena.alloc(KeyPlan, arrs.len);
     var exact = true;
     for (arrs, plans) |k, *p| {

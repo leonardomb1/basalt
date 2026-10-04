@@ -200,6 +200,13 @@ pub fn projectedColumns(env: *Env, stages: []const ast.Stage) !?[][]const u8 {
                 break;
             },
             .limit => {},
+            // A window keeps every input column and adds its own, so the stages
+            // after it still name source columns; it reads its keys and arguments.
+            .window => |w| {
+                for (w.partition_by) |q| try putField(&set, q, right.items);
+                for (w.order_by) |k| try putField(&set, k.field, right.items);
+                for (w.funcs) |f| if (f.arg) |q| try putField(&set, q, right.items);
+            },
             // A join needs its own probe-side keys, and the stages after it name
             // columns from both sides. Adding all of them is safe: `openProjected`
             // walks the file's own leaves and keeps the ones asked for, so a
