@@ -224,10 +224,11 @@ Windows.
 The login is NTLMv2, and every request is signed and every signed reply checked —
 SMB 2.1 to 3.1.1, the latter with pre-authentication integrity — which Windows
 11 24H2 and Server 2025 require by default and older servers accept. A guest
-login is refused rather than taken as success. A share that requires encryption
-is refused by name, as is a server or account that does: encryption is not yet
-supported. Kerberos is not supported either; an account that can only log in
-with it needs NTLM allowed for basalt's host.
+login is refused rather than taken as success. A share or session that requires
+encryption gets it: AES-128-GCM on SMB 3.1.1, AES-128-CCM on 3.0. Kerberos is not
+supported; an account that can only log in with it — an Active Directory account
+on Azure Files, where NTLM serves only the storage account key — is refused as a
+failed login.
 
 Reads are by offset, as on SFTP: a Parquet file or an Excel workbook is read
 without fetching what the query does not need, several reads in flight within

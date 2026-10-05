@@ -10,8 +10,11 @@
 //! integrity). Reads and writes are pipelined within the credits the server
 //! grants, matched back to their requests by message id.
 //!
-//! Not here: Kerberos, DFS referrals, oplocks and leases, multichannel, and
-//! (yet) encryption — a share that requires it is refused by name.
+//! A session or share that requires encryption gets it: each message sealed in
+//! an SMB2 TRANSFORM_HEADER with AES-128-GCM (3.1.1) or AES-128-CCM (3.0, and
+//! 3.1.1 when the server picks it), keys derived as the signing key is.
+//!
+//! Not here: Kerberos, DFS referrals, oplocks and leases, multichannel.
 
 const std = @import("std");
 const ntlm = @import("ntlm.zig");
@@ -111,6 +114,8 @@ const cap_large_mtu: u32 = 0x4;
 const cap_encryption: u32 = 0x40;
 
 const share_flag_encrypt: u32 = 0x8000;
+const cipher_ccm: u16 = 1;
+const cipher_gcm: u16 = 2;
 
 // access masks, share access, dispositions, options (MS-SMB2 2.2.13)
 pub const Access = struct {
@@ -176,6 +181,18 @@ pub const Session = struct {
     signing: bool = false,
     /// SHA-512 over the negotiate and session setup exchange (3.1.1).
     preauth: [64]u8 = [_]u8{0} ** 64,
+
+    /// Sealing: the client-to-server and server-to-client keys, and whether the
+    /// whole session is sealed or only the trees in `sealed_trees`.
+    enc_key: [16]u8 = undefined,
+    dec_key: [16]u8 = undefined,
+    have_keys: bool = false,
+    seal_all: bool = false,
+    sealed_trees: [16]u32 = undefined,
+    n_sealed: usize = 0,
+    /// Nonces are a random prefix and a counter: never reused under one key.
+    nonce_prefix: [4]u8 = undefined,
+    nonce_ctr: u64 = 0,
 
     /// Responses read while waiting for another, by message id.
     held: std.AutoHashMap(u64, Msg),
@@ -248,18 +265,31 @@ pub const Session = struct {
         std.mem.writeInt(u32, msg[36..40], tree_id, .little);
         std.mem.writeInt(u64, msg[40..48], self.session_id, .little);
         @memcpy(msg[header_len..], body);
-        if (self.signing and cmd != .negotiate) {
+        const seal = self.sealed(cmd, tree_id);
+        // a sealed message is authenticated by its cipher, and not also signed
+        if (self.signing and cmd != .negotiate and !seal) {
             std.mem.writeInt(u32, msg[16..20], flag_signed, .little);
             const sig = self.sign(msg);
             @memcpy(msg[48..64], &sig);
         }
         if (cmd == .negotiate or cmd == .session_setup) self.preauthAdd(msg);
         self.credits -|= @max(credit_charge, 1);
-        var nb: [4]u8 = undefined;
-        std.mem.writeInt(u32, &nb, @intCast(msg.len), .big);
         const w = &self.sw.interface;
-        w.writeAll(&nb) catch return error.SmbDisconnected;
-        w.writeAll(msg) catch return error.SmbDisconnected;
+        var nb: [4]u8 = undefined;
+        if (seal) {
+            var th: [52]u8 = undefined;
+            const ct = self.gpa.alloc(u8, msg.len) catch return error.SmbFailure;
+            defer self.gpa.free(ct);
+            self.encrypt(&th, ct, msg);
+            std.mem.writeInt(u32, &nb, @intCast(th.len + ct.len), .big);
+            w.writeAll(&nb) catch return error.SmbDisconnected;
+            w.writeAll(&th) catch return error.SmbDisconnected;
+            w.writeAll(ct) catch return error.SmbDisconnected;
+        } else {
+            std.mem.writeInt(u32, &nb, @intCast(msg.len), .big);
+            w.writeAll(&nb) catch return error.SmbDisconnected;
+            w.writeAll(msg) catch return error.SmbDisconnected;
+        }
         w.flush() catch return error.SmbDisconnected;
         return id;
     }
@@ -273,14 +303,20 @@ pub const Session = struct {
             const nb = r.takeArray(4) catch return error.SmbDisconnected;
             const len = std.mem.readInt(u32, nb, .big) & 0x00ff_ffff;
             if (len < header_len) return fail(error.SmbProtocol, "short frame from the server", .{});
-            const bytes = self.gpa.alloc(u8, len) catch return error.SmbFailure;
+            const frame = self.gpa.alloc(u8, len) catch return error.SmbFailure;
+            r.readSliceAll(frame) catch {
+                self.gpa.free(frame);
+                return error.SmbDisconnected;
+            };
+            var was_sealed = false;
+            const bytes = if (std.mem.eql(u8, frame[0..4], "\xfdSMB")) blk: {
+                defer self.gpa.free(frame);
+                was_sealed = true;
+                break :blk try self.decrypt(frame);
+            } else frame;
             errdefer self.gpa.free(bytes);
-            r.readSliceAll(bytes) catch return error.SmbDisconnected;
-            if (!std.mem.eql(u8, bytes[0..4], "\xfeSMB")) {
-                if (std.mem.eql(u8, bytes[0..4], "\xfdSMB"))
-                    return fail(error.SmbEncryptionRequired, "the server encrypts this session, which basalt does not do yet", .{});
+            if (bytes.len < header_len or !std.mem.eql(u8, bytes[0..4], "\xfeSMB"))
                 return fail(error.SmbProtocol, "not an SMB2 message", .{});
-            }
             const m = Msg{
                 .status = std.mem.readInt(u32, bytes[8..12], .little),
                 .command = std.mem.readInt(u16, bytes[12..14], .little),
@@ -295,7 +331,7 @@ pub const Session = struct {
                 self.gpa.free(bytes);
                 continue;
             }
-            if (m.flags & flag_signed != 0 and self.signing) {
+            if (m.flags & flag_signed != 0 and self.signing and !was_sealed) {
                 var sig: [16]u8 = undefined;
                 @memcpy(&sig, bytes[48..64]);
                 @memset(bytes[48..64], 0);
@@ -410,7 +446,7 @@ pub const Session = struct {
         if (self.dialect == dialect_311) {
             // the hash so far covered our request; it covers the response too
             self.preauthAdd(m.bytes);
-            const off = std.mem.readInt(u32, r[56..60], .little);
+            const off = std.mem.readInt(u32, r[60..64], .little);
             var at: usize = off;
             var k: usize = 0;
             while (k < ctx_count and at + 8 <= m.bytes.len) : (k += 1) {
@@ -455,8 +491,10 @@ pub const Session = struct {
         const flags = std.mem.readInt(u16, m2.body()[2..4], .little);
         if (flags & 0x3 != 0)
             return fail(error.SmbLogonFailure, "the server logged {s} in as a guest — check the user name and password", .{self.cfg.user});
-        if (flags & 0x4 != 0)
-            return fail(error.SmbEncryptionRequired, "the server requires this session to be encrypted, which basalt does not do yet", .{});
+        if (flags & 0x4 != 0) {
+            if (!self.have_keys) return fail(error.SmbEncryptionRequired, "the server requires an encrypted session, which needs SMB 3 with a cipher it shares with basalt", .{});
+            self.seal_all = true;
+        }
     }
 
     /// One SESSION_SETUP round. With `key`, this is the last one: its response
@@ -510,11 +548,66 @@ pub const Session = struct {
     }
 
     fn deriveSigningKey(self: *Session, session_key: [16]u8) void {
+        std.crypto.random.bytes(&self.nonce_prefix);
         switch (self.dialect) {
             dialect_210 => self.signing_key = session_key,
-            dialect_300, dialect_302 => self.signing_key = kdf(&session_key, "SMB2AESCMAC\x00", "SmbSign\x00"),
-            else => self.signing_key = kdf(&session_key, "SMBSigningKey\x00", &self.preauth),
+            dialect_300, dialect_302 => {
+                self.signing_key = kdf(&session_key, "SMB2AESCMAC\x00", "SmbSign\x00");
+                self.enc_key = kdf(&session_key, "SMB2AESCCM\x00", "ServerIn \x00");
+                self.dec_key = kdf(&session_key, "SMB2AESCCM\x00", "ServerOut\x00");
+                self.cipher = cipher_ccm;
+                self.have_keys = true;
+            },
+            else => {
+                self.signing_key = kdf(&session_key, "SMBSigningKey\x00", &self.preauth);
+                self.enc_key = kdf(&session_key, "SMBC2SCipherKey\x00", &self.preauth);
+                self.dec_key = kdf(&session_key, "SMBS2CCipherKey\x00", &self.preauth);
+                self.have_keys = self.cipher == cipher_ccm or self.cipher == cipher_gcm;
+            },
         }
+    }
+
+    /// Whether a request goes sealed: all of them once the session is, else
+    /// those on a share that asked for it.
+    fn sealed(self: *Session, cmd: Command, tree_id: u32) bool {
+        if (cmd == .negotiate or cmd == .session_setup) return false;
+        if (self.seal_all) return true;
+        for (self.sealed_trees[0..self.n_sealed]) |t| if (t == tree_id) return true;
+        return false;
+    }
+
+    /// Seal `msg` into `ct`, writing the TRANSFORM_HEADER to `th` (MS-SMB2 2.2.41).
+    fn encrypt(self: *Session, th: *[52]u8, ct: []u8, msg: []const u8) void {
+        @memset(th, 0);
+        @memcpy(th[0..4], "\xfdSMB");
+        @memcpy(th[20..24], &self.nonce_prefix);
+        std.mem.writeInt(u64, th[24..32], self.nonce_ctr, .little);
+        self.nonce_ctr += 1;
+        std.mem.writeInt(u32, th[36..40], @intCast(msg.len), .little);
+        std.mem.writeInt(u16, th[42..44], 1, .little); // Flags: encrypted
+        std.mem.writeInt(u64, th[44..52], self.session_id, .little);
+        const aad = th[20..52];
+        if (self.cipher == cipher_gcm) {
+            std.crypto.aead.aes_gcm.Aes128Gcm.encrypt(ct, th[4..20], msg, aad, th[20..32].*, self.enc_key);
+        } else {
+            ccmEncrypt(ct, th[4..20], msg, aad, th[20..31].*, self.enc_key);
+        }
+    }
+
+    /// The SMB2 message inside a sealed frame, owned by the caller.
+    fn decrypt(self: *Session, frame: []const u8) Error![]u8 {
+        if (frame.len < 52 or !self.have_keys) return fail(error.SmbProtocol, "a sealed message the session has no key for", .{});
+        const size = std.mem.readInt(u32, frame[36..40], .little);
+        if (size != frame.len - 52) return fail(error.SmbProtocol, "a sealed message's size does not match its frame", .{});
+        const out = self.gpa.alloc(u8, size) catch return error.SmbFailure;
+        errdefer self.gpa.free(out);
+        const aad = frame[20..52];
+        const ok = if (self.cipher == cipher_gcm)
+            std.crypto.aead.aes_gcm.Aes128Gcm.decrypt(out, frame[52..], frame[4..20].*, aad, frame[20..32].*, self.dec_key)
+        else
+            ccmDecrypt(out, frame[52..], frame[4..20].*, aad, frame[20..31].*, self.dec_key);
+        ok catch return fail(error.SmbSignature, "a sealed response does not authenticate — the session key is wrong, or the message was altered", .{});
+        return out;
     }
 
     // --- trees and files -----------------------------------------------------------
@@ -542,12 +635,22 @@ pub const Session = struct {
         switch (m.status) {
             Status.success => {},
             Status.bad_network_name => return fail(error.SmbBadShare, "no share named {s} on {s}", .{ share, self.cfg.host }),
-            Status.access_denied => return fail(error.SmbAccessDenied, "{s} may not open the share {s}", .{ self.cfg.user, share }),
+            // a share that requires encryption is denied outright to a session that
+            // cannot seal, before its flags could say why
+            Status.access_denied => return if (self.have_keys)
+                fail(error.SmbAccessDenied, "{s} may not open the share {s}", .{ self.cfg.user, share })
+            else
+                fail(error.SmbAccessDenied, "{s} may not open the share {s} — or it requires encryption, which SMB {s} cannot do", .{ self.cfg.user, share, dialectName(self.dialect) }),
             else => return fail(error.SmbFailure, "opening the share {s} failed (status 0x{x:0>8})", .{ share, m.status }),
         }
         const flags = std.mem.readInt(u32, m.body()[4..8], .little);
-        if (flags & share_flag_encrypt != 0)
-            return fail(error.SmbEncryptionRequired, "the share {s} requires encryption, which basalt does not do yet", .{share});
+        if (flags & share_flag_encrypt != 0 and !self.seal_all) {
+            if (!self.have_keys)
+                return fail(error.SmbEncryptionRequired, "the share {s} requires encryption, which needs SMB 3 with a cipher the server shares with basalt", .{share});
+            if (self.n_sealed == self.sealed_trees.len) return fail(error.SmbFailure, "too many encrypted shares open on one session", .{});
+            self.sealed_trees[self.n_sealed] = m.tree_id;
+            self.n_sealed += 1;
+        }
         self.trees.put(self.gpa.dupe(u8, low) catch return error.SmbFailure, m.tree_id) catch return error.SmbFailure;
         return m.tree_id;
     }
@@ -1244,6 +1347,101 @@ fn winPath(arena: std.mem.Allocator, p: []const u8) ![]const u8 {
     return w;
 }
 
+// --- AES-128-CCM (RFC 3610), the cipher of SMB 3.0 ------------------------------------
+// std has GCM but no CCM. SMB's: an 11-byte nonce, so a 4-byte length field, and a
+// 16-byte tag.
+
+const Aes = std.crypto.core.aes.Aes128;
+
+fn ccmCtrBlock(nonce: [11]u8, i: u32) [16]u8 {
+    var a: [16]u8 = undefined;
+    a[0] = 3; // L - 1
+    @memcpy(a[1..12], &nonce);
+    std.mem.writeInt(u32, a[12..16], i, .big);
+    return a;
+}
+
+fn ccmMac(ctx: anytype, msg: []const u8, aad: []const u8, nonce: [11]u8) [16]u8 {
+    var x: [16]u8 = undefined;
+    var b0: [16]u8 = undefined;
+    b0[0] = 0x40 | (((16 - 2) / 2) << 3) | 3; // Adata, M = 16, L = 4
+    @memcpy(b0[1..12], &nonce);
+    std.mem.writeInt(u32, b0[12..16], @intCast(msg.len), .big);
+    ctx.encrypt(&x, &b0);
+    // the associated data, its 2-byte length first, zero-padded to blocks
+    var blk: [16]u8 = [_]u8{0} ** 16;
+    std.mem.writeInt(u16, blk[0..2], @intCast(aad.len), .big);
+    var fill: usize = 2;
+    for (aad) |c| {
+        blk[fill] = c;
+        fill += 1;
+        if (fill == 16) {
+            for (&x, blk) |*d, s| d.* ^= s;
+            ctx.encrypt(&x, &x);
+            blk = [_]u8{0} ** 16;
+            fill = 0;
+        }
+    }
+    if (fill > 0) {
+        for (&x, blk) |*d, s| d.* ^= s;
+        ctx.encrypt(&x, &x);
+    }
+    var at: usize = 0;
+    while (at < msg.len) : (at += 16) {
+        const n = @min(16, msg.len - at);
+        for (x[0..n], msg[at..][0..n]) |*d, s| d.* ^= s;
+        ctx.encrypt(&x, &x);
+    }
+    return x;
+}
+
+fn ccmCtr(ctx: anytype, out: []u8, in: []const u8, nonce: [11]u8) void {
+    var at: usize = 0;
+    var i: u32 = 1;
+    while (at < in.len) : ({
+        at += 16;
+        i += 1;
+    }) {
+        var ks: [16]u8 = undefined;
+        ctx.encrypt(&ks, &ccmCtrBlock(nonce, i));
+        const n = @min(16, in.len - at);
+        for (out[at..][0..n], in[at..][0..n], ks[0..n]) |*o, p, k| o.* = p ^ k;
+    }
+}
+
+pub fn ccmEncrypt(ct: []u8, tag: *[16]u8, msg: []const u8, aad: []const u8, nonce: [11]u8, key: [16]u8) void {
+    const ctx = Aes.initEnc(key);
+    const mac = ccmMac(ctx, msg, aad, nonce);
+    var s0: [16]u8 = undefined;
+    ctx.encrypt(&s0, &ccmCtrBlock(nonce, 0));
+    for (tag, mac, s0) |*t, m, k| t.* = m ^ k;
+    ccmCtr(ctx, ct, msg, nonce);
+}
+
+pub fn ccmDecrypt(msg: []u8, ct: []const u8, tag: [16]u8, aad: []const u8, nonce: [11]u8, key: [16]u8) error{AuthenticationFailed}!void {
+    const ctx = Aes.initEnc(key);
+    ccmCtr(ctx, msg, ct, nonce);
+    const mac = ccmMac(ctx, msg, aad, nonce);
+    var s0: [16]u8 = undefined;
+    ctx.encrypt(&s0, &ccmCtrBlock(nonce, 0));
+    var want: [16]u8 = undefined;
+    for (&want, mac, s0) |*t, m, k| t.* = m ^ k;
+    if (!std.crypto.timing_safe.eql([16]u8, want, tag)) {
+        @memset(msg, 0);
+        return error.AuthenticationFailed;
+    }
+}
+
+fn dialectName(d: u16) []const u8 {
+    return switch (d) {
+        dialect_210 => "2.1",
+        dialect_300 => "3.0",
+        dialect_302 => "3.0.2",
+        dialect_311 => "3.1.1",
+        else => "?",
+    };
+}
+
 // --- SP800-108 KDF (MS-SMB2 3.1.4.2) ------------------------------------------------
 
 /// HMAC-SHA256 in counter mode, one block, 128 bits out.
@@ -1400,6 +1598,35 @@ test "smb: SPNEGO wraps an NTLM token and finds one in a reply" {
     try std.testing.expectEqual(@as(usize, 600), spnegoToken(tb).?.len);
 }
 
+test "smb: AES-128-CCM seals and opens, and refuses a tampered message" {
+    const key = [_]u8{0x40} ** 16;
+    const nonce = [_]u8{0x10} ** 11;
+    const aad = "transform header bytes 20 to 52";
+    // lengths around the block size, and one with a partial last block
+    for ([_]usize{ 0, 1, 15, 16, 17, 100, 4096 + 3 }) |n| {
+        const gpa = std.testing.allocator;
+        const msg = try gpa.alloc(u8, n);
+        defer gpa.free(msg);
+        for (msg, 0..) |*c, i| c.* = @truncate(i * 7 + 3);
+        const ct = try gpa.alloc(u8, n);
+        defer gpa.free(ct);
+        var tag: [16]u8 = undefined;
+        ccmEncrypt(ct, &tag, msg, aad, nonce, key);
+        const back = try gpa.alloc(u8, n);
+        defer gpa.free(back);
+        try ccmDecrypt(back, ct, tag, aad, nonce, key);
+        try std.testing.expectEqualSlices(u8, msg, back);
+        if (n > 0) {
+            ct[n / 2] ^= 1;
+            try std.testing.expectError(error.AuthenticationFailed, ccmDecrypt(back, ct, tag, aad, nonce, key));
+            ct[n / 2] ^= 1;
+        }
+        var bad_tag = tag;
+        bad_tag[0] ^= 1;
+        try std.testing.expectError(error.AuthenticationFailed, ccmDecrypt(back, ct, bad_tag, aad, nonce, key));
+    }
+}
+
 test "smb URLs: share, domain, port, registered names" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -1438,13 +1665,32 @@ test "smb: a live login, share, listing and read (BASALT_SMB_TEST_PORT)" {
         try std.testing.expectEqual(d, s.dialect);
         try liveRoundTrip(s, ar.allocator());
     }
+    // the `secure` share requires encryption: sealed with CCM on 3.0.2 and GCM on
+    // 3.1.1 — Samba refuses any request on it that is not — and refused by name on
+    // 2.1, which has no encryption
+    for ([_]u16{ dialect_302, dialect_311 }) |d| {
+        const s = try Session.connect(gpa, .{ .host = "127.0.0.1", .port = try std.fmt.parseInt(u16, port_s, 10), .user = "basalt", .password = "it", .max_dialect = d });
+        defer s.close();
+        try liveRoundTripOn(s, ar.allocator(), "secure");
+        try std.testing.expectEqual(if (d == dialect_311) cipher_gcm else cipher_ccm, s.cipher);
+    }
+    {
+        const s = try Session.connect(gpa, .{ .host = "127.0.0.1", .port = try std.fmt.parseInt(u16, port_s, 10), .user = "basalt", .password = "it", .max_dialect = dialect_210 });
+        defer s.close();
+        try std.testing.expectError(error.SmbAccessDenied, s.tree("secure"));
+        try std.testing.expect(std.mem.indexOf(u8, lastError(), "requires encryption") != null);
+    }
     // a wrong password is refused by name, not as a protocol error
     try std.testing.expectError(error.SmbLogonFailure, Session.connect(gpa, .{ .host = "127.0.0.1", .port = try std.fmt.parseInt(u16, port_s, 10), .user = "basalt", .password = "wrong" }));
 }
 
 fn liveRoundTrip(s: *Session, arena: std.mem.Allocator) !void {
+    return liveRoundTripOn(s, arena, "data");
+}
+
+fn liveRoundTripOn(s: *Session, arena: std.mem.Allocator, share: []const u8) !void {
     const gpa = std.testing.allocator;
-    const root = try s.open("data", "", Access.read_data | Access.read_attributes | Access.synchronize, disposition_open, option_directory);
+    const root = try s.open(share, "", Access.read_data | Access.read_attributes | Access.synchronize, disposition_open, option_directory);
     const entries = try s.list(arena, root);
     s.closeHandle(root);
     _ = entries;
@@ -1452,11 +1698,11 @@ fn liveRoundTrip(s: *Session, arena: std.mem.Allocator) !void {
     const payload = try gpa.alloc(u8, 3 * io_unit + 12345);
     defer gpa.free(payload);
     for (payload, 0..) |*c, i| c.* = @truncate(i *% 31);
-    const w = try s.open("data", "basalt_live.bin.part", Access.write_data | Access.read_data | Access.delete | Access.synchronize, disposition_overwrite_if, option_non_directory);
+    const w = try s.open(share, "basalt_live.bin.part", Access.write_data | Access.read_data | Access.delete | Access.synchronize, disposition_overwrite_if, option_non_directory);
     try s.writeAt(w, 0, payload);
     try s.rename(w, "basalt_live.bin");
     s.closeHandle(w);
-    const r = try s.open("data", "basalt_live.bin", Access.read_data | Access.delete | Access.synchronize, disposition_open, option_non_directory);
+    const r = try s.open(share, "basalt_live.bin", Access.read_data | Access.delete | Access.synchronize, disposition_open, option_non_directory);
     try std.testing.expectEqual(@as(u64, payload.len), r.size);
     const back = try gpa.alloc(u8, payload.len + 100);
     defer gpa.free(back);
@@ -1464,6 +1710,6 @@ fn liveRoundTrip(s: *Session, arena: std.mem.Allocator) !void {
     try std.testing.expectEqualSlices(u8, payload, back[0..payload.len]);
     try s.deleteOnClose(r);
     s.closeHandle(r);
-    try std.testing.expectError(error.SmbNoSuchFile, s.open("data", "basalt_live.bin", Access.read_data, disposition_open, option_non_directory));
+    try std.testing.expectError(error.SmbNoSuchFile, s.open(share, "basalt_live.bin", Access.read_data, disposition_open, option_non_directory));
     try std.testing.expectError(error.SmbBadShare, s.tree("nope"));
 }
