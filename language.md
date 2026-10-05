@@ -1776,18 +1776,32 @@ int  string               float  …  string   string
 ```
 
 A REPL result keeps its first 10,000 rows (and the last 20) rather than all of
-it. Set `NO_COLOR` to drop the dim and bold styling.
+it. Values are coloured by their column's type — numbers cyan and a negative one
+red, dates and times magenta, `true` green and `false` red, arrays and structs
+yellow, `NULL` dim — with the names bold and the types dim; only foreground
+colours, so a light terminal reads it as well as a dark one. Set `NO_COLOR` to
+drop all of it.
 
-In the REPL, `\view` (or `\v`) opens the last result full-screen: arrows scroll
-by column and by row with the names and types pinned, Ctrl-arrows and PgUp/PgDn
-move a screenful, Home/End jump to the first and last columns, `g`/`G` to the
-first and last rows, `q` leaves.
+In the REPL, `\view` (or `\v`) opens the last result full-screen, the names and
+types pinned. ←/→ move a column cursor (its name lit; the view follows it),
+↑/↓ scroll by row, Ctrl-arrows and PgUp/PgDn move a screenful, Home/End jump to
+the first and last columns, `g`/`G` to the first and last rows, `q` leaves.
+`s` sorts by the cursor's column — ascending, again descending, again off; by
+value for a number, as text otherwise (which orders ISO dates rightly), `NULL`
+last either way. `/` filters it as you type: `text` keeps the rows containing it
+in any case, `!text` those that do not, and `>= 100`, `< 2026-01-01`, `= SP`,
+`!= 0` compare — by value on a number column. Filters on several columns all
+apply; the header marks a filtered column `≈` and the sorted one `↑`/`↓`. Enter
+keeps a filter, Esc while typing puts it back, Esc after clears the filters and
+then the sort. Both rearrange the rows kept and never run the query again — so
+on a result larger than 10,000 rows they see only the first 10,000, and the
+status line says so.
 
 `basalt repl` executes on a top-level `;` and carries `CREATE CONNECTION` /
 `CREATE FUNCTION` / `PARAM` declarations across entries (re-declaring a name
 replaces it). Meta commands: `\connections` list the session's declarations ·
-`\reset` drop them · `\clear` (or `clear`, `cls`, `^L`) clear the screen · `\format table|json|csv|tsv` switch result output · `\view` scroll
-the last result · `\help` ·
+`\reset` drop them · `\clear` (or `clear`, `cls`, `^L`) clear the screen · `\format table|json|csv|tsv` switch result output · `\view` scroll, sort
+and filter the last result · `\help` ·
 `\q`.
 
 The entry is a small text editor rather than a single line, with an editor's

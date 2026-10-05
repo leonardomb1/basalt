@@ -60,3 +60,4 @@ pub const obs = @import("runtime/obs.zig");
 pub const analyze = @import("runtime/analyze.zig");
 pub const cli = @import("cli/cli.zig");
 pub const form = @import("cli/form.zig");
+pub const view = @import("cli/view.zig");

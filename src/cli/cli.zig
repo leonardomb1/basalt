@@ -2367,7 +2367,7 @@ fn replHelp(msg: *std.Io.Writer) !void {
         \\  \d <conn.table|'file'>  its columns and types      (DESCRIBE ...)
         \\
         \\results
-        \\  \view, \v               scroll the last result: arrows by column and row, q leaves
+        \\  \view, \v               the last result full-screen: arrows move, s sorts, / filters, q leaves
         \\  \format table|json|csv|tsv
         \\                          the output format (bare \format shows it); \f for short
         \\  \clear, \cls            clear the screen (Ctrl+L too, mid-entry)

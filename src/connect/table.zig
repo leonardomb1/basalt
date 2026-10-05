@@ -212,6 +212,36 @@ fn typeLabel(gpa: std.mem.Allocator, t: types.Type) ![]const u8 {
     return std.fmt.allocPrint(gpa, "{s}{s}", .{ @tagName(t.kind), q });
 }
 
+/// The kind behind a column's type label (`int?`, `decimal(10,2)`, …).
+pub fn kindOf(label: []const u8) ?types.TypeKind {
+    const end = std.mem.indexOfAny(u8, label, "?(") orelse label.len;
+    return std.meta.stringToEnum(types.TypeKind, label[0..end]);
+}
+
+/// How a value is coloured, by its column's type: numbers cyan and a negative
+/// one red, dates and times magenta, booleans green or red, nested values
+/// yellow, bytes dim, text as the terminal writes it. Only the foreground and
+/// the plain attributes, so it reads on a dark terminal and a light one alike.
+pub const palette = struct {
+    pub const name = "\x1b[1m";
+    pub const type_label = "\x1b[2m";
+    pub const rule = "\x1b[2m";
+    pub const null_ = "\x1b[2;3m";
+    pub const reset = "\x1b[0m";
+
+    pub fn value(kind: ?types.TypeKind, cell: []const u8) []const u8 {
+        const k = kind orelse return "";
+        return switch (k) {
+            .int, .float, .decimal => if (cell.len > 0 and cell[0] == '-') "\x1b[31m" else "\x1b[36m",
+            .date, .time, .timestamp => "\x1b[35m",
+            .bool => if (std.mem.eql(u8, cell, "true")) "\x1b[32m" else "\x1b[31m",
+            .array, .@"struct" => "\x1b[33m",
+            .bytes => "\x1b[2m",
+            .string => "",
+        };
+    }
+};
+
 pub const TermSize = struct { cols: usize = 80, rows: usize = 24 };
 
 pub fn termSize(file: std.fs.File) TermSize {
@@ -317,8 +347,10 @@ pub fn renderFitted(out: *std.Io.Writer, g: Grid, fit: Fit) !void {
         }
     };
     const Rule = struct {
-        fn cell(_: @This(), o: *std.Io.Writer, _: Grid, _: usize, w: usize, _: []const u8, _: []const u8, _: []const u8) !void {
+        fn cell(_: @This(), o: *std.Io.Writer, _: Grid, _: usize, w: usize, _: []const u8, rs: []const u8, dm: []const u8) !void {
+            try o.writeAll(dm);
             try o.splatBytesAll("-", w);
+            try o.writeAll(rs);
         }
     };
     const Gap = struct {
@@ -331,9 +363,16 @@ pub fn renderFitted(out: *std.Io.Writer, g: Grid, fit: Fit) !void {
     const Data = struct {
         value: *const fn (Grid, usize, usize) ?[]const u8,
         row: usize,
-        fn cell(self: @This(), o: *std.Io.Writer, gg: Grid, i: usize, w: usize, _: []const u8, rs: []const u8, dm: []const u8) !void {
-            if (self.value(gg, self.row, i)) |s| return alignedCell(o, s, w, gg.right[i]);
-            try o.writeAll(dm);
+        color: bool,
+        fn cell(self: @This(), o: *std.Io.Writer, gg: Grid, i: usize, w: usize, _: []const u8, rs: []const u8, _: []const u8) !void {
+            if (self.value(gg, self.row, i)) |s| {
+                const st = if (self.color) palette.value(kindOf(gg.types[i]), s) else "";
+                try o.writeAll(st);
+                try alignedCell(o, s, w, gg.right[i]);
+                if (st.len > 0) try o.writeAll(rs);
+                return;
+            }
+            if (self.color) try o.writeAll(palette.null_);
             try aligned(o, "NULL", w, gg.right[i]);
             try o.writeAll(rs);
         }
@@ -350,14 +389,14 @@ pub fn renderFitted(out: *std.Io.Writer, g: Grid, fit: Fit) !void {
     try Row.write(out, g, widths, cf, bold, reset, dim, Names{});
     try Row.write(out, g, widths, cf, dim, reset, dim, Types{});
     try Row.write(out, g, widths, cf, "", reset, dim, Rule{});
-    for (0..head) |r| try Row.write(out, g, widths, cf, "", reset, dim, Data{ .value = Pick.kept_, .row = r });
+    for (0..head) |r| try Row.write(out, g, widths, cf, "", reset, dim, Data{ .value = Pick.kept_, .row = r, .color = fit.color });
     if (elide_rows) {
         try Row.write(out, g, widths, cf, "", reset, dim, Gap{});
         for (0..tail_n) |t| {
             if (tail_from_ring)
-                try Row.write(out, g, widths, cf, "", reset, dim, Data{ .value = Pick.ring, .row = tail_rows_kept - tail_n + t })
+                try Row.write(out, g, widths, cf, "", reset, dim, Data{ .value = Pick.ring, .row = tail_rows_kept - tail_n + t, .color = fit.color })
             else
-                try Row.write(out, g, widths, cf, "", reset, dim, Data{ .value = Pick.kept_, .row = kept - tail_n + t });
+                try Row.write(out, g, widths, cf, "", reset, dim, Data{ .value = Pick.kept_, .row = kept - tail_n + t, .color = fit.color });
         }
     }
 
