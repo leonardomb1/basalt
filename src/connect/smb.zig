@@ -19,6 +19,7 @@
 const std = @import("std");
 const ntlm = @import("ntlm.zig");
 const krb5 = @import("krb5.zig");
+const spnego = @import("spnego.zig");
 
 pub const Error = error{
     SmbProtocol,
@@ -486,7 +487,7 @@ pub const Session = struct {
         const t = krb5.serviceTicket(self.gpa, cred, spn) catch |e| return krbFailed(e);
         const ctx = krb5.initContext(self.gpa, cred, &t) catch |e| return krbFailed(e);
         defer self.gpa.free(ctx.token);
-        const tok = spnegoInitWith(self.gpa, &.{ &oid_krb5, &oid_ms_krb5 }, ctx.token) catch return error.SmbFailure;
+        const tok = spnego.initWith(self.gpa, &.{ &spnego.oid_krb5, &spnego.oid_ms_krb5 }, ctx.token) catch return error.SmbFailure;
         defer self.gpa.free(tok);
 
         const m = try self.sessionSetup(tok, null);
@@ -495,7 +496,7 @@ pub const Session = struct {
             return fail(error.SmbUnsupported, "the server asked for a second Kerberos round, which basalt does not do", .{});
         if (m.status != Status.success) return self.logonFailed(m.status);
         self.session_id = m.session_id;
-        const reply = spnegoToken(sessionBlob(m)) orelse
+        const reply = spnego.token(sessionBlob(m)) orelse
             return fail(error.SmbLogonFailure, "the server accepted the ticket without proving itself (no AP-REP)", .{});
         const key = krb5.acceptReply(self.gpa, &ctx, reply) catch |e| return krbFailed(e);
         var session_key: [16]u8 = [_]u8{0} ** 16;
@@ -518,7 +519,7 @@ pub const Session = struct {
         const cred = ntlm.Credential{ .domain = self.cfg.domain, .user = self.cfg.user, .password = self.cfg.password };
         const t1 = ntlm.negotiate(self.gpa, cred) catch return error.SmbFailure;
         defer self.gpa.free(t1);
-        const init_tok = spnegoInit(self.gpa, t1) catch return error.SmbFailure;
+        const init_tok = spnego.init(self.gpa, t1) catch return error.SmbFailure;
         defer self.gpa.free(init_tok);
 
         const m1 = try self.sessionSetup(init_tok, null);
@@ -527,7 +528,7 @@ pub const Session = struct {
         self.session_id = m1.session_id;
         // only a response that is not the final one joins the hash
         self.preauthAdd(m1.bytes);
-        const chal = spnegoToken(sessionBlob(m1)) orelse
+        const chal = spnego.token(sessionBlob(m1)) orelse
             return fail(error.SmbProtocol, "the server's SPNEGO reply carries no NTLM challenge", .{});
 
         var nonce: [8]u8 = undefined;
@@ -537,7 +538,7 @@ pub const Session = struct {
             else => return fail(error.SmbProtocol, "the server's NTLM challenge is malformed", .{}),
         };
         defer self.gpa.free(auth.msg);
-        const resp_tok = spnegoResponse(self.gpa, auth.msg) catch return error.SmbFailure;
+        const resp_tok = spnego.response(self.gpa, auth.msg) catch return error.SmbFailure;
         defer self.gpa.free(resp_tok);
 
         const m2 = try self.sessionSetup(resp_tok, auth.session_key);
@@ -1542,103 +1543,6 @@ pub fn kdf(key: []const u8, label: []const u8, context: []const u8) [16]u8 {
     return full[0..16].*;
 }
 
-// --- SPNEGO (RFC 4178), just what an NTLM-only client sends and reads -------------------
-
-const oid_spnego = [_]u8{ 0x06, 0x06, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x02 };
-const oid_ntlmssp = [_]u8{ 0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a };
-
-fn derLen(out: *std.array_list.Managed(u8), n: usize) !void {
-    if (n < 0x80) return out.append(@intCast(n));
-    if (n < 0x100) return out.appendSlice(&[_]u8{ 0x81, @intCast(n) });
-    return out.appendSlice(&[_]u8{ 0x82, @intCast(n >> 8), @intCast(n & 0xff) });
-}
-
-fn derWrap(gpa: std.mem.Allocator, tag: u8, inner: []const u8) ![]u8 {
-    var out = std.array_list.Managed(u8).init(gpa);
-    try out.append(tag);
-    try derLen(&out, inner.len);
-    try out.appendSlice(inner);
-    return out.toOwnedSlice();
-}
-
-const oid_krb5 = [_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02 };
-/// Microsoft's legacy OID for Kerberos 5, which Windows lists beside the standard one.
-const oid_ms_krb5 = [_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x82, 0xf7, 0x12, 0x01, 0x02, 0x02 };
-
-/// GSS-API InitialContextToken with a NegTokenInit offering NTLMSSP only and
-/// carrying its NEGOTIATE_MESSAGE.
-pub fn spnegoInit(gpa: std.mem.Allocator, ntlm_negotiate: []const u8) ![]u8 {
-    return spnegoInitWith(gpa, &.{&oid_ntlmssp}, ntlm_negotiate);
-}
-
-/// A NegTokenInit offering `mechs`, the first one's token optimistically sent.
-pub fn spnegoInitWith(gpa: std.mem.Allocator, mechs: []const []const u8, token: []const u8) ![]u8 {
-    const oids = try std.mem.concat(gpa, u8, mechs);
-    defer gpa.free(oids);
-    const mech_list = try derWrap(gpa, 0x30, oids);
-    defer gpa.free(mech_list);
-    const mech_types = try derWrap(gpa, 0xa0, mech_list);
-    defer gpa.free(mech_types);
-    const octets = try derWrap(gpa, 0x04, token);
-    defer gpa.free(octets);
-    const mech_token = try derWrap(gpa, 0xa2, octets);
-    defer gpa.free(mech_token);
-    const seq_inner = try std.mem.concat(gpa, u8, &.{ mech_types, mech_token });
-    defer gpa.free(seq_inner);
-    const seq = try derWrap(gpa, 0x30, seq_inner);
-    defer gpa.free(seq);
-    const init_tok = try derWrap(gpa, 0xa0, seq);
-    defer gpa.free(init_tok);
-    const app_inner = try std.mem.concat(gpa, u8, &.{ &oid_spnego, init_tok });
-    defer gpa.free(app_inner);
-    return derWrap(gpa, 0x60, app_inner);
-}
-
-/// NegTokenResp carrying the AUTHENTICATE_MESSAGE.
-pub fn spnegoResponse(gpa: std.mem.Allocator, ntlm_authenticate: []const u8) ![]u8 {
-    const octets = try derWrap(gpa, 0x04, ntlm_authenticate);
-    defer gpa.free(octets);
-    const tok = try derWrap(gpa, 0xa2, octets);
-    defer gpa.free(tok);
-    const seq = try derWrap(gpa, 0x30, tok);
-    defer gpa.free(seq);
-    return derWrap(gpa, 0xa1, seq);
-}
-
-/// A DER element at `at`: its tag, and its contents as a slice.
-fn derAt(b: []const u8, at: usize) ?struct { tag: u8, body: []const u8, end: usize } {
-    if (at + 2 > b.len) return null;
-    var i = at + 1;
-    var n: usize = b[i];
-    i += 1;
-    if (n & 0x80 != 0) {
-        const k = n & 0x7f;
-        if (k == 0 or k > 3 or i + k > b.len) return null;
-        n = 0;
-        for (b[i..][0..k]) |c| n = (n << 8) | c;
-        i += k;
-    }
-    if (i + n > b.len) return null;
-    return .{ .tag = b[at], .body = b[i..][0..n], .end = i + n };
-}
-
-/// The responseToken of a server's NegTokenResp: the NTLM CHALLENGE_MESSAGE.
-pub fn spnegoToken(blob: []const u8) ?[]const u8 {
-    const outer = derAt(blob, 0) orelse return null;
-    if (outer.tag != 0xa1) return null;
-    const seq = derAt(outer.body, 0) orelse return null;
-    if (seq.tag != 0x30) return null;
-    var at: usize = 0;
-    while (derAt(seq.body, at)) |el| : (at = el.end) {
-        if (el.tag == 0xa2) {
-            const oct = derAt(el.body, 0) orelse return null;
-            if (oct.tag != 0x04) return null;
-            return oct.body;
-        }
-    }
-    return null;
-}
-
 // --- little helpers ---------------------------------------------------------------
 
 fn put16(b: *std.array_list.Managed(u8), v: u64) void {
@@ -1674,25 +1578,6 @@ fn utf8(arena: std.mem.Allocator, le: []const u8) ![]const u8 {
 }
 
 // --- tests ------------------------------------------------------------------------
-
-test "smb: SPNEGO wraps an NTLM token and finds one in a reply" {
-    const gpa = std.testing.allocator;
-    const t = try spnegoResponse(gpa, "NTLMSSP\x00\x03");
-    defer gpa.free(t);
-    // a client NegTokenResp has the same shape as a server's: the token comes back out
-    try std.testing.expectEqualStrings("NTLMSSP\x00\x03", spnegoToken(t).?);
-    const init_tok = try spnegoInit(gpa, "NTLMSSP\x00\x01");
-    defer gpa.free(init_tok);
-    try std.testing.expectEqual(@as(u8, 0x60), init_tok[0]);
-    try std.testing.expect(std.mem.indexOf(u8, init_tok, &oid_ntlmssp) != null);
-    // long lengths: a token over 255 bytes takes the two-byte form
-    const big = try gpa.alloc(u8, 600);
-    defer gpa.free(big);
-    @memset(big, 'x');
-    const tb = try spnegoResponse(gpa, big);
-    defer gpa.free(tb);
-    try std.testing.expectEqual(@as(usize, 600), spnegoToken(tb).?.len);
-}
 
 test "smb: AES-128-CCM seals and opens, and refuses a tampered message" {
     const key = [_]u8{0x40} ** 16;

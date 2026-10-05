@@ -42,6 +42,7 @@ pub const ssh = @import("connect/ssh.zig");
 pub const sftp = @import("connect/sftp.zig");
 pub const smb = @import("connect/smb.zig");
 pub const krb5 = @import("connect/krb5.zig");
+pub const spnego = @import("connect/spnego.zig");
 pub const deflate = @import("connect/deflate.zig");
 pub const folder = @import("connect/folder.zig");
 pub const pqwrite = @import("connect/pqwrite.zig");

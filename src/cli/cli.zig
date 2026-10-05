@@ -1103,6 +1103,8 @@ const connectors = [_]Connector{
         .{ .key = "host", .prompt = "host" },
         .{ .key = "port", .prompt = "port (blank: 1433, or the instance's)", .int = true },
         .{ .key = "database", .prompt = "database" },
+        .{ .key = "auth", .prompt = "auth (blank for a SQL login; ntlm, kerberos, aad)" },
+        .{ .key = "realm", .prompt = "Kerberos realm, as CORP.LOCAL (blank unless kerberos)" },
         .{ .key = "user", .prompt = "user" },
         .{ .key = "password", .prompt = "password", .secret = true },
         .{ .key = "tls", .prompt = "tls (off, require, insecure)", .default = "require" },

@@ -1,7 +1,7 @@
 //! Minimal TDS (SQL Server) client. Packet framing, PRELOGIN, optional TDS 7.x
 //! tunneled TLS (the handshake rides inside PRELOGIN packets; all TDS traffic
-//! then flows inside the session), LOGIN7 with SQL / federated / NTLMv2 (SSPI)
-//! auth, SQLBatch, and a streaming token-stream reader (PacketReader/TdsCursor)
+//! then flows inside the session), LOGIN7 with SQL / federated / NTLMv2 or
+//! Kerberos (SSPI) auth, SQLBatch, and a streaming token-stream reader (PacketReader/TdsCursor)
 //! that pulls packets on demand so ROW tokens may span packet boundaries.
 
 const std = @import("std");
@@ -12,6 +12,8 @@ const Value = @import("../exec/value.zig").Value;
 const driver = @import("driver.zig");
 const sql = @import("sql.zig");
 const ntlm = @import("ntlm.zig");
+const krb5 = @import("krb5.zig");
+const spnego = @import("spnego.zig");
 
 const PKT_PRELOGIN = 0x12;
 const PKT_LOGIN7 = 0x10;
@@ -32,6 +34,8 @@ pub const Conn = struct {
     sw: std.net.Stream.Writer = undefined,
     msg: std.array_list.Managed(u8),
     last_error: []const u8 = "",
+    /// The SSPI token of the last login response, a slice into `msg`.
+    sspi_reply: []const u8 = "",
     tls: ?*sql.TlsState = null,
     shim: TlsShim = undefined,
     fed_required: bool = false,
@@ -85,8 +89,8 @@ pub const Conn = struct {
     /// Connect with Windows NTLMv2 credentials (`DOMAIN\user` + password), the
     /// on-prem integrated-security path. Encryption is mandatory: a cleartext
     /// NTLM exchange hands the challenge/response to any passive observer for
-    /// offline cracking. This is NTLMv2 with an explicit password, not Kerberos
-    /// and not OS single sign-on.
+    /// offline cracking. This is NTLMv2 with an explicit password, not OS single
+    /// sign-on.
     pub fn connectNtlm(gpa: std.mem.Allocator, host: []const u8, port: u16, cred: ntlm.Credential, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
         if (tls_mode == .off) return error.EncryptionRequired;
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
@@ -99,6 +103,29 @@ pub const Conn = struct {
         try self.prelogin(true);
         try self.startTls(host, tls_mode);
         try self.loginNtlm(cred, database, host);
+        try self.afterLogin();
+        return self;
+    }
+
+    /// Connect with a domain account over Kerberos: a ticket for `spn`
+    /// (`MSSQLSvc/<host>:<port>`) asked of the KDC with the password, its AP-REQ
+    /// in SPNEGO in the LOGIN7 SSPI field, the server's AP-REP checked. Always
+    /// over TLS, as the rest of the session is not otherwise protected.
+    pub fn connectKerberos(gpa: std.mem.Allocator, host: []const u8, port: u16, cred: krb5.Credential, spn: []const u8, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
+        if (tls_mode == .off) return error.EncryptionRequired;
+        const stream = try std.net.tcpConnectToHost(gpa, host, port);
+        driver.tuneSocket(stream.handle);
+        const self = try gpa.create(Conn);
+        self.* = .{ .gpa = gpa, .stream = stream, .msg = std.array_list.Managed(u8).init(gpa) };
+        self.sr = std.net.Stream.Reader.init(stream, &self.read_buf);
+        self.sw = std.net.Stream.Writer.init(stream, &self.write_buf);
+        errdefer self.close();
+        try self.prelogin(true);
+        try self.startTls(host, tls_mode);
+        self.loginKerberos(cred, spn, database, host) catch |e| {
+            if (self.last_error.len > 0) std.debug.print("[tds] login rejected: {s}\n", .{self.last_error});
+            return e;
+        };
         try self.afterLogin();
         return self;
     }
@@ -360,6 +387,46 @@ pub const Conn = struct {
         };
     }
 
+    /// One round (MS-TDS 2.2.6.4): the AP-REQ in SPNEGO rides in the LOGIN7 SSPI
+    /// field, and the server answers with its AP-REP (an SSPI token) beside the
+    /// LOGINACK. The AP-REP is required and checked, so the server proves it
+    /// holds the service's key; a login that skips it is refused.
+    fn loginKerberos(self: *Conn, cred: krb5.Credential, spn: []const u8, database: []const u8, host: []const u8) !void {
+        const t = krb5.serviceTicket(self.gpa, cred, spn) catch |e| return self.krbFailed(e);
+        const ctx = krb5.initContext(self.gpa, cred, &t) catch |e| return self.krbFailed(e);
+        defer self.gpa.free(ctx.token);
+        const tok = try spnego.initWith(self.gpa, &.{ &spnego.oid_krb5, &spnego.oid_ms_krb5 }, ctx.token);
+        defer self.gpa.free(tok);
+        const payload = try buildLogin7Sspi(self.gpa, tok, database, host);
+        defer self.gpa.free(payload);
+        try self.writePacket(PKT_LOGIN7, payload);
+        try self.readMessage();
+
+        self.parseLoginResponse() catch |e| {
+            if (e == error.LoginFailed and self.last_error.len == 0 and self.sspi_reply.len > 0)
+                return self.loginRefused("the server asked for a second Kerberos round, which basalt does not do", .{});
+            return e;
+        };
+        if (self.sspi_reply.len == 0)
+            return self.loginRefused("the server accepted the ticket without proving itself (no AP-REP)", .{});
+        const reply = spnego.token(self.sspi_reply) orelse self.sspi_reply;
+        _ = krb5.acceptReply(self.gpa, &ctx, reply) catch |e| return self.krbFailed(e);
+        self.sspi_reply = "";
+    }
+
+    /// A Kerberos failure as a failed login, in the Kerberos layer's words.
+    fn krbFailed(self: *Conn, e: anyerror) Error {
+        if (e == error.OutOfMemory) return error.OutOfMemory;
+        const why = krb5.lastError();
+        return self.loginRefused("kerberos: {s}: {s}", .{ @errorName(e), if (why.len > 0) why else "no further detail" });
+    }
+
+    fn loginRefused(self: *Conn, comptime fmt: []const u8, args: anytype) Error {
+        if (self.last_error.len > 0) self.gpa.free(self.last_error);
+        self.last_error = try std.fmt.allocPrint(self.gpa, fmt, args);
+        return error.LoginFailed;
+    }
+
     /// The server's SSPI token (0xED) out of the current message: a US_VARBYTE
     /// (2-byte byte count) carrying the security blob. Returns a slice into
     /// `self.msg`, valid until the next `readMessage`.
@@ -385,10 +452,12 @@ pub const Conn = struct {
         return error.TdsProtocol;
     }
 
+    /// Also notes the SSPI token the response carries, if any, in `sspi_reply`.
     fn parseLoginResponse(self: *Conn) !void {
         const p = self.msg.items;
         var i: usize = 0;
         var ok = false;
+        self.sspi_reply = "";
         while (i < p.len) {
             const token = p[i];
             i += 1;
@@ -410,9 +479,16 @@ pub const Conn = struct {
                     self.last_error = try self.decodeError(p[i + 2 .. i + 2 + len]);
                     return error.LoginFailed;
                 },
-                0xAB, 0xED => {
+                0xAB => {
                     if (i + 2 > p.len) return error.TdsProtocol;
                     i += 2 + rdU16(p, i);
+                },
+                0xED => {
+                    if (i + 2 > p.len) return error.TdsProtocol;
+                    const len = rdU16(p, i);
+                    if (i + 2 + len > p.len) return error.TdsProtocol;
+                    self.sspi_reply = p[i + 2 .. i + 2 + len];
+                    i += 2 + len;
                 },
                 0xE3 => {
                     if (i + 2 > p.len) return error.TdsProtocol;
@@ -1824,6 +1900,26 @@ fn addField(fixed: []u8, ib_pos: usize, s: []const u8, vd: *std.array_list.Manag
 
 fn rdU16(buf: []const u8, i: usize) usize {
     return @as(usize, buf[i]) | (@as(usize, buf[i + 1]) << 8);
+}
+
+test "parseLoginResponse keeps the SSPI token beside the LOGINACK" {
+    var c: Conn = undefined;
+    c.msg = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer c.msg.deinit();
+    c.last_error = "";
+    // SSPI token "ap-rep", then a LOGINACK (its body skipped by length)
+    try c.msg.appendSlice("\xED\x06\x00ap-rep\xAD\x01\x00\x00");
+    try c.parseLoginResponse();
+    try std.testing.expectEqualStrings("ap-rep", c.sspi_reply);
+    // an SSPI token alone is not a login: another round is wanted
+    c.msg.clearRetainingCapacity();
+    try c.msg.appendSlice(&.{ 0xED, 2, 0, 'h', 'i' });
+    try std.testing.expectError(error.LoginFailed, c.parseLoginResponse());
+    try std.testing.expectEqualStrings("hi", c.sspi_reply);
+    // a length past the message is refused, not sliced
+    c.msg.clearRetainingCapacity();
+    try c.msg.appendSlice(&.{ 0xED, 9, 0, 'x' });
+    try std.testing.expectError(error.TdsProtocol, c.parseLoginResponse());
 }
 
 test "login7 packet has sane framing" {

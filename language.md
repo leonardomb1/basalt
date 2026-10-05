@@ -274,14 +274,25 @@ Give an explicit `port` to skip the lookup — the robust choice where UDP 1434
 is firewalled but the TDS port is open. (`*.dynamics.com` / Azure SQL are
 default-instance cloud endpoints, so this never applies there.)
 
-**Windows authentication (`auth = 'ntlm'`):** authenticates to an on-prem SQL
-Server with a domain account. Give the domain either inline —
+**Windows authentication (`auth = 'ntlm'` or `'kerberos'`):** authenticates to
+an on-prem SQL Server with a domain account. Give the domain either inline —
 `user = 'CORP\myuser'` — or as its own option, `domain = 'CORP'`; when both
 appear the `domain` option wins and the `CORP\` prefix is stripped off the user
-name. This is **NTLMv2 with an explicit password**. It is *not* Kerberos and
-*not* single sign-on from the host's logged-in identity: basalt runs on Linux,
-holds no ticket, and always needs `password`. A server that mandates Kerberos
-will refuse it.
+name. Either way it is a login **with an explicit password**, *not* single
+sign-on from the host's logged-in identity: basalt runs on Linux, holds no
+system ticket, reads no keytab, and always needs `password`.
+
+`auth = 'kerberos'` is for a server or domain that refuses NTLM. It needs the
+realm — `realm = 'CORP.LOCAL'`, the domain's DNS name, or a user written
+`myuser@CORP.LOCAL` — and asks the KDC for a ticket to `MSSQLSvc/<host>:<port>`
+with the resolved port (a named instance's included), so `host` is the server's
+DNS name as registered in AD; when it is not (an IP, an alias), `spn` names the
+service: `spn = 'MSSQLSvc/sql01.corp.local:1433'`. The KDC is `kdc =
+'host[:port]'`, else the one DNS lists for `_kerberos._tcp.<realm>`, else the
+realm's own name; AES keys only, RC4 refused, tickets reused until they expire.
+The server's reply must prove it holds the service's key, or the login is
+refused. The channel is always TLS (`tls = 'off'` is taken as `'require'`).
+Extended Protection set to *Required* on the server is not supported.
 
 Encryption is mandatory for `auth = 'ntlm'`: `tls = 'off'` is a plan-time
 error, refused before any socket opens, because an unencrypted NTLM exchange

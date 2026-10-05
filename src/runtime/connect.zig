@@ -36,6 +36,7 @@ const aad = @import("../connect/aad.zig");
 const split = @import("../connect/split.zig");
 const ssrp = @import("../connect/ssrp.zig");
 const ntlm = @import("../connect/ntlm.zig");
+const krb5 = @import("../connect/krb5.zig");
 const BufferSource = @import("../connect/wal.zig").BufferSource;
 const azure = @import("../connect/azure.zig");
 const s3 = @import("../connect/s3.zig");
@@ -695,7 +696,8 @@ fn rangeBound(env: *Env, e: *const ast.Expr) !i64 {
 }
 
 /// Open a SQL Server connection: Azure AD (ROPC token -> FEDAUTH) for `auth =
-/// aad`, Windows NTLMv2 (SSPI) for `auth = ntlm`, else a normal SQL login.
+/// aad`, Windows NTLMv2 or Kerberos (SSPI) for `auth = ntlm` / `kerberos`, else
+/// a normal SQL login.
 fn tdsConnect(gpa: std.mem.Allocator, cfg_in: DbConfig) !*tds.Conn {
     var cfg = cfg_in;
     const hi = ssrp.splitHostInstance(cfg.host);
@@ -706,6 +708,13 @@ fn tdsConnect(gpa: std.mem.Allocator, cfg_in: DbConfig) !*tds.Conn {
     if (cfg.auth == .sql) return tds.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls);
     const mode: sql.TlsMode = if (cfg.tls == .off) .require else cfg.tls;
     if (cfg.auth == .ntlm) return tds.Conn.connectNtlm(gpa, cfg.host, cfg.port, ntlmCredential(cfg), cfg.database, mode);
+    if (cfg.auth == .kerberos) {
+        var realm_buf: [256]u8 = undefined;
+        var spn_buf: [300]u8 = undefined;
+        const cred = krbCredential(cfg, &realm_buf) orelse return error.LoginFailed;
+        const spn = if (cfg.spn.len > 0) cfg.spn else try std.fmt.bufPrint(&spn_buf, "MSSQLSvc/{s}:{d}", .{ cfg.host, cfg.port });
+        return tds.Conn.connectKerberos(gpa, cfg.host, cfg.port, cred, spn, cfg.database, mode);
+    }
     if (cfg.token.len > 0) return tds.Conn.connectAad(gpa, cfg.host, cfg.port, cfg.token, cfg.database, mode);
     const client_id = if (cfg.client_id.len > 0) cfg.client_id else aad.ado_client_id;
     var rbuf: ?[]u8 = null;
@@ -732,6 +741,21 @@ fn ntlmCredential(cfg: DbConfig) ntlm.Credential {
     return .{ .domain = domain, .user = user, .password = cfg.password };
 }
 
+/// A Kerberos login out of the connection: `user = 'me@CORP.LOCAL'` names the
+/// realm inline, `DOMAIN\me` is taken as `me`, and an explicit `realm` wins.
+/// The realm is upper-cased into `buf`, as AD writes it.
+fn krbCredential(cfg: DbConfig, buf: []u8) ?krb5.Credential {
+    var user = cfg.user;
+    var realm = cfg.realm;
+    if (std.mem.indexOfScalar(u8, user, '\\')) |i| user = user[i + 1 ..];
+    if (std.mem.lastIndexOfScalar(u8, user, '@')) |i| {
+        if (realm.len == 0) realm = user[i + 1 ..];
+        user = user[0..i];
+    }
+    if (realm.len == 0 or realm.len > buf.len) return null;
+    return .{ .user = user, .password = cfg.password, .realm = std.ascii.upperString(buf[0..realm.len], realm), .kdc = cfg.kdc };
+}
+
 /// One key-dispatch for the shared DB connection attributes. `f` supplies the
 /// values: `resolveDbConfig` evaluates them strictly and reports through the
 /// diag. It is generic because a second, lenient fetcher used to exist for
@@ -748,7 +772,7 @@ fn parseDbConfig(conn: ast.Connection, default_port: u16, f: anytype) anyerror!D
             }
             continue;
         }
-        if (!eqlAny(k, &.{ "host", "fe_host", "user", "password", "database", "tls", "auth", "domain", "client_id", "resource", "token" })) continue;
+        if (!eqlAny(k, &.{ "host", "fe_host", "user", "password", "database", "tls", "auth", "domain", "realm", "kdc", "spn", "client_id", "resource", "token" })) continue;
         const v = (try f.str(attr.value)) orelse continue;
         if (eqlAny(k, &.{ "host", "fe_host" })) {
             cfg.host = v;
@@ -764,6 +788,12 @@ fn parseDbConfig(conn: ast.Connection, default_port: u16, f: anytype) anyerror!D
             cfg.auth = try f.auth(v);
         } else if (std.mem.eql(u8, k, "domain")) {
             cfg.domain = v;
+        } else if (std.mem.eql(u8, k, "realm")) {
+            cfg.realm = v;
+        } else if (std.mem.eql(u8, k, "kdc")) {
+            cfg.kdc = v;
+        } else if (std.mem.eql(u8, k, "spn")) {
+            cfg.spn = v;
         } else if (std.mem.eql(u8, k, "client_id")) {
             cfg.client_id = v;
         } else if (std.mem.eql(u8, k, "resource")) {
@@ -792,13 +822,15 @@ const EnvCfg = struct {
     }
     fn auth(self: EnvCfg, v: []const u8) !DbAuth {
         return std.meta.stringToEnum(DbAuth, v) orelse
-            planErr(self.env.diag, "connection `auth` must be \"sql\", \"aad\" or \"ntlm\"");
+            planErr(self.env.diag, "connection `auth` must be \"sql\", \"aad\", \"ntlm\" or \"kerberos\"");
     }
 };
 
 fn resolveDbConfig(env: *Env, conn: ast.Connection, default_port: u16) !DbConfig {
     const cfg = try parseDbConfig(conn, default_port, EnvCfg{ .env = env });
     if (cfg.host.len == 0) return planErr(env.diag, "connection needs a `host`");
+    if (cfg.auth == .kerberos and cfg.realm.len == 0 and std.mem.indexOfScalar(u8, cfg.user, '@') == null)
+        return planErr(env.diag, "connection `auth = 'kerberos'` needs the `realm` — the domain's DNS name, as CORP.LOCAL, not its NetBIOS name — or a user written `me@CORP.LOCAL`");
     if (cfg.auth == .ntlm and cfg.tls == .off) return planErr(env.diag, "connection `auth = 'ntlm'` requires an encrypted channel: set `tls = 'require'`, or `tls = 'insecure'` for a self-signed server certificate");
     return cfg;
 }
@@ -1708,6 +1740,18 @@ const LitCfg = struct {
         return .sql;
     }
 };
+
+test "a Kerberos login takes its realm from `realm` or the user, upper-cased" {
+    var buf: [256]u8 = undefined;
+    const a = krbCredential(.{ .port = 1433, .user = "me@corp.local", .password = "p" }, &buf).?;
+    try std.testing.expectEqualStrings("me", a.user);
+    try std.testing.expectEqualStrings("CORP.LOCAL", a.realm);
+    const b = krbCredential(.{ .port = 1433, .user = "CORP\\me", .realm = "corp.local", .kdc = "dc1:88" }, &buf).?;
+    try std.testing.expectEqualStrings("me", b.user);
+    try std.testing.expectEqualStrings("CORP.LOCAL", b.realm);
+    try std.testing.expectEqualStrings("dc1:88", b.kdc);
+    try std.testing.expect(krbCredential(.{ .port = 1433, .user = "me" }, &buf) == null);
+}
 
 test "an http connection reads user/password only where its auth uses them" {
     var v = ast.Expr{ .str_lit = "x" };

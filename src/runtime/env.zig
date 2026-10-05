@@ -582,7 +582,7 @@ pub const no_loop_vars = LoopRow{ .names = &[_][]const u8{}, .cells = &[_][]cons
 
 /// How a SQL Server connection authenticates: a SQL login (default), an Azure AD
 /// token (`auth = 'aad'`), or Windows NTLMv2 (`auth = 'ntlm'`).
-pub const DbAuth = enum { sql, aad, ntlm };
+pub const DbAuth = enum { sql, aad, ntlm, kerberos };
 
 pub const DbConfig = struct {
     host: []const u8 = "",
@@ -597,6 +597,11 @@ pub const DbConfig = struct {
     tls: sql.TlsMode = .off,
     auth: DbAuth = .sql,
     domain: []const u8 = "",
+    /// Kerberos: the realm (`CORP.LOCAL`), a KDC (`host[:port]`, looked up when
+    /// empty) and the service's name (`MSSQLSvc/<host>:<port>` when empty).
+    realm: []const u8 = "",
+    kdc: []const u8 = "",
+    spn: []const u8 = "",
     client_id: []const u8 = "",
     resource: []const u8 = "",
     token: []const u8 = "",
