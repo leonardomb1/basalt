@@ -216,6 +216,10 @@ fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const ast.E
     const sp = aggregates.spec(func);
     if (sp.arg == .star_or_any) return types.Type.init(.int);
     const a = arg orelse return fail(diag, "this aggregate requires an argument", .{});
+    // `SUM('Kick-Off')` sums the text, not the column: in SQL single quotes make
+    // a string and double quotes a name. Taken as written, it summed to 0.
+    if (sp.arg == .numeric and a.* == .str_lit)
+        return fail(diag, "`{s}('{s}')` reads the text '{s}', not a column — a name with spaces or symbols takes double quotes: {s}(\"{s}\")", .{ sp.names[0], a.str_lit, a.str_lit, sp.names[0], a.str_lit });
     const at = try exprType(arena, in, a, diag);
     if (!sp.arg.accepts(at))
         return fail(diag, "`{s}` needs a {s} argument, got {s}", .{ sp.names[0], sp.arg.word(), try at.name(arena) });
@@ -2413,6 +2417,18 @@ test "analyze: an undeclared `$name` is refused by name, never read as the colum
         \\  LOAD INTO '/tmp/y.csv' AS SELECT id FROM pg.orders WHERE region = $r;
         \\END FOR;
     ), &ok);
+}
+
+test "analyze: a numeric aggregate of a string literal says to double-quote a column name" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const f = [_]types.Schema.Field{.{ .name = "Kick-Off", .ty = types.Type.init(.int) }};
+    var diag = Diag{};
+    const lit = try a.create(ast.Expr);
+    lit.* = .{ .str_lit = "Kick-Off" };
+    try std.testing.expectError(error.AnalyzeFailed, aggResultType(a, .sum, lit, .{ .fields = &f }, &diag));
+    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "sum(\"Kick-Off\")") != null);
 }
 
 test "analyze: a numeric aggregate refuses a non-numeric argument at plan time" {
