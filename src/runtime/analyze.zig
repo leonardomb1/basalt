@@ -1997,6 +1997,25 @@ test "analyze: EXPLAIN shows the WHERE a join's right side sends, under the join
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "pushdown: (\"active\" = 1)") != null);
 }
 
+test "analyze: a condition in ON on a connection's table on the right is the WHERE that side sends" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag = Diag{};
+    const plan = try analyze(a, try parse(a,
+        \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', user = 'u', password = 'p', database = 'd');
+        \\LOAD INTO '/tmp/x.csv' AS SELECT o.id, c.name FROM pg.orders AS o INNER JOIN pg.customers AS c ON 1 = 1 AND c.active = 1 AND c.deleted <> '*' AND c.cid = o.cid;
+    ), &diag);
+    var join: ?Stage = null;
+    for (plan.outputs[0].stages) |st| {
+        if (std.mem.eql(u8, st.kind, "join")) join = st;
+    }
+    // the number is sent as it is; the text comparison as an equivalent CTE's
+    // WHERE would be, once the column's collation is known at run time
+    try std.testing.expect(std.mem.indexOf(u8, join.?.right_pushdown, "(\"active\" = 1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, join.?.right_pushdown, "text comparisons decided by the collation at run time") != null);
+}
+
 test "analyze pushdown preview: raw PUSHDOWN AND-ed with the translated filter" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();

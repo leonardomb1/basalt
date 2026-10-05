@@ -440,6 +440,14 @@ pub const Parser = struct {
         return .{ .line = t.line, .col = t.col };
     }
 
+    /// `AS` before a source's alias, which SQL allows and leaves optional: eaten
+    /// only when an alias follows it, so `... AS SELECT` stays the statement's.
+    fn eatAliasAs(self: *Parser) void {
+        if (!self.isKw("as")) return;
+        const next = self.peekTok();
+        if (next.tag == .ident and !isReservedAfterSource(next.text)) _ = self.advance();
+    }
+
     fn claimAlias(self: *Parser, aliases: *AliasSet, name: []const u8, pos: Pos, kind: AliasSet.Kind) Error!void {
         aliases.put(name, kind) catch |e| return switch (e) {
             error.AliasTaken => self.fail(pos, "`{s}` names two tables in this FROM; give one of them a different alias", .{name}),
@@ -1926,14 +1934,16 @@ pub const Parser = struct {
                 continue;
             }
             // `JOIN (SELECT ...) x ON ...` — the same lowering as a FROM-position
-            // derived table, since a join's right side is named by binding anyway.
-            if (self.at(.string))
-                return self.fail(jpos, "JOIN right side must be a WITH-defined CTE or a `(SELECT ...)`, not a path; read it in one: `WITH b AS (SELECT * FROM '{s}')`", .{self.cur().text});
+            // derived table, since a join's right side is named by binding anyway;
+            // and so a path or a connection's table, read as `(SELECT * FROM it)`.
             var jalias: ?[]const u8 = null;
             var binding: []const u8 = undefined;
             var bpos: Pos = undefined;
-            if (self.at(.lparen)) {
-                const d = try self.parseDerivedTable();
+            const reads = self.at(.string) or
+                (self.isKw("identifier") and self.peekTag() == .lparen) or
+                (self.at(.ident) and self.peekTag() == .dot and !self.isLet(self.cur().text));
+            if (self.at(.lparen) or reads) {
+                const d = if (reads) try self.parseJoinRead() else try self.parseDerivedTable();
                 binding = d.binding;
                 jalias = d.alias;
                 bpos = d.alias_pos;
@@ -1941,6 +1951,7 @@ pub const Parser = struct {
                 binding = try self.expectIdent();
                 bpos = self.prevPos();
                 const written = binding;
+                self.eatAliasAs();
                 const has_alias = self.at(.lparen) or (self.at(.ident) and !isReservedAfterSource(self.cur().text));
                 if (self.at(.lparen)) {
                     const fd = self.findTableFn(binding) orelse
@@ -1964,6 +1975,7 @@ pub const Parser = struct {
             } else try self.claimAlias(&aliases, binding, bpos, .reserved);
             var left_keys = std.array_list.Managed(ast.QualName).init(self.arena);
             var right_keys = std.array_list.Managed(ast.QualName).init(self.arena);
+            var post_filters = std.array_list.Managed(*ast.Expr).init(self.arena);
             for (lateral_keys) |lk| {
                 try left_keys.append(stripQual(lk.left, &aliases));
                 const rp = try self.arena.alloc([]const u8, 1);
@@ -1984,19 +1996,53 @@ pub const Parser = struct {
             } else {
                 if (!self.isKw("on"))
                     return self.fail(self.curPos(), "expected `ON <column> = <column>` after JOIN {s}", .{binding});
-                _ = self.advance();
-                // `ON a = b AND c = d`: plain column names only. Anything else
-                // (a function call, a literal, a range test) belongs upstream.
-                while (true) {
-                    const a = try self.parseJoinKey();
-                    if (!(self.eat(.assign) or self.eat(.eq))) return self.joinKeyFail();
-                    const b = try self.parseJoinKey();
-                    const a_right = qualHasPrefix(a, jalias orelse binding);
-                    const l = if (a_right) b else a;
-                    const r = if (a_right) a else b;
-                    try left_keys.append(stripQual(l, &aliases));
-                    try right_keys.append(stripPrefix(r, jalias orelse binding));
-                    if (!self.eatKw("and")) break;
+                const opos = self.advance();
+                // `ON a = b AND ...`, split at its ANDs: a column of one side equal
+                // to a column of the other is a key; a condition on the right side
+                // alone, or on no column (`1 = 1`), narrows the right side before
+                // the join, which is right for an outer join too; any other — the
+                // left side alone, both sides compared otherwise — filters the
+                // joined rows, which only an inner join means.
+                const rname = jalias orelse binding;
+                const on = try self.parseExpr();
+                var conj = std.array_list.Managed(*ast.Expr).init(self.arena);
+                try splitAnd(on, &conj);
+                var narrow: ?*ast.Expr = null;
+                for (conj.items) |c| {
+                    if (c.* == .binary and c.binary.op == .eq and c.binary.l.* == .field and c.binary.r.* == .field and
+                        !c.binary.l.field.dollar and !c.binary.r.field.dollar)
+                    {
+                        const a = c.binary.l.field;
+                        const b = c.binary.r.field;
+                        const a_right = qualHasPrefix(a, rname);
+                        if (a_right != qualHasPrefix(b, rname) or (!a_right and (a.parts.len == 1 or b.parts.len == 1))) {
+                            const l = if (a_right) b else a;
+                            const r = if (a_right) a else b;
+                            try left_keys.append(stripQual(l, &aliases));
+                            try right_keys.append(stripPrefix(r, rname));
+                            continue;
+                        }
+                    }
+                    if (!try self.namesOtherSide(c, rname)) {
+                        const e = try self.stripRightExpr(c, rname);
+                        narrow = if (narrow) |n| try self.mk(.{ .binary = .{ .op = .@"and", .l = n, .r = e } }) else e;
+                    } else if (kind == .inner) {
+                        try post_filters.append(c);
+                    } else return self.fail(.{ .line = opos.line, .col = opos.col }, "this {s} JOIN's ON compares the left side otherwise than by `=` to a right column; only an inner join can take that — filter in WHERE, or in a CTE first", .{@tagName(kind)});
+                }
+                if (left_keys.items.len == 0)
+                    return self.fail(.{ .line = opos.line, .col = opos.col }, "the ON of a join needs at least one `left.col = right.col` to join by, between plain columns — compute a key in a CTE / a select first", .{});
+                if (narrow) |n| {
+                    // The right side, narrowed, as a binding of its own.
+                    self.derived_n += 1;
+                    const name = try std.fmt.allocPrint(self.arena, "__derived{d}_on", .{self.derived_n});
+                    try self.let_names.append(name);
+                    const st = try self.arena.alloc(ast.Stage, 2);
+                    st[0] = .{ .node = .{ .ref = binding }, .hints = &.{}, .pos = jpos };
+                    st[1] = .{ .node = .{ .filter = n }, .hints = &.{}, .pos = jpos };
+                    try self.pending_bindings.append(.{ .binding = .{ .name = name, .pipeline = .{ .stages = st, .pos = jpos }, .pos = jpos } });
+                    if (jalias == null) jalias = binding;
+                    binding = name;
                 }
             }
             var jhints = std.array_list.Managed(ast.Hint).init(self.arena);
@@ -2015,6 +2061,11 @@ pub const Parser = struct {
                 .hints = try jhints.toOwnedSlice(),
                 .pos = jpos,
             });
+            for (post_filters.items) |c| {
+                const e = try self.stripExpr(c, &aliases);
+                try stages.append(.{ .node = .{ .filter = e }, .hints = &.{}, .pos = jpos });
+            }
+            post_filters.clearRetainingCapacity();
         }
 
         if (self.eatKw("where")) {
@@ -2842,6 +2893,35 @@ pub const Parser = struct {
 
     const Derived = struct { binding: []const u8, alias: ?[]const u8, alias_pos: Pos };
 
+    /// A join's right side that reads — a path, `IDENTIFIER(...)`, a connection's
+    /// table or query — lowered as `(SELECT * FROM it) alias` would be: a binding
+    /// of its own, its read hints (`WITH (sheet = ...)` after the alias) with it.
+    fn parseJoinRead(self: *Parser) Error!Derived {
+        const rpos = self.curPos();
+        var scratch = AliasSet{};
+        var hints = std.array_list.Managed(ast.Hint).init(self.arena);
+        const node = try self.parseFromSource(&scratch, &hints);
+        if (self.isKw("with") and self.peekTag() == .lparen) {
+            _ = self.advance();
+            try self.parseWithHints(&hints);
+        }
+        const alias: ?[]const u8 = if (scratch.n > 0) scratch.names[0] else null;
+        self.derived_n += 1;
+        const name = if (alias) |al|
+            try std.fmt.allocPrint(self.arena, "__derived{d}_{s}", .{ self.derived_n, al })
+        else
+            try std.fmt.allocPrint(self.arena, "__derived{d}", .{self.derived_n});
+        try self.let_names.append(name);
+        const stages = try self.arena.alloc(ast.Stage, 1);
+        stages[0] = .{ .node = node, .hints = try hints.toOwnedSlice(), .pos = rpos };
+        try self.pending_bindings.append(.{ .binding = .{
+            .name = name,
+            .pipeline = .{ .stages = stages, .pos = rpos },
+            .pos = rpos,
+        } });
+        return .{ .binding = name, .alias = alias, .alias_pos = rpos };
+    }
+
     /// A parenthesized query in expression or LET position, the `(` already
     /// consumed: parse it into a pipeline and route any bindings it creates to
     /// `pending_bindings`, exactly the way `parseDerivedTable` does.
@@ -3292,6 +3372,7 @@ pub const Parser = struct {
             }
             if (self.tvf) |f| if (f.cte(head)) |bname| {
                 node = .{ .ref = bname };
+                self.eatAliasAs();
                 if (self.at(.ident) and !isReservedAfterSource(self.cur().text))
                     try self.claimAlias(aliases, self.advance().text, self.prevPos(), .left);
                 return node;
@@ -3336,6 +3417,7 @@ pub const Parser = struct {
                 return self.fail(pos, "unknown source `{s}`: not a CTE, connection, or path", .{head});
             }
         }
+        self.eatAliasAs();
         if (self.at(.ident) and !isReservedAfterSource(self.cur().text)) {
             try self.claimAlias(aliases, self.advance().text, self.prevPos(), .left);
         }
@@ -4069,6 +4151,38 @@ pub const Parser = struct {
         return S.recur(.{ .p = self, .m = map }, e);
     }
 
+    /// Whether `e` names a column other than one of the join's right side
+    /// (`rname.col`) — a left column, or one written without its table.
+    fn namesOtherSide(self: *Parser, e: *ast.Expr, rname: []const u8) Error!bool {
+        const Ctx = struct { p: *Parser, rname: []const u8, other: *bool };
+        const S = struct {
+            fn recur(cx: Ctx, node: *const ast.Expr) Error!*ast.Expr {
+                if (node.* == .field) {
+                    if (!node.field.dollar and !qualHasPrefix(node.field, cx.rname)) cx.other.* = true;
+                    return @constCast(node);
+                }
+                return ast.rebuildExpr(cx.p.arena, node, cx, recur);
+            }
+        };
+        var other = false;
+        _ = try S.recur(.{ .p = self, .rname = rname, .other = &other }, e);
+        return other;
+    }
+
+    /// `e` with the join's right name taken off its columns: `sra.x` is `x` to
+    /// the right side's own rows.
+    fn stripRightExpr(self: *Parser, e: *ast.Expr, rname: []const u8) Error!*ast.Expr {
+        const Ctx = struct { p: *Parser, rname: []const u8 };
+        const S = struct {
+            fn recur(cx: Ctx, node: *const ast.Expr) Error!*ast.Expr {
+                if (node.* == .field and !node.field.dollar and qualHasPrefix(node.field, cx.rname))
+                    return cx.p.mk(.{ .field = stripPrefix(node.field, cx.rname) });
+                return ast.rebuildExpr(cx.p.arena, node, cx, recur);
+            }
+        };
+        return S.recur(.{ .p = self, .rname = rname }, e);
+    }
+
     fn stripExpr(self: *Parser, e: *ast.Expr, aliases: *const AliasSet) Error!*ast.Expr {
         const Ctx = struct { p: *Parser, aliases: *const AliasSet };
         const S = struct {
@@ -4626,6 +4740,15 @@ fn binOpText(op: ast.BinOp) []const u8 {
     };
 }
 
+/// The conjuncts of `e`, its top-level ANDs taken apart.
+fn splitAnd(e: *ast.Expr, out: *std.array_list.Managed(*ast.Expr)) !void {
+    if (e.* == .binary and e.binary.op == .@"and") {
+        try splitAnd(e.binary.l, out);
+        return splitAnd(e.binary.r, out);
+    }
+    try out.append(e);
+}
+
 fn qualHasPrefix(q: ast.QualName, prefix: []const u8) bool {
     return q.parts.len > 1 and std.mem.eql(u8, q.parts[0], prefix);
 }
@@ -5015,13 +5138,52 @@ test "sql: a name used for two tables in one FROM is refused where it repeats" {
     _ = try parseTest(a, "WITH p AS (SELECT a FROM 'x.csv') SELECT a FROM p JOIN p ON a = a;");
 }
 
-test "sql: a path on a JOIN's right side says to read it in a CTE" {
+test "sql: a path or a connection's table on a JOIN's right side reads in a binding of its own, AS optional" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
+    const prog = try parseTest(a,
+        \\CREATE CONNECTION sr TYPE starrocks OPTIONS (host = 'h', database = 'd');
+        \\SELECT * FROM 'x.xlsx' AS xl JOIN sr.db.t AS t ON t.id = xl.id JOIN 'y.csv' y WITH (delimiter = ';') ON y.k = xl.k;
+    );
+    // two reads lowered to bindings, ahead of the statement that joins them
+    const t_read = prog.stmts[2].binding;
+    try testing.expectEqualStrings("__derived1_t", t_read.name);
+    try testing.expectEqualStrings("sr", t_read.pipeline.stages[0].node.read.connector);
+    const y_read = prog.stmts[3].binding;
+    try testing.expectEqualStrings("delimiter", y_read.pipeline.stages[0].hints[0].key);
+    const st = prog.stmts[4].output.stages;
+    try testing.expectEqualStrings("csv", st[0].node.read.connector);
+    try testing.expectEqualStrings("t", st[1].node.join.alias);
+    try testing.expectEqualStrings("id", st[1].node.join.right_keys[0].parts[0]);
+    try testing.expectEqualStrings("y", st[2].node.join.alias);
+}
+
+test "sql: ON beyond keys — the right side alone narrows it, the rest of an inner join filters after" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parseTest(a,
+        \\SELECT * FROM 'a.csv' AS a JOIN 'b.csv' AS b ON 1 = 1 AND b.del <> '*' AND b.id = a.id AND a.v = 'x';
+    );
+    // b's read, then b narrowed by `1 = 1 AND del <> '*'` in its own names
+    const narrowed = prog.stmts[2].binding;
+    try testing.expectEqualStrings("__derived2_on", narrowed.name);
+    try testing.expectEqualStrings("__derived1_b", narrowed.pipeline.stages[0].node.ref);
+    const f = narrowed.pipeline.stages[1].node.filter;
+    try testing.expectEqualStrings("del", f.binary.r.binary.l.field.parts[0]);
+    const st = prog.stmts[3].output.stages;
+    try testing.expectEqualStrings("__derived2_on", st[1].node.join.binding);
+    try testing.expectEqualStrings("b", st[1].node.join.alias);
+    try testing.expectEqual(@as(usize, 1), st[1].node.join.left_keys.len);
+    // `a.v = 'x'` after the join
+    try testing.expect(st[2].node == .filter);
+
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT * FROM 'x.csv' a JOIN 'y.csv' b ON a.id = b.id;", &diag));
-    try testing.expect(std.mem.indexOf(u8, diag.msg, "WITH b AS (SELECT * FROM 'y.csv')") != null);
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT * FROM 'a.csv' a LEFT JOIN 'b.csv' b ON b.id = a.id AND a.v = 'x';", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "only an inner join") != null);
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT * FROM 'a.csv' a JOIN 'b.csv' b ON b.del <> '*';", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "at least one") != null);
 }
 
 test "sql: multi-key ON, RIGHT/FULL/CROSS join kinds, and the plain-column rule" {

@@ -435,6 +435,8 @@ LIMIT 100 OFFSET 20;
 | CTE | `FROM <name>` |
 | table function | `FROM paid_orders($since) p` — a `CREATE FUNCTION ... RETURNS TABLE` (§9), also as a `JOIN`'s right side |
 
+Every source takes an alias, with or without `AS`: `FROM 'x.xlsx' AS xl`, `FROM sr.db.t t`.
+
 A folder read lists the folder — subfolders included, names starting `_` or
 `.` skipped (`_SUCCESS`, `_temporary/`, `.crc`) — and reads the files sorted
 by path. Parquet files and no CSVs read as Parquet; CSVs as CSV, other files
@@ -793,7 +795,7 @@ apart.
 | `SELECT DISTINCT` / `DISTINCT ON (a, b)` | distinct — `ON` keys are input columns: they need not be in the SELECT list, and may be ones it renames (`DISTINCT ON (grp) grp AS k`). `DISTINCT ON` keeps the first row per key in `ORDER BY` order when there is one (`ORDER BY k, ts DESC` keeps the latest), else the first in input order |
 | `CROSS JOIN UNNEST(SPLIT(tags, ',')) AS tag` | explode (also `UNNEST(col)`) |
 | `CROSS JOIN UNNEST(JSON_EACH(tags)) AS tag` | explode a JSON array: one row per element — strings unquoted, objects and arrays as JSON text, a JSON `null` as null. A null or `null` cell gives no rows; an object or scalar is an error |
-| `[INNER\|LEFT\|RIGHT\|FULL\|CROSS\|SEMI\|ANTI] JOIN <cte> x ON a = b [AND c = d ...]` | join (right side must be a CTE) |
+| `[INNER\|LEFT\|RIGHT\|FULL\|CROSS\|SEMI\|ANTI] JOIN <source> [AS] x ON a = b [AND ...]` | join — the right side a CTE, `(SELECT ...)`, table function, path or connection table |
 
 Row order without `ORDER BY` is not defined in SQL, and `GROUP BY` returns groups
 in hash-partition order. A pipeline that only filters, projects or joins keeps the
@@ -806,11 +808,20 @@ does not order its rows (a table has none). `DISTINCT` keeps the first row per
 key in input order at any `-j`. Add `ORDER BY` whenever the order is part of
 the answer.
 
-Joins are hash equi-joins: the CTE (right) side is materialized and indexed
-once, the left side streams through. Keys are plain columns (compute
-expressions in the CTE or a select first), `AND`-combined for composite keys;
-pairs may be written in either order, and a null key never matches. `CROSS
-JOIN <cte>` takes no `ON`. Right-side columns that collide with a left name
+Joins are hash equi-joins: the right side is materialized and indexed once,
+the left side streams through. The right side is a CTE, a `(SELECT ...)`, a
+table function, or any source a `FROM` reads — a path (`JOIN 'smb://fs/x.xlsx'
+x`, its `WITH (...)` after the alias) or a connection's table (`JOIN
+sr.db.t AS t`), read as `(SELECT * FROM it)` would be. Keys are plain columns
+(compute expressions in the CTE or a select first), `AND`-combined for composite
+keys; pairs may be written in either order, and a null key never matches. The
+rest of an `ON` is a condition: one naming only the right side, or no column
+(`1 = 1`), narrows the right side before the join — right for an outer join
+too, and pushed down to a SQL source as that side's `WHERE` — so `JOIN sr.t AS t
+ON t.D_E_L_E_T_ <> '*' AND t.k = x.k` reads only live rows. Any other (the left
+side alone, the two sides compared otherwise than by `=`) filters the joined
+rows, which only an inner join means; another kind says so. `CROSS JOIN <cte>`
+takes no `ON`. Right-side columns that collide with a left name
 come back suffixed `_r`, and `_r2`, `_r3`, … if that name is taken too — that is
 the name `SELECT *` shows. A qualified reference needs no suffix: with `FROM t a
 JOIN r b`, `b.amt` is the right side's `amt` everywhere in the query (`SELECT`,
