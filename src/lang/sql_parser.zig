@@ -1976,6 +1976,11 @@ pub const Parser = struct {
             var left_keys = std.array_list.Managed(ast.QualName).init(self.arena);
             var right_keys = std.array_list.Managed(ast.QualName).init(self.arena);
             var post_filters = std.array_list.Managed(*ast.Expr).init(self.arena);
+            // Computed keys: each side's `SELECT *, expr AS __jkN`, and the names
+            // to drop after the join.
+            var left_computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
+            var right_computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
+            var key_cols = std.array_list.Managed([]const u8).init(self.arena);
             for (lateral_keys) |lk| {
                 try left_keys.append(stripQual(lk.left, &aliases));
                 const rp = try self.arena.alloc([]const u8, 1);
@@ -2023,6 +2028,40 @@ pub const Parser = struct {
                             continue;
                         }
                     }
+                    // A computed key: `trim(b.code) = cast(a.code AS string)`, each
+                    // side naming its own table only. Each side computes its key
+                    // as a column of its own, dropped again after the join.
+                    if (c.* == .binary and c.binary.op == .eq) {
+                        const sl = try self.sidesOf(c.binary.l, rname);
+                        const sr = try self.sidesOf(c.binary.r, rname);
+                        const l_left = sl.other and !sl.right;
+                        const r_left = sr.other and !sr.right;
+                        const l_right = sl.right and !sl.other;
+                        const r_right = sr.right and !sr.other;
+                        if ((l_left and r_right) or (l_right and r_left)) {
+                            const le = if (l_left) c.binary.l else c.binary.r;
+                            const re = if (l_left) c.binary.r else c.binary.l;
+                            if (le.* == .field) {
+                                try left_keys.append(stripQual(le.field, &aliases));
+                            } else {
+                                self.derived_n += 1;
+                                const k = try std.fmt.allocPrint(self.arena, "__jk{d}", .{self.derived_n});
+                                try left_computed.append(.{ .computed = .{ .name = k, .expr = try self.stripExpr(le, &aliases) } });
+                                try key_cols.append(k);
+                                try left_keys.append(try self.qualOne(k));
+                            }
+                            if (re.* == .field) {
+                                try right_keys.append(stripPrefix(re.field, rname));
+                            } else {
+                                self.derived_n += 1;
+                                const k = try std.fmt.allocPrint(self.arena, "__jk{d}", .{self.derived_n});
+                                try right_computed.append(.{ .computed = .{ .name = k, .expr = try self.stripRightExpr(re, rname) } });
+                                try key_cols.append(k);
+                                try right_keys.append(try self.qualOne(k));
+                            }
+                            continue;
+                        }
+                    }
                     if (!try self.namesOtherSide(c, rname)) {
                         const e = try self.stripRightExpr(c, rname);
                         narrow = if (narrow) |n| try self.mk(.{ .binary = .{ .op = .@"and", .l = n, .r = e } }) else e;
@@ -2031,18 +2070,27 @@ pub const Parser = struct {
                     } else return self.fail(.{ .line = opos.line, .col = opos.col }, "this {s} JOIN's ON compares the left side otherwise than by `=` to a right column; only an inner join can take that — filter in WHERE, or in a CTE first", .{@tagName(kind)});
                 }
                 if (left_keys.items.len == 0)
-                    return self.fail(.{ .line = opos.line, .col = opos.col }, "the ON of a join needs at least one `left.col = right.col` to join by, between plain columns — compute a key in a CTE / a select first", .{});
-                if (narrow) |n| {
-                    // The right side, narrowed, as a binding of its own.
+                    return self.fail(.{ .line = opos.line, .col = opos.col }, "the ON of a join needs at least one `=` between a left and a right value to join by — `b.k = a.k`, or computed: `trim(b.k) = cast(a.k AS string)`", .{});
+                if (narrow != null or right_computed.items.len > 0) {
+                    // The right side, narrowed and its keys computed, as a binding
+                    // of its own.
                     self.derived_n += 1;
                     const name = try std.fmt.allocPrint(self.arena, "__derived{d}_on", .{self.derived_n});
                     try self.let_names.append(name);
-                    const st = try self.arena.alloc(ast.Stage, 2);
-                    st[0] = .{ .node = .{ .ref = binding }, .hints = &.{}, .pos = jpos };
-                    st[1] = .{ .node = .{ .filter = n }, .hints = &.{}, .pos = jpos };
-                    try self.pending_bindings.append(.{ .binding = .{ .name = name, .pipeline = .{ .stages = st, .pos = jpos }, .pos = jpos } });
+                    var st = std.array_list.Managed(ast.Stage).init(self.arena);
+                    try st.append(.{ .node = .{ .ref = binding }, .hints = &.{}, .pos = jpos });
+                    if (narrow) |n| try st.append(.{ .node = .{ .filter = n }, .hints = &.{}, .pos = jpos });
+                    if (right_computed.items.len > 0) {
+                        try right_computed.insert(0, .star);
+                        try st.append(.{ .node = .{ .select = try right_computed.toOwnedSlice() }, .hints = &.{}, .pos = jpos });
+                    }
+                    try self.pending_bindings.append(.{ .binding = .{ .name = name, .pipeline = .{ .stages = try st.toOwnedSlice(), .pos = jpos }, .pos = jpos } });
                     if (jalias == null) jalias = binding;
                     binding = name;
+                }
+                if (left_computed.items.len > 0) {
+                    try left_computed.insert(0, .star);
+                    try stages.append(.{ .node = .{ .select = try left_computed.toOwnedSlice() }, .hints = &.{}, .pos = jpos });
                 }
             }
             var jhints = std.array_list.Managed(ast.Hint).init(self.arena);
@@ -2066,6 +2114,11 @@ pub const Parser = struct {
                 try stages.append(.{ .node = .{ .filter = e }, .hints = &.{}, .pos = jpos });
             }
             post_filters.clearRetainingCapacity();
+            if (key_cols.items.len > 0) {
+                const drop = try self.arena.alloc(ast.SelectItem, 1);
+                drop[0] = .{ .star_except = try key_cols.toOwnedSlice() };
+                try stages.append(.{ .node = .{ .select = drop }, .hints = &.{}, .pos = jpos });
+            }
         }
 
         if (self.eatKw("where")) {
@@ -4151,6 +4204,33 @@ pub const Parser = struct {
         return S.recur(.{ .p = self, .m = map }, e);
     }
 
+    /// Which sides `e` names: a column of the join's right side (`rname.col`),
+    /// and any other — a left column, or one written without its table.
+    fn sidesOf(self: *Parser, e: *ast.Expr, rname: []const u8) Error!struct { right: bool, other: bool } {
+        const Ctx = struct { p: *Parser, rname: []const u8, right: *bool, other: *bool };
+        const S = struct {
+            fn recur(cx: Ctx, node: *const ast.Expr) Error!*ast.Expr {
+                if (node.* == .field) {
+                    if (!node.field.dollar) {
+                        if (qualHasPrefix(node.field, cx.rname)) cx.right.* = true else cx.other.* = true;
+                    }
+                    return @constCast(node);
+                }
+                return ast.rebuildExpr(cx.p.arena, node, cx, recur);
+            }
+        };
+        var right = false;
+        var other = false;
+        _ = try S.recur(.{ .p = self, .rname = rname, .right = &right, .other = &other }, e);
+        return .{ .right = right, .other = other };
+    }
+
+    fn qualOne(self: *Parser, name: []const u8) Error!ast.QualName {
+        const parts = try self.arena.alloc([]const u8, 1);
+        parts[0] = name;
+        return .{ .parts = parts };
+    }
+
     /// Whether `e` names a column other than one of the join's right side
     /// (`rname.col`) — a left column, or one written without its table.
     fn namesOtherSide(self: *Parser, e: *ast.Expr, rname: []const u8) Error!bool {
@@ -5186,6 +5266,28 @@ test "sql: ON beyond keys — the right side alone narrows it, the rest of an in
     try testing.expect(std.mem.indexOf(u8, diag.msg, "at least one") != null);
 }
 
+test "sql: a computed key in ON — each side computes its own column, dropped after the join" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parseTest(a,
+        \\SELECT * FROM 'a.csv' AS a JOIN 'b.csv' AS b ON trim(b.code) = cast(a.code AS string) AND b.del <> '*';
+    );
+    // b: read, then narrowed and its key computed
+    const rb = prog.stmts[2].binding.pipeline.stages;
+    try testing.expect(rb[1].node == .filter);
+    try testing.expect(rb[2].node.select[0] == .star);
+    try testing.expectEqualStrings("code", rb[2].node.select[1].computed.expr.call.args[0].field.parts[0]);
+    const st = prog.stmts[3].output.stages;
+    // a computes its key before the join, and the keys go after it
+    try testing.expect(st[1].node.select[0] == .star);
+    const lk = st[1].node.select[1].computed.name;
+    const j = st[2].node.join;
+    try testing.expectEqualStrings(lk, j.left_keys[0].parts[0]);
+    try testing.expectEqualStrings(rb[2].node.select[1].computed.name, j.right_keys[0].parts[0]);
+    try testing.expectEqual(@as(usize, 2), st[3].node.select[0].star_except.len);
+}
+
 test "sql: multi-key ON, RIGHT/FULL/CROSS join kinds, and the plain-column rule" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -5229,12 +5331,13 @@ test "sql: multi-key ON, RIGHT/FULL/CROSS join kinds, and the plain-column rule"
     try testing.expect(up.stmts[1].output.stages[1].node == .explode);
 
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    try testing.expectError(error.ParseFailed, parseSource(a,
+    // a computed key is a key: `t` computes it before the join
+    const ck = try parseTest(a,
         \\LOAD INTO 'out.csv' AS
         \\WITH r AS (SELECT id FROM 'r.csv')
         \\SELECT * FROM 'in.csv' t JOIN r ON lower(t.id) = r.id;
-    , &diag));
-    try testing.expect(std.mem.indexOf(u8, diag.msg, "plain columns") != null);
+    );
+    try testing.expectEqualStrings("id", ck.stmts[2].output.stages[2].node.join.right_keys[0].parts[0]);
 
     try testing.expectError(error.ParseFailed, parseSource(a,
         \\LOAD INTO 'out.csv' AS

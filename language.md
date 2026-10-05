@@ -812,9 +812,12 @@ Joins are hash equi-joins: the right side is materialized and indexed once,
 the left side streams through. The right side is a CTE, a `(SELECT ...)`, a
 table function, or any source a `FROM` reads — a path (`JOIN 'smb://fs/x.xlsx'
 x`, its `WITH (...)` after the alias) or a connection's table (`JOIN
-sr.db.t AS t`), read as `(SELECT * FROM it)` would be. Keys are plain columns
-(compute expressions in the CTE or a select first), `AND`-combined for composite
-keys; pairs may be written in either order, and a null key never matches. The
+sr.db.t AS t`), read as `(SELECT * FROM it)` would be. A key is an `=` between
+a value of each side, `AND`-combined for composite keys, written in either
+order; a null key never matches. A key may be computed — `trim(t.code) =
+CAST(x.code AS string)`, each side naming only its own table — and each side
+then computes it before the join, out of sight of `SELECT *`. Keys of two types
+(a spreadsheet's number against a table's text) do not join until one is cast. The
 rest of an `ON` is a condition: one naming only the right side, or no column
 (`1 = 1`), narrows the right side before the join — right for an outer join
 too, and pushed down to a SQL source as that side's `WHERE` — so `JOIN sr.t AS t

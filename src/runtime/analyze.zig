@@ -335,7 +335,7 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
         const lt = left.fields[pair[0]].ty;
         const rt = right.fields[pair[1]].ty;
         if (types.Type.unify(lt, rt) == null)
-            return fail(diag, "join keys `{s}` and `{s}` are not comparable", .{ left.fields[pair[0]].name, right.fields[pair[1]].name });
+            return fail(diag, "join keys `{s}` ({s}) and `{s}` ({s}) are not comparable — make them one type in the ON: `CAST(x AS string) = y`", .{ left.fields[pair[0]].name, @tagName(lt.kind), right.fields[pair[1]].name, @tagName(rt.kind) });
     }
 
     const emit_right = (j.kind != .semi and j.kind != .anti);
