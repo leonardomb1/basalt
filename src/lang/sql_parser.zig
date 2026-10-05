@@ -1875,6 +1875,10 @@ pub const Parser = struct {
 
         var stages = std.array_list.Managed(ast.Stage).init(self.arena);
         try stages.append(.{ .node = src, .hints = try read_hints.toOwnedSlice(), .pos = pos });
+        // Computed join keys' columns (`__jkN`), dropped once the WHERE is in —
+        // not right after the join, where a stage would hold the WHERE above it
+        // and keep it from the sources.
+        var key_cols = std.array_list.Managed([]const u8).init(self.arena);
 
         while (true) {
             const jk: ?ast.JoinKind = blk: {
@@ -1980,7 +1984,6 @@ pub const Parser = struct {
             // to drop after the join.
             var left_computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
             var right_computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
-            var key_cols = std.array_list.Managed([]const u8).init(self.arena);
             for (lateral_keys) |lk| {
                 try left_keys.append(stripQual(lk.left, &aliases));
                 const rp = try self.arena.alloc([]const u8, 1);
@@ -2114,11 +2117,6 @@ pub const Parser = struct {
                 try stages.append(.{ .node = .{ .filter = e }, .hints = &.{}, .pos = jpos });
             }
             post_filters.clearRetainingCapacity();
-            if (key_cols.items.len > 0) {
-                const drop = try self.arena.alloc(ast.SelectItem, 1);
-                drop[0] = .{ .star_except = try key_cols.toOwnedSlice() };
-                try stages.append(.{ .node = .{ .select = drop }, .hints = &.{}, .pos = jpos });
-            }
         }
 
         if (self.eatKw("where")) {
@@ -2163,6 +2161,11 @@ pub const Parser = struct {
                 });
             }
             self.pending_semijoins.shrinkRetainingCapacity(sj_base);
+        }
+        if (key_cols.items.len > 0) {
+            const drop = try self.arena.alloc(ast.SelectItem, 1);
+            drop[0] = .{ .star_except = try key_cols.toOwnedSlice() };
+            try stages.append(.{ .node = .{ .select = drop }, .hints = &.{}, .pos = pos });
         }
 
         var group: []const ast.QualName = &.{};
