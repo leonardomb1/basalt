@@ -1608,9 +1608,20 @@ pub fn registerSmb(env: *Env, conn: ast.Connection) !void {
             c.domain = v;
         } else if (std.mem.eql(u8, k, "share")) {
             c.share = if (v) |sh| std.mem.trim(u8, sh, "/\\") else null;
-        } else return planErr(env.diag, try std.fmt.allocPrint(env.arena, "smb connection `{s}`: unknown option `{s}` (host, port, user, password, domain, share)", .{ conn.name, k }));
+        } else if (std.mem.eql(u8, k, "realm")) {
+            c.realm = if (v) |r| try std.ascii.allocUpperString(env.arena, r) else null;
+        } else if (std.mem.eql(u8, k, "kdc")) {
+            c.kdc = v;
+        } else if (std.mem.eql(u8, k, "spn")) {
+            c.spn = v;
+        } else if (std.mem.eql(u8, k, "auth")) {
+            const a = v orelse "";
+            c.auth = if (std.ascii.eqlIgnoreCase(a, "kerberos")) .kerberos else if (std.ascii.eqlIgnoreCase(a, "ntlm")) .ntlm else return planErr(env.diag, try std.fmt.allocPrint(env.arena, "smb connection `{s}`: `auth` is kerberos or ntlm, not `{s}`", .{ conn.name, a }));
+        } else return planErr(env.diag, try std.fmt.allocPrint(env.arena, "smb connection `{s}`: unknown option `{s}` (host, port, user, password, domain, share, auth, realm, kdc, spn)", .{ conn.name, k }));
     }
     if (c.host.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "smb connection `{s}` needs a `host`", .{conn.name}));
+    if (c.auth == .kerberos and c.realm == null)
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "smb connection `{s}`: Kerberos needs the `realm` — the domain's DNS name, as CORP.LOCAL, not its NetBIOS name", .{conn.name}));
     try smb.register(conn.name, c);
 }
 

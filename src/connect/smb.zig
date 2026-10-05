@@ -1,8 +1,8 @@
 //! An SMB2/3 client, per [MS-SMB2]: enough of the protocol to read, list and
 //! write files on a Windows share or a Samba server.
 //!
-//! Dialects 2.1 through 3.1.1 over direct TCP (445). Login is NTLMv2 inside
-//! SPNEGO (`ntlm.zig`). Every request after login is signed and every signed
+//! Dialects 2.1 through 3.1.1 over direct TCP (445). Login is NTLMv2
+//! (`ntlm.zig`) or Kerberos (`krb5.zig`) inside SPNEGO. Every request after login is signed and every signed
 //! response checked — Windows 11 24H2 and Server 2025 require signing by
 //! default, and a server that does not still accepts it: HMAC-SHA256 on 2.1,
 //! AES-CMAC on 3.x with keys derived by the SP800-108 KDF, on 3.1.1 over the
@@ -14,10 +14,11 @@
 //! an SMB2 TRANSFORM_HEADER with AES-128-GCM (3.1.1) or AES-128-CCM (3.0, and
 //! 3.1.1 when the server picks it), keys derived as the signing key is.
 //!
-//! Not here: Kerberos, DFS referrals, oplocks and leases, multichannel.
+//! Not here: DFS referrals, oplocks and leases, multichannel.
 
 const std = @import("std");
 const ntlm = @import("ntlm.zig");
+const krb5 = @import("krb5.zig");
 
 pub const Error = error{
     SmbProtocol,
@@ -43,7 +44,15 @@ pub const Config = struct {
     domain: []const u8 = "",
     /// The newest dialect to offer — 0x0311 unless a server mishandles it.
     max_dialect: u16 = dialect_311,
+    auth: Auth = .ntlm,
+    /// Kerberos: the realm (`CORP.LOCAL`), a KDC (`host[:port]`, looked up
+    /// when empty) and the service's name (`cifs/<host>` when empty).
+    realm: []const u8 = "",
+    kdc: []const u8 = "",
+    spn: []const u8 = "",
 };
+
+pub const Auth = enum { ntlm, kerberos };
 
 /// Why the last call on this thread failed, in words; never a secret.
 threadlocal var why_buf: [512]u8 = undefined;
@@ -460,6 +469,52 @@ pub const Session = struct {
     }
 
     fn login(self: *Session) Error!void {
+        switch (self.cfg.auth) {
+            .ntlm => try self.loginNtlm(),
+            .kerberos => try self.loginKerberos(),
+        }
+    }
+
+    /// One round: the AP-REQ in SPNEGO, the server's AP-REP back — checked, so the
+    /// server proves it holds the service key — and the session key from it. The
+    /// reply is signed with a key only that AP-REP yields, so its signature is
+    /// checked once the key is in hand.
+    fn loginKerberos(self: *Session) Error!void {
+        const cred = krb5.Credential{ .user = self.cfg.user, .password = self.cfg.password, .realm = self.cfg.realm, .kdc = self.cfg.kdc };
+        var spn_buf: [300]u8 = undefined;
+        const spn = if (self.cfg.spn.len > 0) self.cfg.spn else std.fmt.bufPrint(&spn_buf, "cifs/{s}", .{self.cfg.host}) catch return error.SmbFailure;
+        const t = krb5.serviceTicket(self.gpa, cred, spn) catch |e| return krbFailed(e);
+        const ctx = krb5.initContext(self.gpa, cred, &t) catch |e| return krbFailed(e);
+        defer self.gpa.free(ctx.token);
+        const tok = spnegoInitWith(self.gpa, &.{ &oid_krb5, &oid_ms_krb5 }, ctx.token) catch return error.SmbFailure;
+        defer self.gpa.free(tok);
+
+        const m = try self.sessionSetup(tok, null);
+        defer self.gpa.free(m.bytes);
+        if (m.status == Status.more_processing)
+            return fail(error.SmbUnsupported, "the server asked for a second Kerberos round, which basalt does not do", .{});
+        if (m.status != Status.success) return self.logonFailed(m.status);
+        self.session_id = m.session_id;
+        const reply = spnegoToken(sessionBlob(m)) orelse
+            return fail(error.SmbLogonFailure, "the server accepted the ticket without proving itself (no AP-REP)", .{});
+        const key = krb5.acceptReply(self.gpa, &ctx, reply) catch |e| return krbFailed(e);
+        var session_key: [16]u8 = [_]u8{0} ** 16;
+        const kl = @min(16, key.len);
+        @memcpy(session_key[0..kl], key.bytes[0..kl]);
+        self.deriveSigningKey(session_key);
+        self.signing = true;
+        if (m.flags & flag_signed != 0) {
+            var sig: [16]u8 = undefined;
+            @memcpy(&sig, m.bytes[48..64]);
+            @memset(m.bytes[48..64], 0);
+            const want = self.sign(m.bytes);
+            if (!std.crypto.timing_safe.eql([16]u8, sig, want))
+                return fail(error.SmbSignature, "the server's login reply is not signed with the Kerberos session key", .{});
+        }
+        try self.loggedIn(m);
+    }
+
+    fn loginNtlm(self: *Session) Error!void {
         const cred = ntlm.Credential{ .domain = self.cfg.domain, .user = self.cfg.user, .password = self.cfg.password };
         const t1 = ntlm.negotiate(self.gpa, cred) catch return error.SmbFailure;
         defer self.gpa.free(t1);
@@ -488,7 +543,12 @@ pub const Session = struct {
         const m2 = try self.sessionSetup(resp_tok, auth.session_key);
         defer self.gpa.free(m2.bytes);
         if (m2.status != Status.success) return self.logonFailed(m2.status);
-        const flags = std.mem.readInt(u16, m2.body()[2..4], .little);
+        try self.loggedIn(m2);
+    }
+
+    /// What the final SESSION_SETUP response says of the session.
+    fn loggedIn(self: *Session, m: Msg) Error!void {
+        const flags = std.mem.readInt(u16, m.body()[2..4], .little);
         if (flags & 0x3 != 0)
             return fail(error.SmbLogonFailure, "the server logged {s} in as a guest — check the user name and password", .{self.cfg.user});
         if (flags & 0x4 != 0) {
@@ -923,6 +983,11 @@ pub const Conn = struct {
     /// When set, a path under the connection is inside this share:
     /// `smb://name/dir/x.csv` rather than `smb://name/share/dir/x.csv`.
     share: ?[]const u8 = null,
+    /// Kerberos when a realm is given, unless `auth` says otherwise.
+    auth: ?Auth = null,
+    realm: ?[]const u8 = null,
+    kdc: ?[]const u8 = null,
+    spn: ?[]const u8 = null,
 };
 
 var registry_mtx: std.Thread.Mutex = .{};
@@ -937,7 +1002,7 @@ pub fn register(name: []const u8, c: Conn) !void {
     defer registry_mtx.unlock();
     var owned = c;
     owned.host = try gpa.dupe(u8, c.host);
-    inline for (.{ "user", "password", "domain", "share" }) |f| {
+    inline for (.{ "user", "password", "domain", "share", "realm", "kdc", "spn" }) |f| {
         if (@field(c, f)) |v| @field(owned, f) = try gpa.dupe(u8, v);
     }
     try registry.put(gpa, try std.ascii.allocLowerString(gpa, name), owned);
@@ -995,6 +1060,10 @@ pub fn resolve(arena: std.mem.Allocator, url: []const u8) !Target {
             .user = user orelse c.user orelse std.posix.getenv("USER") orelse "",
             .password = c.password orelse "",
             .domain = domain orelse c.domain orelse "",
+            .realm = c.realm orelse "",
+            .kdc = c.kdc orelse "",
+            .spn = c.spn orelse "",
+            .auth = c.auth orelse if (c.realm != null) .kerberos else .ntlm,
         };
         if (c.share) |sh| {
             share = sh;
@@ -1008,6 +1077,9 @@ pub fn resolve(arena: std.mem.Allocator, url: []const u8) !Target {
             .user = user orelse std.posix.getenv("SMB_USER") orelse std.posix.getenv("USER") orelse "",
             .password = std.posix.getenv("SMB_PASSWORD") orelse "",
             .domain = domain orelse std.posix.getenv("SMB_DOMAIN") orelse "",
+            .realm = std.posix.getenv("SMB_REALM") orelse "",
+            .kdc = std.posix.getenv("SMB_KDC") orelse "",
+            .auth = if (std.posix.getenv("SMB_REALM") != null) .kerberos else .ntlm,
         };
         share = try splitShare(&path);
     }
@@ -1036,6 +1108,10 @@ fn poolKey(buf: []u8, cfg: Config) []const u8 {
     h.update(cfg.password);
     h.update(&[_]u8{0});
     h.update(cfg.domain);
+    h.update(&[_]u8{ 0, @intFromEnum(cfg.auth) });
+    h.update(cfg.realm);
+    h.update(&[_]u8{0});
+    h.update(cfg.spn);
     return std.fmt.bufPrint(buf, "{s}@{s}:{d}#{x}", .{ cfg.user, cfg.host, cfg.port, h.final() }) catch cfg.host;
 }
 
@@ -1432,6 +1508,15 @@ pub fn ccmDecrypt(msg: []u8, ct: []const u8, tag: [16]u8, aad: []const u8, nonce
     }
 }
 
+/// A Kerberos failure as a failed SMB login, in the Kerberos layer's words.
+fn krbFailed(e: anyerror) Error {
+    const why = krb5.lastError();
+    return switch (e) {
+        error.OutOfMemory => error.SmbFailure,
+        else => fail(error.SmbLogonFailure, "kerberos: {s}: {s}", .{ @errorName(e), if (why.len > 0) why else "no further detail" }),
+    };
+}
+
 fn dialectName(d: u16) []const u8 {
     return switch (d) {
         dialect_210 => "2.1",
@@ -1476,14 +1561,25 @@ fn derWrap(gpa: std.mem.Allocator, tag: u8, inner: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
+const oid_krb5 = [_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02 };
+/// Microsoft's legacy OID for Kerberos 5, which Windows lists beside the standard one.
+const oid_ms_krb5 = [_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x82, 0xf7, 0x12, 0x01, 0x02, 0x02 };
+
 /// GSS-API InitialContextToken with a NegTokenInit offering NTLMSSP only and
 /// carrying its NEGOTIATE_MESSAGE.
 pub fn spnegoInit(gpa: std.mem.Allocator, ntlm_negotiate: []const u8) ![]u8 {
-    const mech_list = try derWrap(gpa, 0x30, &oid_ntlmssp);
+    return spnegoInitWith(gpa, &.{&oid_ntlmssp}, ntlm_negotiate);
+}
+
+/// A NegTokenInit offering `mechs`, the first one's token optimistically sent.
+pub fn spnegoInitWith(gpa: std.mem.Allocator, mechs: []const []const u8, token: []const u8) ![]u8 {
+    const oids = try std.mem.concat(gpa, u8, mechs);
+    defer gpa.free(oids);
+    const mech_list = try derWrap(gpa, 0x30, oids);
     defer gpa.free(mech_list);
     const mech_types = try derWrap(gpa, 0xa0, mech_list);
     defer gpa.free(mech_types);
-    const octets = try derWrap(gpa, 0x04, ntlm_negotiate);
+    const octets = try derWrap(gpa, 0x04, token);
     defer gpa.free(octets);
     const mech_token = try derWrap(gpa, 0xa2, octets);
     defer gpa.free(mech_token);
