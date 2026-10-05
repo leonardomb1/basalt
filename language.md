@@ -267,7 +267,7 @@ Timestamps are `DATETIME(6)`, to keep microseconds. Loads run in Doris' strict
 mode, so a value that does not convert fails the load instead of landing as
 NULL.
 
-**Named SQL Server instances:** write `host = '10.110.2.5\WMS'`. When a `host`
+**Named SQL Server instances:** write `host = 'sql01.corp.local\SALES'`. When a `host`
 carries a `\INSTANCE` and no explicit `port` is given, basalt resolves the
 instance's TCP port via the SQL Server Browser (UDP 1434) before connecting.
 Give an explicit `port` to skip the lookup — the robust choice where UDP 1434

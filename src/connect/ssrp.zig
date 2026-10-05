@@ -8,7 +8,7 @@
 //! instance on this server") to <host>:1434; the Browser replies with one
 //! datagram: `0x05`, a 2-byte little-endian length, then an ASCII string of
 //! `;`-delimited `key;value` pairs, one instance block per `;;`:
-//!   ServerName;HOST;InstanceName;WMS;IsClustered;No;Version;15.0.2000.5;tcp;51000;;
+//!   ServerName;HOST;InstanceName;SALES;IsClustered;No;Version;15.0.2000.5;tcp;51000;;
 //! We find the block whose InstanceName matches (case-insensitive) and read its
 //! `tcp` port.
 //!
@@ -97,9 +97,9 @@ pub fn resolveInstancePort(gpa: std.mem.Allocator, host: []const u8, instance: [
 const testing = std.testing;
 
 test "splitHostInstance: named instance vs plain host" {
-    const a = splitHostInstance("10.110.2.5\\WMS");
-    try testing.expectEqualStrings("10.110.2.5", a.host);
-    try testing.expectEqualStrings("WMS", a.instance.?);
+    const a = splitHostInstance("sql01.corp.local\\SALES");
+    try testing.expectEqualStrings("sql01.corp.local", a.host);
+    try testing.expectEqualStrings("SALES", a.instance.?);
 
     const b = splitHostInstance("sql.internal");
     try testing.expectEqualStrings("sql.internal", b.host);
@@ -109,21 +109,21 @@ test "splitHostInstance: named instance vs plain host" {
 test "parsePort: picks the matching instance's tcp port (case-insensitive)" {
     const payload =
         "ServerName;HOST;InstanceName;MSSQLSERVER;IsClustered;No;Version;15.0.2000.5;tcp;1433;;" ++
-        "ServerName;HOST;InstanceName;WMS;IsClustered;No;Version;15.0.2000.5;tcp;51000;;";
+        "ServerName;HOST;InstanceName;SALES;IsClustered;No;Version;15.0.2000.5;tcp;51000;;";
     var data: [3 + payload.len]u8 = undefined;
     data[0] = 0x05;
     std.mem.writeInt(u16, data[1..3], @intCast(payload.len), .little);
     @memcpy(data[3..], payload);
 
-    try testing.expectEqual(@as(u16, 51000), try parsePort(&data, "wms"));
+    try testing.expectEqual(@as(u16, 51000), try parsePort(&data, "sales"));
     try testing.expectEqual(@as(u16, 1433), try parsePort(&data, "MSSQLSERVER"));
 }
 
 test "parsePort: header-less body and error cases" {
-    const one = "ServerName;H;InstanceName;WMS;tcp;51000;;";
-    try testing.expectEqual(@as(u16, 51000), try parsePort(one, "WMS"));
+    const one = "ServerName;H;InstanceName;SALES;tcp;51000;;";
+    try testing.expectEqual(@as(u16, 51000), try parsePort(one, "SALES"));
     try testing.expectError(Error.InstanceNotFound, parsePort(one, "OTHER"));
 
-    const np = "ServerName;H;InstanceName;WMS;np;\\\\H\\pipe\\sql\\query;;";
-    try testing.expectError(Error.TcpDisabled, parsePort(np, "WMS"));
+    const np = "ServerName;H;InstanceName;SALES;np;\\\\H\\pipe\\sql\\query;;";
+    try testing.expectError(Error.TcpDisabled, parsePort(np, "SALES"));
 }
