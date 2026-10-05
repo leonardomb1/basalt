@@ -1913,6 +1913,7 @@ const Batch = @import("../exec/batch.zig").Batch;
 const http_client = @import("http_client.zig");
 const objstore = @import("objstore.zig");
 const sftp = @import("sftp.zig");
+const smb = @import("smb.zig");
 
 /// Byte source a reader pulls from: a local file read on demand, or an already
 /// resident buffer.
@@ -1927,10 +1928,13 @@ pub const Bytes = union(enum) {
     remote: *Remote,
     /// A file on an SFTP server, read by offset.
     sftp: *sftp.File,
+    /// A file on an SMB share, read by offset.
+    smb: *smb.File,
 
     /// Where `path` is read from: an SFTP server, an HTTP range, or the disk.
     pub fn open(arena: std.mem.Allocator, path: []const u8) !Bytes {
         if (sftp.isUrl(path)) return .{ .sftp = try sftp.File.open(arena, path) };
+        if (smb.isUrl(path)) return .{ .smb = try smb.File.open(arena, path) };
         if (isRemote(path)) return .{ .remote = try Remote.open(arena, path) };
         const f = try std.fs.cwd().openFile(path, .{});
         errdefer f.close();
@@ -1943,6 +1947,7 @@ pub const Bytes = union(enum) {
             .file => |x| x.size,
             .remote => |r| r.total,
             .sftp => |f| f.size,
+            .smb => |f| f.size,
         };
     }
 
@@ -1973,6 +1978,13 @@ pub const Bytes = union(enum) {
                     else => e,
                 };
             },
+            .smb => |f| {
+                if (off + len > f.size) return Error.CorruptParquetPage;
+                return f.read(arena, off, len) catch |e| switch (e) {
+                    error.EndOfStream => Error.CorruptParquetPage,
+                    else => e,
+                };
+            },
         }
     }
 
@@ -1982,6 +1994,7 @@ pub const Bytes = union(enum) {
             .file => |x| x.f.close(),
             .remote => |r| r.client.deinit(),
             .sftp => |f| f.close(),
+            .smb => |f| f.close(),
         }
     }
 };

@@ -1,4 +1,4 @@
-//! A folder read: a path ending in `/` — local, `sftp://`, `s3://` or `az://` —
+//! A folder read: a path ending in `/` — local, `sftp://`, `smb://`, `s3://` or `az://` —
 //! is every file under it, subfolders included, as one table. Names starting
 //! with `_` or `.` are skipped at any depth: `_SUCCESS`, `_temporary/`, `.crc`
 //! are what Spark and Hadoop leave beside the data. The listing is sorted by
@@ -9,6 +9,7 @@ const std = @import("std");
 const http_client = @import("http_client.zig");
 const objstore = @import("objstore.zig");
 const sftp = @import("sftp.zig");
+const smb = @import("smb.zig");
 
 pub fn isFolder(path: []const u8) bool {
     return path.len > 0 and path[path.len - 1] == '/';
@@ -19,6 +20,8 @@ pub fn list(arena: std.mem.Allocator, path: []const u8) ![]const []const u8 {
     var out = std.array_list.Managed([]const u8).init(arena);
     if (sftp.isUrl(path)) {
         for (try sftp.listPrefix(arena, path)) |u| if (!hidden(below(u, path))) try out.append(u);
+    } else if (smb.isUrl(path)) {
+        for (try smb.listPrefix(arena, path)) |u| if (!hidden(below(u, path))) try out.append(u);
     } else if (objstore.isUrl(path)) {
         var client = http_client.initClient(arena);
         defer client.deinit();

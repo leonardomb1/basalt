@@ -68,6 +68,7 @@ const Command = enum(u16) {
     close = 6,
     read = 8,
     write = 9,
+    echo = 0x0D,
     query_directory = 0x0E,
     set_info = 0x11,
 };
@@ -785,12 +786,463 @@ pub const Session = struct {
         if (st != Status.success) return fail(error.SmbFailure, "renaming to {s} failed (status 0x{x:0>8})", .{ to, st });
     }
 
+    /// Whether the session still answers — a pooled one may have been dropped.
+    pub fn echo(self: *Session) bool {
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u16, b[0..2], 4, .little);
+        std.mem.writeInt(u16, b[2..4], 0, .little);
+        const m = self.call(.echo, 0, &b, 1) catch return false;
+        defer self.gpa.free(m.bytes);
+        return m.status == Status.success;
+    }
+
     /// Mark the open file `h` for deletion when it is closed.
     pub fn deleteOnClose(self: *Session, h: Handle) Error!void {
         const st = try self.setInfo(h, 13, &[_]u8{1}); // FileDispositionInformation
         if (st != Status.success) return fail(error.SmbFailure, "deleting a file failed (status 0x{x:0>8})", .{st});
     }
 };
+
+// --- URLs, connections and the pool -------------------------------------------------
+
+pub fn isUrl(path: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(path, "smb://");
+}
+
+/// What a `CREATE CONNECTION … TYPE smb` resolved to, registered by the runtime
+/// so a path's host part can name it.
+pub const Conn = struct {
+    host: []const u8,
+    port: u16 = 445,
+    user: ?[]const u8 = null,
+    password: ?[]const u8 = null,
+    domain: ?[]const u8 = null,
+    /// When set, a path under the connection is inside this share:
+    /// `smb://name/dir/x.csv` rather than `smb://name/share/dir/x.csv`.
+    share: ?[]const u8 = null,
+};
+
+var registry_mtx: std.Thread.Mutex = .{};
+var registry: std.StringHashMapUnmanaged(Conn) = .empty;
+
+/// Make `smb://name/…` reach the server `c` describes. Process-wide, as the
+/// pool is; a later registration of a name replaces the earlier one. Strings
+/// are copied.
+pub fn register(name: []const u8, c: Conn) !void {
+    const gpa = std.heap.page_allocator;
+    registry_mtx.lock();
+    defer registry_mtx.unlock();
+    var owned = c;
+    owned.host = try gpa.dupe(u8, c.host);
+    inline for (.{ "user", "password", "domain", "share" }) |f| {
+        if (@field(c, f)) |v| @field(owned, f) = try gpa.dupe(u8, v);
+    }
+    try registry.put(gpa, try std.ascii.allocLowerString(gpa, name), owned);
+}
+
+/// A parsed `smb://` path: the session it needs, the share, and the file in it
+/// (backslashes, from the share's root).
+pub const Target = struct {
+    cfg: Config,
+    share: []const u8,
+    path: []const u8,
+};
+
+/// `smb://[[domain;]user@]host[:port]/share/path`. The host may name a
+/// registered connection, whose share — when it fixes one — the path is then
+/// inside. Otherwise the user is the URL's, `SMB_USER` or `$USER`, the password
+/// `SMB_PASSWORD`, the domain `SMB_DOMAIN`.
+pub fn resolve(arena: std.mem.Allocator, url: []const u8) !Target {
+    if (!isUrl(url)) return error.NotSmbUrl;
+    const rest = url["smb://".len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.NotSmbUrl;
+    var auth = rest[0..slash];
+    var path = std.mem.trimLeft(u8, rest[slash..], "/");
+    var user: ?[]const u8 = null;
+    var domain: ?[]const u8 = null;
+    if (std.mem.lastIndexOfScalar(u8, auth, '@')) |at| {
+        var u = auth[0..at];
+        if (std.mem.indexOfScalar(u8, u, ';')) |semi| {
+            domain = u[0..semi];
+            u = u[semi + 1 ..];
+        }
+        user = u;
+        auth = auth[at + 1 ..];
+    }
+    var host = auth;
+    var port: ?u16 = null;
+    if (std.mem.lastIndexOfScalar(u8, auth, ':')) |c| {
+        host = auth[0..c];
+        port = std.fmt.parseInt(u16, auth[c + 1 ..], 10) catch return error.NotSmbUrl;
+    }
+    if (host.len == 0) return error.NotSmbUrl;
+
+    var low_buf: [256]u8 = undefined;
+    const low = if (host.len <= low_buf.len) std.ascii.lowerString(&low_buf, host) else host;
+    registry_mtx.lock();
+    const named = registry.get(low);
+    registry_mtx.unlock();
+
+    var cfg: Config = undefined;
+    var share: []const u8 = undefined;
+    if (named) |c| {
+        cfg = .{
+            .host = c.host,
+            .port = port orelse c.port,
+            .user = user orelse c.user orelse std.posix.getenv("USER") orelse "",
+            .password = c.password orelse "",
+            .domain = domain orelse c.domain orelse "",
+        };
+        if (c.share) |sh| {
+            share = sh;
+        } else {
+            share = try splitShare(&path);
+        }
+    } else {
+        cfg = .{
+            .host = host,
+            .port = port orelse 445,
+            .user = user orelse std.posix.getenv("SMB_USER") orelse std.posix.getenv("USER") orelse "",
+            .password = std.posix.getenv("SMB_PASSWORD") orelse "",
+            .domain = domain orelse std.posix.getenv("SMB_DOMAIN") orelse "",
+        };
+        share = try splitShare(&path);
+    }
+    const win = try arena.dupe(u8, path);
+    std.mem.replaceScalar(u8, win, '/', '\\');
+    return .{ .cfg = cfg, .share = share, .path = win };
+}
+
+fn splitShare(path: *[]const u8) ![]const u8 {
+    const p = path.*;
+    const e = std.mem.indexOfScalar(u8, p, '/') orelse p.len;
+    if (e == 0) return error.NotSmbUrl;
+    path.* = if (e < p.len) p[e + 1 ..] else "";
+    return p[0..e];
+}
+
+const Pooled = struct { s: *Session, key: []const u8, idle_since: i64 };
+
+var pool_mtx: std.Thread.Mutex = .{};
+var pool: std.ArrayListUnmanaged(Pooled) = .empty;
+
+/// A session is reused only for the same login: another password must not
+/// inherit a session the first one opened.
+fn poolKey(buf: []u8, cfg: Config) []const u8 {
+    var h = std.hash.Wyhash.init(0);
+    h.update(cfg.password);
+    h.update(&[_]u8{0});
+    h.update(cfg.domain);
+    return std.fmt.bufPrint(buf, "{s}@{s}:{d}#{x}", .{ cfg.user, cfg.host, cfg.port, h.final() }) catch cfg.host;
+}
+
+/// A session to the server `cfg` names, the caller's alone until `checkin`.
+pub fn checkout(cfg: Config) !*Session {
+    why_len = 0;
+    var kb: [512]u8 = undefined;
+    const key = poolKey(&kb, cfg);
+    while (takePooled(key)) |p| {
+        // one idle a while may have been dropped by the server or a NAT
+        if (std.time.milliTimestamp() - p.idle_since < 15_000 or p.s.echo()) {
+            std.heap.page_allocator.free(p.key);
+            return p.s;
+        }
+        std.heap.page_allocator.free(p.key);
+        p.s.close();
+    }
+    return Session.connect(std.heap.page_allocator, cfg);
+}
+
+fn takePooled(key: []const u8) ?Pooled {
+    pool_mtx.lock();
+    defer pool_mtx.unlock();
+    var i = pool.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (std.mem.eql(u8, pool.items[i].key, key)) return pool.swapRemove(i);
+    }
+    return null;
+}
+
+/// Hand a session back for the next opener; a broken one is closed instead.
+pub fn checkin(s: *Session, healthy: bool) void {
+    if (!healthy) {
+        s.close();
+        return;
+    }
+    var kb: [512]u8 = undefined;
+    const key = std.heap.page_allocator.dupe(u8, poolKey(&kb, s.cfg)) catch {
+        s.close();
+        return;
+    };
+    pool_mtx.lock();
+    defer pool_mtx.unlock();
+    pool.append(std.heap.page_allocator, .{ .s = s, .key = key, .idle_since = std.time.milliTimestamp() }) catch {
+        std.heap.page_allocator.free(key);
+        s.close();
+    };
+}
+
+/// A file or folder error keeps the session usable; a transport error does not.
+fn isProtocolOk(e: anyerror) bool {
+    return switch (e) {
+        error.SmbNoSuchFile, error.SmbAccessDenied, error.SmbSharingViolation, error.SmbBadShare, error.SmbFailure, error.EndOfStream => true,
+        else => false,
+    };
+}
+
+// --- files ------------------------------------------------------------------------
+
+const read_access = Access.read_data | Access.read_attributes | Access.synchronize;
+
+/// An open remote file, its session checked out for as long as it is open.
+pub const File = struct {
+    session: *Session,
+    handle: Session.Handle,
+    size: u64,
+    healthy: bool = true,
+
+    pub fn open(arena: std.mem.Allocator, url: []const u8) !*File {
+        const t = try resolve(arena, url);
+        const s = try checkout(t.cfg);
+        const h = s.open(t.share, t.path, read_access, disposition_open, option_non_directory) catch |e| {
+            checkin(s, isProtocolOk(e));
+            return e;
+        };
+        const self = try arena.create(File);
+        self.* = .{ .session = s, .handle = h, .size = h.size };
+        return self;
+    }
+
+    /// `len` bytes at `off`, owned by `arena`.
+    pub fn read(self: *File, arena: std.mem.Allocator, off: u64, len: usize) ![]const u8 {
+        const buf = try arena.alloc(u8, len);
+        const n = self.session.readAt(self.handle, off, buf) catch |e| {
+            self.healthy = isProtocolOk(e);
+            return e;
+        };
+        if (n != len) return error.EndOfStream;
+        return buf;
+    }
+
+    pub fn close(self: *File) void {
+        if (self.healthy) self.session.closeHandle(self.handle);
+        checkin(self.session, self.healthy);
+    }
+};
+
+/// A file read front to back as a `std.Io.Reader`, a megabyte-sized chunk at a
+/// time with the reads behind it in flight together.
+pub const Stream = struct {
+    file: *File,
+    at: u64 = 0,
+    /// Where the stream stops: the file's end, or a window's.
+    end: u64,
+    /// Opened by `open`, closed with the stream; a window borrows its file.
+    owns_file: bool,
+    /// Fetched ahead, `chunk[pos..len]` not yet handed out.
+    chunk: []u8,
+    pos: usize = 0,
+    len: usize = 0,
+    interface: std.Io.Reader,
+
+    const chunk_size = 4 << 20;
+
+    pub fn open(arena: std.mem.Allocator, url: []const u8) !*Stream {
+        const f = try File.open(arena, url);
+        errdefer f.close();
+        return make(arena, f, 0, f.size, true);
+    }
+
+    /// `len` bytes of an open file from `off` — a zip member inside a remote
+    /// archive.
+    pub fn window(arena: std.mem.Allocator, f: *File, off: u64, len: u64) !*Stream {
+        return make(arena, f, off, off + len, false);
+    }
+
+    fn make(arena: std.mem.Allocator, f: *File, start: u64, end: u64, owns: bool) !*Stream {
+        const self = try arena.create(Stream);
+        self.* = .{
+            .file = f,
+            .at = start,
+            .end = end,
+            .owns_file = owns,
+            .chunk = try arena.alloc(u8, chunk_size),
+            .interface = .{
+                .buffer = try arena.alloc(u8, 64 * 1024),
+                .vtable = &.{ .stream = streamFn },
+                .seek = 0,
+                .end = 0,
+            },
+        };
+        return self;
+    }
+
+    pub fn close(self: *Stream) void {
+        if (self.owns_file) self.file.close();
+    }
+
+    fn streamFn(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *Stream = @fieldParentPtr("interface", r);
+        if (self.pos == self.len) {
+            if (self.at >= self.end) return error.EndOfStream;
+            const want: usize = @intCast(@min(@as(u64, self.chunk.len), self.end - self.at));
+            const n = self.file.session.readAt(self.file.handle, self.at, self.chunk[0..want]) catch |e| {
+                self.file.healthy = isProtocolOk(e);
+                return error.ReadFailed;
+            };
+            if (n == 0) return error.EndOfStream;
+            self.at += n;
+            self.pos = 0;
+            self.len = n;
+        }
+        const n = limit.minInt(self.len - self.pos);
+        w.writeAll(self.chunk[self.pos..][0..n]) catch return error.WriteFailed;
+        self.pos += n;
+        return n;
+    }
+};
+
+/// A file written front to back to `path.part`, renamed over `path` by `finish`
+/// and deleted by `abort`.
+pub const Upload = struct {
+    session: *Session,
+    handle: Session.Handle,
+    path: []const u8,
+    at: u64 = 0,
+    interface: std.Io.Writer,
+    last_status: ?anyerror = null,
+    last_error: []const u8 = "",
+    err_buf: [256]u8 = undefined,
+    done: bool = false,
+
+    pub fn open(arena: std.mem.Allocator, url: []const u8) !*Upload {
+        const t = try resolve(arena, url);
+        const s = try checkout(t.cfg);
+        const part = try std.fmt.allocPrint(arena, "{s}.part", .{t.path});
+        // DELETE: the handle that wrote the `.part` also renames it or deletes it
+        const h = s.open(t.share, part, Access.write_data | Access.read_data | Access.delete | Access.synchronize, disposition_overwrite_if, option_non_directory) catch |e| {
+            checkin(s, isProtocolOk(e));
+            return e;
+        };
+        const self = try arena.create(Upload);
+        self.* = .{
+            .session = s,
+            .handle = h,
+            .path = t.path,
+            .interface = .{ .buffer = try arena.alloc(u8, 4 << 20), .vtable = &.{ .drain = drainFn } },
+        };
+        return self;
+    }
+
+    fn put(self: *Upload, bytes: []const u8) std.Io.Writer.Error!usize {
+        if (bytes.len == 0) return 0;
+        self.session.writeAt(self.handle, self.at, bytes) catch |e| {
+            self.fail(e);
+            return error.WriteFailed;
+        };
+        self.at += bytes.len;
+        return bytes.len;
+    }
+
+    fn drainFn(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *Upload = @fieldParentPtr("interface", w);
+        var total: usize = 0;
+        total += try self.put(w.buffered());
+        for (data[0 .. data.len - 1]) |d| total += try self.put(d);
+        const last = data[data.len - 1];
+        for (0..splat) |_| total += try self.put(last);
+        return w.consume(total);
+    }
+
+    fn fail(self: *Upload, e: anyerror) void {
+        self.last_status = e;
+        const why = lastError();
+        const n = @min(why.len, self.err_buf.len);
+        @memcpy(self.err_buf[0..n], why[0..n]);
+        self.last_error = self.err_buf[0..n];
+    }
+
+    /// Write what is buffered and rename `path.part` over `path`. On any failure
+    /// the `.part` is deleted, as by `abort`.
+    pub fn finish(self: *Upload) !void {
+        if (self.done) return;
+        self.interface.flush() catch |e| {
+            const err = self.last_status orelse e;
+            self.abort();
+            return err;
+        };
+        self.session.rename(self.handle, self.path) catch |e| {
+            self.fail(e);
+            self.abort();
+            return e;
+        };
+        self.session.closeHandle(self.handle);
+        self.release();
+    }
+
+    /// Drop the upload: the `.part` is deleted, `path` untouched.
+    pub fn abort(self: *Upload) void {
+        if (self.done) return;
+        self.session.deleteOnClose(self.handle) catch {};
+        self.session.closeHandle(self.handle);
+        self.release();
+    }
+
+    fn release(self: *Upload) void {
+        self.done = true;
+        checkin(self.session, if (self.last_status) |e| isProtocolOk(e) else true);
+    }
+};
+
+/// The regular files under `url` (ending in `/`), subfolders included but not
+/// those starting `_` or `.`, as `smb://` URLs sorted by name.
+pub fn listPrefix(arena: std.mem.Allocator, url: []const u8) ![]const []const u8 {
+    const t = try resolve(arena, url);
+    const s = try checkout(t.cfg);
+    var healthy = true;
+    defer checkin(s, healthy);
+    const top = std.mem.trimRight(u8, t.path, "\\");
+    var names = std.array_list.Managed([]const u8).init(arena);
+    // folders still to list, relative to `top` with `/`; "" is `top` itself
+    var todo = std.array_list.Managed([]const u8).init(arena);
+    try todo.append("");
+    while (todo.pop()) |rel| {
+        const dir = if (rel.len == 0) top else if (top.len == 0) try winPath(arena, rel) else try std.fmt.allocPrint(arena, "{s}\\{s}", .{ top, try winPath(arena, rel) });
+        const h = s.open(t.share, dir, read_access, disposition_open, option_directory) catch |e| {
+            healthy = isProtocolOk(e);
+            return e;
+        };
+        const entries = s.list(arena, h) catch |e| {
+            healthy = isProtocolOk(e);
+            s.closeHandle(h);
+            return e;
+        };
+        s.closeHandle(h);
+        for (entries) |en| {
+            const sub = if (rel.len == 0) en.name else try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, en.name });
+            if (en.directory) {
+                if (en.name[0] != '_' and en.name[0] != '.') try todo.append(sub);
+            } else try names.append(sub);
+        }
+        if (names.items.len > 1_000_000) return error.FolderTooLarge;
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    const base = url[0 .. url.len - (if (std.mem.endsWith(u8, url, "/")) @as(usize, 1) else 0)];
+    const out = try arena.alloc([]const u8, names.items.len);
+    for (names.items, out) |n, *o| o.* = try std.fmt.allocPrint(arena, "{s}/{s}", .{ base, n });
+    return out;
+}
+
+fn winPath(arena: std.mem.Allocator, p: []const u8) ![]const u8 {
+    const w = try arena.dupe(u8, p);
+    std.mem.replaceScalar(u8, w, '/', '\\');
+    return w;
+}
 
 // --- SP800-108 KDF (MS-SMB2 3.1.4.2) ------------------------------------------------
 
@@ -946,6 +1398,30 @@ test "smb: SPNEGO wraps an NTLM token and finds one in a reply" {
     const tb = try spnegoResponse(gpa, big);
     defer gpa.free(tb);
     try std.testing.expectEqual(@as(usize, 600), spnegoToken(tb).?.len);
+}
+
+test "smb URLs: share, domain, port, registered names" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const t = try resolve(a, "smb://CORP;ana@files.example.com:4445/finance/in/x.csv");
+    try std.testing.expectEqualStrings("files.example.com", t.cfg.host);
+    try std.testing.expectEqual(@as(u16, 4445), t.cfg.port);
+    try std.testing.expectEqualStrings("ana", t.cfg.user);
+    try std.testing.expectEqualStrings("CORP", t.cfg.domain);
+    try std.testing.expectEqualStrings("finance", t.share);
+    try std.testing.expectEqualStrings("in\\x.csv", t.path);
+    try std.testing.expectEqualStrings("", (try resolve(a, "smb://h/share/")).path);
+    try std.testing.expectError(error.NotSmbUrl, resolve(a, "smb://h/"));
+    try std.testing.expectError(error.NotSmbUrl, resolve(a, "smb://nopath"));
+    // a registered name, matched without regard to case; with a fixed share the
+    // whole path is inside it
+    try register("FS_T", .{ .host = "fs.corp.example", .user = "svc", .password = "p", .domain = "CORP", .share = "data" });
+    const n = try resolve(a, "smb://fs_t/2026/out.parquet");
+    try std.testing.expectEqualStrings("fs.corp.example", n.cfg.host);
+    try std.testing.expectEqualStrings("svc", n.cfg.user);
+    try std.testing.expectEqualStrings("data", n.share);
+    try std.testing.expectEqualStrings("2026\\out.parquet", n.path);
 }
 
 test "smb: a live login, share, listing and read (BASALT_SMB_TEST_PORT)" {

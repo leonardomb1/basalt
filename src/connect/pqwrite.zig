@@ -25,6 +25,7 @@ const driver = @import("driver.zig");
 const http_client = @import("http_client.zig");
 const objstore = @import("objstore.zig");
 const sftp = @import("sftp.zig");
+const smb = @import("smb.zig");
 const types = @import("../lang/types.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const column = @import("../exec/column.zig");
@@ -418,6 +419,8 @@ pub const Writer = struct {
         };
         if (sftp.isUrl(path)) {
             self.backend = .{ .object = objstore.writer(try sftp.Upload.open(arena, path)) };
+        } else if (smb.isUrl(path)) {
+            self.backend = .{ .object = objstore.writer(try smb.Upload.open(arena, path)) };
         } else if (objstore.isUrl(path)) {
             const client = try arena.create(std.http.Client);
             client.* = http_client.initClient(arena);

@@ -17,6 +17,7 @@ const std = @import("std");
 const zip = std.zip;
 const pqdecode = @import("pqdecode.zig");
 const sftp = @import("sftp.zig");
+const smb = @import("smb.zig");
 
 pub const Error = error{
     ZipMemberNotFound,
@@ -51,6 +52,8 @@ pub const Member = struct {
         },
         /// Streamed through an `sftp.Stream` window on `src`, which owns the file.
         sftp,
+        /// Streamed through an `smb.Stream` window on `src`, which owns the file.
+        smb,
     },
     limited: std.Io.Reader.Limited,
     inflate: std.compress.flate.Decompress,
@@ -58,7 +61,7 @@ pub const Member = struct {
     pub fn close(self: *Member) void {
         switch (self.body) {
             .http => |*h| h.req.deinit(),
-            .file, .fixed, .sftp => {},
+            .file, .fixed, .sftp, .smb => {},
         }
         self.src.close();
     }
@@ -230,6 +233,10 @@ pub fn openMember(arena: std.mem.Allocator, path: []const u8, want: ?[]const u8)
         .sftp => |f| blk: {
             m.body = .sftp;
             break :blk &(try sftp.Stream.window(arena, f, data_off, e.compressed_size)).interface;
+        },
+        .smb => |f| blk: {
+            m.body = .smb;
+            break :blk &(try smb.Stream.window(arena, f, data_off, e.compressed_size)).interface;
         },
     };
 

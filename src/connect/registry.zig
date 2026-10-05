@@ -49,6 +49,8 @@ pub const Connector = enum {
     doris,
     /// Files on an SFTP server, read and written by path (`sftp://name/…`).
     sftp,
+    /// Files on a Windows share or a Samba server (`smb://name/…`).
+    smb,
     postgres,
     mysql,
     sqlserver,

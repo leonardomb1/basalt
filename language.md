@@ -200,6 +200,42 @@ folder never picks up half a file; a failed load removes the `.part`. `APPEND`
 is not supported, and a missing folder is an error rather than created on
 someone else's server.
 
+An `smb` connection names a Windows file share or a Samba server, and paths
+reach it as `smb://name/share/path` — or `smb://name/path` when the connection
+fixes the share:
+
+```sql
+CREATE CONNECTION fs TYPE smb OPTIONS (
+  host = 'fileserver.corp.local', domain = 'CORP', user = 'svc_basalt',
+  share = 'Financeiro'                           -- optional; password from FS_PASS
+);
+SELECT * FROM 'smb://fs/fechamento/2026-10.xlsx';
+LOAD INTO 'smb://fs/exportacao/vendas.parquet' AS SELECT * FROM vendas;
+```
+
+Options are `host port user password domain share`; `user`/`password` follow the
+`NAME_USER`/`NAME_PASS` convention, `domain` is the account's (empty for one
+local to the server), and `port` is 445. Without a connection,
+`smb://[domain;]user@host/share/path` logs in as that user with `SMB_PASSWORD`
+(`SMB_USER` and `SMB_DOMAIN` filling what the URL leaves out). Paths use `/`;
+names are matched as the server matches them, without regard to case on
+Windows.
+
+The login is NTLMv2, and every request is signed and every signed reply checked —
+SMB 2.1 to 3.1.1, the latter with pre-authentication integrity — which Windows
+11 24H2 and Server 2025 require by default and older servers accept. A guest
+login is refused rather than taken as success. A share that requires encryption
+is refused by name, as is a server or account that does: encryption is not yet
+supported. Kerberos is not supported either; an account that can only log in
+with it needs NTLM allowed for basalt's host.
+
+Reads are by offset, as on SFTP: a Parquet file or an Excel workbook is read
+without fetching what the query does not need, several reads in flight within
+the credits the server grants, and a parallel read gets a session per lane;
+sessions are pooled per server and login. A write goes to `name.part` and is
+renamed over `name` once complete; a failed load deletes the `.part` and leaves
+`name` as it was. `APPEND` is not supported, and a missing folder is an error.
+
 A `doris` connection is the same in every respect — Doris is the project
 StarRocks forked from, read through its FE and loaded by stream load — except
 for the tables it creates. Doris takes no FLOAT, DOUBLE or STRING column as a
@@ -354,6 +390,7 @@ LIMIT 100 OFFSET 20;
 | folder | `FROM 'sales/'` — a trailing `/`, local or remote, reads every Parquet file under it (subfolders too, as Spark's `year=2026/` layout) as one table, or every `.csv`/`.tsv`/`.txt` when it holds CSVs; see below |
 | object storage | `FROM 'az://account/container/path.parquet'` or `FROM 's3://bucket/key.parquet'`; a trailing `/` reads the prefix as a folder |
 | SFTP | `FROM 'sftp://bank/retorno/2026-10.csv'` — `bank` a `CREATE CONNECTION bank TYPE sftp` (below), or `sftp://user@host[:port]/path`; any file format, a trailing `/` a folder; `LOAD INTO 'sftp://…'` writes |
+| Windows share (SMB) | `FROM 'smb://fs/share/2026-10.xlsx'` — `fs` a `CREATE CONNECTION fs TYPE smb` (below), or `smb://[domain;]user@host/share/path`; any file format, a trailing `/` a folder; `LOAD INTO 'smb://…'` writes |
 | REST (connection) | `FROM crm.GET('/v1/customers', status = 'open')` — path on the conn's base URL; each `name = value` is a URL-encoded query param, and path and values are expressions (`'/v1/customers/' \|\| $id`). `crm.POST('/search', body = $$...$$)` sends a body. `crm.'/v1/customers'` is the older spelling of a bare GET |
 | REST resource | `FROM crm.customers` — an endpoint named with `CREATE RESOURCE` (§3) |
 | REST (raw URL) | `FROM HTTP('https://host/api/x')` — the URL exactly as written, the way `QUERY()` is raw SQL |

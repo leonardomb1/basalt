@@ -57,8 +57,9 @@ runs on.
 |---|---|
 | **Files** | CSV and Parquet, local or over HTTP; Arrow IPC (`.arrow`, `.feather`, `.ipc`, `.arrows`), local, read and written; Excel (`.xlsx`) read, a sheet or a range of it — the extension picks the format, and an extension basalt does not read is refused rather than guessed at. `WITH (delimiter = ';', encoding = 'latin1')` for the CSV most of the world publishes |
 | **Compressed & archived** | `orders.csv.gz`, `orders.csv.zst`, and `archive.zip :: inner.csv`. Members stream rather than expanding to memory or a temp file |
-| **Object storage** | `az://account/container/path` (Azure Blob / ADLS Gen2) or `s3://bucket/key` (S3, MinIO). A trailing `/` reads a folder — local, SFTP or object storage — of Parquet files or CSVs as one table, subfolders included |
+| **Object storage** | `az://account/container/path` (Azure Blob / ADLS Gen2) or `s3://bucket/key` (S3, MinIO). A trailing `/` reads a folder — local, SFTP, SMB or object storage — of Parquet files or CSVs as one table, subfolders included |
 | **SFTP** | `sftp://conn/path`, read and written — host keys checked against `known_hosts` or a pinned fingerprint, password or Ed25519 key logins, writes through a `.part` renamed into place |
+| **Windows shares** | `smb://conn/share/path`, read and written — SMB 2.1 to 3.1.1, NTLMv2 with every message signed, as Windows 11 24H2 and Server 2025 require; writes through a `.part` renamed into place |
 | **Databases** | PostgreSQL, MySQL, SQL Server, StarRocks, Apache Doris |
 | **HTTP** | paginated REST sources; serve a pipeline as an endpoint |
 | **Buffer** | a durable WAL buffer, replayed by a later run |

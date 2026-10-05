@@ -14,6 +14,7 @@ const pqwrite = @import("../connect/pqwrite.zig");
 const arrowread = @import("../connect/arrowread.zig");
 const xlsx = @import("../connect/xlsx.zig");
 const sftp = @import("../connect/sftp.zig");
+const smb = @import("../connect/smb.zig");
 const JsonWriter = @import("../connect/table.zig").JsonWriter;
 const arrow = @import("../connect/arrow.zig");
 const ArrowWriter = arrow.ArrowWriter;
@@ -1581,6 +1582,36 @@ pub fn registerSftp(env: *Env, conn: ast.Connection) !void {
     }
     if (c.host.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sftp connection `{s}` needs a `host`", .{conn.name}));
     try sftp.register(conn.name, c);
+}
+
+/// Make a `CREATE CONNECTION name TYPE smb` reachable as `smb://name/…`. With a
+/// `share`, a path under the name is inside that share; without one its first
+/// part names the share. An option it does not know is an error naming the
+/// ones it does.
+pub fn registerSmb(env: *Env, conn: ast.Connection) !void {
+    if (!std.mem.eql(u8, conn.connector, "smb")) return;
+    var c = smb.Conn{ .host = "" };
+    for (conn.config) |attr| {
+        const k = attr.key;
+        if (std.mem.eql(u8, k, "port")) {
+            c.port = std.math.cast(u16, try evalCfgInt(env, attr.value)) orelse return planErr(env.diag, "smb connection `port` is out of range");
+            continue;
+        }
+        const v = optCfgStr(env, attr.value) catch |e| return e;
+        if (std.mem.eql(u8, k, "host")) {
+            c.host = v orelse "";
+        } else if (std.mem.eql(u8, k, "user")) {
+            c.user = v;
+        } else if (std.mem.eql(u8, k, "password")) {
+            c.password = v;
+        } else if (std.mem.eql(u8, k, "domain")) {
+            c.domain = v;
+        } else if (std.mem.eql(u8, k, "share")) {
+            c.share = if (v) |sh| std.mem.trim(u8, sh, "/\\") else null;
+        } else return planErr(env.diag, try std.fmt.allocPrint(env.arena, "smb connection `{s}`: unknown option `{s}` (host, port, user, password, domain, share)", .{ conn.name, k }));
+    }
+    if (c.host.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "smb connection `{s}` needs a `host`", .{conn.name}));
+    try smb.register(conn.name, c);
 }
 
 /// A config string, or null for an `env(...)` that is not set.

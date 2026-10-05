@@ -7,7 +7,7 @@
 #   ./it/run.sh mysql postgres  several
 #   KEEP=1 ./it/run.sh azure    leave the stack up afterwards
 #
-# Suite names: mysql postgres sqlserver starrocks doris sftp azure parquet s3 arrow
+# Suite names: mysql postgres sqlserver starrocks doris sftp smb azure parquet s3 arrow
 # stdout kernel
 # (arrow needs `uv`: it reads the stream back with pyarrow; stdout needs nothing;
 # kernel needs python3)
@@ -16,7 +16,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ALL_SUITES="mysql postgres sqlserver starrocks doris sftp azure parquet s3 arrow stdout kernel"
+ALL_SUITES="mysql postgres sqlserver starrocks doris sftp smb azure parquet s3 arrow stdout kernel"
 DEFAULT_SUITES="$ALL_SUITES"
 SUITES="${*:-$DEFAULT_SUITES}"
 
@@ -38,6 +38,7 @@ for s in $SUITES; do
     starrocks) services="$services starrocks" ;;
     doris)     services="$services doris" ;;
     sftp)      services="$services sftp" ;;
+    smb)       services="$services smb" ;;
     azure)     services="$services azurite" ;;
     s3)        services="$services s3" ;;
     parquet)   services="$services static static-norange" ;;  # local fixtures, plus HTTP
@@ -639,6 +640,62 @@ LOAD INTO '$out/sftp_ecdsa.csv' AS SELECT * FROM 'sftp://box/~/in/seed.csv' ORDE
   if brun run -c "$PW LOAD INTO '$out/sftp_kbd.csv' AS SELECT * FROM 'sftp://box/~/in/seed.csv' ORDER BY id;"; then
     check sftp-kbd-interactive-ctr-rsa "$out/sftp_kbd.csv" it/expected.csv
   else report "sftp-kbd-interactive-ctr-rsa (run error)" bad; fi
+fi
+
+# Samba with signing mandatory: a CSV and a 200k-row Parquet round trip, a folder,
+# an Excel workbook, an aborted load, and the failures named.
+if runs smb; then
+  SMB="CREATE CONNECTION box TYPE smb OPTIONS (host = '127.0.0.1', port = 44445, user = 'basalt', password = 'it');"
+  docker exec it-smb-1 sh -c 'rm -rf /share/* && mkdir -p /share/folder/sub /share/folder/_skip && chown -R basalt /share'
+  if brun run -c "$SMB LOAD INTO 'smb://box/data/seed.csv' AS SELECT * FROM 'it/seed.csv';" &&
+     brun run -c "$SMB LOAD INTO '$out/smb_rt.csv' AS SELECT * FROM 'smb://box/data/seed.csv' ORDER BY id;"; then
+    check smb-csv-roundtrip "$out/smb_rt.csv" it/expected.csv
+  else
+    report "smb-csv-roundtrip (run error)" bad
+  fi
+
+  awk 'BEGIN{print "id,name,val"; for(i=1;i<=200000;i++) printf "%d,name_%d,%d\n", i, i, i*7}' >"$out/smb_big.csv"
+  if brun run -c "$SMB LOAD INTO 'smb://box/data/big.parquet' AS SELECT * FROM '$out/smb_big.csv';" &&
+     brun run -c "$SMB LOAD INTO '$out/smb_big_got.csv' AS SELECT COUNT(*) AS n, SUM(val) AS s FROM 'smb://box/data/big.parquet';"; then
+    brun run -c "LOAD INTO '$out/smb_big_want.csv' AS SELECT COUNT(*) AS n, SUM(val) AS s FROM '$out/smb_big.csv';"
+    check smb-parquet-roundtrip "$out/smb_big_got.csv" "$out/smb_big_want.csv"
+  else
+    report "smb-parquet-roundtrip (run error)" bad
+  fi
+
+  # a folder: subfolders read, `_` ones skipped
+  docker exec it-smb-1 sh -c 'cp /share/seed.csv /share/folder/a.csv && cp /share/seed.csv /share/folder/sub/b.csv && cp /share/seed.csv /share/folder/_skip/c.csv && chown -R basalt /share'
+  if brun run -c "$SMB LOAD INTO '$out/smb_folder.csv' AS SELECT COUNT(*) AS n FROM 'smb://box/data/folder/';" &&
+     brun run -c "LOAD INTO '$out/smb_folder_want.csv' AS SELECT COUNT(*) * 2 AS n FROM 'it/seed.csv';"; then
+    check smb-folder "$out/smb_folder.csv" "$out/smb_folder_want.csv"
+  else
+    report "smb-folder (run error)" bad
+  fi
+
+  docker cp src/connect/testdata/openpyxl.xlsx it-smb-1:/share/book.xlsx >/dev/null
+  docker exec it-smb-1 chown basalt /share/book.xlsx
+  if brun run -c "$SMB LOAD INTO '$out/smb_xlsx.csv' AS SELECT * FROM 'smb://box/data/book.xlsx';" &&
+     brun run -c "LOAD INTO '$out/smb_xlsx_want.csv' AS SELECT * FROM 'src/connect/testdata/openpyxl.xlsx';"; then
+    check smb-xlsx "$out/smb_xlsx.csv" "$out/smb_xlsx_want.csv"
+  else
+    report "smb-xlsx (run error)" bad
+  fi
+
+  # a load that fails mid-way leaves the target as it was and no .part
+  $B run -q -c "$SMB LOAD INTO 'smb://box/data/seed.csv' AS SELECT id, CAST(name AS INT) AS name FROM 'it/seed.csv';" >/dev/null 2>&1 || true
+  if docker exec it-smb-1 sh -c 'ls /share' | grep -q '\.part$'; then
+    report "smb-aborted-load-leaves-nothing" bad
+  elif brun run -c "$SMB LOAD INTO '$out/smb_after.csv' AS SELECT * FROM 'smb://box/data/seed.csv' ORDER BY id;"; then
+    check smb-aborted-load-keeps-target "$out/smb_after.csv" it/expected.csv
+  else
+    report "smb-aborted-load-keeps-target (run error)" bad
+  fi
+
+  # the failures say what they are
+  $B run -q -c "CREATE CONNECTION box TYPE smb OPTIONS (host = '127.0.0.1', port = 44445, user = 'basalt', password = 'wrong'); SELECT * FROM 'smb://box/data/seed.csv';" >"$out/smb_pw.txt" 2>&1 || true
+  if grep -q "SmbLogonFailure" "$out/smb_pw.txt"; then report "smb-wrong-password-named" ok; else report "smb-wrong-password-named" bad; cat "$out/smb_pw.txt"; fi
+  $B run -q -c "$SMB SELECT * FROM 'smb://box/nosuch/seed.csv';" >"$out/smb_share.txt" 2>&1 || true
+  if grep -q "SmbBadShare" "$out/smb_share.txt"; then report "smb-unknown-share-named" ok; else report "smb-unknown-share-named" bad; cat "$out/smb_share.txt"; fi
 fi
 
 # Doris: the same arrangement as StarRocks, which forked from it — stream load in,

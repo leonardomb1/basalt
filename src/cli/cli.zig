@@ -1131,6 +1131,14 @@ const connectors = [_]Connector{
         .{ .key = "password", .prompt = "password", .secret = true },
         .{ .key = "host_key", .prompt = "pinned host key (blank for ~/.ssh/known_hosts)" },
     } },
+    .{ .name = "smb", .blurb = "a Windows file share or Samba server (files read and written as smb://<name>/path)", .fields = &.{
+        .{ .key = "host", .prompt = "host" },
+        .{ .key = "port", .prompt = "port", .default = "445", .int = true },
+        .{ .key = "domain", .prompt = "domain (blank for a local account)" },
+        .{ .key = "user", .prompt = "user" },
+        .{ .key = "password", .prompt = "password", .secret = true },
+        .{ .key = "share", .prompt = "share (blank to name it in each path)" },
+    } },
     .{ .name = "http", .blurb = "a REST API (paginated sources, an endpoint sink)", .fields = &.{
         .{ .key = "base_url", .prompt = "base URL" },
         .{ .key = "auth", .prompt = "auth (blank, bearer, basic)" },
@@ -2528,6 +2536,9 @@ fn usage(w: anytype) !void {
         \\  sftp       sftp://<conn>/<path> through CREATE CONNECTION <conn> TYPE sftp
         \\             (or sftp://user@host/path), read and written; the host key is
         \\             checked against known_hosts or a pinned host_key, never trusted
+        \\  smb        smb://<conn>/<share>/<path> through CREATE CONNECTION <conn> TYPE smb
+        \\             (or smb://user@host/share/path), read and written; NTLMv2, every
+        \\             message signed (SMB 2.1 to 3.1.1)
         \\  databases  postgres, mysql, sqlserver, starrocks, doris (CREATE CONNECTION ... TYPE ...)
         \\  http       REST sources and sinks; `request` for an HTTP request body
         \\  buffer     durable WAL buffer, replayed by a later run

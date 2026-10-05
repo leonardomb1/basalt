@@ -13,6 +13,7 @@ const csv = @import("../connect/csv.zig");
 const pqdecode = @import("../connect/pqdecode.zig");
 const folder = @import("../connect/folder.zig");
 const sftp = @import("../connect/sftp.zig");
+const smb = @import("../connect/smb.zig");
 const driver = @import("../connect/driver.zig");
 const sql = @import("../connect/sql.zig");
 const wrapProjected = @import("../connect/split.zig").wrapProjected;
@@ -278,6 +279,8 @@ const WorkQueue = struct {
                 @memcpy(q.note_buf[0..q.note_len], why[0..q.note_len]);
             } else if ((std.mem.startsWith(u8, name, "Sftp") or std.mem.startsWith(u8, name, "Ssh")) and sftp.lastError().len > 0) {
                 q.note_len = (std.fmt.bufPrint(&q.note_buf, "sftp: {s}: {s}", .{ name, sftp.lastError() }) catch q.note_buf[0..0]).len;
+            } else if (std.mem.startsWith(u8, name, "Smb") and smb.lastError().len > 0) {
+                q.note_len = (std.fmt.bufPrint(&q.note_buf, "smb: {s}: {s}", .{ name, smb.lastError() }) catch q.note_buf[0..0]).len;
             }
         }
         q.err_mtx.unlock();

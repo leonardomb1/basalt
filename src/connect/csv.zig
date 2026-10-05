@@ -18,6 +18,7 @@ const driver = @import("driver.zig");
 const http_client = @import("http_client.zig");
 const objstore = @import("objstore.zig");
 const sftp = @import("sftp.zig");
+const smb = @import("smb.zig");
 const zipsrc = @import("zipsrc.zig");
 const folder = @import("folder.zig");
 const deflate = @import("deflate.zig");
@@ -257,6 +258,8 @@ pub const CsvReader = struct {
         member: *zipsrc.Member,
         /// A file on an SFTP server, streamed.
         sftp: *sftp.Stream,
+        /// A file on an SMB share, streamed.
+        smb: *smb.Stream,
     };
     const FileBackend = struct {
         file: std.fs.File,
@@ -304,7 +307,7 @@ pub const CsvReader = struct {
 
     pub fn isUrl(path: []const u8) bool {
         return std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://") or
-            objstore.isUrl(path) or sftp.isUrl(path);
+            objstore.isUrl(path) or sftp.isUrl(path) or smb.isUrl(path);
     }
 
     pub fn open(arena: std.mem.Allocator, path: []const u8, dialect: Dialect) !*CsvReader {
@@ -353,6 +356,10 @@ pub const CsvReader = struct {
         } else if (sftp.isUrl(first)) {
             const st = try sftp.Stream.open(arena, first);
             self.backend = .{ .sftp = st };
+            self.rdr = &st.interface;
+        } else if (smb.isUrl(first)) {
+            const st = try smb.Stream.open(arena, first);
+            self.backend = .{ .smb = st };
             self.rdr = &st.interface;
         } else if (isUrl(first)) {
             const hf = try arena.create(HttpFetch);
@@ -496,6 +503,16 @@ pub const CsvReader = struct {
                 if (!std.mem.eql(u8, std.mem.trim(u8, hdr, " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
                 return true;
             },
+            .smb => |st| {
+                st.close();
+                const st2 = try smb.Stream.open(self.arena, url);
+                self.backend = .{ .smb = st2 };
+                self.rdr = &st2.interface;
+                try self.decodeAs(splitCodec(url).codec);
+                const hdr = (try self.readLine()) orelse return error.EmptyCsv;
+                if (!std.mem.eql(u8, std.mem.trim(u8, hdr, " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
+                return true;
+            },
             .file => |*f| {
                 f.file.close();
                 f.file = try std.fs.cwd().openFile(url, .{});
@@ -539,6 +556,7 @@ pub const CsvReader = struct {
             },
             .member => |m| m.close(),
             .sftp => |st| st.close(),
+            .smb => |st| st.close(),
         }
     }
 
@@ -1196,6 +1214,10 @@ pub const CsvWriter = struct {
             // written whole through a `.part`, so there is nothing to extend
             if (mode == .append) return error.AppendNotSupported;
             self.* = .{ .backend = .{ .object = objstore.writer(try sftp.Upload.open(arena, path)) } };
+        } else if (smb.isUrl(path)) {
+            // written whole through a `.part`, as on SFTP
+            if (mode == .append) return error.AppendNotSupported;
+            self.* = .{ .backend = .{ .object = objstore.writer(try smb.Upload.open(arena, path)) } };
         } else if (objstore.isUrl(path)) {
             if (mode == .append) return error.AppendNotSupported;
             const client = try arena.create(std.http.Client);

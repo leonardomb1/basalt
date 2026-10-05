@@ -16,6 +16,7 @@ const registry = @import("../connect/registry.zig");
 const azure = @import("../connect/azure.zig");
 const s3 = @import("../connect/s3.zig");
 const sftp = @import("../connect/sftp.zig");
+const smb = @import("../connect/smb.zig");
 const analyze = @import("analyze.zig");
 const obs = @import("obs.zig");
 const pushdown = @import("pushdown.zig");
@@ -648,6 +649,7 @@ fn pathLayer(path: []const u8) []const u8 {
     if (azure.isUrl(path)) return "azure blob";
     if (s3.isUrl(path)) return "s3 object";
     if (sftp.isUrl(path)) return "sftp";
+    if (smb.isUrl(path)) return "smb";
     if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://")) return "http";
     return "local file";
 }
@@ -658,6 +660,9 @@ pub fn pathFail(arena: std.mem.Allocator, path: []const u8, e: anyerror) ![]cons
     // unknown host key's fingerprint, a refused login, a missing file
     if (sftp.isUrl(path)) if (sftp.lastError().len > 0)
         return std.fmt.allocPrint(arena, "{s}: {s}: {s}", .{ pathLayer(path), @errorName(e), sftp.lastError() });
+    // so does an SMB one: a refused login, a missing share, a file in use
+    if (smb.isUrl(path)) if (smb.lastError().len > 0)
+        return std.fmt.allocPrint(arena, "{s}: {s}: {s}", .{ pathLayer(path), @errorName(e), smb.lastError() });
     return std.fmt.allocPrint(arena, "{s}: {s}", .{ pathLayer(path), @errorName(e) });
 }
 
