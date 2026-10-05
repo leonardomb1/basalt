@@ -481,7 +481,9 @@ pub const Session = struct {
     /// reply is signed with a key only that AP-REP yields, so its signature is
     /// checked once the key is in hand.
     fn loginKerberos(self: *Session) Error!void {
-        const cred = krb5.Credential{ .user = self.cfg.user, .password = self.cfg.password, .realm = self.cfg.realm, .kdc = self.cfg.kdc };
+        var realm_buf: [256]u8 = undefined;
+        const cred = krb5.credential(self.cfg.user, self.cfg.password, self.cfg.realm, self.cfg.kdc, &realm_buf) orelse
+            return fail(error.SmbLogonFailure, "kerberos needs the realm — the `realm` option, or a user written me@CORP.LOCAL", .{});
         var spn_buf: [300]u8 = undefined;
         const spn = if (self.cfg.spn.len > 0) self.cfg.spn else std.fmt.bufPrint(&spn_buf, "cifs/{s}", .{self.cfg.host}) catch return error.SmbFailure;
         const t = krb5.serviceTicket(self.gpa, cred, spn) catch |e| return krbFailed(e);

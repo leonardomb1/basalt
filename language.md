@@ -239,8 +239,10 @@ system ticket and reads no keytab — with pre-authentication and AES keys only
 lists for `_kerberos._tcp.<realm>`, else the realm's own name; the service is
 `cifs/<host>`, or `spn` when the server is known by another name (reach a
 private endpoint by IP, say, but name it by its DNS name). Tickets are reused
-until they expire. `auth = 'ntlm'` keeps NTLM despite a realm; `SMB_REALM` and
-`SMB_KDC` fill in for a plain `smb://` URL. The machine's clock must be within
+until they expire. The user may be written `me@CORP.LOCAL` or `CORP\me`; it
+logs in as `me`, and with `auth = 'kerberos'` the part after `@` serves as the
+realm when no `realm` is given. `auth = 'ntlm'` keeps NTLM despite a realm;
+`SMB_REALM` and `SMB_KDC` fill in for a plain `smb://` URL. The machine's clock must be within
 five minutes of the KDC's.
 
 Every request is signed and every signed reply checked — SMB 2.1 to 3.1.1, the

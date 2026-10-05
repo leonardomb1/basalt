@@ -40,6 +40,21 @@ pub const Credential = struct {
     kdc: []const u8 = "",
 };
 
+/// A credential out of a login as people write it: `me@CORP.LOCAL` names the
+/// realm inline, `DOMAIN\\me` is taken as `me`, and an explicit `realm` wins.
+/// The realm is upper-cased into `buf`, as AD writes it; null when there is none.
+pub fn credential(user_in: []const u8, password: []const u8, realm_in: []const u8, kdc: []const u8, buf: []u8) ?Credential {
+    var user = user_in;
+    var realm = realm_in;
+    if (std.mem.indexOfScalar(u8, user, '\\')) |i| user = user[i + 1 ..];
+    if (std.mem.lastIndexOfScalar(u8, user, '@')) |i| {
+        if (realm.len == 0) realm = user[i + 1 ..];
+        user = user[0..i];
+    }
+    if (realm.len == 0 or realm.len > buf.len) return null;
+    return .{ .user = user, .password = password, .realm = std.ascii.upperString(buf[0..realm.len], realm), .kdc = kdc };
+}
+
 threadlocal var why_buf: [512]u8 = undefined;
 threadlocal var why_len: usize = 0;
 
@@ -1008,6 +1023,22 @@ fn hex(comptime s: []const u8) [s.len / 2]u8 {
     var out: [s.len / 2]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, s) catch unreachable;
     return out;
+}
+
+test "krb5: a login names its realm by `realm` or after the user's @, upper-cased" {
+    var buf: [256]u8 = undefined;
+    const a = credential("me@corp.local", "p", "", "", &buf).?;
+    try std.testing.expectEqualStrings("me", a.user);
+    try std.testing.expectEqualStrings("CORP.LOCAL", a.realm);
+    // an explicit realm wins, and the user's own suffix is dropped either way
+    const b = credential("me@corp.local", "p", "OTHER.LOCAL", "dc1:88", &buf).?;
+    try std.testing.expectEqualStrings("me", b.user);
+    try std.testing.expectEqualStrings("OTHER.LOCAL", b.realm);
+    try std.testing.expectEqualStrings("dc1:88", b.kdc);
+    const c = credential("CORP\\me", "p", "corp.local", "", &buf).?;
+    try std.testing.expectEqualStrings("me", c.user);
+    try std.testing.expectEqualStrings("CORP.LOCAL", c.realm);
+    try std.testing.expect(credential("me", "p", "", "", &buf) == null);
 }
 
 test "krb5: n-fold reproduces RFC 3961 A.1" {

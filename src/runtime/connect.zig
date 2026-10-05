@@ -711,7 +711,7 @@ fn tdsConnect(gpa: std.mem.Allocator, cfg_in: DbConfig) !*tds.Conn {
     if (cfg.auth == .kerberos) {
         var realm_buf: [256]u8 = undefined;
         var spn_buf: [300]u8 = undefined;
-        const cred = krbCredential(cfg, &realm_buf) orelse return error.LoginFailed;
+        const cred = krb5.credential(cfg.user, cfg.password, cfg.realm, cfg.kdc, &realm_buf) orelse return error.LoginFailed;
         const spn = if (cfg.spn.len > 0) cfg.spn else try std.fmt.bufPrint(&spn_buf, "MSSQLSvc/{s}:{d}", .{ cfg.host, cfg.port });
         return tds.Conn.connectKerberos(gpa, cfg.host, cfg.port, cred, spn, cfg.database, mode);
     }
@@ -739,21 +739,6 @@ fn ntlmCredential(cfg: DbConfig) ntlm.Credential {
         user = user[i + 1 ..];
     }
     return .{ .domain = domain, .user = user, .password = cfg.password };
-}
-
-/// A Kerberos login out of the connection: `user = 'me@CORP.LOCAL'` names the
-/// realm inline, `DOMAIN\me` is taken as `me`, and an explicit `realm` wins.
-/// The realm is upper-cased into `buf`, as AD writes it.
-fn krbCredential(cfg: DbConfig, buf: []u8) ?krb5.Credential {
-    var user = cfg.user;
-    var realm = cfg.realm;
-    if (std.mem.indexOfScalar(u8, user, '\\')) |i| user = user[i + 1 ..];
-    if (std.mem.lastIndexOfScalar(u8, user, '@')) |i| {
-        if (realm.len == 0) realm = user[i + 1 ..];
-        user = user[0..i];
-    }
-    if (realm.len == 0 or realm.len > buf.len) return null;
-    return .{ .user = user, .password = cfg.password, .realm = std.ascii.upperString(buf[0..realm.len], realm), .kdc = cfg.kdc };
 }
 
 /// One key-dispatch for the shared DB connection attributes. `f` supplies the
@@ -1652,8 +1637,8 @@ pub fn registerSmb(env: *Env, conn: ast.Connection) !void {
         } else return planErr(env.diag, try std.fmt.allocPrint(env.arena, "smb connection `{s}`: unknown option `{s}` (host, port, user, password, domain, share, auth, realm, kdc, spn)", .{ conn.name, k }));
     }
     if (c.host.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "smb connection `{s}` needs a `host`", .{conn.name}));
-    if (c.auth == .kerberos and c.realm == null)
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "smb connection `{s}`: Kerberos needs the `realm` — the domain's DNS name, as CORP.LOCAL, not its NetBIOS name", .{conn.name}));
+    if (c.auth == .kerberos and c.realm == null and std.mem.indexOfScalar(u8, c.user orelse "", '@') == null)
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "smb connection `{s}`: Kerberos needs the `realm` — the domain's DNS name, as CORP.LOCAL, not its NetBIOS name — or a user written `me@CORP.LOCAL`", .{conn.name}));
     try smb.register(conn.name, c);
 }
 
@@ -1740,18 +1725,6 @@ const LitCfg = struct {
         return .sql;
     }
 };
-
-test "a Kerberos login takes its realm from `realm` or the user, upper-cased" {
-    var buf: [256]u8 = undefined;
-    const a = krbCredential(.{ .port = 1433, .user = "me@corp.local", .password = "p" }, &buf).?;
-    try std.testing.expectEqualStrings("me", a.user);
-    try std.testing.expectEqualStrings("CORP.LOCAL", a.realm);
-    const b = krbCredential(.{ .port = 1433, .user = "CORP\\me", .realm = "corp.local", .kdc = "dc1:88" }, &buf).?;
-    try std.testing.expectEqualStrings("me", b.user);
-    try std.testing.expectEqualStrings("CORP.LOCAL", b.realm);
-    try std.testing.expectEqualStrings("dc1:88", b.kdc);
-    try std.testing.expect(krbCredential(.{ .port = 1433, .user = "me" }, &buf) == null);
-}
 
 test "an http connection reads user/password only where its auth uses them" {
     var v = ast.Expr{ .str_lit = "x" };
