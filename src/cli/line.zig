@@ -1076,44 +1076,15 @@ pub const Editor = struct {
     /// Text arriving between the bracketed-paste markers: taken as typed, never as
     /// keys — a pasted newline is a new line, not a request to run half a script.
     fn readPaste(self: *Editor, buf: *Buffer) !void {
-        var pasted = std.array_list.Managed(u8).init(self.gpa);
-        defer pasted.deinit();
-        const end = "\x1b[201~";
-        var b: [1]u8 = undefined;
-        var prev_cr = false;
-        while (try std.posix.read(self.in_fd, &b) != 0) {
-            // CRLF, CR and LF all mean one line break.
-            if (b[0] == '\n' and prev_cr) {
-                prev_cr = false;
-                continue;
-            }
-            prev_cr = b[0] == '\r';
-            try pasted.append(if (b[0] == '\r') '\n' else b[0]);
-            if (std.mem.endsWith(u8, pasted.items, end)) {
-                pasted.shrinkRetainingCapacity(pasted.items.len - end.len);
-                break;
-            }
-        }
-        try buf.insert(pasted.items);
+        const pasted = try readPasted(self.gpa, self.in_fd);
+        defer self.gpa.free(pasted);
+        try buf.insert(pasted);
     }
 
     /// Read one entry with editing. The returned `.line` is gpa-owned by the caller
     /// and may hold several lines.
     pub fn readEntry(self: *Editor, opts: Options) !Result {
-        const orig = try std.posix.tcgetattr(self.in_fd);
-        var raw = orig;
-        raw.lflag.ECHO = false;
-        raw.lflag.ICANON = false;
-        raw.lflag.ISIG = false; // ^C arrives as a byte; execution re-arms normal signals
-        raw.lflag.IEXTEN = false;
-        raw.iflag.IXON = false;
-        // Bytes as sent: with CR→LF translation on, a pasted CRLF reads as two
-        // line feeds and every line of a Windows paste comes out double-spaced.
-        raw.iflag.ICRNL = false;
-        raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
-        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
-        // .NOW, not .FLUSH: flushing would eat the tail of a multi-line paste.
-        try std.posix.tcsetattr(self.in_fd, .NOW, raw);
+        const orig = try enterRaw(self.in_fd);
         defer std.posix.tcsetattr(self.in_fd, .NOW, orig) catch {};
         self.write("\x1b[?2004h");
         defer self.write("\x1b[?2004l");
@@ -1261,9 +1232,52 @@ pub fn historyMatch(hist: []const []const u8, query: []const u8, from: usize) ?u
     return null;
 }
 
+/// Put `fd` in the editor's raw mode and hand back the settings to restore.
+pub fn enterRaw(fd: std.posix.fd_t) !std.posix.termios {
+    const orig = try std.posix.tcgetattr(fd);
+    var raw = orig;
+    raw.lflag.ECHO = false;
+    raw.lflag.ICANON = false;
+    raw.lflag.ISIG = false; // ^C arrives as a byte; execution re-arms normal signals
+    raw.lflag.IEXTEN = false;
+    raw.iflag.IXON = false;
+    // Bytes as sent: with CR→LF translation on, a pasted CRLF reads as two
+    // line feeds and every line of a Windows paste comes out double-spaced.
+    raw.iflag.ICRNL = false;
+    raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+    raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+    // .NOW, not .FLUSH: flushing would eat the tail of a multi-line paste.
+    try std.posix.tcsetattr(fd, .NOW, raw);
+    return orig;
+}
+
+/// The rest of a bracketed paste, after its `ESC [ 200 ~`: the text up to the
+/// closing `ESC [ 201 ~`, every line break as `\n`. gpa-owned.
+pub fn readPasted(gpa: std.mem.Allocator, fd: std.posix.fd_t) ![]u8 {
+    var pasted = std.array_list.Managed(u8).init(gpa);
+    defer pasted.deinit();
+    const end = "\x1b[201~";
+    var b: [1]u8 = undefined;
+    var prev_cr = false;
+    while (try std.posix.read(fd, &b) != 0) {
+        // CRLF, CR and LF all mean one line break.
+        if (b[0] == '\n' and prev_cr) {
+            prev_cr = false;
+            continue;
+        }
+        prev_cr = b[0] == '\r';
+        try pasted.append(if (b[0] == '\r') '\n' else b[0]);
+        if (std.mem.endsWith(u8, pasted.items, end)) {
+            pasted.shrinkRetainingCapacity(pasted.items.len - end.len);
+            break;
+        }
+    }
+    return pasted.toOwnedSlice();
+}
+
 pub const TermSize = struct { cols: usize = 80, rows: usize = 24 };
 
-fn termSize(file: std.fs.File) TermSize {
+pub fn termSize(file: std.fs.File) TermSize {
     var ws: std.posix.winsize = undefined;
     const rc = std.posix.system.ioctl(file.handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
     if (std.posix.errno(rc) != .SUCCESS or ws.col == 0) return .{};

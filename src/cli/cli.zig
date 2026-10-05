@@ -15,6 +15,8 @@ const include = @import("../lang/include.zig");
 const Editor = @import("line.zig").Editor;
 const LineResult = @import("line.zig").Result;
 const view = @import("view.zig");
+const form = @import("form.zig");
+const hilite = @import("hilite.zig");
 const table = @import("../connect/table.zig");
 const ast = @import("../lang/ast.zig");
 const aggregates = @import("../lang/aggregates.zig");
@@ -1080,163 +1082,245 @@ const Connector = struct {
     name: []const u8,
     blurb: []const u8,
     fields: []const Field,
-    const Field = struct { key: []const u8, prompt: []const u8, default: []const u8 = "", secret: bool = false, int: bool = false };
+    const Field = struct {
+        key: []const u8,
+        hint: []const u8 = "",
+        /// Taken when the field is left blank; one with a `<…>` in it is only a
+        /// pattern to follow, and a blank there writes nothing.
+        default: []const u8 = "",
+        secret: bool = false,
+        int: bool = false,
+        choices: []const []const u8 = &.{},
+        /// The choice that is the runtime's own default, so it writes nothing.
+        omit: []const u8 = "",
+        /// Asked only when the field `key` holds `value`.
+        when: ?struct { key: []const u8, value: []const u8 } = null,
+    };
 };
+const tls_choices: []const []const u8 = &.{ "off", "require", "insecure" };
 const connectors = [_]Connector{
     .{ .name = "postgres", .blurb = "PostgreSQL (source and sink)", .fields = &.{
-        .{ .key = "host", .prompt = "host", .default = "localhost" },
-        .{ .key = "port", .prompt = "port", .default = "5432", .int = true },
-        .{ .key = "database", .prompt = "database" },
-        .{ .key = "user", .prompt = "user" },
-        .{ .key = "password", .prompt = "password", .secret = true },
-        .{ .key = "tls", .prompt = "tls (off, require, insecure)", .default = "off" },
+        .{ .key = "host", .default = "localhost" },
+        .{ .key = "port", .default = "5432", .int = true },
+        .{ .key = "database" },
+        .{ .key = "user" },
+        .{ .key = "password", .secret = true },
+        .{ .key = "tls", .choices = tls_choices, .default = "off" },
     } },
     .{ .name = "mysql", .blurb = "MySQL / MariaDB (source and sink)", .fields = &.{
-        .{ .key = "host", .prompt = "host", .default = "localhost" },
-        .{ .key = "port", .prompt = "port", .default = "3306", .int = true },
-        .{ .key = "database", .prompt = "database" },
-        .{ .key = "user", .prompt = "user" },
-        .{ .key = "password", .prompt = "password", .secret = true },
-        .{ .key = "tls", .prompt = "tls (off, require, insecure)", .default = "off" },
+        .{ .key = "host", .default = "localhost" },
+        .{ .key = "port", .default = "3306", .int = true },
+        .{ .key = "database" },
+        .{ .key = "user" },
+        .{ .key = "password", .secret = true },
+        .{ .key = "tls", .choices = tls_choices, .default = "off" },
     } },
     .{ .name = "sqlserver", .blurb = "SQL Server (source and sink; host\\INSTANCE resolves the port)", .fields = &.{
-        .{ .key = "host", .prompt = "host" },
-        .{ .key = "port", .prompt = "port (blank: 1433, or the instance's)", .int = true },
-        .{ .key = "database", .prompt = "database" },
-        .{ .key = "auth", .prompt = "auth (blank for a SQL login; ntlm, kerberos, aad)" },
-        .{ .key = "realm", .prompt = "Kerberos realm, as CORP.LOCAL (blank unless kerberos)" },
-        .{ .key = "user", .prompt = "user" },
-        .{ .key = "password", .prompt = "password", .secret = true },
-        .{ .key = "tls", .prompt = "tls (off, require, insecure)", .default = "require" },
+        .{ .key = "host", .hint = "host\\INSTANCE for a named instance" },
+        .{ .key = "port", .hint = "blank: 1433, or the instance's", .int = true },
+        .{ .key = "database" },
+        .{ .key = "auth", .choices = &.{ "sql", "ntlm", "kerberos", "aad" }, .default = "sql", .omit = "sql", .hint = "a SQL login, a domain account, Entra ID" },
+        .{ .key = "realm", .hint = "the domain's DNS name, as CORP.LOCAL", .when = .{ .key = "auth", .value = "kerberos" } },
+        .{ .key = "user" },
+        .{ .key = "password", .secret = true },
+        .{ .key = "tls", .choices = tls_choices, .default = "require" },
     } },
     .{ .name = "starrocks", .blurb = "StarRocks (read through the FE, write by stream load)", .fields = &.{
-        .{ .key = "host", .prompt = "FE host" },
-        .{ .key = "port", .prompt = "FE query port", .default = "9030", .int = true },
-        .{ .key = "load_url", .prompt = "BE/CN stream-load URL", .default = "http://<be-host>:8040" },
-        .{ .key = "database", .prompt = "database" },
-        .{ .key = "user", .prompt = "user", .default = "root" },
-        .{ .key = "password", .prompt = "password", .secret = true },
+        .{ .key = "host", .hint = "the FE" },
+        .{ .key = "port", .default = "9030", .int = true, .hint = "the FE's query port" },
+        .{ .key = "load_url", .default = "http://<be-host>:8040", .hint = "a BE or CN, for stream load" },
+        .{ .key = "database" },
+        .{ .key = "user", .default = "root" },
+        .{ .key = "password", .secret = true },
     } },
     .{ .name = "doris", .blurb = "Apache Doris (read through the FE, write by stream load)", .fields = &.{
-        .{ .key = "host", .prompt = "FE host" },
-        .{ .key = "port", .prompt = "FE query port", .default = "9030", .int = true },
-        .{ .key = "load_url", .prompt = "BE stream-load URL", .default = "http://<be-host>:8040" },
-        .{ .key = "database", .prompt = "database" },
-        .{ .key = "user", .prompt = "user", .default = "root" },
-        .{ .key = "password", .prompt = "password", .secret = true },
+        .{ .key = "host", .hint = "the FE" },
+        .{ .key = "port", .default = "9030", .int = true, .hint = "the FE's query port" },
+        .{ .key = "load_url", .default = "http://<be-host>:8040", .hint = "a BE, for stream load" },
+        .{ .key = "database" },
+        .{ .key = "user", .default = "root" },
+        .{ .key = "password", .secret = true },
     } },
     .{ .name = "sftp", .blurb = "an SFTP server (files read and written as sftp://<name>/path)", .fields = &.{
-        .{ .key = "host", .prompt = "host" },
-        .{ .key = "port", .prompt = "port", .default = "22", .int = true },
-        .{ .key = "user", .prompt = "user" },
-        .{ .key = "key_file", .prompt = "key file (blank for a password)" },
-        .{ .key = "password", .prompt = "password", .secret = true },
-        .{ .key = "host_key", .prompt = "pinned host key (blank for ~/.ssh/known_hosts)" },
+        .{ .key = "host" },
+        .{ .key = "port", .default = "22", .int = true },
+        .{ .key = "user" },
+        .{ .key = "key_file", .hint = "blank for a password" },
+        .{ .key = "password", .secret = true },
+        .{ .key = "host_key", .hint = "pinned; blank for ~/.ssh/known_hosts" },
     } },
     .{ .name = "smb", .blurb = "a Windows file share or Samba server (files read and written as smb://<name>/path)", .fields = &.{
-        .{ .key = "host", .prompt = "host" },
-        .{ .key = "port", .prompt = "port", .default = "445", .int = true },
-        .{ .key = "domain", .prompt = "domain (blank for a local account)" },
-        .{ .key = "realm", .prompt = "Kerberos realm, as CORP.LOCAL (blank for NTLM)" },
-        .{ .key = "user", .prompt = "user" },
-        .{ .key = "password", .prompt = "password", .secret = true },
-        .{ .key = "share", .prompt = "share (blank to name it in each path)" },
+        .{ .key = "host" },
+        .{ .key = "port", .default = "445", .int = true },
+        .{ .key = "domain", .hint = "blank for a local account" },
+        .{ .key = "realm", .hint = "Kerberos, as CORP.LOCAL; blank for NTLM" },
+        .{ .key = "user" },
+        .{ .key = "password", .secret = true },
+        .{ .key = "share", .hint = "blank to name it in each path" },
     } },
     .{ .name = "http", .blurb = "a REST API (paginated sources, an endpoint sink)", .fields = &.{
-        .{ .key = "base_url", .prompt = "base URL" },
-        .{ .key = "auth", .prompt = "auth (blank, bearer, basic)" },
+        .{ .key = "base_url" },
+        .{ .key = "auth", .choices = &.{ "none", "bearer", "basic" }, .default = "none", .omit = "none" },
     } },
 };
 
-/// One answer from the terminal, the default when the line is empty. The terminal
-/// is in cooked mode between entries, so a plain read gets a whole line; a secret
-/// is read with echo off.
-fn ask(msg: *std.Io.Writer, prompt: []const u8, default: []const u8, secret: bool, buf: []u8) ![]const u8 {
-    if (default.len > 0) try msg.print("  {s} [{s}]: ", .{ prompt, default }) else try msg.print("  {s}: ", .{prompt});
-    try msg.flush();
-    const fd = std.fs.File.stdin().handle;
-    var orig: ?std.posix.termios = null;
-    if (secret) {
-        if (std.posix.tcgetattr(fd)) |t| {
-            var raw = t;
-            raw.lflag.ECHO = false;
-            std.posix.tcsetattr(fd, .NOW, raw) catch {};
-            orig = t;
-        } else |_| {}
+/// The `\connect` form's live parts: the credential placeholders follow the
+/// name as it is typed, and a field asked only for some answer comes and goes.
+const Wizard = struct {
+    conn: Connector,
+    user_ph: [96]u8 = undefined,
+    pass_ph: [96]u8 = undefined,
+
+    /// `NAME_USER` / `NAME_PASS` for the name typed so far.
+    fn convention(name: []const u8, suffix: []const u8, buf: []u8) []const u8 {
+        var n: usize = 0;
+        for (name) |ch| {
+            if (n + suffix.len + 1 >= buf.len) break;
+            buf[n] = std.ascii.toUpper(ch);
+            n += 1;
+        }
+        if (n == 0) {
+            @memcpy(buf[0..4], "NAME");
+            n = 4;
+        }
+        buf[n] = '_';
+        @memcpy(buf[n + 1 ..][0..suffix.len], suffix);
+        return buf[0 .. n + 1 + suffix.len];
     }
-    defer if (orig) |t| {
-        std.posix.tcsetattr(fd, .NOW, t) catch {};
-        msg.writeAll("\n") catch {};
-    };
-    var n: usize = 0;
-    while (n < buf.len) {
-        var b: [1]u8 = undefined;
-        if (try std.posix.read(fd, &b) == 0) break;
-        if (b[0] == '\n') break;
-        if (b[0] == '\r') continue;
-        buf[n] = b[0];
-        n += 1;
+
+    fn refresh(ctx: *anyopaque, fields: []form.Field) void {
+        const self: *Wizard = @ptrCast(@alignCast(ctx));
+        const name = fields[0].value();
+        for (self.conn.fields, fields[1..]) |cf, *f| {
+            if (cf.when) |w| {
+                f.hidden = true;
+                for (self.conn.fields, fields[1..]) |other, of| if (std.mem.eql(u8, other.key, w.key)) {
+                    f.hidden = !std.mem.eql(u8, of.value(), w.value);
+                };
+            }
+            if (cf.default.len > 0) continue;
+            if (cf.secret) {
+                @memcpy(self.pass_ph[0..4], "env:");
+                f.placeholder = self.pass_ph[0 .. 4 + convention(name, "PASS", self.pass_ph[4..]).len];
+            } else if (std.mem.eql(u8, cf.key, "user")) {
+                @memcpy(self.user_ph[0..4], "env:");
+                f.placeholder = self.user_ph[0 .. 4 + convention(name, "USER", self.user_ph[4..]).len];
+            }
+        }
     }
-    const line = std.mem.trim(u8, buf[0..n], " \t");
-    return if (line.len == 0) default else line;
-}
+
+    fn check(_: *anyopaque, fields: []form.Field) ?form.Form.Problem {
+        const name = fields[0].value();
+        if (name.len == 0) return .{ .field = 0, .why = "a name is needed — the script calls the connection by it" };
+        if (!std.ascii.isAlphabetic(name[0])) return .{ .field = 0, .why = "a name starts with a letter" };
+        for (name) |ch| if (!std.ascii.isAlphanumeric(ch) and ch != '_')
+            return .{ .field = 0, .why = "a name is letters, digits and _" };
+        return null;
+    }
+};
 
 /// `\connect [type]`: ask what the connector needs, show the `CREATE CONNECTION`
 /// it makes, register it, and offer to reach it and to save it — the way a
 /// project scaffolder asks its few questions and writes the file.
 fn connectWizard(alloc: std.mem.Allocator, type_arg: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
-    var buf: [512]u8 = undefined;
+    var term = form.Term.init(alloc, msg);
     var which: ?Connector = null;
     if (type_arg.len > 0) {
         for (connectors) |c| if (std.ascii.eqlIgnoreCase(c.name, type_arg)) {
             which = c;
         };
-        if (which == null) return msg.print("error: no connector `{s}` — one of postgres, mysql, sqlserver, starrocks, http\n", .{type_arg});
+        if (which == null) {
+            try msg.print("error: no connector `{s}` — one of", .{type_arg});
+            for (connectors, 0..) |c, i| try msg.print("{s} {s}", .{ if (i == 0) "" else ",", c.name });
+            return msg.writeAll("\n");
+        }
     } else {
-        try msg.writeAll("new connection — the type:\n");
-        for (connectors, 1..) |c, i| try msg.print("  {d}. {s: <10} {s}\n", .{ i, c.name, c.blurb });
-        const a = try ask(msg, "type (number or name)", "", false, &buf);
-        const idx = std.fmt.parseInt(usize, a, 10) catch 0;
-        if (idx >= 1 and idx <= connectors.len) which = connectors[idx - 1];
-        for (connectors) |c| if (std.ascii.eqlIgnoreCase(c.name, a)) {
-            which = c;
-        };
-        if (which == null) return msg.writeAll("no such type; nothing made\n");
+        var items: [connectors.len]form.Item = undefined;
+        for (connectors, &items) |c, *it| it.* = .{ .name = c.name, .detail = c.blurb };
+        var picker = form.Picker{ .title = "new connection", .items = &items };
+        if (!try term.run(&picker)) return msg.writeAll("cancelled; nothing made\n");
+        which = connectors[picker.focus];
     }
     const conn = which.?;
-    const name = try alloc.dupe(u8, try ask(msg, "name (how the script refers to it, e.g. erp)", "", false, &buf));
-    defer alloc.free(name);
-    if (name.len == 0 or !std.ascii.isAlphabetic(name[0])) return msg.writeAll("a name starts with a letter; nothing made\n");
-    var upper_buf: [64]u8 = undefined;
-    const up = std.ascii.upperString(&upper_buf, name);
 
+    var fields = std.array_list.Managed(form.Field).init(alloc);
+    defer {
+        for (fields.items) |*f| f.buf.deinit();
+        fields.deinit();
+    }
+    try fields.append(form.Field.init(alloc, .{ .label = "name", .hint = "how scripts refer to it, e.g. erp" }));
+    for (conn.fields) |cf| {
+        var choice: usize = 0;
+        for (cf.choices, 0..) |ch, i| if (std.mem.eql(u8, ch, cf.default)) {
+            choice = i;
+        };
+        try fields.append(form.Field.init(alloc, .{
+            .label = cf.key,
+            .hint = cf.hint,
+            .placeholder = cf.default,
+            .secret = cf.secret,
+            .digits = cf.int,
+            .choices = cf.choices,
+            .choice = choice,
+        }));
+    }
+    var wiz = Wizard{ .conn = conn };
+    var title_buf: [64]u8 = undefined;
+    var f = form.Form{
+        .title = std.fmt.bufPrint(&title_buf, "new {s} connection", .{conn.name}) catch "new connection",
+        .fields = fields.items,
+        .hooks = .{ .ctx = &wiz, .refresh = Wizard.refresh, .check = Wizard.check },
+    };
+    if (!try term.run(&f)) return msg.writeAll("cancelled; nothing made\n");
+
+    const name = fields.items[0].value();
+    var upper_buf: [96]u8 = undefined;
+    const user_conv = Wizard.convention(name, "USER", &upper_buf);
+    var pass_buf: [96]u8 = undefined;
+    const pass_conv = Wizard.convention(name, "PASS", &pass_buf);
+
+    // The statement, and as echoed: the same but for a typed password, which
+    // stays off the screen.
     var stmt = std.array_list.Managed(u8).init(alloc);
     defer stmt.deinit();
-    try stmt.writer().print("CREATE CONNECTION {s} TYPE {s} OPTIONS (", .{ name, conn.name });
+    var shown = std.array_list.Managed(u8).init(alloc);
+    defer shown.deinit();
+    const out = [_]*std.array_list.Managed(u8){ &stmt, &shown };
+    for (out) |o| try o.writer().print("CREATE CONNECTION {s} TYPE {s} OPTIONS (", .{ name, conn.name });
     var first = true;
-    for (conn.fields) |f| {
-        var default = f.default;
-        var hint_buf: [96]u8 = undefined;
-        var conv_buf: [80]u8 = undefined;
-        const cred = f.secret or std.mem.eql(u8, f.key, "user");
-        // Blank credentials mean the runtime's own convention: env(NAME_USER) / env(NAME_PASS).
-        const conv = try std.fmt.bufPrint(&conv_buf, "{s}_{s}", .{ up, if (f.secret) "PASS" else "USER" });
-        if (cred and f.default.len == 0) default = try std.fmt.bufPrint(&hint_buf, "env:{s}", .{conv});
-        const v = try ask(msg, f.prompt, default, f.secret, &buf);
-        if (v.len == 0 or std.mem.startsWith(u8, v, "<")) continue;
+    for (conn.fields, fields.items[1..]) |cf, *fld| {
+        if (fld.hidden) continue;
+        var v = fld.value();
+        if (cf.choices.len > 0 and std.mem.eql(u8, v, cf.omit)) continue;
+        if (v.len == 0) {
+            // Blank credentials mean the runtime's own convention: env(NAME_USER) / env(NAME_PASS).
+            if (cf.secret or std.mem.eql(u8, cf.key, "user")) continue;
+            if (std.mem.indexOfScalar(u8, cf.default, '<') != null) continue;
+            v = cf.default;
+        }
+        if (v.len == 0) continue;
+        const sep: []const u8 = if (first) "" else ", ";
+        first = false;
         if (std.mem.startsWith(u8, v, "env:")) {
             const var_name = v[4..];
-            if (std.mem.eql(u8, var_name, conv)) continue;
-            try stmt.writer().print("{s}{s} = env('{s}')", .{ if (first) "" else ", ", f.key, var_name });
-        } else if (f.int) {
-            try stmt.writer().print("{s}{s} = {s}", .{ if (first) "" else ", ", f.key, v });
+            if (std.mem.eql(u8, var_name, if (cf.secret) pass_conv else user_conv)) {
+                first = sep.len == 0;
+                continue;
+            }
+            for (out) |o| try o.writer().print("{s}{s} = env('{s}')", .{ sep, cf.key, var_name });
+        } else if (cf.int) {
+            for (out) |o| try o.writer().print("{s}{s} = {s}", .{ sep, cf.key, v });
         } else {
-            try stmt.writer().print("{s}{s} = '{s}'", .{ if (first) "" else ", ", f.key, v });
+            for (out) |o| try o.writer().print("{s}{s} = '", .{ sep, cf.key });
+            for (v) |ch| try stmt.appendSlice(if (ch == '\'') "''" else &.{ch});
+            if (cf.secret) try shown.appendSlice("********") else for (v) |ch| try shown.appendSlice(if (ch == '\'') "''" else &.{ch});
+            for (out) |o| try o.append('\'');
         }
-        first = false;
     }
-    try stmt.appendSlice(");");
-    try msg.print("\n{s}\n", .{stmt.items});
+    for (out) |o| try o.appendSlice(");");
+    try msg.writeAll("\n");
+    try writeHighlighted(alloc, msg, shown.items, term.colors.off.len > 0);
+    try msg.writeAll("\n");
     try runBlock(alloc, stmt.items, sess, msg);
     var declared = false;
     for (sess.decls.items.items) |e| if (e.kind == .connection and std.ascii.eqlIgnoreCase(e.name, name)) {
@@ -1245,14 +1329,31 @@ fn connectWizard(alloc: std.mem.Allocator, type_arg: []const u8, sess: *Session,
     if (!declared) return;
 
     if (!std.mem.eql(u8, conn.name, "http")) {
-        const t = try ask(msg, "reach it now? (y/n)", "y", false, &buf);
-        if (std.ascii.toLower(t[0]) == 'y') {
+        var reach = form.Confirm{ .question = "reach it now?", .yes = true };
+        if (try term.run(&reach) and reach.yes) {
             const reached = connTables(&sess.completer(), name).len > 0;
             try msg.print("  {s}\n", .{if (reached) "reached" else "could not reach it (or it has no tables) — \\c test retries; the connection stays declared"});
         }
     }
-    const sv = try ask(msg, "save to the startup file, so every session has it? (y/n)", "n", false, &buf);
-    if (std.ascii.toLower(sv[0]) == 'y') try saveDecls(alloc, "", sess, msg);
+    var save = form.Confirm{ .question = "save to the startup file, so every session has it?", .yes = false };
+    if (try term.run(&save) and save.yes) try saveDecls(alloc, "", sess, msg);
+}
+
+/// SQL as the entry colours it.
+fn writeHighlighted(gpa: std.mem.Allocator, w: *std.Io.Writer, text: []const u8, color: bool) !void {
+    if (!color) return w.writeAll(text);
+    const styles = try gpa.alloc(hilite.Style, text.len);
+    defer gpa.free(styles);
+    hilite.scan(text, styles);
+    var style: hilite.Style = .plain;
+    for (text, styles) |ch, st| {
+        if (st != style) {
+            style = st;
+            try w.writeAll(hilite.sgr(st));
+        }
+        try w.writeByte(ch);
+    }
+    try w.writeAll(hilite.sgr_reset);
 }
 
 /// `\i <file>`: run a file as an entry, so its declarations join the session —
@@ -2253,7 +2354,7 @@ fn replHelp(msg: *std.Io.Writer) !void {
         \\LOAD INTO writes to its target. Declarations stay for the session.
         \\
         \\session
-        \\  \connect [type]         make a connection by answering a few questions
+        \\  \connect [type]         make a connection by filling in a form (arrows move, esc cancels)
         \\  \connections, \c        the connections as a table; `\c test` reaches each now
         \\  \i <file>               run a file; its declarations join the session
         \\  \save [file]            write the declarations, by default to the startup file
