@@ -5,7 +5,7 @@
 
 const std = @import("std");
 
-pub const Style = enum(u8) { plain, keyword, string, number, comment, param, punct };
+pub const Style = enum(u8) { plain, keyword, string, number, comment, param, punct, func };
 
 /// The words the parser reads as keywords (`sql_parser.zig`'s `isKw` set), plus
 /// the aggregate and window names that read as keywords to a person.
@@ -26,6 +26,9 @@ pub const keywords = [_][]const u8{
     "min",      "median",   "cast",       "try_cast",  "if",        "rank",      "dense_rank", "row_number", "lag",
     "lead",     "string",   "int",        "float",     "decimal",   "bool",      "date",       "time",       "timestamp",
     "resource", "get",      "post",       "json_each",
+    // type names, as `CAST(x AS varchar)` and a column list write them
+    "varchar",   "char",      "nvarchar",   "text",       "bigint",
+    "smallint", "tinyint",  "integer",    "double",    "real",      "numeric",   "boolean",    "datetime",
 };
 
 fn isKeyword(word: []const u8) bool {
@@ -87,9 +90,16 @@ pub fn scan(text: []const u8, out: []Style) void {
         } else if (isIdent(c)) {
             var j = i;
             while (j < text.len and isIdent(text[j])) j += 1;
-            // `x.count` is a column; only a bare word can be a keyword.
+            // `x.count` is a column; only a bare word can be a keyword. A word
+            // a `(` follows is a call — `trim(`, `erp.QUERY(` — unless it is a
+            // keyword (`IN (`, `AS (`).
             const qualified = i > 0 and text[i - 1] == '.';
-            if (!qualified and isKeyword(text[i..j])) @memset(out[i..j], .keyword);
+            var k = j;
+            while (k < text.len and text[k] == ' ') k += 1;
+            const call = k < text.len and text[k] == '(';
+            if (!qualified and isKeyword(text[i..j])) {
+                @memset(out[i..j], .keyword);
+            } else if (call) @memset(out[i..j], .func);
             i = j;
         } else {
             if (std.mem.indexOfScalar(u8, "(),;|=<>+-*/%", c) != null) out[i] = .punct;
@@ -108,6 +118,7 @@ pub fn sgr(s: Style) []const u8 {
         .comment => "\x1b[2;39m",
         .param => "\x1b[35m",
         .punct => "\x1b[39m",
+        .func => "\x1b[33m",
     };
 }
 
@@ -127,6 +138,19 @@ test "scan: keywords, a string with a doubled quote, a comment, a param, a numbe
     try std.testing.expectEqual(Style.comment, out[30]);
     try std.testing.expectEqual(Style.keyword, out[38]); // FROM
     try std.testing.expectEqual(Style.string, out[text.len - 1]);
+}
+
+test "scan: a call is a function whatever its name; a keyword before ( stays one; types are keywords" {
+    const text = "SELECT trim(a), erp.QUERY($$x$$), x IN (1) FROM t WHERE CAST(b AS varchar) = lower (c)";
+    var out: [96]Style = undefined;
+    scan(text, out[0..text.len]);
+    try std.testing.expectEqual(Style.func, out[7]); // trim
+    try std.testing.expectEqual(Style.func, out[20]); // QUERY after erp.
+    try std.testing.expectEqual(Style.plain, out[16]); // erp
+    try std.testing.expectEqual(Style.keyword, out[36]); // IN
+    try std.testing.expectEqual(Style.keyword, out[56]); // CAST stays a keyword
+    try std.testing.expectEqual(Style.keyword, out[66]); // varchar
+    try std.testing.expectEqual(Style.func, out[77]); // lower, a space before its (
 }
 
 test "scan: a qualified name is not a keyword, a dollar-quoted body is a string" {

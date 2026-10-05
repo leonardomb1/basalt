@@ -1795,7 +1795,10 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
                         ed.remember(l);
                         const t = std.mem.trim(u8, l, " \t\r\n");
                         if (t.len > 0 and (t[0] == '\\' or isQuit(t) or isHelp(t) or isClear(t))) {
-                            if (isQuit(t)) quit = true else try metaCommand(t, &sess, msg);
+                            if (isQuit(t)) quit = true else {
+                                try metaCommand(t, &sess, msg);
+                                if (!isClear(t) and !isViewCmd(t)) try separator(&sess, msg);
+                            }
                         } else {
                             try block.appendSlice(l);
                             // Run without its `;` (Ctrl+J), the entry
@@ -1841,17 +1844,34 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
         if (sess.last_entry) |l| alloc.free(l);
         sess.last_entry = try alloc.dupe(u8, trimmed);
         try runBlock(alloc, trimmed, &sess, msg);
-        // Room between one result and the next entry, in either mode.
-        if (sess.tty) {
-            try msg.writeAll("\n");
-            try msg.flush();
-        }
+        try separator(&sess, msg);
     }
     if (sess.tty) {
         try msg.writeAll("bye\n");
         try msg.flush();
     }
     return 0;
+}
+
+/// Between one response and the next entry: a blank line and a slim rule the
+/// width of the terminal, so where one answer ends reads at a glance. Only at a
+/// terminal; piped, the output stays as it was.
+fn separator(sess: *const Session, msg: *std.Io.Writer) !void {
+    if (!sess.tty) return;
+    const color = !std.process.hasEnvVarConstant("NO_COLOR");
+    const cols = @import("line.zig").termSize(std.fs.File.stderr()).cols;
+    try msg.writeAll("\n");
+    if (color) try msg.writeAll("\x1b[2m");
+    for (0..cols) |_| try msg.writeAll("\xe2\x94\x80");
+    if (color) try msg.writeAll("\x1b[0m");
+    try msg.writeAll("\n");
+    try msg.flush();
+}
+
+fn isViewCmd(t: []const u8) bool {
+    var i: usize = 0;
+    const cmd = nextWord(t, &i) orelse return false;
+    return std.mem.eql(u8, cmd, "\\view") or std.mem.eql(u8, cmd, "\\v");
 }
 
 /// One statement of an entry: the declaration it is, or null for something to
