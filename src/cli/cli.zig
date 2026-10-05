@@ -1796,8 +1796,10 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
                         const t = std.mem.trim(u8, l, " \t\r\n");
                         if (t.len > 0 and (t[0] == '\\' or isQuit(t) or isHelp(t) or isClear(t))) {
                             if (isQuit(t)) quit = true else {
+                                const framed = !isClear(t) and !isViewCmd(t);
+                                if (framed) try entryGap(&sess, msg);
                                 try metaCommand(t, &sess, msg);
-                                if (!isClear(t) and !isViewCmd(t)) try separator(&sess, msg);
+                                if (framed) try separator(&sess, msg);
                             }
                         } else {
                             try block.appendSlice(l);
@@ -1843,6 +1845,7 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
         if (trimmed.len == 0) continue;
         if (sess.last_entry) |l| alloc.free(l);
         sess.last_entry = try alloc.dupe(u8, trimmed);
+        try entryGap(&sess, msg);
         try runBlock(alloc, trimmed, &sess, msg);
         try separator(&sess, msg);
     }
@@ -1853,17 +1856,18 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
     return 0;
 }
 
-/// Between one response and the next entry: a blank line and a slim rule the
-/// width of the terminal, so where one answer ends reads at a glance. Only at a
-/// terminal; piped, the output stays as it was.
+/// Between one response and the next entry: a blank line. Only at a terminal;
+/// piped, the output stays as it was.
 fn separator(sess: *const Session, msg: *std.Io.Writer) !void {
     if (!sess.tty) return;
-    const color = !std.process.hasEnvVarConstant("NO_COLOR");
-    const cols = @import("line.zig").termSize(std.fs.File.stderr()).cols;
     try msg.writeAll("\n");
-    if (color) try msg.writeAll("\x1b[2m");
-    for (0..cols) |_| try msg.writeAll("\xe2\x94\x80");
-    if (color) try msg.writeAll("\x1b[0m");
+    try msg.flush();
+}
+
+/// Between an entry and its response: a blank line, so the answer does not sit
+/// against the query that asked for it.
+fn entryGap(sess: *const Session, msg: *std.Io.Writer) !void {
+    if (!sess.tty) return;
     try msg.writeAll("\n");
     try msg.flush();
 }
