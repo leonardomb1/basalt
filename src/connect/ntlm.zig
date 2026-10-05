@@ -89,6 +89,27 @@ pub fn authenticate(
     time: u64,
     nonce: [8]u8,
 ) Error![]u8 {
+    return (try authenticateKeyed(gpa, cred, challenge, time, nonce)).msg;
+}
+
+/// An AUTHENTICATE_MESSAGE and the session key both ends now hold.
+pub const Authenticated = struct {
+    msg: []u8,
+    /// The NTLMv2 SessionBaseKey, HMAC_MD5(ResponseKeyNT, NTProofStr) (MS-NLMP
+    /// 3.3.2). With key exchange not negotiated it is also the exported session
+    /// key (3.4.5.1 KXKEY, 3.1.5.1.2) — what SMB2 signs with and derives its
+    /// SMB 3 signing keys from.
+    session_key: [16]u8,
+};
+
+/// `authenticate`, also handing back the session key.
+pub fn authenticateKeyed(
+    gpa: std.mem.Allocator,
+    cred: Credential,
+    challenge: []const u8,
+    time: u64,
+    nonce: [8]u8,
+) Error!Authenticated {
     const chal = try parseChallenge(challenge);
     const key = try ntowfv2(gpa, cred);
 
@@ -160,7 +181,10 @@ pub fn authenticate(
     @memcpy(msg[lm_at..][0..lm.len], &lm);
     @memcpy(msg[nt_at..][0..proof.len], &proof);
     @memcpy(msg[nt_at + proof.len ..][0..temp.len], temp);
-    return msg;
+
+    var session_key: [16]u8 = undefined;
+    std.crypto.auth.hmac.HmacMd5.create(&session_key, &proof, &key);
+    return .{ .msg = msg, .session_key = session_key };
 }
 
 /// The current time as a Windows FILETIME, for callers with nothing better to
@@ -439,6 +463,16 @@ test "authenticate reproduces the MS-NLMP 4.2.4 NTLMv2 and LMv2 responses" {
     try std.testing.expectEqual(client_flags, std.mem.readInt(u32, msg[60..64], .little));
     try expectHex("0000000000000000", msg[64..72]);
     try std.testing.expectEqual(@as(usize, 72 + 12 + 8 + 16 + 24 + 84), msg.len);
+}
+
+test "authenticateKeyed: the session key is MS-NLMP 4.2.4.1.3's SessionBaseKey" {
+    const gpa = std.testing.allocator;
+    var chal: [104]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&chal, example_challenge);
+    const cred = Credential{ .domain = "Domain", .user = "User", .password = "Password", .workstation = "COMPUTER" };
+    const a = try authenticateKeyed(gpa, cred, &chal, 0, [_]u8{0xaa} ** 8);
+    defer gpa.free(a.msg);
+    try expectHex("8de40ccadbc14a82f15cb0ad0de95ca3", &a.session_key);
 }
 
 test "authenticate: MsvAvTimestamp overrides the caller's clock" {
