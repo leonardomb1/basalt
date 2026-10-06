@@ -6,8 +6,6 @@ type-checked, and planned once, then executed as a streaming pull pipeline.
 
 This is the reference for the SQL dialect, derived from the parser
 (`src/lang/sql_parser.zig`); it reflects what the engine actually accepts.
-Basalt SQL is the only dialect: the BSL (`.bsl`) parser was removed in v0.2.0 —
-`examples/golden/` holds the frozen plans that gated the removal.
 
 1. [Program structure](#1-program-structure)
 2. [Parameters](#2-parameters)
@@ -45,15 +43,17 @@ CASE ... END CASE;                -- plan-time dispatch
 PRINT <expr>;                     -- progress line on stderr, via the run log
 ```
 
-`@include` splices another script's declarations ahead of this one at plan
-time: each included file is parsed separately (errors report the included
-file's own path and line), includes may nest (depth 16, cycles rejected), and
-paths resolve relative to the including file. A file is spliced in **once**, at
-its first include, like C's `#pragma once`: when `outliers.sql` and
-`dispersion.sql` both include `stats.sql` and a script includes both, `stats.sql`
-is in the program one time — its `CREATE FUNCTION`s are not defined twice — and
-each library still sees what it declares. That holds for every statement in it,
-so an included file's `LOAD INTO` runs once however many paths reach it.
+`@include 'file.sql';` splices another script's declarations ahead of this one
+at plan time. It stands on a line of its own — nothing may follow it there but a
+`--` comment. Each included file is parsed separately (errors report the
+included file's own path and line), includes may nest (depth 16, cycles
+rejected), and paths resolve relative to the including file. A file is spliced
+in **once**, at its first include, like C's `#pragma once`: when `outliers.sql`
+and `dispersion.sql` both include `stats.sql` and a script includes both,
+`stats.sql` is in the program one time — its `CREATE FUNCTION`s are not defined
+twice — and each library still sees what it declares. That holds for every
+statement in it, so an included file's `LOAD INTO` runs once however many paths
+reach it.
 
 `THROW <message> [WHEN <condition>];` asserts what the engine cannot infer.
 Both operands are ordinary expressions over `$params` and `$lets` (§9), so they
@@ -89,13 +89,13 @@ THROW 'unreachable branch';       -- unconditional, e.g. in a CASE arm
 `FOR EACH` or `CALL` says what it is doing. The argument is an ordinary
 expression (literals, `||`, `$params`, `$lets`, and inside a `FOR EACH` or
 statement-function body the loop variables, bound per row); non-strings render
-as they would in a sink. It writes to **stderr through the run log at `info`**,
-never stdout — stdout is the data contract (`--format json` NDJSON rows or the
-summary object), and a progress line there would corrupt it. So `PRINT`
-inherits the log settings: `--log-format json` carries the text as the `msg`
-field of an NDJSON line, and the default level is `warn`, so a `PRINT` only
-appears under `--log-level info` (or `debug`); `-q` silences it. `PRINT` is not
-an output pipeline — a script still needs a `LOAD INTO` or a terminal query.
+as they would in a sink. It writes to **stderr through the run log**, never
+stdout — stdout is the data contract (`--format json` NDJSON rows or the summary
+object), and a progress line there would corrupt it. A `PRINT` is shown whatever
+`--log-level` says, since the script asked for it; only `-q` silences it. Under
+`--log-format json` it is an NDJSON line with `"level":"print"` and the text as
+its `msg`. `PRINT` is not an output pipeline — a script still needs a `LOAD INTO`
+or a terminal query.
 
 ## 2. Parameters
 
@@ -108,6 +108,10 @@ PARAM tenant STRING FROM HEADER('X-Tenant');
 
 - Reference with `$`: `$dias`, `$desde`. JSON documents navigate by dotted
   path — `$job.tables`, `$job.source.host` — resolved to literals at plan time.
+  A `JSON` param takes its document from `-p job='{"a":1}'` (or a kernel's
+  `params`), else the request body in HTTP mode, else a string `DEFAULT`; a
+  path to a key the document lacks is an error naming the key. `check` with no
+  value bound reads every path as `null`.
 - Safe navigation: `$job.filtro?.uf` — a missing intermediate resolves the
   whole path to `null` instead of erroring.
 - Types: `BOOL INT FLOAT STRING BYTES DATE TIME TIMESTAMP DECIMAL(p,s) JSON`
@@ -117,8 +121,11 @@ PARAM tenant STRING FROM HEADER('X-Tenant');
   `-p d=2026-02-01` is a `DATE` (`date_add('day', 1, $d)` works), a date alone
   bound to a `TIMESTAMP` is its midnight, `TIME` takes `HH:MM[:SS[.ffffff]]`,
   and a `DECIMAL(10,2)` rounds `12.345` to `12.35`. Text that is not one fails
-  the run, and `check`, with the value named (`PARAM d: 'nope' is not a date`).
+  the run, and `check`, naming the param and the value. `DECIMAL` alone is
+  `DECIMAL(38,0)`; `DECIMAL(p)` without a scale is refused.
 - Source defaults: scalars bind from the query string, `JSON` from the body.
+  `FROM QUERY`, `FROM BODY` and `FROM HEADER('X-Name')` say so explicitly; a
+  bare `FROM HEADER` reads the header named like the param.
 
 **`LET name = <expr>;`** is PARAM's sealed sibling: a script-scoped constant
 folded once at plan time (in declaration order; it may reference `$params` and
@@ -142,10 +149,17 @@ CREATE CONNECTION erp TYPE sqlserver OPTIONS (
 );
 ```
 
-Connector types and their options are unchanged from BSL: `sqlserver`
-(`host port database user password tls auth domain tenant client_id resource`),
-`mysql`, `postgres`, `starrocks` and `doris` (`fe_host fe_port be_url database
-buckets replication_num auto_create label_prefix ...`), `http`.
+The connection types are `postgres`, `mysql`, `sqlserver`, `starrocks`,
+`doris`, `http`, `sftp` and `smb`; any other `TYPE` is a plan-time error.
+
+- `postgres`, `mysql`, `sqlserver`: `host port database user password tls`
+  (`off`, `require` or `insecure`). `sqlserver` adds `auth` (`sql`, the default;
+  `aad` with `client_id` `resource` `token`; `ntlm`; `kerberos`) and, for
+  Windows authentication, `domain realm kdc spn` (below).
+- `starrocks` and `doris`: `fe_host`/`host`, `fe_port`/`port`, `user`
+  `password`, a required `database`, and for loading `be_url` (also `load_url`)
+  `buckets replication_num auto_create label_prefix`.
+- `http`, `sftp` and `smb` are described below.
 
 A `starrocks` connection is both ends: `LOAD INTO sr.t` writes by stream load
 (`be_url`), and `FROM sr.db.t` / `sr.QUERY($$...$$)` reads through the FE's
@@ -177,12 +191,13 @@ LOAD INTO 'sftp://bank/remessa/pagamentos.csv' AS SELECT * FROM pagamentos;
 
 Options are `host port user password key_file key_passphrase known_hosts
 host_key`; `user`/`password` follow the `NAME_USER`/`NAME_PASS` convention, and
-the password is optional when a `key_file` logs in. The key is an OpenSSH Ed25519
-key, passphrase-protected or not; an RSA key file is refused with that advice.
-Password and keyboard-interactive logins both work. Without a connection,
-`sftp://user@host/path` logs in with `~/.ssh/id_ed25519` or `SFTP_PASSWORD`. A connection
-name is process-wide: under `basalt serve` every script sees the latest
-`CREATE CONNECTION` of it, so give different servers different names.
+the password is optional when a `key_file` logs in. The key is an OpenSSH
+Ed25519 key, passphrase-protected or not; an RSA key file is refused with that
+advice. Password and keyboard-interactive logins both work. Without a
+connection, `sftp://user@host/path` logs in with `~/.ssh/id_ed25519` or
+`SFTP_PASSWORD`. A connection name is process-wide: under `basalt serve` every
+script sees the latest `CREATE CONNECTION` of it, so give different servers
+different names.
 
 The server's host key is checked before anything is sent, against
 `known_hosts` (`~/.ssh/known_hosts` by default, hashed entries and `[host]:port`
@@ -213,13 +228,13 @@ SELECT * FROM 'smb://fs/fechamento/2026-10.xlsx';
 LOAD INTO 'smb://fs/exportacao/vendas.parquet' AS SELECT * FROM vendas;
 ```
 
-Options are `host port user password domain share realm kdc spn auth`; `user`/`password` follow the
-`NAME_USER`/`NAME_PASS` convention, `domain` is the account's (empty for one
-local to the server), and `port` is 445. Without a connection,
-`smb://[domain;]user@host/share/path` logs in as that user with `SMB_PASSWORD`
-(`SMB_USER` and `SMB_DOMAIN` filling what the URL leaves out). Paths use `/`;
-names are matched as the server matches them, without regard to case on
-Windows.
+Options are `host port user password domain share realm kdc spn auth`;
+`user`/`password` follow the `NAME_USER`/`NAME_PASS` convention, `domain` is the
+account's (empty for one local to the server), and `port` is 445. Without a
+connection, `smb://[domain;]user@host/share/path` logs in as that user with
+`SMB_PASSWORD` (`SMB_USER` and `SMB_DOMAIN` filling what the URL leaves out).
+Paths use `/`; names are matched as the server matches them, without regard to
+case on Windows.
 
 The login is NTLMv2, or Kerberos when the connection names a `realm` — the
 domain's DNS name in capitals (`CORP.LOCAL`), not its NetBIOS name. Kerberos is
@@ -233,17 +248,17 @@ CREATE CONNECTION az TYPE smb OPTIONS (
 );
 ```
 
-basalt asks the KDC for a ticket with the password itself — it holds no
-system ticket and reads no keytab — with pre-authentication and AES keys only
-(RC4 is refused). The KDC is `kdc = 'host[:port]'` when given, else the one DNS
-lists for `_kerberos._tcp.<realm>`, else the realm's own name; the service is
+basalt asks the KDC for a ticket with the password itself — it holds no system
+ticket and reads no keytab — with pre-authentication and AES keys only (RC4 is
+refused). The KDC is `kdc = 'host[:port]'` when given, else the one DNS lists
+for `_kerberos._tcp.<realm>`, else the realm's own name; the service is
 `cifs/<host>`, or `spn` when the server is known by another name (reach a
 private endpoint by IP, say, but name it by its DNS name). Tickets are reused
-until they expire. The user may be written `me@CORP.LOCAL` or `CORP\me`; it
-logs in as `me`, and with `auth = 'kerberos'` the part after `@` serves as the
-realm when no `realm` is given. `auth = 'ntlm'` keeps NTLM despite a realm;
-`SMB_REALM` and `SMB_KDC` fill in for a plain `smb://` URL. The machine's clock must be within
-five minutes of the KDC's.
+until they expire. The user may be written `me@CORP.LOCAL` or `CORP\me`; it logs
+in as `me`, and with `auth = 'kerberos'` the part after `@` serves as the realm
+when no `realm` is given. `auth = 'ntlm'` keeps NTLM despite a realm;
+`SMB_REALM` and `SMB_KDC` fill in for a plain `smb://` URL. The machine's clock
+must be within five minutes of the KDC's.
 
 Every request is signed and every signed reply checked — SMB 2.1 to 3.1.1, the
 latter with pre-authentication integrity — which Windows 11 24H2 and Server
@@ -309,18 +324,19 @@ challenge-response derived from it — whereas a SQL login sends it under
 LOGIN7's trivially reversible scrambling, so on an unverified channel NTLM is
 the stronger of the two, not the weaker.
 
-**Credentials by convention:** connection `erp` resolves `ERP_USER` /
-`ERP_PASS` from the environment at connect time — the common case costs zero
-characters. Explicit `user = ...` / `password = ...` options override the
-convention. An `http` connection reads them only for `auth = 'basic'` (and
-`oauth2` without `client_id`/`client_secret`), so a public API needs none. Azure Blob paths (`az://...`, §5) resolve `AZURE_STORAGE_KEY`, and
-`AZURE_BLOB_ENDPOINT` points them at an emulator. S3 paths (`s3://...`, §5)
-resolve `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ optional
-`AWS_SESSION_TOKEN`, `AWS_REGION`), and `AWS_ENDPOINT_URL` points them at an
-emulator such as MinIO. Secrets are never literals in the script; always
-environment indirection.
+**Credentials by convention:** connection `erp` resolves `ERP_USER` / `ERP_PASS`
+from the environment at connect time — the common case costs zero characters.
+Explicit `user = ...` / `password = ...` options override the convention. An
+`http` connection reads them only for `auth = 'basic'` (and `oauth2` without
+`client_id`/`client_secret`), so a public API needs none. Azure Blob paths
+(`az://...`, §5) resolve `AZURE_STORAGE_KEY`, and `AZURE_BLOB_ENDPOINT` points
+them at an emulator. S3 paths (`s3://...`, §5) resolve `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`, `AWS_REGION`), and
+`AWS_ENDPOINT_URL` points them at an emulator such as MinIO. Secrets are never
+literals in the script; always environment indirection.
 
-`CREATE OR REPLACE CONNECTION` re-declares an existing name.
+A second `CREATE CONNECTION` of a name replaces the first from that statement
+on; `CREATE OR REPLACE CONNECTION` says the same thing explicitly.
 
 **HTTP connections** hold what every read of an API shares. After `OPTIONS`,
 an `http` connection takes the REST source clauses (§5) — `PAGINATE`, `RETRY`,
@@ -335,7 +351,9 @@ CREATE CONNECTION gh TYPE http OPTIONS (base_url = 'https://api.github.com',
 
 `auth` is `bearer` (`token`), `basic` (`user`/`password`, which default to the
 `NAME_USER`/`NAME_PASS` convention), `header` (`header_name`/`header_value`,
-for API keys), `login_json` or `oauth2` (`token_url`, `client_id`,
+for API keys), `login_json` (`login_url`, the body's fields as `body_<name>`,
+and `token_path`, `token_header`, `token_prefix` for where the token goes) or
+`oauth2` (`login_url` — `token_url` is accepted too — `client_id`,
 `client_secret`, `scope`). With no `auth`, no credentials are read at all.
 
 `CREATE RESOURCE conn.name AS GET(...) | POST(...) [PAGINATE ...] [RETRY ...]
@@ -356,10 +374,10 @@ SELECT name, stargazers_count FROM gh.repos WHERE NOT archived;
 
 ```sql
 LOAD INTO sr.silver.pedidos            -- conn[.schema].table, or a quoted path
-  USING stream_load                    -- physical adapter (connector verb)
+  USING stream_load                    -- load path; optional, starrocks/doris only
   UPSERT ON (empresa, num_pedido)      -- disposition (below)
   SPLIT BY (num_pedido) JOBS 4         -- key-range parallel load
-  WITH (label_prefix = 'noturno')      -- residual connector knobs
+  WITH (label_prefix = 'noturno')      -- overrides the connection's label_prefix
 AS
 <query>;
 ```
@@ -370,8 +388,16 @@ AS
   `.arrows` for the stream format, local paths only), or an object-store
   path `LOAD INTO 'az://account/container/bronze/x.parquet'` or
   `LOAD INTO 's3://bucket/bronze/x.parquet'`.
+- `USING stream_load` names the one load path StarRocks and Doris have, and
+  may be left out; on any other target, or with another name, it is an error.
 - A per-row dynamic target uses `IDENTIFIER(<string-expr>)` over loop vars
-  (§7): `LOAD INTO sr.IDENTIFIER('crm_' || lower($name)) ...`.
+  (§7): `LOAD INTO sr.IDENTIFIER('crm_' || lower($name)) ...`. A file target
+  built this way must end in a literal extension, which picks the writer.
+- `.xlsx` is read but never written: a workbook target is a plan-time error.
+- `UPSERT` needs a table to merge into; on a file target it is a plan-time error.
+- `WITH (...)` on a `LOAD INTO` takes `delimiter` and `format` (a file) and
+  `label_prefix` (StarRocks, Doris); any other key is a plan-time error rather
+  than ignored.
 - Dispositions on a **table target**: `APPEND` (default, omissible) · `REPLACE`
   (overwrite) · `UPSERT ON (k1, k2)` · `UPSERT ON (id) PARTIAL COLS (a, b)` ·
   bare `UPSERT` (infer the PK from the source table's metadata at plan time —
@@ -383,8 +409,10 @@ AS
   opened without truncating and the header row is written only when it was
   absent or empty. Explicit `APPEND` is a plan-time error for `.parquet` and
   Arrow IPC (the footer indexes every row group or batch and is written last,
-  so appending means rewriting the file) and for `az://` / `s3://` (an object is replaced on
-  write, never extended) — use `REPLACE`, a per-run path, or `INTO BUFFER` (§8).
+  so appending means rewriting the file), for `az://` / `s3://` (an object is
+  replaced on write, never extended), and for `sftp://` / `smb://` (the file is
+  written beside the target and renamed over it) — use `REPLACE`, a per-run
+  path, or `INTO BUFFER` (§8).
 - `SPLIT BY (col)` parallelizes the load by key ranges; `JOBS n` fixes the
   lane count (otherwise the CLI `-j` applies).
 
@@ -417,7 +445,7 @@ LIMIT 100 OFFSET 20;
 | SQL table | `FROM erp.dbo.SC5010` |
 | SQL table (per-row name) | `FROM erp.dbo.IDENTIFIER($name)` (§7) — still a table read |
 | raw query | `FROM erp.QUERY($$SELECT ...$$)` (no dialect translation) |
-| file — CSV, Parquet, Arrow IPC or Excel | `FROM 'path.csv'` / `FROM 'path.parquet'` / `FROM 'path.arrow'` / `FROM 'path.xlsx'` — the extension picks the reader; local or HTTPS URL (Arrow IPC: local only). Any other extension is a plan-time error unless `WITH (format = 'csv' \| 'parquet' \| 'arrow' \| 'xlsx')` names one |
+| file — CSV, Parquet, Arrow IPC or Excel | `FROM 'path.csv'` / `FROM 'path.parquet'` / `FROM 'path.arrow'` (also `.feather`, `.ipc`, `.arrows`) / `FROM 'path.xlsx'` (also `.xlsm`) — the extension picks the reader; local or HTTPS URL (Arrow IPC: local only). Any other extension is a plan-time error unless `WITH (format = 'csv' \| 'parquet' \| 'arrow' \| 'xlsx')` names one |
 | compressed file | `FROM 'path.csv.gz'` / `.csv.zst` — the inner name picks the reader |
 | file inside a zip | `FROM 'archive.zip :: inner.csv'`, or just `FROM 'archive.zip'` when it holds one file |
 | folder | `FROM 'sales/'` — a trailing `/`, local or remote, reads every Parquet file under it (subfolders too, as Spark's `year=2026/` layout) as one table, or every `.csv`/`.tsv`/`.txt` when it holds CSVs; see below |
@@ -435,7 +463,8 @@ LIMIT 100 OFFSET 20;
 | CTE | `FROM <name>` |
 | table function | `FROM paid_orders($since) p` — a `CREATE FUNCTION ... RETURNS TABLE` (§9), also as a `JOIN`'s right side |
 
-Every source takes an alias, with or without `AS`: `FROM 'x.xlsx' AS xl`, `FROM sr.db.t t`.
+Every source takes an alias, with or without `AS`: `FROM 'x.xlsx' AS xl`, `FROM
+sr.db.t t`.
 
 A folder read lists the folder — subfolders included, names starting `_` or
 `.` skipped (`_SUCCESS`, `_temporary/`, `.crc`) — and reads the files sorted
@@ -463,6 +492,9 @@ long for its column is refused (`String or binary data would be truncated`)
 rather than cut, a division by zero is an error rather than NULL, a `varchar`
 keeps its trailing spaces, a column created without `NULL` / `NOT NULL` allows
 nulls, and a table with a filtered index or an indexed view can be written.
+
+A header name in double quotes loses its quotes (`""` inside is one quote) and
+may hold the delimiter: `"Valor Total"` is the column `Valor Total`.
 
 A CSV column's type is sniffed from the first 1024 rows: int ⊂ float ⊂ string,
 and a column whose every non-empty, unquoted cell is an ISO `YYYY-MM-DD` reads as
@@ -548,11 +580,11 @@ its leaves, not the JSON.
 Source clauses, in any order after the source:
 
 - **`PUSHDOWN(<expr>)`** — a raw predicate sent verbatim into the generated
-  source query's `WHERE` (the successor of BSL `@[where]`). The argument is a
-  string expression: a `$$...$$` literal (`PUSHDOWN($$D_E_L_E_T_ <> '*'$$)`),
-  a loop-var value (`PUSHDOWN($where)`), or one built with `||`. ANDed with
-  whatever the translated `WHERE` pushes down. Empty ⇒ no clause. Syntax errors
-  surface at the source at runtime (permanent, exit 1).
+  source query's `WHERE`. The argument is a string expression: a `$$...$$`
+  literal (`PUSHDOWN($$D_E_L_E_T_ <> '*'$$)`), a loop-var value
+  (`PUSHDOWN($where)`), or one built with `||`. ANDed with whatever the
+  translated `WHERE` pushes down. Empty ⇒ no clause. Syntax errors surface at
+  the source at runtime (permanent, exit 1).
 - **Projection pushdown** — a table read asks the source only for the columns
   the pipeline provably needs (`SELECT a, b FROM erp.t` is sent as
   `SELECT [a], [b] FROM t`), so a narrow read of a 300-column table no longer
@@ -648,7 +680,7 @@ Source clauses, in any order after the source:
   When an aggregate over a SQL source does *not* descend, every matching row
   is streamed to the engine to be grouped — the run log says so in a `warn`
   line that names the rule that refused it (`the WHERE predicate does not
-  translate whole to mysql SQL`, ``group key `x` is renamed by the
+  translate exactly to mysql SQL (…)`, ``group key `x` is renamed by the
   aggregate``, …).
 - **`LIMIT` and top-N pushdown** — `read <sql> | filters | [SELECT] | [ORDER BY]
   | LIMIT n [OFFSET m]` asks the source for `n + m` rows: `LIMIT` on
@@ -658,7 +690,7 @@ Source clauses, in any order after the source:
   a leading `k IS NULL` key on mysql/StarRocks; a `CASE` key on sqlserver) —
   and the engine still sorts, offsets and cuts what arrives, so the final order
   is its own. It descends only when the answer cannot change:
-  - every `WHERE` before the limit translates (§7's rules) — the source counts
+  - every `WHERE` before the limit translates (the rules above) — the source counts
     rows after its own filter, so one left here would thin the capped set;
   - each `ORDER BY` key is a source column, as-is or renamed by the `SELECT`
     (`SELECT id AS k … ORDER BY k`), not a computed one;
@@ -695,6 +727,40 @@ Source clauses, in any order after the source:
   mojibake, so prefer the publisher's stated encoding over guessing. The delimiter
   is also accepted on a `LOAD INTO` file target; `encoding` is not — a CSV sink
   always writes UTF-8, and being told otherwise is an error rather than ignored.
+- **`WITH (format = 'csv' | 'parquet' | 'arrow' | 'xlsx')`** — read or write a
+  path as this format whatever its extension says (`xlsx` reads only). Needed
+  for a file named `.dat` or `.txt`, and for a URL that serves CSV from an
+  extensionless path. Without it, an extension basalt does not know is refused
+  at plan time rather than parsed as CSV, which would read a binary file's
+  bytes as rows.
+- **`WITH (k = v, flag, ...)`** — residual source options: `items` (dotted
+  path to the row array when the response nests it, e.g. `items = 'data.rows'`
+  — a bare array needs nothing), `buffer` (drain the source fully before
+  opening the sink), `prefetch`, `timeout_ms`, `header = 'Name: value'`,
+  `auth` forms, `method`/`body` for POST sources, etc.
+
+`WHERE` on a REST source runs in basalt after the fetch; on a SQL table it is
+pushdown. Same word, different plan — `EXPLAIN` shows which.
+
+A complete REST read, for orientation:
+
+```sql
+CREATE CONNECTION crates TYPE http OPTIONS (base_url = 'https://crates.io/api/v1')
+  RETRY 2 ON (429, 503);
+
+SELECT id AS crate, downloads, json_get(links, 'owners') AS owners
+FROM crates.GET('/crates', sort = 'downloads', per_page = 100)
+  PAGINATE BY page (param = 'page', size = 100, total = 'meta.total', max = 5)
+  WITH (items = 'crates')
+WHERE downloads > 0;
+```
+
+The rows are the array at `items` (or the response itself); a single object —
+a detail endpoint's answer — is one row. Columns are typed from the first
+object: numbers, booleans and strings as themselves, nested objects and arrays
+as JSON text, which `json_get` and `JSON_EACH` (§9, and `UNNEST` below) take
+apart.
+
 ### Compressed files and archives
 
 A compression suffix is read through: `FROM 'orders.csv.gz'` and `FROM 'orders.csv.zst'`
@@ -738,40 +804,6 @@ Two consequences worth knowing:
 Reading an archive over HTTP is not supported yet: a zip's index sits at the end of
 the file, so it needs a ranged fetch before anything else can happen.
 
-- **`WITH (format = 'csv' | 'parquet')`** — read or write a path as this format
-  whatever its extension says. Needed for a file named `.dat` or `.txt`, and for
-  a URL that serves CSV from an extensionless path. Without it, an extension
-  basalt does not know is refused at plan time rather than parsed as CSV: a
-  `.zip` used to be read as text and answer `COUNT(*)` with the number of
-  newlines that happened to occur in its compressed bytes.
-- **`WITH (k = v, flag, ...)`** — residual source options: `items` (dotted
-  path to the row array when the response nests it, e.g. `items = 'data.rows'`
-  — a bare array needs nothing), `buffer` (drain the source fully before
-  opening the sink), `prefetch`, `timeout_ms`, `header = 'Name: value'`,
-  `auth` forms, `method`/`body` for POST sources, etc.
-
-`WHERE` on a REST source runs in basalt after the fetch; on a SQL table it is
-pushdown. Same word, different plan — `EXPLAIN` shows which.
-
-A complete REST read, for orientation:
-
-```sql
-CREATE CONNECTION crates TYPE http OPTIONS (base_url = 'https://crates.io/api/v1')
-  RETRY 2 ON (429, 503);
-
-SELECT id AS crate, downloads, json_get(links, 'owners') AS owners
-FROM crates.GET('/crates', sort = 'downloads', per_page = 100)
-  PAGINATE BY page (param = 'page', size = 100, total = 'meta.total', max = 5)
-  WITH (items = 'crates')
-WHERE downloads > 0;
-```
-
-The rows are the array at `items` (or the response itself); a single object —
-a detail endpoint's answer — is one row. Columns are typed from the first
-object: numbers, booleans and strings as themselves, nested objects and arrays
-as JSON text, which `json_get` and `JSON_EACH` (§9, and `UNNEST` below) take
-apart.
-
 ### Operators
 
 | clause | plan stage |
@@ -780,7 +812,7 @@ apart.
 | `SELECT a, expr AS x` | projection |
 | `SELECT * EXCLUDE (a, b)` / `EXCEPT` | all-but projection |
 | `SELECT * RENAME (a AS b)` | rename projection |
-| `COUNT(*) / SUM / AVG / MIN / MAX ... GROUP BY k` | aggregate (every other item must be a group key, aliased or not, or a plan-time constant). A numeric aggregate refuses a non-numeric argument at plan time, and casts text per row — so a CSV column read as text still sums, and text that is not a number fails the run |
+| `COUNT(*) / SUM / AVG / MIN / MAX ... GROUP BY k` | aggregate (every other item must be a group key, aliased or not, or a plan-time constant; a `GROUP BY` with no aggregate is refused — use `SELECT DISTINCT`). A numeric aggregate refuses a non-numeric argument at plan time, and casts text per row — so a CSV column read as text still sums, and text that is not a number fails the run |
 | `ROUND(AVG(x), 2)`, `SUM(a)/COUNT(*)` | an aggregate inside an expression: the calls are computed by the aggregate, the arithmetic around them by a projection after it |
 | `COUNT(DISTINCT x)` | aggregate — combines freely with other aggregates; ignores nulls |
 | `MEDIAN(x)` | aggregate — a float; the mean of the two middle values on an even count; ignores nulls. Holds every value of the group until the end, so it is the one aggregate that is not O(1) per group. Engine-side only (never pushed down), and not a window function |
@@ -789,13 +821,13 @@ apart.
 | `bit_and(x)` / `bit_or(x)` / `bit_xor(x)` | aggregate — the bitwise fold of an `INT` column; nulls ignored, null when there is nothing to fold |
 | `var_samp(x)` / `var_pop(x)`, `stddev_samp(x)` / `stddev_pop(x)` | aggregate — the sample and population variance and standard deviation, as floats; nulls ignored. `variance` and `stddev` are the **sample** ones, as in Postgres, DuckDB, Trino and SQL Server (MySQL and StarRocks read them as population). A sample statistic of fewer than two values is null; a population one of a single value is `0` |
 | `HAVING <expr>` | filter after the aggregate; aggregate calls in it refer to the columns it produced, including ones the `SELECT` list never asked for |
-| `ORDER BY a DESC, b` | sort |
+| `ORDER BY a DESC, b` | sort — nulls last in both directions; `NULLS FIRST`/`NULLS LAST` are not accepted |
 | `LIMIT n [OFFSET m]` | limit |
 | `SELECT * EXCEPT (a, b)` / `EXCLUDE` | every column but those; a name not present is ignored, so one list serves tables that differ. Right after a union (`EACH TABLE OF`, `UNION ALL BY NAME`) the names are dropped *before* the branches are reconciled, so a column one table carries with an incompatible type can be excepted instead of failing the load. A name may be `IDENTIFIER(<expr>)` — a `$param` or loop variable rendered at run time, `'a, b'` excluding both and `''` nothing |
 | `SELECT DISTINCT` / `DISTINCT ON (a, b)` | distinct — `ON` keys are input columns: they need not be in the SELECT list, and may be ones it renames (`DISTINCT ON (grp) grp AS k`). `DISTINCT ON` keeps the first row per key in `ORDER BY` order when there is one (`ORDER BY k, ts DESC` keeps the latest), else the first in input order |
 | `CROSS JOIN UNNEST(SPLIT(tags, ',')) AS tag` | explode (also `UNNEST(col)`) |
 | `CROSS JOIN UNNEST(JSON_EACH(tags)) AS tag` | explode a JSON array: one row per element — strings unquoted, objects and arrays as JSON text, a JSON `null` as null. A null or `null` cell gives no rows; an object or scalar is an error |
-| `[INNER\|LEFT\|RIGHT\|FULL\|CROSS\|SEMI\|ANTI] JOIN <source> [AS] x ON a = b [AND ...]` | join — the right side a CTE, `(SELECT ...)`, table function, path or connection table |
+| `[INNER\|LEFT [OUTER]\|RIGHT [OUTER]\|FULL [OUTER]\|CROSS\|SEMI\|ANTI] JOIN <source> [AS] x ON a = b [AND ...]` | join — the right side a CTE, `(SELECT ...)`, table function, path or connection table; `JOIN LATERAL f(x.col)` passes a column to a table function (§9) |
 
 Row order without `ORDER BY` is not defined in SQL, and `GROUP BY` returns groups
 in hash-partition order. A pipeline that only filters, projects or joins keeps the
@@ -808,37 +840,37 @@ does not order its rows (a table has none). `DISTINCT` keeps the first row per
 key in input order at any `-j`. Add `ORDER BY` whenever the order is part of
 the answer.
 
-Joins are hash equi-joins: the right side is materialized and indexed once,
-the left side streams through. The right side is a CTE, a `(SELECT ...)`, a
-table function, or any source a `FROM` reads — a path (`JOIN 'smb://fs/x.xlsx'
-x`, its `WITH (...)` after the alias) or a connection's table (`JOIN
-sr.db.t AS t`), read as `(SELECT * FROM it)` would be. A key is an `=` between
-a value of each side, `AND`-combined for composite keys, written in either
-order; a null key never matches. A key may be computed — `trim(t.code) =
-CAST(x.code AS string)`, each side naming only its own table — and each side
-then computes it before the join, out of sight of `SELECT *`. Keys of two types
-(a spreadsheet's number against a table's text) do not join until one is cast. The
-rest of an `ON` is a condition: one naming only the right side, or no column
-(`1 = 1`), narrows the right side before the join — right for an outer join
-too, and pushed down to a SQL source as that side's `WHERE` — so `JOIN sr.t AS t
-ON t.D_E_L_E_T_ <> '*' AND t.k = x.k` reads only live rows. Any other (the left
-side alone, the two sides compared otherwise than by `=`) filters the joined
-rows, which only an inner join means; another kind says so. `CROSS JOIN <cte>`
-takes no `ON`. Right-side columns that collide with a left name
-come back suffixed `_r`, and `_r2`, `_r3`, … if that name is taken too — that is
-the name `SELECT *` shows. A qualified reference needs no suffix: with `FROM t a
-JOIN r b`, `b.amt` is the right side's `amt` everywhere in the query (`SELECT`,
-`WHERE`, `GROUP BY`, `ORDER BY`, a later join's `ON`), and `SELECT b.amt` calls
-its output `amt` unless `a.amt` is already in the list. A pipeline shaped `read | filters | join | filters |
-write` probes in parallel under `-j` — over local CSV/Parquet morsels, and
-over key-range splits for a splittable SQL source. Since 0.5.8 a chain of joins
-followed by `GROUP BY` fans out the same way (`read | filters | join+ | filters |
-aggregate | sort/limit | write`). Right and full joins stay serial in every case:
-they have to emit the build rows nothing matched, and each lane would emit those
-from its own copy of the match tracking. The build side is fully resident; past 4 GiB the
-run fails fast instead of eating the host — raise the ceiling per join with
-`WITH (max_build = '16GB')` on the join clause, filter the CTE, or flip the
-join.
+Joins are hash equi-joins: the right side is materialized and indexed once, the
+left side streams through. The right side is a CTE, a `(SELECT ...)`, a table
+function, or any source a `FROM` reads — a path (`JOIN 'smb://fs/x.xlsx' x`, its
+`WITH (...)` after the alias) or a connection's table (`JOIN sr.db.t AS t`),
+read as `(SELECT * FROM it)` would be. A key is an `=` between a value of each
+side, `AND`-combined for composite keys, written in either order; a null key
+never matches. A key may be computed — `trim(t.code) = CAST(x.code AS string)`,
+each side naming only its own table — and each side then computes it before the
+join, out of sight of `SELECT *`. Keys of two types (a spreadsheet's number
+against a table's text) do not join until one is cast. The rest of an `ON` is a
+condition: one naming only the right side, or no column (`1 = 1`), narrows the
+right side before the join — right for an outer join too, and pushed down to a
+SQL source as that side's `WHERE` — so `JOIN sr.t AS t ON t.D_E_L_E_T_ <> '*'
+AND t.k = x.k` reads only live rows. Any other (the left side alone, the two
+sides compared otherwise than by `=`) filters the joined rows, which only an
+inner join means; another kind says so. `CROSS JOIN <cte>` takes no `ON`.
+Right-side columns that collide with a left name come back suffixed `_r`, and
+`_r2`, `_r3`, … if that name is taken too — that is the name `SELECT *` shows. A
+qualified reference needs no suffix: with `FROM t a JOIN r b`, `b.amt` is the
+right side's `amt` everywhere in the query (`SELECT`, `WHERE`, `GROUP BY`,
+`ORDER BY`, a later join's `ON`), and `SELECT b.amt` calls its output `amt`
+unless `a.amt` is already in the list. A pipeline shaped `read | filters | join
+| filters | write` probes in parallel under `-j` — over local CSV/Parquet
+morsels, and over key-range splits for a splittable SQL source. Since 0.5.8 a
+chain of joins followed by `GROUP BY` fans out the same way (`read | filters |
+join+ | filters | aggregate | sort/limit | write`). Right and full joins stay
+serial in every case: they have to emit the build rows nothing matched, and each
+lane would emit those from its own copy of the match tracking. The build side is
+fully resident; past 4 GiB the run fails fast instead of eating the host — raise
+the ceiling per join with `WITH (max_build = '16GB')` on the join clause, filter
+the CTE, or flip the join.
 
 ### Window functions
 
@@ -867,11 +899,13 @@ FROM 'movimentos.csv';
   projected: they are carried through hidden and dropped afterwards, so
   `SELECT LAG(v) OVER (PARTITION BY k ORDER BY t) AS prev FROM 't.csv'` returns `prev`
   alone.
-- Several window functions in one `SELECT` may share one `OVER (...)` —
-  `MIN(v) OVER (w), MAX(v) OVER (w)` is fine, and each may frame it its own way (a
-  moving sum beside a running total). A different `PARTITION BY` or `ORDER BY` is
+- Several window functions in one `SELECT` may share one window, each writing the
+  same `PARTITION BY` and `ORDER BY` in its own `OVER (...)` — there is no named
+  `WINDOW` clause — and each may frame it its own way (a moving sum beside a
+  running total). A different `PARTITION BY` or `ORDER BY` is
   refused; write the second as a separate query or wrap the first in a derived table.
-  A window function's argument is a plain column: compute an expression in a CTE first.
+  A window function's argument, and its `PARTITION BY` and `ORDER BY` keys, are plain
+  columns: compute an expression in a CTE first.
 - `MIN`/`MAX` answer a value from the column and keep its type; `AVG` is always a float;
   all of them are nullable, since a peer group of nothing but nulls has no answer.
 - The names are not reserved: a column called `rank` still reads as a column.
@@ -957,9 +991,6 @@ column of the outer query — has no equivalent here and is not planned: it need
 either decorrelation in an optimiser or per-row execution of the inner query, and
 the second is fatal for a streaming engine. Rewrite it as a join — the equality
 correlation `EXISTS` usually carries is exactly `IN` on that key.
-
-Table aliases (`FROM t a`, `JOIN c b`) are stripped at parse time — the engine
-sees bare column names.
 
 Aggregation end to end:
 
@@ -1058,13 +1089,16 @@ duplicates. Two NULLs count as the same value there, unlike in a join's `ON`.
 similar tables needs. It applies to `UNION` only, and a chain is one or the other.
 
 A `BY NAME` branch may be **any query** — a file, a filter, a projection, an
-aggregate — not only `SELECT ['tag' AS c,] t.* FROM <conn>.<table>`. That shape is the reconciliation
-case the feature was built for (N similar tables aligned by name) and it still gets the
-`tag` column and table discovery; a general branch is built like any other pipeline and
-reconciled the same way.
+aggregate — not only `SELECT ['tag' AS c,] t.* FROM <conn>.<table>`. That shape
+is the reconciliation case the feature was built for (N similar tables aligned
+by name) and it still gets the `tag` column and table discovery; a general
+branch is built like any other pipeline and reconciled the same way.
 
-Alignment is **by column name**: NULL-fill missing, drop extra, cast type
-differences — DuckDB's `UNION ALL BY NAME`. `UNION BY NAME` also deduplicates.
+Alignment is **by column name**: NULL-fill missing, drop extra, and widen types
+where one holds the other (an int meeting a float is a float), as DuckDB's
+`UNION ALL BY NAME` does. Unlike DuckDB, types with no common one (a date against
+a string) are an error rather than cast to text: `CAST` one side, or `EXCEPT` the
+column. `UNION BY NAME` also deduplicates.
 
 ```sql
 -- explicit branches: the tag is just a literal column
@@ -1124,7 +1158,8 @@ END FOR;
   nested `FOR EACH ROW OF`, the `CASE` statement, `CALL`, `PRINT`, `EXPLAIN`
   and `THROW`. Declarations — `PARAM`, `LET`, `CREATE CONNECTION`, `CREATE
   FUNCTION` — belong at the top level; `check` and `run` refuse one in a body
-  with the same message.
+  alike. A top-level `CASE` arm may declare a connection, so a script can pick
+  its endpoint per environment; a `PARAM`, `LET` or function there is refused.
 - Loops nest. The inner loop's discovery source is rendered with the outer
   row (`FOR EACH ROW OF (erp.QUERY($$SELECT ... WHERE t = '${name}'$$))`), and
   the inner body sees both rows' variables, the innermost winning a shared
@@ -1199,8 +1234,13 @@ FROM BODY (
 WHERE tipo IN ('leitura', 'alarme');
 ```
 
-- `basalt serve <dir>` hosts every endpoint script, routed by the declared
-  path; `DOC` feeds the startup banner.
+- `basalt serve <dir>` hosts every `*.sql` endpoint script in the folder,
+  routed by the declared path, on port 8080 unless `--port` (`-p` here) says
+  otherwise, listening on every interface unless `--host 127.0.0.1` (or another
+  address) narrows it; `DOC` feeds the startup banner. SIGHUP, or `--watch` on a change,
+  reloads the scripts. `GET /healthz` and `/readyz` answer `200` for a load
+  balancer. `basalt run script.sql --port N` serves a single script the same
+  way.
 - **`FROM BODY (schema)`** declares the request contract. The body (JSON array
   or single object) is validated row by row: a missing/null `NOT NULL` column
   or an unreadable value rejects the request with a message naming the row —
@@ -1241,8 +1281,10 @@ FROM BUFFER 'eventos'
   per segment. The StarRocks label is derived from the segment name
   (`eventos-000042`), so a crash between "loaded" and "marked" replays the
   same label and the sink dedups — effectively exactly-once, no 2PC.
-- Backpressure: buffer disk usage over the limit (1 GiB default) ⇒ `503 +
-  Retry-After` — the client is the queue.
+- Backpressure: buffer disk usage over the limit — `MAX 2 GB` in the clause,
+  1 GiB by default — ⇒ `503 + Retry-After`; the client is the queue. Sizes are
+  written in `KB`, `MB` or `GB`.
+- Without `AT`, segments go to `wal/` under the working directory.
 - **Batch replay**: `FROM BUFFER 'eventos' AT '<dir>'` in a plain batch script
   reads every retained segment — the queue is just another source.
 - Honest cost: `serve` becomes stateful (the WAL directory needs a persistent
@@ -1269,9 +1311,9 @@ columns it has not seen.
   `~`. `^` is xor. `>>` is arithmetic; shift counts `< 0` or `>= 64` yield 0
   (`-1` for `>>` of a negative). Companions: `bit_count() to_hex() from_hex()`.
 - `a || b` — string concat (ANSI), sugar for `concat(a, b)`.
-- `IDENTIFIER(<string-expr>)` — treat a computed string as a table/object name
-  (§7); valid in `FROM`/`LOAD INTO`/upsert-key positions, not general
-  expressions.
+- `IDENTIFIER(<string-expr>)` — treat a computed string as a name (§7): a table
+  or path in `FROM`/`LOAD INTO`, an upsert key, or a column wherever a column
+  may be named.
 - `CASE` expression, both forms:
   `CASE status WHEN 'paid', 'ok' THEN 'done' ELSE 'open' END` ·
   `CASE WHEN amount >= 1000 THEN 'gold' WHEN amount >= 100 THEN 'silver' ELSE 'std' END`
@@ -1434,52 +1476,52 @@ columns it has not seen.
        AND cnpj_dv(left(d, 13), '[6,5,4,3,2,9,8,7,6,5,4,3,2]') = ascii(substr(d, 14, 1)) - 48;
   -- cnpj_valid('11.222.333/0001-81') and cnpj_valid('12.ABC.345/01DE-35') are true
   ```
-- `TRY_CAST(x AS T)` — CAST that yields null instead of failing on a bad
-  value; the workhorse for dirty inputs. Never pushed down.
+- `TRY_CAST(x AS T)` — CAST that yields null instead of failing on a bad value;
+  the workhorse for dirty inputs. Never pushed down.
 - `CAST(x AS TIME)` takes `'HH:MM:SS[.ffffff]'` or `'HH:MM'` text, or a
   timestamp (its time of day).
 - `DATE_TRUNC('minute', ts)` and `EXTRACT(minute FROM ts)` — units `year`,
   `month`, `week`, `day`, `hour`, `minute`, `second`, the same for `DATE_ADD`
   and `DATE_DIFF`. `week` is the ISO week: it starts on Monday
   (`DATE_TRUNC('week', …)` is that Monday at 00:00), `EXTRACT(week …)` numbers
-  it 1–53 with week 1 holding the year's first Thursday, and `DATE_DIFF`
-  counts the Mondays crossed. `check` rejects an unknown unit even over a SQL
-  table whose columns it has not seen. `EXTRACT` also accepts the
-  ordinary two-argument call form. `STRLEN` is an alias for `LENGTH`.
+  it 1–53 with week 1 holding the year's first Thursday, and `DATE_DIFF` counts
+  the Mondays crossed. `check` rejects an unknown unit even over a SQL table
+  whose columns it has not seen. `EXTRACT` also accepts the ordinary
+  two-argument call form.
 - `REGEXP_REPLACE(s, pattern, replacement)` — replaces the first match;
   `\1`…`\9` in the replacement expand to captured groups (`\0` is the whole
   match). A literal pattern is compiled at plan time, so a malformed one fails
   `check`. See §11 for the supported syntax.
-- `CREATE [OR REPLACE] FUNCTION nome(a [TYPE] [DEFAULT <expr>], ...)` — two
-  body forms. `AS <expr>;` is a scalar function, inlined at plan time;
-  recursion and arity mismatches are compile errors, declared types are
-  checked against literal arguments at the call site, defaults fill omitted
-  trailing arguments. A body starting with `LOAD`/`FOR`/`CALL`/`SELECT`/`WITH`/
-  `PRINT`/`THROW`, or with the statement `CASE` (the one closed by `END CASE`),
-  is a **statement function** terminated by `END;` and invoked with
-  `CALL nome(args);` — its params bind like loop variables (`$name`,
-  `IDENTIFIER($name)`, `PUSHDOWN($f)`, `${name}` in strings), rendered per
-  call through the same machinery as a `FOR EACH ROW OF` body. CALL nesting is
-  depth-guarded (16); a statement function is not atomic — a mid-body failure
-  leaves earlier loads committed, exactly as if the statements were inline.
-  Plain re-declaration of a name is an error; `OR REPLACE` is the sanctioned
-  overwrite.
+- `CREATE [OR REPLACE] FUNCTION nome(a [TYPE] [DEFAULT <expr>], ...)` — two body
+  forms. `AS <expr>;` is a scalar function, inlined at plan time; recursion and
+  arity mismatches are compile errors, declared types are checked against
+  literal arguments at the call site, defaults fill omitted trailing arguments.
+  A body starting with `LOAD`/`FOR`/`CALL`/`SELECT`/`WITH`/ `PRINT`/`THROW`, or
+  with the statement `CASE` (the one closed by `END CASE`), is a **statement
+  function** terminated by `END;` and invoked with `CALL nome(args);` — its
+  params bind like loop variables (`$name`, `IDENTIFIER($name)`, `PUSHDOWN($f)`,
+  `${name}` in strings), rendered per call through the same machinery as a `FOR
+  EACH ROW OF` body. CALL nesting is depth-guarded (16); a statement function is
+  not atomic — a mid-body failure leaves earlier loads committed, exactly as if
+  the statements were inline. Plain re-declaration of a name is an error; `OR
+  REPLACE` is the sanctioned overwrite.
 - `CREATE [OR REPLACE] FUNCTION nome(a [TYPE] [DEFAULT <expr>], ...) RETURNS
   TABLE AS <query>;` is a **table function**: a query with parameters, read
   wherever a CTE could be — `FROM nome(args) [alias]`, or the right side of a
-  `JOIN`. Each call is the body with every `$a` replaced by its argument, lowered
-  to a derived table at plan time, so it behaves exactly as if the query were
-  written inline; two calls in one query (even of one function) are independent,
-  `WITH` clauses inside the body included. Without an alias, the function's name
-  qualifies its columns (`paid.id`). Arguments are plan-time constants —
-  literals, `$params`, loop variables, and expressions over them — except
-  under `JOIN LATERAL` (below). Arity, defaults and literal-argument types are checked as for a scalar
-  function, the body is checked where it is declared, and an `@include`d table
-  function is called like a local one. A body may call table functions declared
-  before it; a call that reaches its own function (possible only through `OR
-  REPLACE`) stops at 16 levels. A discovery query — `FOR EACH ROW OF (...)`,
-  `EACH TABLE OF (SELECT ...)` — may call one too, as it may read a derived table
-  or open with `WITH`: their bindings run ahead of the loop.
+  `JOIN`. Each call is the body with every `$a` replaced by its argument,
+  lowered to a derived table at plan time, so it behaves exactly as if the query
+  were written inline; two calls in one query (even of one function) are
+  independent, `WITH` clauses inside the body included. Without an alias, the
+  function's name qualifies its columns (`paid.id`). Arguments are plan-time
+  constants — literals, `$params`, loop variables, and expressions over them —
+  except under `JOIN LATERAL` (below). Arity, defaults and literal-argument
+  types are checked as for a scalar function, the body is checked where it is
+  declared, and an `@include`d table function is called like a local one. A body
+  may call table functions declared before it; a call that reaches its own
+  function (possible only through `OR REPLACE`) stops at 16 levels. A discovery
+  query — `FOR EACH ROW OF (...)`, `EACH TABLE OF (SELECT ...)` — may call one
+  too, as it may read a derived table or open with `WITH`: their bindings run
+  ahead of the loop.
 
   ```sql
   CREATE FUNCTION paid_orders(since DATE, branch STRING DEFAULT '01') RETURNS TABLE AS
@@ -1619,13 +1661,18 @@ same query costs at full parallelism.
 
 ## 10. Running & exit codes
 
+```text
+basalt run      <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json|csv|tsv|arrow] [--max-rows N] [--port N] [--host IP]
+basalt serve    <dir> [--port N] [--host IP] [--watch]
+basalt check    <script>|-|-c "<inline>" [-p key=value ...] [--format json] [--known t1,t2]
+basalt complete <script>|-|-c "<inline>" [--pos N] [--connect] [--utf16]
+basalt repl
+basalt kernel   [--format table|json|csv|tsv|arrow] [-j threads] [--max-rows N]
+basalt version
 ```
-basalt run   <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json|csv|tsv|arrow] [--max-rows N]
-basalt serve <dir> [--port N] [--watch]
-basalt check <script>|-|-c "<inline>" [--format json] [--known t1,t2]
-basalt complete <script>|-|-c "<inline>" --pos N [--connect]
-basalt kernel [--format table|json|csv|tsv|arrow] [-j threads] [--max-rows N]
-```
+
+`run` and `serve` take the log options `--log-level error|warn|info|debug`,
+`--log-format text|json|auto` and `-q`; `kernel` takes the first two.
 
 Options may come before or after the script path, and `-` (the script on
 stdin) may sit anywhere among them: `basalt run --format json job.sql` and
@@ -1646,17 +1693,18 @@ timestamps in microseconds), readable with `pyarrow.ipc.open_stream`,
 valid stream: the schema followed by the end-of-stream marker.
 
 A script with several results writes one stream per result, back to back, and
-each describes itself. Its schema carries `custom_metadata`:
-`basalt.statement` (the result's ordinal in the run, from `0`), `basalt.kind`
-(`select`, `show`, `describe` or `explain`), and `basalt.line` / `basalt.col`
-where the statement starts. Just before its end-of-stream marker comes a
-zero-row record batch whose message metadata holds `basalt.rows`,
-`basalt.elapsed_ms` and `basalt.truncated` — plain Arrow, so a reader that ignores metadata sees the
-same table. pyarrow reads the streams in turn from one file object
-(`ipc.open_stream(f)` until `f` is exhausted; the trailer through
-`read_next_batch_with_custom_metadata`). A statement `EXPLAIN` under arrow is a
-result of its own — one string column, `plan`, a row per line — rather than
-text on stderr, and so is a whole-program `EXPLAIN`.
+each describes itself. Its schema carries `custom_metadata`: `basalt.statement`
+(the result's ordinal in the run, from `0`), `basalt.kind` (`select`, `show`,
+`describe` or `explain`), and `basalt.line` / `basalt.col` where the statement
+starts. Just before its end-of-stream marker comes a zero-row record batch whose
+message metadata holds `basalt.rows`, `basalt.elapsed_ms` and `basalt.truncated`
+— plain Arrow, so a reader that ignores metadata sees the same table. pyarrow
+reads the streams in turn from one file object (`ipc.open_stream(f)` until `f`
+is exhausted; the trailer through `read_next_batch_with_custom_metadata`). A
+statement `EXPLAIN` under arrow is a result of its own — one string column,
+`plan`, a row per line — rather than text on stderr, and so is a whole-program
+`EXPLAIN`.
+
 Logs are stderr-only, plain text, level `warn` by default (`--log-level`,
 `--log-format json`, `-q`).
 
@@ -1677,7 +1725,7 @@ log's shape, with the range an editor underlines — `end_line`/`end_col` are ju
 past the offending text, and absent when the error is about a whole stage — and
 whether a retry could help (`class`, the exit-`75` distinction below):
 
-```
+```json
 {"ts":1790592941244,"level":"error","event":"script_error","msg":"unknown field `nope`",
  "file":"orders.sql","line":2,"col":14,"end_line":2,"end_col":18,"class":"permanent"}
 ```
@@ -1687,33 +1735,34 @@ the `@include`d file the fault is in.
 
 For an editor: `basalt check --format json` prints its diagnostics as a JSON
 array on stdout — `[]` when the script checks out, else one object per error in
-the shape above without `ts`/`event` — and still exits `1` on an error.
-`check` does not stop at the first problem: every statement is checked on its
-own and each that fails is listed, in script order. A statement that does not
-parse is skipped to its `;` and parsing resumes after it — except inside a
-`FOR`, `CASE` or `CREATE FUNCTION` body, whose own `;`s make the statement's end
-unknowable, so the problems after a broken block go unreported until it is
-fixed. `--known enrich,daily` names tables the script reads but does not
-declare — a notebook's other cells — so `FROM enrich` is checked as a table
-whose columns are unknown rather than failing as an unknown source.
-`basalt complete --pos N` prints what Tab would offer at byte offset `N` (the
-end, without `--pos`; `--utf16` counts `N` and the answer in UTF-16 units): `{"start":S,"end":N,"items":[{"text":…,"kind":…,"detail":…}]}`, the
-items replacing `script[S..N]`, with `kind` one of `keyword`, `function`,
-`param`, `cte`, `connection`, `table`, `column`, `path`. `S` is where the word
-under the cursor begins even when nothing matches. `detail`, present only when
-there is one, is a built-in function's signature (`date_add(unit, n, ts)`) or
-a column's type — the engine's for a file, the database's `data_type` for a
-table. A word comes back once: a column named `name` is not offered again as
-the keyword `name`, and a column shadows a function of its name. It completes against
-the script's own declarations, so a script half typed still has its names;
-local files named in it give their columns; connections are asked for their
-tables and columns only under `--connect`, since that is a round trip to each.
+the shape above without `ts`/`event` — and still exits `1` on an error. `check`
+does not stop at the first problem: every statement is checked on its own and
+each that fails is listed, in script order. A statement that does not parse is
+skipped to its `;` and parsing resumes after it — except inside a `FOR`, `CASE`
+or `CREATE FUNCTION` body, whose own `;`s make the statement's end unknowable,
+so the problems after a broken block go unreported until it is fixed. `--known
+enrich,daily` names tables the script reads but does not declare — a notebook's
+other cells — so `FROM enrich` is checked as a table whose columns are unknown
+rather than failing as an unknown source. `basalt complete --pos N` prints what
+Tab would offer at byte offset `N` (the end, without `--pos`; `--utf16` counts
+`N` and the answer in UTF-16 units):
+`{"start":S,"end":N,"items":[{"text":…,"kind":…,"detail":…}]}`, the items
+replacing `script[S..N]`, with `kind` one of `keyword`, `function`, `param`,
+`cte`, `connection`, `table`, `column`, `path`. `S` is where the word under the
+cursor begins even when nothing matches. `detail`, present only when there is
+one, is a built-in function's signature (`date_add(unit, n, ts)`) or a column's
+type — the engine's for a file, the database's `data_type` for a table. A word
+comes back once: a column named `name` is not offered again as the keyword
+`name`, and a column shadows a function of its name. It completes against the
+script's own declarations, so a script half typed still has its names; local
+files named in it give their columns; connections are asked for their tables and
+columns only under `--connect`, since that is a round trip to each.
 
 While a `LOAD` runs, a terminal gets a live line on stderr — what is moving
 where, rows so far, the rate and the clock, with `[3/12]` in front inside a
 `FOR EACH`:
 
-```
+```text
 ⠹ [3/12] erp.dbo.SC5010 → sr.bronze.sc5010  1,204,112 rows  48.3k rows/s  0:24
 ```
 
@@ -1721,7 +1770,7 @@ A run that writes closes with one sentence, and one that has several `LOAD`s
 (more than one statement, or a `FOR EACH` / `CASE` / `CALL`) reports each as it
 finishes — ` +` loaded, ` x` failed, with the reason:
 
-```
+```text
  + sr.bronze.sc5010                      1,204,112 rows    24.1s
  x sr.bronze.sb1010  connection reset by peer
 Loaded 11 of 12 targets, 9,482,004 rows in 3m 12s (49.4k rows/s, 12 lanes)
@@ -1742,21 +1791,21 @@ spared anything: parquet `row_groups` considered and `row_groups_skipped` on
 statistics, `columns_read` of `columns_total` (parquet or Arrow), and
 `sql_filtered_reads`, the SQL reads that carried a pushed filter.
 
-The progress line is drawn only when stderr is a TTY, never under `-q` or `--log-format json`,
-not for a terminal `SELECT` (whose rows go to the same screen), and not for the
-first 400 ms, so short runs stay silent. Under `--log-format json` the line
-becomes an event instead, once a second after those 400 ms, terminal or not —
-what a UI reading the log shows in its place (`--no-progress` and `-q` still
-turn it off):
+The progress line is drawn only when stderr is a TTY, never under `-q` or
+`--log-format json`, not for a terminal `SELECT` (whose rows go to the same
+screen), and not for the first 400 ms, so short runs stay silent. Under
+`--log-format json` the line becomes an event instead, once a second after those
+400 ms, terminal or not — what a UI reading the log shows in its place
+(`--no-progress` and `-q` still turn it off):
 
-```
+```json
 {"ts":…,"level":"info","run_id":…,"event":"progress","target":"erp.dbo.SC5010 → sr.bronze.sc5010","rows":1204112,"rows_per_sec":48300,"elapsed_ms":24930}
 ```
 
-`loop_done`/`loop_total` join it inside a `FOR EACH`. A log or `PRINT` line erases it rather
-than colliding with it, and the run summary replaces it at the end. Piped or
-redirected, stderr carries no control characters at all. `--no-progress` turns
-it off.
+`loop_done`/`loop_total` join it inside a `FOR EACH`. A log or `PRINT` line
+erases it rather than colliding with it, and the run summary replaces it at the
+end. Piped or redirected, stderr carries no control characters at all.
+`--no-progress` turns it off.
 
 `basalt run` prints a terminal `SELECT` whole — every row and every column, in a
 plain left-aligned table — whether stdout is a terminal, a pipe or a file. What
@@ -1768,7 +1817,7 @@ out, cells cut at 40 columns, and `…` for what does not fit — the middle col
 in the manner of pandas, and the middle rows past 40. The footer always gives the
 true size:
 
-```
+```text
  id  customer_name       amount  …  country  last_col
 int  string               float  …  string   string
 ---  ------------------  ------  …  -------  --------
@@ -1803,59 +1852,83 @@ status line says so.
 `basalt repl` executes on a top-level `;` and carries `CREATE CONNECTION` /
 `CREATE FUNCTION` / `PARAM` declarations across entries (re-declaring a name
 replaces it). Meta commands: `\connections` list the session's declarations ·
-`\reset` drop them · `\clear` (or `clear`, `cls`, `^L`) clear the screen · `\format table|json|csv|tsv` switch result output · `\view` scroll, sort
-and filter the last result · `\help` ·
-`\q`.
+`\reset` drop them · `\clear` (or `clear`, `cls`, `^L`) clear the screen ·
+`\format table|json|csv|tsv` switch result output · `\view` scroll, sort and
+filter the last result · `\help` · `\q`. Short forms: `\c` for
+`\connections`, `\e` for `\edit`, `\f` for `\format`, `\v` for `\view`,
+`\source` for `\i`; `\h`, `help` or `?` for help, and `\quit`, `:q`, `quit` or
+`exit` to leave.
 
 The entry is a small text editor rather than a single line, with an editor's
-habits. Enter runs the entry when it ends in a top-level `;` and the cursor is at
-its end; anywhere else it opens a line — and after `(` it steps in and puts the
-`)` on a line of its own. Ctrl+J runs the entry as it
-stands, `;` or not (Ctrl+Enter too, where the terminal delivers it). Brackets and quotes close themselves, typing the closer
-steps over it, and over a selection they wrap it; the matching bracket is
-underlined. Alt+Up/Down move the line or selected lines, Shift+Alt+Up/Down
-duplicate them, Tab and Shift+Tab indent and dedent a selection, Ctrl+/ comments
-lines out with `--` and back in, Esc drops the selection. The entry is coloured
-as you type (keywords, strings, numbers, comments, `$params`; `NO_COLOR` turns
-it off), a multi-line entry gets line numbers in its gutter, and a parse error
-is shown with a caret under the column it names.
+habits. Enter runs the entry when it ends in a top-level `;` and the cursor is
+at its end; anywhere else it opens a line — and after `(` it steps in and puts
+the `)` on a line of its own. Ctrl+J runs the entry as it stands, `;` or not
+(Ctrl+Enter too, where the terminal delivers it). Brackets and quotes close
+themselves, typing the closer steps over it, and over a selection they wrap it;
+the matching bracket is underlined. Alt+Up/Down move the line or selected lines,
+Shift+Alt+Up/Down duplicate them, Tab and Shift+Tab indent and dedent a
+selection, Ctrl+/ comments lines out with `--` and back in, Esc drops the
+selection. The entry is coloured as you type (keywords, strings, numbers,
+comments, `$params`; `NO_COLOR` turns it off), a multi-line entry gets line
+numbers in its gutter, and a parse error is shown with a caret under the column
+it names.
 
 `\connect [type]` makes a connection with a form: the type picked from a list
 (↑/↓, its number, or the first letters of its name), then the fields its
-connector needs on one screen — host with the type's usual port, database,
-user, password (blank means the `env(NAME_USER)` / `env(NAME_PASS)` convention;
+connector needs on one screen — host with the type's usual port, database, user,
+password (blank means the `env(NAME_USER)` / `env(NAME_PASS)` convention;
 `env:VAR` names another variable). ↑/↓ and Tab move between fields, ←/→ turn a
 choice such as `tls` or `auth`, a field edits with the entry's own keys, Enter
 goes on and submits from the last field, Esc cancels with nothing made. A field
 only some answers need, such as the Kerberos `realm`, shows only then. It shows
 the `CREATE CONNECTION` it built (a typed password masked), registers it, and
-offers to reach it and to save it to the startup file. `^R` searches the history incrementally (type to narrow, `^R` for an older
-match, Enter keeps it). A session starts by running `~/.config/basalt/repl.sql`
-(or `$XDG_CONFIG_HOME/basalt/repl.sql`) when it exists — the place for the
+offers to reach it and to save it to the startup file. `^R` searches the history
+incrementally (type to narrow, `^R` for an older match, Enter keeps it). A
+session starts by running `~/.config/basalt/repl.sql` (or
+`$XDG_CONFIG_HOME/basalt/repl.sql`) when it exists — the place for the
 connections you always want, with `env()` for the secrets — and `\save` writes
-the session's declarations there (or to a named file); `\i <file>` runs any
-file so its declarations join the session; `\connections` shows them as a
-table with host, database and whether the session has reached them (`\c test`
-reaches each now); `\edit` opens the last entry in `$EDITOR` and runs what
-comes back.
+the session's declarations there (or to a named file); `\i <file>` runs any file
+so its declarations join the session; `\connections` shows them as a table with
+host, database and whether the session has reached them (`\c test` reaches each
+now); `\edit` opens the last entry in `$EDITOR` and runs what comes back.
 
 Tab completes the word under the cursor: keywords (in the case you are typing),
 the session's connections, functions and `$params`, the entry's CTEs, a path
 inside an unclosed quote, `conn.` followed by that connection's tables, the
 columns of every table and file the entry names, and the built-in functions —
-scalar, aggregate and window. Tables and columns are asked
-of the source once per session, on first use, through the same
-`information_schema` queries `SHOW TABLES` and `DESCRIBE` run. A lone match is
-taken; several fill in what they share and come up as a row of choices that
-Tab cycles through. Arrows travel the whole entry — Ctrl+arrows by word, Home/End the line,
-Ctrl+Home/End the entry — and Up or Down past its edge recall history, where an
-entry comes back whole however many lines it had (`~/.basalt_history`). Shift
-with any of those selects; typing, Backspace and Delete replace the selection.
-`^A` selects all, `^C` copies a selection (and drops the entry when there is
-none), `^X` cuts, `^V` pastes, `^Z`/`^Y` undo and redo. A paste is inserted as
-text, never run line by line, and a copy reaches the system clipboard where the
-terminal supports OSC 52. Two things a terminal cannot deliver: the mouse, and
+scalar, aggregate and window. Tables and columns are asked of the source once
+per session, on first use, through the same `information_schema` queries `SHOW
+TABLES` and `DESCRIBE` run. A lone match is taken; several fill in what they
+share and come up as a row of choices that Tab cycles through. Arrows travel the
+whole entry — Ctrl+arrows by word, Home/End the line, Ctrl+Home/End the entry —
+and Up or Down past its edge recall history, where an entry comes back whole
+however many lines it had (`~/.basalt_history`). Shift with any of those
+selects; typing, Backspace and Delete replace the selection. `^A` selects all,
+`^C` copies a selection (and drops the entry when there is none), `^X` cuts,
+`^V` pastes, `^Z`/`^Y` undo and redo. A paste is inserted as text, never run
+line by line, and a copy reaches the system clipboard where the terminal
+supports OSC 52. Two things a terminal cannot deliver: the mouse, and
 Ctrl+Enter, which arrives as plain Enter.
+
+### Exit codes
+
+| code | meaning |
+|------|---------|
+| `0`  | success |
+| `1`  | permanent failure (bad script, data/schema error) — maps to HTTP 422 |
+| `2`  | a malformed command line: an unknown command or option, or a bad option value |
+| `75` | transient (`EX_TEMPFAIL`) — safe to retry — maps to HTTP 503 |
+| `130`| aborted (SIGINT) |
+
+Transient means the network or the peer failed, not the script: a refused,
+reset or timed-out connection, a failed name lookup, an HTTP 429/5xx, and a
+database that closed the connection or failed on its socket — during login
+(a server turning connections away under a burst of parallel logins) or
+mid-query (`ServerClosedConnection`, `ConnectionIoFailed`). Past an HTTP
+source's in-place backoff and a SQL sink's one reconnect mid-write, basalt does
+not retry: the exit code hands the decision to whatever scheduled the run. A
+`FOR EACH` whose failed items are all transient exits `75` too. The same
+end-of-file or write failure on a local file stays permanent.
 
 ### `basalt kernel` — a session for a notebook or editor
 
@@ -1873,7 +1946,7 @@ however its source changes. Declare it again to recompute it. The REPL keeps
 
 Requests are NDJSON on stdin, one object per line:
 
-```
+```text
 {"op":"run","id":"c1","script":"SELECT ...;","params":{"days":7},"format":"arrow"}
 {"op":"cancel","id":"c1"}     stop the running script; the session survives
 {"op":"complete","id":"c2","script":"SELECT erp.","pos":11}
@@ -1919,7 +1992,7 @@ together, and an Arrow reader that cannot read streams in turn gets one stream
 at a time. Exactly one `status` closes each request, listing the results again,
 and nothing for that request follows it:
 
-```
+```text
 {"type":"data","id":"c1","len":1184}
 <1184 bytes>
 {"type":"result","id":"c1","statement":0,"kind":"select","line":2,"col":1,"rows":12,"elapsed_ms":40,"truncated":false}
@@ -1937,7 +2010,7 @@ outermost loop finished, and rows in all — the terminal's `[3/12]`.
 Each `LOAD` sends a `load` frame as it finishes, written or failed, in the
 order they finish — what the CLI's ` + target` and ` x target` lines say:
 
-```
+```json
 {"type":"load","id":"c3","load":0,"target":"/tmp/a.parquet","line":1,"col":1,"rows_read":30000000,
  "rows_written":30000000,"elapsed_ms":3270,"lanes":12,"ok":true}
 {"type":"load","id":"c3","load":1,"target":"sr.bronze.x","line":2,"col":1,"rows_read":0,"rows_written":0,
@@ -1960,6 +2033,7 @@ run's totals: `loads_ok`, `loads_failed`, `rows_read`, `rows_loaded` and
 `lanes`, the facts of the CLI's closing sentence (`Loaded 11 of 12 targets,
 9,482,004 rows in 3m 12s (49.3k rows/s, 12 lanes)`). A failed or cancelled
 run carries them too, for the loads that ran before it stopped.
+
 A result's `line`/`col` count in the script as sent, as its Arrow metadata
 does; `truncated` says a row cap cut it, and the status's `truncated` says any
 result was. `declared` lists what the script added to the session — a script's
@@ -1968,27 +2042,12 @@ cleanly. An error's `line`/`col` count in the script as sent; `file` is
 `script`, an `@include`d file's path, or `session` when the fault lies in a
 declaration an earlier script made. `end_line`/`end_col`, when present, end
 the offending name, as under `--log-format json`. `transient` is the exit-`75`
-class below.
+class above.
+
 Results written before a failing statement are still delivered. Logs and
 `PRINT` stay on stderr (`--log-level`, `--log-format`); the item lines and
 the per-run summary are left out — the `load` frames and the status carry
 them.
-
-| code | meaning |
-|------|---------|
-| `0`  | success |
-| `1`  | permanent failure (bad script, data/schema error) — maps to HTTP 422 |
-| `75` | transient (`EX_TEMPFAIL`) — safe to retry — maps to HTTP 503 |
-| `130`| aborted (SIGINT) |
-
-Transient means the network or the peer failed, not the script: a refused,
-reset or timed-out connection, a failed name lookup, an HTTP 429/5xx, and a
-database that closed the connection or failed on its socket — during login
-(a server turning connections away under a burst of parallel logins) or
-mid-query (`ServerClosedConnection`, `ConnectionIoFailed`). Past an HTTP
-source's in-place backoff and a SQL sink's one reconnect mid-write, basalt does
-not retry: the exit code hands the decision to whatever scheduled the run. A `FOR EACH` whose failed items are all transient exits `75` too. The same
-end-of-file or write failure on a local file stays permanent.
 
 ## 11. Designed but not yet implemented
 
@@ -1999,8 +2058,9 @@ Accepted design not yet in the engine:
   most — before it, a join meant *no* predicate descended at all and a query over
   an 80M-row table read the whole thing. What is still missing: a multi-stage CTE
   that is entirely one connection is not collapsed into a single descended query,
-  aggregates and joins are never pushed into the source the way Trino's
-  `applyAggregation`/`applyJoin` do, and there is no runtime/dynamic filter — the
+  an aggregate descends only in the whole-aggregate shape (§5) and a join never
+  does (Trino's `applyAggregation`/`applyJoin` are more general), and there is no
+  runtime/dynamic filter — the
   build side's key values are not sent back to the probe scan, so a selective
   predicate on a *non-key* dimension column still reads the whole fact table.
   And a filter on a join's right side by a bare name (`WHERE valor > 0` rather
@@ -2013,6 +2073,8 @@ Deliberately partial:
   character classes with ranges and negation, capturing and non-capturing
   groups, the escapes `\d \w \s` (and their negations), the quantifiers
   `* + ?` and counted `{n} {n,} {n,m}` — each greedy, or lazy with a `?`
-  suffix (`*?`, `{2,4}?`). Lookaround and backreferences inside the pattern
-  are **rejected at compile time** rather than read as literal characters, so
-  an unsupported pattern is an error and never a silently wrong match.
+  suffix (`*?`, `{2,4}?`), and `\n \t \r` and an escaped punctuation character
+  (`\.`, `\$`). Lookaround, backreferences (`\1`) and every other letter or
+  digit escape (`\b`, `\A`) are **rejected at compile time** rather than read as
+  literal characters, so an unsupported pattern is an error and never a silently
+  wrong match.
