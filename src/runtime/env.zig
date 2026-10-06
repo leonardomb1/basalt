@@ -268,6 +268,7 @@ pub const Env = struct {
     buffer_decl: ?ast.BufferDecl = null,
     buffer_segment: ?u64 = null,
     load_label_prefix: ?[]const u8 = null,
+    sink_label_prefix: ?[]const u8 = null,
     load_run_id: ?u64 = null,
     sql_desc: ?SqlDesc = null,
     csv_in: csv.Dialect = .{},

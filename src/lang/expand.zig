@@ -11,8 +11,9 @@
 //! `ExpandFailed` with a message.
 //!
 //! The same pass replaces `$p.a.b` refs to `json` params with literals of the
-//! resolved scalar, parsing the request body once (a bare `p.a` is a column of a
-//! table aliased `p`). Offline, with no body, such refs become `null`.
+//! resolved scalar, parsing the param's JSON once: a `-p` value, else the request
+//! body, else a string DEFAULT (a bare `p.a` is a column of a table aliased `p`).
+//! Offline, with none of them, such refs become `null`.
 //!
 //! Depth alone does not bound the work: `f(x) = g(x) + g(x)` doubles per level, so
 //! a 64-deep chain is 2^64 nodes, hence the `max_nodes` cap on the total.
@@ -39,7 +40,16 @@ const Ctx = struct {
 
 const Subst = std.StringHashMap(*ast.Expr);
 
+/// A JSON PARAM's value given as text, by `-p name=...` or a kernel's `params`.
+pub const JsonArg = struct { name: []const u8, text: []const u8 };
+
 pub fn expandProgram(arena: std.mem.Allocator, program: ast.Program, body: ?[]const u8, msg: *[]const u8) Error!ast.Program {
+    return expandProgramWith(arena, program, body, &.{}, msg);
+}
+
+/// A JSON PARAM binds from its `args` text first, then the request body, then a string
+/// DEFAULT; with none of them (offline `check`) its paths read as null.
+pub fn expandProgramWith(arena: std.mem.Allocator, program: ast.Program, body: ?[]const u8, args: []const JsonArg, msg: *[]const u8) Error!ast.Program {
     var fns = std.StringHashMap(ast.FnDecl).init(arena);
     for (program.stmts) |s| if (s == .func) {
         if (builtins.lookup(s.func.name) != null or parser.isAggName(s.func.name)) {
@@ -64,7 +74,16 @@ pub fn expandProgram(arena: std.mem.Allocator, program: ast.Program, body: ?[]co
             msg.* = "invalid JSON in request body";
             return error.ExpandFailed;
         };
-        for (program.stmts) |s| if (s == .param and s.param.is_json) try json.put(s.param.name, parsed);
+        for (program.stmts) |s| if (s == .param and s.param.is_json) {
+            var val = parsed;
+            if (val == null) if (s.param.default) |d| if (d.* == .str_lit) {
+                val = parseJsonArg(arena, s.param.name, d.str_lit, msg) catch |e| return e;
+            };
+            for (args) |arg| if (std.mem.eql(u8, arg.name, s.param.name)) {
+                val = parseJsonArg(arena, s.param.name, arg.text, msg) catch |e| return e;
+            };
+            try json.put(s.param.name, val);
+        };
     }
 
     var cx = Ctx{ .arena = arena, .fns = &fns, .json = &json, .msg = msg };
@@ -91,7 +110,6 @@ fn expandStmt(cx: *Ctx, s: ast.Stmt) Error!ast.Stmt {
         .for_each => |fe| blk: {
             var body = std.array_list.Managed(ast.Stmt).init(cx.arena);
             for (fe.body) |st| {
-                if (st == .func) continue;
                 try body.append(try expandStmt(cx, st));
             }
             const source: ast.ForSource = switch (fe.source) {
@@ -114,7 +132,7 @@ fn expandStmt(cx: *Ctx, s: ast.Stmt) Error!ast.Stmt {
             .when = if (t.when) |w| try expandExpr(cx, w, null, 0) else null,
             .pos = t.pos,
         } },
-        .func => |fd| .{ .func = .{
+        .func => |fd| if (fd.body != .stmts) s else .{ .func = .{
             .name = fd.name,
             .params = fd.params,
             .body = .{ .stmts = try expandBlock(cx, fd.body.stmts) },
@@ -232,12 +250,18 @@ fn expandStmtMatch(cx: *Ctx, m: ast.StmtMatch) Error!ast.StmtMatch {
         const guard = if (arm.guard) |g| try expandExpr(cx, g, null, 0) else null;
         var body = std.array_list.Managed(ast.Stmt).init(cx.arena);
         for (arm.body) |st| {
-            if (st == .func) continue;
             try body.append(try expandStmt(cx, st));
         }
         arms[i] = .{ .pats = pats, .guard = guard, .body = try body.toOwnedSlice(), .is_default = arm.is_default };
     }
     return .{ .subject = subject, .arms = arms, .pos = m.pos };
+}
+
+fn parseJsonArg(arena: std.mem.Allocator, name: []const u8, text: []const u8, msg: *[]const u8) Error!std.json.Value {
+    return std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch {
+        msg.* = std.fmt.allocPrint(arena, "param `{s}`: value is not valid JSON", .{name}) catch "param value is not valid JSON";
+        return error.ExpandFailed;
+    };
 }
 
 fn mk(cx: *Ctx, e: ast.Expr) Error!*ast.Expr {
@@ -653,6 +677,28 @@ test "expandProgram substitutes JSON-param path access from the body" {
     try std.testing.expectEqualStrings("203.0.113.9", sel[0].computed.expr.str_lit);
     try std.testing.expect(sel[1].computed.expr.* == .int_lit);
     try std.testing.expectEqual(@as(i64, 7), sel[1].computed.expr.int_lit);
+}
+
+test "a JSON param binds from a -p value before the body, and from a string DEFAULT" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a, "PARAM job JSON;\nPARAM cfg JSON DEFAULT '{\"n\":9}';\n" ++
+        "SELECT $job.a.b AS b, $cfg.n AS n FROM 'x';", &diag);
+    var msg: []const u8 = "";
+    const out = try expandProgramWith(a, prog, null, &.{.{ .name = "job", .text = "{\"a\":{\"b\":\"cli\"}}" }}, &msg);
+    const sel = outputSelect(out);
+    try std.testing.expectEqualStrings("cli", sel[0].computed.expr.str_lit);
+    try std.testing.expectEqual(@as(i64, 9), sel[1].computed.expr.int_lit);
+
+    const body = "{\"a\":{\"b\":\"body\"},\"n\":1}";
+    const both = try expandProgramWith(a, prog, body, &.{.{ .name = "job", .text = "{\"a\":{\"b\":\"cli\"}}" }}, &msg);
+    try std.testing.expectEqualStrings("cli", outputSelect(both)[0].computed.expr.str_lit);
+    try std.testing.expectEqual(@as(i64, 1), outputSelect(both)[1].computed.expr.int_lit);
+
+    try std.testing.expectError(error.ExpandFailed, expandProgramWith(a, prog, null, &.{.{ .name = "job", .text = "{bad" }}, &msg));
+    try std.testing.expect(std.mem.indexOf(u8, msg, "not valid JSON") != null);
 }
 
 test "?. safe navigation: a missing intermediate resolves to null instead of erroring" {

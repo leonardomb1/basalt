@@ -16,6 +16,7 @@ const run = basalt.runtime.run;
 const runScript = @import("harness.zig").runScript;
 const checkAndRun = @import("harness.zig").checkAndRun;
 const expectFile = @import("harness.zig").expectFile;
+const expectRefusedAlike = @import("harness.zig").expectRefusedAlike;
 
 /// Points fd 2 at a file in `dir` until `end`, which restores it and returns what
 /// was written there — where `PRINT`, an `EXPLAIN` statement's plan and the run
@@ -1176,4 +1177,40 @@ test "check validates a literal date unit or strftime format where the columns' 
             try std.testing.expect(std.mem.indexOf(u8, d.msg, want) != null);
         } else _ = try analyze.analyze(a, prog, &d);
     }
+}
+
+test "check and run refuse alike: a declaration in a body or CASE arm, an unknown connection type, a USING with nothing to name, a sink encoding, APPEND to a server file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.csv", .data = "x\n1\n" });
+    const cases = [_][2][]const u8{
+        .{ "FOR EACH ROW OF ('$B/a.csv') AS (x)\n  CREATE FUNCTION f(v) AS v;\n  LOAD INTO '$B/o.csv' AS SELECT 1 AS a;\nEND FOR;", "may contain only" },
+        .{ "CASE WHEN 1 = 1 THEN PARAM z INT; END CASE;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "PARAM `z` must be declared at the top level" },
+        .{ "CASE WHEN 1 = 1 THEN CREATE FUNCTION f(v) AS v; END CASE;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "function `f` must be declared at the top level" },
+        .{ "CREATE CONNECTION x TYPE foo OPTIONS (host = 'h');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "unknown connection type `foo`" },
+        .{ "LOAD INTO '$B/o.csv' USING stream_load AS SELECT 1 AS a;", "only a starrocks or doris target" },
+        .{ "LOAD INTO '$B/o.csv' WITH (encoding = 'latin1') AS SELECT * FROM '$B/a.csv';", "a CSV sink always writes UTF-8" },
+        .{ "LOAD INTO 'smb://fs/share/o.csv' APPEND AS SELECT 1 AS a;", "renamed over the target" },
+    };
+    for (cases) |c| try expectRefusedAlike(alloc, &tmp, c[0], c[1]);
+}
+
+test "a JSON PARAM's paths bind from -p in a batch run, a missing key is an error, a string DEFAULT is the fallback" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.fmt.allocPrint(alloc,
+        \\PARAM job JSON;
+        \\PARAM cfg JSON DEFAULT '{{"n":9}}';
+        \\LOAD INTO '{s}/out.csv' AS SELECT $job.a.b AS b, $job.n + $cfg.n AS n;
+    , .{base});
+    defer alloc.free(script);
+    const got = try runScript(alloc, &tmp, script, &.{.{ .key = "job", .val = "{\"a\":{\"b\":\"x\"},\"n\":5}" }});
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("b,n\nx,14\n", got);
+
+    try std.testing.expectError(error.PlanFailed, runScript(alloc, &tmp, script, &.{.{ .key = "job", .val = "{\"n\":5}" }}));
 }

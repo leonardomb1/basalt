@@ -11,6 +11,7 @@ const ParamArg = basalt.env.ParamArg;
 const run = basalt.runtime.run;
 const runToString = @import("harness.zig").runToString;
 const runScript = @import("harness.zig").runScript;
+const expectRefusedAlike = @import("harness.zig").expectRefusedAlike;
 
 test "read a semicolon latin-1 file end to end" {
     const alloc = std.testing.allocator;
@@ -315,4 +316,16 @@ test "copying a parquet with nested columns keeps every one of them" {
             "4,\"[{\"\"a\"\":2,\"\"b\"\":\"\"y\"\"}]\",\"{\"\"z\"\":2}\"\n",
         out,
     );
+}
+
+/// A stored zip whose one member, `p.parquet`, holds `x`: the refusal comes from the
+/// member's name, before anything reads it.
+const parquet_member_zip = "\x50\x4b\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00\x21\x5c\x83\x16\xdc\x8c\x01\x00\x00\x00\x01\x00\x00\x00\x09\x00\x00\x00\x70\x2e\x70\x61\x72\x71\x75\x65\x74\x78\x50\x4b\x01\x02\x14\x03\x14\x00\x00\x00\x00\x00\x00\x00\x21\x5c\x83\x16\xdc\x8c\x01\x00\x00\x00\x01\x00\x00\x00\x09\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00\x70\x2e\x70\x61\x72\x71\x75\x65\x74\x50\x4b\x05\x06\x00\x00\x00\x00\x01\x00\x01\x00\x37\x00\x00\x00\x28\x00\x00\x00\x00\x00";
+
+test "a parquet inside a zip is refused by run as by check" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "pz.zip", .data = parquet_member_zip });
+    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/pz.zip :: p.parquet';", "parquet needs random access");
 }

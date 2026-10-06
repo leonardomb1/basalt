@@ -168,7 +168,7 @@ pub const appendUnsupported = @import("analyze/render.zig").appendUnsupported;
 const sinkKind = @import("analyze/render.zig").sinkKind;
 pub const FileFormat = @import("analyze/targets.zig").FileFormat;
 pub const readFormat = @import("analyze/targets.zig").readFormat;
-const hintText = @import("analyze/targets.zig").hintText;
+pub const hintText = @import("analyze/targets.zig").hintText;
 pub const dialectFromHints = @import("analyze/targets.zig").dialectFromHints;
 pub const formatFromHints = @import("analyze/targets.zig").formatFromHints;
 pub const xlsxOptions = @import("analyze/targets.zig").xlsxOptions;
@@ -346,7 +346,9 @@ pub fn analyzeOpts(arena: std.mem.Allocator, raw_program: ast.Program, opts: Opt
 fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Options, diag: *Diag) error{ AnalyzeFailed, OutOfMemory }!Plan {
     const cli = opts.overrides;
     var expand_msg: []const u8 = "";
-    const program = expand.expandProgram(arena, raw_program, null, &expand_msg) catch |e| switch (e) {
+    const json_args = try arena.alloc(expand.JsonArg, cli.len);
+    for (cli, json_args) |o, *ja| ja.* = .{ .name = o.name, .text = o.value };
+    const program = expand.expandProgramWith(arena, raw_program, null, json_args, &expand_msg) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ExpandFailed => return fail(diag, "{s}", .{expand_msg}),
     };
@@ -356,7 +358,14 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
 
     var bindings = std.StringHashMap(ast.Pipeline).init(arena);
     var connections = std.StringHashMap(ast.Connection).init(arena);
-    for (program.stmts[1..]) |s| if (s == .connection) try connections.put(s.connection.name, s.connection);
+    for (program.stmts[1..]) |s| if (s == .connection) {
+        if (!isConnectionType(s.connection.connector)) {
+            const e = fail(diag, "unknown connection type `{s}` (one of {s})", .{ s.connection.connector, connection_types });
+            diag.pos = s.connection.pos;
+            return e;
+        }
+        try connections.put(s.connection.name, s.connection);
+    };
     if (!opts.declarations_only and countOutputs(program.stmts[1..]) == 0)
         return fail(diag, "no output pipeline (a pipeline ending in `write`)", .{});
 
@@ -564,9 +573,12 @@ const Ctx = struct {
             .explain => |e| if (try self.attempt(self.analyzeOutput(e.pipeline))) |o| try outs.append(o),
             .for_each => |fe| try self.checkBody(fe.body, outs),
             .match => |m| for (m.arms) |arm| try self.checkStmts(arm.body, outs, false),
-            .func => |fd| if (fd.body == .stmts) try self.checkBody(fd.body.stmts, outs),
+            .func => |fd| if (!top)
+                try self.note(self.failAt(fd.pos, "function `{s}` must be declared at the top level of the script", .{fd.name}))
+            else if (fd.body == .stmts) try self.checkBody(fd.body.stmts, outs),
             .let_const => |l| if (!top) try self.note(self.failAt(l.pos, "LET `{s}` must be declared at the top level of the script", .{l.name})),
-            .param, .kind, .connection, .call, .throw, .print => {},
+            .param => |pd| if (!top) try self.note(self.failAt(pd.pos, "PARAM `{s}` must be declared at the top level of the script", .{pd.name})),
+            .kind, .connection, .call, .throw, .print => {},
         };
     }
 
@@ -745,26 +757,13 @@ const Ctx = struct {
 
     fn resolveSink(self: *Ctx, w: ast.Write, hints: []const ast.Hint) !Sink {
         if (std.mem.eql(u8, w.connector, "csv") or std.mem.eql(u8, w.connector, "stdout")) {
-            if (s3.bucketNameError(w.target)) |why|
-                return fail(self.diag, "`{s}` is not a valid S3 target: {s}", .{ w.target, why });
-            if (std.mem.eql(u8, w.connector, "csv") and w.target.len > 0) {
-                const fmt = try formatFromHints(hints, self.diag);
-                if (unwritableTarget(w.target, fmt) orelse unreadableTarget(w.target, fmt)) |why|
-                    return fail(self.diag, "cannot write `{s}`: {s}", .{ w.target, why });
-                if ((fmt orelse formatOfPath(w.target)) == .xlsx)
-                    return fail(self.diag, "cannot write `{s}`: basalt reads Excel workbooks but does not write them; write a `.csv` or `.parquet`", .{w.target});
-            }
-            _ = try dialectFromHints(hints, self.diag);
-            if (hintText(hints, "encoding") != null)
-                return fail(self.diag, "`encoding` applies to a read; a CSV sink always writes UTF-8", .{});
-            if (w.mode == .append) {
-                if (appendUnsupported(w.target)) |why|
-                    return fail(self.diag, "`APPEND` into `{s}` is not supported: {s}", .{ w.target, why });
-            }
+            try checkFileSink(w, hints, self.diag);
+            try checkSinkForm(w, w.connector, self.diag);
             return .{ .connector = w.connector, .target = w.target, .mode = @tagName(w.mode) };
         }
         const conn = self.connections.get(w.connector) orelse
             return fail(self.diag, "unknown connection `{s}` in write", .{w.connector});
+        try checkSinkForm(w, conn.connector, self.diag);
         return .{ .connector = conn.connector, .target = w.target, .mode = @tagName(w.mode) };
     }
 
@@ -943,6 +942,45 @@ const Ctx = struct {
         return buf.toOwnedSlice();
     }
 };
+
+/// What a file or stdout sink is refused for, shared by `check` and the run's
+/// planner so the two can never disagree about a target.
+pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!void {
+    if (s3.bucketNameError(w.target)) |why|
+        return fail(diag, "`{s}` is not a valid S3 target: {s}", .{ w.target, why });
+    if (std.mem.eql(u8, w.connector, "csv") and w.target.len > 0) {
+        const fmt = try formatFromHints(hints, diag);
+        if (unwritableTarget(w.target, fmt) orelse unreadableTarget(w.target, fmt)) |why|
+            return fail(diag, "cannot write `{s}`: {s}", .{ w.target, why });
+        if ((fmt orelse formatOfPath(w.target)) == .xlsx)
+            return fail(diag, "cannot write `{s}`: basalt reads Excel workbooks but does not write them; write a `.csv` or `.parquet`", .{w.target});
+    }
+    _ = try dialectFromHints(hints, diag);
+    if (hintText(hints, "encoding") != null)
+        return fail(diag, "`encoding` applies to a read; a CSV sink always writes UTF-8", .{});
+    if (w.mode == .append) {
+        if (appendUnsupported(w.target)) |why|
+            return fail(diag, "`APPEND` into `{s}` is not supported: {s}", .{ w.target, why });
+    }
+}
+
+/// `USING` names a load path, and only StarRocks and Doris have one to name.
+pub fn checkSinkForm(w: ast.Write, connector: []const u8, diag: *Diag) Error!void {
+    const form = w.form orelse return;
+    const stream = if (registry.Connector.parse(connector)) |c| c.streamLoad() else false;
+    if (stream and std.mem.eql(u8, form, "stream_load")) return;
+    if (stream) return fail(diag, "unknown load path `USING {s}`; a {s} target loads by `stream_load`", .{ form, connector });
+    return fail(diag, "`USING {s}` does not apply here: only a starrocks or doris target takes `USING stream_load`", .{form});
+}
+
+pub const connection_types = "http, postgres, mysql, sqlserver, starrocks, doris, sftp, smb";
+
+/// A `CREATE CONNECTION ... TYPE` that names a connector; the built-in sources
+/// (files, `range`, a request body) are never declared.
+pub fn isConnectionType(connector: []const u8) bool {
+    const c = registry.Connector.parse(connector) orelse return false;
+    return !c.isBuiltinSource() or c == .http;
+}
 
 fn isBuiltinSource(connector: []const u8) bool {
     const c = registry.Connector.parse(connector) orelse return false;

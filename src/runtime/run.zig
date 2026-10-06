@@ -156,7 +156,9 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     const arena = plan_arena.allocator();
 
     var expand_msg: []const u8 = "";
-    const program = expand.expandProgram(arena, raw_program, opts.request_body, &expand_msg) catch |e| switch (e) {
+    const json_args = try arena.alloc(expand.JsonArg, opts.params.len);
+    for (opts.params, json_args) |kv, *ja| ja.* = .{ .name = kv.key, .text = kv.val };
+    const program = expand.expandProgramWith(arena, raw_program, opts.request_body, json_args, &expand_msg) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.ExpandFailed => return planErr(diag, expand_msg),
     };
@@ -196,7 +198,14 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var fns = std.StringHashMap(ast.FnDecl).init(arena);
     var runnable: usize = 0;
     for (program.stmts[1..]) |s| switch (s) {
-        .connection => |c| try connections.put(c.name, c),
+        .connection => |c| {
+            if (!analyze.isConnectionType(c.connector)) {
+                const e = planErr(diag, try std.fmt.allocPrint(arena, "unknown connection type `{s}` (one of {s})", .{ c.connector, analyze.connection_types }));
+                diag.pos = c.pos;
+                return e;
+            }
+            try connections.put(c.name, c);
+        },
         .func => |fd| try fns.put(fd.name, fd),
         .print, .binding => {},
         .output, .for_each, .match, .call, .explain => runnable += 1,
@@ -394,8 +403,22 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
             try registerSftp(env, c);
             try registerSmb(env, c);
         },
-        .let_const => |l| return planErr(env.diag, try std.fmt.allocPrint(env.arena, "LET `{s}` must be declared at the top level of the script", .{l.name})),
-        .param, .kind, .func => {},
+        .let_const => |l| {
+            const e = planErr(env.diag, try std.fmt.allocPrint(env.arena, "LET `{s}` must be declared at the top level of the script", .{l.name}));
+            env.diag.pos = l.pos;
+            return e;
+        },
+        .param => |pd| {
+            const e = planErr(env.diag, try std.fmt.allocPrint(env.arena, "PARAM `{s}` must be declared at the top level of the script", .{pd.name}));
+            env.diag.pos = pd.pos;
+            return e;
+        },
+        .func => |fd| {
+            const e = planErr(env.diag, try std.fmt.allocPrint(env.arena, "function `{s}` must be declared at the top level of the script", .{fd.name}));
+            env.diag.pos = fd.pos;
+            return e;
+        },
+        .kind => {},
     }
 }
 

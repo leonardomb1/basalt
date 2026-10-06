@@ -230,6 +230,18 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         try guardFileFormat(env, stages[0].node.read.form.path, env.fmt_in, "read");
     if (std.mem.eql(u8, last.write.connector, "csv") and last.write.target.len > 0)
         try guardFileFormat(env, last.write.target, env.fmt_out, "write");
+    const is_file_sink = std.mem.eql(u8, last.write.connector, "csv") or std.mem.eql(u8, last.write.connector, "stdout");
+    if (is_file_sink)
+        analyze.checkFileSink(last.write, stages[stages.len - 1].hints, &ddiag) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            error.AnalyzeFailed => return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg)),
+        };
+    const sink_connector = if (is_file_sink) last.write.connector else if (env.connections.get(last.write.connector)) |c| c.connector else last.write.connector;
+    analyze.checkSinkForm(last.write, sink_connector, &ddiag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.AnalyzeFailed => return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg)),
+    };
+    env.sink_label_prefix = analyze.hintText(stages[stages.len - 1].hints, "label_prefix");
 
     stages = try analyze.substFilterParams(arena, stages, env.params_expr);
 

@@ -5,9 +5,10 @@
 //! subset, with no lookaround and no backreferences inside the pattern, so it
 //! stays a few hundred lines instead of pulling in a regex dependency. What is
 //! out of scope fails with `BadPattern` rather than matching literally: `(?=`
-//! and friends, a malformed `{...}` count (`\{` is the literal brace), a
-//! quantifier with nothing to repeat, a third quantifier character. Quietly
-//! misreading a pattern would return wrong rows.
+//! and friends, a backreference or other unknown letter escape (`\1`, `\b`), a
+//! malformed `{...}` count (`\{` is the literal brace), a quantifier with nothing
+//! to repeat, a third quantifier character. Quietly misreading a pattern would
+//! return wrong rows.
 //!
 //! Compilation takes an allocator so callers can hand it a
 //! `FixedBufferAllocator` over stack memory: matching a column costs no heap
@@ -305,7 +306,7 @@ const Parser = struct {
                 if (self.i >= self.src.len) return Error.BadPattern;
                 const e = self.src[self.i];
                 self.i += 1;
-                return escapeAtom(e);
+                return try escapeAtom(e);
             },
             else => return .{ .lit = c },
         }
@@ -326,7 +327,7 @@ const Parser = struct {
                 if (self.i >= self.src.len) return Error.BadPattern;
                 const e = self.src[self.i];
                 self.i += 1;
-                switch (escapeAtom(e)) {
+                switch (try escapeAtom(e)) {
                     .class => |sub| {
                         for (0..256) |b| {
                             if (sub.has(@intCast(b))) cl.set(@intCast(b));
@@ -352,7 +353,9 @@ const Parser = struct {
     }
 };
 
-fn escapeAtom(e: u8) Atom {
+/// A letter or digit escape outside the supported set is refused rather than read as
+/// the character: `\1` would otherwise match a literal `1` and `\b` a `b`.
+fn escapeAtom(e: u8) Error!Atom {
     var cl = Class{ .neg = false, .bits = .{0} ** 32 };
     switch (e) {
         'd', 'D' => {
@@ -373,7 +376,10 @@ fn escapeAtom(e: u8) Atom {
         'n' => return .{ .lit = '\n' },
         't' => return .{ .lit = '\t' },
         'r' => return .{ .lit = '\r' },
-        else => return .{ .lit = e },
+        else => {
+            if (std.ascii.isAlphanumeric(e)) return Error.BadPattern;
+            return .{ .lit = e };
+        },
     }
     return .{ .class = cl };
 }
@@ -519,6 +525,18 @@ test "regex: malformed quantifiers are rejected" {
     for (bad) |pat| {
         try std.testing.expectError(Error.BadPattern, Regex.compile(a, pat));
     }
+}
+
+test "regex: a backreference or an unknown letter escape is refused, a punctuation escape is literal" {
+    var buf: [16 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+    for ([_][]const u8{ "(a)\\1", "\\bx", "x\\B", "\\Aa", "a\\z", "[\\b]" }) |pat| {
+        try std.testing.expectError(Error.BadPattern, Regex.compile(a, pat));
+    }
+    var caps: Captures = undefined;
+    const re = try Regex.compile(a, "\\.\\$\\\\\\-");
+    try std.testing.expectEqual([2]usize{ 0, 4 }, (try re.find(".$\\-", 0, &caps)).?);
 }
 
 test "regex: no match leaves the subject alone" {
