@@ -164,26 +164,29 @@ fn interpUnsupported(e: *const ast.Expr) ?[]const u8 {
     };
 }
 
+/// `InterpFailed`, with why as the note its error message shows.
+fn interpFail(arena: std.mem.Allocator, text: []const u8, why: []const u8) anyerror {
+    const msg = std.fmt.allocPrint(arena, "`${{{s}}}`: {s}", .{ text, why }) catch return error.InterpFailed;
+    return eval.explain(error.InterpFailed, msg);
+}
+
 /// Variables bind as strings unless the `for` header typed them (`port:int`), so
 /// `${if(port > 1000, ...)}` compares numerically. A failure is permanent.
 fn evalInterpExpr(arena: std.mem.Allocator, text: []const u8, lr: LoopRow) ![]const u8 {
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
     const e = parser.parseExprStr(arena, text, &diag) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        std.debug.print("[interp] ${{{s}}}: {s}\n", .{ text, diag.msg });
-        return error.InterpFailed;
+        return interpFail(arena, text, diag.msg);
     };
     if (interpUnsupported(e)) |why| {
-        std.debug.print("[interp] ${{{s}}}: {s}\n", .{ text, why });
-        return error.InterpFailed;
+        return interpFail(arena, text, why);
     }
     var names = std.array_list.Managed([]const u8).init(arena);
     var vals = std.array_list.Managed(Value).init(arena);
     try lr.appendScope(arena, &names, &vals);
     const result = eval.constEval(arena, e, names.items, vals.items) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        std.debug.print("[interp] ${{{s}}}: {s}\n", .{ text, @errorName(err) });
-        return error.InterpFailed;
+        return interpFail(arena, text, op.errLabel(err));
     };
     return eval.valueToString(arena, result);
 }
@@ -449,7 +452,7 @@ fn forWorker(ctx: *ForCtx, _: usize) void {
                 for (w_sources.items) |sc| sc.close();
                 break;
             }
-            const emsg = if (w_diag.msg.len > 0) w_diag.msg else @errorName(e);
+            const emsg = if (w_diag.msg.len > 0) w_diag.msg else op.failLabel(e);
             const label = rowLabel(w_arena.allocator(), ctx.needles, row);
             if (ctx.on_error == .continue_ and !w_env.item_reported) w_env.log.log(.err, "for-each row {s}: {s}", .{ label, emsg });
             forRecordFail(ctx, row[0], label, emsg, isTransient(e) or w_diag.retryable, w_env.item_reported);
@@ -627,7 +630,7 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
                     env.sources.shrinkRetainingCapacity(base);
                     if (e == error.Aborted) return error.Aborted;
                     failures += 1;
-                    const emsg = if (env.diag.msg.len > 0) env.diag.msg else @errorName(e);
+                    const emsg = if (env.diag.msg.len > 0) env.diag.msg else op.failLabel(e);
                     const label = rowLabel(env.arena, needles, row);
                     if (opts.outcomes) |sink| sink.recordShown(row[0], false, emsg, isTransient(e) or env.diag.retryable, env.item_reported);
                     if (on_error == .continue_ and !env.item_reported) env.log.log(.err, "for-each row {s}: {s}", .{ label, emsg });

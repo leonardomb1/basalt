@@ -245,7 +245,7 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
     const cfg = try resolveDbConfig(env, conn, info.port);
 
     const setup_conn = connectSql(env.gpa, kind, cfg) catch |e|
-        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} sink connect failed: {s}", .{ conn.connector, @errorName(e) }));
+        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} sink connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, conn.connector, e) }));
     const setup = sql.Sink.open(env.gpa, setup_conn, dialect, w.target, schema, w.mode, null) catch |e|
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink setup failed: {s}", .{ conn.connector, @errorName(e) }));
     setup.sink().close() catch |e|
@@ -630,7 +630,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         switch (info.kind) {
             inline else => |k| {
                 const c = SqlDriver(k).connect(env.gpa, cfg) catch |e|
-                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} connect failed: {s}", .{ conn.connector, @errorName(e) }));
+                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, conn.connector, e) }));
                 const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
                     defer c.close();
                     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} read failed ({s}): {s}", .{ conn.connector, @errorName(e), c.last_error }));
@@ -654,6 +654,16 @@ fn rangeBound(env: *Env, e: *const ast.Expr) !i64 {
         else => {},
     }
     return planErr(env.diag, "RANGE bounds must be integer literals or integer params");
+}
+
+/// A connect failure's error name, with the server's or identity provider's own words
+/// when they refused the login.
+fn connectWhy(arena: std.mem.Allocator, connector: []const u8, e: anyerror) ![]const u8 {
+    if (e == error.LoginFailed and std.mem.eql(u8, connector, "sqlserver") and tds.lastError().len > 0)
+        return std.fmt.allocPrint(arena, "{s}: {s}", .{ @errorName(e), tds.lastError() });
+    if (e == error.AadTokenFailed and aad.lastError().len > 0)
+        return std.fmt.allocPrint(arena, "{s}: {s}", .{ @errorName(e), aad.lastError() });
+    return @errorName(e);
 }
 
 /// Azure AD (ROPC token, FEDAUTH) for `auth = aad`, NTLMv2 or Kerberos for
@@ -1398,7 +1408,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         switch (info.kind) {
             inline else => |k| {
                 const c = SqlDriver(k).connect(env.gpa, cfg) catch |e|
-                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} connect failed: {s}", .{ conn.connector, @errorName(e) }));
+                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, conn.connector, e) }));
                 return openBulkOrInsert(env.gpa, c, SqlDriver(k).Bulk, info.dialect, w.target, schema, w.mode, try redialFor(env.arena, info.kind, cfg)) catch |e| {
                     defer c.close();
                     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink failed ({s}): {s}", .{ conn.connector, @errorName(e), c.last_error }));

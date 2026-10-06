@@ -16,6 +16,18 @@
 const std = @import("std");
 const http_client = @import("../net/http_client.zig");
 
+threadlocal var why_buf: [700]u8 = undefined;
+threadlocal var why_len: usize = 0;
+
+/// Why the last token request on this thread failed, in the identity provider's words, or "".
+pub fn lastError() []const u8 {
+    return why_buf[0..why_len];
+}
+
+fn note(comptime fmt: []const u8, args: anytype) void {
+    why_len = (std.fmt.bufPrint(&why_buf, fmt, args) catch why_buf[0..]).len;
+}
+
 pub const ado_client_id = "2fd908ad-0664-4344-b9be-cd3e8b574c38";
 pub const sql_resource = "https://database.windows.net";
 
@@ -28,6 +40,7 @@ pub fn passwordToken(
     password: []const u8,
     resource: []const u8,
 ) ![]const u8 {
+    why_len = 0;
     const realm = getUserRealm(gpa, username) catch Realm{ .federated = false, .sts_url = "" };
     defer if (realm.sts_url.len > 0) gpa.free(realm.sts_url);
     const tenant = tenantOf(username);
@@ -111,13 +124,13 @@ fn wsTrustAssertion(gpa: std.mem.Allocator, username: []const u8, password: []co
         .payload = envelope,
         .response_writer = &aw.writer,
     }) catch |e| {
-        std.debug.print("ADFS WS-Trust request failed ({s}): {s}\n", .{ @errorName(e), sts_url });
+        note("ADFS WS-Trust request failed ({s}): {s}", .{ @errorName(e), sts_url });
         return error.AadTokenFailed;
     };
     const body = aw.writer.buffered();
     const assertion = extractElement(body, "Assertion") orelse {
         const reason = extractElement(body, "Text") orelse extractElement(body, "faultstring") orelse "";
-        std.debug.print("ADFS WS-Trust http {d}; fault: {s}\n", .{ @intFromEnum(res.status), reason });
+        note("ADFS WS-Trust http {d}; fault: {s}", .{ @intFromEnum(res.status), reason });
         return error.AadTokenFailed;
     };
     return gpa.dupe(u8, assertion);
@@ -171,6 +184,7 @@ pub fn ropcToken(
     password: []const u8,
     resource: []const u8,
 ) ![]const u8 {
+    why_len = 0;
     var body = std.array_list.Managed(u8).init(gpa);
     defer body.deinit();
     try body.appendSlice("grant_type=password");
@@ -198,12 +212,12 @@ fn postForToken(gpa: std.mem.Allocator, url: []const u8, body: []const u8) ![]co
         .payload = body,
         .response_writer = &aw.writer,
     }) catch |e| {
-        std.debug.print("aad token request failed ({s})\n", .{@errorName(e)});
+        note("token request failed ({s})", .{@errorName(e)});
         return error.AadTokenFailed;
     };
     const resp = aw.writer.buffered();
     if (@intFromEnum(res.status) != 200) {
-        std.debug.print("aad token http {d}: {s}\n", .{ @intFromEnum(res.status), resp[0..@min(resp.len, 600)] });
+        note("token http {d}: {s}", .{ @intFromEnum(res.status), resp[0..@min(resp.len, 600)] });
         return error.AadTokenFailed;
     }
     const root = std.json.parseFromSliceLeaky(std.json.Value, gpa, resp, .{}) catch return error.AadTokenFailed;

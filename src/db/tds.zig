@@ -62,6 +62,19 @@ const BULK_PKT_PAYLOAD = 4088;
 
 pub const Error = error{ TdsProtocol, LoginFailed, QueryFailed, EncryptionRequired, TdsTlsRefused, UnsupportedTdsType } || std.mem.Allocator.Error || std.net.Stream.WriteError || std.net.Stream.ReadError;
 
+threadlocal var rejected_buf: [512]u8 = undefined;
+threadlocal var rejected_len: usize = 0;
+
+/// The server's own words for the last login it rejected on this thread, or "".
+pub fn lastError() []const u8 {
+    return rejected_buf[0..rejected_len];
+}
+
+fn noteRejected(msg: []const u8) void {
+    rejected_len = @min(msg.len, rejected_buf.len);
+    @memcpy(rejected_buf[0..rejected_len], msg[0..rejected_len]);
+}
+
 pub const Conn = struct {
     gpa: std.mem.Allocator,
     stream: std.net.Stream,
@@ -80,6 +93,7 @@ pub const Conn = struct {
     last_done_count: ?u64 = null,
 
     pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
+        rejected_len = 0;
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
         driver.tuneSocket(stream.handle);
         const self = try gpa.create(Conn);
@@ -89,7 +103,10 @@ pub const Conn = struct {
         errdefer self.close();
         try self.prelogin(tls_mode != .off);
         if (tls_mode != .off) try self.startTls(host, tls_mode);
-        try self.login(user, password, database, host);
+        self.login(user, password, database, host) catch |e| {
+            noteRejected(self.last_error);
+            return e;
+        };
         try self.afterLogin();
         return self;
     }
@@ -98,6 +115,7 @@ pub const Conn = struct {
     /// FEDAUTHREQUIRED and LOGIN7 carries the token in a FEDAUTH feature extension. The
     /// caller fetches the token (see aad.ropcToken).
     pub fn connectAad(gpa: std.mem.Allocator, host: []const u8, port: u16, token: []const u8, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
+        rejected_len = 0;
         if (tls_mode == .off) return error.EncryptionRequired;
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
         driver.tuneSocket(stream.handle);
@@ -113,7 +131,7 @@ pub const Conn = struct {
         try self.writePacket(PKT_LOGIN7, payload);
         try self.readMessage();
         self.parseLoginResponse() catch |e| {
-            if (self.last_error.len > 0) std.debug.print("[tds] login rejected: {s}\n", .{self.last_error});
+            noteRejected(self.last_error);
             return e;
         };
         try self.afterLogin();
@@ -122,6 +140,7 @@ pub const Conn = struct {
 
     /// NTLMv2 with an explicit `DOMAIN\user` password, not OS single sign-on.
     pub fn connectNtlm(gpa: std.mem.Allocator, host: []const u8, port: u16, cred: ntlm.Credential, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
+        rejected_len = 0;
         if (tls_mode == .off) return error.EncryptionRequired;
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
         driver.tuneSocket(stream.handle);
@@ -140,6 +159,7 @@ pub const Conn = struct {
     /// A ticket for `spn` (`MSSQLSvc/<host>:<port>`) asked of the KDC with the password,
     /// its AP-REQ in SPNEGO in the LOGIN7 SSPI field, the server's AP-REP checked.
     pub fn connectKerberos(gpa: std.mem.Allocator, host: []const u8, port: u16, cred: krb5.Credential, spn: []const u8, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
+        rejected_len = 0;
         if (tls_mode == .off) return error.EncryptionRequired;
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
         driver.tuneSocket(stream.handle);
@@ -151,7 +171,7 @@ pub const Conn = struct {
         try self.prelogin(true);
         try self.startTls(host, tls_mode);
         self.loginKerberos(cred, spn, database, host) catch |e| {
-            if (self.last_error.len > 0) std.debug.print("[tds] login rejected: {s}\n", .{self.last_error});
+            noteRejected(self.last_error);
             return e;
         };
         try self.afterLogin();
@@ -377,7 +397,7 @@ pub const Conn = struct {
         try self.writePacket(PKT_SSPI, auth);
         try self.readMessage();
         self.parseLoginResponse() catch |e| {
-            if (self.last_error.len > 0) std.debug.print("[tds] login rejected: {s}\n", .{self.last_error});
+            noteRejected(self.last_error);
             return e;
         };
     }

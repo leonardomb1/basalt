@@ -147,6 +147,7 @@ pub fn errLabel(e: anyerror) []const u8 {
         error.InvalidJson => "invalid JSON — json_get and JSON_EACH need a JSON document, and the json_* array functions a JSON array",
         error.PatternTooComplex => "regular expression gave up: too much backtracking — anchor it, or replace a nested quantifier like `(a+)+` with a flat one",
         error.CsvHeaderMismatch => "a file in the folder has another header than the first — a folder read takes CSVs of one layout",
+        error.InterpFailed => "a `${...}` interpolation failed",
         error.JoinBuildTooLarge => "join build side exceeds its cap — raise it with WITH (max_build = '8GB') on the join, filter the CTE, or flip the join",
         else => @errorName(e),
     };
