@@ -1,0 +1,30 @@
+name: Set up Zig
+description: Install Zig from the official release tarball (cached) and put it on PATH.
+
+inputs:
+  version:
+    description: Zig version
+    default: 0.15.2
+
+runs:
+  using: composite
+  steps:
+    - name: Cache Zig
+      id: zig-cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.zig
+        key: zig-${{ inputs.version }}-x86_64-linux
+
+    # Tarball naming is arch-first since 0.14.1: zig-<arch>-<os>-<version>.
+    - name: Install Zig
+      if: steps.zig-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        mkdir -p ~/.zig
+        curl -fsSL "https://ziglang.org/download/${{ inputs.version }}/zig-x86_64-linux-${{ inputs.version }}.tar.xz" \
+          | tar -xJ -C ~/.zig --strip-components=1
+
+    - name: Add Zig to PATH
+      shell: bash
+      run: echo "$HOME/.zig" >> "$GITHUB_PATH"
