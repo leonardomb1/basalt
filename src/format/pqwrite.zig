@@ -1441,11 +1441,8 @@ test "an az:// target routes to the blob writer, never the local filesystem" {
         .{ .name = "x", .ty = types.Type.init(.int).asNullable() },
     } };
 
-    const w = Writer.open(a, "az://acct/ctr/bronze/t.parquet", schema, .snappy, .truncate) catch |e| {
-        try testing.expect(e != error.FileNotFound and e != error.NotDir);
-        return;
-    };
-    try testing.expect(w.backend == .object);
+    if (std.posix.getenv("AZURE_STORAGE_KEY") != null) return error.SkipZigTest;
+    try testing.expectError(error.AzureMissingKey, Writer.open(a, "az://acct/ctr/bronze/t.parquet", schema, .snappy, .truncate));
 }
 
 test "chunk size totals account for page headers" {

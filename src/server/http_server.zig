@@ -594,6 +594,7 @@ test "bindHeaderParams: named + bare FROM HEADER, case-insensitive, missing skip
 }
 
 test "buffered endpoint: accept -> WAL -> drain through the pipeline" {
+    initLog(.{ .quiet = true });
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -660,6 +661,7 @@ fn acceptN(gpa: std.mem.Allocator, routes: []const Route, srv: *std.net.Server, 
 }
 
 test "serve integration: buffered accept and FROM HEADER over real HTTP" {
+    initLog(.{ .quiet = true });
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -704,6 +706,11 @@ test "serve integration: buffered accept and FROM HEADER over real HTTP" {
     defer srv.deinit();
     const port = srv.listen_address.getPort();
     const th = try std.Thread.spawn(.{}, acceptN, .{ gpa, &routes, &srv, @as(usize, 3) });
+    var joined = false;
+    defer if (!joined) {
+        for (0..3) |_| if (std.net.tcpConnectToAddress(srv.listen_address)) |c| c.close() else |_| {};
+        th.join();
+    };
 
     var client = std.http.Client{ .allocator = gpa };
     defer client.deinit();
@@ -753,6 +760,7 @@ test "serve integration: buffered accept and FROM HEADER over real HTTP" {
         try std.testing.expectEqual(std.http.Status.ok, res.status);
     }
     th.join();
+    joined = true;
 
     const hdr_out = try tmp.dir.readFileAlloc(a, "out_hdr.csv", 1 << 20);
     try std.testing.expectEqualStrings("id,tenant\n7,acme\n", hdr_out);

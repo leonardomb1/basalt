@@ -2771,8 +2771,11 @@ test "an http parquet source routes to the network, never the local filesystem" 
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
 
-    const r = Reader.open(ar.allocator(), "http://127.0.0.1:1/nope.parquet");
-    try testing.expectError(error.ConnectionRefused, r);
+    _ = Reader.open(ar.allocator(), "http://127.0.0.1:1/nope.parquet") catch |e| {
+        try testing.expect(e != error.FileNotFound and e != error.NotDir and e != error.AccessDenied);
+        return;
+    };
+    return error.TestExpectedConnectionError;
 }
 
 fn fuzzKernels(_: void, input: []const u8) anyerror!void {

@@ -1806,6 +1806,9 @@ fn rdU16(buf: []const u8, i: usize) usize {
 
 test "parseLoginResponse keeps the SSPI token beside the LOGINACK" {
     var c: Conn = undefined;
+    c.gpa = std.testing.allocator;
+    c.pkt_payload = BULK_PKT_PAYLOAD;
+    c.sspi_reply = "";
     c.msg = std.array_list.Managed(u8).init(std.testing.allocator);
     defer c.msg.deinit();
     c.last_error = "";

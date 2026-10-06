@@ -1308,6 +1308,12 @@ fn needsQuote(s: []const u8, delim: u8) bool {
     return false;
 }
 
+/// Wakes a `serveOnce` still blocked in `accept` because the reader never connected,
+/// so a regression fails the test instead of hanging the suite at the join.
+fn releaseAccept(listener: *std.net.Server) void {
+    if (std.net.tcpConnectToAddress(listener.listen_address)) |c| c.close() else |_| {}
+}
+
 fn serveOnce(listener: *std.net.Server, status_line: []const u8, body: []const u8) void {
     serveOnceInner(listener, status_line, body) catch {};
 }
@@ -1336,6 +1342,7 @@ test "CsvReader streams a CSV over http" {
     defer listener.deinit();
     const th = try std.Thread.spawn(.{}, serveOnce, .{ &listener, "200 OK", "id,name\n1,alpha\n2,beta\n" });
     defer th.join();
+    defer releaseAccept(&listener);
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/data.csv", .{listener.listen_address.getPort()});
     const r = try CsvReader.open(a, url, .{});
@@ -1363,6 +1370,7 @@ test "CsvReader maps http status: 4xx permanent, 5xx transient" {
         defer listener.deinit();
         const th = try std.Thread.spawn(.{}, serveOnce, .{ &listener, "404 Not Found", "nope" });
         defer th.join();
+        defer releaseAccept(&listener);
         const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/missing.csv", .{listener.listen_address.getPort()});
         try std.testing.expectError(error.HttpNotFound, CsvReader.open(a, url, .{}));
     }
@@ -1372,6 +1380,7 @@ test "CsvReader maps http status: 4xx permanent, 5xx transient" {
         defer listener.deinit();
         const th = try std.Thread.spawn(.{}, serveOnce, .{ &listener, "503 Service Unavailable", "busy" });
         defer th.join();
+        defer releaseAccept(&listener);
         const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/data.csv", .{listener.listen_address.getPort()});
         try std.testing.expectError(error.HttpServerBusy, CsvReader.open(a, url, .{}));
     }

@@ -1239,6 +1239,7 @@ const TestServer = struct {
     expected: ?usize = null,
     captured: [4][2048]u8 = undefined,
     captured_len: [4]usize = .{ 0, 0, 0, 0 },
+    stop: std.atomic.Value(bool) = .init(false),
 
     fn start(responses: []const []const u8) !*TestServer {
         const self = try std.testing.allocator.create(TestServer);
@@ -1252,14 +1253,22 @@ const TestServer = struct {
     fn run(self: *TestServer) void {
         self.serve() catch {};
     }
+    /// Stops the server thread even when the client made fewer requests than it
+    /// expected, so a regression fails the test instead of hanging it in `accept`.
+    fn finish(self: *TestServer, th: std.Thread) void {
+        self.stop.store(true, .seq_cst);
+        if (std.net.tcpConnectToAddress(self.listener.listen_address)) |c| c.close() else |_| {}
+        th.join();
+    }
     fn serve(self: *TestServer) !void {
         const total = self.expected orelse self.responses.len;
         var i: usize = 0;
         while (i < total) : (i += 1) {
             const conn = try self.listener.accept();
             defer conn.stream.close();
+            if (self.stop.load(.seq_cst)) return;
             var req_buf: [2048]u8 = undefined;
-            const req_len = try conn.stream.read(&req_buf);
+            const req_len = try readRequest(conn.stream, &req_buf);
             if (i < self.captured.len) {
                 @memcpy(self.captured[i][0..req_len], req_buf[0..req_len]);
                 self.captured_len[i] = req_len;
@@ -1291,6 +1300,26 @@ const TestServer = struct {
     }
 };
 
+/// One whole request: the headers, then as many body bytes as `Content-Length` says,
+/// however the client's writes were split.
+fn readRequest(stream: std.net.Stream, buf: []u8) !usize {
+    var n: usize = 0;
+    while (n < buf.len) {
+        const got = try stream.read(buf[n..]);
+        if (got == 0) break;
+        n += got;
+        const end = std.mem.indexOf(u8, buf[0..n], "\r\n\r\n") orelse continue;
+        var want: usize = 0;
+        var lines = std.mem.splitSequence(u8, buf[0..end], "\r\n");
+        while (lines.next()) |ln| {
+            if (std.ascii.startsWithIgnoreCase(ln, "content-length:"))
+                want = std.fmt.parseInt(usize, std.mem.trim(u8, ln["content-length:".len..], " "), 10) catch 0;
+        }
+        if (n >= end + 4 + want) break;
+    }
+    return n;
+}
+
 fn drain(src: *HttpSource, arena: std.mem.Allocator) !usize {
     var total: usize = 0;
     while (try src.next(arena)) |b| total += b.len;
@@ -1307,7 +1336,7 @@ test "http source: bare array, single fetch, bearer header sent" {
     });
     defer srv.deinit();
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
-    defer th.join();
+    defer srv.finish(th);
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{ .bearer = "sek" });
@@ -1332,7 +1361,7 @@ test "http source: page pagination stops on empty page" {
     });
     defer srv.deinit();
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
-    defer th.join();
+    defer srv.finish(th);
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{ .items = "data", .paginate = .page });
@@ -1357,7 +1386,7 @@ test "http source: offset pagination advances $skip by page_size, raw auth sent"
     });
     defer srv.deinit();
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
-    defer th.join();
+    defer srv.finish(th);
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/api/odata/businessobject/incidents", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{
@@ -1390,7 +1419,7 @@ test "http source: 204 past the end of the dataset ends the stream cleanly" {
     srv.statuses = &.{ "200 OK", "204 No Content" };
     defer srv.deinit();
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
-    defer th.join();
+    defer srv.finish(th);
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{
@@ -1440,7 +1469,7 @@ test "http connection: login_json posts body, token rides later requests" {
     });
     defer srv.deinit();
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
-    defer th.join();
+    defer srv.finish(th);
 
     const base = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{srv.port()});
     const s = try HttpSource.openConn(a, std.testing.allocator, .{
@@ -1474,7 +1503,7 @@ test "http connection: 401 mid-run triggers re-login and the page retries" {
     srv.statuses = &.{ "200 OK", "401 Unauthorized", "200 OK", "200 OK" };
     defer srv.deinit();
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
-    defer th.join();
+    defer srv.finish(th);
 
     const base = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{srv.port()});
     const s = try HttpSource.openConn(a, std.testing.allocator, .{
@@ -1499,7 +1528,7 @@ test "http connection: oauth2 client credentials form post -> Bearer" {
     });
     defer srv.deinit();
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
-    defer th.join();
+    defer srv.finish(th);
 
     const base = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{srv.port()});
     const s = try HttpSource.openConn(a, std.testing.allocator, .{
@@ -1535,7 +1564,7 @@ test "http source: prefetch fetches pages concurrently and stops on empty" {
     srv.expected = 5;
     defer srv.deinit();
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
-    defer th.join();
+    defer srv.finish(th);
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{
@@ -1569,7 +1598,7 @@ test "http source: stop_short ends after a short page (no trailing empty fetch)"
     });
     defer srv.deinit();
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
-    defer th.join();
+    defer srv.finish(th);
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{
@@ -1578,6 +1607,7 @@ test "http source: stop_short ends after a short page (no trailing empty fetch)"
         .size_param = "$top",
         .page_size = 2,
         .stop_short = true,
+        .timeout_ms = 2000,
     });
     defer s.close();
     try std.testing.expectEqual(@as(usize, 3), try drain(s, a));
@@ -1593,7 +1623,7 @@ test "abort flag stops pagination between page requests" {
     });
     defer srv.deinit();
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
-    defer th.join();
+    defer srv.finish(th);
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{ .paginate = .page });
@@ -1619,7 +1649,7 @@ test "http source: POST form body carries pagination, content-type set" {
     });
     defer srv.deinit();
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
-    defer th.join();
+    defer srv.finish(th);
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/rest", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{
@@ -1652,7 +1682,7 @@ test "http source: total_field bounds the page count exactly" {
     });
     defer srv.deinit();
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
-    defer th.join();
+    defer srv.finish(th);
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/rest", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{
@@ -1661,6 +1691,7 @@ test "http source: total_field bounds the page count exactly" {
         .items = "itens",
         .paginate = .page,
         .total_field = "totalCount",
+        .timeout_ms = 2000,
     });
     defer s.close();
     try std.testing.expectEqual(@as(usize, 3), try drain(s, a));
@@ -1678,7 +1709,7 @@ test "http source: transient 503 retries in place and succeeds" {
     srv.statuses = &.{ "503 Service Unavailable", "200 OK" };
     defer srv.deinit();
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
-    defer th.join();
+    defer srv.finish(th);
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{ .retries = 2, .retry_base_ms = 10 });
@@ -1698,7 +1729,7 @@ test "retry_statuses treats a lying 404 as transient and retries through it" {
     srv.statuses = &.{ "404 Not Found", "200 OK" };
     defer srv.deinit();
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
-    defer th.join();
+    defer srv.finish(th);
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/rest", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{
@@ -1719,6 +1750,8 @@ test "statusListed parses comma lists with spaces" {
     try std.testing.expect(!statusListed("garbage,abc", 404));
 }
 
+var hang_released = std.atomic.Value(bool).init(false);
+
 fn serveOneThenHang(listener: *std.net.Server) void {
     const body = "[{\"id\":1}]";
     {
@@ -1733,7 +1766,8 @@ fn serveOneThenHang(listener: *std.net.Server) void {
     const conn = listener.accept() catch return;
     var rb: [2048]u8 = undefined;
     _ = conn.stream.read(&rb) catch return;
-    std.Thread.sleep(10 * std.time.ns_per_s);
+    var waited: usize = 0;
+    while (!hang_released.load(.seq_cst) and waited < 500) : (waited += 1) std.Thread.sleep(20 * std.time.ns_per_ms);
     conn.stream.close();
 }
 
@@ -1745,8 +1779,10 @@ test "a black-holed page request times out instead of hanging the run" {
     const addr = try std.net.Address.parseIp("127.0.0.1", 0);
     var listener = try addr.listen(.{ .reuse_address = true });
     defer listener.deinit();
+    hang_released.store(false, .seq_cst);
     const th = try std.Thread.spawn(.{}, serveOneThenHang, .{&listener});
     defer th.join();
+    defer hang_released.store(true, .seq_cst);
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{listener.listen_address.getPort()});
     const s = try HttpSource.open(a, std.heap.page_allocator, url, .{
@@ -1800,7 +1836,7 @@ test "http source: cursor pagination follows token then stops" {
     });
     defer srv.deinit();
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
-    defer th.join();
+    defer srv.finish(th);
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{ .items = "data", .paginate = .cursor });
