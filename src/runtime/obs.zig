@@ -25,6 +25,7 @@
 //! rows into four once reported `11 rows/s`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const driver = @import("../connect/driver.zig");
 const types = @import("../lang/types.zig");
 const Batch = @import("../exec/batch.zig").Batch;
@@ -32,11 +33,11 @@ const Batch = @import("../exec/batch.zig").Batch;
 pub const Format = enum { auto, text, json };
 
 /// Logs through `logger` when the runtime wired one, else a raw stderr line, so
-/// standalone and test use stays debuggable.
+/// standalone use stays debuggable; under the test runner the raw line is dropped.
 pub fn logOr(logger: ?*Logger, level: Level, comptime fmt: []const u8, args: anytype) void {
     if (logger) |lg| {
         lg.log(level, fmt, args);
-    } else {
+    } else if (!builtin.is_test) {
         std.debug.print(fmt ++ "\n", args);
     }
 }
@@ -147,8 +148,11 @@ pub const Logger = struct {
     }
 
     /// Lines over the 16 KiB buffer are cut, not dropped.
+    /// Under the test runner a log to the process's stderr is dropped: the failures a
+    /// test provokes on purpose are not output, and a test that checks logs writes to a file.
     pub fn log(self: *Logger, level: Level, comptime fmt: []const u8, args: anytype) void {
         if (!self.enabled(level)) return;
+        if (builtin.is_test and self.file.handle == std.posix.STDERR_FILENO) return;
         var buf: [16384]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..];
         self.mutex.lock();

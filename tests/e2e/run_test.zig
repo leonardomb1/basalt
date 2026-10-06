@@ -64,7 +64,6 @@ fn runToStringP(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []con
 
     var rdiag: Diag = .{};
     _ = run(alloc, prog, .{ .params = cli_params }, &rdiag) catch |e| {
-        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
         return e;
     };
     return tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
@@ -870,7 +869,6 @@ fn runCsvThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []c
     const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
     _ = run(alloc, prog, .{ .threads = threads }, &rdiag) catch |e| {
-        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
         return e;
     };
     return tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
@@ -945,7 +943,6 @@ fn runParquetThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, query:
     const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
     _ = run(alloc, prog, .{ .threads = threads }, &rdiag) catch |e| {
-        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
         return e;
     };
     return tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
@@ -1354,7 +1351,6 @@ test "for-each over a JSON array param iterates and binds fields by name" {
     const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
     _ = run(alloc, prog, .{ .request_body = body }, &rdiag) catch |e| {
-        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
         return e;
     };
     const first = try tmp.dir.readFileAlloc(alloc, "out_01.csv", 1 << 20);
@@ -1385,7 +1381,6 @@ test "for-each loop var used as an expression value binds per row" {
     const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
     _ = run(alloc, prog, .{}, &rdiag) catch |e| {
-        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
         return e;
     };
 
@@ -1423,7 +1418,6 @@ fn runScript(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, script: []const
 
     var rdiag: Diag = .{};
     _ = run(alloc, prog, .{ .params = cli_params }, &rdiag) catch |e| {
-        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
         return e;
     };
     return tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
@@ -1572,7 +1566,6 @@ test "LOAD INTO IDENTIFIER: one output file per for-each row" {
     const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
     _ = run(alloc, prog, .{}, &rdiag) catch |e| {
-        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
         return e;
     };
 
@@ -1964,7 +1957,6 @@ test "union reconciles branches to a canon schema (tag, null-fill, drop-extra)" 
 
     var rdiag: Diag = .{};
     _ = run(alloc, prog, .{}, &rdiag) catch |e| {
-        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
         return e;
     };
     const out = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
@@ -1996,7 +1988,6 @@ test "for-each fans out over a discovered list with interpolation" {
 
     var rdiag: Diag = .{};
     const stats = run(alloc, prog, .{}, &rdiag) catch |e| {
-        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
         return e;
     };
     try std.testing.expectEqual(@as(u64, 3), stats.rows_out);
@@ -2058,7 +2049,6 @@ test "for-each discovers its rows from an in-engine SELECT" {
 
     var rdiag: Diag = .{};
     const stats = run(alloc, prog, .{}, &rdiag) catch |e| {
-        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
         return e;
     };
     try std.testing.expectEqual(@as(u64, 3), stats.rows_out);
@@ -2213,7 +2203,6 @@ test "join: an empty build side drops all rows (inner) and null-fills (left)" {
     const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
     _ = run(alloc, prog, .{}, &rdiag) catch |e| {
-        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
         return e;
     };
     const inner = try tmp.dir.readFileAlloc(alloc, "inner.csv", 1 << 20);
@@ -2275,7 +2264,6 @@ test "join: duplicate build keys fan out (inner); semi/anti reduce to existence"
     const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
     _ = run(alloc, prog, .{}, &rdiag) catch |e| {
-        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
         return e;
     };
     const inner = try tmp.dir.readFileAlloc(alloc, "inner.csv", 1 << 20);
@@ -2516,7 +2504,6 @@ test "CALL renders a statement function per call (defaults fill the omitted arg)
 
     var rdiag: Diag = .{};
     const stats = run(alloc, prog, .{}, &rdiag) catch |e| {
-        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
         return e;
     };
     try std.testing.expectEqual(@as(u64, 3), stats.rows_out);
@@ -2695,7 +2682,6 @@ fn runJoinThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, body: []c
 
     var rdiag: Diag = .{};
     _ = run(alloc, prog, .{ .threads = threads }, &rdiag) catch |e| {
-        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
         return e;
     };
     return tmp.dir.readFileAlloc(alloc, out_name, 1 << 20);
@@ -2946,7 +2932,6 @@ test "table functions: defaults, a join side, two calls with their own CTEs, one
         const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
         var rdiag: Diag = .{};
         _ = run(alloc, prog, .{}, &rdiag) catch |e| {
-            std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
             return e;
         };
         const got = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
@@ -3045,7 +3030,6 @@ test "JOIN LATERAL passes a row's column to a table function as a join on it" {
         };
         var rdiag: Diag = .{};
         _ = run(alloc, prog, .{}, &rdiag) catch |e| {
-            std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
             return e;
         };
         const got = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
@@ -3078,7 +3062,6 @@ test "an Excel workbook reads as a table: typed columns, a named sheet and range
         const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
         var rdiag: Diag = .{};
         _ = run(alloc, prog, .{}, &rdiag) catch |e| {
-            std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
             return e;
         };
         const got = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
@@ -3120,7 +3103,6 @@ test "a FOR EACH discovery query may read a table function, a derived table or a
     for (loop.?.body) |st| try std.testing.expect(st != .binding);
     var rdiag: Diag = .{};
     _ = run(alloc, prog, .{}, &rdiag) catch |e| {
-        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
         return e;
     };
     const a = try tmp.dir.readFileAlloc(alloc, "out_a.csv", 1 << 16);
@@ -3221,7 +3203,6 @@ fn checkAndRun(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, tmpl: []const
     };
     var rdiag: Diag = .{};
     _ = run(alloc, prog, .{ .threads = threads, .params = cli_params, .log = .{ .quiet = true } }, &rdiag) catch |e| {
-        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
         return e;
     };
 }
