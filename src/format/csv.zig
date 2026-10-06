@@ -378,7 +378,7 @@ pub const CsvReader = struct {
 
         try self.decodeAs(splitCodec(if (splitArchive(first)) |ar| (ar.member orelse ar.archive) else first).codec);
 
-        const header = (try self.readLine()) orelse return error.EmptyCsv;
+        const header = stripBom((try self.readLine()) orelse return error.EmptyCsv);
         self.header_line = try arena.dupe(u8, std.mem.trim(u8, header, " \t\r"));
         var fields = std.array_list.Managed(types.Schema.Field).init(arena);
         var it = std.mem.splitScalar(u8, header, self.dialect.delim);
@@ -463,7 +463,7 @@ pub const CsvReader = struct {
                 self.rdr = &st2.interface;
                 try self.decodeAs(splitCodec(url).codec);
                 const hdr = (try self.readLine()) orelse return error.EmptyCsv;
-                if (!std.mem.eql(u8, std.mem.trim(u8, hdr, " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
+                if (!std.mem.eql(u8, std.mem.trim(u8, stripBom(hdr), " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
                 return true;
             },
             .smb => |st| {
@@ -473,7 +473,7 @@ pub const CsvReader = struct {
                 self.rdr = &st2.interface;
                 try self.decodeAs(splitCodec(url).codec);
                 const hdr = (try self.readLine()) orelse return error.EmptyCsv;
-                if (!std.mem.eql(u8, std.mem.trim(u8, hdr, " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
+                if (!std.mem.eql(u8, std.mem.trim(u8, stripBom(hdr), " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
                 return true;
             },
             .file => |*f| {
@@ -483,7 +483,7 @@ pub const CsvReader = struct {
                 self.rdr = &f.fr.interface;
                 try self.decodeAs(splitCodec(url).codec);
                 const hdr = (try self.readLine()) orelse return error.EmptyCsv;
-                if (!std.mem.eql(u8, std.mem.trim(u8, hdr, " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
+                if (!std.mem.eql(u8, std.mem.trim(u8, stripBom(hdr), " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
                 return true;
             },
             .member => {},
@@ -505,7 +505,7 @@ pub const CsvReader = struct {
 
         try self.decodeAs(splitCodec(url).codec);
         const hdr = (try self.readLine()) orelse return error.EmptyCsv;
-        if (!std.mem.eql(u8, std.mem.trim(u8, hdr, " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
+        if (!std.mem.eql(u8, std.mem.trim(u8, stripBom(hdr), " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
         return true;
     }
 
@@ -554,6 +554,12 @@ pub const CsvReader = struct {
     }
 };
 
+/// A header without the UTF-8 byte-order mark Excel writes before "CSV UTF-8" files,
+/// which would otherwise stick to the first column's name.
+fn stripBom(line: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, line, "\xef\xbb\xbf")) line[3..] else line;
+}
+
 pub const MappedCsv = struct {
     data: []align(std.heap.page_size_min) const u8,
     body: []const u8,
@@ -580,7 +586,7 @@ pub const MappedCsv = struct {
         errdefer std.posix.munmap(data);
 
         const nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.EmptyCsv;
-        var header = data[0..nl];
+        var header = stripBom(data[0..nl]);
         if (header.len > 0 and header[header.len - 1] == '\r') header = header[0 .. header.len - 1];
         var fields = std.array_list.Managed(types.Schema.Field).init(arena);
         var it = std.mem.splitScalar(u8, header, dialect.delim);
@@ -1533,6 +1539,30 @@ test "serial and mapped readers infer the same schema; mismatch past the sample 
         break :blk null;
     }) |_| {}
     try std.testing.expectEqual(@as(?anyerror, error.CsvTypeMismatch), err);
+}
+
+test "a UTF-8 byte-order mark, as Excel writes it, is not part of the first column's name" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.csv", .data = "\xef\xbb\xbfid,name\n1,x\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.csv", .data = "\xef\xbb\xbfid,name\n2,y\n" });
+    const a_path = try tmp.dir.realpathAlloc(a, "a.csv");
+    const b_path = try tmp.dir.realpathAlloc(a, "b.csv");
+
+    const m = try MappedCsv.open(a, a_path, .{});
+    defer m.close();
+    try std.testing.expectEqualStrings("id", m.schema.fields[0].name);
+    try std.testing.expectEqualStrings("1,x\n", m.body);
+
+    const r = try CsvReader.openList(a, &.{ a_path, b_path }, .{});
+    defer r.close();
+    try std.testing.expectEqualStrings("id", r.schema.fields[0].name);
+    var rows: usize = 0;
+    while (try r.next(a)) |b| rows += b.len;
+    try std.testing.expectEqual(@as(usize, 2), rows);
 }
 
 test "MappedCsv chunks are newline-aligned, disjoint, and covering" {
