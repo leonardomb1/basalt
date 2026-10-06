@@ -1458,8 +1458,7 @@ fn classifyAggJoinPipeline(stages: []const ast.Stage) ?AggJoinShape {
     var first_join: ?usize = null;
     var ai: ?usize = null;
     for (middle, 0..) |st, i| switch (st.node) {
-        .filter => if (ai != null) return null,
-        .select => {},
+        .filter, .select => {},
         .join => |j| {
             if (ai != null) return null;
             if (!joinKindLaneSafe(j.kind)) return null;
@@ -2526,4 +2525,25 @@ fn runParallelCsvDistinct(env: *Env, rd: ast.Read, prefix: []const ast.Stage, di
     const mapped = (try csvSplitFile(env, rd, w)) orelse return false;
     defer mapped.close();
     return runParallelDistinct(env, .{ .csv = .{ .mapped = mapped, .schema = &mapped.schema } }, prefix, dist, tail, w, opts, stats, lanes_used);
+}
+
+fn testStages(arena: std.mem.Allocator, src: []const u8) ![]const ast.Stage {
+    var diag: @import("../lang/sql_parser.zig").Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try @import("../lang/sql_parser.zig").parseSource(arena, src, &diag);
+    for (prog.stmts) |s| if (s == .output) return s.output.stages;
+    return error.NoOutput;
+}
+
+test "a join then an aggregate runs on lanes with a HAVING after it, as the plain aggregate does" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const having = try testStages(a,
+        \\LOAD INTO 'o.csv' AS WITH d AS (SELECT id AS did FROM 'x.parquet')
+        \\SELECT g, COUNT(*) AS n FROM 'x.parquet' JOIN d ON id = did GROUP BY g HAVING COUNT(*) > 1;
+    );
+    const shape = classifyAggJoinPipeline(having) orelse return error.TestExpectedLanes;
+    try std.testing.expect(shape.tail[0].node == .filter);
+    const plain = try testStages(a, "LOAD INTO 'o.csv' AS SELECT g, COUNT(*) AS n FROM 'x.parquet' GROUP BY g HAVING COUNT(*) > 1;");
+    try std.testing.expect(classifyAggPipeline(plain) != null);
 }

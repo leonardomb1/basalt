@@ -1077,6 +1077,23 @@ test "parallel parquet aggregate: a join then a grouped agg (threads>1)" {
     try std.testing.expectEqualStrings(serial, par);
 }
 
+test "parallel parquet aggregate: a join, a grouped agg and a HAVING (threads>1)" {
+    const alloc = std.testing.allocator;
+    const q = "WITH d AS (SELECT id AS did FROM '$IN' WHERE id <= 8) " ++
+        "SELECT g, COUNT(*) AS n, SUM(f) AS sf FROM '$IN' JOIN d ON id = did GROUP BY g HAVING SUM(f) > 3 ORDER BY g";
+    var t1 = std.testing.tmpDir(.{});
+    defer t1.cleanup();
+    const serial = try runParquetThreaded(alloc, &t1, q, 1);
+    defer alloc.free(serial);
+    var t4 = std.testing.tmpDir(.{});
+    defer t4.cleanup();
+    const par = try runParquetThreaded(alloc, &t4, q, 4);
+    defer alloc.free(par);
+
+    try std.testing.expectEqualStrings("g,n,sf\n0,2,6\n2,2,4\n3,2,5\n", serial);
+    try std.testing.expectEqualStrings(serial, par);
+}
+
 test "parallel CSV aggregate: global agg (threads>1) matches serial" {
     const alloc = std.testing.allocator;
     const input = "id,v\n1,10\n2,20\n3,30\n4,40\n5,50\n";

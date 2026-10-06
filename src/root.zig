@@ -56,6 +56,7 @@ pub const ssrp = @import("db/ssrp.zig");
 pub const http_server = @import("server/http_server.zig");
 pub const runtime = @import("runtime/run.zig");
 pub const parallel = @import("runtime/parallel.zig");
+pub const lanes = @import("runtime/lanes.zig");
 pub const obs = @import("runtime/obs.zig");
 pub const analyze = @import("runtime/analyze.zig");
 pub const cli = @import("cli/cli.zig");
