@@ -32,8 +32,67 @@ pub fn build(b: *std.Build) void {
         .root_module = root_module,
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
-    const test_step = b.step("test", "Run unit tests");
+
+    // End-to-end tests see the engine only as the `basalt` module, its public API.
+    const basalt_module = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    basalt_module.addOptions("build_options", opts);
+    const e2e_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/e2e/run_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "basalt", .module = basalt_module }},
+        }),
+    });
+    const run_e2e_tests = b.addRunArtifact(e2e_tests);
+
+    const test_step = b.step("test", "Run unit and end-to-end tests");
     test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_e2e_tests.step);
+    const unit_step = b.step("test-unit", "Run the unit tests in src/");
+    unit_step.dependOn(&run_unit_tests.step);
+    const e2e_step = b.step("test-e2e", "Run the end-to-end tests in tests/e2e/");
+    e2e_step.dependOn(&run_e2e_tests.step);
+
+    // Line coverage of src/ by both suites, through kcov. The tests are built with
+    // LLVM here: the self-hosted backend's debug info is not one kcov can read.
+    const coverage_step = b.step("coverage", "Measure the tests' line coverage of src/ (needs kcov)");
+    if (b.findProgram(&.{"kcov"}, &.{})) |kcov| {
+        const out_dir = b.getInstallPath(.prefix, "coverage");
+        const include = b.fmt("--include-path={s}", .{b.pathFromRoot("src")});
+        const merge = b.addSystemCommand(&.{ kcov, "--merge", out_dir });
+        const cov_unit = b.addTest(.{ .name = "cov-unit", .root_module = root_module, .use_llvm = true });
+        const cov_e2e = b.addTest(.{ .name = "cov-e2e", .use_llvm = true, .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/e2e/run_test.zig"),
+            .target = target,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "basalt", .module = basalt_module }},
+        }) });
+        for ([_]*std.Build.Step.Compile{ cov_unit, cov_e2e }, [_][]const u8{ "unit", "e2e" }) |t, name| {
+            const dir = b.fmt("{s}-{s}", .{ out_dir, name });
+            const run = b.addSystemCommand(&.{ kcov, include, dir });
+            run.addArtifactArg(t);
+            run.has_side_effects = true;
+            merge.addArg(dir);
+            merge.step.dependOn(&run.step);
+        }
+        merge.has_side_effects = true;
+        const summary = b.addRunArtifact(b.addExecutable(.{
+            .name = "coverage-summary",
+            .root_module = b.createModule(.{ .root_source_file = b.path("tools/coverage_summary.zig"), .target = b.graph.host }),
+        }));
+        summary.addArg(b.fmt("{s}/kcov-merged/coverage.json", .{out_dir}));
+        summary.addArg(b.pathFromRoot("src"));
+        summary.step.dependOn(&merge.step);
+        summary.has_side_effects = true;
+        coverage_step.dependOn(&summary.step);
+    } else |_| {
+        coverage_step.dependOn(&b.addFail("coverage needs kcov on the PATH (dnf install kcov, apt install kcov)").step);
+    }
 
     const bench = b.addExecutable(.{
         .name = "bench",

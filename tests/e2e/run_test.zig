@@ -5,44 +5,39 @@
 //! fixture), `$LOOKUP` a join's build side, and `$B` the tmp dir in `checkAndRun`,
 //! which also asserts that `check` accepts what `run` executes. The default harness
 //! runs with `threads = 1`; the `*Threaded` helpers pick a thread count to reach
-//! the parallel paths, and compare sorted lines where lanes interleave output.
+//! the parallel paths, whose output keeps file order like a serial run's.
+//!
+//! The engine is reached only through the `basalt` module (src/root.zig), and the
+//! fixture files through `basalt.fixtures`. Tests of a single function live beside
+//! it in src/; these run whole scripts.
 
 const std = @import("std");
-const ast = @import("../lang/ast.zig");
-const types = @import("../lang/types.zig");
-const op = @import("../exec/op.zig");
-const column = @import("../exec/column.zig");
-const csv = @import("../format/csv.zig");
-const driver = @import("../connect/driver.zig");
-const Wal = @import("../connect/wal.zig").Wal;
-const parallel = @import("parallel.zig");
-const analyze = @import("analyze.zig");
-const obs = @import("obs.zig");
-const Value = @import("../exec/value.zig").Value;
+const basalt = @import("basalt");
+const ast = basalt.ast;
+const types = basalt.types;
+const op = basalt.op;
+const column = basalt.column;
+const csv = basalt.csv;
+const driver = basalt.driver;
+const Wal = basalt.wal.Wal;
+const parallel = basalt.parallel;
+const analyze = basalt.analyze;
+const obs = basalt.obs;
+const Value = basalt.value.Value;
+const parser = basalt.sql_parser;
+const fixtures = basalt.fixtures;
 
-const parser = @import("../lang/sql_parser.zig");
+const Diag = basalt.env.Diag;
+const isTransient = basalt.env.isTransient;
+const LogConfig = basalt.env.LogConfig;
+const LoopRow = basalt.env.LoopRow;
+const no_loop_vars = basalt.env.no_loop_vars;
+const OutcomeSink = basalt.env.OutcomeSink;
+const ParamArg = basalt.env.ParamArg;
 
-const Diag = @import("env.zig").Diag;
-const isTransient = @import("env.zig").isTransient;
-const LogConfig = @import("env.zig").LogConfig;
-const LoopRow = @import("env.zig").LoopRow;
-const no_loop_vars = @import("env.zig").no_loop_vars;
-const OutcomeSink = @import("env.zig").OutcomeSink;
-const ParamArg = @import("env.zig").ParamArg;
+const agg_combine_parallel_min = basalt.lanes.agg_combine_parallel_min;
 
-const sqlWithWhere = @import("connect.zig").sqlWithWhere;
-const selectListFor = @import("connect.zig").selectListFor;
-
-const agg_combine_parallel_min = @import("lanes.zig").agg_combine_parallel_min;
-const classifyAggPipeline = @import("lanes.zig").classifyAggPipeline;
-const classifyWholeAgg = @import("lanes.zig").classifyWholeAgg;
-const joinKindLaneSafe = @import("lanes.zig").joinKindLaneSafe;
-
-const interpAll = @import("script.zig").interpAll;
-const printText = @import("script.zig").printText;
-
-const run = @import("run.zig").run;
-const describeRows = @import("run.zig").describeRows;
+const run = basalt.runtime.run;
 
 fn runToString(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []const u8, query: []const u8) ![]u8 {
     return runToStringP(alloc, tmp, input, query, &[_]ParamArg{});
@@ -930,7 +925,7 @@ test "parallel load into parquet: lanes encode row groups, the file keeps every 
     try std.testing.expectEqualStrings(input.items, got);
 }
 
-const fx_rg2 = @embedFile("testdata/rg2.parquet");
+const fx_rg2 = fixtures.rg2_parquet;
 
 fn runParquetThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, query: []const u8, threads: usize) ![]u8 {
     try tmp.dir.writeFile(.{ .sub_path = "in.parquet", .data = fx_rg2 });
@@ -1420,55 +1415,6 @@ test "for-each: a typed loop var used as a value binds as its declared type" {
     try std.testing.expectEqualStrings("id,twice\n7,10\n", out);
 }
 
-test "interpAll: bare-var fast path and expression bodies" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const names = [_][]const u8{ "name", "pk" };
-
-    const empty = [_][]const u8{ "Account", "" };
-    const empty_row = LoopRow{ .names = &names, .cells = &empty };
-    try std.testing.expectEqualStrings("Account", try interpAll(a, "${name}", empty_row));
-    try std.testing.expectEqualStrings("${nope}", try interpAll(a, "${nope}", empty_row));
-
-    try std.testing.expectEqualStrings("crm_account", try interpAll(a, "crm_${lower(name)}", empty_row));
-    try std.testing.expectEqualStrings("ACCOUNT", try interpAll(a, "${upper(name)}", empty_row));
-
-    const key = "${if(pk == '', concat(lower(name), 'id'), pk)}";
-    try std.testing.expectEqualStrings("accountid", try interpAll(a, key, empty_row));
-
-    const given = [_][]const u8{ "ListMember", "lm_custom_id" };
-    try std.testing.expectEqualStrings("lm_custom_id", try interpAll(a, key, .{ .names = &names, .cells = &given }));
-
-    try std.testing.expectEqualStrings("}", try interpAll(a, "${if(pk == '', '}', pk)}", empty_row));
-}
-
-test "interpAll: malformed bodies error" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const names = [_][]const u8{ "name", "pk" };
-    const vals = [_][]const u8{ "Account", "" };
-    const row = LoopRow{ .names = &names, .cells = &vals };
-    try std.testing.expectError(error.InterpFailed, interpAll(a, "${if(pk ==)}", row));
-    try std.testing.expectError(error.InterpFailed, interpAll(a, "${name:lower}", row));
-}
-
-test "interpAll: a typed loop var binds as its type in an expression body" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const names = [_][]const u8{"port"};
-    const expr = "${if(port >= 1000, 'big', 'small')}";
-
-    const typed = [_]?types.Type{types.Type.init(.int)};
-    try std.testing.expectEqualStrings("big", try interpAll(a, expr, .{ .names = &names, .types = &typed, .cells = &[_][]const u8{"9030"} }));
-    try std.testing.expectEqualStrings("small", try interpAll(a, expr, .{ .names = &names, .types = &typed, .cells = &[_][]const u8{"80"} }));
-
-    const untyped = [_]?types.Type{null};
-    try std.testing.expectError(error.InterpFailed, interpAll(a, expr, .{ .names = &names, .types = &untyped, .cells = &[_][]const u8{"9030"} }));
-}
-
 fn runScript(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, script: []const u8, cli_params: []const ParamArg) ![]u8 {
     var parena = std.heap.ArenaAllocator.init(alloc);
     defer parena.deinit();
@@ -1759,7 +1705,7 @@ test "WITH (format = 'csv') reads a file whose extension says nothing" {
     try std.testing.expectEqualStrings("id\n1\n2\n", out);
 }
 
-const fx_zip = @embedFile("../format/testdata/two_members.zip");
+const fx_zip = fixtures.two_members_zip;
 
 test "read a zip member end to end with the :: reference" {
     const alloc = std.testing.allocator;
@@ -2150,24 +2096,6 @@ test "for-each SELECT discovery with fewer columns than loop variables fails to 
     var rdiag: Diag = .{};
     try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "fewer columns than loop variables") != null);
-}
-
-test "sqlWithWhere: table appends WHERE, query wraps, empty is a no-op" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    try std.testing.expectEqualStrings(
-        "SELECT * FROM SC1010 WHERE S_T_A_M_P_ >= '2026-05-09'",
-        try sqlWithWhere(a, "SELECT * FROM SC1010", false, "S_T_A_M_P_ >= '2026-05-09'"),
-    );
-    try std.testing.expectEqualStrings(
-        "SELECT * FROM (SELECT id FROM t WHERE x = 1) _w WHERE id > 5",
-        try sqlWithWhere(a, "SELECT id FROM t WHERE x = 1", true, "id > 5"),
-    );
-    try std.testing.expectEqualStrings(
-        "SELECT * FROM SC1010",
-        try sqlWithWhere(a, "SELECT * FROM SC1010", false, ""),
-    );
 }
 
 test "for-each parallel + on_error=continue isolates a failing table" {
@@ -2676,30 +2604,6 @@ test "THROW: a fired guard is the verbatim, permanent error; a false WHEN is a n
     try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(alloc, "never.csv", 1 << 20));
 }
 
-test "PRINT renders literals, `||` over params, and a loop variable" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    var params = std.StringHashMap(Value).init(a);
-    try params.put("since", .{ .string = "2024-01-01" });
-    try params.put("n", .{ .int = 7 });
-
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const lit = try parser.parseExprStr(a, "'loading'", &pdiag);
-    try std.testing.expectEqualStrings("loading", try printText(a, lit, no_loop_vars, &params));
-
-    const cat = try parser.parseExprStr(a, "'since ' || $since", &pdiag);
-    try std.testing.expectEqualStrings("since 2024-01-01", try printText(a, cat, no_loop_vars, &params));
-
-    const num = try parser.parseExprStr(a, "$n", &pdiag);
-    try std.testing.expectEqualStrings("7", try printText(a, num, no_loop_vars, &params));
-
-    const lr = LoopRow{ .names = &[_][]const u8{"name"}, .cells = &[_][]const u8{"acme"} };
-    const row = try parser.parseExprStr(a, "'company ' || $name", &pdiag);
-    try std.testing.expectEqualStrings("company acme", try printText(a, row, lr, &params));
-}
-
 test "PRINT runs at the top level and per row inside a FOR EACH body" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2888,60 +2792,6 @@ test "parallel join then GROUP BY matches serial" {
 
     try std.testing.expectEqualStrings("label,n\nApple,400\nBanana,400\nCherry,400\n", serial);
     try std.testing.expectEqualStrings(serial, par);
-}
-
-test "join kinds allowed on the parallel probe path" {
-    try std.testing.expect(joinKindLaneSafe(.inner));
-    try std.testing.expect(joinKindLaneSafe(.left));
-    try std.testing.expect(joinKindLaneSafe(.semi));
-    try std.testing.expect(joinKindLaneSafe(.anti));
-    try std.testing.expect(joinKindLaneSafe(.cross));
-    try std.testing.expect(!joinKindLaneSafe(.right));
-    try std.testing.expect(!joinKindLaneSafe(.full));
-}
-
-test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hints" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    const p = ast.Pos{ .line = 0, .col = 0 };
-    const pred = try a.create(ast.Expr);
-    pred.* = .{ .bool_lit = true };
-    const items = try a.alloc(ast.SelectItem, 1);
-    items[0] = .star;
-
-    const rd = ast.Stage{ .node = .{ .read = .{ .connector = "db", .form = .{ .table = .{ .parts = &.{"t"} } } } }, .hints = &.{}, .pos = p };
-    const flt = ast.Stage{ .node = .{ .filter = pred }, .hints = &.{}, .pos = p };
-    const sel = ast.Stage{ .node = .{ .select = items }, .hints = &.{}, .pos = p };
-    const agg = ast.Stage{ .node = .{ .aggregate = .{ .aggs = &.{}, .by = &.{} } }, .hints = &.{}, .pos = p };
-    const wrt = ast.Stage{ .node = .{ .write = .{ .connector = "csv", .form = null, .target = "o.csv", .mode = .default } }, .hints = &.{}, .pos = p };
-
-    const simple = [_]ast.Stage{ rd, flt, agg, wrt };
-    const s1 = classifyWholeAgg(&simple).?;
-    try std.testing.expectEqual(@as(usize, 1), s1.prefix.len);
-    try std.testing.expectEqual(@as(usize, 0), s1.tail.len);
-
-    const having = [_]ast.Stage{ rd, agg, flt, flt, wrt };
-    const s2 = classifyWholeAgg(&having).?;
-    try std.testing.expectEqual(@as(usize, 0), s2.prefix.len);
-    try std.testing.expectEqual(@as(usize, 2), s2.tail.len);
-    const lane = classifyAggPipeline(&having).?;
-    try std.testing.expectEqual(@as(usize, 0), lane.prefix.len);
-    try std.testing.expectEqual(@as(usize, 2), lane.tail.len);
-
-    const selected = [_]ast.Stage{ rd, sel, agg, wrt };
-    try std.testing.expect(classifyWholeAgg(&selected) == null);
-
-    const no_agg = [_]ast.Stage{ rd, flt, wrt };
-    try std.testing.expect(classifyWholeAgg(&no_agg) == null);
-
-    const hints = try a.alloc(ast.Hint, 1);
-    hints[0] = .{ .key = "split", .value = .{ .ident = "id" }, .pos = p };
-    var hinted_rd = rd;
-    hinted_rd.hints = hints;
-    const hinted = [_]ast.Stage{ hinted_rd, flt, agg, wrt };
-    try std.testing.expect(classifyWholeAgg(&hinted) == null);
 }
 
 test "a plan failure carries the failing stage's position" {
@@ -3208,7 +3058,7 @@ test "an Excel workbook reads as a table: typed columns, a named sheet and range
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "f.xlsx", .data = @embedFile("../format/testdata/openpyxl.xlsx") });
+    try tmp.dir.writeFile(.{ .sub_path = "f.xlsx", .data = fixtures.openpyxl_xlsx });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
     const cases = [_]struct { q: []const u8, want: []const u8 }{
@@ -3619,18 +3469,6 @@ test "DISTINCT ON keys are input columns: renamed, unprojected, and beside an OR
     try expectFile(&tmp, "pair.csv", "id\n1\n2\n3\n4\n");
 }
 
-test "DESCRIBE rows: name, engine type (decimal with its precision), nullable" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const fields = [_]types.Schema.Field{
-        .{ .name = "id", .ty = types.Type.init(.int) },
-        .{ .name = "amt", .ty = types.Type.decimal(10, 2).asNullable() },
-        .{ .name = "a,b", .ty = types.Type.init(.string).asNullable() },
-    };
-    const rows = try describeRows(ar.allocator(), .{ .fields = &fields });
-    try std.testing.expectEqualStrings("id,int,no\namt,\"decimal(10,2)\",yes\n\"a,b\",string,yes\n", rows);
-}
-
 test "EXCEPT (IDENTIFIER($cols)): a comma list excludes each name, an empty one excludes nothing" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3674,17 +3512,7 @@ test "union: SELECT * EXCEPT drops a column before the branches are reconciled, 
     try expectFile(&tmp, "ok.csv", "id\n1\n2\n");
 }
 
-test "a projected SQL read asks for its columns, quoted per dialect; none means *" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    try std.testing.expectEqualStrings("*", try selectListFor(a, .sqlserver, &.{}));
-    try std.testing.expectEqualStrings("[E1_NUM], [E1_VALOR]", try selectListFor(a, .sqlserver, &.{ "E1_NUM", "E1_VALOR" }));
-    try std.testing.expectEqualStrings("\"id\", \"amount\"", try selectListFor(a, .postgres, &.{ "id", "amount" }));
-    try std.testing.expectEqualStrings("`id`", try selectListFor(a, .mysql, &.{"id"}));
-}
-
-const fx_logical = @embedFile("../format/testdata/logical_types.parquet");
+const fx_logical = fixtures.logical_types_parquet;
 
 test "LogicalType-only parquet timestamps and times read back as wall-clock values" {
     const alloc = std.testing.allocator;
@@ -3718,7 +3546,7 @@ test "a parquet LIST column unnests through JSON_EACH, one row per element" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "l.parquet", .data = @embedFile("../format/testdata/lists_v2.parquet") });
+    try tmp.dir.writeFile(.{ .sub_path = "l.parquet", .data = fixtures.lists_v2_parquet });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
     const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
@@ -3739,7 +3567,7 @@ test "copying a parquet with nested columns keeps every one of them" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "src.parquet", .data = @embedFile("../format/testdata/lists_v1.parquet") });
+    try tmp.dir.writeFile(.{ .sub_path = "src.parquet", .data = fixtures.lists_v1_parquet });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
     const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
@@ -3832,7 +3660,7 @@ test "a database that closes the connection is a transient failure (exit 75), at
 }
 
 test "onWire names a closed or failed database socket as transient, and leaves the rest alone" {
-    const sql = @import("../db/sql.zig");
+    const sql = basalt.sql;
     try std.testing.expectEqual(error.ServerClosedConnection, sql.onWire(error.EndOfStream));
     try std.testing.expectEqual(error.ServerClosedConnection, sql.onWire(error.TlsConnectionTruncated));
     try std.testing.expectEqual(error.ConnectionIoFailed, sql.onWire(error.ReadFailed));
@@ -3847,9 +3675,9 @@ test "onWire names a closed or failed database socket as transient, and leaves t
 const LoadLog = struct {
     mu: std.Thread.Mutex = .{},
     arena: std.mem.Allocator,
-    list: std.array_list.Managed(@import("env.zig").LoadDone),
+    list: std.array_list.Managed(basalt.env.LoadDone),
 
-    fn f(ctx: *anyopaque, done: @import("env.zig").LoadDone) void {
+    fn f(ctx: *anyopaque, done: basalt.env.LoadDone) void {
         const self: *LoadLog = @ptrCast(@alignCast(ctx));
         self.mu.lock();
         defer self.mu.unlock();
@@ -3879,7 +3707,7 @@ test "on_load: every LOAD reports as it finishes — written, failed before writ
             \\LOAD INTO '/nonexistent/x.csv' AS SELECT 1 AS v;
         , .{base});
         const prog = try parser.parseSource(a, src, &pdiag);
-        var summary: @import("obs.zig").Summary = .{ .run_id = 0 };
+        var summary: basalt.obs.Summary = .{ .run_id = 0 };
         var rdiag: Diag = .{};
         try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{ .on_load = .{ .ctx = &log, .f = LoadLog.f }, .summary_out = &summary }, &rdiag));
         try std.testing.expectEqual(@as(usize, 2), log.list.items.len);
@@ -3934,7 +3762,7 @@ test "on_load: every LOAD reports as it finishes — written, failed before writ
             \\END FOR;
         , .{ base, base, base });
         const prog = try parser.parseSource(a, src, &pdiag);
-        var summary: @import("obs.zig").Summary = .{ .run_id = 0 };
+        var summary: basalt.obs.Summary = .{ .run_id = 0 };
         var rdiag: Diag = .{};
         _ = run(alloc, prog, .{ .threads = 4, .on_load = .{ .ctx = &log, .f = LoadLog.f }, .summary_out = &summary }, &rdiag) catch |e| {
             std.debug.print("parallel on_load run: {s} ({s})\n", .{ @errorName(e), rdiag.msg });

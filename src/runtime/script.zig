@@ -668,3 +668,76 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
         },
     }
 }
+
+test "interpAll: bare-var fast path and expression bodies" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const names = [_][]const u8{ "name", "pk" };
+
+    const empty = [_][]const u8{ "Account", "" };
+    const empty_row = LoopRow{ .names = &names, .cells = &empty };
+    try std.testing.expectEqualStrings("Account", try interpAll(a, "${name}", empty_row));
+    try std.testing.expectEqualStrings("${nope}", try interpAll(a, "${nope}", empty_row));
+
+    try std.testing.expectEqualStrings("crm_account", try interpAll(a, "crm_${lower(name)}", empty_row));
+    try std.testing.expectEqualStrings("ACCOUNT", try interpAll(a, "${upper(name)}", empty_row));
+
+    const key = "${if(pk == '', concat(lower(name), 'id'), pk)}";
+    try std.testing.expectEqualStrings("accountid", try interpAll(a, key, empty_row));
+
+    const given = [_][]const u8{ "ListMember", "lm_custom_id" };
+    try std.testing.expectEqualStrings("lm_custom_id", try interpAll(a, key, .{ .names = &names, .cells = &given }));
+
+    try std.testing.expectEqualStrings("}", try interpAll(a, "${if(pk == '', '}', pk)}", empty_row));
+}
+
+test "interpAll: malformed bodies error" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const names = [_][]const u8{ "name", "pk" };
+    const vals = [_][]const u8{ "Account", "" };
+    const row = LoopRow{ .names = &names, .cells = &vals };
+    try std.testing.expectError(error.InterpFailed, interpAll(a, "${if(pk ==)}", row));
+    try std.testing.expectError(error.InterpFailed, interpAll(a, "${name:lower}", row));
+}
+
+test "interpAll: a typed loop var binds as its type in an expression body" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const names = [_][]const u8{"port"};
+    const expr = "${if(port >= 1000, 'big', 'small')}";
+
+    const typed = [_]?types.Type{types.Type.init(.int)};
+    try std.testing.expectEqualStrings("big", try interpAll(a, expr, .{ .names = &names, .types = &typed, .cells = &[_][]const u8{"9030"} }));
+    try std.testing.expectEqualStrings("small", try interpAll(a, expr, .{ .names = &names, .types = &typed, .cells = &[_][]const u8{"80"} }));
+
+    const untyped = [_]?types.Type{null};
+    try std.testing.expectError(error.InterpFailed, interpAll(a, expr, .{ .names = &names, .types = &untyped, .cells = &[_][]const u8{"9030"} }));
+}
+
+test "PRINT renders literals, `||` over params, and a loop variable" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var params = std.StringHashMap(Value).init(a);
+    try params.put("since", .{ .string = "2024-01-01" });
+    try params.put("n", .{ .int = 7 });
+
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const lit = try parser.parseExprStr(a, "'loading'", &pdiag);
+    try std.testing.expectEqualStrings("loading", try printText(a, lit, no_loop_vars, &params));
+
+    const cat = try parser.parseExprStr(a, "'since ' || $since", &pdiag);
+    try std.testing.expectEqualStrings("since 2024-01-01", try printText(a, cat, no_loop_vars, &params));
+
+    const num = try parser.parseExprStr(a, "$n", &pdiag);
+    try std.testing.expectEqualStrings("7", try printText(a, num, no_loop_vars, &params));
+
+    const lr = LoopRow{ .names = &[_][]const u8{"name"}, .cells = &[_][]const u8{"acme"} };
+    const row = try parser.parseExprStr(a, "'company ' || $name", &pdiag);
+    try std.testing.expectEqualStrings("company acme", try printText(a, row, lr, &params));
+}

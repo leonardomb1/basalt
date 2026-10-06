@@ -1643,3 +1643,31 @@ test "a starrocks connection reads over MySQL: FE host and port, default 9030" {
     } };
     try std.testing.expectEqual(@as(u16, 9031), (try parseDbConfig(explicit, info.port, LitCfg{})).port);
 }
+
+test "sqlWithWhere: table appends WHERE, query wraps, empty is a no-op" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings(
+        "SELECT * FROM SC1010 WHERE S_T_A_M_P_ >= '2026-05-09'",
+        try sqlWithWhere(a, "SELECT * FROM SC1010", false, "S_T_A_M_P_ >= '2026-05-09'"),
+    );
+    try std.testing.expectEqualStrings(
+        "SELECT * FROM (SELECT id FROM t WHERE x = 1) _w WHERE id > 5",
+        try sqlWithWhere(a, "SELECT id FROM t WHERE x = 1", true, "id > 5"),
+    );
+    try std.testing.expectEqualStrings(
+        "SELECT * FROM SC1010",
+        try sqlWithWhere(a, "SELECT * FROM SC1010", false, ""),
+    );
+}
+
+test "a projected SQL read asks for its columns, quoted per dialect; none means *" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("*", try selectListFor(a, .sqlserver, &.{}));
+    try std.testing.expectEqualStrings("[E1_NUM], [E1_VALOR]", try selectListFor(a, .sqlserver, &.{ "E1_NUM", "E1_VALOR" }));
+    try std.testing.expectEqualStrings("\"id\", \"amount\"", try selectListFor(a, .postgres, &.{ "id", "amount" }));
+    try std.testing.expectEqualStrings("`id`", try selectListFor(a, .mysql, &.{"id"}));
+}

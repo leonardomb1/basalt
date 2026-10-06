@@ -176,11 +176,17 @@ apply), with `AWS_ENDPOINT_URL` for MinIO and the like.
 ## Tests
 
 ```console
-zig build test                    # unit tests, no services needed
+zig build test                                   # unit and end-to-end tests, no services needed
+zig build test-unit                              # just the unit tests beside the code in src/
+zig build test-e2e                               # just the whole-script tests in tests/e2e/
+zig build coverage                               # line coverage of src/ per folder (needs kcov)
 ./tests/integration/run.sh                       # integration suite (needs docker)
 ./tests/integration/run.sh azure parquet         # just those suites
 ./tests/integration/run.sh stdout kernel arrow   # the CLI's own contracts: no containers
 ```
+
+Unit tests live beside the code they test; `tests/e2e/` runs whole scripts against
+the engine's public module. `coverage` writes its HTML report to `zig-out/coverage/`.
 
 The integration suite starts only the containers the selected suites need;
 `kernel` needs `python3`, `arrow` needs `uv` (it checks results with pyarrow).

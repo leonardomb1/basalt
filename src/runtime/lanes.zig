@@ -2547,3 +2547,57 @@ test "classifyAggJoinPipeline accepts a HAVING tail, as classifyAggPipeline does
     const plain = try testStages(a, "LOAD INTO 'o.csv' AS SELECT g, COUNT(*) AS n FROM 'x.parquet' GROUP BY g HAVING COUNT(*) > 1;");
     try std.testing.expect(classifyAggPipeline(plain) != null);
 }
+
+test "join kinds allowed on the parallel probe path" {
+    try std.testing.expect(joinKindLaneSafe(.inner));
+    try std.testing.expect(joinKindLaneSafe(.left));
+    try std.testing.expect(joinKindLaneSafe(.semi));
+    try std.testing.expect(joinKindLaneSafe(.anti));
+    try std.testing.expect(joinKindLaneSafe(.cross));
+    try std.testing.expect(!joinKindLaneSafe(.right));
+    try std.testing.expect(!joinKindLaneSafe(.full));
+}
+
+test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hints" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const p = ast.Pos{ .line = 0, .col = 0 };
+    const pred = try a.create(ast.Expr);
+    pred.* = .{ .bool_lit = true };
+    const items = try a.alloc(ast.SelectItem, 1);
+    items[0] = .star;
+
+    const rd = ast.Stage{ .node = .{ .read = .{ .connector = "db", .form = .{ .table = .{ .parts = &.{"t"} } } } }, .hints = &.{}, .pos = p };
+    const flt = ast.Stage{ .node = .{ .filter = pred }, .hints = &.{}, .pos = p };
+    const sel = ast.Stage{ .node = .{ .select = items }, .hints = &.{}, .pos = p };
+    const agg = ast.Stage{ .node = .{ .aggregate = .{ .aggs = &.{}, .by = &.{} } }, .hints = &.{}, .pos = p };
+    const wrt = ast.Stage{ .node = .{ .write = .{ .connector = "csv", .form = null, .target = "o.csv", .mode = .default } }, .hints = &.{}, .pos = p };
+
+    const simple = [_]ast.Stage{ rd, flt, agg, wrt };
+    const s1 = classifyWholeAgg(&simple).?;
+    try std.testing.expectEqual(@as(usize, 1), s1.prefix.len);
+    try std.testing.expectEqual(@as(usize, 0), s1.tail.len);
+
+    const having = [_]ast.Stage{ rd, agg, flt, flt, wrt };
+    const s2 = classifyWholeAgg(&having).?;
+    try std.testing.expectEqual(@as(usize, 0), s2.prefix.len);
+    try std.testing.expectEqual(@as(usize, 2), s2.tail.len);
+    const lane = classifyAggPipeline(&having).?;
+    try std.testing.expectEqual(@as(usize, 0), lane.prefix.len);
+    try std.testing.expectEqual(@as(usize, 2), lane.tail.len);
+
+    const selected = [_]ast.Stage{ rd, sel, agg, wrt };
+    try std.testing.expect(classifyWholeAgg(&selected) == null);
+
+    const no_agg = [_]ast.Stage{ rd, flt, wrt };
+    try std.testing.expect(classifyWholeAgg(&no_agg) == null);
+
+    const hints = try a.alloc(ast.Hint, 1);
+    hints[0] = .{ .key = "split", .value = .{ .ident = "id" }, .pos = p };
+    var hinted_rd = rd;
+    hinted_rd.hints = hints;
+    const hinted = [_]ast.Stage{ hinted_rd, flt, agg, wrt };
+    try std.testing.expect(classifyWholeAgg(&hinted) == null);
+}

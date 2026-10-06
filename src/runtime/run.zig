@@ -1030,7 +1030,6 @@ test {
     _ = @import("plan.zig");
     _ = @import("lanes.zig");
     _ = @import("script.zig");
-    _ = @import("run_test.zig");
 }
 
 const describe_fields = [_]types.Schema.Field{
@@ -1221,4 +1220,16 @@ fn runForMatch(env: *Env, m: ast.StmtMatch, lr: LoopRow, opts: RunOptions, stats
     }
     const idx = (try matchArmIndex(env, m, names.items, values.items, "for/match")) orelse return;
     try runForBody(env, m.arms[idx].body, lr, opts, stats, lanes_used, batch_arena);
+}
+
+test "DESCRIBE rows: name, engine type (decimal with its precision), nullable" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const fields = [_]types.Schema.Field{
+        .{ .name = "id", .ty = types.Type.init(.int) },
+        .{ .name = "amt", .ty = types.Type.decimal(10, 2).asNullable() },
+        .{ .name = "a,b", .ty = types.Type.init(.string).asNullable() },
+    };
+    const rows = try describeRows(ar.allocator(), .{ .fields = &fields });
+    try std.testing.expectEqualStrings("id,int,no\namt,\"decimal(10,2)\",yes\n\"a,b\",string,yes\n", rows);
 }
