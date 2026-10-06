@@ -209,7 +209,7 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
 fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[][]const u8) !driver.Source {
     if (std.mem.eql(u8, rd.connector, "request")) {
         const body = env.request_body orelse
-            return planErr(env.diag, "`read request` is only available when serving HTTP (@http)");
+            return planErr(env.diag, "`FROM BODY` is only available to an endpoint script (`CREATE ENDPOINT`) served over HTTP");
         const declared: ?[]const types.BodyCol = if (rd.form == .request) rd.form.request else null;
         var reject: []const u8 = "";
         const s = request.RequestSource.open(env.gpa, body, declared, env.arena, &reject) catch |e| {

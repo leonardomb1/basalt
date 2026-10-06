@@ -7,6 +7,7 @@ const DeclStore = @import("entry.zig").DeclStore;
 const Offer = @import("catalog.zig").Offer;
 const declOf = @import("entry.zig").declOf;
 const loadSource = @import("args.zig").loadSource;
+const loadExit = @import("args.zig").loadExit;
 const nextVal = @import("args.zig").nextVal;
 const splitStatements = @import("entry.zig").splitStatements;
 const std = @import("std");
@@ -48,7 +49,10 @@ pub fn cmdComplete(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             utf16 = true;
         } else if (try unknownOption(arg, "complete", stderr)) return 2;
     }
-    const src = (try loadSource(a, "complete", args, stderr)) orelse return 1;
+    const src = loadSource(a, "complete", args, stderr) catch |e| switch (e) {
+        error.Usage, error.Unreadable => |le| return loadExit(le),
+        else => return e,
+    };
     const at = if (pos) |p| (if (utf16) utf16ToByte(src.text, p) else p) else src.text.len;
     if (at > src.text.len) {
         try stderr.print("error: --pos {d} is past the script's {d} bytes\n", .{ at, src.text.len });

@@ -426,7 +426,11 @@ pub const LoopRow = struct {
     }
 };
 
-pub const body_stmt_rule = "a `for` or statement-function body may contain only pipelines, `WITH`, `FOR EACH`, `CASE`, `CALL`, `PRINT`, `EXPLAIN` and `THROW` statements";
+pub const tls_values_msg = "connection `tls` must be \"off\", \"require\" or \"insecure\"";
+pub const auth_values_msg = "connection `auth` must be \"sql\", \"aad\", \"ntlm\" or \"kerberos\"";
+pub const ntlm_needs_tls_msg = "connection `auth = 'ntlm'` requires an encrypted channel: set `tls = 'require'`, or `tls = 'insecure'` for a self-signed server certificate";
+
+pub const body_stmt_rule = "a `FOR EACH` or statement-function body may contain only queries, `WITH`, `FOR EACH`, `CASE`, `CALL`, `PRINT`, `EXPLAIN` and `THROW` statements";
 
 pub const no_loop_vars = LoopRow{ .names = &[_][]const u8{}, .cells = &[_][]const u8{} };
 

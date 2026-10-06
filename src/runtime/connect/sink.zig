@@ -46,13 +46,13 @@ const xlsx = @import("../../format/xlsx.zig");
 /// source gets an error pointing at `upsert on <col>`.
 pub fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
     if (w.mode != .upsert or w.mode.upsert.keys.len > 0) return w;
-    const desc = env.sql_desc orelse return planErr(env.diag, "`upsert` without `on <key>` infers the primary key from the source, which needs a SQL `table` read — this pipeline's source can't be introspected; name the key with `upsert on <col>`");
-    const table = desc.table orelse return planErr(env.diag, "`upsert` key inference needs `read <conn> table <name>` (a `query` source has no single table to introspect); name the key with `upsert on <col>`");
+    const desc = env.sql_desc orelse return planErr(env.diag, "a bare `UPSERT` infers the primary key from the source, which needs a SQL table read — this query's source can't be introspected; name the key with `UPSERT ON (col)`");
+    const table = desc.table orelse return planErr(env.diag, "a bare `UPSERT` needs a table read (`FROM conn.schema.table`) to infer its key; a `QUERY(...)` has no single table to introspect — name the key with `UPSERT ON (col)`");
     var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql, .report = try readReport(env, @tagName(desc.kind)) };
     const prober = split.Prober{ .ctx = &pctx, .openFn = proberOpen };
     const keys = split.introspectPkCols(env.arena, prober, desc.dialect, table) catch |e|
         return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read primary key of `{s}`: {s}", .{ table, @errorName(e) }));
-    if (keys.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no primary key found on `{s}`; name the key with `upsert on <col>`", .{table}));
+    if (keys.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no primary key found on `{s}`; name the key with `UPSERT ON (col)`", .{table}));
     env.log.log(.debug, "upsert: inferred key on {s}: {s}", .{ table, try std.mem.join(env.arena, ", ", keys) });
     var out = w;
     out.mode = .{ .upsert = .{ .keys = keys, .partial = w.mode.upsert.partial } };

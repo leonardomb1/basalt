@@ -15,12 +15,13 @@ pub fn cmdServe(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     defer stderr.flush() catch {};
 
     if (args.len < 3 or (args[2].len > 0 and args[2][0] == '-')) {
-        try stderr.print("error: `serve` requires a <dir> of @http scripts\n", .{});
+        try stderr.print("error: `serve` requires a <dir> of endpoint scripts (`CREATE ENDPOINT`)\n", .{});
         return 2;
     }
     const dir = args[2];
 
     var port: u16 = 8080;
+    var host: []const u8 = http_server.default_host;
     var watch = false;
     var log = runtime.LogConfig{ .level = .info, .summary = .stderr };
     var i: usize = 3;
@@ -29,6 +30,12 @@ pub fn cmdServe(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             const v = (try nextVal(args, &i, "--port", stderr)) orelse return 2;
             port = std.fmt.parseInt(u16, v, 10) catch {
                 try stderr.print("error: invalid --port `{s}`\n", .{v});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, args[i], "--host")) {
+            host = (try nextVal(args, &i, "--host", stderr)) orelse return 2;
+            _ = std.net.Address.parseIp(host, 0) catch {
+                try stderr.print("error: invalid --host `{s}` (an IP address, such as 127.0.0.1)\n", .{host});
                 return 2;
             };
         } else if (std.mem.eql(u8, args[i], "--watch") or std.mem.eql(u8, args[i], "-w")) {
@@ -50,7 +57,7 @@ pub fn cmdServe(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         } else if (try unknownOption(args[i], "serve", stderr)) return 2;
     }
 
-    http_server.serveDir(alloc, dir, port, watch, log) catch |e| {
+    http_server.serveDir(alloc, dir, host, port, watch, log) catch |e| {
         try stderr.print("serve error: {s}\n", .{@errorName(e)});
         return 1;
     };

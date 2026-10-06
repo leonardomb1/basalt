@@ -164,7 +164,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     };
 
     if (program.stmts.len == 0 or program.stmts[0] != .kind)
-        return planErr(diag, "script must begin with a @kind tag");
+        return planErr(diag, "internal error: the parsed program has no kind statement");
     var params = std.StringHashMap(Value).init(arena);
     try resolveParams(arena, program, opts.params, &params, diag);
     var params_expr = std.StringHashMap(*const ast.Expr).init(arena);
@@ -204,6 +204,11 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
                 diag.pos = c.pos;
                 return e;
             }
+            if (analyze.sqlOptionProblem(c)) |why| {
+                const e = planErr(diag, why);
+                diag.pos = c.pos;
+                return e;
+            }
             try connections.put(c.name, c);
         },
         .func => |fd| try fns.put(fd.name, fd),
@@ -212,7 +217,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         .param, .kind, .let_const, .throw => {},
     };
     if (runnable == 0 and !opts.declarations_only)
-        return planErr(diag, "no output pipeline (a pipeline ending in `write`)");
+        return planErr(diag, "nothing to run: the script needs a `LOAD INTO` or a terminal `SELECT`");
 
     const run_id: u64 = @intCast(std.time.milliTimestamp());
     var logger = obs.Logger.init(run_id, opts.log.format, if (opts.log.quiet) .err else opts.log.level);

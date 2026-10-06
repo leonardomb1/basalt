@@ -257,14 +257,14 @@ test "analyze checks the stages after a join against the joined schema" {
     try std.testing.expect(stages[stages.len - 1].out_schema != null);
 }
 
-test "analyze rejects a program with no output pipeline" {
+test "analyze rejects a program with nothing to run" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     const prog = try parse(a, "PARAM x INT DEFAULT 1;");
     var diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, prog, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "no output pipeline") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "nothing to run") != null);
 }
 
 test "analyze rejects `* rename` onto a duplicate column name" {

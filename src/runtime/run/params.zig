@@ -4,8 +4,10 @@
 const Diag = @import("../env.zig").Diag;
 const ParamArg = @import("../env.zig").ParamArg;
 const Value = @import("../../exec/value.zig").Value;
+const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
 const constEvalDefault = @import("../run.zig").constEvalDefault;
+const errLabel = @import("../env.zig").errLabel;
 const eval = @import("../../exec/eval.zig");
 const mkLit = @import("../env.zig").mkLit;
 const planErr = @import("../env.zig").planErr;
@@ -29,6 +31,8 @@ pub fn resolveParams(arena: std.mem.Allocator, program: ast.Program, cli: []cons
         var v: ?Value = null;
         for (cli) |kv| {
             if (std.mem.eql(u8, kv.key, p.name)) {
+                if (analyze.paramTextProblem(arena, p.ty, kv.val)) |want|
+                    return planErr(diag, try std.fmt.allocPrint(arena, "PARAM `{s}`: `{s}` is not {s}", .{ p.name, kv.val, want }));
                 v = try parseParamValue(arena, p.ty, kv.val, diag);
                 break;
             }
@@ -36,9 +40,15 @@ pub fn resolveParams(arena: std.mem.Allocator, program: ast.Program, cli: []cons
         if (v == null) {
             if (p.default) |d| {
                 const raw = try constEvalDefault(d, diag);
+                if (raw == .string and p.ty.kind != .string and p.ty.kind != .bytes) {
+                    if (analyze.paramTextProblem(arena, p.ty, raw.string)) |want|
+                        return planErr(diag, try std.fmt.allocPrint(arena, "PARAM `{s}`: `{s}` is not {s}", .{ p.name, raw.string, want }));
+                    try params.put(p.name, try parseParamValue(arena, p.ty, raw.string, diag));
+                    continue;
+                }
                 v = switch (p.ty.kind) {
                     .date, .time, .timestamp, .decimal => if (raw == .null) raw else eval.castValueTyped(arena, raw, p.ty) catch
-                        return planErr(diag, try std.fmt.allocPrint(arena, "PARAM `{s}`: `{s}` is not a {s}", .{ p.name, if (raw == .string) raw.string else "its DEFAULT", try p.ty.name(arena) })),
+                        return planErr(diag, try std.fmt.allocPrint(arena, "PARAM `{s}`: `{s}` is not {s}", .{ p.name, if (raw == .string) raw.string else "its DEFAULT", analyze.paramTextProblem(arena, p.ty, if (raw == .string) raw.string else "") orelse try p.ty.name(arena) })),
                     else => raw,
                 };
             } else {
@@ -77,9 +87,14 @@ pub fn resolveLets(
         if (params.contains(l.name))
             return planErr(diag, try std.fmt.allocPrint(arena, "duplicate LET `{s}`", .{l.name}));
 
+        if (try analyze.letRefProblem(arena, program, l)) |why| {
+            const e = planErr(diag, why);
+            diag.pos = l.pos;
+            return e;
+        }
         const le = l.expr orelse continue;
         const v = eval.constEval(arena, le, names.items, values.items) catch |e|
-            return planErr(diag, try std.fmt.allocPrint(arena, "LET `{s}`: {s}", .{ l.name, @errorName(e) }));
+            return planErr(diag, try std.fmt.allocPrint(arena, "LET `{s}`: {s}", .{ l.name, errLabel(e) }));
         try names.append(l.name);
         try values.append(v);
         try params.put(l.name, v);

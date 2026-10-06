@@ -318,11 +318,11 @@ fn expandRecur(ctx: ExpandCtx, e: *const ast.Expr) Error!*ast.Expr {
 
 fn expandExpr(cx: *Ctx, e: *const ast.Expr, subst: ?*Subst, depth: usize) Error!*ast.Expr {
     if (depth > max_depth) {
-        cx.msg.* = "fn expansion too deep (recursive `fn`?)";
+        cx.msg.* = "function expansion too deep (a recursive function?)";
         return error.ExpandFailed;
     }
     if (cx.budget == 0) {
-        cx.msg.* = "fn expansion produced too many nodes (a `fn` that calls another twice per level?)";
+        cx.msg.* = "function expansion produced too many nodes (a function that calls another twice per level?)";
         return error.ExpandFailed;
     }
     cx.budget -= 1;

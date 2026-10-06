@@ -1146,14 +1146,14 @@ test "DATE, TIMESTAMP, TIME and DECIMAL params bind from text as a CAST reads it
     const prog = try parser.parseSource(parena.allocator(), "PARAM d DATE DEFAULT 'nope'; SELECT $d AS d;", &pdiag);
     var rdiag: Diag = .{};
     try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
-    try std.testing.expectEqualStrings("PARAM `d`: `nope` is not a date", rdiag.msg);
+    try std.testing.expectEqualStrings("PARAM `d`: `nope` is not a date (YYYY-MM-DD)", rdiag.msg);
     var adiag = analyze.Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze.analyze(parena.allocator(), prog, &adiag));
-    try std.testing.expectEqualStrings("PARAM `d`: `nope` is not a date", adiag.msg);
+    try std.testing.expectEqualStrings("PARAM `d`: `nope` is not a date (YYYY-MM-DD)", adiag.msg);
     var bdiag: Diag = .{};
     const bound = try parser.parseSource(parena.allocator(), "PARAM d DATE DEFAULT '2026-01-01'; SELECT $d AS d;", &pdiag);
     try std.testing.expectError(error.PlanFailed, run(alloc, bound, .{ .params = &.{.{ .key = "d", .val = "01/02/2026" }} }, &bdiag));
-    try std.testing.expect(std.mem.indexOf(u8, bdiag.msg, "expected YYYY-MM-DD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bdiag.msg, "PARAM `d`: `01/02/2026` is not a date (YYYY-MM-DD)") != null);
 }
 
 test "check validates a literal date unit or strftime format where the columns' types are not known" {
@@ -1179,7 +1179,7 @@ test "check validates a literal date unit or strftime format where the columns' 
     }
 }
 
-test "check and run refuse alike: a declaration in a body or CASE arm, an unknown connection type, a USING with nothing to name, a sink encoding, APPEND to a server file" {
+test "check and run refuse alike: declarations out of place, bad connection options, sink options no sink reads, PARAM text that is not its type, LETs that cannot fold" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1192,6 +1192,12 @@ test "check and run refuse alike: a declaration in a body or CASE arm, an unknow
         .{ "LOAD INTO '$B/o.csv' USING stream_load AS SELECT 1 AS a;", "only a starrocks or doris target" },
         .{ "LOAD INTO '$B/o.csv' WITH (encoding = 'latin1') AS SELECT * FROM '$B/a.csv';", "a CSV sink always writes UTF-8" },
         .{ "LOAD INTO 'smb://fs/share/o.csv' APPEND AS SELECT 1 AS a;", "renamed over the target" },
+        .{ "LOAD INTO '$B/o.csv' UPSERT ON (a) AS SELECT 1 AS a;", "`UPSERT` needs a table to merge into" },
+        .{ "LOAD INTO '$B/o.csv' WITH (bogus = 1) AS SELECT 1 AS a;", "unknown `LOAD INTO` option `bogus`" },
+        .{ "PARAM n INT DEFAULT 'abc';\nLOAD INTO '$B/o.csv' AS SELECT $n AS a;", "PARAM `n`: `abc` is not an integer" },
+        .{ "LET q = (SELECT COUNT(*) AS c FROM '$B/a.csv');\nLET m = $q + 1;\nLOAD INTO '$B/o.csv' AS SELECT $m AS a;", "LET `m` reads `$q`, a query LET" },
+        .{ "LET m = $zz + 1;\nLOAD INTO '$B/o.csv' AS SELECT $m AS a;", "unknown `$zz`" },
+        .{ "CREATE CONNECTION db TYPE sqlserver OPTIONS (host = 'h', auth = 'ntlm', tls = 'off');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "requires an encrypted channel" },
     };
     for (cases) |c| try expectRefusedAlike(alloc, &tmp, c[0], c[1]);
 }

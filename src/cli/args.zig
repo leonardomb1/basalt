@@ -8,37 +8,49 @@ const std = @import("std");
 
 const Source = struct { label: []const u8, text: []const u8, dir: []const u8 = "." };
 
-pub fn loadSource(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8, stderr: *std.Io.Writer) !?Source {
+/// `Usage` is a command line without a script (exit 2); `Unreadable` a script that
+/// could not be read (exit 1). Either is reported on `stderr` here.
+pub const LoadError = error{ Usage, Unreadable };
+
+/// The exit code for a script that could not be loaded.
+pub fn loadExit(e: LoadError) u8 {
+    return switch (e) {
+        error.Usage => 2,
+        error.Unreadable => 1,
+    };
+}
+
+pub fn loadSource(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8, stderr: *std.Io.Writer) !Source {
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "-c") or std.mem.eql(u8, args[i], "--command")) {
             if (i + 1 >= args.len) {
                 try stderr.print("error: missing script after `{s}`\n", .{args[i]});
-                return null;
+                return error.Usage;
             }
             return Source{ .label = "<command>", .text = args[i + 1] };
         }
     }
     const at = scriptArg(args) orelse {
         try stderr.print("error: `{s}` requires a <script> path, `-` for stdin, or `-c <script>`\n", .{verb});
-        return null;
+        return error.Usage;
     };
     if (std.mem.eql(u8, args[at], "-")) {
         const text = std.fs.File.stdin().readToEndAlloc(arena, 8 << 20) catch |e| {
             try stderr.print("error: cannot read script from stdin: {s}\n", .{@errorName(e)});
-            return null;
+            return error.Unreadable;
         };
         return Source{ .label = "<stdin>", .text = text };
     }
     const path = args[at];
     const text = std.fs.cwd().readFileAlloc(arena, path, 8 << 20) catch |e| {
         try stderr.print("error: cannot read `{s}`: {s}\n", .{ path, @errorName(e) });
-        return null;
+        return error.Unreadable;
     };
     return Source{ .label = path, .text = text, .dir = std.fs.path.dirname(path) orelse "." };
 }
 
-const valued_flags = [_][]const u8{ "-p", "--param", "-j", "--threads", "--format", "--log-format", "--log-level", "--port", "--max-rows", "--pos" };
+const valued_flags = [_][]const u8{ "-p", "--param", "-j", "--threads", "--format", "--log-format", "--log-level", "--port", "--host", "--max-rows", "--pos", "--known" };
 
 /// The first argument that is neither a flag nor a flag's value, `-` included, so the
 /// script may come before or after its flags.
@@ -190,6 +202,7 @@ test "scriptArg: the script is found whatever order flags and it come in" {
         .{ .argv = &.{ "basalt", "run", "-j8", "x.sql" }, .want = 3 },
         .{ .argv = &.{ "basalt", "run", "--format", "json" }, .want = null },
         .{ .argv = &.{ "basalt", "check", "-p", "out.sql" }, .want = null },
+        .{ .argv = &.{ "basalt", "check", "--known", "t1,t2", "x.sql" }, .want = 4 },
     };
     for (cases) |c| try std.testing.expectEqual(c.want, scriptArg(try testArgv(a, c.argv)));
 }

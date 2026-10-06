@@ -195,8 +195,11 @@ fn httpAttr(program: ast.Program, key: []const u8) ?[]const u8 {
     return v;
 }
 
-fn listen(port: u16) !std.net.Server {
-    const address = try std.net.Address.parseIp("0.0.0.0", port);
+/// Every interface unless `--host` names one, so a container's port mapping reaches it.
+pub const default_host = "0.0.0.0";
+
+fn listen(host: []const u8, port: u16) !std.net.Server {
+    const address = try std.net.Address.parseIp(host, port);
     var net_server = try address.listen(.{ .reuse_address = true });
     errdefer net_server.deinit();
     const tv = std.posix.timeval{ .sec = 1, .usec = 0 };
@@ -214,7 +217,7 @@ fn banner(port: u16, routes: []const Route) void {
     }
 }
 
-pub fn serve(gpa: std.mem.Allocator, program: ast.Program, port: u16, log_cfg: runtime.LogConfig) !void {
+pub fn serve(gpa: std.mem.Allocator, program: ast.Program, host: []const u8, port: u16, log_cfg: runtime.LogConfig) !void {
     initLog(log_cfg);
     const bs = try initBufState(gpa, program);
     defer if (bs) |b| {
@@ -223,7 +226,7 @@ pub fn serve(gpa: std.mem.Allocator, program: ast.Program, port: u16, log_cfg: r
     };
     if (bs) |b| try startFlusher(gpa, b);
     const routes = [_]Route{.{ .path = httpPath(program), .program = program, .label = "<script>", .doc = httpDoc(program), .buf = bs }};
-    var net_server = try listen(port);
+    var net_server = try listen(host, port);
     defer net_server.deinit();
     banner(port, &routes);
     const threads = std.Thread.getCpuCount() catch 1;
@@ -274,7 +277,7 @@ fn loadDir(gpa: std.mem.Allocator, dir_path: []const u8) !Registry {
             continue;
         };
         if (prog.stmts.len == 0 or prog.stmts[0] != .kind or prog.stmts[0].kind.kind != .http) {
-            log(.warn, "skip {s}: not an @http script", .{entry.name});
+            log(.warn, "skip {s}: no `CREATE ENDPOINT`", .{entry.name});
             continue;
         }
         const label = try a.dupe(u8, entry.name);
@@ -323,11 +326,11 @@ fn dirFingerprint(dir_path: []const u8) u64 {
 
 /// With `watch` set, also reloads when the directory's contents change, checked
 /// at most every ~2s.
-pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, port: u16, watch: bool, log_cfg: runtime.LogConfig) !void {
+pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, host: []const u8, port: u16, watch: bool, log_cfg: runtime.LogConfig) !void {
     initLog(log_cfg);
     var reg = try loadDir(gpa, dir_path);
     defer reg.deinit();
-    var net_server = try listen(port);
+    var net_server = try listen(host, port);
     defer net_server.deinit();
     banner(port, reg.routes);
     if (watch) log(.info, "watching {s} for changes", .{dir_path});

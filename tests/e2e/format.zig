@@ -329,3 +329,25 @@ test "a parquet inside a zip is refused by run as by check" {
     try tmp.dir.writeFile(.{ .sub_path = "pz.zip", .data = parquet_member_zip });
     try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/pz.zip :: p.parquet';", "parquet needs random access");
 }
+
+test "a CSV header's quoted names lose their quotes, a delimiter inside one included, serial or in lanes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "q.csv", .data = "\"Valor Total\",\"a,b\",c\n1,2,3\n4,5,6\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT \"Valor Total\" AS v, \"a,b\" AS ab FROM '{s}/q.csv' ORDER BY v;", .{ base, base });
+    defer alloc.free(script);
+    for ([_]usize{ 1, 4 }) |threads| {
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+        var rdiag: Diag = .{};
+        _ = try run(alloc, prog, .{ .threads = threads, .log = .{ .quiet = true } }, &rdiag);
+        const got = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 16);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings("v,ab\n1,2\n4,5\n", got);
+    }
+}

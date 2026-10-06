@@ -6,6 +6,7 @@ const DbConfig = @import("../env.zig").DbConfig;
 const Env = @import("../env.zig").Env;
 const aad = @import("../../db/aad.zig");
 const ast = @import("../../lang/ast.zig");
+const env_mod = @import("../env.zig");
 const eqlAny = @import("../env.zig").eqlAny;
 const evalCfgInt = @import("register.zig").evalCfgInt;
 const evalCfgStr = @import("register.zig").evalCfgStr;
@@ -131,11 +132,11 @@ const EnvCfg = struct {
     }
     pub fn tls(self: EnvCfg, v: []const u8) !sql.TlsMode {
         return std.meta.stringToEnum(sql.TlsMode, v) orelse
-            planErr(self.env.diag, "connection `tls` must be \"off\", \"require\" or \"insecure\"");
+            planErr(self.env.diag, env_mod.tls_values_msg);
     }
     pub fn auth(self: EnvCfg, v: []const u8) !DbAuth {
         return std.meta.stringToEnum(DbAuth, v) orelse
-            planErr(self.env.diag, "connection `auth` must be \"sql\", \"aad\", \"ntlm\" or \"kerberos\"");
+            planErr(self.env.diag, env_mod.auth_values_msg);
     }
 };
 
@@ -144,7 +145,7 @@ pub fn resolveDbConfig(env: *Env, conn: ast.Connection, default_port: u16) !DbCo
     if (cfg.host.len == 0) return planErr(env.diag, "connection needs a `host`");
     if (cfg.auth == .kerberos and cfg.realm.len == 0 and std.mem.indexOfScalar(u8, cfg.user, '@') == null)
         return planErr(env.diag, "connection `auth = 'kerberos'` needs the `realm` — the domain's DNS name, as CORP.LOCAL, not its NetBIOS name — or a user written `me@CORP.LOCAL`");
-    if (cfg.auth == .ntlm and cfg.tls == .off) return planErr(env.diag, "connection `auth = 'ntlm'` requires an encrypted channel: set `tls = 'require'`, or `tls = 'insecure'` for a self-signed server certificate");
+    if (cfg.auth == .ntlm and cfg.tls == .off) return planErr(env.diag, env_mod.ntlm_needs_tls_msg);
     return cfg;
 }
 

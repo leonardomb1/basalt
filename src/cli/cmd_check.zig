@@ -6,6 +6,7 @@ const analyze = @import("../runtime/analyze.zig");
 const ast = @import("../lang/ast.zig");
 const include = @import("../lang/include.zig");
 const loadSource = @import("args.zig").loadSource;
+const loadExit = @import("args.zig").loadExit;
 const nextVal = @import("args.zig").nextVal;
 const parser = @import("../lang/sql_parser.zig");
 const std = @import("std");
@@ -114,7 +115,10 @@ pub fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         try overrides.append(.{ .name = args[i][0..eq], .value = args[i][eq + 1 ..] });
     }
 
-    const src = (try loadSource(a, "check", args, stderr)) orelse return 1;
+    const src = loadSource(a, "check", args, stderr) catch |e| switch (e) {
+        error.Usage, error.Unreadable => |le| return loadExit(le),
+        else => return e,
+    };
     const eo = ErrOut{ .w = if (json) stdout else stderr, .json = json, .bare = true, .label = src.label };
     const issues = try checkText(a, src.text, src.label, src.dir, .{ .overrides = overrides.items, .known = known.items });
     if (json) try stdout.writeAll("[");

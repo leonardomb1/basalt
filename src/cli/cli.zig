@@ -181,9 +181,9 @@ fn usage(w: anytype) !void {
         \\basalt — a SQL-driven data pipeline engine
         \\
         \\usage:
-        \\  basalt run   <script>|-|-c <script> [-p key=value ...] [-j N] [--port N]
+        \\  basalt run   <script>|-|-c <script> [-p key=value ...] [-j N] [--port N] [--host IP]
         \\               run a pipeline; HTTP mode when the script declares CREATE ENDPOINT
-        \\  basalt serve <dir> [--port N] [--watch] [--log-format FMT] [--log-level LVL]
+        \\  basalt serve <dir> [--port N] [--host IP] [--watch] [--log-format FMT] [--log-level LVL]
         \\               host every endpoint script in a dir (SIGHUP or -w reloads)
         \\  basalt check <script>|-|-c <script> [--format json] [--known t1,t2]
         \\               parse and validate without running, reporting every problem;
@@ -246,6 +246,7 @@ fn usage(w: anytype) !void {
         \\  --max-rows N       a SELECT printed to stdout keeps its first N rows and stops
         \\                     reading there — a preview of a huge source in milliseconds
         \\  --port N           listen port for HTTP mode
+        \\  --host IP          listen address for HTTP mode (default 0.0.0.0, every interface)
         \\  --format FMT       table|json|csv|tsv|arrow — what a SELECT writes to stdout.
         \\                     table: every row and column, for reading, closed by a
         \\                     `(N rows)` line. json: NDJSON rows (and a summary object

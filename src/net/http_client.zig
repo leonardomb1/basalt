@@ -1,9 +1,11 @@
-//! `read http`: REST/JSON source. GETs a URL and yields one batch per page of
-//! JSON objects. Auth and pagination ride on the read stage's hints, whose keys
-//! mirror the `Options` field names (unknown hints are ignored):
+//! The REST/JSON source. GETs a URL and yields one batch per page of JSON
+//! objects. Auth and pagination ride on the read's hints — its `PAGINATE`,
+//! `RETRY` and `WITH (...)` clauses — whose keys mirror the `Options` field names
+//! (unknown hints are ignored):
 //!
-//!   read http "https://api.x/items" @[bearer_env = API_TOKEN, items = "data",
-//!     paginate = cursor, cursor_field = "next"]
+//!   SELECT * FROM HTTP('https://api.x/items')
+//!     PAGINATE BY cursor (field = 'next')
+//!     WITH (bearer_env = 'API_TOKEN', items = 'data');
 //!
 //! Pagination modes:
 //!   (none)             one GET, one batch.
@@ -31,19 +33,20 @@
 //! replaces the client's (`basalt/<version>`) instead of being sent twice, which
 //! some WAFs reject.
 //!
-//! Connection-level form: `connection itsm = http` + `read itsm "/path?query"`.
-//! The path resolves against the connection's `base_url` (spaces auto-encoded,
-//! so OData filters read naturally) and auth lives on the connection; unknown
-//! connection keys are an error, unlike hints:
-//!   auth = "bearer"      token = secret("TOK")               -> Bearer <token>
-//!   auth = "basic"       user = ..., password = ...          -> Basic <b64>
-//!   auth = "header"      header_name/header_value            -> any API-key header
-//!   auth = "login_json"  login_url + body_* attrs            -> POST a JSON object
+//! Connection-level form: `CREATE CONNECTION itsm TYPE http OPTIONS (base_url =
+//! ...)` and `FROM itsm.GET('/path', k = v)`. The path resolves against the
+//! connection's `base_url` (spaces auto-encoded, so OData filters read naturally)
+//! and auth lives on the connection; unknown connection keys are an error,
+//! unlike hints:
+//!   auth = 'bearer'      token = env('TOK')                  -> Bearer <token>
+//!   auth = 'basic'       user = ..., password = ...          -> Basic <b64>
+//!   auth = 'header'      header_name/header_value            -> any API-key header
+//!   auth = 'login_json'  login_url + body_* attrs            -> POST a JSON object
 //!                        built from every `body_<field>` attr; the response token
 //!                        (`token_path`, default the whole response string) is sent
 //!                        as `token_header` (default Authorization) with
 //!                        `token_prefix` (default none).
-//!   auth = "oauth2"      login_url ("token_url" also accepted) + client_id/
+//!   auth = 'oauth2'      login_url (`token_url` also accepted) + client_id/
 //!                        client_secret [+ scope] -> client-credentials form POST;
 //!                        token_path defaults to access_token, prefix to "Bearer ".
 //! Session kinds (login_json, oauth2) re-login and retry the page once on a 401,
@@ -1237,8 +1240,8 @@ const TestServer = struct {
     statuses: ?[]const []const u8 = null,
     route_div: ?i64 = null,
     expected: ?usize = null,
-    captured: [4][2048]u8 = undefined,
-    captured_len: [4]usize = .{ 0, 0, 0, 0 },
+    captured: [8][2048]u8 = undefined,
+    captured_len: [8]usize = .{0} ** 8,
     requests: std.atomic.Value(usize) = .init(0),
     stop: std.atomic.Value(bool) = .init(false),
 
@@ -1566,7 +1569,8 @@ test "http source: prefetch fetches the pages ahead and stops on empty" {
     srv.expected = 5;
     defer srv.deinit();
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
-    defer srv.finish(th);
+    var joined = false;
+    defer if (!joined) srv.finish(th);
 
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{
@@ -1578,9 +1582,12 @@ test "http source: prefetch fetches the pages ahead and stops on empty" {
     });
     defer s.close();
     try std.testing.expectEqual(@as(usize, 3), try drain(s, a));
+    // Prefetched requests arrive in any order; read what the server saw once it is done.
+    srv.finish(th);
+    joined = true;
     var seen2 = false;
     var seen4 = false;
-    for (0..4) |i| {
+    for (0..srv.captured.len) |i| {
         const req = srv.captured[i][0..srv.captured_len[i]];
         if (std.mem.indexOf(u8, req, "$skip=2&") != null) seen2 = true;
         if (std.mem.indexOf(u8, req, "$skip=4&") != null) seen4 = true;

@@ -4,6 +4,7 @@ const ErrOut = @import("args.zig").ErrOut;
 const analyze = @import("../runtime/analyze.zig");
 const http_server = @import("../server/http_server.zig");
 const loadSource = @import("args.zig").loadSource;
+const loadExit = @import("args.zig").loadExit;
 const nextVal = @import("args.zig").nextVal;
 const obs = @import("../runtime/obs.zig");
 const parseLogFormat = @import("args.zig").parseLogFormat;
@@ -23,13 +24,17 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     const stderr = &stderr_file.interface;
     defer stderr.flush() catch {};
 
-    const src = (try loadSource(arena.allocator(), "run", args, stderr)) orelse return 1;
+    const src = loadSource(arena.allocator(), "run", args, stderr) catch |e| switch (e) {
+        error.Usage, error.Unreadable => |le| return loadExit(le),
+        else => return e,
+    };
     const eo = ErrOut{ .w = stderr, .json = wantsJsonLog(args), .label = src.label };
     const prog = (try parseSrcTo(arena.allocator(), src, eo)) orelse return 1;
 
     var params = std.array_list.Managed(runtime.ParamArg).init(alloc);
     defer params.deinit();
     var port: u16 = 8080;
+    var host: []const u8 = http_server.default_host;
     var threads: usize = std.Thread.getCpuCount() catch 1;
     var log = runtime.LogConfig{};
     var level_set = false;
@@ -88,6 +93,12 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
                 return 2;
             };
             try params.append(.{ .key = kv[0..eqp], .val = kv[eqp + 1 ..] });
+        } else if (std.mem.eql(u8, a, "--host")) {
+            host = (try nextVal(args, &i, a, stderr)) orelse return 2;
+            _ = std.net.Address.parseIp(host, 0) catch {
+                try stderr.print("error: invalid --host `{s}` (an IP address, such as 127.0.0.1)\n", .{host});
+                return 2;
+            };
         } else if (std.mem.eql(u8, a, "--port")) {
             const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
             port = std.fmt.parseInt(u16, v, 10) catch {
@@ -98,7 +109,7 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     }
 
     if (prog.stmts.len > 0 and prog.stmts[0] == .kind and prog.stmts[0].kind.kind == .http) {
-        http_server.serve(alloc, prog, port, .{ .format = log.format, .level = if (level_set) log.level else .info, .quiet = log.quiet, .summary = .stderr }) catch |e| {
+        http_server.serve(alloc, prog, host, port, .{ .format = log.format, .level = if (level_set) log.level else .info, .quiet = log.quiet, .summary = .stderr }) catch |e| {
             try stderr.print("{s}: serve error: {s}\n", .{ src.label, @errorName(e) });
             return 1;
         };

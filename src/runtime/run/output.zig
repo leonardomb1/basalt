@@ -73,7 +73,7 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
     const stages = out.stages;
     if (stages.len == 0) return planErr(env.diag, "empty pipeline");
     const last = stages[stages.len - 1].node;
-    if (last != .write) return planErr(env.diag, "a top-level pipeline must end in `write`");
+    if (last != .write) return planErr(env.diag, "a top-level query must be a `LOAD INTO` or a terminal `SELECT`");
     env.sink_name = sinkLabel(env, last.write);
     if (!env.explain and !std.mem.eql(u8, last.write.connector, "stdout")) env.wrote_sink = true;
     const is_load = !env.explain and !std.mem.eql(u8, last.write.connector, "stdout");
@@ -237,9 +237,13 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
             error.AnalyzeFailed => return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg)),
         };
     const sink_connector = if (is_file_sink) last.write.connector else if (env.connections.get(last.write.connector)) |c| c.connector else last.write.connector;
-    analyze.checkSinkForm(last.write, sink_connector, &ddiag) catch |e| switch (e) {
+    analyze.checkSinkForm(last.write, stages[stages.len - 1].hints, sink_connector, &ddiag) catch |e| switch (e) {
         error.OutOfMemory => return e,
-        error.AnalyzeFailed => return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg)),
+        error.AnalyzeFailed => {
+            const pe = planErr(env.diag, try env.arena.dupe(u8, ddiag.msg));
+            env.diag.pos = ddiag.pos;
+            return pe;
+        },
     };
     env.sink_label_prefix = analyze.hintText(stages[stages.len - 1].hints, "label_prefix");
 

@@ -151,6 +151,41 @@ pub const Dialect = struct {
 
 /// Returns the input untouched when already UTF-8 or all ASCII, as most fields of a
 /// latin-1 file are, so the ordinary field costs one scan and no allocation.
+/// The column names of a header line, every one a nullable string until sniffed. A
+/// quoted name loses its quotes (`""` is one quote) and may hold the delimiter; an
+/// unquoted one is trimmed of spaces and tabs.
+fn headerFields(arena: std.mem.Allocator, header: []const u8, d: Dialect) ![]types.Schema.Field {
+    var fields = std.array_list.Managed(types.Schema.Field).init(arena);
+    var i: usize = 0;
+    while (true) {
+        while (i < header.len and (header[i] == ' ' or header[i] == '\t')) i += 1;
+        var name = std.array_list.Managed(u8).init(arena);
+        if (i < header.len and header[i] == '"') {
+            i += 1;
+            while (i < header.len) : (i += 1) {
+                if (header[i] != '"') {
+                    try name.append(header[i]);
+                } else if (i + 1 < header.len and header[i + 1] == '"') {
+                    try name.append('"');
+                    i += 1;
+                } else {
+                    i += 1;
+                    break;
+                }
+            }
+        }
+        const end = std.mem.indexOfScalarPos(u8, header, i, d.delim) orelse header.len;
+        try name.appendSlice(std.mem.trim(u8, header[i..end], " \t"));
+        try fields.append(.{
+            .name = try decodeField(arena, d.encoding, name.items),
+            .ty = types.Type.init(.string).asNullable(),
+        });
+        if (end >= header.len) break;
+        i = end + 1;
+    }
+    return fields.toOwnedSlice();
+}
+
 fn decodeField(arena: std.mem.Allocator, enc: Encoding, s: []const u8) ![]const u8 {
     if (enc == .utf8) return s;
     var high = false;
@@ -380,14 +415,7 @@ pub const CsvReader = struct {
 
         const header = stripBom((try self.readLine()) orelse return error.EmptyCsv);
         self.header_line = try arena.dupe(u8, std.mem.trim(u8, header, " \t\r"));
-        var fields = std.array_list.Managed(types.Schema.Field).init(arena);
-        var it = std.mem.splitScalar(u8, header, self.dialect.delim);
-        while (it.next()) |name| {
-            try fields.append(.{
-                .name = try decodeField(arena, self.dialect.encoding, try arena.dupe(u8, std.mem.trim(u8, name, " \t"))),
-                .ty = types.Type.init(.string).asNullable(),
-            });
-        }
+        var fields = std.array_list.Managed(types.Schema.Field).fromOwnedSlice(arena, try headerFields(arena, header, self.dialect));
 
         var sniff = try TypeSniffer.init(arena, fields.items.len, self.dialect.delim);
         var pending = std.array_list.Managed([]const u8).init(arena);
@@ -588,12 +616,7 @@ pub const MappedCsv = struct {
         const nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.EmptyCsv;
         var header = stripBom(data[0..nl]);
         if (header.len > 0 and header[header.len - 1] == '\r') header = header[0 .. header.len - 1];
-        var fields = std.array_list.Managed(types.Schema.Field).init(arena);
-        var it = std.mem.splitScalar(u8, header, dialect.delim);
-        while (it.next()) |name| try fields.append(.{
-            .name = try decodeField(arena, dialect.encoding, try arena.dupe(u8, std.mem.trim(u8, name, " \t"))),
-            .ty = types.Type.init(.string).asNullable(),
-        });
+        var fields = std.array_list.Managed(types.Schema.Field).fromOwnedSlice(arena, try headerFields(arena, header, dialect));
 
         const body = data[nl + 1 ..];
         var sniff = try TypeSniffer.init(arena, fields.items.len, dialect.delim);
@@ -2052,4 +2075,12 @@ test "splitInto: delimiter bitmask across chunk edges, missing and extra fields,
     try std.testing.expectEqual(@as(i64, 6), pd.getValue(1).int);
     try std.testing.expect((try Projection.of(a, full, &.{ "a", "b", "c", "d" })) == null);
     try std.testing.expectEqualStrings("a", (try Projection.of(a, full, &.{"zz"})).?.schema.fields[0].name);
+}
+
+test "a header's quoted names lose their quotes and may hold the delimiter" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const fields = try headerFields(ar.allocator(), "\"Valor Total\",\"a,b\", c ,\"x\"\"y\",", .{});
+    try std.testing.expectEqual(@as(usize, 5), fields.len);
+    for ([_][]const u8{ "Valor Total", "a,b", "c", "x\"y", "" }, fields) |want, f| try std.testing.expectEqualStrings(want, f.name);
 }

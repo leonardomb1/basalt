@@ -59,6 +59,8 @@ const xlsx = @import("../format/xlsx.zig");
 const folder = @import("../connect/folder.zig");
 const registry = @import("../connect/registry.zig");
 const body_stmt_rule = @import("env.zig").body_stmt_rule;
+const env_mod = @import("env.zig");
+const sql = @import("../db/sql.zig");
 const analyzeCsv = @import("analyze/testing_util.zig").analyzeCsv;
 const expectAnalyzeErr = @import("analyze/testing_util.zig").expectAnalyzeErr;
 
@@ -240,6 +242,65 @@ pub const ParamOverride = struct { name: []const u8, value: []const u8 };
 
 /// The literal a `-p` string stands for, typed by the PARAM's declared type. Anything
 /// not scalar keeps the declared default: `check` is offline.
+/// Why an expression LET cannot be folded, or null: it reads a query LET, which is
+/// decided only once queries run, or a `$name` no PARAM or earlier LET declares.
+pub fn letRefProblem(arena: std.mem.Allocator, program: ast.Program, l: ast.LetConst) Error!?[]const u8 {
+    const le = l.expr orelse return null;
+    const Collect = struct {
+        arena: std.mem.Allocator,
+        names: *std.array_list.Managed([]const u8),
+        fn recur(c: @This(), x: *const ast.Expr) Error!*ast.Expr {
+            if (x.* == .field) {
+                if (x.field.dollar) try c.names.append(x.field.parts[0]);
+                return @constCast(x);
+            }
+            return ast.rebuildExpr(c.arena, x, c, recur);
+        }
+    };
+    var names = std.array_list.Managed([]const u8).init(arena);
+    _ = try Collect.recur(.{ .arena = arena, .names = &names }, le);
+    for (names.items) |n| {
+        var declared = false;
+        for (program.stmts) |s| switch (s) {
+            .param => |p| if (std.mem.eql(u8, p.name, n)) {
+                declared = true;
+            },
+            .let_const => |other| {
+                if (std.mem.eql(u8, other.name, l.name)) break;
+                if (!std.mem.eql(u8, other.name, n)) continue;
+                if (other.expr == null)
+                    return try std.fmt.allocPrint(arena, "LET `{s}` reads `${s}`, a query LET: an expression LET is folded before any query runs, so compute it in the query instead", .{ l.name, n });
+                declared = true;
+            },
+            else => {},
+        };
+        if (!declared) return try std.fmt.allocPrint(arena, "LET `{s}`: unknown `${s}`: no PARAM or earlier LET of that name", .{ l.name, n });
+    }
+    return null;
+}
+
+/// What a PARAM's text should have been when it does not read as the declared type,
+/// or null when it does; `check` and the run both word the error from it.
+pub fn paramTextProblem(arena: std.mem.Allocator, ty: types.Type, text: []const u8) ?[]const u8 {
+    const ok = switch (ty.kind) {
+        .int => if (std.fmt.parseInt(i64, text, 10)) |_| true else |_| false,
+        .float => if (std.fmt.parseFloat(f64, text)) |_| true else |_| false,
+        .bool => std.mem.eql(u8, text, "true") or std.mem.eql(u8, text, "false"),
+        .date, .time, .timestamp, .decimal => if (eval.castValueTyped(arena, .{ .string = text }, ty)) |_| true else |_| false,
+        else => true,
+    };
+    if (ok) return null;
+    return switch (ty.kind) {
+        .int => "an integer",
+        .float, .decimal => "a number",
+        .bool => "`true` or `false`",
+        .date => "a date (YYYY-MM-DD)",
+        .time => "a time (HH:MM[:SS[.ffffff]])",
+        .timestamp => "a timestamp (YYYY-MM-DD[ HH:MM:SS[.ffffff]])",
+        else => unreachable,
+    };
+}
+
 fn overrideExpr(arena: std.mem.Allocator, ty: types.Type, raw: []const u8) Error!?*const ast.Expr {
     return switch (ty.kind) {
         .int => mk(arena, .{ .int_lit = std.fmt.parseInt(i64, raw, 10) catch return null }),
@@ -353,7 +414,7 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
         error.ExpandFailed => return fail(diag, "{s}", .{expand_msg}),
     };
     if (program.stmts.len == 0 or program.stmts[0] != .kind)
-        return fail(diag, "script must begin with a @kind tag", .{});
+        return fail(diag, "internal error: the parsed program has no kind statement", .{});
     const kind_name = @tagName(program.stmts[0].kind.kind);
 
     var bindings = std.StringHashMap(ast.Pipeline).init(arena);
@@ -364,10 +425,15 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
             diag.pos = s.connection.pos;
             return e;
         }
+        if (sqlOptionProblem(s.connection)) |why| {
+            const e = fail(diag, "{s}", .{why});
+            diag.pos = s.connection.pos;
+            return e;
+        }
         try connections.put(s.connection.name, s.connection);
     };
     if (!opts.declarations_only and countOutputs(program.stmts[1..]) == 0)
-        return fail(diag, "no output pipeline (a pipeline ending in `write`)", .{});
+        return fail(diag, "nothing to run: the script needs a `LOAD INTO` or a terminal `SELECT`", .{});
 
     var params_map = ParamMap.init(arena);
     for (program.stmts) |s| if (s == .param) {
@@ -381,19 +447,19 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
         if (text == null) if (p.default) |d| if (d.* == .str_lit) {
             text = d.str_lit;
         };
-        switch (p.ty.kind) {
-            .date, .time, .timestamp, .decimal => if (text) |t| {
-                _ = eval.castValueTyped(arena, .{ .string = t }, p.ty) catch
-                    return fail(diag, "PARAM `{s}`: `{s}` is not a {s}", .{ p.name, t, try p.ty.name(arena) });
-            },
-            else => {},
-        }
+        if (text) |t| if (paramTextProblem(arena, p.ty, t)) |want|
+            return fail(diag, "PARAM `{s}`: `{s}` is not {s}", .{ p.name, t, want });
         try params_map.put(p.name, bound orelse try typedParam(arena, p.ty, if (p.default) |d| d else try typedZero(arena, p.ty)));
     };
     for (program.stmts) |s| if (s == .let_const) {
         const l = s.let_const;
         if (params_map.contains(l.name))
             return fail(diag, "`{s}` is declared twice: LET and PARAM share one name space", .{l.name});
+        if (try letRefProblem(arena, program, l)) |why| {
+            const e = fail(diag, "{s}", .{why});
+            diag.pos = l.pos;
+            return e;
+        }
         if (l.expr) |le| {
             try params_map.put(l.name, try substExpr(arena, le, &params_map));
         } else {
@@ -622,7 +688,7 @@ const Ctx = struct {
         const via = head.via;
         const stages = (pushdown.hoistFilters(self.arena, self.arena, head.stages, self.bindings) catch null) orelse head.stages;
         if (stages[stages.len - 1].node != .write)
-            return fail(self.diag, "a top-level pipeline must end in `write`", .{});
+            return fail(self.diag, "a top-level query must be a `LOAD INTO` or a terminal `SELECT`", .{});
         for (stages) |st| try checkStageLiterals(self.diag, st);
 
         var source = self.resolveSource(stages[0]) catch |e| {
@@ -758,12 +824,12 @@ const Ctx = struct {
     fn resolveSink(self: *Ctx, w: ast.Write, hints: []const ast.Hint) !Sink {
         if (std.mem.eql(u8, w.connector, "csv") or std.mem.eql(u8, w.connector, "stdout")) {
             try checkFileSink(w, hints, self.diag);
-            try checkSinkForm(w, w.connector, self.diag);
+            try checkSinkForm(w, hints, w.connector, self.diag);
             return .{ .connector = w.connector, .target = w.target, .mode = @tagName(w.mode) };
         }
         const conn = self.connections.get(w.connector) orelse
             return fail(self.diag, "unknown connection `{s}` in write", .{w.connector});
-        try checkSinkForm(w, conn.connector, self.diag);
+        try checkSinkForm(w, hints, conn.connector, self.diag);
         return .{ .connector = conn.connector, .target = w.target, .mode = @tagName(w.mode) };
     }
 
@@ -958,19 +1024,51 @@ pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!v
     _ = try dialectFromHints(hints, diag);
     if (hintText(hints, "encoding") != null)
         return fail(diag, "`encoding` applies to a read; a CSV sink always writes UTF-8", .{});
+    if (w.mode == .upsert)
+        return fail(diag, "`UPSERT` needs a table to merge into; a file is written whole — use `REPLACE` (the default) or `APPEND`", .{});
     if (w.mode == .append) {
         if (appendUnsupported(w.target)) |why|
             return fail(diag, "`APPEND` into `{s}` is not supported: {s}", .{ w.target, why });
     }
 }
 
-/// `USING` names a load path, and only StarRocks and Doris have one to name.
-pub fn checkSinkForm(w: ast.Write, connector: []const u8, diag: *Diag) Error!void {
+const sink_keys = [_][]const u8{ "delimiter", "delim", "encoding", "format", "label_prefix", "split", "splits", "split_kind", "jobs" };
+
+/// `USING` names a load path, and only StarRocks and Doris have one to name; a
+/// `WITH` key no sink reads is refused rather than ignored.
+pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u8, diag: *Diag) Error!void {
+    for (hints) |h| {
+        for (sink_keys) |k| {
+            if (std.mem.eql(u8, h.key, k)) break;
+        } else {
+            const e = fail(diag, "unknown `LOAD INTO` option `{s}` (a sink takes `delimiter`, `format` and, for starrocks or doris, `label_prefix`)", .{h.key});
+            diag.pos = h.pos;
+            return e;
+        }
+    }
     const form = w.form orelse return;
     const stream = if (registry.Connector.parse(connector)) |c| c.streamLoad() else false;
     if (stream and std.mem.eql(u8, form, "stream_load")) return;
     if (stream) return fail(diag, "unknown load path `USING {s}`; a {s} target loads by `stream_load`", .{ form, connector });
     return fail(diag, "`USING {s}` does not apply here: only a starrocks or doris target takes `USING stream_load`", .{form});
+}
+
+/// A SQL connection's literal `tls` and `auth`, judged as the run judges them at
+/// connect time; a value computed by an expression is left to the run.
+pub fn sqlOptionProblem(c: ast.Connection) ?[]const u8 {
+    const conn = registry.Connector.parse(c.connector) orelse return null;
+    if (conn.sqlRead() == null) return null;
+    var tls: ?[]const u8 = null;
+    var auth: ?[]const u8 = null;
+    for (c.config) |a| if (a.value.* == .str_lit) {
+        if (std.mem.eql(u8, a.key, "tls")) tls = a.value.str_lit;
+        if (std.mem.eql(u8, a.key, "auth")) auth = a.value.str_lit;
+    };
+    if (tls) |v| if (std.meta.stringToEnum(sql.TlsMode, v) == null) return env_mod.tls_values_msg;
+    if (auth) |v| if (std.meta.stringToEnum(env_mod.DbAuth, v) == null) return env_mod.auth_values_msg;
+    if (auth != null and tls != null and std.mem.eql(u8, auth.?, "ntlm") and std.mem.eql(u8, tls.?, "off"))
+        return env_mod.ntlm_needs_tls_msg;
+    return null;
 }
 
 pub const connection_types = "http, postgres, mysql, sqlserver, starrocks, doris, sftp, smb";
