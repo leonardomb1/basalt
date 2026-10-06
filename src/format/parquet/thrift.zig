@@ -531,10 +531,10 @@ fn fuzzOne(_: void, input: []const u8) anyerror!void {
 }
 
 const fuzzOne_corpus = [_][]const u8{
-    @embedFile("testdata/uncompressed.parquet"),
+    @embedFile("../testdata/uncompressed.parquet"),
 };
 
 test "fuzz: compact-protocol reader survives arbitrary bytes" {
     try std.testing.fuzz({}, fuzzOne, .{ .corpus = &fuzzOne_corpus });
-    try @import("../net/fuzzutil.zig").pound(fuzzOne, &fuzzOne_corpus);
+    try @import("../../net/fuzzutil.zig").pound(fuzzOne, &fuzzOne_corpus);
 }

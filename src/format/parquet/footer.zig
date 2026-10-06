@@ -22,7 +22,7 @@
 
 const std = @import("std");
 const thrift = @import("thrift.zig");
-const codec = @import("codec.zig");
+const codec = @import("../codec.zig");
 
 pub const Error = error{
     NotParquet,
@@ -624,11 +624,11 @@ test "startOffset prefers the dictionary page when one precedes the data pages" 
     try t.expectEqual(@as(i64, 500), zero.startOffset());
 }
 
-const fx_uncompressed = @embedFile("testdata/uncompressed.parquet");
-const fx_snappy = @embedFile("testdata/snappy.parquet");
-const fx_gzip = @embedFile("testdata/gzip.parquet");
-const fx_zstd = @embedFile("testdata/zstd.parquet");
-const fx_lz4 = @embedFile("testdata/lz4.parquet");
+const fx_uncompressed = @embedFile("../testdata/uncompressed.parquet");
+const fx_snappy = @embedFile("../testdata/snappy.parquet");
+const fx_gzip = @embedFile("../testdata/gzip.parquet");
+const fx_zstd = @embedFile("../testdata/zstd.parquet");
+const fx_lz4 = @embedFile("../testdata/lz4.parquet");
 
 test "footer of a real DuckDB file decodes to the expected schema and layout" {
     var ar = std.heap.ArenaAllocator.init(t.allocator);
@@ -723,13 +723,13 @@ fn fuzzParse(_: void, input: []const u8) anyerror!void {
 }
 
 const fuzzParse_corpus = [_][]const u8{
-    @embedFile("testdata/uncompressed.parquet"),
-    @embedFile("testdata/gzip.parquet"),
-    @embedFile("testdata/v2delta.parquet"),
-    @embedFile("testdata/snappy.parquet"),
+    @embedFile("../testdata/uncompressed.parquet"),
+    @embedFile("../testdata/gzip.parquet"),
+    @embedFile("../testdata/v2delta.parquet"),
+    @embedFile("../testdata/snappy.parquet"),
 };
 
 test "fuzz: file metadata parse survives arbitrary bytes" {
     try std.testing.fuzz({}, fuzzParse, .{ .corpus = &fuzzParse_corpus });
-    try @import("../net/fuzzutil.zig").pound(fuzzParse, &fuzzParse_corpus);
+    try @import("../../net/fuzzutil.zig").pound(fuzzParse, &fuzzParse_corpus);
 }

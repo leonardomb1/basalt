@@ -35,20 +35,20 @@
 //! read it (`UnitEnc`, `openEncoder`), and `appendEncoded` places them in order.
 
 const std = @import("std");
-const parquet = @import("parquet.zig");
+const parquet = @import("footer.zig");
 const thrift = @import("thrift.zig");
-const codec = @import("codec.zig");
-const eval = @import("../exec/eval.zig");
-const driver = @import("../connect/driver.zig");
-const http_client = @import("../net/http_client.zig");
-const objstore = @import("../store/objstore.zig");
-const sftp = @import("../store/sftp.zig");
-const smb = @import("../store/smb.zig");
-const types = @import("../lang/types.zig");
-const Batch = @import("../exec/batch.zig").Batch;
-const column = @import("../exec/column.zig");
-const Decimal = @import("../exec/value.zig").Decimal;
-const Value = @import("../exec/value.zig").Value;
+const codec = @import("../codec.zig");
+const eval = @import("../../exec/eval.zig");
+const driver = @import("../../connect/driver.zig");
+const http_client = @import("../../net/http_client.zig");
+const objstore = @import("../../store/objstore.zig");
+const sftp = @import("../../store/sftp.zig");
+const smb = @import("../../store/smb.zig");
+const types = @import("../../lang/types.zig");
+const Batch = @import("../../exec/batch.zig").Batch;
+const column = @import("../../exec/column.zig");
+const Decimal = @import("../../exec/value.zig").Decimal;
+const Value = @import("../../exec/value.zig").Value;
 
 const List = std.array_list.Managed;
 
@@ -1045,7 +1045,7 @@ fn sinkAbort(p: *anyopaque) void {
 }
 
 const testing = std.testing;
-const pqdecode = @import("pqdecode.zig");
+const pqdecode = @import("read.zig");
 
 test "basalt types map onto Parquet physical and converted types" {
     try testing.expectEqual(parquet.PhysicalType.boolean, (try mapType(types.Type.init(.bool))).phys);

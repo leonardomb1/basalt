@@ -48,13 +48,13 @@
 //! name, order and type, or the read fails naming it rather than misplace values.
 
 const std = @import("std");
-const parquet = @import("parquet.zig");
-const types = @import("../lang/types.zig");
-const column = @import("../exec/column.zig");
-pub const Threshold = @import("../exec/value.zig").Threshold;
-const Value = @import("../exec/value.zig").Value;
-const Decimal = @import("../exec/value.zig").Decimal;
-const eval = @import("../exec/eval.zig");
+const parquet = @import("footer.zig");
+const types = @import("../../lang/types.zig");
+const column = @import("../../exec/column.zig");
+pub const Threshold = @import("../../exec/value.zig").Threshold;
+const Value = @import("../../exec/value.zig").Value;
+const Decimal = @import("../../exec/value.zig").Decimal;
+const eval = @import("../../exec/eval.zig");
 
 pub const Error = error{
     CorruptParquetPage,
@@ -707,7 +707,7 @@ pub fn readColumnChunk(
     rows: usize,
     max_def: u32,
     base_offset: u64,
-) (Error || parquet.Error || @import("codec.zig").Error)!column.Column {
+) (Error || parquet.Error || @import("../codec.zig").Error)!column.Column {
     return readColumnChunkLevels(arena, file_bytes, meta, elem, rows, max_def, 0, null, base_offset);
 }
 
@@ -723,7 +723,7 @@ pub fn readColumnChunkLevels(
     max_rep: u32,
     list: ?ListShape,
     base_offset: u64,
-) (Error || parquet.Error || @import("codec.zig").Error)!column.Column {
+) (Error || parquet.Error || @import("../codec.zig").Error)!column.Column {
     const ty = (try basaltType(elem)).asNullable();
     const tscale = temporalScale(elem);
 
@@ -775,7 +775,7 @@ pub fn readEntries(
     max_def: u32,
     max_rep: u32,
     base_offset: u64,
-) (Error || parquet.Error || @import("codec.zig").Error)!Entries {
+) (Error || parquet.Error || @import("../codec.zig").Error)!Entries {
     const ty = (try basaltType(elem)).asNullable();
     const tscale = temporalScale(elem);
     const entries = std.math.cast(usize, meta.num_values) orelse return Error.CorruptParquetPage;
@@ -1692,12 +1692,12 @@ fn numOrder(a: Value, b: Value) ?std.math.Order {
     return eval.compareValues(a, b);
 }
 
-const driver = @import("../connect/driver.zig");
-const Batch = @import("../exec/batch.zig").Batch;
-const http_client = @import("../net/http_client.zig");
-const objstore = @import("../store/objstore.zig");
-const sftp = @import("../store/sftp.zig");
-const smb = @import("../store/smb.zig");
+const driver = @import("../../connect/driver.zig");
+const Batch = @import("../../exec/batch.zig").Batch;
+const http_client = @import("../../net/http_client.zig");
+const objstore = @import("../../store/objstore.zig");
+const sftp = @import("../../store/sftp.zig");
+const smb = @import("../../store/smb.zig");
 
 pub const Bytes = union(enum) {
     memory: []const u8,
@@ -2330,7 +2330,7 @@ test "physical plus converted type maps onto a basalt type" {
     try testing.expectError(Error.UnsupportedParquetSchema, basaltType(.{ .num_children = 2 }));
 }
 
-const fx = @embedFile("testdata/zstd.parquet");
+const fx = @embedFile("../testdata/zstd.parquet");
 
 test "decodes real column values from a DuckDB-written file" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2479,7 +2479,7 @@ test "LogicalType wins over a ConvertedType, and agreeing annotations stay put" 
     try testing.expectEqual(types.TypeKind.date, (try basaltType(other)).kind);
 }
 
-const fx_v2 = @embedFile("testdata/v2delta.parquet");
+const fx_v2 = @embedFile("../testdata/v2delta.parquet");
 
 test "data page v2 with DELTA encodings decodes to the same values as v1" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2538,7 +2538,7 @@ test "projection keeps only the named columns and never drops all of them" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realpathAlloc(a, ".");
     const path = try std.fs.path.join(a, &.{ dir, "p.parquet" });
-    try tmp.dir.writeFile(.{ .sub_path = "p.parquet", .data = @embedFile("testdata/zstd.parquet") });
+    try tmp.dir.writeFile(.{ .sub_path = "p.parquet", .data = @embedFile("../testdata/zstd.parquet") });
 
     const all = try Reader.open(a, path);
     try testing.expectEqual(@as(usize, 4), all.schema.fields.len);
@@ -2601,7 +2601,7 @@ test "row groups are skipped only when statistics prove no row can match" {
     try testing.expect(groupMayMatch(&schema, &leaves, g, &other));
 }
 
-const fx_logical = @embedFile("testdata/logical_types.parquet");
+const fx_logical = @embedFile("../testdata/logical_types.parquet");
 
 test "a polars footer carries the LogicalType, and pruning uses converted units" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2639,7 +2639,7 @@ test "chunk extents come from the next chunk, never from total_compressed_size" 
 }
 
 test "a corrupted file never panics" {
-    const good = @embedFile("testdata/zstd.parquet");
+    const good = @embedFile("../testdata/zstd.parquet");
     var buf: [good.len]u8 = undefined;
 
     var off: usize = 0;
@@ -2801,7 +2801,7 @@ const fuzzKernels_corpus = [_][]const u8{
 
 test "fuzz: page decode kernels survive arbitrary bytes" {
     try std.testing.fuzz({}, fuzzKernels, .{ .corpus = &fuzzKernels_corpus });
-    try @import("../net/fuzzutil.zig").pound(fuzzKernels, &fuzzKernels_corpus);
+    try @import("../../net/fuzzutil.zig").pound(fuzzKernels, &fuzzKernels_corpus);
 }
 
 test "BitReader: wide values at non-zero bit offsets keep their top bits" {
@@ -2903,15 +2903,15 @@ test "parquet LIST columns read as JSON from pyarrow (pages v1 and v2) and polar
         \\id=4 xs=[null,5] nest=[null,[4]] ds=["1969-12-31",null] recs=[{"a":2,"b":"y"}] m={"z":2}
         \\
     ;
-    try testing.expectEqualStrings(want, try readAllText(a, @embedFile("testdata/lists_v1.parquet"), "v1.parquet"));
-    try testing.expectEqualStrings(want, try readAllText(a, @embedFile("testdata/lists_v2.parquet"), "v2.parquet"));
+    try testing.expectEqualStrings(want, try readAllText(a, @embedFile("../testdata/lists_v1.parquet"), "v1.parquet"));
+    try testing.expectEqualStrings(want, try readAllText(a, @embedFile("../testdata/lists_v2.parquet"), "v2.parquet"));
     try testing.expectEqualStrings(
         \\id=1 xs=[1,2] ss=["a"]
         \\id=2 xs=[] ss=["b","c"]
         \\id=3 xs=null ss=null
         \\id=4 xs=[null,5] ss=[]
         \\
-    , try readAllText(a, @embedFile("testdata/lists_polars.parquet"), "p.parquet"));
+    , try readAllText(a, @embedFile("../testdata/lists_polars.parquet"), "p.parquet"));
 }
 
 test "a nested column is typed string and no bound prunes on it" {
@@ -2920,7 +2920,7 @@ test "a nested column is typed string and no bound prunes on it" {
     const a = ar.allocator();
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "l.parquet", .data = @embedFile("testdata/lists_v1.parquet") });
+    try tmp.dir.writeFile(.{ .sub_path = "l.parquet", .data = @embedFile("../testdata/lists_v1.parquet") });
     const dir = try tmp.dir.realpathAlloc(a, ".");
     const r = try Reader.open(a, try std.fs.path.join(a, &.{ dir, "l.parquet" }));
     defer r.close();
@@ -2970,7 +2970,7 @@ test "a nested fixture with bytes flipped anywhere errors or reads, never crashe
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    inline for (.{ "testdata/lists_v1.parquet", "testdata/lists_v2.parquet" }) |fixture| {
+    inline for (.{ "../testdata/lists_v1.parquet", "../testdata/lists_v2.parquet" }) |fixture| {
         const good = @embedFile(fixture);
         var buf: [good.len]u8 = undefined;
         var i: usize = 0;

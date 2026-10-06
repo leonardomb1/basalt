@@ -22,7 +22,7 @@
 
 const std = @import("std");
 const zip = std.zip;
-const pqdecode = @import("pqdecode.zig");
+const pqdecode = @import("parquet/read.zig");
 const sftp = @import("../store/sftp.zig");
 const smb = @import("../store/smb.zig");
 
