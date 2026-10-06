@@ -2,12 +2,14 @@
 //! `FROM x.table`, `LOAD INTO x` — and what each resolves to. The one place the
 //! name → kind mapping lives; dispatch elsewhere switches on the kind, so a new
 //! connector is a compile error at every site that must know about it.
+//!
+//! StarRocks and Doris are read through the MySQL driver and written by HTTP
+//! Stream Load (`streamload.zig`) rather than SQL INSERTs. `sftp` and `smb`
+//! name file stores addressed by path (`sftp://name/…`, `smb://name/…`).
 
 const std = @import("std");
 const sql = @import("../db/sql.zig");
 
-/// A SQL connector: the driver that speaks its wire protocol and the dialect the
-/// engine renders for it.
 pub const SqlKind = enum {
     postgres,
     mysql,
@@ -36,7 +38,6 @@ pub const SqlKind = enum {
 
 pub const SqlRead = struct { kind: SqlKind, dialect: sql.Dialect, port: u16 };
 
-/// Every connector name the runtime and analyzer dispatch on.
 pub const Connector = enum {
     csv,
     stdout,
@@ -47,9 +48,7 @@ pub const Connector = enum {
     range,
     starrocks,
     doris,
-    /// Files on an SFTP server, read and written by path (`sftp://name/…`).
     sftp,
-    /// Files on a Windows share or a Samba server (`smb://name/…`).
     smb,
     postgres,
     mysql,
@@ -59,7 +58,6 @@ pub const Connector = enum {
         return std.meta.stringToEnum(Connector, name);
     }
 
-    /// Written by HTTP Stream Load rather than SQL INSERTs (`streamload.zig`).
     pub fn streamLoad(self: Connector) bool {
         return self == .starrocks or self == .doris;
     }
@@ -73,11 +71,8 @@ pub const Connector = enum {
         };
     }
 
-    /// How the connector is *read*: the wire driver, the dialect rendered for it
-    /// and the port it listens on. StarRocks has no driver of its own — its FE
-    /// speaks the MySQL protocol on 9030 — so one `starrocks` connection is read
-    /// through the MySQL driver and written by stream load. Doris, which StarRocks
-    /// forked from, is the same arrangement.
+    /// How the connector is read: driver, dialect and port. StarRocks and Doris
+    /// have no driver of their own; their FE speaks MySQL on 9030.
     pub fn sqlRead(self: Connector) ?SqlRead {
         if (self == .starrocks) return .{ .kind = .mysql, .dialect = .starrocks, .port = 9030 };
         if (self == .doris) return .{ .kind = .mysql, .dialect = .doris, .port = 9030 };

@@ -1,7 +1,17 @@
 //! Minimal PostgreSQL v3 wire-protocol client: startup, auth (trust/cleartext/
-//! md5/SCRAM-SHA-256), simple Query, and RowDescription/DataRow parsing into a
-//! batch. Values arrive in text format, so the shared `sql.coerceText` does the
-//! typing. Exposes the `sql.Conn` interface.
+//! md5/SCRAM-SHA-256), simple Query, COPY FROM STDIN, and RowDescription/DataRow
+//! parsing into a batch. Values arrive in text format, so the shared
+//! `sql.coerceText` does the typing. Exposes the `sql.Conn` interface.
+//!
+//! Socket reads go through a 64 KB buffer: unbuffered, every backend message costs
+//! two recv syscalls (header and body), about two per row, which caps throughput.
+//!
+//! Everything read off the wire is bounds-checked before use. Past bugs: a short
+//! md5 reply hashed adjacent heap into a digest sent to the server, and a DataRow
+//! field count that disagreed with the RowDescription indexed `builders` out of
+//! bounds. A second statement's rows are never appended to the first's, since the
+//! schema is the first's. NUMERIC precision (up to 1000 in Postgres) is capped at
+//! 38, the ceiling of the engine's i128 decimal.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -12,9 +22,6 @@ const sql = @import("sql.zig");
 
 pub const Error = error{ PgProtocol, PgAuthFailed, PgQueryFailed, PgAuthUnsupported, PgTlsRefused } || std.mem.Allocator.Error;
 
-/// Buffered socket reads: without this, every backend message costs two recv
-/// syscalls (5-byte header + body) — ~2 per row — which dominates read time and
-/// caps throughput. A 64 KB buffer turns that into one syscall per ~64 KB.
 const SOCK_BUF = 64 * 1024;
 
 pub const Conn = struct {
@@ -46,9 +53,8 @@ pub const Conn = struct {
         return self;
     }
 
-    /// SSLRequest (len=8, code 80877103) → server answers one byte: 'S' starts
-    /// the TLS handshake, 'N' means TLS is disabled server-side (we error rather
-    /// than silently downgrading to plaintext).
+    /// SSLRequest (code 80877103): the server answers 'S' to start the TLS handshake
+    /// or 'N' when TLS is disabled, which is an error rather than a silent plaintext downgrade.
     fn startTls(self: *Conn, host: []const u8, mode: sql.TlsMode) !void {
         var req: [8]u8 = undefined;
         std.mem.writeInt(u32, req[0..4], 8, .big);
@@ -74,8 +80,6 @@ pub const Conn = struct {
         self.gpa.destroy(self);
     }
 
-    /// Cleartext reader/writer: through the TLS session when enabled, else the
-    /// plain socket interfaces.
     fn rd(self: *Conn) *std.Io.Reader {
         return if (self.tls) |t| &t.client.reader else self.sr.interface();
     }
@@ -121,9 +125,6 @@ pub const Conn = struct {
                     switch (code) {
                         0 => {},
                         3 => try self.sendPassword(password),
-                        // The salt is 4 bytes at offset 4; `readI32(p, 0)` only
-                        // proved `p.len >= 4`, so a short reply hashed adjacent
-                        // heap into a digest that then went out on the wire.
                         5 => {
                             if (p.len < 8) return error.PgProtocol;
                             try self.sendMd5(user, password, p[4..8]);
@@ -173,8 +174,8 @@ pub const Conn = struct {
         try self.writeMsg('p', body.items);
     }
 
-    /// SASL SCRAM-SHA-256 (RFC 5802). The server-first/final messages are read
-    /// here; the outer auth loop then continues to AuthenticationOk + ReadyForQuery.
+    /// SASL SCRAM-SHA-256 (RFC 5802, RFC 7677). Reads the server-first and final messages;
+    /// the outer auth loop then continues to AuthenticationOk and ReadyForQuery.
     fn scram(self: *Conn, password: []const u8) !void {
         var aa = std.heap.ArenaAllocator.init(self.gpa);
         defer aa.deinit();
@@ -236,8 +237,8 @@ pub const Conn = struct {
         return sql.openTextCursor(self, stmt, &cursor_vtable);
     }
 
-    /// Send the query and read up to RowDescription (the header); leaves the
-    /// connection positioned just before the DataRows.
+    /// Send the query and read up to RowDescription, leaving the connection just
+    /// before the DataRows.
     pub fn openCursor(self: *Conn, stmt: []const u8) !void {
         try self.sendQuery(stmt);
         const ma = self.meta_arena.allocator();
@@ -288,9 +289,6 @@ pub const Conn = struct {
                     self.last_error = try self.gpa.dupe(u8, errMessage(p));
                     return error.PgQueryFailed;
                 },
-                // A second statement's rows: never appended to the first's — the
-                // schema is the first's, and a same-shaped second set went in as
-                // if it were more of it.
                 'T' => {
                     self.last_error = try self.gpa.dupe(u8, sql.one_result_set);
                     return error.PgQueryFailed;
@@ -322,7 +320,6 @@ pub const Conn = struct {
         try self.writeMsg('Q', body.items);
     }
 
-    /// Send `COPY … FROM STDIN` and wait for the server's CopyInResponse ('G').
     pub fn copyIn(self: *Conn, cmd: []const u8) !void {
         try self.sendQuery(cmd);
         while (true) {
@@ -338,13 +335,12 @@ pub const Conn = struct {
         }
     }
 
-    /// Send one CopyData chunk ('d').
     pub fn copyData(self: *Conn, data: []const u8) !void {
         try self.writeMsg('d', data);
     }
 
-    /// Send CopyDone ('c') and drain to ReadyForQuery, surfacing any error.
-    /// Returns the server's row count from the "COPY <n>" CommandComplete tag.
+    /// Send CopyDone and drain to ReadyForQuery, surfacing any error. Returns the
+    /// row count from the "COPY <n>" CommandComplete tag.
     pub fn copyDone(self: *Conn) !u64 {
         try self.writeMsg('c', "");
         var count: ?u64 = null;
@@ -415,10 +411,6 @@ fn parseRowDescription(arena: std.mem.Allocator, p: []const u8) !RowDesc {
 
 fn parseDataRow(conn: *Conn, arena: std.mem.Allocator, p: []const u8, builders: []column.Builder) !void {
     const raw = try readI16(p, 0);
-    // The field count is read fresh off the wire every row, while `builders` was
-    // sized once from the RowDescription. Trusting it indexed `builders` out of
-    // bounds and then CALLED through the resulting bytes; `0xFFFF` read as -1
-    // also made `@intCast` to usize illegal behavior. Both are unreachable now.
     if (raw < 0 or @as(usize, @intCast(raw)) != builders.len) return error.PgProtocol;
     const n: usize = @intCast(raw);
     var i: usize = 2;
@@ -457,8 +449,6 @@ fn pgType(oid: i32, typmod: i32) types.Type {
 fn decimalFromTypmod(typmod: i32) types.Type {
     if (typmod < 4) return types.Type.decimal(38, 6);
     const m = typmod - 4;
-    // Postgres allows precision up to 1000, which does not fit a u8 at all — and
-    // the engine's decimal is an i128, so 38 digits is the real ceiling anyway.
     const precision: u8 = @intCast(@min((@as(u32, @bitCast(m)) >> 16) & 0xFFFF, 38));
     const scale: u8 = @intCast(@min(@as(u32, @bitCast(m)) & 0xFFFF, 38));
     return types.Type.decimal(precision, scale);
@@ -490,7 +480,7 @@ fn scramKeys(password: []const u8, salt: []const u8, iters: u32) !ScramKeys {
     return keys;
 }
 
-/// ClientProof = ClientKey XOR HMAC(StoredKey, AuthMessage)
+/// ClientProof = ClientKey XOR HMAC(StoredKey, AuthMessage).
 fn scramProof(keys: ScramKeys, auth_message: []const u8) [32]u8 {
     var client_sig: [32]u8 = undefined;
     HmacSha256.create(&client_sig, auth_message, &keys.stored_key);
@@ -499,7 +489,7 @@ fn scramProof(keys: ScramKeys, auth_message: []const u8) [32]u8 {
     return proof;
 }
 
-/// ServerSignature = HMAC(ServerKey, AuthMessage) — what the server's `v=` must equal.
+/// ServerSignature = HMAC(ServerKey, AuthMessage), which the server's `v=` must equal.
 fn scramServerSig(keys: ScramKeys, auth_message: []const u8) [32]u8 {
     var sig: [32]u8 = undefined;
     HmacSha256.create(&sig, auth_message, &keys.server_key);
@@ -544,8 +534,6 @@ test "pgType maps OIDs; numeric typmod carries precision and scale" {
     try std.testing.expectEqual(@as(u8, 38), u.precision);
     try std.testing.expectEqual(@as(u8, 6), u.scale);
 
-    // Postgres allows precision up to 1000; the engine's decimal is an i128, so
-    // anything past 38 digits is capped rather than truncated into a u8.
     const wide = pgType(1700, (500 << 16 | 2) + 4);
     try std.testing.expectEqual(@as(u8, 38), wide.precision);
     try std.testing.expectEqual(@as(u8, 2), wide.scale);
@@ -624,7 +612,6 @@ fn readCStr(p: []const u8, i: *usize) []const u8 {
     return s;
 }
 
-/// CommandComplete tag for COPY: "COPY <n>". Null on any other tag shape.
 fn parseCopyCount(p: []const u8) ?u64 {
     const tag = std.mem.sliceTo(p, 0);
     if (!std.mem.startsWith(u8, tag, "COPY ")) return null;
@@ -638,8 +625,6 @@ test "parseCopyCount: COPY tag, other tags, junk" {
     try std.testing.expectEqual(@as(?u64, null), parseCopyCount("COPY x"));
 }
 
-/// COPY FROM STDIN: text-format rows, one COPY statement per segment, verified
-/// against the "COPY n" tag.
 const CopyProto = struct {
     pub const Connection = Conn;
     pub const dialect: sql.Dialect = .postgres;

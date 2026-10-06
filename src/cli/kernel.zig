@@ -42,9 +42,34 @@
 //! `loop_done`/`loop_total` inside a `FOR EACH`). Each `LOAD` sends a `load`
 //! frame as it finishes, written or failed; the status lists them again with
 //! the run's totals. Exactly one `status` ends each request; after it, the
-//! script wrote nothing more. A failed script's status carries `error` with the message, the line and
-//! column in the script as sent (not in the replayed declarations), and whether
-//! it is `transient`. Logs and `PRINT` stay on stderr.
+//! script wrote nothing more. A failed script's status carries `error` with the
+//! message, the line and column in the script as sent (`file` is `script`, an
+//! included file's path, or `session` for a declaration an earlier script made),
+//! and whether it is `transient`. Logs and `PRINT` stay on stderr, warnings and
+//! errors only unless asked, and without the per-run summary the status carries.
+//!
+//! Unknown request fields are ignored, so a newer frontend can talk to an older
+//! kernel. `complete`'s `pos` and its answer's `start`/`end` count UTF-16 units,
+//! a JavaScript editor's offsets, not bytes. `check`'s `tables` are names, or
+//! `{"name":…,"columns":[{"name":…,"type":…}]}` to type what is read from them.
+//! Echoed ids are clipped to 256 bytes; a clipped echo still pairs in order.
+//!
+//! Threads and fds. A stdin thread reads requests: `cancel` acts there at once,
+//! since it must reach a busy script, and only stops the script whose id it
+//! names; everything else queues for the main loop in order. ^C cancels the
+//! script, never the session (the CLI's own handler exits on a second signal,
+//! taking every declaration with it). Frames go to a private dup of stdout; fd 1
+//! points at stderr between scripts, so a stray write cannot corrupt the stream,
+//! and at a capture pipe while one runs, whose pump thread frames it as `data`.
+//! Each result's close swaps in a fresh pipe, so the old one holds exactly that
+//! result's bytes and its `result` frame follows them; if a swap fails, later
+//! bytes still frame, just without a boundary. The status goes only after fd 1
+//! is handed back and the pump has drained. Loads are recorded under a lock
+//! because the workers of a parallel `FOR EACH` report them.
+//!
+//! A LET's value is decided by the script that declares it, not by whichever
+//! later script first runs, and replaces its expression in the session whether
+//! or not the rest of that script succeeds.
 
 const std = @import("std");
 const cli = @import("cli.zig");
@@ -56,8 +81,6 @@ const types = @import("../lang/types.zig");
 const parser = @import("../lang/sql_parser.zig");
 const obs = @import("../runtime/obs.zig");
 
-/// One request line. Unknown fields are ignored, so a newer frontend can talk to
-/// an older kernel.
 const Request = struct {
     op: []const u8,
     id: ?[]const u8 = null,
@@ -65,26 +88,17 @@ const Request = struct {
     params: ?std.json.Value = null,
     format: ?[]const u8 = null,
     max_rows: ?u64 = null,
-    /// `complete`: the byte offset in `script` to complete at (default: its end),
-    /// and whether connections may be asked for their tables and columns.
     pos: ?usize = null,
     connect: bool = true,
-    /// `pos`, and the `start`/`end` of the answer, count UTF-16 units — what a
-    /// JavaScript editor's offsets are — rather than bytes.
     utf16: bool = false,
-    /// `check`: tables that exist where the script will run but that no script
-    /// declared — each a name, or `{"name":…,"columns":[{"name":…,"type":…}]}`.
     tables: ?std.json.Value = null,
 };
 
-/// Requests the stdin thread hands to the main loop. `cancel` never queues: it
-/// has to reach a script that is busy running.
 const Queue = struct {
     mu: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
     items: std.array_list.Managed([]u8),
     eof: bool = false,
-    /// Id of the script now running, so a late cancel cannot stop the next one.
     running: ?[]const u8 = null,
     active: bool = false,
 
@@ -102,7 +116,6 @@ const Queue = struct {
         self.cond.signal();
     }
 
-    /// Next request line, or null at EOF. Caller owns the line.
     fn pop(self: *Queue) ?[]u8 {
         self.mu.lock();
         defer self.mu.unlock();
@@ -118,7 +131,7 @@ const Queue = struct {
         self.active = id != null;
     }
 
-    /// Abort the running script if `id` names it (or names nothing).
+    /// Aborts the running script if `id` names it, or names nothing.
     fn cancel(self: *Queue, id: ?[]const u8) void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -128,8 +141,6 @@ const Queue = struct {
     }
 };
 
-/// The real stdout, kept once fd 1 starts being swapped for a capture pipe.
-/// Frames from the pump thread and the main loop share it.
 const Out = struct {
     fd: std.posix.fd_t,
     mu: std.Thread.Mutex = .{},
@@ -155,7 +166,6 @@ const Out = struct {
         self.writeAll(bytes);
     }
 
-    /// One JSON header line, already rendered.
     fn line(self: *Out, bytes: []const u8) void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -163,8 +173,6 @@ const Out = struct {
     }
 };
 
-/// Ids are echoed into a fixed header buffer; a frontend has no business sending
-/// a longer one, and a clipped echo still pairs with the request in order.
 fn clip(id: []const u8) []const u8 {
     return id[0..@min(id.len, 256)];
 }
@@ -187,9 +195,6 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     defer stderr.flush() catch {};
 
     var opts = Opts{ .threads = std.Thread.getCpuCount() catch 1 };
-    // A session's own logs would interleave with a frontend's; warnings and
-    // errors only unless asked, and never the per-run summary — the status
-    // frame carries it.
     opts.log = .{ .level = .warn, .summary = .none };
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
@@ -222,14 +227,9 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         }
     }
 
-    // ^C cancels the script, never the session. The CLI's own handler exits on a
-    // second signal, which would take every declaration with it.
     const act = std.posix.Sigaction{ .handler = .{ .handler = onInterrupt }, .mask = std.posix.sigemptyset(), .flags = 0 };
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
 
-    // Frames go to a private copy of stdout; fd 1 itself points at stderr between
-    // scripts (so a stray write cannot corrupt the stream) and at a capture pipe
-    // while one runs.
     var out = Out{ .fd = try std.posix.dup(std.posix.STDOUT_FILENO) };
     defer std.posix.close(out.fd);
     try std.posix.dup2(std.posix.STDERR_FILENO, std.posix.STDOUT_FILENO);
@@ -244,8 +244,6 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
 
     var decls = cli.DeclStore.init(alloc);
     defer decls.deinit();
-    // What sources said about their tables and columns, kept for the session as
-    // the REPL keeps it: asked once, on first use.
     var catalog = cli.Catalog.init(alloc);
     defer catalog.deinit();
 
@@ -280,11 +278,9 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     return 0;
 }
 
-/// `{"op":"check","script":…,"tables":[…]}`: every problem in a cell, as
-/// `basalt check --format json` lists them, read against the session — its
-/// connections, params, LETs and functions — and the `tables` other cells hold.
-/// Nothing runs, nothing connects, and the session is left as it was: the
-/// cell's own declarations are checked, not kept.
+/// Every problem in a cell, in `basalt check --format json`'s shape, against the
+/// session and the given `tables`. Nothing runs or connects; the cell's own
+/// declarations are checked, not kept.
 fn checkScript(a: std.mem.Allocator, out: *Out, decls: *const cli.DeclStore, req: Request) !void {
     const script = req.script orelse
         return reply(a, out, req.id, .{ .ok = false, .@"error" = .{ .msg = "`check` needs a `script`" } });
@@ -308,7 +304,6 @@ fn checkScript(a: std.mem.Allocator, out: *Out, decls: *const cli.DeclStore, req
         var e = ErrorInfo{ .msg = is.msg };
         locate(&e, st.text, st.entry_at, is.file orelse "", is.pos, is.end);
         if (k > 0) try w.writeByte(',');
-        // `basalt check --format json`'s shape, placed in the script as sent
         try w.writeAll("{\"level\":\"error\",\"msg\":");
         try std.json.Stringify.encodeJsonString(e.msg, .{}, w);
         try w.writeAll(",\"file\":");
@@ -321,8 +316,6 @@ fn checkScript(a: std.mem.Allocator, out: *Out, decls: *const cli.DeclStore, req
     try reply(a, out, req.id, .{ .ok = true, .diagnostics = aw.written() });
 }
 
-/// `tables` as the analysis takes them: a name alone leaves the table's columns
-/// unresolved; given columns type everything read from it.
 fn knownTables(a: std.mem.Allocator, v: ?std.json.Value) error{ OutOfMemory, BadTables, BadType }![]const analyze.KnownTable {
     const list = switch (v orelse return &.{}) {
         .array => |arr| arr.items,
@@ -357,7 +350,6 @@ fn knownTables(a: std.mem.Allocator, v: ?std.json.Value) error{ OutOfMemory, Bad
                     .string => |t| t,
                     else => return error.BadTables,
                 };
-                // a notebook's column may hold nulls whatever its type
                 const ty = parser.parseTypeStr(a, tn) orelse return error.BadType;
                 f.* = .{ .name = cn, .ty = ty.asNullable() };
             }
@@ -368,9 +360,6 @@ fn knownTables(a: std.mem.Allocator, v: ?std.json.Value) error{ OutOfMemory, Bad
     return out;
 }
 
-/// `{"op":"complete","script":…,"pos":N}`: what Tab would offer at byte `pos`
-/// of a cell, against the session's declarations and the cell's own. Answered
-/// by the status, which carries `complete: {start, end, items}`.
 fn completeScript(gpa: std.mem.Allocator, a: std.mem.Allocator, out: *Out, decls: *const cli.DeclStore, catalog: *cli.Catalog, req: Request) !void {
     const script = req.script orelse "";
     const at = if (req.pos) |p| (if (req.utf16) cli.utf16ToByte(script, p) else p) else script.len;
@@ -392,14 +381,11 @@ fn usageErr(stderr: *std.Io.Writer, m: []const u8) !u8 {
     return 2;
 }
 
-/// Reads request lines until EOF. `cancel` acts here, at once; every other
-/// request queues for the main loop in arrival order.
 fn readRequests(alloc: std.mem.Allocator, q: *Queue) void {
     defer q.close();
     var buf: [64 * 1024]u8 = undefined;
     var fr = std.fs.File.stdin().readerStreaming(&buf);
     const r = &fr.interface;
-    // A script can be larger than the read buffer; gather the whole line.
     var acc = std.Io.Writer.Allocating.init(alloc);
     defer acc.deinit();
     while (true) {
@@ -418,13 +404,12 @@ fn readRequests(alloc: std.mem.Allocator, q: *Queue) void {
                 };
             }
         }
-        // stopped either at the delimiter, which is stepped over, or at EOF
         _ = r.takeByte() catch return;
     }
 }
 
-/// Parses `{"op":"cancel",...}`: null when the line is anything else, else the
-/// optional id it names (owned by `alloc`).
+/// Null when the line is not a cancel request, else the optional id it names
+/// (owned by `alloc`).
 fn isCancel(alloc: std.mem.Allocator, line: []const u8) ??[]u8 {
     if (std.mem.indexOf(u8, line, "cancel") == null) return null;
     const C = struct { op: []const u8, id: ?[]const u8 = null };
@@ -437,12 +422,9 @@ fn isCancel(alloc: std.mem.Allocator, line: []const u8) ??[]u8 {
 
 const ErrorInfo = struct {
     msg: []const u8,
-    /// Where it is: `script` for the script as sent, a path for an included file,
-    /// `session` for a declaration an earlier script made.
     file: ?[]const u8 = null,
     line: ?u32 = null,
     col: ?u32 = null,
-    /// Just past the offending text, when the error names a span.
     end_line: ?u32 = null,
     end_col: ?u32 = null,
     transient: bool = false,
@@ -456,12 +438,9 @@ const Status = struct {
     elapsed_ms: ?u64 = null,
     declared: ?[]const Declared = null,
     results: ?[]const ResultFrame = null,
-    /// The loads the script ran and the run's totals; null when nothing ran.
     loads: ?Loads = null,
     @"error": ?ErrorInfo = null,
-    /// A `complete` answer, already JSON.
     complete: ?[]const u8 = null,
-    /// A `check` answer: the JSON array of diagnostics.
     diagnostics: ?[]const u8 = null,
 };
 
@@ -512,7 +491,7 @@ fn reply(a: std.mem.Allocator, out: *Out, id: ?[]const u8, st: Status) !void {
 }
 
 /// Maps a position in prelude + script back to the script as the frontend sent
-/// it. A position inside the prelude belongs to an earlier script's declaration.
+/// it; a position inside the prelude belongs to the session.
 fn locate(e: *ErrorInfo, prepared_text: []const u8, entry_at: usize, label: []const u8, pos: ?ast.Pos, end: ?ast.Pos) void {
     const p = pos orelse return;
     if (p.line == 0) return;
@@ -543,7 +522,6 @@ fn paramArgs(a: std.mem.Allocator, v: ?std.json.Value) ![]runtime.ParamArg {
     var out = std.array_list.Managed(runtime.ParamArg).init(a);
     var it = obj.iterator();
     while (it.next()) |kv| {
-        // A PARAM parses its value from text, as it does from `-p k=v`.
         const val: []const u8 = switch (kv.value_ptr.*) {
             .string => |s| s,
             .integer => |n| try std.fmt.allocPrint(a, "{d}", .{n}),
@@ -563,7 +541,6 @@ fn declaresLet(pending: []const cli.Pending) bool {
     return false;
 }
 
-/// Copies the capture pipe into `data` frames until the write end closes.
 fn pump(out: *Out, fd: std.posix.fd_t, id: []const u8) void {
     var buf: [64 * 1024]u8 = undefined;
     while (true) {
@@ -573,12 +550,11 @@ fn pump(out: *Out, fd: std.posix.fd_t, id: []const u8) void {
     }
 }
 
-/// What the status says of a run's loads: each one, and the summary's totals.
 const Loads = struct { list: []const runtime.LoadDone, summary: obs.Summary };
 
-/// One load's fields, without braces: the `load` frame carries them after its
-/// `type`/`id`, and the status's `loads` lists each as an object. Fields a load has no value for are left
-/// out: `reason`/`transient` on success, the loop's when not in one.
+/// One load's fields without braces, shared by the `load` frame and the status.
+/// Fields without a value are left out: `reason`/`transient` on success, the
+/// loop's outside one.
 fn writeLoadFields(w: *std.Io.Writer, l: runtime.LoadDone) !void {
     try w.print("\"load\":{d},\"target\":", .{l.ordinal});
     try std.json.Stringify.encodeJsonString(l.target, .{}, w);
@@ -593,7 +569,6 @@ fn writeLoadFields(w: *std.Io.Writer, l: runtime.LoadDone) !void {
     if (l.loop_total > 0) try w.print(",\"loop_done\":{d},\"loop_total\":{d}", .{ l.loop_done, l.loop_total });
 }
 
-/// A finished result, as the `result` frame and the status list it.
 const ResultFrame = struct {
     statement: u32,
     kind: []const u8,
@@ -604,28 +579,19 @@ const ResultFrame = struct {
     truncated: bool,
 };
 
-/// fd 1 routed into a pipe whose pump frames it. A result's close swaps in a
-/// fresh pipe — the old one then holds exactly that result's bytes — so the
-/// `result` frame can follow them: everything between two `result` frames is
-/// one result, in any format.
 const Capture = struct {
     out: *Out,
     id: []const u8,
     read_fd: std.posix.fd_t = -1,
     thread: ?std.Thread = null,
     results: std.array_list.Managed(ResultFrame),
-    /// A failed swap: later bytes still frame, just without a boundary.
     broken: bool = false,
-    /// Finished loads, copied out of the run's arena. Appended from the worker
-    /// threads of a parallel `FOR EACH`, hence the lock (the arena is not
-    /// thread-safe either).
     loads: std.array_list.Managed(runtime.LoadDone),
     loads_mu: std.Thread.Mutex = .{},
 
     fn start(self: *Capture) !void {
         const pipe = try std.posix.pipe2(.{ .CLOEXEC = true });
         errdefer std.posix.close(pipe[0]);
-        // replacing fd 1 closes the previous pipe's last write end
         std.posix.dup2(pipe[1], std.posix.STDOUT_FILENO) catch |e| {
             std.posix.close(pipe[1]);
             return e;
@@ -635,14 +601,14 @@ const Capture = struct {
         self.read_fd = pipe[0];
     }
 
-    /// Wait for the pump of a pipe whose write end is gone.
     fn drain(self: *Capture, t: ?std.Thread, fd: std.posix.fd_t) void {
         _ = self;
         if (t) |th| th.join();
         if (fd >= 0) std.posix.close(fd);
     }
 
-    /// Hand fd 1 back to stderr and drain what the script wrote.
+    /// Handing fd 1 back closes the pipe's last write end, so the pump drains
+    /// and stops before the status goes.
     fn stop(self: *Capture) void {
         std.posix.dup2(std.posix.STDERR_FILENO, std.posix.STDOUT_FILENO) catch {};
         self.drain(self.thread, self.read_fd);
@@ -682,7 +648,6 @@ const Capture = struct {
         return .{ .ctx = self, .f = onResult };
     }
 
-    /// A `LOAD` finished: its `load` frame now, and a copy for the status.
     fn onLoad(ctx: *anyopaque, done: runtime.LoadDone) void {
         const self: *Capture = @ptrCast(@alignCast(ctx));
         self.loads_mu.lock();
@@ -702,8 +667,6 @@ const Capture = struct {
         self.out.line(aw.written());
     }
 
-    /// A statement still moving rows: what the terminal's progress line says,
-    /// as a `progress` frame, once a second once it has run 400 ms.
     fn onProgress(ctx: *anyopaque, ev: obs.Progress.Event) void {
         const self: *Capture = @ptrCast(@alignCast(ctx));
         var hbuf: [768]u8 = undefined;
@@ -758,8 +721,6 @@ fn runScript(
     for (declared, entry.pending) |*d, p| d.* = .{ .kind = @tagName(p.id.kind), .name = p.id.name };
 
     if (entry.executable == 0) {
-        // Declarations only — but a LET's value is decided here, in the cell
-        // that declares it, not by whichever later cell first runs.
         if (declaresLet(entry.pending)) {
             var freezer = cli.LetFreezer.init(a);
             var rdiag: runtime.Diag = .{};
@@ -782,8 +743,6 @@ fn runScript(
         return reply(a, out, req.id, .{ .ok = true, .elapsed_ms = @intCast(std.time.milliTimestamp() - t0), .declared = declared });
     }
 
-    // Capture fd 1 for the script's lifetime: every sink that writes stdout
-    // lands in the pipe, and the pump turns it into frames as it arrives.
     var cap = Capture{ .out = out, .id = id, .results = std.array_list.Managed(ResultFrame).init(a), .loads = std.array_list.Managed(runtime.LoadDone).init(a) };
     var summary: obs.Summary = .{ .run_id = 0, .loads = 0 };
     var ran = false;
@@ -792,8 +751,6 @@ fn runScript(
         return e;
     };
 
-    // LET values this script decides replace their expressions in the session,
-    // whether or not the rest of it succeeds: they were decided either way
     var freezer = cli.LetFreezer.init(a);
     defer freezer.commit(decls) catch {};
 
@@ -802,8 +759,6 @@ fn runScript(
     var rdiag: runtime.Diag = .{};
     var failed: ?anyerror = null;
     if (entry.prog.explain == .plan) {
-        // An EXPLAIN that opens the program renders without executing, as `basalt
-        // run` does; it only happens with no declarations ahead of it.
         var adiag: analyze.Diag = .{};
         if (analyze.analyzeWith(a, entry.prog, &.{}, &adiag)) |plan| {
             var aw = std.Io.Writer.Allocating.init(a);
@@ -828,7 +783,6 @@ fn runScript(
             .explain = entry.prog.explain == .analyze,
             .stdout_format = format,
             .items = false,
-            // result metadata counts lines in the script as sent
             .line_base = @intCast(std.mem.count(u8, entry.text[0..entry.entry_at], "\n")),
             .on_result = cap.hook(),
             .progress_hook = .{ .ctx = &cap, .f = Capture.onProgress },
@@ -843,8 +797,6 @@ fn runScript(
     }
     q.setRunning(null);
 
-    // Hand fd 1 back to stderr, which closes the pipe's last write end: the pump
-    // drains what the script wrote and stops, and only then does the status go.
     cap.stop();
     const results = cap.results.items;
     const loads: ?Loads = if (ran) .{ .list = cap.loads.items, .summary = summary } else null;
@@ -876,19 +828,16 @@ test "locate: positions count in the script as sent, not the replayed prelude" {
     try std.testing.expectEqual(@as(?u32, 2), e.end_line);
     try std.testing.expectEqual(@as(?u32, 12), e.end_col);
 
-    // inside the prelude: an earlier script's declaration, with no line to give
     var p = ErrorInfo{ .msg = "" };
     locate(&p, text, entry_at, "", .{ .line = 1, .col = 1 }, null);
     try std.testing.expectEqualStrings("session", p.file.?);
     try std.testing.expectEqual(@as(?u32, null), p.line);
 
-    // an included file keeps its own path and lines
     var inc = ErrorInfo{ .msg = "" };
     locate(&inc, text, entry_at, "lib.sql", .{ .line = 7, .col = 3 }, null);
     try std.testing.expectEqualStrings("lib.sql", inc.file.?);
     try std.testing.expectEqual(@as(?u32, 7), inc.line);
 
-    // no position, nothing claimed
     var none = ErrorInfo{ .msg = "" };
     locate(&none, text, entry_at, "", null, null);
     try std.testing.expectEqual(@as(?[]const u8, null), none.file);

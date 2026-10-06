@@ -1,6 +1,6 @@
-//! Parser for the Basalt SQL dialect (docs/language.md). Produces the SAME
-//! `ast.Program` as the BSL parser — the planner, analyzer, pushdown, and
-//! executor are shared ("one plan"). Only the surface differs.
+//! Parser for the Basalt SQL dialect (docs/language.md). Produces the same
+//! `ast.Program` as the BSL parser, so the planner, analyzer, pushdown and
+//! executor are shared ("one plan"); only the surface differs.
 //!
 //! Mapping highlights (see docs/language.md):
 //!   CREATE ENDPOINT '/x'            -> KindDecl http (absent -> batch)
@@ -15,6 +15,44 @@
 //!   UNION [ALL] [BY NAME] + ANCHOR  -> union_ stage (+ distinct; tag col = literal-as-alias)
 //!   FOR EACH ROW OF (...) AS (...)  -> ForEach (PARALLEL / ON ERROR -> hints)
 //!   CASE ... THEN <stmts> END CASE  -> StmtMatch (plan-time dispatch)
+//!
+//! Most SQL is desugared here rather than given plan nodes of its own. A derived
+//! table, a CTE, a join's reading side and a table-function call each lower to a
+//! binding under a generated name, gathered in `pending_bindings` and drained by
+//! `parseQuery` ahead of the statement that reads it; bindings share one namespace
+//! per script, and binding under the written alias once let a second `r` silently
+//! replace the first. Aliases resolve by name at parse time (`AliasSet`), so a
+//! repeated alias is refused where it is written. `IN (SELECT ...)` becomes a semi
+//! or anti join stage (NOT IN null-aware): a sentinel expression, matched by
+//! pointer, holds its place in the WHERE until it is lifted out, so it is accepted
+//! only as a top-level AND conjunct, and a WHERE lifts only the sentinels it
+//! registered itself. A scalar subquery becomes a query LET referenced as `$name`,
+//! a constant by plan time that can push down. BETWEEN becomes `>= AND <=`. Table
+//! functions are expanded while parsing, so their declarations, including
+//! `@include`d ones, must be in hand.
+//!
+//! Aggregation: the aggregate stage emits grouping keys first, then aggregates. A
+//! projection before it carries the columns the aggregates read; one after it
+//! restores the SELECT order, evaluates arithmetic around lifted aggregates
+//! (`round(avg(x), 2)`), renames aliased keys, places constant items and drops
+//! aggregates only HAVING needed. A column neither grouped nor aggregated is
+//! refused, never silently dropped. Sort keys, `DISTINCT ON` keys and window
+//! references the SELECT list leaves out ride along as hidden columns and are
+//! dropped last. With a window, DISTINCT runs after it.
+//!
+//! `$name` is always script scope (a PARAM, LET, loop variable or statement-function
+//! parameter, possibly from an `@include`); a bare name is a column even when a
+//! PARAM shares it. A double-quoted name is always a column, never a keyword or a
+//! string; `'...'` is the only string syntax.
+//!
+//! Stack safety: every later pass recurses on the expression tree, so one deeper
+//! than `max_expr_depth` is refused (a 4000-element IN list once segfaulted in
+//! `run`); AND/OR chains are balanced first, so long IN lists stay shallow. Query
+//! nesting, unary nesting and table-function recursion are bounded too.
+//!
+//! With `Options.errors`, each failed statement is recorded and parsing resumes at
+//! the next; an error inside a block statement (FOR, CASE, CREATE) ends the parse,
+//! since resuming mid-body would report errors the block does not have.
 
 const std = @import("std");
 const token = @import("token.zig");
@@ -32,40 +70,24 @@ pub const Diagnostic = struct {
     msg: []const u8,
     line: u32,
     col: u32,
-    /// Just past the token the error points at, when it points at one; 0 else.
     end_line: u32 = 0,
     end_col: u32 = 0,
 };
 pub const Error = error{ ParseFailed, OutOfMemory };
 
-/// Tokenize and parse a whole Basalt SQL program.
 pub fn parseSource(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic) Error!ast.Program {
     return parseSourceWith(arena, src, diag, &.{});
 }
 
-/// `parseSource` for a file that follows others — an includer after its
-/// `@include`s: `known` are the connections those declared, so a `conn.QUERY(...)`
-/// or `EACH TABLE OF (conn...)` here resolves as it would in one file.
+/// `parseSource` for a file parsed after its `@include`s, whose connections are `known`.
 pub fn parseSourceWith(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic, known: []const ast.Connection) Error!ast.Program {
     return parseSourceOpts(arena, src, diag, .{ .known_conns = known });
 }
 
-/// What a parse may know beyond its own text, and how it treats an error.
 pub const Options = struct {
-    /// Connections declared by files parsed before this one (`@include`).
     known_conns: []const ast.Connection = &.{},
-    /// Table functions declared by files parsed before this one (`@include`):
-    /// a call is expanded while parsing, so the declaration must be in hand.
     known_fns: []const ast.FnDecl = &.{},
-    /// Tables that exist where the script will run but that it does not declare —
-    /// a notebook's other cells. `FROM name` / `JOIN name` read them as a binding
-    /// reference the analyzer resolves, instead of "unknown source".
     known_tables: []const []const u8 = &.{},
-    /// Keep going: every statement that fails to parse is recorded here, and
-    /// parsing resumes at the next statement. A statement that opens a block
-    /// (`FOR`, `CASE`, `CREATE`) has `;`s of its own, so an error inside one
-    /// ends the parse — resuming mid-body would report the rest of the block as
-    /// errors it does not have. Null: the first error fails the parse.
     errors: ?*std.array_list.Managed(Diagnostic) = null,
 };
 
@@ -82,8 +104,7 @@ pub fn parseSourceOpts(arena: std.mem.Allocator, src: []const u8, diag: *Diagnos
     return p.parseProgram();
 }
 
-/// A type name as a `PARAM` or `CAST` spells it (`int`, `decimal(10,2)`,
-/// `varchar(20)`, `timestamp`), or null when it is none.
+/// A type name as a `PARAM` or `CAST` spells it, or null when it is none.
 pub fn parseTypeStr(arena: std.mem.Allocator, src: []const u8) ?types.Type {
     const toks = lexer.tokenize(arena, src) catch return null;
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
@@ -93,8 +114,7 @@ pub fn parseTypeStr(arena: std.mem.Allocator, src: []const u8) ?types.Type {
     return ty;
 }
 
-/// Tokenize and parse a single standalone expression (used to evaluate the
-/// body of a `${ <expr> }` interpolation hole). Fails on trailing input.
+/// Parse one standalone expression, the body of a `${ <expr> }` hole. Fails on trailing input.
 pub fn parseExprStr(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic) Error!*ast.Expr {
     const toks = lexer.tokenize(arena, src) catch return error.OutOfMemory;
     var p = Parser{ .arena = arena, .toks = toks, .diag = diag };
@@ -112,13 +132,6 @@ fn eqlNoCase(a: []const u8, b: []const u8) bool {
 
 const MAX_ALIASES = 32;
 
-/// The FROM/JOIN names of one query. A left alias is stripped from `alias.x`; a
-/// join's right alias is kept, since `b.x` may be a column the join renamed `x_r`;
-/// an unaliased join side only reserves its binding name.
-///
-/// Resolution happens here, at parse time, by name — so two tables sharing a name
-/// cannot be told apart later, and every `r.x` would silently go to the first `r`.
-/// A repeated name is refused where it is written instead.
 const AliasSet = struct {
     const Kind = enum { left, right, reserved };
 
@@ -147,8 +160,6 @@ const AliasSet = struct {
     }
 };
 
-/// Words that terminate an alias-free position (so `FROM t WHERE ...` doesn't
-/// read WHERE as an alias).
 const reserved_after_source = [_][]const u8{
     "where",   "group",    "order",   "limit",  "union",     "anchor", "join",
     "inner",   "left",     "right",   "full",   "cross",     "semi",   "anti",
@@ -171,17 +182,16 @@ fn isReservedAfterSource(name: []const u8) bool {
     return false;
 }
 
-/// The file format of a path source is sniffed from its extension when the read
-/// opens, so a computed path must still spell that extension out: everything after
-/// the last `${...}` hole has to carry a `.ext`.
+/// Whether a computed path spells an extension after its last `${...}` hole: the
+/// format is sniffed from it when the read opens.
 fn hasLiteralExt(tmpl: []const u8) bool {
     const tail = if (std.mem.lastIndexOfScalar(u8, tmpl, '}')) |i| tmpl[i + 1 ..] else tmpl;
     const dot = std.mem.lastIndexOfScalar(u8, tail, '.') orelse return false;
     return dot + 1 < tail.len;
 }
 
-/// Whether `name` is an aggregate function — reserved, since it is parsed as
-/// one before any user function could be looked up.
+/// Whether `name` is an aggregate. Reserved: it parses as one before any user
+/// function is looked up.
 pub fn isAggName(name: []const u8) bool {
     return aggregates.lookup(name) != null;
 }
@@ -193,23 +203,18 @@ fn isGroupKey(group: []const ast.QualName, q: ast.QualName) bool {
     return false;
 }
 
-/// The name the aggregate stage emits a `post` item under: a grouping key keeps its
-/// own column name, a lifted aggregate its alias.
+/// The name the aggregate stage emits a `post` item under: a grouping key's own
+/// column name, a lifted aggregate's alias, or null for a star.
 fn postItemName(it: ast.SelectItem) ?[]const u8 {
     return switch (it) {
         .field => |q| q.last(),
         .computed => |c| c.name,
-        // A star cannot be resolved to names here; the caller declines to reorder.
         .star, .star_except, .star_rename => null,
     };
 }
 
-/// Does the SELECT list ask for a different column order than the aggregate stage
-/// naturally emits? The stage writes every grouping key first and every aggregate
-/// after, so `SELECT k1, SUM(x), k2` would silently come out `k1, k2, sum`. When
-/// this returns true the caller adds the projection that puts the SELECT list back
-/// in charge — and when it returns false nothing is added, keeping the common
-/// keys-then-aggregates query one stage shorter.
+/// Whether the SELECT list orders columns otherwise than the aggregate stage emits
+/// them (keys first), so the caller must add a reordering projection.
 fn aggOrderDiffers(post: []const ast.SelectItem, group: []const ast.QualName, aggs: []const ast.AggItem) bool {
     if (post.len != group.len + aggs.len) return false;
     for (post, 0..) |it, i| {
@@ -220,19 +225,16 @@ fn aggOrderDiffers(post: []const ast.SelectItem, group: []const ast.QualName, ag
     return false;
 }
 
-/// What to call a SELECT item in a diagnostic.
 fn sameName(a: ast.QualName, b: ast.QualName) bool {
     if (a.parts.len != b.parts.len) return false;
     for (a.parts, b.parts) |x, y| if (!std.mem.eql(u8, x, y)) return false;
     return true;
 }
 
-/// Where a SELECT list already carries the column a sort or `DISTINCT ON` key
-/// names: under the key's own name, under an alias the list gave it, or nowhere.
-/// A qualified key (`b.amt`, a join's right side) matches only the same reference —
-/// an output merely *called* `amt` may be the left side's.
 const KeyHome = union(enum) { as_is, renamed: []const u8, missing };
 
+/// Where the SELECT list carries a sort or `DISTINCT ON` key: its own name, an alias,
+/// or nowhere. A qualified key (`b.amt`) matches only the same reference.
 fn keyHome(items: []const ast.SelectItem, k: ast.QualName) KeyHome {
     for (items) |it| switch (it) {
         .field => |f| if (sameName(f, k)) return .as_is,
@@ -248,9 +250,8 @@ fn keyHome(items: []const ast.SelectItem, k: ast.QualName) KeyHome {
     return .missing;
 }
 
-/// The projection that keeps `items`' outputs and nothing a key smuggled in beside
-/// them. A plain column is kept by its own reference, so `b.amt` still finds the
-/// right side's column rather than whatever is called `amt`.
+/// The projection that keeps `items`' outputs and none of the hidden keys beside them;
+/// a plain column is kept by reference, so `b.amt` still finds the right side's column.
 fn keepOutputs(arena: std.mem.Allocator, items: []const ast.SelectItem) ![]const ast.SelectItem {
     const outs = try arena.alloc(ast.SelectItem, items.len);
     for (items, outs) |it, *o| o.* = switch (it) {
@@ -264,6 +265,7 @@ fn keepOutputs(arena: std.mem.Allocator, items: []const ast.SelectItem) ![]const
     return outs;
 }
 
+/// What to call a SELECT item in a diagnostic.
 fn itemLabel(it: ast.SelectItem) []const u8 {
     return switch (it) {
         .star, .star_except, .star_rename => "*",
@@ -276,11 +278,6 @@ fn aggFunc(name: []const u8) ?ast.AggFunc {
     return aggregates.lookup(name);
 }
 
-/// One table-function call being expanded: its parameters bound to the call's
-/// argument expressions, and the body's own `WITH` names mapped to names unique
-/// to this call, so two calls in one query do not share a binding. While a
-/// declaration is only being checked, `args` is empty and every `$param` stays
-/// a plain reference.
 const TableFrame = struct {
     names: []const []const u8,
     args: []const *ast.Expr,
@@ -298,11 +295,8 @@ const TableFrame = struct {
     }
 };
 
-/// How deep table functions may call one another — and where a function that
-/// reaches itself (through `OR REPLACE`) stops.
 const max_tvf_depth = 16;
 
-/// One `CREATE RESOURCE conn.name AS GET(...)`: the read it stands for.
 const Resource = struct { conn: []const u8, name: []const u8, path: []const u8, post: bool, hints: []const ast.Hint };
 
 pub const Parser = struct {
@@ -312,54 +306,26 @@ pub const Parser = struct {
     diag: *Diagnostic,
 
     endpoint: ?ast.KindDecl = null,
-    /// Connections declared by files parsed before this one (`@include`).
     known_conns: []const ast.Connection = &.{},
     known_fns: []const ast.FnDecl = &.{},
     known_tables: []const []const u8 = &.{},
     errors: ?*std.array_list.Managed(Diagnostic) = null,
-    /// `CREATE FUNCTION ... RETURNS TABLE` declarations so far — this file's and
-    /// its includes'. A call takes the last of a name, as `OR REPLACE` means.
     table_fns: std.array_list.Managed(ast.FnDecl) = undefined,
-    /// The table-function call whose body is being parsed, if any.
     tvf: ?*TableFrame = null,
     tvf_depth: usize = 0,
-    /// The parameters of the lambdas whose bodies are being parsed, innermost last.
     lambda_names: [24][]const u8 = undefined,
     lambda_n: usize = 0,
     conn_names: std.array_list.Managed([]const u8) = undefined,
-    /// Parallel to `conn_names`: each connection's connector type, which `SHOW
-    /// TABLES` needs to phrase its catalog query.
     conn_types: std.array_list.Managed([]const u8) = undefined,
-    /// `CREATE RESOURCE`s declared so far, which `FROM conn.name` expands.
     resources: std.array_list.Managed(Resource) = undefined,
     let_names: std.array_list.Managed([]const u8) = undefined,
-    /// PARAM and LET names. `$p` parses to a plain single-part field, so this is
-    /// the only way to tell a script constant from a column at parse time — which
-    /// `constItemExpr` needs to allow one beside an aggregate.
     const_names: std.array_list.Managed([]const u8) = undefined,
-    /// Bindings created by a derived table — `FROM (SELECT ...) x`. A derived table is
-    /// an anonymous CTE, so it lowers to exactly what `WITH x AS (...)` produces; but
-    /// it is discovered deep inside `parseSelectCore`, which has no statement list to
-    /// append to. `parseQuery` drains this.
     pending_bindings: std.array_list.Managed(ast.Stmt) = undefined,
-    /// Counter for naming derived tables that carry no alias.
     derived_n: usize = 0,
-    /// `IN (SELECT ...)` conjuncts found while parsing the current WHERE. Each
-    /// is lifted into a semi/anti join stage beside the filter; the sentinel is
-    /// the placeholder expression standing where the IN test sat, matched by
-    /// POINTER identity so nothing else in the tree can be mistaken for it.
     pending_semijoins: std.array_list.Managed(PendingSemiJoin) = undefined,
-    /// True only while the current WHERE clause parses — the one place an
-    /// `IN (SELECT ...)` can be lifted into a join stage.
     in_where: bool = false,
-    /// Depth of `parseQuery` nesting. A scalar subquery desugars into a query
-    /// LET emitted through `pending_bindings`, which only a surrounding
-    /// `parseQuery` drains — so it is only legal at depth > 0.
     query_depth: usize = 0,
-    /// `parseExpr` nesting: the outermost call checks the finished tree's depth.
     expr_nest: usize = 0,
-    /// `parseUnary` nesting — parentheses, calls, unary operators: the parser's
-    /// own recursion, bounded before it can exhaust the stack.
     unary_nest: usize = 0,
 
     const PendingSemiJoin = struct {
@@ -381,7 +347,6 @@ pub const Parser = struct {
         const t = self.toks[self.i];
         return .{ .line = t.line, .col = t.col };
     }
-    /// From `start` to the end of the last token consumed.
     fn spanFrom(self: *Parser, start: Pos) ast.Span {
         const t = self.toks[if (self.i > 0) self.i - 1 else 0];
         return .{ .start = start, .end = .{ .line = t.end_line, .col = t.end_col } };
@@ -409,7 +374,6 @@ pub const Parser = struct {
         }
         return false;
     }
-    /// Case-insensitive keyword check (SQL style).
     fn isKw(self: *Parser, kw: []const u8) bool {
         const t = self.cur();
         return t.tag == .ident and eqlNoCase(t.text, kw);
@@ -434,14 +398,13 @@ pub const Parser = struct {
         return self.fail(self.curPos(), "expected identifier, found {s}", .{self.curTag().describe()});
     }
 
-    /// Where the token just consumed starts.
     fn prevPos(self: *Parser) Pos {
         const t = self.toks[if (self.i > 0) self.i - 1 else 0];
         return .{ .line = t.line, .col = t.col };
     }
 
-    /// `AS` before a source's alias, which SQL allows and leaves optional: eaten
-    /// only when an alias follows it, so `... AS SELECT` stays the statement's.
+    /// `AS` before a source's alias, eaten only when an alias follows, so `... AS SELECT`
+    /// stays the statement's.
     fn eatAliasAs(self: *Parser) void {
         if (!self.isKw("as")) return;
         const next = self.peekTok();
@@ -455,8 +418,8 @@ pub const Parser = struct {
         };
     }
 
-    /// An identifier in either spelling. Not the same as `isKw`, which stays
-    /// bare-`ident` only: `"select"` is a column named select, never a keyword.
+    /// An identifier in either spelling. `isKw` stays bare-ident only: `"select"` is a
+    /// column named select, never a keyword.
     fn atName(self: *Parser) bool {
         return self.at(.ident) or self.at(.qident);
     }
@@ -464,9 +427,8 @@ pub const Parser = struct {
         if (self.eatKw(kw)) return;
         return self.fail(self.curPos(), "expected `{s}`, found {s}", .{ kw, self.curTag().describe() });
     }
-    /// A column name: identifier or quoted string (so '${var}' can build it).
-    /// A select item's alias: `AS name`, or a bare name as SQL allows —
-    /// `SUM(v) total` — unless the word is what comes after the item (`FROM`).
+    /// A select item's alias: `AS name`, or a bare name (`SUM(v) total`) unless the word
+    /// is a clause that follows the item.
     fn itemAlias(self: *Parser) Error!?[]const u8 {
         if (self.eatKw("as")) return try self.expectColName();
         if (self.at(.qident)) return self.advance().text;
@@ -475,15 +437,14 @@ pub const Parser = struct {
         return null;
     }
 
+    /// A column name: an identifier, or a quoted string so '${var}' can build it.
     fn expectColName(self: *Parser) Error![]const u8 {
         if (self.atName() or self.at(.string)) return self.advance().text;
         return self.fail(self.curPos(), "expected a column name, found {s}", .{self.curTag().describe()});
     }
 
-    /// Name for a computed item written without `AS`, joined from the source
-    /// tokens so `COUNT(*)` becomes `count(*)`. ORDER BY synthesizes the same
-    /// text for the same expression, which is what binds `ORDER BY COUNT(*)`
-    /// to the SELECT item it repeats.
+    /// Name for a computed item written without `AS`, joined from its tokens (`count(*)`).
+    /// ORDER BY synthesizes the same text, which binds it to the item it repeats.
     fn synthName(self: *Parser, start: usize) Error![]const u8 {
         return self.synthRange(start, self.i);
     }
@@ -502,7 +463,6 @@ pub const Parser = struct {
             .line = pos.line,
             .col = pos.col,
         };
-        // The token the error names, when `pos` is the start of one nearby.
         const lo = if (self.i >= 4) self.i - 4 else 0;
         const hi = @min(self.toks.len, self.i + 2);
         for (self.toks[lo..hi]) |t| {
@@ -543,6 +503,8 @@ pub const Parser = struct {
         return false;
     }
 
+    /// A script that opens with EXPLAIN explains the whole script offline, without
+    /// binding params; EXPLAIN anywhere else is `parseExplainStmt`.
     pub fn parseProgram(self: *Parser) Error!ast.Program {
         self.conn_names = std.array_list.Managed([]const u8).init(self.arena);
         self.conn_types = std.array_list.Managed([]const u8).init(self.arena);
@@ -558,10 +520,6 @@ pub const Parser = struct {
         self.const_names = std.array_list.Managed([]const u8).init(self.arena);
         self.pending_semijoins = std.array_list.Managed(PendingSemiJoin).init(self.arena);
 
-        // A script that *opens* with EXPLAIN explains the whole script, offline and
-        // without binding params — `basalt run` renders that plan without executing
-        // anything. EXPLAIN anywhere else is a statement (`parseExplainStmt`), which
-        // explains one query against the declarations above it, mid-run.
         var explain: ast.ExplainMode = .none;
         if (self.isKw("explain")) {
             _ = self.advance();
@@ -578,7 +536,6 @@ pub const Parser = struct {
                 const errs = self.errors orelse return e;
                 if (e == error.OutOfMemory) return e;
                 try errs.append(self.diag.*);
-                // what the failed statement half-emitted (a derived table's binding)
                 stmts.shrinkRetainingCapacity(n0);
                 self.pending_bindings.clearRetainingCapacity();
                 if (self.opensBlock(start)) break;
@@ -588,7 +545,6 @@ pub const Parser = struct {
             };
         }
         if (stmts.items.len == 0) {
-            // with errors recorded, an empty program is what survived them
             const recovered = if (self.errors) |errs| errs.items.len > 0 else false;
             if (!recovered) return self.fail(self.curPos(), "empty program: expected at least one statement", .{});
         }
@@ -599,22 +555,22 @@ pub const Parser = struct {
         return .{ .stmts = try stmts.toOwnedSlice(), .explain = explain };
     }
 
-    /// Whether the statement starting at token `i` has a body of statements —
-    /// `;`s inside it that are not its end.
+    /// Whether the statement at token `i` has a body with `;`s of its own (a
+    /// connection or resource is one statement).
     fn opensBlock(self: *Parser, i: usize) bool {
         if (i >= self.toks.len) return false;
         const t = self.toks[i];
         if (t.tag != .ident) return false;
         if (eqlNoCase(t.text, "for") or eqlNoCase(t.text, "case")) return true;
         if (!eqlNoCase(t.text, "create")) return false;
-        // `CREATE [OR REPLACE] FUNCTION|ENDPOINT` — a connection or resource is one statement
         for (self.toks[i + 1 .. @min(self.toks.len, i + 4)]) |n| {
             if (n.tag == .ident and (eqlNoCase(n.text, "function") or eqlNoCase(n.text, "endpoint"))) return true;
         }
         return false;
     }
 
-    /// One top-level (or arm-body) statement, appended to `out`.
+    /// One top-level or arm-body statement, appended to `out` after any bindings a
+    /// query LET's own subqueries create.
     fn parseStatement(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
         if (self.isKw("create")) return self.parseCreate(out);
         if (self.isKw("param")) {
@@ -625,9 +581,6 @@ pub const Parser = struct {
         if (self.isKw("let")) {
             const l = try self.parseLetStmt();
             try self.const_names.append(l.name);
-            // A query LET may itself contain derived tables or scalar
-            // subqueries; their bindings must precede it. (Ordinary statements
-            // get this from `parseQuery`'s own drain.)
             if (self.pending_bindings.items.len > 0) {
                 try out.appendSlice(self.pending_bindings.items);
                 self.pending_bindings.clearRetainingCapacity();
@@ -652,10 +605,8 @@ pub const Parser = struct {
         return self.fail(self.curPos(), "expected a statement (CREATE / PARAM / LET / PRINT / THROW / EXPLAIN / DESCRIBE / SHOW / LOAD INTO / SELECT / FOR / CASE / CALL), found {s}", .{self.curTag().describe()});
     }
 
-    /// `DESCRIBE <source>;` or `DESCRIBE <query>;` — the columns and engine types
-    /// of a file, a table, a `conn.QUERY(...)` or a query, as rows. Lowered to an
-    /// `EXPLAIN` in `describe` mode over `read | write stdout`, so every place that
-    /// already walks an EXPLAIN (check, expand, for-each bodies) carries it too.
+    /// `DESCRIBE <source|query>;`, lowered to a describe-mode EXPLAIN over `read | write
+    /// stdout`, so everything that walks an EXPLAIN carries it. A table read asks for no rows.
     fn parseDescribe(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
         const pos = self.curPos();
         _ = self.advance();
@@ -670,7 +621,6 @@ pub const Parser = struct {
                 _ = self.advance();
                 try self.parseWithHints(&hints);
             }
-            // Only the shape is wanted: a table or query read is asked for no rows.
             if (node == .read and (node.read.form == .table or node.read.form == .query)) node.read.where = "1 = 0";
             try stages.append(.{ .node = node, .hints = try hints.toOwnedSlice(), .pos = pos });
         }
@@ -679,13 +629,9 @@ pub const Parser = struct {
         try out.append(.{ .explain = .{ .mode = .describe, .pipeline = .{ .stages = try stages.toOwnedSlice(), .pos = pos }, .pos = pos } });
     }
 
-    /// `SHOW TABLES FROM <conn>[.<schema>] [LIKE '<pattern>'];` — one row per table
-    /// or view, from the source's own catalog. Lowered to a terminal query over a
-    /// `conn.QUERY(...)` on `information_schema`, which every SQL connector has.
-    /// Spelled in upper case and aliased back: on a SQL Server database with a
-    /// case-sensitive or binary collation (Protheus uses `Latin1_General_BIN`) only
-    /// `INFORMATION_SCHEMA.TABLES` and `TABLE_NAME` resolve, and upper case is
-    /// what postgres folds an unquoted name from and what mysql ignores.
+    /// `SHOW TABLES FROM conn[.schema] [LIKE p]` as a `conn.QUERY(...)` on information_schema,
+    /// spelled in upper case: a binary-collation SQL Server database resolves only
+    /// `INFORMATION_SCHEMA.TABLES` and `TABLE_NAME`, and postgres and mysql accept it.
     fn parseShow(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
         const pos = self.curPos();
         try self.expectKw("show");
@@ -729,11 +675,8 @@ pub const Parser = struct {
         return null;
     }
 
-    /// `EXPLAIN [ANALYZE] <query>;` in statement position — the same query forms a
-    /// terminal statement takes (`SELECT`, `WITH ... SELECT`, `LOAD INTO ... AS`),
-    /// explained against everything declared above it. A leading `EXPLAIN` is still
-    /// consumed by `parseProgram` as the program-level prefix, which explains a whole
-    /// script offline; this is the form that works anywhere else in one.
+    /// `EXPLAIN [ANALYZE] <query>;` in statement position, explained against the
+    /// declarations above it. A `WITH`'s CTEs stay ordinary bindings.
     fn parseExplainStmt(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
         const pos = self.curPos();
         try self.expectKw("explain");
@@ -750,9 +693,6 @@ pub const Parser = struct {
             return self.fail(self.curPos(), "expected SELECT, WITH or LOAD INTO after EXPLAIN, found {s}", .{self.curTag().describe()});
         }
 
-        // A `WITH` hoists its CTEs into `out` as bindings ahead of the pipeline they
-        // feed. Those stay ordinary statements — the query being explained is the one
-        // pipeline the parse ended with.
         var i = out.items.len;
         while (i > base) {
             i -= 1;
@@ -764,17 +704,13 @@ pub const Parser = struct {
         return self.fail(pos, "EXPLAIN needs a query to explain", .{});
     }
 
-    /// `LET name = <expr>;` — a script-scoped plan-time constant, referenced as
-    /// `$name`. A bare `LET` in statement position is unambiguous: an expression is
-    /// never a statement, so the expression-level `LET x = v IN body` can only be
-    /// reached from inside an expression.
+    /// `LET name = <expr>;`, or `LET x = (SELECT ...);` whose single cell is evaluated at
+    /// run time in statement order (see `runScalarLet`).
     fn parseLetStmt(self: *Parser) Error!ast.LetConst {
         const pos = self.curPos();
         try self.expectKw("let");
         const name = try self.expectIdent();
         _ = try self.expect(.assign);
-        // `LET x = (SELECT ...);` — the value is the query's single cell,
-        // evaluated at run time in statement order (see `runScalarLet`).
         if (self.at(.lparen) and (self.peekKw("select") or self.peekKw("with"))) {
             _ = self.advance();
             const pipe = try self.parseSubqueryPipeline();
@@ -786,9 +722,6 @@ pub const Parser = struct {
         return .{ .name = name, .expr = expr, .pos = pos };
     }
 
-    /// `PRINT <expr>;` — one progress line, evaluated where it stands. The argument
-    /// is an ordinary expression, so `||`, `$param` and the loop variables of an
-    /// enclosing `FOR EACH` / statement function body all work with no extra syntax.
     fn parsePrintStmt(self: *Parser) Error!ast.Print {
         const pos = self.curPos();
         try self.expectKw("print");
@@ -833,9 +766,8 @@ pub const Parser = struct {
         return self.fail(self.curPos(), "expected ENDPOINT, CONNECTION, RESOURCE, or FUNCTION after CREATE", .{});
     }
 
-    /// `ACCEPT BODY (schema) INTO BUFFER 'name' [AT 'dir'] [SEGMENT n MB|KB|GB]
-    /// [MAX n MB|GB] [RETAIN UNTIL LOADED | RETAIN n HOURS]` — after CREATE
-    /// ENDPOINT. `MAX` is the on-disk backpressure limit (503 beyond it).
+    /// `ACCEPT BODY (schema) INTO BUFFER 'name' [AT 'dir'] [SEGMENT n] [MAX n] [RETAIN ...]`
+    /// after CREATE ENDPOINT. `MAX` is the on-disk backpressure limit (503 beyond it).
     fn parseAcceptBuffer(self: *Parser, pos: Pos) Error!ast.BufferDecl {
         try self.expectKw("body");
         const schema = try self.parseBodySchema();
@@ -865,8 +797,8 @@ pub const Parser = struct {
         return decl;
     }
 
-    /// One dotted name atom: a plain identifier, or `IDENTIFIER(<expr>)` whose
-    /// string value is computed per row (lowered to a `${...}` template).
+    /// One dotted name atom: an identifier, or `IDENTIFIER(<expr>)` lowered to a `${...}`
+    /// template computed per row.
     fn parseNameSegment(self: *Parser) Error![]const u8 {
         if (self.isKw("identifier") and self.peekTag() == .lparen) {
             _ = self.advance();
@@ -878,16 +810,12 @@ pub const Parser = struct {
         return self.expectIdent();
     }
 
-    /// `DISTINCT ON` runs over the projection, but its keys are written against the
-    /// input, as in Postgres: `DISTINCT ON (grp) grp AS k` and `DISTINCT ON (grp) id`
-    /// are both legal. A key the list renamed is repointed at its output name, in
-    /// place; one it does not project is carried
-    /// through as a hidden column. Returns the projection that drops those again,
-    /// or null when none was added.
+    /// `DISTINCT ON` keys are written against the input, as in Postgres: a key the list
+    /// renamed is repointed at its output, one it does not project rides as a hidden
+    /// column. Returns the projection that drops those again, or null.
     fn distinctOnOutputs(self: *Parser, items: *std.array_list.Managed(ast.SelectItem), on: []ast.QualName) Error!?[]const ast.SelectItem {
         for (items.items) |it| switch (it) {
             .field, .computed => {},
-            // A `*` already carries every input column under its own name.
             else => return null,
         };
         const visible = items.items.len;
@@ -900,8 +828,6 @@ pub const Parser = struct {
         return keepOutputs(self.arena, items.items[0..visible]) catch return error.OutOfMemory;
     }
 
-    /// A column in a name position: a (qualified) name, or `IDENTIFIER(<expr>)`
-    /// for one computed per row.
     fn parseColRef(self: *Parser) Error!ast.QualName {
         if (self.isKw("identifier") and self.peekTag() == .lparen) {
             const parts = try self.arena.alloc([]const u8, 1);
@@ -911,8 +837,7 @@ pub const Parser = struct {
         return self.parseQualNameTok();
     }
 
-    /// A write-target atom: a name, a quoted string (interpolated as-is), or
-    /// IDENTIFIER(<expr>) for a computed name.
+    /// A write-target atom: a name, a quoted string interpolated as-is, or `IDENTIFIER(<expr>)`.
     fn parseTargetSegment(self: *Parser) Error![]const u8 {
         if (self.isKw("identifier") and self.peekTag() == .lparen) {
             _ = self.advance();
@@ -924,14 +849,8 @@ pub const Parser = struct {
         return self.expectColName();
     }
 
-    /// Lower a reflection expression into the internal `${...}` template. A
-    /// `concat(...)` / `||` chain becomes literal text spliced with `${expr}`
-    /// holes; a bare string literal stays literal (no hole); anything else is
-    /// one `${expr}` hole re-parsed and evaluated per row.
-    /// The trailing clauses a union accepts, in either order: `PUSHDOWN(<expr>)`
-    /// — one raw predicate descended into *every* branch's source query, the
-    /// same `where` hint a plain read produces — and `ANCHOR SCHEMA <table>`,
-    /// naming the branch whose columns are the reconciliation authority.
+    /// A union's trailing clauses in either order: `PUSHDOWN(<expr>)`, a `where` hint for
+    /// every branch (empty means none), and `ANCHOR SCHEMA <table>`.
     fn parseUnionClauses(self: *Parser, hints: *std.array_list.Managed(ast.Hint), pos: Pos) Error!void {
         while (true) {
             if (self.eatKw("pushdown")) {
@@ -939,8 +858,6 @@ pub const Parser = struct {
                 const e = try self.parseExpr();
                 _ = try self.expect(.rparen);
                 const frag = try self.exprToTemplate(e);
-                // An empty predicate is no predicate: `PUSHDOWN($f)` with `f`
-                // unset reads the whole table rather than emitting `WHERE `.
                 if (frag.len > 0)
                     try hints.append(.{ .key = "where", .value = .{ .str = frag }, .pos = pos });
             } else if (self.eatKw("anchor")) {
@@ -951,6 +868,8 @@ pub const Parser = struct {
         }
     }
 
+    /// Lower a reflection expression to a `${...}` template: a `concat`/`||` chain splices
+    /// literal text with holes, a string literal stays literal, anything else is one hole.
     fn exprToTemplate(self: *Parser, e: *const ast.Expr) Error![]const u8 {
         var buf = std.array_list.Managed(u8).init(self.arena);
         try self.templatePart(&buf, e);
@@ -979,9 +898,8 @@ pub const Parser = struct {
         }
     }
 
-    /// Print an expression back as interpolation-hole text (the `${ <here> }`
-    /// sub-language, which is the same expression grammar; `$name` already
-    /// parsed to a bare field, so it prints as `name`).
+    /// Print an expression back as `${ }` hole text; `$name` already parsed to a bare
+    /// field, so it prints as `name`.
     fn unparse(self: *Parser, buf: *std.array_list.Managed(u8), e: *const ast.Expr) Error!void {
         switch (e.*) {
             .null_lit => try buf.appendSlice("null"),
@@ -1039,7 +957,6 @@ pub const Parser = struct {
         }
     }
 
-    /// `<int> KB|MB|GB` -> bytes.
     fn parseByteSize(self: *Parser) Error!u64 {
         const n = try self.expect(.int);
         const v = std.fmt.parseInt(u64, n.text, 10) catch
@@ -1083,8 +1000,8 @@ pub const Parser = struct {
         return .{ .name = name, .connector = connector, .config = try attrs.toOwnedSlice(), .pos = pos, .hints = try hints.toOwnedSlice() };
     }
 
-    /// `[PAGINATE ...] [RETRY ...] [WITH (...)]` in any order — the REST clauses a
-    /// connection or a resource carries for every read of it.
+    /// `[PAGINATE ...] [RETRY ...] [WITH (...)]` in any order, for every read of a
+    /// connection or resource.
     fn parseHttpClauses(self: *Parser, hints: *std.array_list.Managed(ast.Hint)) Error!void {
         while (true) {
             if (self.isKw("paginate")) {
@@ -1098,10 +1015,8 @@ pub const Parser = struct {
         }
     }
 
-    /// `GET(path [, name = value ...])` / `POST(path [, body = value] [, name = value ...])`
-    /// after `conn.`: the path and each value are expressions (so `$params` and
-    /// `||` work); every `name = value` other than `body` is a query parameter,
-    /// URL-encoded when the request is built.
+    /// `GET(path, name = value ...)` / `POST(path, body = value, ...)` after `conn.`: every
+    /// `name = value` but `body` is a query parameter, URL-encoded when the request is built.
     fn parseHttpCall(self: *Parser, conn: []const u8, hints: *std.array_list.Managed(ast.Hint)) Error!ast.Read {
         const pos = self.curPos();
         const verb = self.advance().text;
@@ -1136,9 +1051,8 @@ pub const Parser = struct {
         return null;
     }
 
-    /// `CREATE RESOURCE conn.name AS GET(...) | POST(...) [PAGINATE ...] [RETRY ...]
-    /// [WITH (...)];` — names one endpoint of an http connection, so `FROM
-    /// conn.name` reads it like a table. Expanded here; the plan never sees it.
+    /// `CREATE RESOURCE conn.name AS GET(...)|POST(...) ...` names an http endpoint that
+    /// `FROM conn.name` reads like a table. Expanded here; the plan never sees it.
     fn parseResource(self: *Parser, pos: Pos) Error!void {
         const conn = try self.expectIdent();
         const kind = self.connType(conn) orelse
@@ -1164,8 +1078,7 @@ pub const Parser = struct {
         try self.resources.append(r);
     }
 
-    /// `SHOW TABLES FROM <http conn>`: its resources as rows (resource, method,
-    /// path), built from `RANGE(n)` — the parser already holds the whole list.
+    /// `SHOW TABLES FROM <http conn>`: its resources as rows, built from `RANGE(n)`.
     fn showResources(self: *Parser, conn: []const u8, like: ?[]const u8, pos: Pos) Error!ast.Pipeline {
         var mine = std.array_list.Managed(Resource).init(self.arena);
         for (self.resources.items) |r| {
@@ -1222,8 +1135,8 @@ pub const Parser = struct {
         return self.mk(.{ .call = .{ .name = "env", .args = args } });
     }
 
-    /// `CREATE [OR REPLACE] FUNCTION name(params) AS <body>` in both forms:
-    /// an expression body (`AS <expr>;`) or a statement block (`AS <stmts> END;`).
+    /// `CREATE [OR REPLACE] FUNCTION name(params) AS <expr>;` or `AS <stmts> END;`. A
+    /// statement function's parameters are script constants inside it, like loop variables.
     fn parseFunction(self: *Parser, pos: Pos, replace: bool) Error!ast.FnDecl {
         const name = try self.expectIdent();
         _ = try self.expect(.lparen);
@@ -1253,8 +1166,6 @@ pub const Parser = struct {
         try self.expectKw("as");
 
         if (self.atStmtBody()) {
-            // A statement function's parameters bind like loop variables (§9), so
-            // they are script-scope constants inside the body for the same reason.
             const const_base = self.const_names.items.len;
             for (params.items) |p| try self.const_names.append(p.name);
             var body = std.array_list.Managed(ast.Stmt).init(self.arena);
@@ -1274,19 +1185,16 @@ pub const Parser = struct {
         return .{ .name = name, .params = try params.toOwnedSlice(), .body = .{ .expr = body }, .replace = replace, .pos = pos };
     }
 
-    /// Does the body after `AS` open a statement block? The keywords that begin a
-    /// statement and can never begin a scalar expression — and `CASE` when it is
-    /// the statement form, which only its closing `END CASE` tells apart from the
-    /// scalar `CASE ... END` a function body usually means by it.
+    /// Whether the body after `AS` opens a statement block. A `CASE` does only when
+    /// closed by `END CASE`; otherwise it is the scalar form.
     fn atStmtBody(self: *Parser) bool {
         return self.isKw("load") or self.isKw("for") or self.isKw("call") or
             self.isKw("print") or self.isKw("throw") or self.isKw("select") or self.isKw("with") or
             (self.isKw("case") and self.atStmtCase());
     }
 
-    /// At a `CASE`: is it closed by `END CASE`? Walks the tokens ahead, pairing every
-    /// block opener (`case`, `for`) with its `end` — an `END CASE` / `END FOR` closes
-    /// one block, its second word not opening another — until this one's `end`.
+    /// Whether the `CASE` here is closed by `END CASE`, pairing each block opener ahead
+    /// (`case`, `for`) with its `end`.
     fn atStmtCase(self: *Parser) bool {
         var depth: usize = 0;
         var j = self.i;
@@ -1306,7 +1214,6 @@ pub const Parser = struct {
         return false;
     }
 
-    /// `name [TYPE] [DEFAULT <expr>]`. A bare name is untyped, exactly as before.
     fn parseFnParam(self: *Parser) Error!ast.FnParam {
         const name = try self.expectIdent();
         var ty: ?types.Type = null;
@@ -1317,7 +1224,6 @@ pub const Parser = struct {
         return .{ .name = name, .ty = ty, .default = default };
     }
 
-    /// `CALL name(args);` — invoke a statement-form function.
     fn parseCallStmt(self: *Parser) Error!ast.CallStmt {
         const pos = self.curPos();
         try self.expectKw("call");
@@ -1333,9 +1239,7 @@ pub const Parser = struct {
         return .{ .name = name, .args = try args.toOwnedSlice(), .pos = pos };
     }
 
-    /// `THROW <message> [WHEN <condition>];` — both operands are ordinary
-    /// expressions, so `$param`, `LET`s and every scalar function are available.
-    /// `WHEN` is read greedily, which is what ends the message expression.
+    /// `THROW <message> [WHEN <condition>];`, `WHEN` read greedily to end the message.
     fn parseThrowStmt(self: *Parser) Error!ast.Throw {
         const pos = self.curPos();
         try self.expectKw("throw");
@@ -1430,6 +1334,8 @@ pub const Parser = struct {
             self.fail(.{ .line = t.line, .col = t.col }, "number out of range: {s}", .{t.text});
     }
 
+    /// A computed file target (`IDENTIFIER(...)`) must spell its extension literally: it
+    /// picks the writer and the legal dispositions at plan time, before any row is read.
     fn parseLoadInto(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
         const pos = self.curPos();
         try self.expectKw("load");
@@ -1439,18 +1345,12 @@ pub const Parser = struct {
         if (self.at(.string)) {
             write = .{ .connector = "csv", .form = null, .target = self.advance().text, .mode = .default };
         } else if (self.isKw("identifier") and self.peekTag() == .lparen) {
-            // A computed *file* target, the sink counterpart of `FROM
-            // IDENTIFIER(...)`: one output file per loop row or per param.
-            // `conn.IDENTIFIER(...)` is a computed table and parses below.
             const ipos = self.curPos();
             _ = self.advance();
             _ = try self.expect(.lparen);
             const e = try self.parseExpr();
             _ = try self.expect(.rparen);
             const tmpl = try self.exprToTemplate(e);
-            // The extension picks the writer, and which dispositions are legal
-            // (`APPEND` accumulates for CSV, never for parquet), both of which are
-            // settled at plan time — so it cannot come from a per-row value.
             if (!hasLiteralExt(tmpl))
                 return self.fail(ipos, "dynamic target needs a literal extension (end it with `|| '.csv'`, `|| '.parquet'`, …)", .{});
             write = .{ .connector = "csv", .form = null, .target = tmpl, .mode = .default };
@@ -1519,7 +1419,6 @@ pub const Parser = struct {
         try out.append(.{ .output = .{ .stages = try stages.toOwnedSlice(), .pos = pos } });
     }
 
-    /// A terminal SELECT: query printed to stdout.
     fn parseTerminalQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
         const pos = self.curPos();
         var stages = std.array_list.Managed(ast.Stage).init(self.arena);
@@ -1533,7 +1432,6 @@ pub const Parser = struct {
         try out.append(.{ .output = .{ .stages = try stages.toOwnedSlice(), .pos = pos } });
     }
 
-    /// `WITH (k = v, k, ...)` residual options -> stage hints.
     fn parseWithHints(self: *Parser, hints: *std.array_list.Managed(ast.Hint)) Error!void {
         _ = try self.expect(.lparen);
         while (!self.at(.rparen)) {
@@ -1559,18 +1457,14 @@ pub const Parser = struct {
         _ = try self.expect(.rparen);
     }
 
-    /// Parse `[WITH ctes] core [UNION [ALL] [BY NAME] core]* [ANCHOR SCHEMA q]
-    /// [ORDER BY ...] [LIMIT n [OFFSET m]]`, appending Let stmts for CTEs to
-    /// `out` and pipeline stages to `stages`.
+    /// `[WITH ctes] core [set ops] [ORDER BY ...] [LIMIT n [OFFSET m]]`. Hidden sort keys are
+    /// dropped after LIMIT so sort+limit stay adjacent for top-N; `DISTINCT ON ... ORDER BY`
+    /// sorts first, so the row kept per key is the first in ORDER BY order.
     fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages: *std.array_list.Managed(ast.Stage)) Error!void {
-        // Each level is a `parseSelectCore` frame, which is large: a hundred nested
-        // derived tables overflowed the stack.
         if (self.query_depth >= max_query_depth)
             return self.fail(self.curPos(), "queries nest more than {d} levels deep", .{max_query_depth});
         self.query_depth += 1;
         defer self.query_depth -= 1;
-        // A nested query is a fresh scope: its own WHERE decides where its IN
-        // (SELECT ...) may stand, and the enclosing one's is restored after it.
         const outer_in_where = self.in_where;
         self.in_where = false;
         defer self.in_where = outer_in_where;
@@ -1593,8 +1487,6 @@ pub const Parser = struct {
                 if (!self.eat(.comma)) break;
             }
         }
-        // A derived table anywhere below appends its binding to `pending_bindings`;
-        // move them into the program before the statement that references them.
         defer if (self.pending_bindings.items.len > 0) {
             out.appendSlice(self.pending_bindings.items) catch {};
             self.pending_bindings.clearRetainingCapacity();
@@ -1635,13 +1527,6 @@ pub const Parser = struct {
             }
             const sort_keys = try keys.toOwnedSlice();
 
-            // A sort key the SELECT list does not project still has to reach the
-            // sort operator. Carry it as a hidden column and drop it after the
-            // LIMIT — standard SQL allows ordering by an unselected column, and
-            // dropping it last leaves sort+limit adjacent so top-N still fuses.
-            // `DISTINCT ON` may already be carrying hidden keys of its own, dropped by
-            // a projection right after it. That drop moves to the end with this one,
-            // so the sort can still read what the SELECT list left out.
             var visible: ?[]const ast.SelectItem = null;
             if (distinctDropTail(stages.items)) visible = stages.pop().?.node.select;
             if (lastSelectIdx(stages.items)) |si| {
@@ -1658,8 +1543,6 @@ pub const Parser = struct {
                     try extended.appendSlice(proj);
                     for (sort_keys) |*k| {
                         if (k.field.parts.len != 1) {
-                            // `ORDER BY b.amt`: a join's right-side column, which an
-                            // output merely called `amt` does not stand in for.
                             switch (keyHome(proj, k.field)) {
                                 .as_is => {},
                                 .renamed => |nm| k.field = try self.singleName(nm),
@@ -1681,11 +1564,6 @@ pub const Parser = struct {
             }
             if (hidden_drop == null) hidden_drop = visible;
             const sort_stage: ast.Stage = .{ .node = .{ .sort = .{ .keys = sort_keys } }, .hints = &.{}, .pos = self.curPos() };
-            // `DISTINCT ON (k) ... ORDER BY k, t` keeps the first row per key in
-            // ORDER BY order, as Postgres and DuckDB do: sorted after, the distinct
-            // had already kept the first in input order, and "latest row per key"
-            // silently returned the wrong rows. The distinct keeps first occurrences
-            // in order, so its output stays sorted.
             const last = stages.items.len - 1;
             if (stages.items[last].node == .distinct and stages.items[last].node.distinct.on != null)
                 try stages.insert(last, sort_stage)
@@ -1710,11 +1588,8 @@ pub const Parser = struct {
             try stages.append(.{ .node = .{ .select = keep }, .hints = &.{}, .pos = self.curPos() });
     }
 
-    /// Index of the projection a sort would read through, if the pipeline ends
-    /// in one.
-    /// A `DISTINCT ON` between the projection and the sort is looked through: it
-    /// keeps whole rows, so a hidden sort key rides along. A plain `DISTINCT` is
-    /// not — an extra column there would change which rows are duplicates.
+    /// Index of the projection a sort reads through. A `DISTINCT ON` is looked through
+    /// (it keeps whole rows); a plain `DISTINCT` is not, as an extra column changes duplicates.
     fn lastSelectIdx(stages: []const ast.Stage) ?usize {
         if (stages.len == 0) return null;
         const n = stages.len;
@@ -1723,21 +1598,16 @@ pub const Parser = struct {
         return null;
     }
 
-    /// Does the pipeline end in `select, DISTINCT ON, select` — the shape
-    /// `distinctOnOutputs` leaves when it had to carry a hidden key?
+    /// Whether the pipeline ends `select, DISTINCT ON, select`, as `distinctOnOutputs`
+    /// leaves it when carrying a hidden key.
     fn distinctDropTail(stages: []const ast.Stage) bool {
         const n = stages.len;
         return n >= 3 and stages[n - 1].node == .select and stages[n - 2].node == .distinct and
             stages[n - 2].node.distinct.on != null and stages[n - 3].node == .select;
     }
 
-    /// Set when a core is exactly `SELECT ['lit' AS col,] t.* FROM conn.table`
-    /// — the only shape a UNION ALL BY NAME branch may take.
     const BranchInfo = struct { read: ast.Read, tag: ?[]const u8, tag_col: ?[]const u8 };
 
-    /// A computed SELECT item indexed by the text of its expression, so that
-    /// `GROUP BY`/`ORDER BY` repeating the expression bind to the column the
-    /// SELECT list already produced instead of asking for a second one.
     const ExprAlias = struct { synth: []const u8, out: []const u8 };
 
     fn resolveExprAlias(map: []const ExprAlias, synth: []const u8) []const u8 {
@@ -1754,8 +1624,9 @@ pub const Parser = struct {
         expr_aliases: []const ExprAlias = &.{},
     };
 
-    /// SELECT [DISTINCT [ON (cols)]] items FROM source [alias] [PUSHDOWN(...)]
-    /// [WITH (...)] [joins] [WHERE e] [GROUP BY keys]
+    /// `SELECT [DISTINCT [ON (cols)]] items FROM source [joins] [WHERE] [GROUP BY] [HAVING]`.
+    /// An ON splits at its ANDs: cross-side equalities are keys, right-only conditions narrow
+    /// the right side first, anything else filters the joined rows (inner joins only).
     fn parseSelectCore(self: *Parser) Error!Core {
         const pos = self.curPos();
         try self.expectKw("select");
@@ -1786,10 +1657,6 @@ pub const Parser = struct {
         var win_ord = std.array_list.Managed(ast.SortKey).init(self.arena);
         var win_outs = std.array_list.Managed([]const u8).init(self.arena);
         while (true) {
-            // `ROW_NUMBER() OVER (PARTITION BY .. ORDER BY ..)` is recognised as a whole
-            // select item, before the expression parser sees it: a window function is a
-            // stage, not an expression, and lifting one out of the middle of an
-            // arithmetic expression would need the machinery `IN (SELECT ...)` needs.
             if (try self.parseWindowItem(&win_funcs, &win_part, &win_ord)) {
                 try win_outs.append(win_funcs.items[win_funcs.items.len - 1].out);
                 if (!self.eat(.comma)) break;
@@ -1799,8 +1666,6 @@ pub const Parser = struct {
                 if (self.eatKw("except") or self.eatKw("exclude")) {
                     _ = try self.expect(.lparen);
                     var names = std.array_list.Managed([]const u8).init(self.arena);
-                    // A name may be `IDENTIFIER(<expr>)`: a template rendered at run
-                    // time, and a rendered `a, b` is two names.
                     try names.append(try self.parseNameSegment());
                     while (self.eat(.comma)) try names.append(try self.parseNameSegment());
                     _ = try self.expect(.rparen);
@@ -1852,7 +1717,6 @@ pub const Parser = struct {
         const src: ast.Stage.Node = if (self.eatKw("from"))
             try self.parseFromSource(&aliases, &read_hints)
         else
-            // `SELECT 1;` — no FROM plans a one-row unit source.
             .{ .read = .{ .connector = "unit", .form = .unit } };
 
         while (true) {
@@ -1875,9 +1739,6 @@ pub const Parser = struct {
 
         var stages = std.array_list.Managed(ast.Stage).init(self.arena);
         try stages.append(.{ .node = src, .hints = try read_hints.toOwnedSlice(), .pos = pos });
-        // Computed join keys' columns (`__jkN`), dropped once the WHERE is in —
-        // not right after the join, where a stage would hold the WHERE above it
-        // and keep it from the sources.
         var key_cols = std.array_list.Managed([]const u8).init(self.arena);
 
         while (true) {
@@ -1903,8 +1764,6 @@ pub const Parser = struct {
             if (lateral and !(self.at(.ident) and self.peekTag() == .lparen))
                 return self.fail(self.curPos(), "JOIN LATERAL takes a table function call — `JOIN LATERAL f(o.col) x`", .{});
             var lateral_keys: []const LateralKey = &.{};
-            // `CROSS JOIN UNNEST(...)` is the row-expanding form and stays an
-            // explode stage; `CROSS JOIN <cte>` is the cartesian product.
             if (kind == .cross and self.isKw("unnest")) {
                 _ = self.advance();
                 _ = try self.expect(.lparen);
@@ -1937,9 +1796,6 @@ pub const Parser = struct {
                 });
                 continue;
             }
-            // `JOIN (SELECT ...) x ON ...` — the same lowering as a FROM-position
-            // derived table, since a join's right side is named by binding anyway;
-            // and so a path or a connection's table, read as `(SELECT * FROM it)`.
             var jalias: ?[]const u8 = null;
             var binding: []const u8 = undefined;
             var bpos: Pos = undefined;
@@ -1963,7 +1819,6 @@ pub const Parser = struct {
                     const call = try self.callTableFn(fd, bpos, if (lateral) .lateral else .join);
                     binding = call.binding;
                     lateral_keys = call.keys;
-                    // The call's own name qualifies its columns unless an alias follows.
                     if (!(self.at(.ident) and !isReservedAfterSource(self.cur().text))) jalias = written;
                 } else if (if (self.tvf) |f| f.cte(binding) else null) |bname| {
                     binding = bname;
@@ -1980,8 +1835,6 @@ pub const Parser = struct {
             var left_keys = std.array_list.Managed(ast.QualName).init(self.arena);
             var right_keys = std.array_list.Managed(ast.QualName).init(self.arena);
             var post_filters = std.array_list.Managed(*ast.Expr).init(self.arena);
-            // Computed keys: each side's `SELECT *, expr AS __jkN`, and the names
-            // to drop after the join.
             var left_computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
             var right_computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
             for (lateral_keys) |lk| {
@@ -1990,8 +1843,6 @@ pub const Parser = struct {
                 rp[0] = lk.right;
                 try right_keys.append(.{ .parts = rp });
             }
-            // A LATERAL call's keys come from its arguments: CROSS is then an inner
-            // join on them, and ON is optional (`ON TRUE` is Postgres' spelling).
             if (lateral and lateral_keys.len > 0 and kind == .cross) kind = .inner;
             if (lateral and self.isKw("on") and self.peekTag() == .ident and eqlNoCase(self.peekTok().text, "true")) {
                 _ = self.advance();
@@ -2005,12 +1856,6 @@ pub const Parser = struct {
                 if (!self.isKw("on"))
                     return self.fail(self.curPos(), "expected `ON <column> = <column>` after JOIN {s}", .{binding});
                 const opos = self.advance();
-                // `ON a = b AND ...`, split at its ANDs: a column of one side equal
-                // to a column of the other is a key; a condition on the right side
-                // alone, or on no column (`1 = 1`), narrows the right side before
-                // the join, which is right for an outer join too; any other — the
-                // left side alone, both sides compared otherwise — filters the
-                // joined rows, which only an inner join means.
                 const rname = jalias orelse binding;
                 const on = try self.parseExpr();
                 var conj = std.array_list.Managed(*ast.Expr).init(self.arena);
@@ -2031,9 +1876,6 @@ pub const Parser = struct {
                             continue;
                         }
                     }
-                    // A computed key: `trim(b.code) = cast(a.code AS string)`, each
-                    // side naming its own table only. Each side computes its key
-                    // as a column of its own, dropped again after the join.
                     if (c.* == .binary and c.binary.op == .eq) {
                         const sl = try self.sidesOf(c.binary.l, rname);
                         const sr = try self.sidesOf(c.binary.r, rname);
@@ -2075,8 +1917,6 @@ pub const Parser = struct {
                 if (left_keys.items.len == 0)
                     return self.fail(.{ .line = opos.line, .col = opos.col }, "the ON of a join needs at least one `=` between a left and a right value to join by — `b.k = a.k`, or computed: `trim(b.k) = cast(a.k AS string)`", .{});
                 if (narrow != null or right_computed.items.len > 0) {
-                    // The right side, narrowed and its keys computed, as a binding
-                    // of its own.
                     self.derived_n += 1;
                     const name = try std.fmt.allocPrint(self.arena, "__derived{d}_on", .{self.derived_n});
                     try self.let_names.append(name);
@@ -2121,16 +1961,10 @@ pub const Parser = struct {
 
         if (self.eatKw("where")) {
             const fpos = self.curPos();
-            // Semi joins this WHERE owns start here: a subquery inside it registers
-            // and lifts its own, and one already pending belongs to an enclosing
-            // WHERE. Taking them all turned the outer `k IN (...)` into a join
-            // inside the subquery, where `k` does not exist.
             const sj_base = self.pending_semijoins.items.len;
             self.in_where = true;
             const raw = try self.parseExpr();
             self.in_where = false;
-            // Lift `IN (SELECT ...)` conjuncts BEFORE stripExpr: the sentinels
-            // are matched by pointer, and a rewritten tree would orphan them.
             const remaining = if (self.pending_semijoins.items.len > sj_base)
                 try self.liftSemiJoins(raw, fpos)
             else
@@ -2140,8 +1974,6 @@ pub const Parser = struct {
                 try stages.append(.{ .node = .{ .filter = e }, .hints = &.{}, .pos = fpos });
             }
             for (self.pending_semijoins.items[sj_base..]) |sj| {
-                // `lhs` was checked to be a field at parse; strip any alias
-                // qualifier the same way join keys written in ON do.
                 const lk = try self.arena.alloc(ast.QualName, 1);
                 lk[0] = stripQual(sj.lhs.field, &aliases);
                 const rk = try self.arena.alloc(ast.QualName, 1);
@@ -2177,8 +2009,6 @@ pub const Parser = struct {
                 const ge = try self.parseExpr();
                 var q: ast.QualName = undefined;
                 if (ge.* == .int_lit) {
-                    // `GROUP BY 1` is positional — it names the first SELECT
-                    // item, the way DuckDB and Postgres read it.
                     const n = ge.int_lit;
                     if (n < 1 or n > @as(i64, @intCast(raw_items.items.len)))
                         return self.fail(pos, "GROUP BY position {d} is out of range", .{n});
@@ -2196,8 +2026,6 @@ pub const Parser = struct {
                 } else if (ge.* == .field) {
                     q = stripQual(ge.field, &aliases);
                 } else {
-                    // A computed key names the expression exactly as the SELECT
-                    // list named it, so both sides bind to the same column.
                     const parts = try self.arena.alloc([]const u8, 1);
                     parts[0] = resolveExprAlias(expr_aliases.items, try self.synthName(gstart));
                     q = .{ .parts = parts };
@@ -2216,9 +2044,6 @@ pub const Parser = struct {
         var union_tag: ?[]const u8 = null;
         var union_tag_col: ?[]const u8 = null;
         var star_count: usize = 0;
-        // Output items as the SELECT list asked for them, used only when an
-        // aggregate had to be lifted out of a surrounding expression — that is
-        // the one case needing a projection after the aggregate stage.
         var post = std.array_list.Managed(ast.SelectItem).init(self.arena);
         var lifted = false;
         if (distinct_on) |on| for (on) |*k| {
@@ -2257,19 +2082,12 @@ pub const Parser = struct {
                                 continue;
                             }
                         }
-                        // An aggregate buried in a larger expression: the calls
-                        // move to the aggregate stage and what is left becomes a
-                        // projection over its output.
                         if (containsAgg(stripped)) {
                             const outer = try self.liftAggs(stripped, &aggs, expr_aliases.items, pos);
                             try post.append(.{ .computed = .{ .name = c.name, .expr = outer } });
                             lifted = true;
                             continue;
                         }
-                        // `SELECT x AS y ... GROUP BY x` — an aliased grouping
-                        // key. The aggregate emits the key under its own name,
-                        // so the rename belongs after it; renaming beforehand
-                        // would hide `x` from the GROUP BY that names it.
                         if (group.len > 0 and stripped.* == .field and isGroupKey(group, stripped.field)) {
                             try post.append(.{ .computed = .{ .name = c.name, .expr = stripped } });
                             lifted = true;
@@ -2306,9 +2124,6 @@ pub const Parser = struct {
                     if (it == .star or it == .star_except or it == .star_rename)
                         return self.fail(pos, "`*` cannot be combined with a computed GROUP BY key", .{});
                 }
-                // The projection runs before the aggregate, so it has to carry
-                // the columns the aggregate arguments read as well as the ones
-                // the SELECT list asked for.
                 var needed = std.array_list.Managed(ast.QualName).init(self.arena);
                 for (aggs.items) |a| {
                     if (a.arg) |arg| try self.collectFields(arg, &needed);
@@ -2329,12 +2144,6 @@ pub const Parser = struct {
                 }
                 try stages.append(.{ .node = .{ .select = try items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
             } else {
-                // A constant item is one value for the whole query, so it belongs
-                // to neither the aggregate nor the grouping — it moves to a
-                // projection after the aggregate, the same place a lifted
-                // `round(avg(x), 2)` puts its arithmetic. This is what lets an
-                // aggregate result carry a run id or a tenant tag:
-                // `SELECT $tag AS tag, region, COUNT(*) ... GROUP BY region`.
                 var kept = std.array_list.Managed(ast.SelectItem).init(self.arena);
                 for (items.items) |it| {
                     if (it == .computed and self.constItemExpr(it.computed.expr)) {
@@ -2344,17 +2153,12 @@ pub const Parser = struct {
                     }
                     if (it != .field)
                         return self.fail(pos, "`{s}` is neither an aggregate nor a grouping key — wrap it in an aggregate, or name it in GROUP BY", .{itemLabel(it)});
-                    // A plain column that is not a grouping key has no single
-                    // value per group. It used to be dropped from the output
-                    // without a word, which is worse than refusing the query.
                     if (!isGroupKey(group, it.field))
                         return self.fail(pos, "`{s}` is neither an aggregate nor a grouping key — wrap it in an aggregate, or name it in GROUP BY", .{it.field.last()});
                     try kept.append(it);
                 }
                 items = kept;
             }
-            // Before the aggregate is sealed, since HAVING may name one that the
-            // SELECT list does not.
             if (having) |h| {
                 if (try self.addHavingAggs(h, &aggs, expr_aliases.items)) lifted = true;
             }
@@ -2368,11 +2172,7 @@ pub const Parser = struct {
                 const hf = try self.havingRewrite(h, expr_aliases.items);
                 try stages.append(.{ .node = .{ .filter = hf }, .hints = &.{}, .pos = pos });
             }
-            // An interleaved SELECT list (`SELECT k, SUM(x), k2`) needs the same
-            // projection a lifted aggregate does, for order rather than arithmetic.
             if (!lifted and aggOrderDiffers(post.items, group, aggs_out)) lifted = true;
-            // Runs after HAVING, which reads the aggregate's own columns — the
-            // projection would have already replaced them.
             if (lifted) {
                 for (post.items) |it| {
                     if (it == .star or it == .star_except or it == .star_rename)
@@ -2388,21 +2188,12 @@ pub const Parser = struct {
             }
         }
 
-        // With a window, DISTINCT waits for its output: deduplicating before it
-        // compared rows the window had not yet filled, and `SELECT DISTINCT k,
-        // SUM(v) OVER (PARTITION BY k)` came back one row per input row.
         if (distinct and win_funcs.items.len == 0) {
             try stages.append(.{ .node = .{ .distinct = .{ .on = distinct_on } }, .hints = &.{}, .pos = pos });
             if (distinct_drop) |outs| try stages.append(.{ .node = .{ .select = outs }, .hints = &.{}, .pos = pos });
         }
 
         if (win_funcs.items.len > 0) {
-            // A window's columns are referenced only inside `OVER (...)`, so the
-            // projection above — computed from the ordinary SELECT items — prunes them
-            // and the window operator then cannot resolve them. The error even migrates
-            // as you project more of them by hand. Carry each reference through as a
-            // hidden column and drop it after the window, which is what an outer
-            // `ORDER BY` already does for its own keys.
             var refs = std.array_list.Managed([]const u8).init(self.arena);
             for (win_part.items) |q| try refs.append(q.last());
             for (win_ord.items) |k| try refs.append(k.field.last());
@@ -2412,8 +2203,6 @@ pub const Parser = struct {
             for (refs.items) |name| {
                 var have = false;
                 for (items.items) |it| switch (it) {
-                    // A star already carries everything — except what it leaves
-                    // out or renames away, which the window still has to read.
                     .star => have = true,
                     .star_except => |ex| {
                         var dropped = false;
@@ -2438,8 +2227,6 @@ pub const Parser = struct {
                 };
                 if (!have) try items.append(.{ .field = try self.singleName(name) });
             }
-            // The projection is emitted here rather than by the branch below, since the
-            // hidden columns have to be in it.
             if (items.items.len > 0) {
                 try stages.append(.{ .node = .{ .select = try items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
             }
@@ -2448,10 +2235,6 @@ pub const Parser = struct {
                 .partition_by = try win_part.toOwnedSlice(),
                 .order_by = try win_ord.toOwnedSlice(),
             } }, .hints = &.{}, .pos = pos });
-            // Back to what the SELECT asked for: its own items, the hidden columns
-            // gone, the window's outputs after them.
-            // A `*` here already sees the window's outputs, which are then named again
-            // after it: `SELECT *, ROW_NUMBER() ... AS rn` came out `k, v, rn, rn`.
             var out_items = std.array_list.Managed(ast.SelectItem).init(self.arena);
             for (post.items) |it| try out_items.append(switch (it) {
                 .star => .{ .star_except = win_outs.items },
@@ -2478,10 +2261,8 @@ pub const Parser = struct {
         return .{ .stages = try stages.toOwnedSlice(), .aliases = aliases, .union_branch = union_branch, .expr_aliases = try expr_aliases.toOwnedSlice() };
     }
 
-    /// A union arm that is not a bare source: lower its stages to a binding and hand
-    /// back a branch that reads it. The union operator aligns arms off their schemas,
-    /// so it does not care whether an arm is a table or a query — only the parser
-    /// used to.
+    /// A union arm that is not a bare source, lowered to a binding and read back: the
+    /// union aligns arms by their schemas.
     fn unionBranchFromStages(self: *Parser, branch_stages: []const ast.Stage) Error!ast.UnionBranch {
         self.derived_n += 1;
         const name = try std.fmt.allocPrint(self.arena, "__union{d}", .{self.derived_n});
@@ -2500,13 +2281,9 @@ pub const Parser = struct {
         };
     }
 
-    /// `core (UNION [ALL | DISTINCT] [BY NAME] core)... [ANCHOR SCHEMA qual]` —
-    /// collapse the cores into one union_ stage.
-    ///
-    /// Plain `UNION` lines branches up by position, `BY NAME` by column name; a chain
-    /// is one or the other. A `UNION` without `ALL` removes duplicate rows from
-    /// everything to its left, as in SQL: the prefix up to the last one is unioned
-    /// and deduplicated, and any `UNION ALL` after it appends to that.
+    /// Collapse `core (UNION [ALL|DISTINCT] [BY NAME] core)... [ANCHOR SCHEMA q]` into one
+    /// union_ stage. A chain is all positional or all by name; a `UNION` without ALL
+    /// deduplicates everything to its left.
     fn parseUnionTail(self: *Parser, first: Core, stages: *std.array_list.Managed(ast.Stage)) Error!void {
         const pos = self.curPos();
         var cores = std.array_list.Managed(Core).init(self.arena);
@@ -2544,7 +2321,6 @@ pub const Parser = struct {
                 return self.fail(self.curPos(), "`{s}` applies to `UNION ALL BY NAME`; a plain UNION lines branches up by position", .{self.cur().text});
             if (last_distinct == 0) return self.appendUnion(cs, false, true, stages, pos);
             if (last_distinct == cs.len - 1) return self.appendUnion(cs, true, true, stages, pos);
-            // `a UNION b UNION ALL c`: deduplicate a ∪ b, then append c.
             var prefix = std.array_list.Managed(ast.Stage).init(self.arena);
             try self.appendUnion(cs[0 .. last_distinct + 1], true, true, &prefix, pos);
             var branches = std.array_list.Managed(ast.UnionBranch).init(self.arena);
@@ -2570,10 +2346,8 @@ pub const Parser = struct {
         pos: Pos,
     };
 
-    /// A chain holding `INTERSECT` or `EXCEPT`, all by position. `INTERSECT` binds
-    /// tighter than `UNION` and `EXCEPT`, which then apply left to right — SQL's
-    /// precedence, so `a UNION b INTERSECT c` is `a UNION (b INTERSECT c)`. Each step
-    /// lowers to a two-branch union_ whose result the next step reads as a branch.
+    /// A chain holding INTERSECT or EXCEPT, by position. INTERSECT binds tighter, the
+    /// rest apply left to right; each step is a two-branch union_ the next reads.
     fn parseSetOps(self: *Parser, cores: []const Core, ops: []const SetOpTok, stages: *std.array_list.Managed(ast.Stage), pos: Pos) Error!void {
         for (ops) |o| {
             if (o.named)
@@ -2608,8 +2382,7 @@ pub const Parser = struct {
         try stages.appendSlice(acc);
     }
 
-    /// `left <op> right` as a two-branch positional union_ stage, plus a DISTINCT for
-    /// a plain UNION; intersect/except deduplicate on their own.
+    /// `left <op> right` as a positional union_, plus a DISTINCT for a plain UNION.
     fn setOpStages(self: *Parser, left: []const ast.Stage, right: []const ast.Stage, set: ast.SetOp, distinct: bool, pos: Pos) Error![]const ast.Stage {
         const branches = try self.arena.alloc(ast.UnionBranch, 2);
         branches[0] = try self.unionBranchFromStages(left);
@@ -2620,13 +2393,10 @@ pub const Parser = struct {
         return out.toOwnedSlice();
     }
 
-    /// One union_ stage over `cores`, then a whole-row DISTINCT when `distinct`.
     fn appendUnion(self: *Parser, cores: []const Core, distinct: bool, positional: bool, stages: *std.array_list.Managed(ast.Stage), pos: Pos) Error!void {
         var branches = std.array_list.Managed(ast.UnionBranch).init(self.arena);
         var tag_col: ?[]const u8 = null;
         for (cores) |core| {
-            // A positional branch is always a general query: its tag literal is a
-            // column like any other, not a by-name reconciliation tag.
             const b = if (positional) null else core.union_branch;
             if (b) |fb| {
                 if (fb.tag_col) |tc| {
@@ -2653,19 +2423,6 @@ pub const Parser = struct {
         if (distinct) try stages.append(.{ .node = .{ .distinct = .{ .on = null } }, .hints = &.{}, .pos = pos });
     }
 
-    /// A FROM source: CSV path, IDENTIFIER(<expr>) for a computed path,
-    /// BODY(schema), HTTP('url'), a CTE reference, or a connection-qualified
-    /// table / QUERY($$...$$). Registers the alias.
-    /// `( <query> ) [AS] alias` in a FROM or JOIN position. Lowers to a binding — the
-    /// same statement `WITH alias AS (...)` produces — so the caller can reference it
-    /// as a `.ref` source or as a join's right side. No new execution machinery: a
-    /// derived table *is* a CTE that happened to be written inline.
-    ///
-    /// The binding always gets a generated name no identifier can collide with; the
-    /// alias names it only inside the query that wrote it. Bindings share one
-    /// namespace per script, so binding under the alias let a second `r` anywhere
-    /// replace the first — silently, when the two had the same columns.
-    /// The table function called `name`, the latest declaration winning.
     fn findTableFn(self: *Parser, name: []const u8) ?ast.FnDecl {
         var i = self.table_fns.items.len;
         while (i > 0) {
@@ -2675,8 +2432,8 @@ pub const Parser = struct {
         return null;
     }
 
-    /// A `WITH` name as bound: itself, or — inside a table function's body — a name
-    /// unique to this call, which the body's own `FROM name` maps back to.
+    /// A `WITH` name as bound: itself, or inside a table function's body a name unique
+    /// to this call.
     fn cteName(self: *Parser, name: []const u8) Error![]const u8 {
         const f = self.tvf orelse return name;
         const bname = try std.fmt.allocPrint(self.arena, "__tvf{d}_{s}", .{ f.id, name });
@@ -2684,9 +2441,8 @@ pub const Parser = struct {
         return bname;
     }
 
-    /// Parse a table function's body once where it is declared, so a mistake in it
-    /// is reported there and not at the first call, and hand back its tokens for
-    /// every call to re-parse. Nothing it would bind is kept.
+    /// Parse a table function's body once at its declaration, where mistakes are reported,
+    /// binding nothing; returns its tokens for every call to re-parse.
     fn checkTableBody(self: *Parser) Error![]const Token {
         const start = self.i;
         const let_base = self.let_names.items.len;
@@ -2707,17 +2463,12 @@ pub const Parser = struct {
         return toks;
     }
 
-    /// A `JOIN LATERAL f(o.col)` argument that names a column of the left side:
-    /// where the body says `x = $param`, the join says `o.col = <x as output>`.
     const LateralKey = struct { left: ast.QualName, right: []const u8 };
 
     const TableCall = struct { binding: []const u8, keys: []const LateralKey = &.{} };
 
-    /// `f(args)` in FROM or JOIN, the name already consumed: bind the arguments,
-    /// re-parse the body with them, and lower the result to a binding exactly as a
-    /// derived table is — so a filter on the call still descends to the source.
-    /// `lateral` (a `JOIN LATERAL`) lets an argument be a left-side column; see
-    /// `decorrelate`.
+    /// `f(args)` in FROM or JOIN: bind the arguments, re-parse the body, and lower it to a
+    /// binding like a derived table, so a filter on the call still reaches the source.
     fn callTableFn(self: *Parser, fd: ast.FnDecl, pos: Pos, place: enum { from, join, lateral }) Error!TableCall {
         const lateral = place == .lateral;
         _ = try self.expect(.lparen);
@@ -2746,7 +2497,6 @@ pub const Parser = struct {
             if (!self.constItemExpr(a.*)) {
                 const column = a.*.* == .field and !a.*.field.dollar;
                 if (lateral and column) {
-                    // The body sees a marker in its place, found again by pointer.
                     const marker = try self.mk(.{ .field = .{ .parts = try self.arena.dupe([]const u8, &.{ "\x00lateral", p.name }) } });
                     try correlated.append(.{ .param = p.name, .left = a.*.field, .marker = marker });
                     a.* = marker;
@@ -2798,17 +2548,9 @@ pub const Parser = struct {
 
     const Correlated = struct { param: []const u8, left: ast.QualName, marker: *ast.Expr };
 
-    /// Turn a body that a `JOIN LATERAL` passes a column into one the join can read
-    /// once: each `x = $param` conjunct leaves the WHERE, `x` is made an output of
-    /// the body (under its output name, or the parameter's when the SELECT list
-    /// leaves it out), and the join matches it against the row's column. One read
-    /// of the source and a hash join, instead of a query per row.
-    ///
-    /// Only where that changes nothing: the body is a read, joins, filters and a
-    /// SELECT list. A LIMIT, DISTINCT, GROUP BY or window would see every row the
-    /// equality used to keep out — "first item of the order" would become every
-    /// item — so they are refused, as is any use of `$param` but `x = $param`
-    /// (and the parameter echoed as a SELECT item, which is then `x`).
+    /// Turn each `x = $param` of a `JOIN LATERAL` body into an output column the join
+    /// matches: one read and a hash join, not a query per row. Refused when the body has a
+    /// LIMIT, DISTINCT, GROUP BY or window, or uses `$param` any other way.
     fn decorrelate(self: *Parser, name: []const u8, pos: Pos, stages: *std.array_list.Managed(ast.Stage), inner: []const ast.Stmt, cor: []const Correlated) Error![]const LateralKey {
         const p0 = cor[0].param;
         for (stages.items) |st| switch (st.node) {
@@ -2858,8 +2600,6 @@ pub const Parser = struct {
             } else return self.fail(pos, "`{s}`: `${s}` gets a row's column, but the body never says `column = ${s}` in its WHERE — that is what the join matches on", .{ name, c.param, c.param });
         }
 
-        // The SELECT list: a parameter echoed back is its column, and each
-        // matched column needs an output name to join on.
         var sel_at: ?usize = null;
         for (stages.items, 0..) |st, i| if (st.node == .select) {
             sel_at = i;
@@ -2900,25 +2640,20 @@ pub const Parser = struct {
         return keys;
     }
 
-    /// An error inside a table function's body is positioned in its declaration;
-    /// say which call reached it.
+    /// Name the call that reached an error inside a table function's body, once, at
+    /// the call the script wrote.
     fn inTableFn(self: *Parser, e: Error, name: []const u8, pos: Pos) Error {
-        // Named once, at the call the script wrote — not again at every level a
-        // runaway `OR REPLACE` recursion went through (the defers have not run yet).
         if (e == error.ParseFailed and self.tvf_depth == 1)
             self.diag.msg = std.fmt.allocPrint(self.arena, "in `{s}` called at {d}:{d}: {s}", .{ name, pos.line, pos.col, self.diag.msg }) catch self.diag.msg;
         return e;
     }
 
+    /// `( <query> ) [AS] alias` in FROM or JOIN, lowered to a binding. Inner bindings
+    /// gather in a local list: sharing `parseQuery`'s own drain list once lost them.
     fn parseDerivedTable(self: *Parser) Error!Derived {
         const dpos = self.curPos();
         _ = try self.expect(.lparen);
         var sub_stages = std.array_list.Managed(ast.Stage).init(self.arena);
-        // Bindings the inner query creates — its own `WITH`, or a derived table nested
-        // inside it — go to a local list, NOT straight to `pending_bindings`. Handing
-        // `parseQuery` the same list it drains into made it append that list to itself
-        // and clear it, losing every binding recorded so far: `FROM (SELECT .. FROM
-        // (SELECT ..) a) b` failed with "unknown binding `a`".
         var inner_bindings = std.array_list.Managed(ast.Stmt).init(self.arena);
         try self.parseQuery(&inner_bindings, &sub_stages);
         _ = try self.expect(.rparen);
@@ -2937,7 +2672,6 @@ pub const Parser = struct {
             try std.fmt.allocPrint(self.arena, "__derived{d}", .{self.derived_n});
 
         try self.let_names.append(name);
-        // Inner bindings first: they are what this one reads from.
         try self.pending_bindings.appendSlice(inner_bindings.items);
         try self.pending_bindings.append(.{ .binding = .{
             .name = name,
@@ -2949,9 +2683,8 @@ pub const Parser = struct {
 
     const Derived = struct { binding: []const u8, alias: ?[]const u8, alias_pos: Pos };
 
-    /// A join's right side that reads — a path, `IDENTIFIER(...)`, a connection's
-    /// table or query — lowered as `(SELECT * FROM it) alias` would be: a binding
-    /// of its own, its read hints (`WITH (sheet = ...)` after the alias) with it.
+    /// A join's reading right side (path, `IDENTIFIER`, table or query), lowered as
+    /// `(SELECT * FROM it) alias` would be, with its read hints.
     fn parseJoinRead(self: *Parser) Error!Derived {
         const rpos = self.curPos();
         var scratch = AliasSet{};
@@ -2978,9 +2711,8 @@ pub const Parser = struct {
         return .{ .binding = name, .alias = alias, .alias_pos = rpos };
     }
 
-    /// A parenthesized query in expression or LET position, the `(` already
-    /// consumed: parse it into a pipeline and route any bindings it creates to
-    /// `pending_bindings`, exactly the way `parseDerivedTable` does.
+    /// A parenthesized query in expression or LET position, `(` consumed, its bindings
+    /// routed to `pending_bindings`.
     fn parseSubqueryPipeline(self: *Parser) Error!ast.Pipeline {
         const qpos = self.curPos();
         var sub_stages = std.array_list.Managed(ast.Stage).init(self.arena);
@@ -2991,9 +2723,8 @@ pub const Parser = struct {
         return .{ .stages = try sub_stages.toOwnedSlice(), .pos = qpos };
     }
 
-    /// Output name of a pipeline's single column, or null when there is not
-    /// exactly one nameable column — walked back from the last stage the same
-    /// way the schema will resolve at plan time.
+    /// Output name of a pipeline's single column, or null, walked back from the last
+    /// stage as the plan will resolve it.
     fn firstOutName(stages: []const ast.Stage) ?[]const u8 {
         var i = stages.len;
         while (i > 0) {
@@ -3012,7 +2743,6 @@ pub const Parser = struct {
                     if (ag.aggs.len == 1) return ag.aggs[0].name;
                     return ag.by[0].parts[ag.by[0].parts.len - 1];
                 },
-                // These keep the upstream column set; keep walking.
                 .filter, .sort, .limit, .distinct => {},
                 else => return null,
             }
@@ -3020,7 +2750,6 @@ pub const Parser = struct {
         return null;
     }
 
-    /// What a stage is, for an error that refuses it.
     fn stageWord(n: ast.Stage.Node) []const u8 {
         return switch (n) {
             .aggregate => "a GROUP BY or an aggregate",
@@ -3068,9 +2797,8 @@ pub const Parser = struct {
         return null;
     }
 
-    /// The name `col` leaves the SELECT list under, when the list passes it
-    /// through — as itself, renamed by `AS`, or in a `*` — and null otherwise. A
-    /// computed item that only shares the name (`trim(c) AS c`) is not it.
+    /// The name `col` leaves the SELECT list under, as itself, renamed or in a `*`; null
+    /// otherwise. A computed item that only shares the name is not it.
     fn outputNameOf(items: []const ast.SelectItem, col: ast.QualName) ?[]const u8 {
         const nm = col.last();
         for (items) |it| switch (it) {
@@ -3092,9 +2820,8 @@ pub const Parser = struct {
         return null;
     }
 
-    /// Does `e` contain `needle` anywhere, by pointer? Used to reject an
-    /// `IN (SELECT ...)` sentinel that sits under OR / NOT / any non-AND node,
-    /// where dropping it would change the predicate's meaning.
+    /// Whether `e` contains `needle` by pointer, to reject an `IN (SELECT ...)` sentinel
+    /// off the AND spine.
     fn containsExpr(e: *const ast.Expr, needle: *const ast.Expr) bool {
         if (e == needle) return true;
         return switch (e.*) {
@@ -3137,11 +2864,9 @@ pub const Parser = struct {
         return false;
     }
 
-    /// Remove the pending semi-join sentinels from the top-level AND spine of a
-    /// WHERE predicate. Returns what remains of the predicate (null if the IN
-    /// tests were all of it). A sentinel anywhere BUT the AND spine — under an
-    /// OR, a NOT, a CASE — is an error: dropping it there would change what the
-    /// predicate means, so those shapes stay unsupported rather than wrong.
+    /// Remove the semi-join sentinels from a WHERE's top-level AND spine, returning what
+    /// remains (null if nothing). A sentinel under OR, NOT or CASE is an error: dropping
+    /// it there would change the predicate.
     fn liftSemiJoins(self: *Parser, e: *ast.Expr, pos: Pos) Error!?*ast.Expr {
         if (self.isSentinel(e)) return null;
         if (e.* == .binary and e.binary.op == .@"and") {
@@ -3160,13 +2885,9 @@ pub const Parser = struct {
         return e;
     }
 
-    /// `<fn>() OVER (PARTITION BY .. ORDER BY ..) [AS name]` as a complete select item.
-    /// Returns false when the next tokens are not that, having consumed nothing.
-    ///
-    /// Stage one covers the ranking functions, which need no frame: a frame only means
-    /// anything to an aggregate over a window, and `ROWS BETWEEN` syntax is deliberately
-    /// absent until something asks for it. Every partition and order column must also be
-    /// projected — the stage appends its columns to the projection rather than replacing it.
+    /// `<fn>(...) OVER (PARTITION BY .. ORDER BY .. [ROWS ...]) [AS name]` as a whole item,
+    /// or false with nothing consumed. Functions in a query share one PARTITION/ORDER BY,
+    /// each with its own frame; ranking and offsets require an ORDER BY.
     fn parseWindowItem(
         self: *Parser,
         funcs: *std.array_list.Managed(ast.WindowFunc),
@@ -3189,14 +2910,10 @@ pub const Parser = struct {
             if (std.mem.eql(u8, low, "min")) break :blk .min;
             if (std.mem.eql(u8, low, "max")) break :blk .max;
             if (std.mem.eql(u8, low, "avg")) break :blk .avg;
-            // An aggregate with no window form — `median(x) OVER (...)` — was parsed
-            // as a plain aggregate, and the error blamed a GROUP BY the query never had.
             if (aggFunc(low) != null and self.peekTag() == .lparen and self.overFollows(self.i))
                 return self.fail(self.curPos(), "`{s}` is not a window function — over a window, basalt computes sum, count, min, max, avg, row_number, rank, dense_rank, lag and lead", .{low});
             return false;
         };
-        // Only commit once the whole `name ( ) OVER` prefix is present, so a column
-        // called `rank` still parses as a column.
         if (self.peekTag() != .lparen) return false;
         const save = self.i;
         _ = self.advance();
@@ -3204,10 +2921,7 @@ pub const Parser = struct {
         var arg: ?ast.QualName = null;
         var offset: i64 = 1;
         if (kind == .sum or kind == .count or kind == .min or kind == .max or kind == .avg) {
-            // `COUNT(*)` counts rows; anything else needs a column. Rewind rather than
-            // fail, so a plain `SUM(x)` with no OVER is still an ordinary aggregate.
             if (self.eat(.star)) {
-                // Only COUNT(*) is starrable.
                 if (kind != .count) {
                     return self.notWindow(save);
                 }
@@ -3234,12 +2948,6 @@ pub const Parser = struct {
         _ = self.advance();
         _ = try self.expect(.lparen);
 
-        // One window per query in stage one: two functions may share a window, but two
-        // different windows would need a stage each.
-        // Parse this function's window into locals, then either adopt it (first
-        // function) or require that it matches — `MIN(v) OVER (w), MAX(v) OVER (w)` is
-        // the natural pairing and must be allowed, while two *different* windows would
-        // need a stage each.
         var this_part = std.array_list.Managed(ast.QualName).init(self.arena);
         var this_ord = std.array_list.Managed(ast.SortKey).init(self.arena);
         if (self.eatKw("partition")) {
@@ -3259,9 +2967,6 @@ pub const Parser = struct {
                 if (!self.eat(.comma)) break;
             }
         }
-        // `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, or `<n> PRECEDING`. The
-        // end bound is always CURRENT ROW in this form; a FOLLOWING bound would need the
-        // frame to look ahead and is not accepted yet.
         var this_frame: ast.WinFrame = .{};
         if (self.eatKw("rows")) {
             const fpos = self.curPos();
@@ -3287,9 +2992,6 @@ pub const Parser = struct {
         }
         _ = try self.expect(.rparen);
 
-        // Only PARTITION BY and ORDER BY have to match: a frame is per function.
-        // Comparing just those two let a second frame through and then ignored it,
-        // so a running total beside a moving sum came back as the moving sum.
         if (funcs.items.len == 0) {
             try part.appendSlice(this_part.items);
             try ord.appendSlice(this_ord.items);
@@ -3306,8 +3008,6 @@ pub const Parser = struct {
             if (!same)
                 return self.fail(wpos, "two window functions in one SELECT must share the same OVER (...) window", .{});
         }
-        // Ranking and the offsets need an order to count along. An aggregate does not:
-        // with no ORDER BY its frame is the whole partition, which is share-of-total.
         if (this_ord.items.len == 0 and switch (kind) {
             .sum, .count, .min, .max, .avg => false,
             else => true,
@@ -3319,10 +3019,8 @@ pub const Parser = struct {
         return true;
     }
 
-    /// Rewind a `name(...)` that `parseWindowItem` does not take — unless an `OVER`
-    /// follows its closing parenthesis. Then it is a window function whose argument
-    /// is not a plain column, and parsing it as an ordinary aggregate blamed a
-    /// GROUP BY the query never had.
+    /// Rewind a `name(...)` `parseWindowItem` does not take, unless `OVER` follows: then it
+    /// is a window over a non-column argument, which once parsed as an aggregate.
     fn notWindow(self: *Parser, save: usize) Error!bool {
         self.i = save;
         if (self.overFollows(save))
@@ -3330,8 +3028,6 @@ pub const Parser = struct {
         return false;
     }
 
-    /// Whether the call whose name is token `name_at` is followed, past its closing
-    /// parenthesis, by `OVER`.
     fn overFollows(self: *Parser, name_at: usize) bool {
         var j = name_at + 1;
         var depth: usize = 0;
@@ -3349,6 +3045,8 @@ pub const Parser = struct {
         return j + 1 < self.toks.len and self.toks[j + 1].tag == .ident and eqlNoCase(self.toks[j + 1].text, "over");
     }
 
+    /// A FROM source: a path, `IDENTIFIER(<expr>)`, BODY(schema), HTTP('url'), a CTE, or a
+    /// connection's table or QUERY. Registers the alias.
     fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array_list.Managed(ast.Hint)) Error!ast.Stage.Node {
         var node: ast.Stage.Node = undefined;
         if (self.at(.lparen)) {
@@ -3480,27 +3178,19 @@ pub const Parser = struct {
         return node;
     }
 
-    /// A parenthesized discovery sub-query: a full basalt SELECT pipeline with
-    /// no trailing write, planned and executed in-engine by the runtime. CTEs
-    /// are rejected — `parseQuery` hoists those into top-level bindings, and a
-    /// nested query has nowhere to put them.
+    /// A discovery sub-query: a full SELECT pipeline with no write, run in-engine. Its CTEs
+    /// and derived tables become bindings ahead of the statement that discovers through it.
     fn parseSubQuery(self: *Parser, pos: Pos) Error!ast.Pipeline {
         var hoisted = std.array_list.Managed(ast.Stmt).init(self.arena);
         var stages = std.array_list.Managed(ast.Stage).init(self.arena);
         try self.parseQuery(&hoisted, &stages);
-        // Its CTEs, derived tables and table-function calls become bindings like
-        // any query's, placed ahead of the statement that discovers through them
-        // (`parseForEach` / the enclosing `parseQuery`). They used to be refused —
-        // "may not declare CTEs" even of a query that only called a function.
         try self.pending_bindings.appendSlice(hoisted.items);
         return .{ .stages = try stages.toOwnedSlice(), .pos = pos };
     }
 
-    /// `EACH TABLE OF (SELECT ... | <conn>.QUERY($$...$$) | $param.path
-    ///  | '<json>' IN <conn>) [AS (table_name, <tag_col>)] [ANCHOR SCHEMA qual]`
-    /// — the discovered / json union forms. One row (or array element) per
-    /// branch; the second AS name is the output tag column. The SELECT form is
-    /// a full basalt query planned and run in-engine.
+    /// `EACH TABLE OF (SELECT ... | conn.QUERY(...) | $param.path | '<json>' IN conn)
+    /// [AS (name, tag)] [ANCHOR SCHEMA q]`: one branch per row, on the discovery
+    /// query's connection unless `IN conn` says otherwise.
     fn parseEachTableOf(self: *Parser, hints: *std.array_list.Managed(ast.Hint)) Error!ast.Stage.Node {
         const pos = self.curPos();
         try self.expectKw("each");
@@ -3518,9 +3208,6 @@ pub const Parser = struct {
         } else if (self.isKw("select")) {
             const pipe = try self.parseSubQuery(pos);
             u.discover_pipeline = pipe;
-            // The discovered tables live on whatever connection the discovery
-            // query itself reads from, unless a trailing `IN <conn>` says
-            // otherwise.
             if (pipe.stages.len > 0 and pipe.stages[0].node == .read) {
                 const c = pipe.stages[0].node.read.connector;
                 if (self.isConn(c)) u.discover_conn = c;
@@ -3562,15 +3249,14 @@ pub const Parser = struct {
         return .{ .union_ = u };
     }
 
-    /// `PAGINATE BY page|offset|cursor (key = value, ...)` -> HTTP source hints.
+    /// `PAGINATE BY page|offset|cursor (...)` -> HTTP hints. The mode goes in a `paginate`
+    /// hint: a bare flag once left pagination off and fetched one page.
     fn parsePaginate(self: *Parser, hints: *std.array_list.Managed(ast.Hint)) Error!void {
         const pos = self.curPos();
         try self.expectKw("paginate");
         try self.expectKw("by");
         const mode = try self.expectIdent();
         const is_cursor = eqlNoCase(mode, "cursor");
-        // http_client.zig reads the mode off a `paginate` hint; a bare flag key
-        // planned fine but left paginate=.none, so only one page was fetched.
         if (eqlNoCase(mode, "page") or eqlNoCase(mode, "offset") or is_cursor) {
             try hints.append(.{ .key = "paginate", .value = .{ .ident = mode }, .pos = pos });
         } else {
@@ -3611,7 +3297,6 @@ pub const Parser = struct {
         }
     }
 
-    /// `RETRY n [ON (429, 503)]` -> retries / retry_statuses hints.
     fn parseRetry(self: *Parser, hints: *std.array_list.Managed(ast.Hint)) Error!void {
         const pos = self.curPos();
         try self.expectKw("retry");
@@ -3633,8 +3318,8 @@ pub const Parser = struct {
         }
     }
 
-    /// `BODY (col TYPE [NOT NULL], ...)` — the declared request-body schema,
-    /// enforced row-by-row at bind time (a violation is the endpoint's 422).
+    /// `BODY (col TYPE [NOT NULL], ...)`, enforced per row at bind time (a violation is
+    /// the endpoint's 422).
     fn parseBodySchema(self: *Parser) Error![]const types.BodyCol {
         _ = try self.expect(.lparen);
         var cols = std.array_list.Managed(types.BodyCol).init(self.arena);
@@ -3656,8 +3341,8 @@ pub const Parser = struct {
         return cols.toOwnedSlice();
     }
 
-    /// `pre` receives the bindings the discovery source needs, which run ahead of
-    /// the loop — not inside its body, where the body's first query would take them.
+    /// `pre` receives the discovery source's bindings, which run ahead of the loop. The
+    /// loop variables are script constants in the body, so one may sit beside an aggregate.
     fn parseForEach(self: *Parser, pre: *std.array_list.Managed(ast.Stmt)) Error!ast.ForEach {
         const pos = self.curPos();
         try self.expectKw("for");
@@ -3724,10 +3409,6 @@ pub const Parser = struct {
             } else break;
         }
 
-        // The loop variables are script-scope constants inside the body, exactly as
-        // a PARAM is: `$name` resolves per row before a row is read. Registering them
-        // is what lets one sit beside an aggregate (`SELECT $tabela, COUNT(*)`),
-        // which was refused while the same shape with a PARAM was allowed.
         const const_base = self.const_names.items.len;
         for (names.items) |n| try self.const_names.append(n);
 
@@ -3735,7 +3416,6 @@ pub const Parser = struct {
         while (!self.at(.eof) and !self.isKw("end")) {
             try self.parseStatement(&body);
         }
-        // Scoped to the body: outside it the name is an ordinary column again.
         self.const_names.shrinkRetainingCapacity(const_base);
         try self.expectKw("end");
         try self.expectKw("for");
@@ -3816,8 +3496,8 @@ pub const Parser = struct {
         return .{ .subject = subject, .arms = try arms.toOwnedSlice(), .pos = pos };
     }
 
-    /// The one shape a join key may take. Kept deliberately narrow: the index is
-    /// built on stored columns, so a computed key has to be computed first.
+    /// The one shape a join key may take: the index is built on stored columns, so a
+    /// computed key has to be computed first.
     fn joinKeyFail(self: *Parser) Error {
         return self.fail(self.curPos(), "join keys must be plain columns; compute them in the CTE / a select first", .{});
     }
@@ -3838,9 +3518,8 @@ pub const Parser = struct {
         return .{ .parts = try parts.toOwnedSlice(), .span = self.spanFrom(start) };
     }
 
-    /// Rewrite `alias.x` -> `x` in an expression tree.
-    /// Every column an expression reads. Used to keep a pre-aggregation
-    /// projection from dropping inputs the aggregates still need.
+    /// Every column an expression reads, so a pre-aggregation projection keeps the
+    /// aggregates' inputs.
     fn collectFields(self: *Parser, e: *const ast.Expr, out: *std.array_list.Managed(ast.QualName)) Error!void {
         switch (e.*) {
             .field => |q| out.append(q) catch return error.OutOfMemory,
@@ -3875,8 +3554,9 @@ pub const Parser = struct {
         }
     }
 
-    /// Render an expression exactly as `synthName` renders its source tokens,
-    /// so a HAVING term can be matched to the SELECT item that computed it.
+    /// Render an expression as `synthName` renders tokens, so HAVING matches the item that
+    /// computed it. Arguments render in full: rendering them as `?` once merged
+    /// `sum(v*2)` and `sum(v+100)` into one accumulator.
     fn exprKey(self: *Parser, e: *const ast.Expr, buf: *std.array_list.Managed(u8)) Error!void {
         switch (e.*) {
             .field => |q| for (q.parts, 0..) |part, i| {
@@ -3895,11 +3575,6 @@ pub const Parser = struct {
                 }
                 buf.append(')') catch return error.OutOfMemory;
             },
-            // Every kind below used to fall to the `?` at the end, which made
-            // `sum(v*2)` and `sum(v+100)` both key as `sum(?)` — so the second
-            // aggregate bound to the first's accumulator and the answer was
-            // silently `2 * sum(v*2)`. The key has to carry the argument's
-            // structure, not just its shape.
             .float_lit => |v| buf.writer().print("{d}", .{v}) catch return error.OutOfMemory,
             .bool_lit => |v| buf.appendSlice(if (v) "true" else "false") catch return error.OutOfMemory,
             .null_lit => buf.appendSlice("null") catch return error.OutOfMemory,
@@ -3957,8 +3632,6 @@ pub const Parser = struct {
                 try self.exprKey(c.els, buf);
                 buf.append(')') catch return error.OutOfMemory;
             },
-            // Rendered, not collapsed: `count_if(json_any(a, t -> t = 1))` and the
-            // same over `t = 2` are two aggregates, and one key would merge them.
             .lambda => |l| {
                 for (l.params, 0..) |pp, k| {
                     if (k > 0) buf.append(',') catch return error.OutOfMemory;
@@ -3968,16 +3641,11 @@ pub const Parser = struct {
                 try self.exprKey(l.body, buf);
             },
             .lambda_var => |n| buf.appendSlice(n) catch return error.OutOfMemory,
-            // `match` and `let ... in` still collapse; they cannot appear as an
-            // aggregate argument today, and a distinct key for them would need the
-            // whole arm list rendered.
             else => buf.append('?') catch return error.OutOfMemory,
         }
     }
 
-    /// Whether an aggregate call appears anywhere inside an expression. A
-    /// SELECT item that is one outright is already handled; this finds the ones
-    /// buried in arithmetic or a scalar call, like `round(avg(x), 2)`.
+    /// Whether an aggregate call is buried inside an expression, as in `round(avg(x), 2)`.
     fn containsAgg(e: *const ast.Expr) bool {
         return switch (e.*) {
             .call => |c| aggFunc(c.name) != null or blk: {
@@ -4003,11 +3671,8 @@ pub const Parser = struct {
         };
     }
 
-    /// Point the post-aggregate projection's entry for `name` at `expr` instead of
-    /// at a column of that name. A computed item normally lands in the pre-aggregate
-    /// projection and is referenced by name afterwards; when the item is lifted out
-    /// of the pre-projection entirely, the reference has nothing to read and the
-    /// expression has to be evaluated here instead.
+    /// Point the post-aggregate entry for `name` at `expr`, for an item lifted out of the
+    /// pre-aggregate projection that has no column to read.
     fn repointPostItem(
         self: *Parser,
         post: *std.array_list.Managed(ast.SelectItem),
@@ -4024,30 +3689,16 @@ pub const Parser = struct {
             p.* = .{ .computed = .{ .name = name, .expr = expr } };
             return;
         }
-        // Every computed item appends its own post entry, so this is unreachable
-        // in practice; append rather than lose the column if that ever changes.
         try post.append(.{ .computed = .{ .name = name, .expr = expr } });
         _ = self;
     }
 
-    /// Whether a SELECT item is one value for the whole query, and so may sit in a
-    /// grouped or ungrouped aggregate's select list without being an aggregate or a
-    /// grouping key. That covers literals, arithmetic and string building over them,
-    /// `now()`-style calls, and the PARAMs and LETs — all folded before a row is
-    /// read. A column reference is not constant: it has no single value per group,
-    /// which is the case the caller still refuses.
-    ///
-    /// Only a `$name` is a PARAM or LET; a bare name is a column even when a
-    /// PARAM shares it.
+    /// Whether a SELECT item is one value for the whole query (literals, `now()`-style
+    /// calls, any `$name`), so it may sit beside aggregates. A bare column never is.
     fn constItemExpr(self: *Parser, e: *const ast.Expr) bool {
         return switch (e.*) {
             .int_lit, .float_lit, .str_lit, .bool_lit, .null_lit => true,
-            // Every `$name` is script scope — a PARAM, a LET, a loop variable or a
-            // JSON-param path — so one value per query. Not only the ones declared
-            // in this file: an `@include`d PARAM is parsed elsewhere, and a name
-            // nothing binds is refused by name at plan time.
             .field => |q| q.dollar,
-            // a lambda is constant when its body is, its parameter included
             .lambda => |l| self.constItemExpr(l.body),
             .lambda_var => true,
             .unary => |u| self.constItemExpr(u.e),
@@ -4064,15 +3715,9 @@ pub const Parser = struct {
         };
     }
 
-    /// Lifts the aggregate calls out of a scalar expression, the same swap
-    /// `havingRewrite` performs: each call becomes a column the aggregate stage
-    /// produces, and what surrounds it becomes an ordinary projection over
-    /// those columns. That is what lets `round(avg(x), 2)` be written at all —
-    /// the aggregate itself is unchanged, only where the arithmetic runs.
-    ///
-    /// Naming goes through `exprKey`, so two mentions of the same aggregate
-    /// collapse to one column, and a HAVING or ORDER BY naming that aggregate
-    /// still binds to it.
+    /// Lift the aggregate calls out of a scalar expression into columns of the aggregate
+    /// stage, leaving a projection over them. Naming goes through `exprKey` and the alias
+    /// map, so repeated mentions share one column.
     fn liftAggs(
         self: *Parser,
         e: *ast.Expr,
@@ -4096,9 +3741,6 @@ pub const Parser = struct {
                         }
                         var buf = std.array_list.Managed(u8).init(cx.p.arena);
                         try cx.p.exprKey(node, &buf);
-                        // Through the alias map, so `sum(v) as s` and a later
-                        // `sum(v) * 2` resolve to the one column named `s`
-                        // rather than computing the sum twice.
                         const key = resolveExprAlias(cx.m, buf.toOwnedSlice() catch return error.OutOfMemory);
 
                         var seen = false;
@@ -4125,11 +3767,8 @@ pub const Parser = struct {
         return S.recur(.{ .p = self, .a = aggs, .m = map, .pos = pos }, e);
     }
 
-    /// HAVING may filter on an aggregate the SELECT list never asked for
-    /// (`... GROUP BY g HAVING COUNT(*) > 1` selecting only `g` and an average).
-    /// That aggregate still has to be computed, so it is added as an ordinary
-    /// output column and the post-aggregate projection drops it again — the
-    /// same projection lifting installs. Returns whether anything was added.
+    /// Add aggregates that only HAVING names as output columns, dropped again by the
+    /// post-aggregate projection. Returns whether any was added.
     fn addHavingAggs(
         self: *Parser,
         h: *const ast.Expr,
@@ -4179,16 +3818,14 @@ pub const Parser = struct {
         }
     }
 
-    /// A one-part `QualName`, for referring to a column the previous stage named.
     fn singleName(self: *Parser, name: []const u8) Error!ast.QualName {
         const parts = self.arena.alloc([]const u8, 1) catch return error.OutOfMemory;
         parts[0] = name;
         return .{ .parts = parts };
     }
 
-    /// HAVING runs after aggregation, so each aggregate call in it is really a
-    /// reference to a column the aggregate already produced. Swap the calls for
-    /// those columns and the clause becomes an ordinary filter stage.
+    /// Swap each aggregate call in HAVING for the column the aggregate stage already
+    /// produced, making the clause an ordinary filter.
     fn havingRewrite(self: *Parser, e: *ast.Expr, map: []const ExprAlias) Error!*ast.Expr {
         const Ctx = struct { p: *Parser, m: []const ExprAlias };
         const S = struct {
@@ -4207,8 +3844,8 @@ pub const Parser = struct {
         return S.recur(.{ .p = self, .m = map }, e);
     }
 
-    /// Which sides `e` names: a column of the join's right side (`rname.col`),
-    /// and any other — a left column, or one written without its table.
+    /// Which sides `e` names: a column of the join's right side (`rname.col`), and any
+    /// other, a left column or one written without its table.
     fn sidesOf(self: *Parser, e: *ast.Expr, rname: []const u8) Error!struct { right: bool, other: bool } {
         const Ctx = struct { p: *Parser, rname: []const u8, right: *bool, other: *bool };
         const S = struct {
@@ -4234,8 +3871,6 @@ pub const Parser = struct {
         return .{ .parts = parts };
     }
 
-    /// Whether `e` names a column other than one of the join's right side
-    /// (`rname.col`) — a left column, or one written without its table.
     fn namesOtherSide(self: *Parser, e: *ast.Expr, rname: []const u8) Error!bool {
         const Ctx = struct { p: *Parser, rname: []const u8, other: *bool };
         const S = struct {
@@ -4252,8 +3887,8 @@ pub const Parser = struct {
         return other;
     }
 
-    /// `e` with the join's right name taken off its columns: `sra.x` is `x` to
-    /// the right side's own rows.
+    /// `e` with the join's right name taken off its columns: `sra.x` is `x` to the right
+    /// side's own rows.
     fn stripRightExpr(self: *Parser, e: *ast.Expr, rname: []const u8) Error!*ast.Expr {
         const Ctx = struct { p: *Parser, rname: []const u8 };
         const S = struct {
@@ -4266,6 +3901,7 @@ pub const Parser = struct {
         return S.recur(.{ .p = self, .rname = rname }, e);
     }
 
+    /// Rewrite `alias.x` to `x` in an expression tree.
     fn stripExpr(self: *Parser, e: *ast.Expr, aliases: *const AliasSet) Error!*ast.Expr {
         const Ctx = struct { p: *Parser, aliases: *const AliasSet };
         const S = struct {
@@ -4282,9 +3918,8 @@ pub const Parser = struct {
         return S.recur(.{ .p = self, .aliases = aliases }, e);
     }
 
-    /// One argument of a call: an expression, or a lambda `x -> body` /
-    /// `(acc, x) -> body` — which only the JSON array functions accept; anywhere
-    /// else the type-checker says so.
+    /// One call argument: an expression, or a lambda `x -> body` / `(acc, x) -> body`,
+    /// which only the JSON array functions accept.
     fn parseCallArg(self: *Parser) Error!*ast.Expr {
         const n = self.lambdaHead() orelse return self.parseExpr();
         const pos = self.curPos();
@@ -4292,15 +3927,15 @@ pub const Parser = struct {
         if (paren) _ = self.advance();
         const params = try self.arena.alloc([]const u8, n);
         for (params, 0..) |*pp, k| {
-            if (k > 0) _ = self.advance(); // `,`
+            if (k > 0) _ = self.advance();
             const t = self.advance();
             for (params[0..k]) |prev| {
                 if (std.mem.eql(u8, prev, t.text)) return self.fail(.{ .line = t.line, .col = t.col }, "lambda parameter `{s}` is named twice", .{t.text});
             }
             pp.* = t.text;
         }
-        if (paren) _ = self.advance(); // `)`
-        _ = self.advance(); // `->`
+        if (paren) _ = self.advance();
+        _ = self.advance();
         if (self.lambda_n + n > self.lambda_names.len)
             return self.fail(pos, "lambdas nest too deep ({d} parameters in scope at most)", .{self.lambda_names.len});
         for (params) |pp| {
@@ -4312,8 +3947,8 @@ pub const Parser = struct {
         return self.mk(.{ .lambda = .{ .params = params, .body = body } });
     }
 
-    /// The parameter count when the tokens ahead open a lambda — `x ->` or
-    /// `(a, b, …) ->` — else null, and an ordinary argument follows.
+    /// The parameter count when the tokens ahead open a lambda (`x ->` or `(a, b) ->`),
+    /// else null.
     fn lambdaHead(self: *Parser) ?usize {
         if (self.at(.ident)) return if (self.peekTag() == .arrow) 1 else null;
         if (!self.at(.lparen)) return null;
@@ -4350,17 +3985,12 @@ pub const Parser = struct {
         return e;
     }
 
-    /// Every pass over an expression — typing, evaluation, pushdown — recurses on
-    /// the tree, so a deep enough one overflowed the stack: a 4000-element `IN`
-    /// list passed `check` and then segfaulted in `run`. AND/OR chains and IN
-    /// lists are balanced (`balanceChain`), so this limit only meets a chain of an
-    /// operator that cannot be regrouped.
     const max_expr_depth = 1000;
     const max_paren_depth = 256;
     const max_query_depth = 32;
 
-    /// Whether `e` is more than `limit` levels deep. Stops descending at the limit,
-    /// so the check cannot itself exhaust the stack.
+    /// Whether `e` is more than `limit` levels deep, stopping at the limit so the check
+    /// cannot exhaust the stack itself.
     fn deeperThan(e: *const ast.Expr, limit: usize) bool {
         if (limit == 0) return true;
         return switch (e.*) {
@@ -4376,10 +4006,8 @@ pub const Parser = struct {
         };
     }
 
-    /// A left-deep run of one AND or OR, rebuilt balanced: `a OR b OR c OR d` is
-    /// `(a OR b) OR (c OR d)`. Both are associative under SQL's three-valued logic,
-    /// and the operands stay in order, so results and short-circuiting are
-    /// unchanged; the depth drops from n to log n.
+    /// A left-deep run of one AND or OR rebuilt balanced, operands in order: both are
+    /// associative under three-valued logic, and the depth drops from n to log n.
     fn balanceChain(self: *Parser, e: *ast.Expr) Error!*ast.Expr {
         if (e.* != .binary) return e;
         const op = e.binary.op;
@@ -4407,10 +4035,8 @@ pub const Parser = struct {
 
     const BinInfo = struct { op: ast.BinOp, lbp: u8 };
 
-    /// Binding powers, low to high: `or` 10, `and` 20, unary `not` 25, `??` 30,
-    /// comparisons 40, then the bitwise ladder `|` 42 / `^` 44 / `&` 46 /
-    /// shifts 48, then `+ - ||` 50 and `* / %` 60. So `flags & 4 = 4` is a
-    /// comparison of the AND, and `1 | 2 & 3` is `1 | (2 & 3)`.
+    /// Binding powers, low to high: `or` 10, `and` 20, unary `not` 25, `??` 30, comparisons
+    /// 40, `|` 42, `^` 44, `&` 46, shifts 48, `+ - ||` 50, `* / %` 60.
     fn binInfo(self: *Parser) ?BinInfo {
         switch (self.curTag()) {
             .eq, .assign => return .{ .op = .eq, .lbp = 40 },
@@ -4438,6 +4064,8 @@ pub const Parser = struct {
         }
     }
 
+    /// BETWEEN's bounds parse above AND's binding power, since BETWEEN uses AND as its
+    /// separator.
     fn parseBin(self: *Parser, min_bp: u8) Error!*ast.Expr {
         var lhs = try self.parseUnary();
         while (true) {
@@ -4479,13 +4107,6 @@ pub const Parser = struct {
                 const inpos = self.curPos();
                 _ = self.advance();
                 _ = try self.expect(.lparen);
-                // `IN (SELECT ...)`: a semi join (anti when negated) against an
-                // anonymous binding, not a value list. The test itself becomes
-                // a join STAGE, so a sentinel expression stands in for it here
-                // and the WHERE handler lifts it out — which is why the shape
-                // is only accepted as a top-level AND conjunct of WHERE.
-                //
-                // NOT IN is a null-aware anti join: SQL's three-valued NOT IN.
                 if (self.isKw("select") or self.isKw("with")) {
                     if (!self.in_where)
                         return self.fail(inpos, "IN (SELECT ...) is only supported in a WHERE clause", .{});
@@ -4530,9 +4151,6 @@ pub const Parser = struct {
                 const negated = self.isKw("not");
                 if (negated) _ = self.advance();
                 _ = self.advance();
-                // Bounds are parsed above `AND`'s binding power, since BETWEEN
-                // uses AND as its own separator — otherwise the low bound would
-                // swallow `AND <hi>` as a boolean operand.
                 const lo = try self.parseBin(40);
                 if (!self.eatKw("and"))
                     return self.fail(self.curPos(), "expected `AND` between the bounds of BETWEEN", .{});
@@ -4591,6 +4209,8 @@ pub const Parser = struct {
         return self.parsePrimary();
     }
 
+    /// An aggregate refuses arguments past its maximum: extras were once dropped, so
+    /// `SUM(x, id)` answered `SUM(x)`.
     fn parsePrimary(self: *Parser) Error!*ast.Expr {
         const t = self.cur();
         switch (t.tag) {
@@ -4612,16 +4232,10 @@ pub const Parser = struct {
             },
             .dollar_ident => {
                 const q = try self.parseDollarPath();
-                // Inside a table function's body, its parameters are the call's arguments.
                 if (self.tvf) |f| if (q.parts.len == 1) if (f.arg(q.parts[0])) |a| return a;
                 return self.mk(.{ .field = q });
             },
             .lparen => {
-                // `(SELECT ...)` in expression position: a scalar subquery.
-                // Desugars to an anonymous query LET emitted ahead of the
-                // enclosing statement plus a `$name`-style reference here, so
-                // the value is a plain constant by the time the outer pipeline
-                // plans — and the comparison it sits in can push down.
                 if (self.peekKw("select") or self.peekKw("with")) {
                     const spos = self.curPos();
                     if (self.query_depth == 0)
@@ -4634,7 +4248,6 @@ pub const Parser = struct {
                     try self.const_names.append(name);
                     const parts = try self.arena.alloc([]const u8, 1);
                     parts[0] = name;
-                    // the subquery's value, bound as a LET is
                     return self.mk(.{ .field = .{ .parts = parts, .dollar = true } });
                 }
                 _ = self.advance();
@@ -4642,8 +4255,6 @@ pub const Parser = struct {
                 _ = try self.expect(.rparen);
                 return e;
             },
-            // A quoted name is only ever a column — no keyword, literal or
-            // function-call reading applies, which is the whole point of quoting.
             .qident => return self.mk(.{ .field = try self.parseQualNameField() }),
             .ident => {
                 if (eqlNoCase(t.text, "null")) {
@@ -4660,14 +4271,9 @@ pub const Parser = struct {
                 }
                 if (eqlNoCase(t.text, "case")) return self.parseCaseExpr();
                 if (eqlNoCase(t.text, "extract") and self.peekTag() == .lparen) {
-                    // `EXTRACT(minute FROM ts)` — SQL spells this argument list
-                    // with a keyword instead of a comma; normalise it to the
-                    // ordinary two-argument call the evaluator knows.
                     _ = self.advance();
                     _ = self.advance();
                     const unit = try self.expectColName();
-                    // Both spellings: `EXTRACT(minute FROM ts)` and the plain
-                    // two-argument call `extract('minute', ts)`.
                     if (!self.eatKw("from")) _ = try self.expect(.comma);
                     const src = try self.parseExpr();
                     _ = try self.expect(.rparen);
@@ -4677,8 +4283,6 @@ pub const Parser = struct {
                     return self.mk(.{ .call = .{ .name = "extract", .args = xargs } });
                 }
                 if ((eqlNoCase(t.text, "cast") or eqlNoCase(t.text, "try_cast")) and self.peekTag() == .lparen) {
-                    // `TRY_CAST` is `CAST` with the failure mode flipped: same
-                    // syntax, same target types, null instead of an error.
                     const safe = eqlNoCase(t.text, "try_cast");
                     _ = self.advance();
                     _ = self.advance();
@@ -4688,8 +4292,6 @@ pub const Parser = struct {
                     _ = try self.expect(.rparen);
                     return self.mk(.{ .cast = .{ .e = e, .ty = ty, .safe = safe } });
                 }
-                // `IDENTIFIER(<expr>)` names a column computed per row: a field whose
-                // name is a `${...}` template, rendered before the pipeline is planned.
                 if (eqlNoCase(t.text, "identifier") and self.peekTag() == .lparen)
                     return self.mk(.{ .field = try self.parseColRef() });
                 if (eqlNoCase(t.text, "if") and self.peekTag() == .lparen) {
@@ -4728,15 +4330,11 @@ pub const Parser = struct {
                     }
                     _ = try self.expect(.rparen);
                     const lower = try std.ascii.allocLowerString(self.arena, t.text);
-                    // An aggregate folds one argument; a second used to be dropped
-                    // without a word, so `SUM(x, id)` answered `SUM(x)`.
                     if (aggregates.lookup(lower)) |f| if (args.items.len > aggregates.spec(f).max_args)
                         return self.fail(.{ .line = t.line, .col = t.col }, "`{s}` takes one argument, not {d}", .{ lower, args.items.len });
-                    // the name alone: an error about the call is about its name
                     const name_span = ast.Span{ .start = .{ .line = t.line, .col = t.col }, .end = .{ .line = t.end_line, .col = t.end_col } };
                     return self.mk(.{ .call = .{ .name = lower, .args = try args.toOwnedSlice(), .distinct = call_distinct, .span = name_span } });
                 }
-                // inside a lambda's body, its parameter — not a column of that name
                 if (self.peekTag() != .dot) if (self.lambdaParam(t.text)) |name| {
                     _ = self.advance();
                     return self.mk(.{ .lambda_var = name });
@@ -4823,7 +4421,6 @@ fn binOpText(op: ast.BinOp) []const u8 {
     };
 }
 
-/// The conjuncts of `e`, its top-level ANDs taken apart.
 fn splitAnd(e: *ast.Expr, out: *std.array_list.Managed(*ast.Expr)) !void {
     if (e.* == .binary and e.binary.op == .@"and") {
         try splitAnd(e.binary.l, out);
@@ -4863,23 +4460,19 @@ test "sql expr: bitwise precedence slots between comparisons and additive" {
     const a = ar.allocator();
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
 
-    // `1 | 2 & 3` is `1 | (2 & 3)`
     const or_e = try parseExprStr(a, "1 | 2 & 3", &diag);
     try testing.expectEqual(ast.BinOp.bit_or, or_e.binary.op);
     try testing.expectEqual(@as(i64, 1), or_e.binary.l.int_lit);
     try testing.expectEqual(ast.BinOp.bit_and, or_e.binary.r.binary.op);
 
-    // `flags & 4 = 4` is a comparison of the AND
     const cmp = try parseExprStr(a, "flags & 4 = 4", &diag);
     try testing.expectEqual(ast.BinOp.eq, cmp.binary.op);
     try testing.expectEqual(ast.BinOp.bit_and, cmp.binary.l.binary.op);
 
-    // `1 + 1 << 2` is `(1 + 1) << 2`
     const sh = try parseExprStr(a, "1 + 1 << 2", &diag);
     try testing.expectEqual(ast.BinOp.shl, sh.binary.op);
     try testing.expectEqual(ast.BinOp.add, sh.binary.l.binary.op);
 
-    // `a ^ b | c` is `(a ^ b) | c`; `2 * 3 & 1` is `(2 * 3) & 1`
     const xo = try parseExprStr(a, "a ^ b | c", &diag);
     try testing.expectEqual(ast.BinOp.bit_or, xo.binary.op);
     try testing.expectEqual(ast.BinOp.bit_xor, xo.binary.l.binary.op);
@@ -4887,7 +4480,6 @@ test "sql expr: bitwise precedence slots between comparisons and additive" {
     try testing.expectEqual(ast.BinOp.bit_and, ml.binary.op);
     try testing.expectEqual(ast.BinOp.mul, ml.binary.l.binary.op);
 
-    // `~` binds like the other unaries; `and` is looser than every bitwise op
     const bn = try parseExprStr(a, "~x & 1", &diag);
     try testing.expectEqual(ast.BinOp.bit_and, bn.binary.op);
     try testing.expectEqual(ast.UnOp.bit_not, bn.binary.l.unary.op);
@@ -4895,7 +4487,6 @@ test "sql expr: bitwise precedence slots between comparisons and additive" {
     try testing.expectEqual(ast.BinOp.@"and", an.binary.op);
     try testing.expectEqual(ast.BinOp.bit_and, an.binary.l.binary.op);
 
-    // `||` is still concat, not two bitwise ORs
     const cc = try parseExprStr(a, "a || b", &diag);
     try testing.expectEqualStrings("concat", cc.call.name);
 
@@ -4933,11 +4524,9 @@ test "sql: EXPLAIN is a statement anywhere in a script, not only the first" {
         \\EXPLAIN WITH paid AS (SELECT id, amount FROM 'in.csv' WHERE status = 'paid')
         \\SELECT id FROM paid;
     );
-    // Not the first token, so the program-level prefix stays untouched.
     try testing.expectEqual(ast.ExplainMode.none, prog.explain);
     try testing.expectEqual(@as(usize, 4), prog.stmts.len);
     try testing.expect(prog.stmts[1] == .connection);
-    // The CTE stays an ordinary binding; only the pipeline it feeds is explained.
     try testing.expect(prog.stmts[2] == .binding);
     try testing.expectEqualStrings("paid", prog.stmts[2].binding.name);
     try testing.expect(prog.stmts[3] == .explain);
@@ -4978,7 +4567,6 @@ test "sql: an aggregate refuses a second argument instead of dropping it" {
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT SUM(x, id) AS s FROM 'in.csv';", &diag));
     try testing.expectEqualStrings("`sum` takes one argument, not 2", diag.msg);
     try testing.expectEqual(@as(u32, 8), diag.col);
-    // Inside an expression too, where the call is lifted out of it.
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT round(stddev(x, 2), 2) AS s FROM 'in.csv';", &diag));
     try testing.expectEqualStrings("`stddev` takes one argument, not 2", diag.msg);
     _ = try parseSource(a, "SELECT COUNT(*) AS a, COUNT(DISTINCT x) AS b, SUM(x) AS c FROM 'in.csv';", &diag);
@@ -4989,7 +4577,6 @@ test "sql: an aggregate with no window form says so before OVER" {
     defer ar.deinit();
     const a = ar.allocator();
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    // It used to parse as a plain aggregate and blame a GROUP BY the query never had.
     inline for (.{ "median", "stddev" }) |f| {
         try testing.expectError(error.ParseFailed, parseSource(a, "SELECT g, " ++ f ++ "(x) OVER (PARTITION BY g) AS s FROM 'in.csv';", &diag));
         try testing.expect(std.mem.startsWith(u8, diag.msg, "`" ++ f ++ "` is not a window function"));
@@ -5012,7 +4599,6 @@ test "sql: a table function lowers each call to a binding, its parameters bound 
     try testing.expect(prog.stmts[1].func.body == .table);
     const b = prog.stmts[2].binding;
     try testing.expect(std.mem.startsWith(u8, b.name, "__tvf") and std.mem.endsWith(u8, b.name, "_paid"));
-    // `$minx` is the argument itself, not a reference left for later.
     const f = b.pipeline.stages[1].node.filter;
     try testing.expectEqual(@as(i64, 8), f.binary.r.int_lit);
     try testing.expectEqualStrings(b.name, prog.stmts[3].output.stages[0].node.ref);
@@ -5030,7 +4616,6 @@ test "sql: two calls in one query get their own bindings, the body's CTEs includ
     , &diag);
     var names = std.array_list.Managed([]const u8).init(a);
     for (prog.stmts) |st| if (st == .binding) try names.append(st.binding.name);
-    // two `s`es and two calls, every one distinct; the plain name `s` is never bound
     try testing.expectEqual(@as(usize, 4), names.items.len);
     for (names.items, 0..) |n, i| {
         try testing.expect(!std.mem.eql(u8, n, "s"));
@@ -5055,7 +4640,6 @@ test "sql: a table function call is checked where it is written" {
         try testing.expectError(error.ParseFailed, parseSource(a, try std.mem.concat(a, u8, &.{ decl, c.q }), &diag));
         try testing.expectEqualStrings(c.msg, diag.msg);
     }
-    // The body is checked at its declaration, not at the first call.
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     try testing.expectError(error.ParseFailed, parseSource(a, "CREATE FUNCTION bad() RETURNS TABLE AS SELECT id FROM 'o.csv' WHERE;", &diag));
     try testing.expectEqual(@as(u32, 1), diag.line);
@@ -5074,16 +4658,11 @@ test "sql: a lambda's parameter is its own node in the body, never a column" {
     try testing.expectEqualStrings("t", l.params[0]);
     const lhs = l.body.binary.l.binary;
     try testing.expectEqualStrings("t", lhs.l.lambda_var);
-    // a column named in the body stays a column
     try testing.expectEqualStrings("name", lhs.r.field.parts[0]);
-    // outside the lambda, `t` is a column again
     const p2 = try parseSource(a, "SELECT json_any(tags, t -> t = 1) AS v, t FROM 'in.csv';", &diag);
     try testing.expect(p2.stmts[1].output.stages[1].node.select[1] == .field);
-    // `->` was a syntax error before; `a - > b` still is
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT a - > b AS z FROM 'in.csv';", &diag));
 
-    // several parameters in parentheses, one in parentheses, and a parenthesised
-    // argument that is not a lambda
     const p3 = try parseSource(a, "SELECT json_reduce(tags, 0, (acc, t, i) -> acc + t + i) AS v FROM 'in.csv';", &diag);
     const l3 = p3.stmts[1].output.stages[1].node.select[0].computed.expr.call.args[2].lambda;
     try testing.expectEqual(@as(usize, 3), l3.params.len);
@@ -5118,7 +4697,6 @@ test "sql: JOIN LATERAL refuses a body the join could not apply per row" {
             return error.TestUnexpectedResult;
         }
     }
-    // Without LATERAL, a column argument says how to pass one.
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     try testing.expectError(error.ParseFailed, parseSource(a, "CREATE FUNCTION f(p) RETURNS TABLE AS SELECT x FROM 't.csv' WHERE k = $p; SELECT o.id FROM 'o.csv' o CROSS JOIN f(o.id) i;", &diag));
     try testing.expect(std.mem.indexOf(u8, diag.msg, "JOIN LATERAL") != null);
@@ -5204,8 +4782,6 @@ test "sql: a name used for two tables in one FROM is refused where it repeats" {
     const a = ar.allocator();
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
 
-    // Aliases resolve by name at parse time, so a second `r` sent every `r.x` to
-    // the first one, and the error named a column that exists — in the other `r`.
     try testing.expectError(error.ParseFailed, parseSource(a,
         \\SELECT r.b FROM (SELECT a FROM 'x.csv') r JOIN (SELECT b FROM 'y.csv') r ON r.a = r.b;
     , &diag));
@@ -5217,7 +4793,6 @@ test "sql: a name used for two tables in one FROM is refused where it repeats" {
     , &diag));
     try testing.expect(std.mem.indexOf(u8, diag.msg, "`p` names two tables") != null);
 
-    // An unaliased self-join has one name per side and keeps working.
     _ = try parseTest(a, "WITH p AS (SELECT a FROM 'x.csv') SELECT a FROM p JOIN p ON a = a;");
 }
 
@@ -5229,7 +4804,6 @@ test "sql: a path or a connection's table on a JOIN's right side reads in a bind
         \\CREATE CONNECTION sr TYPE starrocks OPTIONS (host = 'h', database = 'd');
         \\SELECT * FROM 'x.xlsx' AS xl JOIN sr.db.t AS t ON t.id = xl.id JOIN 'y.csv' y WITH (delimiter = ';') ON y.k = xl.k;
     );
-    // two reads lowered to bindings, ahead of the statement that joins them
     const t_read = prog.stmts[2].binding;
     try testing.expectEqualStrings("__derived1_t", t_read.name);
     try testing.expectEqualStrings("sr", t_read.pipeline.stages[0].node.read.connector);
@@ -5249,7 +4823,6 @@ test "sql: ON beyond keys — the right side alone narrows it, the rest of an in
     const prog = try parseTest(a,
         \\SELECT * FROM 'a.csv' AS a JOIN 'b.csv' AS b ON 1 = 1 AND b.del <> '*' AND b.id = a.id AND a.v = 'x';
     );
-    // b's read, then b narrowed by `1 = 1 AND del <> '*'` in its own names
     const narrowed = prog.stmts[2].binding;
     try testing.expectEqualStrings("__derived2_on", narrowed.name);
     try testing.expectEqualStrings("__derived1_b", narrowed.pipeline.stages[0].node.ref);
@@ -5259,7 +4832,6 @@ test "sql: ON beyond keys — the right side alone narrows it, the rest of an in
     try testing.expectEqualStrings("__derived2_on", st[1].node.join.binding);
     try testing.expectEqualStrings("b", st[1].node.join.alias);
     try testing.expectEqual(@as(usize, 1), st[1].node.join.left_keys.len);
-    // `a.v = 'x'` after the join
     try testing.expect(st[2].node == .filter);
 
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
@@ -5276,13 +4848,11 @@ test "sql: a computed key in ON — each side computes its own column, dropped a
     const prog = try parseTest(a,
         \\SELECT * FROM 'a.csv' AS a JOIN 'b.csv' AS b ON trim(b.code) = cast(a.code AS string) AND b.del <> '*';
     );
-    // b: read, then narrowed and its key computed
     const rb = prog.stmts[2].binding.pipeline.stages;
     try testing.expect(rb[1].node == .filter);
     try testing.expect(rb[2].node.select[0] == .star);
     try testing.expectEqualStrings("code", rb[2].node.select[1].computed.expr.call.args[0].field.parts[0]);
     const st = prog.stmts[3].output.stages;
-    // a computes its key before the join, and the keys go after it
     try testing.expect(st[1].node.select[0] == .star);
     const lk = st[1].node.select[1].computed.name;
     const j = st[2].node.join;
@@ -5306,7 +4876,6 @@ test "sql: multi-key ON, RIGHT/FULL/CROSS join kinds, and the plain-column rule"
     try testing.expectEqual(@as(usize, 2), j.left_keys.len);
     try testing.expectEqualStrings("id", j.left_keys[0].parts[0]);
     try testing.expectEqualStrings("id", j.right_keys[0].parts[0]);
-    // Written `r.day = t.day`, so the pair has to be flipped back.
     try testing.expectEqualStrings("day", j.left_keys[1].parts[0]);
     try testing.expectEqualStrings("day", j.right_keys[1].parts[0]);
 
@@ -5326,7 +4895,6 @@ test "sql: multi-key ON, RIGHT/FULL/CROSS join kinds, and the plain-column rule"
     try testing.expectEqual(ast.JoinKind.cross, cj.kind);
     try testing.expectEqual(@as(usize, 0), cj.left_keys.len);
 
-    // CROSS JOIN UNNEST still expands rows rather than pairing them.
     const up = try parseTest(a,
         \\LOAD INTO 'out.csv' AS
         \\SELECT * FROM 'in.csv' CROSS JOIN UNNEST(tags) AS tag;
@@ -5334,7 +4902,6 @@ test "sql: multi-key ON, RIGHT/FULL/CROSS join kinds, and the plain-column rule"
     try testing.expect(up.stmts[1].output.stages[1].node == .explode);
 
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    // a computed key is a key: `t` computes it before the join
     const ck = try parseTest(a,
         \\LOAD INTO 'out.csv' AS
         \\WITH r AS (SELECT id FROM 'r.csv')
@@ -5362,8 +4929,6 @@ test "sql: plain UNION [ALL] lines up by position; INTERSECT binds tighter than 
     defer ar.deinit();
     const a = ar.allocator();
 
-    // Every positional branch is a general query — a bound pipeline — and a plain
-    // UNION deduplicates with a whole-row DISTINCT after the union.
     const all = try parseTest(a, "SELECT k FROM 'x.csv' UNION ALL SELECT k FROM 'y.csv';");
     const ua = all.stmts[all.stmts.len - 1].output.stages;
     try testing.expect(ua[0].node.union_.positional);
@@ -5374,14 +4939,11 @@ test "sql: plain UNION [ALL] lines up by position; INTERSECT binds tighter than 
     const ud = dis.stmts[dis.stmts.len - 1].output.stages;
     try testing.expect(ud[1].node == .distinct);
 
-    // `a UNION b UNION ALL c`: a ∪ b is deduplicated first, and c appended to it.
     const mixed = try parseTest(a, "SELECT k FROM 'x.csv' UNION SELECT k FROM 'y.csv' UNION ALL SELECT k FROM 'z.csv';");
     const um = mixed.stmts[mixed.stmts.len - 1].output.stages;
     try testing.expectEqual(@as(usize, 2), um[0].node.union_.branches.len);
     try testing.expect(um[1].node != .distinct);
 
-    // `a UNION b INTERSECT c` is `a UNION (b INTERSECT c)`: the outer step is the
-    // union, and its right branch reads the intersect.
     const prec = try parseTest(a, "SELECT k FROM 'x.csv' UNION SELECT k FROM 'y.csv' INTERSECT SELECT k FROM 'z.csv';");
     const up = prec.stmts[prec.stmts.len - 1].output.stages;
     try testing.expectEqual(ast.SetOp.union_all, up[0].node.union_.set);
@@ -5407,8 +4969,6 @@ test "sql: long IN lists and AND/OR chains are balanced; deeper nesting is an er
     defer ar.deinit();
     const a = ar.allocator();
 
-    // A 5000-element IN list was a 5000-deep OR chain: `check` passed, and every
-    // recursive pass in `run` then overflowed the stack.
     var src = std.array_list.Managed(u8).init(a);
     try src.appendSlice("SELECT id FROM 'x.csv' WHERE id IN (");
     for (0..5000) |i| try src.writer().print("{s}{d}", .{ if (i == 0) "" else ",", i });
@@ -5557,7 +5117,6 @@ test "sql: EACH TABLE OF (SELECT ...) parses an in-engine discovery pipeline" {
     const u = pl.stages[0].node.union_;
     try testing.expectEqual(@as(usize, 0), u.discover_query.len);
     try testing.expectEqual(@as(usize, 0), u.discover_json.len);
-    // The branch connection is inferred from the discovery query's own source.
     try testing.expectEqualStrings("cat", u.discover_conn);
     const disc = u.discover_pipeline orelse return error.TestExpectedPipeline;
     try testing.expect(disc.stages[0].node == .read);
@@ -5825,7 +5384,6 @@ test "sql: http reads — GET/POST calls, connection clauses, resources" {
     try testing.expectEqualStrings("post", hintStr(post.hints, "method").?);
     try testing.expectEqualStrings(" {\"q\": 1} ", hintStr(post.hints, "body").?);
 
-    // A resource expands to its read; the read's own clauses come after, so win.
     const res = prog.stmts[5].output.stages[0];
     try testing.expectEqualStrings("/countries", res.node.read.form.path);
     try testing.expectEqualStrings("europe", hintStr(res.hints, "query:region").?);
@@ -5934,8 +5492,6 @@ test "sql: LOAD INTO IDENTIFIER without a literal extension is a parse error" {
     defer ar.deinit();
     const a = ar.allocator();
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    // The extension picks the writer and decides which dispositions are legal,
-    // so it has to be known before any row is read.
     const r = parseSource(a, "LOAD INTO IDENTIFIER('dir/' || name) AS SELECT * FROM 'in.csv';", &diag);
     try testing.expectError(error.ParseFailed, r);
     try testing.expect(std.mem.indexOf(u8, diag.msg, "literal extension") != null);
@@ -5950,7 +5506,6 @@ test "sql: a computed GROUP BY key keeps the columns a CASE inside an aggregate 
         \\FROM 't.csv' GROUP BY CAST(DATE_TRUNC('month', d) AS DATE);
     );
     const stages = prog.stmts[1].output.stages;
-    // read | select (pre-aggregation) | aggregate | write
     try std.testing.expect(stages[1].node == .select);
     var has_status = false;
     for (stages[1].node.select) |it| {
@@ -6083,8 +5638,7 @@ fn firstPipelineStages(prog: ast.Program) []const ast.Stage {
     unreachable;
 }
 
-/// Index of the aggregate stage. A pipeline ends in a write, so counting back
-/// from the end finds that instead.
+/// Index of the aggregate stage, counted from the front: the pipeline ends in a write.
 fn aggStageIndex(st: []const ast.Stage) usize {
     for (st, 0..) |s, i| {
         if (s.node == .aggregate) return i;
@@ -6092,10 +5646,6 @@ fn aggStageIndex(st: []const ast.Stage) usize {
     unreachable;
 }
 
-// `round(avg(x), 2)` is ordinary SQL that basalt rejected: an item that was not
-// itself an aggregate call fell through to the group-key rule, whose message
-// named a GROUP BY the query did not have. The calls now move to the aggregate
-// stage and the arithmetic around them becomes a projection over its output.
 test "sql: an aggregate inside a scalar expression lifts to the aggregate stage" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -6104,7 +5654,6 @@ test "sql: an aggregate inside a scalar expression lifts to the aggregate stage"
     const prog = try parseTest(a, "SELECT g, ROUND(AVG(v), 2) AS m FROM 'x.csv' GROUP BY g;");
     const st = firstPipelineStages(prog);
 
-    // read -> aggregate -> select, the projection being what evaluates round()
     const ai = aggStageIndex(st);
     const agg = st[ai].node.aggregate;
     try testing.expectEqual(@as(usize, 1), agg.aggs.len);
@@ -6115,7 +5664,6 @@ test "sql: an aggregate inside a scalar expression lifts to the aggregate stage"
     try testing.expectEqual(@as(usize, 2), sel.len);
     try testing.expectEqualStrings("g", sel[0].field.last());
     try testing.expectEqualStrings("m", sel[1].computed.name);
-    // round's first argument is now the column the aggregate produced
     const arg0 = sel[1].computed.expr.call.args[0];
     try testing.expectEqualStrings("avg(v)", arg0.field.last());
 }
@@ -6132,8 +5680,6 @@ test "sql: one aggregate mentioned twice becomes a single output column" {
     try testing.expectEqualStrings("s", agg.aggs[0].name);
 }
 
-// HAVING is allowed to filter on an aggregate the SELECT list never asked for.
-// It was rejected with "unknown field `count(*)`", because nothing computed it.
 test "sql: HAVING may name an aggregate the SELECT list omits" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -6147,17 +5693,12 @@ test "sql: HAVING may name an aggregate the SELECT list omits" {
     try testing.expectEqual(@as(usize, 2), agg.aggs.len);
     try testing.expectEqualStrings("count(*)", agg.aggs[1].name);
 
-    // ...and the extra column is projected away again, so it never reaches
-    // output. The filter (HAVING) sits between, hence ai + 2.
     const sel = st[ai + 2].node.select;
     try testing.expectEqual(@as(usize, 2), sel.len);
     try testing.expectEqualStrings("g", sel[0].field.last());
     try testing.expectEqualStrings("m", sel[1].field.last());
 }
 
-// BETWEEN desugars to the pair of comparisons rather than becoming a node of
-// its own, so everything downstream — the type checker, the evaluator, and
-// above all pushdown — sees a shape it already handles.
 test "sql: BETWEEN lowers to >= AND <=" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -6192,9 +5733,6 @@ test "sql: NOT BETWEEN negates the whole range" {
     try testing.expectEqual(ast.BinOp.@"and", f.?.unary.e.binary.op);
 }
 
-// `SELECT x AS y ... GROUP BY x` is ordinary SQL. It was rejected unless the
-// GROUP BY named the alias, because the rename was attempted before the
-// aggregate rather than after it.
 test "sql: a grouping key may be aliased in the SELECT list" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -6211,9 +5749,6 @@ test "sql: a grouping key may be aliased in the SELECT list" {
     try testing.expectEqualStrings("n", sel[1].field.last());
 }
 
-// A column that is neither aggregated nor grouped has no one value per group.
-// It used to be dropped from the output silently, which turns a malformed query
-// into a plausible-looking wrong answer.
 test "sql: an ungrouped column is refused, not silently dropped" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -6225,10 +5760,6 @@ test "sql: an ungrouped column is refused, not silently dropped" {
     try testing.expect(std.mem.indexOf(u8, diag.msg, "`v`") != null);
 }
 
-// `"..."` was a second string syntax inherited from BSL, so `SELECT "Exchange
-// rate"` silently produced that constant repeated down the column instead of
-// the column itself — there was no spelling that reached a name with a space in
-// it. It is the ANSI quoted identifier now; `'...'` is the only string.
 test "sql: a double-quoted name is a column reference, not a string" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -6252,8 +5783,6 @@ test "sql: single quotes still make a string" {
     try testing.expectEqualStrings("Exchange rate", sel[0].computed.expr.str_lit);
 }
 
-// A quoted name is never read as a keyword, which is the other half of why
-// quoting exists: a column may legitimately be called `select` or `from`.
 test "sql: a quoted name that spells a keyword is still a column" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -6283,10 +5812,6 @@ test "sql: an empty quoted name is a lex error, not an empty column" {
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT \"\" FROM 'x.csv';", &diag));
 }
 
-// §6 documents `PUSHDOWN(...)` on a discovered union — one raw predicate
-// descended into every branch — but no clause was ever parsed there, so the
-// documented example was a syntax error. The runtime already applied a `where`
-// hint to each branch; only the spelling was missing.
 test "sql: PUSHDOWN on a discovered union becomes a per-branch where hint" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -6313,8 +5838,6 @@ test "sql: PUSHDOWN on a discovered union becomes a per-branch where hint" {
     try testing.expect(saw_canon);
 }
 
-// The two clauses are order-independent, so a script that names the anchor
-// first is not a syntax error.
 test "sql: ANCHOR SCHEMA before PUSHDOWN parses the same" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -6395,11 +5918,9 @@ test "sql: IN (SELECT ...) lifts to a semi join stage beside the filter" {
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
 
     const prog = try parseSource(a, "SELECT k FROM 'f.csv' WHERE v < 10 AND k IN (SELECT k FROM 'd.csv') AND v > 2;", &diag);
-    // The subquery becomes a binding ahead of the output statement.
     try testing.expect(prog.stmts[1] == .binding);
     const bname = prog.stmts[1].binding.name;
     const stages = prog.stmts[2].output.stages;
-    // read | filter (both remaining conjuncts, IN dropped) | semi join | select
     try testing.expect(stages[1].node == .filter);
     try testing.expect(!containsTrueLit(stages[1].node.filter));
     try testing.expect(stages[2].node == .join);
@@ -6408,15 +5929,14 @@ test "sql: IN (SELECT ...) lifts to a semi join stage beside the filter" {
     try testing.expectEqualStrings("k", stages[2].node.join.left_keys[0].parts[0]);
     try testing.expectEqualStrings("k", stages[2].node.join.right_keys[0].parts[0]);
 
-    // NOT IN is the anti join; the IN being the whole WHERE leaves no filter.
     const prog2 = try parseSource(a, "SELECT k FROM 'f.csv' WHERE k NOT IN (SELECT k FROM 'd.csv');", &diag);
     const st2 = prog2.stmts[2].output.stages;
     try testing.expect(st2[1].node == .join);
     try testing.expectEqual(ast.JoinKind.anti, st2[1].node.join.kind);
 }
 
-/// True when a `bool_lit true` survives anywhere in the tree — a leftover
-/// sentinel would read as an always-true conjunct, silently widening a filter.
+/// Whether a `bool_lit true` survives in the tree; a leftover sentinel would read as
+/// an always-true conjunct.
 fn containsTrueLit(e: *const ast.Expr) bool {
     return switch (e.*) {
         .bool_lit => |b| b,
@@ -6435,7 +5955,6 @@ test "sql: IN (SELECT ...) under OR / outside WHERE / multi-column are parse err
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'f.csv' WHERE v = 1 OR k IN (SELECT k FROM 'd.csv');", &diag));
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT (k IN (SELECT k FROM 'd.csv')) AS f FROM 'f.csv';", &diag));
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'f.csv' WHERE k IN (SELECT k, v FROM 'd.csv');", &diag));
-    // The literal-list form is untouched by any of this.
     const prog = try parseSource(a, "SELECT k FROM 'f.csv' WHERE k IN (1, 2, 3);", &diag);
     try testing.expect(prog.stmts[1].output.stages[1].node == .filter);
 }
@@ -6451,11 +5970,9 @@ test "sql: scalar subquery desugars to a query LET ahead of the statement" {
     const l = prog.stmts[1].let_const;
     try testing.expect(l.expr == null);
     try testing.expect(l.query != null);
-    // The reference left behind is a field ref carrying the LET's name.
     const filt = prog.stmts[2].output.stages[1].node.filter;
     try testing.expectEqualStrings(l.name, filt.binary.r.field.parts[0]);
 
-    // Explicit form: LET x = (SELECT ...);
     const prog2 = try parseSource(a, "LET hi = (SELECT max(v) FROM 'f.csv');\nSELECT k FROM 'f.csv' WHERE v > $hi;", &diag);
     try testing.expect(prog2.stmts[1] == .let_const);
     try testing.expect(prog2.stmts[1].let_const.query != null);
@@ -6485,7 +6002,6 @@ test "parse with recovery: every statement that fails is recorded, the rest stil
     };
     try testing.expectEqual(@as(usize, 3), outputs);
 
-    // inside a FOR body the next `;` is not the statement's end: stop there
     errs.clearRetainingCapacity();
     _ = try parseSourceOpts(a,
         \\SELECT 1 AS x;
@@ -6497,7 +6013,6 @@ test "parse with recovery: every statement that fails is recorded, the rest stil
     , &diag, .{ .errors = &errs });
     try testing.expectEqual(@as(usize, 1), errs.items.len);
 
-    // without an error list, the first error still fails the parse
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT 1 +; SELECT 2 AS y;", &diag));
 }
 
@@ -6537,7 +6052,6 @@ test "sql: a select item's alias may omit AS, but not swallow the clause after i
 
     const prog = try parseTest(a, "SELECT category, SUM(value) total, MAX(value) \"top\" FROM 'in.csv' GROUP BY category;");
     try testing.expect(prog.stmts.len == 2);
-    // `FROM`, `WHERE`, `GROUP` after an item are clauses, not names
     _ = try parseTest(a, "SELECT id FROM 'in.csv' WHERE id > 1 ORDER BY id LIMIT 2;");
     _ = try parseTest(a, "SELECT 1 x, 'a' y;");
 }

@@ -1,24 +1,30 @@
-//! `@include 'path.sql';` — C-style composition, resolved before parsing.
+//! `@include 'path.sql';`: C-style composition, resolved before parsing.
 //!
-//! Directives may only appear at the TOP of a script (blank lines and `--`
-//! comments may sit between them); one file per directive. Paths resolve
-//! relative to the INCLUDING file's directory — for `-c` scripts, stdin and the
-//! REPL that is the process cwd. Each included file is parsed on its own, so a
-//! syntax error inside it reports ITS line numbers under ITS name; the resulting
-//! statements are prepended to the includer's, in include order. A file is
-//! spliced in once, at its first include — two libraries that both include a
-//! third share one copy of it, as `#pragma once` would have it.
+//! Directives may only appear at the top of a script (blank lines and `--`
+//! comments may sit between them), one file per directive; a later one is a hard
+//! error, not an ignored line. Paths resolve relative to the including file's
+//! directory; for `-c` scripts, stdin and the REPL that is the process cwd. Each
+//! included file is parsed on its own, so a syntax error inside it reports its
+//! own line numbers under its own name (`Diag.label`, which callers must print
+//! instead of the top-level path). The includer is parsed with the directive
+//! region blanked to newlines, so its line numbers stay real, and it sees the
+//! connections and table functions its includes declared, as if written above it.
 //!
-//! Nothing is filtered: an included file may declare connections, params,
-//! functions or whole pipelines, and they all become part of the program. The one
-//! structural fixup is the kind decl: the parser puts one at `stmts[0]` of every
-//! program it returns (batch unless the script says `CREATE ENDPOINT`), and the
-//! runtime and the HTTP server both read it there — so the merged program keeps
-//! exactly one, the includer's, unless only an included file declares an endpoint.
+//! A file is spliced in once, at its first include, as `#pragma once` would have
+//! it: two libraries that both include a third share one copy. Splicing per path
+//! once defined shared `CREATE FUNCTION`s twice and made diamond-shaped trees
+//! exponential. Nothing is filtered: an included file may declare connections,
+//! params, functions or whole pipelines. The one structural fixup is the kind
+//! decl the parser puts at `stmts[0]` of every program (batch unless the script
+//! says `CREATE ENDPOINT`), which the runtime and the HTTP server read there: the
+//! merged program keeps exactly one, the includer's, unless only an included file
+//! declares an endpoint.
 //!
-//! Cycles are detected on canonical absolute paths and the nesting depth is
-//! capped; both report the offending directive's position in the file that
-//! wrote it.
+//! Cycles are detected on canonical absolute paths and nesting is capped at
+//! `max_depth` (with `max_total_stmts` as a backstop); both report the offending
+//! directive's position in the file that wrote it. The root joins the cycle stack
+//! only when it is a real file. The AST slices into the include texts read here,
+//! so the arena must outlive the program.
 
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -26,30 +32,18 @@ const parser = @import("sql_parser.zig");
 
 pub const Error = parser.Error;
 
-/// A located diagnostic plus the file it belongs to. Included files are parsed
-/// separately, so `parse.line`/`parse.col` are relative to `label` — callers must
-/// print `label`, not the top-level script path, or they will name the wrong file.
-/// Include failures (missing file, cycle, misplaced directive) use the same shape,
-/// positioned at the directive that caused them.
 pub const Diag = struct {
     parse: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 },
     label: []const u8 = "",
 };
 
-/// Nesting cap: deep enough for real layering, shallow enough that a pathological
-/// tree fails fast.
 const max_depth: u32 = 16;
 const max_file_bytes: usize = 8 << 20;
 
-/// Depth bounds nesting, not size. Each file is spliced in once, so the merged
-/// total is the sum of the files, not of the paths through them — this bounds it
-/// all the same, far above any real layering.
 const max_total_stmts: usize = 100_000;
 
-/// Parse `text` (named `label`, with `@include` paths resolved against `base_dir`)
-/// into one program. `base_dir` may be "" or "." for cwd-relative resolution.
-/// Everything is allocated in `arena`, and the AST slices into the include texts
-/// read here, so the arena must outlive the program.
+/// Parses `text` (named `label`, with `@include` paths resolved against `base_dir`,
+/// which may be "" or "." for the cwd) into one program, allocated in `arena`.
 pub fn loadProgram(
     arena: std.mem.Allocator,
     text: []const u8,
@@ -61,8 +55,8 @@ pub fn loadProgram(
 }
 
 /// `loadProgram` with the root script's parse options: `known_tables` apply
-/// throughout, `errors` (keep parsing past an error) to the root script alone —
-/// an included file is a library, and one that does not parse fails outright.
+/// throughout, `errors` (keep parsing past an error) to the root alone, since an
+/// included file is a library and one that does not parse fails outright.
 pub fn loadProgramOpts(
     arena: std.mem.Allocator,
     text: []const u8,
@@ -79,8 +73,6 @@ pub fn loadProgramOpts(
         .known_tables = opts.known_tables,
         .errors = opts.errors,
     };
-    // The root only joins the cycle stack when it is a real file (`-c`, stdin and
-    // the REPL have no path, and so can never be re-included).
     if (std.fs.cwd().realpathAlloc(arena, label)) |canon| {
         try ctx.stack.append(.{ .canon = canon, .shown = label });
     } else |_| {}
@@ -95,10 +87,6 @@ const Ctx = struct {
     arena: std.mem.Allocator,
     diag: *Diag,
     stack: std.array_list.Managed(Frame),
-    /// Canonical path -> the program it parsed to: every file already spliced into
-    /// the program, which a later include of it skips (`load`). A memoised file is
-    /// never re-entered, so cycle detection is unaffected: anything still on the
-    /// stack has not finished and cannot be here.
     memo: std.StringHashMap(ast.Program),
     depth: u32 = 0,
     stmt_budget: usize = max_total_stmts,
@@ -118,8 +106,6 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base_dir: []const u8) Er
     const skipped: u32 = @intCast(std.mem.count(u8, text[0..body_at], "\n"));
     try rejectLateIncludes(ctx, text[body_at..], label, skipped + 1);
 
-    // `subs` are spliced into this file's program; `seen` are every include it
-    // names, whose declarations it may use either way.
     var subs = std.array_list.Managed(ast.Program).init(ctx.arena);
     var seen = std.array_list.Managed(ast.Program).init(ctx.arena);
     for (incs.items) |d| {
@@ -133,10 +119,6 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base_dir: []const u8) Er
             if (!std.mem.eql(u8, f.canon, canon)) continue;
             return ctx.fail(label, d.line, d.col, "include cycle: {s}", .{try cycleTrail(ctx, i, resolved)});
         }
-        // Included once, like `#pragma once`: a file already in the program —
-        // through this includer or another, as when two libraries share a third —
-        // is not spliced in again, where its `CREATE FUNCTION`s would be defined
-        // twice. Its declarations are still this file's to use.
         if (canonical) if (ctx.memo.get(canon)) |cached| {
             try seen.append(cached);
             continue;
@@ -163,19 +145,14 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base_dir: []const u8) Er
         ctx.stmt_budget -= n;
     }
 
-    // A script whose whole body is directives contributes no statements of its
-    // own; parsing the blanked remainder would only report "empty program".
     const rest = try blankPrefix(ctx, text, body_at, incs.items.len);
     const has_body = incs.items.len == 0 or std.mem.trim(u8, rest, " \t\r\n").len > 0;
     var main: ?ast.Program = null;
     if (has_body) {
-        // The includer sees the connections its includes declared, as it would
-        // had they been written above it in one file.
         var known = std.array_list.Managed(ast.Connection).init(ctx.arena);
         var known_fns = std.array_list.Managed(ast.FnDecl).init(ctx.arena);
         for (seen.items) |sp| for (stmtsOf(sp)) |st| {
             if (st == .connection) try known.append(st.connection);
-            // A table function is expanded where it is called, while parsing.
             if (st == .func and st.func.body == .table) try known_fns.append(st.func);
         };
         var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
@@ -194,8 +171,6 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base_dir: []const u8) Er
     }
     if (incs.items.len == 0) return main.?;
 
-    // One kind decl survives: the includer's, unless only an included file
-    // declares an endpoint.
     var kind: ?ast.KindDecl = if (main) |m| leadKind(m) else null;
     var out = std.array_list.Managed(ast.Stmt).init(ctx.arena);
     for (subs.items) |sp| {
@@ -209,13 +184,11 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base_dir: []const u8) Er
     return .{ .stmts = try out.toOwnedSlice(), .explain = if (main) |m| m.explain else .none };
 }
 
-/// The kind decl the parser puts at `stmts[0]`, if this program has one.
 fn leadKind(p: ast.Program) ?ast.KindDecl {
     if (p.stmts.len == 0 or p.stmts[0] != .kind) return null;
     return p.stmts[0].kind;
 }
 
-/// A program's statements without its leading kind decl.
 fn stmtsOf(p: ast.Program) []const ast.Stmt {
     return if (leadKind(p) == null) p.stmts else p.stmts[1..];
 }
@@ -231,9 +204,8 @@ fn blankPrefix(ctx: *Ctx, text: []const u8, body_at: usize, n_directives: usize)
     return buf;
 }
 
-/// Collect the leading `@include` directives, returning the offset where the rest
-/// of the script starts. Blank lines and `--` comments between directives are
-/// skipped; the first other line ends the scan.
+/// Collects the leading `@include` directives and returns the offset where the
+/// rest of the script starts; the first line that is not blank, `--` or a directive ends the scan.
 fn scanDirectives(ctx: *Ctx, text: []const u8, label: []const u8, out: *std.array_list.Managed(Directive)) Error!usize {
     var off: usize = 0;
     var line: u32 = 1;
@@ -252,7 +224,6 @@ fn scanDirectives(ctx: *Ctx, text: []const u8, label: []const u8, out: *std.arra
     return off;
 }
 
-/// `@include '<path>';`, with an optional trailing `--` comment.
 fn parseDirective(ctx: *Ctx, s: []const u8, label: []const u8, line: u32, col: u32) Error![]const u8 {
     const syntax = "expected `@include 'path.sql';`";
     var rest = s["@include".len..];
@@ -272,9 +243,8 @@ fn parseDirective(ctx: *Ctx, s: []const u8, label: []const u8, line: u32, col: u
     return path;
 }
 
-/// A directive past the header is a hard error rather than a silently ignored
-/// line. Line-oriented: a literal `@include` at the start of a line inside a
-/// `$$…$$` block would be misread, which no real script does.
+/// Line-oriented: a literal `@include` at the start of a line inside a `$$…$$`
+/// block would be misread, which no real script does.
 fn rejectLateIncludes(ctx: *Ctx, rest: []const u8, label: []const u8, first_line: u32) Error!void {
     var off: usize = 0;
     var line = first_line;
@@ -296,7 +266,6 @@ fn resolvePath(ctx: *Ctx, base_dir: []const u8, path: []const u8) Error![]const 
     return std.fs.path.join(ctx.arena, &.{ base_dir, path });
 }
 
-/// `a.sql -> lib/b.sql -> a.sql`, from the stack entry that closes the loop.
 fn cycleTrail(ctx: *Ctx, from: usize, repeat: []const u8) Error![]const u8 {
     var buf = std.array_list.Managed(u8).init(ctx.arena);
     for (ctx.stack.items[from..]) |f| {
@@ -309,7 +278,6 @@ fn cycleTrail(ctx: *Ctx, from: usize, repeat: []const u8) Error![]const u8 {
 
 const testing = std.testing;
 
-/// Write `data` at `sub_path` under `tmp` (creating parent directories).
 fn writeFile(tmp: *std.testing.TmpDir, sub_path: []const u8, data: []const u8) !void {
     if (std.fs.path.dirname(sub_path)) |d| try tmp.dir.makePath(d);
     try tmp.dir.writeFile(.{ .sub_path = sub_path, .data = data });
@@ -331,7 +299,6 @@ test "@include prepends a decls file to the including script" {
         \\SELECT dbl(id) AS y FROM 'in.csv';
     , "main.sql", base, &diag);
 
-    // stmts[0] is the kind decl the parser always emits (batch here).
     try testing.expectEqual(@as(usize, 3), prog.stmts.len);
     try testing.expect(prog.stmts[0] == .kind);
     try testing.expectEqual(ast.Kind.batch, prog.stmts[0].kind.kind);
@@ -348,8 +315,6 @@ test "@include: an included PARAM may sit beside an aggregate, as a local one ma
     const base = try tmp.dir.realpathAlloc(a, ".");
     try writeFile(&tmp, "lib/params.sql", "PARAM tag STRING DEFAULT 'x';\n");
 
-    // The main file is parsed without the included declarations, and used to
-    // call `$tag` "neither an aggregate nor a grouping key".
     var diag: Diag = .{};
     const prog = try loadProgram(a,
         \\@include 'lib/params.sql';
@@ -368,8 +333,6 @@ test "@include: a table function declared in a library is called in the includer
     const base = try tmp.dir.realpathAlloc(a, ".");
     try writeFile(&tmp, "lib/tables.sql", "CREATE FUNCTION paid(minx INT) RETURNS TABLE AS SELECT id FROM 'o.csv' WHERE x >= $minx;\n");
 
-    // The call is expanded while the includer is parsed, so the declaration has
-    // to reach that parse the way an included connection does.
     var diag: Diag = .{};
     const prog = try loadProgram(a,
         \\@include 'lib/tables.sql';
@@ -448,7 +411,6 @@ test "@include cycle is reported with the file trail" {
     try testing.expect(std.mem.startsWith(u8, diag.parse.msg, "include cycle:"));
     try testing.expect(std.mem.indexOf(u8, diag.parse.msg, "a.sql") != null);
     try testing.expect(std.mem.indexOf(u8, diag.parse.msg, "b.sql") != null);
-    // Reported against the file holding the offending directive.
     try testing.expect(std.mem.endsWith(u8, diag.label, "b.sql"));
 }
 
@@ -463,8 +425,6 @@ test "a diamond @include DAG is parsed and spliced once per file, not once per p
     try writeFile(&tmp, "a.sql", "@include 'c.sql';\n");
     try writeFile(&tmp, "b.sql", "@include 'c.sql';\n");
 
-    // c is spliced in once, through a, the first arm that reaches it. Both arms
-    // splicing it defined `inc` twice, and the script failed as a duplicate.
     var diag: Diag = .{};
     const prog = try loadProgram(a,
         \\@include 'a.sql';
@@ -486,8 +446,6 @@ test "a fan-out @include tree is spliced once per file, so it neither hangs nor 
     defer tmp.cleanup();
     const base = try tmp.dir.realpathAlloc(a, ".");
 
-    // 12 levels of 4 siblings: 4^12 paths through ~1 KB of source, which used to
-    // be spliced once per path until the statement budget refused it.
     const levels = 12;
     for (0..levels) |i| {
         var body = std.array_list.Managed(u8).init(a);
@@ -510,8 +468,6 @@ test "@include: two libraries sharing a third may both be included" {
     defer tmp.cleanup();
     const base = try tmp.dir.realpathAlloc(a, ".");
     try writeFile(&tmp, "lib/stats.sql", "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');\nCREATE FUNCTION sd(x) AS x * 2;\n");
-    // each library uses what stats.sql declares — dispersion.sql too, though by
-    // the time it is read stats.sql is already in the program and not spliced again
     try writeFile(&tmp, "lib/outliers.sql", "@include 'stats.sql';\nCREATE FUNCTION outl(x) AS sd(x) + 1;\n");
     try writeFile(&tmp, "lib/dispersion.sql", "@include 'stats.sql';\nLET n = (SELECT COUNT(*) AS n FROM pg.public.t);\n");
 

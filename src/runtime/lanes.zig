@@ -1,6 +1,55 @@
 //! Parallel lane drivers: the shape classifiers that decide whether a pipeline
 //! can fan out, and the per-shape drivers (map, aggregate, top-N, distinct,
 //! SQL split, parquet/CSV morsels) plus their merge machinery.
+//!
+//! Shapes. `classifyLaneShape` picks one `LaneShape` per pipeline and each source's
+//! runner switches exhaustively over it, so a new shape does not compile until both
+//! parquet and CSV decide what to do with it; a source that cannot fan a shape out
+//! returns false and falls back to the serial driver explicitly. Below the shape,
+//! `LaneRows` is the only difference between the parquet and CSV copies of a lane
+//! body (row-group morsels off a shared queue vs one newline-aligned byte range),
+//! and `LaneSplit` names how the input divides so a shape has one implementation.
+//! Only right and full joins are kept off the lanes: they must emit unmatched build
+//! rows, and each lane tracking its own matches emitted them once per lane (a
+//! `RIGHT JOIN` under `COUNT(*)` returned 160 instead of 10 at `-j 16`). A join's
+//! build side is materialized once into a read-only index before any lane exists,
+//! and its post-join stages are prevalidated so a lane rebuild cannot fail; each
+//! lane still builds its own `op.Join` for its mutable stats and scratch.
+//!
+//! Determinism. Results do not depend on thread timing. Aggregates fold into one
+//! `AggSlot` per work item (or one fixed arithmetic slice of parquet morsels per
+//! lane, `MorselSource.fixed`) and are combined in item order, because float
+//! addition is not associative and merging as lanes finished made a float SUM
+//! differ between runs; a different `-j` still cuts the input differently, so only
+//! a DECIMAL cast is identical everywhere. An ungrouped aggregate folds straight
+//! into partition 0 in lane order (it has no key to hash, and the radix merge once
+//! dropped every lane, so COUNT(*) returned 0). Distinct dedups per positional item
+//! and breaks ties by input position, keeping the row a serial run keeps. A shared
+//! sink's map output goes through `OrderedOut`: lanes format units outside any
+//! lock, and whichever lane completes the next unit due writes it and the finished
+//! units behind it, at most `window` units ahead, so output is in file order at any
+//! `-j`. Writing under the lock had stalled every lane (parquet to CSV ran 50%
+//! slower), and reusing written units' arenas avoids faulting in fresh pages.
+//!
+//! Merging. Above `agg_combine_parallel_min` partial groups the combine is radix
+//! partitioned by key hash (`pq_parts`, the fold's own partition count), each
+//! partition owned by one task with no lock: a single O(partials) pass over a
+//! unique-key GROUP BY was slower at `-j 16` than serial. The largest source is
+//! merged into in place and the others freed as folded, since copying all of them
+//! doubled memory. Lane partition arenas use the thread-safe gpa, not per-slot or
+//! page allocators (64 page-backed arenas per lane cost 12% at -j 8). Merged groups
+//! under a tail that only filters and projects are written a partition at a time
+//! across lanes; ORDER BY + LIMIT in the tail fuse into a per-partition top-N (a
+//! full sort of the merged groups was 3x slower than serial).
+//!
+//! Descent. `wholeAggStages` and `topNStages` rewrite a SQL read into one grouped
+//! or capped QUERY-form read, dropping hints (a hinted `@[where]` would be reapplied
+//! to the wrong columns, a split has nothing left to split), and the caller rebuilds
+//! the pipeline through the ordinary serial path. The SQL split paths
+//! (`runParallelSqlAgg`, `runParallelSqlMapJoin`) run only against a live DB; the
+//! local tests cover them through the shared CSV/parquet machinery they reuse.
+//! A SQL map+join lane's `SplitSource` rolls to the next key range when one runs
+//! dry, so the lane builds its chain and opens its sink once.
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
@@ -55,12 +104,6 @@ const mapChainSchema = @import("plan.zig").mapChainSchema;
 const projectedColumns = @import("plan.zig").projectedColumns;
 const tailSchema = @import("plan.zig").tailSchema;
 
-/// The pipeline shapes a lane path can run, classified once for every source.
-///
-/// Each source's runner switches exhaustively over this, which is the point: a new
-/// shape does not compile until both sources decide what to do with it. A source that
-/// genuinely cannot fan a shape out returns false and falls back to the serial driver —
-/// explicitly, rather than by omission.
 const LaneShape = union(enum) {
     agg: AggShape,
     agg_join: AggJoinShape,
@@ -70,9 +113,8 @@ const LaneShape = union(enum) {
     map_join: MapJoinShape,
 };
 
-/// Order matters: `classifyAggPipeline` rejects a pipeline containing a join, so the
-/// join-carrying variant is tried after it, and the map shapes last — a map+join is
-/// only a map+join once nothing above it matched.
+/// Order matters: `classifyAggPipeline` rejects a join, so the join-carrying variant
+/// is tried after it, and the map shapes last.
 pub fn classifyLaneShape(stages: []const ast.Stage) ?LaneShape {
     if (classifyAggPipeline(stages)) |x| return .{ .agg = x };
     if (classifyAggJoinPipeline(stages)) |x| return .{ .agg_join = x };
@@ -83,11 +125,9 @@ pub fn classifyLaneShape(stages: []const ast.Stage) ?LaneShape {
     return null;
 }
 
-/// Preconditions every lane path shares. A hinted read is left to the paths that
-/// honour the hint, and one stage plus a write is nothing to split.
+/// Preconditions every lane path shares. A hinted read is left to the paths that honour
+/// the hint: any hint used to keep a read serial while EXPLAIN called it morsel-parallel.
 pub fn laneEligible(stages: []const ast.Stage, opts: RunOptions) bool {
-    // Any hint used to keep a read serial — a `delimiter = ';'` file ran on one
-    // thread at any `-j` while EXPLAIN called it morsel-parallel.
     return opts.threads > 1 and stages.len >= 2 and
         stages[0].node == .read and analyze.laneHints(stages[0]);
 }
@@ -106,9 +146,6 @@ pub fn runParquetLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w:
 }
 
 pub fn runCsvLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    // The columns the lanes convert, as `parquetSplit` asks for them: past a
-    // map path's join the names are the join's, so it hands over the stages
-    // before it.
     const pipe = stages[0 .. stages.len - 1];
     const push = switch (shape) {
         .map => |x| pipe[1..][0..x.len],
@@ -129,21 +166,13 @@ pub fn runCsvLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast
 
 const AggShape = struct { prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage };
 
-/// Recognize `read … | (filter|select)* | aggregate | (sort|limit)* | write` — the
-/// shape the parallel CSV-aggregate path handles: a map-only prefix (folded in
-/// parallel), exactly one aggregate (the breaker), and a small post-aggregate tail
-/// (run serially on the merged result). Anything else → null (serial path).
+/// Recognize `read … | (filter|select)* | aggregate | tail | write`. A `select` or
+/// `filter` after the aggregate (a reordering projection, HAVING) is applied by `writeTail`;
+/// refusing them sent such queries serial (TPC-H q01's shape: 379ms vs 88ms).
 pub fn classifyAggPipeline(stages: []const ast.Stage) ?AggShape {
     const middle = stages[1 .. stages.len - 1];
     var ai: ?usize = null;
     for (middle, 0..) |st, i| switch (st.node) {
-        // A `select` after the aggregate is the reordering projection the parser emits
-        // for an interleaved SELECT list. Rejecting it sent every such query to the
-        // serial driver — 379ms against 88ms on TPC-H q01's shape. `writeTail` applies
-        // it, and the sink is opened with the schema it produces.
-        // A filter after the aggregate is HAVING; `writeTail` runs it over the
-        // merged groups like the projection. Rejecting it made every HAVING
-        // query serial.
         .filter, .select => {},
         .aggregate => {
             if (ai != null) return null;
@@ -156,18 +185,11 @@ pub fn classifyAggPipeline(stages: []const ast.Stage) ?AggShape {
     return .{ .prefix = middle[0..a], .ag = middle[a].node.aggregate, .tail = middle[a + 1 ..] };
 }
 
-/// Recognize `read … | filter* | aggregate | <anything>* | write` — the shape a whole
-/// aggregate can descend into one grouped source query. Two differences from
-/// `classifyAggPipeline`: the prefix is filters ONLY (a `select` renames columns, so the
-/// group keys would no longer be source columns to name in a GROUP BY), and the tail is
-/// unrestricted — `having`, sort, limit and anything else run engine-side over the
-/// grouped result exactly as they did before. Pure: eligibility of the *shape* only;
-/// `pushdown.planWholeAgg` decides whether the aggregate itself is renderable.
+/// Recognize the shape a whole aggregate can descend into one grouped source query:
+/// filters only before it (a `select` renames the keys) and no hint on the read; any
+/// tail. `pushdown.planWholeAgg` decides whether the aggregate itself renders.
 pub fn classifyWholeAgg(stages: []const ast.Stage) ?AggShape {
     if (stages.len < 3 or stages[0].node != .read) return null;
-    // A hint on the read is about scanning it (`@[where]`, `@[split…]`, `@[buffer]`),
-    // and none of those survive the rewrite into a grouped query. Leave hinted reads
-    // to the paths that honour them.
     if (stages[0].hints.len != 0) return null;
     const middle = stages[1 .. stages.len - 1];
     for (middle, 0..) |st, i| switch (st.node) {
@@ -178,11 +200,9 @@ pub fn classifyWholeAgg(stages: []const ast.Stage) ?AggShape {
     return null;
 }
 
-/// Try to descend the whole aggregate into the source. On success returns a rewritten
-/// stage list — a QUERY-form read of the grouped SQL, then the untouched post-aggregate
-/// tail, then the write — which the caller rebuilds through the ordinary serial path, so
-/// the result's schema, row counting and sink all come from the existing machinery.
-/// Null means "not eligible": the caller keeps the pipeline it already built.
+/// Descend the whole aggregate into the source: a QUERY-form read of the grouped SQL
+/// (cast to the engine's own output schema), the untouched tail, then the write. Null
+/// means not eligible, and the caller keeps the pipeline it built.
 pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: AggShape, src_base: usize, why: *[]const u8) !?[]const ast.Stage {
     const arena = env.arena;
     const desc = env.sql_desc orelse return null;
@@ -199,8 +219,6 @@ pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: AggShape, src
 
     const src_schema = try dupeSchema(arena, env.sources.items[src_base].schema());
 
-    // The engine's own output schema for this aggregate — the types every rendered
-    // aggregate is CAST to, and the names the tail and sink already expect.
     var ad = analyze.Diag{};
     const apl = analyze.aggregatePlan(arena, src_schema, shape.ag, env.params_expr, &ad) catch {
         why.* = ad.msg;
@@ -211,9 +229,6 @@ pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: AggShape, src
     const wa = (try pushdown.planWholeAggWhy(arena, desc.dialect, desc.base_sql, src_schema, shape.prefix, shape.ag, apl.schema, facts, why)) orelse return null;
 
     const out = try arena.alloc(ast.Stage, shape.tail.len + 2);
-    // No hints: an `@[where = …]` would be re-applied over the grouped result (whose
-    // columns are the aggregate's, not the source's), and `@[split = …]` has nothing
-    // left to split — the read is already one small result set.
     out[0] = .{
         .node = .{ .read = .{ .connector = rd.connector, .form = .{ .query = wa.sql } } },
         .hints = &.{},
@@ -226,12 +241,9 @@ pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: AggShape, src
     return out;
 }
 
-/// Descend a `LIMIT` — with the `ORDER BY` before it, if any — into the SQL read, when
-/// `pushdown.planTopN` shows the source can send a set the engine's own top-N is
-/// drawn from. Returns the stage list with the read replaced by a QUERY-form read
-/// of the capped statement; every other stage stays, so the engine still filters,
-/// sorts and cuts what arrives and the final rows are its own. Null leaves the
-/// pipeline as built; `why` then says why, when the pipeline had a limit to push.
+/// Descend a `LIMIT` (with its `ORDER BY`) into the SQL read when `pushdown.planTopN`
+/// allows; the engine still sorts and cuts what arrives. Null leaves the pipeline as
+/// built, with `why` set when there was a limit to push.
 pub fn topNStages(env: *Env, stages: []const ast.Stage, src_base: usize, why: *[]const u8) !?[]const ast.Stage {
     const arena = env.arena;
     const desc = env.sql_desc orelse return null;
@@ -244,8 +256,6 @@ pub fn topNStages(env: *Env, stages: []const ast.Stage, src_base: usize, why: *[
     const q = (try pushdown.planTopN(arena, desc.dialect, desc.base_sql, src_schema, stages[0 .. stages.len - 1], t, facts, why)) orelse return null;
 
     const out = try arena.dupe(ast.Stage, stages);
-    // No hints: an `@[where = …]` is already in `base_sql`, and a split has nothing
-    // to gain over a capped set — the read is one small statement now.
     out[0] = .{
         .node = .{ .read = .{ .connector = rd.connector, .form = .{ .query = q } } },
         .hints = &.{},
@@ -255,17 +265,12 @@ pub fn topNStages(env: *Env, stages: []const ast.Stage, src_base: usize, why: *[
     return out;
 }
 
-/// Shared header for the parallel workers: a work-stealing item counter plus the
-/// first-error latch. `failed` flags the other workers to stop (checked lock-free);
-/// `first_err` is what the caller re-raises after the join.
 const WorkQueue = struct {
     nitems: usize,
     next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     err_mtx: std.Thread.Mutex = .{},
     first_err: ?anyerror = null,
     failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// The first error's account, taken on the lane that raised it: the notes
-    /// that explain an error are per thread, and the run reports on another.
     note_buf: [480]u8 = undefined,
     note_len: usize = 0,
 
@@ -287,16 +292,14 @@ const WorkQueue = struct {
         q.failed.store(true, .seq_cst);
     }
 
-    /// The first error, with the account the failing lane left of it.
     fn failure(q: *WorkQueue) ?anyerror {
         const e = q.first_err orelse return null;
         return if (q.note_len > 0) eval.explain(e, q.note_buf[0..q.note_len]) else e;
     }
 };
 
-/// The worker-dispatch loop shared by the parallel CSV/SQL paths: steal the next
-/// item off `ctx.queue`, run `workOne(ctx, i)`, and latch the first error (which
-/// also stops the other workers). `Ctx` only needs a `queue: WorkQueue` field.
+/// The worker loop shared by the parallel CSV/SQL paths: steal the next item off
+/// `ctx.queue`, run `workOne(ctx, i)`, and latch the first error, which stops the others.
 fn dispatchWorker(comptime Ctx: type, comptime workOne: anytype) fn (*Ctx, usize) void {
     return struct {
         fn go(ctx: *Ctx, _: usize) void {
@@ -313,25 +316,10 @@ fn dispatchWorker(comptime Ctx: type, comptime workOne: anytype) fn (*Ctx, usize
     }.go;
 }
 
-/// One work item's partial group set, kept alive past the worker that folded it
-/// so the combine can run in item order.
-///
-/// Folding into a per-*item* slot rather than straight into shared state under a
-/// lock is what makes a parallel aggregate reproducible. Which rows land in which
-/// partial is fixed by the item boundaries (a CSV byte range, a key-range
-/// predicate), and `combineAggSlots` walks the slots by index, so a float `SUM`
-/// adds its partials in the same order on every run. Merging as lanes *finished*
-/// made the order depend on thread scheduling, so the same script wrote a
-/// slightly different total each run — see the note in `combineAggSlots`.
 const AggSlot = struct {
-    /// Per-slot and single-threaded: exactly one worker ever folds a given slot,
-    /// and the main thread only touches it after `spawnJoin` has returned.
     gpa: std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }) = .{},
     arena: std.heap.ArenaAllocator = undefined,
     parts: LaneParts = undefined,
-    /// The slot's groups as the fold stored them, one set per radix partition
-    /// (`op.Aggregate.drainParts`). Empty for a slot no worker reached, which is
-    /// what an aborted run leaves behind; the combine skips it.
     sets: []const op.Aggregate.GroupSet = &.{},
 
     fn arm(self: *AggSlot, shared: std.mem.Allocator) void {
@@ -340,16 +328,10 @@ const AggSlot = struct {
     }
 };
 
-/// A lane's (or slot's) groups split by key hash, one arena per radix partition,
-/// so the merge of partition `p` reads only what it needs. Backed by the run's
-/// thread-safe gpa, not the slot's: the merge tasks run on other threads. Not the
-/// page allocator either — 64 arenas a lane each mapping small buffers made a
-/// 100-group aggregate 12% slower at -j 8.
 const LaneParts = struct {
     arenas: [pq_parts]std.heap.ArenaAllocator,
     allocs: [pq_parts]std.mem.Allocator,
 
-    /// In place: each allocator points at its arena.
     fn init(self: *LaneParts, child: std.mem.Allocator) void {
         for (&self.arenas, &self.allocs) |*a, *al| {
             a.* = std.heap.ArenaAllocator.init(child);
@@ -361,8 +343,7 @@ const LaneParts = struct {
         for (&self.arenas) |*a| a.deinit();
     }
 
-    /// Release partition `p` once the merge is done with it. Left as a fresh,
-    /// empty arena, so `deinit` stays unconditional.
+    /// Release partition `p` once merged, leaving a fresh empty arena so `deinit` stays unconditional.
     fn free(self: *LaneParts, p: usize) void {
         self.arenas[p].deinit();
         self.arenas[p] = std.heap.ArenaAllocator.init(self.backing());
@@ -376,8 +357,6 @@ const LaneParts = struct {
 fn allocAggSlots(gpa: std.mem.Allocator, n: usize) ![]AggSlot {
     const slots = try gpa.alloc(AggSlot, n);
     for (slots) |*s| s.* = .{};
-    // Armed in a second pass: `arm` takes the address of the slot's own gpa, so
-    // it has to run once the slot is at its final location.
     for (slots) |*s| s.arm(gpa);
     return slots;
 }
@@ -392,34 +371,11 @@ fn freeAggSlots(gpa: std.mem.Allocator, slots: []AggSlot) void {
     gpa.free(slots);
 }
 
-/// Above this many partial groups the combine is split across threads by key
-/// hash; below it the single pass takes microseconds and the partition arenas
-/// and thread hop cost more than they save.
 pub const agg_combine_parallel_min: usize = 1 << 14;
 
-/// Combine per-item partials into one group set, walking the slots by index.
-///
-/// The order matters for floats and only for floats: `mergeAcc` adds partial
-/// sums, and float addition is not associative, so combining the same partials
-/// in a different order gives a total that differs in the last few bits. Integer
-/// and DECIMAL sums, counts and min/max are exact and order-insensitive. Note
-/// that this pins the result for a *given* item count — `-j` changes how the
-/// input is cut up, so a float total can still differ between `-j 4` and `-j 8`
-/// (as it does between either and the serial path). `CAST`ing to DECIMAL is the
-/// way to get a total that is identical everywhere.
-///
-/// Two shapes, chosen by how many partial groups there are. One pass is right for
-/// the ordinary case, where a handful of groups come back per slot. But the pass
-/// is O(partials), and with a key of high cardinality that is O(rows): a 2M-row
-/// CSV grouped by a unique id spent longer combining 2M partials than the whole
-/// serial aggregate took, so `-j 16` came in at 1.32s against 0.77s at `-j 1` —
-/// parallelism made it slower. Past the threshold the combine is radix-partitioned
-/// like the parquet path's, so it scales with the fold instead of undoing it.
-///
-/// `parts` is the caller's, because the merged groups live in its arenas and have
-/// to outlive the write. Determinism survives partitioning: keys are disjoint
-/// across partitions, so no group is ever summed across two of them, and each
-/// partition still walks the slots in index order.
+/// Combine per-item partials into one group set, walking the slots by index so a
+/// float SUM adds in the same order every run; radix-partitioned past
+/// `agg_combine_parallel_min`. `parts` is the caller's: the merged groups outlive the write.
 fn combineAggSlots(
     env: *Env,
     slots: []AggSlot,
@@ -454,7 +410,6 @@ fn combineAggSlots(
     return partSets(env.arena, parts);
 }
 
-/// Each partition's merged groups, in partition order.
 fn partSets(a: std.mem.Allocator, parts: []PqPart) ![]const op.Aggregate.GroupSet {
     var sets = std.array_list.Managed(op.Aggregate.GroupSet).init(a);
     for (parts) |*pp| {
@@ -476,10 +431,8 @@ fn slotMergeOne(ctx: *SlotMergeCtx, p: usize) !void {
     return mergeRadixPart(&ctx.parts[p], ctx.slots, ctx.aggs, p);
 }
 
-/// The radix partitions and their arenas, owned by the caller so that whatever the
-/// combine merges into them outlives the sink write. Initialising one is free —
-/// an arena allocates nothing until used — so the ordinary single-pass combine
-/// pays nothing for these being here.
+/// The radix partitions, owned by the caller so merged groups outlive the sink write.
+/// Free when unused: an arena allocates nothing until used.
 fn allocMergeParts(gpa: std.mem.Allocator) ![]PqPart {
     const parts = try gpa.alloc(PqPart, pq_parts);
     for (parts) |*pp| pp.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
@@ -494,7 +447,6 @@ fn freeMergeParts(gpa: std.mem.Allocator, parts: []PqPart) void {
     gpa.free(parts);
 }
 
-/// An Aggregate that only finalizes merged groups (`emitSets`); it never pulls a child.
 fn groupEmitter(env: *Env, agg_in: *const types.Schema, by: []const usize, aggs: []const op.Aggregate.Agg, out_schema: *const types.Schema) op.Aggregate {
     return .{
         .child = undefined,
@@ -507,13 +459,9 @@ fn groupEmitter(env: *Env, agg_in: *const types.Schema, by: []const usize, aggs:
     };
 }
 
-/// Emit merged groups and write them through `tail`. Many groups under a tail that
-/// only filters and projects are emitted, formatted and encoded a partition at a
-/// time across lanes (`GroupWriteCtx`); anything else — a top-N's selection, a sort,
-/// a handful of groups — goes out as one batch.
-///
-/// Emitting into one batch and writing it on one thread was a third of a
-/// high-cardinality GROUP BY at -j 8, and the batch held every output row at once.
+/// Emit merged groups and write them through `tail`: a partition at a time across lanes
+/// when the tail only filters and projects, else as one batch (which had been a third
+/// of a high-cardinality GROUP BY at -j 8).
 fn writeGroups(
     env: *Env,
     snk: driver.Sink,
@@ -552,8 +500,6 @@ fn writeGroups(
     stats.rows_out += ctx.rows_out.load(.monotonic);
 }
 
-/// Shared state for writing merged groups a partition at a time. Units are the
-/// partitions, written in order by `OrderedOut`: the order one serial emit gives.
 const GroupWriteCtx = struct {
     emitter: op.Aggregate,
     sets: []const op.Aggregate.GroupSet,
@@ -637,9 +583,6 @@ fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema, ta
     var sch = schema;
     var i: usize = 0;
     while (i < tail.len) : (i += 1) {
-        // ORDER BY + LIMIT fuse into a top-N, as the serial planner does: built as
-        // two stages, the merged groups were fully sorted to keep a handful, 3x
-        // slower at -j 8 than the serial run.
         const r = if (tail[i].node == .sort and i + 1 < tail.len and tail[i + 1].node == .limit) blk: {
             i += 1;
             break :blk try buildTopN(env, tail[i - 1].node.sort, tail[i].node.limit, cur, sch);
@@ -653,13 +596,7 @@ fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema, ta
     }
 }
 
-/// Shared state for the parallel-aggregate workers. Each worker rebuilds the prefix
-/// chain on its own arena, folds one or more newline-aligned file chunks into a
-/// thread-local partial group set, then merges it into the combined set under `mtx`
-/// (deep-copying keys/min-max into the plan arena, so its own arena can be freed).
-/// The merge is small (O(groups)) vs the fold (O(rows)), so lock contention is low.
 const AggCtx = struct {
-    /// String group keys' ids, one table for every lane so their partials agree.
     strs: *op.Aggregate.StrTable,
     mapped: *csv.MappedCsv,
     csv_schema: *const types.Schema,
@@ -673,7 +610,6 @@ const AggCtx = struct {
     queue: WorkQueue,
     slots: []AggSlot,
     rows_read: *obs.RowCounter,
-    /// The join-then-aggregate shape, exactly as `PqAggCtx.joins`.
     joins: []const LaneJoin = &.{},
 };
 
@@ -701,42 +637,25 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
         .part_state = &slot.parts.allocs,
         .table_gpa = slot.parts.backing(),
     };
-    // Stays in the slot's arenas: the combine reads it after every lane has joined.
     slot.sets = try agg.drainParts();
 }
 
-/// One parallel-aggregate lane: its own arena and its own group table, so the
-/// fold phase never takes a lock.
 const PqLane = struct {
     arena: std.heap.ArenaAllocator,
     parts: LaneParts = undefined,
-    /// One set per radix partition, as `AggSlot.sets`.
     sets: []const op.Aggregate.GroupSet = &.{},
 };
 
-/// One radix partition of the merge: the lanes' groups are split by key hash, so
-/// each partition is owned outright by one task and needs no lock either.
 const PqPart = struct {
     arena: std.heap.ArenaAllocator,
-    /// Built on the first group the partition receives, of the same kind as it.
     merge: ?op.Aggregate.GroupMerge = null,
 };
 
-/// Number of radix partitions: the fold's own, so a lane's partition `p` is the
-/// merge's. Comfortably above the lane count so the merge stays balanced when key
-/// hashes are uneven.
 const pq_parts: usize = op.Aggregate.fold_parts;
 
-/// Fewest lanes worth splitting an aggregate across. Two suffices now that the
-/// merge reuses the hashes the fold produced; while it re-hashed every key, the
-/// extra pass cost more than two lanes could win back.
 const pq_min_lanes: usize = 2;
 
-/// Shared state for parallel *parquet* aggregate lanes. The morsel is a row
-/// group: each lane opens its own reader over a disjoint window and folds into
-/// its own table. Nothing is shared until the radix merge.
 const PqAggCtx = struct {
-    /// String group keys' ids, one table for every lane so their partials agree.
     strs: *op.Aggregate.StrTable,
     morsels: PqMorsels,
     agg_in_schema: *const types.Schema,
@@ -748,46 +667,28 @@ const PqAggCtx = struct {
     aggs: []const op.Aggregate.Agg,
     lanes: []PqLane,
     rows_read: *obs.RowCounter,
-    /// The join-then-aggregate shape: one shared build index per join, in application
-    /// order, plus the post-join stages each lane rebuilds over them. Empty is the
-    /// plain aggregate.
     joins: []const LaneJoin = &.{},
 };
 
-/// Pulls row-group morsels off the shared queue and presents them as one
-/// continuous stream. This is what lets a lane run a *single* aggregate over
-/// everything it steals: folding per morsel and merging afterwards would walk
-/// the lane's groups an extra time, which at high cardinality costs more than
-/// the parallelism buys.
-/// The shared row-group work list a parallel parquet path hands to its lanes.
 const PqMorsels = struct {
-    /// One file, or a folder's files in order.
     files: []const []const u8,
-    /// The folder `files` are under, which a mismatch message names; null for one file.
     root: ?[]const u8 = null,
-    /// What each work item reads: a row group of a local file, a whole remote one.
     items: []const PqItem,
     project: ?[][]const u8,
     bounds: []const pqdecode.Bound,
     src_schema: *const types.Schema,
     queue: WorkQueue,
     tally: ?*driver.ScanTally = null,
-    /// Lanes beyond this take nothing: a remote folder's lanes each hold a
-    /// session to one server, and OpenSSH refuses past ten at once by default.
     max_lanes: usize = std.math.maxInt(usize),
-    /// The files after the first are checked against it as lanes open them, as
-    /// a remote folder's footers are not all read up front.
     check_in_lane: bool = false,
 };
 
 const PqItem = struct { file: u32, rg: u32, rg_end: ?u32 };
 
-/// A lane's open file, kept across the items it takes from it: reopening it
-/// per row group re-read and re-parsed the footer each time.
 const HeldFile = struct { file: u32, r: *pqdecode.Reader };
 
-/// The reader positioned on item `i`, reusing `held` when it is the same file;
-/// null when the item holds nothing (a file that shrank since it was planned).
+/// The reader positioned on item `i`, reusing `held` when it is the same file (reopening
+/// per row group re-parsed the footer); null when a file shrank since it was planned.
 fn openItem(m: *const PqMorsels, scratch: std.mem.Allocator, held: *?HeldFile, i: usize) !?*pqdecode.Reader {
     const it = m.items[i];
     if (held.*) |h| if (h.file != it.file) {
@@ -817,20 +718,9 @@ const MorselSource = struct {
     scratch: std.mem.Allocator,
     held: ?HeldFile = null,
     cur: ?*pqdecode.Reader = null,
-    /// The item `cur` reads, for a consumer that numbers rows by input position.
     cur_item: usize = 0,
-    /// When set, this source owns a fixed arithmetic slice of the morsels
-    /// (`next`, `next + step`, …) instead of stealing whichever is free.
-    ///
-    /// The aggregate path needs that: a lane folds every morsel it reads into one
-    /// partial group set, so the order its float sums are added in is the order
-    /// morsels reached the lane. Stealing makes that order depend on thread
-    /// timing, and the run's totals wobble in their last bits. Fixed slices cost
-    /// balance only when row groups are uneven, whereas the map path — which
-    /// combines nothing across morsels — keeps stealing and stays balanced.
     fixed: ?struct { next: usize, step: usize } = null,
 
-    /// The next morsel index this source should read, or null when it is done.
     fn nextIndex(self: *MorselSource) ?usize {
         if (self.fixed) |*f| {
             if (f.next >= self.m.queue.nitems) return null;
@@ -913,17 +803,8 @@ fn pqMergeOne(ctx: *PqMergeCtx, p: usize) !void {
     return mergeRadixPart(&ctx.parts[p], ctx.lanes, ctx.aggs, p);
 }
 
-/// Merge radix partition `p` of a set of partials into `dst`. `srcs` is a slice of
-/// anything carrying per-partition `sets` and `parts` — parquet lanes or CSV/SQL
-/// slots. A partition owns its keys outright, so the tasks need no lock between
-/// them, which is what stops a high-cardinality merge from serialising behind one
-/// table.
-///
-/// The largest source is merged into in place rather than copied, and every other
-/// one is freed as soon as it is folded in: copying every lane into a new set held
-/// each group twice, so -j 8 took twice the memory of -j 1. The rest are walked in
-/// index order, which with a largest source fixed by the input split keeps a float
-/// SUM from depending on thread timing (see `AggSlot`).
+/// Merge radix partition `p` of `srcs` (parquet lanes or CSV/SQL slots) into `dst`. The
+/// largest source is merged into in place, the rest walked in index order and freed.
 fn mergeRadixPart(dst: *PqPart, srcs: anytype, aggs: []const op.Aggregate.Agg, p: usize) !void {
     var big: ?usize = null;
     for (srcs, 0..) |*ls, i| {
@@ -945,16 +826,13 @@ fn mergeRadixPart(dst: *PqPart, srcs: anytype, aggs: []const op.Aggregate.Agg, p
         st.freeTable();
         ls.parts.free(p);
     }
-    // The index is done with once every lane is in: the emit walks the store.
     dst.merge.?.deinit();
 }
 
-/// The `sort … limit` shape a parallel aggregate can push into its partitions.
 const TopNTail = struct { keys: []const ast.SortKey, n: usize };
 
-/// Recognise a tail that is only sorts and limits, so each partition can drop to
-/// its own best `n` rows before anything is materialised. An `OFFSET` disables
-/// it: the rows a partition discards could be the ones the offset lands on.
+/// A tail of only sorts and limits, so each partition keeps its own best `n` rows. An
+/// `OFFSET` disables it: the rows a partition discards could be the ones it lands on.
 fn topNTail(tail: []const ast.Stage) ?TopNTail {
     var keys: []const ast.SortKey = &.{};
     var n: ?usize = null;
@@ -970,11 +848,10 @@ fn topNTail(tail: []const ast.Stage) ?TopNTail {
     return .{ .keys = keys, .n = n orelse return null };
 }
 
-/// The output value a sort key refers to: the group keys come first in the
-/// aggregate's schema, the aggregates after them.
+/// The output value a sort key refers to: group keys first, then the aggregates. A sum
+/// out of range only orders here; it fails the query when emitted.
 fn groupSortValue(set: *const op.Aggregate.GroupSet, gi: usize, col: usize, by_len: usize, aggs: []const op.Aggregate.Agg) Value {
     if (col < by_len) return set.keyValue(gi, col);
-    // Only orders the groups: a sum out of range fails the query when it is emitted.
     return op.Aggregate.finalizeAcc(set.acc(gi, col - by_len), aggs[col - by_len]) catch .null;
 }
 
@@ -1001,7 +878,6 @@ const PqTopNCtx = struct {
     order: GroupOrder,
     n: usize,
     queue: WorkQueue,
-    /// Per partition, the groups that survive: its best `n`, in order.
     sel: [][]const u32,
 };
 
@@ -1026,33 +902,15 @@ fn pqTopNOne(ctx: *PqTopNCtx, p: usize) !void {
     ctx.sel[p] = idx[0..@min(idx.len, ctx.n)];
 }
 
-/// Map-only pipeline (scan -> filter/project/explode -> write) over a local
-/// parquet file. Each lane pulls row-group morsels and writes its own output,
-/// so nothing is shared except the work list and, for a shared sink, the write
-/// lock.
-/// Where a lane's rows come from. This is the ONLY difference between the parquet and
-/// CSV copies of every lane body: a parquet lane pulls row-group morsels off a queue
-/// shared with its siblings, a CSV lane parses one newline-aligned byte range. Above
-/// this seam the map chain, the join probe, the aggregate fold and the sink writes are
-/// identical — and are written out once per shape per source today.
-///
-/// The two still *distribute* work differently (morsel stealing versus a static chunk
-/// per lane), which is why this unifies the reader and not yet the whole body.
 const LaneRows = union(enum) {
-    /// Borrowed: every lane shares one queue, which is what makes stealing work.
     parquet: *PqMorsels,
-    /// One NAMED row group, rather than whichever is free. A shape whose work
-    /// item index has to mean a position in the file needs this — see
-    /// `LaneSplit`.
     parquet_group: struct { m: *const PqMorsels, group: usize },
     csv: struct { mapped: *csv.MappedCsv, schema: *const types.Schema, chunk: usize, of: usize },
 };
 
-/// This lane's row stream, or null when the item holds nothing (a row group past
-/// the end of a file that shrank between plan and read). The backing reader is
-/// allocated from `scratch` because the returned `driver.Source` borrows it and
-/// has to outlive this call — the reason both copies held it in a `var` local
-/// beside the source. Closing the returned source releases the reader.
+/// This lane's row stream, or null when the item holds nothing (a file that shrank
+/// since planning). The reader comes from `scratch` because the source borrows it;
+/// closing the source releases it.
 fn laneRowSource(rows: LaneRows, scratch: std.mem.Allocator) !?driver.Source {
     switch (rows) {
         .parquet => |m| {
@@ -1078,10 +936,9 @@ fn laneRowSource(rows: LaneRows, scratch: std.mem.Allocator) !?driver.Source {
     }
 }
 
-/// Open `rd`'s parquet file as a splittable input, or null when this pipeline
-/// cannot be split across lanes. Shared by every parquet lane path, which all
-/// gate on the same three things: a real path, an upsert that names its keys,
-/// and enough row groups and threads to be worth dividing.
+/// Open `rd`'s parquet input as splittable, or null. Local files split at row groups,
+/// each footer checked here; a remote folder splits at files and a single remote file
+/// stays serial. `push_stages` stops before a map path's join, whose names are the join's.
 fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: ast.Write, opts: RunOptions) anyerror!?LaneSplit {
     const arena = env.arena;
     const path = switch (rd.form) {
@@ -1091,8 +948,6 @@ fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: ast.
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return null;
     if (opts.threads < pq_min_lanes) return null;
 
-    // A folder's files, local or remote; a single remote file stays serial, as
-    // each lane would fetch its footer again.
     var files: []const []const u8 = &.{};
     var root: ?[]const u8 = null;
     if (folder.isFolder(path)) {
@@ -1108,11 +963,6 @@ fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: ast.
     }
     const remote = csv.CsvReader.isUrl(path);
 
-    // `push_stages` is the caller's: the aggregate and distinct paths hand over
-    // the whole pipeline, join included, because `projectedColumns` understands a
-    // `.join` stage (it contributes the left keys) and restricting it made those
-    // bail to "read every column". The map path hands over the PRE-join stages
-    // only, since past its join the column names are the join's, not the source's.
     const project = try projectedColumns(env, push_stages);
     const bounds = try filterBounds(env, push_stages);
     const probe = pqdecode.Reader.openProjected(arena, files[0], project) catch return null;
@@ -1124,9 +974,6 @@ fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: ast.
         schema = .{ .fields = fields };
     }
 
-    // A local file splits at row groups, each footer read here, which also checks
-    // every file against the first before a lane starts. A remote folder splits
-    // at files: its footers are fetched by the lanes that read them.
     var items = std.array_list.Managed(PqItem).init(arena);
     if (remote) {
         if (files.len < 2) return null;
@@ -1162,48 +1009,31 @@ fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: ast.
     } };
 }
 
-/// Map `rd`'s CSV for splitting, or null when it cannot be split. The caller
-/// owns the result and must `close()` it.
+/// Map `rd`'s CSV for splitting, or null; the caller must `close()` it. A quoted newline
+/// makes byte boundaries undecidable, so that file is closed here and read serially
+/// (leaking it before the caller's defer exhausted fds in a FOR EACH).
 fn csvSplitFile(env: *Env, rd: ast.Read, w: ast.Write) anyerror!?*csv.MappedCsv {
     const path = switch (rd.form) {
         .path => |p| p,
         else => return null,
     };
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return null;
-    // only a CSV is cut on byte boundaries, whatever route asked
     if (analyze.readFormat(path, env.fmt_in) != .csv) return null;
 
     const mapped = csv.MappedCsv.open(env.arena, path, env.csv_in) catch return null;
-    // A newline inside a quoted field makes chunk boundaries undecidable from a
-    // byte offset, so this file is parsed serially rather than split. Closed
-    // explicitly: this returns before the caller's `defer` is armed, and leaking
-    // the mmap + fd once per file exhausted the fd limit in a FOR EACH.
     if (mapped.quoted_newlines) {
         mapped.close();
         return null;
     }
-    // `runCsvLane` named the columns the pipeline reads
     if (rd.cols.len > 0) try mapped.project(env.arena, rd.cols);
     return mapped;
 }
 
-/// The input side of a parallel shape whose work items are POSITIONS: item `i`
-/// covers the part of the file that precedes item `i+1`. Distinct needs that (it
-/// resolves ties by first appearance, so the item index has to order rows the
-/// way a serial run would); the map path does not, and keeps stealing morsels.
-///
-/// This is the axis the parallel paths were duplicated along. Each shape had a
-/// `…Csv…` and a `…Parquet…` copy differing only in how many items there are and
-/// how to open one, while the operator chain, the merge and the sink above were
-/// identical — so naming that difference lets a shape have one implementation,
-/// the way the join variants already share one `…Impl`.
 const LaneSplit = union(enum) {
     csv: struct { mapped: *csv.MappedCsv, schema: *const types.Schema },
     parquet: PqMorsels,
 
-    /// A CSV is split by byte offset, so its item count is a free choice and one
-    /// chunk per thread is the balanced one; a parquet file is split at row
-    /// groups, which the file itself fixes.
+    /// A CSV's item count is free, one chunk per thread; a parquet file's is its row groups.
     fn count(self: LaneSplit, nthreads: usize) usize {
         return switch (self) {
             .csv => nthreads,
@@ -1211,7 +1041,6 @@ const LaneSplit = union(enum) {
         };
     }
 
-    /// The lanes worth starting for `threads`: a remote folder's are capped.
     fn lanes(self: *const LaneSplit, threads: usize) usize {
         const n = @max(@as(usize, 1), threads);
         return switch (self.*) {
@@ -1234,8 +1063,6 @@ const LaneSplit = union(enum) {
         };
     }
 
-    /// What `laneRowSource` needs to open work item `i` of `nitems`, for a shape
-    /// whose items are positions.
     fn rows(self: *const LaneSplit, i: usize, nitems: usize) LaneRows {
         return switch (self.*) {
             .csv => |c| .{ .csv = .{ .mapped = c.mapped, .schema = c.schema, .chunk = i, .of = nitems } },
@@ -1243,14 +1070,9 @@ const LaneSplit = union(enum) {
         };
     }
 
-    /// The same, for a shape that does NOT need its items ordered and can take
-    /// whatever rows are going — top-N re-sorts, so it only cares that every row
-    /// is seen once. A parquet lane then steals row groups off the shared queue
-    /// and keeps ONE heap over all of them, instead of a heap per row group.
-    ///
-    /// `nitems` is still the thread count, and items are still stolen rather than
-    /// indexed by lane: `spawnJoin` may spawn fewer threads than asked, and a
-    /// CSV chunk keyed on lane index would then be silently skipped.
+    /// Rows for a shape that needs no item order (top-N re-sorts): a parquet lane steals row
+    /// groups into one heap. Items are still stolen, not indexed by lane, since `spawnJoin`
+    /// may start fewer threads than asked and a lane-keyed CSV chunk would be skipped.
     fn unorderedRows(self: *LaneSplit, i: usize, nitems: usize) LaneRows {
         return switch (self.*) {
             .csv => |c| .{ .csv = .{ .mapped = c.mapped, .schema = c.schema, .chunk = i, .of = nitems } },
@@ -1258,8 +1080,6 @@ const LaneSplit = union(enum) {
         };
     }
 
-    /// Stop the shared morsel queue after a lane has failed, so the others do not
-    /// keep stealing work whose result is about to be thrown away.
     fn abort(self: *LaneSplit) void {
         switch (self.*) {
             .parquet => |*m| m.queue.failed.store(true, .seq_cst),
@@ -1267,8 +1087,6 @@ const LaneSplit = union(enum) {
         }
     }
 
-    /// How the item count reads in the debug line: chunks are ours to choose,
-    /// row groups are the file's.
     fn unitName(self: LaneSplit) []const u8 {
         return switch (self) {
             .csv => "chunks",
@@ -1277,13 +1095,6 @@ const LaneSplit = union(enum) {
     }
 };
 
-/// Parallel map-only pipeline (`read <local> | (filter|select)* | write`): the
-/// input is fanned out across lanes, each runs the map chain on its own share.
-/// With a shared sink the rows keep file order (see `OrderedOut`), so a run gives
-/// the same output at any `-j`; per-lane sinks — a table load, where rows have no
-/// order — write lock-free as they go. Optionally carries one hash join, whose
-/// build side is materialized once before any lane exists and probed read-only by
-/// all of them.
 const MapCtx = struct {
     split: LaneSplit,
     map_stages: []const ast.Stage,
@@ -1294,23 +1105,10 @@ const MapCtx = struct {
     sink_mtx: std.Thread.Mutex = .{},
     rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     rows_read: *obs.RowCounter,
-    /// Set when the pipeline carries one hash join: each lane probes the shared
-    /// index with its own `op.Join` and runs the post-join stages itself.
     join: ?LaneJoin = null,
-    /// Set with a shared sink: work items are positions, written in order.
     ordered: ?*OrderedOut = null,
 };
 
-/// Keeps a shared sink's rows in file order across lanes. Work items are small
-/// positional units (a CSV byte range, a parquet row group); a lane formats its
-/// unit's rows outside any lock, then hands them over, and whichever lane
-/// completes the next unit due writes it and every finished unit queued behind
-/// it. A lane may run at most `window` units ahead of the writer, so what waits
-/// in memory is bounded by the window, not the file.
-///
-/// Before this, lanes wrote as they finished: output order changed from run to
-/// run, and a plain SELECT to the terminal stayed serial to keep its rows in
-/// order — the reason it was left off the parallel path at all.
 const OrderedOut = struct {
     mtx: std.Thread.Mutex = .{},
     cv: std.Thread.Condition = .{},
@@ -1318,11 +1116,7 @@ const OrderedOut = struct {
     window: usize,
     done: []?*Unit,
     snk: driver.Sink,
-    /// A lane is writing units out. The sink is only ever written by that lane,
-    /// and never under `mtx`, so the others keep formatting their next unit.
     writing: bool = false,
-    /// Written units, arenas reset but kept: formatting into fresh pages each
-    /// time faulted in every output byte again, a third of a parquet-to-CSV move.
     free: ?*Unit = null,
 
     const Part = union(enum) { bytes: []const u8, batch: Batch, encoded: driver.UnitEncoder };
@@ -1347,11 +1141,8 @@ const OrderedOut = struct {
         self.mtx.unlock();
     }
 
-    /// Hand over unit `i`. When no lane is writing, this one becomes the writer
-    /// and writes every consecutive finished unit from `next` on — one at a time,
-    /// outside `mtx`, so a lane handing over its unit never waits on the sink.
-    /// Writing under the lock stalled every lane behind it, and a parquet-to-CSV
-    /// move got 50% slower than when lanes wrote unordered.
+    /// Hand over unit `i`. With no lane writing, this one writes every consecutive finished
+    /// unit from `next` on, outside `mtx`, so handing over never waits on the sink.
     fn deposit(self: *OrderedOut, i: usize, u: *Unit) !void {
         self.mtx.lock();
         self.done[i] = u;
@@ -1414,7 +1205,6 @@ const OrderedOut = struct {
         std.heap.page_allocator.destroy(u);
     }
 
-    /// Units a failed run left behind, and the pool.
     fn freeRest(self: *OrderedOut) void {
         for (self.done) |*d| if (d.*) |u| {
             freeUnit(u);
@@ -1429,9 +1219,8 @@ const OrderedOut = struct {
 
 const mapWorker = dispatchWorker(MapCtx, mapWorkOne);
 
-/// An ordered map lane: unlike `mapWorker`, one set of arenas for the lane's whole
-/// run, reset between units. Units are small, and building them per unit left
-/// every one decoding and formatting into cold pages.
+/// One set of arenas for the lane's whole run, reset between units: per-unit arenas
+/// left every unit decoding and formatting into cold pages.
 fn orderedMapWorker(ctx: *MapCtx, _: usize) void {
     var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
     defer _ = wgpa.deinit();
@@ -1493,7 +1282,6 @@ fn mapWorkOne(ctx: *MapCtx, i: usize) !void {
         }
         _ = batch_arena.reset(.retain_capacity);
     }
-    // One add rather than one per batch: the lanes all hit this counter.
     _ = ctx.rows_out.fetchAdd(out, .monotonic);
 
     if (own_sink) |s| {
@@ -1502,9 +1290,8 @@ fn mapWorkOne(ctx: *MapCtx, i: usize) !void {
     }
 }
 
-/// One positional unit of an ordered map: its rows, formatted for the shared sink
-/// where it can format outside the lock, else copied, then handed to `ord`. A unit
-/// with no rows is still handed over — the writer waits on every position.
+/// One positional unit of an ordered map, formatted (or unit-encoded) on the lane. A unit
+/// with no rows is still handed over: the writer waits on every position.
 fn mapOrderedUnit(ctx: *MapCtx, ord: *OrderedOut, i: usize, warena: *std.heap.ArenaAllocator, batch_arena: *std.heap.ArenaAllocator) !void {
     errdefer {
         ctx.split.abort();
@@ -1520,7 +1307,6 @@ fn mapOrderedUnit(ctx: *MapCtx, ord: *OrderedOut, i: usize, warena: *std.heap.Ar
     const ua = unit.arena.allocator();
     const snk = ord.snk;
     const render = snk.canRender();
-    // A sink with a unit form (parquet) encodes the whole unit here, on the lane.
     const enc: ?driver.UnitEncoder = if (snk.openUnit(ua)) |r| try r else null;
     errdefer if (enc) |e| e.discard();
 
@@ -1560,7 +1346,6 @@ fn mapOrderedUnit(ctx: *MapCtx, ord: *OrderedOut, i: usize, warena: *std.heap.Ar
     try ord.deposit(i, unit);
 }
 
-/// Source-independent — `split` says how the input divides; see `LaneSplit`.
 fn runParallelMapImpl(
     env: *Env,
     split: LaneSplit,
@@ -1577,7 +1362,6 @@ fn runParallelMapImpl(
     env.src_name = split.label();
     env.sink_name = sinkLabel(env, w);
 
-    // Before any lane exists: build side materialized, suffix prevalidated.
     var lane_join: ?LaneJoin = null;
     if (jshape) |js| {
         const lp = try resolveLaneJoin(env, js.join, js.join_hints, js.suffix, out_schema);
@@ -1620,8 +1404,6 @@ fn runParallelMapImpl(
     env.log.log(.debug, "parallel {s} map{s}: {d} {s} over {d} lanes ({s} sink)", .{
         split.label(), if (lane_join != null) "+join" else "", units, split.unitName(), lanes, @tagName(sink_mode),
     });
-    // Only the parquet path has ever printed this; left as it was rather than
-    // widened, since `--explain` output is compared against goldens.
     if (opts.explain and split == .parquet) {
         std.debug.print("actuals (parallel map, {d} lanes over {d} row groups): {d} rows out\n", .{
             lanes, units, ctx.rows_out.load(.monotonic),
@@ -1637,9 +1419,8 @@ fn runParallelMapImpl(
     return true;
 }
 
-/// Work items for an ordered map. A row group is a parquet file's own unit; a CSV is
-/// cut into ranges of about `ordered_chunk_bytes`, at least one per lane, so the
-/// reorder window holds a few MB per lane rather than a lane's whole share.
+/// A row group per item for parquet; a CSV is cut into about `ordered_chunk_bytes`
+/// ranges, at least one per lane, so the reorder window holds a few MB per lane.
 fn orderedUnits(split: LaneSplit, nthreads: usize) usize {
     return switch (split) {
         .csv => |c| std.math.clamp(c.mapped.body.len / ordered_chunk_bytes + 1, nthreads, 1 << 16),
@@ -1653,7 +1434,6 @@ fn runParallelParquetMap(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, m
     return runParallelParquetMapImpl(env, rd, pipeline, map_stages, null, w, opts, stats, lanes_used);
 }
 
-/// Row-group fan-out with one hash join hoisted out of it.
 fn runParallelParquetMapJoin(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, shape: MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     if (!joinKindLaneSafe(shape.join.kind)) return false;
     return runParallelParquetMapImpl(env, rd, pipeline, shape.prefix, shape, w, opts, stats, lanes_used);
@@ -1666,10 +1446,6 @@ fn runParallelParquetMapImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
 
 const AggJoinShape = struct {
     map_stages: []const ast.Stage,
-    /// Every stage from the first join up to the aggregate. Starts with a `.join`, and
-    /// each join is followed by its own `filter`/`select` suffix. Held as a span rather
-    /// than a list of steps so the classifier stays allocation-free;
-    /// `resolveLaneJoins` walks it.
     join_span: []const ast.Stage,
     ag: ast.Aggregate,
     tail: []const ast.Stage,
@@ -1682,21 +1458,10 @@ fn classifyAggJoinPipeline(stages: []const ast.Stage) ?AggJoinShape {
     var first_join: ?usize = null;
     var ai: ?usize = null;
     for (middle, 0..) |st, i| switch (st.node) {
-        // A `select` after the aggregate is the reordering projection the parser emits
-        // for an interleaved SELECT list. Rejecting it sent every such query to the
-        // serial driver — 379ms against 88ms on TPC-H q01's shape. `writeTail` applies
-        // it, and the sink is opened with the schema it produces.
         .filter => if (ai != null) return null,
         .select => {},
         .join => |j| {
-            // A join chain is fine; a join *fed by* an aggregate is a different shape.
             if (ai != null) return null;
-            // Only kinds whose per-lane join carries no cross-lane state. A right or
-            // full join must emit the build rows that nothing matched, and each lane
-            // tracks matches against its own copy — so every lane emitted the
-            // unmatched rows again. TPC-H-shaped queries never noticed; a `RIGHT JOIN`
-            // under a `COUNT(*)` returned 160 instead of 10 at `-j 16`. The map+join
-            // paths refuse these for the same reason.
             if (!joinKindLaneSafe(j.kind)) return null;
             if (first_join == null) first_join = i;
         },
@@ -1717,12 +1482,6 @@ fn classifyAggJoinPipeline(stages: []const ast.Stage) ?AggJoinShape {
     };
 }
 
-/// Materialize every build side in a join chain, left to right, threading each join's
-/// output schema into the next as its probe schema. Returns the lane recipes in
-/// application order plus the schema the aggregate above them reads.
-///
-/// A single join was the original limit, and it left TPC-H q03 — which joins two
-/// dimensions — on the serial driver while q12 and q14 fanned out.
 const LaneJoinChain = struct { joins: []const LaneJoin, out_schema: types.Schema };
 
 fn resolveLaneJoins(env: *Env, join_span: []const ast.Stage, left_schema: types.Schema) anyerror!LaneJoinChain {
@@ -1730,7 +1489,6 @@ fn resolveLaneJoins(env: *Env, join_span: []const ast.Stage, left_schema: types.
     var schema = left_schema;
     var i: usize = 0;
     while (i < join_span.len) {
-        // The span starts on a join, and `i` only ever advances to the next one.
         std.debug.assert(join_span[i].node == .join);
         var k = i + 1;
         while (k < join_span.len and join_span[k].node != .join) k += 1;
@@ -1742,19 +1500,12 @@ fn resolveLaneJoins(env: *Env, join_span: []const ast.Stage, left_schema: types.
     return .{ .joins = list.items, .out_schema = schema };
 }
 
-/// Parallel aggregate over a local parquet file, one morsel per row group.
-/// Two phases, neither of which takes a lock: lanes fold disjoint row groups
-/// into private tables, then the tables are merged by hash partition.
-///
-/// Returns false (serial fallback) when the file has too few row groups to
-/// split, or when fewer than `pq_min_lanes` lanes are available.
+/// Parallel aggregate over parquet, one morsel per row group, folded into private tables
+/// and merged by hash partition. False when too few row groups or lanes.
 fn runParallelParquetAgg(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     return runParallelParquetAggImpl(env, rd, pipeline, prefix, ag, tail, null, w, opts, stats, lanes_used);
 }
 
-/// The join-then-aggregate shape: the build side is materialized once into a shared
-/// index (exactly as the map+join path does) and each lane probes it, then folds its
-/// own morsels into its own partial group set.
 fn runParallelParquetAggJoin(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, js: AggJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     return runParallelParquetAggImpl(env, rd, pipeline, js.map_stages, js.ag, js.tail, js, w, opts, stats, lanes_used);
 }
@@ -1767,9 +1518,6 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
     const src_schema = morsels.src_schema;
     var agg_in_schema = try mapChainSchema(env, prefix, src_schema.*);
 
-    // The build side is materialized here, once, and every lane probes it read-only.
-    // `resolveLaneJoin` also prevalidates the post-join stages and hands back the
-    // schema they produce — which is exactly what the aggregate reads.
     var lane_joins: []const LaneJoin = &.{};
     if (jshape) |js| {
         const chain = try resolveLaneJoins(env, js.join_span, agg_in_schema);
@@ -1833,17 +1581,6 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
 
     const t_mrg0 = std.time.Instant.now() catch unreachable;
     if (apl.by.len == 0) {
-        // An ungrouped aggregate (`SELECT SUM(x) FROM ...`) folds to one implicit
-        // group per lane and has no key to hash, so the radix merge below had
-        // nothing to partition on and dropped every lane — COUNT(*) came back 0
-        // instead of the row count, silently. That is why this shape used to be
-        // turned away to the serial driver, at 3x the wall clock on 16 threads.
-        //
-        // With no key there is exactly one group, so partitioning buys nothing:
-        // fold the lanes straight into partition 0. Walking them in lane index
-        // order is what keeps a parallel float SUM reproducible, the same rule
-        // `combineAggSlots` follows — and it is the CSV path's behaviour, which
-        // has always run this shape in parallel.
         const dst = &parts[0];
         for (lanes) |*l| {
             for (l.sets) |*st| {
@@ -1904,8 +1641,6 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
             };
             _ = try parallel.spawnJoin(arena, nthreads, pqTopNWorker, &tctx);
             if (tctx.queue.failure()) |e| return e;
-            // `sel` lines up with the sets `partSets` returns: one per partition that
-            // received a group, in order.
             var kept = std.array_list.Managed([]const u32).init(arena);
             for (parts, tctx.sel) |*pp, sl| {
                 if (pp.merge != null) try kept.append(sl);
@@ -1938,15 +1673,10 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
     return true;
 }
 
-/// Returns true if it handled the pipeline in parallel; false to fall back to serial.
 fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     return runParallelCsvAggImpl(env, rd, prefix, ag, tail, null, w, opts, stats, lanes_used);
 }
 
-/// The join-then-aggregate shape over a CSV source. The parquet twin is
-/// `runParallelParquetAggJoin`; keeping both means a shape does not silently lose its
-/// parallelism by changing file format, which is how an ungrouped aggregate came to
-/// run on one core for parquet and sixteen for CSV.
 fn runParallelCsvAggJoin(env: *Env, rd: ast.Read, js: AggJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     return runParallelCsvAggImpl(env, rd, js.map_stages, js.ag, js.tail, js, w, opts, stats, lanes_used);
 }
@@ -2017,14 +1747,7 @@ fn runParallelCsvAggImpl(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag:
     return true;
 }
 
-/// Shared state for parallel SQL-aggregate lanes. Mirrors `AggCtx`, but each lane opens
-/// its own DB connection over one key-range predicate (`openSplitSource`) instead of
-/// reading a CSV byte-range. Each lane folds its range into that range's `AggSlot`, and
-/// `combineAggSlots` folds the slots together in key-range order at the raw-`Acc` level
-/// (so AVG stays correct, and a float SUM adds the same way on every run). The combine is
-/// O(groups) vs the O(rows) fold, so it costs little next to the scan.
 const SqlAggCtx = struct {
-    /// String group keys' ids, one table for every lane so their partials agree.
     strs: *op.Aggregate.StrTable,
     split: SplitCtx,
     predicates: []const []const u8,
@@ -2072,14 +1795,8 @@ fn sqlAggWorkOne(ctx: *SqlAggCtx, i: usize) !void {
     slot.sets = try agg.drainParts();
 }
 
-/// Parallel SQL aggregate: `read <sqltable> | (filter|select)* | aggregate | (sort|limit)* | write`
-/// over a splittable source. Fans into key-range lanes (one DB connection each), folds a
-/// partial group set per lane, merges at the raw-`Acc` level, then runs the small
-/// post-aggregate tail serially over the merged batch. Returns false to fall back to the
-/// serial path (non-splittable source, no split plan, bare upsert). NOTE: exercised only
-/// against a live DB — there is no local DB in the test suite, so this path is covered by
-/// the shared CSV-aggregate machinery (`drainSet`/`GroupMerge`/`emitSets`) it reuses, not
-/// by a direct test.
+/// Parallel SQL aggregate over key-range lanes, one connection and one `AggSlot` per
+/// range (ranges are stolen, so only the range index is stable). False falls back.
 pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, src_base: usize) anyerror!bool {
     const arena = env.arena;
     const desc = env.sql_desc orelse return false;
@@ -2109,8 +1826,6 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
     env.sink_name = sinkLabel(env, w);
 
     const nlanes = @min(@max(@as(usize, 1), opts.threads), sp.predicates.len);
-    // One slot per key range, not per lane: the lanes steal ranges off the queue,
-    // so only the range index is a stable identity to combine in.
     const slots = try allocAggSlots(env.gpa, sp.predicates.len);
     defer freeAggSlots(env.gpa, slots);
     const parts = try allocMergeParts(env.gpa);
@@ -2160,9 +1875,6 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
     return true;
 }
 
-/// Recognize a map-only `read … | (filter|select)* | write` (no breaker, no limit),
-/// returning the middle stages. Such a pipeline parallelizes by byte-range chunks
-/// with each worker writing to a shared sink. null → not eligible.
 fn classifyMapPipeline(stages: []const ast.Stage) ?[]const ast.Stage {
     const middle = stages[1 .. stages.len - 1];
     for (middle) |st| switch (st.node) {
@@ -2174,10 +1886,6 @@ fn classifyMapPipeline(stages: []const ast.Stage) ?[]const ast.Stage {
 
 const MapJoinShape = struct { prefix: []const ast.Stage, join: ast.Join, join_hints: []const ast.Hint, suffix: []const ast.Stage };
 
-/// Recognize `read … | (filter|select)* | join | (filter|select)* | write` — exactly
-/// one hash join, no breaker anywhere. The build side is materialized once up front
-/// and the probe side then fans out over morsels like a plain map pipeline.
-/// null → not eligible (any other stage, a second join, or no join at all).
 pub fn classifyMapJoinPipeline(stages: []const ast.Stage) ?MapJoinShape {
     if (stages.len < 3) return null;
     if (stages[stages.len - 1].node != .write) return null;
@@ -2195,13 +1903,8 @@ pub fn classifyMapJoinPipeline(stages: []const ast.Stage) ?MapJoinShape {
     return .{ .prefix = middle[0..j], .join = middle[j].node.join, .join_hints = middle[j].hints, .suffix = middle[j + 1 ..] };
 }
 
-/// Join kinds whose probe is a pure lookup into a read-only index, so every lane can
-/// share one index and emit independently. `right`/`full` have to remember which
-/// build rows matched — that state is global to the probe, not per-lane, so they stay
-/// on the serial driver.
-///
-/// Matched by tag name rather than by a switch: the kind set is still growing on
-/// another branch, and an allowlist spelled this way stays correct either way.
+/// Join kinds whose probe is a pure lookup into a shared read-only index. Matched by tag
+/// name, not a switch: the kind set is still growing on another branch.
 pub fn joinKindLaneSafe(kind: ast.JoinKind) bool {
     for ([_][]const u8{ "inner", "left", "semi", "anti", "cross" }) |ok| {
         if (std.mem.eql(u8, @tagName(kind), ok)) return true;
@@ -2209,20 +1912,14 @@ pub fn joinKindLaneSafe(kind: ast.JoinKind) bool {
     return false;
 }
 
-/// Read a key-index field off `analyze.JoinPlan` as a slice. The multi-key rework
-/// turns the single `lk`/`rk` index into an array; accepting both spellings and both
-/// arities keeps this path building against either snapshot.
+/// A key-index field of `analyze.JoinPlan` as a slice, accepting both the single and
+/// the multi-key spelling so this builds against either snapshot.
 fn planKeys(a: std.mem.Allocator, jp: analyze.JoinPlan, comptime which: []const u8) ![]const usize {
     const name: []const u8 = comptime if (@hasField(analyze.JoinPlan, which)) which else if (std.mem.eql(u8, which, "lk")) "lks" else "rks";
     const v = @field(jp, name);
     return if (@TypeOf(v) == usize) try a.dupe(usize, &[_]usize{v}) else v;
 }
 
-/// What a lane needs to rebuild its own `op.Join` over the one shared build index.
-/// Everything here is read-only for the lifetime of the fan-out: `index` is fully
-/// populated before any lane starts, and the schemas/key slices live in the plan
-/// arena. Each lane still allocates its OWN `op.Join` (it carries mutable stats and
-/// per-batch scratch) — only the index is shared.
 const LaneJoin = struct {
     index: *op.JoinIndex,
     left_keys: []const usize,
@@ -2237,11 +1934,9 @@ const LaneJoin = struct {
 
 const LaneJoinPlan = struct { lane: LaneJoin, out_schema: types.Schema };
 
-/// Hoist the join out of the fan-out: resolve the binding, materialize the build side
-/// once into a shared read-only index, and prevalidate the post-join stages against
-/// the join's output schema so a lane rebuild cannot fail where this succeeded.
-/// Returns the lane recipe plus the pipeline's final output schema (what the sink
-/// gets opened with).
+/// Hoist the join out of the fan-out: materialize the build side into a shared index
+/// (the pulls are scratch) and prevalidate the suffix. Returns the lane recipe and the
+/// sink's output schema.
 fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suffix: []const ast.Stage, left_schema: types.Schema) anyerror!LaneJoinPlan {
     const arena = env.arena;
     const binding = env.bindings.get(j.binding) orelse
@@ -2254,12 +1949,8 @@ fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suffix:
     const right_schema = try schemaPtr(arena, build.schema);
     const right_keys = try planKeys(arena, jp, "rk");
 
-    // Serial prevalidation of the suffix, exactly as `mapChainSchema` does for the
-    // prefix: any analyze error surfaces here, with a diag, before any lane exists.
     const final_schema = try mapChainSchema(env, suffix, out.*);
 
-    // The index outlives the fan-out (plan arena); the pulls that fill it are scratch
-    // and go away with `build_arena` — `materializeFull` copies into the state arena.
     var build_arena = std.heap.ArenaAllocator.init(env.gpa);
     defer build_arena.deinit();
     const index = try op.JoinIndex.create(arena, build_arena.allocator(), build.op, right_schema, right_keys, try joinBuildCap(env, join_hints));
@@ -2280,9 +1971,6 @@ fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suffix:
     };
 }
 
-/// Per-lane tail of the operator tree: this lane's own `op.Join` over the shared
-/// index, then the post-join `filter`/`select` stages. `ta` is the lane arena, so
-/// nothing built here is touched by another thread.
 fn buildLaneJoinChain(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), errctx: ?*op.ErrCtx, lj: LaneJoin, probe: op.Op) !op.Op {
     const j = try ta.create(op.Join);
     j.* = .{
@@ -2301,9 +1989,6 @@ fn buildLaneJoinChain(ta: std.mem.Allocator, params: *std.StringHashMap(*const a
     return buildChainFrom(ta, params, errctx, lj.suffix, .{ .join = j }, lj.out_schema.*);
 }
 
-/// One lane of a split-parallel SQL map+join. Everything here is either read-only
-/// for the fan-out (the split recipe, the shared build index, the stage lists) or
-/// atomic/mutex-guarded (`queue`, `rows_out`, the shared sink).
 const SqlMapJoinCtx = struct {
     split: SplitCtx,
     predicates: []const []const u8,
@@ -2319,10 +2004,6 @@ const SqlMapJoinCtx = struct {
     rows_read: *obs.RowCounter,
 };
 
-/// A lane's probe source: one key-range query at a time, rolling to the next split
-/// when the current one runs dry. Stealing inside the source is what lets a lane
-/// build its operator chain — and open its sink — once however many splits it takes,
-/// the same deal `parallel.run` gives the map-only split path.
 const SplitSource = struct {
     ctx: *SqlMapJoinCtx,
     gpa: std.mem.Allocator,
@@ -2398,20 +2079,12 @@ fn sqlMapJoinLaneRun(ctx: *SqlMapJoinCtx, lane_idx: usize) !void {
     }
 }
 
-/// Split-parallel SQL map+join:
-/// `read <sqltable> | (filter|select)* | join | (filter|select)* | write` over a
-/// splittable source. The build side is materialized once here into a shared
-/// read-only index; each lane then opens its own connection per key range, runs the
-/// pre-join chain, probes that index with its own `op.Join`, and runs the post-join
-/// stages. Returns false to fall back to the serial driver (non-splittable source,
-/// no split plan, bare upsert, join kind whose probe carries global state).
-///
-/// NOTE: like `runParallelSqlAgg`, only exercised against a live DB — the local test
-/// suite covers the shared join machinery through the CSV/parquet fan-outs.
+/// Split-parallel SQL map+join. The serial plan's sources are closed before the shared
+/// index opens its own. No projection narrowing under a join (planMap's liveness is
+/// map-shaped), so lanes select `*`; join-aware liveness would fix that.
 pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, src_base: usize) anyerror!bool {
     const arena = env.arena;
     if (stages[0].node != .read) return false;
-    // Not `env.sql_desc`: the build side planned after this read may have replaced it.
     const desc = (try sqlDescForStage(env, stages[0])) orelse return false;
     if (!joinKindLaneSafe(shape.join.kind)) return false;
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
@@ -2422,12 +2095,9 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
 
     const sp = (try planSplit(env, desc, stages[0], opts.threads, w)) orelse return false;
 
-    // Drop the serial plan's sources (this read and the build side's) before the
-    // shared index opens its own, so nothing this path needs gets closed under it.
     for (env.sources.items[src_base..]) |sc| sc.close();
     env.sources.shrinkRetainingCapacity(src_base);
 
-    // Before any lane exists: build side materialized, suffix prevalidated.
     const lp = try resolveLaneJoin(env, shape.join, shape.join_hints, shape.suffix, probe_schema);
 
     env.sink_name = sinkLabel(env, w);
@@ -2436,12 +2106,6 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
     var shared_open = sink_mode == .shared;
     errdefer if (shared_open) sink_mode.shared.abort();
 
-    // ponytail: no projection narrowing under a join. `pushdown.planMap`'s liveness is
-    // map-shaped; past a join the live set is the left join keys plus whatever the
-    // suffix and the emitted left columns read, which it does not compute — so lanes
-    // select `*`. Leading prefix filters are already folded into `base_sql` by
-    // runOutput's implicit pushdown, so the WHERE half needs nothing here either.
-    // Upgrade: join-aware liveness.
     var ctx = SqlMapJoinCtx{
         .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = sp.base_sql, .report = try connect_mod.readReport(env, @tagName(desc.kind)) },
         .predicates = sp.predicates,
@@ -2473,7 +2137,6 @@ fn runParallelCsvMap(env: *Env, rd: ast.Read, map_stages: []const ast.Stage, w: 
     return runParallelCsvMapImpl(env, rd, map_stages, null, w, opts, stats, lanes_used);
 }
 
-/// The same fan-out with one hash join hoisted out of it.
 fn runParallelCsvMapJoin(env: *Env, rd: ast.Read, shape: MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     if (!joinKindLaneSafe(shape.join.kind)) return false;
     return runParallelCsvMapImpl(env, rd, shape.prefix, shape, w, opts, stats, lanes_used);
@@ -2487,8 +2150,6 @@ fn runParallelCsvMapImpl(env: *Env, rd: ast.Read, map_stages: []const ast.Stage,
 
 const TopNShape = struct { prefix: []const ast.Stage, srt: ast.Sort, lim: ast.Limit };
 
-/// Recognize `read … | (filter|select)* | sort | limit | write` — a Top-N. The sort
-/// must be immediately followed by the limit (the fusable form). null otherwise.
 fn classifyTopNPipeline(stages: []const ast.Stage) ?TopNShape {
     const middle = stages[1 .. stages.len - 1];
     if (middle.len < 2) return null;
@@ -2502,10 +2163,6 @@ fn classifyTopNPipeline(stages: []const ast.Stage) ?TopNShape {
     return .{ .prefix = prefix, .srt = middle[middle.len - 2].node.sort, .lim = middle[middle.len - 1].node.limit };
 }
 
-/// Parallel top-N: each work item keeps its own top `offset+count` rows, then a
-/// global top-N over the union produces the final sorted, offset/limited output.
-/// Only `cap` rows per item ever reach the combine. The output is small and
-/// sorted, so (unlike map-only) it stays deterministic.
 const TopNCtx = struct {
     split: LaneSplit,
     row_schema: *const types.Schema,
@@ -2515,7 +2172,6 @@ const TopNCtx = struct {
     keys: []const op.Sort.Key,
     cap: u64,
     queue: WorkQueue,
-    /// Every item's kept rows, positions included, for the combine to rank.
     kept: std.array_list.Managed(op.TopN.Entry),
     kept_arena: std.mem.Allocator,
     mtx: std.Thread.Mutex = .{},
@@ -2533,8 +2189,6 @@ fn topnWorkOne(ctx: *TopNCtx, i: usize) !void {
     defer batch_arena.deinit();
 
     const src_schema = ctx.split.schema();
-    // Rows are numbered by input position: a CSV lane's chunk is chunk `i`; a
-    // parquet lane steals row groups, and says which one each batch is from.
     var item_ptr: ?*const usize = null;
     const inner: driver.Source = switch (ctx.split) {
         .parquet => |*m| blk: {
@@ -2572,7 +2226,6 @@ fn topnWorkOne(ctx: *TopNCtx, i: usize) !void {
     }
 }
 
-/// Source-independent — `split` says how the input divides; see `LaneSplit`.
 fn runParallelTopN(
     env: *Env,
     split: LaneSplit,
@@ -2620,8 +2273,6 @@ fn runParallelTopN(
     env.log.log(.debug, "parallel {s} top-n: {d} {s} over {d} lanes", .{ split.label(), split.count(nthreads), split.unitName(), lanes });
     if (ctx.queue.failure()) |e| return e;
 
-    // the combine ranks every item's best by key, then input position: what a
-    // stable sort of the whole input would put first
     std.mem.sort(op.TopN.Entry, ctx.kept.items, ks, struct {
         fn lt(keys: []const op.Sort.Key, x: op.TopN.Entry, y: op.TopN.Entry) bool {
             return op.entryLess(x, y, keys);
@@ -2658,13 +2309,9 @@ fn runParallelCsvTopN(env: *Env, rd: ast.Read, prefix: []const ast.Stage, srt: a
 
 const DistinctShape = struct { prefix: []const ast.Stage, dist: ast.Distinct, tail: []const ast.Stage };
 
-/// Recognize `read … | (filter|select)* | distinct | (sort|limit)* | write`.
 fn classifyDistinctPipeline(stages: []const ast.Stage) ?DistinctShape {
     const middle = stages[1 .. stages.len - 1];
     var di: ?usize = null;
-    // Anything `writeTail` can rebuild over the merged batch may follow the
-    // distinct: an aggregate over it (`COUNT(*) FROM (SELECT DISTINCT …)`)
-    // used to send the whole query to the serial driver.
     for (middle, 0..) |st, i| switch (st.node) {
         .filter, .select => {},
         .distinct => {
@@ -2678,11 +2325,6 @@ fn classifyDistinctPipeline(stages: []const ast.Stage) ?DistinctShape {
     return .{ .prefix = middle[0..d], .dist = middle[d].node.distinct, .tail = middle[d + 1 ..] };
 }
 
-/// A surviving distinct row plus where it sat in the input: chunk index (chunks
-/// are handed out in file order) then row ordinal inside that chunk. `DISTINCT`
-/// keeps the *first* row per key, so the merge has to be able to say which of
-/// two candidates came first — otherwise the winner is whichever lane reached
-/// the mutex first and the non-key columns change from run to run.
 const DistinctRow = struct {
     chunk: usize,
     ord: u64,
@@ -2694,9 +2336,6 @@ const DistinctRow = struct {
     }
 };
 
-/// Cross-lane distinct state. Each lane dedups its own chunk and then folds the
-/// survivors in here; ties are broken by input position, so the result — values
-/// *and* order — is what a serial run would have produced.
 const DistinctMerge = struct {
     seen: op.Aggregate.GroupMap(),
     rows: std.array_list.Managed(DistinctRow),
@@ -2719,8 +2358,6 @@ const DistinctMerge = struct {
         return vals;
     }
 
-    /// Folds one lane's already-deduped batch in. `ords` is `op.Distinct.ords`
-    /// for that batch; `chunk` is the work item the lane read.
     fn absorb(self: *DistinctMerge, chunk: usize, b: Batch, ords: []const u64, probe: []Value) !void {
         self.mtx.lock();
         defer self.mtx.unlock();
@@ -2745,8 +2382,7 @@ const DistinctMerge = struct {
         }
     }
 
-    /// Input order, then one batch. Sorting here is what makes `-j 8` agree with
-    /// `-j 1` byte for byte instead of only row-count for row-count.
+    /// Input order, then one batch: sorting here makes `-j 8` agree with `-j 1` byte for byte.
     fn finish(self: *DistinctMerge, row_schema: *const types.Schema) !Batch {
         std.mem.sort(DistinctRow, self.rows.items, {}, DistinctRow.before);
         const cols = try self.arena.alloc(column.Column, row_schema.fields.len);
@@ -2774,10 +2410,8 @@ const DistinctCtx = struct {
 
 const distinctWorker = dispatchWorker(DistinctCtx, distinctWorkOne);
 
-/// One work item — a CSV chunk or a parquet row group. Deduping per item rather
-/// than per lane costs a little extra traffic through the merge mutex, but it is
-/// what makes the item index a usable position: item `i` precedes item `i+1` in
-/// the file, so the merge keeps the same row a serial run would.
+/// Dedups per item rather than per lane, so the item index is a file position and the
+/// merge keeps the same row a serial run would.
 fn distinctWorkOne(ctx: *DistinctCtx, i: usize) !void {
     var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
     defer _ = wgpa.deinit();
@@ -2801,7 +2435,6 @@ fn distinctWorkOne(ctx: *DistinctCtx, i: usize) !void {
     }
 }
 
-/// A single already-positioned parquet reader as a `Source`.
 const ReaderSource = struct {
     r: *pqdecode.Reader,
     schema_: *const types.Schema,
@@ -2814,8 +2447,6 @@ const ReaderSource = struct {
         const self: *ReaderSource = @ptrCast(@alignCast(ptr));
         return self.r.next(arena);
     }
-    /// Owns the reader: `laneRowSource` hands this out in place of a reader the
-    /// caller held in a local, so closing the source is what releases it.
     fn closeFn(ptr: *anyopaque) void {
         const self: *ReaderSource = @ptrCast(@alignCast(ptr));
         self.r.close();
@@ -2823,11 +2454,6 @@ const ReaderSource = struct {
     const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
 };
 
-/// Parallel distinct: each worker dedups its own work item locally, then folds
-/// the survivors into a shared merge that keeps the row which came first in the
-/// input, so the result matches `-j 1` exactly. Returns false to fall back.
-///
-/// Source-independent — `split` says how the input divides; see `LaneSplit`.
 fn runParallelDistinct(
     env: *Env,
     split: LaneSplit,
@@ -2882,8 +2508,6 @@ fn runParallelDistinct(
     const merged = try merge.finish(row_schema);
 
     const wr = try resolveUpsertKeys(env, w);
-    // The sink takes the tail's schema, not the distinct rows': an aggregate
-    // after the distinct writes its own columns.
     const snk = try openSink(env, wr, try tailSchema(env, tail, row_schema.*));
     var snk_open = true;
     errdefer if (snk_open) snk.abort();

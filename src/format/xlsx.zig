@@ -1,4 +1,5 @@
-//! Excel workbook reader — `FROM 'report.xlsx'` / `.xlsm`.
+//! Excel workbook reader: `FROM 'report.xlsx'` / `.xlsm`, with
+//! `WITH (sheet = '...', header = false, range = 'B3:F200')`.
 //!
 //! An `.xlsx` is a zip of XML parts, found through relationship files rather than
 //! fixed names: `_rels/.rels` names the workbook, the workbook's own `.rels` its
@@ -7,17 +8,19 @@
 //!
 //! A sheet is read twice. The first pass, at plan time, walks every row to decide
 //! each column's type and the rows that hold data; the second streams those rows
-//! out as batches. Cells carry their own types, so the first pass is not a sniff:
-//! a "Total" row of text at the bottom of a number column makes that column text
-//! rather than failing the load where it is reached. What stays in memory is the
-//! shared-string table — where most of a sheet's text lives — not the rows.
+//! out as batches, and a cell that no longer fits its column means the file changed
+//! between the passes. Cells carry their own types, so the first pass is not a
+//! sniff: a "Total" row of text at the bottom of a number column makes that column
+//! text rather than failing the load where it is reached. What stays in memory is
+//! the shared-string table (capped at `max_strings_bytes`), not the rows.
 //!
 //! Types, per column: numbers are `int` when every one is an integer below 2^53
 //! (past that a double has already lost digits) and `float` otherwise; numbers in
 //! a date or time format are `date`, `timestamp` or `time`; booleans are `bool`;
 //! any text makes the column `string`, where a number keeps the digits the file
 //! stored. Empty cells and error values (`#N/A`, `#DIV/0!`) are null. A formula
-//! reads as the value Excel last computed; nothing is evaluated.
+//! reads as the value Excel last computed; nothing is evaluated. An ISO 8601 date
+//! cell, as strict OOXML writes it, stays text.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -40,12 +43,10 @@ pub const Error = error{
     ReadFailed,
 };
 
-/// Shared strings held at most — the one part of a workbook kept in memory.
 const max_strings_bytes: usize = 512 << 20;
 
 const batch_rows = 4096;
 
-/// Excel's own limits: 16,384 columns, 1,048,576 rows.
 const max_cols = 16384;
 const max_rows = 1048576;
 
@@ -53,14 +54,12 @@ pub fn isPath(path: []const u8) bool {
     return std.ascii.endsWithIgnoreCase(path, ".xlsx") or std.ascii.endsWithIgnoreCase(path, ".xlsm");
 }
 
-/// `WITH (sheet = '...', header = false, range = 'B3:F200')`.
 pub const Options = struct {
     sheet: ?[]const u8 = null,
     header: bool = true,
     range: ?Range = null,
 };
 
-/// Zero-based columns, one-based rows, inclusive; an open end reads to the data's.
 pub const Range = struct {
     c0: u32,
     r0: u32,
@@ -68,7 +67,6 @@ pub const Range = struct {
     r1: ?u32 = null,
 };
 
-/// `A1`, `B3:F200`, or `B3:F` (to the last row).
 pub fn parseRange(s: []const u8) ?Range {
     const colon = std.mem.indexOfScalar(u8, s, ':');
     const a = cellRef(if (colon) |c| s[0..c] else s) orelse return null;
@@ -87,7 +85,7 @@ pub fn parseRange(s: []const u8) ?Range {
 
 const Ref = struct { col: u32, row: ?u32 };
 
-/// `C5` → column 2, row 5; `C` alone → column 2, no row.
+/// `C5` is column 2, row 5; `C` alone is column 2, no row.
 fn cellRef(s: []const u8) ?Ref {
     var i: usize = 0;
     var col: u32 = 0;
@@ -102,7 +100,6 @@ fn cellRef(s: []const u8) ?Ref {
     return .{ .col = col - 1, .row = row };
 }
 
-/// `A`, `B`, … `Z`, `AA` — a column's letters, for a header that is empty.
 pub fn colName(arena: std.mem.Allocator, col: u32) ![]const u8 {
     var buf: [4]u8 = undefined;
     var n: usize = 0;
@@ -114,11 +111,10 @@ pub fn colName(arena: std.mem.Allocator, col: u32) ![]const u8 {
     return arena.dupe(u8, buf[4 - n ..]);
 }
 
-/// How a cell's number format reads it.
 const Fmt = enum { number, date, datetime, time };
 
-/// Built-in format ids that are dates and times. 27–36 and 50–58 are the East
-/// Asian locale dates; 46 (`[h]:mm:ss`) is a duration and stays a number.
+/// Built-in format ids that are dates and times. 27-36 and 50-58 are East Asian
+/// locale dates; 46 (`[h]:mm:ss`) is a duration and stays a number.
 fn builtinFmt(id: u32) Fmt {
     return switch (id) {
         14...17, 27...36, 50...58 => .date,
@@ -128,9 +124,8 @@ fn builtinFmt(id: u32) Fmt {
     };
 }
 
-/// A custom format code's kind: date and time tokens outside quoted text,
-/// `[...]` sections and backslash escapes. `m` is a month beside `y`/`d` and a
-/// minute beside `h`/`s`; `[h]` makes it a duration, which is a number.
+/// Date and time tokens outside quoted text, `[...]` sections and escapes, in the first
+/// section. `m` is a month beside `y`/`d` and a minute beside `h`/`s`; `[h]` is a duration.
 fn customFmt(code: []const u8) Fmt {
     var date = false;
     var time = false;
@@ -150,7 +145,7 @@ fn customFmt(code: []const u8) Fmt {
                     std.mem.indexOfNone(u8, inner, "hHmMsS") == null) return .number;
                 i = end;
             },
-            ';' => break, // the first section decides
+            ';' => break,
             else => switch (std.ascii.toLower(c)) {
                 'y', 'd' => date = true,
                 'h', 's' => time = true,
@@ -164,7 +159,6 @@ fn customFmt(code: []const u8) Fmt {
     return .number;
 }
 
-/// A cell's `t`: what its `<v>` holds.
 const CellType = enum {
     number,
     shared,
@@ -174,8 +168,8 @@ const CellType = enum {
     err,
     iso_date,
 
-    /// Parsed where the tag is read: the attribute's bytes live in the
-    /// tokenizer's buffer, which the next read may move.
+    /// Parsed where the tag is read: the attribute's bytes live in the tokenizer's
+    /// buffer, which the next read may move.
     fn of(t: ?[]const u8) CellType {
         const v = t orelse return .number;
         if (std.mem.eql(u8, v, "s")) return .shared;
@@ -188,17 +182,14 @@ const CellType = enum {
     }
 };
 
-/// One parsed cell.
 const Cell = struct {
     col: u32,
     kind: enum { empty, number, text, boolean, err },
-    /// `text`: the decoded string; `number`: the stored digits.
     text: []const u8 = "",
     num: f64 = 0,
     fmt: Fmt = .number,
 };
 
-/// What the first pass learned about one column.
 const Stats = struct {
     text: bool = false,
     boolean: bool = false,
@@ -206,10 +197,8 @@ const Stats = struct {
     integral: bool = true,
     dated: bool = false,
     timed: bool = false,
-    /// A date-formatted value with a time of day, or a time format at or past a day.
     fraction: bool = false,
     any: bool = false,
-    /// The header cell, rendered as text.
     header: ?[]const u8 = null,
 
     fn note(self: *Stats, c: Cell) void {
@@ -259,8 +248,8 @@ fn closePart(p: *Part) void {
     p.member.close();
 }
 
-/// `target` from a relationship in part `base`: relative to `base`'s folder, or
-/// from the package root when it starts with `/`. `..` steps out of a folder.
+/// `target` from a relationship in part `base`: relative to `base`'s folder, or from
+/// the package root when it starts with `/`. `..` steps out of a folder.
 fn resolveTarget(arena: std.mem.Allocator, base: []const u8, target: []const u8) ![]const u8 {
     if (target.len > 0 and target[0] == '/') return arena.dupe(u8, target[1..]);
     const dir = if (std.mem.lastIndexOfScalar(u8, base, '/')) |i| base[0 .. i + 1] else "";
@@ -276,7 +265,6 @@ fn resolveTarget(arena: std.mem.Allocator, base: []const u8, target: []const u8)
     return std.mem.join(arena, "/", parts.items);
 }
 
-/// The `.rels` part that holds `part`'s relationships.
 fn relsOf(arena: std.mem.Allocator, part: []const u8) ![]const u8 {
     const slash = std.mem.lastIndexOfScalar(u8, part, '/');
     const dir = if (slash) |i| part[0 .. i + 1] else "";
@@ -286,8 +274,8 @@ fn relsOf(arena: std.mem.Allocator, part: []const u8) ![]const u8 {
 
 const Rel = struct { id: []const u8, kind: []const u8, target: []const u8 };
 
-/// The relationships in `rels`, targets resolved against `base`. A part that is
-/// not there has none.
+/// The relationships in `rels`, targets resolved against `base`. A part that is not
+/// there has none.
 fn readRels(arena: std.mem.Allocator, gpa: std.mem.Allocator, path: []const u8, rels: []const u8, base: []const u8) ![]Rel {
     var p = openPart(arena, gpa, path, rels) catch |e| switch (e) {
         error.ZipMemberNotFound => return &.{},
@@ -301,7 +289,6 @@ fn readRels(arena: std.mem.Allocator, gpa: std.mem.Allocator, path: []const u8, 
             const ty = o.attr("Type") orelse continue;
             try out.append(.{
                 .id = try decodeAttr(arena, o.attr("Id") orelse continue),
-                // the last path segment: `.../relationships/worksheet`
                 .kind = try arena.dupe(u8, ty[if (std.mem.lastIndexOfScalar(u8, ty, '/')) |i| i + 1 else 0..]),
                 .target = try resolveTarget(arena, base, try decodeAttr(arena, o.attr("Target") orelse continue)),
             });
@@ -329,31 +316,23 @@ pub const Reader = struct {
     path: []const u8,
     sheet_part: []const u8,
     strings: []const []const u8,
-    /// Per cell style (`s`), what its number format makes of a number.
     styles: []const Fmt,
     date1904: bool,
     schema: types.Schema,
-    /// The sheet's columns read, `c0 ..= c1`.
     c0: u32,
     c1: u32,
-    /// The first and last row emitted.
     first_row: u32,
     last_row: u32,
     kinds: []types.TypeKind,
 
-    // the second pass
     part: ?Part = null,
     next_row: u32 = 0,
-    /// The last `<row>` number read, for a row without an `r`.
     seen: u32 = 0,
-    /// The row read but not yet emitted: past the batch's end, or ahead of rows
-    /// the file left out.
     pending: ?u32 = null,
     row_cells: std.array_list.Managed(Cell),
     row_arena: std.heap.ArenaAllocator,
     done: bool = false,
 
-    /// Read the workbook's structure and run the first pass over the sheet.
     pub fn open(arena: std.mem.Allocator, gpa: std.mem.Allocator, path: []const u8, opts: Options) !*Reader {
         const self = try arena.create(Reader);
         self.* = undefined;
@@ -373,7 +352,6 @@ pub const Reader = struct {
         const wb_part = relKind(root, "officeDocument") orelse return error.NotXlsx;
         const wb_rels = try readRels(arena, gpa, path, try relsOf(arena, wb_part), wb_part);
 
-        // the workbook: the 1904 flag and the sheets, in tab order
         var chosen: ?[]const u8 = null;
         self.date1904 = false;
         {
@@ -387,7 +365,6 @@ pub const Reader = struct {
                     const rid = o.attr("id") orelse continue;
                     for (wb_rels) |r| {
                         if (!std.mem.eql(u8, r.id, rid)) continue;
-                        // a chartsheet has no cells
                         if (!std.mem.eql(u8, r.kind, "worksheet")) break;
                         const want = if (opts.sheet) |w| std.ascii.eqlIgnoreCase(w, name) else chosen == null;
                         if (want and chosen == null) chosen = r.target;
@@ -405,8 +382,6 @@ pub const Reader = struct {
         return self;
     }
 
-    /// The first pass: every row of the sheet, for the columns' types, the header
-    /// and the rows that hold data.
     fn firstPass(self: *Reader, opts: Options) !void {
         const a = self.arena;
         var stats = std.array_list.Managed(Stats).init(a);
@@ -506,6 +481,8 @@ pub const Reader = struct {
         self.row_arena.deinit();
     }
 
+    /// Rows the file left out between data rows are emitted empty, as are rows past the
+    /// file's last up to `last_row`.
     fn nextBatch(self: *Reader, arena: std.mem.Allocator) !?Batch {
         if (self.done or self.last_row == 0) return null;
         if (self.part == null) {
@@ -519,12 +496,10 @@ pub const Reader = struct {
         while (rows < batch_rows and self.next_row <= self.last_row) {
             if (self.pending == null) {
                 _ = self.row_arena.reset(.retain_capacity);
-                // past the file's last row, the rest to `last_row` are empty
                 self.pending = (try nextRow(&self.part.?.tk, &self.row_cells, self.row_arena.allocator(), self, &self.seen)) orelse max_rows + 1;
             }
             const num = self.pending.?;
             if (num < self.next_row) {
-                // the header, or a row above the range
                 self.pending = null;
                 continue;
             }
@@ -533,7 +508,6 @@ pub const Reader = struct {
                 rows += 1;
             }
             if (num > self.next_row) {
-                // a row the file left out, between data rows: empty
                 for (builders) |*b| try b.append(.null);
                 continue;
             }
@@ -554,9 +528,6 @@ pub const Reader = struct {
         return Batch{ .schema = &self.schema, .columns = cols, .len = rows };
     }
 
-    /// A cell as the value its column's type holds. The first pass settled the
-    /// type over the same cells, so a cell that does not fit means the file
-    /// changed between the passes.
     fn convert(self: *Reader, arena: std.mem.Allocator, c: Cell, k: types.TypeKind) !Value {
         if (c.kind == .empty or c.kind == .err) return .null;
         return switch (k) {
@@ -587,8 +558,6 @@ pub const Reader = struct {
     }
 };
 
-/// The workbook's worksheet names, in tab order — what an error about a sheet
-/// that is not there lists.
 pub fn sheetNames(arena: std.mem.Allocator, gpa: std.mem.Allocator, path: []const u8) ![]const []const u8 {
     const root = try readRels(arena, gpa, path, "_rels/.rels", "");
     const wb_part = relKind(root, "officeDocument") orelse return error.NotXlsx;
@@ -609,9 +578,8 @@ pub fn sheetNames(arena: std.mem.Allocator, gpa: std.mem.Allocator, path: []cons
     return names.items;
 }
 
-/// Days from the workbook's epoch — 1899-12-30, or 1904-01-01 — to 1970-01-01.
-/// The 1900 epoch is the one that makes serials from 61 on right; Excel counts a
-/// 29 February 1900 that never was, so serials below 61 read a day late.
+/// Days from the workbook's epoch (1899-12-30 or 1904-01-01) to 1970-01-01. Excel
+/// counts a 29 February 1900 that never was, so 1900 serials below 61 read a day late.
 fn epochOffset(date1904: bool) i64 {
     return if (date1904) 24107 else 25569;
 }
@@ -620,9 +588,8 @@ fn serialDays(serial: f64, date1904: bool) i64 {
     return @as(i64, @intFromFloat(@floor(serial))) - epochOffset(date1904);
 }
 
-/// A serial's time of day, to the millisecond. A day's fraction in a double
-/// cannot say 23:59:59.5 exactly — it reads back a microsecond off — and Excel
-/// itself keeps times to the millisecond, so that is the precision there is.
+/// To the millisecond: a day's fraction in a double cannot say 23:59:59.5 exactly, and
+/// Excel itself keeps times to the millisecond.
 fn serialMicros(serial: f64, date1904: bool) i64 {
     const ms: i64 = @intFromFloat(@round(serial * 86_400_000.0));
     return (ms - epochOffset(date1904) * 86_400_000) * 1000;
@@ -634,8 +601,6 @@ fn dayMicros(serial: f64) i64 {
     return ms * 1000;
 }
 
-/// A cell as text: a string as itself, a number as the digits the file stored, a
-/// dated number as ISO text, a boolean as `true`/`false`.
 fn renderText(arena: std.mem.Allocator, c: Cell, date1904: bool) ![]const u8 {
     return switch (c.kind) {
         .empty, .err => "",
@@ -650,8 +615,8 @@ fn renderText(arena: std.mem.Allocator, c: Cell, date1904: bool) ![]const u8 {
     };
 }
 
-/// ISO `YYYY-MM-DD` for days since 1970, before it too (Howard Hinnant's
-/// civil-from-days) — a 1904 workbook's serials start in 1904.
+/// ISO `YYYY-MM-DD` for days since 1970, before it too (the
+/// civil-from-days algorithm), since a 1904 workbook's serials start in 1904.
 fn fmtDate(arena: std.mem.Allocator, days: i64) ![]const u8 {
     const z = days + 719468;
     const era = @divFloor(z, 146097);
@@ -678,8 +643,8 @@ fn fmtTimestamp(arena: std.mem.Allocator, us: i64) ![]const u8 {
     return std.fmt.allocPrint(arena, "{s} {s}", .{ try fmtDate(arena, days), try fmtTime(arena, us - days * 86_400_000_000) });
 }
 
-/// The next `<row>` of a sheet into `out` (cells in column order), or null after
-/// the last. Rows and cells without an `r` attribute follow the one before.
+/// The next `<row>` into `out` (cells in column order), or null after the last. Rows
+/// and cells without an `r` attribute follow the one before.
 fn nextRow(tk: *xml.Tokenizer, out: *std.array_list.Managed(Cell), scratch: std.mem.Allocator, rd: *const Reader, prev_row: *u32) !?u32 {
     out.clearRetainingCapacity();
     while (try tk.next()) |t| {
@@ -725,13 +690,12 @@ fn nextRow(tk: *xml.Tokenizer, out: *std.array_list.Managed(Cell), scratch: std.
     return null;
 }
 
-/// The body of a `<c>`: its `<v>` or `<is>`, read as its `t` says. A formula
-/// (`<f>`) is skipped — its cached `<v>` is the value.
+/// The body of a `<c>`, read as its `t` says. A formula (`<f>`) is skipped: its cached
+/// `<v>` is the value.
 fn readCell(tk: *xml.Tokenizer, cell: *Cell, ty: CellType, scratch: std.mem.Allocator, rd: *const Reader) !void {
     while (try tk.next()) |t| switch (t) {
         .open => |o| {
             if (std.mem.eql(u8, o.name, "v")) {
-                // entities decoded; the OOXML escapes are for text only
                 const v = try collectText(tk, o, scratch, false);
                 switch (ty) {
                     .shared => {
@@ -747,7 +711,6 @@ fn readCell(tk: *xml.Tokenizer, cell: *Cell, ty: CellType, scratch: std.mem.Allo
                     },
                     .boolean => cell.* = .{ .col = cell.col, .kind = .boolean, .num = if (std.mem.eql(u8, std.mem.trim(u8, v, " "), "1")) 1 else 0 },
                     .err => cell.kind = .err,
-                    // an ISO 8601 date, as strict OOXML writes it: kept as text
                     .iso_date => cell.* = .{ .col = cell.col, .kind = .text, .text = v },
                     .number => {
                         const digits = std.mem.trim(u8, v, " \t\r\n");
@@ -768,9 +731,8 @@ fn readCell(tk: *xml.Tokenizer, cell: *Cell, ty: CellType, scratch: std.mem.Allo
     return error.BadXml;
 }
 
-/// The text inside `open` up to its close, decoded. With `runs`, only `<t>`
-/// counts (a rich-text string's runs, joined) and a phonetic hint (`<rPh>`) is
-/// skipped; without, the element's own text.
+/// The text inside `open` up to its close, decoded. With `runs`, only `<t>` counts (a
+/// rich-text string's runs, joined) and a phonetic hint (`<rPh>`) is skipped.
 fn collectText(tk: *xml.Tokenizer, open: xml.Tag, arena: std.mem.Allocator, runs: bool) ![]const u8 {
     var out = std.array_list.Managed(u8).init(arena);
     if (open.self_closing) return out.items;
@@ -816,8 +778,8 @@ fn readStrings(arena: std.mem.Allocator, gpa: std.mem.Allocator, path: []const u
     return out.items;
 }
 
-/// Per cell format (`cellXfs`, by index), what its number format makes of a
-/// number. `cellStyleXfs` is skipped: cells point into `cellXfs`.
+/// Per cell format (`cellXfs`, by index), what its number format makes of a number.
+/// `cellStyleXfs` is skipped: cells point into `cellXfs`.
 fn readStyles(arena: std.mem.Allocator, gpa: std.mem.Allocator, path: []const u8, part: []const u8) ![]const Fmt {
     var p = openPart(arena, gpa, path, part) catch |e| switch (e) {
         error.ZipMemberNotFound => return &.{},
@@ -895,7 +857,7 @@ test "relationship targets resolve against their part" {
     try std.testing.expectEqualStrings("xl/_rels/workbook.xml.rels", try relsOf(a, "xl/workbook.xml"));
 }
 
-/// `name:type,…` then one `|`-joined line per row, null as `∅` — for tests.
+/// `name:type,...` then one `|`-joined line per row, null as `∅`, for tests.
 fn dumpFixture(arena: std.mem.Allocator, bytes: []const u8, opts: Options) ![]const u8 {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -973,11 +935,6 @@ test "edge workbook: prefixes, rows and cells without r, escapes, 1904 dates, a 
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const got = try dumpFixture(ar.allocator(), @embedFile("testdata/edge.xlsx"), .{});
-    // header: a number, an empty cell (named by its letter), a duplicate; a column
-    // past the header; rich text without its phonetic hint; `_x000D_` a carriage
-    // return and `_x005F_` an escaped underscore; #N/A null; a number past 2^53 kept
-    // as written beside a boolean; a formula's text decoded once (`&amp;lt;` is
-    // `&lt;`); the left-out row 4 empty; a styled empty tail gone
     try std.testing.expectEqualStrings(
         "nome:string,2026:date,C:string,total:string,total_2:string,F:float,G:string\n" ++
             "rich|1904-01-01|∅|9007199254740993|merged|∅|∅\n" ++

@@ -1,17 +1,33 @@
 //! A small backtracking regular-expression matcher, enough for the pattern
 //! vocabulary SQL queries actually use: anchors, `.`, character classes,
-//! capturing and non-capturing groups, alternation, and quantifiers — `*`,
-//! `+`, `?`, counted `{n}`/`{n,}`/`{n,m}`, each greedy or lazy. Deliberately
-//! a subset — no lookaround, no backreferences inside the pattern — so it
-//! stays a few hundred lines instead of pulling in a regex dependency.
+//! capturing and non-capturing groups, alternation, and quantifiers (`*`, `+`,
+//! `?`, counted `{n}`/`{n,}`/`{n,m}`), each greedy or lazy. Deliberately a
+//! subset, with no lookaround and no backreferences inside the pattern, so it
+//! stays a few hundred lines instead of pulling in a regex dependency. What is
+//! out of scope fails with `BadPattern` rather than matching literally: `(?=`
+//! and friends, a malformed `{...}` count (`\{` is the literal brace), a
+//! quantifier with nothing to repeat, a third quantifier character. Quietly
+//! misreading a pattern would return wrong rows.
 //!
 //! Compilation takes an allocator so callers can hand it a
 //! `FixedBufferAllocator` over stack memory: matching a column costs no heap
-//! traffic and nothing to free.
+//! traffic and nothing to free. Matching is continuation-passing (`Cont` is
+//! what remains once the current atom succeeds), which is what lets a group
+//! backtrack into the sequence that follows it.
 //!
-//! Backtracking is worst-case exponential — `(a|aa)+b` against a run of `a`s is
-//! the classic — so every match runs under a `Budget` and gives up with
-//! `PatternTooComplex` rather than wedging the query. See `Budget`.
+//! Backtracking is worst-case exponential, so every `find` runs under a
+//! `Budget` and gives up with `PatternTooComplex`, an error and never a null,
+//! so a pathological pattern cannot read as a non-matching one. Two counters
+//! for two failure modes. `steps` bounds wide blowup: `(a|aa)+b` against a run
+//! of `a`s doubles its splits per character (28 took 2.5 seconds, 40 would take
+//! hours); the allowance is far above what the depth cap allows, plus a
+//! per-character term so a long subject with a cheap pattern never trips it.
+//! `depth` bounds deep blowup: the matcher recurses once per repetition, and
+//! past the stack is a segfault no caller can catch. The cap claims 4 MiB of
+//! stack at a measured, rounded-up cost per frame, three frames per subject
+//! character, which makes it a ceiling on subject length (about 900 characters
+//! in Debug, 3600 in release). Carrying the continuation stack on the heap
+//! would remove it; until a query needs longer text, this is the cheap half.
 
 const std = @import("std");
 
@@ -22,7 +38,6 @@ pub const Captures = [max_groups]?[2]usize;
 
 const Class = struct {
     neg: bool,
-    /// 256-bit membership set; simpler and faster than a range list.
     bits: [32]u8,
 
     fn has(self: Class, c: u8) bool {
@@ -48,51 +63,18 @@ const Group = struct { alt: []const []const Item, cap: ?u8 };
 
 const Item = struct { atom: Atom, min: u32 = 1, max: u32 = 1, lazy: bool = false };
 
-/// Continuation: what remains to be matched once the current atom succeeds.
-/// Modelling it explicitly is what lets a group backtrack into the sequence
-/// that follows it.
 const Cont = union(enum) {
     done,
     seq: struct { items: []const Item, i: usize, rep: u32, next: *const Cont },
     close: struct { cap: u8, start: usize, next: *const Cont },
 };
 
-/// Work allowance for one `find`, and the reason a pathological pattern stops
-/// the query instead of hanging or crashing it.
-///
-/// Two independent failure modes, so two counters:
-///
-/// `steps` bounds total work, for blowup that is WIDE rather than deep.
-/// `(a|aa)+b` against a run of `a`s is the textbook case: every extra `a`
-/// doubles the ways the run can be split and the trailing `b` never matches, so
-/// all of them get tried — 28 characters took 2.5 seconds, 40 would take hours.
-/// The allowance is far above anything the depth cap below can legitimately
-/// reach, plus a per-character term so that scanning a long subject with a
-/// cheap pattern never trips it.
-///
-/// `depth` bounds recursion, for blowup that is DEEP rather than wide. This
-/// matcher recurses once per repetition, so `[a-z]+` against an n-character
-/// subject stands n frames deep no matter how well the pattern behaves. Past
-/// the stack it is a segfault, which no caller can catch — the cap is what
-/// turns that into an error a query can report.
-///
-/// ponytail: the depth cap is a ceiling on SUBJECT LENGTH (~900 characters in
-/// Debug, ~4000 in release), not a safety margin over a limit nothing reaches.
-/// It exists because the matcher is recursive. Rewriting `step`/`resume_` to
-/// carry an explicit continuation stack on the heap removes the cap entirely;
-/// until a query needs to match longer text than that, this is the cheap half.
 const Budget = struct {
     steps: u64,
     depth: u32 = 0,
 
-    /// Stack a single match may claim. Well under a thread's, since the caller
-    /// has frames of its own below this.
     const stack_allowance = 4 << 20;
 
-    /// Bytes of stack one `enter` costs. Measured on this matcher at ~4235
-    /// bytes per subject character in Debug and ~965 in release, over the three
-    /// `enter`s (`step` → `resume_` → `step`) a character consumes — then
-    /// rounded up, so the cap stays conservative if the frames grow a little.
     const stack_per_level: usize = switch (@import("builtin").mode) {
         .Debug => 1536,
         else => 384,
@@ -100,10 +82,6 @@ const Budget = struct {
 
     const max_depth = stack_allowance / stack_per_level;
 
-    /// The subject length this depth cap actually allows, at the three `enter`s
-    /// a matched character costs. Roughly 900 characters in Debug and 3600 in
-    /// release — see the `ponytail:` note above for why there is a ceiling here
-    /// at all, and what removes it.
     pub const max_subject_len = max_depth / 3;
 
     fn init(subject_len: usize) Budget {
@@ -132,11 +110,8 @@ pub const Regex = struct {
         return .{ .alt = alt, .ngroups = p.ngroup };
     }
 
-    /// Leftmost match at or after `from`, or null if there is none. Returns the
-    /// matched span; `caps` is filled with group spans (index 0 is the whole
-    /// match). `PatternTooComplex` if the match outruns its `Budget` — that is
-    /// "gave up", NOT "no match", so it is an error rather than a null: a
-    /// pathological pattern must not quietly read as a non-matching one.
+    /// Leftmost match span at or after `from`, with `caps` filled (index 0 is
+    /// the whole match). `PatternTooComplex` means gave up, not no match.
     pub fn find(self: Regex, s: []const u8, from: usize, caps: *Captures) Error!?[2]usize {
         var budget = Budget.init(s.len);
         var start = from;
@@ -171,8 +146,8 @@ fn resume_(k: *const Cont, s: []const u8, pos: usize, caps: *Captures, b: *Budge
 }
 
 /// Match `items[i..]` where the item at `i` has already matched `rep` times.
-/// Greedy: one more repetition is always tried before settling for fewer.
-/// Lazy inverts only that order — the set of reachable matches is the same.
+/// Greedy tries one more repetition before settling for fewer; lazy inverts
+/// only that order, so the set of reachable matches is the same.
 fn step(items: []const Item, i: usize, rep: u32, s: []const u8, pos: usize, caps: *Captures, cont: *const Cont, b: *Budget) Error!?usize {
     try b.enter();
     defer b.leave();
@@ -266,8 +241,6 @@ const Parser = struct {
             if (quantified and self.i < self.src.len and self.src[self.i] == '?') {
                 it.lazy = true;
                 self.i += 1;
-                // A third quantifier char has nothing left to mean; the other
-                // spellings (`a**`, `a*+`) fall out of parseAtom rejecting them.
                 if (self.i < self.src.len and self.src[self.i] == '?') return Error.BadPattern;
             }
             try items.append(it);
@@ -275,9 +248,6 @@ const Parser = struct {
         return items.toOwnedSlice();
     }
 
-    /// `{n}`, `{n,}` or `{n,m}`, positioned on the `{`. Anything else is an
-    /// error rather than a literal brace: quietly misreading a count would
-    /// return wrong rows. `\{` still parses as a literal via the escape path.
     fn parseCount(self: *Parser, it: *Item) Error!void {
         self.i += 1;
         const min = (try self.parseCountNum()) orelse return Error.BadPattern;
@@ -318,8 +288,6 @@ const Parser = struct {
                 if (self.i + 1 < self.src.len and self.src[self.i] == '?' and self.src[self.i + 1] == ':') {
                     self.i += 2;
                 } else if (self.i < self.src.len and self.src[self.i] == '?') {
-                    // `(?=`, `(?!`, `(?<` … — lookaround and friends are out of
-                    // scope; failing loudly beats matching them literally.
                     return Error.BadPattern;
                 } else {
                     if (self.ngroup >= max_groups) return Error.BadPattern;
@@ -332,7 +300,7 @@ const Parser = struct {
                 return .{ .group = .{ .alt = alt, .cap = cap } };
             },
             '[' => return .{ .class = try self.parseClass() },
-            '{', '*', '+', '?' => return Error.BadPattern, // quantifier with nothing to repeat
+            '{', '*', '+', '?' => return Error.BadPattern,
             '\\' => {
                 if (self.i >= self.src.len) return Error.BadPattern;
                 const e = self.src[self.i];
@@ -410,12 +378,9 @@ fn escapeAtom(e: u8) Atom {
     return .{ .class = cl };
 }
 
-/// Replace the first match of `pattern` in `s`, expanding `\1`..`\9` in
-/// `repl` to the corresponding capture (`\0` is the whole match). Mirrors
-/// `regexp_replace` without the global flag.
-///
-/// Compiles on every call, so a caller applying one pattern to a whole column
-/// should compile once and use `replaceFirstRe` instead.
+/// `regexp_replace` without the global flag: `\1`..`\9` in `repl` expand to
+/// captures, `\0` to the whole match. Compiles on every call; for a whole
+/// column, compile once and use `replaceFirstRe`.
 pub fn replaceFirst(
     out: std.mem.Allocator,
     scratch: std.mem.Allocator,
@@ -426,7 +391,6 @@ pub fn replaceFirst(
     return replaceFirstRe(out, try Regex.compile(scratch, pattern), s, repl);
 }
 
-/// `replaceFirst` against an already-compiled pattern.
 pub fn replaceFirstRe(
     out: std.mem.Allocator,
     re: Regex,
@@ -564,29 +528,18 @@ test "regex: a pathological pattern gives up instead of hanging" {
     const a = fba.allocator();
     var caps: Captures = undefined;
 
-    // Wide blowup: every `a` doubles the ways `(a|aa)+` can split the run, and
-    // the trailing `b` never matches, so every one of them is tried. Unbudgeted
-    // this took 2.5s at 28 characters and would take hours at 40.
     const re = try Regex.compile(a, "(a|aa)+b");
     try std.testing.expectError(Error.PatternTooComplex, re.find("a" ** 40 ++ "c", 0, &caps));
 
-    // Deep blowup: a counted quantifier recurses once per repetition, and past
-    // the stack that is a segfault no caller can catch.
     const deep = try Regex.compile(a, "a{1,1000000}b");
     try std.testing.expectError(Error.PatternTooComplex, deep.find("a" ** 100_000, 0, &caps));
 
-    // The caps must leave ordinary work alone. A subject within the documented
-    // ceiling, scanned by a pattern that backtracks quadratically over every
-    // start position, still has to answer — both when it matches and when it
-    // does not (the miss is the expensive half).
     const n = Budget.max_subject_len / 2;
     const plain = try Regex.compile(a, "[a-z]+9");
     const hit = "a" ** (Budget.max_subject_len / 2) ++ "9";
     try std.testing.expectEqual([2]usize{ 0, n + 1 }, (try plain.find(hit, 0, &caps)).?);
     try std.testing.expect((try plain.find(hit[0..n], 0, &caps)) == null);
 
-    // A long subject with a cheap pattern is a linear scan, not deep recursion,
-    // so subject length alone must never exhaust the step budget.
     const long = "b" ** 200_000 ++ "zq";
     const lit = try Regex.compile(a, "zq");
     try std.testing.expectEqual([2]usize{ 200_000, 200_002 }, (try lit.find(long, 0, &caps)).?);

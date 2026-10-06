@@ -1,27 +1,31 @@
-//! Thrift compact protocol, read side.
+//! Thrift compact protocol. Parquet serialises its footer and every page header
+//! with it, so nothing in a Parquet file is reachable without it. `Reader` decodes;
+//! `Writer` mirrors it for the metadata basalt writes.
 //!
-//! Parquet serialises its footer and every page header with this, so nothing in
-//! a Parquet file is reachable without it. Only decoding is implemented — basalt
-//! reads Parquet, it does not write it.
-//!
-//! Two details are easy to get wrong and are handled explicitly here:
-//!   * field ids are *deltas* from the previous field within the same struct, so
-//!     the decoder keeps a per-struct stack rather than one running id;
-//!   * booleans carry their value in the field *type* (`bool_true`/`bool_false`)
+//! Two details are easy to get wrong and are handled explicitly:
+//!   * field ids are deltas from the previous field within the same struct, so
+//!     both sides keep a per-struct id stack rather than one running id; a delta
+//!     of 1..15 packs into the header byte, anything else (including a lower id)
+//!     takes the explicit zigzag form;
+//!   * booleans carry their value in the field type (`bool_true`/`bool_false`)
 //!     and occupy no bytes of their own.
+//! Doubles are little-endian on the wire, unlike the binary protocol.
 //!
 //! `skip` is what makes this forward-compatible: Parquet gains metadata fields
 //! over time, and a reader that cannot skip an unknown field cannot open a file
-//! written by anything newer than itself.
+//! written by anything newer. The input is hostile, so the reader only ever
+//! returns a value or `CorruptThrift`: nesting is capped at `max_depth` for
+//! structs and containers alike (only structs were once capped, and a few hundred
+//! KB of "list of list" bytes overflowed the stack), and a list header claiming
+//! more elements than the input holds is refused before any loop runs.
+//! `readBinary` slices borrow the input buffer.
 
 const std = @import("std");
 
 pub const Error = error{
-    /// Truncated, malformed, or nested past `max_depth`.
     CorruptThrift,
 };
 
-/// Compact-protocol type ids, as they appear in field and list headers.
 pub const Type = enum(u8) {
     stop = 0,
     bool_true = 1,
@@ -42,14 +46,11 @@ pub const Type = enum(u8) {
 pub const Field = struct { ty: Type, id: i16 };
 pub const ListHeader = struct { elem: Type, size: usize };
 
-/// Nesting limit. Parquet metadata is only a few levels deep; the cap turns a
-/// malicious or corrupt file into an error instead of a stack overflow.
 pub const max_depth = 32;
 
 pub const Reader = struct {
     buf: []const u8,
     pos: usize = 0,
-    /// Field id the next delta is relative to, for the struct being read.
     last_id: i16 = 0,
     id_stack: [max_depth]i16 = undefined,
     depth: usize = 0,
@@ -68,7 +69,6 @@ pub const Reader = struct {
         return (try self.take(1))[0];
     }
 
-    /// Unsigned LEB128.
     pub fn readVarint(self: *Reader) Error!u64 {
         var v: u64 = 0;
         var shift: u6 = 0;
@@ -80,7 +80,6 @@ pub const Reader = struct {
         }
     }
 
-    /// Signed integers travel zigzag-encoded so small negatives stay short.
     pub fn readZigZag(self: *Reader) Error!i64 {
         const u = try self.readVarint();
         return @as(i64, @bitCast(u >> 1)) ^ -@as(i64, @intCast(u & 1));
@@ -92,21 +91,17 @@ pub const Reader = struct {
         return @intCast(v);
     }
 
-    /// Compact protocol stores doubles little-endian (unlike binary protocol,
-    /// which is big-endian) — a classic source of garbage values.
     pub fn readDouble(self: *Reader) Error!f64 {
         const b = try self.take(8);
         return @bitCast(std.mem.readInt(u64, b[0..8], .little));
     }
 
-    /// Borrowed from the input buffer; valid as long as the footer bytes are.
     pub fn readBinary(self: *Reader) Error![]const u8 {
         const n = try self.readVarint();
         if (n > self.buf.len) return Error.CorruptThrift;
         return self.take(@intCast(n));
     }
 
-    /// Reads the next field header. `.stop` marks the end of the current struct.
     pub fn readField(self: *Reader) Error!Field {
         const b = try self.readByte();
         if (b == 0) return .{ .ty = .stop, .id = 0 };
@@ -121,7 +116,6 @@ pub const Reader = struct {
         return .{ .ty = ty, .id = id };
     }
 
-    /// Enter a nested struct: field-id deltas restart from zero inside it.
     pub fn structBegin(self: *Reader) Error!void {
         if (self.depth >= max_depth) return Error.CorruptThrift;
         self.id_stack[self.depth] = self.last_id;
@@ -147,19 +141,13 @@ pub const Reader = struct {
         return .{ .elem = elem, .size = size };
     }
 
-    /// Skips one value of `ty`. Unknown fields must be skippable or a file
-    /// written by a newer Parquet cannot be opened at all.
     pub fn skip(self: *Reader, ty: Type) Error!void {
         switch (ty) {
-            // booleans are carried entirely by the type id
             .bool_true, .bool_false, .stop => {},
             .byte => _ = try self.readByte(),
             .i16, .i32, .i64 => _ = try self.readZigZag(),
             .double => _ = try self.take(8),
             .binary => _ = try self.readBinary(),
-            // Containers recurse per element, so they need the same depth cap as
-            // `structBegin`: one byte of "list of list, size 1" per level makes
-            // a few hundred KB of input a stack overflow otherwise.
             .list, .set => {
                 const h = try self.readListHeader();
                 if (h.size == 0) return;
@@ -199,8 +187,6 @@ pub const Reader = struct {
     }
 };
 
-// --- tests ------------------------------------------------------------------
-
 const t = std.testing;
 
 test "varint and zigzag round-trip the boundary values" {
@@ -211,7 +197,6 @@ test "varint and zigzag round-trip the boundary values" {
     try t.expectEqual(@as(u64, 128), try r.readVarint());
     try t.expectEqual(@as(u64, 65535), try r.readVarint());
 
-    // zigzag: 0,-1,1,-2,2 encode as 0,1,2,3,4
     var z = Reader.init(&[_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04 });
     try t.expectEqual(@as(i64, 0), try z.readZigZag());
     try t.expectEqual(@as(i64, -1), try z.readZigZag());
@@ -221,8 +206,6 @@ test "varint and zigzag round-trip the boundary values" {
 }
 
 test "field ids accumulate as deltas, and a zero delta means an explicit id" {
-    // 0x15 = delta 1, type i32(5); 0x25 = delta 2 -> id 3; then 0x05 = delta 0,
-    // explicit zigzag id 20 (=40); then stop
     var r = Reader.init(&[_]u8{ 0x15, 0x02, 0x25, 0x04, 0x05, 0x28, 0x06, 0x00 });
     try r.structBegin();
 
@@ -244,7 +227,6 @@ test "field ids accumulate as deltas, and a zero delta means an explicit id" {
 }
 
 test "booleans carry their value in the type and consume no bytes" {
-    // field 1 bool_true (delta 1), field 2 bool_false (delta 1), stop
     var r = Reader.init(&[_]u8{ 0x11, 0x12, 0x00 });
     try r.structBegin();
     const a = try r.readField();
@@ -258,7 +240,6 @@ test "booleans carry their value in the type and consume no bytes" {
 }
 
 test "nested structs restart field-id deltas and restore the outer id" {
-    // outer: field 1 = struct { field 1 = i32 }, then outer field 2
     var r = Reader.init(&[_]u8{ 0x1c, 0x15, 0x02, 0x00, 0x15, 0x04, 0x00 });
     try r.structBegin();
     const outer1 = try r.readField();
@@ -267,12 +248,11 @@ test "nested structs restart field-id deltas and restore the outer id" {
 
     try r.structBegin();
     const inner = try r.readField();
-    try t.expectEqual(@as(i16, 1), inner.id); // restarted, not 2
+    try t.expectEqual(@as(i16, 1), inner.id);
     try t.expectEqual(@as(i32, 1), try r.readI32());
     try t.expectEqual(Type.stop, (try r.readField()).ty);
     try r.structEnd();
 
-    // delta 1 applies to the outer struct's last id (1), giving 2
     const outer2 = try r.readField();
     try t.expectEqual(@as(i16, 2), outer2.id);
     try t.expectEqual(@as(i32, 2), try r.readI32());
@@ -280,24 +260,21 @@ test "nested structs restart field-id deltas and restore the outer id" {
 }
 
 test "short list header inlines the size; 15 escapes to a varint" {
-    var r = Reader.init(&[_]u8{0x38}); // size 3, elem binary(8)
+    var r = Reader.init(&[_]u8{0x38});
     const h = try r.readListHeader();
     try t.expectEqual(Type.binary, h.elem);
     try t.expectEqual(@as(usize, 3), h.size);
 
-    // size nibble 15 escapes to a varint. The buffer must be able to hold the
-    // elements it claims: readListHeader rejects a size larger than the input,
-    // which is what stops a corrupt header from driving a huge loop.
     var backing: [34]u8 = undefined;
     @memset(&backing, 0x02);
     backing[0] = 0xf5;
-    backing[1] = 0x20; // varint 32, elem i32
+    backing[1] = 0x20;
     var big = Reader.init(&backing);
     const h2 = try big.readListHeader();
     try t.expectEqual(Type.i32, h2.elem);
     try t.expectEqual(@as(usize, 32), h2.size);
 
-    var lying = Reader.init(&[_]u8{ 0xf5, 0x80, 0x80, 0x04 }); // claims 65536 elems
+    var lying = Reader.init(&[_]u8{ 0xf5, 0x80, 0x80, 0x04 });
     try t.expectError(Error.CorruptThrift, lying.readListHeader());
 }
 
@@ -307,15 +284,13 @@ test "binary borrows from the buffer without copying" {
 }
 
 test "double is little-endian, unlike the binary protocol" {
-    // 1.0 = 0x3FF0000000000000, little-endian on the wire
     var r = Reader.init(&[_]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f });
     try t.expectEqual(@as(f64, 1.0), try r.readDouble());
 }
 
 test "skip walks past every type, including nested lists and structs" {
-    // struct { 1: list<struct{1:i32}> [1 elem], 2: binary, 3: double } stop
     const bytes = [_]u8{
-        0x19, 0x1c, // field 1, list; header: size 1, elem struct
+        0x19, 0x1c,
         0x15, 0x02, 0x00, //   the element struct: field 1 i32 = 1, stop
         0x18, 0x03, 'a', 'b', 'c', // field 2, binary "abc"
         0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f, // field 3, double 1.0
@@ -336,44 +311,35 @@ test "skip walks past every type, including nested lists and structs" {
 }
 
 test "truncated input errors instead of reading past the buffer" {
-    var r = Reader.init(&[_]u8{0x18}); // binary field with no length byte
+    var r = Reader.init(&[_]u8{0x18});
     try t.expectError(Error.CorruptThrift, r.skip(.binary));
 
-    var v = Reader.init(&[_]u8{0x80}); // varint continuation with nothing after
+    var v = Reader.init(&[_]u8{0x80});
     try t.expectError(Error.CorruptThrift, v.readVarint());
 
-    var b = Reader.init(&[_]u8{ 0x05, 'h' }); // claims 5 bytes, supplies 1
+    var b = Reader.init(&[_]u8{ 0x05, 'h' });
     try t.expectError(Error.CorruptThrift, b.readBinary());
 }
 
 test "nesting deeper than max_depth is an error, not a stack overflow" {
     var buf: [max_depth + 8]u8 = undefined;
-    @memset(&buf, 0x1c); // endless "field 1, struct"
+    @memset(&buf, 0x1c);
     var r = Reader.init(&buf);
     try t.expectError(Error.CorruptThrift, r.skipStruct());
 }
 
 test "nested lists are capped too, not just structs" {
-    // 0x19 is "list of list, size 1" — one byte per level of recursion — and
-    // 0x09 is an empty list, which terminates cleanly. Only `structBegin` was
-    // capped, so this well-formed but absurdly nested value recursed once per
-    // byte; a few hundred KB of 0x19 was a stack overflow.
     var deep: [max_depth + 8]u8 = undefined;
     @memset(&deep, 0x19);
     deep[deep.len - 1] = 0x09;
     var r = Reader.init(&deep);
     try t.expectError(Error.CorruptThrift, r.skip(.list));
 
-    // Nesting inside the cap still skips.
     var ok = [_]u8{ 0x19, 0x19, 0x09 };
     var r2 = Reader.init(&ok);
     try r2.skip(.list);
 }
 
-// --- write side --------------------------------------------------------------
-
-/// Compact-protocol encoder. Mirrors `Reader`: field ids are written as deltas
-/// from the previous field of the same struct, so it keeps the same id stack.
 pub const Writer = struct {
     out: *std.array_list.Managed(u8),
     last_id: i16 = 0,
@@ -406,14 +372,12 @@ pub const Writer = struct {
     }
 
     pub fn structEnd(self: *Writer) !void {
-        try self.out.append(0); // STOP
+        try self.out.append(0);
         if (self.depth == 0) return error.CorruptThrift;
         self.depth -= 1;
         self.last_id = self.id_stack[self.depth];
     }
 
-    /// Field header. A delta of 1..15 packs into the header byte; anything else
-    /// (including a lower id) needs the explicit zigzag form.
     pub fn fieldBegin(self: *Writer, ty: Type, id: i16) !void {
         const delta = id - self.last_id;
         if (delta > 0 and delta <= 15) {
@@ -436,7 +400,6 @@ pub const Writer = struct {
     }
 
     pub fn writeBool(self: *Writer, id: i16, v: bool) !void {
-        // the value lives in the type nibble; no bytes follow
         try self.fieldBegin(if (v) .bool_true else .bool_false, id);
     }
 
@@ -446,7 +409,6 @@ pub const Writer = struct {
         try self.out.appendSlice(v);
     }
 
-    /// List header only; the caller writes the elements.
     pub fn listBegin(self: *Writer, id: i16, elem: Type, size: usize) !void {
         try self.fieldBegin(.list, id);
         if (size < 15) {
@@ -467,7 +429,7 @@ test "writer output round-trips through the reader" {
     try w.writeI32(1, 7);
     try w.writeI64(3, -12345);
     try w.writeBool(4, true);
-    try w.writeBinary(20, "hello"); // id jump > 15 forces the explicit form
+    try w.writeBinary(20, "hello");
     try w.structEnd();
 
     var r = Reader.init(buf.items);
@@ -517,7 +479,7 @@ test "nested struct writing restores the outer field id" {
     try w.structBegin();
     try w.writeI32(1, 42);
     try w.structEnd();
-    try w.writeI32(2, 99); // delta 1 from the outer id 1
+    try w.writeI32(2, 99);
     try w.structEnd();
 
     var r = Reader.init(buf.items);
@@ -533,14 +495,11 @@ test "nested struct writing restores the outer field id" {
 }
 
 fn fuzzOne(_: void, input: []const u8) anyerror!void {
-    // A decoder over hostile bytes must only ever answer with a value or an
-    // error — any panic here is a bug a malicious parquet footer can trigger.
     var r = Reader.init(input);
     r.skipStruct() catch return;
 }
 
 const fuzzOne_corpus = [_][]const u8{
-    // A real footer keeps the fuzzer starting from structurally valid input.
     @embedFile("testdata/uncompressed.parquet"),
 };
 

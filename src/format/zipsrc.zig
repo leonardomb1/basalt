@@ -1,17 +1,24 @@
 //! One member of a zip archive, as a byte stream.
 //!
-//! The member is inflated on demand and never materialized. That is the whole
-//! point: the comparable implementations hold it in memory — duckdb-zipfs
-//! documents that the selected file "will be read entirely into memory, not
-//! streamed", and a gzip under Polars is decompressed up front — which puts a
-//! ceiling at RAM. The archives this exists for are above it: Receita's CNPJ
-//! registry ships about 7.6 GB a month and CVM's monthly `inf_diario` holds a
-//! 59 MB CSV in a 12 MB zip.
+//! The member is inflated on demand and never materialized. That is the point:
+//! comparable implementations hold it in memory (duckdb-zipfs reads the selected
+//! file "entirely into memory", Polars decompresses a gzip up front), which puts a
+//! ceiling at RAM, and the public registry archives this exists for run to several
+//! GB a month.
 //!
 //! A remote archive is read the same way, by range: a HEAD for the size, one GET
 //! for the tail holding the central directory, one for the member's local header,
-//! then a single ranged GET streamed through inflate. The rest of the archive —
-//! other members — is never transferred.
+//! then a single ranged GET streamed through inflate. Other members are never
+//! transferred. The data begins after the local header, whose name and extra
+//! lengths may differ from the central directory's copy, so it is read too. The
+//! read is bounded by the member's compressed size, since a stored member has no
+//! terminator and would run on into the next member.
+//!
+//! Only stored and deflated members are read; the other legal methods (bzip2, lzma,
+//! ppmd, xz) are essentially unseen. An archive with several members and no member
+//! named is refused rather than reading the first, as pandas does. A `Member` lives
+//! in the caller's arena and must never move: its reader interfaces point at each
+//! other.
 
 const std = @import("std");
 const zip = std.zip;
@@ -21,12 +28,7 @@ const smb = @import("../store/smb.zig");
 
 pub const Error = error{
     ZipMemberNotFound,
-    /// The archive holds more than one member and the script did not say which.
-    /// Reading the first would be a plausible answer to a question nobody asked;
-    /// pandas refuses the same case for the same reason.
     ZipMemberAmbiguous,
-    /// Stored and deflated are the two methods a zip in the wild uses. The rest
-    /// (bzip2, lzma, ppmd, xz) are legal in the container and essentially unseen.
     ZipMemberCompression,
     ZipNoEndRecord,
     ZipMultiDiskUnsupported,
@@ -34,25 +36,19 @@ pub const Error = error{
     ZipBadFileOffset,
 };
 
-/// Everything the stream borrows, kept together so it can live in the caller's
-/// arena and never move: the reader interfaces hold pointers to each other.
 pub const Member = struct {
     name: []const u8,
-    /// The member's uncompressed bytes.
     reader: *std.Io.Reader,
     src: pqdecode.Bytes,
     body: union(enum) {
         file: std.fs.File.Reader,
-        /// A server that ignored `Range` already sent the whole archive.
         fixed: std.Io.Reader,
         http: struct {
             req: std.http.Client.Request,
             response: std.http.Client.Response,
             redirect_buf: [8 * 1024]u8,
         },
-        /// Streamed through an `sftp.Stream` window on `src`, which owns the file.
         sftp,
-        /// Streamed through an `smb.Stream` window on `src`, which owns the file.
         smb,
     },
     limited: std.Io.Reader.Limited,
@@ -78,18 +74,16 @@ fn isMax(v: anytype) bool {
     return v == std.math.maxInt(@TypeOf(v));
 }
 
-/// The archive's bytes, by range: a local file or an HTTP(S)/object-store URL.
 fn openBytes(arena: std.mem.Allocator, path: []const u8) !pqdecode.Bytes {
     return pqdecode.Bytes.open(arena, path);
 }
 
-/// Every data member in central-directory order; directory entries are
-/// structure, not data, and are dropped.
+/// Every data member in central-directory order; directory entries are dropped.
+/// Zip64 widens only the fields that overflowed, in a fixed order.
 fn directory(arena: std.mem.Allocator, src: pqdecode.Bytes) ![]const Entry {
     const eocd_len = @sizeOf(zip.EndRecord);
     const total = src.size();
     if (total < eocd_len) return Error.ZipNoEndRecord;
-    // The end record is followed only by its comment, at most 64 KiB.
     const tail_len: usize = @intCast(@min(total, eocd_len + std.math.maxInt(u16)));
     const tail_off = total - tail_len;
     const tail = try src.range(arena, tail_off, tail_len);
@@ -127,7 +121,6 @@ fn directory(arena: std.mem.Allocator, src: pqdecode.Bytes) ![]const Entry {
     }
     if (cd_off + cd_size > total) return Error.ZipBadCentralDirectory;
 
-    // Usually the directory sits inside the tail already fetched.
     const cd = if (cd_off >= tail_off)
         tail[@intCast(cd_off - tail_off)..][0..@intCast(cd_size)]
     else
@@ -149,7 +142,6 @@ fn directory(arena: std.mem.Allocator, src: pqdecode.Bytes) ![]const Entry {
             .compressed_size = h.compressed_size,
             .local_offset = h.local_file_header_offset,
         };
-        // Zip64 widens only the fields that overflowed, in this fixed order.
         if (isMax(h.uncompressed_size) or isMax(h.compressed_size) or isMax(h.local_file_header_offset)) {
             var xr = std.Io.Reader.fixed(extra);
             while (xr.takeInt(u16, .little)) |id| {
@@ -169,8 +161,6 @@ fn directory(arena: std.mem.Allocator, src: pqdecode.Bytes) ![]const Entry {
     return out.toOwnedSlice();
 }
 
-/// Every member name in the archive, in central-directory order. Used to name the
-/// choices when a script has to pick one.
 pub fn names(arena: std.mem.Allocator, path: []const u8) ![]const []const u8 {
     const src = try openBytes(arena, path);
     defer src.close();
@@ -181,9 +171,6 @@ pub fn names(arena: std.mem.Allocator, path: []const u8) ![]const []const u8 {
 }
 
 /// Open `want` inside `path`, or the archive's only member when `want` is null.
-///
-/// The returned `Member` is allocated in `arena` because its readers point at each
-/// other; moving it by value would dangle those pointers.
 pub fn openMember(arena: std.mem.Allocator, path: []const u8, want: ?[]const u8) !*Member {
     const m = try arena.create(Member);
     m.src = try openBytes(arena, path);
@@ -203,9 +190,6 @@ pub fn openMember(arena: std.mem.Allocator, path: []const u8, want: ?[]const u8)
         else => return Error.ZipMemberCompression,
     }
 
-    // The central directory's copy of the sizes is authoritative, but the data
-    // itself begins after the *local* header, whose name and extra fields have
-    // their own lengths — a zip may pad the local extra field differently.
     const lh_len = @sizeOf(zip.LocalFileHeader);
     if (e.local_offset + lh_len > m.src.size()) return Error.ZipBadFileOffset;
     var hr = std.Io.Reader.fixed(try m.src.range(arena, e.local_offset, lh_len));
@@ -240,9 +224,6 @@ pub fn openMember(arena: std.mem.Allocator, path: []const u8, want: ?[]const u8)
         },
     };
 
-    // Stop at the member's end: the compressed stream is followed by the next
-    // member, then the central directory. Inflate would stop on its own, but a
-    // stored member has no terminator of its own.
     const lim_buf = try arena.alloc(u8, 64 * 1024);
     m.limited = std.Io.Reader.Limited.init(inner, .limited64(e.compressed_size), lim_buf);
 
@@ -251,8 +232,6 @@ pub fn openMember(arena: std.mem.Allocator, path: []const u8, want: ?[]const u8)
         .store => m.reader = &m.limited.interface,
         .deflate => {
             const window = try arena.alloc(u8, std.compress.flate.max_window_len);
-            // `.raw`: a zip member is a bare deflate stream, with the checksum and
-            // sizes held in the zip headers rather than a gzip footer.
             m.inflate = std.compress.flate.Decompress.init(&m.limited.interface, .raw, window);
             m.reader = &m.inflate.reader;
         },
@@ -261,15 +240,14 @@ pub fn openMember(arena: std.mem.Allocator, path: []const u8, want: ?[]const u8)
     return m;
 }
 
-/// One GET for the member's compressed extent, streamed rather than buffered, so
-/// a multi-gigabyte member costs a window of memory, not its size.
+/// One identity-encoded GET for the member's compressed extent, streamed, so a
+/// multi-gigabyte member costs a window of memory. A 200 (Range ignored) is skipped to `off`.
 fn streamRange(arena: std.mem.Allocator, m: *Member, rm: *pqdecode.Remote, off: u64, len: u64) !*std.Io.Reader {
     const range = try std.fmt.allocPrint(arena, "bytes={d}-{d}", .{ off, off + len - 1 });
     const extra = try rm.headers(arena, .GET, range);
     const uri = std.Uri.parse(rm.url) catch return error.InvalidUrl;
     m.body = .{ .http = .{ .req = undefined, .response = undefined, .redirect_buf = undefined } };
     const h = &m.body.http;
-    // Identity only: a range of a content-encoded body is a range of the encoding.
     h.req = try rm.client.request(.GET, uri, .{ .extra_headers = extra, .headers = .{ .accept_encoding = .omit } });
     errdefer h.req.deinit();
     try h.req.sendBodiless();
@@ -277,17 +255,12 @@ fn streamRange(arena: std.mem.Allocator, m: *Member, rm: *pqdecode.Remote, off: 
     const rdr = h.response.reader(try arena.alloc(u8, 64 * 1024));
     switch (@intFromEnum(h.response.head.status)) {
         206 => {},
-        // Range ignored between the tail fetch and now: skip to the member.
         200 => try rdr.discardAll64(off),
         else => |code| return rm.statusError(code, ""),
     }
     return rdr;
 }
 
-/// Committed fixtures, alongside the parquet ones. `two_members.zip` holds `a.csv`
-/// stored and `b.csv` deflated, so both branches are exercised without depending
-/// on a `zip` binary. Embedded and written out per test because the reader needs a
-/// real path to seek in — the same shape the parquet fixture tests use.
 const fx_two = @embedFile("testdata/two_members.zip");
 const fx_one = @embedFile("testdata/one_member.zip");
 
@@ -305,9 +278,6 @@ test "openMember: a stored member streams and stops at its own end" {
 
     const m = try openMember(a, try writeFixture(a, &tmp, "t.zip", fx_two), "a.csv");
     defer m.close();
-    // A stored member has no terminator of its own, so this is the case that
-    // proves the read is bounded by the member's size rather than running on into
-    // the next member and the central directory.
     const got = try m.reader.allocRemaining(a, .limited(1 << 20));
     try std.testing.expectEqualStrings("id,v\n1,x\n2,y\n", got);
 }

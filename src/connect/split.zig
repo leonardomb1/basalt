@@ -1,10 +1,25 @@
-//! Split planning for parallel source reads. A "split" is a SQL boolean predicate
-//! over a key column; the set of splits is **disjoint and covering** over the
-//! key's `[min,max]` (captured at plan time), so each lane reads one key range on
-//! its own connection. This is an *unsynchronized* partitioned read: a row present
-//! and unchanged for the whole read appears exactly once, but concurrent writes are
-//! fuzzy and re-runs repeat rows — downstream dedup (StarRocks PK / ClickHouse
-//! Replacing / Snowflake MERGE) owns exactly-once. See `runtime/parallel.zig`.
+//! Split planning for parallel source reads. A split is a SQL boolean predicate
+//! over a key column; the set of splits is disjoint and covering over the key's
+//! `[min,max]` captured at plan time, so each lane reads one key range on its own
+//! connection, wrapping `Plan.base_sql` (which may carry a key column the read's
+//! projection left out) as `SELECT * FROM (<base>) _split WHERE <pred>`.
+//!
+//! This is an unsynchronized partitioned read: a row present and unchanged for the
+//! whole read appears exactly once, but concurrent writes are fuzzy and re-runs
+//! repeat rows; downstream dedup (a primary-key table or MERGE) owns exactly-once.
+//! See `runtime/parallel.zig`.
+//!
+//! Ranges are half-open and the last one is open-ended, so rows inserted past `max`
+//! after the probe still land in a lane. Slice 0 also claims NULL keys (`OR col IS
+//! NULL`): every range test is UNKNOWN for NULL, so a nullable split column once
+//! made those rows match no lane and vanish from a `-j > 1` read. Date keys (DATE and
+//! DATETIME/TIMESTAMP alike) are sliced by day with date literals, which every dialect
+//! compares against either type. UUID keys are sliced evenly over the 128-bit space,
+//! balanced for random v4 ids with no bounds probe.
+//!
+//! Below `min_rows_to_split` estimated rows the planner stays serial: each lane
+//! reconnects, and that setup costs more than it saves. An explicit @[split] or
+//! @[splits] overrides. Each probe consumes the connection `Prober` opens for it.
 
 const std = @import("std");
 const sql = @import("../db/sql.zig");
@@ -15,20 +30,12 @@ const Value = @import("../exec/value.zig").Value;
 const Conn = sql.Conn;
 const Dialect = sql.Dialect;
 
-/// `.date` covers DATE and DATETIME/TIMESTAMP keys alike: ranges are sliced at
-/// day granularity with date literals, which all three dialects compare against
-/// either type (a date literal coerces to that day's midnight).
 pub const KeyKind = enum { int, uuid, date };
 pub const Key = struct { col: []const u8, kind: KeyKind };
 pub const KeyInfo = struct { key: Key, est_rows: i64 };
 
-/// Below this estimated row count, auto-splitting a table costs more in
-/// per-connection setup (each lane re-connects; SCRAM/handshake is not free) than
-/// it saves, so the planner stays serial. An explicit @[split]/@[splits] overrides.
 pub const min_rows_to_split: i64 = 2_000_000;
 
-/// Opens a fresh connection for one probe query. Each probe consumes its
-/// connection (a `Cursor` owns and closes its `Conn`), so probes never share one.
 pub const Prober = struct {
     ctx: *anyopaque,
     openFn: *const fn (ctx: *anyopaque) anyerror!Conn,
@@ -40,25 +47,17 @@ pub const Prober = struct {
 
 pub const Plan = struct {
     key: Key,
-    /// Each entry is a SQL boolean expression over the key column. Wrap the base
-    /// query with `wrap(base, predicates[i])` to get one lane's query.
     predicates: []const []const u8,
-    /// The base query the predicates were planned over — which may carry the key
-    /// column a projection had left out. Lanes wrap this, not the read's own.
     base_sql: []const u8,
 };
 
-/// `SELECT * FROM (<base>) _split WHERE <pred>` — uniform whether `base` came from
-/// a `table T` (`SELECT * FROM T`) or an explicit `query`.
 pub fn wrap(arena: std.mem.Allocator, base: []const u8, pred: []const u8) ![]const u8 {
     return wrapProjected(arena, base, null, pred, null);
 }
 
-/// `wrap` with pushdown: `SELECT <proj or *> FROM (<base>) _split WHERE <pred> [AND
-/// (<extra>)]`. `proj` is a ready comma-joined column list (null → `*`); `extra` is a
-/// translated filter predicate AND-ed onto the key-range `pred` (null → none). Both
-/// reference base columns, all in scope inside the subquery regardless of the
-/// projection list — so a pushed filter may test a column the projection drops.
+/// `wrap` with pushdown: `proj` (null → `*`) is a comma-joined column list and
+/// `extra` a filter AND-ed onto `pred`. Both see every base column inside the
+/// subquery, so a pushed filter may test a column the projection drops.
 pub fn wrapProjected(arena: std.mem.Allocator, base: []const u8, proj: ?[]const u8, pred: []const u8, extra: ?[]const u8) ![]const u8 {
     const sel = proj orelse "*";
     if (extra) |x|
@@ -66,14 +65,8 @@ pub fn wrapProjected(arena: std.mem.Allocator, base: []const u8, proj: ?[]const 
     return std.fmt.allocPrint(arena, "SELECT {s} FROM ({s}) _split WHERE {s}", .{ sel, base, pred });
 }
 
-/// Discover a single-column int/uuid primary key for `table`, or null (no PK, a
-/// composite PK, or an unsupported key type → caller stays serial). Each dialect's
-/// catalog query returns the same shape: (pk_column_name, type_name, est_rows) —
-/// one row per PK column, so a composite PK yields >1 row and is rejected below.
-/// Every primary-key column name for `table`, in key order — composite-safe and
-/// type-agnostic, unlike `introspectKey` (which gates to a single int/uuid split
-/// key). Returns an empty slice when the table has no declared primary key.
-/// Used to infer upsert keys from the source.
+/// Every primary-key column name for `table`, in key order, or empty when there
+/// is none. Used to infer upsert keys from the source.
 pub fn introspectPkCols(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, table: []const u8) ![]const []const u8 {
     const query = switch (dialect) {
         .postgres => try std.fmt.allocPrint(arena,
@@ -176,9 +169,8 @@ fn keyKindFor(typname: []const u8) ?KeyKind {
     return null;
 }
 
-/// Build up to `m` split predicates for `key` over `base` (the unsplit query).
-/// Returns null when the source isn't worth/possible to split (empty, or the key
-/// has no usable bounds), so the caller falls back to a single serial read.
+/// Up to `m` split predicates for `key` over the unsplit `base`, or null when the
+/// source is empty or the key has no usable bounds, so the caller reads serially.
 pub fn plan(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, key: Key, m: usize) !?Plan {
     if (m <= 1) return null;
     switch (key.kind) {
@@ -203,10 +195,8 @@ pub fn plan(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []
     }
 }
 
-/// Cheap non-empty probe (`LIMIT 1`) so a forced uuid split doesn't fan out lanes
-/// over an empty table. A failed probe returns true (uuid splitting doesn't depend
-/// on it, so don't block on a transient probe error) — we only skip on a confirmed
-/// empty result.
+/// A `LIMIT 1` probe so a forced uuid split does not fan out over an empty table.
+/// A failed probe returns true; only a confirmed empty result skips the split.
 fn hasAnyRow(arena: std.mem.Allocator, prober: Prober, base: []const u8) !bool {
     const q = try std.fmt.allocPrint(arena, "SELECT 1 FROM ({s}) _e LIMIT 1", .{base});
     const conn = prober.open() catch return true;
@@ -238,8 +228,6 @@ fn intBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: [
     return Bounds{ .min = lo.int, .max = hi.int };
 }
 
-/// Equal-width half-open ranges over `[min, max]`. The last range has no upper
-/// bound (`>= lo`), so it also captures rows inserted past `max` after the probe.
 fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, min: i64, max: i64, m_in: usize) ![]const []const u8 {
     const qcol = sql.quoteIdent(arena, dialect, col) catch col;
     const span: i128 = @as(i128, max) - @as(i128, min) + 1;
@@ -257,10 +245,6 @@ fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, mi
         if (k == m - 1) {
             try list.append(try std.fmt.allocPrint(arena, "{s} >= {d}", .{ qcol, lo }));
         } else if (k == 0) {
-            // Slice 0 also claims NULL keys. Every predicate here is a `>=`/`<`
-            // comparison, which SQL evaluates UNKNOWN for NULL — so a nullable
-            // split column (legal via `WITH (split = col)`) made those rows
-            // match no lane at all and vanish from a `-j > 1` read.
             const hi: i128 = lo + width;
             try list.append(try std.fmt.allocPrint(arena, "(({s} >= {d} AND {s} < {d}) OR {s} IS NULL)", .{ qcol, lo, qcol, hi, qcol }));
         } else {
@@ -271,9 +255,8 @@ fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, mi
     return list.toOwnedSlice();
 }
 
-/// MIN/MAX of a date/timestamp key as day counts since the 1970 epoch. The
-/// cursor's text coercion yields `.date` (days) or `.timestamp` (micros);
-/// anything else (e.g. a driver that left the column as text) → no split.
+/// MIN/MAX of a date/timestamp key as days since 1970, or null when the cursor
+/// did not yield `.date` or `.timestamp` (e.g. a driver left it as text).
 fn dateBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, col: []const u8) !?Bounds {
     const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ sql.quoteIdent(arena, dialect, col) catch col, base });
     const conn = prober.open() catch return null;
@@ -298,11 +281,6 @@ fn dayOf(v: Value) ?i64 {
     };
 }
 
-/// Equal-width day ranges over `[min_day, max_day]` rendered as date literals:
-/// `col >= 'YYYY-MM-DD' AND col < 'YYYY-MM-DD'`, last slice open-ended. Works
-/// for both DATE and DATETIME/TIMESTAMP keys: a timestamp inside the boundary
-/// day falls in the slice whose half-open range contains its midnight-floored
-/// day, so slices stay disjoint and covering.
 fn dateRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, min_day: i64, max_day: i64, m_in: usize) ![]const []const u8 {
     const qcol = sql.quoteIdent(arena, dialect, col) catch col;
     const span: i128 = @as(i128, max_day) - @as(i128, min_day) + 1;
@@ -322,7 +300,6 @@ fn dateRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m
         } else {
             const hi: i64 = @intCast(@as(i128, lo) + width);
             if (k == 0) {
-                // Slice 0 claims NULL keys too — see `intRangePreds`.
                 try list.append(try std.fmt.allocPrint(arena, "(({s} >= '{s}' AND {s} < '{s}') OR {s} IS NULL)", .{ qcol, try eval.formatDate(arena, lo), qcol, try eval.formatDate(arena, hi), qcol }));
             } else {
                 try list.append(try std.fmt.allocPrint(arena, "{s} >= '{s}' AND {s} < '{s}'", .{ qcol, try eval.formatDate(arena, lo), qcol, try eval.formatDate(arena, hi) }));
@@ -332,8 +309,6 @@ fn dateRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m
     return list.toOwnedSlice();
 }
 
-/// Equal lexicographic slices of the whole 128-bit UUID space. Random (v4) UUIDs
-/// are uniform over this space, so the slices are balanced with no bounds probe.
 fn uuidSpacePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m: usize) ![]const []const u8 {
     const qcol = sql.quoteIdent(arena, dialect, col) catch col;
     var list = std.array_list.Managed([]const u8).init(arena);
@@ -342,7 +317,6 @@ fn uuidSpacePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m
         const lo = if (k == 0) null else try uuidAt(arena, k, m);
         const hi = if (k == m - 1) null else try uuidAt(arena, k + 1, m);
         if (lo == null) {
-            // The opening slice claims NULL keys — see `intRangePreds`.
             try list.append(try std.fmt.allocPrint(arena, "({s} < '{s}' OR {s} IS NULL)", .{ qcol, hi.?, qcol }));
         } else if (hi == null) {
             try list.append(try std.fmt.allocPrint(arena, "{s} >= '{s}'", .{ qcol, lo.? }));
@@ -353,8 +327,8 @@ fn uuidSpacePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m
     return list.toOwnedSlice();
 }
 
-/// The k/m boundary of the UUID space as a canonical UUID string. Uses u256 to
-/// compute `floor(k * 2^128 / m)` without overflow.
+/// The k/m boundary of the UUID space as a canonical UUID string, computing
+/// `floor(k * 2^128 / m)` in u256 to avoid overflow.
 fn uuidAt(arena: std.mem.Allocator, k: usize, m: usize) ![]const u8 {
     const val: u128 = @intCast((@as(u256, k) << 128) / @as(u256, m));
     var bytes: [16]u8 = undefined;
@@ -367,8 +341,6 @@ fn uuidAt(arena: std.mem.Allocator, k: usize, m: usize) ![]const u8 {
     });
 }
 
-/// Re-exported for the pushdown translator, which quotes column references the
-/// same way the split predicates do (each dotted part on its own).
 pub const quoteIdent = sql.quoteIdent;
 
 fn dupeOne(arena: std.mem.Allocator, s: []const u8) ![]const []const u8 {
@@ -427,7 +399,6 @@ test "date range splits are covering, disjoint, and day-aligned" {
 
     const preds = try dateRangePreds(a, .mysql, "updated_at", 19723, 20088, 4);
     try std.testing.expectEqual(@as(usize, 4), preds.len);
-    // Slice 0 also claims NULL keys, so it is parenthesized with an OR tail.
     try std.testing.expectEqualStrings(
         "((`updated_at` >= '2024-01-01' AND `updated_at` < '2024-04-02') OR `updated_at` IS NULL)",
         preds[0],
@@ -497,11 +468,8 @@ fn failOpen(_: *anyopaque) anyerror!Conn {
     return error.ConnectionRefused;
 }
 
-/// Minimal evaluator for the int predicates this module emits, for tests only:
-/// `"id" >= LO` or `"id" >= LO AND "id" < HI`.
-/// Evaluate a generated predicate for a NON-NULL id. Slice 0 carries an
-/// `OR <col> IS NULL` tail (so NULL keys land in exactly one lane); that arm is
-/// false for a real id, so it is stripped before parsing the range.
+/// Test-only evaluator of an emitted int predicate for a non-null id; the
+/// `OR ... IS NULL` tail of slice 0 is stripped first.
 fn intPredHolds(pred_in: []const u8, id: i64) bool {
     var pred = pred_in;
     if (std.mem.indexOf(u8, pred, " OR ")) |o| pred = pred[0..o];

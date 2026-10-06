@@ -9,18 +9,18 @@
 //! The proven win is reductions LLVM cannot legally auto-vectorize: `f64` sum is
 //! not associative, so without an explicit `@reduce` it stays serial (~4x slower).
 //! Integer sums ARE associative and LLVM vectorizes them, so there is no int-sum
-//! kernel here on purpose.
+//! kernel here on purpose. Null lanes hold 0 by builder convention, so a sum
+//! over every lane is a correct SQL `SUM`; min and max have no such luck, and
+//! their callers must gate on an all-valid column.
 
 const std = @import("std");
 
-/// Native vector lane count for `T` (>= 1).
 pub inline fn lanes(comptime T: type) comptime_int {
     return std.simd.suggestVectorLength(T) orelse 1;
 }
 
-/// Sum of an `f64` slice using a vector accumulator + `@reduce` (reassociates,
-/// which is exactly why LLVM won't do it for us). Null lanes hold 0 by builder
-/// convention, so summing every lane is correct for SQL `SUM` (nulls add 0).
+/// Sum with a vector accumulator and `@reduce`, which reassociates; that is
+/// exactly why LLVM will not vectorize it for us.
 pub fn sumF(a: []const f64) f64 {
     const L = lanes(f64);
     var i: usize = 0;
@@ -35,8 +35,7 @@ pub fn sumF(a: []const f64) f64 {
     return total;
 }
 
-/// Min of a non-empty `f64` slice. Caller must guarantee no null lanes (their 0
-/// default would corrupt the result); see `eval`/aggregate callers' all-valid gate.
+/// Min of a non-empty slice with no null lanes, whose 0 would corrupt it.
 pub fn minF(a: []const f64) f64 {
     const L = lanes(f64);
     var i: usize = 0;
@@ -51,7 +50,7 @@ pub fn minF(a: []const f64) f64 {
     return m;
 }
 
-/// Max of a non-empty `f64` slice. Same null caveat as `minF`.
+/// Max of a non-empty slice with no null lanes, whose 0 would corrupt it.
 pub fn maxF(a: []const f64) f64 {
     const L = lanes(f64);
     var i: usize = 0;
@@ -66,10 +65,8 @@ pub fn maxF(a: []const f64) f64 {
     return m;
 }
 
-/// Count of set (valid/non-null) bits among the first `n` bits of a validity
-/// bitmap, via `@popCount` over 64 bits at a time. `popcnt` costs the same on a
-/// word as on a byte, so the byte loop was paying eight instructions for one
-/// instruction's work; the tail keeps the byte-wise form.
+/// Set bits among the first `n` of a validity bitmap, popcounted a 64-bit word at
+/// a time (a byte loop paid eight `popcnt`s for one); the tail goes byte-wise.
 pub fn popcountValid(bits: []const u8, n: usize) usize {
     var count: usize = 0;
     const full = n >> 3;
@@ -166,8 +163,6 @@ test "popcountValid: word-wise count agrees with a bit-by-bit one" {
     const bits = try alloc.alloc(u8, (n + 7) / 8);
     defer alloc.free(bits);
 
-    // A pattern that is neither all-set nor all-clear, so the word path has to
-    // carry real counts rather than a constant.
     for (bits, 0..) |*b, i| b.* = @truncate(i *% 37 +% 11);
 
     for (0..n + 1) |k| {
@@ -178,7 +173,6 @@ test "popcountValid: word-wise count agrees with a bit-by-bit one" {
         try testing.expectEqual(expect, popcountValid(bits, k));
     }
 
-    // All set and all clear, across and past the word boundary.
     @memset(bits, 0xFF);
     try testing.expectEqual(@as(usize, n), popcountValid(bits, n));
     try testing.expectEqual(@as(usize, 64), popcountValid(bits, 64));

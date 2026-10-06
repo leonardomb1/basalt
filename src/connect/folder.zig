@@ -3,7 +3,9 @@
 //! with `_` or `.` are skipped at any depth: `_SUCCESS`, `_temporary/`, `.crc`
 //! are what Spark and Hadoop leave beside the data. The listing is sorted by
 //! path, so the first file (whose schema the rest must match) and the order
-//! rows arrive in do not depend on how a server lists.
+//! rows arrive in do not depend on how a server lists. With no `format`, a
+//! folder must hold Parquet files or CSVs; both is refused, as one table cannot
+//! be read from the two, and `Verdict.mixed` names one file of each.
 
 const std = @import("std");
 const http_client = @import("../net/http_client.zig");
@@ -15,7 +17,6 @@ pub fn isFolder(path: []const u8) bool {
     return path.len > 0 and path[path.len - 1] == '/';
 }
 
-/// Every data file under `path`, sorted.
 pub fn list(arena: std.mem.Allocator, path: []const u8) ![]const []const u8 {
     var out = std.array_list.Managed([]const u8).init(arena);
     if (sftp.isUrl(path)) {
@@ -25,7 +26,6 @@ pub fn list(arena: std.mem.Allocator, path: []const u8) ![]const []const u8 {
     } else if (objstore.isUrl(path)) {
         var client = http_client.initClient(arena);
         defer client.deinit();
-        // an empty prefix fails here, in the provider's words
         const urls = try objstore.listPrefix(arena, &client, path);
         for (urls) |u| if (!hidden(below(u, path))) try out.append(u);
     } else {
@@ -50,7 +50,6 @@ pub fn below(url: []const u8, folder: []const u8) []const u8 {
     return if (std.mem.startsWith(u8, url, folder)) url[folder.len..] else url;
 }
 
-/// A path below the folder with a part starting `_` or `.`.
 fn hidden(rel: []const u8) bool {
     var it = std.mem.tokenizeAny(u8, rel, "/\\");
     while (it.next()) |part| if (part[0] == '_' or part[0] == '.') return true;
@@ -70,8 +69,6 @@ pub fn isParquetName(name: []const u8) bool {
     return std.ascii.endsWithIgnoreCase(name, ".parquet");
 }
 
-/// What a folder holds, when no `format` says: Parquet files, or CSVs. Both is
-/// refused, as one table cannot be read from the two; `mixed` names one of each.
 pub const Verdict = union(enum) {
     kind: Kind,
     empty,
@@ -92,7 +89,6 @@ pub fn kindOf(files: []const []const u8) Verdict {
     return if (files.len == 0) .empty else .neither;
 }
 
-/// The files of `files` a read of `kind` takes, in order.
 pub fn only(arena: std.mem.Allocator, files: []const []const u8, kind: Kind) ![]const []const u8 {
     var out = std.array_list.Managed([]const u8).init(arena);
     for (files) |f| {

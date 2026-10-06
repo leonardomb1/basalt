@@ -1,9 +1,27 @@
-//! Minimal MySQL-protocol client — just enough to run DDL against a StarRocks FE
-//! (handshake + mysql_native_password auth + COM_QUERY, parsing only OK/ERR; no
-//! result sets). Used by the StarRocks sink for CREATE TABLE / TRUNCATE.
+//! Minimal MySQL-protocol client: handshake, auth (mysql_native_password,
+//! caching_sha2_password, mysql_clear_password), COM_QUERY with OK/ERR and text
+//! result sets, and LOAD DATA LOCAL INFILE. Used by the StarRocks sink for DDL and
+//! loads, and as a query source. Network-tested only against a live server; the
+//! auth token math is unit-tested below.
 //!
-//! Network-tested only against a live server; the auth token math is unit-tested
-//! below.
+//! Reads go through a 64 KB socket buffer: each result row is its own packet, so
+//! unbuffered every row would cost two recv syscalls (header and body).
+//!
+//! The three-byte length header caps one wire packet at 16 MB - 1; a larger
+//! logical packet is a run of full packets ended by a short (possibly empty) one,
+//! on both read and write. Sequence numbers come back from `writePacket` rather
+//! than being bumped by one, so any oversized payload splits without
+//! desynchronising either side.
+//!
+//! Column definitions keep charset and flags because they are the only signals
+//! for unsigned and binary columns: `bigint unsigned` rides as an exact
+//! decimal(20, 0) since a u64 does not fit i64, and BLOB/VAR_STRING/STRING under
+//! the binary charset (63) are bytes, since annotating them UTF-8 wrote parquet
+//! that Arrow and DuckDB reject.
+//!
+//! mysql_clear_password sends the password in the clear for the server (e.g.
+//! LDAP or external auth) to validate, so pair it with `tls` whenever the path to
+//! the server is not already trusted.
 
 const std = @import("std");
 const sql = @import("sql.zig");
@@ -23,9 +41,6 @@ const CLIENT_PLUGIN_AUTH = 0x00080000;
 
 pub const Error = error{ MysqlAuthFailed, MysqlQueryFailed, MysqlProtocol } || std.mem.Allocator.Error;
 
-/// Buffered socket reads: each result row is its own MySQL packet, so without
-/// buffering every row costs two recv syscalls (4-byte header + body). A 64 KB
-/// buffer collapses that to one syscall per ~64 KB — the dominant read-time win.
 const SOCK_BUF = 64 * 1024;
 
 pub const Conn = struct {
@@ -132,9 +147,8 @@ pub const Conn = struct {
         }
     }
 
-    /// Send the `LOAD DATA LOCAL INFILE …` query and wait for the server's local
-    /// infile request (a packet whose first byte is 0xFB). Data then streams via
-    /// `loadDataChunk`; `loadDataEnd` finishes it.
+    /// Send the `LOAD DATA LOCAL INFILE` query and wait for the server's local infile
+    /// request (first byte 0xFB); data then streams via `loadDataChunk` and `loadDataEnd`.
     pub fn loadDataStart(self: *Conn, cmd: []const u8) !void {
         const payload = try self.gpa.alloc(u8, cmd.len + 1);
         defer self.gpa.free(payload);
@@ -152,16 +166,13 @@ pub const Conn = struct {
         self.ld_seq = rseq +% 1;
     }
 
-    /// One chunk of the local-infile stream. The sink flushes well under 16 MB,
-    /// but the sequence number comes back from `writePacket` rather than being
-    /// bumped by one, so an oversized chunk splits without desynchronising.
     pub fn loadDataChunk(self: *Conn, data: []const u8) !void {
         if (data.len == 0) return;
         self.ld_seq = try self.writePacket(self.ld_seq, data);
     }
 
-    /// Empty packet = end of data; then read the server's OK/ERR. Returns the
-    /// OK packet's affected-rows count.
+    /// Empty packet ends the data; then reads the server's OK/ERR and returns the OK
+    /// packet's affected-rows count.
     pub fn loadDataEnd(self: *Conn) !u64 {
         _ = try self.writePacket(self.ld_seq, "");
         _ = try self.readPacket();
@@ -181,8 +192,6 @@ pub const Conn = struct {
         self.gpa.destroy(self);
     }
 
-    /// Cleartext reader/writer: through the TLS session when enabled, else the
-    /// plain socket interfaces.
     fn rd(self: *Conn) *std.Io.Reader {
         return if (self.tls) |t| &t.client.reader else self.sr.interface();
     }
@@ -198,7 +207,6 @@ pub const Conn = struct {
         return .{ .ptr = self, .vtable = &sql_vtable };
     }
 
-    /// Start streaming a query: send it, parse the column-def header.
     pub fn queryCursor(self: *Conn, stmt: []const u8) !sql.Cursor {
         return sql.openTextCursor(self, stmt, &cursor_vtable);
     }
@@ -244,8 +252,8 @@ pub const Conn = struct {
         self.done = false;
     }
 
-    /// One result-set packet, classified for `sql.fetchTextBatch`: a row
-    /// (values appended), the end of the stream, or a server error.
+    /// One result-set packet, classified for `sql.fetchTextBatch`: a row (values
+    /// appended), the end of the stream, or a server error.
     pub fn nextRow(self: *Conn, arena: std.mem.Allocator, builders: []column.Builder) !sql.RowStep {
         _ = try self.readPacket();
         const r = self.buf.items;
@@ -272,14 +280,11 @@ pub const Conn = struct {
         return .row;
     }
 
-    /// The three-byte length header caps one packet at 16 MB - 1, so anything
-    /// larger is sent as a run of full packets terminated by a short one.
     const max_payload: usize = 0xFFFFFF;
 
-    /// One logical packet, reassembled from however many wire packets carry it.
-    /// Reading only the first used to fail *and* leave the continuations
-    /// queued, so every later read on the connection was one packet out of
-    /// step — a 20 MB `longtext` broke the query and then the socket.
+    /// One logical packet, reassembled from its wire packets. Reading only the first
+    /// once left the continuations queued, so a 20 MB `longtext` broke the query and then
+    /// the socket.
     fn readPacket(self: *Conn) !u8 {
         const r = self.rd();
         self.buf.clearRetainingCapacity();
@@ -290,17 +295,12 @@ pub const Conn = struct {
             const base = self.buf.items.len;
             try self.buf.resize(base + len);
             try r.readSliceAll(self.buf.items[base..][0..len]);
-            // A full-length packet is always continued, even when the value
-            // ends exactly on the boundary — then the run ends with an empty
-            // packet. A short one is the last.
             if (len < max_payload) return header[3];
         }
     }
 
-    /// Writes `payload` as a packet run starting at `seq` and returns the next
-    /// sequence number. Masking the length into three bytes instead of
-    /// splitting desynchronised the *server*, which then read payload bytes as
-    /// a header.
+    /// Writes `payload` as a packet run starting at `seq`, returning the next sequence
+    /// number. Masking the length into three bytes instead desynchronised the server.
     fn writePacket(self: *Conn, seq: u8, payload: []const u8) !u8 {
         const w = self.wr();
         var off: usize = 0;
@@ -361,9 +361,8 @@ pub const Conn = struct {
         return caps;
     }
 
-    /// The SSLRequest packet: just the fixed 32-byte prefix of the handshake
-    /// response (caps with CLIENT_SSL, max packet, charset, 23 zero bytes). The
-    /// caps here must match the full response sent after the TLS handshake.
+    /// The SSLRequest packet: the fixed 32-byte prefix of the handshake response. Its
+    /// caps must match the full response sent after the TLS handshake.
     fn writeSslRequest(self: *Conn, seq: u8, database: []const u8) !void {
         var out = std.array_list.Managed(u8).init(self.gpa);
         defer out.deinit();
@@ -375,10 +374,6 @@ pub const Conn = struct {
         _ = try self.writePacket(seq, out.items);
     }
 
-    /// mysql_clear_password auth-switch response: the password as a null-terminated
-    /// cleartext string, which the server (e.g. StarRocks with LDAP / external auth)
-    /// validates itself. The password crosses the wire in the clear, so pair it with
-    /// `tls` whenever the path to the server isn't already trusted.
     fn writeClearPassword(self: *Conn, seq: u8, password: []const u8) !void {
         const pw = try self.gpa.alloc(u8, password.len + 1);
         defer self.gpa.free(pw);
@@ -453,9 +448,8 @@ fn pluginByName(s: []const u8) ?AuthPlugin {
     return null;
 }
 
-/// caching_sha2_password fast-auth token:
-///   SHA256(pw) XOR SHA256( SHA256(SHA256(pw)) ++ nonce )
-/// (note: digest-then-nonce — the opposite order of mysql_native_password).
+/// caching_sha2_password: SHA256(pw) XOR SHA256(SHA256(SHA256(pw)) ++ nonce), digest
+/// then nonce, the opposite order of mysql_native_password.
 pub fn cachingSha2Token(password: []const u8, salt: []const u8) [32]u8 {
     const Sha256 = std.crypto.hash.sha2.Sha256;
     var h1: [32]u8 = undefined;
@@ -476,11 +470,9 @@ pub fn cachingSha2Token(password: []const u8, salt: []const u8) [32]u8 {
 
 const AuthSwitch = struct { plugin: ?AuthPlugin, salt: [20]u8 };
 
+/// Total on its own: with no plugin-name byte `p[1..name_end]` would underflow, so
+/// it guards that even though today's caller already does.
 fn parseAuthSwitch(p: []const u8) AuthSwitch {
-    // Byte 0 is the 0xfe marker; the plugin name follows. With no name byte at
-    // all there is nothing to parse — `p[1..name_end]` would underflow to
-    // `p[1..0]`. The caller guards this today, but the parser stays total on
-    // its own so a future caller can't reintroduce the trap.
     if (p.len < 2) return .{ .plugin = null, .salt = std.mem.zeroes([20]u8) };
     var i: usize = 1;
     const name_end = std.mem.indexOfScalarPos(u8, p, i, 0) orelse p.len;
@@ -494,8 +486,6 @@ fn parseAuthSwitch(p: []const u8) AuthSwitch {
 
 const LD_FLUSH_BYTES = 1 << 20;
 
-/// LOAD DATA LOCAL INFILE: tab-separated rows streamed as the "file", one
-/// statement per segment, verified against the OK packet's affected-rows count.
 const LoadDataProto = struct {
     pub const Connection = Conn;
     pub const dialect: sql.Dialect = .mysql;
@@ -524,7 +514,7 @@ const LoadDataProto = struct {
 
 pub const LoadDataSink = sql.BulkSink(LoadDataProto);
 
-/// OK packet → affected-rows count (header 0x00, then affected_rows lenenc).
+/// OK packet to affected-rows count (header 0x00, then affected_rows lenenc).
 fn parseOkAffected(p: []const u8) ?u64 {
     if (p.len < 2 or p[0] != 0x00) return null;
     var i: usize = 1;
@@ -549,8 +539,8 @@ fn errMessage(p: []const u8) []const u8 {
 const sql_vtable = sql.connVTable(Conn);
 const cursor_vtable = sql.textCursorVTable(Conn);
 
-/// Fold a BIT column's raw big-endian bytes into an int (BIT(64) max; longer
-/// inputs keep the low 64 bits).
+/// Fold a BIT column's big-endian bytes into an int (BIT(64) max; longer inputs
+/// keep the low 64 bits).
 fn decodeBits(raw: []const u8) i64 {
     var v: u64 = 0;
     for (raw[raw.len -| 8..]) |b| v = (v << 8) | b;
@@ -637,7 +627,6 @@ test "parseColDef decodes a column definition packet" {
 }
 
 test "engineTypeFor maps MySQL wire types to engine types" {
-    // charset 33 = utf8mb4 (text), 63 = binary; flags 0 = signed, 0x20 = unsigned.
     try std.testing.expectEqual(types.TypeKind.int, engineTypeFor(0x03, 0, 0, 33).kind);
     try std.testing.expectEqual(types.TypeKind.int, engineTypeFor(0x08, 0, 0, 33).kind);
     try std.testing.expectEqual(types.TypeKind.float, engineTypeFor(0x05, 0, 0, 33).kind);
@@ -645,8 +634,6 @@ test "engineTypeFor maps MySQL wire types to engine types" {
     try std.testing.expectEqual(types.TypeKind.timestamp, engineTypeFor(0x0c, 0, 0, 33).kind);
     try std.testing.expectEqual(types.TypeKind.string, engineTypeFor(0xfd, 0, 0, 33).kind);
     try std.testing.expect(engineTypeFor(0x03, 0, 0, 33).nullable);
-    // `bigint unsigned` exceeds i64, so it rides as an exact decimal; a binary
-    // charset makes the string family bytes rather than (mis-declared) UTF-8.
     try std.testing.expectEqual(types.TypeKind.decimal, engineTypeFor(0x08, 0, 0x0020, 63).kind);
     try std.testing.expectEqual(types.TypeKind.bytes, engineTypeFor(0xfd, 0, 0, 63).kind);
     try std.testing.expectEqual(types.TypeKind.bytes, engineTypeFor(0xfc, 0, 0, 63).kind);
@@ -677,10 +664,6 @@ fn parseColDef(arena: std.mem.Allocator, p: []const u8) !MyCol {
     _ = try lenencStr(p, &i);
     _ = try lenencInt(p, &i);
     if (i + 10 > p.len) return error.MysqlProtocol;
-    // These two were stepped over. They carry the only signals that tell an
-    // unsigned column from a signed one and a binary column from text, so
-    // discarding them made `bigint unsigned` unreadable (it parses as i64 and
-    // fails the whole read) and declared `varbinary` as UTF-8 downstream.
     const charset = std.mem.readInt(u16, p[i..][0..2], .little);
     i += 2;
     i += 4;
@@ -697,8 +680,6 @@ fn engineTypeFor(mtype: u8, decimals: u8, flags: u16, charset: u16) types.Type {
     const unsigned = flags & 0x0020 != 0;
     const binary = charset == 63;
     return (switch (mtype) {
-        // A u64 does not fit i64, so an unsigned BIGINT rides as an exact
-        // decimal rather than failing to parse or wrapping negative.
         0x08 => if (unsigned) types.Type.decimal(20, 0) else types.Type.init(.int),
         0x01, 0x02, 0x03, 0x09, 0x0d => types.Type.init(.int),
         0x04, 0x05 => types.Type.init(.float),
@@ -706,8 +687,6 @@ fn engineTypeFor(mtype: u8, decimals: u8, flags: u16, charset: u16) types.Type {
         0x0a => types.Type.init(.date),
         0x07, 0x0c => types.Type.init(.timestamp),
         0x10 => types.Type.init(.int),
-        // BLOB/VAR_STRING/STRING under the binary charset are bytes, not text:
-        // annotating them UTF-8 wrote parquet that Arrow and DuckDB reject.
         0xfb, 0xfc, 0xfd, 0xfe => if (binary) types.Type.init(.bytes) else types.Type.init(.string),
         else => types.Type.init(.string),
     }).asNullable();
@@ -743,16 +722,13 @@ fn lenencStrOrNull(buf: []const u8, i: *usize) !?[]const u8 {
     return try lenencStr(buf, i);
 }
 
+/// Every parser here reads a packet body before authentication has proven anything
+/// about the peer; a lenenc walk must never leave the buffer.
 fn fuzzPackets(_: void, input: []const u8) anyerror!void {
-    // Every one of these parses a packet body as it arrives off the socket,
-    // before authentication has proven anything about the peer.
     _ = parseOkAffected(input);
     _ = errMessage(input);
     _ = parseAuthSwitch(input);
     _ = decodeBits(input);
-    // Walk the input as a run of length-encoded values, the shape of a text
-    // resultset row. Errors end the row; the cursor must still never leave
-    // the buffer.
     var i: usize = 0;
     while (i < input.len) {
         const before = i;
@@ -762,10 +738,10 @@ fn fuzzPackets(_: void, input: []const u8) anyerror!void {
 }
 
 const fuzzPackets_corpus = [_][]const u8{
-    "\x00\x05\x00\x02\x00", // OK-shaped
-    "\xff\x28\x04#42000oops", // ERR-shaped
-    "\xfe" ++ "caching_sha2_password" ++ "\x00" ++ "12345678", // auth-switch-shaped
-    "\x03abc\xfb\x02xy", // lenenc row
+    "\x00\x05\x00\x02\x00",
+    "\xff\x28\x04#42000oops",
+    "\xfe" ++ "caching_sha2_password" ++ "\x00" ++ "12345678",
+    "\x03abc\xfb\x02xy",
 };
 
 test "fuzz: wire packet parsers survive arbitrary bytes" {
@@ -773,8 +749,7 @@ test "fuzz: wire packet parsers survive arbitrary bytes" {
     try @import("../net/fuzzutil.zig").pound(fuzzPackets, &fuzzPackets_corpus);
 }
 
-/// mysql_native_password auth token:
-///   SHA1(pw) XOR SHA1( salt ++ SHA1(SHA1(pw)) )
+/// mysql_native_password: SHA1(pw) XOR SHA1(salt ++ SHA1(SHA1(pw))).
 pub fn mysqlAuthToken(password: []const u8, salt: []const u8) [20]u8 {
     const Sha1 = std.crypto.hash.Sha1;
     var h1: [20]u8 = undefined;

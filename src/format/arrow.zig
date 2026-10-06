@@ -1,4 +1,7 @@
-//! Arrow IPC stream writer — the `--format arrow` stdout sink.
+//! Arrow IPC writer: the `--format arrow` stdout sink (stream format) and the
+//! `LOAD INTO 'x.arrow'` file sink (`.feather` and `.ipc` too; `.arrows` writes the
+//! stream format). The file is local only and replaced, never appended to; its
+//! footer repeats the schema and indexes every batch's block, for random access.
 //!
 //! The columnar store is already Arrow's layout for most of what it holds:
 //! the validity bitmap is LSB-first with 1 = valid, strings and bytes are an
@@ -11,20 +14,20 @@
 //!
 //! One record batch per engine batch, framed as the streaming format: a
 //! continuation marker, the FlatBuffer message length padded to eight, the
-//! message, then the body with every buffer padded to eight. A run that
-//! produced no rows still yields a valid stream — the schema and the
-//! end-of-stream marker — which is what lets a consumer distinguish an empty
-//! result from a failed one. Every column is declared nullable, since the
-//! engine's nullability flag is a plan-time promise and the bitmap is the
-//! truth. Arrays and structs are refused; nothing produces them.
+//! message, then the body with every buffer padded to eight. The schema message
+//! is written at init, so a run that produced no rows still yields a valid
+//! stream, which is what lets a consumer tell an empty result from a failed one.
+//! Every column is declared nullable, since the engine's nullability flag is a
+//! plan-time promise and the bitmap is the truth. Arrays and structs are refused;
+//! nothing produces them.
 //!
 //! Self-description: a script may print several results back to back, so each
 //! stream says which one it is. The schema message carries `custom_metadata`
 //! (`basalt.statement`, `basalt.kind`, `basalt.line`, `basalt.col`), and just
 //! before the end-of-stream marker a zero-row record batch carries the totals in
-//! its message's `custom_metadata` (`basalt.rows`, `basalt.elapsed_ms`). Both are
-//! plain Arrow: a reader that ignores metadata sees the same table, one empty
-//! batch longer.
+//! its message's `custom_metadata` (`basalt.rows`, `basalt.elapsed_ms`,
+//! `basalt.truncated`). Both are plain Arrow: a reader that ignores metadata sees
+//! the same table, one empty batch longer.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -46,7 +49,6 @@ const version_v5: i16 = 4;
 
 const Header = enum(u8) { schema = 1, record_batch = 3 };
 
-/// The Arrow `Type` union tags this writer emits.
 const TypeTag = enum(u8) { int = 2, floating_point = 3, binary = 4, utf8 = 5, bool = 6, decimal = 7, date = 8, time = 9, timestamp = 10 };
 
 pub const KeyValue = struct { key: []const u8, value: []const u8 };
@@ -56,16 +58,9 @@ pub const StreamWriter = struct {
     fb: flatbuf.Builder,
     gpa: std.mem.Allocator,
     schema: types.Schema,
-    /// Bytes written so far, counted from `base` — where the stream starts in
-    /// its file — so a file writer can index its record batches.
     written: u64 = 0,
-    /// When set, each record batch's `[offset, meta_len, body_len]` is appended:
-    /// the footer of the file format.
     blocks: ?*std.array_list.Managed(i64) = null,
 
-    /// Writes the schema message at once, so the stream is well-formed from
-    /// the first byte even if no batch ever follows. `meta` becomes the
-    /// schema's `custom_metadata`.
     pub fn init(gpa: std.mem.Allocator, out: *std.Io.Writer, schema: types.Schema, meta: []const KeyValue) !StreamWriter {
         return initAt(gpa, out, schema, meta, 0, null);
     }
@@ -81,7 +76,6 @@ pub const StreamWriter = struct {
         self.fb.deinit();
     }
 
-    /// End-of-stream marker, then flush.
     pub fn finish(self: *StreamWriter) !void {
         try self.out.writeInt(u32, continuation, .little);
         try self.out.writeInt(u32, 0, .little);
@@ -89,9 +83,8 @@ pub const StreamWriter = struct {
         try self.out.flush();
     }
 
-    /// A zero-row record batch whose message carries `meta`: the stream's
-    /// trailer. Every column gets a zero-length node and zero-length buffers —
-    /// as many as its layout has, which is what a reader checks.
+    /// The trailer: a zero-row batch carrying `meta`. Every column gets as many
+    /// zero-length buffers as its layout has, which is what a reader checks.
     pub fn writeTrailer(self: *StreamWriter, meta: []const KeyValue) !void {
         const fb = &self.fb;
         fb.reset();
@@ -132,7 +125,6 @@ pub const StreamWriter = struct {
         try self.frame(try fb.finish(msg));
     }
 
-    /// The `Schema` table, shared by the schema message and a file's footer.
     fn schemaTable(fb: *flatbuf.Builder, gpa: std.mem.Allocator, schema: types.Schema, meta: []const KeyValue) !u32 {
         const kv = try keyValues(fb, gpa, meta);
         const offs = try gpa.alloc(u32, schema.fields.len);
@@ -189,8 +181,8 @@ pub const StreamWriter = struct {
         self.written += @intCast(body.len);
     }
 
-    /// The file format's closing: end-of-stream, the footer — the schema again
-    /// and every record batch's block — its length, and the magic.
+    /// End-of-stream, then the footer (schema and every batch's block), its length
+    /// and the magic.
     pub fn finishFile(self: *StreamWriter) !void {
         try self.out.writeInt(u32, continuation, .little);
         try self.out.writeInt(u32, 0, .little);
@@ -233,7 +225,6 @@ const Body = struct {
     }
 };
 
-/// A `[KeyValue]` vector, or null for no metadata at all.
 fn keyValues(fb: *flatbuf.Builder, gpa: std.mem.Allocator, meta: []const KeyValue) !?u32 {
     if (meta.len == 0) return null;
     const offs = try gpa.alloc(u32, meta.len);
@@ -371,11 +362,6 @@ fn pushData(arena: std.mem.Allocator, body: *Body, col: *const Column, n: usize)
     }
 }
 
-/// `LOAD INTO 'x.arrow'` (also `.feather`, `.ipc`): the IPC file format, which
-/// pyarrow's `open_file`, `polars.read_ipc` and Arrow JS read with random access
-/// to its batches. `.arrows` writes the stream format instead. A local path
-/// only; the file is replaced, never appended to — the footer indexes every
-/// batch, as a parquet footer does.
 pub const FileSink = struct {
     gpa: std.mem.Allocator,
     file: std.fs.File,
@@ -438,21 +424,15 @@ pub const FileSink = struct {
     const vtable = driver.sinkVTable(FileSink);
 };
 
-/// Which result a stdout stream is, for its schema metadata.
 pub const ResultInfo = struct {
-    /// Ordinal of the result among those the run printed, from 0.
     statement: u32 = 0,
-    /// select, describe, show or explain.
     kind: []const u8 = "select",
     line: u32 = 0,
     col: u32 = 0,
-    /// When the statement started, for the trailer's elapsed time.
     t0_ms: i64 = 0,
-    /// The row cap on this result, read at close for `basalt.truncated`.
     cap: ?*const driver.RowCap = null,
 };
 
-/// The stdout sink: an Arrow stream over a buffered stdout writer.
 pub const ArrowWriter = struct {
     gpa: std.mem.Allocator,
     buf: [1 << 16]u8 = undefined,
@@ -497,7 +477,6 @@ pub const ArrowWriter = struct {
         try self.sw.finish();
     }
 
-    /// Failure path: release without flushing the tail of the stream.
     pub fn abort(self: *ArrowWriter) void {
         self.deinit();
     }
@@ -513,8 +492,6 @@ pub const ArrowWriter = struct {
 
     const vtable = driver.sinkVTable(ArrowWriter);
 };
-
-// --- tests -----------------------------------------------------------------
 
 const Frame = struct { meta: []const u8, body: []const u8, next: usize };
 
@@ -599,7 +576,6 @@ test "stream: schema message declares every column's arrow type" {
     try std.testing.expectEqual(@as(i16, 2), time_t.int(i16, 0, 0));
     try std.testing.expectEqual(@as(i32, 64), time_t.int(i32, 1, 32));
 
-    // An empty result is schema + end-of-stream, nothing else.
     try std.testing.expectEqual(bytes.len, f0.next + 8);
     try std.testing.expectEqual(continuation, std.mem.readInt(u32, bytes[f0.next..][0..4], .little));
     try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, bytes[f0.next + 4 ..][0..4], .little));
@@ -636,7 +612,6 @@ test "stream: a record batch carries validity, repacked bools and decimals, raw 
     try std.testing.expectEqual(@as(i64, 1), rb.i64At(nodes.at + 8));
     try std.testing.expectEqual(@as(i64, 0), rb.i64At(nodes.at + 16 * 2 + 8));
     const bufs = rb.vector(2).?;
-    // 6 fixed-width columns × 2 buffers + 1 bytes column × 3 + bool × 2.
     try std.testing.expectEqual(@as(usize, 6 * 2 + 3 + 2), bufs.len);
 
     const Buf = struct { off: usize, len: usize };
@@ -666,7 +641,6 @@ test "stream: a record batch carries validity, repacked bools and decimals, raw 
     try std.testing.expectEqual(@as(usize, 48), valor_data.len);
     try std.testing.expectEqual(@as(i128, 1050), std.mem.readInt(i128, body[valor_data.off..][0..16], .little));
     try std.testing.expectEqual(@as(i128, 300), std.mem.readInt(i128, body[valor_data.off + 16 ..][0..16], .little));
-    // -12.345 at the column's scale 2 rounds half away from zero
     try std.testing.expectEqual(@as(i128, -1235), std.mem.readInt(i128, body[valor_data.off + 32 ..][0..16], .little));
 
     const dia_data = bufAt(rb, bufs.at, 10);
@@ -712,7 +686,6 @@ test "stream: schema metadata says which result it is, a trailer batch carries t
 
     const f1 = readFrame(bytes, f0.next);
     const f2 = readFrame(bytes, f1.next);
-    // the trailer: a record batch of zero rows, zero-length nodes and buffers, no body
     const msg = flatbuf.Table.root(f2.meta);
     try std.testing.expectEqual(@intFromEnum(Header.record_batch), msg.int(u8, 1, 0));
     try std.testing.expectEqual(@as(usize, 0), f2.body.len);
@@ -720,7 +693,6 @@ test "stream: schema metadata says which result it is, a trailer batch carries t
     const rb = msg.table(2).?;
     try std.testing.expectEqual(@as(i64, 0), rb.int(i64, 0, -1));
     try std.testing.expectEqual(@as(usize, 8), rb.vector(1).?.len);
-    // one bytes column carries three buffers, every other column two
     try std.testing.expectEqual(@as(usize, 7 * 2 + 3), rb.vector(2).?.len);
     try std.testing.expectEqual(bytes.len, f2.next + 8);
 }
@@ -748,8 +720,6 @@ test "file sink: the IPC file and stream a sink writes read back through the rea
         try std.testing.expectEqual(schema.fields.len, r.schema.fields.len);
         var rows: usize = 0;
         while (try r.next(a)) |b| {
-            // the decimal column as the writer stored it: at its declared scale 2,
-            // so the scale-3 input -12.345 rounds half away from zero to -12.35
             const dec_want = [_][]const u8{ "10.50", "3.00", "-12.35" };
             for (0..b.len) |i| {
                 const got = b.columns[3].getValue(i);

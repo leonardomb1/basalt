@@ -2,7 +2,8 @@
 //! its plan-time typing, its row-wise evaluator and (when one exists) its
 //! vectorized kernel. `eval.zig`'s `typeOfCall`, `evalCall` and `callVec` are
 //! each a `lookup` on the call's name, so a builtin missing from the table is
-//! unknown everywhere at once rather than in one of three if-chains.
+//! unknown everywhere at once rather than in one of three if-chains. `lookup`
+//! returns null for unknown names and for aggregates.
 //!
 //! The table itself lives at the bottom of `eval.zig`, next to the handlers it
 //! points at: those handlers lean on eval-private helpers (`evalRow`, `strArg`,
@@ -16,13 +17,10 @@ const std = @import("std");
 const eval = @import("eval.zig");
 const aggregates = @import("../lang/aggregates.zig");
 
-/// One entry of the registry; see `eval.Builtin`.
 pub const Builtin = eval.Builtin;
 
-/// Every scalar builtin, one entry per name.
 pub const table = &eval.builtins;
 
-/// The builtin called `name`, or null for unknown names and aggregates.
 pub const lookup = eval.lookupBuiltin;
 
 test "builtins: every entry has a unique name and resolves through lookup" {

@@ -13,6 +13,16 @@
 //! itself — Windows Terminal owns Alt+Enter and sends Ctrl+Enter as plain Enter.
 //! So an unfinished entry runs with Ctrl+J, which every terminal delivers, and
 //! with Ctrl+Enter where xterm's modifyOtherKeys is spoken.
+//!
+//! `Buffer` is everything about editing that needs no terminal, so all of it is
+//! testable; offsets are bytes and always sit on a UTF-8 boundary. Plain typing
+//! joins one undo step, so undo takes back a run of typing, not a letter. `Editor`
+//! adds the terminal: an entry taller than the screen is drawn as a window around
+//! the cursor, and the prompt is `»` on the first line and each line's number in
+//! that same two-column place after, the gutter growing only past nine lines so
+//! text never jumps as an entry gains a second line. History lives in
+//! `$HOME/.basalt_history` (in memory only without HOME), one entry per line with
+//! an entry's own newlines stored as 0x1f.
 
 const std = @import("std");
 const hilite = @import("hilite.zig");
@@ -21,7 +31,6 @@ pub const Result = union(enum) { line: []u8, eof, interrupt };
 
 pub const Nav = struct {
     to: To,
-    /// Shift was held: extend the selection instead of dropping it.
     select: bool = false,
 
     pub const To = enum { left, right, up, down, home, end, word_left, word_right, buf_home, buf_end };
@@ -38,33 +47,30 @@ pub const Key = union(enum) {
     nav: Nav,
     page_up,
     page_down,
-    escape, // a bare Esc: drop the selection
+    escape,
     shift_tab,
-    line_up, // Alt-Up: move the line
+    line_up,
     line_down,
-    dup_up, // Shift-Alt-Up: duplicate the line
+    dup_up,
     dup_down,
-    comment, // Ctrl-/ (0x1f)
-    kill_end, // ^K
-    kill_line, // ^U
-    word_back, // ^W, Alt-Backspace, Ctrl-Backspace
-    word_fwd_kill, // Alt-d, Ctrl-Delete
-    select_all, // ^A
-    undo, // ^Z
-    redo, // ^Y
-    cut, // ^X
-    paste, // ^V, when the terminal passes it through
-    paste_begin, // ESC [ 200 ~ : a bracketed paste follows
-    clear, // ^L
-    search, // ^R: search the history
-    interrupt, // ^C: copy when something is selected, else drop the entry
-    eof_or_delete, // ^D: EOF on an empty entry, delete-at-cursor otherwise
-    none, // unrecognized escape — ignore
+    comment,
+    kill_end,
+    kill_line,
+    word_back,
+    word_fwd_kill,
+    select_all,
+    undo,
+    redo,
+    cut,
+    paste,
+    paste_begin,
+    clear,
+    search,
+    interrupt,
+    eof_or_delete,
+    none,
 };
 
-/// Decode one keypress from `fd` (one byte, plus the tail of an ESC sequence).
-/// Split out so it is testable over a pipe.
-/// A control byte (`^A` = 1 …) as a key; null where it means nothing here.
 fn controlKey(c: u8) ?Key {
     return switch (c) {
         '\r' => .enter,
@@ -98,13 +104,12 @@ fn pending(fd: std.posix.fd_t, ms: i32) bool {
     return n > 0;
 }
 
-/// A key the terminal reported as a code plus modifiers — the xterm
-/// `CSI 27;mod;code~` and kitty `CSI code;mod u` forms, which are how Ctrl+Enter
-/// arrives when it arrives at all. `mask`: shift 1, alt 2, ctrl 4.
+/// A key reported as code plus modifiers (xterm `CSI 27;mod;code~`, kitty
+/// `CSI code;mod u`), which is how Ctrl+Enter arrives at all. `mask`: shift 1, alt 2,
+/// ctrl 4. Ctrl+Enter and Shift+Enter (Jupyter's) run, as does Alt+Enter.
 fn modifiedKey(code: u32, mask: u32) Key {
     const ctrl = mask & 4 != 0;
     const alt = mask & 2 != 0;
-    // Ctrl+Enter, Shift+Enter (Jupyter's) and Alt+Enter all run; the plain key is Enter.
     if (code == 13 or code == 10) return if (ctrl or mask & 1 != 0) .ctrl_enter else if (alt) .alt_enter else .enter;
     if (code == 27) return .none;
     if (code > 0x7f) return .none;
@@ -120,6 +125,9 @@ fn modifiedKey(code: u32, mask: u32) Key {
     return controlKey(c) orelse if (c >= 0x20) Key{ .char = c } else .none;
 }
 
+/// Decode one keypress from `fd` (one byte, plus the tail of an ESC sequence). A
+/// control sequence is read to its final byte whatever it is: `ESC [ 1 ; 5 C` cut
+/// short at the `;` once left `5C` to be typed into the line.
 pub fn readKey(fd: std.posix.fd_t) !Key {
     var b: [1]u8 = undefined;
     if (try std.posix.read(fd, &b) == 0) return .eof_or_delete;
@@ -137,9 +145,6 @@ pub fn readKey(fd: std.posix.fd_t) !Key {
                 0x7f, 0x08 => return .word_back,
                 else => return .none,
             }
-            // A control sequence is parameters (`0-9 ; :` and the private markers)
-            // and then one final byte. Read all of it whatever it turns out to be:
-            // `ESC [ 1 ; 5 C` cut short at the `;` left `5C` to be typed into the line.
             var first: u32 = 0;
             var modifier: u32 = 0;
             var third: u32 = 0;
@@ -156,7 +161,6 @@ pub fn readKey(fd: std.posix.fd_t) !Key {
                     else => break,
                 }
             }
-            // xterm's modifier parameter is 1 + a bitmask: shift 1, alt 2, ctrl 4.
             const mask = if (modifier > 1) modifier - 1 else 0;
             const shift = mask & 1 != 0;
             const alt = mask & 2 != 0;
@@ -187,9 +191,6 @@ pub fn readKey(fd: std.posix.fd_t) !Key {
     }
 }
 
-/// One terminal row of the entry: the bytes `start..end` of the text. `head` marks
-/// the first row of a logical line — the one that carries a prompt — as opposed to
-/// the continuation of a line too long for the terminal.
 pub const Row = struct { start: usize, end: usize, head: bool };
 
 fn charLen(text: []const u8, i: usize) usize {
@@ -204,9 +205,9 @@ fn charCols(c: u8) usize {
     return if (c == '\t') 2 else 1;
 }
 
-/// Break `text` into terminal rows `width` columns wide: one run per logical line,
-/// wrapped where it is too long. Every byte belongs to exactly one row except the
-/// newlines, which sit between them.
+/// Break `text` into terminal rows `width` columns wide, wrapping long lines; `head`
+/// marks a line's first row, the one with a prompt. Every byte belongs to exactly
+/// one row except the newlines, which sit between them.
 pub fn layoutRows(gpa: std.mem.Allocator, text: []const u8, width: usize) ![]Row {
     const w = @max(width, 2);
     var rows = std.array_list.Managed(Row).init(gpa);
@@ -254,7 +255,6 @@ fn colsBetween(text: []const u8, from: usize, to: usize) usize {
     return n;
 }
 
-/// The byte in `row` that sits `col` columns in, or the row's end if it is shorter.
 fn byteAtCol(text: []const u8, row: Row, col: usize) usize {
     var n: usize = 0;
     var i = row.start;
@@ -271,19 +271,13 @@ fn isWordByte(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_' or c >= 0x80;
 }
 
-/// The text being edited, its cursor and its selection — everything about editing
-/// that does not need a terminal, so all of it is testable. Offsets are bytes and
-/// always sit on a UTF-8 character boundary.
 pub const Buffer = struct {
     gpa: std.mem.Allocator,
     text: std.array_list.Managed(u8),
     cursor: usize = 0,
-    /// The fixed end of the selection; the cursor is the moving one. Null: none.
     anchor: ?usize = null,
     undo_stack: std.array_list.Managed(Snapshot),
     redo_stack: std.array_list.Managed(Snapshot),
-    /// The last edit was plain typing, so the next keystroke joins its undo step
-    /// instead of making a new one — undo takes back a run of typing, not a letter.
     typing: bool = false,
 
     const Snapshot = struct { text: []u8, cursor: usize };
@@ -371,7 +365,8 @@ pub const Buffer = struct {
         self.anchor = null;
     }
 
-    /// Type or paste `s`, over the selection if there is one.
+    /// Type or paste `s`, over the selection if there is one. Typing over a selection
+    /// starts an undo run: the new word comes back out as one step, the selection with the next.
     pub fn insert(self: *Buffer, s: []const u8) !void {
         const plain = s.len == 1 and s[0] != '\n' and s[0] != ' ';
         const sel = self.selection();
@@ -380,15 +375,12 @@ pub const Buffer = struct {
         try self.text.insertSlice(self.cursor, s);
         self.cursor += s.len;
         self.anchor = null;
-        // Typing over a selection starts a run too: the word that replaced it
-        // comes back out as one undo step, and the selection with the next.
         self.typing = plain;
     }
 
-    /// A new line, at the line's start — a prompt, not a code editor: an indent
-    /// that followed the cursor down read as the cursor refusing to go home.
-    /// Between `(` and `)` the new line steps in two past the opener's line, and
-    /// the closer moves to a line of its own at that line's indent.
+    /// A new line, at the line's start: an indent that followed the cursor down read
+    /// as the cursor refusing to go home. Between `(` and `)` the new line steps in two
+    /// past the opener's line, and the closer moves to a line of its own.
     pub fn newline(self: *Buffer) !void {
         const t = self.text.items;
         const prev: u8 = if (self.cursor > 0) t[self.cursor - 1] else 0;
@@ -500,11 +492,10 @@ pub const Buffer = struct {
         }
     }
 
-    /// The logical lines the selection touches (or the cursor's), as `start..end`
-    /// where `end` is the last line's end, without its newline.
+    /// The logical lines the selection touches (or the cursor's), without the last
+    /// newline. A selection ending at the very start of a line does not include that line.
     fn lineBlock(self: *const Buffer) Range {
         const sel = self.selection() orelse Range{ .start = self.cursor, .end = self.cursor };
-        // A selection ending at the very start of a line does not include that line.
         const last = if (sel.end > sel.start and self.text.items[sel.end - 1] == '\n') sel.end - 1 else sel.end;
         return .{ .start = self.lineStart(sel.start), .end = self.lineEnd(last) };
     }
@@ -518,7 +509,6 @@ pub const Buffer = struct {
         self.cursor = r.start + (cursor orelse s.len);
     }
 
-    /// Alt-Up / Alt-Down: the current lines swap places with the neighbour.
     pub fn moveLines(self: *Buffer, down: bool) !void {
         const t = self.text.items;
         const blk = self.lineBlock();
@@ -543,7 +533,6 @@ pub const Buffer = struct {
         }
     }
 
-    /// Shift-Alt-Up / Shift-Alt-Down: a copy of the current lines above or below.
     pub fn duplicateLines(self: *Buffer, down: bool) !void {
         const blk = self.lineBlock();
         const off = self.cursor - blk.start;
@@ -554,7 +543,6 @@ pub const Buffer = struct {
         try self.replaceBlock(blk, joined, if (down) lines.len + 1 + off else off, false);
     }
 
-    /// Tab / Shift-Tab over lines: two spaces in or out at the start of each.
     pub fn indentLines(self: *Buffer, out: bool) !void {
         const blk = self.lineBlock();
         const t = self.text.items;
@@ -583,7 +571,7 @@ pub const Buffer = struct {
         if (had_sel) self.cursor = blk.start + buf.items.len;
     }
 
-    /// Ctrl-/: comment the lines out with `-- `, or back in when they all are.
+    /// Comment the lines out with `-- `, or back in when they all are.
     pub fn toggleComment(self: *Buffer) !void {
         const blk = self.lineBlock();
         const t = self.text.items;
@@ -626,10 +614,9 @@ pub const Buffer = struct {
         };
     }
 
-    /// A typed character, with an editor's reflexes: an opener over a selection
-    /// wraps it; an opener before a blank is paired with its closer; a closer that
-    /// is already the next character is stepped over; `)` on an empty line takes
-    /// the indent out first.
+    /// A typed character, with an editor's reflexes: an opener over a selection wraps
+    /// it; an opener before a blank is paired with its closer; a closer that is already
+    /// next is stepped over; `)` on an empty line takes the indent out first.
     pub fn typeChar(self: *Buffer, c: u8) !void {
         const t = self.text.items;
         if (self.selection()) |r| if (closerOf(c)) |cl| {
@@ -668,8 +655,8 @@ pub const Buffer = struct {
         try self.insert(&[_]u8{c});
     }
 
-    /// The bracket paired with the one at or just before the cursor, as the two
-    /// byte offsets, for the repaint to underline. Strings are not looked into.
+    /// The bracket paired with the one at or just before the cursor, as two byte
+    /// offsets for the repaint to underline. Strings are not looked into.
     pub fn bracketPair(self: *const Buffer) ?[2]usize {
         const t = self.text.items;
         const at: usize = if (self.cursor < t.len and isBracket(t[self.cursor])) self.cursor else if (self.cursor > 0 and isBracket(t[self.cursor - 1])) self.cursor - 1 else return null;
@@ -704,9 +691,8 @@ pub const Buffer = struct {
         return c == '(' or c == ')' or c == '[' or c == ']' or c == '{' or c == '}';
     }
 
-    /// Travel. With `select` the anchor stays put and the cursor drags the
-    /// selection; without it a selection collapses — and Left or Right collapse to
-    /// its near edge rather than stepping past it.
+    /// With `select` the anchor stays put and the cursor drags the selection; without
+    /// it a selection collapses, Left or Right to its near edge rather than past it.
     pub fn move(self: *Buffer, nav: Nav) void {
         self.typing = false;
         if (nav.select) {
@@ -751,20 +737,12 @@ pub const Editor = struct {
     out: std.fs.File,
     hist: std.array_list.Managed([]u8),
     hist_path: ?[]u8 = null,
-    /// What cut and copy last took, for ^V where the terminal passes it through.
     clipboard: ?[]u8 = null,
-    /// The terminal row the cursor was left on by the last repaint, counted from
-    /// the first row drawn; and which row of the entry that first one was — an
-    /// entry taller than the terminal shows a window around the cursor.
     cursor_row: usize = 0,
     top: usize = 0,
-    /// Colour the entry (off under `NO_COLOR`).
     color: bool = true,
 
     const max_history = 500;
-    /// `» ` on the first line and, once there are more, each line's number in
-    /// that same two-column place — the gutter grows only past nine lines, so the
-    /// text never jumps as an entry gains a second line. Wrapped rows are blank there.
     const prompt_first = "\xc2\xbb";
 
     fn gutterWidth(text: []const u8) usize {
@@ -774,24 +752,17 @@ pub const Editor = struct {
         while (n >= 10) : (n /= 10) digits += 1;
         return @max(2, digits + 1);
     }
-    /// A newline inside a history entry, on disk: the file stays one entry per line.
     const hist_newline = 0x1f;
 
     pub const Options = struct {
-        /// Is this text a whole entry, so that Enter should run it rather than
-        /// open another line?
         complete: *const fn (ctx: *anyopaque, text: []const u8) bool,
         complete_ctx: *anyopaque = undefined,
-        /// Tab: what the word at `cursor` could become. `items` are owned by
-        /// `arena`; the editor replaces `text[start..cursor]` with one of them.
         suggest: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, text: []const u8, cursor: usize) anyerror!Suggestions = null,
         suggest_ctx: *anyopaque = undefined,
     };
 
     pub const Suggestions = struct { start: usize = 0, items: []const []const u8 = &.{} };
 
-    /// A completion in progress: the choices, which is lit, and where the word
-    /// they replace begins. Any key but Tab dismisses it.
     const Menu = struct {
         arena: std.heap.ArenaAllocator,
         items: []const []const u8,
@@ -818,7 +789,7 @@ pub const Editor = struct {
         if (self.clipboard) |c| self.gpa.free(c);
     }
 
-    /// `$HOME/.basalt_history`, last `max_history` entries. No HOME → in-memory only.
+    /// Loads the last `max_history` entries; the file is rewritten from that set on the next add.
     fn loadHistory(self: *Editor) void {
         const home = std.process.getEnvVarOwned(self.gpa, "HOME") catch return;
         defer self.gpa.free(home);
@@ -835,7 +806,6 @@ pub const Editor = struct {
                 return;
             };
         }
-        // Keep the tail; the file itself is rewritten from this trimmed set on add.
         while (self.hist.items.len > max_history) self.gpa.free(self.hist.orderedRemove(0));
     }
 
@@ -866,9 +836,8 @@ pub const Editor = struct {
         self.out.writeAll(s) catch {};
     }
 
-    /// Keep a copy for ^V and hand it to the system clipboard. OSC 52 is how a
-    /// program inside a terminal reaches it; a terminal that does not know the
-    /// sequence ignores it, and the internal copy still works.
+    /// Keep a copy for ^V and hand it to the system clipboard through OSC 52; a
+    /// terminal that does not know the sequence ignores it, and the internal copy still works.
     fn toClipboard(self: *Editor, s: []const u8) void {
         if (self.clipboard) |c| self.gpa.free(c);
         self.clipboard = self.gpa.dupe(u8, s) catch null;
@@ -885,8 +854,8 @@ pub const Editor = struct {
     }
 
     /// Repaint the whole entry and park the cursor. It starts from the first row
-    /// drawn last time and clears everything below, so rows a shorter entry no
-    /// longer needs do not linger.
+    /// drawn last time and clears everything below, so rows a shorter entry no longer
+    /// needs do not linger.
     fn redraw(self: *Editor, buf: *const Buffer) void {
         self.redrawWith(buf, null);
     }
@@ -918,7 +887,6 @@ pub const Editor = struct {
             if (r.head) line_no += 1;
             if (ri < self.top) continue;
             if (ri > self.top) w.writeAll("\r\n") catch return;
-            // The window's edges say when the entry goes on beyond them.
             const hidden_above = ri == self.top and self.top > 0;
             const hidden_below = ri == last - 1 and last < rows.len;
             if (hidden_above or hidden_below) {
@@ -961,14 +929,11 @@ pub const Editor = struct {
                 i += n;
             }
             if (self.color and style != .plain) w.writeAll(hilite.sgr_reset) catch return;
-            // A selected line break shows as one lit cell past the row's end.
             const nl_sel = if (sel) |s| r.end < text.len and text[r.end] == '\n' and r.end >= s.start and r.end < s.end else false;
             if (nl_sel and !lit) w.writeAll("\x1b[7m") catch return;
             if (nl_sel) w.writeAll(" ") catch return;
             if (lit or nl_sel) w.writeAll("\x1b[27m") catch return;
         }
-        // The choices, one row under the entry: as many as fit, the lit one in
-        // reverse video, `…` when there are more.
         var extra: usize = 0;
         if (menu) |m| {
             w.writeAll("\r\n") catch return;
@@ -992,9 +957,9 @@ pub const Editor = struct {
         self.cursor_row = cur - self.top;
     }
 
-    /// Tab. With a menu up, the next choice replaces the word; otherwise the
-    /// provider is asked, a lone answer is taken, and several fill in what they
-    /// share and come up as a menu.
+    /// Tab. With a menu up, the next choice replaces the word; otherwise the provider
+    /// is asked, a lone answer is taken, and several fill in what they share and come up
+    /// as a menu that any key but Tab dismisses.
     fn completeWord(self: *Editor, buf: *Buffer, opts: Options, menu: *?Menu) !void {
         if (menu.*) |*m| {
             const i = if (m.index) |i| (i + 1) % m.items.len else 0;
@@ -1025,9 +990,8 @@ pub const Editor = struct {
         menu.* = .{ .arena = arena, .items = s.items, .start = s.start };
     }
 
-    /// ^R: type to narrow, ^R again for an older match, Enter or an arrow keeps
-    /// the match in the entry, Esc or ^C puts the entry back as it was. The match
-    /// is shown in the entry itself, the query on the row under it.
+    /// ^R: type to narrow, ^R again for an older match, Enter or an arrow keeps the
+    /// match, Esc or ^C puts the entry back. The match shows in the entry, the query below.
     fn searchHistory(self: *Editor, buf: *Buffer) !void {
         const original = try self.gpa.dupe(u8, buf.bytes());
         defer self.gpa.free(original);
@@ -1073,32 +1037,30 @@ pub const Editor = struct {
         try buf.insert(with);
     }
 
-    /// Text arriving between the bracketed-paste markers: taken as typed, never as
-    /// keys — a pasted newline is a new line, not a request to run half a script.
+    /// Text between the bracketed-paste markers is taken as typed, never as keys: a
+    /// pasted newline is a new line, not a request to run half a script.
     fn readPaste(self: *Editor, buf: *Buffer) !void {
         const pasted = try readPasted(self.gpa, self.in_fd);
         defer self.gpa.free(pasted);
         try buf.insert(pasted);
     }
 
-    /// Read one entry with editing. The returned `.line` is gpa-owned by the caller
-    /// and may hold several lines.
+    /// Read one entry with editing; `.line` is gpa-owned and may hold several lines.
+    /// Enter runs a complete entry only from its end; Ctrl+J and Ctrl+Enter (asked for via
+    /// xterm modifyOtherKeys level 1) run whatever is there, from anywhere.
     pub fn readEntry(self: *Editor, opts: Options) !Result {
         const orig = try enterRaw(self.in_fd);
         defer std.posix.tcsetattr(self.in_fd, .NOW, orig) catch {};
         self.write("\x1b[?2004h");
         defer self.write("\x1b[?2004l");
 
-        // Ask for Ctrl+Enter: xterm's modifyOtherKeys, level 1, which touches only
-        // keys with no control code of their own. A terminal that does not know
-        // it ignores it.
         self.write("\x1b[>4;1m");
         defer self.write("\x1b[>4;0m");
 
         var buf = Buffer.init(self.gpa);
         defer buf.deinit();
         var hist_pos: usize = self.hist.items.len;
-        var stash: ?[]u8 = null; // the entry in progress while browsing history
+        var stash: ?[]u8 = null;
         defer if (stash) |s| self.gpa.free(s);
         var goal_col: ?usize = null;
         var menu: ?Menu = null;
@@ -1117,9 +1079,6 @@ pub const Editor = struct {
             switch (key) {
                 .enter, .alt_enter, .ctrl_enter => {
                     const text = buf.bytes();
-                    // Enter runs a finished entry only from its end; in the middle, or
-                    // with no `;` yet, it is an editor's Enter — a new line. Ctrl+J and
-                    // Ctrl+Enter run whatever is there, from anywhere.
                     const at_end = buf.cursor == text.len;
                     const meta = std.mem.startsWith(u8, std.mem.trimLeft(u8, text, " \t"), "\\") and std.mem.indexOfScalar(u8, text, '\n') == null;
                     const run = key != .enter or meta or (at_end and opts.complete(opts.complete_ctx, text));
@@ -1190,7 +1149,6 @@ pub const Editor = struct {
                         defer self.gpa.free(rows);
                         const down = nav.to == .down;
                         if (!buf.moveVertical(rows, down, nav.select, &goal_col) and !nav.select) {
-                            // Off the top or bottom of the entry: the history.
                             if (!down and hist_pos > 0) {
                                 if (hist_pos == self.hist.items.len and stash == null) stash = try self.gpa.dupe(u8, buf.bytes());
                                 hist_pos -= 1;
@@ -1204,7 +1162,6 @@ pub const Editor = struct {
                     else => buf.move(nav),
                 },
                 .search => try self.searchHistory(&buf),
-                // A screenful up or down, the column kept, the way an editor pages.
                 .page_up, .page_down => {
                     const size = termSize(self.out);
                     const rows = try layoutRows(self.gpa, buf.bytes(), textWidth(size, gutterWidth(buf.bytes())));
@@ -1232,27 +1189,26 @@ pub fn historyMatch(hist: []const []const u8, query: []const u8, from: usize) ?u
     return null;
 }
 
-/// Put `fd` in the editor's raw mode and hand back the settings to restore.
+/// Put `fd` in raw mode and return the settings to restore. ICRNL is off, or a
+/// pasted CRLF reads as two line feeds; `.NOW`, not `.FLUSH`, which would eat the
+/// tail of a multi-line paste. ISIG is off: ^C arrives as a byte.
 pub fn enterRaw(fd: std.posix.fd_t) !std.posix.termios {
     const orig = try std.posix.tcgetattr(fd);
     var raw = orig;
     raw.lflag.ECHO = false;
     raw.lflag.ICANON = false;
-    raw.lflag.ISIG = false; // ^C arrives as a byte; execution re-arms normal signals
+    raw.lflag.ISIG = false;
     raw.lflag.IEXTEN = false;
     raw.iflag.IXON = false;
-    // Bytes as sent: with CR→LF translation on, a pasted CRLF reads as two
-    // line feeds and every line of a Windows paste comes out double-spaced.
     raw.iflag.ICRNL = false;
     raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
     raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
-    // .NOW, not .FLUSH: flushing would eat the tail of a multi-line paste.
     try std.posix.tcsetattr(fd, .NOW, raw);
     return orig;
 }
 
 /// The rest of a bracketed paste, after its `ESC [ 200 ~`: the text up to the
-/// closing `ESC [ 201 ~`, every line break as `\n`. gpa-owned.
+/// closing `ESC [ 201 ~`, every CRLF, CR or LF as `\n`. gpa-owned.
 pub fn readPasted(gpa: std.mem.Allocator, fd: std.posix.fd_t) ![]u8 {
     var pasted = std.array_list.Managed(u8).init(gpa);
     defer pasted.deinit();
@@ -1260,7 +1216,6 @@ pub fn readPasted(gpa: std.mem.Allocator, fd: std.posix.fd_t) ![]u8 {
     var b: [1]u8 = undefined;
     var prev_cr = false;
     while (try std.posix.read(fd, &b) != 0) {
-        // CRLF, CR and LF all mean one line break.
         if (b[0] == '\n' and prev_cr) {
             prev_cr = false;
             continue;
@@ -1295,13 +1250,11 @@ test "layoutRows: logical lines, wrapped rows, and which row a cursor on the sea
     const gpa = std.testing.allocator;
     const rows = try layoutRows(gpa, "SELECT 1\nFROM abcdefghij\n", 8);
     defer gpa.free(rows);
-    // "SELECT 1" | "FROM abc" + "defghij" | ""
     try std.testing.expectEqual(@as(usize, 4), rows.len);
     try std.testing.expectEqual(Row{ .start = 0, .end = 8, .head = true }, rows[0]);
     try std.testing.expectEqual(Row{ .start = 9, .end = 17, .head = true }, rows[1]);
     try std.testing.expectEqual(Row{ .start = 17, .end = 24, .head = false }, rows[2]);
     try std.testing.expectEqual(Row{ .start = 25, .end = 25, .head = true }, rows[3]);
-    // End of a logical line stays on it; the seam of a wrap is the next row's start.
     try std.testing.expectEqual(@as(usize, 0), rowOf(rows, 8));
     try std.testing.expectEqual(@as(usize, 2), rowOf(rows, 17));
     try std.testing.expectEqual(@as(usize, 3), rowOf(rows, 25));
@@ -1387,9 +1340,9 @@ test "Buffer: Up and Down keep their column across a short row and report the ed
     defer gpa.free(rows);
     var goal: ?usize = null;
     try std.testing.expect(b.moveVertical(rows, true, false, &goal));
-    try std.testing.expectEqual(@as(usize, 14), b.cursor); // end of "  x", column 3
+    try std.testing.expectEqual(@as(usize, 14), b.cursor);
     try std.testing.expect(b.moveVertical(rows, true, false, &goal));
-    try std.testing.expectEqual(@as(usize, 23), b.cursor); // column 8 again
+    try std.testing.expectEqual(@as(usize, 23), b.cursor);
     try std.testing.expect(!b.moveVertical(rows, true, false, &goal));
     try std.testing.expect(b.moveVertical(rows, false, true, &goal));
     try std.testing.expect(b.selection() != null);
@@ -1405,7 +1358,6 @@ test "Buffer: auto-close, skip-over, wrap a selection, and dedent a closer" {
     try b.typeChar(')');
     try std.testing.expectEqualStrings("(x)", b.bytes());
     try std.testing.expectEqual(@as(usize, 3), b.cursor);
-    // `it's`: no pairing after a word character.
     try b.set("it");
     try b.typeChar('\'');
     try std.testing.expectEqualStrings("it'", b.bytes());
@@ -1474,9 +1426,6 @@ test "readKey: modified arrows carry Shift and word, and the editor's control ke
     const fds = try std.posix.pipe();
     defer std.posix.close(fds[0]);
     const w = fds[1];
-    // Ctrl-Right, Shift-Left, Ctrl-Shift-Right, Shift-Up, Ctrl-Home, Shift-End,
-    // Ctrl-Delete, Alt-b, Alt-Enter, ^A ^Z ^Y ^X, paste marker, an unknown
-    // sequence, then a plain byte that must survive it.
     _ = try std.posix.write(w, "\x1b[1;5C\x1b[1;2D\x1b[1;6C\x1b[1;2A\x1b[1;5H\x1b[1;2F\x1b[3;5~\x1bb\x1b\r\x01\x1a\x19\x18\x1b[200~\x1b[?25;9zq\x1b[27;5;13~\x1b[13;5u\x1b[13;3u\x1b[98;3u\x1b[27u\x1b[13;2u\n\x1b[1;3A\x1b[1;4B\x1b[Z\x1f");
     std.posix.close(w);
     const expect = [_]Key{
@@ -1496,14 +1445,13 @@ test "readKey: modified arrows carry Shift and word, and the editor's control ke
         .paste_begin,
         .none,
         .{ .char = 'q' },
-        // Ctrl+Enter in the xterm and kitty forms, Alt+Enter and Alt-b in kitty's, a bare Esc.
         .ctrl_enter,
         .ctrl_enter,
         .alt_enter,
         .{ .nav = .{ .to = .word_left } },
         .none,
-        .ctrl_enter, // Shift+Enter, kitty form
-        .ctrl_enter, // ^J
+        .ctrl_enter,
+        .ctrl_enter,
         .line_up,
         .dup_down,
         .shift_tab,

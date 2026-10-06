@@ -1,28 +1,26 @@
-//! Azure AD token acquisition for the SQL Server / Dataverse TDS endpoints.
-//! basalt's TDS driver does SQL logins; the Dataverse and Azure SQL endpoints
-//! want an Azure AD access token instead. Given an AAD username + password this
-//! gets one with NO app registration, mirroring what Microsoft.Data.SqlClient's
-//! "Active Directory Password" does:
+//! Azure AD token acquisition for the SQL Server / Dataverse TDS endpoints, which
+//! want an AAD access token instead of a SQL login. Given an AAD username and
+//! password it gets one with no app registration, mirroring the "Active Directory
+//! Password" mode of Microsoft.Data.SqlClient:
 //!
-//!   - Managed (cloud) accounts -> OAuth2 ROPC against login.microsoftonline.com.
-//!   - Federated (ADFS) accounts -> realm discovery, then a WS-Trust 1.3
+//!   - Managed (cloud) accounts: OAuth2 ROPC against login.microsoftonline.com.
+//!   - Federated (ADFS) accounts: realm discovery, then a WS-Trust 1.3
 //!     username/password request to the on-prem STS for a SAML assertion, which
-//!     is exchanged at AAD via the SAML-bearer grant. (No MFA: the password flow
-//!     can't satisfy an interactive MFA challenge.)
+//!     is exchanged at AAD via the SAML-bearer grant (v1.0 endpoint with
+//!     `resource`, like ADAL's federated flow).
 //!
-//! The well-known ADO.NET first-party client id is pre-consented in every tenant,
-//! so no registration is required.
+//! No MFA: the password flow cannot satisfy an interactive challenge. The ADO.NET
+//! first-party client id (`ado_client_id`) is pre-consented in every tenant, which
+//! is why no registration is needed.
 
 const std = @import("std");
 const http_client = @import("../net/http_client.zig");
 
-/// Microsoft.Data.SqlClient's built-in client id for AAD auth (first-party,
-/// pre-consented) and the Azure SQL resource the Dataverse TDS endpoint accepts.
 pub const ado_client_id = "2fd908ad-0664-4344-b9be-cd3e8b574c38";
 pub const sql_resource = "https://database.windows.net";
 
 /// Token for an AAD username/password, auto-detecting managed vs federated.
-/// `resource` is the audience (no trailing slash), e.g. https://database.windows.net.
+/// `resource` is the audience with no trailing slash, e.g. https://database.windows.net.
 pub fn passwordToken(
     gpa: std.mem.Allocator,
     client_id: []const u8,
@@ -48,7 +46,7 @@ fn tenantOf(upn: []const u8) []const u8 {
 
 const Realm = struct { federated: bool, sts_url: []const u8 };
 
-/// GET getuserrealm.srf -> {NameSpaceType, AuthURL}. For a federated domain,
+/// GET getuserrealm.srf for {NameSpaceType, AuthURL}. For a federated domain,
 /// derives the WS-Trust 1.3 usernamemixed endpoint from the AuthURL host.
 fn getUserRealm(gpa: std.mem.Allocator, upn: []const u8) !Realm {
     var client = http_client.initClient(gpa);
@@ -80,8 +78,8 @@ fn hostOf(url: []const u8) ?[]const u8 {
     return if (h.len == 0) null else h;
 }
 
-/// POST a WS-Trust 1.3 RST with the username/password to the ADFS usernamemixed
-/// endpoint and return the SAML assertion XML (caller owns it).
+/// POSTs a WS-Trust 1.3 RST to the ADFS usernamemixed endpoint and returns the
+/// SAML assertion XML (caller owns it).
 fn wsTrustAssertion(gpa: std.mem.Allocator, username: []const u8, password: []const u8, sts_url: []const u8) ![]const u8 {
     const now = std.time.timestamp();
     const created = try iso8601(gpa, now);
@@ -125,8 +123,8 @@ fn wsTrustAssertion(gpa: std.mem.Allocator, username: []const u8, password: []co
     return gpa.dupe(u8, assertion);
 }
 
-/// Extract `<[ns:]Name ...>...</[ns:]Name>` (the first occurrence), namespaces
-/// included. ADFS assertions are self-contained, so the slice stands alone.
+/// The first `<[ns:]Name ...>...</[ns:]Name>`, namespaces included. ADFS
+/// assertions are self-contained, so the slice stands alone.
 fn extractElement(xml: []const u8, name: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, xml, i, name)) |p| {
@@ -146,8 +144,6 @@ fn extractElement(xml: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// SAML-bearer grant: exchange the assertion for an AAD access token (v1.0
-/// endpoint with `resource`, like ADAL's federated flow).
 fn samlBearerToken(gpa: std.mem.Allocator, tenant: []const u8, client_id: []const u8, assertion: []const u8, resource: []const u8) ![]const u8 {
     const enc = std.base64.standard.Encoder;
     const b64 = try gpa.alloc(u8, enc.calcSize(assertion.len));
@@ -167,7 +163,6 @@ fn samlBearerToken(gpa: std.mem.Allocator, tenant: []const u8, client_id: []cons
     return postForToken(gpa, url, body.items);
 }
 
-/// OAuth2 ROPC (managed cloud accounts) against the v2.0 endpoint.
 pub fn ropcToken(
     gpa: std.mem.Allocator,
     tenant: []const u8,

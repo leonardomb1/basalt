@@ -1,4 +1,4 @@
-//! The REPL's forms — what `\connect` asks with: a list to pick from, a set of
+//! The REPL's forms, what `\connect` asks with: a list to pick from, a set of
 //! fields to fill, a yes or no. Each is drawn in place and redrawn on every key,
 //! the way the entry is: arrows move between fields and along them, the fields
 //! edit with the entry editor's own `Buffer` and keys (word moves, ^W, ^U, ^K,
@@ -8,8 +8,14 @@
 //! A widget is its state, `apply` (a key in, a step out) and `render` (rows into
 //! a buffer, and where the cursor goes); `run` puts the terminal in raw mode and
 //! drives one. Split that way so the tests drive keys and read rows without a TTY.
-//! No row is drawn wider than the terminal — a wrapped row would throw off the
-//! count the repaint moves back up by — so long values scroll around the cursor.
+//! No row is drawn wider than the terminal, since a wrapped row would throw off
+//! the count the repaint moves back up by, so long values scroll around the
+//! cursor. In `Rows`, text counts toward the width and stops at the edge, while
+//! styles do not count and always go out, so a cut row still resets them.
+//!
+//! A form's hooks let fields follow other answers: `refresh` runs after every
+//! key (placeholders, hidden fields), and `check` on submit names a field to
+//! turn back to and why, shown under the fields until the next key.
 
 const std = @import("std");
 const line = @import("line.zig");
@@ -25,7 +31,7 @@ pub const Colors = struct {
     rev: []const u8 = "",
     off: []const u8 = "",
 
-    /// The banner's palette: its orange mark, dim and bold; nothing under NO_COLOR.
+    /// The banner's palette; nothing under NO_COLOR.
     pub fn init(on: bool) Colors {
         if (!on) return .{};
         return .{ .dim = "\x1b[2m", .bold = "\x1b[1m", .mark = "\x1b[38;5;208m", .bad = "\x1b[31m", .rev = "\x1b[7m", .off = "\x1b[0m" };
@@ -34,18 +40,14 @@ pub const Colors = struct {
 
 pub const Step = enum { more, done, cancel };
 
-/// Where the terminal cursor goes once the rows are drawn.
 pub const Cursor = struct { rows: usize, row: usize, col: usize };
 
-/// Glyphs: the active step, a finished one, the focused row, a masked byte.
-const active = "\xe2\x97\x86"; // ◆
-const finished = "\xe2\x97\x87"; // ◇
-const pointer = "\xe2\x80\xba"; // ›
-const dot = "\xe2\x80\xa2"; // •
-const sep = " \xc2\xb7 "; // ·
+const active = "\xe2\x97\x86";
+const finished = "\xe2\x97\x87";
+const pointer = "\xe2\x80\xba";
+const dot = "\xe2\x80\xa2";
+const sep = " \xc2\xb7 ";
 
-/// Rows under construction: text counts toward the row's width and stops at the
-/// edge; styles do not count and always go out, so a cut row still resets them.
 const Rows = struct {
     out: *std.array_list.Managed(u8),
     limit: usize,
@@ -86,7 +88,7 @@ fn cpLen(s: []const u8, i: usize) usize {
     return @min(n, s.len - i);
 }
 
-/// Columns `s` takes: one per code point.
+/// Columns `s` takes, counted as one per code point.
 fn cols(s: []const u8) usize {
     var n: usize = 0;
     for (s) |b| {
@@ -106,15 +108,12 @@ fn cpByte(s: []const u8, k: usize) usize {
     return s.len;
 }
 
-// --- a list to pick from ----------------------------------------------------------
-
 pub const Item = struct { name: []const u8, detail: []const u8 = "" };
 
 pub const Picker = struct {
     title: []const u8,
     items: []const Item,
     focus: usize = 0,
-    /// Typed letters, to jump to the first name they begin.
     typed: [32]u8 = undefined,
     typed_len: usize = 0,
 
@@ -207,21 +206,15 @@ pub const Picker = struct {
     }
 };
 
-// --- fields to fill --------------------------------------------------------------
-
 pub const Field = struct {
     label: []const u8,
-    /// What the field is for, shown dim beside it while it has the focus.
     hint: []const u8 = "",
-    /// What an empty field stands for, shown dim in it.
     placeholder: []const u8 = "",
     secret: bool = false,
     digits: bool = false,
-    /// A fixed set to choose from with ←/→, in place of free text.
     choices: []const []const u8 = &.{},
     choice: usize = 0,
     hidden: bool = false,
-    /// Set by `init`.
     buf: Buffer = undefined,
 
     pub fn init(gpa: std.mem.Allocator, f: Field) Field {
@@ -230,7 +223,6 @@ pub const Field = struct {
         return copy;
     }
 
-    /// What was typed, or chosen; empty when the field was left blank.
     pub fn value(self: *const Field) []const u8 {
         if (self.choices.len > 0) return self.choices[self.choice];
         return std.mem.trim(u8, self.buf.bytes(), " \t");
@@ -241,16 +233,13 @@ pub const Form = struct {
     title: []const u8,
     fields: []Field,
     focus: usize = 0,
-    /// Why the last submit was turned back, shown under the fields.
     problem: []const u8 = "",
     hooks: Hooks = .{},
 
     pub const Problem = struct { field: usize, why: []const u8 };
     pub const Hooks = struct {
         ctx: *anyopaque = undefined,
-        /// After every key: placeholders or hidden fields that follow other answers.
         refresh: ?*const fn (ctx: *anyopaque, fields: []Field) void = null,
-        /// On submit: a field to turn back to, and why.
         check: ?*const fn (ctx: *anyopaque, fields: []Field) ?Problem = null,
     };
 
@@ -259,7 +248,7 @@ pub const Form = struct {
         if (self.fields[self.focus].hidden) self.focus = self.step(self.focus, true) orelse self.step(self.focus, false) orelse 0;
     }
 
-    /// The next (or previous) field that shows, from `from`.
+    /// The next (or previous) field from `from` that is not hidden.
     fn step(self: *const Form, from: usize, down: bool) ?usize {
         var i = from;
         while (true) {
@@ -301,6 +290,8 @@ pub const Form = struct {
         f.buf.typing = false;
     }
 
+    /// Typed keys go in by `insert`, not `typeChar`, so a host or a password
+    /// takes `(` as it is, unpaired.
     pub fn apply(self: *Form, key: Key) !Step {
         const f = &self.fields[self.focus];
         const choosing = f.choices.len > 0;
@@ -341,7 +332,6 @@ pub const Form = struct {
                     break;
                 };
             } else if (!f.digits or std.ascii.isDigit(c)) {
-                // `insert`, not `typeChar`: a host or a password takes `(` as it is.
                 try f.buf.insert(&.{c});
             },
             .backspace => if (!choosing) try f.buf.delete(.left),
@@ -436,7 +426,6 @@ pub const Form = struct {
                 }
                 continue;
             }
-            // The value, scrolled so the cursor stays in sight.
             const room = r.limit -| value_col -| 1;
             const at = cols(t[0..f.buf.cursor]);
             const first = if (on and at >= room) at - room + 1 else 0;
@@ -481,8 +470,6 @@ pub const Form = struct {
         return cur;
     }
 };
-
-// --- yes or no -------------------------------------------------------------------
 
 pub const Confirm = struct {
     question: []const u8,
@@ -546,14 +533,11 @@ pub const Confirm = struct {
     }
 };
 
-// --- the terminal ----------------------------------------------------------------
-
 pub const Term = struct {
     gpa: std.mem.Allocator,
     in_fd: std.posix.fd_t,
     w: *std.Io.Writer,
     colors: Colors,
-    /// The rows the last repaint drew, and which of them the cursor was left on.
     rows: usize = 0,
     row: usize = 0,
 
@@ -586,9 +570,8 @@ pub const Term = struct {
         try self.w.flush();
     }
 
-    /// Drive `widget` to its end: true when it was finished, false when cancelled.
-    /// The terminal is restored on every way out; a finished widget is left folded
-    /// into its summary, a cancelled one erased.
+    /// True when `widget` finished (left folded into its summary), false when
+    /// cancelled (erased). The terminal is restored on every way out.
     pub fn run(self: *Term, widget: anytype) !bool {
         const orig = try line.enterRaw(self.in_fd);
         defer std.posix.tcsetattr(self.in_fd, .NOW, orig) catch {};
@@ -628,8 +611,6 @@ pub const Term = struct {
     }
 };
 
-// --- tests -----------------------------------------------------------------------
-
 fn testRender(widget: anytype, width: usize, final: bool) ![]u8 {
     var out = std.array_list.Managed(u8).init(std.testing.allocator);
     defer out.deinit();
@@ -654,10 +635,8 @@ test "form: arrows move between fields, typing fills them, Enter on the last sub
     for ("erp") |c| try std.testing.expectEqual(Step.more, try form.apply(.{ .char = c }));
     try std.testing.expectEqual(Step.more, try form.apply(.enter));
     try std.testing.expectEqual(@as(usize, 1), form.focus);
-    // digits only in a number field
     for ("1a4") |c| _ = try form.apply(.{ .char = c });
     try std.testing.expectEqualStrings("14", fields[1].value());
-    // up goes back, down comes again, and editing keys work where it lands
     _ = try form.apply(.{ .nav = .{ .to = .up } });
     try std.testing.expectEqual(@as(usize, 0), form.focus);
     _ = try form.apply(.{ .nav = .{ .to = .home } });
@@ -667,13 +646,11 @@ test "form: arrows move between fields, typing fills them, Enter on the last sub
     try std.testing.expectEqualStrings("erp", fields[0].value());
     _ = try form.apply(.{ .nav = .{ .to = .down } });
     _ = try form.apply(.{ .nav = .{ .to = .down } });
-    // a choice turns with ←/→ and its first letter
     _ = try form.apply(.{ .nav = .{ .to = .right } });
     try std.testing.expectEqualStrings("insecure", fields[2].value());
     _ = try form.apply(.{ .char = 'o' });
     try std.testing.expectEqualStrings("off", fields[2].value());
     _ = try form.apply(.enter);
-    // a bracket goes in as typed, not paired
     _ = try form.apply(.{ .char = '(' });
     try std.testing.expectEqualStrings("(", fields[3].value());
     try std.testing.expectEqual(Step.done, try form.apply(.enter));
@@ -713,7 +690,6 @@ test "form: a check turns submit back to its field; a refresh hides fields from 
     const shown = try testRender(&form, 80, false);
     defer gpa.free(shown);
     try std.testing.expect(std.mem.indexOf(u8, shown, "a name is needed") != null);
-    // tls off hides the port: down from name lands on tls
     fields[2].choice = 0;
     form.refresh();
     _ = try form.apply(.{ .nav = .{ .to = .down } });
@@ -733,7 +709,6 @@ test "form: rows never pass the terminal's width, and a long value scrolls to th
     var rows: usize = 0;
     while (it.next()) |row| : (rows += 1) try std.testing.expect(cols(row) <= 29);
     try std.testing.expectEqual(cur.rows, rows);
-    // the tail is in view, the cursor just past it, inside the row
     try std.testing.expect(std.mem.indexOf(u8, out.items, "789") != null);
     try std.testing.expect(cur.col < 29);
     try std.testing.expectEqual(@as(usize, 1), cur.row);

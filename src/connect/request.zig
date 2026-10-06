@@ -1,8 +1,8 @@
-//! `read request` / `FROM BODY` — turns an HTTP request body (JSON) into rows.
+//! `read request` / `FROM BODY`: turns an HTTP request body (JSON) into rows.
 //! Accepts a JSON array of objects (or a single object) and materializes one
-//! batch. With a DECLARED schema (`FROM BODY (col TYPE [NOT NULL], ...)`) the
-//! body is validated row by row — a violation is a permanent error naming the
-//! offending row/column (the server surfaces it as 422). Without one, the
+//! batch. With a declared schema (`FROM BODY (col TYPE [NOT NULL], ...)`) the
+//! body is validated row by row, and a violation is a permanent error naming the
+//! offending row and column (the server surfaces it as 422). Without one, the
 //! schema is inferred from the first object (BSL `read request`).
 
 const std = @import("std");
@@ -21,9 +21,8 @@ pub const RequestSource = struct {
     batch: Batch,
     yielded: bool = false,
 
-    /// `declared` is the `FROM BODY (...)` schema (null = infer). On
-    /// `error.BodySchemaViolation`, a human-readable reason naming the row and
-    /// column is allocated in `msg_arena` and stored in `msg_out`.
+    /// `declared` null infers the schema. On `error.BodySchemaViolation` a reason naming
+    /// the row and column is allocated in `msg_arena` and stored in `msg_out`.
     pub fn open(
         gpa: std.mem.Allocator,
         body: []const u8,
@@ -88,9 +87,8 @@ pub const RequestSource = struct {
     }
 };
 
-/// A Schema from declared `FROM BODY` / `ACCEPT BODY` columns: field order is
-/// declaration order; NOT NULL keeps the type non-nullable. Shared by the
-/// request source and the WAL buffer source.
+/// Field order is declaration order; NOT NULL keeps the type non-nullable. Shared by
+/// the request source and the WAL buffer source.
 pub fn schemaFromBodyCols(arena: std.mem.Allocator, cols: []const types.BodyCol) !*types.Schema {
     const fields = try arena.alloc(types.Schema.Field, cols.len);
     for (cols, fields) |c, *f| f.* = .{
@@ -102,10 +100,8 @@ pub fn schemaFromBodyCols(arena: std.mem.Allocator, cols: []const types.BodyCol)
     return schema;
 }
 
-/// Row-by-row check of a body against a declared schema: a required column
-/// that is missing/null, or a value the declared type can't read, fails the
-/// whole request with a message naming the first offending row. Shared with
-/// the serve buffer accept path (`ACCEPT BODY ... INTO BUFFER`).
+/// Strict pass before the lenient `coerce`: a missing or null required column, or a
+/// value the declared type cannot read, fails the whole request at the first bad row.
 pub fn validateBody(
     items: []const json.Value,
     cols: []const types.BodyCol,
@@ -135,8 +131,6 @@ pub fn validateBody(
     }
 }
 
-/// Can this JSON value be read as the declared kind? (Mirrors `coerce`, which
-/// is lenient — validation is the strict pass that runs first.)
 fn coercible(v: json.Value, kind: types.TypeKind) bool {
     return switch (kind) {
         .int => switch (v) {
@@ -165,8 +159,8 @@ fn coercible(v: json.Value, kind: types.TypeKind) bool {
     };
 }
 
-/// Schema from the first object's keys and value types (int/float/bool/string,
-/// all nullable). Shared by `read request` and `read http`.
+/// Schema from the first object's keys and value types, all nullable. Shared by
+/// `read request` and `read http`.
 pub fn inferSchema(arena: std.mem.Allocator, items: []const json.Value) !*types.Schema {
     var fields = std.array_list.Managed(types.Schema.Field).init(arena);
     if (items.len > 0 and items[0] == .object) {
@@ -180,9 +174,8 @@ pub fn inferSchema(arena: std.mem.Allocator, items: []const json.Value) !*types.
     return schema;
 }
 
-/// One batch from an array of JSON objects, coerced to `schema`. Fields missing
-/// from an object become null; fields not in the schema are dropped (keeps later
-/// REST pages with drifting keys from breaking the run).
+/// Fields missing from an object become null; fields not in the schema are dropped,
+/// so later REST pages with drifting keys do not break the run.
 pub fn batchFromJson(arena: std.mem.Allocator, schema: *types.Schema, items: []const json.Value) !Batch {
     const builders = try arena.alloc(column.Builder, schema.fields.len);
     for (builders, schema.fields) |*b, f| b.* = column.Builder.init(arena, f.ty);

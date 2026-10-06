@@ -1,18 +1,20 @@
 //! FlatBuffers, write side, plus the few reads the tests need. Arrow IPC frames
-//! every message's metadata as a FlatBuffer — the Schema, and one RecordBatch
-//! header per batch — so nothing Arrow can be written without it. Only what
-//! those two messages use is implemented: tables of scalars and offsets,
-//! strings, vectors of offsets and of inline structs, and unions (a type byte
-//! plus a table offset). No vtable deduplication, no file identifier, no shared
-//! strings — a message here is a few hundred bytes.
+//! every message's metadata as a FlatBuffer (the Schema, and one RecordBatch
+//! header per batch), so nothing Arrow can be written without it. Only what those
+//! messages use is implemented: tables of scalars and offsets, strings, vectors of
+//! offsets and of inline structs, and unions (a type byte plus a table offset). No
+//! vtable deduplication, no file identifier, no shared strings; a message here is
+//! a few hundred bytes.
 //!
-//! Layout rules that are easy to get wrong and are handled explicitly:
-//!   * the buffer is built back to front, so a child is created before the
-//!     table that references it (an offset only ever points forward);
-//!   * every scalar is aligned to its own size relative to the END of the
-//!     buffer, which is why `finish` pads to the largest alignment seen;
+//! Layout rules that are easy to get wrong:
+//!   * the buffer is built back to front, so a child is created before the table
+//!     that references it, and `offset()` (bytes written so far) is the
+//!     coordinate every offset speaks;
+//!   * every scalar is aligned to its own size relative to the END of the buffer,
+//!     which is why `finish` pads to the largest alignment seen;
 //!   * a table starts with a signed offset back to its vtable, and the vtable
 //!     lists each field's offset from the table start (0 = absent).
+//! `Table` decodes just enough to check what the builder produced.
 
 const std = @import("std");
 
@@ -35,14 +37,11 @@ pub const Builder = struct {
         self.alloc.free(self.fields_buf);
     }
 
-    /// Forget everything written; the allocation is kept for the next message.
     pub fn reset(self: *Builder) void {
         self.head = self.buf.len;
         self.minalign = 1;
     }
 
-    /// Bytes written so far, which is also the position of the last thing
-    /// written measured from the end — the coordinate every offset speaks.
     pub fn offset(self: *const Builder) u32 {
         return @intCast(self.buf.len - self.head);
     }
@@ -150,8 +149,8 @@ pub const Builder = struct {
         return self.offset();
     }
 
-    /// A vector of two-i64 structs (Arrow's FieldNode and Buffer are both that
-    /// shape), given as `[a0, b0, a1, b1, …]`.
+    /// A vector of two-i64 structs (Arrow's FieldNode and Buffer), given as
+    /// `[a0, b0, a1, b1, …]`.
     pub fn createI64PairVector(self: *Builder, pairs: []const i64) !u32 {
         const n = pairs.len / 2;
         try self.prep(4, n * 16);
@@ -166,9 +165,8 @@ pub const Builder = struct {
         return self.offset();
     }
 
-    /// A vector of Arrow's footer `Block` structs — `offset: i64`,
-    /// `metaDataLength: i32`, four bytes of padding, `bodyLength: i64` — given as
-    /// `[offset, meta_len, body_len]` triples.
+    /// A vector of Arrow footer `Block` structs (`offset: i64`, `metaDataLength: i32`,
+    /// 4 bytes padding, `bodyLength: i64`), given as `[offset, meta_len, body_len]` triples.
     pub fn createBlockVector(self: *Builder, triples: []const i64) !u32 {
         const n = triples.len / 3;
         try self.prep(4, n * 24);
@@ -185,8 +183,8 @@ pub const Builder = struct {
         return self.offset();
     }
 
-    /// Close the buffer with the root offset; the returned slice aliases the
-    /// builder and is valid until the next `reset`.
+    /// Close the buffer with the root offset; the slice aliases the builder and is
+    /// valid until the next `reset`.
     pub fn finish(self: *Builder, root: u32) ![]const u8 {
         try self.prep(self.minalign, 4);
         try self.prependUOffset(root);
@@ -194,7 +192,6 @@ pub const Builder = struct {
     }
 };
 
-/// Just enough decoding to check what the builder produced.
 pub const Table = struct {
     bytes: []const u8,
     pos: usize,
@@ -238,7 +235,6 @@ pub const Table = struct {
         return .{ .bytes = self.bytes, .pos = t };
     }
 
-    /// Element count and position of the first element.
     pub fn vector(self: Table, slot: usize) ?struct { len: usize, at: usize } {
         const t = self.target(slot) orelse return null;
         return .{ .len = rd(u32, self.bytes, t), .at = t + 4 };

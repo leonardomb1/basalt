@@ -1,6 +1,27 @@
-//! Plan building: turns analyzed stages into the operator tree — projections,
-//! filters, joins, aggregates, unions — the per-stage schema derivations, and
-//! row discovery (a pipeline drained for the rows a `for`/`union` expands over).
+//! Plan building: turns analyzed stages into the operator tree (projections,
+//! filters, joins, aggregates, windows, unions and set operations), the
+//! per-stage schema derivations, and row discovery (a pipeline drained for the
+//! rows a `for`/`union` expands over).
+//!
+//! Parallel plans rebuild the map-only `filter`/`select` prefix per worker on a
+//! thread arena from the shared AST stages. Resolution is pure and plan-time
+//! cheap, so no mutable operator state is shared across threads; the prefix
+//! schema is validated once serially first so a worker cannot hit an analyze error.
+//!
+//! Source-side optimisations are only allowed to lose speed, never rows:
+//! `projectedColumns` and `filterBounds` under-report rather than guess (a missed
+//! column fails loudly, a missed bound only skips less), and the Parquet footer
+//! shortcut for `COUNT(*)`/`MIN`/`MAX` applies only to an unfiltered, ungrouped
+//! read of the file itself. A field qualified by a joined right side is that
+//! side's column and is never asked of the read.
+//!
+//! Union branches are reconciled to a canon schema by a synthesized `select` of
+//! casts, widened column by column across every branch with SQL's UNION type
+//! resolution: taking branch 0 verbatim once truncated a later float branch's 2.7
+//! to 2. A `SELECT * EXCEPT` right after a union is taken out of the canon before
+//! reconciling, so an incompatible column is never cast. INTERSECT and EXCEPT
+//! group the marked union on every column (which, unlike a join key, puts NULLs
+//! together) and keep groups seen on both sides or the left only.
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
@@ -41,12 +62,8 @@ const sqlConnInfo = @import("connect.zig").sqlConnInfo;
 const exceptColumns = @import("connect.zig").exceptColumns;
 const sourceLabel = @import("connect.zig").sourceLabel;
 
-/// Rebuild a map-only `filter`/`select` chain against the projected source schema and
-/// return its linearized stages for `parallel.run` — so projecting fewer columns at the
-/// source keeps each `project` op's column indices in step. Returns null (caller keeps
-/// the full chain) if anything doesn't fit: a non-filter/select stage, or an analyze
-/// hitch. The throwaway scan is only a chain anchor; `linearize` drops it and the stages
-/// apply statelessly, so it's never read.
+/// Rebuild a map-only `filter`/`select` chain against the projected source schema
+/// for `parallel.run`, keeping column indices in step; null if anything does not fit.
 pub fn rebuildMapStages(env: *Env, middle: []const ast.Stage, proj_schema: *const types.Schema) ?[]const op.Stage {
     for (middle) |st| switch (st.node) {
         .filter, .select => {},
@@ -61,19 +78,12 @@ pub fn rebuildMapStages(env: *Env, middle: []const ast.Stage, proj_schema: *cons
     return lin.stages;
 }
 
-/// Build the map-only prefix (`filter`/`select`) onto `scan` using `ta` (a thread
-/// arena). `checkFilter`/`selectCols` are pure (arena + read-only schema/params), so
-/// each worker rebuilds its own prefix chain safely from the shared AST stages — the
-/// resolution is plan-time-cheap and avoids sharing mutable op state across threads.
 pub fn buildMapChain(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), errctx: ?*op.ErrCtx, prefix: []const ast.Stage, scan: *op.Scan, csv_schema: *const types.Schema) !op.Op {
     return buildChainFrom(ta, params, errctx, prefix, .{ .scan = scan }, csv_schema.*);
 }
 
-/// The body of `buildMapChain`, rooted at an arbitrary operator instead of a scan —
-/// the join path reuses it for the stages that sit *after* the join, where the input
-/// is the join's output schema rather than the source's.
-/// `errctx` (shared and locked, so lanes may all hold it) says where a row failed:
-/// without it a lane's error reached the user as a bare `cast failed`.
+/// `buildMapChain` rooted at any operator, e.g. the stages after a join. `errctx`
+/// says where a row failed; without it a lane's error was a bare `cast failed`.
 pub fn buildChainFrom(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), errctx: ?*op.ErrCtx, stages: []const ast.Stage, start: op.Op, in_schema: types.Schema) !op.Op {
     var cur: op.Op = start;
     var sch = in_schema;
@@ -105,8 +115,6 @@ pub fn buildChainFrom(ta: std.mem.Allocator, params: *std.StringHashMap(*const a
     return cur;
 }
 
-/// The schema after the map-only prefix — validated once serially (so worker rebuilds
-/// can't hit an analyze error) and used as the aggregate's input schema.
 pub fn mapChainSchema(env: *Env, prefix: []const ast.Stage, csv_schema: types.Schema) !types.Schema {
     var sch = csv_schema;
     for (prefix) |st| {
@@ -127,11 +135,8 @@ pub fn mapChainSchema(env: *Env, prefix: []const ast.Stage, csv_schema: types.Sc
     return sch;
 }
 
-/// Write a parallel breaker's merged batch to the sink, first running the small
-/// post-breaker `sort`/`limit` tail (which preserves `schema`) serially over it.
-/// The schema the sink is opened with: the aggregate's output as the tail leaves it.
-/// Sort and limit do not change it; a projection does, and one lands in the tail
-/// whenever the SELECT list interleaves grouping keys and aggregates.
+/// The sink's schema after a parallel breaker's tail. A tail may hold a projection,
+/// aggregate or window (HAVING, `COUNT(*) FROM (SELECT DISTINCT …)`), which change it.
 pub fn tailSchema(env: *Env, tail: []const ast.Stage, in: types.Schema) !types.Schema {
     var sch = in;
     for (tail) |st| switch (st.node) {
@@ -139,9 +144,6 @@ pub fn tailSchema(env: *Env, tail: []const ast.Stage, in: types.Schema) !types.S
             const one = [_]ast.Stage{st};
             sch = try mapChainSchema(env, &one, sch);
         },
-        // A lane tail may now hold an aggregate or a window (HAVING and
-        // `COUNT(*) FROM (SELECT DISTINCT …)` shapes); the sink must be
-        // opened with the columns they produce, not the breaker's rows.
         .aggregate => |ag| {
             var ad = analyze.Diag{};
             sch = (analyze.aggregatePlan(env.arena, sch, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e)).schema;
@@ -155,28 +157,17 @@ pub fn tailSchema(env: *Env, tail: []const ast.Stage, in: types.Schema) !types.S
     return sch;
 }
 
-/// Source columns the stages after a read actually need, or null when that set
-/// cannot be proven — in which case every column is read.
-///
-/// Only used to skip decoding work: if this under-reports, a later stage fails
-/// to resolve a field and the query errors loudly. It can never silently return
-/// wrong rows, which is what makes the optimisation safe to attempt.
+/// Source columns the stages after a read need, or null when unprovable. A join
+/// adds its keys and both sides' names; abandoning it once decoded 17 columns, not 4.
 pub fn projectedColumns(env: *Env, stages: []const ast.Stage) !?[][]const u8 {
     var set = std.StringHashMap(void).init(env.arena);
-    // The right sides joined so far, by the name the query calls them: a field
-    // qualified by one (`l.name`) is that side's column, never the read's, and
-    // taking its qualifier for a column name asked the source for a column `l`.
     var right = std.array_list.Managed([]const u8).init(env.arena);
-    // Projection is only sound once some stage *defines* the output columns.
-    // With no such stage the read's own columns are the result — an empty
-    // reference set then means "everything", not "nothing".
     var defines_output = false;
     for (stages) |st| {
         switch (st.node) {
             .filter => |e| try exprFields(env, e, &set, right.items),
             .sort => |so| for (so.keys) |k| try putField(&set, k.field, right.items),
             .distinct => |d| {
-                // `distinct` with no key list looks at every column
                 const on = d.on orelse return null;
                 for (on) |q| try putField(&set, q, right.items);
             },
@@ -188,37 +179,23 @@ pub fn projectedColumns(env: *Env, stages: []const ast.Stage) !?[][]const u8 {
             },
             .select => |items| {
                 for (items) |it| switch (it) {
-                    // a star keeps every column, and after it names are no
-                    // longer the source's, so nothing further can be proven
                     .star, .star_except, .star_rename => return null,
                     .field => |q| try putField(&set, q, right.items),
                     .computed => |c| try exprFields(env, c.expr, &set, right.items),
                 };
-                // downstream stages refer to this select's outputs, not the
-                // source's columns, so the set is complete here
                 defines_output = true;
                 break;
             },
             .limit => {},
-            // A window keeps every input column and adds its own, so the stages
-            // after it still name source columns; it reads its keys and arguments.
             .window => |w| {
                 for (w.partition_by) |q| try putField(&set, q, right.items);
                 for (w.order_by) |k| try putField(&set, k.field, right.items);
                 for (w.funcs) |f| if (f.arg) |q| try putField(&set, q, right.items);
             },
-            // A join needs its own probe-side keys, and the stages after it name
-            // columns from both sides. Adding all of them is safe: `openProjected`
-            // walks the file's own leaves and keeps the ones asked for, so a
-            // right-side name simply never matches. Without this case a join fell to
-            // the `else` below and the projection was abandoned entirely — a joined
-            // query decoded all 17 columns of TPC-H lineitem instead of the 4 it
-            // read, measured at 1174ms of scan against 263ms.
             .join => |j| {
                 for (j.left_keys) |q| try set.put(q.parts[q.parts.len - 1], {});
                 try right.append(if (j.alias.len > 0) j.alias else j.binding);
             },
-            // anything else may reference columns in ways not modelled here
             else => return null,
         }
     }
@@ -229,8 +206,6 @@ pub fn projectedColumns(env: *Env, stages: []const ast.Stage) !?[][]const u8 {
     return try out.toOwnedSlice();
 }
 
-/// Add the source column `q` names, unless it is qualified by a joined right
-/// side — then it is that side's column, not one the read could supply.
 fn putField(set: *std.StringHashMap(void), q: ast.QualName, right: []const []const u8) !void {
     if (q.parts.len > 1) for (right) |r| {
         if (std.ascii.eqlIgnoreCase(r, q.parts[0])) return;
@@ -245,17 +220,13 @@ fn exprFields(env: *Env, e: *const ast.Expr, set: *std.StringHashMap(void), righ
     for (quals.items) |q| try putField(set, q, right);
 }
 
-/// Simple `column <op> literal` conjuncts of a filter, usable to skip whole
+/// `column <op> literal` conjuncts of a filter, AND-joined only, usable to skip
 /// row groups from their statistics.
-///
-/// Only `AND`-joined comparisons are collected. Anything else contributes no
-/// bound, which loses an optimisation but can never exclude a matching row.
 pub fn filterBounds(env: *Env, stages: []const ast.Stage) ![]pqdecode.Bound {
     var out = std.array_list.Managed(pqdecode.Bound).init(env.arena);
     for (stages) |st| {
         switch (st.node) {
             .filter => |e| try collectBounds(e, &out),
-            // stop at the first stage that redefines the columns
             .select, .aggregate, .join, .explode, .union_ => break,
             else => {},
         }
@@ -273,8 +244,6 @@ fn collectBounds(e: *const ast.Expr, out: *std.array_list.Managed(pqdecode.Bound
         try collectBounds(b.r, out);
         return;
     }
-    // only `field <op> literal` in that order; the mirrored form is left alone
-    // A qualified name is a join's right-side column, never the scanned file's.
     const name = switch (b.l.*) {
         .field => |q| if (q.parts.len == 1) q.parts[0] else return,
         else => return,
@@ -296,11 +265,6 @@ fn collectBounds(e: *const ast.Expr, out: *std.array_list.Managed(pqdecode.Bound
     try out.append(.{ .column = name, .op = bop, .value = v });
 }
 
-/// Answer `COUNT(*)`, `MIN(col)` and `MAX(col)` over a whole Parquet file from
-/// the footer instead of scanning it. Deliberately narrow: an unfiltered,
-/// ungrouped aggregate reading the file directly. Anything else — a filter, a
-/// GROUP BY, a URL, a missing statistic — falls through to the real pipeline,
-/// so the shortcut can only ever be as correct as the scan it replaces.
 fn metaShortcut(env: *Env, stages: []const ast.Stage) anyerror!?PipeRes {
     if (stages.len != 2) return null;
     if (stages[0].node != .read or stages[1].node != .aggregate) return null;
@@ -323,7 +287,7 @@ fn metaShortcut(env: *Env, stages: []const ast.Stage) anyerror!?PipeRes {
         if (item.distinct) return null;
         switch (ra.func) {
             .count => {
-                if (ra.arg != null) return null; // COUNT(col) needs null counts
+                if (ra.arg != null) return null;
                 out.* = .{ .int = rdr.md.num_rows };
             },
             .min, .max => {
@@ -353,8 +317,6 @@ fn metaShortcut(env: *Env, stages: []const ast.Stage) anyerror!?PipeRes {
 }
 
 pub fn buildPipeline(env: *Env, stages_in: []const ast.Stage) anyerror!PipeRes {
-    // A CTE's or a join build side's read gets the same projection a top-level
-    // pipeline's does in `runOutput`.
     const stages = try projectSqlRead(env, stages_in);
     if (stages.len == 0) return planErr(env.diag, "empty pipeline");
     if (try metaShortcut(env, stages)) |r| return r;
@@ -386,8 +348,6 @@ pub fn buildPipeline(env: *Env, stages_in: []const ast.Stage) anyerror!PipeRes {
             } else {
                 const b = env.bindings.get(name) orelse
                     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown binding `{s}`", .{name}));
-                // `WITH u AS (<union>) SELECT * EXCEPT (x) FROM u`: the EXCEPT reaches the
-                // union through the binding the same as if it stood right after it.
                 const r = if (b.stages.len == 1 and b.stages[0].node == .union_)
                     try buildUnion(env, b.stages[0].node.union_, b.stages[0].hints, unionExceptNames(stages[1..]))
                 else
@@ -421,6 +381,8 @@ pub fn buildPipeline(env: *Env, stages_in: []const ast.Stage) anyerror!PipeRes {
     return .{ .op = current, .schema = schema };
 }
 
+/// Pushes the running K-th-best bound into a single parquet source with one sort
+/// key, so it can skip row groups its statistics rule out.
 pub fn buildTopN(env: *Env, s: ast.Sort, lim: ast.Limit, child: op.Op, schema: types.Schema) anyerror!PipeRes {
     const arena = env.arena;
     const qs = try arena.alloc(ast.QualName, s.keys.len);
@@ -432,9 +394,6 @@ pub fn buildTopN(env: *Env, s: ast.Sort, lim: ast.Limit, child: op.Op, schema: t
     const o = try arena.create(op.TopN);
     o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = ks, .count = lim.count, .offset = lim.offset, .state = arena, .gpa = env.gpa };
 
-    // Push the running K-th-best bound into a single parquet source so it can
-    // skip row groups its statistics rule out. Requires exactly one parquet
-    // reader and one sort key, so the bound is unambiguous.
     if (env.pq_readers == 1 and s.keys.len == 1 and s.keys[0].field.parts.len == 1) {
         if (env.pq_reader != null or env.pq_folder != null) {
             const t = try arena.create(Threshold);
@@ -454,10 +413,8 @@ fn readName(rd: ast.Read) []const u8 {
     };
 }
 
-/// Synthesize the per-branch "reconcile to canon" projection as a `select`: an
-/// optional tag literal, then every canon column cast to its canon type — taking
-/// the source field when present, else NULL. (Extra source columns aren't listed,
-/// so they're dropped.) Reusing `select` gets us the vectorized cast/eval for free.
+/// The per-branch reconcile projection: an optional tag literal, then every canon
+/// column cast to its type from the source field, else NULL.
 pub fn synthReconcile(arena: std.mem.Allocator, src: types.Schema, canon: types.Schema, tag_col: ?[]const u8, tag_val: ?[]const u8) ![]const ast.SelectItem {
     var items = std.array_list.Managed(ast.SelectItem).init(arena);
     if (tag_col) |tc|
@@ -481,7 +438,7 @@ pub fn synthReconcile(arena: std.mem.Allocator, src: types.Schema, canon: types.
 
 const UnionSpec = struct { read: ast.Read, tag: ?[]const u8, name: []const u8, pipeline: ?ast.Pipeline = null };
 
-/// Resolve a union's branch list — explicit branches, or tables discovered via a
+/// A union's branch list: explicit branches, or tables discovered via a
 /// `(table_name, tag)` query.
 pub fn unionSpecs(env: *Env, u: ast.Union, hints: []const ast.Hint) ![]UnionSpec {
     const arena = env.arena;
@@ -548,7 +505,6 @@ pub fn unionSpecs(env: *Env, u: ast.Union, hints: []const ast.Hint) ![]UnionSpec
     return specs.toOwnedSlice();
 }
 
-/// A string-valued field of a JSON object, or null if absent / not a string.
 fn jsonStrField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     return switch (obj.get(key) orelse return null) {
         .string => |s| s,
@@ -556,8 +512,8 @@ fn jsonStrField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     };
 }
 
-/// Derive a substring of `s` from a `"start,len"` spec (1-based start, matching the
-/// `substr` builtin). Returns null on a malformed/out-of-range spec.
+/// A substring of `s` from a `"start,len"` spec, 1-based like `substr`; null on a
+/// malformed or out-of-range spec.
 fn deriveSubstr(s: []const u8, spec: []const u8) ?[]const u8 {
     const comma = std.mem.indexOfScalar(u8, spec, ',') orelse return null;
     const start = std.fmt.parseInt(usize, std.mem.trim(u8, spec[0..comma], " "), 10) catch return null;
@@ -567,18 +523,11 @@ fn deriveSubstr(s: []const u8, spec: []const u8) ?[]const u8 {
     return s[a..@min(a + len, s.len)];
 }
 
-/// Pick the canon schema among the branch schemas: a named source table, or the
-/// first branch.
 pub fn unionCanon(env: *Env, specs: []const UnionSpec, schemas: []const types.Schema, canon_opt: ?[]const u8, except: []const []const u8) !types.Schema {
     if (canon_opt) |c| if (!std.mem.eql(u8, c, "first")) {
         for (specs, schemas) |s, sch| if (std.mem.eql(u8, s.name, c)) return dropExcept(env.arena, sch, except);
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "union canon `{s}` is not one of the source tables", .{c}));
     };
-    // Widen field-by-field across every branch instead of taking branch 0
-    // verbatim: `synthReconcile` CASTs each branch to this schema, so an int
-    // first branch silently truncated a later float branch's 2.7 to 2 — and
-    // swapping the branches changed the answer. `unify` is SQL's UNION column
-    // type resolution; a pair that cannot unify is an error, not a guess.
     const canon = @constCast((try dropExcept(env.arena, schemas[0], except)).fields);
     for (schemas[1..]) |sch| {
         for (canon) |*f| {
@@ -594,9 +543,8 @@ pub fn unionCanon(env: *Env, specs: []const UnionSpec, schemas: []const types.Sc
     return .{ .fields = canon };
 }
 
-/// A positional `UNION`: the first branch's names, each column widened across the
-/// branches the way the by-name canon is. Branches must agree on the column count,
-/// as in SQL — padding a short one would line every later column up wrong.
+/// A positional `UNION`: the first branch's names, each column widened across
+/// branches. Column counts must agree; padding would misalign later columns.
 fn positionalCanon(env: *Env, schemas: []const types.Schema, set: ast.SetOp) !types.Schema {
     const op_name = setOpName(set);
     const hint: []const u8 = if (set == .union_all) " (`UNION ALL BY NAME` matches them by name)" else "";
@@ -627,7 +575,6 @@ pub fn setOpName(set: ast.SetOp) []const u8 {
     };
 }
 
-/// Column `i` of `src`, cast to canon column `i`'s type under its name.
 fn positionalReconcile(arena: std.mem.Allocator, src: types.Schema, canon: types.Schema) ![]const ast.SelectItem {
     const items = try arena.alloc(ast.SelectItem, canon.fields.len);
     for (items, src.fields, canon.fields) |*it, sf, cf| {
@@ -639,8 +586,6 @@ fn positionalReconcile(arena: std.mem.Allocator, src: types.Schema, canon: types
     return items;
 }
 
-/// `schema` without the columns named in `except` (SQL sources are case-insensitive
-/// about names, so the match is too).
 fn dropExcept(arena: std.mem.Allocator, schema: types.Schema, except: []const []const u8) !types.Schema {
     var kept = std.array_list.Managed(types.Schema.Field).init(arena);
     for (schema.fields) |f| {
@@ -661,16 +606,8 @@ pub fn unionDownstreamMapOnly(stages: []const ast.Stage) bool {
     return true;
 }
 
-/// `SELECT ... FROM (SELECT ..., ROW_NUMBER() OVER (...) AS rn ...) WHERE rn <= k`:
-/// the binding's window only has to rank each partition's first `k` rows, so it is
-/// rebuilt with `top_k` and keeps those as they stream by. Holding and sorting every
-/// row took 2 GB and six seconds over 10M rows for a dedup that keeps a handful.
-///
-/// Only when the window's one function is `ROW_NUMBER`, the stages after it are
-/// projections that keep its column, and the reading query's first stage filters
-/// it from above (`rn <= k`, `rn < k`, `rn = k` — the filter still runs, so any
-/// `AND` beside it is unaffected). A binding is rebuilt for each reference, so
-/// another reader of the same CTE still gets every row. Null otherwise.
+/// `... WHERE rn <= k` over a `ROW_NUMBER()` binding: rebuild its window with
+/// `top_k`. Sorting every row took 2 GB and 6 s over 10M rows; null if inapplicable.
 fn windowTopK(arena: std.mem.Allocator, bstages: []const ast.Stage, after: []const ast.Stage) !?[]const ast.Stage {
     if (after.len == 0 or after[0].node != .filter) return null;
     var wi = bstages.len;
@@ -703,7 +640,7 @@ fn windowTopK(arena: std.mem.Allocator, bstages: []const ast.Stage, after: []con
 }
 
 /// The highest rank a filter keeps, from an AND-conjunct `rn <= c`, `rn < c`,
-/// `rn = c` or the same written the other way round. Null when none bounds it.
+/// `rn = c` or the same written the other way round.
 fn rankBound(e: *const ast.Expr, rn: []const u8) ?u64 {
     if (e.* != .binary) return null;
     const b = e.binary;
@@ -718,7 +655,6 @@ fn rankBound(e: *const ast.Expr, rn: []const u8) ?u64 {
     const lit = if (field_left) b.r else if (field_right) b.l else return null;
     if (lit.* != .int_lit) return null;
     const c = lit.int_lit;
-    // with the field on the right, `c >= rn` is `rn <= c`
     const cmp: ast.BinOp = if (field_left) b.op else switch (b.op) {
         .ge => .le,
         .gt => .lt,
@@ -733,13 +669,6 @@ fn rankBound(e: *const ast.Expr, rn: []const u8) ?u64 {
     };
 }
 
-/// Build the serial union op: open every branch (kept open, drained in order by
-/// op.Union), reconcile each to the canon, and concatenate. Used when split isn't
-/// applicable (threads=1, a breaker downstream, or non-splittable branches).
-/// The columns a `SELECT * EXCEPT (...)` right after a union leaves out. They are
-/// taken out of the canon before the branches are reconciled to it, so a column
-/// that one branch carries with an incompatible type — the reason to except it —
-/// is never cast at all. Applied downstream alone, the EXCEPT would come too late.
 pub fn unionExceptNames(after: []const ast.Stage) []const []const u8 {
     if (after.len == 0 or after[0].node != .select) return &.{};
     for (after[0].node.select) |it| {
@@ -748,10 +677,10 @@ pub fn unionExceptNames(after: []const ast.Stage) []const []const u8 {
     return &.{};
 }
 
+/// The serial union: every branch opened, reconciled to the canon and drained in
+/// order; used when splitting does not apply. Positional unions leave EXCEPT downstream.
 fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, except_names: []const []const u8) anyerror!PipeRes {
     const arena = env.arena;
-    // By position, dropping a name from every branch would shift the columns after
-    // it; the EXCEPT downstream removes it from the result instead.
     const except: []const []const u8 = if (u.positional) &.{} else except_names;
     const tag_col = forHintIdent(hints, "tag");
     const canon_opt = forHintIdent(hints, "canon");
@@ -764,10 +693,6 @@ fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, except_names: []
         if (try exceptColumns(env, s.read, hints, except)) |cols| s.read.cols = cols;
     };
     for (specs, 0..) |s, i| {
-        // An arm that carries a pipeline is a general query — a file, a projection, an
-        // aggregate — rather than the bare table the reconciliation case uses. Build it
-        // like any other pipeline; the by-name alignment below works off the arm's
-        // schema either way and does not care which it was.
         if (s.pipeline) |p| {
             const r = try buildPipeline(env, p.stages);
             children[i] = r.op;
@@ -809,7 +734,6 @@ fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, except_names: []
 
 const side_cols = [2][]const u8{ "__set_left", "__set_right" };
 
-/// Each branch row counts 1 toward its own side and 0 toward the other.
 fn withSideMarks(arena: std.mem.Allocator, items: []const ast.SelectItem, branch: usize) ![]const ast.SelectItem {
     const out = try arena.alloc(ast.SelectItem, items.len + 2);
     @memcpy(out[0..items.len], items);
@@ -820,9 +744,6 @@ fn withSideMarks(arena: std.mem.Allocator, items: []const ast.SelectItem, branch
     return out;
 }
 
-/// INTERSECT / EXCEPT over the marked union: group on every column — which, unlike
-/// a join key, puts NULLs together — count each side, and keep the groups found on
-/// both sides / on the left only. Grouping is also the deduplication both require.
 fn buildSetOp(env: *Env, set: ast.SetOp, canon: types.Schema, child: op.Op, schema: types.Schema) anyerror!PipeRes {
     const arena = env.arena;
     const by = try arena.alloc(ast.QualName, canon.fields.len);
@@ -852,7 +773,6 @@ fn buildSetOp(env: *Env, set: ast.SetOp, canon: types.Schema, child: op.Op, sche
     return buildStage(env, .{ .node = .{ .select = keep }, .hints = &.{}, .pos = at }, r.op, r.schema);
 }
 
-/// Bridge an analyze-layer error (which writes `ad.msg`) into a plan error.
 pub fn aErr(env: *Env, ad: *analyze.Diag, e: analyze.Error) anyerror {
     return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
@@ -915,22 +835,14 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
             const ok = try arena.alloc(op.Sort.Key, oidx.len);
             for (wd.order_by, oidx, ok) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc };
 
-            // The ranking columns are appended, so the input schema is a prefix of the
-            // output and every column reference below stays valid.
             const kinds = try arena.alloc(op.Window.Func, wd.funcs.len);
             const fields = try arena.alloc(types.Schema.Field, schema.fields.len + wd.funcs.len);
             @memcpy(fields[0..schema.fields.len], schema.fields);
             for (wd.funcs, kinds, 0..) |f, *out, i| {
-                // A ranking function counts rows, so it is a non-null int. `lag`/`lead`
-                // carry their source column's type and are always nullable — the first
-                // row of a partition has nothing behind it.
                 var ty = types.Type.init(.int);
                 var arg: ?usize = null;
                 switch (f.kind) {
                     .row_number, .rank, .dense_rank => {},
-                    // COUNT answers an int; SUM keeps its column's family (int stays
-                    // int, anything else widens to float) and is nullable, because a
-                    // peer group of nothing but nulls sums to null.
                     .count => {
                         if (f.arg) |q| {
                             const ai = analyze.fieldIndices(arena, schema, &[_]ast.QualName{q}, &ad) catch |e| return aErr(env, &ad, e);
@@ -1031,7 +943,6 @@ fn buildAggregate(env: *Env, ag: ast.Aggregate, schema: types.Schema, child: op.
     return .{ .op = .{ .aggregate = o }, .schema = out.* };
 }
 
-/// Parse '512MB' / '8GB' / '1024' (bytes) — the value of a join's `max_build` hint.
 fn parseByteSizeText(txt: []const u8) ?usize {
     const t = std.mem.trim(u8, txt, " \t");
     var n: usize = 0;
@@ -1046,8 +957,6 @@ fn parseByteSizeText(txt: []const u8) ?usize {
     return null;
 }
 
-/// The join's build-side byte cap: `WITH (max_build = '8GB')` on the join
-/// clause, else the process default.
 pub fn joinBuildCap(env: *Env, hints: []const ast.Hint) !usize {
     for (hints) |h| {
         if (!std.mem.eql(u8, h.key, "max_build")) continue;
@@ -1063,10 +972,8 @@ pub fn joinBuildCap(env: *Env, hints: []const ast.Hint) !usize {
     return op.join_build_byte_cap;
 }
 
-/// `stages` with the binding chain at its head replaced by the stages it stands
-/// for, while each link starts with a read. Not a binding already materialized
-/// (it is read back from memory), nor one holding a window: `windowTopK` needs
-/// to see that binding apart from the filter after it.
+/// Replace the binding chain at the head of `stages` with the stages it stands for,
+/// except a materialized binding or one holding a window (`windowTopK` needs it apart).
 pub fn inlineHeadBindings(env: *Env, stages_in: []const ast.Stage) ![]const ast.Stage {
     var stages = stages_in;
     var n: usize = 0;
@@ -1087,7 +994,7 @@ pub fn inlineHeadBindings(env: *Env, stages_in: []const ast.Stage) ![]const ast.
 }
 
 /// The implicit pushdown: the contiguous WHERE right after a SQL read, translated
-/// into that read's own query. `stages` as they were when nothing descends.
+/// into that read's own query.
 pub fn descendLeadingWhere(env: *Env, stages: []const ast.Stage) ![]const ast.Stage {
     if (stages[0].node != .read) return stages;
     const arena = env.arena;
@@ -1107,11 +1014,8 @@ pub fn descendLeadingWhere(env: *Env, stages: []const ast.Stage) ![]const ast.St
     return out;
 }
 
-/// A join's right side, readied the way the pipeline a query starts from is
-/// (`runOutputBody`): its binding chain laid out, `$params` bound, filters moved
-/// as early as projections and joins allow, the SQL read narrowed to the columns
-/// used and handed its WHERE. Without it, a CTE or table function joined in read
-/// its whole table and filtered it here.
+/// A join's right side readied like a query's head pipeline, with filters moved
+/// and the SQL read narrowed, so a joined CTE no longer reads its whole table.
 pub fn prepareJoinSide(env: *Env, stages_in: []const ast.Stage) ![]const ast.Stage {
     if (stages_in.len == 0) return stages_in;
     var stages = try inlineHeadBindings(env, stages_in);
@@ -1133,7 +1037,6 @@ fn buildJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, left_schema: types
     const o = try arena.create(op.Join);
     o.* = .{
         .probe = probe,
-        // Serial plan: the index is built from this pipeline on the first pull.
         .build = build.op,
         .index = null,
         .left_keys = jp.lks,
@@ -1150,9 +1053,8 @@ fn buildJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, left_schema: types
     return .{ .op = .{ .join = o }, .schema = out.* };
 }
 
-/// Append one discovery batch's first `ncols` columns to `rows` as text
-/// (strings/ints; null → ""). Shared by every discovery form so they all agree
-/// on the coercion rules and the column-count error.
+/// Append a discovery batch's first `ncols` columns as text (null → ""), shared by
+/// every discovery form so all agree on coercion and the column-count error.
 fn appendDiscoveryRows(env: *Env, rows: *std.array_list.Managed(Row), b: Batch, ncols: usize) !void {
     if (b.columns.len == 0) return;
     if (b.columns.len < ncols)
@@ -1171,14 +1073,10 @@ fn appendDiscoveryRows(env: *Env, rows: *std.array_list.Managed(Row), b: Batch, 
     }
 }
 
-/// Run the discovery source once and collect its first `ncols` columns as rows of
-/// text (strings/ints; null → ""). The list is small — a table catalog — so it is
-/// fully materialized into the plan arena.
+/// The discovery source's first `ncols` columns as text rows, fully materialized
+/// (a table catalog is small). Keeps `openSource`'s own error message.
 pub fn discoverRows(env: *Env, src_read: ast.Read, ncols: usize) ![]const Row {
     const src = openSource(env, src_read, &.{}) catch |e| {
-        // `openSource` already recorded why it failed; reporting only the error
-        // name would replace "sqlserver connect failed: …" with "PlanFailed"
-        // and throw the cause away.
         const why = if (env.diag.msg.len > 0) env.diag.msg else @errorName(e);
         return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "for-each discovery failed: {s}", .{why}));
     };
@@ -1194,16 +1092,8 @@ pub fn discoverRows(env: *Env, src_read: ast.Read, ncols: usize) ![]const Row {
     return rows.toOwnedSlice();
 }
 
-/// Discovery from a full basalt query (`FOR EACH ROW OF (SELECT ...)` /
-/// `EACH TABLE OF (SELECT ...)`): plan and execute the sub-pipeline through the
-/// normal machinery, then collect it into the same rows-of-text shape as
-/// `discoverRows`. Predicate/projection pushdown for SQL sources therefore comes
-/// free from `buildPipeline`.
-///
-/// The sub-pipeline's sources are opened into `env.sources` like any other, so
-/// they are closed here rather than left for the enclosing statement; the
-/// per-pipeline scratch fields are restored so discovery cannot influence how the
-/// body pipelines are planned.
+/// Discovery from a full query, planned through `buildPipeline` (pushdown free).
+/// Its sources are closed here and per-pipeline scratch fields restored after.
 pub fn discoverRowsPipeline(env: *Env, pipe: ast.Pipeline, ncols: usize) anyerror![]const Row {
     if (pipe.stages.len == 0) return planErr(env.diag, "for-each: empty discovery query");
     const src_base = env.sources.items.len;
@@ -1238,9 +1128,8 @@ pub fn discoverRowsPipeline(env: *Env, pipe: ast.Pipeline, ncols: usize) anyerro
     return rows.toOwnedSlice();
 }
 
-/// Discover for-each rows from a JSON array param (`for a, b in job.tables`):
-/// navigate to the array, then bind each loop variable to the like-named field of
-/// each object element (coerced to text). Mirrors `discoverRows` for reads.
+/// For-each rows from a JSON array param, each loop variable bound to the
+/// like-named field of each element as text.
 pub fn discoverRowsJson(env: *Env, path: ast.QualName, var_names: []const []const u8) ![]const Row {
     const head = path.parts[0];
     var cur = env.json_params.get(head) orelse
@@ -1294,8 +1183,6 @@ test "prepareJoinSide: a CTE joined in reads its table with its own WHERE, its c
     const parser = @import("../lang/sql_parser.zig");
     const env_mod = @import("env.zig");
 
-    // A join's right side was built from its binding's stages as they stood, so the
-    // SQL read under it carried no WHERE and the whole table crossed the wire.
     var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const prog = try parser.parseSource(a,
         \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');

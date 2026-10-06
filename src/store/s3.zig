@@ -1,19 +1,42 @@
 //! Amazon S3 (and S3-compatible stores: MinIO, localstack) over the REST API,
 //! authenticated with AWS Signature Version 4.
 //!
-//! URLs are `s3://<bucket>/<key>`. With no endpoint override the real service
-//! is addressed virtual-host style (`https://<bucket>.s3.<region>.amazonaws.com/<key>`,
-//! region from AWS_REGION, default us-east-1). Setting AWS_ENDPOINT_URL selects
-//! path-style (`<endpoint>/<bucket>/<key>`), which is what MinIO and the other
-//! emulators require. Credentials come from AWS_ACCESS_KEY_ID /
-//! AWS_SECRET_ACCESS_KEY (+ optional AWS_SESSION_TOKEN), environment only.
+//! URLs are `s3://<bucket>/<key>`; a trailing slash addresses every object under a
+//! prefix. With no endpoint override the real service is addressed virtual-host
+//! style (`https://<bucket>.s3.<region>.amazonaws.com/<key>`, region from AWS_REGION,
+//! default us-east-1). AWS_ENDPOINT_URL selects path-style (`<endpoint>/<bucket>/<key>`),
+//! which MinIO and the other emulators require; the style changes both the signed
+//! Host and the canonical URI. Credentials come from AWS_ACCESS_KEY_ID /
+//! AWS_SECRET_ACCESS_KEY (+ optional AWS_SESSION_TOKEN, signed as
+//! x-amz-security-token), environment only.
 //!
-//! Every request signs the real payload hash (the empty-body SHA-256 for
-//! bodyless verbs) — no UNSIGNED-PAYLOAD anywhere, so requests are integrity-
-//! protected even over the plain-HTTP endpoints emulators use.
+//! Signing invariants: the request URL's path is percent-encoded exactly as the
+//! canonical URI (single-encoded, '/' kept), and query strings are built pre-sorted
+//! so the URL and the canonical query are the same text; any byte of drift is a
+//! SignatureDoesNotMatch with no hint. Host is signed but not sent by us:
+//! std.http.Client derives it from the URL as the authority including any port,
+//! and `Obj.host` is that same string by construction. Every request signs the real
+//! payload hash (the empty-body SHA-256 for bodyless verbs), never UNSIGNED-PAYLOAD,
+//! so requests are integrity-protected even over the plain-HTTP emulator endpoints.
+//! The tests pin signing to AWS's published SigV4 examples.
 //!
-//! Everything not specific to SigV4 — error bodies, retry policy, the listing
-//! loop, the consumer-facing interface — lives in `objstore.zig`.
+//! Writes go through `MultipartWriter`: content accumulates into one `part_size`
+//! buffer, a multipart upload starts the first time it fills, and `finish`
+//! completes the ordered part list; an object that never fills it is one plain PUT.
+//! Parts are copied into a private buffer rather than staged from drain chunks (as
+//! azure.zig does) because S3 rejects a non-final part under 5 MiB. 8 MiB parts
+//! under the 10,000-part limit cap an object at ~78 GiB. Until `finish` returns
+//! the object does not exist; a dropped writer leaves an invisible upload that S3
+//! only garbage-collects under a bucket lifecycle rule, so an abort call may become
+//! worth adding. Staging runs under `std.Io.Writer`, whose only error is
+//! `WriteFailed`, so the writer keeps the typed error (`last_status`) and S3's
+//! message for the sink to re-raise.
+//!
+//! `S3EmptyPrefix` is kept distinct from an empty object because its usual cause is
+//! a mistyped prefix in an otherwise full bucket.
+//!
+//! Everything not specific to SigV4 (error bodies, retry policy, the listing loop,
+//! the consumer-facing interface) lives in `objstore.zig`.
 
 const std = @import("std");
 const http_client = @import("../net/http_client.zig");
@@ -35,27 +58,16 @@ pub const Error = error{
     S3KeyNotFound,
     S3AuthFailed,
     S3Throttled,
-    /// The bucket exists and is readable; nothing is stored under the prefix.
-    /// Distinct from a genuinely empty object, because the overwhelmingly common
-    /// cause is a mistyped prefix in an otherwise full lake.
     S3EmptyPrefix,
 };
 
 pub const Obj = struct {
     bucket: []const u8,
-    /// Object key within the bucket, no leading slash, as written (unencoded).
     key: []const u8,
-    /// Absolute request URL, endpoint style already applied, path segments
-    /// percent-encoded exactly as the canonical URI is — the two must match
-    /// byte-for-byte or the signature check fails.
     url: []const u8,
-    /// The Host header value std.http.Client will derive from `url` (authority
-    /// including any explicit port). Host participates in the signature.
     host: []const u8,
-    /// Canonical URI for SigV4: the URL's path component, single-encoded.
     uri_path: []const u8,
     region: []const u8,
-    /// The bucket root (no key), for CreateBucket on a fresh destination.
     bucket_url: []const u8,
     bucket_uri_path: []const u8,
 };
@@ -64,22 +76,13 @@ pub fn isUrl(s: []const u8) bool {
     return std.mem.startsWith(u8, s, "s3://");
 }
 
-/// A trailing slash means "every object under this prefix", not one object.
 pub fn isPrefix(url: []const u8) bool {
     return isUrl(url) and std.mem.endsWith(u8, url, "/");
 }
 
-/// Why the bucket in this `s3://` URL cannot name a bucket, or null when it can.
-///
-/// Bucket naming is a property of the URL text, so it is knowable without asking
-/// the service. Left to the service it came back as a bare 400 mapped to
-/// `S3RequestFailed`, which tells an operator nothing — `s3://bt/x.csv` failed
-/// only because a bucket needs three characters. Checked at plan time instead, so
-/// `basalt check` catches it.
-///
-/// These are the DNS-compatible rules AWS requires and MinIO enforces; the
-/// stricter trivia (IP-address-shaped names, `xn--` prefixes) is left to the
-/// service, which rejects those with a message that does name the problem.
+/// Why the bucket in this `s3://` URL cannot name a bucket, or null. Checked at plan
+/// time because the service answers a bare 400 (`s3://bt/x.csv` is too short); only
+/// the DNS rules AWS and MinIO share, the rest left to the service's own message.
 pub fn bucketNameError(url: []const u8) ?[]const u8 {
     if (!isUrl(url)) return null;
     const rest = url["s3://".len..];
@@ -105,7 +108,6 @@ test "bucketNameError accepts real names and explains the rejects" {
     try std.testing.expect(bucketNameError("s3://basalt-it/seed.csv") == null);
     try std.testing.expect(bucketNameError("s3://a.b.c/k") == null);
     try std.testing.expect(bucketNameError("s3://bucket/") == null);
-    // Not an s3 URL: not this function's business.
     try std.testing.expect(bucketNameError("/tmp/x.csv") == null);
     try std.testing.expect(bucketNameError("az://acct/c/x.csv") == null);
 
@@ -128,8 +130,6 @@ pub fn regionFromEnv(arena: std.mem.Allocator) []const u8 {
 pub const Creds = struct {
     access: []const u8,
     secret: []const u8,
-    /// AWS_SESSION_TOKEN when present (STS / role credentials); sent and signed
-    /// as x-amz-security-token.
     token: ?[]const u8 = null,
 };
 
@@ -140,9 +140,8 @@ pub fn credsFromEnv(arena: std.mem.Allocator) !Creds {
     return .{ .access = access, .secret = secret, .token = token };
 }
 
-/// The authority (host[:port]) of an endpoint URL. std.http.Client emits the
-/// Host header as the URI's authority including any explicit port, so this is
-/// exactly the string that must be signed when a MinIO endpoint carries a port.
+/// The authority (host[:port]) of an endpoint URL, which is the Host that
+/// std.http.Client sends and so the one that must be signed.
 fn authorityOf(endpoint: []const u8) ![]const u8 {
     const after = if (std.mem.startsWith(u8, endpoint, "https://"))
         endpoint["https://".len..]
@@ -155,12 +154,8 @@ fn authorityOf(endpoint: []const u8) ![]const u8 {
     return host;
 }
 
-/// Splits `s3://bucket/key...`. The key may contain slashes; the bucket is only
-/// the first segment.
-///
-/// `endpoint` null selects the real service (virtual-host style); non-null
-/// selects path-style against that endpoint (MinIO, localstack). That
-/// distinction changes both the signed Host and the canonical URI.
+/// Splits `s3://bucket/key...`; the bucket is the first segment. A null `endpoint`
+/// selects virtual-host style, non-null path-style against that endpoint.
 pub fn parseUrl(arena: std.mem.Allocator, url: []const u8, endpoint: ?[]const u8) !Obj {
     if (!isUrl(url)) return Error.S3BadUrl;
     const rest = url["s3://".len..];
@@ -172,8 +167,6 @@ pub fn parseUrl(arena: std.mem.Allocator, url: []const u8, endpoint: ?[]const u8
     const region = regionFromEnv(arena);
     const enc_key = try uriEncode(arena, key, .keep_slash);
     const base = try bucketBase(arena, bucket, region, endpoint);
-    // Path style: bucket base has no trailing slash, the key needs a separator.
-    // Virtual-host style: the base URL is `https://host/` and the base URI `/`.
     const sep: []const u8 = if (std.mem.endsWith(u8, base.uri_path, "/")) "" else "/";
     return .{
         .bucket = bucket,
@@ -187,9 +180,7 @@ pub fn parseUrl(arena: std.mem.Allocator, url: []const u8, endpoint: ?[]const u8
     };
 }
 
-/// Splits a prefix URL (`s3://bucket/some/prefix/`) for listing. The prefix may
-/// be empty (`s3://bucket/`), unlike `parseUrl`, which addresses one object and
-/// requires a key.
+/// Splits a prefix URL for listing. Unlike `parseUrl`, the prefix may be empty.
 pub fn parsePrefix(url: []const u8) !struct { bucket: []const u8, prefix: []const u8 } {
     if (!isUrl(url)) return Error.S3BadUrl;
     const rest = url["s3://".len..];
@@ -199,8 +190,8 @@ pub fn parsePrefix(url: []const u8) !struct { bucket: []const u8, prefix: []cons
     return .{ .bucket = bucket, .prefix = rest[b_end + 1 ..] };
 }
 
-/// `20130524T000000Z` — the ISO-basic instant SigV4 signs (x-amz-date). The
-/// first 8 characters are the credential-scope date.
+/// `20130524T000000Z`, the x-amz-date instant; its first 8 characters are the
+/// credential-scope date.
 pub fn amzDate(arena: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
     const days = @divFloor(epoch_secs, 86400);
     const secs: u32 = @intCast(epoch_secs - days * 86400);
@@ -212,9 +203,8 @@ pub fn amzDate(arena: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
 
 const EncodeSlash = enum { keep_slash, encode_slash };
 
-/// SigV4 URI encoding: unreserved characters pass, everything else becomes
-/// %XX (uppercase hex). S3 canonical URIs are single-encoded with '/' kept;
-/// query values encode '/' too.
+/// SigV4 URI encoding: unreserved characters pass, the rest become uppercase %XX.
+/// Canonical URIs keep '/'; query values encode it too.
 fn uriEncode(arena: std.mem.Allocator, s: []const u8, slash: EncodeSlash) ![]const u8 {
     const hex = "0123456789ABCDEF";
     var out = std.array_list.Managed(u8).init(arena);
@@ -231,41 +221,29 @@ fn uriEncode(arena: std.mem.Allocator, s: []const u8, slash: EncodeSlash) ![]con
     return out.toOwnedSlice();
 }
 
-/// SHA-256 of the request payload, lowercase hex — the x-amz-content-sha256
-/// value and the last line of the canonical request.
 pub fn payloadHash(arena: std.mem.Allocator, payload: []const u8) ![]const u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
     return arena.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
 }
 
-/// SHA-256 of the empty string: the payload hash of every bodyless request.
 pub const empty_payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-/// One header participating in the signature. Names must be lowercase; values
-/// are signed verbatim (ours are all machine-built, never needing whitespace
-/// canonicalization).
 pub const SignHeader = struct { name: []const u8, value: []const u8 };
 
 pub const SignParams = struct {
     method: []const u8,
-    /// Canonical URI: the URL's path, single-encoded, starting with '/'.
     uri_path: []const u8,
-    /// Query params as pre-encoded `name=value` strings; sorted here. A
-    /// valueless param signs as `name=`.
     query: []const []const u8 = &.{},
-    /// Signed headers (must include host); sorted here.
     headers: []const SignHeader,
     payload_hash: []const u8,
-    /// `20130524T000000Z` — must equal the x-amz-date header value.
     timestamp: []const u8,
     region: []const u8,
     service: []const u8 = "s3",
 };
 
-/// Canonical request text plus the `;`-joined signed-headers list. A named
-/// function because a single byte of drift here yields SignatureDoesNotMatch
-/// with no further hint; the tests pin it to AWS's published examples.
+/// Canonical request text plus the `;`-joined signed-headers list. Header values
+/// are signed verbatim (all machine-built); a valueless query param signs as `name=`.
 fn canonicalRequest(arena: std.mem.Allocator, p: SignParams) !struct { text: []const u8, signed: []const u8 } {
     const hdrs = try arena.dupe(SignHeader, p.headers);
     std.mem.sort(SignHeader, hdrs, {}, struct {
@@ -302,8 +280,8 @@ fn canonicalRequest(arena: std.mem.Allocator, p: SignParams) !struct { text: []c
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
-/// The derived SigV4 signing key: HMAC chain over date, region, service,
-/// "aws4_request", rooted at "AWS4" + secret.
+/// The derived SigV4 signing key: an HMAC chain over date, region, service and
+/// `aws4_request`, rooted at `AWS4` + secret.
 pub fn signingKey(arena: std.mem.Allocator, secret: []const u8, date: []const u8, region: []const u8, service: []const u8) ![32]u8 {
     const seed = try std.fmt.allocPrint(arena, "AWS4{s}", .{secret});
     var k: [32]u8 = undefined;
@@ -314,8 +292,8 @@ pub fn signingKey(arena: std.mem.Allocator, secret: []const u8, date: []const u8
     return k;
 }
 
-/// Builds the `Authorization: AWS4-HMAC-SHA256 ...` value: canonical request →
-/// string to sign → derived key → signature.
+/// Builds the `Authorization: AWS4-HMAC-SHA256 ...` value: canonical request,
+/// string to sign, derived key, signature.
 pub fn authHeader(arena: std.mem.Allocator, access: []const u8, secret: []const u8, p: SignParams) ![]const u8 {
     const cr = try canonicalRequest(arena, p);
     var cr_hash: [32]u8 = undefined;
@@ -337,18 +315,12 @@ pub fn authHeader(arena: std.mem.Allocator, access: []const u8, secret: []const 
     );
 }
 
-/// Signed headers for a plain GET of a whole object. `range` is `bytes=a-b`
-/// for a partial read, or empty for the whole object; it participates in the
-/// signature, so it cannot be added to the request afterwards.
 pub fn getHeaders(arena: std.mem.Allocator, o: Obj, range: []const u8) ![]const std.http.Header {
     return requestHeaders(arena, o, "GET", range);
 }
 
-/// `getHeaders` for any verb. HEAD is the one other verb a reader needs — it
-/// answers "how big is this object?" without a body — and SigV4 signs the verb,
-/// so it cannot reuse the GET signature. Host is signed but NOT returned:
-/// std.http.Client derives it from the URL, and `Obj.host` is that same
-/// authority by construction.
+/// Signed headers for any verb; `range` is `bytes=a-b` or empty for the whole
+/// object. Host is signed but not returned (see the module header).
 pub fn requestHeaders(
     arena: std.mem.Allocator,
     o: Obj,
@@ -383,8 +355,7 @@ pub fn requestHeaders(
     return out.toOwnedSlice();
 }
 
-/// Maps a status plus S3's error code onto a distinct Zig error, so callers can
-/// react (and users can read a failure) instead of seeing one catch-all.
+/// Maps a status plus S3's error code onto a distinct Zig error.
 pub fn statusToError(code: u16, body: []const u8) Error {
     if (objstore.parseError(body)) |e| {
         if (std.mem.eql(u8, e.code, "NoSuchBucket")) return Error.S3BucketMissing;
@@ -403,8 +374,8 @@ pub fn statusToError(code: u16, body: []const u8) Error {
     };
 }
 
-/// The bucket-level base for listing (and bucket creation): URL, signed host,
-/// and canonical URI, in either endpoint style.
+/// The bucket-level URL, signed host and canonical URI, in either endpoint style,
+/// for listing and bucket creation.
 fn bucketBase(arena: std.mem.Allocator, bucket: []const u8, region: []const u8, endpoint: ?[]const u8) !struct {
     url: []const u8,
     host: []const u8,
@@ -438,8 +409,6 @@ const ListPage = struct {
     uri_path: []const u8,
 
     fn page(c: ListPage, token: []const u8) ![]const u8 {
-        // Query built pre-sorted (continuation-token < list-type < prefix), so
-        // the request URL and the canonical query string are the same text.
         var q = std.array_list.Managed([]const u8).init(c.arena);
         if (token.len > 0)
             try q.append(try std.fmt.allocPrint(c.arena, "continuation-token={s}", .{try uriEncode(c.arena, token, .encode_slash)}));
@@ -490,12 +459,9 @@ const ListPage = struct {
     }
 };
 
-/// Lists object keys under `prefix` (ListObjectsV2), following continuation
-/// tokens to the end. Keys come back bucket-relative, in the lexicographic
-/// order S3 returns them, so a caller reading them in order gets a
-/// deterministic result. Keys appear only inside `<Contents>` elements, and a
-/// flat listing (no delimiter) returns no CommonPrefixes, so the tag scan cannot
-/// pick up anything else.
+/// Lists object keys under `prefix` (ListObjectsV2), bucket-relative, following
+/// continuation tokens, in S3's lexicographic order. Keys are read only from
+/// `<Contents>`, and a flat listing has no CommonPrefixes.
 pub fn listPrefix(
     arena: std.mem.Allocator,
     client: *std.http.Client,
@@ -518,16 +484,10 @@ pub fn listPrefix(
     return objstore.listPages(arena, .{ .item_tag = "Key", .next_tag = "NextContinuationToken" }, ctx, ListPage.page);
 }
 
-/// Part accumulation size. Multipart parts must be at least 5 MiB except the
-/// last; every part staged here is exactly this size, and S3 allows 10,000
-/// parts per upload, so 8 MiB parts cap a single object at ~78 GiB — far past
-/// anything this writes — while keeping resident memory to one part.
 pub const part_size = 8 * 1024 * 1024;
 
-/// Signed header list for one write-path request: signs host, payload hash,
-/// date, session token and (when given) content-type, and returns the headers
-/// to send. Content-type is signed but NOT returned — it is sent through
-/// `std.http.Client`'s own content_type option so only one copy goes out.
+/// Signs host, payload hash, date, session token and content-type for a write.
+/// Content-type is signed but not returned: it goes out via the client's own option.
 fn signedWriteHeaders(
     arena: std.mem.Allocator,
     creds: Creds,
@@ -562,7 +522,6 @@ fn signedWriteHeaders(
     return out.toOwnedSlice();
 }
 
-/// The CompleteMultipartUpload request body: parts in staging order.
 fn completeBody(arena: std.mem.Allocator, etags: []const []const u8) ![]const u8 {
     var body = std.array_list.Managed(u8).init(arena);
     try body.appendSlice("<CompleteMultipartUpload>");
@@ -573,23 +532,6 @@ fn completeBody(arena: std.mem.Allocator, etags: []const []const u8) ![]const u8
     return body.toOwnedSlice();
 }
 
-/// Streams an object. Content accumulates into one `part_size` buffer; the
-/// first time it fills, a multipart upload starts and each full buffer goes out
-/// as one part, with `finish` completing the ordered list. An object that never
-/// fills the buffer is written with a plain single PUT instead — no multipart
-/// bookkeeping for the common small-file case. Memory stays at one part
-/// regardless of object size, which is what keeps the pipeline's constant-RSS
-/// property intact.
-///
-/// Parts accumulate in a private buffer rather than staging the writer's drain
-/// chunks directly (azure.zig's approach): S3 rejects any non-final part under
-/// 5 MiB at completion time, and drain chunk sizes are not under our control.
-///
-/// Until `finish` returns, the object does not exist as far as any reader is
-/// concerned. Dropping the writer without `finish` leaves an invisible
-/// uncommitted upload behind; unlike Azure, S3 only garbage-collects those
-/// where the bucket has a lifecycle rule, so an abort call may become worth
-/// adding if aborted runs prove common.
 pub const MultipartWriter = struct {
     interface: std.Io.Writer,
     arena: std.mem.Allocator,
@@ -600,16 +542,10 @@ pub const MultipartWriter = struct {
     part_buf: []u8,
     part_len: usize = 0,
     upload_id: ?[]const u8 = null,
-    /// URI-encoded once: the id rides in a query string on every part.
     upload_id_enc: []const u8 = "",
     etags: std.array_list.Managed([]const u8),
     created_bucket: bool = false,
-    /// S3's `Code: Message (HTTP nnn)` from the last failure, for the caller to log.
     last_error: []const u8 = "",
-    /// The typed error behind that failure. Part staging runs under
-    /// `std.Io.Writer`, whose error set is only `WriteFailed`; keeping the real
-    /// one here lets the sink re-raise it instead of reporting a generic write
-    /// failure for what was really a 403 or a missing bucket.
     last_status: ?Error = null,
     rand: std.Random.DefaultPrng,
 
@@ -636,9 +572,8 @@ pub const MultipartWriter = struct {
         return self;
     }
 
-    /// Copies into the part buffer, shipping each full part. The copy is what
-    /// guarantees every non-final part is exactly `part_size` — never under
-    /// S3's 5 MiB minimum — regardless of how the writer machinery chunks.
+    /// Copies into the part buffer, shipping each full part, so every non-final part
+    /// is exactly `part_size` however the writer machinery chunks.
     pub fn put(self: *MultipartWriter, bytes: []const u8) std.Io.Writer.Error!usize {
         var rest = bytes;
         while (rest.len > 0) {
@@ -654,8 +589,8 @@ pub const MultipartWriter = struct {
         return bytes.len;
     }
 
-    /// CreateMultipartUpload, once. The URL says `?uploads` while the canonical
-    /// query says `uploads=` — both sides canonicalize a valueless key that way.
+    /// CreateMultipartUpload, once. The URL says `?uploads` and the canonical query
+    /// `uploads=`; both sides canonicalize a valueless key that way.
     fn ensureUpload(self: *MultipartWriter) !void {
         if (self.upload_id != null) return;
         const url = try std.fmt.allocPrint(self.arena, "{s}?uploads", .{self.obj.url});
@@ -689,12 +624,10 @@ pub const MultipartWriter = struct {
         }.attempt);
     }
 
-    /// UploadPart over the lower-level request API: the ETag needed by
-    /// CompleteMultipartUpload only exists as a response header, which
-    /// `Client.fetch` does not surface.
+    /// UploadPart over the lower-level request API, because the ETag that
+    /// CompleteMultipartUpload needs is a response header `Client.fetch` does not surface.
     fn uploadPart(self: *MultipartWriter, bytes: []const u8) !void {
         try self.ensureUpload();
-        // Query pre-sorted: partNumber < uploadId.
         const q = [_][]const u8{
             try std.fmt.allocPrint(self.arena, "partNumber={d}", .{self.etags.items.len + 1}),
             try std.fmt.allocPrint(self.arena, "uploadId={s}", .{self.upload_id_enc}),
@@ -728,6 +661,7 @@ pub const MultipartWriter = struct {
 
     const PutResult = struct { code: u16, etag: []const u8, body: []const u8 };
 
+    /// The ETag is copied out before the body is read, which invalidates the head's strings.
     fn putWithEtag(self: *MultipartWriter, url: []const u8, hdrs: []const std.http.Header, bytes: []const u8) !PutResult {
         const uri = std.Uri.parse(url) catch return Error.S3BadUrl;
         var req = try self.client.request(.PUT, uri, .{ .extra_headers = hdrs });
@@ -741,8 +675,6 @@ pub const MultipartWriter = struct {
         var redirect_buf: [1024]u8 = undefined;
         var resp = try req.receiveHead(&redirect_buf);
         const code = @intFromEnum(resp.head.status);
-        // The ETag must come out before the body: reading the body invalidates
-        // the head's strings.
         var etag: []const u8 = "";
         var it = resp.head.iterateHeaders();
         while (it.next()) |h| {
@@ -754,8 +686,6 @@ pub const MultipartWriter = struct {
         return .{ .code = code, .etag = etag, .body = aw.writer.buffered() };
     }
 
-    /// Whole object in one PUT — the path taken when everything fit in the part
-    /// buffer, so no multipart upload was ever started.
     fn singlePut(self: *MultipartWriter, bytes: []const u8) !void {
         const Ctx = struct { w: *MultipartWriter, ph: []const u8, bytes: []const u8 };
         const ctx = Ctx{ .w = self, .ph = try payloadHash(self.arena, bytes), .bytes = bytes };
@@ -785,9 +715,9 @@ pub const MultipartWriter = struct {
         }.attempt);
     }
 
-    /// Commits the object. Single PUT when the part buffer never filled;
-    /// otherwise the final (possibly short — allowed for the last) part goes
-    /// out and the part list is completed.
+    /// Commits the object: a single PUT when the buffer never filled, else the final
+    /// part and CompleteMultipartUpload. A 200 carrying `<Error>` is documented S3
+    /// behaviour under internal faults and is retried as a failure.
     pub fn finish(self: *MultipartWriter) !void {
         try self.interface.flush();
         if (self.upload_id == null) return self.singlePut(self.part_buf[0..self.part_len]);
@@ -823,9 +753,6 @@ pub const MultipartWriter = struct {
                 });
                 var code = @intFromEnum(res.status);
                 const resp = aw.writer.buffered();
-                // CompleteMultipartUpload can answer 200 with an error body
-                // (documented behavior under internal faults); that is a retriable
-                // failure, not success.
                 if (code == 200 and std.mem.indexOf(u8, resp, "<Error>") != null) code = 500;
                 if (code == 200) {
                     w.last_status = null;
@@ -836,18 +763,16 @@ pub const MultipartWriter = struct {
         }.attempt);
     }
 
-    /// Fresh destination: creates the bucket on the first NoSuchBucket so the
-    /// caller can go straight round again. False when the failure was anything
-    /// else, or the bucket was already created once.
+    /// Creates the bucket on the first NoSuchBucket so the caller can retry. False
+    /// for any other failure, or when the bucket was already created once.
     fn createBucketIfMissing(self: *MultipartWriter, code: u16, body: []const u8) !bool {
         if (statusToError(code, body) != Error.S3BucketMissing or self.created_bucket) return false;
         try self.createBucket();
         return true;
     }
 
-    /// Create the bucket, ignoring "already exists". Called once after a
-    /// NoSuchBucket so writing to a fresh destination works without a separate
-    /// setup step. Regions other than us-east-1 require the location in the body.
+    /// Create the bucket; 409 (already exists, owned or raced) counts as success.
+    /// Regions other than us-east-1 need the location in the body.
     fn createBucket(self: *MultipartWriter) !void {
         self.created_bucket = true;
         const body = if (std.mem.eql(u8, self.obj.region, default_region))
@@ -870,7 +795,6 @@ pub const MultipartWriter = struct {
             .response_writer = &aw.writer,
         });
         const code = @intFromEnum(res.status);
-        // 409 = already there (owned or raced), which is success for our purposes.
         if (code != 200 and code != 409) return self.fail(code, aw.writer.buffered());
     }
 
@@ -893,7 +817,6 @@ test "amzDate matches the reference instant from the S3 signing docs" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // 2013-05-24T00:00:00Z, the timestamp of every example in the S3 SigV4 docs.
     try std.testing.expectEqualStrings("20130524T000000Z", try amzDate(a, 1369353600));
     try std.testing.expectEqualStrings("19700101T000000Z", try amzDate(a, 0));
     try std.testing.expectEqualStrings("20150830T123600Z", try amzDate(a, 1440938160));
@@ -902,7 +825,6 @@ test "amzDate matches the reference instant from the S3 signing docs" {
 test "signingKey matches the derivation example from the AWS SigV4 docs" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
-    // "Deriving the signing key" example: secret/date/region/service → this key.
     const k = try signingKey(ar.allocator(), "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "20150830", "us-east-1", "iam");
     try std.testing.expectEqualStrings(
         "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9",
@@ -910,10 +832,6 @@ test "signingKey matches the derivation example from the AWS SigV4 docs" {
     );
 }
 
-// The next three tests are AWS's published S3 SigV4 examples ("Authenticating
-// Requests: Using the Authorization Header"), signature values verbatim from
-// the docs. They are the ground truth that the signing here is right without a
-// server to test against.
 const example_access = "AKIAIOSFODNN7EXAMPLE";
 const example_secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 
@@ -925,7 +843,6 @@ test "sigv4: AWS example 1 — GET object with a Range header" {
         .method = "GET",
         .uri_path = "/test.txt",
         .headers = &.{
-            // deliberately unsorted: canonicalization must not depend on order
             .{ .name = "x-amz-date", .value = "20130524T000000Z" },
             .{ .name = "host", .value = "examplebucket.s3.amazonaws.com" },
             .{ .name = "range", .value = "bytes=0-9" },
@@ -949,7 +866,6 @@ test "sigv4: AWS example 2 — PUT object with payload hash and extra headers" {
     const a = ar.allocator();
     const ph = try payloadHash(a, "Welcome to Amazon S3.");
     try std.testing.expectEqualStrings("44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072", ph);
-    // the docs' key is `test$file.text`; the canonical URI single-encodes the $
     try std.testing.expectEqualStrings("test%24file.text", try uriEncode(a, "test$file.text", .keep_slash));
     const h = try authHeader(a, example_access, example_secret, .{
         .method = "PUT",
@@ -975,7 +891,6 @@ test "sigv4: AWS example 3 — GET bucket listing with query parameters" {
     const h = try authHeader(a, example_access, example_secret, .{
         .method = "GET",
         .uri_path = "/",
-        // deliberately unsorted: the canonical query string must sort them
         .query = &.{ "prefix=J", "max-keys=2" },
         .headers = &.{
             .{ .name = "host", .value = "examplebucket.s3.amazonaws.com" },
@@ -1001,11 +916,9 @@ test "parseUrl: path-style endpoint keeps the port in the signed host" {
     try std.testing.expectEqualStrings("127.0.0.1:9000", o.host);
     try std.testing.expectEqualStrings("/lake/dir/sub/file.csv", o.uri_path);
 
-    // a trailing slash on the endpoint must not double up
     const t = try parseUrl(a, "s3://lake/f.csv", "http://127.0.0.1:9000/");
     try std.testing.expectEqualStrings("http://127.0.0.1:9000/lake/f.csv", t.url);
 
-    // keys with characters needing encoding stay aligned between URL and canonical URI
     const e = try parseUrl(a, "s3://lake/a b$c.csv", "http://127.0.0.1:9000");
     try std.testing.expectEqualStrings("/lake/a%20b%24c.csv", e.uri_path);
     try std.testing.expectEqualStrings("http://127.0.0.1:9000/lake/a%20b%24c.csv", e.url);
@@ -1096,9 +1009,6 @@ test "parseUrl carries the bucket root for CreateBucket in both styles" {
     try std.testing.expect(std.mem.startsWith(u8, v.bucket_url, "https://mybucket.s3."));
 }
 
-// --- objstore provider --------------------------------------------------------
-
-/// The `objstore.Provider` for `s3://`.
 pub const provider = objstore.Provider{
     .scheme = "s3://",
     .empty_prefix = Error.S3EmptyPrefix,

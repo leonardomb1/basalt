@@ -1,7 +1,94 @@
 //! Streaming pull operators. Each `next(arena)` returns the next batch or null.
-//! Operators form a closed set (a tagged union), dispatched once per batch — the
-//! cold boundary; the per-row work happens in the columnar kernels in `eval.zig`.
-//! The scan operator reads through the abstract `Source` driver seam.
+//! Operators form a closed set (a tagged union) dispatched once per batch, the cold
+//! boundary; per-row work happens in the columnar kernels in `eval.zig`. The scan
+//! reads through the abstract `Source` driver seam. Filter, project and explode are
+//! also stateless `Stage`s that `linearize` hands to the parallel driver; breakers
+//! and limit are order- or state-sensitive and stay serial. Each op's `Stats` are
+//! filled as the pipeline is pulled, so a plan prints with actuals beside estimates.
+//!
+//! Memory: the driver resets the per-pull arena before every `next`, never during
+//! one. Anything that lives across pulls (seen-sets, group tables, join indexes,
+//! copied string keys) goes in `state`, the plan arena, or in `gpa`. A filter pulls
+//! into its own scratch, reset per batch, because a selective predicate can drain
+//! the whole source inside one call; that scratch is backed by `back`, the plan
+//! arena, since nothing destroys a `Filter` and a page-allocator scratch would
+//! orphan its pages (a `FOR EACH` mints a plan per row). Breakers (sort, window,
+//! materialize) hold their whole input.
+//!
+//! `ErrCtx` gives a runtime expression error its stage and column. It keeps an
+//! inline buffer so the message outlives the batch arena, is first-wins under a
+//! mutex so concurrent lanes report deterministically, and cuts a long message
+//! short rather than dropping it.
+//!
+//! Distinct dedups against a seen-set, O(distinct keys). One fixed-width key dedups
+//! on its raw 64-bit word (not floats, which have two zeros). With `track_ords` it
+//! reports each surviving row's input ordinal, so parallel lanes that dedup per
+//! chunk merge to the same row on every run.
+//!
+//! Sort lifts each key once into a typed `KeyArr`, then LSD-radix sorts the rows,
+//! stably, on order-preserving u64 words in 11-bit digits over only the range the
+//! keys use. Ints and floats are one word, decimals two (scaled to the widest scale
+//! present, since postgres NUMERIC carries a per-value scale and raw unscaled ints
+//! sorted 0.5 after 0.10), a string up to 31 bytes is its zero-padded bytes with
+//! the length in the last byte, and a longer one is a 24-byte prefix whose ties the
+//! comparator settles. Nulls sort last in either direction, NaN sorts last and -0.0
+//! equals 0.0, as `eval.orderF64`. A comparator sort of 10M strings took 22s. The
+//! parallel sort splits rows into ranges on the first key's leading bits, one range
+//! per thread, and gives exactly the serial result.
+//!
+//! TopN fuses `sort | limit N [offset M]` into a bounded heap of M+N rows copied
+//! into `gpa`, up to `max_rows` (past it a radix sort is faster). Ties rank by input
+//! position (`seq_base`, and the row group `item` under a stealing source), so the
+//! rows kept are a stable sort's whatever lanes produced them. A row strictly worse
+//! than the worst kept on its first key is rejected off the typed column without
+//! boxing, and that bound can be published as a `threshold` so a source skips row
+//! groups.
+//!
+//! Window is a breaker: one sort over partition ++ order keys, then one numbering
+//! pass. Nulls in a partition key group together, as in GROUP BY. The default frame
+//! is the peer-based RANGE frame (ties share a value); a ROWS frame slides over
+//! positions, adding and subtracting, with a monotonic deque for MIN/MAX (re-walking
+//! the frame was O(partition^2)). A bounded float ROWS frame can drift by rounding;
+//! a segment tree is the exact upgrade. Under `WHERE rn <= k` a lone ROW_NUMBER
+//! (`top_k`) keeps only each partition's best k rows. Window SUM skips non-numeric
+//! kinds like nulls, and sums in i128 with a range check, as it once wrapped.
+//!
+//! Aggregate is streaming hash aggregation, O(groups). Groups are typed records in
+//! blocks: `FixedStore` (raw i64 words plus a null mask) when every key is
+//! fixed-width, `GroupStore` (boxed values) otherwise. Keys are followed by each
+//! aggregate's `Slot` as laid out by `Layout`, so a SUM pays its own bytes rather
+//! than an 80-byte `Acc`, and the hash leads the record, so a table grows without
+//! rehashing. `GroupTable` slots are one u32 (hash salt plus index), sixteen to a
+//! cache line, since at high cardinality the lines a probe touches are the cost;
+//! a batch is hashed first and probed `prefetch_ahead` rows behind a prefetch.
+//! Groups split over `fold_parts` radix partitions by the hash's top bits (the
+//! bucket uses the bottom bits, the salt bits 32-37). A single small-range int key
+//! skips hashing through a `Direct` array. String keys are interned ids in a
+//! `StrTable` shared by the lanes, but placement hashes the string itself so output
+//! order does not follow thread timing. Parallel lanes fold partial `GroupSet`s that
+//! `GroupMerge` combines by their raw accumulators; `emitSets` finalizes once.
+//!
+//! `Acc` fields are shared between aggregates: `n` counts rows, `sum_i`/`sum_f`
+//! hold sums, `ext` the extreme. Bitwise aggregates keep their bits in `sum_i`,
+//! with `n == 0` meaning none yet since zero is not AND's identity; variances keep
+//! Welford's mean in `sum_f` and squared deviations in `ext`, keeping `Acc` at 80
+//! bytes. Sums are exact i128, range-checked once in `finalizeAcc`, so the answer
+//! cannot depend on how rows split across batches and lanes (it once came out 5 at
+//! -j 1 and an overflow at -j 8). DECIMAL addends are normalized to the output
+//! scale. Variances merge with Chan's formula in fixed lane order, reproducible for
+//! a given `-j`, like a float SUM. Text arguments are cast before the accumulator
+//! (`argCast`); without it SUM panicked on a text cell and AVG returned 0.
+//!
+//! Join is a hash join: the build (right) side is drained into a `JoinIndex` and
+//! the probe (left) side streams through it. The index is three flat arrays (bucket
+//! heads, per-row duplicate chains, per-row hashes), read-only after `create`, so
+//! parallel lanes share one; the outer-join `matched` flags are written on the
+//! probe path and live on the `Join`. Serial plans build it on the first `next`,
+//! parallel plans up front. The build side is fully resident and capped at
+//! `join_build_byte_cap` (overridable per join with `WITH (max_build = '16GB')`) so
+//! an oversized one is `JoinBuildTooLarge` rather than an OOM; there is no spill.
+//! A null key joins nothing, and a null-aware (`NOT IN`) anti join keeps nothing
+//! against a build side holding a null. Duplicate keys fan out in build order.
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
@@ -18,16 +105,11 @@ const Value = @import("value.zig").Value;
 const keyhash = @import("keyhash.zig");
 const driver = @import("../connect/driver.zig");
 
-/// Captures context for a runtime expression error (which stage/column), turning
-/// a bare `CastFailed` into something actionable. Inline buffer so it outlives the
-/// per-batch arena; mutex + first-wins so concurrent lanes report deterministically.
 pub const ErrCtx = struct {
     buf: [512]u8 = undefined,
     msg: []const u8 = "",
     mutex: std.Thread.Mutex = .{},
 
-    /// Cut short rather than dropped when it does not fit: a dropped message
-    /// left the user a bare `cast failed`.
     pub fn set(self: *ErrCtx, comptime fmt: []const u8, args: anytype) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -39,14 +121,12 @@ pub const ErrCtx = struct {
     }
 };
 
-/// The label for an evaluation error, or the builtin's own account of it when the
-/// failing function left one (`eval.takeFailure`): `strptime: '31/02/2026' is not
-/// a date in '%d/%m/%Y'` rather than a bare `cast failed`.
+/// The label for an evaluation error, or the builtin's own account of it when it left
+/// one (`eval.takeFailure`), e.g. `strptime: '31/02/2026' is not a date in '%d/%m/%Y'`.
 pub fn failLabel(e: anyerror) []const u8 {
     return eval.takeFailure(e) orelse errLabel(e);
 }
 
-/// Human label for an evaluation error.
 pub fn errLabel(e: anyerror) []const u8 {
     return switch (e) {
         error.CastFailed => "cast failed",
@@ -62,8 +142,6 @@ pub fn errLabel(e: anyerror) []const u8 {
     };
 }
 
-/// Per-operator execution counters, filled in as the pipeline is pulled so a
-/// plan can be printed back with actuals beside its estimates.
 pub const Stats = struct {
     ns: u64 = 0,
     rows: u64 = 0,
@@ -84,22 +162,19 @@ pub const Op = union(enum) {
     explode: *Explode,
     union_: *Union,
 
-    /// Accumulated counters for this operator. `inline else` reaches the
-    /// payload pointer without naming all eleven variants.
     pub fn stats(self: Op) *Stats {
         return switch (self) {
             inline else => |o| &o.stats,
         };
     }
 
-    /// This operator's inputs, written into `buf` (at most two, plus a union's
-    /// branches). Used to turn inclusive timings into exclusive ones.
+    /// This operator's inputs, written into `buf`, used to turn inclusive timings into
+    /// exclusive ones.
     pub fn inputs(self: Op, buf: *std.array_list.Managed(Op)) !void {
         switch (self) {
             .scan => {},
             .join => |j| {
                 try buf.append(j.probe);
-                // A pre-built (shared) index has no build pipeline to charge.
                 if (j.build) |b| try buf.append(b);
             },
             .union_ => |u| try buf.appendSlice(u.children),
@@ -138,9 +213,6 @@ pub const Op = union(enum) {
     }
 };
 
-/// Concatenate (UNION ALL) several child ops: drain child 0 fully, then child 1,
-/// … Each child is expected to already emit the unified output schema (e.g. a
-/// reconcile-projection over its source), so this op just forwards their batches.
 pub const Union = struct {
     stats: Stats = .{},
     children: []const Op,
@@ -155,9 +227,6 @@ pub const Union = struct {
     }
 };
 
-/// A stateless per-batch transform (it does NOT pull from a child) — the building
-/// block of a parallelizable "map" pipeline. Only filter/project/explode qualify;
-/// breakers and limit are order/state sensitive and stay on the serial driver.
 pub const Stage = union(enum) {
     filter: *Filter,
     project: *Project,
@@ -174,9 +243,8 @@ pub const Stage = union(enum) {
 
 pub const Linear = struct { src: driver.Source, stages: []const Stage };
 
-/// If `top` is a map-only pipeline (scan → filter/project/explode chain, no
-/// breakers or limit), decompose it into a source + ordered stage list the
-/// parallel driver can fan out across threads. Returns null otherwise.
+/// Decompose a map-only pipeline (scan, then filter/project/explode) into a source
+/// and ordered stages for the parallel driver; null for anything else.
 pub fn linearize(arena: std.mem.Allocator, top: Op) !?Linear {
     var rev = std.array_list.Managed(Stage).init(arena);
     var cur = top;
@@ -204,9 +272,6 @@ pub fn linearize(arena: std.mem.Allocator, top: Op) !?Linear {
     }
 }
 
-/// Streaming 1→N: split a delimited string column — or, with `json`, a JSON array
-/// — emitting one row per element (other columns repeated). Null/missing cells
-/// produce zero rows.
 pub const Explode = struct {
     stats: Stats = .{},
     child: Op,
@@ -223,11 +288,12 @@ pub const Explode = struct {
         return null;
     }
 
-    /// Stateless transform of one input batch (for the parallel driver).
     pub fn transform(self: *Explode, arena: std.mem.Allocator, b: Batch) anyerror!Batch {
         return self.explodeBatch(arena, b);
     }
 
+    /// Split a delimited string column, or with `json` a JSON array, into one row per
+    /// element, other columns repeated. Null or missing cells produce zero rows.
     fn explodeBatch(self: *Explode, arena: std.mem.Allocator, b: Batch) anyerror!Batch {
         const ncols = b.columns.len;
         const builders = try arena.alloc(column.Builder, ncols);
@@ -287,17 +353,6 @@ fn jsonElems(arena: std.mem.Allocator, text: []const u8) ![]const Value {
     return out.items;
 }
 
-/// Rank rows within each partition and append the result as a column.
-///
-/// A breaker: a row's number is not known until its whole partition has arrived, so
-/// this holds the input the way `Sort` does. Memory is therefore bounded by the input,
-/// not by batch size — the same trade sort, distinct and aggregate already make.
-///
-/// One sort over (partition keys ++ order keys) does all the work: rows of a partition
-/// land together and in order, so a single pass numbers them, resetting at each
-/// boundary. Nulls in a partition key group together, matching `GROUP BY`.
-/// A window `SUM` accepts anything the engine can read as a number; kinds that are not
-/// numeric contribute nothing rather than erroring, matching how `SUM` ignores nulls.
 fn asF64Opt(v: Value) ?f64 {
     return switch (v) {
         .int => |x| @floatFromInt(x),
@@ -323,24 +378,15 @@ pub const Window = struct {
     funcs: []const Func,
     done: bool = false,
     err: ?*ErrCtx = null,
-    /// `ROW_NUMBER` read only up to this rank (an enclosing `WHERE rn <= k`): each
-    /// partition then keeps its best `k` rows as they stream by, in `gpa`, instead
-    /// of the whole input being held and sorted. Set by the planner, and only for
-    /// a window whose one function is `ROW_NUMBER`.
     top_k: ?u64 = null,
     gpa: ?std.mem.Allocator = null,
-    /// Threads the sort may use (`sortIdxThreads`).
     threads: usize = 1,
 
-    /// A row-counted frame, `[current - preceding, current]`, clipped to the partition.
-    /// `rows` false selects the peer-based default instead.
     pub const Frame = struct { rows: bool = false, unbounded: bool = false, preceding: i64 = 0 };
 
     pub const Kind = enum { row_number, rank, dense_rank, lag, lead, sum, count, min, max, avg };
-    /// `arg` is the input column `lag`/`lead` reads; the ranking kinds leave it null.
     pub const Func = struct { kind: Kind, arg: ?usize = null, offset: i64 = 1, frame: Frame = .{} };
 
-    /// Do the two rows compare equal on every one of these keys?
     fn sameOn(arrs: []const KeyArr, a: usize, b: usize) bool {
         for (arrs) |k| {
             if (k.order(a, b) != .eq) return false;
@@ -351,7 +397,6 @@ pub const Window = struct {
     const Kept = std.ArrayListUnmanaged([]Value);
     const Parts = std.HashMap([]const Value, *Kept, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
 
-    /// Whether row `a` ranks before row `b` under the window's ORDER BY.
     fn ranksBefore(self: *const Window, a: []const Value, b: []const Value) bool {
         for (self.ord) |k| {
             const o = keyOrder(a[k.idx], b[k.idx], k.desc);
@@ -360,11 +405,9 @@ pub const Window = struct {
         return false;
     }
 
-    /// `ROW_NUMBER` up to rank `k`: per partition, the best `k` rows so far, best
-    /// first. A newcomer goes after every row it does not rank before, so ties keep
-    /// input order — the stable sort's answer — and one that would land past `k` is
-    /// never copied. The output is what the full window gives for those rows:
-    /// partitions in key order, each in rank order, numbered from 1.
+    /// ROW_NUMBER up to rank `k`: per partition, the best `k` rows so far, best first.
+    /// A newcomer goes after every row it does not rank before, so ties keep input
+    /// order as the stable sort would, and one landing past `k` is never copied.
     fn nextTopK(self: *Window, arena: std.mem.Allocator, k: u64, gpa: std.mem.Allocator) anyerror!?Batch {
         var parts = Parts.init(gpa);
         defer {
@@ -395,7 +438,6 @@ pub const Window = struct {
                     gop.value_ptr.*.* = .{};
                 }
                 const kept = gop.value_ptr.*;
-                // first position whose row the newcomer ranks before
                 var lo: usize = 0;
                 var hi: usize = kept.items.len;
                 while (lo < hi) {
@@ -441,8 +483,6 @@ pub const Window = struct {
         return Batch{ .schema = self.out_schema, .columns = cols, .len = total };
     }
 
-    /// A window SUM's value for one row. It used to wrap: a running total past
-    /// i64 came back as a small plausible number.
     fn intSum(self: *Window, acc: i128) error{IntOverflow}!Value {
         const v = std.math.cast(i64, acc) orelse {
             if (self.err) |ec| ec.set("{s}: in window SUM", .{errLabel(error.IntOverflow)});
@@ -467,9 +507,6 @@ pub const Window = struct {
         const parts = arrs[0..self.part.len];
         const ords = arrs[self.part.len..];
 
-        // Partition bounds, so `lead` can look forward and `lag` cannot walk off the
-        // front of its own partition into the previous one. Only the offsets and the
-        // aggregates read them; a ranking walks the partitions as it numbers.
         var bounds_needed = false;
         for (self.funcs) |f| switch (f.kind) {
             .row_number, .rank, .dense_rank => {},
@@ -496,13 +533,8 @@ pub const Window = struct {
         const builders = try arena.alloc(column.Builder, self.funcs.len);
         for (builders, self.out_schema.fields[ncols..]) |*bd, f| bd.* = try column.Builder.initCapacity(arena, f.ty, all.len);
 
-        // Every function is resolved into a column of values indexed by sorted
-        // position, then emitted in one pass. Ranking needs a running counter, the
-        // offsets need partition bounds, and the aggregates need their peer group's
-        // total before any of its rows can be written — one shape that serves all three.
         const vals = try arena.alloc([]Value, self.funcs.len);
         for (self.funcs, vals, builders) |f, *out, *bd| {
-            // a ranking is written straight into its INT column, in sorted order
             const ranking = switch (f.kind) {
                 .row_number, .rank, .dense_rank => true,
                 else => false,
@@ -520,9 +552,6 @@ pub const Window = struct {
                             dr = 1;
                         } else {
                             rn += 1;
-                            // RANK is 1 + the rows strictly before, so a tie holds and
-                            // the next distinct value jumps to the row number.
-                            // DENSE_RANK counts distinct values and leaves no gap.
                             if (!sameOn(ords, idx[k - 1], row)) {
                                 rk = rn;
                                 dr += 1;
@@ -546,33 +575,12 @@ pub const Window = struct {
                         }
                     }
                 },
-                // The default frame: with no ORDER BY every row of the partition is a
-                // peer, so this yields the partition total on every row; with one, it
-                // accumulates peer group by peer group, which is a running total that
-                // ties share. Both are what standard RANGE framing specifies, and both
-                // fall out of the same loop.
                 .sum, .count, .min, .max, .avg => if (f.frame.rows) {
-                    // A ROWS frame is a window over positions, so each row gets its own
-                    // range and ties do NOT share a value — the difference from the
-                    // peer-based default, and the reason a moving average needs ROWS.
-                    //
-                    // The frame only ever slides forward, so every row enters it once
-                    // and leaves it once: sums and counts add on the way in and
-                    // subtract on the way out, and the extreme is the head of a
-                    // monotonic deque of positions (the textbook O(n) sliding min/max).
-                    // Re-walking the frame per row made `ROWS UNBOUNDED PRECEDING`
-                    // O(partition²): 80s for a 100k-row running total.
-                    //
-                    // ponytail: a bounded float frame subtracts what it added, so a
-                    // long moving average can drift by float rounding; the exact
-                    // upgrade is a segment tree over the partition, as DuckDB does.
                     const vs = try arena.alloc(Value, idx.len);
                     for (idx, vs) |row, *v| v.* = if (f.arg) |ai| all.columns[ai].getValue(row) else .null;
                     var dq = std.array_list.Managed(usize).init(arena);
                     var dq_head: usize = 0;
                     var lo: usize = 0;
-                    // i128, as `Aggregate` sums: exact under the frame's adds and
-                    // subtracts, with the range checked on each row's output.
                     var acc_i: i128 = 0;
                     var acc_f: f64 = 0;
                     var n: i64 = 0;
@@ -629,8 +637,6 @@ pub const Window = struct {
                                 },
                             }
                             if (f.kind == .min or f.kind == .max) {
-                                // Drop everything the new value beats (or ties): it can
-                                // never be the extreme again while this row is in frame.
                                 while (dq.items.len > dq_head) {
                                     const back = vs[dq.items[dq.items.len - 1]];
                                     const beaten = if (f.kind == .max) !lessV(v, back) else !lessV(back, v);
@@ -665,11 +671,7 @@ pub const Window = struct {
                                 if (f.arg) |ai| {
                                     const v = all.columns[ai].getValue(idx[m]);
                                     if (v.isNull()) continue;
-                                    // COUNT(col) counts non-nulls, of any kind.
                                     n += 1;
-                                    // `lessV` is the same ordering `Aggregate` uses for
-                                    // MIN/MAX, so a window extreme and a grouped one
-                                    // cannot disagree.
                                     if (ext.isNull() or (if (f.kind == .max) lessV(ext, v) else lessV(v, ext))) ext = v;
                                     switch (v) {
                                         .int => |x| {
@@ -682,7 +684,6 @@ pub const Window = struct {
                                         },
                                     }
                                 } else {
-                                    // COUNT(*) counts rows, nulls included.
                                     n += 1;
                                 }
                             }
@@ -691,9 +692,6 @@ pub const Window = struct {
                                 out.*[k] = switch (f.kind) {
                                     .count => .{ .int = n },
                                     .min, .max => ext,
-                                    // Every row is its own peer, so `n == 0` can only
-                                    // mean every value in the group was null — SQL
-                                    // answers null there, not zero.
                                     .avg => if (n == 0) .null else .{ .float = acc_f / @as(f64, @floatFromInt(n)) },
                                     else => if (n == 0) .null else if (seen_float) .{ .float = acc_f } else try self.intSum(acc_i),
                                 };
@@ -706,8 +704,6 @@ pub const Window = struct {
             }
         }
 
-        // The input columns come back through the same columnar gather `Sort`
-        // uses; only the appended columns are built from boxed values.
         const cols = try arena.alloc(column.Column, ncols + self.funcs.len);
         for (all.columns, 0..) |*col, ci| cols[ci] = try column.permute(arena, col.*, idx);
         for (builders, vals, ncols..) |*bd, v, ci| {
@@ -732,17 +728,6 @@ pub const Filter = struct {
     child: Op,
     pred: *const ast.Expr,
     err: ?*ErrCtx = null,
-    /// Input batches are pulled into this arena, not the caller's, and it is
-    /// reset per batch. A selective predicate can otherwise drain the entire
-    /// source inside one `next` call — the caller only resets between calls —
-    /// so a filter that matches nothing used to hold every batch it rejected at
-    /// once. `gather` copies the surviving rows into the caller's arena, so
-    /// nothing returned points into here.
-    ///
-    /// `back` must outlive the filter and is normally the plan arena the filter
-    /// itself was created in: nothing ever destroys a `Filter`, so a scratch
-    /// backed by the page allocator would orphan its pages — one arena per
-    /// filter stage per plan, and a `FOR EACH` mints a plan per row.
     back: std.mem.Allocator,
     scratch: ?std.heap.ArenaAllocator = null,
 
@@ -756,7 +741,6 @@ pub const Filter = struct {
         }
     }
 
-    /// Stateless transform of one input batch (for the parallel driver).
     pub fn transform(self: *Filter, arena: std.mem.Allocator, b: Batch) anyerror!Batch {
         return self.filterInto(arena, arena, b);
     }
@@ -776,8 +760,6 @@ pub const Project = struct {
     out_schema: *const types.Schema,
     err: ?*ErrCtx = null,
 
-    /// A projected output column: either a passthrough of an input column index,
-    /// or a computed expression with its resolved output type.
     pub const Col = struct {
         source: union(enum) { passthrough: usize, expr: *const ast.Expr },
         ty: types.Type,
@@ -788,7 +770,6 @@ pub const Project = struct {
         return try self.transform(arena, b);
     }
 
-    /// Stateless transform of one input batch (for the parallel driver).
     pub fn transform(self: *Project, arena: std.mem.Allocator, b: Batch) anyerror!Batch {
         const outcols = try arena.alloc(column.Column, self.cols.len);
         for (self.cols, 0..) |c, i| {
@@ -863,11 +844,8 @@ pub fn sliceBatch(arena: std.mem.Allocator, b: Batch, start: usize, take: usize)
     return Batch{ .schema = b.schema, .columns = outcols, .len = take };
 }
 
-/// Drain `child` and concatenate every row into one in-memory batch (or null if
-/// the input is empty). Memory is O(dataset) — the defining cost of a breaker.
-/// All chunks live in this single `next()`'s arena (no reset happens mid-call),
-/// so the typed buffers are concatenated directly: no per-row `Value` boxing
-/// and no re-duping of string bytes.
+/// Drain `child` into one batch, or null for empty input. All chunks live in this
+/// one `next`'s arena, so typed buffers are concatenated without boxing or re-duping.
 fn materializeAll(arena: std.mem.Allocator, child: Op, schema: *const types.Schema) anyerror!?Batch {
     var chunks = std.array_list.Managed(Batch).init(arena);
     var total: usize = 0;
@@ -888,10 +866,6 @@ fn materializeAll(arena: std.mem.Allocator, child: Op, schema: *const types.Sche
     return Batch{ .schema = schema, .columns = cols, .len = total };
 }
 
-/// Streaming dedup: batches flow through one at a time, filtered against a
-/// seen-set of key strings — O(distinct keys) memory, not O(dataset). The
-/// seen-set (and its key copies) live in `state` (the plan arena), because the
-/// per-pull batch arena is reset between pulls.
 pub const Distinct = struct {
     stats: Stats = .{},
     child: Op,
@@ -900,17 +874,9 @@ pub const Distinct = struct {
     state: std.mem.Allocator,
     gpa: std.mem.Allocator,
     seen: ?Seen = null,
-    /// When set, `next` also reports where each surviving row sat in this
-    /// operator's input. The parallel drivers dedup per chunk and then merge,
-    /// and without an ordinal the merge keeps whichever lane reached the mutex
-    /// first — a different row's non-key columns on every run. Off by default:
-    /// the serial path pays nothing for it.
     track_ords: bool = false,
-    /// Input ordinals of the rows in the batch `next` just returned, allocated
-    /// from the same arena as that batch and valid for exactly as long.
     ords: []const u64 = &.{},
     seen_rows: u64 = 0,
-    /// The single fixed-width key path (see `next`).
     seen_words: ?SeenWords = null,
     seen_null: bool = false,
 
@@ -940,10 +906,6 @@ pub const Distinct = struct {
             var kept: usize = 0;
             var r: usize = 0;
             if (key_idx.len == 1 and fixedWord(b.columns[key_idx[0]]) != null) {
-                // One fixed-width key — `DISTINCT id`, `DISTINCT ON (id)` — dedups
-                // on the raw 64-bit word with no boxing, no per-key hash walk and
-                // no key copy; null is a flag beside the set. The boxed path
-                // below took 120ns a row on an int column, the scan 40ns.
                 if (self.seen_words == null) self.seen_words = SeenWords.init(self.state);
                 const words = &self.seen_words.?;
                 const col = b.columns[key_idx[0]];
@@ -992,8 +954,8 @@ pub const Distinct = struct {
     }
 };
 
-/// The raw 64-bit words of an int-family column (its i64 storage, reinterpreted),
-/// or null for any kind whose bits are not its identity (floats have two zeros).
+/// The raw 64-bit words of an int-family column, or null for a kind whose bits
+/// are not its identity (floats have two zeros).
 fn fixedWord(col: column.Column) ?[]const u64 {
     return switch (col.ty.kind) {
         .int, .time, .timestamp => @ptrCast(col.data.i64),
@@ -1001,9 +963,8 @@ fn fixedWord(col: column.Column) ?[]const u64 {
     };
 }
 
-/// Deep-copy the `keep`-marked rows of `b` into `arena` via column builders, which
-/// dupe string/bytes payloads (unlike `column.gather`, which aliases them). Used when the
-/// source batch lives in a scratch arena that is about to be freed.
+/// Deep-copy the `keep`-marked rows of `b` into `arena`, duping string payloads
+/// (unlike `column.gather`), for a source batch whose scratch is about to be freed.
 fn gatherDeep(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usize) anyerror!Batch {
     const outcols = try arena.alloc(column.Column, b.columns.len);
     for (b.columns, b.schema.fields, 0..) |*col, f, ci| {
@@ -1021,7 +982,6 @@ pub const Sort = struct {
     in_schema: *const types.Schema,
     keys: []const Key,
     done: bool = false,
-    /// Threads the sort may use (`sortIdxThreads`).
     threads: usize = 1,
 
     pub const Key = struct { idx: usize, desc: bool };
@@ -1033,7 +993,6 @@ pub const Sort = struct {
 
         const idx = try arena.alloc(usize, all.len);
         for (idx, 0..) |*x, i| x.* = i;
-        // lift each key column into a flat typed array once, then sort on that
         const arrs = try arena.alloc(KeyArr, self.keys.len);
         for (self.keys, arrs) |k, *a| a.* = try KeyArr.prepare(arena, all.columns[k.idx], k.desc);
         try sortIdxThreads(arena, idx, arrs, self.threads);
@@ -1044,11 +1003,6 @@ pub const Sort = struct {
     }
 };
 
-/// One sort key lifted out of its column into a comparable typed array.
-///
-/// The comparator runs O(n log n) times; `getValue` boxes a ~32-byte tagged
-/// union and re-switches on the column type on every call, twice per comparison.
-/// Extracting each key once, up front, turns that into a plain typed compare.
 const KeyArr = struct {
     desc: bool,
     valid: column.Bitmap,
@@ -1059,15 +1013,11 @@ const KeyArr = struct {
         floats: []f64,
         decs: []i128,
         strs: [][]const u8,
-        /// Types with no cheap flat form fall back to boxing.
         boxed: column.Column,
     };
 
     fn prepare(arena: std.mem.Allocator, col: column.Column, desc: bool) !KeyArr {
         const n = col.len;
-        // The typed slices are aliased where the column already holds the flat
-        // form; only a narrower physical type is widened. A null slot holds
-        // whatever the builder left there and is never compared.
         const data: Data = switch (col.ty.kind) {
             .int, .time, .timestamp => .{ .ints = col.data.i64 },
             .date => blk: {
@@ -1081,10 +1031,6 @@ const KeyArr = struct {
                 break :blk .{ .ints = out };
             },
             .float => .{ .floats = col.data.f64 },
-            // A value's scale need not be the column's (postgres NUMERIC carries
-            // one per value), so the unscaled integers are brought to the widest
-            // scale present before they are compared: 0.5 (5) against 0.10 (10)
-            // compared the raw integers and sorted backwards.
             .decimal => blk: {
                 var scale: u8 = 0;
                 for (col.data.dec[0..n], 0..) |d, i| {
@@ -1106,7 +1052,6 @@ const KeyArr = struct {
         return .{ .desc = desc, .valid = col.validity, .data = data };
     }
 
-    /// Nulls sort last regardless of direction, matching `keyOrder`.
     fn order(self: KeyArr, a: usize, c: usize) std.math.Order {
         const an = !self.valid.get(a);
         const bn = !self.valid.get(c);
@@ -1116,8 +1061,6 @@ const KeyArr = struct {
         }
         const ord: std.math.Order = switch (self.data) {
             .ints => |v| std.math.order(v[a], v[c]),
-            // Total order, NaN last — IEEE leaves NaN unordered and
-            // `std.math.order` answers that with `unreachable`.
             .floats => |v| eval.orderF64(v[a], v[c]),
             .decs => |v| std.math.order(v[a], v[c]),
             .strs => |v| std.mem.order(u8, v[a], v[c]),
@@ -1140,29 +1083,16 @@ const SortCtx = struct {
     }
 };
 
-/// Sort `idx` (pre-filled 0..n) by `arrs`, first key most significant, stably.
-///
-/// Every key becomes order-preserving u64 words and the rows are LSD-radix sorted
-/// on them, 16 bits a pass. Ints and floats are one word, decimals two, a string
-/// up to 31 bytes long is its bytes zero-padded with the length in the last byte
-/// (so `ab` < `ab\0` < `abc`), and a key with nulls gets a flag word above its
-/// value, so nulls sort last whatever the direction. A longer string is ordered
-/// by its first 24 bytes, and runs the words cannot tell apart are then sorted
-/// with the comparator.
-///
-/// Strings and nulls used to take `std.mem.sort` with a comparator: ORDER BY a
-/// string over 10M rows was 22 comparator-bound seconds, 10x DuckDB.
+/// Sort `idx` (pre-filled 0..n) by `arrs`, first key most significant, stably,
+/// with the radix scheme the module header describes.
 fn sortIdx(out_arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr) !void {
     return sortIdxThreads(out_arena, idx, arrs, 1);
 }
 
-/// `sortIdx` on up to `threads` threads: see `sortIdxParallel`.
 fn sortIdxThreads(out_arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, threads: usize) !void {
     _ = out_arena;
     const n = idx.len;
     if (n == 0 or arrs.len == 0) return;
-    // The radix buffers — 40 bytes a row — are dropped once the order is known,
-    // not held to the end of the query in the caller's arena.
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
     const arena = scratch.allocator();
@@ -1183,16 +1113,14 @@ fn sortIdxThreads(out_arena: std.mem.Allocator, idx: []usize, arrs: []const KeyA
     try sortRows(arena, idx, arrs, plans, exact, true);
 }
 
-/// A stable LSD radix sort of `idx` by `arrs`. `all` says `idx` holds every row,
-/// each once: a key's words are then encoded once in row order and gathered;
-/// a subset — one range of a parallel sort — encodes each of its rows' words.
+/// A stable LSD radix sort of `idx`. With `all` (every row, once) each word is
+/// encoded once in row order and gathered; encoding via the permutation read
+/// strings at random.
 fn sortRows(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, plans: []const KeyPlan, exact: bool, all: bool) !void {
     const n = idx.len;
     const pairs = try arena.alloc(RadixPair, n);
     const tmp = try arena.alloc(RadixPair, n);
     const counts = try arena.alloc(u32, 1 << 11);
-    // Each word is encoded once, in row order, then gathered by the current order:
-    // encoding straight from the permutation read every string at random.
     const words: []u64 = if (all) try arena.alloc(u64, n) else &.{};
     var j = arrs.len;
     while (j > 0) {
@@ -1220,12 +1148,9 @@ fn sortRows(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, plans:
     if (!exact) fixTies(idx, arrs, plans);
 }
 
-/// A parallel sort of every row: the rows are dealt, in input order, into
-/// ranges of the first key — split on its leading bits where a histogram puts
-/// about one thread's share — with nulls, which sort last, in a range of their
-/// own; each range is then sorted on its own thread. The ranges follow one
-/// another in key order and each sort is stable, so the result is the serial
-/// sort's. False when it is not worth it, or the first key cannot split.
+/// Deal rows, in input order, into ranges of the first key split where a histogram
+/// puts about one thread's share (nulls in a range of their own), and sort each on
+/// its own thread. False when not worth it or the first key cannot split.
 fn sortIdxParallel(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, plans: []const KeyPlan, exact: bool, threads: usize) !bool {
     const n = idx.len;
     if (threads < 2 or n < 1 << 17) return false;
@@ -1254,7 +1179,6 @@ fn sortIdxParallel(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr,
         hist[@intCast((encWord(k0, p0, 0, row) - lo) >> shift)] += 1;
         nonnull += 1;
     }
-    // digits to ranges, about `threads` of equal size; null rows take the last
     const nthreads = @min(threads, 64);
     var of_digit: [1 << 11]u8 = undefined;
     var cur: usize = 0;
@@ -1311,17 +1235,14 @@ fn sortIdxParallel(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr,
     return true;
 }
 
-/// How one key is laid out in radix words.
 const KeyPlan = struct {
     words: u8,
-    /// The words order the key completely; false for a string past 31 bytes.
     exact: bool,
     nulls: bool,
 
     const max_exact_str = 31;
     const prefix_words = 3;
 
-    /// Null when the key has no word form and the comparator must sort.
     fn of(k: KeyArr, n: usize) ?KeyPlan {
         const nulls = !k.valid.allSet(n);
         return switch (k.data) {
@@ -1340,8 +1261,8 @@ const KeyPlan = struct {
     }
 };
 
-/// Word `w` (0 most significant) of row `i`'s key. A null row's words are 0: its
-/// place is decided by the flag word, and among nulls the key is all equal.
+/// Word `w` (0 most significant) of row `i`'s key. A null row's words are 0: the
+/// flag word places it, and among nulls the key is all equal.
 fn encWord(k: KeyArr, p: KeyPlan, w: usize, i: usize) u64 {
     if (p.nulls and !k.valid.get(i)) return 0;
     const word: u64 = switch (k.data) {
@@ -1358,7 +1279,6 @@ fn encWord(k: KeyArr, p: KeyPlan, w: usize, i: usize) u64 {
                 const take = @min(8, str.len - lo);
                 @memcpy(b[0..take], str[lo..][0..take]);
             }
-            // The length sits in the last byte, which no exact string reaches.
             if (p.exact and w + 1 == p.words) b[7] = @intCast(str.len);
             break :blk std.mem.readInt(u64, &b, .big);
         },
@@ -1367,10 +1287,9 @@ fn encWord(k: KeyArr, p: KeyPlan, w: usize, i: usize) u64 {
     return if (k.desc) ~word else word;
 }
 
-/// After a radix sort on string prefixes: re-sort, with the comparator, each run of
-/// rows the prefixes could not order. A run is equal on every key's words up to
-/// and including the first inexact key — not on all keys: two rows whose prefixes
-/// tie may still differ in that key, and a later key must not decide between them.
+/// Re-sort, with the comparator, each run the string prefixes could not order. A
+/// run is equal on every key's words up to the first inexact key only, so a later
+/// key cannot decide between rows that still differ in it.
 fn fixTies(idx: []usize, arrs: []const KeyArr, plans: []const KeyPlan) void {
     var m: usize = 0;
     while (plans[m].exact) m += 1;
@@ -1396,13 +1315,8 @@ fn sameWords(arrs: []const KeyArr, plans: []const KeyPlan, a: usize, b: usize) b
 
 const RadixPair = struct { k: u64, i: u32 };
 
-/// Stable radix sort of `pairs` by `k`, 16 bits a pass, low digit first. A
-/// pass whose digit is the same on every row is skipped, so a key with a
-/// small range (an id, a day count, a flag) costs one or two sweeps, not four.
-/// Stable LSD radix sort on `k`, in 11-bit digits of the key less its minimum,
-/// over only as many digits as the keys' range needs. 2048 buckets keep each
-/// scatter in cache, where 65536 put every write in a different line and page
-/// — a 17-bit `user_id` was two passes over 65536 buckets, now two over 2048.
+/// Stable LSD radix sort on `k` less its minimum, in 11-bit digits over only the
+/// digits the range needs. 2048 buckets keep the scatter in cache; 65536 did not.
 fn radixSortPairs(pairs: []RadixPair, tmp: []RadixPair, counts: []u32) void {
     if (pairs.len < 2) return;
     var lo: u64 = std.math.maxInt(u64);
@@ -1441,16 +1355,12 @@ fn radixSortPairs(pairs: []RadixPair, tmp: []RadixPair, counts: []u32) void {
     if (src.ptr != pairs.ptr) @memcpy(pairs, src);
 }
 
-/// The u64 whose unsigned order is the key's sort order: ints flip the sign
-/// bit; floats use the IEEE trick (negatives complemented, positives get the
-/// sign bit), with every NaN canonicalized so it sorts last like `orderF64`;
-/// `desc` complements the word.
+/// The u64 whose unsigned order is the key's: ints flip the sign bit, floats use the
+/// IEEE trick with NaN canonicalized last and -0.0 folded into 0.0; `desc` complements.
 fn orderedWord(k: KeyArr, i: usize) u64 {
     const w: u64 = switch (k.data) {
         .ints => |v| @as(u64, @bitCast(v[i])) ^ (1 << 63),
         .floats => |v| blk: {
-            // -0.0 folds into 0.0: `std.math.order` calls them equal, so the
-            // stable sort left them in input order, and the word must too.
             const x = if (v[i] == 0) 0.0 else v[i];
             const b: u64 = if (std.math.isNan(x)) 0x7ff8000000000000 else @bitCast(x);
             break :blk if (b >> 63 != 0) ~b else b | (1 << 63);
@@ -1460,9 +1370,8 @@ fn orderedWord(k: KeyArr, i: usize) u64 {
     return if (k.desc) ~w else w;
 }
 
-/// Effective order of two sort-key values: `.lt` means `va` sorts before `vb`.
-/// Nulls always sort last (independent of `desc`); `desc` flips non-null order.
-/// Shared by `SortCtx.lessThan` and Top-N's heap and final sort.
+/// Order of two sort-key values: nulls always last, `desc` flips non-null order.
+/// Shared by `SortCtx.lessThan` and Top-N.
 fn keyOrder(va: Value, vb: Value, desc: bool) std.math.Order {
     const an = va.isNull();
     const bn = vb.isNull();
@@ -1475,15 +1384,7 @@ fn keyOrder(va: Value, vb: Value, desc: bool) std.math.Order {
     return if (desc) (if (ord == .lt) std.math.Order.gt else std.math.Order.lt) else ord;
 }
 
-/// `sort … | limit N [offset M]` fused into a bounded Top-(M+N) heap: O(n log K)
-/// time and O(K) memory instead of materializing + sorting the whole input. The K
-/// kept rows are deep-copied into `gpa` (strings freed on eviction), so memory is
-/// bounded regardless of input size; only the final K rows are emitted into the
-/// caller arena. A plain `sort` (no following `limit`) still uses the full Sort op.
 pub const TopN = struct {
-    /// The most rows (`OFFSET` + `LIMIT`) a top-N keeps. Past it a heap holding
-    /// them all costs more than sorting everything: `OFFSET 5000000` over 10M
-    /// rows was ten seconds in the heap, against a radix sort's fraction of that.
     pub const max_rows: u64 = 1 << 16;
 
     pub fn fits(lim: anytype) bool {
@@ -1499,21 +1400,12 @@ pub const TopN = struct {
     state: std.mem.Allocator,
     gpa: std.mem.Allocator,
     done: bool = false,
-    /// When set, the K-th best key is published here so a source can skip
-    /// row groups that cannot beat it.
     threshold: ?*Threshold = null,
-    /// Input position of the first row this top-N reads; each row after is one
-    /// more. Ties rank by it, so the rows kept and their order are a stable
-    /// sort's, whatever path — heap, lanes — produced them.
     seq_base: u64 = 0,
     seen: u64 = 0,
-    /// The input item a stealing source is reading — a row group — when rows
-    /// arrive from several in no fixed order: positions are then that item's
-    /// place, then the row's within it. A batch never spans two items.
     item: ?*const usize = null,
     last_item: usize = std.math.maxInt(usize),
 
-    /// A kept row: its values, then its input position as one more `.int`.
     pub const Entry = []Value;
     const Heap = std.PriorityQueue(Entry, []const Sort.Key, entryWorstFirst);
 
@@ -1525,8 +1417,8 @@ pub const TopN = struct {
         return try self.emit(arena, kept[start..end]);
     }
 
-    /// Every row kept, best first, positions included, copied into `arena` —
-    /// for a combine across lanes, which ranks them with `entryLess`.
+    /// Every row kept, best first, positions included, copied into `arena`, for a
+    /// combine across lanes that ranks them with `entryLess`.
     pub fn nextEntries(self: *TopN, arena: std.mem.Allocator) anyerror!?[]Entry {
         if (self.done) return null;
         self.done = true;
@@ -1548,11 +1440,6 @@ pub const TopN = struct {
                 self.seq_base = @as(u64, it.*) << 40;
                 self.seen = 0;
             };
-            // Once full, a row whose first key is strictly worse than the worst
-            // kept row's cannot get in: that is read off the typed column, and
-            // only a row that could beat it, or tie it, is boxed and compared
-            // in full. Nearly every row of a large input is the first kind, and
-            // boxing each was two thousand instructions a row.
             const k0 = if (self.keys.len > 0) self.keys[0] else Sort.Key{ .idx = 0, .desc = false };
             const kc = &b.columns[k0.idx];
             const typed: enum { none, int, float } = if (self.keys.len == 0) .none else switch (kc.ty.kind) {
@@ -1567,11 +1454,6 @@ pub const TopN = struct {
                 try heap.add(try self.cloneRow(b, r));
                 if (heap.count() >= cap) self.publish(heap.items[0]);
             }
-            // Full: the batch's candidates — every row not strictly worse than the
-            // worst kept — best first, each going in while it beats the worst.
-            // Rising input under a descending order makes every row a candidate,
-            // and inserting them one by one cloned and freed each; now at most the
-            // rows that stay are cloned.
             if (r < b.len) {
                 const cand = try pull.alloc(u32, b.len - r);
                 var nc: usize = 0;
@@ -1601,7 +1483,6 @@ pub const TopN = struct {
                     typed: @TypeOf(typed),
                     fn lt(c: @This(), x: u32, y: u32) bool {
                         var rest = c.top.keys;
-                        // the first key off its typed column, nulls last
                         if (c.typed != .none) {
                             const k = c.top.keys[0];
                             const xn = !c.kc.validity.get(x);
@@ -1645,13 +1526,12 @@ pub const TopN = struct {
         return out;
     }
 
-    /// Publishes the worst kept entry's first key. Only a single sort key is
-    /// pushed down; with several, the leading key still bounds the rest.
+    /// Publishes the worst kept entry's first key; with several sort keys the leading
+    /// one still bounds the rest. Null, string and bytes bounds are not published.
     fn publish(self: *TopN, worst: Entry) void {
         const t = self.threshold orelse return;
         if (self.keys.len == 0) return;
         const v = worst[self.keys[0].idx];
-        // a null bound would skip nothing useful, and nulls sort last anyway
         if (v == .null or v == .string or v == .bytes) return;
         t.value = v;
         t.full = true;
@@ -1672,9 +1552,8 @@ pub const TopN = struct {
         self.gpa.free(e);
     }
 
-    /// Does row `r` of `b` rank before stored entry `e` (i.e. belongs above it)?
-    /// Equal keys rank by position (`self.seen` is row `r`'s): a lane reading
-    /// row groups out of order meets rows earlier than some it already keeps.
+    /// Whether row `r` of `b` ranks before entry `e`. Equal keys rank by position, since
+    /// a lane reading row groups out of order meets rows earlier than some it keeps.
     fn rowLess(self: *TopN, b: Batch, r: usize, e: Entry) bool {
         for (self.keys) |k| {
             const o = keyOrder(b.columns[k.idx].getValue(r), e[k.idx], k.desc);
@@ -1716,15 +1595,13 @@ fn entryLessCtx(keys: []const Sort.Key, a: TopN.Entry, b: TopN.Entry) bool {
     return entryLess(a, b, keys);
 }
 
-/// `std.PriorityQueue` comparator: ranks the *worst* row (greatest under
-/// `entryLess`) as highest priority, so `peek`/`remove` yield the eviction
-/// candidate — the max-heap TopN needs, expressed against a min-heap API.
+/// `std.PriorityQueue` comparator ranking the worst row highest, so the min-heap API
+/// yields the eviction candidate. Of two equal rows the later is worse.
 fn entryWorstFirst(keys: []const Sort.Key, a: TopN.Entry, b: TopN.Entry) std.math.Order {
     for (keys) |k| {
         const o = keyOrder(a[k.idx], b[k.idx], k.desc);
         if (o != .eq) return o.invert();
     }
-    // the later of two equal rows is the worse: a stable sort keeps the earlier
     if (entrySeq(a) != entrySeq(b)) return std.math.order(entrySeq(b), entrySeq(a));
     return .eq;
 }
@@ -1751,10 +1628,6 @@ fn dupeValueGpa(gpa: std.mem.Allocator, v: Value) !Value {
     };
 }
 
-/// Streaming hash aggregation: batches are consumed one at a time, folding into
-/// per-group accumulators — O(groups) memory, not O(dataset). Group state (keys,
-/// key values, accumulators) lives in `state` (the plan arena), with string key
-/// values deep-copied there because batch memory dies between pulls.
 pub const Aggregate = struct {
     stats: Stats = .{},
     child: Op,
@@ -1765,27 +1638,14 @@ pub const Aggregate = struct {
     err: ?*ErrCtx = null,
     state: std.mem.Allocator,
     gpa: std.mem.Allocator,
-    /// Set by a parallel lane: one allocator per radix partition, each holding that
-    /// partition's groups — see `drainParts`.
     part_state: ?[]const std.mem.Allocator = null,
-    /// Where a lane's group tables live, when not in `gpa`: a thread-safe
-    /// allocator, since the merge that frees them runs on other threads.
     table_gpa: ?std.mem.Allocator = null,
-    /// String group keys as ids, shared by the lanes of one aggregate so their
-    /// partials agree on them; a serial fold makes its own in `state`.
     strs: ?*StrTable = null,
-    /// This fold's strings already interned: their id and content hash, without
-    /// the table's lock.
     str_cache: std.StringHashMapUnmanaged(StrId) = .empty,
     done: bool = false,
 
     const StrId = struct { id: u32, h: u64 };
 
-    /// Interned strings for string group keys: a key is stored as its id, so the
-    /// fixed-width fold — typed records, the direct index — takes it. An id says
-    /// which entry, never where a group goes: ids follow which lane got there
-    /// first, so placement hashes the string itself, or the output order would
-    /// move with thread timing.
     pub const StrTable = struct {
         mtx: std.Thread.Mutex = .{},
         arena: std.heap.ArenaAllocator,
@@ -1814,7 +1674,6 @@ pub const Aggregate = struct {
             return gop.value_ptr.*;
         }
 
-        /// Read once the folds are done: interning may still grow the list before.
         pub fn at(self: *const StrTable, id: u32) []const u8 {
             return self.strs.items[id];
         }
@@ -1839,39 +1698,16 @@ pub const Aggregate = struct {
 
     pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Type, distinct: bool = false };
 
-    /// One aggregate's running state. The fields are shared, and each aggregate
-    /// reads them its own way:
-    ///   * COUNT, `count_if` — `n`, the rows counted.
-    ///   * SUM, AVG — `n` rows summed into `sum_i` (int, DECIMAL) or `sum_f` (float).
-    ///   * MIN, MAX — `ext`, the extreme so far.
-    ///   * MEDIAN — `vals`; COUNT(DISTINCT) — `seen`.
-    ///   * `bool_and`, `bool_or` — `n` non-null rows, `sum_i` of them true.
-    ///   * `bit_and`, `bit_or`, `bit_xor` — `n` non-null rows, `sum_i` the bits so
-    ///     far (an i64, sign-extended); `n == 0` means none yet, since a zero
-    ///     start is the identity for OR and XOR but not for AND.
-    ///   * the variances and deviations — Welford's running moments: `n` rows,
-    ///     `sum_f` their mean, `ext` (a float) the sum of squared deviations
-    ///     from it. Reusing `ext` keeps `Acc` at 80 bytes; a field of its own
-    ///     would cost every MIN/MAX group 8 more.
     pub const Acc = struct {
         n: i64 = 0,
-        /// Exact: a total that fits i64 must not fail on a partial that does not,
-        /// or the answer would depend on how rows were split across batches and
-        /// lanes. `finalizeAcc` checks the range once. `align(8)`, as
-        /// `Decimal.unscaled`: `GroupStore` packs accumulators after 8-aligned keys.
         sum_i: i128 align(8) = 0,
         sum_f: f64 = 0,
         ext: Value = .null,
-        /// Values already counted by a `COUNT(DISTINCT x)`, per group. Only
-        /// allocated for distinct aggs, so ordinary aggregation keeps its
-        /// scalar accumulator.
         seen: ?*DistinctSet() = null,
-        /// Every value a `MEDIAN(x)` has seen, per group: a median needs the whole
-        /// distribution, so this is the one aggregate that is not O(1) per group.
         vals: ?*std.array_list.Managed(f64) = null,
     };
 
-    /// Wrapped in a fn for the same reason as `GroupMap` — see its comment.
+    /// A type-returning fn for the same reason as `GroupMap`.
     pub fn DistinctSet() type {
         return std.HashMap([]const Value, void, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
     }
@@ -1886,11 +1722,9 @@ pub const Aggregate = struct {
         try l.append(x);
     }
 
-    /// Fold another lane's distinct values into `acc`. The destination is sized
-    /// for both first: iterating a set yields keys in slot — that is, hash — order,
-    /// and inserting that run into a smaller table under the same hash packs it
-    /// into ever-longer probe runs. A global COUNT(DISTINCT) over 10M ids took
-    /// 292s at -j 8 against 8s at -j 1.
+    /// Fold another lane's distinct values into `acc`, sizing the destination first:
+    /// inserting a hash-ordered run into a smaller table built ever-longer probe runs
+    /// (a global COUNT(DISTINCT) took 292s at -j 8, 8s at -j 1).
     fn mergeDistinct(alloc: std.mem.Allocator, acc: *Acc, src: *const DistinctSet()) !void {
         const set = acc.seen orelse blk: {
             const p = try alloc.create(DistinctSet());
@@ -1903,6 +1737,8 @@ pub const Aggregate = struct {
         while (it.next()) |k| try noteDistinct(alloc, acc, k.*[0]);
     }
 
+    /// Probes with a stack key and copies only on a miss. Copying first grew an arena
+    /// per row: COUNT(DISTINCT) over 200M rows held ~7.6 GB for 200 values.
     fn noteDistinct(alloc: std.mem.Allocator, acc: *Acc, v: Value) !void {
         const set = acc.seen orelse blk: {
             const p = try alloc.create(DistinctSet());
@@ -1910,11 +1746,6 @@ pub const Aggregate = struct {
             acc.seen = p;
             break :blk p;
         };
-        // Probe with a stack key and only materialize on a MISS. Allocating
-        // first made this O(rows) in an arena that is never reclaimed —
-        // COUNT(DISTINCT) over 200M rows held ~7.6 GB for 200 values,
-        // against the documented streaming envelope. `Distinct.next`
-        // already probes this way.
         var probe = [_]Value{v};
         const gop = try set.getOrPut(probe[0..]);
         if (!gop.found_existing) {
@@ -1925,23 +1756,11 @@ pub const Aggregate = struct {
         acc.n = @intCast(set.count());
     }
 
-    /// A fold's groups as the fold stored them: typed records in blocks, never boxed
-    /// per group, plus the hash each group was placed by. The emit, the parallel
-    /// merge and a top-N read it through `keyValue` and `acc`.
-    ///
-    /// The fold used to hand back a `Group` per group — a boxed 32-byte `Value` per
-    /// key and an 80-byte `Acc` per aggregate, on top of the record it had just built
-    /// — so a GROUP BY over 10M ids held 280 bytes a group, three times what the
-    /// fixed-width fold needed. The parallel path paid it again for its merge.
     pub const GroupSet = struct {
         store: Store,
         len: usize,
-        /// The key columns' types, which the fixed stores need to box a raw word.
         key_kinds: []const types.TypeKind,
-        /// A lane partition's own index, for `GroupMerge.adopt`. Its entries are
-        /// the caller's to free (`freeTable`).
         table: ?*GroupTable = null,
-        /// The strings a string key's ids name.
         strs: ?*const StrTable = null,
 
         pub fn freeTable(self: *const GroupSet) void {
@@ -1951,7 +1770,6 @@ pub const Aggregate = struct {
         pub const Store = union(enum) {
             fixed: *FixedStore,
             boxed: *GroupStore,
-            /// No GROUP BY: one group, no key.
             single: []Acc,
         };
 
@@ -1986,16 +1804,10 @@ pub const Aggregate = struct {
         }
     };
 
-    /// Folds groups from several sets into one set of the same kind. A key seen for
-    /// the first time costs its record — raw words and accumulators, copied as they
-    /// are — and a repeated one an accumulator merge.
     pub const GroupMerge = struct {
         alloc: std.mem.Allocator,
         aggs: []const Agg,
         any_distinct: bool,
-        /// Deep-copy what a new record borrows — string keys and extremes, a MEDIAN's
-        /// values — so the set it came from can be freed as soon as it is merged.
-        /// Otherwise the sets merged from must outlive the merged set's emit.
         own: bool = false,
         set: GroupSet,
         table: GroupTable,
@@ -2007,10 +1819,8 @@ pub const Aggregate = struct {
             return false;
         }
 
-        /// Merge into `set` itself — its store and index — instead of copying it
-        /// into a new one. New records land in the store's own allocator. The index
-        /// moves here (`deinit` frees it); null for a set without one of its own (a
-        /// serial fold's).
+        /// Merge into `set` itself, its store and index, instead of copying it. The index
+        /// moves here (`deinit` frees it); null for a set without one of its own.
         pub fn adopt(set: *const GroupSet, aggs: []const Agg) ?GroupMerge {
             const table = set.table orelse return null;
             const alloc = switch (set.store) {
@@ -2060,7 +1870,6 @@ pub const Aggregate = struct {
             };
         }
 
-        /// Fold group `i` of `src` in.
         pub fn add(self: *GroupMerge, src: *const GroupSet, i: usize) !void {
             switch (self.set.store) {
                 .single => |dst| for (dst, self.aggs, 0..) |*d, agg, j| try mergeAcc(self.alloc, d, src.acc(i, j), agg),
@@ -2092,8 +1901,7 @@ pub const Aggregate = struct {
             }
         }
 
-        /// The record for `key`, or null after reserving a slot for it — the caller
-        /// then pushes the record that slot names.
+        /// The record for `key`, or null after reserving a slot the caller then fills.
         fn find(self: *GroupMerge, dst: anytype, h: u64, key: anytype) !?@TypeOf(dst.at(0)) {
             const f = try self.table.getOrPut(h, key, dst, @intCast(dst.len));
             if (f.found) return dst.at(f.slot);
@@ -2101,9 +1909,9 @@ pub const Aggregate = struct {
             return null;
         }
 
-        /// A new group's aggregate state, copied — except a DISTINCT set, which
-        /// belongs to the producing fold's arena and is rebuilt in this one, and
-        /// with `own` whatever else points into the source.
+        /// A new group's aggregate state, copied, except a DISTINCT set, which belongs to
+        /// the producing fold's arena and is rebuilt here, and with `own` anything else
+        /// pointing into the source, so the source set can be freed once merged.
         fn adoptTail(self: *GroupMerge, layout: *const Layout, dst: [*]u8, src: [*]u8) !void {
             @memcpy(dst[0..layout.size], src[0..layout.size]);
             if (!self.any_distinct and !self.own) return;
@@ -2135,21 +1943,13 @@ pub const Aggregate = struct {
         }
     };
 
-    /// Group-key hash map (value-keyed). Used by `drainGroups` and by `mergeGroups`
-    /// when combining partial group sets from parallel workers.
-    ///
-    /// A type-returning fn, NOT a `const` type decl: `std.testing.refAllDeclsRecursive`
-    /// (main.zig's test root) recurses into every container-level *type* declaration,
-    /// and diving through a `std.HashMap` instantiation here produces a binary that
-    /// segfaults at startup under Zig 0.15.2. Wrapping in a fn keeps the type reachable
-    /// across modules while hiding it from that recursion. (Matches the codebase's other
-    /// HashMaps, which stay function-local for the same reason.)
+    /// A type-returning fn, not a `const` type: `std.testing.refAllDeclsRecursive` dives
+    /// into container-level types, and diving through this `std.HashMap` built a binary
+    /// that segfaulted at startup under Zig 0.15.2.
     pub fn GroupMap() type {
         return std.HashMap([]const Value, usize, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
     }
 
-    /// One agg's vectorized reduction of a single batch, merged into the running
-    /// accumulator by `mergePartial`.
     const Partial = struct {
         nvalid: usize,
         sum_i: i128 = 0,
@@ -2165,30 +1965,20 @@ pub const Aggregate = struct {
         return try self.emitSets(arena, &.{set}, null);
     }
 
-    /// Fold the entire child into raw per-group accumulators (kept in `state`). This
-    /// is the parallelizable half of aggregation: a worker drains its slice of the
-    /// input into a partial `GroupSet`, `GroupMerge` combines partials across
-    /// workers by recombining the *raw* accumulators (so AVG etc. stay correct), and
-    /// `emitSets` finalizes once at the end. No GROUP BY is exactly one group. The
-    /// hashes stay in the records: the parallel path partitions and merges by them.
+    /// Fold the whole child into raw per-group accumulators: the parallelizable half of
+    /// aggregation, merged across workers by `GroupMerge` and finalized by `emitSets`.
     pub fn drainSet(self: *Aggregate) anyerror!GroupSet {
         std.debug.assert(self.part_state == null);
         return (try self.drainImpl())[0];
     }
 
-    /// Fold as `drainSet`, but a parallel lane's way: one set per radix partition
-    /// (`partOf`), each in its own `part_state` allocator, so the merge takes the
-    /// lanes' partition `p` without walking the rest and can free it once folded.
-    /// An ungrouped aggregate is still one set.
+    /// As `drainSet`, but one set per radix partition in its own `part_state`
+    /// allocator, so the merge takes partition `p` from each lane and frees it once folded.
     pub fn drainParts(self: *Aggregate) anyerror![]GroupSet {
         std.debug.assert(self.part_state.?.len == fold_parts);
         return self.drainImpl();
     }
 
-    /// Radix partitions a fold splits its groups over, by the top bits of the hash.
-    /// A single table for millions of groups misses cache on every probe; sixty-four
-    /// smaller ones stay resident, the shape DuckDB and ClickHouse both arrived at.
-    /// The bucket comes from the bottom bits, so the two never interfere.
     pub const fold_parts = 64;
     const part_shift = 58;
 
@@ -2196,9 +1986,8 @@ pub const Aggregate = struct {
         return @intCast(h >> part_shift);
     }
 
-    /// Where one partition's groups go: its table and the store the table indexes.
-    /// A serial fold shares one store between its partitions, so its groups keep
-    /// the order they were first seen in; a lane's partitions each own theirs.
+    /// One partition's table and the store it indexes. A serial fold shares one store,
+    /// so groups keep first-seen order; a lane's partitions each own theirs.
     fn FoldPart(comptime Store: type) type {
         return struct {
             table: GroupTable,
@@ -2208,8 +1997,7 @@ pub const Aggregate = struct {
     }
 
     /// The tables live in a real allocator, not the arena, so a growing table frees
-    /// what it outgrew: a serial fold frees them when it is done, and a lane's go
-    /// with its sets (`GroupSet.freeTable`).
+    /// what it outgrew.
     fn foldParts(self: *Aggregate, comptime Store: type, layout: *const Layout) ![]FoldPart(Store) {
         const parts = try self.state.alloc(FoldPart(Store), fold_parts);
         const tg = self.table_gpa orelse self.gpa;
@@ -2258,9 +2046,9 @@ pub const Aggregate = struct {
         return kinds;
     }
 
-    /// Fold with raw fixed-width keys. Same shape as `drainImpl`, but the probe
-    /// key is a run of `i64` rather than boxed `Value`s, so the record is smaller
-    /// and the hash is over plain words.
+    /// Fold with raw fixed-width keys. Floats group by number, not bits, as everywhere
+    /// else (-0.0 split from 0.0 before). Below `few_groups` rows go in arrival order;
+    /// past it a batch is walked a partition at a time so probes share a table.
     fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only: bool) anyerror![]GroupSet {
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
@@ -2273,10 +2061,6 @@ pub const Aggregate = struct {
         errdefer for (parts) |*p| p.table.deinit();
         const nk = self.by.len;
 
-        // One integer key: a group seen before is found by the key itself, in
-        // an array over a range of its values, with no hash or probe — the
-        // common `GROUP BY status`, `year`, `category`. Keys outside the range,
-        // and nulls, take the table.
         const direct: ?Direct = if (nk == 1 and kinds[0] != .f64k and kinds[0] != .boolk) try Direct.init(self.gpa) else null;
         var has_str = false;
         for (kinds) |k| if (k == .strk) {
@@ -2287,11 +2071,9 @@ pub const Aggregate = struct {
 
         while (try self.child.next(pull)) |b| {
             const keys = try pull.alloc(i64, b.len * nk);
-            // the words a row is hashed by: its keys, a string's hash for its id
             const hkeys = if (has_str) try pull.alloc(i64, b.len * nk) else keys;
             const masks = try pull.alloc(u64, b.len);
             const hashes = try pull.alloc(u64, b.len);
-            // each row's group record, and the partition holding it
             const tails = try pull.alloc(?[*]u8, b.len);
             const pidx = try pull.alloc(u8, b.len);
             @memset(masks, 0);
@@ -2299,7 +2081,6 @@ pub const Aggregate = struct {
 
             for (self.by, kinds, 0..) |ci, kk, j| {
                 const col = b.columns[ci];
-                // One loop per kind: a switch inside the row loop ran per row.
                 switch (kk) {
                     .i64k => for (0..b.len) |r| {
                         keys[r * nk + j] = col.data.i64[r];
@@ -2310,19 +2091,12 @@ pub const Aggregate = struct {
                     .boolk => for (0..b.len) |r| {
                         keys[r * nk + j] = @intFromBool(col.data.b[r]);
                     },
-                    // Group by the NUMBER, not the bit pattern: this path compares
-                    // raw words, so `-0.0` (0x8000…) and `0.0` would land in
-                    // different groups even though every other part of the engine —
-                    // DISTINCT, join, the parallel merge — calls them equal. Same
-                    // canonicalization as `keyhash.hashValue`.
                     .f64k => for (0..b.len) |r| {
                         keys[r * nk + j] = @bitCast(keyhash.canonF64(col.data.f64[r]));
                     },
-                    // the id is the key; its string's own hash is what places it
                     .strk => {
                         const table = try self.strTable();
                         if (col.dict) |d| {
-                            // a dictionary's entries are interned, not every row
                             const ents = try pull.alloc(StrId, d.values.len);
                             for (ents, d.values) |*e, v| e.* = try self.strId(table, v);
                             for (0..b.len) |r| {
@@ -2371,10 +2145,6 @@ pub const Aggregate = struct {
                 f.* = Fast.of(sl, agg, c.*, b.len);
             }
 
-            // Rows are walked a partition at a time so consecutive probes share a
-            // table — which pays only once the tables outgrow the cache. While the
-            // groups are few, the reorder and the scattered reads it costs were
-            // most of a 100-group GROUP BY, so rows go in the order they came.
             var groups: usize = 0;
             if (self.part_state == null) groups = parts[0].store.len else for (parts) |*pp| {
                 groups += pp.store.len;
@@ -2393,7 +2163,6 @@ pub const Aggregate = struct {
                 }
             }
 
-            // Pass 1: every row's group, found or added.
             for (order, 0..) |ri, oi| {
                 if (tails[ri] != null) continue;
                 if (oi + prefetch_ahead < order.len) {
@@ -2422,9 +2191,6 @@ pub const Aggregate = struct {
                 };
             }
 
-            // Pass 2: each aggregate over the batch in row order — the type's
-            // branch taken once, not per row, and a group's values added in the
-            // order the rows came, as a float sum needs to stay the same.
             if (counts_only) {
                 for (tails[0..b.len]) |t| {
                     const cs: [*]i64 = @ptrCast(@alignCast(t.?));
@@ -2468,6 +2234,8 @@ pub const Aggregate = struct {
         return self.foldSets(.fixed, parts);
     }
 
+    /// Fold with boxed keys: each row's keys boxed once, the batch hashed then probed
+    /// behind a prefetch, each argument evaluated once per batch, rows walked by partition.
     fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
@@ -2503,14 +2271,9 @@ pub const Aggregate = struct {
         const hctx = keyhash.MultiKeyCtx{};
         while (try self.child.next(pull)) |b| {
             const nk = self.by.len;
-            // Every row's keys are boxed once, into one flat slice, and read
-            // back by the probe pass: it used to box them a second time.
             const probes = try pull.alloc(Value, b.len * nk);
             const hashes = try pull.alloc(u64, b.len);
 
-            // Hash the whole batch first, then walk it again to probe, a few
-            // rows ahead of a prefetch on the bucket, so the miss on a large
-            // table overlaps the rows before it instead of stalling each one.
             var r: usize = 0;
             while (r < b.len) : (r += 1) {
                 const probe = probes[r * nk ..][0..nk];
@@ -2518,16 +2281,11 @@ pub const Aggregate = struct {
                 hashes[r] = hctx.hash(probe);
             }
 
-            // Evaluate each aggregate's argument once for the whole batch.
-            // Per row it re-walked the expression tree for every aggregate.
             const argcols = try pull.alloc(?column.Column, self.aggs.len);
             for (self.aggs, argcols) |agg, *c| {
                 c.* = if (agg.arg) |e| try self.argColumn(pull, agg, e, b) else null;
             }
 
-            // Counting-sort the batch's rows by partition, then walk one
-            // partition at a time so consecutive probes land in the same small
-            // table instead of scattering across a huge one.
             @memset(counts, 0);
             for (hashes[0..b.len]) |h| counts[(h >> part_shift) + 1] += 1;
             for (1..nparts + 1) |ci| counts[ci] += counts[ci - 1];
@@ -2563,19 +2321,8 @@ pub const Aggregate = struct {
         return self.foldSets(.boxed, parts);
     }
 
-    /// Open-addressed group index built for the one access pattern aggregation
-    /// has: hash a batch of keys, then probe them all. Two things it does that a
-    /// general map cannot — it stores each key's hash, so growing never re-hashes
-    /// a key, and it exposes the bucket up front so a batch can prefetch its
-    /// buckets before probing. At high cardinality the probe is a cache miss, and
-    /// hiding that miss is the whole game.
-    /// Rows between a bucket's prefetch and its probe. `GroupTable.prefetch`
-    /// existed for this and had no caller, so the two-pass shape above paid
-    /// for a miss it never hid.
     const prefetch_ahead = 8;
 
-    /// The direct index of `drainFixed`: group records by key value, over
-    /// `len` values from a base taken from the first batch.
     const Direct = struct {
         recs: []?[*]u8,
         parts: []u8,
@@ -2594,8 +2341,7 @@ pub const Aggregate = struct {
             gpa.free(self.parts);
         }
 
-        /// The smallest non-null key, so a range starting at 0 or 1 — a status
-        /// code, a year's months — sits wholly inside.
+        /// The smallest non-null key, so a range starting at 0 or 1 sits wholly inside.
         fn baseFor(keys: []const i64, masks: []const u64) i64 {
             var lo: i64 = std.math.maxInt(i64);
             for (keys, masks) |k, m| if (m == 0 and k < lo) {
@@ -2605,14 +2351,10 @@ pub const Aggregate = struct {
         }
     };
 
-    /// Below this many groups a fold walks a batch in row order (see `drainFixed`).
     const few_groups = 1 << 12;
 
-    /// The hash of a fixed-width key: each word through murmur3's 64-bit
-    /// finalizer. Wyhash's streaming form, copying eight bytes into its buffer per
-    /// key, was a fifth of a 100-group GROUP BY; this mixes as well in the bits
-    /// that matter here — the top six pick the partition, the bottom the bucket,
-    /// 32–37 the salt.
+    /// Each word through murmur3's 64-bit finalizer. Wyhash's streaming form was a fifth
+    /// of a 100-group GROUP BY.
     fn fixedHash(vals: []const i64, mask: u64) u64 {
         var h: u64 = 0x9E3779B97F4A7C15 ^ mask;
         for (vals) |v| h = fmix64(h ^ (@as(u64, @bitCast(v)) *% 0xC2B2AE3D27D4EB4F));
@@ -2629,10 +2371,6 @@ pub const Aggregate = struct {
         return x;
     }
 
-    /// An aggregate the fold can update straight from its argument's typed column,
-    /// for one batch: an INT or FLOAT column with no nulls under COUNT, SUM or AVG.
-    /// Everything else boxes the cell into a `Value` and takes `Layout.update`,
-    /// which at 100 groups cost as much as finding the group.
     const Fast = enum {
         count_star,
         count_all_valid,
@@ -2657,7 +2395,6 @@ pub const Aggregate = struct {
         }
     };
 
-    /// How a fixed-width key column is read into a raw `i64`.
     const KeyKind = enum { i64k, i32k, boolk, f64k, strk };
 
     fn keyKindOf(kind: types.TypeKind) ?KeyKind {
@@ -2671,16 +2408,10 @@ pub const Aggregate = struct {
         };
     }
 
-    /// Fixed-size group records in blocks, addressed by index. One allocation per
-    /// block instead of one per group, and blocks never move, so an index stays
-    /// valid for the life of the store. The first blocks are small and double up
-    /// to `block` records: a parallel lane splits its groups over 64 stores, and
-    /// at low cardinality each holds a handful.
     const RecBlocks = struct {
         const first_shift = 4;
         const block_shift = 13;
         const block = 1 << block_shift;
-        /// Blocks 0..small-1 hold 16, 16, 32, … 4096 records: `block` in all.
         const small = block_shift - first_shift + 1;
 
         alloc: std.mem.Allocator,
@@ -2710,7 +2441,6 @@ pub const Aggregate = struct {
             return self.blocks.items[l.b].ptr + l.off * self.rec_size;
         }
 
-        /// Make room for record `i`, the one after the last.
         fn reserve(self: *RecBlocks, i: usize) !void {
             const l = locate(i);
             if (l.b < self.blocks.items.len) return;
@@ -2718,14 +2448,6 @@ pub const Aggregate = struct {
         }
     };
 
-    /// Group storage for keys that are all fixed-width. A boxed `Value` costs 32
-    /// bytes to say what eight bytes of `i64` already says, and hashing one walks
-    /// a tagged union per key; here the keys are raw words with a null mask
-    /// beside them, so both the record and the hash get cheaper. The aggregates'
-    /// state follows, laid out by `Layout`. The key's hash leads the record, so a
-    /// probe rejects a different key on it and a growing table re-homes groups
-    /// without a hash list beside the store — which an arena, growing it, held
-    /// three times over.
     const FixedStore = struct {
         nkeys: usize,
         layout: *const Layout,
@@ -2752,8 +2474,8 @@ pub const Aggregate = struct {
             };
         }
 
-        /// One address computation for the hash, the mask and the keys: going
-        /// through `hashAt` and `at` located the record twice per probe.
+        /// One address computation for hash, mask and keys; going through `hashAt` and `at`
+        /// located the record twice per probe.
         fn eqlAt(self: *const FixedStore, i: usize, h: u64, key: FixedKey) bool {
             const base = self.recs.base(i);
             const words: [*]const u64 = @ptrCast(@alignCast(base));
@@ -2775,16 +2497,6 @@ pub const Aggregate = struct {
 
     const FixedKey = struct { vals: []const i64, mask: u64 };
 
-    /// Open-addressed group index sized for cache, not for generality.
-    ///
-    /// Each slot is a single `u32`: a few salt bits from the key's hash plus the
-    /// group's index. Storing a salt rather than the whole hash is what makes
-    /// the entry small enough that sixteen share a cache line, and at high
-    /// cardinality the number of lines a probe touches *is* the cost — an
-    /// earlier version kept the full 8-byte hash in one array and the index in
-    /// another, so every probe missed twice. The full hash lives beside the
-    /// group instead, so growing never re-hashes a key (the same trick DuckDB's
-    /// aggregate table uses).
     const GroupTable = struct {
         const salt_bits = 6;
         const idx_bits = 32 - salt_bits;
@@ -2801,8 +2513,7 @@ pub const Aggregate = struct {
             return .{ .entries = e, .mask = cap_pow2 - 1, .alloc = alloc };
         }
 
-        /// Salt comes from bits the bucket index does not use, so the two stay
-        /// independent as the table grows.
+        /// Salt comes from bits the bucket index does not use, so the two stay independent.
         fn saltOf(h: u64) u32 {
             return @intCast((h >> 32) & ((1 << salt_bits) - 1));
         }
@@ -2815,17 +2526,15 @@ pub const Aggregate = struct {
             @prefetch(&self.entries[h & self.mask], .{ .rw = .read, .locality = 3 });
         }
 
-        /// Free the entries. Safe to repeat: a table handed on by `GroupMerge.adopt`
-        /// is left empty, and its owner's cleanup still runs.
+        /// Free the entries. Safe to repeat: a table handed on by `GroupMerge.adopt` is left
+        /// empty and its owner's cleanup still runs.
         fn deinit(self: *GroupTable) void {
             self.alloc.free(self.entries);
             self.entries = &.{};
         }
 
-        /// Rebuild from this table's own entries, taking each group's hash from
-        /// its record — so a table owning one radix partition rehomes only the
-        /// groups it holds. The outgrown entries are freed: `alloc` is a real
-        /// allocator, since an arena kept every outgrown table.
+        /// Rebuild from this table's own entries, taking each hash from its record, and
+        /// free the outgrown entries (an arena kept every outgrown table).
         fn grow(self: *GroupTable, store: anytype) !void {
             const cap = self.entries.len * growth;
             const ne = try self.alloc.alloc(u32, cap);
@@ -2872,9 +2581,6 @@ pub const Aggregate = struct {
         }
     };
 
-    /// Group records, keys immediately followed by accumulators, so the probe that
-    /// finds a group and the update that follows touch the same run of bytes. The
-    /// hash leads, as in `FixedStore`.
     const GroupStore = struct {
         nkeys: usize,
         layout: *const Layout,
@@ -2915,9 +2621,8 @@ pub const Aggregate = struct {
         }
     };
 
-    /// Combine a partial accumulator `src` into `dst` for one agg — the dual of
-    /// `updateAcc`, but folding two partials instead of a row. `dst_alloc` owns any
-    /// min/max string carried over (the source partial's memory may be freed).
+    /// Combine partial `src` into `dst` for one agg, the dual of `updateAcc`. `dst_alloc`
+    /// owns any MIN/MAX string carried over.
     pub fn mergeAcc(dst_alloc: std.mem.Allocator, dst: *Acc, src: Acc, agg: Agg) !void {
         switch (agg.func) {
             .count => if (agg.distinct) {
@@ -2958,11 +2663,8 @@ pub const Aggregate = struct {
         }
     }
 
-    /// Try the vectorized path for one batch: every agg's argument evaluated as
-    /// a column once and SIMD-reduced to a `Partial`. Returns false (touching
-    /// nothing) if any agg isn't covered, so the caller folds the batch row-wise.
-    /// The int/float-only constraint depends on the (fixed) schema, so the same
-    /// path is taken for every batch of a run.
+    /// Evaluate every agg's argument as a column once and SIMD-reduce it. False,
+    /// touching nothing, if any agg is not covered; that depends only on the schema.
     fn foldVectorized(self: *Aggregate, arena: std.mem.Allocator, b: Batch, accs: []Acc) anyerror!bool {
         for (self.aggs) |agg| if (agg.distinct) return false;
         const partials = try arena.alloc(Partial, self.aggs.len);
@@ -2983,11 +2685,8 @@ pub const Aggregate = struct {
         }
     }
 
-    /// What a text argument is cast to before it reaches the accumulator, or
-    /// null for an aggregate that takes its argument as it comes (COUNT, MIN,
-    /// MAX). Text passes the plan-time check under every rule — the parallel CSV
-    /// lanes carry raw text columns — so this is where it becomes the number or
-    /// bool the aggregate folds; unparseable text is a clean CastFailed.
+    /// What a text argument is cast to before it reaches the accumulator, or null for
+    /// COUNT, MIN and MAX. Parallel CSV lanes carry raw text, so the cast happens here.
     fn argCast(agg: Agg) ?types.Type {
         return switch (aggregates.spec(agg.func).arg) {
             .star_or_any, .any => null,
@@ -2997,17 +2696,10 @@ pub const Aggregate = struct {
         };
     }
 
-    /// One aggregate's argument evaluated across a whole batch, a text column
-    /// cast as `argCast` says. Without the cast a text cell reached `SUM`'s
-    /// accumulator as a union-access panic, and `AVG`'s as a silent 0.
+    /// One agg's argument across a batch, a text column cast per `argCast`. A stored
+    /// column is handed over uncopied when its type feeds the accumulator; others are
+    /// built as the type it reads (`count_if` folds BOOLs into an INT).
     fn argColumn(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, e: *const ast.Expr, b: Batch) anyerror!column.Column {
-        // `sum(x)` and friends name a column the batch already holds; hand it
-        // over instead of materialising a copy. Only when the stored type feeds
-        // the accumulator directly — a text column under a numeric aggregate
-        // still has to go through the coercing path.
-        // The type the accumulator reads, which is not always the result's:
-        // `count_if` folds BOOLs into an INT. A constant or row-wise argument is
-        // built as this type, so `count_if(true)` must not become a column of 1s.
         const want = argCast(agg) orelse agg.ty;
         if (e.* == .field) {
             if (b.schema.resolve(e.field.parts)) |ci| {
@@ -3028,7 +2720,6 @@ pub const Aggregate = struct {
         return out.finish();
     }
 
-    /// One agg argument for one row, a text value cast as `argCast` says.
     fn argValue(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, b: Batch, r: usize) anyerror!Value {
         const e = agg.arg orelse return .null;
         const v = eval.evalRow(arena, e, b, r) catch |err| {
@@ -3049,8 +2740,8 @@ pub const Aggregate = struct {
         };
     }
 
-    /// Vectorized reduce of one agg over one batch. `null` means "not covered,
-    /// fold row-wise" (non-numeric arg); the constraint is schema-dependent.
+    /// Vectorized reduce of one agg over one batch; null means fold row-wise. A null
+    /// slot holds whatever its producer left, so only an all-valid batch is summed blind.
     fn reduceBatch(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, b: Batch) anyerror!?Partial {
         if (agg.func == .count and agg.arg == null) return Partial{ .nvalid = b.len };
         if (foldsRowwise(agg.func)) return null;
@@ -3067,9 +2758,6 @@ pub const Aggregate = struct {
         switch (agg.func) {
             .count => {},
             .median, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .var_samp, .var_pop, .stddev_samp, .stddev_pop => unreachable,
-            // A null slot holds whatever its producer left there — an outer join's
-            // fill keeps the placeholder row's value — so only an all-valid batch
-            // may be summed without looking at the bitmap.
             .sum, .avg => switch (col.ty.kind) {
                 .float => p.sum_f = if (nvalid == n) simd.sumF(col.data.f64[0..n]) else validSumF(col, n),
                 .int => {
@@ -3083,8 +2771,8 @@ pub const Aggregate = struct {
         return p;
     }
 
-    /// Whether `reduceBatch` leaves an aggregate to the row-wise fold, decided
-    /// before it evaluates a column it would only discard.
+    /// Whether `reduceBatch` leaves an aggregate to the row-wise fold, decided before
+    /// evaluating a column it would only discard.
     fn foldsRowwise(func: ast.AggFunc) bool {
         return switch (func) {
             .count, .sum, .avg, .min, .max => false,
@@ -3092,13 +2780,12 @@ pub const Aggregate = struct {
         };
     }
 
-    /// Fold one batch's `Partial` into the running accumulator. Mirrors the
-    /// row-wise `updateAcc` semantics (null-skipping, agg.ty-driven sum kind).
+    /// Fold one batch's `Partial` into the running accumulator, with `updateAcc`'s
+    /// semantics.
     fn mergePartial(acc: *Acc, agg: Agg, p: Partial) error{IntOverflow}!void {
         switch (agg.func) {
             .count => acc.n += @intCast(p.nvalid),
             .sum => if (p.nvalid > 0) {
-                // Batch partials can overflow on merge even when no batch did.
                 if (agg.ty.kind == .float)
                     acc.sum_f += p.sum_f
                 else
@@ -3123,8 +2810,8 @@ pub const Aggregate = struct {
         }
     }
 
-    /// One output row per group of `sets`, in order — or, with `sel`, only the
-    /// groups `sel[i]` lists for set `i` (a top-N's survivors).
+    /// One output row per group of `sets`, or with `sel` only the groups `sel[i]` lists
+    /// for set `i` (a top-N's survivors).
     pub fn emitSets(self: *Aggregate, arena: std.mem.Allocator, sets: []const GroupSet, sel: ?[]const []const u32) anyerror!Batch {
         const nfields = self.out_schema.fields.len;
         var n: usize = 0;
@@ -3161,8 +2848,8 @@ pub const Aggregate = struct {
         }
     }
 
-    /// `state` owns any string extremum copied into the accumulator: the value
-    /// must outlive the batch it came from (the per-pull arena is reset).
+    /// `state` owns any string extremum copied into the accumulator, since the value
+    /// must outlive the per-pull arena.
     fn updateAcc(state: std.mem.Allocator, acc: *Acc, agg: Agg, v: Value, has_arg: bool) !void {
         switch (agg.func) {
             .count => {
@@ -3205,11 +2892,8 @@ pub const Aggregate = struct {
         }
     }
 
-    /// Add a non-null value to an int or DECIMAL `SUM`. A value's scale is whatever
-    /// the source sent, which need not be the column's declared scale (postgres
-    /// NUMERIC carries a per-value dscale), so every addend is normalized to the
-    /// output scale that `finalizeAcc` will stamp back on. Adding raw unscaled
-    /// integers instead multiplied the sum by 10^(declared - actual).
+    /// Add a non-null value to an int or DECIMAL SUM, normalized to the output scale.
+    /// Adding raw unscaled values multiplied the sum by 10^(declared - actual).
     fn addExact(sum: *align(8) i128, agg: Agg, v: Value) !void {
         if (agg.ty.kind == .decimal) {
             const d: Decimal = if (v == .decimal) v.decimal else .{ .unscaled = v.int, .scale = 0 };
@@ -3218,16 +2902,9 @@ pub const Aggregate = struct {
         } else sum.* = std.math.add(i128, sum.*, v.int) catch return error.IntOverflow;
     }
 
-    /// How one aggregate's state sits in a group record. `Acc` reserves room for
-    /// every kind — a MIN/MAX value, a DISTINCT set, a MEDIAN list — so a SUM paid
-    /// 80 bytes a group for the 24 it uses. The common aggregates get a slot of
-    /// just their own state; the rest keep an `Acc`.
     pub const Slot = enum {
-        /// COUNT(*) / COUNT(x): the count.
         count,
-        /// SUM of ints or DECIMALs: rows summed, and the exact total.
         sum_i,
-        /// SUM of floats, AVG: rows summed, and the float total.
         sum_f,
         full,
 
@@ -3253,7 +2930,6 @@ pub const Aggregate = struct {
     const SumI = struct { n: i64, s: i128 align(8) };
     const SumF = struct { n: i64, s: f64 };
 
-    /// Where each aggregate's slot sits in a record's tail, and the tail's size.
     pub const Layout = struct {
         slots: []const Slot,
         offs: []const usize,
@@ -3287,7 +2963,6 @@ pub const Aggregate = struct {
             };
         }
 
-        /// Slot `j` as an `Acc`, for finalizing and ordering.
         fn acc(self: Layout, tail: [*]u8, j: usize) Acc {
             return switch (self.slots[j]) {
                 .count => .{ .n = self.ptr(i64, tail, j).* },
@@ -3303,7 +2978,6 @@ pub const Aggregate = struct {
             };
         }
 
-        /// Fold one row's value in: `updateAcc` for the slot's kind.
         fn update(self: Layout, state: std.mem.Allocator, tail: [*]u8, j: usize, agg: Agg, v: Value) !void {
             switch (self.slots[j]) {
                 .count => if (agg.arg == null or !v.isNull()) {
@@ -3323,7 +2997,6 @@ pub const Aggregate = struct {
             }
         }
 
-        /// Fold another partial's slot in: `mergeAcc` for the slot's kind.
         fn merge(self: Layout, alloc: std.mem.Allocator, dst: [*]u8, src: [*]u8, j: usize, agg: Agg) !void {
             switch (self.slots[j]) {
                 .count => self.ptr(i64, dst, j).* += self.ptr(i64, src, j).*,
@@ -3344,6 +3017,8 @@ pub const Aggregate = struct {
         }
     };
 
+    /// The aggregate's final value. MEDIAN uses selection, and with an even count the
+    /// mean of the two middle values, as Postgres's percentile_cont(0.5) does.
     pub fn finalizeAcc(acc: Acc, agg: Agg) error{IntOverflow}!Value {
         return switch (agg.func) {
             .count => .{ .int = acc.n },
@@ -3358,11 +3033,6 @@ pub const Aggregate = struct {
                 const xs = l.items;
                 if (xs.len == 0) break :blk Value.null;
                 const mid = xs.len / 2;
-                // Selection, not a sort: O(n) for the middle element. Even
-                // count: the mean of the two middle values, as Postgres's
-                // percentile_cont(0.5) and DuckDB's median both answer; after
-                // selecting `mid`, everything before it is <= it, so the
-                // other middle value is the max of that prefix.
                 const hi = selectNth(xs, mid);
                 if (xs.len % 2 == 1) break :blk Value{ .float = hi };
                 var lo = xs[0];
@@ -3373,7 +3043,6 @@ pub const Aggregate = struct {
             .count_if => .{ .int = acc.n },
             .bool_and => if (acc.n == 0) .null else Value{ .bool = acc.sum_i == acc.n },
             .bool_or => if (acc.n == 0) .null else Value{ .bool = acc.sum_i > 0 },
-            // `sum_i` only ever holds an i64's bits, sign-extended.
             .bit_and, .bit_or, .bit_xor => if (acc.n == 0) .null else Value{ .int = @intCast(acc.sum_i) },
             .var_samp, .stddev_samp => if (acc.n < 2) .null else spread(agg.func, sqDev(acc) / @as(f64, @floatFromInt(acc.n - 1))),
             .var_pop, .stddev_pop => if (acc.n == 0) .null else spread(agg.func, sqDev(acc) / @as(f64, @floatFromInt(acc.n))),
@@ -3389,16 +3058,13 @@ pub const Aggregate = struct {
         };
     }
 
-    /// The sum of squared deviations from the mean — see `Acc`.
     fn sqDev(acc: Acc) f64 {
         return if (acc.ext == .float) acc.ext.float else 0;
     }
 
-    /// Welford's update: one value into the running mean and squared deviations,
-    /// without the cancellation a sum of squares suffers on large values.
+    /// Welford's update. `ext` is read before it is assigned: assigning the union may
+    /// set its tag first and read back a garbage float.
     fn noteMoment(acc: *Acc, x: f64) void {
-        // Read `ext` before assigning it: `acc.ext = .{ .float = f(acc) }` may
-        // set the union's tag first, and `f` would then read a garbage float.
         const m2 = sqDev(acc.*);
         acc.n += 1;
         const delta = x - acc.sum_f;
@@ -3406,9 +3072,7 @@ pub const Aggregate = struct {
         acc.ext = .{ .float = m2 + delta * (x - acc.sum_f) };
     }
 
-    /// Chan et al.'s pairwise combination of two Welford states. Lanes merge in
-    /// a fixed order, so the result is reproducible for a given `-j`, like a
-    /// float SUM — and, like it, may differ in the last bits across `-j`.
+    /// Chan et al.'s pairwise combination of two Welford states.
     fn mergeMoments(dst: *Acc, src: Acc) void {
         if (src.n == 0) return;
         if (dst.n == 0) {
@@ -3427,7 +3091,6 @@ pub const Aggregate = struct {
         dst.n += src.n;
     }
 
-    /// A variance as itself, or a deviation as its square root.
     fn spread(func: ast.AggFunc, variance: f64) Value {
         return .{ .float = switch (func) {
             .stddev_samp, .stddev_pop => @sqrt(variance),
@@ -3440,15 +3103,13 @@ fn lessV(a: Value, b: Value) bool {
     return (eval.compareValues(a, b) orelse .eq) == .lt;
 }
 
-/// Quickselect: reorders `xs` so `xs[k]` is the k-th smallest, everything
-/// before it no larger and everything after no smaller, and returns it.
+/// Quickselect: `xs[k]` becomes the k-th smallest, smaller before, larger after.
 /// Median-of-three pivot, Hoare partition; expected O(n).
 fn selectNth(xs: []f64, k: usize) f64 {
     var lo: usize = 0;
     var hi: usize = xs.len - 1;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        // Median of three into `mid`, which is also the pivot value.
         if (xs[mid] < xs[lo]) std.mem.swap(f64, &xs[mid], &xs[lo]);
         if (xs[hi] < xs[lo]) std.mem.swap(f64, &xs[hi], &xs[lo]);
         if (xs[hi] < xs[mid]) std.mem.swap(f64, &xs[hi], &xs[mid]);
@@ -3465,7 +3126,6 @@ fn selectNth(xs: []f64, k: usize) f64 {
                 j -= 1;
             }
         }
-        // Now xs[lo..=j] <= p <= xs[i..=hi]; recurse into the side holding k.
         if (k <= j) {
             hi = j;
         } else if (k >= i) {
@@ -3477,8 +3137,6 @@ fn selectNth(xs: []f64, k: usize) f64 {
     return xs[k];
 }
 
-/// Deep-copy a value into `state` so it survives the batch it was read from.
-/// Only string/bytes carry pointers into batch memory; scalars copy by value.
 pub fn dupeValue(state: std.mem.Allocator, v: Value) !Value {
     return switch (v) {
         .string => |s| .{ .string = try state.dupe(u8, s) },
@@ -3487,10 +3145,8 @@ pub fn dupeValue(state: std.mem.Allocator, v: Value) !Value {
     };
 }
 
-/// Sum an i64 column exactly. The accumulator is i128 so the hot loop stays
-/// branch-free — a slice of i64 cannot overflow i128 — and the range check waits
-/// for `finalizeAcc`. This used to be `+%`, which silently returned a plausible
-/// wrong total (three big values summed to `-1`).
+/// Sum an i64 column exactly in i128, branch-free, range-checked in `finalizeAcc`.
+/// This was `+%`, which returned a plausible wrong total.
 fn sumIntCol(d: []const i64) i128 {
     var s: i128 = 0;
     for (d) |x| s += x;
@@ -3513,8 +3169,8 @@ fn validSumF(col: column.Column, n: usize) f64 {
     return s;
 }
 
-/// MIN/MAX over an int/float column, honoring nulls. SIMD on the all-valid fast
-/// path (null lanes' 0 default would corrupt the extreme), else a scalar skip.
+/// MIN/MAX over an int or float column: SIMD when all valid (a null lane's 0 would
+/// corrupt the extreme), else a scalar skip.
 fn reduceExtreme(col: column.Column, func: ast.AggFunc, n: usize) Value {
     const is_min = func == .min;
     if (col.ty.kind == .float) {
@@ -3537,19 +3193,9 @@ fn reduceExtreme(col: column.Column, func: ast.AggFunc, n: usize) Value {
     return if (m) |x| Value{ .int = x } else .null;
 }
 
-/// Like materializeAll but always returns a (possibly empty) batch with the
-/// schema's columns present — so a join can emit right-side nulls even when the
-/// build side is empty. The result is built in `state` (which must outlive the
-/// per-pull batch arena: the join probes it across many pulls), while the child
-/// is pulled with the transient `pull` arena.
-///
-/// Fails with `JoinBuildTooLarge` as soon as the drained bytes cross `cap`,
-/// so an oversized build side is a diagnostic rather than an OOM.
+/// Drain the build side into a batch in `state` that is never null, so a join can
+/// emit right-side nulls for an empty build. Fails with `JoinBuildTooLarge` past `cap`.
 fn materializeFull(state: std.mem.Allocator, pull: std.mem.Allocator, child: Op, schema: *const types.Schema, bytes_out: *usize, cap: usize) anyerror!Batch {
-    // Chunks are pulled into `state` and concatenated per column — the same
-    // columnar copy `Sort` makes — instead of one boxed append per cell. The
-    // chunks stay in the arena beside the result; a build side is resident
-    // anyway, and the cap above bounds both.
     _ = pull;
     const ncols = schema.fields.len;
     var chunks = std.array_list.Managed(Batch).init(state);
@@ -3579,9 +3225,7 @@ fn materializeFull(state: std.mem.Allocator, pull: std.mem.Allocator, child: Op,
     return Batch{ .schema = schema, .columns = cols, .len = total };
 }
 
-/// Heap a column occupies: its typed store plus the validity bitmap. Close
-/// enough to bound a build side; exact accounting would have to reach into the
-/// allocator.
+/// A column's heap: typed store plus validity bitmap, close enough to bound a build side.
 fn columnBytes(c: *const column.Column) usize {
     const payload: usize = switch (c.data) {
         .b => |s| s.len,
@@ -3594,21 +3238,13 @@ fn columnBytes(c: *const column.Column) usize {
     return payload + c.validity.bits.len;
 }
 
-// ponytail: a cap, no spill. If a capped run ever needs the data anyway, the
-// upgrade is partitioning the build side and spilling cold partitions to disk.
-/// Default ceiling on a materialized join build side (fully resident — that is
-/// what makes probing O(1)). Without one a mis-written CTE takes the process
-/// down instead of reporting. Per-join override: `WITH (max_build = '16GB')`
-/// on the join clause. A `var` so tests can lower it; nothing else writes it.
 pub var join_build_byte_cap: usize = 4 << 30;
 
-/// How key columns compare for one key position. Deciding once per batch keeps
-/// the per-row comparison a direct typed load instead of two boxed `Value`s.
 pub const KeyClass = enum { i64s, bytes, boxed };
 
+/// How a key position compares. Same kind required: `int` and `timestamp` share the
+/// i64 store but are never equal.
 fn classOf(a: column.Column, b: column.Column) KeyClass {
-    // Same logical kind is required: `int` and `timestamp` share the i64 store
-    // but are never equal, and `valueEq` (the boxed path) says so.
     if (a.ty.kind != b.ty.kind) return .boxed;
     return switch (a.data) {
         .i64 => if (std.meta.activeTag(b.data) == .i64) .i64s else .boxed,
@@ -3625,16 +3261,12 @@ fn cellEq(cls: KeyClass, a: *const column.Column, ar: usize, b: *const column.Co
     };
 }
 
-/// Composite key hash for one row. Folds the same way `keyhash.MultiKeyCtx`
-/// does (Wyhash, type tag + payload per value, in key order), so the build and
-/// probe sides agree.
+/// Composite key hash for one row, folded from the typed store exactly as
+/// `keyhash.MultiKeyCtx` folds boxed values, so build and probe sides agree.
 fn hashRowKeys(cols: []const column.Column, keys: []const usize, classes: []const KeyClass, row: usize) u64 {
     var h = std.hash.Wyhash.init(0);
     for (keys, classes) |k, cls| {
         const c = &cols[k];
-        // The classed cases fold the cell straight from the typed store through
-        // the same helpers `hashValue` uses, so no `Value` is boxed per key and
-        // the hash is the one the boxed path would have produced.
         switch (cls) {
             .i64s => switch (c.ty.kind) {
                 .int => keyhash.hashInt(&h, c.data.i64[row]),
@@ -3649,7 +3281,6 @@ fn hashRowKeys(cols: []const column.Column, keys: []const usize, classes: []cons
     return h.final();
 }
 
-/// SQL: a null key joins to nothing, on either side.
 fn anyNullKey(cols: []const column.Column, keys: []const usize, row: usize) bool {
     for (keys) |k| {
         if (!cols[k].validity.get(row)) return true;
@@ -3657,37 +3288,17 @@ fn anyNullKey(cols: []const column.Column, keys: []const usize, row: usize) bool
     return false;
 }
 
-/// The build side of a hash join: the rows, materialized columnar, plus a flat
-/// chained index over them.
-///
-/// Layout — three arrays, no per-key allocation and no boxed key stored:
-///   * `heads[slot]`  bucket → build row + 1 (0 = empty). Linear probing, and a
-///     slot is claimed by one *distinct* key.
-///   * `next[row]`    build row → the next build row carrying the same key + 1
-///     (0 ends the chain). Duplicate keys are a chain, not a heap list.
-///   * `hashes[row]`  that row's key hash, so a bucket collision costs one u64
-///     compare rather than a column-wise key comparison.
-/// `heads` is sized from the build row count (which bounds the distinct keys)
-/// and never grows, so probing needs no synchronisation.
-///
-/// After `create` the whole structure is read-only: several probe lanes may
-/// share one index. Anything a probe has to *write* (outer-join match tracking)
-/// lives on the `Join`, not here.
 pub const JoinIndex = struct {
     build_batch: Batch,
     keys: []const usize,
-    /// All three are const: they are filled through the local slices `create`
-    /// allocates and never written again, which is what makes a shared probe safe.
     heads: []const u32,
     next: []const u32,
     hashes: []const u64,
     mask: u64,
-    /// A build row had a NULL key — which empties a `NOT IN`.
     has_null_key: bool = false,
 
-    /// Runs `build` to completion, materializes it columnar, and indexes
-    /// `right_keys`. `state` must outlive every probe (plan arena); `pull` is
-    /// the transient arena the build child is drained with.
+    /// Drain `build`, materialize it and index `right_keys`. Rows are inserted in
+    /// reverse so prepending leaves duplicate chains in build order.
     pub fn create(
         state: std.mem.Allocator,
         pull: std.mem.Allocator,
@@ -3699,7 +3310,6 @@ pub const JoinIndex = struct {
         var bytes: usize = 0;
         const batch = try materializeFull(state, pull, build, right_schema, &bytes, cap);
         const n = batch.len;
-        // Rows are addressed as `row + 1` in u32 slots.
         if (n >= std.math.maxInt(u32)) return error.JoinBuildTooLarge;
 
         const self = try state.create(JoinIndex);
@@ -3711,7 +3321,6 @@ pub const JoinIndex = struct {
             .hashes = &.{},
             .mask = 0,
         };
-        // A cross join has no keys and is never looked up.
         if (right_keys.len == 0) return self;
 
         var cap_slots: usize = 16;
@@ -3732,9 +3341,6 @@ pub const JoinIndex = struct {
         for (right_keys, classes) |k, *c| c.* = classOf(batch.columns[k], batch.columns[k]);
 
         @memset(chain, 0);
-        // Insert in reverse row order: prepending then yields chains in build
-        // order, so duplicate-key fan-out preserves the build side's row order
-        // (the pre-rewrite behavior scripts may rely on).
         var ri: usize = n;
         while (ri > 0) {
             ri -= 1;
@@ -3750,9 +3356,6 @@ pub const JoinIndex = struct {
                 const hr: usize = heads[slot] - 1;
                 if (hashes[hr] == h and self.rowsEq(classes, hr, r)) break;
             }
-            // Either an empty slot (a key seen for the first time) or the slot
-            // this key already owns; both prepend, so a chain only ever holds
-            // rows with equal keys.
             chain[r] = heads[slot];
             heads[slot] = @intCast(r + 1);
         }
@@ -3778,22 +3381,18 @@ pub const JoinIndex = struct {
         return true;
     }
 
-    /// First build row whose keys equal probe row `row`'s, or null. Walk the
-    /// rest with `chainNext`. Read-only, so concurrent probes are safe.
-    /// `classes` comes from `classesFor` and is positional with `probe_keys`.
+    /// First build row whose keys equal probe row `row`'s, or null; walk the rest with
+    /// `chainNext`. `classes` comes from `classesFor`.
     pub fn find(self: *const JoinIndex, probe: Batch, probe_keys: []const usize, classes: []const KeyClass, row: usize) ?usize {
         if (self.keys.len == 0 or self.build_batch.len == 0) return null;
         if (anyNullKey(probe.columns, probe_keys, row)) return null;
         return self.findHashed(probe, probe_keys, classes, row, hashRowKeys(probe.columns, probe_keys, classes, row));
     }
 
-    /// Touch the bucket `h` lands in, so a probe a few rows later finds it in
-    /// cache. At a build side past L2 the bucket read is the probe's cost.
     pub fn prefetch(self: *const JoinIndex, h: u64) void {
         @prefetch(&self.heads[h & self.mask], .{ .rw = .read, .locality = 3 });
     }
 
-    /// `find` for a row whose keys are known non-null and already hashed.
     pub fn findHashed(self: *const JoinIndex, probe: Batch, probe_keys: []const usize, classes: []const KeyClass, row: usize, h: u64) ?usize {
         var slot = h & self.mask;
         while (self.heads[slot] != 0) : (slot = (slot + 1) & self.mask) {
@@ -3803,13 +3402,11 @@ pub const JoinIndex = struct {
         return null;
     }
 
-    /// Next build row carrying the same key, or null at the end of the chain.
     pub fn chainNext(self: *const JoinIndex, row: usize) ?usize {
         const nx = self.next[row];
         return if (nx == 0) null else nx - 1;
     }
 
-    /// How each key position compares for this probe batch. Once per batch.
     pub fn classesFor(self: *const JoinIndex, arena: std.mem.Allocator, probe: Batch, probe_keys: []const usize) ![]KeyClass {
         const classes = try arena.alloc(KeyClass, probe_keys.len);
         for (self.keys, probe_keys, classes) |bk, pk, *c|
@@ -3818,21 +3415,10 @@ pub const JoinIndex = struct {
     }
 };
 
-/// Hash join. The build (right) side is drained into a `JoinIndex`; the probe
-/// (left) side then streams through it. Supports inner / left / semi / anti /
-/// right / full / cross.
-///
-/// Serial plans set `build` and the index is created on the first `next`;
-/// parallel plans create it up front and hand the same one to every lane
-/// through `index`. The index and its batch live across pulls, so they MUST NOT
-/// go into the per-pull batch arena (the driver resets it before every `next`):
-/// they are allocated in `state`, the plan arena.
 pub const Join = struct {
     stats: Stats = .{},
     probe: Op,
-    /// Serial path: the build pipeline, indexed lazily on first `next`.
     build: ?Op,
-    /// Parallel path: an index built once and shared across lanes.
     index: ?*JoinIndex = null,
     left_keys: []const usize,
     right_keys: []const usize,
@@ -3840,21 +3426,15 @@ pub const Join = struct {
     right_schema: *const types.Schema,
     out_schema: *const types.Schema,
     kind: ast.JoinKind,
-    /// `NOT IN` semantics on an anti join; see `ast.Join.null_aware`.
     null_aware: bool = false,
     state: std.mem.Allocator,
     err: ?*ErrCtx = null,
-    /// Per-join build-side byte cap (`WITH (max_build = '8GB')`); null = the
-    /// process default `join_build_byte_cap`.
     build_cap: ?usize = null,
 
-    /// right/full: build rows some probe row matched. Lives here rather than in
-    /// `JoinIndex` precisely because it is written on the probe path.
     matched: ?[]bool = null,
     drain_pos: usize = 0,
     probe_done: bool = false,
 
-    /// Rows per drain batch, so a large unmatched build side arrives in pieces.
     const drain_chunk = 4096;
 
     pub fn next(self: *Join, arena: std.mem.Allocator) anyerror!?Batch {
@@ -3888,8 +3468,8 @@ pub const Join = struct {
         return ix;
     }
 
-    /// One probe batch → one output batch. Row pairs are collected as index
-    /// lists first, then every output column is filled by a single gather.
+    /// One probe batch to one output batch, gathered from index lists. Under NOT IN a
+    /// null on either side against a non-empty build is unknown and drops the row.
     fn joinBatch(self: *Join, arena: std.mem.Allocator, ix: *JoinIndex, lb: Batch) anyerror!Batch {
         var lidx = std.array_list.Managed(usize).init(arena);
         var ridx = std.array_list.Managed(usize).init(arena);
@@ -3908,16 +3488,11 @@ pub const Join = struct {
             return self.gatherOut(arena, ix, lb, lidx.items, ridx.items, &.{}, lidx.items.len);
         }
 
-        // Only left/full fill a missing right side; for the others an unmatched
-        // probe row either vanishes or carries no right columns at all.
         const fill_right = (self.kind == .left or self.kind == .full);
         const classes = try ix.classesFor(arena, lb, self.left_keys);
         try ridx.ensureTotalCapacity(lb.len);
         if (fill_right) try rnull.ensureTotalCapacity(lb.len);
 
-        // Hash the whole batch first, then probe it a few rows behind a bucket
-        // prefetch, the way the aggregate does: the bucket miss overlaps the
-        // rows before it instead of stalling each one.
         const empty = ix.keys.len == 0 or ix.build_batch.len == 0;
         const hs = try arena.alloc(u64, lb.len);
         const nulls = try arena.alloc(bool, lb.len);
@@ -3936,8 +3511,6 @@ pub const Join = struct {
                     if (first != null) try lidx.append(r);
                 },
                 .anti => {
-                    // NOT IN: against a non-empty subquery a NULL on either side is
-                    // unknown, and unknown filters the row out.
                     if (self.null_aware and !empty and (ix.has_null_key or nulls[r])) continue;
                     if (first == null) try lidx.append(r);
                 },
@@ -3964,9 +3537,8 @@ pub const Join = struct {
         return self.gatherOut(arena, ix, lb, lidx.items, ridx.items, rnull.items, lidx.items.len);
     }
 
-    /// right/full: once the probe stream ends, every build row nothing matched
-    /// is emitted with the left columns null. Chunked so a large build side does
-    /// not become one enormous batch.
+    /// right/full: after the probe ends, every unmatched build row with the left
+    /// columns null, in chunks.
     fn drain(self: *Join, arena: std.mem.Allocator, ix: *JoinIndex) anyerror!?Batch {
         if (self.kind != .right and self.kind != .full) return null;
         var ridx = std.array_list.Managed(usize).init(arena);
@@ -3978,9 +3550,8 @@ pub const Join = struct {
         return try self.gatherOut(arena, ix, null, &.{}, ridx.items, &.{}, ridx.items.len);
     }
 
-    /// Assemble `n` output rows from the index lists: one gather per column,
-    /// never a per-cell boxed append. `lb == null` marks the outer drain, where
-    /// the whole left side is null.
+    /// Assemble `n` output rows with one gather per column. `lb == null` marks the
+    /// outer drain, where the whole left side is null.
     fn gatherOut(
         self: *Join,
         arena: std.mem.Allocator,
@@ -4013,11 +3584,8 @@ pub const Join = struct {
     }
 };
 
-/// Gather rows `idx` out of `c`, then null out the positions flagged in
-/// `null_mask` (the outer-join fill, which gathers a placeholder row and then
-/// discards it via validity). `permute` covers every physical store, so there
-/// is no per-kind fallback; only a source with no rows at all has to be built
-/// as an all-null column instead.
+/// Gather rows `idx` of `c`, then null out the `null_mask` positions (the outer-join
+/// fill). Only a source with no rows is built as an all-null column instead.
 fn takeCol(arena: std.mem.Allocator, c: column.Column, idx: []const usize, null_mask: []const bool) !column.Column {
     if (c.len == 0) return nullColumn(arena, c.ty, idx.len);
     var out = try column.permute(arena, c, idx);
@@ -4030,7 +3598,6 @@ fn takeCol(arena: std.mem.Allocator, c: column.Column, idx: []const usize, null_
     return out;
 }
 
-/// An all-null column of `n` rows.
 fn nullColumn(arena: std.mem.Allocator, ty: types.Type, n: usize) !column.Column {
     var b = try column.Builder.initCapacity(arena, ty.asNullable(), n);
     var i: usize = 0;
@@ -4040,9 +3607,6 @@ fn nullColumn(arena: std.mem.Allocator, ty: types.Type, n: usize) !column.Column
 
 const testing = std.testing;
 
-/// Test-only in-memory source handing out prebuilt batches. The batches live in
-/// the test arena (outliving any pull arena), so operators that deep-copy for
-/// cross-pull survival are still exercised safely.
 const TestSource = struct {
     schema_: types.Schema,
     batches: []const Batch,
@@ -4066,14 +3630,12 @@ const TestSource = struct {
     }
 };
 
-/// One nullable-int column batch.
 fn intBatch(a: std.mem.Allocator, schema: *const types.Schema, vals: []const ?i64) !Batch {
     const cols = try a.alloc(column.Column, 1);
     cols[0] = try column.intColumn(a, vals);
     return Batch{ .schema = schema, .columns = cols, .len = vals.len };
 }
 
-/// One nullable-string column batch.
 fn strBatch(a: std.mem.Allocator, schema: *const types.Schema, vals: []const ?[]const u8) !Batch {
     var bd = column.Builder.init(a, types.Type.init(.string).asNullable());
     for (vals) |v| try bd.append(if (v) |s| Value{ .string = s } else .null);
@@ -4082,7 +3644,6 @@ fn strBatch(a: std.mem.Allocator, schema: *const types.Schema, vals: []const ?[]
     return Batch{ .schema = schema, .columns = cols, .len = vals.len };
 }
 
-/// Two-column (nullable int, nullable string) batch; slices must be equal length.
 fn kvBatch(a: std.mem.Allocator, schema: *const types.Schema, ints: []const ?i64, strs: []const ?[]const u8) !Batch {
     const cols = try a.alloc(column.Column, 2);
     cols[0] = try column.intColumn(a, ints);
@@ -4092,7 +3653,6 @@ fn kvBatch(a: std.mem.Allocator, schema: *const types.Schema, ints: []const ?i64
     return Batch{ .schema = schema, .columns = cols, .len = ints.len };
 }
 
-/// Drain `top` and collect column 0 as optional ints.
 fn drainInts(a: std.mem.Allocator, top: Op) ![]const ?i64 {
     var got = std.array_list.Managed(?i64).init(a);
     while (try top.next(a)) |b| {
@@ -4146,8 +3706,6 @@ test "filter keeps only known-true rows: null predicate drops the row (3VL)" {
 }
 
 test "filter scratch is backed by the plan arena, so it dies with the plan" {
-    // Nothing destroys a Filter; a page-allocator scratch would outlive the
-    // plan arena and orphan its pages, one arena per filter stage per plan.
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -4222,16 +3780,13 @@ test "project passes columns through and computes expressions with null propagat
 }
 
 test "distinct reports the input ordinal of every surviving row" {
-    // The parallel drivers dedup per chunk and merge; without an ordinal the
-    // merge cannot tell which duplicate came first and the non-key columns of
-    // the emitted row change from run to run.
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
 
     const batches = [_]Batch{
-        try intBatch(a, &int_schema, &.{ 7, 7, 4 }), // ordinals 0,1,2 → keep 0, 2
-        try intBatch(a, &int_schema, &.{ 4, 7, 9 }), // ordinals 3,4,5 → keep 5
+        try intBatch(a, &int_schema, &.{ 7, 7, 4 }),
+        try intBatch(a, &int_schema, &.{ 4, 7, 9 }),
     };
     var ts = TestSource{ .schema_ = int_schema, .batches = &batches };
     var scan = Scan{ .src = ts.src() };
@@ -4427,7 +3982,6 @@ test "aggregate: variance folded in two halves and merged matches one fold, and 
         const agg = A.Agg{ .func = func, .arg = &fx, .ty = types.Type.init(.float).asNullable() };
         var whole = A.Acc{};
         for (xs) |x| try A.updateAcc(testing.allocator, &whole, agg, .{ .float = x }, true);
-        // Every split point, including the empty halves `mergeMoments` must skip or adopt.
         for (0..xs.len + 1) |cut| {
             var lo = A.Acc{};
             var hi = A.Acc{};
@@ -4437,7 +3991,6 @@ test "aggregate: variance folded in two halves and merged matches one fold, and 
             try testing.expectApproxEqAbs((try A.finalizeAcc(whole, agg)).float, (try A.finalizeAcc(lo, agg)).float, 1e-9);
         }
     }
-    // 2, 4, 4, 4, 5, 5, 7, 9: population variance 4, sample 32/7.
     const pop = A.Agg{ .func = .var_pop, .arg = &fx, .ty = types.Type.init(.float).asNullable() };
     const samp = A.Agg{ .func = .var_samp, .arg = &fx, .ty = types.Type.init(.float).asNullable() };
     var p = A.Acc{};
@@ -4446,11 +3999,8 @@ test "aggregate: variance folded in two halves and merged matches one fold, and 
         try A.updateAcc(testing.allocator, &p, pop, .{ .float = x + 1e9 }, true);
         try A.updateAcc(testing.allocator, &q, samp, .{ .int = @intFromFloat(x) }, true);
     }
-    // Shifted by 1e9 the squares are ~1e18, where a sum of squares minus the
-    // squared sum is off by thousands; Welford stays within float noise.
     try testing.expectApproxEqAbs(@as(f64, 4), (try A.finalizeAcc(p, pop)).float, 1e-6);
     try testing.expectApproxEqAbs(@as(f64, 32.0 / 7.0), (try A.finalizeAcc(q, samp)).float, 1e-12);
-    // One value: no sample variance, a population variance of exactly 0.
     var one = A.Acc{};
     try A.updateAcc(testing.allocator, &one, samp, .{ .float = 3 }, true);
     try testing.expect((try A.finalizeAcc(one, samp)) == .null);
@@ -4479,17 +4029,13 @@ test "aggregate: a decimal sum normalizes each value's own scale" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    // A bare postgres `numeric` has no typmod, so the column is typed
-    // decimal(38,6) while each value arrives at whatever dscale it was stored
-    // with. Summing the raw unscaled integers scaled the answer by
-    // 10^(declared - actual); every addend has to be normalized first.
     const col_ty = types.Type.decimal(38, 6).asNullable();
     const in_schema = types.Schema{ .fields = &.{.{ .name = "n", .ty = col_ty }} };
 
     var bld = column.Builder.init(a, col_ty);
-    try bld.append(.{ .decimal = .{ .unscaled = 15, .scale = 1 } }); // 1.5
-    try bld.append(.{ .decimal = .{ .unscaled = 150, .scale = 2 } }); // 1.50
-    try bld.append(.{ .decimal = .{ .unscaled = 1, .scale = 3 } }); // 0.001
+    try bld.append(.{ .decimal = .{ .unscaled = 15, .scale = 1 } });
+    try bld.append(.{ .decimal = .{ .unscaled = 150, .scale = 2 } });
+    try bld.append(.{ .decimal = .{ .unscaled = 1, .scale = 3 } });
     try bld.append(.null);
     const cols = try a.alloc(column.Column, 1);
     cols[0] = try bld.finish();
@@ -4504,7 +4050,6 @@ test "aggregate: a decimal sum normalizes each value's own scale" {
     var agg = Aggregate{ .child = .{ .scan = &scan }, .in_schema = &in_schema, .by = &.{}, .aggs = &aggs, .out_schema = &out_schema, .state = a, .gpa = testing.allocator };
     const out = (try agg.next(a)).?;
     const d = out.columns[0].getValue(0).decimal;
-    // 1.5 + 1.50 + 0.001 = 3.001, carried at the output scale.
     try testing.expectEqual(@as(u8, 6), d.scale);
     try testing.expectEqual(@as(i128, 3_001_000), d.unscaled);
 }
@@ -4602,8 +4147,6 @@ const join_both_schema = types.Schema{ .fields = &.{
     .{ .name = "rv", .ty = types.Type.init(.string).asNullable() },
 } };
 
-/// Drain a join into (column 0 as ?i64, column `rvc` as ?string) pairs. `rvc`
-/// of null collects only the key column (semi/anti, which emit no right side).
 const JoinRows = struct {
     keys: std.array_list.Managed(?i64),
     rvs: std.array_list.Managed(?[]const u8),
@@ -4667,7 +4210,6 @@ test "join: inner/left/semi/anti; null keys never match, duplicate build keys fa
             .kind = case.kind,
             .state = a,
         };
-        // Reverse-order insertion keeps duplicate chains in build order.
         const got = try JoinRows.collect(a, .{ .join = &jn }, if (emit_right) @as(?usize, 3) else null);
         try got.expect(case.keys, case.rvs);
     }
@@ -4678,9 +4220,6 @@ test "join: a null-aware anti join is NOT IN — a NULL on either side is unknow
     defer ar.deinit();
     const a = ar.allocator();
 
-    // A plain anti join is NOT EXISTS and kept `2, null, 3` against a build side
-    // holding a NULL; `NOT IN` must keep nothing there, and drop a NULL probe key
-    // unless the subquery is empty.
     const Case = struct { build: []const ?i64, keys: []const ?i64 };
     const cases = [_]Case{
         .{ .build = &.{ 1, 4, null }, .keys = &.{} },
@@ -4737,8 +4276,6 @@ test "join: right and full drain unmatched build rows with a null left side" {
             .state = a,
         };
         const got = try JoinRows.collect(a, .{ .join = &jn }, 3);
-        // The drain carries build rows 4 and null (nothing matched them), with
-        // the left key column null. `full` additionally keeps left rows 2/null.
         if (kind == .right) {
             try got.expect(&.{ 1, null, null }, &.{ "x", "z", "m" });
         } else {
@@ -4769,7 +4306,6 @@ test "join: multi-key ON (int + string) pairs only fully equal keys" {
         .kind = .inner,
         .state = a,
     };
-    // Only (1,"a") matches, and it matches both build rows carrying that key.
     const got = try JoinRows.collect(a, .{ .join = &jn }, 3);
     try got.expect(&.{ 1, 1 }, &.{ "a", "a" });
 }
@@ -4899,18 +4435,12 @@ test "linearize decomposes map-only pipelines source-to-sink; breakers refuse" {
 }
 
 test "integer SUM: exact across batches, an error only when the total leaves i64" {
-    // Was `+%`: three of these summed to exactly 2^64-1, which wrapped to `-1`
-    // and was reported as the answer. The i64 column path is the one parquet and
-    // database int columns take, so this was a live silent-wrong-answer.
     const big: i64 = 6148914691236517205;
     const agg = Aggregate.Agg{ .func = .sum, .arg = null, .ty = types.Type.init(.int) };
     try testing.expectError(error.IntOverflow, Aggregate.finalizeAcc(.{ .n = 3, .sum_i = sumIntCol(&[_]i64{ big, big, big }) }, agg));
     try testing.expectError(error.IntOverflow, Aggregate.finalizeAcc(.{ .n = 2, .sum_i = sumIntCol(&[_]i64{ std.math.minInt(i64), -1 }) }, agg));
     try testing.expectEqual(@as(i128, 6), sumIntCol(&[_]i64{ 1, 2, 3 }));
 
-    // A running total may leave i64 on the way to one that fits. Checked per
-    // batch or per lane merge, the answer depended on where the rows were split:
-    // 5 at -j 1, an overflow error at -j 8.
     const max = std.math.maxInt(i64);
     var acc = Aggregate.Acc{ .n = 5 };
     for ([_][]const i64{ &.{ max, max }, &.{ -max, -max }, &.{5} }) |part| acc.sum_i += sumIntCol(part);
@@ -4924,8 +4454,6 @@ test "sortIdx: the radix words order rows exactly as the comparator does" {
     var prng = std.Random.DefaultPrng.init(0xba5a17);
     const rnd = prng.random();
 
-    // Short strings (exact words) and long ones sharing a 24-byte prefix (ties the
-    // comparator settles), NaN and -0.0, decimals of mixed scale, and nulls in all.
     const long_base = "a-long-prefix-shared-by-many-";
     for (0..60) |round| {
         const n = 1 + rnd.uintLessThan(usize, 400);
@@ -4987,8 +4515,6 @@ test "top_n: equal keys rank by input position, also when a lane reads items out
         .{ .name = "x", .ty = types.Type.init(.int).asNullable() },
         .{ .name = "s", .ty = types.Type.init(.string).asNullable() },
     } };
-    // item 5 arrives before item 2, every key equal: item 2's rows come first
-    // in the input, so they are the ones a stable sort keeps
     const Src = struct {
         batches: []const Batch,
         items: []const usize,

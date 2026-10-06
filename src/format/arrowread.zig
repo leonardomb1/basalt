@@ -4,29 +4,43 @@
 //! they come. A file (Feather v2: `ARROW1` magic, messages, footer) is read
 //! through its footer, which holds the schema and the offset of every block —
 //! writers do not agree on what sits between the magic and the first batch, and
-//! polars puts its dictionaries after the batches that use them.
+//! polars puts its dictionaries after the batches that use them, so a file's
+//! dictionaries are all loaded up front and kept for the reader's life.
 //!
 //! The file is memory-mapped and each record batch is copied out of the mapping
 //! into the batch arena, decompressing LZ4-frame or ZSTD bodies as they are
 //! met. The copy is the whole cost for the common columns — a fixed-width or
 //! `utf8` buffer is already the engine's own layout — which is the point of the
 //! format: handing a dataframe to basalt as IPC is close to a memcpy, where
-//! Parquet is an encode and a decode.
+//! Parquet is an encode and a decode. A record batch is decompressed and checked
+//! once, then handed out in windows of `window_rows` (a multiple of eight, so
+//! validity bits copy as bytes): a writer that puts a whole frame in one batch
+//! (polars does) would otherwise be converted and held whole. Field names are
+//! duped, since the file is unmapped on close and a schema can outlive its reader.
+//!
+//! The file is untrusted. `flatbuf.Table` trusts its input (it only reads what
+//! this program wrote), so `Fb` checks every offset before following it, and a bad
+//! one is `CorruptArrow`, not a trap. A compressed buffer's declared length may be
+//! at most 1024 times its frame (plus 1 MiB), so a hostile length cannot become a
+//! huge allocation before a byte is decoded.
 //!
 //! Types map as the engine can hold them: every integer width to `int` (a
 //! UInt64 above 2^63-1 is an error, never a wrap), floats to `float`, the
 //! three string layouts (`utf8`, `large_utf8`, `utf8_view`) to `string` and the
 //! binary ones to `bytes`, `decimal128` to `decimal`, dates, times and
 //! timestamps in any unit to basalt's day / microsecond types (a zoned
-//! timestamp reads as its UTC wall-clock, as Parquet's does), dictionary
-//! encodings to their values, and the nested types — lists, structs, maps — to
-//! JSON text, so `json_get` and `UNNEST(JSON_EACH(...))` reach inside them. A
-//! null-typed column is an all-null `string`. Unions, run-end and list-view encodings are refused
-//! by name.
+//! timestamp reads as its UTC wall-clock, as Parquet's does), a duration to its
+//! count of microseconds as an `int` (the engine has no interval type),
+//! dictionary encodings to their values, and the nested types — lists, structs,
+//! maps — to JSON text, so `json_get` and `UNNEST(JSON_EACH(...))` reach inside
+//! them. Every column is nullable: the bitmap is the truth. A null-typed column is
+//! an all-null `string`. Unions, run-end and list-view encodings are refused by
+//! name in `Reader.why`.
 //!
-//! Only the first stream of a file is read: a `basalt run --format arrow`
-//! capture of several results holds several, and which one a query meant is not
-//! something to guess.
+//! A projection is a hint, as for parquet: an unknown name is ignored, and one
+//! that names none of the columns still reads rows. Only the first stream of a
+//! file is read: a `basalt run --format arrow` capture of several results holds
+//! several, and which one a query meant is not something to guess.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -38,13 +52,9 @@ const driver = @import("../connect/driver.zig");
 const codec = @import("codec.zig");
 
 pub const Error = error{
-    /// No `ARROW1` magic and no stream continuation marker at the start.
     NotArrow,
-    /// A length, offset or table that points outside the file or its body.
     CorruptArrow,
-    /// A type or feature the reader names in `Reader.why` rather than guesses at.
     UnsupportedArrow,
-    /// A UInt64 value too large for the engine's signed 64-bit int.
     ArrowIntOverflow,
 } || codec.Error || std.mem.Allocator.Error;
 
@@ -56,12 +66,6 @@ pub fn isPath(path: []const u8) bool {
     }
     return false;
 }
-
-// --- flatbuffers, bounds-checked -------------------------------------------
-//
-// `flatbuf.Table` trusts its input — it only ever reads what this program just
-// wrote. A file from elsewhere can say anything, so every offset here is checked
-// before it is followed, and a bad one is `CorruptArrow`, not a trap.
 
 const Fb = struct {
     buf: []const u8,
@@ -117,7 +121,6 @@ const Fb = struct {
 
     const Vec = struct { len: usize, at: usize };
 
-    /// A vector of `elem`-byte entries, checked to fit.
     fn vector(self: Fb, slot: usize, elem: usize) Error!?Vec {
         const t = (try self.target(slot)) orelse return null;
         const n = try rd(u32, self.buf, t);
@@ -132,8 +135,6 @@ const Fb = struct {
         return .{ .buf = self.buf, .pos = t };
     }
 };
-
-// --- schema ------------------------------------------------------------------
 
 const Kind = enum {
     null_,
@@ -160,13 +161,11 @@ const Kind = enum {
     map,
 };
 
-/// A field of the Arrow schema, reduced to what decoding needs.
 const Field = struct {
     name: []const u8,
     kind: Kind,
     bit_width: u16 = 0,
     signed: bool = true,
-    /// Temporal unit as a divisor/multiplier into micros; floats: 16, 32 or 64.
     unit: Unit = .us,
     precision: u8 = 0,
     scale: u8 = 0,
@@ -176,7 +175,6 @@ const Field = struct {
 
     const Dict = struct { id: i64, index_bits: u16, index_signed: bool };
 
-    /// The engine type a top-level column of this field reads as.
     fn basaltType(self: Field) types.Type {
         const t: types.Type = switch (self.kind) {
             .int, .duration => types.Type.init(.int),
@@ -190,7 +188,6 @@ const Field = struct {
             .binary, .large_binary, .binary_view, .fixed_binary => types.Type.init(.bytes),
             .null_, .list, .large_list, .fixed_list, .struct_, .map => types.Type.init(.string),
         };
-        // the bitmap is the truth; every column may hold nulls
         return t.asNullable();
     }
 };
@@ -221,7 +218,6 @@ const Unit = enum {
     }
 };
 
-/// Arrow `Type` union tags.
 const TypeTag = enum(u8) {
     null_ = 1,
     int = 2,
@@ -253,7 +249,6 @@ const TypeTag = enum(u8) {
 };
 
 fn parseField(arena: std.mem.Allocator, f: Fb, why: *[]const u8) Error!Field {
-    // duped: the file is unmapped on close, and a schema can outlive its reader
     var out = Field{ .name = try arena.dupe(u8, (try f.string(0)) orelse ""), .kind = .null_ };
     const tag: TypeTag = @enumFromInt(try f.int(u8, 2, 0));
     const t = try f.table(3);
@@ -296,7 +291,6 @@ fn parseField(arena: std.mem.Allocator, f: Fb, why: *[]const u8) Error!Field {
             out.scale = @intCast(scale);
         },
         .date => {
-            // DateUnit defaults to MILLISECOND
             const u = if (t) |tt| try tt.int(i16, 0, 1) else 1;
             out.kind = if (u == 0) .date_day else .date_ms;
         },
@@ -313,8 +307,6 @@ fn parseField(arena: std.mem.Allocator, f: Fb, why: *[]const u8) Error!Field {
             out.unit = try Unit.of(try tt.int(i16, 0, 0));
         },
         .duration => {
-            // no interval type in the engine: a duration reads as its count of
-            // microseconds, an ordinary int
             out.kind = .duration;
             out.unit = if (t) |tt| try Unit.of(try tt.int(i16, 0, 1)) else .ms;
         },
@@ -382,21 +374,15 @@ fn tagName(t: TypeTag) []const u8 {
     };
 }
 
-// --- arrays --------------------------------------------------------------------
-
-/// A buffer as the record batch describes it: bytes of the body, possibly
-/// compressed. Decompressed on first use, never before.
 const Buf = struct {
     raw: []const u8,
     compressed: bool,
 };
 
-/// One array of a record batch, its buffers still in body form.
 const Arr = struct {
     len: usize,
     null_count: usize,
     bufs: []Buf,
-    /// Only for the view layouts: their data buffers, in order.
     variadic: []Buf = &.{},
     children: []Arr = &.{},
 };
@@ -438,7 +424,6 @@ const Walk = struct {
         const n = try self.node();
         var a = Arr{ .len = n.len, .null_count = n.nulls, .bufs = &.{} };
         if (f.dict != null) {
-            // the array holds indices; the values are in a dictionary batch
             a.bufs = try self.take(2);
             return a;
         }
@@ -483,9 +468,8 @@ const Walk = struct {
 
 const Codec = enum { lz4_frame, zstd };
 
-/// A buffer's bytes, decompressed if the batch was. Each compressed buffer is an
-/// i64 uncompressed length, then the codec's frame — or, when the length is -1,
-/// the bytes as they are (a writer may skip compressing what does not shrink).
+/// A buffer's bytes, decompressed if the batch was: an i64 uncompressed length,
+/// then the codec's frame, or the bytes as they are when the length is -1.
 fn bytesOf(arena: std.mem.Allocator, b: Buf, c: ?Codec) Error![]const u8 {
     if (!b.compressed or b.raw.len == 0) return b.raw;
     if (b.raw.len < 8) return Error.CorruptArrow;
@@ -493,7 +477,6 @@ fn bytesOf(arena: std.mem.Allocator, b: Buf, c: ?Codec) Error![]const u8 {
     const rest = b.raw[8..];
     if (ulen == -1) return rest;
     if (ulen < 0) return Error.CorruptArrow;
-    // a hostile length must not become a huge allocation before a byte is decoded
     if (ulen > @as(i64, @intCast(rest.len)) * 1024 + (1 << 20)) return Error.CorruptArrow;
     const out = try arena.alloc(u8, @intCast(ulen));
     switch (c.?) {
@@ -503,47 +486,32 @@ fn bytesOf(arena: std.mem.Allocator, b: Buf, c: ?Codec) Error![]const u8 {
     return out;
 }
 
-// --- reader ----------------------------------------------------------------------
-
 pub const Reader = struct {
     arena: std.mem.Allocator,
-    /// The mapping to release on close; empty for a reader over borrowed bytes.
     map: []align(std.heap.page_size_min) const u8,
-    /// The IPC bytes: the mapping, or the borrowed buffer.
     data: []const u8 = &.{},
-    /// Where the message sequence ends: the footer of a file, the end of a stream.
     end: usize,
     pos: usize,
-    /// A file's record batches, from its footer; null for a stream.
     blocks: ?[]const Block = null,
     block_i: usize = 0,
     fields: []Field,
-    /// Indices into `fields` of the columns read, in output order.
     keep: []usize,
     schema: types.Schema,
-    /// Decoded dictionaries by id, as engine columns of their value type, kept
-    /// for as long as the reader: later batches index into them.
     dicts: std.AutoHashMap(i64, column.Column),
-    /// Why an `UnsupportedArrow` was returned, naming the column.
     why: []const u8 = "",
     done: bool = false,
-    /// The record batch being handed out, decompressed and checked once, then
-    /// cut into windows of `window_rows`: a writer that puts a whole frame in
-    /// one batch (polars does) would otherwise be converted — and held — whole.
     rb_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
     cursors: []*Cursor = &.{},
     rb_rows: usize = 0,
     rb_off: usize = 0,
 
-    /// A multiple of eight, so every window's validity starts on a byte.
     const window_rows = 64 * 1024;
 
     pub fn open(arena: std.mem.Allocator, path: []const u8) !*Reader {
         return openProjected(arena, path, null);
     }
 
-    /// `open`, converting only the named columns. An unknown name is ignored,
-    /// as the parquet reader ignores one: the planner's set is a hint.
+    /// `open`, converting only the named columns.
     pub fn openProjected(arena: std.mem.Allocator, path: []const u8, want: ?[]const []const u8) !*Reader {
         if (std.mem.indexOf(u8, path, "://") != null) return Error.UnsupportedArrow;
         const file = try std.fs.cwd().openFile(path, .{});
@@ -607,7 +575,7 @@ pub const Reader = struct {
             self.pos = 0;
             self.end = data.len;
             const first = (try self.nextMessage()) orelse return Error.CorruptArrow;
-            if (first.header != 1) return Error.CorruptArrow; // a schema comes first
+            if (first.header != 1) return Error.CorruptArrow;
             sch = first.table;
         } else return Error.NotArrow;
 
@@ -630,14 +598,12 @@ pub const Reader = struct {
             }
             try keep.append(i);
         }
-        // a projection that names none of the columns still reads rows
         if (keep.items.len == 0 and self.fields.len > 0) try keep.append(0);
         self.keep = try keep.toOwnedSlice();
         const out = try self.arena.alloc(types.Schema.Field, self.keep.len);
         for (out, self.keep) |*o, i| o.* = .{ .name = self.fields[i].name, .ty = self.fields[i].basaltType() };
         self.schema = .{ .fields = out };
 
-        // A file's dictionaries may sit anywhere; every batch may need them.
         for (dict_blocks) |b| {
             const m = try self.messageAt(b);
             if (m.header != 2) return Error.CorruptArrow;
@@ -645,8 +611,6 @@ pub const Reader = struct {
         }
     }
 
-    /// A footer `Block`: where a message starts, the length of its framed
-    /// metadata, and the length of its body.
     const Block = struct { offset: usize, meta_len: usize, body_len: usize };
 
     fn blocksOf(arena: std.mem.Allocator, footer: Fb, slot: usize, limit: usize) Error![]const Block {
@@ -666,7 +630,6 @@ pub const Reader = struct {
         return out;
     }
 
-    /// The message a footer block points at.
     fn messageAt(self: *Reader, b: Block) Error!Message {
         const data = self.data;
         var at = b.offset;
@@ -690,7 +653,6 @@ pub const Reader = struct {
 
     const Message = struct { header: u8, table: Fb, body: []const u8, meta: []const u8 };
 
-    /// The next message, or null at the end-of-stream marker or the footer.
     fn nextMessage(self: *Reader) Error!?Message {
         const data = self.data;
         if (self.pos + 4 > self.end) return null;
@@ -728,8 +690,8 @@ pub const Reader = struct {
         return .{ .schema = &self.schema, .columns = cols, .len = n };
     }
 
-    /// Move to the next record batch; false at the end. An empty one — a
-    /// writer's trailer, say — is loaded like any other and yields no window.
+    /// Move to the next record batch; false at the end. A second schema ends the
+    /// stream; an empty batch (a writer's trailer) loads like any other and yields no window.
     fn loadBatch(self: *Reader) !bool {
         if (self.blocks) |blocks| {
             if (self.block_i >= blocks.len) return false;
@@ -750,7 +712,6 @@ pub const Reader = struct {
                     try self.openBatch(m.table, m.body, m.meta);
                     return true;
                 },
-                // a second schema would start another stream; this one is over
                 1 => self.done = true,
                 else => {},
             }
@@ -766,7 +727,7 @@ pub const Reader = struct {
                 1 => .zstd,
                 else => return Error.CorruptArrow,
             };
-            if ((try comp.int(i8, 1, 0)) != 0) return Error.CorruptArrow; // only BUFFER
+            if ((try comp.int(i8, 1, 0)) != 0) return Error.CorruptArrow;
         }
         return .{
             .arena = arena,
@@ -779,7 +740,6 @@ pub const Reader = struct {
         };
     }
 
-    /// Decompress and check a record batch's kept columns, ready to window.
     fn openBatch(self: *Reader, rb: Fb, body: []const u8, meta: []const u8) !void {
         _ = self.rb_arena.reset(.retain_capacity);
         const a = self.rb_arena.allocator();
@@ -804,13 +764,12 @@ pub const Reader = struct {
             return Error.UnsupportedArrow;
         }
         const rb = (try m.table.table(1)) orelse return Error.CorruptArrow;
-        // the dictionary's values: the field that uses it, minus its encoding
         var vf: ?Field = null;
         for (self.fields) |f| if (findDict(f, id)) |d| {
             vf = d;
             break;
         };
-        var f = vf orelse return; // a dictionary no column uses
+        var f = vf orelse return;
         f.dict = null;
         var w = try walker(self.arena, rb, m.body, m.meta);
         const a = try w.array(f);
@@ -834,10 +793,7 @@ pub const Reader = struct {
         return .{ .ptr = self, .vtable = &source_vtable };
     }
 
-    // --- conversion ---------------------------------------------------------
-
-    /// Rows `off .. off + n` of a checked array as an engine column. `off` is a
-    /// multiple of eight, so the validity bits copy as bytes.
+    /// Rows `off .. off + n` of a checked array as an engine column; `off` is a multiple of eight.
     fn toColumn(arena: std.mem.Allocator, cur: *const Cursor, off: usize, n: usize) !column.Column {
         const f = cur.f;
         const ty = f.basaltType();
@@ -860,15 +816,12 @@ pub const Reader = struct {
                 .float => .{ .f64 = try copyAs(f64, arena, cur.data[off * 8 ..], n) },
                 .date_day => .{ .i32 = try copyAs(i32, arena, cur.data[off * 4 ..], n) },
                 .utf8, .binary => blk: {
-                    // rebased onto this window's own values
                     const offs = try copyAs(i32, arena, cur.offs32[off * 4 ..], n + 1);
                     const base = offs[0];
                     for (offs) |*o| o.* -= base;
                     const lo: usize = @intCast(base);
                     break :blk .{ .bytes = .{ .offsets = offs, .values = try arena.dupe(u8, cur.data[lo..][0..@intCast(offs[n])]) } };
                 },
-                // the other layouts gather into the engine's: sized in one pass,
-                // filled in a second, with no per-row allocation
                 .utf8_view, .binary_view, .large_utf8, .large_binary => blk: {
                     var total: usize = 0;
                     for (off..off + n) |i| total += (try cur.slice(i)).len;
@@ -894,12 +847,10 @@ pub const Reader = struct {
         return b.finish();
     }
 
-    /// Random access to the rows of an array of any supported layout, as values.
     fn cursor(self: *Reader, arena: std.mem.Allocator, f: Field, a: Arr, c: ?Codec) Error!*Cursor {
         const cur = try arena.create(Cursor);
         cur.* = .{ .f = f, .a = a, .reader = self };
         if (a.bufs.len > 0) cur.bits = try bytesOf(arena, a.bufs[0], c);
-        // a Null-typed array has no buffers at all; every row is null by type
         if (f.kind != .null_ and a.null_count > 0 and cur.bits.len < (a.len + 7) / 8) return Error.CorruptArrow;
         if (f.dict) |d| {
             cur.data = try bytesOf(arena, a.bufs[1], c);
@@ -1006,11 +957,9 @@ const Cursor = struct {
         return .{ .lo = @intCast(lo), .hi = @intCast(hi) };
     }
 
-    /// Row `i` of a string or binary array of any layout; a null row's bytes
-    /// are whatever the writer left and are masked by the bitmap.
+    /// A null row's bytes are whatever the writer left (a view may hold garbage), so they read as empty.
     fn slice(self: *const Cursor, i: usize) Error![]const u8 {
         if (self.views.len > 0 or self.f.kind == .utf8_view or self.f.kind == .binary_view) {
-            // a null view may hold garbage; it contributes nothing
             if (self.isNull(i)) return &.{};
             return self.viewAt(i);
         }
@@ -1032,7 +981,6 @@ const Cursor = struct {
         return b[@intCast(off)..][0..len];
     }
 
-    /// Row `i` as an engine value of the column's type; nested rows as JSON text.
     fn value(self: *const Cursor, arena: std.mem.Allocator, i: usize) anyerror!Value {
         if (self.isNull(i)) return .null;
         const f = self.f;
@@ -1077,8 +1025,8 @@ const Cursor = struct {
         };
     }
 
-    /// Row `i` as JSON. Numbers and booleans are bare, text and temporal values
-    /// quoted as their SQL text, decimals as their exact digits.
+    /// Row `i` as JSON. Numbers and booleans are bare, text and temporal values quoted
+    /// as their SQL text, decimals as exact digits, a map as an object keyed by key text.
     fn json(self: *const Cursor, arena: std.mem.Allocator, i: usize, w: *std.Io.Writer) anyerror!void {
         if (self.isNull(i)) return w.writeAll("null");
         switch (self.f.kind) {
@@ -1111,8 +1059,6 @@ const Cursor = struct {
                 try w.writeByte('}');
             },
             .map => {
-                // entries are a struct of (key, value): an object keyed by the
-                // key's text, which is what a JSON consumer expects of a map
                 const s = try self.span(i);
                 const entries = self.kids[0];
                 if (entries.kids.len != 2) return Error.CorruptArrow;
@@ -1164,10 +1110,6 @@ fn srcClose(p: *anyopaque) void {
     @as(*Reader, @ptrCast(@alignCast(p))).close();
 }
 
-// --- tests ---------------------------------------------------------------------
-
-/// Every row as `col=value` pairs, one line per row, for comparing with what the
-/// writer was given. Nulls print as `null`.
 fn dump(a: std.mem.Allocator, bytes: []const u8, want: ?[]const []const u8) ![]const u8 {
     const r = try Reader.openBytes(a, bytes, want);
     defer r.close();
@@ -1196,10 +1138,7 @@ test "polars files read the same whether strings are views or large strings" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // the default layout: utf8_view strings, a view-valued categorical, and the
-    // dictionary written after the batch that uses it
     try std.testing.expectEqualStrings(polars_want, try dump(a, @embedFile("testdata/polars.arrow"), null));
-    // CompatLevel.oldest(): large_utf8 throughout
     try std.testing.expectEqualStrings(polars_want, try dump(a, @embedFile("testdata/polars_compat.arrow"), null));
 }
 
@@ -1215,10 +1154,8 @@ test "pyarrow files: LZ4 and ZSTD bodies, a chunked stream, every unit and neste
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // `bin` holds bytes no text comparison should carry; the projection leaves it out
     try std.testing.expectEqualStrings(pyarrow_want, try dump(a, @embedFile("testdata/pyarrow_lz4.feather"), &pyarrow_cols));
     try std.testing.expectEqualStrings(pyarrow_want, try dump(a, @embedFile("testdata/pyarrow_zstd.feather"), &pyarrow_cols));
-    // the stream format, two rows per batch
     try std.testing.expectEqualStrings(pyarrow_want, try dump(a, @embedFile("testdata/pyarrow_stream.arrows"), &pyarrow_cols));
 }
 
@@ -1264,8 +1201,6 @@ test "not arrow, and every truncation of a real file, is an error rather than a 
         const full = @embedFile(name);
         var n: usize = 8;
         while (n < full.len) : (n += 7) {
-            // a prefix may be a readable stream that simply ends early; what it
-            // must never do is read outside the bytes it was given
             _ = dump(a, full[0..n], null) catch continue;
         }
     }

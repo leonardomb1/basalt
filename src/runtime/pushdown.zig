@@ -1,24 +1,44 @@
-//! Predicate + projection pushdown for split-parallel SQL aggregates.
+//! Predicate, projection, aggregate and top-N pushdown into SQL sources.
 //!
-//! A `read <sqltable> | (filter)* | aggregate … by …` over a splittable source reads
-//! one key range per lane (see `connect/split.zig`). Without pushdown each lane does
-//! `SELECT * FROM (base) WHERE <key range>` and ships every column of every row across
-//! the wire, only to drop most of it in the engine. This module narrows each lane's
-//! query to what the aggregate actually consumes:
+//! A split-parallel `read <sqltable> | (filter)* | aggregate … by …` reads one key
+//! range per lane (see `connect/split.zig`). Without pushdown each lane runs
+//! `SELECT * FROM (base) WHERE <key range>` and ships every column of every row.
+//! `planAgg` and `planMap` narrow each lane's query to the source columns that are
+//! actually consumed and translate the leading filters into a WHERE AND-ed onto
+//! the key range. `serialWhere` does the same for a serial pipeline (§7 implicit
+//! pushdown).
 //!
-//!   - **projection** — `SELECT` only the source columns the group keys, the aggregate
-//!     arguments, and the surviving filters reference (an ERP fact table is often 20+
-//!     columns; an aggregate touches 2–3).
-//!   - **predicate** — translate the prefix `filter`s into a SQL `WHERE` AND-ed onto the
-//!     key range, so the server filters rows before they're sent.
+//! Correctness rests on two things: basalt's filter is 3-valued exactly like SQL
+//! (only a known-true keeps the row, see `op.applyFilter`), so comparisons and
+//! and/or/not/is-null map 1:1; and the engine keeps its filter ops, so an advisory
+//! pushed predicate only has to be a superset. `Need` states what a rendering must
+//! guarantee: `superset` where the engine re-applies the filter, `exact` where the
+//! source's answer is taken as is, `subset` for what sits under a NOT. Anything
+//! unprovable is not pushed, which can cost speed but never changes an answer.
 //!
-//! Correctness rests on two things: basalt's filter is 3-valued *exactly* like SQL
-//! ("only a known-true keeps the row; a null result drops it" — see `op.applyFilter`),
-//! so eq/ne/comparisons/and/or/not/is-null map 1:1; and the caller KEEPS the filter
-//! ops, so a pushed predicate only has to be a superset (never drop a kept row) — which
-//! holds, since untranslatable parts are simply not pushed. Anything ambiguous (a
-//! `select` in the prefix, a non-source field, arithmetic, a function call) disables
-//! the relevant half and the lane falls back to the safe `SELECT * … WHERE <key range>`.
+//! Text is where dialects diverge. `ColFacts` records what the catalog says of a
+//! column: byte-order collation, trailing-space padding (every SQL Server string,
+//! PAD SPACE on mysql, `char(n)` on postgres), and wide characters whose byte
+//! length is not their character count. Literals must be printable ASCII: a
+//! non-ASCII byte sorts above ASCII in every encoding and binary collation, a
+//! control character sorts below the pad space, and SQL Server reads a literal
+//! without `N` in the column's code page. TRY_CAST never descends (no portable
+//! null-on-failure cast), nor does a text-to-number cast of input not provably
+//! numeric: sources disagree on `CAST('1000,00' AS DECIMAL)` (NULL on mysql, an
+//! error on postgres and here). Builtins in `pushable` must also be engine builtins.
+//!
+//! `planWholeAgg` is the exception to advisory pushdown: the source's GROUP BY
+//! result is what the pipeline emits, so every gate must prove the rendering
+//! identical on postgres, mysql and sqlserver, and each aggregate is CAST to the
+//! engine's planned output type. Null semantics match by construction: NULL keys
+//! form one group, COUNT(col)/SUM/MIN/MAX skip nulls, and an ungrouped aggregate
+//! over no rows yields one row. A top-N (`TopN`) is never authoritative: the
+//! engine re-sorts and re-limits, so the source need only send a sufficient set,
+//! which holds when every earlier filter runs at the source and the keys order
+//! alike, nulls last.
+//!
+//! The test schema arrays are file-scope on purpose: as function locals,
+//! `&.{…}` pointed at a stack temporary that dangled in release builds.
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
@@ -27,16 +47,9 @@ const split = @import("../connect/split.zig");
 const Dialect = @import("../db/sql.zig").Dialect;
 const builtins = @import("../exec/builtins.zig");
 
-/// The result of planning pushdown for one aggregate pipeline. Empty fields mean
-/// "don't push that half" — the lane query then uses `*` / the bare key range.
 pub const Plan = struct {
-    /// Comma-joined, dialect-quoted column list, or null for `SELECT *`.
     proj_select: ?[]const u8 = null,
-    /// Schema matching `proj_select` column order, or null when not projecting. The
-    /// aggregate's input schema becomes this, so its column indices line up with the
-    /// narrowed result set.
     proj_schema: ?types.Schema = null,
-    /// AND-combined translated filter predicates, or null when none were pushable.
     where_extra: ?[]const u8 = null,
 };
 
@@ -45,15 +58,12 @@ fn inSchema(schema: types.Schema, name: []const u8) bool {
     return false;
 }
 
-/// Plan projection + predicate pushdown for `read … | prefix | aggregate ag`. `prefix`
-/// is the map-only stages between read and aggregate (filter/select only, per the
-/// caller's classifier). A `select` in the prefix disables projection (its renames make
-/// source-column attribution ambiguous); filters are still translated for the WHERE.
+/// Projection and predicate pushdown for `read … | prefix | aggregate ag`. A
+/// `select` in the prefix disables projection (renames blur attribution); filters still go.
 pub fn planAgg(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, prefix: []const ast.Stage, ag: ast.Aggregate) !Plan {
     return planAggWith(arena, dialect, src_schema, prefix, ag, null);
 }
 
-/// `planAgg` with the source's catalog facts, which decide text comparisons.
 pub fn planAggWith(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, prefix: []const ast.Stage, ag: ast.Aggregate, facts: ?*const Facts) !Plan {
     var plan = Plan{};
 
@@ -83,42 +93,13 @@ pub fn planAggWith(arena: std.mem.Allocator, dialect: Dialect, src_schema: types
     return plan;
 }
 
-/// A whole aggregate descended into ONE source query. Unlike `Plan`/`MapPlan` this is
-/// AUTHORITATIVE: the source's GROUP BY result is what the pipeline emits, so there is
-/// no engine-side re-aggregation to correct a rendering that isn't exactly equivalent.
 pub const WholeAgg = struct {
-    /// The complete grouped statement, ready for `sql.Source.open`.
     sql: []const u8,
-    /// The AND-ed translated prefix filters, or null when the prefix was empty.
     where_sql: ?[]const u8 = null,
 };
 
-/// Render `read <base> | filter* | aggregate ag` as a single grouped query, or null to
-/// leave the aggregate engine-side. `plan_schema` is what the engine's `aggregatePlan`
-/// decided the output is — group keys first, then one field per `ag.aggs` entry — and
-/// every aggregate is wrapped in a CAST to the dialect spelling of *that* type, so the
-/// source cannot hand back a wider/narrower result than the plan promises.
-///
-/// Null (fall back to scanning + aggregating here) on anything not provably identical
-/// on postgres, mysql/StarRocks and sqlserver alike:
-///   - a non-`filter` stage in the prefix, or a filter `translateExpr` won't take;
-///   - a group key that isn't a bare source column, or whose type doesn't pass through;
-///   - `AVG` (int-avg diverges: engine float vs mysql decimal vs sqlserver int division);
-///   - `SUM` of anything but an int column into an int result — a decimal sum can
-///     overflow the CAST target the engine would have carried in an i64, and postgres
-///     `SUM(real)` accumulates in float4 where the engine uses f64;
-///   - `MIN`/`MAX` outside int/float/decimal/date — string extremes follow the source's
-///     COLLATION (case-insensitive by default on mysql and sqlserver) while the engine
-///     compares bytes, and a timestamp CAST can shift under a session timezone;
-///   - `DISTINCT` on anything but `COUNT` (the engine's `updateAcc` only honours it there);
-///   - a planned output type `Dialect.castType` has no cast target for.
-///
-/// Null handling matches by construction and is verified on the engine side: NULL group
-/// keys collapse into one group (`op.Aggregate.drainFixed`'s null mask / `keyhash.valueEq`),
-/// `COUNT(col)`/`SUM`/`MIN`/`MAX` skip nulls (`op.Aggregate.updateAcc`), and an ungrouped
-/// aggregate over zero rows still emits one row of COUNT 0 / NULL extremes
-/// (`op.Aggregate.drainImpl`'s `by.len == 0` branch always returns one group) — which is
-/// exactly what all three dialects return for an ungrouped aggregate over no rows.
+/// The aggregate as one grouped source query, or null to keep it engine-side.
+/// Refuses AVG, non-int SUM, MIN/MAX over text or timestamps, and non-COUNT DISTINCT.
 pub fn planWholeAgg(
     arena: std.mem.Allocator,
     dialect: Dialect,
@@ -132,8 +113,7 @@ pub fn planWholeAgg(
     return planWholeAggWhy(arena, dialect, base_sql, src_schema, prefix, ag, plan_schema, null, &why);
 }
 
-/// `planWholeAgg` that also says, in one line for the run log, which gate refused —
-/// the answer to "why did this COUNT stream the whole table?".
+/// `planWholeAgg` that also says which gate refused, in one line for the run log.
 pub fn planWholeAggWhy(
     arena: std.mem.Allocator,
     dialect: Dialect,
@@ -148,21 +128,15 @@ pub fn planWholeAggWhy(
     if (ag.by.len == 0 and ag.aggs.len == 0) return refuse(why, "nothing to aggregate");
     if (plan_schema.fields.len != ag.by.len + ag.aggs.len) return refuse(why, "the planned output does not match the aggregate");
 
-    // Gate 2: EVERY prefix stage is a filter, and every one translates whole. A
-    // partially pushed predicate would be a superset — fine for advisory pushdown,
-    // wrong here, because nothing re-applies the missing half.
     var where = std.array_list.Managed(u8).init(arena);
     for (prefix) |st| {
         if (st.node != .filter) return refuse(why, "a stage other than WHERE sits between the read and the aggregate");
-        // nothing re-applies it over the grouped rows: the source must keep exactly
-        // the engine's rows, which on text depends on the column's collation
         const frag = (try translatePred(arena, st.node.filter, dialect, .{ .schema = src_schema, .check_fields = true, .facts = facts, .need = .exact })) orelse
             return refuse(why, try std.fmt.allocPrint(arena, "the WHERE predicate does not translate exactly to {s} SQL (a text comparison the column's collation decides differently, or an untranslatable piece)", .{@tagName(dialect)}));
         if (where.items.len > 0) try where.appendSlice(" AND ");
         try where.appendSlice(frag);
     }
 
-    // Gate 3: bare source columns only, carried through with their own type.
     var sel = std.array_list.Managed(u8).init(arena);
     var keys = std.array_list.Managed(u8).init(arena);
     for (ag.by, 0..) |q, i| {
@@ -180,8 +154,6 @@ pub fn planWholeAggWhy(
         try sel.appendSlice(try std.fmt.allocPrint(arena, "{s} AS {s}", .{ qc, qc }));
     }
 
-    // Gates 4 + 5: an allowed aggregate over a bare column, CAST to the engine's own
-    // planned output type, and aliased to the engine's own column name.
     for (ag.aggs, 0..) |item, i| {
         const out = plan_schema.fields[ag.by.len + i];
         const inner = (try aggExpr(arena, dialect, src_schema, item, out.ty)) orelse
@@ -194,9 +166,6 @@ pub fn planWholeAggWhy(
         }));
     }
 
-    // `base_sql` is the read's own statement, raw `PUSHDOWN(...)` predicate included, so
-    // wrapping it as a subquery composes with whatever it already filters — the shape
-    // `sqlWithWhere` and `split.zig` both use for a QUERY-form read.
     var q = std.array_list.Managed(u8).init(arena);
     try q.appendSlice(try std.fmt.allocPrint(arena, "SELECT {s} FROM ({s}) _g", .{ sel.items, base_sql }));
     if (where.items.len > 0) try q.appendSlice(try std.fmt.allocPrint(arena, " WHERE {s}", .{where.items}));
@@ -211,12 +180,9 @@ fn refuse(why: *[]const u8, reason: []const u8) ?WholeAgg {
     return null;
 }
 
-/// One aggregate's SQL (before the outer result-type CAST), or null when it isn't
-/// provably the engine's own answer. See `planWholeAgg`'s doc comment for the why of
-/// each exclusion.
+/// One aggregate's SQL before the outer CAST. SQL Server takes COUNT_BIG and a
+/// bigint SUM addend, as its 32-bit COUNT and int SUM raise on overflow.
 fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, item: ast.AggItem, out_ty: types.Type) !?[]const u8 {
-    // T-SQL's COUNT accumulates in a 32-bit int and RAISES past 2^31 rows, where
-    // postgres/mysql already return a 64-bit count; COUNT_BIG is the matching spelling.
     const count_fn: []const u8 = if (dialect == .sqlserver) "COUNT_BIG" else "COUNT";
 
     if (item.func == .count and item.arg == null) {
@@ -239,9 +205,6 @@ fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema,
         .sum => {
             if (item.distinct) return null;
             if (src_kind != .int or out_ty.kind != .int) return null;
-            // sqlserver sums `int` in `int` and raises on overflow; widening the
-            // ADDEND (not the result) makes it accumulate in bigint like the engine.
-            // postgres (int4→int8, int8→numeric) and mysql (→decimal) already do.
             if (dialect != .sqlserver) return try std.fmt.allocPrint(arena, "SUM({s})", .{col});
             return try std.fmt.allocPrint(arena, "SUM(CAST({s} AS BIGINT))", .{col});
         },
@@ -250,8 +213,6 @@ fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema,
             if (out_ty.kind != src_kind) return null;
             switch (src_kind) {
                 .int, .float, .date => {},
-                // A `DECIMAL(0,0)` cast target is not valid SQL anywhere; an
-                // unresolved precision means fall back rather than guess one.
                 .decimal => if (out_ty.precision == 0 or out_ty.scale > out_ty.precision) return null,
                 else => return null,
             }
@@ -261,33 +222,19 @@ fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema,
     }
 }
 
-/// The result of map-only pushdown planning (`read … | (filter|select|…) | write`).
 pub const MapPlan = struct {
     proj_select: ?[]const u8 = null,
     proj_schema: ?types.Schema = null,
     where_extra: ?[]const u8 = null,
-    /// The middle stages with dead `select` items removed, so the rebuilt chain doesn't
-    /// reference a projected-away column. Set only alongside `proj_schema`; the caller
-    /// rebuilds from these instead of the originals. Null → projection not applied.
     stages: ?[]const ast.Stage = null,
 };
 
-/// Plan pushdown for a map-only split read. `out_cols` is the pipeline's final output
-/// column set (what the sink receives). Only the FILTERS before the first non-filter stage
-/// are source-attributable (a later filter sees a select's renamed output), so only those
-/// become a WHERE. Projection is computed by a backward liveness pass: start from the
-/// output columns, and walk the stages in reverse — a `select` maps each live output back
-/// to the source columns its item reads, a `filter` adds its predicate's columns. What
-/// survives to the source is the minimal column set to fetch. This traces a union branch's
-/// `select(reconcile) | … | select id, recno` all the way back, so only the columns that
-/// reach the sink cross the wire. A `*`/`* rename`/explode stage makes liveness imprecise,
-/// so projection is dropped (the caller keeps the full `SELECT *` chain). The caller
-/// rebuilds its stage chain against `proj_schema` so the narrower indices line up.
+/// Pushdown for a map-only split read. Only filters before the first non-filter
+/// stage become a WHERE; projection is a backward liveness pass from `out_cols`.
 pub fn planMap(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, middle: []const ast.Stage, out_cols: []const []const u8) !MapPlan {
     return planMapWith(arena, dialect, src_schema, middle, out_cols, null);
 }
 
-/// `planMap` with the source's catalog facts, which decide text comparisons.
 pub fn planMapWith(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, middle: []const ast.Stage, out_cols: []const []const u8, facts: ?*const Facts) !MapPlan {
     var plan = MapPlan{};
 
@@ -355,9 +302,8 @@ pub fn planMapWith(arena: std.mem.Allocator, dialect: Dialect, src_schema: types
 
 const Projection = struct { sel: ?[]const u8 = null, schema: ?types.Schema = null };
 
-/// Build a `SELECT` list + matching schema for the source columns in `need`, in
-/// source-schema order (deterministic, and the order the engine expects). Null when it
-/// wouldn't drop anything (all or no columns) — the caller then scans `SELECT *`.
+/// A `SELECT` list and schema for the columns in `need`, in source order; null
+/// when it would drop nothing (all or no columns).
 fn buildProjection(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, need: *std.StringHashMap(void)) !Projection {
     var sel = std.array_list.Managed(u8).init(arena);
     var fields = std.array_list.Managed(types.Schema.Field).init(arena);
@@ -372,12 +318,6 @@ fn buildProjection(arena: std.mem.Allocator, dialect: Dialect, src_schema: types
     return .{};
 }
 
-/// How the rows a translated predicate keeps at the source relate to the rows the
-/// engine keeps evaluating the same predicate. `superset`: every row the engine
-/// keeps, perhaps more — enough where the engine re-applies the filter to what
-/// arrives. `exact`: the same rows — needed where the source's answer is taken as
-/// it is (an aggregate or a top-N descended whole). `subset`: only rows the engine
-/// keeps — what a predicate under NOT must be for the NOT to be a superset.
 pub const Need = enum {
     superset,
     subset,
@@ -392,46 +332,32 @@ pub const Need = enum {
     }
 };
 
-/// What a source's catalog says of one column, for how a text comparison on it
-/// behaves there (see `connect.columnFacts`).
 pub const ColFacts = struct {
     text: bool,
-    /// Compares by byte (code point): a binary collation, `C` on postgres, or
-    /// StarRocks, which has no collations.
     byte_order: bool = false,
-    /// Ignores trailing spaces when comparing: every SQL Server string, a PAD
-    /// SPACE collation on mysql, a `char(n)` on postgres.
     pads: bool = true,
-    /// Two or more bytes a character (`nvarchar`, a utf16 charset): its byte
-    /// length is not its character count, even for ASCII.
     wide: bool = false,
 };
 
 pub const Facts = std.StringHashMap(ColFacts);
 
 pub const Opts = struct {
-    /// The source's schema, when known; with `check_fields`, only its columns are
-    /// translated.
     schema: types.Schema = .{ .fields = &.{} },
     check_fields: bool = false,
     facts: ?*const Facts = null,
     need: Need = .superset,
-    /// Set when a comparison stayed engine-side, or went in a looser form, only
-    /// because a column's collation was not known — asking the catalog could
-    /// change the answer.
     wants_facts: ?*bool = null,
 };
 
 /// A predicate as SQL for `dialect` that keeps the rows `opts.need` asks for, or
-/// null when no rendering is sure to. Pushing is always optional: null keeps the
-/// work in the engine and never changes an answer.
+/// null when no rendering is sure to.
 pub fn translatePred(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dialect, opts: Opts) error{OutOfMemory}!?[]const u8 {
     const tx = Tx{ .arena = arena, .dialect = dialect, .o = opts };
     return tx.pred(e, opts.need);
 }
 
-/// Whether knowing the source columns' collations could change how any filter in
-/// `stages` descends at `need` — asked before paying a catalog round trip.
+/// Whether knowing the columns' collations could change how any filter in
+/// `stages` descends at `need`, asked before paying a catalog round trip.
 pub fn wantsFacts(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage, schema: types.Schema, check_fields: bool, need: Need) !bool {
     var w = false;
     for (stages) |st| {
@@ -442,8 +368,8 @@ pub fn wantsFacts(arena: std.mem.Allocator, dialect: Dialect, stages: []const as
     return false;
 }
 
-/// `translatePred` for a filter the engine re-applies (`need = superset`), with no
-/// catalog facts: what EXPLAIN and the unit tests use.
+/// `translatePred` at `need = superset` with no catalog facts, as EXPLAIN and the
+/// tests use.
 pub fn translateExpr(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dialect, schema: types.Schema, check_fields: bool) error{OutOfMemory}!?[]const u8 {
     return translatePred(arena, e, dialect, .{ .schema = schema, .check_fields = check_fields });
 }
@@ -452,28 +378,21 @@ fn numericKind(k: types.TypeKind) bool {
     return k == .int or k == .float or k == .decimal;
 }
 
-/// Whether this operand is certainly a number already, so casting it means the
-/// same thing in the engine and at the source. A literal is; a column is only when
-/// the schema is at hand and says so. Everything else is unprovable, including
-/// every column of a SQL table before anyone has read its schema.
+/// Whether the operand is certainly a number already: a literal, or a column the
+/// schema at hand says is numeric. A nested numeric cast is checked on its own.
 fn provablyNumeric(e: *const ast.Expr, schema: types.Schema) bool {
     return switch (e.*) {
         .int_lit, .float_lit => true,
-        // a decimal PARAM or LET's text (`env.mkLit`): strictly a number
         .str_lit => |s| plainNumber(s),
         .field => |q| blk: {
             if (schema.fields.len == 0) break :blk false;
             const idx = schema.indexOf(q.last()) orelse break :blk false;
             break :blk numericKind(schema.fields[idx].ty.kind);
         },
-        // A nested cast to a numeric type is itself checked by this same rule when
-        // it is translated, so trusting it here would sidestep the check.
         else => false,
     };
 }
 
-/// An optional `-`, digits, and at most one `.` between digits: text every
-/// source and the engine read as the same number.
 fn plainNumber(s: []const u8) bool {
     var i: usize = 0;
     if (i < s.len and s[i] == '-') i += 1;
@@ -490,22 +409,11 @@ fn plainNumber(s: []const u8) bool {
     return digits > 0;
 }
 
-/// Printable ASCII only. The order argument for a text range rests on it (at
-/// the first byte two strings differ, a non-ASCII byte sorts above an ASCII one
-/// in every encoding and every binary collation alike), a control character
-/// would sort below the pad space SQL Server compares with, and SQL Server needs
-/// it for another reason: a literal without `N` is read in the column's code
-/// page, where a character outside it becomes `?`.
 fn asciiPrintable(s: []const u8) bool {
     for (s) |c| if (c < 0x20 or c > 0x7e) return false;
     return true;
 }
 
-/// Text-valued builtins whose result, compared equal to a printable-ASCII
-/// literal, the source finds wherever the engine does: the engine's result can
-/// only be that literal when the input is ASCII too, where every dialect
-/// computes the same. (`substr` only from position 1, `replace` only under a
-/// byte-order collation — see `textFnFacts`.)
 const text_fns = [_][]const u8{ "lower", "upper", "trim", "substr", "replace", "concat", "coalesce", "left", "right", "repeat", "reverse" };
 
 fn isTextFn(name: []const u8) bool {
@@ -525,8 +433,6 @@ const Tx = struct {
 
     const Err = error{OutOfMemory};
 
-    /// What a comparison operand is. `text` carries the column's facts when the
-    /// catalog gave them; `fn_` marks a builtin's result rather than a column.
     const Kind = union(enum) {
         other,
         unknown,
@@ -571,7 +477,6 @@ const Tx = struct {
         };
     }
 
-    /// The facts of the column a text builtin reads, its first column argument.
     fn textFnFacts(self: Tx, c: ast.Expr.Call) ?ColFacts {
         for (c.args) |a| if (a.* == .field and a.field.parts.len == 1) return self.factsOf(a.field.parts[0]);
         return null;
@@ -583,8 +488,6 @@ const Tx = struct {
                 .@"and", .@"or" => {
                     const l = try self.pred(b.l, need);
                     const r = try self.pred(b.r, need);
-                    // `A` alone keeps every row `A AND B` does: where a superset is
-                    // enough, the half that translates still goes
                     if (b.op == .@"and" and need == .superset) {
                         if (l == null) return r;
                         if (r == null) return l;
@@ -603,7 +506,6 @@ const Tx = struct {
                 const v = (try self.value(n.e)) orelse return null;
                 if (n.kind == .is_null)
                     return try self.fmt("({s} IS {s}NULL)", .{ v, if (n.negated) "NOT " else "" });
-                // EMPTY is null or '': the '' test is a text comparison like any other
                 const blank = (try self.textCompare(.eq, n.e, "", if (n.negated) need.flip() else need)) orelse return null;
                 const t = try self.fmt("({s} IS NULL OR {s})", .{ v, blank });
                 return if (n.negated) try self.fmt("(NOT {s})", .{t}) else t;
@@ -612,7 +514,6 @@ const Tx = struct {
                 if (isLikeFn(c.name)) return self.likePred(c, need);
                 return self.value(e);
             },
-            // a condition decides which branch holds, so it must hold exactly
             .cond => |c| {
                 const cnd = (try self.pred(c.cond, .exact)) orelse return null;
                 const t = (try self.value(c.then)) orelse return null;
@@ -624,6 +525,7 @@ const Tx = struct {
         }
     }
 
+    /// TRY_CAST and text-to-number casts of unprovable input stay engine-side.
     fn value(self: Tx, e: *const ast.Expr) Err!?[]const u8 {
         switch (e.*) {
             .bool_lit => |b| return try self.arena.dupe(u8, if (b) "(1=1)" else "(1=0)"),
@@ -631,10 +533,7 @@ const Tx = struct {
             .float_lit => |v| return try self.fmt("{d}", .{v}),
             .null_lit => return try self.arena.dupe(u8, "NULL"),
             .str_lit => |s| {
-                // SQL Server reads a literal without N in the column's code page,
-                // and N'' would turn a varchar column's index seek into a scan
                 if (self.dialect == .sqlserver and !asciiPrintable(s)) return null;
-                // a backslash is an escape inside a mysql string literal
                 if (self.dialect.mysqlWire() and std.mem.indexOfScalar(u8, s, '\\') != null) return null;
                 return try sqlStr(self.arena, s);
             },
@@ -644,15 +543,7 @@ const Tx = struct {
                 return try split.quoteIdent(self.arena, self.dialect, q.parts[0]);
             },
             .cast => |c| {
-                // TRY_CAST is engine-only: the dialects' support for a null-on-failure cast is
-                // uneven (no portable spelling on mysql/starrocks), and a plain CAST would raise
-                // on the rows TRY_CAST is there to turn into nulls. Never push it.
                 if (c.safe) return null;
-                // Nor a text-to-number cast: the sources do not agree with each other on
-                // what a string that is not a number means (`CAST('1000,00' AS DECIMAL)`
-                // is NULL in StarRocks and MySQL, an error in Postgres and in basalt), so
-                // pushing it made the answer depend on whether the predicate descended.
-                // Provably numeric input still descends; unknown means "cannot prove".
                 if (numericKind(c.ty.kind) and !provablyNumeric(c.e, self.o.schema)) return null;
                 const inner = (try self.value(c.e)) orelse return null;
                 const ty = (try self.dialect.castType(self.arena, c.ty)) orelse return null;
@@ -666,23 +557,21 @@ const Tx = struct {
                 return try self.fmt("(CASE WHEN {s} THEN {s} ELSE {s} END)", .{ cnd, t, f });
             },
             .match => |m| return self.match(m),
-            // a boolean used as a value must be exactly the engine's
             .unary, .binary, .is_null => return self.pred(e, .exact),
             else => return null,
         }
     }
 
+    /// `substr` descends only from position 1 (a UTF-8 SQL Server varchar counts bytes),
+    /// `replace` only under a byte-order collation (others replace case-insensitively).
     fn call(self: Tx, c: ast.Expr.Call) Err!?[]const u8 {
         if (isLikeFn(c.name)) return self.likePred(c, .exact);
         const p = lookupPushable(c.name) orelse return null;
         if (c.args.len < p.min_args or c.args.len > p.max_args) return null;
         if (std.mem.eql(u8, c.name, "substr")) {
-            // a SQL Server `varchar` under a UTF-8 collation counts bytes: past
-            // a non-ASCII character its start and the engine's differ
             if (c.args[1].* != .int_lit or c.args[1].int_lit != 1) return null;
         }
         if (std.mem.eql(u8, c.name, "replace")) {
-            // a case-insensitive collation replaces case-insensitively
             const f = self.textFnFacts(c) orelse {
                 self.want();
                 return null;
@@ -694,14 +583,12 @@ const Tx = struct {
         return p.render(self.arena, p, c, args, self.dialect);
     }
 
-    /// `CASE x WHEN p …` compares by equality, which is exact only off text;
-    /// the guard form's conditions must hold exactly.
+    /// `CASE x WHEN p …` compares by equality, which is exact only off text; the guard
+    /// form's conditions must hold exactly.
     fn match(self: Tx, m: ast.Match) Err!?[]const u8 {
         var out = std.array_list.Managed(u8).init(self.arena);
         const w = out.writer();
         if (m.subject) |subj| {
-            // numeric patterns make it a numeric comparison even when the subject's
-            // type is not known; a text one compares by collation
             const sk = self.kind(subj);
             if (sk == .text) return null;
             if (sk == .unknown) for (m.arms) |arm| for (arm.pats) |p| switch (p.*) {
@@ -761,6 +648,8 @@ const Tx = struct {
         };
     }
 
+    /// Numbers, dates and times compare alike everywhere. On text, equality only widens
+    /// under a folding collation, and order is shared only by byte-ordered unpadded columns.
     fn compare(self: Tx, op_in: ast.BinOp, l_in: *const ast.Expr, r_in: *const ast.Expr, need: Need) Err!?[]const u8 {
         var l = l_in;
         var r = r_in;
@@ -776,14 +665,10 @@ const Tx = struct {
         const texty = lk == .text or rk == .text;
         const unknown = lk == .unknown or rk == .unknown;
         if (!texty and !(unknown and !isLit(r))) {
-            // numbers, dates and times order and equal alike everywhere
             const ls = (try self.value(l)) orelse return null;
             const rs = (try self.value(r)) orelse return null;
             return try self.fmt("({s} {s} {s})", .{ ls, opSql(op), rs });
         }
-        // two text expressions (or ones not yet known not to be): equality only
-        // widens under a folding collation, inequality only narrows; an order is
-        // the same only where both compare bytes without padding
         const lf: ?ColFacts = if (lk == .text) lk.text.facts else null;
         const rf: ?ColFacts = if (rk == .text) rk.text.facts else null;
         const settled = (op == .eq and need == .superset) or (op == .ne and need == .subset);
@@ -800,12 +685,11 @@ const Tx = struct {
         return try self.fmt("({s} {s} {s})", .{ ls, opSql(op), rs });
     }
 
-    /// `col op 'L'` over text. See `ColFacts` and the padded forms below.
+    /// `col op 'L'` over text. Under padding the shorter side compares as if
+    /// space-filled, so ranges widen to a prefix test.
     fn textCompare(self: Tx, op: ast.BinOp, col: *const ast.Expr, lit: []const u8, need: Need) Err!?[]const u8 {
         const k = self.kind(col);
         if (k == .other) {
-            // a date, number or time column: the literal converts to its type at
-            // the source as it does here
             const cs = (try self.value(col)) orelse return null;
             const ls = (try self.value(&.{ .str_lit = lit })) orelse return null;
             return try self.fmt("({s} {s} {s})", .{ cs, opSql(op), ls });
@@ -813,8 +697,6 @@ const Tx = struct {
         const known: ?ColFacts = if (k == .text) k.text.facts else null;
         const f = known orelse ColFacts{ .text = true };
         const is_fn = k == .text and k.text.fn_;
-        // equality as a superset and inequality as a subset hold under any
-        // collation; everything else is the collation's to decide
         const settled = (op == .eq and need == .superset) or (op == .ne and need == .subset);
         if (known == null and !is_fn and !settled) self.want();
         const cs = (try self.value(col)) orelse return null;
@@ -823,7 +705,6 @@ const Tx = struct {
         const ascii = asciiPrintable(lit);
 
         if (is_fn) {
-            // a builtin's result: equality with a printable ASCII literal only
             if (!ascii) return null;
             return switch (op) {
                 .eq => if (need == .superset) plain else null,
@@ -845,10 +726,6 @@ const Tx = struct {
                 if (!f.byte_order or !ascii) return null;
                 if (!f.pads) return plain;
                 if (need == .superset) {
-                    // padding compares a value and the literal as if the shorter were
-                    // filled with spaces: `>` may equal, and a control character
-                    // after the literal's bytes sorts below the fill — both kept by
-                    // the prefix test. `<` may equal only.
                     if (op == .lt or op == .le) return try self.fmt("({s} <= {s})", .{ cs, ls });
                     const pre = (try self.prefixLike(lit)) orelse return null;
                     return try self.fmt("({s} >= {s} OR {s} LIKE {s})", .{ cs, ls, cs, pre });
@@ -859,16 +736,14 @@ const Tx = struct {
         }
     }
 
-    /// Exact text comparisons under a binary, space-padding collation, where a
-    /// byte length separates `'abc'` from `'abc  '`. Printable ASCII literals with
-    /// no trailing space only; null when the dialect has no byte length for it.
+    /// Exact text comparison under a binary, padding collation, via byte length;
+    /// printable ASCII literals with no trailing space only.
     fn padExact(self: Tx, op: ast.BinOp, cs: []const u8, ls: []const u8, lit: []const u8, f: ColFacts) Err!?[]const u8 {
         if (!f.byte_order or f.wide or !asciiPrintable(lit)) return null;
         if (lit.len > 0 and lit[lit.len - 1] == ' ') return null;
         const len_fn: []const u8 = switch (self.dialect) {
             .sqlserver => "DATALENGTH",
             .mysql, .starrocks, .doris => "LENGTH",
-            // a char(n)'s byte length leaves its padding out
             .postgres => return null,
         };
         const n = lit.len;
@@ -887,7 +762,6 @@ const Tx = struct {
         };
     }
 
-    /// `'lit%'`, the literal's own characters escaped for the dialect's LIKE.
     fn prefixLike(self: Tx, lit: []const u8) Err!?[]const u8 {
         var out = std.array_list.Managed(u8).init(self.arena);
         for (lit) |c| switch (self.dialect) {
@@ -895,7 +769,6 @@ const Tx = struct {
                 '%', '_', '[' => try out.writer().print("[{c}]", .{c}),
                 else => try out.append(c),
             },
-            // backslash is both the LIKE escape and, on mysql, a string escape
             else => switch (c) {
                 '%', '_', '\\' => return null,
                 else => try out.append(c),
@@ -905,10 +778,8 @@ const Tx = struct {
         return try sqlStr(self.arena, out.items);
     }
 
-    /// `like` / `starts_with` / `ends_with` / `contains` against a literal
-    /// pattern. A folding collation and SQL Server's padding only let the source
-    /// match more; the source's `_` is a character where the engine's is a byte,
-    /// SQL Server reads `[` as a class, and mysql `\` as an escape.
+    /// `like`/`starts_with`/`ends_with`/`contains` on a literal pattern. The source's `_`
+    /// is a character, the engine's a byte; SQL Server reads `[` as a class, mysql `\` as an escape.
     fn likePred(self: Tx, c: ast.Expr.Call, need: Need) Err!?[]const u8 {
         if (c.args.len != 2 or c.args[1].* != .str_lit) return null;
         const raw = c.args[1].str_lit;
@@ -944,9 +815,6 @@ const Tx = struct {
     }
 };
 
-/// One pushable builtin: the engine name, the argument counts it is pushed
-/// for, and a renderer. `sql` is the portable spelling used by `render.plain`;
-/// dialect-aware renderers ignore it.
 const Pushable = struct {
     name: []const u8,
     sql: []const u8 = "",
@@ -957,8 +825,6 @@ const Pushable = struct {
 
 const variadic = std.math.maxInt(usize);
 
-/// Every builtin `translateCall` will push. Each name must also be an engine
-/// builtin (`exec/builtins.zig`) — a test below holds the two tables together.
 const pushable = [_]Pushable{
     .{ .name = "lower", .sql = "LOWER", .min_args = 1, .max_args = 1, .render = render.plain },
     .{ .name = "upper", .sql = "UPPER", .min_args = 1, .max_args = 1, .render = render.plain },
@@ -967,15 +833,10 @@ const pushable = [_]Pushable{
     .{ .name = "replace", .sql = "REPLACE", .min_args = 3, .max_args = 3, .render = render.plain },
     .{ .name = "concat", .sql = "CONCAT", .min_args = 2, .max_args = variadic, .render = render.plain },
     .{ .name = "coalesce", .sql = "COALESCE", .min_args = 2, .max_args = variadic, .render = render.plain },
-    // rendered by `Tx.likePred`, which knows each dialect's pattern syntax
     .{ .name = "like", .min_args = 2, .max_args = 2, .render = render.none },
     .{ .name = "starts_with", .min_args = 2, .max_args = 2, .render = render.none },
     .{ .name = "ends_with", .min_args = 2, .max_args = 2, .render = render.none },
     .{ .name = "contains", .min_args = 2, .max_args = 2, .render = render.none },
-    // Builtins spelled and evaluated identically on postgres, mysql/starrocks and
-    // sqlserver. (Domain edges — SQRT of a negative, POWER(0, -n), MOD by zero — raise
-    // on some engines and yield NULL on others; that's a loud query failure rather than
-    // a silently dropped row, and the same input is a degenerate case engine-side too.)
     .{ .name = "abs", .sql = "ABS", .min_args = 1, .max_args = 1, .render = render.plain },
     .{ .name = "floor", .sql = "FLOOR", .min_args = 1, .max_args = 1, .render = render.plain },
     .{ .name = "sqrt", .sql = "SQRT", .min_args = 1, .max_args = 1, .render = render.plain },
@@ -1026,62 +887,44 @@ const render = struct {
         _ = p;
         _ = c;
         const f = switch (dialect) {
-            .sqlserver => "CEILING", // T-SQL has no CEIL
+            .sqlserver => "CEILING",
             else => "CEIL",
         };
         return try std.fmt.allocPrint(arena, "{s}({s})", .{ f, args[0] });
     }
 
+    /// SQL Server has only `%`; both spellings take the dividend's sign everywhere,
+    /// matching the engine.
     fn mod(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
         _ = p;
         _ = c;
-        // sqlserver has no MOD function, only the `%` operator. Both take the sign of
-        // the DIVIDEND (`-7 % 3` = `MOD(-7, 3)` = -1) on all four engines, matching the
-        // engine's own mod — so the two spellings agree on negatives.
         return switch (dialect) {
             .sqlserver => try std.fmt.allocPrint(arena, "({s} % {s})", .{ args[0], args[1] }),
             else => try std.fmt.allocPrint(arena, "MOD({s}, {s})", .{ args[0], args[1] }),
         };
     }
 
+    /// Only a literal count >= 0 is pushed: negative counts diverge across dialects.
     fn counted(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
-        // A negative count diverges: postgres LEFT/RIGHT count back from the far end
-        // while mysql/starrocks return '', and sqlserver REPLICATE returns NULL where
-        // the others return ''. Push only a literal count we can see is >= 0.
         if (c.args[1].* != .int_lit or c.args[1].int_lit < 0) return null;
         const f: []const u8 = if (std.mem.eql(u8, p.name, "left"))
             "LEFT"
         else if (std.mem.eql(u8, p.name, "right"))
             "RIGHT"
         else if (dialect == .sqlserver)
-            "REPLICATE" // T-SQL's spelling of REPEAT
+            "REPLICATE"
         else
             "REPEAT";
         return try std.fmt.allocPrint(arena, "{s}({s}, {s})", .{ f, args[0], args[1] });
     }
 };
 
-/// `ORDER BY … LIMIT n` / `LIMIT n` descended into a SQL source: the row cap the
-/// source is asked for, and the order it must pick those rows in.
-///
-/// Unlike the aggregate descent this is never authoritative — the engine keeps its
-/// own filter, sort and limit over what arrives, so the final order and cut are
-/// basalt's. The source only has to send a *sufficient* set: every row the engine's
-/// own top-N would keep. That holds when (a) every filter between the read and the
-/// limit ran at the source too, so the source counts the same rows the engine
-/// does, and (b) the source ranks the keys exactly as the engine does, nulls last
-/// in both directions (`op.Sort`). Rows tied on every key at the cut are
-/// interchangeable in either plan — the engine's own pick among them already
-/// depends on arrival order, which a SQL source never promises.
 pub const TopN = struct {
-    /// `limit + offset`: the engine discards the offset itself.
     rows: u64,
-    /// The source columns to order by, empty for a plain `LIMIT`.
     keys: []const Key = &.{},
 
     pub const Key = struct { col: []const u8, desc: bool };
 
-    /// `order by id desc limit 1000`, for EXPLAIN's `pushdown:` line.
     pub fn describe(self: TopN, arena: std.mem.Allocator) ![]const u8 {
         var out = std.array_list.Managed(u8).init(arena);
         for (self.keys, 0..) |k, i| {
@@ -1095,12 +938,8 @@ pub const TopN = struct {
     }
 };
 
-/// The top-N a pipeline asks of its read: `read | filter* | select* | [sort] |
-/// limit | …`, with each sort key traced back through the selects to the source
-/// column it names. Null when the pipeline has no such limit — or, with a reason in
-/// `why`, when it has one this shape cannot carry (then the caller says so, since a
-/// top-N that stays engine-side streams the whole table). `stages` is the pipeline
-/// without its write. No schema is needed: types are checked by `planTopN`.
+/// The top-N a pipeline asks of its read (`read | filter* | select* | [sort] | limit`),
+/// sort keys traced to source columns. Null, with `why` when there is a limit, otherwise.
 pub fn classifyTopN(arena: std.mem.Allocator, stages: []const ast.Stage, why: *[]const u8) !?TopN {
     if (stages.len < 2 or stages[0].node != .read) return null;
     const mid = stages[1..];
@@ -1114,8 +953,6 @@ pub fn classifyTopN(arena: std.mem.Allocator, stages: []const ast.Stage, why: *[
         sort = mid[at - 1].node.sort;
         selects_end = at - 1;
     }
-    // filters first, then row-preserving projections; anything else changes which
-    // rows reach the limit (or cannot be traced to the source) — not a top-N shape
     var i: usize = 0;
     while (i < selects_end and mid[i].node == .filter) i += 1;
     const sel_start = i;
@@ -1148,7 +985,7 @@ pub fn classifyTopN(arena: std.mem.Allocator, stages: []const ast.Stage, why: *[
 }
 
 /// The source column an output `name` carries through `selects` unchanged or
-/// merely renamed, or null when some select computes it or drops it.
+/// renamed, or null when some select computes or drops it.
 fn sourceName(selects: []const ast.Stage, name_in: []const u8) ?[]const u8 {
     var name = name_in;
     var i = selects.len;
@@ -1168,7 +1005,6 @@ fn selectSource(items: []const ast.SelectItem, name: []const u8) ?[]const u8 {
         },
         else => {},
     };
-    // not produced by name: only a star carries it through
     for (items) |item| switch (item) {
         .star => return name,
         .star_except => |ex| {
@@ -1185,12 +1021,9 @@ fn selectSource(items: []const ast.SelectItem, name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Whether every filter before the limit also runs at the source: the pushed limit
-/// counts rows after the source's WHERE, so a filter left engine-side would thin
-/// the capped set below what the engine's own limit keeps.
+/// Whether every filter before the limit runs exactly at the source; otherwise
+/// the pushed cap would count rows the engine then drops.
 fn filtersAllTranslate(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage, schema: types.Schema, check_fields: bool, facts: ?*const Facts) !bool {
-    // exactly: a looser source filter would let rows the engine then drops take
-    // places under the cap, leaving fewer than the limit
     for (stages[1..]) |st| {
         if (st.node != .filter) break;
         if ((try translatePred(arena, st.node.filter, dialect, .{ .schema = schema, .check_fields = check_fields, .facts = facts, .need = .exact })) == null) return false;
@@ -1198,11 +1031,8 @@ fn filtersAllTranslate(arena: std.mem.Allocator, dialect: Dialect, stages: []con
     return true;
 }
 
-/// Key kinds every dialect orders exactly as the engine: numbers by value (a float's
-/// NaN greatest, as PostgreSQL sorts it — the others store none), and dates, times
-/// and timestamps by instant. A string's order is its collation's — case- and
-/// accent-folded by default on mysql and sqlserver, padded on a `char(n)` — where
-/// the engine compares bytes, so a string key is refused, as `MIN`/`MAX` refuse one.
+/// Key kinds every dialect orders exactly as the engine: numbers (NaN greatest)
+/// and temporals. Strings follow collations, so they are refused, as in MIN/MAX.
 fn orderedAlike(kind: types.TypeKind) bool {
     return switch (kind) {
         .int, .float, .decimal, .date, .time, .timestamp => true,
@@ -1210,11 +1040,10 @@ fn orderedAlike(kind: types.TypeKind) bool {
     };
 }
 
-/// EXPLAIN's view of the top-N, without a connection: what descends, or null.
-/// Analysis never connects, so a sort key's type is still to be checked when the
-/// statement runs; the text says so.
 pub const ExplainedTopN = struct { text: []const u8, rows: u64, sorted: bool };
 
+/// EXPLAIN's view of the top-N without a connection; a sort key's type is still
+/// checked when the statement runs.
 pub fn explainTopN(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage) !?ExplainedTopN {
     var why: []const u8 = "";
     const t = (try classifyTopN(arena, stages, &why)) orelse return null;
@@ -1227,8 +1056,6 @@ pub fn explainTopN(arena: std.mem.Allocator, dialect: Dialect, stages: []const a
     };
 }
 
-/// The statement that asks the source for `t.rows` rows of `base_sql` in the
-/// engine's order, or null (with `why`) when it would not be the engine's answer.
 pub fn planTopN(arena: std.mem.Allocator, dialect: Dialect, base_sql: []const u8, src_schema: types.Schema, stages: []const ast.Stage, t: TopN, facts: ?*const Facts, why: *[]const u8) !?[]const u8 {
     if (!try filtersAllTranslate(arena, dialect, stages, src_schema, true, facts)) {
         why.* = try std.fmt.allocPrint(arena, "a WHERE predicate does not translate exactly to {s} SQL (a text comparison the column's collation decides differently, or an untranslatable piece)", .{@tagName(dialect)});
@@ -1248,9 +1075,8 @@ pub fn planTopN(arena: std.mem.Allocator, dialect: Dialect, base_sql: []const u8
     return try renderTopN(arena, dialect, base_sql, t);
 }
 
-/// `base_sql` as a derived table, ordered nulls-last and capped, in the dialect's
-/// own spelling: `NULLS LAST` on postgres, a leading `k IS NULL` key on
-/// mysql/StarRocks, a `CASE` key and `TOP` on sqlserver.
+/// `base_sql` ordered nulls-last and capped: `NULLS LAST` on postgres, a leading
+/// `k IS NULL` key on mysql, a `CASE` key and `TOP` on sqlserver.
 pub fn renderTopN(arena: std.mem.Allocator, dialect: Dialect, base_sql: []const u8, t: TopN) ![]const u8 {
     var ob = std.array_list.Managed(u8).init(arena);
     for (t.keys, 0..) |k, i| {
@@ -1270,16 +1096,10 @@ pub fn renderTopN(arena: std.mem.Allocator, dialect: Dialect, base_sql: []const 
     };
 }
 
-/// §7 implicit pushdown for a serial pipeline: translate the `filter` stages
-/// that immediately follow a SQL read into one AND-ed WHERE fragment. The
-/// engine KEEPS the filter stages (superset rule) — the fragment only lets
-/// the source pre-narrow, so an untranslatable piece just isn't pushed.
 pub fn serialWhere(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage) !?[]const u8 {
     return serialWhereWith(arena, dialect, stages, null, null);
 }
 
-/// `serialWhere` with the source's catalog facts; `wants` is set when having
-/// them could push more.
 pub fn serialWhereWith(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage, facts: ?*const Facts, wants: ?*bool) !?[]const u8 {
     if (stages.len < 2 or stages[0].node != .read) return null;
     var parts = std.array_list.Managed([]const u8).init(arena);
@@ -1293,8 +1113,6 @@ pub fn serialWhereWith(arena: std.mem.Allocator, dialect: Dialect, stages: []con
     return try std.mem.join(arena, " AND ", parts.items);
 }
 
-/// Single-quoted SQL string literal with `'` doubled — ANSI, accepted by all three
-/// dialects (and StarRocks).
 fn sqlStr(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     var out = std.array_list.Managed(u8).init(arena);
     try out.append('\'');
@@ -1306,12 +1124,11 @@ fn sqlStr(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     return out.toOwnedSlice();
 }
 
-/// Collect every source column an expression references (by `parts[0]`, the base
-/// column even for a nested path) into `set`.
+/// Every source column an expression references, by `parts[0]`; a lambda's
+/// parameter is not one.
 pub fn collectFields(e: *const ast.Expr, set: *std.StringHashMap(void)) !void {
     switch (e.*) {
         .field => |q| try set.put(q.parts[0], {}),
-        // the body's columns are the row's; its parameter is not one
         .lambda => |l| try collectFields(l.body, set),
         .unary => |u| try collectFields(u.e, set),
         .binary => |b| {
@@ -1344,10 +1161,6 @@ pub fn collectFields(e: *const ast.Expr, set: *std.StringHashMap(void)) !void {
 
 const testing = std.testing;
 
-// File-scope so the arrays live in static memory. As function locals,
-// `return .{ .fields = &.{…} }` returned the address of a stack temporary —
-// fine in Debug by accident, dangling in release, where the schema lookups
-// read reused stack and three tests failed (one by segfault).
 const test_schema_fields = [_]types.Schema.Field{
     .{ .name = "a", .ty = types.Type.init(.int) },
     .{ .name = "b", .ty = types.Type.init(.string) },
@@ -1425,7 +1238,6 @@ test "translatePred: bitwise operators are never pushed down" {
     const four = try a.create(ast.Expr);
     four.* = .{ .int_lit = 4 };
 
-    // `a & 4 = 4` — the AND is untranslatable, so the whole filter stays engine-side.
     const masked = try bin(a, .bit_and, try fld(a, "a"), four);
     const pred = try bin(a, .eq, masked, four);
     for ([_]Dialect{ .mysql, .postgres, .sqlserver }) |d| {
@@ -1660,25 +1472,15 @@ test "translateExpr: extended constructs (is empty, CASE, CAST, functions)" {
 
     const cases = [_]struct { src: []const u8, want: ?[]const u8, d: Dialect = .sqlserver }{
         .{ .src = "status IS EMPTY", .want = "([status] IS NULL OR ([status] = ''))" },
-        // SQL Server holds '  ' = '': under NOT that equality would drop a row the
-        // engine keeps, so it waits for the column's collation
         .{ .src = "status IS NOT EMPTY", .want = null },
         .{ .src = "IF(v > 1, 'a', 'b')", .want = "(CASE WHEN ([v] > 1) THEN 'a' ELSE 'b' END)" },
-        // a text subject compares by collation: 'X' would take the 'x' arm
         .{ .src = "CASE status WHEN 'x', 'y' THEN 1 ELSE 0 END", .want = null },
         .{ .src = "CASE v WHEN 1 THEN 1 ELSE 0 END > 0", .want = "((CASE [v] WHEN 1 THEN 1 ELSE 0 END) > 0)" },
-        // Cast to a number, over a schema nobody has resolved: unprovable, so it
-        // stays in the engine. The sources disagree about what `CAST('abc' AS INT)`
-        // means (null in StarRocks/MySQL, an error in Postgres), and descending
-        // changed the row count on identical data.
         .{ .src = "CAST(v AS INT) > 5", .want = null },
         .{ .src = "CAST(v AS INT) > 5", .want = null, .d = .mysql },
-        // A literal is certainly a number, so this one is unambiguous either side.
         .{ .src = "CAST(5 AS INT) > 1", .want = "(CAST(5 AS BIGINT) > 1)" },
-        // Cast to a non-numeric type is unaffected by that disagreement.
         .{ .src = "CAST(v AS STRING) = 'x'", .want = "(CAST([v] AS VARCHAR(MAX)) = 'x')" },
         .{ .src = "lower(status) = 'ok'", .want = "(LOWER([status]) = 'ok')" },
-        // MySQL's LENGTH counts bytes, and SQL Server's LEN drops trailing spaces
         .{ .src = "length(status) > 2", .want = null },
         .{ .src = "length(status) > 2", .want = null, .d = .mysql },
         .{ .src = "strpos(status, 'a') = 2", .want = null },
@@ -1689,17 +1491,13 @@ test "translateExpr: extended constructs (is empty, CASE, CAST, functions)" {
         .{ .src = "starts_with(status, 'CT2')", .want = "([status] LIKE 'CT2%')" },
         .{ .src = "status LIKE 'a%'", .want = "([status] LIKE 'a%')" },
         .{ .src = "contains(status, '10%')", .want = null },
-        // a byte in the engine, a character at the source
         .{ .src = "status LIKE 'a_b'", .want = null },
-        // SQL Server reads `[` as a character class
         .{ .src = "contains(status, '[x]')", .want = "([status] LIKE '%[[]x]%')" },
         .{ .src = "contains(status, '[x]')", .want = "(`status` LIKE '%[x]%')", .d = .mysql },
         .{ .src = "substr(status, 2, 2) = 'AB'", .want = null },
-        // without the column's collation, an order or a negated equality on text stays here
         .{ .src = "status >= 'B'", .want = null },
         .{ .src = "status <> 'x'", .want = null },
         .{ .src = "NOT (status = 'x')", .want = null },
-        // ...while the half of an AND that translates still goes
         .{ .src = "status >= 'B' AND v > 1", .want = "([v] > 1)" },
         .{ .src = "status = '\u{e9}'", .want = null },
         .{ .src = "status = 'a\\b'", .want = null, .d = .mysql },
@@ -1790,7 +1588,6 @@ test "translateCall: same-name numeric builtins render identically everywhere" {
     const nif_e = try callExpr(a, "nullif", &[_]*ast.Expr{ try fld(a, "b"), try strLit(a, "x") });
     try testing.expectEqualStrings("NULLIF(`b`, 'x')", (try translateExpr(a, nif_e, .mysql, testSchema(), true)).?);
 
-    // Wrong arity is not pushed.
     const bad = try callExpr(a, "abs", &[_]*ast.Expr{ try fld(a, "a"), try intLit(a, 1) });
     try testing.expect((try translateExpr(a, bad, .mysql, testSchema(), true)) == null);
 }
@@ -1814,7 +1611,6 @@ test "translateCall: mod is the % operator on sqlserver, MOD elsewhere" {
     try testing.expectEqualStrings("MOD(\"a\", 3)", (try translateExpr(a, e, .postgres, testSchema(), true)).?);
     try testing.expectEqualStrings("MOD(`a`, 3)", (try translateExpr(a, e, .mysql, testSchema(), true)).?);
 
-    // Comparison context: the fragment stays a well-formed operand.
     const cmp = try bin(a, .eq, e, try intLit(a, 0));
     try testing.expectEqualStrings("(([a] % 3) = 0)", (try translateExpr(a, cmp, .sqlserver, testSchema(), true)).?);
 }
@@ -1845,7 +1641,6 @@ test "translateCall: repeat is REPLICATE on sqlserver; left/right are portable" 
     const rt = try callExpr(a, "right", &[_]*ast.Expr{ try fld(a, "b"), try intLit(a, 2) });
     try testing.expectEqualStrings("RIGHT(`b`, 2)", (try translateExpr(a, rt, .mysql, testSchema(), true)).?);
 
-    // A negative or non-literal count diverges across dialects — left engine-side.
     const neg = try callExpr(a, "left", &[_]*ast.Expr{ try fld(a, "b"), try intLit(a, -2) });
     try testing.expect((try translateExpr(a, neg, .postgres, testSchema(), true)) == null);
     const dyn = try callExpr(a, "repeat", &[_]*ast.Expr{ try fld(a, "b"), try fld(a, "a") });
@@ -1867,7 +1662,6 @@ test "translateCall: excluded builtins fall back to the engine" {
         try testing.expect((try translateExpr(a, e, .sqlserver, testSchema(), true)) == null);
     }
 
-    // …and an excluded function inside a comparison sinks the whole predicate.
     const cmp = try bin(a, .gt, round_e, try intLit(a, 1));
     try testing.expect((try translateExpr(a, cmp, .postgres, testSchema(), true)) == null);
 }
@@ -1885,13 +1679,10 @@ test "translateExpr: a safe (TRY_) cast is never pushed" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // `b` is a string in `testSchema()`, so a cast of it to a number is exactly the
-    // case that must not descend — the source's text-to-number rules are not ours.
     const from_text = try a.create(ast.Expr);
     from_text.* = .{ .cast = .{ .e = try fld(a, "b"), .ty = types.Type.init(.int) } };
     try testing.expect((try translateExpr(a, from_text, .mysql, testSchema(), true)) == null);
 
-    // `a` is an int there, so casting it is unambiguous and still pushes.
     const plain = try a.create(ast.Expr);
     plain.* = .{ .cast = .{ .e = try fld(a, "a"), .ty = types.Type.init(.int) } };
     try testing.expectEqualStrings("CAST(`a` AS SIGNED)", (try translateExpr(a, plain, .mysql, testSchema(), true)).?);
@@ -1903,9 +1694,6 @@ test "translateExpr: a safe (TRY_) cast is never pushed" {
     try testing.expect((try translateExpr(a, safe, .sqlserver, testSchema(), true)) == null);
 }
 
-// --- planWholeAgg: AUTHORITATIVE whole-aggregate descent -------------------
-
-/// a int, b string, c int, f float, m decimal(12,2), t timestamp.
 const whole_schema_fields = [_]types.Schema.Field{
     .{ .name = "a", .ty = types.Type.init(.int) },
     .{ .name = "b", .ty = types.Type.init(.string) },
@@ -1968,8 +1756,6 @@ test "planWholeAgg: grouped multi-aggregate renders with a CAST per dialect" {
         my.sql,
     );
 
-    // T-SQL: COUNT_BIG (COUNT raises past 2^31) and a widened addend (SUM of `int`
-    // otherwise accumulates in `int` and overflows where the engine's i64 would not).
     const ms = (try planWholeAgg(a, .sqlserver, base_t, wholeSchema(), &.{filt}, ag, plan_schema)).?;
     try testing.expectEqualStrings(
         "SELECT [b] AS [b], CAST(COUNT_BIG(*) AS BIGINT) AS [n], CAST(SUM(CAST([c] AS BIGINT)) AS BIGINT) AS [total]" ++
@@ -2050,8 +1836,6 @@ test "planWholeAgg: only COUNT, SUM, MIN and MAX descend — every other aggrega
         .{ .name = "b", .ty = types.Type.init(.string) },
         .{ .name = "m", .ty = types.Type.init(.float).withNull(true) },
     } };
-    // A new aggregate falls back until `aggExpr` is taught a rendering that every
-    // dialect answers bit-identically to the engine.
     inline for (@typeInfo(ast.AggFunc).@"enum".fields) |f| {
         const func: ast.AggFunc = @enumFromInt(f.value);
         switch (func) {
@@ -2074,8 +1858,6 @@ test "planWholeAgg: a qualified or unknown group key falls back" {
     const aggs = try a.alloc(ast.AggItem, 1);
     aggs[0] = .{ .name = "n", .func = .count, .arg = null };
 
-    // `t.b` — two parts; the engine groups by `b` but the subquery alias is `_g`,
-    // so the qualified spelling would not resolve there.
     const by = try a.alloc(ast.QualName, 1);
     by[0] = .{ .parts = &.{ "t", "b" } };
     const plan_schema = types.Schema{ .fields = &.{
@@ -2084,7 +1866,6 @@ test "planWholeAgg: a qualified or unknown group key falls back" {
     } };
     try testing.expect((try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = aggs, .by = by }, plan_schema)) == null);
 
-    // A key the source schema doesn't have at all.
     const missing = try byList(a, &.{"zzz"});
     const ms_schema = types.Schema{ .fields = &.{
         .{ .name = "zzz", .ty = types.Type.init(.string) },
@@ -2140,12 +1921,9 @@ test "planWholeAgg: an untranslatable filter falls back instead of pushing a sup
         .{ .name = "n", .ty = types.Type.init(.int) },
     } };
 
-    // One translatable filter alone is fine…
     try testing.expect((try planWholeAgg(a, .mysql, base_t, wholeSchema(), &.{ok}, ag, plan_schema)) != null);
-    // …but one untranslatable filter anywhere in the prefix sinks the whole descent.
     try testing.expect((try planWholeAgg(a, .mysql, base_t, wholeSchema(), &.{ ok, bad }, ag, plan_schema)) == null);
 
-    // A `select` in the prefix does too: it renames columns out from under the keys.
     const items = try a.alloc(ast.SelectItem, 1);
     items[0] = .star;
     const sel = ast.Stage{ .node = .{ .select = items }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
@@ -2159,20 +1937,16 @@ test "planWholeAgg: SUM only descends for an int column into an int result" {
     const by = try byList(a, &.{"b"});
     const key = types.Schema.Field{ .name = "b", .ty = types.Type.init(.string) };
 
-    // float: postgres SUM(real) accumulates in float4, the engine in f64.
     const fa = try a.alloc(ast.AggItem, 1);
     fa[0] = .{ .name = "s", .func = .sum, .arg = try fld(a, "f") };
     const fs = types.Schema{ .fields = &.{ key, .{ .name = "s", .ty = types.Type.init(.float).withNull(true) } } };
     try testing.expect((try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = fa, .by = by }, fs)) == null);
 
-    // decimal: the sum can outgrow the column's own precision, which the CAST would
-    // raise on where the engine's i64 unscaled accumulator would not.
     const da = try a.alloc(ast.AggItem, 1);
     da[0] = .{ .name = "s", .func = .sum, .arg = try fld(a, "m") };
     const ds = types.Schema{ .fields = &.{ key, .{ .name = "s", .ty = types.Type.decimal(12, 2).withNull(true) } } };
     try testing.expect((try planWholeAgg(a, .mysql, base_t, wholeSchema(), &.{}, .{ .aggs = da, .by = by }, ds)) == null);
 
-    // DISTINCT is honoured by the engine only on COUNT, so never render it elsewhere.
     const dd = try a.alloc(ast.AggItem, 1);
     dd[0] = .{ .name = "s", .func = .sum, .arg = try fld(a, "c"), .distinct = true };
     const is = types.Schema{ .fields = &.{ key, .{ .name = "s", .ty = types.Type.init(.int).withNull(true) } } };
@@ -2184,21 +1958,17 @@ test "planWholeAgg: MIN/MAX falls back on collation- and timezone-sensitive type
     defer ar.deinit();
     const a = ar.allocator();
 
-    // A string extreme follows the source COLLATION (case-insensitive by default on
-    // mysql and sqlserver); the engine compares bytes.
     const sa = try a.alloc(ast.AggItem, 1);
     sa[0] = .{ .name = "lo", .func = .min, .arg = try fld(a, "b") };
     const ss = types.Schema{ .fields = &.{.{ .name = "lo", .ty = types.Type.init(.string).withNull(true) }} };
     for ([_]Dialect{ .postgres, .mysql, .sqlserver }) |d|
         try testing.expect((try planWholeAgg(a, d, base_t, wholeSchema(), &.{}, .{ .aggs = sa, .by = &.{} }, ss)) == null);
 
-    // A timestamp CAST can shift the value under a session timezone.
     const ta = try a.alloc(ast.AggItem, 1);
     ta[0] = .{ .name = "hi", .func = .max, .arg = try fld(a, "t") };
     const ts = types.Schema{ .fields = &.{.{ .name = "hi", .ty = types.Type.init(.timestamp).withNull(true) }} };
     try testing.expect((try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = ta, .by = &.{} }, ts)) == null);
 
-    // An unresolved decimal precision has no valid cast target either.
     const ma = try a.alloc(ast.AggItem, 1);
     ma[0] = .{ .name = "lo", .func = .min, .arg = try fld(a, "m") };
     const bad = types.Schema{ .fields = &.{.{ .name = "lo", .ty = types.Type.decimal(0, 0).withNull(true) }} };
@@ -2217,44 +1987,6 @@ test "planWholeAgg: a non-bare aggregate argument falls back" {
     try testing.expect((try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = aggs, .by = &.{} }, plan_schema)) == null);
 }
 
-// ---------------------------------------------------------------------------
-// Moving a filter below a join
-//
-// `serialWhere` above only reads the *contiguous* filter prefix after a read, so
-// a join between the read and the filter stopped every descent: `FROM fact JOIN
-// dim ON … WHERE fact.d = '…'` pulled the whole fact table over the wire and
-// filtered it here. On an 80M-row table that measured 18ms against 15.7s.
-//
-// Every comparable engine solves this the same way — filter pushdown as a rewrite
-// on a plan tree (DuckDB's `filter_pushdown.cpp`, DataFusion's `push_down_filter`,
-// Polars' `predicate_pushdown`, Trino's `PredicatePushDown`) — and basalt has no
-// tree to rewrite. What it does have is a stage list where a join's right side is
-// always a named binding, so the two rewrites below work locally on that list and
-// need no optimizer framework:
-//
-//   hoist:  read | join | filter(probe cols)  ->  read | filter | join
-//   derive: read | join(l.k = r.k) | filter(r.k = 'x')
-//             ->  read | filter(l.k = 'x') | join | filter(r.k = 'x')
-//
-// The second is DuckDB's equivalence-set trick: a predicate on one side of an
-// equijoin also constrains the other, so a filter naming the dimension's key can
-// prune the fact table at the source.
-//
-// Pushdown is where these engines have shipped *wrong answers* rather than slow
-// ones — ClickHouse generating bad queries against distributed tables, Polars
-// returning wrong rows after join/select/filter — so both rewrites here refuse
-// unless they can prove the move is safe, and refusing only costs the old speed.
-
-/// Join kinds a probe-only filter may move below.
-///
-/// `inner` and `cross` are products, so filtering the probe before or after is the
-/// same rows. `left` keeps every probe row (the right side is null-extended, which
-/// a probe-only predicate cannot see), and `semi`/`anti` emit a subset of probe
-/// rows and no right columns at all.
-///
-/// `right` and `full` are excluded because there the *probe* side is the one that
-/// gets null-extended: a filter above the join sees rows that do not exist below
-/// it, and moving it changes the answer.
 fn hoistableKind(k: ast.JoinKind) bool {
     return switch (k) {
         .inner, .cross, .left, .semi, .anti => true,
@@ -2262,9 +1994,6 @@ fn hoistableKind(k: ast.JoinKind) bool {
     };
 }
 
-/// Output column names of a binding, or null when they cannot be known statically —
-/// a `SELECT *` over a source whose schema only the source can describe. Null means
-/// "cannot prove", and every caller treats that as "do not move".
 fn bindingNames(
     arena: std.mem.Allocator,
     bindings: *const std.StringHashMap(ast.Pipeline),
@@ -2280,13 +2009,10 @@ fn bindingNames(
                 for (items, out) |it, *o| o.* = switch (it) {
                     .field => |q| q.last(),
                     .computed => |c| c.name,
-                    // A star of any kind leaves the name set open.
                     else => return null,
                 };
                 return out;
             },
-            // Anything else between the read and here neither adds nor renames a
-            // column, so keep looking for the projection that names them.
             .filter, .limit, .sort, .distinct => {},
             else => return null,
         }
@@ -2294,8 +2020,6 @@ fn bindingNames(
     return null;
 }
 
-/// Whether `name` could be a column the join's right side contributed — including
-/// the `_r`, `_r2`, … suffixes a colliding right-side name comes back under.
 fn isRightName(name: []const u8, right: []const []const u8) bool {
     for (right) |r| {
         if (std.mem.eql(u8, name, r)) return true;
@@ -2313,10 +2037,6 @@ fn isRightName(name: []const u8, right: []const []const u8) bool {
     return false;
 }
 
-/// True when every column the predicate names is one the probe side already had.
-/// Aliases are stripped at parse time, so a bare name cannot say which side it came
-/// from — but the only other supplier is the right side, and that one is
-/// enumerable, so "not the right side's" is a proof of "the probe's".
 fn refsOnlyProbe(
     arena: std.mem.Allocator,
     e: *const ast.Expr,
@@ -2326,19 +2046,12 @@ fn refsOnlyProbe(
     var list = std.array_list.Managed(ast.QualName).init(arena);
     try collectQuals(arena, e, &list);
     for (list.items) |q| {
-        // `r.name` where `r` is the join's binding or alias is the right side, said outright.
         if (q.parts.len > 1 and (std.mem.eql(u8, q.parts[0], j.binding) or std.mem.eql(u8, q.parts[0], j.alias))) return false;
         if (isRightName(q.last(), right)) return false;
     }
     return true;
 }
 
-/// Collect the `QualName` of every column reference, qualifier included.
-///
-/// `collectFields` above keys on `parts[0]`, which for `r.name` is the *qualifier*
-/// `r` and not the column — checking eligibility against that hoisted right-side
-/// filters as if they named probe columns. Both halves are needed here: the
-/// qualifier can name the join's binding outright, and the last part is the column.
 const QualWalk = struct { arena: std.mem.Allocator, list: *std.array_list.Managed(ast.QualName) };
 
 fn collectQualsRecur(cx: QualWalk, e: *const ast.Expr) error{OutOfMemory}!*ast.Expr {
@@ -2355,7 +2068,6 @@ pub fn collectQuals(arena: std.mem.Allocator, e: *const ast.Expr, list: *std.arr
 
 const KeySwap = struct {
     arena: std.mem.Allocator,
-    /// right key name -> left key name
     map: *const std.StringHashMap([]const u8),
 };
 
@@ -2380,14 +2092,6 @@ fn mkExpr(arena: std.mem.Allocator, e: ast.Expr) !*ast.Expr {
     return p;
 }
 
-/// The probe-side twin of a predicate that names only right-side join keys, or null
-/// when there is none to derive.
-///
-/// Sound because an equijoin never matches a null key: if the surviving rows must
-/// have `r.k = 'x'` and they are paired by `l.k = r.k`, then their `l.k` is `'x'`
-/// too. Restricted to `inner`: under `left`/`anti` a probe row that matches nothing
-/// still reaches the output, so constraining it by the right side's predicate would
-/// drop rows the query asked for.
 fn deriveProbePredicate(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -2405,15 +2109,11 @@ fn deriveProbePredicate(
     try collectQuals(arena, e, &list);
     if (list.items.len == 0) return null;
     for (list.items) |q| {
-        // Every reference has to be a right key with a left twin; a predicate
-        // mentioning any other column has no probe-side equivalent.
         if (map.get(q.last()) == null) return null;
     }
     return try swapKeysRecur(.{ .arena = arena, .map = &map }, e);
 }
 
-/// Rewrite `stages` so filters sit as early as the join structure allows. Returns
-/// null when nothing moved, so the caller keeps its original slice.
 pub fn hoistThroughJoins(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -2425,9 +2125,6 @@ pub fn hoistThroughJoins(
     try list.appendSlice(stages);
     var changed = false;
 
-    // Hoist: swap a probe-only filter with the join in front of it, repeatedly, so
-    // a filter can cross several joins. Bounded by the stage count squared, which is
-    // a handful — a pipeline is tens of stages, not thousands.
     var rounds: usize = 0;
     while (rounds < list.items.len) : (rounds += 1) {
         var moved_this_round = false;
@@ -2448,8 +2145,6 @@ pub fn hoistThroughJoins(
         if (!moved_this_round) break;
     }
 
-    // Derive: once per join, and only for the filters directly above it, so there is
-    // no chance of deriving the same predicate twice.
     var k: usize = 0;
     while (k + 1 < list.items.len) : (k += 1) {
         if (list.items[k].node != .join) continue;
@@ -2470,10 +2165,6 @@ pub fn hoistThroughJoins(
     return try list.toOwnedSlice();
 }
 
-/// `hoistThroughJoins` between two passes of `hoistThroughSelects`: a filter may
-/// have to cross a projection to reach a join and cross the join to reach the next
-/// projection. The join pass runs once — a second would derive its key twins again.
-/// Returns null when nothing moved.
 pub fn hoistFilters(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -2491,7 +2182,6 @@ pub fn hoistFilters(
         changed = true;
         if (try hoistThroughSelects(arena, cur)) |t| cur = t;
     }
-    // after the key twins are derived from these filters, not before
     if (try pushIntoJoinSides(arena, cur)) |s| {
         cur = s;
         changed = true;
@@ -2499,15 +2189,6 @@ pub fn hoistFilters(
     return if (changed) cur else null;
 }
 
-/// Rewrite `stages` so a filter after an inner or cross join that names only the
-/// right side's columns, each by the join's alias (`WHERE i.valor > 0`), becomes
-/// that join's `right_filter`: applied where the right side is read, it descends
-/// into the right side's source instead of every row of it crossing the wire to be
-/// joined and dropped. Conjunct by conjunct; it may pass other inner joins and
-/// filters to reach its join. Never a LEFT, RIGHT or FULL join: there a filter on
-/// the right side also removes or keeps the unmatched rows, which moving it would
-/// change. A bare name stays put — with the left schema unknown, it could be
-/// either side's. Returns null when nothing moved.
 pub fn pushIntoJoinSides(arena: std.mem.Allocator, stages: []const ast.Stage) !?[]const ast.Stage {
     var list = std.array_list.Managed(ast.Stage).init(arena);
     try list.appendSlice(stages);
@@ -2562,8 +2243,6 @@ pub fn pushIntoJoinSides(arena: std.mem.Allocator, stages: []const ast.Stage) !?
     return try list.toOwnedSlice();
 }
 
-/// The qualifier every column `e` names shares — `i` for `i.valor > 0 AND i.qty
-/// <> 0` — or null when one is bare, they differ, or there is none.
 fn rightAliasOf(arena: std.mem.Allocator, e: *const ast.Expr) !?[]const u8 {
     var refs = std.array_list.Managed(ast.QualName).init(arena);
     try collectQuals(arena, e, &refs);
@@ -2590,18 +2269,10 @@ fn unqualifyRecur(cx: Unqualify, e: *const ast.Expr) error{OutOfMemory}!*ast.Exp
     return ast.rebuildExpr(cx.arena, e, cx, unqualifyRecur);
 }
 
-/// `e` with `alias.col` written `col`, the right side's own name for it.
 fn unqualify(arena: std.mem.Allocator, e: *ast.Expr, alias: []const u8) !*ast.Expr {
     return unqualifyRecur(.{ .arena = arena, .alias = alias }, e);
 }
 
-/// Rewrite `stages` so a filter written after a projection sits before it, when
-/// every column the filter names is one the projection passes through or renames:
-/// `SELECT C5_CLIENTE AS cliente ... WHERE cliente <> 'x'` filters on `C5_CLIENTE`
-/// first. That is how the WHERE of a query over a CTE, derived table or table
-/// function joins the binding's own WHERE right after the read, where it can
-/// descend. A filter on a computed column stays where it is. Returns null when
-/// nothing moved.
 pub fn hoistThroughSelects(arena: std.mem.Allocator, stages: []const ast.Stage) !?[]const ast.Stage {
     if (stages.len < 3) return null;
     var list = std.array_list.Managed(ast.Stage).init(arena);
@@ -2615,8 +2286,6 @@ pub fn hoistThroughSelects(arena: std.mem.Allocator, stages: []const ast.Stage) 
             if (list.items[i].node != .filter or list.items[i - 1].node != .select) continue;
             const f = list.items[i];
             const items = list.items[i - 1].node.select;
-            // Conjunct by conjunct, so `dbl > 10 AND cliente = 'x'` still moves the
-            // half that names no computed column.
             var parts = std.array_list.Managed(*ast.Expr).init(arena);
             try splitAnd(f.node.filter, &parts);
             var below: ?*ast.Expr = null;
@@ -2652,11 +2321,6 @@ fn andWith(arena: std.mem.Allocator, acc: ?*ast.Expr, e: *ast.Expr) !*ast.Expr {
     return mkExpr(arena, .{ .binary = .{ .op = .@"and", .l = l, .r = e } });
 }
 
-/// The column of the projection's input that output `name` is, when it is one
-/// passed through or renamed; null for a computed column or a name it lacks.
-/// Explicit items win over a `*`, as they would name the column it duplicates.
-/// Unlike `selectSource` it keeps a qualifier: past a join, `b.x` and `x` are two
-/// columns.
 fn projectedFrom(arena: std.mem.Allocator, items: []const ast.SelectItem, name: []const u8) !?ast.QualName {
     var star = false;
     for (items) |it| switch (it) {
@@ -2695,9 +2359,6 @@ fn swapColsRecur(cx: ColSwap, e: *const ast.Expr) error{OutOfMemory}!*ast.Expr {
     return ast.rebuildExpr(cx.arena, e, cx, swapColsRecur);
 }
 
-/// `pred`, written over a projection's output, rewritten over its input — or null
-/// when it names a column the projection computes, a qualified or per-row name, or
-/// one it does not have.
 fn filterBelowSelect(arena: std.mem.Allocator, pred: *const ast.Expr, items: []const ast.SelectItem) !?*ast.Expr {
     for (items) |it| switch (it) {
         .field => |q| if (std.mem.indexOf(u8, q.last(), "${") != null) return null,
@@ -2711,7 +2372,6 @@ fn filterBelowSelect(arena: std.mem.Allocator, pred: *const ast.Expr, items: []c
     try collectQuals(arena, pred, &refs);
     var map = std.StringHashMap(ast.QualName).init(arena);
     for (refs.items) |q| {
-        // a `$param` is a value, not a column, and moves with the filter as it is
         if (q.dollar) continue;
         if (q.parts.len != 1 or std.mem.indexOf(u8, q.parts[0], "${") != null) return null;
         const src = (try projectedFrom(arena, items, q.parts[0])) orelse return null;
@@ -2719,8 +2379,6 @@ fn filterBelowSelect(arena: std.mem.Allocator, pred: *const ast.Expr, items: []c
     }
     return try swapColsRecur(.{ .arena = arena, .map = &map }, pred);
 }
-
-// --- the join rewrites -----------------------------------------------------
 
 fn qual(arena: std.mem.Allocator, parts: []const []const u8) !ast.QualName {
     const p = try arena.alloc([]const u8, parts.len);
@@ -2734,7 +2392,6 @@ fn qfld(arena: std.mem.Allocator, parts: []const []const u8) !*ast.Expr {
     return e;
 }
 
-/// `<parts> = <int>` as a filter stage.
 fn eqFilter(arena: std.mem.Allocator, parts: []const []const u8, v: i64) !ast.Stage {
     const lit = try arena.create(ast.Expr);
     lit.* = .{ .int_lit = v };
@@ -2749,8 +2406,6 @@ fn joinStage(arena: std.mem.Allocator, kind: ast.JoinKind, binding: []const u8, 
     return .{ .node = .{ .join = .{ .kind = kind, .binding = binding, .left_keys = lefts, .right_keys = rights } }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
 }
 
-/// A binding whose projection names `rk` and `name`, so its output columns are
-/// statically knowable — which is what the rewrites require before moving anything.
 fn dimBindings(arena: std.mem.Allocator) !std.StringHashMap(ast.Pipeline) {
     var m = std.StringHashMap(ast.Pipeline).init(arena);
     const items = try arena.alloc(ast.SelectItem, 2);
@@ -2783,7 +2438,6 @@ test "hoist: a filter on a renamed column moves below the projection, in the sou
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // read | select(C5_NUM AS num, C5_VALOR * 2 AS dbl) | filter(dbl > 10 AND num > 5) | write
     const items = [_]ast.SelectItem{
         .{ .computed = .{ .name = "num", .expr = try fld(a, "C5_NUM") } },
         .{ .computed = .{ .name = "dbl", .expr = try bin(a, .mul, try fld(a, "C5_VALOR"), try intLit(a, 2)) } },
@@ -2792,7 +2446,6 @@ test "hoist: a filter on a renamed column moves below the projection, in the sou
     const stages = [_]ast.Stage{ readStage(), projStage(&items), filterStage(pred), writeStage() };
 
     const out = (try hoistThroughSelects(a, &stages)).?;
-    // The `num` half moved and reads `C5_NUM`; the computed `dbl` half stayed above.
     try std.testing.expectEqual(@as(usize, 5), out.len);
     try std.testing.expect(out[1].node == .filter and out[2].node == .select and out[3].node == .filter);
     const where = (try serialWhere(a, .postgres, out[0 .. out.len - 1])).?;
@@ -2804,23 +2457,18 @@ test "hoist: a projection keeps a filter it computes, or names per row, and a qu
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // computed only: nothing moves
     const computed = [_]ast.SelectItem{.{ .computed = .{ .name = "y", .expr = try bin(a, .add, try fld(a, "x"), try intLit(a, 1)) } }};
     const s1 = [_]ast.Stage{ readStage(), projStage(&computed), filterStage(try bin(a, .eq, try fld(a, "y"), try intLit(a, 1))), writeStage() };
     try std.testing.expect((try hoistThroughSelects(a, &s1)) == null);
-    // an OR across a computed column is one conjunct: it stays whole
     const s2 = [_]ast.Stage{ readStage(), projStage(&computed), filterStage(try bin(a, .@"or", try bin(a, .eq, try fld(a, "y"), try intLit(a, 1)), try bin(a, .eq, try fld(a, "x"), try intLit(a, 2)))), writeStage() };
     try std.testing.expect((try hoistThroughSelects(a, &s2)) == null);
-    // `IDENTIFIER(...)` names a column only once the row renders it
     const dynamic = [_]ast.SelectItem{.{ .field = try qual(a, &.{"${col}"}) }};
     const s3 = [_]ast.Stage{ readStage(), projStage(&dynamic), filterStage(try bin(a, .eq, try fld(a, "k"), try intLit(a, 1))), writeStage() };
     try std.testing.expect((try hoistThroughSelects(a, &s3)) == null);
-    // past a join `b.x` and `x` are two columns: the rewrite keeps the qualifier
     const qualified = [_]ast.SelectItem{.{ .computed = .{ .name = "bx", .expr = try mkExpr(a, .{ .field = try qual(a, &.{ "b", "x" }) }) } }};
     const s4 = [_]ast.Stage{ readStage(), projStage(&qualified), filterStage(try bin(a, .eq, try fld(a, "bx"), try intLit(a, 1))), writeStage() };
     const out = (try hoistThroughSelects(a, &s4)).?;
     try std.testing.expectEqual(@as(usize, 2), out[1].node.filter.binary.l.field.parts.len);
-    // a `*` passes every name it does not override
     const star = [_]ast.SelectItem{ .star, .{ .computed = .{ .name = "y", .expr = try bin(a, .add, try fld(a, "x"), try intLit(a, 1)) } } };
     const s5 = [_]ast.Stage{ readStage(), projStage(&star), filterStage(try bin(a, .eq, try fld(a, "k"), try intLit(a, 1))), writeStage() };
     try std.testing.expect((try hoistThroughSelects(a, &s5)).?[1].node == .filter);
@@ -2830,18 +2478,14 @@ test "push: a filter on an inner join's right side by its alias becomes the join
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // read | join r | filter(r.v > 0 AND x > 1) | write
     const stages = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), filterStage(try bin(a, .@"and", try bin(a, .gt, try qfld(a, &.{ "r", "v" }), try intLit(a, 0)), try bin(a, .gt, try fld(a, "x"), try intLit(a, 1)))), writeStage() };
     const out = (try pushIntoJoinSides(a, &stages)).?;
-    // the `r.v` half moved onto the join, unqualified; the bare `x` half stayed
     const rf = out[1].node.join.right_filter.?;
     try std.testing.expectEqual(@as(usize, 1), rf.binary.l.field.parts.len);
     try std.testing.expectEqualStrings("v", rf.binary.l.field.parts[0]);
     try std.testing.expectEqualStrings("x", out[2].node.filter.binary.l.field.parts[0]);
-    // a filter that moved whole leaves no stage behind
     const whole = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), filterStage(try bin(a, .gt, try qfld(a, &.{ "r", "v" }), try intLit(a, 0))), writeStage() };
     try std.testing.expectEqual(@as(usize, 3), (try pushIntoJoinSides(a, &whole)).?.len);
-    // it passes another inner join to reach its own
     const two = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), try joinStage(a, .inner, "s", "k", "sk"), filterStage(try bin(a, .gt, try qfld(a, &.{ "r", "v" }), try intLit(a, 0))), writeStage() };
     const o2 = (try pushIntoJoinSides(a, &two)).?;
     try std.testing.expect(o2[1].node.join.right_filter != null and o2[2].node.join.right_filter == null);
@@ -2852,16 +2496,12 @@ test "push: a filter stays after a LEFT join, across sides, on a bare name, or p
     defer ar.deinit();
     const a = ar.allocator();
     const rv = try bin(a, .gt, try qfld(a, &.{ "r", "v" }), try intLit(a, 0));
-    // after a LEFT join a filter on the right side also drops the unmatched rows
     const left = [_]ast.Stage{ readStage(), try joinStage(a, .left, "r", "k", "rk"), filterStage(rv), writeStage() };
     try std.testing.expect((try pushIntoJoinSides(a, &left)) == null);
-    // one conjunct naming both sides is not the right side's alone
     const across = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), filterStage(try bin(a, .@"or", rv, try bin(a, .eq, try fld(a, "x"), try intLit(a, 1)))), writeStage() };
     try std.testing.expect((try pushIntoJoinSides(a, &across)) == null);
-    // a bare `v` could be the left side's, the right one renamed `v_r`
     const bare = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), filterStage(try bin(a, .gt, try fld(a, "v"), try intLit(a, 0))), writeStage() };
     try std.testing.expect((try pushIntoJoinSides(a, &bare)) == null);
-    // a LEFT join between the filter and its own join is not crossed
     const past = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), try joinStage(a, .left, "s", "k", "sk"), filterStage(rv), writeStage() };
     try std.testing.expect((try pushIntoJoinSides(a, &past)) == null);
 }
@@ -2873,7 +2513,6 @@ test "hoist: a probe-only filter moves below an inner join" {
     var binds = try dimBindings(a);
     defer binds.deinit();
 
-    // read | join | filter(v = 1) | write
     const stages = try a.alloc(ast.Stage, 4);
     stages[0] = readStage();
     stages[1] = try joinStage(a, .inner, "r", "k", "rk");
@@ -2882,8 +2521,6 @@ test "hoist: a probe-only filter moves below an inner join" {
 
     const out = (try hoistThroughJoins(a, a, stages, &binds)).?;
     try std.testing.expectEqual(@as(usize, 4), out.len);
-    // The filter now sits directly after the read, which is the prefix `serialWhere`
-    // reads — so the predicate can descend into the source query.
     try std.testing.expect(out[1].node == .filter);
     try std.testing.expect(out[2].node == .join);
 
@@ -2900,16 +2537,15 @@ test "hoist: a filter naming a right-side column stays put" {
     defer binds.deinit();
 
     for ([_][]const []const u8{
-        &.{"name"}, // bare right-side column
-        &.{ "r", "name" }, // qualified by the binding
-        &.{"name_r"}, // the suffix a colliding right name comes back under
+        &.{"name"},
+        &.{ "r", "name" },
+        &.{"name_r"},
     }) |parts| {
         const stages = try a.alloc(ast.Stage, 4);
         stages[0] = readStage();
         stages[1] = try joinStage(a, .inner, "r", "k", "rk");
         stages[2] = try eqFilter(a, parts, 1);
         stages[3] = writeStage();
-        // Nothing to move: the predicate cannot be evaluated before the join.
         try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds)) == null);
     }
 }
@@ -2921,7 +2557,6 @@ test "hoist: refused for the join kinds that null-extend the probe side" {
     var binds = try dimBindings(a);
     defer binds.deinit();
 
-    // A probe row that only exists null-extended cannot be filtered beforehand.
     for ([_]ast.JoinKind{ .right, .full }) |kind| {
         const stages = try a.alloc(ast.Stage, 4);
         stages[0] = readStage();
@@ -2930,7 +2565,6 @@ test "hoist: refused for the join kinds that null-extend the probe side" {
         stages[3] = writeStage();
         try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds)) == null);
     }
-    // Whereas these preserve or subset the probe rows, so it is safe.
     for ([_]ast.JoinKind{ .inner, .left, .semi, .anti, .cross }) |kind| {
         const stages = try a.alloc(ast.Stage, 4);
         stages[0] = readStage();
@@ -2946,8 +2580,6 @@ test "hoist: a binding with an open name set is left alone" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    // `SELECT *` over a source whose columns only the source knows: the right-side
-    // name set cannot be enumerated, so "not the right side's" is unprovable.
     var binds = std.StringHashMap(ast.Pipeline).init(a);
     defer binds.deinit();
     const items = try a.alloc(ast.SelectItem, 1);
@@ -2972,7 +2604,6 @@ test "derive: a predicate on the join key gains a probe-side twin" {
     var binds = try dimBindings(a);
     defer binds.deinit();
 
-    // read | join(k = rk) | filter(rk = 7) | write
     const stages = try a.alloc(ast.Stage, 4);
     stages[0] = readStage();
     stages[1] = try joinStage(a, .inner, "r", "k", "rk");
@@ -2980,8 +2611,6 @@ test "derive: a predicate on the join key gains a probe-side twin" {
     stages[3] = writeStage();
 
     const out = (try hoistThroughJoins(a, a, stages, &binds)).?;
-    // The original stays; a twin on the probe key appears ahead of the join, which
-    // is what lets a filter written against the dimension prune the fact table.
     try std.testing.expectEqual(@as(usize, 5), out.len);
     try std.testing.expect(out[1].node == .filter);
     try std.testing.expect(out[2].node == .join);
@@ -2998,9 +2627,6 @@ test "derive: only for an inner join, and only when every ref is a key" {
     var binds = try dimBindings(a);
     defer binds.deinit();
 
-    // Under a left/anti join a probe row that matches nothing still reaches the
-    // output, so constraining the probe by the right side's predicate drops rows the
-    // query asked for.
     for ([_]ast.JoinKind{ .left, .anti, .semi, .right, .full, .cross }) |kind| {
         const stages = try a.alloc(ast.Stage, 4);
         stages[0] = readStage();
@@ -3010,7 +2636,6 @@ test "derive: only for an inner join, and only when every ref is a key" {
         try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds)) == null);
     }
 
-    // A predicate touching a non-key right column has no probe-side equivalent.
     const stages = try a.alloc(ast.Stage, 4);
     stages[0] = readStage();
     stages[1] = try joinStage(a, .inner, "r", "k", "rk");
@@ -3019,7 +2644,6 @@ test "derive: only for an inner join, and only when every ref is a key" {
     try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds)) == null);
 }
 
-/// The stages of `sql`'s one pipeline, without its write — as the planner sees them.
 fn topNStagesOf(arena: std.mem.Allocator, sql: []const u8) ![]const ast.Stage {
     const parser = @import("../lang/sql_parser.zig");
     var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
@@ -3046,20 +2670,17 @@ test "top-N: which pipelines carry a limit to the source, and with which keys" {
     const t = (try topNOf(a, "SELECT id AS k, name FROM db.t WHERE id > 5 ORDER BY k DESC, ts LIMIT 3", &why)).?;
     try std.testing.expectEqual(@as(u64, 3), t.rows);
     try std.testing.expectEqual(@as(usize, 2), t.keys.len);
-    // the alias traced back to the source column it renames
     try std.testing.expectEqualStrings("id", t.keys[0].col);
     try std.testing.expect(t.keys[0].desc);
     try std.testing.expectEqualStrings("ts", t.keys[1].col);
     try std.testing.expectEqualStrings("order by id desc, ts limit 3", try t.describe(a));
 
-    // not a top-N at all: no limit, or something that changes which rows reach it
     why = "";
     try std.testing.expect((try topNOf(a, "SELECT * FROM db.t ORDER BY id", &why)) == null);
     try std.testing.expect((try topNOf(a, "SELECT DISTINCT name FROM db.t LIMIT 3", &why)) == null);
     try std.testing.expect((try topNOf(a, "SELECT name, count(*) AS n FROM db.t GROUP BY name ORDER BY n LIMIT 3", &why)) == null);
-    try std.testing.expectEqualStrings("", why); // none of those is a refusal worth a warning
+    try std.testing.expectEqualStrings("", why);
 
-    // a top-N the shape cannot carry: said why
     try std.testing.expect((try topNOf(a, "SELECT id * 2 AS d FROM db.t ORDER BY d LIMIT 3", &why)) == null);
     try std.testing.expect(std.mem.indexOf(u8, why, "not a plain source column") != null);
 }
@@ -3083,12 +2704,10 @@ test "top-N: key types the source orders as the engine does, and filters that mu
         const t = (try classifyTopN(a, stages, &why)).?;
         try std.testing.expect((try planTopN(a, .postgres, "SELECT * FROM t", schema, stages, t, null, &why)) != null);
     }
-    // a string's order is its collation's
     const s_st = try topNStagesOf(a, "SELECT * FROM db.t ORDER BY name LIMIT 5");
     const s_t = (try classifyTopN(a, s_st, &why)).?;
     try std.testing.expect((try planTopN(a, .postgres, "SELECT * FROM t", schema, s_st, s_t, null, &why)) == null);
     try std.testing.expect(std.mem.indexOf(u8, why, "collation") != null);
-    // a filter the source cannot run would thin the capped rows below the engine's cut
     const f_st = try topNStagesOf(a, "SELECT * FROM db.t WHERE to_hex(id) = '5' ORDER BY id LIMIT 5");
     const f_t = (try classifyTopN(a, f_st, &why)).?;
     try std.testing.expect((try planTopN(a, .postgres, "SELECT * FROM t", schema, f_st, f_t, null, &why)) == null);
@@ -3128,18 +2747,16 @@ test "text comparisons against the column's collation: exact where it compares b
     const sqlp = @import("../lang/sql_parser.zig");
 
     var facts = Facts.init(a);
-    try facts.put("d", .{ .text = true, .byte_order = true, .pads = true }); // Protheus: Latin1_General_BIN
-    try facts.put("ci", .{ .text = true, .byte_order = false, .pads = true }); // Latin1_General_CI_AS
-    try facts.put("c", .{ .text = true, .byte_order = true, .pads = false }); // postgres COLLATE "C"
+    try facts.put("d", .{ .text = true, .byte_order = true, .pads = true });
+    try facts.put("ci", .{ .text = true, .byte_order = false, .pads = true });
+    try facts.put("c", .{ .text = true, .byte_order = true, .pads = false });
     try facts.put("n", .{ .text = false });
 
     const cases = [_]struct { src: []const u8, need: Need, want: ?[]const u8, d: Dialect = .sqlserver }{
-        // binary and padded: as a superset, the range is widened and the prefix kept
         .{ .src = "d >= '20240105'", .need = .superset, .want = "([d] >= '20240105' OR [d] LIKE '20240105%')" },
         .{ .src = "d > '000123'", .need = .superset, .want = "([d] >= '000123' OR [d] LIKE '000123%')" },
         .{ .src = "d < 'Z'", .need = .superset, .want = "([d] <= 'Z')" },
         .{ .src = "d = '01'", .need = .superset, .want = "([d] = '01')" },
-        // exact: a byte length separates '01' from '01 '
         .{ .src = "d = '01'", .need = .exact, .want = "([d] = '01' AND DATALENGTH([d]) = 2)" },
         .{ .src = "d > '000123'", .need = .exact, .want = "([d] > '000123' OR ([d] LIKE '000123%' AND DATALENGTH([d]) > 6))" },
         .{ .src = "d < '2024'", .need = .exact, .want = "(NOT ([d] >= '2024' OR [d] LIKE '2024%'))" },
@@ -3147,19 +2764,15 @@ test "text comparisons against the column's collation: exact where it compares b
         .{ .src = "d >= 'a b'", .need = .superset, .want = "([d] >= 'a b' OR [d] LIKE 'a b%')" },
         .{ .src = "d >= '10%'", .need = .superset, .want = "([d] >= '10%' OR [d] LIKE '10[%]%')" },
         .{ .src = "d = 'x '", .need = .exact, .want = null },
-        // case-insensitive: equality may only widen, and there is no exact form
         .{ .src = "ci = 'x'", .need = .superset, .want = "([ci] = 'x')" },
         .{ .src = "ci = 'x'", .need = .exact, .want = null },
         .{ .src = "ci >= 'B'", .need = .superset, .want = null },
         .{ .src = "ci <> 'x'", .need = .superset, .want = null },
         .{ .src = "ci LIKE 'a%'", .need = .superset, .want = "([ci] LIKE 'a%')" },
         .{ .src = "ci LIKE 'a%'", .need = .exact, .want = null },
-        // bytes, no padding: every comparison as it is
         .{ .src = "c >= 'b'", .need = .exact, .want = "(\"c\" >= 'b')", .d = .postgres },
         .{ .src = "c <> 'b'", .need = .exact, .want = "(\"c\" <> 'b')", .d = .postgres },
-        // postgres has no byte length that sees char(n) padding
         .{ .src = "d = 'x'", .need = .exact, .want = null, .d = .postgres },
-        // not text: the literal converts at the source as it does here
         .{ .src = "n >= '2024-01-01'", .need = .exact, .want = "([n] >= '2024-01-01')" },
         .{ .src = "d = '01'", .need = .exact, .want = "(`d` = '01' AND LENGTH(`d`) = 2)", .d = .mysql },
     };
@@ -3178,7 +2791,6 @@ test "text comparisons against the column's collation: exact where it compares b
         }
     }
 
-    // without facts, a text order says it would like them
     var wants = false;
     var diag: sqlp.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const e = try sqlp.parseExprStr(a, "x >= 'B'", &diag);

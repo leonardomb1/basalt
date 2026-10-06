@@ -1,20 +1,16 @@
-//! SQL Server Resolution Protocol (SSRP / [MC-SQLR]) — resolves a named
-//! instance (`host\INSTANCE`) to its dynamic TCP port via the SQL Server
-//! Browser service on UDP 1434. Basalt's TDS driver only speaks direct
-//! host:port, so this runs first when a connection names an instance and no
-//! explicit `port` was given.
+//! SQL Server Resolution Protocol (SSRP, [MC-SQLR]): resolves a named instance
+//! (`host\INSTANCE`) to its dynamic TCP port via the SQL Server Browser on UDP
+//! 1434. The TDS driver only speaks host:port, so this runs first when a
+//! connection names an instance and gives no explicit `port`.
 //!
-//! Exchange: send one request byte `0x03` (CLNT_UCAST_EX — "list every
-//! instance on this server") to <host>:1434; the Browser replies with one
-//! datagram: `0x05`, a 2-byte little-endian length, then an ASCII string of
-//! `;`-delimited `key;value` pairs, one instance block per `;;`:
+//! Exchange: send the single byte `0x03` (CLNT_UCAST_EX, list every instance);
+//! the Browser replies with one datagram: `0x05`, a 2-byte little-endian length,
+//! then ASCII `key;value` pairs with one instance block per `;;`:
 //!   ServerName;HOST;InstanceName;SALES;IsClustered;No;Version;15.0.2000.5;tcp;51000;;
-//! We find the block whose InstanceName matches (case-insensitive) and read its
-//! `tcp` port.
+//! The block whose InstanceName matches (case-insensitive) gives the `tcp` port.
 //!
-//! Caveat: UDP 1434 is frequently firewalled even where the TDS port is open,
-//! so an explicit `port` (which skips this lookup) stays the robust choice in
-//! locked-down networks.
+//! UDP 1434 is often firewalled even where the TDS port is open, so an explicit
+//! `port`, which skips this lookup, stays the robust choice in locked-down networks.
 
 const std = @import("std");
 
@@ -27,8 +23,6 @@ pub const Error = error{
 
 pub const HostInstance = struct { host: []const u8, instance: ?[]const u8 };
 
-/// Split `host\INSTANCE` on the first backslash. No backslash ⇒ instance null
-/// (a plain host:port connection). Slices borrow from `host`.
 pub fn splitHostInstance(host: []const u8) HostInstance {
     if (std.mem.indexOfScalar(u8, host, '\\')) |bs| {
         return .{ .host = host[0..bs], .instance = host[bs + 1 ..] };
@@ -36,10 +30,8 @@ pub fn splitHostInstance(host: []const u8) HostInstance {
     return .{ .host = host, .instance = null };
 }
 
-/// Parse an SSRP response, returning the TCP port of the block whose
-/// InstanceName matches `instance` (case-insensitive). Errors distinguish
-/// "no such instance" from "found but TCP disabled" so the caller can say
-/// something actionable. Offline-testable — no socket involved.
+/// The TCP port of the block whose InstanceName matches `instance`. Errors tell
+/// "no such instance" apart from "found but TCP disabled".
 pub fn parsePort(data: []const u8, instance: []const u8) Error!u16 {
     var body = data;
     if (body.len >= 3 and body[0] == 0x05) body = body[3..];
@@ -67,8 +59,7 @@ pub fn parsePort(data: []const u8, instance: []const u8) Error!u16 {
     return if (found) Error.TcpDisabled else Error.InstanceNotFound;
 }
 
-/// Resolve `host\instance` → TCP port by querying the SQL Server Browser at
-/// `host:1434`. One 2s-timeout UDP round-trip, retried once (UDP is lossy).
+/// One 2s-timeout UDP round-trip to `host:1434`, retried once since UDP is lossy.
 pub fn resolveInstancePort(gpa: std.mem.Allocator, host: []const u8, instance: []const u8) !u16 {
     const list = try std.net.getAddressList(gpa, host, 1434);
     defer list.deinit();

@@ -4,21 +4,35 @@
 //!   - stdout = data only (a sink, or the `--json` run summary).
 //!   - stderr = logs + diagnostics, plain human text. `--log-format json` opts
 //!     into NDJSON (one object per line) for collectors; nothing switches format
-//!     on its own.
+//!     on its own (`auto` resolves to text).
 //! Every line and the summary carry the `run_id` for correlation.
+//!
+//! `Logger` is thread-safe, since lanes log concurrently. `PRINT` output is not a
+//! diagnostic: no log level gates it and only `-q` silences it, but it stays on
+//! stderr so stdout remains the data channel `--format json` makes a contract.
+//!
+//! `Progress` is a live one-line status for a person at a TTY: spinner, what is
+//! moving where, rows, rate and clock, with `[3/12]` under a fanning-out
+//! `FOR EACH`. It shares the logger's mutex and every log write erases it first,
+//! so the two never collide; nothing is drawn for the first `quiet_ms`, and inside
+//! a loop the line stays up between rows. Its `json` mode writes a `progress`
+//! event once a second instead, and `hook` hands the event to a caller.
+//!
+//! `RowCounter` and `LoadTally` are shared by pointer across the workers of a
+//! parallel `FOR EACH`: one `fetchAdd` credits every link of a counter chain, so
+//! the run total and each worker's own count both see every row. The summary's
+//! rate is over rows processed, not written: an aggregate folding six million
+//! rows into four once reported `11 rows/s`.
 
 const std = @import("std");
 const driver = @import("../connect/driver.zig");
 const types = @import("../lang/types.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 
-/// Stderr log rendering. `auto` is the flag's default and an accepted alias; it
-/// resolves to text, same as `text`.
 pub const Format = enum { auto, text, json };
 
-/// Log through `logger` when a handle is wired (connectors get one from the
-/// runtime after open), else fall back to a raw stderr line — keeps standalone
-/// and test use noisy enough to debug without a logger.
+/// Logs through `logger` when the runtime wired one, else a raw stderr line, so
+/// standalone and test use stays debuggable.
 pub fn logOr(logger: ?*Logger, level: Level, comptime fmt: []const u8, args: anytype) void {
     if (logger) |lg| {
         lg.log(level, fmt, args);
@@ -50,21 +64,16 @@ pub const Level = enum(u8) {
     }
 };
 
-/// Stderr logger. `json` is resolved once at init from the format so the hot path
-/// is just a branch. Thread-safe (lanes log concurrently).
 pub const Logger = struct {
     file: std.fs.File,
     json: bool,
     min: Level,
     run_id: u64,
-    /// `-q`: silences `PRINT` too, which no log level does.
     quiet: bool = false,
     mutex: std.Thread.Mutex = .{},
-    /// A `Progress` line currently occupies the terminal row. Guarded by `mutex`;
-    /// every writer below erases it first, so a log line never lands mid-line.
     progress_drawn: bool = false,
 
-    /// One `progress` event as an NDJSON log line. Caller holds `mutex`.
+    /// Caller holds `mutex`.
     fn progressEvent(self: *Logger, ev: Progress.Event) void {
         var buf: [512]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
@@ -91,10 +100,6 @@ pub const Logger = struct {
         return @intFromEnum(level) <= @intFromEnum(self.min);
     }
 
-    /// A line the script itself asked for (`PRINT`). It is output, not a
-    /// diagnostic, so `--log-level` does not gate it and it carries no severity
-    /// prefix — only `-q` silences it. Still stderr: stdout stays the data
-    /// channel that `--format json` makes a parseable contract.
     pub fn script(self: *Logger, msg: []const u8) void {
         if (self.quiet) return;
         self.mutex.lock();
@@ -112,8 +117,6 @@ pub const Logger = struct {
         self.file.writeAll(w.buffered()) catch return;
     }
 
-    /// Render the end-of-run summary to stderr in the logger's format (human block
-    /// by default, a structured `run_complete` line under `--log-format json`).
     pub fn summary(self: *Logger, s: Summary) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -129,10 +132,8 @@ pub const Logger = struct {
         self.file.writeAll(w.buffered()) catch return;
     }
 
-    /// One finished `LOAD` of a run that has several, in the manner of `uv`'s
-    /// ` + package` lines: printed as each completes, above the live progress line.
-    /// Text only when `items` asked for it; under `--log-format json` it is an
-    /// `info`-level `load_complete` / `load_failed` event instead.
+    /// One finished `LOAD` of several, printed above the live progress line when
+    /// `items` asked for it; a `load_complete` / `load_failed` event under JSON.
     pub fn item(self: *Logger, it: Item) void {
         if (self.quiet) return;
         if (self.json and !self.enabled(.info)) return;
@@ -145,10 +146,9 @@ pub const Logger = struct {
         self.file.writeAll(w.buffered()) catch return;
     }
 
+    /// Lines over the 16 KiB buffer are cut, not dropped.
     pub fn log(self: *Logger, level: Level, comptime fmt: []const u8, args: anytype) void {
         if (!self.enabled(level)) return;
-        // Wide enough for a debug line carrying a 300-column SELECT; a line that
-        // still does not fit is cut, not dropped.
         var buf: [16384]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..];
         self.mutex.lock();
@@ -167,22 +167,11 @@ pub const Logger = struct {
     }
 };
 
-/// A live one-line status on stderr while a `LOAD` moves rows, in the manner of
-/// `uv`/`cargo`: a spinner, what is moving where, rows so far, the rate and the
-/// clock — and `[3/12]` in front when a `FOR EACH` is fanning out.
-///
-/// It is a courtesy for a person at a terminal and nothing else: the caller turns
-/// it on only when stderr is a TTY, it never touches stdout, and it shares the
-/// logger's mutex so a log line erases it rather than colliding with it. Nothing
-/// is drawn for the first `quiet_ms`, so a short run never flickers.
 pub const Progress = struct {
     logger: *Logger,
     rows: *RowCounter,
     thread: ?std.Thread = null,
-    /// Set to stop: the ticker waits on it between frames, so `stop` returns at
-    /// once instead of after the sleep it was in — which put 100 ms on every run.
     stop_flag: std.Thread.ResetEvent = .{},
-    /// Below: guarded by `logger.mutex`.
     active: usize = 0,
     label_buf: [192]u8 = undefined,
     label_len: usize = 0,
@@ -193,13 +182,7 @@ pub const Progress = struct {
     loop_done: usize = 0,
     loop_began_ms: i64 = 0,
     frame: usize = 0,
-    /// Colour the line (a cyan spinner, a green count, the rest dim), unless
-    /// `NO_COLOR` asks for plain text.
     color: bool = true,
-    /// `line` draws for a person at a terminal. `json` writes a `progress` event
-    /// to the log instead, once a second — what a UI reading the log shows in
-    /// place of the line — and `hook` hands the same event to a caller (the
-    /// session kernel frames it).
     mode: Mode = .line,
     hook: ?EventHook = null,
     last_event_ms: i64 = 0,
@@ -230,6 +213,8 @@ pub const Progress = struct {
         self.thread = std.Thread.spawn(.{}, ticker, .{self}) catch null;
     }
 
+    /// Signals the ticker's wait rather than letting it finish a sleep, which once
+    /// added 100 ms to every run.
     pub fn stop(self: *Progress) void {
         self.stop_flag.set();
         if (self.thread) |t| t.join();
@@ -239,8 +224,7 @@ pub const Progress = struct {
         self.logger.eraseProgress();
     }
 
-    /// A pipeline started writing `label` (`source → sink`). Calls nest under a
-    /// parallel `FOR EACH`; the line names the most recent one.
+    /// Calls nest under a parallel `FOR EACH`; the line names the most recent one.
     pub fn begin(self: *Progress, label: []const u8) void {
         self.logger.mutex.lock();
         defer self.logger.mutex.unlock();
@@ -257,13 +241,11 @@ pub const Progress = struct {
         self.logger.mutex.lock();
         defer self.logger.mutex.unlock();
         if (self.active > 0) self.active -= 1;
-        // Inside a loop the line stays up between rows: three hundred quick loads
-        // are one long wait, and a line that blinks per table reads as noise.
         if (self.active == 0 and self.loop_depth == 0) self.logger.eraseProgress();
     }
 
-    /// A `FOR EACH` over `total` rows began. Only the outermost loop is counted;
-    /// the result says whether this one is it, and is what `loopTick` takes.
+    /// Only the outermost loop is counted; the result says whether this is it, and
+    /// is what `loopTick` takes.
     pub fn loopBegin(self: *Progress, total: usize) bool {
         self.logger.mutex.lock();
         defer self.logger.mutex.unlock();
@@ -275,7 +257,6 @@ pub const Progress = struct {
         return true;
     }
 
-    /// The outermost loop's rows finished and rows in all; 0 and 0 outside one.
     pub fn loopState(self: *Progress) struct { done: usize, total: usize } {
         self.logger.mutex.lock();
         defer self.logger.mutex.unlock();
@@ -307,7 +288,6 @@ pub const Progress = struct {
             const looping = self.loop_depth > 0;
             if (self.active == 0 and !(looping and self.label_len > 0)) continue;
             const now = std.time.milliTimestamp();
-            // The wait that matters is the whole loop's, not the current row's.
             if (now - (if (looping) self.loop_began_ms else self.began_ms) < quiet_ms) continue;
             if (self.mode != .line) {
                 if (now - self.last_event_ms < event_ms) continue;
@@ -349,10 +329,7 @@ pub const Progress = struct {
         spinner: []const u8,
         label: []const u8,
         rows: u64,
-        /// How long this statement has run — what the rate is over.
         elapsed_ms: u64,
-        /// What the clock shows: the statement's time, or the whole loop's inside a
-        /// `FOR EACH`, where the per-row time keeps snapping back to zero.
         clock_ms: ?u64 = null,
         loop_done: usize = 0,
         loop_total: usize = 0,
@@ -360,10 +337,9 @@ pub const Progress = struct {
         color: bool = false,
     };
 
-    /// One progress line, no newline, never wider than `width` columns — a wrapped
-    /// line cannot be erased with a carriage return. The label gives way first.
+    /// Never wider than `width` columns, since a wrapped line cannot be erased with a
+    /// carriage return. The label gives way first; colour codes are not measured.
     pub fn render(w: *std.Io.Writer, l: Line) !void {
-        // Measured without its colour codes, which take no columns.
         var tail_buf: [96]u8 = undefined;
         var tw = std.Io.Writer.fixed(&tail_buf);
         try tw.writeAll("  ");
@@ -411,8 +387,7 @@ fn columns(s: []const u8) usize {
     return n;
 }
 
-/// `s` in at most `room` columns, the middle replaced by `…` when it does not fit:
-/// a path or a qualified table says most at its two ends.
+/// Elides the middle, since a path or a qualified table says most at its ends.
 fn writeFitted(w: *std.Io.Writer, s: []const u8, room: usize) !void {
     if (columns(s) <= room) return w.writeAll(s);
     if (room < 4) return;
@@ -444,7 +419,6 @@ fn writeThousands(w: anytype, n: u64) !void {
     }
 }
 
-/// `412ms`, `8.2s`, `3m 12s` — the precision a person reads at each scale.
 fn writeDuration(w: anytype, ms: u64) !void {
     if (ms < 1000) return w.print("{d}ms", .{ms});
     if (ms < 60_000) return w.print("{d}.{d}s", .{ ms / 1000, ms % 1000 / 100 });
@@ -457,11 +431,6 @@ fn writeRate(w: anytype, r: u64) !void {
     return writeThousands(w, r);
 }
 
-/// Rows read, counted up a chain: a counter of its own for each worker of a
-/// parallel `FOR EACH`, whose `up` is the run's. One `fetchAdd` credits every
-/// link, so the run total and the live line see all rows while each worker's
-/// load still knows its own. The atomic's method names, so a site that took a
-/// bare counter takes this one unchanged.
 pub const RowCounter = struct {
     n: std.atomic.Value(u64) = .init(0),
     up: ?*RowCounter = null,
@@ -479,15 +448,10 @@ pub const RowCounter = struct {
     }
 };
 
-/// How many `LOAD`s a run finished and how many failed. Shared by pointer, so the
-/// workers of a parallel `FOR EACH` count into the same two numbers.
 pub const LoadTally = struct {
     ok: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     failed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// Rows the finished loads wrote — not the run's `rows_written`, which also
-    /// counts what a terminal SELECT printed.
     rows: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// The next finished load's ordinal.
     seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
@@ -495,7 +459,6 @@ pub const Item = struct {
     target: []const u8,
     rows: u64 = 0,
     elapsed_ms: u64 = 0,
-    /// Set on a failed load: why.
     reason: ?[]const u8 = null,
 
     pub fn renderText(self: Item, w: *std.Io.Writer) !void {
@@ -526,8 +489,6 @@ pub const Item = struct {
     }
 };
 
-/// End-of-run metrics. Rendered as one sentence for a person (stderr) or one JSON
-/// object for a program (stdout `--format json`, or the `run_complete` log line).
 pub const Summary = struct {
     run_id: u64,
     source: []const u8 = "",
@@ -536,21 +497,13 @@ pub const Summary = struct {
     rows_written: u64 = 0,
     elapsed_ms: u64 = 0,
     threads: usize = 1,
-    /// `LOAD`s finished and failed, and — when the run was exactly one — its target
-    /// as the script spelled it.
     loads: u64 = 1,
     loads_failed: u64 = 0,
     target: []const u8 = "",
-    /// Rows the loads wrote, for the sentence; null falls back to `rows_written`.
     rows_loaded: ?u64 = null,
-    /// The run was one `LOAD` and nothing else, so `rows_read` is that load's own
-    /// and worth saying when it differs. Beside other statements it is not.
     lone_load: bool = true,
     pushdown: Pushdown = .{},
 
-    /// What the sources were spared: parquet row groups skipped on statistics
-    /// (of those considered), columns decoded (of those the files hold), and
-    /// SQL reads that carried a pushed filter.
     pub const Pushdown = struct {
         row_groups: u64 = 0,
         row_groups_skipped: u64 = 0,
@@ -563,24 +516,15 @@ pub const Summary = struct {
         }
     };
 
-    /// Throughput on rows **processed**, not rows emitted. Dividing the written count
-    /// by the clock described how fast the answer was printed, not how fast the run
-    /// worked: an aggregate folding 6,001,215 rows into 4 reported `11 rows/s`.
-    ///
-    /// `rows_read` is the volume that actually moved through the pipeline, and for a
-    /// straight move it equals `rows_written`, so this only changes the shapes that
-    /// reduce. It falls back to the written count when nothing was read — a sourceless
-    /// run (`FROM BODY`) still has a meaningful rate.
+    /// Rows read per second, falling back to rows written for a sourceless run.
     pub fn rate(self: Summary) u64 {
         const rows = if (self.rows_read > 0) self.rows_read else self.rows_written;
         if (self.elapsed_ms == 0) return rows;
         return rows * 1000 / self.elapsed_ms;
     }
 
-    /// The run in one sentence, verb first, the way `uv` and `pip` close:
     /// `Loaded 20,000,000 rows into sr.bronze.orders in 8.2s (2.4M rows/s, 12 lanes)`.
-    /// The run id is deliberately absent — it is for correlating machine logs, and
-    /// both JSON renderings carry it.
+    /// The run id is left out; both JSON renderings carry it.
     pub fn renderText(self: Summary, w: anytype) !void {
         const total = self.loads + self.loads_failed;
         const loaded = self.rows_loaded orelse self.rows_written;
@@ -617,9 +561,6 @@ pub const Summary = struct {
         try self.renderJsonFields(w);
     }
 
-    /// The shared metric fields (and closing brace/newline) of both JSON
-    /// renderings: the `--json` stdout summary and the NDJSON `run_complete`
-    /// stderr line — only their envelope prefixes differ.
     fn renderJsonFields(self: Summary, w: anytype) !void {
         try w.print(
             "\"source\":\"{s}\",\"sink\":\"{s}\",\"rows_read\":{d},\"rows_written\":{d},\"elapsed_ms\":{d},\"rows_per_sec\":{d},\"loads\":{d},\"loads_failed\":{d}",
@@ -634,8 +575,6 @@ pub const Summary = struct {
     }
 };
 
-/// Wraps a `driver.Source`, counting emitted rows into a shared atomic — so the
-/// pipeline gets a "rows read" figure with no per-operator instrumentation.
 pub const CountingSource = struct {
     inner: driver.Source,
     count: *RowCounter,
@@ -687,7 +626,6 @@ test "progress line: counts, rate and clock, and a label that gives way to the w
     try std.testing.expect(std.mem.indexOf(u8, line, "…") != null);
     try std.testing.expect(std.mem.endsWith(u8, line, ".parquet  950 rows  15 rows/s  1:01"));
 
-    // In colour the same text, dressed; stripped of its codes it is byte-identical.
     w = std.Io.Writer.fixed(&buf);
     try Progress.render(&w, .{ .spinner = "*", .label = "a → b", .rows = 12, .elapsed_ms = 2000, .loop_done = 0, .loop_total = 3, .width = 80, .color = true });
     var plain: [256]u8 = undefined;
@@ -779,7 +717,6 @@ test "summary sentence: one load, a load that reduces, and a run of several with
     try (Summary{ .run_id = 7, .sink = "csv", .target = "agg_out.csv", .rows_read = 4_000_000, .rows_written = 7, .elapsed_ms = 1900 }).renderText(&w);
     try std.testing.expectEqualStrings("Read 4,000,000 rows, loaded 7 into agg_out.csv in 1.9s (2.1M rows/s)\n", w.buffered());
 
-    // Beside a SELECT, the run's totals are not the load's: say only what it wrote.
     w = std.Io.Writer.fixed(&buf);
     try (Summary{ .run_id = 7, .sink = "parquet", .target = "/tmp/h.parquet", .rows_read = 291, .rows_written = 117, .rows_loaded = 112, .lone_load = false, .elapsed_ms = 771 }).renderText(&w);
     try std.testing.expectEqualStrings("Loaded 112 rows into /tmp/h.parquet in 771ms (377 rows/s)\n", w.buffered());
@@ -800,20 +737,15 @@ test "item lines: a finished load is aligned, a failed one says why" {
 }
 
 test "summary rate: an aggregate reports the rows it processed, not the rows it wrote" {
-    // 6,001,215 rows folded to 4 in 350ms used to read as `11 rows/s` — the speed the
-    // answer was written at. The run's throughput is the volume it moved.
     const agg = Summary{ .run_id = 1, .rows_read = 6_001_215, .rows_written = 4, .elapsed_ms = 350 };
     try std.testing.expectEqual(@as(u64, 17_146_328), agg.rate());
 
-    // A straight move reads and writes the same rows, so nothing changes there.
     const move = Summary{ .run_id = 1, .rows_read = 1000, .rows_written = 1000, .elapsed_ms = 500 };
     try std.testing.expectEqual(@as(u64, 2000), move.rate());
 
-    // Nothing read (a sourceless run) still reports a rate, from what it wrote.
     const sourceless = Summary{ .run_id = 1, .rows_read = 0, .rows_written = 50, .elapsed_ms = 100 };
     try std.testing.expectEqual(@as(u64, 500), sourceless.rate());
 
-    // A sub-millisecond run divides by nothing; report the raw count.
     const instant = Summary{ .run_id = 1, .rows_read = 42, .rows_written = 1, .elapsed_ms = 0 };
     try std.testing.expectEqual(@as(u64, 42), instant.rate());
 }
@@ -835,7 +767,6 @@ test "logger level gate: err/warn/info pass at min=info, debug is filtered" {
 const test_empty_schema = types.Schema{ .fields = &.{} };
 var test_no_cols: [0]@import("../exec/column.zig").Column = .{};
 
-/// A source emitting one zero-column batch per entry of `batches`, then EOF.
 const FakeSource = struct {
     batches: []const usize,
     i: usize = 0,

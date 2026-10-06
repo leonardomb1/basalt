@@ -2,6 +2,19 @@
 //! Rows are accumulated (stringified into the sink's own allocator, since batch
 //! arenas are reset between calls) and the table is laid out on `close`, once all
 //! column widths are known. Intended for the REPL and ad-hoc `pipeline run`.
+//!
+//! `interactive` is set by the REPL alone: tables are fitted to the terminal and
+//! the last result is kept as a `Grid` for `\view`. A grid holds the first
+//! `keep_max` rows row-major, plus a ring of the last few in `tail` so a summary
+//! still shows both ends; a fitted table shows `show_max` rows, cuts cells at
+//! `cell_max` and elides middle columns pandas-style (`fitColumns`). `basalt run`
+//! leaves it off, so its stdout is the whole result whether or not a terminal is
+//! watching. Colours use only foreground and plain attributes, so they read on
+//! dark and light terminals alike.
+//!
+//! `JsonWriter` is the `--format json` sink: NDJSON streamed per batch, never
+//! buffered. Decimals ride as strings (a float would lose precision), non-finite
+//! floats as null, temporal types as ISO text and bytes as base64.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -10,9 +23,6 @@ const eval = @import("../exec/eval.zig");
 const Value = @import("../exec/value.zig").Value;
 const driver = @import("driver.zig");
 
-/// A finished result as text: what the fitted table and the REPL's `\view` draw
-/// from. `cells` is row-major and holds the first `keep_max` rows; when the query
-/// produced more, `tail` holds the last few, so a summary can still show both ends.
 pub const Grid = struct {
     names: []const []const u8,
     types: []const []const u8,
@@ -32,9 +42,6 @@ pub const Grid = struct {
     }
 };
 
-/// Set by the REPL, and by nothing else: fit tables to the terminal and keep the
-/// last one for `\view`. `basalt run` leaves it off, so its stdout is the whole
-/// result — every row and column — whether or not a terminal is watching.
 pub var interactive: bool = false;
 var last_store: ?*TableWriter = null;
 
@@ -58,14 +65,10 @@ pub const TableWriter = struct {
     tail: std.array_list.Managed(?[]const u8),
     tail_at: usize = 0,
     nrows: usize = 0,
-    /// An interactive session on a terminal: fit the table to it rather than
-    /// print every cell.
     tty: bool,
 
-    /// Rows an interactive session keeps. `basalt run` prints everything and keeps it all.
     pub const keep_max = 10_000;
     const tail_rows = 20;
-    /// Rows a fitted table shows before it elides the middle.
     pub const show_max = 40;
 
     pub fn open(gpa: std.mem.Allocator, schema: types.Schema) !*TableWriter {
@@ -103,7 +106,6 @@ pub const TableWriter = struct {
                 } else if (self.tail.items.len < tail_rows * self.ncols) {
                     try self.tail.append(s);
                 } else {
-                    // A ring of the last rows, rotated into order on `grid()`.
                     const at = self.tail_at * self.ncols + c;
                     if (self.tail.items[at]) |old| self.gpa.free(old);
                     self.tail.items[at] = s;
@@ -119,12 +121,12 @@ pub const TableWriter = struct {
         return .{ .names = self.names, .types = self.type_labels, .right = self.right, .cells = self.cells.items, .tail = self.tail.items, .total_rows = self.nrows };
     }
 
+    /// Writes stdout streaming, not positional: a second SELECT's writer would
+    /// otherwise start at offset 0 and overwrite the first in a redirected file.
     pub fn close(self: *TableWriter) !void {
         var keep = false;
         defer if (!keep) self.deinit();
 
-        // Streaming, not positional: a second SELECT's writer would otherwise start
-        // at offset 0 again and, with stdout redirected to a file, overwrite the first.
         var buf: [8192]u8 = undefined;
         var fw = std.fs.File.stdout().writerStreaming(&buf);
         const out = &fw.interface;
@@ -181,7 +183,6 @@ pub const TableWriter = struct {
         try out.print("({d} row{s})\n", .{ self.nrows, if (self.nrows == 1) "" else "s" });
     }
 
-    /// Failure path: discard the accumulated rows without printing.
     pub fn abort(self: *TableWriter) void {
         self.deinit();
     }
@@ -212,16 +213,11 @@ fn typeLabel(gpa: std.mem.Allocator, t: types.Type) ![]const u8 {
     return std.fmt.allocPrint(gpa, "{s}{s}", .{ @tagName(t.kind), q });
 }
 
-/// The kind behind a column's type label (`int?`, `decimal(10,2)`, …).
 pub fn kindOf(label: []const u8) ?types.TypeKind {
     const end = std.mem.indexOfAny(u8, label, "?(") orelse label.len;
     return std.meta.stringToEnum(types.TypeKind, label[0..end]);
 }
 
-/// How a value is coloured, by its column's type: numbers cyan and a negative
-/// one red, dates and times magenta, booleans green or red, nested values
-/// yellow, bytes dim, text as the terminal writes it. Only the foreground and
-/// the plain attributes, so it reads on a dark terminal and a light one alike.
 pub const palette = struct {
     pub const name = "\x1b[1m";
     pub const type_label = "\x1b[2m";
@@ -255,23 +251,17 @@ pub const Fit = struct {
     width: usize = 80,
     color: bool = false,
     max_rows: usize = TableWriter.show_max,
-    /// Appended to the footer when something was elided.
     hint: []const u8 = "",
 };
 
-/// The widest a cell is drawn in a fitted table; the rest is `…`.
 pub const cell_max = 40;
 
-/// Which columns a `width`-wide terminal can show: all of them, or — in the manner
-/// of pandas — as many as fit taken alternately from the left and the right, with
-/// the middle elided. `left + right < widths.len` means a `…` column sits between.
 pub const ColumnFit = struct { left: usize, right: usize };
 
 pub fn fitColumns(widths: []const usize, width: usize) ColumnFit {
     var all: usize = 0;
     for (widths, 0..) |w, i| all += w + @as(usize, if (i > 0) 2 else 0);
     if (all <= width or widths.len <= 1) return .{ .left = widths.len, .right = 0 };
-    // Room for the `…` column and its separator comes off the top.
     var used: usize = 3;
     var left: usize = 0;
     var right: usize = 0;
@@ -286,9 +276,8 @@ pub fn fitColumns(widths: []const usize, width: usize) ColumnFit {
     return .{ .left = left, .right = right };
 }
 
-/// A result fitted to a terminal: a row of types under the names, numbers to the
-/// right, `NULL` said out loud, long cells cut at `cell_max`, and `…` standing in
-/// for the rows and columns that do not fit. The footer always gives the true size.
+/// A row of types under the names, numbers right-aligned, `NULL` spelled out and
+/// `…` for what does not fit; the footer always gives the true size.
 pub fn renderFitted(out: *std.Io.Writer, g: Grid, fit: Fit) !void {
     const n = g.ncols();
     if (n == 0) return out.print("({d} row{s})\n", .{ g.total_rows, if (g.total_rows == 1) "" else "s" });
@@ -297,8 +286,6 @@ pub fn renderFitted(out: *std.Io.Writer, g: Grid, fit: Fit) !void {
     const head: usize = if (elide_rows) fit.max_rows / 2 else kept;
     const tail_n: usize = if (elide_rows) fit.max_rows / 2 else 0;
     const tail_rows_kept = g.tail.len / n;
-    // The closing rows come from the tail ring when the result outgrew what was
-    // kept, and from the end of the kept rows otherwise.
     const tail_from_ring = elide_rows and tail_rows_kept >= tail_n;
 
     var width_buf: [512]usize = undefined;
@@ -438,8 +425,8 @@ fn aligned(out: *std.Io.Writer, s: []const u8, width: usize, right: bool) !void 
     if (!right) try out.splatBytesAll(" ", pad);
 }
 
-/// A data cell in `width` columns: control characters flattened to spaces so a
-/// newline inside a value cannot break the grid, and the overflow cut with `…`.
+/// Control characters become spaces so a newline in a value cannot break the
+/// grid; overflow is cut with `…`.
 pub fn alignedCell(out: *std.Io.Writer, s: []const u8, width: usize, right: bool) !void {
     const w = displayWidth(s);
     const shown = @min(w, width);
@@ -459,12 +446,9 @@ pub fn alignedCell(out: *std.Io.Writer, s: []const u8, width: usize, right: bool
     if (!right) try out.splatBytesAll(" ", pad);
 }
 
-/// Column width in characters, not bytes. `LIQUIDAÇÃO` is ten characters in
-/// twelve bytes, and padding by the byte count pushed every later column of that
-/// row out of line — which shows up the moment a file is not pure ASCII, i.e. on
-/// most non-English data. Counts UTF-8 lead bytes, so a malformed sequence is
-/// counted rather than rejected: this is output formatting, not validation. East
-/// Asian wide characters still measure one, which is a separate problem.
+/// Width in characters, not bytes: padding by bytes misaligned every non-ASCII
+/// row. Counts UTF-8 lead bytes without validating; East Asian wide characters
+/// still measure one.
 pub fn displayWidth(s: []const u8) usize {
     var n: usize = 0;
     for (s) |c| {
@@ -479,14 +463,8 @@ fn padded(out: *std.Io.Writer, s: []const u8, width: usize) !void {
     try out.splatBytesAll(" ", if (width > w) width - w else 0);
 }
 
-/// `--format json` sink: one JSON object per row (NDJSON) on stdout, streamed
-/// per batch — unlike the table it never buffers, so memory stays constant.
-/// int/float/bool ride as JSON numbers/booleans (non-finite floats as null),
-/// decimal as a string (a float would lose precision), temporal types as their
-/// ISO text, bytes as base64.
 pub const JsonWriter = struct {
     gpa: std.mem.Allocator,
-    /// Pre-rendered `"name":` prefixes, escaped once at open.
     keys: []const []const u8,
     buf: [8192]u8 = undefined,
     fw: std.fs.File.Writer = undefined,
@@ -548,7 +526,6 @@ pub const JsonWriter = struct {
         self.deinit();
     }
 
-    /// Failure path: release without flushing the tail of the stream.
     pub fn abort(self: *JsonWriter) void {
         self.deinit();
     }
@@ -600,9 +577,7 @@ test "json escape covers quotes, backslash, and control bytes" {
 
 test "fitColumns: everything when it fits, else both ends around an elided middle" {
     try std.testing.expectEqual(ColumnFit{ .left = 3, .right = 0 }, fitColumns(&.{ 4, 4, 4 }, 80));
-    // 6 columns of 10 in 40: `…` takes 3, each column costs 12 → three fit, left first.
     try std.testing.expectEqual(ColumnFit{ .left = 2, .right = 1 }, fitColumns(&.{ 10, 10, 10, 10, 10, 10 }, 40));
-    // A first column wider than the terminal is still shown rather than nothing.
     try std.testing.expectEqual(ColumnFit{ .left = 1, .right = 0 }, fitColumns(&.{ 90, 5 }, 40));
 }
 

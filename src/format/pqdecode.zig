@@ -1,20 +1,51 @@
-//! Parquet value decoding: levels, encodings, and page-to-column assembly.
+//! Parquet value decoding and the file reader: levels, encodings, page-to-column
+//! assembly, row-group pruning, and the byte sources a file is read from.
 //!
 //! A decompressed page is still encoded. This module turns those bytes into
-//! `Value`s and builds a basalt `Column` from them.
+//! `Value`s, or straight into a column's typed store on the hot paths, and builds
+//! a basalt `Column` from them. Encodings handled: PLAIN, the RLE/bit-packed
+//! hybrid used for levels and dictionary indices (`PLAIN_DICTIONARY` and
+//! `RLE_DICTIONARY` share a wire format), DELTA_BINARY_PACKED,
+//! DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY and BYTE_STREAM_SPLIT, in data pages
+//! v1 and v2. Every length, count, width and offset comes off the wire and is
+//! attacker-controlled, so each is checked before use as a length, shift or cast:
+//! a hostile file yields `CorruptParquetPage`, never a trap or a wrong value.
 //!
-//! A struct's fields read as flat dotted columns (`addr.city`). A list of
-//! scalars — any depth, so a list of lists too — reads as one `string` column
-//! of JSON arrays named for the list, assembled from repetition and definition
-//! levels, which `JSON_EACH` and `json_get` take apart. A list of structs, a
-//! map, and any nesting of them spread over several leaves and are assembled
-//! from all of them into one JSON column — objects for structs and maps,
-//! arrays for lists.
+//! Types come from the LogicalType when the writer gave one, else the legacy
+//! ConvertedType. TIME and TIMESTAMP are stored in millis, micros or nanos and
+//! always read as micros (`TemporalScale`): ignoring the unit once read millisecond
+//! timestamps as 1970. Nanos floor-divide, which is monotone, so statistics-based
+//! pruning stays sound after conversion.
 //!
-//! Encodings handled: PLAIN, and the RLE/bit-packed hybrid used for both
-//! definition levels and dictionary indices (`PLAIN_DICTIONARY` and
-//! `RLE_DICTIONARY` share a wire format). The DELTA_* family is reported as
-//! unsupported rather than guessed at.
+//! A struct's fields read as flat dotted columns (`addr.city`). A list of scalars,
+//! any depth, reads as one `string` column of JSON arrays named for the list,
+//! assembled from repetition and definition levels (`ListShape`), which
+//! `JSON_EACH` and `json_get` take apart. A list of structs, a map, and any
+//! nesting of them span several leaves and are rebuilt row by row from all of
+//! their entries into one JSON column (`NNode`, `Assembler`): objects for structs
+//! and maps, arrays for lists. Within a row every leaf's entries are contiguous (a
+//! repetition level of 0 starts the next row); a repeated node at repetition
+//! level R starts an element at every entry whose level is R, and a definition
+//! level below a node's own says it is absent — null if optional, an empty list if
+//! repeated. Every leaf has an entry for every instance of every ancestor, so the
+//! first entry of a node's first leaf answers whether the node is there. Chunks
+//! appear in leaf order including leaves a read skips, hence `Leaf.chunk_idx`.
+//!
+//! Row-group pruning (`groupMayMatch`, `groupBeatsThreshold`, `fileMinMax`) is
+//! conservative in one direction only: a group is skipped solely when statistics
+//! prove no row can match; anything missing, unknown or unorderable keeps it.
+//!
+//! `Reader` reads one batch per row group, fetching only the footer and the
+//! column chunks a query projects, so resident memory tracks the widest row
+//! group's projected columns rather than the file. `Bytes` is where those bytes
+//! come from: a local file by pread, a resident buffer, an SFTP or SMB file by
+//! offset, or a `Remote` over HTTP range requests (`http(s)://`, or an `az://`
+//! blob whose Shared Key signature is redone per range). A server that answers a
+//! ranged GET with 200 has sent the whole body; `Remote` keeps it in `whole`,
+//! copied into the reader's arena because the batch arena passed to `read` is
+//! recycled per batch, and serves later reads from it. `Folder` reads a folder
+//! of files as one table; every file must match the first's projected columns in
+//! name, order and type, or the read fails naming it rather than misplace values.
 
 const std = @import("std");
 const parquet = @import("parquet.zig");
@@ -27,26 +58,17 @@ const eval = @import("../exec/eval.zig");
 
 pub const Error = error{
     CorruptParquetPage,
-    /// Nested (list/map/struct) columns; basalt has no type for them.
     UnsupportedParquetSchema,
-    /// A DELTA_* or BYTE_STREAM_SPLIT page.
     UnsupportedParquetEncoding,
 } || std.mem.Allocator.Error;
 
-// --- bit-level readers -------------------------------------------------------
-
-/// LSB-first bit reader, the order Parquet's bit-packing uses.
-///
-/// Reads a whole 64-bit word and shifts, rather than looping one bit at a time.
-/// Dictionary indices and delta miniblocks use widths up to 32, where the
-/// per-bit loop costs 5-12x more; definition levels (width 1) are unaffected.
 pub const BitReader = struct {
     buf: []const u8,
     bit_pos: usize = 0,
 
-    /// `u7`, not `u6`: delta miniblocks over INT64 may legally use width 64,
-    /// which a `u6` cannot even name — the old signature turned that page into
-    /// an @intCast panic in the caller.
+    /// LSB-first, the order Parquet's bit-packing uses, a whole u64 word at a time.
+    /// Width is `u7` because INT64 delta miniblocks may use 64; a value spanning two
+    /// words is assembled from both (one word once silently zeroed its top bits).
     pub fn read(self: *BitReader, width: u7) Error!u64 {
         if (width == 0) return 0;
         const end = self.bit_pos + width;
@@ -56,14 +78,11 @@ pub const BitReader = struct {
         const shift: u6 = @intCast(self.bit_pos & 7);
         self.bit_pos = end;
 
-        // Fast path: offset + width fit one u64, which every hot width does
-        // (dictionary indices and levels are <= 32, so shift + width <= 39).
         if (@as(usize, shift) + width <= 64) {
             var word: u64 = 0;
             if (byte + 8 <= self.buf.len) {
                 word = std.mem.readInt(u64, self.buf[byte..][0..8], .little);
             } else {
-                // Tail: fewer than 8 bytes remain, so assemble what is there.
                 var k: usize = 0;
                 while (byte + k < self.buf.len and k < 8) : (k += 1) {
                     word |= @as(u64, self.buf[byte + k]) << @intCast(8 * k);
@@ -73,9 +92,6 @@ pub const BitReader = struct {
             return if (width == 64) v else v & ((@as(u64, 1) << @intCast(width)) - 1);
         }
 
-        // Wide value at a non-zero bit offset: the bits span two u64 words.
-        // One word used to be masked as if it held them all, so widths above
-        // 64-shift returned a value with its top bits silently zeroed.
         var word: u128 = 0;
         var k: usize = 0;
         while (byte + k < self.buf.len and k < 9) : (k += 1) {
@@ -86,17 +102,14 @@ pub const BitReader = struct {
     }
 };
 
-/// Bits needed to hold values up to `max` — the width Parquet uses for levels.
 pub fn bitWidth(max: u32) u6 {
     if (max == 0) return 0;
     return @intCast(32 - @clz(max));
 }
 
-/// Decodes `count` values from an RLE / bit-packed hybrid stream.
-///
-/// The stream is a sequence of runs, each introduced by a varint header whose
-/// low bit selects the kind: set means a bit-packed run of `(header >> 1) * 8`
-/// values, clear means an RLE run of `header >> 1` copies of one value.
+/// RLE/bit-packed hybrid: each run's varint header has its low bit set for
+/// `(header >> 1) * 8` bit-packed values, clear for an RLE run of `header >> 1`
+/// copies. Run counts are checked before they are multiplied, as they can wrap.
 pub fn decodeRleHybrid(
     arena: std.mem.Allocator,
     src: []const u8,
@@ -115,19 +128,12 @@ pub fn decodeRleHybrid(
     while (n < count) {
         const header = try readVarint(src, &pos);
         if (header & 1 == 1) {
-            // bit-packed: header >> 1 groups of eight values. The count comes
-            // straight off the wire, so both products can wrap before anything
-            // is bounds-checked against the page.
             const groups = std.math.cast(usize, header >> 1) orelse return Error.CorruptParquetPage;
             const bytes = std.math.mul(usize, groups, width) catch return Error.CorruptParquetPage;
             if (bytes > src.len - pos) return Error.CorruptParquetPage;
-            const vals = groups * 8; // groups <= src.len here, so this cannot wrap
+            const vals = groups * 8;
             const run = src[pos..][0..bytes];
-            const take = @min(vals, count - n); // trailing padding in the last group
-            // The run's bytes are checked above, so values with a whole u64 after
-            // their first byte unpack without a check apiece; reading them one at a
-            // time through `BitReader` was a fifth of a 100-group GROUP BY. The
-            // last few go through it.
+            const take = @min(vals, count - n);
             const mask = (@as(u64, 1) << width) - 1;
             var i: usize = 0;
             while (width <= 32 and i < take) : (i += 1) {
@@ -142,8 +148,7 @@ pub fn decodeRleHybrid(
             pos += bytes;
         } else {
             const run: usize = @intCast(header >> 1);
-            if (run == 0) return Error.CorruptParquetPage; // no progress
-            // the repeated value occupies ceil(width/8) little-endian bytes
+            if (run == 0) return Error.CorruptParquetPage;
             const vb = (@as(usize, width) + 7) / 8;
             if (pos + vb > src.len) return Error.CorruptParquetPage;
             var v: u32 = 0;
@@ -172,16 +177,11 @@ fn readVarint(src: []const u8, pos: *usize) Error!u64 {
     }
 }
 
-// --- PLAIN values ------------------------------------------------------------
-
-/// Walks PLAIN-encoded values of one physical type. Byte arrays borrow from the
-/// page buffer rather than copying — the column builder dupes on append.
 pub const PlainCursor = struct {
     src: []const u8,
     pos: usize = 0,
     ty: parquet.PhysicalType,
     type_length: usize = 0,
-    /// BOOLEAN is bit-packed, one bit per value, so it needs its own cursor.
     bits: BitReader = .{ .buf = &.{} },
 
     pub fn init(ty: parquet.PhysicalType, type_length: i32, src: []const u8) PlainCursor {
@@ -215,7 +215,6 @@ pub const PlainCursor = struct {
                 if (self.type_length == 0) return Error.CorruptParquetPage;
                 return .{ .bytes = try self.take(self.type_length) };
             },
-            // 12 bytes: 8-byte nanoseconds-of-day then a 4-byte Julian day.
             .int96 => {
                 const b = try self.take(12);
                 const nanos = std.mem.readInt(u64, b[0..8], .little);
@@ -243,25 +242,16 @@ pub const PlainCursor = struct {
     }
 };
 
-/// INT96 is a deprecated Spark timestamp: Julian day plus nanoseconds of day.
-/// 2440588 is the Julian day of 1970-01-01.
-/// The Julian day is a full u32 on the wire: 4.29e9 days of microseconds is
-/// 3.7e20, far past i64. Saturating keeps a corrupt file from being undefined
-/// behaviour in a release build, where the overflow is not checked.
+/// INT96: Julian day (2440588 is 1970-01-01) plus nanoseconds of day. Saturates,
+/// since a u32 Julian day of micros overflows i64 on a corrupt file.
 pub fn int96ToMicros(julian_day: u32, nanos_of_day: u64) i64 {
     const days: i64 = @as(i64, julian_day) - 2_440_588;
     return (days *| 86_400_000_000) +| @as(i64, @intCast(nanos_of_day / 1000));
 }
 
-// --- DELTA encodings ---------------------------------------------------------
-
-/// DELTA_BINARY_PACKED: a header, then blocks of miniblocks holding deltas
-/// bit-packed against a per-block minimum.
-///
-/// Layout: `<block size> <miniblocks per block> <total count> <first value>`
-/// then per block `<min delta> <bit width per miniblock> <packed miniblocks>`.
-/// Values are recovered by running sums, so a single miscount desynchronises
-/// everything after it — hence the explicit bounds checks throughout.
+/// DELTA_BINARY_PACKED: `<block size> <miniblocks> <count> <first>`, then per block
+/// `<min delta> <widths> <miniblocks>`. Running sums desync on any miscount, so
+/// every bound is checked; a width byte over 64 is corrupt (it was once a panic).
 pub fn decodeDeltaBinaryPacked(
     arena: std.mem.Allocator,
     src: []const u8,
@@ -294,8 +284,6 @@ pub fn decodeDeltaBinaryPacked(
 
         for (widths) |w| {
             if (n >= want) break;
-            // A raw page byte: 0..64 are meaningful widths, anything above is
-            // a corrupt page — @intCast here was a crash on hostile input.
             if (w > 64) return Error.CorruptParquetPage;
             const width: u7 = @intCast(w);
             const bytes = (per_mini * @as(usize, width) + 7) / 8;
@@ -311,7 +299,6 @@ pub fn decodeDeltaBinaryPacked(
             pos += bytes;
         }
     }
-    // a page may declare more values than the level count asks for
     while (n < count) : (n += 1) out[n] = value;
     return out;
 }
@@ -321,8 +308,6 @@ fn readZigZagAt(src: []const u8, pos: *usize) Error!i64 {
     return @as(i64, @bitCast(u >> 1)) ^ -@as(i64, @intCast(u & 1));
 }
 
-/// DELTA_LENGTH_BYTE_ARRAY: all lengths delta-packed up front, then the bytes
-/// back to back.
 pub fn decodeDeltaLengthByteArray(
     arena: std.mem.Allocator,
     src: []const u8,
@@ -341,8 +326,8 @@ pub fn decodeDeltaLengthByteArray(
     return out;
 }
 
-/// DELTA_BYTE_ARRAY: each value shares a prefix with the one before it, so the
-/// stream carries prefix lengths, suffix lengths, then the suffix bytes.
+/// DELTA_BYTE_ARRAY: prefix lengths shared with the previous value, suffix
+/// lengths, then the suffix bytes.
 pub fn decodeDeltaByteArray(
     arena: std.mem.Allocator,
     src: []const u8,
@@ -401,8 +386,6 @@ fn decodeDeltaBinaryPackedTracking(
         const widths = src[pos..][0..miniblocks];
         pos += miniblocks;
         for (widths) |w| {
-            // Same guard as `decodeDeltaBinaryPacked`: a raw page byte, valid
-            // only up to 64.
             if (w > 64) return Error.CorruptParquetPage;
             const width: u7 = @intCast(w);
             const bytes = (per_mini * @as(usize, width) + 7) / 8;
@@ -425,10 +408,8 @@ fn decodeDeltaBinaryPackedTracking(
     return out;
 }
 
-/// BYTE_STREAM_SPLIT: the bytes of fixed-width values are transposed — every
-/// value's first byte, then every second byte, and so on. Regrouping them
-/// restores the original little-endian values, which compress far better in
-/// that order for floats.
+/// BYTE_STREAM_SPLIT: every value's first byte, then every second byte, and so
+/// on; regrouping restores the little-endian values.
 pub fn decodeByteStreamSplit(
     arena: std.mem.Allocator,
     src: []const u8,
@@ -444,9 +425,6 @@ pub fn decodeByteStreamSplit(
     return out;
 }
 
-// --- schema mapping ----------------------------------------------------------
-
-/// `ConvertedType` values that change how a physical type is interpreted.
 const conv_utf8 = 0;
 const conv_decimal = 5;
 const conv_date = 6;
@@ -457,15 +435,6 @@ const conv_timestamp_micros = 10;
 const conv_json = 19;
 const conv_bson = 20;
 
-/// Conversion taking a column's stored temporal unit to basalt's microseconds.
-///
-/// Parquet stores TIME/TIMESTAMP in milliseconds, microseconds or nanoseconds
-/// depending on the annotation; basalt's `time`/`timestamp` are always micros.
-/// Ignoring this reads a millisecond timestamp as if it were micros — a silent
-/// 1000x error that lands values in 1970 — and a nanosecond one 1000x too far
-/// out. Nanoseconds floor-divide, so sub-microsecond digits are dropped and a
-/// pre-1970 value still truncates towards the earlier instant; flooring is
-/// monotone, which keeps statistics-based pruning sound after conversion.
 pub const TemporalScale = struct {
     mul: i64 = 1,
     div: i64 = 1,
@@ -503,15 +472,9 @@ pub fn temporalScale(e: parquet.SchemaElement) TemporalScale {
     };
 }
 
-/// basalt type for a leaf schema element, from its physical type and its
-/// annotation: the LogicalType when the writer gave one, else the legacy
-/// ConvertedType. Modern writers (polars, DuckDB, Spark, pyarrow) omit the
-/// converted type for naive and nanosecond timestamps, so the logical type is
-/// the only thing that says the int64 is a timestamp at all.
-///
-/// `isAdjustedToUTC` is not carried: basalt has no zoned timestamp, and a UTC
-/// instant and a naive wall-clock time both read as the same `timestamp`
-/// value — the UTC one as its UTC wall-clock.
+/// Modern writers omit the ConvertedType for naive and nanosecond timestamps, so
+/// the logical type is preferred. `isAdjustedToUTC` is dropped: basalt has no
+/// zoned timestamp, so a UTC instant reads as its UTC wall-clock.
 pub fn basaltType(e: parquet.SchemaElement) Error!types.Type {
     const phys = e.ty orelse return Error.UnsupportedParquetSchema;
     var t = logicalBasaltType(e, phys) orelse try convertedBasaltType(e, phys);
@@ -519,10 +482,8 @@ pub fn basaltType(e: parquet.SchemaElement) Error!types.Type {
     return t;
 }
 
-/// Null when the logical type is absent or says nothing basalt acts on, which
-/// defers to the converted type. A logical type that does not fit its physical
-/// type (a TIMESTAMP on a byte array) is ignored the same way rather than
-/// trusted.
+/// Null when the logical type is absent, says nothing basalt acts on, or does
+/// not fit its physical type, deferring to the converted type.
 fn logicalBasaltType(e: parquet.SchemaElement, phys: parquet.PhysicalType) ?types.Type {
     const lt = e.logical_type orelse return null;
     const is_bytes = phys == .byte_array or phys == .fixed_len_byte_array;
@@ -543,7 +504,6 @@ fn logicalBasaltType(e: parquet.SchemaElement, phys: parquet.PhysicalType) ?type
             else => null,
         },
         .integer => if (phys == .int32 or phys == .int64) types.Type.init(.int) else null,
-        // basalt has no uuid type; the 16 raw bytes stay `bytes`, as before
         .uuid, .other => null,
     };
 }
@@ -589,12 +549,10 @@ fn decimalOf(e: parquet.SchemaElement) types.Type {
     return types.Type.decimal(p, s);
 }
 
-/// Rescales a decimal carried as an integer or big-endian byte array.
 fn decimalValue(t: types.Type, v: Value) Value {
     return switch (v) {
         .int => |x| .{ .decimal = .{ .unscaled = x, .scale = t.scale } },
         .bytes => |b| blk: {
-            // two's-complement big-endian, as Parquet stores DECIMAL bytes
             var acc: i128 = if (b.len > 0 and b[0] & 0x80 != 0) -1 else 0;
             for (b) |byte| acc = (acc << 8) | byte;
             break :blk .{ .decimal = .{ .unscaled = acc, .scale = t.scale } };
@@ -603,8 +561,6 @@ fn decimalValue(t: types.Type, v: Value) Value {
     };
 }
 
-/// Adapts a decoded physical value to the column's logical type. `scale` carries
-/// the temporal unit conversion from `temporalScale`.
 pub fn coerce(t: types.Type, v: Value, scale: TemporalScale) Value {
     if (v == .null) return v;
     return switch (t.kind) {
@@ -621,7 +577,6 @@ pub fn coerce(t: types.Type, v: Value, scale: TemporalScale) Value {
             else => v,
         },
         .timestamp => switch (v) {
-            // int96 already decodes to micros and carries the identity scale
             .int => |x| .{ .timestamp = scale.apply(x) },
             else => v,
         },
@@ -630,66 +585,41 @@ pub fn coerce(t: types.Type, v: Value, scale: TemporalScale) Value {
     };
 }
 
-// --- column chunk assembly ---------------------------------------------------
-
-/// One leaf column of a Parquet schema, resolved against its ancestry.
 pub const Leaf = struct {
-    /// Index into `FileMetaData.schema`.
     schema_idx: usize,
-    /// Index into a row group's `columns`; chunks appear in leaf order,
-    /// *including* leaves this reader skips, so the two can diverge.
     chunk_idx: usize,
-    /// Dotted path, so a struct field reads as `addr.city` rather than colliding.
     name: []const u8,
     max_def: u32,
     max_rep: u32,
-    /// Set for a leaf under a repeated group: a list element, read as JSON text
-    /// of the whole list, and `name` is then the list's own (`tags`, not
-    /// `tags.list.element`).
     list: ?ListShape = null,
-    /// For the same leaves: the schema node their column starts at, and the
-    /// levels above it — what a column spanning several leaves (a list of
-    /// structs, a map) is assembled from.
     root: ?RootRef = null,
 
-    /// A leaf under a repeated group is a list element: many values per row.
     pub fn isRepeated(self: Leaf) bool {
         return self.max_rep > 0;
     }
 };
 
-/// How a list leaf's levels nest: for each repeated ancestor, outermost first,
-/// the definition level at which it holds an element. One level below that,
-/// the list at that depth exists but is empty; below the outermost one's, the
-/// whole column is null for the row.
 pub const ListShape = struct {
     rep_def: []const u32,
 };
 
-/// Where a repeated leaf's column starts in the schema, and the definition and
-/// repetition levels its ancestors above that node contribute.
 pub const RootRef = struct { idx: usize, base_def: u32, base_rep: u32 };
 
 const PathNode = struct { name: []const u8, idx: usize, def: u32, repeated: bool, list_group: bool };
 
-/// `LIST` / `MAP` annotations on a group, as the legacy converted type or the
-/// logical type carries them.
 fn isListGroup(e: parquet.SchemaElement) bool {
     if (e.converted_type) |c| if (c == 1 or c == 2 or c == 3) return true;
     return false;
 }
 
-/// Walks the depth-first schema list, resolving each leaf's definition and
-/// repetition levels from its ancestors.
-///
-/// This is what makes a file with nested columns usable: a struct's fields are
-/// flat leaves, and a repeated leaf learns which column — the list or map it
-/// belongs to — it helps rebuild.
+/// Resolves each leaf's levels and dotted name from its ancestors. A list is
+/// named at a LIST/MAP group wrapping its first repeated node (three-level), else
+/// at that node (legacy two-level). Depth is capped so a hostile schema cannot recurse forever.
 pub fn collectLeaves(arena: std.mem.Allocator, schema: []const parquet.SchemaElement) Error![]Leaf {
     var out = std.array_list.Managed(Leaf).init(arena);
     var path = std.array_list.Managed(PathNode).init(arena);
     if (schema.len == 0) return Error.UnsupportedParquetSchema;
-    var pos: usize = 1; // element 0 is the synthetic root
+    var pos: usize = 1;
     var chunk: usize = 0;
     const root_children: usize = @intCast(@max(0, schema[0].num_children));
     for (0..root_children) |_| {
@@ -709,7 +639,6 @@ fn walkNode(
     rep: u32,
 ) Error!void {
     if (pos.* >= schema.len) return Error.UnsupportedParquetSchema;
-    // the schema is the file's to describe; a hostile one must not recurse forever
     if (path.items.len >= 64) return Error.UnsupportedParquetSchema;
     const e = schema[pos.*];
     const idx = pos.*;
@@ -730,10 +659,6 @@ fn walkNode(
             .max_rep = r2,
         };
         if (r2 > 0) {
-            // The list is named where it starts: at a LIST/MAP-annotated group
-            // wrapping the first repeated node (the three-level layout every
-            // modern writer uses), else at that repeated node itself (the
-            // legacy two-level one, `repeated int32 xs`).
             var first: usize = 0;
             while (!path.items[first].repeated) first += 1;
             const root = if (first > 0 and path.items[first - 1].list_group) first - 1 else first;
@@ -763,7 +688,6 @@ fn walkNode(
     for (0..n) |_| try walkNode(arena, schema, pos, chunk, out, path, d2, r2);
 }
 
-/// `a.b.c` from the names along a path.
 fn joinPath(arena: std.mem.Allocator, nodes: []const PathNode) ![]const u8 {
     var buf = std.array_list.Managed(u8).init(arena);
     for (nodes, 0..) |pn, i| {
@@ -773,12 +697,8 @@ fn joinPath(arena: std.mem.Allocator, nodes: []const PathNode) ![]const u8 {
     return buf.toOwnedSlice();
 }
 
-/// Decodes one column chunk into a `Column`.
-///
-/// Walks the chunk's pages in order: a dictionary page, if present, populates
-/// the dictionary that later data pages index into. Only data page v1 is
-/// handled; v2 moves the levels outside the compressed region and is rejected
-/// rather than mis-parsed.
+/// A dictionary page, if present, fills the dictionary later data pages index
+/// into. `base_offset` is where `file_bytes[0]` sits in the file.
 pub fn readColumnChunk(
     arena: std.mem.Allocator,
     file_bytes: []const u8,
@@ -786,16 +706,13 @@ pub fn readColumnChunk(
     elem: parquet.SchemaElement,
     rows: usize,
     max_def: u32,
-    /// Offset of `file_bytes[0]` within the file. Zero when the caller passed a
-    /// slice that already starts at the chunk, as the ranged reader does.
     base_offset: u64,
 ) (Error || parquet.Error || @import("codec.zig").Error)!column.Column {
     return readColumnChunkLevels(arena, file_bytes, meta, elem, rows, max_def, 0, null, base_offset);
 }
 
-/// `readColumnChunk` for any leaf, a list element included: with `list` set, the
-/// chunk's entries — one per level pair, not one per row — are assembled into a
-/// JSON array per row.
+/// With `list` set, the chunk's entries (one per level pair, not per row) are
+/// assembled into a JSON array per row.
 pub fn readColumnChunkLevels(
     arena: std.mem.Allocator,
     file_bytes: []const u8,
@@ -810,8 +727,6 @@ pub fn readColumnChunkLevels(
     const ty = (try basaltType(elem)).asNullable();
     const tscale = temporalScale(elem);
 
-    // A list's pages count level entries: several per row, or one for an empty
-    // or null list. The chunk's total says when they are all in.
     const entries = if (list != null) std.math.cast(usize, meta.num_values) orelse return Error.CorruptParquetPage else rows;
     var levels: ?Levels = if (list != null) .{
         .reps = std.array_list.Managed(u32).init(arena),
@@ -820,8 +735,6 @@ pub fn readColumnChunkLevels(
 
     var b = try column.Builder.initCapacity(arena, ty, entries);
     var dict: ?[]Value = null;
-    // offsets come from the footer: a negative one, or one before the slice,
-    // is a corrupt file rather than a cast to trap on
     const at = std.math.cast(u64, meta.startOffset()) orelse return Error.CorruptParquetPage;
     if (at < base_offset) return Error.CorruptParquetPage;
     var offset: usize = std.math.cast(usize, at - base_offset) orelse return Error.CorruptParquetPage;
@@ -834,7 +747,6 @@ pub fn readColumnChunkLevels(
 
         switch (pg.header.ty) {
             .dictionary_page => {
-                // dictionary entries are always PLAIN, whatever the data pages use
                 const n = std.math.cast(usize, pg.header.num_values) orelse return Error.CorruptParquetPage;
                 const vals = try arena.alloc(Value, n);
                 var cur = PlainCursor.init(meta.ty, elem.type_length orelse 0, pg.data);
@@ -844,7 +756,7 @@ pub fn readColumnChunkLevels(
             .data_page, .data_page_v2 => {
                 produced += try appendDataPage(arena, &b, pg, meta, elem, ty, max_def, dict, tscale, max_rep, if (levels) |*l| l else null);
             },
-            .index_page => {}, // not data; skip
+            .index_page => {},
             else => return Error.CorruptParquetPage,
         }
     }
@@ -853,8 +765,6 @@ pub fn readColumnChunkLevels(
     return col;
 }
 
-/// A repeated leaf's chunk as entries: one value per level pair (null where the
-/// definition level falls short), with the pair itself.
 pub const Entries = struct { vals: column.Column, reps: []const u32, defs: []const u32 };
 
 pub fn readEntries(
@@ -875,8 +785,6 @@ pub fn readEntries(
     };
     var b = try column.Builder.initCapacity(arena, ty, entries);
     var dict: ?[]Value = null;
-    // offsets come from the footer: a negative one, or one before the slice,
-    // is a corrupt file rather than a cast to trap on
     const at = std.math.cast(u64, meta.startOffset()) orelse return Error.CorruptParquetPage;
     if (at < base_offset) return Error.CorruptParquetPage;
     var offset: usize = std.math.cast(usize, at - base_offset) orelse return Error.CorruptParquetPage;
@@ -905,48 +813,29 @@ pub fn readEntries(
     return .{ .vals = vals, .reps = levels.reps.items, .defs = levels.defs.items };
 }
 
-// --- nested columns ----------------------------------------------------------
-//
-// A column that spans several leaves — a list of structs, a map, a struct
-// holding lists — is rebuilt row by row from all of its leaves' entries, as
-// JSON. Within one row every leaf's entries are contiguous (a repetition level
-// of 0 starts the next row), and the schema subtree says how to cut them
-// further: a repeated node at repetition level R starts a new element at every
-// entry whose level is R; a definition level below a node's own says the node
-// is absent — null if it is optional, an empty list if it is the repeated one.
-// Every leaf carries at least one entry for every instance of every ancestor,
-// so the first entry of a node's first leaf answers "is this node here".
-
-/// One node of a nested column's schema subtree.
 pub const NNode = struct {
     name: []const u8,
-    /// Definition level when this node is present.
     def: u32,
-    /// Repetition level of this node's elements (for a repeated node).
     rep: u32,
     optional: bool,
     repeated: bool,
     kind: Kind,
     children: []NNode = &.{},
-    /// This node's leaves are `first_leaf .. first_leaf + nleaves` of the column's.
     first_leaf: usize,
     nleaves: usize,
-    /// For a leaf: the value's declared max definition level.
     max_def: u32 = 0,
 
     pub const Kind = enum { leaf, group, list, map };
 };
 
-/// A column assembled from several leaves.
 pub const Nested = struct {
     name: []const u8,
     root: NNode,
-    /// Indices into `Reader.leaves`, in the subtree's depth-first order.
     leaves: []const usize,
 };
 
-/// The subtree at `pos`, levels counted on from `def`/`rep`. Leaves are numbered
-/// in depth-first order, the order their chunks appear in.
+/// Leaves are numbered depth-first, the order their chunks appear in. LIST and MAP
+/// are honoured only in the spec's single-repeated-child shape.
 fn buildNode(arena: std.mem.Allocator, schema: []const parquet.SchemaElement, pos: *usize, def: u32, rep: u32, next_leaf: *usize, depth: usize) Error!NNode {
     if (pos.* >= schema.len or depth > 64) return Error.UnsupportedParquetSchema;
     const e = schema[pos.*];
@@ -976,8 +865,6 @@ fn buildNode(arena: std.mem.Allocator, schema: []const parquet.SchemaElement, po
     node.children = kids;
     node.nleaves = next_leaf.* - node.first_leaf;
     const conv = e.converted_type orelse -1;
-    // LIST and MAP only as the spec lays them out — a single repeated child —
-    // and otherwise as the plain group the file says they are
     node.kind = if (n == 1 and kids[0].repeated and conv == 3)
         .list
     else if (n == 1 and kids[0].repeated and (conv == 1 or conv == 2) and kids[0].children.len == 2)
@@ -987,14 +874,12 @@ fn buildNode(arena: std.mem.Allocator, schema: []const parquet.SchemaElement, po
     return node;
 }
 
-/// The subtree a nested column starts at.
 pub fn buildNested(arena: std.mem.Allocator, schema: []const parquet.SchemaElement, root: RootRef) Error!NNode {
     var pos = root.idx;
     var next: usize = 0;
     return buildNode(arena, schema, &pos, root.base_def, root.base_rep, &next, 0);
 }
 
-/// A leaf's entries within one instance of some node: `lo .. hi`.
 const Span = struct { lo: usize, hi: usize };
 
 const Assembler = struct {
@@ -1008,14 +893,11 @@ const Assembler = struct {
         return self.entries[n.first_leaf].defs[s.lo];
     }
 
-    /// The node as it appears in its parent: a repeated one as the array of its
-    /// elements, anything else as its value.
     fn field(self: *Assembler, n: *const NNode, spans: []const Span) anyerror!void {
         if (n.repeated) return self.array(n, spans, elementOf(n, true));
         return self.value(n, spans);
     }
 
-    /// A non-repeated node's value.
     fn value(self: *Assembler, n: *const NNode, spans: []const Span) anyerror!void {
         if (n.optional and try self.firstDef(n, spans) < n.def) return self.out.appendSlice("null");
         switch (n.kind) {
@@ -1042,19 +924,16 @@ const Assembler = struct {
         try self.out.append('}');
     }
 
-    /// What an element of repeated node `rep` is: the node itself for a bare
-    /// repeated field or a list whose repeated group holds several fields (or is
-    /// named `array` / `*_tuple`, the legacy two-level spellings); else, in the
-    /// three-level layout, its one child.
+    /// The node itself for a bare repeated field, or a repeated group with several
+    /// fields or a legacy name (`array`, `*_tuple`); else, three-level, its one child.
     fn elementOf(rep: *const NNode, bare: bool) ?*const NNode {
         if (bare or rep.kind == .leaf or rep.children.len != 1) return null;
         if (std.mem.eql(u8, rep.name, "array") or std.mem.endsWith(u8, rep.name, "_tuple")) return null;
         return &rep.children[0];
     }
 
-    /// The instances of repeated node `rep` within `spans`, as a JSON array: one
-    /// element per entry of its first leaf at `rep.rep` (the first entry opens
-    /// the first), none when that entry's definition stops short of `rep.def`.
+    /// One element per entry of the first leaf at `rep.rep`; none when the first
+    /// entry's definition stops short of `rep.def`.
     fn array(self: *Assembler, rep: *const NNode, spans: []const Span, element: ?*const NNode) anyerror!void {
         if (try self.firstDef(rep, spans) < rep.def) return self.out.appendSlice("[]");
         try self.out.append('[');
@@ -1074,7 +953,6 @@ const Assembler = struct {
             if (element) |el| {
                 try self.field(el, sub);
             } else {
-                // the repeated node is the element: its value, present by now
                 var as_value = rep.*;
                 as_value.repeated = false;
                 as_value.optional = false;
@@ -1084,7 +962,6 @@ const Assembler = struct {
         try self.out.append(']');
     }
 
-    /// A MAP's key_value entries as an object keyed by each key's text.
     fn mapObject(self: *Assembler, kv: *const NNode, spans: []const Span) anyerror!void {
         if (try self.firstDef(kv, spans) < kv.def) return self.out.appendSlice("{}");
         try self.out.append('{');
@@ -1102,8 +979,6 @@ const Assembler = struct {
         for (0..count.?) |i| {
             if (i > 0) try self.out.append(',');
             for (cut, 0..) |c, k| sub[kv.first_leaf + k] = c[i];
-            // a key is required by the spec; a key that is a group is rendered
-            // as its JSON and used as text
             var kbuf = std.array_list.Managed(u8).init(self.arena);
             var ka = Assembler{ .arena = self.arena, .entries = self.entries, .out = &kbuf };
             if (key.kind == .leaf and key.nleaves == 1) {
@@ -1120,9 +995,8 @@ const Assembler = struct {
         try self.out.append('}');
     }
 
-    /// Cut `span` of leaf `li` where a new element at repetition level `r`
-    /// begins. Every entry within an instance repeats at `r` or deeper; one
-    /// that repeats shallower would belong to another instance.
+    /// Cuts where a new element at repetition level `r` begins. Every entry within an
+    /// instance repeats at `r` or deeper.
     fn split(self: *Assembler, li: usize, span: Span, r: u32) Error![]Span {
         const reps = self.entries[li].reps;
         var out = std.array_list.Managed(Span).init(self.arena);
@@ -1146,11 +1020,8 @@ fn appendJsonString(arena: std.mem.Allocator, buf: *std.array_list.Managed(u8), 
     try buf.appendSlice(aw.written());
 }
 
-/// A nested column's rows as JSON text, from its leaves' entries for one row
-/// group.
 pub fn assembleNested(arena: std.mem.Allocator, root: *const NNode, entries: []const Entries, rows: usize) anyerror!column.Column {
     if (entries.len != root.nleaves) return Error.CorruptParquetPage;
-    // each leaf's row boundaries: its entries at repetition level 0
     const starts = try arena.alloc([]usize, entries.len);
     for (entries, starts) |e, *st| {
         var list = std.array_list.Managed(usize).init(arena);
@@ -1170,24 +1041,18 @@ pub fn assembleNested(arena: std.mem.Allocator, root: *const NNode, entries: []c
         var buf = std.array_list.Managed(u8).init(sa);
         var asm_ = Assembler{ .arena = sa, .entries = entries, .out = &buf };
         try asm_.field(root, spans);
-        // a whole-row null reads as a null cell, not the text `null`
         if (std.mem.eql(u8, buf.items, "null")) try out.append(.null) else try out.append(.{ .string = buf.items });
     }
     return out.finish();
 }
 
-/// Every entry's repetition and definition level, for a list chunk.
 const Levels = struct {
     reps: std.array_list.Managed(u32),
     defs: std.array_list.Managed(u32),
 };
 
-/// Rows of JSON arrays from a list leaf's entries: `elems` holds one value per
-/// entry (null where the entry's level is below `max_def`), `reps` and `defs`
-/// its levels. A repetition level of 0 starts a row; `r > 0` is a new element
-/// of the list at depth `r`. Below that depth, each level's definition
-/// threshold decides whether it holds an element, is an empty list, or — the
-/// outermost only, or an element that is itself a list — is null.
+/// Repetition 0 starts a row and `r > 0` a new element at depth `r`; below it,
+/// each level's definition threshold says element, empty list, or null.
 fn assembleLists(
     arena: std.mem.Allocator,
     elems: column.Column,
@@ -1201,7 +1066,7 @@ fn assembleLists(
     const depth = shape.rep_def.len;
     var out = try column.Builder.initCapacity(arena, types.Type.init(.string).asNullable(), rows);
     var buf = std.array_list.Managed(u8).init(arena);
-    var open: usize = 0; // arrays open in the current row
+    var open: usize = 0;
     var in_row = false;
     var row_null = false;
     var done: usize = 0;
@@ -1215,7 +1080,6 @@ fn assembleLists(
             }
             in_row = true;
             row_null = false;
-            // below the outermost repeated node's own level, the list is null
             if (d + 1 < shape.rep_def[0]) {
                 row_null = true;
                 continue;
@@ -1223,22 +1087,17 @@ fn assembleLists(
             try buf.append('[');
             open = 1;
         } else {
-            // a repeated entry is an element of the list at depth `r`, so that
-            // list holds one; a level saying otherwise is a corrupt page
             if (!in_row or row_null or r > open or d < shape.rep_def[r - 1]) return Error.CorruptParquetPage;
             while (open > r) : (open -= 1) try buf.append(']');
             try buf.append(',');
         }
-        // descend from depth `open` as far as this entry's level reaches
         var lvl = open;
         while (true) {
-            // no element at this depth: the list here is empty
             if (d < shape.rep_def[lvl - 1]) break;
             if (lvl == depth) {
                 try jsonValue(arena, &buf, if (d < max_def) .null else elems.getValue(i));
                 break;
             }
-            // the element is itself a list: null, or opened one level down
             if (d + 1 < shape.rep_def[lvl]) {
                 try buf.appendSlice("null");
                 break;
@@ -1266,8 +1125,6 @@ fn finishRow(out: *column.Builder, buf: *std.array_list.Managed(u8), open: *usiz
     buf.clearRetainingCapacity();
 }
 
-/// One list element as JSON: numbers and booleans bare, decimals as their exact
-/// digits, text and temporal values quoted as their SQL text.
 fn jsonValue(arena: std.mem.Allocator, buf: *std.array_list.Managed(u8), v: Value) Error!void {
     switch (v) {
         .null => try buf.appendSlice("null"),
@@ -1283,11 +1140,9 @@ fn jsonValue(arena: std.mem.Allocator, buf: *std.array_list.Managed(u8), v: Valu
     }
 }
 
-/// Splits a data page into levels and values, then emits rows.
-///
-/// v1 length-prefixes each RLE level section with four bytes; v2 moves those
-/// lengths into the page header and leaves the sections unprefixed. Everything
-/// after the levels is the same in both.
+/// v1 length-prefixes each level section; v2 keeps them unprefixed with lengths
+/// in the header. The bulk path keys on `present == n`, not on absent levels:
+/// most writers mark every column OPTIONAL even when nothing is null.
 fn appendDataPage(
     arena: std.mem.Allocator,
     b: *column.Builder,
@@ -1299,17 +1154,14 @@ fn appendDataPage(
     dict: ?[]Value,
     tscale: TemporalScale,
     max_rep: u32,
-    /// A list leaf's levels, appended entry by entry; null for a flat column.
     levels: ?*Levels,
 ) Error!usize {
-    // A negative count is not a count; @intCast on it is undefined in release.
     const n = std.math.cast(usize, pg.header.num_values) orelse return Error.CorruptParquetPage;
     var body = pg.data;
 
     var reps: ?[]u32 = null;
     var defs: ?[]u32 = null;
     if (pg.header.ty == .data_page_v2) {
-        // v2 keeps both level sections, unprefixed, ahead of the values
         const rl = pg.header.rep_levels_len;
         if (rl > body.len) return Error.CorruptParquetPage;
         if (max_rep > 0 and rl > 0) reps = try decodeRleHybrid(arena, body[0..rl], bitWidth(max_rep), n);
@@ -1321,7 +1173,6 @@ fn appendDataPage(
         }
         body = body[dl..];
     } else {
-        // v1: repetition levels, then definition levels, each length-prefixed
         if (max_rep > 0) {
             if (body.len < 4) return Error.CorruptParquetPage;
             const len: usize = std.mem.readInt(u32, body[0..4], .little);
@@ -1342,7 +1193,6 @@ fn appendDataPage(
         if (defs) |d| try lv.defs.appendSlice(d) else try lv.defs.appendNTimes(max_def, n);
     }
 
-    // how many values are actually stored: nulls occupy a level but no value
     var present: usize = n;
     if (defs) |d| {
         present = 0;
@@ -1353,13 +1203,6 @@ fn appendDataPage(
 
     switch (pg.header.encoding) {
         .plain => {
-            // Fast path: a page of fixed-width values with no nulls and no unit
-            // conversion is just a typed array. Skipping the per-value `Value`
-            // round trip is worth a special case on the hottest loop there is.
-            //
-            // `present == n` rather than `defs == null`: most writers mark every
-            // column OPTIONAL, so levels are present even when no row is null,
-            // and keying off their absence would never fire in practice.
             if (tscale.isIdentity() and try bulkPlain(arena, b, ty, meta.ty, body, present, defs, max_def)) {
                 return n;
             }
@@ -1391,7 +1234,6 @@ fn appendDataPage(
             const vals = try decodeDeltaByteArray(arena, body, present);
             try emitBytes(b, ty, defs, max_def, n, vals, tscale);
         },
-        // a boolean data page may be RLE rather than PLAIN bit-packing
         .rle => {
             const bits = try decodeRleHybrid(arena, body[@min(4, body.len)..], 1, present);
             const vals = try arena.alloc(i64, present);
@@ -1401,8 +1243,6 @@ fn appendDataPage(
         .plain_dictionary, .rle_dictionary => {
             const d = dict orelse return Error.CorruptParquetPage;
             if (body.len < 1) return Error.CorruptParquetPage;
-            // the index bit width is a single byte ahead of the hybrid stream;
-            // parquet caps it at 32, and anything past 63 does not fit the shift
             if (body[0] > 32) return Error.CorruptParquetPage;
             const width: u6 = @intCast(body[0]);
             const idx = try decodeRleHybrid(arena, body[1..], width, present);
@@ -1414,9 +1254,8 @@ fn appendDataPage(
     return n;
 }
 
-/// Decodes a whole PLAIN page of fixed-width values directly into the column's
-/// typed store. Returns false when the shape is not one of the handled cases,
-/// leaving the caller to take the general path.
+/// Decodes a PLAIN page straight into the typed store, or returns false for a
+/// shape it does not cover. Byte arrays are slices of the page body.
 fn bulkPlain(
     arena: std.mem.Allocator,
     b: *column.Builder,
@@ -1427,14 +1266,11 @@ fn bulkPlain(
     defs: ?[]const u32,
     max_def: u32,
 ) Error!bool {
-    // values are only stored for present rows; nulls occupy a level, not a slot
     const count = present;
     switch (phys) {
         .int64 => {
             if (body.len < count * 8) return Error.CorruptParquetPage;
             switch (ty.kind) {
-                // time and timestamp share the i64 store; the caller has already
-                // ruled out a unit conversion (identity tscale)
                 .int, .time, .timestamp => {
                     const out = try arena.alloc(i64, count);
                     for (out, 0..) |*o, i| o.* = std.mem.readInt(i64, body[i * 8 ..][0..8], .little);
@@ -1485,8 +1321,6 @@ fn bulkPlain(
             }
         },
         .byte_array => {
-            // Strings are slices of the page body: length-prefixed, no copy
-            // until the builder's own payload append.
             if (ty.kind != .string and ty.kind != .bytes) return false;
             const vals = try plainByteArrays(arena, body, count);
             b.appendBytesScattered(vals, defs, max_def) catch return false;
@@ -1519,8 +1353,6 @@ fn bulkPlain(
     }
 }
 
-/// The `count` length-prefixed values of a PLAIN byte-array page, as slices
-/// into the page body.
 fn plainByteArrays(arena: std.mem.Allocator, body: []const u8, count: usize) Error![]const []const u8 {
     const out = try arena.alloc([]const u8, count);
     var pos: usize = 0;
@@ -1535,11 +1367,8 @@ fn plainByteArrays(arena: std.mem.Allocator, body: []const u8, count: usize) Err
     return out;
 }
 
-/// Expands a dictionary-encoded page straight into the typed store: the
-/// dictionary is turned into a flat typed array once, the indices gathered
-/// through it. The general `emit` boxed every row's entry into a `Value` —
-/// for a low-cardinality string column, the same handful of strings a
-/// million times over. Returns false for a shape it does not cover.
+/// Turns the dictionary into a typed array once and gathers indices through it,
+/// rather than boxing every row into a `Value`. False for a shape not covered.
 fn bulkDict(
     arena: std.mem.Allocator,
     b: *column.Builder,
@@ -1557,7 +1386,6 @@ fn bulkDict(
             const vals = try arena.alloc([]const u8, idx.len);
             for (vals, idx) |*o, ix| o.* = dict[ix].bytes;
             b.appendBytesScattered(vals, defs, max_def) catch return false;
-            // and the codes, so a filter or GROUP BY can work on the entries
             const entries = try arena.alloc([]const u8, dict.len);
             for (entries, dict) |*o, v| o.* = v.bytes;
             try b.noteDict(@intFromPtr(dict.ptr), entries, idx, defs, max_def);
@@ -1595,7 +1423,6 @@ fn bulkDict(
     }
 }
 
-/// Emits integer-shaped decoded values, interleaving nulls by definition level.
 fn emitInts(
     b: *column.Builder,
     ty: types.Type,
@@ -1618,7 +1445,6 @@ fn emitInts(
     }
 }
 
-/// Emits byte-array-shaped decoded values, interleaving nulls.
 fn emitBytes(
     b: *column.Builder,
     ty: types.Type,
@@ -1629,7 +1455,6 @@ fn emitBytes(
     tscale: TemporalScale,
 ) Error!void {
     if (ty.kind == .string or ty.kind == .bytes) {
-        // A short `vals` is the only non-memory failure: the page lied.
         b.appendBytesScattered(vals, defs, max_def) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return Error.CorruptParquetPage,
@@ -1649,8 +1474,8 @@ fn emitBytes(
     }
 }
 
-/// Interleaves nulls with values: a row whose definition level is below the
-/// maximum has no stored value, so the cursor/index stream must not advance.
+/// A row whose definition level is below the maximum has no stored value, so the
+/// value stream does not advance for it.
 fn emit(
     b: *column.Builder,
     ty: types.Type,
@@ -1682,9 +1507,6 @@ fn emit(
     }
 }
 
-// --- row group filtering -----------------------------------------------------
-
-/// A simple `column <op> literal` bound, the shape a row-group filter can use.
 pub const Bound = struct {
     column: []const u8,
     op: Op,
@@ -1693,12 +1515,6 @@ pub const Bound = struct {
     pub const Op = enum { lt, le, gt, ge, eq };
 };
 
-/// Whether a row group can possibly satisfy `bounds`, judged from its
-/// statistics alone.
-///
-/// Conservative in one direction only: a group is skipped solely when its
-/// statistics *prove* no row can match. Missing or unreadable statistics always
-/// mean "keep", so this can never drop matching rows.
 pub fn groupMayMatch(
     schema: []const parquet.SchemaElement,
     leaves: []const Leaf,
@@ -1714,9 +1530,7 @@ pub fn groupMayMatch(
         const lo = statValue(elem, meta.ty, meta.stats.min) orelse continue;
         const hi = statValue(elem, meta.ty, meta.stats.max) orelse continue;
 
-        // An unorderable pair is "unknown", which must never exclude.
         const excluded = switch (b.op) {
-            // every value is >= lo, so `col < v` is impossible when lo >= v
             .lt => (cmp(lo, b.value) orelse .lt) != .lt,
             .le => (cmp(lo, b.value) orelse .eq) == .gt,
             .gt => (cmp(hi, b.value) orelse .gt) != .gt,
@@ -1728,10 +1542,8 @@ pub fn groupMayMatch(
     return true;
 }
 
-/// Whether a row group could hold a row that enters the current top-N.
-///
-/// Conservative by construction: unknown column, missing statistics, or an
-/// unfilled heap all return true. Only a proven strict miss skips.
+/// Whether a row group could hold a row entering the current top-N; only a
+/// proven strict miss returns false.
 pub fn groupBeatsThreshold(
     schema: []const parquet.SchemaElement,
     leaves: []const Leaf,
@@ -1744,8 +1556,6 @@ pub fn groupBeatsThreshold(
     const meta = g.columns[lf.chunk_idx].meta orelse return true;
     const elem = schema[lf.schema_idx];
 
-    // A null sorts last, so a group holding any null can still matter when the
-    // bound itself is null — but that case already returned above.
     if (t.desc) {
         const hi = statValue(elem, meta.ty, meta.stats.max) orelse return true;
         return cmp(hi, t.value) == .gt;
@@ -1756,9 +1566,8 @@ pub fn groupBeatsThreshold(
 
 pub const MinMax = struct { min: Value, max: Value };
 
-/// Whole-file min/max for one column, folded from row-group statistics without
-/// reading a single page. Returns null the moment any row group is missing the
-/// statistic, so the caller scans rather than reporting a partial answer.
+/// Folded from row-group statistics; null as soon as one group lacks them or the
+/// type cannot be ordered (it once returned row group 0's value instead).
 pub fn fileMinMax(rdr: *const Reader, name: []const u8) ?MinMax {
     if (rdr.md.row_groups.len == 0) return null;
     const lf = findLeaf(rdr.leaves, name) orelse return null;
@@ -1774,8 +1583,6 @@ pub fn fileMinMax(rdr: *const Reader, name: []const u8) ?MinMax {
         }
         const mn = statValue(elem, meta.ty, meta.stats.min) orelse return null;
         const mx = statValue(elem, meta.ty, meta.stats.max) orelse return null;
-        // Bail rather than report a wrong extreme when the type cannot be
-        // ordered — this silently returned row group 0's value before.
         if (lo == null) lo = mn else lo = if ((cmp(mn, lo.?) orelse return null) == .lt) mn else lo;
         if (hi == null) hi = mx else hi = if ((cmp(mx, hi.?) orelse return null) == .gt) mx else hi;
     }
@@ -1788,9 +1595,8 @@ fn wanted(want: ?[]const []const u8, name: []const u8) bool {
     return false;
 }
 
-/// The leaf a statistics question is about. A list column is never one: its
-/// chunk statistics describe the elements, not the JSON text the column holds,
-/// so a bound on it proves nothing and must keep every group.
+/// A list column never matches: its chunk statistics describe the elements, not
+/// the JSON text, so a bound on it proves nothing.
 fn findLeaf(leaves: []const Leaf, name: []const u8) ?Leaf {
     for (leaves) |lf| {
         if (std.mem.eql(u8, lf.name, name)) return if (lf.list != null) null else lf;
@@ -1798,17 +1604,14 @@ fn findLeaf(leaves: []const Leaf, name: []const u8) ?Leaf {
     return null;
 }
 
-/// The column type a kept leaf reads as: its own, or JSON text for a list.
 pub fn leafType(e: parquet.SchemaElement, lf: Leaf) Error!types.Type {
     if (lf.list != null) {
-        // the element must still be a type basalt reads
         _ = try basaltType(e);
         return types.Type.init(.string).asNullable();
     }
     return (try basaltType(e)).asNullable();
 }
 
-/// Decodes one PLAIN-encoded statistics blob into a comparable `Value`.
 fn statValue(elem: parquet.SchemaElement, phys: parquet.PhysicalType, raw: ?[]const u8) ?Value {
     const b = raw orelse return null;
     const ty = basaltType(elem) catch return null;
@@ -1817,17 +1620,10 @@ fn statValue(elem: parquet.SchemaElement, phys: parquet.PhysicalType, raw: ?[]co
     return coerce(ty, v, temporalScale(elem));
 }
 
-/// Order two statistic values, or null when the pair cannot be ordered.
-///
-/// Null means "unknown", and every caller must then KEEP the row group — the
-/// pruning contract is that a missing or unusable statistic never drops rows.
-/// This used to return `.eq` for anything it did not recognize, which inverted
-/// that: a DECIMAL column's stats compared equal to every bound, so `.lt`/`.gt`
-/// proved every group non-matching and a range predicate returned ZERO rows.
+/// Null means unknown and the caller must keep the group. It once returned `.eq`
+/// for unknown pairs, which pruned every group of a DECIMAL or date-vs-string range.
+/// A date against an ISO string literal orders by parsing it (dialect §9).
 fn cmp(a: Value, b: Value) ?std.math.Order {
-    // Numerics (int/float/decimal, in any mix) order through the engine's own
-    // comparison, so pruning agrees with the filter that re-checks the rows —
-    // including per-value decimal scale and the NaN total order.
     if (numOrder(a, b)) |o| return o;
     return switch (a) {
         .int => std.math.order(a.int, switch (b) {
@@ -1840,9 +1636,6 @@ fn cmp(a: Value, b: Value) ?std.math.Order {
             .int => |x| @as(f64, @floatFromInt(x)),
             else => return null,
         }),
-        // A date column against an ISO string literal is an ordinary comparison in
-        // this dialect (§9), so parse it and prune on it. A string that is not a
-        // date is unknown, not equal.
         .date => std.math.order(@as(i64, a.date), switch (b) {
             .date => |x| @as(i64, x),
             .int => |x| x,
@@ -1877,21 +1670,14 @@ fn cmp(a: Value, b: Value) ?std.math.Order {
 }
 
 test "cmp: an unorderable pair is unknown, never a fabricated equality" {
-    // This is what made a parquet date range return nothing. `cmp` answered `.eq`
-    // for a date against a string, and `groupMayMatch`'s `.lt` rule excludes a group
-    // whenever the order is not `.lt` — so every row group was pruned and
-    // `WHERE l_shipdate < '1995-01-01'` came back empty. `<=`, `>=` and `=` survived
-    // only because their own defaults happen to keep the group.
-    const d: Value = .{ .date = 9131 }; // 1995-01-01
+    const d: Value = .{ .date = 9131 };
     try std.testing.expectEqual(std.math.Order.lt, cmp(.{ .date = 9130 }, .{ .string = "1995-01-01" }).?);
     try std.testing.expectEqual(std.math.Order.eq, cmp(d, .{ .string = "1995-01-01" }).?);
     try std.testing.expectEqual(std.math.Order.gt, cmp(.{ .date = 9132 }, .{ .string = "1995-01-01" }).?);
-    // Not a date: unknown, so pruning must keep the group.
     try std.testing.expect(cmp(d, .{ .string = "not-a-date" }) == null);
     try std.testing.expect(cmp(d, .{ .bool = true }) == null);
     try std.testing.expect(cmp(.{ .int = 5 }, .{ .string = "5" }) == null);
     try std.testing.expect(cmp(.{ .string = "a" }, .{ .int = 1 }) == null);
-    // A timestamp column against an ISO literal still orders.
     try std.testing.expectEqual(std.math.Order.lt, cmp(.{ .timestamp = 0 }, .{ .string = "1970-01-02" }).?);
 }
 
@@ -1899,14 +1685,12 @@ fn isNumV(v: Value) bool {
     return v == .int or v == .float or v == .decimal;
 }
 
-/// Numeric ordering shared with the engine (`eval.compareValues`), used only
-/// when BOTH sides are numeric so the temporal/text arms below still apply.
+/// Numeric ordering via `eval.compareValues`, used only when both sides are
+/// numeric, so pruning agrees with the filter that re-checks rows.
 fn numOrder(a: Value, b: Value) ?std.math.Order {
     if (!isNumV(a) or !isNumV(b)) return null;
     return eval.compareValues(a, b);
 }
-
-// --- source ------------------------------------------------------------------
 
 const driver = @import("../connect/driver.zig");
 const Batch = @import("../exec/batch.zig").Batch;
@@ -1915,23 +1699,13 @@ const objstore = @import("../store/objstore.zig");
 const sftp = @import("../store/sftp.zig");
 const smb = @import("../store/smb.zig");
 
-/// Byte source a reader pulls from: a local file read on demand, or an already
-/// resident buffer.
-///
-/// Parquet is random-access by design — the footer sits at the end and points at
-/// chunks — so holding the whole object in memory is unnecessary. Fetching only
-/// the footer and the chunks a query touches is what keeps a multi-gigabyte file
-/// from becoming multi-gigabyte resident.
 pub const Bytes = union(enum) {
     memory: []const u8,
     file: struct { f: std.fs.File, size: u64 },
     remote: *Remote,
-    /// A file on an SFTP server, read by offset.
     sftp: *sftp.File,
-    /// A file on an SMB share, read by offset.
     smb: *smb.File,
 
-    /// Where `path` is read from: an SFTP server, an HTTP range, or the disk.
     pub fn open(arena: std.mem.Allocator, path: []const u8) !Bytes {
         if (sftp.isUrl(path)) return .{ .sftp = try sftp.File.open(arena, path) };
         if (smb.isUrl(path)) return .{ .smb = try smb.File.open(arena, path) };
@@ -1951,9 +1725,7 @@ pub const Bytes = union(enum) {
         };
     }
 
-    /// Reads `len` bytes at `off`. The result is owned by `arena` for the file
-    /// and remote cases and borrowed for the memory case; callers treat it as
-    /// read-only.
+    /// Owned by `arena` for file and remote sources, borrowed for memory; read-only.
     pub fn range(self: Bytes, arena: std.mem.Allocator, off: u64, len: usize) ![]const u8 {
         switch (self) {
             .memory => |m| {
@@ -1999,33 +1771,16 @@ pub const Bytes = union(enum) {
     }
 };
 
-/// An object read over HTTP by range request — a plain `http(s)://` URL, or an
-/// `az://` blob, which differs only in that Shared Key signs the Range header
-/// and so must be re-signed per request.
-///
-/// Parquet is what makes this worth the round trips: the footer names the byte
-/// extent of every column chunk, so a projected query over a remote object
-/// fetches the footer and those extents and nothing else. Reading the whole
-/// object to decode two columns of forty is the thing this exists to avoid.
-///
-/// Not every server honours `Range`. One that answers a ranged GET with `200`
-/// has sent the whole body anyway, so it is kept in `whole` and served from
-/// there — correct on any server, fast on the ones that cooperate.
 pub const Remote = struct {
-    /// The reader's arena, not a batch's. `whole` outlives the call that fills
-    /// it, and `range` is handed the batch arena, which is recycled per batch —
-    /// so the fallback body has to be copied somewhere that survives.
     arena: std.mem.Allocator,
     client: *std.http.Client,
     url: []const u8,
     object: ?objstore.Object = null,
     total: u64,
-    /// Set when the origin ignored `Range` (or could not report a size), which
-    /// makes every later read a slice instead of another full transfer.
     whole: ?[]const u8 = null,
-    /// A corporate TLS interceptor is repaired once per object, not per range.
     repaired: bool = false,
 
+    /// Sizes the object by HEAD; without a length it fetches the whole object once.
     pub fn open(arena: std.mem.Allocator, path: []const u8) !*Remote {
         const client = try arena.create(std.http.Client);
         client.* = http_client.initClient(arena);
@@ -2037,9 +1792,6 @@ pub const Remote = struct {
             self.url = o.url;
         }
 
-        // HEAD answers "how big?" without a body. A server that refuses it, or
-        // reports no length, leaves us no way to find the footer — fall back to
-        // fetching the object once, which is what this used to do always.
         if (self.contentLength(arena)) |n| {
             self.total = n;
         } else |_| {
@@ -2050,10 +1802,10 @@ pub const Remote = struct {
         return self;
     }
 
+    /// Slices `whole` once a 200 supplied it, never past its real length, which may
+    /// disagree with HEAD's.
     pub fn read(self: *Remote, arena: std.mem.Allocator, off: u64, len: usize) ![]const u8 {
         if (len == 0) return "";
-        // `total` came from HEAD; `whole` came from a later 200. A server that
-        // disagrees between the two must not slice us past the buffer.
         if (self.whole) |w| {
             if (off + len > w.len) return Error.CorruptParquetPage;
             return w[@intCast(off)..][0..len];
@@ -2066,9 +1818,6 @@ pub const Remote = struct {
                 if (res.body.len != len) return Error.CorruptParquetPage;
                 return res.body;
             },
-            // Range ignored: this is the whole object, so keep it and stop
-            // asking. It has to be copied out of the caller's arena first —
-            // that one is a batch's, recycled before the next read.
             200 => {
                 const kept = try self.arena.dupe(u8, res.body);
                 self.whole = kept;
@@ -2087,6 +1836,8 @@ pub const Remote = struct {
 
     const Resp = struct { code: u16, body: []const u8 };
 
+    /// A TLS retry gets its own buffer, so a failed attempt's partial response is
+    /// not prepended to the retry's body.
     fn send(
         self: *Remote,
         arena: std.mem.Allocator,
@@ -2095,8 +1846,6 @@ pub const Remote = struct {
     ) !Resp {
         const extra = try self.headers(arena, method, range_hdr);
         return self.once(arena, method, extra) catch |e| switch (e) {
-            // Retried on its own buffer: a partially written response from the
-            // failed attempt must not be prepended to the retry's body.
             error.TlsInitializationFailed => {
                 if (!self.repair()) return e;
                 return self.once(arena, method, extra);
@@ -2136,8 +1885,6 @@ pub const Remote = struct {
         return arena.dupe(std.http.Header, &.{.{ .name = "Range", .value = range_hdr }});
     }
 
-    /// The object's size, from a HEAD. Errors (405, no Content-Length, a proxy
-    /// that drops it) send the caller to the whole-object path.
     fn contentLength(self: *Remote, arena: std.mem.Allocator) !u64 {
         const extra = try self.headers(arena, .HEAD, "");
         const uri = std.Uri.parse(self.url) catch return error.InvalidUrl;
@@ -2166,11 +1913,6 @@ pub const Remote = struct {
     }
 };
 
-/// Reads a Parquet file as a pipeline source, one batch per row group.
-///
-/// Only the footer and the column chunks a query needs are read; a chunk is
-/// fetched, decoded and released per row group, so resident memory tracks the
-/// widest row group's projected columns rather than the file.
 pub const Output = union(enum) {
     leaf: usize,
     nested: *const Nested,
@@ -2181,27 +1923,14 @@ pub const Reader = struct {
     src: Bytes,
     md: parquet.FileMetaData,
     schema: types.Schema,
-    /// Readable leaves, in output order. Repeated (list) leaves are excluded but
-    /// still occupy a chunk slot, which is why `Leaf.chunk_idx` is carried.
     leaves: []const Leaf,
-    /// The output columns, in schema order: a leaf of `leaves`, or a column
-    /// assembled from several of them.
     outputs: []const Output = &.{},
-    /// Ascending chunk start offsets plus the footer start, used to bound each
-    /// ranged read.
     boundaries: []const u64 = &.{},
-    /// Bounds used to skip row groups outright; empty means read them all.
     bounds: []const Bound = &.{},
-    /// Live top-N bound, when the pipeline is a `sort … limit` over this file.
     threshold: ?*const Threshold = null,
-    /// Row groups skipped on statistics, for reporting.
     groups_skipped: usize = 0,
-    /// The run's pushdown tally, when it keeps one: groups seen and skipped.
     tally: ?*driver.ScanTally = null,
     rg: usize = 0,
-    /// Exclusive end of the row-group window this reader is confined to. Null
-    /// reads to the end of the file; a parallel worker sets it so each lane owns
-    /// a disjoint slice of the row groups.
     rg_end: ?usize = null,
 
     pub fn isPath(path: []const u8) bool {
@@ -2212,27 +1941,15 @@ pub const Reader = struct {
         return openProjected(arena, path, null);
     }
 
-    /// `open`, decoding only the named columns.
-    ///
-    /// This is what makes Parquet worth its complexity: a column not asked for
-    /// is never touched, so a query over two of forty columns reads two chunks.
-    /// An unknown name is ignored rather than an error — the caller's set is a
-    /// hint, and a stage that truly needs a missing column will fail loudly when
-    /// it cannot resolve it.
+    /// `open`, decoding only the named columns. An unknown name is ignored; an empty
+    /// projection (COUNT(*)) keeps the narrowest column so batches carry a row count.
     pub fn openProjected(arena: std.mem.Allocator, path: []const u8, want: ?[]const []const u8) !*Reader {
-        // Local files read by pread, remote objects by HTTP range — the same
-        // footer-then-chunks access pattern either way, so a projected query
-        // over an object store transfers only what it decodes.
         const src = try Bytes.open(arena, path);
         errdefer src.close();
 
         var footer_start: u64 = 0;
         const md = try parseFooterOf(arena, src, &footer_start);
 
-        // Struct fields read as flat dotted columns; a list of scalars as one JSON
-        // column from its leaf; a list of structs, a map, or anything else that
-        // spans several leaves as one JSON column assembled from all of them.
-        // Nothing in the file is left out.
         const all = try collectLeaves(arena, md.schema);
         var keep = std.array_list.Managed(Leaf).init(arena);
         var fields = std.array_list.Managed(types.Schema.Field).init(arena);
@@ -2243,15 +1960,12 @@ pub const Reader = struct {
                 if (oi != li and other.root != null and other.root.?.idx == rt.idx) break true;
             } else false else false;
             if (shared) {
-                // a column spanning several leaves: taken whole at its first leaf
                 const rt = lf.root.?;
                 for (roots_seen.items) |x| {
                     if (x == rt.idx) break;
                 } else {
                     try roots_seen.append(rt.idx);
                     if (!wanted(want, lf.name)) continue;
-                    // a column basalt cannot rebuild fails the read: leaving it
-                    // out would copy a file short of a column without a word
                     const tree = try buildNested(arena, md.schema, rt);
                     var ix = std.array_list.Managed(usize).init(arena);
                     for (all) |o| if (o.root != null and o.root.?.idx == rt.idx) {
@@ -2272,8 +1986,6 @@ pub const Reader = struct {
             try outputs.append(.{ .leaf = keep.items.len - 1 });
             try fields.append(.{ .name = lf.name, .ty = try leafType(md.schema[lf.schema_idx], lf) });
         }
-        // An empty projection (COUNT(*)) still needs batches with a row count,
-        // so the narrowest column is kept rather than none.
         if (fields.items.len == 0 and want != null) {
             for (all) |lf| {
                 if (lf.isRepeated()) continue;
@@ -2301,8 +2013,8 @@ pub const Reader = struct {
         return self;
     }
 
-    /// One row group per call. Empty groups are skipped rather than returned as
-    /// zero-row batches, which downstream operators treat as end-of-stream.
+    /// One row group per call. Empty groups are skipped, since a zero-row batch reads
+    /// as end-of-stream downstream.
     pub fn next(self: *Reader, arena: std.mem.Allocator) !?Batch {
         const last = self.rg_end orelse self.md.row_groups.len;
         while (self.rg < last) {
@@ -2311,7 +2023,6 @@ pub const Reader = struct {
             const rows = std.math.cast(usize, g.num_rows) orelse return Error.CorruptParquetPage;
             if (rows == 0) continue;
             if (self.tally) |t| driver.ScanTally.add(&t.row_groups, 1);
-            // statistics can rule a whole group out before any page is touched
             if (self.bounds.len > 0 and
                 !groupMayMatch(self.md.schema, self.leaves, g, self.bounds))
             {
@@ -2360,8 +2071,6 @@ pub const Reader = struct {
 
     const Chunk = struct { bytes: []const u8, meta: parquet.ColumnMetaData, start: u64 };
 
-    /// One leaf's chunk of a row group, fetched alone: bounded by wherever the
-    /// next chunk begins.
     fn chunkOf(self: *Reader, arena: std.mem.Allocator, g: parquet.RowGroup, lf: Leaf) !Chunk {
         if (lf.chunk_idx >= g.columns.len) return Error.CorruptParquetPage;
         const meta = g.columns[lf.chunk_idx].meta orelse return Error.CorruptParquetPage;
@@ -2380,9 +2089,8 @@ pub const Reader = struct {
     }
 };
 
-/// How `got` — a folder file's columns — differs from `want`, the first file's,
-/// in words; null when it does not. Nullability is not compared: the folder's
-/// columns are all nullable.
+/// How a folder file's columns differ from the first file's, in words; null when
+/// they do not. Nullability is not compared.
 pub fn schemaMismatch(arena: std.mem.Allocator, want: types.Schema, got: types.Schema) ?[]const u8 {
     for (want.fields, 0..) |w, k| {
         if (k >= got.fields.len) return std.fmt.allocPrint(arena, "it has no column `{s}`", .{w.name}) catch "a column is missing";
@@ -2400,7 +2108,6 @@ pub fn schemaMismatch(arena: std.mem.Allocator, want: types.Schema, got: types.S
     return null;
 }
 
-/// The message for a folder file refused by `schemaMismatch`.
 pub fn mismatchMessage(arena: std.mem.Allocator, root: []const u8, path: []const u8, first: []const u8, why: []const u8) []const u8 {
     const rel = struct {
         fn f(r: []const u8, x: []const u8) []const u8 {
@@ -2410,14 +2117,8 @@ pub fn mismatchMessage(arena: std.mem.Allocator, root: []const u8, path: []const
     return std.fmt.allocPrint(arena, "`{s}` in folder `{s}` does not match `{s}`, its first file: {s}", .{ rel(root, path), root, rel(root, first), why }) catch why;
 }
 
-/// A folder of Parquet files read as one table, file after file in the order
-/// given. The first file's columns are the table's; every other file must have
-/// the same ones — names, order and types, nullability aside — among those the
-/// query reads, or the read fails naming it: a file with a column missing or
-/// moved would otherwise put values under the wrong name.
 pub const Folder = struct {
     arena: std.mem.Allocator,
-    /// The folder, ending in `/`, which messages name files below.
     root: []const u8,
     files: []const []const u8,
     project: ?[]const []const u8,
@@ -2425,7 +2126,6 @@ pub const Folder = struct {
     bounds: []const Bound = &.{},
     threshold: ?*const Threshold = null,
     tally: ?*driver.ScanTally = null,
-    /// The file being read and the index of the next one.
     cur: ?*Reader = null,
     i: usize = 0,
 
@@ -2439,7 +2139,6 @@ pub const Folder = struct {
         return self;
     }
 
-    /// The first file, as opened for the schema: what a plan-time look needs.
     pub fn firstReader(self: *const Folder) ?*Reader {
         return if (self.i == 1) self.cur else null;
     }
@@ -2518,12 +2217,8 @@ fn srcClose(p: *anyopaque) void {
     @as(*Reader, @ptrCast(@alignCast(p))).close();
 }
 
-/// End offset of the chunk starting at `start`.
-///
-/// `total_compressed_size` cannot be used for this: writers disagree about
-/// whether it counts page headers and the dictionary page, so trusting it
-/// truncates chunks. The next chunk's start is unambiguous, and the footer
-/// bounds the last one.
+/// Ends at the next chunk's start, or the footer. `total_compressed_size` is not
+/// used: writers disagree on whether it counts headers, which truncated chunks.
 fn chunkEnd(boundaries: []const u64, start: u64) u64 {
     for (boundaries) |b| {
         if (b > start) return b;
@@ -2531,8 +2226,6 @@ fn chunkEnd(boundaries: []const u64, start: u64) u64 {
     return start;
 }
 
-/// Every chunk start in the file plus the footer offset, ascending. Built once
-/// so each chunk read knows exactly where it ends.
 fn chunkBoundaries(arena: std.mem.Allocator, md: parquet.FileMetaData, footer_start: u64) ![]u64 {
     var out = std.array_list.Managed(u64).init(arena);
     for (md.row_groups) |g| {
@@ -2547,7 +2240,6 @@ fn chunkBoundaries(arena: std.mem.Allocator, md: parquet.FileMetaData, footer_st
     return sl;
 }
 
-/// Reads the footer with two small ranged reads instead of the whole file.
 fn parseFooterOf(arena: std.mem.Allocator, src: Bytes, footer_start: *u64) !parquet.FileMetaData {
     const total = src.size();
     if (total < parquet.trailer_len + parquet.magic.len) return parquet.Error.NotParquet;
@@ -2561,21 +2253,17 @@ fn parseFooterOf(arena: std.mem.Allocator, src: Bytes, footer_start: *u64) !parq
     return parquet.parseFooter(arena, footer);
 }
 
-/// Paths a `Remote` serves: object storage and plain URLs alike. Everything
-/// else is a local file.
 pub fn isRemote(path: []const u8) bool {
     return objstore.isUrl(path) or
         std.mem.startsWith(u8, path, "http://") or
         std.mem.startsWith(u8, path, "https://");
 }
 
-// --- tests -------------------------------------------------------------------
-
 const testing = std.testing;
 
 test "bitWidth covers the level widths Parquet asks for" {
-    try testing.expectEqual(@as(u6, 0), bitWidth(0)); // required column: no levels
-    try testing.expectEqual(@as(u6, 1), bitWidth(1)); // optional flat column
+    try testing.expectEqual(@as(u6, 0), bitWidth(0));
+    try testing.expectEqual(@as(u6, 1), bitWidth(1));
     try testing.expectEqual(@as(u6, 2), bitWidth(2));
     try testing.expectEqual(@as(u6, 2), bitWidth(3));
     try testing.expectEqual(@as(u6, 3), bitWidth(4));
@@ -2585,7 +2273,6 @@ test "bitWidth covers the level widths Parquet asks for" {
 test "RLE run repeats one value" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    // header varint 8 = (4 << 1) | 0 -> RLE, run of 4; value byte 1
     const got = try decodeRleHybrid(ar.allocator(), &[_]u8{ 0x08, 0x01 }, 1, 4);
     try testing.expectEqualSlices(u32, &.{ 1, 1, 1, 1 }, got);
 }
@@ -2593,8 +2280,6 @@ test "RLE run repeats one value" {
 test "bit-packed run unpacks LSB-first in groups of eight" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    // header varint 3 = (1 << 1) | 1 -> one group of 8 values, width 1.
-    // 0b10110010 read LSB-first is 0,1,0,0,1,1,0,1
     const got = try decodeRleHybrid(ar.allocator(), &[_]u8{ 0x03, 0b10110010 }, 1, 8);
     try testing.expectEqualSlices(u32, &.{ 0, 1, 0, 0, 1, 1, 0, 1 }, got);
 }
@@ -2609,30 +2294,22 @@ test "a width of zero yields all zeroes without consuming input" {
 test "a truncated hybrid stream errors rather than reading past the page" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    // claims a bit-packed group but supplies no data
     try testing.expectError(Error.CorruptParquetPage, decodeRleHybrid(ar.allocator(), &[_]u8{0x03}, 1, 8));
-    // an RLE run of zero would loop forever
     try testing.expectError(Error.CorruptParquetPage, decodeRleHybrid(ar.allocator(), &[_]u8{ 0x00, 0x01 }, 1, 4));
 }
 
 test "int96 converts Julian day plus nanoseconds to epoch micros" {
-    // Julian day 2440588 is 1970-01-01
     try testing.expectEqual(@as(i64, 0), int96ToMicros(2_440_588, 0));
     try testing.expectEqual(@as(i64, 1_000_000), int96ToMicros(2_440_588, 1_000_000_000));
     try testing.expectEqual(@as(i64, 86_400_000_000), int96ToMicros(2_440_589, 0));
     try testing.expectEqual(@as(i64, -86_400_000_000), int96ToMicros(2_440_587, 0));
-    // A wire Julian day is a full u32: 4.29e9 days of micros is 3.7e20, past i64.
-    // Saturating keeps a corrupt file from being undefined behaviour in release.
     try testing.expectEqual(@as(i64, std.math.maxInt(i64)), int96ToMicros(std.math.maxInt(u32), 0));
-    // Julian day 0 is only 2.4e6 days before the epoch, so it still fits.
     try testing.expectEqual(@as(i64, -210_866_803_200_000_000), int96ToMicros(0, 0));
 }
 
 test "a bit-packed run length from the wire cannot overflow the byte count" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    // varint 0xFFFF_FFFF_FFFF_FFFF: the bit-packed header claims 2^63 groups, so
-    // `groups * width` wrapped before anything checked it against the page.
     const huge = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01 };
     try testing.expectError(Error.CorruptParquetPage, decodeRleHybrid(ar.allocator(), &huge, 32, 8));
 }
@@ -2648,10 +2325,8 @@ test "physical plus converted type maps onto a basalt type" {
     try testing.expectEqual(types.TypeKind.string, (try basaltType(.{ .ty = .byte_array, .converted_type = 0, .repetition = opt })).kind);
     try testing.expectEqual(types.TypeKind.decimal, (try basaltType(.{ .ty = .int64, .converted_type = 5, .precision = 18, .scale = 4, .repetition = opt })).kind);
 
-    // required columns are non-nullable, optional ones nullable
     try testing.expect((try basaltType(.{ .ty = .int32, .repetition = .required })).nullable == false);
     try testing.expect((try basaltType(.{ .ty = .int32, .repetition = opt })).nullable);
-    // a group node has no physical type and cannot be a column
     try testing.expectError(Error.UnsupportedParquetSchema, basaltType(.{ .num_children = 2 }));
 }
 
@@ -2666,23 +2341,19 @@ test "decodes real column values from a DuckDB-written file" {
     const g = md.row_groups[0];
     const rows: usize = @intCast(g.num_rows);
 
-    // id INT32: 0..59
     const id = try readColumnChunk(a, fx, g.columns[0].meta.?, md.schema[1], rows, 1, 0);
     try testing.expectEqual(@as(usize, 60), id.len);
     try testing.expectEqual(@as(i64, 0), id.getValue(0).int);
     try testing.expectEqual(@as(i64, 59), id.getValue(59).int);
 
-    // name BYTE_ARRAY/UTF8 -> string
     const name = try readColumnChunk(a, fx, g.columns[1].meta.?, md.schema[2], rows, 1, 0);
     try testing.expectEqualStrings("row-0", name.getValue(0).string);
     try testing.expectEqualStrings("row-59", name.getValue(59).string);
 
-    // amt DOUBLE: i * 1.5
     const amt = try readColumnChunk(a, fx, g.columns[2].meta.?, md.schema[3], rows, 1, 0);
     try testing.expectEqual(@as(f64, 0.0), amt.getValue(0).float);
     try testing.expectEqual(@as(f64, 88.5), amt.getValue(59).float);
 
-    // flag BOOLEAN: even ids true — bit-packed, one bit per value
     const flag = try readColumnChunk(a, fx, g.columns[3].meta.?, md.schema[4], rows, 1, 0);
     try testing.expectEqual(true, flag.getValue(0).bool);
     try testing.expectEqual(false, flag.getValue(1).bool);
@@ -2713,8 +2384,6 @@ test "schema walk resolves levels and dotted names for nested groups" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    // root { id (required int32), addr (optional group { city, zip }),
-    //        tags (repeated group { element }) }
     const schema = [_]parquet.SchemaElement{
         .{ .name = "root", .num_children = 3 },
         .{ .name = "id", .ty = .int32, .repetition = .required },
@@ -2731,30 +2400,25 @@ test "schema walk resolves levels and dotted names for nested groups" {
     try testing.expectEqual(@as(u32, 0), leaves[0].max_def);
     try testing.expect(!leaves[0].isRepeated());
 
-    // a field of an optional group is nullable at two levels
     try testing.expectEqualStrings("addr.city", leaves[1].name);
     try testing.expectEqual(@as(u32, 2), leaves[1].max_def);
     try testing.expectEqualStrings("addr.zip", leaves[2].name);
     try testing.expectEqual(@as(u32, 1), leaves[2].max_def);
 
-    // the list element is repeated: named for the list it makes, with the
-    // definition level at which the (two-level, legacy) list holds an element
     try testing.expectEqualStrings("tags", leaves[3].name);
     try testing.expect(leaves[3].isRepeated());
     try testing.expectEqualSlices(u32, &.{1}, leaves[3].list.?.rep_def);
 
-    // chunk indices count every leaf, list elements included
     try testing.expectEqual(@as(usize, 3), leaves[3].chunk_idx);
 }
 
 test "temporal scale converts millisecond columns and leaves micros alone" {
-    try testing.expectEqual(TemporalScale{ .mul = 1000 }, temporalScale(.{ .converted_type = 9 })); // TIMESTAMP_MILLIS
-    try testing.expectEqual(TemporalScale{ .mul = 1000 }, temporalScale(.{ .converted_type = 7 })); // TIME_MILLIS
-    try testing.expectEqual(TemporalScale.identity, temporalScale(.{ .converted_type = 10 })); // TIMESTAMP_MICROS
-    try testing.expectEqual(TemporalScale.identity, temporalScale(.{})); // no annotation
+    try testing.expectEqual(TemporalScale{ .mul = 1000 }, temporalScale(.{ .converted_type = 9 }));
+    try testing.expectEqual(TemporalScale{ .mul = 1000 }, temporalScale(.{ .converted_type = 7 }));
+    try testing.expectEqual(TemporalScale.identity, temporalScale(.{ .converted_type = 10 }));
+    try testing.expectEqual(TemporalScale.identity, temporalScale(.{}));
 
     const ts = types.Type.init(.timestamp);
-    // a millisecond value must be scaled up, not read as micros
     try testing.expectEqual(@as(i64, 1_583_298_367_123_000), coerce(ts, .{ .int = 1_583_298_367_123 }, .{ .mul = 1000 }).timestamp);
     try testing.expectEqual(@as(i64, 1_583_298_367_123), coerce(ts, .{ .int = 1_583_298_367_123 }, .identity).timestamp);
 }
@@ -2764,7 +2428,6 @@ fn logical(phys: parquet.PhysicalType, lt: parquet.LogicalType) parquet.SchemaEl
 }
 
 test "a LogicalType-only TIMESTAMP reads as timestamp in every unit" {
-    // 2026-01-01T12:00:00, as polars/pyarrow write it with no ConvertedType
     const want: i64 = 1_767_268_800_000_000;
     const ts = types.Type.init(.timestamp);
     inline for (.{
@@ -2776,7 +2439,6 @@ test "a LogicalType-only TIMESTAMP reads as timestamp in every unit" {
         try testing.expectEqual(types.TypeKind.timestamp, (try basaltType(e)).kind);
         try testing.expectEqual(want, coerce(ts, .{ .int = c[1] }, temporalScale(e)).timestamp);
     }
-    // isAdjustedToUTC reads as the same timestamp: basalt has no zoned type
     const utc = logical(.int64, .{ .timestamp = .{ .adjusted_to_utc = true, .unit = .nanos } });
     try testing.expectEqual(types.TypeKind.timestamp, (try basaltType(utc)).kind);
 }
@@ -2784,16 +2446,14 @@ test "a LogicalType-only TIMESTAMP reads as timestamp in every unit" {
 test "nanoseconds floor to micros, including before 1970" {
     const ns = TemporalScale{ .div = 1000 };
     try testing.expectEqual(@as(i64, 1), ns.apply(1_999));
-    try testing.expectEqual(@as(i64, -1), ns.apply(-1)); // 1969-12-31T23:59:59.999999
+    try testing.expectEqual(@as(i64, -1), ns.apply(-1));
     try testing.expectEqual(@as(i64, -2), ns.apply(-1_001));
-    // a millisecond value too large for micros saturates rather than wrapping
     const ms = TemporalScale{ .mul = 1000 };
     try testing.expectEqual(@as(i64, std.math.maxInt(i64)), ms.apply(std.math.maxInt(i64) / 10));
 }
 
 test "a LogicalType-only TIME reads as time in millis and micros" {
     const tm = types.Type.init(.time);
-    // 01:02:00 in micros
     const want: i64 = 3_720_000_000;
     const ms = logical(.int32, .{ .time = .{ .unit = .millis } });
     try testing.expectEqual(types.TypeKind.time, (try basaltType(ms)).kind);
@@ -2815,16 +2475,13 @@ test "LogicalType DATE, DECIMAL, STRING and INTEGER map without a ConvertedType"
     try testing.expectEqual(types.TypeKind.string, (try basaltType(logical(.byte_array, .string))).kind);
     try testing.expectEqual(types.TypeKind.string, (try basaltType(logical(.byte_array, .json))).kind);
     try testing.expectEqual(types.TypeKind.int, (try basaltType(logical(.int32, .{ .integer = .{ .bit_width = 8, .signed = false } }))).kind);
-    // uuid has no basalt type and stays raw bytes
     try testing.expectEqual(types.TypeKind.bytes, (try basaltType(logical(.fixed_len_byte_array, .uuid))).kind);
-    // a logical type that contradicts its physical type is ignored, not trusted
     try testing.expectEqual(types.TypeKind.bytes, (try basaltType(logical(.byte_array, .{ .timestamp = .{} }))).kind);
 }
 
 test "LogicalType wins over a ConvertedType, and agreeing annotations stay put" {
-    // both present and agreeing, as a spec-following writer emits for millis
     var both = logical(.int64, .{ .timestamp = .{ .adjusted_to_utc = true, .unit = .millis } });
-    both.converted_type = 9; // TIMESTAMP_MILLIS
+    both.converted_type = 9;
     try testing.expectEqual(types.TypeKind.timestamp, (try basaltType(both)).kind);
     try testing.expectEqual(TemporalScale{ .mul = 1000 }, temporalScale(both));
 
@@ -2836,9 +2493,8 @@ test "LogicalType wins over a ConvertedType, and agreeing annotations stay put" 
     try testing.expectEqual(@as(u8, 18), d.precision);
     try testing.expectEqual(@as(u8, 4), d.scale);
 
-    // an unrecognised logical type falls back to the converted one
     var other = logical(.int32, .other);
-    other.converted_type = 6; // DATE
+    other.converted_type = 6;
     try testing.expectEqual(types.TypeKind.date, (try basaltType(other)).kind);
 }
 
@@ -2849,7 +2505,6 @@ test "data page v2 with DELTA encodings decodes to the same values as v1" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    // same 60 rows as the v1 fixtures, written with V2 pages and DELTA encodings
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try tmp.dir.realpathAlloc(a, ".");
@@ -2861,11 +2516,9 @@ test "data page v2 with DELTA encodings decodes to the same values as v1" {
     const b = (try r.next(a)).?;
     try testing.expectEqual(@as(usize, 60), b.len);
 
-    // id is DELTA_BINARY_PACKED
     try testing.expectEqual(@as(i64, 0), b.columns[0].getValue(0).int);
     try testing.expectEqual(@as(i64, 42), b.columns[0].getValue(42).int);
     try testing.expectEqual(@as(i64, 59), b.columns[0].getValue(59).int);
-    // name is DELTA_LENGTH_BYTE_ARRAY
     try testing.expectEqualStrings("row-0", b.columns[1].getValue(0).string);
     try testing.expectEqualStrings("row-59", b.columns[1].getValue(59).string);
     try testing.expectEqual(@as(f64, 88.5), b.columns[2].getValue(59).float);
@@ -2876,19 +2529,16 @@ test "delta binary packed recovers a running sum, including negatives" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // header: block 128, 4 miniblocks, 1 value, first value 7 (zigzag 14)
     const src = [_]u8{ 0x80, 0x01, 0x04, 0x01, 0x0e };
     const got = try decodeDeltaBinaryPacked(a, &src, 1);
     try testing.expectEqualSlices(i64, &.{7}, got);
 
-    // a malformed header (zero miniblocks) must not divide by zero
     try testing.expectError(Error.CorruptParquetPage, decodeDeltaBinaryPacked(a, &[_]u8{ 0x80, 0x01, 0x00, 0x01, 0x00 }, 1));
 }
 
 test "byte stream split regroups transposed value bytes" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    // two 4-byte values 0x03020100 and 0x07060504, transposed by byte position
     const src = [_]u8{ 0x00, 0x04, 0x01, 0x05, 0x02, 0x06, 0x03, 0x07 };
     const got = try decodeByteStreamSplit(ar.allocator(), &src, 4, 2);
     try testing.expectEqualSlices(u8, &.{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07 }, got);
@@ -2906,11 +2556,9 @@ test "projection keeps only the named columns and never drops all of them" {
     const path = try std.fs.path.join(a, &.{ dir, "p.parquet" });
     try tmp.dir.writeFile(.{ .sub_path = "p.parquet", .data = @embedFile("testdata/zstd.parquet") });
 
-    // no projection: every column
     const all = try Reader.open(a, path);
     try testing.expectEqual(@as(usize, 4), all.schema.fields.len);
 
-    // two of four
     const two = try Reader.openProjected(a, path, &.{ "name", "flag" });
     try testing.expectEqual(@as(usize, 2), two.schema.fields.len);
     try testing.expectEqualStrings("name", two.schema.fields[0].name);
@@ -2920,11 +2568,9 @@ test "projection keeps only the named columns and never drops all of them" {
     try testing.expectEqualStrings("row-0", b.columns[0].getValue(0).string);
     try testing.expectEqual(true, b.columns[1].getValue(0).bool);
 
-    // an unknown name is ignored rather than fatal
     const one = try Reader.openProjected(a, path, &.{ "name", "nosuch" });
     try testing.expectEqual(@as(usize, 1), one.schema.fields.len);
 
-    // an empty projection still yields batches with a usable row count
     const none = try Reader.openProjected(a, path, &.{});
     try testing.expectEqual(@as(usize, 1), none.schema.fields.len);
     const nb = (try none.next(a)).?;
@@ -2938,7 +2584,6 @@ test "row groups are skipped only when statistics prove no row can match" {
     };
     const leaves = [_]Leaf{.{ .schema_idx = 1, .chunk_idx = 0, .name = "id", .max_def = 1, .max_rep = 0 }};
 
-    // a chunk whose values run 100..200
     var lo: [8]u8 = undefined;
     var hi: [8]u8 = undefined;
     std.mem.writeInt(i64, &lo, 100, .little);
@@ -2954,7 +2599,6 @@ test "row groups are skipped only when statistics prove no row can match" {
     try testing.expect(groupMayMatch(&schema, &leaves, g, &keep));
     try testing.expect(!groupMayMatch(&schema, &leaves, g, &drop));
 
-    // equality outside [min,max] is provably empty; inside it is not
     const eq_in = [_]Bound{.{ .column = "id", .op = .eq, .value = .{ .int = 150 } }};
     const eq_out = [_]Bound{.{ .column = "id", .op = .eq, .value = .{ .int = 999 } }};
     try testing.expect(groupMayMatch(&schema, &leaves, g, &eq_in));
@@ -2965,18 +2609,14 @@ test "row groups are skipped only when statistics prove no row can match" {
     try testing.expect(groupMayMatch(&schema, &leaves, g, &gt_keep));
     try testing.expect(!groupMayMatch(&schema, &leaves, g, &gt_drop));
 
-    // without statistics nothing is provable, so the group is always kept
     var bare = [_]parquet.ColumnChunk{.{ .meta = .{ .ty = .int64 } }};
     const g2 = parquet.RowGroup{ .columns = &bare, .num_rows = 10 };
     try testing.expect(groupMayMatch(&schema, &leaves, g2, &drop));
 
-    // an unknown column contributes no bound
     const other = [_]Bound{.{ .column = "nosuch", .op = .lt, .value = .{ .int = 0 } }};
     try testing.expect(groupMayMatch(&schema, &leaves, g, &other));
 }
 
-/// polars 1.44, no ConvertedType on the temporal columns: `ts` naive micros,
-/// `ts_utc` UTC nanos, `t` TIME nanos. Two row groups of two rows each.
 const fx_logical = @embedFile("testdata/logical_types.parquet");
 
 test "a polars footer carries the LogicalType, and pruning uses converted units" {
@@ -2994,14 +2634,11 @@ test "a polars footer carries the LogicalType, and pruning uses converted units"
     try testing.expect(utc.logical_type.?.timestamp.adjusted_to_utc);
     try testing.expectEqual(types.TypeKind.time, (try basaltType(md.schema[leaves[3].schema_idx])).kind);
 
-    // group 0: ts up to 2026-01-01 12:00, ts_utc from 2025-06-01 08:30
-    // group 1: ts only 1969-12-31,        ts_utc only 2026-03-01
     try testing.expectEqual(@as(usize, 2), md.row_groups.len);
-    const jan1: i64 = 1_767_225_600_000_000; // 2026-01-01T00:00:00 in micros
+    const jan1: i64 = 1_767_225_600_000_000;
     const ge_jan1 = [_]Bound{.{ .column = "ts", .op = .ge, .value = .{ .timestamp = jan1 } }};
     try testing.expect(groupMayMatch(md.schema, leaves, md.row_groups[0], &ge_jan1));
     try testing.expect(!groupMayMatch(md.schema, leaves, md.row_groups[1], &ge_jan1));
-    // raw nanosecond stats would sit 1000x above any micros literal and keep group 0
     const utc_lt = [_]Bound{.{ .column = "ts_utc", .op = .lt, .value = .{ .timestamp = jan1 } }};
     try testing.expect(groupMayMatch(md.schema, leaves, md.row_groups[0], &utc_lt));
     try testing.expect(!groupMayMatch(md.schema, leaves, md.row_groups[1], &utc_lt));
@@ -3013,16 +2650,11 @@ test "chunk extents come from the next chunk, never from total_compressed_size" 
     const b = [_]u64{ 4, 100, 250, 900 };
     try testing.expectEqual(@as(u64, 100), chunkEnd(&b, 4));
     try testing.expectEqual(@as(u64, 250), chunkEnd(&b, 100));
-    // the last chunk ends at the footer, which is the final boundary
     try testing.expectEqual(@as(u64, 900), chunkEnd(&b, 250));
-    // an offset past every boundary yields no span, which the caller rejects
     try testing.expectEqual(@as(u64, 900), chunkEnd(&b, 900));
 }
 
 test "a corrupted file errors instead of panicking" {
-    // Every guard in this file is a wire value used as a length, a shift or a
-    // count. Flipping bytes across a real file walks them: the only acceptable
-    // outcomes are a decoded batch or an error, never a trap.
     const good = @embedFile("testdata/zstd.parquet");
     var buf: [good.len]u8 = undefined;
 
@@ -3060,7 +2692,6 @@ test "ranged reads return the same values as an in-memory file" {
     const dir = try tmp.dir.realpathAlloc(a, ".");
     const path = try std.fs.path.join(a, &.{ dir, "r.parquet" });
 
-    // the reader opens by range; compare against decoding the same bytes whole
     const r = try Reader.open(a, path);
     defer r.close();
     const got = (try r.next(a)).?;
@@ -3086,8 +2717,6 @@ test "a remote whole-body read refuses to slice past the body it was given" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    // HEAD claimed 100000 bytes; the ranged GET came back 200 with 10. The
-    // fast path must not trust `total` over the buffer it actually holds.
     var client = http_client.initClient(a);
     defer client.deinit();
     var r = Remote{
@@ -3115,17 +2744,13 @@ test "top-N threshold skips only groups it can prove cannot contribute" {
     var chunks = [_]parquet.ColumnChunk{.{ .meta = .{ .ty = .int64, .stats = .{ .min = &lo, .max = &hi } } }};
     const g = parquet.RowGroup{ .columns = &chunks, .num_rows = 10 };
 
-    // DESC: the group tops out at 200, so a bound of 500 rules it out entirely
     try testing.expect(!groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = true, .full = true, .value = .{ .int = 500 } }));
     try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = true, .full = true, .value = .{ .int = 150 } }));
-    // equal to the bound is NOT skippable on its own, but cannot beat it either
     try testing.expect(!groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = true, .full = true, .value = .{ .int = 200 } }));
 
-    // ASC mirrors it against the minimum
     try testing.expect(!groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = false, .full = true, .value = .{ .int = 50 } }));
     try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = false, .full = true, .value = .{ .int = 150 } }));
 
-    // every conservative case must keep the group
     try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = true, .full = false, .value = .{ .int = 500 } }));
     try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "nosuch", .desc = true, .full = true, .value = .{ .int = 500 } }));
     try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = true, .full = true, .value = .null }));
@@ -3142,11 +2767,6 @@ test "remote paths are recognised, local ones left alone" {
     try testing.expect(!isRemote("a.parquet"));
 }
 
-// The regression this pins: `openProjected` used to send everything that was not
-// `az://` to `std.fs.cwd().openFile`, so an `http(s)://` URL failed with
-// FileNotFound having never opened a socket — while the docs advertised it. Port
-// 1 is not listening, so a routed read fails at connect; a filesystem error here
-// means the URL never reached the network at all.
 test "an http parquet source routes to the network, never the local filesystem" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -3156,17 +2776,10 @@ test "an http parquet source routes to the network, never the local filesystem" 
 }
 
 fn fuzzKernels(_: void, input: []const u8) anyerror!void {
-    // Every kernel here decodes attacker-controlled page bytes. `count` and
-    // `width` come from page headers in real use — also attacker-controlled —
-    // so both are derived from the input; count is bounded only to keep the
-    // harness fast, not because the kernels may assume a bound.
     if (input.len < 3) return;
     const width6: u6 = @truncate(input[0]);
     const count: usize = ((@as(usize, input[1]) << 4) | (input[2] & 0x0F)) & 0x1FF;
     const src = input[3..];
-    // Fixed buffer, not a heap arena: it makes each iteration allocation-free
-    // (the mutation loop runs thousands), and a decoder talked into a huge
-    // size by hostile bytes gets error.OutOfMemory instead of the memory.
     var mem: [256 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&mem);
     var arena = std.heap.ArenaAllocator.init(fba.allocator());
@@ -3179,7 +2792,6 @@ fn fuzzKernels(_: void, input: []const u8) anyerror!void {
     _ = decodeDeltaByteArray(a, src, count) catch {};
     _ = decodeByteStreamSplit(a, src, @max(1, @as(usize, width6 % 17)), count) catch {};
 
-    // PLAIN decode across every physical type, including the deprecated int96.
     inline for (.{ .boolean, .int32, .int64, .int96, .float, .double, .byte_array, .fixed_len_byte_array }) |pt| {
         var cur = PlainCursor.init(pt, @intCast(width6), src);
         var n: usize = 0;
@@ -3190,8 +2802,8 @@ fn fuzzKernels(_: void, input: []const u8) anyerror!void {
 }
 
 const fuzzKernels_corpus = [_][]const u8{
-    "\x03\x01\x00" ++ "\x03\x88\x01\x02\x03", // small RLE-ish seed
-    "\x02\x00\x08" ++ "\x80\x01\x04\x05\x00\x01\x02\x03\x04", // delta-ish seed
+    "\x03\x01\x00" ++ "\x03\x88\x01\x02\x03",
+    "\x02\x00\x08" ++ "\x80\x01\x04\x05\x00\x01\x02\x03\x04",
 };
 
 test "fuzz: page decode kernels survive arbitrary bytes" {
@@ -3200,18 +2812,14 @@ test "fuzz: page decode kernels survive arbitrary bytes" {
 }
 
 test "BitReader: wide values at non-zero bit offsets keep their top bits" {
-    // Layout: 3 one-bits, then a 61-bit value, then a 64-bit value. Before the
-    // two-word path, any read whose shift + width crossed 64 bits silently
-    // zeroed the bits beyond the first word — a wrong VALUE, not an error.
     const v61: u64 = 0x1ABC_DEF0_1234_5678 & ((1 << 61) - 1);
     const v64: u64 = 0xFEDC_BA98_7654_3210;
     var bits: [17]u8 = @splat(0);
     var w = std.io.Writer.fixed(&bits);
     _ = &w;
-    // Pack by hand, LSB-first: bit 0..2 = 0b111, then v61, then v64.
     var acc: u128 = 0b111;
     acc |= @as(u128, v61) << 3;
-    var acc2: u128 = @as(u128, v64) << ((3 + 61) % 8); // second region starts at bit 64
+    var acc2: u128 = @as(u128, v64) << ((3 + 61) % 8);
     _ = &acc2;
     var all: [16]u8 = undefined;
     std.mem.writeInt(u128, &all, acc | (@as(u128, v64) << 64), .little);
@@ -3220,7 +2828,6 @@ test "BitReader: wide values at non-zero bit offsets keep their top bits" {
     try std.testing.expectEqual(v61, try br.read(61));
     try std.testing.expectEqual(v64, try br.read(64));
 
-    // Reading past the buffer is an error, not a partial value.
     var short = BitReader{ .buf = all[0..8] };
     _ = try short.read(3);
     try std.testing.expectError(Error.CorruptParquetPage, short.read(64));
@@ -3229,8 +2836,6 @@ test "BitReader: wide values at non-zero bit offsets keep their top bits" {
 test "decodeDeltaBinaryPacked: a miniblock width above 64 is a corrupt page" {
     var mem: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&mem);
-    // header: block=128, miniblocks=1, total=2, first=0; then min_delta=0 and
-    // a width byte of 255 — the exact byte the mutation harness found.
     const page = [_]u8{ 0x80, 0x01, 0x01, 0x02, 0x00, 0x00, 0xFF };
     try std.testing.expectError(
         Error.CorruptParquetPage,
@@ -3249,8 +2854,6 @@ test "assembleLists: null, empty, a null element, and nested lists from levels" 
     defer ar.deinit();
     const a = ar.allocator();
 
-    // optional group xs (LIST) { repeated group list { optional int64 element } }
-    // defs: 0 = xs null, 1 = empty, 2 = null element, 3 = value
     const flat = ListShape{ .rep_def = &.{2} };
     const vals = [_]Value{ .{ .int = 1 }, .{ .int = 2 }, .null, .null, .null, .{ .int = 5 } };
     const reps = [_]u32{ 0, 1, 0, 0, 0, 1 };
@@ -3261,7 +2864,6 @@ test "assembleLists: null, empty, a null element, and nested lists from levels" 
     try testing.expect(got.getValue(2) == .null);
     try testing.expectEqualStrings("[null,5]", got.getValue(3).string);
 
-    // list<list<int>>, both levels optional: rep_def = {2, 4}, max_def = 5
     const nested = ListShape{ .rep_def = &.{ 2, 4 } };
     const nvals = [_]Value{ .{ .int = 1 }, .{ .int = 2 }, .{ .int = 3 }, .null, .null, .{ .int = 4 } };
     const nreps = [_]u32{ 0, 1, 2, 0, 1, 1 };
@@ -3270,12 +2872,9 @@ test "assembleLists: null, empty, a null element, and nested lists from levels" 
     try testing.expectEqualStrings("[[1],[2,3]]", ngot.getValue(0).string);
     try testing.expectEqualStrings("[[],null,[4]]", ngot.getValue(1).string);
 
-    // a row count that disagrees with the levels, or a repetition deeper than
-    // the list, is a corrupt page — never a wrong answer
     try testing.expectError(Error.CorruptParquetPage, assembleLists(a, try listColumn(a, &vals), &reps, &defs, 3, flat, 5));
     const bad_reps = [_]u32{ 0, 2, 0, 0, 0, 1 };
     try testing.expectError(Error.CorruptParquetPage, assembleLists(a, try listColumn(a, &vals), &bad_reps, &defs, 3, flat, 4));
-    // a repeated entry below its own level's threshold: an element that is not one
     const bad_defs = [_]u32{ 3, 1, 1, 0, 2, 3 };
     try testing.expectError(Error.CorruptParquetPage, assembleLists(a, try listColumn(a, &vals), &reps, &bad_defs, 3, flat, 4));
 }
@@ -3305,8 +2904,6 @@ test "parquet LIST columns read as JSON from pyarrow (pages v1 and v2) and polar
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // `recs` (a list of structs) and `m` (a map) span several leaves and are
-    // assembled from all of them: objects in an array, and an object
     const want =
         \\id=1 xs=[1,2] nest=[[1],[2,3]] ds=["2026-01-01"] recs=[{"a":1,"b":"x"}] m={"k":1}
         \\id=2 xs=[] nest=[[]] ds=null recs=null m=null
@@ -3314,7 +2911,6 @@ test "parquet LIST columns read as JSON from pyarrow (pages v1 and v2) and polar
         \\id=4 xs=[null,5] nest=[null,[4]] ds=["1969-12-31",null] recs=[{"a":2,"b":"y"}] m={"z":2}
         \\
     ;
-    // v1: two row groups of two rows, uncompressed; v2: one group, snappy
     try testing.expectEqualStrings(want, try readAllText(a, @embedFile("testdata/lists_v1.parquet"), "v1.parquet"));
     try testing.expectEqualStrings(want, try readAllText(a, @embedFile("testdata/lists_v2.parquet"), "v2.parquet"));
     try testing.expectEqualStrings(
@@ -3337,15 +2933,12 @@ test "a nested column is typed string, read whole, and no bound prunes on it" {
     const r = try Reader.open(a, try std.fs.path.join(a, &.{ dir, "l.parquet" }));
     defer r.close();
     try testing.expectEqual(types.TypeKind.string, r.schema.fields[r.schema.indexOf("xs").?].ty.kind);
-    // every column of the file, nothing left out
     const names = [_][]const u8{ "id", "xs", "nest", "ds", "recs", "m" };
     try testing.expectEqual(names.len, r.schema.fields.len);
     for (names, r.schema.fields) |n, f| try testing.expectEqualStrings(n, f.name);
     try testing.expectEqual(types.TypeKind.string, r.schema.fields[4].ty.kind);
-    // a bound on a nested column's name proves nothing either
     const rb = [_]Bound{.{ .column = "recs", .op = .eq, .value = .{ .string = "zzz" } }};
     for (r.md.row_groups) |g| try testing.expect(groupMayMatch(r.md.schema, r.leaves, g, &rb));
-    // the element statistics say 1..5; a bound on the column must not trust them
     const b = [_]Bound{.{ .column = "xs", .op = .gt, .value = .{ .int = 100 } }};
     for (r.md.row_groups) |g| try testing.expect(groupMayMatch(r.md.schema, r.leaves, g, &b));
 }
@@ -3358,7 +2951,6 @@ test "assembleNested: leaves that disagree, or a row count that does not match, 
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // optional group recs (LIST) { repeated group list { optional group element { optional int a; optional int b } } }
     const schema = [_]parquet.SchemaElement{
         .{ .name = "root", .num_children = 1 },
         .{ .name = "recs", .repetition = .optional, .num_children = 1, .converted_type = 3 },
@@ -3368,7 +2960,6 @@ test "assembleNested: leaves that disagree, or a row count that does not match, 
         .{ .name = "b", .ty = .int64, .repetition = .optional },
     };
     const root = try buildNested(a, &schema, .{ .idx = 1, .base_def = 0, .base_rep = 0 });
-    // row 0: [{a:1,b:2},{a:null,b:3}]; row 1: null; row 2: []; row 3: [null]
     const ea = try entriesOf(a, &.{ .{ .int = 1 }, .null, .null, .null, .null }, &.{ 0, 1, 0, 0, 0 }, &.{ 4, 3, 0, 1, 2 });
     const eb = try entriesOf(a, &.{ .{ .int = 2 }, .{ .int = 3 }, .null, .null, .null }, &.{ 0, 1, 0, 0, 0 }, &.{ 4, 4, 0, 1, 2 });
     const got = try assembleNested(a, &root, &.{ ea, eb }, 4);
@@ -3377,12 +2968,9 @@ test "assembleNested: leaves that disagree, or a row count that does not match, 
     try testing.expectEqualStrings("[]", got.getValue(2).string);
     try testing.expectEqualStrings("[null]", got.getValue(3).string);
 
-    // `b` claims a third element in row 0 that `a` does not have
     const eb3 = try entriesOf(a, &.{ .{ .int = 2 }, .{ .int = 3 }, .{ .int = 9 }, .null, .null, .null }, &.{ 0, 1, 1, 0, 0, 0 }, &.{ 4, 4, 4, 0, 1, 2 });
     try testing.expectError(Error.CorruptParquetPage, assembleNested(a, &root, &.{ ea, eb3 }, 4));
-    // a row count the levels do not have
     try testing.expectError(Error.CorruptParquetPage, assembleNested(a, &root, &.{ ea, eb }, 5));
-    // a leaf missing altogether
     try testing.expectError(Error.CorruptParquetPage, assembleNested(a, &root, &.{ea}, 4));
 }
 
@@ -3393,9 +2981,6 @@ test "a nested fixture with bytes flipped anywhere errors or reads, never crashe
     inline for (.{ "testdata/lists_v1.parquet", "testdata/lists_v2.parquet" }) |fixture| {
         const good = @embedFile(fixture);
         var buf: [good.len]u8 = undefined;
-        // Every byte, one mask: this sweep found a negative row count, a
-        // negative chunk offset and an empty schema reaching unchecked casts,
-        // and a pre-year-0 date trapping in the formatter.
         var i: usize = 0;
         while (i < good.len) : (i += 1) {
             @memcpy(&buf, good);

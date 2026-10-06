@@ -1,30 +1,29 @@
-//! JSON read in place. `json_get`, `JSON_EACH` and the JSON array functions
-//! parse one document per row, and `std.json` built a whole tree for each —
-//! a hash map per object, a list per array, a copy of every string — to hand
-//! back one value or one array's elements. This reads the text where it lies,
-//! in the On-Demand style of simdjson and sonic-rs: `validate` checks the
-//! document without allocating, then `path` and `Elements` locate values as
-//! slices of the original text, and only what is returned is decoded.
+//! JSON read in place. `json_get`, `JSON_EACH` and the JSON array functions parse
+//! one document per row, and `std.json` built a whole tree for each (a hash map per
+//! object, a list per array, a copy of every string) to hand back one value or one
+//! array's elements. This reads the text where it lies, in the On-Demand style of
+//! simdjson and sonic-rs: `validate` checks the document without allocating, then
+//! `path` and `Elements` locate values as slices of the original text, and only
+//! what is returned is decoded. Everything after `validate` assumes it passed and
+//! does not check the text again.
 //!
-//! What it accepts and refuses is `std.json`'s exactly — a cell that is not
-//! JSON was an error and still is, duplicate keys included — and a document it
-//! is not sure of (nesting deeper than `max_depth`, more open keys than
-//! `max_keys`, a long escaped key) is handed to `std.json` to decide, so those
-//! cases are exact by construction. The values it returns are `std.json`'s too
-//! (`eval.jsonToValue`): a test holds the two against each other.
+//! What it accepts and refuses is `std.json`'s exactly: a cell that is not JSON was
+//! an error and still is, duplicate keys included. A document it is not sure of
+//! (nesting deeper than `max_depth`, more open keys than `max_keys`, an escaped key
+//! longer than `max_key_bytes`) is handed to `std.json` to decide, so those cases
+//! are exact by construction. The values it returns are `std.json`'s too, as
+//! `eval.jsonToValue` makes them (strings unquoted, numbers and booleans as their
+//! text, containers as compact JSON); a randomized test holds the two against each
+//! other.
 
 const std = @import("std");
 
 pub const Error = error{ InvalidJson, OutOfMemory };
 
-/// Nesting the validator follows itself; a deeper document goes to `std.json`.
 const max_depth = 128;
-/// Keys of the open objects compared for duplicates; more go to `std.json`.
 const max_keys = 256;
-/// The longest escaped key decoded on the stack to compare; longer goes to `std.json`.
 const max_key_bytes = 256;
 
-/// Whether `text` is one JSON document, as `std.json` decides.
 pub fn validate(arena: std.mem.Allocator, text: []const u8) Error!void {
     var v = Validator{ .t = text };
     v.run() catch |e| switch (e) {
@@ -78,8 +77,8 @@ const Validator = struct {
         v.i += word.len;
     }
 
-    /// `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?` — what follows it is the
-    /// enclosing value's to judge, so `01` and `1a` fail there.
+    /// `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`; what follows is the enclosing
+    /// value's to judge, so `01` and `1a` fail there.
     fn number(v: *Validator) E!void {
         const t = v.t;
         var i = v.i;
@@ -106,7 +105,6 @@ const Validator = struct {
         v.i = i;
     }
 
-    /// A string at `v.i`; returns its raw content, between the quotes.
     fn string(v: *Validator) E![]const u8 {
         const t = v.t;
         v.i += 1;
@@ -148,6 +146,7 @@ const Validator = struct {
         return raw;
     }
 
+    /// Refuses a key repeated in one object, as `std.json` does.
     fn object(v: *Validator) E!void {
         if (v.depth == max_depth) return error.Fallback;
         v.depth += 1;
@@ -165,7 +164,6 @@ const Validator = struct {
             v.ws();
             if (v.i >= t.len or t[v.i] != '"') return error.Invalid;
             const key = try v.string();
-            // `std.json` refuses a document with a key repeated in one object
             for (v.keys[base..v.nkeys]) |k| if (try keysEqual(k, key)) return error.Invalid;
             if (v.nkeys == max_keys) return error.Fallback;
             v.keys[v.nkeys] = key;
@@ -215,7 +213,6 @@ const Validator = struct {
         }
     }
 
-    /// Two raw keys naming the same key once decoded (`"a"` and `"a"`).
     fn keysEqual(a: []const u8, b: []const u8) E!bool {
         if (std.mem.eql(u8, a, b)) return true;
         const ea = std.mem.indexOfScalar(u8, a, '\\') != null;
@@ -232,7 +229,7 @@ fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
 }
 
-/// Four hex digits exactly — not `std.fmt.parseInt`, which takes a sign and `_`.
+/// Four hex digits exactly, not `std.fmt.parseInt`, which takes a sign and `_`.
 fn hex4(t: []const u8, at: usize) ?u21 {
     if (at + 4 > t.len) return null;
     var v: u21 = 0;
@@ -248,9 +245,6 @@ fn hex4(t: []const u8, at: usize) ?u21 {
     return v;
 }
 
-// --- walking a validated document --------------------------------------------
-// Everything below assumes `validate` passed: it does not check the text again.
-
 fn skipWs(t: []const u8, i_in: usize) usize {
     var i = i_in;
     while (i < t.len) switch (t[i]) {
@@ -260,7 +254,6 @@ fn skipWs(t: []const u8, i_in: usize) usize {
     return i;
 }
 
-/// Just past the string whose opening quote is at `i`.
 fn stringEnd(t: []const u8, i: usize) usize {
     var j = i + 1;
     while (true) {
@@ -305,7 +298,6 @@ fn valueEnd(t: []const u8, i: usize) usize {
     }
 }
 
-/// The value of member `key` of the object at `i`, keys compared decoded.
 fn member(arena: std.mem.Allocator, t: []const u8, i: usize, key: []const u8) Error!?usize {
     var j = skipWs(t, i + 1);
     if (t[j] == '}') return null;
@@ -324,7 +316,6 @@ fn member(arena: std.mem.Allocator, t: []const u8, i: usize, key: []const u8) Er
     }
 }
 
-/// Element `n` of the array at `i`.
 fn element(t: []const u8, i: usize, n: usize) ?usize {
     var it = Elements.at(t, i);
     var k: usize = 0;
@@ -335,10 +326,9 @@ fn element(t: []const u8, i: usize, n: usize) ?usize {
     return null;
 }
 
-/// The value `path` names in the validated document `t` — `a.b`, `a[0].b` or
-/// `a.0.b`, a leading `$` allowed — as a slice of `t`; null when a key is
-/// missing, an index is past the end, or a step lands on a scalar. The same
-/// walk as `eval.jsonPath` over a `std.json` tree.
+/// The value `path` names (`a.b`, `a[0].b` or `a.0.b`, leading `$` allowed) as a slice
+/// of `t`; null when a key is missing, an index is past the end, or a step lands on a
+/// scalar. The same walk as `eval.jsonPath` over a `std.json` tree.
 pub fn path(arena: std.mem.Allocator, t: []const u8, p_in: []const u8) Error!?[]const u8 {
     var p = p_in;
     if (std.mem.startsWith(u8, p, "$")) p = p[1..];
@@ -354,7 +344,6 @@ pub fn path(arena: std.mem.Allocator, t: []const u8, p_in: []const u8) Error!?[]
     return t[cur..valueEnd(t, cur)];
 }
 
-/// What the validated document `t` is at its root.
 pub fn rootKind(t: []const u8) enum { array, null, other } {
     return switch (t[skipWs(t, 0)]) {
         '[' => .array,
@@ -363,8 +352,6 @@ pub fn rootKind(t: []const u8) enum { array, null, other } {
     };
 }
 
-/// The elements of the array at the root of the validated document `t`, each a
-/// slice of `t`.
 pub const Elements = struct {
     t: []const u8,
     i: usize,
@@ -389,7 +376,6 @@ pub const Elements = struct {
         return self.i;
     }
 
-    /// Where the element after the one starting at `s` starts (or the `]`).
     fn after(self: *Elements, s: usize) usize {
         const j = skipWs(self.t, valueEnd(self.t, s));
         if (self.t[j] == ',') return skipWs(self.t, j + 1);
@@ -398,11 +384,6 @@ pub const Elements = struct {
     }
 };
 
-// --- values -------------------------------------------------------------------
-
-/// A JSON value as a cell, as `eval.jsonToValue` makes one from a `std.json`
-/// tree: strings unquoted, numbers and booleans as their text, objects and
-/// arrays as compact JSON, null as null.
 pub const Cell = union(enum) { null, text: []const u8 };
 
 pub fn cell(arena: std.mem.Allocator, raw: []const u8) Error!Cell {
@@ -416,10 +397,10 @@ pub fn cell(arena: std.mem.Allocator, raw: []const u8) Error!Cell {
     };
 }
 
-/// A number's kind, as `std.json` reads one: an integer when it is written as
-/// one and fits an i64, a float when it is finite, else its text.
 pub const Number = union(enum) { int: i64, float: f64, text: []const u8 };
 
+/// A number as `std.json` reads one: an int when written as one and it fits an i64, a
+/// float when finite, else its text.
 pub fn number(raw: []const u8) Number {
     if (!std.mem.eql(u8, raw, "-0") and std.mem.indexOfAny(u8, raw, ".eE") == null) {
         return if (std.fmt.parseInt(i64, raw, 10)) |i| .{ .int = i } else |_| .{ .text = raw };
@@ -428,13 +409,12 @@ pub fn number(raw: []const u8) Number {
     return if (std.math.isFinite(f)) .{ .float = f } else .{ .text = raw };
 }
 
-/// `.cell` renders a float as `jsonToValue` does (`{d}`); `.json` as
-/// `std.json.Stringify` writes one (`{}`).
 const NumberStyle = enum { cell, json };
 
+/// `.cell` renders a float as `jsonToValue` does (`{d}`); `.json` as
+/// `std.json.Stringify` writes one (`{}`).
 fn numberText(arena: std.mem.Allocator, raw: []const u8, style: NumberStyle) Error![]const u8 {
     return switch (number(raw)) {
-        // written as an integer, it is already its own shortest text
         .int, .text => raw,
         .float => |f| switch (style) {
             .cell => try std.fmt.allocPrint(arena, "{d}", .{f}),
@@ -443,16 +423,15 @@ fn numberText(arena: std.mem.Allocator, raw: []const u8, style: NumberStyle) Err
     };
 }
 
-/// A string's raw content decoded: escapes resolved, `\u` pairs joined. The
-/// content itself when it holds no escape.
+/// Escapes resolved and `\u` pairs joined; the content itself when it holds no escape.
 pub fn decodeString(arena: std.mem.Allocator, content: []const u8) Error![]const u8 {
     if (std.mem.indexOfScalar(u8, content, '\\') == null) return content;
     const buf = try arena.alloc(u8, content.len);
     return decodeInto(buf, content);
 }
 
-/// Decode `content` into `buf`, which a decoded string never outgrows (every
-/// escape is at least as long as what it stands for).
+/// Decode into `buf`, which a decoded string never outgrows: every escape is at least
+/// as long as what it stands for.
 fn decodeInto(buf: []u8, content: []const u8) []const u8 {
     var o: usize = 0;
     var i: usize = 0;
@@ -483,7 +462,7 @@ fn decodeInto(buf: []u8, content: []const u8) []const u8 {
                 o += std.unicode.utf8Encode(cp, buf[o..]) catch unreachable;
                 continue;
             },
-            else => e, // `"`, `\`, `/`
+            else => e,
         };
         buf[o] = lit;
         o += 1;
@@ -491,10 +470,8 @@ fn decodeInto(buf: []u8, content: []const u8) []const u8 {
     return buf[0..o];
 }
 
-/// The validated value `raw` written as `std.json.Stringify` writes the tree it
-/// parses to: no insignificant whitespace, strings re-escaped, numbers in its
-/// form. A string with no escape is written as it stands: it holds nothing
-/// `Stringify` would escape.
+/// Written as `std.json.Stringify` writes the parsed tree: no insignificant whitespace,
+/// strings re-escaped, numbers in its form. A string with no escape is copied as is.
 pub fn compact(arena: std.mem.Allocator, raw: []const u8) Error![]const u8 {
     var aw = std.Io.Writer.Allocating.init(arena);
     try compactInto(arena, raw, &aw.writer);
@@ -539,8 +516,6 @@ pub fn compactInto(arena: std.mem.Allocator, raw: []const u8, w: *std.Io.Writer)
     }
 }
 
-// --- tests --------------------------------------------------------------------
-
 const testing = std.testing;
 const eval = @import("eval.zig");
 const Value = @import("value.zig").Value;
@@ -573,7 +548,6 @@ test "json: accepts and refuses what std.json does" {
     }
 }
 
-/// A random JSON document: nested values, escapes, awkward numbers and spacing.
 fn genValue(r: std.Random, w: *std.Io.Writer, depth: usize) !void {
     const kind = r.uintLessThan(u8, if (depth > 4) 5 else 7);
     switch (kind) {
@@ -595,7 +569,6 @@ fn genValue(r: std.Random, w: *std.Io.Writer, depth: usize) !void {
             const n = r.uintLessThan(usize, 5);
             for (0..n) |k| {
                 if (k > 0) try w.writeByte(',');
-                // keys from a small set, so lookups hit and duplicates happen
                 try w.writeAll(([_][]const u8{ "\"a\"", "\"b\"", "\"c\"", "\"\\u0061\"", "\"k\\n\"", "\"0\"" })[r.uintLessThan(usize, 6)]);
                 try w.writeAll(([_][]const u8{ ":", " : " })[r.uintLessThan(usize, 2)]);
                 try genValue(r, w, depth + 1);
@@ -633,7 +606,6 @@ test "json: reads every generated document as std.json does, and every damaged o
         var aw = std.Io.Writer.Allocating.init(a);
         try genValue(r, &aw.writer, 0);
         var doc: []u8 = try a.dupe(u8, aw.written());
-        // a third of the documents get one byte damaged
         if (round % 3 == 0 and doc.len > 0) {
             const at = r.uintLessThan(usize, doc.len);
             doc[at] = ([_]u8{ '"', '\\', ',', ']', '}', '1', ' ', 0x01, 0xff, 'e' })[r.uintLessThan(usize, 10)];
@@ -673,6 +645,5 @@ test "json: reads every generated document as std.json does, and every damaged o
             return error.TestUnexpectedResult;
         }
     }
-    // the generator must not be producing only failures
     try testing.expect(checked > 8000);
 }

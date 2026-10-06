@@ -1,9 +1,39 @@
-//! Static analysis: parsed program → validated `Plan` IR, without executing or
-//! connecting. Shared groundwork for `EXPLAIN` (render the IR) and `basalt
-//! check` (validate and report). It does full structural + reference validation
-//! and resolves what it can read locally — a CSV header, a Parquet footer. A
-//! schema only the source can describe (a database table, a remote object)
-//! stays null and renders as `schema: unresolved`.
+//! Static analysis: parsed program to validated `Plan` IR, without executing or
+//! connecting. Shared groundwork for `EXPLAIN` (render the IR) and `basalt check`
+//! (validate and report). It does full structural and reference validation and
+//! resolves what it can read locally, a CSV header (split on the script's
+//! delimiter), a Parquet footer, a workbook's first pass. A schema only the source
+//! can describe (a database table, a remote object) stays null, renders as
+//! `schema: unresolved` once at its scan, and nothing past it is typed; so does a
+//! name computed per row (`IDENTIFIER(...)`). A `$name` that nothing binds is still
+//! refused there, whatever the columns turn out to be.
+//!
+//! Analysis mirrors the runtime so `check` refuses exactly what a run would and
+//! `EXPLAIN` prints the plan that runs: the same param substitution into filters
+//! (a `$param` reaches pushdown as its value, never as a column), the same binding
+//! inlining and pushdown rewrite, the same `joinPlan`, the same `THROW` guards and
+//! body-statement rule, and the same physical labels. `splittable` is the SQL
+//! key-range fan-out (map-only, an aggregate with a sort/limit tail, map+join);
+//! `morsel_parallel` is a file read cut into byte ranges or row groups. Both were
+//! once mislabelled `serial` while the run fanned out, so the predicates here are
+//! the ones the runtime asks.
+//!
+//! Binding order: PARAMs (with `-p` overrides typed as the run binds them), then
+//! statement-level LETs in declaration order as expressions; a query LET is an
+//! unknown-typed null placeholder. Guards are checked before body-scoped variables
+//! (loop vars, statement-fn params) bind to typed placeholders.
+//!
+//! `Diag.pos` is cleared by `fail` and stamped as the error unwinds, innermost
+//! stage first; `end` is set when the error names a span. With `Options.issues`
+//! every statement is checked and each failure recorded; without it the first
+//! fails. `ParamMap` is deliberately not a `pub` alias: re-exporting a
+//! StringHashMap type makes `refAllDeclsRecursive` recurse its decl tree and crash.
+//!
+//! File targets: an unrecognised extension used to fall through to the CSV reader,
+//! and a 12 MB zip answered `COUNT(*)` with the newlines in its deflate stream, so
+//! an extension basalt does not read is a plan-time error. Parquet cannot be read
+//! through a codec (it must seek), a compressed CSV or archive member is read
+//! serially, and archives are judged by their member's name.
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
@@ -28,10 +58,7 @@ const body_stmt_rule = @import("env.zig").body_stmt_rule;
 pub const Diag = struct {
     buf: [512]u8 = undefined,
     msg: []const u8 = "",
-    /// Where the failing stage/pipeline sits in the script. Cleared by `fail` and
-    /// stamped as the error unwinds through the analyzer, innermost stage first.
     pos: ?ast.Pos = null,
-    /// End of the offending text, when the error names a span rather than a stage.
     end: ?ast.Pos = null,
 
     pub fn stamp(self: *Diag, pos: ast.Pos) void {
@@ -58,22 +85,16 @@ fn failAt(diag: *Diag, span: ?ast.Span, comptime fmt: []const u8, args: anytype)
     return e;
 }
 
-/// Param name → the literal expression it substitutes to (CLI values for the
-/// executor; declared defaults for offline analysis). Deliberately NOT a `pub`
-/// named alias — re-exporting a StringHashMap type makes `refAllDeclsRecursive`
-/// (the test harness) recurse the whole hashmap decl tree and crash. Callers spell
-/// `std.StringHashMap(*const ast.Expr)` directly; it's the same type.
 const ParamMap = std.StringHashMap(*const ast.Expr);
 
-/// Deep-copy `expr`, replacing each `$name` that names a param or LET with its
-/// literal. A bare name is a column — a PARAM of the same name never stands in
-/// for it. No params ⇒ returns the original (no copy).
 const SubstCtx = struct { arena: std.mem.Allocator, params: *const ParamMap };
 
 fn substRecur(ctx: SubstCtx, e: *const ast.Expr) Error!*ast.Expr {
     return @constCast(try substExpr(ctx.arena, e, ctx.params));
 }
 
+/// Deep-copy `expr`, replacing each `$name` that names a param or LET with its literal;
+/// no params returns the original. A bare name is a column, never a same-named PARAM.
 pub fn substExpr(arena: std.mem.Allocator, expr: *const ast.Expr, params: *const ParamMap) Error!*const ast.Expr {
     if (params.count() == 0) return expr;
     if (expr.* == .field) {
@@ -84,11 +105,9 @@ pub fn substExpr(arena: std.mem.Allocator, expr: *const ast.Expr, params: *const
     return ast.rebuildExpr(arena, expr, SubstCtx{ .arena = arena, .params = params }, substRecur);
 }
 
-/// `stages` with every `$param` / `$let` in a filter replaced by its value. The
-/// parser reads `$since` as a name, which the engine resolves when it evaluates;
-/// pushdown translates the predicate before that, and sent `[since]` to the
-/// source as a column. Applied ahead of every descent, it hands them literals.
-/// Returns `stages` itself when no filter names a param.
+/// Every `$param` / `$let` in a filter replaced by its value: pushdown translates
+/// before evaluation and once sent `[since]` to the source as a column. Returns
+/// `stages` itself when no filter names one.
 pub fn substFilterParams(arena: std.mem.Allocator, stages: []const ast.Stage, params: *const ParamMap) Error![]const ast.Stage {
     if (params.count() == 0) return stages;
     var out: ?[]ast.Stage = null;
@@ -120,17 +139,15 @@ fn exprType(arena: std.mem.Allocator, in: types.Schema, e: *const ast.Expr, diag
     };
 }
 
-/// One resolved output column of `select`: either a passthrough of an input index
-/// or a computed (already param-substituted) expression, plus its name and type.
 pub const Col = struct {
     name: []const u8,
     ty: types.Type,
     source: union(enum) { passthrough: usize, expr: *const ast.Expr },
-    /// A passed-through column keeps the join side it came from (`Schema.Field`).
     rel: []const u8 = "",
     base: []const u8 = "",
 };
 
+/// `b.x` is called `x` in the output, as in SQL, unless `a.x` is already there.
 pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast.SelectItem, params: *const ParamMap, diag: *Diag) Error![]Col {
     var cols = std.array_list.Managed(Col).init(arena);
     for (items) |item| switch (item) {
@@ -152,8 +169,6 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
         },
         .field => |q| {
             const idx = in.resolve(q.parts) orelse return failAt(diag, q.span, "unknown field `{s}`", .{lastPart(q)});
-            // `b.x` is called `x` in the output, as SQL has it — unless `a.x` is
-            // already there, when it keeps the name the join gave it.
             var nm = lastPart(q);
             for (cols.items) |c| if (std.mem.eql(u8, c.name, nm)) {
                 nm = in.fields[idx].name;
@@ -183,8 +198,6 @@ pub fn checkFilter(arena: std.mem.Allocator, in: types.Schema, pred0: *const ast
     return pred;
 }
 
-/// Validate field references (sort keys / distinct keys / group-by) and return
-/// their column indices.
 pub fn fieldIndices(arena: std.mem.Allocator, in: types.Schema, names: []const ast.QualName, diag: *Diag) Error![]usize {
     const idxs = try arena.alloc(usize, names.len);
     for (names, 0..) |q, i| idxs[i] = in.resolve(q.parts) orelse return failAt(diag, q.span, "unknown field `{s}`", .{lastPart(q)});
@@ -212,12 +225,12 @@ pub fn aggregatePlan(arena: std.mem.Allocator, in: types.Schema, ag: ast.Aggrega
     return .{ .by = by, .aggs = aggs, .schema = .{ .fields = try fields.toOwnedSlice() } };
 }
 
+/// Refuses `SUM('Kick-Off')`: single quotes make a string, which once summed to 0. A
+/// decimal sum stays decimal; typed as int it once reported the unscaled integer.
 fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const ast.Expr, in: types.Schema, diag: *Diag) Error!types.Type {
     const sp = aggregates.spec(func);
     if (sp.arg == .star_or_any) return types.Type.init(.int);
     const a = arg orelse return fail(diag, "this aggregate requires an argument", .{});
-    // `SUM('Kick-Off')` sums the text, not the column: in SQL single quotes make
-    // a string and double quotes a name. Taken as written, it summed to 0.
     if (sp.arg == .numeric and a.* == .str_lit)
         return fail(diag, "`{s}('{s}')` reads the text '{s}', not a column — a name with spaces or symbols takes double quotes: {s}(\"{s}\")", .{ sp.names[0], a.str_lit, a.str_lit, sp.names[0], a.str_lit });
     const at = try exprType(arena, in, a, diag);
@@ -227,9 +240,6 @@ fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const ast.E
         .count => types.Type.init(.int),
         .sum => switch (at.kind) {
             .float => types.Type.init(.float).withNull(true),
-            // A decimal sum stays a decimal: typing it as an int reported
-            // the accumulated *unscaled* integer, so 1.5+2.25+3.125 came
-            // back as 68750.
             .decimal => at.withNull(true),
             else => types.Type.init(.int).withNull(true),
         },
@@ -240,11 +250,8 @@ fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const ast.E
     };
 }
 
-/// Result type of one window function over its source column (`int` for the
-/// argument-less ones). Ranking counts rows, so it is a non-null int; MIN/MAX,
-/// LAG and LEAD keep the column's type; AVG is always a float; SUM keeps the
-/// column's family. Everything with an argument is nullable — a peer group of
-/// nothing but nulls has no answer, and a partition's first row has no LAG.
+/// Ranking is a non-null int; MIN/MAX, LAG and LEAD keep the column's type; AVG is a
+/// float; SUM keeps the family. With an argument it is nullable (all-null peers, first LAG).
 pub fn windowFuncType(kind: ast.WinKind, src: types.Type) types.Type {
     return switch (kind) {
         .row_number, .rank, .dense_rank, .count => types.Type.init(.int),
@@ -254,9 +261,8 @@ pub fn windowFuncType(kind: ast.WinKind, src: types.Type) types.Type {
     };
 }
 
-/// Output schema of a window stage: the input, then one appended column per
-/// function. The same rule the planner applies, so `EXPLAIN` can show the
-/// schema past a window instead of `unresolved`.
+/// The input then one column per function, the planner's rule, so `EXPLAIN` shows
+/// the schema past a window instead of `unresolved`.
 pub fn windowSchema(arena: std.mem.Allocator, in: types.Schema, wd: ast.Window, diag: *Diag) Error!types.Schema {
     _ = try fieldIndices(arena, in, wd.partition_by, diag);
     const oqs = try arena.alloc(ast.QualName, wd.order_by.len);
@@ -281,7 +287,6 @@ pub fn explodePlan(arena: std.mem.Allocator, in: types.Schema, ex: ast.Explode, 
         return fail(diag, "explode needs a string column (it splits a delimited value or a JSON array)", .{});
     const fields = try arena.alloc(types.Schema.Field, in.fields.len);
     for (in.fields, fields, 0..) |f, *out, i| {
-        // A JSON array may hold nulls; a split string never yields one.
         const ty = if (ex.json) types.Type.init(.string).asNullable() else types.Type.init(.string);
         out.* = if (i == idx) .{ .name = ex.as_name orelse f.name, .ty = ty } else f;
     }
@@ -297,25 +302,19 @@ pub const JoinPlan = struct {
     left_nullable: bool,
 };
 
-/// Resolve one `a = b` pair against both schemas. The parser orients by alias
-/// prefix, which unqualified names don't carry — so a pair may still arrive
-/// written right-side-first, and the side each name belongs to is decided here
-/// by where it actually resolves. A name living in both schemas is ambiguous.
+/// The parser orients by alias prefix, which unqualified names lack, so the side is
+/// decided by where each name resolves. Both readings resolving to different columns
+/// is ambiguous; a left key may carry an earlier join's alias.
 fn joinPair(left: types.Schema, right: types.Schema, lq: ast.QualName, rq: ast.QualName, diag: *Diag) Error![2]usize {
     const ln = lastPart(lq);
     const rn = lastPart(rq);
-    // A left key may be qualified by an earlier join's alias (`b.k = c.k`).
     const l_in_l = left.resolve(lq.parts);
     const l_in_r = right.indexOf(ln);
     const r_in_l = left.resolve(rq.parts);
     const r_in_r = right.indexOf(rn);
 
     const as_written = l_in_l != null and r_in_r != null;
-    // Written the other way round (`right.k = left.k`).
     const flipped = r_in_l != null and l_in_r != null;
-    // Both readings resolve and they name different columns: only the writer
-    // knows which side each belongs to. Equal names are the benign case —
-    // either reading pairs the same two columns.
     if (as_written and flipped and !std.mem.eql(u8, ln, rn))
         return fail(diag, "join key `{s}` is ambiguous — `{s}` and `{s}` both exist on both sides; qualify them", .{ ln, ln, rn });
     if (as_written) return .{ l_in_l.?, r_in_r.? };
@@ -326,6 +325,8 @@ fn joinPair(left: types.Schema, right: types.Schema, lq: ast.QualName, rq: ast.Q
     return fail(diag, "join key `{s}` is not a column of the joined side", .{ln});
 }
 
+/// The `_r` suffix keeps bumping until free: two output fields with one name make the
+/// second unreachable, since every lookup goes through `Schema.indexOf`.
 pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schema, j: ast.Join, diag: *Diag) Error!JoinPlan {
     if (j.left_keys.len != j.right_keys.len) return fail(diag, "join has mismatched key lists", .{});
     if (j.kind != .cross and j.left_keys.len == 0) return fail(diag, "join needs at least one `ON <column> = <column>` pair", .{});
@@ -349,10 +350,6 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
     var fields = std.array_list.Managed(types.Schema.Field).init(arena);
     for (left.fields) |f| try fields.append(.{ .name = f.name, .ty = if (left_nullable) f.ty.asNullable() else f.ty, .rel = f.rel, .base = f.base });
     if (emit_right) for (right.fields) |f| {
-        // The `_r` suffix can collide in turn — a left column literally named
-        // `x_r` beside a right `x`, or two right columns that disambiguate onto
-        // the same name. Two output fields with one name make the second
-        // unreachable, since every lookup goes through `Schema.indexOf`.
         var name = f.name;
         var n: usize = 0;
         while ((types.Schema{ .fields = fields.items }).indexOf(name) != null) : (n += 1) {
@@ -383,14 +380,13 @@ fn nameIn(names: []const []const u8, n: []const u8) bool {
     return false;
 }
 
-/// The new name for field `n` under a `* rename (...)` list, or null if unrenamed.
 fn renameTo(renames: []const ast.SelectItem.Rename, n: []const u8) ?[]const u8 {
     for (renames) |r| if (std.mem.eql(u8, r.from, n)) return r.to;
     return null;
 }
 
-/// A literal of the right type (value irrelevant) to stand in for a param during
-/// type-flow when it has no declared default.
+/// Body-scoped variables (loop vars, statement-fn params) bound to typed
+/// placeholders, so `$var` used as a value is lenient instead of an unknown field.
 fn bindBodyVars(arena: std.mem.Allocator, stmts: []const ast.Stmt, map: *ParamMap) Error!void {
     for (stmts) |s| switch (s) {
         .for_each => |fe| {
@@ -413,6 +409,8 @@ fn bindBodyVars(arena: std.mem.Allocator, stmts: []const ast.Stmt, map: *ParamMa
     };
 }
 
+/// A literal of the right type (value irrelevant) to stand in for a param during
+/// type-flow when it has no declared default.
 fn typedZero(arena: std.mem.Allocator, ty: types.Type) Error!*const ast.Expr {
     const e = try arena.create(ast.Expr);
     e.* = switch (ty.kind) {
@@ -428,11 +426,7 @@ fn typedZero(arena: std.mem.Allocator, ty: types.Type) Error!*const ast.Expr {
 pub const Source = struct {
     connector: []const u8,
     detail: []const u8,
-    /// Resolved column schema, or null when it needs a live connection.
     schema: ?types.Schema = null,
-    /// The predicate translated down into the source query (§7 implicit
-    /// pushdown + any raw `PUSHDOWN` fragment), or "" when none — so `check -s`
-    /// shows the cut line between "descended to the source" and "runs here".
     pushdown: []const u8 = "",
 };
 
@@ -446,11 +440,8 @@ pub const Stage = struct {
     kind: []const u8,
     detail: []const u8,
     breaker: bool,
-    /// A join's right side, when it is a SQL read: what it scans and the WHERE it
-    /// sends (`plan.prepareJoinSide`), shown under the join.
     right_scan: ?[]const u8 = null,
     right_pushdown: []const u8 = "",
-    /// Output schema after this stage — filled by the type-flow layer (later).
     out_schema: ?types.Schema = null,
 };
 
@@ -458,13 +449,7 @@ pub const Physical = struct {
     has_breaker: bool,
     splittable: bool,
     sink_parallel: bool,
-    /// The source divides into per-lane morsels at `-j > 1` — a local CSV into
-    /// byte-range chunks, a parquet into row groups. Distinct from `splittable`,
-    /// which is the SQL key-range fan-out; a file read reported as neither used to
-    /// print `physical: serial` while the run fanned out over 16 lanes.
     morsel_parallel: bool,
-    /// A LIMIT descended into the SQL read, and it caps everything the pipeline
-    /// holds at once: at most this many rows arrive to be sorted and cut.
     top_n: ?u64 = null,
 };
 
@@ -480,11 +465,8 @@ pub const Plan = struct {
     outputs: []const Output,
 };
 
-/// Decide one top-level `THROW` against the folded PARAM/LET values: substitute the
-/// bindings into both operands and const-fold them. Only a literal `true` fires (a
-/// null condition is not a failure, as in SQL), and when it does the script's own
-/// message becomes the diagnostic verbatim — so `basalt check` rejects exactly what
-/// a run would, before anything connects.
+/// Only a literal `true` fires (null is not a failure, as in SQL), and then the
+/// script's own message is the diagnostic, so `check` rejects exactly what a run would.
 fn checkThrow(arena: std.mem.Allocator, t: ast.Throw, params: *const ParamMap, diag: *Diag) Error!void {
     if (t.when) |w| {
         const c = eval.constEval(arena, try substExpr(arena, w, params), &.{}, &.{}) catch
@@ -496,13 +478,10 @@ fn checkThrow(arena: std.mem.Allocator, t: ast.Throw, params: *const ParamMap, d
     return fail(diag, "{s}", .{try eval.valueToString(arena, m)});
 }
 
-/// A `-p key=value` binding, so `check` decides a `THROW` guard against the same
-/// inputs the run would use instead of always against the declared defaults.
 pub const ParamOverride = struct { name: []const u8, value: []const u8 };
 
-/// The literal a CLI string stands for, typed by the PARAM's declared type.
-/// Anything not scalar keeps the declared default: `check` is offline, and a
-/// half-parsed JSON document would be a worse answer than the default.
+/// The literal a `-p` string stands for, typed by the PARAM's declared type. Anything
+/// not scalar keeps the declared default: `check` is offline.
 fn overrideExpr(arena: std.mem.Allocator, ty: types.Type, raw: []const u8) Error!?*const ast.Expr {
     return switch (ty.kind) {
         .int => mk(arena, .{ .int_lit = std.fmt.parseInt(i64, raw, 10) catch return null }),
@@ -514,9 +493,8 @@ fn overrideExpr(arena: std.mem.Allocator, ty: types.Type, raw: []const u8) Error
     };
 }
 
-/// A PARAM's value as the runtime binds it: a DATE, TIME, TIMESTAMP or DECIMAL
-/// is its text CAST to the declared type (`env.mkLit`), so a check types `$d` as
-/// the run does — `date_add('day', 1, $d)` is fine for a DATE param.
+/// A DATE, TIME, TIMESTAMP or DECIMAL param is its text CAST to the declared type
+/// (`env.mkLit`), so `date_add('day', 1, $d)` types as the run does.
 fn typedParam(arena: std.mem.Allocator, ty: types.Type, e: *const ast.Expr) Error!*const ast.Expr {
     return switch (ty.kind) {
         .date, .time, .timestamp, .decimal => mk(arena, .{ .cast = .{ .e = @constCast(e), .ty = ty } }),
@@ -532,11 +510,9 @@ pub fn analyzeWith(arena: std.mem.Allocator, raw_program: ast.Program, cli: []co
     return analyzeOpts(arena, raw_program, .{ .overrides = cli }, diag);
 }
 
-/// Arguments a builtin takes as syntax rather than data — a date unit, a
-/// `strftime` format — checked wherever a literal one appears. Typing checks
-/// them too, but only where the columns' types are known, which a SQL table's
-/// are not until it is read: `date_trunc('fortnight', ts)` over one checked out
-/// and failed at run time.
+/// Syntax-like arguments (a date unit, a `strftime` format) checked wherever a literal
+/// one appears, since typing only sees them where column types are known:
+/// `date_trunc('fortnight', ts)` over a SQL table once failed only at run time.
 fn checkLiteralArgs(diag: *Diag, e: *const ast.Expr) Error!void {
     switch (e.*) {
         .call => |c| {
@@ -588,30 +564,19 @@ fn checkStageLiterals(diag: *Diag, st: ast.Stage) Error!void {
     }
 }
 
-/// A table that exists where the script runs but that the script does not
-/// declare — a notebook's other cells. `FROM name` reads it; `schema`, when the
-/// caller knows it, types what follows, and null leaves it unresolved (as a live
-/// SQL table is to an analysis that does not connect).
 pub const KnownTable = struct { name: []const u8, schema: ?types.Schema = null };
 
-/// One problem the analysis found.
 pub const Issue = struct { msg: []const u8, pos: ?ast.Pos = null, end: ?ast.Pos = null };
 
 pub const Options = struct {
     overrides: []const ParamOverride = &.{},
     known_tables: []const KnownTable = &.{},
-    /// Report every problem: each statement is checked on its own, a failure is
-    /// recorded here, and the rest are still checked. Null: the first one fails.
     issues: ?*std.array_list.Managed(Issue) = null,
-    /// A script of declarations alone is whole — a notebook cell that only
-    /// declares — rather than "no output pipeline".
     declarations_only: bool = false,
 };
 
 pub fn analyzeOpts(arena: std.mem.Allocator, raw_program: ast.Program, opts: Options, diag: *Diag) error{ AnalyzeFailed, OutOfMemory }!Plan {
     var p = analyzeInner(arena, raw_program, opts, diag);
-    // With an issue list, a failure before the statements (an expansion, a
-    // parameter) is one more issue — there is nothing after it to go on with.
     if (opts.issues) |list| if (p) |_| {} else |e| {
         if (e == error.OutOfMemory) return e;
         try list.append(.{ .msg = try arena.dupe(u8, diag.msg), .pos = diag.pos, .end = diag.end });
@@ -649,7 +614,6 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
         if (text == null) if (p.default) |d| if (d.* == .str_lit) {
             text = d.str_lit;
         };
-        // what the run's CAST would refuse, refused here with its words
         switch (p.ty.kind) {
             .date, .time, .timestamp, .decimal => if (text) |t| {
                 _ = eval.castValueTyped(arena, .{ .string = t }, p.ty) catch
@@ -659,11 +623,6 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
         }
         try params_map.put(p.name, bound orelse try typedParam(arena, p.ty, if (p.default) |d| d else try typedZero(arena, p.ty)));
     };
-    // Statement-level `LET`s bind exactly like params — a `$name` ref substitutes
-    // the bound expression — but after every PARAM and in declaration order, so a
-    // LET body sees all params and only the LETs ahead of it. The executor folds
-    // these to a literal; here they stay expressions, which is all the checker
-    // needs to type a filter that mentions `$let`.
     for (program.stmts) |s| if (s == .let_const) {
         const l = s.let_const;
         if (params_map.contains(l.name))
@@ -671,20 +630,12 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
         if (l.expr) |le| {
             try params_map.put(l.name, try substExpr(arena, le, &params_map));
         } else {
-            // A query LET's value only exists at run time. For checking, an
-            // unknown-typed null stands in — it unifies with any comparison,
-            // which is all the checker needs from it.
             const ph = try arena.create(ast.Expr);
             ph.* = .null_lit;
             try params_map.put(l.name, ph);
         }
     };
-    // Guards run against params and LETs only, before the body-var placeholders
-    // below can make a `$name` resolve to a stand-in the script never sees.
     for (program.stmts) |s| if (s == .throw) try checkThrow(arena, s.throw, &params_map, diag);
-    // Body-scoped variables (for-each loop vars, statement-fn params) bind per
-    // row/call at run time; for checking, a typed placeholder (or unknown-typed
-    // null) keeps `$var`-as-value expressions lenient instead of "unknown field".
     try bindBodyVars(arena, program.stmts, &params_map);
 
     var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .diag = diag, .known = opts.known_tables, .issues = opts.issues };
@@ -695,8 +646,8 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
     return .{ .kind = kind_name, .outputs = try out_plans.toOwnedSlice() };
 }
 
-/// Does a stage name a column through a `${...}` template — `IDENTIFIER(<expr>)`,
-/// which the parser lowers to a field whose name is the template?
+/// Does a stage name a column through `IDENTIFIER(<expr>)`, which the parser lowers to
+/// a field whose name is a `${...}` template?
 fn hasDynamicName(node: ast.Stage.Node) bool {
     return switch (node) {
         .filter => |e| exprHasDynamicName(e),
@@ -790,10 +741,8 @@ pub fn stmtPos(s: ast.Stmt) ?ast.Pos {
     };
 }
 
-/// Analyze a single pipeline against declarations already in scope — what the
-/// executor's `EXPLAIN <query>;` statement renders. `analyzeWith` derives the same
-/// context by walking a whole program; the executor is already holding these maps
-/// (with params folded to their bound values), so it hands them over directly.
+/// One pipeline against declarations already in scope, for the executor's
+/// `EXPLAIN <query>;`, which holds these maps (params folded) and hands them over.
 pub fn analyzeOne(
     arena: std.mem.Allocator,
     kind_name: []const u8,
@@ -818,8 +767,8 @@ const Ctx = struct {
     known: []const KnownTable = &.{},
     issues: ?*std.array_list.Managed(Issue) = null,
 
-    /// A statement's failure: recorded, and the caller goes on to the next
-    /// statement — or, without an issue list, returned as the analysis's error.
+    /// A statement's failure: recorded and the caller goes on, or, without an issue
+    /// list, returned as the analysis's error.
     fn note(self: *Ctx, e: Error) Error!void {
         if (e == error.OutOfMemory) return e;
         const list = self.issues orelse return e;
@@ -834,8 +783,8 @@ const Ctx = struct {
         };
     }
 
-    /// A CTE's literal arguments, checked where it is declared: it is only typed
-    /// where it is read, and then only when its source's columns are known.
+    /// A CTE's literal arguments, checked where it is declared, since it is only typed
+    /// where it is read and its source's columns are known.
     fn checkBindingLiterals(self: *Ctx, p: ast.Pipeline) Error!void {
         for (p.stages) |st| checkStageLiterals(self.diag, st) catch |e| return self.note(e);
     }
@@ -845,10 +794,8 @@ const Ctx = struct {
         return null;
     }
 
-    /// The statements in the order the executor runs them: a `WITH` is visible to
-    /// what follows it, a body's `WITH` is scoped to that body, and the one rule
-    /// `runForStmt` applies per row is applied here once, with a position — so
-    /// `check` and `run` name the same constraint.
+    /// The statements in run order: a `WITH` is visible to what follows, a body's `WITH`
+    /// is scoped to it, and `runForStmt`'s per-row rule is applied once, with a position.
     fn checkStmts(self: *Ctx, stmts: []const ast.Stmt, outs: *std.array_list.Managed(Output), top: bool) Error!void {
         for (stmts) |s| switch (s) {
             .binding => |b| {
@@ -900,9 +847,6 @@ const Ctx = struct {
 
     fn analyzeOutput(self: *Ctx, pipe: ast.Pipeline) !Output {
         errdefer self.diag.stamp(pipe.pos);
-        // The same rewrite the runtime applies, so the plan `EXPLAIN` prints is the
-        // plan that runs — a filter shown below a join really did descend, and one
-        // shown above it really did not.
         if (pipe.stages.len == 0) return fail(self.diag, "empty pipeline", .{});
         const head = try self.inlineHead(pipe.stages);
         const via = head.via;
@@ -933,10 +877,6 @@ const Ctx = struct {
         var has_breaker = false;
         var breakers: usize = 0;
         var map_only = true;
-        // Tracks whether the shape is one the runtime fans out over key ranges. It
-        // dispatches three of them for a SQL source: map-only, an aggregate with a
-        // sort/limit tail, and a map+join. Anything else — a DISTINCT, or a sort
-        // with no aggregate under it — falls to the serial driver.
         var sql_fanout = true;
         var seen_breaker = false;
         var cur: ?types.Schema = source.schema;
@@ -950,8 +890,6 @@ const Ctx = struct {
             if (!isMapStage(st.node)) map_only = false;
             switch (st.node) {
                 .aggregate, .join => seen_breaker = true,
-                // A sort or a limit is a tail, which both fan-out paths carry; on its
-                // own in front of one it is a top-N, and that runs serially.
                 .sort, .limit => if (!seen_breaker) {
                     sql_fanout = false;
                 },
@@ -975,10 +913,6 @@ const Ctx = struct {
         const src_is_sql = isSqlSource(source.connector);
         const sink_is_parallel = isSqlConnector(sink.connector) or
             (if (registry.Connector.parse(sink.connector)) |c| c.streamLoad() else false);
-        // Not `map_only`: that gate said `serial` for every aggregate over a
-        // splittable table, while `runParallelSqlAgg` fans exactly that shape into
-        // key-range lanes. It was the SQL half of the same mislabelling fixed for
-        // file sources — reported as serial, run in parallel.
         const splittable = src_is_sql and sql_fanout and splittableRead(stages[0].node);
 
         return .{
@@ -990,7 +924,6 @@ const Ctx = struct {
                 .splittable = splittable,
                 .sink_parallel = sink_is_parallel,
                 .morsel_parallel = !splittable and laneHints(stages[0]) and morselParallelRead(source.connector, stages[0].node),
-                // the pushed sort is then the only breaker, over the capped rows
                 .top_n = if (top_n) |t| (if (!t.sorted or breakers == 1) t.rows else null) else null,
             },
         };
@@ -1028,7 +961,6 @@ const Ctx = struct {
             },
             .ref => |name| {
                 const b = self.bindings.get(name) orelse {
-                    // a script's own CTE shadows a table the session knows
                     if (self.knownTable(name)) |k|
                         return .{ .connector = "session", .detail = try std.fmt.allocPrint(self.arena, "session table {s}", .{name}), .schema = k.schema };
                     return fail(self.diag, "unknown binding `{s}`", .{name});
@@ -1057,7 +989,6 @@ const Ctx = struct {
         if (std.mem.eql(u8, w.connector, "csv") or std.mem.eql(u8, w.connector, "stdout")) {
             if (s3.bucketNameError(w.target)) |why|
                 return fail(self.diag, "`{s}` is not a valid S3 target: {s}", .{ w.target, why });
-            // A `stdout` sink has no target path to name a format for.
             if (std.mem.eql(u8, w.connector, "csv") and w.target.len > 0) {
                 const fmt = try formatFromHints(hints, self.diag);
                 if (unwritableTarget(w.target, fmt) orelse unreadableTarget(w.target, fmt)) |why|
@@ -1066,8 +997,6 @@ const Ctx = struct {
                     return fail(self.diag, "cannot write `{s}`: basalt reads Excel workbooks but does not write them; write a `.csv` or `.parquet`", .{w.target});
             }
             _ = try dialectFromHints(hints, self.diag);
-            // Accepting it and writing UTF-8 anyway would be the silent kind of
-            // wrong; transcoding on the way out is a separate feature.
             if (hintText(hints, "encoding") != null)
                 return fail(self.diag, "`encoding` applies to a read; a CSV sink always writes UTF-8", .{});
             if (w.mode == .append) {
@@ -1081,8 +1010,8 @@ const Ctx = struct {
         return .{ .connector = conn.connector, .target = w.target, .mode = @tagName(w.mode) };
     }
 
-    /// The schema a binding's pipeline produces, propagated stage by stage from
-    /// its source; null past anything only the source can describe.
+    /// The schema a binding's pipeline produces; null past anything only the source can
+    /// describe.
     fn bindingSchema(self: *Ctx, b: ast.Pipeline) Error!?types.Schema {
         const src = try self.resolveSource(b.stages[0]);
         var cur: ?types.Schema = src.schema orelse return null;
@@ -1095,9 +1024,6 @@ const Ctx = struct {
         return cur;
     }
 
-    /// A stage past the point the schema is known is not typed, but a `$name`
-    /// that no PARAM, LET or loop variable binds is wrong whatever the columns
-    /// turn out to be — so `check` says so offline too, not only the run.
     fn checkUnbound(self: *Ctx, node: ast.Stage.Node) Error!void {
         switch (node) {
             .filter => |p| try self.unboundIn(p),
@@ -1130,13 +1056,10 @@ const Ctx = struct {
         return err;
     }
 
-    /// Output schema after a stage (type-checking expressions along the way).
-    /// Returns null where the flow becomes unresolvable — a source only a
-    /// connection can describe, or a join whose right side is one.
+    /// Output schema after a stage, type-checking along the way; null where the flow
+    /// becomes unresolvable. A join is planned with `joinPlan` so later stages are checked
+    /// (it once stopped there, and `check` passed a missing column).
     fn propagate(self: *Ctx, in: types.Schema, node: ast.Stage.Node) Error!?types.Schema {
-        // A name computed per row (`IDENTIFIER(...)` in a SELECT list, GROUP BY,
-        // ORDER BY or DISTINCT ON) has no column to type until the row renders it;
-        // from here on the schema is unresolved, as it is behind a live source.
         if (hasDynamicName(node)) return null;
         switch (node) {
             .filter => |p| {
@@ -1158,10 +1081,6 @@ const Ctx = struct {
             .explode => |ex| return (try explodePlan(self.arena, in, ex, self.diag)).schema,
             .aggregate => |ag| return (try aggregatePlan(self.arena, in, ag, self.params, self.diag)).schema,
             .window => |wd| return try windowSchema(self.arena, in, wd, self.diag),
-            // The same joinPlan the runtime builds from, over the binding's offline
-            // schema, so an aggregate or filter after the join is checked like any
-            // other stage. It used to stop here, and `check` said ok to a column
-            // that did not exist as long as a join sat in front of it.
             .join => |j| {
                 const right = if (self.bindings.get(j.binding)) |b|
                     (try self.bindingSchema(b)) orelse return null
@@ -1195,8 +1114,6 @@ const Ctx = struct {
             return fail(self.diag, "unknown binding `{s}` in join", .{j.binding});
         const d = try std.fmt.allocPrint(self.arena, "{s} {s}", .{ @tagName(j.kind), j.binding });
         var st = Stage{ .kind = "join", .detail = d, .breaker = true };
-        // The right side's read, readied as the runtime readies it
-        // (`plan.prepareJoinSide`), so the WHERE it sends is on the plan too.
         const b = self.bindings.get(j.binding) orelse return st;
         if (b.stages.len == 0) return st;
         const head = try self.inlineHead(try j.rightStages(self.arena, b.stages));
@@ -1210,8 +1127,7 @@ const Ctx = struct {
     }
 
     /// The binding chain at the head of `stages` laid out in front of the rest, as
-    /// the runtime does (`plan.inlineHeadBindings`) — so a binding's WHERE is shown
-    /// descending. `via` is the first binding laid out, if any.
+    /// `plan.inlineHeadBindings` does. `via` is the first binding laid out, if any.
     fn inlineHead(self: *Ctx, stages_in: []const ast.Stage) !struct { stages: []const ast.Stage, via: ?[]const u8 } {
         var via: ?[]const u8 = null;
         var head = stages_in;
@@ -1231,9 +1147,8 @@ const Ctx = struct {
         return .{ .stages = head, .via = via };
     }
 
-    /// What the SQL read leading `stages` would be sent as its WHERE — a raw
-    /// `PUSHDOWN`, AND the contiguous filters after it — with the params' values
-    /// in, as the run sends them. Null when the lead is no SQL read.
+    /// The WHERE the leading SQL read would be sent (raw `PUSHDOWN` AND the contiguous
+    /// filters), params in; text comparisons are left to the run, which knows collation.
     fn previewPushdown(self: *Ctx, stages: []const ast.Stage) !?struct { where: []const u8, dialect: Dialect, bound: []const ast.Stage } {
         if (stages[0].node != .read) return null;
         const rd = stages[0].node.read;
@@ -1248,8 +1163,6 @@ const Ctx = struct {
         var wants = false;
         const implicit = pushdown.serialWhereWith(self.arena, d, bound, null, &wants) catch null;
         var where = try composePushdown(self.arena, raw, implicit);
-        // analysis does not connect, and a text comparison's descent is the
-        // column's collation's to decide
         if (wants) where = if (where.len > 0)
             try std.fmt.allocPrint(self.arena, "{s}; text comparisons decided by the collation at run time", .{where})
         else
@@ -1273,10 +1186,8 @@ const Ctx = struct {
     }
 };
 
-/// Prints the plan as a tree, root first and source deepest — the nesting a
-/// pull pipeline actually has, and the one `EXPLAIN ANALYZE` prints, so the two
-/// read as the same picture with different annotations. Node names are the
-/// operator names `ANALYZE` reports, `scan` included.
+/// The plan as a tree, root first and source deepest, as `EXPLAIN ANALYZE` prints it.
+/// A split or morsel fan-out prints as a candidate: only the source or file can settle it.
 pub fn render(plan: Plan, w: anytype) !void {
     for (plan.outputs) |o| {
         if (std.mem.eql(u8, plan.kind, "batch")) {
@@ -1293,7 +1204,6 @@ pub fn render(plan: Plan, w: anytype) !void {
             try w.print("write  {s}  ({s})\n", .{ sinkKind(o.sink), o.sink.mode });
         }
 
-        // Stages are held in dataflow order; the tree reads the other way.
         var i = o.stages.len;
         while (i > 0) {
             i -= 1;
@@ -1331,16 +1241,9 @@ pub fn render(plan: Plan, w: anytype) !void {
 
         try w.writeAll("  physical: ");
         if (o.physical.splittable) {
-            // Whether it *will* split depends on the table's key and size, which
-            // only the source can answer — and analysis does not connect.
             try w.writeAll("split-parallel candidate");
             if (o.physical.sink_parallel) try w.writeAll(", per-lane sink");
         } else if (o.physical.morsel_parallel) {
-            // Same hedge as above, for the reasons only the file can settle: a CSV
-            // that quotes a newline cannot be cut on byte boundaries, and a parquet
-            // with a single row group has nothing to divide. A breaker still runs
-            // per lane here — the lanes fold partials and the combine merges them —
-            // so unlike the serial branch it does not mean the fan-out is off.
             try w.writeAll("morsel-parallel candidate");
             if (o.physical.has_breaker) try w.writeAll(" (per-lane partials, combined)");
         } else {
@@ -1353,11 +1256,8 @@ pub fn render(plan: Plan, w: anytype) !void {
     }
 }
 
-/// Why an explicit `APPEND` cannot be honoured for a file target, or null when
-/// it can. Both refusals are about rewriting what is already there: a parquet
-/// footer indexes every row group and is written last, and a block blob is
-/// committed whole rather than extended. One source of truth, so `check` and the
-/// runtime planner cannot drift apart on which targets accumulate.
+/// Why `APPEND` cannot be honoured for a file target, or null: a parquet footer is
+/// written last and a block blob is committed whole. Shared with the runtime planner.
 pub fn appendUnsupported(target: []const u8) ?[]const u8 {
     if (azure.isUrl(target) or s3.isUrl(target)) return "an object-store blob is replaced on write, never extended";
     if (pqwrite.Writer.isPath(target)) return "a parquet file's footer indexes every row group and is written last, so appending means rewriting the file";
@@ -1365,8 +1265,7 @@ pub fn appendUnsupported(target: []const u8) ?[]const u8 {
     return null;
 }
 
-/// The `csv` connector backs every file sink, so the plan has to name the
-/// format from the target — otherwise a parquet write reads as `write csv`.
+/// Every file sink runs on the `csv` connector, so the format is named from the target.
 fn sinkKind(node: anytype) []const u8 {
     const path = if (@hasField(@TypeOf(node), "target")) node.target else node.detail;
     if (std.mem.eql(u8, node.connector, "csv")) {
@@ -1382,12 +1281,8 @@ fn indent(w: anytype, depth: usize) !void {
     while (n < depth) : (n += 1) try w.writeAll("  ");
 }
 
-/// An unresolved schema is only worth saying once, at the scan that could not
-/// resolve it: nothing downstream of an unknown source is knowable either, and
-/// repeating the note on every stage buried the plan in it.
-///
-/// Labelled, because an annotation and a child node land at the same depth and
-/// a bare list of columns reads like another operator otherwise.
+/// Printed once, at the scan that could not resolve it, and labelled, since a bare
+/// column list at a child's depth reads like another operator.
 fn printSchema(w: anytype, depth: usize, schema: ?types.Schema) !void {
     const s = schema orelse return;
     try indent(w, depth);
@@ -1412,14 +1307,11 @@ fn isSqlSource(connector: []const u8) bool {
     return dialectOf(connector) != null;
 }
 
-/// The pushdown dialect for a connector, or null if it's not a SQL source.
 fn dialectOf(connector: []const u8) ?Dialect {
     const c = registry.Connector.parse(connector) orelse return null;
     return (c.sqlRead() orelse return null).dialect;
 }
 
-/// AND a raw `PUSHDOWN`/@[where] fragment with the translated implicit
-/// predicate for the plan preview.
 fn composePushdown(arena: std.mem.Allocator, raw: []const u8, implicit: ?[]const u8) ![]const u8 {
     if (raw.len > 0 and implicit != null)
         return std.fmt.allocPrint(arena, "({s}) AND ({s})", .{ raw, implicit.? });
@@ -1434,8 +1326,8 @@ fn isMapStage(node: ast.Stage.Node) bool {
     };
 }
 
-/// A read is split-eligible if it's a `table` (PK introspection) or a `query`
-/// with an explicit `@[split]`. (The actual key/size check happens at run time.)
+/// A `table` (PK introspection) or a `query` with `@[split]`; key and size are
+/// checked at run time.
 fn splittableRead(node: ast.Stage.Node) bool {
     return switch (node) {
         .read => |rd| switch (rd.form) {
@@ -1447,20 +1339,15 @@ fn splittableRead(node: ast.Stage.Node) bool {
     };
 }
 
-/// The file format a path is read or written as. `format` in a `WITH (...)` names
-/// it outright; otherwise the extension does.
 pub const FileFormat = enum {
     csv,
     parquet,
-    /// Arrow IPC: `.arrow` / `.feather` / `.ipc` (file) or `.arrows` (stream).
     arrow,
-    /// An Excel workbook, `.xlsx` / `.xlsm` — read only.
     xlsx,
 };
 
-/// The format a file read resolves to: the named one, else the extension's,
-/// else CSV. The one place the CSV fast paths ask, so a binary format is never
-/// memory-mapped and parsed as text.
+/// The named format, else the extension's, else CSV. The one place the CSV fast paths
+/// ask, so a binary format is never memory-mapped and parsed as text.
 pub fn readFormat(path: []const u8, explicit: ?FileFormat) FileFormat {
     return explicit orelse formatOfPath(path) orelse .csv;
 }
@@ -1477,17 +1364,11 @@ fn hintText(hints: []const ast.Hint, key: []const u8) ?[]const u8 {
     return null;
 }
 
-/// `WITH (delimiter = ';', encoding = 'latin1')` for a file read or write.
-///
-/// Both are validated here rather than at the reader, so `basalt check` rejects a
-/// typo before anything opens a file — an unknown encoding name is exactly the
-/// kind of mistake that would otherwise be discovered halfway through a load.
+/// Validated here, not at the reader, so `check` rejects a typo before anything opens.
+/// The delimiter is one byte; a tab may be spelled out, since SQL's `'\t'` is no escape.
 pub fn dialectFromHints(hints: []const ast.Hint, diag: *Diag) Error!csv.Dialect {
     var d = csv.Dialect{};
     if (hintText(hints, "delimiter") orelse hintText(hints, "delim")) |s| {
-        // One byte, because the reader compares bytes and the parallel reader cuts
-        // the file on them. A tab is worth spelling out; `'\t'` in a SQL string
-        // literal has no escape processing.
         const one: ?u8 = if (s.len == 1)
             s[0]
         else if (std.mem.eql(u8, s, "\\t") or std.mem.eql(u8, s, "tab"))
@@ -1505,7 +1386,6 @@ pub fn dialectFromHints(hints: []const ast.Hint, diag: *Diag) Error!csv.Dialect 
     return d;
 }
 
-/// The format named by `WITH (format = ...)`, validated. Null when unset.
 pub fn formatFromHints(hints: []const ast.Hint, diag: *Diag) Error!?FileFormat {
     const s = hintText(hints, "format") orelse return null;
     if (std.ascii.eqlIgnoreCase(s, "csv")) return .csv;
@@ -1515,8 +1395,7 @@ pub fn formatFromHints(hints: []const ast.Hint, diag: *Diag) Error!?FileFormat {
     return fail(diag, "unknown format `{s}` (csv, parquet, arrow, xlsx)", .{s});
 }
 
-/// `WITH (sheet = 'Vendas', header = false, range = 'B3:F200')` for a workbook
-/// read, validated here so `check` turns away a malformed range before a run.
+/// Validated here so `check` turns away a malformed range before a run.
 pub fn xlsxOptions(hints: []const ast.Hint, diag: *Diag) Error!xlsx.Options {
     var o = xlsx.Options{};
     o.sheet = hintText(hints, "sheet");
@@ -1533,11 +1412,8 @@ pub fn xlsxOptions(hints: []const ast.Hint, diag: *Diag) Error!xlsx.Options {
     return o;
 }
 
-/// The extension basalt reads a path as, or null when it carries none it knows.
-///
-/// `csv.dataName` walks the chain first, so `orders.csv.gz` and
-/// `inf.zip :: inf_diario.csv` both answer `.csv` — the name that matters is the
-/// innermost one, not the container's.
+/// `csv.dataName` walks the chain first, so `orders.csv.gz` and `inf.zip :: x.csv`
+/// both answer `.csv`.
 fn formatOfPath(path: []const u8) ?FileFormat {
     const bare = csv.dataName(path);
     if (pqwrite.Writer.isPath(bare)) return .parquet;
@@ -1547,29 +1423,16 @@ fn formatOfPath(path: []const u8) ?FileFormat {
     return null;
 }
 
-/// The label the run summary shows for a file source or sink: the format actually
-/// resolved, not the connector name. A bare path lowers to the `csv` connector
-/// whatever its extension, so reporting the connector announced every serial
-/// parquet scan as `csv` — the summary is the main feedback channel, and it was
-/// naming the wrong reader.
-///
-/// A malformed `format` hint is `analyzeOne`'s error to raise, not a label's, so an
-/// unresolvable format falls back to the extension and then to `csv`.
+/// The format actually resolved, not the connector: every bare path is `csv`, which
+/// once labelled parquet scans as csv. A malformed hint falls back to the extension.
 pub fn formatLabel(path: []const u8, hints: []const ast.Hint) []const u8 {
     var d = Diag{};
     const explicit = formatFromHints(hints, &d) catch null;
     return @tagName(explicit orelse formatOfPath(path) orelse .csv);
 }
 
-/// Why this path cannot be read or written as a table, or null when it can.
-///
-/// Every unrecognised extension used to fall through to the CSV reader, silently.
-/// A 12 MB zip holding 583k rows answered `SELECT COUNT(*)` with 46204 — the
-/// newlines that happen to occur in deflate output — and `check` said the script
-/// was fine. A wrong number that looks right is the one outcome this engine is
-/// built to avoid, so an extension it does not read is a plan-time error.
-/// Why `path` cannot be written, beyond what `unreadableTarget` says; null when
-/// it can. A CSV is gzip-compressed for a `.gz` name; nothing else is.
+/// Why `path` cannot be written beyond `unreadableTarget`; a CSV is gzipped for a
+/// `.gz` name, nothing else is.
 pub fn unwritableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
     const codec = csv.splitCodec(path).codec;
     if (codec == .none) return null;
@@ -1579,19 +1442,13 @@ pub fn unwritableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
     return null;
 }
 
+/// Why `path` cannot be read or written as a table, or null. A trailing `/` is a folder
+/// and an archive is `archiveProblem`'s to judge.
 pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
-    // A trailing `/` is a folder read: the files under it carry the extensions,
-    // and `connect.resolveFolder` decides from the listing.
     if (std.mem.endsWith(u8, path, "/")) return null;
 
-    // Everything about an archive is `archiveProblem`'s to judge: the member's own
-    // name is what carries the format, and only opening the archive reveals it.
     if (csv.splitArchive(path) != null) return null;
 
-    // Parquet is random-access — footer first, then the chunks a query needs. A
-    // compressed stream is sequential, so the reader has nothing to seek in.
-    // Refusing beats decompressing gigabytes into a temp file that nothing in the
-    // plan mentions.
     const fmt = explicit orelse formatOfPath(path);
     if (csv.splitCodec(path).codec != .none and fmt == .parquet)
         return "parquet needs random access, so it cannot be read through compression; decompress it first";
@@ -1609,16 +1466,9 @@ pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
     return "basalt handles `.csv`, `.parquet`, Arrow IPC (`.arrow`, `.feather`, `.ipc`, `.arrows`) and Excel (`.xlsx`, read only), a CSV optionally `.gz`/`.zst` compressed or inside a `.zip`; name the format with `WITH (format = 'csv')` if the extension differs";
 }
 
-/// Why this archive reference cannot be read as one table, or null when it can.
-///
-/// Opens the archive to answer, and stays quiet when it cannot be opened — a script
-/// may legitimately be checked before its data has been fetched, which is what
-/// `offlineSchema` already assumes. Everything archive-shaped is decided here so the
-/// guarantee `unreadableTarget` gives for a loose file also holds inside a
-/// container: a `.json` member is refused exactly like a `.json` file.
-///
-/// A remote archive is opened only when `online`: `check` stays off the network,
-/// and judges just the member name the script wrote.
+/// Opens the archive and stays quiet when it cannot (data may not be fetched yet), so
+/// a `.json` member is refused like a `.json` file. A remote one is opened only when
+/// `online`.
 pub fn archiveProblem(arena: std.mem.Allocator, path: []const u8, explicit: ?FileFormat, online: bool) ?[]const u8 {
     const ar = csv.splitArchive(path) orelse return null;
     if (!online and csv.CsvReader.isUrl(ar.archive)) {
@@ -1640,7 +1490,6 @@ pub fn archiveProblem(arena: std.mem.Allocator, path: []const u8, explicit: ?Fil
     return memberProblem(arena, chosen, explicit);
 }
 
-/// Why the chosen member cannot be streamed as a table, or null when it can.
 fn memberProblem(arena: std.mem.Allocator, chosen: []const u8, explicit: ?FileFormat) ?[]const u8 {
     if (explicit == null and formatOfPath(chosen) == null)
         return std.fmt.allocPrint(arena, "`{s}` inside it is not a `.csv` or `.parquet`; name the format with `WITH (format = 'csv')`", .{chosen}) catch null;
@@ -1653,7 +1502,6 @@ fn memberProblem(arena: std.mem.Allocator, chosen: []const u8, explicit: ?FileFo
     return null;
 }
 
-/// The first few names, for an error that has to name the choices.
 fn joinNames(arena: std.mem.Allocator, items: []const []const u8) []const u8 {
     var out: []const u8 = "";
     for (items, 0..) |m, i| {
@@ -1663,17 +1511,8 @@ fn joinNames(arena: std.mem.Allocator, items: []const []const u8) []const u8 {
     return out;
 }
 
-/// Whether a read divides into per-lane morsels at `-j > 1`.
-///
-/// A parquet is cut into row groups wherever it lives, since every lane range-reads
-/// its own chunks. A CSV is cut into byte ranges, which needs the bytes locally —
-/// the runtime memory-maps the file, so a CSV over HTTP or object storage is
-/// fetched whole and parsed serially.
-/// Whether a file read's hints still let it fan out over lanes: its CSV dialect
-/// (`delimiter`, `encoding`), which every lane reads its chunk with, and a
-/// `format` naming what the path's extension already says. Any other hint keeps
-/// the read on the serial reader. The runtime (`lanes.laneEligible`) and EXPLAIN
-/// both ask this, so the plan cannot claim a fan-out the run does not take.
+/// Whether a file read's hints still let it fan out: a CSV dialect, or a `format`
+/// agreeing with the extension. `lanes.laneEligible` and EXPLAIN both ask this.
 pub fn laneHints(st: ast.Stage) bool {
     for (st.hints) |h| {
         if (std.mem.eql(u8, h.key, "delimiter") or std.mem.eql(u8, h.key, "delim") or std.mem.eql(u8, h.key, "encoding")) continue;
@@ -1689,8 +1528,10 @@ pub fn laneHints(st: ast.Stage) bool {
     return true;
 }
 
+/// A parquet is cut into row groups anywhere; a CSV into byte ranges only locally. A
+/// compressed stream or archive member has no offset-to-row mapping, matching
+/// `MappedCsv.open`'s `NotMappable`; Arrow and workbooks read serially.
 fn morselParallelRead(connector: []const u8, node: ast.Stage.Node) bool {
-    // Every file read arrives on the `csv` connector; the path decides the format.
     if (!std.mem.eql(u8, connector, "csv")) return false;
     const path = switch (node) {
         .read => |rd| switch (rd.form) {
@@ -1699,22 +1540,15 @@ fn morselParallelRead(connector: []const u8, node: ast.Stage.Node) bool {
         },
         else => return false,
     };
-    // Splittability, in Hadoop's sense: there is no mapping from a byte offset in a
-    // compressed stream to a row, so a `.csv.gz` is read start to finish however
-    // many lanes are free. An archive member is sequential for the same reason. Both
-    // are `MappedCsv.open`'s `NotMappable`, and the label has to agree with the
-    // runtime or EXPLAIN goes back to overstating what it is about to do.
     if (csv.splitCodec(path).codec != .none or csv.splitArchive(path) != null) return false;
     if (pqwrite.Writer.isPath(path)) return true;
-    // an Arrow file reads serially: its batches are not independent morsels yet
     if (arrowread.isPath(path)) return false;
-    // nor does a workbook: a sheet is one stream of XML
     if (xlsx.isPath(path)) return false;
     return std.mem.indexOf(u8, path, "://") == null;
 }
 
-/// Offline schema resolution: a local CSV header or parquet footer is readable
-/// without connecting to anything; everything else stays unresolved.
+/// A local CSV header, parquet footer, Parquet folder's first file or workbook's
+/// first pass, as the run reads them; everything else stays unresolved.
 fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.Hint) ?types.Schema {
     if (std.mem.eql(u8, rd.connector, "unit")) return .{ .fields = &.{} };
     if (std.mem.eql(u8, rd.connector, "range")) {
@@ -1724,7 +1558,6 @@ fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.Hint
     }
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
         if (csv.CsvReader.isUrl(rd.form.path)) return null;
-        // a local folder of Parquet: its first file's columns, as the run reads them
         if (folder.isFolder(rd.form.path)) {
             var fdiag = Diag{};
             const explicit = formatFromHints(hints, &fdiag) catch return null;
@@ -1737,8 +1570,6 @@ fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.Hint
             defer pf.close();
             return pf.schema;
         }
-        // A compressed or archived parquet is refused above, so only a plain path
-        // reaches the parquet reader here.
         if (csv.splitCodec(rd.form.path).codec == .none and csv.splitArchive(rd.form.path) == null and
             pqdecode.Reader.isPath(rd.form.path))
         {
@@ -1753,15 +1584,12 @@ fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.Hint
             return ar.schema;
         }
         if (readFormat(rd.form.path, explicit) == .xlsx) {
-            // the same first pass the run makes, so `check` and the run agree
             var odiag = Diag{};
             const opts = xlsxOptions(hints, &odiag) catch return null;
             const xr = xlsx.Reader.open(arena, arena, rd.form.path, opts) catch return null;
             defer xr.close();
             return xr.schema;
         }
-        // The header is split on the script's delimiter, or `check` would report
-        // one column named after the whole header line for a `;` file.
         var hdiag = Diag{};
         const d = dialectFromHints(hints, &hdiag) catch return null;
         const reader = csv.CsvReader.open(arena, rd.form.path, d) catch return null;
@@ -1813,39 +1641,27 @@ test "analyze a CSV map pipeline: structure, offline schema, physical" {
     try std.testing.expectEqualStrings("select", o.stages[1].kind);
     try std.testing.expect(!o.physical.has_breaker);
     try std.testing.expect(!o.physical.splittable);
-    // Not `splittable` (that is the SQL key-range fan-out) but still parallel:
-    // the runtime cuts a local CSV into byte-range chunks.
     try std.testing.expect(o.physical.morsel_parallel);
 }
 
 test "unreadableTarget: an extension basalt does not read is refused" {
-    // The reason this exists: a 12MB zip of 583k rows answered COUNT(*) with 46204
-    // — newlines in its deflate stream — and `check` approved the script.
     try std.testing.expect(unreadableTarget("/data/x.csv", null) == null);
     try std.testing.expect(unreadableTarget("/data/X.CSV", null) == null);
     try std.testing.expect(unreadableTarget("/data/x.parquet", null) == null);
-    // A query string is not part of the name.
     try std.testing.expect(unreadableTarget("https://h/d.csv?token=abc", null) == null);
-    // A trailing slash is a prefix read; the objects under it carry extensions.
     try std.testing.expect(unreadableTarget("s3://bkt/bronze/", null) == null);
 
-    // Compressed and archived names resolve through the chain to their inner name.
     try std.testing.expect(unreadableTarget("/data/x.csv.gz", null) == null);
     try std.testing.expect(unreadableTarget("/data/x.csv.zst", null) == null);
-    // An archive is `archiveProblem`'s to judge, since only its members name a
-    // format; `unreadableTarget` deliberately passes it through.
     try std.testing.expect(unreadableTarget("/data/inf.zip", null) == null);
     try std.testing.expect(unreadableTarget("/data/inf.zip :: a.csv", null) == null);
-    // Parquet cannot be read through a codec: it needs to seek.
     try std.testing.expect(unreadableTarget("/data/x.parquet.gz", null) != null);
 
     try std.testing.expect(unreadableTarget("/data/rows.json", null) != null);
-    // a workbook is read; the old binary `.xls` and a compressed one are not
     try std.testing.expect(unreadableTarget("/data/book.xlsx", null) == null);
     try std.testing.expect(unreadableTarget("/data/book.xlsx.gz", null) != null);
     try std.testing.expect(unreadableTarget("/data/book.xls", null) != null);
     try std.testing.expect(unreadableTarget("/data/noext", null) != null);
-    // Naming the format is the escape hatch for an oddly-named file.
     try std.testing.expect(unreadableTarget("/data/weird.dat", .csv) == null);
 }
 
@@ -1881,18 +1697,11 @@ test "physical plan: which SQL shapes report a key-range split" {
     const conn = "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');\n";
 
     const cases = [_]struct { q: []const u8, split: bool }{
-        // map-only: the original case
         .{ .q = "SELECT a FROM pg.t WHERE b > 0", .split = true },
-        // an aggregate fans into key-range lanes via runParallelSqlAgg; this is the
-        // shape that used to print `serial` while running in parallel
         .{ .q = "SELECT g, COUNT(*) AS n FROM pg.t GROUP BY g", .split = true },
-        // ... including with the sort/limit tail both fan-out paths carry
         .{ .q = "SELECT g, COUNT(*) AS n FROM pg.t GROUP BY g ORDER BY n DESC LIMIT 5", .split = true },
-        // a top-N with nothing to fan out under it stays serial
         .{ .q = "SELECT a FROM pg.t ORDER BY a DESC LIMIT 10", .split = false },
-        // DISTINCT is a breaker neither path handles
         .{ .q = "SELECT DISTINCT a FROM pg.t", .split = false },
-        // a raw query read is not divisible by key range whatever its shape
         .{ .q = "SELECT g, COUNT(*) AS n FROM pg.QUERY($$SELECT * FROM t$$) GROUP BY g", .split = false },
     };
 
@@ -1911,16 +1720,12 @@ test "physical plan: which file reads divide into morsels" {
     const a = ar.allocator();
 
     const cases = [_]struct { from: []const u8, morsel: bool }{
-        // A parquet is cut into row groups wherever it lives — each lane
-        // range-reads its own chunks.
         .{ .from = "'/data/x.parquet'", .morsel = true },
         .{ .from = "'https://h/x.parquet'", .morsel = true },
         .{ .from = "'s3://bkt/x.parquet'", .morsel = true },
-        // A CSV is cut on byte offsets, which needs the bytes on disk to mmap.
         .{ .from = "'/data/x.csv'", .morsel = true },
         .{ .from = "'https://h/x.csv'", .morsel = false },
         .{ .from = "'az://acct/c/x.csv'", .morsel = false },
-        // Not a file read at all.
         .{ .from = "RANGE(10)", .morsel = false },
     };
 
@@ -1957,12 +1762,10 @@ test "analyze pushdown preview: a CTE, derived table or table function at the he
     defer ar.deinit();
     const a = ar.allocator();
     const conn = "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', user = 'u', password = 'p', database = 'd');\n";
-    // Through a binding, the table used to be read whole and filtered in the engine.
     const queries = [_][]const u8{
         "LOAD INTO '/tmp/x.csv' AS WITH o AS (SELECT id, amount FROM pg.orders WHERE amount > 0) SELECT id FROM o;",
         "LOAD INTO '/tmp/x.csv' AS SELECT id FROM (SELECT id, amount FROM pg.orders WHERE amount > 0) d;",
         "CREATE FUNCTION pos(lo INT) RETURNS TABLE AS SELECT id, amount FROM pg.orders WHERE amount > $lo;\nLOAD INTO '/tmp/x.csv' AS SELECT id FROM pos(0);",
-        // the query's own WHERE, over a renamed column, crosses the binding's SELECT
         "LOAD INTO '/tmp/x.csv' AS SELECT id FROM (SELECT id, amount AS amt FROM pg.orders) d WHERE amt > 0;",
     };
     for (queries) |q| {
@@ -1973,7 +1776,6 @@ test "analyze pushdown preview: a CTE, derived table or table function at the he
         try std.testing.expectEqualStrings("(\"amount\" > 0)", src.pushdown);
         try std.testing.expect(std.mem.indexOf(u8, src.detail, "(via binding ") != null);
     }
-    // A window in the binding keeps it apart: the top-N over `rn` needs to see it so.
     var diag = Diag{};
     const w = try analyze(a, try parse(a, conn ++
         "LOAD INTO '/tmp/x.csv' AS WITH r AS (SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM pg.orders WHERE amount > 0) SELECT id FROM r WHERE rn = 1;"), &diag);
@@ -2014,8 +1816,6 @@ test "analyze: a condition in ON on a connection's table on the right is the WHE
     for (plan.outputs[0].stages) |st| {
         if (std.mem.eql(u8, st.kind, "join")) join = st;
     }
-    // the number is sent as it is; the text comparison as an equivalent CTE's
-    // WHERE would be, once the column's collation is known at run time
     try std.testing.expect(std.mem.indexOf(u8, join.?.right_pushdown, "(\"active\" = 1)") != null);
     try std.testing.expect(std.mem.indexOf(u8, join.?.right_pushdown, "text comparisons decided by the collation at run time") != null);
 }
@@ -2093,8 +1893,8 @@ test "analyze rejects unknown connection" {
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "unknown connection") != null);
 }
 
-/// Analyze `LOAD INTO ... AS <query over a 2-col CSV>` offline and expect a
-/// type/plan error. `$IN` in the query is the input CSV's path.
+/// Analyze `LOAD INTO ... AS <query over a 2-col CSV>` offline and expect an error.
+/// `$IN` in the query is the input CSV's path.
 fn expectAnalyzeErr(a: std.mem.Allocator, csv_data: []const u8, query: []const u8) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2107,7 +1907,6 @@ fn expectAnalyzeErr(a: std.mem.Allocator, csv_data: []const u8, query: []const u
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, src), &diag));
 }
 
-/// Analyze one CSV-backed query and hand back the plan (or the analyzer's error).
 fn analyzeCsv(a: std.mem.Allocator, csv_data: []const u8, query: []const u8, diag: *Diag) !Plan {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2125,19 +1924,14 @@ test "analyze checks the stages after a join against the joined schema" {
     const a = ar.allocator();
     const csv_data = "id,name,amount\n1,x,10\n";
 
-    // Used to pass: the schema went unresolved at the join, so nothing after it
-    // was checked and `check` said ok to a column that does not exist.
     var diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyzeCsv(a, csv_data, "WITH r AS (SELECT id AS rid, name AS rname FROM '$IN') SELECT SUM(CAST(nope AS INT)) AS x FROM '$IN' JOIN r ON id = rid", &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "nope") != null);
 
-    // A filter after the join is checked the same way.
     diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyzeCsv(a, csv_data, "WITH r AS (SELECT id AS rid, name AS rname FROM '$IN') SELECT id FROM '$IN' JOIN r ON id = rid WHERE missing = 'x'", &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "missing") != null);
 
-    // The good query plans, and the join stage carries the joined schema: the
-    // left columns plus the binding's, so a right-side column resolves after it.
     diag = Diag{};
     const plan = try analyzeCsv(a, csv_data, "WITH r AS (SELECT id AS rid, name AS rname FROM '$IN') SELECT rname, SUM(CAST(amount AS INT)) AS total FROM '$IN' JOIN r ON id = rid WHERE rname <> '' GROUP BY rname", &diag);
     const stages = plan.outputs[0].stages;
@@ -2220,7 +2014,6 @@ test "joinPlan: collision suffix `_r`, left-nullability, semi/anti drop the righ
     try std.testing.expect(!semi.emit_right);
     try std.testing.expectEqual(@as(usize, 2), semi.schema.fields.len);
 
-    // right/full null the left side; full nulls both. cross needs no keys.
     const rj = try joinPlan(a, left, right, .{ .kind = .right, .binding = "r", .left_keys = keys, .right_keys = keys }, &diag);
     try std.testing.expect(rj.left_nullable and !rj.right_nullable);
     try std.testing.expect(rj.schema.fields[0].ty.nullable);
@@ -2240,8 +2033,6 @@ test "joinPlan: the `_r` suffix keeps bumping until the name is actually free" {
     const a = ar.allocator();
     const I = types.Type.init(.int);
     const S = types.Type.init(.string);
-    // `x_r` on the left and `x` on the right used to produce two `x_r` columns,
-    // the second unreachable; `x_r` on the right collides with its own suffix.
     const left = types.Schema{ .fields = &.{
         .{ .name = "id", .ty = I },
         .{ .name = "x", .ty = S },
@@ -2259,7 +2050,6 @@ test "joinPlan: the `_r` suffix keeps bumping until the name is actually free" {
     try std.testing.expectEqualStrings("id_r", p.schema.fields[3].name);
     try std.testing.expectEqualStrings("x_r2", p.schema.fields[4].name);
     try std.testing.expectEqualStrings("x_r_r", p.schema.fields[5].name);
-    // Every output name resolves to its own column.
     for (p.schema.fields, 0..) |f, i| try std.testing.expectEqual(i, p.schema.indexOf(f.name).?);
 }
 
@@ -2280,7 +2070,6 @@ test "joinPlan: pair orientation, ambiguity, per-pair comparability" {
     const k_b = ast.QualName{ .parts = &.{"b"} };
     var diag = Diag{};
 
-    // `ref = id AND day = d`: the first pair is written right-side-first.
     const p = try joinPlan(a, left, right, .{
         .kind = .inner,
         .binding = "r",
@@ -2290,7 +2079,6 @@ test "joinPlan: pair orientation, ambiguity, per-pair comparability" {
     try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, p.lks);
     try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, p.rks);
 
-    // `amount = d` compares an int against a string.
     try std.testing.expectError(error.AnalyzeFailed, joinPlan(a, left, right, .{
         .kind = .inner,
         .binding = "r",
@@ -2299,7 +2087,6 @@ test "joinPlan: pair orientation, ambiguity, per-pair comparability" {
     }, &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "not comparable") != null);
 
-    // Both names live in both schemas, so neither reading wins.
     const both_l = types.Schema{ .fields = &.{ .{ .name = "a", .ty = I }, .{ .name = "b", .ty = I } } };
     const both_r = types.Schema{ .fields = &.{ .{ .name = "b", .ty = I }, .{ .name = "a", .ty = I } } };
     try std.testing.expectError(error.AnalyzeFailed, joinPlan(a, both_l, both_r, .{
@@ -2310,7 +2097,6 @@ test "joinPlan: pair orientation, ambiguity, per-pair comparability" {
     }, &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "ambiguous") != null);
 
-    // Same name on both sides is not ambiguous — both readings agree.
     const same = try joinPlan(a, both_l, both_r, .{
         .kind = .inner,
         .binding = "r",
@@ -2393,17 +2179,12 @@ test "analyze: an undeclared `$name` is refused by name, never read as the colum
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // The file has a `tag` column; `$tag` used to read it.
     var diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyzeCsv(a, "id,tag\n1,x\n", "SELECT $tag AS t FROM '$IN'", &diag));
     try std.testing.expectEqualStrings("unknown `$tag`: no PARAM, LET or loop variable of that name", diag.msg);
-    // Beside an aggregate the parser lifts it as a constant; the name is still refused.
     var grouped = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyzeCsv(a, "id,g\n1,x\n", "SELECT $tag AS t, g, COUNT(*) AS n FROM '$IN' GROUP BY g", &grouped));
     try std.testing.expectEqualStrings("unknown `$tag`: no PARAM, LET or loop variable of that name", grouped.msg);
-    // Over a SQL table `check` cannot type the stages, but an unbound name is
-    // wrong whatever the columns are — while a PARAM, a query LET and a loop
-    // variable all stay fine.
     const conn = "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', user = 'u', password = 'p', database = 'd');\n";
     var sql_diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, conn ++ "LOAD INTO '/tmp/x.csv' AS SELECT id FROM pg.orders WHERE day >= $since;"), &sql_diag));
@@ -2435,11 +2216,9 @@ test "analyze: a numeric aggregate refuses a non-numeric argument at plan time" 
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // `SUM(date)` used to reach the accumulator and panic on the union access.
     var diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyzeCsv(a, "id,d\n1,2024-01-01\n", "SELECT SUM(d) AS s FROM '$IN'", &diag));
     try std.testing.expectEqualStrings("`sum` needs a numeric argument, got date", diag.msg);
-    // Text still passes: it is coerced per row, as the parallel CSV lanes need.
     var ok = Diag{};
     _ = try analyzeCsv(a, "id,s\n1,x\n", "SELECT SUM(s) AS n, MIN(s) AS lo FROM '$IN'", &ok);
 }
@@ -2452,7 +2231,6 @@ test "laneHints: a CSV dialect and an agreeing format fan out; anything else sta
         .{ .hints = &.{}, .ok = true },
         .{ .hints = &.{ .{ .key = "delimiter", .value = .{ .str = ";" }, .pos = pos }, .{ .key = "encoding", .value = .{ .str = "latin1" }, .pos = pos } }, .ok = true },
         .{ .hints = &.{.{ .key = "format", .value = .{ .str = "csv" }, .pos = pos }}, .ok = true },
-        // a format the extension does not say is read by another reader than the lanes'
         .{ .hints = &.{.{ .key = "format", .value = .{ .str = "parquet" }, .pos = pos }}, .ok = false },
         .{ .hints = &.{.{ .key = "split", .value = .{ .str = "id" }, .pos = pos }}, .ok = false },
     };
@@ -2461,18 +2239,12 @@ test "laneHints: a CSV dialect and an agreeing format fan out; anything else sta
 
 test "formatLabel names the reader, not the connector" {
     const no_hints: []const ast.Hint = &.{};
-    // The bug: a bare path lowers to the `csv` connector, so a serial parquet scan
-    // announced itself as csv in the run summary.
     try std.testing.expectEqualStrings("parquet", formatLabel("t.parquet", no_hints));
     try std.testing.expectEqualStrings("csv", formatLabel("t.csv", no_hints));
-    // The innermost name wins, so a compressed or archived CSV is still csv.
     try std.testing.expectEqualStrings("csv", formatLabel("t.csv.gz", no_hints));
     try std.testing.expectEqualStrings("csv", formatLabel("a.zip :: t.csv", no_hints));
-    // An explicit hint outranks the extension.
     const as_parquet: []const ast.Hint = &.{.{ .key = "format", .value = .{ .str = "parquet" }, .pos = .{ .line = 1, .col = 1 } }};
     try std.testing.expectEqualStrings("parquet", formatLabel("t.dat", as_parquet));
-    // An unknown extension is `unreadableTarget`'s error to raise; the label just
-    // must not crash or claim parquet.
     try std.testing.expectEqualStrings("csv", formatLabel("t.dat", no_hints));
 }
 
@@ -2579,17 +2351,11 @@ test "analyze: an unknown name is underlined where it is written, not at its sta
 
     const Case = struct { src: []const u8, line: u32, col: u32, end_col: u32 };
     const cases = [_]Case{
-        // a bare select-list column
         .{ .src = "SELECT nope FROM RANGE(3);", .line = 1, .col = 8, .end_col = 12 },
-        // inside a call, on the second line of the statement
         .{ .src = "SELECT range,\n       upper(nope) AS u\nFROM RANGE(3);", .line = 2, .col = 14, .end_col = 18 },
-        // an unknown function: its name
         .{ .src = "SELECT frobnicate(range) AS f FROM RANGE(3);", .line = 1, .col = 8, .end_col = 18 },
-        // a call with the wrong arguments: the call's name, not its first argument
         .{ .src = "SELECT substr(range) AS s FROM RANGE(3);", .line = 1, .col = 8, .end_col = 14 },
-        // a sort key
         .{ .src = "SELECT range FROM RANGE(3) ORDER BY zz;", .line = 1, .col = 37, .end_col = 39 },
-        // a quoted name spans its quotes
         .{ .src = "SELECT \"no such\" FROM RANGE(3);", .line = 1, .col = 8, .end_col = 17 },
     };
     for (cases) |c| {
@@ -2675,7 +2441,6 @@ test "a $param or LET in a filter reaches the pushdown as its value, never as a 
     const plan = try analyze(a, prog, &diag);
     try std.testing.expectEqualStrings("(([b] >= 1) AND ([k] < 5))", plan.outputs[0].source.pushdown);
 
-    // the rewrite itself: values in, and the stages untouched when none is named
     var params = ParamMap.init(a);
     const five = try a.create(ast.Expr);
     five.* = .{ .int_lit = 5 };

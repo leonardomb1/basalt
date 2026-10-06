@@ -1,26 +1,44 @@
 //! Azure Blob Storage over the Blob REST API, authenticated with Shared Key.
 //!
 //! ADLS Gen2 data is reachable through this endpoint: Gen2 is layered on Blob
-//! storage, and the separate DFS endpoint only adds hierarchical-namespace
-//! operations (atomic directory rename, POSIX ACLs) that a read/write file
-//! pipeline never issues. Azurite implements Blob only — no DFS, no HNS — so
-//! going through Blob is what makes the local integration suite possible while
-//! staying valid against a real Gen2 account.
+//! storage, and the DFS endpoint only adds hierarchical-namespace operations
+//! (atomic rename, POSIX ACLs) a file pipeline never issues. Azurite implements
+//! Blob only, so going through Blob makes the local integration suite possible
+//! while staying valid against a real Gen2 account.
 //!
-//! URLs are `az://<account>/<container>/<path>`. The endpoint defaults to
-//! `https://<account>.blob.core.windows.net`; set AZURE_BLOB_ENDPOINT to point
-//! at Azurite (which is path-style: `<endpoint>/<account>/<container>/<path>`).
-//! The key comes from AZURE_STORAGE_KEY.
+//! URLs are `az://<account>/<container>/<path>`; a trailing slash addresses every
+//! blob under a prefix. The endpoint defaults to
+//! `https://<account>.blob.core.windows.net`; AZURE_BLOB_ENDPOINT points at Azurite,
+//! which is path-style (`<endpoint>/<account>/<container>/<path>`). The key comes
+//! from AZURE_STORAGE_KEY. `api_version` only needs to be recent enough for the
+//! operations used; Shared Key signing is stable across versions.
 //!
-//! Everything not specific to Shared Key — error bodies, retry policy, the
-//! listing loop, the consumer-facing interface — lives in `objstore.zig`.
+//! Shared Key signs the verb, the `x-ms-*` headers (sorted), the Range and the
+//! canonical resource, so none of them can be changed after signing. StringToSign
+//! is the verb, then Content-Encoding, Content-Language, Content-Length (empty, not
+//! "0", when zero), Content-MD5, Content-Type, Date (empty: x-ms-date is used),
+//! If-Modified-Since, If-Match, If-None-Match, If-Unmodified-Since and Range, one
+//! per line. Any mistake there is an opaque 403.
+//!
+//! Writes stream as a block blob: one `block_size` buffer is staged per Put Block
+//! and `finish` commits the ordered list with Put Block List, so memory stays at
+//! one block (4 MiB blocks under Azure's 50,000-block limit cap an object at
+//! ~190 GiB). There is no abort: uncommitted blocks are invisible and Azure
+//! garbage-collects them, so dropping the writer without `finish` is the abort.
+//! Staging runs under `std.Io.Writer`, whose only error is `WriteFailed`, so the
+//! writer keeps the typed error (`last_status`) and Azure's message for the sink
+//! to re-raise.
+//!
+//! `AzureEmptyPrefix` is kept distinct from an empty object because its usual
+//! cause is a mistyped prefix in an otherwise full container.
+//!
+//! Everything not specific to Shared Key (error bodies, retry policy, the listing
+//! loop, the consumer-facing interface) lives in `objstore.zig`.
 
 const std = @import("std");
 const http_client = @import("../net/http_client.zig");
 const objstore = @import("objstore.zig");
 
-/// x-ms-version sent on every request. Shared Key signing is stable across
-/// versions; this only needs to be recent enough for the operations used.
 pub const api_version = "2021-08-06";
 
 pub const env_key = "AZURE_STORAGE_KEY";
@@ -35,21 +53,14 @@ pub const Error = error{
     AzureBlobNotFound,
     AzureAuthFailed,
     AzureThrottled,
-    /// The container exists and is readable; nothing is stored under the prefix.
-    /// Distinct from a genuinely empty object, because the overwhelmingly common
-    /// cause is a mistyped prefix in an otherwise full lake.
     AzureEmptyPrefix,
 };
 
 pub const Blob = struct {
     account: []const u8,
     container: []const u8,
-    /// Blob path within the container, no leading slash.
     path: []const u8,
-    /// Absolute request URL, endpoint style already applied.
     url: []const u8,
-    /// `/<account>/<container>/<path>` — what Shared Key signs, identical for
-    /// both host-style and path-style endpoints.
     canonical_resource: []const u8,
 };
 
@@ -57,14 +68,9 @@ pub fn isUrl(s: []const u8) bool {
     return std.mem.startsWith(u8, s, "az://");
 }
 
-/// Splits `az://account/container/path...`. The path may contain slashes; the
-/// container is only the first segment after the account.
-///
-/// `endpoint` null selects the real service (host-style,
-/// `https://<account>.blob.core.windows.net/<container>/<path>`); non-null
-/// selects a path-style emulator such as Azurite, where the account is itself a
-/// path segment. That distinction changes the *signature*, not just the URL —
-/// see `canonicalResource`.
+/// Splits `az://account/container/path...`; the container is the first segment.
+/// A non-null `endpoint` selects a path-style emulator, which changes the signed
+/// resource, not just the URL (see `canonicalResource`).
 pub fn parseUrl(arena: std.mem.Allocator, url: []const u8, endpoint: ?[]const u8) !Blob {
     if (!isUrl(url)) return Error.AzureBadUrl;
     const rest = url["az://".len..];
@@ -97,12 +103,9 @@ pub fn parseUrl(arena: std.mem.Allocator, url: []const u8, endpoint: ?[]const u8
     };
 }
 
-/// `/<account>` followed by the request URL's path.
-///
-/// The subtlety: against a path-style emulator the URL path *already begins with
-/// the account*, so the account legitimately appears twice
-/// (`/devstoreaccount1/devstoreaccount1/lake/f.csv`). Getting this wrong is an
-/// opaque 403 with no hint, which is why it is a named function with a test.
+/// `/<account>` followed by the request URL's path. Against a path-style emulator
+/// that path already begins with the account, so it legitimately appears twice
+/// (`/devstoreaccount1/devstoreaccount1/lake/f.csv`); signing it once is a bare 403.
 pub fn canonicalResource(arena: std.mem.Allocator, account: []const u8, url_path: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "/{s}{s}", .{ account, url_path });
 }
@@ -115,12 +118,11 @@ pub fn keyFromEnv(arena: std.mem.Allocator) ![]const u8 {
     return std.process.getEnvVarOwned(arena, env_key) catch return Error.AzureMissingKey;
 }
 
-/// `Sun, 06 Nov 1994 08:49:37 GMT` — the only date format Shared Key accepts.
+/// `Sun, 06 Nov 1994 08:49:37 GMT`, the only date format Shared Key accepts.
 pub fn rfc1123(arena: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
     const days = @divFloor(epoch_secs, 86400);
     const secs_of_day = @as(u32, @intCast(epoch_secs - days * 86400));
     const c = objstore.civilFromDays(days);
-    // 1970-01-01 was a Thursday; shift so 0 = Sunday.
     const dow: usize = @intCast(@mod(days + 4, 7));
     const day_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
     const mon_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
@@ -135,46 +137,36 @@ pub fn rfc1123(arena: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
     });
 }
 
-/// One `x-ms-*` header. They participate in the signature, so they are kept
-/// together with the request rather than rebuilt at send time.
 pub const MsHeader = struct { name: []const u8, value: []const u8 };
 
 pub const SignParams = struct {
     method: []const u8,
     canonical_resource: []const u8,
-    /// Sorted lexicographically by the caller-independent path below.
     ms_headers: []const MsHeader,
     content_length: usize = 0,
     content_type: []const u8 = "",
-    /// `bytes=a-b`, signed verbatim when present.
     range: []const u8 = "",
-    /// Query params, `name=value`, lowercase names, sorted by name.
     query: []const []const u8 = &.{},
 };
 
-/// Builds the `Authorization: SharedKey ...` value.
-///
-/// StringToSign is a fixed 12-line preamble (most lines empty for the requests
-/// this driver makes) followed by the canonicalized `x-ms-*` headers and the
-/// canonicalized resource. Getting a single newline wrong yields an opaque 403,
-/// so the layout below is written out one line per field deliberately.
+/// Builds the `Authorization: SharedKey ...` value. The StringToSign layout is
+/// written out one line per field on purpose (see the module header).
 pub fn authHeader(arena: std.mem.Allocator, account: []const u8, key_b64: []const u8, p: SignParams) ![]const u8 {
     var sts = std.array_list.Managed(u8).init(arena);
     const w = sts.writer();
 
     try w.print("{s}\n", .{p.method});
-    try w.writeAll("\n"); // Content-Encoding
-    try w.writeAll("\n"); // Content-Language
-    // Content-Length is the empty string when zero, not "0".
+    try w.writeAll("\n");
+    try w.writeAll("\n");
     if (p.content_length > 0) try w.print("{d}", .{p.content_length});
     try w.writeAll("\n");
-    try w.writeAll("\n"); // Content-MD5
+    try w.writeAll("\n");
     try w.print("{s}\n", .{p.content_type});
-    try w.writeAll("\n"); // Date — empty, x-ms-date is used instead
-    try w.writeAll("\n"); // If-Modified-Since
-    try w.writeAll("\n"); // If-Match
-    try w.writeAll("\n"); // If-None-Match
-    try w.writeAll("\n"); // If-Unmodified-Since
+    try w.writeAll("\n");
+    try w.writeAll("\n");
+    try w.writeAll("\n");
+    try w.writeAll("\n");
+    try w.writeAll("\n");
     try w.print("{s}\n", .{p.range});
 
     const sorted = try arena.dupe(MsHeader, p.ms_headers);
@@ -203,16 +195,11 @@ pub fn authHeader(arena: std.mem.Allocator, account: []const u8, key_b64: []cons
     return std.fmt.allocPrint(arena, "SharedKey {s}:{s}", .{ account, sig });
 }
 
-/// Signed headers for a plain GET of a whole blob. `range` is `bytes=a-b` for a
-/// partial read, or empty for the whole object; it participates in the
-/// signature, so it cannot be added to the request afterwards.
 pub fn getHeaders(arena: std.mem.Allocator, b: Blob, range: []const u8) ![]const std.http.Header {
     return requestHeaders(arena, b, "GET", range);
 }
 
-/// `getHeaders` for any verb. HEAD (Get Blob Properties) is the one other verb
-/// a reader needs — it answers "how big is this object?" without a body — and
-/// Shared Key signs the verb, so it cannot reuse the GET signature.
+/// Signed headers for any verb; `range` is `bytes=a-b` or empty for the whole object.
 pub fn requestHeaders(
     arena: std.mem.Allocator,
     b: Blob,
@@ -240,8 +227,7 @@ pub fn requestHeaders(
     return out.toOwnedSlice();
 }
 
-/// Maps a status plus Azure's error code onto a distinct Zig error, so callers
-/// can react (and users can read a failure) instead of seeing one catch-all.
+/// Maps a status plus Azure's error code onto a distinct Zig error.
 pub fn statusToError(code: u16, body: []const u8) Error {
     if (objstore.parseError(body)) |e| {
         if (std.mem.eql(u8, e.code, "AuthenticationFailed")) return Error.AzureAuthFailed;
@@ -257,20 +243,8 @@ pub fn statusToError(code: u16, body: []const u8) Error {
     };
 }
 
-/// Staging block size. Azure allows up to 50,000 blocks per blob, so 4 MiB
-/// blocks cap a single object at ~190 GiB — far past anything this writes — while
-/// keeping resident memory to one block.
 pub const block_size = 4 * 1024 * 1024;
 
-/// Streams a block blob: content accumulates into one `block_size` buffer, each
-/// full buffer is staged with Put Block, and `finish` commits the ordered list
-/// with Put Block List. Memory stays at one block regardless of object size,
-/// which is what keeps the pipeline's constant-RSS property intact — buffering
-/// the whole object for a single Put Blob would not.
-///
-/// There is no abort call to make: uncommitted blocks are invisible (the blob
-/// does not exist until the block list is committed) and Azure garbage-collects
-/// them after a week. Dropping the writer without `finish` is the abort.
 pub const BlockBlobWriter = struct {
     interface: std.Io.Writer,
     arena: std.mem.Allocator,
@@ -279,12 +253,7 @@ pub const BlockBlobWriter = struct {
     key: []const u8,
     block_ids: std.array_list.Managed([]const u8),
     content_type: []const u8,
-    /// Azure's `<Code>: <Message>` from the last failure, for the caller to log.
     last_error: []const u8 = "",
-    /// The typed error behind that failure. Block staging runs under
-    /// `std.Io.Writer`, whose error set is only `WriteFailed`; keeping the real
-    /// one here lets the sink re-raise it instead of reporting a generic write
-    /// failure for what was really a 403 or a missing container.
     last_status: ?Error = null,
     rand: std.Random.DefaultPrng,
 
@@ -317,7 +286,7 @@ pub const BlockBlobWriter = struct {
     }
 
     /// Block IDs must all be the same length and base64-encoded; the commit list
-    /// is what defines order, so a simple counter is enough.
+    /// defines order, so a counter is enough.
     fn blockId(self: *BlockBlobWriter, n: usize) ![]const u8 {
         var raw: [16]u8 = undefined;
         _ = try std.fmt.bufPrint(&raw, "blk{d:0>13}", .{n});
@@ -327,6 +296,8 @@ pub const BlockBlobWriter = struct {
         return out;
     }
 
+    /// Put Block. A missing container is created once and the block retried, so a
+    /// fresh destination needs no setup step. Query params sign sorted: blockid, comp.
     fn stageBlock(self: *BlockBlobWriter, bytes: []const u8) !void {
         const id = try self.blockId(self.block_ids.items.len);
         const id_enc = try urlEncode(self.arena, id);
@@ -337,7 +308,6 @@ pub const BlockBlobWriter = struct {
             .{ .name = "x-ms-date", .value = date },
             .{ .name = "x-ms-version", .value = api_version },
         };
-        // Canonicalized query params are sorted by name: blockid before comp.
         const auth = try authHeader(self.arena, self.blob.account, self.key, .{
             .method = "PUT",
             .canonical_resource = self.blob.canonical_resource,
@@ -350,7 +320,6 @@ pub const BlockBlobWriter = struct {
         });
 
         self.send(url, date, auth, bytes, &.{}) catch |e| switch (e) {
-            // Fresh destination: create the container, then retry this block once.
             Error.AzureContainerMissing => {
                 try self.createContainer();
                 try self.send(url, date, auth, bytes, &.{});
@@ -360,8 +329,7 @@ pub const BlockBlobWriter = struct {
         try self.block_ids.append(id);
     }
 
-    /// Commits the staged blocks in order. Until this returns, the blob does not
-    /// exist as far as any reader is concerned.
+    /// Commits the staged blocks in order. Until this returns, the blob does not exist.
     pub fn finish(self: *BlockBlobWriter) !void {
         try self.interface.flush();
 
@@ -395,6 +363,8 @@ pub const BlockBlobWriter = struct {
 
     const Send = struct { w: *BlockBlobWriter, url: []const u8, hdrs: []const std.http.Header, body: []const u8 };
 
+    /// PUT with retry. `last_status` is cleared on success, since `stageBlock` retries a
+    /// missing container and that first attempt's stale error must not be re-raised.
     fn send(
         self: *BlockBlobWriter,
         url: []const u8,
@@ -421,8 +391,6 @@ pub const BlockBlobWriter = struct {
                     .response_writer = &aw.writer,
                 });
                 const code = @intFromEnum(res.status);
-                // Cleared on success: `stageBlock` retries a missing container, and a
-                // stale code from that first attempt must not be re-raised later.
                 if (code == 201 or code == 200) {
                     c.w.last_status = null;
                     return .done;
@@ -432,8 +400,7 @@ pub const BlockBlobWriter = struct {
         }.attempt);
     }
 
-    /// Create the container, ignoring "already exists". Called once after a 404
-    /// so writing to a fresh destination works without a separate setup step.
+    /// Create the container; 409 (already exists) counts as success.
     fn createContainer(self: *BlockBlobWriter) !void {
         const base = self.blob.url[0 .. self.blob.url.len - self.blob.path.len - 1];
         const url = try std.fmt.allocPrint(self.arena, "{s}?restype=container", .{base});
@@ -466,7 +433,6 @@ pub const BlockBlobWriter = struct {
             .response_writer = &aw.writer,
         });
         const code = @intFromEnum(res.status);
-        // 409 = already there, which is success for our purposes.
         if (code != 201 and code != 409) return self.fail(code, aw.writer.buffered());
     }
 
@@ -503,8 +469,6 @@ test "block ids are fixed-width base64 so ordering is stable past 10 blocks" {
     const a = ar.allocator();
     var client: std.http.Client = undefined;
     const blob = try parseUrl(a, "az://acct/c/f.csv", null);
-    // key must be valid base64 for init to succeed via keyFromEnv; call blockId
-    // on a hand-built struct instead of touching the environment.
     var w = BlockBlobWriter{
         .interface = .{ .vtable = undefined, .buffer = &.{} },
         .arena = a,
@@ -545,14 +509,10 @@ test "parseUrl: path-style emulator repeats the account in the signed resource" 
     defer ar.deinit();
     const a = ar.allocator();
 
-    // Regression guard: Azurite's URL path already starts with the account, and
-    // the canonicalized resource is "/" + account + that path — so the account
-    // appears twice. Signing it once yields a bare 403 with no diagnostic.
     const b = try parseUrl(a, "az://devstoreaccount1/lake/in.csv", "http://127.0.0.1:31000");
     try std.testing.expectEqualStrings("http://127.0.0.1:31000/devstoreaccount1/lake/in.csv", b.url);
     try std.testing.expectEqualStrings("/devstoreaccount1/devstoreaccount1/lake/in.csv", b.canonical_resource);
 
-    // a trailing slash on the endpoint must not double up
     const c = try parseUrl(a, "az://devstoreaccount1/lake/in.csv", "http://127.0.0.1:31000/");
     try std.testing.expectEqualStrings(b.url, c.url);
 }
@@ -561,7 +521,6 @@ test "rfc1123 matches the reference date from the Azure signing docs" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // 1994-11-06T08:49:37Z, a Sunday.
     try std.testing.expectEqualStrings("Sun, 06 Nov 1994 08:49:37 GMT", try rfc1123(a, 784111777));
     try std.testing.expectEqualStrings("Thu, 01 Jan 1970 00:00:00 GMT", try rfc1123(a, 0));
 }
@@ -572,7 +531,6 @@ test "authHeader: canonical headers are sorted and Content-Length 0 signs as emp
     const a = ar.allocator();
     const key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
 
-    // headers deliberately out of order: the signature must not depend on it
     const h1 = try authHeader(a, "devstoreaccount1", key, .{
         .method = "GET",
         .canonical_resource = "/devstoreaccount1/c/f.csv",
@@ -592,7 +550,6 @@ test "authHeader: canonical headers are sorted and Content-Length 0 signs as emp
     try std.testing.expectEqualStrings(h1, h2);
     try std.testing.expect(std.mem.startsWith(u8, h1, "SharedKey devstoreaccount1:"));
 
-    // a different verb must produce a different signature
     const put = try authHeader(a, "devstoreaccount1", key, .{
         .method = "PUT",
         .canonical_resource = "/devstoreaccount1/c/f.csv",
@@ -631,7 +588,6 @@ const ListPage = struct {
             .{ .name = "x-ms-date", .value = date },
             .{ .name = "x-ms-version", .value = api_version },
         };
-        // Canonicalized query params sort by name: comp, marker, prefix, restype.
         var q = std.array_list.Managed([]const u8).init(c.arena);
         try q.append("comp:list");
         if (marker.len > 0) try q.append(try std.fmt.allocPrint(c.arena, "marker:{s}", .{marker}));
@@ -665,11 +621,8 @@ const ListPage = struct {
     }
 };
 
-/// Lists blob names under `prefix`, following continuation markers to the end.
-/// Names come back container-relative, in the lexicographic order Azure returns
-/// them, so a caller reading them in order gets a deterministic result. A flat
-/// listing (no delimiter) returns only blobs, so no BlobPrefix entries can be
-/// confused for one.
+/// Lists blob names under `prefix`, container-relative, following continuation
+/// markers, in Azure's lexicographic order. A flat listing returns only blobs.
 pub fn listPrefix(
     arena: std.mem.Allocator,
     client: *std.http.Client,
@@ -706,9 +659,7 @@ test "statusToError distinguishes causes instead of one catch-all" {
     try std.testing.expectEqual(Error.AzureRequestFailed, statusToError(418, ""));
 }
 
-/// Splits a prefix URL (`az://account/container/some/prefix/`) for listing. The
-/// prefix may be empty (`az://account/container/`), unlike `parseUrl`, which
-/// addresses one blob and requires a path.
+/// Splits a prefix URL for listing. Unlike `parseUrl`, the prefix may be empty.
 pub fn parsePrefix(url: []const u8) !struct { account: []const u8, container: []const u8, prefix: []const u8 } {
     if (!isUrl(url)) return Error.AzureBadUrl;
     const rest = url["az://".len..];
@@ -721,7 +672,6 @@ pub fn parsePrefix(url: []const u8) !struct { account: []const u8, container: []
     return .{ .account = account, .container = container, .prefix = after[c_end + 1 ..] };
 }
 
-/// A trailing slash means "every blob under this prefix", not one blob.
 pub fn isPrefix(url: []const u8) bool {
     return isUrl(url) and std.mem.endsWith(u8, url, "/");
 }
@@ -740,9 +690,6 @@ test "prefix URLs are distinguished from blob URLs and may have an empty prefix"
     try std.testing.expectEqualStrings("", bare.prefix);
 }
 
-// --- objstore provider --------------------------------------------------------
-
-/// The `objstore.Provider` for `az://`.
 pub const provider = objstore.Provider{
     .scheme = "az://",
     .empty_prefix = Error.AzureEmptyPrefix,

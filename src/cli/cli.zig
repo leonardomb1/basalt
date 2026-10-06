@@ -4,10 +4,38 @@
 //!   basalt repl
 //!   basalt kernel
 //! `run` executes (HTTP mode when the script declares an endpoint); `check`
-//! validates and plans without running. A
-//! script comes from a file path or, with `-c/--command`, inline. `repl` is an
-//! interactive loop that runs on `;`, carries declarations across entries, and
-//! prints results via the `write stdout` table sink.
+//! validates and plans without running; `serve <dir>` hosts every `@http` script
+//! in a directory and reloads it on SIGHUP. A script comes from a file path or,
+//! with `-c/--command`, inline; `@include` resolves against its directory, or the
+//! cwd for an inline or stdin script. SIGTERM and SIGINT ask a run to stop at its
+//! next boundary, which is how the control plane cancels a job. `--log-format
+//! json` is read before parsing, so a parse error has a runtime error's shape.
+//! Progress is a live line on a terminal, a `progress` event a second under a
+//! JSON log, and nothing on a pipe or under `-q`. A server's own lines are its
+//! output, so `serve` logs at `info` where a one-shot run logs at `warn`.
+//!
+//! `repl` is an interactive loop that runs on `;` and prints results through a
+//! `write stdout` table sink. Declarations carry across entries in a `DeclStore`:
+//! order-preserving, as one may reference another; re-declaring a kind and name
+//! replaces the text in place; text is duped, as the input buffer is reused.
+//! Each entry is parsed with the stored declarations as a prelude, and its own
+//! are committed only once it parses. An `@include` in an entry lasts for that
+//! entry; `\i` joins a file to the session. An entry that opens with `EXPLAIN`
+//! renders its plan without running, as `basalt run` does. A LET's value is
+//! frozen as a literal in the entry that declares it, since replaying `LET t =
+//! now()` ahead of every later entry would give each its own instant. Arrow is
+//! not a REPL format: a binary stream in a terminal is noise. The startup file,
+//! `$XDG_CONFIG_HOME/basalt/repl.sql` (else `~/.config/...`), holds the
+//! declarations a session starts with and is where `\save` writes.
+//!
+//! Completion (the REPL's Tab, `basalt complete`, the kernel's `complete`) draws
+//! on the declarations in scope and a `Catalog` of what sources said, fetched
+//! once each. A source that could not be asked is cached as empty, so a dead
+//! connection costs one wait, not one per Tab. Without `connect`, only local
+//! files, whose headers cost no round trip, contribute columns. The `\connect`
+//! form asks for the keys the runtime reads (`parseDbConfig`,
+//! `resolveStreamLoadConfig`, `http_client.connFromKvs`); a default with `<…>` in
+//! it is only a pattern, and a blank there writes nothing.
 
 const std = @import("std");
 const parser = @import("../lang/sql_parser.zig");
@@ -30,17 +58,13 @@ const eval = @import("../exec/eval.zig");
 const Value = @import("../exec/value.zig").Value;
 const types = @import("../lang/types.zig");
 
-/// SIGTERM/SIGINT → ask the run to stop at its next boundary (async-signal-safe:
-/// one atomic store). The control plane uses this to cancel a job or roll a http_server.
-/// A second signal means "stop being graceful": exit 130 on the spot, so an
-/// interactive ^C ^C isn't held hostage by a slow upstream read.
+/// Asks the run to stop at its next boundary with one atomic store (async-signal-safe).
+/// A second signal exits 130 at once, so ^C ^C is not held hostage by a slow read.
 fn onTerminate(_: i32) callconv(.c) void {
     if (runtime.aborting()) std.posix.exit(130);
     runtime.requestAbort();
 }
 
-/// SIGHUP → reload a multi-script server's directory (control plane writes new
-/// scripts, then signals). Async-signal-safe: one atomic store.
 fn onReload(_: i32) callconv(.c) void {
     runtime.requestReload();
 }
@@ -102,14 +126,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
     std.process.exit(2);
 }
 
-/// A script source plus a label used in diagnostics (a file path, or `<command>`).
-/// `dir` is what `@include 'p.sql'` resolves against: the script's own directory,
-/// or the cwd for an inline/stdin script.
 const Source = struct { label: []const u8, text: []const u8, dir: []const u8 = "." };
 
-/// Resolve the script source: `-c/--command <text>` for an inline script, else the
-/// positional <script> path read from disk. Prints diagnostics and returns null on
-/// failure. `text` is owned by `arena` (or by argv, also long-lived).
 fn loadSource(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8, stderr: *std.Io.Writer) !?Source {
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
@@ -140,12 +158,10 @@ fn loadSource(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8, stderr
     return Source{ .label = path, .text = text, .dir = std.fs.path.dirname(path) orelse "." };
 }
 
-/// Flags that take the next argument as their value, across `run` and `check`.
 const valued_flags = [_][]const u8{ "-p", "--param", "-j", "--threads", "--format", "--log-format", "--log-level", "--port", "--max-rows", "--pos" };
 
-/// Index of the script argument: the first that is neither a flag nor a flag's
-/// value, `-` (stdin) included — so `run --format json x.sql` finds `x.sql`, as
-/// `run x.sql --format json` always did.
+/// The first argument that is neither a flag nor a flag's value, `-` included, so the
+/// script may come before or after its flags.
 fn scriptArg(args: [][:0]u8) ?usize {
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
@@ -175,15 +191,13 @@ test "scriptArg: the script is found whatever order flags and it come in" {
         .{ .argv = &.{ "basalt", "run", "-p", "k=v", "-j", "4", "--quiet", "x.sql" }, .want = 7 },
         .{ .argv = &.{ "basalt", "run", "-j8", "x.sql" }, .want = 3 },
         .{ .argv = &.{ "basalt", "run", "--format", "json" }, .want = null },
-        // a flag's value that happens to look like a path is still its value
         .{ .argv = &.{ "basalt", "check", "-p", "out.sql" }, .want = null },
     };
     for (cases) |c| try std.testing.expectEqual(c.want, scriptArg(try testArgv(a, c.argv)));
 }
 
-/// A dash-prefixed argument no branch claimed. `-` alone is the stdin script,
-/// not an option. Reports it and returns true so the caller can exit 2 — a typo
-/// like `--treads` used to run single-threaded without a word.
+/// Reports a dash-prefixed argument no branch claimed (`-` alone is stdin), so the
+/// caller exits 2: a typo like `--treads` once ran single-threaded without a word.
 fn unknownOption(arg: []const u8, verb: []const u8, stderr: *std.Io.Writer) !bool {
     if (arg.len < 2 or arg[0] != '-') return false;
     try stderr.print("error: unknown option `{s}` for `{s}` — see `basalt help`\n", .{ arg, verb });
@@ -197,8 +211,6 @@ pub fn parseLogFormat(v: []const u8) ?obs.Format {
     return null;
 }
 
-/// `label:line:col: error: msg` when the diagnostic carries a position, else
-/// `label: error: msg` — the same shape parse errors already print.
 fn printDiag(stderr: *std.Io.Writer, label: []const u8, tag: []const u8, pos: ?ast.Pos, msg: []const u8) !void {
     if (pos) |p|
         try stderr.print("{s}:{d}:{d}: error{s}: {s}\n", .{ label, p.line, p.col, tag, msg })
@@ -206,22 +218,16 @@ fn printDiag(stderr: *std.Io.Writer, label: []const u8, tag: []const u8, pos: ?a
         try stderr.print("{s}: error{s}: {s}\n", .{ label, tag, msg });
 }
 
-/// Where a script's errors go: the located text line, or under `--log-format
-/// json` one NDJSON object in the log's own shape, with the span an editor
-/// underlines and whether a retry could help.
 const ErrOut = struct {
     w: *std.Io.Writer,
     json: bool,
     label: []const u8,
-    /// `check --format json`: the object alone, an element of the caller's
-    /// array, without the log envelope (`ts`, `event`).
     bare: bool = false,
 
     const Located = struct {
         msg: []const u8,
         pos: ?ast.Pos = null,
         end: ?ast.Pos = null,
-        /// A file other than the script itself, e.g. an `@include`d one.
         file: ?[]const u8 = null,
         transient: bool = false,
         event: []const u8 = "script_error",
@@ -248,8 +254,6 @@ const ErrOut = struct {
     }
 };
 
-/// `--log-format json` anywhere on the command line, read before the script is
-/// parsed so a parse error is reported in the same shape as a runtime one.
 fn wantsJsonLog(args: [][:0]u8) bool {
     var i: usize = 2;
     while (i + 1 < args.len) : (i += 1) {
@@ -258,11 +262,8 @@ fn wantsJsonLog(args: [][:0]u8) bool {
     return false;
 }
 
-/// Parse a resolved source (resolving its `@include` header first), printing a
-/// located diagnostic on failure. The AST is allocated in `arena` and slices into
-/// `src.text` and the included files' texts, so all must outlive use. The
-/// diagnostic names the file it came from — an included file reports its own
-/// path and its own line numbers.
+/// The AST slices into `src.text` and the included files' texts, so all must outlive
+/// it. An error in an included file names that file's path and lines.
 fn parseSrc(arena: std.mem.Allocator, src: Source, stderr: *std.Io.Writer) !?ast.Program {
     return parseSrcTo(arena, src, .{ .w = stderr, .json = false, .label = src.label });
 }
@@ -285,19 +286,16 @@ fn parseSrcTo(arena: std.mem.Allocator, src: Source, eo: ErrOut) !?ast.Program {
     };
 }
 
-/// One problem `check` found, located in the file it names (null: the script).
 pub const CheckIssue = struct { msg: []const u8, pos: ?ast.Pos = null, end: ?ast.Pos = null, file: ?[]const u8 = null };
 
 pub const CheckOpts = struct {
     overrides: []const analyze.ParamOverride = &.{},
     known: []const analyze.KnownTable = &.{},
-    /// A script of declarations alone checks out — a notebook cell.
     declarations_only: bool = false,
 };
 
 /// Every problem in `text`, in script order: each statement that does not parse
-/// (parsing resumes at the next one), then each that does not check. Nothing
-/// runs and nothing is connected to.
+/// (parsing resumes at the next), then each that does not check. Nothing runs or connects.
 pub fn checkText(a: std.mem.Allocator, text: []const u8, label: []const u8, dir: []const u8, opts: CheckOpts) ![]CheckIssue {
     var issues = std.array_list.Managed(CheckIssue).init(a);
     var names = std.array_list.Managed([]const u8).init(a);
@@ -306,7 +304,6 @@ pub fn checkText(a: std.mem.Allocator, text: []const u8, label: []const u8, dir:
     var idiag: include.Diag = .{};
     const prog = include.loadProgramOpts(a, text, label, dir, &idiag, .{ .known_tables = names.items, .errors = &perrs }) catch |e| switch (e) {
         error.OutOfMemory => return e,
-        // what recovery cannot pass: an unlexable token, an `@include` that fails
         error.ParseFailed => {
             const p = idiag.parse;
             try issues.append(.{ .msg = p.msg, .pos = .{ .line = p.line, .col = p.col }, .end = if (p.end_line > 0) ast.Pos{ .line = p.end_line, .col = p.end_col } else null, .file = if (idiag.label.len > 0 and !std.mem.eql(u8, idiag.label, label)) idiag.label else null });
@@ -321,7 +318,6 @@ pub fn checkText(a: std.mem.Allocator, text: []const u8, label: []const u8, dir:
         .overrides = opts.overrides,
         .known_tables = opts.known,
         .issues = &found,
-        // statements that did not parse are gone; "no output" would be about them
         .declarations_only = opts.declarations_only or perrs.items.len > 0,
     }, &adiag);
     for (found.items) |f| try issues.append(.{ .msg = f.msg, .pos = f.pos, .end = f.end });
@@ -368,7 +364,6 @@ fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             continue;
         }
         if (std.mem.eql(u8, args[i], "--known")) {
-            // tables that exist where the script runs, which it does not declare
             const v = (try nextVal(args, &i, "--known", stderr)) orelse return 2;
             var it = std.mem.splitScalar(u8, v, ',');
             while (it.next()) |n| {
@@ -394,8 +389,6 @@ fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     }
 
     const src = (try loadSource(a, "check", args, stderr)) orelse return 1;
-    // `--format json`: stdout is an array of diagnostics — empty when the script
-    // checks out — for an editor to place; the text lines stay on stderr.
     const eo = ErrOut{ .w = if (json) stdout else stderr, .json = json, .bare = true, .label = src.label };
     const issues = try checkText(a, src.text, src.label, src.dir, .{ .overrides = overrides.items, .known = known.items });
     if (json) try stdout.writeAll("[");
@@ -409,12 +402,8 @@ fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     return 0;
 }
 
-/// `complete <script>|-|-c <script> --pos N [--connect]`: what Tab would offer
-/// at byte offset N, as JSON — `{"start":S,"end":N,"items":[{"text","kind"}]}`,
-/// the candidates replacing `script[S..N]`. Declarations come from the script
-/// itself; local files contribute their columns; connections are asked for
-/// their tables and columns only under `--connect`, since that means a round
-/// trip to each.
+/// What Tab would offer at byte `--pos`, as JSON. Connections are asked for their
+/// tables and columns only under `--connect`, as that is a round trip to each.
 fn cmdComplete(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -467,8 +456,8 @@ fn cmdComplete(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     return 0;
 }
 
-/// The declarations a text makes, by its statements' first words — so a script
-/// still being typed, which will not parse, still has its names in scope.
+/// The declarations a text makes, by its statements' first words, so a script still
+/// being typed, which will not parse, still has its names in scope.
 pub fn declareFrom(decls: *DeclStore, arena: std.mem.Allocator, text: []const u8) !void {
     for (try splitStatements(arena, text)) |st| {
         const id = declOf(st) orelse continue;
@@ -477,9 +466,8 @@ pub fn declareFrom(decls: *DeclStore, arena: std.mem.Allocator, text: []const u8
     }
 }
 
-/// Byte offset of UTF-16 offset `u` in `text` — where a JavaScript editor's
-/// cursor is. An offset inside a surrogate pair, or past the end, clamps to the
-/// character boundary before it; bytes that are not UTF-8 count one unit each.
+/// Byte offset of UTF-16 offset `u`, a JavaScript editor's cursor. Inside a surrogate
+/// pair or past the end clamps back to a boundary; non-UTF-8 bytes count one unit.
 pub fn utf16ToByte(text: []const u8, u: usize) usize {
     var i: usize = 0;
     var units: usize = 0;
@@ -493,7 +481,6 @@ pub fn utf16ToByte(text: []const u8, u: usize) usize {
     return i;
 }
 
-/// UTF-16 offset of byte `b` in `text`: `utf16ToByte`'s inverse.
 pub fn byteToUtf16(text: []const u8, b: usize) usize {
     var i: usize = 0;
     var units: usize = 0;
@@ -505,8 +492,7 @@ pub fn byteToUtf16(text: []const u8, b: usize) usize {
     return units;
 }
 
-/// `{"start":S,"end":N,"items":[{"text":…,"kind":…[,"detail":…]}]}`. With `utf16`, the
-/// offsets are counted in UTF-16 units of `text`, as a JavaScript editor counts.
+/// With `utf16`, offsets count UTF-16 units of `text`, as a JavaScript editor does.
 pub fn writeOfferIn(w: *std.Io.Writer, offer: Offer, cursor: usize, text: []const u8, utf16: bool) !void {
     var o = offer;
     var c = cursor;
@@ -517,8 +503,6 @@ pub fn writeOfferIn(w: *std.Io.Writer, offer: Offer, cursor: usize, text: []cons
     return writeOffer(w, o, c);
 }
 
-/// `{"start":S,"end":N,"items":[{"text":…,"kind":…[,"detail":…]}]}` — `detail` only
-/// when there is one: a built-in function's signature, a column's type.
 pub fn writeOffer(w: *std.Io.Writer, offer: Offer, cursor: usize) !void {
     try w.print("{{\"start\":{d},\"end\":{d},\"items\":[", .{ offer.start, cursor });
     for (offer.items, 0..) |c, k| {
@@ -654,9 +638,6 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var diag: runtime.Diag = .{};
     var sink = runtime.OutcomeSink.init(alloc);
     defer sink.deinit();
-    // A person watching a terminal gets the live line; under `--log-format json`
-    // a reader of the log gets a `progress` event a second instead, terminal or
-    // not. A plain pipe or file and `-q` get neither.
     const progress = !no_progress and !log.quiet and (log.format == .json or std.posix.isatty(std.fs.File.stderr().handle));
     _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze, .stdout_format = stdout_format, .progress = progress, .items = true, .max_rows = max_rows }, &diag) catch |e| switch (e) {
         error.Aborted => {
@@ -698,8 +679,6 @@ fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     return 0;
 }
 
-/// `serve <dir> [--port N]`: host every `@http` script in a directory, routing by
-/// each script's declared path. SIGHUP reloads the directory.
 fn cmdServe(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var err_buf: [4096]u8 = undefined;
     var err_file = std.fs.File.stderr().writer(&err_buf);
@@ -714,8 +693,6 @@ fn cmdServe(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
 
     var port: u16 = 8080;
     var watch = false;
-    // A host's own lines (routes, reloads, flush failures) are its output, so
-    // the default is `info` where a one-shot run defaults to `warn`.
     var log = runtime.LogConfig{ .level = .info, .summary = .stderr };
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
@@ -751,10 +728,8 @@ fn cmdServe(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     return 0;
 }
 
-/// Index of the next `;` at statement level — outside `'...'` (with `''`
-/// escapes), `"..."` (with `\` escapes), `$$`/`$tag$` dollar quotes, `--` line
-/// comments and `/* */` block comments. Mirrors the lexer's trivia and string
-/// rules so the REPL agrees with the parser on where a statement ends.
+/// Next statement-level `;`, skipping strings, dollar quotes and comments by the
+/// lexer's own rules, so the REPL agrees with the parser on where a statement ends.
 fn nextTopSemi(s: []const u8, from: usize) ?usize {
     var i = from;
     while (i < s.len) {
@@ -819,11 +794,8 @@ fn dollarTagLen(s: []const u8, i: usize) ?usize {
     return j + 1 - i;
 }
 
-/// What the editor asks on Enter, and the piped loop after each line: run this,
-/// or wait for more? A meta command, a quit word and a blank entry are whole as
-/// they stand. SQL is whole at a top-level `;` — unless the parser, given the
-/// session's declarations, runs out of input first: a `CREATE FUNCTION ... AS`
-/// whose body is still open ends in `;` several times before its `END;`.
+/// Run or wait for more? SQL is whole at a top-level `;` unless the parser, given
+/// the session, runs out of input: an open `CREATE FUNCTION` body holds `;`s before `END;`.
 fn entryComplete(ctx: *anyopaque, s: []const u8) bool {
     const t = std.mem.trim(u8, s, " \t\r\n");
     if (t.len == 0 or t[0] == '\\' or isQuit(t) or isHelp(t) or isClear(t)) return true;
@@ -845,8 +817,6 @@ fn entryComplete(ctx: *anyopaque, s: []const u8) bool {
     return true;
 }
 
-/// True when the entry is ready to run: its last non-blank character is a
-/// statement-level `;`.
 fn endsComplete(s: []const u8) bool {
     const t = std.mem.trim(u8, s, " \t\r\n");
     if (t.len == 0 or t[t.len - 1] != ';') return false;
@@ -857,8 +827,6 @@ fn endsComplete(s: []const u8) bool {
     return false;
 }
 
-/// Split an entry on statement-level `;`, returning trimmed non-empty statement
-/// texts with the terminator stripped. Slices point into `s`.
 fn splitStatements(arena: std.mem.Allocator, s: []const u8) ![]const []const u8 {
     var out = std.array_list.Managed([]const u8).init(arena);
     var start: usize = 0;
@@ -876,7 +844,6 @@ fn splitStatements(arena: std.mem.Allocator, s: []const u8) ![]const []const u8 
 pub const DeclKind = enum { connection, function, param, let, endpoint, resource };
 pub const DeclId = struct { kind: DeclKind, name: []const u8 };
 
-/// Next whitespace-delimited word at `i.*`, advancing past it.
 fn nextWord(s: []const u8, i: *usize) ?[]const u8 {
     while (i.* < s.len and std.ascii.isWhitespace(s[i.*])) i.* += 1;
     if (i.* >= s.len) return null;
@@ -885,18 +852,15 @@ fn nextWord(s: []const u8, i: *usize) ?[]const u8 {
     return s[start..i.*];
 }
 
-/// Leading identifier of a word, so `f(a,` yields `f`.
-/// ponytail: bare identifiers only — the dialect has no quoted decl names.
+/// Bare identifiers only: the dialect has no quoted declaration names.
 fn identPrefix(w: []const u8) []const u8 {
     var n: usize = 0;
     while (n < w.len and (std.ascii.isAlphanumeric(w[n]) or w[n] == '_')) n += 1;
     return w[0..n];
 }
 
-/// Classify a statement as a session declaration and name it:
-/// `CREATE [OR REPLACE] CONNECTION|FUNCTION <name>`, `CREATE RESOURCE <conn>.<name>`,
-/// `CREATE ENDPOINT ...`
-/// (unnamed — the REPL rejects it), or `PARAM <name>`. Null for anything else.
+/// The session declaration a statement makes, by its first words, or null. A resource
+/// is named `conn.name`, as two connections may each have one of the same name.
 fn declOf(stmt: []const u8) ?DeclId {
     var i: usize = 0;
     var w = nextWord(stmt, &i) orelse return null;
@@ -917,7 +881,6 @@ fn declOf(stmt: []const u8) ?DeclId {
     }
     if (std.ascii.eqlIgnoreCase(w, "endpoint")) return .{ .kind = .endpoint, .name = "" };
     if (std.ascii.eqlIgnoreCase(w, "resource")) {
-        // Named `conn.name`: two resources of different connections may share a name.
         const q = nextWord(stmt, &i) orelse return null;
         const conn = identPrefix(q);
         if (conn.len == 0 or conn.len + 1 >= q.len or q[conn.len] != '.') return null;
@@ -934,11 +897,6 @@ fn declOf(stmt: []const u8) ?DeclId {
     return if (n.len == 0) null else .{ .kind = kind, .name = n };
 }
 
-/// Declarations carried across REPL entries, so `CREATE CONNECTION erp ...` in
-/// one entry is still in scope for a `SELECT ... FROM erp.orders` in the next.
-/// Order-preserving (declarations may reference earlier ones); re-declaring a
-/// (kind, name) replaces the stored text in place. Text is duped with the
-/// REPL's gpa because the input buffer is reused every line.
 pub const DeclStore = struct {
     const Entry = struct { kind: DeclKind, name: []u8, text: []u8 };
 
@@ -974,17 +932,12 @@ pub const DeclStore = struct {
     }
 };
 
-/// Mutable REPL state: the declaration prelude plus per-session toggles.
 const Session = struct {
     decls: DeclStore,
     format: runtime.StdoutFormat = .table,
     tty: bool = false,
-    /// What Tab has learned about the sources so far, for as long as the session.
     catalog: Catalog,
-    /// The last entry run, for `\edit`.
     last_entry: ?[]u8 = null,
-    /// Say `ok: connection x` as declarations register — off while the startup
-    /// file loads, which is summed up in one line instead.
     announce: bool = true,
 
     fn completer(self: *Session) Completer {
@@ -992,7 +945,6 @@ const Session = struct {
     }
 };
 
-/// A path with the home directory folded to `~`, for messages.
 fn tilde(buf: []u8, path: []const u8) []const u8 {
     const home = std.posix.getenv("HOME") orelse return path;
     if (home.len > 1 and std.mem.startsWith(u8, path, home) and path.len > home.len and path[home.len] == '/')
@@ -1000,8 +952,6 @@ fn tilde(buf: []u8, path: []const u8) []const u8 {
     return path;
 }
 
-/// The REPL's opening: a small mark, the name and version, what the tool is,
-/// and the two things a newcomer needs. Three lines — a prompt, not a splash.
 fn banner(msg: *std.Io.Writer, color: bool) !void {
     const dim: []const u8 = if (color) "\x1b[2m" else "";
     const bold: []const u8 = if (color) "\x1b[1m" else "";
@@ -1012,8 +962,6 @@ fn banner(msg: *std.Io.Writer, color: bool) !void {
     try msg.print("{s}  ▀▀▀ {s} {s}\\help keys and commands · \\connect a new source · \\q quit{s}\n\n", .{ mark, off, dim, off });
 }
 
-/// `$XDG_CONFIG_HOME/basalt/repl.sql`, else `~/.config/basalt/repl.sql`: the
-/// declarations a session starts with, and where `\save` writes.
 fn startupPath(gpa: std.mem.Allocator) ?[]u8 {
     if (std.process.getEnvVarOwned(gpa, "XDG_CONFIG_HOME")) |x| {
         defer gpa.free(x);
@@ -1024,7 +972,6 @@ fn startupPath(gpa: std.mem.Allocator) ?[]u8 {
     return std.fs.path.join(gpa, &.{ home, ".config", "basalt", "repl.sql" }) catch null;
 }
 
-/// The value of `key = '...'` in a `CREATE CONNECTION` text, or null.
 fn connAttr(text: []const u8, key: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i + key.len < text.len) : (i += 1) {
@@ -1047,9 +994,6 @@ fn connAttr(text: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
-/// `\connections`: one row per connection — its type, host and database as
-/// declared, and what the session has learned: how many tables Tab or
-/// `\connections test` found, or that it could not be reached.
 fn listConnections(sess: *Session, msg: *std.Io.Writer, probe: bool) !void {
     var n: usize = 0;
     for (sess.decls.items.items) |e| if (e.kind == .connection) {
@@ -1075,9 +1019,6 @@ fn listConnections(sess: *Session, msg: *std.Io.Writer, probe: bool) !void {
     }
 }
 
-/// What each connector needs, for `\connect`: the questions, in order, with the
-/// default a newcomer would want. Mirrors the keys the runtime reads
-/// (`parseDbConfig`, `resolveStreamLoadConfig`, `http_client.connFromKvs`).
 const Connector = struct {
     name: []const u8,
     blurb: []const u8,
@@ -1085,15 +1026,11 @@ const Connector = struct {
     const Field = struct {
         key: []const u8,
         hint: []const u8 = "",
-        /// Taken when the field is left blank; one with a `<…>` in it is only a
-        /// pattern to follow, and a blank there writes nothing.
         default: []const u8 = "",
         secret: bool = false,
         int: bool = false,
         choices: []const []const u8 = &.{},
-        /// The choice that is the runtime's own default, so it writes nothing.
         omit: []const u8 = "",
-        /// Asked only when the field `key` holds `value`.
         when: ?struct { key: []const u8, value: []const u8 } = null,
     };
 };
@@ -1164,14 +1101,11 @@ const connectors = [_]Connector{
     } },
 };
 
-/// The `\connect` form's live parts: the credential placeholders follow the
-/// name as it is typed, and a field asked only for some answer comes and goes.
 const Wizard = struct {
     conn: Connector,
     user_ph: [96]u8 = undefined,
     pass_ph: [96]u8 = undefined,
 
-    /// `NAME_USER` / `NAME_PASS` for the name typed so far.
     fn convention(name: []const u8, suffix: []const u8, buf: []u8) []const u8 {
         var n: usize = 0;
         for (name) |ch| {
@@ -1219,9 +1153,8 @@ const Wizard = struct {
     }
 };
 
-/// `\connect [type]`: ask what the connector needs, show the `CREATE CONNECTION`
-/// it makes, register it, and offer to reach it and to save it — the way a
-/// project scaffolder asks its few questions and writes the file.
+/// Blank credentials are left out, meaning the runtime's `env(NAME_USER)` and
+/// `env(NAME_PASS)` convention; a typed password is never echoed.
 fn connectWizard(alloc: std.mem.Allocator, type_arg: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
     var term = form.Term.init(alloc, msg);
     var which: ?Connector = null;
@@ -1279,8 +1212,6 @@ fn connectWizard(alloc: std.mem.Allocator, type_arg: []const u8, sess: *Session,
     var pass_buf: [96]u8 = undefined;
     const pass_conv = Wizard.convention(name, "PASS", &pass_buf);
 
-    // The statement, and as echoed: the same but for a typed password, which
-    // stays off the screen.
     var stmt = std.array_list.Managed(u8).init(alloc);
     defer stmt.deinit();
     var shown = std.array_list.Managed(u8).init(alloc);
@@ -1293,7 +1224,6 @@ fn connectWizard(alloc: std.mem.Allocator, type_arg: []const u8, sess: *Session,
         var v = fld.value();
         if (cf.choices.len > 0 and std.mem.eql(u8, v, cf.omit)) continue;
         if (v.len == 0) {
-            // Blank credentials mean the runtime's own convention: env(NAME_USER) / env(NAME_PASS).
             if (cf.secret or std.mem.eql(u8, cf.key, "user")) continue;
             if (std.mem.indexOfScalar(u8, cf.default, '<') != null) continue;
             v = cf.default;
@@ -1339,7 +1269,6 @@ fn connectWizard(alloc: std.mem.Allocator, type_arg: []const u8, sess: *Session,
     if (try term.run(&save) and save.yes) try saveDecls(alloc, "", sess, msg);
 }
 
-/// SQL as the entry colours it.
 fn writeHighlighted(gpa: std.mem.Allocator, w: *std.Io.Writer, text: []const u8, color: bool) !void {
     if (!color) return w.writeAll(text);
     const styles = try gpa.alloc(hilite.Style, text.len);
@@ -1356,8 +1285,7 @@ fn writeHighlighted(gpa: std.mem.Allocator, w: *std.Io.Writer, text: []const u8,
     try w.writeAll(hilite.sgr_reset);
 }
 
-/// `\i <file>`: run a file as an entry, so its declarations join the session —
-/// what `@include` inside an entry does not do. Also the startup file's path in.
+/// Runs a file as an entry, so its declarations join the session, which `@include` does not.
 fn sourceFile(alloc: std.mem.Allocator, path: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
     const text = std.fs.cwd().readFileAlloc(alloc, path, 1 << 22) catch |e|
         return msg.print("error: could not read `{s}`: {s}\n", .{ path, @errorName(e) });
@@ -1367,8 +1295,6 @@ fn sourceFile(alloc: std.mem.Allocator, path: []const u8, sess: *Session, msg: *
     try runBlock(alloc, trimmed, sess, msg);
 }
 
-/// `\save [file]`: the session's declarations, one statement per line, to the
-/// startup file by default — the way a session's connections become tomorrow's.
 fn saveDecls(alloc: std.mem.Allocator, path_arg: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
     const path = if (path_arg.len > 0) try alloc.dupe(u8, path_arg) else (startupPath(alloc) orelse return msg.writeAll("error: no HOME to save under\n"));
     defer alloc.free(path);
@@ -1387,9 +1313,6 @@ fn saveDecls(alloc: std.mem.Allocator, path_arg: []const u8, sess: *Session, msg
     try msg.print("saved {d} declaration{s} to {s}\n", .{ n, if (n == 1) "" else "s", tilde(&tbuf, path) });
 }
 
-/// `\edit [file]`: the last entry (or the file) in `$EDITOR`, then run what
-/// comes back. The terminal is in cooked mode between entries, so the editor
-/// gets it whole.
 fn editAndRun(alloc: std.mem.Allocator, path_arg: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
     const editor = std.process.getEnvVarOwned(alloc, "EDITOR") catch try alloc.dupe(u8, "vi");
     defer alloc.free(editor);
@@ -1413,9 +1336,6 @@ fn editAndRun(alloc: std.mem.Allocator, path_arg: []const u8, sess: *Session, ms
     try sourceFile(alloc, path, sess, msg);
 }
 
-/// Names fetched for completion, once each: a connection's tables, a table's or
-/// a file's columns. A source that could not be asked is remembered as empty, so
-/// a dead connection costs one wait, not one per Tab.
 pub const Catalog = struct {
     arena: std.heap.ArenaAllocator,
     tables: std.StringHashMap([]const []const u8),
@@ -1431,24 +1351,16 @@ pub const Catalog = struct {
     }
 };
 
-/// What completion draws on: the declarations in scope, and a cache of what
-/// sources said about their tables and columns. The REPL builds one from its
-/// session; `basalt complete` and the kernel's `complete` build their own.
 pub const Completer = struct {
     gpa: std.mem.Allocator,
     decls: *const DeclStore,
     catalog: *Catalog,
-    /// Ask connections for their tables and columns. Off, only local files
-    /// (whose headers and footers cost no round trip) contribute columns.
     connect: bool = true,
 };
 
-/// A completion offer: replace `text[start..cursor]` with one of `items`.
 pub const Offer = struct { start: usize = 0, items: []const complete.Candidate = &.{} };
 
-/// Run `SELECT ...` under the session's declarations into a temporary CSV and
-/// hand back its rows, first column only — how Tab asks a source a question
-/// without printing anything. Errors come back as no rows.
+/// How Tab asks a source a question without printing anything; errors read as no rows.
 fn fetchColumn(cx: *const Completer, select: []const u8) []const []const u8 {
     const a = cx.catalog.arena.allocator();
     const rows = fetchRows(cx, select);
@@ -1457,9 +1369,8 @@ fn fetchColumn(cx: *const Completer, select: []const u8) []const []const u8 {
     return out;
 }
 
-/// Every row of `SELECT ...`, as its cells (each row has at least one). The
-/// temporary file is basalt's own CSV, so a cell is split on commas outside
-/// quotes and a doubled quote read as one.
+/// Every row of `SELECT ...` as its cells, split as basalt's own CSV writes them:
+/// on commas outside quotes, a doubled quote read as one.
 fn fetchRows(cx: *const Completer, select: []const u8) []const []const []const u8 {
     const a = cx.catalog.arena.allocator();
     var scratch = std.heap.ArenaAllocator.init(cx.gpa);
@@ -1515,8 +1426,6 @@ fn csvCells(a: std.mem.Allocator, line: []const u8) ![]const []const u8 {
     return cells.toOwnedSlice();
 }
 
-/// The resources declared on `conn` when it is an http connection — its
-/// "tables", known from the session without asking the network — else null.
 fn httpResources(arena: std.mem.Allocator, cx: *const Completer, conn: []const u8) !?[]const []const u8 {
     const is_http = for (cx.decls.items.items) |e| {
         if (e.kind == .connection and std.ascii.eqlIgnoreCase(e.name, conn))
@@ -1531,7 +1440,6 @@ fn httpResources(arena: std.mem.Allocator, cx: *const Completer, conn: []const u
     return try out.toOwnedSlice();
 }
 
-/// The tables of `conn` as `schema.table`, fetched on first use.
 fn connTables(cx: *const Completer, conn: []const u8) []const []const u8 {
     if (cx.catalog.tables.get(conn)) |t| return t;
     if (!cx.connect) return &.{};
@@ -1542,13 +1450,13 @@ fn connTables(cx: *const Completer, conn: []const u8) []const []const u8 {
     return rows;
 }
 
-/// The columns of `conn.schema.table`, or of a file path, fetched on first use.
+/// Table names are queried in upper case, as `SHOW TABLES` spells them, and
+/// aliased so every dialect answers the same names.
 fn sourceColumns(cx: *const Completer, key: []const u8) []const complete.Column {
     if (cx.catalog.columns.get(key)) |c| return c;
     const a = cx.catalog.arena.allocator();
     var rows: []const complete.Column = &.{};
     if (key[0] == '\'') {
-        // A file: the analyzer reads its schema without moving a row.
         var scratch = std.heap.ArenaAllocator.init(cx.gpa);
         defer scratch.deinit();
         const sa = scratch.allocator();
@@ -1572,8 +1480,6 @@ fn sourceColumns(cx: *const Completer, key: []const u8) []const complete.Column 
         const conn = parts.next().?;
         const schema = parts.next() orelse return rows;
         const tbl = parts.next() orelse return rows;
-        // Upper case, as `SHOW TABLES` spells it (a case-sensitive SQL Server
-        // resolves nothing else), aliased so every dialect answers the same names.
         const q = std.fmt.allocPrint(a, "SELECT col_name, col_type FROM {s}.QUERY($$SELECT COLUMN_NAME AS col_name, DATA_TYPE AS col_type FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = '{s}' AND TABLE_NAME = '{s}' ORDER BY ORDINAL_POSITION$$)", .{ conn, schema, tbl }) catch return rows;
         const got = fetchRows(cx, q);
         const cols = a.alloc(complete.Column, got.len) catch return rows;
@@ -1584,8 +1490,6 @@ fn sourceColumns(cx: *const Completer, key: []const u8) []const complete.Column 
     return rows;
 }
 
-/// The connector type of a declared connection, read off its `CREATE CONNECTION`
-/// text (`TYPE <word>`).
 fn connTypeOf(text: []const u8) ?[]const u8 {
     var it = std.mem.tokenizeAny(u8, text, " \t\r\n(");
     while (it.next()) |w| {
@@ -1594,8 +1498,6 @@ fn connTypeOf(text: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Tab's provider: the session's names, plus the columns of every table and
-/// file the entry mentions, handed to the matcher; a path is listed here.
 fn suggest(ctx: *anyopaque, arena: std.mem.Allocator, text: []const u8, cursor: usize) anyerror!Editor.Suggestions {
     const sess: *Session = @ptrCast(@alignCast(ctx));
     const cx = sess.completer();
@@ -1605,9 +1507,8 @@ fn suggest(ctx: *anyopaque, arena: std.mem.Allocator, text: []const u8, cursor: 
     return .{ .start = offer.start, .items = items };
 }
 
-/// Completion at `cursor` in `text`: keywords, the declared names in scope, the
-/// entry's CTEs, a path inside an open quote, a connection's tables after
-/// `conn.`, and the columns of every table and file the text names.
+/// Never asks for the columns of a name the cursor is still typing at the end of the
+/// text, which would send a catalog query on every keystroke.
 pub fn suggestFor(arena: std.mem.Allocator, cx: *const Completer, text: []const u8, cursor: usize) anyerror!Offer {
     var conns = std.array_list.Managed([]const u8).init(arena);
     var fns = std.array_list.Managed([]const u8).init(arena);
@@ -1619,7 +1520,6 @@ pub fn suggestFor(arena: std.mem.Allocator, cx: *const Completer, text: []const 
         .endpoint, .resource => {},
     };
 
-    // CTEs of the entry: `WITH name AS (` and `, name AS (`.
     var ctes = std.array_list.Managed([]const u8).init(arena);
     var i: usize = 0;
     while (i + 4 < text.len) : (i += 1) {
@@ -1635,8 +1535,6 @@ pub fn suggestFor(arena: std.mem.Allocator, cx: *const Completer, text: []const 
         if (k + 2 < text.len and std.ascii.eqlIgnoreCase(text[k .. k + 2], "as") and text[k + 2] == ' ') try ctes.append(text[ns..j]);
     }
 
-    // The tables of every connection the entry names with a dot, and the columns
-    // of every `conn.schema.table` and `'file'` in it.
     var tables = std.array_list.Managed(complete.ConnTables).init(arena);
     var columns = std.array_list.Managed(complete.Column).init(arena);
     for (conns.items) |c| {
@@ -1651,10 +1549,6 @@ pub fn suggestFor(arena: std.mem.Allocator, cx: *const Completer, text: []const 
             while (e < text.len and (std.ascii.isAlphanumeric(text[e]) or text[e] == '_' or text[e] == '.')) : (e += 1) {
                 if (text[e] == '.') dots += 1;
             }
-            // `conn.QUERY(` is no table; a name at the very end of the text is
-            // (`SELECT a FROM erp.dbo.t`), unless the cursor is still typing it —
-            // then it is half a name, and asking for its columns would send a
-            // catalog query on every keystroke.
             const typing = cursor > p and cursor <= e;
             if (dots == 1 and !typing and (e == text.len or text[e] != '(')) for (sourceColumns(cx, text[p..e])) |col| try columns.append(col);
         }
@@ -1693,8 +1587,6 @@ pub fn suggestFor(arena: std.mem.Allocator, cx: *const Completer, text: []const 
     }
 }
 
-/// The entries of the directory `partial` is in, that begin as it does — a
-/// directory with a `/` after it, so the next Tab goes inside.
 fn listPaths(arena: std.mem.Allocator, partial: []const u8) ![]const []const u8 {
     const slash = std.mem.lastIndexOfScalar(u8, partial, '/');
     const dir_part = if (slash) |s| partial[0 .. s + 1] else "";
@@ -1716,11 +1608,8 @@ fn listPaths(arena: std.mem.Allocator, partial: []const u8) ![]const []const u8 
     return out.toOwnedSlice();
 }
 
-/// Interactive read-eval-print loop. An entry runs when a line ends in a
-/// statement-level `;` (a blank line also runs a pending buffer, which is what
-/// `echo ... | basalt repl` relies on). Declarations persist across entries; a
-/// terminal SELECT prints as a table (a stdout sink is appended when the entry
-/// doesn't write). Prompts only on a TTY.
+/// A blank line also runs a pending buffer, which `echo ... | basalt repl` relies on.
+/// After a ^C the abort flag is reset, so the session is not left poisoned.
 fn cmdRepl(alloc: std.mem.Allocator) !u8 {
     var in_buf: [64 * 1024]u8 = undefined;
     var in_file = std.fs.File.stdin().reader(&in_buf);
@@ -1737,7 +1626,6 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
     var editor: ?Editor = if (sess.tty) Editor.init(alloc) else null;
     defer if (editor) |*e| e.deinit();
 
-    // Only here are tables fitted to the terminal and the last one kept for `\view`.
     table.interactive = sess.tty;
     defer table.dropLast();
 
@@ -1746,7 +1634,6 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
         try msg.flush();
     }
 
-    // The startup file, when there is one: connections a session should start with.
     if (startupPath(alloc)) |sp| {
         defer alloc.free(sp);
         if (std.fs.cwd().access(sp, .{})) |_| {
@@ -1776,13 +1663,11 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
 
     var quit = false;
     while (!quit) {
-        // Un-poison the session: a ^C-aborted query leaves the abort flag set.
         runtime.resetAbort();
         block.clearRetainingCapacity();
         while (true) {
             var line: []const u8 = undefined;
             if (editor) |*ed| {
-                // The editor hands back a whole entry, however many lines it took.
                 switch (ed.readEntry(.{ .complete = entryComplete, .complete_ctx = &sess, .suggest = suggest, .suggest_ctx = &sess }) catch |e| blk: {
                     try msg.print("input error: {s}\n", .{@errorName(e)});
                     try msg.flush();
@@ -1803,8 +1688,6 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
                             }
                         } else {
                             try block.appendSlice(l);
-                            // Run without its `;` (Ctrl+J), the entry
-                            // may lack one — which is all the parser would say about it.
                             if (t.len > 0 and !endsComplete(l)) try block.append(';');
                         }
                     },
@@ -1825,9 +1708,8 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
             const t = std.mem.trim(u8, line, " \t\r\n");
             if (t.len == 0) {
                 if (block.items.len == 0) continue;
-                break; // blank line still runs a pending buffer
+                break;
             }
-            // Meta commands only lead an entry, so `\` inside a query is untouched.
             if (block.items.len == 0 and (t[0] == '\\' or isQuit(t) or isHelp(t) or isClear(t))) {
                 if (isQuit(t)) {
                     quit = true;
@@ -1856,16 +1738,12 @@ fn cmdRepl(alloc: std.mem.Allocator) !u8 {
     return 0;
 }
 
-/// Between one response and the next entry: a blank line. Only at a terminal;
-/// piped, the output stays as it was.
 fn separator(sess: *const Session, msg: *std.Io.Writer) !void {
     if (!sess.tty) return;
     try msg.writeAll("\n");
     try msg.flush();
 }
 
-/// Between an entry and its response: a blank line, so the answer does not sit
-/// against the query that asked for it.
 fn entryGap(sess: *const Session, msg: *std.Io.Writer) !void {
     if (!sess.tty) return;
     try msg.writeAll("\n");
@@ -1878,8 +1756,6 @@ fn isViewCmd(t: []const u8) bool {
     return std.mem.eql(u8, cmd, "\\view") or std.mem.eql(u8, cmd, "\\v");
 }
 
-/// One statement of an entry: the declaration it is, or null for something to
-/// run, and its text (a declaration's, without the closing `;`).
 const EntryStmt = struct { id: ?DeclId, text: []const u8 };
 
 fn offsetOf(text: []const u8, pos: ast.Pos) ?usize {
@@ -1890,8 +1766,7 @@ fn offsetOf(text: []const u8, pos: ast.Pos) ?usize {
     return @min(text.len, i + pos.col - 1);
 }
 
-/// The statements of the entry (the part of `text` from `entry_at`), in source
-/// order, each with its text cut at its own last top-level `;` — so a statement
+/// The entry's statements, each cut at its own last top-level `;`, so a statement
 /// function is one statement however many `;`s its body holds.
 fn entryStatements(arena: std.mem.Allocator, text: []const u8, entry_at: usize, prog: ast.Program) ![]EntryStmt {
     const Found = struct { off: usize, stmt: ast.Stmt };
@@ -1909,7 +1784,6 @@ fn entryStatements(arena: std.mem.Allocator, text: []const u8, entry_at: usize, 
     }.lt);
     var out = std.array_list.Managed(EntryStmt).init(arena);
     for (found.items, 0..) |f, i| {
-        // A hoisted CTE and the query that reads it share a start; keep the query.
         if (i + 1 < found.items.len and found.items[i + 1].off == f.off) continue;
         const end = if (i + 1 < found.items.len) found.items[i + 1].off else text.len;
         var piece = text[f.off..end];
@@ -1959,9 +1833,7 @@ test "entryStatements: a statement function is one declaration, its body's `;`s 
     try std.testing.expect(got[2].id == null);
 }
 
-/// The line a parse error names, with a caret under the column — as an editor
-/// marks a squiggle. `text` is prelude + entry; only a position inside the entry
-/// (the part the person typed) is shown.
+/// Only a position inside the entry, the part the person typed, gets a caret.
 fn errorCaret(msg: *std.Io.Writer, text: []const u8, entry: []const u8, line: u32, col: u32) !void {
     const entry_at = std.mem.lastIndexOf(u8, text, entry) orelse return;
     const prelude_lines = std.mem.count(u8, text[0..entry_at], "\n");
@@ -1983,8 +1855,6 @@ fn errorCaret(msg: *std.Io.Writer, text: []const u8, entry: []const u8, line: u3
     }
 }
 
-/// Handle a `\...` entry. Unknown ones report themselves instead of reaching
-/// the parser.
 fn metaCommand(t: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
     defer msg.flush() catch {};
     if (isHelp(t)) return replHelp(msg);
@@ -2007,7 +1877,6 @@ fn metaCommand(t: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
     }
     if (std.mem.eql(u8, cmd, "\\edit") or std.mem.eql(u8, cmd, "\\e")) return editAndRun(sess.decls.gpa, rest, sess, msg);
     if (isClear(t)) {
-        // The whole screen, cursor home; the terminal's scrollback is left alone.
         return msg.writeAll("\x1b[2J\x1b[H");
     }
     if (std.mem.eql(u8, cmd, "\\reset")) {
@@ -2024,7 +1893,6 @@ fn metaCommand(t: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
         }
         return msg.print("format {s}\n", .{@tagName(sess.format)});
     }
-    // psql's spellings, as the statements they stand for.
     if (std.mem.eql(u8, cmd, "\\d") or std.mem.eql(u8, cmd, "\\dt")) {
         if (rest.len == 0) return msg.writeAll(if (std.mem.eql(u8, cmd, "\\d")) "usage: \\d <conn.table | 'file' | conn.QUERY($$...$$)>  — the same as DESCRIBE\n" else "usage: \\dt <conn[.schema]> [pattern]  — the same as SHOW TABLES FROM\n");
         var text = std.array_list.Managed(u8).init(sess.decls.gpa);
@@ -2050,8 +1918,6 @@ fn metaCommand(t: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
     try msg.print("error: unknown command `{s}` — \\help for help\n", .{cmd});
 }
 
-/// The formats a REPL session can print in. Arrow is left out: a binary stream in
-/// a terminal is noise, and `basalt run --format arrow` is the way to pipe one.
 fn parseReplFormat(name: []const u8) ?runtime.StdoutFormat {
     inline for (.{ runtime.StdoutFormat.table, .json, .csv, .tsv }) |f| {
         if (std.ascii.eqlIgnoreCase(name, @tagName(f))) return f;
@@ -2059,33 +1925,19 @@ fn parseReplFormat(name: []const u8) ?runtime.StdoutFormat {
     return null;
 }
 
-/// A declaration an entry makes, committed to the session once the entry parses.
 pub const Pending = struct { id: DeclId, text: []const u8 };
 
-/// An entry ready to run: the session's declarations as a prelude, the entry
-/// after them, parsed as one program.
 pub const Prepared = struct {
-    /// Prelude + entry: what the parser saw, and what diagnostics' lines count in.
     text: []const u8,
-    /// Where the entry starts in `text`.
     entry_at: usize,
     prog: ast.Program,
     pending: []const Pending,
-    /// Statements that do something beyond declaring.
     executable: usize,
 };
 
 pub const PrepareError = error{ ParseFailed, EndpointInSession, OutOfMemory };
 
-/// Parse one entry against the session's declarations. The entry is prefixed with
-/// the stored declarations so earlier connections/functions/params are in scope;
-/// nothing is committed here — the caller commits `pending` once it has decided
-/// the entry stands, so a typo can't poison the session. On `ParseFailed`,
-/// `diag` holds the position (in `Prepared.text` lines, or the included file's),
-/// and `text_out`, when given, the prelude + entry text those lines count in.
-/// The session's declarations, then `block`: the text an entry runs as, and
-/// where the entry starts in it. A declaration the entry makes again is left
-/// out of the prelude, so the text never declares one name twice.
+/// A declaration the entry makes again is left out of the prelude, so no name is declared twice.
 fn withPrelude(a: std.mem.Allocator, decls: *const DeclStore, pending: []const Pending, block: []const u8) !struct { text: []const u8, entry_at: usize } {
     var buf = std.array_list.Managed(u8).init(a);
     for (decls.items.items) |e| {
@@ -2102,8 +1954,6 @@ fn withPrelude(a: std.mem.Allocator, decls: *const DeclStore, pending: []const P
     return .{ .text = buf.items, .entry_at = entry_at };
 }
 
-/// `withPrelude` for a block not yet split into its declarations: what `check`
-/// reads a cell against, without touching the session.
 pub fn sessionText(a: std.mem.Allocator, decls: *const DeclStore, block: []const u8) !struct { text: []const u8, entry_at: usize } {
     var pending = std.array_list.Managed(Pending).init(a);
     for (try splitStatements(a, block)) |st| {
@@ -2113,6 +1963,9 @@ pub fn sessionText(a: std.mem.Allocator, decls: *const DeclStore, block: []const
     return .{ .text = j.text, .entry_at = j.entry_at };
 }
 
+/// Nothing is committed here: the caller commits `pending` once the entry stands, so a
+/// typo cannot poison the session. Statements are re-read from the parse, as a function
+/// body's `;`s fool the pre-scan, except under `@include`, whose positions are elsewhere.
 pub fn prepareEntry(a: std.mem.Allocator, decls: *const DeclStore, block: []const u8, diag: *include.Diag, text_out: ?*[]const u8) PrepareError!Prepared {
     var pending = std.array_list.Managed(Pending).init(a);
     var executable: usize = 0;
@@ -2130,20 +1983,11 @@ pub fn prepareEntry(a: std.mem.Allocator, decls: *const DeclStore, block: []cons
     const entry_at = joined.entry_at;
     if (text_out) |t| t.* = text;
 
-    // An entry may open with `@include 'p.sql';` (paths relative to the cwd): the
-    // file's text is parsed with the entry as one program, so its declarations are
-    // in scope for the statements typed below it. They live as long as the entry —
-    // the session keeps no include store.
     const prog = include.loadProgram(a, text, "<repl>", ".", diag) catch |e| switch (e) {
         error.ParseFailed => return error.ParseFailed,
         error.OutOfMemory => return error.OutOfMemory,
     };
 
-    // The entry's statements as the parser saw them. The pre-scan above only knows
-    // first words and top-level `;`s, and a statement function's body has `;`s of
-    // its own — it would be cut into a truncated declaration and stray fragments.
-    // An `@include` puts other files' positions in the program, so it keeps the
-    // pre-scan's reading.
     if (std.mem.indexOf(u8, block, "@include") == null) {
         const parsed = try entryStatements(a, text, entry_at, prog);
         pending.clearRetainingCapacity();
@@ -2155,11 +1999,6 @@ pub fn prepareEntry(a: std.mem.Allocator, decls: *const DeclStore, block: []cons
     return .{ .text = text, .entry_at = entry_at, .prog = prog, .pending = pending.items, .executable = executable };
 }
 
-/// The `LET` values a run decided, kept as literal declarations: a session
-/// replays its declarations ahead of every later entry, and replaying
-/// `LET t = now()` or `LET n = (SELECT count(*) ...)` would give each entry a
-/// value of its own — a different instant, a re-run query — where the entry
-/// that declared it saw one.
 pub const LetFreezer = struct {
     arena: std.mem.Allocator,
     frozen: std.array_list.Managed(Frozen),
@@ -2182,8 +2021,6 @@ pub const LetFreezer = struct {
         self.frozen.append(.{ .name = n, .text = text }) catch {};
     }
 
-    /// Replace each LET's stored text with its value. A LET the session does not
-    /// hold (none, today — every top-level LET is a declaration) is left alone.
     pub fn commit(self: *const LetFreezer, decls: *DeclStore) !void {
         for (self.frozen.items) |f| {
             for (decls.items.items) |e| {
@@ -2194,10 +2031,8 @@ pub const LetFreezer = struct {
     }
 };
 
-/// A SQL expression that folds back to exactly `v`, or null for a value with
-/// no literal form (bytes, nested), which then keeps its expression. Text the
-/// lexer has no literal for — a date, an exponent, the one int whose magnitude
-/// overflows — goes through a CAST from its printed form, which reads back exact.
+/// A SQL expression that folds back to exactly `v`, or null when there is no literal
+/// form. A date, an exponent or the one overflowing int goes through a CAST of its text.
 pub fn letLiteral(arena: std.mem.Allocator, v: Value) !?[]const u8 {
     return switch (v) {
         .null => "NULL",
@@ -2225,7 +2060,7 @@ pub fn letLiteral(arena: std.mem.Allocator, v: Value) !?[]const u8 {
     };
 }
 
-/// Parse and run one REPL entry, reporting errors without aborting the loop.
+/// Logs errors only, but not `quiet`, which would swallow the entry's own `PRINT`s.
 fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -2256,8 +2091,6 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *s
     for (pending) |p| try sess.decls.put(p.id, p.text);
 
     if (entry.executable == 0) {
-        // A LET's value is decided in the entry that declares it, not by the
-        // next one that happens to run something.
         for (pending) |p| if (p.id.kind == .let) {
             var freezer = LetFreezer.init(a);
             var rdiag: runtime.Diag = .{};
@@ -2281,10 +2114,6 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *s
 
     const prepared = try appendDisplaySinks(a, prog);
 
-    // An entry that *opens* with EXPLAIN carries the program-level prefix, which
-    // `basalt run` renders without executing; do the same here rather than silently
-    // running the query. EXPLAIN after anything else (including the session's own
-    // declaration prelude) is an ordinary statement the executor handles.
     if (prog.explain == .plan) {
         var adiag: analyze.Diag = .{};
         const plan = analyze.analyze(a, prepared, &adiag) catch |e| switch (e) {
@@ -2306,7 +2135,6 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *s
     defer freezer.commit(&sess.decls) catch {};
     _ = runtime.run(alloc, prepared, .{
         .on_let = freezer.hook(),
-        // Errors only, but not `quiet`: that would swallow the entry's own `PRINT`s.
         .log = .{ .summary = .none, .level = .err },
         .stdout_format = sess.format,
         .explain = prog.explain == .analyze,
@@ -2330,8 +2158,7 @@ fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg: *s
     }
 }
 
-/// Append a `write stdout` table sink to any output pipeline that doesn't already
-/// end in a `write`, so REPL entries show their results.
+/// Appends a `write stdout` table sink to any output pipeline not already ending in a `write`.
 pub fn appendDisplaySinks(arena: std.mem.Allocator, prog: ast.Program) !ast.Program {
     const stmts = try arena.alloc(ast.Stmt, prog.stmts.len);
     for (prog.stmts, 0..) |st, i| {
@@ -2351,8 +2178,6 @@ pub fn appendDisplaySinks(arena: std.mem.Allocator, prog: ast.Program) !ast.Prog
     return .{ .stmts = stmts };
 }
 
-/// `\clear`, `clear`, `cls`: clear the screen — what a person typing any of them
-/// means, so none of them may do anything else.
 fn isClear(t: []const u8) bool {
     inline for (.{ "\\clear", "\\cls", "clear", "cls" }) |k| {
         if (std.ascii.eqlIgnoreCase(t, k)) return true;
@@ -2433,8 +2258,6 @@ fn replHelp(msg: *std.Io.Writer) !void {
     );
 }
 
-/// Advance past a flag to its value argument; null (after printing the
-/// `missing value` error) when the flag is the last argument.
 fn nextVal(args: [][:0]u8, i: *usize, flag: []const u8, stderr: *std.Io.Writer) !?[]const u8 {
     i.* += 1;
     if (i.* >= args.len) {
@@ -2444,8 +2267,6 @@ fn nextVal(args: [][:0]u8, i: *usize, flag: []const u8, stderr: *std.Io.Writer) 
     return args[i.*];
 }
 
-/// Recognize the threads flag in all of `-j N`, `-jN`, `--threads N`,
-/// `--threads=N`, returning the value string (advancing `i` past a separate arg).
 fn threadFlagValue(a: []const u8, args: [][:0]u8, i: *usize) ?[]const u8 {
     if (std.mem.eql(u8, a, "-j") or std.mem.eql(u8, a, "--threads")) {
         if (i.* + 1 < args.len) {
@@ -2459,7 +2280,6 @@ fn threadFlagValue(a: []const u8, args: [][:0]u8, i: *usize) ?[]const u8 {
     return null;
 }
 
-/// Build a mutable argv ([][:0]u8) from string literals for flag-parsing tests.
 fn testArgv(arena: std.mem.Allocator, strs: []const []const u8) ![][:0]u8 {
     const out = try arena.alloc([:0]u8, strs.len);
     for (strs, 0..) |s, i| out[i] = try arena.dupeZ(u8, s);
@@ -2513,23 +2333,20 @@ test "endsComplete sees only statement-level semicolons" {
     try std.testing.expect(!endsComplete(""));
     try std.testing.expect(!endsComplete("SELECT 1"));
 
-    // a `;` inside a literal or a comment doesn't end the statement
     try std.testing.expect(!endsComplete("SELECT ';' AS x"));
     try std.testing.expect(endsComplete("SELECT ';' AS x;"));
-    try std.testing.expect(!endsComplete("SELECT 'it''s;")); // `''` escape, still open
+    try std.testing.expect(!endsComplete("SELECT 'it''s;"));
     try std.testing.expect(endsComplete("SELECT 'it''s;' AS x;"));
-    try std.testing.expect(!endsComplete("SELECT \"a\\\";")); // `\"` escape, still open
+    try std.testing.expect(!endsComplete("SELECT \"a\\\";"));
     try std.testing.expect(endsComplete("SELECT \"a;b\" AS x;"));
     try std.testing.expect(!endsComplete("SELECT 1 -- ;"));
     try std.testing.expect(!endsComplete("/* ; */"));
     try std.testing.expect(endsComplete("/* ; */ SELECT 1;"));
 
-    // dollar quotes, both anonymous and tagged
     try std.testing.expect(!endsComplete("FROM c.QUERY($$a;b$$)"));
     try std.testing.expect(endsComplete("FROM c.QUERY($$a;b$$);"));
     try std.testing.expect(!endsComplete("FROM c.QUERY($q$a;b$q$)"));
     try std.testing.expect(endsComplete("FROM c.QUERY($q$a;b$q$);"));
-    // `$name` is a param reference, not a quote opener
     try std.testing.expect(endsComplete("SELECT $since;"));
 }
 
@@ -2721,7 +2538,6 @@ test "every meta command the REPL handles is one Tab offers, and the other way r
             return error.TestUnexpectedResult;
         }
     }
-    // The reverse: each command `metaCommand` compares `cmd` against is offered.
     const body_start = std.mem.indexOf(u8, src, "\nfn metaCommand(").?;
     const body_end = std.mem.indexOfPos(u8, src, body_start + 1, "\nfn ").?;
     var it = std.mem.splitSequence(u8, src[body_start..body_end], "std.mem.eql(u8, cmd, \"\\\\");
@@ -2756,7 +2572,6 @@ test "suggestFor: a half-typed script's own declarations and a local file's colu
     defer catalog.deinit();
     const text = try std.fmt.allocPrint(a, "CREATE FUNCTION tax(x) AS x * 2;\nPARAM since DATE;\nSELECT ta FROM '{s}/t.csv' WHERE order_", .{dir});
     try declareFrom(&decls, a, text);
-    // offline: no connection is asked anything
     const cx = Completer{ .gpa = std.testing.allocator, .decls = &decls, .catalog = &catalog, .connect = false };
 
     const at_fn = std.mem.indexOf(u8, text, "SELECT ta").? + "SELECT ta".len;
@@ -2795,7 +2610,6 @@ test "an offer with no candidates still starts at the word being typed, not the 
     try std.testing.expectEqual(@as(usize, 0), gap.items.len);
     try std.testing.expectEqual(@as(usize, 7), gap.start);
 
-    // UTF-16 offsets too: `é` is two bytes, one unit.
     const wide = "SELECT 'é' FROM sal";
     const w = try suggestFor(a, &cx, wide, wide.len);
     var aw = std.Io.Writer.Allocating.init(a);
@@ -2899,16 +2713,15 @@ test "letLiteral: every value folds back to itself" {
         try std.testing.expectEqual(std.meta.activeTag(v), std.meta.activeTag(back));
         if (v != .null) try std.testing.expectEqual(std.math.Order.eq, eval.compareValues(v, back).?);
     }
-    // bytes have no literal: the LET keeps its expression
     try std.testing.expect((try letLiteral(a, .{ .bytes = "\x00" })) == null);
 }
 
 test "utf16 offsets: a JavaScript editor's positions map to bytes and back" {
-    const text = "SELECT 'é😀' AS x"; // é: 2 bytes, 1 unit; 😀: 4 bytes, 2 units
-    try std.testing.expectEqual(@as(usize, 8), utf16ToByte(text, 8)); // before é
-    try std.testing.expectEqual(@as(usize, 10), utf16ToByte(text, 9)); // after é
-    try std.testing.expectEqual(@as(usize, 10), utf16ToByte(text, 10)); // inside the pair: clamped
-    try std.testing.expectEqual(@as(usize, 14), utf16ToByte(text, 11)); // after 😀
+    const text = "SELECT 'é😀' AS x";
+    try std.testing.expectEqual(@as(usize, 8), utf16ToByte(text, 8));
+    try std.testing.expectEqual(@as(usize, 10), utf16ToByte(text, 9));
+    try std.testing.expectEqual(@as(usize, 10), utf16ToByte(text, 10));
+    try std.testing.expectEqual(@as(usize, 14), utf16ToByte(text, 11));
     try std.testing.expectEqual(text.len, utf16ToByte(text, 1000));
     for ([_]usize{ 0, 8, 10, 14, text.len }) |b| try std.testing.expectEqual(b, utf16ToByte(text, byteToUtf16(text, b)));
     try std.testing.expectEqual(@as(usize, 17), byteToUtf16(text, text.len));
@@ -2940,12 +2753,10 @@ test "checkText: every problem in script order, known tables typed or not, nothi
     try std.testing.expectEqual(@as(u32, 4), issues[2].pos.?.line);
     try std.testing.expect(std.mem.indexOf(u8, issues[2].msg, "`missing`") != null);
 
-    // not known: the name is the one problem on its line, and the rest still check
     const unknown = try checkText(a, "SELECT * FROM enrich;\nSELECT nope FROM RANGE(1);", "t.sql", ".", .{});
     try std.testing.expectEqual(@as(usize, 2), unknown.len);
     try std.testing.expect(std.mem.indexOf(u8, unknown[0].msg, "unknown source `enrich`") != null);
 
-    // a cell that only declares is whole when asked; a script, not
     try std.testing.expectEqual(@as(usize, 0), (try checkText(a, "PARAM n INT DEFAULT 1;", "t.sql", ".", .{ .declarations_only = true })).len);
     try std.testing.expectEqual(@as(usize, 1), (try checkText(a, "PARAM n INT DEFAULT 1;", "t.sql", ".", .{})).len);
 }

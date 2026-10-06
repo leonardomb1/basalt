@@ -1,15 +1,17 @@
 //! Token definitions for the DSL. The lexer is whitespace-insensitive (newlines
 //! are trivia); structure comes from `|`, commas, and leading keywords. Keywords
-//! are not distinguished here — they are plain `ident`s recognized contextually
-//! by the parser (so `filter` can be an operator or, in another position, a field).
+//! are not distinguished here: they are plain `ident`s recognized contextually by
+//! the parser, so `filter` can be an operator or, in another position, a field.
+//!
+//! `qident` is a double-quoted name, an ANSI SQL quoted identifier: `"Exchange
+//! rate"` names that column, never the string, and is never read as a keyword.
+//! `end_line`/`end_col` mark just past the token's last source byte, where an
+//! editor ends its underline; they are zero on a token made rather than lexed.
 
 const std = @import("std");
 
 pub const Tag = enum {
     ident,
-    /// A double-quoted name: ANSI SQL quoted identifier, so `"Exchange rate"`
-    /// refers to that column and never to the string. Kept distinct from `ident`
-    /// so a quoted word is never read as a keyword.
     qident,
     string,
     int,
@@ -33,7 +35,6 @@ pub const Tag = enum {
 
     assign,
     fat_arrow,
-    /// `->`: a lambda's parameter from its body, `t -> t LIKE 'vip%'`.
     arrow,
     eq,
     ne,
@@ -114,8 +115,6 @@ pub const Token = struct {
     text: []const u8,
     line: u32,
     col: u32,
-    /// Just past the token's last source byte — where an editor ends its
-    /// underline. Zero when the token was made rather than lexed.
     end_line: u32 = 0,
     end_col: u32 = 0,
 };

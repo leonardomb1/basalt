@@ -1,12 +1,47 @@
-//! Minimal CSV source and sink. The source reads a header row into an all-string
-//! schema (empty field = null) and produces batches of string columns; the sink
-//! writes a header then serializes each batch. RFC-ish quoting: fields containing
-//! the delimiter, a quote or a newline are double-quoted with `""` escaping.
+//! Minimal CSV source and sink. The source reads a header row and produces
+//! batches of columns typed by sniffing; the sink writes a header then
+//! serializes each batch. RFC 4180 quoting: fields containing the delimiter, a
+//! quote or a newline are double-quoted with `""` escaping, and a newline inside
+//! a quoted field belongs to the value. Only a quote at the start of a field
+//! opens one; a mid-field `"` (`12" pipe`) is data, since treating it as an
+//! opener once swallowed every following row. Unquoted empty is null and `""`
+//! is an empty string. A physical line is at most 64 KiB (`StreamTooLong`).
 //!
 //! The delimiter and the source encoding are a `Dialect`, because the CSV a
-//! government statistics office publishes is usually neither comma-separated nor
-//! UTF-8: the Brazilian securities regulator ships `;` and ISO-8859-1, and so
-//! does most of the EU.
+//! statistics office or regulator publishes is often `;`-separated latin-1.
+//! Only single-byte encodings exist, since a multi-byte one would break the
+//! parallel reader's byte-range chunking. Byte `b` of latin-1 is U+00`b`, so no
+//! byte sequence can hold a delimiter or newline. Files labelled latin-1 are
+//! often really cp1252, whose 0x80–0x9F block holds curly quotes, dashes and the
+//! euro sign (its five undefined slots decode to U+FFFD).
+//!
+//! Compression is chosen by suffix, and the inner name picks the format: gzip and
+//! zstd through `std.http.Decompress`, the same path HTTP `Content-Encoding`
+//! uses. No `.xz`: std's decoder still has the old reader shape and the files are
+//! rare. Concatenated gzip members (`pigz`, `bgzip`, appends) read as one stream,
+//! where std stops after the first. `data.zip :: member.csv` names a member of an
+//! archive (spaces optional); a bare `.zip` must hold exactly one member.
+//!
+//! Types are sniffed from the first `SAMPLE_ROWS` lines by the same rules in the
+//! serial and parallel readers, so both agree on a file's schema: int ⊂ float ⊂
+//! string, and a column of only `YYYY-MM-DD` cells is a DATE. A quoted cell is
+//! text, and a leading zero or `+` rules out int so "007" round-trips. A later
+//! cell that no longer parses as the inferred type is an error, not corruption.
+//! When a query reads only some columns, the rest are cut past, never parsed.
+//!
+//! A prefix read or a folder is one CSV: every later file must repeat the first
+//! one's header, or the read would splice mismatched columns, and sniffing goes
+//! on into the next file. `MappedCsv` maps a local, uncompressed, non-archive
+//! file once so workers parse disjoint newline-aligned chunks in parallel (the
+//! parse, not the read, is the bottleneck). A file with a newline inside a quoted
+//! field cannot be split, as no offset tells whether a newline is quoted, and
+//! falls back to the serial reader, as compressed and archived files do.
+//!
+//! The sink appends to a `.gz` by adding a gzip member. On failure a local file
+//! keeps the rows already flushed (a CSV has no transaction); an object is never
+//! committed, so its staged blocks or multipart upload stay invisible (`az://`
+//! reaps them after a week, `s3://` only with a lifecycle rule), and an SFTP
+//! `.part` is removed. Committing on close is what makes the object appear.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -24,22 +59,11 @@ const folder = @import("../connect/folder.zig");
 const deflate = @import("deflate.zig");
 
 const BATCH_ROWS = 1024;
-/// Reader/writer buffer size; also the max CSV line length (a line longer than
-/// this yields `error.StreamTooLong`).
 const LINE_BUF = 64 * 1024;
 
-/// How a file's bytes map to text. Only single-byte encodings are here: a
-/// multi-byte one would break the byte-range chunking the parallel reader depends
-/// on, and would need a decoder that spans chunk boundaries.
 pub const Encoding = enum {
     utf8,
-    /// ISO-8859-1. Byte `b` is codepoint U+00`b`, so decoding is a table-free
-    /// widening and no byte sequence can contain a delimiter or a newline.
     latin1,
-    /// Windows-1252. Latin-1 except for 0x80–0x9F, where it puts the curly
-    /// quotes, the dashes and the euro sign. Files labelled latin-1 are very
-    /// often really this, and decoding one as latin-1 turns a quote into a
-    /// control character rather than failing.
     cp1252,
 
     pub fn parse(s: []const u8) ?Encoding {
@@ -68,8 +92,6 @@ pub const Encoding = enum {
     }
 };
 
-/// The 0x80–0x9F block of Windows-1252 as codepoints; 0 marks the five slots that
-/// are undefined, which decode to U+FFFD rather than being invented.
 const cp1252_high = [32]u21{
     0x20AC, 0,      0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
     0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0,      0x017D, 0,
@@ -77,15 +99,8 @@ const cp1252_high = [32]u21{
     0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0,      0x017E, 0x0178,
 };
 
-/// A single-stream compression suffix. Only the ones Zig's std decompresses into a
-/// `*std.Io.Reader`: gzip and zstd via `std.http.Decompress`, which is the same
-/// mechanism this reader already uses for HTTP `Content-Encoding`. `.xz` is absent
-/// deliberately — std's xz decoder is still the old `GenericReader` shape and would
-/// need an adapter, and `.csv.xz` is vanishingly rare in published data.
 pub const Codec = enum { none, gzip, zstd };
 
-/// Splits a trailing compression suffix off a path: `orders.csv.gz` is a gzip
-/// wrapping `orders.csv`, and it is the inner name that picks the format.
 pub fn splitCodec(path: []const u8) struct { codec: Codec, rest: []const u8 } {
     const bare = path[0 .. std.mem.indexOfAny(u8, path, "?#") orelse path.len];
     if (std.ascii.endsWithIgnoreCase(bare, ".gz")) return .{ .codec = .gzip, .rest = bare[0 .. bare.len - 3] };
@@ -95,16 +110,10 @@ pub fn splitCodec(path: []const u8) struct { codec: Codec, rest: []const u8 } {
     return .{ .codec = .none, .rest = bare };
 }
 
-/// A path naming a file inside an archive: `inf.zip :: inf_diario.csv`.
-///
-/// `::` is ClickHouse's separator for the same idea, and following it means the
-/// member's own name carries the extension that picks the reader. Whitespace around
-/// it is optional.
 pub const ArchiveRef = struct { archive: []const u8, member: ?[]const u8 };
 
 pub fn splitArchive(path: []const u8) ?ArchiveRef {
     const at = std.mem.indexOf(u8, path, "::") orelse {
-        // A bare `.zip` is still an archive; it just has to hold one member.
         if (isArchive(path)) return .{ .archive = path, .member = null };
         return null;
     };
@@ -119,19 +128,14 @@ pub fn isArchive(path: []const u8) bool {
     return std.ascii.endsWithIgnoreCase(bare, ".zip");
 }
 
-/// The name whose extension decides the format: the member inside an archive, with
-/// any compression suffix taken off.
 pub fn dataName(path: []const u8) []const u8 {
     const inner = if (splitArchive(path)) |a| (a.member orelse a.archive) else path;
     return splitCodec(inner).rest;
 }
 
-/// Buffer a decompressor needs, per codec.
-///
-/// Not `std.http.ContentEncoding.minBufferCapacity()`: that returns
-/// `zstd.default_window_len` alone, while `zstd.Decompress` asserts capacity for
-/// the window *plus* `block_size_max` and otherwise fails the stream with
-/// `OutputBufferUndersize`. A real 2.6 MB `.csv.zst` failed exactly that way.
+/// Not `ContentEncoding.minBufferCapacity()`, which gives zstd only its window:
+/// `zstd.Decompress` needs the window plus `block_size_max`, or fails the stream
+/// with `OutputBufferUndersize`, as a real 2.6 MB `.csv.zst` did.
 fn codecBuffer(codec: Codec) usize {
     return switch (codec) {
         .none => 0,
@@ -145,10 +149,8 @@ pub const Dialect = struct {
     encoding: Encoding = .utf8,
 };
 
-/// Re-encode one field as UTF-8. Returns the input untouched when the encoding is
-/// already UTF-8 or when every byte is ASCII — which is true of most fields even
-/// in a latin-1 file (the CVM registry's dates, CNPJs and codes are all ASCII), so
-/// the ordinary field costs one scan and no allocation.
+/// Returns the input untouched when already UTF-8 or all ASCII, as most fields of a
+/// latin-1 file are, so the ordinary field costs one scan and no allocation.
 fn decodeField(arena: std.mem.Allocator, enc: Encoding, s: []const u8) ![]const u8 {
     if (enc == .utf8) return s;
     var high = false;
@@ -158,7 +160,6 @@ fn decodeField(arena: std.mem.Allocator, enc: Encoding, s: []const u8) ![]const 
     };
     if (!high) return s;
 
-    // a byte becomes at most three: U+0080..U+FFFF, the replacement char included
     var out = try std.array_list.Managed(u8).initCapacity(arena, s.len * 3);
     var buf: [4]u8 = undefined;
     for (s) |c| {
@@ -181,9 +182,6 @@ fn decodeField(arena: std.mem.Allocator, enc: Encoding, s: []const u8) ![]const 
     return out.items;
 }
 
-/// gzip members one after another, read as one stream: `pigz`, `bgzip` and a
-/// `.csv.gz` appended to write several, and std's decompressor stops at the
-/// end of the first.
 const Gunzip = struct {
     src: *std.Io.Reader,
     dec: std.compress.flate.Decompress,
@@ -204,7 +202,6 @@ const Gunzip = struct {
         while (true) {
             return self.dec.reader.stream(w, limit) catch |e| switch (e) {
                 error.EndOfStream => {
-                    // another member follows, or the stream is done
                     _ = self.src.peekByte() catch |e2| return switch (e2) {
                         error.EndOfStream => error.EndOfStream,
                         error.ReadFailed => error.ReadFailed,
@@ -223,30 +220,18 @@ pub const CsvReader = struct {
     dialect: Dialect = .{},
     backend: Backend,
     read_buf: [LINE_BUF]u8 = undefined,
-    /// Line source, independent of where bytes come from: points at the file
-    /// reader's interface or the HTTP response body reader.
     rdr: *std.Io.Reader = undefined,
     schema: types.Schema,
     pending: []const []const u8 = &.{},
     pending_i: usize = 0,
     stream_eof: bool = false,
     done: bool = false,
-    /// Remaining `az://`/`s3://` object URLs of a prefix read, in listing order.
-    /// Empty for a single object.
     rest_urls: []const []const u8 = &.{},
-    /// Header line of the first blob; later blobs must match it, or the read
-    /// would silently splice mismatched columns together.
     header_line: []const u8 = "",
-    /// Scratch for a record that spans physical lines (quoted newline). Reused,
-    /// so it costs one allocation of the longest such record, not one per row.
     join_buf: std.array_list.Managed(u8) = undefined,
-    /// Set when the path carried a compression suffix; holds the decompressor the
-    /// line reader pulls through. Must not move once `rdr` points into it.
     codec_state: std.http.Decompress = undefined,
     gunzip: Gunzip = undefined,
-    /// The decompressor's buffers, allocated once and reused for each file of a folder.
     codec_bufs: ?CodecBufs = null,
-    /// The file columns kept, when the query reads only some (`project`).
     slot: ?[]const i16 = null,
 
     const CodecBufs = struct { window: []u8, buf: []u8 };
@@ -254,20 +239,14 @@ pub const CsvReader = struct {
     const Backend = union(enum) {
         file: FileBackend,
         http: *HttpFetch,
-        /// A member of a zip, local or fetched by range, already inflating.
         member: *zipsrc.Member,
-        /// A file on an SFTP server, streamed.
         sftp: *sftp.Stream,
-        /// A file on an SMB share, streamed.
         smb: *smb.Stream,
     };
     const FileBackend = struct {
         file: std.fs.File,
         fr: std.fs.File.Reader,
     };
-    /// The live HTTP request whose body the reader streams from. Separate
-    /// allocation: Request/Response hold internal pointers, so they are built
-    /// in place here and never moved.
     const HttpFetch = struct {
         client: std.http.Client,
         req: std.http.Client.Request,
@@ -277,15 +256,12 @@ pub const CsvReader = struct {
         transfer_buf: [LINE_BUF]u8 = undefined,
     };
 
-    /// Convert only the columns `names` lists; the schema becomes those, in file
-    /// order. Before the first `next`.
     pub fn project(self: *CsvReader, names: []const []const u8) !void {
         const p = (try Projection.of(self.arena, self.schema, names)) orelse return;
         self.slot = p.slot;
         self.schema = p.schema;
     }
 
-    /// Put the decompressor `codec` needs between the file's bytes and the line reader.
     fn decodeAs(self: *CsvReader, codec: Codec) !void {
         switch (codec) {
             .none => {},
@@ -330,7 +306,6 @@ pub const CsvReader = struct {
         return self.openFirst(path);
     }
 
-    /// The files of a folder, read as one CSV: the rest must repeat the first's header.
     pub fn openList(arena: std.mem.Allocator, files: []const []const u8, dialect: Dialect) !*CsvReader {
         if (files.len == 0) return error.EmptyFolder;
         const self = try arena.create(CsvReader);
@@ -365,8 +340,6 @@ pub const CsvReader = struct {
             const hf = try arena.create(HttpFetch);
             hf.* = .{ .client = http_client.initClient(arena), .req = undefined, .response = undefined };
             errdefer hf.client.deinit();
-            // az:// and s3:// resolve to a real endpoint and carry a signature;
-            // plain http(s) URLs go out unsigned as before.
             var req_url = first;
             var extra: []const std.http.Header = &.{};
             if (objstore.isUrl(first)) {
@@ -390,8 +363,6 @@ pub const CsvReader = struct {
             self.backend = .{ .http = hf };
             const ce = hf.response.head.content_encoding;
             if (ce == .compress) return error.UnsupportedCompressionMethod;
-            // Sized here rather than from `minBufferCapacity`, which under-sizes
-            // zstd — see `codecBuffer`.
             const win = switch (ce) {
                 .zstd => codecBuffer(.zstd),
                 .gzip, .deflate => codecBuffer(.gzip),
@@ -405,9 +376,6 @@ pub const CsvReader = struct {
             self.rdr = &self.backend.file.fr.interface;
         }
 
-        // A compression suffix on the name wraps whatever the bytes came from —
-        // file, HTTP body or archive member — in the same decompressor the HTTP
-        // content-encoding path uses.
         try self.decodeAs(splitCodec(if (splitArchive(first)) |ar| (ar.member orelse ar.archive) else first).codec);
 
         const header = (try self.readLine()) orelse return error.EmptyCsv;
@@ -425,8 +393,6 @@ pub const CsvReader = struct {
         var pending = std.array_list.Managed([]const u8).init(arena);
         while (pending.items.len < SAMPLE_ROWS) {
             const line = (try self.readLine()) orelse {
-                // A prefix read keeps sniffing into the next blob; stopping here
-                // would both truncate the read and infer types from one file.
                 if (try self.advance()) continue;
                 self.stream_eof = true;
                 break;
@@ -464,7 +430,6 @@ pub const CsvReader = struct {
                     self.stream_eof = false;
                 }
                 line = (try self.readLine()) orelse blk: {
-                    // End of this blob — a prefix read continues into the next.
                     if (try self.advance()) break :blk (try self.readLine()) orelse {
                         self.done = true;
                         break;
@@ -484,8 +449,6 @@ pub const CsvReader = struct {
         return Batch{ .schema = &self.schema, .columns = cols, .len = rows };
     }
 
-    /// Opens the next blob of a prefix read and discards its header, which must
-    /// match the first blob's. Returns false when the listing is exhausted.
     fn advance(self: *CsvReader) !bool {
         if (self.rest_urls.len == 0) return false;
         const url = self.rest_urls[0];
@@ -523,7 +486,6 @@ pub const CsvReader = struct {
                 if (!std.mem.eql(u8, std.mem.trim(u8, hdr, " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
                 return true;
             },
-            // an archive member is one file, never a folder's
             .member => {},
         }
         const hf = try self.arena.create(HttpFetch);
@@ -571,10 +533,8 @@ pub const CsvReader = struct {
         hf.response = try hf.req.receiveHead(&hf.redirect_buf);
     }
 
-    /// One CSV record, which may span several physical lines: a newline inside a
-    /// quoted field belongs to the value. The common case (balanced quotes) is
-    /// the untouched zero-copy path; only a continued record is joined, into a
-    /// buffer reused across records so a long file does not grow the arena.
+    /// One record, which may span physical lines. Balanced quotes take the zero-copy
+    /// path; only a continued record is joined, into a buffer reused across records.
     fn readLine(self: *CsvReader) !?[]const u8 {
         const first = (try self.rdr.takeDelimiter('\n')) orelse return null;
         var s: []const u8 = first;
@@ -594,25 +554,15 @@ pub const CsvReader = struct {
     }
 };
 
-/// A local CSV file mapped into memory once, so N worker threads can parse disjoint
-/// newline-aligned byte ranges in parallel (the parse, not the read, is the CSV
-/// bottleneck). The mapping is shared read-only; each thread builds a `CsvSliceReader`
-/// over its chunk. Only for local files — not URLs.
 pub const MappedCsv = struct {
     data: []align(std.heap.page_size_min) const u8,
     body: []const u8,
     schema: types.Schema,
     file: std.fs.File,
-    /// True when some quoted field contains a newline. Chunk boundaries are
-    /// picked by seeking a newline from a byte offset, and whether that newline
-    /// is inside quotes cannot be known without scanning from the start of the
-    /// file — so callers must not split this file; they fall back to serial.
     quoted_newlines: bool = false,
     dialect: Dialect = .{},
-    /// The file columns kept, when the query reads only some (`project`).
     slot: ?[]const i16 = null,
 
-    /// Convert only the columns `names` lists; `schema` becomes those.
     pub fn project(self: *MappedCsv, arena: std.mem.Allocator, names: []const []const u8) !void {
         const p = (try Projection.of(arena, self.schema, names)) orelse return;
         self.slot = p.slot;
@@ -620,10 +570,6 @@ pub const MappedCsv = struct {
     }
 
     pub fn open(arena: std.mem.Allocator, path: []const u8, dialect: Dialect) !*MappedCsv {
-        // Chunking picks boundaries by seeking a newline from a byte offset, which
-        // needs the plain bytes on disk. A compressed stream has no such mapping
-        // from offset to row, and an archive member is not the file itself — both
-        // belong on the serial reader, and the callers fall back on this error.
         if (splitCodec(path).codec != .none or splitArchive(path) != null) return error.NotMappable;
         const self = try arena.create(MappedCsv);
         const file = try std.fs.cwd().openFile(path, .{});
@@ -668,16 +614,15 @@ pub const MappedCsv = struct {
         return self;
     }
 
-    /// The i-th of `n` newline-aligned chunks of the body (whole lines only; a line
-    /// belongs to the chunk that contains its first byte). May be empty.
+    /// The i-th of `n` newline-aligned chunks of the body; a line belongs to the
+    /// chunk holding its first byte. May be empty.
     pub fn chunk(self: *const MappedCsv, i: usize, n: usize) []const u8 {
         const lo = self.lineStart(self.body.len * i / n);
         const hi = self.lineStart(self.body.len * (i + 1) / n);
         return self.body[lo..hi];
     }
 
-    /// Does any quoted field hold a newline? Skipped entirely when the file has
-    /// no quote at all (the common case), so the scan costs one `memchr`.
+    /// Skipped when the file has no quote at all, so the common case costs one `memchr`.
     fn hasQuotedNewline(body: []const u8, delim: u8) bool {
         if (std.mem.indexOfScalar(u8, body, '"') == null) return false;
         var in_q = false;
@@ -707,7 +652,6 @@ pub const MappedCsv = struct {
         return false;
     }
 
-    /// Smallest line-start offset >= `raw` (0, or just past a '\n').
     fn lineStart(self: *const MappedCsv, raw: usize) usize {
         if (raw == 0) return 0;
         if (raw >= self.body.len) return self.body.len;
@@ -722,14 +666,11 @@ pub const MappedCsv = struct {
     }
 };
 
-/// A `driver.Source` over an in-memory byte slice of whole CSV lines (one chunk of a
-/// `MappedCsv`). Shares the parent's schema; copies field bytes into the pull arena.
 pub const CsvSliceReader = struct {
     data: []const u8,
     pos: usize = 0,
     schema: *const types.Schema,
     dialect: Dialect = .{},
-    /// The file columns kept, when the query reads only some (`Projection`).
     slot: ?[]const i16 = null,
 
     pub fn next(self: *CsvSliceReader, arena: std.mem.Allocator) !?Batch {
@@ -773,15 +714,8 @@ fn sliceNext(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
 }
 fn sliceClose(_: *anyopaque) void {}
 
-/// Rows sampled for type inference. Both CSV readers sniff the same first
-/// SAMPLE_ROWS lines with the same rules, so the serial and mapped-parallel
-/// paths always agree on a file's schema.
 pub const SAMPLE_ROWS = 1024;
 
-/// Column type inference over sampled lines: int ⊂ float ⊂ string, and a column
-/// of nothing but `YYYY-MM-DD` cells is a DATE. Quoted cells force string
-/// (quotes mark text), empty cells only mark nullability, and a leading zero /
-/// '+' sign disqualifies int ("007" must round-trip verbatim).
 const TypeSniffer = struct {
     const ColState = struct { seen: bool = false, all_int: bool = true, all_float: bool = true, all_date: bool = true };
     cols: []ColState,
@@ -839,16 +773,11 @@ const TypeSniffer = struct {
 
     fn resolve(self: *const TypeSniffer, j: usize) types.Type {
         const c = self.cols[j];
-        // A number never parses as a date and a date never as a number, so the
-        // order here only matters for an unseen column, which stays string.
         const k: types.TypeKind = if (!c.seen) .string else if (c.all_int) .int else if (c.all_float) .float else if (c.all_date) .date else .string;
         return types.Type.init(k).asNullable();
     }
 };
 
-/// Append one decoded cell per the builder's column type. Unquoted empty is
-/// null; quoted "" is an empty string. A cell beyond the sample that no longer
-/// parses as the inferred type is a hard error rather than silent corruption.
 fn appendCell(b: *column.Builder, raw: []const u8, quoted: bool) !void {
     if (raw.len == 0) return b.append(if (quoted and b.ty.kind == .string) Value{ .string = raw } else .null);
     switch (b.ty.kind) {
@@ -859,9 +788,8 @@ fn appendCell(b: *column.Builder, raw: []const u8, quoted: bool) !void {
     }
 }
 
-/// `[-]digits`, at most 18 of them, which cannot overflow an i64: the whole
-/// of what `std.fmt.parseInt` does that a CSV cell needs, without the base
-/// prefix, underscore and sign handling it pays for per call. Else null.
+/// `[-]digits`, at most 18 of them so no i64 overflow: what a CSV cell needs of
+/// `std.fmt.parseInt`, without its per-call base, underscore and sign handling.
 fn parseIntFast(s: []const u8) ?i64 {
     if (s.len == 0 or s.len > 19) return null;
     var i: usize = 0;
@@ -886,11 +814,9 @@ test "parseIntFast agrees with std and declines what it cannot prove" {
     }
 }
 
-/// The plain decimal most CSV floats are — `[-]digits[.digits]`, no exponent,
-/// at most 15 significant digits and 22 fractional — read as an integer
-/// mantissa divided by a power of ten. Both are exact doubles, so the one
-/// division rounds correctly (Clinger's fast path) and the answer is what
-/// `std.fmt.parseFloat` gives, at a fraction of its cost. Anything else: null.
+/// `[-]digits[.digits]` with at most 15 significant digits, as an integer mantissa
+/// over a power of ten: both exact doubles, so one division rounds correctly
+/// (Clinger's fast path) and matches `std.fmt.parseFloat`. Anything else is null.
 fn parseFloatFast(s: []const u8) ?f64 {
     if (s.len == 0 or s.len > 18) return null;
     var i: usize = 0;
@@ -928,16 +854,10 @@ test "parseFloatFast agrees with std on plain decimals and declines the rest" {
     }
 }
 
-/// One CSV record starting at `data[start]`, plus where the next one begins.
-///
-/// A `\n` inside a quoted field is part of the value (RFC 4180) — `splitInto`
-/// has always honored quotes when cutting FIELDS, but records used to be cut on
-/// the first raw newline, which split such a row in half. basalt's own CSV
-/// writer quotes embedded newlines, so it emitted files it could not read back.
+/// One record from `data[start]` and where the next begins. Records were once cut
+/// on the first raw newline, so basalt could not read back its own quoted newlines.
+/// A quoteless line ends at the next newline, found by two SIMD scans.
 fn scanRecord(data: []const u8, start: usize, delim: u8) struct { line: []const u8, next: usize } {
-    // Fast path: the next newline ends the record unless a quote precedes it.
-    // Two SIMD scans instead of the byte walk below, which is what every
-    // quoteless line — nearly all of them — used to pay per byte.
     if (std.mem.indexOfScalarPos(u8, data, start, '\n')) |nl| {
         if (std.mem.indexOfScalar(u8, data[start..nl], '"') == null) {
             var end = nl;
@@ -951,9 +871,6 @@ fn scanRecord(data: []const u8, start: usize, delim: u8) struct { line: []const 
     while (i < data.len) : (i += 1) {
         const c = data[i];
         if (c == '"') {
-            // Only a quote at the START of a field opens one — `splitInto` cuts
-            // fields by that same rule. A bare `"` in the middle (`12" pipe`) is
-            // data, and treating it as an opener swallowed every following row.
             if (in_q) {
                 if (i + 1 < data.len and data[i + 1] == '"') {
                     i += 1;
@@ -979,12 +896,9 @@ fn scanRecord(data: []const u8, start: usize, delim: u8) struct { line: []const 
     return .{ .line = data[start..end], .next = data.len };
 }
 
-/// Whether `line` leaves a quoted field open — i.e. the record continues on the
-/// next physical line. `""` contributes two, so plain parity is the quote state.
+/// Whether a quoted field is left open. `""` counts two, so parity is the state;
+/// a quoteless line is one SIMD scan (a byte walk capped the parse at ~75 MB/s).
 fn quotesOpen(line: []const u8, delim: u8) bool {
-    // No quote anywhere — nearly every line — is one SIMD scan; the byte walk
-    // below only runs on a line that has one. Walking every byte of every line
-    // here made the serial parse byte-bound at ~75 MB/s whatever the columns.
     const first_q = std.mem.indexOfScalar(u8, line, '"') orelse return false;
     var in_q = false;
     var at_field = first_q == 0 or line[first_q - 1] == delim;
@@ -1009,15 +923,12 @@ fn quotesOpen(line: []const u8, delim: u8) bool {
     return in_q;
 }
 
-/// The columns a read converts, for a query that names only some: `slot[i]`
-/// is the builder field `i` of a line goes to, or -1 for a column nothing
-/// reads — cut past, never parsed. The schema is the kept columns, in file order.
 pub const Projection = struct {
     slot: []const i16,
     schema: types.Schema,
 
-    /// Null when every column is wanted. A query naming none of them (a
-    /// `COUNT(*)`) keeps the first, as a batch still needs a column to count.
+    /// Null when every column is wanted. A query naming none (a `COUNT(*)`) keeps the
+    /// first, as a batch still needs a column to count.
     pub fn of(arena: std.mem.Allocator, full: types.Schema, names: []const []const u8) !?Projection {
         const slot = try arena.alloc(i16, full.fields.len);
         var fields = std.array_list.Managed(types.Schema.Field).init(arena);
@@ -1038,11 +949,11 @@ pub const Projection = struct {
     }
 };
 
-/// Cut `line` into its fields and append the ones `slot` keeps (all when null)
-/// to `builders`. Missing trailing fields are null; extra ones are ignored.
+/// Missing trailing fields are null; extra ones are ignored. A quoted field with no
+/// `""` is a slice of the line. Text after a closing quote stays in the field up to
+/// the delimiter: ending at the quote once silently shifted a row's values by one.
 fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Builder, d: Dialect, slot: ?[]const i16) !void {
     const ncols = if (slot) |sl| sl.len else builders.len;
-    // no quote anywhere — nearly every line — is cut on a delimiter bitmask
     if (std.mem.indexOfScalar(u8, line, '"') == null) return splitPlain(arena, line, builders, d, slot, ncols);
     var i: usize = 0;
     var col: usize = 0;
@@ -1050,9 +961,6 @@ fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Buil
         const dest: ?*column.Builder = if (slot) |sl| (if (sl[col] >= 0) &builders[@intCast(sl[col])] else null) else &builders[col];
         if (i < line.len and line[i] == '"') {
             i += 1;
-            // The common quoted field has no `""` inside and ends right at the
-            // delimiter: it is a slice of the line, no copy. Only an escaped
-            // quote, or text trailing the closing quote, goes through a buffer.
             const start = i;
             var buf: ?std.array_list.Managed(u8) = null;
             while (i < line.len) {
@@ -1071,15 +979,8 @@ fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Buil
                 }
                 break;
             }
-            const end = i; // the closing quote (or end of line)
+            const end = i;
             if (i < line.len) i += 1;
-            // Text between the closing quote and the delimiter, as in the CVM
-            // registry's `"1" é calculado de acordo com…`: a field that opens
-            // quoted and then continues unquoted. RFC 4180 leaves it undefined and
-            // it is plainly a publishing mistake, but ending the field at the quote
-            // made the remainder look like the next column — one such row shifted
-            // its last 19 values by one and dropped the final one, silently. Keep
-            // reading to the delimiter, which is where the field visibly ends.
             const tail_end = std.mem.indexOfScalarPos(u8, line, i, d.delim) orelse line.len;
             if (tail_end > i and dest != null) {
                 if (buf == null) {
@@ -1103,8 +1004,7 @@ fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Buil
     }
 }
 
-/// A quoteless line: its delimiters found 32 bytes at a time, as a bitmask
-/// walked lowest bit first, instead of a search per field.
+/// A quoteless line, its delimiters found 32 bytes at a time as a walked bitmask.
 fn splitPlain(arena: std.mem.Allocator, line: []const u8, builders: []column.Builder, d: Dialect, slot: ?[]const i16, ncols: usize) !void {
     const V = 32;
     const Vec = @Vector(V, u8);
@@ -1170,13 +1070,9 @@ pub const CsvWriter = struct {
     dialect: Dialect = .{},
     write_buf: [LINE_BUF]u8 = undefined,
     fw: std.fs.File.Writer = undefined,
-    /// False for stdout, which is the process's to close, not the sink's.
     owns_file: bool = true,
-    /// A `.gz` target: rows go through this, which writes to the backend.
     gz: ?*deflate.Gzip = null,
 
-    /// A local file, or an object staged over HTTP. Both expose a plain
-    /// `*std.Io.Writer`, so row formatting below is identical either way.
     const Backend = union(enum) {
         file: std.fs.File,
         object: objstore.Writer,
@@ -1203,19 +1099,16 @@ pub const CsvWriter = struct {
         };
     }
 
-    /// `.append` opens the file without truncating and resumes at its end,
-    /// emitting the header only when there was nothing there — appending to a
-    /// populated CSV must not splice a second header into the rows. A block blob
-    /// is committed whole rather than extended, so it takes `.truncate` only.
+    /// `.append` resumes at the file's end and writes the header only to an empty file,
+    /// so a second header never lands among the rows. Objects, SFTP and SMB are written
+    /// whole (through a `.part`), so they cannot append.
     pub fn open(arena: std.mem.Allocator, path: []const u8, schema: types.Schema, mode: driver.FileMode, dialect: Dialect) !*CsvWriter {
         const self = try arena.create(CsvWriter);
         var header = true;
         if (sftp.isUrl(path)) {
-            // written whole through a `.part`, so there is nothing to extend
             if (mode == .append) return error.AppendNotSupported;
             self.* = .{ .backend = .{ .object = objstore.writer(try sftp.Upload.open(arena, path)) } };
         } else if (smb.isUrl(path)) {
-            // written whole through a `.part`, as on SFTP
             if (mode == .append) return error.AppendNotSupported;
             self.* = .{ .backend = .{ .object = objstore.writer(try smb.Upload.open(arena, path)) } };
         } else if (objstore.isUrl(path)) {
@@ -1234,15 +1127,12 @@ pub const CsvWriter = struct {
             }
         }
 
-        // a .gz name is compressed; appending adds a gzip member, which readers
-        // take as the continuation of the stream
         switch (splitCodec(path).codec) {
             .none => {},
             .gzip => self.gz = try deflate.Gzip.init(std.heap.page_allocator, self.raw()),
             .zstd => return error.ZstdWriteUnsupported,
         }
 
-        // Set before the header is written, which is the writer's first output.
         self.dialect = dialect;
         if (header) {
             const w = self.out();
@@ -1255,15 +1145,12 @@ pub const CsvWriter = struct {
         return self;
     }
 
-    /// `--format csv|tsv`: the same rows and quoting a `.csv` sink gets, on stdout.
-    /// Streamed per batch, header first, and nothing else — no footer, no summary.
     pub fn openStdout(arena: std.mem.Allocator, schema: types.Schema, dialect: Dialect) !*CsvWriter {
         return openBorrowed(arena, std.fs.File.stdout(), schema, dialect);
     }
 
-    /// Write to a file someone else owns: it is left open on `close`, and written
-    /// from wherever it currently stands — streaming, so that a second writer on
-    /// the same file carries on after the first instead of starting over at 0.
+    /// Writes to a file someone else owns: left open on `close`, and written from
+    /// where it stands, so a second writer carries on after the first.
     pub fn openBorrowed(arena: std.mem.Allocator, file: std.fs.File, schema: types.Schema, dialect: Dialect) !*CsvWriter {
         const self = try arena.create(CsvWriter);
         self.* = .{ .backend = .{ .file = file }, .owns_file = false, .dialect = dialect };
@@ -1285,32 +1172,20 @@ pub const CsvWriter = struct {
         return self.renderRows(self.out(), arena, batch);
     }
 
-    /// Format `batch` into `w`. Split out from `writeRows` so a parallel lane can
-    /// render into its own buffer and hold the shared sink's lock only for the
-    /// append — see `driver.Sink.VTable.renderBatch`.
+    /// Split from `writeRows` so a parallel lane renders into its own buffer and holds
+    /// the shared sink's lock only for the append (`driver.Sink.VTable.renderBatch`).
     fn renderRows(self: *CsvWriter, w: *std.Io.Writer, arena: std.mem.Allocator, batch: Batch) !void {
         const d = self.dialect.delim;
-        // Whether a number or timestamp could need quoting under this dialect —
-        // constant for the whole run, so it is decided once rather than per field.
         const quote_scalars = scalarCanNeedQuote(d);
         var r: usize = 0;
         while (r < batch.len) : (r += 1) {
             for (batch.columns, 0..) |*col, i| {
                 if (i > 0) try w.writeByte(d);
                 switch (col.ty.kind) {
-                    // Text columns already hold their bytes: read straight out of
-                    // the Arrow buffers rather than boxing into a `Value` only for
-                    // `valueToString` to switch back out and hand back the slice.
                     .string, .bytes => if (col.validity.get(r)) try writeField(w, col.data.bytes.at(r), d),
                     else => {
                         if (!col.validity.get(r)) continue;
                         const v = col.getValue(r);
-                        // The common case: a number or timestamp cannot contain this
-                        // delimiter, a quote or a newline, so it needs no quoting and
-                        // no scan to discover that — it goes straight into the output
-                        // buffer. `valueToString` would allocate a string per field,
-                        // which on a 6M-row move is tens of millions of allocations
-                        // whose only purpose is to be copied once and dropped.
                         if (quote_scalars) {
                             try writeField(w, try eval.valueToString(arena, v), d);
                         } else {
@@ -1323,13 +1198,8 @@ pub const CsvWriter = struct {
         }
     }
 
-    /// Rows as bytes, allocated from the caller's arena. One allocation per batch,
-    /// versus one per field before the numeric fast path landed.
     pub fn renderBatch(self: *CsvWriter, arena: std.mem.Allocator, batch: Batch) ![]const u8 {
         var aw = std.Io.Writer.Allocating.init(arena);
-        // One row of a typical schema is a few dozen bytes; sizing up front keeps the
-        // growth out of the per-batch path. The arena is the lane's, so this is freed
-        // wholesale when the lane resets it.
         try aw.ensureUnusedCapacity(batch.len * 64 + 64);
         self.renderRows(&aw.writer, arena, batch) catch |e| return self.specific(e);
         return aw.writer.buffered();
@@ -1352,15 +1222,10 @@ pub const CsvWriter = struct {
                 try self.fw.interface.flush();
                 if (self.owns_file) f.close();
             },
-            // Committing the staged upload is what makes the object appear.
             .object => |o| o.finish() catch |e| return self.specific(e),
         }
     }
 
-    /// Failure path. For a file, rows already flushed stay on disk (a CSV has no
-    /// transaction to roll back). For a blob, skipping the block-list commit is
-    /// the rollback: staged blocks never become a readable object, and Azure
-    /// discards them after a week — so a failed run leaves nothing behind.
     pub fn abort(self: *CsvWriter) void {
         if (self.gz) |g| {
             g.deinit(std.heap.page_allocator);
@@ -1368,9 +1233,6 @@ pub const CsvWriter = struct {
         }
         switch (self.backend) {
             .file => |f| if (self.owns_file) f.close(),
-            // Staged blocks and an uncompleted multipart upload are invisible to
-            // readers. Azure reaps them after a week; S3 only where the bucket has
-            // a lifecycle rule. An SFTP `.part` is removed.
             .object => |o| o.abort(),
         }
     }
@@ -1408,13 +1270,8 @@ fn sinkAbort(ptr: *anyopaque) void {
     self.abort();
 }
 
-/// Could a number or timestamp rendering ever need CSV quoting under this delimiter?
-///
-/// `valueToString`/`writeValue` render non-text values using only digits and
-/// `+-.:eE ` (the space appears in a timestamp), so with an ordinary delimiter — `,`
-/// `;` tab `|` — the answer is no and the quote scan can be skipped entirely. A
-/// pathological delimiter like `.` or `-` would collide, and those take the same
-/// quoted path text does.
+/// Numbers and timestamps render with only digits and `+-.:eE `, so under an
+/// ordinary delimiter they skip the quote scan; a `.` or `-` delimiter cannot.
 fn scalarCanNeedQuote(delim: u8) bool {
     return switch (delim) {
         '0'...'9', '+', '-', '.', ':', 'e', 'E', ' ', '"', '\n', '\r' => true,
@@ -1435,9 +1292,8 @@ pub fn writeField(w: anytype, s: []const u8, delim: u8) !void {
     }
 }
 
-/// An empty value must be quoted. Only the writer knows it is a string rather
-/// than a null — unquoted empty is how the reader spells null — so emitting it
-/// bare turned `""` into NULL on the next read.
+/// An empty string is quoted, since unquoted empty is how the reader spells null;
+/// emitting it bare once turned `""` into NULL on the next read.
 fn needsQuote(s: []const u8, delim: u8) bool {
     if (s.len == 0) return true;
     for (s) |c| {
@@ -1446,7 +1302,6 @@ fn needsQuote(s: []const u8, delim: u8) bool {
     return false;
 }
 
-/// Accept one connection, swallow the request, write a canned HTTP response.
 fn serveOnce(listener: *std.net.Server, status_line: []const u8, body: []const u8) void {
     serveOnceInner(listener, status_line, body) catch {};
 }
@@ -1516,9 +1371,6 @@ test "CsvReader maps http status: 4xx permanent, 5xx transient" {
     }
 }
 
-/// Parse `data` (whole CSV lines, no header) as `ncols` string columns and
-/// return the one resulting batch — the pure-parsing entry shared by every
-/// reader backend (`splitInto` under a `CsvSliceReader`).
 pub fn parseSlice(a: std.mem.Allocator, schema: *const types.Schema, data: []const u8) !Batch {
     var r = CsvSliceReader{ .data = data, .schema = schema };
     return (try r.next(a)).?;
@@ -1593,9 +1445,6 @@ test "an empty string survives a write/read round-trip and stays distinct from n
     const a = ar.allocator();
     const schema = try stringSchema(a, &.{ "a", "b" });
 
-    // The writer emits nothing for a null and `""` for an empty string; reading
-    // that back has to reproduce exactly that distinction. Emitting the empty
-    // string bare made every one of them come back as NULL.
     var line = std.array_list.Managed(u8).init(a);
     try writeField(line.writer(), "", ',');
     try line.append(',');
@@ -1640,8 +1489,6 @@ test "TypeSniffer: int/float promotion, leading zeros and quoted cells force str
 test "TypeSniffer: cells split on the dialect's delimiter, not always a comma" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
-    // A `;` file sniffed on `,` saw one text column and left the rest unseen, so
-    // every column came out string and SUM over a numeric one failed its cast.
     var s = try TypeSniffer.init(ar.allocator(), 4, ';');
     s.feed("2026-07-01;1140469.50;1;1,5");
     s.feed("2026-07-02;0.00;12;2,25");
@@ -1744,7 +1591,6 @@ test "splitCodec / splitArchive / dataName walk the container chain" {
     try std.testing.expectEqualStrings("a/orders.csv", splitCodec("a/orders.csv.gz").rest);
     try std.testing.expectEqual(Codec.zstd, splitCodec("x.csv.ZST").codec);
     try std.testing.expectEqual(Codec.none, splitCodec("x.csv").codec);
-    // A query string is not part of the name.
     try std.testing.expectEqual(Codec.gzip, splitCodec("https://h/x.csv.gz?sig=1").codec);
 
     try std.testing.expect(splitArchive("plain.csv") == null);
@@ -1754,14 +1600,11 @@ test "splitCodec / splitArchive / dataName walk the container chain" {
     const two = splitArchive("d/inf.zip :: inner/data.csv").?;
     try std.testing.expectEqualStrings("d/inf.zip", two.archive);
     try std.testing.expectEqualStrings("inner/data.csv", two.member.?);
-    // No spaces required.
     try std.testing.expectEqualStrings("a.csv", splitArchive("i.zip::a.csv").?.member.?);
 
-    // The innermost name is the one that carries the format.
     try std.testing.expectEqualStrings("inner/data.csv", dataName("d/inf.zip :: inner/data.csv"));
     try std.testing.expectEqualStrings("rows.csv", dataName("rows.csv.gz"));
     try std.testing.expectEqualStrings("m.csv", dataName("a.zip :: m.csv.gz"));
-    // An s3 URL is not mistaken for an archive reference despite its colons.
     try std.testing.expect(splitArchive("s3://bucket/key.csv") == null);
 }
 
@@ -1779,7 +1622,6 @@ test "csv reader: a gzip stream decompresses and types normally" {
     const r = try CsvReader.open(a, path, .{});
     defer r.close();
     try std.testing.expectEqual(@as(usize, 2), r.schema.fields.len);
-    // Type sniffing runs on the decompressed bytes, so `id` is still an int.
     try std.testing.expectEqual(types.TypeKind.int, r.schema.fields[0].ty.kind);
     const b = (try r.next(a)).?;
     try std.testing.expectEqual(@as(usize, 3), b.len);
@@ -1797,8 +1639,6 @@ test "csv reader: a zstd stream decompresses" {
     try tmp.dir.writeFile(.{ .sub_path = "rows.csv.zst", .data = fx_zst });
     const path = try tmp.dir.realpathAlloc(a, "rows.csv.zst");
 
-    // Regression: sized from `ContentEncoding.minBufferCapacity()` this failed with
-    // `OutputBufferUndersize`, because zstd needs the window plus a max block.
     const r = try CsvReader.open(a, path, .{});
     defer r.close();
     const b = (try r.next(a)).?;
@@ -1823,7 +1663,6 @@ test "csv reader: a zip member reads, and MappedCsv refuses both containers" {
     const b = (try r.next(a)).?;
     try std.testing.expectEqual(@as(usize, 2), b.len);
 
-    // Neither can be cut on byte offsets, so the parallel paths must fall back.
     try std.testing.expectError(error.NotMappable, MappedCsv.open(a, ref, .{}));
     try std.testing.expectError(error.NotMappable, MappedCsv.open(a, gpath, .{}));
     try std.testing.expectError(error.NotMappable, MappedCsv.open(a, zpath, .{}));
@@ -1845,21 +1684,14 @@ test "decodeField: latin-1 and cp1252 widen to UTF-8, ASCII is passed through" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    // Pure ASCII returns the very same slice — the no-allocation fast path.
     const ascii = "2020-10-27";
     try std.testing.expect((try decodeField(a, .latin1, ascii)).ptr == ascii.ptr);
-    // And UTF-8 is never touched whatever the bytes are.
     try std.testing.expect((try decodeField(a, .utf8, "\xC7\xC3")).len == 2);
 
-    // LIQUIDA<C7><C3>O in latin-1 is LIQUIDAÇÃO.
     try std.testing.expectEqualStrings("LIQUIDAÇÃO", try decodeField(a, .latin1, "LIQUIDA\xC7\xC3O"));
-    // 0x93/0x94 are undefined in latin-1 (C1 controls) but the curly quotes in
-    // cp1252, which is what a Windows-authored file actually means by them.
     try std.testing.expectEqualStrings("“hi”", try decodeField(a, .cp1252, "\x93hi\x94"));
     try std.testing.expectEqualStrings("€", try decodeField(a, .cp1252, "\x80"));
-    // An undefined cp1252 slot is replacement, not an invented codepoint.
     try std.testing.expectEqualStrings("\u{FFFD}", try decodeField(a, .cp1252, "\x81"));
-    // many widened bytes before ASCII: the output outgrows the input by more than a little
     try std.testing.expectEqualStrings("ção éáíóúâêô x", try decodeField(a, .latin1, "\xe7\xe3o \xe9\xe1\xed\xf3\xfa\xe2\xea\xf4 x"));
     try std.testing.expectEqualStrings("€€€€€€€€€€ ok", try decodeField(a, .cp1252, "\x80" ** 10 ++ " ok"));
 }
@@ -1871,7 +1703,6 @@ test "csv dialect: a semicolon latin-1 file reads as UTF-8 columns" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // Shaped like the CVM fund registry: `;` separated, ISO-8859-1, CRLF.
     try tmp.dir.writeFile(.{
         .sub_path = "cad.csv",
         .data = "SIT;DENOM\r\nLIQUIDA\xC7\xC3O;A\xC7\xD5ES\r\nCANCELADA;PLAIN\r\n",
@@ -1892,8 +1723,6 @@ test "csv dialect: a semicolon latin-1 file reads as UTF-8 columns" {
 }
 
 test "csv dialect: the same file read with the default dialect is one column" {
-    // Not a bug to fix, just the reason the option had to exist: a `;` file holds
-    // no commas, so the comma reader sees one field per row.
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1907,9 +1736,6 @@ test "csv dialect: the same file read with the default dialect is one column" {
 }
 
 test "csv: text after a closing quote stays in the field" {
-    // From the CVM registry: `"1" é calculado de acordo…`, a field that opens
-    // quoted and continues unquoted. Ending it at the quote made the remainder
-    // look like the next column, shifting every later value of the row.
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1922,7 +1748,6 @@ test "csv: text after a closing quote stays in the field" {
     const b = (try r.next(a)).?;
     try std.testing.expectEqual(@as(usize, 1), b.len);
     try std.testing.expectEqualStrings("2 and more", b.columns[1].data.bytes.at(0));
-    // The row's last column must still be its own value, not shifted.
     try std.testing.expectEqualStrings("3", b.columns[2].data.bytes.at(0));
 }
 
@@ -1938,7 +1763,6 @@ test "csv writer: the delimiter carries to the header, rows and quoting" {
     var names = [_][]const u8{ "x", "y" };
     const schema = try stringSchema(a, &names);
     const w = try CsvWriter.open(a, path, schema, .truncate, .{ .delim = ';' });
-    // A value holding the delimiter must be quoted; one holding a comma must not.
     const b = try parseSlice(a, &schema, "a;b,c\n");
     try w.writeBatch(a, b);
     try w.close();
@@ -1962,7 +1786,6 @@ test "csv writer on a borrowed file: header and rows only, tsv quotes a tab, the
     try w.writeBatch(a, try parseSlice(a, &schema, "plain,\"has\ttab\"\n\"a,b\",\n"));
     try w.close();
 
-    // Still open after `close`: the sink borrowed it.
     try file.writeAll("# still writable\n");
     const got = try tmp.dir.readFileAlloc(a, "o.tsv", 1 << 16);
     try std.testing.expectEqualStrings("x\ty\nplain\t\"has\ttab\"\na,b\t\n# still writable\n", got);
@@ -1992,8 +1815,6 @@ test "two borrowed-file writers in a row append: a second SELECT must not overwr
     try std.testing.expectEqualStrings("a\n1\nb\n2\n", got);
 }
 
-/// A schema with one field per (name, kind) pair, all nullable — for exercising the
-/// writer's typed paths, which `stringSchema` cannot reach.
 fn typedSchema(a: std.mem.Allocator, names: []const []const u8, kinds: []const types.TypeKind) !types.Schema {
     const fields = try a.alloc(types.Schema.Field, names.len);
     for (names, kinds, 0..) |n, k, i| fields[i] = .{ .name = n, .ty = types.Type.init(k).asNullable() };
@@ -2009,11 +1830,6 @@ test "csv writer: typed columns render without quoting, and nulls stay empty" {
     const base = try tmp.dir.realpathAlloc(a, ".");
     const path = try std.fs.path.join(a, &.{ base, "o.csv" });
 
-    // Numbers take the no-allocation path that formats straight into the output
-    // buffer. This pins the exact bytes it produces, including a null (bare empty,
-    // which is how the reader spells null) and a negative value. The kinds are the
-    // ones a CSV source can actually yield — `TypeSniffer` resolves int, float or
-    // string — while `eval`'s equivalence test covers date/time/decimal rendering.
     var names = [_][]const u8{ "i", "f", "s" };
     var kinds = [_]types.TypeKind{ .int, .float, .string };
     const schema = try typedSchema(a, &names, &kinds);
@@ -2031,10 +1847,6 @@ test "csv writer: a delimiter that collides with a number still round-trips" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    // The fast path skips the quote scan because an ordinary delimiter cannot occur
-    // in a number. These two can: `.` inside a float, `-` in front of a negative.
-    // Getting this wrong writes `2.5` as two fields under `delim = '.'` — a silently
-    // corrupt file that still parses.
     const cases = [_]struct { delim: u8, kinds: [2]types.TypeKind, csv: []const u8, want: []const u8 }{
         .{ .delim = '.', .kinds = .{ .float, .int }, .csv = "2.5,7\n", .want = "f.i\n\"2.5\".7\n" },
         .{ .delim = '-', .kinds = .{ .int, .int }, .csv = "-3,7\n", .want = "f-i\n\"-3\"-7\n" },
@@ -2049,7 +1861,6 @@ test "csv writer: a delimiter that collides with a number still round-trips" {
         var names = [_][]const u8{ "f", "i" };
         var kinds = c.kinds;
         const schema = try typedSchema(a, &names, &kinds);
-        // The input is comma-separated; only the *output* dialect is exotic.
         var in_names = [_][]const u8{ "f", "i" };
         const in_schema = try typedSchema(a, &in_names, &kinds);
         const b = try parseSlice(a, &in_schema, c.csv);
@@ -2061,8 +1872,6 @@ test "csv writer: a delimiter that collides with a number still round-trips" {
         const got = try tmp.dir.readFileAlloc(a, "o.csv", 1 << 16);
         try std.testing.expectEqualStrings(c.want, got);
 
-        // And a reader on the same dialect must see two fields, not three — the
-        // quoting has to survive the round trip, or the file is silently corrupt.
         var rd = CsvSliceReader{
             .data = got[std.mem.indexOfScalar(u8, got, '\n').? + 1 ..],
             .schema = &schema,
@@ -2083,9 +1892,6 @@ test "csv writer: renderBatch produces exactly what writeBatch writes" {
     defer tmp.cleanup();
     const base = try tmp.dir.realpathAlloc(a, ".");
 
-    // A parallel lane formats with `renderBatch` and appends with `writeRendered`,
-    // while a serial run calls `writeBatch`. If those two disagree, output silently
-    // depends on `-j`. Same schema, same rows, same dialect — assert the same bytes.
     var names = [_][]const u8{ "i", "f", "s" };
     var kinds = [_]types.TypeKind{ .int, .float, .string };
     const schema = try typedSchema(a, &names, &kinds);
@@ -2105,25 +1911,19 @@ test "csv writer: renderBatch produces exactly what writeBatch writes" {
     const got_direct = try tmp.dir.readFileAlloc(a, "direct.csv", 1 << 16);
     const got_staged = try tmp.dir.readFileAlloc(a, "staged.csv", 1 << 16);
     try std.testing.expectEqualStrings(got_direct, got_staged);
-    // And the rendered bytes are the rows alone — the header belongs to `open`.
     try std.testing.expectEqualStrings("1,2.5,ok\n-7,,\n0,-0.125,\"has,comma\"\n", bytes);
 
-    // The sink must advertise the capability, or the lane path silently never uses it.
     try std.testing.expect(ws.sink().canRender());
 }
 
 test "scalarCanNeedQuote: only a delimiter a number could contain forces the scan" {
-    // The ordinary delimiters, where the fast path applies.
     for ([_]u8{ ',', ';', '\t', '|', '#', '^' }) |d| try std.testing.expect(!scalarCanNeedQuote(d));
-    // Every character a number, decimal, date, time or timestamp rendering can emit.
     for ([_]u8{ '0', '9', '+', '-', '.', ':', 'e', 'E', ' ', '"', '\n', '\r' }) |d| {
         try std.testing.expect(scalarCanNeedQuote(d));
     }
 }
 
 test "scanRecord: a newline inside a quoted field stays in the value" {
-    // RFC 4180 allows it and basalt's own writer emits it, so cutting records on
-    // the first raw newline turned one row into several — silently.
     const data = "1,\"line A\nline B\"\n2,plain\n";
     const r1 = scanRecord(data, 0, ',');
     try std.testing.expectEqualStrings("1,\"line A\nline B\"", r1.line);
@@ -2131,11 +1931,9 @@ test "scanRecord: a newline inside a quoted field stays in the value" {
     try std.testing.expectEqualStrings("2,plain", r2.line);
     try std.testing.expectEqual(data.len, r2.next);
 
-    // An escaped `""` inside a quoted field does not end the quote.
     const esc = "a,\"he said \"\"hi\"\"\nand left\"\n";
     try std.testing.expectEqualStrings("a,\"he said \"\"hi\"\"\nand left\"", scanRecord(esc, 0, ',').line);
 
-    // CRLF is still trimmed, and an unterminated final record still returns.
     try std.testing.expectEqualStrings("x,y", scanRecord("x,y\r\n", 0, ',').line);
     try std.testing.expectEqualStrings("x,y", scanRecord("x,y", 0, ',').line);
 }
@@ -2144,7 +1942,6 @@ test "quotesOpen / hasQuotedNewline drive the continuation and split decisions" 
     try std.testing.expect(quotesOpen("1,\"line A", ','));
     try std.testing.expect(!quotesOpen("1,\"line A\"", ','));
     try std.testing.expect(!quotesOpen("plain,row", ','));
-    // `""` is an escaped quote: two marks, so the field is still closed.
     try std.testing.expect(!quotesOpen("a,\"he said \"\"hi\"\"\"", ','));
 
     try std.testing.expect(MappedCsv.hasQuotedNewline("1,\"a\nb\"\n", ','));
@@ -2182,7 +1979,6 @@ test "splitInto: delimiter bitmask across chunk edges, missing and extra fields,
     const S = types.Type.init(.string).asNullable();
     const I = types.Type.init(.int).asNullable();
 
-    // fields straddling the 32-byte chunk boundary, then a short line padded with nulls
     var bs = [_]column.Builder{ column.Builder.init(a, I), column.Builder.init(a, S), column.Builder.init(a, S), column.Builder.init(a, I) };
     try splitInto(a, "12345678901,abcdefghijklmnopqrstu,vwxyzABCDEFGHIJKLMNOP,42,extra,more", &bs, .{}, null);
     try splitInto(a, "7,x", &bs, .{}, null);
@@ -2200,7 +1996,6 @@ test "splitInto: delimiter bitmask across chunk edges, missing and extra fields,
     try std.testing.expect(c2.getValue(2).isNull());
     try std.testing.expectEqual(@as(i64, 9), c3.getValue(2).int);
 
-    // only the second and fourth columns converted, plain and quoted lines alike
     const full = types.Schema{ .fields = &.{ .{ .name = "a", .ty = I }, .{ .name = "b", .ty = S }, .{ .name = "c", .ty = S }, .{ .name = "d", .ty = I } } };
     const p = (try Projection.of(a, full, &.{ "d", "b" })).?;
     try std.testing.expectEqualStrings("b", p.schema.fields[0].name);

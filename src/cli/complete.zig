@@ -5,7 +5,8 @@
 //!
 //! What is offered, by where the cursor is:
 //!   - `\…` at the start of the entry: the meta commands;
-//!   - inside an unclosed `'…'`: a file path, asked of the caller;
+//!   - inside an unclosed `'…'`: a file path, asked of the caller, which replaces
+//!     from just after the opening quote;
 //!   - `$…`: params and LETs;
 //!   - `conn.…`: that connection's tables, `schema.table`; `x.…` otherwise: columns;
 //!   - a bare word: CTEs, connections, declared functions, the columns of the
@@ -13,22 +14,23 @@
 //!     spelled in the case of the prefix.
 //!
 //! A word is offered once: the first kind to claim it wins, so a column called
-//! `name` is not offered again as the keyword `name`.
+//! `name` is not offered again as the keyword `name`. A candidate's `detail` is
+//! what an editor shows beside it: a function's signature, or a column's type as
+//! its source names it (empty when unknown).
+//!
+//! `builtin_functions` and `meta_commands` list everything the engine and REPL
+//! answer to by name; `cli.zig`'s tests hold them to the engine's registries both
+//! ways, so a builtin added there cannot go missing from Tab.
 
 const std = @import("std");
 const hilite = @import("hilite.zig");
 
 pub const Kind = enum { meta, param, cte, connection, function, table, column, keyword, path };
 
-/// `detail` is what an editor shows beside the pick: a built-in function's
-/// signature, a column's type. Empty when there is nothing to add.
 pub const Candidate = struct { text: []const u8, kind: Kind, detail: []const u8 = "" };
 
-/// One connection's tables, as `schema.table`.
 pub const ConnTables = struct { conn: []const u8, tables: []const []const u8 };
 
-/// A column and its type as its source names it — the engine's type for a file,
-/// the database's `data_type` for a table; empty when unknown.
 pub const Column = struct { name: []const u8, type: []const u8 = "" };
 
 pub const Names = struct {
@@ -37,19 +39,12 @@ pub const Names = struct {
     functions: []const []const u8 = &.{},
     params: []const []const u8 = &.{},
     tables: []const ConnTables = &.{},
-    /// The columns of every table and file the entry names, pooled.
     columns: []const Column = &.{},
 };
 
-/// A built-in function and how it is called.
 pub const Builtin = struct { name: []const u8, sig: []const u8 };
 
-/// Every function the engine answers to by name: the scalar builtins, the
-/// aggregates, the window functions, and the call-shaped `CAST`/`TRY_CAST`/`IF`.
-/// `cli.zig`'s test holds it to the engine's registries both ways, so a
-/// builtin added there cannot go missing from Tab.
 pub const builtin_functions = [_]Builtin{
-    // scalar
     .{ .name = "now", .sig = "now()" },
     .{ .name = "today", .sig = "today()" },
     .{ .name = "regexp_replace", .sig = "regexp_replace(s, pattern, replacement)" },
@@ -127,7 +122,6 @@ pub const builtin_functions = [_]Builtin{
     .{ .name = "json_transform", .sig = "json_transform(array, x -> value)" },
     .{ .name = "json_any", .sig = "json_any(array, x -> condition)" },
     .{ .name = "json_all", .sig = "json_all(array, x -> condition)" },
-    // aggregate (the five that also run over a window say so)
     .{ .name = "count", .sig = "count(* | x) [OVER (…)]" },
     .{ .name = "sum", .sig = "sum(x) [OVER (…)]" },
     .{ .name = "avg", .sig = "avg(x) [OVER (…)]" },
@@ -146,26 +140,20 @@ pub const builtin_functions = [_]Builtin{
     .{ .name = "stddev_samp", .sig = "stddev_samp(x)" },
     .{ .name = "stddev", .sig = "stddev(x)" },
     .{ .name = "stddev_pop", .sig = "stddev_pop(x)" },
-    // window
     .{ .name = "row_number", .sig = "row_number() OVER (…)" },
     .{ .name = "rank", .sig = "rank() OVER (…)" },
     .{ .name = "dense_rank", .sig = "dense_rank() OVER (…)" },
     .{ .name = "lag", .sig = "lag(x[, n]) OVER (…)" },
     .{ .name = "lead", .sig = "lead(x[, n]) OVER (…)" },
-    // call-shaped syntax
     .{ .name = "cast", .sig = "cast(x AS type)" },
     .{ .name = "try_cast", .sig = "try_cast(x AS type)" },
     .{ .name = "if", .sig = "if(cond, a, b)" },
 };
 
-/// Every meta command the REPL answers to; `cli.zig`'s test checks it stays so.
 pub const meta_commands = [_][]const u8{ "\\connections", "\\c", "\\connect", "\\reset", "\\clear", "\\cls", "\\format", "\\f", "\\view", "\\v", "\\d", "\\dt", "\\i", "\\source", "\\save", "\\edit", "\\e", "\\help", "\\h", "\\q", "\\quit" };
 
 pub const Result = union(enum) {
-    /// Replace `text[start..cursor]` with a pick from `items`.
     candidates: struct { start: usize, items: []const Candidate },
-    /// The cursor is inside a string: the caller lists paths for `partial` and
-    /// replaces from `start` (just after the opening quote).
     path: struct { start: usize, partial: []const u8 },
     none,
 };
@@ -209,9 +197,8 @@ fn cased(arena: std.mem.Allocator, word: []const u8, like: []const u8) ![]const 
     return out;
 }
 
-/// Where the word being typed at `cursor` begins — what a pick replaces from,
-/// and what an empty offer still reports, so an editor never reads "replace
-/// from the top of the cell". `cursor` itself when no word is under way.
+/// Where the word at `cursor` begins (`cursor` itself when none is under way).
+/// An empty offer still reports it, so an editor never replaces from the top of the cell.
 pub fn wordStart(text: []const u8, cursor: usize) usize {
     var start = cursor;
     while (start > 0 and (isWordByte(text[start - 1]) or text[start - 1] == '.' or text[start - 1] == '$' or text[start - 1] == '\\')) start -= 1;
@@ -274,7 +261,7 @@ fn finish(out: *std.array_list.Managed(Candidate), start: usize) !Result {
     return .{ .candidates = .{ .start = start, .items = try out.toOwnedSlice() } };
 }
 
-/// The longest prefix every candidate shares, compared without case — what a
+/// The longest prefix every candidate shares, compared without case: what a
 /// first Tab fills in before the choices are shown.
 pub fn commonPrefix(items: []const Candidate) []const u8 {
     if (items.len == 0) return "";
@@ -298,12 +285,10 @@ test "complete: keywords in the typer's case, names first, and nothing for an em
     try std.testing.expectEqualStrings("customer", items[0].text);
     try std.testing.expectEqual(Kind.column, items[0].kind);
     try std.testing.expectEqualStrings("cents", items[1].text);
-    // then the built-in functions, then keywords
     try std.testing.expectEqual(Kind.function, items[2].kind);
     try std.testing.expectEqualStrings("concat", items[2].text);
     try std.testing.expectEqual(Kind.keyword, items[items.len - 1].kind);
     try std.testing.expectEqualStrings("SELECT", (try complete(a, names, "SEL", 3)).candidates.items[0].text);
-    // `co` could be a column or several keywords: what they share is `co` itself.
     const co = (try complete(a, .{ .columns = &.{.{ .name = "color" }} }, "WHERE co", 8)).candidates.items;
     try std.testing.expectEqualStrings("color", co[0].text);
     try std.testing.expect(co.len > 1);
@@ -335,7 +320,6 @@ test "complete: conn.table from the catalog, alias.column from the pool, $param,
     const path = (try complete(a, names, "FROM 'data/or", 13)).path;
     try std.testing.expectEqualStrings("data/or", path.partial);
     try std.testing.expectEqual(@as(usize, 6), path.start);
-    // A closed string is not a path.
     try std.testing.expect((try complete(a, names, "FROM 'a.csv' WHERE ", 19)) == .none);
 }
 
@@ -353,26 +337,22 @@ test "complete: built-in functions by prefix with their signature, columns with 
     try std.testing.expectEqualStrings("date_add", d.items[1].text);
     try std.testing.expectEqualStrings("date_add(unit, n, ts)", d.items[1].detail);
     try std.testing.expectEqualStrings("date_diff", d.items[2].text);
-    // in the typer's case, like a keyword
     try std.testing.expectEqualStrings("DATE_ADD", (try complete(a, .{}, "DATE_A", 6)).candidates.items[0].text);
     try std.testing.expectEqualStrings("row_number() OVER (…)", (try complete(a, .{}, "row_n", 5)).candidates.items[0].detail);
 
     const names = Names{ .columns = &.{ .{ .name = "name", .type = "string" }, .{ .name = "amount", .type = "decimal(10,2)" }, .{ .name = "NAME", .type = "int" } } };
     const n = (try complete(a, names, "SELECT na", 9)).candidates.items;
-    try std.testing.expectEqual(@as(usize, 1), n.len); // not the keyword `name` too, nor the second source's `NAME`
+    try std.testing.expectEqual(@as(usize, 1), n.len);
     try std.testing.expectEqual(Kind.column, n[0].kind);
     try std.testing.expectEqualStrings("string", n[0].detail);
     const q = (try complete(a, names, "SELECT t.am", 11)).candidates.items;
     try std.testing.expectEqualStrings("t.amount", q[0].text);
     try std.testing.expectEqualStrings("decimal(10,2)", q[0].detail);
-    // a column shadows the function of the same name, and keeps its type
-    // (`count_if` shares the prefix and is still offered)
     const cnt = (try complete(a, .{ .columns = &.{.{ .name = "count", .type = "int" }} }, "cou", 3)).candidates.items;
     try std.testing.expectEqual(@as(usize, 2), cnt.len);
     try std.testing.expectEqual(Kind.column, cnt[0].kind);
     try std.testing.expectEqualStrings("count", cnt[0].text);
     try std.testing.expectEqualStrings("count_if", cnt[1].text);
-    // a function with no column in the way is a function, not the keyword `count`
     const fnc = (try complete(a, .{}, "cou", 3)).candidates.items;
     try std.testing.expectEqual(@as(usize, 2), fnc.len);
     for (fnc) |c| try std.testing.expectEqual(Kind.function, c.kind);

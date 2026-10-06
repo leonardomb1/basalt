@@ -1,20 +1,23 @@
 //! A Kerberos 5 client, enough to log in to a Windows file share: a password
 //! turned into an AES key (RFC 3962), a ticket-granting ticket from the KDC with
-//! encrypted-timestamp pre-authentication (RFC 4120 — Active Directory requires
+//! encrypted-timestamp pre-authentication (RFC 4120; Active Directory requires
 //! it), a service ticket for `cifs/<host>`, and the AP-REQ a server accepts
-//! inside SPNEGO, its AP-REP checked in turn so the server proves it holds the
-//! service key (mutual authentication). What it yields is the session key SMB
-//! signs and seals with.
+//! inside SPNEGO (GSS-API, RFC 4121), its AP-REP checked in turn so the server
+//! proves it holds the service key (mutual authentication). What it yields is the
+//! session key SMB signs and seals with.
 //!
-//! AES only — aes256-cts-hmac-sha1-96 and aes128-cts-hmac-sha1-96. A KDC that
+//! AES only: aes256-cts-hmac-sha1-96 and aes128-cts-hmac-sha1-96. A KDC that
 //! offers an account nothing but RC4 is refused by name: RC4 is off by default
 //! on current Windows domains and weak where it is not.
 //!
 //! The KDC is the connection's `kdc`, else what DNS lists for
 //! `_kerberos._tcp.<realm>`, else the realm's own name (an AD domain's name
-//! resolves to its domain controllers). Tickets are kept in-process per
-//! principal and service until they expire, so a parallel read's lanes do not
-//! each go back to the KDC.
+//! resolves to its domain controllers). The realm is kept upper-cased, as AD
+//! writes it. Tickets are kept in-process per principal and service until they
+//! expire, so a parallel read's lanes do not each go back to the KDC.
+//! `lastError` says why the last call on this thread failed, never with a secret.
+//! The live test against a real domain never tries a wrong password: each one
+//! counts toward the account's lockout.
 
 const std = @import("std");
 
@@ -34,15 +37,12 @@ pub const Error = error{
 pub const Credential = struct {
     user: []const u8,
     password: []const u8,
-    /// The realm in upper case, as AD writes it: `CORP.LOCAL`.
     realm: []const u8,
-    /// `host[:port]` of a KDC; looked up when empty.
     kdc: []const u8 = "",
 };
 
-/// A credential out of a login as people write it: `me@CORP.LOCAL` names the
-/// realm inline, `DOMAIN\\me` is taken as `me`, and an explicit `realm` wins.
-/// The realm is upper-cased into `buf`, as AD writes it; null when there is none.
+/// A credential from a login as people write it: `me@CORP.LOCAL` names the realm
+/// inline, `DOMAIN\\me` is taken as `me`, and an explicit `realm` wins.
 pub fn credential(user_in: []const u8, password: []const u8, realm_in: []const u8, kdc: []const u8, buf: []u8) ?Credential {
     var user = user_in;
     var realm = realm_in;
@@ -58,7 +58,6 @@ pub fn credential(user_in: []const u8, password: []const u8, realm_in: []const u
 threadlocal var why_buf: [512]u8 = undefined;
 threadlocal var why_len: usize = 0;
 
-/// Why the last call on this thread failed, in words; never a secret.
 pub fn lastError() []const u8 {
     return why_buf[0..why_len];
 }
@@ -68,8 +67,6 @@ fn fail(e: Error, comptime fmt: []const u8, args: anytype) Error {
     why_len = s.len;
     return e;
 }
-
-// --- crypto (RFC 3961, RFC 3962) ------------------------------------------------------
 
 pub const etype_aes128: i32 = 17;
 pub const etype_aes256: i32 = 18;
@@ -102,7 +99,6 @@ pub fn nfold(out: []u8, in: []const u8) void {
     var i: usize = lcm;
     while (i > 0) {
         i -= 1;
-        // the bit offset of byte i of the replicated, rotated input
         const msbit = ((k << 3) - 1 + (((k << 3) + 13) * (i / k)) + ((k - (i % k)) << 3)) % (k << 3);
         const b: u32 = ((@as(u32, in[((k - 1) - (msbit >> 3)) % k]) << 8) | in[((k) - (msbit >> 3)) % k]);
         const byte: u32 = (b >> @intCast((msbit & 7) + 1)) & 0xff;
@@ -110,7 +106,6 @@ pub fn nfold(out: []u8, in: []const u8) void {
         out[i % n] = @truncate(carry);
         carry >>= 8;
     }
-    // end-around carry
     if (carry != 0) {
         var j: usize = n;
         while (j > 0) {
@@ -139,9 +134,8 @@ fn aesDecryptBlock(key: []const u8, out: *[16]u8, in: *const [16]u8) void {
     }
 }
 
-/// AES in CBC mode with ciphertext stealing (RFC 3962 5), IV zero: the input
-/// zero-padded and CBC-encrypted, the last two blocks swapped, the output cut
-/// to the input's length. A single block is plain AES.
+/// AES-CBC with ciphertext stealing (RFC 3962 5), IV zero: the input zero-padded
+/// and CBC-encrypted, the last two blocks swapped, the output cut to the input's length.
 pub fn ctsEncrypt(key: []const u8, out: []u8, in: []const u8) void {
     std.debug.assert(in.len >= 16 and out.len == in.len);
     var prev: [16]u8 = [_]u8{0} ** 16;
@@ -166,7 +160,6 @@ pub fn ctsEncrypt(key: []const u8, out: []u8, in: []const u8) void {
             @memcpy(last_two[0..16], &prev);
         }
     }
-    // swapped: the final block first, then the stolen head of the one before
     const tail = in.len - (nblocks - 2) * 16;
     @memcpy(out[(nblocks - 2) * 16 ..][0..tail], last_two[0..tail]);
 }
@@ -187,9 +180,7 @@ pub fn ctsDecrypt(key: []const u8, out: []u8, in: []const u8) void {
         @memcpy(&prev, in[i * 16 ..][0..16]);
     }
     const base = (nblocks - 2) * 16;
-    const r = in.len - base - 16; // bytes of the stolen final block, 1..16
-    // the block that was CBC's last: decrypting it gives the padded last
-    // plaintext XORed with the full block before it, whose tail it supplies
+    const r = in.len - base - 16;
     var x: [16]u8 = undefined;
     aesDecryptBlock(key, &x, in[base..][0..16]);
     var full: [16]u8 = undefined;
@@ -238,8 +229,8 @@ fn usageKey(base: *const Key, usage: u32, suffix: u8) Key {
 
 const HmacSha1 = std.crypto.auth.hmac.HmacSha1;
 
-/// Encrypt for `usage`: a random confounder and the message, CTS-encrypted with
-/// Ke, then 96 bits of HMAC-SHA1 with Ki over the plaintext.
+/// A random confounder and the message, CTS-encrypted with Ke, then 96 bits of
+/// HMAC-SHA1 with Ki over the plaintext.
 pub fn encrypt(gpa: std.mem.Allocator, key: *const Key, usage: u32, msg: []const u8) ![]u8 {
     const ke = usageKey(key, usage, 0xAA);
     const ki = usageKey(key, usage, 0x55);
@@ -255,7 +246,6 @@ pub fn encrypt(gpa: std.mem.Allocator, key: *const Key, usage: u32, msg: []const
     return out;
 }
 
-/// The plaintext of `ct` for `usage`, its HMAC checked; owned by the caller.
 pub fn decrypt(gpa: std.mem.Allocator, key: *const Key, usage: u32, ct: []const u8) ![]u8 {
     if (ct.len < 16 + 12) return fail(error.KrbProtocol, "an encrypted part too short to hold anything", .{});
     const ke = usageKey(key, usage, 0xAA);
@@ -271,15 +261,12 @@ pub fn decrypt(gpa: std.mem.Allocator, key: *const Key, usage: u32, ct: []const 
     return gpa.dupe(u8, plain[16..]);
 }
 
-/// HMAC-SHA1-96 checksum with Kc for `usage`.
 fn checksum(key: *const Key, usage: u32, msg: []const u8) [12]u8 {
     const kc = usageKey(key, usage, 0x99);
     var mac: [20]u8 = undefined;
     HmacSha1.create(&mac, msg, kc.slice());
     return mac[0..12].*;
 }
-
-// --- DER --------------------------------------------------------------------------------
 
 const Der = struct {
     out: std.array_list.Managed(u8),
@@ -304,7 +291,6 @@ const Der = struct {
         }
     }
 
-    /// `tag` around what `body` wrote.
     fn wrap(self: *Der, tag: u8, body: []const u8) !void {
         try self.out.append(tag);
         try self.len(body.len);
@@ -336,7 +322,6 @@ fn derOf(gpa: std.mem.Allocator, tag: u8, parts: []const []const u8) ![]u8 {
     return d.out.toOwnedSlice();
 }
 
-/// A builder that frees every intermediate it made when done.
 const B = struct {
     gpa: std.mem.Allocator,
     made: std.array_list.Managed([]u8),
@@ -363,7 +348,6 @@ const B = struct {
         return self.tag(0x30, parts);
     }
 
-    /// `[n]` explicit context tag.
     fn ctx(self: *B, n: u8, inner: []const u8) ![]const u8 {
         return self.tag(0xa0 | n, &.{inner});
     }
@@ -373,7 +357,7 @@ const B = struct {
     }
 
     fn str(self: *B, s: []const u8) ![]const u8 {
-        return self.tag(0x1b, &.{s}); // GeneralString
+        return self.tag(0x1b, &.{s});
     }
 
     fn octets(self: *B, s: []const u8) ![]const u8 {
@@ -425,7 +409,6 @@ fn civil(z0: i64) struct { y: i64, m: u32, d: u32 } {
     return .{ .y = y + (if (m <= 2) @as(i64, 1) else 0), .m = m, .d = d };
 }
 
-/// Seconds since the epoch of a `YYYYMMDDHHMMSSZ` time; 0 when malformed.
 fn parseTime(s: []const u8) i64 {
     if (s.len < 15) return 0;
     const n = struct {
@@ -436,7 +419,6 @@ fn parseTime(s: []const u8) i64 {
     const y = n(s[0..4]);
     const mo = n(s[4..6]);
     const d = n(s[6..8]);
-    // days from civil (Hinnant)
     const yy = if (mo <= 2) y - 1 else y;
     const era = @divFloor(if (yy >= 0) yy else yy - 399, 400);
     const yoe = yy - era * 400;
@@ -447,12 +429,10 @@ fn parseTime(s: []const u8) i64 {
     return days * 86400 + n(s[8..10]) * 3600 + n(s[10..12]) * 60 + n(s[12..14]);
 }
 
-/// One DER element: its tag and contents.
 const El = struct {
     tag: u8,
     body: []const u8,
     end: usize,
-    /// The whole element, tag and length included.
     raw: []const u8,
 
     fn at(b: []const u8, i: usize) ?El {
@@ -471,7 +451,6 @@ const El = struct {
         return .{ .tag = b[i], .body = b[j..][0..n], .end = j + n, .raw = b[i .. j + n] };
     }
 
-    /// The child with tag `t` among this element's children.
     fn child(self: El, t: u8) ?El {
         var i: usize = 0;
         while (El.at(self.body, i)) |e| : (i = e.end) {
@@ -480,7 +459,6 @@ const El = struct {
         return null;
     }
 
-    /// The content of `[n]`, unwrapped.
     fn field(self: El, n: u8) ?El {
         const c = self.child(0xa0 | n) orelse return null;
         return El.at(c.body, 0);
@@ -492,13 +470,10 @@ const El = struct {
         return v;
     }
 
-    /// The single SEQUENCE inside an [APPLICATION n] wrapper, or self.
     fn inner(self: El) ?El {
         return El.at(self.body, 0);
     }
 };
-
-// --- the KDC ----------------------------------------------------------------------------
 
 const pvno = 5;
 const msg_as_req = 10;
@@ -512,7 +487,6 @@ const nt_srv_inst = 2;
 const pa_tgs_req = 1;
 const pa_enc_timestamp = 2;
 const pa_etype_info2 = 19;
-/// forwardable, renewable, canonicalize, renewable-ok
 const kdc_options: u32 = 0x4081_0010;
 
 const err_principal_unknown = 6;
@@ -524,7 +498,6 @@ const err_preauth_failed = 24;
 const err_preauth_required = 25;
 const err_skew = 37;
 
-/// Send one request to the KDC over TCP and return its reply.
 fn exchange(gpa: std.mem.Allocator, cred: Credential, req: []const u8) ![]u8 {
     var hosts_buf: [16][]const u8 = undefined;
     var hosts = std.array_list.Managed([]const u8).init(gpa);
@@ -586,7 +559,6 @@ fn readFull(stream: std.net.Stream, buf: []u8) bool {
     return true;
 }
 
-/// A KRB-ERROR in words; the KDC's clock is kept for a skew message.
 fn kdcError(e: El, cred: Credential, what: []const u8) Error {
     const code = if (e.field(6)) |c| c.int() else -1;
     const stime = if (e.field(4)) |t| parseTime(t.body) else 0;
@@ -602,19 +574,16 @@ fn kdcError(e: El, cred: Credential, what: []const u8) Error {
     };
 }
 
-/// A ticket and the session key that goes with it.
 pub const Ticket = struct {
-    /// The DER of the Ticket, as the KDC sent it.
     der: []u8,
     key: Key,
     end: i64,
     realm: []const u8,
 };
 
-/// A ticket-granting ticket for `cred`.
+/// A ticket-granting ticket for `cred`. The first request learns the
+/// pre-authentication, salt and key type the KDC expects.
 pub fn asExchange(gpa: std.mem.Allocator, cred: Credential) !Ticket {
-    // the first request asks for the pre-authentication the KDC wants, and the
-    // salt and key type it expects
     var salt_buf: [512]u8 = undefined;
     var salt: []const u8 = std.fmt.bufPrint(&salt_buf, "{s}{s}", .{ cred.realm, cred.user }) catch return error.KrbFailure;
     var etype: i32 = etype_aes256;
@@ -705,8 +674,6 @@ fn reqBody(b: *B, realm: []const u8, cname: ?[]const u8, sname: []const u8) ![]c
     return b.seq(fields.items);
 }
 
-/// The ticket and session key in an AS-REP or TGS-REP, its enc-part opened
-/// with `key` for `usage`.
 fn kdcReply(gpa: std.mem.Allocator, cred: Credential, r: []const u8, key: *const Key, usage: u32, what: []const u8) !Ticket {
     const top = El.at(r, 0) orelse return fail(error.KrbProtocol, "the KDC's reply is not DER", .{});
     const rep = top.inner() orelse return error.KrbProtocol;
@@ -734,9 +701,8 @@ fn kdcReply(gpa: std.mem.Allocator, cred: Credential, r: []const u8, key: *const
     return .{ .der = try gpa.dupe(u8, tdr.raw), .key = sk, .end = end, .realm = try gpa.dupe(u8, srealm) };
 }
 
-/// An AP-REQ carrying `t` to the service, with an authenticator under the
-/// ticket's session key for `usage` — 7 inside a TGS-REQ (with a checksum of the
-/// request body), 11 for the service itself (with the GSS checksum and a subkey).
+/// An AP-REQ carrying `t`, its authenticator under the session key for `usage`:
+/// 7 inside a TGS-REQ (body checksum), 11 for the service (GSS checksum and subkey).
 fn apReq(b: *B, cred: Credential, t: *const Ticket, usage: u32, cksum: []const u8, subkey: ?*const Key, mutual: bool) ![]const u8 {
     const now = std.time.microTimestamp();
     var fields = std.array_list.Managed([]const u8).init(b.gpa);
@@ -762,7 +728,6 @@ fn apReq(b: *B, cred: Credential, t: *const Ticket, usage: u32, cksum: []const u
     })});
 }
 
-/// A service ticket for `spn` (`cifs/host`), from the ticket-granting ticket.
 pub fn tgsExchange(gpa: std.mem.Allocator, cred: Credential, tgt: *const Ticket, spn: []const u8) !Ticket {
     var b = B.init(gpa);
     defer b.deinit();
@@ -787,24 +752,19 @@ pub fn tgsExchange(gpa: std.mem.Allocator, cred: Credential, tgt: *const Ticket,
     return kdcReply(gpa, cred, r, &tgt.key, 8, spn);
 }
 
-// --- GSS-API (RFC 4121) and the service ---------------------------------------------------
-
 const oid_krb5 = [_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02 };
 
-/// What a client sends a service and keeps to check its answer.
 pub const Context = struct {
-    /// The GSS InitialContextToken: the krb5 OID, TOK_ID 01 00, the AP-REQ.
     token: []u8,
     ticket_key: Key,
     subkey: Key,
 };
 
-/// The initial token for the service of `t`, asking for mutual authentication.
+/// The GSS InitialContextToken for the service of `t`, asking for mutual
+/// authentication (GSS checksum per RFC 4121 4.1.1, no channel bindings).
 pub fn initContext(gpa: std.mem.Allocator, cred: Credential, t: *const Ticket) !Context {
     var b = B.init(gpa);
     defer b.deinit();
-    // the GSS checksum (RFC 4121 4.1.1): no channel bindings; mutual, replay,
-    // sequence, confidentiality and integrity
     var gss: [24]u8 = [_]u8{0} ** 24;
     std.mem.writeInt(u32, gss[0..4], 16, .little);
     std.mem.writeInt(u32, gss[20..24], 0x3e, .little);
@@ -816,13 +776,12 @@ pub fn initContext(gpa: std.mem.Allocator, cred: Credential, t: *const Ticket) !
     return .{ .token = token, .ticket_key = t.key, .subkey = sub };
 }
 
-/// Check the service's AP-REP (inside its GSS token) and return the context's
-/// key: the service's subkey when it sent one, else ours.
+/// Check the service's AP-REP inside its GSS token and return the context's key:
+/// the service's subkey when it sent one, else ours.
 pub fn acceptReply(gpa: std.mem.Allocator, ctx: *const Context, token: []const u8) !Key {
     const g = El.at(token, 0) orelse return fail(error.KrbProtocol, "the server's Kerberos reply is not DER", .{});
     var rep_der: []const u8 = token;
     if (g.tag == 0x60) {
-        // skip the OID and the two TOK_ID bytes
         const oid = El.at(g.body, 0) orelse return error.KrbProtocol;
         if (oid.end + 2 > g.body.len) return error.KrbProtocol;
         if (g.body[oid.end] == 0x03) return fail(error.KrbFailure, "the server answered with a Kerberos error", .{});
@@ -850,8 +809,6 @@ pub fn acceptReply(gpa: std.mem.Allocator, ctx: *const Context, token: []const u
     }
     return ctx.subkey;
 }
-
-// --- the ticket cache -----------------------------------------------------------------------
 
 const Cached = struct { key: []const u8, t: Ticket };
 var cache_mtx: std.Thread.Mutex = .{};
@@ -884,7 +841,6 @@ fn remember(key: []const u8, t: Ticket) void {
     cache.append(gpa, .{ .key = k, .t = copy }) catch {};
 }
 
-/// A service ticket for `spn`, from the cache or the KDC; owned by the cache.
 pub fn serviceTicket(gpa: std.mem.Allocator, cred: Credential, spn: []const u8) !Ticket {
     why_len = 0;
     var kb: [512]u8 = undefined;
@@ -910,9 +866,6 @@ pub fn serviceTicket(gpa: std.mem.Allocator, cred: Credential, spn: []const u8) 
     return cached(skey) orelse error.KrbFailure;
 }
 
-// --- DNS SRV ---------------------------------------------------------------------------------
-
-/// The KDCs DNS lists for `_kerberos._tcp.<realm>`, as `host:port`, into `out`.
 fn srvLookup(gpa: std.mem.Allocator, realm: []const u8, out: [][]const u8) !usize {
     const ns = nameserver() orelse return 0;
     var q = std.array_list.Managed(u8).init(gpa);
@@ -921,7 +874,7 @@ fn srvLookup(gpa: std.mem.Allocator, realm: []const u8, out: [][]const u8) !usiz
     std.crypto.random.bytes(std.mem.asBytes(&id));
     var hdr: [12]u8 = [_]u8{0} ** 12;
     std.mem.writeInt(u16, hdr[0..2], id, .big);
-    hdr[2] = 0x01; // recursion desired
+    hdr[2] = 0x01;
     std.mem.writeInt(u16, hdr[4..6], 1, .big);
     try q.appendSlice(&hdr);
     const name = try std.fmt.allocPrint(gpa, "_kerberos._tcp.{s}", .{realm});
@@ -932,7 +885,7 @@ fn srvLookup(gpa: std.mem.Allocator, realm: []const u8, out: [][]const u8) !usiz
         try q.append(@intCast(l.len));
         for (l) |c| try q.append(std.ascii.toLower(c));
     }
-    try q.appendSlice(&[_]u8{ 0, 0, 33, 0, 1 }); // SRV, IN
+    try q.appendSlice(&[_]u8{ 0, 0, 33, 0, 1 });
 
     const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
     defer std.posix.close(sock);
@@ -1017,8 +970,6 @@ fn readName(r: []const u8, start: usize, out: *std.array_list.Managed(u8)) !void
     }
 }
 
-// --- tests ------------------------------------------------------------------------------------
-
 fn hex(comptime s: []const u8) [s.len / 2]u8 {
     var out: [s.len / 2]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, s) catch unreachable;
@@ -1030,7 +981,6 @@ test "krb5: a login names its realm by `realm` or after the user's @, upper-case
     const a = credential("me@corp.local", "p", "", "", &buf).?;
     try std.testing.expectEqualStrings("me", a.user);
     try std.testing.expectEqualStrings("CORP.LOCAL", a.realm);
-    // an explicit realm wins, and the user's own suffix is dropped either way
     const b = credential("me@corp.local", "p", "OTHER.LOCAL", "dc1:88", &buf).?;
     try std.testing.expectEqualStrings("me", b.user);
     try std.testing.expectEqualStrings("OTHER.LOCAL", b.realm);
@@ -1161,6 +1111,4 @@ test "krb5: a live login and service ticket (BASALT_KRB_REALM, _USER, _PASS, _SP
         gpa.free(st.realm);
     }
     try std.testing.expect(st.end > std.time.timestamp());
-    // no wrong-password attempt here: against a real domain each one counts
-    // toward the account's lockout
 }

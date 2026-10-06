@@ -1,27 +1,36 @@
-//! Parquet file metadata: the footer, and the structs needed to locate pages.
+//! Parquet file metadata and pages: the footer, the structs needed to locate
+//! pages, and page headers and bodies.
 //!
 //! Layout is `PAR1 <data> <thrift FileMetaData> <u32 LE footer length> PAR1`.
-//! Metadata lives at the *end* precisely so a reader can fetch it with two small
-//! ranged reads instead of downloading the object — the last 8 bytes give the
-//! footer length, then the footer itself.
+//! Metadata lives at the end so a reader can fetch it with two small ranged reads
+//! instead of downloading the object: the last 8 bytes give the footer length,
+//! then the footer itself.
 //!
-//! Only the fields basalt needs are decoded; everything else is skipped, which
-//! is what lets this open files written by newer Parquet versions.
+//! Only the fields basalt needs are decoded; everything else is skipped, which is
+//! what lets this open files written by newer Parquet versions. A `LogicalType`
+//! supersedes `converted_type` when present, since writers omit the legacy
+//! annotation for what it cannot express (naive timestamps, nanosecond units);
+//! members basalt ignores decode to `.other`. Statistics prefer `min_value`/
+//! `max_value` over the deprecated `min`/`max`, whose ordering was never consistent.
+//!
+//! Footer metadata is the first thing read from an untrusted file, so a corrupt or
+//! hostile file must produce an error, never a trap or a runaway allocation.
+//!
+//! The real-file tests use fixtures from an external writer, the same rows in five
+//! codecs, because the Snappy and LZ4 decoders in `codec.zig` are our own and only
+//! byte-identical page bodies prove them right.
 
 const std = @import("std");
 const thrift = @import("thrift.zig");
 const codec = @import("codec.zig");
 
 pub const Error = error{
-    /// Missing or misplaced `PAR1` magic, or a footer length that does not fit.
     NotParquet,
-    /// A wire value that no enum in the format defines.
     CorruptParquet,
 } || thrift.Error || std.mem.Allocator.Error;
 
-/// Convert a wire i32 into `E`, or fail. `@enumFromInt` on a value the enum does
-/// not define is illegal behaviour — a corrupt or hostile file must produce an
-/// error, not a trap.
+/// Convert a wire i32 into `E`, or fail: `@enumFromInt` on an undefined value is
+/// illegal behaviour, and a hostile file must produce an error, not a trap.
 fn enumFrom(comptime E: type, v: i32) Error!E {
     inline for (@typeInfo(E).@"enum".fields) |f| {
         if (f.value == v) return @field(E, f.name);
@@ -30,15 +39,12 @@ fn enumFrom(comptime E: type, v: i32) Error!E {
 }
 
 pub const magic = "PAR1";
-/// Trailing `u32` footer length plus the magic.
 pub const trailer_len = 8;
 
-/// Physical storage type of a column (`parquet.thrift` `Type`).
 pub const PhysicalType = enum(i32) {
     boolean = 0,
     int32 = 1,
     int64 = 2,
-    /// Deprecated 12-byte timestamp, still emitted by older Spark writers.
     int96 = 3,
     float = 4,
     double = 5,
@@ -62,8 +68,6 @@ pub const Encoding = enum(i32) {
     _,
 };
 
-/// One node of the schema tree, flattened depth-first as Parquet stores it.
-/// `num_children > 0` marks a group (the root, or a nested list/struct).
 pub const SchemaElement = struct {
     ty: ?PhysicalType = null,
     type_length: ?i32 = null,
@@ -73,9 +77,6 @@ pub const SchemaElement = struct {
     converted_type: ?i32 = null,
     scale: ?i32 = null,
     precision: ?i32 = null,
-    /// Field 10. Supersedes `converted_type` when present: a writer omits the
-    /// legacy annotation for anything it cannot express, notably a naive
-    /// (`isAdjustedToUTC = false`) timestamp and every nanosecond unit.
     logical_type: ?LogicalType = null,
 
     pub fn isLeaf(self: SchemaElement) bool {
@@ -85,9 +86,6 @@ pub const SchemaElement = struct {
 
 pub const TimeUnit = enum { millis, micros, nanos };
 
-/// The `LogicalType` union, reduced to the members that change how basalt reads
-/// a column. Anything else decodes to `.other` and falls back to the converted
-/// type, exactly as if the field were absent.
 pub const LogicalType = union(enum) {
     string,
     @"enum",
@@ -104,9 +102,6 @@ pub const LogicalType = union(enum) {
     pub const Temporal = struct { adjusted_to_utc: bool = false, unit: TimeUnit = .micros };
 };
 
-/// Per-chunk statistics. `min`/`max` are PLAIN-encoded bytes of the column's
-/// physical type, which is enough to decide whether a row group can contain a
-/// value without decoding any of it.
 pub const Statistics = struct {
     null_count: ?i64 = null,
     min: ?[]const u8 = null,
@@ -125,8 +120,8 @@ pub const ColumnMetaData = struct {
     dictionary_page_offset: ?i64 = null,
     stats: Statistics = .{},
 
-    /// Where this chunk's pages start. A dictionary page, when present, precedes
-    /// the data pages, so it — not `data_page_offset` — is the true beginning.
+    /// Where this chunk's pages start: a dictionary page, when present, precedes the
+    /// data pages. Some writers emit 0 for an absent dictionary offset.
     pub fn startOffset(self: ColumnMetaData) i64 {
         if (self.dictionary_page_offset) |d| if (d > 0 and d < self.data_page_offset) return d;
         return self.data_page_offset;
@@ -152,8 +147,8 @@ pub const FileMetaData = struct {
     row_groups: []RowGroup = &.{},
     created_by: []const u8 = "",
 
-    /// Leaf columns, in the order their chunks appear. The first schema element
-    /// is the synthetic root and is never a column.
+    /// Leaf columns, in the order their chunks appear. The first schema element is
+    /// the synthetic root and is never a column.
     pub fn leafCount(self: FileMetaData) usize {
         var n: usize = 0;
         for (self.schema[@min(1, self.schema.len)..]) |e| {
@@ -163,8 +158,7 @@ pub const FileMetaData = struct {
     }
 };
 
-/// Byte range of the footer, given the file size and its last 8 bytes. Lets a
-/// caller issue exactly two ranged reads rather than fetching the whole object.
+/// Byte range of the footer, given the file size and its last 8 bytes.
 pub fn footerRange(file_size: u64, trailer: []const u8) Error!struct { offset: u64, len: u32 } {
     if (trailer.len < trailer_len) return Error.NotParquet;
     const tail = trailer[trailer.len - trailer_len ..];
@@ -182,7 +176,6 @@ pub fn parseFile(arena: std.mem.Allocator, bytes: []const u8) Error!FileMetaData
     return parseFooter(arena, bytes[r.offset..][0..r.len]);
 }
 
-/// Parses a `FileMetaData` from the footer bytes alone.
 pub fn parseFooter(arena: std.mem.Allocator, footer: []const u8) Error!FileMetaData {
     var r = thrift.Reader.init(footer);
     var md = FileMetaData{};
@@ -204,7 +197,6 @@ pub fn parseFooter(arena: std.mem.Allocator, footer: []const u8) Error!FileMetaD
     return md;
 }
 
-/// Reads a `list<struct>` into a slice using `readOne` per element.
 fn readList(
     comptime T: type,
     arena: std.mem.Allocator,
@@ -244,8 +236,6 @@ fn readSchemaElement(arena: std.mem.Allocator, r: *thrift.Reader) Error!SchemaEl
     return e;
 }
 
-/// A thrift union is a struct with exactly one field set. Member ids follow
-/// parquet.thrift; the payload structs of members basalt ignores are skipped.
 fn readLogicalType(r: *thrift.Reader) Error!LogicalType {
     var lt: LogicalType = .other;
     try r.structBegin();
@@ -330,7 +320,7 @@ fn readTemporalType(r: *thrift.Reader) Error!LogicalType.Temporal {
     return tt;
 }
 
-/// `TimeUnit` is itself a union of empty structs: MILLIS=1, MICROS=2, NANOS=3.
+/// `TimeUnit` is a union of empty structs: MILLIS=1, MICROS=2, NANOS=3.
 fn readTimeUnit(r: *thrift.Reader) Error!TimeUnit {
     var u: TimeUnit = .micros;
     try r.structBegin();
@@ -414,8 +404,6 @@ fn readColumnChunk(arena: std.mem.Allocator, r: *thrift.Reader) Error!ColumnChun
     return c;
 }
 
-/// Reads `Statistics`, preferring `min_value`/`max_value` (fields 5/6) over the
-/// deprecated `min`/`max` (2/1) whose byte-array ordering was never consistent.
 fn readStatistics(r: *thrift.Reader) Error!Statistics {
     var st = Statistics{};
     var legacy_min: ?[]const u8 = null;
@@ -481,28 +469,18 @@ pub const PageType = enum(i32) {
     _,
 };
 
-/// Header preceding every page in a column chunk. Also thrift-encoded, so pages
-/// cannot be walked without the same decoder the footer needs.
 pub const PageHeader = struct {
     ty: PageType = .data_page,
     uncompressed_page_size: i32 = 0,
     compressed_page_size: i32 = 0,
-    /// Values in this page (data pages and dictionary pages alike).
     num_values: i32 = 0,
     encoding: Encoding = .plain,
-    /// Bytes consumed by the header itself; the page body follows it.
     header_len: usize = 0,
-    /// Data page v2 only: level sections sit *outside* the compressed region and
-    /// their lengths come from the header rather than an inline prefix.
     def_levels_len: usize = 0,
     rep_levels_len: usize = 0,
-    /// Data page v2 may declare its values uncompressed even when the chunk has
-    /// a codec.
     is_compressed: bool = true,
 };
 
-/// Decodes a page header from the start of `bytes`, reporting how many bytes it
-/// occupied so the caller can find the body.
 pub fn parsePageHeader(bytes: []const u8) Error!PageHeader {
     var r = thrift.Reader.init(bytes);
     var h = PageHeader{};
@@ -514,7 +492,6 @@ pub fn parsePageHeader(bytes: []const u8) Error!PageHeader {
             1 => h.ty = @enumFromInt(try r.readI32()),
             2 => h.uncompressed_page_size = try r.readI32(),
             3 => h.compressed_page_size = try r.readI32(),
-            // v1 data page and dictionary page
             5, 7 => try readPageDetail(&r, &h),
             8 => try readPageV2Detail(&r, &h),
             else => try r.skip(f.ty),
@@ -558,21 +535,17 @@ fn readPageDetail(r: *thrift.Reader, h: *PageHeader) Error!void {
     try r.structEnd();
 }
 
-/// Re-exported so callers can name the codec of a chunk without importing the
-/// codec module separately.
 pub const Codec = codec.Codec;
 
 pub const Page = struct {
     header: PageHeader,
-    /// Decompressed page body.
     data: []const u8,
-    /// Offset of the next page in the chunk.
     next_offset: usize,
 };
 
-/// Reads one page at `offset`: thrift header, then the body decompressed with
-/// the chunk's codec. This is where the three layers meet — thrift for framing,
-/// codec for the body — so callers walk pages without touching either directly.
+/// Reads one page at `offset`: thrift header, then the body decompressed with the
+/// chunk's codec. In a v2 page the levels precede the values uncompressed, so they
+/// are carved off before decompressing.
 pub fn readPage(
     arena: std.mem.Allocator,
     bytes: []const u8,
@@ -591,9 +564,6 @@ pub fn readPage(
     const ulen: usize = @intCast(h.uncompressed_page_size);
 
     if (h.ty == .data_page_v2) {
-        // v2 layout: [rep levels][def levels][values]. Only the values are
-        // compressed, so the levels must be carved off before decompressing —
-        // running the codec over the whole body would fail or produce garbage.
         const lvl = h.rep_levels_len + h.def_levels_len;
         if (lvl > body.len or lvl > ulen) return Error.NotParquet;
         const codec_used: Codec = if (h.is_compressed) compression else .uncompressed;
@@ -609,18 +579,13 @@ pub fn readPage(
     return .{ .header = h, .data = raw, .next_offset = body_start + clen };
 }
 
-// --- tests ------------------------------------------------------------------
-
 const t = std.testing;
 
-/// Footer of a 3-row file written by DuckDB v1.5.1 (id INT32, name BYTE_ARRAY,
-/// amt DOUBLE, uncompressed). A real writer's output, not a hand-built vector.
 const tiny_footer =
     "\x15\x02\x19\x4c\x35\x00\x18\x0d\x64\x75\x63\x6b\x64\x62\x5f\x73\x63\x68\x65\x6d\x61\x15\x06\x00" ++
     "\x15\x02\x25\x02\x18\x02\x69\x64\x25\x22\x00\x15\x0c\x25\x02\x18\x04\x6e\x61\x6d\x65\x25\x00\x00";
 
 test "footerRange locates the footer from the trailer and rejects bad magic" {
-    // 468-byte file, 322-byte footer: offset 468-8-322 = 138
     var trailer: [8]u8 = undefined;
     std.mem.writeInt(u32, trailer[0..4], 322, .little);
     @memcpy(trailer[4..8], magic);
@@ -632,7 +597,6 @@ test "footerRange locates the footer from the trailer and rejects bad magic" {
     bad[4] = 'X';
     try t.expectError(Error.NotParquet, footerRange(468, &bad));
 
-    // a footer longer than the file is corruption, not a huge read
     var big: [8]u8 = undefined;
     std.mem.writeInt(u32, big[0..4], 999_999, .little);
     @memcpy(big[4..8], magic);
@@ -651,22 +615,20 @@ test "schema elements decode from a real DuckDB footer prefix" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    // The prefix above covers version + the first schema entries; decoding it
-    // exercises the delta-id and nested-struct handling against real bytes.
     var r = thrift.Reader.init(tiny_footer);
     try r.structBegin();
     const f1 = try r.readField();
     try t.expectEqual(@as(i16, 1), f1.id);
-    try t.expectEqual(@as(i32, 1), try r.readI32()); // version 1
+    try t.expectEqual(@as(i32, 1), try r.readI32());
 
     const f2 = try r.readField();
-    try t.expectEqual(@as(i16, 2), f2.id); // schema list
+    try t.expectEqual(@as(i16, 2), f2.id);
     const h = try r.readListHeader();
     try t.expectEqual(thrift.Type.@"struct", h.elem);
 
     const root = try readSchemaElement(a, &r);
     try t.expectEqualStrings("duckdb_schema", root.name);
-    try t.expectEqual(@as(i32, 3), root.num_children); // three columns
+    try t.expectEqual(@as(i32, 3), root.num_children);
     try t.expect(root.isLeaf() == false);
 
     const id_col = try readSchemaElement(a, &r);
@@ -686,17 +648,9 @@ test "startOffset prefers the dictionary page when one precedes the data pages" 
     const no_dict = ColumnMetaData{ .data_page_offset = 500 };
     try t.expectEqual(@as(i64, 500), no_dict.startOffset());
 
-    // some writers emit 0 for "absent" rather than omitting the field
     const zero = ColumnMetaData{ .data_page_offset = 500, .dictionary_page_offset = 0 };
     try t.expectEqual(@as(i64, 500), zero.startOffset());
 }
-
-// --- real-file tests --------------------------------------------------------
-//
-// Fixtures are written by DuckDB v1.5.1: the same 60 rows in five codecs. They
-// are ~6 KB total and exist to prove interoperability with a real writer, which
-// hand-built vectors cannot do — the Snappy and LZ4 decoders in `codec.zig` are
-// our own, and this is what actually holds them honest.
 
 const fx_uncompressed = @embedFile("testdata/uncompressed.parquet");
 const fx_snappy = @embedFile("testdata/snappy.parquet");
@@ -715,7 +669,6 @@ test "footer of a real DuckDB file decodes to the expected schema and layout" {
     try t.expectEqual(@as(usize, 4), md.leafCount());
     try t.expect(std.mem.startsWith(u8, md.created_by, "DuckDB"));
 
-    // schema is root + 4 leaves, in column order
     try t.expectEqual(@as(usize, 5), md.schema.len);
     try t.expectEqualStrings("id", md.schema[1].name);
     try t.expectEqual(PhysicalType.int32, md.schema[1].ty.?);
@@ -737,9 +690,6 @@ test "footer of a real DuckDB file decodes to the expected schema and layout" {
     }
 }
 
-// The decisive codec test: identical rows written five ways must decompress to
-// byte-identical PLAIN page bodies. Matching *lengths* would prove nothing —
-// matching *bytes* is what catches a wrong copy offset in Snappy or LZ4.
 test "every codec decompresses a real page to byte-identical output" {
     var ar = std.heap.ArenaAllocator.init(t.allocator);
     defer ar.deinit();
@@ -764,8 +714,6 @@ test "each fixture reports the codec it was written with" {
         .{ .bytes = fx_snappy, .want = .snappy },
         .{ .bytes = fx_gzip, .want = .gzip },
         .{ .bytes = fx_zstd, .want = .zstd },
-        // DuckDB writes LZ4_RAW (codec 7) when asked for LZ4, not the
-        // deprecated Hadoop-framed codec 5.
         .{ .bytes = fx_lz4, .want = .lz4_raw },
     };
     for (cases) |c| {
@@ -784,8 +732,6 @@ test "page headers of a real file report plain encoding and exact sizes" {
     try t.expectEqual(PageType.data_page, pg.header.ty);
     try t.expectEqual(Encoding.plain, pg.header.encoding);
     try t.expectEqual(@as(i32, 60), pg.header.num_values);
-    // readPage validates this, but assert it explicitly: the decompressed body
-    // must be exactly the size the header promised.
     try t.expectEqual(@as(usize, @intCast(pg.header.uncompressed_page_size)), pg.data.len);
 }
 
@@ -797,12 +743,6 @@ fn firstPage(a: std.mem.Allocator, file: []const u8, col: usize) ![]const u8 {
 }
 
 fn fuzzParse(_: void, input: []const u8) anyerror!void {
-    // Footer metadata is the first thing read from an untrusted file, before
-    // any size or sanity check can exist — errors are the contract, panics
-    // and runaway allocation are findings.
-    // Fixed buffer, not a heap arena: it makes each iteration allocation-free
-    // (the mutation loop runs thousands), and a decoder talked into a huge
-    // size by hostile bytes gets error.OutOfMemory instead of the memory.
     var mem: [256 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&mem);
     var arena = std.heap.ArenaAllocator.init(fba.allocator());

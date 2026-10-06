@@ -1,5 +1,27 @@
 //! Source and sink resolution: connector-name dispatch, connection config
 //! (SQL, AAD, NTLM, StarRocks), split planning, and the parallel sink specs.
+//!
+//! The `csv` connector covers every file path, so a file's format comes from an
+//! explicit `format` hint, else its extension: without that a `.parquet` path was
+//! memory-mapped and parsed as CSV text, and a `.parquet` target written as CSV.
+//! Summary labels follow the same rule, so telemetry does not report parquet as
+//! csv. A file sink truncates unless the write says `APPEND`, which is refused
+//! where bytes cannot be added (a parquet footer, a block blob).
+//!
+//! Parallel writes: a split pipeline's sink runs its DDL (and an overwrite's
+//! DELETE or TRUNCATE) once at plan time, then each lane opens its own Stream
+//! Load stream (shared run_id, lane-distinct labels) or SQL connection. That is
+//! safe because splits are disjoint key ranges, so no two lanes write the same
+//! key. Append and overwrite take the dialect's bulk loader (COPY, LOAD DATA,
+//! INSERT BULK); upsert takes the generic INSERT sink, the only one that can
+//! redial on a transient error, since the bulk loaders are mid-protocol streams.
+//! Postgres COPY benchmarks faster serial, so it is not split. Other sinks (CSV)
+//! share one sink behind a mutex.
+//!
+//! A SQL read is narrowed to the columns later stages need when that is provable,
+//! and only ever to a superset, so a wrong guess fails at the source rather than
+//! quietly. `SELECT * EXCEPT (...)` is resolved with a zero-row probe so unwanted
+//! wide columns never leave the server.
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
@@ -58,8 +80,6 @@ const SqlDesc = @import("env.zig").SqlDesc;
 const SqlKind = @import("env.zig").SqlKind;
 const srOpenErr = @import("env.zig").srOpenErr;
 
-/// Drains every batch and keeps none: the rows must still be pulled for the
-/// measured counts to be real.
 const DiscardSink = struct {
     fn writeBatch(_: *anyopaque, _: std.mem.Allocator, _: Batch) anyerror!void {}
     fn close(_: *anyopaque) anyerror!void {}
@@ -71,7 +91,6 @@ const DiscardSink = struct {
     }
 };
 
-/// Connection config carried into the split lanes (referenced via *anyopaque).
 pub const SplitCtx = struct {
     gpa: std.mem.Allocator,
     kind: SqlKind,
@@ -79,12 +98,9 @@ pub const SplitCtx = struct {
     base_sql: []const u8,
     proj_select: ?[]const u8 = null,
     where_extra: ?[]const u8 = null,
-    /// Where a lane's read that fails mid-stream says why.
     report: ?sql.Report = null,
 };
 
-/// A read's mid-stream failure, in the run's error context, worded as a failure
-/// to open one is: `sqlserver read failed (QueryFailed): <the server's message>`.
 const ReadReport = struct {
     errctx: *op.ErrCtx,
     connector: []const u8,
@@ -101,10 +117,9 @@ pub fn readReport(env: *Env, connector: []const u8) !sql.Report {
     return .{ .ctx = r, .f = ReadReport.f };
 }
 
-/// The concrete driver for one `SqlKind`: `connect` opens the driver connection
-/// (sqlserver routes through `tdsConnect` for AAD) and `Bulk` is its bulk write
-/// strategy. Comptime, so callers that need the concrete conn type (bulk sinks,
-/// `last_error`) can reach it via `switch (kind) { inline else => |k| ... }`.
+/// The concrete driver for one `SqlKind`: `connect` (sqlserver via `tdsConnect`)
+/// and its `Bulk` sink. Comptime, so callers reach the concrete conn type with
+/// `switch (kind) { inline else => |k| ... }`.
 fn SqlDriver(comptime kind: SqlKind) type {
     return switch (kind) {
         .postgres => struct {
@@ -134,7 +149,6 @@ fn connectSql(gpa: std.mem.Allocator, kind: SqlKind, cfg: DbConfig) !sql.Conn {
     }
 }
 
-/// `parallel.OpenSplitFn`: open a fresh source for one split predicate.
 pub fn openSplitSource(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, pred: []const u8) anyerror!driver.Source {
     const ctx: *SplitCtx = @ptrCast(@alignCast(ctx_ptr));
     const q = try split.wrapProjected(gpa, ctx.base_sql, ctx.proj_select, pred, ctx.where_extra);
@@ -142,7 +156,6 @@ pub fn openSplitSource(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, pred: []cons
     return openSqlQuery(ctx, gpa, q);
 }
 
-/// Open a SQL source for a ready-built lane query (one connection per call).
 pub fn openSqlQuery(ctx: *const SplitCtx, gpa: std.mem.Allocator, query: []const u8) anyerror!driver.Source {
     const conn = try connectSql(gpa, ctx.kind, ctx.cfg);
     errdefer conn.close();
@@ -151,8 +164,6 @@ pub fn openSqlQuery(ctx: *const SplitCtx, gpa: std.mem.Allocator, query: []const
     return s.source();
 }
 
-/// Resolved config for a per-lane Stream Load sink (DDL already done once at plan
-/// time; lanes just stream-load with a shared run_id and lane-distinct labels).
 const StreamLoadSpec = struct {
     cfg: streamload.Config,
     target: []const u8,
@@ -162,7 +173,6 @@ const StreamLoadSpec = struct {
     errctx: ?*op.ErrCtx = null,
 };
 
-/// `parallel.OpenSinkFn`: one stream-load stream per lane.
 fn openLaneStreamLoadSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize) anyerror!driver.Sink {
     const spec: *StreamLoadSpec = @ptrCast(@alignCast(ctx_ptr));
     var cfg = spec.cfg;
@@ -175,10 +185,6 @@ fn openLaneStreamLoadSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx:
     return s.sink();
 }
 
-/// Resolved config for a per-lane SQL sink (reverse-ETL). DDL + any overwrite
-/// DELETE run once at plan time; each lane opens its own connection and INSERTs.
-/// Safe under concurrency because the source splits are disjoint key ranges, so no
-/// two lanes ever write the same key (upserts never collide cross-lane).
 const SqlSinkSpec = struct {
     kind: SqlKind,
     dialect: sql.Dialect,
@@ -189,8 +195,6 @@ const SqlSinkSpec = struct {
     redial: sql.Redial,
 };
 
-/// Read-only dial config for the INSERT sink's transient-retry reconnect.
-/// Allocated in the plan arena; shared (immutably) across lanes.
 const DialSpec = struct { kind: SqlKind, cfg: DbConfig };
 
 fn dialSqlConn(ctx: *const anyopaque, gpa: std.mem.Allocator) anyerror!sql.Conn {
@@ -204,21 +208,13 @@ fn redialFor(arena: std.mem.Allocator, kind: SqlKind, cfg: DbConfig) !sql.Redial
     return .{ .ctx = ds, .dial = dialSqlConn };
 }
 
-/// Open the per-dialect write strategy from an already-connected conn: a bulk
-/// loader (COPY / LOAD DATA / INSERT BULK) for append/overwrite, or the generic
-/// INSERT `sql.Sink` for upsert. Centralizes the bulk-vs-INSERT rule so the serial
-/// (`openSink`) and per-lane (`openLaneSqlSink`) paths can't drift. `conn` is the
-/// concrete driver connection; on error the caller still owns and closes it.
-/// `redial` arms the INSERT sink's transient retry; the bulk loaders are
-/// mid-protocol streams (COPY/LOAD DATA/INSERT BULK) that cannot resume on a
-/// fresh connection, so they stay fail-fast.
+/// The bulk-vs-INSERT rule, shared by the serial and per-lane paths so they
+/// cannot drift. On error the caller still owns and closes `conn`.
 fn openBulkOrInsert(gpa: std.mem.Allocator, conn: anytype, comptime BulkSink: type, dialect: sql.Dialect, target: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?sql.Redial) !driver.Sink {
     if (mode != .upsert) return (try BulkSink.open(gpa, conn, target, schema, mode, redial)).sink();
     return (try sql.Sink.open(gpa, conn.sqlConn(), dialect, target, schema, mode, redial)).sink();
 }
 
-/// `parallel.OpenSinkFn`: one DB stream per lane (append/overwrite → bulk loader,
-/// upsert → INSERT, per `openBulkOrInsert`).
 fn openLaneSqlSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize) anyerror!driver.Sink {
     _ = lane_idx;
     const spec: *SqlSinkSpec = @ptrCast(@alignCast(ctx_ptr));
@@ -231,8 +227,8 @@ fn openLaneSqlSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize)
     }
 }
 
-/// Build the parallel-sink mode for a split pipeline: a per-lane StarRocks or SQL
-/// sink, or null to fall back to the shared-mutex path (CSV).
+/// A per-lane Stream Load or SQL sink for a split pipeline, or null for the
+/// shared-mutex path.
 pub fn buildParallelSink(env: *Env, w: ast.Write, schema: types.Schema) !?parallel.SinkMode {
     if (try buildStreamLoadSpec(env, w, schema)) |spec|
         return parallel.SinkMode{ .per_lane = .{ .open = openLaneStreamLoadSink, .ctx = spec } };
@@ -268,9 +264,6 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
     return spec;
 }
 
-/// If `w` writes to a Stream Load database, run the one-time DDL/truncate now and
-/// return a spec the lanes use to open their own stream-load streams. Returns null
-/// for any other sink (those use the shared mutex path).
 fn buildStreamLoadSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*StreamLoadSpec {
     const conn = env.connections.get(w.connector) orelse return null;
     const flavor = streamload.Flavor.of(conn.connector) orelse return null;
@@ -291,9 +284,8 @@ fn buildStreamLoadSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*StreamL
     return spec;
 }
 
-/// Gates the mmap'd parallel-CSV fast paths. A `.parquet` path shares the `csv`
-/// connector but is not CSV — without this it would be memory-mapped and parsed
-/// as text, silently yielding binary garbage instead of rows.
+/// Gates the mmap'd parallel-CSV fast paths; a `.parquet` path shares the `csv`
+/// connector and must not be parsed as text.
 pub fn isLocalCsvRead(rd: ast.Read) bool {
     if (!std.mem.eql(u8, rd.connector, "csv")) return false;
     return switch (rd.form) {
@@ -302,7 +294,6 @@ pub fn isLocalCsvRead(rd: ast.Read) bool {
     };
 }
 
-/// A folder read, local or remote: the parquet lanes take it when it holds Parquet.
 pub fn isFolderRead(rd: ast.Read) bool {
     if (!std.mem.eql(u8, rd.connector, "csv")) return false;
     return rd.form == .path and folder.isFolder(rd.form.path);
@@ -316,12 +307,6 @@ pub fn isLocalParquetRead(rd: ast.Read) bool {
     };
 }
 
-/// Resolve a sink/source connector name to its driver type for the summary
-/// (`csv`/`request` are types; a connection name maps to its `connector`).
-/// Label for a *write* target: the `csv` connector covers every file sink, so
-/// the format has to come from the target itself or telemetry reports parquet
-/// writes as csv.
-/// The write target of a binding materialized for the pipeline that reads it.
 pub const mem_connector = "__memory";
 
 pub fn sinkLabel(env: *Env, w: ast.Write) []const u8 {
@@ -331,9 +316,6 @@ pub fn sinkLabel(env: *Env, w: ast.Write) []const u8 {
     return connectorType(env, w.connector);
 }
 
-/// The summary label for a source. A file read carries its format in the path (or a
-/// `format` hint), not in the connector name, so it resolves separately; everything
-/// else is named by its connector.
 pub fn sourceLabel(env: *Env, rd: ast.Read, hints: []const ast.Hint) []const u8 {
     return switch (rd.form) {
         .path => |p| analyze.formatLabel(p, hints),
@@ -348,8 +330,6 @@ fn connectorType(env: *Env, name: []const u8) []const u8 {
     return name;
 }
 
-/// A single pre-computed batch, so a metadata answer can enter the pipeline
-/// through the ordinary scan path.
 pub const ConstSource = struct {
     batch: Batch,
     out: *const types.Schema,
@@ -376,8 +356,8 @@ pub fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sour
     return openSourceProjected(env, rd, hints, null, &.{});
 }
 
-/// `openSource`, with the column set the pipeline needs when it is known.
-/// Only the parquet reader can act on it; every other source ignores it.
+/// Only the parquet and Arrow readers act on `project`. Parquet readers are counted
+/// so a top-N bound is pushed only into a pipeline with exactly one of them.
 pub fn openSourceProjected(
     env: *Env,
     rd: ast.Read,
@@ -385,9 +365,6 @@ pub fn openSourceProjected(
     project: ?[][]const u8,
     bounds: []const pqdecode.Bound,
 ) !driver.Source {
-    // Track parquet readers so a top-N bound is only ever pushed into a pipeline
-    // with exactly one of them; with two the single slot would be ambiguous and
-    // could skip groups of the wrong file.
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
         if (try resolveFolder(env, rd.form.path, hints)) |fr| if (fr.kind == .parquet) {
             env.folder_memo = null;
@@ -409,8 +386,6 @@ pub fn openSourceProjected(
         env.pq_reader = pr;
         return pr.source();
     }
-    // An Arrow file converts only the columns asked for, as parquet decodes only
-    // those; the explicit format is honoured the way `openSourceAll` honours it.
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path and project != null) {
         var fdiag = analyze.Diag{};
         const want = analyze.formatFromHints(hints, &fdiag) catch null;
@@ -420,11 +395,9 @@ pub fn openSourceProjected(
     return openSourceCols(env, rd, hints, project);
 }
 
-/// A folder read (`path` ending in `/`): its format and the files it takes, or
-/// null when `path` is not a folder. Without `format` the listing decides — a
-/// folder of both Parquet and CSVs is refused, naming one of each; one of
-/// neither says so. Remembered until the source is open: the read is resolved
-/// twice on its way there, and each listing is a round trip.
+/// A folder's format and files, or null when `path` is not a folder. Without
+/// `format` the listing decides; a mix of Parquet and CSV is refused. Remembered
+/// until the source opens, since the read is resolved twice and listing is a round trip.
 pub fn resolveFolder(env: *Env, path: []const u8, hints: []const ast.Hint) !?FolderRead {
     if (!folder.isFolder(path)) return null;
     var fdiag = analyze.Diag{};
@@ -433,12 +406,10 @@ pub fn resolveFolder(env: *Env, path: []const u8, hints: []const ast.Hint) !?Fol
     return resolveFolderFmt(env, path, want);
 }
 
-/// `resolveFolder` with the read's `format` already taken from its hints.
 pub fn resolveFolderFmt(env: *Env, path: []const u8, want: ?analyze.FileFormat) !?FolderRead {
     if (!folder.isFolder(path)) return null;
     if (env.folder_memo) |m| if (std.mem.eql(u8, m.path, path)) return m.read;
     const all = folder.list(env.arena, path) catch |e| {
-        // a mistyped prefix and an empty one are the same listing: say which came back empty
         if (e == azure.Error.AzureEmptyPrefix)
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no blobs under prefix `{s}`", .{path}));
         if (e == s3.Error.S3EmptyPrefix)
@@ -475,7 +446,6 @@ fn openParquetFolder(env: *Env, path: []const u8, files: []const []const u8, pro
     return pf;
 }
 
-/// Count a parquet read into the run's pushdown tally.
 pub fn noteParquet(env: *Env, pr: *pqdecode.Reader) void {
     const t = env.scan orelse return;
     pr.tally = t;
@@ -527,7 +497,8 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
     return openSourceCols(env, rd, hints, null);
 }
 
-/// `openSourceAll`, a CSV converting only the columns `project` names.
+/// `openSourceAll`, a CSV converting only the columns `project` names. A union's
+/// branches already carry its `where` hint, so it is not folded in twice.
 fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[][]const u8) !driver.Source {
     if (std.mem.eql(u8, rd.connector, "request")) {
         const body = env.request_body orelse
@@ -586,8 +557,6 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         const fr = try resolveFolder(env, rd.form.path, hints);
         env.folder_memo = null;
         if (fr) |f| if (f.kind == .parquet) return (try openParquetFolder(env, rd.form.path, f.files, null)).source();
-        // An explicit `format` decides, so a parquet under an unusual name is not
-        // handed to the CSV parser; otherwise the extension does, as before.
         const boxed = csv.splitCodec(rd.form.path).codec != .none or csv.splitArchive(rd.form.path) != null;
         const rfmt = want orelse (if (!boxed and pqdecode.Reader.isPath(rd.form.path)) analyze.FileFormat.parquet else analyze.FileFormat.csv);
         if (rfmt == .parquet) {
@@ -601,14 +570,10 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         var ddiag = analyze.Diag{};
         const d = analyze.dialectFromHints(hints, &ddiag) catch
             return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg));
-        // `run` never analyzed the pipeline, so it repeats the plan-time question
-        // here: which member did you mean?
         if (analyze.archiveProblem(env.arena, rd.form.path, want, true)) |why|
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot read `{s}`: {s}", .{ rd.form.path, why }));
         const opened = if (fr) |f| csv.CsvReader.openList(env.arena, f.files, d) else csv.CsvReader.open(env.arena, rd.form.path, d);
         const reader = opened catch |e| {
-            // A mistyped prefix and a truly empty one are the same listing; say
-            // which prefix came back empty rather than blaming the CSV parser.
             if (e == azure.Error.AzureEmptyPrefix)
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no blobs under prefix `{s}`", .{rd.form.path}));
             if (e == error.NoCsvInFolder)
@@ -617,8 +582,6 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no files in folder `{s}`", .{rd.form.path}));
             if (e == s3.Error.S3EmptyPrefix)
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no objects under prefix `{s}`", .{rd.form.path}));
-            // A malformed container is not a CSV problem, and saying so sends the
-            // reader looking in the wrong place.
             const what: []const u8 = if (csv.splitArchive(rd.form.path) != null) "archive" else "input CSV";
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open {s} `{s}` ({s})", .{ what, rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
         };
@@ -628,8 +591,6 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
     const conn = env.connections.get(rd.connector) orelse
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown connection `{s}`", .{rd.connector}));
     var rd_eff = rd;
-    // A union puts its `where` hint into each branch read already; folding the
-    // same predicate in twice sent `(p) AND (p)` to the source.
     if (forHintName(hints, "where")) |wh| {
         if (wh.len > 0 and !std.mem.eql(u8, wh, rd.where)) {
             rd_eff.where = if (rd.where.len > 0)
@@ -683,8 +644,8 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unsupported source connector `{s}`", .{conn.connector}));
 }
 
-/// Resolve a RANGE bound to an i64 at plan time: params substitute as
-/// literals; a leading `-` is folded here since substExpr doesn't.
+/// Params substitute as literals; a leading `-` is folded here since `substExpr`
+/// does not.
 fn rangeBound(env: *Env, e: *const ast.Expr) !i64 {
     const r = try analyze.substExpr(env.arena, e, env.params_expr);
     switch (r.*) {
@@ -695,9 +656,8 @@ fn rangeBound(env: *Env, e: *const ast.Expr) !i64 {
     return planErr(env.diag, "RANGE bounds must be integer literals or integer params");
 }
 
-/// Open a SQL Server connection: Azure AD (ROPC token -> FEDAUTH) for `auth =
-/// aad`, Windows NTLMv2 or Kerberos (SSPI) for `auth = ntlm` / `kerberos`, else
-/// a normal SQL login.
+/// Azure AD (ROPC token, FEDAUTH) for `auth = aad`, NTLMv2 or Kerberos for
+/// `ntlm` / `kerberos`, else a SQL login.
 fn tdsConnect(gpa: std.mem.Allocator, cfg_in: DbConfig) !*tds.Conn {
     var cfg = cfg_in;
     const hi = ssrp.splitHostInstance(cfg.host);
@@ -728,9 +688,8 @@ fn tdsConnect(gpa: std.mem.Allocator, cfg_in: DbConfig) !*tds.Conn {
     return tds.Conn.connectAad(gpa, cfg.host, cfg.port, token, cfg.database, mode);
 }
 
-/// Split a Windows login into domain + user. `user = 'DOMAIN\me'` carries the
-/// domain inline; an explicit `domain` option wins when both are given, but the
-/// `DOMAIN\` prefix is stripped off the user name either way.
+/// `user = 'DOMAIN\me'` carries the domain inline; an explicit `domain` wins,
+/// but the prefix is stripped from the user either way.
 fn ntlmCredential(cfg: DbConfig) ntlm.Credential {
     var domain = cfg.domain;
     var user = cfg.user;
@@ -741,15 +700,12 @@ fn ntlmCredential(cfg: DbConfig) ntlm.Credential {
     return .{ .domain = domain, .user = user, .password = cfg.password };
 }
 
-/// One key-dispatch for the shared DB connection attributes. `f` supplies the
-/// values: `resolveDbConfig` evaluates them strictly and reports through the
-/// diag. It is generic because a second, lenient fetcher used to exist for
-/// offline resolution; the seam is kept so one can return without moving this.
+/// `f` fetches each value. Generic because a lenient offline fetcher once existed;
+/// the seam is kept so one can return. `fe_host`/`fe_port` are StarRocks spellings.
 fn parseDbConfig(conn: ast.Connection, default_port: u16, f: anytype) anyerror!DbConfig {
     var cfg = DbConfig{ .port = default_port };
     for (conn.config) |attr| {
         const k = attr.key;
-        // `fe_host`/`fe_port` are the StarRocks spellings of the same two attributes.
         if (eqlAny(k, &.{ "port", "fe_port" })) {
             if (try f.port(attr.value)) |p| {
                 cfg.port = p;
@@ -790,8 +746,6 @@ fn parseDbConfig(conn: ast.Connection, default_port: u16, f: anytype) anyerror!D
     return cfg;
 }
 
-/// Strict attribute fetcher for `parseDbConfig`: literals + env()/secret(), with
-/// plan errors on anything unresolvable (the run-time path).
 const EnvCfg = struct {
     env: *Env,
     fn str(self: EnvCfg, e: *const ast.Expr) !?[]const u8 {
@@ -829,7 +783,6 @@ fn readSql(env: *Env, rd: ast.Read) ![]const u8 {
     return sqlWithWhere(env.arena, base, rd.form == .query, rd.where);
 }
 
-/// `*`, or the read's projected columns quoted for the connection's dialect.
 fn selectList(env: *Env, rd: ast.Read) ![]const u8 {
     if (rd.cols.len == 0) return "*";
     const conn = env.connections.get(rd.connector) orelse return "*";
@@ -847,15 +800,8 @@ pub fn selectListFor(arena: std.mem.Allocator, dialect: sql.Dialect, cols: []con
     return out.toOwnedSlice();
 }
 
-/// A read with `cols` narrowed to what the stages after it need — when that can be
-/// proven and the read is a SQL table; any other read is returned as it is. The
-/// projection is only ever a superset of what the engine reads next, so a wrong
-/// guess fails loudly at the source, never quietly.
-///
-/// `SELECT * EXCEPT (...)` is the one star the source can be spared: the table's
-/// columns are learnt with a metadata-only probe and all but the excepted ones
-/// asked for by name — a 79 GB XML column nobody wants then never leaves the
-/// server, instead of crossing the wire to be dropped here.
+/// After a join an unqualified name may be the other side's, so only the table's
+/// own columns are kept, learnt from a zero-row probe; a failed probe reads all.
 pub fn projectSqlRead(env: *Env, stages: []const ast.Stage) ![]const ast.Stage {
     if (stages.len == 0 or stages[0].node != .read) return stages;
     const rd = stages[0].node.read;
@@ -868,10 +814,6 @@ pub fn projectSqlRead(env: *Env, stages: []const ast.Stage) ![]const ast.Stage {
     };
     if (cols.len == 0) return stages;
     for (cols) |c| if (std.mem.indexOfScalar(u8, c, '.') != null) return stages;
-    // After a join an unqualified name may be the other side's, and a column
-    // list naming one the table lacks is a query the database refuses. Keep
-    // only the table's own columns, learnt from a zero-row probe; when the
-    // probe fails, read every column rather than guess.
     var own = cols;
     for (stages[1..]) |st| if (st.node == .join) {
         own = (try tableColumnsAmong(env, rd, stages[0].hints, cols)) orelse return stages;
@@ -885,8 +827,6 @@ pub fn projectSqlRead(env: *Env, stages: []const ast.Stage) ![]const ast.Stage {
     return out;
 }
 
-/// Those of `names` the table `rd` reads has, in its own spelling. Null when the
-/// probe fails.
 fn tableColumnsAmong(env: *Env, rd: ast.Read, hints: []const ast.Hint, names: []const []const u8) !?[]const []const u8 {
     var probe = rd;
     probe.where = "1 = 0";
@@ -903,8 +843,8 @@ fn tableColumnsAmong(env: *Env, rd: ast.Read, hints: []const ast.Hint, names: []
     return try out.toOwnedSlice();
 }
 
-/// The names a `SELECT * EXCEPT (...)` directly after the read leaves out, when
-/// that select has no other star (a plain `*` beside it would want everything).
+/// The names a `SELECT * EXCEPT (...)` right after the read leaves out, when that
+/// select has no other star.
 fn starExcept(after: []const ast.Stage) ?[]const []const u8 {
     if (after.len == 0 or after[0].node != .select) return null;
     var found: ?[]const []const u8 = null;
@@ -916,9 +856,6 @@ fn starExcept(after: []const ast.Stage) ?[]const []const u8 {
     return found;
 }
 
-/// Every column of the table `rd` reads, minus `except` — learnt from the source
-/// itself by asking for its shape and no rows. Null when the probe fails: the
-/// read then goes out as `SELECT *`, as before.
 pub fn exceptColumns(env: *Env, rd: ast.Read, hints: []const ast.Hint, except: []const []const u8) !?[]const []const u8 {
     var probe = rd;
     probe.where = "1 = 0";
@@ -938,11 +875,8 @@ pub fn exceptColumns(env: *Env, rd: ast.Read, hints: []const ast.Hint, except: [
     return try out.toOwnedSlice();
 }
 
-/// Compose a pushed-down predicate into a read's SQL. Table reads get a plain
-/// `WHERE`; query reads are wrapped as a subquery so the predicate composes with
-/// whatever the query already filters (same shape split.zig uses for lane ranges).
-/// An empty predicate is "no WHERE" — a for-loop `${var}` that rendered empty
-/// (e.g. no `since` field on a full extraction) falls through to a full scan.
+/// Table reads get a plain `WHERE`; query reads are wrapped as a subquery. An
+/// empty predicate (a `${var}` that rendered empty) means a full scan.
 pub fn sqlWithWhere(arena: std.mem.Allocator, base: []const u8, is_query: bool, where: []const u8) ![]const u8 {
     if (where.len == 0) return base;
     if (is_query) return std.fmt.allocPrint(arena, "SELECT * FROM ({s}) _w WHERE {s}", .{ base, where });
@@ -957,12 +891,8 @@ fn sqlDescFor(env: *Env, kind: SqlKind, dialect: sql.Dialect, cfg: DbConfig, bas
     return .{ .kind = kind, .dialect = dialect, .cfg = cfg, .base_sql = base_sql, .table = table, .read = rd };
 }
 
-/// The `SqlDesc` a read stage would produce, recomputed without opening anything.
-/// `env.sql_desc` is last-writer-wins across every SQL source a plan opens, and a join
-/// plans its build side *after* the probe read — so a pipeline with a SQL binding
-/// leaves `env.sql_desc` describing the binding, not the read. Mirrors
-/// `openSourceProjected`: the `where` hint folds into the read the same way.
-/// Null → not a splittable SQL read.
+/// Recomputed rather than read from `env.sql_desc`, which is last-writer-wins: a
+/// join plans its build side after the probe read. Null for a non-splittable read.
 pub fn sqlDescForStage(env: *Env, stage: ast.Stage) !?SqlDesc {
     if (stage.node != .read) return null;
     var rd = stage.node.read;
@@ -981,8 +911,6 @@ pub fn sqlDescForStage(env: *Env, stage: ast.Stage) !?SqlDesc {
     return try sqlDescFor(env, info.kind, info.dialect, cfg, try readSql(env, rd), rd);
 }
 
-/// Pull `@[split = col]` / `@[splits = N]` / `@[split_kind = int|uuid|date]`
-/// off the leading read stage.
 const SplitHints = struct { col: ?[]const u8 = null, count: ?usize = null, kind: ?split.KeyKind = null };
 fn splitHints(stage: ast.Stage) SplitHints {
     var h = SplitHints{};
@@ -998,15 +926,12 @@ fn splitHints(stage: ast.Stage) SplitHints {
     return h;
 }
 
-/// Try to build a split plan for a map-only SQL pipeline. Returns null (→ run
-/// serial) when the source isn't a splittable SQL table/query, no usable key is
-/// found, or the table is too small to split.
-/// True when this sink is the Postgres COPY path (append/overwrite to a postgres
-/// connection), which benchmarks faster run serially than split — see planSplit.
 fn isPostgresCopySink(env: *Env, w: ast.Write) bool {
     return w.mode != .upsert and std.mem.eql(u8, connectorType(env, w.connector), "postgres");
 }
 
+/// Null (run serial) when the read is not splittable, no key is usable, or the
+/// table is too small. A projection that dropped the split key takes it back.
 pub fn planSplit(env: *Env, desc: SqlDesc, lead: ast.Stage, threads: usize, w: ast.Write) !?split.Plan {
     const hints = splitHints(lead);
     const forced = hints.col != null or hints.count != null;
@@ -1027,8 +952,6 @@ pub fn planSplit(env: *Env, desc: SqlDesc, lead: ast.Stage, threads: usize, w: a
     } else {
         return null;
     }
-    // A lane's range predicate is applied over the base query, so a projection
-    // that left the key out has to take it back in.
     var base = desc.base_sql;
     if (desc.read.cols.len > 0) {
         var has = false;
@@ -1055,18 +978,15 @@ fn proberOpen(ctx_ptr: *anyopaque) anyerror!sql.Conn {
 
 pub const SqlConnInfo = registry.SqlRead;
 
-/// What a `CREATE CONNECTION` resolves to when it can be read over a SQL wire
-/// protocol; null for every other connector. A `starrocks` connection qualifies
-/// (see `Connector.sqlRead`) — its *sink* is stream load, which every write path
-/// checks for before asking this.
+/// Null for connectors without a SQL wire protocol. A `starrocks` connection
+/// qualifies for reads; every write path checks for Stream Load first.
 pub fn sqlConnInfo(conn: ast.Connection) ?SqlConnInfo {
     const c = registry.Connector.parse(conn.connector) orelse return null;
     return c.sqlRead();
 }
 
-/// Every connection carries `user`/`password` — explicit, or the parser's
-/// env(NAME_USER/NAME_PASS) default — but an http connection reads them only
-/// for basic auth, and for oauth2 where no client_id/client_secret is given.
+/// Every connection carries `user`/`password`, but http reads them only for
+/// basic auth, and for oauth2 without client_id/client_secret.
 fn httpAttrUsed(conn: ast.Connection, auth: []const u8, key: []const u8) bool {
     const alias: []const u8 = if (std.mem.eql(u8, key, "user"))
         "client_id"
@@ -1082,8 +1002,7 @@ fn httpAttrUsed(conn: ast.Connection, auth: []const u8, key: []const u8) bool {
     return true;
 }
 
-/// The `query:<name>` hints `conn.GET(path, name = value)` leaves, in order;
-/// a name given twice (a resource's, then the read's own) keeps the later value.
+/// A name given twice (a resource's, then the read's own) keeps the later value.
 fn queryParams(arena: std.mem.Allocator, hints: []const ast.Hint) ![]const http_client.KV {
     var out = std.array_list.Managed(http_client.KV).init(arena);
     for (hints) |h| {
@@ -1122,12 +1041,8 @@ pub fn dupeSchema(arena: std.mem.Allocator, s: types.Schema) !types.Schema {
     return .{ .fields = fields };
 }
 
-/// What the source's catalog says of each column of a SQL table read — whether
-/// it is text, and how its collation compares — for deciding which text
-/// comparisons can descend (`pushdown.ColFacts`). Asked once per run and table,
-/// and only when a comparison would descend differently for knowing. Null for a
-/// read that is not a SQL table. A catalog that cannot be asked (no permission, an
-/// old server) answers nothing, which keeps every text comparison in the engine.
+/// Per-column text and collation facts that decide which text comparisons may
+/// descend. A catalog that cannot be asked answers nothing, keeping them in the engine.
 pub fn columnFacts(env: *Env, rd: ast.Read) !?*const pushdown.Facts {
     if (rd.form != .table) return null;
     const conn = env.connections.get(rd.connector) orelse return null;
@@ -1150,16 +1065,14 @@ pub fn columnFacts(env: *Env, rd: ast.Read) !?*const pushdown.Facts {
     return facts;
 }
 
-/// `columnFacts`, but only when some filter in `stages` would descend differently
-/// for them — most pipelines never pay the catalog round trip.
 pub fn factsIfWanted(env: *Env, rd: ast.Read, dialect: sql.Dialect, stages: []const ast.Stage, schema: types.Schema, check_fields: bool, need: pushdown.Need) !?*const pushdown.Facts {
     if (rd.form != .table) return null;
     if (!try pushdown.wantsFacts(env.arena, dialect, stages, schema, check_fields, need)) return null;
     return columnFacts(env, rd);
 }
 
+/// Restores the run's diag, so a failed probe leaves no message behind.
 fn probeFacts(env: *Env, ca: std.mem.Allocator, conn: ast.Connection, info: SqlConnInfo, parts: []const []const u8, out: *pushdown.Facts) !void {
-    // the diag is the run's: a failed probe must not leave a message behind
     const saved = env.diag.*;
     defer env.diag.* = saved;
     const cfg = try resolveDbConfig(env, conn, info.port);
@@ -1196,14 +1109,12 @@ fn flag(v: Value) bool {
     };
 }
 
-/// One row per column: its name, then whether it is text, compares by byte,
-/// ignores trailing spaces, and is two or more bytes a character.
+/// One row per column: name, is text, compares by byte, ignores trailing spaces,
+/// multi-byte. Byte order is judged from the server's own collation data (C/POSIX,
+/// builtin, `_bin`/`_BIN2`), never a locale's name; musl libc locales compare bytes.
 fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []const u8) ![]const u8 {
     const table = parts[parts.len - 1];
     switch (dialect) {
-        // A `_BIN2` collation compares code points; `_BIN` does too on a single-byte
-        // type (on nchar it compares the rest of a string little-endian). Every
-        // SQL Server string comparison pads with spaces.
         .sqlserver => {
             var obj = std.array_list.Managed(u8).init(arena);
             for (parts, 0..) |p, i| {
@@ -1222,14 +1133,6 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\FROM sys.columns c WHERE c.object_id = OBJECT_ID({s})
             , .{try sqlLit(arena, obj.items)});
         },
-        // Byte (code point) order, from what the server says rather than a
-        // locale's name: `C`, `POSIX` and `ucs_basic`; the builtin provider
-        // (PG 17), which sorts by code point; never an ICU collation; and a libc
-        // one only where libc compares bytes — a C locale, or any locale on a
-        // musl build, whose strcoll is strcmp (an Alpine `en_US.utf8` sorts
-        // 'B' < 'a'). `to_jsonb` reads the provider columns without failing on
-        // a server too old to have them (libc then, the only provider it had).
-        // citext compares case-insensitively whatever its collation.
         .postgres => {
             var obj = std.array_list.Managed(u8).init(arena);
             for (parts, 0..) |p, i| {
@@ -1260,8 +1163,6 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\WHERE a.attrelid = {s}::regclass AND a.attnum > 0 AND NOT a.attisdropped AND d.datname = current_database()
             , .{try sqlLit(arena, obj.items)});
         },
-        // A `_bin` collation (or `binary`) compares bytes; PAD SPACE is mysql's
-        // default pad attribute, NO PAD only the 0900 family's.
         .mysql => {
             const schema = if (parts.len >= 2) try sqlLit(arena, parts[parts.len - 2]) else "DATABASE()";
             return std.fmt.allocPrint(arena,
@@ -1274,8 +1175,6 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\WHERE c.TABLE_SCHEMA = {s} AND c.TABLE_NAME = {s}
             , .{ schema, try sqlLit(arena, table) });
         },
-        // StarRocks and Doris have no collations: strings compare by byte. A
-        // CHAR is taken as padding, to be safe.
         .starrocks, .doris => {
             const schema = if (parts.len >= 2) try sqlLit(arena, parts[parts.len - 2]) else "DATABASE()";
             return std.fmt.allocPrint(arena,
@@ -1306,10 +1205,8 @@ fn qualStr(arena: std.mem.Allocator, q: ast.QualName) ![]const u8 {
     return std.mem.join(arena, ".", q.parts);
 }
 
-/// Bare `upsert` (no `on <key>`) infers the upsert keys from the source table's
-/// primary key at plan time. Needs the lead read to be a SQL `table` source
-/// (env.sql_desc.table set); a `query` source or non-SQL source can't be
-/// introspected and gets a clear error pointing at `upsert on <col>`.
+/// Bare `upsert` takes its keys from the source table's primary key; a non-table
+/// source gets an error pointing at `upsert on <col>`.
 pub fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
     if (w.mode != .upsert or w.mode.upsert.keys.len > 0) return w;
     const desc = env.sql_desc orelse return planErr(env.diag, "`upsert` without `on <key>` infers the primary key from the source, which needs a SQL `table` read — this pipeline's source can't be introspected; name the key with `upsert on <col>`");
@@ -1325,35 +1222,20 @@ pub fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
     return out;
 }
 
-/// Narrows a write disposition to how a file target is opened. A bare `LOAD INTO`
-/// and an explicit `REPLACE` both create-or-truncate — one-shot output is what a
-/// file sink is for, and that is unchanged. Only an explicit `APPEND` accumulates,
-/// and only where bytes can actually be added to what is already there: a parquet
-/// footer indexes the whole file and is written last, and a block blob is committed
-/// as a new object rather than extended, so both are refused here instead of
-/// quietly truncating the target the pipeline meant to grow.
 fn fileWriteMode(env: *Env, w: ast.Write) !driver.FileMode {
     if (w.mode != .append) return .truncate;
     const why = analyze.appendUnsupported(w.target) orelse return .append;
     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`APPEND` into `{s}` is not supported: {s}. Use `REPLACE`, write each run to its own path, or accumulate with `INTO BUFFER` and load the buffer once", .{ w.target, why }));
 }
 
-/// Refuse a file path whose extension names no format basalt reads.
-///
-/// `check` applies this through `analyze`, but `run` does not analyze the pipeline
-/// first, so without this call the runtime still parsed a `.zip` as CSV and
-/// answered `SELECT COUNT(*)` with the newline count of its deflate stream.
+/// `run` does not analyze first; without this a `.zip` was parsed as CSV and
+/// `COUNT(*)` answered with its deflate stream's newline count.
 pub fn guardFileFormat(env: *Env, path: []const u8, explicit: ?analyze.FileFormat, comptime verb: []const u8) !void {
     const unwritable = if (comptime std.mem.eql(u8, verb, "write")) analyze.unwritableTarget(path, explicit) else null;
     if (unwritable orelse analyze.unreadableTarget(path, explicit)) |why|
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot " ++ verb ++ " `{s}`: {s}", .{ path, why }));
 }
 
-/// A stdout result's sink, wrapped for whatever the run asked of it: report the
-/// result once closed (the session kernel), and keep only its first rows
-/// (`--max-rows`). Rows are counted atomically, since lanes render outside a
-/// shared sink's lock. A capped result takes the plain write path so each batch
-/// passes through the cap; its render path would format rows it then drops.
 const StdoutSink = struct {
     inner: driver.Sink,
     gpa: std.mem.Allocator,
@@ -1376,13 +1258,10 @@ const StdoutSink = struct {
             _ = self.rows.fetchAdd(b.len, .monotonic);
             return;
         };
-        // Lanes may share this sink; the cap's arithmetic must see them in turn.
         self.mu.lock();
         defer self.mu.unlock();
         const room = c.max - c.kept;
         if (b.len > room) {
-            // More rows than the cap keeps: the result is cut, and nothing
-            // upstream needs to run any further.
             c.truncated = true;
             driver.requestStop();
         }
@@ -1484,10 +1363,6 @@ fn openStdoutSink(env: *Env, schema: types.Schema, info: arrow.ResultInfo) !driv
 fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (std.mem.eql(u8, w.connector, "csv")) {
         const fmode = try fileWriteMode(env, w);
-        // A `.parquet` target shares the csv connector but is a different format;
-        // without this it would be written as CSV text under a .parquet name. An
-        // explicit `WITH (format = ...)` overrides the extension.
-        // Nor as CSV under a workbook's name: Excel is read, not written.
         if ((env.fmt_out == null and xlsx.isPath(w.target)) or env.fmt_out == .xlsx)
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: basalt reads Excel workbooks but does not write them; write a `.csv` or `.parquet`", .{w.target}));
         const wfmt = env.fmt_out orelse (if (pqwrite.Writer.isPath(w.target)) analyze.FileFormat.parquet else if (arrowread.isPath(w.target)) analyze.FileFormat.arrow else analyze.FileFormat.csv);
@@ -1541,7 +1416,6 @@ fn resolveStreamLoadConfig(env: *Env, conn: ast.Connection, flavor: streamload.F
         if (eqlAny(k, &.{ "host", "fe_host" })) {
             cfg.fe_host = try evalCfgStr(env, attr.value);
         } else if (eqlAny(k, &.{ "port", "fe_port" })) {
-            // `port`, as the read side and the connection wizard spell it, too
             cfg.fe_port = @intCast(try evalCfgInt(env, attr.value));
         } else if (eqlAny(k, &.{ "be_url", "load_url" })) {
             cfg.load_url = try evalCfgStr(env, attr.value);
@@ -1567,10 +1441,8 @@ fn resolveStreamLoadConfig(env: *Env, conn: ast.Connection, flavor: streamload.F
     return cfg;
 }
 
-/// Make a `CREATE CONNECTION name TYPE sftp` reachable as `sftp://name/…`.
-/// A password is optional (a key logs in without one), so the convention's
-/// `NAME_PASS` default may be unset; an option it does not know is an error
-/// naming the ones it does.
+/// A password is optional (a key logs in without one); an unknown option is an
+/// error naming the known ones.
 pub fn registerSftp(env: *Env, conn: ast.Connection) !void {
     if (!std.mem.eql(u8, conn.connector, "sftp")) return;
     var c = sftp.Conn{ .host = "" };
@@ -1601,10 +1473,8 @@ pub fn registerSftp(env: *Env, conn: ast.Connection) !void {
     try sftp.register(conn.name, c);
 }
 
-/// Make a `CREATE CONNECTION name TYPE smb` reachable as `smb://name/…`. With a
-/// `share`, a path under the name is inside that share; without one its first
-/// part names the share. An option it does not know is an error naming the
-/// ones it does.
+/// With a `share`, paths under the name are inside it; without one the first path
+/// part names the share. An unknown option is an error naming the known ones.
 pub fn registerSmb(env: *Env, conn: ast.Connection) !void {
     if (!std.mem.eql(u8, conn.connector, "smb")) return;
     var c = smb.Conn{ .host = "" };
@@ -1642,7 +1512,6 @@ pub fn registerSmb(env: *Env, conn: ast.Connection) !void {
     try smb.register(conn.name, c);
 }
 
-/// A config string, or null for an `env(...)` that is not set.
 fn optCfgStr(env: *Env, expr: *const ast.Expr) !?[]const u8 {
     if (expr.* == .call) {
         const c = expr.call;
@@ -1687,8 +1556,6 @@ fn evalCfgBool(env: *Env, expr: *const ast.Expr) !bool {
     };
 }
 
-/// A `driver.Source` yielding one in-memory batch then EOF — used to run a small
-/// post-aggregate `sort`/`limit` tail over the merged result.
 pub const OneBatch = struct {
     b: ?Batch,
     sch: types.Schema,

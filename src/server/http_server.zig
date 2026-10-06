@@ -1,11 +1,22 @@
 //! HTTP trigger host for `@http` scripts. Each matching request runs the pipeline
 //! once: query-string values bind params, the request body feeds `read request`,
 //! and the response is a JSON run summary. Single-threaded accept loop (one request
-//! at a time) — scale out with replicas behind a load balancer.
+//! at a time); scale out with replicas behind a load balancer.
 //!
 //! Two entry points: `serve` hosts a single program; `serveDir` hosts every `@http`
 //! script in a directory, routing by each script's declared `@http(path=…)` and
-//! reloading the directory on SIGHUP (the control plane writes scripts, then signals).
+//! reloading on SIGHUP (the control plane writes scripts, then signals). The
+//! listener has a 1s accept timeout so the loop re-checks the shutdown and reload
+//! flags even when idle. `g_log` is the host's one logger, shared by every route
+//! and the flusher, so `--log-format json` covers loads, reloads and flush failures.
+//!
+//! `ACCEPT ... INTO BUFFER` endpoints validate a request against the declared
+//! schema, append it to the WAL as JSONL and ack only after fsync; past the
+//! `MAX n MB|GB` limit (1 GiB default) they answer 503 with Retry-After, so the
+//! client is the queue. A flusher thread drains completed segments through the
+//! pipeline, one run per segment, labelled after it (prefix = segment stem,
+//! run_id = seq), so a replay produces identical labels and the sink dedups. A
+//! failed segment stops the drain, preserving order, and retries on the next tick.
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
@@ -16,9 +27,6 @@ const obs = @import("../runtime/obs.zig");
 const Wal = @import("../connect/wal.zig").Wal;
 const request = @import("../connect/request.zig");
 
-/// The host's own logger, in the format and at the level the CLI asked for, so
-/// `--log-format json` covers route loads, reloads and flush failures — not just
-/// the runs they trigger. One per process: every route and the flusher share it.
 var g_log: obs.Logger = undefined;
 var g_log_cfg: runtime.LogConfig = .{};
 
@@ -37,21 +45,15 @@ pub const Route = struct {
     program: ast.Program,
     label: []const u8,
     doc: []const u8 = "",
-    /// Set for `ACCEPT ... INTO BUFFER` endpoints: requests are validated,
-    /// appended to the WAL, and acked after fsync; a flusher thread drains
-    /// completed segments through the program's pipeline.
     buf: ?*BufState = null,
 };
 
-/// Shared state of one buffered endpoint (accept loop + flusher thread).
 pub const BufState = struct {
     wal: Wal,
     decl: ast.BufferDecl,
     program: ast.Program,
     flush_secs: u64 = 5,
     flush_rows: u64 = 50_000,
-    /// Backpressure limit (`MAX n MB|GB` on the declaration; 1 GiB default):
-    /// bytes on disk beyond this ⇒ 503 + Retry-After (the client is the queue).
     max_bytes: u64 = 1 << 30,
     rows_since: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -65,8 +67,6 @@ pub const BufState = struct {
     }
 };
 
-/// Build the flusher state for a buffered program (or null). `FLUSH EVERY n
-/// SECONDS [OR n ROWS]` comes from the program's `FROM BUFFER` stage hints.
 pub fn initBufState(gpa: std.mem.Allocator, program: ast.Program) !?*BufState {
     if (program.stmts.len == 0 or program.stmts[0] != .kind) return null;
     const decl = program.stmts[0].kind.buffer orelse return null;
@@ -94,10 +94,8 @@ pub fn initBufState(gpa: std.mem.Allocator, program: ast.Program) !?*BufState {
     return bs;
 }
 
-/// Accept-path: validate the body against the declared schema and append one
-/// JSONL line per row, acking only after fsync. Returns the row count.
-/// Errors map to statuses: BodySchemaViolation/bad JSON ⇒ 422 (msg says why),
-/// Backpressure ⇒ 503.
+/// Returns the row count. BodySchemaViolation or bad JSON maps to 422 (with
+/// `msg_out` saying why), Backpressure to 503.
 pub fn acceptIntoBuffer(bs: *BufState, arena: std.mem.Allocator, body: []const u8, msg_out: *[]const u8) !usize {
     if (bs.wal.bytesOnDisk() > bs.max_bytes) return error.Backpressure;
 
@@ -128,10 +126,6 @@ pub fn acceptIntoBuffer(bs: *BufState, arena: std.mem.Allocator, body: []const u
     return items.len;
 }
 
-/// Drain every completed segment through the program's pipeline, one run per
-/// segment, labeled after it (label prefix = segment stem, run_id = seq — a
-/// replay produces identical labels, and the sink dedups). A failed segment
-/// stops the drain (order preserved); it retries on the next flush tick.
 pub fn drainPending(gpa: std.mem.Allocator, bs: *BufState) void {
     const pending = bs.wal.pendingSegments(gpa) catch |e| {
         log(.err, "buffer {s}: listing segments failed: {s}", .{ bs.decl.name, @errorName(e) });
@@ -180,23 +174,18 @@ fn flusherMain(gpa: std.mem.Allocator, bs: *BufState) void {
     drainPending(gpa, bs);
 }
 
-/// Spawn the flusher for a buffered route.
 pub fn startFlusher(gpa: std.mem.Allocator, bs: *BufState) !void {
     bs.thread = try std.Thread.spawn(.{}, flusherMain, .{ gpa, bs });
 }
 
-/// The `@http(path=…)` of a program (defaults to "/").
 fn httpPath(program: ast.Program) []const u8 {
     return httpAttr(program, "path") orelse "/";
 }
 
-/// The optional `@http(doc=…)` route description (empty when unset). Surfaced in the
-/// startup banner so `basalt serve` self-documents what each route does.
 fn httpDoc(program: ast.Program) []const u8 {
     return httpAttr(program, "doc") orelse "";
 }
 
-/// The string value of an `@http(<key>=…)` config attribute, or null if absent.
 fn httpAttr(program: ast.Program, key: []const u8) ?[]const u8 {
     if (program.stmts.len == 0 or program.stmts[0] != .kind) return null;
     var v: ?[]const u8 = null;
@@ -206,8 +195,6 @@ fn httpAttr(program: ast.Program, key: []const u8) ?[]const u8 {
     return v;
 }
 
-/// Listen on `0.0.0.0:port` with a 1s accept timeout so the loop re-checks the
-/// shutdown/reload flags even when idle (SIGTERM/SIGHUP take effect within ~1s).
 fn listen(port: u16) !std.net.Server {
     const address = try std.net.Address.parseIp("0.0.0.0", port);
     var net_server = try address.listen(.{ .reuse_address = true });
@@ -227,7 +214,6 @@ fn banner(port: u16, routes: []const Route) void {
     }
 }
 
-/// Serve a single `@http` program.
 pub fn serve(gpa: std.mem.Allocator, program: ast.Program, port: u16, log_cfg: runtime.LogConfig) !void {
     initLog(log_cfg);
     const bs = try initBufState(gpa, program);
@@ -264,9 +250,8 @@ const Registry = struct {
     }
 };
 
-/// Parse every `*.sql` `CREATE ENDPOINT` script in `dir_path` into a route table. Non-endpoint
-/// scripts and parse failures are skipped (logged), so one bad file doesn't take
-/// down the rest of the fleet.
+/// Route table of every `CREATE ENDPOINT` `*.sql` script in `dir_path`. Other
+/// scripts and parse failures are logged and skipped, so one bad file spares the rest.
 fn loadDir(gpa: std.mem.Allocator, dir_path: []const u8) !Registry {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
@@ -282,7 +267,6 @@ fn loadDir(gpa: std.mem.Allocator, dir_path: []const u8) !Registry {
             log(.warn, "skip {s}: read failed: {s}", .{ entry.name, @errorName(e) });
             continue;
         };
-        // `@include` paths in an endpoint script resolve against the served dir.
         var pdiag: include.Diag = .{};
         const prog = include.loadProgram(a, text, entry.name, dir_path, &pdiag) catch {
             const at = if (pdiag.label.len > 0) pdiag.label else entry.name;
@@ -320,9 +304,8 @@ fn loadDir(gpa: std.mem.Allocator, dir_path: []const u8) !Registry {
     return .{ .gpa = gpa, .arena = arena, .routes = try routes.toOwnedSlice() };
 }
 
-/// A cheap content fingerprint of the `.sql` files in `dir_path` (name + mtime +
-/// size). Changes when a script is added, removed, or edited — including when a
-/// git-sync `current` symlink repoints to a fresh checkout. 0 on error.
+/// A cheap fingerprint (name + mtime + size) of the `.sql` files in `dir_path`; it
+/// changes when a git-sync `current` symlink repoints. 0 on error.
 fn dirFingerprint(dir_path: []const u8) u64 {
     var fp: u64 = 0xcbf29ce484222325;
     var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return 0;
@@ -338,9 +321,8 @@ fn dirFingerprint(dir_path: []const u8) u64 {
     return fp;
 }
 
-/// Serve every `@http` script in a directory, routing by path. Reloads on SIGHUP,
-/// and — when `watch` is set — automatically when the directory's contents change
-/// (e.g. a git-sync sidecar pulled new scripts), checked at most every ~2s.
+/// With `watch` set, also reloads when the directory's contents change, checked
+/// at most every ~2s.
 pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, port: u16, watch: bool, log_cfg: runtime.LogConfig) !void {
     initLog(log_cfg);
     var reg = try loadDir(gpa, dir_path);
@@ -514,8 +496,6 @@ fn handleConn(gpa: std.mem.Allocator, routes: []const Route, conn: std.net.Serve
     }
 }
 
-/// Write `s` JSON-string-escaped (no surrounding quotes) — error messages may
-/// contain quotes/newlines that would otherwise break the response body.
 fn writeJsonStr(w: anytype, s: []const u8) !void {
     for (s) |c| switch (c) {
         '"' => try w.writeAll("\\\""),
@@ -527,9 +507,8 @@ fn writeJsonStr(w: anytype, s: []const u8) !void {
     };
 }
 
-/// Bind every `FROM HEADER` param whose header is present in `headers`.
-/// The header to match is `header_name` (`FROM HEADER('X-Tenant')`) or, bare,
-/// the param's own name. Header names compare case-insensitively (RFC 9110).
+/// Bind every `FROM HEADER` param whose header (`header_name`, else the param's own
+/// name) is present. Header names compare case-insensitively (RFC 9110).
 fn bindHeaderParams(
     params: *std.array_list.Managed(runtime.ParamArg),
     program: ast.Program,
@@ -550,11 +529,8 @@ fn bindHeaderParams(
     }
 }
 
-/// Drop any binding whose key names a statement-level `LET`. Header binding walks
-/// declared params only, but the query string is whatever the caller typed — and a
-/// LET is sealed: it is not part of the endpoint's parameter surface, so `?cutoff=x`
-/// is ignored here rather than reaching the planner (where `-p cutoff=x` is an
-/// error, the command line having no reason to name one).
+/// Drop any query-string binding that names a statement-level `LET`: a LET is
+/// sealed, not part of the endpoint's parameter surface.
 fn dropLetParams(params: *std.array_list.Managed(runtime.ParamArg), program: ast.Program) void {
     var i: usize = 0;
     while (i < params.items.len) {
@@ -571,7 +547,7 @@ fn dropLetParams(params: *std.array_list.Managed(runtime.ParamArg), program: ast
     }
 }
 
-/// Parse a `k=v&k2=v2` query string into params (no percent-decoding for now).
+/// Parse a `k=v&k2=v2` query string into params, with no percent-decoding.
 fn parseQuery(params: *std.array_list.Managed(runtime.ParamArg), query: []const u8) !void {
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
@@ -673,7 +649,6 @@ test "buffered endpoint: accept -> WAL -> drain through the pipeline" {
     try std.testing.expectEqual(@as(u64, 0), bs.wal.bytesOnDisk());
 }
 
-/// Accept exactly `n` connections and handle each (test harness).
 fn acceptN(gpa: std.mem.Allocator, routes: []const Route, srv: *std.net.Server, n: usize) void {
     var read_buf: [64 * 1024]u8 = undefined;
     var i: usize = 0;

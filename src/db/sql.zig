@@ -1,8 +1,36 @@
 //! Shared SQL-database plumbing. A `Conn` is any protocol client (mysql/postgres/
 //! tds) that can run a query and exec a statement. `Dialect` captures the only
 //! per-database differences (type mapping, identifier quoting, upsert syntax).
-//! `Source` and `Sink` are written once on top of these — each new database is
-//! just a protocol client + a dialect.
+//! `Source` and `Sink` are written once on top of these, so each new database is
+//! just a protocol client and a dialect. StarRocks and Doris speak MySQL on the
+//! wire but have their own DDL: type names and a mandatory table model and
+//! distribution clause.
+//!
+//! Ownership: `Conn.queryCursor` returns a cursor that owns the connection until
+//! closed; on error the connection stays open so the caller can read `last_error`,
+//! and the caller closes it. A `Report` carries the server's own message for a read
+//! that fails mid-stream. A batch returning a second result set is refused: a read
+//! has one schema, and dropping or appending the rest would answer something the
+//! batch never said.
+//!
+//! TLS: `require` verifies against the system CA bundle and hostname, `insecure`
+//! encrypts without verifying. A `TlsState` must sit at a stable heap address
+//! before `start`, and the socket reader's buffer must hold a whole ciphertext
+//! record. It uses the vendored `tls_client.zig` because MySQL servers always
+//! request a client certificate, which std's client does not handle.
+//!
+//! Sinks: the INSERT sink batches multi-row INSERTs (SQL Server caps a VALUES list
+//! at 1000 rows) and redials on a transient error. Bulk sinks (COPY, LOAD DATA,
+//! INSERT BULK) accumulate a `SEGMENT_BYTES` segment, send it as one statement,
+//! verify the server's row count, and only then discard it, so the segment is the
+//! replay unit: a dead connection rolls the statement back, and the count check
+//! turns silent row drops into errors. The one unavoidable window is a connection
+//! lost after the server committed but before its reply, where the replay
+//! double-writes. Flushes already committed stay on abort; downstream dedup owns
+//! exactly-once (see split.zig).
+//!
+//! Text from the wire is typed by `coerceText`. A cell that does not parse as its
+//! numeric type is an error, never a quiet 0 or a different number.
 
 const std = @import("std");
 const TlsClient = @import("../net/tls_client.zig");
@@ -14,28 +42,12 @@ const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
 const ast = @import("../lang/ast.zig");
 
-/// Rows are this many per streamed batch.
 pub const STREAM_ROWS = 4096;
 
-/// Bulk sinks (COPY / LOAD DATA / INSERT BULK) accumulate one segment of encoded
-/// rows, transmit it as a single statement, verify the server's row count, and
-/// only then discard the bytes. The segment is therefore the replay unit: a
-/// transient network failure redials and resends the intact segment (each
-/// statement is atomic server-side — a dead connection rolls it back), and the
-/// count check turns silent row drops into hard errors.
 pub const SEGMENT_BYTES = 4 << 20;
 
-/// `require` = full verification (system CA bundle + hostname); `insecure` =
-/// encrypt but skip verification (self-signed dev/test servers).
 pub const TlsMode = enum { off, require, insecure };
 
-/// A TLS session layered over an established plain socket. Must live at a
-/// stable heap address before `start` (the client holds internal pointers),
-/// and per std.crypto.tls the socket reader's buffer must hold at least one
-/// ciphertext record (the drivers' 64 KB socket buffers satisfy this).
-///
-/// Uses the vendored `tls_client.zig` (std's client + TLS 1.3 client-cert
-/// request handling) because MySQL servers always request a client certificate.
 pub const TlsState = struct {
     client: TlsClient,
     read_buf: [TlsClient.min_buffer_len]u8,
@@ -60,8 +72,6 @@ pub const TlsState = struct {
     }
 };
 
-/// A streaming cursor over a result set: read the schema up front, then pull
-/// batches of rows on demand (bounded memory). `close` releases the connection.
 pub const Cursor = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -70,7 +80,6 @@ pub const Cursor = struct {
         schema: *const fn (*anyopaque) types.Schema,
         nextBatch: *const fn (*anyopaque, std.mem.Allocator) anyerror!?Batch,
         close: *const fn (*anyopaque) void,
-        /// The server's own words for the last failure, when it sent some.
         last_error: ?*const fn (*anyopaque) []const u8 = null,
     };
 
@@ -91,19 +100,11 @@ pub const Cursor = struct {
 
 pub const RowStep = enum { row, end };
 
-/// Why a `QUERY(...)` whose batch returns a second result set fails: a read has
-/// one schema, and taking the first while dropping the rest — or appending the
-/// second's rows to the first's — would answer something the batch never said.
 pub const one_result_set = "the query returned more than one result set; a read takes one — keep a single SELECT in the batch (statements before or after it are fine)";
 
-/// Name a failed database operation for what it means on the wire. A driver
-/// reads and writes its socket through `std.Io`, so a server that closed the
-/// connection (a login refused under load, a session killed mid-query) surfaces
-/// as the ambient `EndOfStream`/`ReadFailed`/`WriteFailed` — names a local file
-/// shares, so they cannot be transient everywhere. At this boundary the peer is
-/// known to be a database socket, and they become names the exit code treats as
-/// transient. Applied where an operation leaves a driver: connect, query,
-/// cursor pull, exec and the bulk loaders.
+/// Rename a socket's `EndOfStream`/`ReadFailed`/`WriteFailed` to names the exit
+/// code treats as transient. Applied where an operation leaves a driver, where the
+/// peer is known to be a database socket rather than a local file.
 pub fn onWire(e: anyerror) anyerror {
     return switch (e) {
         error.EndOfStream, error.TlsConnectionTruncated => error.ServerClosedConnection,
@@ -112,9 +113,8 @@ pub fn onWire(e: anyerror) anyerror {
     };
 }
 
-/// `conn` requires: `meta_arena`, `openCursor(sql)`, and `last_error`
-/// conventions. On open failure the connection is left open so the caller can
-/// read `last_error`, and the caller closes it.
+/// `conn` needs `meta_arena`, `openCursor(sql)` and `last_error`. On open failure
+/// the connection is left open for the caller to read `last_error` and close.
 pub fn openTextCursor(conn: anytype, sql_text: []const u8, vt: *const Cursor.VTable) !Cursor {
     conn.meta_arena = std.heap.ArenaAllocator.init(conn.gpa);
     conn.openCursor(sql_text) catch |e| {
@@ -124,9 +124,8 @@ pub fn openTextCursor(conn: anytype, sql_text: []const u8, vt: *const Cursor.VTa
     return .{ .ptr = conn, .vtable = vt };
 }
 
-/// `conn` requires: `cols` (each with `.engine_type`), `cur_schema`, `done`,
-/// and `nextRow(arena, builders) !RowStep` appending exactly one value per
-/// column on `.row`.
+/// `conn` needs `cols` (each with `.engine_type`), `cur_schema`, `done`, and a
+/// `nextRow(arena, builders) !RowStep` appending exactly one value per column on `.row`.
 pub fn fetchTextBatch(conn: anytype, arena: std.mem.Allocator) !?Batch {
     if (conn.done) return null;
     const ncol = conn.cols.len;
@@ -155,10 +154,6 @@ pub fn closeTextCursor(conn: anytype) void {
     conn.close();
 }
 
-/// A connection to a SQL database (protocol-agnostic). `queryCursor` sends a
-/// query, reads the result-set header, and returns a streaming cursor (which
-/// then owns the connection until closed). On error it leaves the connection
-/// open: the caller owns it (so it can read `last_error`) and must close it.
 pub const Conn = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -180,8 +175,8 @@ pub const Conn = struct {
     }
 };
 
-/// Builds the `*anyopaque` shims a driver needs to satisfy `Conn.VTable`, from a
-/// concrete connection type exposing `queryCursor`/`exec`/`close`.
+/// The `*anyopaque` shims of `Conn.VTable` for a connection type exposing
+/// `queryCursor`/`exec`/`close`.
 pub fn connVTable(comptime T: type) Conn.VTable {
     return .{
         .queryCursor = struct {
@@ -202,9 +197,8 @@ pub fn connVTable(comptime T: type) Conn.VTable {
     };
 }
 
-/// `Cursor.VTable` for drivers whose cursor is the connection itself and which
-/// pull rows through the shared text-protocol reader. Drivers with a distinct
-/// cursor type (tds) write their own shims.
+/// `Cursor.VTable` for drivers whose cursor is the connection itself and which pull
+/// rows through the shared text-protocol reader; tds writes its own.
 pub fn textCursorVTable(comptime T: type) Cursor.VTable {
     return .{
         .schema = struct {
@@ -230,9 +224,6 @@ pub fn textCursorVTable(comptime T: type) Cursor.VTable {
     };
 }
 
-/// `.starrocks` and `.doris` speak MySQL on the wire (backtick quoting, same
-/// catalog queries) but have their own DDL: type names, and a mandatory table
-/// model / distribution clause emitted by `createTableSqlWith`.
 pub const Dialect = enum {
     postgres,
     mysql,
@@ -240,7 +231,7 @@ pub const Dialect = enum {
     starrocks,
     doris,
 
-    /// Read over the MySQL protocol and written as MySQL writes SQL: backticks,
+    /// Read over the MySQL protocol and written as MySQL writes SQL: backticks, and
     /// `\` an escape inside a string literal.
     pub fn mysqlWire(self: Dialect) bool {
         return switch (self) {
@@ -282,7 +273,6 @@ pub const Dialect = enum {
             .decimal => try std.fmt.allocPrint(arena, "DECIMAL({d},{d})", .{ ty.precision, ty.scale }),
             .string => switch (self) {
                 .postgres => if (is_key) "VARCHAR(255)" else "TEXT",
-                // a Doris key cannot be STRING
                 .doris => if (is_key) "VARCHAR(65533)" else "STRING",
                 .mysql => "VARCHAR(255)",
                 .sqlserver => if (is_key) "NVARCHAR(255)" else "NVARCHAR(4000)",
@@ -302,7 +292,6 @@ pub const Dialect = enum {
             .timestamp => switch (self) {
                 .postgres => "TIMESTAMP",
                 .mysql, .starrocks => "DATETIME",
-                // Doris' DATETIME keeps whole seconds unless asked for more
                 .doris => "DATETIME(6)",
                 .sqlserver => "DATETIME2",
             },
@@ -317,11 +306,9 @@ pub const Dialect = enum {
         };
     }
 
-    /// The type name a pushed-down `CAST(x AS ...)` uses, or null when the
-    /// dialect has no CAST target for the kind and the predicate stays in the
-    /// engine. Deliberately not `ddlType`: a column and a CAST take different
-    /// spellings — MySQL casts to SIGNED and CHAR but declares BIGINT and
-    /// VARCHAR; SQL Server casts to VARCHAR(MAX) but a key column is NVARCHAR(255).
+    /// The type a pushed-down `CAST` uses, or null when the predicate stays in the
+    /// engine. Not `ddlType`: MySQL casts to SIGNED and CHAR but declares BIGINT and
+    /// VARCHAR. A bool is rendered as a comparison instead.
     pub fn castType(self: Dialect, arena: std.mem.Allocator, ty: types.Type) !?[]const u8 {
         return switch (ty.kind) {
             .int => switch (self) {
@@ -346,15 +333,11 @@ pub const Dialect = enum {
                 .mysql, .starrocks, .doris => "DATETIME",
                 .sqlserver => "DATETIME2",
             },
-            // No portable CAST spelling: a bool literal is rendered as a
-            // comparison instead, and the rest never appear in a pushed predicate.
             .bool, .bytes, .array, .@"struct" => null,
         };
     }
 };
 
-/// Where a read that fails mid-stream says why: the server's message, which
-/// the error name alone (`QueryFailed`) does not carry.
 pub const Report = struct {
     ctx: *anyopaque,
     f: *const fn (ctx: *anyopaque, e: anyerror, msg: []const u8) void,
@@ -365,7 +348,6 @@ pub const Source = struct {
     cursor: Cursor,
     report: ?Report = null,
 
-    /// Start streaming `sql` on `conn`. The cursor owns `conn` from here on.
     pub fn open(gpa: std.mem.Allocator, conn: Conn, sql: []const u8) !*Source {
         const self = try gpa.create(Source);
         errdefer gpa.destroy(self);
@@ -397,8 +379,6 @@ pub const Source = struct {
 
 const source_vtable = driver.sourceVTable(Source);
 
-/// Rows per multi-row INSERT. Bigger = fewer round-trips/commits (the dominant
-/// cost of row loading), but SQL Server caps a `VALUES` list at 1000 rows.
 fn flushRowsFor(dialect: Dialect) usize {
     return switch (dialect) {
         .sqlserver => 1000,
@@ -406,8 +386,6 @@ fn flushRowsFor(dialect: Dialect) usize {
     };
 }
 
-/// A gpa-owned copy of `schema`'s field list, so a sink outlives the planner's
-/// arena. Released with `freeSchema`.
 fn ownedSchema(gpa: std.mem.Allocator, schema: types.Schema) !types.Schema {
     const fields = try gpa.alloc(types.Schema.Field, schema.fields.len);
     errdefer gpa.free(fields);
@@ -425,9 +403,6 @@ fn freeSchema(gpa: std.mem.Allocator, schema: types.Schema) void {
     gpa.free(schema.fields);
 }
 
-/// Re-establishes a connection for the INSERT sink's transient retry. `ctx`
-/// is read-only shared config (safe across lanes); the allocator is the
-/// calling sink's own, so lane-confined allocators stay lane-confined.
 pub const Redial = struct {
     ctx: *const anyopaque,
     dial: *const fn (*const anyopaque, std.mem.Allocator) anyerror!Conn,
@@ -517,9 +492,6 @@ pub const Sink = struct {
         try self.flush();
     }
 
-    /// Failure path: drop the buffered tuples without a final INSERT. Flushes
-    /// that already ran are autocommitted and stay (downstream dedup owns
-    /// exactly-once, per split.zig).
     pub fn abort(self: *Sink) void {
         self.teardown();
     }
@@ -536,18 +508,9 @@ pub const Sink = struct {
 
 const sink_vtable = driver.sinkVTable(Sink);
 
-/// The segment-streaming sink shared by every bulk protocol (postgres COPY, mysql
-/// LOAD DATA, tds INSERT BULK): accumulate encoded rows up to `SEGMENT_BYTES`,
-/// transmit the segment as one statement, verify the server's row count, and only
-/// then discard the bytes. `Proto` supplies what differs:
-///   - `Connection`: the driver connection type (`exec`, `close`, `last_error`);
-///   - `dialect` and `stmt`: DDL quoting, and the statement name in count errors;
-///   - `command(arena, qtable, schema)`: the statement that opens a segment;
-///   - `appendBatch(w, arena, batch)`: encode rows into the segment buffer;
-///   - `send(conn, command, segment, rows)`: transmit one segment and return the
-///     server's row count;
-///   - optionally `segmentHeader(w, gpa, schema)`: bytes every segment starts
-///     with (tds COLMETADATA).
+/// The segment-streaming sink shared by every bulk protocol. `Proto` supplies
+/// `Connection`, `dialect`, `stmt`, `command`, `appendBatch`, `send` (returning the
+/// server's row count) and optionally `segmentHeader` (tds COLMETADATA).
 pub fn BulkSink(comptime Proto: type) type {
     return struct {
         gpa: std.mem.Allocator,
@@ -599,13 +562,8 @@ pub fn BulkSink(comptime Proto: type) type {
             if (@hasDecl(Proto, "segmentHeader")) try Proto.segmentHeader(self.buffer.writer(), self.gpa, self.schema);
         }
 
-        /// Transmit the buffered segment as one statement and verify the server's
-        /// row count. A transient network failure redials once and resends the
-        /// intact segment: a statement that dies mid-stream rolls back
-        /// server-side, so the replay cannot duplicate. (The one unavoidable
-        /// window: if the connection dies AFTER the server committed but before
-        /// its reply arrived, the replay double-writes — same tradeoff as the
-        /// INSERT sink.) A segment holding only a header (no rows) is dropped
+        /// Send the buffered segment and verify the row count, redialing once and
+        /// resending on a transient failure. A segment holding only a header is dropped
         /// without a round-trip.
         fn commitSegment(self: *Self) !void {
             if (self.seg_rows == 0) {
@@ -638,9 +596,8 @@ pub fn BulkSink(comptime Proto: type) type {
             try self.commitSegment();
         }
 
-        /// Failure path: drop the buffer and close the socket mid-statement. The
-        /// server aborts the in-flight statement when the connection dies, so
-        /// none of it is committed.
+        /// Drop the buffer and close the socket mid-statement, so the server aborts the
+        /// in-flight statement and none of it is committed.
         pub fn abort(self: *Self) void {
             self.teardown();
         }
@@ -655,8 +612,6 @@ pub fn BulkSink(comptime Proto: type) type {
     };
 }
 
-/// Knobs only some dialects' CREATE TABLE need. StarRocks requires a
-/// distribution clause and a replication factor on every table.
 pub const TableOpts = struct {
     buckets: u32 = 4,
     replication_num: u32 = 1,
@@ -666,8 +621,6 @@ pub fn createTableSql(arena: std.mem.Allocator, dialect: Dialect, qtable: []cons
     return createTableSqlWith(arena, dialect, qtable, schema, mode, .{});
 }
 
-/// `createTableSql` with per-dialect options. Keys (upsert mode) become the
-/// primary key; StarRocks additionally picks its table model from the mode.
 pub fn createTableSqlWith(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8, schema: types.Schema, mode: ast.WriteMode, opts: TableOpts) ![]const u8 {
     if (dialect == .starrocks) return starrocksTableSql(arena, qtable, schema, mode, opts);
     if (dialect == .doris) return dorisTableSql(arena, qtable, schema, mode, opts);
@@ -700,9 +653,9 @@ pub fn createTableSqlWith(arena: std.mem.Allocator, dialect: Dialect, qtable: []
     return buf.toOwnedSlice();
 }
 
-/// StarRocks: the write mode selects the table model — `upsert on k` → PRIMARY
-/// KEY (keys reordered first and NOT NULL), append/overwrite → DUPLICATE KEY on
-/// the first column — and the same columns drive DISTRIBUTED BY HASH.
+/// StarRocks: `upsert on k` makes a PRIMARY KEY table (keys first and NOT NULL),
+/// append/overwrite a DUPLICATE KEY on the first column; the same columns drive
+/// DISTRIBUTED BY HASH.
 fn starrocksTableSql(arena: std.mem.Allocator, qtable: []const u8, schema: types.Schema, mode: ast.WriteMode, opts: TableOpts) ![]const u8 {
     const is_pk = (mode == .upsert);
     const keys: []const []const u8 = switch (mode) {
@@ -739,10 +692,9 @@ fn starrocksTableSql(arena: std.mem.Allocator, qtable: []const u8, schema: types
     return buf.toOwnedSlice();
 }
 
-/// Doris: `upsert on k` → a UNIQUE KEY table with merge-on-write, keys first and
-/// NOT NULL. Append and overwrite → a duplicate table with no sort key at all:
-/// Doris refuses a FLOAT, DOUBLE or STRING key column, so StarRocks' "first column
-/// is the key" would turn away any table that starts with one.
+/// Doris: `upsert on k` makes a merge-on-write UNIQUE KEY table, keys first and
+/// NOT NULL. Otherwise a duplicate table with no sort key, since Doris refuses a
+/// FLOAT, DOUBLE or STRING key column.
 fn dorisTableSql(arena: std.mem.Allocator, qtable: []const u8, schema: types.Schema, mode: ast.WriteMode, opts: TableOpts) ![]const u8 {
     const keys: []const []const u8 = switch (mode) {
         .upsert => |u| u.keys,
@@ -807,8 +759,6 @@ fn buildStatement(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8
                 try w.writeAll(" ON DUPLICATE KEY UPDATE ");
                 try writeMysqlUpdate(w, arena, dialect, schema, u.keys);
             },
-            // A StarRocks primary-key or Doris unique-key table upserts on a
-            // plain INSERT.
             .starrocks, .doris => {},
             .sqlserver => unreachable,
         },
@@ -859,8 +809,6 @@ fn writeMysqlUpdate(w: anytype, arena: std.mem.Allocator, dialect: Dialect, sche
     }
 }
 
-/// The schema's columns, quoted and comma-joined — the column list of an INSERT,
-/// COPY, LOAD DATA or Stream Load header.
 pub fn colList(arena: std.mem.Allocator, dialect: Dialect, schema: types.Schema) ![]const u8 {
     var buf = std.array_list.Managed(u8).init(arena);
     for (schema.fields, 0..) |f, i| {
@@ -958,8 +906,6 @@ fn bulkValue(w: anytype, arena: std.mem.Allocator, v: Value, fmt: BulkFormat) !v
     }
 }
 
-/// The plain text of a non-null value (no escaping), with real date/timestamp
-/// formatting — shared by the delimited bulk format and the TDS NVARCHAR encoding.
 pub fn valueText(arena: std.mem.Allocator, v: Value, fmt: BulkFormat) ![]const u8 {
     return switch (v) {
         .null => "",
@@ -987,9 +933,8 @@ pub fn quoteIdent(arena: std.mem.Allocator, dialect: Dialect, name: []const u8) 
     return buf.toOwnedSlice();
 }
 
-/// `quoteIdent` straight into a list — what the column-list builders use, so a
-/// sink opened on a general-purpose allocator does not leave one small
-/// allocation behind per column (a 306-column StarRocks load leaked thousands).
+/// `quoteIdent` straight into a list, so a sink on a general-purpose allocator does
+/// not leak one allocation per column (a 306-column load once leaked thousands).
 fn writeQuoted(buf: *std.array_list.Managed(u8), dialect: Dialect, name: []const u8) !void {
     var it = std.mem.splitScalar(u8, name, '.');
     var first = true;
@@ -1009,17 +954,11 @@ pub fn nameIn(names: []const []const u8, n: []const u8) bool {
     return false;
 }
 
-/// Errors with `UnparseableNumber` when an int/float cell doesn't parse:
-/// silently coercing bad source text to 0 would corrupt the pipeline's output
-/// with valid-looking values. The driver cursors wrap the error with the failing
-/// column's name in `last_error`.
 pub fn coerceText(arena: std.mem.Allocator, text: ?[]const u8, ty: types.Type) !Value {
     const t = text orelse return .null;
     return switch (ty.kind) {
         .int => .{ .int = std.fmt.parseInt(i64, std.mem.trim(u8, t, " "), 10) catch return error.UnparseableNumber },
         .float => .{ .float = std.fmt.parseFloat(f64, t) catch return error.UnparseableNumber },
-        // Symmetric with int/float above: a value the source sent that cannot be
-        // read is an error, not a quietly different number.
         .decimal => parseDecimalText(t) orelse return error.UnparseableNumber,
         .bool => .{ .bool = t.len > 0 and (t[0] == '1' or t[0] == 't' or t[0] == 'T' or t[0] == 'y' or t[0] == 'Y') },
         .date => .{ .date = @intCast(parseDateText(t)) },
@@ -1028,17 +967,9 @@ pub fn coerceText(arena: std.mem.Allocator, text: ?[]const u8, ty: types.Type) !
     };
 }
 
-/// A decimal literal: optional sign, digits, at most one `.`, at least one digit.
-/// Null for anything else — the caller decides whether that is an error (`CAST`, a
-/// malformed value on the wire) or a null (`TRY_CAST`).
-///
-/// It used to `continue` past every character it did not recognise, which invented
-/// numbers rather than rejecting them: `'1000,00'` came back as 100000.00 because
-/// the comma was skipped and the digits read as one run, `'1.234,56'` as 1.23456,
-/// and `'abc'` as 0.00. Brazilian and most European data writes money exactly that
-/// way, so every `CAST(x AS DECIMAL)` over it was silently 100x out, and `TRY_CAST`
-/// — the documented tool for dirty input — had nothing to catch. Strip the grouping
-/// separator explicitly (`replace(x, ',', '.')`) and the value parses.
+/// A decimal literal: optional sign, digits, at most one `.`, at least one digit, else
+/// null. It once skipped unknown characters, so `'1000,00'` read as 100000.00 and
+/// `'abc'` as 0; comma-decimal data must be rewritten with `replace(x, ',', '.')`.
 pub fn parseDecimalText(t: []const u8) ?Value {
     var s = t;
     var neg = false;
@@ -1054,7 +985,7 @@ pub fn parseDecimalText(t: []const u8) ?Value {
     var after_dot = false;
     for (s) |c| {
         if (c == '.') {
-            if (after_dot) return null; // a second radix point
+            if (after_dot) return null;
             after_dot = true;
             continue;
         }
@@ -1075,11 +1006,10 @@ test "parseDecimalText rejects what it cannot read instead of inventing a number
     try std.testing.expectEqual(@as(i128, 7), parseDecimalText("+7").?.decimal.unscaled);
     try std.testing.expectEqual(@as(i128, 25), parseDecimalText(".25").?.decimal.unscaled);
 
-    // Every one of these used to come back as a plausible-looking wrong number.
-    try std.testing.expect(parseDecimalText("1000,00") == null); // 100000.00
-    try std.testing.expect(parseDecimalText("1.234,56") == null); // 1.23456
-    try std.testing.expect(parseDecimalText("1,2,3") == null); // 123
-    try std.testing.expect(parseDecimalText("abc") == null); // 0
+    try std.testing.expect(parseDecimalText("1000,00") == null);
+    try std.testing.expect(parseDecimalText("1.234,56") == null);
+    try std.testing.expect(parseDecimalText("1,2,3") == null);
+    try std.testing.expect(parseDecimalText("abc") == null);
     try std.testing.expect(parseDecimalText("1.2.3") == null);
     try std.testing.expect(parseDecimalText("12 34") == null);
     try std.testing.expect(parseDecimalText("") == null);
@@ -1092,13 +1022,12 @@ fn parseDateText(t: []const u8) i64 {
     return daysFromCivil(atoiN(t[0..4]), @intCast(atoiN(t[5..7])), @intCast(atoiN(t[8..10])));
 }
 
+/// Keeps the `.ffffff` fraction: dropping it once made `datetime(3)` values within a
+/// second identical, collapsing distinct rows and unsettling ORDER BY.
 fn parseDatetimeText(t: []const u8) i64 {
     const days = parseDateText(t);
     var secs: i64 = 0;
     if (t.len >= 19) secs = atoiN(t[11..13]) * 3600 + atoiN(t[14..16]) * 60 + atoiN(t[17..19]);
-    // `Value.timestamp` is already micros, so dropping `.ffffff` was pure loss:
-    // a `datetime(3)` column made `…56.100` and `…56.900` byte-identical, which
-    // collapsed distinct rows and made ORDER BY non-deterministic within a second.
     var frac: i64 = 0;
     if (t.len > 20 and t[19] == '.') {
         var i: usize = 20;

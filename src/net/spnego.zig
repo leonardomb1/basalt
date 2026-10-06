@@ -2,6 +2,9 @@
 //! offering NTLM or Kerberos with the first mechanism's token sent
 //! optimistically, a NegTokenResp carrying the next NTLM leg, and the token
 //! out of a server's reply. Shared by the SMB and SQL Server logins.
+//!
+//! `oid_ms_krb5` is the legacy Kerberos 5 OID that Windows lists beside the
+//! standard one.
 
 const std = @import("std");
 
@@ -23,7 +26,6 @@ fn derWrap(gpa: std.mem.Allocator, tag: u8, inner: []const u8) ![]u8 {
 }
 
 pub const oid_krb5 = [_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02 };
-/// Microsoft's legacy OID for Kerberos 5, which Windows lists beside the standard one.
 pub const oid_ms_krb5 = [_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x82, 0xf7, 0x12, 0x01, 0x02, 0x02 };
 
 /// GSS-API InitialContextToken with a NegTokenInit offering NTLMSSP only and
@@ -66,7 +68,6 @@ pub fn response(gpa: std.mem.Allocator, ntlm_authenticate: []const u8) ![]u8 {
     return derWrap(gpa, 0xa1, seq);
 }
 
-/// A DER element at `at`: its tag, and its contents as a slice.
 fn derAt(b: []const u8, at: usize) ?struct { tag: u8, body: []const u8, end: usize } {
     if (at + 2 > b.len) return null;
     var i = at + 1;
@@ -101,19 +102,15 @@ pub fn token(blob: []const u8) ?[]const u8 {
     return null;
 }
 
-// --- tests ------------------------------------------------------------------------
-
 test "spnego: wraps an NTLM token and finds one in a reply" {
     const gpa = std.testing.allocator;
     const t = try response(gpa, "NTLMSSP\x00\x03");
     defer gpa.free(t);
-    // a client NegTokenResp has the same shape as a server's: the token comes back out
     try std.testing.expectEqualStrings("NTLMSSP\x00\x03", token(t).?);
     const init_tok = try init(gpa, "NTLMSSP\x00\x01");
     defer gpa.free(init_tok);
     try std.testing.expectEqual(@as(u8, 0x60), init_tok[0]);
     try std.testing.expect(std.mem.indexOf(u8, init_tok, &oid_ntlmssp) != null);
-    // long lengths: a token over 255 bytes takes the two-byte form
     const big = try gpa.alloc(u8, 600);
     defer gpa.free(big);
     @memset(big, 'x');

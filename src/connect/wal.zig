@@ -1,24 +1,29 @@
-//! Durable request buffer — the WAL under `ACCEPT ... INTO BUFFER` and the
-//! `FROM BUFFER` source: a durable WAL buffer replayed by a later run.
+//! Durable request buffer: the WAL under `ACCEPT ... INTO BUFFER`, and the
+//! `FROM BUFFER` source that replays it in a later run.
 //!
-//! Layout inside the buffer directory, for a buffer named `eventos`:
-//!   eventos-000001.jsonl    append-only JSONL segments, rotated by size
-//!   eventos.state           manifest: seq of the last fully-LOADED segment
+//! A buffer named `eventos` is a directory of append-only JSONL segments
+//! (`eventos-000001.jsonl`, rotated by size) plus `eventos.state`, a manifest
+//! holding the sequence of the last fully loaded segment. `append` writes one
+//! line unsynced and `sync` fsyncs the segment; serve acks 200 only after
+//! `sync`, so many appends share one sync (group commit). `markLoaded` advances
+//! the manifest by write-to-temp and rename, so a torn write cannot corrupt it.
 //!
-//! Contracts:
-//!   - `append` writes one JSONL line; `sync` fsyncs the current segment —
-//!     the serve layer acks 200 only after `sync` (group commit: many
-//!     appends, one sync).
-//!   - Segment names are deterministic; the stream-load LABEL for a segment
-//!     is its file stem (`eventos-000042`). A crash between "loaded" and
-//!     "marked" replays the same label, and StarRocks dedups — effectively
-//!     exactly-once with no two-phase commit.
-//!   - `markLoaded` advances the manifest via write-to-temp + rename (atomic
-//!     on POSIX), so a torn write can't corrupt consumption state.
-//!   - Threading: every mutating/positional op takes the internal mutex, so
-//!     the accept loop (append/sync) and the flusher (rotateIfNonEmpty,
-//!     pendingSegments, markLoaded, purge) can share one Wal. Completed
-//!     segments are immutable — `readSegment` needs no lock.
+//! A segment's Stream Load label is its file stem (`eventos-000042`). A crash
+//! between loading and marking replays the same label, which the sink dedups:
+//! effectively exactly-once without two-phase commit. Reopening a buffer whose
+//! newest segment is unloaded appends into it for the same reason.
+//!
+//! Threading: the accept loop (append, sync) and the flusher (rotation,
+//! `pendingSegments`, purge) share one `Wal` under its mutex. Segments below
+//! `currentSeq` are complete and immutable, so reading them needs no lock, and
+//! the manifest changes only by atomic rename, so reading it needs none either.
+//! Retention bounds reprocessing, not durability: no purge touches a segment
+//! that is not yet loaded, whatever its age.
+//!
+//! `BufferSource` yields one batch per segment, ascending. Batch replay reads
+//! every segment on disk, retained ones included; the serve flusher reads one
+//! (`only`) per run, labeled after it. Its schema is the declared `ACCEPT BODY`
+//! columns, or inferred from the first row.
 
 const std = @import("std");
 
@@ -32,9 +37,6 @@ pub const Wal = struct {
     cur_size: u64 = 0,
     mu: std.Thread.Mutex = .{},
 
-    /// Open (or resume) the buffer `name` under `dir_path`. If the newest
-    /// existing segment is not yet loaded, appending resumes into it — its
-    /// label replays on the next flush, which the sink dedups.
     pub fn open(gpa: std.mem.Allocator, dir_path: []const u8, name: []const u8, segment_bytes: u64) !Wal {
         std.fs.cwd().makePath(dir_path) catch |e| switch (e) {
             error.PathAlreadyExists => {},
@@ -77,17 +79,12 @@ pub const Wal = struct {
         self.* = undefined;
     }
 
-    /// The sequence of the segment currently being written. A flusher may
-    /// safely read any segment with a smaller sequence.
     pub fn currentSeq(self: *Wal) u64 {
         self.mu.lock();
         defer self.mu.unlock();
         return self.seq;
     }
 
-    /// Append one JSONL line (a `\n` is added). Rotates first when the line
-    /// would push the current segment past `segment_bytes`. NOT fsynced —
-    /// call `sync` before acking (group commit: N appends, one sync).
     pub fn append(self: *Wal, line: []const u8) !void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -110,23 +107,19 @@ pub const Wal = struct {
         self.cur_size += line.len + 1;
     }
 
-    /// Fsync the current segment — the durability point (ack barrier).
     pub fn sync(self: *Wal) !void {
         self.mu.lock();
         defer self.mu.unlock();
         if (self.cur) |f| try f.sync();
     }
 
-    /// Close the current segment and start the next one. The closed segment
-    /// becomes visible to `pendingSegments`.
     pub fn rotate(self: *Wal) !void {
         self.mu.lock();
         defer self.mu.unlock();
         try self.rotateLocked();
     }
 
-    /// Flusher-side rotation: close the current segment only if it has rows
-    /// (so idle buffers don't mint empty segments).
+    /// Rotates only a segment with rows, so an idle buffer mints no empty segments.
     pub fn rotateIfNonEmpty(self: *Wal) !void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -143,8 +136,7 @@ pub const Wal = struct {
         self.seq += 1;
     }
 
-    /// Sequences of segments that are complete (rotated away) and not yet
-    /// marked loaded, ascending — the flusher's work list. Caller frees.
+    /// Complete, not-yet-loaded segments, ascending: the flusher's work list.
     pub fn pendingSegments(self: *Wal, alloc: std.mem.Allocator) ![]u64 {
         self.mu.lock();
         const cur_seq = self.seq;
@@ -163,24 +155,19 @@ pub const Wal = struct {
         return out;
     }
 
-    /// The stream-load label / file stem for a segment: `<name>-NNNNNN`.
     pub fn labelFor(self: *const Wal, buf: []u8, s: u64) []const u8 {
         return std.fmt.bufPrint(buf, "{s}-{d:0>6}", .{ self.name, s }) catch unreachable;
     }
 
-    /// The file name of a segment: `<name>-NNNNNN.jsonl`.
     pub fn fileFor(self: *const Wal, buf: []u8, s: u64) []const u8 {
         return segmentFileName(buf, self.name, s);
     }
 
-    /// Read a complete segment's bytes (flusher side). Caller frees.
     pub fn readSegment(self: *Wal, alloc: std.mem.Allocator, s: u64, max_bytes: usize) ![]u8 {
         var fname_buf: [256]u8 = undefined;
         return self.dir.readFileAlloc(alloc, segmentFileName(&fname_buf, self.name, s), max_bytes);
     }
 
-    /// Last fully-loaded segment per the manifest (0 = none). Reads a file
-    /// that only changes via `markLoaded`'s atomic rename — no lock needed.
     pub fn loadedUpTo(self: *const Wal) u64 {
         var buf: [64]u8 = undefined;
         var fname_buf: [256]u8 = undefined;
@@ -190,9 +177,6 @@ pub const Wal = struct {
         return std.fmt.parseInt(u64, trimmed, 10) catch 0;
     }
 
-    /// Advance the manifest to `s` (write temp + atomic rename). Loading is
-    /// sequential, so `s` must be `loadedUpTo() + 1`-adjacent by convention;
-    /// this is not enforced here.
     pub fn markLoaded(self: *Wal, s: u64) !void {
         var content_buf: [64]u8 = undefined;
         const content = try std.fmt.bufPrint(&content_buf, "{d}\n", .{s});
@@ -209,8 +193,6 @@ pub const Wal = struct {
         try self.dir.rename(tmp, fname);
     }
 
-    /// Delete loaded segments (RETAIN UNTIL LOADED). Returns how many were
-    /// removed. `RETAIN n HOURS` keeps them; a later purge pass ages them out.
     pub fn purgeLoaded(self: *Wal) !usize {
         const loaded = self.loadedUpTo();
         var removed: usize = 0;
@@ -230,9 +212,6 @@ pub const Wal = struct {
         return removed;
     }
 
-    /// Delete LOADED segments older than `hours` (RETAIN n HOURS aging).
-    /// Unloaded segments are never touched, no matter their age — retention
-    /// bounds reprocessing, not durability. Returns how many were removed.
     pub fn purgeOlderThan(self: *Wal, hours: u32) !usize {
         self.mu.lock();
         defer self.mu.unlock();
@@ -258,8 +237,7 @@ pub const Wal = struct {
         return removed;
     }
 
-    /// Total bytes across this buffer's segments — the backpressure input
-    /// (over the configured limit ⇒ serve answers 503 + Retry-After).
+    /// The backpressure input: over the configured limit, serve answers 503 with Retry-After.
     pub fn bytesOnDisk(self: *Wal) u64 {
         var total: u64 = 0;
         var it = self.dir.iterate();
@@ -288,7 +266,6 @@ pub const Wal = struct {
     }
 };
 
-/// `<name>-NNNNNN.jsonl` -> NNNNNN, or null for anything else.
 fn segSeqOf(name: []const u8, fname: []const u8) ?u64 {
     if (!std.mem.startsWith(u8, fname, name)) return null;
     const rest = fname[name.len..];
@@ -304,12 +281,6 @@ const driver = @import("driver.zig");
 const request = @import("request.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 
-/// A `driver.Source` over a buffer directory: one batch per JSONL segment,
-/// ascending. Batch mode reads EVERY segment on disk (retained ones included —
-/// that is what "reprocess a RETAIN 24 HOURS buffer" means); the serve flusher
-/// (phase 3) instead drains `pendingSegments` one at a time with the segment
-/// label. Schema: the declared `ACCEPT BODY` columns, or inferred from the
-/// first row when replaying without a declaration.
 pub const BufferSource = struct {
     gpa: std.mem.Allocator,
     arena_inst: std.heap.ArenaAllocator,
@@ -319,9 +290,6 @@ pub const BufferSource = struct {
     segs: []u64,
     idx: usize = 0,
 
-    /// `only` restricts the source to a single segment (the serve flusher
-    /// drains one segment per run, labeled after it); null = every segment
-    /// on disk (batch replay).
     pub fn open(
         gpa: std.mem.Allocator,
         dir_path: []const u8,
@@ -403,7 +371,6 @@ pub const BufferSource = struct {
     }
 };
 
-/// Parse JSONL text into one json.Value per non-empty line.
 fn parseLines(arena: std.mem.Allocator, text: []const u8) ![]std.json.Value {
     var items = std.array_list.Managed(std.json.Value).init(arena);
     var it = std.mem.splitScalar(u8, text, '\n');

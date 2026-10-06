@@ -1,31 +1,33 @@
 //! NTLMv2 message construction, per [MS-NLMP]. Builds the Type 1
 //! NEGOTIATE_MESSAGE and, from a server's Type 2 CHALLENGE_MESSAGE, the Type 3
-//! AUTHENTICATE_MESSAGE. Pure: no sockets, no clock, no randomness — the
-//! timestamp and the client challenge are injected by the caller, so every
-//! message this module produces is a deterministic function of its inputs and
-//! can be checked against the spec's own worked example.
+//! AUTHENTICATE_MESSAGE. Pure: no sockets, no clock, no randomness. The timestamp
+//! and client challenge are injected by the caller, so every message is a
+//! deterministic function of its inputs and is checked against the spec's worked
+//! example (section 4.2.4).
 //!
-//! Deliberately omitted: NTLMv1 and LMv1, key exchange
-//! (NTLMSSP_NEGOTIATE_KEY_EXCH), signing and sealing — a client that negotiates
-//! none of them never needs RC4, which is the other primitive std does not
-//! ship. Also omitted: the MIC (section 3.1.5.1.2), an HMAC-MD5 over the
-//! NEGOTIATE, CHALLENGE and AUTHENTICATE messages concatenated. Emitting one
-//! would mean taking the NEGOTIATE_MESSAGE bytes back in here and reserving a
-//! 16-byte MIC field in the Type 3; instead the MsvAvFlags 0x2 bit is left
-//! clear, which is exactly how a client tells the server there is no MIC to
-//! check. What that costs: the negotiated flags are not integrity-protected
-//! against a downgrade, and a server hardened to require a MIC refuses the
-//! login. The Type 3 this builds otherwise has the same shape as the one in
-//! the spec's own example (section 4.2.4.3), which carries no MIC either.
+//! Deliberately omitted: NTLMv1 and LMv1, key exchange (NTLMSSP_NEGOTIATE_KEY_EXCH),
+//! signing and sealing. A client that negotiates none of them never needs RC4, the
+//! other primitive std does not ship, and promising them would strand the
+//! connection after login. NTLMSSP_NEGOTIATE_ALWAYS_SIGN is still set because
+//! 2.2.2.5 requires it; it only asks that a session key be derived. The spec draws
+//! the flag word MSB-first, so bit "A" is the u32's least significant bit.
 //!
-//! MD4 lives here because the NT hash is defined in terms of it and std omits
-//! it as a broken primitive; it is not exported and must not be used elsewhere.
+//! Also omitted: the MIC (3.1.5.1.2), an HMAC-MD5 over all three messages. The
+//! MsvAvFlags 0x2 bit is left clear, which is how a client says there is no MIC.
+//! The cost: the negotiated flags are not integrity-protected against a downgrade,
+//! and a server that requires a MIC refuses the login. The Type 3 otherwise has
+//! the layout of the spec's example (4.2.4.3), which carries no MIC either.
+//!
+//! With key exchange off, the NTLMv2 SessionBaseKey (3.3.2) is also the exported
+//! session key (3.4.5.1), which SMB2 signs with and derives SMB 3 keys from.
+//!
+//! MD4 lives here because the NT hash is defined in terms of it and std omits it as
+//! a broken primitive; it is not exported and must not be used elsewhere.
 
 const std = @import("std");
 
 pub const Error = error{ NtlmBadMessage, NtlmUnsupported } || std.mem.Allocator.Error;
 
-/// A Windows credential. `domain` may be empty for a local account.
 pub const Credential = struct {
     domain: []const u8,
     user: []const u8,
@@ -35,8 +37,6 @@ pub const Credential = struct {
 
 const signature = "NTLMSSP\x00";
 
-// MS-NLMP 2.2.2.5. The spec draws the flag word MSB-first, so bit "A"
-// (NTLMSSP_NEGOTIATE_UNICODE) is the least significant bit of the u32.
 const negotiate_unicode: u32 = 0x0000_0001;
 const request_target: u32 = 0x0000_0004;
 const negotiate_ntlm: u32 = 0x0000_0200;
@@ -44,24 +44,15 @@ const negotiate_always_sign: u32 = 0x0000_8000;
 const negotiate_extended_session_security: u32 = 0x0008_0000;
 const negotiate_target_info: u32 = 0x0080_0000;
 
-/// Sent unchanged in both messages: Unicode strings, extended session security
-/// (which is what makes the response NTLMv2 rather than NTLMv1), and target
-/// info. Signing, sealing and key exchange are left clear on purpose — this
-/// module cannot honour them, and promising them to the server would strand the
-/// connection after login. NTLMSSP_NEGOTIATE_ALWAYS_SIGN is set because
-/// MS-NLMP 2.2.2.5 requires it in the NEGOTIATE_MESSAGE; it only asks that a
-/// session key be derived, not that traffic be signed.
 const client_flags = negotiate_unicode | request_target | negotiate_ntlm |
     negotiate_always_sign | negotiate_extended_session_security | negotiate_target_info;
 
 const av_eol: u16 = 0;
 const av_timestamp: u16 = 7;
 
-/// Type 1 NEGOTIATE_MESSAGE. Caller owns the returned slice.
-///
-/// Carries neither DomainName nor Workstation: MS-NLMP 2.2.1.1 requires both to
-/// be OEM-encoded here, and servers ignore them — the authoritative, Unicode
-/// copies travel in the Type 3 message.
+/// Type 1 NEGOTIATE_MESSAGE. Caller owns the returned slice. Carries neither
+/// DomainName nor Workstation: 2.2.1.1 wants them OEM-encoded and servers ignore
+/// them; the Unicode copies travel in the Type 3.
 pub fn negotiate(gpa: std.mem.Allocator, cred: Credential) Error![]u8 {
     _ = cred;
     const msg = try gpa.alloc(u8, 32);
@@ -74,14 +65,9 @@ pub fn negotiate(gpa: std.mem.Allocator, cred: Credential) Error![]u8 {
     return msg;
 }
 
-/// Parse a Type 2 CHALLENGE_MESSAGE and build the Type 3 AUTHENTICATE_MESSAGE.
-/// `time` is a Windows FILETIME (100ns ticks since 1601-01-01 UTC) and `nonce`
-/// the 8-byte client challenge — both injected so the result is deterministic
-/// and testable. Caller owns the returned slice.
-///
-/// `time` is only used when the challenge carries no MsvAvTimestamp AV pair;
-/// when it does, MS-NLMP 3.1.5.1.2 requires the server's clock to be echoed
-/// instead, which this does.
+/// Parse a Type 2 CHALLENGE_MESSAGE and build the Type 3. `time` is a FILETIME,
+/// used only when the challenge has no MsvAvTimestamp (else the server's is echoed,
+/// 3.1.5.1.2); `nonce` is the client challenge. Caller owns the returned slice.
 pub fn authenticate(
     gpa: std.mem.Allocator,
     cred: Credential,
@@ -92,17 +78,13 @@ pub fn authenticate(
     return (try authenticateKeyed(gpa, cred, challenge, time, nonce)).msg;
 }
 
-/// An AUTHENTICATE_MESSAGE and the session key both ends now hold.
 pub const Authenticated = struct {
     msg: []u8,
-    /// The NTLMv2 SessionBaseKey, HMAC_MD5(ResponseKeyNT, NTProofStr) (MS-NLMP
-    /// 3.3.2). With key exchange not negotiated it is also the exported session
-    /// key (3.4.5.1 KXKEY, 3.1.5.1.2) — what SMB2 signs with and derives its
-    /// SMB 3 signing keys from.
     session_key: [16]u8,
 };
 
-/// `authenticate`, also handing back the session key.
+/// `authenticate`, also handing back the session key. The LMv2 response is always
+/// computed: 3.1.5.1.2 allows Z(24) once a timestamp is present, but a correct one is accepted.
 pub fn authenticateKeyed(
     gpa: std.mem.Allocator,
     cred: Credential,
@@ -113,9 +95,6 @@ pub fn authenticateKeyed(
     const chal = try parseChallenge(challenge);
     const key = try ntowfv2(gpa, cred);
 
-    // NTLMv2_CLIENT_CHALLENGE (MS-NLMP 2.2.2.7), which 3.3.2 calls `temp`:
-    // RespType, HiRespType, Z(6), TimeStamp, ChallengeFromClient, Z(4),
-    // the target info copied verbatim, then a trailing Z(4).
     const temp = try gpa.alloc(u8, 28 + chal.target_info.len + 4);
     defer gpa.free(temp);
     @memset(temp, 0);
@@ -131,9 +110,6 @@ pub fn authenticateKeyed(
     nt_mac.update(temp);
     nt_mac.final(&proof);
 
-    // LMv2_RESPONSE (MS-NLMP 2.2.2.4). MS-NLMP 3.1.5.1.2 says a client SHOULD
-    // send Z(24) here once the challenge carries a timestamp; a correct LMv2
-    // response is accepted in either case, so it is always computed.
     var lm: [24]u8 = undefined;
     var lm_mac = std.crypto.auth.hmac.HmacMd5.init(&key);
     lm_mac.update(&chal.server_challenge);
@@ -148,8 +124,6 @@ pub fn authenticateKeyed(
     const wks = try utf16le(gpa, cred.workstation);
     defer gpa.free(wks);
 
-    // Header through the Version field; no MIC field, matching the layout of
-    // the AUTHENTICATE_MESSAGE in the spec's own example (MS-NLMP 4.2.4.3).
     const header = 72;
     const nt_len = proof.len + temp.len;
     if (nt_len > 0xffff or dom.len > 0xffff or usr.len > 0xffff or wks.len > 0xffff) {
@@ -187,22 +161,20 @@ pub fn authenticateKeyed(
     return .{ .msg = msg, .session_key = session_key };
 }
 
-/// The current time as a Windows FILETIME, for callers with nothing better to
-/// pass to `authenticate`.
+/// The current time as a Windows FILETIME (100ns ticks since 1601-01-01 UTC).
 pub fn filetimeNow() u64 {
-    // 11644473600 seconds separate the FILETIME epoch (1601-01-01) from the
-    // Unix epoch, at 10^7 ticks per second.
     const ticks = @divFloor(std.time.nanoTimestamp(), 100) + 116_444_736_000_000_000;
     return if (ticks <= 0) 0 else @intCast(ticks);
 }
 
 const Challenge = struct {
     server_challenge: [8]u8,
-    /// Borrowed from the caller's message.
     target_info: []const u8,
     timestamp: ?u64,
 };
 
+/// A pre-NTLMv2 server may omit TargetInfoFields (2.2.1.2); the blob then simply
+/// carries no server naming context. `target_info` borrows from `msg`.
 fn parseChallenge(msg: []const u8) Error!Challenge {
     if (msg.len < 32) return error.NtlmBadMessage;
     if (!std.mem.eql(u8, msg[0..8], signature)) return error.NtlmBadMessage;
@@ -213,9 +185,6 @@ fn parseChallenge(msg: []const u8) Error!Challenge {
         .target_info = &.{},
         .timestamp = null,
     };
-    // TargetInfoFields sit at offset 40; a pre-NTLMv2 server may not send them
-    // at all, in which case the NTLMv2 blob simply carries no server naming
-    // context (MS-NLMP 2.2.1.2).
     if (msg.len >= 48) {
         const len = std.mem.readInt(u16, msg[40..42], .little);
         const off = std.mem.readInt(u32, msg[44..48], .little);
@@ -228,9 +197,8 @@ fn parseChallenge(msg: []const u8) Error!Challenge {
     return chal;
 }
 
-/// Walks the AV_PAIR list (MS-NLMP 2.2.2.1) for MsvAvTimestamp. A truncated
-/// list is not an error: the bytes are copied verbatim either way, and only the
-/// timestamp is being looked up.
+/// Walks the AV_PAIR list (2.2.2.1) for MsvAvTimestamp. A truncated list is not
+/// an error: the bytes are copied verbatim either way.
 fn avTimestamp(info: []const u8) ?u64 {
     var i: usize = 0;
     while (i + 4 <= info.len) {
@@ -245,11 +213,9 @@ fn avTimestamp(info: []const u8) ?u64 {
     return null;
 }
 
-/// NTOWFv2 (MS-NLMP 3.3.2): HMAC_MD5(MD4(UTF-16LE(password)),
-/// UTF-16LE(uppercase(user) ++ domain)). The user is uppercased; the domain is
-/// taken as given. Case folding is ASCII-only — Windows folds the full Unicode
-/// range, so a non-ASCII user name whose case differs from the account's will
-/// hash differently.
+/// NTOWFv2 (3.3.2): HMAC_MD5(MD4(UTF-16LE(password)), UTF-16LE(upper(user) ++ domain)).
+/// Case folding is ASCII-only, unlike Windows, so a non-ASCII user name whose case
+/// differs from the account's hashes differently.
 fn ntowfv2(gpa: std.mem.Allocator, cred: Credential) Error![16]u8 {
     const pass = try utf16le(gpa, cred.password);
     defer gpa.free(pass);
@@ -278,16 +244,14 @@ fn utf16le(gpa: std.mem.Allocator, s: []const u8) Error![]u8 {
     return out;
 }
 
-/// One of the Len/MaxLen/BufferOffset triples every variable-length field in an
-/// NTLM message is described by.
+/// Writes one Len/MaxLen/BufferOffset triple describing a variable-length field.
 fn putFields(msg: []u8, at: usize, len: usize, off: usize) void {
     std.mem.writeInt(u16, msg[at..][0..2], @intCast(len), .little);
     std.mem.writeInt(u16, msg[at + 2 ..][0..2], @intCast(len), .little);
     std.mem.writeInt(u32, msg[at + 4 ..][0..4], @intCast(off), .little);
 }
 
-/// MD4 (RFC 1320), one-shot. Only reason it exists: the NT hash is MD4 of the
-/// UTF-16LE password.
+/// MD4 (RFC 1320), one-shot.
 fn md4(msg: []const u8) [16]u8 {
     var state = [4]u32{ 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476 };
 
@@ -320,8 +284,6 @@ fn md4Block(state: *[4]u32, block: *const [64]u8) void {
     var c = state[2];
     var d = state[3];
 
-    // Each step assigns one register and rotates the roles, which is what the
-    // RFC's [ABCD]/[DABC]/[CDAB]/[BCDA] operand ordering describes.
     const shift1 = [4]u5{ 3, 7, 11, 19 };
     for (0..16) |j| {
         const f = (b & c) | (~b & d);
@@ -389,7 +351,6 @@ test "md4 matches the RFC 1320 A.5 test suite" {
 
 test "NTOWFv2 matches the MS-NLMP 4.2.4.1.1 worked example" {
     const cred = Credential{ .domain = "Domain", .user = "User", .password = "Password" };
-    // MS-NLMP 4.2.2.1.2: NTOWFv1 is the bare NT hash, i.e. MD4 of the password.
     const pass = try utf16le(std.testing.allocator, cred.password);
     defer std.testing.allocator.free(pass);
     try expectMd4("a4f49c406510bdcab6824ee7c30fd852", pass);
@@ -397,28 +358,24 @@ test "NTOWFv2 matches the MS-NLMP 4.2.4.1.1 worked example" {
     const key = try ntowfv2(std.testing.allocator, cred);
     try expectHex("0c868a403bfd7a93a3001ef22ef02e3f", &key);
 
-    // Uppercasing applies to the user only; lower-casing the domain must change
-    // the key, lower-casing the user must not.
     const same = try ntowfv2(std.testing.allocator, .{ .domain = "Domain", .user = "user", .password = "Password" });
     try std.testing.expectEqualSlices(u8, &key, &same);
     const other = try ntowfv2(std.testing.allocator, .{ .domain = "domain", .user = "User", .password = "Password" });
     try std.testing.expect(!std.mem.eql(u8, &key, &other));
 }
 
-/// A CHALLENGE_MESSAGE carrying the server challenge, target name and target
-/// info of MS-NLMP 4.2.4: NetBIOS domain "Domain", NetBIOS computer "Server".
-const example_challenge = "4e544c4d53535000" ++ // NTLMSSP\0
-    "02000000" ++ // MessageType
-    "0c000c0038000000" ++ // TargetNameFields: 12 bytes at 56
-    "33828ae2" ++ // NegotiateFlags, as in 4.2.4
-    "0123456789abcdef" ++ // ServerChallenge
-    "0000000000000000" ++ // Reserved
-    "2400240044000000" ++ // TargetInfoFields: 36 bytes at 68
-    "0000000000000000" ++ // Version
-    "530065007200760065007200" ++ // "Server"
-    "02000c0044006f006d00610069006e00" ++ // MsvAvNbDomainName
-    "01000c00530065007200760065007200" ++ // MsvAvNbComputerName
-    "00000000"; // MsvAvEOL
+const example_challenge = "4e544c4d53535000" ++
+    "02000000" ++
+    "0c000c0038000000" ++
+    "33828ae2" ++
+    "0123456789abcdef" ++
+    "0000000000000000" ++
+    "2400240044000000" ++
+    "0000000000000000" ++
+    "530065007200760065007200" ++
+    "02000c0044006f006d00610069006e00" ++
+    "01000c00530065007200760065007200" ++
+    "00000000";
 
 test "authenticate reproduces the MS-NLMP 4.2.4 NTLMv2 and LMv2 responses" {
     const gpa = std.testing.allocator;
@@ -441,20 +398,18 @@ test "authenticate reproduces the MS-NLMP 4.2.4 NTLMv2 and LMv2 responses" {
     const nt = field(msg, 20);
     try expectHex("86c35097ac9cec102554764a57cccc19" ++ "aaaaaaaaaaaaaaaa", lm);
     try expectHex(
-        "68cd0ab851e51c96aabc927bebef6a1c" ++ // NTProofStr, 4.2.4.2.2
-            "0101000000000000" ++ // RespType, HiRespType, Z(6)
-            "0000000000000000" ++ // TimeStamp
-            "aaaaaaaaaaaaaaaa" ++ // ChallengeFromClient
-            "00000000" ++ // Z(4)
-            "02000c0044006f006d00610069006e00" ++ // target info, verbatim
+        "68cd0ab851e51c96aabc927bebef6a1c" ++
+            "0101000000000000" ++
+            "0000000000000000" ++
+            "aaaaaaaaaaaaaaaa" ++
+            "00000000" ++
+            "02000c0044006f006d00610069006e00" ++
             "01000c00530065007200760065007200" ++
             "00000000" ++
-            "00000000", // trailing Z(4)
+            "00000000",
         nt,
     );
 
-    // Payload layout: the three names precede the two responses, and the
-    // unused EncryptedRandomSessionKey points just past the message.
     try expectHex("44006f006d00610069006e00", field(msg, 28));
     try expectHex("5500730065007200", field(msg, 36));
     try expectHex("43004f004d0050005500540045005200", field(msg, 44));
@@ -477,21 +432,19 @@ test "authenticateKeyed: the session key is MS-NLMP 4.2.4.1.3's SessionBaseKey" 
 
 test "authenticate: MsvAvTimestamp overrides the caller's clock" {
     const gpa = std.testing.allocator;
-    // Same challenge, with an MsvAvTimestamp AV pair spliced in front of EOL.
     var chal: [116]u8 = undefined;
     _ = try std.fmt.hexToBytes(&chal, "4e544c4d53535000" ++ "02000000" ++
         "0c000c0038000000" ++ "33828ae2" ++ "0123456789abcdef" ++ "0000000000000000" ++
-        "3000300044000000" ++ // TargetInfo is now 48 bytes
+        "3000300044000000" ++
         "0000000000000000" ++ "530065007200760065007200" ++
         "02000c0044006f006d00610069006e00" ++
         "01000c00530065007200760065007200" ++
-        "070008000102030405060708" ++ // MsvAvTimestamp
+        "070008000102030405060708" ++
         "00000000");
 
     const cred = Credential{ .domain = "D", .user = "U", .password = "P" };
     const msg = try authenticate(gpa, cred, &chal, 0xdead, [_]u8{0xaa} ** 8);
     defer gpa.free(msg);
-    // The blob's TimeStamp is at temp+8, i.e. 16+8 bytes into the response.
     try expectHex("0102030405060708", field(msg, 20)[24..32]);
 }
 
@@ -530,7 +483,6 @@ test "a challenge that is not one is rejected, not misread" {
     std.mem.writeInt(u32, past_end[44..48], 100, .little);
     try std.testing.expectError(Error.NtlmBadMessage, authenticate(gpa, cred, &past_end, 0, nonce));
 
-    // No target info at all: still a valid NTLMv2 blob, just an empty one.
     var no_info = chal;
     std.mem.writeInt(u16, no_info[40..42], 0, .little);
     const msg = try authenticate(gpa, cred, &no_info, 0, nonce);

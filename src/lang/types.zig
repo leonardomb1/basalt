@@ -1,9 +1,15 @@
 //! The engine's canonical type system: the type lattice every column and value
 //! speaks, the nullability flag, and the implicit-widening / unification rules.
 //!
-//! Coercion policy (see plan): implicit *widening only* (`int -> decimal`,
-//! `int -> float`); everything else needs an explicit `cast`. Nulls follow SQL
-//! three-valued logic, tracked here as a per-type `nullable` flag.
+//! Coercion policy: implicit widening only (`int -> decimal`, `int -> float`);
+//! everything else needs an explicit `cast`. Nulls follow SQL three-valued logic,
+//! tracked as a per-type `nullable` flag; a bare `null` literal is `unknown` and
+//! unifies with anything.
+//!
+//! `BodyCol` (a declared `FROM BODY (...)` column) lives here so the connect layer
+//! does not need the AST. A `Field`'s `rel`/`base` are set on columns a join's
+//! right side contributed: the side's alias and the column's original name, which
+//! `name` no longer is once a collision renamed it `x_r`.
 
 const std = @import("std");
 
@@ -43,7 +49,6 @@ pub const Type = struct {
         return .{ .kind = kind };
     }
 
-    /// The type of a bare `null` literal — unifies with anything.
     pub fn unknownNull() Type {
         return .{ .kind = .bool, .nullable = true, .unknown = true };
     }
@@ -77,8 +82,6 @@ pub const Type = struct {
         return true;
     }
 
-    /// Can a value of kind `from` be implicitly widened to kind `to`?
-    /// Only `int -> decimal` and `int -> float` (plus identity).
     pub fn canWiden(from: TypeKind, to: TypeKind) bool {
         if (from == to) return true;
         return from == .int and (to == .decimal or to == .float);
@@ -113,19 +116,11 @@ pub const Type = struct {
     }
 };
 
-/// An ordered set of named, typed columns — the schema flowing between operators.
-/// A declared request-body column — `FROM BODY (name TYPE [NOT NULL], ...)`.
-/// Carried on `ast.ReadForm.request`; the request source enforces it at bind
-/// time (a violating row is a permanent error naming the row). Lives here so
-/// the connect layer doesn't need the AST.
 pub const BodyCol = struct { name: []const u8, ty: Type, not_null: bool = false };
 
 pub const Schema = struct {
     fields: []const Field,
 
-    /// `rel`/`base` are set on the columns a join's right side contributed: the
-    /// side's alias and the column's name there, which `name` no longer is once a
-    /// collision renamed it `x_r`. They are what lets `b.x` find that column.
     pub const Field = struct { name: []const u8, ty: Type, rel: []const u8 = "", base: []const u8 = "" };
 
     pub fn indexOf(self: Schema, name: []const u8) ?usize {
@@ -136,7 +131,7 @@ pub const Schema = struct {
     }
 
     /// The column a possibly qualified name refers to. `b.x`, where `b` is a join's
-    /// right side, is that side's `x` whatever the join had to rename it; any other
+    /// right side, is that side's `x` whatever it was renamed to; any other
     /// qualifier is decoration and the last part alone decides.
     pub fn resolve(self: Schema, parts: []const []const u8) ?usize {
         const name = parts[parts.len - 1];

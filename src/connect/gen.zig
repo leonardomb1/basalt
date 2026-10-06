@@ -1,6 +1,8 @@
-//! Generated sources — rows made from nothing: `SELECT <exprs>;` with no
-//! FROM (one empty row the projection fills with literals) and
-//! `FROM RANGE(lo, hi)` (integers lo..hi-1 as one `range` column).
+//! Generated sources: rows made from nothing. `SELECT <exprs>;` with no FROM is
+//! `UnitSource`, one row with zero columns that the select stage above fills with
+//! literals. `FROM RANGE(lo, hi)` is `RangeSource`, which streams the integers
+//! lo..hi-1 in batches as one `range` column; an empty or inverted range yields
+//! zero rows.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -9,7 +11,6 @@ const Column = @import("../exec/column.zig").Column;
 const Batch = @import("../exec/batch.zig").Batch;
 const driver = @import("driver.zig");
 
-/// One row, zero columns. The select stage above computes every output.
 pub const UnitSource = struct {
     gpa: std.mem.Allocator,
     schema_: types.Schema = .{ .fields = &.{} },
@@ -44,8 +45,6 @@ pub const UnitSource = struct {
     const unit_vtable = driver.sourceVTable(UnitSource);
 };
 
-/// `RANGE(lo, hi)` — streams lo..hi-1 in batches; an empty or inverted range
-/// yields zero rows.
 pub const RangeSource = struct {
     gpa: std.mem.Allocator,
     schema_: types.Schema,

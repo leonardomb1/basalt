@@ -1,8 +1,54 @@
 //! Typed expression evaluation. `TypeCtx` resolves and type-checks an expression
-//! against an input schema (filling `msg` on failure); `evalColumn` evaluates an
-//! expression over a whole batch into a new column. Null handling follows SQL
-//! three-valued logic: any null operand in a comparison/arithmetic yields null;
-//! `and`/`or` use the 3VL truth tables; `is null` is total (never null).
+//! against an input schema (filling `msg` and `span` on failure); `evalColumn`
+//! evaluates an expression over a whole batch into a new column. Null handling
+//! follows SQL three-valued logic: any null operand in a comparison/arithmetic
+//! yields null; `and`/`or` use the 3VL truth tables; `is null` is total.
+//!
+//! Every scalar builtin is one `Builtin` entry (plan-time typing, row-wise
+//! evaluator, optional whole-batch kernel) found by `lookupBuiltin`; the table is
+//! re-exported by `exec/builtins.zig`. Check time catches what it can so a bad
+//! input fails `check`, not the run: a literal regex pattern or `strftime` format
+//! is compiled, and a string literal compared to a date/timestamp must be strict
+//! ISO, bending to the column's type (never the reverse, so `'01/07/2013'` is an
+//! error instead of a text comparison). A `$name` still present at typing time
+//! names nothing and is never read as a column.
+//!
+//! Two evaluators. `evalVec` works on whole typed column slices with no per-row
+//! `Value` boxing; a node it does not cover (bitwise ops, `try_cast`, most string
+//! functions) is evaluated row-wise by itself and handed back as a column, so its
+//! parent stays vectorized. The vector path is eager, so a value-dependent error
+//! (zero divisor, failed cast) there is demoted to `Unsupported` and the
+//! expression re-runs on the lazy row-wise `evalRow`, which raises it only for a
+//! row that really takes the branch, and names that row. The row-wise evaluator
+//! is the reference both paths must agree with. Temporal comparisons vectorize as
+//! i64 lanes with the ISO literal parsed once per batch (row-wise they were 43x
+//! slower than the same comparison on an int column).
+//!
+//! Numeric rules, each fixed after a wrong answer: i64 arithmetic is checked,
+//! since the shipped ReleaseFast build makes overflow undefined (and `minInt / -1`
+//! traps with SIGFPE); `%` takes the dividend's sign for ints, floats and
+//! decimals alike; DECIMAL `+ - * %` is exact on i128 unscaled integers (`/` and
+//! any float operand stay float), so `1.1 + 0.3` is not 1.4000000000000001.
+//! Every decimal rounding (casts, sinks, aggregates, `round`) is half away from
+//! zero, as PostgreSQL does, and a float becomes a decimal through its 15
+//! significant digits, so 12.345 rounds to 12.35. Floats order totally, NaN equal
+//! to itself and above everything (PostgreSQL's rule), because `std.math.order`
+//! reaches `unreachable` on NaN. Text functions count characters, not bytes; a
+//! byte that does not start valid UTF-8 counts as one character, so non-UTF-8
+//! text degrades to byte semantics. Generated strings are capped at
+//! `max_str_bytes` (1 MiB).
+//!
+//! Per-thread state, since parallel lanes evaluate concurrently: `field_memo`
+//! (column index per name, verified on every hit so a stale entry costs one
+//! compare, never a wrong column), `RegexCache` (keyed by pattern bytes, not
+//! address, because batch-arena patterns reuse addresses), `reduce_memo`, and
+//! `fail_note`, the human reason for the last builtin failure. A note is tied to
+//! the error code it explains and dropped when evaluation restarts, so an error
+//! swallowed by TRY_CAST or a fallback never lends its note to a later one.
+//!
+//! Rendering: `writeValue` writes text straight into a sink with no allocation
+//! and is byte-identical to `valueToString`; years before 0 print with a sign.
+//! Dates are day counts and timestamps microseconds since 1970-01-01.
 
 const std = @import("std");
 const regex = @import("regex.zig");
@@ -25,7 +71,6 @@ pub const TypeCtx = struct {
     schema: types.Schema,
     arena: std.mem.Allocator,
     msg: []const u8 = "",
-    /// The name the error is about, when it is about one.
     span: ?ast.Span = null,
 
     pub fn typeOf(self: *TypeCtx, expr: *const ast.Expr) TypeError!Type {
@@ -37,8 +82,6 @@ pub const TypeCtx = struct {
             .str_lit => return Type.init(.string),
             .field => |q| {
                 self.span = q.span;
-                // Every bound `$name` was replaced by its value before typing; one
-                // still here names nothing, and is never read as the column it spells.
                 if (q.dollar) return self.err("unknown `${s}`: no PARAM, LET or loop variable of that name", .{q.parts[0]});
                 if (q.safe.len > 0) return self.err("`?.` (safe navigation) only applies to JSON-param paths, not column `{s}`", .{lastPart(q)});
                 const idx = fieldIndex(self.schema, q) orelse
@@ -67,8 +110,6 @@ pub const TypeCtx = struct {
             .match => |m| return self.typeOfMatch(m),
             .cast => |c| {
                 const s = try self.typeOf(c.e);
-                // `try_cast` turns a failed conversion into null, so its result
-                // is nullable even when the input can never be null.
                 return c.ty.withNull(s.nullable or c.safe);
             },
             .is_null => |n| {
@@ -81,7 +122,6 @@ pub const TypeCtx = struct {
             },
             .let_in => return self.err("internal: `let … in` should have been expanded before type-checking", .{}),
             .lambda => return self.err("a lambda (`x -> …`) is only an argument of json_filter, json_transform, json_any, json_all or json_reduce", .{}),
-            // The JSON array functions bind their parameter before typing the body.
             .lambda_var => |n| return self.err("internal: lambda parameter `{s}` typed outside its function", .{n}),
         }
     }
@@ -97,7 +137,6 @@ pub const TypeCtx = struct {
                 const k: types.TypeKind = if (lt.kind == .float or rt.kind == .float or lt.kind == .decimal or rt.kind == .decimal) .float else .int;
                 return Type{ .kind = k, .nullable = nn };
             },
-            // Bitwise ops are INT-only: no float coercion, no string coercion.
             .bit_and, .bit_or, .bit_xor, .shl, .shr => {
                 if (!(intish(lt) and intish(rt))) return self.err("bitwise operators need INT operands", .{});
                 return Type{ .kind = .int, .nullable = nn };
@@ -115,10 +154,8 @@ pub const TypeCtx = struct {
         }
     }
 
-    /// A date/timestamp compared against a string *literal*. The literal bends
-    /// to the column's type, never the reverse, so a mistyped `'01/07/2013'`
-    /// stays an error instead of degrading into a text comparison. Validated
-    /// here so a bad literal fails `check` rather than the run.
+    /// A date/timestamp compared against a string literal: the literal must parse as
+    /// the column's type, validated here so a bad one fails `check` rather than the run.
     fn temporalLit(self: *TypeCtx, e: *const ast.Expr, other: Type) TypeError!bool {
         if (e.* != .str_lit) return false;
         if (other.kind != .date and other.kind != .timestamp) return false;
@@ -130,6 +167,8 @@ pub const TypeCtx = struct {
         return true;
     }
 
+    /// An argument's own error names its own span; one about the call as a whole
+    /// (arity, argument types) underlines the function name.
     fn typeOfCall(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
         const name = c.name;
         self.span = c.span;
@@ -138,8 +177,6 @@ pub const TypeCtx = struct {
         }
         const b = lookupBuiltin(name) orelse return self.err("unknown function `{s}`", .{name});
         self.span = null;
-        // An argument's own error names its own span; one about the call as a
-        // whole (arity, argument types) underlines the function name.
         return b.type_fn(self, c) catch |e| {
             if (self.span == null) self.span = c.span;
             return e;
@@ -180,9 +217,8 @@ pub const TypeCtx = struct {
         return error.TypeError;
     }
 
-    /// A text parameter: strings and bytes, plus every scalar the runtime renders
-    /// as text (numbers, bools, temporals) — `concat(id, '-', name)` is too common
-    /// to refuse. Only nested values have no text form.
+    /// A text parameter: strings, bytes and every scalar the runtime renders as text,
+    /// since `concat(id, '-', name)` is too common to refuse. Only nested values fail.
     fn wantText(self: *TypeCtx, c: ast.Expr.Call, i: usize) TypeError!Type {
         const t = try self.argType(c, i);
         if (t.kind == .array or t.kind == .@"struct")
@@ -190,7 +226,6 @@ pub const TypeCtx = struct {
         return t;
     }
 
-    /// A position or count parameter: an INT, or an untyped null.
     fn wantInt(self: *TypeCtx, c: ast.Expr.Call, i: usize, what: []const u8) TypeError!Type {
         const t = try self.argType(c, i);
         if (!intish(t)) return self.err("`{s}` {s} must be an INT, got {s}", .{ c.name, what, @tagName(t.kind) });
@@ -216,13 +251,6 @@ fn comparable(a: Type, b: Type) bool {
     return a.kind == b.kind;
 }
 
-/// Evaluate `expr` over every row of `batch` into a new column of type `out_ty`.
-///
-/// Fast path: a vectorized kernel that works on whole typed column slices (i64 /
-/// f64 / bool / bytes) with no per-row `Value` boxing — the inner loops are tight
-/// and autovectorize when a column has no nulls. Expressions containing nodes the
-/// vectorizer does not cover (string functions, `match`) transparently fall back
-/// to the row-at-a-time evaluator below.
 pub fn evalColumn(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, out_ty: Type) EvalError!column.Column {
     forgetFailure();
     const v = evalVec(arena, expr, batch) catch |e| switch (e) {
@@ -262,8 +290,6 @@ const Vec = union(enum) {
     scalar: Value,
 };
 
-/// A numeric operand normalized to one of four shapes. Decimal columns are
-/// widened to an f64 column up front (rare in the hot path).
 const Num = union(enum) {
     icol: struct { d: []const i64, v: Bitmap },
     fcol: struct { d: []const f64, v: Bitmap },
@@ -281,13 +307,6 @@ const BoolOp = union(enum) {
     scalar: ?bool,
 };
 
-/// One node of the expression as a vector. A node the kernels do not cover is
-/// evaluated row-wise *by itself* and handed back as a column, so its parent
-/// stays on the vector path: one `round()` in a filter used to send the whole
-/// predicate — every comparison and `AND` around it — to the row evaluator.
-/// An error the row path raises for real (a bad cast, a zero divisor) still
-/// surfaces as `Unsupported` here and is re-raised by `evalColumn`'s own
-/// row-wise pass, which is also the lazy evaluator that untaken branches need.
 fn evalVec(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch) VecError!Vec {
     return evalVecNode(arena, expr, batch) catch |e| switch (e) {
         error.Unsupported => rowwiseVec(arena, expr, batch),
@@ -317,13 +336,9 @@ fn evalVecNode(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch) Ve
     }
 }
 
-/// Row-wise evaluation of one node as a column, typed by widening every
-/// non-null value's type; nothing but nulls is a null scalar.
-///
-/// The type used to be the first value's alone, so `CASE WHEN .. THEN 1 ELSE
-/// 2.5 END` built an int column when row 0 took the int arm and truncated 2.5
-/// to 2 — and the answer changed with where a batch or lane began. Kinds with
-/// no common type decline, and the caller evaluates with the analyzer's type.
+/// Row-wise evaluation of one node as a column, typed by widening every non-null
+/// value's type (the first value's alone made the answer depend on where a batch
+/// began). Kinds with no common type decline.
 fn rowwiseVec(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch) VecError!Vec {
     const n = batch.len;
     const vals = try arena.alloc(Value, n);
@@ -350,10 +365,8 @@ fn rowwiseVec(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch) Vec
     return .{ .col = try b.finish() };
 }
 
-/// CASE, both forms: each arm's condition becomes a row mask, and the arms are
-/// folded back to front over the default (or null), an earlier arm's rows
-/// overriding a later one's — the answer the row evaluator gives. Every SQL
-/// CASE used to drag its whole enclosing expression row-wise.
+/// CASE, both forms: each arm's condition becomes a row mask, folded back to
+/// front over the default so an earlier arm's rows override a later one's.
 fn matchVec(arena: std.mem.Allocator, m: ast.Match, batch: Batch) VecError!Vec {
     const n = batch.len;
     const takes = try arena.alloc([]bool, m.arms.len);
@@ -385,7 +398,6 @@ fn matchVec(arena: std.mem.Allocator, m: ast.Match, batch: Batch) VecError!Vec {
     return acc;
 }
 
-/// OR a bool vector into a row mask; a null is false.
 fn orInto(take: []bool, c: Vec) VecError!void {
     switch (c) {
         .scalar => |s| if (s == .bool and s.bool) {
@@ -399,8 +411,7 @@ fn orInto(take: []bool, c: Vec) VecError!void {
 }
 
 /// Per row, `t` where `take[i]` else `e`. A null scalar on either side is an
-/// all-null column of the other's type, so `IF(c, x, NULL)` and a CASE with no
-/// ELSE stay vectorized; two null scalars are null.
+/// all-null column of the other's type, so `IF(c, x, NULL)` stays vectorized.
 fn pickVec(arena: std.mem.Allocator, take: []const bool, t: Vec, e: Vec) VecError!Vec {
     const n = take.len;
     const tn = t == .scalar and t.scalar.isNull();
@@ -414,7 +425,6 @@ fn pickVec(arena: std.mem.Allocator, take: []const bool, t: Vec, e: Vec) VecErro
     return mergeCols(arena, take, tcol, ecol);
 }
 
-/// Evaluate an argument to a string operand, or null → Unsupported fallback.
 fn strArg(arena: std.mem.Allocator, e: *const ast.Expr, batch: Batch) VecError!Str {
     const v = try evalVec(arena, e, batch);
     return asStr(v) orelse error.Unsupported;
@@ -466,7 +476,6 @@ fn unaryVec(arena: std.mem.Allocator, u: ast.Expr.Unary, batch: Batch) VecError!
                 return mkCol(c.ty, n, c.validity, .{ .b = out });
             },
         },
-        // Handled rowwise, like the binary bitwise ops.
         .bit_not => return error.Unsupported,
     }
 }
@@ -493,10 +502,11 @@ fn isNullVec(arena: std.mem.Allocator, n: ast.Expr.IsNull, batch: Batch) VecErro
     }
 }
 
+/// Bitwise ops are refused here and run row-wise. A date column against an ISO
+/// literal is tried as a temporal comparison before the string path.
 fn binaryVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecError!Vec {
     switch (b.op) {
         .@"and", .@"or" => return boolOpVec(arena, b.op, b.l, b.r, batch),
-        // No vectorized kernel yet — the rowwise evaluator owns bitwise ops.
         .bit_and, .bit_or, .bit_xor, .shl, .shr => return error.Unsupported,
         .add, .sub, .mul, .div, .mod => {
             const l = try evalVec(arena, b.l, batch);
@@ -514,8 +524,6 @@ fn binaryVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecErro
             if (try asNum(arena, l, batch.len)) |ln| {
                 if (try asNum(arena, r, batch.len)) |rn| return numOpVec(arena, b.op, ln, rn, batch.len);
             }
-            // Before the string path: a date column compared to an ISO literal is a
-            // temporal comparison, not a text one.
             if (try temporalPair(arena, l, r, batch.len)) |tp| {
                 return numOpVec(arena, b.op, tp[0], tp[1], batch.len);
             }
@@ -528,10 +536,6 @@ fn binaryVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecErro
     }
 }
 
-/// Vectorized arithmetic/comparison over two numeric operands: dispatches the
-/// runtime op and int-vs-float lane type to a comptime-specialized kernel
-/// (`numOpVecT`), keeping each op's inner loop free of per-row branching —
-/// the same codegen shape as the previous hand-unrolled per-op loops.
 fn numOpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Num, r: Num, n: usize) VecError!Vec {
     const int_lane = isIntNum(l) and isIntNum(r);
     switch (op) {
@@ -545,10 +549,8 @@ fn numOpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Num, r: Num, n: usize) V
     }
 }
 
-/// Shared valid/nullable template behind `numOpVec`: apply `op` elementwise
-/// over two numeric operands widened to comptime `T`. All-valid inputs skip
-/// the per-row validity checks; otherwise null-in → null-out with the evicted
-/// slot zero-filled (builder convention).
+/// Applies `op` elementwise over operands widened to comptime `T`. All-valid
+/// inputs skip the per-row validity checks; a null slot is zero-filled.
 fn numOpVecT(comptime T: type, comptime op: ast.BinOp, arena: std.mem.Allocator, l: Num, r: Num, n: usize) VecError!Vec {
     const Out = OpOut(T, op);
     const ty = Type.init(if (Out == bool) .bool else if (T == i64) .int else .float);
@@ -572,8 +574,6 @@ fn numOpVecT(comptime T: type, comptime op: ast.BinOp, arena: std.mem.Allocator,
     return mkCol(ty.withNull(any), n, bm, outData(Out, out));
 }
 
-/// Result element type of `applyOp`: comparisons yield `bool`, arithmetic the
-/// operand type.
 fn OpOut(comptime T: type, comptime op: ast.BinOp) type {
     return switch (op) {
         .eq, .ne, .lt, .le, .gt, .ge => bool,
@@ -581,21 +581,15 @@ fn OpOut(comptime T: type, comptime op: ast.BinOp) type {
     };
 }
 
-/// One elementwise binary op over already-valid operands widened to `T` (i64
-/// or f64). Int div/mod raise on a zero divisor; float div/mod follow float
-/// semantics (`/`, `@mod`) — both matching the rowwise evaluator.
+/// Int div/mod raise on a zero divisor and int add/sub/mul on overflow; f64
+/// compares through `orderF64`, since `std.math.order` is `unreachable` on NaN.
 inline fn applyOp(comptime T: type, comptime op: ast.BinOp, a: T, d: T) VecError!OpOut(T, op) {
     return switch (op) {
-        // See `arith`: unchecked i64 overflow is UB in the release build.
         .add => if (T == i64) (std.math.add(i64, a, d) catch return error.IntOverflow) else a + d,
         .sub => if (T == i64) (std.math.sub(i64, a, d) catch return error.IntOverflow) else a - d,
         .mul => if (T == i64) (std.math.mul(i64, a, d) catch return error.IntOverflow) else a * d,
         .div => if (T == i64) intDiv(a, d) else a / d,
-        // `@rem`, as the int path: SQL's remainder takes the dividend's sign.
         .mod => if (T == i64) intRem(a, d) else @rem(a, d),
-        // f64 comparison goes through the total order (NaN equal to itself,
-        // above everything else); `std.math.order` hits `unreachable` on NaN,
-        // and this kernel runs on whole columns.
         .eq, .ne, .lt, .le, .gt, .ge => cmpResult(op, if (T == f64) orderF64(a, d) else std.math.order(a, d)),
         else => unreachable,
     };
@@ -605,9 +599,8 @@ inline fn outData(comptime Out: type, out: []Out) Column.Data {
     return if (Out == bool) .{ .b = out } else if (Out == i64) .{ .i64 = out } else .{ .f64 = out };
 }
 
-/// A dictionary column against a string literal: each entry compared once and
-/// the answer gathered through the codes, as `cmpStrVec` would give row by row
-/// — 20 comparisons for a 20-value column, not a batch's worth. Null otherwise.
+/// A dictionary column against a string literal: each entry compared once and the
+/// answer gathered through the codes. Null when the operands are not that shape.
 fn dictCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) VecError!?Vec {
     const col, const lit, const flip = blk: {
         if (l == .col and r == .scalar) if (l.col.dict != null and r.scalar == .string) break :blk .{ l.col, r.scalar.string, false };
@@ -647,13 +640,8 @@ fn cmpStrVec(arena: std.mem.Allocator, op: ast.BinOp, l: Str, r: Str, n: usize) 
     return mkCol(Type.init(.bool).withNull(any), n, bm, .{ .b = out });
 }
 
-/// Evaluate a subexpression whose value the rowwise evaluator might never need
-/// (an untaken `if` branch, the short-circuited side of and/or). The vectorized
-/// path is eager — it computes every row of every branch — so a value-dependent
-/// error (div-by-zero, failed cast) here must not escape: rowwise semantics only
-/// raise it on rows that actually take the branch. Demote it to Unsupported,
-/// which falls the whole expression back to the lazy rowwise evaluator: that
-/// either succeeds (the error was on an untaken row) or raises it for real.
+/// Evaluates a subexpression the row evaluator might never need (an untaken
+/// branch, a short-circuited side), demoting a value-dependent error to Unsupported.
 fn evalVecLazy(arena: std.mem.Allocator, e: *const ast.Expr, batch: Batch) VecError!Vec {
     return evalVec(arena, e, batch) catch |err| switch (err) {
         error.DivByZero, error.CastFailed => error.Unsupported,
@@ -701,16 +689,13 @@ fn boolOpVec(arena: std.mem.Allocator, op: ast.BinOp, le: *const ast.Expr, re: *
     return mkCol(Type.init(.bool).withNull(any), n, bm, .{ .b = out });
 }
 
+/// `try_cast` and any value that does not convert go to the row-wise path, which
+/// yields per-row nulls or stops at the failing row and names it.
 fn castVec(arena: std.mem.Allocator, c: ast.Expr.Cast, batch: Batch) VecError!Vec {
-    // `try_cast` needs per-row null-on-failure, but the vectorized cast fails
-    // the whole column at the first bad value — hand it to the rowwise path.
     if (c.safe) return error.Unsupported;
     const v = try evalVec(arena, c.e, batch);
     const target = c.ty.kind;
     if (target == .decimal) return error.Unsupported;
-    // A value that does not convert sends the expression to the rowwise path,
-    // which stops at that row and names it; the column kernel only knows that
-    // one failed somewhere.
     switch (v) {
         .scalar => |s| {
             if (s.isNull()) return .{ .scalar = .null };
@@ -726,9 +711,8 @@ fn castVec(arena: std.mem.Allocator, c: ast.Expr.Cast, batch: Batch) VecError!Ve
     }
 }
 
-/// Float→int cast guarding the i64 range and NaN/inf (all of which `@intFromFloat`
-/// treats as illegal behavior — a safety-check panic in safe builds, UB otherwise).
-/// Out-of-range/NaN → CastFailed, matching the string→int arm's error contract.
+/// Float to int guarding the i64 range and NaN/inf, which `@intFromFloat` treats
+/// as illegal behavior; out of range is CastFailed, as for a string.
 fn floatToInt(x: f64) error{CastFailed}!i64 {
     if (!(x >= -9223372036854775808.0 and x < 9223372036854775808.0)) return error.CastFailed;
     return @intFromFloat(x);
@@ -804,7 +788,6 @@ fn condVec(arena: std.mem.Allocator, c: ast.Expr.Cond, batch: Batch) VecError!Ve
     return pickVec(arena, take, tv, ev);
 }
 
-/// Pick, per row, the matching element from `t` (where `take[i]`) or `e`.
 fn mergeCols(arena: std.mem.Allocator, take: []const bool, t: Column, e: Column) VecError!Vec {
     const n = take.len;
     var bm = try Bitmap.initFull(arena, n);
@@ -841,9 +824,6 @@ fn mergeCols(arena: std.mem.Allocator, take: []const bool, t: Column, e: Column)
     return .{ .col = .{ .ty = t.ty.withNull(true), .len = n, .validity = bm, .data = data } };
 }
 
-/// `mergePick` for the Arrow bytes layout: the picked payloads have to be copied
-/// into a fresh values buffer, so sizes are summed first and the buffer is
-/// allocated exactly once.
 fn mergeBytes(arena: std.mem.Allocator, bm: *Bitmap, take: []const bool, ts: column.Bytes, es: column.Bytes, tv: Bitmap, ev: Bitmap) !column.Bytes {
     const n = take.len;
     var span: usize = 0;
@@ -900,8 +880,8 @@ fn asNum(arena: std.mem.Allocator, v: Vec, n: usize) VecError!?Num {
     }
 }
 
-/// The exact lane for `decimalArithType`: null when the operands or the op are
-/// not its case, and the float kernels take over as before.
+/// The exact lane for `decimalArithType`; null when the operands or the op are
+/// not its case, and the float kernels take over.
 fn decOpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) VecError!?Vec {
     const ty = decimalArithType(op, vecType(l) orelse return null, vecType(r) orelse return null) orelse return null;
     const out = try arena.alloc(Decimal, n);
@@ -919,7 +899,6 @@ fn decOpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) V
     return mkCol(ty.withNull(any), n, bm, .{ .dec = out });
 }
 
-/// The numeric type of an int/decimal operand; null for anything else.
 fn vecType(v: Vec) ?Type {
     return switch (v) {
         .scalar => |s| switch (s) {
@@ -938,7 +917,6 @@ inline fn vecValid(v: Vec, i: usize) bool {
     };
 }
 
-/// Only for operands `vecType` accepted, at a valid row.
 inline fn decAt(v: Vec, i: usize) Decimal {
     return switch (v) {
         .scalar => |s| asDecimal(s).?,
@@ -946,18 +924,6 @@ inline fn decAt(v: Vec, i: usize) Decimal {
     };
 }
 
-/// A comparison where one side is temporal, as integer lanes.
-///
-/// `asNum` covers int/float/decimal only, so every date comparison used to fall out
-/// of the vectorized path and be evaluated a row at a time: measured at 48ns a row
-/// against 1.1ns for the same comparison on an int column, 43x, and a date is only
-/// an i32 day count. TPC-H spends most of its filter time on exactly this shape.
-///
-/// A date/time/timestamp column becomes an i64 lane, and the literal beside it is
-/// coerced once per batch rather than once per row — the same ISO parse
-/// `compareValues` does per row, so the answers are identical. Returns null for
-/// anything it cannot line up (a string that is not a date, a temporal against a
-/// number), which leaves the row-wise path to produce the error it produced before.
 fn temporalKind(v: Vec) ?types.TypeKind {
     return switch (v) {
         .col => |c| switch (c.ty.kind) {
@@ -973,12 +939,9 @@ fn temporalKind(v: Vec) ?types.TypeKind {
     };
 }
 
-/// One side of a temporal comparison as an i64 lane. `want` is the temporal kind of
-/// the other side, which is what an ISO string literal is parsed into.
 fn temporalNum(arena: std.mem.Allocator, v: Vec, want: types.TypeKind, n: usize) VecError!?Num {
     switch (v) {
         .col => |c| switch (c.ty.kind) {
-            // Dates are stored 32-bit; widen once per batch, as decimals already do.
             .date => {
                 const out = try arena.alloc(i64, n);
                 for (c.data.i32[0..n], out) |d, *o| o.* = d;
@@ -1004,13 +967,12 @@ fn temporalNum(arena: std.mem.Allocator, v: Vec, want: types.TypeKind, n: usize)
     }
 }
 
-/// Both sides of a temporal comparison, or null when the pair does not line up.
+/// Both sides of a temporal comparison as i64 lanes (dates widened once per batch),
+/// or null when they do not line up, including a date against a timestamp.
 fn temporalPair(arena: std.mem.Allocator, l: Vec, r: Vec, n: usize) VecError!?[2]Num {
     const lk = temporalKind(l);
     const rk = temporalKind(r);
     const kind = lk orelse rk orelse return null;
-    // Two temporal sides of different kinds (a date against a timestamp) are left to
-    // the row-wise path, which already has the widening rules for that.
     if (lk != null and rk != null and lk.? != rk.?) return null;
     const ln = (try temporalNum(arena, l, kind, n)) orelse return null;
     const rn = (try temporalNum(arena, r, kind, n)) orelse return null;
@@ -1060,7 +1022,6 @@ inline fn numF(x: Num, i: usize) f64 {
         .fscalar => |s| s,
     };
 }
-/// `numI`/`numF` selected by comptime lane type (folds to a direct call).
 inline fn numAt(comptime T: type, x: Num, i: usize) T {
     return if (T == i64) numI(x, i) else numF(x, i);
 }
@@ -1101,8 +1062,6 @@ fn mkCol(ty: Type, n: usize, validity: Bitmap, data: Column.Data) Vec {
     return .{ .col = .{ .ty = ty, .len = n, .validity = validity, .data = data } };
 }
 
-/// Turn a `Vec` into a concrete column of `n` rows, broadcasting a scalar across
-/// all rows (used when the whole expression collapses to a constant).
 fn realize(arena: std.mem.Allocator, v: Vec, n: usize) VecError!?Column {
     switch (v) {
         .col => |c| return c,
@@ -1130,11 +1089,8 @@ fn broadcastScalar(arena: std.mem.Allocator, s: Value, out_ty: Type, n: usize) E
     return b.finish();
 }
 
-/// Evaluate an expression at PLAN TIME against named scalar bindings (params,
-/// for-each loop variables) — no columns exist yet. Implemented by materializing
-/// the bindings as a one-row batch and reusing `evalRow`, so the full expression
-/// language (the C primitives, `match`, `cond`, `cast`) is available for `match`
-/// subjects/guards and `fn` folding. Errors if a referenced name isn't bound.
+/// Evaluates an expression at plan time against named scalar bindings (params,
+/// loop variables) by materializing them as a one-row batch for `evalRow`.
 pub fn constEval(arena: std.mem.Allocator, expr: *const ast.Expr, names: []const []const u8, values: []const Value) EvalError!Value {
     const fields = try arena.alloc(types.Schema.Field, names.len);
     const cols = try arena.alloc(column.Column, names.len);
@@ -1165,7 +1121,6 @@ fn scalarType(v: Value) Type {
     };
 }
 
-/// True for an empty string/bytes value — the non-null half of `is empty`.
 fn isEmptyVal(v: Value) bool {
     return switch (v) {
         .string, .bytes => |s| s.len == 0,
@@ -1190,7 +1145,6 @@ pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, ro
             if (v.isNull()) return .null;
             return switch (u.op) {
                 .neg => switch (v) {
-                    // `-minInt(i64)` wrapped back to itself.
                     .int => |x| .{ .int = std.math.negate(x) catch return error.IntOverflow },
                     .float => |x| .{ .float = -x },
                     .decimal => |d| .{ .decimal = .{ .unscaled = -d.unscaled, .scale = d.scale } },
@@ -1224,7 +1178,6 @@ pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, ro
                 error.CastFailed => return castFailure(arena, v, c.ty),
                 else => return e,
             };
-            // `try_cast`: a failed conversion is a null, not an error.
             const out: Value = castValueTyped(arena, v, c.ty) catch |e| {
                 if (e == error.CastFailed) return .null;
                 return e;
@@ -1233,8 +1186,6 @@ pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, ro
         },
         .match => |m| return evalMatch(arena, m, batch, row),
         .call => |c| return evalCall(arena, c, batch, row),
-        // a lambda is evaluated only through the function it is an argument of,
-        // which binds its parameter first
         .let_in, .lambda, .lambda_var => return error.TypeMismatch,
     }
 }
@@ -1274,8 +1225,8 @@ fn evalBinary(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch, row: u
     }
 }
 
-/// `minInt(i64) / -1` is the one quotient i64 cannot hold, and the hardware
-/// traps on it: the process died of SIGFPE. The remainder is 0 by definition.
+/// `minInt(i64) / -1` is the one quotient i64 cannot hold and the hardware traps
+/// on it (SIGFPE); it is IntOverflow here, and its remainder is 0.
 fn intDiv(a: i64, b: i64) error{ DivByZero, IntOverflow }!i64 {
     if (b == 0) return error.DivByZero;
     if (b == -1) return std.math.negate(a) catch error.IntOverflow;
@@ -1292,10 +1243,6 @@ fn arith(op: ast.BinOp, l: Value, r: Value) EvalError!Value {
     if (l == .int and r == .int) {
         const a = l.int;
         const b = r.int;
-        // Checked: the shipped binary is ReleaseFast, where a bare `+` on
-        // overflow is undefined behavior — a silently wrong (usually negative)
-        // number. i64 is the widest integer basalt carries, so there is nothing
-        // to widen into; the honest answer is to fail the row.
         return switch (op) {
             .add => .{ .int = std.math.add(i64, a, b) catch return error.IntOverflow },
             .sub => .{ .int = std.math.sub(i64, a, b) catch return error.IntOverflow },
@@ -1315,25 +1262,17 @@ fn arith(op: ast.BinOp, l: Value, r: Value) EvalError!Value {
         .sub => .{ .float = a - b },
         .mul => .{ .float = a * b },
         .div => .{ .float = a / b },
-        // Truncated, the dividend's sign — `-5.0 % 3` is -2, as for ints; `@mod`
-        // floored it to 1.
         .mod => .{ .float = @rem(a, b) },
         else => unreachable,
     };
 }
 
-/// Exact DECIMAL arithmetic: `+`/`-`/`%` at the wider operand's scale, `*` at the
-/// summed scale, all on the i128 unscaled integers. `/` has no finite scale and
-/// stays float, as does anything with a float operand. A remainder is no wider
-/// than either operand, so it keeps the narrower integer part. Money math
-/// used to go through f64 here, so `CAST(1.1 AS DECIMAL(18,2)) + CAST(0.3 AS
-/// DECIMAL(18,2))` answered 1.4000000000000001 — which defeated the advice to
-/// cast a SUM to DECIMAL the moment the total was subtracted from another.
+/// The exact DECIMAL type of `op`, or null when it stays float. `+ - %` take the
+/// wider scale, `*` the summed scale; an INT operand is a DECIMAL(19,0).
 fn decimalArithType(op: ast.BinOp, lt: Type, rt: Type) ?Type {
     if (op != .add and op != .sub and op != .mul and op != .mod) return null;
     if (lt.kind == .float or rt.kind == .float) return null;
     if (lt.kind != .decimal and rt.kind != .decimal) return null;
-    // An INT operand is a DECIMAL(19,0); an unresolved precision (0) is the ceiling.
     const lp: u16 = if (lt.kind != .decimal) 19 else if (lt.precision == 0) 38 else lt.precision;
     const rp: u16 = if (rt.kind != .decimal) 19 else if (rt.precision == 0) 38 else rt.precision;
     const ls: u16 = if (lt.kind == .decimal) lt.scale else 0;
@@ -1355,7 +1294,6 @@ fn asDecimal(v: Value) ?Decimal {
     };
 }
 
-/// Null for an op that is not exact over decimals (see `decimalArithType`).
 fn decimalOp(op: ast.BinOp, a: Decimal, b: Decimal) ?error{ IntOverflow, DivByZero }!Decimal {
     switch (op) {
         .mul => return .{
@@ -1380,7 +1318,6 @@ fn decimalOp(op: ast.BinOp, a: Decimal, b: Decimal) ?error{ IntOverflow, DivByZe
     }
 }
 
-/// INT-only bitwise ops. Null propagation happens in the caller.
 fn bitwise(op: ast.BinOp, l: Value, r: Value) EvalError!Value {
     if (l != .int or r != .int) return error.TypeMismatch;
     const a = l.int;
@@ -1395,10 +1332,8 @@ fn bitwise(op: ast.BinOp, l: Value, r: Value) EvalError!Value {
     };
 }
 
-/// Shift counts outside 0..63 are defined, never UB: they shift every bit out.
-/// `<<` therefore yields 0, and the arithmetic `>>` yields 0 or -1 depending on
-/// the sign bit — but only for an over-wide count; a negative count is 0 either
-/// way (there is no implied direction flip).
+/// Shift counts outside 0..63 are defined, never UB: an over-wide `<<` is 0 and
+/// `>>` is 0 or -1 by sign; a negative count is 0 either way.
 fn shiftLeft(a: i64, n: i64) i64 {
     const s = std.math.cast(u6, n) orelse return 0;
     return @bitCast(@as(u64, @bitCast(a)) << s);
@@ -1455,9 +1390,8 @@ pub fn parseJson(arena: std.mem.Allocator, text: []const u8) EvalError!std.json.
         return if (e == error.OutOfMemory) error.OutOfMemory else error.InvalidJson;
 }
 
-/// Walk `path` — `a.b`, `a[0].b` or `a.0.b`, optionally led by `$.` — through
-/// `v`. Null when a key is missing, an index is out of range, or a step lands
-/// on a scalar.
+/// Walks `path` (`a.b`, `a[0].b` or `a.0.b`, optionally led by `$.`) through `v`;
+/// null for a missing key, an index out of range, or a step onto a scalar.
 pub fn jsonPath(v: std.json.Value, path: []const u8) ?std.json.Value {
     var p = path;
     if (std.mem.startsWith(u8, p, "$")) p = p[1..];
@@ -1476,8 +1410,6 @@ pub fn jsonPath(v: std.json.Value, path: []const u8) ?std.json.Value {
     return cur;
 }
 
-/// A JSON value as a cell: strings unquoted, numbers and booleans as their
-/// text, objects and arrays as compact JSON, null as null.
 pub fn jsonToValue(arena: std.mem.Allocator, v: std.json.Value) EvalError!Value {
     return switch (v) {
         .null => .null,
@@ -1490,8 +1422,7 @@ pub fn jsonToValue(arena: std.mem.Allocator, v: std.json.Value) EvalError!Value 
 }
 
 /// A JSON array element as a lambda's parameter: numbers, booleans and strings as
-/// themselves — so `x > 5` compares numbers — and an object or array as its JSON
-/// text, which `json_get` and the array functions take apart.
+/// themselves, so `x > 5` compares numbers, and objects or arrays as their JSON text.
 fn jsonElementValue(arena: std.mem.Allocator, raw: []const u8) EvalError!Value {
     return switch (raw[0]) {
         '"' => .{ .string = try json.decodeString(arena, raw[1 .. raw.len - 1]) },
@@ -1507,17 +1438,13 @@ fn jsonElementValue(arena: std.mem.Allocator, raw: []const u8) EvalError!Value {
     };
 }
 
-/// A value `json_transform` puts in its array. Text that is a JSON object or array
-/// — what `json_get` returns for one — goes in as that object or array, not as a
-/// string holding its text; any other text is a JSON string.
+/// Text that is a JSON object or array goes in as that value, not a string.
+/// NaN and infinity are written as `null`, as JSON.stringify does.
 fn writeJsonValue(arena: std.mem.Allocator, v: Value, w: *std.Io.Writer) EvalError!void {
     switch (v) {
         .null => w.writeAll("null") catch return error.OutOfMemory,
         .bool => |b| w.writeAll(if (b) "true" else "false") catch return error.OutOfMemory,
         .int => |i| w.print("{d}", .{i}) catch return error.OutOfMemory,
-        // as `std.json.Stringify` writes a float; JSON has no NaN or infinity, and
-        // writing `nan` made the whole document unreadable, so they are `null`
-        // as JavaScript's JSON.stringify has them
         .float => |f| if (std.math.isFinite(f))
             w.print("{}", .{f}) catch return error.OutOfMemory
         else
@@ -1534,15 +1461,12 @@ fn writeJsonValue(arena: std.mem.Allocator, v: Value, w: *std.Io.Writer) EvalErr
     }
 }
 
-/// `body` with the lambda parameter `name` replaced by `v`, as a literal — how an
-/// element reaches the body. An inner lambda with the same parameter shadows it.
 pub fn bindLambda(arena: std.mem.Allocator, body: *const ast.Expr, name: []const u8, v: Value) error{OutOfMemory}!*ast.Expr {
     const lit = try arena.create(ast.Expr);
     lit.* = try literalOf(arena, v);
     return bindLambdaTo(arena, body, name, lit);
 }
 
-/// A value as the literal expression that stands for it.
 fn literalOf(arena: std.mem.Allocator, v: Value) error{OutOfMemory}!ast.Expr {
     return switch (v) {
         .null => .null_lit,
@@ -1554,8 +1478,8 @@ fn literalOf(arena: std.mem.Allocator, v: Value) error{OutOfMemory}!ast.Expr {
     };
 }
 
-/// `body` with the lambda parameter `name` replaced by the node `lit` — one node
-/// for every mention, so a caller can rebind it by overwriting `lit`.
+/// `body` with parameter `name` replaced by the node `lit`, one node for every
+/// mention, so a caller rebinds it by overwriting `lit`.
 fn bindLambdaTo(arena: std.mem.Allocator, body: *const ast.Expr, name: []const u8, lit: *ast.Expr) error{OutOfMemory}!*ast.Expr {
     const Bind = struct {
         arena: std.mem.Allocator,
@@ -1575,8 +1499,6 @@ fn bindLambdaTo(arena: std.mem.Allocator, body: *const ast.Expr, name: []const u
     return Bind.recur(.{ .arena = arena, .name = name, .lit = lit }, body);
 }
 
-/// A JSON array argument's text, or null for a null cell. JSON that is not an
-/// array is an error, as it is to the array functions.
 fn jsonArrayArg(arena: std.mem.Allocator, e: *const ast.Expr, batch: Batch, row: usize) EvalError!?[]const u8 {
     const v = try evalRow(arena, e, batch, row);
     if (v.isNull()) return null;
@@ -1586,14 +1508,12 @@ fn jsonArrayArg(arena: std.mem.Allocator, e: *const ast.Expr, batch: Batch, row:
     return doc;
 }
 
-/// `l`'s body with each parameter bound to its node in `slots`, in order.
 fn bindParams(arena: std.mem.Allocator, l: ast.Expr.Lambda, slots: []const *ast.Expr) error{OutOfMemory}!*ast.Expr {
     var body = l.body;
     for (l.params, slots[0..l.params.len]) |pp, slot| body = try bindLambdaTo(arena, body, pp, slot);
     return body;
 }
 
-/// Fresh nodes holding `vals`, one per slot a lambda's parameters bind to.
 fn lambdaSlots(arena: std.mem.Allocator, vals: []const ast.Expr) error{OutOfMemory}![]*ast.Expr {
     const slots = try arena.alloc(*ast.Expr, vals.len);
     for (slots, vals) |*sl, v| {
@@ -1603,10 +1523,8 @@ fn lambdaSlots(arena: std.mem.Allocator, vals: []const ast.Expr) error{OutOfMemo
     return slots;
 }
 
-/// The accumulator as the node `json_reduce` binds `acc` to. A value with no
-/// literal of its own — a DECIMAL, a date — is its text cast back to the
-/// accumulator's type, so a running DECIMAL total stays one from element to
-/// element instead of turning into text after the first.
+/// The node `json_reduce` binds `acc` to. A value with no literal of its own (a
+/// DECIMAL, a date) is its text cast back, so a running DECIMAL total stays one.
 fn accNode(arena: std.mem.Allocator, acc: Value, ty: Type) error{OutOfMemory}!ast.Expr {
     switch (acc) {
         .null, .bool, .int, .float, .string => return literalOf(arena, acc),
@@ -1619,9 +1537,6 @@ fn accNode(arena: std.mem.Allocator, acc: Value, ty: Type) error{OutOfMemory}!as
     }
 }
 
-/// The accumulator type `json_reduce` plans, worked out again where a batch is
-/// evaluated — the evaluator sees only the call — and kept for the call it was
-/// worked out for, so a column pays for it once per batch at most.
 threadlocal var reduce_memo: struct { args: ?[*]const *ast.Expr = null, schema: ?*const types.Schema = null, ty: Type = undefined } = .{};
 
 fn reduceTypeAt(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) EvalError!Type {
@@ -1636,14 +1551,8 @@ fn reduceTypeAt(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) EvalEr
     return ty;
 }
 
-/// 1 MiB ceiling on a single generated string (`repeat`, `lpad`/`rpad`), so
-/// `repeat(x, 1000000000)` is a clean error instead of an OOM or a stall.
 const max_str_bytes = 1 << 20;
 
-/// One scalar builtin: its plan-time typing, its row-wise evaluator and, when
-/// the vectorized path covers it, its whole-batch kernel. `typeOfCall`,
-/// `evalCall` and `callVec` are each a `lookupBuiltin` on the call's name;
-/// the table itself is `builtins` below (re-exported by `exec/builtins.zig`).
 pub const Builtin = struct {
     name: []const u8,
     type_fn: *const fn (*TypeCtx, ast.Expr.Call) TypeError!Type,
@@ -1651,9 +1560,6 @@ pub const Builtin = struct {
     vec_fn: ?*const fn (std.mem.Allocator, ast.Expr.Call, Batch) VecError!Vec = null,
 };
 
-/// Every scalar builtin the engine knows, one entry per name. Aliases and
-/// near-twins (`length`/`strlen`, `floor`/`ceil`, …) share handlers that
-/// branch on `c.name` where the two differ.
 pub const builtins = [_]Builtin{
     .{ .name = "now", .type_fn = typing.now, .eval_fn = per_row.now, .vec_fn = vectorized.now },
     .{ .name = "today", .type_fn = typing.today, .eval_fn = per_row.today, .vec_fn = vectorized.today },
@@ -1734,8 +1640,6 @@ pub const builtins = [_]Builtin{
     .{ .name = "url_decode", .type_fn = typing.unaryString, .eval_fn = per_row.urlCode },
 };
 
-/// The builtin called `name`, or null: unknown names and aggregates
-/// (`count`, `sum`, …, which are not scalar builtins) both come back null.
 pub fn lookupBuiltin(name: []const u8) ?*const Builtin {
     const map = comptime blk: {
         var kvs: [builtins.len]struct { []const u8, usize } = undefined;
@@ -1766,8 +1670,6 @@ const typing = struct {
         return Type.init(.string).withNull(a.nullable);
     }
 
-    /// A literal pattern's group count, group 0 included, compiled here so a bad pattern fails
-    /// `check` rather than partway through a run; null for a computed one.
     fn literalPattern(self: *TypeCtx, c: ast.Expr.Call) TypeError!?u8 {
         if (c.args[1].* != .str_lit) return null;
         var pbuf: [16 * 1024]u8 = undefined;
@@ -1796,7 +1698,6 @@ const typing = struct {
             if (g < 0 or g >= regex.max_groups or (groups != null and g >= groups.?))
                 return self.err("`regexp_extract` group {d} is not in the pattern", .{g});
         }
-        // Null where the pattern does not match, whatever the input.
         return Type.init(.string).withNull(true);
     }
 
@@ -1806,7 +1707,6 @@ const typing = struct {
         return Type.init(if (eq(c.name, "xxhash64")) .int else .string).withNull(a.nullable);
     }
 
-    /// Never null: a null value is JSON's `null` in the document built.
     fn jsonBuild(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
         if (eq(c.name, "json_object") and c.args.len % 2 != 0)
             return self.err("`json_object` takes key, value pairs", .{});
@@ -1920,7 +1820,6 @@ const typing = struct {
         if (c.args.len != 1) return self.err("`{s}` takes one argument", .{name});
         const a = try self.argType(c, 0);
         if (!numericish(a)) return self.err("`{s}` needs a numeric argument", .{name});
-        // An int is already whole, so it passes through with its type.
         if (a.unknown or a.kind == .int) return a;
         return Type.init(.float).withNull(a.nullable);
     }
@@ -1944,7 +1843,6 @@ const typing = struct {
         const b = try self.argType(c, 1);
         if (!(a.kind == .int or a.unknown) or !(b.kind == .int or b.unknown))
             return self.err("`mod` needs integer arguments", .{});
-        // A zero divisor yields null, so the result is always nullable.
         return Type.init(.int).asNullable();
     }
 
@@ -1960,7 +1858,6 @@ const typing = struct {
         if (c.args.len != 1) return self.err("`sqrt` takes one argument", .{});
         const a = try self.argType(c, 0);
         if (!numericish(a)) return self.err("`sqrt` needs a numeric argument", .{});
-        // A negative operand is outside the domain and yields null.
         return Type.init(.float).asNullable();
     }
 
@@ -1990,8 +1887,6 @@ const typing = struct {
             else
                 t;
         }
-        // Null arguments are ignored (Postgres), so the result is null only
-        // when every argument is — hence nullable regardless of the inputs.
         return result.?.asNullable();
     }
 
@@ -2017,14 +1912,9 @@ const typing = struct {
         _ = try self.wantText(c, 0);
         _ = try self.wantText(c, 1);
         _ = try self.wantInt(c, 2, "n");
-        // An empty delimiter yields null, so this is nullable either way.
         return Type.init(.string).asNullable();
     }
 
-    /// `json_filter` / `json_transform` / `json_any` / `json_all`: a JSON array and
-    /// a lambda. The body is typed with its parameter as an untyped null — what an
-    /// element is, the data decides — and, but for `json_transform`, must be a
-    /// condition.
     fn jsonLambda(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
         if (c.args.len != 2 or c.args[1].* != .lambda)
             return self.err("`{s}` takes (json array, x -> {s})", .{ c.name, if (eq(c.name, "json_transform")) "value" else "condition" });
@@ -2048,9 +1938,8 @@ const typing = struct {
         return (try reduceAcc(self, c)).asNullable();
     }
 
-    /// The accumulator's type: the initial value's, widened to hold what the
-    /// lambda returns from it — an INT start summing floats is a FLOAT — and
-    /// settled before the run, so an empty array gives the same type a long one does.
+    /// The accumulator's type: the initial value's, widened to hold what the lambda
+    /// returns (an INT start summing floats is FLOAT) and settled before the run.
     fn reduceAcc(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
         const l = c.args[2].lambda;
         var acc = try self.typeOf(c.args[1]);
@@ -2063,7 +1952,6 @@ const typing = struct {
             const bt = try self.typeOf(body);
             var u = Type.unify(acc, bt) orelse
                 return self.err("`json_reduce`: the lambda returns {s}, which an accumulator of {s} cannot hold", .{ @tagName(bt.kind), @tagName(acc.kind) });
-            // A running DECIMAL sum keeps its scale; its precision is the widest.
             if (u.kind == .decimal) u.precision = 38;
             if (u.kind == acc.kind and u.unknown == acc.unknown and u.scale == acc.scale and u.precision == acc.precision) return u;
             acc = u;
@@ -2108,7 +1996,6 @@ const typing = struct {
         if (c.args.len != 2) return self.err("`json_get` takes (json, path)", .{});
         _ = try self.wantText(c, 0);
         _ = try self.wantText(c, 1);
-        // A missing key or a JSON null is SQL null.
         return Type.init(.string).asNullable();
     }
 
@@ -2143,7 +2030,6 @@ const typing = struct {
         if (a.unknown) return a;
         const nn = a.nullable or nt.nullable or nt.unknown;
         if (a.kind == .date) {
-            // A DATE has no time of day, so sub-day units have nowhere to go.
             if (u == .hour or u == .minute or u == .second)
                 return self.err("`date_add` cannot add `{s}` to a date; cast it to a timestamp first", .{c.args[0].str_lit});
             return Type.init(.date).withNull(nn);
@@ -2189,14 +2075,12 @@ const typing = struct {
         return Type.init(.timestamp).withNull(a.nullable);
     }
 
+    /// A literal format is validated here so an unsupported directive fails `check`.
     fn strftime(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
         if (c.args.len != 2) return self.err("`strftime` takes (timestamp, format)", .{});
         const a = try self.argType(c, 0);
         if (!temporalish(a)) return self.err("`strftime` needs a date or timestamp", .{});
         const f = try self.argType(c, 1);
-        // A literal format is validated here so an unsupported directive
-        // fails `check` rather than partway through a run — the same
-        // treatment `regexp_replace` gives a literal pattern.
         if (c.args[1].* == .str_lit) {
             if (badStrftime(c.args[1].str_lit)) |bad|
                 return self.err("`strftime` does not support `%{s}` (supported: %Y %m %d %H %M %S %y %%)", .{bad});
@@ -2271,15 +2155,13 @@ const per_row = struct {
         return .{ .string = out };
     }
 
-    /// True when the pattern matches anywhere in the string; anchor it with `^`
-    /// and `$` for the whole of it.
     fn regexpMatches(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const m = try regexpFind(arena, c, batch, row) orelse return .null;
         return .{ .bool = m.span != null };
     }
 
-    /// The match, or with a group number that group; null where the pattern does
-    /// not match (DuckDB answers '', which a load cannot tell from an empty field).
+    /// Null where the pattern does not match, unlike DuckDB's '', which a load
+    /// cannot tell from an empty field.
     fn regexpExtract(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const m = try regexpFind(arena, c, batch, row) orelse return .null;
         if (m.span == null) return .null;
@@ -2303,9 +2185,8 @@ const per_row = struct {
         return .{ .string = try std.fmt.allocPrint(arena, "{x}", .{&d}) };
     }
 
-    /// `{"k": v, …}` from key, value pairs. Values are written as `json_transform`
-    /// writes its elements, so a nested `json_object`/`json_array` — or a
-    /// `json_get` that returned an object — goes in as JSON, not as a string.
+    /// Values are written as `json_transform` writes elements, so a nested object or
+    /// array goes in as JSON. A null key is an error.
     fn jsonObject(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         var out = std.Io.Writer.Allocating.init(arena);
         const w = &out.writer;
@@ -2313,7 +2194,6 @@ const per_row = struct {
         var i: usize = 0;
         while (i < c.args.len) : (i += 2) {
             const k = try evalRow(arena, c.args[i], batch, row);
-            // A JSON key cannot be null; a missing name is a broken document.
             if (k.isNull()) return failWith(error.CastFailed, "json_object: key {d} is null", .{i / 2 + 1});
             if (i > 0) w.writeByte(',') catch return error.OutOfMemory;
             std.json.Stringify.encodeJsonString(try valueToString(arena, k), .{}, w) catch return error.OutOfMemory;
@@ -2356,9 +2236,8 @@ const per_row = struct {
         return .{ .bytes = out };
     }
 
-    /// Percent-encoding as RFC 3986 has it: everything but letters, digits and
-    /// `-._~` becomes `%XX` of its UTF-8 bytes. Decoding leaves `+` alone and
-    /// passes a `%` not followed by two hex digits through, as DuckDB does.
+    /// RFC 3986 percent-encoding: all but letters, digits and `-._~` become `%XX`.
+    /// Decoding leaves `+` alone and passes a stray `%` through, as DuckDB does.
     fn urlCode(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
@@ -2386,9 +2265,8 @@ const per_row = struct {
         return .{ .string = out.items };
     }
 
-    /// Postgres' `concat_ws`: the values joined by the separator, nulls skipped —
-    /// where `concat` is null when any value is, which hashed a row with one empty
-    /// column to null.
+    /// Postgres' `concat_ws`: nulls are skipped, where `concat` is null when any
+    /// value is (which hashed a row with one empty column to null).
     fn concatWs(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const sv = try evalRow(arena, c.args[0], batch, row);
         if (sv.isNull()) return .null;
@@ -2432,8 +2310,8 @@ const per_row = struct {
         return .{ .string = out.items };
     }
 
-    /// `length` counts characters, `strlen` bytes — DuckDB's split; a BYTES
-    /// value is bytes either way.
+    /// `length` counts characters, `strlen` bytes (DuckDB's split); a BYTES value
+    /// is bytes either way.
     fn strlen(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
@@ -2527,7 +2405,6 @@ const per_row = struct {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
         switch (v) {
-            // `-minInt(i64)` has no i64 representation; refuse rather than wrap.
             .int => |x| {
                 if (x == std.math.minInt(i64)) return error.IntOverflow;
                 return Value{ .int = if (x < 0) -x else x };
@@ -2570,12 +2447,8 @@ const per_row = struct {
         const b = try evalRow(arena, c.args[1], batch, row);
         if (a.isNull() or b.isNull()) return .null;
         const d = toI64(b);
-        // `mod` is the guarded spelling of `%`: a zero divisor is null here,
-        // where the operator raises DivByZero. Never a crash either way.
         if (d == 0) return .null;
-        // `@rem(minInt, -1)` overflows; the answer is 0 by definition.
         if (d == -1) return Value{ .int = 0 };
-        // @rem (not @mod) so the result takes the sign of the dividend, as SQL wants.
         return Value{ .int = @rem(toI64(a), d) };
     }
 
@@ -2605,7 +2478,6 @@ const per_row = struct {
         const a = try evalRow(arena, c.args[0], batch, row);
         if (a.isNull()) return .null;
         const b = try evalRow(arena, c.args[1], batch, row);
-        // `a = b` is unknown against a null `b`, so `a` comes back (Postgres).
         if (b.isNull()) return a;
         if (compareValues(a, b)) |ord| {
             if (ord == .eq) return .null;
@@ -2613,9 +2485,8 @@ const per_row = struct {
         return a;
     }
 
+    /// Null arguments are ignored (Postgres); all-null yields null.
     fn greatestLeast(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        // Postgres semantics: null arguments are IGNORED (unlike the
-        // null-propagating arithmetic above); all-null yields null.
         const want_gt = eq(c.name, "greatest");
         var best: Value = .null;
         for (c.args) |ae| {
@@ -2661,7 +2532,6 @@ const per_row = struct {
         const nv = try evalRow(arena, c.args[2], batch, row);
         if (sv.isNull() or dv.isNull() or nv.isNull()) return .null;
         const delim = try valueToString(arena, dv);
-        // An empty delimiter splits into nothing meaningful — null, not a guess.
         if (delim.len == 0) return .null;
         const want = toI64(nv);
         if (want < 1) return Value{ .string = "" };
@@ -2674,13 +2544,9 @@ const per_row = struct {
         return Value{ .string = "" };
     }
 
-    /// The JSON array functions: the body evaluated once per element, with the
-    /// parameter bound to it. `json_filter` keeps the elements whose condition is
-    /// true, as they were written; `json_transform` makes an array of the body's
-    /// values; `json_any` / `json_all` ask whether it holds for some / every one
-    /// (a null condition is not true). A null cell is null; a cell that is JSON
-    /// but not an array is an error, as a cell that is not JSON is to `json_get`.
-    /// An element the body cannot compare (a number against text) counts as null.
+    /// The JSON array functions: the body is bound once to slots each element then
+    /// overwrites. An element the body cannot compare counts as null; a failed CAST
+    /// still fails. A JSON cell that is not an array is an error.
     fn jsonLambda(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         if (c.args.len != 2 or c.args[1].* != .lambda) return error.TypeMismatch;
         const dv = try evalRow(arena, c.args[0], batch, row);
@@ -2695,8 +2561,6 @@ const per_row = struct {
         const w = &out.writer;
         w.writeByte('[') catch return error.OutOfMemory;
         var n: usize = 0;
-        // The body is bound once, to literals each element then overwrites:
-        // rebuilding it per element was most of what a lambda cost.
         const slots = try lambdaSlots(arena, &.{ .null_lit, .{ .int_lit = 0 } });
         const body = try bindParams(arena, l, slots);
         var items = json.Elements.root(doc);
@@ -2704,9 +2568,6 @@ const per_row = struct {
         while (items.next()) |el| : (idx += 1) {
             slots[0].* = try literalOf(arena, try jsonElementValue(arena, el));
             slots[1].* = .{ .int_lit = idx };
-            // A JSON array may mix kinds: an element the body cannot compare — a
-            // number against text — is null there, not a failed query. A CAST that
-            // fails still fails, as it does anywhere else.
             const r = evalRow(arena, body, batch, row) catch |e| switch (e) {
                 error.TypeMismatch => Value.null,
                 else => return e,
@@ -2732,10 +2593,8 @@ const per_row = struct {
         };
     }
 
-    /// A fold: the accumulator starts at `initial` and becomes the body's value at
-    /// each element, in order. An empty array is `initial`; a null array is null.
-    /// Unlike `json_transform`, an element the body cannot compare fails the
-    /// statement — a null there would quietly wipe out everything folded so far.
+    /// A fold from `initial`. Unlike `json_transform`, an element the body cannot
+    /// compare fails the statement, and a float into an INT total is a CastFailed.
     fn jsonReduce(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         if (c.args.len != 3 or c.args[2].* != .lambda) return error.TypeMismatch;
         const dv = try evalRow(arena, c.args[0], batch, row);
@@ -2755,8 +2614,6 @@ const per_row = struct {
             slots[1].* = try literalOf(arena, try jsonElementValue(arena, el));
             slots[2].* = .{ .int_lit = idx };
             const r = try evalRow(arena, body, batch, row);
-            // Element types are the data's, so a plan from an INT start cannot know
-            // the array holds floats; cutting 1.5 to 1 would be a silent wrong sum.
             if (r == .float and (ty.kind == .int or ty.kind == .decimal) and !ty.unknown)
                 return failWith(error.CastFailed, "json_reduce: the lambda returned {d} into {s} accumulator — start from a FLOAT (0.0)", .{ r.float, if (ty.kind == .int) "an INT" else "a DECIMAL" });
             acc = if (r.isNull() or ty.unknown) r else try castValueTyped(arena, r, ty);
@@ -2764,8 +2621,6 @@ const per_row = struct {
         return acc;
     }
 
-    /// A string's characters as a JSON array of one-character strings — what
-    /// `json_reduce` and the other array functions walk.
     fn chars(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
@@ -2785,8 +2640,6 @@ const per_row = struct {
         return .{ .string = out.written() };
     }
 
-    /// `[start, …, stop - 1]`, `start` 0 when only `stop` is given: an index to
-    /// walk with the array functions. Empty when `stop` is not past `start`.
     fn jsonRange(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         var bounds = [2]i64{ 0, 0 };
         for (c.args, bounds[2 - c.args.len ..]) |e, *b| {
@@ -2816,9 +2669,8 @@ const per_row = struct {
         return .{ .int = n };
     }
 
-    /// Elements `start` up to (not including) `stop`, from 0; a negative bound
-    /// counts from the end, as Python's slices do, and bounds past either end
-    /// are clamped.
+    /// Elements `start` up to (not including) `stop`, from 0; negative bounds count
+    /// from the end, as Python's slices do, and bounds past either end are clamped.
     fn jsonSlice(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const doc = try jsonArrayArg(arena, c.args[0], batch, row) orelse return .null;
         var len: i64 = 0;
@@ -2847,7 +2699,6 @@ const per_row = struct {
         return .{ .string = out.written() };
     }
 
-    /// The arrays' elements, in order, as one array; null when any is null.
     fn jsonConcat(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         var out = std.Io.Writer.Allocating.init(arena);
         const w = &out.writer;
@@ -2933,8 +2784,6 @@ const per_row = struct {
         const y = toI64(yv);
         const m = toI64(mv);
         const d = toI64(dv);
-        // Fail loud on an impossible date, matching CAST's posture. Wrap the
-        // call in `try_cast`-style validity checks upstream if null is wanted.
         if (m < 1 or m > 12) return error.CastFailed;
         if (d < 1 or d > daysInMonth(y, @intCast(m))) return error.CastFailed;
         const days = daysFromCivil(y, @intCast(m), @intCast(d));
@@ -2963,8 +2812,6 @@ const per_row = struct {
         return Value{ .string = try strftimeFmt(arena, us, try valueToString(arena, fv)) };
     }
 
-    /// `strptime` stops the statement at text that does not fit the format;
-    /// `try_strptime` makes it null, for files where a bad date is data to keep.
     fn strptime(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
@@ -2995,9 +2842,8 @@ const per_row = struct {
         return .{ .string = out.items };
     }
 
-    /// Postgres' `translate`: each character of `from` becomes the character at the
-    /// same place in `to`, or is deleted when `to` is shorter. Characters, not
-    /// bytes, so `translate(s, 'ãç', 'ac')` works on UTF-8.
+    /// Postgres' `translate`, by characters: each character of `from` becomes the one
+    /// at the same place in `to`, or is deleted when `to` is shorter.
     fn translate(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         var args: [3][]const u8 = undefined;
         for (&args, c.args) |*o, e| {
@@ -3030,8 +2876,6 @@ const per_row = struct {
         return .{ .string = out.items };
     }
 
-    /// Postgres' `initcap`: the first letter or digit of each run of them upper,
-    /// the rest lower.
     fn initcap(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
@@ -3057,8 +2901,6 @@ const per_row = struct {
         return .{ .string = out.items };
     }
 
-    /// The first character's code point, as Postgres answers on UTF-8; 0 for an
-    /// empty string, and a byte that is not UTF-8 is its own value.
     fn ascii(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
@@ -3150,7 +2992,6 @@ const vectorized = struct {
         if (c.args.len < 1) return error.Unsupported;
         const v = try evalVec(arena, c.args[0], batch);
         const s = asStr(v) orelse return error.Unsupported;
-        // A BYTES value counts bytes under either name, as the row path does.
         const is_bytes = switch (v) {
             .col => |col| col.ty.kind == .bytes,
             .scalar => |sc| sc == .bytes,
@@ -3312,9 +3153,8 @@ const vectorized = struct {
     }
 };
 
-/// Cast honouring the target's scale. `castValue` only sees a `TypeKind`, which
-/// is enough for every type except `DECIMAL(p, s)` — where dropping the scale
-/// left the conversion undefined, so it failed outright.
+/// Cast honouring the target's scale; `castValue` only sees a `TypeKind`, which
+/// for `DECIMAL(p, s)` left the conversion undefined.
 pub fn castValueTyped(arena: std.mem.Allocator, v: Value, ty: types.Type) EvalError!Value {
     if (ty.kind != .decimal) return castValue(arena, v, ty.kind);
     const d: Decimal = switch (v) {
@@ -3322,8 +3162,6 @@ pub fn castValueTyped(arena: std.mem.Allocator, v: Value, ty: types.Type) EvalEr
         .int => |x| .{ .unscaled = x, .scale = 0 },
         .bool => |x| .{ .unscaled = if (x) 1 else 0, .scale = 0 },
         .float => |x| floatToDecimal(x) orelse return error.CastFailed,
-        // Null means the text is not a decimal literal: `CAST` fails here and
-        // `TRY_CAST` turns that failure into a null one level up.
         .string, .bytes => |str| switch (sql.parseDecimalText(trim(str)) orelse return error.CastFailed) {
             .decimal => |x| x,
             .int => |x| Decimal{ .unscaled = x, .scale = 0 },
@@ -3341,16 +3179,12 @@ fn powTen(n: u8) i128 {
     return r;
 }
 
-/// A float as the decimal its 15 significant digits spell, as PostgreSQL turns
-/// a `float8` into `numeric`: `12.345` is stored as 12.34499999999999886, and
-/// rounding that binary value to two places would give 12.34 where every reader
-/// of the number expects 12.35. Null for a non-finite value, or one too large
-/// for 38 digits.
+/// A float as the decimal its 15 significant digits spell, as PostgreSQL casts
+/// float8 to numeric. Null for a non-finite value or one past 38 digits.
 pub fn floatToDecimal(x: f64) ?Decimal {
     if (!std.math.isFinite(x)) return null;
     if (x == 0) return .{ .unscaled = 0, .scale = 0 };
     var buf: [48]u8 = undefined;
-    // d.dddddddddddddde±N: fifteen significant digits
     const s = std.fmt.bufPrint(&buf, "{e:.14}", .{@abs(x)}) catch return null;
     const e_at = std.mem.indexOfScalar(u8, s, 'e') orelse return null;
     var m: i128 = 0;
@@ -3360,31 +3194,24 @@ pub fn floatToDecimal(x: f64) ?Decimal {
     }
     const exp = std.fmt.parseInt(i32, s[e_at + 1 ..], 10) catch return null;
     if (x < 0) m = -m;
-    // m has 15 digits, so the value is m * 10^(exp - 14)
     const shift = exp - 14;
     if (shift >= 0) {
-        if (shift > 23) return null; // past 38 digits
+        if (shift > 23) return null;
         return .{ .unscaled = std.math.mul(i128, m, powTen(@intCast(shift))) catch return null, .scale = 0 };
     }
     const sc = -shift;
     if (sc <= 38) return .{ .unscaled = m, .scale = @intCast(sc) };
-    // smaller than 38 places can hold: what 38 places round it to
     return .{ .unscaled = roundScaleDown(m, @intCast(sc - 38)), .scale = 38 };
 }
 
-/// `u / 10^drop`, rounded half away from zero — PostgreSQL's rule for numeric,
-/// and SQL Server's: 12.345 → 12.35 and -12.345 → -12.35 at two places.
 /// The scale `round(decimal, digits)` answers in: the digits when they are a
-/// literal (`round(x, 2)` is a DECIMAL(p,2), as DuckDB types it), else the
-/// input's own. The type and every value must agree on it.
+/// literal (as DuckDB types it), else the input's own.
 fn roundOutScale(c: ast.Expr.Call, in_scale: u8) u8 {
     if (c.args.len < 2) return 0;
     if (c.args[1].* != .int_lit) return in_scale;
     return @intCast(std.math.clamp(c.args[1].int_lit, 0, in_scale));
 }
 
-/// `round` on a DECIMAL, exact and half away from zero. It went through f64,
-/// where 1.005 is 1.00499…, so `round(1.005, 2)` answered 1.
 fn roundDecimal(d: Decimal, digits: i64, out_scale: u8) ?Decimal {
     var r = d;
     if (digits < d.scale) {
@@ -3399,10 +3226,9 @@ fn roundDecimal(d: Decimal, digits: i64, out_scale: u8) ?Decimal {
     return rescaleTo(r, out_scale);
 }
 
+/// `u / 10^drop`, rounded half away from zero.
 pub fn roundScaleDown(u: i128, drop: u32) i128 {
     if (drop == 0) return u;
-    // 10^38 is the largest power of ten an i128 holds; past it every value
-    // basalt can carry is under half a unit
     if (drop > 38) return 0;
     const p = powTen(@intCast(drop));
     const q = @divTrunc(u, p);
@@ -3412,15 +3238,9 @@ pub fn roundScaleDown(u: i128, drop: u32) i128 {
     return q;
 }
 
-/// Shift a decimal to `want`, rounding half away from zero when it loses
-/// digits — one rule for every cast, sink and aggregate, as PostgreSQL applies
-/// it. Null when scaling up overflows.
-///
-/// Public because a value's scale is NOT guaranteed to match its column's
-/// declared scale: postgres sends a per-value `dscale` on NUMERIC, so a bare
-/// `numeric` column (typed `decimal(38,6)` for want of a typmod) delivers
-/// values at whatever scale each one was stored with. Anything that combines
-/// decimals across rows has to normalize first.
+/// Shifts a decimal to `want`, rounding half away from zero; null on overflow.
+/// Public because a value's scale need not match its column's (Postgres sends a
+/// per-value `dscale`), so anything combining decimals across rows normalizes first.
 pub fn rescaleTo(d: Decimal, want: u8) ?Decimal {
     var unscaled = d.unscaled;
     var have: i32 = d.scale;
@@ -3436,8 +3256,6 @@ pub fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalE
         .int => switch (v) {
             .int => v,
             .float => |x| .{ .int = try floatToInt(x) },
-            // Rounded half away from zero, as PostgreSQL and DuckDB cast a
-            // numeric; a decimal used to fail every numeric cast.
             .decimal => |d| .{ .int = std.math.cast(i64, (rescaleTo(d, 0) orelse return error.IntOverflow).unscaled) orelse return error.IntOverflow },
             .bool => |x| .{ .int = if (x) 1 else 0 },
             .string => |s| .{ .int = std.fmt.parseInt(i64, trim(s), 10) catch return error.CastFailed },
@@ -3464,7 +3282,6 @@ pub fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalE
         },
         .time => switch (v) {
             .time => v,
-            // the time of day a timestamp falls at
             .timestamp => |x| .{ .time = @mod(x, 86_400_000_000) },
             .string => |str| .{ .time = parseIsoTime(str) orelse return error.CastFailed },
             else => error.CastFailed,
@@ -3485,13 +3302,6 @@ pub fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalE
     };
 }
 
-/// Render a value straight into a writer, with no intermediate allocation.
-///
-/// `valueToString` allocates from an arena for every non-text value, which is fine
-/// for one-off formatting and ruinous in a sink: a 6M-row CSV move spent most of its
-/// time allocating and copying strings it wrote once and dropped. The renderings here
-/// are byte-identical to `valueToString`'s — that is what the tests assert — so a
-/// caller can pick either without changing its output.
 pub fn writeValue(w: anytype, v: Value) !void {
     switch (v) {
         .null => {},
@@ -3506,29 +3316,23 @@ pub fn writeValue(w: anytype, v: Value) !void {
     }
 }
 
-/// `YYYY-MM-DD` from a day count since the 1970 epoch.
 pub fn writeDate(w: anytype, days: i64) !void {
     const c = civilFromDays(days);
     try writeYear(w, c.y);
     try w.print("-{d:0>2}-{d:0>2}", .{ c.m, c.d });
 }
 
-/// Four digits, zero-padded; a year before astronomical year 0 carries a
-/// leading `-`, as ISO 8601's expanded form does. Files hold such dates — a
-/// `date32` of any value is valid — and printing one used to trap on the cast.
+/// Four digits, zero-padded; a year before 0 carries a leading `-`, as ISO
+/// 8601's expanded form does (printing one used to trap on the cast).
 fn writeYear(w: anytype, y: i64) !void {
     if (y < 0) try w.writeByte('-');
     try w.print("{d:0>4}", .{@abs(y)});
 }
 
-/// `HH:MM:SS[.ffffff]` from microseconds since midnight. (Time parts are unsigned so
-/// `{d:0>2}` zero-pads instead of printing a sign.)
 pub fn writeTime(w: anytype, t: i64) !void {
     const us: u64 = @intCast(@mod(t, 86_400_000_000));
     const secs = us / 1_000_000;
     const frac = us % 1_000_000;
-    // `.ffffff` only when there is a fraction, so a `time(0)` reads as `12:00:00`
-    // rather than `12:00:00.000000`.
     if (frac != 0) {
         try w.print("{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ secs / 3600, (secs % 3600) / 60, secs % 60, frac });
     } else {
@@ -3558,8 +3362,6 @@ pub fn writeDecimal(w: anytype, unscaled: i128, scale: u8) !void {
     const neg = unscaled < 0;
     var mag: u128 = if (neg) @intCast(-unscaled) else @intCast(unscaled);
 
-    // i128 is at most 39 digits; the padding loop below adds at most `scale` more,
-    // and scale is bounded by the decimal types the engine accepts.
     var digits: [48]u8 = undefined;
     var n: usize = 0;
     if (mag == 0) {
@@ -3596,15 +3398,10 @@ pub fn valueToString(arena: std.mem.Allocator, v: Value) ![]const u8 {
     };
 }
 
-/// `YYYY-MM-DD` from a day count since the 1970 epoch. One rendering shared with
-/// `writeDate`, so the two cannot drift.
-///
-/// The buffer cannot overflow: the widest output is an 11-digit year (i64 days spans
-/// ~±25 billion years) plus `-MM-DD`, so 17 bytes. Writing into a fixed buffer would
-/// otherwise add `error.WriteFailed` to this function's error set, and every caller
-/// declares a set that does not include it. `bound` covers all four formatters.
 const fmt_bound = 128;
 
+/// Renders through `writeDate` into a fixed `fmt_bound` buffer, which cannot
+/// overflow (the widest output is 17 bytes), so the catch is `unreachable`.
 pub fn formatDate(arena: std.mem.Allocator, days: i64) ![]const u8 {
     var buf: [fmt_bound]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -3612,8 +3409,6 @@ pub fn formatDate(arena: std.mem.Allocator, days: i64) ![]const u8 {
     return arena.dupe(u8, w.buffered());
 }
 
-/// `HH:MM:SS.ffffff` from microseconds since midnight. (Time parts are unsigned so
-/// `{d:0>2}` zero-pads instead of printing a sign.)
 pub fn formatTime(arena: std.mem.Allocator, t: i64) ![]const u8 {
     var buf: [fmt_bound]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -3621,8 +3416,6 @@ pub fn formatTime(arena: std.mem.Allocator, t: i64) ![]const u8 {
     return arena.dupe(u8, w.buffered());
 }
 
-/// `YYYY-MM-DD HH:MM:SS` from microseconds since the 1970 epoch (floor-divides so
-/// pre-epoch instants format correctly).
 pub fn formatTimestamp(arena: std.mem.Allocator, micros: i64) ![]const u8 {
     var buf: [fmt_bound]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -3630,13 +3423,8 @@ pub fn formatTimestamp(arena: std.mem.Allocator, micros: i64) ![]const u8 {
     return arena.dupe(u8, w.buffered());
 }
 
-/// Field selector shared by `extract` and `date_trunc`.
-/// `week` is the ISO week: it starts on Monday, and `extract` numbers it 1-53
-/// with week 1 the one holding the year's first Thursday (Postgres, DuckDB).
 pub const TimeUnit = enum { year, month, week, day, hour, minute, second };
 
-/// Days since the epoch of the Monday starting `day`'s ISO week. 1970-01-01 was
-/// a Thursday, three days after a Monday.
 fn isoWeekStart(day: i64) i64 {
     return day - @mod(day + 3, 7);
 }
@@ -3647,8 +3435,6 @@ pub fn timeUnit(name: []const u8) ?TimeUnit {
     return std.meta.stringToEnum(TimeUnit, std.ascii.lowerString(buf[0..name.len], name));
 }
 
-/// Microseconds since the epoch for a temporal value, so both `date` and
-/// `timestamp` feed the same field arithmetic.
 fn temporalMicros(v: Value) ?i64 {
     return switch (v) {
         .timestamp => |x| x,
@@ -3684,7 +3470,6 @@ fn extractField(us: i64, u: TimeUnit) i64 {
     return switch (u) {
         .year => c.y,
         .month => @intCast(c.m),
-        // the week's Thursday decides its year, and it is that year's nth
         .week => blk: {
             const thu = isoWeekStart(day) + 3;
             const ty = civilFromDays(thu).y;
@@ -3697,8 +3482,6 @@ fn extractField(us: i64, u: TimeUnit) i64 {
     };
 }
 
-/// Checked i64 arithmetic for the date builtins — an absurd `n` in
-/// `date_add`/`to_timestamp` becomes a clean error instead of a wrap panic.
 fn mulI64(a: i64, b: i64) EvalError!i64 {
     return std.math.mul(i64, a, b) catch return error.CastFailed;
 }
@@ -3716,9 +3499,8 @@ fn daysInMonth(y: i64, m: u32) u32 {
     return lens[m - 1];
 }
 
-/// Add `n` CALENDAR months to a day count, clamping the day-of-month to the
-/// target month's length: 2024-01-31 plus one month is 2024-02-29, and plus
-/// one more is 2024-03-29 (the clamp is not remembered, matching Postgres).
+/// Adds `n` calendar months, clamping the day to the target month's length;
+/// the clamp is not remembered (Jan 31 +1 is Feb 29, +2 is Mar 29), as Postgres does.
 fn addMonthsToDays(days: i64, n: i64) i64 {
     const c = civilFromDays(days);
     const total = c.y * 12 + @as(i64, c.m) - 1 + n;
@@ -3727,9 +3509,6 @@ fn addMonthsToDays(days: i64, n: i64) i64 {
     return daysFromCivil(y, m, @min(c.d, daysInMonth(y, m)));
 }
 
-/// `date_add(unit, n, ts)` for one temporal value. A DATE only accepts day and
-/// coarser units (the type-checker rejects the rest); a TIMESTAMP accepts all
-/// six, and month/year steps preserve the time of day.
 fn addUnits(v: Value, u: TimeUnit, n: i64) EvalError!Value {
     switch (v) {
         .date => |d0| {
@@ -3764,13 +3543,8 @@ fn addUnits(v: Value, u: TimeUnit, n: i64) EvalError!Value {
     }
 }
 
-/// `date_diff(unit, a, b)` with DuckDB's semantics, chosen because it is the
-/// one definition that does not depend on the time of day for calendar units:
-/// `year`/`month` count the unit BOUNDARIES crossed, computed from the civil
-/// components — so 2023-12-31 → 2024-01-01 is one year, and one month — while
-/// `day` and finer are the exact elapsed difference divided by the unit and
-/// truncated toward zero. (Postgres' `age`-style "complete units" would make
-/// that same pair zero years; we deliberately do not use it.)
+/// DuckDB semantics: `year`/`month`/`week` count unit boundaries crossed, so
+/// 2023-12-31 to 2024-01-01 is one year; `day` and finer divide the elapsed time and truncate.
 fn dateDiff(a_us: i64, b_us: i64, u: TimeUnit) i64 {
     switch (u) {
         .year, .month => {
@@ -3779,7 +3553,6 @@ fn dateDiff(a_us: i64, b_us: i64, u: TimeUnit) i64 {
             if (u == .year) return cb.y - ca.y;
             return (cb.y * 12 + @as(i64, cb.m)) - (ca.y * 12 + @as(i64, ca.m));
         },
-        // weeks are a calendar unit too: the Mondays crossed, as date_trunc cuts
         .week => {
             const wa = isoWeekStart(@divFloor(a_us, 86_400_000_000));
             const wb = isoWeekStart(@divFloor(b_us, 86_400_000_000));
@@ -3792,9 +3565,6 @@ fn dateDiff(a_us: i64, b_us: i64, u: TimeUnit) i64 {
     }
 }
 
-/// The first unsupported `%` directive in `fmt` (as a one-byte slice), or null
-/// when every directive is one `strftimeFmt` understands. Used at check time on
-/// a literal format so a typo fails the plan, not the run.
 pub fn badStrftime(fmt: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i < fmt.len) : (i += 1) {
@@ -3809,9 +3579,8 @@ pub fn badStrftime(fmt: []const u8) ?[]const u8 {
     return null;
 }
 
-/// `strftime` over exactly `%Y %m %d %H %M %S %y %%`. Any other directive is an
-/// error, never a silent passthrough — a literal format is already rejected at
-/// check time, so this only fires for a format computed at run time.
+/// `strftime` over exactly `%Y %m %d %H %M %S %y %%`; any other directive is an
+/// error, never a silent passthrough.
 fn strftimeFmt(arena: std.mem.Allocator, us: i64, fmt: []const u8) EvalError![]const u8 {
     const day = @divFloor(us, 86_400_000_000);
     const rem: u64 = @intCast(us - day * 86_400_000_000);
@@ -3843,11 +3612,8 @@ fn strftimeFmt(arena: std.mem.Allocator, us: i64, fmt: []const u8) EvalError![]c
     return try out.toOwnedSlice();
 }
 
-/// `strptime` over the directives `strftime` writes. A number takes up to its
-/// width in digits (so `3/1/2026` reads under `%d/%m/%Y`), `%y` pivots as POSIX
-/// does (69–99 the 1900s, 00–68 the 2000s), other characters match themselves,
-/// and the whole text must be consumed. Null when the text does not fit, or
-/// names a date that does not exist (`31/02/2026`).
+/// Numbers take up to their width in digits, `%y` pivots as POSIX does (69-99 are
+/// the 1900s), and the whole text must be consumed. Null for a date that does not exist.
 fn strptimeFmt(text: []const u8, fmt: []const u8) ?i64 {
     var y: i64 = 1970;
     var mo: u32 = 1;
@@ -3887,8 +3653,6 @@ fn strptimeFmt(text: []const u8, fmt: []const u8) ?i64 {
     return (daysFromCivil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec) * 1_000_000;
 }
 
-/// Day count since the 1970 epoch for a civil date: the inverse of
-/// `civilFromDays` (Howard Hinnant's algorithm).
 pub fn daysFromCivil(y0: i64, m: u32, d: u32) i64 {
     const y = if (m <= 2) y0 - 1 else y0;
     const era = @divFloor(if (y >= 0) y else y - 399, 400);
@@ -3908,9 +3672,8 @@ fn isoNum(s: []const u8) ?i64 {
     return v;
 }
 
-/// Parse `YYYY-MM-DD` into a day count. Strict on purpose: a literal that is
-/// not an ISO date must fail rather than coerce, so `date_col = '01/07/2013'`
-/// is an error instead of a silently wrong comparison.
+/// Strict on purpose: a literal that is not an ISO date must fail, so
+/// `date_col = '01/07/2013'` is an error, not a silently wrong comparison.
 pub fn parseIsoDate(s0: []const u8) ?i64 {
     const s = trim(s0);
     if (s.len != 10 or s[4] != '-' or s[7] != '-') return null;
@@ -3921,9 +3684,8 @@ pub fn parseIsoDate(s0: []const u8) ?i64 {
     return daysFromCivil(y, @intCast(m), @intCast(d));
 }
 
-/// Parse `YYYY-MM-DD[ HH:MM:SS]` into microseconds since the epoch.
-/// `HH:MM:SS[.ffffff]` (or `HH:MM`) as microseconds since midnight — the text a
-/// `time` value prints as, so a cast back is exact.
+/// `HH:MM:SS[.ffffff]` or `HH:MM` as microseconds since midnight, the text a
+/// `time` prints as, using the timestamp parser's rules on a fixed date.
 pub fn parseIsoTime(s0: []const u8) ?i64 {
     const s = trim(s0);
     if (s.len == 5 and s[2] == ':') {
@@ -3932,13 +3694,14 @@ pub fn parseIsoTime(s0: []const u8) ?i64 {
         if (hh > 23 or mm > 59) return null;
         return (hh * 3600 + mm * 60) * 1_000_000;
     }
-    // reuse the timestamp parser's clock and fraction rules on a fixed date
     if (s.len < 8 or s.len > 8 + 7) return null;
     var buf: [32]u8 = undefined;
     const ts = std.fmt.bufPrint(&buf, "1970-01-01 {s}", .{s}) catch return null;
     return parseIsoTimestamp(ts);
 }
 
+/// `YYYY-MM-DD[ HH:MM:SS[.ffffff]]` as microseconds since the epoch. The fraction
+/// is kept: dropping it once made sub-second rows identical under DISTINCT.
 pub fn parseIsoTimestamp(s0: []const u8) ?i64 {
     const s = trim(s0);
     if (s.len == 10) return (parseIsoDate(s) orelse return null) * 86_400_000_000;
@@ -3948,8 +3711,6 @@ pub fn parseIsoTimestamp(s0: []const u8) ?i64 {
     const mm = isoNum(s[14..16]) orelse return null;
     const ss = isoNum(s[17..19]) orelse return null;
     if (hh > 23 or mm > 59 or ss > 59) return null;
-    // Accept and keep `.ffffff`. `Value.timestamp` is micros, so ignoring the
-    // fraction silently discarded it on every CAST of a sub-second literal.
     var frac: i64 = 0;
     if (s.len > 20 and s[19] == '.') {
         var i: usize = 20;
@@ -3963,8 +3724,6 @@ pub fn parseIsoTimestamp(s0: []const u8) ?i64 {
     return days * 86_400_000_000 + (hh * 3600 + mm * 60 + ss) * 1_000_000 + frac;
 }
 
-/// Civil (Gregorian) date from a day count since the 1970 epoch (Howard Hinnant's
-/// algorithm). Shared by the text-sink serializer and the SQL INSERT serializer.
 pub fn civilFromDays(z0: i64) struct { y: i64, m: u32, d: u32 } {
     const z = z0 + 719468;
     const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
@@ -3988,7 +3747,6 @@ test "parseIsoTime: the text a time prints as, and nothing out of range" {
 }
 
 test "decimals lose digits by rounding half away from zero, on every path" {
-    // a decimal's own digits
     const cases = [_]struct { u: i128, s: u8, to: u8, want: i128 }{
         .{ .u = 12345, .s = 3, .to = 2, .want = 1235 },
         .{ .u = -12345, .s = 3, .to = 2, .want = -1235 },
@@ -4000,8 +3758,6 @@ test "decimals lose digits by rounding half away from zero, on every path" {
     };
     for (cases) |c| try std.testing.expectEqual(c.want, rescaleTo(.{ .unscaled = c.u, .scale = c.s }, c.to).?.unscaled);
 
-    // a float through its fifteen significant digits, as PostgreSQL casts float8
-    // to numeric: the binary 12.345 is 12.34499…, and must still read 12.35
     const floats = [_]struct { x: f64, to: u8, want: i128 }{
         .{ .x = 12.345, .to = 2, .want = 1235 },
         .{ .x = -12.345, .to = 2, .want = -1235 },
@@ -4017,10 +3773,8 @@ test "decimals lose digits by rounding half away from zero, on every path" {
         const got = try castValueTyped(ar.allocator(), .{ .float = c.x }, types.Type.decimal(38, c.to));
         try std.testing.expectEqual(c.want, got.decimal.unscaled);
     }
-    // too large for 38 digits, or not a number: a failed cast, never a trap
     try std.testing.expectError(error.CastFailed, castValueTyped(ar.allocator(), .{ .float = 1e300 }, types.Type.decimal(10, 2)));
     try std.testing.expectError(error.CastFailed, castValueTyped(ar.allocator(), .{ .float = std.math.nan(f64) }, types.Type.decimal(10, 2)));
-    // text rounds the same way
     try std.testing.expectEqual(@as(i128, -1235), (try castValueTyped(ar.allocator(), .{ .string = "-12.345" }, types.Type.decimal(10, 2))).decimal.unscaled);
 }
 
@@ -4049,7 +3803,6 @@ test "format temporal values for text sinks" {
     }
 }
 
-/// Render an exact decimal `unscaled * 10^-scale`, e.g. (12345, 2) -> "123.45".
 pub fn formatDecimal(arena: std.mem.Allocator, unscaled: i128, scale: u8) ![]const u8 {
     var buf: [fmt_bound]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -4057,34 +3810,15 @@ pub fn formatDecimal(arena: std.mem.Allocator, unscaled: i128, scale: u8) ![]con
     return arena.dupe(u8, w.buffered());
 }
 
-/// Last resolved column index per name slot. `Schema.indexOf` is a linear scan
-/// comparing names, and `evalRow` resolves every field reference it evaluates —
-/// once per ROW on the row-at-a-time fallback path, where the same handful of
-/// names resolve against the same schema for the whole batch. On a 40-column
-/// schema that scan was a third of the per-row cost.
-///
-/// Direct-mapped and tiny, so an expression naming several columns keeps a slot
-/// for each instead of thrashing one. Thread-local because parallel lanes
-/// evaluate concurrently.
 threadlocal var field_memo: [8]usize = @splat(0);
 
+/// Hashes length, first and last byte (names like `col36`..`col39` share the
+/// first two) into the memo. A qualified name skips the memo, which is by name alone.
 fn fieldIndex(schema: types.Schema, q: ast.QualName) ?usize {
-    // A qualifier survives parsing only when it names a join's right side, where
-    // it decides between `x` and the renamed `x_r`; the memo below is by name alone.
     if (q.parts.len > 1) return schema.resolve(q.parts);
     const name = lastPart(q);
     if (name.len == 0) return schema.indexOf(name);
-    // Length and first byte alone are not enough to spread real column names:
-    // `col36`…`col39`, or `customer_id`/`customer_city`, share both and would
-    // land in one slot, so an expression naming several of them would evict on
-    // every lookup and never hit. The last byte is what separates them, and
-    // three bytes of mixing stays far cheaper than the scan it avoids.
     const slot = (name.len *% 31 +% name[0] *% 7 +% name[name.len - 1]) & (field_memo.len - 1);
-    // Verified, not trusted: a remembered slot is accepted only after checking
-    // it still names the field being asked for. That is the same comparison
-    // `indexOf` would make on its way to the answer, so a stale entry — a
-    // different schema, a reordered one — costs one compare and falls through
-    // to the scan rather than resolving to the wrong column.
     const cached = field_memo[slot];
     if (cached < schema.fields.len and std.mem.eql(u8, schema.fields[cached].name, name)) return cached;
     const idx = schema.indexOf(name) orelse return null;
@@ -4106,17 +3840,6 @@ pub fn toF64(v: Value) f64 {
     };
 }
 
-/// One compiled pattern, kept across calls. `regexp_replace` is evaluated per
-/// ROW, and recompiling the pattern for each one made a column scan pay for a
-/// parse it had already done — the pattern is almost always a literal, so every
-/// compile after the first is identical work.
-///
-/// Keyed on the pattern's BYTES, not its address: a non-literal pattern comes
-/// out of the batch arena, which is reset between pulls, so a later pattern can
-/// land on the address an earlier one had and a pointer key would hand back the
-/// wrong expression. A short memcmp is cheap next to a compile either way.
-/// Thread-local because parallel lanes evaluate concurrently, and the buffer is
-/// no bigger than the stack one this replaced.
 const RegexCache = struct {
     buf: [16 * 1024]u8 = undefined,
     src: []const u8 = &.{},
@@ -4125,14 +3848,8 @@ const RegexCache = struct {
 };
 threadlocal var regex_cache: RegexCache = .{};
 
-/// Why the last builtin to fail on this thread failed, for the operator that
-/// reports the error: the error code alone only says `cast failed`. Tied to the
-/// code it explains, so a note left by an error something swallowed cannot
-/// describe a different one.
 threadlocal var fail_note: struct { err: ?anyerror = null, buf: [480]u8 = undefined, len: usize = 0 } = .{};
 
-/// Record `msg` as why `e` is being returned, and return it: for a source whose
-/// error code alone cannot say which file or what about it.
 pub fn explain(e: anyerror, msg: []const u8) anyerror {
     const n = &fail_note;
     const k = @min(msg.len, n.buf.len);
@@ -4142,7 +3859,6 @@ pub fn explain(e: anyerror, msg: []const u8) anyerror {
     return e;
 }
 
-/// Record why `e` is being returned, and return it.
 fn failWith(e: EvalError, comptime fmt: []const u8, args: anytype) EvalError {
     const n = &fail_note;
     const msg = std.fmt.bufPrint(&n.buf, fmt, args) catch blk: {
@@ -4154,9 +3870,8 @@ fn failWith(e: EvalError, comptime fmt: []const u8, args: anytype) EvalError {
     return e;
 }
 
-/// A CAST that failed, saying which value and to what — `'31/12/2026' is not a
-/// DATE` — with the format a date or time is read in, since that is what a
-/// file in another convention trips over.
+/// A CAST failure naming the value and target, with the format a date or time is
+/// read in, since that is what a file in another convention trips over.
 fn castFailure(arena: std.mem.Allocator, v: Value, ty: Type) EvalError {
     const text = clip(valueToString(arena, v) catch "?");
     const want: []const u8 = switch (ty.kind) {
@@ -4174,14 +3889,10 @@ fn castFailure(arena: std.mem.Allocator, v: Value, ty: Type) EvalError {
     return failWith(error.CastFailed, "CAST: '{s}' is not {s}", .{ text, want });
 }
 
-/// Drop a note nobody reported. Evaluation starting again means the failure it
-/// explained was swallowed — by a TRY_CAST, a json_transform element, the
-/// vectorized path falling back — and a later error must not inherit it.
 inline fn forgetFailure() void {
     if (fail_note.err != null) fail_note.err = null;
 }
 
-/// The note for `e`, once: null when the last failure was not `e`.
 pub fn takeFailure(e: anyerror) ?[]const u8 {
     const n = &fail_note;
     if (n.err == null or n.err.? != e) return null;
@@ -4189,7 +3900,6 @@ pub fn takeFailure(e: anyerror) ?[]const u8 {
     return n.buf[0..n.len];
 }
 
-/// At most `max` bytes of `s`, for quoting a value in a message.
 fn clip(s: []const u8) []const u8 {
     const max = 80;
     return if (s.len <= max) s else s[0..max];
@@ -4197,8 +3907,6 @@ fn clip(s: []const u8) []const u8 {
 
 const RegexMatch = struct { s: []const u8, span: ?[2]usize, caps: regex.Captures };
 
-/// The first match of `c`'s pattern (argument 1) in its string (argument 0), or
-/// null when either is null. A match with no span is "no match".
 fn regexpFind(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!?RegexMatch {
     const v = try evalRow(arena, c.args[0], batch, row);
     if (v.isNull()) return null;
@@ -4218,26 +3926,18 @@ fn regexpFind(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usi
     return m;
 }
 
+/// The entry is invalidated before compiling, so a failed compile never leaves the
+/// old pattern under the new key, and `src` is copied into the entry's own buffer.
 fn cachedRegex(pattern: []const u8) regex.Error!regex.Regex {
     const c = &regex_cache;
     if (c.valid and std.mem.eql(u8, c.src, pattern)) return c.re;
     var fba = std.heap.FixedBufferAllocator.init(&c.buf);
-    // Cleared first: a failed compile must not leave the previous pattern
-    // reachable under the new key.
     c.valid = false;
     c.re = try regex.Regex.compile(fba.allocator(), pattern);
-    // `src` has to live as long as the entry it keys. The pattern itself may be
-    // arena memory that dies at the next pull, so keep a copy in the same buffer
-    // the compile allocated from.
     c.src = fba.allocator().dupe(u8, pattern) catch return error.OutOfMemory;
     c.valid = true;
     return c.re;
 }
-/// Total order over f64, postgres' rule: NaN equals NaN and sorts above every
-/// other value. IEEE leaves NaN unordered, which `std.math.order` answers with
-/// `unreachable` — so a NaN anywhere in a float column crashed every compare
-/// (sort, filter, MIN/MAX, group, join). Grouping and hashing need a total
-/// order to be well defined at all, so the choice is postgres', not IEEE's.
 pub fn orderF64(x: f64, y: f64) std.math.Order {
     const xn = std.math.isNan(x);
     const yn = std.math.isNan(y);
@@ -4248,15 +3948,14 @@ pub fn orderF64(x: f64, y: f64) std.math.Order {
     return std.math.order(x, y);
 }
 
+/// Bytes compare by content: a null answer here once made MIN/MAX over a bytes
+/// column keep the first value forever.
 pub fn compareValues(a: Value, b: Value) ?std.math.Order {
     if (isNum(a) and isNum(b)) {
         if (a == .int and b == .int) return std.math.order(a.int, b.int);
         return orderF64(toF64(a), toF64(b));
     }
     if (a == .string and b == .string) return std.mem.order(u8, a.string, b.string);
-    // Without this, `compareValues` returned null for bytes and `op.lessV`
-    // folded that to false — so MIN/MAX over a bytes column kept the FIRST
-    // value forever, while ORDER BY on the same column was correct.
     if (a == .bytes and b == .bytes) return std.mem.order(u8, a.bytes, b.bytes);
     if (a == .bool and b == .bool) return std.math.order(@intFromBool(a.bool), @intFromBool(b.bool));
     if (a == .timestamp and b == .timestamp) return std.math.order(a.timestamp, b.timestamp);
@@ -4275,9 +3974,8 @@ fn trim(s: []const u8) []const u8 {
     return std.mem.trim(u8, s, " \t\r\n");
 }
 
-/// `from_hex`: optional `0x` prefix, either case, and 16 digits' worth of range
-/// (so `to_hex` of a negative round-trips). Fail-loud on junk or overflow —
-/// nullability is the caller's to compose, e.g. `if(like(s, '%'), …)`.
+/// `from_hex`: optional `0x`, either case, 16 digits of range so `to_hex` of a
+/// negative round-trips. Junk or overflow is an error, never a null.
 fn parseHexI64(s: []const u8) EvalError!i64 {
     var t = trim(s);
     if (t.len >= 2 and t[0] == '0' and (t[1] == 'x' or t[1] == 'X')) t = t[2..];
@@ -4296,12 +3994,6 @@ fn toI64(v: Value) i64 {
     };
 }
 
-/// Text functions count characters, as Postgres and DuckDB do — and as the
-/// sources a pushed-down `substr` or `left` runs on do. A character is one UTF-8
-/// sequence; a byte that does not start a valid one counts as a character of its
-/// own, so text that is not UTF-8 degrades to byte semantics instead of failing a
-/// load. They counted bytes: `length('naïve')` was 6 and `reverse('日本')` was
-/// invalid UTF-8.
 inline fn charWidth(s: []const u8, i: usize) usize {
     const b = s[i];
     if (b < 0x80) return 1;
@@ -4311,7 +4003,6 @@ inline fn charWidth(s: []const u8, i: usize) usize {
     return n;
 }
 
-/// Eight bytes at a time: every string function asks this first.
 fn isAscii(s: []const u8) bool {
     var i: usize = 0;
     while (i + 8 <= s.len) : (i += 8) {
@@ -4331,7 +4022,6 @@ fn charCount(s: []const u8) usize {
     return n;
 }
 
-/// Byte offset just past the first `k` characters of `s`, clamped to its end.
 fn charOffset(s: []const u8, k: usize) usize {
     var i: usize = 0;
     var c: usize = 0;
@@ -4339,7 +4029,6 @@ fn charOffset(s: []const u8, k: usize) usize {
     return i;
 }
 
-/// SQL `substr` with a 1-based start, in characters; `len` null = to end.
 fn substrChars(arena: std.mem.Allocator, s: []const u8, start1: i64, len_opt: ?i64) ![]const u8 {
     var start: usize = 0;
     if (start1 > 1) start = charOffset(s, @intCast(start1 - 1));
@@ -4351,23 +4040,16 @@ fn substrChars(arena: std.mem.Allocator, s: []const u8, start1: i64, len_opt: ?i
     return arena.dupe(u8, s[start..end]);
 }
 
-/// `round` rounds HALF AWAY FROM ZERO (`@round`) — 2.5 → 3, -2.5 → -3 — which
-/// is the SQL-standard / Postgres / SQL Server rule. It is deliberately NOT the
-/// banker's rounding some engines (DuckDB, and IEEE `rint`) use for floats.
-/// Because engines disagree, `round` is kept OUT of the pushdown whitelist in
-/// `runtime/pushdown.zig`: the engine must compute it locally so the answer
-/// cannot change depending on where the query happened to run.
+/// Half away from zero (2.5 to 3, -2.5 to -3), not banker's rounding. Engines
+/// disagree, so `round` stays out of the pushdown whitelist in runtime/pushdown.zig.
 fn roundHalfAway(x: f64, digits: i64) f64 {
     if (digits == 0) return @round(x);
-    // 10^22 is the last power of ten f64 holds exactly; past it the scaling
-    // step is meaningless anyway, so clamp rather than drift.
     const s = pow10f(@intCast(@min(@abs(digits), 22)));
     return if (digits > 0) @round(x * s) / s else @round(x / s) * s;
 }
 
-/// Postgres `lpad`/`rpad`: pad `s` with repetitions of `fill` out to exactly
-/// `n` characters, TRUNCATING to the first `n` when `s` is already longer. An
-/// empty `fill` cannot pad, so a short `s` comes back unchanged.
+/// Postgres `lpad`/`rpad`: pads to exactly `n` characters and truncates a longer
+/// `s` to its first `n`; an empty `fill` leaves a short `s` unchanged.
 fn padChars(arena: std.mem.Allocator, s: []const u8, n: i64, fill: []const u8, left: bool) ![]const u8 {
     if (n <= 0) return "";
     const want: usize = @intCast(n);
@@ -4388,8 +4070,8 @@ fn padChars(arena: std.mem.Allocator, s: []const u8, n: i64, fill: []const u8, l
     return std.mem.concat(arena, u8, if (left) &.{ pad.items, s } else &.{ s, pad.items });
 }
 
-/// Postgres `left`/`right`: a NEGATIVE `n` means "all but the last/first |n|
-/// characters" rather than clamping to empty, so `left(s, -2)` drops the last two.
+/// Postgres `left`/`right`: a negative `n` means all but the last/first |n|
+/// characters, rather than clamping to empty.
 fn endSlice(s: []const u8, n: i64, left: bool) []const u8 {
     const slen: i64 = @intCast(charCount(s));
     var take: i64 = if (n >= 0) n else slen + n;
@@ -4399,7 +4081,6 @@ fn endSlice(s: []const u8, n: i64, left: bool) []const u8 {
     return if (left) s[0..charOffset(s, k)] else s[charOffset(s, @intCast(slen - take))..];
 }
 
-/// `s` in reverse character order.
 fn reverseChars(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     const out = try arena.alloc(u8, s.len);
     var i: usize = 0;
@@ -4411,9 +4092,8 @@ fn reverseChars(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     return out;
 }
 
-/// Simple case mapping, one code point to one, for the scripts data in the wild
-/// is written in: ASCII, Latin-1, Latin Extended-A, Greek and Cyrillic. Anything
-/// else — and a mapping that changes length, like `ß` to `SS` — is left as is.
+/// One-to-one case mapping for ASCII, Latin-1, Latin Extended-A, Greek and
+/// Cyrillic; anything else, and length-changing mappings like `ß`, stay as is.
 fn caseMap(cp: u21, up: bool) u21 {
     if (cp < 0x80) return if (up) std.ascii.toUpper(@intCast(cp)) else std.ascii.toLower(@intCast(cp));
     if (up) {
@@ -4422,7 +4102,6 @@ fn caseMap(cp: u21, up: bool) u21 {
         if (cp >= 0x100 and cp <= 0x17F) return latinExtA(cp, true);
         if (cp >= 0x3B1 and cp <= 0x3C9 and cp != 0x3C2) return cp - 0x20;
         if (cp == 0x3C2) return 0x3A3;
-        // Greek vowels with tonos
         if (cp == 0x3AC) return 0x386;
         if (cp >= 0x3AD and cp <= 0x3AF) return cp - 0x25;
         if (cp == 0x3CC) return 0x38C;
@@ -4444,10 +4123,8 @@ fn caseMap(cp: u21, up: bool) u21 {
     return cp;
 }
 
-/// Latin Extended-A pairs upper/lower on adjacent code points: even/odd through
-/// U+0137 and from U+014A, odd/even across U+0139–U+0148 and U+0179–U+017E.
-/// U+0130/U+0131 (Turkish dotted/dotless I), U+0138, U+0149 and U+017F have no
-/// one-to-one partner and stay.
+/// Latin Extended-A pairs on adjacent code points: even/odd through U+0137 and from
+/// U+014A, odd/even across U+0139-U+0148 and U+0179-U+017E; the rest have no partner.
 fn latinExtA(cp: u21, up: bool) u21 {
     if (cp == 0x130 or cp == 0x131 or cp == 0x138 or cp == 0x149 or cp == 0x17F or cp == 0x178) return cp;
     const odd_upper = (cp >= 0x139 and cp <= 0x148) or (cp >= 0x179 and cp <= 0x17E);
@@ -4457,9 +4134,6 @@ fn latinExtA(cp: u21, up: bool) u21 {
     return cp;
 }
 
-/// Latin-1 and Latin Extended-A letters with their accents dropped, one byte a code
-/// point from U+00C0: `*` is a ligature or a letter spelled with two (`unaccentCp`),
-/// `-` is not a letter (× ÷) and stays.
 const unaccent_base = "AAAAAA*CEEEEIIIIDNOOOOO-OUUUUY**" ++ "aaaaaa*ceeeeiiiidnooooo-ouuuuy*y" ++
     "AaAaAaCcCcCcCcDdDdEeEeEeEeEeGgGgGgGgHhHhIiIiIiIiIi**JjKkkLlLlLlLlLlNnNnNnnNnOoOoOo**RrRrRrSsSsSsSsTtTtTtUuUuUuUuUuUuWwYyYZzZzZzs";
 
@@ -4467,8 +4141,8 @@ comptime {
     std.debug.assert(unaccent_base.len == 0x180 - 0xC0);
 }
 
-/// What `unaccent` writes for code point `cp`, or null to keep it. A combining
-/// accent (U+0300–U+036F, from decomposed text) is dropped.
+/// What `unaccent` writes for `cp`, or null to keep it. In `unaccent_base`, `*`
+/// marks a ligature spelled here and `-` a non-letter; combining accents are dropped.
 fn unaccentCp(cp: u21) ?[]const u8 {
     if (cp >= 0x300 and cp <= 0x36F) return "";
     if (cp < 0xC0 or cp >= 0x180) return null;
@@ -4489,16 +4163,12 @@ fn unaccentCp(cp: u21) ?[]const u8 {
     };
 }
 
-/// A letter or digit, for `initcap`: ASCII alphanumerics, and above ASCII any
-/// code point the case mapping knows. A byte that is not UTF-8 is not one.
 fn isWordChar(cp: u21, w: usize) bool {
     if (cp < 0x80) return std.ascii.isAlphanumeric(@intCast(cp));
     if (w == 1) return false;
     return cp == 0xDF or caseMap(cp, true) != cp or caseMap(cp, false) != cp;
 }
 
-/// `upper`/`lower` over a string. ASCII maps in place; otherwise each character
-/// is decoded, mapped and re-encoded, and a byte that is not UTF-8 is copied.
 fn caseMapInto(out: *std.array_list.Managed(u8), s: []const u8, up: bool) !void {
     var i: usize = 0;
     while (i < s.len) {
@@ -4515,10 +4185,8 @@ fn caseMapInto(out: *std.array_list.Managed(u8), s: []const u8, up: bool) !void 
     }
 }
 
-/// SQL `LIKE`: `%` matches any run (including empty), `_` matches one character.
-///
-/// `%` is tested before the literal compare: a `%` in the text equal to a `%` in
-/// the pattern was taken as a literal match, so `'50% off' LIKE '50%'` was false.
+/// SQL `LIKE`. `%` is tested before the literal compare: otherwise a `%` in the
+/// text matched a `%` in the pattern literally, and `'50% off' LIKE '50%'` was false.
 fn likeMatch(s: []const u8, pat: []const u8) bool {
     var si: usize = 0;
     var pi: usize = 0;
@@ -4560,14 +4228,12 @@ test "substr (1-based, in characters) and like wildcard matcher" {
     try std.testing.expect(!likeMatch("hello", "h_l"));
     try std.testing.expect(!likeMatch("paid", "pending%"));
 
-    // A `%` in the text is still just a character to a pattern's `%`.
     try std.testing.expect(likeMatch("%%", "%"));
     try std.testing.expect(likeMatch("50% off", "50%"));
     try std.testing.expect(likeMatch("ab%c", "ab%"));
     try std.testing.expect(likeMatch("a%b", "a%b"));
     try std.testing.expect(!likeMatch("a%b", "a%c"));
 
-    // Characters, not bytes; a byte that is not UTF-8 counts as one character.
     try std.testing.expectEqualStrings("ïv", try substrChars(a, "naïve", 3, 2));
     try std.testing.expectEqual(@as(usize, 5), charCount("naïve"));
     try std.testing.expectEqual(@as(usize, 3), charCount("a\xe9b"));
@@ -4638,7 +4304,6 @@ test "a date column compares on the vectorized path, and matches rowwise" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    // 1994-12-31, 1995-01-01, 1995-01-02, null
     const days = [_]?i32{ 9130, 9131, 9132, null };
     var validity = try column.Bitmap.initFull(a, days.len);
     const store = try a.alloc(i32, days.len);
@@ -4660,9 +4325,6 @@ test "a date column compares on the vectorized path, and matches rowwise" {
 
     const sqlp = @import("../lang/sql_parser.zig");
     const cases = [_]struct { src: []const u8, want: [4]?bool }{
-        // `<` and `>` are the shapes that used to leave the vectorized path and be
-        // evaluated a row at a time — 48ns a row against 1.1ns for the same
-        // comparison on an int column, and a date is only an i32 day count.
         .{ .src = "d < '1995-01-01'", .want = .{ true, false, false, null } },
         .{ .src = "d > '1995-01-01'", .want = .{ false, false, true, null } },
         .{ .src = "d <= '1995-01-01'", .want = .{ true, true, false, null } },
@@ -4681,14 +4343,11 @@ test "a date column compares on the vectorized path, and matches rowwise" {
             } else {
                 try std.testing.expect(got.isNull());
             }
-            // The row-wise evaluator is the reference: both paths must agree.
             const rw = try evalRow(a, e, batch, i);
             if (w) |b| try std.testing.expectEqual(b, rw.bool) else try std.testing.expect(rw.isNull());
         }
     }
 
-    // A string that is not a date has no temporal reading, so it stays off this
-    // path and the row-wise evaluator reports the mismatch as before.
     var d2: sqlp.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const bad = try sqlp.parseExprStr(a, "d < 'not-a-date'", &d2);
     try std.testing.expectError(error.TypeMismatch, evalColumn(a, bad, batch, Type.init(.bool).asNullable()));
@@ -4834,8 +4493,6 @@ test "bitwise operators and hex builtins" {
         }
     };
 
-    // Row 0 has x = -8. Every case is INT-typed and evaluated on the rowwise
-    // path (the vectorizer has no bitwise kernel).
     const ints = [_]struct { src: []const u8, want: i64 }{
         .{ .src = "1 | 2 & 3", .want = 3 },
         .{ .src = "6 & 3", .want = 2 },
@@ -4845,7 +4502,6 @@ test "bitwise operators and hex builtins" {
         .{ .src = "~x", .want = 7 },
         .{ .src = "x >> 1", .want = -4 },
         .{ .src = "1 << 63 >> 63", .want = -1 },
-        // shift edges: never UB, never a panic
         .{ .src = "1 << 64", .want = 0 },
         .{ .src = "8 << -1", .want = 0 },
         .{ .src = "8 >> 100", .want = 0 },
@@ -4881,7 +4537,6 @@ test "bitwise operators and hex builtins" {
         try std.testing.expectEqualStrings(c.want, col.getValue(0).string);
     }
 
-    // Row 1 has x = null: it propagates through every new op.
     const nulls = [_][]const u8{ "x & 1", "x | 1", "x ^ 1", "x << 1", "x >> 1", "~x", "bit_count(x)", "to_hex(x)", "from_hex(to_hex(x))" };
     for (nulls) |src| {
         const e, const t = try S.checked(a, schema, src);
@@ -4890,8 +4545,6 @@ test "bitwise operators and hex builtins" {
         try std.testing.expect((try evalRow(a, e, batch, 1)).isNull());
     }
 
-    // Bitwise ops have no kernel, so the node itself is refused — and `evalVec`
-    // then answers it row-wise as a column, keeping the parent vectorized.
     {
         const pair = try S.checked(a, schema, "x & 1");
         try std.testing.expectError(error.Unsupported, evalVecNode(a, pair[0], batch));
@@ -4901,14 +4554,12 @@ test "bitwise operators and hex builtins" {
         try std.testing.expect(v.col.getValue(1).isNull());
     }
 
-    // `from_hex` is fail-loud: junk and overflow raise instead of nulling.
     for ([_][]const u8{ "from_hex('zz')", "from_hex('')", "from_hex('0x')", "from_hex('1ffffffffffffffff')" }) |src| {
         const e, const t = try S.checked(a, schema, src);
         try std.testing.expectError(error.CastFailed, evalRow(a, e, batch, 0));
         try std.testing.expectError(error.CastFailed, evalColumn(a, e, batch, t));
     }
 
-    // Anything but INT is a check-time type error.
     for ([_][]const u8{ "s & 1", "1.5 & 1", "1 << 1.5", "~s", "bit_count(s)", "to_hex(s)", "from_hex(1)" }) |src| {
         var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
         const e = try parser.parseExprStr(a, src, &diag);
@@ -5018,9 +4669,6 @@ test "evalColumn over an empty batch yields an empty column" {
     try std.testing.expectEqual(@as(usize, 0), out.len);
 }
 
-/// Parse and fold a constant expression — the shortest path to a builtin's
-/// row-wise semantics, since `constEval` runs the same `evalRow` the batch
-/// evaluator falls back to.
 fn evalLit(a: std.mem.Allocator, src: []const u8) !Value {
     var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const e = try parser.parseExprStr(a, src, &diag);
@@ -5036,19 +4684,16 @@ test "math builtins: rounding direction, guarded mod, domain edges" {
     try std.testing.expectEqual(@as(f64, 2.5), (try evalLit(a, "abs(-2.5)")).float);
     try std.testing.expect((try evalLit(a, "abs(null)")).isNull());
 
-    // An int is already whole: floor/ceil/round hand it straight back.
     try std.testing.expectEqual(@as(i64, 5), (try evalLit(a, "floor(5)")).int);
     try std.testing.expectEqual(@as(i64, 5), (try evalLit(a, "round(5)")).int);
     try std.testing.expectEqual(@as(f64, 2.0), (try evalLit(a, "floor(2.7)")).float);
     try std.testing.expectEqual(@as(f64, 3.0), (try evalLit(a, "ceil(2.1)")).float);
 
-    // Half away from zero, both signs — not banker's rounding.
     try std.testing.expectEqual(@as(f64, 3.0), (try evalLit(a, "round(2.5)")).float);
     try std.testing.expectEqual(@as(f64, -3.0), (try evalLit(a, "round(-2.5)")).float);
     try std.testing.expectEqual(@as(f64, 2.13), (try evalLit(a, "round(2.125, 2)")).float);
 
     try std.testing.expectEqual(@as(i64, 1), (try evalLit(a, "mod(7, 3)")).int);
-    // @rem semantics: the remainder takes the sign of the dividend.
     try std.testing.expectEqual(@as(i64, -1), (try evalLit(a, "mod(-7, 3)")).int);
     try std.testing.expect((try evalLit(a, "mod(7, 0)")).isNull());
 
@@ -5068,7 +4713,6 @@ test "nullif propagates nulls; greatest/least ignore them" {
 
     try std.testing.expect((try evalLit(a, "nullif(3, 3)")).isNull());
     try std.testing.expectEqual(@as(i64, 3), (try evalLit(a, "nullif(3, 4)")).int);
-    // `3 = null` is unknown, not true, so `a` survives.
     try std.testing.expectEqual(@as(i64, 3), (try evalLit(a, "nullif(3, null)")).int);
     try std.testing.expect((try evalLit(a, "nullif(null, 3)")).isNull());
 
@@ -5089,8 +4733,6 @@ test "try_cast yields null exactly where cast raises" {
     try std.testing.expect((try evalLit(a, "try_cast('x' as int)")).isNull());
     try std.testing.expectError(error.CastFailed, evalLit(a, "cast('x' as int)"));
 
-    // A safe cast is nullable even over a non-nullable input, and the column
-    // path must agree with it (the vectorized cast bails out to rowwise).
     var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const e = try parser.parseExprStr(a, "try_cast(s as int)", &diag);
     const schema = types.Schema{ .fields = &.{.{ .name = "s", .ty = Type.init(.string) }} };
@@ -5116,13 +4758,11 @@ test "string builtins: padding truncates, ends take negatives, split_part clamps
 
     try std.testing.expectEqualStrings("00042", (try evalLit(a, "lpad('42', 5, '0')")).string);
     try std.testing.expectEqualStrings("42   ", (try evalLit(a, "rpad('42', 5)")).string);
-    // n shorter than the input truncates rather than padding (Postgres).
     try std.testing.expectEqualStrings("abc", (try evalLit(a, "lpad('abcdef', 3)")).string);
     try std.testing.expectEqualStrings("abc", (try evalLit(a, "rpad('abcdef', 3)")).string);
 
     try std.testing.expectEqualStrings("ab", (try evalLit(a, "left('abcde', 2)")).string);
     try std.testing.expectEqualStrings("de", (try evalLit(a, "right('abcde', 2)")).string);
-    // A negative n drops that many from the OTHER end.
     try std.testing.expectEqualStrings("abc", (try evalLit(a, "left('abcde', -2)")).string);
     try std.testing.expectEqualStrings("cde", (try evalLit(a, "right('abcde', -2)")).string);
 
@@ -5136,7 +4776,6 @@ test "string builtins: padding truncates, ends take negatives, split_part clamps
 
     try std.testing.expectEqualStrings("abab", (try evalLit(a, "repeat('ab', 2)")).string);
     try std.testing.expectEqualStrings("", (try evalLit(a, "repeat('ab', 0)")).string);
-    // Past the 1 MiB ceiling this is an error, never an unbounded allocation.
     try std.testing.expectError(error.CastFailed, evalLit(a, "repeat('ab', 1000000)"));
 
     try std.testing.expectEqualStrings("cba", (try evalLit(a, "reverse('abc')")).string);
@@ -5148,18 +4787,14 @@ test "date builtins: month clamp, boundary diffs, epoch round trip, strftime pad
     defer ar.deinit();
     const a = ar.allocator();
 
-    // Jan 31 + 1 month clamps to the end of February, leap year or not.
     try std.testing.expectEqualStrings("2024-02-29", try formatDate(a, (try evalLit(a, "date_add('month', 1, cast('2024-01-31' as date))")).date));
     try std.testing.expectEqualStrings("2023-02-28", try formatDate(a, (try evalLit(a, "date_add('month', 1, cast('2023-01-31' as date))")).date));
     try std.testing.expectEqualStrings("2023-12-31", try formatDate(a, (try evalLit(a, "date_add('day', -1, cast('2024-01-01' as date))")).date));
     try std.testing.expectEqualStrings("2025-03-15", try formatDate(a, (try evalLit(a, "date_add('year', 1, cast('2024-03-15' as date))")).date));
-    // On a timestamp a month step keeps the time of day.
     try std.testing.expectEqualStrings("2024-02-29 06:30:00", try formatTimestamp(a, (try evalLit(a, "date_add('month', 1, cast('2024-01-31 06:30:00' as timestamp))")).timestamp));
 
-    // Boundary crossings for year/month: one day apart, but a year apart.
     try std.testing.expectEqual(@as(i64, 1), (try evalLit(a, "date_diff('year', cast('2023-12-31' as date), cast('2024-01-01' as date))")).int);
     try std.testing.expectEqual(@as(i64, 1), (try evalLit(a, "date_diff('month', cast('2023-12-31' as date), cast('2024-01-01' as date))")).int);
-    // Exact division for day and finer.
     try std.testing.expectEqual(@as(i64, 60), (try evalLit(a, "date_diff('day', cast('2024-01-01' as date), cast('2024-03-01' as date))")).int);
     try std.testing.expectEqual(@as(i64, -1), (try evalLit(a, "date_diff('day', cast('2024-01-02' as date), cast('2024-01-01' as date))")).int);
 
@@ -5196,7 +4831,6 @@ test "strptime: widths, %y pivot, impossible days, try_ form" {
     try std.testing.expectError(error.CastFailed, evalLit(a, "strptime('2026-10-03', '%d/%m/%Y')"));
     try std.testing.expectError(error.CastFailed, evalLit(a, "strptime('03/10/2026 24:00:00', '%d/%m/%Y %H:%M:%S')"));
     try std.testing.expect((try evalLit(a, "try_strptime('31/02/2026', '%d/%m/%Y')")) == .null);
-    // The failure says which value and format, once, and only for its own error.
     _ = evalLit(a, "strptime('31/02/2026', '%d/%m/%Y')") catch {};
     try std.testing.expect(takeFailure(error.DivByZero) == null);
     try std.testing.expectEqualStrings("strptime: '31/02/2026' is not a date in '%d/%m/%Y' (try_strptime gives null)", takeFailure(error.CastFailed).?);
@@ -5223,7 +4857,6 @@ test "text cleanup: translate, initcap, unaccent, ascii, chr" {
 
     try std.testing.expectEqualStrings("Sao Paulo Acao U n", try str(a, "unaccent('São Paulo Ação Ü ñ')"));
     try std.testing.expectEqualStrings("AEther strasse Lodz OEuvre ×", try str(a, "strip_accents('Æther straße Łódź Œuvre ×')"));
-    // A combining accent (decomposed text) is dropped; a non-UTF-8 byte stays.
     try std.testing.expectEqualStrings("Sao", try str(a, "unaccent('Sa\u{0303}o')"));
 
     try std.testing.expectEqual(@as(i64, 65), (try evalLit(a, "ascii('ABC')")).int);
@@ -5244,7 +4877,6 @@ test "regex and hashes: regexp_matches, regexp_extract, md5, sha256, xxhash64, c
     try std.testing.expectEqualStrings("123", (try evalLit(a, "regexp_extract('abc123', '[0-9]+')")).string);
     try std.testing.expectEqualStrings("12", (try evalLit(a, "regexp_extract('ab-12', '([a-z]+)-([0-9]+)', 2)")).string);
     try std.testing.expect((try evalLit(a, "regexp_extract('abc', '[0-9]+')")) == .null);
-    // A group that took no part in the match is null too.
     try std.testing.expect((try evalLit(a, "regexp_extract('b', '(a)?b', 1)")) == .null);
 
     try std.testing.expectEqualStrings("900150983cd24fb0d6963f7d28e17f72", (try evalLit(a, "md5('abc')")).string);
@@ -5286,7 +4918,6 @@ test "json builders and encodings: json_object, json_array, base64, url" {
     try std.testing.expectEqualStrings(
         \\{"k":{"y":1}}
     , try str(a, "json_object('k', json_get('{\"x\": {\"y\": 1}}', 'x'))"));
-    // Text that only looks like JSON stays a string.
     try std.testing.expectEqualStrings(
         \\["[not json"]
     , try str(a, "json_array('[not json')"));
@@ -5313,19 +4944,15 @@ test "json_reduce: folds, typed accumulators, positions, shadowing" {
     try std.testing.expectEqual(@as(i64, 0), (try evalLit(a, "json_reduce('[]', 0, (acc, x) -> acc + x)")).int);
     try std.testing.expect((try evalLit(a, "json_reduce(NULL, 0, (acc, x) -> acc + x)")) == .null);
     try std.testing.expectEqual(@as(f64, 3.5), (try evalLit(a, "json_reduce('[1.5,2]', 0.0, (acc, x) -> acc + x)")).float);
-    // An INT total cannot take a float without cutting it.
     try std.testing.expectError(error.CastFailed, evalLit(a, "json_reduce('[1.5,2]', 0, (acc, x) -> acc + x)"));
 
-    // A DECIMAL total stays one, scale and all; a date stays a date.
     const d = try evalLit(a, "json_reduce('[\"0.10\",\"0.25\"]', CAST(0 AS DECIMAL(10,2)), (acc, x) -> acc + CAST(x AS DECIMAL(10,2)))");
     try std.testing.expectEqualStrings("0.35", try valueToString(a, d));
     try std.testing.expectEqualStrings("2026-01-04", try formatDate(a, (try evalLit(a, "json_reduce('[1,2]', CAST('2026-01-01' AS DATE), (dt, x) -> date_add('day', x, dt))")).date));
 
-    // Positions from 0, as a json_get path counts them.
     try std.testing.expectEqual(@as(i64, 22), (try evalLit(a, "json_reduce('[1,2,3]', 0, (acc, x, i) -> acc + x * CAST(json_get('[5,4,3]', CAST(i AS STRING)) AS INT))")).int);
     try std.testing.expectEqualStrings("[10,21]", (try evalLit(a, "json_transform('[10,20]', (x, i) -> x + i)")).string);
 
-    // An inner lambda's `x` is its own, not the outer one's.
     try std.testing.expect((try evalLit(a, "json_any('[[1,2],[3]]', x -> json_reduce(x, 0, (acc, x) -> acc + x) = 3)")).bool);
 }
 
@@ -5351,7 +4978,6 @@ test "array helpers: chars, json_range, json_length, json_slice, json_concat" {
     try std.testing.expectEqualStrings("[]", try str(a, "json_slice('[1,2,3,4]', 9)"));
     try std.testing.expectEqualStrings("[1,{\"k\":2},3]", try str(a, "json_concat('[1]', '[{\"k\": 2}, 3]')"));
     try std.testing.expect((try evalLit(a, "json_concat('[1]', NULL)")) == .null);
-    // The CNPJ check digit, as docs/language.md writes it.
     try std.testing.expectEqual(@as(i64, 8), (try evalLit(a, "11 - json_reduce(chars('112223330001'), 0, (acc, c, i) -> acc + (ascii(c) - 48) * CAST(json_get('[5,4,3,2,9,8,7,6,5,4,3,2]', CAST(i AS STRING)) AS INT)) % 11")).int);
 }
 
@@ -5388,7 +5014,6 @@ test "check-time errors: bad strftime directive, sub-day date_add on a date" {
     try std.testing.expectError(error.TypeError, ctx.typeOf(bad_unit));
     try std.testing.expect(std.mem.indexOf(u8, ctx.msg, "date_add") != null);
 
-    // A good one still type-checks, and picks up its operand's kind.
     ctx.msg = "";
     const ok = try parser.parseExprStr(a, "date_add('day', 7, d)", &diag);
     try std.testing.expectEqual(types.TypeKind.date, (try ctx.typeOf(ok)).kind);
@@ -5396,9 +5021,6 @@ test "check-time errors: bad strftime directive, sub-day date_add on a date" {
 
 test "orderF64: a total order over NaN, so comparisons never hit unreachable" {
     const nan = std.math.nan(f64);
-    // Postgres' rule: NaN equals NaN and is greater than every other value.
-    // IEEE calls these unordered, which `std.math.order` reports by reaching
-    // `unreachable` — that crashed sort/filter/MIN/GROUP BY on any NaN.
     try std.testing.expectEqual(std.math.Order.eq, orderF64(nan, nan));
     try std.testing.expectEqual(std.math.Order.gt, orderF64(nan, 1.0));
     try std.testing.expectEqual(std.math.Order.lt, orderF64(1.0, nan));
@@ -5406,16 +5028,12 @@ test "orderF64: a total order over NaN, so comparisons never hit unreachable" {
     try std.testing.expectEqual(std.math.Order.eq, orderF64(0.0, -0.0));
     try std.testing.expectEqual(std.math.Order.lt, orderF64(-1.0, 1.0));
 
-    // Reached through the public comparison the operators use.
     const v_nan = Value{ .float = nan };
     try std.testing.expectEqual(std.math.Order.eq, compareValues(v_nan, v_nan).?);
     try std.testing.expectEqual(std.math.Order.gt, compareValues(v_nan, .{ .int = 9 }).?);
 }
 
 test "integer arithmetic overflow is an error, not a silent wrap" {
-    // The release build is ReleaseFast, where an unchecked `+` past i64 is
-    // undefined behavior — historically a silently negative result. i64 is the
-    // widest integer basalt carries, so overflow has to fail the row.
     const big = Value{ .int = std.math.maxInt(i64) };
     const one = Value{ .int = 1 };
     try std.testing.expectError(error.IntOverflow, arith(.add, big, one));
@@ -5423,7 +5041,6 @@ test "integer arithmetic overflow is an error, not a silent wrap" {
     try std.testing.expectError(error.IntOverflow, arith(.sub, .{ .int = std.math.minInt(i64) }, one));
     try std.testing.expectEqual(@as(i64, 5), (try arith(.add, .{ .int = 2 }, .{ .int = 3 })).int);
 
-    // minInt / -1 trapped in the CPU (SIGFPE), and -minInt wrapped to itself.
     const min = Value{ .int = std.math.minInt(i64) };
     try std.testing.expectError(error.IntOverflow, arith(.div, min, .{ .int = -1 }));
     try std.testing.expectEqual(@as(i64, 0), (try arith(.mod, min, .{ .int = -1 })).int);
@@ -5438,23 +5055,18 @@ test "numeric semantics: % truncates for every kind; decimals round, negate and 
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // `%` takes the dividend's sign for floats and decimals too, as for ints:
-    // the float path floored (`-5.0 % 3` was 1), decimals went through it.
     try std.testing.expectEqual(@as(f64, -2), (try evalLit(a, "-5.0 % 3")).float);
     try std.testing.expectEqual(@as(f64, -1.5), (try evalLit(a, "-5.5 % 2")).float);
     const m = (try evalLit(a, "CAST(-1.005 AS DECIMAL(10,3)) % 2")).decimal;
     try std.testing.expectEqual(@as(i128, -1005), m.unscaled);
     try std.testing.expectEqual(@as(u8, 3), m.scale);
 
-    // round on a decimal is exact: through f64, 1.005 was 1.00499… and rounded to 1.
     const r = (try evalLit(a, "round(CAST(-1.005 AS DECIMAL(10,3)), 2)")).decimal;
     try std.testing.expectEqual(@as(i128, -101), r.unscaled);
     try std.testing.expectEqual(@as(u8, 2), r.scale);
     try std.testing.expectEqual(@as(i128, 3), (try evalLit(a, "round(CAST(2.5 AS DECIMAL(4,1)))")).decimal.unscaled);
-    // `-2` is not a literal digit count, so the value keeps the input's scale: 100.0.
     try std.testing.expectEqual(@as(i128, 1000), (try evalLit(a, "round(CAST(149.9 AS DECIMAL(5,1)), -2)")).decimal.unscaled);
 
-    // Negation and numeric casts used to be a type mismatch / cast failure.
     try std.testing.expectEqual(@as(i128, -25), (try evalLit(a, "-CAST(2.5 AS DECIMAL(4,1))")).decimal.unscaled);
     try std.testing.expectEqual(@as(i64, 3), (try evalLit(a, "CAST(CAST(2.5 AS DECIMAL(4,1)) AS INT)")).int);
     try std.testing.expectEqual(@as(i64, -3), (try evalLit(a, "CAST(CAST(-2.5 AS DECIMAL(4,1)) AS INT)")).int);
@@ -5462,9 +5074,6 @@ test "numeric semantics: % truncates for every kind; decimals round, negate and 
 }
 
 test "timestamps keep sub-second precision through parse and format" {
-    // `Value.timestamp` is micros; dropping `.ffffff` made `…56.100` and
-    // `…56.900` byte-identical, collapsing distinct rows on DISTINCT and making
-    // ORDER BY non-deterministic inside a second.
     const us = parseIsoTimestamp("2026-08-08 12:34:56.123456").?;
     try std.testing.expectEqual(@as(i64, 123456), @mod(us, 1_000_000));
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -5473,9 +5082,7 @@ test "timestamps keep sub-second precision through parse and format" {
         "2026-08-08 12:34:56.123456",
         try formatTimestamp(ar.allocator(), us),
     );
-    // Fewer digits right-pad: `.1` is 100000 micros, not 1.
     try std.testing.expectEqual(@as(i64, 100000), @mod(parseIsoTimestamp("2026-08-08 12:34:56.1").?, 1_000_000));
-    // A whole second still formats without a fraction, and trailing junk fails.
     const w = parseIsoTimestamp("2026-08-08 12:34:56").?;
     try std.testing.expectEqualStrings("2026-08-08 12:34:56", try formatTimestamp(ar.allocator(), w));
     try std.testing.expect(parseIsoTimestamp("2026-08-08 12:34:56.12x") == null);
@@ -5486,10 +5093,6 @@ test "writeValue renders exactly what valueToString does, for every kind" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    // The CSV sink picks between these two by delimiter, so a single value that
-    // renders differently down the two paths would make output depend on the
-    // delimiter. Extremes are included because `formatX` now writes into a fixed
-    // buffer: if `fmt_bound` were too small these would trip the `unreachable`.
     const cases = [_]Value{
         .null,
         .{ .bool = true },
@@ -5511,7 +5114,6 @@ test "writeValue renders exactly what valueToString does, for every kind" {
         .{ .decimal = .{ .unscaled = 0, .scale = 0 } },
         .{ .decimal = .{ .unscaled = 1700, .scale = 2 } },
         .{ .decimal = .{ .unscaled = -1700, .scale = 2 } },
-        // Scale wider than the digits, so the padding loop runs.
         .{ .decimal = .{ .unscaled = 5, .scale = 6 } },
         .{ .decimal = .{ .unscaled = std.math.maxInt(i128), .scale = 0 } },
         .{ .decimal = .{ .unscaled = std.math.minInt(i128) + 1, .scale = 10 } },
@@ -5520,7 +5122,7 @@ test "writeValue renders exactly what valueToString does, for every kind" {
         .{ .bytes = "raw" },
         .{ .date = 0 },
         .{ .date = 20000 },
-        .{ .date = 2932896 }, // year 9999
+        .{ .date = 2932896 },
         .{ .time = 0 },
         .{ .time = 1 },
         .{ .time = 86_400_000_000 - 1 },
@@ -5557,27 +5159,19 @@ test "regexp_replace: the compiled-pattern cache keys on bytes, not on identity"
     defer ar.deinit();
     const a = ar.allocator();
 
-    // Repeating one pattern is the case the cache exists for: every call after
-    // the first reuses the compile, and must still answer for its own input.
     try std.testing.expectEqualStrings("X-b-c", (try evalLit(a, "regexp_replace('a-b-c', 'a', 'X')")).string);
     try std.testing.expectEqualStrings("a-b-X", (try evalLit(a, "regexp_replace('a-b-c', 'c', 'X')")).string);
     try std.testing.expectEqualStrings("X-b-c", (try evalLit(a, "regexp_replace('a-b-c', 'a', 'X')")).string);
 
-    // Switching patterns must recompile rather than reuse the entry: same
-    // length, same shape, different meaning.
     try std.testing.expectEqualStrings("Xbc", (try evalLit(a, "regexp_replace('abc', '^a', 'X')")).string);
     try std.testing.expectEqualStrings("abX", (try evalLit(a, "regexp_replace('abc', 'c$', 'X')")).string);
 
-    // Captures survive the cached entry.
     try std.testing.expectEqualStrings("b-a", (try evalLit(a, "regexp_replace('a-b', '(a)-(b)', '\\2-\\1')")).string);
     try std.testing.expectEqualStrings("b-a", (try evalLit(a, "regexp_replace('a-b', '(a)-(b)', '\\2-\\1')")).string);
 
-    // A pattern that fails to compile must not fall back to whatever was
-    // cached before it.
     try std.testing.expectError(error.CastFailed, evalLit(a, "regexp_replace('abc', '(', 'X')"));
     try std.testing.expectEqualStrings("Xbc", (try evalLit(a, "regexp_replace('abc', '^a', 'X')")).string);
 
-    // No match leaves the subject untouched.
     try std.testing.expectEqualStrings("abc", (try evalLit(a, "regexp_replace('abc', 'zzz', 'X')")).string);
 }
 
@@ -5587,9 +5181,6 @@ test "field resolution: the memo verifies its entry instead of trusting it" {
     const a = ar.allocator();
 
     const int = types.Type.init(.int);
-    // Two schemas holding the SAME names at DIFFERENT positions. Resolving
-    // against one and then the other is what a stale cache would get wrong, and
-    // the wrong answer here is a silently wrong column rather than an error.
     const wide = types.Schema{ .fields = &.{
         .{ .name = "col36", .ty = int },
         .{ .name = "col37", .ty = int },
@@ -5611,8 +5202,6 @@ test "field resolution: the memo verifies its entry instead of trusting it" {
         }
     };
 
-    // Names sharing a length and a first byte must still each keep a slot,
-    // and every one has to resolve to its own index in whichever schema.
     for (0..3) |_| {
         for ([_][]const u8{ "col36", "col37", "col38", "col39" }, 0..) |name, i| {
             try std.testing.expectEqual(i, fieldIndex(wide, q.of(a, name)).?);
@@ -5620,13 +5209,10 @@ test "field resolution: the memo verifies its entry instead of trusting it" {
         }
     }
 
-    // A name in neither schema is null, and asking again after a hit still is —
-    // a miss must not adopt whatever the slot held.
     try std.testing.expect(fieldIndex(wide, q.of(a, "nope")) == null);
     try std.testing.expectEqual(@as(usize, 0), fieldIndex(wide, q.of(a, "col36")).?);
     try std.testing.expect(fieldIndex(wide, q.of(a, "nope")) == null);
 
-    // A schema shorter than a remembered index must not read out of bounds.
     const tiny = types.Schema{ .fields = &.{.{ .name = "z", .ty = int }} };
     try std.testing.expectEqual(@as(usize, 3), fieldIndex(wide, q.of(a, "col39")).?);
     try std.testing.expect(fieldIndex(tiny, q.of(a, "col39")) == null);

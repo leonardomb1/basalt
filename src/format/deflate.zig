@@ -3,6 +3,8 @@
 //!
 //! LZ77 over a 32 KiB window — hash chains, one step of lazy matching, as
 //! zlib's default level does — and a dynamic Huffman code per block of input.
+//! `data[0..cur]` is the history matches may reach into and `data[cur..fill]` the
+//! input not yet compressed; after each block the last window is kept as history.
 //! A block that would come out larger than its input is stored instead, so an
 //! incompressible stream grows by a few bytes per 64 KiB, not by a fraction.
 
@@ -14,22 +16,17 @@ const min_match = 3;
 const max_match = 258;
 const hash_bits = 15;
 const max_chain = 48;
-/// A match this long is taken without looking further, or lazily past.
 const nice_len = 128;
 const lazy_len = 32;
 
 const Token = packed struct(u32) {
-    /// 0 for a literal; else the match length.
     len: u16,
-    /// The literal byte, or the match distance.
     val: u16,
 };
 
 pub const Gzip = struct {
     out: *std.Io.Writer,
     interface: std.Io.Writer,
-    /// `data[0..cur]` is history matches may reach back into; `data[cur..fill]`
-    /// is input not yet compressed.
     data: []u8,
     cur: usize = 0,
     fill: usize = 0,
@@ -53,7 +50,6 @@ pub const Gzip = struct {
         errdefer gpa.free(head);
         const prev = try gpa.alloc(i32, data.len);
         errdefer gpa.free(prev);
-        // a block is at most the whole buffer, history included the first time
         const tokens = try gpa.alloc(Token, data.len);
         errdefer gpa.free(tokens);
         const buf = try gpa.alloc(u8, 64 * 1024);
@@ -66,7 +62,6 @@ pub const Gzip = struct {
             .prev = prev,
             .tokens = tokens,
         };
-        // magic, deflate, no flags, no mtime, no extra flags, OS unknown
         try out.writeAll(&.{ 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255 });
         return self;
     }
@@ -110,8 +105,8 @@ pub const Gzip = struct {
         }
     }
 
-    /// Compress what is buffered as the last block and write the gzip trailer.
-    /// The underlying writer is left to its owner to flush.
+    /// Compresses the buffer as the last block and writes the trailer; flushing the
+    /// underlying writer is left to its owner.
     pub fn finish(self: *Gzip) !void {
         if (self.done) return;
         self.done = true;
@@ -124,8 +119,6 @@ pub const Gzip = struct {
         try self.emitBytes(&tail);
         try self.flushOut();
     }
-
-    // --- LZ77 ------------------------------------------------------------------
 
     fn hashAt(self: *const Gzip, i: usize) usize {
         const v = @as(u32, self.data[i]) | @as(u32, self.data[i + 1]) << 8 | @as(u32, self.data[i + 2]) << 16;
@@ -141,7 +134,6 @@ pub const Gzip = struct {
 
     const Match = struct { len: usize = 0, dist: usize = 0 };
 
-    /// The longest match for position `p` (already inserted) along its chain.
     fn findMatch(self: *const Gzip, p: usize, end: usize, prev_len: usize) Match {
         const max_len = @min(max_match, end - p);
         if (max_len < min_match or prev_len >= max_len) return .{};
@@ -178,7 +170,6 @@ pub const Gzip = struct {
         const end = self.fill;
         var nt: usize = 0;
         var p = self.cur;
-        // zlib's lazy evaluation: a match found at p is emitted only if p+1 has none longer
         var pend: ?Match = null;
         while (p < end) {
             self.insert(p);
@@ -207,7 +198,6 @@ pub const Gzip = struct {
         }
         try self.writeBlock(self.tokens[0..nt], self.data[self.cur..end], final);
 
-        // keep the last window as history
         self.cur = end;
         if (self.fill > window) {
             const shift = self.fill - window;
@@ -220,8 +210,6 @@ pub const Gzip = struct {
             self.fill = window;
         }
     }
-
-    // --- blocks ----------------------------------------------------------------
 
     fn writeBlock(self: *Gzip, tokens: []const Token, raw: []const u8, final: bool) !void {
         var lfreq = [_]u32{0} ** 286;
@@ -245,7 +233,6 @@ pub const Gzip = struct {
         var hdist: usize = 30;
         while (hdist > 1 and dlen[hdist - 1] == 0) hdist -= 1;
 
-        // the code lengths, run-length coded (symbols 16, 17, 18)
         var all: [286 + 30]u8 = undefined;
         @memcpy(all[0..hlit], llen[0..hlit]);
         @memcpy(all[hlit..][0..hdist], dlen[0..hdist]);
@@ -259,7 +246,6 @@ pub const Gzip = struct {
         var hclen: usize = 19;
         while (hclen > 4 and clen[order[hclen - 1]] == 0) hclen -= 1;
 
-        // stored when the code would not pay for itself
         var cost: u64 = 3 + 5 + 5 + 4 + 3 * hclen;
         for (rle[0..nrle]) |r| cost += clen[r.sym] + @as(u64, switch (r.sym) {
             16 => 2,
@@ -327,9 +313,6 @@ pub const Gzip = struct {
         }
     }
 
-    // --- bits ------------------------------------------------------------------
-
-    /// `n` bits of `v`, least significant first, as DEFLATE packs them.
     fn put(self: *Gzip, v: u32, n: u6) !void {
         self.bits |= @as(u64, v) << self.nbits;
         self.nbits += n;
@@ -353,7 +336,6 @@ pub const Gzip = struct {
         self.bits = 0;
     }
 
-    /// Bytes on a byte boundary (stored data, the trailer).
     fn emitBytes(self: *Gzip, bytes: []const u8) !void {
         try self.flushOut();
         try self.out.writeAll(bytes);
@@ -394,8 +376,8 @@ fn distExtraBits(sym: usize) u32 {
     return if (sym < 4) 0 else @intCast(sym / 2 - 1);
 }
 
-/// Code-length run-length coding: 16 repeats the previous length 3–6 times,
-/// 17 and 18 write 3–10 and 11–138 zeros.
+/// Code-length run-length coding (RFC 1951 3.2.7): 16 repeats the previous
+/// length 3–6 times, 17 and 18 write 3–10 and 11–138 zeros.
 fn runLengths(lens: []const u8, out: anytype) usize {
     var n: usize = 0;
     var i: usize = 0;
@@ -435,11 +417,9 @@ fn runLengths(lens: []const u8, out: anytype) usize {
     return n;
 }
 
-/// Huffman code lengths for `freq`, none longer than `max_bits` — the
-/// minimum-redundancy lengths (Moffat and Katajainen's in-place method), then
-/// cut to the limit and the code made whole again, as miniz does. A tree of
-/// fewer than two symbols gets two, as a code of one length-1 symbol is not
-/// complete and some decoders refuse it.
+/// Minimum-redundancy lengths (Moffat and Katajainen), cut to `max_bits` and made
+/// whole again as miniz does. Fewer than two symbols get two: a one-symbol code is
+/// incomplete and some decoders refuse it.
 fn buildLengths(freq: []u32, lens: []u8, max_bits: u5) void {
     var syms: [286]u16 = undefined;
     var n: usize = 0;
@@ -489,7 +469,6 @@ fn buildLengths(freq: []u32, lens: []u8, max_bits: u5) void {
         }
     }
     @memset(lens, 0);
-    // the rarest symbols take the longest codes
     var j: usize = 0;
     var len: usize = max_bits;
     while (len > 0) : (len -= 1) {
@@ -560,7 +539,7 @@ fn minimumRedundancy(a: []u32) void {
     }
 }
 
-/// Canonical codes for `lens`, bit-reversed for least-significant-first output.
+/// Canonical codes, bit-reversed for least-significant-first output.
 fn canonical(lens: []const u8, codes: []u16) void {
     var count = [_]u16{0} ** 16;
     for (lens) |l| count[l] += 1;
@@ -585,7 +564,6 @@ fn roundTrip(input: []const u8) !void {
     defer sink.deinit();
     const gz = try Gzip.init(gpa, &sink.writer);
     defer gz.deinit(gpa);
-    // in uneven pieces, as rows arrive
     var i: usize = 0;
     var step: usize = 1;
     while (i < input.len) : (step = step * 7 % 9973 + 1) {
@@ -612,7 +590,6 @@ test "gzip: round trips through std's decompressor" {
     try roundTrip("abcabcabcabcabcabcabc");
     try roundTrip("a" ** 1000);
 
-    // CSV-like text over several blocks, long runs, and incompressible noise
     var text: std.Io.Writer.Allocating = .init(gpa);
     defer text.deinit();
     for (0..60_000) |r| try text.writer.print("{d},name_{d},{d}.{d},2026-10-{d:0>2}\n", .{ r, r % 977, r * 7 % 1000, r % 100, r % 28 + 1 });

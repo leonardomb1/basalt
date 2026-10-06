@@ -2,11 +2,13 @@
 //! the BSL lexer; keywords are plain `ident`s matched case-insensitively by the
 //! SQL parser. Differences from the BSL lexer:
 //!   - comments: `--` to end of line and `/* ... */` blocks (not `#`)
-//!   - strings: '...' with `''` doubling (unescaped here), plus "..." kept with
-//!     the BSL backslash rules for interp-friendly quoting
+//!   - strings: '...' with `''` doubling (unescaped here)
+//!   - "..." is an ANSI quoted identifier, the only way to name a column with a
+//!     space or keyword in it. Before v0.4.6 it was a second string syntax, which
+//!     silently made `SELECT "Exchange rate"` a constant instead of the column.
 //!   - raw SQL literals: $$...$$ / $tag$...$tag$ (dollar-quoting, verbatim body)
 //!   - `$name` lexes as .dollar_ident (a PARAM reference)
-//!   - `;` statement terminator, `<>` as not-equal
+//!   - `;` statement terminator, `<>` as not-equal, `||` concat over bitwise `|`
 
 const std = @import("std");
 const token = @import("token.zig");
@@ -88,8 +90,8 @@ pub const Lexer = struct {
         return try out.toOwnedSlice();
     }
 
-    /// Unescape a quoted identifier: ANSI doubles the delimiter, so `"a""b"`
-    /// names the column `a"b`. A backslash is an ordinary character in a name.
+    /// Unescape a quoted identifier: ANSI doubles the delimiter, so `"a""b"` names the
+    /// column `a"b`. A backslash is an ordinary character in a name.
     fn unquoteIdent(self: *Lexer, body: []const u8) ![]const u8 {
         if (std.mem.indexOfScalar(u8, body, '"') == null) return body;
         var out = try std.array_list.Managed(u8).initCapacity(self.alloc, body.len);
@@ -149,16 +151,11 @@ pub const Lexer = struct {
             return self.make(.string, try self.unquoteSingle(body), line, col);
         }
 
-        // ANSI quoted identifier. `"x"` names a column — the only way to reach
-        // one whose name has a space or a keyword in it. It was a second string
-        // syntax before v0.4.6, which made `SELECT "Exchange rate"` a constant
-        // repeated down the column instead of the column itself, silently.
         if (c == '"') {
             _ = self.bump();
             const start = self.i;
             while (self.i < self.src.len) {
                 if (self.src[self.i] == '"') {
-                    // A doubled quote is an escaped one, not the end.
                     if (self.i + 1 < self.src.len and self.src[self.i + 1] == '"') {
                         _ = self.bump();
                         _ = self.bump();
@@ -241,7 +238,6 @@ pub const Lexer = struct {
             '^' => return self.make(.caret, self.src[start..self.i], line, col),
             '~' => return self.make(.tilde, self.src[start..self.i], line, col),
             '|' => {
-                // `||` (concat) must win over the bitwise `|`.
                 if (self.i < self.src.len and self.src[self.i] == '|') {
                     _ = self.bump();
                     return self.make(.pipe, self.src[start..self.i], line, col);

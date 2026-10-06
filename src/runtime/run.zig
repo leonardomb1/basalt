@@ -1,6 +1,40 @@
 //! Runtime entry: parse-tree to execution. `run` walks the statements; each
 //! pipeline is planned (plan.zig), resolved to sources/sinks (connect.zig), and
 //! either fanned out (lanes.zig) or driven serially here.
+//!
+//! Statement order is scope order. Expression LETs are folded once before anything
+//! runs (a LET nested in a branch is refused rather than missed); a query LET runs
+//! in statement order, and a `WITH` is registered where it stands, so two
+//! statements may reuse a CTE name and each sees its own (registering all up front
+//! once made the last win for both). A `for` body's bindings are scoped to the
+//! body and restored after each row. Sources are closed on every way out: they own
+//! sockets and gpa memory outside the plan arena, and a failed run under `serve`
+//! once leaked a socket per request. `EXPLAIN ANALYZE` runs serially: ten parallel
+//! paths would each need their own lane figures, and a plan must not depend on the
+//! pipeline's shape to print at all.
+//!
+//! Under `--format json` a LOAD run's stdout is the summary object and a SELECT
+//! run's the NDJSON rows, never both; a SELECT's summary then goes to a JSON log
+//! only. Statement `EXPLAIN` writes to stderr for the same reason, in one
+//! `writeAll`: a `File.Writer` opened on stderr mid-run starts at position zero and
+//! overwrote the logger's output when stderr was a regular file. Under Arrow
+//! output the plan is a one-column result instead.
+//!
+//! `runOutputBody` prepares a pipeline in a fixed order, each step there because a
+//! past bug lived in its absence: inline head bindings so the binding's WHERE
+//! reaches the source (a SQL table read through a CTE used to be read whole);
+//! refuse unreadable extensions as `check` does (a zip's COUNT(*) once answered
+//! 46204); substitute `$param`s in filters before they become SQL; hoist filters
+//! past joins so `serialWhere` sees them; carry `SPLIT BY ... JOBS n` from the sink
+//! to the read's hints; narrow SQL reads to the needed columns. Then one
+//! classification picks the lane shape: `runParquetLane`/`runCsvLane` switch
+//! exhaustively over `LaneShape`, since two parallel if-chains drifting apart
+//! caused both 0.5.8 lane bugs. Whole-aggregate and top-N descent to a SQL source
+//! win over splitting (one small result beats N range queries shipping raw rows);
+//! an aggregate that cannot descend is logged, being the costliest silent
+//! behaviour the engine has. In the serial driver the ping-pong arenas are
+//! declared before the `PipelinedSink` so its `shutdown` defer runs first: the
+//! reverse freed the arenas while the writer still serialised from them.
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
@@ -25,7 +59,6 @@ pub const aborting = @import("env.zig").aborting;
 pub const Diag = @import("env.zig").Diag;
 const Env = @import("env.zig").Env;
 pub const errLabel = @import("env.zig").errLabel;
-/// `errLabel`, or the account the failing code left of it (`eval.explain`).
 pub const failLabel = op.failLabel;
 const forHintIdent = @import("env.zig").forHintIdent;
 const hasFlagHint = @import("env.zig").hasFlagHint;
@@ -112,11 +145,6 @@ const runPrint = @import("script.zig").runPrint;
 const runThrow = @import("script.zig").runThrow;
 
 pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions, diag: *Diag) !Stats {
-    // `EXPLAIN ANALYZE` runs serially. Ten parallel paths exist and each would
-    // have to report its own lane figures; the one operator tree is the useful
-    // artifact, and a plan is worthless if the shape of the pipeline decides
-    // whether anything prints at all. The timings are therefore a serial
-    // profile, which is what the tree has always claimed to be.
     var opts = opts_in;
     if (opts.explain) opts.threads = 1;
 
@@ -168,8 +196,6 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         .connection => |c| try connections.put(c.name, c),
         .func => |fd| try fns.put(fd.name, fd),
         .print, .binding => {},
-        // An EXPLAIN counts: a script whose only pipeline is explained is a complete
-        // script, not one that forgot to write anywhere.
         .output, .for_each, .match, .call, .explain => runnable += 1,
         .param, .kind, .let_const, .throw => {},
     };
@@ -190,9 +216,6 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     };
 
     var sources = std.array_list.Managed(driver.Source).init(arena);
-    // A source's `close` releases the socket and its gpa allocations — neither
-    // owned by the plan arena — so a failed run used to leak an fd per open
-    // connection. Under `serve` that is one leaked socket per failing request.
     defer for (sources.items) |sc| sc.close();
     var buffer_decl: ?ast.BufferDecl = null;
     for (program.stmts) |s| {
@@ -225,7 +248,6 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         progress.start();
         env.progress = &progress;
     } else if (opts.progress) {
-        // Under `--log-format json` the line becomes a once-a-second event.
         progress.mode = if (opts.log.format == .json) .json else .line;
         progress.start();
         env.progress = &progress;
@@ -236,15 +258,10 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
 
     var stats = Stats{ .run_id = run_id };
     var lanes_used: usize = 1;
-    // On every way out, a failed run's included: the loads before the failure
-    // happened, and a caller showing them wants their totals.
     defer if (opts.summary_out) |so| {
         so.* = runSummary(&env, run_id, stats.rows_out, rows_read.load(.monotonic), @intCast(std.time.milliTimestamp() - t0), lanes_used, &loads, &scan, runnable == 1);
     };
     for (program.stmts[1..]) |s| switch (s) {
-        // A `WITH` is registered where it stands, rendered with script scope like the
-        // query that reads it: two statements may reuse a CTE name, and each must see
-        // its own — registering them all up front made the last one win for both.
         .binding => |b| try bindings.put(b.name, try renderScriptScope(&env, b.pipeline)),
         .output => |p| {
             env.noteResult(if (p.show) "show" else "select", p.pos);
@@ -259,9 +276,6 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         .print => |p| try runPrint(&env, p, no_loop_vars),
         .call => |c| try runCall(&env, c, no_loop_vars, opts, &stats, &lanes_used, &batch_arena, runForBody),
         .throw => |t| try runThrow(&env, t, no_loop_vars),
-        // Expression LETs were folded before this loop; a query LET runs here,
-        // in statement order, so it sees every binding declared above it and
-        // every statement below it sees its value.
         .let_const => |l| if (l.query != null) try runScalarLet(&env, l),
         else => {},
     };
@@ -273,10 +287,6 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
 
     const summary = runSummary(&env, run_id, stats.rows_out, stats.rows_read, stats.elapsed_ms, lanes_used, &loads, &scan, runnable == 1);
     switch (opts.log.summary) {
-        // `--format json`: a LOAD run's stdout is the summary object; a SELECT
-        // run's stdout is the NDJSON rows — never both on one stream, so a
-        // SELECT's summary goes to the log, and only a JSON log: the terminal's
-        // printed table is a SELECT's own feedback.
         .json_stdout => if (env.wrote_sink) {
             var sbuf: [1024]u8 = undefined;
             var sfw = std.fs.File.stdout().writerStreaming(&sbuf);
@@ -313,10 +323,8 @@ fn runSummary(env: *const Env, run_id: u64, rows_written: u64, rows_read: u64, e
     };
 }
 
-/// Equality for plan-time `match`: numbers/strings/bools/temporals compare by value;
-/// a typed-vs-literal mismatch (e.g. a `port:int` subject vs a `"9030"` string
-/// pattern) falls back to a textual compare so a typed value still matches a string
-/// pattern instead of silently never matching.
+/// Equality for plan-time `match`. A typed-vs-literal mismatch (a `port:int` subject
+/// vs a `"9030"` pattern) falls back to a textual compare instead of never matching.
 fn valuesEqualLoose(arena: std.mem.Allocator, a: Value, b: Value) bool {
     if (eval.compareValues(a, b)) |ord| return ord == .eq;
     const as = eval.valueToString(arena, a) catch return false;
@@ -324,11 +332,8 @@ fn valuesEqualLoose(arena: std.mem.Allocator, a: Value, b: Value) bool {
     return std.mem.eql(u8, as, bs);
 }
 
-/// Evaluate a statement-`match`'s subject/guards/patterns over the bound names/values
-/// and return the index of the first matching arm (a `_` default matches), or null if
-/// none. Shared by the param-level (`runStmtMatch`) and per-row for-loop
-/// (`runForMatch`) runners, which differ only in how they bind names/values and how
-/// they run the chosen arm's body. `ctx` prefixes any eval-error message.
+/// The index of the first `match` arm whose pattern or guard holds (`_` matches), or
+/// null. Shared by `runStmtMatch` and `runForMatch`; `ctx` prefixes eval errors.
 pub fn matchArmIndex(env: *Env, m: ast.StmtMatch, ns: []const []const u8, vs: []const Value, ctx: []const u8) anyerror!?usize {
     var subj: ?Value = null;
     if (m.subject) |s| subj = eval.constEval(env.arena, s, ns, vs) catch |e|
@@ -351,10 +356,7 @@ pub fn matchArmIndex(env: *Env, m: ast.StmtMatch, ns: []const []const u8, vs: []
     return null;
 }
 
-/// Plan-time structural dispatch: evaluate the subject/guards over the resolved
-/// params and run the first matching arm's block. No matching arm (and no `_`) is
-/// a no-op. Subject form compares the subject to each pattern; guard form runs the
-/// first arm whose boolean condition holds.
+/// No matching arm (and no `_`) is a no-op.
 fn runStmtMatch(env: *Env, m: ast.StmtMatch, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     var names = std.array_list.Managed([]const u8).init(env.arena);
     var values = std.array_list.Managed(Value).init(env.arena);
@@ -367,8 +369,6 @@ fn runStmtMatch(env: *Env, m: ast.StmtMatch, opts: RunOptions, stats: *Stats, la
     for (m.arms[idx].body) |*st| try runStmt(env, st, opts, stats, lanes_used, batch_arena);
 }
 
-/// Execute one statement — used for match arm bodies. Registers declarations into
-/// the env and runs output / for-each / nested match.
 fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     env.diag.pos = null;
     switch (s.*) {
@@ -391,27 +391,15 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
             try registerSftp(env, c);
             try registerSmb(env, c);
         },
-        // A LET is folded once, before anything runs; one nested in a branch would
-        // silently miss that pass, so say so instead of resolving to nothing.
         .let_const => |l| return planErr(env.diag, try std.fmt.allocPrint(env.arena, "LET `{s}` must be declared at the top level of the script", .{l.name})),
         .param, .kind, .func => {},
     }
 }
 
-/// Run one output pipeline (ending in `write`): build it, then either split it
-/// into parallel key-range lanes or stream it serially into the sink.
-/// `LET x = (SELECT ...);` — run the query now, keep its single cell as the
-/// constant `$x` substitutes to. Also the desugared form of a scalar subquery
-/// in a WHERE: the parser lifts `(SELECT max(ts) FROM ...)` into an anonymous
-/// query LET ahead of the statement, so by the time the outer pipeline plans,
-/// the subquery is a literal — which is what lets the comparison ride the
-/// ordinary filter pushdown to the source.
-///
-/// SQL scalar-subquery semantics: one column required, zero rows is NULL, more
-/// than one row is an error.
+/// `LET x = (SELECT ...);`: run the query now and keep its single cell as `$x`. Also
+/// the desugared form of a WHERE scalar subquery, which becomes a literal that rides
+/// filter pushdown. One column required, zero rows is NULL, more than one an error.
 fn runScalarLet(env: *Env, l: ast.LetConst) !void {
-    // Inline scalar subqueries desugar to LETs with generated names; error
-    // text should name what the user wrote, not the internal binding.
     const what: []const u8 = if (std.mem.startsWith(u8, l.name, "__scalar"))
         "scalar subquery"
     else
@@ -428,7 +416,6 @@ fn runScalarLet(env: *Env, l: ast.LetConst) !void {
     var cur = pipe.op;
     while (try cur.next(scratch.allocator())) |b| {
         if (b.len > 0 and rows == 0) {
-            // The batch dies with the scratch arena; string payloads must not.
             v = try op.dupeValue(env.arena, b.columns[0].getValue(0));
         }
         rows += b.len;
@@ -439,11 +426,12 @@ fn runScalarLet(env: *Env, l: ast.LetConst) !void {
 
     try env.params.put(l.name, v);
     try env.params_expr.put(l.name, try mkLit(env.arena, v));
-    // a desugared scalar subquery is the statement's own, not a name to keep
     if (!std.mem.startsWith(u8, l.name, "__scalar")) if (env.on_let) |h| h.f(h.ctx, l.name, v);
     env.log.log(.debug, "LET {s} = scalar query result ({s})", .{ l.name, @tagName(std.meta.activeTag(v)) });
 }
 
+/// Run one output pipeline: split it into key-range lanes or stream it serially. A
+/// fanned-out union reports per branch, so this outer call then counts nothing.
 pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     errdefer env.diag.stamp(out.pos);
     const arena = env.arena;
@@ -453,23 +441,16 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
     if (last != .write) return planErr(env.diag, "a top-level pipeline must end in `write`");
     env.sink_name = sinkLabel(env, last.write);
     if (!env.explain and !std.mem.eql(u8, last.write.connector, "stdout")) env.wrote_sink = true;
-    // Only a real `LOAD`: a terminal SELECT prints rows to the same terminal.
     const is_load = !env.explain and !std.mem.eql(u8, last.write.connector, "stdout");
     if (is_load) env.last_target = try targetLabel(arena, last.write);
-    // A terminal SELECT draws no line — its rows go to the same screen — but a
-    // caller taking events wants to see one fill.
     const moving = env.progress != null and (is_load or env.progress.?.mode == .hook);
     if (moving) env.progress.?.begin(try moveLabel(arena, stages[0], last.write));
     const load_t0 = std.time.milliTimestamp();
     const load_rows0 = stats.rows_out;
     const read0 = env.rows_read.load(.monotonic);
-    // Lanes are a running maximum; counted from 1 here, this load's own show,
-    // and the maximum is restored on the way out.
     const lanes0 = lanes_used.*;
     lanes_used.* = 1;
     var load_err: ?anyerror = null;
-    // A union that fans out runs one `runOutput` per branch, and those report
-    // themselves; this outer call then counts nothing, or the rows count twice.
     var delegated = false;
     defer {
         if (moving) env.progress.?.end();
@@ -488,15 +469,9 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
     };
 }
 
-/// `runOutput` past the bookkeeping: plan and move the rows. Split off so the
-/// caller sees the error a load failed with, for its report.
-/// `SELECT ... FROM (SELECT k, SUM(v) FROM t GROUP BY k) x` — or the same through
-/// a CTE: the binding is an aggregate over a file or table, which the parallel
-/// paths only take when it is the pipeline itself. Built where it is read, it ran on
-/// one thread whatever `-j` said. So it is run first, on those paths, into memory,
-/// and the pipeline reads the rows back; an aggregate holds all its groups anyway,
-/// so this keeps nothing a serial run would not. Returns the binding's name when it
-/// was materialized, for the caller to drop afterwards.
+/// A derived table or CTE that aggregates a file or table is run first, in parallel,
+/// into memory, since built where it is read it ran on one thread. Returns the
+/// binding's name when materialized, for the caller to drop afterwards.
 fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!?[]const u8 {
     if (opts.threads < 2 or env.explain or stages[0].node != .ref) return null;
     const name = stages[0].node.ref;
@@ -524,16 +499,10 @@ fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, la
 
 const window_input = "__window_input";
 
-/// `read → (filter|select)* → window → …` over a file, or `… → ORDER BY → …`
-/// past the top-N: the window, as the sort, holds every row before it emits one, so its input is read first, on the parallel paths, into memory
-/// — the columns it and the stages after it use, in file order, as the shared
-/// sink keeps it — and the window runs over that. Built in place, the read ran on
-/// one thread whatever `-j` said. Not when a filter follows the window: that may
-/// be `WHERE rn <= k`, whose window keeps only `k` rows a partition as they stream.
+/// A window (or full sort) over a file reads its input first, in parallel, into
+/// memory, since built in place the read ran on one thread. Not when a filter follows
+/// the window: `WHERE rn <= k` keeps only `k` rows a partition as they stream.
 fn windowInput(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!?[]const ast.Stage {
-    // A window in a derived table or CTE (`… FROM (SELECT …, ROW_NUMBER() OVER …)`)
-    // is a binding `inlineHeadBindings` keeps whole, as a filter must not cross
-    // the window; laid end to end here only to be split at the window, nothing moves.
     var stages = stages_in;
     if (stages.len > 0 and stages[0].node == .ref) {
         if (env.materialized.contains(stages[0].node.ref)) return null;
@@ -559,15 +528,11 @@ fn windowInput(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_
             if (w.top_k != null) return null;
             for (stages[wi + 1 ..]) |st| if (st.node == .filter) return null;
         },
-        // a full sort holds every row too; ORDER BY with a small LIMIT is the
-        // parallel top-N's already
         .sort => if (wi + 1 < stages.len and stages[wi + 1].node == .limit and op.TopN.fits(stages[wi + 1].node.limit)) return null,
         else => return null,
     }
     if (env.materialized.contains(window_input)) return null;
 
-    // the source columns read past here: the names the window adds are its own
-    // (the parser puts a `select` of exactly those ahead of the window already)
     var keep = std.array_list.Managed(ast.SelectItem).init(env.arena);
     if (!narrowed) if (try projectedColumns(env, stages[1..])) |cols| {
         names: for (cols) |c| {
@@ -609,11 +574,6 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     defer if (mat) |name| {
         _ = env.materialized.remove(name);
     };
-    // A CTE, derived table or table-function call at the head reads through its
-    // binding, which `buildPipeline` builds from the binding's own stages and then
-    // the rest — the same rows as the stages laid end to end. Laid out here, the
-    // read leads, so the descent below sends the binding's WHERE to the source:
-    // through a binding, a SQL table used to be read whole and filtered here.
     stages = try inlineHeadBindings(env, stages);
     const win = try windowInput(env, opts, stages, lanes_used, batch_arena);
     defer if (win != null) {
@@ -630,33 +590,19 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg));
     env.fmt_out = analyze.formatFromHints(stages[stages.len - 1].hints, &ddiag) catch
         return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg));
-    // `run` does not analyze the pipeline the way `check` does, so the guard that
-    // stops an unreadable extension being parsed as CSV has to be applied here
-    // too — this is the path that answered a zip's COUNT(*) with 46204.
     if (stages[0].node == .read and stages[0].node.read.form == .path and
         std.mem.eql(u8, stages[0].node.read.connector, "csv"))
         try guardFileFormat(env, stages[0].node.read.form.path, env.fmt_in, "read");
     if (std.mem.eql(u8, last.write.connector, "csv") and last.write.target.len > 0)
         try guardFileFormat(env, last.write.target, env.fmt_out, "write");
 
-    // Every descent below translates filters to SQL, and a `$param` there must be
-    // its value, not a column of that name.
     stages = try analyze.substFilterParams(arena, stages, env.params_expr);
 
-    // Before the descent below: move whatever filters the join structure allows to
-    // sit ahead of the joins, so the contiguous prefix `serialWhere` reads actually
-    // contains them. Without this a join between the read and the WHERE meant no
-    // predicate descended at all.
     if (try pushdown.hoistFilters(arena, env.gpa, stages, env.bindings)) |hoisted| {
         env.log.log(.debug, "filter hoisted through a projection or join: {d} -> {d} stages", .{ stages.len, hoisted.len });
         stages = hoisted;
     }
 
-    // `LOAD INTO ... SPLIT BY (col) JOBS n` is written on the sink, but the split
-    // is a property of the read: carry the key to the lead's hints — a read's, or
-    // a union's, whose branches inherit them — where the planner looks, and let
-    // JOBS set this pipeline's lane count (also inside a PARALLEL FOR EACH, whose
-    // workers otherwise run single-lane: the person asked for lanes by name).
     if (stages[0].node == .read or stages[0].node == .union_) {
         var extra = std.array_list.Managed(ast.Hint).init(arena);
         for (stages[stages.len - 1].hints) |h| {
@@ -674,14 +620,10 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         }
     }
 
-    // Narrow a SQL table read to the columns the pipeline needs, before either
-    // path (serial or split lanes) renders its SQL from the stage.
     stages = try projectSqlRead(env, stages);
 
     stages = try descendLeadingWhere(env, stages);
 
-    // Split lanes re-read each branch's source by key range, so an arm that is a
-    // query rather than a table read has nothing to split; the serial union builds it.
     if (stages[0].node == .union_ and opts.threads > 1 and
         !std.mem.eql(u8, last.write.connector, "csv") and
         unionBranchesAreReads(stages[0].node.union_) and
@@ -691,17 +633,6 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         return runUnionSplit(env, stages[0].node.union_, stages[0].hints, stages[1 .. stages.len - 1], stages[stages.len - 1], opts, stats, lanes_used, batch_arena);
     }
 
-    // One classification, one eligibility check, one switch per source. This used to
-    // be two structurally identical if-else chains — and a shape wired into one chain
-    // and forgotten in the other is exactly how both 0.5.8 lane bugs happened: an
-    // ungrouped aggregate fanned out over CSV and ran serially over parquet, and the
-    // join-kind guard that three map paths applied was missing from the aggregate one.
-    // `runParquetLane`/`runCsvLane` switch exhaustively over `LaneShape`, so adding a
-    // shape is a compile error until both sources handle it.
-    // A derived table or CTE is a binding reference at the head of the pipeline,
-    // and the lanes want the read it wraps. Inline it, as `buildPipeline` will
-    // anyway, so `COUNT(*) FROM (SELECT DISTINCT …)` and a CTE-fed aggregate fan
-    // out instead of falling to the serial driver on the `.ref`.
     var head_stages = stages;
     var inlined: usize = 0;
     while (head_stages[0].node == .ref and inlined < 16) : (inlined += 1) {
@@ -730,11 +661,6 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
 
     const wr = try resolveUpsertKeys(env, last.write);
 
-    // Whole-aggregate descent takes precedence over splitting: one small grouped
-    // result beats N range queries that each ship raw rows here to be folded. The
-    // source schema is only knowable once the read is open, so the plain pipeline is
-    // built first and thrown away when the descent is eligible — the same "open, plan,
-    // reopen" the split path below does.
     var whole_agg = false;
     if (env.sql_desc != null and src_base < env.sources.items.len) {
         var why: []const u8 = "the pipeline is not read -> filter* -> aggregate";
@@ -748,16 +674,10 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                 whole_agg = true;
             }
         }
-        // The single most expensive silent behaviour the engine has: every matching
-        // source row ships here to be grouped. Say so, and why, where the run log is.
         if (!whole_agg and hasAggregate(stages))
             env.log.log(.warn, "aggregate over {s} runs engine-side, not in the source ({s}); every matching row is streamed here to be grouped", .{ @tagName(env.sql_desc.?.dialect), why });
     }
 
-    // A LIMIT, and the ORDER BY before it, descend the same way — built, checked
-    // against the source schema, rebuilt — so "the latest 1000 rows" asks the
-    // source for 1000 rather than streaming the table here to be sorted. The
-    // pushed read is one capped statement, so the split below is skipped.
     var top_n = false;
     if (!whole_agg and env.sql_desc != null and src_base < env.sources.items.len) {
         var why: []const u8 = "";
@@ -778,8 +698,6 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
             if (classifyAggPipeline(stages)) |shape| {
                 if (try runParallelSqlAgg(env, stages, shape.prefix, shape.ag, shape.tail, wr, opts, stats, lanes_used, src_base)) return;
             } else if (classifyMapJoinPipeline(stages)) |js| {
-                // A join is not linearizable, so the map split path below never sees
-                // this shape — it fans out over the same key ranges from here instead.
                 if (try runParallelSqlMapJoin(env, stages, js, wr, opts, stats, lanes_used, src_base)) return;
             }
         }
@@ -853,10 +771,6 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
 
-    // Order matters: defers run LIFO, so the arenas must be declared FIRST and
-    // `shutdown` (which joins the writer thread) LAST. Reversed, an error or a
-    // ^C between `submit` and `finish` freed the batch arenas while the writer
-    // was still serializing the batch out of them.
     var ping_pong: [2]std.heap.ArenaAllocator = .{ std.heap.ArenaAllocator.init(gpa), std.heap.ArenaAllocator.init(gpa) };
     defer for (&ping_pong) |*a| a.deinit();
     var pw = parallel.PipelinedSink{ .snk = snk, .gpa = gpa };
@@ -877,16 +791,9 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     if (opts.explain) try explainTree(arena, res.op);
 }
 
-/// `EXPLAIN [ANALYZE] <query>;` where it stands — explained against the connections,
-/// CTE bindings, params and LETs the statements above it put in scope, which is the
-/// whole point of the statement form over the program-level prefix.
-///
-/// `ANALYZE` is the ordinary pipeline run with the sink discarded (`env.explain`) and
-/// serially (a plan is worthless if the shape of the pipeline decides what prints), so
-/// it prints exactly the operator tree a whole-script `EXPLAIN ANALYZE` prints. The
-/// plain form executes nothing and renders the static plan — the same IR `basalt
-/// check` builds, through the same `analyze.render`. Both are scoped to this one
-/// statement: everything before and after it runs normally, at full parallelism.
+/// `EXPLAIN [ANALYZE] <query>;` against what the statements above put in scope.
+/// ANALYZE runs the pipeline serially with the sink discarded; the plain form renders
+/// the static plan through `analyze.render`. Both are scoped to this one statement.
 pub fn runExplain(env: *Env, e: ast.ExplainStmt, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     if (e.mode == .describe) return runDescribe(env, e.pipeline, stats);
     if (e.mode == .analyze) {
@@ -902,26 +809,12 @@ pub fn runExplain(env: *Env, e: ast.ExplainStmt, opts: RunOptions, stats: *Stats
     var adiag = analyze.Diag{};
     const plan = analyze.analyzeOne(env.arena, env.kind_name, e.pipeline, env.bindings, env.connections, env.params_expr, &adiag) catch |err| switch (err) {
         error.OutOfMemory => return err,
-        // `adiag`'s message lives in its own stack buffer; copy it out before it goes.
         error.AnalyzeFailed => return planErr(env.diag, try env.arena.dupe(u8, adiag.msg)),
     };
 
-    // stderr, not stdout: stdout is the data contract (NDJSON rows under
-    // `--format json`, or the summary object), and a script may run pipelines
-    // that write there before or after this statement. The whole-script
-    // `EXPLAIN <script>` prefix still prints to stdout — there it IS the
-    // invocation's only output. This also matches EXPLAIN ANALYZE, whose
-    // operator tree already goes to stderr.
-    //
-    // Rendered into memory and handed to ONE `writeAll`, the way `obs.Logger`
-    // writes: a `File.Writer` opened on stderr mid-run starts its own position
-    // at zero, so when stderr is a regular file it overwrites whatever the
-    // logger already wrote there instead of appending.
     var aw = std.Io.Writer.Allocating.init(env.gpa);
     defer aw.deinit();
     try analyze.render(plan, &aw.writer);
-    // Arrow output is for a program, which cannot read stderr as a result: there
-    // the plan is a result of its own, a `plan` column of one row per line.
     if (env.stdout_format == .arrow) {
         const info = env.takeResult();
         const n = try printPlanArrow(env.gpa, aw.writer.buffered(), info);
@@ -932,8 +825,6 @@ pub fn runExplain(env: *Env, e: ast.ExplainStmt, opts: RunOptions, stats: *Stats
     std.fs.File.stderr().writeAll(aw.writer.buffered()) catch {};
 }
 
-/// Writes a rendered plan to stdout as an Arrow stream with one string column,
-/// `plan`, one row per line. Returns the row count.
 pub fn printPlanArrow(gpa: std.mem.Allocator, text: []const u8, info: arrow.ResultInfo) !usize {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
@@ -953,9 +844,8 @@ pub fn printPlanArrow(gpa: std.mem.Allocator, text: []const u8, info: arrow.Resu
     return n;
 }
 
-/// Print the operator tree with per-stage actuals. Time is *exclusive*: an
-/// operator's own cost with its inputs' subtracted, since a pull pipeline
-/// nests children inside the parent's `next`.
+/// Time is exclusive: an operator's own cost with its inputs' subtracted, since a
+/// pull pipeline nests children inside the parent's `next`.
 fn explainTree(arena: std.mem.Allocator, root: op.Op) !void {
     var buf = std.array_list.Managed(u8).init(arena);
     try buf.appendSlice("plan (actuals, exclusive time)\n");
@@ -985,11 +875,8 @@ fn unionBranchesAreReads(u: ast.Union) bool {
     return true;
 }
 
-/// Split-parallel union: expand each branch into a `read | select(reconcile) |
-/// <downstream maps> | write` pipeline and run it through runOutput, which
-/// split-reads the single branch source into key-range lanes. Branches share the
-/// sink — the first keeps the write mode (so `overwrite` truncates once), later
-/// branches append/upsert into it.
+/// Split-parallel union: each branch runs as its own split pipeline into the shared
+/// sink; the first keeps the write mode (so `overwrite` truncates once), later ones append.
 fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: []const ast.Stage, write_stage: ast.Stage, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     const arena = env.arena;
     const tag_col = forHintIdent(hints, "tag");
@@ -1000,8 +887,6 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
     const except = unionExceptNames(downstream);
     const schemas = try arena.alloc(types.Schema, specs.len);
     for (specs, schemas) |*s, *sch| {
-        // The shape only: no rows are wanted here, and with an EXCEPT in play the
-        // branch is then asked for every column but those, by name.
         if (except.len > 0) {
             if (try exceptColumns(env, s.read, hints, except)) |cols| s.read.cols = cols;
         }
@@ -1034,9 +919,9 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
     }
 }
 
+/// A LET named on the command line is an error, not ignored. A default takes the
+/// declared type: `PARAM d DATE DEFAULT '2026-01-01'` is a DATE.
 fn resolveParams(arena: std.mem.Allocator, program: ast.Program, cli: []const ParamArg, params: *std.StringHashMap(Value), diag: *Diag) !void {
-    // A LET is sealed: it is computed by the script, never bound from outside.
-    // Naming one on the command line is a mistake worth reporting, not ignoring.
     for (cli) |kv| {
         for (program.stmts) |s| {
             if (s != .let_const) continue;
@@ -1057,8 +942,6 @@ fn resolveParams(arena: std.mem.Allocator, program: ast.Program, cli: []const Pa
         }
         if (v == null) {
             if (p.default) |d| {
-                // the declared type, as a bound value gets it: `PARAM d DATE
-                // DEFAULT '2026-01-01'` is a DATE, not the text of one
                 const raw = try constEvalDefault(d, diag);
                 v = switch (p.ty.kind) {
                     .date, .time, .timestamp, .decimal => if (raw == .null) raw else eval.castValueTyped(arena, raw, p.ty) catch
@@ -1073,12 +956,9 @@ fn resolveParams(arena: std.mem.Allocator, program: ast.Program, cli: []const Pa
     }
 }
 
-/// Fold every statement-level `LET name = <expr>;` into a plan-time constant, in
-/// declaration order, and register it under the same two maps a PARAM uses — so
-/// `$name` substitutes through the ordinary machinery and every pipeline in the
-/// script sees one identical value. Each expression is evaluated with the params
-/// and the earlier LETs in scope; a LET is never bound from outside, so this is
-/// the only place its value is decided.
+/// Fold every statement-level expression `LET` into a constant, in declaration order,
+/// with params and earlier LETs in scope, registered as a PARAM is. A LET is never
+/// bound from outside, so this is the only place its value is decided.
 fn resolveLets(
     arena: std.mem.Allocator,
     program: ast.Program,
@@ -1104,9 +984,6 @@ fn resolveLets(
         if (params.contains(l.name))
             return planErr(diag, try std.fmt.allocPrint(arena, "duplicate LET `{s}`", .{l.name}));
 
-        // A query LET has no expression to fold here — its value comes from
-        // running the query, which happens in statement order in the main loop
-        // (`runScalarLet`), after the bindings it may reference exist.
         const le = l.expr orelse continue;
         const v = eval.constEval(arena, le, names.items, values.items) catch |e|
             return planErr(diag, try std.fmt.allocPrint(arena, "LET `{s}`: {s}", .{ l.name, @errorName(e) }));
@@ -1117,15 +994,14 @@ fn resolveLets(
     }
 }
 
+/// Typed text is read as a CAST reads it: `-p d=2026-02-01` binds what
+/// `CAST('2026-02-01' AS DATE)` would, and a decimal rounds as a cast does.
 fn parseParamValue(arena: std.mem.Allocator, ty: types.Type, str: []const u8, diag: *Diag) !Value {
     return switch (ty.kind) {
         .int => .{ .int = std.fmt.parseInt(i64, str, 10) catch return planErr(diag, "invalid integer param value") },
         .float => .{ .float = std.fmt.parseFloat(f64, str) catch return planErr(diag, "invalid float param value") },
         .string => .{ .string = try arena.dupe(u8, str) },
         .bool => if (std.mem.eql(u8, str, "true")) Value{ .bool = true } else if (std.mem.eql(u8, str, "false")) Value{ .bool = false } else planErr(diag, "invalid bool param value"),
-        // The text a CAST takes, read as a CAST reads it — so `-p d=2026-02-01`
-        // binds exactly what `CAST('2026-02-01' AS DATE)` would, a date alone
-        // reaches a TIMESTAMP as its midnight, and a decimal rounds as a cast does.
         .date, .time, .timestamp, .decimal => eval.castValueTyped(arena, .{ .string = str }, ty) catch
             planErr(diag, try std.fmt.allocPrint(arena, "invalid {s} param value `{s}` — expected {s}", .{ try ty.name(arena), str, switch (ty.kind) {
                 .date => "YYYY-MM-DD",
@@ -1163,23 +1039,20 @@ const describe_fields = [_]types.Schema.Field{
     .{ .name = "nullable", .ty = types.Type.init(.string) },
 };
 
-/// The rows `DESCRIBE` prints for `schema`, as CSV text (no header): one per
-/// column, its engine type spelled the way `EXPLAIN` spells it, `yes`/`no`.
+/// The rows `DESCRIBE` prints for `schema`, as CSV text (no header). The type is
+/// quoted like the name, or `decimal(p,s)`'s comma would shift its scale a column.
 pub fn describeRows(arena: std.mem.Allocator, schema: types.Schema) ![]const u8 {
     var text = std.array_list.Managed(u8).init(arena);
     for (schema.fields) |f| {
         try csv.writeField(text.writer(), f.name, ',');
         try text.append(',');
-        // `decimal(p,s)` holds the delimiter: quoted like the name, or its scale
-        // lands in the `nullable` column.
         try csv.writeField(text.writer(), try f.ty.name(arena), ',');
         try text.writer().print(",{s}\n", .{if (f.ty.nullable) "yes" else "no"});
     }
     return text.toOwnedSlice();
 }
 
-/// `DESCRIBE`: open the source for its schema alone — the engine's types, which
-/// are what a sink would receive — and print one row per column through the
+/// Open the source for its schema alone and print one row per column through the
 /// ordinary stdout sink, so `--format json|csv` shape it like any result.
 fn runDescribe(env: *Env, pipe: ast.Pipeline, stats: *Stats) anyerror!void {
     errdefer env.diag.stamp(pipe.pos);
@@ -1207,9 +1080,8 @@ fn runDescribe(env: *Env, pipe: ast.Pipeline, stats: *Stats) anyerror!void {
     stats.rows_out += batch.len;
 }
 
-/// Does the script have more than one `LOAD` to report — several statements, or
-/// anything (`FOR EACH`, `CASE`, `CALL`) that can run one more than once? A lone
-/// `LOAD` is summed up by the closing sentence and needs no item line.
+/// More than one `LOAD` to report: several statements, or a `FOR EACH`, `CASE` or
+/// `CALL` that can run one repeatedly. A lone `LOAD` needs no item line.
 fn manyLoads(stmts: []const ast.Stmt) bool {
     var n: usize = 0;
     for (stmts) |s| switch (s) {
@@ -1222,11 +1094,9 @@ fn manyLoads(stmts: []const ast.Stmt) bool {
 
 const LoadFacts = struct { rows: u64, rows_read: u64, elapsed_ms: u64, lanes: usize };
 
-/// Count a finished `LOAD`, report it when the run is showing item lines, and
-/// hand it to the caller's `on_load`.
+/// A ^C is not a failed load: the run says `aborted` itself.
 fn noteLoad(env: *Env, pos: ?ast.Pos, err: ?anyerror, f: LoadFacts) void {
     const failed = err != null;
-    // A ^C is not a failed load; the run is about to say `aborted` itself.
     if (failed and aborting()) return;
     if (env.loads) |t| {
         _ = (if (failed) &t.failed else &t.ok).fetchAdd(1, .monotonic);
@@ -1266,14 +1136,12 @@ fn noteLoad(env: *Env, pos: ?ast.Pos, err: ?anyerror, f: LoadFacts) void {
     env.log.item(.{ .target = env.last_target, .rows = f.rows, .elapsed_ms = f.elapsed_ms });
 }
 
-/// The write target as the script spelled it: a path, or `conn.table`.
 fn targetLabel(arena: std.mem.Allocator, w: ast.Write) ![]const u8 {
     if (std.mem.eql(u8, w.connector, "csv") or w.target.len == 0) return w.target;
     return std.fmt.allocPrint(arena, "{s}.{s}", .{ w.connector, w.target });
 }
 
-/// `source → sink` for the progress line: the table, path or binding being read,
-/// and the target being written, each as the script spelled it.
+/// `source → sink` for the progress line, each as the script spelled it.
 fn moveLabel(arena: std.mem.Allocator, first: ast.Stage, w: ast.Write) ![]const u8 {
     const src: []const u8 = switch (first.node) {
         .read => |rd| switch (rd.form) {
@@ -1300,13 +1168,9 @@ fn hasSort(stages: []const ast.Stage) bool {
     return false;
 }
 
-/// Run one row of a `for` body. The body is a statement block (a bare pipeline is a
-/// one-statement block): each pipeline is rendered with the row's `${var}` values and
-/// executed; a `match` branches on the loop variables and runs the winning arm.
+/// Run one row of a `for` body: each pipeline is rendered with the row's `${var}`
+/// values; a nested loop's source is rendered with the outer row and chains to it.
 pub fn runForBody(env: *Env, body: []const ast.Stmt, lr: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
-    // A body's `WITH`/derived table is scoped to the body: whatever the name meant
-    // outside comes back once the row is done, so the next row (or the top level)
-    // never reads a stale per-row pipeline.
     var saved = std.array_list.Managed(struct { name: []const u8, prev: ?ast.Pipeline }).init(env.arena);
     for (body) |st| if (st == .binding) try saved.append(.{ .name = st.binding.name, .prev = env.bindings.get(st.binding.name) });
     defer {
@@ -1334,11 +1198,7 @@ fn runForStmt(env: *Env, s: *const ast.Stmt, lr: LoopRow, opts: RunOptions, stat
         .print => |p| try runPrint(env, p, lr),
         .call => |c| try runCall(env, c, lr, opts, stats, lanes_used, batch_arena, runForBody),
         .throw => |t| try runThrow(env, t, lr),
-        // A `WITH`/derived table inside a body is rendered with the row like the
-        // pipeline that reads it, so a per-row reconciliation can join.
         .binding => |b| try env.bindings.put(b.name, try renderPipeline(env.arena, b.pipeline, lr)),
-        // A nested loop: its discovery source is rendered with the outer row, and
-        // every inner row chains to it so `${outer}` still resolves in the body.
         .for_each => |fe| try runForEach(env, try renderForSource(env.arena, fe, lr), opts, stats, lanes_used, batch_arena, runForBody, &lr),
         .let_const => |l| {
             env.diag.stamp(l.pos);
@@ -1348,10 +1208,8 @@ fn runForStmt(env: *Env, s: *const ast.Stmt, lr: LoopRow, opts: RunOptions, stat
     }
 }
 
-/// A `match` evaluated per row of a `for`: the loop variables are bound (shadowing
-/// same-named params), so a guard like `pk == ""` picks a branch. Untyped variables
-/// bind as strings; a `name:type` annotation binds the coerced value, so a guard like
-/// `port >= 1000` compares numerically rather than lexically.
+/// The loop variables are bound over same-named params. Untyped ones bind as strings;
+/// a `name:type` one binds the coerced value, so `port >= 1000` compares numerically.
 fn runForMatch(env: *Env, m: ast.StmtMatch, lr: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     var names = std.array_list.Managed([]const u8).init(env.arena);
     var values = std.array_list.Managed(Value).init(env.arena);

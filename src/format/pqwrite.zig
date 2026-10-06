@@ -1,20 +1,38 @@
-//! Parquet writer: PLAIN-encoded pages, one data page per column chunk, one
-//! chunk per row group.
+//! Parquet writer: PLAIN-encoded pages (or a dictionary page plus RLE indices for
+//! byte-array columns), one column chunk per column per row group.
 //!
-//! Every column is written OPTIONAL, so every page carries definition levels —
-//! uniform and always correct, at the cost of one bit per row for columns that
-//! happen to have no nulls.
+//! Nullable columns are written OPTIONAL with definition levels; REQUIRED columns
+//! carry none. Rows accumulate until `group_rows`, then a row group is flushed.
+//! That bounds memory to roughly one row group, the closest a Parquet writer gets
+//! to streaming: a chunk's size and offset must be known before its metadata, and
+//! the footer indexes every row group, so a file cannot be appended to.
+//! Everything that matters only until the group is written (sealed pages,
+//! compressed bodies, dictionary strings, statistics) lives in `scratch` and is
+//! reset after each flush; on the plan arena a 10M-row write held 1.4 GB.
+//! Statistics values are copied there because an incoming `Value` borrows from
+//! the batch arena, which is recycled long before the group flushes.
 //!
-//! Rows accumulate until `row_group_rows`, then a row group is flushed and the
-//! buffers are reset. That bounds memory to roughly one row group rather than
-//! the whole file, which is the closest a Parquet writer can get to streaming:
-//! the format needs a chunk's full size and offset before its metadata can be
-//! written, and the footer needs every row group.
+//! Pages of one chunk must land contiguously, so they are held until the flush.
+//! A dictionary is per chunk and emitted whole; a column gives it up once it
+//! exceeds `dict_max_entries`. Both chunk size totals include page headers, per
+//! ColumnMetaData's "including the headers": without them a reader that bounds a
+//! chunk by `total_compressed_size` (Arrow-based ones do) found the last page short.
 //!
-//! Output is strictly forward — every byte goes through `emit`, which tracks the
-//! running offset itself and never seeks — so the destination only has to be a
-//! `*std.Io.Writer`. That is what lets the same writer target a local file or an
-//! Azure block blob, and what a future S3/GCS sink would plug into.
+//! Output is strictly forward: every byte goes through `emit`, which tracks the
+//! running offset and never seeks, so the destination is any `*std.Io.Writer`, a
+//! local file or a staged object upload. Committing the upload happens only after
+//! the footer, so a reader never sees a Parquet object without one; an aborted
+//! run leaves either a footerless (unreadable) file or no object at all.
+//!
+//! Decimals take the physical type their precision calls for, as the spec
+//! prescribes: INT32 to 9 digits, INT64 to 18, FIXED_LEN_BYTE_ARRAY to the 38-digit
+//! i128 ceiling. Everything used to be INT64, so a `numeric(38,18)` could not hold
+//! its own values. Scale above precision is refused, as Spark and Arrow do.
+//! Timestamps are written with `isAdjustedToUTC` false: basalt has no timezone
+//! concept, and claiming UTC would make readers shift every displayed time.
+//!
+//! In a parallel run each ordered unit is encoded to row groups on the lane that
+//! read it (`UnitEnc`, `openEncoder`), and `appendEncoded` places them in order.
 
 const std = @import("std");
 const parquet = @import("parquet.zig");
@@ -36,33 +54,20 @@ const List = std.array_list.Managed;
 
 pub const Error = error{
     UnsupportedParquetWrite,
-    /// A parquet file cannot be extended: the footer indexes every row group and
-    /// is written last, so adding rows means rewriting the file.
     AppendNotSupported,
-    /// A DECIMAL column this writer cannot store: scale above precision (which
-    /// no reader accepts), or a value too wide for the column's own precision —
-    /// 38 digits being the ceiling, since the unscaled value is an i128.
     UnsupportedParquetDecimal,
 } || std.mem.Allocator.Error || codec.Error;
 
-/// Rows buffered before a row group is flushed.
 pub const row_group_rows = 100_000;
 
-/// Target uncompressed size of one data page. Splitting a chunk into pages of
-/// roughly this size lets a reader skip and buffer page-by-page instead of
-/// materialising a whole column chunk.
 pub const page_target_bytes = 1 << 20;
 
-/// How a basalt column is stored in Parquet.
 const Mapping = struct {
     phys: parquet.PhysicalType,
     converted: ?i32 = null,
     precision: ?i32 = null,
     scale: ?i32 = null,
-    /// Byte width of a FIXED_LEN_BYTE_ARRAY column (schema field 2).
     type_length: ?i32 = null,
-    /// REQUIRED columns carry no definition levels at all, which is both smaller
-    /// and truer to the source schema than marking everything OPTIONAL.
     optional: bool = true,
 };
 
@@ -82,16 +87,8 @@ fn mapType(t: types.Type) Error!Mapping {
         .date => .{ .phys = .int32, .converted = conv_date },
         .time => .{ .phys = .int64, .converted = conv_time_micros },
         .timestamp => .{ .phys = .int64, .converted = conv_timestamp_micros },
-        // The physical type follows the real precision, as the spec prescribes:
-        // INT32 to 9 digits, INT64 to 18, FIXED_LEN_BYTE_ARRAY beyond. Storing
-        // everything as INT64 meant a `numeric(38,18)` could not hold its own
-        // values — `12.5` restated to scale 18 is 1.25e19, past i64.
         .decimal => blk: {
-            // 38 digits is the engine's ceiling too: the unscaled value is an
-            // i128. Postgres allows more, and clamping is what its driver does.
             const p: i32 = @max(1, @min(38, @as(i32, t.precision)));
-            // scale > precision is not a representable DECIMAL — Spark and
-            // Arrow both reject the schema.
             const s: i32 = @as(i32, t.scale);
             if (s > p) return Error.UnsupportedParquetDecimal;
             if (p <= 9) break :blk .{ .phys = .int32, .converted = conv_decimal, .precision = p, .scale = s };
@@ -102,55 +99,39 @@ fn mapType(t: types.Type) Error!Mapping {
     };
 }
 
-/// Narrowest two's-complement byte width that holds every `p`-digit decimal —
-/// the width readers expect for a FIXED_LEN_BYTE_ARRAY DECIMAL. 16 at p = 38.
+/// Narrowest two's-complement byte width that holds every `p`-digit decimal;
+/// 16 at p = 38.
 fn flbaLen(p: i32) i32 {
-    var limit: i128 = 1; // 10^p
+    var limit: i128 = 1;
     var k: i32 = 0;
     while (k < p) : (k += 1) limit *= 10;
     var n: i32 = 1;
     while (n < 16) : (n += 1) {
-        const span: i128 = @as(i128, 1) << @intCast(8 * n - 1); // 2^(8n-1)
+        const span: i128 = @as(i128, 1) << @intCast(8 * n - 1);
         if (span >= limit) return n;
     }
     return 16;
 }
 
-/// Distinct values a column may hold before dictionary encoding is abandoned.
-/// Past this the dictionary stops paying for itself and the indices get wide.
 pub const dict_max_entries = 1 << 15;
 
-/// A page whose rows are complete, waiting to be written at row-group flush.
-/// Pages of one chunk must land contiguously in the file, so they cannot be
-/// emitted as they fill — they are held until the group is flushed.
 const PendingPage = struct {
     defs: []const u8,
     values: []const u8,
     rows: usize,
 };
 
-/// Per-column accumulation for the row group being built.
 const ColBuf = struct {
     values: List(u8),
     pages: List(PendingPage),
-    /// One entry per row: 1 present, 0 null. Packed at flush time.
     defs: List(u8),
-    /// BOOLEAN values are bit-packed, so they need their own accumulator.
     bit_buf: u8 = 0,
     bit_n: u3 = 0,
-    /// Column statistics for this row group. Readers use these to skip whole
-    /// row groups without decoding them, so emitting them is what makes a
-    /// basalt-written file efficient for *other* engines.
     nulls: i64 = 0,
     min: ?Value = null,
     max: ?Value = null,
-    /// Dictionary state for BYTE_ARRAY columns. Strings repeat far more often
-    /// than they do not, and PLAIN stores every copy in full; a dictionary page
-    /// plus RLE indices is what closes the size gap with other writers.
     dict: std.StringHashMap(u32),
     dict_order: List([]const u8),
-    /// One index per non-null row, or abandoned once the column proves to have
-    /// too many distinct values.
     dict_idx: List(u32),
     dict_ok: bool = false,
 
@@ -165,8 +146,6 @@ const ColBuf = struct {
         };
     }
 
-    /// Seals the in-progress page. Definition levels are packed now, while the
-    /// row set is known.
     fn sealPage(self: *ColBuf, arena: std.mem.Allocator, optional: bool) !void {
         if (self.defs.items.len == 0) return;
         try self.flushBits();
@@ -218,12 +197,6 @@ const ColBuf = struct {
         return true;
     }
 
-    /// Statistics are per row group, so they track only values since the last
-    /// flush.
-    ///
-    /// String and byte values must be copied: the incoming `Value` borrows from
-    /// the *batch* arena, which is recycled long before the row group flushes.
-    /// Keeping the borrowed slice reads freed memory at flush time.
     fn observe(self: *ColBuf, arena: std.mem.Allocator, v: Value) !void {
         if (self.min == null or order(v, self.min.?) == .lt) self.min = try own(arena, v);
         if (self.max == null or order(v, self.max.?) == .gt) self.max = try own(arena, v);
@@ -251,7 +224,6 @@ fn ownOpt(arena: std.mem.Allocator, v: ?Value) !?Value {
     return if (v) |x| try own(arena, x) else null;
 }
 
-/// Copies any value that borrows memory, so it can outlive the batch it came from.
 fn own(arena: std.mem.Allocator, v: Value) !Value {
     return switch (v) {
         .string => |x| .{ .string = try arena.dupe(u8, x) },
@@ -262,7 +234,6 @@ fn own(arena: std.mem.Allocator, v: Value) !Value {
 
 const ChunkMeta = struct {
     offset: i64,
-    /// Offset of the dictionary page, when the chunk is dictionary-encoded.
     dict_offset: i64 = 0,
     dict: bool = false,
     num_values: i64,
@@ -273,8 +244,8 @@ const ChunkMeta = struct {
     max: ?Value = null,
 };
 
-/// Ordering used for min/max statistics. Only the shapes basalt writes need to
-/// be comparable; mixed kinds cannot occur within one column.
+/// Ordering for min/max statistics. Decimals compare as numbers, not mantissas:
+/// per-value scales once ranked `0.5` above `0.10`, wrote min > max, and readers pruned real rows.
 fn order(a: Value, b: Value) std.math.Order {
     return switch (a) {
         .int => std.math.order(a.int, switch (b) {
@@ -297,10 +268,6 @@ fn order(a: Value, b: Value) std.math.Order {
             .timestamp => |x| x,
             else => a.timestamp,
         }),
-        // Compare the NUMBER, not the mantissa: a source sends a per-value scale
-        // (postgres NUMERIC dscale), so `0.5` (unscaled 5) and `0.10` (unscaled
-        // 10) ranked backwards and this wrote min > max into the row group's
-        // statistics. Readers then pruned the group and dropped real rows.
         .decimal => eval.compareValues(a, b) orelse .eq,
         .bool => std.math.order(@intFromBool(a.bool), switch (b) {
             .bool => |x| @intFromBool(x),
@@ -325,21 +292,12 @@ const RowGroupMeta = struct {
     total_byte_size: i64,
 };
 
-/// Bytes buffered before the local-file destination drains. Pages arrive as
-/// single large slices; this mostly amortizes the small footer/length/magic
-/// emits at the end of a file.
 const WRITE_BUF = 64 * 1024;
 
-/// The IANA-registered media type for Parquet.
 const parquet_content_type = "application/vnd.apache.parquet";
 
 pub const Writer = struct {
-    /// Lives as long as the plan: the footer's per-group metadata goes here.
     arena: std.mem.Allocator,
-    /// Everything that only matters until the row group is written — sealed
-    /// pages, compressed bodies, dictionary strings, statistics candidates —
-    /// reset after each flush. On the plan arena, a 10M-row write held 1.4 GB
-    /// where a row group needs a few MB.
     scratch: std.heap.ArenaAllocator,
     scratch_live: bool = true,
     backend: Backend,
@@ -353,17 +311,11 @@ pub const Writer = struct {
     total_rows: i64 = 0,
     offset: i64 = 0,
     groups: List(RowGroupMeta),
-    /// Rows per row group. A unit encoder takes a larger cap: its group is one
-    /// unit's worth of rows, already bounded by the unit.
     group_rows: usize = row_group_rows,
 
-    /// A local file, or an object staged over HTTP. Both expose a plain
-    /// `*std.Io.Writer`, so page and footer emission below is identical either
-    /// way — mirrors `csv.CsvWriter.Backend`.
     const Backend = union(enum) {
         file: std.fs.File,
         object: objstore.Writer,
-        /// A unit encoder's row groups, before `appendEncoded` places them.
         memory: *std.Io.Writer.Allocating,
     };
 
@@ -379,10 +331,9 @@ pub const Writer = struct {
         return std.mem.endsWith(u8, path, ".parquet");
     }
 
-    /// `mode` only ever arrives as `.truncate`: the plan layer turns an `APPEND`
-    /// onto a parquet target into an error before opening anything. The check is
-    /// repeated here so a future caller that forgets it fails loudly instead of
-    /// truncating the file it meant to extend.
+    /// `.append` is refused here as well as in the plan layer, so a caller that
+    /// forgets the check fails loudly instead of truncating the file. An object
+    /// URL must never reach the filesystem: `az://` once became a local `az:` dir.
     pub fn open(
         arena: std.mem.Allocator,
         path: []const u8,
@@ -401,8 +352,6 @@ pub const Writer = struct {
         const cols = try arena.alloc(ColBuf, schema.fields.len);
         for (cols, maps) |*c, m| {
             c.* = ColBuf.init(arena);
-            // only variable-length values gain from a dictionary; fixed-width
-            // types are already as small as the index would be
             c.dict_ok = m.phys == .byte_array;
         }
 
@@ -471,8 +420,6 @@ pub const Writer = struct {
                 try encodePlain(cb, m, v);
             }
             for (self.cols, self.maps) |*cb, m| {
-                // a dictionary is per chunk, so its indices are emitted as one
-                // page at flush; splitting only applies to PLAIN columns
                 if (cb.dict_ok) continue;
                 if (cb.values.items.len >= page_target_bytes) try cb.sealPage(sa, m.optional);
             }
@@ -482,7 +429,6 @@ pub const Writer = struct {
         }
     }
 
-    /// Writes one page per column, then records the row group's metadata.
     fn flushRowGroup(self: *Writer) !void {
         if (self.rows == 0) return;
         const chunks = try self.arena.alloc(ChunkMeta, self.cols.len);
@@ -490,8 +436,6 @@ pub const Writer = struct {
         var group_bytes: i64 = 0;
 
         for (self.cols, chunks, self.maps) |*cb, *cm, m| {
-            // A dictionary-encoded chunk is emitted whole: a dictionary page
-            // followed by one data page of RLE indices.
             const use_dict = cb.dict_ok and cb.dict_order.items.len > 0 and
                 cb.dict_order.items.len * 2 < cb.dict_idx.items.len;
             if (use_dict) {
@@ -508,8 +452,6 @@ pub const Writer = struct {
             var compressed: i64 = 0;
 
             for (cb.pages.items) |pgm| {
-                // page body: [4-byte level length][RLE def levels][values],
-                // with the level section omitted for REQUIRED columns
                 var body = List(u8).init(sa);
                 if (m.optional) {
                     var len4: [4]u8 = undefined;
@@ -527,11 +469,6 @@ pub const Writer = struct {
                 try self.emit(packed_body);
 
                 values += @intCast(pgm.rows);
-                // Both totals count the page headers, per ColumnMetaData's
-                // "including the headers". A reader that bounds the chunk by
-                // total_compressed_size stops one header short of the last page
-                // otherwise — a truncated-page error in Arrow-based readers, and
-                // silently fine in ones that just walk headers to the row count.
                 uncompressed += @intCast(hdr.items.len + raw.len);
                 compressed += @intCast(hdr.items.len + packed_body.len);
             }
@@ -558,14 +495,12 @@ pub const Writer = struct {
         _ = self.scratch.reset(.retain_capacity);
     }
 
-    /// Writes a dictionary page followed by an RLE_DICTIONARY data page.
     fn writeDictChunk(self: *Writer, cb: *ColBuf, m: Mapping) !ChunkMeta {
         const sa = self.scratch.allocator();
         const start = self.offset;
         var uncompressed: i64 = 0;
         var compressed: i64 = 0;
 
-        // dictionary page: the distinct values, PLAIN-encoded in index order
         var dict_body = List(u8).init(sa);
         for (cb.dict_order.items) |v| {
             var len4: [4]u8 = undefined;
@@ -578,14 +513,11 @@ pub const Writer = struct {
         try writeDictPageHeader(&dhdr, dict_body.items.len, dict_packed.len, cb.dict_order.items.len, std.hash.Crc32.hash(dict_packed));
         try self.emit(dhdr.items);
         try self.emit(dict_packed);
-        // Headers included — see the note in flushRowGroup. A dictionary chunk
-        // carries two of them, so it is short by twice as much when they are not.
         uncompressed += @intCast(dhdr.items.len + dict_body.items.len);
         compressed += @intCast(dhdr.items.len + dict_packed.len);
 
         const data_start = self.offset;
 
-        // data page: [levels][bit width][RLE indices]
         var body = List(u8).init(sa);
         if (m.optional) {
             const levels = try packLevels(sa, cb.defs.items);
@@ -640,11 +572,7 @@ pub const Writer = struct {
                 };
                 f.close();
             },
-            // Committing the staged upload is what publishes the object, and it
-            // happens only once the footer is written — so a reader never observes
-            // a Parquet object without one. Atomic publication, for free.
             .object => |o| o.finish() catch |e| return self.specific(e),
-            // an encoder's bytes are placed by `appendEncoded`, never closed
             .memory => {},
         }
     }
@@ -656,17 +584,10 @@ pub const Writer = struct {
         self.scratch_live = false;
     }
 
-    /// A partial Parquet file has no footer and is unreadable, which is the
-    /// correct outcome for an aborted run — there is nothing to roll back. A blob
-    /// is stronger: skipping the block-list commit means the object never appears
-    /// at all, and Azure discards the staged blocks after a week.
     pub fn abort(self: *Writer) void {
         self.freeScratch();
         switch (self.backend) {
             .file => |f| f.close(),
-            // Staged blocks and an uncompleted multipart upload are invisible to
-            // readers. Azure reaps them after a week; S3 only where the bucket has
-            // a lifecycle rule. An SFTP `.part` is removed.
             .object => |o| o.abort(),
             .memory => {},
         }
@@ -675,8 +596,7 @@ pub const Writer = struct {
     fn writeFileMetaData(self: *Writer, out: *List(u8)) !void {
         var w = thrift.Writer.init(out);
         try w.structBegin();
-        try w.writeI32(1, 1); // version
-        // schema: a root group followed by one leaf per column, depth-first
+        try w.writeI32(1, 1);
         try w.listBegin(2, .@"struct", self.schema.fields.len + 1);
         try writeSchemaRoot(&w, self.schema.fields.len);
         for (self.schema.fields, self.maps) |f, m| try writeSchemaLeaf(&w, f.name, m);
@@ -693,8 +613,8 @@ pub const Writer = struct {
         try w.listBegin(1, .@"struct", g.chunks.len);
         for (g.chunks, self.schema.fields, self.maps) |c, f, m| {
             try w.structBegin();
-            try w.writeI64(2, c.offset); // file_offset
-            try w.fieldBegin(.@"struct", 3); // meta_data
+            try w.writeI64(2, c.offset);
+            try w.fieldBegin(.@"struct", 3);
             try w.structBegin();
             try w.writeI32(1, @intFromEnum(m.phys));
             try w.listBegin(2, .i32, 1);
@@ -706,8 +626,8 @@ pub const Writer = struct {
             try w.writeI64(5, c.num_values);
             try w.writeI64(6, c.uncompressed);
             try w.writeI64(7, c.compressed);
-            try w.writeI64(9, c.offset); // data_page_offset
-            if (c.dict) try w.writeI64(11, c.dict_offset); // dictionary_page_offset
+            try w.writeI64(9, c.offset);
+            if (c.dict) try w.writeI64(11, c.dict_offset);
             try writeStatistics(w, self.arena, m, c);
             try w.structEnd();
             try w.structEnd();
@@ -721,9 +641,6 @@ pub const Writer = struct {
         return .{ .ptr = self, .vtable = &sink_vtable };
     }
 
-    /// A writer into memory for one unit of a parallel run: the same schema and
-    /// encoding, no magic, offsets from zero. `appendEncoded` moves its row groups
-    /// into this one.
     fn openEncoder(self: *Writer, arena: std.mem.Allocator) !*Writer {
         const cols = try arena.alloc(ColBuf, self.cols.len);
         for (cols, self.maps) |*c, m| {
@@ -768,18 +685,10 @@ pub const Writer = struct {
     }
 };
 
-/// A unit encoder's cap per row group. Units are a few MB of input or one source
-/// row group, so this is rarely reached; it bounds a unit that is not.
 const unit_group_rows = 4 * row_group_rows;
 
-/// Below this many rows a unit is not worth a row group of its own: a selective
-/// filter would leave the file a string of tiny groups. Its rows are handed to the
-/// writer instead, which gathers them with the next into full-size groups.
 const unit_min_rows = row_group_rows / 2;
 
-/// One ordered unit's rows, encoded to row groups on the lane that read them.
-/// Encoding and compression were the whole cost of a parallel load into parquet,
-/// and they ran on whichever lane held the writer, one row group at a time.
 const UnitEnc = struct {
     parent: *Writer,
     arena: std.mem.Allocator,
@@ -837,28 +746,24 @@ const UnitEnc = struct {
     };
 };
 
-/// `Statistics` (ColumnMetaData field 12). Writes the modern `min_value` and
-/// `max_value` fields plus `null_count`; the legacy `min`/`max` are deliberately
-/// omitted, since their signedness rules for byte arrays were never consistent
-/// and readers prefer the newer pair.
+/// `Statistics` (ColumnMetaData field 12): `min_value`/`max_value` and `null_count`;
+/// legacy `min`/`max` are omitted. parquet.thrift puts max before min in both
+/// pairs (fields 5 and 6); swapping them inverts every reader's row-group filter.
 fn writeStatistics(w: *thrift.Writer, arena: std.mem.Allocator, m: Mapping, c: ChunkMeta) !void {
     try w.fieldBegin(.@"struct", 12);
     try w.structBegin();
-    try w.writeI64(3, c.nulls); // null_count
-    // parquet.thrift orders Statistics as max(1), min(2), ..., max_value(5),
-    // min_value(6) — max comes *before* min in both pairs. Writing them the
-    // intuitive way round silently inverts every reader's row-group filter.
+    try w.writeI64(3, c.nulls);
     if (c.max) |mx| {
-        if (try statBytes(arena, m, mx)) |b| try w.writeBinary(5, b); // max_value
+        if (try statBytes(arena, m, mx)) |b| try w.writeBinary(5, b);
     }
     if (c.min) |mn| {
-        if (try statBytes(arena, m, mn)) |b| try w.writeBinary(6, b); // min_value
+        if (try statBytes(arena, m, mn)) |b| try w.writeBinary(6, b);
     }
     try w.structEnd();
 }
 
-/// Statistics values are PLAIN-encoded, but *without* the length prefix that a
-/// byte-array page would carry — the thrift binary field already carries it.
+/// PLAIN-encoded, but without the length prefix a byte-array page carries,
+/// since the thrift binary field already has one.
 fn statBytes(arena: std.mem.Allocator, m: Mapping, v: Value) !?[]const u8 {
     switch (m.phys) {
         .boolean => {
@@ -889,9 +794,6 @@ fn statBytes(arena: std.mem.Allocator, m: Mapping, v: Value) !?[]const u8 {
             std.mem.writeInt(i64, b[0..8], x, .little);
             return b;
         },
-        // Decimal FLBA statistics are compared as signed decimals, which is the
-        // order `observe` already tracked them in, so the same big-endian
-        // encoding the pages use is what belongs here.
         .fixed_len_byte_array => {
             const len: usize = @intCast(m.type_length orelse return null);
             const x: i128 = switch (v) {
@@ -942,26 +844,24 @@ fn writeSchemaLeaf(w: *thrift.Writer, name: []const u8, m: Mapping) !void {
     try w.structEnd();
 }
 
-/// `LogicalType` (SchemaElement field 10), the modern annotation that
-/// supersedes ConvertedType. It carries what ConvertedType cannot — a
-/// timestamp's unit and whether it is UTC-adjusted — and newer readers prefer
-/// it. Both are emitted so old and new readers agree.
+/// `LogicalType` (SchemaElement field 10), emitted beside ConvertedType so old and
+/// new readers agree; it alone carries a timestamp's unit and UTC flag.
 fn writeLogicalType(w: *thrift.Writer, m: Mapping) !void {
     const c = m.converted orelse return;
     try w.fieldBegin(.@"struct", 10);
     try w.structBegin();
     switch (c) {
-        conv_utf8 => try emptyVariant(w, 1), // STRING
+        conv_utf8 => try emptyVariant(w, 1),
         conv_decimal => {
-            try w.fieldBegin(.@"struct", 5); // DECIMAL
+            try w.fieldBegin(.@"struct", 5);
             try w.structBegin();
             try w.writeI32(1, m.scale orelse 0);
             try w.writeI32(2, m.precision orelse 18);
             try w.structEnd();
         },
-        conv_date => try emptyVariant(w, 6), // DATE
-        conv_time_micros => try timeVariant(w, 7), // TIME
-        conv_timestamp_micros => try timeVariant(w, 8), // TIMESTAMP
+        conv_date => try emptyVariant(w, 6),
+        conv_time_micros => try timeVariant(w, 7),
+        conv_timestamp_micros => try timeVariant(w, 8),
         else => {},
     }
     try w.structEnd();
@@ -973,19 +873,13 @@ fn emptyVariant(w: *thrift.Writer, id: i16) !void {
     try w.structEnd();
 }
 
-/// TIME and TIMESTAMP both carry `isAdjustedToUTC` and a unit.
-///
-/// `isAdjustedToUTC` is false: basalt has no timezone concept, so its
-/// timestamps are wall-clock values. Claiming UTC would make readers treat them
-/// as instants and re-render them in the viewer's zone, shifting every
-/// displayed time.
 fn timeVariant(w: *thrift.Writer, id: i16) !void {
     try w.fieldBegin(.@"struct", id);
     try w.structBegin();
-    try w.writeBool(1, false); // isAdjustedToUTC
-    try w.fieldBegin(.@"struct", 2); // TimeUnit
+    try w.writeBool(1, false);
+    try w.fieldBegin(.@"struct", 2);
     try w.structBegin();
-    try emptyVariant(w, 2); // MICROS
+    try emptyVariant(w, 2);
     try w.structEnd();
     try w.structEnd();
 }
@@ -1002,24 +896,22 @@ fn writePageHeader(
     try w.writeI32(1, @intFromEnum(parquet.PageType.data_page));
     try w.writeI32(2, @intCast(uncompressed));
     try w.writeI32(3, @intCast(compressed));
-    // CRC32 of the compressed page data, so a reader can detect corruption
     try w.writeI32(4, @bitCast(crc));
-    try w.fieldBegin(.@"struct", 5); // data_page_header
+    try w.fieldBegin(.@"struct", 5);
     try w.structBegin();
     try w.writeI32(1, @intCast(values));
     try w.writeI32(2, @intFromEnum(parquet.Encoding.plain));
-    try w.writeI32(3, @intFromEnum(parquet.Encoding.rle)); // definition_level_encoding
-    try w.writeI32(4, @intFromEnum(parquet.Encoding.rle)); // repetition_level_encoding
+    try w.writeI32(3, @intFromEnum(parquet.Encoding.rle));
+    try w.writeI32(4, @intFromEnum(parquet.Encoding.rle));
     try w.structEnd();
     try w.structEnd();
 }
 
-/// Definition levels as an RLE/bit-packed hybrid. Always bit-packed groups of
-/// eight at width 1: simple, and never worse than a byte per eight rows.
+/// Definition levels as an RLE/bit-packed hybrid, always bit-packed groups of
+/// eight at width 1.
 fn packLevels(arena: std.mem.Allocator, defs: []const u8) ![]u8 {
     var out = List(u8).init(arena);
     const groups = (defs.len + 7) / 8;
-    // header varint: (groups << 1) | 1 selects the bit-packed form
     var h: u64 = (@as(u64, groups) << 1) | 1;
     while (true) {
         const b: u8 = @intCast(h & 0x7F);
@@ -1102,29 +994,23 @@ fn encodePlain(cb: *ColBuf, m: Mapping, v: Value) !void {
     }
 }
 
-/// Decimal values may carry a scale different from the column's; Parquet stores
-/// the unscaled integer against the schema's scale, so it has to be restated.
-/// The result is the full i128 — how many bytes it lands in is the physical
-/// type's business. Overflowing i128 is an error, not a saturated one: clamping
-/// turned `12.5` in a `numeric(38,18)` column into `9.223372036854775807`.
+/// The unscaled integer restated to the schema's scale. Overflowing i128 is an
+/// error: clamping once turned `12.5` in a `numeric(38,18)` into `9.223372036854775807`.
 fn rescale(d: Decimal, want: i32) Error!i128 {
     var unscaled: i128 = d.unscaled;
     var have: i32 = d.scale;
     while (have < want) : (have += 1)
         unscaled = std.math.mul(i128, unscaled, 10) catch return Error.UnsupportedParquetDecimal;
-    // the same rounding every decimal cast and sink applies
     if (have > want) unscaled = eval.roundScaleDown(unscaled, @intCast(have - want));
     return unscaled;
 }
 
-/// The restated unscaled value narrowed to the column's storage width.
 fn rescaleTo(comptime T: type, d: Decimal, want: i32) Error!T {
     return std.math.cast(T, try rescale(d, want)) orelse Error.UnsupportedParquetDecimal;
 }
 
-/// Big-endian two's complement in exactly `len` bytes, which is how Parquet
-/// stores a FIXED_LEN_BYTE_ARRAY decimal. Errors rather than truncating a value
-/// the declared precision cannot hold.
+/// Big-endian two's complement in exactly `len` bytes (a FIXED_LEN_BYTE_ARRAY
+/// decimal); errors rather than truncating a value the precision cannot hold.
 fn decimalBytes(b: []u8, x: i128) Error!void {
     if (b.len == 0 or b.len > 16) return Error.UnsupportedParquetDecimal;
     var v = x;
@@ -1133,8 +1019,6 @@ fn decimalBytes(b: []u8, x: i128) Error!void {
         b[i - 1] = @truncate(@as(u128, @bitCast(v)));
         v >>= 8;
     }
-    // Everything above the stored bytes must be pure sign extension, or the
-    // value did not fit.
     if (v != (if (x < 0) @as(i128, -1) else 0)) return Error.UnsupportedParquetDecimal;
     if ((b[0] & 0x80 != 0) != (x < 0)) return Error.UnsupportedParquetDecimal;
 }
@@ -1160,8 +1044,6 @@ fn sinkAbort(p: *anyopaque) void {
     @as(*Writer, @ptrCast(@alignCast(p))).abort();
 }
 
-// --- tests -------------------------------------------------------------------
-
 const testing = std.testing;
 const pqdecode = @import("pqdecode.zig");
 
@@ -1180,7 +1062,6 @@ test "basalt types map onto Parquet physical and converted types" {
     try testing.expectEqual(@as(?i32, 2), dec.scale);
     try testing.expectEqual(@as(?i32, 10), dec.precision);
 
-    // nested types have no representation and must be refused, not guessed
     try testing.expectError(Error.UnsupportedParquetWrite, mapType(types.Type.init(.array)));
 }
 
@@ -1189,13 +1070,11 @@ test "definition levels pack LSB-first into bit-packed groups of eight" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    // 8 rows, present except rows 1 and 6 -> 0b10111101
     const packed_levels = try packLevels(a, &[_]u8{ 1, 0, 1, 1, 1, 1, 0, 1 });
-    try testing.expectEqual(@as(usize, 2), packed_levels.len); // header + one group
-    try testing.expectEqual(@as(u8, 0x03), packed_levels[0]); // (1 groups << 1) | 1
+    try testing.expectEqual(@as(usize, 2), packed_levels.len);
+    try testing.expectEqual(@as(u8, 0x03), packed_levels[0]);
     try testing.expectEqual(@as(u8, 0b10111101), packed_levels[1]);
 
-    // the decoder must agree with what we wrote
     const got = try pqdecode.decodeRleHybrid(a, packed_levels, 1, 8);
     try testing.expectEqualSlices(u32, &.{ 1, 0, 1, 1, 1, 1, 0, 1 }, got);
 }
@@ -1203,25 +1082,17 @@ test "definition levels pack LSB-first into bit-packed groups of eight" {
 test "decimal rescaling restates the unscaled value against the column scale" {
     try testing.expectEqual(@as(i128, 1550), try rescale(.{ .unscaled = 155, .scale = 1 }, 2));
     try testing.expectEqual(@as(i128, 155), try rescale(.{ .unscaled = 155, .scale = 2 }, 2));
-    // reducing scale rounds half away from zero, as every decimal cast does
     try testing.expectEqual(@as(i128, 16), try rescale(.{ .unscaled = 155, .scale = 2 }, 1));
     try testing.expectEqual(@as(i128, -16), try rescale(.{ .unscaled = -155, .scale = 2 }, 1));
     try testing.expectEqual(@as(i128, 15), try rescale(.{ .unscaled = 154, .scale = 2 }, 1));
     try testing.expectEqual(@as(i128, -1235), try rescale(.{ .unscaled = -12345, .scale = 3 }, 2));
-    // `12.5` in a numeric(38,18) column is 1.25e19 unscaled — past i64, which is
-    // exactly why that column is not stored as one.
     try testing.expectEqual(@as(i128, 12_500_000_000_000_000_000), try rescale(.{ .unscaled = 125, .scale = 1 }, 18));
-    // Overflowing i128 is still an error rather than a saturated value.
     try testing.expectError(Error.UnsupportedParquetDecimal, rescale(.{ .unscaled = std.math.maxInt(i64), .scale = 0 }, 30));
-    // Narrowing to the storage width is the physical type's check.
     try testing.expectError(Error.UnsupportedParquetDecimal, rescaleTo(i64, .{ .unscaled = 125, .scale = 1 }, 18));
     try testing.expectEqual(@as(i64, std.math.maxInt(i64)), try rescaleTo(i64, .{ .unscaled = std.math.maxInt(i64), .scale = 0 }, 0));
 }
 
 test "the physical type follows the decimal's real precision" {
-    // INT32 to 9 digits, INT64 to 18, FIXED_LEN_BYTE_ARRAY beyond. Everything
-    // used to be INT64 at a precision clamped to 18, which could not hold the
-    // column's own values.
     const small = try mapType(types.Type.decimal(9, 2));
     try testing.expectEqual(parquet.PhysicalType.int32, small.phys);
     try testing.expectEqual(@as(?i32, 9), small.precision);
@@ -1236,13 +1107,10 @@ test "the physical type follows the decimal's real precision" {
     try testing.expectEqual(@as(?i32, 18), wide.scale);
     try testing.expectEqual(@as(?i32, 16), wide.type_length);
 
-    // A precision that no longer gets clamped means scale <= precision holds,
-    // so numeric(30,20) is representable now instead of emitting DECIMAL(18,20).
     const nc = try mapType(types.Type.decimal(30, 20));
     try testing.expectEqual(@as(?i32, 30), nc.precision);
     try testing.expectEqual(@as(?i32, 20), nc.scale);
 
-    // scale > precision is still no schema at all.
     try testing.expectError(Error.UnsupportedParquetDecimal, mapType(types.Type.decimal(10, 12)));
     try testing.expectError(Error.UnsupportedParquetWrite, mapType(types.Type.init(.array)));
 }
@@ -1261,7 +1129,6 @@ test "flba widths and big-endian two's complement match what readers expect" {
     try decimalBytes(&b, -2);
     try testing.expectEqualSlices(u8, &.{ 0xFF, 0xFF, 0xFF, 0xFE }, &b);
 
-    // and the reader turns them back into the same number
     var wide: [16]u8 = undefined;
     const x: i128 = 12_500_000_000_000_000_000;
     try decimalBytes(&wide, x);
@@ -1269,7 +1136,6 @@ test "flba widths and big-endian two's complement match what readers expect" {
     for (wide) |byte| acc = (acc << 8) | byte;
     try testing.expectEqual(x, acc);
 
-    // a value the declared width cannot hold is refused, not truncated
     var one: [1]u8 = undefined;
     try testing.expectError(Error.UnsupportedParquetDecimal, decimalBytes(&one, 128));
     try testing.expectError(Error.UnsupportedParquetDecimal, decimalBytes(&one, -129));
@@ -1277,8 +1143,6 @@ test "flba widths and big-endian two's complement match what readers expect" {
     try testing.expectEqual(@as(u8, 0x80), one[0]);
 }
 
-// Writes a file, reads it back with our own reader, and compares. Exercises
-// the writer and reader against each other end to end.
 test "written files read back with the values and nulls intact" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -1297,7 +1161,6 @@ test "written files read back with the values and nulls intact" {
     } };
 
     var w = try Writer.open(a, path, schema, .snappy, .truncate);
-    // three rows, with a null in every column position at least once
     var ids = try column.Builder.initCapacity(a, schema.fields[0].ty, 3);
     var names = try column.Builder.initCapacity(a, schema.fields[1].ty, 3);
     var amts = try column.Builder.initCapacity(a, schema.fields[2].ty, 3);
@@ -1334,7 +1197,7 @@ test "written files read back with the values and nulls intact" {
     try testing.expectEqual(@as(f64, -2.25), b.columns[2].getValue(1).float);
     try testing.expectEqual(true, b.columns[3].getValue(0).bool);
     try testing.expectEqual(false, b.columns[3].getValue(1).bool);
-    try testing.expect((try r.next(a)) == null); // one row group only
+    try testing.expect((try r.next(a)) == null);
 }
 
 test "a codec without an encoder is refused at open, before any bytes are written" {
@@ -1378,7 +1241,6 @@ test "statistics record min, max and null count per row group" {
     try w.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 4 });
     try w.close();
 
-    // read the footer back and check the statistics landed in the right fields
     const bytes = try std.fs.cwd().readFileAlloc(a, path, 1 << 20);
     const md = try parquet.parseFile(a, bytes);
     const stats = try readStats(a, bytes, md);
@@ -1392,8 +1254,6 @@ test "statistics record min, max and null count per row group" {
 
 const Stat = struct { nulls: i64, min: []const u8, max: []const u8 };
 
-/// Minimal Statistics reader, used by the test to prove the writer put max_value
-/// and min_value in the fields readers actually look at.
 fn readStats(arena: std.mem.Allocator, bytes: []const u8, md: parquet.FileMetaData) ![]Stat {
     const r = try parquet.footerRange(bytes.len, bytes);
     var th = thrift.Reader.init(bytes[r.offset..][0..r.len]);
@@ -1463,14 +1323,13 @@ fn readStats(arena: std.mem.Allocator, bytes: []const u8, md: parquet.FileMetaDa
     return out.toOwnedSlice();
 }
 
-/// Bits needed to index a dictionary of `n` entries.
 fn indexWidth(n: usize) u8 {
     if (n <= 1) return 0;
     return @intCast(32 - @clz(@as(u32, @intCast(n - 1))));
 }
 
 /// Dictionary indices as an RLE/bit-packed hybrid, always bit-packed in groups
-/// of eight — the same shape the reader's `decodeRleHybrid` expects.
+/// of eight, the shape the reader's `decodeRleHybrid` expects.
 fn packRleIndices(out: *List(u8), idx: []const u32, width: u8) !void {
     if (width == 0 or idx.len == 0) return;
     const groups = (idx.len + 7) / 8;
@@ -1503,7 +1362,7 @@ fn writeDictPageHeader(out: *List(u8), uncompressed: usize, compressed: usize, v
     try w.writeI32(2, @intCast(uncompressed));
     try w.writeI32(3, @intCast(compressed));
     try w.writeI32(4, @bitCast(crc));
-    try w.fieldBegin(.@"struct", 7); // dictionary_page_header
+    try w.fieldBegin(.@"struct", 7);
     try w.structBegin();
     try w.writeI32(1, @intCast(values));
     try w.writeI32(2, @intFromEnum(parquet.Encoding.plain));
@@ -1543,7 +1402,6 @@ test "dictionary encoding round-trips low-cardinality strings" {
     } };
     var w = try Writer.open(a, path, schema, .snappy, .truncate);
 
-    // 300 rows over three distinct values: comfortably dictionary-worthy
     var b = try column.Builder.initCapacity(a, schema.fields[0].ty, 300);
     const vals = [_][]const u8{ "alpha", "beta", "gamma" };
     for (0..300) |i| {
@@ -1574,12 +1432,6 @@ test "index width covers the dictionary size" {
     try testing.expectEqual(@as(u8, 8), indexWidth(256));
 }
 
-// The regression this pins: `open` used to call `std.fs.cwd().createFile` for
-// every target, so an `az://` path became an attempt to create a file under a
-// local directory named `az:` and failed with FileNotFound — the error looked
-// like a storage problem and hid the real one for a whole debugging session.
-// Whatever the outcome here without credentials in the environment, it must not
-// come from the filesystem.
 test "an az:// target routes to the blob writer, never the local filesystem" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -1590,20 +1442,12 @@ test "an az:// target routes to the blob writer, never the local filesystem" {
     } };
 
     const w = Writer.open(a, "az://acct/ctr/bronze/t.parquet", schema, .snappy, .truncate) catch |e| {
-        // No AZURE_STORAGE_KEY set is the expected outcome on a bare test box.
         try testing.expect(e != error.FileNotFound and e != error.NotDir);
         return;
     };
     try testing.expect(w.backend == .object);
 }
 
-// A reader that bounds a column chunk by `total_compressed_size` — Arrow does,
-// and so StarRocks does — must find the chunk's last page whole. It did not:
-// both size totals omitted the page headers, leaving every chunk short by 29
-// bytes per page (58 for a dictionary chunk, which has two), surfacing as
-// "Page was smaller than expected". A lenient reader that just walks page
-// headers to the row count never noticed, which is why a round trip through
-// basalt's own reader stayed green.
 test "chunk size totals account for page headers" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -1614,8 +1458,6 @@ test "chunk size totals account for page headers" {
     const dir = try tmp.dir.realpathAlloc(a, ".");
     const path = try std.fs.path.join(a, &.{ dir, "sizes.parquet" });
 
-    // `name` repeats, so it takes the dictionary path (two headers per chunk);
-    // `id` stays PLAIN (one). Both accounting sites are covered.
     const schema = types.Schema{ .fields = &.{
         .{ .name = "id", .ty = types.Type.init(.int).asNullable() },
         .{ .name = "name", .ty = types.Type.init(.string).asNullable() },
@@ -1640,8 +1482,6 @@ test "chunk size totals account for page headers" {
     const footer_start = bytes.len - parquet.trailer_len - flen;
     const md = try parquet.parseFooter(a, bytes[footer_start..][0..flen]);
 
-    // Chunks are written back to back, so the next one's start — or the footer,
-    // for the last — is where this one truly ends.
     var starts = std.array_list.Managed(i64).init(a);
     for (md.row_groups) |g| for (g.columns) |c| try starts.append((c.meta.?).startOffset());
     std.mem.sort(i64, starts.items, {}, std.sort.asc(i64));

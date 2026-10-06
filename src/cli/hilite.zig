@@ -2,13 +2,16 @@
 //! never fails on half-typed text — an unclosed string is coloured to the end and
 //! the rest is left plain. Deliberately not the parser's lexer: that one skips
 //! comments and stops at the first bad byte, both wrong for text being typed.
+//!
+//! `keywords` is the parser's keyword set (`sql_parser.zig`'s `isKw`) plus the
+//! aggregate, window and type names that read as keywords to a person. Only a bare
+//! word can be a keyword (`x.count` is a column); a word followed by `(` is coloured
+//! as a call (`trim(`, `erp.QUERY(`) unless it is a keyword (`IN (`, `AS (`).
 
 const std = @import("std");
 
 pub const Style = enum(u8) { plain, keyword, string, number, comment, param, punct, func };
 
-/// The words the parser reads as keywords (`sql_parser.zig`'s `isKw` set), plus
-/// the aggregate and window names that read as keywords to a person.
 pub const keywords = [_][]const u8{
     "accept",   "all",      "analyze",    "anchor",    "and",       "anti",      "append",     "as",         "asc",
     "at",       "between",  "body",       "buffer",    "by",        "call",      "case",       "cols",       "connection",
@@ -26,7 +29,7 @@ pub const keywords = [_][]const u8{
     "min",      "median",   "cast",       "try_cast",  "if",        "rank",      "dense_rank", "row_number", "lag",
     "lead",     "string",   "int",        "float",     "decimal",   "bool",      "date",       "time",       "timestamp",
     "resource", "get",      "post",       "json_each",
-    // type names, as `CAST(x AS varchar)` and a column list write them
+    // type names
     "varchar",   "char",      "nvarchar",   "text",       "bigint",
     "smallint", "tinyint",  "integer",    "double",    "real",      "numeric",   "boolean",    "datetime",
 };
@@ -40,7 +43,6 @@ fn isIdent(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_' or c >= 0x80;
 }
 
-/// Fill `out` (one entry per byte of `text`) with the style of each byte.
 pub fn scan(text: []const u8, out: []Style) void {
     @memset(out, .plain);
     var i: usize = 0;
@@ -69,7 +71,6 @@ pub fn scan(text: []const u8, out: []Style) void {
             @memset(out[i..j], if (c == '\'') .string else .plain);
             i = j;
         } else if (c == '$' and i + 1 < text.len and text[i + 1] == '$') {
-            // `$$...$$` and `$tag$...$tag$`: a dollar-quoted body.
             const end = if (std.mem.indexOfPos(u8, text, i + 2, "$$")) |p| p + 2 else text.len;
             @memset(out[i..end], .string);
             i = end;
@@ -90,9 +91,6 @@ pub fn scan(text: []const u8, out: []Style) void {
         } else if (isIdent(c)) {
             var j = i;
             while (j < text.len and isIdent(text[j])) j += 1;
-            // `x.count` is a column; only a bare word can be a keyword. A word
-            // a `(` follows is a call — `trim(`, `erp.QUERY(` — unless it is a
-            // keyword (`IN (`, `AS (`).
             const qualified = i > 0 and text[i - 1] == '.';
             var k = j;
             while (k < text.len and text[k] == ' ') k += 1;
@@ -108,7 +106,6 @@ pub fn scan(text: []const u8, out: []Style) void {
     }
 }
 
-/// The SGR sequence that starts `s`, and the one that ends it.
 pub fn sgr(s: Style) []const u8 {
     return switch (s) {
         .plain => "\x1b[39m",
@@ -130,13 +127,13 @@ test "scan: keywords, a string with a doubled quote, a comment, a param, a numbe
     scan(text, out[0..text.len]);
     try std.testing.expectEqual(Style.keyword, out[0]);
     try std.testing.expectEqual(Style.string, out[7]);
-    try std.testing.expectEqual(Style.string, out[12]); // the closing quote of 'it''s'
-    try std.testing.expectEqual(Style.keyword, out[15]); // AS
-    try std.testing.expectEqual(Style.plain, out[18]); // x
-    try std.testing.expectEqual(Style.param, out[21]); // $p
+    try std.testing.expectEqual(Style.string, out[12]);
+    try std.testing.expectEqual(Style.keyword, out[15]);
+    try std.testing.expectEqual(Style.plain, out[18]);
+    try std.testing.expectEqual(Style.param, out[21]);
     try std.testing.expectEqual(Style.number, out[25]);
     try std.testing.expectEqual(Style.comment, out[30]);
-    try std.testing.expectEqual(Style.keyword, out[38]); // FROM
+    try std.testing.expectEqual(Style.keyword, out[38]);
     try std.testing.expectEqual(Style.string, out[text.len - 1]);
 }
 
@@ -144,19 +141,19 @@ test "scan: a call is a function whatever its name; a keyword before ( stays one
     const text = "SELECT trim(a), erp.QUERY($$x$$), x IN (1) FROM t WHERE CAST(b AS varchar) = lower (c)";
     var out: [96]Style = undefined;
     scan(text, out[0..text.len]);
-    try std.testing.expectEqual(Style.func, out[7]); // trim
-    try std.testing.expectEqual(Style.func, out[20]); // QUERY after erp.
-    try std.testing.expectEqual(Style.plain, out[16]); // erp
-    try std.testing.expectEqual(Style.keyword, out[36]); // IN
-    try std.testing.expectEqual(Style.keyword, out[56]); // CAST stays a keyword
-    try std.testing.expectEqual(Style.keyword, out[66]); // varchar
-    try std.testing.expectEqual(Style.func, out[77]); // lower, a space before its (
+    try std.testing.expectEqual(Style.func, out[7]);
+    try std.testing.expectEqual(Style.func, out[20]);
+    try std.testing.expectEqual(Style.plain, out[16]);
+    try std.testing.expectEqual(Style.keyword, out[36]);
+    try std.testing.expectEqual(Style.keyword, out[56]);
+    try std.testing.expectEqual(Style.keyword, out[66]);
+    try std.testing.expectEqual(Style.func, out[77]);
 }
 
 test "scan: a qualified name is not a keyword, a dollar-quoted body is a string" {
     const text = "SELECT t.count FROM erp.QUERY($$SELECT 1$$)";
     var out: [64]Style = undefined;
     scan(text, out[0..text.len]);
-    try std.testing.expectEqual(Style.plain, out[9]); // count after t.
-    try std.testing.expectEqual(Style.string, out[32]); // inside $$...$$
+    try std.testing.expectEqual(Style.plain, out[9]);
+    try std.testing.expectEqual(Style.string, out[32]);
 }

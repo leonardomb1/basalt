@@ -1,15 +1,23 @@
 //! Split-parallel source driver. Given a list of split predicates and a factory
-//! that opens a `driver.Source` for one split, this runs N lanes (threads) that
-//! work-steal splits from a shared counter. Each lane owns its split's connection,
-//! reads it to exhaustion, applies the map-only stage chain (the vectorized
-//! kernels) on its own arena, and writes to the sink. Because the splits are
-//! disjoint key ranges, output order across lanes is not preserved (union order)
-//! — which is exactly what a partitioned read means.
+//! that opens a `driver.Source` for one split (owned and closed by the lane), this
+//! runs N lanes (threads) that work-steal splits from a shared counter. Each lane
+//! owns its split's connection, reads it to exhaustion, applies the map-only stage
+//! chain (the vectorized kernels) on its own arena, and writes to the sink. Because
+//! the splits are disjoint key ranges, output order across lanes is not preserved
+//! (union order), which is exactly what a partitioned read means.
 //!
 //! Sinks come in two flavors. A `shared` sink (e.g. one CSV file) is written under
-//! a mutex. A `per_lane` sink (StarRocks stream-load, a DB connection) is opened
-//! once per lane and written lock-free, so the *write* side fans out across cores
-//! too — N concurrent stream-load streams / INSERT connections.
+//! a mutex and closed by the caller. A `per_lane` sink (StarRocks stream-load, a DB
+//! connection) is opened once per lane (`lane_idx` keeps e.g. load labels apart),
+//! written lock-free and closed by its lane, so the write side fans out across
+//! cores too.
+//!
+//! `PipelinedSink` overlaps writes with reads in the serial pipeline: one writer
+//! thread, one batch in flight, FIFO, so a passthrough job costs max(read, write)
+//! per batch. Arena contract: `submit` returns only once the previous batch is
+//! fully written, so its arena may then be reset. Always pair `start` with a
+//! deferred `shutdown`, and call `finish` before the sink's own close to surface
+//! the last write error.
 
 const std = @import("std");
 const obs = @import("obs.zig");
@@ -17,29 +25,20 @@ const driver = @import("../connect/driver.zig");
 const op = @import("../exec/op.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 
-/// Opens a fresh source for one split predicate. `ctx` carries the connection
-/// config; the returned source is owned by the caller (closed by the lane).
 pub const OpenSplitFn = *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, pred: []const u8) anyerror!driver.Source;
 
-/// Opens a sink for one lane (`lane_idx` disambiguates e.g. StarRocks labels).
 pub const OpenSinkFn = *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize) anyerror!driver.Sink;
 
 pub const SinkMode = union(enum) {
-    /// One sink object; lane writes serialize on a mutex (single-stream sinks).
     shared: driver.Sink,
-    /// Each lane opens its own sink and writes it lock-free (parallel sinks).
     per_lane: struct { open: OpenSinkFn, ctx: *anyopaque },
 };
 
-/// Write one batch through a lane's sink: a `shared` sink serializes on `mtx`;
-/// a `per_lane` sink (`own`, already opened by the lane) writes lock-free.
+/// Formats outside the lock and holds `mtx` only for the append: locking the whole
+/// write made 6M rows of parquet to CSV slower at -j 16 (835ms) than at -j 1 (752ms).
 pub fn writeLaneBatch(mode: SinkMode, mtx: *std.Thread.Mutex, own: ?driver.Sink, a: std.mem.Allocator, b: Batch) !void {
     switch (mode) {
         .shared => |snk| {
-            // Format first, lock second. Holding the mutex across the whole write made
-            // a write-heavy move *slower* with more lanes — 6M rows of parquet to CSV
-            // took 752ms at -j 1 and 835ms at -j 16, because every lane queued behind
-            // one thread doing all the formatting.
             if (snk.canRender()) {
                 const bytes = try snk.renderBatch(a, b).?;
                 mtx.lock();
@@ -54,13 +53,6 @@ pub fn writeLaneBatch(mode: SinkMode, mtx: *std.Thread.Mutex, own: ?driver.Sink,
     }
 }
 
-/// Overlaps sink writes with source reads in the serial pipeline: one writer
-/// thread, one batch in flight, FIFO (row order is preserved). The caller builds
-/// batch N+1 while the worker has batch N on the wire, so a passthrough job costs
-/// max(read, write) per batch instead of read + write. Arena contract: `submit`
-/// returns only when the PREVIOUS batch is fully written — the arena that batch
-/// lived in is then safe to reset. Always pair `start` with `shutdown` (defer);
-/// call `finish` before the sink's own close to surface the last write error.
 pub const PipelinedSink = struct {
     snk: driver.Sink,
     gpa: std.mem.Allocator,
@@ -76,8 +68,6 @@ pub const PipelinedSink = struct {
         self.thread = try std.Thread.spawn(.{}, workerFn, .{self});
     }
 
-    /// Hand a batch to the writer; blocks until the worker is idle (previous
-    /// batch written). Returns the worker's pending error, if any.
     pub fn submit(self: *PipelinedSink, b: Batch) !void {
         self.mtx.lock();
         defer self.mtx.unlock();
@@ -87,13 +77,11 @@ pub const PipelinedSink = struct {
         self.cv.broadcast();
     }
 
-    /// Drain the in-flight batch, stop the worker, and surface its error.
     pub fn finish(self: *PipelinedSink) !void {
         self.shutdown();
         if (self.err) |e| return e;
     }
 
-    /// Idempotent join (safe as a defer alongside an explicit `finish`).
     pub fn shutdown(self: *PipelinedSink) void {
         const t = self.thread orelse return;
         self.mtx.lock();
@@ -129,8 +117,7 @@ pub const PipelinedSink = struct {
 };
 
 /// Spawn up to `n` copies of `worker(ctx, lane_idx)`, join them, and return the
-/// effective lane count (>= 1). When no thread can be spawned the worker runs
-/// inline on this thread as lane 0.
+/// lane count (>= 1). When no thread can be spawned the worker runs inline as lane 0.
 pub fn spawnJoin(alloc: std.mem.Allocator, n: usize, comptime worker: anytype, ctx: anytype) !usize {
     const threads = try alloc.alloc(std.Thread, n);
     defer alloc.free(threads);
@@ -231,9 +218,8 @@ fn lane(sh: *Shared, lane_idx: usize) void {
     }
 }
 
-/// Run `predicates.len` splits across `min(nthreads, predicates.len)` lanes.
-/// Returns total rows written, or the first error any lane hit. A `shared` sink is
-/// closed by the caller; `per_lane` sinks are closed by their lanes.
+/// Run the splits across `min(nthreads, predicates.len)` lanes. Returns total rows
+/// written, or the first error any lane hit.
 pub fn run(
     gpa: std.mem.Allocator,
     predicates: []const []const u8,
@@ -268,8 +254,6 @@ const column = @import("../exec/column.zig");
 const test_empty_schema = types.Schema{ .fields = &.{} };
 var test_no_cols: [0]column.Column = .{};
 
-/// A split source yielding `remaining` rows as zero-column batches of ≤2 rows
-/// (so a split spans several `next` pulls). "fail-read" splits error on read.
 const FakeSplitSource = struct {
     gpa: std.mem.Allocator,
     remaining: usize,
@@ -296,8 +280,7 @@ const FakeSplitSource = struct {
     }
 };
 
-/// `OpenSplitFn` for tests: the predicate is the split's row count, or a
-/// failure directive ("fail-open" / "fail-read").
+/// The predicate is the split's row count, or "fail-open" / "fail-read".
 fn testOpenSplit(ctx: *anyopaque, gpa: std.mem.Allocator, pred: []const u8) anyerror!driver.Source {
     _ = ctx;
     if (std.mem.eql(u8, pred, "fail-open")) return error.SplitOpenFailed;
@@ -310,7 +293,6 @@ fn testOpenSplit(ctx: *anyopaque, gpa: std.mem.Allocator, pred: []const u8) anye
     return src.source();
 }
 
-/// A caller-owned (shared-mode) sink counting rows and lifecycle calls.
 const CountSink = struct {
     rows: usize = 0,
     closed: bool = false,
@@ -334,8 +316,6 @@ const CountSink = struct {
     }
 };
 
-/// A lane-owned sink: rows commit into the shared totals only on close, so the
-/// test observes the lanes' commit-on-close/abort-on-failure discipline.
 const LaneSink = struct {
     gpa: std.mem.Allocator,
     totals: *Totals,
@@ -376,8 +356,6 @@ fn testOpenLaneSink(ctx: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize) an
     return s.sinkOf();
 }
 
-/// Records the length of every batch written, in order; optionally fails on the
-/// N-th write (1-based) to exercise error propagation.
 const SeqSink = struct {
     lens: std.array_list.Managed(usize),
     fail_on: usize = 0,

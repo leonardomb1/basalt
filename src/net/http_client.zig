@@ -1,5 +1,6 @@
-//! `read http` — REST/JSON source. GETs a URL and yields one batch per page of
-//! JSON objects. Auth and pagination ride on the read stage's hints:
+//! `read http`: REST/JSON source. GETs a URL and yields one batch per page of
+//! JSON objects. Auth and pagination ride on the read stage's hints, whose keys
+//! mirror the `Options` field names (unknown hints are ignored):
 //!
 //!   read http "https://api.x/items" @[bearer_env = API_TOKEN, items = "data",
 //!     paginate = cursor, cursor_field = "next"]
@@ -7,24 +8,33 @@
 //! Pagination modes:
 //!   (none)             one GET, one batch.
 //!   paginate = page    `?<page_param>=N` (N starts at `start_page`), optionally
-//!                      `&<size_param>=<page_size>`; stops on an empty page.
+//!                      `&<size_param>=<page_size>`; stops on an empty page, or
+//!                      after exactly `total_field` pages for APIs that never
+//!                      return an empty one.
 //!   paginate = offset  like `page`, but the param advances by `page_size` from
 //!                      `start_offset` (OData `$skip`/`$top` style).
 //!   paginate = cursor  reads `<cursor_field>` (dotted path) from each response;
 //!                      a value starting with http(s):// is the next URL, anything
 //!                      else is sent as `?<cursor_param>=<value>`; stops when the
 //!                      field is missing/null/empty or the page is empty.
-//! `max_pages` caps every mode so a misbehaving API can't loop forever.
+//! `max_pages` caps every mode so a misbehaving API can't loop forever. With
+//! `body` (POST) the page param goes into the body, as form-style APIs expect.
+//! `stop_short` ends on a page shorter than page_size; it is opt-in because a
+//! server that caps page size below the requested one makes the short page lie.
+//! An empty body or bare JSON `null` is an empty page.
 //!
 //! Auth: `bearer_env`/`auth_env`/`user_env`+`pass_env` name environment variables
 //! (keeps tokens out of script text); `bearer` prepends "Bearer ", `auth`/`auth_env`
 //! send the Authorization value verbatim (session-token APIs). `bearer`/`auth`
 //! take literals (useful with for-loop `${var}` interpolation), and
-//! `header = "Name: value"` adds one extra raw header.
+//! `header = "Name: value"` adds one extra raw header; a User-Agent given that way
+//! replaces the client's (`basalt/<version>`) instead of being sent twice, which
+//! some WAFs reject.
 //!
 //! Connection-level form: `connection itsm = http` + `read itsm "/path?query"`.
 //! The path resolves against the connection's `base_url` (spaces auto-encoded,
-//! so OData filters read naturally) and auth lives on the connection:
+//! so OData filters read naturally) and auth lives on the connection; unknown
+//! connection keys are an error, unlike hints:
 //!   auth = "bearer"      token = secret("TOK")               -> Bearer <token>
 //!   auth = "basic"       user = ..., password = ...          -> Basic <b64>
 //!   auth = "header"      header_name/header_value            -> any API-key header
@@ -37,12 +47,38 @@
 //!                        client_secret [+ scope] -> client-credentials form POST;
 //!                        token_path defaults to access_token, prefix to "Bearer ".
 //! Session kinds (login_json, oauth2) re-login and retry the page once on a 401,
-//! so server-side session expiry mid-pull heals itself.
+//! so server-side session expiry mid-pull heals itself. A 401 goes to re-login
+//! before `retry_statuses` is consulted.
+//!
+//! Resilience: transient failures (429/5xx, connection resets) retry in place
+//! `retries` times with exponential backoff and jitter, so one blip deep in a long
+//! backfill does not restart the run. `retry_statuses` ("404,408") marks extra
+//! codes transient for APIs that misreport an outage; if they outlive the budget
+//! the run exits 75 so the control plane re-runs it. A socket failure that
+//! survives the budget surfaces as HttpTransportFailed, never as a std.Io
+//! WriteFailed/ReadFailed, which must not count as transient globally (a CSV
+//! sink's disk-full is WriteFailed too). `progress_ms` emits a heartbeat.
+//!
+//! Deadlines and prefetch: `timeout_ms` bounds every page fetch, sequential or
+//! prefetched, by running it on a detached worker in a `Slot`; a black-holed
+//! request surfaces as ConnectionTimedOut. The worker cannot be interrupted, so it
+//! is abandoned (bounded and counted) and frees itself if the server ever
+//! answers. That is why a slot reads only its own arena snapshot and the
+//! gpa-allocated client (never the run arena or the HttpSource), and a state CAS
+//! decides whether consumer or worker frees it. `prefetch` (page/offset modes)
+//! keeps N such slots in flight, which helps slow APIs that compute pages in
+//! parallel and hurts servers that serialise requests per session.
+//!
+//! TLS: std's verifier walks the server's chain strictly in presentation order,
+//! so `repairBundle` re-anchors a misordered chain; BASALT_CA_BUNDLE (a PEM file)
+//! is the manual override for chains it cannot fix, such as a missing
+//! intermediate. Responses decompress straight into the caller's allocating
+//! writer (`decompress_direct`): through std's fixed window buffer the flate
+//! decoder could emit up to 258 bytes past the limit and abort the process.
 //!
 //! The schema is inferred from the first page (request.zig rules); later pages
-//! coerce to it — missing keys become null, new keys are dropped. Each page is
-//! fetched whole into the per-batch arena (pages are bounded; the stream as a
-//! whole is not, so memory stays flat across pages).
+//! coerce to it: missing keys become null, new keys are dropped. Each page is
+//! fetched whole into the per-batch arena, so memory stays flat across pages.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -56,15 +92,9 @@ const obs = @import("../runtime/obs.zig");
 
 const json = std.json;
 
-/// std's verifier does no path building: it walks the server's chain strictly
-/// in presentation order, so a misordered chain (a depressingly common server
-/// misconfiguration) fails with CertificateIssuerMismatch even though every
-/// certificate is valid. This fixes that out-of-band: harvest the chain over an
-/// unverified handshake, then add to the bundle each presented certificate that
-/// itself verifies against a certificate already in the bundle, repeating until
-/// a fixpoint so order doesn't matter. Nothing gets trusted that doesn't chain
-/// to an existing root — this only reorders trust the server already earned.
-/// Returns true if the bundle gained at least one certificate.
+/// Adds to `bundle` each certificate the server presents that verifies against one
+/// already there, repeating to a fixpoint so order doesn't matter. Trusts nothing
+/// new that does not chain to an existing root; true if the bundle grew.
 pub fn repairBundle(gpa: std.mem.Allocator, bundle: *std.crypto.Certificate.Bundle, host: []const u8, port: u16) bool {
     var cap = ChainCapture{};
     harvestChain(gpa, host, port, &cap) catch return false;
@@ -93,9 +123,8 @@ pub fn repairBundle(gpa: std.mem.Allocator, bundle: *std.crypto.Certificate.Bund
     return added_any;
 }
 
-/// Capture the certificate chain a server presents, trusting nothing: the
-/// hostname is still sent and checked (we need SNI to reach the right vhost)
-/// but the CA path is not verified.
+/// Captures the chain a server presents over an unverified handshake. SNI and the
+/// hostname are still sent and checked; only the CA path is not verified.
 fn harvestChain(gpa: std.mem.Allocator, host: []const u8, port: u16, cap: *ChainCapture) !void {
     const stream = try std.net.tcpConnectToHost(gpa, host, port);
     defer stream.close();
@@ -126,7 +155,6 @@ pub const AuthKind = enum { none, bearer, basic, header, login_json, oauth2 };
 
 pub const KV = struct { key: []const u8, value: []const u8 };
 
-/// Resolved configuration of a `connection <name> = http` block.
 pub const ConnConfig = struct {
     base_url: []const u8 = "",
     auth: AuthKind = .none,
@@ -143,10 +171,8 @@ pub const ConnConfig = struct {
     token_prefix: ?[]const u8 = null,
 };
 
-/// Build a ConnConfig from resolved (string) connection attrs. `body_<field>`
-/// attrs pass through into the login JSON object — vendor-agnostic, so any
-/// login body shape works without templating. Unknown keys are an error
-/// (connections are explicit config, unlike advisory hints); `errmsg` says which.
+/// Builds a ConnConfig from resolved connection attrs. `body_<field>` attrs pass
+/// into the login JSON object; an unknown key is an error that `errmsg` names.
 pub fn connFromKvs(arena: std.mem.Allocator, kvs: []const KV, errmsg: *[]const u8) !ConnConfig {
     var cc = ConnConfig{};
     var body = std.array_list.Managed(KV).init(arena);
@@ -193,9 +219,6 @@ pub fn connFromKvs(arena: std.mem.Allocator, kvs: []const KV, errmsg: *[]const u
     return cc;
 }
 
-/// Produces and refreshes the auth header for a connection. Static kinds
-/// (bearer/basic/header) compute once; session kinds (login_json/oauth2) log in
-/// lazily and can mint a fresh token after a 401.
 pub const AuthState = struct {
     arena: std.mem.Allocator,
     cc: ConnConfig,
@@ -223,7 +246,6 @@ pub const AuthState = struct {
         return self.header;
     }
 
-    /// Session kinds re-login (server-side expiry mid-pull); static kinds can't.
     pub fn refresh(self: *AuthState, client: *std.http.Client) bool {
         switch (self.cc.auth) {
             .login_json, .oauth2 => {
@@ -311,7 +333,6 @@ fn formUnreserved(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
 }
 
-/// Resolve a read path against a base URL; absolute http(s) paths pass through.
 pub fn joinUrl(arena: std.mem.Allocator, base: []const u8, path: []const u8) ![]const u8 {
     if (path.len == 0) return base;
     if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://")) return path;
@@ -321,7 +342,7 @@ pub fn joinUrl(arena: std.mem.Allocator, base: []const u8, path: []const u8) ![]
 }
 
 /// `path` with each param appended as `key=value`, both percent-encoded, after a
-/// `?` or — when the path already carries a query string — an `&`.
+/// `?` or, when the path already carries a query string, an `&`.
 pub fn withQuery(arena: std.mem.Allocator, path: []const u8, params: []const KV) ![]const u8 {
     if (params.len == 0) return path;
     var buf = std.array_list.Managed(u8).init(arena);
@@ -337,9 +358,8 @@ pub fn withQuery(arena: std.mem.Allocator, path: []const u8, params: []const KV)
     return buf.toOwnedSlice();
 }
 
-/// Encode the one character that breaks URI parsing but appears constantly in
-/// hand-written query strings (OData filters): the space. Everything else is
-/// the script author's responsibility.
+/// Encodes the one character that breaks URI parsing but appears constantly in
+/// hand-written OData filters: the space. Everything else is the author's job.
 pub fn encodeSpaces(arena: std.mem.Allocator, url: []const u8) ![]const u8 {
     const n = std.mem.count(u8, url, " ");
     if (n == 0) return url;
@@ -357,17 +377,6 @@ pub fn encodeSpaces(arena: std.mem.Allocator, url: []const u8) ![]const u8 {
     return out;
 }
 
-/// A std.http.Client with the CA store pre-loaded: system roots plus, when the
-/// BASALT_CA_BUNDLE env var names a PEM file, every certificate in it. That's
-/// the manual override for chains the automatic repair can't fix (e.g. a server
-/// that omits its intermediate entirely — repair can only re-anchor what the
-/// server actually sends).
-/// Decompress straight into the response writer rather than through std's
-/// fixed window buffer. The flate decoder can emit a match up to 258 bytes
-/// past the limit it was handed; on the buffered path that destination is a
-/// fixed writer that cannot rebase, so the process aborted on any gzip body
-/// larger than the window. Streaming direct leaves growth to the caller's
-/// allocating writer, which rebases fine.
 pub const decompress_direct: []u8 = &.{};
 
 pub fn initClient(gpa: std.mem.Allocator) std.http.Client {
@@ -391,9 +400,6 @@ pub const Options = struct {
     header: ?[]const u8 = null,
     items: ?[]const u8 = null,
     method: enum { get, post } = .get,
-    /// POST body sent with every page. With page/offset pagination the page
-    /// param is appended to the BODY (`&<page_param>=N`), not the URL — the
-    /// form-style APIs that want POST paginate in the body.
     body: ?[]const u8 = null,
     body_type: []const u8 = "form",
     paginate: Mode = .none,
@@ -405,48 +411,17 @@ pub const Options = struct {
     cursor_param: []const u8 = "cursor",
     cursor_field: []const u8 = "next",
     max_pages: i64 = 10_000,
-    /// page/offset modes: fetch up to N pages concurrently (1 = sequential).
-    /// The win is server-side latency: slow APIs compute pages in parallel.
-    /// Counterproductive on servers that serialize requests per session.
     prefetch: i64 = 1,
-    /// Transient failures (429/5xx, connection resets) retry in place with
-    /// exponential backoff + jitter, like any robust extraction client. Without
-    /// this, one blip at page 400k of a long backfill restarts the whole run.
     retries: i64 = 2,
     retry_base_ms: i64 = 500,
-    /// Per-page deadline (ms) for page fetches (both sequential and prefetched
-    /// paths); 0 disables. A request
-    /// that black-holes (no reset, just silence) is abandoned at the deadline
-    /// and surfaces as ConnectionTimedOut (transient). The blocked worker
-    /// thread can't be interrupted — it frees itself if the server ever
-    /// answers, and is leaked (bounded, counted) if it never does.
     timeout_ms: i64 = 300_000,
-    /// Progress heartbeat to stderr every N ms during multi-page pulls
-    /// (0 = silent). Long extractions are otherwise mute for an hour.
     progress_ms: i64 = 30_000,
-    /// Extra status codes to treat as transient (comma-separated, e.g. "404,408").
-    /// For vendors that lie: iFractal answers 404 with "Erro ao conectar no banco
-    /// de dados" when ITS database is down. Listed codes retry with backoff and,
-    /// if they outlive the retry budget, exit 75 so the control plane re-runs.
     retry_statuses: ?[]const u8 = null,
-    /// Runtime-injected (not a hint): structured logger for diagnostics and
-    /// heartbeats, wired BEFORE the first fetch so even open()-time errors log
-    /// structured. Null (tests/probes) falls back to raw stderr.
     logger: ?*obs.Logger = null,
-    /// page mode: dotted path to a "total pages" field in the response; when
-    /// set, exactly that many pages are fetched. For APIs that never return an
-    /// empty page (page-overrun keeps yielding data), where the empty-page
-    /// detector can't terminate.
     total_field: ?[]const u8 = null,
-    /// page/offset modes: a page shorter than page_size ends the stream,
-    /// skipping the trailing empty-page request (a full server-side scan on
-    /// slow OData backends). Opt-in: unsafe when the server caps page size
-    /// below the requested one (the short page would lie).
     stop_short: bool = false,
 };
 
-/// Hint keys mirror the Options field names. Unknown hints are ignored, per the
-/// engine-wide hint convention.
 pub fn optsFromHints(hints: []const ast.Hint) Options {
     var o = Options{};
     for (hints) |h| {
@@ -522,8 +497,6 @@ pub fn optsFromHints(hints: []const ast.Hint) Options {
 pub const HttpSource = struct {
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
-    /// gpa-allocated (not in the run arena): an abandoned worker may still be
-    /// using it after the run's arena is freed.
     client: *std.http.Client,
     zombies: usize = 0,
     base_url: []const u8,
@@ -542,8 +515,6 @@ pub const HttpSource = struct {
     issue_done: bool = false,
     auth_gen: u32 = 0,
     total_pages: ?i64 = null,
-    /// Set by the runtime after open(): heartbeats go through the structured
-    /// logger (JSON-safe, level-gated). Null (tests/probes) falls back to stderr.
     logger: ?*obs.Logger = null,
     rows_done: u64 = 0,
     pages_done: i64 = 0,
@@ -551,10 +522,6 @@ pub const HttpSource = struct {
 
     const SlotState = enum(u8) { running, done, abandoned };
 
-    /// One prefetched page in flight — fully self-contained: every slice it
-    /// reads lives in its own arena snapshot (never the run arena), so a worker
-    /// abandoned at the timeout deadline can safely outlive the run. The state
-    /// CAS decides who frees the slot: consumer (done) or worker (abandoned).
     const Slot = struct {
         state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(SlotState.running)),
         gpa: std.mem.Allocator,
@@ -562,8 +529,6 @@ pub const HttpSource = struct {
         client: *std.http.Client,
         method_post: bool,
         content_type: ?[]const u8,
-        /// Sent as the client's User-Agent rather than an extra header, so a
-        /// user-supplied one replaces std's default instead of joining it.
         user_agent: []const u8,
         url: []const u8,
         req_body: ?[]const u8 = null,
@@ -588,9 +553,6 @@ pub const HttpSource = struct {
         return openConn(arena, gpa, .{ .base_url = url }, "", opts);
     }
 
-    /// Open against a `connection ... = http`: `path` resolves on the
-    /// connection's base_url, and the connection's auth kind applies (with
-    /// mid-run re-login for session kinds).
     pub fn openConn(arena: std.mem.Allocator, gpa: std.mem.Allocator, cc: ConnConfig, path: []const u8, opts: Options) !*HttpSource {
         if (std.mem.indexOfAny(u8, path, "\r\n") != null) return error.UrlContainsLineBreak;
         const url = try encodeSpaces(arena, try joinUrl(arena, cc.base_url, path));
@@ -638,8 +600,6 @@ pub const HttpSource = struct {
         return self;
     }
 
-    /// Heartbeat so a 30-minute pull isn't silent: pages done (of total when
-    /// known) and rows so far, to stderr like the other source diagnostics.
     fn noteProgress(self: *HttpSource, n_rows: usize) void {
         self.pages_done += 1;
         self.rows_done += n_rows;
@@ -660,8 +620,6 @@ pub const HttpSource = struct {
 
     const Page = struct { root: json.Value, items: []const json.Value };
 
-    /// Fetch one page and extract its rows. An empty body or a bare JSON `null`
-    /// (end-of-dataset markers in the wild, alongside http 204) yields no items.
     fn fetchParsed(self: *HttpSource, arena: std.mem.Allocator, req: PageReq) !Page {
         const body = try self.fetchPage(arena, req);
         const trimmed = std.mem.trim(u8, body, " \t\r\n");
@@ -671,7 +629,6 @@ pub const HttpSource = struct {
         return .{ .root = root, .items = try itemsOf(arena, root, self.opts.items) };
     }
 
-    /// Per-page bookkeeping: decide whether another page exists and what its URL is.
     fn advance(self: *HttpSource, arena: std.mem.Allocator, root: json.Value, n_items: usize) !void {
         self.pages_fetched += 1;
         switch (self.opts.paginate) {
@@ -785,10 +742,8 @@ pub const HttpSource = struct {
         };
     }
 
-    /// One request attempt with the page deadline applied (timeout_ms > 0):
-    /// runs through the same slot machinery as prefetch, window of one, so the
-    /// sequential/cursor/default paths get the black-hole protection too. The
-    /// slot carries retries=0 — fetchPage owns the sequential retry budget.
+    /// One attempt under the page deadline, through the slot machinery with a window
+    /// of one. The slot carries retries=0: fetchPage owns the sequential retry budget.
     fn rawOrTimed(self: *HttpSource, arena: std.mem.Allocator, req: PageReq) ![]const u8 {
         if (self.opts.timeout_ms <= 0) return self.fetchPageRaw(arena, req);
         const slot = try self.spawnFetch(req, 0);
@@ -819,8 +774,6 @@ pub const HttpSource = struct {
             (self.opts.paginate == .page or self.opts.paginate == .offset);
     }
 
-    /// Spawn a worker for the next page; page bookkeeping happens at issue time
-    /// (the sequential path does it at consume time via advance()).
     fn issueSlot(self: *HttpSource) !void {
         if (self.total_pages) |t| {
             if (1 + self.pages_issued >= t) {
@@ -840,10 +793,8 @@ pub const HttpSource = struct {
         self.pages_issued += 1;
     }
 
-    /// Build + spawn the next page's slot. Page strings are built in a scratch
-    /// arena (freed on return) and duped into the slot's own arena by
-    /// spawnFetch — building them in the run arena would grow it by ~2x url
-    /// bytes per page for the life of the run.
+    /// Page strings are built in a scratch arena and duped into the slot's own;
+    /// building them in the run arena would grow it by ~2x URL bytes per page.
     fn spawnSlot(self: *HttpSource) !*Slot {
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
@@ -851,7 +802,6 @@ pub const HttpSource = struct {
         return self.spawnFetch(req, self.opts.retries);
     }
 
-    /// Spawn a slot for an explicit request (also the sequential timed path).
     fn spawnFetch(self: *HttpSource, req: PageReq, retries: i64) !*Slot {
         const slot = try self.gpa.create(Slot);
         slot.* = .{
@@ -891,11 +841,6 @@ pub const HttpSource = struct {
         }
     }
 
-    /// Worker thread (detached): GET one page. Reads ONLY the slot (never the
-    /// HttpSource, which lives in the run arena) plus the heap-allocated client,
-    /// whose pool is mutex-guarded. On completion the state CAS hands the slot
-    /// to the consumer — unless the consumer already abandoned it (timeout), in
-    /// which case the worker frees it.
     fn workerMain(slot: *Slot) void {
         const sa = slot.snap.allocator();
         var attempt: i64 = 0;
@@ -945,9 +890,8 @@ pub const HttpSource = struct {
         }
     }
 
-    /// Wait for a slot under the page deadline, polling so an abort (Ctrl+C)
-    /// interrupts a blocked fetch within ~25ms. On timeout/abort the slot is
-    /// abandoned to its worker and counted as a zombie.
+    /// Waits under the page deadline, polling so Ctrl+C interrupts within ~25ms. On
+    /// timeout or abort the slot is abandoned to its worker and counted as a zombie.
     fn awaitSlot(self: *HttpSource, slot: *Slot) !void {
         const deadline: i64 = if (self.opts.timeout_ms > 0)
             std.time.milliTimestamp() +| self.opts.timeout_ms
@@ -975,10 +919,8 @@ pub const HttpSource = struct {
         }
     }
 
-    /// Discard in-flight slots whose results are no longer wanted (end of data,
-    /// stop_short, teardown). One short SHARED grace window — they are usually
-    /// milliseconds from done — then abandon; nothing here waits a full page
-    /// deadline per slot.
+    /// Discards in-flight slots no longer wanted after one short shared grace window,
+    /// rather than waiting a full page deadline per slot.
     fn drainSlots(self: *HttpSource) void {
         const grace_ms: i64 = if (self.opts.timeout_ms > 0) @min(self.opts.timeout_ms, 5_000) else 5_000;
         const deadline = std.time.milliTimestamp() +| grace_ms;
@@ -988,8 +930,6 @@ pub const HttpSource = struct {
         self.slots.clearRetainingCapacity();
     }
 
-    /// End of dataset reached: requests already in flight past the end are
-    /// joined and discarded (same waste profile as any prefetch window).
     fn finishEmpty(self: *HttpSource) ?Batch {
         self.issue_done = true;
         self.drainSlots();
@@ -1081,9 +1021,8 @@ pub const HttpSource = struct {
         return aw.writer.buffered();
     }
 
-    /// Single status-disposition policy for every fetch path. 401 outranks the
-    /// retry_statuses mapping: session re-login gets first claim, and only when
-    /// auth declines (no auth kind / refresh failed) does listedFallback apply.
+    /// The single status policy for every fetch path: 401 goes to session re-login
+    /// first, and only when auth declines does `listedFallback` apply.
     fn raiseStatus(self: *HttpSource, code: u16, url: []const u8, body: []const u8) anyerror {
         obs.logOr(self.logger, .warn, "http {d} from {s}: {s}", .{ code, url, body[0..@min(body.len, 300)] });
         if (code == 401) return error.HttpUnauthorized;
@@ -1126,13 +1065,8 @@ pub const HttpSource = struct {
     }
 };
 
-/// Default User-Agent. Naming the tool beats std's generic `zig/x (std.http)`,
-/// which some endpoints filter as an unattended library client.
 pub const user_agent = "basalt/" ++ @import("build_options").version;
 
-/// The User-Agent to send: the one given via `header = 'User-Agent: ...'`, else
-/// our own. Returned separately from `buildHeaders` because it belongs on the
-/// client, not in `extra_headers`.
 pub fn userAgentOf(opts: Options) []const u8 {
     const h = opts.header orelse return user_agent;
     const colon = std.mem.indexOfScalar(u8, h, ':') orelse return user_agent;
@@ -1158,8 +1092,6 @@ fn buildHeaders(arena: std.mem.Allocator, opts: Options) ![]const std.http.Heade
     if (opts.header) |h| {
         const colon = std.mem.indexOfScalar(u8, h, ':') orelse return error.BadHeaderHint;
         const name = std.mem.trim(u8, h[0..colon], " ");
-        // User-Agent is set on the client instead; appending it here would send
-        // two, which several WAFs reject outright (GitHub answers 403).
         if (!std.ascii.eqlIgnoreCase(name, "user-agent")) {
             try hdrs.append(.{
                 .name = name,
@@ -1176,10 +1108,6 @@ fn envOpt(arena: std.mem.Allocator, name_opt: ?[]const u8) !?[]const u8 {
     return std.process.getEnvVarOwned(arena, name) catch return error.MissingAuthEnv;
 }
 
-/// The row array of a response: a bare array, the (dotted) `items` path into an
-/// object, or — with no path — a single object treated as one row.
-/// The rows of a response: the array at `items_path` (or the root), where a
-/// lone object — a detail endpoint's answer — is one row.
 fn itemsOf(arena: std.mem.Allocator, root: json.Value, items_path: ?[]const u8) ![]const json.Value {
     if (items_path) |p| {
         const v = jsonPath(root, p) orelse return error.ItemsFieldMissing;
@@ -1217,7 +1145,6 @@ fn jsonPath(root: json.Value, dotted: []const u8) ?json.Value {
     return cur;
 }
 
-/// `base&key=val` (no leading & when base is empty) — form-body composition.
 fn appendParam(arena: std.mem.Allocator, base: []const u8, key: []const u8, val: []const u8) ![]const u8 {
     const sep: []const u8 = if (base.len == 0) "" else "&";
     return std.fmt.allocPrint(arena, "{s}{s}{s}={s}", .{ base, sep, key, val });
@@ -1228,11 +1155,8 @@ fn withParam(arena: std.mem.Allocator, base: []const u8, key: []const u8, val: [
     return std.fmt.allocPrint(arena, "{s}{c}{s}={s}", .{ base, sep, key, val });
 }
 
-/// Map a non-200 status to a named error so failures are diagnosable from the
-/// error name alone. 429/5xx are worth a control-plane retry (exit 75); the
-/// 4xx family is config/auth — distinct names because each means a different
-/// fix (401: token expired mid-run -> re-auth + retry the step; 400: the
-/// server rejected the request, e.g. deep $skip paging).
+/// Maps a non-200 status to a named error, distinct per fix: 429/5xx are worth a
+/// control-plane retry (exit 75), 401 is an expired token, 400 a rejected request.
 pub fn statusError(code: u16) anyerror {
     if (code == 429 or code >= 500) return error.HttpServerBusy;
     return switch (code) {
@@ -1244,7 +1168,6 @@ pub fn statusError(code: u16) anyerror {
     };
 }
 
-/// Is `code` in a comma-separated status list ("404,408")?
 fn statusListed(list_opt: ?[]const u8, code: u16) bool {
     const list = list_opt orelse return false;
     var it = std.mem.splitScalar(u8, list, ',');
@@ -1256,26 +1179,18 @@ fn statusListed(list_opt: ?[]const u8, code: u16) bool {
     return false;
 }
 
-/// Worth an in-place retry: server overload/restart or a dropped connection.
-/// 4xx (other than 429, mapped to HttpServerBusy) is config — retrying lies.
-/// The socket set is the shared driver.transientNet, so the retry layers
-/// (sql reconnect, http backoff) can never drift apart.
+/// Worth an in-place retry. The socket set is the shared `driver.transientNet`,
+/// so the sql reconnect and http backoff layers can never drift apart.
 fn isRetryableNet(e: anyerror) bool {
     return e == error.HttpServerBusy or driver.transientNet(e);
 }
 
-/// Site-level transient classification: a socket failure that survived the
-/// retry budget surfaces as HttpTransportFailed — a name the run-level
-/// classifier can safely treat as transient. The ambient std.Io names
-/// (WriteFailed/ReadFailed/EndOfStream) must NOT be transient globally:
-/// a CSV sink's disk-full is also WriteFailed.
 fn mapTransport(e: anyerror) anyerror {
     if (e == error.HttpServerBusy) return e;
     return if (driver.transientNet(e)) error.HttpTransportFailed else e;
 }
 
-/// base * 2^(attempt-1), with +-30% time-seeded jitter so concurrent workers
-/// don't re-hammer in lockstep.
+/// base * 2^(attempt-1), with +-30% time-seeded jitter.
 fn retryDelayNs(base_ms: i64, attempt: i64) u64 {
     const shift: u6 = @intCast(@min(@max(attempt - 1, 0), 6));
     const base: u64 = @intCast(@max(base_ms, 1));
@@ -1316,7 +1231,6 @@ test "optsFromHints maps hint keys" {
     try std.testing.expectEqual(@as(i64, 5), o.max_pages);
 }
 
-/// Serve `responses` in order, one connection each; captures each request head.
 const TestServer = struct {
     listener: std.net.Server,
     responses: []const []const u8,

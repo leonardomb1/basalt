@@ -4,10 +4,30 @@
 //!   - HTTP Stream Load -> BE/FE: the actual data load.
 //! The write mode selects the table model: append/overwrite -> Duplicate Key,
 //! `upsert on k` -> Primary Key (keys reordered first + NOT NULL). What differs
-//! between the databases — DDL, a header's spelling — is the `Flavor`.
+//! between the databases — DDL, a header's spelling — is the `Flavor`. Doris
+//! splits rows on newlines unless told `line_delimiter` (it ignores
+//! `row_delimiter`), and loads non-strict by default, turning a bad value into a
+//! silent NULL; both are set explicitly.
 //!
-//! This file's pure logic (type mapping, DDL generation, TSV body, labels, auth)
-//! is unit-tested. The network paths require a live StarRocks to exercise.
+//! The body is fields separated by 0x01 and rows by 0x02, control bytes Stream
+//! Load does no quoting for; `\n` would let an embedded newline split a row.
+//! Stray 0x01/0x02 bytes in source text become spaces. NULL is `\N`, which has no
+//! escape in StarRocks CSV, so a value that is exactly `\N` is refused rather than
+//! silently loaded as NULL; loads run at max_filter_ratio=0, never partial.
+//!
+//! Each flush has a label, which makes it at-most-once within a run. Labels do not
+//! give cross-run idempotency (split ranges are reassigned to lanes
+//! non-deterministically); exactly-once across runs is owned by downstream dedup
+//! on a primary-key table, per the split.zig contract.
+//!
+//! `logger` and `errctx` are set by the runtime after `open`, so a refused load or
+//! DDL carries the server's own message (e.g. the missing privilege) into the
+//! run's error instead of only the log. Auto-create creates only what is missing:
+//! StarRocks checks the CREATE privilege before `IF NOT EXISTS` can no-op, so a
+//! role allowed only to load would otherwise be refused.
+//!
+//! The pure logic (type mapping, DDL, body, labels, auth) is unit-tested; the
+//! network paths need a live server.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -21,12 +41,10 @@ const op = @import("../exec/op.zig");
 
 const FLUSH_BYTES = 8 * 1024 * 1024;
 
-/// Which database a Stream Load connection talks to.
 pub const Flavor = enum {
     starrocks,
     doris,
 
-    /// The flavor a connection's `TYPE` names, or null for any other connector.
     pub fn of(connector: []const u8) ?Flavor {
         return std.meta.stringToEnum(Flavor, connector);
     }
@@ -35,7 +53,6 @@ pub const Flavor = enum {
         return @tagName(self);
     }
 
-    /// The dialect its FE is read and its DDL written in.
     pub fn dialect(self: Flavor) sql.Dialect {
         return switch (self) {
             .starrocks => .starrocks,
@@ -43,13 +60,9 @@ pub const Flavor = enum {
         };
     }
 
-    /// The Stream Load headers that carry the row delimiter and a partial
-    /// update.
     fn rowDelimiterHeader(self: Flavor) []const u8 {
         return switch (self) {
             .starrocks => "row_delimiter",
-            // Doris ignores `row_delimiter` and splits rows on newlines — a load
-            // that "succeeds" with every embedded newline cutting a row in two.
             .doris => "line_delimiter",
         };
     }
@@ -61,8 +74,6 @@ pub const Flavor = enum {
         };
     }
 
-    /// Doris loads in non-strict mode by default, where a value that does not
-    /// convert lands as NULL and the load still reports success.
     fn strict(self: Flavor) bool {
         return self == .doris;
     }
@@ -81,13 +92,10 @@ pub const Config = struct {
     auto_create: bool = true,
     label_prefix: []const u8 = "basalt",
     run_id: u64 = 0,
-    /// Where a refused DDL says why — StarRocks' own words, e.g. the privilege
-    /// it needs — so the run's error carries them, not only the log.
     errctx: ?*op.ErrCtx = null,
 };
 
-/// A single-quoted string literal for the FE's MySQL protocol: `'` doubled,
-/// and `\\` doubled since it is an escape there.
+/// A single-quoted literal for the FE's MySQL protocol: `'` and `\` doubled.
 fn appendStrLit(out: *std.array_list.Managed(u8), s: []const u8) !void {
     try out.append('\'');
     for (s) |c| switch (c) {
@@ -98,13 +106,10 @@ fn appendStrLit(out: *std.array_list.Managed(u8), s: []const u8) !void {
     try out.append('\'');
 }
 
-/// The StarRocks column type for an engine type (`sql.Dialect.starrocks.ddlType`).
 pub fn srType(arena: std.mem.Allocator, t: types.Type) ![]const u8 {
     return sql.Dialect.starrocks.ddlType(arena, t, false);
 }
 
-/// `CREATE TABLE IF NOT EXISTS` for `db`.`table` — the shared DDL builder with
-/// the flavor's table-model clauses; see `sql.createTableSqlWith`.
 pub fn genCreateTable(
     arena: std.mem.Allocator,
     flavor: Flavor,
@@ -119,48 +124,25 @@ pub fn genCreateTable(
     return sql.createTableSqlWith(arena, flavor.dialect(), qtable, schema, mode, .{ .buckets = buckets, .replication_num = replication_num });
 }
 
-/// Stream Load label: `<prefix>_<table>_<run_id>_<seq>`. The label makes each flush
-/// at-most-once within a run (StarRocks rejects a duplicate label). It does NOT give
-/// cross-run idempotency: split key-ranges are re-probed each run and work-stealing
-/// assigns them to lanes non-deterministically, so the same (prefix, run_id, seq) can
-/// cover different rows on a re-run. Exactly-once across re-runs is owned by downstream
-/// dedup (a StarRocks primary-key table), per the split.zig contract — not by run_id.
-///
-/// StarRocks validates the label against `^[-\\w]{1,128}$`, so anything the table name
-/// carries that is not a letter, digit, `_` or `-` becomes `_`. A qualified target is the
-/// case that matters: `scratch.cvm_cad_fi` used to produce a label with a dot in it and
-/// the load was rejected outright with "Label format error".
+/// `<prefix>_<table>_<run_id>_<seq>`, with every byte outside `[-\w]` folded to `_`:
+/// a qualified target's dot once got the load rejected with "Label format error".
+/// Over 128 bytes the head is cut, keeping the run id and sequence that make it unique.
 pub fn genLabel(arena: std.mem.Allocator, prefix: []const u8, table: []const u8, run_id: u64, seq: u64) ![]const u8 {
     const raw = try std.fmt.allocPrint(arena, "{s}_{s}_{d}_{d}", .{ prefix, table, run_id, seq });
     for (raw) |*c| {
         const ok = std.ascii.isAlphanumeric(c.*) or c.* == '_' or c.* == '-';
         if (!ok) c.* = '_';
     }
-    // 128 is the hard ceiling; the tail carries the run id and sequence, which are what
-    // make the label unique, so an over-long table name loses its head rather than them.
     if (raw.len > 128) return raw[raw.len - 128 ..];
     return raw;
 }
 
-/// The comma-joined column list for the Stream Load `columns` header. Names are
-/// backtick-quoted: source field names can contain spaces or symbols (e.g.
-/// payroll APIs emitting keys like "extra noturna 110"), which the header's
-/// SQL-ish parser would otherwise reject.
+/// Backtick-quoted: source field names can hold spaces or symbols the `columns`
+/// header's parser would otherwise reject.
 pub fn columnList(arena: std.mem.Allocator, schema: types.Schema) ![]const u8 {
-    // backtick quoting, as every flavor's FE takes it
     return sql.colList(arena, .starrocks, schema);
 }
 
-/// Append a batch to the load buffer. Fields are separated by 0x01 (`\x01`, set
-/// as the Stream Load `column_separator`) and rows by 0x02 (`\x02`, set as the
-/// `row_delimiter`) — control bytes StarRocks CSV does no quoting for. A literal
-/// `\n` is NOT used as the row delimiter because text columns routinely contain
-/// embedded newlines, which would otherwise split one row into several and break
-/// the column count. ERP text/memo columns do carry stray 0x01/0x02 bytes in
-/// practice (e.g. Protheus memo fields), so values are sanitized: those two
-/// bytes are replaced with a space. Nulls are `\N`, and a non-null value that
-/// is itself `\N` is an error rather than a silent null.
-/// What Stream Load reads as NULL. Unescapable — see `appendBatchTsv`.
 const NULL_MARKER = "\\N";
 
 pub fn appendBatchTsv(w: anytype, arena: std.mem.Allocator, batch: Batch) !void {
@@ -173,12 +155,6 @@ pub fn appendBatchTsv(w: anytype, arena: std.mem.Allocator, batch: Batch) !void 
                 try w.writeAll(NULL_MARKER);
             } else {
                 const s = try sql.valueText(arena, v, .{ .bool_true = "true", .bool_false = "false" });
-                // StarRocks CSV has no escape for the null marker: a field whose
-                // bytes are exactly `\N` is NULL whatever we do — `enclose` does
-                // not exempt it, and backslashes are never unescaped, so `\\N`
-                // arrives as three characters. Writing the value through would
-                // silently turn it into NULL, so refuse. The load already runs
-                // at max_filter_ratio=0; this sink does not do partial data.
                 if (std.mem.eql(u8, s, NULL_MARKER)) return error.StreamLoadNullMarkerInData;
                 try writeSanitized(w, s);
             }
@@ -187,8 +163,6 @@ pub fn appendBatchTsv(w: anytype, arena: std.mem.Allocator, batch: Batch) !void 
     }
 }
 
-/// Write `s` with any separator/delimiter bytes (0x01, 0x02) replaced by a space,
-/// so data can never shift the Stream Load column or row framing.
 fn writeSanitized(w: anytype, s: []const u8) !void {
     var start: usize = 0;
     for (s, 0..) |b, i| {
@@ -212,13 +186,7 @@ pub const StreamLoadSink = struct {
     seq: u64 = 0,
     run_id: u64 = 0,
     client: std.http.Client,
-    /// Set by the runtime after open(): error diagnostics go through the
-    /// structured logger; null (tests/embedded) falls back to raw stderr.
     logger: ?*obs.Logger = null,
-    /// Also set by the runtime: carries the reason a load failed into the final
-    /// message. Without it the caller saw `StreamLoadFailed` while the answer —
-    /// StarRocks' own `Message`, e.g. "you need the INSERT privilege" — was only in
-    /// the log above it.
     errctx: ?*op.ErrCtx = null,
 
     pub fn open(gpa: std.mem.Allocator, cfg: Config, table: []const u8, schema: types.Schema, mode: ast.WriteMode) !*StreamLoadSink {
@@ -243,12 +211,6 @@ pub const StreamLoadSink = struct {
         errdefer self.buffer.deinit();
         errdefer self.client.deinit();
         if (cfg.auto_create) {
-            // Create only what is missing. A role that may load into an existing
-            // table need hold no CREATE privilege — StarRocks checks it before
-            // `IF NOT EXISTS` can make the statement a no-op, so asking anyway
-            // refused the load. The table is looked for first: when it is there
-            // the database is too, and a role granted only the table may not see
-            // the database in `schemata` at all.
             if (!try self.exists("information_schema.tables", "TABLE_SCHEMA", cfg.database, table)) {
                 if (!try self.exists("information_schema.schemata", "SCHEMA_NAME", cfg.database, null)) {
                     const cdb = try std.fmt.allocPrint(gpa, "CREATE DATABASE IF NOT EXISTS `{s}`", .{cfg.database});
@@ -283,10 +245,9 @@ pub const StreamLoadSink = struct {
         };
     }
 
-    /// Whether `information_schema` lists the database (`table` null) or the
-    /// table, matched by equality — `_` in a name is a LIKE wildcard. A catalog
-    /// that cannot be asked answers "no", which leaves the `IF NOT EXISTS` DDL to
-    /// decide, as it always did.
+    /// Whether `information_schema` lists the database (`table` null) or the table,
+    /// matched by equality since `_` is a LIKE wildcard. A catalog that cannot be
+    /// asked answers "no", leaving the decision to the `IF NOT EXISTS` DDL.
     fn exists(self: *StreamLoadSink, view: []const u8, schema_col: []const u8, db: []const u8, table: ?[]const u8) !bool {
         var q = std.array_list.Managed(u8).init(self.gpa);
         defer q.deinit();
@@ -297,7 +258,6 @@ pub const StreamLoadSink = struct {
             try appendStrLit(&q, t);
         }
         const conn = mysql.Conn.connect(self.gpa, self.cfg.fe_host, self.cfg.fe_port, self.cfg.user, self.cfg.password, "", .off) catch return false;
-        // the cursor owns the connection from here and closes it
         var cur = conn.sqlConn().queryCursor(q.items) catch {
             conn.close();
             return false;
@@ -324,9 +284,7 @@ pub const StreamLoadSink = struct {
         try self.flush();
     }
 
-    /// Failure path: drop the buffered TSV without a final Stream Load. Loads
-    /// that already went out are committed server-side and stay (downstream
-    /// dedup owns exactly-once, per the label scheme above).
+    /// Drops the buffered body; loads already sent are committed and stay.
     pub fn abort(self: *StreamLoadSink) void {
         self.teardown();
     }
@@ -409,9 +367,8 @@ pub const StreamLoadSink = struct {
     }
 };
 
-/// One string field of a flat JSON object, unescaped only as far as StarRocks'
-/// own responses need — this runs on the failure path to quote a message back, not
-/// to interpret arbitrary JSON.
+/// One string field of a flat JSON object, unescaped only as far as the server's
+/// own responses need; not a general JSON parser.
 fn jsonField(body: []const u8, name: []const u8) ?[]const u8 {
     var needle_buf: [64]u8 = undefined;
     const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{name}) catch return null;
@@ -531,7 +488,6 @@ test "create table: Doris appends to a keyless duplicate table and upserts into 
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    // A DOUBLE or STRING first column is no key Doris accepts, so append takes none.
     const schema = types.Schema{ .fields = &.{
         .{ .name = "score", .ty = types.Type.init(.float) },
         .{ .name = "name", .ty = types.Type.init(.string) },
@@ -558,9 +514,7 @@ test "label and column list" {
     defer ar.deinit();
     const a = ar.allocator();
     try std.testing.expectEqualStrings("basalt_orders_99_3", try genLabel(a, "basalt", "orders", 99, 3));
-    // A qualified target: the dot is not legal in a label, so it is folded to `_`.
     try std.testing.expectEqualStrings("basalt_scratch_cvm_cad_fi_99_3", try genLabel(a, "basalt", "scratch.cvm_cad_fi", 99, 3));
-    // And the length ceiling keeps the run id and sequence, which carry the uniqueness.
     const long = try genLabel(a, "basalt", "x" ** 200, 99, 3);
     try std.testing.expectEqual(@as(usize, 128), long.len);
     try std.testing.expect(std.mem.endsWith(u8, long, "_99_3"));
@@ -632,8 +586,6 @@ test "a value that is literally the null marker is refused, not written as null"
     var out = std.array_list.Managed(u8).init(a);
     try std.testing.expectError(error.StreamLoadNullMarkerInData, appendBatchTsv(out.writer(), a, batch));
 
-    // Only the whole field is ambiguous — `\N` inside a longer value is data,
-    // and StarRocks reads it back verbatim.
     var b1 = columnmod.Builder.init(a, str_ty);
     try b1.append(.{ .string = "a\\Nb" });
     const cols2 = try a.alloc(columnmod.Column, 1);

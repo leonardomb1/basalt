@@ -1,19 +1,28 @@
-//! An SSH-2 client — just enough transport for SFTP.
+//! An SSH-2 client, just enough transport for SFTP.
 //!
 //! Key exchange is curve25519-sha256 (RFC 8731), with OpenSSH's strict-kex
 //! extension: sequence numbers restart at each NEWKEYS and the first exchange
 //! admits no other message, which is what closes the Terrapin prefix-truncation
 //! attack (CVE-2023-48795) on chacha20-poly1305. The server's host key is checked
-//! twice — its signature over the exchange hash, and the key itself against
-//! `known_hosts` or a pinned fingerprint — and an unknown or changed key is
+//! twice, its signature over the exchange hash and the key itself against
+//! `known_hosts` or a pinned fingerprint, and an unknown or changed key is
 //! refused, never trusted on first use: a file transfer to the wrong host is a
-//! leak, not a hiccup.
+//! leak, not a hiccup. Host key algorithms are offered with those `known_hosts`
+//! holds for the server first, as OpenSSH does, else a server with an ECDSA key on
+//! file would be asked for its Ed25519 one and refused.
 //!
 //! Ciphers: chacha20-poly1305@openssh.com and AES-GCM, and AES-CTR with
 //! HMAC-SHA2 (plain or encrypt-then-MAC) for the file-transfer appliances that
-//! offer nothing newer. Host keys: Ed25519, ECDSA P-256, RSA with SHA-2. Login:
-//! password, keyboard-interactive, or an Ed25519 key (passphrase-protected too).
-//! The server may rekey at any moment; that is handled where it is met.
+//! offer nothing newer. AES leads only where the CPU has AES instructions (about
+//! five times std's chacha20-poly1305, and SFTP throughput is the cipher's).
+//! Host keys: Ed25519, ECDSA P-256, RSA with SHA-2. Login: password,
+//! keyboard-interactive, or an Ed25519 key (passphrase-protected too).
+//!
+//! The server may rekey at any moment; that is handled where it is met. Channel
+//! data arriving while a send waits on the window is held for the next `recv`. A
+//! packet longer than `max_packet` is refused rather than buffered. The failure
+//! text (`why`, and the thread-local copy that outlives a failed `connect`) holds
+//! the server's disconnect message or a fingerprint, never a secret.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -40,7 +49,6 @@ pub const Error = error{
     SshHostKeyUnknown,
     SshHostKeyChanged,
     SshHostKeyRevoked,
-    /// A bare fingerprint pin did not match this key; another of the server's may.
     SshHostKeyRetry,
     SshBadHostSignature,
     SshAuthFailed,
@@ -55,20 +63,14 @@ pub const Config = struct {
     port: u16 = 22,
     user: []const u8,
     password: ?[]const u8 = null,
-    /// An OpenSSH private key file (`openssh-key-v1`): Ed25519.
     key_file: ?[]const u8 = null,
     key_passphrase: ?[]const u8 = null,
-    /// `known_hosts` to check the server against; `~/.ssh/known_hosts` when null.
     known_hosts: ?[]const u8 = null,
-    /// A pinned host key — `SHA256:…` as the error for an unknown host prints
-    /// it, or a public key line `ssh-ed25519 AAAA…` — instead of `known_hosts`.
     host_key: ?[]const u8 = null,
 };
 
 const client_version = "SSH-2.0-basalt";
 
-/// Why the last session on this thread failed, kept past the session: a failed
-/// `connect` frees it before the caller could ask.
 threadlocal var failure_buf: [512]u8 = undefined;
 threadlocal var failure_len: usize = 0;
 
@@ -80,7 +82,6 @@ pub fn clearFailure() void {
     failure_len = 0;
 }
 
-// message numbers (RFC 4250 §4.1)
 const msg = struct {
     const disconnect = 1;
     const ignore = 2;
@@ -113,8 +114,6 @@ const msg = struct {
     const channel_success = 99;
     const channel_failure = 100;
 };
-
-// --- wire encoding ----------------------------------------------------------
 
 pub const Buf = struct {
     list: std.array_list.Managed(u8),
@@ -190,20 +189,17 @@ pub const Cursor = struct {
     }
 };
 
-/// `name` in a comma-separated name-list.
 fn listHas(list: []const u8, name: []const u8) bool {
     var it = std.mem.splitScalar(u8, list, ',');
     while (it.next()) |n| if (std.mem.eql(u8, n, name)) return true;
     return false;
 }
 
-/// The first of `ours` the server also lists — RFC 4253 §7.1's rule.
+/// The first of `ours` the server also lists (RFC 4253 §7.1).
 fn pick(ours: []const []const u8, theirs: []const u8) ?[]const u8 {
     for (ours) |n| if (listHas(theirs, n)) return n;
     return null;
 }
-
-// --- ciphers ----------------------------------------------------------------
 
 const CipherKind = enum {
     none,
@@ -244,7 +240,6 @@ const CipherKind = enum {
             else => 16,
         };
     }
-    /// The cipher authenticates the packet itself; no separate MAC is chosen.
     fn aead(self: CipherKind) bool {
         return self == .chacha or self == .gcm128 or self == .gcm256;
     }
@@ -278,17 +273,12 @@ const MacKind = enum {
     }
 };
 
-/// AES first where the build has the CPU's AES instructions: there AES-GCM runs
-/// at five times the standard library's chacha20-poly1305 (about 900 MB/s
-/// against 180 on one core), and SFTP throughput is the cipher's. Without them
-/// AES is a table-free software cipher, slower than chacha, which leads.
 const cipher_prefs = if (builtin.cpu.arch == .x86_64 and builtin.cpu.has(.x86, .aes) and builtin.cpu.has(.x86, .pclmul))
     [_]CipherKind{ .gcm128, .gcm256, .chacha, .ctr128, .ctr256 }
 else
     [_]CipherKind{ .chacha, .gcm256, .gcm128, .ctr256, .ctr128 };
 const mac_prefs = [_]MacKind{ .sha256_etm, .sha512_etm, .sha256, .sha512 };
 
-/// One direction's keys and counters.
 const Dir = struct {
     cipher: CipherKind = .none,
     mac: MacKind = .none,
@@ -317,7 +307,6 @@ const Dir = struct {
         }
     }
 
-    /// AES-CTR over `buf` in place, the counter carried from packet to packet.
     fn ctrXor(self: *Dir, buf: []u8) void {
         switch (self.cipher) {
             .ctr128 => ctrRun(crypto.core.aes.Aes128, self.key[0..16].*, &self.iv, buf),
@@ -326,8 +315,8 @@ const Dir = struct {
         }
     }
 
-    /// The GCM nonce: four fixed bytes and a 64-bit invocation counter that
-    /// steps once per packet (RFC 5647 §7.1).
+    /// The GCM nonce: four fixed bytes and a 64-bit invocation counter that steps
+    /// once per packet (RFC 5647 §7.1).
     fn gcmNonce(self: *Dir) [12]u8 {
         const n: [12]u8 = self.iv[0..12].*;
         const ctr = std.mem.readInt(u64, self.iv[4..12], .big);
@@ -344,21 +333,17 @@ fn ctrRun(comptime Aes: type, key: [Aes.key_bits / 8]u8, ctr: *[16]u8, buf: []u8
         ctx.encrypt(&ks, ctr);
         const n = @min(16, buf.len - i);
         for (buf[i..][0..n], ks[0..n]) |*b, k| b.* ^= k;
-        // the whole 128-bit block is one big-endian counter
         var c = std.mem.readInt(u128, ctr, .big);
         c +%= 1;
         std.mem.writeInt(u128, ctr, c, .big);
     }
 }
 
-// --- the session ------------------------------------------------------------
-
 pub const Session = struct {
     gpa: std.mem.Allocator,
     stream: std.net.Stream,
     sr: std.net.Stream.Reader,
     sw: std.net.Stream.Writer,
-    /// Holds a whole packet: the reader can only `take` what fits its buffer.
     rbuf: [max_packet + 1024]u8 = undefined,
     wbuf: [64 * 1024]u8 = undefined,
     cfg: Config,
@@ -366,28 +351,18 @@ pub const Session = struct {
     session_id: [32]u8 = undefined,
     have_session_id: bool = false,
     strict: bool = false,
-    /// Host key algorithms in the order offered: those `known_hosts` (or the
-    /// pin) has a key of for this server first, as OpenSSH does — else a server
-    /// with an ECDSA key on file would be asked for its Ed25519 one, and refused.
     hk_order: [host_key_algs.len][]const u8 = host_key_algs,
     hk_n: usize = host_key_algs.len,
-    /// The methods the server's last USERAUTH_FAILURE listed.
     auth_methods: [128]u8 = undefined,
     auth_methods_len: usize = 0,
-    /// Across the connects one bare `SHA256:` pin may take: the key types tried.
     pin_try: ?*PinTry = null,
-    /// The server offers a host key type not yet tried against the pin.
     hk_more: bool = false,
     tx: Dir = .{},
     rx: Dir = .{},
-    /// The last payload read; valid until the next read.
     packet: std.array_list.Managed(u8),
     out: std.array_list.Managed(u8),
-    /// Why the last call failed, in words — the server's disconnect message, a
-    /// host key's fingerprint. Never a secret.
     why: std.array_list.Managed(u8),
 
-    // the one channel this client opens
     chan_local: u32 = 0,
     chan_remote: u32 = 0,
     remote_window: u64 = 0,
@@ -395,16 +370,13 @@ pub const Session = struct {
     local_window: u64 = 0,
     chan_open: bool = false,
     eof: bool = false,
-    /// Channel data that arrived while a send waited, kept for the next `recv`.
     held: std.array_list.Managed(u8),
 
     const local_window_size: u32 = 2 * 1024 * 1024;
-    /// OpenSSH's own channel packet size.
     const local_max_packet: u32 = 32 * 1024;
 
-    /// A bare fingerprint names no key type, and a server has several keys: one
-    /// that does not match is followed by a connect asking for the next type, so
-    /// any of the fingerprints `ssh-keyscan` prints pins the server.
+    /// A bare fingerprint pin names no key type: a key that does not match is followed
+    /// by a connect asking for the next type, so any fingerprint `ssh-keyscan` prints pins the server.
     pub fn connect(gpa: std.mem.Allocator, cfg: Config) !*Session {
         var pt = PinTry{};
         while (true) return connectOnce(gpa, cfg, &pt) catch |e| {
@@ -469,8 +441,6 @@ pub const Session = struct {
     fn reader(self: *Session) *std.Io.Reader {
         return self.sr.interface();
     }
-
-    // --- packets ---------------------------------------------------------------
 
     fn sendPacket(self: *Session, payload: []const u8) !void {
         const d = &self.tx;
@@ -615,23 +585,19 @@ pub const Session = struct {
             },
         }
         d.seq +%= 1;
-        // padding_length || payload || padding
         if (p.items.len < 1) return error.SshProtocol;
         const padn = p.items[0];
         if (padn + 1 > p.items.len) return error.SshProtocol;
         return p.items[1 .. p.items.len - padn];
     }
 
-    // --- key exchange ----------------------------------------------------------
-
+    /// Reads the server's version line inclusive of its `\n`: the exclusive form left
+    /// that byte unread ahead of the first binary packet.
     fn handshake(self: *Session) !void {
-        // version exchange: the server may send lines before its identification
         self.sw.interface.writeAll(client_version ++ "\r\n") catch return error.SshDisconnected;
         self.sw.interface.flush() catch return error.SshDisconnected;
         var tries: usize = 0;
         while (tries < 64) : (tries += 1) {
-            // inclusive: the exclusive form leaves the `\n` unread, a byte ahead of
-            // the first binary packet
             const line = self.reader().takeDelimiterInclusive('\n') catch return error.SshDisconnected;
             const l = std.mem.trimRight(u8, line, "\r\n");
             if (std.mem.startsWith(u8, l, "SSH-")) {
@@ -672,8 +638,8 @@ pub const Session = struct {
         try out.u32be(0);
     }
 
-    /// A key exchange: the first, or a rekey the server started with the
-    /// KEXINIT it sent (`their`).
+    /// A key exchange: the first, or a rekey the server started with the KEXINIT it
+    /// sent (`their`).
     fn kex(self: *Session, their: ?[]const u8) !void {
         const first = !self.have_session_id;
         var ic = Buf.init(self.gpa);
@@ -704,7 +670,6 @@ pub const Session = struct {
         const comp_sc = try c.str();
         if (first and listHas(kex_algs, "kex-strict-s-v00@openssh.com")) {
             self.strict = true;
-            // strict kex (the Terrapin fix) wants the server's KEXINIT as its first packet
             if (self.rx.seq != 1) return self.fail(error.SshProtocol, "packets before the server's KEXINIT in a strict key exchange", .{});
         }
         _ = pick(&.{ "curve25519-sha256", "curve25519-sha256@libssh.org" }, kex_algs) orelse
@@ -720,7 +685,6 @@ pub const Session = struct {
         try self.chooseCiphers(&next_tx, enc_cs, mac_cs);
         try self.chooseCiphers(&next_rx, enc_sc, mac_sc);
 
-        // ECDH
         const kp = X25519.KeyPair.generate();
         var ecdh = Buf.init(self.gpa);
         defer ecdh.deinit();
@@ -825,8 +789,8 @@ pub const Session = struct {
         @memcpy(out, acc[0..out.len]);
     }
 
-    /// The next packet during a key exchange. In a strict first exchange any
-    /// other message is fatal; otherwise the ignorable ones are skipped.
+    /// The next packet during a key exchange. In a strict first exchange any other
+    /// message is fatal; otherwise the ignorable ones are skipped.
     fn nextKex(self: *Session, first: bool) ![]const u8 {
         while (true) {
             const p = try self.readPacket();
@@ -848,8 +812,8 @@ pub const Session = struct {
         return self.fail(error.SshDisconnected, "the server disconnected: {s}", .{why});
     }
 
-    /// The next connection-level message: ignorable ones skipped, a rekey run
-    /// where it is met, a global request refused.
+    /// The next connection-level message: ignorable ones skipped, a rekey run where
+    /// it is met, a global request refused.
     fn next(self: *Session) ![]const u8 {
         while (true) {
             const p = try self.readPacket();
@@ -872,9 +836,6 @@ pub const Session = struct {
         }
     }
 
-    // --- host keys ---------------------------------------------------------------
-
-    /// The `known_hosts` file's text, owned; empty when there is none.
     fn knownHostsText(self: *Session) ![]const u8 {
         const path = self.cfg.known_hosts orelse blk: {
             const home = std.posix.getenv("HOME") orelse return "";
@@ -933,8 +894,6 @@ pub const Session = struct {
         }
     }
 
-    // --- authentication ----------------------------------------------------------
-
     fn authenticate(self: *Session) !void {
         var b = Buf.init(self.gpa);
         defer b.deinit();
@@ -956,7 +915,6 @@ pub const Session = struct {
         return self.fail(error.SshAuthFailed, "the server refused the login for {s}@{s} (it accepts: {s})", .{ self.cfg.user, self.cfg.host, self.auth_methods[0..self.auth_methods_len] });
     }
 
-    /// The answer to a userauth request: true on success, false on failure.
     fn authReply(self: *Session) !bool {
         while (true) {
             const p = try self.next();
@@ -968,7 +926,6 @@ pub const Session = struct {
         }
     }
 
-    /// Keeps the methods a USERAUTH_FAILURE says can continue, for the message.
     fn authRefused(self: *Session, p: []const u8) bool {
         var c = Cursor{ .s = p[1..] };
         const methods = c.str() catch "";
@@ -1080,9 +1037,6 @@ pub const Session = struct {
         return self.authReply();
     }
 
-    // --- the channel ---------------------------------------------------------------
-
-    /// Open a session channel and start `name` on it (`sftp`).
     pub fn openSubsystem(self: *Session, name: []const u8) !void {
         var b = Buf.init(self.gpa);
         defer b.deinit();
@@ -1133,8 +1087,7 @@ pub const Session = struct {
         self.remote_window += try c.u32be();
     }
 
-    /// Send `data` on the channel, cut to the peer's packet size and waiting on
-    /// its window.
+    /// Send `data` on the channel, cut to the peer's packet size and waiting on its window.
     pub fn send(self: *Session, data: []const u8) !void {
         var rest = data;
         var b = Buf.init(self.gpa);
@@ -1145,7 +1098,6 @@ pub const Session = struct {
                 switch (p[0]) {
                     msg.channel_window_adjust => try self.onWindow(p),
                     msg.channel_eof, msg.channel_close => return self.fail(error.SshDisconnected, "the server closed the channel", .{}),
-                    // data arriving while we wait is held for `recv`
                     msg.channel_data => try self.stash(p),
                     else => {},
                 }
@@ -1169,7 +1121,6 @@ pub const Session = struct {
         try self.consumed(d.len);
     }
 
-    /// Append the next channel data to `out`, at least one byte; error at EOF.
     pub fn recv(self: *Session, out: *std.array_list.Managed(u8)) !void {
         if (self.held.items.len > 0) {
             try out.appendSlice(self.held.items);
@@ -1198,7 +1149,6 @@ pub const Session = struct {
                     return self.fail(error.SshDisconnected, "the server closed the channel", .{});
                 },
                 msg.channel_request => {
-                    // exit-status and the like: answer a want-reply with failure
                     _ = try c.u32be();
                     _ = try c.str();
                     if (try c.boolean()) {
@@ -1230,9 +1180,6 @@ pub const Session = struct {
     }
 };
 
-/// The largest packet read, past which a length is refused rather than
-/// buffered. RFC 4253 §6.1 asks for 35000 at least; channel data comes in at
-/// most `local_max_packet`.
 const max_packet = 256 * 1024;
 
 fn checkLen(n: u32) !void {
@@ -1252,8 +1199,7 @@ fn keyTypeOfAlg(alg: []const u8) []const u8 {
     return alg;
 }
 
-/// `SHA256:` and the unpadded base64 of the key blob's SHA-256, as OpenSSH
-/// prints it.
+/// `SHA256:` and the unpadded base64 of the key blob's SHA-256, as OpenSSH prints it.
 pub fn fingerprint(blob: []const u8, out: *[64]u8) []const u8 {
     var h: [32]u8 = undefined;
     Sha256.hash(blob, &h, .{});
@@ -1276,12 +1222,6 @@ fn keyLineMatches(gpa: std.mem.Allocator, line: []const u8, blob: []const u8) bo
 
 const Verdict = enum { ok, unknown, changed, revoked };
 
-/// What `known_hosts` says of `blob` for `host`:`port`. Patterns are `host`,
-/// `[host]:port` off port 22, comma lists, `*`/`?` wildcards, `!negations`, and
-/// hashed `|1|salt|hash` (HMAC-SHA1 of the name). `@revoked` refuses the key;
-/// `@cert-authority` is not supported and skipped. Only entries of the
-/// negotiated key type count, as OpenSSH counts them.
-/// The host keys a bare fingerprint pin was checked against, connect to connect.
 const PinTry = struct {
     types: [host_key_algs.len][]const u8 = undefined,
     n: usize = 0,
@@ -1308,7 +1248,6 @@ const PinTry = struct {
 
 const host_key_algs = [_][]const u8{ "ssh-ed25519", "ecdsa-sha2-nistp256", "rsa-sha2-512", "rsa-sha2-256" };
 
-/// Which of `host_key_algs` `known_hosts` holds a key type of for the server.
 fn knownKeyTypes(text: []const u8, host: []const u8, port: u16, known: *[host_key_algs.len]bool) void {
     var name_buf: [300]u8 = undefined;
     const name = if (port == 22) host else (std.fmt.bufPrint(&name_buf, "[{s}]:{d}", .{ host, port }) catch return);
@@ -1326,6 +1265,9 @@ fn knownKeyTypes(text: []const u8, host: []const u8, port: u16, known: *[host_ke
     }
 }
 
+/// What `known_hosts` says of `blob` for `host`:`port`: `[host]:port`, wildcards,
+/// negations and hashed `|1|salt|hash` names are matched; `@revoked` refuses the key,
+/// `@cert-authority` is skipped, and only entries of the negotiated key type count.
 pub fn knownHostsVerdict(gpa: std.mem.Allocator, text: []const u8, host: []const u8, port: u16, key_type: []const u8, blob: []const u8) !Verdict {
     var name_buf: [300]u8 = undefined;
     const name = if (port == 22) host else (std.fmt.bufPrint(&name_buf, "[{s}]:{d}", .{ host, port }) catch return .unknown);
@@ -1391,7 +1333,6 @@ fn hashedMatch(field: []const u8, name: []const u8) bool {
     return std.mem.eql(u8, &got, want[0..hl]);
 }
 
-/// `*` and `?` over a host name, case-insensitively.
 fn glob(pat: []const u8, s: []const u8) bool {
     if (pat.len == 0) return s.len == 0;
     if (pat[0] == '*') {
@@ -1404,7 +1345,6 @@ fn glob(pat: []const u8, s: []const u8) bool {
     return glob(pat[1..], s[1..]);
 }
 
-/// Check `sig` over the exchange hash `h` with host key `blob`.
 fn verifySignature(self: *Session, blob: []const u8, alg: []const u8, sig: []const u8, h: *const [32]u8) !void {
     var kc = Cursor{ .s = blob };
     const ktype = try kc.str();
@@ -1458,7 +1398,6 @@ fn verifySignature(self: *Session, blob: []const u8, alg: []const u8, sig: []con
     return self.fail(bad, "host key type {s} is not supported", .{ktype});
 }
 
-/// An mpint's magnitude right-aligned in `out`; false when it does not fit.
 fn fitInt(m: []const u8, out: []u8) bool {
     var b = m;
     while (b.len > 0 and b[0] == 0) b = b[1..];
@@ -1467,11 +1406,9 @@ fn fitInt(m: []const u8, out: []u8) bool {
     return true;
 }
 
-// --- private keys -------------------------------------------------------------
-
 const PrivateKey = struct { public: [32]u8, secret: [64]u8 };
 
-/// An `openssh-key-v1` Ed25519 private key (OpenSSH's PROTOCOL.key), plain or
+/// An `openssh-key-v1` Ed25519 private key (OpenSSH PROTOCOL.key), plain or
 /// encrypted with aes256-ctr under bcrypt-pbkdf as `ssh-keygen` writes it.
 fn parsePrivateKey(gpa: std.mem.Allocator, text: []const u8, passphrase: ?[]const u8) !PrivateKey {
     const begin = "-----BEGIN OPENSSH PRIVATE KEY-----";
@@ -1495,7 +1432,7 @@ fn parsePrivateKey(gpa: std.mem.Allocator, text: []const u8, passphrase: ?[]cons
     const kdf = try c.str();
     const kdf_opts = try c.str();
     if (try c.u32be() != 1) return error.SshKeyUnsupported;
-    _ = try c.str(); // public key
+    _ = try c.str();
     const sec_in = try c.str();
     const sec = try gpa.dupe(u8, sec_in);
     defer {
@@ -1517,7 +1454,6 @@ fn parsePrivateKey(gpa: std.mem.Allocator, text: []const u8, passphrase: ?[]cons
     var pc = Cursor{ .s = sec };
     const c1 = try pc.u32be();
     const c2 = try pc.u32be();
-    // the check words match only when the passphrase was right
     if (c1 != c2) return error.SshKeyPassphrase;
     const ktype = try pc.str();
     if (!std.mem.eql(u8, ktype, "ssh-ed25519")) return error.SshKeyUnsupported;
@@ -1556,10 +1492,8 @@ test "known_hosts: plain, bracketed port, lists, wildcards, hashed, revoked, cha
     try std.testing.expectEqual(Verdict.ok, try knownHostsVerdict(a, text, "SFTP.Bank.Example", 22, "ssh-ed25519", blob));
     try std.testing.expectEqual(Verdict.revoked, try knownHostsVerdict(a, text, "bad.example", 22, "ssh-ed25519", blob));
     try std.testing.expectEqual(Verdict.changed, try knownHostsVerdict(a, text, "old.example", 22, "ssh-ed25519", blob));
-    // another key type for the host is not a change
     try std.testing.expectEqual(Verdict.unknown, try knownHostsVerdict(a, text, "old.example", 22, "ssh-rsa", blob));
 
-    // hashed: |1|base64(salt)|base64(HMAC-SHA1(salt, name))
     const salt = "0123456789abcdef0123";
     var mac: [20]u8 = undefined;
     HmacSha1.create(&mac, "hidden.example", salt);
@@ -1583,7 +1517,6 @@ test "known_hosts: key types on file for the server lead the offer" {
 test "fingerprint as OpenSSH prints it" {
     var out: [64]u8 = undefined;
     const fp = fingerprint("", &out);
-    // SHA-256 of nothing, base64 without padding
     try std.testing.expectEqualStrings("SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU", fp);
 }
 
@@ -1608,7 +1541,6 @@ test "live: log in and open sftp (BASALT_SSH_TEST_PORT)" {
         try s.openSubsystem("sftp");
         std.debug.print("ok: tx {s}/{s} strict={}\n", .{ s.tx.cipher.name(), s.tx.mac.name(), s.strict });
     }
-    // an unknown host and a wrong pin are refused; the right pin is enough alone
     try std.testing.expectError(error.SshHostKeyUnknown, Session.connect(a, .{ .host = "127.0.0.1", .port = port, .user = "basalt", .password = "pw", .known_hosts = "/dev/null" }));
     try std.testing.expectError(error.SshHostKeyChanged, Session.connect(a, .{ .host = "127.0.0.1", .port = port, .user = "basalt", .password = "pw", .host_key = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }));
     const pin = std.posix.getenv("BASALT_SSH_TEST_PIN") orelse return;

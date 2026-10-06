@@ -4,9 +4,14 @@
 //! you are. `s` sorts by the cursor's column, `/` filters it, as you type.
 //! It draws on the alternate screen, so leaving it puts the session back as it was.
 //!
-//! Sorting and filtering rearrange the rows the REPL kept — the first
-//! `TableWriter.keep_max` of a result — and never run the query again; when a
+//! Sorting and filtering rearrange the rows the REPL kept (the first
+//! `TableWriter.keep_max` of a result) and never run the query again; when a
 //! result was larger, the status line says the rows shown are of those kept.
+//! Each column has its own filter and all of them apply. A filter is a substring
+//! (any case), its negation (`!text`), or a comparison (`>= 100`, `< 2026-01-01`),
+//! by value on a number column and as text on any other, which orders ISO dates
+//! and times rightly. Columns are drawn up to `col_max` wide, wider than the
+//! inline table, since a truncated value is the reason one came here.
 
 const std = @import("std");
 const table = @import("../connect/table.zig");
@@ -16,15 +21,10 @@ const line = @import("line.zig");
 const Grid = table.Grid;
 const palette = table.palette;
 
-/// The widest a column is drawn here — wider than the inline table allows, since
-/// scrolling sideways is cheap and a truncated value is the reason one came.
 const col_max = 60;
 
 pub const Dir = enum { asc, desc };
 
-/// What `/` keeps: a substring (any case), its negation (`!text`), or a
-/// comparison (`>= 100`, `< 2026-01-01`) — by value on a number column, as text
-/// on any other, which orders ISO dates and times rightly.
 pub const Filter = struct {
     op: Op,
     text: []const u8,
@@ -46,7 +46,7 @@ pub const Filter = struct {
         return .{ .op = .contains, .text = t };
     }
 
-    /// Does `cell` pass? A NULL passes only `!text` — it contains nothing.
+    /// Does `cell` pass? A NULL passes only `!text`, since it contains nothing.
     pub fn keeps(self: Filter, kind: ?types.TypeKind, cell: ?[]const u8) bool {
         const c = cell orelse return self.op == .excludes;
         switch (self.op) {
@@ -71,8 +71,8 @@ fn numeric(kind: ?types.TypeKind) bool {
     return if (kind) |k| k.isNumeric() else false;
 }
 
-/// Two values of a column, in its type's order: numbers by value (text that is
-/// no number after them), false before true, the rest as text, case aside first.
+/// Two values of a column, in its type's order: numbers by value (non-numbers
+/// after them), false before true, the rest as text, case aside first.
 pub fn order(kind: ?types.TypeKind, a: []const u8, b: []const u8) std.math.Order {
     if (numeric(kind)) {
         const x = std.fmt.parseFloat(f64, a) catch null;
@@ -88,8 +88,8 @@ pub fn order(kind: ?types.TypeKind, a: []const u8, b: []const u8) std.math.Order
 
 pub const ColFilter = struct { col: usize, f: Filter };
 
-/// The kept rows to show, in order: those every filter keeps, sorted stably by
-/// the sort column with NULLs last whichever way it runs. gpa-owned.
+/// The kept rows to show: those every filter keeps, sorted stably by the sort
+/// column with NULLs last whichever way it runs. gpa-owned.
 pub fn arrange(gpa: std.mem.Allocator, g: Grid, kinds: []const ?types.TypeKind, sort: ?struct { col: usize, dir: Dir }, filters: []const ColFilter) ![]usize {
     var rows = std.array_list.Managed(usize).init(gpa);
     errdefer rows.deinit();
@@ -122,17 +122,13 @@ const View = struct {
     widths: []usize,
     kinds: []?types.TypeKind,
     color: bool,
-    /// The rows shown, as indices into the kept ones.
     rows: []usize,
     row0: usize = 0,
     col0: usize = 0,
-    /// The column cursor: what `s` sorts and `/` filters.
     cur: usize = 0,
     sort_col: ?usize = null,
     sort_dir: Dir = .asc,
-    /// Each column's filter as typed, empty for none; every one applies.
     filters: []std.array_list.Managed(u8),
-    /// The cursor's filter is being typed; the status line is its prompt.
     typing: bool = false,
 
     fn filterOf(self: *const View, c: usize) ?Filter {
@@ -160,7 +156,7 @@ const View = struct {
         self.row0 = 0;
     }
 
-    /// `s`: off → ascending → descending → off, on the cursor's column; another
+    /// `s`: off, ascending, descending, off on the cursor's column; another
     /// column starts ascending.
     fn cycleSort(self: *View) !void {
         if (self.sort_col != self.cur) {
@@ -172,7 +168,6 @@ const View = struct {
         try self.rearrange();
     }
 
-    /// How many columns fit from `from` in `width`, always at least one.
     fn colsFrom(self: View, from: usize, width: usize) usize {
         var used: usize = 0;
         var n: usize = 0;
@@ -186,7 +181,6 @@ const View = struct {
         return @max(n, 1);
     }
 
-    /// Scroll sideways just enough that the cursor's column is on screen.
     fn follow(self: *View, width: usize) void {
         if (self.cur < self.col0) self.col0 = self.cur;
         while (self.cur >= self.col0 + self.colsFrom(self.col0, width)) self.col0 += 1;
@@ -235,7 +229,6 @@ const View = struct {
             if (k > 0) try out.writeAll("  ");
             switch (what) {
                 .names => {
-                    // The sort column carries its arrow; the cursor's is lit.
                     var buf: [256]u8 = undefined;
                     const arrow: []const u8 = if (self.sort_col == c) (if (self.sort_dir == .asc) " \xe2\x86\x91" else " \xe2\x86\x93") else "";
                     const mark: []const u8 = if (self.filterOf(c) != null) " \xe2\x89\x88" else "";
@@ -259,7 +252,7 @@ const View = struct {
         try out.writeAll("\x1b[K\r\n");
     }
 
-    /// The bottom line, in reverse video and cut to the terminal's width — a
+    /// The bottom line, in reverse video and cut to the terminal's width, since a
     /// wrapped one would scroll the screen.
     fn status(self: *View, out: *std.Io.Writer, size: table.TermSize, ncols: usize, body: usize) !void {
         var buf: [1024]u8 = undefined;
@@ -285,7 +278,6 @@ const View = struct {
     }
 };
 
-/// `s`, no wider than `cols` columns.
 fn cutTo(out: *std.Io.Writer, s: []const u8, cols: usize) !void {
     var n: usize = 0;
     var i: usize = 0;
@@ -310,8 +302,7 @@ fn measure(gpa: std.mem.Allocator, g: Grid) ![]usize {
     return widths;
 }
 
-/// Where a move lands, clamped so the last screenful stays full. Split out so the
-/// arithmetic is testable without a terminal.
+/// Where a move lands, clamped so the last screenful stays full.
 pub fn clampScroll(pos: usize, delta: isize, total: usize, page: usize) usize {
     const max: usize = if (total > page) total - page else 0;
     const next: isize = @as(isize, @intCast(pos)) + delta;
@@ -319,7 +310,8 @@ pub fn clampScroll(pos: usize, delta: isize, total: usize, page: usize) usize {
     return @min(@as(usize, @intCast(next)), max);
 }
 
-/// Show `g` until the user leaves. Both ends must be terminals.
+/// Shows `g` until the user leaves; both ends must be terminals. Esc restores
+/// the filters first, then the sort; Backspace removes a whole UTF-8 character.
 pub fn run(gpa: std.mem.Allocator, g: Grid) !void {
     if (g.ncols() == 0) return;
     const in_fd = std.fs.File.stdin().handle;
@@ -357,7 +349,6 @@ pub fn run(gpa: std.mem.Allocator, g: Grid) !void {
     };
     defer gpa.free(v.rows);
     try v.rearrange();
-    // What the cursor's filter was before `/`, for Esc to put back.
     var before = std.array_list.Managed(u8).init(gpa);
     defer before.deinit();
 
@@ -382,7 +373,6 @@ pub fn run(gpa: std.mem.Allocator, g: Grid) !void {
                     try v.rearrange();
                 },
                 .backspace => if (ft.items.len > 0) {
-                    // a whole character, not the last byte of one
                     var cut = ft.items.len - 1;
                     while (cut > 0 and ft.items[cut] & 0xC0 == 0x80) cut -= 1;
                     ft.shrinkRetainingCapacity(cut);
@@ -424,7 +414,6 @@ pub fn run(gpa: std.mem.Allocator, g: Grid) !void {
             .page_up => v.row0 = clampScroll(v.row0, -page_rows, n, body),
             .page_down => v.row0 = clampScroll(v.row0, page_rows, n, body),
             .interrupt, .eof_or_delete => return,
-            // Esc takes back the filters first, then the sort.
             .escape => if (v.anyFilter()) {
                 for (v.filters) |*f| f.clearRetainingCapacity();
                 try v.rearrange();
@@ -489,7 +478,6 @@ test "view: a number column sorts by value, NULLs last either way, and stably" {
     const down = try arrange(gpa, g, &test_kinds, .{ .col = 1, .dir = .desc }, &.{});
     defer gpa.free(down);
     try std.testing.expectEqualSlices(usize, &.{ 3, 0, 4, 1, 2 }, down);
-    // text: case aside first, then case — and dates as text, in time order
     const uf = try arrange(gpa, g, &test_kinds, .{ .col = 0, .dir = .asc }, &.{});
     defer gpa.free(uf);
     try std.testing.expectEqualSlices(usize, &.{ 3, 1, 0, 4, 2 }, uf);
@@ -507,14 +495,12 @@ test "view: a filter keeps a substring in any case, excludes with !, compares by
     const not_sp = try arrange(gpa, g, &test_kinds, null, &.{.{ .col = 0, .f = Filter.parse("!sp").? }});
     defer gpa.free(not_sp);
     try std.testing.expectEqualSlices(usize, &.{ 1, 3 }, not_sp);
-    // by value: 9.99 < 10 though "9.99" > "10" as text; NULL passes no comparison
     const big = try arrange(gpa, g, &test_kinds, .{ .col = 1, .dir = .desc }, &.{.{ .col = 1, .f = Filter.parse(">= 9.5").? }});
     defer gpa.free(big);
     try std.testing.expectEqualSlices(usize, &.{ 3, 0, 4 }, big);
     const y2026 = try arrange(gpa, g, &test_kinds, null, &.{.{ .col = 2, .f = Filter.parse(">=2026-01-01").? }});
     defer gpa.free(y2026);
     try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, y2026);
-    // filters on two columns: both must keep a row
     const both = try arrange(gpa, g, &test_kinds, null, &.{ .{ .col = 0, .f = Filter.parse("sp").? }, .{ .col = 1, .f = Filter.parse("> 10").? } });
     defer gpa.free(both);
     try std.testing.expectEqualSlices(usize, &.{0}, both);

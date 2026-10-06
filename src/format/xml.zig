@@ -1,28 +1,26 @@
-//! A streaming XML tokenizer — just what reading an `.xlsx` needs.
+//! A streaming XML tokenizer, just what reading an `.xlsx` needs.
 //!
 //! Tokens come off a `std.Io.Reader` one at a time and are valid until the next
 //! call, so a worksheet streams through in a buffer the size of its longest tag or
-//! text run rather than its whole body. Names are given without their namespace
-//! prefix: the .NET OpenXML SDK writes `<x:row>` where Excel writes `<row>`, and a
-//! reader matching the prefix found no rows at all in such a file. Comments,
-//! processing instructions and DOCTYPEs are skipped; CDATA is text.
+//! text run (at most `max_token`) rather than its whole body. Names are given
+//! without their namespace prefix: the .NET OpenXML SDK writes `<x:row>` where Excel
+//! writes `<row>`, and a reader matching the prefix found no rows at all in such a
+//! file. Comments, processing instructions and DOCTYPEs are skipped; CDATA is text.
+//! Tag attributes and text are returned raw; entities are decoded with `decode`.
 
 const std = @import("std");
 
 pub const Error = error{ BadXml, XmlTokenTooLong, OutOfMemory, ReadFailed };
 
-/// The longest single token — a tag, or a run of text — the tokenizer holds.
 const max_token = 64 << 20;
 
 pub const Tag = struct {
-    /// Local name: `row` for both `<row>` and `<x:row>`.
     name: []const u8,
-    /// Everything between the name and the closing `>`, undecoded.
     attrs: []const u8,
     self_closing: bool,
 
     /// The raw value of the attribute whose local name is `want`, or null. `r:id`
-    /// answers to `id`; decode it with `decode` when it may hold entities.
+    /// answers to `id`.
     pub fn attr(self: Tag, want: []const u8) ?[]const u8 {
         var i: usize = 0;
         const s = self.attrs;
@@ -52,11 +50,8 @@ pub const Tag = struct {
 
 pub const Token = union(enum) {
     open: Tag,
-    /// A closing tag's local name.
     close: []const u8,
-    /// Raw text between tags, entities not yet decoded (see `decode`).
     text: []const u8,
-    /// CDATA content, which is literal.
     cdata: []const u8,
 };
 
@@ -74,7 +69,6 @@ pub const Tokenizer = struct {
         self.buf.deinit();
     }
 
-    /// Read more input behind what is unconsumed. False at the end of input.
     fn fill(self: *Tokenizer) Error!bool {
         if (self.eof) return false;
         if (self.lo > 0 and self.lo * 2 >= self.buf.items.len) {
@@ -95,7 +89,8 @@ pub const Tokenizer = struct {
         return true;
     }
 
-    /// The next token, or null at the end of the document.
+    /// The next token, or null at the end of the document. Trailing text is read after
+    /// `fill`, which may move what `have` pointed at.
     pub fn next(self: *Tokenizer) Error!?Token {
         while (true) {
             const have = self.buf.items[self.lo..];
@@ -106,8 +101,6 @@ pub const Tokenizer = struct {
             if (have[0] != '<') {
                 const lt = std.mem.indexOfScalar(u8, have, '<') orelse {
                     if (try self.fill()) continue;
-                    // trailing text after the root element — taken after `fill`,
-                    // which may have moved what `have` pointed at
                     const rest = self.buf.items[self.lo..];
                     self.lo = self.buf.items.len;
                     return .{ .text = rest };
@@ -116,7 +109,7 @@ pub const Tokenizer = struct {
                 return .{ .text = have[0..lt] };
             }
             if (try self.special(have)) |t| return t;
-            if (have.len >= 2 and (have[1] == '?' or have[1] == '!')) continue; // skipped by `special`
+            if (have.len >= 2 and (have[1] == '?' or have[1] == '!')) continue;
             const gt = tagEnd(have) orelse {
                 if (try self.fill()) continue;
                 return error.BadXml;
@@ -132,8 +125,8 @@ pub const Tokenizer = struct {
         }
     }
 
-    /// `<?…?>`, `<!--…-->`, `<!DOCTYPE …>` are consumed and skipped (null with
-    /// `lo` advanced, so `next` loops); `<![CDATA[…]]>` is returned.
+    /// Consumes and skips `<?…?>`, `<!--…-->` and `<!DOCTYPE …>` (null with `lo`
+    /// advanced, so `next` loops); returns `<![CDATA[…]]>`.
     fn special(self: *Tokenizer, have: []const u8) Error!?Token {
         if (have.len < 2 or (have[1] != '?' and have[1] != '!')) return null;
         const Close = struct { open: []const u8, close: []const u8 };
@@ -152,7 +145,6 @@ pub const Tokenizer = struct {
                 if (std.mem.eql(u8, k.open, "<![CDATA[")) return .{ .cdata = h[k.open.len..end] };
                 return null;
             } else {
-                // `<!DOCTYPE …>` or another declaration: to its `>`
                 if (h.len >= 2 and h[1] == '!' and !std.mem.startsWith(u8, h, "<!-") and !std.mem.startsWith(u8, h, "<![")) {
                     const gt = std.mem.indexOfScalar(u8, h, '>') orelse {
                         if (try self.fill()) continue;
@@ -166,7 +158,7 @@ pub const Tokenizer = struct {
         }
     }
 
-    /// Skip to the end of the element just opened by `tag` (its children too).
+    /// Skip to the end of the element just opened by `tag`, children included.
     pub fn skip(self: *Tokenizer, tag: Tag) Error!void {
         if (tag.self_closing) return;
         var depth: usize = 1;
@@ -185,7 +177,7 @@ pub const Tokenizer = struct {
 };
 
 /// The `>` closing a tag that starts at `s[0]`, skipping any inside quoted
-/// attribute values — some writers leave a bare `>` there.
+/// attribute values, where some writers leave a bare `>`.
 fn tagEnd(s: []const u8) ?usize {
     var q: u8 = 0;
     for (s, 0..) |c, i| {
@@ -207,10 +199,8 @@ pub fn localName(full: []const u8) []const u8 {
     return full[colon + 1 ..];
 }
 
-/// Append `raw` with XML's entities decoded — the five named ones and `&#…;` /
-/// `&#x…;` — and, with `ooxml`, OOXML's `_xHHHH_` escapes after them: Excel writes
-/// a carriage return in a cell as `_x000D_`, and an underscore that would read as
-/// one as `_x005F_`.
+/// Append `raw` with XML entities decoded and, with `ooxml`, OOXML `_xHHHH_` escapes
+/// after them (Excel writes a carriage return as `_x000D_`, an underscore as `_x005F_`).
 pub fn decodeInto(out: *std.array_list.Managed(u8), raw: []const u8, ooxml: bool) Error!void {
     const start = out.items.len;
     var i: usize = 0;
@@ -245,7 +235,7 @@ pub fn decodeInto(out: *std.array_list.Managed(u8), raw: []const u8, ooxml: bool
     if (ooxml) unescapeOoxml(out, start);
 }
 
-/// OOXML's `_xHHHH_` escapes over `out[start..]`, in place: for text whose XML
+/// OOXML `_xHHHH_` escapes over `out[start..]`, in place, for text whose XML
 /// entities are already decoded.
 pub fn unescapeOoxml(out: *std.array_list.Managed(u8), start: usize) void {
     if (std.mem.indexOf(u8, out.items[start..], "_x") == null) return;

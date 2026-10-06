@@ -1,13 +1,22 @@
 //! The aggregate registry: one `Spec` per aggregate function, carrying the names
-//! it answers to, what it accepts and how its result is typed. The parser
-//! recognizes an aggregate through `lookup`, `runtime/analyze.zig` checks and
-//! types it through `spec`, and Tab completion is held to the same names by a
-//! test in `cli/cli.zig` — so adding an aggregate is one `ast.AggFunc` value and
-//! one row here, after which the compiler points at every `switch` in
-//! `exec/op.zig` that must learn to fold it.
+//! it answers to (the first canonical, the rest aliases), what it accepts and how
+//! its result is typed. The parser recognizes an aggregate through `lookup`,
+//! `runtime/analyze.zig` checks and types it through `spec`, and Tab completion is
+//! held to the same names by a test in `cli/cli.zig` — so adding an aggregate is
+//! one `ast.AggFunc` value and one row here, after which the compiler points at
+//! every `switch` in `exec/op.zig` that must learn to fold it. `specs` is in
+//! `AggFunc` order, since `spec` indexes it by the enum's value.
 //!
 //! Every name here is reserved: aggregates are recognized while parsing, before
 //! `CREATE FUNCTION` macros expand, so a user function cannot take one.
+//!
+//! An argument of type text always passes the plan-time `Arg` check: the parallel
+//! CSV lanes carry raw text and coerce it per row, so a numeric CSV column may
+//! still be typed STRING. So does a type the check could not see (a SQL table not
+//! yet connected). SUM is FLOAT over floats, DECIMAL over decimals at the same
+//! scale, else INT. `variance` and `stddev` are the sample statistics, as in
+//! Postgres, DuckDB, Trino and SQL Server; MySQL and StarRocks read them as the
+//! population ones.
 
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -15,20 +24,11 @@ const types = @import("types.zig");
 
 pub const AggFunc = ast.AggFunc;
 
-/// What an aggregate's argument may be, checked at plan time. Text always passes:
-/// the parallel CSV lanes carry raw text and coerce it per row, so a numeric CSV
-/// column may still be typed STRING here. So does a type `check` could not see
-/// (a SQL table it has not connected to).
 pub const Arg = enum {
-    /// `COUNT(*)` or `COUNT(x)` of anything.
     star_or_any,
-    /// Any one value: MIN and MAX compare whatever they are given.
     any,
-    /// INT, FLOAT or DECIMAL.
     numeric,
-    /// INT: the bitwise aggregates.
     int,
-    /// BOOL: a condition, as `count_if(amount > 0)` or `bool_and(paid)`.
     bool,
 
     pub fn accepts(self: Arg, t: types.Type) bool {
@@ -41,7 +41,6 @@ pub const Arg = enum {
         };
     }
 
-    /// The argument's kind in a plan-time error: "`sum` needs a {s} argument".
     pub fn word(self: Arg) []const u8 {
         return switch (self) {
             .star_or_any, .any => "",
@@ -52,33 +51,23 @@ pub const Arg = enum {
     }
 };
 
-/// How an aggregate's result type follows from its argument's.
 pub const Result = enum {
-    /// A row count: INT, never null (COUNT, `count_if`).
     count,
-    /// SUM: FLOAT over floats, DECIMAL over decimals (same scale), else INT; nullable.
     sum,
-    /// Always a nullable FLOAT (AVG, MEDIAN, the variances).
     float,
-    /// The argument's own type, nullable (MIN, MAX).
     same,
-    /// A nullable BOOL (`bool_and`, `bool_or`).
     bool,
-    /// A nullable INT (the bitwise aggregates).
     int,
 };
 
 pub const Spec = struct {
     func: AggFunc,
-    /// The first name is canonical; the rest are aliases.
     names: []const []const u8,
     arg: Arg,
     result: Result,
-    /// How many arguments the call may pass; the parser refuses more.
     max_args: u8 = 1,
 };
 
-/// In `AggFunc` order — `spec` indexes it by the enum's value.
 pub const specs = [_]Spec{
     .{ .func = .count, .names = &.{"count"}, .arg = .star_or_any, .result = .count },
     .{ .func = .sum, .names = &.{"sum"}, .arg = .numeric, .result = .sum },
@@ -92,8 +81,6 @@ pub const specs = [_]Spec{
     .{ .func = .bit_and, .names = &.{"bit_and"}, .arg = .int, .result = .int },
     .{ .func = .bit_or, .names = &.{"bit_or"}, .arg = .int, .result = .int },
     .{ .func = .bit_xor, .names = &.{"bit_xor"}, .arg = .int, .result = .int },
-    // The unqualified names are the sample statistics, as in Postgres, DuckDB,
-    // Trino and SQL Server. MySQL and StarRocks read them as the population ones.
     .{ .func = .var_samp, .names = &.{ "var_samp", "variance" }, .arg = .numeric, .result = .float },
     .{ .func = .var_pop, .names = &.{"var_pop"}, .arg = .numeric, .result = .float },
     .{ .func = .stddev_samp, .names = &.{ "stddev_samp", "stddev" }, .arg = .numeric, .result = .float },
@@ -113,7 +100,6 @@ pub fn spec(func: AggFunc) Spec {
     return specs[@intFromEnum(func)];
 }
 
-/// The aggregate called `name` (any case), or null.
 pub fn lookup(name: []const u8) ?AggFunc {
     for (specs) |s| for (s.names) |n| {
         if (std.ascii.eqlIgnoreCase(n, name)) return s.func;

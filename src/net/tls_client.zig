@@ -1,15 +1,15 @@
-//! Vendored from Zig 0.15 `std.crypto.tls.Client` with ONE functional change,
-//! marked `// [basalt]`: TLS 1.3 CertificateRequest handling. MySQL servers
-//! always request a client certificate during the TLS handshake (for optional
-//! x509 auth); RFC 8446 says a client with no certificate replies with an
-//! empty Certificate message, but std's client errors with
-//! TlsUnexpectedMessage instead — making any MySQL TLS connection impossible.
-//! Drop this vendor once std supports client certificates.
+//! Vendored from Zig 0.15 `std.crypto.tls.Client` with one functional change,
+//! TLS 1.3 CertificateRequest handling: the `.certificate_request` branch and
+//! the `client_cert_requested` uses around the client Finished. MySQL servers
+//! always request a client certificate (for optional x509 auth); RFC 8446
+//! §4.4.2 has a client without one reply with an empty Certificate message, but
+//! std errors with TlsUnexpectedMessage, which makes MySQL over TLS impossible.
+//! The comments below are upstream's, kept so the file diffs cleanly against
+//! std. Drop this vendor once std supports client certificates.
 //!
-//! Scope: the empty-certificate reply is implemented for TLS 1.3 only. A TLS
-//! 1.2 server that requests a client certificate still fails (MySQL forced to
-//! `--tls-version=TLSv1.2` — rare); 1.2 without a certificate request works
-//! unchanged.
+//! Scope: TLS 1.3 only. A TLS 1.2 server that requests a client certificate
+//! still fails (MySQL forced to `--tls-version=TLSv1.2`, which is rare); 1.2
+//! without a certificate request works unchanged.
 
 const builtin = @import("builtin");
 const native_endian = builtin.cpu.arch.endian();

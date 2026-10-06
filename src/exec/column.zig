@@ -1,6 +1,22 @@
 //! Columnar storage: a typed, struct-of-arrays column with an out-of-band
 //! validity bitmap (Arrow convention: bit set = valid/non-null). This is the
-//! hot-path data layout — one contiguous buffer per column, indexed by row.
+//! hot-path data layout, one contiguous buffer per column indexed by row.
+//!
+//! `Data` is keyed by storage width, not logical kind (int/time/timestamp share
+//! `i64`, string/bytes share `bytes`). Byte payloads use the Arrow
+//! variable-size binary layout: one `values` buffer plus `len + 1` offsets, which
+//! costs 4 bytes per row instead of a 16-byte slice and one allocation per column;
+//! a null row is an empty slot. `gather`, `concat` and `permute` copy typed
+//! buffers directly with no per-row `Value` boxing, and their output never borrows
+//! from the input. A string column read from a dictionary keeps it (`dict`, row
+//! `i` is `values[codes[i]]`, a null row's code is 0) so filters and GROUP BY can
+//! work on the entries; anything that makes a new column leaves it behind.
+//!
+//! `Builder` writes validity directly in its final bit-packed form, appended
+//! pre-set to all-valid, so a null-free column never touches it beyond growing it
+//! (it was once a `[]bool` shadow array folded down in `finish`). The bulk and
+//! typed appends exist because boxing every value into a `Value` measured several
+//! times slower than the typed path, and any single null used to force it.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -8,7 +24,6 @@ const value = @import("value.zig");
 
 const Value = value.Value;
 
-/// Bit-packed validity: 1 = valid (non-null), 0 = null.
 pub const Bitmap = struct {
     bits: []u8,
     len: usize,
@@ -35,13 +50,8 @@ pub const Bitmap = struct {
         }
     }
 
-    /// True if the first `n` bits are all set (no nulls) — lets kernels take a
-    /// branch-free fast path.
-    ///
-    /// Checked eight bytes at a time. This runs ahead of nearly every kernel in
-    /// the executor, over the full length of a column, and answers true for the
-    /// overwhelmingly common null-free case only after reading every byte — so
-    /// the width of the scan is the whole cost.
+    /// True if the first `n` bits are all set (no nulls). Checked eight bytes at a
+    /// time: it runs ahead of nearly every kernel, so the scan width is the whole cost.
     pub fn allSet(self: Bitmap, n: usize) bool {
         if (n == 0) return true;
         const full = n >> 3;
@@ -62,10 +72,6 @@ pub const Bitmap = struct {
     }
 };
 
-/// Arrow variable-size binary layout: one contiguous `values` buffer plus an
-/// `offsets` buffer of `len + 1` entries delimiting each row. Costs 4 bytes of
-/// per-row overhead instead of the 16 a slice header takes, and needs one
-/// allocation per column rather than one per value.
 pub const Bytes = struct {
     offsets: []i32,
     values: []u8,
@@ -76,15 +82,12 @@ pub const Bytes = struct {
         return self.values[lo..hi];
     }
 
-    /// Total bytes spanned by rows `i` where `pick(i)` — sizes the values buffer
-    /// before a copy so the output is allocated exactly once.
     fn spanOf(self: Bytes, rows_idx: []const usize) usize {
         var total: usize = 0;
         for (rows_idx) |r| total += self.at(r).len;
         return total;
     }
 
-    /// Copy the rows listed in `rows_idx` (in that order) into a fresh Bytes.
     fn take(self: Bytes, arena: std.mem.Allocator, rows_idx: []const usize) !Bytes {
         const values = try arena.alloc(u8, self.spanOf(rows_idx));
         const offsets = try arena.alloc(i32, rows_idx.len + 1);
@@ -100,8 +103,6 @@ pub const Bytes = struct {
     }
 };
 
-/// Row-order accumulator for the Arrow bytes layout, for kernels that emit one
-/// payload per row. A null row is an empty slot: offsets repeat, no bytes added.
 pub const BytesAppender = struct {
     values: std.array_list.Managed(u8),
     offsets: std.array_list.Managed(i32),
@@ -113,14 +114,10 @@ pub const BytesAppender = struct {
         return .{ .values = std.array_list.Managed(u8).init(arena), .offsets = offsets };
     }
 
-    /// Add bytes to the row being built, without closing it — lets a kernel
-    /// assemble a row from several pieces with no temporary allocation.
     pub fn append(self: *BytesAppender, s: []const u8) !void {
         try self.values.appendSlice(s);
     }
 
-    /// Close the current row. With nothing appended since the last close this
-    /// is an empty slot, which is how a null row is stored.
     pub fn endRow(self: *BytesAppender) !void {
         try self.offsets.append(@intCast(self.values.items.len));
     }
@@ -134,8 +131,8 @@ pub const BytesAppender = struct {
         try self.endRow();
     }
 
-    /// Appends `s` as a whole row, then hands back the just-written region so a
-    /// kernel can transform it in place instead of duping first.
+    /// Appends `s` as a whole row and returns the just-written region, so a kernel
+    /// can transform it in place instead of duping first.
     pub fn pushMutable(self: *BytesAppender, s: []const u8) ![]u8 {
         const start = self.values.items.len;
         try self.push(s);
@@ -147,7 +144,6 @@ pub const BytesAppender = struct {
     }
 };
 
-/// Row indices flagged in `keep`, in order — the shape `Bytes.take` wants.
 fn keptIndices(arena: std.mem.Allocator, keep: []const bool, kept: usize) ![]usize {
     const idx = try arena.alloc(usize, kept);
     var w: usize = 0;
@@ -160,7 +156,6 @@ fn keptIndices(arena: std.mem.Allocator, keep: []const bool, kept: usize) ![]usi
     return idx;
 }
 
-/// Copy a typed backing slice, keeping only rows where `keep[i]` is true.
 fn gatherSlice(comptime T: type, arena: std.mem.Allocator, src: []const T, keep: []const bool, kept: usize) ![]T {
     const out = try arena.alloc(T, kept);
     var w: usize = 0;
@@ -173,11 +168,10 @@ fn gatherSlice(comptime T: type, arena: std.mem.Allocator, src: []const T, keep:
     return out;
 }
 
+/// Returns the all-valid bitmap untouched when the source has no nulls, as
+/// `concat` and `permute` do: this backs the filter hot path.
 fn gatherValidity(arena: std.mem.Allocator, v: Bitmap, keep: []const bool, kept: usize) !Bitmap {
     var bm = try Bitmap.initFull(arena, kept);
-    // Mirrors the guard `concat` and `permute` already use: with no nulls in the
-    // source there is nothing to clear, and this backs `gather`, the filter hot
-    // path — the most frequently executed loop in the executor.
     if (v.allSet(v.len)) return bm;
     var w: usize = 0;
     for (keep, 0..) |k, i| {
@@ -189,8 +183,6 @@ fn gatherValidity(arena: std.mem.Allocator, v: Bitmap, keep: []const bool, kept:
     return bm;
 }
 
-/// Select the `kept` rows of `c` flagged in `keep` into a fresh column, copying
-/// the typed buffer directly (no per-row `Value` boxing). The hot filter path.
 pub fn gather(arena: std.mem.Allocator, c: Column, keep: []const bool, kept: usize) !Column {
     const bm = try gatherValidity(arena, c.validity, keep, kept);
     const data: Column.Data = switch (c.data) {
@@ -204,10 +196,6 @@ pub fn gather(arena: std.mem.Allocator, c: Column, keep: []const bool, kept: usi
     return .{ .ty = c.ty, .len = kept, .validity = bm, .data = data };
 }
 
-/// Concatenate same-typed column chunks into one column of `total` rows by
-/// copying the typed backing slices directly — no per-row `Value` boxing. Byte
-/// payloads are copied into a fresh values buffer (one memcpy per chunk), so
-/// the output does not borrow from the inputs.
 pub fn concat(arena: std.mem.Allocator, chunks: []const Column, total: usize) !Column {
     std.debug.assert(chunks.len > 0);
     var bm = try Bitmap.initFull(arena, total);
@@ -234,8 +222,6 @@ pub fn concat(arena: std.mem.Allocator, chunks: []const Column, total: usize) !C
     return .{ .ty = chunks[0].ty, .len = total, .validity = bm, .data = data };
 }
 
-/// Byte payloads concatenate as one memcpy per chunk (rows are contiguous
-/// within a chunk); only the offsets need rebasing row by row.
 fn concatBytes(arena: std.mem.Allocator, chunks: []const Column, total: usize) !Bytes {
     var span: usize = 0;
     for (chunks) |c| {
@@ -273,8 +259,6 @@ fn concatSlices(comptime tag: []const u8, comptime T: type, arena: std.mem.Alloc
     return out;
 }
 
-/// Reorder a column by `idx` (`out[i] = c[idx[i]]`) into a fresh column, copying
-/// the typed buffer directly (no per-row `Value` boxing). The sort output path.
 pub fn permute(arena: std.mem.Allocator, c: Column, idx: []const usize) !Column {
     var bm = try Bitmap.initFull(arena, idx.len);
     if (!c.validity.allSet(c.len)) {
@@ -304,17 +288,10 @@ pub const Column = struct {
     len: usize,
     validity: Bitmap,
     data: Data,
-    /// A string column read from a dictionary keeps it: row `i` is
-    /// `dict.values[dict.codes[i]]` (a null row's code is 0 and means nothing).
-    /// The bytes are there too, so a reader that ignores this loses nothing;
-    /// a filter or a GROUP BY works on the handful of entries instead of every
-    /// row. Anything that makes a new column from this one leaves it behind.
     dict: ?*const Dict = null,
 
     pub const Dict = struct { values: []const []const u8, codes: []const u32 };
 
-    /// Physical backing store, keyed by storage width rather than logical kind
-    /// (e.g. int/time/timestamp all share `i64`, string/bytes share `bytes`).
     pub const Data = union(enum) {
         b: []bool,
         i32: []i32,
@@ -324,7 +301,6 @@ pub const Column = struct {
         bytes: Bytes,
     };
 
-    /// Boxed read of row `i`, honoring the validity bitmap.
     pub fn getValue(self: Column, i: usize) Value {
         if (!self.validity.get(i)) return .null;
         return switch (self.ty.kind) {
@@ -342,28 +318,16 @@ pub const Column = struct {
     }
 };
 
-/// Accumulates values one row at a time into the correct physical store, then
-/// `finish()`es into an immutable `Column`. Strings are duped into the arena.
 pub const Builder = struct {
     arena: std.mem.Allocator,
     ty: types.Type,
-    /// The dictionary the rows came from, while every append has (`noteDict`).
     dict_src: ?usize = null,
     dict_vals: ?[]const []const u8 = null,
     dict_codes: std.ArrayListUnmanaged(u32) = .empty,
-    /// Validity accumulated in its FINAL bit-packed form, one bit per row.
-    ///
-    /// This used to be a `[]bool` shadow array that `finish` folded down into a
-    /// bitmap — a byte per row of scratch, plus a second full pass over it, to
-    /// produce something the appends could write directly. Bytes are appended
-    /// pre-set to all-valid, so a null-free column (the overwhelmingly common
-    /// one) never touches this beyond growing it.
     bits: std.array_list.Managed(u8),
     rows: usize = 0,
     store: Store,
 
-    /// Byte payloads accumulate into one growing buffer; `ends` holds each row's
-    /// end offset, which `finish` turns into Arrow's leading-zero offsets buffer.
     pub const BytesStore = struct {
         values: std.array_list.Managed(u8),
         ends: std.array_list.Managed(i32),
@@ -394,17 +358,14 @@ pub const Builder = struct {
         return .{ .arena = arena, .ty = ty, .bits = std.array_list.Managed(u8).init(arena), .store = store };
     }
 
-    /// Record one row's validity. New bytes arrive all-ones, so a valid row is
-    /// nothing but a bump of the counter once the byte exists.
     fn pushValid(self: *Builder, ok: bool) !void {
         if (self.rows & 7 == 0) try self.bits.append(0xFF);
         if (!ok) self.bits.items[self.rows >> 3] &= ~(@as(u8, 1) << @intCast(self.rows & 7));
         self.rows += 1;
     }
 
-    /// Record `count` consecutive valid rows. Whole bytes are appended at once
-    /// rather than a bit at a time; bits already covered by the current partial
-    /// byte are set, since nothing clears one except an actual null.
+    /// Records `count` valid rows, a whole byte at a time; bits of the current
+    /// partial byte are set, since nothing clears one except an actual null.
     fn pushValidRun(self: *Builder, count: usize) !void {
         const end = self.rows + count;
         const need = (end + 7) / 8;
@@ -413,13 +374,10 @@ pub const Builder = struct {
         self.rows = end;
     }
 
-    /// Starting guess for a byte column's payload, in bytes per row. Only sizes
-    /// the first allocation — the buffer still grows if rows are longer.
     const BYTES_PER_ROW_HINT = 24;
 
-    /// `init` with the buffers pre-sized for `rows`. Callers that know their
-    /// batch size should use this: the values buffer otherwise grows by doubling,
-    /// and each growth memcpys everything appended so far.
+    /// `init` with the buffers pre-sized for `rows`; otherwise the values buffer
+    /// grows by doubling and each growth copies everything appended so far.
     pub fn initCapacity(arena: std.mem.Allocator, ty: types.Type, rows: usize) !Builder {
         var b = init(arena, ty);
         try b.bits.ensureTotalCapacity((rows + 7) / 8);
@@ -433,12 +391,6 @@ pub const Builder = struct {
         return b;
     }
 
-    /// Appends `n` non-null values straight into the typed store.
-    ///
-    /// The per-row path boxes every value into a `Value` and switches on its
-    /// kind; for a page of plain fixed-width values none of that is needed, and
-    /// this is the difference between a memcpy-shaped loop and a million
-    /// tagged-union round trips.
     pub fn appendBulk(self: *Builder, comptime T: type, vals: []const T) !void {
         switch (self.store) {
             inline .b, .i32, .i64, .f64, .dec => |*l| {
@@ -450,9 +402,6 @@ pub const Builder = struct {
         try self.pushValidRun(vals.len);
     }
 
-    /// The bytes twin of `appendBulk`/`appendBulkScattered`: one slice per
-    /// present row, `defs` (when given) saying which rows those are. The
-    /// parquet decoder used to box every string into a `Value` for this.
     pub fn appendBytesScattered(self: *Builder, vals: []const []const u8, defs: ?[]const u32, max_def: u32) !void {
         if (self.store != .bytes) return error.BulkTypeMismatch;
         const l = &self.store.bytes;
@@ -479,12 +428,8 @@ pub const Builder = struct {
         }
     }
 
-    /// Bulk append where only `vals` for present rows are supplied: `defs[i] ==
-    /// max_def` marks a row present, and nulls consume a slot without a value.
-    ///
-    /// This is the nullable twin of `appendBulk`. Without it any column holding
-    /// a single null falls back to boxing every value into a `Value`, which
-    /// measures ~5x slower than the typed path.
+    /// Bulk append where only present rows supply a value: `defs[i] == max_def`
+    /// marks a row present, and a null consumes a slot without one.
     pub fn appendBulkScattered(
         self: *Builder,
         comptime T: type,
@@ -514,9 +459,8 @@ pub const Builder = struct {
         }
     }
 
-    /// Typed appends for a producer that already knows the cell's kind — the
-    /// CSV reader — so the hot loop skips boxing a `Value` and re-switching on
-    /// the store. The caller guarantees the store matches.
+    /// Typed appends for a producer that already knows the cell's kind (the CSV
+    /// reader). The caller guarantees the store matches.
     pub fn appendInt(self: *Builder, x: i64) !void {
         try self.pushValid(true);
         try self.store.i64.append(x);
@@ -548,9 +492,8 @@ pub const Builder = struct {
         }
     }
 
-    /// A value on its way into an int-typed store. `else => 0` used to swallow
-    /// every kind not listed, so a decimal appended to a numeric column became
-    /// zero without a word — see `asF64`.
+    /// `else => 0` once swallowed decimals appended to a numeric column; a kind with
+    /// no numeric reading (string, date) still becomes 0 rather than widening `append`'s error set.
     fn asI64(self: *Builder, v: Value) i64 {
         return switch (self.ty.kind) {
             .time => v.time,
@@ -560,24 +503,13 @@ pub const Builder = struct {
                 .float => |x| @intFromFloat(x),
                 .bool => |x| @intFromBool(x),
                 .decimal => |d| @intFromFloat(d.toF64()),
-                // Still zero for a kind that has no numeric reading at all
-                // (a string, a date). Making that an error means widening
-                // `append`'s error set into the parquet decoder's declared sets,
-                // which is a wider change than this release should carry.
                 else => 0,
             },
         };
     }
 
-    /// A value on its way into a float-typed store.
-    ///
-    /// The missing `.decimal` arm here is what made `ROUND(AVG(CAST(x AS
-    /// DECIMAL(p,s))), n)` answer 0: the aggregate materializes its argument with
-    /// its *result* type, which for AVG is float, so the decimals the CAST produced
-    /// were appended to a float column and each one silently became zero. A real
-    /// query over 16.5M rows reported an average of 0 and looked plausible. An
-    /// unconvertible kind now fails instead of zeroing, because a wrong number that
-    /// looks right is the outcome this engine exists to avoid.
+    /// The missing `.decimal` arm once made `ROUND(AVG(CAST(x AS DECIMAL(p,s))), n)`
+    /// answer 0, since AVG materializes its argument as float; keep every numeric kind here.
     fn asF64(_: *Builder, v: Value) f64 {
         return switch (v) {
             .float => |x| x,
@@ -587,12 +519,10 @@ pub const Builder = struct {
             else => 0,
         };
     }
+    /// Takes either `.string` or `.bytes`: a text-protocol driver decodes a binary
+    /// column into `.string`, and keying off the column's kind panicked on that.
     fn asBytes(self: *Builder, v: Value) []const u8 {
         _ = self;
-        // Both tags carry a byte payload and share this store, and a producer
-        // may hand either one to a bytes-typed column (a text-protocol driver
-        // decodes a binary column into `.string`). Keying off the column's kind
-        // instead panicked on that perfectly valid pairing.
         return switch (v) {
             .string => |s| s,
             .bytes => |s| s,
@@ -602,7 +532,6 @@ pub const Builder = struct {
 
     pub fn finish(self: *Builder) !Column {
         const n = self.rows;
-        // Already in final form — the appends wrote the bits as they went.
         const bm = Bitmap{ .bits = try self.bits.toOwnedSlice(), .len = n };
         const data: Column.Data = switch (self.store) {
             .b => |*l| .{ .b = try l.toOwnedSlice() },
@@ -626,10 +555,8 @@ pub const Builder = struct {
         return .{ .ty = self.ty, .len = n, .validity = bm, .data = data, .dict = dict };
     }
 
-    /// Record the dictionary the rows just appended came from: `codes` for the
-    /// present ones, in order, a null row taking 0. Rows appended any other way,
-    /// or from another dictionary, leave the count short or the source different,
-    /// and `finish` then attaches none.
+    /// Records the dictionary the rows just appended came from (`codes` for present
+    /// rows, a null taking 0). Rows appended otherwise leave the count short and `finish` attaches none.
     pub fn noteDict(self: *Builder, src: usize, vals: []const []const u8, codes: []const u32, defs: ?[]const u32, max_def: u32) !void {
         if (self.dict_src) |prev| if (prev != src) {
             self.dict_vals = null;
@@ -650,7 +577,6 @@ pub const Builder = struct {
     }
 };
 
-/// Build an `int` column from optional values (null where `null`). Test/helper.
 pub fn intColumn(alloc: std.mem.Allocator, vals: []const ?i64) !Column {
     var validity = try Bitmap.initFull(alloc, vals.len);
     const store = try alloc.alloc(i64, vals.len);
@@ -776,18 +702,12 @@ test "bitmap set/get across byte boundaries" {
 
 test "bitmap allSet: word-wise scan agrees with a bit-by-bit one at every length" {
     const alloc = std.testing.allocator;
-    // Spans several u64 words plus a partial word plus a partial byte, so the
-    // word loop, the byte tail and the bit tail all get exercised.
     const n = 200;
     var bm = try Bitmap.initFull(alloc, n);
     defer alloc.free(bm.bits);
 
-    // No nulls: true at every prefix length.
     for (0..n + 1) |k| try std.testing.expect(bm.allSet(k));
 
-    // One null at position i must be invisible to every prefix that stops at or
-    // before it, and visible to every prefix past it — including when it sits
-    // inside the first word, on a word boundary, or in the byte tail.
     for ([_]usize{ 0, 1, 7, 8, 63, 64, 65, 127, 128, 191, 192, 199 }) |i| {
         bm.setValid(i, false);
         for (0..n + 1) |k| {
@@ -803,14 +723,11 @@ test "builder validity: nulls, bulk runs and partial bytes interleave correctly"
     defer arena.deinit();
     const a = arena.allocator();
 
-    // The case the bulk run has to get right: start mid-byte, so the run must
-    // set the bits left in the current byte as well as the whole bytes after
-    // it, without disturbing the null already recorded below it.
     var b = Builder.init(a, types.Type.init(.int).asNullable());
     try b.append(.{ .int = 1 });
     try b.append(.null);
     try b.append(.{ .int = 3 });
-    try b.appendBulk(i64, &.{ 4, 5, 6, 7, 8, 9, 10, 11, 12 }); // crosses two byte boundaries
+    try b.appendBulk(i64, &.{ 4, 5, 6, 7, 8, 9, 10, 11, 12 });
     try b.append(.null);
     try b.append(.{ .int = 14 });
 
@@ -824,8 +741,6 @@ test "builder validity: nulls, bulk runs and partial bytes interleave correctly"
     try std.testing.expect(!c.validity.allSet(14));
     try std.testing.expect(c.validity.allSet(1));
 
-    // A null-free column of the same shape must report all-set at every prefix,
-    // including past the byte boundaries the run crossed.
     var b2 = Builder.init(a, types.Type.init(.int));
     try b2.appendBulk(i64, &.{ 1, 2, 3 });
     try b2.append(.{ .int = 4 });
@@ -833,6 +748,5 @@ test "builder validity: nulls, bulk runs and partial bytes interleave correctly"
     const c2 = try b2.finish();
     try std.testing.expectEqual(@as(usize, 17), c2.len);
     for (0..18) |k| try std.testing.expect(c2.validity.allSet(k));
-    // The bitmap is exactly the rows' worth of bytes, no shadow array behind it.
     try std.testing.expectEqual(@as(usize, 3), c2.validity.bits.len);
 }

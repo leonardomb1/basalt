@@ -1,8 +1,45 @@
-//! Minimal TDS (SQL Server) client. Packet framing, PRELOGIN, optional TDS 7.x
-//! tunneled TLS (the handshake rides inside PRELOGIN packets; all TDS traffic
-//! then flows inside the session), LOGIN7 with SQL / federated / NTLMv2 or
-//! Kerberos (SSPI) auth, SQLBatch, and a streaming token-stream reader (PacketReader/TdsCursor)
-//! that pulls packets on demand so ROW tokens may span packet boundaries.
+//! Minimal TDS (SQL Server) client: packet framing, PRELOGIN, optional TDS 7.x
+//! tunneled TLS, LOGIN7 with SQL, federated (Azure AD), NTLMv2 or Kerberos (SSPI)
+//! auth, SQLBatch, INSERT BULK, and a streaming token-stream reader
+//! (`PacketReader`/`TdsCursor`) that pulls packets on demand, so a ROW token may
+//! span packet boundaries invisibly to the parser. `TdsCursor` has its own batch
+//! reader, so its cursor vtable is hand-written rather than `sql.textCursorVTable`.
+//!
+//! Tunneled TLS: while handshaking, `TlsShim` wraps outgoing TLS flights in
+//! PRELOGIN packets and unwraps the server's replies; afterwards both directions
+//! pass through raw, with whole TDS packets riding inside the session. Federated,
+//! NTLM and Kerberos logins always require TLS: a cleartext NTLM exchange hands the
+//! challenge/response to any passive observer for offline cracking, and nothing
+//! else protects the session.
+//!
+//! Outgoing messages are split into packets of the negotiated size with EOM only
+//! on the last: a SQLBatch sent as one oversized packet is reset by the server or
+//! gateway. A negotiated packet size is accepted only within the spec's 512-32767.
+//!
+//! After login every session sets what the ODBC, OLE DB, JDBC and .NET drivers set,
+//! since a bare TDS login gets legacy defaults: TEXTSIZE (else (max) values arrive
+//! cut at 4096 bytes), ANSI_WARNINGS (else overlong values truncate and division by
+//! zero becomes NULL silently), ANSI_NULLS (the three-valued logic every translated
+//! predicate assumes), ANSI_PADDING, ANSI_NULL_DFLT_ON, and QUOTED_IDENTIFIER,
+//! CONCAT_NULL_YIELDS_NULL and ARITHABORT, without which writes to a table with a
+//! filtered index, indexed view or indexed computed column are refused.
+//!
+//! Every token and cell parser reads server-controlled bytes, often before
+//! authentication, so lengths are bounded against the message (an unbounded error
+//! text once disclosed adjacent heap pre-auth), wire integers use checked casts and
+//! saturating math (raw day counts and time units once panicked), and shifts stop
+//! at the accumulator's width. A corrupt cell reads as null or a clamped value.
+//!
+//! Decoding notes: `tinyint` is the only 1-byte integer and is unsigned (sign
+//! extension once turned 200 into -56). MONEY is a scaled integer of
+//! ten-thousandths, the 8-byte form sent high word first. Non-Unicode text is
+//! transcoded from Windows-1252, the code page behind the common Latin collations,
+//! so accented text does not reach a UTF-8 sink as invalid bytes. `uniqueidentifier`
+//! renders as a canonical GUID and binary as `0x...` hex, since raw bytes would
+//! carry separators and newlines into a delimited bulk load.
+//!
+//! INSERT BULK declares every column nvarchar(4000); each segment carries its own
+//! COLMETADATA then ROW tokens of UTF-16 cells, verified against the DONE count.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -34,7 +71,6 @@ pub const Conn = struct {
     sw: std.net.Stream.Writer = undefined,
     msg: std.array_list.Managed(u8),
     last_error: []const u8 = "",
-    /// The SSPI token of the last login response, a slice into `msg`.
     sspi_reply: []const u8 = "",
     tls: ?*sql.TlsState = null,
     shim: TlsShim = undefined,
@@ -58,11 +94,9 @@ pub const Conn = struct {
         return self;
     }
 
-    /// Connect with an Azure AD access token (the Dataverse / Azure SQL TDS
-    /// endpoints). PRELOGIN advertises FEDAUTHREQUIRED, TLS is mandatory, and the
-    /// LOGIN7 carries the token in a FEDAUTH feature extension (Security Token
-    /// library) instead of a SQL password. The caller fetches the token (see
-    /// aad.ropcToken); this only speaks the wire protocol.
+    /// Azure AD access token (Dataverse / Azure SQL): PRELOGIN advertises
+    /// FEDAUTHREQUIRED and LOGIN7 carries the token in a FEDAUTH feature extension. The
+    /// caller fetches the token (see aad.ropcToken).
     pub fn connectAad(gpa: std.mem.Allocator, host: []const u8, port: u16, token: []const u8, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
         if (tls_mode == .off) return error.EncryptionRequired;
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
@@ -86,11 +120,7 @@ pub const Conn = struct {
         return self;
     }
 
-    /// Connect with Windows NTLMv2 credentials (`DOMAIN\user` + password), the
-    /// on-prem integrated-security path. Encryption is mandatory: a cleartext
-    /// NTLM exchange hands the challenge/response to any passive observer for
-    /// offline cracking. This is NTLMv2 with an explicit password, not OS single
-    /// sign-on.
+    /// NTLMv2 with an explicit `DOMAIN\user` password, not OS single sign-on.
     pub fn connectNtlm(gpa: std.mem.Allocator, host: []const u8, port: u16, cred: ntlm.Credential, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
         if (tls_mode == .off) return error.EncryptionRequired;
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
@@ -107,10 +137,8 @@ pub const Conn = struct {
         return self;
     }
 
-    /// Connect with a domain account over Kerberos: a ticket for `spn`
-    /// (`MSSQLSvc/<host>:<port>`) asked of the KDC with the password, its AP-REQ
-    /// in SPNEGO in the LOGIN7 SSPI field, the server's AP-REP checked. Always
-    /// over TLS, as the rest of the session is not otherwise protected.
+    /// A ticket for `spn` (`MSSQLSvc/<host>:<port>`) asked of the KDC with the password,
+    /// its AP-REQ in SPNEGO in the LOGIN7 SSPI field, the server's AP-REP checked.
     pub fn connectKerberos(gpa: std.mem.Allocator, host: []const u8, port: u16, cred: krb5.Credential, spn: []const u8, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
         if (tls_mode == .off) return error.EncryptionRequired;
         const stream = try std.net.tcpConnectToHost(gpa, host, port);
@@ -130,9 +158,6 @@ pub const Conn = struct {
         return self;
     }
 
-    /// TDS 7.x tunneled TLS: the handshake's TLS records are wrapped in
-    /// PRELOGIN packets by `shim`; once established, the shim switches to
-    /// passthrough and every TDS packet flows inside the session.
     fn startTls(self: *Conn, host: []const u8, mode: sql.TlsMode) !void {
         self.shim = .{ .inner_r = self.sr.interface(), .inner_w = &self.sw.interface, .reader = undefined, .writer = undefined };
         self.shim.reader = .{ .vtable = &TlsShim.reader_vtable, .buffer = &self.shim.rbuf, .seek = 0, .end = 0 };
@@ -153,8 +178,6 @@ pub const Conn = struct {
         self.gpa.destroy(self);
     }
 
-    /// Cleartext reader/writer: through the TLS session when enabled, else the
-    /// plain socket interfaces.
     fn rd(self: *Conn) *std.Io.Reader {
         return if (self.tls) |t| &t.client.reader else self.sr.interface();
     }
@@ -173,8 +196,6 @@ pub const Conn = struct {
         return .{ .ptr = self, .vtable = &sql_vtable };
     }
 
-    /// Streaming cursor: send the query, then read tokens incrementally via a
-    /// packet-streaming reader (bounded memory; ROW tokens may span packets).
     pub fn queryCursor(self: *Conn, stmt: []const u8) !sql.Cursor {
         try self.sendBatch(stmt);
         const cur = try self.gpa.create(TdsCursor);
@@ -196,23 +217,6 @@ pub const Conn = struct {
         return .{ .ptr = cur, .vtable = &cursor_vtable };
     }
 
-    /// Run a statement with no result set (DDL/INSERT/MERGE); errors on ERROR token.
-    /// What every session needs before its first query — what the ODBC, OLE DB,
-    /// JDBC and .NET drivers (and so SSMS) set at connect, where a bare TDS login
-    /// gets the server's legacy defaults, every one of them off:
-    ///   - TEXTSIZE: otherwise varchar(max)/nvarchar(max)/varbinary(max) values
-    ///     arrive cut at 4096 bytes.
-    ///   - ANSI_WARNINGS: otherwise a value too long for its column is truncated
-    ///     on insert instead of refused, and a division by zero or an overflow
-    ///     becomes NULL — data changed without a word.
-    ///   - ANSI_NULLS: `x = NULL` is unknown, never true — the three-valued logic
-    ///     the engine and every translated predicate assume.
-    ///   - ANSI_PADDING: a varchar keeps the trailing spaces it was given.
-    ///   - ANSI_NULL_DFLT_ON: a column created without NULL / NOT NULL allows nulls.
-    ///   - QUOTED_IDENTIFIER, CONCAT_NULL_YIELDS_NULL, ARITHABORT: with the ones
-    ///     above, what SQL Server requires to write a table that has a filtered
-    ///     index, an indexed view or an indexed computed column; without them the
-    ///     write is refused.
     fn afterLogin(self: *Conn) !void {
         try self.exec("SET TEXTSIZE 2147483647; SET ANSI_WARNINGS ON; SET ANSI_NULLS ON; SET ANSI_PADDING ON; " ++
             "SET ANSI_NULL_DFLT_ON ON; SET QUOTED_IDENTIFIER ON; SET CONCAT_NULL_YIELDS_NULL ON; SET ARITHABORT ON; " ++
@@ -225,9 +229,8 @@ pub const Conn = struct {
         try self.scanResultTokens();
     }
 
-    /// Scan a server response token stream (DONE/ERROR/ENVCHANGE/…) in self.msg.
-    /// Bounds-checked against truncated/malformed tokens (mirrors the guards in
-    /// parseLoginResponse); an ERROR token sets last_error and returns QueryFailed.
+    /// Scan a response token stream in `self.msg`, bounds-checked like
+    /// `parseLoginResponse`; an ERROR token sets `last_error` and returns QueryFailed.
     fn scanResultTokens(self: *Conn) !void {
         const p = self.msg.items;
         var i: usize = 0;
@@ -257,10 +260,6 @@ pub const Conn = struct {
         }
     }
 
-    /// Frame a message into one or more TDS packets of <= the negotiated packet
-    /// size (4096; 4088 payload), setting EOM only on the last. Splitting matters:
-    /// a SQLBatch larger than one packet (e.g. a wide UNION query) sent as a single
-    /// oversized packet is reset by the server/gateway.
     fn writePacket(self: *Conn, ptype: u8, payload: []const u8) !void {
         const w = self.wr();
         var off: usize = 0;
@@ -279,7 +278,6 @@ pub const Conn = struct {
         try self.flushOut();
     }
 
-    /// Reassemble a full message (across packets) into self.msg.
     fn readMessage(self: *Conn) !void {
         self.msg.clearRetainingCapacity();
         const r = self.rd();
@@ -295,9 +293,8 @@ pub const Conn = struct {
         }
     }
 
-    /// PRELOGIN that advertises FEDAUTHREQUIRED + encryption-on (Azure AD). The
-    /// option table holds VERSION, ENCRYPTION, FEDAUTHREQUIRED, then data. Parses
-    /// the response for the server's FEDAUTHREQUIRED value and any 32-byte nonce.
+    /// PRELOGIN advertising FEDAUTHREQUIRED and encryption on; parses the server's
+    /// FEDAUTHREQUIRED value and any 32-byte nonce from the response.
     fn preloginFed(self: *Conn) !void {
         const payload = [_]u8{
             0x00, 0x00, 0x10, 0x00, 0x06,
@@ -362,10 +359,8 @@ pub const Conn = struct {
         try self.parseLoginResponse();
     }
 
-    /// Three-leg NTLMv2 handshake (MS-TDS 2.2.6.8): the Type 1 blob rides in the
-    /// LOGIN7 SSPI field, the server answers with an SSPI token carrying the
-    /// Type 2 challenge, and the Type 3 blob goes back in an SSPI Message packet
-    /// (type 0x11); the server's reply to that is an ordinary login response.
+    /// Three-leg NTLMv2 handshake (MS-TDS 2.2.6.8): Type 1 in the LOGIN7 SSPI field, Type 2
+    /// in the server's SSPI token, Type 3 back in an SSPI packet (0x11).
     fn loginNtlm(self: *Conn, cred: ntlm.Credential, database: []const u8, host: []const u8) !void {
         const neg = try ntlm.negotiate(self.gpa, cred);
         defer self.gpa.free(neg);
@@ -387,10 +382,9 @@ pub const Conn = struct {
         };
     }
 
-    /// One round (MS-TDS 2.2.6.4): the AP-REQ in SPNEGO rides in the LOGIN7 SSPI
-    /// field, and the server answers with its AP-REP (an SSPI token) beside the
-    /// LOGINACK. The AP-REP is required and checked, so the server proves it
-    /// holds the service's key; a login that skips it is refused.
+    /// One round (MS-TDS 2.2.6.4): AP-REQ in SPNEGO in the LOGIN7 SSPI field. The AP-REP
+    /// beside the LOGINACK is required and checked, so the server proves it holds the
+    /// service key; a login without it is refused.
     fn loginKerberos(self: *Conn, cred: krb5.Credential, spn: []const u8, database: []const u8, host: []const u8) !void {
         const t = krb5.serviceTicket(self.gpa, cred, spn) catch |e| return self.krbFailed(e);
         const ctx = krb5.initContext(self.gpa, cred, &t) catch |e| return self.krbFailed(e);
@@ -414,7 +408,6 @@ pub const Conn = struct {
         self.sspi_reply = "";
     }
 
-    /// A Kerberos failure as a failed login, in the Kerberos layer's words.
     fn krbFailed(self: *Conn, e: anyerror) Error {
         if (e == error.OutOfMemory) return error.OutOfMemory;
         const why = krb5.lastError();
@@ -427,8 +420,7 @@ pub const Conn = struct {
         return error.LoginFailed;
     }
 
-    /// The server's SSPI token (0xED) out of the current message: a US_VARBYTE
-    /// (2-byte byte count) carrying the security blob. Returns a slice into
+    /// The server's SSPI token (0xED), a US_VARBYTE security blob. Returns a slice into
     /// `self.msg`, valid until the next `readMessage`.
     fn sspiToken(self: *Conn) ![]const u8 {
         const p = self.msg.items;
@@ -452,7 +444,7 @@ pub const Conn = struct {
         return error.TdsProtocol;
     }
 
-    /// Also notes the SSPI token the response carries, if any, in `sspi_reply`.
+    /// Also notes the response's SSPI token, if any, in `sspi_reply`.
     fn parseLoginResponse(self: *Conn) !void {
         const p = self.msg.items;
         var i: usize = 0;
@@ -469,10 +461,6 @@ pub const Conn = struct {
                     ok = true;
                 },
                 0xAA => {
-                    // Bound the token body, as the sibling 0xAA/0xE3 parsers do:
-                    // only the slice START was checked, so a server-supplied
-                    // length copied adjacent heap into the error text shown to
-                    // the user — a pre-auth disclosure.
                     if (i + 2 > p.len) return error.TdsProtocol;
                     const len = rdU16(p, i);
                     if (i + 2 + len > p.len) return error.TdsProtocol;
@@ -548,14 +536,11 @@ pub const Conn = struct {
         try self.writePacket(PKT_SQLBATCH, payload.items);
     }
 
-    /// Send `INSERT BULK …` and read the server's acknowledgment; the bulk data
-    /// then streams via `bulkPacket`, finished by `bulkFinish`.
     pub fn bulkStart(self: *Conn, insert_bulk_sql: []const u8) !void {
         try self.sendBatch(insert_bulk_sql);
         try self.readBulkResponse();
     }
 
-    /// One Bulk Load (0x07) packet; `status` carries EOM on the final one.
     pub fn bulkPacket(self: *Conn, status: u8, payload: []const u8) !void {
         var header: [8]u8 = .{ PKT_BULK, status, 0, 0, 0, 0, 0, 0 };
         const total: u16 = @intCast(payload.len + 8);
@@ -567,9 +552,7 @@ pub const Conn = struct {
         try self.flushOut();
     }
 
-    /// Read the server's response to the bulk load (DONE on success, ERROR
-    /// token). Returns the DONE row count, the server's word on how many rows
-    /// actually landed.
+    /// Returns the DONE row count, the server's word on how many rows actually landed.
     pub fn bulkFinish(self: *Conn) !?u64 {
         self.last_done_count = null;
         try self.readBulkResponse();
@@ -582,11 +565,6 @@ pub const Conn = struct {
     }
 };
 
-/// TDS 7.x tunneled TLS framing between the socket and the TLS client. While
-/// `handshaking`, outgoing TLS flights are wrapped in PRELOGIN packets and the
-/// server's wrapped replies are unwrapped; afterwards both directions pass
-/// through raw (the TLS records themselves frame the post-login stream, with
-/// whole TDS packets riding inside the session).
 const TlsShim = struct {
     inner_r: *std.Io.Reader,
     inner_w: *std.Io.Writer,
@@ -667,8 +645,6 @@ const TlsShim = struct {
 
 const sql_vtable = sql.connVTable(Conn);
 
-/// Hand-written: the tds cursor is a separate `TdsCursor` with its own batch
-/// reader, so it does not fit `sql.textCursorVTable`.
 const cursor_vtable = sql.Cursor.VTable{ .schema = curSchema, .nextBatch = curNext, .close = curClose, .last_error = curLastError };
 
 fn curLastError(ptr: *anyopaque) []const u8 {
@@ -689,9 +665,6 @@ fn curClose(ptr: *anyopaque) void {
     self.closeCursor();
 }
 
-/// Reads the TDS response as a continuous byte stream, pulling packets on
-/// demand (respecting the EOM bit). Multi-byte reads transparently span packet
-/// boundaries — so a ROW token straddling two packets is invisible to the parser.
 const SOCK_BUF = 64 * 1024;
 
 const PacketReader = struct {
@@ -707,7 +680,6 @@ const PacketReader = struct {
         self.buf.deinit();
     }
 
-    /// Ensure at least one byte is available; returns false at end of message.
     fn ensure(self: *PacketReader) !bool {
         while (self.pos >= self.buf.items.len) {
             if (self.eom) return false;
@@ -759,9 +731,8 @@ const PacketReader = struct {
         try self.readBytes(&b);
         return std.mem.readInt(u64, &b, .little);
     }
-    /// Read a PLP (Partially Length-Prefixed) value — how SQL Server frames
-    /// varchar(max)/nvarchar(max)/varbinary(max): an 8-byte total length (0xFF…FF =
-    /// NULL; otherwise ignored), then 4-byte-prefixed chunks until a 0-length chunk.
+    /// PLP (Partially Length-Prefixed), how (max) types are framed: an 8-byte total
+    /// (all ones = NULL, else ignored), then 4-byte-prefixed chunks until a 0-length one.
     fn readPlp(self: *PacketReader, arena: std.mem.Allocator) !?[]u8 {
         const total = try self.readU64();
         if (total == 0xFFFFFFFFFFFFFFFF) return null;
@@ -801,7 +772,6 @@ const TdsCursor = struct {
     schema: *types.Schema,
     done: bool,
 
-    /// Read tokens up to (and including) COLMETADATA, building the schema.
     fn readHeader(self: *TdsCursor) !void {
         const ma = self.meta_arena.allocator();
         const empty = try ma.create(types.Schema);
@@ -820,8 +790,6 @@ const TdsCursor = struct {
                 0xAA => try self.handleError(),
                 0xAB, 0xE3, 0xA9, 0xA4, 0xA5 => try self.reader.skip(try self.reader.readU16()),
                 0x79 => try self.reader.skip(4),
-                // A statement ahead of the rowset finished — a DELETE, an INSERT, a
-                // SET. Unless it was the batch's last, the rowset may still come.
                 0xFD, 0xFE, 0xFF => {
                     if (try self.doneMore()) continue;
                     self.done = true;
@@ -835,6 +803,8 @@ const TdsCursor = struct {
         }
     }
 
+    /// After the rowset the batch is run to its end, so a later statement executes and
+    /// its error is seen; closing early would have SQL Server abandon it silently.
     fn fetchBatch(self: *TdsCursor, arena: std.mem.Allocator) !?Batch {
         if (self.done) return null;
         const ncol = self.cols.len;
@@ -862,9 +832,6 @@ const TdsCursor = struct {
                 },
                 0xAB, 0xE3, 0xA9, 0xA4, 0xA5 => try self.reader.skip(try self.reader.readU16()),
                 0x79 => try self.reader.skip(4),
-                // The rowset ended. The batch may go on: run it to its end, so a
-                // statement after the SELECT executes and its error is seen —
-                // closing here would have SQL Server abandon it without a word.
                 0xFD, 0xFE, 0xFF => {
                     if (try self.doneMore()) try self.drain();
                     self.done = true;
@@ -883,17 +850,15 @@ const TdsCursor = struct {
         return .{ .schema = self.schema, .columns = out, .len = n };
     }
 
-    /// Read a DONE / DONEPROC / DONEINPROC body: whether more results follow in
-    /// the batch (the DONE_MORE bit of its status).
+    /// Whether more results follow in the batch (the DONE_MORE bit of the status).
     fn doneMore(self: *TdsCursor) !bool {
         const status = try self.reader.readU16();
         try self.reader.skip(10);
         return status & 0x0001 != 0;
     }
 
-    /// The rest of the batch after the rowset: statements with no rows run to
-    /// their end; an error in one fails the read; a second rowset is refused
-    /// (`sql.one_result_set`).
+    /// Statements with no rows run to their end; an error in one fails the read; a
+    /// second rowset is refused (`sql.one_result_set`).
     fn drain(self: *TdsCursor) !void {
         while (true) {
             const token = self.reader.readByte() catch |e| {
@@ -1002,8 +967,6 @@ const TdsCursor = struct {
                 _ = try self.reader.readByte();
                 d.engine_type = floatT;
             },
-            // MONEYNTYPE. Not a float: a scaled integer of ten-thousandths, and
-            // the 8-byte form is the one TDS type sent high word first.
             0x6E => {
                 const ml = try self.reader.readByte();
                 d.is_money = true;
@@ -1163,9 +1126,6 @@ const TdsCursor = struct {
 const NVARCHAR_MAX_BYTES = 8000;
 const BULK_COLLATION = [5]u8{ 0x09, 0x04, 0xD0, 0x00, 0x34 };
 
-/// INSERT BULK: every column is declared nvarchar(4000) in the bulk descriptor
-/// and each segment carries its own COLMETADATA token followed by ROW tokens of
-/// UTF-16 cells, verified against the DONE row count.
 const BulkProto = struct {
     pub const Connection = Conn;
     pub const dialect: sql.Dialect = .sqlserver;
@@ -1273,9 +1233,6 @@ fn decodeValue(arena: std.mem.Allocator, d: ColumnDesc, bytes: []const u8) !Valu
         .decimal => if (d.is_money) decodeMoney(bytes) else decodeDecimal(d, bytes),
         .string => .{ .string = if (d.is_guid) try formatGuid(arena, bytes) else if (d.is_binary) try bytesToHex(arena, bytes) else if (d.is_unicode) try utf16ToUtf8(arena, bytes) else try win1252ToUtf8(arena, bytes) },
         .bytes => .{ .bytes = try arena.dupe(u8, bytes) },
-        // Checked, not @intCast: the day count is raw wire bytes, and a value
-        // past the i32 date range panicked instead of erroring. Out of range
-        // means a corrupt cell, and a corrupt cell reads as null.
         .date => if (std.math.cast(i32, @as(i64, @bitCast(readULE(bytes))) - 719162)) |days|
             .{ .date = days }
         else
@@ -1291,14 +1248,12 @@ fn decodeDecimal(d: ColumnDesc, bytes: []const u8) Value {
     const positive = bytes[0] == 1;
     var mag: i128 = 0;
     for (bytes[1..], 0..) |b, k| {
-        if (k >= 16) break; // shifting past the width of an i128 is UB
+        if (k >= 16) break;
         mag |= @as(i128, b) << @intCast(k * 8);
     }
     return .{ .decimal = .{ .unscaled = if (positive) mag else -mag, .scale = d.scale } };
 }
 
-/// MONEY/SMALLMONEY: a scaled integer of ten-thousandths, never IEEE-754. The
-/// 8-byte form is the one TDS value sent high word first.
 fn decodeMoney(bytes: []const u8) Value {
     const unscaled: i64 = switch (bytes.len) {
         4 => std.mem.readInt(i32, bytes[0..4], .little),
@@ -1312,7 +1267,7 @@ fn decodeMoney(bytes: []const u8) Value {
     return .{ .decimal = .{ .unscaled = unscaled, .scale = 4 } };
 }
 
-/// TIMENTYPE: 3–5 little-endian bytes counting 10^-scale seconds since midnight.
+/// TIMENTYPE: 3-5 little-endian bytes counting 10^-scale seconds since midnight.
 fn decodeTime(d: ColumnDesc, bytes: []const u8) i64 {
     var tu: i64 = 0;
     for (bytes, 0..) |b, k| {
@@ -1330,23 +1285,16 @@ fn decodeDateTime(d: ColumnDesc, bytes: []const u8) i64 {
             const tlen = bytes.len - 3 - off_bytes;
             var tu: i64 = 0;
             for (bytes[0..tlen], 0..) |b, k| {
-                if (k >= 8) break; // shifting past the width of an i64 is UB
+                if (k >= 8) break;
                 tu |= @as(i64, b) << @intCast(k * 8);
             }
             const days: i64 = @intCast(u24le(bytes[tlen .. tlen + 3]));
             const days1970 = days - 719162;
-            // Saturating: `tu` is up to eight wire bytes, so a corrupt or
-            // hostile value reaches i64 max and ordinary `*`/`+` here was a
-            // server-triggerable panic. A clamped timestamp out of garbage
-            // matches what the short-body paths already do (return 0).
             const time_micros = @divTrunc(tu *| 1_000_000, pow10(d.scale));
             return days1970 *| 86_400_000_000 +| time_micros;
         },
         else => {
             if (bytes.len >= 8) {
-                // Same saturation: `date4` is a full signed 32-bit day count
-                // off the wire; ~68 years is day ~25k, but nothing stops a
-                // peer sending 0x7FFFFFFF.
                 const date4 = readIntLE(bytes[0..4]);
                 const ticks: i64 = @intCast(readULE(bytes[4..8]));
                 return (date4 - 25567) *| 86_400_000_000 +| @divTrunc(ticks * 1_000_000, 300);
@@ -1359,8 +1307,8 @@ fn decodeDateTime(d: ColumnDesc, bytes: []const u8) i64 {
     }
 }
 
-/// 10^18 is the largest power of ten an i64 holds; a wire scale is capped there
-/// rather than allowed to overflow. TDS never sends more than 7.
+/// 10^18 is the largest power of ten an i64 holds; a wire scale is capped there.
+/// TDS never sends more than 7.
 fn pow10(n: u8) i64 {
     var r: i64 = 1;
     var k: u8 = 0;
@@ -1372,7 +1320,6 @@ fn u24le(b: []const u8) u32 {
     return @as(u32, b[0]) | (@as(u32, b[1]) << 8) | (@as(u32, b[2]) << 16);
 }
 
-/// Little-endian unsigned of up to 8 bytes.
 fn readULE(bytes: []const u8) u64 {
     var u: u64 = 0;
     for (bytes, 0..) |b, k| {
@@ -1382,13 +1329,9 @@ fn readULE(bytes: []const u8) u64 {
     return u;
 }
 
-/// Little-endian signed integer (sign-extended) for TDS integer widths.
 fn readIntLE(bytes: []const u8) i64 {
     return switch (bytes.len) {
         0 => 0,
-        // SQL Server has no signed 1-byte type: the only producers of a 1-byte
-        // body are INT1TYPE and INTNTYPE(1), both `tinyint`, which is unsigned
-        // 0-255. Sign-extending turned 200 into -56 and 255 into -1.
         1 => @as(i64, bytes[0]),
         2 => std.mem.readInt(i16, bytes[0..2], .little),
         4 => std.mem.readInt(i32, bytes[0..4], .little),
@@ -1405,9 +1348,6 @@ fn readIntLE(bytes: []const u8) i64 {
     };
 }
 
-/// Map a high byte (0x80–0xFF) of Windows-1252 to its Unicode code point. 0xA0–0xFF
-/// match Latin-1 (cp == byte); 0x80–0x9F carry the cp1252-specific punctuation;
-/// the five undefined slots (0x81/0x8D/0x8F/0x90/0x9D) fall back to the byte value.
 fn cp1252High(b: u8) u21 {
     return switch (b) {
         0x80 => 0x20AC,
@@ -1441,11 +1381,6 @@ fn cp1252High(b: u8) u21 {
     };
 }
 
-/// Transcode a non-Unicode (single-byte) SQL Server char value to UTF-8, assuming
-/// Windows-1252 — the code page behind the common Latin collations (e.g.
-/// SQL_Latin1_General_CP1). Pure-ASCII input is duped as-is (no allocation growth).
-/// Without this, accented Latin text (RELÓGIO, SINALIZAÇÃO) reaches a UTF-8 sink as
-/// invalid bytes and is rejected (e.g. StarRocks "Invalid UTF-8 row").
 fn win1252ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     var high = false;
     for (bytes) |b| {
@@ -1467,11 +1402,6 @@ fn win1252ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     return out.toOwnedSlice();
 }
 
-/// Format a SQL Server `uniqueidentifier` (16 wire bytes, mixed-endian) as the
-/// canonical lowercase GUID string. Decoding it as raw text would emit control
-/// bytes (incl. the load separator/newline) and corrupt a delimited bulk load.
-/// Render binary as a `0x…` lowercase hex string (CSV/Stream-Load safe — raw
-/// binary bytes would otherwise carry separators/newlines and corrupt the load).
 fn bytesToHex(arena: std.mem.Allocator, b: []const u8) ![]const u8 {
     const digits = "0123456789abcdef";
     const out = try arena.alloc(u8, 2 + b.len * 2);
@@ -1491,12 +1421,9 @@ fn formatGuid(arena: std.mem.Allocator, b: []const u8) ![]const u8 {
     });
 }
 
-/// UCS-2 is not UTF-16: a code unit outside the BMP arrives as a surrogate
-/// PAIR, and encoding the halves one at a time (which `utf8Encode` refuses)
-/// turned every emoji into `??` — while the write side has always paired them,
-/// so a round-trip through SQL Server was lossy. `?` is kept for a half with no
-/// partner, which is the only thing that cannot be decoded. The wire buffer is
-/// byte-aligned, so the `[]const u16` helpers in std are not usable here.
+/// UCS-2 is not UTF-16: halves of a surrogate pair are joined (encoding them singly
+/// once made every emoji `??`); only an unpaired half becomes `?`. The wire buffer is
+/// byte-aligned, so std's `[]const u16` helpers do not apply.
 fn utf16ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     var out = std.array_list.Managed(u8).init(arena);
     var k: usize = 0;
@@ -1555,7 +1482,6 @@ test "win1252 transcode to utf8" {
 
 test "readIntLE sign-extends every TDS integer width" {
     try std.testing.expectEqual(@as(i64, 0), readIntLE(&.{}));
-    // `tinyint` is unsigned in T-SQL — a 1-byte body is 0-255, never negative.
     try std.testing.expectEqual(@as(i64, 255), readIntLE(&.{0xFF}));
     try std.testing.expectEqual(@as(i64, 127), readIntLE(&.{0x7F}));
     try std.testing.expectEqual(@as(i64, -2), readIntLE(&.{ 0xFE, 0xFF }));
@@ -1577,20 +1503,16 @@ test "decodeDecimal: sign byte + little-endian magnitude at the column scale" {
 }
 
 test "short or oversized bodies are refused, not read out of bounds" {
-    // SMALLDATETIME wants 4 bytes; a truncated body read `bytes[2..4]` anyway.
     const sdt = ColumnDesc{ .tds_type = 0x3A, .engine_type = types.Type.init(.timestamp).asNullable(), .kind = .fixed, .fixed_len = 4 };
     try std.testing.expectEqual(@as(i64, 0), decodeDateTime(sdt, &.{ 1, 2, 3 }));
     try std.testing.expectEqual(@as(i64, 0), decodeDateTime(sdt, &.{}));
 
-    // A DATETIME2 wire scale past 7 overflowed pow10 before it was ever divided by.
     const dt2 = ColumnDesc{ .tds_type = 0x2A, .engine_type = types.Type.init(.timestamp).asNullable(), .kind = .bytelen, .scale = 40 };
     _ = decodeDateTime(dt2, &.{ 1, 2, 3, 4, 5, 6, 7 });
-    // …and a long body shifted past the width of the i64 it accumulates into.
     var long_dt: [64]u8 = undefined;
     @memset(&long_dt, 0xFF);
     _ = decodeDateTime(dt2, &long_dt);
 
-    // A decimal body longer than 17 bytes shifted past the width of an i128.
     var long: [40]u8 = undefined;
     @memset(&long, 0xFF);
     long[0] = 1;
@@ -1599,23 +1521,19 @@ test "short or oversized bodies are refused, not read out of bounds" {
 }
 
 test "decodeMoney: ten-thousandths, high word first for the 8-byte form" {
-    // -0.0001 is all-ones on the wire in both widths.
     try std.testing.expectEqual(@as(i128, -1), decodeMoney(&(.{0xFF} ** 8)).decimal.unscaled);
     try std.testing.expectEqual(@as(i128, -1), decodeMoney(&(.{0xFF} ** 4)).decimal.unscaled);
     try std.testing.expectEqual(@as(u8, 4), decodeMoney(&(.{0xFF} ** 8)).decimal.scale);
 
-    // 922337203685477.5807 == i64 max: high word first, so 0x7FFFFFFF then 0xFFFFFFFF.
     var b: [8]u8 = undefined;
     std.mem.writeInt(i32, b[0..4], 0x7FFFFFFF, .little);
     std.mem.writeInt(u32, b[4..8], 0xFFFFFFFF, .little);
     try std.testing.expectEqual(@as(i128, std.math.maxInt(i64)), decodeMoney(&b).decimal.unscaled);
 
-    // 1.0000 -> 10000, which lives entirely in the low word.
     std.mem.writeInt(i32, b[0..4], 0, .little);
     std.mem.writeInt(u32, b[4..8], 10000, .little);
     try std.testing.expectEqual(@as(i128, 10000), decodeMoney(&b).decimal.unscaled);
 
-    // smallmoney -214748.3648 is plain little-endian i32.
     var b4: [4]u8 = undefined;
     std.mem.writeInt(i32, &b4, std.math.minInt(i32), .little);
     try std.testing.expectEqual(@as(i128, std.math.minInt(i32)), decodeMoney(&b4).decimal.unscaled);
@@ -1629,7 +1547,7 @@ test "decodeTime: 10^-scale seconds since midnight to micros" {
 
     d.scale = 7;
     var b5: [5]u8 = .{ 0, 0, 0, 0, 0 };
-    const tenths_us: u40 = 863_999_999_999; // 23:59:59.9999999
+    const tenths_us: u40 = 863_999_999_999;
     inline for (0..5) |k| b5[k] = @intCast((tenths_us >> (k * 8)) & 0xFF);
     try std.testing.expectEqual(@as(i64, 86_399_999_999), decodeTime(d, &b5));
 }
@@ -1669,33 +1587,28 @@ test "utf16ToUtf8 decodes BMP text and replaces invalid units" {
 
 test "utf16ToUtf8 pairs surrogates; only an unpaired half degrades to `?`" {
     const alloc = std.testing.allocator;
-    // U+1F600, D83D DE00 little-endian, with BMP text on both sides.
     const emoji = try utf16ToUtf8(alloc, "a\x00\x3d\xd8\x00\xde" ++ "b\x00");
     defer alloc.free(emoji);
     try std.testing.expectEqualStrings("a😀b", emoji);
 
-    // Whatever the write side encodes must come back unchanged.
     const round = try std.unicode.utf8ToUtf16LeAlloc(alloc, "𝄞x𝕏");
     defer alloc.free(round);
     const back = try utf16ToUtf8(alloc, std.mem.sliceAsBytes(round));
     defer alloc.free(back);
     try std.testing.expectEqualStrings("𝄞x𝕏", back);
 
-    // A high half followed by a non-low unit, and a truncated high half.
     const orphan = try utf16ToUtf8(alloc, "\x3d\xd8" ++ "a\x00");
     defer alloc.free(orphan);
     try std.testing.expectEqualStrings("?a", orphan);
     const cut = try utf16ToUtf8(alloc, "a\x00\x3d\xd8");
     defer alloc.free(cut);
     try std.testing.expectEqualStrings("a?", cut);
-    // A low half with no high half before it.
     const low = try utf16ToUtf8(alloc, "\x00\xde");
     defer alloc.free(low);
     try std.testing.expectEqualStrings("?", low);
 }
 
-/// DONE token body (status u16, curcmd u16, rowcount u64, all LE) → the count
-/// when this is a final DONE (0xFD) with the DONE_COUNT flag (0x10) set.
+/// The row count of a final DONE (0xFD) with DONE_COUNT (0x10) set.
 fn parseDoneRowCount(token: u8, d: []const u8) ?u64 {
     if (token != 0xFD or d.len != 12) return null;
     if (std.mem.readInt(u16, d[0..2], .little) & 0x10 == 0) return null;
@@ -1710,9 +1623,6 @@ test "parseDoneRowCount: counted DONE, uncounted DONE, DONEINPROC" {
     try std.testing.expectEqual(@as(?u64, null), parseDoneRowCount(0xFF, &counted));
 }
 
-/// ENVCHANGE data → negotiated packet size, or null if it's another env type or
-/// malformed. Layout: Type u8; type 4's NewValue is a B_VARCHAR (char count,
-/// UCS-2 digits). Accepts the server's value only within the spec's 512-32767.
 fn parseEnvPacketSize(d: []const u8) ?usize {
     if (d.len < 2 or d[0] != 4) return null;
     const n: usize = d[1];
@@ -1771,12 +1681,9 @@ fn buildLogin7(gpa: std.mem.Allocator, user: []const u8, password: []const u8, d
     return out;
 }
 
-/// LOGIN7 carrying an Azure AD access token in a FEDAUTH feature extension
-/// (Security Token library) — no SQL username/password. The token rides as
-/// UTF-16LE bytes; `echo` mirrors the server's FEDAUTHREQUIRED and, when set with
-/// a server nonce, the nonce is appended. The OptionFlags3 fExtension bit (0x10)
-/// flags the feature block, whose offset lives in a 4-byte slot referenced by the
-/// repurposed "Extension" offset/length pair.
+/// LOGIN7 with a FEDAUTH feature extension (Security Token library) and no SQL
+/// credentials. `echo` mirrors FEDAUTHREQUIRED; fExtension (0x10) flags the feature
+/// block, whose offset sits in a slot the Extension offset/length pair points to.
 fn buildLogin7Fedauth(gpa: std.mem.Allocator, token: []const u8, database: []const u8, host: []const u8, echo: bool, nonce: ?[32]u8) ![]u8 {
     var fixed = std.mem.zeroes([94]u8);
     fixed[4] = 0x04;
@@ -1832,11 +1739,9 @@ fn buildLogin7Fedauth(gpa: std.mem.Allocator, token: []const u8, database: []con
     return out;
 }
 
-/// LOGIN7 carrying an NTLM Type 1 blob in the SSPI field (MS-TDS 2.2.6.4), with
-/// empty user/password: OptionFlags2 bit fIntSecurity (0x80, byte 25) selects
-/// integrated security, and ibSSPI/cbSSPI (byte 78) point at the blob as raw
-/// bytes rather than UTF-16. cbSSPILong (byte 90) stays 0 — the spec only
-/// consults it when cbSSPI is 0xFFFF, far above any NTLM token's size.
+/// LOGIN7 with an SSPI blob (MS-TDS 2.2.6.4): fIntSecurity (0x80, byte 25) selects
+/// integrated security; ibSSPI/cbSSPI (byte 78) point at raw bytes. cbSSPILong stays 0,
+/// consulted only when cbSSPI is 0xFFFF.
 fn buildLogin7Sspi(gpa: std.mem.Allocator, sspi: []const u8, database: []const u8, host: []const u8) ![]u8 {
     var fixed = std.mem.zeroes([94]u8);
     fixed[4] = 0x04;
@@ -1870,8 +1775,6 @@ fn buildLogin7Sspi(gpa: std.mem.Allocator, sspi: []const u8, database: []const u
     return out;
 }
 
-/// Append opaque bytes to var-data and write their (offset, byte-count) into the
-/// fixed block — the SSPI field is a blob, not a string, so no UTF-16 widening.
 fn addRaw(fixed: []u8, ib_pos: usize, bytes: []const u8, vd: *std.array_list.Managed(u8)) !void {
     const ib: u16 = @intCast(94 + vd.items.len);
     try vd.appendSlice(bytes);
@@ -1879,8 +1782,7 @@ fn addRaw(fixed: []u8, ib_pos: usize, bytes: []const u8, vd: *std.array_list.Man
     std.mem.writeInt(u16, fixed[ib_pos + 2 ..][0..2], @intCast(bytes.len), .little);
 }
 
-/// Append a UTF-16LE string to var-data and write its (offset, char-count) into
-/// the fixed offset/length block. ASCII only (sufficient for creds/identifiers).
+/// Writes an ASCII string as UTF-16LE (offset, char count); creds and identifiers only.
 fn addField(fixed: []u8, ib_pos: usize, s: []const u8, vd: *std.array_list.Managed(u8), obfuscate: bool) !void {
     const ib: u16 = @intCast(94 + vd.items.len);
     const start = vd.items.len;
@@ -1907,16 +1809,13 @@ test "parseLoginResponse keeps the SSPI token beside the LOGINACK" {
     c.msg = std.array_list.Managed(u8).init(std.testing.allocator);
     defer c.msg.deinit();
     c.last_error = "";
-    // SSPI token "ap-rep", then a LOGINACK (its body skipped by length)
     try c.msg.appendSlice("\xED\x06\x00ap-rep\xAD\x01\x00\x00");
     try c.parseLoginResponse();
     try std.testing.expectEqualStrings("ap-rep", c.sspi_reply);
-    // an SSPI token alone is not a login: another round is wanted
     c.msg.clearRetainingCapacity();
     try c.msg.appendSlice(&.{ 0xED, 2, 0, 'h', 'i' });
     try std.testing.expectError(error.LoginFailed, c.parseLoginResponse());
     try std.testing.expectEqualStrings("hi", c.sspi_reply);
-    // a length past the message is refused, not sliced
     c.msg.clearRetainingCapacity();
     try c.msg.appendSlice(&.{ 0xED, 9, 0, 'x' });
     try std.testing.expectError(error.TdsProtocol, c.parseLoginResponse());
@@ -1989,11 +1888,9 @@ test "buildLogin7Fedauth: nonce appended when echo && nonce present" {
     try std.testing.expectEqualSlices(u8, &nonce, out[out.len - 33 .. out.len - 1]);
 }
 
+/// Sweeps the column-description space from the first two bytes and feeds the rest
+/// as a cell, into a fixed buffer so a hostile size gets OutOfMemory, not the memory.
 fn fuzzCell(_: void, input: []const u8) anyerror!void {
-    // One TOKEN row cell: `decodeValue` dispatches on the column description
-    // negotiated at COLMETADATA time, then reads the raw cell bytes — both of
-    // which the server controls. Sweep the description space from the first
-    // two input bytes, feed the rest as the cell.
     if (input.len < 2) return;
     const kinds = [_]types.TypeKind{ .int, .bool, .float, .decimal, .string, .bytes, .date, .time, .timestamp };
     const kind = kinds[input[0] % kinds.len];
@@ -2010,9 +1907,6 @@ fn fuzzCell(_: void, input: []const u8) anyerror!void {
         .is_binary = flags & 4 != 0,
         .is_money = flags & 8 != 0,
     };
-    // Fixed buffer, not a heap arena: it makes each iteration allocation-free
-    // (the mutation loop runs thousands), and a decoder talked into a huge
-    // size by hostile bytes gets error.OutOfMemory instead of the memory.
     var mem: [256 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&mem);
     var arena = std.heap.ArenaAllocator.init(fba.allocator());
@@ -2021,10 +1915,10 @@ fn fuzzCell(_: void, input: []const u8) anyerror!void {
 }
 
 const fuzzCell_corpus = [_][]const u8{
-    "\x00\x00\x2a\x00\x00\x00\x00\x00\x00\x00", // int cell
-    "\x03\x08\x01\x00\xd2\x04", // decimal-shaped
-    "\x04\x01A\x00B\x00", // unicode string
-    "\x06\x00\xda\xb9\x0a\x00", // date-shaped
+    "\x00\x00\x2a\x00\x00\x00\x00\x00\x00\x00",
+    "\x03\x08\x01\x00\xd2\x04",
+    "\x04\x01A\x00B\x00",
+    "\x06\x00\xda\xb9\x0a\x00",
 };
 
 test "fuzz: row cell decode survives arbitrary bytes" {

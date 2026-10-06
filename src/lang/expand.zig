@@ -3,9 +3,19 @@
 //! `expandProgram` collects the `fn` declarations, then rewrites every expression
 //! in the program so each call to a user fn is replaced by the fn's body with the
 //! call's arguments substituted for the parameters (a hygienic inline expansion).
-//! The `fn` declarations are dropped from the returned program, so the rest of the
-//! engine (type-checker, evaluator, planner) never sees a user function. Recursion
-//! and arity mismatches are reported as `ExpandFailed` with a message.
+//! Expression-form declarations are dropped from the returned program, so the
+//! type-checker, evaluator and planner never see them; table functions were
+//! already expanded by the parser. Statement-form declarations survive, their
+//! bodies expanded, as the macro table `CALL` renders at run time. Only top-level
+//! declarations are collected. Recursion and arity mismatches are reported as
+//! `ExpandFailed` with a message.
+//!
+//! The same pass replaces `$p.a.b` refs to `json` params with literals of the
+//! resolved scalar, parsing the request body once (a bare `p.a` is a column of a
+//! table aliased `p`). Offline, with no body, such refs become `null`.
+//!
+//! Depth alone does not bound the work: `f(x) = g(x) + g(x)` doubles per level, so
+//! a 64-deep chain is 2^64 nodes, hence the `max_nodes` cap on the total.
 
 const std = @import("std");
 const builtins = @import("../exec/builtins.zig");
@@ -17,9 +27,6 @@ pub const Error = error{ OutOfMemory, ExpandFailed };
 
 const max_depth = 64;
 
-/// Depth bounds nesting, not work: `f(x) = g(x) + g(x)` doubles per level, so a
-/// 64-deep chain is 2^64 nodes long before the depth cap fires. This bounds the
-/// total, and sits far above any real script (thousands of nodes at most).
 const max_nodes = 250_000;
 
 const Ctx = struct {
@@ -32,11 +39,6 @@ const Ctx = struct {
 
 const Subst = std.StringHashMap(*ast.Expr);
 
-/// Expand user-fn calls and JSON-param path refs, returning a program with the
-/// `fn` declarations removed. `body` is the request body (or null offline); it is
-/// parsed once if any `json` params are declared, and `p.a.b` field refs are
-/// replaced by literals of the resolved scalar (or `null` when unbound, e.g.
-/// offline `check`).
 pub fn expandProgram(arena: std.mem.Allocator, program: ast.Program, body: ?[]const u8, msg: *[]const u8) Error!ast.Program {
     var fns = std.StringHashMap(ast.FnDecl).init(arena);
     for (program.stmts) |s| if (s == .func) {
@@ -68,9 +70,6 @@ pub fn expandProgram(arena: std.mem.Allocator, program: ast.Program, body: ?[]co
     var cx = Ctx{ .arena = arena, .fns = &fns, .json = &json, .msg = msg };
     var out = std.array_list.Managed(ast.Stmt).init(arena);
     for (program.stmts) |s| {
-        // Expression-form declarations are inlined at their call sites and dropped,
-        // as are table functions, which the parser already expanded at theirs;
-        // statement-form ones survive as the macro table `CALL` renders at run time.
         if (s == .func and s.func.body != .stmts) continue;
         try out.append(try expandStmt(&cx, s));
     }
@@ -115,8 +114,6 @@ fn expandStmt(cx: *Ctx, s: ast.Stmt) Error!ast.Stmt {
             .when = if (t.when) |w| try expandExpr(cx, w, null, 0) else null,
             .pos = t.pos,
         } },
-        // Only the statement form reaches here (expandProgram drops the expression
-        // form); its block is expanded so nested user fns / JSON params resolve.
         .func => |fd| .{ .func = .{
             .name = fd.name,
             .params = fd.params,
@@ -127,8 +124,6 @@ fn expandStmt(cx: *Ctx, s: ast.Stmt) Error!ast.Stmt {
     };
 }
 
-/// Expand a statement block, dropping any nested `fn` declaration (only
-/// top-level declarations are collected, as they always have been).
 fn expandBlock(cx: *Ctx, stmts: []const ast.Stmt) Error![]const ast.Stmt {
     var out = std.array_list.Managed(ast.Stmt).init(cx.arena);
     for (stmts) |st| {
@@ -138,10 +133,8 @@ fn expandBlock(cx: *Ctx, stmts: []const ast.Stmt) Error![]const ast.Stmt {
     return try out.toOwnedSlice();
 }
 
-/// Resolve a `CALL f(args)` against the declaration table: the name must exist and
-/// be statement-form, and the argument list must match after defaults are filled.
-/// The arguments themselves stay as expressions — `run.zig` const-evaluates them
-/// against the params / loop variables in scope at the call site.
+/// Resolve `CALL f(args)` to a statement-form declaration with defaults filled.
+/// The arguments stay expressions; `run.zig` const-evaluates them at the call site.
 fn expandCallStmt(cx: *Ctx, c: ast.CallStmt) Error!ast.Stmt {
     const fd = cx.fns.get(c.name) orelse {
         cx.msg.* = std.fmt.allocPrint(cx.arena, "CALL: no function named `{s}`", .{c.name}) catch "CALL: unknown function";
@@ -196,11 +189,8 @@ fn expandNode(cx: *Ctx, n: ast.Stage.Node) Error!ast.Stage.Node {
     };
 }
 
-/// If `s` is exactly `${<json-param>.<path>}`, render the addressed JSON
-/// subtree as text (the union's branch array). Returns null when `s` is not
-/// that shape or names no JSON param (e.g. a loop-var placeholder rendered
-/// later by the for-each pass). An unbound param (offline check / no body)
-/// renders `[]` — zero branches.
+/// If `s` is exactly `${<json-param>.<path>}`, the addressed JSON subtree as text;
+/// null for any other shape. An unbound param renders `[]` (zero branches).
 fn renderDiscoverJson(cx: *Ctx, s: []const u8) Error!?[]const u8 {
     if (s.len < 4 or !std.mem.startsWith(u8, s, "${") or s[s.len - 1] != '}') return null;
     const body = s[2 .. s.len - 1];
@@ -260,9 +250,8 @@ fn mkNull(cx: *Ctx) Error!*ast.Expr {
     return mk(cx, .null_lit);
 }
 
-/// Navigate a JSON value along `path`, returning a literal of the leaf scalar. An
-/// unbound binding (offline `check`) yields `null`; a missing key or non-scalar
-/// leaf at run time is an error.
+/// A literal of the leaf scalar at `path`. An unbound binding (offline `check`)
+/// yields `null`; a missing key or non-scalar leaf at run time is an error.
 fn jsonPathLit(cx: *Ctx, maybe_val: ?std.json.Value, path: []const []const u8, safe: []const bool) Error!*ast.Expr {
     var cur = maybe_val orelse return mkNull(cx);
     for (path, 0..) |key, i| {
@@ -316,7 +305,6 @@ fn expandExpr(cx: *Ctx, e: *const ast.Expr, subst: ?*Subst, depth: usize) Error!
     switch (e.*) {
         .field => |q| {
             if (subst) |s| if (q.single()) |nm| if (s.get(nm)) |arg| return arg;
-            // `$job.a.b`; a bare `job.a` is a column of a table aliased `job`
             if (q.dollar and q.parts.len >= 1) if (cx.json.get(q.parts[0])) |maybe_val|
                 return jsonPathLit(cx, maybe_val, q.parts[1..], q.safe);
             return mk(cx, e.*);
@@ -328,12 +316,8 @@ fn expandExpr(cx: *Ctx, e: *const ast.Expr, subst: ?*Subst, depth: usize) Error!
     return ast.rebuildExpr(cx.arena, e, ExpandCtx{ .cx = cx, .subst = subst, .depth = depth }, expandRecur);
 }
 
-/// Inline `let name = value in body` by substituting the (expanded) value for
-/// `name` while expanding `body` — the binding disappears, like a single-use `fn`.
-/// `value` is expanded under the outer scope; `body` under the scope extended with
-/// `name`. The extension is done in place on the existing scope map (install →
-/// expand body → restore prior binding), so nested/chained lets don't pay the
-/// O(n²) cost of copying the whole map each time.
+/// Inline `let name = value in body` by substitution. The scope map is extended in
+/// place and restored after, so chained lets avoid an O(n²) copy of the map.
 fn expandLetIn(cx: *Ctx, l: ast.Expr.LetIn, subst: ?*Subst, depth: usize) Error!*ast.Expr {
     const val = try expandExpr(cx, l.value, subst, depth);
     if (subst) |s| {
@@ -372,10 +356,8 @@ fn expandCall(cx: *Ctx, c: ast.Expr.Call, subst: ?*Subst, depth: usize) Error!*a
     return mk(cx, .{ .call = .{ .name = c.name, .args = args, .distinct = c.distinct, .span = c.span } });
 }
 
-/// Pad a short argument list from the declaration's trailing `DEFAULT` expressions.
-/// A default is expanded scope-free (no caller substitutions in view), so it may
-/// only mention literals and other expression-form functions — never the caller's
-/// columns or the function's own parameters.
+/// Pad a short argument list from trailing `DEFAULT`s, expanded scope-free: a
+/// default may mention only literals and expression-form functions.
 fn fillDefaults(cx: *Ctx, fd: ast.FnDecl, args: []const *ast.Expr) Error![]const *ast.Expr {
     if (args.len == fd.params.len) return args;
     fill: {
@@ -397,10 +379,8 @@ fn fillDefaults(cx: *Ctx, fd: ast.FnDecl, args: []const *ast.Expr) Error![]const
     return error.ExpandFailed;
 }
 
-/// Check declared parameter types against the arguments. Expansion has expressions,
-/// not values, so only a literal argument is decidable — anything else (a column, a
-/// call, a param) passes through and is checked downstream by the type-checker,
-/// exactly as an untyped parameter always was.
+/// Only a literal argument is decidable at expansion; anything else passes through
+/// to the type-checker. Ints widen to float/decimal; strings coerce to temporals and bytes.
 fn checkArgTypes(cx: *Ctx, fd: ast.FnDecl, args: []const *ast.Expr) Error!void {
     for (fd.params, args, 1..) |p, a, n| {
         const want = (p.ty orelse continue).kind;
@@ -411,8 +391,8 @@ fn checkArgTypes(cx: *Ctx, fd: ast.FnDecl, args: []const *ast.Expr) Error!void {
     }
 }
 
-/// The type of an argument that is a literal, or null when it is anything else.
-/// `null` is a literal but assignable to every type, so it reports null too.
+/// The type of a literal argument, else null; a `null` literal reports null too,
+/// being assignable to every type.
 pub fn literalKind(e: *const ast.Expr) ?types.TypeKind {
     return switch (e.*) {
         .bool_lit => types.TypeKind.bool,
@@ -426,10 +406,7 @@ pub fn literalKind(e: *const ast.Expr) ?types.TypeKind {
 pub fn acceptsLiteral(want: types.TypeKind, got: types.TypeKind) bool {
     if (want == got) return true;
     return switch (want) {
-        // Implicit widening, as everywhere else in the type system.
         .float, .decimal => got == .int or got == .float,
-        // Temporals and bytes are written as string literals ('2026-01-01') and
-        // coerced downstream, so a string argument is not a mistake.
         .date, .time, .timestamp, .bytes => got == .string,
         else => false,
     };
@@ -508,8 +485,6 @@ test "expandProgram bounds total nodes, not just nesting depth" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    // Each level calls the one below it twice, so the body doubles per level and
-    // 30 levels is 2^30 nodes — well inside the depth cap of 64.
     var src = std.array_list.Managed(u8).init(a);
     try src.appendSlice("CREATE FUNCTION f0(x) AS x + 1;\n");
     for (1..31) |i| try src.writer().print("CREATE FUNCTION f{d}(x) AS f{d}(x) + f{d}(x);\n", .{ i, i - 1, i - 1 });
@@ -519,7 +494,6 @@ test "expandProgram bounds total nodes, not just nesting depth" {
     try std.testing.expect(std.mem.indexOf(u8, msg, "too many nodes") != null);
 }
 
-/// Parse + expand, returning the error message instead of the program.
 fn expandErr(a: std.mem.Allocator, src: []const u8) ![]const u8 {
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
     const prog = parser.parseSource(a, src, &diag) catch |e| {
@@ -555,8 +529,6 @@ test "expandProgram: a declared parameter type rejects a wrong-kind literal" {
         "SELECT margin('x', 1) AS m FROM 'd';");
     try std.testing.expectEqualStrings("`margin`: argument 1 (`rev`) expects FLOAT, got STRING", m);
 
-    // An int literal widens into a FLOAT parameter, and a non-literal argument is
-    // undecidable here — both pass through to the type-checker as before.
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
     const prog = try parser.parseSource(a, "CREATE FUNCTION margin(rev FLOAT, cost FLOAT) AS rev - cost;\n" ++
         "SELECT margin(7, amount) AS m FROM 'd';", &diag);
@@ -574,7 +546,6 @@ test "expandProgram: a table function is read with FROM, not called as a scalar 
     try std.testing.expectEqualStrings("`paid` is a table function — read it with FROM paid(...), not in an expression", m1);
     const m2 = try expandErr(a, decl ++ "CALL paid();\nSELECT 1 AS a;");
     try std.testing.expectEqualStrings("`paid` is a table function — read it with FROM paid(...), not CALL", m2);
-    // The declaration itself is gone once expanded; the call is an ordinary binding.
     var msg: []const u8 = "";
     var d: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const prog = try expandProgram(a, try parser.parseSource(a, decl ++ "SELECT * FROM paid();", &d), null, &msg);
@@ -610,8 +581,6 @@ test "expandProgram: statement functions survive, and the two forms don't cross 
     var msg: []const u8 = "";
     const out = try expandProgram(a, prog, null, &msg);
 
-    // The scalar declaration is dropped; the statement one is kept, with its body
-    // expanded (the nested `inc` call is already inlined).
     var fns: usize = 0;
     var calls: usize = 0;
     for (out.stmts) |s| switch (s) {
@@ -817,8 +786,6 @@ test "statement-level LET parses to a let_const stmt and its expression expands"
 
     var msg: []const u8 = "";
     const out = try expandProgram(a, prog, null, &msg);
-    // The `fn` declaration is dropped, so the LET lands right after the kind tag —
-    // with the user fn inlined into its body.
     try std.testing.expect(out.stmts[1] == .let_const);
     const e = out.stmts[1].let_const.expr.?;
     try std.testing.expect(e.* == .binary);

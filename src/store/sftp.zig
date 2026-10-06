@@ -5,19 +5,24 @@
 //! Parquet's footer-then-chunks reads and a zip's directory-then-member reads
 //! need, so an `.xlsx` or a `.parquet` on a server is read without fetching the
 //! rest of it. `Stream` reads front to back with requests kept in flight ahead
-//! of the reader, for CSV. And `Upload` writes to `name.part`, renamed over
-//! `name` when complete, so a reader polling the folder never sees half a file.
+//! of the reader, for CSV; a `window` stream borrows its file, an opened one owns
+//! it. And `Upload` writes to `name.part`, renamed over `name` by `finish` and
+//! removed by `abort` or any failure, so a reader polling the folder never sees
+//! half a file.
 //!
 //! Each request costs a round trip, so reads and writes are pipelined: up to
 //! `inflight` requests out at once, matched to their replies by id. A server
 //! may answer a read short of what was asked before the end of the file; the
-//! rest is asked for again.
+//! rest is asked for again, and on failure what is still in flight is drained.
 //!
 //! Logging in is the expensive part — a key exchange and an authentication —
 //! and an Excel workbook alone opens its file seven times, a parallel Parquet
 //! read once per lane. Sessions are pooled per server and user for the life of
 //! the process, each opened file its own handle on a session the opener has to
-//! itself until it closes the file.
+//! itself until it closes the file. `CREATE CONNECTION … TYPE sftp` registers a
+//! `Conn` so a path's host part can name it. `last_error_buf` (thread-local) keeps
+//! why the last attempt to reach a server failed, in the session's own words (an
+//! unknown host key's fingerprint) when it got that far.
 
 const std = @import("std");
 const ssh = @import("../net/ssh.zig");
@@ -68,15 +73,12 @@ const status = struct {
     const op_unsupported = 8;
 };
 
-/// Requests kept in flight on a read or write.
 const inflight = 32;
 
 pub fn isUrl(path: []const u8) bool {
     return std.mem.startsWith(u8, path, "sftp://");
 }
 
-/// What a `CREATE CONNECTION … TYPE sftp` resolved to, registered by the runtime
-/// so a path's host part can name it.
 pub const Conn = struct {
     host: []const u8,
     port: u16 = 22,
@@ -91,9 +93,8 @@ pub const Conn = struct {
 var registry_mtx: std.Thread.Mutex = .{};
 var registry: std.StringHashMapUnmanaged(Conn) = .empty;
 
-/// Make `sftp://name/…` reach the server `c` describes. Process-wide, as the
-/// pool is; a later registration of a name replaces the earlier one. Strings
-/// are copied.
+/// Make `sftp://name/…` reach the server `c` describes. Process-wide, as the pool
+/// is; a later registration of a name replaces the earlier one. Strings are copied.
 pub fn register(name: []const u8, c: Conn) !void {
     const gpa = std.heap.page_allocator;
     registry_mtx.lock();
@@ -109,16 +110,14 @@ pub fn register(name: []const u8, c: Conn) !void {
     try registry.put(gpa, key, owned);
 }
 
-/// A parsed `sftp://` path: the session it needs and the file on it.
 pub const Target = struct {
     cfg: ssh.Config,
     path: []const u8,
 };
 
-/// `sftp://[user@]host[:port]/path`. The host may name a registered connection;
-/// otherwise the user is the URL's or `$USER`, the password `SFTP_PASSWORD`, the
-/// key `~/.ssh/id_ed25519` when there is one. `/~/x` is `x` under the login's
-/// home directory, as curl reads it; any other path is absolute.
+/// The host may name a registered connection; otherwise the user is the URL's or
+/// `$USER`, the password `SFTP_PASSWORD`, the key `~/.ssh/id_ed25519` if present.
+/// `/~/x` is `x` under the login's home, as curl reads it; other paths are absolute.
 pub fn resolve(arena: std.mem.Allocator, url: []const u8) !Target {
     if (!isUrl(url)) return error.NotSftpUrl;
     const rest = url["sftp://".len..];
@@ -167,23 +166,18 @@ pub fn resolve(arena: std.mem.Allocator, url: []const u8) !Target {
     } };
 }
 
-// --- the protocol client ----------------------------------------------------
-
 pub const Client = struct {
     gpa: std.mem.Allocator,
     ssh: *ssh.Session,
     key: []const u8,
-    /// When it last went back to the pool, in ms.
     idle_since: i64 = 0,
     next_id: u32 = 1,
     inbuf: std.array_list.Managed(u8),
-    /// Bytes of `inbuf` already handed out by `reply`.
     consumed: usize = 0,
     out: ssh.Buf,
     max_read: u32 = 32 * 1024,
     max_write: u32 = 32 * 1024,
     posix_rename: bool = false,
-    /// Server-side reason for the last failed status.
     why: std.array_list.Managed(u8),
 
     fn open(gpa: std.mem.Allocator, cfg: ssh.Config, key: []const u8) !*Client {
@@ -259,13 +253,9 @@ pub const Client = struct {
         try self.ssh.send(b);
     }
 
-    /// The next whole SFTP packet (type byte first), reassembled across channel
-    /// data; valid until the next call.
-    ///
-    /// `consumed` marks where unread bytes start. They are moved to the front only
-    /// once the read part outweighs them: moving whatever was pending on every
-    /// reply copied megabytes per reply with reads pipelined, and a Parquet read
-    /// over SFTP ran at a seventh of what the link carries.
+    /// The next whole SFTP packet (type byte first), valid until the next call. Unread
+    /// bytes move to the front only once the read part outweighs them: moving them on
+    /// every reply copied megabytes per reply and ran Parquet reads at a seventh of the link.
     fn reply(self: *Client) ![]const u8 {
         const pending = self.inbuf.items.len - self.consumed;
         if (self.consumed > 0 and self.consumed >= pending) {
@@ -288,7 +278,6 @@ pub const Client = struct {
         return r;
     }
 
-    /// A STATUS reply as an error (OK is no error).
     fn statusOf(self: *Client, r: []const u8) !void {
         if (r[0] != fxp.status) return error.SftpProtocol;
         var c = ssh.Cursor{ .s = r[5..] };
@@ -310,7 +299,7 @@ pub const Client = struct {
         const id = try self.begin(fxp.open);
         try self.out.str(path);
         try self.out.u32be(pflags);
-        try self.out.u32be(0); // no attributes
+        try self.out.u32be(0);
         try self.finish();
         const r = try self.replyFor(id);
         if (r[0] == fxp.handle) {
@@ -328,7 +317,6 @@ pub const Client = struct {
         try self.statusOf(try self.replyFor(id));
     }
 
-    /// The size of an open file, or of a path.
     fn sizeOf(self: *Client, handle: ?[]const u8, path: []const u8) !u64 {
         const id = try self.begin(if (handle != null) fxp.fstat else fxp.stat);
         try self.out.str(handle orelse path);
@@ -343,8 +331,6 @@ pub const Client = struct {
         return a.size orelse error.SftpUnsupported;
     }
 
-    /// `len` bytes at `off` into `out`, requests pipelined; short at the end of
-    /// the file.
     fn readRange(self: *Client, handle: []const u8, off: u64, out: []u8) !usize {
         const Req = struct { id: u32, at: u64, len: u32 };
         var reqs: [inflight]Req = undefined;
@@ -382,7 +368,6 @@ pub const Client = struct {
                 const dst: usize = @intCast(q.at - off);
                 @memcpy(out[dst..][0..d.len], d);
                 got += d.len;
-                // a short answer before the end: ask for the rest of it again
                 if (d.len < q.len and d.len > 0) {
                     const id2 = try self.begin(fxp.read);
                     try self.out.str(handle);
@@ -399,14 +384,12 @@ pub const Client = struct {
                         continue;
                     },
                     else => {
-                        // drain what is still in flight before failing
                         while (n_out > 0) : (n_out -= 1) _ = self.reply() catch break;
                         return e;
                     },
                 };
             }
         }
-        // got bytes are contiguous from `off` unless the file ended mid-range
         return @min(got, out.len);
     }
 
@@ -441,6 +424,8 @@ pub const Client = struct {
         }
     }
 
+    /// Uses posix-rename@openssh.com when offered; plain RENAME refuses an existing
+    /// target, so that is removed first.
     fn rename(self: *Client, from: []const u8, to: []const u8) !void {
         if (self.posix_rename) {
             const id = try self.begin(fxp.extended);
@@ -450,7 +435,6 @@ pub const Client = struct {
             try self.finish();
             return self.statusOf(try self.replyFor(id));
         }
-        // plain RENAME refuses an existing target: remove it first
         self.remove(to) catch {};
         const id = try self.begin(fxp.rename);
         try self.out.str(from);
@@ -468,7 +452,6 @@ pub const Client = struct {
 
     pub const Entry = struct { name: []const u8, size: u64, regular: bool, dir: bool = false };
 
-    /// The entries of a directory, names copied into `arena`.
     fn listDir(self: *Client, arena: std.mem.Allocator, path: []const u8) ![]Entry {
         const id = try self.begin(fxp.opendir);
         try self.out.str(path);
@@ -497,7 +480,7 @@ pub const Client = struct {
             const count = try c.u32be();
             for (0..count) |_| {
                 const name = try c.str();
-                _ = try c.str(); // longname
+                _ = try c.str();
                 const a = try readAttrs(&c);
                 if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
                 try out.append(.{
@@ -538,14 +521,11 @@ fn readAttrs(c: *ssh.Cursor) !Attrs {
     return a;
 }
 
-// --- the pool -----------------------------------------------------------------
-
 var pool_mtx: std.Thread.Mutex = .{};
 var pool: std.ArrayListUnmanaged(*Client) = .empty;
 
-/// A session is reused only for the same login and the same trust: a second
-/// connection to the server with another key or pin must not inherit a session
-/// the first one's checks let through.
+/// A session is reused only for the same login and the same trust: a connection
+/// with another key or pin must not inherit a session the first one's checks let through.
 fn poolKey(buf: []u8, cfg: ssh.Config) []const u8 {
     var h = std.hash.Wyhash.init(0);
     inline for (.{ "password", "key_file", "key_passphrase", "known_hosts", "host_key" }) |f| {
@@ -557,7 +537,6 @@ fn poolKey(buf: []u8, cfg: ssh.Config) []const u8 {
     return std.fmt.bufPrint(buf, "{s}@{s}:{d}#{x}", .{ cfg.user, cfg.host, cfg.port, h.final() }) catch cfg.host;
 }
 
-/// A session to the server `cfg` names, the caller's alone until `checkin`.
 pub fn checkout(cfg: ssh.Config) !*Client {
     ssh.clearFailure();
     last_error_len = 0;
@@ -581,8 +560,8 @@ fn takePooled(key: []const u8) ?*Client {
     return null;
 }
 
-/// A session idle for a while may have been dropped by the server or a NAT on
-/// the way; one stat of the home directory tells before a load trips on it.
+/// A session idle for a while may have been dropped by the server or a NAT; one
+/// stat of the home directory tells before a load trips on it.
 fn alive(c: *Client) bool {
     if (std.time.milliTimestamp() - c.idle_since < 15_000) return true;
     const id = c.begin(fxp.stat) catch return false;
@@ -605,8 +584,6 @@ pub fn checkin(c: *Client, healthy: bool) void {
     pool.append(std.heap.page_allocator, c) catch c.destroy();
 }
 
-/// Why the last attempt to reach `cfg` failed, for an error message — the
-/// session's own words (an unknown host key's fingerprint) when it got that far.
 pub threadlocal var last_error_buf: [512]u8 = undefined;
 pub threadlocal var last_error_len: usize = 0;
 
@@ -620,9 +597,6 @@ pub fn lastError() []const u8 {
     return last_error_buf[0..last_error_len];
 }
 
-// --- files --------------------------------------------------------------------
-
-/// An open remote file, its session checked out for as long as it is open.
 pub const File = struct {
     client: *Client,
     handle: []const u8,
@@ -652,7 +626,6 @@ pub const File = struct {
         return self;
     }
 
-    /// `len` bytes at `off`, owned by `arena`.
     pub fn read(self: *File, arena: std.mem.Allocator, off: u64, len: usize) ![]const u8 {
         const buf = try arena.alloc(u8, len);
         const n = self.client.readRange(self.handle, off, buf) catch |e| {
@@ -672,16 +645,11 @@ pub const File = struct {
     }
 };
 
-/// A file read front to back as a `std.Io.Reader`, the next chunks requested
-/// while the current one is consumed.
 pub const Stream = struct {
     file: *File,
     at: u64 = 0,
-    /// Where the stream stops: the file's end, or a window's.
     end: u64,
-    /// Opened by `open`, closed with the stream; a window borrows its file.
     owns_file: bool,
-    /// Fetched ahead, `chunk[pos..len]` not yet handed out.
     chunk: []u8,
     pos: usize = 0,
     len: usize = 0,
@@ -695,8 +663,7 @@ pub const Stream = struct {
         return make(arena, f, 0, f.size, true);
     }
 
-    /// `len` bytes of an open file from `off` — a zip member inside a remote
-    /// archive.
+    /// `len` bytes of an open file from `off`: a zip member inside a remote archive.
     pub fn window(arena: std.mem.Allocator, f: *File, off: u64, len: u64) !*Stream {
         return make(arena, f, off, off + len, false);
     }
@@ -723,10 +690,9 @@ pub const Stream = struct {
         if (self.owns_file) self.file.close();
     }
 
-    /// The file is fetched a whole chunk at a time — 32 reads in flight — and
-    /// handed out in the sizes asked for. Fetching only what each call asked,
-    /// the reader's 64 KiB, kept two reads in flight and waited a round trip
-    /// per refill: a CSV streamed at a quarter of what a Parquet read got.
+    /// Fetches a whole chunk at a time (32 reads in flight) and hands it out in the
+    /// sizes asked: fetching only the reader's 64 KiB kept two reads in flight and
+    /// streamed CSV at a quarter of a Parquet read's speed.
     fn streamFn(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const self: *Stream = @fieldParentPtr("interface", r);
         if (self.pos == self.len) {
@@ -748,8 +714,6 @@ pub const Stream = struct {
     }
 };
 
-/// A file written front to back to `path.part`, renamed over `path` by `finish`
-/// and removed by `abort`.
 pub const Upload = struct {
     client: *Client,
     handle: []const u8,
@@ -807,8 +771,6 @@ pub const Upload = struct {
         return w.consume(total);
     }
 
-    /// Write what is buffered, close, and rename `path.part` to `path`. On any
-    /// failure the `.part` is removed, as by `abort`.
     pub fn finish(self: *Upload) !void {
         if (self.done) return;
         self.commit() catch |e| {
@@ -839,7 +801,6 @@ pub const Upload = struct {
         self.last_error = self.err_buf[0..n];
     }
 
-    /// Drop the upload: the `.part` is removed, `path` untouched.
     pub fn abort(self: *Upload) void {
         if (self.done) return;
         if (!self.closed) self.client.closeHandle(self.handle) catch {};
@@ -854,9 +815,8 @@ pub const Upload = struct {
     }
 };
 
-/// The regular files under `url` (ending in `/`), subfolders included but not
-/// those starting `_` or `.`, as `sftp://` URLs sorted by name — a server lists
-/// in whatever order it keeps.
+/// The regular files under `url` (ending in `/`), subfolders included but not those
+/// starting `_` or `.`, sorted by name since a server lists in whatever order it keeps.
 pub fn listPrefix(arena: std.mem.Allocator, url: []const u8) ![]const []const u8 {
     const t = try resolve(arena, url);
     const c = checkout(t.cfg) catch |e| {
@@ -867,7 +827,6 @@ pub fn listPrefix(arena: std.mem.Allocator, url: []const u8) ![]const []const u8
     defer checkin(c, healthy);
     const top = if (t.path.len > 1 and t.path[t.path.len - 1] == '/') t.path[0 .. t.path.len - 1] else t.path;
     var names = std.array_list.Managed([]const u8).init(arena);
-    // relative folders still to list, "" the top one
     var todo = std.array_list.Managed([]const u8).init(arena);
     try todo.append("");
     while (todo.pop()) |rel| {
@@ -896,8 +855,7 @@ pub fn listPrefix(arena: std.mem.Allocator, url: []const u8) ![]const []const u8
     return out;
 }
 
-/// A file or directory error keeps the session usable; a transport error
-/// does not.
+/// A file or directory error keeps the session usable; a transport error does not.
 fn isProtocolOk(e: anyerror) bool {
     return switch (e) {
         error.SftpNoSuchFile, error.SftpPermissionDenied, error.SftpFailure, error.SftpUnsupported, error.EndOfStream => true,
@@ -907,8 +865,8 @@ fn isProtocolOk(e: anyerror) bool {
 
 threadlocal var why_buf: [600]u8 = undefined;
 
-/// An SSH failure in words. A failed connect leaves no session to ask, so the
-/// session's reason is unavailable; the error and the server name it.
+/// An SSH failure in words. A failed connect leaves no session to ask, so the error
+/// and the server name it.
 fn sshWhy(e: anyerror, cfg: ssh.Config) []const u8 {
     const said = ssh.lastFailure();
     if (said.len > 0) return said;
@@ -946,7 +904,6 @@ test "live: upload, list, read back whole, by range and streaming; an aborted up
         .password = "pw",
         .known_hosts = try std.fmt.allocPrint(a, "{s}/known_hosts", .{dir}),
     });
-    // 3 MB: past the read and write chunk sizes, and the stream's chunk
     const body = try a.alloc(u8, 3 * 1024 * 1024 + 123);
     for (body, 0..) |*b, i| b.* = @truncate(i *% 31 +% (i >> 9));
 

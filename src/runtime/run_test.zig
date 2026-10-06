@@ -1,5 +1,11 @@
 //! End-to-end runtime tests: fixtures in a tmp dir, a script through `run`,
 //! assertions on the written output.
+//!
+//! Helpers substitute paths into the script: `$IN` is the input CSV (or parquet
+//! fixture), `$LOOKUP` a join's build side, and `$B` the tmp dir in `checkAndRun`,
+//! which also asserts that `check` accepts what `run` executes. The default harness
+//! runs with `threads = 1`; the `*Threaded` helpers pick a thread count to reach
+//! the parallel paths, and compare sorted lines where lanes interleave output.
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
@@ -38,8 +44,6 @@ const printText = @import("script.zig").printText;
 const run = @import("run.zig").run;
 const describeRows = @import("run.zig").describeRows;
 
-/// Run `LOAD INTO out.csv AS <query>` over `input`. `$IN` in the query is
-/// replaced with the input CSV's path.
 fn runToString(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []const u8, query: []const u8) ![]u8 {
     return runToStringP(alloc, tmp, input, query, &[_]ParamArg{});
 }
@@ -86,8 +90,6 @@ test "EXPLAIN mid-script explains that query without running it" {
     const never_path = try std.fs.path.join(alloc, &.{ base, "never.csv" });
     defer alloc.free(never_path);
 
-    // The EXPLAIN is not the first statement — the whole point — and its query is
-    // built on a CTE, so it only plans if the binding above it is in scope.
     const script = try std.fmt.allocPrint(alloc,
         \\LOAD INTO '{s}' AS SELECT id FROM '{s}';
         \\EXPLAIN LOAD INTO '{s}' AS
@@ -108,9 +110,6 @@ test "EXPLAIN mid-script explains that query without running it" {
         return e;
     };
 
-    // The plan itself goes to stdout (analyze.render), which a test cannot capture;
-    // what is checkable is the half that matters — the statement before it ran, and
-    // the explained load wrote nothing.
     const ran = try tmp.dir.readFileAlloc(alloc, "ran.csv", 1 << 20);
     defer alloc.free(ran);
     try std.testing.expectEqualStrings("id\n1\n2\n", ran);
@@ -132,10 +131,6 @@ test "union all by name: a branch may be any query, not just a table" {
     const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
     defer alloc.free(out_path);
 
-    // A branch used to have to be `SELECT ['tag' AS c,] t.* FROM <conn>.<table>` — the
-    // reconciliation case the feature was built for. A file, a filter or an aggregate
-    // in a branch was refused, which is most of what a UNION is actually written for.
-    // Reconciliation still applies: `extra` is dropped against the first branch's canon.
     const script = try std.fmt.allocPrint(
         alloc,
         "LOAD INTO '{s}' AS SELECT k, v FROM '{s}' WHERE v = 1" ++
@@ -157,9 +152,6 @@ test "derived tables: an alias names its table only inside its own query" {
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
 
-    // A derived table was bound under its alias, in one namespace for the whole
-    // script: the last `r` replaced every other, so `a` read t2's rows with no
-    // warning, and `(… (…) r) r` read itself until the stack gave out.
     const cases = [_]struct { q: []const u8, want: []const u8 }{
         .{
             .q = "WITH a AS (SELECT k FROM (SELECT k FROM '$B/t1.csv' WHERE k = 1) r)," ++
@@ -172,7 +164,6 @@ test "derived tables: an alias names its table only inside its own query" {
             .want = "n\n3\n",
         },
         .{
-            // An alias equal to a CTE's name does not shadow the CTE.
             .q = "WITH b AS (SELECT k AS k2 FROM '$B/t2.csv')," ++
                 " a AS (SELECT k1 FROM (SELECT k AS k1 FROM '$B/t1.csv') b)" ++
                 " SELECT COUNT(*) AS n FROM a JOIN b ON a.k1 = b.k2",
@@ -199,14 +190,10 @@ test "union: plain UNION [ALL] lines branches up by position" {
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
 
-    // Written as BY NAME, differently named columns do not line up: `b` was
-    // dropped and its rows came back as NULLs under `a`.
     const cases = [_]struct { q: []const u8, want: []const u8 }{
         .{ .q = "SELECT k AS a FROM '$B/t1.csv' UNION ALL SELECT k AS b FROM '$B/t2.csv'", .want = "a\n1\n2\n3\n2\n3\n4\n" },
         .{ .q = "SELECT k FROM '$B/t1.csv' UNION SELECT k FROM '$B/t2.csv' ORDER BY k", .want = "k\n1\n2\n3\n4\n" },
-        // Widened like BY NAME: an int column meeting a float one becomes float.
         .{ .q = "SELECT k FROM '$B/t1.csv' WHERE k = 1 UNION ALL SELECT 2.5 AS x FROM '$B/t2.csv' WHERE k = 2", .want = "k\n1\n2.5\n" },
-        // Deduplication covers everything to the left of the last plain UNION only.
         .{
             .q = "SELECT k FROM '$B/t1.csv' UNION SELECT k FROM '$B/t2.csv' UNION ALL SELECT k FROM '$B/t1.csv' WHERE k = 1 ORDER BY k",
             .want = "k\n1\n1\n2\n3\n4\n",
@@ -222,7 +209,6 @@ test "union: plain UNION [ALL] lines branches up by position" {
         try std.testing.expectEqualStrings(c.want, out);
     }
 
-    // A branch with another column count is refused, not padded.
     const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT k FROM '{s}/t1.csv' UNION ALL SELECT k, v FROM '{s}/t2.csv';", .{ base, base, base });
     defer alloc.free(script);
     var parena = std.heap.ArenaAllocator.init(alloc);
@@ -238,14 +224,11 @@ test "NOT IN (SELECT ...): a NULL in the subquery keeps no row, a NULL probe sur
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // Two columns, so an empty `k` is a NULL rather than a skipped blank line.
     try tmp.dir.writeFile(.{ .sub_path = "l.csv", .data = "k,v\n1,a\n,b\n2,c\n" });
     try tmp.dir.writeFile(.{ .sub_path = "r.csv", .data = "k,v\n2,x\n,y\n3,z\n" });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
 
-    // Lowered to a plain anti join, this returned `1` and the NULL row: `NOT IN`
-    // against a set holding a NULL is never true. Verified against DuckDB.
     const cases = [_]struct { q: []const u8, want: []const u8 }{
         .{ .q = "SELECT k FROM '$B/l.csv' WHERE k NOT IN (SELECT k FROM '$B/r.csv')", .want = "k\n" },
         .{ .q = "SELECT k FROM '$B/l.csv' WHERE k NOT IN (SELECT k FROM '$B/r.csv' WHERE k IS NOT NULL)", .want = "k\n1\n" },
@@ -273,9 +256,6 @@ test "INTERSECT / EXCEPT: NULLs compare equal, results are deduplicated, INTERSE
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
 
-    // A semi/anti join on every column would get these wrong: join keys never match
-    // a NULL, set operations treat two NULLs as the same value. Verified against
-    // DuckDB; ORDER BY only makes the comparison stable.
     const cases = [_]struct { q: []const u8, want: []const u8 }{
         .{ .q = "SELECT k, v FROM '$B/s1.csv' INTERSECT SELECT k, v FROM '$B/s2.csv' ORDER BY k", .want = "k,v\n2,\n,b\n" },
         .{ .q = "SELECT k, v FROM '$B/s1.csv' EXCEPT SELECT k, v FROM '$B/s2.csv' ORDER BY k", .want = "k,v\n1,a\n4,d\n" },
@@ -309,16 +289,11 @@ test "SUM/AVG over an outer join's null fill, and integer sums that leave i64" {
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
 
-    // The unmatched rows' `n` is null by validity, but the fill gathers a
-    // placeholder row, so its slot held 100: an ungrouped SUM added every slot
-    // and answered 307 / 153.5. Verified against DuckDB.
     const cases = [_]struct { q: []const u8, want: []const u8 }{
         .{
             .q = "SELECT SUM(r.n) AS s, AVG(r.n) AS a FROM '$B/l.csv' l LEFT JOIN (SELECT * FROM '$B/r.csv') r ON l.k = r.k",
             .want = "s,a\n107,53.5\n",
         },
-        // The running total leaves i64 on the way to 5; the answer must not depend
-        // on where batches or lanes split the rows.
         .{ .q = "SELECT SUM(x) AS s FROM '$B/big.csv'", .want = "s\n5\n" },
     };
     for (cases) |c| {
@@ -331,7 +306,6 @@ test "SUM/AVG over an outer join's null fill, and integer sums that leave i64" {
         try std.testing.expectEqualStrings(c.want, out);
     }
 
-    // A window SUM whose running value leaves i64 wrapped to a plausible 2.
     const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT g, x, SUM(x) OVER (ORDER BY g, x) AS s FROM '{s}/big.csv';", .{ base, base });
     defer alloc.free(script);
     var parena = std.heap.ArenaAllocator.init(alloc);
@@ -350,8 +324,6 @@ test "CASE / COALESCE / greatest mixing int and float are float on every row, no
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
 
-    // Row 0 took the int arm, so the column was built as int and 2.5 truncated to
-    // 2 — in the output, in a WHERE, and in a SUM, which then disagreed with -j 8.
     const cases = [_]struct { q: []const u8, want: []const u8 }{
         .{ .q = "SELECT id, CASE WHEN id < 3 THEN 1 ELSE 2.5 END AS c FROM '$B/m.csv'", .want = "id,c\n1,1\n2,1\n3,2.5\n4,2.5\n" },
         .{ .q = "SELECT id FROM '$B/m.csv' WHERE CASE WHEN id < 3 THEN 1 ELSE 2.5 END > 2.2", .want = "id\n3\n4\n" },
@@ -376,8 +348,6 @@ test "DISTINCT ON with ORDER BY keeps the first row per key in ORDER BY order" {
     try tmp.dir.writeFile(.{ .sub_path = "d.csv", .data = "k,v,t\n1,10,3\n1,20,1\n1,30,2\n2,5,9\n2,6,8\n" });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
-    // Sorted after the distinct, the first row in INPUT order was kept: the
-    // "latest row per key" idiom returned the wrong rows. Verified against DuckDB.
     const cases = [_]struct { q: []const u8, want: []const u8 }{
         .{ .q = "SELECT DISTINCT ON (k) k, v, t FROM '$B/d.csv' ORDER BY k, t", .want = "k,v,t\n1,20,1\n2,6,8\n" },
         .{ .q = "SELECT DISTINCT ON (k) k, v FROM '$B/d.csv' ORDER BY k, t DESC", .want = "k,v\n1,10\n2,5\n" },
@@ -403,9 +373,6 @@ test "several IN (SELECT ...) conditions, each subquery with its own WHERE" {
     try tmp.dir.writeFile(.{ .sub_path = "pb.csv", .data = "p,q\n2,0\n3,0\n4,0\n" });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
-    // The subquery's WHERE ended the "inside a WHERE" state for the outer one,
-    // and lifted every pending IN — the outer `k IN` became a join inside the
-    // subquery, where `k` does not exist. Verified against DuckDB.
     const cases = [_]struct { q: []const u8, want: []const u8 }{
         .{ .q = "SELECT k FROM '$B/m.csv' WHERE k IN (SELECT p FROM '$B/pa.csv' WHERE q > 0) AND k IN (SELECT p FROM '$B/pb.csv') ORDER BY k", .want = "k\n2\n3\n" },
         .{ .q = "SELECT k FROM '$B/m.csv' WHERE k IN (SELECT p FROM '$B/pa.csv') AND k IN (SELECT p FROM '$B/pb.csv' WHERE q = 0) ORDER BY k", .want = "k\n2\n3\n" },
@@ -430,9 +397,6 @@ test "windows: each function keeps its own frame; DISTINCT and * see the window'
     try tmp.dir.writeFile(.{ .sub_path = "m.csv", .data = "k,v\na,1\na,2\nb,3\n,4\n" });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
-    // Verified against DuckDB. The frame was taken from the first function only,
-    // DISTINCT ran before the window filled its column, and `*` re-listed the
-    // window's outputs after itself.
     const cases = [_]struct { q: []const u8, want: []const u8 }{
         .{
             .q = "SELECT id, SUM(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s, SUM(v) OVER (ORDER BY id) AS r FROM '$B/f.csv' ORDER BY id",
@@ -463,10 +427,6 @@ test "aggregate: two aggregates over different expressions stay separate" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // `exprKey` rendered every expression kind it did not handle as a single `?`, so
-    // `SUM(v*2)` and `SUM(v+100)` both keyed as `sum(?)` and the second bound to the
-    // first's accumulator: the answer came back as 2 * SUM(v*2), silently. Reported
-    // against 0.6.1. Verified against DuckDB: 120 + 360 = 480.
     const out = try runToString(
         alloc,
         &tmp,
@@ -481,8 +441,6 @@ test "aggregate: the same expression twice still shares one accumulator" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // The dedup is the point of the key, so an identical argument must still collapse to
-    // one accumulator rather than being computed twice.
     const out = try runToString(
         alloc,
         &tmp,
@@ -497,11 +455,6 @@ test "window: a column only named inside OVER survives the projection" {
     const alloc = std.testing.allocator;
     var t1 = std.testing.tmpDir(.{});
     defer t1.cleanup();
-    // Reported against 0.6.2. The projection was built from the ordinary SELECT items,
-    // so `categoria`, `id` and `valor` were pruned before the window operator ran and
-    // resolution failed — the error even migrated as you projected them by hand. They
-    // are now carried through hidden and dropped afterwards, the way an outer ORDER BY
-    // already treats its own keys. Output is `ant` alone.
     const out = try runToString(
         alloc,
         &t1,
@@ -513,8 +466,6 @@ test "window: a column only named inside OVER survives the projection" {
 
     var t2 = std.testing.tmpDir(.{});
     defer t2.cleanup();
-    // The shape the reporter's checksums use: the outer query names none of the inner
-    // columns at all.
     const sub = try runToString(
         alloc,
         &t2,
@@ -543,9 +494,6 @@ test "window: a tie holds rank and skips, dense_rank leaves no gap" {
     const alloc = std.testing.allocator;
     var t1 = std.testing.tmpDir(.{});
     defer t1.cleanup();
-    // The case that separates the two: RANK is 1 + the rows strictly before, so after a
-    // two-row tie at 20 the next value jumps to 4 and the last to 6. DENSE_RANK counts
-    // distinct values instead: 1,2,2,3,3,4. Both verified against DuckDB.
     const rk = try runToString(
         alloc,
         &t1,
@@ -571,9 +519,6 @@ test "window: lag and lead stop at the partition edge" {
     const alloc = std.testing.allocator;
     var t1 = std.testing.tmpDir(.{});
     defer t1.cleanup();
-    // The first row of a partition has nothing behind it and the last nothing ahead, so
-    // both yield null rather than reaching into the neighbouring partition. Verified
-    // against DuckDB.
     const lag = try runToString(
         alloc,
         &t1,
@@ -613,8 +558,6 @@ test "window: a lag result feeds an expression through a derived table" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // A window function cannot sit inside an expression, so change detection composes
-    // by wrapping it — which is what derived tables are for.
     const out = try runToString(
         alloc,
         &tmp,
@@ -629,8 +572,6 @@ test "window: an aggregate frame is the partition, or the peers so far" {
     const alloc = std.testing.allocator;
     var t1 = std.testing.tmpDir(.{});
     defer t1.cleanup();
-    // No ORDER BY: every row of the partition is a peer, so the frame is the whole
-    // partition — share-of-total.
     const tot = try runToString(
         alloc,
         &t1,
@@ -642,9 +583,6 @@ test "window: an aggregate frame is the partition, or the peers so far" {
 
     var t2 = std.testing.tmpDir(.{});
     defer t2.cleanup();
-    // With ORDER BY it accumulates peer group by peer group, so the two tied 20s BOTH
-    // read 50 rather than 30 and 50. That is standard RANGE framing, and it matches
-    // DuckDB — getting it row-by-row instead would be a subtle wrong answer.
     const running = try runToString(
         alloc,
         &t2,
@@ -670,8 +608,6 @@ test "window: COUNT(*) over a partition, and a plain SUM still aggregates" {
 
     var t2 = std.testing.tmpDir(.{});
     defer t2.cleanup();
-    // Without OVER, `SUM` is the ordinary aggregate: the item parser rewinds unless it
-    // sees the whole `name ( .. ) OVER` prefix, so these names stay unreserved.
     const agg = try runToString(
         alloc,
         &t2,
@@ -686,10 +622,6 @@ test "window: min, max and avg share one window in a single SELECT" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // `MIN(v) OVER (w), MAX(v) OVER (w)` is the natural pairing, so an identical OVER
-    // clause has to be accepted — the first attempt rejected any repeat of the clause.
-    // MIN/MAX use the same `lessV` ordering the grouped aggregate does, so a window
-    // extreme and a grouped one cannot disagree.
     const out = try runToString(
         alloc,
         &tmp,
@@ -697,8 +629,6 @@ test "window: min, max and avg share one window in a single SELECT" {
         "SELECT k, v, MIN(v) OVER (PARTITION BY k) AS lo, MAX(v) OVER (PARTITION BY k) AS hi, AVG(v) OVER (PARTITION BY k) AS mean FROM '$IN'",
     );
     defer alloc.free(out);
-    // `v` has to be projected: the window reads it, and the stage appends to the
-    // projection rather than reaching behind it.
     try std.testing.expectEqualStrings("k,v,lo,hi,mean\na,10,10,20,15\na,20,10,20,15\nb,5,5,5,5\n", out);
 }
 
@@ -713,8 +643,6 @@ test "window: two different windows in one SELECT are refused" {
     defer alloc.free(in_path);
     const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
     defer alloc.free(out_path);
-    // Each distinct window would need its own stage; say so instead of silently using
-    // one of them for both.
     const script = try std.fmt.allocPrint(
         alloc,
         "LOAD INTO '{s}' AS SELECT k, MIN(v) OVER (PARTITION BY k) AS lo, MAX(v) OVER (ORDER BY v) AS hi FROM '{s}';",
@@ -731,9 +659,6 @@ test "window: a ROWS frame counts rows where the default counts peers" {
     const alloc = std.testing.allocator;
     var t1 = std.testing.tmpDir(.{});
     defer t1.cleanup();
-    // The whole reason ROWS exists. Same query but for the frame: under ROWS the two
-    // tied 20s read 30 and 50, under the RANGE default they both read 50. Both match
-    // DuckDB; picking one behaviour for both spellings would be a silent wrong answer.
     const rows = try runToString(
         alloc,
         &t1,
@@ -759,7 +684,6 @@ test "window: a bounded ROWS frame is a moving window" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // A moving average over two rows, clipped at the partition's first row.
     const out = try runToString(
         alloc,
         &tmp,
@@ -774,8 +698,6 @@ test "window: a column named `rank` is still a column" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // The item parser only commits once it has seen `name ( ) OVER`, and rewinds
-    // otherwise — so the function names are not reserved words.
     const out = try runToString(
         alloc,
         &tmp,
@@ -790,9 +712,6 @@ test "derived table: a subquery in FROM is an anonymous CTE" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // `FROM (SELECT ...) x` lowers to the binding `WITH x AS (...)` would produce, so
-    // it needs no execution machinery — only a name. Every TPC-DS query that reads a
-    // derived table needed hand-rewriting into a CTE before this.
     const out = try runToString(
         alloc,
         &tmp,
@@ -807,9 +726,6 @@ test "derived table: nested, and beside a WITH binding" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // The inner query's own bindings used to be drained into the very list the outer
-    // parse was collecting into, which cleared it: this failed with "unknown binding
-    // `a`". A `WITH` inside a derived table hits the same path.
     const out = try runToString(
         alloc,
         &tmp,
@@ -824,9 +740,6 @@ test "derived table: a join right side may be a subquery" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // A join's right side is named by binding anyway, so an inline subquery there is
-    // the same lowering. Both positions in one query, to prove they do not clobber
-    // each other's bindings.
     const out = try runToString(
         alloc,
         &tmp,
@@ -870,10 +783,6 @@ test "aggregate: an interleaved SELECT list keeps its column order" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // The aggregate stage emits grouping keys first and aggregates after, so this
-    // used to come out `status,region,n` — the values right, the columns moved.
-    // TPC-H Q3 has exactly this shape, and a positional CSV consumer downstream
-    // would have loaded the wrong columns without a word.
     const out = try runToString(
         alloc,
         &tmp,
@@ -888,8 +797,6 @@ test "aggregate: keys-then-aggregates adds no projection" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // The common order must stay on the shorter plan — the reorder projection is
-    // only for lists that actually interleave.
     const out = try runToString(
         alloc,
         &tmp,
@@ -928,9 +835,6 @@ test "aggregate: group by a numeric (int) key (value-keyed hashing)" {
     try std.testing.expectEqualStrings("g,c\n5,3\n7,1\n", out);
 }
 
-/// Run `read csv | <body> | write csv` with an explicit thread count, returning
-/// out.csv. Used to exercise the parallel CSV-aggregate path (`threads > 1`), which
-/// the default in-process harness (`threads = 1`) never reaches.
 fn runCsvThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []const u8, query: []const u8, threads: usize) ![]u8 {
     try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = input });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
@@ -969,8 +873,6 @@ test "parallel map keeps file order: a threaded load writes the rows a serial on
         try input.writer().print("{d},{d}\n", .{ i, i % 7 });
         if (i % 7 != 3) try want.writer().print("{d}\n", .{i});
     }
-    // Lanes finish in any order; the rows used to be written as they did, so the
-    // output changed from run to run. Several runs, since one could get lucky.
     for (0..5) |_| {
         const out = try runCsvThreaded(alloc, &tmp, input.items, "SELECT id FROM '$IN' WHERE v <> 3", 4);
         defer alloc.free(out);
@@ -985,15 +887,11 @@ test "parallel load into parquet: lanes encode row groups, the file keeps every 
     var input = std.array_list.Managed(u8).init(alloc);
     defer input.deinit();
     try input.appendSlice("id,s\n");
-    // Four lanes cut this into four units of 60k rows: each over the size at which
-    // a lane encodes its own row group rather than handing the rows on.
     for (0..240_000) |i| try input.writer().print("{d},s{d}\n", .{ i, i % 1000 });
     try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = input.items });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
 
-    // Written with four lanes, read back serially: the same rows in file order,
-    // with chunk offsets that point at real pages — a misplaced one fails to decode.
     const script = try std.fmt.allocPrint(alloc,
         \\LOAD INTO '{s}/out.parquet' AS SELECT id, s FROM '{s}/in.csv';
         \\LOAD INTO '{s}/back.csv' AS SELECT id, s FROM '{s}/out.parquet';
@@ -1010,14 +908,8 @@ test "parallel load into parquet: lanes encode row groups, the file keeps every 
     try std.testing.expectEqualStrings(input.items, got);
 }
 
-/// A parquet file with three row groups — enough for the parallel scan, which needs
-/// at least `pq_min_lanes` lanes and more than one row group. 5000 rows of
-/// `id = 1..5000`, `f = id * 0.5` and `g = id % 4` (a low-cardinality group key), so
-/// `SUM(id)` and `SUM(f)` are both exactly representable and the assertion holds
-/// whatever order the lanes add in.
 const fx_rg2 = @embedFile("testdata/rg2.parquet");
 
-/// Run a query over `fx_rg2` at an explicit thread count, returning out.csv.
 fn runParquetThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, query: []const u8, threads: usize) ![]u8 {
     try tmp.dir.writeFile(.{ .sub_path = "in.parquet", .data = fx_rg2 });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
@@ -1044,10 +936,6 @@ fn runParquetThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, query:
 
 test "parallel parquet aggregate: an ungrouped agg (threads>1) matches serial" {
     const alloc = std.testing.allocator;
-    // This shape used to be refused by the parallel path and sent to the serial
-    // driver, because folding into zero groups made the radix merge emit the
-    // identity and COUNT(*) came back 0. It is the most common analytical query
-    // there is, and it ran on one core.
     var t1 = std.testing.tmpDir(.{});
     defer t1.cleanup();
     const serial = try runParquetThreaded(alloc, &t1, "SELECT COUNT(*) AS n, SUM(id) AS sid, SUM(f) AS sf FROM '$IN'", 1);
@@ -1063,8 +951,6 @@ test "parallel parquet aggregate: an ungrouped agg (threads>1) matches serial" {
 
 test "parallel parquet aggregate: an ungrouped agg under a filter (threads>1)" {
     const alloc = std.testing.allocator;
-    // A prefix filter is the q06 shape: the lanes must each apply it and still
-    // combine into the single implicit group.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const par = try runParquetThreaded(alloc, &tmp, "SELECT COUNT(*) AS n, SUM(id) AS sid FROM '$IN' WHERE id <= 100", 4);
@@ -1074,9 +960,6 @@ test "parallel parquet aggregate: an ungrouped agg under a filter (threads>1)" {
 
 test "parallel parquet aggregate: a join then an ungrouped agg (threads>1)" {
     const alloc = std.testing.allocator;
-    // Neither classifier used to admit this: `classifyAggPipeline` rejects a join and
-    // `classifyMapJoinPipeline` rejects the aggregate, so join-then-aggregate had no
-    // parallel path and TPC-H q12/q14 ran the same at -j 1 and -j 16.
     const q = "WITH d AS (SELECT id AS did FROM '$IN' WHERE id <= 50) " ++
         "SELECT COUNT(*) AS n, SUM(f) AS sf FROM '$IN' JOIN d ON id = did";
     var t1 = std.testing.tmpDir(.{});
@@ -1094,9 +977,6 @@ test "parallel parquet aggregate: a join then an ungrouped agg (threads>1)" {
 
 test "parallel parquet aggregate: a chain of two joins then an agg (threads>1)" {
     const alloc = std.testing.allocator;
-    // One join was the original limit, which left TPC-H q03 — two dimensions — serial
-    // while q12 and q14 fanned out. Each join's output schema is the next one's probe
-    // schema, so the chain has to resolve left to right.
     const q = "WITH d1 AS (SELECT id AS did FROM '$IN' WHERE id <= 100), " ++
         "d2 AS (SELECT id AS eid FROM '$IN' WHERE id <= 50) " ++
         "SELECT COUNT(*) AS n, SUM(f) AS sf FROM '$IN' JOIN d1 ON id = did JOIN d2 ON id = eid";
@@ -1115,12 +995,6 @@ test "parallel parquet aggregate: a chain of two joins then an agg (threads>1)" 
 
 test "parallel parquet aggregate: a right join under an aggregate is not fanned out" {
     const alloc = std.testing.allocator;
-    // A right or full join must emit the build rows nothing matched. Each lane tracks
-    // matches against its own `op.Join`, so every lane emitted them again: this
-    // returned 160 at -j 4 where the answer is 10. The shape has to decline these
-    // kinds and let the serial driver have them, which is what the map+join paths do.
-    //
-    // `d` is 4996..5005 against ids 1..5000, so five keys match and five do not.
     const q = "WITH d AS (SELECT (id + 4995) AS did FROM '$IN' WHERE id <= 10) " ++
         "SELECT COUNT(*) AS n, SUM(id) AS sum_left FROM '$IN' RIGHT JOIN d ON id = did";
     var t1 = std.testing.tmpDir(.{});
@@ -1149,14 +1023,12 @@ test "parallel parquet aggregate: a full join under an aggregate is not fanned o
     const par = try runParquetThreaded(alloc, &t4, q, 4);
     defer alloc.free(par);
 
-    // 5000 left rows, of which 5 match, plus the 5 build rows with no left partner.
     try std.testing.expectEqualStrings("n\n5005\n", serial);
     try std.testing.expectEqualStrings(serial, par);
 }
 
 test "parallel parquet aggregate: the lane-safe kinds still fan out under an aggregate" {
     const alloc = std.testing.allocator;
-    // The guard must not be so broad that it takes the ordinary kinds with it.
     inline for (.{ "INNER", "LEFT", "SEMI", "ANTI" }) |kind| {
         const q = "WITH d AS (SELECT (id + 4995) AS did FROM '$IN' WHERE id <= 10) " ++
             "SELECT COUNT(*) AS n FROM '$IN' " ++ kind ++ " JOIN d ON id = did";
@@ -1174,10 +1046,6 @@ test "parallel parquet aggregate: the lane-safe kinds still fan out under an agg
 
 test "parallel parquet aggregate: an interleaved SELECT list still fans out" {
     const alloc = std.testing.allocator;
-    // The reordering projection that keeps an interleaved SELECT list in its declared
-    // order lands in the tail, and rejecting a tail projection sent the whole query to
-    // the serial driver: 379ms against 88ms on q01's shape. Both facts are asserted
-    // here — the column order AND that -j changes nothing about the answer.
     const q = "SELECT g, COUNT(*) AS n, id FROM '$IN' WHERE id <= 4 GROUP BY g, id ORDER BY id";
     var t1 = std.testing.tmpDir(.{});
     defer t1.cleanup();
@@ -1194,8 +1062,6 @@ test "parallel parquet aggregate: an interleaved SELECT list still fans out" {
 
 test "parallel parquet aggregate: a join then a grouped agg (threads>1)" {
     const alloc = std.testing.allocator;
-    // The grouped case goes through the radix merge rather than the single-partition
-    // fold, so it exercises the other half of the merge with a join underneath.
     const q = "WITH d AS (SELECT id AS did FROM '$IN' WHERE id <= 8) " ++
         "SELECT g, COUNT(*) AS n, SUM(f) AS sf FROM '$IN' JOIN d ON id = did GROUP BY g ORDER BY g";
     var t1 = std.testing.tmpDir(.{});
@@ -1223,9 +1089,6 @@ test "parallel CSV aggregate: global agg (threads>1) matches serial" {
 
 test "parallel CSV aggregate: a join then an agg (threads>1) matches serial" {
     const alloc = std.testing.allocator;
-    // The CSV twin of the parquet join+aggregate tests above. Both exist on purpose:
-    // the ungrouped aggregate was parallel for CSV and serial for parquet for exactly
-    // this reason — one hand-rolled path grew a capability its twin never did.
     const input = "id,v\n1,10\n2,20\n3,30\n4,40\n5,50\n";
     const q = "WITH d AS (SELECT id AS did FROM '$IN' WHERE CAST(id AS INT) <= 3) " ++
         "SELECT COUNT(*) AS n, SUM(CAST(v AS INT)) AS s FROM '$IN' JOIN d ON id = did";
@@ -1285,12 +1148,6 @@ test "parallel CSV aggregate: grouped agg (threads>1) merges partials by key" {
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, par, "\n"));
 }
 
-// A float SUM whose value depends on the order the chunk partials are added:
-// 1e16 has a spacing of 2, so `1e16 + 1` is 1e16 exactly, and adding the small
-// values first is the only way the ones survive. The big value sits in the last
-// row, hence the last chunk, so combining the chunks in index order sums the
-// eight 1.0s before it and lands on 1e16 + 8 (even, so exact). Combining in
-// completion order would drop some of them.
 const float_order_csv =
     "g,v\n" ++
     "a,1\n" ++ "a,1\n" ++ "a,1\n" ++ "a,1\n" ++
@@ -1308,8 +1165,6 @@ test "parallel CSV aggregate: float SUM combines partials in chunk order" {
 
 test "parallel CSV aggregate: float SUM is identical across runs at one -j" {
     const alloc = std.testing.allocator;
-    // Same input every round; only the thread scheduling can differ. Any run that
-    // disagrees with the first means partials are being combined in arrival order.
     var first: ?[]u8 = null;
     defer if (first) |f| alloc.free(f);
     for (0..8) |_| {
@@ -1327,14 +1182,11 @@ test "parallel CSV aggregate: float SUM is identical across runs at one -j" {
 
 test "parallel CSV aggregate: high-cardinality combine is partitioned and exact" {
     const alloc = std.testing.allocator;
-    // Above `agg_combine_parallel_min`, so this takes the radix-partitioned
-    // combine rather than the single pass.
     const ngroups = (agg_combine_parallel_min * 3) / 2;
     var input = std.array_list.Managed(u8).init(alloc);
     defer input.deinit();
     try input.appendSlice("k,v\n");
     for (0..ngroups) |k| {
-        // Each key twice, so every group must come back with count 2 and sum 3.
         try input.writer().print("{d},1\n{d},2\n", .{ k, k });
     }
 
@@ -1345,13 +1197,12 @@ test "parallel CSV aggregate: high-cardinality combine is partitioned and exact"
 
     var seen: usize = 0;
     var it = std.mem.tokenizeScalar(u8, out, '\n');
-    _ = it.next(); // header
+    _ = it.next();
     while (it.next()) |line| {
         var f = std.mem.tokenizeScalar(u8, line, ',');
         const k = f.next().?;
         try std.testing.expectEqualStrings("2", f.next().?);
         try std.testing.expectEqualStrings("3", f.next().?);
-        // Every key must be one of the ones written, and appear once.
         const kv = try std.fmt.parseInt(usize, k, 10);
         try std.testing.expect(kv < ngroups);
         seen += 1;
@@ -1365,8 +1216,6 @@ test "parallel CSV aggregate: the partitioned combine is reproducible" {
     var input = std.array_list.Managed(u8).init(alloc);
     defer input.deinit();
     try input.appendSlice("k,v\n");
-    // Values that only add up the same way if the partials are combined in a
-    // fixed order, as in the low-cardinality test above.
     for (0..ngroups) |k| {
         try input.writer().print("{d},1\n{d},1\n{d},10000000000000000\n", .{ k, k, k });
     }
@@ -1565,7 +1414,6 @@ test "for-each: a typed loop var used as a value binds as its declared type" {
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
 
-    // `$n * 2` only type-checks (and yields 10) if `n` bound as an int, not text.
     const script = try std.fmt.allocPrint(alloc, "FOR EACH ROW OF ('{s}/nums.csv') AS (n:INT)\n" ++
         "  LOAD INTO '{s}/out.csv' AS SELECT id, $n * 2 AS twice FROM '{s}/in.csv';\nEND FOR;", .{ base, base, base });
     defer alloc.free(script);
@@ -1642,7 +1490,6 @@ test "interpAll: a typed loop var binds as its type in an expression body" {
     try std.testing.expectError(error.InterpFailed, interpAll(a, expr, .{ .names = &names, .types = &untyped, .cells = &[_][]const u8{"9030"} }));
 }
 
-/// Parse and run a fully-assembled `script`, returning the contents of out.csv.
 fn runScript(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, script: []const u8, cli_params: []const ParamArg) ![]u8 {
     var parena = std.heap.ArenaAllocator.init(alloc);
     defer parena.deinit();
@@ -1691,9 +1538,6 @@ test "IDENTIFIER path: a PARAM resolves outside any FOR EACH" {
     const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
     defer alloc.free(out_path);
 
-    // The parser lowers IDENTIFIER(...) to a `${...}` template, which only the
-    // for-each renderer used to fill in — a plain script opened the literal
-    // path `<dir>/${name}.csv` and failed with FileNotFound.
     const script = try std.fmt.allocPrint(
         alloc,
         "PARAM dir STRING DEFAULT '{s}';\nPARAM name STRING DEFAULT 'in';\n" ++
@@ -1717,10 +1561,6 @@ test "IDENTIFIER path: a PARAM resolves inside a CTE body" {
     const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
     defer alloc.free(out_path);
 
-    // CTE bodies are registered by a pre-pass that runs before script scope is
-    // built, so this used to open the literal path `<dir>/${name}.csv` even though
-    // the identical read in a top-level FROM resolved (the test above). Found by
-    // the TPC-H harness, where three of five queries put a dimension in a CTE.
     const script = try std.fmt.allocPrint(
         alloc,
         "PARAM dir STRING DEFAULT '{s}';\nPARAM name STRING DEFAULT 'in';\n" ++
@@ -1768,8 +1608,6 @@ test "IDENTIFIER path: a loop variable shadows a same-named PARAM" {
     const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
     defer alloc.free(out_path);
 
-    // `name` is bound in both scopes; §9's rule is that the innermost wins, so
-    // the read must resolve to in.csv and not to the param's `absent`.
     const script = try std.fmt.allocPrint(
         alloc,
         "PARAM dir STRING DEFAULT '{s}';\nPARAM name STRING DEFAULT 'absent';\n" ++
@@ -1866,21 +1704,14 @@ test "aggregate: a loop variable and a function parameter count as constants" {
     defer ar.deinit();
     var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
 
-    // A loop variable is script scope per §9's rule, exactly as a PARAM is, so it
-    // has one value per row and may sit beside an aggregate. This was refused while
-    // the same shape with a PARAM was allowed — `SELECT $tabela, COUNT(*)` over a
-    // discovered catalog is the whole point of a for-each.
     _ = try parser.parseSource(ar.allocator(), "FOR EACH ROW OF (SELECT 'z' AS x) AS (x)\n" ++
         "  LOAD INTO '/tmp/o.csv' AS SELECT $x AS a, COUNT(*) AS n FROM 'in.csv';\n" ++
         "END FOR;", &pdiag);
 
-    // Same for a statement function's parameters, which bind the same way.
     _ = try parser.parseSource(ar.allocator(), "CREATE FUNCTION f(t) AS\n" ++
         "  LOAD INTO '/tmp/o.csv' AS SELECT $t AS a, COUNT(*) AS n FROM 'in.csv';\n" ++
         "END;\nCALL f('x');", &pdiag);
 
-    // Scoped to the body: outside it the name is an ordinary column again, and a
-    // column beside an aggregate is still refused.
     var d2: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const r = parser.parseSource(ar.allocator(), "FOR EACH ROW OF (SELECT 'z' AS x) AS (x)\n" ++
         "  LOAD INTO '/tmp/o.csv' AS SELECT $x AS a FROM 'in.csv';\n" ++
@@ -1895,7 +1726,6 @@ test "aggregate: a bare column beside an aggregate is still refused" {
     var ar = std.heap.ArenaAllocator.init(alloc);
     defer ar.deinit();
     var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    // `g` has no single value per group; only constants get the new pass.
     const r = parser.parseSource(ar.allocator(), "LOAD INTO '/tmp/o.csv' AS SELECT g, COUNT(*) AS c FROM 'in.csv';", &pdiag);
     try std.testing.expectError(error.ParseFailed, r);
     try std.testing.expect(std.mem.indexOf(u8, pdiag.msg, "neither an aggregate nor a grouping key") != null);
@@ -1905,7 +1735,6 @@ test "read a semicolon latin-1 file end to end" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // The shape the CVM fund registry ships in.
     const out = try runToString(
         alloc,
         &tmp,
@@ -1913,7 +1742,6 @@ test "read a semicolon latin-1 file end to end" {
         "SELECT SIT, N FROM '$IN' WITH (delimiter = ';', encoding = 'latin1') ORDER BY N DESC",
     );
     defer alloc.free(out);
-    // Out comes UTF-8, comma-separated, with the columns actually separated.
     try std.testing.expectEqualStrings("SIT,N\nLIQUIDAÇÃO,2\nCANCELADA,1\n", out);
 }
 
@@ -1936,7 +1764,6 @@ test "an unreadable extension is refused by run, not just check" {
     var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
 
-    // `run` does not analyze the pipeline first, so this is its own guard.
     var rdiag: Diag = .{};
     try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "cannot read") != null);
@@ -2003,7 +1830,6 @@ test "a zip holding several files refuses to guess which one" {
 
     var rdiag: Diag = .{};
     try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
-    // The message has to name the candidates, or the user has to go find them.
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "a.csv") != null);
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "b.csv") != null);
 }
@@ -2094,8 +1920,6 @@ test "parallel driver matches serial output across many batches" {
     try std.testing.expect(std.mem.indexOf(u8, outputs[1], "id,doubled\n") != null);
 }
 
-/// Sort the newline-separated lines of `text` (for order-insensitive comparison of
-/// parallel vs serial output). Caller frees.
 fn sortedLines(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
     var lines = std.array_list.Managed([]const u8).init(alloc);
     defer lines.deinit();
@@ -2375,7 +2199,6 @@ test "for-each discovers its rows from an in-engine SELECT" {
     defer alloc.free(b);
     try std.testing.expectEqualStrings("id,v\n1,10\n2,20\n", a);
     try std.testing.expectEqualStrings("id,v\n3,30\n", b);
-    // `active = 0` never reached the body: the discovery filter ran in-engine.
     try std.testing.expectError(error.FileNotFound, tmp.dir.access("out_gamma.csv", .{}));
 }
 
@@ -2574,7 +2397,6 @@ test "join: two-key ON matches on both columns" {
 
     const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
     defer alloc.free(out);
-    // Row 3 (mon,B) has no lookup row; row 2 matches only on the (tue,A) pair.
     try std.testing.expectEqualStrings("id,label\n1,first\n2,second\n", out);
 }
 
@@ -2723,8 +2545,6 @@ test "generated sources: SELECT with no FROM and RANGE(lo, hi)" {
     try std.testing.expectEqualStrings("i\n2\n4\n", r);
 }
 
-/// Build the LET fixture script: a param, a LET over it, a LET over that LET, and
-/// two pipelines that both reference them.
 fn letScript(alloc: std.mem.Allocator, base: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc,
         \\PARAM days INT DEFAULT 3;
@@ -3020,9 +2840,6 @@ test "PRINT over an unbound name is a plan error, not a silent blank" {
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "PRINT:") != null);
 }
 
-/// Run a join script over `in.csv` (probe) + `lookup.csv` (build) at an explicit
-/// thread count. `$IN`/`$LOOKUP` in `body` are replaced with the two paths; the
-/// result comes back as sorted lines, since lanes interleave the output order.
 fn runJoinThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, body: []const u8, threads: usize) ![]u8 {
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
@@ -3057,8 +2874,6 @@ fn runJoinThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, body: []c
     return sortedLines(alloc, raw);
 }
 
-/// `in.csv` = 2000 probe rows cycling five codes; `lookup.csv` = labels for three
-/// of them, so two fifths of the probe side stays unmatched.
 fn writeJoinFixtures(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) !void {
     var in = std.array_list.Managed(u8).init(alloc);
     defer in.deinit();
@@ -3085,7 +2900,6 @@ test "parallel join: inner join over CSV chunks matches the serial driver" {
     defer alloc.free(par);
 
     try std.testing.expectEqualStrings(serial, par);
-    // header + 3 matching codes x 400 rows + the trailing empty line
     try std.testing.expectEqual(@as(usize, 1202), std.mem.count(u8, par, "\n"));
 }
 
@@ -3134,10 +2948,6 @@ test "parallel join: a breaker after the join falls back to the serial driver" {
     defer tmp.cleanup();
     try writeJoinFixtures(alloc, &tmp);
 
-    // An aggregate past the join fails every classifier, so this runs serially —
-    // the fallback must still produce the same answer at threads > 1. (RIGHT/FULL,
-    // the other serial-only join case, is rejected by the SQL parser today, so it
-    // has no runnable script to compare.)
     const body =
         "WITH labels AS (SELECT * FROM '$LOOKUP') " ++
         "SELECT l.label, COUNT(*) AS n FROM '$IN' t JOIN labels l ON t.code = l.code GROUP BY l.label";
@@ -3180,9 +2990,6 @@ test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hints" {
     try std.testing.expectEqual(@as(usize, 1), s1.prefix.len);
     try std.testing.expectEqual(@as(usize, 0), s1.tail.len);
 
-    // A post-aggregate filter is HAVING: it stays engine-side, so it must NOT
-    // disqualify the descent — nor the lane shape, whose tail runs it over
-    // the merged groups.
     const having = [_]ast.Stage{ rd, agg, flt, flt, wrt };
     const s2 = classifyWholeAgg(&having).?;
     try std.testing.expectEqual(@as(usize, 0), s2.prefix.len);
@@ -3191,11 +2998,9 @@ test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hints" {
     try std.testing.expectEqual(@as(usize, 0), lane.prefix.len);
     try std.testing.expectEqual(@as(usize, 2), lane.tail.len);
 
-    // A `select` in the prefix renames columns out from under the group keys.
     const selected = [_]ast.Stage{ rd, sel, agg, wrt };
     try std.testing.expect(classifyWholeAgg(&selected) == null);
 
-    // No aggregate at all, and an aggregate behind a hinted read.
     const no_agg = [_]ast.Stage{ rd, flt, wrt };
     try std.testing.expect(classifyWholeAgg(&no_agg) == null);
 
@@ -3260,8 +3065,6 @@ test "a numeric aggregate casts a text argument, grouped or not, and refuses tex
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // Grouped, a text argument reached SUM's accumulator as a panic and AVG's
-    // and MEDIAN's as a silent 0; ungrouped, MEDIAN read it as 0 too.
     const grouped = try runToString(alloc, &tmp, "k,v\na,1\na,2\nb,3\n", "SELECT k, SUM(CAST(v AS STRING)) AS s, AVG(CAST(v AS STRING)) AS a, MEDIAN(CAST(v AS STRING)) AS m FROM '$IN' GROUP BY k ORDER BY k");
     defer alloc.free(grouped);
     try std.testing.expectEqualStrings("k,s,a,m\na,3,1.5,1.5\nb,3,3,3\n", grouped);
@@ -3275,7 +3078,6 @@ test "count_if, bool_and/or, bit_and/or/xor: grouped and not, nulls skipped, emp
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // `ok` is text in a CSV, cast per row; `c` holds only nulls.
     const input = "k,ok,v\na,true,6\na,false,3\na,,\nb,true,5\nc,,\n";
     const grouped = try runToString(alloc, &tmp, input,
         \\SELECT k, count_if(ok) AS ci, count_if(v > 4) AS big, bool_and(ok) AS ba, bool_or(ok) AS bo,
@@ -3287,17 +3089,12 @@ test "count_if, bool_and/or, bit_and/or/xor: grouped and not, nulls skipped, emp
     const whole = try runToString(alloc, &tmp, input, "SELECT count_if(ok) AS ci, bool_and(ok) AS ba, bit_or(v) AS o FROM '$IN'");
     defer alloc.free(whole);
     try std.testing.expectEqualStrings("ci,ba,o\n2,false,7\n", whole);
-    // No rows at all: a count is 0, the rest null.
     const none = try runToString(alloc, &tmp, input, "SELECT count_if(ok) AS ci, bool_or(ok) AS bo, bit_and(v) AS an FROM '$IN' WHERE k = 'zz'");
     defer alloc.free(none);
     try std.testing.expectEqualStrings("ci,bo,an\n0,,\n", none);
-    // A constant condition, and one built row-wise (`abs` has no vector kernel),
-    // are BOOL columns even though `count_if` answers an INT: grouped, the
-    // constant used to be broadcast as INT and counted nothing.
     const built = try runToString(alloc, &tmp, input, "SELECT k, count_if(true) AS t, count_if(abs(v) > 4) AS a FROM '$IN' GROUP BY k ORDER BY k");
     defer alloc.free(built);
     try std.testing.expectEqualStrings("k,t,a\na,3,1\nb,1,1\nc,1,0\n", built);
-    // Across lanes: each lane folds its own slice and the partials merge.
     const lanes = try runCsvThreaded(alloc, &tmp, input,
         \\SELECT k, count_if(ok) AS ci, count_if(v > 4) AS big, bool_and(ok) AS ba, bool_or(ok) AS bo,
         \\       bit_and(v) AS an, bit_or(v) AS o, bit_xor(v) AS x
@@ -3414,8 +3211,6 @@ test "a CSV read with a delimiter and an encoding fans out over lanes and reads 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // `;`-separated latin-1, as the CVM publishes: any hint used to keep the read
-    // serial, and the lanes' chunk readers ignored the dialect when they did run.
     var input = std.array_list.Managed(u8).init(alloc);
     defer input.deinit();
     try input.appendSlice("cidade;valor\n");
@@ -3434,8 +3229,6 @@ test "JOIN LATERAL passes a row's column to a table function as a join on it" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // Orders (kind o) and their items (kind i) in one file; order 4 has no items
-    // and one order number is empty.
     const input = "kind,num,prod,qty\no,1,,\no,2,,\no,,,\no,4,,\ni,1,X,5\ni,1,Y,2\ni,2,Z,1\ni,,N,9\n";
     const fns =
         \\CREATE FUNCTION itens(pedido, minq INT DEFAULT 0) RETURNS TABLE AS
@@ -3445,12 +3238,8 @@ test "JOIN LATERAL passes a row's column to a table function as a join on it" {
         \\
     ;
     const cases = [_]struct { q: []const u8, want: []const u8 }{
-        // CROSS: an inner join on the argument; a null order matches nothing; the
-        // echoed parameter is the row's value; a constant argument still filters.
         .{ .q = "SELECT o.num, i.prod, i.eco FROM (SELECT num FROM '$IN' WHERE kind = 'o') o CROSS JOIN LATERAL itens(o.num, 1) i ORDER BY o.num, i.prod", .want = "num,prod,eco\n1,X,1\n1,Y,1\n" },
-        // LEFT ... ON TRUE keeps an order with no items.
         .{ .q = "SELECT o.num, i.prod FROM (SELECT num FROM '$IN' WHERE kind = 'o') o LEFT JOIN LATERAL itens(o.num) i ON TRUE ORDER BY o.num, i.prod", .want = "num,prod\n1,X\n1,Y\n2,Z\n4,\n,\n" },
-        // A body that does not select the column joins on it under the parameter's name.
         .{ .q = "SELECT o.num, n.prod, n.pedido FROM (SELECT num FROM '$IN' WHERE kind = 'o') o JOIN LATERAL nomes(o.num) n ORDER BY n.prod", .want = "num,prod,pedido\n1,X,1\n1,Y,1\n2,Z,2\n" },
     };
     for (cases) |c| {
@@ -3514,7 +3303,6 @@ test "an Excel workbook reads as a table: typed columns, a named sheet and range
         defer alloc.free(got);
         try std.testing.expectEqualStrings(c.want, got);
     }
-    // writing one is refused, not done as CSV under a workbook's name
     var parena = std.heap.ArenaAllocator.init(alloc);
     defer parena.deinit();
     var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
@@ -3532,8 +3320,6 @@ test "a FOR EACH discovery query may read a table function, a derived table or a
     try tmp.dir.writeFile(.{ .sub_path = "o.csv", .data = "id,g,x\n1,a,10\n2,a,20\n3,b,30\n4,c,5\n" });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
-    // The discovery query's bindings run ahead of the loop. It used to be refused —
-    // "may not declare CTEs" even of a query that only called a function.
     const script = try std.fmt.allocPrint(alloc,
         \\CREATE FUNCTION groups(minx INT) RETURNS TABLE AS SELECT DISTINCT g FROM '{0s}/o.csv' WHERE x >= $minx;
         \\FOR EACH ROW OF (WITH s AS (SELECT g FROM groups(10)) SELECT g FROM (SELECT g FROM s) d) AS (gg)
@@ -3545,7 +3331,6 @@ test "a FOR EACH discovery query may read a table function, a derived table or a
     defer parena.deinit();
     var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-    // the bindings sit before the loop, none inside its body
     var loop: ?ast.ForEach = null;
     for (prog.stmts) |st| if (st == .for_each) {
         loop = st.for_each;
@@ -3562,7 +3347,6 @@ test "a FOR EACH discovery query may read a table function, a derived table or a
     const b = try tmp.dir.readFileAlloc(alloc, "out_b.csv", 1 << 16);
     defer alloc.free(b);
     try std.testing.expectEqualStrings("id\n3\n", b);
-    // `c` has no x >= 10, so the function's WHERE kept it out of the loop
     try std.testing.expectError(error.FileNotFound, tmp.dir.access("out_c.csv", .{}));
 }
 
@@ -3624,15 +3408,11 @@ test "parallel parquet: an aggregate after DISTINCT and a HAVING both fan out an
     try std.testing.expectEqualStrings("n,mg\n4,0\n", dist);
     var t2 = std.testing.tmpDir(.{});
     defer t2.cleanup();
-    // g = id % 4 over id = 1..5000: SUM(id) is 3127500, 3123750, 3125000, 3126250 for g = 0..3.
     const having = try runParquetThreaded(alloc, &t2, "SELECT g, COUNT(*) AS c FROM '$IN' GROUP BY g HAVING SUM(id) > 3125000 ORDER BY g", 4);
     defer alloc.free(having);
     try std.testing.expectEqualStrings("g,c\n0,1250\n3,1250\n", having);
 }
 
-/// Check, then run, a script in which `$B` stands for the tmp dir — so every test
-/// below also asserts that `check` accepts what `run` executes. Fixtures: `a.csv`
-/// and `b.csv` (id, grp, amt), `outer.csv` (name: a, b), `inner.csv` (suffix: one, two).
 fn checkAndRun(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, tmpl: []const u8, threads: usize, cli_params: []const ParamArg) !void {
     try tmp.dir.writeFile(.{ .sub_path = "a.csv", .data = "id,grp,amt\n1,a,10\n2,a,20\n3,b,5\n" });
     try tmp.dir.writeFile(.{ .sub_path = "b.csv", .data = "id,grp,amt\n7,x,1\n8,x,2\n" });
@@ -3888,8 +3668,6 @@ test "DISTINCT ON keys are input columns: renamed, unprojected, and beside an OR
     , 1, &.{});
     try expectFile(&tmp, "renamed.csv", "k,u\nb,B\na,A\n");
     try expectFile(&tmp, "hidden.csv", "id,amt\n1,10\n3,5\n");
-    // The highest `amt` per group, in `amt DESC` order (DuckDB/Postgres); it was
-    // the first row per group in input order, sorted afterwards.
     try expectFile(&tmp, "sorted.csv", "id\n4\n2\n");
     try expectFile(&tmp, "output.csv", "k,id\na,1\nb,3\n");
     try expectFile(&tmp, "pair.csv", "id\n1\n2\n3\n4\n");
@@ -3936,7 +3714,6 @@ test "union: SELECT * EXCEPT drops a column before the branches are reconciled, 
         \\WITH u AS (SELECT id, CAST(x AS DATE) AS x FROM '$B/ua.csv'
         \\           UNION ALL BY NAME SELECT id, CAST(x AS INT) AS x FROM '$B/ub.csv' ANCHOR SCHEMA first)
     ;
-    // A date `x` in one branch and an int `x` in the other: no common type.
     const bad = try std.mem.replaceOwned(u8, alloc, "LOAD INTO '$B/bad.csv' AS " ++ with_u ++ "\nSELECT * FROM u;", "$B", base);
     defer alloc.free(bad);
     var parena = std.heap.ArenaAllocator.init(alloc);
@@ -3947,7 +3724,6 @@ test "union: SELECT * EXCEPT drops a column before the branches are reconciled, 
     try std.testing.expect(std.meta.isError(run(alloc, bad_prog, .{ .log = .{ .quiet = true } }, &rdiag)));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "no common type") != null);
 
-    // Excepted, the column is dropped from the canon: neither branch casts it.
     try checkAndRun(alloc, &tmp, "LOAD INTO '$B/ok.csv' AS " ++ with_u ++ "\nSELECT * EXCEPT (x) FROM u ORDER BY id;", 1, &.{});
     try expectFile(&tmp, "ok.csv", "id\n1\n2\n");
 }
@@ -3962,9 +3738,6 @@ test "a projected SQL read asks for its columns, quoted per dialect; none means 
     try std.testing.expectEqualStrings("`id`", try selectListFor(a, .mysql, &.{"id"}));
 }
 
-/// Written by polars 1.44 with no ConvertedType on the temporal columns: `ts` is a
-/// naive microsecond timestamp, `ts_utc` a UTC nanosecond one, `t` a TIME. Two row
-/// groups of two rows, so statistics on the converted units get exercised too.
 const fx_logical = @embedFile("../format/testdata/logical_types.parquet");
 
 test "LogicalType-only parquet timestamps and times read back as wall-clock values" {
@@ -4005,7 +3778,6 @@ test "a parquet LIST column unnests through JSON_EACH, one row per element" {
     const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
     defer alloc.free(out_path);
 
-    // an empty or null list gives no rows; a null element is a null row
     const script = try std.fmt.allocPrint(
         alloc,
         "LOAD INTO '{s}' AS SELECT id, x FROM '{s}/l.parquet' CROSS JOIN UNNEST(JSON_EACH(xs)) AS x ORDER BY id;",
@@ -4018,8 +3790,6 @@ test "a parquet LIST column unnests through JSON_EACH, one row per element" {
 }
 
 test "copying a parquet with nested columns keeps every one of them" {
-    // The risk this guards: `SELECT *` into a sink used to drop a list of
-    // structs or a map from the copy without an error.
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4046,8 +3816,6 @@ test "copying a parquet with nested columns keeps every one of them" {
     );
 }
 
-/// Accepts every connection and closes it at once — a database refusing logins
-/// under load. `done` plus one last connect ends the loop.
 const SlamServer = struct {
     server: std.net.Server,
     done: std.atomic.Value(bool) = .init(false),
@@ -4125,7 +3893,6 @@ test "onWire names a closed or failed database socket as transient, and leaves t
     try std.testing.expectEqual(error.TdsProtocol, sql.onWire(error.TdsProtocol));
     try std.testing.expect(isTransient(sql.onWire(error.EndOfStream)));
     try std.testing.expect(isTransient(sql.onWire(error.ReadFailed)));
-    // Untouched outside a driver: a truncated local file stays permanent.
     try std.testing.expect(!isTransient(error.EndOfStream));
     try std.testing.expect(!isTransient(error.WriteFailed));
 }
@@ -4158,8 +3925,6 @@ test "on_load: every LOAD reports as it finishes — written, failed before writ
     const a = ar.allocator();
     var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
 
-    // two loads, the second failing before it writes: both report, and the
-    // summary still carries the first
     {
         var log = LoadLog{ .arena = a, .list = .init(a) };
         const src = try std.fmt.allocPrint(a,
@@ -4188,7 +3953,6 @@ test "on_load: every LOAD reports as it finishes — written, failed before writ
         try std.testing.expectEqual(@as(?u64, 5), summary.rows_loaded);
     }
 
-    // a for-each: one report per row, each knowing its row, with the rendered target
     {
         var log = LoadLog{ .arena = a, .list = .init(a) };
         const src = try std.fmt.allocPrint(a,
@@ -4208,8 +3972,6 @@ test "on_load: every LOAD reports as it finishes — written, failed before writ
         }
     }
 
-    // side by side, each load still counts only its own rows read: row n reads
-    // n thousand rows, so a shared count would give each the others' too
     {
         try tmp.dir.writeFile(.{ .sub_path = "sizes.csv", .data = "n\n1\n2\n3\n4\n5\n6\n" });
         for (1..7) |n| {
@@ -4237,7 +3999,6 @@ test "on_load: every LOAD reports as it finishes — written, failed before writ
             try std.testing.expectEqual(@as(u64, l.loop_row * 1000), l.rows_read);
             try std.testing.expectEqual(l.rows_read, l.rows_written);
         }
-        // and the run's total still sees every row
         try std.testing.expectEqual(@as(u64, 21_000), summary.rows_read);
     }
 }
@@ -4246,7 +4007,6 @@ test "a bare name is a column even when a PARAM or loop variable shares it; `$na
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // a.csv: id,grp,amt — 1,a,10 / 2,a,20 / 3,b,5; outer.csv: name — a / b
     try checkAndRun(alloc, &tmp,
         \\PARAM grp STRING DEFAULT 'b';
         \\LOAD INTO '$B/bare.csv' AS SELECT COUNT(*) AS n FROM '$B/a.csv' WHERE grp = 'a';
@@ -4275,10 +4035,8 @@ test "DATE, TIMESTAMP, TIME and DECIMAL params bind from text as a CAST reads it
         \\LET x = CAST('1.5' AS DECIMAL(10,2));
         \\LOAD INTO '$B/p.csv' AS SELECT $d AS d, date_add('day', 1, $d) AS d1, $t AS t, $tm AS tm, $m AS m, $x + 1 AS x1;
     ;
-    // defaults, each its declared type
     try checkAndRun(alloc, &tmp, script, 1, &.{});
     try expectFile(&tmp, "p.csv", "d,d1,t,tm,m,x1\n2026-01-01,2026-01-02,2026-01-01 08:00:00,08:00:00,1.50,2.50\n");
-    // bound: a date alone reaches a TIMESTAMP as its midnight; a decimal rounds as a cast does
     try checkAndRun(alloc, &tmp, script, 1, &.{
         .{ .key = "d", .val = "2026-02-01" },
         .{ .key = "t", .val = "2026-02-01" },
@@ -4287,7 +4045,6 @@ test "DATE, TIMESTAMP, TIME and DECIMAL params bind from text as a CAST reads it
     });
     try expectFile(&tmp, "p.csv", "d,d1,t,tm,m,x1\n2026-02-01,2026-02-02,2026-02-01 00:00:00,10:30:15,12.35,2.50\n");
 
-    // text that is not one: the run refuses it, and so does the check, in the same words
     var parena = std.heap.ArenaAllocator.init(alloc);
     defer parena.deinit();
     var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
