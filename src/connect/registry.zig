@@ -4,7 +4,7 @@
 //! connector is a compile error at every site that must know about it.
 
 const std = @import("std");
-const sql = @import("sql.zig");
+const sql = @import("../db/sql.zig");
 
 /// A SQL connector: the driver that speaks its wire protocol and the dialect the
 /// engine renders for it.

@@ -16,7 +16,7 @@
 //! listing loop, the consumer-facing interface — lives in `objstore.zig`.
 
 const std = @import("std");
-const http_client = @import("http_client.zig");
+const http_client = @import("../net/http_client.zig");
 const objstore = @import("objstore.zig");
 
 /// x-ms-version sent on every request. Shared Key signing is stable across

@@ -7,7 +7,7 @@ const std = @import("std");
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
 const Batch = @import("../exec/batch.zig").Batch;
-const driver = @import("driver.zig");
+const driver = @import("../connect/driver.zig");
 const sql = @import("sql.zig");
 
 pub const Error = error{ PgProtocol, PgAuthFailed, PgQueryFailed, PgAuthUnsupported, PgTlsRefused } || std.mem.Allocator.Error;

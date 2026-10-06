@@ -24,7 +24,7 @@ const std = @import("std");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const split = @import("../connect/split.zig");
-const Dialect = @import("../connect/sql.zig").Dialect;
+const Dialect = @import("../db/sql.zig").Dialect;
 const builtins = @import("../exec/builtins.zig");
 
 /// The result of planning pushdown for one aggregate pipeline. Empty fields mean
@@ -185,7 +185,7 @@ pub fn planWholeAggWhy(
     for (ag.aggs, 0..) |item, i| {
         const out = plan_schema.fields[ag.by.len + i];
         const inner = (try aggExpr(arena, dialect, src_schema, item, out.ty)) orelse
-            return refuse(why, try std.fmt.allocPrint(arena, "`{s}` is not pushed down for this argument and result type (see the pushdown rules in language.md)", .{out.name}));
+            return refuse(why, try std.fmt.allocPrint(arena, "`{s}` is not pushed down for this argument and result type (see the pushdown rules in docs/language.md)", .{out.name}));
         const cast_to = (try dialect.castType(arena, out.ty)) orelse
             return refuse(why, try std.fmt.allocPrint(arena, "{s} has no cast for the result type of `{s}`", .{ @tagName(dialect), out.name }));
         if (sel.items.len > 0) try sel.appendSlice(", ");

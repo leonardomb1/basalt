@@ -1162,5 +1162,5 @@ test "krb5: a live login and service ticket (BASALT_KRB_REALM, _USER, _PASS, _SP
     }
     try std.testing.expect(st.end > std.time.timestamp());
     // no wrong-password attempt here: against a real domain each one counts
-    // toward the account's lockout — the AD DC suite in it/ checks that case
+    // toward the account's lockout
 }

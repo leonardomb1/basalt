@@ -16,8 +16,8 @@
 const std = @import("std");
 const zip = std.zip;
 const pqdecode = @import("pqdecode.zig");
-const sftp = @import("sftp.zig");
-const smb = @import("smb.zig");
+const sftp = @import("../store/sftp.zig");
+const smb = @import("../store/smb.zig");
 
 pub const Error = error{
     ZipMemberNotFound,

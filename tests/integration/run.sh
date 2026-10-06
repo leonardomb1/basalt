@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Integration suite: seed CSV -> write to each backend (auto-created table or
-# blob) -> read back -> compare against it/expected.csv. Needs docker compose.
+# blob) -> read back -> compare against tests/integration/expected.csv. Needs docker compose.
 #
-#   ./it/run.sh                 all suites
-#   ./it/run.sh azure           only that suite (boots only the containers it needs)
-#   ./it/run.sh mysql postgres  several
-#   KEEP=1 ./it/run.sh azure    leave the stack up afterwards
+#   ./tests/integration/run.sh                 all suites
+#   ./tests/integration/run.sh azure           only that suite (boots only the containers it needs)
+#   ./tests/integration/run.sh mysql postgres  several
+#   KEEP=1 ./tests/integration/run.sh azure    leave the stack up afterwards
 #
 # Suite names: mysql postgres sqlserver starrocks doris sftp smb azure parquet s3 arrow
 # stdout kernel
@@ -14,7 +14,7 @@
 # Scripts are Basalt SQL (the BSL parser was removed in v0.2.0); connection
 # attrs are passed as `OPTIONS(...)` bodies.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 ALL_SUITES="mysql postgres sqlserver starrocks doris sftp smb azure parquet s3 arrow stdout kernel"
 DEFAULT_SUITES="$ALL_SUITES"
@@ -47,7 +47,7 @@ done
 
 zig build
 B=./zig-out/bin/basalt
-COMPOSE="docker compose -f it/compose.yaml"
+COMPOSE="docker compose -f tests/integration/compose.yaml"
 
 # The sftp suite logs in with a key made here, for this run only.
 keydir=$(mktemp -d)
@@ -104,10 +104,10 @@ check() { # $1 name, $2 actual csv, $3 expected csv
 sqlrt() { # $1 connector, $2 OPTIONS(...) body -- round trip via replace + table read
   local decl="CREATE CONNECTION db TYPE $1 OPTIONS ($2);"
   if brun run -c "$decl
-LOAD INTO db.basalt_it REPLACE AS SELECT * FROM 'it/seed.csv';" &&
+LOAD INTO db.basalt_it REPLACE AS SELECT * FROM 'tests/integration/seed.csv';" &&
      brun run -c "$decl
 LOAD INTO '$out/$1.csv' AS SELECT * FROM db.basalt_it ORDER BY id;"; then
-    check "$1" "$out/$1.csv" it/expected.csv
+    check "$1" "$out/$1.csv" tests/integration/expected.csv
   else
     report "$1 (run error)" bad
   fi
@@ -135,7 +135,7 @@ SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM db.basalt_vol;"; 
 topnrt() { # $1 label, $2 CREATE CONNECTION db ..., $3 LOAD target
   local decl=$2
   if ! brun run -c "$decl
-LOAD INTO $3 REPLACE AS SELECT CAST(id AS INT) AS id, CAST(v AS INT) AS v, CAST(ts AS TIMESTAMP) AS ts, CAST(amt AS DECIMAL(10,2)) AS amt, name FROM 'it/topn.csv';"; then
+LOAD INTO $3 REPLACE AS SELECT CAST(id AS INT) AS id, CAST(v AS INT) AS v, CAST(ts AS TIMESTAMP) AS ts, CAST(amt AS DECIMAL(10,2)) AS amt, name FROM 'tests/integration/topn.csv';"; then
     report "$1-topn (load error)" bad
     return
   fi
@@ -313,7 +313,7 @@ if runs sqlserver; then
   if brun run -c "CREATE CONNECTION m TYPE sqlserver OPTIONS ($MSSQL_OPTS);
 SELECT * FROM m.QUERY(\$\$IF DB_ID('it_bin') IS NULL EXEC('CREATE DATABASE it_bin COLLATE Latin1_General_BIN'); SELECT 1 AS ok\$\$);" &&
      brun run -c "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_BIN);
-LOAD INTO db.dbo.it_topn REPLACE AS SELECT CAST(id AS INT) AS id, CAST(amt AS DECIMAL(10,2)) AS amt FROM 'it/topn.csv';"; then
+LOAD INTO db.dbo.it_topn REPLACE AS SELECT CAST(id AS INT) AS id, CAST(amt AS DECIMAL(10,2)) AS amt FROM 'tests/integration/topn.csv';"; then
     catalogrt sqlserver-binary-collation "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_BIN);" dbo
     collrt sqlserver-binary "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_BIN);" db.it_coll
 
@@ -359,7 +359,7 @@ fi
 pgjoin() { # $1 threads, $2 output csv
   brun run -j "$1" -c "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);
 LOAD INTO '$2' AS
-WITH labels AS (SELECT id, name FROM 'it/seed.csv')
+WITH labels AS (SELECT id, name FROM 'tests/integration/seed.csv')
 SELECT t.id, l.name FROM db.basalt_it t WITH (split = id, splits = 4) JOIN labels l ON t.id = l.id;"
 }
 
@@ -378,7 +378,7 @@ if runs postgres; then
   # the database refuses.
   if brun run -c "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);
 LOAD INTO '$out/pg_join_cols.csv' AS
-WITH labels AS (SELECT id AS lid, name AS label FROM 'it/seed.csv')
+WITH labels AS (SELECT id AS lid, name AS label FROM 'tests/integration/seed.csv')
 SELECT id, l.label AS a, upper(label) AS b FROM db.basalt_it t JOIN labels l ON t.id = l.lid ORDER BY id;"; then
     printf 'id,a,b\n1,alpha,ALPHA\n2,"beta, gamma","BETA, GAMMA"\n3,delta,DELTA\n' >"$out/pg_join_cols_want.csv"
     check postgres-join-projects-own-columns "$out/pg_join_cols.csv" "$out/pg_join_cols_want.csv"
@@ -393,7 +393,7 @@ fi
 # hashing (unscaled, scale) counted `1.5` and `1.50` as two distinct values.
 # psql computes the expected row, so this stays honest if the engine changes.
 if runs postgres; then
-  pgq() { docker compose -f it/compose.yaml exec -T postgres psql -U postgres -d it -t -A -F, "$@"; }
+  pgq() { docker compose -f tests/integration/compose.yaml exec -T postgres psql -U postgres -d it -t -A -F, "$@"; }
   pgq -c "DROP TABLE IF EXISTS it_dec;
           CREATE TABLE it_dec (k int, n numeric, m numeric(12,2));
           INSERT INTO it_dec VALUES (1,1.5,1.50),(1,1.50,1.50),(1,0.001,0.10),(2,2.25,2.25);" >/dev/null 2>&1
@@ -419,7 +419,7 @@ fi
 # the fixed-length forms (money NOT NULL) were missing from the type switch
 # entirely. `time(n)` was read as CP1252 text, so it came back as mojibake.
 if runs sqlserver; then
-  docker compose -f it/compose.yaml exec -T mssql /opt/mssql-tools18/bin/sqlcmd \
+  docker compose -f tests/integration/compose.yaml exec -T mssql /opt/mssql-tools18/bin/sqlcmd \
     -S localhost -U sa -P It_Passw0rd1 -C -Q \
     "USE master; DROP TABLE IF EXISTS dbo.it_money;
      CREATE TABLE dbo.it_money (k int, a money NULL, b smallmoney NULL,
@@ -484,7 +484,7 @@ SELECT id, LENGTH(v) AS n, SUBSTR(v, 1, 1) AS a, SUBSTR(v, 20000000, 1) AS z FRO
 LOAD INTO '$out/mysql_after.csv' AS SELECT * FROM db.basalt_it ORDER BY id;"; then
     { echo "id,n,a,z"; echo "1,20000000,A,Z"; } >"$out/mysql_big_expected.csv"
     check mysql-large-packet "$out/mysql_big.csv" "$out/mysql_big_expected.csv"
-    check mysql-large-packet-no-desync "$out/mysql_after.csv" it/expected.csv
+    check mysql-large-packet-no-desync "$out/mysql_after.csv" tests/integration/expected.csv
   else
     report "mysql-large-packet (run error)" bad
   fi
@@ -493,10 +493,10 @@ fi
 # StarRocks: write via stream load, read back through its MySQL-protocol FE.
 if runs starrocks; then
   if brun run -c "CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');
-LOAD INTO sr.basalt_it USING stream_load REPLACE AS SELECT * FROM 'it/seed.csv';" &&
+LOAD INTO sr.basalt_it USING stream_load REPLACE AS SELECT * FROM 'tests/integration/seed.csv';" &&
      brun run -c "CREATE CONNECTION fe TYPE mysql OPTIONS (host = '127.0.0.1', port = 39030, user = 'root', password = '', database = 'it');
 LOAD INTO '$out/starrocks.csv' AS SELECT * FROM fe.basalt_it ORDER BY id;"; then
-    check starrocks "$out/starrocks.csv" it/expected.csv
+    check starrocks "$out/starrocks.csv" tests/integration/expected.csv
   else
     report "starrocks (run error)" bad
   fi
@@ -542,8 +542,8 @@ if runs sftp; then
   for _ in $(seq 1 30); do docker exec $SC pgrep -f sshd >/dev/null 2>&1 && break; sleep 1; done
   sleep 2
   docker exec $SC sh -c 'mkdir -p /config/in/parts /config/out && chown -R 1000:1000 /config/in /config/out'
-  docker cp it/seed.csv $SC:/config/in/seed.csv
-  docker cp src/connect/testdata/openpyxl.xlsx $SC:/config/in/book.xlsx
+  docker cp tests/integration/seed.csv $SC:/config/in/seed.csv
+  docker cp src/format/testdata/openpyxl.xlsx $SC:/config/in/book.xlsx
   printf 'id,v\n1,a\n' | docker exec -i $SC sh -c 'cat > /config/in/parts/p2.csv'
   printf 'id,v\n0,z\n' | docker exec -i $SC sh -c 'cat > /config/in/parts/p1.csv'
   # a folder read skips what is not a CSV
@@ -555,8 +555,8 @@ if runs sftp; then
   # a CSV read with a password, the same through a key
   if brun run -c "$PW LOAD INTO '$out/sftp_pw.csv' AS SELECT * FROM 'sftp://box/~/in/seed.csv' ORDER BY id;" &&
      brun run -c "$KEY LOAD INTO '$out/sftp_key.csv' AS SELECT * FROM 'sftp://box/~/in/seed.csv' ORDER BY id;"; then
-    check sftp-password "$out/sftp_pw.csv" it/expected.csv
-    check sftp-key "$out/sftp_key.csv" it/expected.csv
+    check sftp-password "$out/sftp_pw.csv" tests/integration/expected.csv
+    check sftp-key "$out/sftp_key.csv" tests/integration/expected.csv
   else
     report "sftp (run error)" bad
   fi
@@ -583,7 +583,7 @@ if runs sftp; then
   fi
 
   # a failed load takes its .part back and leaves no target
-  $B run -q -c "$KEY LOAD INTO 'sftp://box/~/out/bad.csv' AS SELECT CAST(name AS INT) AS x FROM 'it/seed.csv';" >/dev/null 2>&1 || true
+  $B run -q -c "$KEY LOAD INTO 'sftp://box/~/out/bad.csv' AS SELECT CAST(name AS INT) AS x FROM 'tests/integration/seed.csv';" >/dev/null 2>&1 || true
   if docker exec $SC sh -c 'ls /config/out' | grep -q "bad"; then report "sftp-aborted-load-leaves-nothing" bad; else report "sftp-aborted-load-leaves-nothing" ok; fi
 
   # an unknown host is refused with its fingerprint; a wrong pin is a changed key
@@ -594,16 +594,16 @@ if runs sftp; then
 
   # a folder of Parquet, nested as Spark writes it, with a marker file beside the data
   docker exec $SC sh -c 'mkdir -p /config/out/pq/day=2 /config/out/pq/_temporary && chown -R 1000:1000 /config/out'
-  if brun run -c "$KEY LOAD INTO 'sftp://box/~/out/pq/part-0.parquet' AS SELECT * FROM 'it/seed.csv' WHERE id <= 1;" &&
-     brun run -c "$KEY LOAD INTO 'sftp://box/~/out/pq/day=2/part-1.parquet' AS SELECT * FROM 'it/seed.csv' WHERE id > 1;" &&
+  if brun run -c "$KEY LOAD INTO 'sftp://box/~/out/pq/part-0.parquet' AS SELECT * FROM 'tests/integration/seed.csv' WHERE id <= 1;" &&
+     brun run -c "$KEY LOAD INTO 'sftp://box/~/out/pq/day=2/part-1.parquet' AS SELECT * FROM 'tests/integration/seed.csv' WHERE id > 1;" &&
      brun run -c "$KEY LOAD INTO 'sftp://box/~/out/pq/_temporary/x.csv' AS SELECT 1 AS done;" &&
      brun run -c "$KEY LOAD INTO '$out/sftp_pq_dir.csv' AS SELECT * FROM 'sftp://box/~/out/pq/' ORDER BY id;"; then
-    check sftp-parquet-folder "$out/sftp_pq_dir.csv" it/expected.csv
+    check sftp-parquet-folder "$out/sftp_pq_dir.csv" tests/integration/expected.csv
   else report "sftp-parquet-folder (run error)" bad; fi
   # the same folder folded in parallel, a file per lane, against the local file
   if $B run -j 4 --log-level debug -c "$KEY LOAD INTO '$out/sftp_pq_agg.csv' AS SELECT COUNT(*) AS n, SUM(id) AS s FROM 'sftp://box/~/out/pq/';" 2>"$out/sftp_pq_agg.log" &&
      grep -q "parallel parquet aggregate" "$out/sftp_pq_agg.log"; then
-    brun run -c "LOAD INTO '$out/sftp_pq_agg_want.csv' AS SELECT COUNT(*) AS n, SUM(id) AS s FROM 'it/seed.csv';"
+    brun run -c "LOAD INTO '$out/sftp_pq_agg_want.csv' AS SELECT COUNT(*) AS n, SUM(id) AS s FROM 'tests/integration/seed.csv';"
     check sftp-parquet-folder-parallel "$out/sftp_pq_agg.csv" "$out/sftp_pq_agg_want.csv"
   else report "sftp-parquet-folder-parallel (run error or not parallel)" bad; cat "$out/sftp_pq_agg.log"; fi
   # a file whose columns differ fails the read by name, though a lane found it
@@ -614,7 +614,7 @@ if runs sftp; then
 
   # a rename that cannot happen (the target is a folder) fails the load and leaves no .part
   docker exec $SC sh -c 'mkdir -p /config/out/isdir/x && chown -R 1000:1000 /config/out'
-  if $B run -q -c "$KEY LOAD INTO 'sftp://box/~/out/isdir' AS SELECT * FROM 'it/seed.csv';" >/dev/null 2>&1 ||
+  if $B run -q -c "$KEY LOAD INTO 'sftp://box/~/out/isdir' AS SELECT * FROM 'tests/integration/seed.csv';" >/dev/null 2>&1 ||
      docker exec $SC sh -c 'ls /config/out' | grep -q "isdir.part"; then
     report "sftp-failed-rename-leaves-nothing" bad
   else report "sftp-failed-rename-leaves-nothing" ok; fi
@@ -629,7 +629,7 @@ SELECT COUNT(*) FROM 'sftp://box/~/in/seed.csv'; SELECT COUNT(*) FROM 'sftp://pi
   docker exec -i $SC sh -c 'cat >> /config/.ssh/authorized_keys' <"$keydir/id_pp.pub"
   if brun run -c "CREATE CONNECTION box TYPE sftp OPTIONS (host = '127.0.0.1', port = 42222, user = 'basalt', key_file = '$keydir/id_pp', key_passphrase = 'it-pp', known_hosts = '$out/known_hosts_ecdsa');
 LOAD INTO '$out/sftp_ecdsa.csv' AS SELECT * FROM 'sftp://box/~/in/seed.csv' ORDER BY id;"; then
-    check sftp-ecdsa-host-passphrase-key "$out/sftp_ecdsa.csv" it/expected.csv
+    check sftp-ecdsa-host-passphrase-key "$out/sftp_ecdsa.csv" tests/integration/expected.csv
   else report "sftp-ecdsa-host-passphrase-key (run error)" bad; fi
 
   # keyboard-interactive only, over AES-CTR with HMAC and the server's RSA host key
@@ -638,7 +638,7 @@ LOAD INTO '$out/sftp_ecdsa.csv' AS SELECT * FROM 'sftp://box/~/in/seed.csv' ORDE
   for _ in $(seq 1 30); do docker exec $SC pgrep -f sshd >/dev/null 2>&1 && break; sleep 1; done
   sleep 2
   if brun run -c "$PW LOAD INTO '$out/sftp_kbd.csv' AS SELECT * FROM 'sftp://box/~/in/seed.csv' ORDER BY id;"; then
-    check sftp-kbd-interactive-ctr-rsa "$out/sftp_kbd.csv" it/expected.csv
+    check sftp-kbd-interactive-ctr-rsa "$out/sftp_kbd.csv" tests/integration/expected.csv
   else report "sftp-kbd-interactive-ctr-rsa (run error)" bad; fi
 fi
 
@@ -647,9 +647,9 @@ fi
 if runs smb; then
   SMB="CREATE CONNECTION box TYPE smb OPTIONS (host = '127.0.0.1', port = 44445, user = 'basalt', password = 'it');"
   docker exec it-smb-1 sh -c 'rm -rf /share/* && mkdir -p /share/folder/sub /share/folder/_skip && chown -R basalt /share'
-  if brun run -c "$SMB LOAD INTO 'smb://box/data/seed.csv' AS SELECT * FROM 'it/seed.csv';" &&
+  if brun run -c "$SMB LOAD INTO 'smb://box/data/seed.csv' AS SELECT * FROM 'tests/integration/seed.csv';" &&
      brun run -c "$SMB LOAD INTO '$out/smb_rt.csv' AS SELECT * FROM 'smb://box/data/seed.csv' ORDER BY id;"; then
-    check smb-csv-roundtrip "$out/smb_rt.csv" it/expected.csv
+    check smb-csv-roundtrip "$out/smb_rt.csv" tests/integration/expected.csv
   else
     report "smb-csv-roundtrip (run error)" bad
   fi
@@ -666,27 +666,27 @@ if runs smb; then
   # a folder: subfolders read, `_` ones skipped
   docker exec it-smb-1 sh -c 'cp /share/seed.csv /share/folder/a.csv && cp /share/seed.csv /share/folder/sub/b.csv && cp /share/seed.csv /share/folder/_skip/c.csv && chown -R basalt /share'
   if brun run -c "$SMB LOAD INTO '$out/smb_folder.csv' AS SELECT COUNT(*) AS n FROM 'smb://box/data/folder/';" &&
-     brun run -c "LOAD INTO '$out/smb_folder_want.csv' AS SELECT COUNT(*) * 2 AS n FROM 'it/seed.csv';"; then
+     brun run -c "LOAD INTO '$out/smb_folder_want.csv' AS SELECT COUNT(*) * 2 AS n FROM 'tests/integration/seed.csv';"; then
     check smb-folder "$out/smb_folder.csv" "$out/smb_folder_want.csv"
   else
     report "smb-folder (run error)" bad
   fi
 
-  docker cp src/connect/testdata/openpyxl.xlsx it-smb-1:/share/book.xlsx >/dev/null
+  docker cp src/format/testdata/openpyxl.xlsx it-smb-1:/share/book.xlsx >/dev/null
   docker exec it-smb-1 chown basalt /share/book.xlsx
   if brun run -c "$SMB LOAD INTO '$out/smb_xlsx.csv' AS SELECT * FROM 'smb://box/data/book.xlsx';" &&
-     brun run -c "LOAD INTO '$out/smb_xlsx_want.csv' AS SELECT * FROM 'src/connect/testdata/openpyxl.xlsx';"; then
+     brun run -c "LOAD INTO '$out/smb_xlsx_want.csv' AS SELECT * FROM 'src/format/testdata/openpyxl.xlsx';"; then
     check smb-xlsx "$out/smb_xlsx.csv" "$out/smb_xlsx_want.csv"
   else
     report "smb-xlsx (run error)" bad
   fi
 
   # a load that fails mid-way leaves the target as it was and no .part
-  $B run -q -c "$SMB LOAD INTO 'smb://box/data/seed.csv' AS SELECT id, CAST(name AS INT) AS name FROM 'it/seed.csv';" >/dev/null 2>&1 || true
+  $B run -q -c "$SMB LOAD INTO 'smb://box/data/seed.csv' AS SELECT id, CAST(name AS INT) AS name FROM 'tests/integration/seed.csv';" >/dev/null 2>&1 || true
   if docker exec it-smb-1 sh -c 'ls /share' | grep -q '\.part$'; then
     report "smb-aborted-load-leaves-nothing" bad
   elif brun run -c "$SMB LOAD INTO '$out/smb_after.csv' AS SELECT * FROM 'smb://box/data/seed.csv' ORDER BY id;"; then
-    check smb-aborted-load-keeps-target "$out/smb_after.csv" it/expected.csv
+    check smb-aborted-load-keeps-target "$out/smb_after.csv" tests/integration/expected.csv
   else
     report "smb-aborted-load-keeps-target (run error)" bad
   fi
@@ -704,10 +704,10 @@ if runs doris; then
   DR="CREATE CONNECTION dr TYPE doris OPTIONS (host = '127.0.0.1', port = 49030, load_url = 'http://127.0.0.1:48040', database = 'it', user = 'root', password = '');"
   DB="CREATE CONNECTION db TYPE doris OPTIONS (host = '127.0.0.1', port = 49030, load_url = 'http://127.0.0.1:48040', database = 'it', user = 'root', password = '');"
   if brun run -c "$DR
-LOAD INTO dr.basalt_it USING stream_load REPLACE AS SELECT * FROM 'it/seed.csv';" &&
+LOAD INTO dr.basalt_it USING stream_load REPLACE AS SELECT * FROM 'tests/integration/seed.csv';" &&
      brun run -c "$DR
 LOAD INTO '$out/doris.csv' AS SELECT * FROM dr.basalt_it ORDER BY id;"; then
-    check doris "$out/doris.csv" it/expected.csv
+    check doris "$out/doris.csv" tests/integration/expected.csv
   else
     report "doris (run error)" bad
   fi
@@ -758,19 +758,19 @@ if runs azure; then
 
   # Single blob: out through the block-staging writer, back through the signed
   # reader — a green run exercises both halves of the Shared Key path.
-  if brun run -c "LOAD INTO 'az://devstoreaccount1/basalt-it/seed.csv' AS SELECT * FROM 'it/seed.csv';" &&
+  if brun run -c "LOAD INTO 'az://devstoreaccount1/basalt-it/seed.csv' AS SELECT * FROM 'tests/integration/seed.csv';" &&
      brun run -c "LOAD INTO '$out/azure.csv' AS SELECT * FROM 'az://devstoreaccount1/basalt-it/seed.csv' ORDER BY id;"; then
-    check azure "$out/azure.csv" it/expected.csv
+    check azure "$out/azure.csv" tests/integration/expected.csv
   else
     report "azure (run error)" bad
   fi
 
   # Prefix read: two blobs under one prefix must read back as a single table, in
   # listing order. Guards the multi-blob rollover, which one blob cannot.
-  if brun run -c "LOAD INTO 'az://devstoreaccount1/basalt-it/parts/a.csv' AS SELECT * FROM 'it/seed.csv' WHERE id <= 1;" &&
-     brun run -c "LOAD INTO 'az://devstoreaccount1/basalt-it/parts/b.csv' AS SELECT * FROM 'it/seed.csv' WHERE id > 1;" &&
+  if brun run -c "LOAD INTO 'az://devstoreaccount1/basalt-it/parts/a.csv' AS SELECT * FROM 'tests/integration/seed.csv' WHERE id <= 1;" &&
+     brun run -c "LOAD INTO 'az://devstoreaccount1/basalt-it/parts/b.csv' AS SELECT * FROM 'tests/integration/seed.csv' WHERE id > 1;" &&
      brun run -c "LOAD INTO '$out/azure_prefix.csv' AS SELECT * FROM 'az://devstoreaccount1/basalt-it/parts/' ORDER BY id;"; then
-    check azure-prefix "$out/azure_prefix.csv" it/expected.csv
+    check azure-prefix "$out/azure_prefix.csv" tests/integration/expected.csv
   else
     report "azure-prefix (run error)" bad
   fi
@@ -789,10 +789,10 @@ SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM 'az://devstoreacc
   # `std.fs.cwd().createFile` unconditionally, so an `az://` path failed with
   # FileNotFound from a local directory named `az:` — the README's own opening
   # example. This is the routing guard; the read half already worked.
-  if brun run -c "LOAD INTO 'az://devstoreaccount1/basalt-it/bronze/seed.parquet' AS SELECT * FROM 'it/seed.csv';" &&
+  if brun run -c "LOAD INTO 'az://devstoreaccount1/basalt-it/bronze/seed.parquet' AS SELECT * FROM 'tests/integration/seed.csv';" &&
      brun run -c "LOAD INTO '$out/azure_parquet.csv' AS
 SELECT * FROM 'az://devstoreaccount1/basalt-it/bronze/seed.parquet' ORDER BY id;"; then
-    check azure-parquet "$out/azure_parquet.csv" it/expected.csv
+    check azure-parquet "$out/azure_parquet.csv" tests/integration/expected.csv
   else
     report "azure-parquet (run error)" bad
   fi
@@ -841,14 +841,14 @@ if runs s3; then
   export AWS_SECRET_ACCESS_KEY="minioadmin"
   export AWS_REGION="us-east-1"
 
-  docker compose -f it/compose.yaml exec -T s3 sh -c \
+  docker compose -f tests/integration/compose.yaml exec -T s3 sh -c \
     "echo 's3.bucket.create -name basalt-it' | weed shell" >/dev/null 2>&1
 
   # Single object: out through the writer, back through the signed reader — a
   # green run exercises both halves of the SigV4 path.
-  if brun run -c "LOAD INTO 's3://basalt-it/seed.csv' AS SELECT * FROM 'it/seed.csv';" &&
+  if brun run -c "LOAD INTO 's3://basalt-it/seed.csv' AS SELECT * FROM 'tests/integration/seed.csv';" &&
      brun run -c "LOAD INTO '$out/s3.csv' AS SELECT * FROM 's3://basalt-it/seed.csv' ORDER BY id;"; then
-    check s3 "$out/s3.csv" it/expected.csv
+    check s3 "$out/s3.csv" tests/integration/expected.csv
   else
     report "s3 (run error)" bad
   fi
@@ -856,30 +856,30 @@ if runs s3; then
   # Prefix read: two objects under one prefix must read back as a single table,
   # in listing order. ListObjectsV2 paging or ordering bugs show up here and
   # nowhere else.
-  if brun run -c "LOAD INTO 's3://basalt-it/parts/a.csv' AS SELECT * FROM 'it/seed.csv' WHERE id <= 1;" &&
-     brun run -c "LOAD INTO 's3://basalt-it/parts/b.csv' AS SELECT * FROM 'it/seed.csv' WHERE id > 1;" &&
+  if brun run -c "LOAD INTO 's3://basalt-it/parts/a.csv' AS SELECT * FROM 'tests/integration/seed.csv' WHERE id <= 1;" &&
+     brun run -c "LOAD INTO 's3://basalt-it/parts/b.csv' AS SELECT * FROM 'tests/integration/seed.csv' WHERE id > 1;" &&
      brun run -c "LOAD INTO '$out/s3_prefix.csv' AS SELECT * FROM 's3://basalt-it/parts/' ORDER BY id;"; then
-    check s3-prefix "$out/s3_prefix.csv" it/expected.csv
+    check s3-prefix "$out/s3_prefix.csv" tests/integration/expected.csv
   else
     report "s3-prefix (run error)" bad
   fi
 
   # a prefix of Parquet objects, one nested, reads as one table; a marker object is skipped
-  if brun run -c "LOAD INTO 's3://basalt-it/pq/part-0.parquet' AS SELECT * FROM 'it/seed.csv' WHERE id <= 1;" &&
-     brun run -c "LOAD INTO 's3://basalt-it/pq/day=2/part-1.parquet' AS SELECT * FROM 'it/seed.csv' WHERE id > 1;" &&
+  if brun run -c "LOAD INTO 's3://basalt-it/pq/part-0.parquet' AS SELECT * FROM 'tests/integration/seed.csv' WHERE id <= 1;" &&
+     brun run -c "LOAD INTO 's3://basalt-it/pq/day=2/part-1.parquet' AS SELECT * FROM 'tests/integration/seed.csv' WHERE id > 1;" &&
      brun run -c "LOAD INTO 's3://basalt-it/pq/_temporary/x.csv' AS SELECT 1 AS done;" &&
      brun run -c "LOAD INTO '$out/s3_pq_prefix.csv' AS SELECT * FROM 's3://basalt-it/pq/' ORDER BY id;"; then
-    check s3-parquet-prefix "$out/s3_pq_prefix.csv" it/expected.csv
+    check s3-parquet-prefix "$out/s3_pq_prefix.csv" tests/integration/expected.csv
   else
     report "s3-parquet-prefix (run error)" bad
   fi
 
   # Parquet out to an object and back — the routing guard, same as azure-parquet:
   # an s3:// target must not be opened as a local file named `s3:`.
-  if brun run -c "LOAD INTO 's3://basalt-it/bronze/seed.parquet' AS SELECT * FROM 'it/seed.csv';" &&
+  if brun run -c "LOAD INTO 's3://basalt-it/bronze/seed.parquet' AS SELECT * FROM 'tests/integration/seed.csv';" &&
      brun run -c "LOAD INTO '$out/s3_parquet.csv' AS
 SELECT * FROM 's3://basalt-it/bronze/seed.parquet' ORDER BY id;"; then
-    check s3-parquet "$out/s3_parquet.csv" it/expected.csv
+    check s3-parquet "$out/s3_parquet.csv" tests/integration/expected.csv
   else
     report "s3-parquet (run error)" bad
   fi
@@ -941,7 +941,7 @@ fi
 # not retry a script that can never succeed.
 tp_ok=1
 TP="PARAM tbl STRING DEFAULT ''; THROW 'tbl is required' WHEN \$tbl IS EMPTY;
-LOAD INTO '$out/tp.csv' AS SELECT * FROM 'it/seed.csv';"
+LOAD INTO '$out/tp.csv' AS SELECT * FROM 'tests/integration/seed.csv';"
 if $B check -c "$TP" >"$out/tp.log" 2>&1; then tp_ok=0; echo "  check accepted a firing guard"; fi
 if ! grep -q "tbl is required" "$out/tp.log"; then tp_ok=0; echo "  message not verbatim"; fi
 tp_rc=0
@@ -954,7 +954,7 @@ if [ "$tp_ok" = 1 ]; then report throw-guard ok; else report "throw-guard" bad; 
 # --log-level needed), silenced by -q, and on stderr so --format json's stdout
 # contract stays parseable.
 pr_ok=1
-PR="PRINT 'hello from the script'; SELECT id FROM 'it/seed.csv';"
+PR="PRINT 'hello from the script'; SELECT id FROM 'tests/integration/seed.csv';"
 $B run -c "$PR" 2>"$out/pr_err.log" >"$out/pr_out.log" || true
 if ! grep -q "hello from the script" "$out/pr_err.log"; then pr_ok=0; echo "  not visible by default"; fi
 if grep -q "hello from the script" "$out/pr_out.log"; then pr_ok=0; echo "  leaked onto stdout"; fi
@@ -1036,8 +1036,8 @@ check append-replace-truncates "$out/rep.csv" "$out/trunc_expected.csv"
 # A .csv.gz target is gzip that the system gzip reads back byte for byte, and so is
 # one appended to: a second gzip member continues the stream.
 rm -f "$out/out.csv.gz" "$out/out_gz_want.csv"
-if brun run -c "LOAD INTO '$out/out.csv.gz' AS SELECT * FROM 'it/seed.csv';" &&
-   brun run -c "LOAD INTO '$out/out.csv' AS SELECT * FROM 'it/seed.csv';" &&
+if brun run -c "LOAD INTO '$out/out.csv.gz' AS SELECT * FROM 'tests/integration/seed.csv';" &&
+   brun run -c "LOAD INTO '$out/out.csv' AS SELECT * FROM 'tests/integration/seed.csv';" &&
    gzip -t "$out/out.csv.gz" && gzip -cd "$out/out.csv.gz" | cmp -s - "$out/out.csv"; then
   report csv-gzip-output ok
 else report csv-gzip-output bad; fi
@@ -1066,8 +1066,8 @@ fi
 # basalt agrees with another implementation rather than with itself.
 if runs parquet; then
   if brun run -c "LOAD INTO '$out/parquet.csv' AS
-SELECT id, name, amt, flag FROM 'src/connect/testdata/zstd.parquet' ORDER BY id;"; then
-    check parquet "$out/parquet.csv" it/parquet_expected.csv
+SELECT id, name, amt, flag FROM 'src/format/testdata/zstd.parquet' ORDER BY id;"; then
+    check parquet "$out/parquet.csv" tests/integration/parquet_expected.csv
   else
     report "parquet (run error)" bad
   fi
@@ -1076,19 +1076,19 @@ SELECT id, name, amt, flag FROM 'src/connect/testdata/zstd.parquet' ORDER BY id;
   # not just the decoder unit tests.
   for c in uncompressed snappy gzip lz4; do
     if brun run -c "LOAD INTO '$out/parquet_$c.csv' AS
-SELECT id, name, amt, flag FROM 'src/connect/testdata/$c.parquet' ORDER BY id;"; then
-      check "parquet-$c" "$out/parquet_$c.csv" it/parquet_expected.csv
+SELECT id, name, amt, flag FROM 'src/format/testdata/$c.parquet' ORDER BY id;"; then
+      check "parquet-$c" "$out/parquet_$c.csv" tests/integration/parquet_expected.csv
     else
       report "parquet-$c (run error)" bad
     fi
   done
 
   # Write path: CSV -> parquet -> read back. Reading our own output only proves
-  # self-consistency, so the seed round-trip is checked against it/expected.csv,
+  # self-consistency, so the seed round-trip is checked against tests/integration/expected.csv,
   # which every other backend is held to as well.
-  if brun run -c "LOAD INTO '$out/w.parquet' AS SELECT * FROM 'it/seed.csv';" &&
+  if brun run -c "LOAD INTO '$out/w.parquet' AS SELECT * FROM 'tests/integration/seed.csv';" &&
      brun run -c "LOAD INTO '$out/parquet_rt.csv' AS SELECT * FROM '$out/w.parquet' ORDER BY id;"; then
-    check parquet-write "$out/parquet_rt.csv" it/expected.csv
+    check parquet-write "$out/parquet_rt.csv" tests/integration/expected.csv
   else
     report "parquet-write (run error)" bad
   fi
@@ -1184,7 +1184,7 @@ SELECT name, COUNT(*) AS n, SUM(val) AS s FROM '$out/vol.parquet' GROUP BY name 
     DUCK=$(command -v duckdb || echo "$HOME/.duckdb/cli/latest/duckdb")
     # COPY with NULLSTR '' so duckdb renders nulls the way basalt's CSV sink does
     if "$DUCK" -c "COPY (SELECT id, name, val FROM '$out/w.parquet' ORDER BY id) TO '$out/parquet_duck.csv' (FORMAT CSV, HEADER, NULLSTR '');" >/dev/null 2>&1; then
-      check parquet-interop "$out/parquet_duck.csv" it/expected.csv
+      check parquet-interop "$out/parquet_duck.csv" tests/integration/expected.csv
     else
       report "parquet-interop (duckdb could not read basalt output)" bad
     fi
@@ -1231,7 +1231,7 @@ SELECT name, COUNT(*) AS n, SUM(val) AS s FROM '$out/vol.parquet' GROUP BY name 
   # arithmetic is wrong.
   if brun run -c "LOAD INTO '$out/parquet_http.csv' AS
 SELECT id, name, amt, flag FROM 'http://127.0.0.1:38080/snappy.parquet' ORDER BY id;"; then
-    check parquet-http "$out/parquet_http.csv" it/parquet_expected.csv
+    check parquet-http "$out/parquet_http.csv" tests/integration/parquet_expected.csv
   else
     report "parquet-http (run error)" bad
   fi
@@ -1242,7 +1242,7 @@ SELECT id, name, amt, flag FROM 'http://127.0.0.1:38080/snappy.parquet' ORDER BY
   # a correctness check, not a transfer-volume one.
   if brun run -c "LOAD INTO '$out/parquet_http_proj.csv' AS
 SELECT id, name FROM 'http://127.0.0.1:38080/snappy.parquet' ORDER BY id;"; then
-    if cut -d, -f1,2 it/parquet_expected.csv > "$out/proj_expected.csv"; then
+    if cut -d, -f1,2 tests/integration/parquet_expected.csv > "$out/proj_expected.csv"; then
       check parquet-http-projection "$out/parquet_http_proj.csv" "$out/proj_expected.csv"
     fi
   else
@@ -1256,7 +1256,7 @@ SELECT id, name FROM 'http://127.0.0.1:38080/snappy.parquet' ORDER BY id;"; then
   # carried it has been recycled.
   if brun run -c "LOAD INTO '$out/parquet_norange.csv' AS
 SELECT id, name, amt, flag FROM 'http://127.0.0.1:38081/snappy.parquet' ORDER BY id;"; then
-    check parquet-http-norange "$out/parquet_norange.csv" it/parquet_expected.csv
+    check parquet-http-norange "$out/parquet_norange.csv" tests/integration/parquet_expected.csv
   else
     report "parquet-http-norange (run error)" bad
   fi
@@ -1273,12 +1273,12 @@ SELECT id, name, amt, flag FROM 'http://127.0.0.1:38081/snappy.parquet' ORDER BY
 fi
 
 # Arrow: the stream on stdout must be what an independent reader decodes, so the
-# seed round-trip goes through pyarrow and is held to the same it/expected.csv as
+# seed round-trip goes through pyarrow and is held to the same tests/integration/expected.csv as
 # every backend. Rows are re-serialised by hand so the compare is byte-exact.
 if runs arrow; then
   if ! command -v uv >/dev/null; then
     report "arrow (uv not installed, skipped)" bad
-  elif $B run -q --format arrow -c "SELECT * FROM 'it/seed.csv' ORDER BY id;" >"$out/seed.arrows" 2>"$out/arrow.log" &&
+  elif $B run -q --format arrow -c "SELECT * FROM 'tests/integration/seed.csv' ORDER BY id;" >"$out/seed.arrows" 2>"$out/arrow.log" &&
        uv run --quiet --with pyarrow python - "$out/seed.arrows" "$out/arrow_rt.csv" <<'PY' 2>>"$out/arrow.log"
 import sys, pyarrow.ipc as ipc
 t = ipc.open_stream(sys.argv[1]).read_all()
@@ -1293,7 +1293,7 @@ with open(sys.argv[2], "w") as f:
         f.write(",".join(cell(row[c]) for c in t.column_names) + "\n")
 PY
   then
-    check arrow "$out/arrow_rt.csv" it/expected.csv
+    check arrow "$out/arrow_rt.csv" tests/integration/expected.csv
   else
     report "arrow (run error)" bad
     tail -5 "$out/arrow.log"
@@ -1303,7 +1303,7 @@ PY
   # position, and ends with a zero-row trailer batch carrying its totals. An
   # EXPLAIN is a result of its own under arrow, a `plan` column.
   if command -v uv >/dev/null &&
-     $B run -q --format arrow -c "SELECT id FROM 'it/seed.csv' ORDER BY id;
+     $B run -q --format arrow -c "SELECT id FROM 'tests/integration/seed.csv' ORDER BY id;
   SELECT 'x' AS b FROM RANGE(3);
 EXPLAIN SELECT range FROM RANGE(5) WHERE range > 2;
 DESCRIBE SELECT 1 AS z;" >"$out/multi.arrows" 2>>"$out/arrow.log" &&
@@ -1342,24 +1342,24 @@ PY
   if command -v uv >/dev/null &&
      uv run --quiet --with pyarrow python - "$out/seed.feather" <<'PY' 2>>"$out/arrow.log" &&
 import sys, pyarrow.csv as pcsv, pyarrow.feather as feather
-feather.write_feather(pcsv.read_csv("it/seed.csv"), sys.argv[1], compression="lz4")
+feather.write_feather(pcsv.read_csv("tests/integration/seed.csv"), sys.argv[1], compression="lz4")
 PY
      $B run -q -j 1 --format csv -c "SELECT * FROM '$out/seed.feather' ORDER BY id;" >"$out/feather_rt.csv" 2>>"$out/arrow.log"; then
-    check "arrow: a pyarrow Feather file reads back as the seed" "$out/feather_rt.csv" it/expected.csv
+    check "arrow: a pyarrow Feather file reads back as the seed" "$out/feather_rt.csv" tests/integration/expected.csv
   else
     report "arrow: a pyarrow Feather file reads back as the seed (run error)" bad
     tail -5 "$out/arrow.log"
   fi
   # Nested parquet columns — lists of structs, maps, any nesting — rebuilt as
   # JSON, cell by cell against pyarrow's reading, in three page layouts.
-  if command -v uv >/dev/null && uv run --quiet --with pyarrow python it/parquet_nested.py "$B" "$out" >"$out/nested.log" 2>&1; then
+  if command -v uv >/dev/null && uv run --quiet --with pyarrow python tests/integration/parquet_nested.py "$B" "$out" >"$out/nested.log" 2>&1; then
     report "parquet: nested columns match pyarrow cell for cell" ok
   else
     report "parquet: nested columns match pyarrow cell for cell" bad
     tail -8 "$out/nested.log"
   fi
   if command -v uv >/dev/null &&
-     brun run -c "LOAD INTO '$out/seed.arrow' AS SELECT * FROM 'it/seed.csv' ORDER BY id;" &&
+     brun run -c "LOAD INTO '$out/seed.arrow' AS SELECT * FROM 'tests/integration/seed.csv' ORDER BY id;" &&
      uv run --quiet --with pyarrow python - "$out/seed.arrow" "$out/arrow_sink_rt.csv" <<'PY' 2>>"$out/arrow.log"
 import sys, pyarrow.ipc as ipc
 t = ipc.open_file(sys.argv[1]).read_all()
@@ -1374,7 +1374,7 @@ with open(sys.argv[2], "w") as f:
         f.write(",".join(cell(row[c]) for c in t.column_names) + "\n")
 PY
   then
-    check "arrow: LOAD INTO .arrow is a file pyarrow reads" "$out/arrow_sink_rt.csv" it/expected.csv
+    check "arrow: LOAD INTO .arrow is a file pyarrow reads" "$out/arrow_sink_rt.csv" tests/integration/expected.csv
   else
     report "arrow: LOAD INTO .arrow is a file pyarrow reads (run error)" bad
     tail -5 "$out/arrow.log"
@@ -1385,11 +1385,11 @@ fi
 # test is the CLI's own — rows and nothing else for a program, and a result that is
 # the same bytes whether stdout is a pipe or a file.
 if runs stdout; then
-  sel="SELECT * FROM 'it/seed.csv' ORDER BY id;"
+  sel="SELECT * FROM 'tests/integration/seed.csv' ORDER BY id;"
 
   # csv is the seed back again: same quoting as a .csv sink, no rule, no footer.
   if $B run -q -j 1 --format csv -c "$sel" >"$out/stdout.csv" 2>"$out/stdout.log"; then
-    check "stdout csv" "$out/stdout.csv" it/expected.csv
+    check "stdout csv" "$out/stdout.csv" tests/integration/expected.csv
   else
     report "stdout csv (run error)" bad
     tail -5 "$out/stdout.log"
@@ -1398,7 +1398,7 @@ if runs stdout; then
   # tsv carries the same cells; a field holding a comma needs no quotes under a tab.
   if $B run -q -j 1 --format tsv -c "$sel" >"$out/stdout.tsv" 2>>"$out/stdout.log" &&
      $B run -q -j 1 --format csv -c "SELECT * FROM '$out/stdout.tsv' WITH (format = 'csv', delimiter = '\t') ORDER BY id;" >"$out/stdout_tsv_rt.csv" 2>>"$out/stdout.log"; then
-    check "stdout tsv" "$out/stdout_tsv_rt.csv" it/expected.csv
+    check "stdout tsv" "$out/stdout_tsv_rt.csv" tests/integration/expected.csv
     if grep -q '"beta, gamma"' "$out/stdout.tsv"; then report "stdout tsv quotes only what a tab demands" bad; else report "stdout tsv quotes only what a tab demands" ok; fi
   else
     report "stdout tsv (run error)" bad
@@ -1406,8 +1406,8 @@ if runs stdout; then
   fi
 
   # Nothing but data on stdout: the summary and the logs stay on stderr.
-  rows=$(($(wc -l <it/expected.csv)))
-  got=$($B run --format csv -c "LOAD INTO '$out/stdout_side.csv' AS SELECT * FROM 'it/seed.csv'; $sel" 2>/dev/null | wc -l)
+  rows=$(($(wc -l <tests/integration/expected.csv)))
+  got=$($B run --format csv -c "LOAD INTO '$out/stdout_side.csv' AS SELECT * FROM 'tests/integration/seed.csv'; $sel" 2>/dev/null | wc -l)
   if [ "$got" -eq "$rows" ]; then report "stdout csv carries rows only beside a LOAD" ok; else report "stdout csv carries rows only beside a LOAD ($got lines, want $rows)" bad; fi
 
   # A second SELECT appends. Redirected to a file it used to start again at offset
@@ -1496,7 +1496,7 @@ assert [(e["line"], e["msg"].split("`")[1] if "`" in e["msg"] else "syntax") for
   # the span of the offending name, on its own line of a multi-line statement.
   $B run --log-format json -c "SELECT id,
        upper(nope) AS u
-FROM 'it/seed.csv';" >/dev/null 2>"$out/jerr.log" || true
+FROM 'tests/integration/seed.csv';" >/dev/null 2>"$out/jerr.log" || true
   if python3 -c '
 import json, sys
 e = json.loads(open(sys.argv[1]).read().strip().splitlines()[-1])
@@ -1535,7 +1535,7 @@ if runs kernel; then
   if ! command -v python3 >/dev/null; then
     report "kernel (python3 not installed, skipped)" bad
   else
-    python3 it/kernel.py "$B" >"$out/kernel.log" 2>&1 || true
+    python3 tests/integration/kernel.py "$B" >"$out/kernel.log" 2>&1 || true
     grep -E '^(PASS|FAIL) ' "$out/kernel.log" || tail -20 "$out/kernel.log"
     pass=$((pass + $(grep -c '^PASS ' "$out/kernel.log" || true)))
     fail=$((fail + $(grep -c '^FAIL ' "$out/kernel.log" || true)))

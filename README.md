@@ -169,7 +169,7 @@ apply), with `AWS_ENDPOINT_URL` for MinIO and the like.
 
 ## Documentation
 
-- [`language.md`](language.md) — the SQL dialect: sources, sinks, joins,
+- [`docs/language.md`](docs/language.md) — the SQL dialect: sources, sinks, joins,
   unions, `FOR EACH`, parameters, endpoints
 - [`examples/`](examples) — runnable scripts, one per feature
 
@@ -177,9 +177,9 @@ apply), with `AWS_ENDPOINT_URL` for MinIO and the like.
 
 ```console
 zig build test                    # unit tests, no services needed
-./it/run.sh                       # integration suite (needs docker)
-./it/run.sh azure parquet         # just those suites
-./it/run.sh stdout kernel arrow   # the CLI's own contracts: no containers
+./tests/integration/run.sh                       # integration suite (needs docker)
+./tests/integration/run.sh azure parquet         # just those suites
+./tests/integration/run.sh stdout kernel arrow   # the CLI's own contracts: no containers
 ```
 
 The integration suite starts only the containers the selected suites need;

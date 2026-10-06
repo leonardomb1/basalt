@@ -6,10 +6,10 @@
 //! rows arrive in do not depend on how a server lists.
 
 const std = @import("std");
-const http_client = @import("http_client.zig");
-const objstore = @import("objstore.zig");
-const sftp = @import("sftp.zig");
-const smb = @import("smb.zig");
+const http_client = @import("../net/http_client.zig");
+const objstore = @import("../store/objstore.zig");
+const sftp = @import("../store/sftp.zig");
+const smb = @import("../store/smb.zig");
 
 pub fn isFolder(path: []const u8) bool {
     return path.len > 0 and path[path.len - 1] == '/';

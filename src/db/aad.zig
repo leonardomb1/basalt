@@ -14,7 +14,7 @@
 //! so no registration is required.
 
 const std = @import("std");
-const http_client = @import("http_client.zig");
+const http_client = @import("../net/http_client.zig");
 
 /// Microsoft.Data.SqlClient's built-in client id for AAD auth (first-party,
 /// pre-consented) and the Azure SQL resource the Dataverse TDS endpoint accepts.

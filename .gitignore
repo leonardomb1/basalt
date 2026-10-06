@@ -1,7 +1,6 @@
 .zig-cache/
 zig-out/
 .claude/
+.vscode/
+# what the examples write
 examples/out.csv
-ex/.env
-ex/crm_opportunity.sh
-ex/opportunity_columns.txt

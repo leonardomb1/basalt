@@ -34,7 +34,7 @@ const column = @import("../exec/column.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const Value = @import("../exec/value.zig").Value;
 const eval = @import("../exec/eval.zig");
-const driver = @import("driver.zig");
+const driver = @import("../connect/driver.zig");
 const codec = @import("codec.zig");
 
 pub const Error = error{

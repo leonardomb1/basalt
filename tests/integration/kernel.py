@@ -1,6 +1,6 @@
 """Drives `basalt kernel` over its stdin/stdout protocol, as a notebook would.
 
-Usage: python3 it/kernel.py <basalt binary>
+Usage: python3 tests/integration/kernel.py <basalt binary>
 Prints PASS/FAIL lines; exits non-zero on any failure. Standard library only.
 """
 

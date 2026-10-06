@@ -20,7 +20,7 @@
 //! itself until it closes the file.
 
 const std = @import("std");
-const ssh = @import("ssh.zig");
+const ssh = @import("../net/ssh.zig");
 
 pub const Error = error{
     SftpProtocol,

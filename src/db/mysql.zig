@@ -11,7 +11,7 @@ const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
 const Value = @import("../exec/value.zig").Value;
 const Batch = @import("../exec/batch.zig").Batch;
-const driver = @import("driver.zig");
+const driver = @import("../connect/driver.zig");
 
 const CLIENT_LONG_PASSWORD = 0x00000001;
 const CLIENT_CONNECT_WITH_DB = 0x00000008;
@@ -770,7 +770,7 @@ const fuzzPackets_corpus = [_][]const u8{
 
 test "fuzz: wire packet parsers survive arbitrary bytes" {
     try std.testing.fuzz({}, fuzzPackets, .{ .corpus = &fuzzPackets_corpus });
-    try @import("fuzzutil.zig").pound(fuzzPackets, &fuzzPackets_corpus);
+    try @import("../net/fuzzutil.zig").pound(fuzzPackets, &fuzzPackets_corpus);
 }
 
 /// mysql_native_password auth token:

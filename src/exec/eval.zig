@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const regex = @import("regex.zig");
-const sql = @import("../connect/sql.zig");
+const sql = @import("../db/sql.zig");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const column = @import("column.zig");
@@ -5351,7 +5351,7 @@ test "array helpers: chars, json_range, json_length, json_slice, json_concat" {
     try std.testing.expectEqualStrings("[]", try str(a, "json_slice('[1,2,3,4]', 9)"));
     try std.testing.expectEqualStrings("[1,{\"k\":2},3]", try str(a, "json_concat('[1]', '[{\"k\": 2}, 3]')"));
     try std.testing.expect((try evalLit(a, "json_concat('[1]', NULL)")) == .null);
-    // The CNPJ check digit, as language.md writes it.
+    // The CNPJ check digit, as docs/language.md writes it.
     try std.testing.expectEqual(@as(i64, 8), (try evalLit(a, "11 - json_reduce(chars('112223330001'), 0, (acc, c, i) -> acc + (ascii(c) - 48) * CAST(json_get('[5,4,3,2,9,8,7,6,5,4,3,2]', CAST(i AS STRING)) AS INT)) % 11")).int);
 }
 

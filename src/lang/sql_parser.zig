@@ -1,8 +1,8 @@
-//! Parser for the Basalt SQL dialect (language.md). Produces the SAME
+//! Parser for the Basalt SQL dialect (docs/language.md). Produces the SAME
 //! `ast.Program` as the BSL parser — the planner, analyzer, pushdown, and
 //! executor are shared ("one plan"). Only the surface differs.
 //!
-//! Mapping highlights (see language.md):
+//! Mapping highlights (see docs/language.md):
 //!   CREATE ENDPOINT '/x'            -> KindDecl http (absent -> batch)
 //!   PARAM x INT DEFAULT 7           -> Param (referenced as $x)
 //!   CREATE CONNECTION c TYPE t ...  -> Connection (+ credential convention:

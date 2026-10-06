@@ -819,5 +819,5 @@ const fuzzParse_corpus = [_][]const u8{
 
 test "fuzz: file metadata parse survives arbitrary bytes" {
     try std.testing.fuzz({}, fuzzParse, .{ .corpus = &fuzzParse_corpus });
-    try @import("fuzzutil.zig").pound(fuzzParse, &fuzzParse_corpus);
+    try @import("../net/fuzzutil.zig").pound(fuzzParse, &fuzzParse_corpus);
 }

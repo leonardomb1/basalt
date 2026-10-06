@@ -1908,12 +1908,12 @@ fn numOrder(a: Value, b: Value) ?std.math.Order {
 
 // --- source ------------------------------------------------------------------
 
-const driver = @import("driver.zig");
+const driver = @import("../connect/driver.zig");
 const Batch = @import("../exec/batch.zig").Batch;
-const http_client = @import("http_client.zig");
-const objstore = @import("objstore.zig");
-const sftp = @import("sftp.zig");
-const smb = @import("smb.zig");
+const http_client = @import("../net/http_client.zig");
+const objstore = @import("../store/objstore.zig");
+const sftp = @import("../store/sftp.zig");
+const smb = @import("../store/smb.zig");
 
 /// Byte source a reader pulls from: a local file read on demand, or an already
 /// resident buffer.
@@ -3196,7 +3196,7 @@ const fuzzKernels_corpus = [_][]const u8{
 
 test "fuzz: page decode kernels survive arbitrary bytes" {
     try std.testing.fuzz({}, fuzzKernels, .{ .corpus = &fuzzKernels_corpus });
-    try @import("fuzzutil.zig").pound(fuzzKernels, &fuzzKernels_corpus);
+    try @import("../net/fuzzutil.zig").pound(fuzzKernels, &fuzzKernels_corpus);
 }
 
 test "BitReader: wide values at non-zero bit offsets keep their top bits" {

@@ -682,7 +682,7 @@ const fuzzDecompress_corpus = [_][]const u8{
 
 test "fuzz: decompressors survive arbitrary bytes" {
     try std.testing.fuzz({}, fuzzDecompress, .{ .corpus = &fuzzDecompress_corpus });
-    try @import("fuzzutil.zig").pound(fuzzDecompress, &fuzzDecompress_corpus);
+    try @import("../net/fuzzutil.zig").pound(fuzzDecompress, &fuzzDecompress_corpus);
 }
 
 test "snappy: chunked copies agree with a byte-at-a-time decode on random streams" {

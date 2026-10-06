@@ -9,11 +9,11 @@ const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const Value = @import("../exec/value.zig").Value;
-const driver = @import("driver.zig");
+const driver = @import("../connect/driver.zig");
 const sql = @import("sql.zig");
-const ntlm = @import("ntlm.zig");
-const krb5 = @import("krb5.zig");
-const spnego = @import("spnego.zig");
+const ntlm = @import("../net/ntlm.zig");
+const krb5 = @import("../net/krb5.zig");
+const spnego = @import("../net/spnego.zig");
 
 const PKT_PRELOGIN = 0x12;
 const PKT_LOGIN7 = 0x10;
@@ -597,7 +597,7 @@ const TlsShim = struct {
     rbuf: [shim_buf_len]u8 = undefined,
     wbuf: [shim_buf_len]u8 = undefined,
 
-    const shim_buf_len = @import("tls_client.zig").min_buffer_len;
+    const shim_buf_len = @import("../net/tls_client.zig").min_buffer_len;
     const reader_vtable = std.Io.Reader.VTable{ .stream = readStream };
     const writer_vtable = std.Io.Writer.VTable{ .drain = drainFn };
 
@@ -2029,5 +2029,5 @@ const fuzzCell_corpus = [_][]const u8{
 
 test "fuzz: row cell decode survives arbitrary bytes" {
     try std.testing.fuzz({}, fuzzCell, .{ .corpus = &fuzzCell_corpus });
-    try @import("fuzzutil.zig").pound(fuzzCell, &fuzzCell_corpus);
+    try @import("../net/fuzzutil.zig").pound(fuzzCell, &fuzzCell_corpus);
 }

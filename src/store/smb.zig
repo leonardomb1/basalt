@@ -17,9 +17,9 @@
 //! Not here: DFS referrals, oplocks and leases, multichannel.
 
 const std = @import("std");
-const ntlm = @import("ntlm.zig");
-const krb5 = @import("krb5.zig");
-const spnego = @import("spnego.zig");
+const ntlm = @import("../net/ntlm.zig");
+const krb5 = @import("../net/krb5.zig");
+const spnego = @import("../net/spnego.zig");
 
 pub const Error = error{
     SmbProtocol,

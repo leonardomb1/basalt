@@ -6,7 +6,7 @@ const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const op = @import("../exec/op.zig");
 const column = @import("../exec/column.zig");
-const csv = @import("../connect/csv.zig");
+const csv = @import("../format/csv.zig");
 const driver = @import("../connect/driver.zig");
 const Wal = @import("../connect/wal.zig").Wal;
 const parallel = @import("parallel.zig");
@@ -1961,7 +1961,7 @@ test "WITH (format = 'csv') reads a file whose extension says nothing" {
     try std.testing.expectEqualStrings("id\n1\n2\n", out);
 }
 
-const fx_zip = @embedFile("../connect/testdata/two_members.zip");
+const fx_zip = @embedFile("../format/testdata/two_members.zip");
 
 test "read a zip member end to end with the :: reference" {
     const alloc = std.testing.allocator;
@@ -3487,7 +3487,7 @@ test "an Excel workbook reads as a table: typed columns, a named sheet and range
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "f.xlsx", .data = @embedFile("../connect/testdata/openpyxl.xlsx") });
+    try tmp.dir.writeFile(.{ .sub_path = "f.xlsx", .data = @embedFile("../format/testdata/openpyxl.xlsx") });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
     const cases = [_]struct { q: []const u8, want: []const u8 }{
@@ -3965,7 +3965,7 @@ test "a projected SQL read asks for its columns, quoted per dialect; none means 
 /// Written by polars 1.44 with no ConvertedType on the temporal columns: `ts` is a
 /// naive microsecond timestamp, `ts_utc` a UTC nanosecond one, `t` a TIME. Two row
 /// groups of two rows, so statistics on the converted units get exercised too.
-const fx_logical = @embedFile("../connect/testdata/logical_types.parquet");
+const fx_logical = @embedFile("../format/testdata/logical_types.parquet");
 
 test "LogicalType-only parquet timestamps and times read back as wall-clock values" {
     const alloc = std.testing.allocator;
@@ -3999,7 +3999,7 @@ test "a parquet LIST column unnests through JSON_EACH, one row per element" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "l.parquet", .data = @embedFile("../connect/testdata/lists_v2.parquet") });
+    try tmp.dir.writeFile(.{ .sub_path = "l.parquet", .data = @embedFile("../format/testdata/lists_v2.parquet") });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
     const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
@@ -4023,7 +4023,7 @@ test "copying a parquet with nested columns keeps every one of them" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "src.parquet", .data = @embedFile("../connect/testdata/lists_v1.parquet") });
+    try tmp.dir.writeFile(.{ .sub_path = "src.parquet", .data = @embedFile("../format/testdata/lists_v1.parquet") });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
     const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
@@ -4117,7 +4117,7 @@ test "a database that closes the connection is a transient failure (exit 75), at
 }
 
 test "onWire names a closed or failed database socket as transient, and leaves the rest alone" {
-    const sql = @import("../connect/sql.zig");
+    const sql = @import("../db/sql.zig");
     try std.testing.expectEqual(error.ServerClosedConnection, sql.onWire(error.EndOfStream));
     try std.testing.expectEqual(error.ServerClosedConnection, sql.onWire(error.TlsConnectionTruncated));
     try std.testing.expectEqual(error.ConnectionIoFailed, sql.onWire(error.ReadFailed));

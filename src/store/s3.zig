@@ -16,7 +16,7 @@
 //! loop, the consumer-facing interface — lives in `objstore.zig`.
 
 const std = @import("std");
-const http_client = @import("http_client.zig");
+const http_client = @import("../net/http_client.zig");
 const objstore = @import("objstore.zig");
 
 pub const env_key_id = "AWS_ACCESS_KEY_ID";

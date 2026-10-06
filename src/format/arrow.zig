@@ -32,7 +32,7 @@ const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
 const Column = column.Column;
 const Batch = @import("../exec/batch.zig").Batch;
-const driver = @import("driver.zig");
+const driver = @import("../connect/driver.zig");
 const flatbuf = @import("flatbuf.zig");
 const rescaleTo = @import("../exec/eval.zig").rescaleTo;
 

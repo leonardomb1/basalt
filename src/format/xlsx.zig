@@ -24,7 +24,7 @@ const types = @import("../lang/types.zig");
 const Value = @import("../exec/value.zig").Value;
 const column = @import("../exec/column.zig");
 const Batch = @import("../exec/batch.zig").Batch;
-const driver = @import("driver.zig");
+const driver = @import("../connect/driver.zig");
 const zipsrc = @import("zipsrc.zig");
 const xml = @import("xml.zig");
 

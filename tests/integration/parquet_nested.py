@@ -1,6 +1,6 @@
 """Nested parquet columns against pyarrow's own reading of them.
 
-Usage: python it/parquet_nested.py <basalt> <scratch dir>
+Usage: python tests/integration/parquet_nested.py <basalt> <scratch dir>
 Random rows (seeded) with nulls at every level — lists of structs holding
 lists and structs, maps of lists, lists of lists of structs, a struct holding a
 list and a map — written in three page layouts. Every cell basalt returns must

@@ -5,13 +5,13 @@
 //! just a protocol client + a dialect.
 
 const std = @import("std");
-const TlsClient = @import("tls_client.zig");
+const TlsClient = @import("../net/tls_client.zig");
 const types = @import("../lang/types.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const Value = @import("../exec/value.zig").Value;
 const column = @import("../exec/column.zig");
 const eval = @import("../exec/eval.zig");
-const driver = @import("driver.zig");
+const driver = @import("../connect/driver.zig");
 const ast = @import("../lang/ast.zig");
 
 /// Rows are this many per streamed batch.

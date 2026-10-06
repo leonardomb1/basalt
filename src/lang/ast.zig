@@ -197,7 +197,7 @@ pub const BufferRef = struct { name: []const u8, dir: []const u8 = "" };
 
 /// `CREATE ENDPOINT ... ACCEPT BODY (schema) INTO BUFFER 'name' AT 'dir'
 /// SEGMENT n MB [RETAIN UNTIL LOADED | RETAIN n HOURS]` — the durable-buffer
-/// declaration (language.md §9). The endpoint acks 200 after fsync; the
+/// declaration (docs/language.md §9). The endpoint acks 200 after fsync; the
 /// pipeline drains the buffer asynchronously via `FROM BUFFER`.
 pub const BufferDecl = struct {
     name: []const u8,

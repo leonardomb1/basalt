@@ -7,7 +7,7 @@
 //! Replacing / Snowflake MERGE) owns exactly-once. See `runtime/parallel.zig`.
 
 const std = @import("std");
-const sql = @import("sql.zig");
+const sql = @import("../db/sql.zig");
 const types = @import("../lang/types.zig");
 const eval = @import("../exec/eval.zig");
 const Value = @import("../exec/value.zig").Value;
