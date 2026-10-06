@@ -34,6 +34,11 @@
 //! an extension basalt does not read is a plan-time error. Parquet cannot be read
 //! through a codec (it must seek), a compressed CSV or archive member is read
 //! serially, and archives are judged by their member's name.
+//!
+//! This file walks a program (`Ctx`) and holds the entry points and parameter
+//! substitution; `analyze/schema.zig` types each stage, `analyze/targets.zig` judges
+//! what a read or write reaches without connecting, and `analyze/render.zig` prints
+//! EXPLAIN.
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
@@ -54,6 +59,8 @@ const xlsx = @import("../format/xlsx.zig");
 const folder = @import("../connect/folder.zig");
 const registry = @import("../connect/registry.zig");
 const body_stmt_rule = @import("env.zig").body_stmt_rule;
+const analyzeCsv = @import("analyze/testing_util.zig").analyzeCsv;
+const expectAnalyzeErr = @import("analyze/testing_util.zig").expectAnalyzeErr;
 
 pub const Diag = struct {
     buf: [512]u8 = undefined,
@@ -68,7 +75,7 @@ pub const Diag = struct {
 
 pub const Error = error{ AnalyzeFailed, OutOfMemory };
 
-fn fail(diag: *Diag, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
+pub fn fail(diag: *Diag, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
     diag.msg = std.fmt.bufPrint(&diag.buf, fmt, args) catch "analysis error";
     diag.pos = null;
     diag.end = null;
@@ -76,7 +83,7 @@ fn fail(diag: *Diag, comptime fmt: []const u8, args: anytype) error{AnalyzeFaile
 }
 
 /// `fail`, underlining `span` when the offending text has one.
-fn failAt(diag: *Diag, span: ?ast.Span, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
+pub fn failAt(diag: *Diag, span: ?ast.Span, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
     const e = fail(diag, fmt, args);
     if (span) |s| {
         diag.pos = s.start;
@@ -125,13 +132,13 @@ pub fn substFilterParams(arena: std.mem.Allocator, stages: []const ast.Stage, pa
     return out orelse stages;
 }
 
-fn mk(arena: std.mem.Allocator, e: ast.Expr) Error!*const ast.Expr {
+pub fn mk(arena: std.mem.Allocator, e: ast.Expr) Error!*const ast.Expr {
     const p = try arena.create(ast.Expr);
     p.* = e;
     return p;
 }
 
-fn exprType(arena: std.mem.Allocator, in: types.Schema, e: *const ast.Expr, diag: *Diag) Error!types.Type {
+pub fn exprType(arena: std.mem.Allocator, in: types.Schema, e: *const ast.Expr, diag: *Diag) Error!types.Type {
     var ctx = eval.TypeCtx{ .schema = in, .arena = arena };
     return ctx.typeOf(e) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -139,289 +146,40 @@ fn exprType(arena: std.mem.Allocator, in: types.Schema, e: *const ast.Expr, diag
     };
 }
 
-pub const Col = struct {
-    name: []const u8,
-    ty: types.Type,
-    source: union(enum) { passthrough: usize, expr: *const ast.Expr },
-    rel: []const u8 = "",
-    base: []const u8 = "",
-};
-
-/// `b.x` is called `x` in the output, as in SQL, unless `a.x` is already there.
-pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast.SelectItem, params: *const ParamMap, diag: *Diag) Error![]Col {
-    var cols = std.array_list.Managed(Col).init(arena);
-    for (items) |item| switch (item) {
-        .star => for (in.fields, 0..) |f, idx| try cols.append(.{ .name = f.name, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base }),
-        .star_except => |names| for (in.fields, 0..) |f, idx| {
-            if (nameIn(names, f.name)) continue;
-            try cols.append(.{ .name = f.name, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base });
-        },
-        .star_rename => |renames| {
-            for (renames) |r| if (in.indexOf(r.from) == null)
-                return fail(diag, "unknown rename field `{s}`", .{r.from});
-            for (in.fields, 0..) |f, idx| {
-                const nm = renameTo(renames, f.name) orelse f.name;
-                for (in.fields[0..idx]) |g|
-                    if (std.mem.eql(u8, nm, renameTo(renames, g.name) orelse g.name))
-                        return fail(diag, "`* rename` produces duplicate column `{s}`", .{nm});
-                try cols.append(.{ .name = nm, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base });
-            }
-        },
-        .field => |q| {
-            const idx = in.resolve(q.parts) orelse return failAt(diag, q.span, "unknown field `{s}`", .{lastPart(q)});
-            var nm = lastPart(q);
-            for (cols.items) |c| if (std.mem.eql(u8, c.name, nm)) {
-                nm = in.fields[idx].name;
-                break;
-            };
-            try cols.append(.{ .name = nm, .ty = in.fields[idx].ty, .source = .{ .passthrough = idx }, .rel = in.fields[idx].rel, .base = in.fields[idx].base });
-        },
-        .computed => |c| {
-            const e = try substExpr(arena, c.expr, params);
-            const ty = try exprType(arena, in, e, diag);
-            try cols.append(.{ .name = c.name, .ty = ty, .source = .{ .expr = e } });
-        },
-    };
-    return cols.toOwnedSlice();
-}
-
-pub fn schemaOfCols(arena: std.mem.Allocator, cols: []const Col) Error!types.Schema {
-    const fields = try arena.alloc(types.Schema.Field, cols.len);
-    for (cols, fields) |c, *f| f.* = .{ .name = c.name, .ty = c.ty, .rel = c.rel, .base = c.base };
-    return .{ .fields = fields };
-}
-
-pub fn checkFilter(arena: std.mem.Allocator, in: types.Schema, pred0: *const ast.Expr, params: *const ParamMap, diag: *Diag) Error!*const ast.Expr {
-    const pred = try substExpr(arena, pred0, params);
-    const t = try exprType(arena, in, pred, diag);
-    if (!(t.kind == .bool or t.unknown)) return fail(diag, "filter predicate must be bool", .{});
-    return pred;
-}
-
-pub fn fieldIndices(arena: std.mem.Allocator, in: types.Schema, names: []const ast.QualName, diag: *Diag) Error![]usize {
-    const idxs = try arena.alloc(usize, names.len);
-    for (names, 0..) |q, i| idxs[i] = in.resolve(q.parts) orelse return failAt(diag, q.span, "unknown field `{s}`", .{lastPart(q)});
-    return idxs;
-}
-
-pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Type, name: []const u8, distinct: bool = false };
-pub const AggregatePlan = struct { by: []usize, aggs: []Agg, schema: types.Schema };
-
-pub fn aggregatePlan(arena: std.mem.Allocator, in: types.Schema, ag: ast.Aggregate, params: *const ParamMap, diag: *Diag) Error!AggregatePlan {
-    var fields = std.array_list.Managed(types.Schema.Field).init(arena);
-    const by = try arena.alloc(usize, ag.by.len);
-    for (ag.by, 0..) |q, i| {
-        const idx = in.resolve(q.parts) orelse return fail(diag, "unknown group field `{s}`", .{lastPart(q)});
-        by[i] = idx;
-        try fields.append(.{ .name = lastPart(q), .ty = in.fields[idx].ty, .rel = in.fields[idx].rel, .base = in.fields[idx].base });
-    }
-    const aggs = try arena.alloc(Agg, ag.aggs.len);
-    for (ag.aggs, 0..) |item, i| {
-        const arg: ?*const ast.Expr = if (item.arg) |a| try substExpr(arena, a, params) else null;
-        const ty = try aggResultType(arena, item.func, arg, in, diag);
-        aggs[i] = .{ .func = item.func, .arg = arg, .ty = ty, .name = item.name, .distinct = item.distinct };
-        try fields.append(.{ .name = item.name, .ty = ty });
-    }
-    return .{ .by = by, .aggs = aggs, .schema = .{ .fields = try fields.toOwnedSlice() } };
-}
-
-/// Refuses `SUM('Kick-Off')`: single quotes make a string, which once summed to 0. A
-/// decimal sum stays decimal; typed as int it once reported the unscaled integer.
-fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const ast.Expr, in: types.Schema, diag: *Diag) Error!types.Type {
-    const sp = aggregates.spec(func);
-    if (sp.arg == .star_or_any) return types.Type.init(.int);
-    const a = arg orelse return fail(diag, "this aggregate requires an argument", .{});
-    if (sp.arg == .numeric and a.* == .str_lit)
-        return fail(diag, "`{s}('{s}')` reads the text '{s}', not a column — a name with spaces or symbols takes double quotes: {s}(\"{s}\")", .{ sp.names[0], a.str_lit, a.str_lit, sp.names[0], a.str_lit });
-    const at = try exprType(arena, in, a, diag);
-    if (!sp.arg.accepts(at))
-        return fail(diag, "`{s}` needs a {s} argument, got {s}", .{ sp.names[0], sp.arg.word(), try at.name(arena) });
-    return switch (sp.result) {
-        .count => types.Type.init(.int),
-        .sum => switch (at.kind) {
-            .float => types.Type.init(.float).withNull(true),
-            .decimal => at.withNull(true),
-            else => types.Type.init(.int).withNull(true),
-        },
-        .float => types.Type.init(.float).withNull(true),
-        .same => at.withNull(true),
-        .bool => types.Type.init(.bool).withNull(true),
-        .int => types.Type.init(.int).withNull(true),
-    };
-}
-
-/// Ranking is a non-null int; MIN/MAX, LAG and LEAD keep the column's type; AVG is a
-/// float; SUM keeps the family. With an argument it is nullable (all-null peers, first LAG).
-pub fn windowFuncType(kind: ast.WinKind, src: types.Type) types.Type {
-    return switch (kind) {
-        .row_number, .rank, .dense_rank, .count => types.Type.init(.int),
-        .min, .max, .lag, .lead => src.asNullable(),
-        .avg => types.Type.init(.float).asNullable(),
-        .sum => (if (src.kind == .int) types.Type.init(.int) else types.Type.init(.float)).asNullable(),
-    };
-}
-
-/// The input then one column per function, the planner's rule, so `EXPLAIN` shows
-/// the schema past a window instead of `unresolved`.
-pub fn windowSchema(arena: std.mem.Allocator, in: types.Schema, wd: ast.Window, diag: *Diag) Error!types.Schema {
-    _ = try fieldIndices(arena, in, wd.partition_by, diag);
-    const oqs = try arena.alloc(ast.QualName, wd.order_by.len);
-    for (wd.order_by, oqs) |sk, *q| q.* = sk.field;
-    _ = try fieldIndices(arena, in, oqs, diag);
-    const fields = try arena.alloc(types.Schema.Field, in.fields.len + wd.funcs.len);
-    @memcpy(fields[0..in.fields.len], in.fields);
-    for (wd.funcs, 0..) |f, i| {
-        var src = types.Type.init(.int);
-        if (f.arg) |q| src = in.fields[(try fieldIndices(arena, in, &[_]ast.QualName{q}, diag))[0]].ty;
-        fields[in.fields.len + i] = .{ .name = f.out, .ty = windowFuncType(f.kind, src) };
-    }
-    return .{ .fields = fields };
-}
-
-pub const ExplodePlan = struct { idx: usize, schema: types.Schema };
-
-pub fn explodePlan(arena: std.mem.Allocator, in: types.Schema, ex: ast.Explode, diag: *Diag) Error!ExplodePlan {
-    const idx = in.indexOf(ex.field) orelse return fail(diag, "unknown field `{s}`", .{ex.field});
-    const fty = in.fields[idx].ty;
-    if (!(fty.kind == .string or fty.kind == .bytes))
-        return fail(diag, "explode needs a string column (it splits a delimited value or a JSON array)", .{});
-    const fields = try arena.alloc(types.Schema.Field, in.fields.len);
-    for (in.fields, fields, 0..) |f, *out, i| {
-        const ty = if (ex.json) types.Type.init(.string).asNullable() else types.Type.init(.string);
-        out.* = if (i == idx) .{ .name = ex.as_name orelse f.name, .ty = ty } else f;
-    }
-    return .{ .idx = idx, .schema = .{ .fields = fields } };
-}
-
-pub const JoinPlan = struct {
-    lks: []const usize,
-    rks: []const usize,
-    schema: types.Schema,
-    emit_right: bool,
-    right_nullable: bool,
-    left_nullable: bool,
-};
-
-/// The parser orients by alias prefix, which unqualified names lack, so the side is
-/// decided by where each name resolves. Both readings resolving to different columns
-/// is ambiguous; a left key may carry an earlier join's alias.
-fn joinPair(left: types.Schema, right: types.Schema, lq: ast.QualName, rq: ast.QualName, diag: *Diag) Error![2]usize {
-    const ln = lastPart(lq);
-    const rn = lastPart(rq);
-    const l_in_l = left.resolve(lq.parts);
-    const l_in_r = right.indexOf(ln);
-    const r_in_l = left.resolve(rq.parts);
-    const r_in_r = right.indexOf(rn);
-
-    const as_written = l_in_l != null and r_in_r != null;
-    const flipped = r_in_l != null and l_in_r != null;
-    if (as_written and flipped and !std.mem.eql(u8, ln, rn))
-        return fail(diag, "join key `{s}` is ambiguous — `{s}` and `{s}` both exist on both sides; qualify them", .{ ln, ln, rn });
-    if (as_written) return .{ l_in_l.?, r_in_r.? };
-    if (flipped) return .{ r_in_l.?, l_in_r.? };
-    if (l_in_l == null and l_in_r == null) return fail(diag, "unknown left join key `{s}`", .{ln});
-    if (r_in_r == null and r_in_l == null) return fail(diag, "unknown right join key `{s}`", .{rn});
-    if (l_in_l != null and r_in_l != null) return fail(diag, "join key `{s}` is not a column of the joined side", .{rn});
-    return fail(diag, "join key `{s}` is not a column of the joined side", .{ln});
-}
-
-/// The `_r` suffix keeps bumping until free: two output fields with one name make the
-/// second unreachable, since every lookup goes through `Schema.indexOf`.
-pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schema, j: ast.Join, diag: *Diag) Error!JoinPlan {
-    if (j.left_keys.len != j.right_keys.len) return fail(diag, "join has mismatched key lists", .{});
-    if (j.kind != .cross and j.left_keys.len == 0) return fail(diag, "join needs at least one `ON <column> = <column>` pair", .{});
-
-    const lks = try arena.alloc(usize, j.left_keys.len);
-    const rks = try arena.alloc(usize, j.right_keys.len);
-    for (j.left_keys, j.right_keys, lks, rks) |lq, rq, *lo, *ro| {
-        const pair = try joinPair(left, right, lq, rq, diag);
-        lo.* = pair[0];
-        ro.* = pair[1];
-        const lt = left.fields[pair[0]].ty;
-        const rt = right.fields[pair[1]].ty;
-        if (types.Type.unify(lt, rt) == null)
-            return fail(diag, "join keys `{s}` ({s}) and `{s}` ({s}) are not comparable — make them one type in the ON: `CAST(x AS string) = y`", .{ left.fields[pair[0]].name, @tagName(lt.kind), right.fields[pair[1]].name, @tagName(rt.kind) });
-    }
-
-    const emit_right = (j.kind != .semi and j.kind != .anti);
-    const right_nullable = (j.kind == .left or j.kind == .full);
-    const left_nullable = (j.kind == .right or j.kind == .full);
-
-    var fields = std.array_list.Managed(types.Schema.Field).init(arena);
-    for (left.fields) |f| try fields.append(.{ .name = f.name, .ty = if (left_nullable) f.ty.asNullable() else f.ty, .rel = f.rel, .base = f.base });
-    if (emit_right) for (right.fields) |f| {
-        var name = f.name;
-        var n: usize = 0;
-        while ((types.Schema{ .fields = fields.items }).indexOf(name) != null) : (n += 1) {
-            name = if (n == 0)
-                try std.fmt.allocPrint(arena, "{s}_r", .{f.name})
-            else
-                try std.fmt.allocPrint(arena, "{s}_r{d}", .{ f.name, n + 1 });
-        }
-        try fields.append(.{
-            .name = name,
-            .ty = if (right_nullable) f.ty.asNullable() else f.ty,
-            .rel = if (j.alias.len != 0) j.alias else j.binding,
-            .base = f.name,
-        });
-    };
-    return .{
-        .lks = lks,
-        .rks = rks,
-        .schema = .{ .fields = try fields.toOwnedSlice() },
-        .emit_right = emit_right,
-        .right_nullable = right_nullable,
-        .left_nullable = left_nullable,
-    };
-}
-
-fn nameIn(names: []const []const u8, n: []const u8) bool {
-    for (names) |x| if (std.mem.eql(u8, x, n)) return true;
-    return false;
-}
-
-fn renameTo(renames: []const ast.SelectItem.Rename, n: []const u8) ?[]const u8 {
-    for (renames) |r| if (std.mem.eql(u8, r.from, n)) return r.to;
-    return null;
-}
-
-/// Body-scoped variables (loop vars, statement-fn params) bound to typed
-/// placeholders, so `$var` used as a value is lenient instead of an unknown field.
-fn bindBodyVars(arena: std.mem.Allocator, stmts: []const ast.Stmt, map: *ParamMap) Error!void {
-    for (stmts) |s| switch (s) {
-        .for_each => |fe| {
-            for (fe.var_names, 0..) |vn, i| {
-                if (map.contains(vn)) continue;
-                const ty: ?types.Type = if (i < fe.var_types.len) fe.var_types[i] else null;
-                try map.put(vn, if (ty) |t| try typedZero(arena, t) else try mk(arena, .null_lit));
-            }
-            try bindBodyVars(arena, fe.body, map);
-        },
-        .func => |fd| if (fd.body == .stmts) {
-            for (fd.params) |p| {
-                if (map.contains(p.name)) continue;
-                try map.put(p.name, if (p.ty) |t| try typedZero(arena, t) else try mk(arena, .null_lit));
-            }
-            try bindBodyVars(arena, fd.body.stmts, map);
-        },
-        .match => |m| for (m.arms) |arm| try bindBodyVars(arena, arm.body, map),
-        else => {},
-    };
-}
-
-/// A literal of the right type (value irrelevant) to stand in for a param during
-/// type-flow when it has no declared default.
-fn typedZero(arena: std.mem.Allocator, ty: types.Type) Error!*const ast.Expr {
-    const e = try arena.create(ast.Expr);
-    e.* = switch (ty.kind) {
-        .int => .{ .int_lit = 0 },
-        .float => .{ .float_lit = 0 },
-        .string, .bytes => .{ .str_lit = "" },
-        .bool => .{ .bool_lit = false },
-        else => .null_lit,
-    };
-    return e;
-}
+pub const Col = @import("analyze/schema.zig").Col;
+pub const selectCols = @import("analyze/schema.zig").selectCols;
+pub const schemaOfCols = @import("analyze/schema.zig").schemaOfCols;
+pub const checkFilter = @import("analyze/schema.zig").checkFilter;
+pub const fieldIndices = @import("analyze/schema.zig").fieldIndices;
+pub const Agg = @import("analyze/schema.zig").Agg;
+pub const AggregatePlan = @import("analyze/schema.zig").AggregatePlan;
+pub const aggregatePlan = @import("analyze/schema.zig").aggregatePlan;
+const aggResultType = @import("analyze/schema.zig").aggResultType;
+pub const windowFuncType = @import("analyze/schema.zig").windowFuncType;
+pub const windowSchema = @import("analyze/schema.zig").windowSchema;
+pub const ExplodePlan = @import("analyze/schema.zig").ExplodePlan;
+pub const explodePlan = @import("analyze/schema.zig").explodePlan;
+pub const JoinPlan = @import("analyze/schema.zig").JoinPlan;
+pub const joinPlan = @import("analyze/schema.zig").joinPlan;
+const bindBodyVars = @import("analyze/schema.zig").bindBodyVars;
+const typedZero = @import("analyze/schema.zig").typedZero;
+pub const render = @import("analyze/render.zig").render;
+pub const appendUnsupported = @import("analyze/render.zig").appendUnsupported;
+const sinkKind = @import("analyze/render.zig").sinkKind;
+pub const FileFormat = @import("analyze/targets.zig").FileFormat;
+pub const readFormat = @import("analyze/targets.zig").readFormat;
+const hintText = @import("analyze/targets.zig").hintText;
+pub const dialectFromHints = @import("analyze/targets.zig").dialectFromHints;
+pub const formatFromHints = @import("analyze/targets.zig").formatFromHints;
+pub const xlsxOptions = @import("analyze/targets.zig").xlsxOptions;
+const formatOfPath = @import("analyze/targets.zig").formatOfPath;
+pub const formatLabel = @import("analyze/targets.zig").formatLabel;
+pub const unwritableTarget = @import("analyze/targets.zig").unwritableTarget;
+pub const unreadableTarget = @import("analyze/targets.zig").unreadableTarget;
+pub const archiveProblem = @import("analyze/targets.zig").archiveProblem;
+pub const laneHints = @import("analyze/targets.zig").laneHints;
+const morselParallelRead = @import("analyze/targets.zig").morselParallelRead;
+const offlineSchema = @import("analyze/targets.zig").offlineSchema;
 
 pub const Source = struct {
     connector: []const u8,
@@ -1186,114 +944,6 @@ const Ctx = struct {
     }
 };
 
-/// The plan as a tree, root first and source deepest, as `EXPLAIN ANALYZE` prints it.
-/// A split or morsel fan-out prints as a candidate: only the source or file can settle it.
-pub fn render(plan: Plan, w: anytype) !void {
-    for (plan.outputs) |o| {
-        if (std.mem.eql(u8, plan.kind, "batch")) {
-            try w.writeAll("plan\n");
-        } else {
-            try w.print("plan ({s})\n", .{plan.kind});
-        }
-
-        var depth: usize = 1;
-        try indent(w, depth);
-        if (o.sink.target.len > 0) {
-            try w.print("write  {s}  {s} ({s})\n", .{ sinkKind(o.sink), o.sink.target, o.sink.mode });
-        } else {
-            try w.print("write  {s}  ({s})\n", .{ sinkKind(o.sink), o.sink.mode });
-        }
-
-        var i = o.stages.len;
-        while (i > 0) {
-            i -= 1;
-            depth += 1;
-            const st = o.stages[i];
-            try indent(w, depth);
-            if (st.detail.len > 0) {
-                try w.print("{s}  {s}\n", .{ st.kind, st.detail });
-            } else {
-                try w.print("{s}\n", .{st.kind});
-            }
-            try printSchema(w, depth + 1, st.out_schema);
-            if (st.right_scan) |rs| {
-                try indent(w, depth + 1);
-                try w.print("right  scan  {s}\n", .{rs});
-                if (st.right_pushdown.len > 0) {
-                    try indent(w, depth + 2);
-                    try w.print("pushdown: {s}\n", .{st.right_pushdown});
-                }
-            }
-        }
-
-        depth += 1;
-        try indent(w, depth);
-        try w.print("scan  {s}  {s}\n", .{ sinkKind(o.source), o.source.detail });
-        if (o.source.pushdown.len > 0) {
-            try indent(w, depth + 1);
-            try w.print("pushdown: {s}\n", .{o.source.pushdown});
-        }
-        if (o.source.schema == null) {
-            try indent(w, depth + 1);
-            try w.writeAll("schema: unresolved\n");
-        }
-        try printSchema(w, depth + 1, o.source.schema);
-
-        try w.writeAll("  physical: ");
-        if (o.physical.splittable) {
-            try w.writeAll("split-parallel candidate");
-            if (o.physical.sink_parallel) try w.writeAll(", per-lane sink");
-        } else if (o.physical.morsel_parallel) {
-            try w.writeAll("morsel-parallel candidate");
-            if (o.physical.has_breaker) try w.writeAll(" (per-lane partials, combined)");
-        } else {
-            try w.writeAll("serial");
-            if (o.physical.top_n) |n| {
-                if (o.physical.has_breaker) try w.print(" (top-N pushed, sorts at most {d} rows)", .{n}) else try w.print(" (limit pushed, at most {d} rows arrive)", .{n});
-            } else if (o.physical.has_breaker) try w.writeAll(" (has breaker, materializes)");
-        }
-        try w.writeAll("\n");
-    }
-}
-
-/// Why `APPEND` cannot be honoured for a file target, or null: a parquet footer is
-/// written last and a block blob is committed whole. Shared with the runtime planner.
-pub fn appendUnsupported(target: []const u8) ?[]const u8 {
-    if (azure.isUrl(target) or s3.isUrl(target)) return "an object-store blob is replaced on write, never extended";
-    if (pqwrite.Writer.isPath(target)) return "a parquet file's footer indexes every row group and is written last, so appending means rewriting the file";
-    if (arrowread.isPath(target)) return "an Arrow IPC file's footer indexes every batch and is written last, so appending means rewriting the file";
-    return null;
-}
-
-/// Every file sink runs on the `csv` connector, so the format is named from the target.
-fn sinkKind(node: anytype) []const u8 {
-    const path = if (@hasField(@TypeOf(node), "target")) node.target else node.detail;
-    if (std.mem.eql(u8, node.connector, "csv")) {
-        if (pqwrite.Writer.isPath(path)) return "parquet";
-        if (arrowread.isPath(path)) return "arrow";
-        if (xlsx.isPath(path)) return "xlsx";
-    }
-    return node.connector;
-}
-
-fn indent(w: anytype, depth: usize) !void {
-    var n: usize = 0;
-    while (n < depth) : (n += 1) try w.writeAll("  ");
-}
-
-/// Printed once, at the scan that could not resolve it, and labelled, since a bare
-/// column list at a child's depth reads like another operator.
-fn printSchema(w: anytype, depth: usize, schema: ?types.Schema) !void {
-    const s = schema orelse return;
-    try indent(w, depth);
-    try w.writeAll("schema: ");
-    for (s.fields, 0..) |f, i| {
-        if (i > 0) try w.writeAll("  ");
-        try w.print("{s}:{s}{s}", .{ f.name, @tagName(f.ty.kind), if (f.ty.nullable) "?" else "" });
-    }
-    try w.writeAll("\n");
-}
-
 fn isBuiltinSource(connector: []const u8) bool {
     const c = registry.Connector.parse(connector) orelse return false;
     return c.isBuiltinSource();
@@ -1339,274 +989,13 @@ fn splittableRead(node: ast.Stage.Node) bool {
     };
 }
 
-pub const FileFormat = enum {
-    csv,
-    parquet,
-    arrow,
-    xlsx,
-};
-
-/// The named format, else the extension's, else CSV. The one place the CSV fast paths
-/// ask, so a binary format is never memory-mapped and parsed as text.
-pub fn readFormat(path: []const u8, explicit: ?FileFormat) FileFormat {
-    return explicit orelse formatOfPath(path) orelse .csv;
-}
-
-fn hintText(hints: []const ast.Hint, key: []const u8) ?[]const u8 {
-    for (hints) |h| {
-        if (!std.mem.eql(u8, h.key, key)) continue;
-        return switch (h.value) {
-            .str => |s| s,
-            .ident => |s| s,
-            else => null,
-        };
-    }
-    return null;
-}
-
-/// Validated here, not at the reader, so `check` rejects a typo before anything opens.
-/// The delimiter is one byte; a tab may be spelled out, since SQL's `'\t'` is no escape.
-pub fn dialectFromHints(hints: []const ast.Hint, diag: *Diag) Error!csv.Dialect {
-    var d = csv.Dialect{};
-    if (hintText(hints, "delimiter") orelse hintText(hints, "delim")) |s| {
-        const one: ?u8 = if (s.len == 1)
-            s[0]
-        else if (std.mem.eql(u8, s, "\\t") or std.mem.eql(u8, s, "tab"))
-            '\t'
-        else
-            null;
-        d.delim = one orelse return fail(diag, "delimiter must be a single character (or `tab`), got `{s}`", .{s});
-        if (d.delim == '"' or d.delim == '\n' or d.delim == '\r')
-            return fail(diag, "delimiter cannot be a quote or a newline", .{});
-    }
-    if (hintText(hints, "encoding")) |s| {
-        d.encoding = csv.Encoding.parse(s) orelse
-            return fail(diag, "unknown encoding `{s}` (utf8, latin1 / iso-8859-1, cp1252 / windows-1252)", .{s});
-    }
-    return d;
-}
-
-pub fn formatFromHints(hints: []const ast.Hint, diag: *Diag) Error!?FileFormat {
-    const s = hintText(hints, "format") orelse return null;
-    if (std.ascii.eqlIgnoreCase(s, "csv")) return .csv;
-    if (std.ascii.eqlIgnoreCase(s, "parquet")) return .parquet;
-    inline for (.{ "arrow", "ipc", "feather" }) |n| if (std.ascii.eqlIgnoreCase(s, n)) return .arrow;
-    inline for (.{ "xlsx", "excel" }) |n| if (std.ascii.eqlIgnoreCase(s, n)) return .xlsx;
-    return fail(diag, "unknown format `{s}` (csv, parquet, arrow, xlsx)", .{s});
-}
-
-/// Validated here so `check` turns away a malformed range before a run.
-pub fn xlsxOptions(hints: []const ast.Hint, diag: *Diag) Error!xlsx.Options {
-    var o = xlsx.Options{};
-    o.sheet = hintText(hints, "sheet");
-    if (hintText(hints, "range")) |r| o.range = xlsx.parseRange(r) orelse
-        return fail(diag, "`range = '{s}'` is not a cell range like `A1:F100`, `B3` or `B3:F`", .{r});
-    for (hints) |h| {
-        if (!std.mem.eql(u8, h.key, "header")) continue;
-        o.header = switch (h.value) {
-            .flag => true,
-            .int => |n| n != 0,
-            .str, .ident => |s| if (std.ascii.eqlIgnoreCase(s, "true")) true else if (std.ascii.eqlIgnoreCase(s, "false")) false else return fail(diag, "`header` is true or false, not `{s}`", .{s}),
-        };
-    }
-    return o;
-}
-
-/// `csv.dataName` walks the chain first, so `orders.csv.gz` and `inf.zip :: x.csv`
-/// both answer `.csv`.
-fn formatOfPath(path: []const u8) ?FileFormat {
-    const bare = csv.dataName(path);
-    if (pqwrite.Writer.isPath(bare)) return .parquet;
-    if (arrowread.isPath(bare)) return .arrow;
-    if (xlsx.isPath(bare)) return .xlsx;
-    if (std.ascii.endsWithIgnoreCase(bare, ".csv")) return .csv;
-    return null;
-}
-
-/// The format actually resolved, not the connector: every bare path is `csv`, which
-/// once labelled parquet scans as csv. A malformed hint falls back to the extension.
-pub fn formatLabel(path: []const u8, hints: []const ast.Hint) []const u8 {
-    var d = Diag{};
-    const explicit = formatFromHints(hints, &d) catch null;
-    return @tagName(explicit orelse formatOfPath(path) orelse .csv);
-}
-
-/// Why `path` cannot be written beyond `unreadableTarget`; a CSV is gzipped for a
-/// `.gz` name, nothing else is.
-pub fn unwritableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
-    const codec = csv.splitCodec(path).codec;
-    if (codec == .none) return null;
-    const fmt = explicit orelse formatOfPath(path) orelse .csv;
-    if (fmt != .csv) return "Parquet and Arrow compress their own pages, so they are written without a `.gz`/`.zst` suffix";
-    if (codec == .zstd) return "basalt compresses CSV output as gzip; name it `.csv.gz`, as zstd output is not supported";
-    return null;
-}
-
-/// Why `path` cannot be read or written as a table, or null. A trailing `/` is a folder
-/// and an archive is `archiveProblem`'s to judge.
-pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
-    if (std.mem.endsWith(u8, path, "/")) return null;
-
-    if (csv.splitArchive(path) != null) return null;
-
-    const fmt = explicit orelse formatOfPath(path);
-    if (csv.splitCodec(path).codec != .none and fmt == .parquet)
-        return "parquet needs random access, so it cannot be read through compression; decompress it first";
-    if (fmt == .xlsx and csv.splitCodec(path).codec != .none)
-        return "an Excel workbook is a zip archive already, so it is read uncompressed; decompress it first";
-    if (fmt == .arrow) {
-        if (csv.splitCodec(path).codec != .none)
-            return "an Arrow IPC file is read memory-mapped, so it cannot be read through compression; decompress it first (IPC compresses its own buffers)";
-        if (std.mem.indexOf(u8, path, "://") != null)
-            return "Arrow IPC is read from a local file; fetch it first";
-    }
-
-    if (explicit != null) return null;
-    if (fmt != null) return null;
-    return "basalt handles `.csv`, `.parquet`, Arrow IPC (`.arrow`, `.feather`, `.ipc`, `.arrows`) and Excel (`.xlsx`, read only), a CSV optionally `.gz`/`.zst` compressed or inside a `.zip`; name the format with `WITH (format = 'csv')` if the extension differs";
-}
-
-/// Opens the archive and stays quiet when it cannot (data may not be fetched yet), so
-/// a `.json` member is refused like a `.json` file. A remote one is opened only when
-/// `online`.
-pub fn archiveProblem(arena: std.mem.Allocator, path: []const u8, explicit: ?FileFormat, online: bool) ?[]const u8 {
-    const ar = csv.splitArchive(path) orelse return null;
-    if (!online and csv.CsvReader.isUrl(ar.archive)) {
-        const m = ar.member orelse return null;
-        return memberProblem(arena, m, explicit);
-    }
-
-    const members = zipsrc.names(arena, ar.archive) catch return null;
-    if (members.len == 0) return "the archive holds no files";
-
-    const chosen = if (ar.member) |want| blk: {
-        for (members) |m| if (std.mem.eql(u8, m, want)) break :blk m;
-        return std.fmt.allocPrint(arena, "no file `{s}` in the archive ({s})", .{ want, joinNames(arena, members) }) catch null;
-    } else if (members.len > 1)
-        return std.fmt.allocPrint(arena, "the archive holds {d} files; name one with `:: <name>` ({s})", .{ members.len, joinNames(arena, members) }) catch null
-    else
-        members[0];
-
-    return memberProblem(arena, chosen, explicit);
-}
-
-fn memberProblem(arena: std.mem.Allocator, chosen: []const u8, explicit: ?FileFormat) ?[]const u8 {
-    if (explicit == null and formatOfPath(chosen) == null)
-        return std.fmt.allocPrint(arena, "`{s}` inside it is not a `.csv` or `.parquet`; name the format with `WITH (format = 'csv')`", .{chosen}) catch null;
-    if ((explicit orelse formatOfPath(chosen)) == .parquet)
-        return "parquet needs random access, so it cannot be read out of an archive; extract it first";
-    if ((explicit orelse formatOfPath(chosen)) == .arrow)
-        return "an Arrow IPC file is read memory-mapped, so it cannot be read out of an archive; extract it first";
-    if ((explicit orelse formatOfPath(chosen)) == .xlsx)
-        return "an Excel workbook is itself a zip archive, so it cannot be read out of another; extract it first";
-    return null;
-}
-
-fn joinNames(arena: std.mem.Allocator, items: []const []const u8) []const u8 {
-    var out: []const u8 = "";
-    for (items, 0..) |m, i| {
-        if (i == 3) return std.fmt.allocPrint(arena, "{s}, …", .{out}) catch out;
-        out = std.fmt.allocPrint(arena, "{s}{s}{s}", .{ out, if (i == 0) "" else ", ", m }) catch return out;
-    }
-    return out;
-}
-
-/// Whether a file read's hints still let it fan out: a CSV dialect, or a `format`
-/// agreeing with the extension. `lanes.laneEligible` and EXPLAIN both ask this.
-pub fn laneHints(st: ast.Stage) bool {
-    for (st.hints) |h| {
-        if (std.mem.eql(u8, h.key, "delimiter") or std.mem.eql(u8, h.key, "delim") or std.mem.eql(u8, h.key, "encoding")) continue;
-        if (std.mem.eql(u8, h.key, "format")) {
-            if (st.node != .read or st.node.read.form != .path) return false;
-            var d = Diag{};
-            const f = (formatFromHints(st.hints, &d) catch return false) orelse return false;
-            if (f != readFormat(st.node.read.form.path, null)) return false;
-            continue;
-        }
-        return false;
-    }
-    return true;
-}
-
-/// A parquet is cut into row groups anywhere; a CSV into byte ranges only locally. A
-/// compressed stream or archive member has no offset-to-row mapping, matching
-/// `MappedCsv.open`'s `NotMappable`; Arrow and workbooks read serially.
-fn morselParallelRead(connector: []const u8, node: ast.Stage.Node) bool {
-    if (!std.mem.eql(u8, connector, "csv")) return false;
-    const path = switch (node) {
-        .read => |rd| switch (rd.form) {
-            .path => |p| p,
-            else => return false,
-        },
-        else => return false,
-    };
-    if (csv.splitCodec(path).codec != .none or csv.splitArchive(path) != null) return false;
-    if (pqwrite.Writer.isPath(path)) return true;
-    if (arrowread.isPath(path)) return false;
-    if (xlsx.isPath(path)) return false;
-    return std.mem.indexOf(u8, path, "://") == null;
-}
-
-/// A local CSV header, parquet footer, Parquet folder's first file or workbook's
-/// first pass, as the run reads them; everything else stays unresolved.
-fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.Hint) ?types.Schema {
-    if (std.mem.eql(u8, rd.connector, "unit")) return .{ .fields = &.{} };
-    if (std.mem.eql(u8, rd.connector, "range")) {
-        const fields = arena.alloc(types.Schema.Field, 1) catch return null;
-        fields[0] = .{ .name = "range", .ty = .{ .kind = .int } };
-        return .{ .fields = fields };
-    }
-    if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
-        if (csv.CsvReader.isUrl(rd.form.path)) return null;
-        if (folder.isFolder(rd.form.path)) {
-            var fdiag = Diag{};
-            const explicit = formatFromHints(hints, &fdiag) catch return null;
-            if (explicit != null and explicit.? != .parquet) return null;
-            const all = folder.list(arena, rd.form.path) catch return null;
-            if (explicit == null and !std.meta.eql(folder.kindOf(all), folder.Verdict{ .kind = .parquet })) return null;
-            const files = folder.only(arena, all, .parquet) catch return null;
-            if (files.len == 0) return null;
-            const pf = pqdecode.Folder.open(arena, rd.form.path, files, null) catch return null;
-            defer pf.close();
-            return pf.schema;
-        }
-        if (csv.splitCodec(rd.form.path).codec == .none and csv.splitArchive(rd.form.path) == null and
-            pqdecode.Reader.isPath(rd.form.path))
-        {
-            const pr = pqdecode.Reader.open(arena, rd.form.path) catch return null;
-            return pr.schema;
-        }
-        var fdiag = Diag{};
-        const explicit = formatFromHints(hints, &fdiag) catch return null;
-        if (readFormat(rd.form.path, explicit) == .arrow) {
-            const ar = arrowread.Reader.open(arena, rd.form.path) catch return null;
-            defer ar.close();
-            return ar.schema;
-        }
-        if (readFormat(rd.form.path, explicit) == .xlsx) {
-            var odiag = Diag{};
-            const opts = xlsxOptions(hints, &odiag) catch return null;
-            const xr = xlsx.Reader.open(arena, arena, rd.form.path, opts) catch return null;
-            defer xr.close();
-            return xr.schema;
-        }
-        var hdiag = Diag{};
-        const d = dialectFromHints(hints, &hdiag) catch return null;
-        const reader = csv.CsvReader.open(arena, rd.form.path, d) catch return null;
-        const schema = reader.schema;
-        reader.close();
-        return schema;
-    }
-    return null;
-}
-
-fn lastPart(q: ast.QualName) []const u8 {
+pub fn lastPart(q: ast.QualName) []const u8 {
     return q.parts[q.parts.len - 1];
 }
 
 const parser = @import("../lang/sql_parser.zig");
 
-fn parse(a: std.mem.Allocator, src: []const u8) !ast.Program {
+pub fn parse(a: std.mem.Allocator, src: []const u8) !ast.Program {
     var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     return parser.parseSource(a, src, &pd);
 }
@@ -1642,52 +1031,6 @@ test "analyze a CSV map pipeline: structure, offline schema, physical" {
     try std.testing.expect(!o.physical.has_breaker);
     try std.testing.expect(!o.physical.splittable);
     try std.testing.expect(o.physical.morsel_parallel);
-}
-
-test "unreadableTarget: an extension basalt does not read is refused" {
-    try std.testing.expect(unreadableTarget("/data/x.csv", null) == null);
-    try std.testing.expect(unreadableTarget("/data/X.CSV", null) == null);
-    try std.testing.expect(unreadableTarget("/data/x.parquet", null) == null);
-    try std.testing.expect(unreadableTarget("https://h/d.csv?token=abc", null) == null);
-    try std.testing.expect(unreadableTarget("s3://bkt/bronze/", null) == null);
-
-    try std.testing.expect(unreadableTarget("/data/x.csv.gz", null) == null);
-    try std.testing.expect(unreadableTarget("/data/x.csv.zst", null) == null);
-    try std.testing.expect(unreadableTarget("/data/inf.zip", null) == null);
-    try std.testing.expect(unreadableTarget("/data/inf.zip :: a.csv", null) == null);
-    try std.testing.expect(unreadableTarget("/data/x.parquet.gz", null) != null);
-
-    try std.testing.expect(unreadableTarget("/data/rows.json", null) != null);
-    try std.testing.expect(unreadableTarget("/data/book.xlsx", null) == null);
-    try std.testing.expect(unreadableTarget("/data/book.xlsx.gz", null) != null);
-    try std.testing.expect(unreadableTarget("/data/book.xls", null) != null);
-    try std.testing.expect(unreadableTarget("/data/noext", null) != null);
-    try std.testing.expect(unreadableTarget("/data/weird.dat", .csv) == null);
-}
-
-test "dialectFromHints: parses, and rejects what cannot work" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    const mkh = struct {
-        fn hint(al: std.mem.Allocator, k: []const u8, v: []const u8) ![]const ast.Hint {
-            const h = try al.alloc(ast.Hint, 1);
-            h[0] = .{ .key = k, .value = .{ .str = v }, .pos = .{ .line = 1, .col = 1 } };
-            return h;
-        }
-    };
-
-    var d = Diag{};
-    try std.testing.expectEqual(@as(u8, ','), (try dialectFromHints(&.{}, &d)).delim);
-    try std.testing.expectEqual(@as(u8, ';'), (try dialectFromHints(try mkh.hint(a, "delimiter", ";"), &d)).delim);
-    try std.testing.expectEqual(@as(u8, '\t'), (try dialectFromHints(try mkh.hint(a, "delimiter", "tab"), &d)).delim);
-    try std.testing.expectEqual(@as(u8, '|'), (try dialectFromHints(try mkh.hint(a, "delim", "|"), &d)).delim);
-    try std.testing.expectEqual(csv.Encoding.latin1, (try dialectFromHints(try mkh.hint(a, "encoding", "iso-8859-1"), &d)).encoding);
-
-    try std.testing.expectError(error.AnalyzeFailed, dialectFromHints(try mkh.hint(a, "delimiter", ";;"), &d));
-    try std.testing.expectError(error.AnalyzeFailed, dialectFromHints(try mkh.hint(a, "delimiter", "\""), &d));
-    try std.testing.expectError(error.AnalyzeFailed, dialectFromHints(try mkh.hint(a, "encoding", "latin9"), &d));
 }
 
 test "physical plan: which SQL shapes report a key-range split" {
@@ -1781,27 +1124,6 @@ test "analyze pushdown preview: a CTE, derived table or table function at the he
     try std.testing.expectEqualStrings("", w.outputs[0].source.pushdown);
 }
 
-test "analyze: EXPLAIN shows the WHERE a join's right side sends, under the join" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    var diag = Diag{};
-    const plan = try analyze(a, try parse(a,
-        \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', user = 'u', password = 'p', database = 'd');
-        \\CREATE FUNCTION active(flag INT) RETURNS TABLE AS SELECT cid, name AS nm FROM pg.customers WHERE active = $flag;
-        \\LOAD INTO '/tmp/x.csv' AS SELECT o.id, c.nm FROM pg.orders o JOIN active(1) c ON o.cid = c.cid;
-    ), &diag);
-    var join: ?Stage = null;
-    for (plan.outputs[0].stages) |st| {
-        if (std.mem.eql(u8, st.kind, "join")) join = st;
-    }
-    try std.testing.expectEqualStrings("(\"active\" = 1)", join.?.right_pushdown);
-    var out = std.Io.Writer.Allocating.init(a);
-    try render(plan, &out.writer);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "right  scan  postgres  table customers (via binding __tvf") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "pushdown: (\"active\" = 1)") != null);
-}
-
 test "analyze: a condition in ON on a connection's table on the right is the WHERE that side sends" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -1893,35 +1215,6 @@ test "analyze rejects unknown connection" {
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "unknown connection") != null);
 }
 
-/// Analyze `LOAD INTO ... AS <query over a 2-col CSV>` offline and expect an error
-/// whose message contains `msg`. `$IN` in the query is the input CSV's path.
-fn expectAnalyzeErr(a: std.mem.Allocator, csv_data: []const u8, query: []const u8, msg: []const u8) !void {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = csv_data });
-    const base = try tmp.dir.realpathAlloc(a, ".");
-    const in = try std.fs.path.join(a, &.{ base, "in.csv" });
-    const q = try std.mem.replaceOwned(u8, a, query, "$IN", in);
-    const src = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS {s};", .{q});
-    var diag = Diag{};
-    try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, src), &diag));
-    if (std.mem.indexOf(u8, diag.msg, msg) == null) {
-        std.debug.print("expected a message containing `{s}`, got `{s}`\n", .{ msg, diag.msg });
-        return error.TestUnexpectedResult;
-    }
-}
-
-fn analyzeCsv(a: std.mem.Allocator, csv_data: []const u8, query: []const u8, diag: *Diag) !Plan {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = csv_data });
-    const base = try tmp.dir.realpathAlloc(a, ".");
-    const in = try std.fs.path.join(a, &.{ base, "in.csv" });
-    const q = try std.mem.replaceOwned(u8, a, query, "$IN", in);
-    const src = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS {s};", .{q});
-    return analyze(a, try parse(a, src), diag);
-}
-
 test "analyze checks the stages after a join against the joined schema" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -1957,193 +1250,6 @@ test "analyze rejects a program with no output pipeline" {
     var diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, prog, &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "no output pipeline") != null);
-}
-
-fn tfld(a: std.mem.Allocator, name: []const u8) !*ast.Expr {
-    const parts = try a.alloc([]const u8, 1);
-    parts[0] = name;
-    const e = try a.create(ast.Expr);
-    e.* = .{ .field = .{ .parts = parts } };
-    return e;
-}
-
-test "joinPlan: collision suffix `_r`, left-nullability, semi/anti drop the right side" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const I = types.Type.init(.int);
-    const S = types.Type.init(.string);
-    const left = types.Schema{ .fields = &.{ .{ .name = "id", .ty = I }, .{ .name = "code", .ty = S } } };
-    const right = types.Schema{ .fields = &.{ .{ .name = "code", .ty = S }, .{ .name = "label", .ty = S } } };
-    const key = ast.QualName{ .parts = &.{"code"} };
-    var diag = Diag{};
-
-    const keys: []const ast.QualName = &.{key};
-
-    const inner = try joinPlan(a, left, right, .{ .kind = .inner, .binding = "r", .left_keys = keys, .right_keys = keys }, &diag);
-    try std.testing.expectEqual(@as(usize, 1), inner.lks[0]);
-    try std.testing.expectEqual(@as(usize, 0), inner.rks[0]);
-    try std.testing.expectEqual(@as(usize, 4), inner.schema.fields.len);
-    try std.testing.expectEqualStrings("code_r", inner.schema.fields[2].name);
-    try std.testing.expectEqualStrings("label", inner.schema.fields[3].name);
-    try std.testing.expect(!inner.schema.fields[3].ty.nullable);
-
-    const lj = try joinPlan(a, left, right, .{ .kind = .left, .binding = "r", .left_keys = keys, .right_keys = keys }, &diag);
-    try std.testing.expect(lj.right_nullable);
-    try std.testing.expect(lj.schema.fields[2].ty.nullable and lj.schema.fields[3].ty.nullable);
-    try std.testing.expect(!lj.schema.fields[0].ty.nullable);
-
-    const semi = try joinPlan(a, left, right, .{ .kind = .semi, .binding = "r", .left_keys = keys, .right_keys = keys }, &diag);
-    try std.testing.expect(!semi.emit_right);
-    try std.testing.expectEqual(@as(usize, 2), semi.schema.fields.len);
-
-    const rj = try joinPlan(a, left, right, .{ .kind = .right, .binding = "r", .left_keys = keys, .right_keys = keys }, &diag);
-    try std.testing.expect(rj.left_nullable and !rj.right_nullable);
-    try std.testing.expect(rj.schema.fields[0].ty.nullable);
-    const fj = try joinPlan(a, left, right, .{ .kind = .full, .binding = "r", .left_keys = keys, .right_keys = keys }, &diag);
-    try std.testing.expect(fj.left_nullable and fj.right_nullable);
-    const cj = try joinPlan(a, left, right, .{ .kind = .cross, .binding = "r", .left_keys = &.{}, .right_keys = &.{} }, &diag);
-    try std.testing.expectEqual(@as(usize, 0), cj.lks.len);
-    try std.testing.expectEqual(@as(usize, 4), cj.schema.fields.len);
-
-    try std.testing.expectError(error.AnalyzeFailed, joinPlan(a, left, right, .{ .kind = .inner, .binding = "r", .left_keys = &.{.{ .parts = &.{"nope"} }}, .right_keys = keys }, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "unknown left join key") != null);
-}
-
-test "joinPlan: the `_r` suffix keeps bumping until the name is actually free" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const I = types.Type.init(.int);
-    const S = types.Type.init(.string);
-    const left = types.Schema{ .fields = &.{
-        .{ .name = "id", .ty = I },
-        .{ .name = "x", .ty = S },
-        .{ .name = "x_r", .ty = S },
-    } };
-    const right = types.Schema{ .fields = &.{
-        .{ .name = "id", .ty = I },
-        .{ .name = "x", .ty = S },
-        .{ .name = "x_r", .ty = S },
-    } };
-    var diag = Diag{};
-    const keys: []const ast.QualName = &.{.{ .parts = &.{"id"} }};
-    const p = try joinPlan(a, left, right, .{ .kind = .inner, .binding = "r", .left_keys = keys, .right_keys = keys }, &diag);
-    try std.testing.expectEqual(@as(usize, 6), p.schema.fields.len);
-    try std.testing.expectEqualStrings("id_r", p.schema.fields[3].name);
-    try std.testing.expectEqualStrings("x_r2", p.schema.fields[4].name);
-    try std.testing.expectEqualStrings("x_r_r", p.schema.fields[5].name);
-    for (p.schema.fields, 0..) |f, i| try std.testing.expectEqual(i, p.schema.indexOf(f.name).?);
-}
-
-test "joinPlan: pair orientation, ambiguity, per-pair comparability" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const I = types.Type.init(.int);
-    const S = types.Type.init(.string);
-    const left = types.Schema{ .fields = &.{ .{ .name = "id", .ty = I }, .{ .name = "day", .ty = S }, .{ .name = "amount", .ty = I } } };
-    const right = types.Schema{ .fields = &.{ .{ .name = "d", .ty = S }, .{ .name = "ref", .ty = I }, .{ .name = "note", .ty = S } } };
-    const k_ref = ast.QualName{ .parts = &.{"ref"} };
-    const k_id = ast.QualName{ .parts = &.{"id"} };
-    const k_day = ast.QualName{ .parts = &.{"day"} };
-    const k_d = ast.QualName{ .parts = &.{"d"} };
-    const k_amount = ast.QualName{ .parts = &.{"amount"} };
-    const k_a = ast.QualName{ .parts = &.{"a"} };
-    const k_b = ast.QualName{ .parts = &.{"b"} };
-    var diag = Diag{};
-
-    const p = try joinPlan(a, left, right, .{
-        .kind = .inner,
-        .binding = "r",
-        .left_keys = &.{ k_ref, k_day },
-        .right_keys = &.{ k_id, k_d },
-    }, &diag);
-    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, p.lks);
-    try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, p.rks);
-
-    try std.testing.expectError(error.AnalyzeFailed, joinPlan(a, left, right, .{
-        .kind = .inner,
-        .binding = "r",
-        .left_keys = &.{k_amount},
-        .right_keys = &.{k_d},
-    }, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "not comparable") != null);
-
-    const both_l = types.Schema{ .fields = &.{ .{ .name = "a", .ty = I }, .{ .name = "b", .ty = I } } };
-    const both_r = types.Schema{ .fields = &.{ .{ .name = "b", .ty = I }, .{ .name = "a", .ty = I } } };
-    try std.testing.expectError(error.AnalyzeFailed, joinPlan(a, both_l, both_r, .{
-        .kind = .inner,
-        .binding = "r",
-        .left_keys = &.{k_a},
-        .right_keys = &.{k_b},
-    }, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "ambiguous") != null);
-
-    const same = try joinPlan(a, both_l, both_r, .{
-        .kind = .inner,
-        .binding = "r",
-        .left_keys = &.{k_a},
-        .right_keys = &.{k_a},
-    }, &diag);
-    try std.testing.expectEqualSlices(usize, &.{0}, same.lks);
-    try std.testing.expectEqualSlices(usize, &.{1}, same.rks);
-}
-
-test "aggregatePlan: result types per function and group-key passthrough" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const in = types.Schema{ .fields = &.{
-        .{ .name = "g", .ty = types.Type.init(.string) },
-        .{ .name = "v", .ty = types.Type.init(.int) },
-    } };
-    const by = try a.alloc(ast.QualName, 1);
-    by[0] = .{ .parts = &.{"g"} };
-    const aggs = try a.alloc(ast.AggItem, 4);
-    aggs[0] = .{ .name = "n", .func = .count, .arg = null };
-    aggs[1] = .{ .name = "s", .func = .sum, .arg = try tfld(a, "v") };
-    aggs[2] = .{ .name = "m", .func = .avg, .arg = try tfld(a, "v") };
-    aggs[3] = .{ .name = "lo", .func = .min, .arg = try tfld(a, "g") };
-    var pm = std.StringHashMap(*const ast.Expr).init(a);
-    var diag = Diag{};
-    const plan = try aggregatePlan(a, in, .{ .aggs = aggs, .by = by }, &pm, &diag);
-
-    try std.testing.expectEqual(@as(usize, 1), plan.by.len);
-    try std.testing.expectEqual(@as(usize, 0), plan.by[0]);
-    const f = plan.schema.fields;
-    try std.testing.expectEqual(@as(usize, 5), f.len);
-    try std.testing.expectEqual(types.TypeKind.string, f[0].ty.kind);
-    try std.testing.expect(f[1].ty.kind == .int and !f[1].ty.nullable);
-    try std.testing.expect(f[2].ty.kind == .int and f[2].ty.nullable);
-    try std.testing.expect(f[3].ty.kind == .float and f[3].ty.nullable);
-    try std.testing.expect(f[4].ty.kind == .string and f[4].ty.nullable);
-
-    const bad = try a.alloc(ast.QualName, 1);
-    bad[0] = .{ .parts = &.{"zzz"} };
-    try std.testing.expectError(error.AnalyzeFailed, aggregatePlan(a, in, .{ .aggs = aggs, .by = bad }, &pm, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "zzz") != null);
-}
-
-test "selectCols: `* except` drops the named columns and keeps source order" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const I = types.Type.init(.int);
-    const in = types.Schema{ .fields = &.{
-        .{ .name = "a", .ty = I },
-        .{ .name = "b", .ty = I },
-        .{ .name = "c", .ty = I },
-    } };
-    var pm = std.StringHashMap(*const ast.Expr).init(a);
-    var diag = Diag{};
-    const items = [_]ast.SelectItem{.{ .star_except = &.{"b"} }};
-    const cols = try selectCols(a, in, &items, &pm, &diag);
-    try std.testing.expectEqual(@as(usize, 2), cols.len);
-    try std.testing.expectEqualStrings("a", cols[0].name);
-    try std.testing.expectEqualStrings("c", cols[1].name);
-    try std.testing.expectEqual(@as(usize, 0), cols[0].source.passthrough);
-    try std.testing.expectEqual(@as(usize, 2), cols[1].source.passthrough);
 }
 
 test "analyze rejects `* rename` onto a duplicate column name" {
@@ -2183,18 +1289,6 @@ test "analyze: an undeclared `$name` is refused by name, never read as the colum
     ), &ok);
 }
 
-test "analyze: a numeric aggregate of a string literal says to double-quote a column name" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const f = [_]types.Schema.Field{.{ .name = "Kick-Off", .ty = types.Type.init(.int) }};
-    var diag = Diag{};
-    const lit = try a.create(ast.Expr);
-    lit.* = .{ .str_lit = "Kick-Off" };
-    try std.testing.expectError(error.AnalyzeFailed, aggResultType(a, .sum, lit, .{ .fields = &f }, &diag));
-    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "sum(\"Kick-Off\")") != null);
-}
-
 test "analyze: a numeric aggregate refuses a non-numeric argument at plan time" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -2204,31 +1298,6 @@ test "analyze: a numeric aggregate refuses a non-numeric argument at plan time" 
     try std.testing.expectEqualStrings("`sum` needs a numeric argument, got date", diag.msg);
     var ok = Diag{};
     _ = try analyzeCsv(a, "id,s\n1,x\n", "SELECT SUM(s) AS n, MIN(s) AS lo FROM '$IN'", &ok);
-}
-
-test "laneHints: a CSV dialect and an agreeing format fan out; anything else stays serial" {
-    const rd = ast.Stage.Node{ .read = .{ .connector = "csv", .form = .{ .path = "x.csv" } } };
-    const pos = ast.Pos{ .line = 1, .col = 1 };
-    const Case = struct { hints: []const ast.Hint, ok: bool };
-    const cases = [_]Case{
-        .{ .hints = &.{}, .ok = true },
-        .{ .hints = &.{ .{ .key = "delimiter", .value = .{ .str = ";" }, .pos = pos }, .{ .key = "encoding", .value = .{ .str = "latin1" }, .pos = pos } }, .ok = true },
-        .{ .hints = &.{.{ .key = "format", .value = .{ .str = "csv" }, .pos = pos }}, .ok = true },
-        .{ .hints = &.{.{ .key = "format", .value = .{ .str = "parquet" }, .pos = pos }}, .ok = false },
-        .{ .hints = &.{.{ .key = "split", .value = .{ .str = "id" }, .pos = pos }}, .ok = false },
-    };
-    for (cases) |c| try std.testing.expectEqual(c.ok, laneHints(.{ .node = rd, .hints = c.hints, .pos = pos }));
-}
-
-test "formatLabel names the reader, not the connector" {
-    const no_hints: []const ast.Hint = &.{};
-    try std.testing.expectEqualStrings("parquet", formatLabel("t.parquet", no_hints));
-    try std.testing.expectEqualStrings("csv", formatLabel("t.csv", no_hints));
-    try std.testing.expectEqualStrings("csv", formatLabel("t.csv.gz", no_hints));
-    try std.testing.expectEqualStrings("csv", formatLabel("a.zip :: t.csv", no_hints));
-    const as_parquet: []const ast.Hint = &.{.{ .key = "format", .value = .{ .str = "parquet" }, .pos = .{ .line = 1, .col = 1 } }};
-    try std.testing.expectEqualStrings("parquet", formatLabel("t.dat", as_parquet));
-    try std.testing.expectEqualStrings("csv", formatLabel("t.dat", no_hints));
 }
 
 test "analyze rejects `?.` safe navigation on a plain column reference" {
@@ -2416,4 +1485,11 @@ test "a $param or LET in a filter reaches the pushdown as its value, never as a 
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"k\" < 5") != null);
     var none = ParamMap.init(a);
     try std.testing.expect((try substFilterParams(a, stages, &none)).ptr == stages.ptr);
+}
+
+test {
+    _ = @import("analyze/render.zig");
+    _ = @import("analyze/schema.zig");
+    _ = @import("analyze/targets.zig");
+    _ = @import("analyze/testing_util.zig");
 }
