@@ -27,6 +27,11 @@ const std = @import("std");
 const toF64 = @import("support.zig").toF64;
 const trim = @import("support.zig").trim;
 const types = @import("../../lang/types.zig");
+const TypeCtx = @import("../eval.zig").TypeCtx;
+const compareValues = @import("support.zig").compareValues;
+const evalLit = @import("testing_util.zig").evalLit;
+const parser = @import("../../lang/sql_parser.zig");
+const vectorized = @import("fn_vec.zig").vectorized;
 
 pub fn evalColumn(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, out_ty: Type) EvalError!column.Column {
     forgetFailure();
@@ -912,4 +917,398 @@ pub fn isEmptyVal(v: Value) bool {
         .string, .bytes => |s| s.len == 0,
         else => false,
     };
+}
+
+test "constEval folds an expression over plan-time bindings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tbl = ast.Expr{ .field = .{ .parts = &[_][]const u8{"tbl"} } };
+    var prefix = ast.Expr{ .str_lit = "SD1" };
+    var sw_args = [_]*ast.Expr{ &tbl, &prefix };
+    var sw = ast.Expr{ .call = .{ .name = "starts_with", .args = &sw_args } };
+    const r = try constEval(a, &sw, &[_][]const u8{"tbl"}, &[_]Value{.{ .string = "SD1010" }});
+    try std.testing.expect(r.bool);
+
+    var four = ast.Expr{ .int_lit = 4 };
+    var two = ast.Expr{ .int_lit = 2 };
+    var ss_args = [_]*ast.Expr{ &tbl, &four, &two };
+    var ss = ast.Expr{ .call = .{ .name = "substr", .args = &ss_args } };
+    const e = try constEval(a, &ss, &[_][]const u8{"tbl"}, &[_]Value{.{ .string = "SD1010" }});
+    try std.testing.expectEqualStrings("01", e.string);
+}
+
+test "type-check and evaluate an if-expression with 3VL" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const pred = try parser.parseExprStr(a, "amount > 100", &diag);
+    const sel = try parser.parseExprStr(a, "if(amount >= 100, 'yes', 'no')", &diag);
+
+    const schema = types.Schema{ .fields = &.{.{ .name = "amount", .ty = Type.init(.int).asNullable() }} };
+    var ctx = TypeCtx{ .schema = schema, .arena = a };
+    try std.testing.expectEqual(types.TypeKind.bool, (try ctx.typeOf(pred)).kind);
+    const sel_ty = try ctx.typeOf(sel);
+    try std.testing.expectEqual(types.TypeKind.string, sel_ty.kind);
+
+    const amt = try column.intColumn(a, &.{ 50, 150, null });
+    var cols = [_]column.Column{amt};
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 3 };
+
+    const out = try evalColumn(a, sel, batch, sel_ty);
+    try std.testing.expectEqualStrings("no", out.getValue(0).string);
+    try std.testing.expectEqualStrings("yes", out.getValue(1).string);
+    try std.testing.expectEqualStrings("no", out.getValue(2).string);
+}
+
+test "a date column compares on the vectorized path, and matches rowwise" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const days = [_]?i32{ 9130, 9131, 9132, null };
+    var validity = try column.Bitmap.initFull(a, days.len);
+    const store = try a.alloc(i32, days.len);
+    for (days, 0..) |d, i| {
+        if (d) |x| store[i] = x else {
+            store[i] = 0;
+            validity.setValid(i, false);
+        }
+    }
+    const dcol = column.Column{
+        .ty = Type.init(.date).asNullable(),
+        .len = days.len,
+        .validity = validity,
+        .data = .{ .i32 = store },
+    };
+    const schema = types.Schema{ .fields = &.{.{ .name = "d", .ty = Type.init(.date).asNullable() }} };
+    var cols = [_]column.Column{dcol};
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = days.len };
+
+    const sqlp = @import("../../lang/sql_parser.zig");
+    const cases = [_]struct { src: []const u8, want: [4]?bool }{
+        .{ .src = "d < '1995-01-01'", .want = .{ true, false, false, null } },
+        .{ .src = "d > '1995-01-01'", .want = .{ false, false, true, null } },
+        .{ .src = "d <= '1995-01-01'", .want = .{ true, true, false, null } },
+        .{ .src = "d >= '1995-01-01'", .want = .{ false, true, true, null } },
+        .{ .src = "d = '1995-01-01'", .want = .{ false, true, false, null } },
+        .{ .src = "d <> '1995-01-01'", .want = .{ true, false, true, null } },
+    };
+    for (cases) |tc| {
+        var diag: sqlp.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const e = try sqlp.parseExprStr(a, tc.src, &diag);
+        _ = evalVecNode(a, e, batch) catch |err| {
+            std.debug.print("expr de-vectorized: {s}: {s}\n", .{ tc.src, @errorName(err) });
+            return err;
+        };
+        const out = try evalColumn(a, e, batch, Type.init(.bool).asNullable());
+        for (tc.want, 0..) |w, i| {
+            const got = out.getValue(i);
+            if (w) |b| {
+                try std.testing.expectEqual(b, got.bool);
+            } else {
+                try std.testing.expect(got.isNull());
+            }
+            const rw = try evalRow(a, e, batch, i);
+            if (w) |b| try std.testing.expectEqual(b, rw.bool) else try std.testing.expect(rw.isNull());
+        }
+    }
+
+    var d2: sqlp.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const bad = try sqlp.parseExprStr(a, "d < 'not-a-date'", &d2);
+    try std.testing.expectError(error.TypeMismatch, evalColumn(a, bad, batch, Type.init(.bool).asNullable()));
+}
+
+test "vectorized kernels match the rowwise evaluator" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const x = try column.intColumn(a, &.{ 10, 20, null, 40, 0 });
+    const y = try column.intColumn(a, &.{ 3, null, 7, 8, 5 });
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "x", .ty = Type.init(.int).asNullable() },
+        .{ .name = "y", .ty = Type.init(.int).asNullable() },
+    } };
+    var cols = [_]column.Column{ x, y };
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 5 };
+
+    const exprs = [_]struct { src: []const u8, vectorized: bool }{
+        .{ .src = "x + y", .vectorized = true },
+        .{ .src = "x * y - 1", .vectorized = true },
+        .{ .src = "x / y", .vectorized = true },
+        .{ .src = "x > y", .vectorized = true },
+        .{ .src = "x >= 10 and y < 8", .vectorized = true },
+        .{ .src = "x == 40 or y == 5", .vectorized = true },
+        .{ .src = "if(x > y, x, y)", .vectorized = true },
+        .{ .src = "-x", .vectorized = true },
+        .{ .src = "x is null", .vectorized = true },
+        .{ .src = "if(x != 0, y / x, 0)", .vectorized = false },
+        .{ .src = "x != 0 and y / x > 1", .vectorized = false },
+        .{ .src = "x == 0 or y / x > 1", .vectorized = false },
+    };
+    for (exprs) |tc| {
+        const body = tc.src;
+        var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const e = try parser.parseExprStr(a, body, &diag);
+        var ctx = TypeCtx{ .schema = schema, .arena = a };
+        const ty = try ctx.typeOf(e);
+
+        if (tc.vectorized) {
+            _ = evalVecNode(a, e, batch) catch |err| {
+                std.debug.print("expr de-vectorized: {s}: {s}\n", .{ body, @errorName(err) });
+                return err;
+            };
+        }
+
+        const vec = try evalColumn(a, e, batch, ty);
+        const rowwise = try evalColumnRowwise(a, e, batch, ty);
+        try std.testing.expectEqual(rowwise.len, vec.len);
+        var i: usize = 0;
+        while (i < vec.len) : (i += 1) {
+            const want = rowwise.getValue(i);
+            const got = vec.getValue(i);
+            try std.testing.expectEqual(want.isNull(), got.isNull());
+            if (!want.isNull()) {
+                if (compareValues(want, got)) |ord| {
+                    try std.testing.expect(ord == .eq);
+                } else try std.testing.expect(false);
+            }
+        }
+    }
+}
+
+test "vectorized string kernels match the rowwise evaluator" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var sb = column.Builder.init(a, Type.init(.string).asNullable());
+    try sb.append(.{ .string = "  Apple " });
+    try sb.append(.null);
+    try sb.append(.{ .string = "banana" });
+    try sb.append(.{ .string = "" });
+    try sb.append(.{ .string = "Cherry pie" });
+    const s = try sb.finish();
+    const x = try column.intColumn(a, &.{ 1, 2, null, 4, 5 });
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "s", .ty = Type.init(.string).asNullable() },
+        .{ .name = "x", .ty = Type.init(.int).asNullable() },
+    } };
+    var cols = [_]column.Column{ s, x };
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 5 };
+
+    const exprs = [_][]const u8{
+        "upper(s)",
+        "lower(s)",
+        "trim(s)",
+        "length(s)",
+        "concat(s, '-', s)",
+        "starts_with(s, 'b')",
+        "ends_with(s, 'e')",
+        "contains(s, 'an')",
+        "like(s, '%an%')",
+        "substr(s, 2, 3)",
+        "replace(s, 'an', 'AN')",
+        "coalesce(s, 'fallback')",
+        "if(contains(s, 'p'), upper(s), s)",
+        "length(trim(s)) > 5 and contains(s, 'e')",
+    };
+    for (exprs) |body| {
+        var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const e = try parser.parseExprStr(a, body, &diag);
+        var ctx = TypeCtx{ .schema = schema, .arena = a };
+        const ty = try ctx.typeOf(e);
+
+        _ = evalVecNode(a, e, batch) catch |err| {
+            std.debug.print("expr de-vectorized: {s}: {s}\n", .{ body, @errorName(err) });
+            return err;
+        };
+
+        const vec = try evalColumn(a, e, batch, ty);
+        const rowwise = try evalColumnRowwise(a, e, batch, ty);
+        try std.testing.expectEqual(rowwise.len, vec.len);
+        var i: usize = 0;
+        while (i < vec.len) : (i += 1) {
+            const want = rowwise.getValue(i);
+            const got = vec.getValue(i);
+            try std.testing.expectEqual(want.isNull(), got.isNull());
+            if (!want.isNull()) {
+                if (compareValues(want, got)) |ord| {
+                    try std.testing.expect(ord == .eq);
+                } else try std.testing.expect(false);
+            }
+        }
+    }
+}
+
+test "bitwise operators and hex builtins" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "x", .ty = Type.init(.int).asNullable() },
+        .{ .name = "s", .ty = Type.init(.string) },
+    } };
+    const x = try column.intColumn(a, &.{ -8, null });
+    var sb = column.Builder.init(a, Type.init(.string));
+    try sb.append(.{ .string = "0xFF" });
+    try sb.append(.{ .string = "ff" });
+    var cols = [_]column.Column{ x, try sb.finish() };
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 2 };
+
+    const S = struct {
+        fn checked(al: std.mem.Allocator, sch: types.Schema, src: []const u8) !struct { *ast.Expr, Type } {
+            var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+            const e = try parser.parseExprStr(al, src, &diag);
+            var ctx = TypeCtx{ .schema = sch, .arena = al };
+            return .{ e, try ctx.typeOf(e) };
+        }
+    };
+
+    const ints = [_]struct { src: []const u8, want: i64 }{
+        .{ .src = "1 | 2 & 3", .want = 3 },
+        .{ .src = "6 & 3", .want = 2 },
+        .{ .src = "6 ^ 3", .want = 5 },
+        .{ .src = "1 + 1 << 2", .want = 8 },
+        .{ .src = "~0", .want = -1 },
+        .{ .src = "~x", .want = 7 },
+        .{ .src = "x >> 1", .want = -4 },
+        .{ .src = "1 << 63 >> 63", .want = -1 },
+        .{ .src = "1 << 64", .want = 0 },
+        .{ .src = "8 << -1", .want = 0 },
+        .{ .src = "8 >> 100", .want = 0 },
+        .{ .src = "x >> 100", .want = -1 },
+        .{ .src = "x >> -1", .want = 0 },
+        .{ .src = "bit_count(255)", .want = 8 },
+        .{ .src = "bit_count(~0)", .want = 64 },
+        .{ .src = "bit_count(0)", .want = 0 },
+        .{ .src = "from_hex('ff')", .want = 255 },
+        .{ .src = "from_hex('0xFF')", .want = 255 },
+        .{ .src = "from_hex(s)", .want = 255 },
+        .{ .src = "from_hex(to_hex(x))", .want = -8 },
+        .{ .src = "from_hex(to_hex(0))", .want = 0 },
+    };
+    for (ints) |c| {
+        const e, const t = try S.checked(a, schema, c.src);
+        try std.testing.expectEqual(types.TypeKind.int, t.kind);
+        const col = try evalColumn(a, e, batch, t);
+        try std.testing.expectEqual(c.want, col.getValue(0).int);
+        try std.testing.expectEqual(c.want, (try evalRow(a, e, batch, 0)).int);
+    }
+
+    const hex = [_]struct { src: []const u8, want: []const u8 }{
+        .{ .src = "to_hex(255)", .want = "ff" },
+        .{ .src = "to_hex(0)", .want = "0" },
+        .{ .src = "to_hex(-1)", .want = "ffffffffffffffff" },
+        .{ .src = "to_hex(x)", .want = "fffffffffffffff8" },
+    };
+    for (hex) |c| {
+        const e, const t = try S.checked(a, schema, c.src);
+        try std.testing.expectEqual(types.TypeKind.string, t.kind);
+        const col = try evalColumn(a, e, batch, t);
+        try std.testing.expectEqualStrings(c.want, col.getValue(0).string);
+    }
+
+    const nulls = [_][]const u8{ "x & 1", "x | 1", "x ^ 1", "x << 1", "x >> 1", "~x", "bit_count(x)", "to_hex(x)", "from_hex(to_hex(x))" };
+    for (nulls) |src| {
+        const e, const t = try S.checked(a, schema, src);
+        try std.testing.expect(t.nullable);
+        try std.testing.expect((try evalColumn(a, e, batch, t)).getValue(1).isNull());
+        try std.testing.expect((try evalRow(a, e, batch, 1)).isNull());
+    }
+
+    {
+        const pair = try S.checked(a, schema, "x & 1");
+        try std.testing.expectError(error.Unsupported, evalVecNode(a, pair[0], batch));
+        const v = try evalVec(a, pair[0], batch);
+        try std.testing.expect(v == .col and v.col.ty.kind == .int);
+        try std.testing.expectEqual(@as(i64, 0), v.col.getValue(0).int);
+        try std.testing.expect(v.col.getValue(1).isNull());
+    }
+
+    for ([_][]const u8{ "from_hex('zz')", "from_hex('')", "from_hex('0x')", "from_hex('1ffffffffffffffff')" }) |src| {
+        const e, const t = try S.checked(a, schema, src);
+        try std.testing.expectError(error.CastFailed, evalRow(a, e, batch, 0));
+        try std.testing.expectError(error.CastFailed, evalColumn(a, e, batch, t));
+    }
+
+    for ([_][]const u8{ "s & 1", "1.5 & 1", "1 << 1.5", "~s", "bit_count(s)", "to_hex(s)", "from_hex(1)" }) |src| {
+        var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const e = try parser.parseExprStr(a, src, &diag);
+        var ctx = TypeCtx{ .schema = schema, .arena = a };
+        try std.testing.expectError(error.TypeError, ctx.typeOf(e));
+    }
+}
+
+test "int division/modulo by zero raise DivByZero; float division yields inf" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const schema = types.Schema{ .fields = &.{.{ .name = "x", .ty = Type.init(.int).asNullable() }} };
+    const x = try column.intColumn(a, &.{ 6, null });
+    var cols = [_]column.Column{x};
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 2 };
+
+    var fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
+    var zero = ast.Expr{ .int_lit = 0 };
+    var div = ast.Expr{ .binary = .{ .op = .div, .l = &fx, .r = &zero } };
+    var mod = ast.Expr{ .binary = .{ .op = .mod, .l = &fx, .r = &zero } };
+    try std.testing.expectError(error.DivByZero, evalColumn(a, &div, batch, Type.init(.int).asNullable()));
+    try std.testing.expectError(error.DivByZero, evalRow(a, &div, batch, 0));
+    try std.testing.expectError(error.DivByZero, evalRow(a, &mod, batch, 0));
+
+    var fzero = ast.Expr{ .float_lit = 0.0 };
+    var fdiv = ast.Expr{ .binary = .{ .op = .div, .l = &fx, .r = &fzero } };
+    const out = try evalColumn(a, &fdiv, batch, Type.init(.float).asNullable());
+    try std.testing.expect(std.math.isInf(out.getValue(0).float));
+    try std.testing.expect(out.getValue(1).isNull());
+}
+
+test "evalColumn over an empty batch yields an empty column" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const schema = types.Schema{ .fields = &.{.{ .name = "x", .ty = Type.init(.int) }} };
+    const x = try column.intColumn(a, &.{});
+    var cols = [_]column.Column{x};
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 0 };
+
+    var fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
+    var one = ast.Expr{ .int_lit = 1 };
+    var plus = ast.Expr{ .binary = .{ .op = .add, .l = &fx, .r = &one } };
+    const out = try evalColumn(a, &plus, batch, Type.init(.int));
+    try std.testing.expectEqual(@as(usize, 0), out.len);
+}
+
+test "try_cast yields null exactly where cast raises" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    try std.testing.expectEqual(@as(i64, 3), (try evalLit(a, "try_cast('3' as int)")).int);
+    try std.testing.expect((try evalLit(a, "try_cast('x' as int)")).isNull());
+    try std.testing.expectError(error.CastFailed, evalLit(a, "cast('x' as int)"));
+
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const e = try parser.parseExprStr(a, "try_cast(s as int)", &diag);
+    const schema = types.Schema{ .fields = &.{.{ .name = "s", .ty = Type.init(.string) }} };
+    var ctx = TypeCtx{ .schema = schema, .arena = a };
+    const ty = try ctx.typeOf(e);
+    try std.testing.expectEqual(types.TypeKind.int, ty.kind);
+    try std.testing.expect(ty.nullable);
+
+    var sb = column.Builder.init(a, Type.init(.string));
+    try sb.append(.{ .string = "3" });
+    try sb.append(.{ .string = "x" });
+    var cols = [_]column.Column{try sb.finish()};
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 2 };
+    const out = try evalColumn(a, e, batch, ty);
+    try std.testing.expectEqual(@as(i64, 3), out.getValue(0).int);
+    try std.testing.expect(out.getValue(1).isNull());
 }

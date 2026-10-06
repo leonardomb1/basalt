@@ -8,6 +8,10 @@ const column = @import("../column.zig");
 const json = @import("../json.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
+const Scan = @import("../op.zig").Scan;
+const TestSource = @import("testing_util.zig").TestSource;
+const kvBatch = @import("testing_util.zig").kvBatch;
+const testing = std.testing;
 
 pub const Explode = struct {
     stats: Stats = .{},
@@ -88,4 +92,28 @@ fn jsonElems(arena: std.mem.Allocator, text: []const u8) ![]const Value {
         .text => |t| .{ .string = t },
     });
     return out.items;
+}
+
+test "explode splits delimited strings, repeats other columns, drops null cells" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "id", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "tags", .ty = types.Type.init(.string).asNullable() },
+    } };
+    const batches = [_]Batch{try kvBatch(a, &schema, &.{ 1, 2, 3, 4 }, &.{ "a,b", null, "c", "" })};
+    var ts = TestSource{ .schema_ = schema, .batches = &batches };
+    var scan = Scan{ .src = ts.src() };
+    var ex = Explode{ .child = .{ .scan = &scan }, .field_idx = 1, .delim = ",", .out_schema = &schema };
+
+    const b = (try (Op{ .explode = &ex }).next(a)).?;
+    try testing.expectEqual(@as(usize, 4), b.len);
+    const want_ids = [_]i64{ 1, 1, 3, 4 };
+    const want_tags = [_][]const u8{ "a", "b", "c", "" };
+    for (want_ids, want_tags, 0..) |wi, wt, r| {
+        try testing.expectEqual(wi, b.columns[0].getValue(r).int);
+        try testing.expectEqualStrings(wt, b.columns[1].getValue(r).string);
+    }
 }

@@ -13,6 +13,14 @@ const keyhash = @import("../keyhash.zig");
 const std = @import("std");
 const op_mod = @import("../op.zig");
 const types = @import("../../lang/types.zig");
+const JoinRows = @import("testing_util.zig").JoinRows;
+const Scan = @import("../op.zig").Scan;
+const TestSource = @import("testing_util.zig").TestSource;
+const join_both_schema = @import("testing_util.zig").join_both_schema;
+const join_left_schema = @import("testing_util.zig").join_left_schema;
+const join_right_schema = @import("testing_util.zig").join_right_schema;
+const kvBatch = @import("testing_util.zig").kvBatch;
+const testing = std.testing;
 
 /// Drain the build side into a batch in `state` that is never null, so a join can
 /// emit right-side nulls for an empty build. Fails with `JoinBuildTooLarge` past `cap`.
@@ -422,4 +430,193 @@ fn nullColumn(arena: std.mem.Allocator, ty: types.Type, n: usize) !column.Column
     var i: usize = 0;
     while (i < n) : (i += 1) try b.append(.null);
     return b.finish();
+}
+
+test "join: inner/left/semi/anti; null keys never match, duplicate build keys fan out" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const Case = struct { kind: ast.JoinKind, keys: []const ?i64, rvs: []const ?[]const u8 };
+    const cases = [_]Case{
+        .{ .kind = .inner, .keys = &.{ 1, 1 }, .rvs = &.{ "x", "y" } },
+        .{ .kind = .left, .keys = &.{ 1, 1, 2, null, 3 }, .rvs = &.{ "x", "y", null, null, null } },
+        .{ .kind = .semi, .keys = &.{1}, .rvs = &.{} },
+        .{ .kind = .anti, .keys = &.{ 2, null, 3 }, .rvs = &.{} },
+    };
+    for (cases) |case| {
+        const lb = [_]Batch{try kvBatch(a, &join_left_schema, &.{ 1, 2, null, 3 }, &.{ "a", "b", "n", "c" })};
+        const rb = [_]Batch{try kvBatch(a, &join_right_schema, &.{ 1, 1, 4, null }, &.{ "x", "y", "z", "m" })};
+        var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+        var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+        var lscan = Scan{ .src = lts.src() };
+        var rscan = Scan{ .src = rts.src() };
+        const emit_right = case.kind == .inner or case.kind == .left;
+        var jn = Join{
+            .probe = .{ .scan = &lscan },
+            .build = .{ .scan = &rscan },
+            .left_keys = &.{0},
+            .right_keys = &.{0},
+            .left_schema = &join_left_schema,
+            .right_schema = &join_right_schema,
+            .out_schema = if (emit_right) &join_both_schema else &join_left_schema,
+            .kind = case.kind,
+            .state = a,
+        };
+        const got = try JoinRows.collect(a, .{ .join = &jn }, if (emit_right) @as(?usize, 3) else null);
+        try got.expect(case.keys, case.rvs);
+    }
+}
+
+test "join: a null-aware anti join is NOT IN — a NULL on either side is unknown" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const Case = struct { build: []const ?i64, keys: []const ?i64 };
+    const cases = [_]Case{
+        .{ .build = &.{ 1, 4, null }, .keys = &.{} },
+        .{ .build = &.{ 1, 4 }, .keys = &.{ 2, 3 } },
+        .{ .build = &.{}, .keys = &.{ 1, 2, null, 3 } },
+    };
+    for (cases) |case| {
+        const lb = [_]Batch{try kvBatch(a, &join_left_schema, &.{ 1, 2, null, 3 }, &.{ "a", "b", "n", "c" })};
+        const rvs = try a.alloc(?[]const u8, case.build.len);
+        @memset(rvs, "r");
+        const rb = [_]Batch{try kvBatch(a, &join_right_schema, case.build, rvs)};
+        var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+        var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+        var lscan = Scan{ .src = lts.src() };
+        var rscan = Scan{ .src = rts.src() };
+        var jn = Join{
+            .probe = .{ .scan = &lscan },
+            .build = .{ .scan = &rscan },
+            .left_keys = &.{0},
+            .right_keys = &.{0},
+            .left_schema = &join_left_schema,
+            .right_schema = &join_right_schema,
+            .out_schema = &join_left_schema,
+            .kind = .anti,
+            .null_aware = true,
+            .state = a,
+        };
+        const got = try JoinRows.collect(a, .{ .join = &jn }, null);
+        try got.expect(case.keys, &.{});
+    }
+}
+
+test "join: right and full drain unmatched build rows with a null left side" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    for ([_]ast.JoinKind{ .right, .full }) |kind| {
+        const lb = [_]Batch{try kvBatch(a, &join_left_schema, &.{ 1, 2, null }, &.{ "a", "b", "n" })};
+        const rb = [_]Batch{try kvBatch(a, &join_right_schema, &.{ 1, 4, null }, &.{ "x", "z", "m" })};
+        var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+        var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+        var lscan = Scan{ .src = lts.src() };
+        var rscan = Scan{ .src = rts.src() };
+        var jn = Join{
+            .probe = .{ .scan = &lscan },
+            .build = .{ .scan = &rscan },
+            .left_keys = &.{0},
+            .right_keys = &.{0},
+            .left_schema = &join_left_schema,
+            .right_schema = &join_right_schema,
+            .out_schema = &join_both_schema,
+            .kind = kind,
+            .state = a,
+        };
+        const got = try JoinRows.collect(a, .{ .join = &jn }, 3);
+        if (kind == .right) {
+            try got.expect(&.{ 1, null, null }, &.{ "x", "z", "m" });
+        } else {
+            try got.expect(&.{ 1, 2, null, null, null }, &.{ "x", null, null, "z", "m" });
+        }
+    }
+}
+
+test "join: multi-key ON (int + string) pairs only fully equal keys" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const lb = [_]Batch{try kvBatch(a, &join_left_schema, &.{ 1, 1, 2, 3 }, &.{ "a", "b", "a", null })};
+    const rb = [_]Batch{try kvBatch(a, &join_right_schema, &.{ 1, 2, 1 }, &.{ "a", "z", "a" })};
+    var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+    var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+    var lscan = Scan{ .src = lts.src() };
+    var rscan = Scan{ .src = rts.src() };
+    var jn = Join{
+        .probe = .{ .scan = &lscan },
+        .build = .{ .scan = &rscan },
+        .left_keys = &.{ 0, 1 },
+        .right_keys = &.{ 0, 1 },
+        .left_schema = &join_left_schema,
+        .right_schema = &join_right_schema,
+        .out_schema = &join_both_schema,
+        .kind = .inner,
+        .state = a,
+    };
+    const got = try JoinRows.collect(a, .{ .join = &jn }, 3);
+    try got.expect(&.{ 1, 1 }, &.{ "a", "a" });
+}
+
+test "join: cross pairs every probe row with every build row" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const lb = [_]Batch{try kvBatch(a, &join_left_schema, &.{ 1, 2 }, &.{ "a", "b" })};
+    const rb = [_]Batch{try kvBatch(a, &join_right_schema, &.{ 7, 8, 9 }, &.{ "x", "y", "z" })};
+    var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+    var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+    var lscan = Scan{ .src = lts.src() };
+    var rscan = Scan{ .src = rts.src() };
+    var jn = Join{
+        .probe = .{ .scan = &lscan },
+        .build = .{ .scan = &rscan },
+        .left_keys = &.{},
+        .right_keys = &.{},
+        .left_schema = &join_left_schema,
+        .right_schema = &join_right_schema,
+        .out_schema = &join_both_schema,
+        .kind = .cross,
+        .state = a,
+    };
+    const got = try JoinRows.collect(a, .{ .join = &jn }, 3);
+    try got.expect(&.{ 1, 1, 1, 2, 2, 2 }, &.{ "x", "y", "z", "x", "y", "z" });
+}
+
+test "join: the build-size guard reports instead of exhausting memory" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const rb = [_]Batch{try kvBatch(a, &join_right_schema, &.{ 1, 2, 3 }, &.{ "x", "y", "z" })};
+    const lb = [_]Batch{try kvBatch(a, &join_left_schema, &.{1}, &.{"a"})};
+    var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+    var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+    var lscan = Scan{ .src = lts.src() };
+    var rscan = Scan{ .src = rts.src() };
+    var ec = ErrCtx{};
+    var jn = Join{
+        .probe = .{ .scan = &lscan },
+        .build = .{ .scan = &rscan },
+        .left_keys = &.{0},
+        .right_keys = &.{0},
+        .left_schema = &join_left_schema,
+        .right_schema = &join_right_schema,
+        .out_schema = &join_both_schema,
+        .kind = .inner,
+        .state = a,
+        .err = &ec,
+    };
+    const saved = op_mod.join_build_byte_cap;
+    op_mod.join_build_byte_cap = 8;
+    defer op_mod.join_build_byte_cap = saved;
+    const top = Op{ .join = &jn };
+    try testing.expectError(error.JoinBuildTooLarge, top.next(a));
+    try testing.expect(std.mem.indexOf(u8, ec.msg, "exceeds its cap") != null);
 }

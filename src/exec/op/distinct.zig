@@ -9,6 +9,12 @@ const dupeValue = @import("aggregate.zig").dupeValue;
 const keyhash = @import("../keyhash.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
+const Scan = @import("../op.zig").Scan;
+const TestSource = @import("testing_util.zig").TestSource;
+const intBatch = @import("testing_util.zig").intBatch;
+const int_schema = @import("testing_util.zig").int_schema;
+const strBatch = @import("testing_util.zig").strBatch;
+const testing = std.testing;
 
 pub const Distinct = struct {
     stats: Stats = .{},
@@ -118,4 +124,59 @@ fn gatherDeep(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usiz
         outcols[ci] = try bd.finish();
     }
     return Batch{ .schema = b.schema, .columns = outcols, .len = kept };
+}
+
+test "distinct reports the input ordinal of every surviving row" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const batches = [_]Batch{
+        try intBatch(a, &int_schema, &.{ 7, 7, 4 }),
+        try intBatch(a, &int_schema, &.{ 4, 7, 9 }),
+    };
+    var ts = TestSource{ .schema_ = int_schema, .batches = &batches };
+    var scan = Scan{ .src = ts.src() };
+    var dst = Distinct{ .child = .{ .scan = &scan }, .in_schema = &int_schema, .keys = null, .state = a, .gpa = testing.allocator, .track_ords = true };
+
+    var ords = std.array_list.Managed(u64).init(a);
+    const top = Op{ .distinct = &dst };
+    while (try top.next(a)) |b| {
+        try testing.expectEqual(b.len, dst.ords.len);
+        try ords.appendSlice(dst.ords);
+    }
+    try testing.expectEqualSlices(u64, &.{ 0, 2, 5 }, ords.items);
+}
+
+test "distinct dedups across batches, groups nulls as one key, deep-copies strings" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "s", .ty = types.Type.init(.string).asNullable() },
+    } };
+    const batches = [_]Batch{
+        try strBatch(a, &schema, &.{ "a", "b", null }),
+        try strBatch(a, &schema, &.{ "b", null, "c", "a" }),
+    };
+    var ts = TestSource{ .schema_ = schema, .batches = &batches };
+    var scan = Scan{ .src = ts.src() };
+    var dst = Distinct{ .child = .{ .scan = &scan }, .in_schema = &schema, .keys = null, .state = a, .gpa = testing.allocator };
+
+    var got = std.array_list.Managed(?[]const u8).init(a);
+    const top = Op{ .distinct = &dst };
+    while (try top.next(a)) |b| {
+        var r: usize = 0;
+        while (r < b.len) : (r += 1) {
+            const v = b.columns[0].getValue(r);
+            try got.append(if (v.isNull()) null else v.string);
+        }
+        for (batches[0..ts.idx]) |consumed| @memset(consumed.columns[0].data.bytes.values, '#');
+    }
+    const want = [_]?[]const u8{ "a", "b", null, "c" };
+    try testing.expectEqual(want.len, got.items.len);
+    for (want, got.items) |w, g| {
+        if (w) |s| try testing.expectEqualStrings(s, g.?) else try testing.expect(g == null);
+    }
 }

@@ -10,6 +10,16 @@ const eval = @import("../eval.zig");
 const materializeAll = @import("../op.zig").materializeAll;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
+const Filter = @import("../op.zig").Filter;
+const Project = @import("../op.zig").Project;
+const Scan = @import("../op.zig").Scan;
+const TestSource = @import("testing_util.zig").TestSource;
+const ast = @import("../../lang/ast.zig");
+const drainInts = @import("testing_util.zig").drainInts;
+const intBatch = @import("testing_util.zig").intBatch;
+const int_schema = @import("testing_util.zig").int_schema;
+const linearize = @import("../op.zig").linearize;
+const testing = std.testing;
 
 pub const Sort = struct {
     stats: Stats = .{},
@@ -417,4 +427,108 @@ pub fn keyOrder(va: Value, vb: Value, desc: bool) std.math.Order {
     const ord = eval.compareValues(va, vb) orelse return .eq;
     if (ord == .eq) return .eq;
     return if (desc) (if (ord == .lt) std.math.Order.gt else std.math.Order.lt) else ord;
+}
+
+test "sort: descending order with nulls always last" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const batches = [_]Batch{
+        try intBatch(a, &int_schema, &.{ 3, null }),
+        try intBatch(a, &int_schema, &.{ 1, 2 }),
+    };
+    var ts = TestSource{ .schema_ = int_schema, .batches = &batches };
+    var scan = Scan{ .src = ts.src() };
+    var srt = Sort{ .child = .{ .scan = &scan }, .in_schema = &int_schema, .keys = &[_]Sort.Key{.{ .idx = 0, .desc = true }} };
+    try testing.expectEqualDeep(@as([]const ?i64, &.{ 3, 2, 1, null }), try drainInts(a, .{ .sort = &srt }));
+
+    var ts_asc = TestSource{ .schema_ = int_schema, .batches = &batches };
+    var scan_asc = Scan{ .src = ts_asc.src() };
+    var srt_asc = Sort{ .child = .{ .scan = &scan_asc }, .in_schema = &int_schema, .keys = &[_]Sort.Key{.{ .idx = 0, .desc = false }} };
+    try testing.expectEqualDeep(@as([]const ?i64, &.{ 1, 2, 3, null }), try drainInts(a, .{ .sort = &srt_asc }));
+}
+
+test "linearize decomposes map-only pipelines source-to-sink; breakers refuse" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var ts = TestSource{ .schema_ = int_schema, .batches = &.{} };
+    var scan = Scan{ .src = ts.src() };
+    var fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
+    var zero = ast.Expr{ .int_lit = 0 };
+    var pred = ast.Expr{ .binary = .{ .op = .gt, .l = &fx, .r = &zero } };
+    var flt = Filter{ .child = .{ .scan = &scan }, .pred = &pred, .back = a };
+    const pcols = [_]Project.Col{.{ .source = .{ .passthrough = 0 }, .ty = types.Type.init(.int).asNullable() }};
+    var proj = Project{ .child = .{ .filter = &flt }, .cols = &pcols, .out_schema = &int_schema };
+
+    const lin = (try linearize(a, .{ .project = &proj })).?;
+    try testing.expectEqual(@as(usize, 2), lin.stages.len);
+    try testing.expect(lin.stages[0] == .filter);
+    try testing.expect(lin.stages[1] == .project);
+    try testing.expectEqual(@as(*anyopaque, &ts), lin.src.ptr);
+
+    var srt = Sort{ .child = .{ .project = &proj }, .in_schema = &int_schema, .keys = &.{} };
+    try testing.expect((try linearize(a, .{ .sort = &srt })) == null);
+}
+
+test "sortIdx: the radix words order rows exactly as the comparator does" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var prng = std.Random.DefaultPrng.init(0xba5a17);
+    const rnd = prng.random();
+
+    const long_base = "a-long-prefix-shared-by-many-";
+    for (0..60) |round| {
+        const n = 1 + rnd.uintLessThan(usize, 400);
+        const nkeys = 1 + rnd.uintLessThan(usize, 3);
+        const arrs = try a.alloc(KeyArr, nkeys);
+        for (arrs) |*k| {
+            const kind = rnd.uintLessThan(u8, 4);
+            const ty: types.Type = switch (kind) {
+                0 => types.Type.init(.int),
+                1 => types.Type.init(.float),
+                2 => types.Type.decimal(18, 3),
+                else => types.Type.init(.string),
+            };
+            var b = column.Builder.init(a, ty.asNullable());
+            for (0..n) |_| {
+                if (rnd.uintLessThan(u8, 8) == 0) {
+                    try b.append(.null);
+                    continue;
+                }
+                try b.append(switch (kind) {
+                    0 => Value{ .int = rnd.intRangeAtMost(i64, -5, 5) * @as(i64, if (rnd.boolean()) 1 else std.math.maxInt(i64) / 7) },
+                    1 => Value{ .float = switch (rnd.uintLessThan(u8, 6)) {
+                        0 => std.math.nan(f64),
+                        1 => -0.0,
+                        2 => 0.0,
+                        else => @as(f64, @floatFromInt(rnd.intRangeAtMost(i64, -3, 3))) / 2,
+                    } },
+                    2 => Value{ .decimal = .{ .unscaled = rnd.intRangeAtMost(i128, -30, 30), .scale = rnd.uintLessThan(u8, 3) } },
+                    else => Value{ .string = blk: {
+                        const len = rnd.uintLessThan(usize, 4);
+                        const tail = try a.alloc(u8, len);
+                        for (tail) |*c| c.* = "ab\x00"[rnd.uintLessThan(usize, 3)];
+                        break :blk if (rnd.boolean()) try std.mem.concat(a, u8, &.{ long_base, tail }) else tail;
+                    } },
+                });
+            }
+            k.* = try KeyArr.prepare(a, try b.finish(), rnd.boolean());
+        }
+        const want = try a.alloc(usize, n);
+        const got = try a.alloc(usize, n);
+        for (want, got, 0..) |*x, *y, i| {
+            x.* = i;
+            y.* = i;
+        }
+        std.mem.sort(usize, want, SortCtx{ .arrs = arrs }, SortCtx.lessThan);
+        try sortIdx(a, got, arrs);
+        testing.expectEqualSlices(usize, want, got) catch |e| {
+            std.debug.print("sortIdx mismatch in round {d}\n", .{round});
+            return e;
+        };
+    }
 }

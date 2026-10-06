@@ -11,6 +11,12 @@ const dupeValue = @import("aggregate.zig").dupeValue;
 const keyOrder = @import("sort.zig").keyOrder;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
+const Limit = @import("../op.zig").Limit;
+const Scan = @import("../op.zig").Scan;
+const TestSource = @import("testing_util.zig").TestSource;
+const driver = @import("../../connect/driver.zig");
+const kvBatch = @import("testing_util.zig").kvBatch;
+const testing = std.testing;
 
 pub const TopN = struct {
     pub const max_rows: u64 = 1 << 16;
@@ -254,4 +260,125 @@ fn dupeValueGpa(gpa: std.mem.Allocator, v: Value) !Value {
         .bytes => |s| .{ .bytes = try gpa.dupe(u8, s) },
         else => v,
     };
+}
+
+test "top_n keeps best rows across batches, honors offset, matches full sort" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "x", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "s", .ty = types.Type.init(.string).asNullable() },
+    } };
+    const batches = [_]Batch{
+        try kvBatch(a, &schema, &.{ 5, 1, 4 }, &.{ "e", "a", "d" }),
+        try kvBatch(a, &schema, &.{ 2, 8, 3 }, &.{ "b", "z", "c" }),
+        try kvBatch(a, &schema, &.{ null, 0, 9 }, &.{ "n", "y", "q" }),
+    };
+    const Row = struct { x: ?i64, s: []const u8 };
+    const drain = struct {
+        fn f(al: std.mem.Allocator, top: Op) ![]const Row {
+            var rows = std.array_list.Managed(Row).init(al);
+            while (try top.next(al)) |b| {
+                var r: usize = 0;
+                while (r < b.len) : (r += 1) {
+                    const v = b.columns[0].getValue(r);
+                    try rows.append(.{ .x = if (v.isNull()) null else v.int, .s = b.columns[1].getValue(r).string });
+                }
+            }
+            return rows.toOwnedSlice();
+        }
+    }.f;
+
+    const cases = [_]struct { count: u64, offset: u64, desc: bool }{
+        .{ .count = 2, .offset = 1, .desc = false },
+        .{ .count = 3, .offset = 0, .desc = true },
+        .{ .count = 4, .offset = 7, .desc = false },
+        .{ .count = 5, .offset = 6, .desc = true },
+    };
+    for (cases, 0..) |tc, ci| {
+        const keys = try a.dupe(Sort.Key, &.{.{ .idx = 0, .desc = tc.desc }});
+
+        var ts = TestSource{ .schema_ = schema, .batches = &batches };
+        var scan = Scan{ .src = ts.src() };
+        var tn = TopN{
+            .child = .{ .scan = &scan },
+            .in_schema = &schema,
+            .keys = keys,
+            .count = tc.count,
+            .offset = tc.offset,
+            .state = a,
+            .gpa = testing.allocator,
+        };
+        const got = try drain(a, .{ .top_n = &tn });
+
+        var ts_ref = TestSource{ .schema_ = schema, .batches = &batches };
+        var scan_ref = Scan{ .src = ts_ref.src() };
+        var srt = Sort{ .child = .{ .scan = &scan_ref }, .in_schema = &schema, .keys = keys };
+        var lim = Limit{ .child = .{ .sort = &srt }, .remaining = tc.count, .to_skip = tc.offset };
+        const want = try drain(a, .{ .limit = &lim });
+
+        try testing.expectEqual(want.len, got.len);
+        for (want, got) |w, g| {
+            try testing.expectEqual(w.x, g.x);
+            try testing.expectEqualStrings(w.s, g.s);
+        }
+
+        if (ci == 0) {
+            try testing.expectEqual(@as(usize, 2), got.len);
+            try testing.expectEqual(@as(?i64, 1), got[0].x);
+            try testing.expectEqualStrings("a", got[0].s);
+            try testing.expectEqual(@as(?i64, 2), got[1].x);
+            try testing.expectEqualStrings("b", got[1].s);
+        }
+    }
+}
+
+test "top_n: equal keys rank by input position, also when a lane reads items out of order" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "x", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "s", .ty = types.Type.init(.string).asNullable() },
+    } };
+    const Src = struct {
+        batches: []const Batch,
+        items: []const usize,
+        i: usize = 0,
+        cur: usize = 0,
+        sch: types.Schema,
+        fn schemaFn(p: *anyopaque) types.Schema {
+            return @as(*@This(), @ptrCast(@alignCast(p))).sch;
+        }
+        fn nextFn(p: *anyopaque, _: std.mem.Allocator) anyerror!?Batch {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            if (self.i == self.batches.len) return null;
+            defer self.i += 1;
+            self.cur = self.items[self.i];
+            return self.batches[self.i];
+        }
+        fn closeFn(_: *anyopaque) void {}
+        const vt = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
+    };
+    const batches = [_]Batch{
+        try kvBatch(a, &schema, &.{ 7, 7, 7 }, &.{ "five-a", "five-b", "five-c" }),
+        try kvBatch(a, &schema, &.{ 7, 7, 7 }, &.{ "two-a", "two-b", "two-c" }),
+    };
+    var src = Src{ .batches = &batches, .items = &.{ 5, 2 }, .sch = schema };
+    var scan = Scan{ .src = .{ .ptr = &src, .vtable = &Src.vt } };
+    var tn = TopN{
+        .child = .{ .scan = &scan },
+        .in_schema = &schema,
+        .keys = &[_]Sort.Key{.{ .idx = 0, .desc = true }},
+        .count = 2,
+        .offset = 0,
+        .state = a,
+        .gpa = testing.allocator,
+        .item = &src.cur,
+    };
+    const b = (try tn.next(a)).?;
+    try testing.expectEqualStrings("two-a", b.columns[1].getValue(0).string);
+    try testing.expectEqualStrings("two-b", b.columns[1].getValue(1).string);
 }

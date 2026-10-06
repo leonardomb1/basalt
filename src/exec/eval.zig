@@ -55,7 +55,8 @@
 //! row and vector forms in `fn_typing.zig`, `fn_row.zig` and `fn_vec.zig`;
 //! `cast.zig`, `format.zig`, `time.zig` and `strings.zig` the value helpers, and
 //! `support.zig` the shared caches, failure notes and value ordering. This file
-//! keeps the types, `TypeCtx` and the tests, and re-exports the public API.
+//! keeps the types and `TypeCtx`, and re-exports the public API. Each part carries
+//! the tests of its own code; `testing_util.zig` holds the helpers they share.
 
 const std = @import("std");
 const regex = @import("regex.zig");
@@ -64,15 +65,16 @@ const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const column = @import("column.zig");
 const Decimal = @import("value.zig").Decimal;
-const Value = @import("value.zig").Value;
+pub const Value = @import("value.zig").Value;
 const json = @import("json.zig");
 const pow10f = @import("value.zig").pow10f;
-const Batch = @import("batch.zig").Batch;
+pub const Batch = @import("batch.zig").Batch;
 
 const Type = types.Type;
 
 pub const TypeError = error{ TypeError, OutOfMemory };
 pub const EvalError = error{ CastFailed, DivByZero, TypeMismatch, IntOverflow, PatternTooComplex, InvalidJson, OutOfMemory };
+const evalLit = @import("eval/testing_util.zig").evalLit;
 
 pub const TypeCtx = struct {
     schema: types.Schema,
@@ -313,440 +315,7 @@ const reverseChars = @import("eval/strings.zig").reverseChars;
 const caseMapInto = @import("eval/strings.zig").caseMapInto;
 const likeMatch = @import("eval/strings.zig").likeMatch;
 
-test "parseIsoTime: the text a time prints as, and nothing out of range" {
-    try std.testing.expectEqual(@as(?i64, 3_723_000_000), parseIsoTime("01:02:03"));
-    try std.testing.expectEqual(@as(?i64, 86_399_999_999), parseIsoTime("23:59:59.999999"));
-    try std.testing.expectEqual(@as(?i64, 45_000_000_000), parseIsoTime(" 12:30 "));
-    try std.testing.expectEqual(@as(?i64, null), parseIsoTime("24:00:00"));
-    try std.testing.expectEqual(@as(?i64, null), parseIsoTime("1:02:03"));
-    try std.testing.expectEqual(@as(?i64, null), parseIsoTime("01:02:03 extra"));
-}
-
-test "decimals lose digits by rounding half away from zero, on every path" {
-    const cases = [_]struct { u: i128, s: u8, to: u8, want: i128 }{
-        .{ .u = 12345, .s = 3, .to = 2, .want = 1235 },
-        .{ .u = -12345, .s = 3, .to = 2, .want = -1235 },
-        .{ .u = 12344, .s = 3, .to = 2, .want = 1234 },
-        .{ .u = 5, .s = 3, .to = 2, .want = 1 },
-        .{ .u = -4, .s = 3, .to = 2, .want = 0 },
-        .{ .u = 999, .s = 3, .to = 0, .want = 1 },
-        .{ .u = std.math.maxInt(i128), .s = 38, .to = 0, .want = 2 },
-    };
-    for (cases) |c| try std.testing.expectEqual(c.want, rescaleTo(.{ .unscaled = c.u, .scale = c.s }, c.to).?.unscaled);
-
-    const floats = [_]struct { x: f64, to: u8, want: i128 }{
-        .{ .x = 12.345, .to = 2, .want = 1235 },
-        .{ .x = -12.345, .to = 2, .want = -1235 },
-        .{ .x = 1.005, .to = 2, .want = 101 },
-        .{ .x = 2.675, .to = 2, .want = 268 },
-        .{ .x = 0.1 + 0.2, .to = 17, .want = 30000000000000000 },
-        .{ .x = 1e-300, .to = 2, .want = 0 },
-        .{ .x = 123456789012345678.0, .to = 0, .want = 123456789012346000 },
-    };
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    for (floats) |c| {
-        const got = try castValueTyped(ar.allocator(), .{ .float = c.x }, types.Type.decimal(38, c.to));
-        try std.testing.expectEqual(c.want, got.decimal.unscaled);
-    }
-    try std.testing.expectError(error.CastFailed, castValueTyped(ar.allocator(), .{ .float = 1e300 }, types.Type.decimal(10, 2)));
-    try std.testing.expectError(error.CastFailed, castValueTyped(ar.allocator(), .{ .float = std.math.nan(f64) }, types.Type.decimal(10, 2)));
-    try std.testing.expectEqual(@as(i128, -1235), (try castValueTyped(ar.allocator(), .{ .string = "-12.345" }, types.Type.decimal(10, 2))).decimal.unscaled);
-}
-
-test "dates and timestamps before year 0 print with a sign instead of trapping" {
-    var buf: [128]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    try writeDate(&w, -1_000_000);
-    try w.writeByte(' ');
-    try writeTimestamp(&w, -1_000_000 * 86_400_000_000 + 1);
-    try w.writeByte('|');
-    try writeDate(&w, -719_529);
-    try w.writeByte('|');
-    try writeDate(&w, -719_530);
-    try std.testing.expectEqualStrings("-0768-02-05 -0768-02-05 00:00:00.000001|0000-01-01|-0001-12-31", w.buffered());
-}
-
-test "format temporal values for text sinks" {
-    const alloc = std.testing.allocator;
-    const cases = .{
-        .{ try formatDate(alloc, 0), "1970-01-01" },
-        .{ try formatDate(alloc, -1), "1969-12-31" },
-        .{ try formatTimestamp(alloc, 0), "1970-01-01 00:00:00" },
-        .{ try formatTimestamp(alloc, 86_400_000_000 + (1 * 3600 + 2 * 60 + 3) * 1_000_000), "1970-01-02 01:02:03" },
-    };
-    inline for (cases) |c| {
-        defer alloc.free(c[0]);
-        try std.testing.expectEqualStrings(c[1], c[0]);
-    }
-}
-
-test "UTF-8 string helpers: substr, like, reverse, pad, case-map" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expectEqualStrings("01", try substrChars(a, "SD1010", 4, 2));
-    try std.testing.expectEqualStrings("SD1", try substrChars(a, "SD1010", 1, 3));
-    try std.testing.expectEqualStrings("010", try substrChars(a, "SD1010", 4, null));
-    try std.testing.expectEqualStrings("", try substrChars(a, "SD1010", 99, 2));
-
-    try std.testing.expect(likeMatch("hello, world", "hello%"));
-    try std.testing.expect(likeMatch("hello", "h_llo"));
-    try std.testing.expect(likeMatch("anything", "%"));
-    try std.testing.expect(!likeMatch("hello", "h_l"));
-    try std.testing.expect(!likeMatch("paid", "pending%"));
-
-    try std.testing.expect(likeMatch("%%", "%"));
-    try std.testing.expect(likeMatch("50% off", "50%"));
-    try std.testing.expect(likeMatch("ab%c", "ab%"));
-    try std.testing.expect(likeMatch("a%b", "a%b"));
-    try std.testing.expect(!likeMatch("a%b", "a%c"));
-
-    try std.testing.expectEqualStrings("ïv", try substrChars(a, "naïve", 3, 2));
-    try std.testing.expectEqual(@as(usize, 5), charCount("naïve"));
-    try std.testing.expectEqual(@as(usize, 3), charCount("a\xe9b"));
-    try std.testing.expectEqualStrings("本日", try reverseChars(a, "日本"));
-    try std.testing.expectEqualStrings("aç", endSlice("ação", -2, true));
-    try std.testing.expectEqualStrings("ão", endSlice("ação", 2, false));
-    try std.testing.expectEqualStrings("çã", endSlice("çãoo", 2, true));
-    try std.testing.expectEqualStrings("ñ-ñ-a", try padChars(a, "a", 5, "ñ-", true));
-    try std.testing.expectEqualStrings("日", try padChars(a, "日本", 1, " ", false));
-    try std.testing.expect(likeMatch("ünï", "_n_"));
-    try std.testing.expect(!likeMatch("ü", "__"));
-    var out = std.array_list.Managed(u8).init(a);
-    try caseMapInto(&out, "café ação ÿ łódź πσς ελληνικά ώ жё", true);
-    try std.testing.expectEqualStrings("CAFÉ AÇÃO Ÿ ŁÓDŹ ΠΣΣ ΕΛΛΗΝΙΚΆ Ώ ЖЁ", out.items);
-    out.clearRetainingCapacity();
-    try caseMapInto(&out, "CAFÉ AÇÃO Ÿ ŁÓDŹ ΠΣ ЖЁ ß", false);
-    try std.testing.expectEqualStrings("café ação ÿ łódź πσ жё ß", out.items);
-}
-
-test "constEval folds an expression over plan-time bindings" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var tbl = ast.Expr{ .field = .{ .parts = &[_][]const u8{"tbl"} } };
-    var prefix = ast.Expr{ .str_lit = "SD1" };
-    var sw_args = [_]*ast.Expr{ &tbl, &prefix };
-    var sw = ast.Expr{ .call = .{ .name = "starts_with", .args = &sw_args } };
-    const r = try constEval(a, &sw, &[_][]const u8{"tbl"}, &[_]Value{.{ .string = "SD1010" }});
-    try std.testing.expect(r.bool);
-
-    var four = ast.Expr{ .int_lit = 4 };
-    var two = ast.Expr{ .int_lit = 2 };
-    var ss_args = [_]*ast.Expr{ &tbl, &four, &two };
-    var ss = ast.Expr{ .call = .{ .name = "substr", .args = &ss_args } };
-    const e = try constEval(a, &ss, &[_][]const u8{"tbl"}, &[_]Value{.{ .string = "SD1010" }});
-    try std.testing.expectEqualStrings("01", e.string);
-}
-
 const parser = @import("../lang/sql_parser.zig");
-
-test "type-check and evaluate an if-expression with 3VL" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const pred = try parser.parseExprStr(a, "amount > 100", &diag);
-    const sel = try parser.parseExprStr(a, "if(amount >= 100, 'yes', 'no')", &diag);
-
-    const schema = types.Schema{ .fields = &.{.{ .name = "amount", .ty = Type.init(.int).asNullable() }} };
-    var ctx = TypeCtx{ .schema = schema, .arena = a };
-    try std.testing.expectEqual(types.TypeKind.bool, (try ctx.typeOf(pred)).kind);
-    const sel_ty = try ctx.typeOf(sel);
-    try std.testing.expectEqual(types.TypeKind.string, sel_ty.kind);
-
-    const amt = try column.intColumn(a, &.{ 50, 150, null });
-    var cols = [_]column.Column{amt};
-    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 3 };
-
-    const out = try evalColumn(a, sel, batch, sel_ty);
-    try std.testing.expectEqualStrings("no", out.getValue(0).string);
-    try std.testing.expectEqualStrings("yes", out.getValue(1).string);
-    try std.testing.expectEqualStrings("no", out.getValue(2).string);
-}
-
-test "a date column compares on the vectorized path, and matches rowwise" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    const days = [_]?i32{ 9130, 9131, 9132, null };
-    var validity = try column.Bitmap.initFull(a, days.len);
-    const store = try a.alloc(i32, days.len);
-    for (days, 0..) |d, i| {
-        if (d) |x| store[i] = x else {
-            store[i] = 0;
-            validity.setValid(i, false);
-        }
-    }
-    const dcol = column.Column{
-        .ty = Type.init(.date).asNullable(),
-        .len = days.len,
-        .validity = validity,
-        .data = .{ .i32 = store },
-    };
-    const schema = types.Schema{ .fields = &.{.{ .name = "d", .ty = Type.init(.date).asNullable() }} };
-    var cols = [_]column.Column{dcol};
-    const batch = Batch{ .schema = &schema, .columns = &cols, .len = days.len };
-
-    const sqlp = @import("../lang/sql_parser.zig");
-    const cases = [_]struct { src: []const u8, want: [4]?bool }{
-        .{ .src = "d < '1995-01-01'", .want = .{ true, false, false, null } },
-        .{ .src = "d > '1995-01-01'", .want = .{ false, false, true, null } },
-        .{ .src = "d <= '1995-01-01'", .want = .{ true, true, false, null } },
-        .{ .src = "d >= '1995-01-01'", .want = .{ false, true, true, null } },
-        .{ .src = "d = '1995-01-01'", .want = .{ false, true, false, null } },
-        .{ .src = "d <> '1995-01-01'", .want = .{ true, false, true, null } },
-    };
-    for (cases) |tc| {
-        var diag: sqlp.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const e = try sqlp.parseExprStr(a, tc.src, &diag);
-        _ = evalVecNode(a, e, batch) catch |err| {
-            std.debug.print("expr de-vectorized: {s}: {s}\n", .{ tc.src, @errorName(err) });
-            return err;
-        };
-        const out = try evalColumn(a, e, batch, Type.init(.bool).asNullable());
-        for (tc.want, 0..) |w, i| {
-            const got = out.getValue(i);
-            if (w) |b| {
-                try std.testing.expectEqual(b, got.bool);
-            } else {
-                try std.testing.expect(got.isNull());
-            }
-            const rw = try evalRow(a, e, batch, i);
-            if (w) |b| try std.testing.expectEqual(b, rw.bool) else try std.testing.expect(rw.isNull());
-        }
-    }
-
-    var d2: sqlp.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const bad = try sqlp.parseExprStr(a, "d < 'not-a-date'", &d2);
-    try std.testing.expectError(error.TypeMismatch, evalColumn(a, bad, batch, Type.init(.bool).asNullable()));
-}
-
-test "vectorized kernels match the rowwise evaluator" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    const x = try column.intColumn(a, &.{ 10, 20, null, 40, 0 });
-    const y = try column.intColumn(a, &.{ 3, null, 7, 8, 5 });
-    const schema = types.Schema{ .fields = &.{
-        .{ .name = "x", .ty = Type.init(.int).asNullable() },
-        .{ .name = "y", .ty = Type.init(.int).asNullable() },
-    } };
-    var cols = [_]column.Column{ x, y };
-    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 5 };
-
-    const exprs = [_]struct { src: []const u8, vectorized: bool }{
-        .{ .src = "x + y", .vectorized = true },
-        .{ .src = "x * y - 1", .vectorized = true },
-        .{ .src = "x / y", .vectorized = true },
-        .{ .src = "x > y", .vectorized = true },
-        .{ .src = "x >= 10 and y < 8", .vectorized = true },
-        .{ .src = "x == 40 or y == 5", .vectorized = true },
-        .{ .src = "if(x > y, x, y)", .vectorized = true },
-        .{ .src = "-x", .vectorized = true },
-        .{ .src = "x is null", .vectorized = true },
-        .{ .src = "if(x != 0, y / x, 0)", .vectorized = false },
-        .{ .src = "x != 0 and y / x > 1", .vectorized = false },
-        .{ .src = "x == 0 or y / x > 1", .vectorized = false },
-    };
-    for (exprs) |tc| {
-        const body = tc.src;
-        var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const e = try parser.parseExprStr(a, body, &diag);
-        var ctx = TypeCtx{ .schema = schema, .arena = a };
-        const ty = try ctx.typeOf(e);
-
-        if (tc.vectorized) {
-            _ = evalVecNode(a, e, batch) catch |err| {
-                std.debug.print("expr de-vectorized: {s}: {s}\n", .{ body, @errorName(err) });
-                return err;
-            };
-        }
-
-        const vec = try evalColumn(a, e, batch, ty);
-        const rowwise = try evalColumnRowwise(a, e, batch, ty);
-        try std.testing.expectEqual(rowwise.len, vec.len);
-        var i: usize = 0;
-        while (i < vec.len) : (i += 1) {
-            const want = rowwise.getValue(i);
-            const got = vec.getValue(i);
-            try std.testing.expectEqual(want.isNull(), got.isNull());
-            if (!want.isNull()) {
-                if (compareValues(want, got)) |ord| {
-                    try std.testing.expect(ord == .eq);
-                } else try std.testing.expect(false);
-            }
-        }
-    }
-}
-
-test "vectorized string kernels match the rowwise evaluator" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    var sb = column.Builder.init(a, Type.init(.string).asNullable());
-    try sb.append(.{ .string = "  Apple " });
-    try sb.append(.null);
-    try sb.append(.{ .string = "banana" });
-    try sb.append(.{ .string = "" });
-    try sb.append(.{ .string = "Cherry pie" });
-    const s = try sb.finish();
-    const x = try column.intColumn(a, &.{ 1, 2, null, 4, 5 });
-    const schema = types.Schema{ .fields = &.{
-        .{ .name = "s", .ty = Type.init(.string).asNullable() },
-        .{ .name = "x", .ty = Type.init(.int).asNullable() },
-    } };
-    var cols = [_]column.Column{ s, x };
-    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 5 };
-
-    const exprs = [_][]const u8{
-        "upper(s)",
-        "lower(s)",
-        "trim(s)",
-        "length(s)",
-        "concat(s, '-', s)",
-        "starts_with(s, 'b')",
-        "ends_with(s, 'e')",
-        "contains(s, 'an')",
-        "like(s, '%an%')",
-        "substr(s, 2, 3)",
-        "replace(s, 'an', 'AN')",
-        "coalesce(s, 'fallback')",
-        "if(contains(s, 'p'), upper(s), s)",
-        "length(trim(s)) > 5 and contains(s, 'e')",
-    };
-    for (exprs) |body| {
-        var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const e = try parser.parseExprStr(a, body, &diag);
-        var ctx = TypeCtx{ .schema = schema, .arena = a };
-        const ty = try ctx.typeOf(e);
-
-        _ = evalVecNode(a, e, batch) catch |err| {
-            std.debug.print("expr de-vectorized: {s}: {s}\n", .{ body, @errorName(err) });
-            return err;
-        };
-
-        const vec = try evalColumn(a, e, batch, ty);
-        const rowwise = try evalColumnRowwise(a, e, batch, ty);
-        try std.testing.expectEqual(rowwise.len, vec.len);
-        var i: usize = 0;
-        while (i < vec.len) : (i += 1) {
-            const want = rowwise.getValue(i);
-            const got = vec.getValue(i);
-            try std.testing.expectEqual(want.isNull(), got.isNull());
-            if (!want.isNull()) {
-                if (compareValues(want, got)) |ord| {
-                    try std.testing.expect(ord == .eq);
-                } else try std.testing.expect(false);
-            }
-        }
-    }
-}
-
-test "bitwise operators and hex builtins" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    const schema = types.Schema{ .fields = &.{
-        .{ .name = "x", .ty = Type.init(.int).asNullable() },
-        .{ .name = "s", .ty = Type.init(.string) },
-    } };
-    const x = try column.intColumn(a, &.{ -8, null });
-    var sb = column.Builder.init(a, Type.init(.string));
-    try sb.append(.{ .string = "0xFF" });
-    try sb.append(.{ .string = "ff" });
-    var cols = [_]column.Column{ x, try sb.finish() };
-    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 2 };
-
-    const S = struct {
-        fn checked(al: std.mem.Allocator, sch: types.Schema, src: []const u8) !struct { *ast.Expr, Type } {
-            var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-            const e = try parser.parseExprStr(al, src, &diag);
-            var ctx = TypeCtx{ .schema = sch, .arena = al };
-            return .{ e, try ctx.typeOf(e) };
-        }
-    };
-
-    const ints = [_]struct { src: []const u8, want: i64 }{
-        .{ .src = "1 | 2 & 3", .want = 3 },
-        .{ .src = "6 & 3", .want = 2 },
-        .{ .src = "6 ^ 3", .want = 5 },
-        .{ .src = "1 + 1 << 2", .want = 8 },
-        .{ .src = "~0", .want = -1 },
-        .{ .src = "~x", .want = 7 },
-        .{ .src = "x >> 1", .want = -4 },
-        .{ .src = "1 << 63 >> 63", .want = -1 },
-        .{ .src = "1 << 64", .want = 0 },
-        .{ .src = "8 << -1", .want = 0 },
-        .{ .src = "8 >> 100", .want = 0 },
-        .{ .src = "x >> 100", .want = -1 },
-        .{ .src = "x >> -1", .want = 0 },
-        .{ .src = "bit_count(255)", .want = 8 },
-        .{ .src = "bit_count(~0)", .want = 64 },
-        .{ .src = "bit_count(0)", .want = 0 },
-        .{ .src = "from_hex('ff')", .want = 255 },
-        .{ .src = "from_hex('0xFF')", .want = 255 },
-        .{ .src = "from_hex(s)", .want = 255 },
-        .{ .src = "from_hex(to_hex(x))", .want = -8 },
-        .{ .src = "from_hex(to_hex(0))", .want = 0 },
-    };
-    for (ints) |c| {
-        const e, const t = try S.checked(a, schema, c.src);
-        try std.testing.expectEqual(types.TypeKind.int, t.kind);
-        const col = try evalColumn(a, e, batch, t);
-        try std.testing.expectEqual(c.want, col.getValue(0).int);
-        try std.testing.expectEqual(c.want, (try evalRow(a, e, batch, 0)).int);
-    }
-
-    const hex = [_]struct { src: []const u8, want: []const u8 }{
-        .{ .src = "to_hex(255)", .want = "ff" },
-        .{ .src = "to_hex(0)", .want = "0" },
-        .{ .src = "to_hex(-1)", .want = "ffffffffffffffff" },
-        .{ .src = "to_hex(x)", .want = "fffffffffffffff8" },
-    };
-    for (hex) |c| {
-        const e, const t = try S.checked(a, schema, c.src);
-        try std.testing.expectEqual(types.TypeKind.string, t.kind);
-        const col = try evalColumn(a, e, batch, t);
-        try std.testing.expectEqualStrings(c.want, col.getValue(0).string);
-    }
-
-    const nulls = [_][]const u8{ "x & 1", "x | 1", "x ^ 1", "x << 1", "x >> 1", "~x", "bit_count(x)", "to_hex(x)", "from_hex(to_hex(x))" };
-    for (nulls) |src| {
-        const e, const t = try S.checked(a, schema, src);
-        try std.testing.expect(t.nullable);
-        try std.testing.expect((try evalColumn(a, e, batch, t)).getValue(1).isNull());
-        try std.testing.expect((try evalRow(a, e, batch, 1)).isNull());
-    }
-
-    {
-        const pair = try S.checked(a, schema, "x & 1");
-        try std.testing.expectError(error.Unsupported, evalVecNode(a, pair[0], batch));
-        const v = try evalVec(a, pair[0], batch);
-        try std.testing.expect(v == .col and v.col.ty.kind == .int);
-        try std.testing.expectEqual(@as(i64, 0), v.col.getValue(0).int);
-        try std.testing.expect(v.col.getValue(1).isNull());
-    }
-
-    for ([_][]const u8{ "from_hex('zz')", "from_hex('')", "from_hex('0x')", "from_hex('1ffffffffffffffff')" }) |src| {
-        const e, const t = try S.checked(a, schema, src);
-        try std.testing.expectError(error.CastFailed, evalRow(a, e, batch, 0));
-        try std.testing.expectError(error.CastFailed, evalColumn(a, e, batch, t));
-    }
-
-    for ([_][]const u8{ "s & 1", "1.5 & 1", "1 << 1.5", "~s", "bit_count(s)", "to_hex(s)", "from_hex(1)" }) |src| {
-        var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const e = try parser.parseExprStr(a, src, &diag);
-        var ctx = TypeCtx{ .schema = schema, .arena = a };
-        try std.testing.expectError(error.TypeError, ctx.typeOf(e));
-    }
-}
 
 test "type errors: unknown field and non-bool not" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -764,95 +333,6 @@ test "type errors: unknown field and non-bool not" {
     var notx = ast.Expr{ .unary = .{ .op = .not, .e = &fx } };
     try std.testing.expectError(error.TypeError, ctx.typeOf(&notx));
     try std.testing.expect(std.mem.indexOf(u8, ctx.msg, "bool operand") != null);
-}
-
-test "castValue: conversions succeed and failures are CastFailed specifically" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    try std.testing.expectEqual(@as(i64, 42), (try castValue(a, .{ .string = " 42 " }, .int)).int);
-    try std.testing.expectEqual(@as(i64, 1), (try castValue(a, .{ .bool = true }, .int)).int);
-    try std.testing.expectEqual(@as(i64, -3), (try castValue(a, .{ .float = -3.9 }, .int)).int);
-    try std.testing.expectEqual(@as(f64, 2.5), (try castValue(a, .{ .string = "2.5" }, .float)).float);
-    try std.testing.expect((try castValue(a, .{ .string = " TRUE " }, .bool)).bool);
-    try std.testing.expect(!(try castValue(a, .{ .int = 0 }, .bool)).bool);
-    try std.testing.expectEqualStrings("123.45", (try castValue(a, .{ .decimal = .{ .unscaled = 12345, .scale = 2 } }, .string)).string);
-
-    try std.testing.expectError(error.CastFailed, castValue(a, .{ .string = "abc" }, .int));
-    try std.testing.expectError(error.CastFailed, castValue(a, .{ .float = std.math.nan(f64) }, .int));
-    try std.testing.expectError(error.CastFailed, castValue(a, .{ .float = 1e19 }, .int));
-    try std.testing.expectError(error.CastFailed, castValue(a, .{ .string = "yes" }, .bool));
-    try std.testing.expectError(error.CastFailed, castValue(a, .{ .bool = true }, .float));
-}
-
-test "formatDecimal pads sub-unit magnitudes, zero, and negatives" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    try std.testing.expectEqualStrings("-0.005", try formatDecimal(a, -5, 3));
-    try std.testing.expectEqualStrings("0", try formatDecimal(a, 0, 0));
-    try std.testing.expectEqualStrings("0.00", try formatDecimal(a, 0, 2));
-    try std.testing.expectEqualStrings("7", try formatDecimal(a, 7, 0));
-}
-
-test "int division/modulo by zero raise DivByZero; float division yields inf" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    const schema = types.Schema{ .fields = &.{.{ .name = "x", .ty = Type.init(.int).asNullable() }} };
-    const x = try column.intColumn(a, &.{ 6, null });
-    var cols = [_]column.Column{x};
-    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 2 };
-
-    var fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
-    var zero = ast.Expr{ .int_lit = 0 };
-    var div = ast.Expr{ .binary = .{ .op = .div, .l = &fx, .r = &zero } };
-    var mod = ast.Expr{ .binary = .{ .op = .mod, .l = &fx, .r = &zero } };
-    try std.testing.expectError(error.DivByZero, evalColumn(a, &div, batch, Type.init(.int).asNullable()));
-    try std.testing.expectError(error.DivByZero, evalRow(a, &div, batch, 0));
-    try std.testing.expectError(error.DivByZero, evalRow(a, &mod, batch, 0));
-
-    var fzero = ast.Expr{ .float_lit = 0.0 };
-    var fdiv = ast.Expr{ .binary = .{ .op = .div, .l = &fx, .r = &fzero } };
-    const out = try evalColumn(a, &fdiv, batch, Type.init(.float).asNullable());
-    try std.testing.expect(std.math.isInf(out.getValue(0).float));
-    try std.testing.expect(out.getValue(1).isNull());
-}
-
-test "compareValues orders across numeric kinds and rejects mixed kinds" {
-    try std.testing.expectEqual(std.math.Order.lt, compareValues(.{ .int = 1 }, .{ .float = 1.5 }).?);
-    try std.testing.expectEqual(std.math.Order.eq, compareValues(.{ .float = 2.0 }, .{ .int = 2 }).?);
-    try std.testing.expectEqual(std.math.Order.gt, compareValues(.{ .decimal = .{ .unscaled = 250, .scale = 2 } }, .{ .int = 2 }).?);
-    try std.testing.expectEqual(std.math.Order.lt, compareValues(.{ .string = "a" }, .{ .string = "b" }).?);
-    try std.testing.expectEqual(std.math.Order.lt, compareValues(.{ .bool = false }, .{ .bool = true }).?);
-    try std.testing.expect(compareValues(.{ .string = "1" }, .{ .int = 1 }) == null);
-    try std.testing.expect(compareValues(.{ .bool = true }, .{ .int = 1 }) == null);
-    try std.testing.expect(compareValues(.{ .date = 1 }, .{ .timestamp = 1 }) == null);
-}
-
-test "evalColumn over an empty batch yields an empty column" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    const schema = types.Schema{ .fields = &.{.{ .name = "x", .ty = Type.init(.int) }} };
-    const x = try column.intColumn(a, &.{});
-    var cols = [_]column.Column{x};
-    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 0 };
-
-    var fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
-    var one = ast.Expr{ .int_lit = 1 };
-    var plus = ast.Expr{ .binary = .{ .op = .add, .l = &fx, .r = &one } };
-    const out = try evalColumn(a, &plus, batch, Type.init(.int));
-    try std.testing.expectEqual(@as(usize, 0), out.len);
-}
-
-fn evalLit(a: std.mem.Allocator, src: []const u8) !Value {
-    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const e = try parser.parseExprStr(a, src, &diag);
-    return constEval(a, e, &[_][]const u8{}, &[_]Value{});
 }
 
 test "math builtins: rounding direction, guarded mod, domain edges" {
@@ -904,33 +384,6 @@ test "nullif propagates nulls; greatest/least ignore them" {
     try std.testing.expectEqualStrings("pear", (try evalLit(a, "greatest('apple', 'pear')")).string);
 }
 
-test "try_cast yields null exactly where cast raises" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    try std.testing.expectEqual(@as(i64, 3), (try evalLit(a, "try_cast('3' as int)")).int);
-    try std.testing.expect((try evalLit(a, "try_cast('x' as int)")).isNull());
-    try std.testing.expectError(error.CastFailed, evalLit(a, "cast('x' as int)"));
-
-    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const e = try parser.parseExprStr(a, "try_cast(s as int)", &diag);
-    const schema = types.Schema{ .fields = &.{.{ .name = "s", .ty = Type.init(.string) }} };
-    var ctx = TypeCtx{ .schema = schema, .arena = a };
-    const ty = try ctx.typeOf(e);
-    try std.testing.expectEqual(types.TypeKind.int, ty.kind);
-    try std.testing.expect(ty.nullable);
-
-    var sb = column.Builder.init(a, Type.init(.string));
-    try sb.append(.{ .string = "3" });
-    try sb.append(.{ .string = "x" });
-    var cols = [_]column.Column{try sb.finish()};
-    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 2 };
-    const out = try evalColumn(a, e, batch, ty);
-    try std.testing.expectEqual(@as(i64, 3), out.getValue(0).int);
-    try std.testing.expect(out.getValue(1).isNull());
-}
-
 test "string builtins: padding truncates, ends take negatives, split_part clamps" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -960,62 +413,6 @@ test "string builtins: padding truncates, ends take negatives, split_part clamps
 
     try std.testing.expectEqualStrings("cba", (try evalLit(a, "reverse('abc')")).string);
     try std.testing.expect((try evalLit(a, "reverse(null)")).isNull());
-}
-
-test "date builtins: month clamp, boundary diffs, epoch round trip, strftime padding" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    try std.testing.expectEqualStrings("2024-02-29", try formatDate(a, (try evalLit(a, "date_add('month', 1, cast('2024-01-31' as date))")).date));
-    try std.testing.expectEqualStrings("2023-02-28", try formatDate(a, (try evalLit(a, "date_add('month', 1, cast('2023-01-31' as date))")).date));
-    try std.testing.expectEqualStrings("2023-12-31", try formatDate(a, (try evalLit(a, "date_add('day', -1, cast('2024-01-01' as date))")).date));
-    try std.testing.expectEqualStrings("2025-03-15", try formatDate(a, (try evalLit(a, "date_add('year', 1, cast('2024-03-15' as date))")).date));
-    try std.testing.expectEqualStrings("2024-02-29 06:30:00", try formatTimestamp(a, (try evalLit(a, "date_add('month', 1, cast('2024-01-31 06:30:00' as timestamp))")).timestamp));
-
-    try std.testing.expectEqual(@as(i64, 1), (try evalLit(a, "date_diff('year', cast('2023-12-31' as date), cast('2024-01-01' as date))")).int);
-    try std.testing.expectEqual(@as(i64, 1), (try evalLit(a, "date_diff('month', cast('2023-12-31' as date), cast('2024-01-01' as date))")).int);
-    try std.testing.expectEqual(@as(i64, 60), (try evalLit(a, "date_diff('day', cast('2024-01-01' as date), cast('2024-03-01' as date))")).int);
-    try std.testing.expectEqual(@as(i64, -1), (try evalLit(a, "date_diff('day', cast('2024-01-02' as date), cast('2024-01-01' as date))")).int);
-
-    try std.testing.expectEqualStrings("2024-02-29", try formatDate(a, (try evalLit(a, "make_date(2024, 2, 29)")).date));
-    try std.testing.expectError(error.CastFailed, evalLit(a, "make_date(2023, 2, 29)"));
-    try std.testing.expectError(error.CastFailed, evalLit(a, "make_date(2023, 13, 1)"));
-
-    try std.testing.expectEqual(@as(i64, 1700000000), (try evalLit(a, "epoch(to_timestamp(1700000000))")).int);
-    try std.testing.expectEqual(@as(i64, 0), (try evalLit(a, "epoch(cast('1970-01-01' as date))")).int);
-
-    try std.testing.expectEqualStrings("1970-01-01 00:00:00", (try evalLit(a, "strftime(to_timestamp(0), '%Y-%m-%d %H:%M:%S')")).string);
-    try std.testing.expectEqualStrings("70 01:01:01 %", (try evalLit(a, "strftime(to_timestamp(3661), '%y %H:%M:%S %%')")).string);
-}
-
-test "strptime: widths, %y pivot, impossible days, try_ form" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const ts = struct {
-        fn f(al: std.mem.Allocator, src: []const u8) ![]const u8 {
-            return formatTimestamp(al, (try evalLit(al, src)).timestamp);
-        }
-    }.f;
-
-    try std.testing.expectEqualStrings("2026-10-03 00:00:00", try ts(a, "strptime('03/10/2026', '%d/%m/%Y')"));
-    try std.testing.expectEqualStrings("2026-01-03 00:00:00", try ts(a, "strptime('3/1/2026', '%d/%m/%Y')"));
-    try std.testing.expectEqualStrings("2024-02-29 13:05:09", try ts(a, "strptime('2024-02-29 13:05:09', '%Y-%m-%d %H:%M:%S')"));
-    try std.testing.expectEqualStrings("1969-10-03 00:00:00", try ts(a, "strptime('03/10/69', '%d/%m/%y')"));
-    try std.testing.expectEqualStrings("2068-10-03 00:00:00", try ts(a, "strptime('03/10/68', '%d/%m/%y')"));
-    try std.testing.expectEqualStrings("2026-10-03 00:00:00", try ts(a, "strptime('100% 03/10/2026', '100%% %d/%m/%Y')"));
-
-    try std.testing.expectError(error.CastFailed, evalLit(a, "strptime('31/02/2026', '%d/%m/%Y')"));
-    try std.testing.expectError(error.CastFailed, evalLit(a, "strptime('03/10/2026 x', '%d/%m/%Y')"));
-    try std.testing.expectError(error.CastFailed, evalLit(a, "strptime('2026-10-03', '%d/%m/%Y')"));
-    try std.testing.expectError(error.CastFailed, evalLit(a, "strptime('03/10/2026 24:00:00', '%d/%m/%Y %H:%M:%S')"));
-    try std.testing.expect((try evalLit(a, "try_strptime('31/02/2026', '%d/%m/%Y')")) == .null);
-    _ = evalLit(a, "strptime('31/02/2026', '%d/%m/%Y')") catch {};
-    try std.testing.expect(takeFailure(error.DivByZero) == null);
-    try std.testing.expectEqualStrings("strptime: '31/02/2026' is not a date in '%d/%m/%Y' (try_strptime gives null)", takeFailure(error.CastFailed).?);
-    try std.testing.expect(takeFailure(error.CastFailed) == null);
-    try std.testing.expect((try evalLit(a, "try_strptime('', '%d/%m/%Y')")) == .null);
 }
 
 test "text cleanup: translate, initcap, unaccent, ascii, chr" {
@@ -1115,27 +512,6 @@ test "json builders and encodings: json_object, json_array, base64, url" {
     try std.testing.expectEqualStrings("%zz%4", try str(a, "url_decode('%zz%4')"));
 }
 
-test "json_reduce: folds, typed accumulators, positions, shadowing" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    try std.testing.expectEqual(@as(i64, 6), (try evalLit(a, "json_reduce('[1,2,3]', 0, (acc, x) -> acc + x)")).int);
-    try std.testing.expectEqual(@as(i64, 0), (try evalLit(a, "json_reduce('[]', 0, (acc, x) -> acc + x)")).int);
-    try std.testing.expect((try evalLit(a, "json_reduce(NULL, 0, (acc, x) -> acc + x)")) == .null);
-    try std.testing.expectEqual(@as(f64, 3.5), (try evalLit(a, "json_reduce('[1.5,2]', 0.0, (acc, x) -> acc + x)")).float);
-    try std.testing.expectError(error.CastFailed, evalLit(a, "json_reduce('[1.5,2]', 0, (acc, x) -> acc + x)"));
-
-    const d = try evalLit(a, "json_reduce('[\"0.10\",\"0.25\"]', CAST(0 AS DECIMAL(10,2)), (acc, x) -> acc + CAST(x AS DECIMAL(10,2)))");
-    try std.testing.expectEqualStrings("0.35", try valueToString(a, d));
-    try std.testing.expectEqualStrings("2026-01-04", try formatDate(a, (try evalLit(a, "json_reduce('[1,2]', CAST('2026-01-01' AS DATE), (dt, x) -> date_add('day', x, dt))")).date));
-
-    try std.testing.expectEqual(@as(i64, 22), (try evalLit(a, "json_reduce('[1,2,3]', 0, (acc, x, i) -> acc + x * CAST(json_get('[5,4,3]', CAST(i AS STRING)) AS INT))")).int);
-    try std.testing.expectEqualStrings("[10,21]", (try evalLit(a, "json_transform('[10,20]', (x, i) -> x + i)")).string);
-
-    try std.testing.expect((try evalLit(a, "json_any('[[1,2],[3]]', x -> json_reduce(x, 0, (acc, x) -> acc + x) = 3)")).bool);
-}
-
 test "array helpers: chars, json_range, json_length, json_slice, json_concat" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -1159,18 +535,6 @@ test "array helpers: chars, json_range, json_length, json_slice, json_concat" {
     try std.testing.expectEqualStrings("[1,{\"k\":2},3]", try str(a, "json_concat('[1]', '[{\"k\": 2}, 3]')"));
     try std.testing.expect((try evalLit(a, "json_concat('[1]', NULL)")) == .null);
     try std.testing.expectEqual(@as(i64, 8), (try evalLit(a, "11 - json_reduce(chars('112223330001'), 0, (acc, c, i) -> acc + (ascii(c) - 48) * CAST(json_get('[5,4,3,2,9,8,7,6,5,4,3,2]', CAST(i AS STRING)) AS INT)) % 11")).int);
-}
-
-test "a failed CAST names its value and type, and TRY_CAST leaves no note" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    try std.testing.expectError(error.CastFailed, evalLit(a, "CAST('03/10/2026' AS DATE)"));
-    try std.testing.expectEqualStrings("CAST: '03/10/2026' is not a DATE (YYYY-MM-DD; strptime reads other formats)", takeFailure(error.CastFailed).?);
-    try std.testing.expectError(error.CastFailed, evalLit(a, "CAST('1,5' AS DECIMAL(10,2))"));
-    try std.testing.expectEqualStrings("CAST: '1,5' is not a DECIMAL(10,2)", takeFailure(error.CastFailed).?);
-    try std.testing.expect((try evalLit(a, "TRY_CAST('x' AS INT)")) == .null);
-    try std.testing.expect(takeFailure(error.CastFailed) == null);
 }
 
 test "check-time errors: bad strftime directive, sub-day date_add on a date" {
@@ -1199,38 +563,6 @@ test "check-time errors: bad strftime directive, sub-day date_add on a date" {
     try std.testing.expectEqual(types.TypeKind.date, (try ctx.typeOf(ok)).kind);
 }
 
-test "orderF64: a total order over NaN, so comparisons never hit unreachable" {
-    const nan = std.math.nan(f64);
-    try std.testing.expectEqual(std.math.Order.eq, orderF64(nan, nan));
-    try std.testing.expectEqual(std.math.Order.gt, orderF64(nan, 1.0));
-    try std.testing.expectEqual(std.math.Order.lt, orderF64(1.0, nan));
-    try std.testing.expectEqual(std.math.Order.gt, orderF64(nan, std.math.inf(f64)));
-    try std.testing.expectEqual(std.math.Order.eq, orderF64(0.0, -0.0));
-    try std.testing.expectEqual(std.math.Order.lt, orderF64(-1.0, 1.0));
-
-    const v_nan = Value{ .float = nan };
-    try std.testing.expectEqual(std.math.Order.eq, compareValues(v_nan, v_nan).?);
-    try std.testing.expectEqual(std.math.Order.gt, compareValues(v_nan, .{ .int = 9 }).?);
-}
-
-test "integer arithmetic overflow is an error, not a silent wrap" {
-    const big = Value{ .int = std.math.maxInt(i64) };
-    const one = Value{ .int = 1 };
-    try std.testing.expectError(error.IntOverflow, arith(.add, big, one));
-    try std.testing.expectError(error.IntOverflow, arith(.mul, big, .{ .int = 2 }));
-    try std.testing.expectError(error.IntOverflow, arith(.sub, .{ .int = std.math.minInt(i64) }, one));
-    try std.testing.expectEqual(@as(i64, 5), (try arith(.add, .{ .int = 2 }, .{ .int = 3 })).int);
-
-    const min = Value{ .int = std.math.minInt(i64) };
-    try std.testing.expectError(error.IntOverflow, arith(.div, min, .{ .int = -1 }));
-    try std.testing.expectEqual(@as(i64, 0), (try arith(.mod, min, .{ .int = -1 })).int);
-    try std.testing.expectEqual(@as(i64, -7), (try arith(.div, .{ .int = 7 }, .{ .int = -1 })).int);
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    try std.testing.expectError(error.IntOverflow, evalLit(ar.allocator(), "-(-9223372036854775807 - 1)"));
-    try std.testing.expectError(error.IntOverflow, evalLit(ar.allocator(), "abs(-9223372036854775807 - 1)"));
-}
-
 test "numeric semantics: % truncates for every kind; decimals round, negate and cast exactly" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -1253,164 +585,17 @@ test "numeric semantics: % truncates for every kind; decimals round, negate and 
     try std.testing.expectEqual(@as(f64, 2.5), (try evalLit(a, "CAST(CAST(2.5 AS DECIMAL(4,1)) AS DOUBLE)")).float);
 }
 
-test "timestamps keep sub-second precision through parse and format" {
-    const us = parseIsoTimestamp("2026-08-08 12:34:56.123456").?;
-    try std.testing.expectEqual(@as(i64, 123456), @mod(us, 1_000_000));
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    try std.testing.expectEqualStrings(
-        "2026-08-08 12:34:56.123456",
-        try formatTimestamp(ar.allocator(), us),
-    );
-    try std.testing.expectEqual(@as(i64, 100000), @mod(parseIsoTimestamp("2026-08-08 12:34:56.1").?, 1_000_000));
-    const w = parseIsoTimestamp("2026-08-08 12:34:56").?;
-    try std.testing.expectEqualStrings("2026-08-08 12:34:56", try formatTimestamp(ar.allocator(), w));
-    try std.testing.expect(parseIsoTimestamp("2026-08-08 12:34:56.12x") == null);
-}
-
-test "writeValue renders exactly what valueToString does, for every kind" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    const cases = [_]Value{
-        .null,
-        .{ .bool = true },
-        .{ .bool = false },
-        .{ .int = 0 },
-        .{ .int = -1 },
-        .{ .int = std.math.maxInt(i64) },
-        .{ .int = std.math.minInt(i64) },
-        .{ .float = 0 },
-        .{ .float = -0.0 },
-        .{ .float = 0.1 },
-        .{ .float = 1.0 / 3.0 },
-        .{ .float = -2.5e-8 },
-        .{ .float = 1.7976931348623157e308 },
-        .{ .float = 5e-324 },
-        .{ .float = std.math.inf(f64) },
-        .{ .float = -std.math.inf(f64) },
-        .{ .float = std.math.nan(f64) },
-        .{ .decimal = .{ .unscaled = 0, .scale = 0 } },
-        .{ .decimal = .{ .unscaled = 1700, .scale = 2 } },
-        .{ .decimal = .{ .unscaled = -1700, .scale = 2 } },
-        .{ .decimal = .{ .unscaled = 5, .scale = 6 } },
-        .{ .decimal = .{ .unscaled = std.math.maxInt(i128), .scale = 0 } },
-        .{ .decimal = .{ .unscaled = std.math.minInt(i128) + 1, .scale = 10 } },
-        .{ .string = "" },
-        .{ .string = "plain" },
-        .{ .bytes = "raw" },
-        .{ .date = 0 },
-        .{ .date = 20000 },
-        .{ .date = 2932896 },
-        .{ .time = 0 },
-        .{ .time = 1 },
-        .{ .time = 86_400_000_000 - 1 },
-        .{ .timestamp = 0 },
-        .{ .timestamp = -1 },
-        .{ .timestamp = 1_754_000_000_000_000 },
-        .{ .timestamp = 1_754_000_000_123_456 },
-    };
-
-    for (cases) |v| {
-        var buf: [512]u8 = undefined;
-        var w = std.Io.Writer.fixed(&buf);
-        try writeValue(&w, v);
-        const want = try valueToString(a, v);
-        std.testing.expectEqualStrings(want, w.buffered()) catch |e| {
-            std.debug.print("mismatch on {s}\n", .{@tagName(v)});
-            return e;
-        };
-    }
-}
-
-test "formatTime suppresses an all-zero fraction, like formatTimestamp" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    try std.testing.expectEqualStrings("12:00:00", try formatTime(a, 12 * 3600 * 1_000_000));
-    try std.testing.expectEqualStrings("00:00:00", try formatTime(a, 0));
-    try std.testing.expectEqualStrings("23:59:59.999999", try formatTime(a, 86_400_000_000 - 1));
-    try std.testing.expectEqualStrings("00:00:00.000001", try formatTime(a, 1));
-}
-
-test "regexp_replace: the compiled-pattern cache keys on bytes, not on identity" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    try std.testing.expectEqualStrings("X-b-c", (try evalLit(a, "regexp_replace('a-b-c', 'a', 'X')")).string);
-    try std.testing.expectEqualStrings("a-b-X", (try evalLit(a, "regexp_replace('a-b-c', 'c', 'X')")).string);
-    try std.testing.expectEqualStrings("X-b-c", (try evalLit(a, "regexp_replace('a-b-c', 'a', 'X')")).string);
-
-    try std.testing.expectEqualStrings("Xbc", (try evalLit(a, "regexp_replace('abc', '^a', 'X')")).string);
-    try std.testing.expectEqualStrings("abX", (try evalLit(a, "regexp_replace('abc', 'c$', 'X')")).string);
-
-    try std.testing.expectEqualStrings("b-a", (try evalLit(a, "regexp_replace('a-b', '(a)-(b)', '\\2-\\1')")).string);
-    try std.testing.expectEqualStrings("b-a", (try evalLit(a, "regexp_replace('a-b', '(a)-(b)', '\\2-\\1')")).string);
-
-    try std.testing.expectError(error.CastFailed, evalLit(a, "regexp_replace('abc', '(', 'X')"));
-    try std.testing.expectEqualStrings("Xbc", (try evalLit(a, "regexp_replace('abc', '^a', 'X')")).string);
-
-    try std.testing.expectEqualStrings("abc", (try evalLit(a, "regexp_replace('abc', 'zzz', 'X')")).string);
-
-    var caps: regex.Captures = undefined;
-    var pat = "(a)-(b)".*;
-    var re = try cachedRegex(&pat);
-    try std.testing.expectEqual(@as(?[2]usize, .{ 0, 3 }), try re.find("a-b", 0, &caps));
-    pat[1] = 'b';
-    pat[5] = 'a';
-    re = try cachedRegex(&pat);
-    try std.testing.expectEqual(@as(?[2]usize, null), try re.find("a-b", 0, &caps));
-    try std.testing.expectEqual(@as(?[2]usize, .{ 0, 3 }), try re.find("b-a", 0, &caps));
-
-    try std.testing.expectError(error.BadPattern, cachedRegex("("));
-    re = try cachedRegex("(a)-(b)");
-    try std.testing.expectEqual(@as(?[2]usize, .{ 0, 3 }), try re.find("a-b", 0, &caps));
-    try std.testing.expectEqual(@as(?[2]usize, .{ 2, 3 }), caps[2]);
-    try std.testing.expectEqual(@as(?[2]usize, null), try re.find("b-a", 0, &caps));
-}
-
-test "field resolution: the memo verifies its entry instead of trusting it" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    const int = types.Type.init(.int);
-    const wide = types.Schema{ .fields = &.{
-        .{ .name = "col36", .ty = int },
-        .{ .name = "col37", .ty = int },
-        .{ .name = "col38", .ty = int },
-        .{ .name = "col39", .ty = int },
-    } };
-    const flipped = types.Schema{ .fields = &.{
-        .{ .name = "col39", .ty = int },
-        .{ .name = "col38", .ty = int },
-        .{ .name = "col37", .ty = int },
-        .{ .name = "col36", .ty = int },
-    } };
-
-    const q = struct {
-        fn of(alloc: std.mem.Allocator, name: []const u8) ast.QualName {
-            const parts = alloc.alloc([]const u8, 1) catch unreachable;
-            parts[0] = name;
-            return .{ .parts = parts };
-        }
-    };
-
-    for (0..3) |_| {
-        for ([_][]const u8{ "col36", "col37", "col38", "col39" }, 0..) |name, i| {
-            try std.testing.expectEqual(i, fieldIndex(wide, q.of(a, name)).?);
-            try std.testing.expectEqual(3 - i, fieldIndex(flipped, q.of(a, name)).?);
-        }
-    }
-
-    try std.testing.expect(fieldIndex(wide, q.of(a, "nope")) == null);
-    try std.testing.expectEqual(@as(usize, 0), fieldIndex(wide, q.of(a, "col36")).?);
-    try std.testing.expect(fieldIndex(wide, q.of(a, "nope")) == null);
-
-    const tiny = types.Schema{ .fields = &.{.{ .name = "z", .ty = int }} };
-    try std.testing.expectEqual(@as(usize, 3), fieldIndex(wide, q.of(a, "col39")).?);
-    try std.testing.expect(fieldIndex(tiny, q.of(a, "col39")) == null);
-    try std.testing.expectEqual(@as(usize, 0), fieldIndex(tiny, q.of(a, "z")).?);
+test {
+    _ = @import("eval/cast.zig");
+    _ = @import("eval/fn_row.zig");
+    _ = @import("eval/fn_typing.zig");
+    _ = @import("eval/fn_vec.zig");
+    _ = @import("eval/format.zig");
+    _ = @import("eval/functions.zig");
+    _ = @import("eval/row.zig");
+    _ = @import("eval/strings.zig");
+    _ = @import("eval/support.zig");
+    _ = @import("eval/time.zig");
+    _ = @import("eval/vec.zig");
+    _ = @import("eval/testing_util.zig");
 }

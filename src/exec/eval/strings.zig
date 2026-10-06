@@ -223,3 +223,43 @@ pub fn likeMatch(s: []const u8, pat: []const u8) bool {
     while (pi < pat.len and pat[pi] == '%') pi += 1;
     return pi == pat.len;
 }
+
+test "UTF-8 string helpers: substr, like, reverse, pad, case-map" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("01", try substrChars(a, "SD1010", 4, 2));
+    try std.testing.expectEqualStrings("SD1", try substrChars(a, "SD1010", 1, 3));
+    try std.testing.expectEqualStrings("010", try substrChars(a, "SD1010", 4, null));
+    try std.testing.expectEqualStrings("", try substrChars(a, "SD1010", 99, 2));
+
+    try std.testing.expect(likeMatch("hello, world", "hello%"));
+    try std.testing.expect(likeMatch("hello", "h_llo"));
+    try std.testing.expect(likeMatch("anything", "%"));
+    try std.testing.expect(!likeMatch("hello", "h_l"));
+    try std.testing.expect(!likeMatch("paid", "pending%"));
+
+    try std.testing.expect(likeMatch("%%", "%"));
+    try std.testing.expect(likeMatch("50% off", "50%"));
+    try std.testing.expect(likeMatch("ab%c", "ab%"));
+    try std.testing.expect(likeMatch("a%b", "a%b"));
+    try std.testing.expect(!likeMatch("a%b", "a%c"));
+
+    try std.testing.expectEqualStrings("ïv", try substrChars(a, "naïve", 3, 2));
+    try std.testing.expectEqual(@as(usize, 5), charCount("naïve"));
+    try std.testing.expectEqual(@as(usize, 3), charCount("a\xe9b"));
+    try std.testing.expectEqualStrings("本日", try reverseChars(a, "日本"));
+    try std.testing.expectEqualStrings("aç", endSlice("ação", -2, true));
+    try std.testing.expectEqualStrings("ão", endSlice("ação", 2, false));
+    try std.testing.expectEqualStrings("çã", endSlice("çãoo", 2, true));
+    try std.testing.expectEqualStrings("ñ-ñ-a", try padChars(a, "a", 5, "ñ-", true));
+    try std.testing.expectEqualStrings("日", try padChars(a, "日本", 1, " ", false));
+    try std.testing.expect(likeMatch("ünï", "_n_"));
+    try std.testing.expect(!likeMatch("ü", "__"));
+    var out = std.array_list.Managed(u8).init(a);
+    try caseMapInto(&out, "café ação ÿ łódź πσς ελληνικά ώ жё", true);
+    try std.testing.expectEqualStrings("CAFÉ AÇÃO Ÿ ŁÓDŹ ΠΣΣ ΕΛΛΗΝΙΚΆ Ώ ЖЁ", out.items);
+    out.clearRetainingCapacity();
+    try caseMapInto(&out, "CAFÉ AÇÃO Ÿ ŁÓDŹ ΠΣ ЖЁ ß", false);
+    try std.testing.expectEqualStrings("café ação ÿ łódź πσ жё ß", out.items);
+}

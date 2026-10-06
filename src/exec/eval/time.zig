@@ -7,6 +7,7 @@ const std = @import("std");
 const trim = @import("support.zig").trim;
 
 pub const TimeUnit = enum { year, month, week, day, hour, minute, second };
+const formatTimestamp = @import("format.zig").formatTimestamp;
 
 fn isoWeekStart(day: i64) i64 {
     return day - @mod(day + 3, 7);
@@ -319,4 +320,28 @@ pub fn civilFromDays(z0: i64) struct { y: i64, m: u32, d: u32 } {
     const d: u32 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
     const m: u32 = @intCast(if (mp < 10) mp + 3 else mp - 9);
     return .{ .y = y + (if (m <= 2) @as(i64, 1) else 0), .m = m, .d = d };
+}
+
+test "parseIsoTime: the text a time prints as, and nothing out of range" {
+    try std.testing.expectEqual(@as(?i64, 3_723_000_000), parseIsoTime("01:02:03"));
+    try std.testing.expectEqual(@as(?i64, 86_399_999_999), parseIsoTime("23:59:59.999999"));
+    try std.testing.expectEqual(@as(?i64, 45_000_000_000), parseIsoTime(" 12:30 "));
+    try std.testing.expectEqual(@as(?i64, null), parseIsoTime("24:00:00"));
+    try std.testing.expectEqual(@as(?i64, null), parseIsoTime("1:02:03"));
+    try std.testing.expectEqual(@as(?i64, null), parseIsoTime("01:02:03 extra"));
+}
+
+test "timestamps keep sub-second precision through parse and format" {
+    const us = parseIsoTimestamp("2026-08-08 12:34:56.123456").?;
+    try std.testing.expectEqual(@as(i64, 123456), @mod(us, 1_000_000));
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    try std.testing.expectEqualStrings(
+        "2026-08-08 12:34:56.123456",
+        try formatTimestamp(ar.allocator(), us),
+    );
+    try std.testing.expectEqual(@as(i64, 100000), @mod(parseIsoTimestamp("2026-08-08 12:34:56.1").?, 1_000_000));
+    const w = parseIsoTimestamp("2026-08-08 12:34:56").?;
+    try std.testing.expectEqualStrings("2026-08-08 12:34:56", try formatTimestamp(ar.allocator(), w));
+    try std.testing.expect(parseIsoTimestamp("2026-08-08 12:34:56.12x") == null);
 }

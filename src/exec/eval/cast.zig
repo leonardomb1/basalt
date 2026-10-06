@@ -162,3 +162,55 @@ pub fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalE
         else => error.CastFailed,
     };
 }
+
+test "decimals lose digits by rounding half away from zero, on every path" {
+    const cases = [_]struct { u: i128, s: u8, to: u8, want: i128 }{
+        .{ .u = 12345, .s = 3, .to = 2, .want = 1235 },
+        .{ .u = -12345, .s = 3, .to = 2, .want = -1235 },
+        .{ .u = 12344, .s = 3, .to = 2, .want = 1234 },
+        .{ .u = 5, .s = 3, .to = 2, .want = 1 },
+        .{ .u = -4, .s = 3, .to = 2, .want = 0 },
+        .{ .u = 999, .s = 3, .to = 0, .want = 1 },
+        .{ .u = std.math.maxInt(i128), .s = 38, .to = 0, .want = 2 },
+    };
+    for (cases) |c| try std.testing.expectEqual(c.want, rescaleTo(.{ .unscaled = c.u, .scale = c.s }, c.to).?.unscaled);
+
+    const floats = [_]struct { x: f64, to: u8, want: i128 }{
+        .{ .x = 12.345, .to = 2, .want = 1235 },
+        .{ .x = -12.345, .to = 2, .want = -1235 },
+        .{ .x = 1.005, .to = 2, .want = 101 },
+        .{ .x = 2.675, .to = 2, .want = 268 },
+        .{ .x = 0.1 + 0.2, .to = 17, .want = 30000000000000000 },
+        .{ .x = 1e-300, .to = 2, .want = 0 },
+        .{ .x = 123456789012345678.0, .to = 0, .want = 123456789012346000 },
+    };
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    for (floats) |c| {
+        const got = try castValueTyped(ar.allocator(), .{ .float = c.x }, types.Type.decimal(38, c.to));
+        try std.testing.expectEqual(c.want, got.decimal.unscaled);
+    }
+    try std.testing.expectError(error.CastFailed, castValueTyped(ar.allocator(), .{ .float = 1e300 }, types.Type.decimal(10, 2)));
+    try std.testing.expectError(error.CastFailed, castValueTyped(ar.allocator(), .{ .float = std.math.nan(f64) }, types.Type.decimal(10, 2)));
+    try std.testing.expectEqual(@as(i128, -1235), (try castValueTyped(ar.allocator(), .{ .string = "-12.345" }, types.Type.decimal(10, 2))).decimal.unscaled);
+}
+
+test "castValue: conversions succeed and failures are CastFailed specifically" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    try std.testing.expectEqual(@as(i64, 42), (try castValue(a, .{ .string = " 42 " }, .int)).int);
+    try std.testing.expectEqual(@as(i64, 1), (try castValue(a, .{ .bool = true }, .int)).int);
+    try std.testing.expectEqual(@as(i64, -3), (try castValue(a, .{ .float = -3.9 }, .int)).int);
+    try std.testing.expectEqual(@as(f64, 2.5), (try castValue(a, .{ .string = "2.5" }, .float)).float);
+    try std.testing.expect((try castValue(a, .{ .string = " TRUE " }, .bool)).bool);
+    try std.testing.expect(!(try castValue(a, .{ .int = 0 }, .bool)).bool);
+    try std.testing.expectEqualStrings("123.45", (try castValue(a, .{ .decimal = .{ .unscaled = 12345, .scale = 2 } }, .string)).string);
+
+    try std.testing.expectError(error.CastFailed, castValue(a, .{ .string = "abc" }, .int));
+    try std.testing.expectError(error.CastFailed, castValue(a, .{ .float = std.math.nan(f64) }, .int));
+    try std.testing.expectError(error.CastFailed, castValue(a, .{ .float = 1e19 }, .int));
+    try std.testing.expectError(error.CastFailed, castValue(a, .{ .string = "yes" }, .bool));
+    try std.testing.expectError(error.CastFailed, castValue(a, .{ .bool = true }, .float));
+}

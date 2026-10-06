@@ -23,6 +23,7 @@ const toF64 = @import("support.zig").toF64;
 const types = @import("../../lang/types.zig");
 const typing = @import("fn_typing.zig").typing;
 const valueToString = @import("format.zig").valueToString;
+const evalLit = @import("testing_util.zig").evalLit;
 
 pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, row: usize) EvalError!Value {
     forgetFailure();
@@ -445,4 +446,22 @@ pub fn reduceTypeAt(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) Ev
     };
     m.* = .{ .args = c.args.ptr, .schema = batch.schema, .ty = ty };
     return ty;
+}
+
+test "integer arithmetic overflow is an error, not a silent wrap" {
+    const big = Value{ .int = std.math.maxInt(i64) };
+    const one = Value{ .int = 1 };
+    try std.testing.expectError(error.IntOverflow, arith(.add, big, one));
+    try std.testing.expectError(error.IntOverflow, arith(.mul, big, .{ .int = 2 }));
+    try std.testing.expectError(error.IntOverflow, arith(.sub, .{ .int = std.math.minInt(i64) }, one));
+    try std.testing.expectEqual(@as(i64, 5), (try arith(.add, .{ .int = 2 }, .{ .int = 3 })).int);
+
+    const min = Value{ .int = std.math.minInt(i64) };
+    try std.testing.expectError(error.IntOverflow, arith(.div, min, .{ .int = -1 }));
+    try std.testing.expectEqual(@as(i64, 0), (try arith(.mod, min, .{ .int = -1 })).int);
+    try std.testing.expectEqual(@as(i64, -7), (try arith(.div, .{ .int = 7 }, .{ .int = -1 })).int);
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    try std.testing.expectError(error.IntOverflow, evalLit(ar.allocator(), "-(-9223372036854775807 - 1)"));
+    try std.testing.expectError(error.IntOverflow, evalLit(ar.allocator(), "abs(-9223372036854775807 - 1)"));
 }
