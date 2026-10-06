@@ -4621,6 +4621,16 @@ test "sql: two calls in one query get their own bindings, the body's CTEs includ
         try testing.expect(!std.mem.eql(u8, n, "s"));
         for (names.items[0..i]) |m| try testing.expect(!std.mem.eql(u8, m, n));
     }
+    var args = std.array_list.Managed([]const u8).init(a);
+    for (prog.stmts) |st| if (st == .binding and std.mem.endsWith(u8, st.binding.name, "_byg")) {
+        const stages = st.binding.pipeline.stages;
+        const own_s = try std.mem.concat(a, u8, &.{ st.binding.name[0 .. st.binding.name.len - "byg".len], "s" });
+        try testing.expectEqualStrings(own_s, stages[0].node.ref);
+        try args.append(stages[1].node.filter.binary.r.str_lit);
+    };
+    try testing.expectEqual(@as(usize, 2), args.items.len);
+    try testing.expectEqualStrings("a", args.items[0]);
+    try testing.expectEqualStrings("b", args.items[1]);
 }
 
 test "sql: a table function call is checked where it is written" {
@@ -4962,6 +4972,7 @@ test "sql: plain UNION [ALL] lines up by position; INTERSECT binds tighter than 
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'x.csv' UNION ALL BY NAME SELECT k FROM 'y.csv' UNION ALL SELECT k FROM 'z.csv';", &diag));
     try testing.expect(std.mem.indexOf(u8, diag.msg, "all `BY NAME` or all by position") != null);
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'x.csv' UNION ALL SELECT k FROM 'y.csv' ANCHOR SCHEMA first;", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "`ANCHOR` applies to `UNION ALL BY NAME`") != null);
 }
 
 test "sql: long IN lists and AND/OR chains are balanced; deeper nesting is an error, not a stack overflow" {
@@ -5138,6 +5149,7 @@ test "sql: EACH TABLE OF (SELECT ...) over a non-connection source needs IN <con
         \\LOAD INTO 'out.csv' AS
         \\SELECT * FROM EACH TABLE OF (SELECT name, emp FROM 'cat.csv') AS (table_name, emp);
     , &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "add `IN <conn>`") != null);
 
     const prog = try parseTest(a,
         \\CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'h', database = 'd');
@@ -5205,6 +5217,9 @@ test "sql: truncated expression is a parse error" {
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const r = parseSource(a, "SELECT * FROM x.QUERY($$q$$) WHERE a >", &diag);
     try testing.expectError(error.ParseFailed, r);
+    try testing.expectEqualStrings("expected an expression, found end of input", diag.msg);
+    try testing.expectEqual(@as(u32, 1), diag.line);
+    try testing.expectEqual(@as(u32, 39), diag.col);
 }
 
 test "sql: ACCEPT INTO BUFFER declaration and FROM BUFFER source" {
@@ -5275,19 +5290,6 @@ test "sql: reflection lowering — IDENTIFIER / || / PUSHDOWN(expr) -> ${...} te
     try testing.expectEqual(@as(usize, 0), w.mode.upsert.keys.len);
 }
 
-test "sql: PUSHDOWN($$literal$$) still lowers to a plain fragment (no hole)" {
-    var ar = std.heap.ArenaAllocator.init(testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const prog = try parseTest(a,
-        \\CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'h', database = 'd');
-        \\LOAD INTO '/tmp/x.csv' AS
-        \\SELECT filial FROM erp.dbo.T PUSHDOWN($$D_E_L_E_T_ <> '*'$$);
-    );
-    const st = prog.stmts[2].output.stages[0];
-    try testing.expectEqualStrings("D_E_L_E_T_ <> '*'", st.hints[0].value.str);
-}
-
 test "sql: IDENTIFIER(expr) in a column position -> a field named by a template" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -5301,10 +5303,15 @@ test "sql: IDENTIFIER(expr) in a column position -> a field named by a template"
     const stages = prog.stmts[prog.stmts.len - 1].output.stages;
     var saw_agg = false;
     var saw_sort = false;
+    for (stages) |st| try testing.expect(st.node != .select);
     for (stages) |st| switch (st.node) {
         .aggregate => |ag| {
             saw_agg = true;
+            try testing.expectEqual(@as(usize, 1), ag.by.len);
+            try testing.expectEqual(@as(usize, 1), ag.by[0].parts.len);
             try testing.expectEqualStrings("${c}", ag.by[0].parts[0]);
+            try testing.expectEqual(@as(usize, 1), ag.aggs.len);
+            try testing.expectEqualStrings("n", ag.aggs[0].name);
         },
         .sort => |so| {
             saw_sort = true;
@@ -5435,6 +5442,7 @@ test "sql: a statement function may open with the statement CASE; the scalar CAS
         \\SELECT pick('b') AS p;
     , &diag);
     try testing.expect(prog.stmts[1].func.body == .expr);
+    try testing.expect(prog.stmts[1].func.body.expr.* == .match);
     try testing.expect(prog.stmts[2].func.body == .stmts);
     try testing.expect(prog.stmts[2].func.body.stmts[0] == .match);
 }
@@ -5577,18 +5585,6 @@ test "sql: CREATE FUNCTION — expression, typed/DEFAULT params, statement body,
     try testing.expectEqual(@as(usize, 2), call.args.len);
     try testing.expectEqualStrings("SC5010", call.args[0].str_lit);
     try testing.expectEqualStrings("D_E_L_E_T_ <> '*'", call.args[1].str_lit);
-}
-
-test "sql: CREATE FUNCTION AS CASE stays the expression form" {
-    var ar = std.heap.ArenaAllocator.init(testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const prog = try parseTest(a,
-        \\CREATE FUNCTION grade(n) AS CASE WHEN n > 90 THEN 'a' ELSE 'b' END;
-        \\SELECT grade(score) AS g FROM 'x.csv';
-    );
-    try testing.expect(prog.stmts[1].func.body == .expr);
-    try testing.expect(prog.stmts[1].func.body.expr.* == .match);
 }
 
 test "sql: THROW — bare, WHEN-guarded, and inside a CASE arm" {
@@ -5770,17 +5766,7 @@ test "sql: a double-quoted name is a column reference, not a string" {
     const sel = st[1].node.select;
     try testing.expectEqualStrings("taxa", sel[0].computed.name);
     try testing.expectEqualStrings("Exchange rate", sel[0].computed.expr.field.last());
-}
-
-test "sql: single quotes still make a string" {
-    var ar = std.heap.ArenaAllocator.init(testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    const prog = try parseTest(a, "SELECT 'Exchange rate' AS lit FROM 'x.csv';");
-    const st = firstPipelineStages(prog);
-    const sel = st[1].node.select;
-    try testing.expectEqualStrings("Exchange rate", sel[0].computed.expr.str_lit);
+    try testing.expectEqualStrings("Exchange rate", firstPipelineStages(try parseTest(a, "SELECT 'Exchange rate' AS lit FROM 'x.csv';"))[1].node.select[0].computed.expr.str_lit);
 }
 
 test "sql: a quoted name that spells a keyword is still a column" {
@@ -5810,6 +5796,8 @@ test "sql: an empty quoted name is a lex error, not an empty column" {
 
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT \"\" FROM 'x.csv';", &diag));
+    try testing.expect(std.mem.startsWith(u8, diag.msg, "invalid token `\"\""));
+    try testing.expectEqual(@as(u32, 8), diag.col);
 }
 
 test "sql: PUSHDOWN on a discovered union becomes a per-branch where hint" {
@@ -5853,7 +5841,14 @@ test "sql: ANCHOR SCHEMA before PUSHDOWN parses the same" {
     const st = firstPipelineStages(prog);
     var n: usize = 0;
     for (st[0].hints) |h| {
-        if (std.mem.eql(u8, h.key, "where") or std.mem.eql(u8, h.key, "canon")) n += 1;
+        if (std.mem.eql(u8, h.key, "where")) {
+            n += 1;
+            try testing.expectEqualStrings("1 = 1", h.value.str);
+        }
+        if (std.mem.eql(u8, h.key, "canon")) {
+            n += 1;
+            try testing.expectEqualStrings("SC5010", h.value.ident);
+        }
     }
     try testing.expectEqual(@as(usize, 2), n);
 }
@@ -5909,6 +5904,7 @@ test "sql: PRINT without an expression is a parse error" {
 
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     try testing.expectError(error.ParseFailed, parseSource(a, "PRINT;\nSELECT id FROM 'x.csv';", &diag));
+    try testing.expectEqualStrings("expected an expression, found ';'", diag.msg);
 }
 
 test "sql: IN (SELECT ...) lifts to a semi join stage beside the filter" {
@@ -5953,8 +5949,11 @@ test "sql: IN (SELECT ...) under OR / outside WHERE / multi-column are parse err
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
 
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'f.csv' WHERE v = 1 OR k IN (SELECT k FROM 'd.csv');", &diag));
+    try testing.expectEqualStrings("IN (SELECT ...) is only supported as a top-level AND condition of WHERE — not under OR, NOT or CASE", diag.msg);
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT (k IN (SELECT k FROM 'd.csv')) AS f FROM 'f.csv';", &diag));
+    try testing.expectEqualStrings("IN (SELECT ...) is only supported in a WHERE clause", diag.msg);
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'f.csv' WHERE k IN (SELECT k, v FROM 'd.csv');", &diag));
+    try testing.expectEqualStrings("the subquery of IN must produce exactly one named column", diag.msg);
     const prog = try parseSource(a, "SELECT k FROM 'f.csv' WHERE k IN (1, 2, 3);", &diag);
     try testing.expect(prog.stmts[1].output.stages[1].node == .filter);
 }
@@ -6037,7 +6036,12 @@ test "known tables: a name the session holds reads as a binding reference, FROM 
         };
     };
     try testing.expectEqual(@as(usize, 2), refs);
+}
 
+test "parseTypeStr: params, aliases, junk" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
     try testing.expect(parseTypeStr(a, "decimal(10,2)").?.scale == 2);
     try testing.expect(parseTypeStr(a, "varchar(20)").?.kind == .string);
     try testing.expect(parseTypeStr(a, "timestamp").?.kind == .timestamp);
@@ -6052,6 +6056,23 @@ test "sql: a select item's alias may omit AS, but not swallow the clause after i
 
     const prog = try parseTest(a, "SELECT category, SUM(value) total, MAX(value) \"top\" FROM 'in.csv' GROUP BY category;");
     try testing.expect(prog.stmts.len == 2);
-    _ = try parseTest(a, "SELECT id FROM 'in.csv' WHERE id > 1 ORDER BY id LIMIT 2;");
-    _ = try parseTest(a, "SELECT 1 x, 'a' y;");
+    const agg = prog.stmts[1].output.stages[1].node.aggregate;
+    try testing.expectEqual(@as(usize, 2), agg.aggs.len);
+    try testing.expectEqualStrings("total", agg.aggs[0].name);
+    try testing.expectEqualStrings("top", agg.aggs[1].name);
+    try testing.expectEqualStrings("category", agg.by[0].last());
+
+    const clauses = try parseTest(a, "SELECT id FROM 'in.csv' WHERE id > 1 ORDER BY id LIMIT 2;");
+    const st = clauses.stmts[1].output.stages;
+    try testing.expect(st[1].node == .filter);
+    try testing.expectEqual(@as(usize, 1), st[2].node.select.len);
+    try testing.expectEqualStrings("id", st[2].node.select[0].field.last());
+    try testing.expect(st[3].node == .sort);
+    try testing.expectEqualStrings("id", st[3].node.sort.keys[0].field.last());
+    try testing.expectEqual(@as(u64, 2), st[4].node.limit.count);
+
+    const bare = try parseTest(a, "SELECT 1 x, 'a' y;");
+    const items = bare.stmts[1].output.stages[1].node.select;
+    try testing.expectEqualStrings("x", items[0].computed.name);
+    try testing.expectEqualStrings("y", items[1].computed.name);
 }

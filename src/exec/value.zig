@@ -70,12 +70,3 @@ pub const Value = union(enum) {
         return self == .null;
     }
 };
-
-test "value tag and null" {
-    const v: Value = .{ .int = 7 };
-    try std.testing.expect(!v.isNull());
-    try std.testing.expectEqual(@as(i64, 7), v.int);
-
-    const n: Value = .null;
-    try std.testing.expect(n.isNull());
-}

@@ -718,13 +718,24 @@ test "file sink: the IPC file and stream a sink writes read back through the rea
         const r = try arrowread.Reader.open(a, path);
         defer r.close();
         try std.testing.expectEqual(schema.fields.len, r.schema.fields.len);
+        for (schema.fields, r.schema.fields) |want, got| {
+            try std.testing.expectEqualStrings(want.name, got.name);
+            try std.testing.expectEqual(want.ty.kind, got.ty.kind);
+        }
         var rows: usize = 0;
         while (try r.next(a)) |b| {
             const dec_want = [_][]const u8{ "10.50", "3.00", "-12.35" };
+            try std.testing.expectEqual(schema.fields.len, b.columns.len);
             for (0..b.len) |i| {
-                const got = b.columns[3].getValue(i);
-                try std.testing.expectEqualStrings(dec_want[i % 3], try @import("../exec/eval.zig").valueToString(a, got));
-                try std.testing.expectEqual(batch.columns[0].getValue(i % 3) == .null, b.columns[0].getValue(i) == .null);
+                const src = (rows + i) % batch.len;
+                for (b.columns, batch.columns, 0..) |got_col, want_col, c| {
+                    const got = got_col.getValue(i);
+                    if (c == 3) {
+                        try std.testing.expectEqualStrings(dec_want[src], try @import("../exec/eval.zig").valueToString(a, got));
+                    } else {
+                        try std.testing.expectEqualDeep(want_col.getValue(src), got);
+                    }
+                }
             }
             rows += b.len;
         }

@@ -85,17 +85,6 @@ pub fn popcountValid(bits: []const u8, n: usize) usize {
 
 const testing = std.testing;
 
-test "sumF matches scalar across vector body + tail" {
-    const n = 37;
-    var a: [n]f64 = undefined;
-    var expect: f64 = 0;
-    for (0..n) |i| {
-        a[i] = @floatFromInt(i * 3 + 1);
-        expect += a[i];
-    }
-    try testing.expectApproxEqAbs(expect, sumF(&a), 1e-9);
-}
-
 test "sumF agrees with a scalar loop at every remainder length" {
     const L = lanes(f64);
     var buf: [2 * L + 3]f64 = undefined;
@@ -137,24 +126,6 @@ test "minF/maxF honor extremes in the scalar tail at odd lengths" {
     a[a.len - 1] = 1e9;
     try testing.expectEqual(@as(f64, 10), minF(&a));
     try testing.expectEqual(@as(f64, 1e9), maxF(&a));
-}
-
-test "popcountValid: zero bits and exact byte multiples read no partial byte" {
-    const bits = [_]u8{ 0b1010_1010, 0xFF };
-    try testing.expectEqual(@as(usize, 0), popcountValid(&bits, 0));
-    try testing.expectEqual(@as(usize, 1), popcountValid(&bits, 2));
-    try testing.expectEqual(@as(usize, 12), popcountValid(&bits, 16));
-}
-
-test "popcountValid honors partial trailing byte" {
-    const alloc = testing.allocator;
-    const bits = try alloc.alloc(u8, 3);
-    defer alloc.free(bits);
-    @memset(bits, 0xFF);
-    try testing.expectEqual(@as(usize, 20), popcountValid(bits, 20));
-    bits[0] &= ~@as(u8, 1);
-    bits[2] &= ~@as(u8, 0b0000_1000);
-    try testing.expectEqual(@as(usize, 18), popcountValid(bits, 20));
 }
 
 test "popcountValid: word-wise count agrees with a bit-by-bit one" {

@@ -279,8 +279,11 @@ test "short list header inlines the size; 15 escapes to a varint" {
 }
 
 test "binary borrows from the buffer without copying" {
-    var r = Reader.init("\x05hello");
-    try t.expectEqualStrings("hello", try r.readBinary());
+    const buf: []const u8 = "\x05hello";
+    var r = Reader.init(buf);
+    const got = try r.readBinary();
+    try t.expectEqualStrings("hello", got);
+    try t.expectEqual(buf.ptr + 1, got.ptr);
 }
 
 test "double is little-endian, unlike the binary protocol" {
@@ -289,24 +292,29 @@ test "double is little-endian, unlike the binary protocol" {
 }
 
 test "skip walks past every type, including nested lists and structs" {
-    const bytes = [_]u8{
-        0x19, 0x1c,
-        0x15, 0x02, 0x00, //   the element struct: field 1 i32 = 1, stop
-        0x18, 0x03, 'a', 'b', 'c', // field 2, binary "abc"
-        0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f, // field 3, double 1.0
-        0x00, // stop
-    };
+    const bytes = [_]u8{ 0x19, 0x1c, 0x15, 0x02, 0x00 } ++
+        [_]u8{ 0x18, 0x03, 'a', 'b', 'c' } ++
+        [_]u8{ 0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f } ++
+        [_]u8{ 0x16, 0xff, 0x01 } ++
+        [_]u8{ 0x1b, 0x02, 0x85, 0x01, 'k', 0x02, 0x01, 'j', 0x04 } ++
+        [_]u8{ 0x1a, 0x25, 0x02, 0x04 } ++
+        [_]u8{ 0x11, 0x12 } ++
+        [_]u8{ 0x13, 0x7f } ++
+        [_]u8{ 0x14, 0x06 } ++
+        [_]u8{ 0x1b, 0x00 } ++
+        [_]u8{0x00};
     var r = Reader.init(&bytes);
     try r.structBegin();
-    var seen: usize = 0;
+    var seen: i16 = 0;
     while (true) {
         const f = try r.readField();
         if (f.ty == .stop) break;
-        try r.skip(f.ty);
         seen += 1;
+        try t.expectEqual(seen, f.id);
+        try r.skip(f.ty);
     }
     try r.structEnd();
-    try t.expectEqual(@as(usize, 3), seen);
+    try t.expectEqual(@as(i16, 11), seen);
     try t.expectEqual(bytes.len, r.pos);
 }
 
@@ -429,25 +437,48 @@ test "writer output round-trips through the reader" {
     try w.writeI32(1, 7);
     try w.writeI64(3, -12345);
     try w.writeBool(4, true);
+    try w.writeBool(5, false);
     try w.writeBinary(20, "hello");
+    try w.writeI32(21, std.math.minInt(i32));
+    try w.writeI64(40, std.math.maxInt(i64));
+    try w.writeBinary(41, "");
     try w.structEnd();
 
     var r = Reader.init(buf.items);
     try r.structBegin();
     const f1 = try r.readField();
+    try t.expectEqual(Type.i32, f1.ty);
     try t.expectEqual(@as(i16, 1), f1.id);
     try t.expectEqual(@as(i32, 7), try r.readI32());
     const f2 = try r.readField();
+    try t.expectEqual(Type.i64, f2.ty);
     try t.expectEqual(@as(i16, 3), f2.id);
     try t.expectEqual(@as(i64, -12345), try r.readZigZag());
     const f3 = try r.readField();
-    try t.expectEqual(@as(i16, 4), f3.id);
     try t.expectEqual(Type.bool_true, f3.ty);
+    try t.expectEqual(@as(i16, 4), f3.id);
     const f4 = try r.readField();
-    try t.expectEqual(@as(i16, 20), f4.id);
+    try t.expectEqual(Type.bool_false, f4.ty);
+    try t.expectEqual(@as(i16, 5), f4.id);
+    const f5 = try r.readField();
+    try t.expectEqual(Type.binary, f5.ty);
+    try t.expectEqual(@as(i16, 20), f5.id);
     try t.expectEqualStrings("hello", try r.readBinary());
+    const f6 = try r.readField();
+    try t.expectEqual(Type.i32, f6.ty);
+    try t.expectEqual(@as(i16, 21), f6.id);
+    try t.expectEqual(@as(i32, std.math.minInt(i32)), try r.readI32());
+    const f7 = try r.readField();
+    try t.expectEqual(Type.i64, f7.ty);
+    try t.expectEqual(@as(i16, 40), f7.id);
+    try t.expectEqual(@as(i64, std.math.maxInt(i64)), try r.readZigZag());
+    const f8 = try r.readField();
+    try t.expectEqual(Type.binary, f8.ty);
+    try t.expectEqual(@as(i16, 41), f8.id);
+    try t.expectEqualStrings("", try r.readBinary());
     try t.expectEqual(Type.stop, (try r.readField()).ty);
     try r.structEnd();
+    try t.expectEqual(buf.items.len, r.pos);
 }
 
 test "lists round-trip in both the short and escaped size forms" {

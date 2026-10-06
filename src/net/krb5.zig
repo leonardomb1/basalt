@@ -1069,6 +1069,34 @@ test "krb5: encrypt and decrypt round-trip per usage, and a wrong key or usage f
     }
 }
 
+test "krb5: decrypt opens MIT krb5's known AES-CTS-HMAC-SHA1 ciphertexts, and a flipped bit fails" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { usage: u32, plain: []const u8, key: []const u8, ct: []const u8 }{
+        .{ .usage = 0, .plain = "", .key = "5a5c0f0ba54f3828b2195e66ca24a289", .ct = "49ff8e11c173d9583a3254fbe7b1f1df36c538e8416784a1672e6676" },
+        .{ .usage = 1, .plain = "1", .key = "98450e3f3baa13f5c99beb936981b06f", .ct = "f86742f537b35dc2174a4dbaa920faf9042090b065e1ebb1cad9a65394" },
+        .{ .usage = 2, .plain = "9 bytesss", .key = "9062430c8cda3388922e6d6a509f5b7a", .ct = "68fb9679601f45c78857b2bf820fd6e53eca8d42fd4b1d7024a09205abb7cd2ec26c355d2f" },
+        .{ .usage = 3, .plain = "13 bytes byte", .key = "033ee6502c54fd23e27791e987983827", .ct = "ec366d0327a933bf49330e650e49bc6b974637fe80bf532fe51795b4809718e6194724db948d1fd637" },
+        .{ .usage = 4, .plain = "30 bytes bytes bytes bytes byt", .key = "dceeb70b3de76562e689226c76429148", .ct = "c96081032d5d8eeb7e32b4089f789d0faa481dea74c0f97cbf3146ddfcf8e800156ecb532fc203e30ff600b63b350939fece510f02d7ff1e7bac" },
+        .{ .usage = 0, .plain = "", .key = "17f275f2954f2ed1f90c377ba7f4d6a369aa0136e0bf0c927ad6133c693759a9", .ct = "e5094c55ee7b38262e2b044280b069379a95bf95bd8376fb3281b435" },
+        .{ .usage = 1, .plain = "1", .key = "b9477e1ff0329c0050e20ce6c72d2dff27e8fe541ab0954429a9cb5b4f7b1e2a", .ct = "406150b97aeb76d43b36b62cc1ecdfbe6f40e95755e0beb5c27825f3a4" },
+        .{ .usage = 2, .plain = "9 bytesss", .key = "b1ae4cd8462aff1677053cc9279aac30b796fb81ce21474dd3ddbcfea4ec76d7", .ct = "09957aa25fcaf88f7b39e4406e633012d5fea21853f6478da7065caef41fd454a40824eec5" },
+        .{ .usage = 3, .plain = "13 bytes byte", .key = "e5a72be9b7926c1225bafef9c1872e7ba4cdb2b17893d84abd90acdd8764d966", .ct = "d8f1aafeec84587cc3e700a774e56651a6d693e174ec4473b5e6d96f80297a653fb818ad893e719f96" },
+        .{ .usage = 4, .plain = "30 bytes bytes bytes bytes byt", .key = "f1c795e9248a09338d82c3f8d5b567040b0110736845041347235b1404231398", .ct = "d1137a4d634cfece924dbc3bf6790648bd5cff7de0e7b99460211d0daef3d79a295c688858f3b34b9cbd6eebae81daf6b734d4d498b6714f1c1d" },
+    };
+    for (cases) |c| {
+        var k = Key{ .etype = if (c.key.len == 64) etype_aes256 else etype_aes128, .len = c.key.len / 2 };
+        _ = try std.fmt.hexToBytes(k.bytes[0..k.len], c.key);
+        var ct: [64]u8 = undefined;
+        const n = c.ct.len / 2;
+        _ = try std.fmt.hexToBytes(ct[0..n], c.ct);
+        const back = try decrypt(gpa, &k, c.usage, ct[0..n]);
+        defer gpa.free(back);
+        try std.testing.expectEqualStrings(c.plain, back);
+        ct[0] ^= 1;
+        try std.testing.expectError(error.KrbIntegrity, decrypt(gpa, &k, c.usage, ct[0..n]));
+    }
+}
+
 test "krb5: DER integers and times" {
     const gpa = std.testing.allocator;
     for ([_]struct { v: i64, h: []const u8 }{ .{ .v = 0, .h = "020100" }, .{ .v = 5, .h = "020105" }, .{ .v = 128, .h = "02020080" }, .{ .v = 0x8003, .h = "0203008003" }, .{ .v = -1, .h = "0201ff" } }) |c| {

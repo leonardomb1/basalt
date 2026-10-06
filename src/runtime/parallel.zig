@@ -420,7 +420,42 @@ test "spawnJoin: worker runs exactly once per effective lane (n, 1, 0 threads)" 
     }
 }
 
-test "writeLaneBatch: shared routes to the shared sink, per_lane to the lane's own" {
+const RenderSink = struct {
+    mtx: *std.Thread.Mutex,
+    renders: usize = 0,
+    rendered_unlocked: bool = false,
+    appended: [16]u8 = undefined,
+    appended_len: usize = 0,
+    appended_locked: bool = false,
+    plain_writes: usize = 0,
+
+    fn sinkOf(self: *RenderSink) driver.Sink {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    const vtable = driver.Sink.VTable{ .writeBatch = vtWrite, .close = vtClose, .abort = vtAbort, .renderBatch = vtRender, .writeRendered = vtWriteRendered };
+    fn vtWrite(ptr: *anyopaque, _: std.mem.Allocator, _: Batch) anyerror!void {
+        const self: *RenderSink = @ptrCast(@alignCast(ptr));
+        self.plain_writes += 1;
+    }
+    fn vtRender(ptr: *anyopaque, a: std.mem.Allocator, b: Batch) anyerror![]const u8 {
+        const self: *RenderSink = @ptrCast(@alignCast(ptr));
+        self.renders += 1;
+        self.rendered_unlocked = self.mtx.tryLock();
+        if (self.rendered_unlocked) self.mtx.unlock();
+        return std.fmt.allocPrint(a, "rows={d}", .{b.len});
+    }
+    fn vtWriteRendered(ptr: *anyopaque, bytes: []const u8) anyerror!void {
+        const self: *RenderSink = @ptrCast(@alignCast(ptr));
+        self.appended_locked = !self.mtx.tryLock();
+        if (!self.appended_locked) self.mtx.unlock();
+        @memcpy(self.appended[0..bytes.len], bytes);
+        self.appended_len = bytes.len;
+    }
+    fn vtClose(_: *anyopaque) anyerror!void {}
+    fn vtAbort(_: *anyopaque) void {}
+};
+
+test "writeLaneBatch: shared routes to the shared sink, rendering outside the lock when it can; per_lane to the lane's own" {
     var shared = CountSink{};
     var own = CountSink{};
     var totals = LaneSink.Totals{};
@@ -430,17 +465,40 @@ test "writeLaneBatch: shared routes to the shared sink, per_lane to the lane's o
     try writeLaneBatch(.{ .shared = shared.sink() }, &mtx, null, testing.allocator, b);
     try testing.expectEqual(@as(usize, 3), shared.rows);
 
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var rs = RenderSink{ .mtx = &mtx };
+    try writeLaneBatch(.{ .shared = rs.sinkOf() }, &mtx, null, arena.allocator(), b);
+    try testing.expectEqual(@as(usize, 1), rs.renders);
+    try testing.expect(rs.rendered_unlocked);
+    try testing.expect(rs.appended_locked);
+    try testing.expectEqualStrings("rows=3", rs.appended[0..rs.appended_len]);
+    try testing.expectEqual(@as(usize, 0), rs.plain_writes);
+    try testing.expect(mtx.tryLock());
+    mtx.unlock();
+
     try writeLaneBatch(.{ .per_lane = .{ .open = testOpenLaneSink, .ctx = &totals } }, &mtx, own.sink(), testing.allocator, b);
     try testing.expectEqual(@as(usize, 3), own.rows);
     try testing.expectEqual(@as(usize, 3), shared.rows);
+    try testing.expectEqual(@as(usize, 0), totals.opened.load(.seq_cst));
 }
 
-test "run: work-steals uneven splits across fewer lanes than splits (shared sink)" {
+fn testOpenSplitCounted(ctx: *anyopaque, gpa: std.mem.Allocator, pred: []const u8) anyerror!driver.Source {
+    const opens: *[8]std.atomic.Value(usize) = @ptrCast(@alignCast(ctx));
+    _ = opens[try std.fmt.parseInt(usize, pred, 10)].fetchAdd(1, .seq_cst);
+    return testOpenSplit(ctx, gpa, pred);
+}
+
+test "run: work-steals uneven splits across fewer lanes than splits; every split is read exactly once" {
     var snk = CountSink{};
     var rows_read = obs.RowCounter.init(0);
-    var dummy: u8 = 0;
+    var opens = [_]std.atomic.Value(usize){std.atomic.Value(usize).init(0)} ** 8;
     const preds = [_][]const u8{ "5", "3", "4", "1" };
-    const n = try run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .shared = snk.sink() }, 2, &rows_read);
+    const n = try run(testing.allocator, &preds, testOpenSplitCounted, &opens, &.{}, .{ .shared = snk.sink() }, 2, &rows_read);
+    for (opens, 0..) |o, i| try testing.expectEqual(@as(usize, switch (i) {
+        1, 3, 4, 5 => 1,
+        else => 0,
+    }), o.load(.seq_cst));
     try testing.expectEqual(@as(usize, 13), n);
     try testing.expectEqual(@as(usize, 13), snk.rows);
     try testing.expectEqual(@as(u64, 13), rows_read.load(.seq_cst));
@@ -450,18 +508,20 @@ test "run: work-steals uneven splits across fewer lanes than splits (shared sink
 test "run: lane count clamps to the split count; zero threads still runs one lane" {
     var dummy: u8 = 0;
     {
-        var snk = CountSink{};
+        var totals = LaneSink.Totals{};
         var rows_read = obs.RowCounter.init(0);
         const preds = [_][]const u8{"2"};
-        try testing.expectEqual(@as(usize, 2), try run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .shared = snk.sink() }, 8, &rows_read));
-        try testing.expectEqual(@as(usize, 2), snk.rows);
+        try testing.expectEqual(@as(usize, 2), try run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .per_lane = .{ .open = testOpenLaneSink, .ctx = &totals } }, 8, &rows_read));
+        try testing.expectEqual(@as(usize, 1), totals.opened.load(.seq_cst));
+        try testing.expectEqual(@as(usize, 2), totals.committed.load(.seq_cst));
     }
     {
-        var snk = CountSink{};
+        var totals = LaneSink.Totals{};
         var rows_read = obs.RowCounter.init(0);
         const preds = [_][]const u8{ "3", "2" };
-        try testing.expectEqual(@as(usize, 5), try run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .shared = snk.sink() }, 0, &rows_read));
-        try testing.expectEqual(@as(usize, 5), snk.rows);
+        try testing.expectEqual(@as(usize, 5), try run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .per_lane = .{ .open = testOpenLaneSink, .ctx = &totals } }, 0, &rows_read));
+        try testing.expectEqual(@as(usize, 1), totals.opened.load(.seq_cst));
+        try testing.expectEqual(@as(usize, 5), totals.committed.load(.seq_cst));
     }
 }
 

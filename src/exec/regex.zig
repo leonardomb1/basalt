@@ -432,6 +432,12 @@ test "regex: literals, classes, anchors, groups" {
 
     re = try Regex.compile(a, "a|bc");
     try std.testing.expect((try re.find("zzbc", 0, &caps)) != null);
+
+    re = try Regex.compile(a, "x(b+)(c?)d");
+    try std.testing.expectEqual(@as(?[2]usize, .{ 1, 6 }), try re.find("zxbbbd", 0, &caps));
+    try std.testing.expectEqual(@as(?[2]usize, .{ 1, 6 }), caps[0]);
+    try std.testing.expectEqual(@as(?[2]usize, .{ 2, 5 }), caps[1]);
+    try std.testing.expectEqual(@as(?[2]usize, .{ 5, 5 }), caps[2]);
 }
 
 test "regex: the ClickBench host-extraction pattern" {

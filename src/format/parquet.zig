@@ -581,10 +581,6 @@ pub fn readPage(
 
 const t = std.testing;
 
-const tiny_footer =
-    "\x15\x02\x19\x4c\x35\x00\x18\x0d\x64\x75\x63\x6b\x64\x62\x5f\x73\x63\x68\x65\x6d\x61\x15\x06\x00" ++
-    "\x15\x02\x25\x02\x18\x02\x69\x64\x25\x22\x00\x15\x0c\x25\x02\x18\x04\x6e\x61\x6d\x65\x25\x00\x00";
-
 test "footerRange locates the footer from the trailer and rejects bad magic" {
     var trailer: [8]u8 = undefined;
     std.mem.writeInt(u32, trailer[0..4], 322, .little);
@@ -608,37 +604,13 @@ test "parseFile rejects anything without both magics" {
     defer ar.deinit();
     try t.expectError(Error.NotParquet, parseFile(ar.allocator(), "not a parquet file at all"));
     try t.expectError(Error.NotParquet, parseFile(ar.allocator(), "PAR1"));
-}
-
-test "schema elements decode from a real DuckDB footer prefix" {
-    var ar = std.heap.ArenaAllocator.init(t.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    var r = thrift.Reader.init(tiny_footer);
-    try r.structBegin();
-    const f1 = try r.readField();
-    try t.expectEqual(@as(i16, 1), f1.id);
-    try t.expectEqual(@as(i32, 1), try r.readI32());
-
-    const f2 = try r.readField();
-    try t.expectEqual(@as(i16, 2), f2.id);
-    const h = try r.readListHeader();
-    try t.expectEqual(thrift.Type.@"struct", h.elem);
-
-    const root = try readSchemaElement(a, &r);
-    try t.expectEqualStrings("duckdb_schema", root.name);
-    try t.expectEqual(@as(i32, 3), root.num_children);
-    try t.expect(root.isLeaf() == false);
-
-    const id_col = try readSchemaElement(a, &r);
-    try t.expectEqualStrings("id", id_col.name);
-    try t.expectEqual(PhysicalType.int32, id_col.ty.?);
-    try t.expect(id_col.isLeaf());
-
-    const name_col = try readSchemaElement(a, &r);
-    try t.expectEqualStrings("name", name_col.name);
-    try t.expectEqual(PhysicalType.byte_array, name_col.ty.?);
+    const tail_broken = try ar.allocator().dupe(u8, fx_uncompressed);
+    tail_broken[tail_broken.len - 1] = 'X';
+    try t.expectError(Error.NotParquet, parseFile(ar.allocator(), tail_broken));
+    const head_broken = try ar.allocator().dupe(u8, fx_uncompressed);
+    head_broken[0] = 'X';
+    try t.expectError(Error.NotParquet, parseFile(ar.allocator(), head_broken));
+    _ = try parseFile(ar.allocator(), fx_uncompressed);
 }
 
 test "startOffset prefers the dictionary page when one precedes the data pages" {

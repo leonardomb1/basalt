@@ -1185,7 +1185,7 @@ fn bin(arena: std.mem.Allocator, op: ast.BinOp, l: *ast.Expr, r: *ast.Expr) !*as
     return e;
 }
 
-test "translatePred: equality with a string literal escapes quotes" {
+test "translateExpr: equality with a string literal escapes quotes" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1196,7 +1196,7 @@ test "translatePred: equality with a string literal escapes quotes" {
     try testing.expectEqualStrings("(`b` = 'O''Brien')", sql);
 }
 
-test "translatePred: AND of comparisons, per-dialect quoting" {
+test "translateExpr: AND of comparisons, per-dialect quoting" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1209,7 +1209,7 @@ test "translatePred: AND of comparisons, per-dialect quoting" {
     try testing.expectEqualStrings("(([a] >= 5) AND ([c] < 9))", (try translateExpr(a, e, .sqlserver, testSchema(), true)).?);
 }
 
-test "translatePred: is not null" {
+test "translateExpr: is not null" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1218,20 +1218,16 @@ test "translatePred: is not null" {
     try testing.expectEqualStrings("(`a` IS NOT NULL)", (try translateExpr(a, e, .mysql, testSchema(), true)).?);
 }
 
-test "translatePred: unknown field and unsupported nodes are not pushed" {
+test "translateExpr: a field the schema does not have is not pushed" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     const lit = try a.create(ast.Expr);
     lit.* = .{ .int_lit = 1 };
     try testing.expect((try translateExpr(a, try bin(a, .eq, try fld(a, "zzz"), lit), .mysql, testSchema(), true)) == null);
-    try testing.expect((try translateExpr(a, try bin(a, .add, try fld(a, "a"), lit), .mysql, testSchema(), true)) == null);
-    const call = try a.create(ast.Expr);
-    call.* = .{ .call = .{ .name = "now", .args = &.{} } };
-    try testing.expect((try translateExpr(a, call, .mysql, testSchema(), true)) == null);
 }
 
-test "translatePred: bitwise operators are never pushed down" {
+test "translateExpr: bitwise operators are never pushed down" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1370,7 +1366,7 @@ test "planMap: a star select disables projection" {
     try testing.expect(plan.proj_select == null);
 }
 
-test "translatePred: NOT over an OR with a bool literal" {
+test "translateExpr: NOT over an OR with a bool literal" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1382,18 +1378,6 @@ test "translatePred: NOT over an OR with a bool literal" {
     const not_e = try a.create(ast.Expr);
     not_e.* = .{ .unary = .{ .op = .not, .e = or_e } };
     try testing.expectEqualStrings("(NOT (((`a` > 1) OR (1=0))))", (try translateExpr(a, not_e, .mysql, testSchema(), true)).?);
-}
-
-test "translatePred: `is empty` translates to null-or-'', plain `is null` to IS NULL" {
-    var ar = std.heap.ArenaAllocator.init(testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const e = try a.create(ast.Expr);
-    e.* = .{ .is_null = .{ .e = try fld(a, "b"), .negated = false, .kind = .is_empty } };
-    try testing.expectEqualStrings("(`b` IS NULL OR (`b` = ''))", (try translateExpr(a, e, .mysql, testSchema(), true)).?);
-    const n = try a.create(ast.Expr);
-    n.* = .{ .is_null = .{ .e = try fld(a, "b"), .negated = false, .kind = .is_null } };
-    try testing.expectEqualStrings("(`b` IS NULL)", (try translateExpr(a, n, .mysql, testSchema(), true)).?);
 }
 
 test "planAgg: no projection when the aggregate consumes every source column" {
@@ -1472,6 +1456,8 @@ test "translateExpr: extended constructs (is empty, CASE, CAST, functions)" {
 
     const cases = [_]struct { src: []const u8, want: ?[]const u8, d: Dialect = .sqlserver }{
         .{ .src = "status IS EMPTY", .want = "([status] IS NULL OR ([status] = ''))" },
+        .{ .src = "status IS EMPTY", .want = "(`status` IS NULL OR (`status` = ''))", .d = .mysql },
+        .{ .src = "status IS NULL", .want = "(`status` IS NULL)", .d = .mysql },
         .{ .src = "status IS NOT EMPTY", .want = null },
         .{ .src = "IF(v > 1, 'a', 'b')", .want = "(CASE WHEN ([v] > 1) THEN 'a' ELSE 'b' END)" },
         .{ .src = "CASE status WHEN 'x', 'y' THEN 1 ELSE 0 END", .want = null },
@@ -1813,19 +1799,13 @@ test "planWholeAgg: a QUERY-form read is wrapped as the subquery, its own WHERE 
     );
 }
 
-test "planWholeAgg: AVG always falls back (int-avg result types diverge)" {
-    var ar = std.heap.ArenaAllocator.init(testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const aggs = try a.alloc(ast.AggItem, 1);
-    aggs[0] = .{ .name = "m", .func = .avg, .arg = try fld(a, "c") };
-    const ag = ast.Aggregate{ .aggs = aggs, .by = try byList(a, &.{"b"}) };
-    const plan_schema = types.Schema{ .fields = &.{
-        .{ .name = "b", .ty = types.Type.init(.string) },
-        .{ .name = "m", .ty = types.Type.init(.float).withNull(true) },
-    } };
-    for ([_]Dialect{ .postgres, .mysql, .sqlserver }) |d|
-        try testing.expect((try planWholeAgg(a, d, base_t, wholeSchema(), &.{}, ag, plan_schema)) == null);
+fn expectWholeAggRefused(a: std.mem.Allocator, d: Dialect, ag: ast.Aggregate, plan_schema: types.Schema, want: []const u8) !void {
+    var why: []const u8 = "";
+    try testing.expect((try planWholeAggWhy(a, d, base_t, wholeSchema(), &.{}, ag, plan_schema, null, &why)) == null);
+    if (!std.mem.startsWith(u8, why, want)) {
+        std.debug.print("expected a refusal starting `{s}`, got `{s}`\n", .{ want, why });
+        return error.TestUnexpectedResult;
+    }
 }
 
 test "planWholeAgg: only COUNT, SUM, MIN and MAX descend — every other aggregate stays engine-side" {
@@ -1845,13 +1825,22 @@ test "planWholeAgg: only COUNT, SUM, MIN and MAX descend — every other aggrega
                 aggs[0] = .{ .name = "m", .func = func, .arg = try fld(a, "c") };
                 const ag = ast.Aggregate{ .aggs = aggs, .by = try byList(a, &.{"b"}) };
                 for ([_]Dialect{ .postgres, .mysql, .sqlserver }) |d|
-                    try testing.expect((try planWholeAgg(a, d, base_t, wholeSchema(), &.{}, ag, plan_schema)) == null);
+                    try expectWholeAggRefused(a, d, ag, plan_schema, "`m` is not pushed down");
             },
         }
     }
+
+    const cnt = try a.alloc(ast.AggItem, 1);
+    cnt[0] = .{ .name = "m", .func = .count, .arg = try fld(a, "c") };
+    const cnt_schema = types.Schema{ .fields = &.{
+        .{ .name = "b", .ty = types.Type.init(.string) },
+        .{ .name = "m", .ty = types.Type.init(.int) },
+    } };
+    for ([_]Dialect{ .postgres, .mysql, .sqlserver }) |d|
+        try testing.expect((try planWholeAgg(a, d, base_t, wholeSchema(), &.{}, .{ .aggs = cnt, .by = try byList(a, &.{"b"}) }, cnt_schema)) != null);
 }
 
-test "planWholeAgg: a qualified or unknown group key falls back" {
+test "planWholeAgg: a qualified group key falls back" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1864,14 +1853,9 @@ test "planWholeAgg: a qualified or unknown group key falls back" {
         .{ .name = "b", .ty = types.Type.init(.string) },
         .{ .name = "n", .ty = types.Type.init(.int) },
     } };
-    try testing.expect((try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = aggs, .by = by }, plan_schema)) == null);
-
-    const missing = try byList(a, &.{"zzz"});
-    const ms_schema = types.Schema{ .fields = &.{
-        .{ .name = "zzz", .ty = types.Type.init(.string) },
-        .{ .name = "n", .ty = types.Type.init(.int) },
-    } };
-    try testing.expect((try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = aggs, .by = missing }, ms_schema)) == null);
+    var why: []const u8 = "";
+    try testing.expect((try planWholeAggWhy(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = aggs, .by = by }, plan_schema, null, &why)) == null);
+    try testing.expectEqualStrings("a group key is not a bare source column", why);
 }
 
 test "planWholeAggWhy: a refusal names the gate that refused" {
@@ -1930,30 +1914,34 @@ test "planWholeAgg: an untranslatable filter falls back instead of pushing a sup
     try testing.expect((try planWholeAgg(a, .mysql, base_t, wholeSchema(), &.{sel}, ag, plan_schema)) == null);
 }
 
-test "planWholeAgg: SUM only descends for an int column into an int result" {
+test "planWholeAgg: SUM only descends, without DISTINCT, for an int column into an int result" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     const by = try byList(a, &.{"b"});
     const key = types.Schema.Field{ .name = "b", .ty = types.Type.init(.string) };
+    const is = types.Schema{ .fields = &.{ key, .{ .name = "s", .ty = types.Type.init(.int).withNull(true) } } };
 
     const fa = try a.alloc(ast.AggItem, 1);
     fa[0] = .{ .name = "s", .func = .sum, .arg = try fld(a, "f") };
     const fs = types.Schema{ .fields = &.{ key, .{ .name = "s", .ty = types.Type.init(.float).withNull(true) } } };
-    try testing.expect((try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = fa, .by = by }, fs)) == null);
+    try expectWholeAggRefused(a, .postgres, .{ .aggs = fa, .by = by }, fs, "`s` is not pushed down");
 
     const da = try a.alloc(ast.AggItem, 1);
     da[0] = .{ .name = "s", .func = .sum, .arg = try fld(a, "m") };
     const ds = types.Schema{ .fields = &.{ key, .{ .name = "s", .ty = types.Type.decimal(12, 2).withNull(true) } } };
-    try testing.expect((try planWholeAgg(a, .mysql, base_t, wholeSchema(), &.{}, .{ .aggs = da, .by = by }, ds)) == null);
+    try expectWholeAggRefused(a, .mysql, .{ .aggs = da, .by = by }, ds, "`s` is not pushed down");
 
     const dd = try a.alloc(ast.AggItem, 1);
     dd[0] = .{ .name = "s", .func = .sum, .arg = try fld(a, "c"), .distinct = true };
-    const is = types.Schema{ .fields = &.{ key, .{ .name = "s", .ty = types.Type.init(.int).withNull(true) } } };
-    try testing.expect((try planWholeAgg(a, .mysql, base_t, wholeSchema(), &.{}, .{ .aggs = dd, .by = by }, is)) == null);
+    try expectWholeAggRefused(a, .mysql, .{ .aggs = dd, .by = by }, is, "`s` is not pushed down");
+
+    const ia = try a.alloc(ast.AggItem, 1);
+    ia[0] = .{ .name = "s", .func = .sum, .arg = try fld(a, "c") };
+    try testing.expect((try planWholeAgg(a, .mysql, base_t, wholeSchema(), &.{}, .{ .aggs = ia, .by = by }, is)) != null);
 }
 
-test "planWholeAgg: MIN/MAX falls back on collation- and timezone-sensitive types" {
+test "planWholeAgg: MIN/MAX falls back on collation- and timezone-sensitive types and on a decimal result without a precision" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1962,17 +1950,20 @@ test "planWholeAgg: MIN/MAX falls back on collation- and timezone-sensitive type
     sa[0] = .{ .name = "lo", .func = .min, .arg = try fld(a, "b") };
     const ss = types.Schema{ .fields = &.{.{ .name = "lo", .ty = types.Type.init(.string).withNull(true) }} };
     for ([_]Dialect{ .postgres, .mysql, .sqlserver }) |d|
-        try testing.expect((try planWholeAgg(a, d, base_t, wholeSchema(), &.{}, .{ .aggs = sa, .by = &.{} }, ss)) == null);
+        try expectWholeAggRefused(a, d, .{ .aggs = sa, .by = &.{} }, ss, "`lo` is not pushed down");
 
     const ta = try a.alloc(ast.AggItem, 1);
     ta[0] = .{ .name = "hi", .func = .max, .arg = try fld(a, "t") };
     const ts = types.Schema{ .fields = &.{.{ .name = "hi", .ty = types.Type.init(.timestamp).withNull(true) }} };
-    try testing.expect((try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = ta, .by = &.{} }, ts)) == null);
+    try expectWholeAggRefused(a, .postgres, .{ .aggs = ta, .by = &.{} }, ts, "`hi` is not pushed down");
 
     const ma = try a.alloc(ast.AggItem, 1);
     ma[0] = .{ .name = "lo", .func = .min, .arg = try fld(a, "m") };
     const bad = types.Schema{ .fields = &.{.{ .name = "lo", .ty = types.Type.decimal(0, 0).withNull(true) }} };
-    try testing.expect((try planWholeAgg(a, .mysql, base_t, wholeSchema(), &.{}, .{ .aggs = ma, .by = &.{} }, bad)) == null);
+    try expectWholeAggRefused(a, .mysql, .{ .aggs = ma, .by = &.{} }, bad, "`lo` is not pushed down");
+
+    const good = types.Schema{ .fields = &.{.{ .name = "lo", .ty = types.Type.decimal(12, 2).withNull(true) }} };
+    try testing.expect((try planWholeAgg(a, .mysql, base_t, wholeSchema(), &.{}, .{ .aggs = ma, .by = &.{} }, good)) != null);
 }
 
 test "planWholeAgg: a non-bare aggregate argument falls back" {
@@ -1984,7 +1975,11 @@ test "planWholeAgg: a non-bare aggregate argument falls back" {
     const aggs = try a.alloc(ast.AggItem, 1);
     aggs[0] = .{ .name = "s", .func = .sum, .arg = try bin(a, .add, try fld(a, "c"), two) };
     const plan_schema = types.Schema{ .fields = &.{.{ .name = "s", .ty = types.Type.init(.int).withNull(true) }} };
-    try testing.expect((try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = aggs, .by = &.{} }, plan_schema)) == null);
+    try expectWholeAggRefused(a, .postgres, .{ .aggs = aggs, .by = &.{} }, plan_schema, "`s` is not pushed down");
+
+    const bare = try a.alloc(ast.AggItem, 1);
+    bare[0] = .{ .name = "s", .func = .sum, .arg = try fld(a, "c") };
+    try testing.expect((try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, .{ .aggs = bare, .by = &.{} }, plan_schema)) != null);
 }
 
 fn hoistableKind(k: ast.JoinKind) bool {

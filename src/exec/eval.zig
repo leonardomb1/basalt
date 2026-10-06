@@ -3779,14 +3779,16 @@ test "decimals lose digits by rounding half away from zero, on every path" {
 }
 
 test "dates and timestamps before year 0 print with a sign instead of trapping" {
-    var buf: [96]u8 = undefined;
+    var buf: [128]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try writeDate(&w, -1_000_000);
     try w.writeByte(' ');
     try writeTimestamp(&w, -1_000_000 * 86_400_000_000 + 1);
-    const got = w.buffered();
-    try std.testing.expect(got[0] == '-');
-    try std.testing.expect(std.mem.endsWith(u8, got, " 00:00:00.000001"));
+    try w.writeByte('|');
+    try writeDate(&w, -719_529);
+    try w.writeByte('|');
+    try writeDate(&w, -719_530);
+    try std.testing.expectEqualStrings("-0768-02-05 -0768-02-05 00:00:00.000001|0000-01-01|-0001-12-31", w.buffered());
 }
 
 test "format temporal values for text sinks" {
@@ -4213,7 +4215,7 @@ fn likeMatch(s: []const u8, pat: []const u8) bool {
     return pi == pat.len;
 }
 
-test "substr (1-based, in characters) and like wildcard matcher" {
+test "UTF-8 string helpers: substr, like, reverse, pad, case-map" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -4335,6 +4337,10 @@ test "a date column compares on the vectorized path, and matches rowwise" {
     for (cases) |tc| {
         var diag: sqlp.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
         const e = try sqlp.parseExprStr(a, tc.src, &diag);
+        _ = evalVecNode(a, e, batch) catch |err| {
+            std.debug.print("expr de-vectorized: {s}: {s}\n", .{ tc.src, @errorName(err) });
+            return err;
+        };
         const out = try evalColumn(a, e, batch, Type.init(.bool).asNullable());
         for (tc.want, 0..) |w, i| {
             const got = out.getValue(i);
@@ -4367,25 +4373,33 @@ test "vectorized kernels match the rowwise evaluator" {
     var cols = [_]column.Column{ x, y };
     const batch = Batch{ .schema = &schema, .columns = &cols, .len = 5 };
 
-    const exprs = [_][]const u8{
-        "x + y",
-        "x * y - 1",
-        "x / y",
-        "x > y",
-        "x >= 10 and y < 8",
-        "x == 40 or y == 5",
-        "if(x > y, x, y)",
-        "-x",
-        "x is null",
-        "if(x != 0, y / x, 0)",
-        "x != 0 and y / x > 1",
-        "x == 0 or y / x > 1",
+    const exprs = [_]struct { src: []const u8, vectorized: bool }{
+        .{ .src = "x + y", .vectorized = true },
+        .{ .src = "x * y - 1", .vectorized = true },
+        .{ .src = "x / y", .vectorized = true },
+        .{ .src = "x > y", .vectorized = true },
+        .{ .src = "x >= 10 and y < 8", .vectorized = true },
+        .{ .src = "x == 40 or y == 5", .vectorized = true },
+        .{ .src = "if(x > y, x, y)", .vectorized = true },
+        .{ .src = "-x", .vectorized = true },
+        .{ .src = "x is null", .vectorized = true },
+        .{ .src = "if(x != 0, y / x, 0)", .vectorized = false },
+        .{ .src = "x != 0 and y / x > 1", .vectorized = false },
+        .{ .src = "x == 0 or y / x > 1", .vectorized = false },
     };
-    for (exprs) |body| {
+    for (exprs) |tc| {
+        const body = tc.src;
         var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
         const e = try parser.parseExprStr(a, body, &diag);
         var ctx = TypeCtx{ .schema = schema, .arena = a };
         const ty = try ctx.typeOf(e);
+
+        if (tc.vectorized) {
+            _ = evalVecNode(a, e, batch) catch |err| {
+                std.debug.print("expr de-vectorized: {s}: {s}\n", .{ body, @errorName(err) });
+                return err;
+            };
+        }
 
         const vec = try evalColumn(a, e, batch, ty);
         const rowwise = try evalColumnRowwise(a, e, batch, ty);
@@ -4446,9 +4460,9 @@ test "vectorized string kernels match the rowwise evaluator" {
         var ctx = TypeCtx{ .schema = schema, .arena = a };
         const ty = try ctx.typeOf(e);
 
-        _ = evalVec(a, e, batch) catch |err| {
-            std.debug.print("expr de-vectorized: {s}\n", .{body});
-            try std.testing.expect(err != error.Unsupported);
+        _ = evalVecNode(a, e, batch) catch |err| {
+            std.debug.print("expr de-vectorized: {s}: {s}\n", .{ body, @errorName(err) });
+            return err;
         };
 
         const vec = try evalColumn(a, e, batch, ty);
@@ -4889,7 +4903,7 @@ test "regex and hashes: regexp_matches, regexp_extract, md5, sha256, xxhash64, c
     try std.testing.expect((try evalLit(a, "concat_ws(NULL, 'a')")) == .null);
 }
 
-test "check-time errors: a regexp_extract group past the pattern's" {
+test "check-time errors: regexp group past the pattern's count, malformed pattern" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -5173,6 +5187,22 @@ test "regexp_replace: the compiled-pattern cache keys on bytes, not on identity"
     try std.testing.expectEqualStrings("Xbc", (try evalLit(a, "regexp_replace('abc', '^a', 'X')")).string);
 
     try std.testing.expectEqualStrings("abc", (try evalLit(a, "regexp_replace('abc', 'zzz', 'X')")).string);
+
+    var caps: regex.Captures = undefined;
+    var pat = "(a)-(b)".*;
+    var re = try cachedRegex(&pat);
+    try std.testing.expectEqual(@as(?[2]usize, .{ 0, 3 }), try re.find("a-b", 0, &caps));
+    pat[1] = 'b';
+    pat[5] = 'a';
+    re = try cachedRegex(&pat);
+    try std.testing.expectEqual(@as(?[2]usize, null), try re.find("a-b", 0, &caps));
+    try std.testing.expectEqual(@as(?[2]usize, .{ 0, 3 }), try re.find("b-a", 0, &caps));
+
+    try std.testing.expectError(error.BadPattern, cachedRegex("("));
+    re = try cachedRegex("(a)-(b)");
+    try std.testing.expectEqual(@as(?[2]usize, .{ 0, 3 }), try re.find("a-b", 0, &caps));
+    try std.testing.expectEqual(@as(?[2]usize, .{ 2, 3 }), caps[2]);
+    try std.testing.expectEqual(@as(?[2]usize, null), try re.find("b-a", 0, &caps));
 }
 
 test "field resolution: the memo verifies its entry instead of trusting it" {

@@ -2534,7 +2534,7 @@ fn testStages(arena: std.mem.Allocator, src: []const u8) ![]const ast.Stage {
     return error.NoOutput;
 }
 
-test "a join then an aggregate runs on lanes with a HAVING after it, as the plain aggregate does" {
+test "classifyAggJoinPipeline accepts a HAVING tail, as classifyAggPipeline does" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();

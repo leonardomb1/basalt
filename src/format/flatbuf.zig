@@ -306,11 +306,25 @@ test "strings, offset vectors, nested tables and struct vectors" {
 test "growth keeps earlier bytes and offsets valid" {
     var b = try Builder.init(std.testing.allocator, 16);
     defer b.deinit();
+    const small = try b.createString("ab");
+    try b.startTable(2);
+    try b.addInt(i32, 0, 42);
+    try b.addOffset(1, small);
+    const early = try b.endTable();
+    const before = b.buf.len;
     const long = "x" ** 200;
     const s = try b.createString(long);
-    try b.startTable(1);
+    try std.testing.expect(b.buf.len > before);
+    try b.startTable(3);
     try b.addOffset(0, s);
+    try b.addOffset(1, early);
+    try b.addOffset(2, small);
     const t = try b.endTable();
     const bytes = try b.finish(t);
-    try std.testing.expectEqualStrings(long, Table.root(bytes).string(0).?);
+    const r = Table.root(bytes);
+    try std.testing.expectEqualStrings(long, r.string(0).?);
+    const e = r.table(1).?;
+    try std.testing.expectEqual(@as(i32, 42), e.int(i32, 0, 0));
+    try std.testing.expectEqualStrings("ab", e.string(1).?);
+    try std.testing.expectEqualStrings("ab", r.string(2).?);
 }

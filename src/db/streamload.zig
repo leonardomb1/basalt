@@ -467,23 +467,6 @@ test "create table: composite inferred upsert -> multi-col PRIMARY KEY, ordered 
     try std.testing.expect(epos < ppos);
 }
 
-test "create table: upsert -> Primary Key, keys first + NOT NULL" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const schema = types.Schema{ .fields = &.{
-        .{ .name = "name", .ty = types.Type.init(.string) },
-        .{ .name = "id", .ty = types.Type.init(.int) },
-    } };
-    const mode = ast.WriteMode{ .upsert = .{ .keys = &.{"id"} } };
-    const stmt = try genCreateTable(a, .starrocks, "warehouse", "orders", schema, mode, 4, 1);
-    try std.testing.expect(std.mem.indexOf(u8, stmt, "PRIMARY KEY(`id`)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stmt, "`id` BIGINT NOT NULL") != null);
-    const ipos = std.mem.indexOf(u8, stmt, "`id`").?;
-    const npos = std.mem.indexOf(u8, stmt, "`name`").?;
-    try std.testing.expect(ipos < npos);
-}
-
 test "create table: Doris appends to a keyless duplicate table and upserts into a merge-on-write unique key" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -530,17 +513,6 @@ test "label and column list" {
     try std.testing.expectEqualStrings("`id`,`amount`", try columnList(a, schema));
 }
 
-test "writeSanitized replaces separator bytes embedded in data" {
-    var buf = std.array_list.Managed(u8).init(std.testing.allocator);
-    defer buf.deinit();
-    try writeSanitized(buf.writer(), "memo\x01with\x02stray bytes\x02");
-    try std.testing.expectEqualStrings("memo with stray bytes ", buf.items);
-
-    buf.clearRetainingCapacity();
-    try writeSanitized(buf.writer(), "clean value");
-    try std.testing.expectEqualStrings("clean value", buf.items);
-}
-
 test "stream-load TSV body: control-byte framing, nulls, sanitized values" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -552,9 +524,11 @@ test "stream-load TSV body: control-byte framing, nulls, sanitized values" {
     var b0 = columnmod.Builder.init(a, int_ty);
     try b0.append(.{ .int = 1 });
     try b0.append(.null);
+    try b0.append(.{ .int = 2 });
     var b1 = columnmod.Builder.init(a, str_ty);
     try b1.append(.{ .string = "memo\x01with\x02bytes" });
     try b1.append(.{ .string = "line\nbreak" });
+    try b1.append(.{ .string = "clean value" });
     const cols = try a.alloc(columnmod.Column, 2);
     cols[0] = try b0.finish();
     cols[1] = try b1.finish();
@@ -562,11 +536,11 @@ test "stream-load TSV body: control-byte framing, nulls, sanitized values" {
         .{ .name = "id", .ty = int_ty },
         .{ .name = "memo", .ty = str_ty },
     } };
-    const batch = Batch{ .schema = &schema, .columns = cols, .len = 2 };
+    const batch = Batch{ .schema = &schema, .columns = cols, .len = 3 };
 
     var out = std.array_list.Managed(u8).init(a);
     try appendBatchTsv(out.writer(), a, batch);
-    try std.testing.expectEqualStrings("1\x01memo with bytes\x02\\N\x01line\nbreak\x02", out.items);
+    try std.testing.expectEqualStrings("1\x01memo with bytes\x02\\N\x01line\nbreak\x022\x01clean value\x02", out.items);
 }
 
 test "a value that is literally the null marker is refused, not written as null" {

@@ -1531,6 +1531,33 @@ test "smb: AES-128-CCM seals and opens, and refuses a tampered message" {
     }
 }
 
+test "smb: AES-128-CCM with an 11-byte nonce and 16-byte tag matches known ciphertexts" {
+    var key: [16]u8 = undefined;
+    for (&key, 0..) |*b, i| b.* = @intCast(i);
+    var nonce: [11]u8 = undefined;
+    for (&nonce, 0..) |*b, i| b.* = @intCast(0x10 + i);
+    var aad: [32]u8 = undefined;
+    for (&aad, 0..) |*b, i| b.* = @intCast(0x20 + i);
+    const cases = [_]struct { msg: []const u8, ct: []const u8, tag: []const u8 }{
+        .{ .msg = "", .ct = "", .tag = "9d87ba17e61320c833a70c92217c4c80" },
+        .{ .msg = "SMB3 sealed payload, 40 bytes long......", .ct = "1f223fe8e0ce34cae2698d435202e7c24e09bc756fe94acf8839f266eed8be8567ad5a946d6c414e", .tag = "d8fcdc404fe60df6a7f6b99803ae8343" },
+    };
+    for (cases) |c| {
+        var want_ct: [40]u8 = undefined;
+        var want_tag: [16]u8 = undefined;
+        _ = try std.fmt.hexToBytes(want_ct[0..c.msg.len], c.ct);
+        _ = try std.fmt.hexToBytes(&want_tag, c.tag);
+        var ct: [40]u8 = undefined;
+        var tag: [16]u8 = undefined;
+        ccmEncrypt(ct[0..c.msg.len], &tag, c.msg, &aad, nonce, key);
+        try std.testing.expectEqualSlices(u8, want_ct[0..c.msg.len], ct[0..c.msg.len]);
+        try std.testing.expectEqualSlices(u8, &want_tag, &tag);
+        var back: [40]u8 = undefined;
+        try ccmDecrypt(back[0..c.msg.len], want_ct[0..c.msg.len], want_tag, &aad, nonce, key);
+        try std.testing.expectEqualStrings(c.msg, back[0..c.msg.len]);
+    }
+}
+
 test "smb URLs: share, domain, port, registered names" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();

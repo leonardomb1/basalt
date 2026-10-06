@@ -274,6 +274,19 @@ pub fn commonPrefix(items: []const Candidate) []const u8 {
     return items[0].text[0..n];
 }
 
+fn offered(items: []const Candidate, text: []const u8) ?Candidate {
+    for (items) |c| if (std.mem.eql(u8, c.text, text)) return c;
+    return null;
+}
+
+fn timesOffered(items: []const Candidate, text: []const u8) usize {
+    var n: usize = 0;
+    for (items) |c| if (std.mem.eql(u8, c.text, text)) {
+        n += 1;
+    };
+    return n;
+}
+
 test "complete: keywords in the typer's case, names first, and nothing for an empty word" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -285,8 +298,8 @@ test "complete: keywords in the typer's case, names first, and nothing for an em
     try std.testing.expectEqualStrings("customer", items[0].text);
     try std.testing.expectEqual(Kind.column, items[0].kind);
     try std.testing.expectEqualStrings("cents", items[1].text);
-    try std.testing.expectEqual(Kind.function, items[2].kind);
-    try std.testing.expectEqualStrings("concat", items[2].text);
+    try std.testing.expectEqual(Kind.column, items[1].kind);
+    try std.testing.expectEqual(Kind.function, offered(items, "concat").?.kind);
     try std.testing.expectEqual(Kind.keyword, items[items.len - 1].kind);
     try std.testing.expectEqualStrings("SELECT", (try complete(a, names, "SEL", 3)).candidates.items[0].text);
     const co = (try complete(a, .{ .columns = &.{.{ .name = "color" }} }, "WHERE co", 8)).candidates.items;
@@ -331,12 +344,13 @@ test "complete: built-in functions by prefix with their signature, columns with 
     const text = "SELECT * FROM RANGE(3) WHERE date_";
     const d = (try complete(a, .{}, text, text.len)).candidates;
     try std.testing.expectEqual(@as(usize, text.len - "date_".len), d.start);
-    try std.testing.expectEqual(@as(usize, 3), d.items.len);
-    for (d.items) |c| try std.testing.expectEqual(Kind.function, c.kind);
-    try std.testing.expectEqualStrings("date_trunc", d.items[0].text);
-    try std.testing.expectEqualStrings("date_add", d.items[1].text);
-    try std.testing.expectEqualStrings("date_add(unit, n, ts)", d.items[1].detail);
-    try std.testing.expectEqualStrings("date_diff", d.items[2].text);
+    for (d.items) |c| {
+        try std.testing.expectEqual(Kind.function, c.kind);
+        try std.testing.expect(std.mem.startsWith(u8, c.text, "date_"));
+    }
+    try std.testing.expect(offered(d.items, "date_trunc") != null);
+    try std.testing.expect(offered(d.items, "date_diff") != null);
+    try std.testing.expectEqualStrings("date_add(unit, n, ts)", offered(d.items, "date_add").?.detail);
     try std.testing.expectEqualStrings("DATE_ADD", (try complete(a, .{}, "DATE_A", 6)).candidates.items[0].text);
     try std.testing.expectEqualStrings("row_number() OVER (…)", (try complete(a, .{}, "row_n", 5)).candidates.items[0].detail);
 
@@ -349,11 +363,12 @@ test "complete: built-in functions by prefix with their signature, columns with 
     try std.testing.expectEqualStrings("t.amount", q[0].text);
     try std.testing.expectEqualStrings("decimal(10,2)", q[0].detail);
     const cnt = (try complete(a, .{ .columns = &.{.{ .name = "count", .type = "int" }} }, "cou", 3)).candidates.items;
-    try std.testing.expectEqual(@as(usize, 2), cnt.len);
     try std.testing.expectEqual(Kind.column, cnt[0].kind);
     try std.testing.expectEqualStrings("count", cnt[0].text);
-    try std.testing.expectEqualStrings("count_if", cnt[1].text);
+    try std.testing.expectEqual(@as(usize, 1), timesOffered(cnt, "count"));
+    try std.testing.expectEqual(Kind.function, offered(cnt, "count_if").?.kind);
     const fnc = (try complete(a, .{}, "cou", 3)).candidates.items;
-    try std.testing.expectEqual(@as(usize, 2), fnc.len);
     for (fnc) |c| try std.testing.expectEqual(Kind.function, c.kind);
+    try std.testing.expect(offered(fnc, "count") != null);
+    try std.testing.expect(offered(fnc, "count_if") != null);
 }

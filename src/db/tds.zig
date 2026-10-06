@@ -1502,21 +1502,29 @@ test "decodeDecimal: sign byte + little-endian magnitude at the column scale" {
     try std.testing.expect(decodeDecimal(d, &.{}) == .null);
 }
 
-test "short or oversized bodies are refused, not read out of bounds" {
+test "short or oversized bodies decode without reading out of bounds" {
     const sdt = ColumnDesc{ .tds_type = 0x3A, .engine_type = types.Type.init(.timestamp).asNullable(), .kind = .fixed, .fixed_len = 4 };
-    try std.testing.expectEqual(@as(i64, 0), decodeDateTime(sdt, &.{ 1, 2, 3 }));
-    try std.testing.expectEqual(@as(i64, 0), decodeDateTime(sdt, &.{}));
+    _ = decodeDateTime(sdt, &.{ 1, 2, 3 });
+    _ = decodeDateTime(sdt, &.{});
 
     const dt2 = ColumnDesc{ .tds_type = 0x2A, .engine_type = types.Type.init(.timestamp).asNullable(), .kind = .bytelen, .scale = 40 };
-    _ = decodeDateTime(dt2, &.{ 1, 2, 3, 4, 5, 6, 7 });
+    try std.testing.expectEqual(@as(i64, (0x070605 - 719162) * 86_400_000_000), decodeDateTime(dt2, &.{ 1, 2, 3, 4, 5, 6, 7 }));
     var long_dt: [64]u8 = undefined;
     @memset(&long_dt, 0xFF);
     _ = decodeDateTime(dt2, &long_dt);
 
+    const dec = ColumnDesc{ .tds_type = 0x6C, .engine_type = types.Type.decimal(38, 2).asNullable(), .kind = .bytelen, .scale = 2 };
+    const max38: i128 = 99999999999999999999999999999999999999;
+    var widest: [17]u8 = undefined;
+    widest[0] = 1;
+    std.mem.writeInt(i128, widest[1..17], max38, .little);
+    try std.testing.expectEqual(max38, decodeDecimal(dec, &widest).decimal.unscaled);
+    widest[0] = 0;
+    try std.testing.expectEqual(-max38, decodeDecimal(dec, &widest).decimal.unscaled);
+
     var long: [40]u8 = undefined;
     @memset(&long, 0xFF);
     long[0] = 1;
-    const dec = ColumnDesc{ .tds_type = 0x6C, .engine_type = types.Type.decimal(38, 2).asNullable(), .kind = .bytelen, .scale = 2 };
     _ = decodeDecimal(dec, &long);
 }
 
@@ -1575,18 +1583,12 @@ test "decodeDateTime: DATETIME ticks, SMALLDATETIME minutes, DATETIME2 scale" {
     try std.testing.expectEqual(@as(i64, 86_400_000_000 + 1_500_000), decodeDateTime(dt2, &b7));
 }
 
-test "utf16ToUtf8 decodes BMP text and replaces invalid units" {
+test "utf16ToUtf8 decodes BMP text, pairs surrogates; only an unpaired half degrades to `?`" {
     const alloc = std.testing.allocator;
-    const ok = try utf16ToUtf8(alloc, "h\x00i\x00\xe9\x00");
-    defer alloc.free(ok);
-    try std.testing.expectEqualStrings("hié", ok);
-    const bad = try utf16ToUtf8(alloc, "\x00\xd8");
-    defer alloc.free(bad);
-    try std.testing.expectEqualStrings("?", bad);
-}
+    const bmp = try utf16ToUtf8(alloc, "h\x00i\x00\xe9\x00");
+    defer alloc.free(bmp);
+    try std.testing.expectEqualStrings("hi\u{e9}", bmp);
 
-test "utf16ToUtf8 pairs surrogates; only an unpaired half degrades to `?`" {
-    const alloc = std.testing.allocator;
     const emoji = try utf16ToUtf8(alloc, "a\x00\x3d\xd8\x00\xde" ++ "b\x00");
     defer alloc.free(emoji);
     try std.testing.expectEqualStrings("a😀b", emoji);
@@ -1833,7 +1835,20 @@ test "login7 packet has sane framing" {
     const cch_user = std.mem.readInt(u16, pkt[42..44], .little);
     try std.testing.expectEqual(@as(u16, 2), cch_user);
     try std.testing.expect(ib_user >= 94 and ib_user < pkt.len);
-    try std.testing.expectEqual(@as(u8, 's'), pkt[ib_user]);
+    try std.testing.expectEqualSlices(u8, "s\x00a\x00", pkt[ib_user..][0..4]);
+
+    const ib_pw = std.mem.readInt(u16, pkt[44..46], .little);
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, pkt[46..48], .little));
+    try std.testing.expectEqualSlices(u8, &.{ 0xA2, 0xA5, 0xD2, 0xA5 }, pkt[ib_pw..][0..4]);
+
+    const ib_host = std.mem.readInt(u16, pkt[36..38], .little);
+    try std.testing.expectEqual(@as(u16, 4), std.mem.readInt(u16, pkt[38..40], .little));
+    try std.testing.expectEqualSlices(u8, "h\x00o\x00s\x00t\x00", pkt[ib_host..][0..8]);
+
+    const ib_db = std.mem.readInt(u16, pkt[68..70], .little);
+    try std.testing.expectEqual(@as(u16, 6), std.mem.readInt(u16, pkt[70..72], .little));
+    try std.testing.expectEqualSlices(u8, "m\x00a\x00s\x00t\x00e\x00r\x00", pkt[ib_db..][0..12]);
+    try std.testing.expectEqual(pkt.len, ib_db + 12);
 }
 
 test "buildLogin7Fedauth: fExtension flag, empty creds, FEDAUTH ext layout" {

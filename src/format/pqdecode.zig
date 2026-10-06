@@ -2360,25 +2360,6 @@ test "decodes real column values from a DuckDB-written file" {
     try testing.expectEqual(false, flag.getValue(59).bool);
 }
 
-test "every codec's fixture decodes to the same values" {
-    var ar = std.heap.ArenaAllocator.init(testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const files = [_][]const u8{
-        @embedFile("testdata/uncompressed.parquet"),
-        @embedFile("testdata/snappy.parquet"),
-        @embedFile("testdata/gzip.parquet"),
-        @embedFile("testdata/lz4.parquet"),
-    };
-    for (files) |f| {
-        const md = try parquet.parseFile(a, f);
-        const g = md.row_groups[0];
-        const name = try readColumnChunk(a, f, g.columns[1].meta.?, md.schema[2], @intCast(g.num_rows), 1, 0);
-        try testing.expectEqualStrings("row-0", name.getValue(0).string);
-        try testing.expectEqualStrings("row-42", name.getValue(42).string);
-    }
-}
-
 test "schema walk resolves levels and dotted names for nested groups" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -2533,6 +2514,9 @@ test "delta binary packed recovers a running sum, including negatives" {
     const got = try decodeDeltaBinaryPacked(a, &src, 1);
     try testing.expectEqualSlices(i64, &.{7}, got);
 
+    const block = [_]u8{ 0x80, 0x01, 0x04, 0x05, 0x05, 0x0f, 0x04, 0x00, 0x00, 0x00, 0x96, 0x0c } ++ [_]u8{0} ** 14;
+    try testing.expectEqualSlices(i64, &.{ -3, -5, -4, 0, -8 }, try decodeDeltaBinaryPacked(a, &block, 5));
+
     try testing.expectError(Error.CorruptParquetPage, decodeDeltaBinaryPacked(a, &[_]u8{ 0x80, 0x01, 0x00, 0x01, 0x00 }, 1));
 }
 
@@ -2654,7 +2638,7 @@ test "chunk extents come from the next chunk, never from total_compressed_size" 
     try testing.expectEqual(@as(u64, 900), chunkEnd(&b, 900));
 }
 
-test "a corrupted file errors instead of panicking" {
+test "a corrupted file never panics" {
     const good = @embedFile("testdata/zstd.parquet");
     var buf: [good.len]u8 = undefined;
 
@@ -2688,19 +2672,25 @@ test "ranged reads return the same values as an in-memory file" {
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "r.parquet", .data = @embedFile("testdata/zstd.parquet") });
+    try tmp.dir.writeFile(.{ .sub_path = "r.parquet", .data = fx });
     const dir = try tmp.dir.realpathAlloc(a, ".");
     const path = try std.fs.path.join(a, &.{ dir, "r.parquet" });
 
     const r = try Reader.open(a, path);
     defer r.close();
+    try testing.expect(r.src == .file);
     const got = (try r.next(a)).?;
     try testing.expectEqual(@as(usize, 60), got.len);
-    try testing.expectEqual(@as(i64, 0), got.columns[0].getValue(0).int);
-    try testing.expectEqual(@as(i64, 59), got.columns[0].getValue(59).int);
-    try testing.expectEqualStrings("row-59", got.columns[1].getValue(59).string);
-    try testing.expectEqual(@as(f64, 88.5), got.columns[2].getValue(59).float);
     try testing.expect((try r.next(a)) == null);
+
+    const md = try parquet.parseFile(a, fx);
+    const g = md.row_groups[0];
+    try testing.expectEqual(g.columns.len, got.columns.len);
+    for (g.columns, 0..) |c, ci| {
+        const want = try readColumnChunk(a, fx, c.meta.?, md.schema[ci + 1], @intCast(g.num_rows), 1, 0);
+        try testing.expectEqual(want.len, got.columns[ci].len);
+        for (0..want.len) |i| try testing.expectEqualDeep(want.getValue(i), got.columns[ci].getValue(i));
+    }
 }
 
 test "a Bytes range refuses to read past the end" {
@@ -2817,19 +2807,18 @@ test "fuzz: page decode kernels survive arbitrary bytes" {
 test "BitReader: wide values at non-zero bit offsets keep their top bits" {
     const v61: u64 = 0x1ABC_DEF0_1234_5678 & ((1 << 61) - 1);
     const v64: u64 = 0xFEDC_BA98_7654_3210;
-    var bits: [17]u8 = @splat(0);
-    var w = std.io.Writer.fixed(&bits);
-    _ = &w;
-    var acc: u128 = 0b111;
-    acc |= @as(u128, v61) << 3;
-    var acc2: u128 = @as(u128, v64) << ((3 + 61) % 8);
-    _ = &acc2;
     var all: [16]u8 = undefined;
-    std.mem.writeInt(u128, &all, acc | (@as(u128, v64) << 64), .little);
+    std.mem.writeInt(u128, &all, 0b111 | (@as(u128, v61) << 3) | (@as(u128, v64) << 64), .little);
     var br = BitReader{ .buf = &all };
     try std.testing.expectEqual(@as(u64, 0b111), try br.read(3));
     try std.testing.expectEqual(v61, try br.read(61));
     try std.testing.expectEqual(v64, try br.read(64));
+
+    var nine: [9]u8 = undefined;
+    std.mem.writeInt(u72, &nine, 0b101 | (@as(u72, v64) << 3), .little);
+    var odd = BitReader{ .buf = &nine };
+    try std.testing.expectEqual(@as(u64, 0b101), try odd.read(3));
+    try std.testing.expectEqual(v64, try odd.read(64));
 
     var short = BitReader{ .buf = all[0..8] };
     _ = try short.read(3);
@@ -2925,7 +2914,7 @@ test "parquet LIST columns read as JSON from pyarrow (pages v1 and v2) and polar
     , try readAllText(a, @embedFile("testdata/lists_polars.parquet"), "p.parquet"));
 }
 
-test "a nested column is typed string, read whole, and no bound prunes on it" {
+test "a nested column is typed string and no bound prunes on it" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();

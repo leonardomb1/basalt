@@ -463,7 +463,7 @@ fn urlEncode(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     return out.toOwnedSlice();
 }
 
-test "block ids are fixed-width base64 so ordering is stable past 10 blocks" {
+test "block ids are the same width at every block number" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -480,11 +480,18 @@ test "block ids are fixed-width base64 so ordering is stable past 10 blocks" {
         .rand = std.Random.DefaultPrng.init(0),
     };
     const b0 = try w.blockId(0);
-    const b9 = try w.blockId(9);
-    const b10 = try w.blockId(10);
-    try std.testing.expectEqual(b0.len, b10.len);
-    try std.testing.expect(std.mem.lessThan(u8, b9, b10));
+    try std.testing.expectEqual(b0.len, (try w.blockId(9)).len);
+    try std.testing.expectEqual(b0.len, (try w.blockId(10)).len);
+    try std.testing.expectEqual(b0.len, (try w.blockId(49_999)).len);
+}
+
+test "urlEncode escapes the base64 characters that are not URL-safe" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
     try std.testing.expectEqualStrings("%2B", try urlEncode(a, "+"));
+    try std.testing.expectEqualStrings("a%2Fb%3D%3D", try urlEncode(a, "a/b=="));
+    try std.testing.expectEqualStrings("YmxrMDA", try urlEncode(a, "YmxrMDA"));
 }
 
 test "parseUrl: host-style URL and signature for the real service" {
@@ -525,37 +532,43 @@ test "rfc1123 matches the reference date from the Azure signing docs" {
     try std.testing.expectEqualStrings("Thu, 01 Jan 1970 00:00:00 GMT", try rfc1123(a, 0));
 }
 
-test "authHeader: canonical headers are sorted and Content-Length 0 signs as empty" {
+test "authHeader: signatures match the SharedKey layout, header order does not matter, and Content-Length 0 signs as empty" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     const key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+    const date = "Sun, 06 Nov 1994 08:49:37 GMT";
+    const res = "/devstoreaccount1/c/f.csv";
 
     const h1 = try authHeader(a, "devstoreaccount1", key, .{
         .method = "GET",
-        .canonical_resource = "/devstoreaccount1/c/f.csv",
+        .canonical_resource = res,
         .ms_headers = &.{
             .{ .name = "x-ms-version", .value = api_version },
-            .{ .name = "x-ms-date", .value = "Sun, 06 Nov 1994 08:49:37 GMT" },
+            .{ .name = "x-ms-date", .value = date },
         },
     });
     const h2 = try authHeader(a, "devstoreaccount1", key, .{
         .method = "GET",
-        .canonical_resource = "/devstoreaccount1/c/f.csv",
+        .canonical_resource = res,
         .ms_headers = &.{
-            .{ .name = "x-ms-date", .value = "Sun, 06 Nov 1994 08:49:37 GMT" },
+            .{ .name = "x-ms-date", .value = date },
             .{ .name = "x-ms-version", .value = api_version },
         },
     });
+    try std.testing.expectEqualStrings("SharedKey devstoreaccount1:obRwfj83MnpKQKlq0x0hh52lTflQP09ZDntY2eAI7Hk=", h1);
     try std.testing.expectEqualStrings(h1, h2);
-    try std.testing.expect(std.mem.startsWith(u8, h1, "SharedKey devstoreaccount1:"));
 
-    const put = try authHeader(a, "devstoreaccount1", key, .{
-        .method = "PUT",
-        .canonical_resource = "/devstoreaccount1/c/f.csv",
-        .ms_headers = &.{.{ .name = "x-ms-date", .value = "Sun, 06 Nov 1994 08:49:37 GMT" }},
-    });
-    try std.testing.expect(!std.mem.eql(u8, h1, put));
+    const headers = &[_]MsHeader{
+        .{ .name = "x-ms-date", .value = date },
+        .{ .name = "x-ms-version", .value = api_version },
+    };
+    const omitted = try authHeader(a, "devstoreaccount1", key, .{ .method = "PUT", .canonical_resource = res, .ms_headers = headers, .content_type = "text/csv" });
+    const zero = try authHeader(a, "devstoreaccount1", key, .{ .method = "PUT", .canonical_resource = res, .ms_headers = headers, .content_type = "text/csv", .content_length = 0 });
+    const five = try authHeader(a, "devstoreaccount1", key, .{ .method = "PUT", .canonical_resource = res, .ms_headers = headers, .content_type = "text/csv", .content_length = 5 });
+    try std.testing.expectEqualStrings("SharedKey devstoreaccount1:A3dhQWBT20oStAXoOomI0lCAMLRuq2OUX2fi9Zq0c78=", zero);
+    try std.testing.expectEqualStrings(omitted, zero);
+    try std.testing.expectEqualStrings("SharedKey devstoreaccount1:leEHE8BYEl9Yzf92qjOQxX5MlJKmy64LZXWbOKAA8AA=", five);
 }
 
 test "authHeader rejects a malformed key rather than signing with garbage" {
@@ -657,6 +670,10 @@ test "statusToError distinguishes causes instead of one catch-all" {
     try std.testing.expectEqual(Error.AzureBlobNotFound, statusToError(404, "<Error><Code>BlobNotFound</Code></Error>"));
     try std.testing.expectEqual(Error.AzureThrottled, statusToError(503, ""));
     try std.testing.expectEqual(Error.AzureRequestFailed, statusToError(418, ""));
+    try std.testing.expectEqual(Error.AzureAuthFailed, statusToError(400, "<Error><Code>AuthenticationFailed</Code></Error>"));
+    try std.testing.expectEqual(Error.AzureBlobNotFound, statusToError(400, "<Error><Code>BlobNotFound</Code></Error>"));
+    try std.testing.expectEqual(Error.AzureContainerMissing, statusToError(403, "<Error><Code>ContainerNotFound</Code></Error>"));
+    try std.testing.expectEqual(Error.AzureRequestFailed, statusToError(400, "<Error><Code>InvalidHeaderValue</Code></Error>"));
 }
 
 /// Splits a prefix URL for listing. Unlike `parseUrl`, the prefix may be empty.

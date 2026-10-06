@@ -643,14 +643,13 @@ test "progress line: counts, rate and clock, and a label that gives way to the w
     try std.testing.expectEqualStrings("* [1/3] a → b  12 rows  6 rows/s  0:02", plain[0..n]);
 }
 
-test "level parse + summary rate" {
+test "Level.parse" {
+    try std.testing.expectEqual(Level.err, Level.parse("error").?);
     try std.testing.expectEqual(Level.warn, Level.parse("warn").?);
     try std.testing.expect(Level.parse("nope") == null);
-    const s = Summary{ .run_id = 1, .rows_written = 1000, .elapsed_ms = 500 };
-    try std.testing.expectEqual(@as(u64, 2000), s.rate());
 }
 
-test "json log line escapes and is one line" {
+test "writeEscaped: quotes, backslashes and control characters are escaped" {
     var buf: [256]u8 = undefined;
     var fbw = std.Io.Writer.fixed(&buf);
     const w = &fbw;
@@ -658,11 +657,6 @@ test "json log line escapes and is one line" {
     try writeEscaped(w, "a\"b\nc\\d\t\r\x01");
     try w.writeAll("\"}");
     try std.testing.expectEqualStrings("{\"msg\":\"a\\\"b\\nc\\\\d\\t\\r\\u0001\"}", w.buffered());
-}
-
-test "summary rate: zero elapsed falls back to rows_written (no div-by-zero)" {
-    const s = Summary{ .run_id = 1, .rows_written = 42, .elapsed_ms = 0 };
-    try std.testing.expectEqual(@as(u64, 42), s.rate());
 }
 
 test "summary renderJson: one status-ok object with every metric field" {
@@ -748,20 +742,44 @@ test "summary rate: an aggregate reports the rows it processed, not the rows it 
 
     const instant = Summary{ .run_id = 1, .rows_read = 42, .rows_written = 1, .elapsed_ms = 0 };
     try std.testing.expectEqual(@as(u64, 42), instant.rate());
+
+    const instant_sourceless = Summary{ .run_id = 1, .rows_read = 0, .rows_written = 42, .elapsed_ms = 0 };
+    try std.testing.expectEqual(@as(u64, 42), instant_sourceless.rate());
 }
 
-test "logger format: only explicit json is NDJSON; auto resolves to text" {
-    try std.testing.expect(!Logger.init(1, .auto, .info).json);
-    try std.testing.expect(!Logger.init(1, .text, .info).json);
-    try std.testing.expect(Logger.init(1, .json, .info).json);
+fn testLogAll(dir: std.fs.Dir, name: []const u8, format: Format, buf: []u8) ![]const u8 {
+    const f = try dir.createFile(name, .{ .read = true });
+    defer f.close();
+    var lg = Logger.init(1, format, .info);
+    lg.file = f;
+    lg.log(.err, "e{d}", .{1});
+    lg.log(.warn, "w{d}", .{2});
+    lg.log(.info, "i\"{d}\n", .{3});
+    lg.log(.debug, "d{d}", .{4});
+    try f.seekTo(0);
+    const n = try f.readAll(buf);
+    return buf[0..n];
 }
 
-test "logger level gate: err/warn/info pass at min=info, debug is filtered" {
-    var lg = Logger.init(1, .text, .info);
-    try std.testing.expect(lg.enabled(.err));
-    try std.testing.expect(lg.enabled(.warn));
-    try std.testing.expect(lg.enabled(.info));
-    try std.testing.expect(!lg.enabled(.debug));
+test "Logger.log: min=info writes err, warn and info and drops debug; only explicit json is NDJSON" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [1024]u8 = undefined;
+
+    try std.testing.expectEqualStrings("error: e1\nwarn: w2\ninfo: i\"3\n\n", try testLogAll(tmp.dir, "auto", .auto, &buf));
+    try std.testing.expectEqualStrings("error: e1\nwarn: w2\ninfo: i\"3\n\n", try testLogAll(tmp.dir, "text", .text, &buf));
+
+    const out = try testLogAll(tmp.dir, "json", .json, &buf);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, out, "\n"));
+    var it = std.mem.splitScalar(u8, out[0 .. out.len - 1], '\n');
+    const want = [_][2][]const u8{ .{ "error", "e1" }, .{ "warn", "w2" }, .{ "info", "i\"3\n" } };
+    for (want) |wl| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, it.next().?, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(wl[0], parsed.value.object.get("level").?.string);
+        try std.testing.expectEqualStrings(wl[1], parsed.value.object.get("msg").?.string);
+    }
+    try std.testing.expect(it.next() == null);
 }
 
 const test_empty_schema = types.Schema{ .fields = &.{} };

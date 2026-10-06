@@ -2430,12 +2430,15 @@ test "appendDisplaySinks adds `write stdout` only to sink-less pipelines" {
         \\LOAD INTO 'out.csv' AS SELECT * FROM 'in.csv';
     , &diag);
     const kept = try appendDisplaySinks(a, sunk);
+    var found_sunk = false;
     for (kept.stmts, sunk.stmts) |st, orig| {
         if (st != .output) continue;
+        found_sunk = true;
         const stages = st.output.stages;
         try std.testing.expectEqualStrings("csv", stages[stages.len - 1].node.write.connector);
         try std.testing.expectEqual(orig.output.stages.len, stages.len);
     }
+    try std.testing.expect(found_sunk);
 }
 
 fn usage(w: anytype) !void {
@@ -2542,8 +2545,10 @@ test "every meta command the REPL handles is one Tab offers, and the other way r
     const body_end = std.mem.indexOfPos(u8, src, body_start + 1, "\nfn ").?;
     var it = std.mem.splitSequence(u8, src[body_start..body_end], "std.mem.eql(u8, cmd, \"\\\\");
     _ = it.next();
+    var scraped: usize = 0;
     while (it.next()) |rest| {
         const end = std.mem.indexOfScalar(u8, rest, '"') orelse continue;
+        scraped += 1;
         var cmd_buf: [64]u8 = undefined;
         const cmd = try std.fmt.bufPrint(&cmd_buf, "\\{s}", .{rest[0..end]});
         var offered = false;
@@ -2555,6 +2560,7 @@ test "every meta command the REPL handles is one Tab offers, and the other way r
             return error.TestUnexpectedResult;
         }
     }
+    try std.testing.expect(scraped >= 17);
 }
 
 test "suggestFor: a half-typed script's own declarations and a local file's columns" {
@@ -2648,7 +2654,7 @@ test "Tab's built-in functions are exactly the engine's: every scalar, aggregate
     }
 }
 
-test "a file's columns are offered with their type, and each word once" {
+test "a file's columns are offered with their type, in the offer and in its JSON" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -2675,8 +2681,15 @@ test "a file's columns are offered with their type, and each word once" {
     const item = parsed.value.object.get("items").?.array.items[0].object;
     try std.testing.expectEqualStrings("string", item.get("detail").?.string);
 
-    const w = try suggestFor(a, &cx, text[0 .. text.len - 2], text.len - 2);
-    for (w.items) |c| if (std.mem.eql(u8, c.text, "when_at")) try std.testing.expect(c.detail.len > 0);
+    const wtext = try std.fmt.allocPrint(a, "SELECT * FROM '{s}/t.csv' WHERE wh", .{dir});
+    const w = try suggestFor(a, &cx, wtext, wtext.len);
+    var found = false;
+    for (w.items) |c| if (std.mem.eql(u8, c.text, "when_at")) {
+        found = true;
+        try std.testing.expectEqual(complete.Kind.column, c.kind);
+        try std.testing.expectEqualStrings("date", c.detail);
+    };
+    try std.testing.expect(found);
 }
 
 test "csvCells: quoted cells keep their commas and doubled quotes" {

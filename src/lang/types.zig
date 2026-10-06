@@ -198,12 +198,17 @@ test "eql compares decimal parameters but ignores nullability" {
     try std.testing.expect(Type.eql(Type.init(.int).asNullable(), Type.init(.int)));
 }
 
-test "schema lookup" {
+test "Schema.resolve finds a join's renamed right-side column by its qualified name" {
     const s = Schema{ .fields = &.{
         .{ .name = "id", .ty = Type.init(.int) },
-        .{ .name = "name", .ty = Type.init(.string) },
+        .{ .name = "x", .ty = Type.init(.string) },
+        .{ .name = "x_r", .ty = Type.init(.int), .rel = "b", .base = "x" },
     } };
-    try std.testing.expectEqual(@as(?usize, 0), s.indexOf("id"));
-    try std.testing.expectEqual(@as(?usize, 1), s.indexOf("name"));
+    try std.testing.expectEqual(@as(?usize, 2), s.resolve(&.{ "b", "x" }));
+    try std.testing.expectEqual(@as(?usize, 1), s.resolve(&.{ "a", "x" }));
+    try std.testing.expectEqual(@as(?usize, 1), s.resolve(&.{"x"}));
+    try std.testing.expectEqual(@as(?usize, 2), s.resolve(&.{"x_r"}));
+    try std.testing.expectEqual(@as(?usize, 0), s.resolve(&.{ "b", "id" }));
+    try std.testing.expectEqual(@as(?usize, null), s.resolve(&.{ "b", "missing" }));
     try std.testing.expectEqual(@as(?usize, null), s.indexOf("missing"));
 }

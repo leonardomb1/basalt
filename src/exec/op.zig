@@ -3677,16 +3677,21 @@ test "limit skips offset rows across batch boundaries and stops at count" {
     const batches = [_]Batch{
         try intBatch(a, &int_schema, &.{ 1, 2, 3 }),
         try intBatch(a, &int_schema, &.{ 4, 5, 6 }),
+        try intBatch(a, &int_schema, &.{ 7, 8, 9 }),
     };
     var ts = TestSource{ .schema_ = int_schema, .batches = &batches };
     var scan = Scan{ .src = ts.src() };
     var lim = Limit{ .child = .{ .scan = &scan }, .remaining = 3, .to_skip = 4 };
-    try testing.expectEqualDeep(@as([]const ?i64, &.{ 5, 6 }), try drainInts(a, .{ .limit = &lim }));
+    try testing.expectEqualDeep(@as([]const ?i64, &.{ 5, 6, 7 }), try drainInts(a, .{ .limit = &lim }));
+    try testing.expectEqual(@as(usize, 3), ts.idx);
 
     var ts2 = TestSource{ .schema_ = int_schema, .batches = &batches };
     var scan2 = Scan{ .src = ts2.src() };
     var lim2 = Limit{ .child = .{ .scan = &scan2 }, .remaining = 3, .to_skip = 1 };
     try testing.expectEqualDeep(@as([]const ?i64, &.{ 2, 3, 4 }), try drainInts(a, .{ .limit = &lim2 }));
+    try testing.expectEqual(@as(usize, 2), ts2.idx);
+    try testing.expect((try lim2.next(a)) == null);
+    try testing.expectEqual(@as(usize, 2), ts2.idx);
 }
 
 test "filter keeps only known-true rows: null predicate drops the row (3VL)" {
@@ -3825,6 +3830,7 @@ test "distinct dedups across batches, groups nulls as one key, deep-copies strin
             const v = b.columns[0].getValue(r);
             try got.append(if (v.isNull()) null else v.string);
         }
+        for (batches[0..ts.idx]) |consumed| @memset(consumed.columns[0].data.bytes.values, '#');
     }
     const want = [_]?[]const u8{ "a", "b", null, "c" };
     try testing.expectEqual(want.len, got.items.len);
@@ -3846,6 +3852,11 @@ test "sort: descending order with nulls always last" {
     var scan = Scan{ .src = ts.src() };
     var srt = Sort{ .child = .{ .scan = &scan }, .in_schema = &int_schema, .keys = &[_]Sort.Key{.{ .idx = 0, .desc = true }} };
     try testing.expectEqualDeep(@as([]const ?i64, &.{ 3, 2, 1, null }), try drainInts(a, .{ .sort = &srt }));
+
+    var ts_asc = TestSource{ .schema_ = int_schema, .batches = &batches };
+    var scan_asc = Scan{ .src = ts_asc.src() };
+    var srt_asc = Sort{ .child = .{ .scan = &scan_asc }, .in_schema = &int_schema, .keys = &[_]Sort.Key{.{ .idx = 0, .desc = false }} };
+    try testing.expectEqualDeep(@as([]const ?i64, &.{ 1, 2, 3, null }), try drainInts(a, .{ .sort = &srt_asc }));
 }
 
 test "top_n keeps best rows across batches, honors offset, matches full sort" {
@@ -3860,25 +3871,65 @@ test "top_n keeps best rows across batches, honors offset, matches full sort" {
     const batches = [_]Batch{
         try kvBatch(a, &schema, &.{ 5, 1, 4 }, &.{ "e", "a", "d" }),
         try kvBatch(a, &schema, &.{ 2, 8, 3 }, &.{ "b", "z", "c" }),
+        try kvBatch(a, &schema, &.{ null, 0, 9 }, &.{ "n", "y", "q" }),
     };
-    var ts = TestSource{ .schema_ = schema, .batches = &batches };
-    var scan = Scan{ .src = ts.src() };
-    var tn = TopN{
-        .child = .{ .scan = &scan },
-        .in_schema = &schema,
-        .keys = &[_]Sort.Key{.{ .idx = 0, .desc = false }},
-        .count = 2,
-        .offset = 1,
-        .state = a,
-        .gpa = testing.allocator,
+    const Row = struct { x: ?i64, s: []const u8 };
+    const drain = struct {
+        fn f(al: std.mem.Allocator, top: Op) ![]const Row {
+            var rows = std.array_list.Managed(Row).init(al);
+            while (try top.next(al)) |b| {
+                var r: usize = 0;
+                while (r < b.len) : (r += 1) {
+                    const v = b.columns[0].getValue(r);
+                    try rows.append(.{ .x = if (v.isNull()) null else v.int, .s = b.columns[1].getValue(r).string });
+                }
+            }
+            return rows.toOwnedSlice();
+        }
+    }.f;
+
+    const cases = [_]struct { count: u64, offset: u64, desc: bool }{
+        .{ .count = 2, .offset = 1, .desc = false },
+        .{ .count = 3, .offset = 0, .desc = true },
+        .{ .count = 4, .offset = 7, .desc = false },
+        .{ .count = 5, .offset = 6, .desc = true },
     };
-    const b = (try tn.next(a)).?;
-    try testing.expectEqual(@as(usize, 2), b.len);
-    try testing.expectEqual(@as(i64, 2), b.columns[0].getValue(0).int);
-    try testing.expectEqualStrings("b", b.columns[1].getValue(0).string);
-    try testing.expectEqual(@as(i64, 3), b.columns[0].getValue(1).int);
-    try testing.expectEqualStrings("c", b.columns[1].getValue(1).string);
-    try testing.expect((try tn.next(a)) == null);
+    for (cases, 0..) |tc, ci| {
+        const keys = try a.dupe(Sort.Key, &.{.{ .idx = 0, .desc = tc.desc }});
+
+        var ts = TestSource{ .schema_ = schema, .batches = &batches };
+        var scan = Scan{ .src = ts.src() };
+        var tn = TopN{
+            .child = .{ .scan = &scan },
+            .in_schema = &schema,
+            .keys = keys,
+            .count = tc.count,
+            .offset = tc.offset,
+            .state = a,
+            .gpa = testing.allocator,
+        };
+        const got = try drain(a, .{ .top_n = &tn });
+
+        var ts_ref = TestSource{ .schema_ = schema, .batches = &batches };
+        var scan_ref = Scan{ .src = ts_ref.src() };
+        var srt = Sort{ .child = .{ .scan = &scan_ref }, .in_schema = &schema, .keys = keys };
+        var lim = Limit{ .child = .{ .sort = &srt }, .remaining = tc.count, .to_skip = tc.offset };
+        const want = try drain(a, .{ .limit = &lim });
+
+        try testing.expectEqual(want.len, got.len);
+        for (want, got) |w, g| {
+            try testing.expectEqual(w.x, g.x);
+            try testing.expectEqualStrings(w.s, g.s);
+        }
+
+        if (ci == 0) {
+            try testing.expectEqual(@as(usize, 2), got.len);
+            try testing.expectEqual(@as(?i64, 1), got[0].x);
+            try testing.expectEqualStrings("a", got[0].s);
+            try testing.expectEqual(@as(?i64, 2), got[1].x);
+            try testing.expectEqualStrings("b", got[1].s);
+        }
+    }
 }
 
 test "aggregate: grouped count/sum/avg/min/max skip nulls per group" {

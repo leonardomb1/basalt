@@ -791,6 +791,7 @@ test "parseQuery binds k=v pairs and skips malformed ones" {
     try std.testing.expectEqual(@as(usize, 3), params.items.len);
     try std.testing.expectEqualStrings("a", params.items[0].key);
     try std.testing.expectEqualStrings("1", params.items[0].val);
+    try std.testing.expectEqualStrings("b", params.items[1].key);
     try std.testing.expectEqualStrings("x%20y", params.items[1].val);
     try std.testing.expectEqualStrings("c", params.items[2].key);
     try std.testing.expectEqualStrings("", params.items[2].val);
@@ -849,4 +850,11 @@ test "httpPath/httpDoc read CREATE ENDPOINT config, with defaults" {
     , &diag);
     try std.testing.expectEqualStrings("/", httpPath(bare));
     try std.testing.expectEqualStrings("", httpDoc(bare));
+
+    const batch = try parser.parseSource(a,
+        \\LOAD INTO 'out.csv' AS SELECT * FROM 'in.csv';
+    , &diag);
+    try std.testing.expectEqualStrings("/", httpPath(batch));
+    try std.testing.expectEqualStrings("", httpDoc(batch));
+    try std.testing.expectEqualStrings("/", httpPath(.{ .stmts = &.{} }));
 }

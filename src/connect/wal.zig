@@ -425,7 +425,7 @@ test "wal: append, rotate by size, pending list, label" {
     try testing.expectEqualStrings("{\"a\":1}\n{\"a\":2}\n", seg);
 }
 
-test "wal: markLoaded is atomic-rename, purge removes loaded segments" {
+test "wal: markLoaded persists the state file and leaves no temp file, purge removes loaded segments" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -450,8 +450,15 @@ test "wal: markLoaded is atomic-rename, purge removes loaded segments" {
     gpa.free(pending);
 
     try testing.expectError(error.FileNotFound, w.dir.statFile("ev.state.tmp"));
+    const state1 = try w.dir.readFileAlloc(gpa, "ev.state", 64);
+    defer gpa.free(state1);
+    try testing.expectEqualStrings("1\n", state1);
 
     try w.markLoaded(3);
+    try testing.expectError(error.FileNotFound, w.dir.statFile("ev.state.tmp"));
+    const state3 = try w.dir.readFileAlloc(gpa, "ev.state", 64);
+    defer gpa.free(state3);
+    try testing.expectEqualStrings("3\n", state3);
     const removed = try w.purgeLoaded();
     try testing.expectEqual(@as(usize, 3), removed);
     try testing.expectEqual(@as(u64, 0), w.bytesOnDisk());

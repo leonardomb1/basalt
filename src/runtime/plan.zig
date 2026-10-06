@@ -1212,4 +1212,7 @@ test "prepareJoinSide: a CTE joined in reads its table with its own WHERE, its c
     const rd = out[0].node.read;
     try std.testing.expectEqualStrings("(\"active\" = 1)", rd.where);
     try std.testing.expectEqual(@as(usize, 3), rd.cols.len);
+    try std.testing.expectEqualStrings("active", rd.cols[0]);
+    try std.testing.expectEqualStrings("name", rd.cols[1]);
+    try std.testing.expectEqualStrings("cid", rd.cols[2]);
 }

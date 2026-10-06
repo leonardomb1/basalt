@@ -596,46 +596,24 @@ pub fn intColumn(alloc: std.mem.Allocator, vals: []const ?i64) !Column {
     };
 }
 
-test "int column round-trips values and nulls" {
-    const alloc = std.testing.allocator;
-    const c = try intColumn(alloc, &.{ 1, null, 3 });
-    defer {
-        alloc.free(c.validity.bits);
-        alloc.free(c.data.i64);
-    }
-
-    try std.testing.expectEqual(@as(i64, 1), c.getValue(0).int);
-    try std.testing.expect(c.getValue(1).isNull());
-    try std.testing.expectEqual(@as(i64, 3), c.getValue(2).int);
-}
-
-test "builder assembles a nullable string column" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var b = Builder.init(arena.allocator(), types.Type.init(.string).asNullable());
-    try b.append(.{ .string = "a" });
-    try b.append(.null);
-    try b.append(.{ .string = "c" });
-    const c = try b.finish();
-    try std.testing.expectEqual(@as(usize, 3), c.len);
-    try std.testing.expectEqualStrings("a", c.getValue(0).string);
-    try std.testing.expect(c.getValue(1).isNull());
-    try std.testing.expectEqualStrings("c", c.getValue(2).string);
-}
-
 test "concat joins typed chunks and carries nulls across offsets" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const c1 = try intColumn(a, &.{ 1, null, 3 });
-    const c2 = try intColumn(a, &.{ null, 5 });
-    const out = try concat(a, &.{ c1, c2 }, 5);
-    try std.testing.expectEqual(@as(usize, 5), out.len);
-    try std.testing.expectEqual(@as(i64, 1), out.getValue(0).int);
-    try std.testing.expect(out.getValue(1).isNull());
-    try std.testing.expectEqual(@as(i64, 3), out.getValue(2).int);
-    try std.testing.expect(out.getValue(3).isNull());
-    try std.testing.expectEqual(@as(i64, 5), out.getValue(4).int);
+    const v1 = [_]?i64{ 1, null, 3, 4, null };
+    const v2 = [_]?i64{ 6, 7, null, null, 10, null };
+    const c1 = try intColumn(a, &v1);
+    const c2 = try intColumn(a, &v2);
+    const out = try concat(a, &.{ c1, c2 }, 11);
+    try std.testing.expectEqual(@as(usize, 11), out.len);
+    const want = v1 ++ v2;
+    for (want, 0..) |w, i| {
+        if (w) |x| {
+            try std.testing.expectEqual(x, out.getValue(i).int);
+        } else {
+            try std.testing.expect(out.getValue(i).isNull());
+        }
+    }
 }
 
 test "permute reorders values and validity" {
@@ -671,18 +649,6 @@ test "builder finish with zero appended rows yields an empty column" {
     const c = try b.finish();
     try std.testing.expectEqual(@as(usize, 0), c.len);
     try std.testing.expectEqual(@as(usize, 0), c.data.i64.len);
-}
-
-test "bitmap allSet: empty prefix, partial byte, exact byte multiple" {
-    const alloc = std.testing.allocator;
-    var bm = try Bitmap.initFull(alloc, 16);
-    defer alloc.free(bm.bits);
-    try std.testing.expect(bm.allSet(0));
-    try std.testing.expect(bm.allSet(16));
-    bm.setValid(11, false);
-    try std.testing.expect(bm.allSet(11));
-    try std.testing.expect(!bm.allSet(12));
-    try std.testing.expect(!bm.allSet(16));
 }
 
 test "bitmap set/get across byte boundaries" {

@@ -1454,7 +1454,7 @@ test "writeField quotes exactly the fields that need it, doubling quotes" {
     try std.testing.expectEqualStrings("plain|\"a,b\"|\"say \"\"hi\"\"\"|\"line\nbreak\"|\"\"", buf.items);
 }
 
-test "an empty string survives a write/read round-trip and stays distinct from null" {
+test "quoted values and an empty string survive a write/read round-trip, the empty string distinct from null" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1464,41 +1464,33 @@ test "an empty string survives a write/read round-trip and stays distinct from n
     try writeField(line.writer(), "", ',');
     try line.append(',');
     try line.append('\n');
-    const b = try parseSlice(a, &schema, line.items);
-    try std.testing.expect(!b.columns[0].getValue(0).isNull());
-    try std.testing.expectEqualStrings("", b.columns[0].getValue(0).string);
-    try std.testing.expect(b.columns[1].getValue(0).isNull());
-}
-
-test "csv write/parse round-trip preserves quoted values" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const schema = try stringSchema(a, &.{ "a", "b" });
-
-    var line = std.array_list.Managed(u8).init(a);
     try writeField(line.writer(), "O'Neil, \"Jr\"", ',');
     try line.append(',');
     try writeField(line.writer(), "plain", ',');
     try line.append('\n');
     const b = try parseSlice(a, &schema, line.items);
-    try std.testing.expectEqualStrings("O'Neil, \"Jr\"", b.columns[0].getValue(0).string);
-    try std.testing.expectEqualStrings("plain", b.columns[1].getValue(0).string);
+    try std.testing.expectEqual(@as(usize, 2), b.len);
+    try std.testing.expect(!b.columns[0].getValue(0).isNull());
+    try std.testing.expectEqualStrings("", b.columns[0].getValue(0).string);
+    try std.testing.expect(b.columns[1].getValue(0).isNull());
+    try std.testing.expectEqualStrings("O'Neil, \"Jr\"", b.columns[0].getValue(1).string);
+    try std.testing.expectEqualStrings("plain", b.columns[1].getValue(1).string);
 }
 
 test "TypeSniffer: int/float promotion, leading zeros and quoted cells force string, empties only mark nulls" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
-    var s = try TypeSniffer.init(ar.allocator(), 6, ',');
-    s.feed("1,1.5,abc,007,\"9\",");
-    s.feed("-2,2,x,12,3,");
+    var s = try TypeSniffer.init(ar.allocator(), 7, ',');
+    s.feed("1,1.5,abc,007,\"9\",,5");
+    s.feed("-2,2,x,12,3,,");
+    s.feed("3,2,y,1,4,,6");
     try std.testing.expectEqual(types.TypeKind.int, s.resolve(0).kind);
     try std.testing.expectEqual(types.TypeKind.float, s.resolve(1).kind);
     try std.testing.expectEqual(types.TypeKind.string, s.resolve(2).kind);
     try std.testing.expectEqual(types.TypeKind.string, s.resolve(3).kind);
     try std.testing.expectEqual(types.TypeKind.string, s.resolve(4).kind);
     try std.testing.expectEqual(types.TypeKind.string, s.resolve(5).kind);
-    try std.testing.expect(s.resolve(0).nullable);
+    try std.testing.expectEqual(types.TypeKind.int, s.resolve(6).kind);
 }
 
 test "TypeSniffer: cells split on the dialect's delimiter, not always a comma" {
@@ -1617,12 +1609,15 @@ test "CsvSliceReader over a MappedCsv chunk parses only its rows" {
     const m = try MappedCsv.open(a, path, .{});
     defer m.close();
 
-    var rows: usize = 0;
+    const want = [_][]const i64{ &.{ 1, 2, 3 }, &.{4} };
     for (0..2) |i| {
         var r = CsvSliceReader{ .data = m.chunk(i, 2), .schema = &m.schema };
-        while (try r.next(a)) |b| rows += b.len;
+        var ids = std.array_list.Managed(i64).init(a);
+        while (try r.next(a)) |b| {
+            for (0..b.len) |j| try ids.append(b.columns[0].getValue(j).int);
+        }
+        try std.testing.expectEqualSlices(i64, want[i], ids.items);
     }
-    try std.testing.expectEqual(@as(usize, 4), rows);
 }
 
 test "splitCodec / splitArchive / dataName walk the container chain" {
@@ -1886,9 +1881,9 @@ test "csv writer: a delimiter that collides with a number still round-trips" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    const cases = [_]struct { delim: u8, kinds: [2]types.TypeKind, csv: []const u8, want: []const u8 }{
-        .{ .delim = '.', .kinds = .{ .float, .int }, .csv = "2.5,7\n", .want = "f.i\n\"2.5\".7\n" },
-        .{ .delim = '-', .kinds = .{ .int, .int }, .csv = "-3,7\n", .want = "f-i\n\"-3\"-7\n" },
+    const cases = [_]struct { delim: u8, kinds: [2]types.TypeKind, csv: []const u8, want: []const u8, first: Value }{
+        .{ .delim = '.', .kinds = .{ .float, .int }, .csv = "2.5,7\n", .want = "f.i\n\"2.5\".7\n", .first = .{ .float = 2.5 } },
+        .{ .delim = '-', .kinds = .{ .int, .int }, .csv = "-3,7\n", .want = "f-i\n\"-3\"-7\n", .first = .{ .int = -3 } },
     };
 
     for (cases) |c| {
@@ -1920,6 +1915,7 @@ test "csv writer: a delimiter that collides with a number still round-trips" {
         try std.testing.expectEqual(@as(usize, 1), back.len);
         try std.testing.expectEqual(@as(usize, 2), back.columns.len);
         try std.testing.expectEqual(@as(i64, 7), back.columns[1].getValue(0).int);
+        try std.testing.expectEqualDeep(c.first, back.columns[0].getValue(0));
     }
 }
 
@@ -2006,9 +2002,18 @@ test "CsvReader reads every member of a multi-member .csv.gz, as pigz and an app
     const path = try tmp.dir.realpathAlloc(a, "two.csv.gz");
     const r = try CsvReader.open(a, path, .{});
     defer r.close();
-    var rows: usize = 0;
-    while (try r.next(a)) |b| rows += b.len;
-    try std.testing.expectEqual(@as(usize, 2), rows);
+    var ids = std.array_list.Managed(i64).init(a);
+    var names = std.array_list.Managed([]const u8).init(a);
+    while (try r.next(a)) |b| {
+        for (0..b.len) |i| {
+            try ids.append(b.columns[0].getValue(i).int);
+            try names.append(b.columns[1].getValue(i).string);
+        }
+    }
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, ids.items);
+    try std.testing.expectEqual(@as(usize, 2), names.items.len);
+    try std.testing.expectEqualStrings("alpha", names.items[0]);
+    try std.testing.expectEqualStrings("beta", names.items[1]);
 }
 
 test "splitInto: delimiter bitmask across chunk edges, missing and extra fields, a projection" {

@@ -128,7 +128,7 @@ test "distinct int keys produce no 64-bit collisions over a dense domain" {
     for (hashes[0 .. hashes.len - 1], hashes[1..]) |a, b| try testing.expect(a != b);
 }
 
-test "valueEq: nulls group together, null never equals a value, mixed types unequal" {
+test "valueEq: nulls group together, null never equals a value, non-numeric mixed types unequal" {
     try testing.expect(valueEq(.null, .null));
     try testing.expect(!valueEq(.null, .{ .int = 0 }));
     try testing.expect(!valueEq(.{ .string = "" }, .null));
@@ -157,13 +157,6 @@ test "MultiKeyCtx: composite equality and order-sensitive hashing" {
     try testing.expect(ctx.eql(&n1, &n2));
     try testing.expectEqual(ctx.hash(&n1), ctx.hash(&n2));
     try testing.expect(!ctx.eql(&n1, &z0));
-}
-
-test "SingleKeyCtx delegates to hashOne/valueEq" {
-    const ctx = SingleKeyCtx{};
-    try testing.expectEqual(hashOne(.{ .int = 9 }), ctx.hash(.{ .int = 9 }));
-    try testing.expect(ctx.eql(.{ .string = "k" }, .{ .string = "k" }));
-    try testing.expect(!ctx.eql(.{ .string = "k" }, .null));
 }
 
 test "hashValue: numerically equal decimals hash alike, so DISTINCT counts them once" {

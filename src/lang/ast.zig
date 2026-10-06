@@ -467,11 +467,12 @@ test "rebuildExpr identity copies every field — no silent drop" {
     };
     const x = try mkExpr(a, .{ .field = .{ .parts = &[_][]const u8{"x"} } });
     const empty = try mkExpr(a, .{ .is_null = .{ .e = x, .negated = true, .kind = .is_empty } });
-    const casted = try mkExpr(a, .{ .cast = .{ .e = empty, .ty = types.Type.init(.int) } });
+    const casted = try mkExpr(a, .{ .cast = .{ .e = empty, .ty = types.Type.init(.int), .safe = true } });
 
     const out = try Id.r(a, casted);
     try std.testing.expect(out.* == .cast);
     try std.testing.expectEqual(types.TypeKind.int, out.cast.ty.kind);
+    try std.testing.expect(out.cast.safe);
     try std.testing.expect(out.cast.e.* == .is_null);
     try std.testing.expectEqual(Expr.NullTest.is_empty, out.cast.e.is_null.kind);
     try std.testing.expect(out.cast.e.is_null.negated);
@@ -485,10 +486,63 @@ test "rebuildExpr identity copies every field — no silent drop" {
     const args = try a.alloc(*Expr, 2);
     args[0] = x;
     args[1] = empty;
-    const call = try mkExpr(a, .{ .call = .{ .name = "concat", .args = args } });
+    const span: Span = .{ .start = .{ .line = 3, .col = 5 }, .end = .{ .line = 3, .col = 17 } };
+    const call = try mkExpr(a, .{ .call = .{ .name = "concat", .args = args, .distinct = true, .span = span } });
     const out3 = try Id.r(a, call);
     try std.testing.expect(out3.* == .call);
     try std.testing.expectEqualStrings("concat", out3.call.name);
     try std.testing.expectEqual(@as(usize, 2), out3.call.args.len);
     try std.testing.expect(out3.call.args[1].* == .is_null);
+    try std.testing.expect(out3.call.distinct);
+    try std.testing.expectEqual(span, out3.call.span.?);
+
+    const one = try mkExpr(a, .{ .int_lit = 1 });
+    const two = try mkExpr(a, .{ .int_lit = 2 });
+    const pats = try a.alloc(*Expr, 2);
+    pats[0] = one;
+    pats[1] = two;
+    const arms = try a.alloc(MatchArm, 3);
+    arms[0] = .{ .pats = pats, .guard = null, .value = x, .is_default = false };
+    arms[1] = .{ .pats = &.{}, .guard = empty, .value = one, .is_default = false };
+    arms[2] = .{ .pats = &.{}, .guard = null, .value = two, .is_default = true };
+    const m = try mkExpr(a, .{ .match = .{ .subject = x, .arms = arms } });
+    const out4 = try Id.r(a, m);
+    try std.testing.expect(out4.* == .match);
+    try std.testing.expect(out4.match.subject.?.* == .field);
+    try std.testing.expectEqual(@as(usize, 3), out4.match.arms.len);
+    try std.testing.expectEqual(@as(usize, 2), out4.match.arms[0].pats.len);
+    try std.testing.expectEqual(@as(i64, 1), out4.match.arms[0].pats[0].int_lit);
+    try std.testing.expectEqual(@as(i64, 2), out4.match.arms[0].pats[1].int_lit);
+    try std.testing.expect(out4.match.arms[0].guard == null);
+    try std.testing.expect(!out4.match.arms[0].is_default);
+    try std.testing.expect(out4.match.arms[0].value.* == .field);
+    try std.testing.expect(out4.match.arms[1].guard.?.* == .is_null);
+    try std.testing.expect(!out4.match.arms[1].is_default);
+    try std.testing.expectEqual(@as(i64, 1), out4.match.arms[1].value.int_lit);
+    try std.testing.expect(out4.match.arms[2].is_default);
+    try std.testing.expect(out4.match.arms[2].guard == null);
+    try std.testing.expectEqual(@as(usize, 0), out4.match.arms[2].pats.len);
+    try std.testing.expectEqual(@as(i64, 2), out4.match.arms[2].value.int_lit);
+
+    const bin = try mkExpr(a, .{ .binary = .{ .op = .ge, .l = x, .r = two } });
+    const out5 = try Id.r(a, bin);
+    try std.testing.expect(out5.* == .binary);
+    try std.testing.expectEqual(BinOp.ge, out5.binary.op);
+    try std.testing.expect(out5.binary.l.* == .field);
+    try std.testing.expectEqual(@as(i64, 2), out5.binary.r.int_lit);
+
+    const un = try mkExpr(a, .{ .unary = .{ .op = .bit_not, .e = one } });
+    const out6 = try Id.r(a, un);
+    try std.testing.expect(out6.* == .unary);
+    try std.testing.expectEqual(UnOp.bit_not, out6.unary.op);
+    try std.testing.expectEqual(@as(i64, 1), out6.unary.e.int_lit);
+
+    const lam = try mkExpr(a, .{ .lambda = .{ .params = &[_][]const u8{ "acc", "t" }, .body = bin } });
+    const out7 = try Id.r(a, lam);
+    try std.testing.expect(out7.* == .lambda);
+    try std.testing.expectEqual(@as(usize, 2), out7.lambda.params.len);
+    try std.testing.expectEqualStrings("acc", out7.lambda.params[0]);
+    try std.testing.expectEqualStrings("t", out7.lambda.params[1]);
+    try std.testing.expect(out7.lambda.body.* == .binary);
+    try std.testing.expectEqual(BinOp.ge, out7.lambda.body.binary.op);
 }

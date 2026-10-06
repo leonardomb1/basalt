@@ -563,7 +563,7 @@ test "snappy compressor output round-trips through our own decoder" {
     try t.expectEqualSlices(u8, big, try decompress(a, .snappy, comp, big.len));
 }
 
-test "codecs without an encoder are refused before a file is written" {
+test "compress refuses codecs without an encoder" {
     var ar = std.heap.ArenaAllocator.init(t.allocator);
     defer ar.deinit();
     const a = ar.allocator();

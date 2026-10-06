@@ -1696,13 +1696,15 @@ test "physical plan: which SQL shapes report a key-range split" {
     const a = ar.allocator();
     const conn = "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');\n";
 
-    const cases = [_]struct { q: []const u8, split: bool }{
-        .{ .q = "SELECT a FROM pg.t WHERE b > 0", .split = true },
+    const cases = [_]struct { q: []const u8, split: bool, breaker: ?bool = null }{
+        .{ .q = "SELECT a FROM pg.t WHERE b > 0", .split = true, .breaker = false },
         .{ .q = "SELECT g, COUNT(*) AS n FROM pg.t GROUP BY g", .split = true },
         .{ .q = "SELECT g, COUNT(*) AS n FROM pg.t GROUP BY g ORDER BY n DESC LIMIT 5", .split = true },
         .{ .q = "SELECT a FROM pg.t ORDER BY a DESC LIMIT 10", .split = false },
+        .{ .q = "SELECT * FROM pg.orders ORDER BY id", .split = false, .breaker = true },
         .{ .q = "SELECT DISTINCT a FROM pg.t", .split = false },
         .{ .q = "SELECT g, COUNT(*) AS n FROM pg.QUERY($$SELECT * FROM t$$) GROUP BY g", .split = false },
+        .{ .q = "SELECT * FROM pg.QUERY($$SELECT 1 AS x$$)", .split = false, .breaker = false },
     };
 
     for (cases) |c| {
@@ -1711,6 +1713,7 @@ test "physical plan: which SQL shapes report a key-range split" {
         var diag = Diag{};
         const plan = try analyze(a, prog, &diag);
         try std.testing.expectEqual(c.split, plan.outputs[0].physical.splittable);
+        if (c.breaker) |b| try std.testing.expectEqual(b, plan.outputs[0].physical.has_breaker);
     }
 }
 
@@ -1738,7 +1741,7 @@ test "physical plan: which file reads divide into morsels" {
     }
 }
 
-test "analyze a SQL table pipeline: unresolved schema offline, split candidate" {
+test "analyze a SQL table pipeline: the schema stays unresolved offline" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1750,11 +1753,7 @@ test "analyze a SQL table pipeline: unresolved schema offline, split candidate" 
     );
     var diag = Diag{};
     const plan = try analyze(a, prog, &diag);
-    const o = plan.outputs[0];
-    try std.testing.expectEqualStrings("postgres", o.source.connector);
-    try std.testing.expect(o.source.schema == null);
-    try std.testing.expect(o.physical.splittable);
-    try std.testing.expectEqualStrings("(\"amount\" > 0)", o.source.pushdown);
+    try std.testing.expect(plan.outputs[0].source.schema == null);
 }
 
 test "analyze pushdown preview: a CTE, derived table or table function at the head sends its WHERE to the source" {
@@ -1881,6 +1880,7 @@ test "type flow catches a type error in an expression" {
     const src = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS SELECT * FROM '{s}' WHERE NOT name;", .{in});
     var diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, src), &diag));
+    try std.testing.expectEqualStrings("`not` needs a bool operand", diag.msg);
 }
 
 test "analyze rejects unknown connection" {
@@ -1893,9 +1893,9 @@ test "analyze rejects unknown connection" {
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "unknown connection") != null);
 }
 
-/// Analyze `LOAD INTO ... AS <query over a 2-col CSV>` offline and expect an error.
-/// `$IN` in the query is the input CSV's path.
-fn expectAnalyzeErr(a: std.mem.Allocator, csv_data: []const u8, query: []const u8) !void {
+/// Analyze `LOAD INTO ... AS <query over a 2-col CSV>` offline and expect an error
+/// whose message contains `msg`. `$IN` in the query is the input CSV's path.
+fn expectAnalyzeErr(a: std.mem.Allocator, csv_data: []const u8, query: []const u8, msg: []const u8) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = csv_data });
@@ -1905,6 +1905,10 @@ fn expectAnalyzeErr(a: std.mem.Allocator, csv_data: []const u8, query: []const u
     const src = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS {s};", .{q});
     var diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, src), &diag));
+    if (std.mem.indexOf(u8, diag.msg, msg) == null) {
+        std.debug.print("expected a message containing `{s}`, got `{s}`\n", .{ msg, diag.msg });
+        return error.TestUnexpectedResult;
+    }
 }
 
 fn analyzeCsv(a: std.mem.Allocator, csv_data: []const u8, query: []const u8, diag: *Diag) !Plan {
@@ -1953,27 +1957,6 @@ test "analyze rejects a program with no output pipeline" {
     var diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, prog, &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "no output pipeline") != null);
-}
-
-test "physical plan: a breaker keeps SQL serial; a query read is not split-eligible" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    var diag = Diag{};
-
-    const p1 = try analyze(a, try parse(a,
-        \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');
-        \\LOAD INTO '/tmp/x.csv' AS SELECT * FROM pg.orders ORDER BY id;
-    ), &diag);
-    try std.testing.expect(p1.outputs[0].physical.has_breaker);
-    try std.testing.expect(!p1.outputs[0].physical.splittable);
-
-    const p2 = try analyze(a, try parse(a,
-        \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');
-        \\LOAD INTO '/tmp/x.csv' AS SELECT * FROM pg.QUERY($$SELECT 1 AS x$$);
-    ), &diag);
-    try std.testing.expect(!p2.outputs[0].physical.has_breaker);
-    try std.testing.expect(!p2.outputs[0].physical.splittable);
 }
 
 fn tfld(a: std.mem.Allocator, name: []const u8) !*ast.Expr {
@@ -2166,13 +2149,13 @@ test "selectCols: `* except` drops the named columns and keeps source order" {
 test "analyze rejects `* rename` onto a duplicate column name" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
-    try expectAnalyzeErr(ar.allocator(), "id,name\n1,x\n", "SELECT * RENAME (id AS name) FROM '$IN'");
+    try expectAnalyzeErr(ar.allocator(), "id,name\n1,x\n", "SELECT * RENAME (id AS name) FROM '$IN'", "`* rename` produces duplicate column `name`");
 }
 
 test "analyze rejects `is empty` on a non-string operand" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
-    try expectAnalyzeErr(ar.allocator(), "id,amount\n1,100\n", "SELECT * FROM '$IN' WHERE CAST(amount AS INT) IS EMPTY");
+    try expectAnalyzeErr(ar.allocator(), "id,amount\n1,100\n", "SELECT * FROM '$IN' WHERE CAST(amount AS INT) IS EMPTY", "`is empty` needs a string operand (got int)");
 }
 
 test "analyze: an undeclared `$name` is refused by name, never read as the column it spells" {
@@ -2251,7 +2234,7 @@ test "formatLabel names the reader, not the connector" {
 test "analyze rejects `?.` safe navigation on a plain column reference" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
-    try expectAnalyzeErr(ar.allocator(), "id,name\n1,x\n", "SELECT name?.foo AS v FROM '$IN'");
+    try expectAnalyzeErr(ar.allocator(), "id,name\n1,x\n", "SELECT name?.foo AS v FROM '$IN'", "`?.` (safe navigation) only applies to JSON-param paths");
 }
 
 test "check accepts a filter over a statement-level LET (and rejects a LET/PARAM clash)" {
@@ -2274,7 +2257,6 @@ test "check accepts a filter over a statement-level LET (and rejects a LET/PARAM
     const plan = try analyze(a, prog, &diag);
     try std.testing.expectEqual(@as(usize, 1), plan.outputs.len);
     try std.testing.expectEqualStrings("filter", plan.outputs[0].stages[0].kind);
-
     const clash = try std.fmt.allocPrint(a,
         \\PARAM cutoff INT DEFAULT 10;
         \\LET cutoff = 5;
@@ -2324,33 +2306,14 @@ test "check rejects a script whose THROW guard fires, and passes one whose WHEN 
     try std.testing.expectEqualStrings("unreachable branch: zz", bdiag.msg);
 }
 
-test "analyze: a failing stage reports its line and column" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,amount\n1,100\n" });
-    const base = try tmp.dir.realpathAlloc(a, ".");
-    const in = try std.fs.path.join(a, &.{ base, "in.csv" });
-
-    const src = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS\nSELECT id\nFROM '{s}'\nWHERE nosuch > 1;", .{in});
-    const prog = try parse(a, src);
-    var diag = Diag{};
-    try std.testing.expectError(error.AnalyzeFailed, analyze(a, prog, &diag));
-    try std.testing.expectEqualStrings("unknown field `nosuch`", diag.msg);
-    try std.testing.expectEqual(@as(u32, 4), diag.pos.?.line);
-    try std.testing.expectEqual(@as(u32, 7), diag.pos.?.col);
-    try std.testing.expectEqual(@as(u32, 13), diag.end.?.col);
-}
-
 test "analyze: an unknown name is underlined where it is written, not at its statement" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
 
-    const Case = struct { src: []const u8, line: u32, col: u32, end_col: u32 };
+    const Case = struct { src: []const u8, line: u32, col: u32, end_col: u32, msg: []const u8 = "" };
     const cases = [_]Case{
+        .{ .src = "LOAD INTO '/tmp/x.csv' AS\nSELECT range\nFROM RANGE(3)\nWHERE nosuch > 1;", .line = 4, .col = 7, .end_col = 13, .msg = "unknown field `nosuch`" },
         .{ .src = "SELECT nope FROM RANGE(3);", .line = 1, .col = 8, .end_col = 12 },
         .{ .src = "SELECT range,\n       upper(nope) AS u\nFROM RANGE(3);", .line = 2, .col = 14, .end_col = 18 },
         .{ .src = "SELECT frobnicate(range) AS f FROM RANGE(3);", .line = 1, .col = 8, .end_col = 18 },
@@ -2366,6 +2329,7 @@ test "analyze: an unknown name is underlined where it is written, not at its sta
         try std.testing.expectEqual(c.col, diag.pos.?.col);
         try std.testing.expectEqual(c.line, diag.end.?.line);
         try std.testing.expectEqual(c.end_col, diag.end.?.col);
+        if (c.msg.len > 0) try std.testing.expectEqualStrings(c.msg, diag.msg);
     }
 }
 

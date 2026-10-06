@@ -338,19 +338,27 @@ test "collectTag reads every item from a listing page and nothing else" {
     try std.testing.expectEqual(@as(usize, 0), (try collectTag(a, "", "Key")).len);
 }
 
-test "retry policy: only transient statuses, and jitter never collapses to zero spread" {
+test "retry policy: only transient statuses retry; backoff doubles from 200 ms with up to 50% jitter, capped at 6.4 s" {
     try std.testing.expect(retriable(429) and retriable(500) and retriable(503));
     try std.testing.expect(!retriable(403) and !retriable(404) and !retriable(201) and !retriable(200));
 
-    var prng = std.Random.DefaultPrng.init(1);
-    const r = prng.random();
-    var prev: u64 = 0;
     for (0..5) |i| {
         const base = @as(u64, 200) << @intCast(i);
-        const ms = backoffMs(i, r);
-        try std.testing.expect(ms >= base and ms <= base + base / 2 + 1);
-        try std.testing.expect(ms > prev);
-        prev = base;
+        var above_base = false;
+        for (0..64) |seed| {
+            var prng = std.Random.DefaultPrng.init(seed);
+            const ms = backoffMs(i, prng.random());
+            try std.testing.expect(ms >= base and ms <= base + base / 2);
+            if (ms > base) above_base = true;
+        }
+        try std.testing.expect(above_base);
+    }
+    for ([_]usize{ 5, 6, 12, 40 }) |attempt| {
+        for (0..64) |seed| {
+            var prng = std.Random.DefaultPrng.init(seed);
+            const ms = backoffMs(attempt, prng.random());
+            try std.testing.expect(ms >= 6400 and ms <= 9600);
+        }
     }
 }
 

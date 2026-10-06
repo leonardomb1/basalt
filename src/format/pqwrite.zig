@@ -1057,11 +1057,6 @@ test "basalt types map onto Parquet physical and converted types" {
     try testing.expectEqual(@as(?i32, conv_date), (try mapType(types.Type.init(.date))).converted);
     try testing.expectEqual(@as(?i32, conv_timestamp_micros), (try mapType(types.Type.init(.timestamp))).converted);
 
-    const dec = try mapType(types.Type.decimal(10, 2));
-    try testing.expectEqual(parquet.PhysicalType.int64, dec.phys);
-    try testing.expectEqual(@as(?i32, 2), dec.scale);
-    try testing.expectEqual(@as(?i32, 10), dec.precision);
-
     try testing.expectError(Error.UnsupportedParquetWrite, mapType(types.Type.init(.array)));
 }
 
@@ -1097,6 +1092,11 @@ test "the physical type follows the decimal's real precision" {
     try testing.expectEqual(parquet.PhysicalType.int32, small.phys);
     try testing.expectEqual(@as(?i32, 9), small.precision);
 
+    const ten = try mapType(types.Type.decimal(10, 2));
+    try testing.expectEqual(parquet.PhysicalType.int64, ten.phys);
+    try testing.expectEqual(@as(?i32, 2), ten.scale);
+    try testing.expectEqual(@as(?i32, 10), ten.precision);
+
     const mid = try mapType(types.Type.decimal(18, 4));
     try testing.expectEqual(parquet.PhysicalType.int64, mid.phys);
     try testing.expectEqual(@as(?i32, 18), mid.precision);
@@ -1112,7 +1112,6 @@ test "the physical type follows the decimal's real precision" {
     try testing.expectEqual(@as(?i32, 20), nc.scale);
 
     try testing.expectError(Error.UnsupportedParquetDecimal, mapType(types.Type.decimal(10, 12)));
-    try testing.expectError(Error.UnsupportedParquetWrite, mapType(types.Type.init(.array)));
 }
 
 test "flba widths and big-endian two's complement match what readers expect" {
@@ -1210,6 +1209,7 @@ test "a codec without an encoder is refused at open, before any bytes are writte
     const path = try std.fs.path.join(a, &.{ dir, "x.parquet" });
     const schema = types.Schema{ .fields = &.{.{ .name = "a", .ty = types.Type.init(.int) }} };
     try testing.expectError(codec.Error.UnsupportedCodec, Writer.open(a, path, schema, .zstd, .truncate));
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile("x.parquet"));
 }
 
 test "statistics record min, max and null count per row group" {
@@ -1410,6 +1410,18 @@ test "dictionary encoding round-trips low-cardinality strings" {
     var cols = [_]column.Column{try b.finish()};
     try w.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 300 });
     try w.close();
+
+    const bytes = try tmp.dir.readFileAlloc(a, "d.parquet", 1 << 20);
+    const md = try parquet.parseFile(a, bytes);
+    const meta = md.row_groups[0].columns[0].meta.?;
+    try testing.expect(std.mem.indexOfScalar(parquet.Encoding, meta.encodings, .rle_dictionary) != null);
+    const dict_at: usize = @intCast(meta.dictionary_page_offset.?);
+    try testing.expect(dict_at > 0 and dict_at < meta.data_page_offset);
+    const dict = try parquet.parsePageHeader(bytes[dict_at..]);
+    try testing.expectEqual(parquet.PageType.dictionary_page, dict.ty);
+    try testing.expectEqual(@as(i32, 3), dict.num_values);
+    const data = try parquet.parsePageHeader(bytes[@intCast(meta.data_page_offset)..]);
+    try testing.expectEqual(parquet.Encoding.rle_dictionary, data.encoding);
 
     const r = try pqdecode.Reader.open(a, path);
     const back = (try r.next(a)).?;

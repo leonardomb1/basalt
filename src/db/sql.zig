@@ -1104,19 +1104,6 @@ test "coerceText: bad numeric text errors instead of silently zeroing" {
     try std.testing.expectError(error.UnparseableNumber, coerceText(a, "1.2.3", types.Type.init(.float)));
 }
 
-test "value serialization escapes quotes and formats dates" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    var buf = std.array_list.Managed(u8).init(a);
-    try serializeValue(buf.writer(), .postgres, .{ .string = "O'Brien" }, a);
-    try std.testing.expectEqualStrings("'O''Brien'", buf.items);
-
-    buf.clearRetainingCapacity();
-    try serializeValue(buf.writer(), .postgres, .{ .date = 0 }, a);
-    try std.testing.expectEqualStrings("'1970-01-01'", buf.items);
-}
-
 test "upsert SQL (mysql): ON DUPLICATE KEY UPDATE with VALUES()" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -1187,6 +1174,13 @@ test "serializeValue: dialect-specific escaping, bools, bytes, null" {
     buf.clearRetainingCapacity();
     try serializeValue(buf.writer(), .postgres, .null, a);
     try std.testing.expectEqualStrings("NULL", buf.items);
+
+    buf.clearRetainingCapacity();
+    try serializeValue(buf.writer(), .postgres, .{ .string = "O'Brien" }, a);
+    try std.testing.expectEqualStrings("'O''Brien'", buf.items);
+    buf.clearRetainingCapacity();
+    try serializeValue(buf.writer(), .postgres, .{ .date = 0 }, a);
+    try std.testing.expectEqualStrings("'1970-01-01'", buf.items);
 }
 
 test "coerceText parses bools, dates, timestamps, and decimals" {
@@ -1316,23 +1310,33 @@ test "BulkSink: without a redial the transient failure is the caller's" {
     try std.testing.expect(only.closed);
 }
 
-test "every type kind has a DDL spelling in every dialect, and CAST covers the scalars" {
+test "DDL and CAST spell each kind the way each dialect declares it" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    inline for (std.meta.fields(types.TypeKind)) |kf| {
-        const kind: types.TypeKind = @enumFromInt(kf.value);
-        const ty = types.Type{ .kind = kind, .precision = 10, .scale = 2 };
-        inline for (std.meta.fields(Dialect)) |df| {
-            const d: Dialect = @enumFromInt(df.value);
-            try std.testing.expect((try d.ddlType(a, ty, false)).len > 0);
-            try std.testing.expect((try d.ddlType(a, ty, true)).len > 0);
-            const cast = try d.castType(a, ty);
-            const scalar = switch (kind) {
-                .int, .float, .decimal, .string, .date, .time, .timestamp => true,
-                .bool, .bytes, .array, .@"struct" => false,
-            };
-            try std.testing.expect((cast != null) == scalar);
-        }
+    const dec = types.Type{ .kind = .decimal, .precision = 10, .scale = 2 };
+    const ts = types.Type.init(.timestamp);
+    const str = types.Type.init(.string);
+    const Case = struct { d: Dialect, ts: []const u8, str: []const u8, str_key: []const u8, str_cast: []const u8 };
+    const cases = [_]Case{
+        .{ .d = .postgres, .ts = "TIMESTAMP", .str = "TEXT", .str_key = "VARCHAR(255)", .str_cast = "TEXT" },
+        .{ .d = .mysql, .ts = "DATETIME", .str = "VARCHAR(255)", .str_key = "VARCHAR(255)", .str_cast = "CHAR" },
+        .{ .d = .sqlserver, .ts = "DATETIME2", .str = "NVARCHAR(4000)", .str_key = "NVARCHAR(255)", .str_cast = "VARCHAR(MAX)" },
+        .{ .d = .starrocks, .ts = "DATETIME", .str = "VARCHAR(65533)", .str_key = "VARCHAR(65533)", .str_cast = "CHAR" },
+        .{ .d = .doris, .ts = "DATETIME(6)", .str = "STRING", .str_key = "VARCHAR(65533)", .str_cast = "CHAR" },
+    };
+    for (cases) |c| {
+        try std.testing.expectEqualStrings("DECIMAL(10,2)", try c.d.ddlType(a, dec, false));
+        try std.testing.expectEqualStrings("DECIMAL(10,2)", (try c.d.castType(a, dec)).?);
+        try std.testing.expectEqualStrings(c.ts, try c.d.ddlType(a, ts, false));
+        try std.testing.expectEqualStrings(c.str, try c.d.ddlType(a, str, false));
+        try std.testing.expectEqualStrings(c.str_key, try c.d.ddlType(a, str, true));
+        try std.testing.expectEqualStrings(c.str_cast, (try c.d.castType(a, str)).?);
+        try std.testing.expect((try c.d.castType(a, types.Type.init(.bool))) == null);
+        try std.testing.expect((try c.d.castType(a, types.Type.init(.bytes))) == null);
     }
+    try std.testing.expectEqualStrings("BIT", try Dialect.sqlserver.ddlType(a, types.Type.init(.bool), false));
+    try std.testing.expectEqualStrings("TINYINT(1)", try Dialect.mysql.ddlType(a, types.Type.init(.bool), false));
+    try std.testing.expectEqualStrings("BIGINT", try Dialect.mysql.ddlType(a, types.Type.init(.int), false));
+    try std.testing.expectEqualStrings("SIGNED", (try Dialect.mysql.castType(a, types.Type.init(.int))).?);
 }

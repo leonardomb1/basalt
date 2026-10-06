@@ -103,21 +103,20 @@ test "every SqlKind is a Connector with the same name and the expected port" {
     try std.testing.expect(Connector.parse("nope") == null);
 }
 
-test "a doris connection is read through the MySQL driver on the FE port, written by stream load" {
-    const c = Connector.parse("doris").?;
-    const r = c.sqlRead().?;
-    try std.testing.expectEqual(SqlKind.mysql, r.kind);
-    try std.testing.expectEqual(sql.Dialect.doris, r.dialect);
-    try std.testing.expectEqual(@as(u16, 9030), r.port);
-    try std.testing.expect(c.streamLoad() and Connector.parse("starrocks").?.streamLoad());
+test "doris and starrocks connections are read through the MySQL driver on the FE port, written by stream load" {
+    const cases = [_]struct { name: []const u8, dialect: sql.Dialect }{
+        .{ .name = "doris", .dialect = .doris },
+        .{ .name = "starrocks", .dialect = .starrocks },
+    };
+    for (cases) |tc| {
+        const c = Connector.parse(tc.name).?;
+        const r = c.sqlRead().?;
+        try std.testing.expectEqual(SqlKind.mysql, r.kind);
+        try std.testing.expectEqual(tc.dialect, r.dialect);
+        try std.testing.expectEqual(@as(u16, 9030), r.port);
+        try std.testing.expect(c.streamLoad());
+    }
     try std.testing.expect(!Connector.parse("mysql").?.streamLoad());
-}
-
-test "a starrocks connection is read through the MySQL driver on the FE port" {
-    const r = Connector.parse("starrocks").?.sqlRead().?;
-    try std.testing.expectEqual(SqlKind.mysql, r.kind);
-    try std.testing.expectEqual(sql.Dialect.starrocks, r.dialect);
-    try std.testing.expectEqual(@as(u16, 9030), r.port);
     try std.testing.expectEqual(sql.Dialect.postgres, Connector.parse("postgres").?.sqlRead().?.dialect);
     try std.testing.expect(Connector.parse("csv").?.sqlRead() == null);
 }

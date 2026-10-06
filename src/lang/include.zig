@@ -316,12 +316,35 @@ test "@include: an included PARAM may sit beside an aggregate, as a local one ma
     try writeFile(&tmp, "lib/params.sql", "PARAM tag STRING DEFAULT 'x';\n");
 
     var diag: Diag = .{};
-    const prog = try loadProgram(a,
+    const included = try loadProgram(a,
         \\@include 'lib/params.sql';
         \\SELECT $tag AS t, g, COUNT(*) AS n FROM 'in.csv' GROUP BY g;
     , "main.sql", base, &diag);
-    try testing.expect(prog.stmts[1] == .param);
-    try testing.expect(prog.stmts[2] == .output);
+    const local = try loadProgram(a,
+        \\PARAM tag STRING DEFAULT 'x';
+        \\SELECT $tag AS t, g, COUNT(*) AS n FROM 'in.csv' GROUP BY g;
+    , "main.sql", base, &diag);
+    for ([_]ast.Program{ included, local }) |prog| {
+        try testing.expect(prog.stmts[1] == .param);
+        try testing.expectEqualStrings("tag", prog.stmts[1].param.name);
+        try testing.expect(prog.stmts[2] == .output);
+        const stages = prog.stmts[2].output.stages;
+        try testing.expect(stages[1].node == .aggregate);
+        const agg = stages[1].node.aggregate;
+        try testing.expectEqual(@as(usize, 1), agg.by.len);
+        try testing.expectEqualStrings("g", agg.by[0].last());
+        try testing.expectEqual(@as(usize, 1), agg.aggs.len);
+        try testing.expectEqual(ast.AggFunc.count, agg.aggs[0].func);
+        try testing.expectEqualStrings("n", agg.aggs[0].name);
+        try testing.expect(stages[2].node == .select);
+        const items = stages[2].node.select;
+        try testing.expectEqual(@as(usize, 3), items.len);
+        try testing.expectEqualStrings("t", items[0].computed.name);
+        const tag = items[0].computed.expr;
+        try testing.expect(tag.* == .field);
+        try testing.expect(tag.field.dollar);
+        try testing.expectEqualStrings("tag", tag.field.last());
+    }
 }
 
 test "@include: a table function declared in a library is called in the includer" {
@@ -460,7 +483,7 @@ test "a fan-out @include tree is spliced once per file, so it neither hangs nor 
     try testing.expect(prog.stmts[1] == .output);
 }
 
-test "@include: two libraries sharing a third may both be included" {
+test "@include: a library sees a connection its own @include declares, though another library spliced that include first" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();

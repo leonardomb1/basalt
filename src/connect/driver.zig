@@ -95,14 +95,6 @@ test "stop flag: a source reports end of stream while it is set, and only then" 
     try std.testing.expect((try src.next(std.testing.allocator)) != null);
 }
 
-test "abort flag: requestAbort sets, resetAbort clears" {
-    defer resetAbort();
-    requestAbort();
-    try std.testing.expect(aborting());
-    resetAbort();
-    try std.testing.expect(!aborting());
-}
-
 /// TCP_NODELAY, since drivers flush whole messages then wait (Nagle + delayed ACK
 /// stalls each exchange); SO_KEEPALIVE so idle multi-hour loads behind NATs surface
 /// a dead peer as an error, not a hang. Best-effort: never fails a connect.

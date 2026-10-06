@@ -118,3 +118,53 @@ test "spnego: wraps an NTLM token and finds one in a reply" {
     defer gpa.free(tb);
     try std.testing.expectEqual(@as(usize, 600), token(tb).?.len);
 }
+
+test "spnego: the token is found after negState and supportedMech in a server's reply" {
+    const reply = [_]u8{
+        0xa1, 0x22, 0x30, 0x20,
+        0xa0, 0x03, 0x0a, 0x01,
+        0x01, 0xa1, 0x0c, 0x06,
+        0x0a, 0x2b, 0x06, 0x01,
+        0x04, 0x01, 0x82, 0x37,
+        0x02, 0x02, 0x0a, 0xa2,
+        0x0b, 0x04, 0x09, 'N',
+        'T',  'L',  'M',  'S',
+        'S',  'P',  0x00, 0x02,
+    };
+    try std.testing.expectEqualStrings("NTLMSSP\x00\x02", token(&reply).?);
+    try std.testing.expect(token(reply[0..9]) == null);
+
+    const no_token = [_]u8{ 0xa1, 0x07, 0x30, 0x05, 0xa0, 0x03, 0x0a, 0x01, 0x00 };
+    try std.testing.expect(token(&no_token) == null);
+}
+
+test "spnego: a NegTokenInit offering NTLMSSP encodes byte for byte" {
+    const gpa = std.testing.allocator;
+    const got = try init(gpa, "NTLMSSP\x00\x01");
+    defer gpa.free(got);
+    const want = [_]u8{
+        0x60, 0x29,
+        0x06, 0x06,
+        0x2b, 0x06,
+        0x01, 0x05,
+        0x05, 0x02,
+        0xa0, 0x1f,
+        0x30, 0x1d,
+        0xa0, 0x0e,
+        0x30, 0x0c,
+        0x06, 0x0a,
+        0x2b, 0x06,
+        0x01, 0x04,
+        0x01, 0x82,
+        0x37, 0x02,
+        0x02, 0x0a,
+        0xa2, 0x0b,
+        0x04, 0x09,
+        'N',  'T',
+        'L',  'M',
+        'S',  'S',
+        'P',  0x00,
+        0x01,
+    };
+    try std.testing.expectEqualSlices(u8, &want, got);
+}

@@ -461,6 +461,9 @@ test "expandProgram inlines a user fn and drops its declaration" {
     try std.testing.expect(e.* == .call);
     try std.testing.expectEqualStrings("substr", e.call.name);
     try std.testing.expectEqual(@as(usize, 3), e.call.args.len);
+    try std.testing.expect(e.call.args[0].* == .field);
+    try std.testing.expectEqual(@as(usize, 1), e.call.args[0].field.parts.len);
+    try std.testing.expectEqualStrings("id", e.call.args[0].field.parts[0]);
 }
 
 test "expandProgram rejects recursion and arity mismatch" {
@@ -612,7 +615,7 @@ test "expandProgram: statement functions survive, and the two forms don't cross 
     try std.testing.expectEqualStrings("`sync` expects 2 argument(s), got 1", m3);
 }
 
-test "expandProgram inlines `let … in` away (single-use binding)" {
+test "expandProgram inlines `let … in` away, a let binding used twice" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -625,25 +628,15 @@ test "expandProgram inlines `let … in` away (single-use binding)" {
     try std.testing.expectEqual(ast.BinOp.mul, e.binary.op);
     try std.testing.expect(e.binary.l.* == .binary);
     try std.testing.expectEqual(ast.BinOp.add, e.binary.l.binary.op);
+    try std.testing.expect(e.binary.r.* == .binary);
+    try std.testing.expectEqual(ast.BinOp.add, e.binary.r.binary.op);
+    try std.testing.expectEqualStrings("id", e.binary.r.binary.l.field.parts[0]);
+    try std.testing.expectEqual(@as(i64, 1), e.binary.r.binary.r.int_lit);
 }
 
 fn outputSelect(prog: ast.Program) []const ast.SelectItem {
     for (prog.stmts) |s| if (s == .output) return s.output.stages[1].node.select;
     return &.{};
-}
-
-test "expandProgram keeps an http connection's clauses" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(a, "CREATE CONNECTION e TYPE http OPTIONS (base_url = 'u') RETRY 2 WITH (header = 'X: y');", &diag);
-    var msg: []const u8 = "";
-    const out = try expandProgram(a, prog, null, &msg);
-    for (out.stmts) |st| {
-        if (st == .connection) return std.testing.expectEqual(@as(usize, 2), st.connection.hints.len);
-    }
-    return error.TestUnexpectedResult;
 }
 
 test "expandProgram substitutes JSON-param path access from the body" {

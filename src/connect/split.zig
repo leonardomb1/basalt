@@ -369,6 +369,11 @@ test "int range splits are covering and disjoint" {
         hits_over += 1;
     };
     try std.testing.expectEqual(@as(usize, 1), hits_over);
+    var null_preds: usize = 0;
+    for (preds) |p| if (std.mem.indexOf(u8, p, "IS NULL") != null) {
+        null_preds += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), null_preds);
 }
 
 test "int range clamps slice count to the value span" {
@@ -376,7 +381,15 @@ test "int range clamps slice count to the value span" {
     defer ar.deinit();
     const a = ar.allocator();
     const preds = try intRangePreds(a, .postgres, "id", 1, 3, 8);
-    try std.testing.expect(preds.len <= 3);
+    try std.testing.expectEqual(@as(usize, 3), preds.len);
+    var id: i64 = 1;
+    while (id <= 3) : (id += 1) {
+        var hits: usize = 0;
+        for (preds) |p| if (intPredHolds(p, id)) {
+            hits += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 1), hits);
+    }
 }
 
 test "uuid space splits are ordered and cover the endpoints" {
@@ -387,9 +400,26 @@ test "uuid space splits are ordered and cover the endpoints" {
     try std.testing.expect(preds.len == 4);
     try std.testing.expect(std.mem.indexOf(u8, preds[0], ">=") == null);
     try std.testing.expect(std.mem.startsWith(u8, preds[3], "\"id\" >= "));
-    const b1 = try uuidAt(a, 1, 4);
-    const b2 = try uuidAt(a, 2, 4);
-    try std.testing.expect(std.mem.order(u8, b1, b2) == .lt);
+    try std.testing.expect(std.mem.indexOf(u8, preds[3], "<") == null);
+    var k: usize = 0;
+    while (k + 1 < preds.len) : (k += 1) {
+        const hi_pos = std.mem.lastIndexOf(u8, preds[k], "< '").?;
+        const hi = preds[k][hi_pos + 3 ..][0..36];
+        const lo_pos = std.mem.indexOf(u8, preds[k + 1], ">= '").?;
+        const lo = preds[k + 1][lo_pos + 4 ..][0..36];
+        try std.testing.expectEqualStrings(hi, lo);
+        try std.testing.expectEqualStrings(try uuidAt(a, k + 1, 4), hi);
+        if (k > 0) {
+            const prev_lo_pos = std.mem.indexOf(u8, preds[k], ">= '").?;
+            const prev_lo = preds[k][prev_lo_pos + 4 ..][0..36];
+            try std.testing.expect(std.mem.order(u8, prev_lo, hi) == .lt);
+        }
+    }
+    var null_preds: usize = 0;
+    for (preds) |p| if (std.mem.indexOf(u8, p, "IS NULL") != null) {
+        null_preds += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), null_preds);
 }
 
 test "date range splits are covering, disjoint, and day-aligned" {
@@ -419,7 +449,17 @@ test "date range clamps slice count to the day span" {
     defer ar.deinit();
     const a = ar.allocator();
     const preds = try dateRangePreds(a, .postgres, "d", 100, 102, 8);
-    try std.testing.expect(preds.len <= 3);
+    try std.testing.expectEqual(@as(usize, 3), preds.len);
+    try std.testing.expect(std.mem.indexOf(u8, preds[0], ">= '1970-04-11'") != null);
+    try std.testing.expect(std.mem.endsWith(u8, preds[2], ">= '1970-04-13'"));
+    var k: usize = 0;
+    while (k + 1 < preds.len) : (k += 1) {
+        const hi_pos = std.mem.lastIndexOf(u8, preds[k], "< '").?;
+        const hi = preds[k][hi_pos + 3 ..][0..10];
+        const lo_pos = std.mem.indexOf(u8, preds[k + 1], ">= '").?;
+        const lo = preds[k + 1][lo_pos + 4 ..][0..10];
+        try std.testing.expectEqualStrings(hi, lo);
+    }
 }
 
 test "dayOf converts date and timestamp values" {

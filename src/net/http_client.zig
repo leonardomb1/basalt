@@ -1239,6 +1239,7 @@ const TestServer = struct {
     expected: ?usize = null,
     captured: [4][2048]u8 = undefined,
     captured_len: [4]usize = .{ 0, 0, 0, 0 },
+    requests: std.atomic.Value(usize) = .init(0),
     stop: std.atomic.Value(bool) = .init(false),
 
     fn start(responses: []const []const u8) !*TestServer {
@@ -1269,6 +1270,7 @@ const TestServer = struct {
             if (self.stop.load(.seq_cst)) return;
             var req_buf: [2048]u8 = undefined;
             const req_len = try readRequest(conn.stream, &req_buf);
+            _ = self.requests.fetchAdd(1, .seq_cst);
             if (i < self.captured.len) {
                 @memcpy(self.captured[i][0..req_len], req_buf[0..req_len]);
                 self.captured_len[i] = req_len;
@@ -1548,7 +1550,7 @@ test "http connection: oauth2 client credentials form post -> Bearer" {
     try std.testing.expect(std.mem.indexOf(u8, srv.captured[1][0..srv.captured_len[1]], "Authorization: Bearer xyz") != null);
 }
 
-test "http source: prefetch fetches pages concurrently and stops on empty" {
+test "http source: prefetch fetches the pages ahead and stops on empty" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1595,6 +1597,8 @@ test "http source: stop_short ends after a short page (no trailing empty fetch)"
         \\[{"id":1},{"id":2}]
         ,
         \\[{"id":3}]
+        ,
+        "[]",
     });
     defer srv.deinit();
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
@@ -1611,6 +1615,7 @@ test "http source: stop_short ends after a short page (no trailing empty fetch)"
     });
     defer s.close();
     try std.testing.expectEqual(@as(usize, 3), try drain(s, a));
+    try std.testing.expectEqual(@as(usize, 2), srv.requests.load(.seq_cst));
 }
 
 test "abort flag stops pagination between page requests" {
@@ -1679,6 +1684,8 @@ test "http source: total_field bounds the page count exactly" {
         \\{"totalCount":2,"itens":[{"id":1},{"id":2}]}
         ,
         \\{"totalCount":2,"itens":[{"id":3}]}
+        ,
+        \\{"totalCount":2,"itens":[]}
     });
     defer srv.deinit();
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
@@ -1695,6 +1702,7 @@ test "http source: total_field bounds the page count exactly" {
     });
     defer s.close();
     try std.testing.expectEqual(@as(usize, 3), try drain(s, a));
+    try std.testing.expectEqual(@as(usize, 2), srv.requests.load(.seq_cst));
 }
 
 test "http source: transient 503 retries in place and succeeds" {
@@ -1845,7 +1853,7 @@ test "http source: cursor pagination follows token then stops" {
     try std.testing.expect(std.mem.indexOf(u8, srv.captured[1][0..srv.captured_len[1]], "GET /items?cursor=t1") != null);
 }
 
-test "http source: non-200 maps to permanent/transient errors" {
+test "http source: a 404 on open is HttpNotFound" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();

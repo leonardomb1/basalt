@@ -332,7 +332,7 @@ test "declared body schema: column order, types, and enforcement" {
     try std.testing.expect(std.mem.indexOf(u8, msg, "value") != null);
 }
 
-test "JSON-typed columns keep object payloads as JSON text" {
+test "a declared string column keeps an object payload as JSON text" {
     const gpa = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();

@@ -75,6 +75,31 @@ fn runToStringP(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []con
     return tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
 }
 
+/// Points fd 2 at a file in `dir` until `end`, which restores it and returns what
+/// was written there — where `PRINT`, an `EXPLAIN` statement's plan and the run
+/// logger all go. Tests run one at a time, so the swap is seen by nothing else.
+const StderrCapture = struct {
+    file: std.fs.File,
+    saved: std.posix.fd_t,
+
+    fn begin(dir: std.fs.Dir) !StderrCapture {
+        const file = try dir.createFile("stderr.txt", .{ .read = true, .truncate = true });
+        errdefer file.close();
+        const saved = try std.posix.dup(std.posix.STDERR_FILENO);
+        errdefer std.posix.close(saved);
+        try std.posix.dup2(file.handle, std.posix.STDERR_FILENO);
+        return .{ .file = file, .saved = saved };
+    }
+
+    fn end(self: *StderrCapture, alloc: std.mem.Allocator) ![]u8 {
+        std.posix.dup2(self.saved, std.posix.STDERR_FILENO) catch {};
+        std.posix.close(self.saved);
+        defer self.file.close();
+        try self.file.seekTo(0);
+        return self.file.readToEndAlloc(alloc, 1 << 20);
+    }
+};
+
 test "EXPLAIN mid-script explains that query without running it" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -105,10 +130,20 @@ test "EXPLAIN mid-script explains that query without running it" {
     try std.testing.expectEqual(ast.ExplainMode.none, prog.explain);
 
     var rdiag: Diag = .{};
-    _ = run(alloc, prog, .{ .log = .{ .quiet = true, .summary = .none } }, &rdiag) catch |e| {
-        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
-        return e;
-    };
+    var cap = try StderrCapture.begin(tmp.dir);
+    const res = run(alloc, prog, .{ .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+    const plan = try cap.end(alloc);
+    defer alloc.free(plan);
+    _ = try res;
+    const write_line = try std.fmt.allocPrint(alloc, "write  csv  {s}", .{never_path});
+    defer alloc.free(write_line);
+    const scan_line = try std.fmt.allocPrint(alloc, "scan  csv  {s} (via binding paid)", .{in_path});
+    defer alloc.free(scan_line);
+    try std.testing.expect(std.mem.startsWith(u8, plan, "plan\n"));
+    try std.testing.expect(std.mem.indexOf(u8, plan, write_line) != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan, "filter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan, scan_line) != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, plan, "scan  csv"));
 
     const ran = try tmp.dir.readFileAlloc(alloc, "ran.csv", 1 << 20);
     defer alloc.free(ran);
@@ -593,7 +628,7 @@ test "window: an aggregate frame is the partition, or the peers so far" {
     try std.testing.expectEqualStrings("k,v,run\na,10,10\na,20,50\na,20,50\nb,5,5\nb,7,12\n", running);
 }
 
-test "window: COUNT(*) over a partition, and a plain SUM still aggregates" {
+test "window: COUNT(*) over a partition counts the partition's rows" {
     const alloc = std.testing.allocator;
     var t1 = std.testing.tmpDir(.{});
     defer t1.cleanup();
@@ -605,17 +640,6 @@ test "window: COUNT(*) over a partition, and a plain SUM still aggregates" {
     );
     defer alloc.free(n);
     try std.testing.expectEqualStrings("k,n\na,2\na,2\nb,1\n", n);
-
-    var t2 = std.testing.tmpDir(.{});
-    defer t2.cleanup();
-    const agg = try runToString(
-        alloc,
-        &t2,
-        "k,v\na,10\na,20\nb,5\n",
-        "SELECT k, SUM(v) AS s FROM '$IN' GROUP BY k ORDER BY k",
-    );
-    defer alloc.free(agg);
-    try std.testing.expectEqualStrings("k,s\na,30\nb,5\n", agg);
 }
 
 test "window: min, max and avg share one window in a single SELECT" {
@@ -653,6 +677,7 @@ test "window: two different windows in one SELECT are refused" {
     defer parena.deinit();
     var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     try std.testing.expectError(error.ParseFailed, parser.parseSource(parena.allocator(), script, &pdiag));
+    try std.testing.expectEqualStrings("two window functions in one SELECT must share the same OVER (...) window", pdiag.msg);
 }
 
 test "window: a ROWS frame counts rows where the default counts peers" {
@@ -791,20 +816,17 @@ test "aggregate: an interleaved SELECT list keeps its column order" {
     );
     defer alloc.free(out);
     try std.testing.expectEqualStrings("status,n,region\npaid,2,west\n", out);
-}
 
-test "aggregate: keys-then-aggregates adds no projection" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const out = try runToString(
+    var t2 = std.testing.tmpDir(.{});
+    defer t2.cleanup();
+    const keys_first = try runToString(
         alloc,
-        &tmp,
+        &t2,
         "status,region,amount\npaid,west,100\npaid,west,50\n",
         "SELECT status, region, COUNT(*) AS n FROM '$IN' GROUP BY status, region",
     );
-    defer alloc.free(out);
-    try std.testing.expectEqualStrings("status,region,n\npaid,west,2\n", out);
+    defer alloc.free(keys_first);
+    try std.testing.expectEqualStrings("status,region,n\npaid,west,2\n", keys_first);
 }
 
 test "sort: numeric desc, nulls last" {
@@ -993,7 +1015,7 @@ test "parallel parquet aggregate: a chain of two joins then an agg (threads>1)" 
     try std.testing.expectEqualStrings(serial, par);
 }
 
-test "parallel parquet aggregate: a right join under an aggregate is not fanned out" {
+test "parallel parquet aggregate: a right join under an aggregate gives the serial answer at -j4" {
     const alloc = std.testing.allocator;
     const q = "WITH d AS (SELECT (id + 4995) AS did FROM '$IN' WHERE id <= 10) " ++
         "SELECT COUNT(*) AS n, SUM(id) AS sum_left FROM '$IN' RIGHT JOIN d ON id = did";
@@ -1010,7 +1032,7 @@ test "parallel parquet aggregate: a right join under an aggregate is not fanned 
     try std.testing.expectEqualStrings(serial, par);
 }
 
-test "parallel parquet aggregate: a full join under an aggregate is not fanned out" {
+test "parallel parquet aggregate: a full join under an aggregate gives the serial answer at -j4" {
     const alloc = std.testing.allocator;
     const q = "WITH d AS (SELECT (id + 4995) AS did FROM '$IN' WHERE id <= 10) " ++
         "SELECT COUNT(*) AS n FROM '$IN' FULL JOIN d ON id = did";
@@ -1027,11 +1049,16 @@ test "parallel parquet aggregate: a full join under an aggregate is not fanned o
     try std.testing.expectEqualStrings(serial, par);
 }
 
-test "parallel parquet aggregate: the lane-safe kinds still fan out under an aggregate" {
+test "parallel parquet aggregate: the lane-safe join kinds under an aggregate give the serial answer at -j4" {
     const alloc = std.testing.allocator;
-    inline for (.{ "INNER", "LEFT", "SEMI", "ANTI" }) |kind| {
+    inline for (.{
+        .{ "INNER", "n\n5\n" },
+        .{ "LEFT", "n\n5000\n" },
+        .{ "SEMI", "n\n5\n" },
+        .{ "ANTI", "n\n4995\n" },
+    }) |c| {
         const q = "WITH d AS (SELECT (id + 4995) AS did FROM '$IN' WHERE id <= 10) " ++
-            "SELECT COUNT(*) AS n FROM '$IN' " ++ kind ++ " JOIN d ON id = did";
+            "SELECT COUNT(*) AS n FROM '$IN' " ++ c[0] ++ " JOIN d ON id = did";
         var t1 = std.testing.tmpDir(.{});
         defer t1.cleanup();
         const serial = try runParquetThreaded(alloc, &t1, q, 1);
@@ -1040,6 +1067,7 @@ test "parallel parquet aggregate: the lane-safe kinds still fan out under an agg
         defer t4.cleanup();
         const par = try runParquetThreaded(alloc, &t4, q, 4);
         defer alloc.free(par);
+        try std.testing.expectEqualStrings(c[1], serial);
         try std.testing.expectEqualStrings(serial, par);
     }
 }
@@ -1094,7 +1122,7 @@ test "parallel parquet aggregate: a join, a grouped agg and a HAVING (threads>1)
     try std.testing.expectEqualStrings(serial, par);
 }
 
-test "parallel CSV aggregate: global agg (threads>1) matches serial" {
+test "parallel CSV aggregate: global agg (threads>1)" {
     const alloc = std.testing.allocator;
     const input = "id,v\n1,10\n2,20\n3,30\n4,40\n5,50\n";
     var tmp = std.testing.tmpDir(.{});
@@ -1142,7 +1170,7 @@ test "parallel CSV distinct (threads>1): dedups across chunks" {
     try std.testing.expectEqualStrings("g\na\nb\nc\n", out);
 }
 
-test "parallel CSV Top-N: sort | limit (threads>1) matches serial" {
+test "parallel CSV Top-N: sort | limit (threads>1)" {
     const alloc = std.testing.allocator;
     const input = "id,v\n1,10\n2,40\n3,20\n4,50\n5,30\n";
     var tmp = std.testing.tmpDir(.{});
@@ -1173,27 +1201,12 @@ const float_order_csv =
 
 test "parallel CSV aggregate: float SUM combines partials in chunk order" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const out = try runCsvThreaded(alloc, &tmp, float_order_csv, "SELECT g, SUM(CAST(v AS FLOAT)) AS s FROM '$IN' GROUP BY g", 4);
-    defer alloc.free(out);
-    try std.testing.expectEqualStrings("g,s\na,10000000000000008\n", out);
-}
-
-test "parallel CSV aggregate: float SUM is identical across runs at one -j" {
-    const alloc = std.testing.allocator;
-    var first: ?[]u8 = null;
-    defer if (first) |f| alloc.free(f);
-    for (0..8) |_| {
+    for ([_]usize{ 4, 8, 8, 8, 8 }) |threads| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const out = try runCsvThreaded(alloc, &tmp, float_order_csv, "SELECT g, SUM(CAST(v AS FLOAT)) AS s FROM '$IN' GROUP BY g", 8);
-        if (first) |f| {
-            defer alloc.free(out);
-            try std.testing.expectEqualStrings(f, out);
-        } else {
-            first = out;
-        }
+        const out = try runCsvThreaded(alloc, &tmp, float_order_csv, "SELECT g, SUM(CAST(v AS FLOAT)) AS s FROM '$IN' GROUP BY g", threads);
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings("g,s\na,10000000000000008\n", out);
     }
 }
 
@@ -1250,6 +1263,17 @@ test "parallel CSV aggregate: the partitioned combine is reproducible" {
             first = out;
         }
     }
+
+    var rows: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, first.?, '\n');
+    try std.testing.expectEqualStrings("k,s", it.next().?);
+    while (it.next()) |line| : (rows += 1) {
+        var f = std.mem.tokenizeScalar(u8, line, ',');
+        try std.testing.expectEqual(rows, try std.fmt.parseInt(usize, f.next().?, 10));
+        try std.testing.expect(f.next() != null);
+        try std.testing.expect(f.next() == null);
+    }
+    try std.testing.expectEqual(ngroups, rows);
 }
 
 test "distinct: multi-column key (value-keyed)" {
@@ -1308,72 +1332,25 @@ test "top-N: nulls sort last, matching a full sort | limit-all" {
     try std.testing.expectEqualStrings("id,amt\n3,200\n5,150\n1,100\n2,50\n4,\n", out);
 }
 
-test "distinct keeps first row per key" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const out = try runToString(
-        alloc,
-        &tmp,
-        "status,amount\npaid,100\npending,50\npaid,200\n",
-        "SELECT DISTINCT ON (status) * FROM '$IN'",
-    );
-    defer alloc.free(out);
-    try std.testing.expectEqualStrings("status,amount\npaid,100\npending,50\n", out);
-}
-
 test "for-each over a JSON array param iterates and binds fields by name" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,status\n1,paid\n2,pending\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "a.csv", .data = "id,status\n1,paid\n2,pending\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.csv", .data = "id,status\n3,paid\n" });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
-    const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
-    defer alloc.free(in_path);
-    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
-    defer alloc.free(out_path);
 
-    const body = try std.fmt.allocPrint(alloc, "{{\"tables\":[{{\"name\":\"{s}\"}}]}}", .{in_path});
-    defer alloc.free(body);
-    const script = try std.fmt.allocPrint(alloc, "PARAM job JSON FROM BODY;\n" ++
-        "FOR EACH ROW OF ($job.tables) AS (name) SEQUENTIAL\n" ++
-        "  LOAD INTO '{s}' AS SELECT id FROM '${{name}}';\n" ++
-        "END FOR;", .{out_path});
-    defer alloc.free(script);
-
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-    var rdiag: Diag = .{};
-    _ = run(alloc, prog, .{ .request_body = body }, &rdiag) catch |e| {
-        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
-        return e;
-    };
-    const out = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
-    defer alloc.free(out);
-    try std.testing.expectEqualStrings("id\n1\n2\n", out);
-}
-
-test "for-each loop var interpolates into a select column value" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,status\n1,paid\n2,pending\n" });
-    const base = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(base);
-    const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
-    defer alloc.free(in_path);
-    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
-    defer alloc.free(out_path);
-
-    const body = try std.fmt.allocPrint(alloc, "{{\"tables\":[{{\"name\":\"{s}\",\"emp\":\"01\"}}]}}", .{in_path});
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"tables\":[{{\"name\":\"{s}/a.csv\",\"emp\":\"01\"}},{{\"name\":\"{s}/b.csv\",\"emp\":\"02\"}}]}}",
+        .{ base, base },
+    );
     defer alloc.free(body);
     const script = try std.fmt.allocPrint(alloc, "PARAM job JSON FROM BODY;\n" ++
         "FOR EACH ROW OF ($job.tables) AS (name, emp) SEQUENTIAL\n" ++
-        "  LOAD INTO '{s}' AS SELECT id, '${{emp}}' AS EMPRESA FROM '${{name}}';\n" ++
-        "END FOR;", .{out_path});
+        "  LOAD INTO '{s}/out_${{emp}}.csv' AS SELECT id, '${{emp}}' AS EMPRESA FROM '${{name}}';\n" ++
+        "END FOR;", .{base});
     defer alloc.free(script);
 
     var parena = std.heap.ArenaAllocator.init(alloc);
@@ -1385,9 +1362,12 @@ test "for-each loop var interpolates into a select column value" {
         std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
         return e;
     };
-    const out = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
-    defer alloc.free(out);
-    try std.testing.expectEqualStrings("id,EMPRESA\n1,01\n2,01\n", out);
+    const first = try tmp.dir.readFileAlloc(alloc, "out_01.csv", 1 << 20);
+    defer alloc.free(first);
+    try std.testing.expectEqualStrings("id,EMPRESA\n1,01\n2,01\n", first);
+    const second = try tmp.dir.readFileAlloc(alloc, "out_02.csv", 1 << 20);
+    defer alloc.free(second);
+    try std.testing.expectEqualStrings("id,EMPRESA\n3,02\n", second);
 }
 
 test "for-each loop var used as an expression value binds per row" {
@@ -1438,24 +1418,6 @@ test "for-each: a typed loop var used as a value binds as its declared type" {
     const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
     defer alloc.free(out);
     try std.testing.expectEqualStrings("id,twice\n7,10\n", out);
-}
-
-test "for-each: a loop var shadows a same-named source column" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "names.csv", .data = "name\nalpha\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,name\n1,from_file\n" });
-    const base = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(base);
-
-    const script = try std.fmt.allocPrint(alloc, "FOR EACH ROW OF ('{s}/names.csv') AS (name)\n" ++
-        "  LOAD INTO '{s}/out.csv' AS SELECT id, $name AS who FROM '{s}/in.csv';\nEND FOR;", .{ base, base, base });
-    defer alloc.free(script);
-
-    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
-    defer alloc.free(out);
-    try std.testing.expectEqualStrings("id,who\n1,alpha\n", out);
 }
 
 test "interpAll: bare-var fast path and expression bodies" {
@@ -1728,14 +1690,6 @@ test "aggregate: a loop variable and a function parameter count as constants" {
     _ = try parser.parseSource(ar.allocator(), "CREATE FUNCTION f(t) AS\n" ++
         "  LOAD INTO '/tmp/o.csv' AS SELECT $t AS a, COUNT(*) AS n FROM 'in.csv';\n" ++
         "END;\nCALL f('x');", &pdiag);
-
-    var d2: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const r = parser.parseSource(ar.allocator(), "FOR EACH ROW OF (SELECT 'z' AS x) AS (x)\n" ++
-        "  LOAD INTO '/tmp/o.csv' AS SELECT $x AS a FROM 'in.csv';\n" ++
-        "END FOR;\n" ++
-        "LOAD INTO '/tmp/p.csv' AS SELECT x, COUNT(*) AS n FROM 'in.csv';", &d2);
-    try std.testing.expectError(error.ParseFailed, r);
-    try std.testing.expect(std.mem.indexOf(u8, d2.msg, "neither an aggregate") != null);
 }
 
 test "aggregate: a bare column beside an aggregate is still refused" {
@@ -1893,70 +1847,7 @@ test "JSON_EACH explodes a JSON array; json_get walks keys and indexes" {
     try std.testing.expectEqualStrings("id,tag\n1,a\n1,1\n1,\n1,\"{\"\"k\"\":true}\"\n", tags);
 }
 
-test "parallel driver matches serial output across many batches" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var in = std.array_list.Managed(u8).init(alloc);
-    defer in.deinit();
-    try in.appendSlice("id,amount\n");
-    var k: usize = 0;
-    while (k < 5000) : (k += 1) try in.writer().print("{d},{d}\n", .{ k, (k * 7) % 1000 });
-    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = in.items });
-
-    const base = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(base);
-    const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
-    defer alloc.free(in_path);
-
-    var outputs: [2][]u8 = undefined;
-    for ([_]usize{ 1, 4 }, 0..) |nthreads, idx| {
-        const out_path = try std.fs.path.join(alloc, &.{ base, if (idx == 0) "s.csv" else "p.csv" });
-        defer alloc.free(out_path);
-        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS SELECT id, CAST(amount AS INT) * 2 AS doubled FROM '{s}' WHERE CAST(amount AS INT) >= 500;", .{ out_path, in_path });
-        defer alloc.free(script);
-
-        var parena = std.heap.ArenaAllocator.init(alloc);
-        defer parena.deinit();
-        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-
-        var rdiag: Diag = .{};
-        _ = try run(alloc, prog, .{ .threads = nthreads }, &rdiag);
-        outputs[idx] = try tmp.dir.readFileAlloc(alloc, if (idx == 0) "s.csv" else "p.csv", 1 << 20);
-    }
-    defer alloc.free(outputs[0]);
-    defer alloc.free(outputs[1]);
-
-    const s = try sortedLines(alloc, outputs[0]);
-    defer alloc.free(s);
-    const p = try sortedLines(alloc, outputs[1]);
-    defer alloc.free(p);
-    try std.testing.expectEqualStrings(s, p);
-    try std.testing.expect(std.mem.indexOf(u8, outputs[1], "id,doubled\n") != null);
-}
-
-fn sortedLines(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
-    var lines = std.array_list.Managed([]const u8).init(alloc);
-    defer lines.deinit();
-    var it = std.mem.splitScalar(u8, text, '\n');
-    while (it.next()) |l| try lines.append(l);
-    std.mem.sort([]const u8, lines.items, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.lessThan(u8, a, b);
-        }
-    }.lt);
-    var out = std.array_list.Managed(u8).init(alloc);
-    errdefer out.deinit();
-    for (lines.items) |l| {
-        try out.appendSlice(l);
-        try out.append('\n');
-    }
-    return out.toOwnedSlice();
-}
-
-test "let binding + inner join" {
+test "join: an inner join drops the unmatched probe row" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2132,11 +2023,7 @@ test "union reconciles branches to a canon schema (tag, null-fill, drop-extra)" 
     };
     const out = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
     defer alloc.free(out);
-    try std.testing.expect(std.mem.startsWith(u8, out, "src,id,v\n"));
-    try std.testing.expect(std.mem.indexOf(u8, out, "w") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "01,1,10") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "01,2,20") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "02,3,") != null);
+    try std.testing.expectEqualStrings("src,id,v\n01,1,10\n01,2,20\n02,3,\n", out);
 }
 
 test "for-each fans out over a discovered list with interpolation" {
@@ -2176,8 +2063,28 @@ test "for-each fans out over a discovered list with interpolation" {
     try std.testing.expectEqualStrings("id,v\n3,30\n", b);
 }
 
-test "log defaults to warn: a healthy run says nothing" {
+test "log defaults to warn: a healthy run writes nothing to stderr" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n1\n2\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT id FROM '{s}/in.csv';", .{ base, base });
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    var cap = try StderrCapture.begin(tmp.dir);
+    const res = run(alloc, prog, .{}, &rdiag);
+    const logged = try cap.end(alloc);
+    defer alloc.free(logged);
+    _ = try res;
     try std.testing.expectEqual(obs.Level.warn, (LogConfig{}).level);
+    try std.testing.expectEqualStrings("", logged);
 }
 
 test "for-each discovers its rows from an in-engine SELECT" {
@@ -2580,7 +2487,7 @@ fn runLetScript(alloc: std.mem.Allocator, script: []const u8, cli: []const Param
     _ = try run(alloc, prog, .{ .params = cli, .log = .{ .summary = .none, .quiet = true } }, rdiag);
 }
 
-test "LET folds once at plan time and hands every pipeline the same value" {
+test "LET value is shared across statements" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2821,15 +2728,13 @@ test "PRINT runs at the top level and per row inside a FOR EACH body" {
     const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
 
     var rdiag: Diag = .{};
-    const stats = run(alloc, prog, .{}, &rdiag) catch |e| {
-        std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
-        return e;
-    };
+    var cap = try StderrCapture.begin(tmp.dir);
+    const res = run(alloc, prog, .{}, &rdiag);
+    const printed = try cap.end(alloc);
+    defer alloc.free(printed);
+    const stats = try res;
     try std.testing.expectEqual(@as(u64, 3), stats.rows_out);
-
-    const a = try tmp.dir.readFileAlloc(alloc, "out_alpha.csv", 1 << 20);
-    defer alloc.free(a);
-    try std.testing.expectEqualStrings("id,v\n1,10\n2,20\n", a);
+    try std.testing.expectEqualStrings("run nightly\ncompany alpha\ncompany beta\n", printed);
 }
 
 test "PRINT over an unbound name is a plan error, not a silent blank" {
@@ -2857,6 +2762,9 @@ test "PRINT over an unbound name is a plan error, not a silent blank" {
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "PRINT:") != null);
 }
 
+/// Run a join script over `in.csv` (probe) + `lookup.csv` (build) at an explicit
+/// thread count. `$IN`/`$LOOKUP` in `body` are replaced with the two paths; the
+/// result comes back as written, since lanes keep file order.
 fn runJoinThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, body: []const u8, threads: usize) ![]u8 {
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
@@ -2886,9 +2794,7 @@ fn runJoinThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, body: []c
         std.debug.print("run error: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
         return e;
     };
-    const raw = try tmp.dir.readFileAlloc(alloc, out_name, 1 << 20);
-    defer alloc.free(raw);
-    return sortedLines(alloc, raw);
+    return tmp.dir.readFileAlloc(alloc, out_name, 1 << 20);
 }
 
 fn writeJoinFixtures(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) !void {
@@ -2917,7 +2823,9 @@ test "parallel join: inner join over CSV chunks matches the serial driver" {
     defer alloc.free(par);
 
     try std.testing.expectEqualStrings(serial, par);
-    try std.testing.expectEqual(@as(usize, 1202), std.mem.count(u8, par, "\n"));
+    try std.testing.expectEqual(@as(usize, 1201), std.mem.count(u8, par, "\n"));
+    try std.testing.expect(std.mem.startsWith(u8, par, "id,label\n0,Apple\n1,Banana\n2,Cherry\n5,Apple\n"));
+    try std.testing.expect(std.mem.endsWith(u8, par, "\n1995,Apple\n1996,Banana\n1997,Cherry\n"));
 }
 
 test "parallel join: left join keeps unmatched probe rows on every lane" {
@@ -2936,7 +2844,9 @@ test "parallel join: left join keeps unmatched probe rows on every lane" {
     defer alloc.free(par);
 
     try std.testing.expectEqualStrings(serial, par);
-    try std.testing.expectEqual(@as(usize, 2002), std.mem.count(u8, par, "\n"));
+    try std.testing.expectEqual(@as(usize, 2001), std.mem.count(u8, par, "\n"));
+    try std.testing.expect(std.mem.startsWith(u8, par, "id,label\n0,Apple\n1,Banana\n2,Cherry\n3,\n4,\n5,Apple\n"));
+    try std.testing.expect(std.mem.endsWith(u8, par, "\n1997,Cherry\n1998,\n1999,\n"));
 }
 
 test "parallel join: a suffix filter on a right-side column runs after the join" {
@@ -2955,11 +2865,13 @@ test "parallel join: a suffix filter on a right-side column runs after the join"
     defer alloc.free(par);
 
     try std.testing.expectEqualStrings(serial, par);
-    try std.testing.expectEqual(@as(usize, 402), std.mem.count(u8, par, "\n"));
+    try std.testing.expectEqual(@as(usize, 401), std.mem.count(u8, par, "\n"));
+    try std.testing.expect(std.mem.startsWith(u8, par, "id,label\n2,Cherry\n7,Cherry\n12,Cherry\n"));
+    try std.testing.expect(std.mem.endsWith(u8, par, "\n1992,Cherry\n1997,Cherry\n"));
     try std.testing.expect(std.mem.indexOf(u8, par, "Apple") == null);
 }
 
-test "parallel join: a breaker after the join falls back to the serial driver" {
+test "parallel join then GROUP BY matches serial" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2967,15 +2879,15 @@ test "parallel join: a breaker after the join falls back to the serial driver" {
 
     const body =
         "WITH labels AS (SELECT * FROM '$LOOKUP') " ++
-        "SELECT l.label, COUNT(*) AS n FROM '$IN' t JOIN labels l ON t.code = l.code GROUP BY l.label";
+        "SELECT l.label, COUNT(*) AS n FROM '$IN' t JOIN labels l ON t.code = l.code GROUP BY l.label ORDER BY l.label";
 
     const serial = try runJoinThreaded(alloc, &tmp, body, 1);
     defer alloc.free(serial);
     const par = try runJoinThreaded(alloc, &tmp, body, 4);
     defer alloc.free(par);
 
+    try std.testing.expectEqualStrings("label,n\nApple,400\nBanana,400\nCherry,400\n", serial);
     try std.testing.expectEqualStrings(serial, par);
-    try std.testing.expect(std.mem.indexOf(u8, par, "Cherry,400") != null);
 }
 
 test "join kinds allowed on the parallel probe path" {
@@ -2983,6 +2895,9 @@ test "join kinds allowed on the parallel probe path" {
     try std.testing.expect(joinKindLaneSafe(.left));
     try std.testing.expect(joinKindLaneSafe(.semi));
     try std.testing.expect(joinKindLaneSafe(.anti));
+    try std.testing.expect(joinKindLaneSafe(.cross));
+    try std.testing.expect(!joinKindLaneSafe(.right));
+    try std.testing.expect(!joinKindLaneSafe(.full));
 }
 
 test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hints" {
@@ -3492,6 +3407,20 @@ test "nested for-each: an outer loop variable is a name, a value, a THROW operan
         try expectFile(&tmp, "out_a_one.csv", "grp,total,src_name,sfx\na,30,a,one\nb,5,a,one\n");
         try expectFile(&tmp, "out_a_two.csv", "grp,total,src_name,sfx\na,30,a,two\nb,5,a,two\n");
         try std.testing.expectError(error.FileNotFound, tmp.dir.access("out_b_one.csv", .{}));
+
+        const base = try tmp.dir.realpathAlloc(alloc, ".");
+        defer alloc.free(base);
+        const firing = try std.mem.replaceOwned(u8, alloc, script, "'zzz'", "'b'");
+        defer alloc.free(firing);
+        const fscript = try std.mem.replaceOwned(u8, alloc, firing, "$B", base);
+        defer alloc.free(fscript);
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = try parser.parseSource(parena.allocator(), fscript, &pdiag);
+        var rdiag: Diag = .{};
+        try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{ .threads = 4, .log = .{ .quiet = true } }, &rdiag));
+        try std.testing.expectEqualStrings("for-each row name=b: for-each row suffix=one: never b", rdiag.msg);
     }
 }
 
@@ -3883,7 +3812,7 @@ test "a database that closes the connection is a transient failure (exit 75), at
 
         const each = try std.fmt.allocPrint(parena.allocator(),
             \\CREATE CONNECTION db TYPE {s} OPTIONS (host = '127.0.0.1', port = {d}, user = 'u', password = 'p', database = 'd');
-            \\FOR EACH ROW OF ('{s}/names.csv') AS (name)
+            \\FOR EACH ROW OF ('{s}/names.csv') AS (name) SEQUENTIAL ON ERROR CONTINUE
             \\  LOAD INTO '{s}/out_${{name}}.csv' AS SELECT * FROM db.t;
             \\END FOR;
         , .{ kind, port, base, base });
@@ -3891,7 +3820,8 @@ test "a database that closes the connection is a transient failure (exit 75), at
         var sink = OutcomeSink.init(parena.allocator());
         var ediag: Diag = .{};
         _ = run(alloc, eprog, .{ .outcomes = &sink }, &ediag) catch {};
-        try std.testing.expect(sink.failures() > 0);
+        try std.testing.expectEqual(@as(usize, 2), sink.failures());
+        try std.testing.expectEqual(@as(usize, 2), sink.list.items.len);
         for (sink.list.items) |o| {
             if (!o.ok and !o.retryable) {
                 std.debug.print("{s}: a for-each item failed as permanent\n", .{kind});

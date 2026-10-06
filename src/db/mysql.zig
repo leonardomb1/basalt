@@ -554,11 +554,6 @@ test "pluginByName round-trips the supported auth plugins" {
     try std.testing.expect(pluginByName("sha256_password") == null);
 }
 
-test "parseAuthSwitch recognizes mysql_clear_password (StarRocks LDAP/external auth)" {
-    const sw = parseAuthSwitch("\xfe" ++ "mysql_clear_password" ++ "\x00");
-    try std.testing.expectEqual(AuthPlugin.clear, sw.plugin.?);
-}
-
 test "decodeBits folds big-endian BIT bytes" {
     try std.testing.expectEqual(@as(i64, 0), decodeBits(""));
     try std.testing.expectEqual(@as(i64, 5), decodeBits("\x05"));
@@ -644,6 +639,7 @@ test "parseAuthSwitch extracts the plugin and its trailing salt" {
     const sw = parseAuthSwitch(payload);
     try std.testing.expectEqual(AuthPlugin.native, sw.plugin.?);
     try std.testing.expectEqualStrings("ABCDEFGHIJKLMNOPQRST", &sw.salt);
+    try std.testing.expectEqual(AuthPlugin.clear, parseAuthSwitch("\xfe" ++ "mysql_clear_password" ++ "\x00").plugin.?);
     try std.testing.expect(parseAuthSwitch("\xfe" ++ "sha256_password" ++ "\x00").plugin == null);
 }
 

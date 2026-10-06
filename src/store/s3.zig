@@ -915,6 +915,8 @@ test "parseUrl: path-style endpoint keeps the port in the signed host" {
     try std.testing.expectEqualStrings("http://127.0.0.1:9000/lake/dir/sub/file.csv", o.url);
     try std.testing.expectEqualStrings("127.0.0.1:9000", o.host);
     try std.testing.expectEqualStrings("/lake/dir/sub/file.csv", o.uri_path);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9000/lake", o.bucket_url);
+    try std.testing.expectEqualStrings("/lake", o.bucket_uri_path);
 
     const t = try parseUrl(a, "s3://lake/f.csv", "http://127.0.0.1:9000/");
     try std.testing.expectEqualStrings("http://127.0.0.1:9000/lake/f.csv", t.url);
@@ -935,11 +937,16 @@ test "parseUrl: virtual-host style for the real service" {
     const a = ar.allocator();
 
     const o = try parseUrl(a, "s3://mybucket/dir/f.parquet", null);
-    const host = try std.fmt.allocPrint(a, "mybucket.s3.{s}.amazonaws.com", .{regionFromEnv(a)});
-    try std.testing.expectEqualStrings(host, o.host);
     try std.testing.expectEqualStrings("/dir/f.parquet", o.uri_path);
-    const url = try std.fmt.allocPrint(a, "https://{s}/dir/f.parquet", .{host});
-    try std.testing.expectEqualStrings(url, o.url);
+    try std.testing.expectEqualStrings("/", o.bucket_uri_path);
+    if (std.process.hasEnvVarConstant(env_region)) {
+        const host = try std.fmt.allocPrint(a, "mybucket.s3.{s}.amazonaws.com", .{regionFromEnv(a)});
+        try std.testing.expectEqualStrings(host, o.host);
+    } else {
+        try std.testing.expectEqualStrings("mybucket.s3.us-east-1.amazonaws.com", o.host);
+        try std.testing.expectEqualStrings("https://mybucket.s3.us-east-1.amazonaws.com/dir/f.parquet", o.url);
+        try std.testing.expectEqualStrings("https://mybucket.s3.us-east-1.amazonaws.com/", o.bucket_url);
+    }
 }
 
 test "prefix URLs are distinguished from object URLs and may have an empty prefix" {
@@ -964,6 +971,11 @@ test "statusToError distinguishes causes instead of one catch-all" {
     try std.testing.expectEqual(Error.S3Throttled, statusToError(503, "<Error><Code>SlowDown</Code></Error>"));
     try std.testing.expectEqual(Error.S3Throttled, statusToError(503, ""));
     try std.testing.expectEqual(Error.S3RequestFailed, statusToError(418, ""));
+    try std.testing.expectEqual(Error.S3AuthFailed, statusToError(400, "<Error><Code>ExpiredToken</Code></Error>"));
+    try std.testing.expectEqual(Error.S3AuthFailed, statusToError(400, "<Error><Code>InvalidAccessKeyId</Code></Error>"));
+    try std.testing.expectEqual(Error.S3KeyNotFound, statusToError(403, "<Error><Code>NoSuchKey</Code></Error>"));
+    try std.testing.expectEqual(Error.S3Throttled, statusToError(400, "<Error><Code>SlowDown</Code></Error>"));
+    try std.testing.expectEqual(Error.S3RequestFailed, statusToError(400, "<Error><Code>InvalidArgument</Code></Error>"));
 }
 
 test "bucketBase covers both endpoint styles" {
@@ -993,20 +1005,6 @@ test "completeBody lists parts in staging order, 1-based" {
             "</CompleteMultipartUpload>",
         body,
     );
-}
-
-test "parseUrl carries the bucket root for CreateBucket in both styles" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    const p = try parseUrl(a, "s3://lake/dir/f.csv", "http://127.0.0.1:9000");
-    try std.testing.expectEqualStrings("http://127.0.0.1:9000/lake", p.bucket_url);
-    try std.testing.expectEqualStrings("/lake", p.bucket_uri_path);
-
-    const v = try parseUrl(a, "s3://mybucket/f.csv", null);
-    try std.testing.expectEqualStrings("/", v.bucket_uri_path);
-    try std.testing.expect(std.mem.startsWith(u8, v.bucket_url, "https://mybucket.s3."));
 }
 
 pub const provider = objstore.Provider{

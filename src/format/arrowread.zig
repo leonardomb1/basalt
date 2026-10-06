@@ -1192,17 +1192,25 @@ test "types map onto the engine's, every column nullable" {
     try std.testing.expectEqual(@as(u8, 3), dec.scale);
 }
 
-test "not arrow, and every truncation of a real file, is an error rather than a crash" {
+test "not arrow, and every truncation of an IPC file, is an error; a truncated stream never crashes" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     try std.testing.expectError(Error.NotArrow, Reader.openBytes(a, "PAR1 and then some", null));
-    inline for (.{ "testdata/polars.arrow", "testdata/pyarrow_lz4.feather", "testdata/pyarrow_stream.arrows" }) |name| {
+    inline for (.{ "testdata/polars.arrow", "testdata/pyarrow_lz4.feather" }) |name| {
         const full = @embedFile(name);
         var n: usize = 8;
         while (n < full.len) : (n += 7) {
-            _ = dump(a, full[0..n], null) catch continue;
+            if (dump(a, full[0..n], null)) |_| {
+                std.debug.print("{s}: a truncation to {d} of {d} bytes read without error\n", .{ name, n, full.len });
+                return error.TestUnexpectedResult;
+            } else |_| {}
         }
+    }
+    const stream = @embedFile("testdata/pyarrow_stream.arrows");
+    var n: usize = 8;
+    while (n < stream.len) : (n += 7) {
+        _ = dump(a, stream[0..n], null) catch continue;
     }
 }
 
