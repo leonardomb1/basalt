@@ -2,6 +2,8 @@
 //! checking the plan, the schemas it resolves, or the error a construct gives.
 
 const analyze = @import("../analyze.zig").analyze;
+const analyzeWith = @import("../analyze.zig").analyzeWith;
+const ParamOverride = @import("../analyze.zig").ParamOverride;
 const analyzeCsv = @import("testing_util.zig").analyzeCsv;
 const ast = @import("../../lang/ast.zig");
 const Diag = @import("../analyze.zig").Diag;
@@ -160,6 +162,27 @@ test "analyze pushdown preview: a chain of CTEs over one read sends every WHERE 
     const computed = try analyze(a, try parse(a, conn ++
         "LOAD INTO '/tmp/x.csv' AS WITH a AS (SELECT id, amt * 2 AS dbl FROM pg.t), b AS (SELECT id FROM a WHERE dbl > 5 AND id < 100) SELECT id FROM b;"), &diag);
     try std.testing.expectEqualStrings("(\"id\" < 100)", computed.outputs[0].source.pushdown);
+}
+
+test "check folds an expression LET over known values as the run does, and leaves one over an unbound PARAM" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const cases = [_]struct { src: []const u8, cli: []const ParamOverride = &.{}, err: ?[]const u8 }{
+        .{ .src = "LET m = 1 / 0;\nSELECT $m AS x;", .err = "LET `m`: division by zero" },
+        .{ .src = "LET m = CAST('abc' AS INT);\nSELECT $m AS x;", .err = "LET `m`: cast failed" },
+        .{ .src = "PARAM n INT DEFAULT 4;\nLET r = 100 / $n;\nLET s = $r + 1;\nSELECT $s AS x;", .err = null },
+        .{ .src = "PARAM n INT DEFAULT 4;\nLET r = 100 / $n;\nSELECT $r AS x;", .cli = &.{.{ .name = "n", .value = "0" }}, .err = "LET `r`: division by zero" },
+        .{ .src = "PARAM n INT;\nLET r = 100 / $n;\nSELECT $r AS x;", .err = null },
+    };
+    for (cases) |c| {
+        var diag = Diag{};
+        const got = analyzeWith(a, try parse(a, c.src), c.cli, &diag);
+        if (c.err) |want| {
+            try std.testing.expectError(error.AnalyzeFailed, got);
+            try std.testing.expectEqualStrings(want, diag.msg);
+        } else _ = try got;
+    }
 }
 
 test "analyze: a condition in ON on a connection's table on the right is the WHERE that side sends" {

@@ -60,6 +60,7 @@ const folder = @import("../connect/folder.zig");
 const registry = @import("../connect/registry.zig");
 const body_stmt_rule = @import("env.zig").body_stmt_rule;
 const env_mod = @import("env.zig");
+const Value = @import("../exec/value.zig").Value;
 const sql = @import("../db/sql.zig");
 const analyzeCsv = @import("analyze/testing_util.zig").analyzeCsv;
 const expectAnalyzeErr = @import("analyze/testing_util.zig").expectAnalyzeErr;
@@ -242,10 +243,8 @@ pub const ParamOverride = struct { name: []const u8, value: []const u8 };
 
 /// The literal a `-p` string stands for, typed by the PARAM's declared type. Anything
 /// not scalar keeps the declared default: `check` is offline.
-/// Why an expression LET cannot be folded, or null: it reads a query LET, which is
-/// decided only once queries run, or a `$name` no PARAM or earlier LET declares.
-pub fn letRefProblem(arena: std.mem.Allocator, program: ast.Program, l: ast.LetConst) Error!?[]const u8 {
-    const le = l.expr orelse return null;
+/// The `$name`s an expression reads, in order, repeats included.
+fn dollarRefs(arena: std.mem.Allocator, e: *const ast.Expr) Error![]const []const u8 {
     const Collect = struct {
         arena: std.mem.Allocator,
         names: *std.array_list.Managed([]const u8),
@@ -258,8 +257,15 @@ pub fn letRefProblem(arena: std.mem.Allocator, program: ast.Program, l: ast.LetC
         }
     };
     var names = std.array_list.Managed([]const u8).init(arena);
-    _ = try Collect.recur(.{ .arena = arena, .names = &names }, le);
-    for (names.items) |n| {
+    _ = try Collect.recur(.{ .arena = arena, .names = &names }, e);
+    return names.items;
+}
+
+/// Why an expression LET cannot be folded, or null: it reads a query LET, which is
+/// decided only once queries run, or a `$name` no PARAM or earlier LET declares.
+pub fn letRefProblem(arena: std.mem.Allocator, program: ast.Program, l: ast.LetConst) Error!?[]const u8 {
+    const le = l.expr orelse return null;
+    for (try dollarRefs(arena, le)) |n| {
         var declared = false;
         for (program.stmts) |s| switch (s) {
             .param => |p| if (std.mem.eql(u8, p.name, n)) {
@@ -436,6 +442,10 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
         return fail(diag, "nothing to run: the script needs a `LOAD INTO` or a terminal `SELECT`", .{});
 
     var params_map = ParamMap.init(arena);
+    // What the run will bind for sure — a PARAM given a value or a DEFAULT, and the LETs
+    // folded from them — so a LET over them is folded here as the run folds it.
+    var known_names = std.array_list.Managed([]const u8).init(arena);
+    var known_values = std.array_list.Managed(Value).init(arena);
     for (program.stmts) |s| if (s == .param) {
         const p = s.param;
         var bound: ?*const ast.Expr = null;
@@ -449,7 +459,12 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
         };
         if (text) |t| if (paramTextProblem(arena, p.ty, t)) |want|
             return fail(diag, "PARAM `{s}`: `{s}` is not {s}", .{ p.name, t, want });
-        try params_map.put(p.name, bound orelse try typedParam(arena, p.ty, if (p.default) |d| d else try typedZero(arena, p.ty)));
+        const pe = bound orelse try typedParam(arena, p.ty, if (p.default) |d| d else try typedZero(arena, p.ty));
+        try params_map.put(p.name, pe);
+        if (bound != null or p.default != null) if (eval.constEval(arena, pe, &.{}, &.{})) |v| {
+            try known_names.append(p.name);
+            try known_values.append(v);
+        } else |_| {};
     };
     for (program.stmts) |s| if (s == .let_const) {
         const l = s.let_const;
@@ -461,7 +476,21 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
             return e;
         }
         if (l.expr) |le| {
-            try params_map.put(l.name, try substExpr(arena, le, &params_map));
+            const refs = try dollarRefs(arena, le);
+            const all_known = for (refs) |n| {
+                if (!containsName(known_names.items, n)) break false;
+            } else true;
+            if (all_known) {
+                const v = eval.constEval(arena, le, known_names.items, known_values.items) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    const e = fail(diag, "LET `{s}`: {s}", .{ l.name, env_mod.errLabel(err) });
+                    diag.pos = l.pos;
+                    return e;
+                };
+                try known_names.append(l.name);
+                try known_values.append(v);
+                try params_map.put(l.name, env_mod.mkLit(arena, v) catch return error.OutOfMemory);
+            } else try params_map.put(l.name, try substExpr(arena, le, &params_map));
         } else {
             const ph = try arena.create(ast.Expr);
             ph.* = .null_lit;
@@ -1070,6 +1099,11 @@ pub fn sqlOptionProblem(c: ast.Connection) ?[]const u8 {
     if (auth != null and tls != null and std.mem.eql(u8, auth.?, "ntlm") and std.mem.eql(u8, tls.?, "off"))
         return env_mod.ntlm_needs_tls_msg;
     return null;
+}
+
+fn containsName(names: []const []const u8, n: []const u8) bool {
+    for (names) |x| if (std.mem.eql(u8, x, n)) return true;
+    return false;
 }
 
 pub const connection_types = "http, postgres, mysql, sqlserver, starrocks, doris, sftp, smb";
