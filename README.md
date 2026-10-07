@@ -169,8 +169,10 @@ apply), with `AWS_ENDPOINT_URL` for MinIO and the like.
 
 ## Documentation
 
-- [`docs/language.md`](docs/language.md) — the SQL dialect: sources, sinks, joins,
-  unions, `FOR EACH`, parameters, endpoints
+- [The basalt book](https://leonardomb1.github.io/basalt/) — the SQL dialect,
+  its connectors and tools; the pages are Markdown under [`docs/`](docs/), starting
+  at [`docs/introduction.md`](docs/introduction.md). `zig build test-docs` checks
+  every SQL example in it
 - [`examples/`](examples) — runnable scripts, one per feature
 
 ## Tests

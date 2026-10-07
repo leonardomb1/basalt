@@ -201,7 +201,7 @@ fn usage(w: anytype) !void {
         \\script:
         \\  a path, `-` for stdin, or `-c <script>` for an inline script
         \\  a terminal `SELECT ...;` prints a table; `LOAD INTO <target> AS <query>;` writes
-        \\  see docs/language.md for the dialect
+        \\  see https://leonardomb1.github.io/basalt/ (or docs/ in the source) for the dialect
         \\
         \\sources and sinks:
         \\  files      CSV and Parquet, by path or URL, Arrow IPC (.arrow, .feather,

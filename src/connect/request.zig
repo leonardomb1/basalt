@@ -1,9 +1,9 @@
-//! `read request` / `FROM BODY`: turns an HTTP request body (JSON) into rows.
+//! `FROM BODY`: turns an HTTP request body (JSON) into rows.
 //! Accepts a JSON array of objects (or a single object) and materializes one
 //! batch. With a declared schema (`FROM BODY (col TYPE [NOT NULL], ...)`) the
 //! body is validated row by row, and a violation is a permanent error naming the
 //! offending row and column (the server surfaces it as 422). Without one, the
-//! schema is inferred from the first object (BSL `read request`).
+//! schema is inferred from the first object.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");

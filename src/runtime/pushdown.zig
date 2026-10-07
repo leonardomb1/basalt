@@ -170,7 +170,7 @@ pub fn planWholeAggWhy(
     for (ag.aggs, 0..) |item, i| {
         const out = plan_schema.fields[ag.by.len + i];
         const inner = (try aggExpr(arena, dialect, src_schema, item, out.ty)) orelse
-            return refuse(why, try std.fmt.allocPrint(arena, "`{s}` is not pushed down for this argument and result type (see the pushdown rules in docs/language.md)", .{out.name}));
+            return refuse(why, try std.fmt.allocPrint(arena, "`{s}` is not pushed down for this argument and result type (see the pushdown rules in docs/language/pushdown.md)", .{out.name}));
         const cast_to = (try dialect.castType(arena, out.ty)) orelse
             return refuse(why, try std.fmt.allocPrint(arena, "{s} has no cast for the result type of `{s}`", .{ @tagName(dialect), out.name }));
         if (sel.items.len > 0) try sel.appendSlice(", ");

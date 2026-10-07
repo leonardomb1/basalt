@@ -1,11 +1,10 @@
-//! Lexer for the Basalt SQL dialect (docs/language.md). Shares `token.Token` with
-//! the BSL lexer; keywords are plain `ident`s matched case-insensitively by the
-//! SQL parser. Differences from the BSL lexer:
-//!   - comments: `--` to end of line and `/* ... */` blocks (not `#`)
+//! Lexer for the basalt SQL dialect (docs/language/scripts.md). Keywords are plain
+//! `ident`s, matched case-insensitively by the parser. The token forms:
+//!   - comments: `--` to end of line and `/* ... */` blocks
 //!   - strings: '...' with `''` doubling (unescaped here)
 //!   - "..." is an ANSI quoted identifier, the only way to name a column with a
-//!     space or keyword in it. Before v0.4.6 it was a second string syntax, which
-//!     silently made `SELECT "Exchange rate"` a constant instead of the column.
+//!     space or keyword in it; read as a string it would make
+//!     `SELECT "Exchange rate"` a constant instead of the column.
 //!   - raw SQL literals: $$...$$ / $tag$...$tag$ (dollar-quoting, verbatim body)
 //!   - `$name` lexes as .dollar_ident (a PARAM reference)
 //!   - `;` statement terminator, `<>` as not-equal, `||` concat over bitwise `|`

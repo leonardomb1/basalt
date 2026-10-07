@@ -4,3 +4,4 @@ zig-out/
 .vscode/
 # what the examples write
 examples/out.csv
+/book/

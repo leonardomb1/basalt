@@ -1,20 +1,19 @@
 name: CI
 
-# The light check for main and pull requests: formatting and the unit and e2e
-# tests. Releases (cross-build, image, assets) run from release.yml on tags.
+# The light check for main and pull requests: formatting, the unit and e2e tests,
+# and the book's SQL examples (so docs/ is not ignored). Releases (cross-build,
+# image, assets) run from release.yml on tags.
 on:
   push:
     branches: [main]
     paths-ignore:
       - 'README.md'
-      - 'docs/**'
       - 'LICENSE'
       - '.gitignore'
   pull_request:
     branches: [main]
     paths-ignore:
       - 'README.md'
-      - 'docs/**'
       - 'LICENSE'
       - '.gitignore'
   workflow_dispatch:

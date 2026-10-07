@@ -50,9 +50,26 @@ pub fn build(b: *std.Build) void {
     });
     const run_e2e_tests = b.addRunArtifact(e2e_tests);
 
-    const test_step = b.step("test", "Run unit and end-to-end tests");
+    // The book's SQL examples, checked as `basalt check` would; it reads docs/, so
+    // an edit there alone must re-run it.
+    const docs_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/docs/examples_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "basalt", .module = basalt_module }},
+        }),
+    });
+    const run_docs_tests = b.addRunArtifact(docs_tests);
+    run_docs_tests.has_side_effects = true;
+    run_docs_tests.setCwd(b.path("."));
+
+    const test_step = b.step("test", "Run unit, end-to-end and documentation tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_e2e_tests.step);
+    test_step.dependOn(&run_docs_tests.step);
+    const docs_step = b.step("test-docs", "Check the SQL examples in docs/");
+    docs_step.dependOn(&run_docs_tests.step);
     const unit_step = b.step("test-unit", "Run the unit tests in src/");
     unit_step.dependOn(&run_unit_tests.step);
     const e2e_step = b.step("test-e2e", "Run the end-to-end tests in tests/e2e/");

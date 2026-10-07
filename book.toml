@@ -1,0 +1,17 @@
+[book]
+title = "basalt"
+description = "A SQL-driven data pipeline engine: the language, its connectors and its tools."
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/leonardomb1/basalt"
+edit-url-template = "https://github.com/leonardomb1/basalt/edit/main/docs/{path}"
+no-section-label = true
+
+[output.html.search]
+enable = true
