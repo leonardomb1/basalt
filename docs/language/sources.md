@@ -88,11 +88,58 @@ source is asked to do are on [Pushdown](pushdown.md).
   extensionless path. Without it, an extension basalt does not know is refused
   at plan time rather than parsed as CSV, which would read a binary file's
   bytes as rows.
-- **`WITH (k = v, flag, ...)`** — residual source options: `items` (dotted
-  path to the row array when the response nests it, e.g. `items = 'data.rows'`
-  — a bare array needs nothing), `buffer` (drain the source fully before
-  opening the sink), `prefetch`, `timeout_ms`, `header = 'Name: value'`,
-  `auth` forms, `method`/`body` for POST sources, etc.
+- **`WITH (k = v, flag, ...)`** — every other option of a read, listed in full
+  below.
+
+## WITH options
+
+A read's `WITH (...)` takes `key = value` pairs and bare flags. `PAGINATE BY` and
+`RETRY` (above) are shorthands that set some of the REST ones.
+
+**Files**
+
+| option | meaning |
+|---|---|
+| `format` | `csv`, `parquet`, `arrow` or `xlsx`, whatever the extension says |
+| `delimiter` | a CSV's separator: one character, or `tab` (also on a `LOAD INTO` file) |
+| `encoding` | a CSV's text encoding: `utf8` (default), `latin1` / `iso-8859-1`, `cp1252` / `windows-1252` |
+| `sheet` | an Excel worksheet by name (default the first) |
+| `range` | an Excel block such as `'B3:F200'`, or `'B3:F'` to the last row |
+| `header` | `false` reads an Excel sheet's first row as data, the columns named `A`, `B`, … |
+| `buffer` | a flag: drain the source fully before opening the sink |
+
+**REST sources** — `HTTP(...)`, `conn.GET(...)`, `conn.POST(...)` and resources
+
+| option | default | meaning |
+|---|---|---|
+| `items` | the response | dotted path to the array of rows when the response nests it, as `'data.rows'` |
+| `method` | `get` | `post` sends `body` |
+| `body` | none | the request body; the page parameter is added to it when paginating a POST |
+| `body_type` | `form` | `json` sends the body as `application/json`, anything else as a form |
+| `header` | none | one extra header, `'Name: value'`; a `User-Agent` given this way replaces basalt's |
+| `bearer`, `bearer_env` | none | a bearer token, or the environment variable holding one |
+| `auth`, `auth_env` | none | an `Authorization` value sent verbatim, or the variable holding it |
+| `user_env`, `pass_env` | none | variables holding a basic-auth user and password |
+| `paginate` | none | `page`, `offset` or `cursor` (`PAGINATE BY`) |
+| `page_param` | `page` | the query parameter that carries the page number or offset (`param` in `PAGINATE`) |
+| `start_page` | `1` | the first page number (`start`) |
+| `start_offset` | `0` | the first offset, in `offset` mode |
+| `size_param` | none | the query parameter that carries the page size, as OData's `$top` |
+| `page_size` | `100` | rows per page, sent in `size_param` and the step of `offset` mode (`size`) |
+| `cursor_param` | `cursor` | the query parameter that carries a cursor (`param` in cursor mode) |
+| `cursor_field` | `next` | dotted path to the next cursor or URL in each response (`field`) |
+| `total_field` | none | dotted path to a page count, for APIs that never return an empty page (`total`) |
+| `max_pages` | `10000` | a cap on pages fetched (`max`) |
+| `stop_short` | off | a flag: stop after a page shorter than `page_size` |
+| `prefetch` | `1` | pages kept in flight at once, in `page` and `offset` modes |
+| `retries` | `2` | retries of a transient failure (`RETRY n`) |
+| `retry_statuses` | none | extra HTTP codes treated as transient, as `'404,408'` (`RETRY n ON (...)`) |
+| `retry_base_ms` | `500` | the first retry's back-off, doubled each time, ±30% jitter |
+| `timeout_ms` | `300000` | the limit on one page's fetch |
+| `progress_ms` | `30000` | how often a long fetch logs its progress |
+
+**Joins** — on the `JOIN` clause: `max_build = '16GB'` raises the right side's
+memory ceiling ([Joins](joins.md)).
 
 `WHERE` on a REST source runs in basalt after the fetch; on a SQL table it is
 pushdown. Same word, different plan — `EXPLAIN` shows which.
