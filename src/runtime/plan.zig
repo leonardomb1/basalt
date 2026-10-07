@@ -627,8 +627,9 @@ pub fn joinBuildCap(env: *Env, hints: []const ast.Hint) !usize {
     return op.join_build_byte_cap;
 }
 
-/// Replace the binding chain at the head of `stages` with the stages it stands for,
-/// except a materialized binding or one holding a window (`windowTopK` needs it apart).
+/// Replace the binding chain at the head of `stages` with the stages it stands for —
+/// a binding over a read, or over another binding — except a materialized binding
+/// or one holding a window (`windowTopK` needs it apart).
 pub fn inlineHeadBindings(env: *Env, stages_in: []const ast.Stage) ![]const ast.Stage {
     var stages = stages_in;
     var n: usize = 0;
@@ -636,7 +637,7 @@ pub fn inlineHeadBindings(env: *Env, stages_in: []const ast.Stage) ![]const ast.
         const name = stages[0].node.ref;
         if (env.materialized.contains(name)) break;
         const b = env.bindings.get(name) orelse break;
-        if (b.stages.len == 0 or b.stages[0].node != .read) break;
+        if (b.stages.len == 0 or (b.stages[0].node != .read and b.stages[0].node != .ref)) break;
         for (b.stages) |st| {
             if (st.node == .window) return stages;
         }

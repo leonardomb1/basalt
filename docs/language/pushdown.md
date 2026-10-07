@@ -43,8 +43,9 @@ crosses the wire. The answer never changes, only where the work happens;
   `now()`/`today()`, user funcs) stay in the engine — the filter is always
   kept, so results never change, only how much crosses the wire. `EXPLAIN`
   prints the descended predicate on a `pushdown:` line. A CTE, derived table or
-  table function the query *starts from* counts as that read: its own `WHERE`
-  descends as if written inline (`(via binding …)` in `EXPLAIN`), except a binding
+  table function the query *starts from* counts as that read, and so does a chain
+  of them, each reading the one before: every `WHERE` along it descends as if
+  written inline (`(via binding b, a)` in `EXPLAIN`), except in a binding
   holding a window function, which stays apart so a `WHERE rn = 1` over it can run
   as a top-N. A filter written after a `SELECT` list — the query's own `WHERE`
   over a CTE, derived table or table function — moves in front of it when every

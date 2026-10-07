@@ -139,6 +139,29 @@ test "analyze pushdown preview: a CTE, derived table or table function at the he
     try std.testing.expectEqualStrings("", w.outputs[0].source.pushdown);
 }
 
+test "analyze pushdown preview: a chain of CTEs over one read sends every WHERE it can, and lists its stages" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const conn = "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', user = 'u', password = 'p', database = 'd');\n";
+
+    var diag = Diag{};
+    const plain = try analyze(a, try parse(a, conn ++
+        "LOAD INTO '/tmp/x.csv' AS WITH a AS (SELECT id, amt, k FROM pg.t WHERE amt > 1), b AS (SELECT id, k FROM a WHERE id < 100) SELECT id FROM b WHERE k = 'x';"), &diag);
+    const src = plain.outputs[0].source;
+    try std.testing.expectEqualStrings("(\"amt\" > 1) AND (\"id\" < 100) AND (\"k\" = 'x')", src.pushdown);
+    try std.testing.expect(std.mem.indexOf(u8, src.detail, "(via binding b, a)") != null);
+    var filters: usize = 0;
+    for (plain.outputs[0].stages) |st| {
+        if (std.mem.eql(u8, st.kind, "filter")) filters += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), filters);
+
+    const computed = try analyze(a, try parse(a, conn ++
+        "LOAD INTO '/tmp/x.csv' AS WITH a AS (SELECT id, amt * 2 AS dbl FROM pg.t), b AS (SELECT id FROM a WHERE dbl > 5 AND id < 100) SELECT id FROM b;"), &diag);
+    try std.testing.expectEqualStrings("(\"id\" < 100)", computed.outputs[0].source.pushdown);
+}
+
 test "analyze: a condition in ON on a connection's table on the right is the WHERE that side sends" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();

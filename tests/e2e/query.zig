@@ -899,3 +899,38 @@ test "week: ISO weeks from Monday, in date_trunc, extract, date_add and date_dif
     , 1, &.{});
     try expectFile(&tmp, "w.csv", "wed,sun,w53,w1,crossed,plus2\n2026-09-28 00:00:00,2026-09-28 00:00:00,53,1,1,2026-10-14\n");
 }
+
+test "a chain of CTEs, each reading the one before, gives the same rows inlined at any thread count" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]usize{ 1, 4 }) |threads| {
+        try checkAndRun(alloc, &tmp,
+            \\LOAD INTO '$B/filters.csv' AS
+            \\WITH x AS (SELECT id, grp, amt FROM '$B/a.csv' WHERE amt > 5),
+            \\     y AS (SELECT id, grp FROM x WHERE id < 3)
+            \\SELECT id FROM y WHERE grp = 'a' ORDER BY id;
+            \\LOAD INTO '$B/computed.csv' AS
+            \\WITH x AS (SELECT id, amt * 2 AS dbl FROM '$B/a.csv'),
+            \\     y AS (SELECT id, dbl FROM x WHERE dbl > 15)
+            \\SELECT id, dbl FROM y ORDER BY id;
+            \\LOAD INTO '$B/window.csv' AS
+            \\WITH x AS (SELECT id, grp, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY id) AS rn FROM '$B/a.csv'),
+            \\     y AS (SELECT id, grp FROM x WHERE rn = 1)
+            \\SELECT id, grp FROM y ORDER BY id;
+            \\LOAD INTO '$B/agg.csv' AS
+            \\WITH x AS (SELECT grp, SUM(amt) AS total FROM '$B/a.csv' GROUP BY grp),
+            \\     y AS (SELECT grp, total FROM x WHERE total > 10)
+            \\SELECT grp, total FROM y;
+            \\LOAD INTO '$B/joined.csv' AS
+            \\WITH x AS (SELECT id, amt FROM '$B/a.csv' WHERE amt > 5),
+            \\     y AS (SELECT id FROM x WHERE id > 1)
+            \\SELECT l.id, l.grp FROM '$B/a.csv' l JOIN y ON l.id = y.id ORDER BY l.id;
+        , threads, &.{});
+        try expectFile(&tmp, "filters.csv", "id\n1\n2\n");
+        try expectFile(&tmp, "computed.csv", "id,dbl\n1,20\n2,40\n");
+        try expectFile(&tmp, "window.csv", "id,grp\n1,a\n3,b\n");
+        try expectFile(&tmp, "agg.csv", "grp,total\na,30\n");
+        try expectFile(&tmp, "joined.csv", "id,grp\n2,a\n");
+    }
+}

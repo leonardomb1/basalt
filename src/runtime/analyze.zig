@@ -950,18 +950,19 @@ const Ctx = struct {
     }
 
     /// The binding chain at the head of `stages` laid out in front of the rest, as
-    /// `plan.inlineHeadBindings` does. `via` is the first binding laid out, if any.
+    /// `plan.inlineHeadBindings` does. `via` names the bindings laid out, outermost
+    /// first, if any.
     fn inlineHead(self: *Ctx, stages_in: []const ast.Stage) !struct { stages: []const ast.Stage, via: ?[]const u8 } {
         var via: ?[]const u8 = null;
         var head = stages_in;
         var n: usize = 0;
         while (head[0].node == .ref and n < 16) : (n += 1) {
             const b = self.bindings.get(head[0].node.ref) orelse break;
-            if (b.stages.len == 0 or b.stages[0].node != .read) break;
+            if (b.stages.len == 0 or (b.stages[0].node != .read and b.stages[0].node != .ref)) break;
             if (for (b.stages) |st| {
                 if (st.node == .window) break true;
             } else false) break;
-            via = via orelse head[0].node.ref;
+            via = if (via) |v| try std.fmt.allocPrint(self.arena, "{s}, {s}", .{ v, head[0].node.ref }) else head[0].node.ref;
             const joined = try self.arena.alloc(ast.Stage, b.stages.len + head.len - 1);
             @memcpy(joined[0..b.stages.len], b.stages);
             @memcpy(joined[b.stages.len..], head[1..]);
