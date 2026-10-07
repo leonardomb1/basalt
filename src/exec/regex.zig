@@ -100,12 +100,33 @@ const Budget = struct {
     }
 };
 
+/// `icase` matches a letter in either case, as a literal and inside a class.
+pub const Options = struct { icase: bool = false };
+
+/// `regexp_replace`'s flags: `g` replaces every match, `i` ignores case. Null for
+/// any other letter.
+pub const Flags = struct { global: bool = false, icase: bool = false };
+
+pub fn parseFlags(s: []const u8) ?Flags {
+    var f = Flags{};
+    for (s) |c| switch (c) {
+        'g' => f.global = true,
+        'i' => f.icase = true,
+        else => return null,
+    };
+    return f;
+}
+
 pub const Regex = struct {
     alt: []const []const Item,
     ngroups: u8,
 
     pub fn compile(gpa: std.mem.Allocator, pattern: []const u8) Error!Regex {
-        var p = Parser{ .src = pattern, .gpa = gpa };
+        return compileOpts(gpa, pattern, .{});
+    }
+
+    pub fn compileOpts(gpa: std.mem.Allocator, pattern: []const u8, opts: Options) Error!Regex {
+        var p = Parser{ .src = pattern, .gpa = gpa, .icase = opts.icase };
         const alt = try p.parseAlt();
         if (p.i != pattern.len) return Error.BadPattern;
         return .{ .alt = alt, .ngroups = p.ngroup };
@@ -198,6 +219,7 @@ const Parser = struct {
     i: usize = 0,
     gpa: std.mem.Allocator,
     ngroup: u8 = 1,
+    icase: bool = false,
 
     fn parseAlt(self: *Parser) Error![]const []const Item {
         var branches = std.array_list.Managed([]const Item).init(self.gpa);
@@ -308,7 +330,13 @@ const Parser = struct {
                 self.i += 1;
                 return try escapeAtom(e);
             },
-            else => return .{ .lit = c },
+            else => {
+                if (!self.icase or !std.ascii.isAlphabetic(c)) return .{ .lit = c };
+                var cl = Class{ .neg = false, .bits = .{0} ** 32 };
+                cl.set(std.ascii.toLower(c));
+                cl.set(std.ascii.toUpper(c));
+                return .{ .class = cl };
+            },
         }
     }
 
@@ -349,6 +377,15 @@ const Parser = struct {
         }
         if (self.i >= self.src.len) return Error.BadPattern;
         self.i += 1;
+        if (self.icase) for ('a'..'z' + 1) |lc| {
+            const l: u8 = @intCast(lc);
+            const u = std.ascii.toUpper(l);
+            const in = (cl.bits[l >> 3] >> @intCast(l & 7)) & 1 != 0 or (cl.bits[u >> 3] >> @intCast(u & 7)) & 1 != 0;
+            if (in) {
+                cl.set(l);
+                cl.set(u);
+            }
+        };
         return cl;
     }
 };
@@ -403,11 +440,43 @@ pub fn replaceFirstRe(
     s: []const u8,
     repl: []const u8,
 ) Error![]const u8 {
-    var caps: Captures = undefined;
-    const span = (try re.find(s, 0, &caps)) orelse return s;
+    return replaceRe(out, re, s, repl, false);
+}
 
+/// Every non-overlapping match replaced, left to right; after an empty match the
+/// next character is copied, so the scan always advances.
+pub fn replaceAllRe(
+    out: std.mem.Allocator,
+    re: Regex,
+    s: []const u8,
+    repl: []const u8,
+) Error![]const u8 {
+    return replaceRe(out, re, s, repl, true);
+}
+
+fn replaceRe(out: std.mem.Allocator, re: Regex, s: []const u8, repl: []const u8, all: bool) Error![]const u8 {
+    var caps: Captures = undefined;
     var buf = std.array_list.Managed(u8).init(out);
-    try buf.appendSlice(s[0..span[0]]);
+    var at: usize = 0;
+    var replaced = false;
+    while (at <= s.len) {
+        const span = (try re.find(s, at, &caps)) orelse break;
+        replaced = true;
+        try buf.appendSlice(s[at..span[0]]);
+        try expandReplacement(&buf, s, repl, &caps);
+        at = span[1];
+        if (!all) break;
+        if (span[0] == span[1]) {
+            if (at < s.len) try buf.append(s[at]);
+            at += 1;
+        }
+    }
+    if (!replaced) return s;
+    if (at < s.len) try buf.appendSlice(s[at..]);
+    return buf.toOwnedSlice();
+}
+
+fn expandReplacement(buf: *std.array_list.Managed(u8), s: []const u8, repl: []const u8, caps: *const Captures) Error!void {
     var i: usize = 0;
     while (i < repl.len) : (i += 1) {
         if (repl[i] == '\\' and i + 1 < repl.len and repl[i + 1] >= '0' and repl[i + 1] <= '9') {
@@ -418,8 +487,6 @@ pub fn replaceFirstRe(
             try buf.append(repl[i]);
         }
     }
-    try buf.appendSlice(s[span[1]..]);
-    return buf.toOwnedSlice();
 }
 
 test "regex: literals, classes, anchors, groups" {
@@ -567,4 +634,29 @@ test "regex: a pathological pattern gives up instead of hanging" {
     const long = "b" ** 200_000 ++ "zq";
     const lit = try Regex.compile(a, "zq");
     try std.testing.expectEqual([2]usize{ 200_000, 200_002 }, (try lit.find(long, 0, &caps)).?);
+}
+
+test "regex: icase folds literals and classes, a negated class included; replaceAllRe advances past empty matches" {
+    var buf: [32 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+    var caps: Captures = undefined;
+
+    var re = try Regex.compileOpts(a, "hello", .{ .icase = true });
+    try std.testing.expect((try re.find("say HeLLo", 0, &caps)) != null);
+    re = try Regex.compileOpts(a, "[a-c]+", .{ .icase = true });
+    try std.testing.expectEqual([2]usize{ 0, 3 }, (try re.find("AbC", 0, &caps)).?);
+    re = try Regex.compileOpts(a, "[^a-z]", .{ .icase = true });
+    try std.testing.expect((try re.find("ABC", 0, &caps)) == null);
+    re = try Regex.compile(a, "hello");
+    try std.testing.expect((try re.find("HELLO", 0, &caps)) == null);
+
+    try std.testing.expectEqualStrings("a+b+c", try replaceAllRe(a, try Regex.compile(a, "-"), "a-b-c", "+"));
+    try std.testing.expectEqualStrings("-a-b-c-", try replaceAllRe(a, try Regex.compile(a, "x*"), "abc", "-"));
+    try std.testing.expectEqualStrings("a[1][2]", try replaceAllRe(a, try Regex.compile(a, "(\\d)"), "a12", "[\\1]"));
+    try std.testing.expectEqualStrings("a+b-c", try replaceFirstRe(a, try Regex.compile(a, "-"), "a-b-c", "+"));
+    try std.testing.expectEqualStrings("abc", try replaceAllRe(a, try Regex.compile(a, "z"), "abc", "+"));
+
+    try std.testing.expectEqual(Flags{ .global = true, .icase = true }, parseFlags("gi").?);
+    try std.testing.expect(parseFlags("gx") == null);
 }

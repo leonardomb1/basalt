@@ -62,6 +62,7 @@ const RegexCache = struct {
     buf: [16 * 1024]u8 = undefined,
     src: []const u8 = &.{},
     re: regex.Regex = undefined,
+    icase: bool = false,
     valid: bool = false,
 };
 
@@ -148,11 +149,16 @@ pub fn regexpFind(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row:
 /// The entry is invalidated before compiling, so a failed compile never leaves the
 /// old pattern under the new key, and `src` is copied into the entry's own buffer.
 pub fn cachedRegex(pattern: []const u8) regex.Error!regex.Regex {
+    return cachedRegexOpts(pattern, .{});
+}
+
+pub fn cachedRegexOpts(pattern: []const u8, opts: regex.Options) regex.Error!regex.Regex {
     const c = &regex_cache;
-    if (c.valid and std.mem.eql(u8, c.src, pattern)) return c.re;
+    if (c.valid and c.icase == opts.icase and std.mem.eql(u8, c.src, pattern)) return c.re;
     var fba = std.heap.FixedBufferAllocator.init(&c.buf);
     c.valid = false;
-    c.re = try regex.Regex.compile(fba.allocator(), pattern);
+    c.icase = opts.icase;
+    c.re = try regex.Regex.compileOpts(fba.allocator(), pattern, opts);
     c.src = fba.allocator().dupe(u8, pattern) catch return error.OutOfMemory;
     c.valid = true;
     return c.re;

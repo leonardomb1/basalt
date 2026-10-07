@@ -47,7 +47,7 @@ pub const Builtin = struct { name: []const u8, sig: []const u8 };
 pub const builtin_functions = [_]Builtin{
     .{ .name = "now", .sig = "now()" },
     .{ .name = "today", .sig = "today()" },
-    .{ .name = "regexp_replace", .sig = "regexp_replace(s, pattern, replacement)" },
+    .{ .name = "regexp_replace", .sig = "regexp_replace(s, pattern, replacement[, flags])" },
     .{ .name = "regexp_matches", .sig = "regexp_matches(s, pattern)" },
     .{ .name = "regexp_extract", .sig = "regexp_extract(s, pattern[, group])" },
     .{ .name = "md5", .sig = "md5(s)" },

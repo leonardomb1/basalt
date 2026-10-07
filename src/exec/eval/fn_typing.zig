@@ -33,11 +33,16 @@ pub const typing = struct {
     }
 
     pub fn regexpReplace(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
-        if (c.args.len != 3) return self.err("`regexp_replace` takes (string, pattern, replacement)", .{});
+        if (c.args.len != 3 and c.args.len != 4) return self.err("`regexp_replace` takes (string, pattern, replacement[, flags])", .{});
         _ = try literalPattern(self, c);
         const a = try self.wantText(c, 0);
         _ = try self.wantText(c, 1);
         _ = try self.wantText(c, 2);
+        if (c.args.len == 4) {
+            _ = try self.wantText(c, 3);
+            if (c.args[3].* == .str_lit and regex.parseFlags(c.args[3].str_lit) == null)
+                return self.err("`regexp_replace` flags are `g` (every match) and `i` (ignore case), not `{s}`", .{c.args[3].str_lit});
+        }
         return Type.init(.string).withNull(a.nullable);
     }
 

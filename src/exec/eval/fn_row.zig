@@ -8,6 +8,7 @@ const addUnits = @import("time.zig").addUnits;
 const ast = @import("../../lang/ast.zig");
 const bindParams = @import("row.zig").bindParams;
 const cachedRegex = @import("support.zig").cachedRegex;
+const cachedRegexOpts = @import("support.zig").cachedRegexOpts;
 const caseMap = @import("strings.zig").caseMap;
 const caseMapInto = @import("strings.zig").caseMapInto;
 const castValueTyped = @import("cast.zig").castValueTyped;
@@ -82,12 +83,19 @@ pub const per_row = struct {
         const pat = try evalRow(arena, c.args[1], batch, row);
         const rep = try evalRow(arena, c.args[2], batch, row);
         if (pat.isNull() or rep.isNull()) return .null;
-        const re = cachedRegex(try valueToString(arena, pat)) catch |e| switch (e) {
+        var flags = regex.Flags{};
+        if (c.args.len == 4) {
+            const fv = try evalRow(arena, c.args[3], batch, row);
+            if (fv.isNull()) return .null;
+            flags = regex.parseFlags(try valueToString(arena, fv)) orelse return error.CastFailed;
+        }
+        const re = cachedRegexOpts(try valueToString(arena, pat), .{ .icase = flags.icase }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.BadPattern => return error.CastFailed,
             error.PatternTooComplex => return error.PatternTooComplex,
         };
-        const out = regex.replaceFirstRe(
+        const replaceFn = if (flags.global) &regex.replaceAllRe else &regex.replaceFirstRe;
+        const out = replaceFn(
             arena,
             re,
             try valueToString(arena, v),

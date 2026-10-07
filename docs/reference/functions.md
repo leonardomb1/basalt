@@ -47,7 +47,7 @@ compiled at plan time, so a malformed one fails `check`.
 |---|---|
 | `regexp_matches(s, pattern)` | whether the pattern matches anywhere; anchor with `^…$` for the whole string |
 | `regexp_extract(s, pattern[, group])` | the match, or the numbered group; null where nothing matches |
-| `regexp_replace(s, pattern, replacement)` | the text with the first match replaced; `\1`…`\9` in the replacement expand to captured groups and `\0` to the whole match |
+| `regexp_replace(s, pattern, replacement[, flags])` | the text with the first match replaced; `\1`…`\9` in the replacement expand to captured groups and `\0` to the whole match. `flags` is any of `g` (replace every match) and `i` (ignore the case of ASCII letters): `regexp_replace(s, '\s+', ' ', 'g')` |
 
 ## Hashes and encodings
 
