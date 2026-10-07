@@ -81,6 +81,10 @@ pub fn build(b: *std.Build) void {
     if (b.findProgram(&.{"kcov"}, &.{})) |kcov| {
         const out_dir = b.getInstallPath(.prefix, "coverage");
         const include = b.fmt("--include-path={s}", .{b.pathFromRoot("src")});
+        // kcov makes its output folder but not the parents, and a fresh checkout
+        // has no zig-out/ yet.
+        const mkdir = b.addSystemCommand(&.{ "mkdir", "-p", b.getInstallPath(.prefix, "") });
+        mkdir.has_side_effects = true;
         const merge = b.addSystemCommand(&.{ kcov, "--merge", out_dir });
         const cov_unit = b.addTest(.{ .name = "cov-unit", .root_module = root_module, .use_llvm = true });
         const cov_e2e = b.addTest(.{ .name = "cov-e2e", .use_llvm = true, .root_module = b.createModule(.{
@@ -94,6 +98,7 @@ pub fn build(b: *std.Build) void {
             const run = b.addSystemCommand(&.{ kcov, include, dir });
             run.addArtifactArg(t);
             run.has_side_effects = true;
+            run.step.dependOn(&mkdir.step);
             merge.addArg(dir);
             merge.step.dependOn(&run.step);
         }
