@@ -151,7 +151,8 @@ pub const TableWriter = struct {
         self.tail_at = 0;
     }
 
-    /// Every row and every column, left-aligned: what a pipe or a file receives.
+    /// Every row and every column, left-aligned: what a pipe or a file receives. A null
+    /// is spelled `NULL`, so it is never mistaken for an empty string.
     fn renderPlain(self: *TableWriter, out: *std.Io.Writer) !void {
         const gpa = self.gpa;
         const widths = try gpa.alloc(usize, self.ncols);
@@ -159,7 +160,7 @@ pub const TableWriter = struct {
         for (self.names, 0..) |n, i| widths[i] = displayWidth(n);
         for (0..self.nrows) |r| {
             for (0..self.ncols) |c| {
-                const len = displayWidth(self.cells.items[r * self.ncols + c] orelse "");
+                const len = displayWidth(self.cells.items[r * self.ncols + c] orelse "NULL");
                 if (len > widths[c]) widths[c] = len;
             }
         }
@@ -176,7 +177,7 @@ pub const TableWriter = struct {
         for (0..self.nrows) |r| {
             for (0..self.ncols) |c| {
                 if (c > 0) try out.writeAll("  ");
-                try padded(out, self.cells.items[r * self.ncols + c] orelse "", widths[c]);
+                try padded(out, self.cells.items[r * self.ncols + c] orelse "NULL", widths[c]);
             }
             try out.writeByte('\n');
         }
@@ -618,4 +619,21 @@ test "renderFitted: types row, right-aligned numbers, NULL, cut cells, elided ro
     _ = it.next();
     _ = it.next();
     try std.testing.expectEqualStrings("  1  ana      a value that is much longer than forty …    10.5", it.next().?);
+}
+
+test "renderPlain spells a null NULL, so it is never read as an empty string" {
+    const gpa = std.testing.allocator;
+    const fields = [_]types.Schema.Field{
+        .{ .name = "prev", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "empty", .ty = types.Type.init(.string) },
+    };
+    const tw = try TableWriter.open(gpa, .{ .fields = &fields });
+    defer tw.deinit();
+    try tw.cells.appendSlice(&.{ null, try gpa.dupe(u8, "") });
+    tw.nrows = 1;
+
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try tw.renderPlain(&w);
+    try std.testing.expectEqualStrings("prev  empty\n----  -----\nNULL       \n(1 row)\n", w.buffered());
 }
