@@ -43,12 +43,12 @@ test "sql: an aggregate refuses a second argument instead of dropping it" {
     _ = try parseSource(a, "SELECT COUNT(*) AS a, COUNT(DISTINCT x) AS b, SUM(x) AS c FROM 'in.csv';", &diag);
 }
 
-test "sql: an aggregate with no window form says so before OVER" {
+test "sql: an aggregate or a function with no window form says so before OVER" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    inline for (.{ "median", "stddev" }) |f| {
+    inline for (.{ "median", "stddev", "first_value", "nth_value", "ntile", "percent_rank" }) |f| {
         try testing.expectError(error.ParseFailed, parseSource(a, "SELECT g, " ++ f ++ "(x) OVER (PARTITION BY g) AS s FROM 'in.csv';", &diag));
         try testing.expect(std.mem.startsWith(u8, diag.msg, "`" ++ f ++ "` is not a window function"));
         try testing.expectEqual(@as(u32, 11), diag.col);

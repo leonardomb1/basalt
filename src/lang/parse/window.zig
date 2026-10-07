@@ -2,7 +2,6 @@
 
 const Parser = @import("../sql_parser.zig").Parser;
 const Error = @import("../sql_parser.zig").Error;
-const aggFunc = @import("../sql_parser.zig").aggFunc;
 const ast = @import("../ast.zig");
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const std = @import("std");
@@ -18,10 +17,9 @@ pub fn parseWindowItem(
 ) Error!bool {
     if (!self.at(.ident)) return false;
     const kind: ast.WinKind = blk: {
-        var buf: [16]u8 = undefined;
+        var buf: [64]u8 = undefined;
         const t = self.cur().text;
-        if (t.len >= buf.len) return false;
-        const low = std.ascii.lowerString(buf[0..t.len], t);
+        const low = if (t.len <= buf.len) std.ascii.lowerString(buf[0..t.len], t) else t;
         if (std.mem.eql(u8, low, "row_number")) break :blk .row_number;
         if (std.mem.eql(u8, low, "rank")) break :blk .rank;
         if (std.mem.eql(u8, low, "dense_rank")) break :blk .dense_rank;
@@ -32,7 +30,7 @@ pub fn parseWindowItem(
         if (std.mem.eql(u8, low, "min")) break :blk .min;
         if (std.mem.eql(u8, low, "max")) break :blk .max;
         if (std.mem.eql(u8, low, "avg")) break :blk .avg;
-        if (aggFunc(low) != null and self.peekTag() == .lparen and self.overFollows(self.i))
+        if (self.peekTag() == .lparen and self.overFollows(self.i))
             return self.fail(self.curPos(), "`{s}` is not a window function — over a window, basalt computes sum, count, min, max, avg, row_number, rank, dense_rank, lag and lead", .{low});
         return false;
     };
