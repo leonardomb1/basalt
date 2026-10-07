@@ -322,3 +322,21 @@ test "window SUM over a DECIMAL is an exact DECIMAL in every frame, as the SUM a
         try std.testing.expectEqualStrings(c[1], got);
     }
 }
+
+test "window columns come out where the SELECT list puts them, beside *, t.* or other items" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const input = "v,t\n1,a\n2,b\n";
+    const cases = [_][2][]const u8{
+        .{ "SELECT v, LAG(v) OVER (ORDER BY v) AS prev, t FROM '$IN' ORDER BY v", "v,prev,t\n1,,a\n2,1,b\n" },
+        .{ "SELECT ROW_NUMBER() OVER (ORDER BY v) AS rn, v * 2 AS dbl FROM '$IN' ORDER BY rn", "rn,dbl\n1,2\n2,4\n" },
+        .{ "SELECT ROW_NUMBER() OVER (ORDER BY v) AS rn, * FROM '$IN' ORDER BY rn", "rn,v,t\n1,1,a\n2,2,b\n" },
+        .{ "SELECT x.*, ROW_NUMBER() OVER (ORDER BY v) AS rn FROM '$IN' x ORDER BY rn", "v,t,rn\n1,a,1\n2,b,2\n" },
+    };
+    for (cases) |c| {
+        const got = try runToString(alloc, &tmp, input, c[0]);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c[1], got);
+    }
+}

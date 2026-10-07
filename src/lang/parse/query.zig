@@ -339,9 +339,12 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     var win_part = std.array_list.Managed(ast.QualName).init(self.arena);
     var win_ord = std.array_list.Managed(ast.SortKey).init(self.arena);
     var win_outs = std.array_list.Managed([]const u8).init(self.arena);
+    // Where each window item stood among the others, so its column comes back there.
+    var win_raw_at = std.array_list.Managed(usize).init(self.arena);
     while (true) {
         if (try self.parseWindowItem(&win_funcs, &win_part, &win_ord)) {
             try win_outs.append(win_funcs.items[win_funcs.items.len - 1].out);
+            try win_raw_at.append(raw_items.items.len);
             if (!self.eat(.comma)) break;
             continue;
         }
@@ -732,12 +735,15 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     if (distinct_on) |on| for (on) |*k| {
         k.* = stripQual(k.*, &aliases);
     };
-    for (raw_items.items) |ri| {
+    const post_before = try self.arena.alloc(usize, raw_items.items.len + 1);
+    for (raw_items.items, 0..) |ri, ri_at| {
+        post_before[ri_at] = post.items.len;
         switch (ri) {
             .qstar => |alias| {
                 if (!aliases.has(alias))
                     return self.fail(pos, "unknown alias `{s}` in `{s}.*`", .{ alias, alias });
                 try items.append(.star);
+                try post.append(.star);
                 star_count += 1;
             },
             .item => |it| switch (it) {
@@ -786,6 +792,8 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             },
         }
     }
+
+    post_before[raw_items.items.len] = post.items.len;
 
     if (aggs.items.len > 0 or group.len > 0) {
         if (aggs.items.len == 0)
@@ -919,12 +927,17 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             .order_by = try win_ord.toOwnedSlice(),
         } }, .hints = &.{}, .pos = pos });
         var out_items = std.array_list.Managed(ast.SelectItem).init(self.arena);
-        for (post.items) |it| try out_items.append(switch (it) {
-            .star => .{ .star_except = win_outs.items },
-            .star_except => |ex| .{ .star_except = try std.mem.concat(self.arena, []const u8, &.{ ex, win_outs.items }) },
-            else => it,
-        });
-        for (win_outs.items) |name| try out_items.append(.{ .field = try self.singleName(name) });
+        for (0..post.items.len + 1) |at| {
+            for (win_outs.items, win_raw_at.items) |name, raw_at| {
+                if (post_before[raw_at] == at) try out_items.append(.{ .field = try self.singleName(name) });
+            }
+            if (at == post.items.len) break;
+            try out_items.append(switch (post.items[at]) {
+                .star => .{ .star_except = win_outs.items },
+                .star_except => |ex| .{ .star_except = try std.mem.concat(self.arena, []const u8, &.{ ex, win_outs.items }) },
+                else => post.items[at],
+            });
+        }
         try stages.append(.{ .node = .{ .select = try out_items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
         if (distinct) try stages.append(.{ .node = .{ .distinct = .{ .on = distinct_on } }, .hints = &.{}, .pos = pos });
     }
