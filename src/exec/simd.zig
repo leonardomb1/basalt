@@ -50,19 +50,32 @@ pub fn minF(a: []const f64) f64 {
     return m;
 }
 
-/// Max of a non-empty slice with no null lanes, whose 0 would corrupt it.
+/// Max of a non-empty slice with no null lanes, whose 0 would corrupt it. A NaN is
+/// the largest value, as a sort places it, so one makes the max NaN; `@max` alone
+/// would skip it, as IEEE `maxNum` does.
 pub fn maxF(a: []const f64) f64 {
     const L = lanes(f64);
     var i: usize = 0;
     var m: f64 = a[0];
+    var nan = false;
     if (L > 1 and a.len >= L) {
         const V = @Vector(L, f64);
+        const B = @Vector(L, bool);
         var acc: V = @splat(a[0]);
-        while (i + L <= a.len) : (i += L) acc = @max(acc, @as(V, a[i..][0..L].*));
+        var seen: B = @splat(false);
+        while (i + L <= a.len) : (i += L) {
+            const v: V = a[i..][0..L].*;
+            acc = @max(acc, v);
+            seen = @select(bool, v != v, @as(B, @splat(true)), seen);
+        }
         m = @reduce(.Max, acc);
+        nan = @reduce(.Or, seen);
     }
-    while (i < a.len) : (i += 1) m = @max(m, a[i]);
-    return m;
+    while (i < a.len) : (i += 1) {
+        m = @max(m, a[i]);
+        if (std.math.isNan(a[i])) nan = true;
+    }
+    return if (nan or std.math.isNan(m)) std.math.nan(f64) else m;
 }
 
 /// Set bits among the first `n` of a validity bitmap, popcounted a 64-bit word at
@@ -115,6 +128,20 @@ test "minF/maxF" {
     const one = [_]f64{42};
     try testing.expectEqual(@as(f64, 42), minF(&one));
     try testing.expectEqual(@as(f64, 42), maxF(&one));
+}
+
+test "maxF is NaN when any value is, as a sort places NaN last; minF skips NaN unless all are" {
+    const L = lanes(f64);
+    var a: [2 * L + 1]f64 = undefined;
+    for ([_]usize{ 0, 1, L, a.len - 1 }) |at| {
+        for (&a, 0..) |*x, i| x.* = @floatFromInt(i);
+        a[at] = std.math.nan(f64);
+        try testing.expect(std.math.isNan(maxF(&a)));
+        try testing.expectEqual(@as(f64, if (at == 0) 1 else 0), minF(&a));
+    }
+    @memset(&a, std.math.nan(f64));
+    try testing.expect(std.math.isNan(minF(&a)));
+    try testing.expect(std.math.isNan(maxF(&a)));
 }
 
 test "minF/maxF honor extremes in the scalar tail at odd lengths" {
