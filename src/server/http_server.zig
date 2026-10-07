@@ -436,7 +436,9 @@ fn handleConn(gpa: std.mem.Allocator, routes: []const Route, conn: std.net.Serve
 
         var params = std.array_list.Managed(runtime.ParamArg).init(gpa);
         defer params.deinit();
-        try parseQuery(&params, query);
+        var query_arena = std.heap.ArenaAllocator.init(gpa);
+        defer query_arena.deinit();
+        try parseQuery(query_arena.allocator(), &params, query);
 
         var hdrs = std.array_list.Managed(std.http.Header).init(gpa);
         defer hdrs.deinit();
@@ -550,14 +552,33 @@ fn dropLetParams(params: *std.array_list.Managed(runtime.ParamArg), program: ast
     }
 }
 
-/// Parse a `k=v&k2=v2` query string into params, with no percent-decoding.
-fn parseQuery(params: *std.array_list.Managed(runtime.ParamArg), query: []const u8) !void {
+/// Parse a `k=v&k2=v2` query string into params, each side decoded as a browser or
+/// a form encodes it: `%XX` is that byte and `+` a space (`%2B` is a plus).
+fn parseQuery(arena: std.mem.Allocator, params: *std.array_list.Managed(runtime.ParamArg), query: []const u8) !void {
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
         if (pair.len == 0) continue;
         const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-        try params.append(.{ .key = pair[0..eq], .val = pair[eq + 1 ..] });
+        try params.append(.{ .key = try decodeQueryPart(arena, pair[0..eq]), .val = try decodeQueryPart(arena, pair[eq + 1 ..]) });
     }
+}
+
+/// A `%` not followed by two hex digits is kept as written.
+fn decodeQueryPart(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    if (std.mem.indexOfAny(u8, s, "%+") == null) return s;
+    var out = try std.array_list.Managed(u8).initCapacity(arena, s.len);
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '+') {
+            out.appendAssumeCapacity(' ');
+        } else if (s[i] == '%' and i + 2 < s.len) {
+            if (std.fmt.parseInt(u8, s[i + 1 .. i + 3], 16)) |b| {
+                out.appendAssumeCapacity(b);
+                i += 2;
+            } else |_| out.appendAssumeCapacity('%');
+        } else out.appendAssumeCapacity(s[i]);
+    }
+    return out.items;
 }
 
 fn attrToStr(e: *const ast.Expr) []const u8 {
@@ -786,21 +807,24 @@ test "findRoute matches exact paths only" {
     try std.testing.expect(findRoute(&routes, "/") == null);
 }
 
-test "parseQuery binds k=v pairs and skips malformed ones" {
-    const gpa = std.testing.allocator;
-    var params = std.array_list.Managed(runtime.ParamArg).init(gpa);
-    defer params.deinit();
-    try parseQuery(&params, "a=1&b=x%20y&novalue&&c=");
-    try std.testing.expectEqual(@as(usize, 3), params.items.len);
-    try std.testing.expectEqualStrings("a", params.items[0].key);
-    try std.testing.expectEqualStrings("1", params.items[0].val);
-    try std.testing.expectEqualStrings("b", params.items[1].key);
-    try std.testing.expectEqualStrings("x%20y", params.items[1].val);
-    try std.testing.expectEqualStrings("c", params.items[2].key);
-    try std.testing.expectEqualStrings("", params.items[2].val);
+test "parseQuery binds k=v pairs, decodes each side as a form encodes it, and skips malformed pairs" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var params = std.array_list.Managed(runtime.ParamArg).init(a);
+    try parseQuery(a, &params, "a=1&b=x%20y&novalue&&c=&city=S%C3%A3o+Paulo&q=1%2B1&n%61me=v&bad=%zz%4");
+    const want = [_][2][]const u8{
+        .{ "a", "1" },   .{ "b", "x y" },  .{ "c", "" },        .{ "city", "S\u{e3}o Paulo" },
+        .{ "q", "1+1" }, .{ "name", "v" }, .{ "bad", "%zz%4" },
+    };
+    try std.testing.expectEqual(want.len, params.items.len);
+    for (want, params.items) |w, got| {
+        try std.testing.expectEqualStrings(w[0], got.key);
+        try std.testing.expectEqualStrings(w[1], got.val);
+    }
 
     params.clearRetainingCapacity();
-    try parseQuery(&params, "");
+    try parseQuery(a, &params, "");
     try std.testing.expectEqual(@as(usize, 0), params.items.len);
 }
 
@@ -817,7 +841,7 @@ test "dropLetParams: a query string cannot bind a sealed LET" {
     , &diag);
 
     var params = std.array_list.Managed(runtime.ParamArg).init(a);
-    try parseQuery(&params, "tenant=acme&cutoff=999");
+    try parseQuery(a, &params, "tenant=acme&cutoff=999");
     dropLetParams(&params, prog);
     try std.testing.expectEqual(@as(usize, 1), params.items.len);
     try std.testing.expectEqualStrings("tenant", params.items[0].key);

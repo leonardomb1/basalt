@@ -24,7 +24,9 @@ PARAM tenant STRING FROM HEADER('X-Tenant');
   and a `DECIMAL(10,2)` rounds `12.345` to `12.35`. Text that is not one fails
   the run, and `check`, naming the param and the value. `DECIMAL` alone is
   `DECIMAL(38,0)`; `DECIMAL(p)` without a scale is refused.
-- Source defaults: scalars bind from the query string, `JSON` from the body.
+- Source defaults: scalars bind from the query string, `JSON` from the body. A
+  query-string value is decoded as a browser or a form encodes it: `%C3%A3` is
+  `ã`, `+` is a space and `%2B` a plus.
   `FROM QUERY`, `FROM BODY` and `FROM HEADER('X-Name')` say so explicitly; a
   bare `FROM HEADER` reads the header named like the param.
 
