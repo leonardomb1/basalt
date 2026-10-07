@@ -1,0 +1,60 @@
+name: Coverage
+
+# Line coverage of src/ by the unit and end-to-end tests, measured with kcov. The
+# per-folder table goes to the run's summary, and the report to Codecov, which
+# keeps the trend, the badge and each pull request's coverage of changed lines.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-zig
+
+      - name: Install kcov
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y kcov
+
+      - name: Measure
+        run: zig build coverage 2>&1 | tee coverage.txt
+
+      - name: Summary
+        run: |
+          {
+            echo '### Line coverage of src/'
+            echo '```'
+            grep -E '^  (src/|total)' coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: codecov/codecov-action@v5
+        with:
+          files: zig-out/coverage/kcov-merged/cobertura.xml
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false

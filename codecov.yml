@@ -1,0 +1,15 @@
+# Coverage is reported, not enforced: a drop shows on the pull request without
+# failing it. Test helpers that live under src/ are not product code.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+ignore:
+  - "src/**/testing_util.zig"
+  - "src/**/tests*.zig"
+  - "src/**/fuzzutil.zig"
