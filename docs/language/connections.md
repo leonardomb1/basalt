@@ -9,7 +9,7 @@ CREATE CONNECTION erp TYPE sqlserver OPTIONS (
 ```
 
 The connection types are `postgres`, `mysql`, `sqlserver`, `starrocks`,
-`doris`, `http`, `sftp` and `smb`; any other `TYPE` is a plan-time error.
+`doris`, `http`, `sftp`, `smb` and `ftp`; any other `TYPE` is a plan-time error.
 
 - `postgres`, `mysql`, `sqlserver`: `host port database user password tls`
   (`off`, `require` or `insecure`). `sqlserver` adds `auth` (`sql`, the default;
@@ -18,8 +18,9 @@ The connection types are `postgres`, `mysql`, `sqlserver`, `starrocks`,
 - `starrocks` and `doris`: `fe_host`/`host`, `fe_port`/`port`, `user`
   `password`, a required `database`, and for loading `be_url` (also `load_url`)
   `buckets replication_num auto_create label_prefix`.
-- `http`, `sftp` and `smb` have pages of their own: [HTTP APIs](../connectors/http.md),
-  [SFTP](../connectors/sftp.md) and [SMB file shares](../connectors/smb.md); the
+- `http`, `sftp`, `smb` and `ftp` have pages of their own: [HTTP APIs](../connectors/http.md),
+  [SFTP](../connectors/sftp.md), [SMB file shares](../connectors/smb.md) and
+  [FTP](../connectors/ftp.md); the
   databases' particulars are under [SQL databases](../connectors/databases.md).
 
 ## Credentials

@@ -9,6 +9,7 @@ const ast = @import("../../lang/ast.zig");
 const csv = @import("../../format/csv.zig");
 const fail = @import("../analyze.zig").fail;
 const folder = @import("../../connect/folder.zig");
+const ftp = @import("../../store/ftp.zig");
 const pqdecode = @import("../../format/parquet/read.zig");
 const pqwrite = @import("../../format/parquet/write.zig");
 const std = @import("std");
@@ -148,7 +149,7 @@ pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
 /// `online`.
 pub fn archiveProblem(arena: std.mem.Allocator, path: []const u8, explicit: ?FileFormat, online: bool) ?[]const u8 {
     const ar = csv.splitArchive(path) orelse return null;
-    if (!online and csv.CsvReader.isUrl(ar.archive)) {
+    if (!online and (csv.CsvReader.isUrl(ar.archive) or ftp.isUrl(ar.archive))) {
         const m = ar.member orelse return null;
         return memberProblem(arena, m, explicit);
     }
@@ -234,7 +235,7 @@ pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.
         return .{ .fields = fields };
     }
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
-        if (csv.CsvReader.isUrl(rd.form.path)) return null;
+        if (csv.CsvReader.isUrl(rd.form.path) or ftp.isUrl(rd.form.path)) return null;
         if (folder.isFolder(rd.form.path)) {
             var fdiag = Diag{};
             const explicit = formatFromHints(hints, &fdiag) catch return null;

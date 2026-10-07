@@ -42,6 +42,7 @@
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
 const expand = @import("../lang/expand.zig");
+const ftp = @import("../store/ftp.zig");
 const types = @import("../lang/types.zig");
 const op = @import("../exec/op.zig");
 const Batch = @import("../exec/batch.zig").Batch;
@@ -96,6 +97,7 @@ const buildParallelSink = @import("connect.zig").buildParallelSink;
 const dupeSchema = @import("connect.zig").dupeSchema;
 const guardFileFormat = @import("connect.zig").guardFileFormat;
 const registerSftp = @import("connect.zig").registerSftp;
+const registerFtp = @import("connect.zig").registerFtp;
 const registerSmb = @import("connect.zig").registerSmb;
 const isLocalCsvRead = @import("connect.zig").isLocalCsvRead;
 const isLocalParquetRead = @import("connect.zig").isLocalParquetRead;
@@ -150,6 +152,16 @@ const runThrow = @import("script.zig").runThrow;
 pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions, diag: *Diag) !Stats {
     var opts = opts_in;
     if (opts.explain) opts.threads = 1;
+    ftp.beginRun();
+    defer {
+        if (diag.msg.len > 0) {
+            var tmp: [diag.buf.len]u8 = undefined;
+            const m = ftp.unlocalize(&tmp, diag.msg);
+            @memcpy(diag.buf[0..m.len], m);
+            diag.msg = diag.buf[0..m.len];
+        }
+        ftp.endRun();
+    }
 
     var plan_arena = std.heap.ArenaAllocator.init(gpa);
     defer plan_arena.deinit();
@@ -244,6 +256,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     while (cit.next()) |c| {
         try registerSftp(&env, c.*);
         try registerSmb(&env, c.*);
+        try registerFtp(&env, c.*);
     }
 
     var batch_arena = std.heap.ArenaAllocator.init(gpa);
@@ -407,6 +420,7 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
             try env.connections.put(c.name, c);
             try registerSftp(env, c);
             try registerSmb(env, c);
+            try registerFtp(env, c);
         },
         .let_const => |l| {
             const e = planErr(env.diag, try std.fmt.allocPrint(env.arena, "LET `{s}` must be declared at the top level of the script", .{l.name}));

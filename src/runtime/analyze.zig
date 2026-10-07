@@ -57,6 +57,7 @@ const s3 = @import("../store/s3.zig");
 const zipsrc = @import("../format/zipsrc.zig");
 const xlsx = @import("../format/xlsx.zig");
 const folder = @import("../connect/folder.zig");
+const ftp = @import("../store/ftp.zig");
 const registry = @import("../connect/registry.zig");
 const body_stmt_rule = @import("env.zig").body_stmt_rule;
 const env_mod = @import("env.zig");
@@ -1044,6 +1045,8 @@ const Ctx = struct {
 pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!void {
     if (s3.bucketNameError(w.target)) |why|
         return fail(diag, "`{s}` is not a valid S3 target: {s}", .{ w.target, why });
+    if (ftp.isUrl(w.target))
+        return fail(diag, "cannot write `{s}`: basalt reads from FTP but does not write to it; write to `sftp://` or a local file", .{w.target});
     if (std.mem.eql(u8, w.connector, "csv") and w.target.len > 0) {
         const fmt = try formatFromHints(hints, diag);
         if (unwritableTarget(w.target, fmt) orelse unreadableTarget(w.target, fmt)) |why|
@@ -1106,7 +1109,7 @@ fn containsName(names: []const []const u8, n: []const u8) bool {
     return false;
 }
 
-pub const connection_types = "http, postgres, mysql, sqlserver, starrocks, doris, sftp, smb";
+pub const connection_types = "http, postgres, mysql, sqlserver, starrocks, doris, sftp, smb, ftp";
 
 /// A `CREATE CONNECTION ... TYPE` that names a connector; the built-in sources
 /// (files, `range`, a request body) are never declared.

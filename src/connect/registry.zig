@@ -4,8 +4,9 @@
 //! connector is a compile error at every site that must know about it.
 //!
 //! StarRocks and Doris are read through the MySQL driver and written by HTTP
-//! Stream Load (`streamload.zig`) rather than SQL INSERTs. `sftp` and `smb`
-//! name file stores addressed by path (`sftp://name/…`, `smb://name/…`).
+//! Stream Load (`streamload.zig`) rather than SQL INSERTs. `sftp`, `smb` and
+//! `ftp` name file stores addressed by path (`sftp://name/…`, `smb://name/…`,
+//! `ftp://name/…`).
 
 const std = @import("std");
 const sql = @import("../db/sql.zig");
@@ -50,6 +51,7 @@ pub const Connector = enum {
     doris,
     sftp,
     smb,
+    ftp,
     postgres,
     mysql,
     sqlserver,

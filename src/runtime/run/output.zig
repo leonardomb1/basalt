@@ -22,6 +22,7 @@ const exceptColumns = @import("../connect.zig").exceptColumns;
 const explainTree = @import("explain.zig").explainTree;
 const factsIfWanted = @import("../connect.zig").factsIfWanted;
 const forHintIdent = @import("../env.zig").forHintIdent;
+const ftp = @import("../../store/ftp.zig");
 const guardFileFormat = @import("../connect.zig").guardFileFormat;
 const hasAggregate = @import("../run.zig").hasAggregate;
 const hasFlagHint = @import("../env.zig").hasFlagHint;
@@ -31,6 +32,7 @@ const isFolderRead = @import("../connect.zig").isFolderRead;
 const isLocalCsvRead = @import("../connect.zig").isLocalCsvRead;
 const isLocalParquetRead = @import("../connect.zig").isLocalParquetRead;
 const laneEligible = @import("../lanes.zig").laneEligible;
+const localRead = @import("../connect/source.zig").localRead;
 const mem_connector = @import("../connect.zig").mem_connector;
 const moveLabel = @import("../run.zig").moveLabel;
 const noteLoad = @import("../run.zig").noteLoad;
@@ -215,6 +217,11 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         _ = env.materialized.remove(window_input);
     };
     if (win) |w| stages = w;
+    if (stages[0].node == .read and stages[0].node.read.form == .path and ftp.isUrl(stages[0].node.read.form.path)) {
+        const copy = try env.arena.dupe(ast.Stage, stages);
+        copy[0].node.read = try localRead(env, copy[0].node.read);
+        stages = copy;
+    }
 
     var ddiag = analyze.Diag{};
     env.csv_in = analyze.dialectFromHints(stages[0].hints, &ddiag) catch

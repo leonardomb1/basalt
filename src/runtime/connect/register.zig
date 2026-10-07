@@ -1,8 +1,9 @@
-//! SFTP and SMB connections registered from their options, and how option values
+//! SFTP, SMB and FTP connections registered from their options, and how option values
 //! (literals, env(), secrets) are evaluated.
 
 const Env = @import("../env.zig").Env;
 const ast = @import("../../lang/ast.zig");
+const ftp = @import("../../store/ftp.zig");
 const planErr = @import("../env.zig").planErr;
 const sftp = @import("../../store/sftp.zig");
 const smb = @import("../../store/smb.zig");
@@ -77,6 +78,30 @@ pub fn registerSmb(env: *Env, conn: ast.Connection) !void {
     if (c.auth == .kerberos and c.realm == null and std.mem.indexOfScalar(u8, c.user orelse "", '@') == null)
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "smb connection `{s}`: Kerberos needs the `realm` — the domain's DNS name, as CORP.LOCAL, not its NetBIOS name — or a user written `me@CORP.LOCAL`", .{conn.name}));
     try smb.register(conn.name, c);
+}
+
+/// Without a `user` (or `NAME_USER`) the login is anonymous; an unknown option is
+/// an error naming the known ones.
+pub fn registerFtp(env: *Env, conn: ast.Connection) !void {
+    if (!std.mem.eql(u8, conn.connector, "ftp")) return;
+    var c = ftp.Conn{ .host = "" };
+    for (conn.config) |attr| {
+        const k = attr.key;
+        if (std.mem.eql(u8, k, "port")) {
+            c.port = std.math.cast(u16, try evalCfgInt(env, attr.value)) orelse return planErr(env.diag, "ftp connection `port` is out of range");
+            continue;
+        }
+        const v = optCfgStr(env, attr.value) catch |e| return e;
+        if (std.mem.eql(u8, k, "host")) {
+            c.host = v orelse "";
+        } else if (std.mem.eql(u8, k, "user")) {
+            c.user = v;
+        } else if (std.mem.eql(u8, k, "password")) {
+            c.password = v;
+        } else return planErr(env.diag, try std.fmt.allocPrint(env.arena, "ftp connection `{s}`: unknown option `{s}` (host, port, user, password)", .{ conn.name, k }));
+    }
+    if (c.host.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "ftp connection `{s}` needs a `host`", .{conn.name}));
+    try ftp.register(conn.name, c);
 }
 
 fn optCfgStr(env: *Env, expr: *const ast.Expr) !?[]const u8 {

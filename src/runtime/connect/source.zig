@@ -16,6 +16,7 @@ const env_mod = @import("../env.zig");
 const evalCfgStr = @import("register.zig").evalCfgStr;
 const folder = @import("../../connect/folder.zig");
 const forHintName = @import("../env.zig").forHintName;
+const ftp = @import("../../store/ftp.zig");
 const gen = @import("../../connect/gen.zig");
 const guardFileFormat = @import("sink.zig").guardFileFormat;
 const httpAttrUsed = @import("../connect.zig").httpAttrUsed;
@@ -59,6 +60,16 @@ pub const ConstSource = struct {
     pub const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
 };
 
+/// A read of an `ftp://` path as a read of its local copy, downloaded once per run;
+/// any other read unchanged.
+pub fn localRead(env: *Env, rd: ast.Read) !ast.Read {
+    if (rd.form != .path or !ftp.isUrl(rd.form.path)) return rd;
+    var out = rd;
+    out.form = .{ .path = ftp.localize(env.arena, rd.form.path) catch |e|
+        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not download `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) })) };
+    return out;
+}
+
 pub fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
     return openSourceProjected(env, rd, hints, null, &.{});
 }
@@ -67,11 +78,12 @@ pub fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sour
 /// so a top-N bound is pushed only into a pipeline with exactly one of them.
 pub fn openSourceProjected(
     env: *Env,
-    rd: ast.Read,
+    rd_in: ast.Read,
     hints: []const ast.Hint,
     project: ?[][]const u8,
     bounds: []const pqdecode.Bound,
 ) !driver.Source {
+    const rd = try localRead(env, rd_in);
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
         if (try resolveFolder(env, rd.form.path, hints)) |fr| if (fr.kind == .parquet) {
             env.folder_memo = null;

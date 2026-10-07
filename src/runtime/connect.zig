@@ -191,6 +191,7 @@ pub const resolveUpsertKeys = @import("connect/sink.zig").resolveUpsertKeys;
 pub const guardFileFormat = @import("connect/sink.zig").guardFileFormat;
 pub const openSink = @import("connect/sink.zig").openSink;
 pub const registerSftp = @import("connect/register.zig").registerSftp;
+pub const registerFtp = @import("connect/register.zig").registerFtp;
 pub const registerSmb = @import("connect/register.zig").registerSmb;
 
 /// Gates the mmap'd parallel-CSV fast paths; a `.parquet` path shares the `csv`

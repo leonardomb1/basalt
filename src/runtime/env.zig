@@ -31,6 +31,7 @@ const azure = @import("../store/azure.zig");
 const s3 = @import("../store/s3.zig");
 const sftp = @import("../store/sftp.zig");
 const smb = @import("../store/smb.zig");
+const ftp = @import("../store/ftp.zig");
 const analyze = @import("analyze.zig");
 const obs = @import("obs.zig");
 const pushdown = @import("pushdown.zig");
@@ -78,6 +79,7 @@ pub fn isTransient(e: anyerror) bool {
         error.NameServerFailure,
         error.HostLacksNetworkAddresses,
         error.HttpServerBusy,
+        error.FtpServerBusy,
         error.HttpTransportFailed,
         error.ServerClosedConnection,
         error.ConnectionIoFailed,
@@ -494,6 +496,7 @@ fn pathLayer(path: []const u8) []const u8 {
     if (s3.isUrl(path)) return "s3 object";
     if (sftp.isUrl(path)) return "sftp";
     if (smb.isUrl(path)) return "smb";
+    if (ftp.isUrl(path)) return "ftp";
     if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://")) return "http";
     return "local file";
 }
@@ -503,6 +506,8 @@ pub fn pathFail(arena: std.mem.Allocator, path: []const u8, e: anyerror) ![]cons
         return std.fmt.allocPrint(arena, "{s}: {s}: {s}", .{ pathLayer(path), @errorName(e), sftp.lastError() });
     if (smb.isUrl(path)) if (smb.lastError().len > 0)
         return std.fmt.allocPrint(arena, "{s}: {s}: {s}", .{ pathLayer(path), @errorName(e), smb.lastError() });
+    if (ftp.isUrl(path)) if (ftp.lastError().len > 0)
+        return std.fmt.allocPrint(arena, "{s}: {s}: {s}", .{ pathLayer(path), @errorName(e), ftp.lastError() });
     return std.fmt.allocPrint(arena, "{s}: {s}", .{ pathLayer(path), @errorName(e) });
 }
 

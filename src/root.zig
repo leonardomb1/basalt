@@ -41,6 +41,7 @@ pub const xml = @import("format/xml.zig");
 pub const ssh = @import("net/ssh.zig");
 pub const sftp = @import("store/sftp.zig");
 pub const smb = @import("store/smb.zig");
+pub const ftp = @import("store/ftp.zig");
 pub const krb5 = @import("net/krb5.zig");
 pub const spnego = @import("net/spnego.zig");
 pub const deflate = @import("format/deflate.zig");

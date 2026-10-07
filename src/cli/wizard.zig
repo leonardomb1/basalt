@@ -86,6 +86,12 @@ const connectors = [_]Connector{
         .{ .key = "password", .secret = true },
         .{ .key = "share", .hint = "blank to name it in each path" },
     } },
+    .{ .name = "ftp", .blurb = "a plain FTP server (files read as ftp://<name>/path)", .fields = &.{
+        .{ .key = "host" },
+        .{ .key = "port", .default = "21", .int = true },
+        .{ .key = "user", .hint = "blank for anonymous" },
+        .{ .key = "password", .secret = true },
+    } },
     .{ .name = "http", .blurb = "a REST API (paginated sources, an endpoint sink)", .fields = &.{
         .{ .key = "base_url" },
         .{ .key = "auth", .choices = &.{ "none", "bearer", "basic" }, .default = "none", .omit = "none" },

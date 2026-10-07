@@ -35,6 +35,7 @@
 - [SQL databases](connectors/databases.md)
 - [HTTP APIs](connectors/http.md)
 - [SFTP](connectors/sftp.md)
+- [FTP](connectors/ftp.md)
 - [SMB file shares](connectors/smb.md)
 
 # Tools

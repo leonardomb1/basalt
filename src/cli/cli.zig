@@ -222,6 +222,10 @@ fn usage(w: anytype) !void {
         \\  smb        smb://<conn>/<share>/<path> through CREATE CONNECTION <conn> TYPE smb
         \\             (or smb://user@host/share/path), read and written; NTLMv2 or
         \\             Kerberos (realm), every message signed (SMB 2.1 to 3.1.1)
+        \\  ftp        ftp://[user[:pass]@]host/path or ftp://<conn>/path through
+        \\             CREATE CONNECTION <conn> TYPE ftp, read only; anonymous by
+        \\             default; each file is downloaded once per run and read
+        \\             locally, a trailing / a folder with its subfolders
         \\  databases  postgres, mysql, sqlserver, starrocks, doris (CREATE CONNECTION ... TYPE ...)
         \\  http       REST sources and sinks; `request` for an HTTP request body
         \\  buffer     durable WAL buffer, replayed by a later run
