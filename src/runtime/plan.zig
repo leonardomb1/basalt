@@ -496,6 +496,7 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
             for (wd.funcs, kinds, 0..) |f, *out, i| {
                 var ty = types.Type.init(.int);
                 var arg: ?usize = null;
+                var default: Value = .null;
                 switch (f.kind) {
                     .row_number, .rank, .dense_rank => {},
                     .count => {
@@ -515,6 +516,12 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
                         const ai = analyze.fieldIndices(arena, schema, &[_]ast.QualName{q}, &ad) catch |e| return aErr(env, &ad, e);
                         arg = ai[0];
                         ty = schema.fields[ai[0]].ty.asNullable();
+                        if (f.default) |d| {
+                            const v = eval.constEval(arena, try analyze.substExpr(arena, d, env.params_expr), &.{}, &.{}) catch |e|
+                                return planErr(env.diag, try std.fmt.allocPrint(arena, "LAG/LEAD default: {s}", .{op.errLabel(e)}));
+                            default = if (v.isNull()) .null else eval.castValueTyped(arena, v, ty) catch
+                                return planErr(env.diag, try std.fmt.allocPrint(arena, "LAG/LEAD default does not fit `{s}` ({s})", .{ q.last(), try ty.name(arena) }));
+                        }
                     },
                 }
                 out.* = .{
@@ -532,6 +539,7 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
                     },
                     .arg = arg,
                     .offset = f.offset,
+                    .default = default,
                     .frame = .{ .rows = f.frame.rows, .unbounded = f.frame.unbounded, .preceding = f.frame.preceding },
                 };
                 fields[schema.fields.len + i] = .{ .name = f.out, .ty = ty };

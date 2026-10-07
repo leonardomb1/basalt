@@ -1,6 +1,6 @@
 # Window functions
 
-`ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG(col[, n])` / `LEAD(col[, n])`, and
+`ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG(col[, n[, default]])` / `LEAD(col[, n[, default]])`, and
 `SUM(col)` / `COUNT(*|col)` / `MIN(col)` / `MAX(col)` / `AVG(col)` over `PARTITION BY` /
 `ORDER BY`:
 
@@ -53,9 +53,10 @@ FROM 'movimentos.csv';
   `FOLLOWING` end bound is not accepted; the frame always ends at the current row.
 - A frame applies to an aggregate. `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG` and `LEAD`
   do not take one, and writing one is an error rather than being ignored.
-- `LAG`/`LEAD` read a plain column and an optional literal offset (default 1). Looking
-  past the edge of the row's own partition yields **null** — there is no third
-  `default` argument — so the column is always nullable.
+- `LAG`/`LEAD` read a plain column, an optional literal offset (default 1) and an
+  optional default: looking past the edge of the row's own partition yields the
+  default, cast to the column's type (`LAG(amount, 1, 0)`), or **null** without one.
+  The default is a constant — a literal, a `$param` or an expression over them.
 
 Because a window function cannot sit inside an expression, compose one by wrapping it in
 a derived table. Change detection reads:

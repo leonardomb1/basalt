@@ -317,7 +317,8 @@ pub const Stage = struct {
 };
 
 pub const WinKind = enum { row_number, rank, dense_rank, lag, lead, sum, count, min, max, avg };
-pub const WindowFunc = struct { kind: WinKind, out: []const u8, arg: ?QualName = null, offset: i64 = 1, frame: WinFrame = .{} };
+/// `default` is LAG/LEAD's third argument, the value past the partition's edge.
+pub const WindowFunc = struct { kind: WinKind, out: []const u8, arg: ?QualName = null, offset: i64 = 1, default: ?*Expr = null, frame: WinFrame = .{} };
 pub const WinFrame = struct { rows: bool = false, unbounded: bool = false, preceding: i64 = 0 };
 
 pub const Window = struct {

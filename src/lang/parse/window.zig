@@ -40,6 +40,7 @@ pub fn parseWindowItem(
     _ = self.advance();
     var arg: ?ast.QualName = null;
     var offset: i64 = 1;
+    var default: ?*ast.Expr = null;
     if (kind == .sum or kind == .count or kind == .min or kind == .max or kind == .avg) {
         if (self.eat(.star)) {
             if (kind != .count) {
@@ -61,6 +62,7 @@ pub fn parseWindowItem(
                 return self.fail(self.curPos(), "LAG/LEAD offset must be an integer", .{});
             if (offset < 0)
                 return self.fail(self.curPos(), "LAG/LEAD offset must not be negative — use the other function", .{});
+            if (self.eat(.comma)) default = try self.parseExpr();
         }
     }
     if (!self.eat(.rparen) or !self.isKw("over")) return self.notWindow(save);
@@ -135,7 +137,7 @@ pub fn parseWindowItem(
         return self.fail(wpos, "a window function needs ORDER BY inside OVER (...) to number by", .{});
 
     const name = (try self.itemAlias()) orelse @tagName(kind);
-    try funcs.append(.{ .kind = kind, .out = name, .arg = arg, .offset = offset, .frame = this_frame });
+    try funcs.append(.{ .kind = kind, .out = name, .arg = arg, .offset = offset, .default = default, .frame = this_frame });
     return true;
 }
 

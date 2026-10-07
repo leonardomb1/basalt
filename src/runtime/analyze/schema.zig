@@ -2,6 +2,7 @@
 //! windows, explodes and joins, with the errors a mistyped stage gets at check time.
 
 const Diag = @import("../analyze.zig").Diag;
+const eval = @import("../../exec/eval.zig");
 const Error = @import("../analyze.zig").Error;
 const ParamMap = std.StringHashMap(*const ast.Expr);
 const aggregates = @import("../../lang/aggregates.zig");
@@ -157,9 +158,40 @@ pub fn windowSchema(arena: std.mem.Allocator, in: types.Schema, wd: ast.Window, 
     for (wd.funcs, 0..) |f, i| {
         var src = types.Type.init(.int);
         if (f.arg) |q| src = in.fields[(try fieldIndices(arena, in, &[_]ast.QualName{q}, diag))[0]].ty;
+        if (f.default) |d| if (f.arg) |q| try checkLagDefault(arena, d, q, src, diag);
         fields[in.fields.len + i] = .{ .name = f.out, .ty = windowFuncType(f.kind, src) };
     }
     return .{ .fields = fields };
+}
+
+/// A literal LAG/LEAD default must fit its column, as the run requires; one over
+/// `$params` is left to the run, which knows their values.
+fn checkLagDefault(arena: std.mem.Allocator, d: *const ast.Expr, q: ast.QualName, ty: types.Type, diag: *Diag) Error!void {
+    if (try exprHasDollar(arena, d)) return;
+    const v = eval.constEval(arena, d, &.{}, &.{}) catch |e| {
+        if (e == error.OutOfMemory) return error.OutOfMemory;
+        return fail(diag, "LAG/LEAD default: {s}", .{@import("../env.zig").errLabel(e)});
+    };
+    if (v.isNull()) return;
+    _ = eval.castValueTyped(arena, v, ty.asNullable()) catch
+        return fail(diag, "LAG/LEAD default does not fit `{s}` ({s})", .{ q.last(), try ty.name(arena) });
+}
+
+fn exprHasDollar(arena: std.mem.Allocator, e: *const ast.Expr) Error!bool {
+    var found = false;
+    const Walk = struct {
+        arena: std.mem.Allocator,
+        found: *bool,
+        fn recur(w: @This(), x: *const ast.Expr) Error!*ast.Expr {
+            if (x.* == .field) {
+                if (x.field.dollar) w.found.* = true;
+                return @constCast(x);
+            }
+            return ast.rebuildExpr(w.arena, x, w, recur);
+        }
+    };
+    _ = try Walk.recur(.{ .arena = arena, .found = &found }, e);
+    return found;
 }
 
 pub const ExplodePlan = struct { idx: usize, schema: types.Schema };

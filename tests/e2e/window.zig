@@ -340,3 +340,16 @@ test "window columns come out where the SELECT list puts them, beside *, t.* or 
         try std.testing.expectEqualStrings(c[1], got);
     }
 }
+
+test "LAG and LEAD take a default for the rows past the partition's edge, cast to the column's type" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const got = try runToString(alloc, &tmp, "g,v\na,1.50\na,2.25\nb,4.00\n",
+        \\SELECT g, d, LAG(d, 1, 0) OVER (PARTITION BY g ORDER BY d) AS prev,
+        \\       LEAD(d, 1, -1) OVER (PARTITION BY g ORDER BY d) AS nxt
+        \\FROM (SELECT g, CAST(v AS DECIMAL(10,2)) AS d FROM '$IN') x ORDER BY g, d
+    );
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("g,d,prev,nxt\na,1.50,0.00,2.25\na,2.25,1.50,-1.00\nb,4.00,0.00,-1.00\n", got);
+}

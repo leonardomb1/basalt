@@ -67,7 +67,7 @@ pub const Window = struct {
     pub const Frame = struct { rows: bool = false, unbounded: bool = false, preceding: i64 = 0 };
 
     pub const Kind = enum { row_number, rank, dense_rank, lag, lead, sum, count, min, max, avg };
-    pub const Func = struct { kind: Kind, arg: ?usize = null, offset: i64 = 1, frame: Frame = .{} };
+    pub const Func = struct { kind: Kind, arg: ?usize = null, offset: i64 = 1, default: Value = .null, frame: Frame = .{} };
 
     fn sameOn(arrs: []const KeyArr, a: usize, b: usize) bool {
         for (arrs) |k| {
@@ -251,7 +251,7 @@ pub const Window = struct {
                     for (idx, 0..) |_, k| {
                         const target = @as(i64, @intCast(k)) + dir;
                         if (target < @as(i64, @intCast(pstart[k])) or target >= @as(i64, @intCast(pend[k]))) {
-                            out.*[k] = .null;
+                            out.*[k] = f.default;
                         } else {
                             out.*[k] = all.columns[f.arg.?].getValue(idx[@intCast(target)]);
                         }
