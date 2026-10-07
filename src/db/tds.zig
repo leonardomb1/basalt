@@ -1250,31 +1250,36 @@ fn decodeValue(arena: std.mem.Allocator, d: ColumnDesc, bytes: []const u8) !Valu
         .int => .{ .int = readIntLE(bytes) },
         .bool => .{ .bool = bytes.len > 0 and bytes[0] != 0 },
         .float => .{ .float = if (bytes.len == 4) @as(f64, @as(f32, @bitCast(@as(u32, @truncate(readULE(bytes)))))) else @bitCast(readULE(bytes)) },
-        .decimal => if (d.is_money) decodeMoney(bytes) else decodeDecimal(d, bytes),
+        .decimal => if (d.is_money) try decodeMoney(bytes) else try decodeDecimal(d, bytes),
         .string => .{ .string = if (d.is_guid) try formatGuid(arena, bytes) else if (d.is_binary) try bytesToHex(arena, bytes) else if (d.is_unicode) try utf16ToUtf8(arena, bytes) else try win1252ToUtf8(arena, bytes) },
         .bytes => .{ .bytes = try arena.dupe(u8, bytes) },
         .date => if (std.math.cast(i32, @as(i64, @bitCast(readULE(bytes))) - 719162)) |days|
             .{ .date = days }
         else
             .null,
-        .time => .{ .time = decodeTime(d, bytes) },
-        .timestamp => .{ .timestamp = decodeDateTime(d, bytes) },
+        .time => .{ .time = try decodeTime(d, bytes) },
+        .timestamp => .{ .timestamp = try decodeDateTime(d, bytes) },
         else => .{ .string = try arena.dupe(u8, bytes) },
     };
 }
 
-fn decodeDecimal(d: ColumnDesc, bytes: []const u8) Value {
-    if (bytes.len < 1) return .null;
-    const positive = bytes[0] == 1;
-    var mag: i128 = 0;
-    for (bytes[1..], 0..) |b, k| {
-        if (k >= 16) break;
-        mag |= @as(i128, b) << @intCast(k * 8);
+/// A value body whose length its type cannot have. It fails the read rather than
+/// decoding to a plausible wrong value (a cut-off decimal, a 1970 date).
+const MalformedValue = error{MalformedTdsValue};
+
+/// DECIMALN: a sign byte, then a 4, 8, 12 or 16-byte little-endian magnitude.
+fn decodeDecimal(d: ColumnDesc, bytes: []const u8) MalformedValue!Value {
+    switch (bytes.len) {
+        5, 9, 13, 17 => {},
+        else => return error.MalformedTdsValue,
     }
-    return .{ .decimal = .{ .unscaled = if (positive) mag else -mag, .scale = d.scale } };
+    var mag: u128 = 0;
+    for (bytes[1..], 0..) |b, k| mag |= @as(u128, b) << @intCast(k * 8);
+    const m = std.math.cast(i128, mag) orelse return error.MalformedTdsValue;
+    return .{ .decimal = .{ .unscaled = if (bytes[0] == 1) m else -m, .scale = d.scale } };
 }
 
-fn decodeMoney(bytes: []const u8) Value {
+fn decodeMoney(bytes: []const u8) MalformedValue!Value {
     const unscaled: i64 = switch (bytes.len) {
         4 => std.mem.readInt(i32, bytes[0..4], .little),
         8 => blk: {
@@ -1282,47 +1287,47 @@ fn decodeMoney(bytes: []const u8) Value {
             const lo: u64 = std.mem.readInt(u32, bytes[4..8], .little);
             break :blk @bitCast((hi << 32) | lo);
         },
-        else => return .null,
+        else => return error.MalformedTdsValue,
     };
     return .{ .decimal = .{ .unscaled = unscaled, .scale = 4 } };
 }
 
 /// TIMENTYPE: 3-5 little-endian bytes counting 10^-scale seconds since midnight.
-fn decodeTime(d: ColumnDesc, bytes: []const u8) i64 {
+fn decodeTime(d: ColumnDesc, bytes: []const u8) MalformedValue!i64 {
+    if (bytes.len < 3 or bytes.len > 5) return error.MalformedTdsValue;
     var tu: i64 = 0;
-    for (bytes, 0..) |b, k| {
-        if (k >= 5) break;
-        tu |= @as(i64, b) << @intCast(k * 8);
-    }
+    for (bytes, 0..) |b, k| tu |= @as(i64, b) << @intCast(k * 8);
     return @divTrunc(tu * 1_000_000, pow10(d.scale));
 }
 
-fn decodeDateTime(d: ColumnDesc, bytes: []const u8) i64 {
+/// DATETIME2/DATETIMEOFFSET: 3-5 bytes of time, 3 of date (and 2 of offset);
+/// DATETIME: 8 bytes; SMALLDATETIME: 4.
+fn decodeDateTime(d: ColumnDesc, bytes: []const u8) MalformedValue!i64 {
     switch (d.tds_type) {
         0x2A, 0x2B => {
             const off_bytes: usize = if (d.tds_type == 0x2B) 2 else 0;
-            if (bytes.len < 3 + off_bytes) return 0;
+            if (bytes.len < 3 + off_bytes) return error.MalformedTdsValue;
             const tlen = bytes.len - 3 - off_bytes;
+            if (tlen < 3 or tlen > 5) return error.MalformedTdsValue;
             var tu: i64 = 0;
-            for (bytes[0..tlen], 0..) |b, k| {
-                if (k >= 8) break;
-                tu |= @as(i64, b) << @intCast(k * 8);
-            }
+            for (bytes[0..tlen], 0..) |b, k| tu |= @as(i64, b) << @intCast(k * 8);
             const days: i64 = @intCast(u24le(bytes[tlen .. tlen + 3]));
             const days1970 = days - 719162;
             const time_micros = @divTrunc(tu *| 1_000_000, pow10(d.scale));
             return days1970 *| 86_400_000_000 +| time_micros;
         },
-        else => {
-            if (bytes.len >= 8) {
+        else => switch (bytes.len) {
+            8 => {
                 const date4 = readIntLE(bytes[0..4]);
                 const ticks: i64 = @intCast(readULE(bytes[4..8]));
                 return (date4 - 25567) *| 86_400_000_000 +| @divTrunc(ticks * 1_000_000, 300);
-            } else if (bytes.len >= 4) {
+            },
+            4 => {
                 const days: i64 = @intCast(rdU16(bytes, 0));
                 const mins: i64 = @intCast(rdU16(bytes, 2));
                 return (days - 25567) * 86_400_000_000 + mins * 60_000_000;
-            } else return 0;
+            },
+            else => return error.MalformedTdsValue,
         },
     }
 }
@@ -1514,70 +1519,77 @@ test "readIntLE sign-extends every TDS integer width" {
 
 test "decodeDecimal: sign byte + little-endian magnitude at the column scale" {
     const d = ColumnDesc{ .tds_type = 0x6C, .engine_type = types.Type.decimal(10, 2).asNullable(), .kind = .bytelen, .scale = 2 };
-    const pos = decodeDecimal(d, &.{ 1, 0x39, 0x30, 0, 0 });
+    const pos = try decodeDecimal(d, &.{ 1, 0x39, 0x30, 0, 0 });
     try std.testing.expectEqual(@as(i128, 12345), pos.decimal.unscaled);
     try std.testing.expectEqual(@as(u8, 2), pos.decimal.scale);
-    const neg = decodeDecimal(d, &.{ 0, 0x39, 0x30, 0, 0 });
+    const neg = try decodeDecimal(d, &.{ 0, 0x39, 0x30, 0, 0 });
     try std.testing.expectEqual(@as(i128, -12345), neg.decimal.unscaled);
-    try std.testing.expect(decodeDecimal(d, &.{}) == .null);
 }
 
-test "short or oversized bodies decode without reading out of bounds" {
+test "a body of a length its type cannot have is an error, never a cut-off value or a 1970 date" {
     const sdt = ColumnDesc{ .tds_type = 0x3A, .engine_type = types.Type.init(.timestamp).asNullable(), .kind = .fixed, .fixed_len = 4 };
-    _ = decodeDateTime(sdt, &.{ 1, 2, 3 });
-    _ = decodeDateTime(sdt, &.{});
+    try std.testing.expectError(error.MalformedTdsValue, decodeDateTime(sdt, &.{ 1, 2, 3 }));
+    try std.testing.expectError(error.MalformedTdsValue, decodeDateTime(sdt, &.{}));
+    try std.testing.expectError(error.MalformedTdsValue, decodeDateTime(sdt, &.{ 1, 2, 3, 4, 5, 6 }));
 
     const dt2 = ColumnDesc{ .tds_type = 0x2A, .engine_type = types.Type.init(.timestamp).asNullable(), .kind = .bytelen, .scale = 40 };
-    try std.testing.expectEqual(@as(i64, (0x070605 - 719162) * 86_400_000_000), decodeDateTime(dt2, &.{ 1, 2, 3, 4, 5, 6, 7 }));
+    try std.testing.expectEqual(@as(i64, (0x070605 - 719162) * 86_400_000_000), try decodeDateTime(dt2, &.{ 1, 2, 3, 4, 5, 6, 7 }));
     var long_dt: [64]u8 = undefined;
     @memset(&long_dt, 0xFF);
-    _ = decodeDateTime(dt2, &long_dt);
+    try std.testing.expectError(error.MalformedTdsValue, decodeDateTime(dt2, &long_dt));
+    try std.testing.expectError(error.MalformedTdsValue, decodeDateTime(dt2, &.{ 1, 2, 3, 4 }));
+
+    const tm = ColumnDesc{ .tds_type = 0x29, .engine_type = types.Type.init(.time).asNullable(), .kind = .bytelen, .scale = 7 };
+    try std.testing.expectError(error.MalformedTdsValue, decodeTime(tm, &.{ 1, 2 }));
+    try std.testing.expectError(error.MalformedTdsValue, decodeTime(tm, &.{ 1, 2, 3, 4, 5, 6 }));
 
     const dec = ColumnDesc{ .tds_type = 0x6C, .engine_type = types.Type.decimal(38, 2).asNullable(), .kind = .bytelen, .scale = 2 };
     const max38: i128 = 99999999999999999999999999999999999999;
     var widest: [17]u8 = undefined;
     widest[0] = 1;
     std.mem.writeInt(i128, widest[1..17], max38, .little);
-    try std.testing.expectEqual(max38, decodeDecimal(dec, &widest).decimal.unscaled);
+    try std.testing.expectEqual(max38, (try decodeDecimal(dec, &widest)).decimal.unscaled);
     widest[0] = 0;
-    try std.testing.expectEqual(-max38, decodeDecimal(dec, &widest).decimal.unscaled);
+    try std.testing.expectEqual(-max38, (try decodeDecimal(dec, &widest)).decimal.unscaled);
 
     var long: [40]u8 = undefined;
     @memset(&long, 0xFF);
     long[0] = 1;
-    _ = decodeDecimal(dec, &long);
+    try std.testing.expectError(error.MalformedTdsValue, decodeDecimal(dec, &long));
+    try std.testing.expectError(error.MalformedTdsValue, decodeDecimal(dec, &long[0..17].*));
+    try std.testing.expectError(error.MalformedTdsValue, decodeDecimal(dec, &.{}));
+    try std.testing.expectError(error.MalformedTdsValue, decodeDecimal(dec, &.{ 1, 2, 3 }));
+    try std.testing.expectError(error.MalformedTdsValue, decodeMoney(&.{ 1, 2, 3 }));
 }
 
 test "decodeMoney: ten-thousandths, high word first for the 8-byte form" {
-    try std.testing.expectEqual(@as(i128, -1), decodeMoney(&(.{0xFF} ** 8)).decimal.unscaled);
-    try std.testing.expectEqual(@as(i128, -1), decodeMoney(&(.{0xFF} ** 4)).decimal.unscaled);
-    try std.testing.expectEqual(@as(u8, 4), decodeMoney(&(.{0xFF} ** 8)).decimal.scale);
+    try std.testing.expectEqual(@as(i128, -1), (try decodeMoney(&(.{0xFF} ** 8))).decimal.unscaled);
+    try std.testing.expectEqual(@as(i128, -1), (try decodeMoney(&(.{0xFF} ** 4))).decimal.unscaled);
+    try std.testing.expectEqual(@as(u8, 4), (try decodeMoney(&(.{0xFF} ** 8))).decimal.scale);
 
     var b: [8]u8 = undefined;
     std.mem.writeInt(i32, b[0..4], 0x7FFFFFFF, .little);
     std.mem.writeInt(u32, b[4..8], 0xFFFFFFFF, .little);
-    try std.testing.expectEqual(@as(i128, std.math.maxInt(i64)), decodeMoney(&b).decimal.unscaled);
+    try std.testing.expectEqual(@as(i128, std.math.maxInt(i64)), (try decodeMoney(&b)).decimal.unscaled);
 
     std.mem.writeInt(i32, b[0..4], 0, .little);
     std.mem.writeInt(u32, b[4..8], 10000, .little);
-    try std.testing.expectEqual(@as(i128, 10000), decodeMoney(&b).decimal.unscaled);
+    try std.testing.expectEqual(@as(i128, 10000), (try decodeMoney(&b)).decimal.unscaled);
 
     var b4: [4]u8 = undefined;
     std.mem.writeInt(i32, &b4, std.math.minInt(i32), .little);
-    try std.testing.expectEqual(@as(i128, std.math.minInt(i32)), decodeMoney(&b4).decimal.unscaled);
-
-    try std.testing.expect(decodeMoney(&.{ 1, 2, 3 }) == .null);
+    try std.testing.expectEqual(@as(i128, std.math.minInt(i32)), (try decodeMoney(&b4)).decimal.unscaled);
 }
 
 test "decodeTime: 10^-scale seconds since midnight to micros" {
     var d = ColumnDesc{ .tds_type = 0x29, .engine_type = types.Type.init(.time).asNullable(), .kind = .bytelen, .scale = 0 };
-    try std.testing.expectEqual(@as(i64, 12 * 3600 * 1_000_000), decodeTime(d, &.{ 0xC0, 0xA8, 0x00 }));
+    try std.testing.expectEqual(@as(i64, 12 * 3600 * 1_000_000), try decodeTime(d, &.{ 0xC0, 0xA8, 0x00 }));
 
     d.scale = 7;
     var b5: [5]u8 = .{ 0, 0, 0, 0, 0 };
     const tenths_us: u40 = 863_999_999_999;
     inline for (0..5) |k| b5[k] = @intCast((tenths_us >> (k * 8)) & 0xFF);
-    try std.testing.expectEqual(@as(i64, 86_399_999_999), decodeTime(d, &b5));
+    try std.testing.expectEqual(@as(i64, 86_399_999_999), try decodeTime(d, &b5));
 }
 
 test "decodeDateTime: DATETIME ticks, SMALLDATETIME minutes, DATETIME2 scale" {
@@ -1585,13 +1597,13 @@ test "decodeDateTime: DATETIME ticks, SMALLDATETIME minutes, DATETIME2 scale" {
     var bytes8: [8]u8 = undefined;
     std.mem.writeInt(i32, bytes8[0..4], 25567, .little);
     std.mem.writeInt(u32, bytes8[4..8], 300, .little);
-    try std.testing.expectEqual(@as(i64, 1_000_000), decodeDateTime(dt, &bytes8));
+    try std.testing.expectEqual(@as(i64, 1_000_000), try decodeDateTime(dt, &bytes8));
 
     dt.tds_type = 0x3A;
     var bytes4: [4]u8 = undefined;
     std.mem.writeInt(u16, bytes4[0..2], 25568, .little);
     std.mem.writeInt(u16, bytes4[2..4], 90, .little);
-    try std.testing.expectEqual(@as(i64, 86_400_000_000 + 90 * 60_000_000), decodeDateTime(dt, &bytes4));
+    try std.testing.expectEqual(@as(i64, 86_400_000_000 + 90 * 60_000_000), try decodeDateTime(dt, &bytes4));
 
     const dt2 = ColumnDesc{ .tds_type = 0x2A, .engine_type = types.Type.init(.timestamp).asNullable(), .kind = .bytelen, .scale = 3 };
     var b7: [7]u8 = .{ 0, 0, 0, 0, 0, 0, 0 };
@@ -1600,7 +1612,7 @@ test "decodeDateTime: DATETIME ticks, SMALLDATETIME minutes, DATETIME2 scale" {
     b7[4] = @intCast(days & 0xFF);
     b7[5] = @intCast((days >> 8) & 0xFF);
     b7[6] = @intCast(days >> 16);
-    try std.testing.expectEqual(@as(i64, 86_400_000_000 + 1_500_000), decodeDateTime(dt2, &b7));
+    try std.testing.expectEqual(@as(i64, 86_400_000_000 + 1_500_000), try decodeDateTime(dt2, &b7));
 }
 
 test "utf16ToUtf8 decodes BMP text, pairs surrogates; only an unpaired half degrades to `?`" {
