@@ -32,7 +32,9 @@ FROM 'movimentos.csv';
   refused; write the second as a separate query or wrap the first in a derived table.
   A window function's argument, and its `PARTITION BY` and `ORDER BY` keys, are plain
   columns: compute an expression in a CTE first.
-- `MIN`/`MAX` answer a value from the column and keep its type; `AVG` is always a float;
+- `MIN`/`MAX` answer a value from the column and keep its type; `SUM` over a
+  `DECIMAL` is an exact `DECIMAL` of the column's scale, as the `SUM` aggregate is,
+  and an `INT` over ints; `AVG` is always a float;
   all of them are nullable, since a peer group of nothing but nulls has no answer.
 - The names are not reserved: a column called `rank` still reads as a column.
 - `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` and

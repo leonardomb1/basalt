@@ -129,13 +129,19 @@ pub fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const a
 }
 
 /// Ranking is a non-null int; MIN/MAX, LAG and LEAD keep the column's type; AVG is a
-/// float; SUM keeps the family. With an argument it is nullable (all-null peers, first LAG).
+/// float; SUM is an INT over ints, a DECIMAL of the column's scale over decimals, as the
+/// SUM aggregate is, and a float otherwise. With an argument it is nullable (all-null
+/// peers, first LAG).
 pub fn windowFuncType(kind: ast.WinKind, src: types.Type) types.Type {
     return switch (kind) {
         .row_number, .rank, .dense_rank, .count => types.Type.init(.int),
         .min, .max, .lag, .lead => src.asNullable(),
         .avg => types.Type.init(.float).asNullable(),
-        .sum => (if (src.kind == .int) types.Type.init(.int) else types.Type.init(.float)).asNullable(),
+        .sum => switch (src.kind) {
+            .int => types.Type.init(.int).asNullable(),
+            .decimal => src.asNullable(),
+            else => types.Type.init(.float).asNullable(),
+        },
     };
 }
 

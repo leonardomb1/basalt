@@ -492,7 +492,7 @@ test "analyze: a window stage resolves its schema — the input plus one typed c
         try std.testing.expectEqualStrings("prev", s.fields[2].name);
         try std.testing.expect(s.fields[2].ty.kind == .decimal and s.fields[2].ty.nullable);
         try std.testing.expectEqualStrings("run", s.fields[3].name);
-        try std.testing.expect(s.fields[3].ty.kind == .float and s.fields[3].ty.nullable);
+        try std.testing.expect(s.fields[3].ty.kind == .decimal and s.fields[3].ty.scale == 2 and s.fields[3].ty.nullable);
     }
     try std.testing.expect(found);
 }

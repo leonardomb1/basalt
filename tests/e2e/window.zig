@@ -303,3 +303,22 @@ test "window ROWS frame slides: bounded sum/min/max/count per partition, nulls s
     defer alloc.free(got);
     try std.testing.expectEqualStrings("k,i,v,s3,mn3,mx3,c3\n0,0,0,0,0,0,1\n0,2,4,4,0,4,2\n0,4,8,12,0,8,3\n0,6,2,14,2,8,3\n0,8,6,16,2,8,3\n1,1,7,7,7,7,1\n1,3,1,8,1,7,2\n1,5,,8,1,7,2\n1,7,9,10,1,9,2\n1,9,3,12,3,9,2\n", got);
 }
+
+test "window SUM over a DECIMAL is an exact DECIMAL in every frame, as the SUM aggregate is" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const input = "g,v\na,0.10\na,0.20\na,0.30\nb,1.05\n";
+    const cases = [_][2][]const u8{
+        .{ "SUM(d) OVER (PARTITION BY g)", "g,d,s\na,0.10,0.60\na,0.20,0.60\na,0.30,0.60\nb,1.05,1.05\n" },
+        .{ "SUM(d) OVER (PARTITION BY g ORDER BY d)", "g,d,s\na,0.10,0.10\na,0.20,0.30\na,0.30,0.60\nb,1.05,1.05\n" },
+        .{ "SUM(d) OVER (PARTITION BY g ORDER BY d ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)", "g,d,s\na,0.10,0.10\na,0.20,0.30\na,0.30,0.50\nb,1.05,1.05\n" },
+    };
+    for (cases) |c| {
+        const q = try std.fmt.allocPrint(alloc, "SELECT g, d, {s} AS s FROM (SELECT g, CAST(v AS DECIMAL(10,2)) AS d FROM '$IN') x ORDER BY g, d", .{c[0]});
+        defer alloc.free(q);
+        const got = try runToString(alloc, &tmp, input, q);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c[1], got);
+    }
+}

@@ -7,10 +7,12 @@ const KeyArr = @import("sort.zig").KeyArr;
 const Op = @import("../op.zig").Op;
 const Sort = @import("sort.zig").Sort;
 const Stats = @import("../op.zig").Stats;
+const Decimal = @import("../value.zig").Decimal;
 const Value = @import("../value.zig").Value;
 const column = @import("../column.zig");
 const dupeRowGpa = @import("topn.zig").dupeRowGpa;
 const errLabel = @import("../op.zig").errLabel;
+const rescaleTo = @import("../eval.zig").rescaleTo;
 const freeRowGpa = @import("topn.zig").freeRowGpa;
 const keyOrder = @import("sort.zig").keyOrder;
 const keyhash = @import("../keyhash.zig");
@@ -19,6 +21,19 @@ const materializeAll = @import("../op.zig").materializeAll;
 const sortIdxThreads = @import("sort.zig").sortIdxThreads;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
+
+/// Adds (or, leaving a ROWS frame, takes away) a value from a DECIMAL sum, exactly, at
+/// the sum's scale, as the SUM aggregate does; a float total would read 0.1 + 0.2 as
+/// 0.30000000000000004.
+fn decStep(acc: *i128, v: Value, scale: u8, sub: bool) !void {
+    const d: Decimal = switch (v) {
+        .decimal => |x| x,
+        .int => |x| .{ .unscaled = x, .scale = 0 },
+        else => return error.TypeMismatch,
+    };
+    const u = (rescaleTo(d, scale) orelse return error.CastFailed).unscaled;
+    acc.* = (if (sub) std.math.sub(i128, acc.*, u) else std.math.add(i128, acc.*, u)) catch return error.CastFailed;
+}
 
 fn asF64Opt(v: Value) ?f64 {
     return switch (v) {
@@ -243,6 +258,7 @@ pub const Window = struct {
                     }
                 },
                 .sum, .count, .min, .max, .avg => if (f.frame.rows) {
+                    const dec: ?u8 = if (f.kind == .sum and bd.ty.kind == .decimal) bd.ty.scale else null;
                     const vs = try arena.alloc(Value, idx.len);
                     for (idx, vs) |row, *v| v.* = if (f.arg) |ai| all.columns[ai].getValue(row) else .null;
                     var dq = std.array_list.Managed(usize).init(arena);
@@ -277,7 +293,7 @@ pub const Window = struct {
                             const v = vs[lo];
                             if (v.isNull()) continue;
                             n -= 1;
-                            switch (v) {
+                            if (dec) |s| try decStep(&acc_i, v, s, true) else switch (v) {
                                 .int => |x| {
                                     acc_i -= x;
                                     acc_f -= @floatFromInt(x);
@@ -293,7 +309,7 @@ pub const Window = struct {
                         } else if (!vs[k].isNull()) {
                             const v = vs[k];
                             n += 1;
-                            switch (v) {
+                            if (dec) |s| try decStep(&acc_i, v, s, false) else switch (v) {
                                 .int => |x| {
                                     acc_i += x;
                                     acc_f += @floatFromInt(x);
@@ -317,10 +333,11 @@ pub const Window = struct {
                             .count => .{ .int = n },
                             .min, .max => if (dq_head < dq.items.len) vs[dq.items[dq_head]] else .null,
                             .avg => if (n == 0) .null else .{ .float = acc_f / @as(f64, @floatFromInt(n)) },
-                            else => if (n == 0) .null else if (seen_float) .{ .float = acc_f } else try self.intSum(acc_i),
+                            else => if (n == 0) .null else if (dec) |s| .{ .decimal = .{ .unscaled = acc_i, .scale = s } } else if (seen_float) .{ .float = acc_f } else try self.intSum(acc_i),
                         };
                     }
                 } else {
+                    const dec: ?u8 = if (f.kind == .sum and bd.ty.kind == .decimal) bd.ty.scale else null;
                     var i: usize = 0;
                     while (i < idx.len) {
                         const stop = pend[i];
@@ -340,7 +357,7 @@ pub const Window = struct {
                                     if (v.isNull()) continue;
                                     n += 1;
                                     if (ext.isNull() or (if (f.kind == .max) lessV(ext, v) else lessV(v, ext))) ext = v;
-                                    switch (v) {
+                                    if (dec) |s| try decStep(&acc_i, v, s, false) else switch (v) {
                                         .int => |x| {
                                             acc_i += x;
                                             acc_f += @floatFromInt(x);
@@ -360,7 +377,7 @@ pub const Window = struct {
                                     .count => .{ .int = n },
                                     .min, .max => ext,
                                     .avg => if (n == 0) .null else .{ .float = acc_f / @as(f64, @floatFromInt(n)) },
-                                    else => if (n == 0) .null else if (seen_float) .{ .float = acc_f } else try self.intSum(acc_i),
+                                    else => if (n == 0) .null else if (dec) |s| .{ .decimal = .{ .unscaled = acc_i, .scale = s } } else if (seen_float) .{ .float = acc_f } else try self.intSum(acc_i),
                                 };
                             }
                             g = e;
