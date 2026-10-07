@@ -1,9 +1,10 @@
-//! Every ```sql example in docs/ is parsed and checked as `basalt check` would,
-//! after tests/docs/prelude.sql, so the book cannot describe syntax the engine
-//! refuses. A fence tagged `sql ignore` is a fragment or synopsis and is skipped;
-//! one tagged `sql error` must fail, and one tagged `sql cont` is checked after the
-//! block before it on the page, whose declarations it uses. The run step has side effects so an edit to
-//! the docs alone re-runs it; it reads docs/ from the build root.
+//! Every ```sql example in docs/ and README.md is parsed and checked as `basalt
+//! check` would, after tests/docs/prelude.sql, so the docs cannot describe syntax
+//! the engine refuses. A fence tagged `sql ignore` is a fragment or synopsis and is
+//! skipped; one tagged `sql error` must fail, and one tagged `sql cont` is checked
+//! after the block before it on the page, whose declarations it uses. The run step
+//! has side effects so an edit to the docs alone re-runs it; it reads docs/ and
+//! README.md from the build root.
 
 const std = @import("std");
 const basalt = @import("basalt");
@@ -33,6 +34,7 @@ test "every SQL example in the book checks out" {
         const text = try dir.readFileAlloc(a, entry.path, 1 << 20);
         try collect(a, try std.fmt.allocPrint(a, "docs/{s}", .{entry.path}), text, &blocks);
     }
+    try collect(a, "README.md", try std.fs.cwd().readFileAlloc(a, "README.md", 1 << 20), &blocks);
     try std.testing.expect(blocks.items.len > 0);
 
     var failures: usize = 0;

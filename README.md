@@ -1,198 +1,140 @@
 # basalt
 
-A lightweight SQL data movement engine in a single static binary.
+**Move data with SQL scripts.** A lightweight data movement engine in a single
+static binary: read from files, object storage, file servers, databases and
+APIs, transform with a query, and write the result to a file, a bucket, a share
+or a table.
 
-A script describes a columnar pipeline — read from a source, transform with a
-query, write to a sink. It is parsed, type-checked and planned once, then
-executed as a streaming pull pipeline.
+[![CI](https://github.com/leonardomb1/basalt/actions/workflows/ci.yml/badge.svg)](https://github.com/leonardomb1/basalt/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/leonardomb1/basalt)](https://github.com/leonardomb1/basalt/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-```sql
--- move yesterday's paid orders from SQL Server into the lake
-CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'sql.internal', database = 'totvs');
-
-LOAD INTO 'az://lakeacct/bronze/orders.parquet' AS
-SELECT id, customer, amount, placed_at
-FROM erp.orders
-WHERE status = 'paid';
-```
-
-Or the same shape against a published CSV that is neither comma-separated nor
-UTF-8, which is most of them:
+[Documentation](https://leonardomb1.github.io/basalt/) ·
+[Getting started](https://leonardomb1.github.io/basalt/getting-started.html) ·
+[Language](https://leonardomb1.github.io/basalt/language/scripts.html) ·
+[Functions](https://leonardomb1.github.io/basalt/reference/functions.html) ·
+[Connectors](https://leonardomb1.github.io/basalt/connectors/databases.html)
 
 ```sql
-LOAD INTO 's3://lake/bronze/funds.parquet' AS
-SELECT CNPJ_FUNDO, DENOM_SOCIAL, SIT
-FROM 'https://dados.cvm.gov.br/dados/FI/CAD/DADOS/cad_fi.csv'
-  WITH (delimiter = ';', encoding = 'latin1');
+-- active funds from a Latin-1, semicolon-separated CSV, into Parquet
+LOAD INTO 'funds.parquet' AS
+SELECT cnpj, nome AS name,
+       CAST(replace(patrimonio, ',', '.') AS DECIMAL(18,2)) AS net_assets
+FROM 'funds.csv' WITH (delimiter = ';', encoding = 'latin1')
+WHERE situacao = 'EM FUNCIONAMENTO NORMAL';
 ```
 
 ```console
-basalt run orders.sql
+$ basalt check funds.sql
+ok: funds.sql checks out
+$ basalt run funds.sql
+Read 3 rows, loaded 2 into funds.parquet in 4ms (750 rows/s, 12 lanes)
+$ basalt run -c "SELECT * FROM 'funds.parquet';"
+cnpj                name                         net_assets
+------------------  ---------------------------  ----------
+11.222.333/0001-81  Fundo Ação Brasil            1500000.50
+33.444.555/0001-02  Fundo Imobiliário São Paulo  820000.00
+(2 rows)
+```
+
+A script is parsed, type-checked and planned before a row is read, so a typo
+fails in `check` rather than an hour into a load:
+
+```console
+$ basalt check -c "SELECT cnpj, situaco FROM 'funds.csv' WITH (delimiter = ';', encoding = 'latin1');"
+<command>:1:14: error: unknown field `situaco`
+```
+
+The same shape moves a database table into a lake, with the `WHERE` run by the
+database:
+
+```sql
+CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'sql.internal', database = 'erp');
+
+LOAD INTO 's3://lake/bronze/orders.parquet' AS
+SELECT id, customer, amount, placed_at
+FROM erp.dbo.orders
+WHERE status = 'paid';
 ```
 
 ## Install
 
-Prebuilt binary (Linux x86-64, ~3.7 MB, statically linked — runs anywhere):
+A prebuilt binary for Linux x86-64, statically linked:
 
 ```console
 curl -fsSL -o basalt https://github.com/leonardomb1/basalt/releases/latest/download/basalt-x86_64-linux
-chmod +x basalt && ./basalt help
+chmod +x basalt
+./basalt help
 ```
 
-From source, with Zig 0.15.2:
+A container image, with scripts mounted rather than baked in:
 
 ```console
-zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dcpu=x86_64_v3+aes+pclmul -Dstrip=true
+docker run --rm -v "$PWD:/scripts:ro" -w /scripts ghcr.io/leonardomb1/basalt check funds.sql
+```
+
+From source, with [Zig 0.15.2](https://ziglang.org/download/):
+
+```console
+zig build -Doptimize=ReleaseFast
 ./zig-out/bin/basalt help
 ```
 
-`-Dstrip` drops debug info for a smaller binary. `-Dcpu=x86_64_v3+aes+pclmul`
-builds for AVX2 and AES-NI — any x86-64 CPU since Intel Haswell (2013) or AMD
-Zen; drop it for an older machine, or a plain `zig build` targets the CPU it
-runs on.
+## What it reads and writes
 
-## What it talks to
+| | read | write |
+|---|---|---|
+| **Files** — CSV (any delimiter, Latin-1 and CP1252), Parquet, Arrow IPC, Excel | ✓ | ✓ (not Excel) |
+| **Compressed and archived** — `.gz`, `.zst`, a member of a `.zip` | ✓ | `.gz` |
+| **Object storage** — S3 and S3-compatible, Azure Blob / ADLS Gen2 | ✓ | ✓ |
+| **File servers** — SFTP, Windows and Samba shares (SMB 2.1–3.1.1, NTLMv2 or Kerberos) | ✓ | ✓ |
+| **Databases** — PostgreSQL, MySQL, SQL Server, StarRocks, Apache Doris | ✓ | ✓ |
+| **HTTP APIs** — paginated REST, with bearer, basic, OAuth2 and login flows | ✓ | |
 
-| | |
-|---|---|
-| **Files** | CSV and Parquet, local or over HTTP; Arrow IPC (`.arrow`, `.feather`, `.ipc`, `.arrows`), local, read and written; Excel (`.xlsx`) read, a sheet or a range of it — the extension picks the format, and an extension basalt does not read is refused rather than guessed at. `WITH (delimiter = ';', encoding = 'latin1')` for the CSV most of the world publishes |
-| **Compressed & archived** | `orders.csv.gz`, `orders.csv.zst`, and `archive.zip :: inner.csv`. Members stream rather than expanding to memory or a temp file |
-| **Object storage** | `az://account/container/path` (Azure Blob / ADLS Gen2) or `s3://bucket/key` (S3, MinIO). A trailing `/` reads a folder — local, SFTP, SMB or object storage — of Parquet files or CSVs as one table, subfolders included |
-| **SFTP** | `sftp://conn/path`, read and written — host keys checked against `known_hosts` or a pinned fingerprint, password or Ed25519 key logins, writes through a `.part` renamed into place |
-| **Windows shares** | `smb://conn/share/path`, read and written — SMB 2.1 to 3.1.1, NTLMv2 or Kerberos with every message signed, as Windows 11 24H2 and Server 2025 require; writes through a `.part` renamed into place |
-| **Databases** | PostgreSQL, MySQL, SQL Server, StarRocks, Apache Doris |
-| **HTTP** | paginated REST sources; serve a pipeline as an endpoint |
-| **Buffer** | a durable WAL buffer, replayed by a later run |
+A folder — local, remote or a storage prefix — reads as one table. Parquet is
+read by column and row group, over the network too, so a narrow query fetches
+only what it needs. A connection named `erp` takes its login from `ERP_USER` and
+`ERP_PASS`, so scripts carry no secrets.
+Each connector's page in the [documentation](https://leonardomb1.github.io/basalt/)
+has the details.
 
-Parquet reads use column projection, row-group skipping from statistics, and
-ranged reads — only the footer and the chunks a query needs are fetched. That
-holds over the network too: a remote `.parquet` is read by HTTP range request,
-so projecting two columns of forty transfers two chunks, not the object. A
-server that ignores `Range` is handled by falling back to a single whole-object
-fetch. Column types follow the file's `LogicalType`, so the naive and nanosecond
-timestamps polars, DuckDB, Spark and pyarrow write read as timestamps. Nested
-columns — lists, lists of structs, maps, at any depth — read as JSON text that
-`UNNEST(JSON_EACH(col))` and `json_get` take apart, or that `json_filter(col, x ->
-…)`, `json_transform`, `json_any` and `json_all` work on in place; no column is
-left out.
-
-Arrow IPC is the fast way to hand a dataframe over: the file is memory-mapped
-and copied out, with no encode or decode step. polars' `write_ipc` and pyarrow's
-`write_feather` both read as written, compressed or not, categoricals and
-nested columns included.
-
-## Running things
+## Commands
 
 ```console
-$ basalt run pipeline.sql -p days=7       # bind a PARAM
-$ basalt run --format json -c "<query>"   # NDJSON rows on stdout, for scripts
-$ basalt run --format arrow -c "<query>"  # Arrow IPC stream per result, for pyarrow/Polars/Arrow JS
-$ basalt run --max-rows 500 -c "<query>"  # first 500 rows, and stop reading there
-$ basalt check pipeline.sql               # validate without running
-$ basalt run -c "EXPLAIN <query>"         # print the plan
-$ basalt run -c "EXPLAIN ANALYZE <query>" # run it, print the plan with actuals
-$ basalt repl                             # interactive: runs on `;`, keeps
-                                          # connections/functions across entries
-$ basalt kernel --format arrow            # a session for a notebook: NDJSON requests
-                                          # on stdin, framed results + status on stdout
-$ basalt serve ./endpoints --watch        # host every endpoint script in a dir
+$ basalt run pipeline.sql -p since=2026-01-01   # run once; -p binds a PARAM
+$ basalt check pipeline.sql                     # validate without connecting
+$ basalt serve ./endpoints                      # each script as an HTTP endpoint
+$ basalt repl                                   # an interactive session
+$ basalt kernel                                 # a session a notebook or editor drives
 ```
 
-A terminal `SELECT ...;` prints a table — or one JSON object per row with
-`--format json`. `LOAD INTO <target> AS <query>;` writes. A script that
-declares `CREATE ENDPOINT` runs as HTTP; otherwise it runs once and exits.
-Options go before or after the script path, and `-` reads the script from stdin.
+`run` takes `--format json|csv|arrow` for programs reading its output, and
+`-j N` for parallel lanes. Exit code `75` means a transient failure worth
+retrying, `1` a permanent one. See [Command line](https://leonardomb1.github.io/basalt/tools/cli.html).
 
-Logging is quiet by default: plain-text errors and warnings on stderr, plus a
-one-line summary when a run loads a sink. `--log-level debug` shows plan
-detail; `--log-format json` switches stderr to NDJSON for collectors — errors
-with the exact range of the offending name and whether a retry could help,
-a `progress` event a second for long statements, and a `run_complete` summary
-for every run, with what the sources were spared (row groups skipped, columns
-not decoded, filters pushed).
+## When not to use it
 
-## Notebooks and editors
+- **Continuous replication.** basalt runs a script to completion (or once per
+  HTTP request); it does not follow a change log. Schedule it with cron, Airflow
+  or the like.
+- **Inputs larger than memory in a blocking step.** Pipelines stream, but a
+  `GROUP BY` holds its groups, a join its build side and a sort its input, with
+  no spill to disk.
+- **Ad-hoc analytics over large local data.** A columnar database such as
+  DuckDB is the better tool for that.
 
-`basalt kernel` keeps one session alive for a frontend. Each script sees the
-connections, functions, params and `LET`s earlier scripts declared; a request
-can bind params, pick a format and cap rows for that script alone, and a
-`cancel` (or SIGINT) stops the running script without ending the session.
-Results come back framed — a `result` frame after each one, `progress` frames
-while a statement runs, and one JSON `status` per script — so several results
-in one cell never run together.
+## Development
 
 ```console
-$ basalt kernel --format arrow --max-rows 5000
-{"op":"run","id":"c1","script":"CREATE CONNECTION erp TYPE postgres OPTIONS (host = 'db', database = 'erp'); PARAM since DATE;"}
-{"op":"run","id":"c2","script":"SELECT * FROM erp.orders WHERE day >= $since;","params":{"since":"2026-01-01"}}
-{"op":"complete","id":"c3","script":"SELECT * FROM erp.","pos":18}
+zig build test          # unit, end-to-end and documentation tests
+zig build coverage      # line coverage of src/ (needs kcov)
+zig fmt --check src tests tools build.zig
 ```
 
-For an editor without a session, `basalt check --format json` prints
-diagnostics as a JSON array with their ranges, and `basalt complete --pos N`
-prints what Tab would offer at byte `N`.
-
-The summary's rate is rows **processed** per second — the volume that moved
-through the pipeline, which for a straight move is also the rows written. (Before
-0.5.8 it divided the *written* count by the clock, so an aggregate folding six
-million rows into four reported `11 rows/s`.)
-
-## Design
-
-- Errors surface at plan time: an unknown column, an incomparable type or a
-  missing credential fails `check`, before a row is read.
-- Execution streams: a map pipeline's memory is bounded by batch size, not file
-  size, however large the input. A stage that has to see the whole input first is
-  bounded by its *result* instead — a `GROUP BY` holds one entry per group, a
-  join holds its build side, failing fast past 4 GiB (`WITH (max_build = '16GB')`
-  to raise it), and a window function holds the input it ranks. Aggregating a high-cardinality key is the case to watch: grouping
-  2M distinct ids out of a 98 MB CSV peaks around 1.1 GB, and there is no spill to
-  disk.
-- `WHERE` against a database table runs in the database. The plan shows what
-  was pushed down.
-- Parquet pipelines run in parallel over row-group morsels, local CSV pipelines
-  over byte-range chunks, a splittable database read over key ranges; `-j`
-  controls it and `EXPLAIN` names which one a query gets.
-- A rerun reproduces its output. Parallel aggregates total their slices in a
-  fixed order rather than in completion order, so the same command over the same
-  data writes the same bytes at the same `-j`.
-- One process, one allocation strategy, no garbage collector.
-
-## Credentials
-
-Secrets never appear in a script. A connection named `erp` resolves `ERP_USER`
-and `ERP_PASS` from the environment; explicit `user = ...` / `password = ...`
-options override that. Azure Blob uses `AZURE_STORAGE_KEY`, and
-`AZURE_BLOB_ENDPOINT` points it at an emulator. S3 uses `AWS_ACCESS_KEY_ID` and
-`AWS_SECRET_ACCESS_KEY` (plus `AWS_SESSION_TOKEN` and `AWS_REGION` when they
-apply), with `AWS_ENDPOINT_URL` for MinIO and the like.
-
-## Documentation
-
-- [The basalt book](https://leonardomb1.github.io/basalt/) — the SQL dialect,
-  its connectors and tools; the pages are Markdown under [`docs/`](docs/), starting
-  at [`docs/introduction.md`](docs/introduction.md). `zig build test-docs` checks
-  every SQL example in it
-- [`examples/`](examples) — runnable scripts, one per feature
-
-## Tests
-
-```console
-zig build test                                   # unit and end-to-end tests, no services needed
-zig build test-unit                              # just the unit tests beside the code in src/
-zig build test-e2e                               # just the whole-script tests in tests/e2e/
-zig build coverage                               # line coverage of src/ per folder (needs kcov)
-./tests/integration/run.sh                       # integration suite (needs docker)
-./tests/integration/run.sh azure parquet         # just those suites
-./tests/integration/run.sh stdout kernel arrow   # the CLI's own contracts: no containers
-```
-
-Unit tests live beside the code they test; `tests/e2e/` runs whole scripts against
-the engine's public module. `coverage` writes its HTML report to `zig-out/coverage/`.
-
-The integration suite starts only the containers the selected suites need;
-`kernel` needs `python3`, `arrow` needs `uv` (it checks results with pyarrow).
-`KEEP=1` leaves the stack up afterwards.
+`tests/integration/run.sh` runs the connectors against real services in Docker.
+The documentation is an [mdBook](https://rust-lang.github.io/mdBook/) in
+[`docs/`](docs/); `zig build test-docs` checks every SQL example in it and in
+this README.
 
 ## License
 
