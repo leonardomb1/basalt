@@ -1,5 +1,5 @@
-//! Parquet writer: PLAIN-encoded pages (or a dictionary page plus RLE indices for
-//! byte-array columns), one column chunk per column per row group.
+//! Parquet writer: per column chunk, a dictionary page plus RLE/bit-packed indices
+//! where that is smaller, else PLAIN-encoded pages; one chunk per column per row group.
 //!
 //! Nullable columns are written OPTIONAL with definition levels; REQUIRED columns
 //! carry none. Rows accumulate until `group_rows`, then a row group is flushed.
@@ -13,10 +13,16 @@
 //! the batch arena, which is recycled long before the group flushes.
 //!
 //! Pages of one chunk must land contiguously, so they are held until the flush.
-//! A dictionary is per chunk and emitted whole; a column gives it up once it
-//! exceeds `dict_max_entries`. Both chunk size totals include page headers, per
-//! ColumnMetaData's "including the headers": without them a reader that bounds a
-//! chunk by `total_compressed_size` (Arrow-based ones do) found the last page short.
+//! A dictionary is per chunk and emitted whole, for every type but BOOLEAN: a byte
+//! array keyed by its bytes, a fixed-width value by its PLAIN encoding. A chunk gives
+//! it up past `dict_max_entries` or `dict_max_bytes`, or once it is mostly distinct,
+//! and writes PLAIN; at the flush it keeps it only if it is smaller than PLAIN, so
+//! codes, dates and categories shrink while unique ids and timestamps do not grow.
+//! Values are PLAIN-encoded alongside throughout, so giving up costs nothing.
+//!
+//! Both chunk size totals include page headers, per ColumnMetaData's "including
+//! the headers": without them a reader that bounds a chunk by
+//! `total_compressed_size` (Arrow-based ones do) found the last page short.
 //!
 //! Output is strictly forward: every byte goes through `emit`, which tracks the
 //! running offset and never seeks, so the destination is any `*std.Io.Writer`, a
@@ -113,7 +119,10 @@ fn flbaLen(p: i32) i32 {
     return 16;
 }
 
-pub const dict_max_entries = 1 << 15;
+/// A chunk gives up its dictionary past either cap and is written PLAIN: 1 MiB is
+/// Arrow's default dictionary page limit, and the entry cap holds 8-byte values to it.
+pub const dict_max_entries = 1 << 17;
+pub const dict_max_bytes = 1 << 20;
 
 const PendingPage = struct {
     defs: []const u8,
@@ -132,8 +141,16 @@ const ColBuf = struct {
     max: ?Value = null,
     dict: std.StringHashMap(u32),
     dict_order: List([]const u8),
+    /// A fixed-width column's dictionary: its PLAIN bytes (at most 16) as an integer
+    /// key, and the entries back to back in `fixed_raw`, the dictionary page's body.
+    fixed: std.AutoHashMap(u128, u32),
+    fixed_raw: List(u8),
     dict_idx: List(u32),
     dict_ok: bool = false,
+    dict_bytes: usize = 0,
+    /// Whether the column's type is dictionary-encoded at all; `dict_ok` starts each
+    /// row group from it, since a dictionary is per chunk.
+    dict_eligible: bool = false,
 
     fn init(a: std.mem.Allocator) ColBuf {
         return .{
@@ -142,6 +159,8 @@ const ColBuf = struct {
             .defs = List(u8).init(a),
             .dict = std.StringHashMap(u32).init(a),
             .dict_order = List([]const u8).init(a),
+            .fixed = std.AutoHashMap(u128, u32).init(a),
+            .fixed_raw = List(u8).init(a),
             .dict_idx = List(u32).init(a),
         };
     }
@@ -173,8 +192,43 @@ const ColBuf = struct {
         self.max = null;
         self.dict.clearRetainingCapacity();
         self.dict_order.clearRetainingCapacity();
+        self.fixed.clearRetainingCapacity();
+        self.fixed_raw.clearRetainingCapacity();
         self.dict_idx.clearRetainingCapacity();
-        self.dict_ok = false;
+        self.dict_bytes = 0;
+        self.dict_ok = self.dict_eligible;
+    }
+
+    fn entries(self: *const ColBuf) usize {
+        return self.dict_order.items.len + self.fixed.count();
+    }
+
+    /// Whether a new entry of `len` bytes would take the dictionary past a cap, or
+    /// the column has shown it is mostly distinct: past 8192 values with over 80%
+    /// distinct, a dictionary cannot beat PLAIN, and hashing every value on to the
+    /// end of the row group only to find that out is what slowed the writer.
+    fn dictFull(self: *const ColBuf, len: usize) bool {
+        const n = self.dict_idx.items.len;
+        return self.entries() >= dict_max_entries or self.dict_bytes + len > dict_max_bytes or
+            (n >= 8192 and self.entries() * 5 > n * 4);
+    }
+
+    /// Records a fixed-width value, given as its PLAIN bytes, against the dictionary.
+    fn dictPutFixed(self: *ColBuf, v: []const u8) !void {
+        var key: u128 = 0;
+        for (v, 0..) |b, k| key |= @as(u128, b) << @intCast(8 * k);
+        const gop = try self.fixed.getOrPut(key);
+        if (!gop.found_existing) {
+            if (self.dictFull(v.len)) {
+                self.fixed.removeByPtr(gop.key_ptr);
+                self.dict_ok = false;
+                return;
+            }
+            gop.value_ptr.* = @intCast(self.fixed.count() - 1);
+            try self.fixed_raw.appendSlice(v);
+            self.dict_bytes += v.len;
+        }
+        try self.dict_idx.append(gop.value_ptr.*);
     }
 
     /// Records a byte-array value against the dictionary. Returns false once the
@@ -185,10 +239,11 @@ const ColBuf = struct {
             try self.dict_idx.append(ix);
             return true;
         }
-        if (self.dict.count() >= dict_max_entries) {
+        if (self.dictFull(v.len)) {
             self.dict_ok = false;
             return false;
         }
+        self.dict_bytes += v.len;
         const owned = try arena.dupe(u8, v);
         const ix: u32 = @intCast(self.dict_order.items.len);
         try self.dict.put(owned, ix);
@@ -352,7 +407,8 @@ pub const Writer = struct {
         const cols = try arena.alloc(ColBuf, schema.fields.len);
         for (cols, maps) |*c, m| {
             c.* = ColBuf.init(arena);
-            c.dict_ok = m.phys == .byte_array;
+            c.dict_eligible = m.phys != .boolean;
+            c.dict_ok = c.dict_eligible;
         }
 
         const self = try arena.create(Writer);
@@ -409,15 +465,14 @@ pub const Writer = struct {
                     continue;
                 }
                 try cb.observe(sa, v);
-                if (m.phys == .byte_array and cb.dict_ok) {
-                    const sv: []const u8 = switch (v) {
-                        .string => |x| x,
-                        .bytes => |x| x,
-                        else => "",
-                    };
-                    _ = try cb.dictPut(sa, sv);
-                }
+                const before = cb.values.items.len;
                 try encodePlain(cb, m, v);
+                if (cb.dict_ok) switch (v) {
+                    .string, .bytes => |x| _ = try cb.dictPut(sa, x),
+                    // A fixed-width value's key is its PLAIN encoding, just written,
+                    // which is also its dictionary entry.
+                    else => try cb.dictPutFixed(cb.values.items[before..]),
+                };
             }
             for (self.cols, self.maps) |*cb, m| {
                 if (cb.dict_ok) continue;
@@ -436,8 +491,7 @@ pub const Writer = struct {
         var group_bytes: i64 = 0;
 
         for (self.cols, chunks, self.maps) |*cb, *cm, m| {
-            const use_dict = cb.dict_ok and cb.dict_order.items.len > 0 and
-                cb.dict_order.items.len * 2 < cb.dict_idx.items.len;
+            const use_dict = cb.dict_ok and cb.entries() > 0 and dictSmaller(cb, m);
             if (use_dict) {
                 cm.* = try self.writeDictChunk(cb, m);
                 group_bytes += cm.uncompressed;
@@ -502,15 +556,17 @@ pub const Writer = struct {
         var compressed: i64 = 0;
 
         var dict_body = List(u8).init(sa);
-        for (cb.dict_order.items) |v| {
-            var len4: [4]u8 = undefined;
-            std.mem.writeInt(u32, &len4, @intCast(v.len), .little);
-            try dict_body.appendSlice(&len4);
-            try dict_body.appendSlice(v);
-        }
+        if (m.phys == .byte_array) {
+            for (cb.dict_order.items) |v| {
+                var len4: [4]u8 = undefined;
+                std.mem.writeInt(u32, &len4, @intCast(v.len), .little);
+                try dict_body.appendSlice(&len4);
+                try dict_body.appendSlice(v);
+            }
+        } else try dict_body.appendSlice(cb.fixed_raw.items);
         const dict_packed = try codec.compress(sa, self.compression, dict_body.items);
         var dhdr = List(u8).init(sa);
-        try writeDictPageHeader(&dhdr, dict_body.items.len, dict_packed.len, cb.dict_order.items.len, std.hash.Crc32.hash(dict_packed));
+        try writeDictPageHeader(&dhdr, dict_body.items.len, dict_packed.len, cb.entries(), std.hash.Crc32.hash(dict_packed));
         try self.emit(dhdr.items);
         try self.emit(dict_packed);
         uncompressed += @intCast(dhdr.items.len + dict_body.items.len);
@@ -526,7 +582,7 @@ pub const Writer = struct {
             try body.appendSlice(&len4);
             try body.appendSlice(levels);
         }
-        const width = indexWidth(cb.dict_order.items.len);
+        const width = indexWidth(cb.entries());
         try body.append(width);
         try packRleIndices(&body, cb.dict_idx.items, width);
 
@@ -645,7 +701,8 @@ pub const Writer = struct {
         const cols = try arena.alloc(ColBuf, self.cols.len);
         for (cols, self.maps) |*c, m| {
             c.* = ColBuf.init(arena);
-            c.dict_ok = m.phys == .byte_array;
+            c.dict_eligible = m.phys != .boolean;
+            c.dict_ok = c.dict_eligible;
         }
         const mem = try arena.create(std.Io.Writer.Allocating);
         mem.* = std.Io.Writer.Allocating.init(arena);
@@ -909,26 +966,83 @@ fn writePageHeader(
 
 /// Definition levels as an RLE/bit-packed hybrid, always bit-packed groups of
 /// eight at width 1.
+/// Definition levels (0 or 1) as an RLE/bit-packed hybrid of width 1, with no width
+/// byte: a column without nulls is a single run.
 fn packLevels(arena: std.mem.Allocator, defs: []const u8) ![]u8 {
     var out = List(u8).init(arena);
-    const groups = (defs.len + 7) / 8;
-    var h: u64 = (@as(u64, groups) << 1) | 1;
+    try encodeHybrid(u8, &out, defs, 1);
+    return out.toOwnedSlice();
+}
+
+/// The RLE/bit-packed hybrid: a run of at least eight equal values is one RLE run,
+/// anything else is bit-packed in groups of eight. A packed stretch ends on a group
+/// boundary, borrowing values from the run that follows if need be, so that only
+/// the stream's last group is ever padded.
+fn encodeHybrid(comptime T: type, out: *List(u8), vals: []const T, width: u8) !void {
+    const n = vals.len;
+    var i: usize = 0;
+    while (i < n) {
+        const run = runLen(T, vals, i);
+        if (run >= 8) {
+            try putVarint(out, @as(u64, run) << 1);
+            var v: u64 = vals[i];
+            var k: usize = 0;
+            while (k < (@as(usize, width) + 7) / 8) : (k += 1) {
+                try out.append(@intCast(v & 0xFF));
+                v >>= 8;
+            }
+            i += run;
+            continue;
+        }
+        var j = i;
+        while (j < n) {
+            const r = runLen(T, vals, j);
+            if (r >= 8) {
+                const rem = (j - i) % 8;
+                if (rem == 0) break;
+                j += 8 - rem;
+                continue;
+            }
+            j += r;
+        }
+        try packBits(T, out, vals[i..j], width);
+        i = j;
+    }
+}
+
+fn runLen(comptime T: type, vals: []const T, at: usize) usize {
+    var e = at + 1;
+    while (e < vals.len and vals[e] == vals[at]) e += 1;
+    return e - at;
+}
+
+fn putVarint(out: *List(u8), x: u64) !void {
+    var h = x;
     while (true) {
         const b: u8 = @intCast(h & 0x7F);
         h >>= 7;
         try out.append(if (h != 0) b | 0x80 else b);
         if (h == 0) break;
     }
-    var i: usize = 0;
-    while (i < groups) : (i += 1) {
-        var byte: u8 = 0;
-        for (0..8) |k| {
-            const idx = i * 8 + k;
-            if (idx < defs.len and defs[idx] != 0) byte |= @as(u8, 1) << @intCast(k);
+}
+
+/// One bit-packed run of `vals`, padded with zeros to a whole group of eight.
+fn packBits(comptime T: type, out: *List(u8), vals: []const T, width: u8) !void {
+    const groups = (vals.len + 7) / 8;
+    try putVarint(out, (@as(u64, groups) << 1) | 1);
+    var bit_buf: u64 = 0;
+    var bit_n: u7 = 0;
+    for (0..groups * 8) |k| {
+        const v: u64 = if (k < vals.len) vals[k] else 0;
+        bit_buf |= v << @intCast(bit_n);
+        bit_n += @intCast(width);
+        while (bit_n >= 8) {
+            try out.append(@intCast(bit_buf & 0xFF));
+            bit_buf >>= 8;
+            bit_n -= 8;
         }
-        try out.append(byte);
     }
-    return out.toOwnedSlice();
+    if (bit_n > 0) try out.append(@intCast(bit_buf & 0xFF));
 }
 
 fn encodePlain(cb: *ColBuf, m: Mapping, v: Value) !void {
@@ -1323,36 +1437,26 @@ fn readStats(arena: std.mem.Allocator, bytes: []const u8, md: parquet.FileMetaDa
     return out.toOwnedSlice();
 }
 
+/// Whether the chunk is smaller as a dictionary plus bit-packed indices than as
+/// PLAIN values, before compression. Unique ids and timestamps stay PLAIN.
+fn dictSmaller(cb: *const ColBuf, m: Mapping) bool {
+    const entries = cb.entries();
+    const dict = cb.dict_bytes + if (m.phys == .byte_array) 4 * entries else 0;
+    const indices = (cb.dict_idx.items.len * indexWidth(entries) + 7) / 8;
+    return dict + indices < cb.values.items.len;
+}
+
+/// At least 1: a one-entry dictionary with width 0 is legal, but not every reader
+/// takes a zero-byte RLE value.
 fn indexWidth(n: usize) u8 {
-    if (n <= 1) return 0;
+    if (n <= 1) return 1;
     return @intCast(32 - @clz(@as(u32, @intCast(n - 1))));
 }
 
-/// Dictionary indices as an RLE/bit-packed hybrid, always bit-packed in groups
-/// of eight, the shape the reader's `decodeRleHybrid` expects.
+/// Dictionary indices as an RLE/bit-packed hybrid.
 fn packRleIndices(out: *List(u8), idx: []const u32, width: u8) !void {
-    if (width == 0 or idx.len == 0) return;
-    const groups = (idx.len + 7) / 8;
-    var h: u64 = (@as(u64, groups) << 1) | 1;
-    while (true) {
-        const b: u8 = @intCast(h & 0x7F);
-        h >>= 7;
-        try out.append(if (h != 0) b | 0x80 else b);
-        if (h == 0) break;
-    }
-    var bit_buf: u32 = 0;
-    var bit_n: u6 = 0;
-    for (0..groups * 8) |i| {
-        const v: u32 = if (i < idx.len) idx[i] else 0;
-        bit_buf |= v << @intCast(bit_n);
-        bit_n += @intCast(width);
-        while (bit_n >= 8) {
-            try out.append(@intCast(bit_buf & 0xFF));
-            bit_buf >>= 8;
-            bit_n -= 8;
-        }
-    }
-    if (bit_n > 0) try out.append(@intCast(bit_buf & 0xFF));
+    if (idx.len == 0) return;
+    try encodeHybrid(u32, out, idx, width);
 }
 
 fn writeDictPageHeader(out: *List(u8), uncompressed: usize, compressed: usize, values: usize, crc: u32) !void {
@@ -1436,12 +1540,96 @@ test "dictionary encoding round-trips low-cardinality strings" {
 }
 
 test "index width covers the dictionary size" {
-    try testing.expectEqual(@as(u8, 0), indexWidth(1));
+    try testing.expectEqual(@as(u8, 1), indexWidth(1));
     try testing.expectEqual(@as(u8, 1), indexWidth(2));
     try testing.expectEqual(@as(u8, 2), indexWidth(3));
     try testing.expectEqual(@as(u8, 2), indexWidth(4));
     try testing.expectEqual(@as(u8, 3), indexWidth(5));
     try testing.expectEqual(@as(u8, 8), indexWidth(256));
+}
+
+test "the RLE/bit-packed hybrid round-trips runs, short stretches and runs that start mid-group" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var vals = List(u32).init(a);
+    for (0..20) |_| try vals.append(3);
+    for (0..5) |k| try vals.append(@intCast(k));
+    for (0..13) |_| try vals.append(7);
+    for (0..3) |k| try vals.append(@intCast(k + 1));
+    for (0..9) |_| try vals.append(0);
+    var x: u32 = 12345;
+    for (0..37) |_| {
+        x = x *% 1103515245 +% 12345;
+        try vals.append((x >> 16) % 6);
+    }
+    for ([_]u8{ 3, 8, 17 }) |width| {
+        var out = List(u8).init(a);
+        try encodeHybrid(u32, &out, vals.items, width);
+        try testing.expectEqualSlices(u32, vals.items, try pqdecode.decodeRleHybrid(a, out.items, @intCast(width), vals.items.len));
+    }
+
+    const all_set = [_]u8{1} ** 100_000;
+    const levels = try packLevels(a, &all_set);
+    try testing.expect(levels.len <= 4);
+    try testing.expectEqualSlices(u32, &([_]u32{1} ** 100_000), try pqdecode.decodeRleHybrid(a, levels, 1, all_set.len));
+}
+
+test "fixed-width columns of few values are dictionary-encoded, with nulls, and read back exactly; a unique column stays PLAIN" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ dir, "f.parquet" });
+
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "code", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "day", .ty = types.Type.init(.date) },
+        .{ .name = "amt", .ty = types.Type.decimal(30, 2) },
+        .{ .name = "rate", .ty = types.Type.init(.float) },
+        .{ .name = "id", .ty = types.Type.init(.int) },
+    } };
+    var w = try Writer.open(a, path, schema, .snappy, .truncate);
+    const n = 20_000;
+    var bs: [5]column.Builder = undefined;
+    for (&bs, schema.fields) |*b, f| b.* = try column.Builder.initCapacity(a, f.ty, n);
+    for (0..n) |i| {
+        const k: i64 = @intCast(i % 5);
+        try bs[0].append(if (i % 11 == 0) .null else .{ .int = k * 100 });
+        try bs[1].append(.{ .date = @intCast(20_000 + k) });
+        try bs[2].append(.{ .decimal = .{ .unscaled = k * 125, .scale = 2 } });
+        try bs[3].append(.{ .float = @as(f64, @floatFromInt(k)) / 4 });
+        try bs[4].append(.{ .int = @intCast(i) });
+    }
+    var cols: [5]column.Column = undefined;
+    for (&cols, &bs) |*c, *b| c.* = try b.finish();
+    try w.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = n });
+    try w.close();
+
+    const bytes = try tmp.dir.readFileAlloc(a, "f.parquet", 1 << 22);
+    const md = try parquet.parseFile(a, bytes);
+    for (md.row_groups[0].columns, 0..) |c, ci| {
+        const dict = std.mem.indexOfScalar(parquet.Encoding, c.meta.?.encodings, .rle_dictionary) != null;
+        try testing.expectEqual(ci != 4, dict);
+    }
+
+    const r = try pqdecode.Reader.open(a, path);
+    var seen: usize = 0;
+    while (try r.next(a)) |back| {
+        for (0..back.len) |j| {
+            const i = seen + j;
+            const k: i64 = @intCast(i % 5);
+            if (i % 11 == 0) try testing.expect(back.columns[0].getValue(j).isNull()) else try testing.expectEqual(k * 100, back.columns[0].getValue(j).int);
+            try testing.expectEqual(@as(i32, @intCast(20_000 + k)), back.columns[1].getValue(j).date);
+            try testing.expectEqual(@as(i128, k * 125), back.columns[2].getValue(j).decimal.unscaled);
+            try testing.expectEqual(@as(f64, @floatFromInt(k)) / 4, back.columns[3].getValue(j).float);
+            try testing.expectEqual(@as(i64, @intCast(i)), back.columns[4].getValue(j).int);
+        }
+        seen += back.len;
+    }
+    try testing.expectEqual(@as(usize, n), seen);
 }
 
 test "an az:// target routes to the blob writer, never the local filesystem" {
