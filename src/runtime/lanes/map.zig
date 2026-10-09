@@ -29,6 +29,7 @@ const openSink = @import("../connect.zig").openSink;
 const openSqlQuery = @import("../connect.zig").openSqlQuery;
 const parallel = @import("../parallel.zig");
 const parquetSplit = @import("sources.zig").parquetSplit;
+const pqdecode = @import("../../format/parquet/read.zig");
 const planSplit = @import("../connect.zig").planSplit;
 const resolveLaneJoin = @import("join.zig").resolveLaneJoin;
 const keyExprs = @import("../plan.zig").keyExprs;
@@ -294,7 +295,7 @@ fn mapOrderedUnit(ctx: *MapCtx, ord: *OrderedOut, i: usize, warena: *std.heap.Ar
 
 fn runParallelMapImpl(
     env: *Env,
-    split: LaneSplit,
+    split_in: LaneSplit,
     map_stages: []const ast.Stage,
     jshape: ?MapJoinShape,
     w: ast.Write,
@@ -303,6 +304,7 @@ fn runParallelMapImpl(
     lanes_used: *usize,
 ) anyerror!bool {
     const arena = env.arena;
+    var split = split_in;
     var out_schema = try mapChainSchema(env, map_stages, split.schema().*);
 
     env.src_name = split.label();
@@ -313,6 +315,7 @@ fn runParallelMapImpl(
         const lp = (try resolveLaneJoin(env, js.join, js.join_hints, js.suffix, out_schema)) orelse return false;
         lane_join = lp.lane;
         out_schema = lp.out_schema;
+        if (split == .parquet) split.parquet.keys = try laneParquetKeys(env, js, lp.lane, map_stages);
     }
 
     const wr = try resolveUpsertKeys(env, w);
@@ -397,6 +400,21 @@ fn writeLaneJoinDrain(env: *Env, lj: LaneJoin, sink_mode: parallel.SinkMode, mtx
         try sk.close();
     }
     return out;
+}
+
+/// The indexed right side's keys as row-group tests for the Parquet morsels of the
+/// left side, on the terms of the serial plan (`keypush.ParquetKeys`).
+fn laneParquetKeys(env: *Env, js: MapJoinShape, lane: LaneJoin, map_stages: []const ast.Stage) ![]const pqdecode.KeyBound {
+    const arena = env.arena;
+    if (!keypush.leftMayNarrow(js.join) or keypush.disabled(js.join_hints)) return &.{};
+    const trace = try std.mem.concat(arena, ast.Stage, &.{ map_stages, lane.probe_prep });
+    const exprs = (try keyExprs(arena, trace, lane.left_key_names)) orelse return &.{};
+    const cols = try keypush.plainColumns(arena, exprs);
+    for (cols) |c| {
+        if (c != null) break;
+    } else return &.{};
+    const keys = try op.collectKeys(arena, &.{lane.index.build_batch}, lane.right_keys, op.default_push_cap);
+    return keypush.keyBounds(arena, cols, keys);
 }
 
 /// A row group per item for parquet; a CSV is cut into about `ordered_chunk_bytes`

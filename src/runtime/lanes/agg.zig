@@ -410,6 +410,7 @@ pub const PqMorsels = struct {
     items: []const PqItem,
     project: ?[][]const u8,
     bounds: []const pqdecode.Bound,
+    keys: []const pqdecode.KeyBound = &.{},
     src_schema: *const types.Schema,
     queue: WorkQueue,
     tally: ?*driver.ScanTally = null,
@@ -440,6 +441,7 @@ pub fn openItem(m: *const PqMorsels, scratch: std.mem.Allocator, held: *?HeldFil
     }
     const r = held.*.?.r;
     r.bounds = m.bounds;
+    r.keys = m.keys;
     r.tally = m.tally;
     r.rg = it.rg;
     r.rg_end = if (it.rg_end) |e| e else null;

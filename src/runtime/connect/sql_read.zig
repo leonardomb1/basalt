@@ -74,6 +74,35 @@ pub fn projectSqlRead(env: *Env, stages: []const ast.Stage) ![]const ast.Stage {
     return out;
 }
 
+/// A joined side's SQL table read narrowed to what the join and the stages after it
+/// may take from it (`needs`, names after the side's own stages, traced back through
+/// them), kept to the table's own columns, as `needs` holds the other side's names
+/// too. Unchanged when the side already asks for columns or anything is unprovable.
+pub fn projectJoinedSqlRead(env: *Env, stages: []const ast.Stage, needs: []const []const u8) ![]const ast.Stage {
+    if (stages.len == 0 or stages[0].node != .read) return stages;
+    const rd = stages[0].node.read;
+    if (rd.form != .table or rd.cols.len > 0) return stages;
+    const conn = env.connections.get(rd.connector) orelse return stages;
+    if (sqlConnInfo(conn) == null) return stages;
+    const items = try env.arena.alloc(ast.SelectItem, needs.len);
+    for (needs, items) |n, *it| {
+        const parts = try env.arena.alloc([]const u8, 1);
+        parts[0] = n;
+        it.* = .{ .field = .{ .parts = parts } };
+    }
+    const tail = [_]ast.Stage{.{ .node = .{ .select = items }, .hints = &.{}, .pos = stages[0].pos }};
+    const cols = (try projectedColumns(env, try std.mem.concat(env.arena, ast.Stage, &.{ stages[1..], &tail }))) orelse return stages;
+    if (cols.len == 0) return stages;
+    for (cols) |c| if (std.mem.indexOfScalar(u8, c, '.') != null) return stages;
+    const own = (try tableColumnsAmong(env, rd, stages[0].hints, cols)) orelse return stages;
+    if (own.len == 0) return stages;
+    const out = try env.arena.dupe(ast.Stage, stages);
+    var nrd = rd;
+    nrd.cols = own;
+    out[0].node = .{ .read = nrd };
+    return out;
+}
+
 fn tableColumnsAmong(env: *Env, rd: ast.Read, hints: []const ast.Hint, names: []const []const u8) !?[]const []const u8 {
     var probe = rd;
     probe.where = "1 = 0";

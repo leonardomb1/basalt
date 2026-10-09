@@ -23,6 +23,14 @@
 //! key as nothing, since a collation orders text otherwise than basalt. Text
 //! compared under a case- or trailing-space-insensitive collation keeps more rows
 //! than match, which the join then discards.
+//!
+//! A local Parquet file or folder takes keys the same way and on the same terms
+//! (`ParquetKeys`), but nothing is re-read: its row groups whose min/max statistics
+//! hold no key value (or, past the cap, no part of the keys' range) are skipped.
+//! Only a key that is one of the file's columns as is counts; a computed one, a
+//! text one (`groupMayHoldKeys`), or a group without statistics of the key's own
+//! kind, keeps every group. A SQL side
+//! takes before a Parquet one, so two sides never wait on each other's keys.
 
 const Env = @import("env.zig").Env;
 const Value = @import("../exec/value.zig").Value;
@@ -30,7 +38,11 @@ const ast = @import("../lang/ast.zig");
 const connect = @import("connect.zig");
 const driver = @import("../connect/driver.zig");
 const eval = @import("../exec/eval.zig");
+const csv = @import("../format/csv.zig");
+const folder = @import("../connect/folder.zig");
+const ftp = @import("../store/ftp.zig");
 const op = @import("../exec/op.zig");
+const pqdecode = @import("../format/parquet/read.zig");
 const std = @import("std");
 const translate = @import("pushdown/translate.zig");
 const types = @import("../lang/types.zig");
@@ -83,6 +95,33 @@ pub fn sqlDialect(env: *Env, stages: []const ast.Stage) ?Dialect {
         else => return null,
     };
     return info.dialect;
+}
+
+/// What a read at the head of `stages` takes keys as: its SQL dialect, or a local
+/// Parquet file or folder, followed by nothing but filters and selects.
+pub const Want = union(enum) { sql: Dialect, parquet };
+
+pub fn takerFor(env: *Env, stages: []const ast.Stage) !?Want {
+    if (sqlDialect(env, stages)) |d| return .{ .sql = d };
+    if (try parquetSide(env, stages)) return .parquet;
+    return null;
+}
+
+/// A local Parquet file, or a folder of them, read with nothing but filters and
+/// selects after it. A folder that cannot be listed is left to fail on its read.
+pub fn parquetSide(env: *Env, stages: []const ast.Stage) !bool {
+    if (stages.len == 0 or stages[0].node != .read) return false;
+    const rd = stages[0].node.read;
+    if (!std.mem.eql(u8, rd.connector, "csv") or rd.form != .path) return false;
+    for (stages[1..]) |st| switch (st.node) {
+        .filter, .select => {},
+        else => return false,
+    };
+    const path = rd.form.path;
+    if (csv.CsvReader.isUrl(path) or ftp.isUrl(path)) return false;
+    if (!folder.isFolder(path)) return pqdecode.Reader.isPath(path);
+    const fr = (connect.resolveFolder(env, path, stages[0].hints) catch return false) orelse return false;
+    return fr.kind == .parquet;
 }
 
 /// Column `name` after `stages` (what follows a read: filters and selects) as an
@@ -191,6 +230,77 @@ pub fn render(arena: std.mem.Allocator, dialect: Dialect, schema: types.Schema, 
     if (parts.items.len == 0) return null;
     return try std.mem.join(arena, " AND ", parts.items);
 }
+
+/// Per key, the column of the read it is unchanged, or null for a computed key.
+pub fn plainColumns(arena: std.mem.Allocator, exprs: []const ?*ast.Expr) ![]const ?[]const u8 {
+    const out = try arena.alloc(?[]const u8, exprs.len);
+    for (exprs, out) |maybe, *c| {
+        c.* = null;
+        const e = maybe orelse continue;
+        if (e.* == .field and !e.field.dollar and e.field.parts.len == 1) c.* = e.field.parts[0];
+    }
+    return out;
+}
+
+/// The row-group tests for a Parquet read whose key `cols[i]` (null: computed) must
+/// equal one of `keys[i]`: the values while they are all listed, else their range.
+/// A key the other side holds no value of rules out every group.
+pub fn keyBounds(arena: std.mem.Allocator, cols: []const ?[]const u8, keys: []const op.KeyValues) ![]const pqdecode.KeyBound {
+    var out = std.array_list.Managed(pqdecode.KeyBound).init(arena);
+    for (cols, keys) |maybe, kv| {
+        if (kv.values.len == 0 and !kv.overflow) {
+            const none = try arena.alloc(pqdecode.KeyBound, 1);
+            none[0] = .{ .column = "", .none = true };
+            return none;
+        }
+        const c = maybe orelse continue;
+        try out.append(.{ .column = c, .values = if (kv.overflow) &.{} else kv.values, .min = kv.min, .max = kv.max });
+    }
+    return out.toOwnedSlice();
+}
+
+/// A Parquet read handed a join's keys before its first row group: the reader (or
+/// the folder, for every file it opens) then skips the groups `keyBounds` rules out.
+pub const ParquetKeys = struct {
+    arena: std.mem.Allocator,
+    reader: ?*pqdecode.Reader = null,
+    folder: ?*pqdecode.Folder = null,
+    cols: []const ?[]const u8 = &.{},
+
+    pub fn push(self: *ParquetKeys) op.KeyPush {
+        return .{ .ctx = self, .apply = apply };
+    }
+
+    fn apply(ctx: *anyopaque, keys: []const op.KeyValues) anyerror!void {
+        const self: *ParquetKeys = @ptrCast(@alignCast(ctx));
+        if (self.cols.len != keys.len) return;
+        const kb = try keyBounds(self.arena, self.cols, keys);
+        if (self.reader) |r| r.keys = kb;
+        if (self.folder) |f| f.keys = kb;
+    }
+};
+
+/// The read a join hands its keys to, SQL or Parquet.
+pub const Taker = union(enum) {
+    sql: *LateSql,
+    parquet: *ParquetKeys,
+
+    /// Gives the taker each key's expression over its read's columns, and returns
+    /// where the join sends the keys, or null when no key reaches the read.
+    pub fn bind(self: Taker, exprs: []const ?*ast.Expr) !?op.KeyPush {
+        switch (self) {
+            .sql => |l| {
+                l.exprs = exprs;
+                return l.push();
+            },
+            .parquet => |p| {
+                p.cols = try plainColumns(p.arena, exprs);
+                for (p.cols) |c| if (c != null) return p.push();
+                return null;
+            },
+        }
+    }
+};
 
 /// `v` as a SQL literal, or null when it cannot be spelled exactly. Floats only
 /// bound a range (`ranged`), as their text may not round-trip to the column's

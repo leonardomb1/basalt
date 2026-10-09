@@ -1,5 +1,6 @@
-//! Row-group pruning: a group's min/max statistics against the query's bounds, and a
-//! file's min/max for a top-N threshold.
+//! Row-group pruning: a group's min/max statistics against the query's bounds and
+//! against the other side's keys of a join, and a file's min/max for a top-N
+//! threshold.
 
 const Error = @import("read.zig").Error;
 const Leaf = @import("schema.zig").Leaf;
@@ -52,6 +53,66 @@ pub fn groupMayMatch(
         if (excluded) return false;
     }
     return true;
+}
+
+/// One join key's values on the other side of a join: the distinct values when
+/// `values` lists them all, else only their `min`..`max`; `none` when that side
+/// holds no key at all, so no row here can match.
+pub const KeyBound = struct {
+    column: []const u8,
+    values: []const Value = &.{},
+    min: ?Value = null,
+    max: ?Value = null,
+    none: bool = false,
+};
+
+/// Whether a row group could hold a row whose key equals one of the other side's.
+/// A group is dropped only when its statistics are present, of the key's own kind,
+/// and no key value (or, past the list, no part of the keys' range) falls within
+/// its min/max. Text statistics are never read (`statValue`), so text keys skip
+/// nothing: without the footer's column orders a writer's byte order is unknown.
+pub fn groupMayHoldKeys(
+    schema: []const parquet.SchemaElement,
+    leaves: []const Leaf,
+    g: parquet.RowGroup,
+    keys: []const KeyBound,
+) bool {
+    for (keys) |k| {
+        if (k.none) return false;
+        const lf = findLeaf(leaves, k.column) orelse continue;
+        if (lf.chunk_idx >= g.columns.len) continue;
+        const meta = g.columns[lf.chunk_idx].meta orelse continue;
+        const elem = schema[lf.schema_idx];
+        const lo = statValue(elem, meta.ty, meta.stats.min) orelse continue;
+        const hi = statValue(elem, meta.ty, meta.stats.max) orelse continue;
+        if (k.values.len > 0) {
+            for (k.values) |v| {
+                if (!sameKind(lo, v) or !sameKind(hi, v)) break;
+                const a = cmp(v, lo) orelse break;
+                const b = cmp(v, hi) orelse break;
+                if (a != .lt and b != .gt) break;
+            } else return false;
+            continue;
+        }
+        const mn = k.min orelse continue;
+        const mx = k.max orelse continue;
+        if (!sameKind(lo, mn) or !sameKind(hi, mx)) continue;
+        if ((cmp(mx, lo) orelse continue) == .lt) return false;
+        if ((cmp(mn, hi) orelse continue) == .gt) return false;
+    }
+    return true;
+}
+
+/// Whether a key value and a statistic order alike: both numbers, or both of one
+/// kind; a NaN orders with nothing.
+fn sameKind(stat: Value, v: Value) bool {
+    if (v == .float and std.math.isNan(v.float)) return false;
+    if (stat == .float and std.math.isNan(stat.float)) return false;
+    if (isNumV(stat) and isNumV(v)) return true;
+    return switch (v) {
+        .string, .bytes, .date, .timestamp, .time => std.meta.activeTag(stat) == std.meta.activeTag(v),
+        else => false,
+    };
 }
 
 /// Whether a row group could hold a row entering the current top-N; only a
@@ -242,6 +303,50 @@ test "row groups are skipped only when statistics prove no row can match" {
 
     const other = [_]Bound{.{ .column = "nosuch", .op = .lt, .value = .{ .int = 0 } }};
     try testing.expect(groupMayMatch(&schema, &leaves, g, &other));
+}
+
+test "join keys skip a row group only when no key value can fall within its min/max" {
+    const schema = [_]parquet.SchemaElement{
+        .{ .name = "root", .num_children = 2 },
+        .{ .name = "id", .ty = .int64, .repetition = .optional },
+        .{ .name = "code", .ty = .byte_array, .repetition = .optional, .converted_type = 0 },
+    };
+    const leaves = [_]Leaf{
+        .{ .schema_idx = 1, .chunk_idx = 0, .name = "id", .max_def = 1, .max_rep = 0 },
+        .{ .schema_idx = 2, .chunk_idx = 1, .name = "code", .max_def = 1, .max_rep = 0 },
+    };
+    var lo: [8]u8 = undefined;
+    var hi: [8]u8 = undefined;
+    std.mem.writeInt(i64, &lo, 100, .little);
+    std.mem.writeInt(i64, &hi, 200, .little);
+    var chunks = [_]parquet.ColumnChunk{
+        .{ .meta = .{ .ty = .int64, .stats = .{ .min = &lo, .max = &hi } } },
+        .{ .meta = .{ .ty = .byte_array, .stats = .{ .min = "b", .max = "d" } } },
+    };
+    const g = parquet.RowGroup{ .columns = &chunks, .num_rows = 10 };
+    const hold = struct {
+        fn f(gr: parquet.RowGroup, sch: []const parquet.SchemaElement, lv: []const Leaf, k: KeyBound) bool {
+            return groupMayHoldKeys(sch, lv, gr, &.{k});
+        }
+    }.f;
+
+    try testing.expect(!hold(g, &schema, &leaves, .{ .column = "id", .values = &.{ .{ .int = 5 }, .{ .int = 250 } } }));
+    try testing.expect(hold(g, &schema, &leaves, .{ .column = "id", .values = &.{ .{ .int = 5 }, .{ .int = 150 } } }));
+    try testing.expect(hold(g, &schema, &leaves, .{ .column = "id", .values = &.{ .{ .int = 5 }, .{ .int = 200 } } }));
+    try testing.expect(hold(g, &schema, &leaves, .{ .column = "id", .values = &.{.{ .float = 150.5 }} }));
+    try testing.expect(hold(g, &schema, &leaves, .{ .column = "id", .values = &.{ .{ .int = 5 }, .{ .string = "150" } } }));
+    try testing.expect(hold(g, &schema, &leaves, .{ .column = "id", .values = &.{.{ .float = std.math.nan(f64) }} }));
+    try testing.expect(!hold(g, &schema, &leaves, .{ .column = "id", .min = .{ .int = 300 }, .max = .{ .int = 900 } }));
+    try testing.expect(!hold(g, &schema, &leaves, .{ .column = "id", .min = .{ .int = 1 }, .max = .{ .int = 99 } }));
+    try testing.expect(hold(g, &schema, &leaves, .{ .column = "id", .min = .{ .int = 1 }, .max = .{ .int = 900 } }));
+    try testing.expect(hold(g, &schema, &leaves, .{ .column = "id" }));
+    try testing.expect(!hold(g, &schema, &leaves, .{ .column = "id", .none = true }));
+    try testing.expect(hold(g, &schema, &leaves, .{ .column = "nosuch", .values = &.{.{ .int = 5 }} }));
+    try testing.expect(hold(g, &schema, &leaves, .{ .column = "code", .values = &.{.{ .string = "z" }} }));
+
+    var bare = [_]parquet.ColumnChunk{.{ .meta = .{ .ty = .int64 } }};
+    const g2 = parquet.RowGroup{ .columns = &bare, .num_rows = 10 };
+    try testing.expect(hold(g2, &schema, &leaves, .{ .column = "id", .values = &.{.{ .int = 5 }} }));
 }
 
 test "a polars footer carries the LogicalType, and pruning uses converted units" {

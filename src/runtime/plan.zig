@@ -63,6 +63,7 @@ const OneBatch = @import("connect.zig").OneBatch;
 const openSource = @import("connect.zig").openSource;
 const openSourceProjected = @import("connect.zig").openSourceProjected;
 const projectSqlRead = @import("connect.zig").projectSqlRead;
+const projectJoinedSqlRead = @import("connect/sql_read.zig").projectJoinedSqlRead;
 const factsIfWanted = @import("connect.zig").factsIfWanted;
 const sqlConnInfo = @import("connect.zig").sqlConnInfo;
 const exceptColumns = @import("connect.zig").exceptColumns;
@@ -165,69 +166,158 @@ pub fn tailSchema(env: *Env, tail: []const ast.Stage, in: types.Schema) !types.S
 
 /// Source columns the stages after a read need, or null when unprovable. A join
 /// adds its keys and both sides' names; abandoning it once decoded 17 columns, not 4.
-/// A key whose side the plan places by schema could name either side's columns,
-/// so it proves nothing.
+/// A key whose side the plan places by schema (`deferred`) adds every name either
+/// value of its `=` uses, so the placement sees the same columns. A select of `*`
+/// plus computed columns (a computed join key's) passes every column through and
+/// asks only for what its expressions read; a lone `* EXCEPT` (the drop of those
+/// keys after the join) passes the rest through.
 pub fn projectedColumns(env: *Env, stages: []const ast.Stage) !?[][]const u8 {
-    var set = std.StringHashMap(void).init(env.arena);
-    var right = std.array_list.Managed([]const u8).init(env.arena);
-    var defines_output = false;
-    for (stages) |st| {
-        switch (st.node) {
-            .filter => |e| try exprFields(env, e, &set, right.items),
-            .sort => |so| for (so.keys) |k| try putField(&set, k.field, right.items),
-            .distinct => |d| {
-                const on = d.on orelse return null;
-                for (on) |q| try putField(&set, q, right.items);
-            },
-            .aggregate => |ag| {
-                for (ag.by) |q| try putField(&set, q, right.items);
-                for (ag.aggs) |a| if (a.arg) |e| try exprFields(env, e, &set, right.items);
-                defines_output = true;
-                break;
-            },
-            .select => |items| {
-                for (items) |it| switch (it) {
-                    .star, .star_except, .star_rename => return null,
-                    .field => |q| try putField(&set, q, right.items),
-                    .computed => |c| try exprFields(env, c.expr, &set, right.items),
-                };
-                defines_output = true;
-                break;
-            },
-            .limit => {},
-            .window => |w| {
-                for (w.partition_by) |q| try putField(&set, q, right.items);
-                for (w.order_by) |k| try putField(&set, k.field, right.items);
-                for (w.funcs) |f| if (f.arg) |q| try putField(&set, q, right.items);
-            },
-            .join => |j| {
-                if (j.deferred.len > 0) return null;
-                for (j.left_keys) |q| try set.put(q.parts[q.parts.len - 1], {});
-                try right.append(if (j.alias.len > 0) j.alias else j.binding);
-                if (j.residual) |e| try exprFields(env, e, &set, right.items);
-            },
-            else => return null,
-        }
+    var w = Needs.init(env, null);
+    return w.walk(stages);
+}
+
+/// The names a join and the stages after it (`after`) may take from its right side:
+/// its keys and every name its ON uses, then what the rest uses that is the side's
+/// (qualified by its alias) or could be (unqualified, a clash's `_r` suffix also read
+/// as the bare name). Null when the rest keeps every column or cannot be read.
+pub fn rightNeeds(env: *Env, j: ast.Join, after: []const ast.Stage) !?[][]const u8 {
+    var w = Needs.init(env, if (j.alias.len > 0) j.alias else j.binding);
+    for (j.right_keys) |q| try w.key(q);
+    for (j.deferred) |d| {
+        try w.expr(d.a);
+        try w.expr(d.b);
     }
-    if (!defines_output) return null;
-    var out = std.array_list.Managed([]const u8).init(env.arena);
-    var it = set.keyIterator();
-    while (it.next()) |k| try out.append(k.*);
-    return try out.toOwnedSlice();
+    if (j.residual) |e| try w.expr(e);
+    return w.walk(after);
 }
 
-fn putField(set: *std.StringHashMap(void), q: ast.QualName, right: []const []const u8) !void {
-    if (q.parts.len > 1) for (right) |r| {
-        if (std.ascii.eqlIgnoreCase(r, q.parts[0])) return;
-    };
-    try set.put(q.parts[0], {});
-}
+/// What `projectedColumns` and `rightNeeds` collect. `own`, when set, is the alias
+/// whose qualified names are the read's own; names a join or a pass-through select
+/// made (`made`) are no source's.
+const Needs = struct {
+    env: *Env,
+    own: ?[]const u8,
+    set: std.StringHashMap(void),
+    right: std.array_list.Managed([]const u8),
+    made: std.StringHashMap(void),
+    joined: bool = false,
 
-fn exprFields(env: *Env, e: *const ast.Expr, set: *std.StringHashMap(void), right: []const []const u8) !void {
-    if (right.len == 0) return pushdown.collectFields(e, set);
-    var quals = std.array_list.Managed(ast.QualName).init(env.arena);
-    try pushdown.collectQuals(env.arena, e, &quals);
-    for (quals.items) |q| try putField(set, q, right);
+    fn init(env: *Env, own: ?[]const u8) Needs {
+        return .{
+            .env = env,
+            .own = own,
+            .set = std.StringHashMap(void).init(env.arena),
+            .right = std.array_list.Managed([]const u8).init(env.arena),
+            .made = std.StringHashMap(void).init(env.arena),
+            .joined = own != null,
+        };
+    }
+
+    fn walk(self: *Needs, stages: []const ast.Stage) !?[][]const u8 {
+        var defines_output = false;
+        for (stages) |st| {
+            switch (st.node) {
+                .filter => |e| try self.expr(e),
+                .sort => |so| for (so.keys) |k| try self.field(k.field),
+                .distinct => |d| {
+                    const on = d.on orelse return null;
+                    for (on) |q| try self.field(q);
+                },
+                .aggregate => |ag| {
+                    for (ag.by) |q| try self.field(q);
+                    for (ag.aggs) |a| if (a.arg) |e| try self.expr(e);
+                    defines_output = true;
+                    break;
+                },
+                .select => |items| {
+                    if (passThrough(items)) {
+                        for (items[1..]) |it| try self.expr(it.computed.expr);
+                        for (items[1..]) |it| try self.made.put(it.computed.name, {});
+                        continue;
+                    }
+                    if (items.len == 1 and items[0] == .star_except) continue;
+                    for (items) |it| switch (it) {
+                        .star, .star_except, .star_rename => return null,
+                        .field => |q| try self.field(q),
+                        .computed => |c| try self.expr(c.expr),
+                    };
+                    defines_output = true;
+                    break;
+                },
+                .limit => {},
+                .window => |wd| {
+                    for (wd.partition_by) |q| try self.field(q);
+                    for (wd.order_by) |k| try self.field(k.field);
+                    for (wd.funcs) |f| if (f.arg) |q| try self.field(q);
+                },
+                .join => |j| {
+                    for (j.left_keys) |q| try self.key(q);
+                    for (j.deferred) |d| {
+                        try self.expr(d.a);
+                        try self.expr(d.b);
+                        try self.made.put(d.left_name, {});
+                        try self.made.put(d.right_name, {});
+                    }
+                    try self.right.append(if (j.alias.len > 0) j.alias else j.binding);
+                    self.joined = true;
+                    if (j.residual) |e| try self.expr(e);
+                },
+                else => return null,
+            }
+        }
+        if (!defines_output) return null;
+        var out = std.array_list.Managed([]const u8).init(self.env.arena);
+        var it = self.set.keyIterator();
+        while (it.next()) |k| try out.append(k.*);
+        return try out.toOwnedSlice();
+    }
+
+    /// `*` followed only by computed columns: every input column passes through.
+    fn passThrough(items: []const ast.SelectItem) bool {
+        if (items.len < 2 or items[0] != .star) return false;
+        for (items[1..]) |it| if (it != .computed) return false;
+        return true;
+    }
+
+    fn name(self: *Needs, n: []const u8) !void {
+        if (self.made.contains(n)) return;
+        try self.set.put(n, {});
+        if (self.joined) if (clashBase(n)) |b| try self.set.put(b, {});
+    }
+
+    fn field(self: *Needs, q: ast.QualName) !void {
+        if (q.parts.len > 1) {
+            if (self.own) |o| if (std.ascii.eqlIgnoreCase(o, q.parts[0])) return self.name(q.parts[1]);
+            for (self.right.items) |r| if (std.ascii.eqlIgnoreCase(r, q.parts[0])) return;
+        }
+        try self.name(q.parts[0]);
+    }
+
+    fn key(self: *Needs, q: ast.QualName) !void {
+        if (q.parts.len > 1) if (self.own) |o| if (std.ascii.eqlIgnoreCase(o, q.parts[0])) return self.name(q.parts[1]);
+        try self.name(q.parts[q.parts.len - 1]);
+    }
+
+    fn expr(self: *Needs, e: *const ast.Expr) !void {
+        if (!self.joined) {
+            var names = std.StringHashMap(void).init(self.env.arena);
+            try pushdown.collectFields(e, &names);
+            var it = names.keyIterator();
+            while (it.next()) |k| try self.name(k.*);
+            return;
+        }
+        var quals = std.array_list.Managed(ast.QualName).init(self.env.arena);
+        try pushdown.collectQuals(self.env.arena, e, &quals);
+        for (quals.items) |q| try self.field(q);
+    }
+};
+
+/// `x` for a right column renamed `x_r` or `x_r2` on clashing with a left one.
+fn clashBase(n: []const u8) ?[]const u8 {
+    const at = std.mem.lastIndexOf(u8, n, "_r") orelse return null;
+    if (at == 0) return null;
+    for (n[at + 2 ..]) |c| if (!std.ascii.isDigit(c)) return null;
+    return n[0..at];
 }
 
 /// `column <op> literal` conjuncts of a filter, AND-joined only, usable to skip
@@ -330,24 +420,26 @@ pub fn buildPipeline(env: *Env, stages_in: []const ast.Stage) anyerror!PipeRes {
     return buildPipelineWith(env, stages_in, null);
 }
 
-/// A join's request that the pipeline's SQL read open late, to take its keys.
-const LateReq = struct { dialect: keypush.Dialect, out: *?*keypush.LateSql };
+/// A join's request that the pipeline's read take its keys: a SQL read opens late,
+/// a Parquet one keeps its reader.
+const LateReq = struct { want: keypush.Want, out: *?keypush.Taker };
 
-/// The pipeline's own read opened late for the first join after it, which hands
+/// The pipeline's own read taking the keys of the first join after it, which hands
 /// it the right side's keys; `prefix` is what lies between them.
-pub const ProbeTake = struct { late: *keypush.LateSql, prefix: []const ast.Stage };
+pub const ProbeTake = struct { late: keypush.Taker, prefix: []const ast.Stage };
 
-/// The first join after `stages[0]` whose right side's keys narrow this SQL read:
-/// only filters and selects between, a kind that drops unmatched left rows, and
-/// a right side that is not itself taking the left side's keys.
-fn probeTaker(env: *Env, stages: []const ast.Stage) !?struct { idx: usize, dialect: keypush.Dialect } {
+/// The first join after `stages[0]` whose right side's keys narrow this SQL or
+/// Parquet read: only filters and selects between, a kind that drops unmatched left
+/// rows, and a right side that is not itself taking the left side's keys.
+fn probeTaker(env: *Env, stages: []const ast.Stage) !?struct { idx: usize, want: keypush.Want } {
     for (stages[1..], 1..) |st, i| switch (st.node) {
         .filter, .select => {},
         .join => |j| {
             if (keypush.disabled(st.hints) or !keypush.leftMayNarrow(j)) return null;
-            const d = keypush.sqlDialect(env, stages[0..i]) orelse return null;
+            const want = (try keypush.takerFor(env, stages[0..i])) orelse return null;
             if (try rightTakes(env, j, st.hints)) return null;
-            return .{ .idx = i, .dialect = d };
+            if (want == .parquet and try rightTakesParquet(env, j, st.hints)) return null;
+            return .{ .idx = i, .want = want };
         },
         else => return null,
     };
@@ -359,6 +451,37 @@ pub fn rightTakes(env: *Env, j: ast.Join, hints: []const ast.Hint) !bool {
     if (keypush.disabled(hints) or !keypush.rightMayNarrow(j)) return false;
     const b = env.bindings.get(j.binding) orelse return false;
     return keypush.sqlDialect(env, try inlineHeadBindings(env, try j.rightStages(env.arena, b.stages))) != null;
+}
+
+fn rightTakesParquet(env: *Env, j: ast.Join, hints: []const ast.Hint) !bool {
+    if (keypush.disabled(hints) or !keypush.rightMayNarrow(j)) return false;
+    const b = env.bindings.get(j.binding) orelse return false;
+    return keypush.parquetSide(env, try inlineHeadBindings(env, try j.rightStages(env.arena, b.stages)));
+}
+
+const Taken = struct { src: @import("../connect/driver.zig").Source, taker: ?keypush.Taker };
+
+/// The pipeline's read opened to take a join's keys: a SQL read late, a Parquet one
+/// as usual with its reader or folder kept. No taker when it did not open as Parquet.
+fn openTaker(env: *Env, stages: []const ast.Stage, want: keypush.Want) !Taken {
+    const rd = stages[0].node.read;
+    switch (want) {
+        .sql => |d| {
+            const l = try keypush.LateSql.open(env, rd, stages[0].hints, d);
+            return .{ .src = l.source(), .taker = .{ .sql = l } };
+        },
+        .parquet => {
+            const r0 = env.pq_reader;
+            const f0 = env.pq_folder;
+            const src = try openSourceProjected(env, rd, stages[0].hints, try projectedColumns(env, stages[1..]), try filterBounds(env, stages[1..]));
+            const pk = try env.arena.create(keypush.ParquetKeys);
+            pk.* = .{ .arena = env.arena };
+            if (env.pq_reader != r0) pk.reader = env.pq_reader;
+            if (env.pq_folder != f0) pk.folder = env.pq_folder;
+            if (pk.reader == null and pk.folder == null) return .{ .src = src, .taker = null };
+            return .{ .src = src, .taker = .{ .parquet = pk } };
+        },
+    }
 }
 
 fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq) anyerror!PipeRes {
@@ -374,14 +497,16 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
     switch (stages[0].node) {
         .read => |rd| {
             const raw = if (late_req) |lr| blk: {
-                const l = try keypush.LateSql.open(env, rd, stages[0].hints, lr.dialect);
-                lr.out.* = l;
-                break :blk l.source();
+                const t = try openTaker(env, stages, lr.want);
+                lr.out.* = t.taker;
+                break :blk t.src;
             } else if (try probeTaker(env, stages)) |pt| blk: {
-                const l = try keypush.LateSql.open(env, rd, stages[0].hints, pt.dialect);
-                take = .{ .late = l, .prefix = stages[1..pt.idx] };
-                take_at = pt.idx;
-                break :blk l.source();
+                const t = try openTaker(env, stages, pt.want);
+                if (t.taker) |tk| {
+                    take = .{ .late = tk, .prefix = stages[1..pt.idx] };
+                    take_at = pt.idx;
+                }
+                break :blk t.src;
             } else try openSourceProjected(env, rd, stages[0].hints, try projectedColumns(env, stages[1..]), try filterBounds(env, stages[1..]));
             const cs = try env.arena.create(obs.CountingSource);
             cs.* = .{ .inner = raw, .count = env.rows_read };
@@ -757,23 +882,30 @@ pub fn laneJoinCap(env: *Env, j: ast.Join, hints: []const ast.Hint) !usize {
 }
 
 fn buildJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, left_schema: types.Schema, probe: op.Op, take: ?ProbeTake) anyerror!PipeRes {
-    const a = try assembleJoin(env, j, hints, try joinSide(env, j, hints), left_schema, probe, take);
+    const a = try assembleJoin(env, j, hints, try joinSide(env, j, hints, null), left_schema, probe, take);
     if (a.nl) |r| return r;
     return .{ .op = .{ .join = a.o }, .schema = a.schema };
 }
 
-pub const JoinSide = struct { rstages: []const ast.Stage, build: PipeRes, right_late: ?*keypush.LateSql };
+pub const JoinSide = struct { rstages: []const ast.Stage, build: PipeRes, right_late: ?keypush.Taker };
 
-/// A join's right side, planned, with its SQL read when that read takes the left
-/// side's keys.
-pub fn joinSide(env: *Env, j: ast.Join, hints: []const ast.Hint) anyerror!JoinSide {
+/// A join's right side, planned, with its SQL or Parquet read when that read takes
+/// the left side's keys. `after` is what follows the join in its pipeline, when
+/// known: a SQL table read then asks only for the columns those stages may take.
+pub fn joinSide(env: *Env, j: ast.Join, hints: []const ast.Hint, after: ?[]const ast.Stage) anyerror!JoinSide {
     if (env.bindings.get(j.binding) == null)
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown binding `{s}` in join", .{j.binding}));
-    const rstages = try prepareJoinSide(env, try j.rightStages(env.arena, env.bindings.get(j.binding).?.stages));
-    var right_late: ?*keypush.LateSql = null;
-    const a_dialect = if (!keypush.disabled(hints) and keypush.rightMayNarrow(j)) keypush.sqlDialect(env, rstages) else null;
-    const build = if (a_dialect) |d|
-        try buildPipelineWith(env, rstages, .{ .dialect = d, .out = &right_late })
+    var rstages = try prepareJoinSide(env, try j.rightStages(env.arena, env.bindings.get(j.binding).?.stages));
+    if (after) |rest| if (try rightNeeds(env, j, rest)) |needs| {
+        rstages = try projectJoinedSqlRead(env, rstages, needs);
+    };
+    var right_late: ?keypush.Taker = null;
+    const a_want: ?keypush.Want = if (keypush.disabled(hints) or !keypush.rightMayNarrow(j))
+        null
+    else
+        try keypush.takerFor(env, rstages);
+    const build = if (a_want) |w|
+        try buildPipelineWith(env, rstages, .{ .want = w, .out = &right_late })
     else
         try buildPipeline(env, rstages);
     return .{ .rstages = rstages, .build = build, .right_late = right_late };
@@ -819,16 +951,13 @@ pub fn assembleJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, side: JoinS
         o.residual = rp.pred;
         o.pair_schema = try schemaPtr(arena, rp.schema);
     }
-    if (right_late) |rl| {
-        if (try keyExprs(arena, try std.mem.concat(arena, ast.Stage, &.{ rstages[1..], prep.right }), prep.join.right_keys)) |ex| {
-            rl.exprs = ex;
-            o.push_build = rl.push();
-        }
+    const right_takes = if (right_late) |rl| rl == .sql or take == null else false;
+    if (right_takes) {
+        if (try keyExprs(arena, try std.mem.concat(arena, ast.Stage, &.{ rstages[1..], prep.right }), prep.join.right_keys)) |ex|
+            o.push_build = try right_late.?.bind(ex);
     } else if (take) |t| {
-        if (try keyExprs(arena, try std.mem.concat(arena, ast.Stage, &.{ t.prefix, prep.left }), prep.join.left_keys)) |ex| {
-            t.late.exprs = ex;
-            o.push_probe = t.late.push();
-        }
+        if (try keyExprs(arena, try std.mem.concat(arena, ast.Stage, &.{ t.prefix, prep.left }), prep.join.left_keys)) |ex|
+            o.push_probe = try t.late.bind(ex);
     }
     return .{ .o = o, .schema = out.* };
 }
@@ -932,6 +1061,64 @@ test "prepareJoinSide: a CTE joined in reads its table with its own WHERE, its c
     try std.testing.expectEqualStrings("active", rd.cols[0]);
     try std.testing.expectEqualStrings("name", rd.cols[1]);
     try std.testing.expectEqualStrings("cid", rd.cols[2]);
+}
+
+fn sortedNames(names: ?[][]const u8) ![]const []const u8 {
+    const n = names orelse return error.TestUnexpectedResult;
+    std.mem.sort([]const u8, n, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.order(u8, x, y) == .lt;
+        }
+    }.lt);
+    return n;
+}
+
+test "projectedColumns and rightNeeds: computed and deferred join keys narrow both sides to what they read" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const parser = @import("../lang/sql_parser.zig");
+    const env_mod = @import("env.zig");
+    var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a,
+        \\SELECT s.qty, c.name FROM 's.csv' s JOIN 'c.csv' c ON trim(c.code) = CAST(s.cr AS varchar);
+        \\SELECT qty, nm_r FROM 's.csv' JOIN 'c.csv' ON trim(code) = CAST(cr AS varchar);
+        \\SELECT * FROM 's.csv' s JOIN 'c.csv' c ON trim(c.code) = CAST(s.cr AS varchar);
+    , &pd);
+    var params = std.StringHashMap(Value).init(a);
+    var bindings = std.StringHashMap(ast.Pipeline).init(a);
+    var connections = std.StringHashMap(ast.Connection).init(a);
+    var sources = std.array_list.Managed(@import("../connect/driver.zig").Source).init(a);
+    var diag = env_mod.Diag{};
+    var log = obs.Logger.init(0, .text, .err);
+    var params_expr = std.StringHashMap(*const ast.Expr).init(a);
+    var errctx = op.ErrCtx{};
+    var rows = obs.RowCounter.init(0);
+    var json = std.StringHashMap(std.json.Value).init(a);
+    const fns = std.StringHashMap(ast.FnDecl).init(a);
+    var env = Env{ .arena = a, .gpa = a, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = null, .diag = &diag, .log = &log, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows, .json_params = &json, .fns = &fns };
+
+    var outs = std.array_list.Managed([]const ast.Stage).init(a);
+    for (prog.stmts) |st| if (st == .output) try outs.append(st.output.stages);
+    const want = [_][]const []const u8{
+        &.{ "cr", "qty" },
+        &.{ "code", "cr", "nm", "nm_r", "qty" },
+    };
+    const want_right = [_][]const []const u8{
+        &.{ "__jk", "name", "qty" },
+        &.{ "code", "cr", "nm", "nm_r", "qty" },
+    };
+    for (outs.items[0..2], want, want_right) |stages, w, wr| {
+        const got = try sortedNames(try projectedColumns(&env, stages[1..]));
+        try std.testing.expectEqual(w.len, got.len);
+        for (w, got) |x, y| try std.testing.expectEqualStrings(x, y);
+        for (stages[1..], 1..) |st, i| if (st.node == .join) {
+            const r = try sortedNames(try rightNeeds(&env, st.node.join, stages[i + 1 ..]));
+            try std.testing.expectEqual(wr.len, r.len);
+            for (wr, r) |x, y| try std.testing.expectEqualStrings(if (std.mem.eql(u8, x, "__jk")) st.node.join.right_keys[0].last() else x, y);
+        };
+    }
+    try std.testing.expect((try projectedColumns(&env, outs.items[2][1..])) == null);
 }
 
 test {

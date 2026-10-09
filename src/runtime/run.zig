@@ -700,6 +700,8 @@ test {
     _ = @import("connect.zig");
     _ = @import("plan.zig");
     _ = @import("keypush.zig");
+    _ = @import("keypush_tests.zig");
+    _ = @import("../db/postgres_fake.zig");
     _ = @import("lanes.zig");
     _ = @import("scratch.zig");
     _ = @import("script.zig");

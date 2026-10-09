@@ -3,6 +3,7 @@
 
 const Batch = @import("../../exec/batch.zig").Batch;
 const Bound = @import("stats.zig").Bound;
+const KeyBound = @import("stats.zig").KeyBound;
 const Bytes = @import("remote.zig").Bytes;
 const Error = @import("read.zig").Error;
 const Reader = @import("read.zig").Reader;
@@ -24,6 +25,7 @@ pub const Folder = struct {
     project: ?[]const []const u8,
     schema: types.Schema,
     bounds: []const Bound = &.{},
+    keys: []const KeyBound = &.{},
     threshold: ?*const Threshold = null,
     tally: ?*driver.ScanTally = null,
     cur: ?*Reader = null,
@@ -47,6 +49,7 @@ pub const Folder = struct {
         while (true) {
             if (self.cur) |r| {
                 r.bounds = self.bounds;
+                r.keys = self.keys;
                 r.threshold = self.threshold;
                 r.tally = self.tally;
                 if (try r.next(arena)) |b| {

@@ -1017,7 +1017,8 @@ const Ctx = struct {
 
     /// What `plan.buildJoin` will do for key pushdown, as `EXPLAIN` tells it: a SQL
     /// right side takes the left side's keys, else a SQL left read right before
-    /// the first join takes the right side's.
+    /// the first join takes the right side's, else a Parquet file on the right,
+    /// else on the left, skips row groups by them.
     fn keyPushNote(self: *Ctx, before: []const ast.Stage, st: ast.Stage) ![]const u8 {
         const j = st.node.join;
         if (keypush.disabled(st.hints)) return "";
@@ -1028,7 +1029,24 @@ const Ctx = struct {
             return try std.fmt.allocPrint(self.arena, "the right read takes the left side's keys (the left read ahead up to {d} rows / {d} MB, else none)", .{ op.default_prefetch_rows, op.default_prefetch_bytes >> 20 });
         if (keypush.leftMayNarrow(j) and self.sqlSide(before))
             return "the left read takes the right side's keys";
+        if (keypush.rightMayNarrow(j) and parquetFileSide(right))
+            return try std.fmt.allocPrint(self.arena, "the right Parquet read skips row groups by the left side's keys (the left read ahead up to {d} rows / {d} MB, else none)", .{ op.default_prefetch_rows, op.default_prefetch_bytes >> 20 });
+        if (keypush.leftMayNarrow(j) and parquetFileSide(before))
+            return "the left Parquet read skips row groups by the right side's keys";
         return "";
+    }
+
+    /// A local `.parquet` file read followed by only filters and selects.
+    fn parquetFileSide(stages: []const ast.Stage) bool {
+        if (stages.len == 0 or stages[0].node != .read) return false;
+        const rd = stages[0].node.read;
+        if (!std.mem.eql(u8, rd.connector, "csv") or rd.form != .path) return false;
+        if (!pqdecode.Reader.isPath(rd.form.path) or csv.CsvReader.isUrl(rd.form.path)) return false;
+        for (stages[1..]) |x| switch (x.node) {
+            .filter, .select => {},
+            else => return false,
+        };
+        return true;
     }
 
     /// A SQL table or query read followed by only filters and selects.

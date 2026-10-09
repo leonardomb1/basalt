@@ -352,7 +352,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
                     return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, conn.connector, e) }));
                 const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
                     defer c.close();
-                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} read failed ({s}): {s}", .{ conn.connector, @errorName(e), c.last_error }));
+                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} read failed ({s}): {s}", .{ conn.connector, @errorName(e), c.last_error }));
                 };
                 s.report = try readReport(env, conn.connector);
                 env.sql_desc = try sqlDescFor(env, info.kind, info.dialect, cfg, query, rd_eff);

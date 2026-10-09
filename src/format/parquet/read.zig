@@ -31,9 +31,10 @@
 //! first entry of a node's first leaf answers whether the node is there. Chunks
 //! appear in leaf order including leaves a read skips, hence `Leaf.chunk_idx`.
 //!
-//! Row-group pruning (`groupMayMatch`, `groupBeatsThreshold`, `fileMinMax`) is
-//! conservative in one direction only: a group is skipped solely when statistics
-//! prove no row can match; anything missing, unknown or unorderable keeps it.
+//! Row-group pruning (`groupMayMatch`, `groupMayHoldKeys` for a join's keys,
+//! `groupBeatsThreshold`, `fileMinMax`) is conservative in one direction only: a
+//! group is skipped solely when statistics prove no row can match; anything
+//! missing, unknown or unorderable keeps it.
 //!
 //! `Reader` reads one batch per row group, fetching only the footer and the
 //! column chunks a query projects, so resident memory tracks the widest row
@@ -99,7 +100,9 @@ pub const buildNested = @import("nested.zig").buildNested;
 pub const assembleNested = @import("nested.zig").assembleNested;
 const assembleLists = @import("nested.zig").assembleLists;
 pub const Bound = @import("stats.zig").Bound;
+pub const KeyBound = @import("stats.zig").KeyBound;
 pub const groupMayMatch = @import("stats.zig").groupMayMatch;
+pub const groupMayHoldKeys = @import("stats.zig").groupMayHoldKeys;
 pub const groupBeatsThreshold = @import("stats.zig").groupBeatsThreshold;
 pub const MinMax = @import("stats.zig").MinMax;
 pub const fileMinMax = @import("stats.zig").fileMinMax;
@@ -136,6 +139,7 @@ pub const Reader = struct {
     outputs: []const Output = &.{},
     boundaries: []const u64 = &.{},
     bounds: []const Bound = &.{},
+    keys: []const KeyBound = &.{},
     threshold: ?*const Threshold = null,
     groups_skipped: usize = 0,
     tally: ?*driver.ScanTally = null,
@@ -232,8 +236,8 @@ pub const Reader = struct {
             const rows = std.math.cast(usize, g.num_rows) orelse return Error.CorruptParquetPage;
             if (rows == 0) continue;
             if (self.tally) |t| driver.ScanTally.add(&t.row_groups, 1);
-            if (self.bounds.len > 0 and
-                !groupMayMatch(self.md.schema, self.leaves, g, self.bounds))
+            if ((self.bounds.len > 0 and !groupMayMatch(self.md.schema, self.leaves, g, self.bounds)) or
+                (self.keys.len > 0 and !groupMayHoldKeys(self.md.schema, self.leaves, g, self.keys)))
             {
                 self.groups_skipped += 1;
                 if (self.tally) |t| driver.ScanTally.add(&t.row_groups_skipped, 1);

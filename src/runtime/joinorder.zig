@@ -9,10 +9,10 @@
 //! flipped: the left side is indexed and the right side streams through it. The
 //! flipped `op.Join` sees the right side as its probe; a `Project` above it puts
 //! the columns back as left then right, under the written join's names (`_r`
-//! suffixes included). Key pushdown follows the sides: a SQL right side that
-//! takes the left side's keys gets them once the left side is indexed, not from a
-//! read-ahead, and a SQL left read that takes the right side's keys gets them from
-//! the right side's read-ahead. A left side whose estimated bytes pass the join's
+//! suffixes included). Key pushdown follows the sides: a SQL (or Parquet) right
+//! side that takes the left side's keys gets them once the left side is indexed,
+//! not from a read-ahead, and a SQL (or Parquet) left read that takes the right
+//! side's keys gets them from the right side's read-ahead. A left side whose estimated bytes pass the join's
 //! spill threshold is not flipped, so the side moved into memory never spills;
 //! a flipped join that spills anyway is still correct, inner joins being symmetric.
 //!
@@ -120,10 +120,10 @@ pub fn buildAt(env: *Env, stages: []const ast.Stage, si: usize, probe: op.Op, sc
     if (take == null) {
         const end = chainEnd(stages, si);
         if (end - si >= 2 and orderFree(stages[end..]))
-            return .{ .res = try buildChain(env, stages[si..end], probe, schema), .next = end };
+            return .{ .res = try buildChain(env, stages[si..end], stages[end..], probe, schema), .next = end };
     }
     const j = st.node.join;
-    const side = try plan.joinSide(env, j, st.hints);
+    const side = try plan.joinSide(env, j, st.hints, stages[si + 1 ..]);
     const a = try plan.assembleJoin(env, j, st.hints, side, schema, probe, take);
     if (a.nl) |r| return .{ .res = r, .next = si + 1 };
     const plain: Built = .{ .res = .{ .op = .{ .join = a.o }, .schema = a.schema }, .next = si + 1 };
@@ -172,11 +172,11 @@ pub fn flipped(arena: std.mem.Allocator, o: *const op.Join, schema: types.Schema
 }
 
 /// A star chain run smallest side first, else as written; either way its output
-/// is the written chain's.
-fn buildChain(env: *Env, chain: []const ast.Stage, probe: op.Op, head: types.Schema) anyerror!PipeRes {
+/// is the written chain's. `after` is what follows the chain.
+fn buildChain(env: *Env, chain: []const ast.Stage, after: []const ast.Stage, probe: op.Op, head: types.Schema) anyerror!PipeRes {
     const arena = env.arena;
     const sides = try arena.alloc(plan.JoinSide, chain.len);
-    for (chain, sides) |st, *s| s.* = try plan.joinSide(env, st.node.join, st.hints);
+    for (chain, sides, 0..) |st, *s, k| s.* = try plan.joinSide(env, st.node.join, st.hints, try std.mem.concat(arena, ast.Stage, &.{ chain[k + 1 ..], after }));
 
     const order = (try starOrder(env, chain, sides, head)) orelse {
         var cur = probe;
