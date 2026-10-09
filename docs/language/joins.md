@@ -58,11 +58,17 @@ The build side is held in memory up to `--op-memory` (2 GiB by default), or the
 join's own `WITH (max_build = '16GB')`. Past that the join spills: both sides
 are split by key into 16 partitions, a file per side each, in the run's scratch
 directory, and joined one partition at a time, so memory holds one partition's
-build rows. A spilled join
-gives the same rows, but not in the same order — add `ORDER BY` if order
-matters. A partition past 4 GiB, or past `max_build` when given (most rows
-sharing a few keys), fails with the build-too-large error; so does a `NOT IN`
-build side, which never spills, since one null on it changes every row's answer.
+build rows. A partition whose build rows still pass the limit is split again
+into 16, and so on up to 4 levels (65,536 partitions); each file is deleted as
+soon as it is split or joined, so the disk holds about one copy of the data. A
+spilled join gives the same rows, but not in the same order — add `ORDER BY` if
+order matters. Splitting cannot separate rows of one key: a key whose rows alone
+pass 4 GiB (or `--op-memory`, if larger), or `max_build` when given, fails at
+once with "a single join key holds N rows, more than --op-memory allows" —
+raise `--op-memory` or `max_build`, or filter that key out; one under it is held
+whole. A partition still past that after 4 levels fails too. A `NOT IN` build side
+never spills, since one null on it changes every row's answer, and fails with
+the build-too-large error past the limit.
 Under `-j` a build side past the limit sends the pipeline back to a serial run,
 which reads that side again — a second query for a SQL source. `--spill-cap`
 bounds the disk a run's spills hold at once (8 GiB by default; a partition's files

@@ -52,8 +52,11 @@ pub const DirSpace = struct {
     fn chargeImpl(ctx: *anyopaque, bytes: u64) anyerror!void {
         const self: *DirSpace = @ptrCast(@alignCast(ctx));
         const now = self.used.fetchAdd(bytes, .monotonic) + bytes;
+        if (now > self.cap) {
+            _ = self.used.fetchSub(bytes, .monotonic);
+            return error.SpillCapExceeded;
+        }
         _ = self.peak.fetchMax(now, .monotonic);
-        if (now > self.cap) return error.SpillCapExceeded;
     }
 
     fn releaseImpl(ctx: *anyopaque, bytes: u64) void {
@@ -63,7 +66,7 @@ pub const DirSpace = struct {
     }
 };
 
-test "DirSpace: released bytes make room again under the cap" {
+test "DirSpace: a refused charge holds nothing, and released bytes make room again" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -71,9 +74,10 @@ test "DirSpace: released bytes make room again under the cap" {
     const s = ds.space();
     try s.charge(80);
     try std.testing.expectError(error.SpillCapExceeded, s.charge(30));
-    s.release(110);
+    try std.testing.expectEqual(@as(u64, 80), ds.used.load(.monotonic));
+    s.release(80);
     try s.charge(90);
     s.release(1000);
     try std.testing.expectEqual(@as(u64, 0), ds.used.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 110), ds.peak.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 90), ds.peak.load(.monotonic));
 }

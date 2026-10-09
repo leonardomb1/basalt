@@ -10,11 +10,20 @@
 //! usual `joinBatch`, its unmatched build rows drained for right and full joins —
 //! then freed and its files deleted. Peak memory is about one partition's index
 //! plus a probe batch, besides the up to `spill_at` bytes held when the switch
-//! happens. The partition is the hash's top four bits (the index buckets on its
-//! low bits), and each side hashes a key that the other side types differently
-//! boxed, so equal int, float and decimal keys land together. A partition still
-//! past `max(spill_at, build_cap)` fails with `JoinBuildTooLarge`; there is one
-//! level of partitioning. Row order is not kept. NOT IN never spills (a null key
+//! happens. The partition is the key hash salted per depth (`spill_parts.partOf`;
+//! the index buckets on the unsalted hash's low bits), and each side hashes a key
+//! that the other side types differently boxed, so equal int, float and decimal
+//! keys land together at every depth. A partition whose build file still passes
+//! `spill_at` is split again, both its files, one depth deeper, up to
+//! `max_spill_depth` levels (16^4 partitions by default); the deepest partitions
+//! are joined first and every file is deleted once split or joined, so the disk
+//! holds about one copy of the data plus the partition being split. A partition
+//! no split can spread — every build row has one key hash — is not split: it is
+//! indexed if it fits `max(spill_at, build_cap)`, else fails at once with
+//! `JoinBuildTooLarge` naming the single key; one still too large at the depth
+//! limit fails with `SpillTooDeep`. A null-key build row matches nothing: dropped,
+//! or for right and full joins kept in a file of its own and streamed out last; a
+//! null-key probe row follows partition 0 down. Row order is not kept. NOT IN never spills (a null key
 //! anywhere on the build side changes every probe row's answer), nor CROSS: both
 //! keep the in-memory cap. In grace mode `push_probe` is never applied, so a late
 //! probe source opens without a key predicate. Without a `Space` the join fails
@@ -31,6 +40,7 @@ const failLabel = @import("../op.zig").failLabel;
 const keyhash = @import("../keyhash.zig");
 const keyset = @import("keyset.zig");
 const spill = @import("../spill.zig");
+const spill_parts = @import("spill_parts.zig");
 const Space = @import("../space.zig").Space;
 const DirSpace = @import("../space.zig").DirSpace;
 const eval = @import("../eval.zig");
@@ -154,7 +164,8 @@ fn anyNullKey(cols: []const column.Column, keys: []const usize, row: usize) bool
     return false;
 }
 
-pub const grace_parts = 16;
+pub const grace_parts = spill_parts.fanout;
+pub const default_grace_depth: u8 = 4;
 
 /// Which key positions the two sides type differently (int against decimal, say):
 /// those hash boxed on both sides, as `classOf` would pair them.
@@ -171,99 +182,156 @@ fn partClasses(arena: std.mem.Allocator, b: Batch, keys: []const usize, mixed: [
     return classes;
 }
 
-/// A row's partition: the top bits of its key hash, which `hashRowKeys` folds alike
-/// for equal keys of int, float and decimal; the index built for one partition
-/// spreads over the low bits. A row with a null key matches nothing and goes to 0.
-fn partOf(cols: []const column.Column, keys: []const usize, classes: []const KeyClass, row: usize) usize {
-    if (anyNullKey(cols, keys, row)) return 0;
-    return @intCast(hashRowKeys(cols, keys, classes, row) >> 60);
+/// A row's partition at `depth`: its key hash salted for that depth by
+/// `spill_parts.partOf`. `hashRowKeys` folds equal keys of int, float and decimal
+/// alike, so both sides agree at every depth, and the keys of one partition spread
+/// over all of the next depth's. A row with a null key goes to `nulls`.
+fn partOf(cols: []const column.Column, keys: []const usize, classes: []const KeyClass, row: usize, depth: u8, nulls: u8) u8 {
+    if (anyNullKey(cols, keys, row)) return nulls;
+    return spill_parts.partOf(hashRowKeys(cols, keys, classes, row), depth);
 }
 
-/// `b`'s rows written to the writer of their partition, gathered in `scratch`.
-fn partitionInto(scratch: std.mem.Allocator, ws: []spill.Writer, b: Batch, keys: []const usize, mixed: []const bool) !void {
-    if (b.len == 0) return;
-    const classes = try partClasses(scratch, b, keys, mixed);
-    const parts = try scratch.alloc(u8, b.len);
-    var counts = [_]usize{0} ** grace_parts;
-    for (parts, 0..) |*p, r| {
-        p.* = @intCast(partOf(b.columns, keys, classes, r));
-        counts[p.*] += 1;
+/// A `Split` destination for rows that are written nowhere.
+const drop_row: u8 = spill_parts.keep;
+
+/// One side's rows split by key hash into `grace_parts` files at one depth, plus
+/// a file at index `grace_parts` for the null-key rows when `nulls` sends them
+/// there. A file is made on its first row. The writers' buffers live in the
+/// split's own arena, freed by `deinit`, which also deletes the files of a split
+/// that never finished; only the paths `finish` copies out outlast it.
+const Split = struct {
+    arena: std.heap.ArenaAllocator,
+    space: Space,
+    schema: *const types.Schema,
+    keys: []const usize,
+    mixed: []const bool,
+    depth: u8,
+    nulls: u8,
+    tag: []const u8,
+    ws: [grace_parts + 1]?spill.Writer = @splat(null),
+
+    fn init(space: Space, schema: *const types.Schema, keys: []const usize, mixed: []const bool, depth: u8, nulls: u8, tag: []const u8) Split {
+        return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator), .space = space, .schema = schema, .keys = keys, .mixed = mixed, .depth = depth, .nulls = nulls, .tag = tag };
     }
-    var starts: [grace_parts]usize = undefined;
-    var at: usize = 0;
-    for (&starts, counts) |*s, c| {
-        s.* = at;
-        at += c;
+
+    /// `b`'s rows written to the files of their partitions, gathered in `scratch`.
+    fn add(self: *Split, scratch: std.mem.Allocator, b: Batch) !void {
+        if (b.len == 0) return;
+        const classes = try partClasses(scratch, b, self.keys, self.mixed);
+        const parts = try scratch.alloc(u8, b.len);
+        var counts = [_]usize{0} ** (grace_parts + 1);
+        for (parts, 0..) |*p, r| {
+            p.* = partOf(b.columns, self.keys, classes, r, self.depth, self.nulls);
+            if (p.* != drop_row) counts[p.*] += 1;
+        }
+        var starts: [grace_parts + 1]usize = undefined;
+        var at: usize = 0;
+        for (&starts, counts) |*s, c| {
+            s.* = at;
+            at += c;
+        }
+        const order = try scratch.alloc(usize, at);
+        var fill = starts;
+        for (parts, 0..) |p, r| {
+            if (p == drop_row) continue;
+            order[fill[p]] = r;
+            fill[p] += 1;
+        }
+        for (&self.ws, starts, counts) |*w, s, c| {
+            if (c == 0) continue;
+            const idx = order[s..][0..c];
+            const cols = try scratch.alloc(column.Column, b.columns.len);
+            for (cols, b.columns) |*out, col| out.* = try column.permute(scratch, col, idx);
+            if (w.* == null) w.* = try spill.Writer.init(self.space, self.arena.allocator(), self.schema, self.tag);
+            try w.*.?.write(.{ .schema = b.schema, .columns = cols, .len = c });
+        }
     }
-    const order = try scratch.alloc(usize, b.len);
-    var fill = starts;
-    for (parts, 0..) |p, r| {
-        order[fill[p]] = r;
-        fill[p] += 1;
+
+    fn addRun(self: *Split, run: spill.Run) !void {
+        var r = try spill.Reader.open(run);
+        defer r.close();
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        while (try r.next(scratch.allocator())) |b| {
+            try self.add(scratch.allocator(), b);
+            _ = scratch.reset(.retain_capacity);
+        }
     }
-    for (ws, starts, counts) |*w, s, c| {
-        if (c == 0) continue;
-        const idx = order[s..][0..c];
-        const cols = try scratch.alloc(column.Column, b.columns.len);
-        for (cols, b.columns) |*out, col| out.* = try column.permute(scratch, col, idx);
-        try w.write(.{ .schema = b.schema, .columns = cols, .len = c });
+
+    /// Closes the files, their paths copied into `keep`; a partition without rows
+    /// has none. On failure every file is deleted.
+    fn finish(self: *Split, keep: std.mem.Allocator) ![grace_parts + 1]?spill.Run {
+        var runs: [grace_parts + 1]?spill.Run = @splat(null);
+        errdefer for (runs) |r| if (r) |run| spill.discard(run);
+        for (&self.ws, &runs) |*w, *r| if (w.*) |*wr| {
+            r.* = try wr.finish();
+            w.* = null;
+            r.*.?.path = try keep.dupe(u8, r.*.?.path);
+        };
+        return runs;
     }
-}
 
-fn openWriters(space: Space, arena: std.mem.Allocator, schema: *const types.Schema, tag: []const u8) ![grace_parts]spill.Writer {
-    var ws: [grace_parts]spill.Writer = undefined;
-    var made: usize = 0;
-    errdefer for (ws[0..made]) |*w| w.abort();
-    for (&ws) |*w| {
-        w.* = try spill.Writer.init(space, arena, schema, tag);
-        made += 1;
+    fn deinit(self: *Split) void {
+        for (&self.ws) |*w| if (w.*) |*wr| wr.abort();
+        self.arena.deinit();
     }
-    return ws;
+};
+
+/// A partition: its build file and its probe file, either absent when that side
+/// has no rows there, and the depth it was split at.
+const Pair = struct { build: ?spill.Run = null, probe: ?spill.Run = null, depth: u8 = 0 };
+
+fn dropPair(p: *Pair) void {
+    if (p.build) |r| spill.discard(r);
+    if (p.probe) |r| spill.discard(r);
+    p.* = .{};
 }
 
-fn finishWriters(ws: *[grace_parts]spill.Writer, runs: *[grace_parts]spill.Run) !void {
-    for (ws, runs) |*w, *r| r.* = try w.finish();
-}
+/// How a partition's build side came to be indexed: within `spill_at`, or past it
+/// because no split can help — every row has one key, or the depth limit is reached.
+const Fit = enum { fits, one_key, too_deep };
 
-fn abortWriters(ws: *[grace_parts]spill.Writer) void {
-    for (ws) |*w| w.abort();
-}
-
-fn dropRun(run: spill.Run) void {
-    spill.discard(run);
-}
-
-/// A join spilled to disk: both sides split into `grace_parts` files by key hash,
-/// joined one partition at a time. `files` holds the writers' buffers and the
-/// paths; `part_mem` the current partition's index and match flags.
+/// A join spilled to disk: a stack of partitions joined one at a time. A partition
+/// whose build side passes `spill_at` is split again one depth deeper and its
+/// partitions pushed in its place, so the deepest are joined first and the disk
+/// holds about one copy of the data plus the partition being split. `cur` is the
+/// partition popped and not yet consumed; its files are deleted as they are read,
+/// or by `deinit`. `files` holds the stack and the paths; `part_mem` the current
+/// partition's index and match flags; `lone` reads a build file whose rows no
+/// probe row can match (the null keys, or a partition without probe rows).
 const Grace = struct {
     files: std.heap.ArenaAllocator,
-    build: [grace_parts]spill.Run = undefined,
-    probe: [grace_parts]spill.Run = undefined,
+    pending: std.ArrayList(Pair) = .empty,
+    build_mixed: []const bool = &.{},
+    probe_mixed: []const bool = &.{},
+    first: usize = 0,
     probed: bool = false,
-    part: usize = 0,
+    done: bool = false,
+    deepest: u8 = 0,
+    cur: Pair = .{},
     part_mem: ?std.heap.ArenaAllocator = null,
     index: ?*JoinIndex = null,
     reader: ?spill.Reader = null,
+    lone: ?spill.Reader = null,
 
     fn closePart(self: *Grace) void {
         if (self.reader) |*r| r.close();
         self.reader = null;
+        if (self.lone) |*r| r.close();
+        self.lone = null;
         if (self.part_mem) |*m| m.deinit();
         self.part_mem = null;
         self.index = null;
+        dropPair(&self.cur);
     }
 
     /// Frees what is left and deletes the files not yet joined; later calls are no-ops.
     fn deinit(self: *Grace) void {
-        if (self.part > grace_parts) return;
+        if (self.done) return;
         self.closePart();
-        if (self.part < grace_parts) {
-            if (self.probed) for (self.probe[self.part..]) |r| dropRun(r);
-            for (self.build[self.part..]) |r| dropRun(r);
-        }
+        for (self.pending.items) |*p| dropPair(p);
         self.files.deinit();
-        self.part = grace_parts + 1;
+        self.done = true;
     }
 };
 
@@ -431,9 +499,11 @@ pub const Join = struct {
     build_cap: ?usize = null,
 
     /// Spilling: with a `space`, a build side past `spill_at` bytes switches the
-    /// join to grace mode instead of failing.
+    /// join to grace mode instead of failing, splitting a partition at most
+    /// `max_spill_depth` levels deep.
     space: ?Space = null,
     spill_at: usize = std.math.maxInt(usize),
+    max_spill_depth: u8 = default_grace_depth,
     grace: ?*Grace = null,
 
     /// Key pushdown. `push_build` gets the probe side's keys before the build side
@@ -568,78 +638,212 @@ pub const Join = struct {
         return null;
     }
 
-    /// Splits the build side, `held` and then the rest of `build`, into partition files.
+    /// Right and full joins emit the build rows no probe row matches.
+    fn emitsBuild(self: *const Join) bool {
+        return self.kind == .right or self.kind == .full;
+    }
+
+    /// Left, full and anti joins emit the probe rows no build row matches.
+    fn emitsProbe(self: *const Join) bool {
+        return self.kind == .left or self.kind == .full or self.kind == .anti;
+    }
+
+    /// Splits the build side, `held` and then the rest of `build`, into the depth-0
+    /// partitions, pushed on the stack in reverse so partition 0 is joined first.
+    /// A null-key build row matches nothing: dropped, or for a right or full join
+    /// kept apart in a file streamed out last.
     fn startGrace(self: *Join, pull: *std.heap.ArenaAllocator, held: []const Batch, build: Op) anyerror!void {
         const g = try self.state.create(Grace);
         g.* = .{ .files = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
         errdefer g.files.deinit();
         const fa = g.files.allocator();
-        const mixed = try mixedKeys(fa, self.right_schema, self.right_keys, self.left_schema, self.left_keys);
-        var ws = try openWriters(self.space.?, fa, self.right_schema, "join-build");
-        errdefer abortWriters(&ws);
+        g.build_mixed = try mixedKeys(fa, self.right_schema, self.right_keys, self.left_schema, self.left_keys);
+        g.probe_mixed = try mixedKeys(fa, self.left_schema, self.left_keys, self.right_schema, self.right_keys);
+        var sp = Split.init(self.space.?, self.right_schema, self.right_keys, g.build_mixed, 0, if (self.emitsBuild()) grace_parts else drop_row, "join-build");
+        defer sp.deinit();
         var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer scratch.deinit();
         for (held) |b| {
-            try partitionInto(scratch.allocator(), &ws, b, self.right_keys, mixed);
+            try sp.add(scratch.allocator(), b);
             _ = scratch.reset(.retain_capacity);
         }
         _ = pull.reset(.free_all);
         while (try build.next(scratch.allocator())) |b| {
-            try partitionInto(scratch.allocator(), &ws, b, self.right_keys, mixed);
+            try sp.add(scratch.allocator(), b);
             _ = scratch.reset(.retain_capacity);
         }
-        try finishWriters(&ws, &g.build);
+        try g.pending.ensureUnusedCapacity(fa, grace_parts + 1);
+        const runs = try sp.finish(fa);
+        if (runs[grace_parts]) |r| g.pending.appendAssumeCapacity(.{ .build = r });
+        g.first = g.pending.items.len;
+        var i: usize = grace_parts;
+        while (i > 0) {
+            i -= 1;
+            g.pending.appendAssumeCapacity(.{ .build = runs[i] });
+        }
         self.grace = g;
         self.probe_pushed = true;
     }
 
-    /// Grace mode: the probe side split into partition files first, then each
-    /// partition joined in turn from its build file's index, right and full joins
-    /// draining its unmatched build rows before the next one opens.
+    /// Grace mode: the probe side split into the depth-0 partitions first, then
+    /// each partition joined in turn from its build file's index, right and full
+    /// joins draining its unmatched build rows before the next one opens.
     fn nextGrace(self: *Join, arena: std.mem.Allocator) anyerror!?Batch {
         const g = self.grace.?;
         errdefer g.deinit();
         if (!g.probed) try self.splitProbe(g);
-        while (g.part < grace_parts) {
-            const ix = g.index orelse try self.openPart(g);
-            if (!self.probe_done) {
-                while (try g.reader.?.next(arena)) |pb| {
-                    const out = try self.joinBatch(arena, ix, pb);
-                    if (out.len > 0) return out;
+        while (true) {
+            if (g.index) |ix| {
+                if (!self.probe_done) {
+                    if (g.reader) |*r| while (try r.next(arena)) |pb| {
+                        const out = try self.joinBatch(arena, ix, pb);
+                        if (out.len > 0) return out;
+                    };
+                    self.probe_done = true;
                 }
-                self.probe_done = true;
+                if (try self.drain(arena, ix)) |b| return b;
+                g.closePart();
+                self.matched = null;
+                continue;
             }
-            if (try self.drain(arena, ix)) |b| return b;
-            g.closePart();
-            self.matched = null;
-            dropRun(g.probe[g.part]);
-            g.part += 1;
+            if (g.lone) |*r| {
+                if (try r.next(arena)) |b| {
+                    if (b.len > 0) return try self.loneOut(arena, b);
+                    continue;
+                }
+                g.closePart();
+                continue;
+            }
+            if (!try self.nextPart(g)) break;
         }
         g.deinit();
         return null;
     }
 
+    /// Splits the probe side into the depth-0 partitions, each paired with its
+    /// build file. A null-key probe row goes to partition 0 if its join kind emits
+    /// it, and is dropped otherwise.
     fn splitProbe(self: *Join, g: *Grace) anyerror!void {
-        const fa = g.files.allocator();
-        const mixed = try mixedKeys(fa, self.left_schema, self.left_keys, self.right_schema, self.right_keys);
-        var ws = try openWriters(self.space.?, fa, self.left_schema, "join-probe");
-        errdefer abortWriters(&ws);
+        var sp = Split.init(self.space.?, self.left_schema, self.left_keys, g.probe_mixed, 0, if (self.emitsProbe()) 0 else drop_row, "join-probe");
+        defer sp.deinit();
         var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer scratch.deinit();
         while (try self.nextProbe(scratch.allocator())) |b| {
-            try partitionInto(scratch.allocator(), &ws, b, self.left_keys, mixed);
+            try sp.add(scratch.allocator(), b);
             _ = scratch.reset(.retain_capacity);
         }
-        try finishWriters(&ws, &g.probe);
+        const runs = try sp.finish(g.files.allocator());
+        for (runs[0..grace_parts], 0..) |r, i| g.pending.items[g.first + grace_parts - 1 - i].probe = r;
         g.probed = true;
     }
 
-    /// Partition `g.part`'s index, read from its build file (deleted once read),
-    /// and its probe file opened.
-    fn openPart(self: *Join, g: *Grace) anyerror!*JoinIndex {
+    /// Pops the next partition and readies it: indexed from its build file, its
+    /// build rows streamed out as they are when it has no probe file and the join
+    /// emits them, split one depth deeper when its build side passes `spill_at` and
+    /// a split can spread it, or dropped when it cannot add a row. False once the
+    /// stack is empty.
+    fn nextPart(self: *Join, g: *Grace) anyerror!bool {
+        g.cur = g.pending.pop() orelse return false;
+        const build = g.cur.build orelse {
+            if (g.cur.probe != null and self.emitsProbe()) try self.openPart(g, .fits) else g.closePart();
+            return true;
+        };
+        if (g.cur.probe == null) {
+            if (self.emitsBuild()) g.lone = try spill.Reader.open(build) else g.closePart();
+            return true;
+        }
+        var fit: Fit = .fits;
+        const rows: usize = @intCast(build.rows);
+        const bytes: usize = @intCast(build.bytes);
+        if (bytes + indexOverhead(rows) > self.spill_at) {
+            if (try self.oneKey(g, build)) {
+                fit = .one_key;
+            } else if (g.cur.depth + 1 >= self.max_spill_depth) {
+                fit = .too_deep;
+            } else {
+                try self.resplit(g, g.cur.depth + 1);
+                return true;
+            }
+        }
+        try self.openPart(g, fit);
+        return true;
+    }
+
+    /// Whether every row of the build file `run` has the same key hash, which no
+    /// split at any depth can spread.
+    fn oneKey(self: *Join, g: *Grace, run: spill.Run) anyerror!bool {
+        var r = try spill.Reader.open(run);
+        defer r.close();
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var first: ?u64 = null;
+        while (try r.next(scratch.allocator())) |b| {
+            const classes = try partClasses(scratch.allocator(), b, self.right_keys, g.build_mixed);
+            for (0..b.len) |row| {
+                if (anyNullKey(b.columns, self.right_keys, row)) return false;
+                const h = hashRowKeys(b.columns, self.right_keys, classes, row);
+                if (first) |f| {
+                    if (f != h) return false;
+                } else first = h;
+            }
+            _ = scratch.reset(.retain_capacity);
+        }
+        return true;
+    }
+
+    /// Splits the current partition at `depth`, deleting each of its files once
+    /// split, and pushes the partitions that hold rows.
+    fn resplit(self: *Join, g: *Grace, depth: u8) anyerror!void {
+        g.deepest = @max(g.deepest, depth);
+        const fa = g.files.allocator();
+        try g.pending.ensureUnusedCapacity(fa, grace_parts);
+        var bs = Split.init(self.space.?, self.right_schema, self.right_keys, g.build_mixed, depth, drop_row, "join-build");
+        defer bs.deinit();
+        try bs.addRun(g.cur.build.?);
+        const bruns = try bs.finish(fa);
+        errdefer for (bruns) |r| if (r) |run| spill.discard(run);
+        spill.discard(g.cur.build.?);
+        g.cur.build = null;
+        var pruns: [grace_parts + 1]?spill.Run = @splat(null);
+        if (g.cur.probe) |pr| {
+            var ps = Split.init(self.space.?, self.left_schema, self.left_keys, g.probe_mixed, depth, 0, "join-probe");
+            defer ps.deinit();
+            try ps.addRun(pr);
+            pruns = try ps.finish(fa);
+            spill.discard(pr);
+            g.cur.probe = null;
+        }
+        var i: usize = grace_parts;
+        while (i > 0) {
+            i -= 1;
+            if (bruns[i] == null and pruns[i] == null) continue;
+            g.pending.appendAssumeCapacity(.{ .build = bruns[i], .probe = pruns[i], .depth = depth });
+        }
+    }
+
+    /// The current partition's index, read from its build file (deleted once read;
+    /// none is an empty index), and its probe file opened.
+    fn openPart(self: *Join, g: *Grace, fit: Fit) anyerror!void {
         g.part_mem = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         const pa = g.part_mem.?.allocator();
-        const run = g.build[g.part];
+        const ix = try self.indexPart(pa, g.cur.build, fit);
+        if (g.cur.build) |run| spill.discard(run);
+        g.cur.build = null;
+        if (self.emitsBuild()) {
+            const m = try pa.alloc(bool, ix.build_batch.len);
+            @memset(m, false);
+            self.matched = m;
+        }
+        self.drain_pos = 0;
+        self.probe_done = false;
+        if (g.cur.probe) |pr| g.reader = try spill.Reader.open(pr);
+        g.index = ix;
+    }
+
+    /// `run`'s rows indexed in `pa`, under `partCap`; past it the error says why no
+    /// split could help.
+    fn indexPart(self: *Join, pa: std.mem.Allocator, run_opt: ?spill.Run, fit: Fit) anyerror!*JoinIndex {
+        const run = run_opt orelse return JoinIndex.fromBatches(pa, &.{}, self.right_schema, self.right_keys, 0, std.math.maxInt(usize));
         var r = try spill.Reader.open(run);
         defer r.close();
         var held = std.array_list.Managed(Batch).init(pa);
@@ -648,22 +852,28 @@ pub const Join = struct {
             try held.append(b);
             bytes += batchBytes(b);
         }
-        const ix = JoinIndex.fromBatches(pa, held.items, self.right_schema, self.right_keys, bytes, self.partCap()) catch |e| {
-            if (e == error.JoinBuildTooLarge) if (self.err) |ec|
-                ec.set("join build side too large even spilled: partition {d} of {d} holds {d} rows over the {d}-byte limit — raise it with WITH (max_build = '8GB') on the join, filter the CTE, or flip the join", .{ g.part + 1, grace_parts, run.rows, self.partCap() });
-            return e;
+        const cap = self.partCap();
+        return JoinIndex.fromBatches(pa, held.items, self.right_schema, self.right_keys, bytes, cap) catch |e| {
+            if (e != error.JoinBuildTooLarge) return e;
+            const ec = self.err orelse return if (fit == .too_deep) error.SpillTooDeep else e;
+            switch (fit) {
+                .one_key => ec.set("join build side too large even spilled: a single join key holds {d} rows, more than --op-memory allows (the limit is {d} bytes) — raise --op-memory or the join's max_build with WITH (max_build = '8GB'), or filter that key out", .{ run.rows, cap }),
+                .too_deep => ec.set("join build side still too large after {d} levels of spilling: a partition holds {d} rows over the {d}-byte limit — raise --op-memory or the join's max_build with WITH (max_build = '8GB'), or filter the CTE", .{ self.max_spill_depth, run.rows, cap }),
+                .fits => ec.set("join build side too large even spilled: a partition holds {d} rows over the {d}-byte limit — raise it with WITH (max_build = '8GB') on the join, filter the CTE, or flip the join", .{ run.rows, cap }),
+            }
+            return if (fit == .too_deep) error.SpillTooDeep else e;
         };
-        dropRun(run);
-        if (self.kind == .right or self.kind == .full) {
-            const m = try pa.alloc(bool, ix.build_batch.len);
-            @memset(m, false);
-            self.matched = m;
-        }
-        self.drain_pos = 0;
-        self.probe_done = false;
-        g.reader = try spill.Reader.open(g.probe[g.part]);
-        g.index = ix;
-        return ix;
+    }
+
+    /// Build rows no probe row can match, as a right or full join emits them: the
+    /// left side null.
+    fn loneOut(self: *Join, arena: std.mem.Allocator, b: Batch) anyerror!Batch {
+        const nleft = self.left_schema.fields.len;
+        const cols = try arena.alloc(column.Column, nleft + b.columns.len);
+        for (self.left_schema.fields, 0..) |f, i| cols[i] = try nullColumn(arena, f.ty, b.len);
+        const copy = try b.deepCopy(arena);
+        @memcpy(cols[nleft..], copy.columns);
+        return .{ .schema = self.out_schema, .columns = cols, .len = b.len };
     }
 
     /// One probe batch to one output batch, gathered from index lists. Under NOT IN a
@@ -1191,10 +1401,13 @@ const JoinSetup = struct {
     null_aware: bool = false,
     space: ?Space = null,
     spill_at: usize = std.math.maxInt(usize),
+    build_cap: ?usize = null,
+    max_spill_depth: u8 = default_grace_depth,
     err: ?*ErrCtx = null,
+    deepest: ?*u8 = null,
 };
 
-const JoinOutcome = struct { rows: []const []const u8, spilled: bool };
+const JoinOutcome = struct { rows: []const []const u8, spilled: bool, deepest: u8 };
 
 fn cellText(a: std.mem.Allocator, v: @import("../value.zig").Value) ![]const u8 {
     return switch (v) {
@@ -1206,7 +1419,8 @@ fn cellText(a: std.mem.Allocator, v: @import("../value.zig").Value) ![]const u8 
     };
 }
 
-/// The join's rows as sorted `a|b|c` lines, and whether it went to grace mode.
+/// The join's rows as sorted `a|b|c` lines, whether it went to grace mode and the
+/// deepest level it split to, also left in `s.deepest` when the join fails.
 fn runJoin(a: std.mem.Allocator, s: JoinSetup) !JoinOutcome {
     var lts = TestSource{ .schema_ = s.left_schema.*, .batches = s.left };
     var rts = TestSource{ .schema_ = s.right_schema.*, .batches = s.right };
@@ -1229,6 +1443,11 @@ fn runJoin(a: std.mem.Allocator, s: JoinSetup) !JoinOutcome {
         .pair_schema = if (s.residual != null) &join_both_schema else null,
         .space = s.space,
         .spill_at = s.spill_at,
+        .build_cap = s.build_cap,
+        .max_spill_depth = s.max_spill_depth,
+    };
+    defer if (s.deepest) |d| {
+        d.* = if (jn.grace) |g| g.deepest else 0;
     };
     var rows = std.array_list.Managed([]const u8).init(a);
     const top = Op{ .join = &jn };
@@ -1247,7 +1466,7 @@ fn runJoin(a: std.mem.Allocator, s: JoinSetup) !JoinOutcome {
             return std.mem.lessThan(u8, x, y);
         }
     }.lt);
-    return .{ .rows = rows.items, .spilled = jn.grace != null };
+    return .{ .rows = rows.items, .spilled = jn.grace != null, .deepest = if (jn.grace) |g| g.deepest else 0 };
 }
 
 fn expectSameRows(want: []const []const u8, got: []const []const u8) !void {
@@ -1371,15 +1590,17 @@ test "join spill: decimal build keys and int probe keys that are equal land in t
     try testing.expect(dmixed[0] and imixed[0]);
     const dcls = try partClasses(a, db, &.{0}, dmixed);
     const icls = try partClasses(a, ib, &.{0}, imixed);
-    var seen = [_]bool{false} ** grace_parts;
-    for (0..ints.len) |r| {
-        const p = partOf(ib.columns, &.{0}, icls, r);
-        try testing.expectEqual(p, partOf(db.columns, &.{0}, dcls, r));
-        seen[p] = true;
+    for (0..default_grace_depth) |depth| {
+        var seen = [_]bool{false} ** grace_parts;
+        for (0..ints.len) |r| {
+            const p = partOf(ib.columns, &.{0}, icls, r, @intCast(depth), 0);
+            try testing.expectEqual(p, partOf(db.columns, &.{0}, dcls, r, @intCast(depth), 0));
+            seen[p] = true;
+        }
+        var used: usize = 0;
+        for (seen) |s| used += @intFromBool(s);
+        try testing.expect(used > 1);
     }
-    var used: usize = 0;
-    for (seen) |s| used += @intFromBool(s);
-    try testing.expect(used > 1);
 
     var sd = try SpillDir.init(a, 1 << 30);
     defer sd.tmp.cleanup();
@@ -1403,8 +1624,10 @@ test "join spill: decimal build keys and int probe keys that are equal land in t
         spilled.spill_at = 1;
         const got = try runJoin(a, spilled);
         try testing.expect(got.spilled);
+        try testing.expect(got.deepest >= 1);
         try testing.expect(want.rows.len > 100);
         try expectSameRows(want.rows, got.rows);
+        try testing.expectEqual(@as(usize, 0), try sd.files());
     }
 }
 
@@ -1429,7 +1652,7 @@ test "join spill: NOT IN never spills and still fails past the build cap" {
     try testing.expectEqual(@as(usize, 0), try sd.files());
 }
 
-test "join spill: a partition still past the cap fails, saying so, and leaves no files" {
+test "join spill: one key past the cap fails at once, naming the single key, and leaves no files" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1437,13 +1660,164 @@ test "join spill: a partition still past the cap fails, saying so, and leaves no
     defer sd.tmp.cleanup();
     const left = try genBatches(a, &join_left_schema, 40, 20, 1, 10, 7, "l");
     const right = try genBatches(a, &join_right_schema, 400, 50, 0, 1, 1000, "r");
+    for ([_]ast.JoinKind{ .inner, .right }) |kind| {
+        var ec = ErrCtx{};
+        var deepest: u8 = 99;
+        try testing.expectError(error.JoinBuildTooLarge, runJoin(a, .{ .kind = kind, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1, .build_cap = 64, .err = &ec, .deepest = &deepest }));
+        try testing.expect(std.mem.indexOf(u8, ec.msg, "a single join key holds 399 rows") != null);
+        try testing.expect(std.mem.indexOf(u8, ec.msg, "--op-memory") != null);
+        try testing.expectEqual(@as(u8, 0), deepest);
+        try testing.expectEqual(@as(usize, 0), try sd.files());
+    }
+
+    var mixed = std.array_list.Managed(Batch).init(a);
+    try mixed.appendSlice(right);
+    try mixed.appendSlice(try genBatches(a, &join_right_schema, 300, 50, 1, 300, 1000, "s"));
     var ec = ErrCtx{};
-    const saved = op_mod.join_build_byte_cap;
-    op_mod.join_build_byte_cap = 64;
-    defer op_mod.join_build_byte_cap = saved;
-    try testing.expectError(error.JoinBuildTooLarge, runJoin(a, .{ .kind = .inner, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1, .err = &ec }));
-    try testing.expect(std.mem.indexOf(u8, ec.msg, "even spilled") != null);
+    var deepest: u8 = 99;
+    try testing.expectError(error.JoinBuildTooLarge, runJoin(a, .{ .kind = .full, .left = left, .right = mixed.items, .space = sd.ds.space(), .spill_at = 1, .build_cap = 2048, .max_spill_depth = 8, .err = &ec, .deepest = &deepest }));
+    try testing.expect(std.mem.indexOf(u8, ec.msg, "a single join key holds 399 rows") != null);
+    try testing.expect(deepest < 4);
     try testing.expectEqual(@as(usize, 0), try sd.files());
+
+    const fits = try runJoin(a, .{ .kind = .inner, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1 });
+    try testing.expectEqual(@as(u8, 0), fits.deepest);
+    try expectSameRows((try runJoin(a, .{ .kind = .inner, .left = left, .right = right })).rows, fits.rows);
+    try testing.expectEqual(@as(usize, 0), try sd.files());
+}
+
+test "join spill: partitions past spill_at split again, two levels and more, for every kind" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var sd = try SpillDir.init(a, 1 << 30);
+    defer sd.tmp.cleanup();
+
+    const rv = try a.create(ast.Expr);
+    rv.* = .{ .field = .{ .parts = &.{"rv"} } };
+    const x = try a.create(ast.Expr);
+    x.* = .{ .str_lit = "x" };
+    const residual = try a.create(ast.Expr);
+    residual.* = .{ .binary = .{ .op = .ne, .l = rv, .r = x } };
+
+    const left = try genBatches(a, &join_left_schema, 3000, 256, 7, 2500, 31, "l");
+    const right = try genBatches(a, &join_right_schema, 4000, 300, 3, 1500, 41, "r");
+    const kinds = [_]ast.JoinKind{ .inner, .left, .right, .full, .semi, .anti };
+    for (kinds) |kind| for ([_]?*const ast.Expr{ null, residual }) |res| {
+        const base = JoinSetup{ .kind = kind, .left = left, .right = right, .residual = res };
+        const want = try runJoin(a, base);
+        try testing.expect(!want.spilled);
+        try testing.expect(want.rows.len > 100);
+        for ([_]usize{ 1, 600, 3000 }) |at| {
+            var spilled = base;
+            spilled.space = sd.ds.space();
+            spilled.spill_at = at;
+            const got = try runJoin(a, spilled);
+            try testing.expect(got.spilled);
+            try testing.expect(got.deepest >= if (at == 1) @as(u8, 2) else 1);
+            try expectSameRows(want.rows, got.rows);
+            try testing.expectEqual(@as(usize, 0), try sd.files());
+            try testing.expectEqual(@as(u64, 0), sd.ds.used.load(.monotonic));
+        }
+    };
+}
+
+test "join spill: the disk holds about one copy of the data while partitions split again" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const left = try genBatches(a, &join_left_schema, 3000, 256, 7, 2500, 31, "l");
+    const right = try genBatches(a, &join_right_schema, 4000, 300, 3, 1500, 41, "r");
+
+    var flat = try SpillDir.init(a, 1 << 30);
+    defer flat.tmp.cleanup();
+    const one = try runJoin(a, .{ .kind = .full, .left = left, .right = right, .space = flat.ds.space(), .spill_at = 1, .max_spill_depth = 1 });
+    try testing.expectEqual(@as(u8, 0), one.deepest);
+
+    var deep = try SpillDir.init(a, 1 << 30);
+    defer deep.tmp.cleanup();
+    const got = try runJoin(a, .{ .kind = .full, .left = left, .right = right, .space = deep.ds.space(), .spill_at = 1 });
+    try testing.expect(got.deepest >= 2);
+    try expectSameRows(one.rows, got.rows);
+    const once = flat.ds.peak.load(.monotonic);
+    try testing.expect(deep.ds.peak.load(.monotonic) < once + once / 2);
+}
+
+test "join spill: decimal build keys meet equal int probe keys at every depth" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var sd = try SpillDir.init(a, 1 << 30);
+    defer sd.tmp.cleanup();
+    const left = try genBatches(a, &join_left_schema, 3000, 256, 1, 2200, 37, "l");
+    var rights = std.array_list.Managed(Batch).init(a);
+    var k: usize = 0;
+    while (k < 2000) : (k += 100) {
+        var us: [100]?i128 = undefined;
+        var vs: [100]?[]const u8 = undefined;
+        for (&us, &vs, 0..) |*u, *v, j| {
+            const key: i128 = @intCast(k + j);
+            u.* = if (j == 13) null else key * 100 + (if (j % 5 == 0) @as(i128, 50) else 0);
+            v.* = try std.fmt.allocPrint(a, "r{d}", .{key});
+        }
+        try rights.append(try decBatch(a, &us, &vs));
+    }
+    for ([_]ast.JoinKind{ .inner, .left, .right, .full, .semi, .anti }) |kind| {
+        const emit_right = kind != .semi and kind != .anti;
+        const base = JoinSetup{ .kind = kind, .left = left, .right = rights.items, .right_schema = &dec_right_schema, .out_schema = if (emit_right) &dec_both_schema else &join_left_schema };
+        const want = try runJoin(a, base);
+        var spilled = base;
+        spilled.space = sd.ds.space();
+        spilled.spill_at = 1;
+        const got = try runJoin(a, spilled);
+        try testing.expect(got.deepest >= 2);
+        try testing.expect(want.rows.len > 100);
+        try expectSameRows(want.rows, got.rows);
+        try testing.expectEqual(@as(usize, 0), try sd.files());
+    }
+}
+
+test "join spill: a partition still past the cap at the depth limit fails with SpillTooDeep and leaves no files" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var sd = try SpillDir.init(a, 1 << 30);
+    defer sd.tmp.cleanup();
+    const left = try genBatches(a, &join_left_schema, 500, 100, 1, 500, 1000, "l");
+    const right = try genBatches(a, &join_right_schema, 2000, 200, 1, 500, 1000, "r");
+    for ([_]u8{ 1, 2 }) |depth| {
+        var ec = ErrCtx{};
+        var deepest: u8 = 99;
+        try testing.expectError(error.SpillTooDeep, runJoin(a, .{ .kind = .full, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1, .build_cap = 1024, .max_spill_depth = depth, .err = &ec, .deepest = &deepest }));
+        try testing.expect(std.mem.indexOf(u8, ec.msg, "levels of spilling") != null);
+        try testing.expectEqual(depth - 1, deepest);
+        try testing.expectEqual(@as(usize, 0), try sd.files());
+    }
+    const want = try runJoin(a, .{ .kind = .full, .left = left, .right = right });
+    const got = try runJoin(a, .{ .kind = .full, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1, .build_cap = 1024 });
+    try expectSameRows(want.rows, got.rows);
+    try testing.expectEqual(@as(usize, 0), try sd.files());
+}
+
+test "join spill: the disk cap stopping a join mid-split leaves no files" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const left = try genBatches(a, &join_left_schema, 1500, 256, 7, 1200, 31, "l");
+    const right = try genBatches(a, &join_right_schema, 2000, 300, 3, 900, 41, "r");
+    var deep_fail = false;
+    var cap: u64 = 4096;
+    while (cap < 1 << 20) : (cap += cap / 8) {
+        var sd = try SpillDir.init(a, cap);
+        defer sd.tmp.cleanup();
+        var deepest: u8 = 0;
+        if (runJoin(a, .{ .kind = .right, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1, .deepest = &deepest })) |_| {} else |e| {
+            try testing.expectEqual(error.SpillCapExceeded, e);
+            if (deepest >= 1) deep_fail = true;
+        }
+        try testing.expectEqual(@as(usize, 0), try sd.files());
+    }
+    try testing.expect(deep_fail);
 }
 
 test "join spill: the disk cap stops a spilling join" {

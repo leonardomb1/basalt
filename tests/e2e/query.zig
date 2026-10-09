@@ -9,6 +9,7 @@ const ParamArg = basalt.env.ParamArg;
 const run = basalt.runtime.run;
 const runToString = @import("harness.zig").runToString;
 const runScript = @import("harness.zig").runScript;
+const runScriptOpts = @import("harness.zig").runScriptOpts;
 const checkAndRun = @import("harness.zig").checkAndRun;
 const expectFile = @import("harness.zig").expectFile;
 
@@ -537,6 +538,67 @@ test "join spill: a build side past --op-memory spills to disk, serially and und
         var capped: Diag = .{};
         try std.testing.expectError(error.SpillCapExceeded, run(alloc, prog, .{ .threads = case.threads, .op_memory = 1024, .spill_dir = base, .spill_cap = 64, .log = .{ .quiet = true } }, &capped));
     }
+}
+
+test "join spill: partitions still past max_build split again, and one key past it fails naming the key" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var orders = std.array_list.Managed(u8).init(alloc);
+    defer orders.deinit();
+    try orders.appendSlice("id,cust\n");
+    var custs = std.array_list.Managed(u8).init(alloc);
+    defer custs.deinit();
+    try custs.appendSlice("cust,name\n");
+    var want = std.array_list.Managed(u8).init(alloc);
+    defer want.deinit();
+    try want.appendSlice("id,name\n");
+    for (0..60000) |i| {
+        const c = (i * 7) % 70000;
+        try orders.writer().print("{d},{d}\n", .{ i, c });
+        if (c >= 50000 or c % 5 == 0) try want.writer().print("{d},\n", .{i}) else try want.writer().print("{d},n{d}\n", .{ i, c });
+    }
+    for (0..50000) |c| if (c % 5 != 0) try custs.writer().print("{d},n{d}\n", .{ c, c });
+    try tmp.dir.writeFile(.{ .sub_path = "orders.csv", .data = orders.items });
+    try tmp.dir.writeFile(.{ .sub_path = "custs.csv", .data = custs.items });
+    var skew = std.array_list.Managed(u8).init(alloc);
+    defer skew.deinit();
+    try skew.appendSlice("cust,name\n");
+    for (0..5000) |i| try skew.writer().print("7,s{d}\n", .{i});
+    try tmp.dir.writeFile(.{ .sub_path = "skew.csv", .data = skew.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    for ([_]usize{ 1, 4 }) |threads| {
+        const script = try std.fmt.allocPrint(
+            alloc,
+            "LOAD INTO '{s}/out.csv' AS SELECT o.id, c.name FROM '{s}/orders.csv' o LEFT JOIN '{s}/custs.csv' c ON o.cust = c.cust WITH (max_build = '4KB') ORDER BY o.id;",
+            .{ base, base, base },
+        );
+        defer alloc.free(script);
+        const out = try runScriptOpts(alloc, &tmp, script, .{ .threads = threads, .spill_dir = base, .log = .{ .quiet = true } });
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(want.items, out);
+        var it = tmp.dir.iterate();
+        while (try it.next()) |e| try std.testing.expect(!std.mem.startsWith(u8, e.name, "basalt-spill-"));
+    }
+
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "LOAD INTO '{s}/out.csv' AS SELECT o.id, c.name FROM '{s}/orders.csv' o JOIN '{s}/skew.csv' c ON o.cust = c.cust WITH (max_build = '4KB');",
+        .{ base, base, base },
+    );
+    defer alloc.free(script);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.JoinBuildTooLarge, run(alloc, prog, .{ .spill_dir = base, .log = .{ .quiet = true } }, &rdiag));
+    try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "a single join key holds 5000 rows") != null);
+    var it = tmp.dir.iterate();
+    while (try it.next()) |e| try std.testing.expect(!std.mem.startsWith(u8, e.name, "basalt-spill-"));
 }
 
 test "union reconciles branches to a canon schema (tag, null-fill, drop-extra)" {
