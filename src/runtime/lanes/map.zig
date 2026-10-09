@@ -449,6 +449,7 @@ pub fn classifyMapJoinPipeline(stages: []const ast.Stage) ?MapJoinShape {
         else => return null,
     };
     const j = ji orelse return null;
+    if (middle[j].node.join.keyless()) return null;
     return .{ .prefix = middle[0..j], .join = middle[j].node.join, .join_hints = middle[j].hints, .suffix = middle[j + 1 ..] };
 }
 

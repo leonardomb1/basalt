@@ -77,8 +77,9 @@ const LaneJoinPlan = struct { lane: LaneJoin, out_schema: types.Schema };
 /// Hoist the join out of the fan-out: materialize the build side into a shared index
 /// (the pulls are scratch) and prevalidate the suffix. Returns the lane recipe and the
 /// sink's output schema, or null when the build side is past the spill threshold of
-/// a join that could spill serially: its reads are closed and the caller falls back
-/// to the serial plan, which reads that side again.
+/// a join that could spill serially, or when its keys all turned out to be filters
+/// (a nested-loop join): its reads are closed and the caller falls back to the
+/// serial plan, which reads that side again.
 pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suffix: []const ast.Stage, left_schema: types.Schema) anyerror!?LaneJoinPlan {
     const arena = env.arena;
     const binding = env.bindings.get(j.binding) orelse
@@ -91,6 +92,11 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
     const lsch = try mapChainSchema(env, prep.left, left_schema);
     const rsch = try mapChainSchema(env, prep.right, build.schema);
     const jp = analyze.joinPlan(arena, lsch, rsch, prep.join, &ad) catch |e| return aErr(env, &ad, e);
+    if (prep.join.keyless()) {
+        for (env.sources.items[src_base..]) |sc| sc.close();
+        env.sources.shrinkRetainingCapacity(src_base);
+        return null;
+    }
     const out = try schemaPtr(arena, jp.schema);
     const right_schema = try schemaPtr(arena, rsch);
     const right_keys = try planKeys(arena, jp, "rk");

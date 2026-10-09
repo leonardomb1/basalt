@@ -758,6 +758,7 @@ pub fn laneJoinCap(env: *Env, j: ast.Join, hints: []const ast.Hint) !usize {
 
 fn buildJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, left_schema: types.Schema, probe: op.Op, take: ?ProbeTake) anyerror!PipeRes {
     const a = try assembleJoin(env, j, hints, try joinSide(env, j, hints), left_schema, probe, take);
+    if (a.nl) |r| return r;
     return .{ .op = .{ .join = a.o }, .schema = a.schema };
 }
 
@@ -778,7 +779,8 @@ pub fn joinSide(env: *Env, j: ast.Join, hints: []const ast.Hint) anyerror!JoinSi
     return .{ .rstages = rstages, .build = build, .right_late = right_late };
 }
 
-pub const Assembled = struct { o: *op.Join, schema: types.Schema };
+/// A hash join (`o`), or for a join with no key the nested-loop plan (`nl`).
+pub const Assembled = struct { o: *op.Join = undefined, schema: types.Schema, nl: ?PipeRes = null };
 
 /// The join as written over a planned right side: `probe` streams, the right side
 /// is indexed, and the output is the left columns then the right.
@@ -794,6 +796,7 @@ pub fn assembleJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, side: JoinS
     const rsch = try mapChainSchema(env, prep.right, build.schema);
     const jp = analyze.joinPlan(arena, lsch, rsch, prep.join, &ad) catch |e| return aErr(env, &ad, e);
     const out = try schemaPtr(arena, jp.schema);
+    if (prep.join.keyless()) return .{ .schema = out.*, .nl = try buildNLJoin(env, prep, hints, lsch, rsch, out, try buildChainFrom(arena, env.params_expr, env.errctx, prep.left, probe, left_schema), try buildChainFrom(arena, env.params_expr, env.errctx, prep.right, build.op, build.schema)) };
     const o = try arena.create(op.Join);
     o.* = .{
         .probe = try buildChainFrom(arena, env.params_expr, env.errctx, prep.left, probe, left_schema),
@@ -828,6 +831,31 @@ pub fn assembleJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, side: JoinS
         }
     }
     return .{ .o = o, .schema = out.* };
+}
+
+/// A join with no key: a nested loop over its ON, with the range path when the ON
+/// bounds a left value by right ones. It takes no key pushdown and never spills.
+fn buildNLJoin(env: *Env, prep: analyze.KeyPrep, hints: []const ast.Hint, lsch: types.Schema, rsch: types.Schema, out: *const types.Schema, probe: op.Op, build: op.Op) anyerror!PipeRes {
+    const arena = env.arena;
+    var ad = analyze.Diag{};
+    const o = try arena.create(op.NLJoin);
+    o.* = .{
+        .probe = probe,
+        .build = build,
+        .left_schema = try schemaPtr(arena, lsch),
+        .right_schema = try schemaPtr(arena, rsch),
+        .out_schema = out,
+        .kind = prep.join.kind,
+        .state = arena,
+        .err = env.errctx,
+        .build_cap = try joinBuildCap(env, hints),
+    };
+    if (analyze.residualPlan(arena, lsch, rsch, prep.join, env.params_expr, &ad) catch |e| return aErr(env, &ad, e)) |rp| {
+        o.cond = rp.pred;
+        o.pair_schema = try schemaPtr(arena, rp.schema);
+        o.range = try op.nlRangeOf(arena, rp.pred, rp.schema, lsch.fields.len);
+    }
+    return .{ .op = .{ .nl_join = o }, .schema = out.* };
 }
 
 /// Whether a pipeline over a local file small enough to read ahead runs serially,

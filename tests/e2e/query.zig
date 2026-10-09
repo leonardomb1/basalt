@@ -777,6 +777,47 @@ test "join: an outer join's ON beyond its keys picks matching pairs and keeps th
     }
 }
 
+test "join: an ON with no `=` key runs as a nested-loop or range join, of any kind" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "sales.csv", .data = "id,sold_on\n1,2026-01-10\n2,2026-02-15\n3,2025-12-31\n4,2026-03-01\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "periods.csv", .data = "name,starts,ends\nJan,2026-01-01,2026-01-31\nFeb,2026-02-01,2026-02-28\nMar,2026-03-01,2026-03-31\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "a.csv", .data = "v\n1\n5\n9\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.csv", .data = "w\n3\n7\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "lo,hi\n0,2\n4,6\n20,30\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    const cases = .{
+        .{
+            "SELECT s.id, p.name FROM '{s}/sales.csv' s LEFT JOIN '{s}/periods.csv' p ON CAST(s.sold_on AS DATE) BETWEEN CAST(p.starts AS DATE) AND CAST(p.ends AS DATE) ORDER BY s.id",
+            "id,name\n1,Jan\n2,Feb\n3,\n4,Mar\n",
+        },
+        .{
+            "SELECT a.v, b.w FROM '{s}/a.csv' a JOIN '{s}/b.csv' b ON a.v < b.w ORDER BY a.v, b.w",
+            "v,w\n1,3\n1,7\n5,7\n",
+        },
+        .{
+            "SELECT a.v, c.lo FROM '{s}/a.csv' a FULL JOIN '{s}/c.csv' c ON a.v BETWEEN c.lo AND c.hi ORDER BY a.v, c.lo",
+            "v,lo\n1,0\n5,4\n9,\n,20\n",
+        },
+        .{
+            "SELECT a.v, b.w FROM '{s}/a.csv' a RIGHT JOIN '{s}/b.csv' b ON a.v = b.w OR a.v + 2 = b.w ORDER BY b.w",
+            "v,w\n1,3\n5,7\n",
+        },
+    };
+    inline for (cases) |c| {
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS " ++ c[0] ++ ";", .{ out_path, base, base });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c[1], out);
+    }
+}
+
 test "join: USING lists each shared column once, first, and a full join takes it from either side" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

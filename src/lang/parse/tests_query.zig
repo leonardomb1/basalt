@@ -273,9 +273,51 @@ test "sql: ON beyond keys — the right side alone narrows it, the rest filters 
     try testing.expect(rj.stmts[2].output.stages[1].node.join.residual != null);
     try testing.expectEqualStrings("__derived1_b", rj.stmts[2].output.stages[1].node.join.binding);
 
-    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT * FROM 'a.csv' a JOIN 'b.csv' b ON b.del <> '*';", &diag));
-    try testing.expect(std.mem.indexOf(u8, diag.msg, "at least one") != null);
+    const only_right = try parseTest(a, "SELECT * FROM 'a.csv' a JOIN 'b.csv' b ON b.del <> '*';");
+    const orj = only_right.stmts[3].output.stages[1].node.join;
+    try testing.expect(orj.keyless() and orj.residual == null);
+    try testing.expectEqualStrings("b", orj.alias);
+}
+
+test "sql: an ON with no `=` key is the whole condition of a nested-loop join, of any kind" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const inner = try parseTest(a, "SELECT * FROM 'a.csv' a JOIN 'b.csv' b ON a.x < b.y AND a.v = 'x';");
+    const ist = inner.stmts[2].output.stages;
+    for (ist[2..]) |st| try testing.expect(st.node != .filter);
+    const ij = ist[1].node.join;
+    try testing.expect(ij.keyless());
+    try testing.expectEqual(ast.BinOp.@"and", ij.residual.?.binary.op);
+    try testing.expectEqual(ast.BinOp.lt, ij.residual.?.binary.l.binary.op);
+    try testing.expectEqual(ast.BinOp.eq, ij.residual.?.binary.r.binary.op);
+
+    const between = try parseTest(a, "SELECT * FROM 'a.csv' a LEFT JOIN 'b.csv' b ON a.d BETWEEN b.lo AND b.hi;");
+    const bj = between.stmts[2].output.stages[1].node.join;
+    try testing.expect(bj.keyless() and bj.kind == .left);
+    try testing.expectEqual(ast.BinOp.ge, bj.residual.?.binary.l.binary.op);
+    try testing.expectEqual(ast.BinOp.le, bj.residual.?.binary.r.binary.op);
+
+    const ors = try parseTest(a, "SELECT * FROM 'a.csv' a FULL JOIN 'b.csv' b ON a.k = b.k OR a.alt = b.k;");
+    const oj = ors.stmts[2].output.stages[1].node.join;
+    try testing.expect(oj.keyless() and oj.kind == .full);
+    try testing.expectEqual(ast.BinOp.@"or", oj.residual.?.binary.op);
+
+    const right = try parseTest(a, "SELECT * FROM 'a.csv' a RIGHT JOIN 'b.csv' b ON a.x > b.y AND b.del <> '*';");
+    const rj = right.stmts[2].output.stages[1].node.join;
+    try testing.expect(rj.keyless() and rj.kind == .right);
+    try testing.expectEqualStrings("__derived1_b", rj.binding);
+
+    const keyed = try parseTest(a, "SELECT * FROM 'a.csv' a JOIN 'b.csv' b ON a.k = b.k AND a.x < b.y;");
+    const kst = keyed.stmts[2].output.stages;
+    try testing.expect(!kst[1].node.join.keyless());
+    try testing.expect(kst[1].node.join.residual == null);
+    try testing.expect(kst[2].node == .filter);
+
+    const cross = try parseTest(a, "SELECT * FROM 'a.csv' a CROSS JOIN 'b.csv' b WHERE a.x < b.y;");
+    const cst = cross.stmts[2].output.stages;
+    try testing.expect(!cst[1].node.join.keyless());
+    try testing.expect(cst[2].node == .filter);
 }
 
 test "sql: a computed key in ON — each side computes its own column, dropped after the join" {

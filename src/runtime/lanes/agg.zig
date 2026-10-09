@@ -580,7 +580,7 @@ pub fn classifyAggJoinPipeline(stages: []const ast.Stage) ?AggJoinShape {
         .filter, .select => {},
         .join => |j| {
             if (ai != null) return null;
-            if (!joinKindLaneSafe(j.kind)) return null;
+            if (!joinKindLaneSafe(j.kind) or j.keyless()) return null;
             if (first_join == null) first_join = i;
         },
         .aggregate => {

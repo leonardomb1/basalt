@@ -81,7 +81,7 @@ pub fn orderFree(after: []const ast.Stage) bool {
 pub fn eligible(st: ast.Stage) bool {
     if (st.node != .join) return false;
     const j = st.node.join;
-    return j.kind == .inner and !j.null_aware and j.residual == null and mode(st.hints) == .auto;
+    return j.kind == .inner and !j.null_aware and j.residual == null and !j.keyless() and mode(st.hints) == .auto;
 }
 
 /// Past the run of consecutive chainable joins starting at `si`.
@@ -125,6 +125,7 @@ pub fn buildAt(env: *Env, stages: []const ast.Stage, si: usize, probe: op.Op, sc
     const j = st.node.join;
     const side = try plan.joinSide(env, j, st.hints);
     const a = try plan.assembleJoin(env, j, st.hints, side, schema, probe, take);
+    if (a.nl) |r| return .{ .res = r, .next = si + 1 };
     const plain: Built = .{ .res = .{ .op = .{ .join = a.o }, .schema = a.schema }, .next = si + 1 };
     if (!eligible(st) or a.o.residual != null or !orderFree(stages[si + 1 ..])) return plain;
     const left = estimate.ofSide(env, stages[0..si]);
@@ -281,7 +282,9 @@ test "joinorder: only an aggregate or a sort after the join frees its row order"
 }
 
 test "joinorder: join_order hint and which joins are eligible" {
-    const ij = ast.Join{ .kind = .inner, .binding = "b", .left_keys = &.{}, .right_keys = &.{} };
+    const k = [_]ast.QualName{.{ .parts = &.{"k"} }};
+    const ij = ast.Join{ .kind = .inner, .binding = "b", .left_keys = &k, .right_keys = &k };
+    const keyless = ast.Join{ .kind = .inner, .binding = "b", .left_keys = &.{}, .right_keys = &.{} };
     var lj = ij;
     lj.kind = .left;
     var na = ij;
@@ -297,6 +300,7 @@ test "joinorder: join_order hint and which joins are eligible" {
     try testing.expect(!eligible(stage(.{ .join = ij }, &written)));
     try testing.expect(!eligible(stage(.{ .join = lj }, &.{})));
     try testing.expect(!eligible(stage(.{ .join = na }, &.{})));
+    try testing.expect(!eligible(stage(.{ .join = keyless }, &.{})));
 
     const sel = stage(.{ .select = &.{} }, &.{});
     const chain = [_]ast.Stage{ sel, stage(.{ .join = ij }, &.{}), stage(.{ .join = ij }, &.{}), stage(.{ .join = lj }, &.{}), stage(.{ .join = ij }, &.{}) };

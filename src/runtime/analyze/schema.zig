@@ -277,7 +277,8 @@ fn fitOf(arena: std.mem.Allocator, e: *const ast.Expr, left: types.Schema, right
 /// plain one: a value of each side makes a computed key; two of the left side make
 /// a filter of an inner join's left rows, two of the right side narrow the right.
 /// Two of a side the join keeps unmatched (the left of a left join, the right of a
-/// right one) cannot filter it, so they join the residual condition instead.
+/// right one) cannot filter it, so they join the residual condition instead. With
+/// no key left the join runs as a nested loop over the residual.
 pub fn orientKeys(arena: std.mem.Allocator, left: types.Schema, right: types.Schema, j: ast.Join, diag: *Diag) Error!KeyPrep {
     if (j.deferred.len == 0) return .{ .join = j };
     var lk = std.array_list.Managed(ast.QualName).init(arena);
@@ -320,8 +321,6 @@ pub fn orientKeys(arena: std.mem.Allocator, left: types.Schema, right: types.Sch
             } else eq;
         } else return failPos(diag, d.pos, "each value of an `=` in the ON of the join with `{s}` must name one side's columns, not both", .{rname});
     }
-    if (lk.items.len == 0)
-        return failPos(diag, j.deferred[0].pos, "the ON of a join needs at least one `=` between a left and a right value to join by — `b.k = a.k`, or computed: `trim(b.k) = cast(a.k AS string)`", .{});
     if (lcomp.items.len > 0) {
         try lcomp.insert(0, .star);
         try lfilt.append(.{ .node = .{ .select = try lcomp.toOwnedSlice() }, .hints = &.{}, .pos = j.deferred[0].pos });
@@ -377,7 +376,6 @@ pub fn residualPlan(arena: std.mem.Allocator, left: types.Schema, right: types.S
 pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schema, j: ast.Join, diag: *Diag) Error!JoinPlan {
     if (j.left_keys.len != j.right_keys.len) return fail(diag, "join has mismatched key lists", .{});
     if (j.deferred.len > 0) return fail(diag, "internal error: a join's keys were not placed (orientKeys) before planning it", .{});
-    if (j.kind != .cross and j.left_keys.len == 0) return fail(diag, "join needs at least one `ON <column> = <column>` pair", .{});
 
     const lks = try arena.alloc(usize, j.left_keys.len);
     const rks = try arena.alloc(usize, j.right_keys.len);

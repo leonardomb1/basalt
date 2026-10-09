@@ -264,8 +264,14 @@ pub const Join = struct {
     right_filter: ?*Expr = null,
     deferred: []const DeferredKey = &.{},
     /// The rest of an outer join's ON, over a left row and a right row together:
-    /// a pair joins only where it holds, so an unmatched row still comes out.
+    /// a pair joins only where it holds, so an unmatched row still comes out. With
+    /// no key it is the whole ON, of any join kind.
     residual: ?*Expr = null,
+
+    /// An ON with no `=` key, run as a nested-loop join.
+    pub fn keyless(self: Join) bool {
+        return self.kind != .cross and self.left_keys.len == 0 and self.deferred.len == 0;
+    }
 
     pub fn rightStages(self: Join, arena: std.mem.Allocator, stages: []const Stage) ![]const Stage {
         const f = self.right_filter orelse return stages;

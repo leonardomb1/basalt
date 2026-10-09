@@ -92,9 +92,12 @@
 //! (`spill.zig` holds the file format).
 //! A null key joins nothing, and a null-aware (`NOT IN`) anti join keeps nothing
 //! against a build side holding a null. Duplicate keys fan out in build order.
+//! A join whose ON has no key is an `NLJoin` (`nljoin.zig`): the build side held
+//! in memory under the same cap, never spilled, each probe row paired with its
+//! rows and the ON evaluated over the pairs.
 //!
 //! The operators with more than a page of logic each live in op/: `aggregate.zig`,
-//! `join.zig`, `sort.zig`, `topn.zig`, `window.zig`, `distinct.zig` and
+//! `join.zig`, `nljoin.zig`, `sort.zig`, `topn.zig`, `window.zig`, `distinct.zig` and
 //! `explode.zig`. This file keeps the `Op` union and its dispatch, the simple
 //! operators (scan, filter, project, limit, union) and the error labels. Each part
 //! carries the tests of its own code; `testing_util.zig` holds the shared helpers.
@@ -175,6 +178,7 @@ pub const Op = union(enum) {
     aggregate: *Aggregate,
     top_n: *TopN,
     join: *Join,
+    nl_join: *NLJoin,
     explode: *Explode,
     union_: *Union,
 
@@ -190,6 +194,10 @@ pub const Op = union(enum) {
         switch (self) {
             .scan => {},
             .join => |j| {
+                try buf.append(j.probe);
+                if (j.build) |b| try buf.append(b);
+            },
+            .nl_join => |j| {
                 try buf.append(j.probe);
                 if (j.build) |b| try buf.append(b);
             },
@@ -223,6 +231,7 @@ pub const Op = union(enum) {
             .aggregate => |a| a.next(arena),
             .top_n => |t| t.next(arena),
             .join => |j| j.next(arena),
+            .nl_join => |j| j.next(arena),
             .explode => |e| e.next(arena),
             .union_ => |u| u.next(arena),
         };
@@ -304,6 +313,8 @@ pub var join_build_byte_cap: usize = 4 << 30;
 pub const KeyClass = @import("op/join.zig").KeyClass;
 pub const JoinIndex = @import("op/join.zig").JoinIndex;
 pub const Join = @import("op/join.zig").Join;
+pub const NLJoin = @import("op/nljoin.zig").NLJoin;
+pub const nlRangeOf = @import("op/nljoin.zig").rangeOf;
 pub const KeyValues = @import("op/keyset.zig").KeyValues;
 pub const KeyPush = @import("op/keyset.zig").KeyPush;
 pub const collectKeys = @import("op/keyset.zig").collect;
@@ -604,6 +615,7 @@ test {
     _ = @import("op/explode.zig");
     _ = @import("op/join.zig");
     _ = @import("op/keyset.zig");
+    _ = @import("op/nljoin.zig");
     _ = @import("op/sort.zig");
     _ = @import("op/topn.zig");
     _ = @import("op/window.zig");

@@ -779,6 +779,9 @@ const Ctx = struct {
             if (cur) |c| {
                 cur = try self.propagate(c, st.node);
                 si.out_schema = cur;
+                if (cur != null and st.node == .join) if (try self.joinStrategy(c, st.node.join)) |how| {
+                    si.detail = try std.fmt.allocPrint(self.arena, "{s} ({s})", .{ si.detail, how });
+                };
             } else try self.checkUnbound(st.node);
             try stage_infos.append(si);
         }
@@ -948,20 +951,36 @@ const Ctx = struct {
             .aggregate => |ag| return (try aggregatePlan(self.arena, in, ag, self.params, self.diag)).schema,
             .window => |wd| return try windowSchema(self.arena, in, wd, self.diag),
             .join => |j| {
-                const right = if (self.bindings.get(j.binding)) |b|
-                    (try self.bindingSchema(b)) orelse return null
-                else if (self.knownTable(j.binding)) |k|
-                    k.schema orelse return null
-                else
-                    return fail(self.diag, "unknown binding `{s}` in join", .{j.binding});
-                const prep = try orientKeys(self.arena, in, right, j, self.diag);
-                const l2 = try prepSchema(self.arena, in, prep.left, self.params, self.diag);
-                const r2 = try prepSchema(self.arena, right, prep.right, self.params, self.diag);
-                _ = try residualPlan(self.arena, l2, r2, prep.join, self.params, self.diag);
-                return (try joinPlan(self.arena, l2, r2, prep.join, self.diag)).schema;
+                const s = (try self.joinSides(in, j)) orelse return null;
+                _ = try residualPlan(self.arena, s.left, s.right, s.join, self.params, self.diag);
+                return (try joinPlan(self.arena, s.left, s.right, s.join, self.diag)).schema;
             },
             else => return null,
         }
+    }
+
+    /// A join's two sides as the plan joins them, its keys placed; null where the
+    /// right side's columns are not known before the run.
+    fn joinSides(self: *Ctx, in: types.Schema, j: ast.Join) Error!?struct { left: types.Schema, right: types.Schema, join: ast.Join } {
+        const right = if (self.bindings.get(j.binding)) |b|
+            (try self.bindingSchema(b)) orelse return null
+        else if (self.knownTable(j.binding)) |k|
+            k.schema orelse return null
+        else
+            return fail(self.diag, "unknown binding `{s}` in join", .{j.binding});
+        const prep = try orientKeys(self.arena, in, right, j, self.diag);
+        const l2 = try prepSchema(self.arena, in, prep.left, self.params, self.diag);
+        const r2 = try prepSchema(self.arena, right, prep.right, self.params, self.diag);
+        return .{ .left = l2, .right = r2, .join = prep.join };
+    }
+
+    /// `nested-loop` or `range` for a join with no key, as `plan.buildNLJoin` runs
+    /// it; null for a hash join.
+    fn joinStrategy(self: *Ctx, in: types.Schema, j: ast.Join) Error!?[]const u8 {
+        const s = (try self.joinSides(in, j)) orelse return null;
+        if (!s.join.keyless()) return null;
+        const rp = (try residualPlan(self.arena, s.left, s.right, s.join, self.params, self.diag)) orelse return "nested-loop";
+        return if (try op.nlRangeOf(self.arena, rp.pred, rp.schema, s.left.fields.len) != null) "range" else "nested-loop";
     }
 
     fn stageInfo(self: *Ctx, st: ast.Stage) !Stage {

@@ -331,6 +331,38 @@ test "analyze checks the stages after a join against the joined schema" {
     try std.testing.expect(stages[stages.len - 1].out_schema != null);
 }
 
+test "analyze: a join with no `=` key is a range or nested-loop join, its ON checked over both sides" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const csv_data = "id,name,amount\n1,x,10\n";
+    const r = "WITH r AS (SELECT id AS rid, name AS rname FROM '$IN') ";
+    const Case = struct { q: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .q = "SELECT * FROM '$IN' JOIN r ON id < rid", .want = "inner r (range)" },
+        .{ .q = "SELECT * FROM '$IN' LEFT JOIN r ON name BETWEEN rname AND rname", .want = "left r (range)" },
+        .{ .q = "SELECT * FROM '$IN' FULL JOIN r ON id = rid OR name = rname", .want = "full r (nested-loop)" },
+        .{ .q = "SELECT * FROM '$IN' JOIN r ON id = rid", .want = "inner r" },
+    };
+    for (cases) |c| {
+        var diag = Diag{};
+        const plan = try analyzeCsv(a, csv_data, try std.mem.concat(a, u8, &.{ r, c.q }), &diag);
+        var join: ?Stage = null;
+        for (plan.outputs[0].stages) |st| {
+            if (std.mem.eql(u8, st.kind, "join")) join = st;
+        }
+        try std.testing.expectEqualStrings(c.want, join.?.detail);
+        try std.testing.expectEqualStrings("", join.?.key_pushdown);
+    }
+
+    var diag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyzeCsv(a, csv_data, r ++ "SELECT * FROM '$IN' LEFT JOIN r ON id < nope", &diag));
+    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "nope") != null);
+    diag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyzeCsv(a, csv_data, r ++ "SELECT * FROM '$IN' JOIN r ON name BETWEEN rname AND rid", &diag));
+    try std.testing.expectEqualStrings("incomparable operands", diag.msg);
+}
+
 test "analyze rejects a program with nothing to run" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();

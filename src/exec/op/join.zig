@@ -1059,7 +1059,7 @@ pub const Join = struct {
 
 /// Gather rows `idx` of `c`, then null out the `null_mask` positions (the outer-join
 /// fill). Only a source with no rows is built as an all-null column instead.
-fn takeCol(arena: std.mem.Allocator, c: column.Column, idx: []const usize, null_mask: []const bool) !column.Column {
+pub fn takeCol(arena: std.mem.Allocator, c: column.Column, idx: []const usize, null_mask: []const bool) !column.Column {
     if (c.len == 0) return nullColumn(arena, c.ty, idx.len);
     var out = try column.permute(arena, c, idx);
     if (null_mask.len == idx.len) {
@@ -1071,7 +1071,7 @@ fn takeCol(arena: std.mem.Allocator, c: column.Column, idx: []const usize, null_
     return out;
 }
 
-fn nullColumn(arena: std.mem.Allocator, ty: types.Type, n: usize) !column.Column {
+pub fn nullColumn(arena: std.mem.Allocator, ty: types.Type, n: usize) !column.Column {
     var b = try column.Builder.initCapacity(arena, ty.asNullable(), n);
     var i: usize = 0;
     while (i < n) : (i += 1) try b.append(.null);

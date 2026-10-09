@@ -50,18 +50,20 @@ pub fn disabled(hints: []const ast.Hint) bool {
     return false;
 }
 
-/// The join kinds whose right side may lose rows that match nothing on the left.
+/// The join kinds whose right side may lose rows that match nothing on the left;
+/// never a join with no key, which has none to send.
 pub fn rightMayNarrow(j: ast.Join) bool {
-    if (j.null_aware) return false;
+    if (j.null_aware or j.keyless()) return false;
     return switch (j.kind) {
         .inner, .left, .semi, .anti => true,
         else => false,
     };
 }
 
-/// The join kinds whose left side may lose rows that match nothing on the right.
+/// The join kinds whose left side may lose rows that match nothing on the right;
+/// never a join with no key.
 pub fn leftMayNarrow(j: ast.Join) bool {
-    if (j.null_aware) return false;
+    if (j.null_aware or j.keyless()) return false;
     return switch (j.kind) {
         .inner, .right, .semi => true,
         else => false,

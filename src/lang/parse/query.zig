@@ -310,6 +310,7 @@ pub fn resolveExprAlias(map: []const ExprAlias, synth: []const u8) []const u8 {
 /// `SELECT [DISTINCT [ON (cols)]] items FROM source [joins] [WHERE] [GROUP BY] [HAVING]`.
 /// An ON splits at its ANDs: cross-side equalities are keys, right-only conditions narrow
 /// the right side first, anything else filters the joined rows (inner joins only).
+/// Without a key it all stays the join's condition, run as a nested-loop join.
 pub fn parseSelectCore(self: *Parser) Error!Core {
     const pos = self.curPos();
     try self.expectKw("select");
@@ -632,8 +633,13 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     residual = if (residual) |r| try self.mk(.{ .binary = .{ .op = .@"and", .l = r, .r = e } }) else e;
                 }
             }
-            if (left_keys.items.len == 0 and deferred.items.len == 0)
-                return self.fail(.{ .line = opos.line, .col = opos.col }, "the ON of a join needs at least one `=` between a left and a right value to join by — `b.k = a.k`, or computed: `trim(b.k) = cast(a.k AS string)`", .{});
+            if (left_keys.items.len == 0 and deferred.items.len == 0) {
+                for (post_filters.items) |c| {
+                    const e = try self.stripExpr(c, &aliases);
+                    residual = if (residual) |r| try self.mk(.{ .binary = .{ .op = .@"and", .l = r, .r = e } }) else e;
+                }
+                post_filters.clearRetainingCapacity();
+            }
             if (narrow != null or right_computed.items.len > 0) {
                 self.derived_n += 1;
                 const name = try std.fmt.allocPrint(self.arena, "__derived{d}_on", .{self.derived_n});

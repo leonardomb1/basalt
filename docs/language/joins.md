@@ -1,9 +1,11 @@
 # Joins
 
-Joins are hash equi-joins: one side is materialized and indexed once, the other
-streams through — the right side is indexed unless the left is estimated much
-smaller ([Which side is held in memory](#which-side-is-held-in-memory)). The
-right side is a CTE, a `(SELECT ...)`, a table
+A join with an `=` key is a hash join: one side is materialized and indexed
+once, the other streams through — the right side is indexed unless the left is
+estimated much smaller ([Which side is held in memory](#which-side-is-held-in-memory)).
+One whose `ON` has no `=` between a left and a right value is a nested-loop or
+range join ([Joins without a key](#joins-without-a-key)), which holds the right
+side in memory. The right side is a CTE, a `(SELECT ...)`, a table
 function, or any source a `FROM` reads — a path (`JOIN 'smb://fs/x.xlsx' x`, its
 `WITH (...)` after the alias) or a connection's table (`JOIN sr.db.t AS t`),
 read as `(SELECT * FROM it)` would be. A key is an `=` between a value of each
@@ -37,7 +39,8 @@ LEFT JOIN 'prices.csv' p
 
 A right or full join keeps every right row the same way, so there a condition
 on the right side alone decides matches too rather than narrowing it. `CROSS
-JOIN <cte>` takes no `ON`.
+JOIN <cte>` takes no `ON`; an `ON` with no condition across the sides (only
+`b.del <> '*'`) pairs every left row with every right row it leaves.
 Right-side columns that collide with a left name come back suffixed `_r`, and
 `_r2`, `_r3`, … if that name is taken too — that is the name `SELECT *` shows. A
 qualified reference needs no suffix: with `FROM t a JOIN r b`, `b.amt` is the
@@ -53,6 +56,38 @@ one shared set, and once all lanes are done the build rows nothing matched are
 written once, in build order, through the filters after the join, after
 every other row, as a serial run writes them. Under a `GROUP BY` they stay
 serial.
+
+## Joins without a key
+
+An `ON` with no `=` between a left and a right value — `a.x < b.y`, `a.d
+BETWEEN b.from AND b.to`, `a.k = b.k OR a.alt = b.k`, any condition — is a
+nested-loop join, of any kind: inner, left, right, full. The right side is read
+into memory, then each left row is paired with the right rows and the whole `ON`
+decides which pairs join, evaluated over up to 65,536 pairs at a time; a
+comparison with a null is no match, and the unmatched rows of an outer join come
+out as with a hash join. When the `ON` holds, `AND`-ed, a comparison of a left
+value with a right one (`L BETWEEN R1 AND R2`, `L >= R`, `L < R`, …) of one
+orderable type — numbers, or text, dates, times or timestamps on both sides —
+it is a range join: the right rows are sorted by that bound and each left row is
+paired only with those a binary search leaves, which makes looking up the period
+a date falls in cheap:
+
+```sql
+SELECT s.id, p.name AS period
+FROM 'sales.csv' s
+LEFT JOIN 'periods.csv' p
+  ON CAST(s.sold_on AS DATE) BETWEEN CAST(p.starts AS DATE) AND CAST(p.ends AS DATE);
+```
+
+With both bounds the search keeps the rows that start on or before the date
+whose running latest end reaches it, so periods that do not overlap cost one
+row each. An `OR` of equalities has no key and no range: it runs as a plain
+nested loop, comparing every pair — correct, but its cost grows with the product
+of the sides; split it into two keyed joins when the sides are large. `EXPLAIN`
+names the join `(range)` or `(nested-loop)`. Such a join never spills, never
+runs in parallel lanes and takes no key pushdown: its right side must fit in
+memory, up to the join's `WITH (max_build = '…')` or 4 GiB, past which it fails
+with the build-too-large error.
 
 ## Which side is held in memory
 
