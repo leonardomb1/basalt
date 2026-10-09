@@ -40,13 +40,17 @@ never fails a load.
 
 ## Searching rows
 
-`search(cols, text)` is true when a row holds `text` in the given columns:
+`search(cols, text[, unaccent])` is true when a row holds `text` in the given columns:
 `*` for every column, `t.*` for one table of a join, `* EXCEPT (a, b)` or
 `t.* EXCEPT (…)` to leave some out, `(a, b)` or a single column to name them.
 The text is a small query: words must all appear, each in any of the columns;
 `-word` keeps the rows without it; `col:word` looks in that column only (a name
 that is none of them leaves the whole token as text); `"two words"` is one
-phrase. All of it ignores case, and a value is matched as basalt prints it — a
+phrase. All of it ignores case — accented, Greek and Cyrillic letters too, as
+`upper()` and `lower()` fold them, so `crédito` finds `CRÉDITO` (an accent still
+counts: `credito` does not, unless the third argument is `true`, which drops
+accents on both sides as `unaccent()` does — `credito` then finds `CRÉDITO` and
+`strasse` finds `Straße`; it may be a bool `$param`) — and a value is matched as basalt prints it — a
 date as `2026-03-01`, a decimal at its scale — so `2026-03` finds March and
 `10.50` that amount; a NULL holds nothing. The REPL's `\view` find (`f`) is the
 same search over the rows it shows.
@@ -56,6 +60,7 @@ SELECT * FROM 'orders.csv' WHERE search(*, 'north -cancelled');
 SELECT o.id, c.name FROM 'orders.csv' o JOIN 'customers.csv' c ON c.id = o.cust
 WHERE search(c.*, '"são paulo"');
 SELECT COUNT_IF(search((note, memo), 'urgent')) AS urgent FROM 'orders.csv';
+SELECT * FROM 'payments.csv' WHERE search(kind, 'credito', true);
 ```
 
 It reads whole rows, so it is never pushed to a source: a SQL read sends every

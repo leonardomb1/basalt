@@ -12,6 +12,7 @@ const fail = @import("../analyze.zig").fail;
 const failAt = @import("../analyze.zig").failAt;
 const lastPart = @import("../analyze.zig").lastPart;
 const mk = @import("../analyze.zig").mk;
+const op = @import("../../exec/op.zig");
 const std = @import("std");
 const substExpr = @import("../analyze.zig").substExpr;
 const collectQuals = @import("../pushdown/hoist.zig").collectQuals;
@@ -133,39 +134,196 @@ pub fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const a
     };
 }
 
-/// Ranking is a non-null int; MIN/MAX, LAG and LEAD keep the column's type; AVG is a
-/// float; SUM is an INT over ints, a DECIMAL of the column's scale over decimals, as the
-/// SUM aggregate is, and a float otherwise. With an argument it is nullable (all-null
-/// peers, first LAG).
-pub fn windowFuncType(kind: ast.WinKind, src: types.Type) types.Type {
-    return switch (kind) {
-        .row_number, .rank, .dense_rank, .count => types.Type.init(.int),
-        .min, .max, .lag, .lead => src.asNullable(),
-        .avg => types.Type.init(.float).asNullable(),
-        .sum => switch (src.kind) {
-            .int => types.Type.init(.int).asNullable(),
-            .decimal => src.asNullable(),
-            else => types.Type.init(.float).asNullable(),
+/// Ranking, NTILE and the counts are a non-null int, PERCENT_RANK and CUME_DIST a
+/// non-null float; LAG, LEAD, the value functions, MIN and MAX keep the column's type;
+/// SUM is an INT over ints, a DECIMAL of the column's scale over decimals, as the SUM
+/// aggregate is, and a float otherwise; any other aggregate is typed as under GROUP
+/// BY. With an argument it is nullable (an empty frame, the first LAG).
+pub fn windowFuncType(f: ast.WinFn, src: types.Type) types.Type {
+    return switch (f) {
+        .win => |k| switch (k) {
+            .row_number, .rank, .dense_rank, .ntile => types.Type.init(.int),
+            .percent_rank, .cume_dist => types.Type.init(.float),
+            .lag, .lead, .first_value, .last_value, .nth_value => src.asNullable(),
+        },
+        .agg => |a| switch (a) {
+            .sum => switch (src.kind) {
+                .int => types.Type.init(.int).asNullable(),
+                .decimal => src.asNullable(),
+                else => types.Type.init(.float).asNullable(),
+            },
+            else => switch (aggregates.spec(a).result) {
+                .count => types.Type.init(.int),
+                .float, .sum => types.Type.init(.float).asNullable(),
+                .same => src.asNullable(),
+                .bool => types.Type.init(.bool).asNullable(),
+                .int => types.Type.init(.int).asNullable(),
+            },
         },
     };
+}
+
+pub const WindowPlan = struct {
+    part: []usize,
+    ord: []usize,
+    funcs: []op.Window.Func,
+    range: op.Window.RangeConv,
+    schema: types.Schema,
+};
+
+/// A window stage as the operator runs it: key columns, each function with its
+/// frame in the order key's units, and the schema it leaves (the input then one
+/// column per function). LAG/LEAD defaults are left to the caller, which knows the
+/// parameters.
+pub fn windowPlan(arena: std.mem.Allocator, in: types.Schema, wd: ast.Window, diag: *Diag) Error!WindowPlan {
+    const part = try fieldIndices(arena, in, wd.partition_by, diag);
+    const oqs = try arena.alloc(ast.QualName, wd.order_by.len);
+    for (wd.order_by, oqs) |sk, *q| q.* = sk.field;
+    const ord = try fieldIndices(arena, in, oqs, diag);
+    var conv: op.Window.RangeConv = .{};
+    var key_kind: types.TypeKind = .int;
+    for (wd.funcs) |f| if (f.frame) |fr| if (fr.unit == .range and fr.hasOffset()) {
+        if (ord.len != 1) return fail(diag, "RANGE with an offset needs exactly one ORDER BY key inside OVER (...), a number, date or timestamp", .{});
+        const kt = in.fields[ord[0]].ty;
+        key_kind = kt.kind;
+        conv = try rangeConv(arena, kt, oqs[0], wd.funcs, diag);
+        break;
+    };
+    const fields = try arena.alloc(types.Schema.Field, in.fields.len + wd.funcs.len);
+    @memcpy(fields[0..in.fields.len], in.fields);
+    const funcs = try arena.alloc(op.Window.Func, wd.funcs.len);
+    for (wd.funcs, funcs, 0..) |f, *o, i| {
+        var src = types.Type.init(.int);
+        var arg: ?usize = null;
+        if (f.arg) |q| {
+            arg = (try fieldIndices(arena, in, &[_]ast.QualName{q}, diag))[0];
+            src = in.fields[arg.?].ty;
+        }
+        if (f.func == .agg) {
+            const sp = aggregates.spec(f.func.agg);
+            if (sp.arg != .star_or_any and !sp.arg.accepts(src))
+                return fail(diag, "`{s}` needs a {s} argument, got {s}", .{ sp.names[0], sp.arg.word(), try src.name(arena) });
+        }
+        fields[in.fields.len + i] = .{ .name = f.out, .ty = windowFuncType(f.func, src) };
+        o.* = .{
+            .func = f.func,
+            .arg = arg,
+            .offset = f.offset,
+            .distinct = f.distinct,
+            .ignore_nulls = f.ignore_nulls,
+            .frame = if (f.frame) |fr| try opFrame(fr, conv, key_kind) else .{},
+        };
+    }
+    return .{ .part = part, .ord = ord, .funcs = funcs, .range = conv, .schema = .{ .fields = fields } };
 }
 
 /// The input then one column per function, the planner's rule, so `EXPLAIN` shows
 /// the schema past a window instead of `unresolved`.
 pub fn windowSchema(arena: std.mem.Allocator, in: types.Schema, wd: ast.Window, diag: *Diag) Error!types.Schema {
-    _ = try fieldIndices(arena, in, wd.partition_by, diag);
-    const oqs = try arena.alloc(ast.QualName, wd.order_by.len);
-    for (wd.order_by, oqs) |sk, *q| q.* = sk.field;
-    _ = try fieldIndices(arena, in, oqs, diag);
-    const fields = try arena.alloc(types.Schema.Field, in.fields.len + wd.funcs.len);
-    @memcpy(fields[0..in.fields.len], in.fields);
-    for (wd.funcs, 0..) |f, i| {
-        var src = types.Type.init(.int);
-        if (f.arg) |q| src = in.fields[(try fieldIndices(arena, in, &[_]ast.QualName{q}, diag))[0]].ty;
-        if (f.default) |d| if (f.arg) |q| try checkLagDefault(arena, d, q, src, diag);
-        fields[in.fields.len + i] = .{ .name = f.out, .ty = windowFuncType(f.kind, src) };
+    const wp = try windowPlan(arena, in, wd, diag);
+    for (wd.funcs) |f| {
+        if (f.default) |d| if (f.arg) |q| try checkLagDefault(arena, d, q, in.fields[(try fieldIndices(arena, in, &[_]ast.QualName{q}, diag))[0]].ty, diag);
     }
-    return .{ .fields = fields };
+    return wp.schema;
+}
+
+const us_per_day: i128 = 86_400_000_000;
+
+fn unitMicros(u: ast.IntervalUnit) i128 {
+    return switch (u) {
+        .day => us_per_day,
+        .hour => 3_600_000_000,
+        .minute => 60_000_000,
+        .second => 1_000_000,
+    };
+}
+
+/// Digits after the point in a frame offset's text, as its exact scale.
+fn fracDigits(text: []const u8) u8 {
+    if (std.mem.indexOfAny(u8, text, "eE") != null) return 6;
+    const dot = std.mem.indexOfScalar(u8, text, '.') orelse return 0;
+    return @intCast(@min(text.len - dot - 1, 18));
+}
+
+/// `text` as an integer at `scale` decimal places, exactly when it is plain digits.
+fn scaledText(text: []const u8, scale: u8) i128 {
+    const p = std.math.powi(i128, 10, scale) catch return std.math.maxInt(i64);
+    if (std.mem.indexOfAny(u8, text, "eE") != null) {
+        const f = std.fmt.parseFloat(f64, text) catch return 0;
+        return @intFromFloat(@round(f * @as(f64, @floatFromInt(p))));
+    }
+    const dot = std.mem.indexOfScalar(u8, text, '.') orelse text.len;
+    var v: i128 = std.fmt.parseInt(i128, text[0..dot], 10) catch std.math.maxInt(i64);
+    v = std.math.mul(i128, v, p) catch std.math.maxInt(i64);
+    if (dot < text.len) {
+        const frac = text[dot + 1 ..];
+        var place = p;
+        for (frac) |c| {
+            place = @divTrunc(place, 10);
+            if (place == 0) break;
+            v += @as(i128, c - '0') * place;
+        }
+    }
+    return v;
+}
+
+/// How a stage's single ORDER BY key reads as a number for its RANGE offsets: a
+/// float as itself, an int at the scale its offsets need, a decimal at its own or
+/// theirs, a date or timestamp in microseconds. A plain number over a date or
+/// timestamp is days; a TIME takes only an INTERVAL.
+fn rangeConv(arena: std.mem.Allocator, kt: types.Type, key: ast.QualName, funcs: []const ast.WindowFunc, diag: *Diag) Error!op.Window.RangeConv {
+    var digits: u8 = 0;
+    var interval = false;
+    var plain = false;
+    for (funcs) |f| if (f.frame) |fr| if (fr.unit == .range) for ([_]ast.FrameBound{ fr.start, fr.end }) |b| switch (b) {
+        .preceding, .following => |o| {
+            if (o.unit != null) interval = true else plain = true;
+            digits = @max(digits, fracDigits(o.text));
+        },
+        else => {},
+    };
+    if (kt.unknown) return .{};
+    switch (kt.kind) {
+        .int, .float, .decimal => if (interval)
+            return fail(diag, "an INTERVAL frame offset needs a date or timestamp ORDER BY key; `{s}` is {s}", .{ lastPart(key), try kt.name(arena) }),
+        .time => if (plain)
+            return fail(diag, "a RANGE offset over the TIME key `{s}` is an INTERVAL, e.g. INTERVAL '5' MINUTE", .{lastPart(key)}),
+        .date, .timestamp => {},
+        else => return fail(diag, "RANGE with an offset needs a numeric, date or timestamp ORDER BY key; `{s}` is {s}", .{ lastPart(key), try kt.name(arena) }),
+    }
+    return switch (kt.kind) {
+        .float => .{ .float = true },
+        .int => .{ .mul = std.math.powi(i128, 10, digits) catch 1, .scale = digits },
+        .decimal => .{ .scale = @max(kt.scale, digits) },
+        .date => .{ .mul = us_per_day },
+        else => .{},
+    };
+}
+
+fn opOff(o: ast.FrameOffset, unit: ast.FrameUnit, conv: op.Window.RangeConv, key_kind: types.TypeKind) op.Window.Off {
+    if (unit == .rows) return .{ .rows = std.fmt.parseInt(i64, o.text, 10) catch std.math.maxInt(i64) };
+    if (conv.float) return .{ .float = std.fmt.parseFloat(f64, o.text) catch 0 };
+    return switch (key_kind) {
+        .date, .timestamp, .time => .{ .int = if (o.unit) |u|
+            @intFromFloat(@round((std.fmt.parseFloat(f64, o.text) catch 0) * @as(f64, @floatFromInt(unitMicros(u)))))
+        else
+            @intFromFloat(@round((std.fmt.parseFloat(f64, o.text) catch 0) * @as(f64, @floatFromInt(us_per_day)))) },
+        else => .{ .int = scaledText(o.text, conv.scale) },
+    };
+}
+
+fn opBound(b: ast.FrameBound, unit: ast.FrameUnit, conv: op.Window.RangeConv, key_kind: types.TypeKind) op.Window.Bound {
+    return switch (b) {
+        .unbounded_preceding => .unbounded_preceding,
+        .preceding => |o| .{ .preceding = opOff(o, unit, conv, key_kind) },
+        .current_row => .current_row,
+        .following => |o| .{ .following = opOff(o, unit, conv, key_kind) },
+        .unbounded_following => .unbounded_following,
+    };
+}
+
+fn opFrame(fr: ast.WinFrame, conv: op.Window.RangeConv, key_kind: types.TypeKind) Error!op.Window.Frame {
+    return .{ .range = fr.unit == .range, .start = opBound(fr.start, fr.unit, conv, key_kind), .end = opBound(fr.end, fr.unit, conv, key_kind) };
 }
 
 /// A literal LAG/LEAD default must fit its column, as the run requires; one over

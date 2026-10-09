@@ -95,5 +95,9 @@ fn explainNode(arena: std.mem.Allocator, node: op.Op, buf: *std.array_list.Manag
         try buf.appendNTimes(' ', depth * 2 + 2);
         try buf.writer().print("{s}\n", .{node.join.note});
     }
+    if (node == .nl_join) {
+        try buf.appendNTimes(' ', depth * 2 + 2);
+        try buf.appendSlice(if (node.nl_join.range != null) "range join: the right side sorted by its bound\n" else "nested loop: every left row against every right row\n");
+    }
     for (kids.items) |k| try explainNode(arena, k, buf, depth + 1);
 }

@@ -3,7 +3,8 @@
 //! the names and types stay pinned on top, and the status line always says where
 //! you are. `s` sorts by the cursor's column, `/` filters it, as you type, and
 //! `f` finds text across every column once Enter is pressed: the rows narrow to
-//! those holding it and each match is highlighted where it shows. It draws on the
+//! those holding it and each match is highlighted where it shows. `a` makes the
+//! find and the filters ignore accents as well as case, as `search(…, true)` does. It draws on the
 //! alternate screen, so leaving it puts the session back as it was.
 //!
 //! Sorting and filtering rearrange the rows the REPL kept (the first
@@ -36,6 +37,7 @@ pub const Dir = enum { asc, desc };
 pub const Filter = struct {
     op: Op,
     text: []const u8,
+    fold: search.Fold = .case,
 
     pub const Op = enum { contains, excludes, eq, ne, lt, le, gt, ge };
 
@@ -58,8 +60,8 @@ pub const Filter = struct {
     pub fn keeps(self: Filter, kind: ?types.TypeKind, cell: ?[]const u8) bool {
         const c = cell orelse return self.op == .excludes;
         switch (self.op) {
-            .contains => return std.ascii.indexOfIgnoreCase(c, self.text) != null,
-            .excludes => return std.ascii.indexOfIgnoreCase(c, self.text) == null,
+            .contains => return search.findFold(c, self.text, 0, self.fold) != null,
+            .excludes => return search.findFold(c, self.text, 0, self.fold) == null,
             else => {},
         }
         const ord = order(kind, c, self.text);
@@ -101,7 +103,12 @@ pub const Find = struct {
     terms: []const search.Bound = &.{},
 
     pub fn parse(gpa: std.mem.Allocator, src: []const u8, names: []const []const u8) !Find {
+        return parseFold(gpa, src, names, .case);
+    }
+
+    pub fn parseFold(gpa: std.mem.Allocator, src: []const u8, names: []const []const u8, fold: search.Fold) !Find {
         var q = try search.Query.parse(gpa, src);
+        q.fold = fold;
         errdefer q.deinit(gpa);
         return .{ .query = q, .terms = try q.bind(gpa, names) };
     }
@@ -134,7 +141,7 @@ pub const Find = struct {
 
 /// `s` drawn as `table.alignedCell` draws it, with every case-insensitive
 /// occurrence of a needle in `hit` style and the rest in `base`.
-pub fn markedCell(out: *std.Io.Writer, s: []const u8, width: usize, right: bool, needles: []const []const u8, base: []const u8, hit: []const u8) !void {
+pub fn markedCell(out: *std.Io.Writer, s: []const u8, width: usize, right: bool, needles: []const []const u8, fold: search.Fold, base: []const u8, hit: []const u8) !void {
     if (needles.len == 0) {
         try out.writeAll(base);
         return table.alignedCell(out, s, width, right);
@@ -146,9 +153,9 @@ pub fn markedCell(out: *std.Io.Writer, s: []const u8, width: usize, right: bool,
         if (nd.len == 0) continue;
         var from: usize = 0;
         while (from < s.len) {
-            const at = (std.ascii.indexOfIgnoreCasePos(s, from, nd)) orelse break;
-            for (at..@min(at + nd.len, marks.len)) |k| marks[k] = true;
-            from = at + nd.len;
+            const sp = search.findFold(s, nd, from, fold) orelse break;
+            for (sp.start..@min(sp.end, marks.len)) |k| marks[k] = true;
+            from = sp.end;
         }
     }
     const w = table.displayWidth(s);
@@ -233,6 +240,9 @@ const View = struct {
     filters: []std.array_list.Managed(u8),
     typing: bool = false,
     finding: bool = false,
+    whole: bool = false,
+    rerun: bool = false,
+    accents: bool = false,
     find_query: std.array_list.Managed(u8) = undefined,
     find_text: []const u8 = "",
     find: Find = .{},
@@ -249,7 +259,11 @@ const View = struct {
     fn rearrange(self: *View) !void {
         var fs = std.array_list.Managed(ColFilter).init(self.gpa);
         defer fs.deinit();
-        for (0..self.filters.len) |c| if (self.filterOf(c)) |f| try fs.append(.{ .col = c, .f = f });
+        for (0..self.filters.len) |c| if (self.filterOf(c)) |f| {
+            var ff = f;
+            ff.fold = self.fold();
+            try fs.append(.{ .col = c, .f = ff });
+        };
         const rows = try arrangeWith(
             self.gpa,
             self.g,
@@ -293,6 +307,16 @@ const View = struct {
         while (self.cur >= self.col0 + self.colsFrom(self.col0, width)) self.col0 += 1;
     }
 
+    fn fold(self: *const View) search.Fold {
+        return if (self.accents) .accents else .case;
+    }
+
+    /// `a`: accents ignored or not, by the find and the filters alike.
+    fn toggleAccents(self: *View) !void {
+        self.accents = !self.accents;
+        try self.setFind(self.find_text);
+    }
+
     fn style(self: *const View, s: []const u8) []const u8 {
         return if (self.color) s else "";
     }
@@ -301,7 +325,7 @@ const View = struct {
     fn setFind(self: *View, text: []const u8) !void {
         const owned = try self.gpa.dupe(u8, std.mem.trim(u8, text, " "));
         errdefer self.gpa.free(owned);
-        var f = try Find.parse(self.gpa, owned, self.g.names);
+        var f = try Find.parseFold(self.gpa, owned, self.g.names, self.fold());
         errdefer f.deinit(self.gpa);
         self.find.deinit(self.gpa);
         self.gpa.free(self.find_text);
@@ -331,7 +355,7 @@ const View = struct {
                         var nb: [8][]const u8 = undefined;
                         var base_buf: [32]u8 = undefined;
                         const base = std.fmt.bufPrint(&base_buf, "{s}{s}", .{ if (at) self.style("\x1b[1m") else "", self.style(palette.value(self.kinds[c], s)) }) catch "";
-                        try markedCell(out, s, self.widths[c], self.g.right[c], self.find.needles(c, &nb), base, if (self.color) "\x1b[30;43m" else "\x1b[7m");
+                        try markedCell(out, s, self.widths[c], self.g.right[c], self.find.needles(c, &nb), self.fold(), base, if (self.color) "\x1b[30;43m" else "\x1b[7m");
                     } else {
                         try out.writeAll(self.style(palette.null_));
                         try table.alignedCell(out, "NULL", self.widths[c], self.g.right[c]);
@@ -382,7 +406,8 @@ const View = struct {
         if (self.typing) {
             w.print(" filter {s}: {s}\xe2\x96\x8f   text \xc2\xb7 !text \xc2\xb7 >= 100 \xc2\xb7 enter keeps \xc2\xb7 esc drops", .{ self.g.names[self.cur], self.filters[self.cur].items }) catch {};
         } else if (self.finding) {
-            w.print(" find: {s}\xe2\x96\x8f   words AND-ed \xc2\xb7 -word \xc2\xb7 col:word \xc2\xb7 \"two words\" \xc2\xb7 enter finds \xc2\xb7 esc drops", .{self.find_query.items}) catch {};
+            const what: []const u8 = if (self.whole) "find in the whole result (runs the query again)" else "find";
+            w.print(" {s}: {s}\xe2\x96\x8f   words AND-ed \xc2\xb7 -word \xc2\xb7 col:word \xc2\xb7 \"two words\" \xc2\xb7 enter finds \xc2\xb7 esc drops", .{ what, self.find_query.items }) catch {};
         } else {
             const kept = self.g.kept();
             const shown = self.rows.len;
@@ -395,7 +420,8 @@ const View = struct {
                 w.print(" \xc2\xb7 {s}: {s}", .{ self.g.names[c], std.mem.trim(u8, self.filters[c].items, " ") }) catch {};
             };
             if (self.find.active()) w.print(" \xc2\xb7 find: {s}", .{self.find_text}) catch {};
-            w.print(" \xc2\xb7 col {d}/{d} ({d} shown) \xc2\xb7 \xe2\x86\x90\xe2\x86\x92 column \xc2\xb7 s sort \xc2\xb7 / filter \xc2\xb7 f find \xc2\xb7 esc clears \xc2\xb7 q quits", .{ self.cur + 1, self.widths.len, ncols }) catch {};
+            if (self.accents) w.writeAll(" \xc2\xb7 accents ignored") catch {};
+            w.print(" \xc2\xb7 col {d}/{d} ({d} shown) \xc2\xb7 \xe2\x86\x90\xe2\x86\x92 column \xc2\xb7 s sort \xc2\xb7 / filter \xc2\xb7 f find{s} \xc2\xb7 a accents \xc2\xb7 esc clears \xc2\xb7 q quits", .{ self.cur + 1, self.widths.len, ncols, if (self.rerun) " (F: whole result)" else "" }) catch {};
         }
         try out.writeAll("\x1b[7m");
         try cutTo(out, w.buffered(), size.cols -| 1);
@@ -435,11 +461,18 @@ pub fn clampScroll(pos: usize, delta: isize, total: usize, page: usize) usize {
     return @min(@as(usize, @intCast(next)), max);
 }
 
+/// What the user left the view for: nothing, or `F`'s search to run over the
+/// whole result (`text` gpa-owned), which only the REPL can do.
+pub const Exit = union(enum) {
+    quit,
+    rerun: struct { text: []u8, accents: bool },
+};
+
 /// Shows `g` until the user leaves; both ends must be terminals. Esc clears the
 /// find first, then the filters, then the sort; Backspace removes a whole UTF-8
-/// character.
-pub fn run(gpa: std.mem.Allocator, g: Grid) !void {
-    if (g.ncols() == 0) return;
+/// character. `rerun` says whether `F` is offered.
+pub fn run(gpa: std.mem.Allocator, g: Grid, rerun: bool) !Exit {
+    if (g.ncols() == 0) return .quit;
     const in_fd = std.fs.File.stdin().handle;
     const out_file = std.fs.File.stdout();
 
@@ -472,6 +505,7 @@ pub fn run(gpa: std.mem.Allocator, g: Grid) !void {
         .color = !std.process.hasEnvVarConstant("NO_COLOR"),
         .rows = &.{},
         .filters = filters,
+        .rerun = rerun,
     };
     defer gpa.free(v.rows);
     v.find_query = std.array_list.Managed(u8).init(gpa);
@@ -497,7 +531,10 @@ pub fn run(gpa: std.mem.Allocator, g: Grid) !void {
             switch (key) {
                 .enter, .ctrl_enter => {
                     v.finding = false;
-                    try v.setFind(q.items);
+                    if (v.whole) {
+                        const text = std.mem.trim(u8, q.items, " ");
+                        if (text.len > 0) return .{ .rerun = .{ .text = try gpa.dupe(u8, text), .accents = v.accents } };
+                    } else try v.setFind(q.items);
                 },
                 .escape, .interrupt => v.finding = false,
                 .backspace => if (q.items.len > 0) {
@@ -568,7 +605,7 @@ pub fn run(gpa: std.mem.Allocator, g: Grid) !void {
             .enter => v.row0 = clampScroll(v.row0, 1, n, body),
             .page_up => v.row0 = clampScroll(v.row0, -page_rows, n, body),
             .page_down => v.row0 = clampScroll(v.row0, page_rows, n, body),
-            .interrupt, .eof_or_delete => return,
+            .interrupt, .eof_or_delete => return .quit,
             .escape => if (v.find.active()) {
                 try v.setFind("");
             } else if (v.anyFilter()) {
@@ -579,7 +616,7 @@ pub fn run(gpa: std.mem.Allocator, g: Grid) !void {
                 try v.rearrange();
             },
             .char => |c| switch (c) {
-                'q', 'Q' => return,
+                'q', 'Q' => return .quit,
                 'g' => v.row0 = 0,
                 'G' => v.row0 = clampScroll(v.row0, std.math.maxInt(i32), n, body),
                 'h' => v.cur -|= 1,
@@ -588,14 +625,22 @@ pub fn run(gpa: std.mem.Allocator, g: Grid) !void {
                 'j' => v.row0 = clampScroll(v.row0, 1, n, body),
                 ' ' => v.row0 = clampScroll(v.row0, page_rows, n, body),
                 's', 'S' => try v.cycleSort(),
+                'a', 'A' => try v.toggleAccents(),
                 '/' => {
                     before.clearRetainingCapacity();
                     try before.appendSlice(v.filters[v.cur].items);
                     v.typing = true;
                 },
-                'f', 'F' => {
+                'f' => {
                     v.find_query.clearRetainingCapacity();
                     try v.find_query.appendSlice(v.find_text);
+                    v.whole = false;
+                    v.finding = true;
+                },
+                'F' => if (rerun) {
+                    v.find_query.clearRetainingCapacity();
+                    try v.find_query.appendSlice(v.find_text);
+                    v.whole = true;
                     v.finding = true;
                 },
                 else => {},
@@ -751,21 +796,63 @@ test "view: a found text is marked in any case inside the cell, the padding kept
     const gpa = std.testing.allocator;
     var out = std.Io.Writer.Allocating.init(gpa);
     defer out.deinit();
-    try markedCell(&out.writer, "Sao Paulo SP", 14, false, &.{"sp"}, "", "[");
+    try markedCell(&out.writer, "Sao Paulo SP", 14, false, &.{"sp"}, .case, "", "[");
     try std.testing.expectEqualStrings("Sao Paulo [SP\x1b[0m  ", out.written());
 
     var two = std.Io.Writer.Allocating.init(gpa);
     defer two.deinit();
-    try markedCell(&two.writer, "abcabc", 8, true, &.{ "b", "C" }, "<", "[");
+    try markedCell(&two.writer, "abcabc", 8, true, &.{ "b", "C" }, .case, "<", "[");
     try std.testing.expectEqualStrings("<  a[bc\x1b[0m<a[bc\x1b[0m<", two.written());
 
     var cut = std.Io.Writer.Allocating.init(gpa);
     defer cut.deinit();
-    try markedCell(&cut.writer, "xxxxxxxxmatch", 6, false, &.{"match"}, "", "[");
+    try markedCell(&cut.writer, "xxxxxxxxmatch", 6, false, &.{"match"}, .case, "", "[");
     try std.testing.expectEqualStrings("xxxxx…", cut.written());
 
     var none = std.Io.Writer.Allocating.init(gpa);
     defer none.deinit();
-    try markedCell(&none.writer, "plain", 6, false, &.{}, "", "[");
+    try markedCell(&none.writer, "plain", 6, false, &.{}, .case, "", "[");
     try std.testing.expectEqualStrings("plain ", none.written());
+}
+
+test "view: a filter and a found text fold accented letters like upper()/lower()" {
+    try std.testing.expect(Filter.parse("são").?.keeps(.string, "SÃO PAULO"));
+    try std.testing.expect(!Filter.parse("!CRÉDITO").?.keeps(.string, "crédito"));
+    const gpa = std.testing.allocator;
+    var out = std.Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    try markedCell(&out.writer, "TIPO CRÉDITO", 12, false, &.{"crédito"}, .case, "", "[");
+    try std.testing.expectEqualStrings("TIPO [CRÉDITO\x1b[0m", out.written());
+}
+
+test "view: with accents ignored, the filters, the find and the marks match unaccented text" {
+    const gpa = std.testing.allocator;
+    var f = Filter.parse("credito").?;
+    try std.testing.expect(!f.keeps(.string, "CRÉDITO"));
+    f.fold = .accents;
+    try std.testing.expect(f.keeps(.string, "CRÉDITO"));
+
+    const S = struct {
+        const names = [_][]const u8{"n"};
+        const tys = [_][]const u8{"string?"};
+        const right = [_]bool{false};
+        const cells = [_]?[]const u8{ "CRÉDITO", "débito", "credito" };
+    };
+    const g = Grid{ .names = &S.names, .types = &S.tys, .right = &S.right, .cells = &S.cells, .total_rows = 3 };
+    const kinds = [_]?types.TypeKind{.string};
+    var plain = try Find.parse(gpa, "credito", g.names);
+    defer plain.deinit(gpa);
+    const a = try arrangeWith(gpa, g, &kinds, null, &.{}, plain);
+    defer gpa.free(a);
+    try std.testing.expectEqualSlices(usize, &.{2}, a);
+    var loose = try Find.parseFold(gpa, "credito", g.names, .accents);
+    defer loose.deinit(gpa);
+    const b = try arrangeWith(gpa, g, &kinds, null, &.{}, loose);
+    defer gpa.free(b);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2 }, b);
+
+    var out = std.Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    try markedCell(&out.writer, "TIPO CRÉDITO", 12, false, &.{"credito"}, .accents, "", "[");
+    try std.testing.expectEqualStrings("TIPO [CRÉDITO\x1b[0m", out.written());
 }

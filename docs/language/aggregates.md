@@ -31,6 +31,29 @@ FROM 'orders.parquet' GROUP BY region;
 A plain *column* still may not: it has no single value per group, so it must be
 wrapped in an aggregate or named in `GROUP BY`.
 
+## FILTER
+
+Any aggregate takes `FILTER (WHERE <condition>)`, folding only the rows where the
+condition holds — several slices of a group in one pass, where a `WHERE` would need
+a query each:
+
+```sql
+SELECT region,
+       COUNT(*)                                       AS orders,
+       COUNT(*)    FILTER (WHERE status = 'returned') AS returns,
+       SUM(amount) FILTER (WHERE amount > 0)          AS revenue,
+       COUNT(DISTINCT customer) FILTER (WHERE placed_at >= '2026-01-01') AS new_year_customers
+FROM 'orders.parquet'
+GROUP BY region
+HAVING SUM(amount) FILTER (WHERE amount > 0) > 1000;
+```
+
+A null condition counts as false. Every aggregate skips nulls, so `agg(x) FILTER
+(WHERE c)` is read as `agg(if(c, x, null))` and `COUNT(*) FILTER (WHERE c)` as
+`count_if(c)`: the result is the same, and a filtered aggregate runs wherever a
+plain one does — on the parallel lanes, spilling, and over a
+[window](windows.md#filter). An aggregate with no matching row is null (`COUNT` 0).
+
 **A float `SUM` is reproducible for a given `-j`, not across values of it.** The
 lanes each total their own slice and the slices are added in a fixed order, so
 rerunning the same command writes the same bytes; but `-j` decides how the input

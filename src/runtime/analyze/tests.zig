@@ -331,7 +331,7 @@ test "analyze checks the stages after a join against the joined schema" {
     try std.testing.expect(stages[stages.len - 1].out_schema != null);
 }
 
-test "analyze: a join with no `=` key is a range or nested-loop join, its ON checked over both sides" {
+test "analyze: a join with no `=` key is a range or nested-loop join, its ON checked over both sides, and says so unresolved" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -361,6 +361,14 @@ test "analyze: a join with no `=` key is a range or nested-loop join, its ON che
     diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyzeCsv(a, csv_data, r ++ "SELECT * FROM '$IN' JOIN r ON name BETWEEN rname AND rid", &diag));
     try std.testing.expectEqualStrings("incomparable operands", diag.msg);
+
+    diag = Diag{};
+    const remote = try analyzeCsv(a, csv_data, "WITH r AS (SELECT * FROM 'http://127.0.0.1:9/r.csv') SELECT * FROM '$IN' JOIN r ON id < r.rid", &diag);
+    var rj: ?Stage = null;
+    for (remote.outputs[0].stages) |st| {
+        if (std.mem.eql(u8, st.kind, "join")) rj = st;
+    }
+    try std.testing.expectEqualStrings("inner r (no key: range or nested-loop, decided at run time)", rj.?.detail);
 }
 
 test "analyze rejects a program with nothing to run" {

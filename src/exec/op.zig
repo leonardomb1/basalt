@@ -44,14 +44,16 @@
 //! boxing, and that bound can be published as a `threshold` so a source skips row
 //! groups.
 //!
-//! Window is a breaker: one sort over partition ++ order keys, then one numbering
-//! pass. Nulls in a partition key group together, as in GROUP BY. The default frame
-//! is the peer-based RANGE frame (ties share a value); a ROWS frame slides over
-//! positions, adding and subtracting, with a monotonic deque for MIN/MAX (re-walking
-//! the frame was O(partition^2)). A bounded float ROWS frame can drift by rounding;
-//! a segment tree is the exact upgrade. Under `WHERE rn <= k` a lone ROW_NUMBER
-//! (`top_k`) keeps only each partition's best k rows. Window SUM skips non-numeric
-//! kinds like nulls, and sums in i128 with a range check, as it once wrapped.
+//! Window is a breaker: one sort over partition ++ order keys, then one pass per
+//! function. Nulls in a partition key group together, as in GROUP BY. The default
+//! frame is the peer-based RANGE frame (ties share a value); any ROWS or RANGE frame
+//! resolves to two forward-moving edges per row, and an aggregate slides over them,
+//! adding and taking back, with a monotonic deque for MIN/MAX (re-walking the frame
+//! was O(partition^2)); MEDIAN and BIT_AND/OR recompute a frame that does not only
+//! grow. A sliding float frame can drift by rounding; a segment tree is the exact
+//! upgrade. Under `WHERE rn <= k` a lone ROW_NUMBER (`top_k`) keeps only each
+//! partition's best k rows. Window SUM skips non-numeric kinds like nulls, and sums
+//! in i128 with a range check, as it once wrapped.
 //!
 //! Aggregate is streaming hash aggregation, O(groups). Groups are typed records in
 //! blocks: `FixedStore` (raw i64 words plus a null mask) when every key is

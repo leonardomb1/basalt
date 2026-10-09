@@ -43,16 +43,19 @@ test "sql: an aggregate refuses a second argument instead of dropping it" {
     _ = try parseSource(a, "SELECT COUNT(*) AS a, COUNT(DISTINCT x) AS b, SUM(x) AS c FROM 'in.csv';", &diag);
 }
 
-test "sql: an aggregate or a function with no window form says so before OVER" {
+test "sql: a scalar function before OVER says it is not a window function; every aggregate is one" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    inline for (.{ "median", "stddev", "first_value", "nth_value", "ntile", "percent_rank" }) |f| {
+    inline for (.{ "upper", "coalesce", "abs" }) |f| {
         try testing.expectError(error.ParseFailed, parseSource(a, "SELECT g, " ++ f ++ "(x) OVER (PARTITION BY g) AS s FROM 'in.csv';", &diag));
         try testing.expect(std.mem.startsWith(u8, diag.msg, "`" ++ f ++ "` is not a window function"));
         try testing.expectEqual(@as(u32, 11), diag.col);
     }
+    inline for (.{ "median", "stddev", "variance", "bool_and", "bit_or", "count_if", "first_value", "last_value" }) |f|
+        _ = try parseSource(a, "SELECT g, " ++ f ++ "(x) OVER (PARTITION BY g) AS s FROM 'in.csv';", &diag);
+    _ = try parseSource(a, "SELECT g, nth_value(x, 2) OVER (PARTITION BY g ORDER BY x) AS s, ntile(4) OVER (ORDER BY x) AS q, percent_rank() OVER (ORDER BY x) AS p, cume_dist() OVER (ORDER BY x) AS c FROM 'in.csv';", &diag);
     _ = try parseSource(a, "SELECT g, median(x) AS m FROM 'in.csv' GROUP BY g;", &diag);
     _ = try parseSource(a, "SELECT g, x, SUM(x) OVER (PARTITION BY g ORDER BY x) AS s FROM 'in.csv';", &diag);
 }

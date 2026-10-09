@@ -1,5 +1,6 @@
-//! `search(cols, 'query')`: whether a row holds the query's words (`search.zig`)
-//! in the given columns. The parser hands the columns over as string items of a
+//! `search(cols, 'query'[, unaccent])`: whether a row holds the query's words
+//! (`search.zig`) in the given columns, ignoring accents as well as case when
+//! `unaccent` is true. The parser hands the columns over as string items of a
 //! `search_cols` call — `*` every column, `*@t` the columns of `t` (`*@` the
 //! FROM table's own, which carry no relation), `-name` one left out by `EXCEPT`,
 //! `=col` / `=t.col` a listed one — and they are resolved here against the rows'
@@ -82,15 +83,29 @@ fn pick(list: *std.array_list.Managed(usize), i: usize) !void {
 }
 
 fn specOf(c: ast.Expr.Call) ?ast.Expr.Call {
-    if (c.args.len != 2 or c.args[0].* != .call) return null;
+    if (c.args.len < 2 or c.args.len > 3 or c.args[0].* != .call) return null;
     const s = c.args[0].call;
     if (!std.mem.eql(u8, s.name, "search_cols")) return null;
     for (s.args) |a| if (a.* != .str_lit) return null;
     return s;
 }
 
+/// The fold `unaccent` asks for at `row`: accents too when it is true, case alone
+/// when it is false, null or left out.
+fn foldAt(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!search.Fold {
+    if (c.args.len < 3) return .case;
+    return switch (try evalRow(arena, c.args[2], batch, row)) {
+        .bool => |b| if (b) .accents else .case,
+        else => .case,
+    };
+}
+
 pub fn typeSearch(ctx: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
     const spec = specOf(c) orelse return ctx.err("`search` takes the columns, then the text: `search(*, 'sp 2026')`", .{});
+    if (c.args.len == 3) {
+        const u = try ctx.typeOf(c.args[2]);
+        if (!(u.kind == .bool or u.unknown)) return ctx.err("`search`'s third argument is a bool: true ignores accents as well as case", .{});
+    }
     var why: Unresolved = undefined;
     _ = resolve(ctx.arena, spec, ctx.schema, &why) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -108,7 +123,7 @@ pub fn typeSearch(ctx: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
 const Prepared = struct { cols: Cols, terms: []const search.Bound };
 
 /// The columns and the bound query for `batch`, or null when the query is NULL.
-fn prepare(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, query: ?[]const u8) EvalError!?Prepared {
+fn prepare(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, query: ?[]const u8, fold: search.Fold) EvalError!?Prepared {
     const text = query orelse return null;
     const spec = specOf(c) orelse return error.TypeMismatch;
     var why: Unresolved = undefined;
@@ -116,7 +131,8 @@ fn prepare(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, query: ?[]c
         error.OutOfMemory => return error.OutOfMemory,
         error.Unresolved => return error.TypeMismatch,
     };
-    const q = try search.Query.parse(arena, text);
+    var q = try search.Query.parse(arena, text);
+    q.fold = fold;
     return .{ .cols = cols, .terms = try q.bind(arena, cols.names) };
 }
 
@@ -140,17 +156,23 @@ pub fn rowSearch(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: 
         .string => |s| s,
         else => try valueToString(arena, qv),
     };
-    const p = try prepare(arena, c, batch, text) orelse return .{ .bool = false };
+    const p = try prepare(arena, c, batch, text, try foldAt(arena, c, batch, row)) orelse return .{ .bool = false };
     return .{ .bool = search.matches(p.terms, p.cols.idx.len, RowCtx{ .arena = arena, .batch = batch, .cols = p.cols.idx, .row = row }, RowCtx.at) };
 }
 
-/// One query for the whole batch: a text that varies by row goes row by row.
+/// One query for the whole batch: a text or an `unaccent` that varies by row goes
+/// row by row.
 pub fn vecSearch(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
-    if (c.args.len != 2 or !(c.args[1].* == .str_lit or c.args[1].* == .null_lit)) return error.Unsupported;
+    if (c.args.len < 2 or !(c.args[1].* == .str_lit or c.args[1].* == .null_lit)) return error.Unsupported;
+    const fold: search.Fold = if (c.args.len < 3) .case else switch (c.args[2].*) {
+        .bool_lit => |b| if (b) .accents else .case,
+        .null_lit => .case,
+        else => return error.Unsupported,
+    };
     const text: ?[]const u8 = if (c.args[1].* == .str_lit) c.args[1].str_lit else null;
     const n = batch.len;
     const out = try arena.alloc(bool, n);
-    const p = try prepare(arena, c, batch, text) orelse {
+    const p = try prepare(arena, c, batch, text, fold) orelse {
         @memset(out, false);
         return mkCol(Type.init(.bool), n, try Bitmap.initFull(arena, n), .{ .b = out });
     };

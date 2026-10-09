@@ -58,7 +58,7 @@
 //! `tablefn.zig`, `window.zig`, `from.zig`, `control.zig`, `rewrite.zig`,
 //! `expr.zig`), each method aliased back into `Parser` so `self.parseExpr()` reads
 //! as before. The parser's tests are in `parse/tests_expr.zig`,
-//! `parse/tests_query.zig` and `parse/tests_script.zig`.
+//! `parse/tests_query.zig`, `parse/tests_script.zig` and `parse/tests_window.zig`.
 
 const std = @import("std");
 const token = @import("token.zig");
@@ -173,7 +173,7 @@ const reserved_after_source = [_][]const u8{
     "else",     "case",     "select", "from",    "load",   "for",       "using",
     "natural",  "upsert",   "append", "replace", "split",  "jobs",      "offset",
     "paginate", "retry",    "create", "param",   "having", "and",       "or",
-    "not",      "explain",  "costs",  "analyze", "except", "intersect",
+    "not",      "explain",  "costs",  "analyze", "except", "intersect", "window",
 };
 
 fn isKwIn(name: []const u8, kws: []const []const u8) bool {
@@ -330,6 +330,7 @@ pub const Parser = struct {
     derived_n: usize = 0,
     pending_semijoins: std.array_list.Managed(PendingSemiJoin) = undefined,
     in_where: bool = false,
+    win_sink: ?*std.array_list.Managed(WinCall) = null,
     query_depth: usize = 0,
     expr_nest: usize = 0,
     unary_nest: usize = 0,
@@ -606,9 +607,20 @@ pub const Parser = struct {
     pub const containsExpr = @import("parse/tablefn.zig").containsExpr;
     pub const isSentinel = @import("parse/tablefn.zig").isSentinel;
     pub const liftSemiJoins = @import("parse/tablefn.zig").liftSemiJoins;
-    pub const parseWindowItem = @import("parse/window.zig").parseWindowItem;
-    pub const notWindow = @import("parse/window.zig").notWindow;
-    pub const overFollows = @import("parse/window.zig").overFollows;
+    pub const WinCall = @import("parse/window.zig").WinCall;
+    pub const NamedWindow = @import("parse/window.zig").NamedWindow;
+    pub const parseNullTreatment = @import("parse/window.zig").parseNullTreatment;
+    pub const parseFilterClause = @import("parse/window.zig").parseFilterClause;
+    pub const applyFilter = @import("parse/window.zig").applyFilter;
+    pub const parseWindowCall = @import("parse/window.zig").parseWindowCall;
+    pub const windowArgs = @import("parse/window.zig").windowArgs;
+    pub const parseSpecBody = @import("parse/window.zig").parseSpecBody;
+    pub const parseFrame = @import("parse/window.zig").parseFrame;
+    pub const parseBound = @import("parse/window.zig").parseBound;
+    pub const parseWindowClause = @import("parse/window.zig").parseWindowClause;
+    pub const resolveSpec = @import("parse/window.zig").resolveSpec;
+    pub const checkCall = @import("parse/window.zig").checkCall;
+    pub const groupedOnly = @import("parse/window.zig").groupedOnly;
     pub const parseFromSource = @import("parse/from.zig").parseFromSource;
     pub const parseSubQuery = @import("parse/from.zig").parseSubQuery;
     pub const parseEachTableOf = @import("parse/from.zig").parseEachTableOf;
@@ -724,5 +736,6 @@ test {
     _ = @import("parse/tests_expr.zig");
     _ = @import("parse/tests_query.zig");
     _ = @import("parse/tests_script.zig");
+    _ = @import("parse/tests_window.zig");
     _ = @import("parse/testing_util.zig");
 }

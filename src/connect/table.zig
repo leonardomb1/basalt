@@ -45,6 +45,9 @@ pub const Grid = struct {
 pub var interactive: bool = false;
 var last_store: ?*TableWriter = null;
 
+/// Counts the results kept, so a caller can tell whether a run made a new one.
+pub var kept_results: u64 = 0;
+
 /// The most recent retained result, valid until the next one replaces it.
 pub fn last() ?Grid {
     return if (last_store) |t| t.grid() else null;
@@ -137,6 +140,7 @@ pub const TableWriter = struct {
             try out.flush();
             dropLast();
             last_store = self;
+            kept_results += 1;
             keep = true;
             return;
         }

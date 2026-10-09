@@ -227,7 +227,7 @@ pub fn windowTopK(arena: std.mem.Allocator, bstages: []const ast.Stage, after: [
     } else return null;
     if (bstages[wi].node != .window) return null;
     const wd = bstages[wi].node.window;
-    if (wd.funcs.len != 1 or wd.funcs[0].kind != .row_number) return null;
+    if (wd.funcs.len != 1 or wd.funcs[0].func != .win or wd.funcs[0].func.win != .row_number) return null;
     const rn = wd.funcs[0].out;
     for (bstages[wi + 1 ..]) |st| {
         if (st.node != .select) return null;
@@ -381,4 +381,36 @@ fn buildSetOp(env: *Env, set: ast.SetOp, canon: types.Schema, child: op.Op, sche
     var r = try buildStage(env, .{ .node = .{ .aggregate = .{ .aggs = aggs, .by = by } }, .hints = &.{}, .pos = at }, child, schema);
     r = try buildStage(env, .{ .node = .{ .filter = pred }, .hints = &.{}, .pos = at }, r.op, r.schema);
     return buildStage(env, .{ .node = .{ .select = keep }, .hints = &.{}, .pos = at }, r.op, r.schema);
+}
+
+test "windowTopK: a whole-item ROW_NUMBER, filtered by its alias, gets top_k; one inside an expression does not" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const parser = @import("../../lang/sql_parser.zig");
+    const Case = struct { src: []const u8, want: ?u64 };
+    const cases = [_]Case{
+        .{ .src = "WITH r AS (SELECT k, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v DESC) AS rn FROM 'x.csv') SELECT * FROM r WHERE rn <= 2;", .want = 2 },
+        .{ .src = "WITH r AS (SELECT k, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) + 0 AS rn FROM 'x.csv') SELECT * FROM r WHERE rn <= 2;", .want = null },
+        .{ .src = "WITH r AS (SELECT k, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) AS rn, SUM(v) OVER (ORDER BY v) AS s FROM 'x.csv') SELECT * FROM r WHERE rn <= 2;", .want = null },
+    };
+    for (cases) |c| {
+        var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = try parser.parseSource(a, c.src, &diag);
+        var bstages: []const ast.Stage = &.{};
+        var after: []const ast.Stage = &.{};
+        for (prog.stmts) |st| switch (st) {
+            .binding => |b| bstages = b.pipeline.stages,
+            .output => |o| after = o.stages[1..],
+            else => {},
+        };
+        const got = try windowTopK(a, bstages, after);
+        if (c.want) |k| {
+            var top: ?u64 = null;
+            for (got.?) |st| {
+                if (st.node == .window) top = st.node.window.top_k;
+            }
+            try std.testing.expectEqual(k, top.?);
+        } else try std.testing.expect(got == null);
+    }
 }

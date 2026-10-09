@@ -668,85 +668,35 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
         },
         .window => |wd| {
             var ad = analyze.Diag{};
-            const pidx = analyze.fieldIndices(arena, schema, wd.partition_by, &ad) catch |e| return aErr(env, &ad, e);
-            const oqs = try arena.alloc(ast.QualName, wd.order_by.len);
-            for (wd.order_by, oqs) |sk, *q| q.* = sk.field;
-            const oidx = analyze.fieldIndices(arena, schema, oqs, &ad) catch |e| return aErr(env, &ad, e);
-
-            const pk = try arena.alloc(op.Sort.Key, pidx.len);
-            for (pidx, pk) |idx, *k| k.* = .{ .idx = idx, .desc = false };
-            const ok = try arena.alloc(op.Sort.Key, oidx.len);
-            for (wd.order_by, oidx, ok) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc };
-
-            const kinds = try arena.alloc(op.Window.Func, wd.funcs.len);
-            const fields = try arena.alloc(types.Schema.Field, schema.fields.len + wd.funcs.len);
-            @memcpy(fields[0..schema.fields.len], schema.fields);
-            for (wd.funcs, kinds, 0..) |f, *out, i| {
-                var ty = types.Type.init(.int);
-                var arg: ?usize = null;
-                var default: Value = .null;
-                switch (f.kind) {
-                    .row_number, .rank, .dense_rank => {},
-                    .count => {
-                        if (f.arg) |q| {
-                            const ai = analyze.fieldIndices(arena, schema, &[_]ast.QualName{q}, &ad) catch |e| return aErr(env, &ad, e);
-                            arg = ai[0];
-                        }
-                    },
-                    .sum, .min, .max, .avg => {
-                        const q = f.arg orelse return planErr(env.diag, "this window function needs a column argument");
-                        const ai = analyze.fieldIndices(arena, schema, &[_]ast.QualName{q}, &ad) catch |e| return aErr(env, &ad, e);
-                        arg = ai[0];
-                        ty = analyze.windowFuncType(f.kind, schema.fields[ai[0]].ty);
-                    },
-                    .lag, .lead => {
-                        const q = f.arg orelse return planErr(env.diag, "LAG/LEAD needs a column argument");
-                        const ai = analyze.fieldIndices(arena, schema, &[_]ast.QualName{q}, &ad) catch |e| return aErr(env, &ad, e);
-                        arg = ai[0];
-                        ty = schema.fields[ai[0]].ty.asNullable();
-                        if (f.default) |d| {
-                            const v = eval.constEval(arena, try analyze.substExpr(arena, d, env.params_expr), &.{}, &.{}) catch |e|
-                                return planErr(env.diag, try std.fmt.allocPrint(arena, "LAG/LEAD default: {s}", .{op.errLabel(e)}));
-                            default = if (v.isNull()) .null else eval.castValueTyped(arena, v, ty) catch
-                                return planErr(env.diag, try std.fmt.allocPrint(arena, "LAG/LEAD default does not fit `{s}` ({s})", .{ q.last(), try ty.name(arena) }));
-                        }
-                    },
-                }
-                out.* = .{
-                    .kind = switch (f.kind) {
-                        .row_number => .row_number,
-                        .rank => .rank,
-                        .dense_rank => .dense_rank,
-                        .lag => .lag,
-                        .lead => .lead,
-                        .sum => .sum,
-                        .count => .count,
-                        .min => .min,
-                        .max => .max,
-                        .avg => .avg,
-                    },
-                    .arg = arg,
-                    .offset = f.offset,
-                    .default = default,
-                    .frame = .{ .rows = f.frame.rows, .unbounded = f.frame.unbounded, .preceding = f.frame.preceding },
-                };
-                fields[schema.fields.len + i] = .{ .name = f.out, .ty = ty };
+            const wp = analyze.windowPlan(arena, schema, wd, &ad) catch |e| return aErr(env, &ad, e);
+            const pk = try arena.alloc(op.Sort.Key, wp.part.len);
+            for (wp.part, pk) |idx, *k| k.* = .{ .idx = idx, .desc = false };
+            const ok = try arena.alloc(op.Sort.Key, wp.ord.len);
+            for (wd.order_by, wp.ord, ok) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc };
+            for (wd.funcs, wp.funcs, 0..) |f, *out, i| {
+                const d = f.default orelse continue;
+                const q = f.arg orelse continue;
+                const ty = wp.schema.fields[schema.fields.len + i].ty;
+                const v = eval.constEval(arena, try analyze.substExpr(arena, d, env.params_expr), &.{}, &.{}) catch |e|
+                    return planErr(env.diag, try std.fmt.allocPrint(arena, "LAG/LEAD default: {s}", .{op.errLabel(e)}));
+                out.default = if (v.isNull()) .null else eval.castValueTyped(arena, v, ty) catch
+                    return planErr(env.diag, try std.fmt.allocPrint(arena, "LAG/LEAD default does not fit `{s}` ({s})", .{ q.last(), try ty.name(arena) }));
             }
-            const out: types.Schema = .{ .fields = fields };
             const o = try arena.create(op.Window);
             o.* = .{
                 .child = child,
                 .in_schema = try schemaPtr(arena, schema),
-                .out_schema = try schemaPtr(arena, out),
+                .out_schema = try schemaPtr(arena, wp.schema),
                 .part = pk,
                 .ord = ok,
-                .funcs = kinds,
+                .funcs = wp.funcs,
+                .range = wp.range,
                 .err = env.errctx,
                 .top_k = wd.top_k,
                 .gpa = env.gpa,
                 .threads = env.sort_threads,
             };
-            return .{ .op = .{ .window = o }, .schema = out };
+            return .{ .op = .{ .window = o }, .schema = wp.schema };
         },
         .aggregate => |ag| return buildAggregate(env, ag, schema, child),
         .join => |j| return buildJoin(env, j, stage.hints, schema, child, null),

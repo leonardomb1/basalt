@@ -33,6 +33,7 @@ pub const Session = struct {
     tty: bool = false,
     catalog: Catalog,
     last_entry: ?[]u8 = null,
+    result_block: ?[]u8 = null,
     announce: bool = true,
 
     pub fn completer(self: *Session) Completer {
@@ -214,6 +215,7 @@ pub fn cmdRepl(alloc: std.mem.Allocator) !u8 {
         } else |_| {}
     }
     defer if (sess.last_entry) |l| alloc.free(l);
+    defer if (sess.result_block) |b| alloc.free(b);
 
     var block = std.array_list.Managed(u8).init(alloc);
     defer block.deinit();
@@ -439,9 +441,21 @@ fn metaCommand(t: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
     if (std.mem.eql(u8, cmd, "\\view") or std.mem.eql(u8, cmd, "\\v")) {
         if (!sess.tty or !std.posix.isatty(std.fs.File.stdout().handle))
             return msg.writeAll("error: \\view needs a terminal\n");
-        const g = table.last() orelse return msg.writeAll("nothing to view yet — run a SELECT first\n");
-        try msg.flush();
-        return view.run(sess.decls.gpa, g);
+        var g = table.last() orelse return msg.writeAll("nothing to view yet — run a SELECT first\n");
+        const gpa = sess.decls.gpa;
+        while (true) {
+            try msg.flush();
+            switch (try view.run(gpa, g, sess.result_block != null)) {
+                .quit => return,
+                .rerun => |r| {
+                    defer gpa.free(r.text);
+                    const before = table.kept_results;
+                    try rerunWithSearch(gpa, sess, r.text, r.accents, msg);
+                    if (table.kept_results == before) return;
+                    g = table.last() orelse return;
+                },
+            }
+        }
     }
     try msg.print("error: unknown command `{s}` — \\help for help\n", .{cmd});
 }
@@ -523,6 +537,11 @@ pub fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg
     }
 
     const t0 = std.time.nanoTimestamp();
+    const kept_before = table.kept_results;
+    defer if (table.kept_results != kept_before) {
+        if (sess.result_block) |b| alloc.free(b);
+        sess.result_block = alloc.dupe(u8, block) catch null;
+    };
     var rdiag: runtime.Diag = .{};
     var freezer = LetFreezer.init(a);
     defer freezer.commit(&sess.decls) catch {};
@@ -549,6 +568,91 @@ pub fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg
         try msg.print("({d}.{d} ms)\n", .{ us / 1000, us % 1000 / 100 });
         try msg.flush();
     }
+}
+
+/// `\view`'s `F`: the entry that made the last result run again, its last terminal
+/// `SELECT` only, narrowed by `search(*, text)` over its output columns. Its other
+/// statements are not run again, so a `LOAD INTO` or `PRINT` beside it stays done.
+fn rerunWithSearch(gpa: std.mem.Allocator, sess: *Session, text: []const u8, accents: bool, msg: *std.Io.Writer) !void {
+    const block = sess.result_block orelse return;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: include.Diag = .{};
+    const entry = prepareEntry(a, &sess.decls, block, &diag, null) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return msg.writeAll("error: the query behind this result no longer parses\n"),
+    };
+    const prog = (try searchProgram(a, entry.prog, text, accents)) orelse
+        return msg.writeAll("error: F searches a result made by a SELECT that ends its entry; run search(*, '…') in a query instead\n");
+    var rdiag: runtime.Diag = .{};
+    _ = runtime.run(gpa, try appendDisplaySinks(a, prog), .{
+        .log = .{ .summary = .none, .level = .err },
+        .stdout_format = .table,
+        .progress = sess.tty and std.posix.isatty(std.fs.File.stderr().handle),
+        .items = true,
+    }, &rdiag) catch |e| {
+        if (e == error.OutOfMemory) return e;
+        try msg.print("error: {s}\n", .{if (rdiag.msg.len > 0) rdiag.msg else @errorName(e)});
+        return;
+    };
+}
+
+/// `prog` with its declarations and its last terminal `SELECT`, that one ending in
+/// `search(*, text[, true])`; null when something other than declarations
+/// follows that `SELECT`, which then may not be what made the result.
+pub fn searchProgram(a: std.mem.Allocator, prog: ast.Program, text: []const u8, accents: bool) !?ast.Program {
+    var at: ?usize = null;
+    for (prog.stmts, 0..) |st, i| if (st == .output and shown(st.output)) {
+        at = i;
+    };
+    const k = at orelse return null;
+    for (prog.stmts[k + 1 ..]) |st| if (!isDeclaration(st)) return null;
+
+    const cols = try a.alloc(*ast.Expr, 1);
+    cols[0] = try mkExpr(a, .{ .str_lit = "*" });
+    const args = try a.alloc(*ast.Expr, if (accents) 3 else 2);
+    args[0] = try mkExpr(a, .{ .call = .{ .name = "search_cols", .args = cols } });
+    args[1] = try mkExpr(a, .{ .str_lit = text });
+    if (accents) args[2] = try mkExpr(a, .{ .bool_lit = true });
+    const found = try mkExpr(a, .{ .call = .{ .name = "search", .args = args } });
+
+    const p = prog.stmts[k].output;
+    const body = if (p.stages[p.stages.len - 1].node == .write) p.stages.len - 1 else p.stages.len;
+    const stages = try a.alloc(ast.Stage, p.stages.len + 1);
+    @memcpy(stages[0..body], p.stages[0..body]);
+    stages[body] = .{ .node = .{ .filter = found }, .hints = &.{}, .pos = p.pos };
+    @memcpy(stages[body + 1 ..], p.stages[body..]);
+    var narrowed = p;
+    narrowed.stages = stages;
+
+    var out = std.array_list.Managed(ast.Stmt).init(a);
+    for (prog.stmts, 0..) |st, i| {
+        if (i == k) {
+            try out.append(.{ .output = narrowed });
+        } else if (isDeclaration(st)) try out.append(st);
+    }
+    return .{ .stmts = try out.toOwnedSlice() };
+}
+
+/// A pipeline whose rows are shown: a terminal `SELECT`, written to stdout.
+fn shown(p: ast.Pipeline) bool {
+    if (p.stages.len < 2) return false;
+    const last = p.stages[p.stages.len - 1].node;
+    return last != .write or std.mem.eql(u8, last.write.connector, "stdout");
+}
+
+fn isDeclaration(st: ast.Stmt) bool {
+    return switch (st) {
+        .kind, .param, .connection, .binding, .func, .let_const => true,
+        else => false,
+    };
+}
+
+fn mkExpr(a: std.mem.Allocator, e: ast.Expr) !*ast.Expr {
+    const p = try a.create(ast.Expr);
+    p.* = e;
+    return p;
 }
 
 /// Appends a `write stdout` table sink to any output pipeline not already ending in a `write`.
@@ -611,7 +715,7 @@ fn replHelp(msg: *std.Io.Writer) !void {
         \\  \d <conn.table|'file'>  its columns and types      (DESCRIBE ...)
         \\
         \\results
-        \\  \view, \v               the last result full-screen: arrows move, s sorts, / filters, f finds, q leaves
+        \\  \view, \v               the last result full-screen: arrows move, s sorts, / filters, f finds (F in the whole result), a ignores accents, q leaves
         \\  \format table|json|csv|tsv
         \\                          the output format (bare \format shows it); \f for short
         \\  \clear, \cls            clear the screen (Ctrl+L too, mid-entry)
@@ -724,4 +828,48 @@ test "appendDisplaySinks adds `write stdout` only to sink-less pipelines" {
         try std.testing.expectEqual(orig.output.stages.len, stages.len);
     }
     try std.testing.expect(found_sunk);
+}
+
+test "searchProgram keeps the declarations and the last SELECT, ending it in search" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+
+    const prog = try parser.parseSource(a,
+        \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');
+        \\LOAD INTO 'out.csv' AS WITH r AS (SELECT * FROM 'r.csv') SELECT * FROM r;
+        \\PRINT 'loaded';
+        \\SELECT id, name FROM 'in.csv' ORDER BY id;
+    , &diag);
+    const out = (try searchProgram(a, prog, "crédito -x", true)).?;
+    var outputs: usize = 0;
+    var connections: usize = 0;
+    for (out.stmts) |st| switch (st) {
+        .output => |p| {
+            outputs += 1;
+            try std.testing.expectEqualStrings("stdout", p.stages[p.stages.len - 1].node.write.connector);
+            const before = p.stages[p.stages.len - 2].node;
+            try std.testing.expect(before == .filter);
+            const c = before.filter.call;
+            try std.testing.expectEqualStrings("search", c.name);
+            try std.testing.expectEqualStrings("crédito -x", c.args[1].str_lit);
+            try std.testing.expect(c.args[2].bool_lit);
+        },
+        .connection => connections += 1,
+        .print => return error.TestUnexpectedResult,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), outputs);
+    try std.testing.expectEqual(@as(usize, 1), connections);
+
+    const after = try parser.parseSource(a,
+        \\SELECT 1 AS x FROM RANGE(0, 1);
+        \\PRINT 'then this';
+    , &diag);
+    try std.testing.expect((try searchProgram(a, after, "x", false)) == null);
+    const loads = try parser.parseSource(a,
+        \\LOAD INTO 'out.csv' AS SELECT 1 AS x FROM RANGE(0, 1);
+    , &diag);
+    try std.testing.expect((try searchProgram(a, loads, "x", false)) == null);
 }

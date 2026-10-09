@@ -164,6 +164,7 @@ pub const aggregatePlan = @import("analyze/schema.zig").aggregatePlan;
 const aggResultType = @import("analyze/schema.zig").aggResultType;
 pub const windowFuncType = @import("analyze/schema.zig").windowFuncType;
 pub const windowSchema = @import("analyze/schema.zig").windowSchema;
+pub const windowPlan = @import("analyze/schema.zig").windowPlan;
 pub const ExplodePlan = @import("analyze/schema.zig").ExplodePlan;
 pub const explodePlan = @import("analyze/schema.zig").explodePlan;
 pub const JoinPlan = @import("analyze/schema.zig").JoinPlan;
@@ -776,13 +777,14 @@ const Ctx = struct {
                     sql_fanout = false;
                 },
             }
+            var how: ?[]const u8 = null;
             if (cur) |c| {
                 cur = try self.propagate(c, st.node);
                 si.out_schema = cur;
-                if (cur != null and st.node == .join) if (try self.joinStrategy(c, st.node.join)) |how| {
-                    si.detail = try std.fmt.allocPrint(self.arena, "{s} ({s})", .{ si.detail, how });
-                };
+                if (cur != null and st.node == .join) how = try self.joinStrategy(c, st.node.join);
             } else try self.checkUnbound(st.node);
+            if (how == null and st.node == .join and st.node.join.keyless()) how = "no key: range or nested-loop, decided at run time";
+            if (how) |h| si.detail = try std.fmt.allocPrint(self.arena, "{s} ({s})", .{ si.detail, h });
             try stage_infos.append(si);
         }
 
@@ -993,7 +995,7 @@ const Ctx = struct {
             .sort => |s| .{ .kind = "sort", .detail = try std.fmt.allocPrint(self.arena, "{d} key(s)", .{s.keys.len}), .breaker = true },
             .aggregate => |ag| .{ .kind = "aggregate", .detail = try std.fmt.allocPrint(self.arena, "{d} agg(s), {d} group(s)", .{ ag.aggs.len, ag.by.len }), .breaker = true },
             .join => |j| try self.joinInfo(j),
-            .window => |wd| .{ .kind = "window", .detail = try std.fmt.allocPrint(self.arena, "{d} fn(s), {d} partition key(s)", .{ wd.funcs.len, wd.partition_by.len }), .breaker = true },
+            .window => |wd| .{ .kind = "window", .detail = try ast.windowDetail(self.arena, wd), .breaker = true },
             .read, .ref, .write, .union_ => fail(self.diag, "unexpected operator in the middle of a pipeline", .{}),
         };
     }

@@ -10,6 +10,7 @@ const ExprAlias = Parser.ExprAlias;
 const LateralKey = Parser.LateralKey;
 const Pos = @import("../sql_parser.zig").Pos;
 const SetOpTok = Parser.SetOpTok;
+const Window = @import("window.zig");
 const aggFunc = @import("../sql_parser.zig").aggFunc;
 const aggOrderDiffers = @import("../sql_parser.zig").aggOrderDiffers;
 const ast = @import("../ast.zig");
@@ -204,9 +205,19 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                 q = try self.parseColRef();
             } else if (self.at(.ident) and self.peekTag() == .lparen) {
                 const start = self.i;
-                _ = try self.parseExpr();
+                const kpos = self.curPos();
+                var scratch = std.array_list.Managed(Parser.WinCall).init(self.arena);
+                {
+                    const outer_sink = self.win_sink;
+                    self.win_sink = &scratch;
+                    defer self.win_sink = outer_sink;
+                    _ = try self.parseExpr();
+                }
+                const synth = try self.synthName(start);
                 const parts = try self.arena.alloc([]const u8, 1);
-                parts[0] = resolveExprAlias(first.expr_aliases, try self.synthName(start));
+                parts[0] = resolveExprAlias(first.expr_aliases, synth);
+                if (scratch.items.len > 0 and parts[0].ptr == synth.ptr)
+                    return self.fail(kpos, "a window function in ORDER BY must repeat one the SELECT list computes — or give that one an alias and order by it", .{});
                 q = .{ .parts = parts };
             } else {
                 q = try self.parseQualNameTok();
@@ -333,22 +344,15 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     const RawItem = union(enum) {
         item: ast.SelectItem,
         qstar: []const u8,
+        win: usize,
     };
     var raw_items = std.array_list.Managed(RawItem).init(self.arena);
     var expr_aliases = std.array_list.Managed(ExprAlias).init(self.arena);
-    var win_funcs = std.array_list.Managed(ast.WindowFunc).init(self.arena);
-    var win_part = std.array_list.Managed(ast.QualName).init(self.arena);
-    var win_ord = std.array_list.Managed(ast.SortKey).init(self.arena);
-    var win_outs = std.array_list.Managed([]const u8).init(self.arena);
-    // Where each window item stood among the others, so its column comes back there.
-    var win_raw_at = std.array_list.Managed(usize).init(self.arena);
+    var win_calls = std.array_list.Managed(Parser.WinCall).init(self.arena);
+    const outer_sink = self.win_sink;
+    self.win_sink = &win_calls;
+    defer self.win_sink = outer_sink;
     while (true) {
-        if (try self.parseWindowItem(&win_funcs, &win_part, &win_ord)) {
-            try win_outs.append(win_funcs.items[win_funcs.items.len - 1].out);
-            try win_raw_at.append(raw_items.items.len);
-            if (!self.eat(.comma)) break;
-            continue;
-        }
         if (self.eat(.star)) {
             if (self.eatKw("except") or self.eatKw("exclude")) {
                 _ = try self.expect(.lparen);
@@ -381,7 +385,19 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             try raw_items.append(.{ .qstar = alias });
         } else {
             const start = self.i;
+            const before = win_calls.items.len;
             const e = try self.parseExpr();
+            if (e.* == .field and e.field.parts.len == 1 and win_calls.items.len == before + 1 and
+                std.mem.eql(u8, e.field.parts[0], win_calls.items[before].hidden))
+            {
+                const sy = try self.synthRange(start, self.i);
+                const out = (try self.itemAlias()) orelse win_calls.items[before].name;
+                win_calls.items[before].out = out;
+                try expr_aliases.append(.{ .synth = sy, .out = out });
+                try raw_items.append(.{ .win = before });
+                if (!self.eat(.comma)) break;
+                continue;
+            }
             const synth: ?[]const u8 = if (e.* == .field) null else try self.synthRange(start, self.i);
             var name: ?[]const u8 = null;
             name = try self.itemAlias();
@@ -398,6 +414,8 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         }
         if (!self.eat(.comma)) break;
     }
+
+    self.win_sink = null;
 
     var aliases = AliasSet{};
     var read_hints = std.array_list.Managed(ast.Hint).init(self.arena);
@@ -749,6 +767,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 if (n < 1 or n > @as(i64, @intCast(raw_items.items.len)))
                     return self.fail(pos, "GROUP BY position {d} is out of range", .{n});
                 const ri = raw_items.items[@intCast(n - 1)];
+                if (ri == .win) return self.fail(pos, "GROUP BY position {d} is a window function — group on it in an outer query", .{n});
                 if (ri != .item) return self.fail(pos, "GROUP BY position {d} refers to `*`", .{n});
                 q = switch (ri.item) {
                     .field => |f| stripQual(f, &aliases),
@@ -775,6 +794,20 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     var having: ?*ast.Expr = null;
     if (self.eatKw("having")) having = try self.parseExpr();
 
+    var named = std.array_list.Managed(Parser.NamedWindow).init(self.arena);
+    if (self.eatKw("window")) try self.parseWindowClause(&named);
+    const specs = try self.arena.alloc(Window.Spec, win_calls.items.len);
+    for (win_calls.items, specs) |*c, *sp| {
+        const r = try self.resolveSpec(c.spec, named.items, 0);
+        try self.checkCall(c.*, r);
+        if (c.arg) |a| c.arg = try self.stripExpr(a, &aliases);
+        const part = try self.arena.alloc(*ast.Expr, r.partition.len);
+        for (r.partition, part) |e, *o| o.* = try self.stripExpr(e, &aliases);
+        const ord = try self.arena.alloc(Window.OrderExpr, r.order.len);
+        for (r.order, ord) |k, *o| o.* = .{ .e = try self.stripExpr(k.e, &aliases), .desc = k.desc };
+        sp.* = .{ .partition = part, .order = ord, .frame = r.frame, .pos = r.pos };
+    }
+
     var items = std.array_list.Managed(ast.SelectItem).init(self.arena);
     var aggs = std.array_list.Managed(ast.AggItem).init(self.arena);
     var union_tag: ?[]const u8 = null;
@@ -785,10 +818,10 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     if (distinct_on) |on| for (on) |*k| {
         k.* = stripQual(k.*, &aliases);
     };
-    const post_before = try self.arena.alloc(usize, raw_items.items.len + 1);
-    for (raw_items.items, 0..) |ri, ri_at| {
-        post_before[ri_at] = post.items.len;
+    var win_post = std.array_list.Managed(usize).init(self.arena);
+    for (raw_items.items) |ri| {
         switch (ri) {
+            .win => |wi| try post.append(.{ .field = try self.singleName(win_calls.items[wi].out.?) }),
             .qstar => |alias| {
                 if (!aliases.has(alias))
                     return self.fail(pos, "unknown alias `{s}` in `{s}.*`", .{ alias, alias });
@@ -813,6 +846,11 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 },
                 .computed => |c| {
                     const stripped = try self.stripExpr(c.expr, &aliases);
+                    if (Window.refsWindow(stripped, win_calls.items)) {
+                        try win_post.append(post.items.len);
+                        try post.append(.{ .computed = .{ .name = c.name, .expr = stripped } });
+                        continue;
+                    }
                     if (stripped.* == .call) {
                         if (aggFunc(stripped.call.name)) |f| {
                             const arg: ?*ast.Expr = if (stripped.call.args.len > 0) stripped.call.args[0] else null;
@@ -843,10 +881,57 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         }
     }
 
-    post_before[raw_items.items.len] = post.items.len;
+    for (aggs.items) |a| if (a.arg) |arg| if (Window.refsWindow(arg, win_calls.items))
+        return self.fail(pos, "an aggregate cannot take a window function's result — compute the window in a derived table or CTE first", .{});
+    var agg_mode = aggs.items.len > 0 or group.len > 0;
+    if (!agg_mode) {
+        for (win_post.items) |at| {
+            if (containsAgg(post.items[at].computed.expr)) agg_mode = true;
+        }
+        for (win_calls.items, specs) |c, sp| {
+            if (c.arg) |a| if (containsAgg(a)) {
+                agg_mode = true;
+            };
+            for (sp.partition) |e| if (containsAgg(e)) {
+                agg_mode = true;
+            };
+            for (sp.order) |k| if (containsAgg(k.e)) {
+                agg_mode = true;
+            };
+        }
+    }
+    if (agg_mode and win_calls.items.len > 0) {
+        const L = struct {
+            fn lift(p: *Parser, e: *ast.Expr, a: *std.array_list.Managed(ast.AggItem), m: []const ExprAlias, at: Pos) Error!*ast.Expr {
+                return if (containsAgg(e)) p.liftAggs(e, a, m, at) else e;
+            }
+        };
+        for (win_post.items) |at| {
+            const it = &post.items[at].computed;
+            it.expr = try L.lift(self, it.expr, &aggs, expr_aliases.items, pos);
+            lifted = true;
+        }
+        for (win_calls.items, specs) |*c, *sp| {
+            if (c.arg) |a| c.arg = try L.lift(self, a, &aggs, expr_aliases.items, pos);
+            const part = try self.arena.dupe(*ast.Expr, sp.partition);
+            for (part) |*e| e.* = try L.lift(self, e.*, &aggs, expr_aliases.items, pos);
+            const ord = try self.arena.dupe(Window.OrderExpr, sp.order);
+            for (ord) |*k| k.e = try L.lift(self, k.e, &aggs, expr_aliases.items, pos);
+            sp.partition = part;
+            sp.order = ord;
+        }
+        for (aggs.items) |a| if (a.arg) |arg| if (Window.refsWindow(arg, win_calls.items))
+            return self.fail(pos, "an aggregate cannot take a window function's result — compute the window in a derived table or CTE first", .{});
+        for (win_post.items) |at| try self.groupedOnly(post.items[at].computed.expr, group, aggs.items, win_calls.items, pos);
+        for (win_calls.items, specs) |c, sp| {
+            if (c.arg) |a| try self.groupedOnly(a, group, aggs.items, win_calls.items, pos);
+            for (sp.partition) |e| try self.groupedOnly(e, group, aggs.items, win_calls.items, pos);
+            for (sp.order) |k| try self.groupedOnly(k.e, group, aggs.items, win_calls.items, pos);
+        }
+    }
 
-    if (aggs.items.len > 0 or group.len > 0) {
-        if (aggs.items.len == 0)
+    if (agg_mode) {
+        if (aggs.items.len == 0 and win_calls.items.len == 0)
             return self.fail(pos, "GROUP BY without aggregate functions in SELECT", .{});
         for (aggs.items) |a| {
             if (a.distinct and a.func != .count)
@@ -914,14 +999,14 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             try stages.append(.{ .node = .{ .filter = hf }, .hints = &.{}, .pos = pos });
         }
         if (!lifted and aggOrderDiffers(post.items, group, aggs_out)) lifted = true;
-        if (lifted) {
+        if (lifted and win_calls.items.len == 0) {
             for (post.items) |it| {
                 if (it == .star or it == .star_except or it == .star_rename)
                     return self.fail(pos, "`*` cannot be combined with an aggregate inside an expression", .{});
             }
             try stages.append(.{ .node = .{ .select = try post.toOwnedSlice() }, .hints = &.{}, .pos = pos });
         }
-    } else if (win_funcs.items.len == 0) {
+    } else if (win_calls.items.len == 0) {
         const lone_star = items.items.len == 1 and items.items[0] == .star;
         if (!lone_star) {
             if (distinct_on) |on| distinct_drop = try self.distinctOnOutputs(&items, on);
@@ -929,65 +1014,42 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         }
     }
 
-    if (distinct and win_funcs.items.len == 0) {
+    if (distinct and win_calls.items.len == 0) {
         try stages.append(.{ .node = .{ .distinct = .{ .on = distinct_on } }, .hints = &.{}, .pos = pos });
         if (distinct_drop) |outs| try stages.append(.{ .node = .{ .select = outs }, .hints = &.{}, .pos = pos });
     }
 
-    if (win_funcs.items.len > 0) {
-        var refs = std.array_list.Managed([]const u8).init(self.arena);
-        for (win_part.items) |q| try refs.append(q.last());
-        for (win_ord.items) |k| try refs.append(k.field.last());
-        for (win_funcs.items) |f| {
-            if (f.arg) |q| try refs.append(q.last());
-        }
-        for (refs.items) |name| {
-            var have = false;
-            for (items.items) |it| switch (it) {
-                .star => have = true,
-                .star_except => |ex| {
-                    var dropped = false;
-                    for (ex) |x| {
-                        if (std.ascii.eqlIgnoreCase(x, name)) dropped = true;
-                    }
-                    if (!dropped) have = true;
-                },
-                .star_rename => |rs| {
-                    var moved = false;
-                    for (rs) |r| {
-                        if (std.ascii.eqlIgnoreCase(r.from, name)) moved = true;
-                    }
-                    if (!moved) have = true;
-                },
-                .field => |q| {
-                    if (std.ascii.eqlIgnoreCase(q.last(), name)) have = true;
-                },
-                .computed => |c| {
-                    if (std.ascii.eqlIgnoreCase(c.name, name)) have = true;
-                },
-            };
-            if (!have) try items.append(.{ .field = try self.singleName(name) });
-        }
-        if (items.items.len > 0) {
-            try stages.append(.{ .node = .{ .select = try items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
-        }
-        try stages.append(.{ .node = .{ .window = .{
-            .funcs = try win_funcs.toOwnedSlice(),
-            .partition_by = try win_part.toOwnedSlice(),
-            .order_by = try win_ord.toOwnedSlice(),
-        } }, .hints = &.{}, .pos = pos });
-        var out_items = std.array_list.Managed(ast.SelectItem).init(self.arena);
-        for (0..post.items.len + 1) |at| {
-            for (win_outs.items, win_raw_at.items) |name, raw_at| {
-                if (post_before[raw_at] == at) try out_items.append(.{ .field = try self.singleName(name) });
+    if (win_calls.items.len > 0) {
+        var low = Window.Lower.init(self, win_calls.items);
+        if (!agg_mode) for (win_post.items) |at| {
+            const it = &post.items[at].computed;
+            it.expr = try low.carryExpr(it.expr);
+        };
+        const wstages = try low.stages(specs, pos);
+        if (agg_mode) {
+            if (low.pre.items.len > 0) {
+                try low.pre.insert(0, .star);
+                try stages.append(.{ .node = .{ .select = try low.pre.toOwnedSlice() }, .hints = &.{}, .pos = pos });
             }
-            if (at == post.items.len) break;
-            try out_items.append(switch (post.items[at]) {
-                .star => .{ .star_except = win_outs.items },
-                .star_except => |ex| .{ .star_except = try std.mem.concat(self.arena, []const u8, &.{ ex, win_outs.items }) },
-                else => post.items[at],
-            });
+        } else {
+            for (low.carries.items) |name| {
+                if (!providesName(items.items, name)) try items.append(.{ .field = try self.singleName(name) });
+            }
+            try items.appendSlice(low.pre.items);
+            if (items.items.len > 0) {
+                try stages.append(.{ .node = .{ .select = try items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
+            }
         }
+        try stages.appendSlice(wstages);
+        var drop = std.array_list.Managed([]const u8).init(self.arena);
+        try drop.appendSlice(low.hidden.items);
+        for (win_calls.items) |c| if (c.out) |o| try drop.append(o);
+        var out_items = std.array_list.Managed(ast.SelectItem).init(self.arena);
+        for (post.items) |it| try out_items.append(switch (it) {
+            .star => .{ .star_except = drop.items },
+            .star_except => |ex| .{ .star_except = try std.mem.concat(self.arena, []const u8, &.{ ex, drop.items }) },
+            else => it,
+        });
         try stages.append(.{ .node = .{ .select = try out_items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
         if (distinct) try stages.append(.{ .node = .{ .distinct = .{ .on = distinct_on } }, .hints = &.{}, .pos = pos });
     }
@@ -1005,6 +1067,27 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     }
 
     return .{ .stages = try stages.toOwnedSlice(), .aliases = aliases, .union_branch = union_branch, .expr_aliases = try expr_aliases.toOwnedSlice() };
+}
+
+/// Whether a projection already yields a column called `name`, so a window's
+/// reference to it need not be carried.
+fn providesName(items: []const ast.SelectItem, name: []const u8) bool {
+    for (items) |it| switch (it) {
+        .star => return true,
+        .star_except => |ex| {
+            for (ex) |x| {
+                if (std.ascii.eqlIgnoreCase(x, name)) break;
+            } else return true;
+        },
+        .star_rename => |rs| {
+            for (rs) |r| {
+                if (std.ascii.eqlIgnoreCase(r.from, name)) break;
+            } else return true;
+        },
+        .field => |q| if (std.ascii.eqlIgnoreCase(q.last(), name)) return true,
+        .computed => |c| if (std.ascii.eqlIgnoreCase(c.name, name)) return true,
+    };
+    return false;
 }
 
 /// A union arm that is not a bare source, lowered to a binding and read back: the

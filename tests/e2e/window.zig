@@ -1,9 +1,12 @@
-//! End-to-end window functions: ranking, offsets, aggregate frames and ROWS frames.
+//! End-to-end window functions: ranking, offsets, value and distribution functions,
+//! ROWS and RANGE frames, IGNORE NULLS, FILTER, windows inside expressions, several
+//! OVER clauses, windows over a GROUP BY, and the parallel paths before a window.
 
 const std = @import("std");
 const basalt = @import("basalt");
-const parser = basalt.sql_parser;
 const ParamArg = basalt.env.ParamArg;
+const expectRefusedAlike = @import("harness.zig").expectRefusedAlike;
+const runCsvThreaded = @import("harness.zig").runCsvThreaded;
 const runToString = @import("harness.zig").runToString;
 const runScript = @import("harness.zig").runScript;
 
@@ -23,6 +26,7 @@ test "windows: each function keeps its own frame; DISTINCT and * see the window'
         .{ .q = "SELECT DISTINCT k, SUM(v) OVER (PARTITION BY k) AS s FROM '$B/m.csv' ORDER BY k", .want = "k,s\na,3\nb,3\n,4\n" },
         .{ .q = "SELECT *, ROW_NUMBER() OVER (ORDER BY v) AS rn FROM '$B/m.csv' ORDER BY rn", .want = "k,v,rn\na,1,1\na,2,2\nb,3,3\n,4,4\n" },
         .{ .q = "SELECT * EXCEPT (v), SUM(v) OVER (ORDER BY v) AS rs FROM '$B/m.csv' ORDER BY rs", .want = "k,rs\na,1\na,3\nb,6\n,10\n" },
+        .{ .q = "SELECT k, SUM(v * 2) OVER (PARTITION BY k) AS a FROM '$B/m.csv' ORDER BY k, a", .want = "k,a\na,6\na,6\nb,6\n,8\n" },
     };
     for (cases) |c| {
         const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
@@ -33,12 +37,6 @@ test "windows: each function keeps its own frame; DISTINCT and * see the window'
         defer alloc.free(out);
         try std.testing.expectEqualStrings(c.want, out);
     }
-
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    try std.testing.expectError(error.ParseFailed, parser.parseSource(parena.allocator(), "SELECT k, SUM(v * 2) OVER (PARTITION BY k) AS a FROM 'm.csv';", &pdiag));
-    try std.testing.expect(std.mem.indexOf(u8, pdiag.msg, "a window function takes a plain column") != null);
 }
 
 test "window: a column only named inside OVER survives the projection" {
@@ -211,28 +209,18 @@ test "window: min, max and avg share one window in a single SELECT" {
     try std.testing.expectEqualStrings("k,v,lo,hi,mean\na,10,10,20,15\na,20,10,20,15\nb,5,5,5,5\n", out);
 }
 
-test "window: two different windows in one SELECT are refused" {
+test "window: two different windows in one SELECT each sort their own input; columns keep the SELECT order" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "k,v\na,1\n" });
-    const base = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(base);
-    const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
-    defer alloc.free(in_path);
-    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
-    defer alloc.free(out_path);
-    const script = try std.fmt.allocPrint(
+    const out = try runToString(
         alloc,
-        "LOAD INTO '{s}' AS SELECT k, MIN(v) OVER (PARTITION BY k) AS lo, MAX(v) OVER (ORDER BY v) AS hi FROM '{s}';",
-        .{ out_path, in_path },
+        &tmp,
+        "k,v\na,1\nb,5\na,3\nb,2\n",
+        "SELECT k, v, MAX(v) OVER (ORDER BY v) AS hi, MIN(v) OVER (PARTITION BY k) AS lo, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v DESC) AS rn FROM '$IN' ORDER BY k, v",
     );
-    defer alloc.free(script);
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    try std.testing.expectError(error.ParseFailed, parser.parseSource(parena.allocator(), script, &pdiag));
-    try std.testing.expectEqualStrings("two window functions in one SELECT must share the same OVER (...) window", pdiag.msg);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("k,v,hi,lo,rn\na,1,1,1,2\na,3,3,1,1\nb,2,2,2,2\nb,5,5,2,1\n", out);
 }
 
 test "window: a ROWS frame counts rows where the default counts peers" {
@@ -352,4 +340,164 @@ test "LAG and LEAD take a default for the rows past the partition's edge, cast t
     );
     defer alloc.free(got);
     try std.testing.expectEqualStrings("g,d,prev,nxt\na,1.50,0.00,2.25\na,2.25,1.50,-1.00\nb,4.00,0.00,-1.00\n", got);
+}
+
+const Case = struct { q: []const u8, want: []const u8 };
+
+const sales_csv = "id,k,t,v\n1,a,1,10\n2,a,2,\n3,a,2,30\n4,a,5,40\n5,b,1,5\n6,b,3,\n7,b,4,7\n";
+const days_csv = "day,amt\n2024-01-01,1\n2024-01-02,2\n2024-01-02,3\n2024-01-05,4\n2024-01-06,5\n";
+
+/// Each case's query over `$B/s.csv` (`sales_csv`) and `$B/d.csv` (`days_csv`),
+/// loaded into a CSV and compared whole.
+fn expectCases(cases: []const Case) !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "s.csv", .data = sales_csv });
+    try tmp.dir.writeFile(.{ .sub_path = "d.csv", .data = days_csv });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        std.testing.expectEqualStrings(c.want, out) catch |e| {
+            std.debug.print("query: {s}\n", .{c.q});
+            return e;
+        };
+    }
+}
+
+test "window frames: ROWS and RANGE, every bound, offsets past the partition's edges" {
+    try expectCases(&.{
+        .{
+            .q = "SELECT id, SUM(v) OVER (PARTITION BY k ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS c3, SUM(v) OVER (PARTITION BY k ORDER BY id ROWS 2 PRECEDING) AS p2, COUNT(v) OVER (PARTITION BY k ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS rest, SUM(v) OVER (PARTITION BY k ORDER BY id ROWS BETWEEN 2 FOLLOWING AND 5 FOLLOWING) AS ahead FROM '$B/s.csv' ORDER BY id",
+            .want = "id,c3,p2,rest,ahead\n1,10,10,3,70\n2,40,10,2,40\n3,70,40,2,\n4,70,70,1,\n5,5,5,2,7\n6,12,5,1,\n7,7,12,1,\n",
+        },
+        .{
+            .q = "SELECT id, t, SUM(v) OVER (PARTITION BY k ORDER BY t RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS r1, COUNT(*) OVER (PARTITION BY k ORDER BY t RANGE BETWEEN CURRENT ROW AND 2 FOLLOWING) AS f2, SUM(v) OVER (PARTITION BY k ORDER BY t DESC RANGE BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS above FROM '$B/s.csv' ORDER BY id",
+            .want = "id,t,r1,f2,above\n1,1,10,3,70\n2,2,40,2,40\n3,2,40,2,40\n4,5,40,1,\n5,1,5,2,7\n6,3,,2,7\n7,4,7,1,\n",
+        },
+        .{
+            .q = "SELECT day, SUM(amt) OVER (ORDER BY day RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS two_days, SUM(amt) OVER (ORDER BY day RANGE BETWEEN INTERVAL '3' DAY PRECEDING AND INTERVAL '1' DAY FOLLOWING) AS wide FROM '$B/d.csv' ORDER BY day, amt",
+            .want = "day,two_days,wide\n2024-01-01,1,6\n2024-01-02,6,6\n2024-01-02,6,6\n2024-01-05,4,14\n2024-01-06,9,9\n",
+        },
+    });
+}
+
+test "window functions: value functions, distribution, and every aggregate over a window" {
+    try expectCases(&.{
+        .{
+            .q = "SELECT id, FIRST_VALUE(v) OVER w AS fv, LAST_VALUE(v) OVER w AS lv_default, LAST_VALUE(v) OVER (w ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS lv_all, NTH_VALUE(v, 2) OVER (w ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS second FROM '$B/s.csv' WINDOW w AS (PARTITION BY k ORDER BY t) ORDER BY id",
+            .want = "id,fv,lv_default,lv_all,second\n1,10,10,40,\n2,10,30,40,\n3,10,30,40,\n4,10,40,40,\n5,5,5,7,\n6,5,,7,\n7,5,7,7,\n",
+        },
+        .{
+            .q = "SELECT id, NTILE(3) OVER (ORDER BY id) AS nt, PERCENT_RANK() OVER (PARTITION BY k ORDER BY t) AS pr, CUME_DIST() OVER (PARTITION BY k ORDER BY t) AS cd, DENSE_RANK() OVER (PARTITION BY k ORDER BY t) AS dr FROM '$B/s.csv' ORDER BY id",
+            .want = "id,nt,pr,cd,dr\n1,1,0,0.25,1\n2,1,0.3333333333333333,0.75,2\n3,1,0.3333333333333333,0.75,2\n4,2,1,1,3\n5,2,0,0.3333333333333333,1\n6,3,0.5,0.6666666666666666,2\n7,3,1,1,3\n",
+        },
+        .{
+            .q = "SELECT k, id, MEDIAN(v) OVER (PARTITION BY k) AS med, STDDEV(v) OVER (PARTITION BY k) AS sd, VAR_POP(v) OVER (PARTITION BY k) AS vp, COUNT(DISTINCT t) OVER (PARTITION BY k) AS dt, BOOL_AND(v > 6) OVER (PARTITION BY k) AS all_big, BOOL_OR(v > 30) OVER (PARTITION BY k ORDER BY id) AS any_big_yet FROM '$B/s.csv' ORDER BY id",
+            .want = "k,id,med,sd,vp,dt,all_big,any_big_yet\na,1,30,15.275252316519467,155.55555555555557,3,true,false\na,2,30,15.275252316519467,155.55555555555557,3,true,false\na,3,30,15.275252316519467,155.55555555555557,3,true,false\na,4,30,15.275252316519467,155.55555555555557,3,true,true\nb,5,6,1.4142135623730951,1,3,false,false\nb,6,6,1.4142135623730951,1,3,false,false\nb,7,6,1.4142135623730951,1,3,false,false\n",
+        },
+    });
+}
+
+test "window IGNORE NULLS: LAG, LEAD, FIRST_VALUE and LAST_VALUE skip nulls, after the call or inside it" {
+    try expectCases(&.{.{
+        .q = "SELECT id, v, LAG(v) OVER (PARTITION BY k ORDER BY id) AS lag_r, LAG(v) IGNORE NULLS OVER (PARTITION BY k ORDER BY id) AS lag_i, LEAD(v IGNORE NULLS) OVER (PARTITION BY k ORDER BY id) AS lead_i, FIRST_VALUE(v) IGNORE NULLS OVER (PARTITION BY k ORDER BY id DESC) AS fv_i, LAST_VALUE(v) IGNORE NULLS OVER (PARTITION BY k ORDER BY id) AS carried FROM '$B/s.csv' ORDER BY id",
+        .want = "id,v,lag_r,lag_i,lead_i,fv_i,carried\n1,10,,,30,40,10\n2,,10,10,30,40,10\n3,30,,10,40,40,30\n4,40,30,30,,40,40\n5,5,,,7,7,5\n6,,5,5,7,7,5\n7,7,,5,,7,7\n",
+    }});
+}
+
+test "FILTER (WHERE …): under GROUP BY and HAVING, over the whole table, and over a window" {
+    try expectCases(&.{
+        .{
+            .q = "SELECT k, SUM(v) FILTER (WHERE t > 1) AS late, COUNT(*) FILTER (WHERE v IS NULL) AS missing, COUNT(DISTINCT t) FILTER (WHERE v > 6) AS dt, AVG(v) FILTER (WHERE id <> 4) AS a FROM '$B/s.csv' GROUP BY k HAVING SUM(v) FILTER (WHERE t > 1) > 10 ORDER BY k",
+            .want = "k,late,missing,dt,a\na,70,1,3,20\n",
+        },
+        .{
+            .q = "SELECT COUNT(*) FILTER (WHERE v > 6) AS big, MAX(id) FILTER (WHERE v IS NULL) AS last_missing FROM '$B/s.csv'",
+            .want = "big,last_missing\n4,6\n",
+        },
+        .{
+            .q = "SELECT id, SUM(v) FILTER (WHERE t <= 2) OVER (PARTITION BY k ORDER BY id) AS early_run, COUNT(*) FILTER (WHERE v IS NOT NULL) OVER (PARTITION BY k) AS n FROM '$B/s.csv' ORDER BY id",
+            .want = "id,early_run,n\n1,10,3\n2,10,3\n3,40,3\n4,40,3\n5,5,2\n6,5,2\n7,5,2\n",
+        },
+    });
+}
+
+test "windows in expressions, ORDER BY, expression keys and arguments, and over a GROUP BY" {
+    try expectCases(&.{
+        .{
+            .q = "SELECT id, ROW_NUMBER() OVER (PARTITION BY k ORDER BY id) + 100 AS rn, v - LAG(v) OVER (PARTITION BY k ORDER BY id) AS delta, CASE WHEN RANK() OVER (PARTITION BY k ORDER BY v DESC) = 1 THEN 'top' ELSE '-' END AS best, ROUND(AVG(v) OVER (PARTITION BY k), 2) AS mean FROM '$B/s.csv' ORDER BY ROW_NUMBER() OVER (PARTITION BY k ORDER BY id) + 100, id",
+            .want = "id,rn,delta,best,mean\n1,101,,-,26.67\n5,101,,-,6\n2,102,,-,26.67\n6,102,,-,6\n3,103,,-,26.67\n7,103,,top,6\n4,104,10,top,26.67\n",
+        },
+        .{
+            .q = "SELECT id, SUM(v * t) OVER (PARTITION BY substr(k, 1, 1) ORDER BY t + id) AS weighted, MAX(v) OVER (ORDER BY id % 3, id) AS m, MIN(t) OVER (PARTITION BY v IS NULL) AS mt FROM '$B/s.csv' ORDER BY id",
+            .want = "id,weighted,m,mt\n1,10,30,1\n2,10,40,2\n3,70,30,1\n4,270,40,1\n5,5,40,1\n6,5,30,2\n7,33,40,1\n",
+        },
+        .{
+            .q = "SELECT k, SUM(v) AS s, SUM(SUM(v)) OVER () AS total, ROUND(100.0 * SUM(v) / SUM(SUM(v)) OVER (), 1) AS pct, RANK() OVER (ORDER BY SUM(v) DESC) AS rk FROM '$B/s.csv' GROUP BY k ORDER BY rk",
+            .want = "k,s,total,pct,rk\na,80,92,87,1\nb,12,92,13,2\n",
+        },
+        .{
+            .q = "SELECT * FROM (SELECT id, k, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v DESC) AS rn FROM '$B/s.csv') r WHERE rn <= 2 ORDER BY id",
+            .want = "id,k,rn\n3,a,2\n4,a,1\n5,b,2\n7,b,1\n",
+        },
+    });
+}
+
+test "windows check like they run: a RANGE offset's key type, an INTERVAL's, a window's argument type" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "s.csv", .data = sales_csv });
+    try expectRefusedAlike(alloc, &tmp, "SELECT SUM(v) OVER (ORDER BY k RANGE 1 PRECEDING) AS s FROM '$B/s.csv';", "RANGE with an offset needs a numeric, date or timestamp ORDER BY key; `k` is string");
+    try expectRefusedAlike(alloc, &tmp, "SELECT SUM(v) OVER (ORDER BY t RANGE INTERVAL '1' DAY PRECEDING) AS s FROM '$B/s.csv';", "an INTERVAL frame offset needs a date or timestamp ORDER BY key");
+    try expectRefusedAlike(alloc, &tmp, "SELECT BOOL_AND(v) OVER (ORDER BY t) AS s FROM '$B/s.csv';", "`bool_and` needs a BOOL argument");
+    try expectRefusedAlike(alloc, &tmp, "SELECT SUM(nope * 2) OVER (ORDER BY t) AS s FROM '$B/s.csv';", "unknown field `nope`");
+    try expectRefusedAlike(alloc, &tmp, "SELECT SUM(v) OVER (PARTITION BY nope) AS s FROM '$B/s.csv';", "unknown field `nope`");
+}
+
+/// A CSV large enough to split across lanes: an id, a group, and a value that is
+/// sometimes missing.
+fn laneInput(alloc: std.mem.Allocator) ![]u8 {
+    var out = std.array_list.Managed(u8).init(alloc);
+    try out.appendSlice("id,g,v\n");
+    var prng = std.Random.DefaultPrng.init(42);
+    const rnd = prng.random();
+    for (0..6000) |i| {
+        const g = "abcde"[rnd.uintLessThan(usize, 5)];
+        if (rnd.uintLessThan(u8, 10) == 0) {
+            try out.writer().print("{d},{c},\n", .{ i, g });
+        } else {
+            try out.writer().print("{d},{c},{d}\n", .{ i, g, rnd.intRangeAtMost(i64, -100, 100) });
+        }
+    }
+    return out.toOwnedSlice();
+}
+
+test "windows after parallel stages: -j 4 writes what -j 1 does" {
+    const alloc = std.testing.allocator;
+    const input = try laneInput(alloc);
+    defer alloc.free(input);
+    const queries = [_][]const u8{
+        "SELECT g, SUM(v) AS s, SUM(SUM(v)) OVER () AS tot, RANK() OVER (ORDER BY SUM(v) DESC, g) AS rk, COUNT(*) FILTER (WHERE v > 50) AS big FROM '$IN' GROUP BY g ORDER BY g",
+        "SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING) AS s, v - LAG(v) IGNORE NULLS OVER (PARTITION BY g ORDER BY id) AS d, MAX(v) OVER (ORDER BY id % 7, id) AS m, COUNT(DISTINCT v) FILTER (WHERE v > 0) OVER (PARTITION BY g) AS pos FROM '$IN' WHERE id % 5 <> 0 ORDER BY id",
+    };
+    for (queries) |q| {
+        var t1 = std.testing.tmpDir(.{});
+        defer t1.cleanup();
+        const serial = try runCsvThreaded(alloc, &t1, input, q, 1);
+        defer alloc.free(serial);
+        var t4 = std.testing.tmpDir(.{});
+        defer t4.cleanup();
+        const lanes = try runCsvThreaded(alloc, &t4, input, q, 4);
+        defer alloc.free(lanes);
+        try std.testing.expect(std.mem.count(u8, serial, "\n") > 5);
+        try std.testing.expectEqualStrings(serial, lanes);
+    }
 }

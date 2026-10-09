@@ -30,11 +30,16 @@
 //! a NULL `x` only against an empty one. `INTERSECT`/`EXCEPT` compare NULLs equal,
 //! unlike join keys. A `UNION ALL BY NAME` reconciles arms to a canon schema by
 //! name (take, NULL-fill, drop, cast); plain `UNION ALL` aligns by position. A
-//! window stage is a breaker, bounded by its largest partition; without `ROWS
-//! BETWEEN` the frame is the whole partition, or with `ORDER BY` everything up to
-//! the current row's peers. `FROM RANGE` bounds and `CALL` arguments resolve at
-//! plan time; an empty `FROM BUFFER` dir resolves from the `INTO BUFFER`
-//! declaration, whose endpoint acks after fsync and answers 503 past `MAX`.
+//! window stage is a breaker, bounded by its largest partition; its keys and
+//! arguments are plain columns (the parser computes expressions into hidden ones
+//! first). A function is an aggregate or one that exists only over a window
+//! (`WinKind`); `offset` is LAG/LEAD's step, NTILE's bucket count and NTH_VALUE's
+//! position. A frame offset is kept as written, a non-negative number or an
+//! `INTERVAL`, for the plan to read in the order key's units. Without a frame it is
+//! the whole partition, or with `ORDER BY` everything up to the current row's peers.
+//! `FROM RANGE` bounds and `CALL` arguments resolve at plan time; an empty `FROM
+//! BUFFER` dir resolves from the `INTO BUFFER` declaration, whose endpoint acks
+//! after fsync and answers 503 past `MAX`.
 //!
 //! Statements. A statement `LET` is folded once at plan time in declaration order
 //! and is sealed: never bound from outside, never part of an endpoint's parameter
@@ -367,10 +372,116 @@ pub const Stage = struct {
     };
 };
 
-pub const WinKind = enum { row_number, rank, dense_rank, lag, lead, sum, count, min, max, avg };
+pub const WinKind = enum { row_number, rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, first_value, last_value, nth_value };
+pub const WinFn = union(enum) {
+    win: WinKind,
+    agg: AggFunc,
+
+    pub fn name(self: WinFn) []const u8 {
+        return switch (self) {
+            .win => |k| @tagName(k),
+            .agg => |a| @tagName(a),
+        };
+    }
+};
 /// `default` is LAG/LEAD's third argument, the value past the partition's edge.
-pub const WindowFunc = struct { kind: WinKind, out: []const u8, arg: ?QualName = null, offset: i64 = 1, default: ?*Expr = null, frame: WinFrame = .{} };
-pub const WinFrame = struct { rows: bool = false, unbounded: bool = false, preceding: i64 = 0 };
+pub const WindowFunc = struct {
+    func: WinFn,
+    out: []const u8,
+    arg: ?QualName = null,
+    offset: i64 = 1,
+    default: ?*Expr = null,
+    distinct: bool = false,
+    ignore_nulls: bool = false,
+    frame: ?WinFrame = null,
+};
+pub const FrameUnit = enum { rows, range };
+pub const IntervalUnit = enum { day, hour, minute, second };
+pub const FrameOffset = struct { text: []const u8, unit: ?IntervalUnit = null };
+pub const FrameBound = union(enum) {
+    unbounded_preceding,
+    preceding: FrameOffset,
+    current_row,
+    following: FrameOffset,
+    unbounded_following,
+
+    pub fn rank(self: FrameBound) u8 {
+        return switch (self) {
+            .unbounded_preceding => 0,
+            .preceding => 1,
+            .current_row => 2,
+            .following => 3,
+            .unbounded_following => 4,
+        };
+    }
+
+    pub fn hasOffset(self: FrameBound) bool {
+        return self == .preceding or self == .following;
+    }
+};
+pub const WinFrame = struct {
+    unit: FrameUnit,
+    start: FrameBound,
+    end: FrameBound,
+
+    pub fn hasOffset(self: WinFrame) bool {
+        return self.start.hasOffset() or self.end.hasOffset();
+    }
+
+    /// The frame as SQL writes it, for EXPLAIN.
+    pub fn render(self: WinFrame, arena: std.mem.Allocator) ![]const u8 {
+        return std.fmt.allocPrint(arena, "{s} BETWEEN {s} AND {s}", .{
+            if (self.unit == .rows) "ROWS" else "RANGE",
+            try renderBound(self.start, arena),
+            try renderBound(self.end, arena),
+        });
+    }
+
+    fn renderBound(b: FrameBound, arena: std.mem.Allocator) ![]const u8 {
+        return switch (b) {
+            .unbounded_preceding => "UNBOUNDED PRECEDING",
+            .current_row => "CURRENT ROW",
+            .unbounded_following => "UNBOUNDED FOLLOWING",
+            .preceding, .following => |o| std.fmt.allocPrint(arena, "{s}{s}{s}{s} {s}", .{
+                if (o.unit != null) "INTERVAL '" else "",
+                o.text,
+                if (o.unit != null) "' " else "",
+                if (o.unit) |u| @tagName(u) else "",
+                if (b == .preceding) "PRECEDING" else "FOLLOWING",
+            }),
+        };
+    }
+};
+
+/// A window stage for EXPLAIN: its keys, then each function with its frame.
+pub fn windowDetail(arena: std.mem.Allocator, wd: Window) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(arena);
+    const w = out.writer();
+    if (wd.partition_by.len > 0) {
+        try w.writeAll("PARTITION BY ");
+        for (wd.partition_by, 0..) |q, i| try w.print("{s}{s}", .{ if (i > 0) ", " else "", q.last() });
+    }
+    if (wd.order_by.len > 0) {
+        try w.writeAll(if (wd.partition_by.len > 0) " ORDER BY " else "ORDER BY ");
+        for (wd.order_by, 0..) |k, i| try w.print("{s}{s}{s}", .{ if (i > 0) ", " else "", k.field.last(), if (k.desc) " DESC" else "" });
+    }
+    if (wd.partition_by.len + wd.order_by.len == 0) try w.writeAll("whole input");
+    try w.writeAll(": ");
+    for (wd.funcs, 0..) |f, i| {
+        try w.print("{s}{s}", .{ if (i > 0) "; " else "", f.func.name() });
+        if (f.frame) |fr| {
+            try w.print(" {s}", .{try fr.render(arena)});
+        } else switch (f.func) {
+            .agg => try w.writeAll(if (wd.order_by.len > 0) " RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW" else " whole partition"),
+            .win => |k| switch (k) {
+                .first_value, .last_value, .nth_value => try w.writeAll(if (wd.order_by.len > 0) " RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW" else " whole partition"),
+                else => {},
+            },
+        }
+        if (f.ignore_nulls) try w.writeAll(" IGNORE NULLS");
+    }
+    return out.toOwnedSlice();
+}
 
 pub const Window = struct {
     funcs: []const WindowFunc,

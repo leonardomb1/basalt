@@ -4,6 +4,7 @@
 const Parser = @import("../sql_parser.zig").Parser;
 const BinInfo = Parser.BinInfo;
 const Error = @import("../sql_parser.zig").Error;
+const Pos = @import("../sql_parser.zig").Pos;
 const aggregates = @import("../aggregates.zig");
 const ast = @import("../ast.zig");
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
@@ -417,12 +418,24 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
                         while (self.eat(.comma)) try args.append(try self.parseCallArg());
                     }
                 }
+                var nulls = self.parseNullTreatment();
                 _ = try self.expect(.rparen);
-                const lower = try std.ascii.allocLowerString(self.arena, t.text);
+                const tpos: Pos = .{ .line = t.line, .col = t.col };
+                var lower: []const u8 = try std.ascii.allocLowerString(self.arena, t.text);
                 if (aggregates.lookup(lower)) |f| if (args.items.len > aggregates.spec(f).max_args)
-                    return self.fail(.{ .line = t.line, .col = t.col }, "`{s}` takes one argument, not {d}", .{ lower, args.items.len });
+                    return self.fail(tpos, "`{s}` takes one argument, not {d}", .{ lower, args.items.len });
+                if (nulls == null) nulls = self.parseNullTreatment();
+                var call_args = try args.toOwnedSlice();
+                if (try self.parseFilterClause()) |c| {
+                    const f = try self.applyFilter(lower, call_args, c, tpos);
+                    lower = f.name;
+                    call_args = f.args;
+                }
+                if (self.isKw("over")) return self.parseWindowCall(lower, call_args, call_distinct, nulls, tpos);
+                if (nulls != null)
+                    return self.fail(tpos, "IGNORE NULLS and RESPECT NULLS belong to a window function — `{s}(...)` needs OVER (...)", .{lower});
                 const name_span = ast.Span{ .start = .{ .line = t.line, .col = t.col }, .end = .{ .line = t.end_line, .col = t.end_col } };
-                return self.mk(.{ .call = .{ .name = lower, .args = try args.toOwnedSlice(), .distinct = call_distinct, .span = name_span } });
+                return self.mk(.{ .call = .{ .name = lower, .args = call_args, .distinct = call_distinct, .span = name_span } });
             }
             if (self.peekTag() != .dot) if (self.lambdaParam(t.text)) |name| {
                 _ = self.advance();
@@ -486,7 +499,7 @@ pub fn parseCaseExpr(self: *Parser) Error!*ast.Expr {
     return self.mk(.{ .match = .{ .subject = subject, .arms = try arms.toOwnedSlice() } });
 }
 
-/// `search(cols, query)`. The columns become string items of a `search_cols` call
+/// `search(cols, query[, options])`. The columns become string items of a `search_cols` call
 /// (`*`; `*@t` for `t.*`; `-name` for each `EXCEPT` name; `=col` or `=t.col` for a
 /// listed column) so that no pass reading column references mistakes them for
 /// some: the evaluator resolves them against the rows it is given.
@@ -531,10 +544,12 @@ pub fn parseSearch(self: *Parser) Error!*ast.Expr {
     if (!self.eat(.comma))
         return self.fail(self.curPos(), "search takes the columns, then the text: `search(*, 'sp 2026')`, `search(t.*, 'x')`, `search((a, b), 'x')`", .{});
     const query = try self.parseExpr();
+    const options: ?*ast.Expr = if (self.eat(.comma)) try self.parseExpr() else null;
     _ = try self.expect(.rparen);
-    const args = try self.arena.alloc(*ast.Expr, 2);
+    const args = try self.arena.alloc(*ast.Expr, if (options != null) 3 else 2);
     args[0] = try self.mk(.{ .call = .{ .name = "search_cols", .args = try items.toOwnedSlice() } });
     args[1] = query;
+    if (options) |o| args[2] = o;
     const span = ast.Span{ .start = .{ .line = start.line, .col = start.col }, .end = .{ .line = start.end_line, .col = start.end_col } };
     return self.mk(.{ .call = .{ .name = "search", .args = args, .span = span } });
 }

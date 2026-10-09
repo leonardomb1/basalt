@@ -28,10 +28,11 @@ pub const keywords = [_][]const u8{
     "using",    "when",     "where",      "with",      "true",      "false",     "count",      "sum",        "avg",
     "min",      "median",   "cast",       "try_cast",  "if",        "rank",      "dense_rank", "row_number", "lag",
     "lead",     "string",   "int",        "float",     "decimal",   "bool",      "date",       "time",       "timestamp",
-    "resource", "get",      "post",       "json_each",
+    "resource", "get",      "post",       "json_each", "following", "filter",    "window",     "ignore",     "respect",
+    "nulls",    "interval",
     // type names
-    "varchar",   "char",      "nvarchar",   "text",       "bigint",
-    "smallint", "tinyint",  "integer",    "double",    "real",      "numeric",   "boolean",    "datetime",
+    "varchar",    "char",      "nvarchar",  "text",      "bigint",     "smallint",   "tinyint",
+    "integer",  "double",   "real",       "numeric",   "boolean",   "datetime",
 };
 
 fn isKeyword(word: []const u8) bool {

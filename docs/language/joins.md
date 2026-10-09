@@ -84,7 +84,10 @@ whose running latest end reaches it, so periods that do not overlap cost one
 row each. An `OR` of equalities has no key and no range: it runs as a plain
 nested loop, comparing every pair — correct, but its cost grows with the product
 of the sides; split it into two keyed joins when the sides are large. `EXPLAIN`
-names the join `(range)` or `(nested-loop)`. Such a join never spills, never
+names the join `(range)` or `(nested-loop)`, or — when a side's columns are only
+known once it is read, as for a SQL table or a remote file — `(no key: range or
+nested-loop, decided at run time)`; `EXPLAIN ANALYZE` then says which ran under
+the join. Such a join never spills, never
 runs in parallel lanes and takes no key pushdown: its right side must fit in
 memory, up to the join's `WITH (max_build = '…')` or 4 GiB, past which it fails
 with the build-too-large error.

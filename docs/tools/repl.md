@@ -47,10 +47,14 @@ shows. Words are AND-ed and may be in any column, `-word` keeps the rows without
 it, `col:word` looks in that column only, and `"two words"` is one phrase — all in
 any case, the rules of the language's
 [`search`](../reference/functions.md#searching-rows), which runs the same search
-over a whole result in a query. Esc clears a find before the filters and the sort. Sorting, filtering
-and finding rearrange the rows kept and never run the query again — so on a
-result larger than 10,000 rows they see only the first 10,000, and the status
-line says so.
+over a whole result in a query. `a` makes the find and the filters ignore accents
+as well as case (the status line says so), as `search(…, true)` does. `f`
+searches the rows kept; `F` searches the whole result instead: it runs the query
+that made it again — that `SELECT` alone, not the rest of its entry — narrowed by
+the search, and opens the view on what it finds. Esc clears a find before the
+filters and the sort. Sorting, filtering and `f` rearrange the rows kept and
+never run the query again — so on a result larger than 10,000 rows they see only
+the first 10,000, and the status line says so; `F` is the way past them.
 
 ## Commands
 
