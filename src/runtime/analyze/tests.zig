@@ -208,10 +208,8 @@ test "analyze: EXPLAIN tells which side's SQL read takes the other side's join k
     const a = ar.allocator();
     const Case = struct { join: []const u8, want: []const u8 };
     const cases = [_]Case{
-        // A SQL right side takes the file's keys; a SQL left side the file's otherwise.
         .{ .join = "FROM 'sheet.csv' s JOIN pg.centers AS c ON c.code = s.cr", .want = "the right read takes the left side's keys" },
         .{ .join = "FROM pg.orders AS o JOIN 'sheet.csv' s ON s.cr = o.code", .want = "the left read takes the right side's keys" },
-        // A left join keeps every left row, and the hint turns it off.
         .{ .join = "FROM pg.orders AS o LEFT JOIN 'sheet.csv' s ON s.cr = o.code", .want = "" },
         .{ .join = "FROM 'sheet.csv' s JOIN pg.centers AS c ON c.code = s.cr WITH (key_pushdown = false)", .want = "" },
     };

@@ -371,7 +371,9 @@ var local: Local = .{};
 
 /// The local copy of an `ftp://` path, downloaded on first use in this run: a file,
 /// a folder (trailing `/`, every file under it) or an archive member
-/// (`ftp://h/a.zip :: m.csv`, the archive fetched and the member kept).
+/// (`ftp://h/a.zip :: m.csv`, the archive fetched and the member kept). A socket
+/// that fails or times out mid-reply is `ConnectionIoFailed`, which the exit code
+/// counts as transient.
 pub fn localize(arena: std.mem.Allocator, url: []const u8) anyerror![]const u8 {
     if (std.mem.indexOf(u8, url, " :: ")) |at| {
         return std.mem.concat(arena, u8, &.{ try localize(arena, url[0..at]), url[at..] });
@@ -381,7 +383,6 @@ pub fn localize(arena: std.mem.Allocator, url: []const u8) anyerror![]const u8 {
     if (local.cache.get(url)) |p| return arena.dupe(u8, p);
 
     return fetch(arena, url) catch |e| switch (@as(anyerror, e)) {
-        // A socket that failed or timed out mid-reply, under the name the exit code knows.
         error.ReadFailed, error.WriteFailed, error.EndOfStream, error.WouldBlock => error.ConnectionIoFailed,
         else => e,
     };

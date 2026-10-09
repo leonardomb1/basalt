@@ -593,8 +593,6 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                         }
                         continue;
                     }
-                    // No side names the right table and a column is bare, so only the
-                    // schemas can say which side each value belongs to.
                     if (!sl.right and !sr.right and sl.other and sr.other and
                         (try self.hasBareField(c.binary.l) or try self.hasBareField(c.binary.r)))
                     {

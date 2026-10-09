@@ -540,7 +540,6 @@ test "join: key pushdown sends one side's keys first and replays a read-ahead pr
             self.calls += 1;
         }
     };
-    // Each case: read-ahead limit, then whether the probe's keys reach the build side.
     for ([_]struct { rows: usize, sent: bool }{ .{ .rows = 100, .sent = true }, .{ .rows = 1, .sent = false } }) |case| {
         const lb = [_]Batch{
             try kvBatch(a, &join_left_schema, &.{ 1, 2 }, &.{ "a", "b" }),

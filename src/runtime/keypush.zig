@@ -216,7 +216,9 @@ fn literal(arena: std.mem.Allocator, dialect: Dialect, v: Value, ranged: bool) !
 }
 
 /// A SQL read opened twice: once with `WHERE 1 = 0` while planning, for its schema,
-/// and for real on its first pull, with whatever `push` was handed AND-ed in.
+/// and for real on its first pull, with whatever `push` was handed AND-ed in. The
+/// probe's query is not left as the read's description, and a failure of the late
+/// open is reported in the read's own words rather than the join's label for it.
 pub const LateSql = struct {
     env: *Env,
     rd: ast.Read,
@@ -234,7 +236,6 @@ pub const LateSql = struct {
         const src = try connect.openSourceProjected(env, probe, hints, null, &.{});
         const sch = try connect.dupeSchema(env.arena, src.schema());
         src.close();
-        // The probe left its own query as the read's; the real one is this.
         env.sql_desc = try connect.sqlDescForStage(env, .{ .node = .{ .read = rd }, .hints = hints, .pos = .{ .line = 0, .col = 0 } });
         const self = try env.arena.create(LateSql);
         self.* = .{ .env = env, .rd = rd, .hints = hints, .schema_ = sch, .dialect = dialect };
@@ -274,7 +275,6 @@ pub const LateSql = struct {
             else
                 x;
             self.inner = connect.openSourceProjected(self.env, rd, self.hints, null, &.{}) catch |e| {
-                // Opened mid-run, the failure is told by the read, not by the join.
                 if (self.env.diag.msg.len > 0) self.env.errctx.set("{s}", .{self.env.diag.msg});
                 return e;
             };
@@ -302,7 +302,6 @@ test "traceKey: through filters, selects, renames and computed keys to the read'
         \\WITH b AS (SELECT code AS cc, name FROM 'x.csv' WHERE name <> '')
         \\SELECT * FROM 'y.csv' JOIN b ON trim(b.cc) = y.k;
     , &pd);
-    // The stages after the read, as the join's side hands them over.
     const bst = prog.stmts[1].binding.pipeline.stages[1..];
     const e = (try traceKey(a, bst, "cc")).?;
     try testing.expectEqualStrings("code", e.field.parts[0]);

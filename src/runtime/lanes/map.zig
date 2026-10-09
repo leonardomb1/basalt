@@ -535,7 +535,6 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
 
     const lp = try resolveLaneJoin(env, shape.join, shape.join_hints, shape.suffix, probe_schema);
 
-    // The build side is indexed: its keys narrow every split's read.
     var where_extra: ?[]const u8 = null;
     if (keypush.leftMayNarrow(shape.join) and !keypush.disabled(shape.join_hints)) {
         const trace = try std.mem.concat(arena, ast.Stage, &.{ shape.prefix, lp.lane.probe_prep });

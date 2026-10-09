@@ -163,6 +163,8 @@ pub fn tailSchema(env: *Env, tail: []const ast.Stage, in: types.Schema) !types.S
 
 /// Source columns the stages after a read need, or null when unprovable. A join
 /// adds its keys and both sides' names; abandoning it once decoded 17 columns, not 4.
+/// A key whose side the plan places by schema could name either side's columns,
+/// so it proves nothing.
 pub fn projectedColumns(env: *Env, stages: []const ast.Stage) !?[][]const u8 {
     var set = std.StringHashMap(void).init(env.arena);
     var right = std.array_list.Managed([]const u8).init(env.arena);
@@ -197,7 +199,6 @@ pub fn projectedColumns(env: *Env, stages: []const ast.Stage) !?[][]const u8 {
                 for (w.funcs) |f| if (f.arg) |q| try putField(&set, q, right.items);
             },
             .join => |j| {
-                // A key whose side the plan decides could name either side's columns.
                 if (j.deferred.len > 0) return null;
                 for (j.left_keys) |q| try set.put(q.parts[q.parts.len - 1], {});
                 try right.append(if (j.alias.len > 0) j.alias else j.binding);

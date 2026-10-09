@@ -653,7 +653,6 @@ test "orientKeys: each value goes to the side its columns are on; one side's pai
     const fld = tfld;
     var diag = Diag{};
 
-    // `code = cr`, written right first: the key goes left `cr`, right `code`.
     const flipped = ast.Join{ .kind = .inner, .binding = "r", .left_keys = &.{}, .right_keys = &.{}, .deferred = &.{
         .{ .a = try fld(a, "code"), .b = try fld(a, "cr"), .left_name = "__l", .right_name = "__r", .pos = pos },
         .{ .a = try fld(a, "d"), .b = try fld(a, "cr"), .left_name = "__l2", .right_name = "__r2", .pos = pos },
