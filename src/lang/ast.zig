@@ -242,6 +242,35 @@ pub const AggItem = struct { name: []const u8, func: AggFunc, arg: ?*Expr, disti
 pub const Aggregate = struct { aggs: []const AggItem, by: []const QualName };
 
 pub const JoinKind = enum { inner, left, semi, anti, right, full, cross };
+/// Whether `e` calls `search`, which reads whole rows: no column list proves what
+/// it needs, so a filter holding one is never moved across a select or a join.
+pub fn hasSearch(e: *const Expr) bool {
+    return switch (e.*) {
+        .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit, .field, .lambda_var => false,
+        .unary => |u| hasSearch(u.e),
+        .binary => |b| hasSearch(b.l) or hasSearch(b.r),
+        .call => |c| blk: {
+            if (std.mem.eql(u8, c.name, "search")) break :blk true;
+            for (c.args) |a| if (hasSearch(a)) break :blk true;
+            break :blk false;
+        },
+        .cond => |c| hasSearch(c.cond) or hasSearch(c.then) or hasSearch(c.els),
+        .match => |m| blk: {
+            if (m.subject) |s| if (hasSearch(s)) break :blk true;
+            for (m.arms) |arm| {
+                for (arm.pats) |p| if (hasSearch(p)) break :blk true;
+                if (arm.guard) |g| if (hasSearch(g)) break :blk true;
+                if (hasSearch(arm.value)) break :blk true;
+            }
+            break :blk false;
+        },
+        .cast => |c| hasSearch(c.e),
+        .is_null => |n| hasSearch(n.e),
+        .let_in => |l| hasSearch(l.value) or hasSearch(l.body),
+        .lambda => |l| hasSearch(l.body),
+    };
+}
+
 /// An `=` of the ON whose sides the parser cannot tell apart, its columns written
 /// without a table (`trim(code) = cast(cr AS string)`). The plan decides by where
 /// the columns resolve: one side each makes a computed key, named `left_name` and

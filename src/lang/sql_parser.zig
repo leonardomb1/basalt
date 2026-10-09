@@ -655,6 +655,7 @@ pub const Parser = struct {
     pub const parsePrimary = @import("parse/expr.zig").parsePrimary;
     pub const parseQualNameField = @import("parse/expr.zig").parseQualNameField;
     pub const parseCaseExpr = @import("parse/expr.zig").parseCaseExpr;
+    pub const parseSearch = @import("parse/expr.zig").parseSearch;
 };
 
 pub fn binOpText(op: ast.BinOp) []const u8 {
@@ -695,6 +696,11 @@ pub fn qualHasPrefix(q: ast.QualName, prefix: []const u8) bool {
 pub fn stripPrefix(q: ast.QualName, prefix: []const u8) ast.QualName {
     if (qualHasPrefix(q, prefix)) return .{ .parts = q.parts[1..], .safe = if (q.safe.len > 0) q.safe[1..] else &.{} };
     return q;
+}
+
+/// Whether `name` is the FROM table's alias, which its own columns drop.
+pub fn stripsAlias(aliases: *const AliasSet, name: []const u8) bool {
+    return aliases.strips(name);
 }
 
 pub fn stripQual(q: ast.QualName, aliases: *const AliasSet) ast.QualName {

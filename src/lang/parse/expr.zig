@@ -358,6 +358,7 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
                 return self.mk(.{ .bool_lit = false });
             }
             if (eqlNoCase(t.text, "case")) return self.parseCaseExpr();
+            if (eqlNoCase(t.text, "search") and self.peekTag() == .lparen) return self.parseSearch();
             if (eqlNoCase(t.text, "extract") and self.peekTag() == .lparen) {
                 _ = self.advance();
                 _ = self.advance();
@@ -483,4 +484,57 @@ pub fn parseCaseExpr(self: *Parser) Error!*ast.Expr {
     if (arms.items.len == 0)
         return self.fail(self.curPos(), "CASE needs at least one WHEN arm", .{});
     return self.mk(.{ .match = .{ .subject = subject, .arms = try arms.toOwnedSlice() } });
+}
+
+/// `search(cols, query)`. The columns become string items of a `search_cols` call
+/// (`*`; `*@t` for `t.*`; `-name` for each `EXCEPT` name; `=col` or `=t.col` for a
+/// listed column) so that no pass reading column references mistakes them for
+/// some: the evaluator resolves them against the rows it is given.
+pub fn parseSearch(self: *Parser) Error!*ast.Expr {
+    const start = self.advance();
+    _ = self.advance();
+    var items = std.array_list.Managed(*ast.Expr).init(self.arena);
+    if (self.at(.lparen)) {
+        _ = self.advance();
+        while (true) {
+            const q = try self.parseQualNameField();
+            try items.append(try self.mk(.{ .str_lit = try std.fmt.allocPrint(self.arena, "={s}", .{try std.mem.join(self.arena, ".", q.parts)}) }));
+            if (!self.eat(.comma)) break;
+        }
+        _ = try self.expect(.rparen);
+    } else {
+        var star = false;
+        if (self.at(.star)) {
+            _ = self.advance();
+            try items.append(try self.mk(.{ .str_lit = "*" }));
+            star = true;
+        } else if (self.at(.ident) and self.peekTag() == .dot and self.i + 2 < self.toks.len and self.toks[self.i + 2].tag == .star) {
+            const rel = self.advance().text;
+            _ = self.advance();
+            _ = self.advance();
+            try items.append(try self.mk(.{ .str_lit = try std.fmt.allocPrint(self.arena, "*@{s}", .{rel}) }));
+            star = true;
+        } else {
+            const q = try self.parseQualNameField();
+            try items.append(try self.mk(.{ .str_lit = try std.fmt.allocPrint(self.arena, "={s}", .{try std.mem.join(self.arena, ".", q.parts)}) }));
+        }
+        if (star and self.eatKw("except")) {
+            _ = try self.expect(.lparen);
+            while (true) {
+                const name = try self.expectColName();
+                try items.append(try self.mk(.{ .str_lit = try std.fmt.allocPrint(self.arena, "-{s}", .{name}) }));
+                if (!self.eat(.comma)) break;
+            }
+            _ = try self.expect(.rparen);
+        }
+    }
+    if (!self.eat(.comma))
+        return self.fail(self.curPos(), "search takes the columns, then the text: `search(*, 'sp 2026')`, `search(t.*, 'x')`, `search((a, b), 'x')`", .{});
+    const query = try self.parseExpr();
+    _ = try self.expect(.rparen);
+    const args = try self.arena.alloc(*ast.Expr, 2);
+    args[0] = try self.mk(.{ .call = .{ .name = "search_cols", .args = try items.toOwnedSlice() } });
+    args[1] = query;
+    const span = ast.Span{ .start = .{ .line = start.line, .col = start.col }, .end = .{ .line = start.end_line, .col = start.end_col } };
+    return self.mk(.{ .call = .{ .name = "search", .args = args, .span = span } });
 }

@@ -165,6 +165,7 @@ pub fn hoistThroughJoins(
             if (list.items[i - 1].node != .join) continue;
             const j = list.items[i - 1].node.join;
             if (!hoistableKind(j.kind)) continue;
+            if (ast.hasSearch(list.items[i].node.filter)) continue;
             const right = (try bindingNames(arena, bindings, j.binding)) orelse continue;
             if (!try refsOnlyProbe(arena, list.items[i].node.filter, right, j)) continue;
             const tmp = list.items[i - 1];
@@ -183,6 +184,7 @@ pub fn hoistThroughJoins(
         var m = k + 1;
         var inserted: usize = 0;
         while (m < list.items.len and list.items[m].node == .filter) : (m += 1) {
+            if (ast.hasSearch(list.items[m].node.filter)) continue;
             const derived = (try deriveProbePredicate(arena, gpa, list.items[m].node.filter, j)) orelse continue;
             try list.insert(k, .{ .node = .{ .filter = derived }, .hints = &.{}, .pos = list.items[m].pos });
             inserted += 1;
@@ -235,7 +237,8 @@ pub fn pushIntoJoinSides(arena: std.mem.Allocator, stages: []const ast.Stage) !?
         var stay: ?*ast.Expr = null;
         var moved = false;
         for (parts.items) |c| {
-            const target = (try rightAliasOf(arena, c)) orelse {
+            const found = if (ast.hasSearch(c)) null else try rightAliasOf(arena, c);
+            const target = found orelse {
                 stay = try andWith(arena, stay, c);
                 continue;
             };
@@ -322,7 +325,9 @@ pub fn hoistThroughSelects(arena: std.mem.Allocator, stages: []const ast.Stage) 
             var below: ?*ast.Expr = null;
             var above: ?*ast.Expr = null;
             for (parts.items) |c| {
-                if (try filterBelowSelect(arena, c, items)) |m| {
+                if (ast.hasSearch(c)) {
+                    above = try andWith(arena, above, c);
+                } else if (try filterBelowSelect(arena, c, items)) |m| {
                     below = try andWith(arena, below, m);
                 } else above = try andWith(arena, above, c);
             }

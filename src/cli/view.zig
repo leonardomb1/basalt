@@ -24,6 +24,7 @@ const std = @import("std");
 const table = @import("../connect/table.zig");
 const types = @import("../lang/types.zig");
 const line = @import("line.zig");
+const search = @import("../exec/search.zig");
 
 const Grid = table.Grid;
 const palette = table.palette;
@@ -93,45 +94,21 @@ pub fn order(kind: ?types.TypeKind, a: []const u8, b: []const u8) std.math.Order
     return if (ci != .eq) ci else std.mem.order(u8, a, b);
 }
 
-/// `f`'s search: terms over the whole row, all of which must hold. `terms` is
-/// gpa-owned; their text points into the query it was parsed from.
+/// `f`'s search over the whole row, the engine's `search` rules (`search.zig`)
+/// bound to the grid's column names.
 pub const Find = struct {
-    terms: []const Term = &.{},
-
-    pub const Term = struct { col: ?usize, text: []const u8, not: bool };
+    query: search.Query = .{},
+    terms: []const search.Bound = &.{},
 
     pub fn parse(gpa: std.mem.Allocator, src: []const u8, names: []const []const u8) !Find {
-        var out = std.array_list.Managed(Term).init(gpa);
-        errdefer out.deinit();
-        var i: usize = 0;
-        while (i < src.len) {
-            while (i < src.len and src[i] == ' ') i += 1;
-            if (i == src.len) break;
-            const not = src[i] == '-' and i + 1 < src.len and src[i + 1] != ' ';
-            if (not) i += 1;
-            const start = i;
-            var quoted = false;
-            while (i < src.len and (quoted or src[i] != ' ')) : (i += 1) {
-                if (src[i] == '"') quoted = !quoted;
-            }
-            const tok = src[start..i];
-            var col: ?usize = null;
-            var text = tok;
-            if (std.mem.indexOfScalar(u8, tok, ':')) |c| if (c > 0 and tok[0] != '"') {
-                for (names, 0..) |n, k| if (std.ascii.eqlIgnoreCase(n, tok[0..c])) {
-                    col = k;
-                    text = tok[c + 1 ..];
-                    break;
-                };
-            };
-            text = std.mem.trim(u8, text, "\"");
-            if (text.len > 0) try out.append(.{ .col = col, .text = text, .not = not });
-        }
-        return .{ .terms = try out.toOwnedSlice() };
+        var q = try search.Query.parse(gpa, src);
+        errdefer q.deinit(gpa);
+        return .{ .query = q, .terms = try q.bind(gpa, names) };
     }
 
     pub fn deinit(self: *Find, gpa: std.mem.Allocator) void {
         gpa.free(self.terms);
+        self.query.deinit(gpa);
         self.terms = &.{};
     }
 
@@ -140,32 +117,18 @@ pub const Find = struct {
     }
 
     pub fn keeps(self: Find, g: Grid, r: usize) bool {
-        for (self.terms) |t| {
-            const hit = if (t.col) |c| holds(g.cell(r, c), t.text) else blk: {
-                for (0..g.ncols()) |c| if (holds(g.cell(r, c), t.text)) break :blk true;
-                break :blk false;
-            };
-            if (hit == t.not) return false;
-        }
-        return true;
+        const Row = struct {
+            g: Grid,
+            r: usize,
+            fn at(cx: @This(), c: usize) ?[]const u8 {
+                return cx.g.cell(cx.r, c);
+            }
+        };
+        return search.matches(self.terms, g.ncols(), Row{ .g = g, .r = r }, Row.at);
     }
 
-    /// The texts to highlight in column `col`: the terms that look there and are
-    /// not exclusions. At most `buf.len`.
     pub fn needles(self: Find, col: usize, buf: [][]const u8) [][]const u8 {
-        var n: usize = 0;
-        for (self.terms) |t| {
-            if (t.not or n == buf.len) continue;
-            if (t.col != null and t.col.? != col) continue;
-            buf[n] = t.text;
-            n += 1;
-        }
-        return buf[0..n];
-    }
-
-    fn holds(cell: ?[]const u8, text: []const u8) bool {
-        const c = cell orelse return false;
-        return std.ascii.indexOfIgnoreCase(c, text) != null;
+        return search.needles(self.terms, col, buf);
     }
 };
 

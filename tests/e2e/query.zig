@@ -846,6 +846,41 @@ test "join: USING lists each shared column once, first, and a full join takes it
     }
 }
 
+test "search: words across the chosen columns, after a select and a join, in ON too" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "orders.csv", .data = "id,cust,note\n1,10,urgent north\n2,11,\n3,10,north pallet\n4,12,south\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "custs.csv", .data = "cust,name,region\n10,Acme North,north\n11,Beta,south\n12,Gamma North,east\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const orders = try std.fs.path.join(alloc, &.{ base, "orders.csv" });
+    defer alloc.free(orders);
+    const custs = try std.fs.path.join(alloc, &.{ base, "custs.csv" });
+    defer alloc.free(custs);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    const cases = .{
+        .{ "SELECT id FROM '{s}' o WHERE search(*, 'NORTH -urgent') ORDER BY id", "id\n3\n", false },
+        .{ "SELECT id FROM (SELECT id, note AS memo FROM '{s}') WHERE search(*, 'pallet')", "id\n3\n", false },
+        .{ "SELECT id, search(* EXCEPT (note), 'north') AS a, search((note), 'north') AS b FROM '{s}' o ORDER BY id", "id,a,b\n1,false,true\n2,false,false\n3,false,true\n4,false,false\n", false },
+        .{ "SELECT o.id FROM '{s}' o JOIN '{s}' c ON c.cust = o.cust WHERE search(c.*, 'north') ORDER BY o.id", "id\n1\n3\n4\n", true },
+        .{ "SELECT o.id FROM '{s}' o JOIN '{s}' c ON c.cust = o.cust WHERE search(o.*, 'north') ORDER BY o.id", "id\n1\n3\n", true },
+        .{ "SELECT o.id, c.name FROM '{s}' o LEFT JOIN '{s}' c ON c.cust = o.cust AND search(c.*, 'north') ORDER BY o.id", "id,name\n1,Acme North\n2,\n3,Acme North\n4,Gamma North\n", true },
+    };
+    inline for (cases) |c| {
+        const script = if (c[2])
+            try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS " ++ c[0] ++ ";", .{ out_path, orders, custs })
+        else
+            try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS " ++ c[0] ++ ";", .{ out_path, orders });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c[1], out);
+    }
+}
+
 test "join: duplicate build keys fan out (inner); semi/anti reduce to existence" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

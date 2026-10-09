@@ -13,6 +13,7 @@ const resolveExprAlias = Parser.resolveExprAlias;
 const std = @import("std");
 const stripPrefix = @import("../sql_parser.zig").stripPrefix;
 const stripQual = @import("../sql_parser.zig").stripQual;
+const stripsAlias = @import("../sql_parser.zig").stripsAlias;
 
 /// The one shape a join key may take: the index is built on stored columns, so a
 /// computed key has to be computed first.
@@ -447,8 +448,29 @@ pub fn stripExpr(self: *Parser, e: *ast.Expr, aliases: *const AliasSet) Error!*a
                     return cx.p.mk(.{ .field = q });
                 return @constCast(node);
             }
+            if (node.* == .call and std.mem.eql(u8, node.call.name, "search_cols"))
+                return stripSearchCols(cx.p, node.call, cx.aliases);
             return ast.rebuildExpr(cx.p.arena, node, cx, recur);
         }
     };
     return S.recur(.{ .p = self, .aliases = aliases }, e);
+}
+
+/// `search`'s column items with the FROM table's alias dropped, as its columns
+/// carry none: `*@a` becomes `*@` (that table's own), `=a.x` becomes `=x`.
+fn stripSearchCols(p: *Parser, c: ast.Expr.Call, aliases: *const AliasSet) Error!*ast.Expr {
+    const args = try p.arena.alloc(*ast.Expr, c.args.len);
+    for (c.args, args) |a, *o| {
+        o.* = a;
+        if (a.* != .str_lit) continue;
+        const item = a.str_lit;
+        if (std.mem.startsWith(u8, item, "*@") and item.len > 2 and stripsAlias(aliases, item[2..])) {
+            o.* = try p.mk(.{ .str_lit = "*@" });
+        } else if (std.mem.startsWith(u8, item, "=")) {
+            if (std.mem.indexOfScalar(u8, item, '.')) |dot| if (stripsAlias(aliases, item[1..dot])) {
+                o.* = try p.mk(.{ .str_lit = try std.fmt.allocPrint(p.arena, "={s}", .{item[dot + 1 ..]}) });
+            };
+        }
+    }
+    return p.mk(.{ .call = .{ .name = c.name, .args = args } });
 }

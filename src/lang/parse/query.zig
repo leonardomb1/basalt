@@ -559,6 +559,15 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             try splitAnd(on, &conj);
             var narrow: ?*ast.Expr = null;
             for (conj.items) |c| {
+                if (ast.hasSearch(c)) {
+                    if (kind == .inner) {
+                        try post_filters.append(c);
+                    } else {
+                        const e = try self.stripExpr(c, &aliases);
+                        residual = if (residual) |r| try self.mk(.{ .binary = .{ .op = .@"and", .l = r, .r = e } }) else e;
+                    }
+                    continue;
+                }
                 if (c.* == .binary and c.binary.op == .eq and c.binary.l.* == .field and c.binary.r.* == .field and
                     !c.binary.l.field.dollar and !c.binary.r.field.dollar)
                 {

@@ -48,6 +48,7 @@ pub const builtin_functions = [_]Builtin{
     .{ .name = "now", .sig = "now()" },
     .{ .name = "today", .sig = "today()" },
     .{ .name = "regexp_replace", .sig = "regexp_replace(s, pattern, replacement[, flags])" },
+    .{ .name = "search", .sig = "search(* | t.* | * EXCEPT (c) | (a, b), 'words -not col:word \"a phrase\"')" },
     .{ .name = "regexp_matches", .sig = "regexp_matches(s, pattern)" },
     .{ .name = "regexp_extract", .sig = "regexp_extract(s, pattern[, group])" },
     .{ .name = "md5", .sig = "md5(s)" },

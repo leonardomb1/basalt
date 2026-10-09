@@ -38,6 +38,34 @@ never fails a load.
 | `ascii(s)` | the first character's code point |
 | `chr(n)` | the character with code point `n` |
 
+## Searching rows
+
+`search(cols, text)` is true when a row holds `text` in the given columns:
+`*` for every column, `t.*` for one table of a join, `* EXCEPT (a, b)` or
+`t.* EXCEPT (…)` to leave some out, `(a, b)` or a single column to name them.
+The text is a small query: words must all appear, each in any of the columns;
+`-word` keeps the rows without it; `col:word` looks in that column only (a name
+that is none of them leaves the whole token as text); `"two words"` is one
+phrase. All of it ignores case, and a value is matched as basalt prints it — a
+date as `2026-03-01`, a decimal at its scale — so `2026-03` finds March and
+`10.50` that amount; a NULL holds nothing. The REPL's `\view` find (`f`) is the
+same search over the rows it shows.
+
+```sql
+SELECT * FROM 'orders.csv' WHERE search(*, 'north -cancelled');
+SELECT o.id, c.name FROM 'orders.csv' o JOIN 'customers.csv' c ON c.id = o.cust
+WHERE search(c.*, '"são paulo"');
+SELECT COUNT_IF(search((note, memo), 'urgent')) AS urgent FROM 'orders.csv';
+```
+
+It reads whole rows, so it is never pushed to a source: a SQL read sends every
+column and filters here, and a `WHERE` with `search` stays after the selects and
+joins it follows. In a join's `ON` it applies to the joined pair — filtering an
+inner join, deciding the matches of an outer one. The columns are resolved when
+the query is planned, so an unknown name fails `check`; the text may be a
+literal or a `$param`. Every searched value is turned into text for each row, so
+naming the columns (`search((a, b), …)`) is faster than `*` on a wide table.
+
 ## Regular expressions
 
 The pattern syntax is on [Regular expressions](regex.md). A literal pattern is

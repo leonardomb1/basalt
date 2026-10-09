@@ -10,6 +10,7 @@ const Value = @import("../value.zig").Value;
 const Vec = @import("vec.zig").Vec;
 const VecError = @import("vec.zig").VecError;
 const ast = @import("../../lang/ast.zig");
+const fn_search = @import("fn_search.zig");
 const per_row = @import("fn_row.zig").per_row;
 const std = @import("std");
 const typing = @import("fn_typing.zig").typing;
@@ -48,6 +49,7 @@ pub const builtins = [_]Builtin{
     .{ .name = "starts_with", .type_fn = typing.strPredicate, .eval_fn = per_row.affix, .vec_fn = vectorized.strPredicate },
     .{ .name = "ends_with", .type_fn = typing.strPredicate, .eval_fn = per_row.affix, .vec_fn = vectorized.strPredicate },
     .{ .name = "contains", .type_fn = typing.strPredicate, .eval_fn = per_row.affix, .vec_fn = vectorized.strPredicate },
+    .{ .name = "search", .type_fn = fn_search.typeSearch, .eval_fn = fn_search.rowSearch, .vec_fn = fn_search.vecSearch },
     .{ .name = "like", .type_fn = typing.strPredicate, .eval_fn = per_row.like, .vec_fn = vectorized.strPredicate },
     .{ .name = "trim", .type_fn = typing.unaryString, .eval_fn = per_row.trimSpace, .vec_fn = vectorized.trimSpace },
     .{ .name = "substr", .type_fn = typing.substr, .eval_fn = per_row.substr, .vec_fn = vectorized.substr },

@@ -170,7 +170,8 @@ pub fn tailSchema(env: *Env, tail: []const ast.Stage, in: types.Schema) !types.S
 /// value of its `=` uses, so the placement sees the same columns. A select of `*`
 /// plus computed columns (a computed join key's) passes every column through and
 /// asks only for what its expressions read; a lone `* EXCEPT` (the drop of those
-/// keys after the join) passes the rest through.
+/// keys after the join) passes the rest through. A `search` reads whole rows, so
+/// it proves nothing.
 pub fn projectedColumns(env: *Env, stages: []const ast.Stage) !?[][]const u8 {
     var w = Needs.init(env, null);
     return w.walk(stages);
@@ -201,6 +202,7 @@ const Needs = struct {
     right: std.array_list.Managed([]const u8),
     made: std.StringHashMap(void),
     joined: bool = false,
+    whole_row: bool = false,
 
     fn init(env: *Env, own: ?[]const u8) Needs {
         return .{
@@ -265,7 +267,7 @@ const Needs = struct {
                 else => return null,
             }
         }
-        if (!defines_output) return null;
+        if (!defines_output or self.whole_row) return null;
         var out = std.array_list.Managed([]const u8).init(self.env.arena);
         var it = self.set.keyIterator();
         while (it.next()) |k| try out.append(k.*);
@@ -299,6 +301,7 @@ const Needs = struct {
     }
 
     fn expr(self: *Needs, e: *const ast.Expr) !void {
+        if (ast.hasSearch(e)) self.whole_row = true;
         if (!self.joined) {
             var names = std.StringHashMap(void).init(self.env.arena);
             try pushdown.collectFields(e, &names);
