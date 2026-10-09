@@ -524,6 +524,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         var left_computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
         var right_computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
         var deferred = std.array_list.Managed(ast.DeferredKey).init(self.arena);
+        var residual: ?*ast.Expr = null;
         for (lateral_keys) |lk| {
             try left_keys.append(stripQual(lk.left, &aliases));
             const rp = try self.arena.alloc([]const u8, 1);
@@ -612,12 +613,16 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                         continue;
                     }
                 }
-                if (!try self.namesOtherSide(c, rname)) {
+                const right_only = !try self.namesOtherSide(c, rname);
+                if (right_only and (kind == .inner or kind == .left)) {
                     const e = try self.stripRightExpr(c, rname);
                     narrow = if (narrow) |n| try self.mk(.{ .binary = .{ .op = .@"and", .l = n, .r = e } }) else e;
                 } else if (kind == .inner) {
                     try post_filters.append(c);
-                } else return self.fail(.{ .line = opos.line, .col = opos.col }, "this {s} JOIN's ON compares the left side otherwise than by `=` to a right column; only an inner join can take that — filter in WHERE, or in a CTE first", .{@tagName(kind)});
+                } else {
+                    const e = try self.stripExpr(c, &aliases);
+                    residual = if (residual) |r| try self.mk(.{ .binary = .{ .op = .@"and", .l = r, .r = e } }) else e;
+                }
             }
             if (left_keys.items.len == 0 and deferred.items.len == 0)
                 return self.fail(.{ .line = opos.line, .col = opos.col }, "the ON of a join needs at least one `=` between a left and a right value to join by — `b.k = a.k`, or computed: `trim(b.k) = cast(a.k AS string)`", .{});
@@ -654,6 +659,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 .left_keys = try left_keys.toOwnedSlice(),
                 .right_keys = try right_keys.toOwnedSlice(),
                 .deferred = try deferred.toOwnedSlice(),
+                .residual = residual,
             } },
             .hints = try jhints.toOwnedSlice(),
             .pos = jpos,

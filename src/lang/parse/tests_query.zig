@@ -247,7 +247,7 @@ test "sql: a path or a connection's table on a JOIN's right side reads in a bind
     try testing.expectEqualStrings("y", st[2].node.join.alias);
 }
 
-test "sql: ON beyond keys — the right side alone narrows it, the rest of an inner join filters after" {
+test "sql: ON beyond keys — the right side alone narrows it, the rest filters an inner join after and an outer join's pairs" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -265,9 +265,15 @@ test "sql: ON beyond keys — the right side alone narrows it, the rest of an in
     try testing.expectEqual(@as(usize, 1), st[1].node.join.left_keys.len);
     try testing.expect(st[2].node == .filter);
 
+    const lj = try parseTest(a, "SELECT * FROM 'a.csv' a LEFT JOIN 'b.csv' b ON b.id = a.id AND a.v = 'x';");
+    const ljj = lj.stmts[2].output.stages[1].node.join;
+    try testing.expectEqualStrings("v", ljj.residual.?.binary.l.field.parts[ljj.residual.?.binary.l.field.parts.len - 1]);
+    try testing.expect(lj.stmts[2].output.stages[2].node != .filter);
+    const rj = try parseTest(a, "SELECT * FROM 'a.csv' a RIGHT JOIN 'b.csv' b ON b.id = a.id AND b.del <> '*';");
+    try testing.expect(rj.stmts[2].output.stages[1].node.join.residual != null);
+    try testing.expectEqualStrings("__derived1_b", rj.stmts[2].output.stages[1].node.join.binding);
+
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT * FROM 'a.csv' a LEFT JOIN 'b.csv' b ON b.id = a.id AND a.v = 'x';", &diag));
-    try testing.expect(std.mem.indexOf(u8, diag.msg, "only an inner join") != null);
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT * FROM 'a.csv' a JOIN 'b.csv' b ON b.del <> '*';", &diag));
     try testing.expect(std.mem.indexOf(u8, diag.msg, "at least one") != null);
 }

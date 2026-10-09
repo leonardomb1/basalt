@@ -609,6 +609,40 @@ test "join: computed keys of bare columns take their side from where the columns
     }
 }
 
+test "join: an outer join's ON beyond its keys picks matching pairs and keeps the rest unmatched" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "sales.csv", .data = "id,product,sold_on\n1,A,2026-01-10\n2,A,2026-02-15\n3,B,2026-03-05\n4,C,2026-01-01\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "prices.csv", .data = "product,valid_from,valid_to,price\nA,2026-01-01,2026-01-31,10\nA,2026-02-01,2026-12-31,12\nB,2026-01-01,2026-02-28,7\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const sales = try std.fs.path.join(alloc, &.{ base, "sales.csv" });
+    defer alloc.free(sales);
+    const prices = try std.fs.path.join(alloc, &.{ base, "prices.csv" });
+    defer alloc.free(prices);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    const cases = .{
+        .{
+            "SELECT s.id, p.price FROM '{s}' s LEFT JOIN '{s}' p ON p.product = s.product AND CAST(s.sold_on AS DATE) BETWEEN CAST(p.valid_from AS DATE) AND CAST(p.valid_to AS DATE) ORDER BY s.id",
+            "id,price\n1,10\n2,12\n3,\n4,\n",
+        },
+        .{
+            "SELECT p.price, s.id FROM '{s}' s RIGHT JOIN '{s}' p ON p.product = s.product AND p.price > 9 ORDER BY p.price, s.id",
+            "price,id\n7,\n10,1\n10,2\n12,1\n12,2\n",
+        },
+    };
+    inline for (cases) |c| {
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS " ++ c[0] ++ ";", .{ out_path, sales, prices });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c[1], out);
+    }
+}
+
 test "join: duplicate build keys fan out (inner); semi/anti reduce to existence" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

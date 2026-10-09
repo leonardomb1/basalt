@@ -263,6 +263,9 @@ pub const Join = struct {
     null_aware: bool = false,
     right_filter: ?*Expr = null,
     deferred: []const DeferredKey = &.{},
+    /// The rest of an outer join's ON, over a left row and a right row together:
+    /// a pair joins only where it holds, so an unmatched row still comes out.
+    residual: ?*Expr = null,
 
     pub fn rightStages(self: Join, arena: std.mem.Allocator, stages: []const Stage) ![]const Stage {
         const f = self.right_filter orelse return stages;

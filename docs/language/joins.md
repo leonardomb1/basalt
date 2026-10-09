@@ -13,12 +13,26 @@ side they are: `trim(code) = CAST(cr AS varchar)` finds `code` and `cr` in the t
 sides' columns, in either order, and is refused as ambiguous only when both
 values' columns exist on both sides. Keys of two types (a spreadsheet's number
 against a table's text) do not join until one is cast. The rest of an `ON` is a
-condition: one naming only the right side, or no column (`1 = 1`), narrows the
-right side before the join — right for an outer join too, and pushed down to a
-SQL source as that side's `WHERE` — so `JOIN sr.t AS t ON t.D_E_L_E_T_ <> '*'
-AND t.k = x.k` reads only live rows. Any other (the left side alone, the two
-sides compared otherwise than by `=`) filters the joined rows, which only an
-inner join means; another kind says so. `CROSS JOIN <cte>` takes no `ON`.
+condition. In an inner or left join, one naming only the right side, or no
+column (`1 = 1`), narrows the right side before the join, pushed down to a SQL
+source as that side's `WHERE` — so `JOIN sr.t AS t ON t.D_E_L_E_T_ <> '*' AND
+t.k = x.k` reads only live rows. In an inner join any other condition (the left
+side alone, the two sides compared otherwise than by `=`) filters the joined
+rows. In an outer join it decides which key matches count instead, and a row
+none of whose matches pass still comes out, unmatched — the way to look up the
+value valid on a date:
+
+```sql
+SELECT s.id, p.price
+FROM 'sales.csv' s
+LEFT JOIN 'prices.csv' p
+  ON p.product = s.product
+ AND CAST(s.sold_on AS DATE) BETWEEN CAST(p.valid_from AS DATE) AND CAST(p.valid_to AS DATE);
+```
+
+A right or full join keeps every right row the same way, so there a condition
+on the right side alone decides matches too rather than narrowing it. `CROSS
+JOIN <cte>` takes no `ON`.
 Right-side columns that collide with a left name come back suffixed `_r`, and
 `_r2`, `_r3`, … if that name is taken too — that is the name `SELECT *` shows. A
 qualified reference needs no suffix: with `FROM t a JOIN r b`, `b.amt` is the

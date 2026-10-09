@@ -11,6 +11,7 @@ const column = @import("../column.zig");
 const failLabel = @import("../op.zig").failLabel;
 const keyhash = @import("../keyhash.zig");
 const keyset = @import("keyset.zig");
+const eval = @import("../eval.zig");
 const std = @import("std");
 const op_mod = @import("../op.zig");
 const types = @import("../../lang/types.zig");
@@ -270,6 +271,11 @@ pub const Join = struct {
     /// `prefetch_bytes` and replayed, and past either the read-ahead stops and no
     /// keys are sent. `push_probe` gets the build side's keys once it is indexed,
     /// before the first probe row. At most `push_cap` distinct values per key.
+    /// The rest of an outer join's ON, checked over `pair_schema` (a left row and a
+    /// right row side by side): a key match counts only where it holds.
+    residual: ?*const ast.Expr = null,
+    pair_schema: ?*const types.Schema = null,
+
     push_build: ?keyset.KeyPush = null,
     push_probe: ?keyset.KeyPush = null,
     prefetch_rows: usize = default_prefetch_rows,
@@ -374,6 +380,7 @@ pub const Join = struct {
             return self.gatherOut(arena, ix, lb, lidx.items, ridx.items, &.{}, lidx.items.len);
         }
 
+        if (self.residual != null) return self.joinBatchResidual(arena, ix, lb);
         const fill_right = (self.kind == .left or self.kind == .full);
         const classes = try ix.classesFor(arena, lb, self.left_keys);
         try ridx.ensureTotalCapacity(lb.len);
@@ -417,6 +424,67 @@ pub const Join = struct {
                         if (self.matched) |m| m[br] = true;
                         cur = ix.chainNext(br);
                     }
+                },
+            }
+        }
+        return self.gatherOut(arena, ix, lb, lidx.items, ridx.items, rnull.items, lidx.items.len);
+    }
+
+    /// `joinBatch` with a residual condition: every key match becomes a candidate
+    /// pair, the condition is evaluated over all of them at once, and only the
+    /// pairs it holds for match — a row whose candidates all fail is unmatched.
+    fn joinBatchResidual(self: *Join, arena: std.mem.Allocator, ix: *JoinIndex, lb: Batch) anyerror!Batch {
+        const classes = try ix.classesFor(arena, lb, self.left_keys);
+        const empty = ix.keys.len == 0 or ix.build_batch.len == 0;
+        var cl = std.array_list.Managed(usize).init(arena);
+        var cr = std.array_list.Managed(usize).init(arena);
+        for (0..lb.len) |r| {
+            if (empty or anyNullKey(lb.columns, self.left_keys, r)) continue;
+            var cur = ix.findHashed(lb, self.left_keys, classes, r, hashRowKeys(lb.columns, self.left_keys, classes, r));
+            while (cur) |br| {
+                try cl.append(r);
+                try cr.append(br);
+                cur = ix.chainNext(br);
+            }
+        }
+
+        const pass = try arena.alloc(bool, cl.items.len);
+        if (cl.items.len > 0) {
+            const nl = lb.columns.len;
+            const cols = try arena.alloc(column.Column, nl + ix.build_batch.columns.len);
+            for (lb.columns, 0..) |c, i| cols[i] = try takeCol(arena, c, cl.items, &.{});
+            for (ix.build_batch.columns, 0..) |c, k| cols[nl + k] = try takeCol(arena, c, cr.items, &.{});
+            const pairs = Batch{ .schema = self.pair_schema.?, .columns = cols, .len = cl.items.len };
+            const mask = eval.evalColumn(arena, self.residual.?, pairs, types.Type.init(.bool)) catch |e| {
+                if (self.err) |ec| ec.set("{s}: in the join's ON condition", .{failLabel(e)});
+                return e;
+            };
+            for (pass, 0..) |*p, i| p.* = mask.validity.get(i) and mask.data.b[i];
+        }
+
+        const fill_right = (self.kind == .left or self.kind == .full);
+        var lidx = std.array_list.Managed(usize).init(arena);
+        var ridx = std.array_list.Managed(usize).init(arena);
+        var rnull = std.array_list.Managed(bool).init(arena);
+        var p: usize = 0;
+        for (0..lb.len) |r| {
+            var hit = false;
+            while (p < cl.items.len and cl.items[p] == r) : (p += 1) {
+                if (!pass[p]) continue;
+                hit = true;
+                if (self.kind == .semi or self.kind == .anti) continue;
+                try lidx.append(r);
+                try ridx.append(cr.items[p]);
+                if (fill_right) try rnull.append(false);
+                if (self.matched) |m| m[cr.items[p]] = true;
+            }
+            switch (self.kind) {
+                .semi => if (hit) try lidx.append(r),
+                .anti => if (!hit) try lidx.append(r),
+                else => if (!hit and fill_right) {
+                    try lidx.append(r);
+                    try ridx.append(0);
+                    try rnull.append(true);
                 },
             }
         }
@@ -572,6 +640,52 @@ test "join: key pushdown sends one side's keys first and replays a read-ahead pr
         if (case.sent) try testing.expectEqual(@as(usize, 3), to_build.got.?[0].values.len);
         try testing.expectEqual(@as(usize, 1), to_probe.calls);
         try testing.expectEqual(@as(usize, 2), to_probe.got.?[0].values.len);
+    }
+}
+
+test "join: a residual ON condition decides which key matches count, per join kind" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const rv = try a.create(ast.Expr);
+    rv.* = .{ .field = .{ .parts = &.{"rv"} } };
+    const x = try a.create(ast.Expr);
+    x.* = .{ .str_lit = "x" };
+    const residual = try a.create(ast.Expr);
+    residual.* = .{ .binary = .{ .op = .ne, .l = rv, .r = x } };
+
+    const Case = struct { kind: ast.JoinKind, keys: []const ?i64, rvs: []const ?[]const u8 };
+    const cases = [_]Case{
+        .{ .kind = .inner, .keys = &.{1}, .rvs = &.{"y"} },
+        .{ .kind = .left, .keys = &.{ 1, 2, null, 3 }, .rvs = &.{ "y", null, null, null } },
+        .{ .kind = .semi, .keys = &.{1}, .rvs = &.{} },
+        .{ .kind = .anti, .keys = &.{ 2, null, 3 }, .rvs = &.{} },
+        .{ .kind = .right, .keys = &.{ 1, null, null, null }, .rvs = &.{ "y", "x", "z", "m" } },
+        .{ .kind = .full, .keys = &.{ 1, 2, null, 3, null, null, null }, .rvs = &.{ "y", null, null, null, "x", "z", "m" } },
+    };
+    for (cases) |case| {
+        const lb = [_]Batch{try kvBatch(a, &join_left_schema, &.{ 1, 2, null, 3 }, &.{ "a", "b", "n", "c" })};
+        const rb = [_]Batch{try kvBatch(a, &join_right_schema, &.{ 1, 1, 4, null }, &.{ "x", "y", "z", "m" })};
+        var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+        var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+        var lscan = Scan{ .src = lts.src() };
+        var rscan = Scan{ .src = rts.src() };
+        const emit_right = case.kind != .semi and case.kind != .anti;
+        var jn = Join{
+            .probe = .{ .scan = &lscan },
+            .build = .{ .scan = &rscan },
+            .left_keys = &.{0},
+            .right_keys = &.{0},
+            .left_schema = &join_left_schema,
+            .right_schema = &join_right_schema,
+            .out_schema = if (emit_right) &join_both_schema else &join_left_schema,
+            .kind = case.kind,
+            .state = a,
+            .residual = residual,
+            .pair_schema = &join_both_schema,
+        };
+        const got = try JoinRows.collect(a, .{ .join = &jn }, if (emit_right) @as(?usize, 3) else null);
+        try got.expect(case.keys, case.rvs);
     }
 }
 

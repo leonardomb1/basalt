@@ -273,6 +273,8 @@ fn fitOf(arena: std.mem.Allocator, e: *const ast.Expr, left: types.Schema, right
 /// Places each deferred key by where its columns resolve, as `joinPair` does for a
 /// plain one: a value of each side makes a computed key; two of the left side make
 /// a filter of an inner join's left rows, two of the right side narrow the right.
+/// Two of a side the join keeps unmatched (the left of a left join, the right of a
+/// right one) cannot filter it, so they join the residual condition instead.
 pub fn orientKeys(arena: std.mem.Allocator, left: types.Schema, right: types.Schema, j: ast.Join, diag: *Diag) Error!KeyPrep {
     if (j.deferred.len == 0) return .{ .join = j };
     var lk = std.array_list.Managed(ast.QualName).init(arena);
@@ -284,6 +286,7 @@ pub fn orientKeys(arena: std.mem.Allocator, left: types.Schema, right: types.Sch
     var lfilt = std.array_list.Managed(ast.Stage).init(arena);
     var rfilt = std.array_list.Managed(ast.Stage).init(arena);
     const rname = if (j.alias.len > 0) j.alias else j.binding;
+    var residual = j.residual;
     for (j.deferred) |d| {
         const fa = try fitOf(arena, d.a, left, right);
         const fb = try fitOf(arena, d.b, left, right);
@@ -302,12 +305,16 @@ pub fn orientKeys(arena: std.mem.Allocator, left: types.Schema, right: types.Sch
             try rcomp.append(.{ .computed = .{ .name = d.right_name, .expr = re } });
             try lk.append(try qualOne(arena, d.left_name));
             try rk.append(try qualOne(arena, d.right_name));
-        } else if (fa.left and fb.left) {
-            if (j.kind != .inner)
-                return failPos(diag, d.pos, "this {s} JOIN's ON compares two values of the left side; only an inner join can take that — filter in WHERE, or in a CTE first", .{@tagName(j.kind)});
+        } else if (fa.left and fb.left and j.kind == .inner) {
             try lfilt.append(.{ .node = .{ .filter = eq }, .hints = &.{}, .pos = d.pos });
-        } else if (fa.right and fb.right) {
+        } else if (fa.right and fb.right and j.kind != .right and j.kind != .full) {
             try rfilt.append(.{ .node = .{ .filter = eq }, .hints = &.{}, .pos = d.pos });
+        } else if ((fa.left and fb.left) or (fa.right and fb.right)) {
+            residual = if (residual) |r| blk: {
+                const both = try arena.create(ast.Expr);
+                both.* = .{ .binary = .{ .op = .@"and", .l = r, .r = eq } };
+                break :blk both;
+            } else eq;
         } else return failPos(diag, d.pos, "each value of an `=` in the ON of the join with `{s}` must name one side's columns, not both", .{rname});
     }
     if (lk.items.len == 0)
@@ -324,6 +331,7 @@ pub fn orientKeys(arena: std.mem.Allocator, left: types.Schema, right: types.Sch
     out.left_keys = try lk.toOwnedSlice();
     out.right_keys = try rk.toOwnedSlice();
     out.deferred = &.{};
+    out.residual = residual;
     return .{ .join = out, .left = try lfilt.toOwnedSlice(), .right = try rfilt.toOwnedSlice() };
 }
 
@@ -348,6 +356,17 @@ pub fn prepSchema(arena: std.mem.Allocator, in: types.Schema, stages: []const as
         else => unreachable,
     };
     return sch;
+}
+
+/// A join's residual ON condition checked over both sides' columns side by side,
+/// laid out as an inner join lays them out, with that schema; null without one.
+pub fn residualPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schema, j: ast.Join, params: *const ParamMap, diag: *Diag) Error!?struct { pred: *const ast.Expr, schema: types.Schema } {
+    const res = j.residual orelse return null;
+    var pj = j;
+    pj.kind = .inner;
+    pj.residual = null;
+    const pair = (try joinPlan(arena, left, right, pj, diag)).schema;
+    return .{ .pred = try checkFilter(arena, pair, res, params, diag), .schema = pair };
 }
 
 /// The `_r` suffix keeps bumping until free: two output fields with one name make the
@@ -678,7 +697,11 @@ test "orientKeys: each value goes to the side its columns are on; one side's pai
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "ambiguous") != null);
 
     const left_only = ast.Join{ .kind = .left, .binding = "r", .left_keys = &.{}, .right_keys = &.{}, .deferred = &.{
-        .{ .a = try fld(a, "cr"), .b = try fld(a, "d"), .left_name = "__l", .right_name = "__r", .pos = pos },
+        .{ .a = try fld(a, "code"), .b = try fld(a, "cr"), .left_name = "__l", .right_name = "__r", .pos = pos },
+        .{ .a = try fld(a, "cr"), .b = try fld(a, "d"), .left_name = "__l2", .right_name = "__r2", .pos = pos },
     } };
-    try std.testing.expectError(error.AnalyzeFailed, orientKeys(a, left, right, left_only, &diag));
+    const lp = try orientKeys(a, left, right, left_only, &diag);
+    try std.testing.expectEqual(@as(usize, 1), lp.join.left_keys.len);
+    try std.testing.expect(lp.join.residual.?.* == .binary);
+    try std.testing.expectEqual(@as(usize, 1), lp.left.len);
 }

@@ -202,6 +202,7 @@ pub fn projectedColumns(env: *Env, stages: []const ast.Stage) !?[][]const u8 {
                 if (j.deferred.len > 0) return null;
                 for (j.left_keys) |q| try set.put(q.parts[q.parts.len - 1], {});
                 try right.append(if (j.alias.len > 0) j.alias else j.binding);
+                if (j.residual) |e| try exprFields(env, e, &set, right.items);
             },
             else => return null,
         }
@@ -776,6 +777,10 @@ fn buildJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, left_schema: types
         .err = env.errctx,
         .build_cap = try joinBuildCap(env, hints),
     };
+    if (analyze.residualPlan(arena, lsch, rsch, prep.join, env.params_expr, &ad) catch |e| return aErr(env, &ad, e)) |rp| {
+        o.residual = rp.pred;
+        o.pair_schema = try schemaPtr(arena, rp.schema);
+    }
     if (right_late) |rl| {
         if (try keyExprs(arena, try std.mem.concat(arena, ast.Stage, &.{ rstages[1..], prep.right }), prep.join.right_keys)) |ex| {
             rl.exprs = ex;

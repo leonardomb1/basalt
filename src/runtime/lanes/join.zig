@@ -52,6 +52,8 @@ pub const LaneJoin = struct {
     probe_schema: *const types.Schema,
     /// The probe side's key columns by name, for tracing them to its read.
     left_key_names: []const ast.QualName = &.{},
+    residual: ?*const ast.Expr = null,
+    pair_schema: ?*const types.Schema = null,
     left_schema: *const types.Schema,
     right_schema: *const types.Schema,
     out_schema: *const types.Schema,
@@ -81,6 +83,7 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
     const right_keys = try planKeys(arena, jp, "rk");
 
     const final_schema = try mapChainSchema(env, suffix, out.*);
+    const rp = analyze.residualPlan(arena, lsch, rsch, prep.join, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
 
     var build_arena = std.heap.ArenaAllocator.init(env.gpa);
     defer build_arena.deinit();
@@ -94,6 +97,8 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
             .right_keys = right_keys,
             .probe_prep = prep.left,
             .left_key_names = prep.join.left_keys,
+            .residual = if (rp) |r| r.pred else null,
+            .pair_schema = if (rp) |r| try schemaPtr(arena, r.schema) else null,
             .probe_schema = try schemaPtr(arena, left_schema),
             .left_schema = try schemaPtr(arena, lsch),
             .right_schema = right_schema,
@@ -119,6 +124,8 @@ pub fn buildLaneJoinChain(ta: std.mem.Allocator, params: *std.StringHashMap(*con
         .out_schema = lj.out_schema,
         .kind = lj.kind,
         .null_aware = lj.null_aware,
+        .residual = lj.residual,
+        .pair_schema = lj.pair_schema,
         .state = ta,
     };
     return buildChainFrom(ta, params, errctx, lj.suffix, .{ .join = j }, lj.out_schema.*);
