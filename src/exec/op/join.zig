@@ -1,5 +1,24 @@
 //! Hash joins: the build side materialized and indexed once (`JoinIndex`), the probe
 //! side streamed through it, for every join kind.
+//!
+//! Grace mode. Given a `Space`, a join whose build side passes `spill_at` bytes
+//! (the join's `max_build`, else the run's `--op-memory`) spills instead of
+//! failing: the build rows already pulled and the rest of the build stream are
+//! split by key hash into `grace_parts` files, then the whole probe side (read-
+//! ahead replay included) the same way, and each partition is joined on its own —
+//! its build file indexed in a fresh arena, its probe file streamed through the
+//! usual `joinBatch`, its unmatched build rows drained for right and full joins —
+//! then freed and its files deleted. Peak memory is about one partition's index
+//! plus a probe batch, besides the up to `spill_at` bytes held when the switch
+//! happens. The partition is the hash's top four bits (the index buckets on its
+//! low bits), and each side hashes a key that the other side types differently
+//! boxed, so equal int, float and decimal keys land together. A partition still
+//! past `max(spill_at, build_cap)` fails with `JoinBuildTooLarge`; there is one
+//! level of partitioning. Row order is not kept. NOT IN never spills (a null key
+//! anywhere on the build side changes every probe row's answer), nor CROSS: both
+//! keep the in-memory cap. In grace mode `push_probe` is never applied, so a late
+//! probe source opens without a key predicate. Without a `Space` the join fails
+//! with `JoinBuildTooLarge` past `build_cap`, as before.
 
 const Batch = @import("../batch.zig").Batch;
 const Decimal = @import("../value.zig").Decimal;
@@ -11,6 +30,9 @@ const column = @import("../column.zig");
 const failLabel = @import("../op.zig").failLabel;
 const keyhash = @import("../keyhash.zig");
 const keyset = @import("keyset.zig");
+const spill = @import("../spill.zig");
+const Space = @import("../space.zig").Space;
+const DirSpace = @import("../space.zig").DirSpace;
 const eval = @import("../eval.zig");
 const std = @import("std");
 const op_mod = @import("../op.zig");
@@ -24,36 +46,51 @@ const join_right_schema = @import("testing_util.zig").join_right_schema;
 const kvBatch = @import("testing_util.zig").kvBatch;
 const testing = std.testing;
 
-/// Drain the build side into a batch in `state` that is never null, so a join can
-/// emit right-side nulls for an empty build. Fails with `JoinBuildTooLarge` past `cap`.
-fn materializeFull(state: std.mem.Allocator, pull: std.mem.Allocator, child: Op, schema: *const types.Schema, bytes_out: *usize, cap: usize) anyerror!Batch {
-    _ = pull;
-    const ncols = schema.fields.len;
-    var chunks = std.array_list.Managed(Batch).init(state);
-    var total: usize = 0;
+/// The build side's batches, pulled into `pull`, and their bytes. Fails with
+/// `JoinBuildTooLarge` as soon as they pass `cap`.
+fn drainBuild(pull: std.mem.Allocator, child: Op, bytes_out: *usize, cap: usize) anyerror![]const Batch {
+    var chunks = std.array_list.Managed(Batch).init(pull);
     var bytes: usize = 0;
-    while (try child.next(state)) |b| {
-        for (b.columns) |*col| bytes += columnBytes(col);
+    while (try child.next(pull)) |b| {
+        bytes += batchBytes(b);
         if (bytes > cap) return error.JoinBuildTooLarge;
         if (b.len == 0) continue;
         try chunks.append(b);
-        total += b.len;
     }
-    const cols = try state.alloc(column.Column, ncols);
+    bytes_out.* = bytes;
+    return chunks.items;
+}
+
+/// `chunks` concatenated into one batch in `state` that is never null, so a join
+/// can emit right-side nulls for an empty build.
+fn concatBatches(state: std.mem.Allocator, chunks: []const Batch, schema: *const types.Schema, total: usize) anyerror!Batch {
+    const cols = try state.alloc(column.Column, schema.fields.len);
     if (total == 0) {
         for (cols, schema.fields) |*c, f| {
             var bd = column.Builder.init(state, f.ty);
             c.* = try bd.finish();
         }
     } else {
-        const per = try state.alloc(column.Column, chunks.items.len);
+        const per = try state.alloc(column.Column, chunks.len);
         for (cols, 0..) |*out, ci| {
-            for (chunks.items, 0..) |b, k| per[k] = b.columns[ci];
+            for (chunks, 0..) |b, k| per[k] = b.columns[ci];
             out.* = try column.concat(state, per, total);
         }
     }
-    bytes_out.* = bytes;
     return Batch{ .schema = schema, .columns = cols, .len = total };
+}
+
+fn batchBytes(b: Batch) usize {
+    var n: usize = 0;
+    for (b.columns) |*col| n += columnBytes(col);
+    return n;
+}
+
+/// The bucket heads, chains and hashes `JoinIndex` adds over `rows` keyed rows.
+fn indexOverhead(rows: usize) usize {
+    var slots: usize = 16;
+    while (slots < rows * 2) slots *= 2;
+    return slots * @sizeOf(u32) + rows * (@sizeOf(u32) + @sizeOf(u64));
 }
 
 /// A column's heap: typed store plus validity bitmap, close enough to bound a build side.
@@ -117,6 +154,119 @@ fn anyNullKey(cols: []const column.Column, keys: []const usize, row: usize) bool
     return false;
 }
 
+pub const grace_parts = 16;
+
+/// Which key positions the two sides type differently (int against decimal, say):
+/// those hash boxed on both sides, as `classOf` would pair them.
+fn mixedKeys(arena: std.mem.Allocator, schema: *const types.Schema, keys: []const usize, other: *const types.Schema, other_keys: []const usize) ![]bool {
+    const mixed = try arena.alloc(bool, keys.len);
+    for (keys, other_keys, mixed) |k, ok, *m| m.* = schema.fields[k].ty.kind != other.fields[ok].ty.kind;
+    return mixed;
+}
+
+/// One side's key classes for partitioning `b`.
+fn partClasses(arena: std.mem.Allocator, b: Batch, keys: []const usize, mixed: []const bool) ![]KeyClass {
+    const classes = try arena.alloc(KeyClass, keys.len);
+    for (keys, mixed, classes) |k, m, *c| c.* = if (m) .boxed else classOf(b.columns[k], b.columns[k]);
+    return classes;
+}
+
+/// A row's partition: the top bits of its key hash, which `hashRowKeys` folds alike
+/// for equal keys of int, float and decimal; the index built for one partition
+/// spreads over the low bits. A row with a null key matches nothing and goes to 0.
+fn partOf(cols: []const column.Column, keys: []const usize, classes: []const KeyClass, row: usize) usize {
+    if (anyNullKey(cols, keys, row)) return 0;
+    return @intCast(hashRowKeys(cols, keys, classes, row) >> 60);
+}
+
+/// `b`'s rows written to the writer of their partition, gathered in `scratch`.
+fn partitionInto(scratch: std.mem.Allocator, ws: []spill.Writer, b: Batch, keys: []const usize, mixed: []const bool) !void {
+    if (b.len == 0) return;
+    const classes = try partClasses(scratch, b, keys, mixed);
+    const parts = try scratch.alloc(u8, b.len);
+    var counts = [_]usize{0} ** grace_parts;
+    for (parts, 0..) |*p, r| {
+        p.* = @intCast(partOf(b.columns, keys, classes, r));
+        counts[p.*] += 1;
+    }
+    var starts: [grace_parts]usize = undefined;
+    var at: usize = 0;
+    for (&starts, counts) |*s, c| {
+        s.* = at;
+        at += c;
+    }
+    const order = try scratch.alloc(usize, b.len);
+    var fill = starts;
+    for (parts, 0..) |p, r| {
+        order[fill[p]] = r;
+        fill[p] += 1;
+    }
+    for (ws, starts, counts) |*w, s, c| {
+        if (c == 0) continue;
+        const idx = order[s..][0..c];
+        const cols = try scratch.alloc(column.Column, b.columns.len);
+        for (cols, b.columns) |*out, col| out.* = try column.permute(scratch, col, idx);
+        try w.write(.{ .schema = b.schema, .columns = cols, .len = c });
+    }
+}
+
+fn openWriters(space: Space, arena: std.mem.Allocator, schema: *const types.Schema, tag: []const u8) ![grace_parts]spill.Writer {
+    var ws: [grace_parts]spill.Writer = undefined;
+    var made: usize = 0;
+    errdefer for (ws[0..made]) |*w| w.abort();
+    for (&ws) |*w| {
+        w.* = try spill.Writer.init(space, arena, schema, tag);
+        made += 1;
+    }
+    return ws;
+}
+
+fn finishWriters(ws: *[grace_parts]spill.Writer, runs: *[grace_parts]spill.Run) !void {
+    for (ws, runs) |*w, *r| r.* = try w.finish();
+}
+
+fn abortWriters(ws: *[grace_parts]spill.Writer) void {
+    for (ws) |*w| w.abort();
+}
+
+fn dropRun(run: spill.Run) void {
+    spill.discard(run);
+}
+
+/// A join spilled to disk: both sides split into `grace_parts` files by key hash,
+/// joined one partition at a time. `files` holds the writers' buffers and the
+/// paths; `part_mem` the current partition's index and match flags.
+const Grace = struct {
+    files: std.heap.ArenaAllocator,
+    build: [grace_parts]spill.Run = undefined,
+    probe: [grace_parts]spill.Run = undefined,
+    probed: bool = false,
+    part: usize = 0,
+    part_mem: ?std.heap.ArenaAllocator = null,
+    index: ?*JoinIndex = null,
+    reader: ?spill.Reader = null,
+
+    fn closePart(self: *Grace) void {
+        if (self.reader) |*r| r.close();
+        self.reader = null;
+        if (self.part_mem) |*m| m.deinit();
+        self.part_mem = null;
+        self.index = null;
+    }
+
+    /// Frees what is left and deletes the files not yet joined; later calls are no-ops.
+    fn deinit(self: *Grace) void {
+        if (self.part > grace_parts) return;
+        self.closePart();
+        if (self.part < grace_parts) {
+            if (self.probed) for (self.probe[self.part..]) |r| dropRun(r);
+            for (self.build[self.part..]) |r| dropRun(r);
+        }
+        self.files.deinit();
+        self.part = grace_parts + 1;
+    }
+};
+
 pub const JoinIndex = struct {
     build_batch: Batch,
     keys: []const usize,
@@ -126,8 +276,7 @@ pub const JoinIndex = struct {
     mask: u64,
     has_null_key: bool = false,
 
-    /// Drain `build`, materialize it and index `right_keys`. Rows are inserted in
-    /// reverse so prepending leaves duplicate chains in build order.
+    /// Drain `build` into `pull`, materialize it in `state` and index `right_keys`.
     pub fn create(
         state: std.mem.Allocator,
         pull: std.mem.Allocator,
@@ -137,9 +286,26 @@ pub const JoinIndex = struct {
         cap: usize,
     ) anyerror!*JoinIndex {
         var bytes: usize = 0;
-        const batch = try materializeFull(state, pull, build, right_schema, &bytes, cap);
-        const n = batch.len;
+        const chunks = try drainBuild(pull, build, &bytes, cap);
+        return fromBatches(state, chunks, right_schema, right_keys, bytes, cap);
+    }
+
+    /// Index `chunks` (holding `bytes`), copied into `state`; checked against `cap`
+    /// before anything is copied. Rows are inserted in reverse so prepending leaves
+    /// duplicate chains in build order.
+    pub fn fromBatches(
+        state: std.mem.Allocator,
+        chunks: []const Batch,
+        right_schema: *const types.Schema,
+        right_keys: []const usize,
+        bytes: usize,
+        cap: usize,
+    ) anyerror!*JoinIndex {
+        var n: usize = 0;
+        for (chunks) |b| n += b.len;
         if (n >= std.math.maxInt(u32)) return error.JoinBuildTooLarge;
+        if (right_keys.len > 0 and bytes + indexOverhead(n) > cap) return error.JoinBuildTooLarge;
+        const batch = try concatBatches(state, chunks, right_schema, n);
 
         const self = try state.create(JoinIndex);
         self.* = .{
@@ -154,8 +320,6 @@ pub const JoinIndex = struct {
 
         var cap_slots: usize = 16;
         while (cap_slots < n * 2) cap_slots *= 2;
-        bytes += cap_slots * @sizeOf(u32) + n * (@sizeOf(u32) + @sizeOf(u64));
-        if (bytes > cap) return error.JoinBuildTooLarge;
 
         const heads = try state.alloc(u32, cap_slots);
         @memset(heads, 0);
@@ -166,7 +330,7 @@ pub const JoinIndex = struct {
         self.hashes = hashes;
         self.mask = cap_slots - 1;
 
-        const classes = try pull.alloc(KeyClass, right_keys.len);
+        const classes = try state.alloc(KeyClass, right_keys.len);
         for (right_keys, classes) |k, *c| c.* = classOf(batch.columns[k], batch.columns[k]);
 
         @memset(chain, 0);
@@ -266,6 +430,12 @@ pub const Join = struct {
     err: ?*ErrCtx = null,
     build_cap: ?usize = null,
 
+    /// Spilling: with a `space`, a build side past `spill_at` bytes switches the
+    /// join to grace mode instead of failing.
+    space: ?Space = null,
+    spill_at: usize = std.math.maxInt(usize),
+    grace: ?*Grace = null,
+
     /// Key pushdown. `push_build` gets the probe side's keys before the build side
     /// is read: the probe is read ahead into memory up to `prefetch_rows` /
     /// `prefetch_bytes` and replayed, and past either the read-ahead stops and no
@@ -295,7 +465,7 @@ pub const Join = struct {
 
     pub fn next(self: *Join, arena: std.mem.Allocator) anyerror!?Batch {
         if (self.push_build != null and !self.prefetched) try self.prefetch(arena);
-        const ix = try self.ensureIndex(arena);
+        const ix = (try self.ensureIndex(arena)) orelse return self.nextGrace(arena);
         if (self.push_probe) |kp| if (!self.probe_pushed) {
             self.probe_pushed = true;
             try kp.apply(kp.ctx, try keyset.collect(self.state, &.{ix.build_batch}, self.right_keys, self.push_cap));
@@ -342,13 +512,14 @@ pub const Join = struct {
             try self.push_build.?.apply(self.push_build.?.ctx, try keyset.collect(self.state, self.replay, self.left_keys, self.push_cap));
     }
 
-    fn ensureIndex(self: *Join, arena: std.mem.Allocator) anyerror!*JoinIndex {
+    /// The index, or null once the join has gone to grace mode.
+    fn ensureIndex(self: *Join, arena: std.mem.Allocator) anyerror!?*JoinIndex {
+        if (self.grace != null) return null;
         const ix = self.index orelse blk: {
-            const build = self.build orelse return error.JoinHasNoBuildSide;
-            const made = JoinIndex.create(self.state, arena, build, self.right_schema, self.right_keys, self.build_cap orelse op_mod.join_build_byte_cap) catch |e| {
+            const made = (self.buildIndex(arena) catch |e| {
                 if (self.err) |ec| ec.set("{s}", .{failLabel(e)});
                 return e;
-            };
+            }) orelse return null;
             self.index = made;
             break :blk made;
         };
@@ -357,6 +528,140 @@ pub const Join = struct {
             @memset(m, false);
             self.matched = m;
         }
+        return ix;
+    }
+
+    /// Whether this join may spill: never a CROSS join, which has no key to split
+    /// on, nor NOT IN, where one null key anywhere on the build side changes every
+    /// probe row's answer.
+    fn mayGrace(self: *const Join) bool {
+        return self.space != null and !self.null_aware and self.kind != .cross and self.right_keys.len > 0;
+    }
+
+    fn partCap(self: *const Join) usize {
+        return @max(self.spill_at, self.build_cap orelse op_mod.join_build_byte_cap);
+    }
+
+    /// The in-memory index, or null after switching to grace mode. A join that may
+    /// spill pulls its build side into a scratch arena, so what it held is freed
+    /// once indexed or written out.
+    fn buildIndex(self: *Join, arena: std.mem.Allocator) anyerror!?*JoinIndex {
+        const build = self.build orelse return error.JoinHasNoBuildSide;
+        const cap = self.build_cap orelse op_mod.join_build_byte_cap;
+        if (!self.mayGrace()) return try JoinIndex.create(self.state, arena, build, self.right_schema, self.right_keys, cap);
+        var pull = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer pull.deinit();
+        var held = std.array_list.Managed(Batch).init(pull.allocator());
+        var bytes: usize = 0;
+        var rows: usize = 0;
+        while (try build.next(pull.allocator())) |b| {
+            if (b.len == 0) continue;
+            try held.append(b);
+            bytes += batchBytes(b);
+            rows += b.len;
+            if (bytes > self.spill_at) break;
+        } else if (bytes + indexOverhead(rows) <= self.spill_at and rows < std.math.maxInt(u32)) {
+            return try JoinIndex.fromBatches(self.state, held.items, self.right_schema, self.right_keys, bytes, std.math.maxInt(usize));
+        }
+        try self.startGrace(&pull, held.items, build);
+        return null;
+    }
+
+    /// Splits the build side, `held` and then the rest of `build`, into partition files.
+    fn startGrace(self: *Join, pull: *std.heap.ArenaAllocator, held: []const Batch, build: Op) anyerror!void {
+        const g = try self.state.create(Grace);
+        g.* = .{ .files = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+        errdefer g.files.deinit();
+        const fa = g.files.allocator();
+        const mixed = try mixedKeys(fa, self.right_schema, self.right_keys, self.left_schema, self.left_keys);
+        var ws = try openWriters(self.space.?, fa, self.right_schema, "join-build");
+        errdefer abortWriters(&ws);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        for (held) |b| {
+            try partitionInto(scratch.allocator(), &ws, b, self.right_keys, mixed);
+            _ = scratch.reset(.retain_capacity);
+        }
+        _ = pull.reset(.free_all);
+        while (try build.next(scratch.allocator())) |b| {
+            try partitionInto(scratch.allocator(), &ws, b, self.right_keys, mixed);
+            _ = scratch.reset(.retain_capacity);
+        }
+        try finishWriters(&ws, &g.build);
+        self.grace = g;
+        self.probe_pushed = true;
+    }
+
+    /// Grace mode: the probe side split into partition files first, then each
+    /// partition joined in turn from its build file's index, right and full joins
+    /// draining its unmatched build rows before the next one opens.
+    fn nextGrace(self: *Join, arena: std.mem.Allocator) anyerror!?Batch {
+        const g = self.grace.?;
+        errdefer g.deinit();
+        if (!g.probed) try self.splitProbe(g);
+        while (g.part < grace_parts) {
+            const ix = g.index orelse try self.openPart(g);
+            if (!self.probe_done) {
+                while (try g.reader.?.next(arena)) |pb| {
+                    const out = try self.joinBatch(arena, ix, pb);
+                    if (out.len > 0) return out;
+                }
+                self.probe_done = true;
+            }
+            if (try self.drain(arena, ix)) |b| return b;
+            g.closePart();
+            self.matched = null;
+            dropRun(g.probe[g.part]);
+            g.part += 1;
+        }
+        g.deinit();
+        return null;
+    }
+
+    fn splitProbe(self: *Join, g: *Grace) anyerror!void {
+        const fa = g.files.allocator();
+        const mixed = try mixedKeys(fa, self.left_schema, self.left_keys, self.right_schema, self.right_keys);
+        var ws = try openWriters(self.space.?, fa, self.left_schema, "join-probe");
+        errdefer abortWriters(&ws);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        while (try self.nextProbe(scratch.allocator())) |b| {
+            try partitionInto(scratch.allocator(), &ws, b, self.left_keys, mixed);
+            _ = scratch.reset(.retain_capacity);
+        }
+        try finishWriters(&ws, &g.probe);
+        g.probed = true;
+    }
+
+    /// Partition `g.part`'s index, read from its build file (deleted once read),
+    /// and its probe file opened.
+    fn openPart(self: *Join, g: *Grace) anyerror!*JoinIndex {
+        g.part_mem = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        const pa = g.part_mem.?.allocator();
+        const run = g.build[g.part];
+        var r = try spill.Reader.open(run);
+        defer r.close();
+        var held = std.array_list.Managed(Batch).init(pa);
+        var bytes: usize = 0;
+        while (try r.next(pa)) |b| {
+            try held.append(b);
+            bytes += batchBytes(b);
+        }
+        const ix = JoinIndex.fromBatches(pa, held.items, self.right_schema, self.right_keys, bytes, self.partCap()) catch |e| {
+            if (e == error.JoinBuildTooLarge) if (self.err) |ec|
+                ec.set("join build side too large even spilled: partition {d} of {d} holds {d} rows over the {d}-byte limit — raise it with WITH (max_build = '8GB') on the join, filter the CTE, or flip the join", .{ g.part + 1, grace_parts, run.rows, self.partCap() });
+            return e;
+        };
+        dropRun(run);
+        if (self.kind == .right or self.kind == .full) {
+            const m = try pa.alloc(bool, ix.build_batch.len);
+            @memset(m, false);
+            self.matched = m;
+        }
+        self.drain_pos = 0;
+        self.probe_done = false;
+        g.reader = try spill.Reader.open(g.probe[g.part]);
+        g.index = ix;
         return ix;
     }
 
@@ -840,4 +1145,302 @@ test "join: the build-size guard reports instead of exhausting memory" {
     const top = Op{ .join = &jn };
     try testing.expectError(error.JoinBuildTooLarge, top.next(a));
     try testing.expect(std.mem.indexOf(u8, ec.msg, "exceeds its cap") != null);
+}
+
+const SpillDir = struct {
+    tmp: testing.TmpDir,
+    path: []const u8,
+    ds: DirSpace,
+
+    fn init(a: std.mem.Allocator, cap: u64) !SpillDir {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        errdefer tmp.cleanup();
+        const path = try tmp.dir.realpathAlloc(a, ".");
+        return .{ .tmp = tmp, .path = path, .ds = .{ .dir = path, .cap = cap } };
+    }
+
+    fn files(self: *SpillDir) !usize {
+        var it = self.tmp.dir.iterate();
+        var n: usize = 0;
+        while (try it.next()) |_| n += 1;
+        return n;
+    }
+};
+
+const JoinSetup = struct {
+    kind: ast.JoinKind,
+    left: []const Batch,
+    right: []const Batch,
+    left_schema: *const types.Schema = &join_left_schema,
+    right_schema: *const types.Schema = &join_right_schema,
+    out_schema: ?*const types.Schema = null,
+    residual: ?*const ast.Expr = null,
+    null_aware: bool = false,
+    space: ?Space = null,
+    spill_at: usize = std.math.maxInt(usize),
+    err: ?*ErrCtx = null,
+};
+
+const JoinOutcome = struct { rows: []const []const u8, spilled: bool };
+
+fn cellText(a: std.mem.Allocator, v: @import("../value.zig").Value) ![]const u8 {
+    return switch (v) {
+        .null => "~",
+        .int => |x| try std.fmt.allocPrint(a, "{d}", .{x}),
+        .string => |s| s,
+        .decimal => |d| try std.fmt.allocPrint(a, "{d}e-{d}", .{ d.unscaled, d.scale }),
+        else => "?",
+    };
+}
+
+/// The join's rows as sorted `a|b|c` lines, and whether it went to grace mode.
+fn runJoin(a: std.mem.Allocator, s: JoinSetup) !JoinOutcome {
+    var lts = TestSource{ .schema_ = s.left_schema.*, .batches = s.left };
+    var rts = TestSource{ .schema_ = s.right_schema.*, .batches = s.right };
+    var lscan = Scan{ .src = lts.src() };
+    var rscan = Scan{ .src = rts.src() };
+    const emit_right = s.kind != .semi and s.kind != .anti;
+    var jn = Join{
+        .probe = .{ .scan = &lscan },
+        .build = .{ .scan = &rscan },
+        .left_keys = &.{0},
+        .right_keys = &.{0},
+        .left_schema = s.left_schema,
+        .right_schema = s.right_schema,
+        .out_schema = s.out_schema orelse if (emit_right) &join_both_schema else s.left_schema,
+        .kind = s.kind,
+        .null_aware = s.null_aware,
+        .state = a,
+        .err = s.err,
+        .residual = s.residual,
+        .pair_schema = if (s.residual != null) &join_both_schema else null,
+        .space = s.space,
+        .spill_at = s.spill_at,
+    };
+    var rows = std.array_list.Managed([]const u8).init(a);
+    const top = Op{ .join = &jn };
+    while (try top.next(a)) |b| {
+        for (0..b.len) |r| {
+            var line = std.array_list.Managed(u8).init(a);
+            for (b.columns, 0..) |c, ci| {
+                if (ci > 0) try line.append('|');
+                try line.appendSlice(try cellText(a, c.getValue(r)));
+            }
+            try rows.append(line.items);
+        }
+    }
+    std.mem.sort([]const u8, rows.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return .{ .rows = rows.items, .spilled = jn.grace != null };
+}
+
+fn expectSameRows(want: []const []const u8, got: []const []const u8) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try testing.expectEqualStrings(w, g);
+}
+
+/// `n` rows in batches of `per`: key `(i * mul) % mod`, null every `null_every`th
+/// row, value `prefix` and `i`, or "x" every third row.
+fn genBatches(a: std.mem.Allocator, schema: *const types.Schema, n: usize, per: usize, mul: i64, mod: i64, null_every: usize, prefix: []const u8) ![]const Batch {
+    var out = std.array_list.Managed(Batch).init(a);
+    var i: usize = 0;
+    while (i < n) {
+        const m = @min(per, n - i);
+        const keys = try a.alloc(?i64, m);
+        const vals = try a.alloc(?[]const u8, m);
+        for (keys, vals, 0..) |*k, *v, j| {
+            const row = i + j;
+            const ri: i64 = @intCast(row);
+            k.* = if (row % null_every == 0) null else @mod(ri * mul, mod);
+            v.* = if (row % 3 == 0) "x" else try std.fmt.allocPrint(a, "{s}{d}", .{ prefix, row });
+        }
+        try out.append(try kvBatch(a, schema, keys, vals));
+        i += m;
+    }
+    return out.items;
+}
+
+test "join spill: every kind, with and without a residual, gives the in-memory rows" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var sd = try SpillDir.init(a, 1 << 30);
+    defer sd.tmp.cleanup();
+
+    const rv = try a.create(ast.Expr);
+    rv.* = .{ .field = .{ .parts = &.{"rv"} } };
+    const x = try a.create(ast.Expr);
+    x.* = .{ .str_lit = "x" };
+    const residual = try a.create(ast.Expr);
+    residual.* = .{ .binary = .{ .op = .ne, .l = rv, .r = x } };
+
+    const left = try genBatches(a, &join_left_schema, 300, 70, 1, 50, 17, "l");
+    const right = try genBatches(a, &join_right_schema, 200, 45, 7, 60, 23, "r");
+    const empty_one = [_]Batch{try kvBatch(a, &join_right_schema, &.{}, &.{})};
+
+    const Sides = struct { left: []const Batch, right: []const Batch };
+    const sides = [_]Sides{
+        .{ .left = left, .right = right },
+        .{ .left = left, .right = &.{} },
+        .{ .left = left, .right = &empty_one },
+        .{ .left = &.{}, .right = right },
+    };
+    const kinds = [_]ast.JoinKind{ .inner, .left, .right, .full, .semi, .anti };
+    for (sides) |sd_case| for (kinds) |kind| for ([_]?*const ast.Expr{ null, residual }) |res| {
+        const base = JoinSetup{ .kind = kind, .left = sd_case.left, .right = sd_case.right, .residual = res };
+        const want = try runJoin(a, base);
+        try testing.expect(!want.spilled);
+        var spilled = base;
+        spilled.space = sd.ds.space();
+        spilled.spill_at = 1;
+        const got = try runJoin(a, spilled);
+        try testing.expect(got.spilled);
+        try expectSameRows(want.rows, got.rows);
+        try testing.expectEqual(@as(usize, 0), try sd.files());
+    };
+}
+
+test "join spill: a build side under the threshold stays in memory" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var sd = try SpillDir.init(a, 1 << 30);
+    defer sd.tmp.cleanup();
+    const left = try genBatches(a, &join_left_schema, 50, 20, 1, 10, 7, "l");
+    const right = try genBatches(a, &join_right_schema, 30, 10, 1, 10, 7, "r");
+    const got = try runJoin(a, .{ .kind = .inner, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1 << 20 });
+    try testing.expect(!got.spilled);
+    try testing.expectEqual(@as(usize, 0), try sd.files());
+}
+
+const dec_right_schema = types.Schema{ .fields = &.{
+    .{ .name = "rk", .ty = types.Type.decimal(18, 2).asNullable() },
+    .{ .name = "rv", .ty = types.Type.init(.string).asNullable() },
+} };
+
+const dec_both_schema = types.Schema{ .fields = &.{
+    .{ .name = "lk", .ty = types.Type.init(.int).asNullable() },
+    .{ .name = "lv", .ty = types.Type.init(.string).asNullable() },
+    .{ .name = "rk", .ty = types.Type.decimal(18, 2).asNullable() },
+    .{ .name = "rv", .ty = types.Type.init(.string).asNullable() },
+} };
+
+fn decBatch(a: std.mem.Allocator, unscaled: []const ?i128, vals: []const ?[]const u8) !Batch {
+    const cols = try a.alloc(column.Column, 2);
+    var kb = column.Builder.init(a, dec_right_schema.fields[0].ty);
+    for (unscaled) |u| try kb.append(if (u) |x| .{ .decimal = .{ .unscaled = x, .scale = 2 } } else .null);
+    cols[0] = try kb.finish();
+    var vb = column.Builder.init(a, types.Type.init(.string).asNullable());
+    for (vals) |v| try vb.append(if (v) |s| .{ .string = s } else .null);
+    cols[1] = try vb.finish();
+    return .{ .schema = &dec_right_schema, .columns = cols, .len = unscaled.len };
+}
+
+test "join spill: decimal build keys and int probe keys that are equal land in the same partition" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const ints = [_]?i64{ 0, 1, 2, 3, 7, 42, 100, -5, 123456 };
+    var unscaled: [ints.len]?i128 = undefined;
+    var vals: [ints.len]?[]const u8 = undefined;
+    for (ints, &unscaled, &vals) |i, *u, *v| {
+        u.* = @as(i128, i.?) * 100;
+        v.* = "d";
+    }
+    const db = try decBatch(a, &unscaled, &vals);
+    const ib = try kvBatch(a, &join_left_schema, &ints, &vals);
+    const dmixed = try mixedKeys(a, &dec_right_schema, &.{0}, &join_left_schema, &.{0});
+    const imixed = try mixedKeys(a, &join_left_schema, &.{0}, &dec_right_schema, &.{0});
+    try testing.expect(dmixed[0] and imixed[0]);
+    const dcls = try partClasses(a, db, &.{0}, dmixed);
+    const icls = try partClasses(a, ib, &.{0}, imixed);
+    var seen = [_]bool{false} ** grace_parts;
+    for (0..ints.len) |r| {
+        const p = partOf(ib.columns, &.{0}, icls, r);
+        try testing.expectEqual(p, partOf(db.columns, &.{0}, dcls, r));
+        seen[p] = true;
+    }
+    var used: usize = 0;
+    for (seen) |s| used += @intFromBool(s);
+    try testing.expect(used > 1);
+
+    var sd = try SpillDir.init(a, 1 << 30);
+    defer sd.tmp.cleanup();
+    const left = try genBatches(a, &join_left_schema, 200, 64, 1, 40, 11, "l");
+    var rights = std.array_list.Managed(Batch).init(a);
+    for (0..3) |bi| {
+        var us: [20]?i128 = undefined;
+        var vs: [20]?[]const u8 = undefined;
+        for (&us, &vs, 0..) |*u, *v, j| {
+            const k: i128 = @intCast(bi * 20 + j);
+            u.* = if (j == 5) null else k * 100 + (if (j % 4 == 0) @as(i128, 50) else 0);
+            v.* = try std.fmt.allocPrint(a, "r{d}", .{k});
+        }
+        try rights.append(try decBatch(a, &us, &vs));
+    }
+    for ([_]ast.JoinKind{ .inner, .full }) |kind| {
+        const base = JoinSetup{ .kind = kind, .left = left, .right = rights.items, .right_schema = &dec_right_schema, .out_schema = &dec_both_schema };
+        const want = try runJoin(a, base);
+        var spilled = base;
+        spilled.space = sd.ds.space();
+        spilled.spill_at = 1;
+        const got = try runJoin(a, spilled);
+        try testing.expect(got.spilled);
+        try testing.expect(want.rows.len > 100);
+        try expectSameRows(want.rows, got.rows);
+    }
+}
+
+test "join spill: NOT IN never spills and still fails past the build cap" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var sd = try SpillDir.init(a, 1 << 30);
+    defer sd.tmp.cleanup();
+    const left = try genBatches(a, &join_left_schema, 40, 20, 1, 10, 7, "l");
+    const right = try genBatches(a, &join_right_schema, 40, 20, 1, 10, 1000, "r");
+
+    const small = try runJoin(a, .{ .kind = .anti, .null_aware = true, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1 });
+    try testing.expect(!small.spilled);
+
+    var ec = ErrCtx{};
+    const saved = op_mod.join_build_byte_cap;
+    op_mod.join_build_byte_cap = 8;
+    defer op_mod.join_build_byte_cap = saved;
+    try testing.expectError(error.JoinBuildTooLarge, runJoin(a, .{ .kind = .anti, .null_aware = true, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1, .err = &ec }));
+    try testing.expect(std.mem.indexOf(u8, ec.msg, "exceeds its cap") != null);
+    try testing.expectEqual(@as(usize, 0), try sd.files());
+}
+
+test "join spill: a partition still past the cap fails, saying so, and leaves no files" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var sd = try SpillDir.init(a, 1 << 30);
+    defer sd.tmp.cleanup();
+    const left = try genBatches(a, &join_left_schema, 40, 20, 1, 10, 7, "l");
+    const right = try genBatches(a, &join_right_schema, 400, 50, 0, 1, 1000, "r");
+    var ec = ErrCtx{};
+    const saved = op_mod.join_build_byte_cap;
+    op_mod.join_build_byte_cap = 64;
+    defer op_mod.join_build_byte_cap = saved;
+    try testing.expectError(error.JoinBuildTooLarge, runJoin(a, .{ .kind = .inner, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1, .err = &ec }));
+    try testing.expect(std.mem.indexOf(u8, ec.msg, "even spilled") != null);
+    try testing.expectEqual(@as(usize, 0), try sd.files());
+}
+
+test "join spill: the disk cap stops a spilling join" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var sd = try SpillDir.init(a, 4096);
+    defer sd.tmp.cleanup();
+    const left = try genBatches(a, &join_left_schema, 40, 20, 1, 10, 7, "l");
+    const right = try genBatches(a, &join_right_schema, 2000, 100, 1, 500, 1000, "r");
+    try testing.expectError(error.SpillCapExceeded, runJoin(a, .{ .kind = .inner, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1 }));
+    try testing.expectEqual(@as(usize, 0), try sd.files());
 }

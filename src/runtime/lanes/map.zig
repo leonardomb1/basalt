@@ -307,7 +307,7 @@ fn runParallelMapImpl(
 
     var lane_join: ?LaneJoin = null;
     if (jshape) |js| {
-        const lp = try resolveLaneJoin(env, js.join, js.join_hints, js.suffix, out_schema);
+        const lp = (try resolveLaneJoin(env, js.join, js.join_hints, js.suffix, out_schema)) orelse return false;
         lane_join = lp.lane;
         out_schema = lp.out_schema;
     }
@@ -533,7 +533,7 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
     for (env.sources.items[src_base..]) |sc| sc.close();
     env.sources.shrinkRetainingCapacity(src_base);
 
-    const lp = try resolveLaneJoin(env, shape.join, shape.join_hints, shape.suffix, probe_schema);
+    const lp = (try resolveLaneJoin(env, shape.join, shape.join_hints, shape.suffix, probe_schema)) orelse return false;
 
     var where_extra: ?[]const u8 = null;
     if (keypush.leftMayNarrow(shape.join) and !keypush.disabled(shape.join_hints)) {

@@ -37,6 +37,7 @@ const obs = @import("obs.zig");
 const pushdown = @import("pushdown.zig");
 const Value = @import("../exec/value.zig").Value;
 const arrow = @import("../format/arrow.zig");
+const Space = @import("../exec/space.zig").Space;
 
 pub const Diag = struct {
     buf: [512]u8 = undefined,
@@ -169,6 +170,9 @@ pub const RunOptions = struct {
     declarations_only: bool = false,
     on_load: ?LoadHook = null,
     summary_out: ?*obs.Summary = null,
+    spill_dir: ?[]const u8 = null,
+    spill_cap: u64 = 8 << 30,
+    op_memory: usize = 2 << 30,
 };
 
 pub const FactsCache = struct {
@@ -296,6 +300,8 @@ pub const Env = struct {
     on_result: ?ResultHook = null,
     max_rows: ?u64 = null,
     on_let: ?LetHook = null,
+    space: ?Space = null,
+    op_memory: usize = 2 << 30,
 
     pub fn takeResult(self: *Env) arrow.ResultInfo {
         var info = self.result;
@@ -509,6 +515,42 @@ pub fn pathFail(arena: std.mem.Allocator, path: []const u8, e: anyerror) ![]cons
     if (ftp.isUrl(path)) if (ftp.lastError().len > 0)
         return std.fmt.allocPrint(arena, "{s}: {s}: {s}", .{ pathLayer(path), @errorName(e), ftp.lastError() });
     return std.fmt.allocPrint(arena, "{s}: {s}", .{ pathLayer(path), @errorName(e) });
+}
+
+/// `512MB`, `8GB`, `2GiB`, `64k` or a bare byte count, case-insensitive; every
+/// unit is binary (`1MB` is 1024 KiB). Null when it does not parse or overflows.
+pub fn parseByteSize(txt: []const u8) ?u64 {
+    const t = std.mem.trim(u8, txt, " \t");
+    var n: usize = 0;
+    while (n < t.len and std.ascii.isDigit(t[n])) n += 1;
+    if (n == 0) return null;
+    const v = std.fmt.parseInt(u64, t[0..n], 10) catch return null;
+    const unit = std.mem.trim(u8, t[n..], " \t");
+    const units = [_]struct { []const u8, u6 }{
+        .{ "", 0 },     .{ "b", 0 },
+        .{ "k", 10 },   .{ "kb", 10 },
+        .{ "kib", 10 }, .{ "m", 20 },
+        .{ "mb", 20 },  .{ "mib", 20 },
+        .{ "g", 30 },   .{ "gb", 30 },
+        .{ "gib", 30 }, .{ "t", 40 },
+        .{ "tb", 40 },  .{ "tib", 40 },
+    };
+    for (units) |u| {
+        if (std.ascii.eqlIgnoreCase(unit, u[0])) return std.math.shlExact(u64, v, u[1]) catch null;
+    }
+    return null;
+}
+
+test "parseByteSize: suffixes, case, spaces, and what it refuses" {
+    const ok = [_]struct { []const u8, u64 }{
+        .{ "0", 0 },             .{ "4096", 4096 },        .{ "12b", 12 },
+        .{ "64k", 64 << 10 },    .{ "64KB", 64 << 10 },    .{ "64KiB", 64 << 10 },
+        .{ "512MB", 512 << 20 }, .{ "512mib", 512 << 20 }, .{ "8GB", 8 << 30 },
+        .{ "2GiB", 2 << 30 },    .{ " 16 gb ", 16 << 30 }, .{ "1TB", 1 << 40 },
+    };
+    for (ok) |c| try std.testing.expectEqual(@as(?u64, c[1]), parseByteSize(c[0]));
+    const bad = [_][]const u8{ "", "GB", "-1GB", "1.5GB", "8 XB", "8GBs", "99999999999999999999", "99999999999TB" };
+    for (bad) |b| try std.testing.expectEqual(@as(?u64, null), parseByteSize(b));
 }
 
 pub fn schemaPtr(arena: std.mem.Allocator, schema: types.Schema) !*types.Schema {

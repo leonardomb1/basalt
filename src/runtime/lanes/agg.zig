@@ -620,7 +620,7 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
 
     var lane_joins: []const LaneJoin = &.{};
     if (jshape) |js| {
-        const chain = try resolveLaneJoins(env, js.join_span, agg_in_schema);
+        const chain = (try resolveLaneJoins(env, js.join_span, agg_in_schema)) orelse return false;
         lane_joins = chain.joins;
         agg_in_schema = chain.out_schema;
     }
@@ -789,7 +789,7 @@ fn runParallelCsvAggImpl(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag:
     var agg_in_schema = try mapChainSchema(env, prefix, mapped.schema);
     var lane_joins: []const LaneJoin = &.{};
     if (jshape) |js| {
-        const chain = try resolveLaneJoins(env, js.join_span, agg_in_schema);
+        const chain = (try resolveLaneJoins(env, js.join_span, agg_in_schema)) orelse return false;
         lane_joins = chain.joins;
         agg_in_schema = chain.out_schema;
     }

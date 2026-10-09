@@ -49,6 +49,7 @@ const MemSource = @import("env.zig").MemSource;
 const forHintIdent = @import("env.zig").forHintIdent;
 const forHintName = @import("env.zig").forHintName;
 const mk = @import("env.zig").mk;
+const parseByteSize = @import("env.zig").parseByteSize;
 const PipeRes = @import("env.zig").PipeRes;
 const planErr = @import("env.zig").planErr;
 const planErrT = @import("env.zig").planErrT;
@@ -518,7 +519,7 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
                 keys = analyze.fieldIndices(arena, schema, fields, &ad) catch |e| return aErr(env, &ad, e);
             }
             const o = try arena.create(op.Distinct);
-            o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = keys, .state = arena, .gpa = env.gpa };
+            o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = keys, .state = arena, .gpa = env.gpa, .err = env.errctx, .space = env.space, .spill_at = env.op_memory };
             return .{ .op = .{ .distinct = o }, .schema = schema };
         },
         .sort => |s| {
@@ -529,7 +530,7 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
             const ks = try arena.alloc(op.Sort.Key, s.keys.len);
             for (s.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc };
             const o = try arena.create(op.Sort);
-            o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = ks, .threads = env.sort_threads };
+            o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = ks, .threads = env.sort_threads, .space = env.space, .spill_at = env.op_memory, .gpa = env.gpa };
             return .{ .op = .{ .sort = o }, .schema = schema };
         },
         .window => |wd| {
@@ -656,22 +657,8 @@ fn buildAggregate(env: *Env, ag: ast.Aggregate, schema: types.Schema, child: op.
     for (ap.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct };
     const out = try schemaPtr(arena, ap.schema);
     const o = try arena.create(op.Aggregate);
-    o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .by = ap.by, .aggs = aggs, .out_schema = out, .err = env.errctx, .state = arena, .gpa = env.gpa };
+    o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .by = ap.by, .aggs = aggs, .out_schema = out, .err = env.errctx, .state = arena, .gpa = env.gpa, .space = env.space, .spill_at = env.op_memory };
     return .{ .op = .{ .aggregate = o }, .schema = out.* };
-}
-
-fn parseByteSizeText(txt: []const u8) ?usize {
-    const t = std.mem.trim(u8, txt, " \t");
-    var n: usize = 0;
-    while (n < t.len and std.ascii.isDigit(t[n])) n += 1;
-    if (n == 0) return null;
-    const v = std.fmt.parseInt(usize, t[0..n], 10) catch return null;
-    const unit = std.mem.trim(u8, t[n..], " \t");
-    if (unit.len == 0 or std.ascii.eqlIgnoreCase(unit, "b")) return v;
-    if (std.ascii.eqlIgnoreCase(unit, "kb")) return v << 10;
-    if (std.ascii.eqlIgnoreCase(unit, "mb")) return v << 20;
-    if (std.ascii.eqlIgnoreCase(unit, "gb")) return v << 30;
-    return null;
 }
 
 pub fn joinBuildCap(env: *Env, hints: []const ast.Hint) !usize {
@@ -683,8 +670,8 @@ pub fn joinBuildCap(env: *Env, hints: []const ast.Hint) !usize {
             .int => |v| return if (v > 0) @intCast(v) else planErr(env.diag, "max_build must be positive"),
             .flag => "",
         };
-        return parseByteSizeText(txt) orelse
-            planErr(env.diag, try std.fmt.allocPrint(env.arena, "bad max_build `{s}` — use e.g. '512MB' or '8GB'", .{txt}));
+        if (parseByteSize(txt)) |v| if (std.math.cast(usize, v)) |cap| return cap;
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "bad max_build `{s}` — use e.g. '512MB' or '8GB'", .{txt}));
     }
     return op.join_build_byte_cap;
 }
@@ -743,6 +730,27 @@ pub fn prepareJoinSide(env: *Env, stages_in: []const ast.Stage) ![]const ast.Sta
     return descendLeadingWhere(env, stages);
 }
 
+/// The build-side bytes past which a join spills: its `max_build` when given,
+/// else the run's per-operator memory.
+pub fn joinSpillAt(env: *Env, hints: []const ast.Hint) !usize {
+    for (hints) |h| {
+        if (std.mem.eql(u8, h.key, "max_build")) return joinBuildCap(env, hints);
+    }
+    return env.op_memory;
+}
+
+/// Whether the serial join could spill where a lane's in-memory index cannot:
+/// there is a scratch space and the join is neither NOT IN nor CROSS.
+pub fn joinMaySpill(env: *Env, j: ast.Join) bool {
+    return env.space != null and !j.null_aware and j.kind != .cross;
+}
+
+/// The cap a lane's shared index is built under: the spill threshold where the
+/// serial join could spill instead, so a larger build side falls back to it.
+pub fn laneJoinCap(env: *Env, j: ast.Join, hints: []const ast.Hint) !usize {
+    return if (joinMaySpill(env, j)) joinSpillAt(env, hints) else joinBuildCap(env, hints);
+}
+
 fn buildJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, left_schema: types.Schema, probe: op.Op, take: ?ProbeTake) anyerror!PipeRes {
     const arena = env.arena;
     if (env.bindings.get(j.binding) == null)
@@ -776,6 +784,8 @@ fn buildJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, left_schema: types
         .state = arena,
         .err = env.errctx,
         .build_cap = try joinBuildCap(env, hints),
+        .space = env.space,
+        .spill_at = try joinSpillAt(env, hints),
     };
     if (analyze.residualPlan(arena, lsch, rsch, prep.join, env.params_expr, &ad) catch |e| return aErr(env, &ad, e)) |rp| {
         o.residual = rp.pred;

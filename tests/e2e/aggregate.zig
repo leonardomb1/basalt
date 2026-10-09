@@ -1,5 +1,6 @@
-//! End-to-end aggregates: grouped and global, across batches, and the numeric and
-//! statistical functions.
+//! End-to-end aggregates: grouped and global, across batches, the numeric and
+//! statistical functions, and GROUP BY and DISTINCT spilling past a tiny
+//! `op_memory` with the same result as in memory.
 
 const std = @import("std");
 const basalt = @import("basalt");
@@ -10,6 +11,7 @@ const run = basalt.runtime.run;
 const runToString = @import("harness.zig").runToString;
 const runCsvThreaded = @import("harness.zig").runCsvThreaded;
 const runScript = @import("harness.zig").runScript;
+const runScriptOpts = @import("harness.zig").runScriptOpts;
 
 test "SUM/AVG over an outer join's null fill, and integer sums that leave i64" {
     const alloc = std.testing.allocator;
@@ -331,4 +333,56 @@ test "variance and standard deviation: sample by default, population on request,
     , 4);
     defer alloc.free(threaded);
     try std.testing.expectEqualStrings(want, threaded);
+}
+
+test "GROUP BY and DISTINCT past --op-memory spill to disk and return what they return in memory" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var csv = std.array_list.Managed(u8).init(alloc);
+    defer csv.deinit();
+    try csv.appendSlice("g,s,v,f\n");
+    for (0..6000) |i| {
+        if (i % 41 == 3) {
+            try csv.writer().print(",n{d},{d},{d}.25\n", .{ i % 7, i, i % 13 });
+        } else try csv.writer().print("{d},n{d},{d},{d}.25\n", .{ (i * 7919) % 2200, i % 7, i, i % 13 });
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = csv.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const spill_dir = try std.fs.path.join(alloc, &.{ base, "spill" });
+    defer alloc.free(spill_dir);
+
+    const queries = [_][]const u8{
+        "SELECT g, s, COUNT(*) AS c, SUM(v) AS sv, SUM(f) AS sf, AVG(f) AS af, MIN(v) AS mn, MAX(s) AS mx, COUNT(DISTINCT s) AS ds, median(v) AS md, stddev_pop(f) AS sd FROM '$B/in.csv' GROUP BY g, s ORDER BY g, s",
+        "SELECT g, COUNT(*) AS c, SUM(v * 2) AS sv, bit_xor(v) AS bx FROM '$B/in.csv' GROUP BY g ORDER BY g",
+        "SELECT DISTINCT g, s FROM '$B/in.csv' ORDER BY g, s",
+        "WITH d AS (SELECT DISTINCT ON (g) g, v FROM '$B/in.csv') SELECT * FROM d ORDER BY g",
+    };
+    for (queries) |tmpl| {
+        const q = try std.mem.replaceOwned(u8, alloc, tmpl, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const want = try runScriptOpts(alloc, &tmp, script, .{});
+        defer alloc.free(want);
+        const got = try runScriptOpts(alloc, &tmp, script, .{ .op_memory = 1, .spill_dir = spill_dir });
+        defer alloc.free(got);
+        try std.testing.expect(std.mem.count(u8, want, "\n") > 1000);
+        try std.testing.expectEqualStrings(want, got);
+        try std.testing.expectError(error.SpillCapExceeded, runScriptOpts(alloc, &tmp, script, .{ .op_memory = 1, .spill_dir = spill_dir, .spill_cap = 64 }));
+    }
+    for ([_][]const u8{ "SELECT g, COUNT(*) AS c FROM '$B/in.csv' GROUP BY g LIMIT 1500", "SELECT DISTINCT g FROM '$B/in.csv' LIMIT 1500" }) |tmpl| {
+        const q = try std.mem.replaceOwned(u8, alloc, tmpl, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const got = try runScriptOpts(alloc, &tmp, script, .{ .op_memory = 1, .spill_dir = spill_dir });
+        defer alloc.free(got);
+        try std.testing.expectEqual(@as(usize, 1501), std.mem.count(u8, got, "\n"));
+    }
+    var dir = try tmp.dir.openDir("spill", .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    try std.testing.expect((try it.next()) == null);
 }

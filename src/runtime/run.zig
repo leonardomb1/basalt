@@ -37,7 +37,9 @@
 //! reverse freed the arenas while the writer still serialised from them.
 //!
 //! The statements run here; an output pipeline's execution is `run/output.zig`,
-//! EXPLAIN `run/explain.zig`, and PARAM/LET binding `run/params.zig`.
+//! EXPLAIN `run/explain.zig`, and PARAM/LET binding `run/params.zig`. Each run
+//! spills into a `Scratch` of its own (`scratch.zig`), handed to operators as
+//! `env.space` with `env.op_memory`, and removed when the run ends.
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
@@ -149,6 +151,8 @@ const renderForSource = @import("script.zig").renderForSource;
 const runPrint = @import("script.zig").runPrint;
 const runThrow = @import("script.zig").runThrow;
 
+const Scratch = @import("scratch.zig").Scratch;
+
 pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions, diag: *Diag) !Stats {
     var opts = opts_in;
     if (opts.explain) opts.threads = 1;
@@ -162,6 +166,8 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         }
         ftp.endRun();
     }
+    var scratch = Scratch.init(gpa, opts.spill_dir, opts.spill_cap);
+    defer scratch.deinit();
 
     var plan_arena = std.heap.ArenaAllocator.init(gpa);
     defer plan_arena.deinit();
@@ -262,6 +268,8 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var batch_arena = std.heap.ArenaAllocator.init(gpa);
     defer batch_arena.deinit();
 
+    env.space = scratch.space();
+    env.op_memory = opts.op_memory;
     var scan = driver.ScanTally{};
     env.scan = &scan;
     var loads = obs.LoadTally{};
@@ -693,6 +701,7 @@ test {
     _ = @import("plan.zig");
     _ = @import("keypush.zig");
     _ = @import("lanes.zig");
+    _ = @import("scratch.zig");
     _ = @import("script.zig");
 }
 

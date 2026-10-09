@@ -6,6 +6,7 @@
 //! which also asserts that `check` accepts what `run` executes. The default harness
 //! runs with `threads = 1`; the `*Threaded` helpers pick a thread count to reach
 //! the parallel paths, whose output keeps file order like a serial run's.
+//! `runScriptOpts` takes the run's options whole, for limits such as `op_memory`.
 //!
 //! The engine is reached only through the `basalt` module (src/root.zig), and the
 //! fixture files through `basalt.fixtures`. Tests of a single function live beside
@@ -83,6 +84,17 @@ pub fn runScript(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, script: []c
         return e;
     };
     return tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
+}
+
+/// `runScript` with the run's options given, e.g. a tiny `op_memory` to force spilling.
+pub fn runScriptOpts(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, script: []const u8, opts: basalt.env.RunOptions) ![]u8 {
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    _ = try run(alloc, prog, opts, &rdiag);
+    return tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 24);
 }
 
 pub fn checkAndRun(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, tmpl: []const u8, threads: usize, cli_params: []const ParamArg) !void {

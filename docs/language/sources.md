@@ -139,8 +139,8 @@ A read's `WITH (...)` takes `key = value` pairs and bare flags. `PAGINATE BY` an
 | `timeout_ms` | `300000` | the limit on one page's fetch |
 | `progress_ms` | `30000` | how often a long fetch logs its progress |
 
-**Joins** — on the `JOIN` clause: `max_build = '16GB'` raises the right side's
-memory ceiling ([Joins](joins.md)).
+**Joins** — on the `JOIN` clause: `max_build = '16GB'` sets the right side's
+memory ceiling, past which the join spills to disk ([Joins](joins.md)).
 
 `WHERE` on a REST source runs in basalt after the fetch; on a SQL table it is
 pushdown. Same word, different plan — `EXPLAIN` shows which.

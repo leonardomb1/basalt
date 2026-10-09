@@ -1,5 +1,6 @@
 //! The group hash tables: a direct table for small integer keys, a fast path for a
 //! few groups, fixed-width keys in record blocks, and the general table and store.
+//! `GroupTable.find` probes without inserting, for a table frozen by spilling.
 
 const Aggregate = @import("../aggregate.zig").Aggregate;
 const Agg = Aggregate.Agg;
@@ -243,6 +244,19 @@ pub const GroupTable = struct {
     }
 
     const growth = 2;
+
+    /// The slot holding `key`, or null; never inserts or grows.
+    pub fn find(self: *const GroupTable, h: u64, key: anytype, store: anytype) ?u32 {
+        const want = saltOf(h) << idx_bits;
+        var i = h & self.mask;
+        while (true) : (i = (i + 1) & self.mask) {
+            const e = self.entries[i];
+            if (e == 0) return null;
+            if ((e >> idx_bits) << idx_bits != want) continue;
+            const idx = (e & max_groups) - 1;
+            if (store.eqlAt(idx, h, key)) return idx;
+        }
+    }
 
     const Found = struct { slot: u32, found: bool };
 

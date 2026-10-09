@@ -84,9 +84,12 @@
 //! heads, per-row duplicate chains, per-row hashes), read-only after `create`, so
 //! parallel lanes share one; the outer-join `matched` flags are written on the
 //! probe path and live on the `Join`. Serial plans build it on the first `next`,
-//! parallel plans up front. The build side is fully resident and capped at
-//! `join_build_byte_cap` (overridable per join with `WITH (max_build = '16GB')`) so
-//! an oversized one is `JoinBuildTooLarge` rather than an OOM; there is no spill.
+//! parallel plans up front. With the run's scratch space, a build side past
+//! `--op-memory` (or the join's `max_build`) spills: both sides split by key hash
+//! into partition files joined one at a time (`join.zig`). Without one, or under
+//! `NOT IN`, it is capped at `join_build_byte_cap` so an oversized one is
+//! `JoinBuildTooLarge` rather than an OOM. Sort and GROUP BY spill the same way
+//! (`spill.zig` holds the file format).
 //! A null key joins nothing, and a null-aware (`NOT IN`) anti join keeps nothing
 //! against a build side holding a null. Duplicate keys fan out in build order.
 //!
@@ -149,6 +152,8 @@ pub fn errLabel(e: anyerror) []const u8 {
         error.CsvHeaderMismatch => "a file in the folder has another header than the first — a folder read takes CSVs of one layout",
         error.InterpFailed => "a `${...}` interpolation failed",
         error.JoinBuildTooLarge => "join build side exceeds its cap — raise it with WITH (max_build = '8GB') on the join, filter the CTE, or flip the join",
+        error.SpillCapExceeded => "spilling to disk passed the run's cap — raise it with --spill-cap, give operators more memory with --op-memory, or filter earlier",
+        error.CorruptSpill => "a spill file read back corrupt — the scratch directory was changed or the disk failed during the run",
         else => @errorName(e),
     };
 }
@@ -603,4 +608,6 @@ test {
     _ = @import("op/topn.zig");
     _ = @import("op/window.zig");
     _ = @import("op/testing_util.zig");
+    _ = @import("spill.zig");
+    _ = @import("space.zig");
 }

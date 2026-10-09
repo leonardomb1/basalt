@@ -5,6 +5,9 @@
 //! `aggregate/table.zig`, a lane's group sets and their merge in `groups.zig`, the
 //! input loop in `drain.zig`, and the accumulators in `accumulate.zig`, each aliased
 //! back into the struct.
+//!
+//! With a `space`, a grouped serial aggregate spills to disk once what it holds
+//! passes `spill_at` (`aggregate/spill.zig`); without one, or on a lane, it never does.
 
 const Batch = @import("../batch.zig").Batch;
 const Decimal = @import("../value.zig").Decimal;
@@ -22,6 +25,8 @@ const simd = @import("../simd.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 const Scan = @import("../op.zig").Scan;
+const Space = @import("../space.zig").Space;
+const spill_parts = @import("spill_parts.zig");
 const TestSource = @import("testing_util.zig").TestSource;
 const intBatch = @import("testing_util.zig").intBatch;
 const int_schema = @import("testing_util.zig").int_schema;
@@ -44,7 +49,18 @@ pub const Aggregate = struct {
     strs: ?*StrTable = null,
     str_cache: std.StringHashMapUnmanaged(StrId) = .empty,
     done: bool = false,
+    space: ?Space = null,
+    spill_at: usize = std.math.maxInt(usize),
+    max_spill_depth: u8 = spill_parts.default_max_depth,
+    spill_depth: u8 = 0,
+    spill: ?*Spill = null,
 
+    pub const Spill = @import("aggregate/spill.zig").Spill;
+    pub const spillNext = @import("aggregate/spill.zig").spillNext;
+    pub const replayChild = @import("aggregate/spill.zig").replayChild;
+    pub const overBudget = @import("aggregate/spill.zig").overBudget;
+    pub const spillRows = @import("aggregate/spill.zig").spillRows;
+    pub const destOf = @import("aggregate/spill.zig").destOf;
     pub const StrId = @import("aggregate/groups.zig").StrId;
     pub const StrTable = @import("aggregate/groups.zig").StrTable;
     pub const strId = @import("aggregate/groups.zig").strId;
@@ -257,6 +273,11 @@ pub fn reduceExtreme(col: column.Column, func: ast.AggFunc, n: usize) Value {
         m = if (m) |cur| (if (is_min) @min(cur, x) else @max(cur, x)) else x;
     }
     return if (m) |x| Value{ .int = x } else .null;
+}
+
+test {
+    _ = @import("aggregate/spill.zig");
+    _ = @import("spill_parts.zig");
 }
 
 test "aggregate: grouped count/sum/avg/min/max skip nulls per group" {

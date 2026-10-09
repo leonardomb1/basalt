@@ -249,6 +249,12 @@ fn usage(w: anytype) !void {
         \\                     CAST to DECIMAL for a total that never varies.)
         \\  --max-rows N       a SELECT printed to stdout keeps its first N rows and stops
         \\                     reading there — a preview of a huge source in milliseconds
+        \\  --op-memory SIZE   memory one join, sort or aggregate may hold before it
+        \\                     spills to disk (default 2GB; SIZE as 512MB, 8GB, 2GiB)
+        \\  --spill-dir DIR    where spills go (default $TMPDIR, else /tmp), in a
+        \\                     directory of the run's own, removed when the run ends
+        \\  --spill-cap SIZE   disk a run may spill to (default 8GB); past it the
+        \\                     run fails cleanly
         \\  --port N           listen port for HTTP mode
         \\  --host IP          listen address for HTTP mode (default 0.0.0.0, every interface)
         \\  --format FMT       table|json|csv|tsv|arrow — what a SELECT writes to stdout.

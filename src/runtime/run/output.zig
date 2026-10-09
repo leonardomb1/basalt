@@ -358,6 +358,10 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                 if (try runParallelSqlAgg(env, stages, shape.prefix, shape.ag, shape.tail, wr, opts, stats, lanes_used, src_base)) return;
             } else if (classifyMapJoinPipeline(stages)) |js| {
                 if (try runParallelSqlMapJoin(env, stages, js, wr, opts, stats, lanes_used, src_base)) return;
+                if (env.sources.items.len == src_base) {
+                    env.sql_desc = null;
+                    res = try buildPipeline(env, stages[0 .. stages.len - 1]);
+                }
             }
         }
         if (try op.linearize(arena, res.op)) |lin| {

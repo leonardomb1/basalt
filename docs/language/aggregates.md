@@ -41,3 +41,12 @@ to total money you intend to compare or checksum. `COUNT`, `MIN` and `MAX` are
 exact too, as are `count_if`, `bool_and`/`bool_or` and the `bit_*` aggregates.
 The variances and deviations combine their lanes the same fixed way, so they
 share `SUM`'s float caveat: `ROUND` them before comparing runs at different `-j`.
+
+**Past `--op-memory`, a `GROUP BY` spills to disk** (see
+[Spilling to disk](../tools/cli.md#spilling-to-disk)): groups it already holds keep
+folding in memory, and rows of new groups go to disk by a hash of their key, to be
+aggregated once the input ends. Every result is exact — a float `SUM` included,
+since each group still sees its rows in input order — but the groups come out in
+another order, so add `ORDER BY` if the order matters. The disk it may use is
+bounded by `--spill-cap`. Spilling happens on a `-j 1` run and on any aggregate
+the parallel lanes do not take; the lanes' own per-lane tables do not spill.

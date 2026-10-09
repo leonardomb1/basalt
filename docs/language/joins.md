@@ -47,10 +47,24 @@ morsels, and over key-range splits for a splittable SQL source. A chain of
 joins followed by `GROUP BY` fans out the same way (`read | filters |
 join+ | filters | aggregate | sort/limit | write`). Right and full joins stay
 serial in every case: they have to emit the build rows nothing matched, and each
-lane would emit those from its own copy of the match tracking. The build side is
-fully resident; past 4 GiB the run fails fast instead of eating the host — raise
-the ceiling per join with `WITH (max_build = '16GB')` on the join clause, filter
-the CTE, or flip the join.
+lane would emit those from its own copy of the match tracking.
+
+## Spilling
+
+The build side is held in memory up to `--op-memory` (2 GiB by default), or the
+join's own `WITH (max_build = '16GB')`. Past that the join spills: both sides
+are split by key into 16 partitions, a file per side each, in the run's scratch
+directory, and joined one partition at a time, so memory holds one partition's
+build rows. A spilled join
+gives the same rows, but not in the same order — add `ORDER BY` if order
+matters. A partition past 4 GiB, or past `max_build` when given (most rows
+sharing a few keys), fails with the build-too-large error; so does a `NOT IN`
+build side, which never spills, since one null on it changes every row's answer.
+Under `-j` a build side past the limit sends the pipeline back to a serial run,
+which reads that side again — a second query for a SQL source. `--spill-cap`
+bounds the disk a run's spills hold at once (8 GiB by default; a partition's files
+count until it is joined) and `--spill-dir` puts them elsewhere; the files are
+removed when the run ends.
 
 ## Key pushdown
 

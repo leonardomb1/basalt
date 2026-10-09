@@ -7,7 +7,9 @@ const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
 const buildChainFrom = @import("../plan.zig").buildChainFrom;
 const buildPipeline = @import("../plan.zig").buildPipeline;
-const joinBuildCap = @import("../plan.zig").joinBuildCap;
+const joinMaySpill = @import("../plan.zig").joinMaySpill;
+const joinSpillAt = @import("../plan.zig").joinSpillAt;
+const laneJoinCap = @import("../plan.zig").laneJoinCap;
 const mapChainSchema = @import("../plan.zig").mapChainSchema;
 const op = @import("../../exec/op.zig");
 const planErr = @import("../env.zig").planErr;
@@ -18,15 +20,22 @@ const types = @import("../../lang/types.zig");
 
 const LaneJoinChain = struct { joins: []const LaneJoin, out_schema: types.Schema };
 
-pub fn resolveLaneJoins(env: *Env, join_span: []const ast.Stage, left_schema: types.Schema) anyerror!LaneJoinChain {
+/// Null when one join's build side sends the pipeline back to the serial plan; the
+/// reads of the joins indexed before it are closed too.
+pub fn resolveLaneJoins(env: *Env, join_span: []const ast.Stage, left_schema: types.Schema) anyerror!?LaneJoinChain {
     var list = std.array_list.Managed(LaneJoin).init(env.arena);
     var schema = left_schema;
+    const src_base = env.sources.items.len;
     var i: usize = 0;
     while (i < join_span.len) {
         std.debug.assert(join_span[i].node == .join);
         var k = i + 1;
         while (k < join_span.len and join_span[k].node != .join) k += 1;
-        const lp = try resolveLaneJoin(env, join_span[i].node.join, join_span[i].hints, join_span[i + 1 .. k], schema);
+        const lp = (try resolveLaneJoin(env, join_span[i].node.join, join_span[i].hints, join_span[i + 1 .. k], schema)) orelse {
+            for (env.sources.items[src_base..]) |sc| sc.close();
+            env.sources.shrinkRetainingCapacity(src_base);
+            return null;
+        };
         try list.append(lp.lane);
         schema = lp.out_schema;
         i = k;
@@ -66,11 +75,14 @@ const LaneJoinPlan = struct { lane: LaneJoin, out_schema: types.Schema };
 
 /// Hoist the join out of the fan-out: materialize the build side into a shared index
 /// (the pulls are scratch) and prevalidate the suffix. Returns the lane recipe and the
-/// sink's output schema.
-pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suffix: []const ast.Stage, left_schema: types.Schema) anyerror!LaneJoinPlan {
+/// sink's output schema, or null when the build side is past the spill threshold of
+/// a join that could spill serially: its reads are closed and the caller falls back
+/// to the serial plan, which reads that side again.
+pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suffix: []const ast.Stage, left_schema: types.Schema) anyerror!?LaneJoinPlan {
     const arena = env.arena;
     const binding = env.bindings.get(j.binding) orelse
         return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown binding `{s}` in join", .{j.binding}));
+    const src_base = env.sources.items.len;
     const build = try buildPipeline(env, try prepareJoinSide(env, try j.rightStages(arena, binding.stages)));
 
     var ad = analyze.Diag{};
@@ -88,7 +100,13 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
     var build_arena = std.heap.ArenaAllocator.init(env.gpa);
     defer build_arena.deinit();
     const build_op = try buildChainFrom(arena, env.params_expr, env.errctx, prep.right, build.op, build.schema);
-    const index = try op.JoinIndex.create(arena, build_arena.allocator(), build_op, right_schema, right_keys, try joinBuildCap(env, join_hints));
+    const index = op.JoinIndex.create(arena, build_arena.allocator(), build_op, right_schema, right_keys, try laneJoinCap(env, j, join_hints)) catch |e| {
+        if (e != error.JoinBuildTooLarge or !joinMaySpill(env, j)) return e;
+        for (env.sources.items[src_base..]) |sc| sc.close();
+        env.sources.shrinkRetainingCapacity(src_base);
+        env.log.log(.info, "join build side `{s}` is past {d} bytes; the join runs serially, where it can spill to disk", .{ j.binding, try joinSpillAt(env, join_hints) });
+        return null;
+    };
 
     return .{
         .lane = .{

@@ -10,6 +10,7 @@ const obs = @import("../runtime/obs.zig");
 const parseLogFormat = @import("args.zig").parseLogFormat;
 const parseSrcTo = @import("args.zig").parseSrcTo;
 const runtime = @import("../runtime/run.zig");
+const sizeFlag = @import("args.zig").sizeFlag;
 const std = @import("std");
 const threadFlagValue = @import("args.zig").threadFlagValue;
 const unknownOption = @import("args.zig").unknownOption;
@@ -42,6 +43,9 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var explain = false;
     var no_progress = false;
     var max_rows: ?u64 = null;
+    var spill_dir: ?[]const u8 = null;
+    var spill_cap: u64 = (runtime.RunOptions{}).spill_cap;
+    var op_memory: usize = (runtime.RunOptions{}).op_memory;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -65,6 +69,23 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
             max_rows = std.fmt.parseInt(u64, v, 10) catch {
                 try stderr.print("error: invalid --max-rows `{s}`\n", .{v});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, a, "--spill-dir")) {
+            const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
+            if (v.len == 0) {
+                try stderr.print("error: --spill-dir needs a directory\n", .{});
+                return 2;
+            }
+            spill_dir = v;
+        } else if (std.mem.eql(u8, a, "--spill-cap")) {
+            const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
+            spill_cap = (try sizeFlag(v, a, stderr)) orelse return 2;
+        } else if (std.mem.eql(u8, a, "--op-memory")) {
+            const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
+            const n = (try sizeFlag(v, a, stderr)) orelse return 2;
+            op_memory = std.math.cast(usize, n) orelse {
+                try stderr.print("error: --op-memory `{s}` is more than this machine can address\n", .{v});
                 return 2;
             };
         } else if (std.mem.eql(u8, a, "--explain")) {
@@ -145,7 +166,7 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var sink = runtime.OutcomeSink.init(alloc);
     defer sink.deinit();
     const progress = !no_progress and !log.quiet and (log.format == .json or std.posix.isatty(std.fs.File.stderr().handle));
-    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze, .stdout_format = stdout_format, .progress = progress, .items = true, .max_rows = max_rows }, &diag) catch |e| switch (e) {
+    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze, .stdout_format = stdout_format, .progress = progress, .items = true, .max_rows = max_rows, .spill_dir = spill_dir, .spill_cap = spill_cap, .op_memory = op_memory }, &diag) catch |e| switch (e) {
         error.Aborted => {
             if (eo.json)
                 try eo.report(.{ .msg = "aborted", .event = "aborted" })

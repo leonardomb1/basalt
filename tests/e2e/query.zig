@@ -467,6 +467,78 @@ test "join probe side spanning multiple batches" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\n2499,Banana\n") != null);
 }
 
+fn sortedLines(alloc: std.mem.Allocator, text: []const u8) ![][]const u8 {
+    var lines = std.array_list.Managed([]const u8).init(alloc);
+    var it = std.mem.splitScalar(u8, std.mem.trimRight(u8, text, "\n"), '\n');
+    while (it.next()) |l| try lines.append(l);
+    std.mem.sort([]const u8, lines.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return lines.toOwnedSlice();
+}
+
+test "join spill: a build side past --op-memory spills to disk, serially and under -j, and gives every row" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var orders = std.array_list.Managed(u8).init(alloc);
+    defer orders.deinit();
+    try orders.appendSlice("id,cust\n");
+    var custs = std.array_list.Managed(u8).init(alloc);
+    defer custs.deinit();
+    try custs.appendSlice("cust,name\n");
+    var want = std.array_list.Managed(u8).init(alloc);
+    defer want.deinit();
+    try want.appendSlice("id,name\n");
+    for (0..3000) |i| {
+        const c = (i * 7) % 900;
+        try orders.writer().print("{d},{d}\n", .{ i, c });
+        if (c % 3 == 0) try want.writer().print("{d},\n", .{i}) else try want.writer().print("{d},cust-{d}\n", .{ i, c });
+    }
+    for (0..1200) |c| if (c % 3 != 0) try custs.writer().print("{d},cust-{d}\n", .{ c, c });
+    try tmp.dir.writeFile(.{ .sub_path = "orders.csv", .data = orders.items });
+    try tmp.dir.writeFile(.{ .sub_path = "custs.csv", .data = custs.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    for ([_]struct { threads: usize, order: []const u8 }{ .{ .threads = 1, .order = " ORDER BY o.id" }, .{ .threads = 4, .order = "" } }) |case| {
+        const script = try std.fmt.allocPrint(
+            alloc,
+            "LOAD INTO '{s}/out.csv' AS SELECT o.id, c.name FROM '{s}/orders.csv' o LEFT JOIN '{s}/custs.csv' c ON o.cust = c.cust{s};",
+            .{ base, base, base, case.order },
+        );
+        defer alloc.free(script);
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+        var rdiag: Diag = .{};
+        _ = try run(alloc, prog, .{ .threads = case.threads, .op_memory = 1024, .spill_dir = base, .log = .{ .quiet = true } }, &rdiag);
+
+        const out = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
+        defer alloc.free(out);
+        if (case.order.len > 0) {
+            try std.testing.expectEqualStrings(want.items, out);
+        } else {
+            const got_lines = try sortedLines(alloc, out);
+            defer alloc.free(got_lines);
+            const want_lines = try sortedLines(alloc, want.items);
+            defer alloc.free(want_lines);
+            try std.testing.expectEqual(want_lines.len, got_lines.len);
+            for (want_lines, got_lines) |w, g| try std.testing.expectEqualStrings(w, g);
+        }
+
+        var it = tmp.dir.iterate();
+        while (try it.next()) |e| try std.testing.expect(!std.mem.startsWith(u8, e.name, "basalt-spill-"));
+
+        var capped: Diag = .{};
+        try std.testing.expectError(error.SpillCapExceeded, run(alloc, prog, .{ .threads = case.threads, .op_memory = 1024, .spill_dir = base, .spill_cap = 64, .log = .{ .quiet = true } }, &capped));
+    }
+}
+
 test "union reconciles branches to a canon schema (tag, null-fill, drop-extra)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -887,6 +959,76 @@ test "sort: the radix fast path keeps input order on ties, honors DESC and multi
     const nulls = try runToString(alloc, &tmp, "i,k\n0,1\n1,0\n2,1\n3,\n4,0\n", "SELECT i FROM '$IN' ORDER BY k DESC");
     defer alloc.free(nulls);
     try std.testing.expectEqualStrings("i\n0\n2\n1\n4\n3\n", nulls);
+}
+
+test "sort: an ORDER BY past --op-memory spills sorted runs and merges them to the in-memory result" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const Row = struct { id: usize, k: ?u32, s: u32 };
+    const n = 5000;
+    const rows = try alloc.alloc(Row, n);
+    defer alloc.free(rows);
+    var in = std.array_list.Managed(u8).init(alloc);
+    defer in.deinit();
+    try in.appendSlice("id,k,s\n");
+    for (rows, 0..) |*r, i| {
+        r.* = .{ .id = i, .k = if (i % 13 == 0) null else @intCast((i * 7919) % 97), .s = @intCast((i * 31) % 50) };
+        if (r.k) |k| try in.print("{d},{d},s{d}\n", .{ i, k, r.s }) else try in.print("{d},,s{d}\n", .{ i, r.s });
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = in.items });
+    try tmp.dir.makeDir("spill");
+
+    const Ctx = struct {
+        fn less(_: void, a: Row, b: Row) bool {
+            if (a.k == null or b.k == null) {
+                if (a.k == null and b.k == null) return sLess(a.s, b.s);
+                return b.k == null;
+            }
+            if (a.k.? != b.k.?) return a.k.? > b.k.?;
+            return sLess(a.s, b.s);
+        }
+        fn sLess(x: u32, y: u32) bool {
+            var bx: [16]u8 = undefined;
+            var by: [16]u8 = undefined;
+            const sx = std.fmt.bufPrint(&bx, "s{d}", .{x}) catch unreachable;
+            const sy = std.fmt.bufPrint(&by, "s{d}", .{y}) catch unreachable;
+            return std.mem.order(u8, sx, sy) == .lt;
+        }
+    };
+    std.mem.sort(Row, rows, {}, Ctx.less);
+    var want = std.array_list.Managed(u8).init(alloc);
+    defer want.deinit();
+    try want.appendSlice("id,k,s\n");
+    for (rows) |r| {
+        if (r.k) |k| try want.print("{d},{d},s{d}\n", .{ r.id, k, r.s }) else try want.print("{d},,s{d}\n", .{ r.id, r.s });
+    }
+
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const spill_dir = try std.fs.path.join(alloc, &.{ base, "spill" });
+    defer alloc.free(spill_dir);
+    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT id, k, s FROM '{s}/in.csv' ORDER BY k DESC, s;", .{ base, base });
+    defer alloc.free(script);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+
+    for ([_]usize{ 2 << 30, 1, 20_000 }) |op_memory| {
+        var rdiag: Diag = .{};
+        _ = try run(alloc, prog, .{ .op_memory = op_memory, .spill_dir = spill_dir, .log = .{ .quiet = true } }, &rdiag);
+        const out = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(want.items, out);
+        var sd = try tmp.dir.openDir("spill", .{ .iterate = true });
+        defer sd.close();
+        var it = sd.iterate();
+        try std.testing.expect((try it.next()) == null);
+    }
+
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.SpillCapExceeded, run(alloc, prog, .{ .op_memory = 1, .spill_dir = spill_dir, .spill_cap = 1024, .log = .{ .quiet = true } }, &rdiag));
 }
 
 test "distinct: the single int-key path keeps first occurrences, null included once" {

@@ -4,6 +4,7 @@
 const ast = @import("../lang/ast.zig");
 const include = @import("../lang/include.zig");
 const obs = @import("../runtime/obs.zig");
+const parseByteSize = @import("../runtime/env.zig").parseByteSize;
 const std = @import("std");
 
 const Source = struct { label: []const u8, text: []const u8, dir: []const u8 = "." };
@@ -50,7 +51,7 @@ pub fn loadSource(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8, st
     return Source{ .label = path, .text = text, .dir = std.fs.path.dirname(path) orelse "." };
 }
 
-const valued_flags = [_][]const u8{ "-p", "--param", "-j", "--threads", "--format", "--log-format", "--log-level", "--port", "--host", "--max-rows", "--pos", "--known" };
+const valued_flags = [_][]const u8{ "-p", "--param", "-j", "--threads", "--format", "--log-format", "--log-level", "--port", "--host", "--max-rows", "--pos", "--known", "--spill-dir", "--spill-cap", "--op-memory" };
 
 /// The first argument that is neither a flag nor a flag's value, `-` included, so the
 /// script may come before or after its flags.
@@ -170,6 +171,14 @@ pub fn nextVal(args: [][:0]u8, i: *usize, flag: []const u8, stderr: *std.Io.Writ
     return args[i.*];
 }
 
+/// A byte-size flag's value (`512MB`, `8GB`, `2GiB`); null once a bad one is
+/// reported, for the caller to exit 2.
+pub fn sizeFlag(v: []const u8, flag: []const u8, stderr: *std.Io.Writer) !?u64 {
+    if (parseByteSize(v)) |n| return n;
+    try stderr.print("error: invalid {s} `{s}` — a size such as 512MB, 8GB or 2GiB\n", .{ flag, v });
+    return null;
+}
+
 pub fn threadFlagValue(a: []const u8, args: [][:0]u8, i: *usize) ?[]const u8 {
     if (std.mem.eql(u8, a, "-j") or std.mem.eql(u8, a, "--threads")) {
         if (i.* + 1 < args.len) {
@@ -203,6 +212,7 @@ test "scriptArg: the script is found whatever order flags and it come in" {
         .{ .argv = &.{ "basalt", "run", "--format", "json" }, .want = null },
         .{ .argv = &.{ "basalt", "check", "-p", "out.sql" }, .want = null },
         .{ .argv = &.{ "basalt", "check", "--known", "t1,t2", "x.sql" }, .want = 4 },
+        .{ .argv = &.{ "basalt", "run", "--spill-dir", "/scratch", "--spill-cap", "1GB", "--op-memory", "64MB", "x.sql" }, .want = 8 },
     };
     for (cases) |c| try std.testing.expectEqual(c.want, scriptArg(try testArgv(a, c.argv)));
 }
@@ -237,4 +247,14 @@ test "threadFlagValue recognizes all four -j/--threads spellings" {
     i = 0;
     try std.testing.expect(threadFlagValue(args[0], args, &i) == null);
     try std.testing.expectEqual(@as(usize, 0), i);
+}
+
+test "sizeFlag: a size reads as bytes; a bad one is named with its flag" {
+    var out: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&out);
+    try std.testing.expectEqual(@as(?u64, 512 << 20), try sizeFlag("512MB", "--op-memory", &w));
+    try std.testing.expectEqual(@as(?u64, 2 << 30), try sizeFlag("2GiB", "--spill-cap", &w));
+    try std.testing.expectEqual(@as(usize, 0), w.end);
+    try std.testing.expectEqual(@as(?u64, null), try sizeFlag("lots", "--spill-cap", &w));
+    try std.testing.expectEqualStrings("error: invalid --spill-cap `lots` — a size such as 512MB, 8GB or 2GiB\n", w.buffered());
 }

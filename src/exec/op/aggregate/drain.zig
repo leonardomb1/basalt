@@ -1,5 +1,9 @@
 //! The aggregate's input loop: batches folded into the group tables, partitioned
 //! into parts for a parallel combine, and the group sets drained in the end.
+//!
+//! In spilling mode (`spill.zig`) both folds check the budget before each batch;
+//! once frozen they look keys up instead of inserting them, fold the rows they
+//! find, and send the rest to `spillRows`, picked by the hash they already have.
 
 const Aggregate = @import("../aggregate.zig").Aggregate;
 const Acc = Aggregate.Acc;
@@ -24,10 +28,21 @@ const fixedHash = Aggregate.fixedHash;
 const keyKindOf = Aggregate.keyKindOf;
 const keyhash = @import("../../keyhash.zig");
 const prefetch_ahead = Aggregate.prefetch_ahead;
+const spill_parts = @import("../spill_parts.zig");
 const std = @import("std");
 const types = @import("../../../lang/types.zig");
 
+const absent_id = std.math.maxInt(u32);
+
+/// A string's interned id without interning it: `absent_id` when this aggregate has
+/// never seen it, which no group key can then hold. The hash is `strId`'s.
+fn internedId(self: *Aggregate, s: []const u8) StrId {
+    if (self.str_cache.get(s)) |e| return e;
+    return .{ .id = absent_id, .h = std.hash.Wyhash.hash(0x5bd1e995, s) };
+}
+
 pub fn next(self: *Aggregate, arena: std.mem.Allocator) anyerror!?Batch {
+    if (self.space != null and self.by.len != 0 and self.part_state == null) return self.spillNext(arena);
     if (self.done) return null;
     self.done = true;
     const set = try self.drainSet();
@@ -141,14 +156,17 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
     var direct_base: ?i64 = null;
 
     while (try self.child.next(pull)) |b| {
+        const frozen = self.overBudget(parts);
         const keys = try pull.alloc(i64, b.len * nk);
         const hkeys = if (has_str) try pull.alloc(i64, b.len * nk) else keys;
         const masks = try pull.alloc(u64, b.len);
         const hashes = try pull.alloc(u64, b.len);
         const tails = try pull.alloc(?[*]u8, b.len);
         const pidx = try pull.alloc(u8, b.len);
+        const dest: []u8 = if (frozen) try pull.alloc(u8, b.len) else &.{};
         @memset(masks, 0);
         @memset(tails, null);
+        @memset(dest, spill_parts.keep);
 
         for (self.by, kinds, 0..) |ci, kk, j| {
             const col = b.columns[ci];
@@ -169,18 +187,21 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
                     const table = try self.strTable();
                     if (col.dict) |d| {
                         const ents = try pull.alloc(StrId, d.values.len);
-                        for (ents, d.values) |*e, v| e.* = try self.strId(table, v);
+                        for (ents, d.values) |*e, v| e.* = if (frozen) internedId(self, v) else try self.strId(table, v);
                         for (0..b.len) |r| {
                             if (!col.validity.get(r)) continue;
                             const e = ents[d.codes[r]];
                             keys[r * nk + j] = e.id;
                             hkeys[r * nk + j] = @bitCast(e.h);
+                            if (frozen and e.id == absent_id) dest[r] = 0;
                         }
                     } else for (0..b.len) |r| {
                         if (!col.validity.get(r)) continue;
-                        const e = try self.strId(table, col.data.bytes.at(r));
+                        const s = col.data.bytes.at(r);
+                        const e = if (frozen) internedId(self, s) else try self.strId(table, s);
                         keys[r * nk + j] = e.id;
                         hkeys[r * nk + j] = @bitCast(e.h);
+                        if (frozen and e.id == absent_id) dest[r] = 0;
                     }
                 },
             }
@@ -234,6 +255,7 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
             }
         }
 
+        var nspill: usize = 0;
         for (order, 0..) |ri, oi| {
             if (tails[ri] != null) continue;
             if (oi + prefetch_ahead < order.len) {
@@ -243,6 +265,17 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
             const key = FixedKey{ .vals = keys[ri * nk ..][0..nk], .mask = masks[ri] };
             const pi = hashes[ri] >> part_shift;
             const part = &parts[pi];
+            if (frozen) {
+                const slot = if (dest[ri] == spill_parts.keep) part.table.find(hashes[ri], key, part.store) else null;
+                if (slot) |sl| {
+                    tails[ri] = part.store.at(sl).tail;
+                    pidx[ri] = @intCast(pi);
+                } else {
+                    dest[ri] = self.destOf(hashes[ri]);
+                    nspill += 1;
+                }
+                continue;
+            }
             const at: u32 = @intCast(part.store.len);
             const f = try part.table.getOrPut(hashes[ri], key, part.store, at);
             const rec = if (f.found) part.store.at(f.slot) else blk: {
@@ -262,7 +295,16 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
             };
         }
 
-        if (counts_only) {
+        if (nspill > 0) {
+            try self.spillRows(pull, b, dest);
+            for (tails[0..b.len], pidx[0..b.len], 0..) |t, pi, ri| {
+                const tail = t orelse continue;
+                for (self.aggs, 0..) |agg, j| {
+                    const v = if (argcols[j]) |col| col.getValue(ri) else Value.null;
+                    try layout.update(parts[pi].alloc, tail, j, agg, v);
+                }
+            }
+        } else if (counts_only) {
             for (tails[0..b.len]) |t| {
                 const cs: [*]i64 = @ptrCast(@alignCast(t.?));
                 for (cs[0..self.aggs.len]) |*c| c.* += 1;
@@ -341,9 +383,13 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
     errdefer for (parts) |*p| p.table.deinit();
     const hctx = keyhash.MultiKeyCtx{};
     while (try self.child.next(pull)) |b| {
+        const frozen = self.overBudget(parts);
         const nk = self.by.len;
         const probes = try pull.alloc(Value, b.len * nk);
         const hashes = try pull.alloc(u64, b.len);
+        const dest: []u8 = if (frozen) try pull.alloc(u8, b.len) else &.{};
+        @memset(dest, spill_parts.keep);
+        var nspill: usize = 0;
 
         var r: usize = 0;
         while (r < b.len) : (r += 1) {
@@ -375,9 +421,17 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
             r = ri;
             const probe = probes[r * nk ..][0..nk];
             const part = &parts[hashes[r] >> part_shift];
-            const at: u32 = @intCast(part.store.len);
-            const f = try part.table.getOrPut(hashes[r], probe, part.store, at);
-            const rec = if (f.found) part.store.at(f.slot) else blk: {
+            const rec = if (frozen) blk: {
+                const sl = part.table.find(hashes[r], probe, part.store) orelse {
+                    dest[r] = self.destOf(hashes[r]);
+                    nspill += 1;
+                    continue;
+                };
+                break :blk part.store.at(sl);
+            } else blk: {
+                const at: u32 = @intCast(part.store.len);
+                const f = try part.table.getOrPut(hashes[r], probe, part.store, at);
+                if (f.found) break :blk part.store.at(f.slot);
                 const nr = try part.store.push(hashes[r]);
                 for (probe, nr.keys) |v, *o| o.* = try dupeValue(part.alloc, v);
                 break :blk nr;
@@ -387,6 +441,7 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
                 try layout.update(part.alloc, rec.tail, j, agg, v);
             }
         }
+        if (nspill > 0) try self.spillRows(pull, b, dest);
         _ = scratch.reset(.retain_capacity);
     }
     return self.foldSets(.boxed, parts);

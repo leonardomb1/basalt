@@ -55,6 +55,15 @@ does not order its rows (a table has none). `DISTINCT` keeps the first row per
 key in input order at any `-j`. Add `ORDER BY` whenever the order is part of
 the answer.
 
+An `ORDER BY` whose input passes `--op-memory` sorts it in pieces: each piece is
+written as a sorted run to the scratch directory and the runs are merged as rows
+are read out. The result is the same, ties included, and the disk it takes is
+bounded by `--spill-cap` ([Spilling to disk](../tools/cli.md#spilling-to-disk)).
+
+A `GROUP BY` or `DISTINCT` whose keys outgrow `--op-memory` spills to disk the
+same way. The rows are the same — `DISTINCT ON` still keeps the first row per
+key — but their order without `ORDER BY` is not that of an in-memory run.
+
 ## Naming, `GROUP BY` and `ORDER BY`
 
 A computed `SELECT` item does not need `AS`. Without one it is named after the

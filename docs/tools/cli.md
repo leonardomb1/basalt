@@ -1,7 +1,7 @@
 # Command line
 
 ```text
-basalt run      <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json|csv|tsv|arrow] [--max-rows N] [--port N] [--host IP]
+basalt run      <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json|csv|tsv|arrow] [--max-rows N] [--op-memory SIZE] [--spill-dir DIR] [--spill-cap SIZE] [--port N] [--host IP]
 basalt serve    <dir> [--port N] [--host IP] [--watch]
 basalt check    <script>|-|-c "<inline>" [-p key=value ...] [--format json] [--known t1,t2]
 basalt complete <script>|-|-c "<inline>" [--pos N] [--connect] [--utf16]
@@ -62,6 +62,18 @@ its whole input before the first row reaches stdout, so what is kept is exactly
 the first `N` rows of the full answer. A cut result logs `result cut at
 --max-rows N` (level `warn`), carries `basalt.truncated = true` in its Arrow
 trailer, and in a kernel status. A `LOAD` is never capped.
+
+## Spilling to disk
+
+A blocking operator — a join's build side, a sort, an aggregate — holds its
+input in memory up to `--op-memory` (default `2GB`) and spills the rest to
+disk. Spill files go in a directory of the run's own under `--spill-dir`
+(default `$TMPDIR`, else `/tmp`), made only when something first spills and
+removed with everything in it when the run ends, however it ends. `--spill-cap`
+(default `8GB`) bounds the disk a run's spills hold at once — a file counts until
+it is deleted, so a sort's merge passes do not add up; a run that needs more
+fails cleanly rather than filling the disk. Sizes take `512MB`, `8GB` or `2GiB`
+(units are binary: `1GB` is 1024 MiB).
 
 ## Errors and editors
 
