@@ -6,9 +6,12 @@ function, or any source a `FROM` reads — a path (`JOIN 'smb://fs/x.xlsx' x`, i
 `WITH (...)` after the alias) or a connection's table (`JOIN sr.db.t AS t`),
 read as `(SELECT * FROM it)` would be. A key is an `=` between a value of each
 side, `AND`-combined for composite keys, written in either order; a null key
-never matches. A key may be computed — `trim(t.code) = CAST(x.code AS string)`,
-each value naming one side's columns — and each side then computes it before the
-join, out of sight of `SELECT *`. Columns need no table when the names say which
+never matches. `USING (k, d)` joins on the columns of those names on both sides
+and lists each once, first, as SQL does; under a right or full join that column
+is the first non-null of the two. `NATURAL JOIN` is refused — name the shared
+columns with `USING`. A key may be computed — `trim(t.code) = CAST(x.code AS
+string)`, each value naming one side's columns — and each side then computes it
+before the join, out of sight of `SELECT *`. Columns need no table when the names say which
 side they are: `trim(code) = CAST(cr AS varchar)` finds `code` and `cr` in the two
 sides' columns, in either order, and is refused as ambiguous only when both
 values' columns exist on both sides. Keys of two types (a spreadsheet's number

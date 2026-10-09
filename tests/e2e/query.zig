@@ -643,6 +643,34 @@ test "join: an outer join's ON beyond its keys picks matching pairs and keeps th
     }
 }
 
+test "join: USING lists each shared column once, first, and a full join takes it from either side" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.csv", .data = "v,k\n10,1\n20,2\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.csv", .data = "k,w\n2,x\n3,y\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const a = try std.fs.path.join(alloc, &.{ base, "a.csv" });
+    defer alloc.free(a);
+    const b = try std.fs.path.join(alloc, &.{ base, "b.csv" });
+    defer alloc.free(b);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    const cases = .{
+        .{ "SELECT * FROM '{s}' a JOIN '{s}' b USING (k)", "k,v,w\n2,20,x\n" },
+        .{ "SELECT * FROM '{s}' a FULL JOIN '{s}' b USING (k) ORDER BY k", "k,v,w\n1,10,\n2,20,x\n3,,y\n" },
+    };
+    inline for (cases) |c| {
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS " ++ c[0] ++ ";", .{ out_path, a, b });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c[1], out);
+    }
+}
+
 test "join: duplicate build keys fan out (inner); semi/anti reduce to existence" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

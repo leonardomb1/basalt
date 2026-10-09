@@ -316,6 +316,27 @@ test "sql: an `=` of bare columns in ON is left for the plan to place, its key c
     try testing.expectEqualStrings(j.deferred[0].right_name, drop[1]);
 }
 
+test "sql: USING keys on renamed right columns and lists the names first; NATURAL is refused" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parseTest(a, "SELECT * FROM 'a.csv' a RIGHT JOIN 'b.csv' b USING (k, d);");
+    const st = prog.stmts[3].output.stages;
+    const j = st[1].node.join;
+    try testing.expectEqualStrings("k", j.left_keys[0].parts[0]);
+    try testing.expectEqualStrings("d", j.left_keys[1].parts[0]);
+    try testing.expect(std.mem.startsWith(u8, j.right_keys[0].parts[0], "__uk"));
+    try testing.expectEqualStrings("b", j.alias);
+    const sel = st[2].node.select;
+    try testing.expectEqualStrings("k", sel[0].computed.name);
+    try testing.expectEqualStrings("coalesce", sel[0].computed.expr.call.name);
+    try testing.expectEqual(@as(usize, 4), sel[2].star_except.len);
+
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT * FROM 'a.csv' a NATURAL JOIN 'b.csv' b;", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "USING (a, b)") != null);
+}
+
 test "sql: multi-key ON, RIGHT/FULL/CROSS join kinds, and the plain-column rule" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -369,7 +390,7 @@ test "sql: multi-key ON, RIGHT/FULL/CROSS join kinds, and the plain-column rule"
         \\WITH r AS (SELECT id FROM 'r.csv')
         \\SELECT * FROM 'in.csv' t CROSS JOIN r ON t.id = r.id;
     , &diag));
-    try testing.expect(std.mem.indexOf(u8, diag.msg, "no ON clause") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "no ON or USING clause") != null);
 
     try testing.expectError(error.ParseFailed, parseSource(a,
         \\LOAD INTO 'out.csv' AS

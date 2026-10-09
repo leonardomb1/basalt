@@ -167,13 +167,13 @@ pub const AliasSet = struct {
 };
 
 const reserved_after_source = [_][]const u8{
-    "where",   "group",    "order",   "limit",  "union",     "anchor", "join",
-    "inner",   "left",     "right",   "full",   "cross",     "semi",   "anti",
-    "on",      "pushdown", "with",    "as",     "end",       "when",   "then",
-    "else",    "case",     "select",  "from",   "load",      "for",    "using",
-    "upsert",  "append",   "replace", "split",  "jobs",      "offset", "paginate",
-    "retry",   "create",   "param",   "having", "and",       "or",     "not",
-    "explain", "costs",    "analyze", "except", "intersect",
+    "where",    "group",    "order",  "limit",   "union",  "anchor",    "join",
+    "inner",    "left",     "right",  "full",    "cross",  "semi",      "anti",
+    "on",       "pushdown", "with",   "as",      "end",    "when",      "then",
+    "else",     "case",     "select", "from",    "load",   "for",       "using",
+    "natural",  "upsert",   "append", "replace", "split",  "jobs",      "offset",
+    "paginate", "retry",    "create", "param",   "having", "and",       "or",
+    "not",      "explain",  "costs",  "analyze", "except", "intersect",
 };
 
 fn isKwIn(name: []const u8, kws: []const []const u8) bool {
@@ -566,6 +566,7 @@ pub const Parser = struct {
     };
 
     pub const parseSelectCore = @import("parse/query.zig").parseSelectCore;
+    pub const parseUsing = @import("parse/query.zig").parseUsing;
     pub const unionBranchFromStages = @import("parse/query.zig").unionBranchFromStages;
     pub const parseUnionTail = @import("parse/query.zig").parseUnionTail;
     pub const SetOpTok = struct {

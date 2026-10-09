@@ -36,8 +36,11 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
             try cols.append(.{ .name = f.name, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base });
         },
         .star_rename => |renames| {
-            for (renames) |r| if (in.indexOf(r.from) == null)
+            for (renames) |r| if (in.indexOf(r.from) == null) {
+                if (std.mem.startsWith(u8, r.to, "__uk"))
+                    return fail(diag, "USING column `{s}` is not a column of the joined side", .{r.from});
                 return fail(diag, "unknown rename field `{s}`", .{r.from});
+            };
             for (in.fields, 0..) |f, idx| {
                 const nm = renameTo(renames, f.name) orelse f.name;
                 for (in.fields[0..idx]) |g|

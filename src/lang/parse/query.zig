@@ -439,6 +439,8 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             if (self.isKw("join")) break :blk .inner;
             break :blk null;
         };
+        if (self.isKw("natural"))
+            return self.fail(self.curPos(), "NATURAL JOIN is not supported — name the shared columns: `JOIN t USING (a, b)`", .{});
         var kind = jk orelse break;
         if (!self.isKw("join")) _ = self.advance();
         _ = self.eatKw("outer");
@@ -525,6 +527,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         var right_computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
         var deferred = std.array_list.Managed(ast.DeferredKey).init(self.arena);
         var residual: ?*ast.Expr = null;
+        var using_sel: ?[]const ast.SelectItem = null;
         for (lateral_keys) |lk| {
             try left_keys.append(stripQual(lk.left, &aliases));
             const rp = try self.arena.alloc([]const u8, 1);
@@ -538,11 +541,16 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         } else if (lateral and lateral_keys.len > 0 and !self.isKw("on")) {
             // keys from the call alone
         } else if (kind == .cross) {
-            if (self.isKw("on"))
-                return self.fail(self.curPos(), "CROSS JOIN takes no ON clause — it pairs every row with every row", .{});
+            if (self.isKw("on") or self.isKw("using"))
+                return self.fail(self.curPos(), "CROSS JOIN takes no ON or USING clause — it pairs every row with every row", .{});
+        } else if (self.eatKw("using")) {
+            const u = try self.parseUsing(kind, binding, jpos, &left_keys, &right_keys);
+            using_sel = u.select;
+            if (jalias == null) jalias = binding;
+            binding = u.binding;
         } else {
             if (!self.isKw("on"))
-                return self.fail(self.curPos(), "expected `ON <column> = <column>` after JOIN {s}", .{binding});
+                return self.fail(self.curPos(), "expected `ON <column> = <column>` or `USING (<column>, ...)` after JOIN {s}", .{binding});
             const opos = self.advance();
             const rname = jalias orelse binding;
             const on = try self.parseExpr();
@@ -669,6 +677,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             try stages.append(.{ .node = .{ .filter = e }, .hints = &.{}, .pos = jpos });
         }
         post_filters.clearRetainingCapacity();
+        if (using_sel) |items| try stages.append(.{ .node = .{ .select = items }, .hints = &.{}, .pos = jpos });
     }
 
     if (self.eatKw("where")) {
@@ -1135,4 +1144,52 @@ pub fn appendUnion(self: *Parser, cores: []const Core, distinct: bool, positiona
         .pos = pos,
     });
     if (distinct) try stages.append(.{ .node = .{ .distinct = .{ .on = null } }, .hints = &.{}, .pos = pos });
+}
+
+/// `USING (a, b)`: the right side's columns of those names are renamed apart, the
+/// join keys on them, and a select after the join lists each name once, first,
+/// as SQL does — the left value, or under a right or full join the first non-null
+/// of the two — with the renamed copies dropped.
+pub fn parseUsing(
+    self: *Parser,
+    kind: ast.JoinKind,
+    binding: []const u8,
+    jpos: Pos,
+    left_keys: *std.array_list.Managed(ast.QualName),
+    right_keys: *std.array_list.Managed(ast.QualName),
+) Error!struct { binding: []const u8, select: []const ast.SelectItem } {
+    _ = try self.expect(.lparen);
+    var renames = std.array_list.Managed(ast.SelectItem.Rename).init(self.arena);
+    var items = std.array_list.Managed(ast.SelectItem).init(self.arena);
+    var drop = std.array_list.Managed([]const u8).init(self.arena);
+    while (true) {
+        const k = try self.expectIdent();
+        self.derived_n += 1;
+        const rk = try std.fmt.allocPrint(self.arena, "__uk{d}", .{self.derived_n});
+        try renames.append(.{ .from = k, .to = rk });
+        try left_keys.append(try self.qualOne(k));
+        try right_keys.append(try self.qualOne(rk));
+        const left = try self.mk(.{ .field = try self.qualOne(k) });
+        const value = if (kind == .right or kind == .full) blk: {
+            const args = try self.arena.alloc(*ast.Expr, 2);
+            args[0] = left;
+            args[1] = try self.mk(.{ .field = try self.qualOne(rk) });
+            break :blk try self.mk(.{ .call = .{ .name = "coalesce", .args = args } });
+        } else left;
+        try items.append(.{ .computed = .{ .name = k, .expr = value } });
+        try drop.append(k);
+        try drop.append(rk);
+        if (!self.eat(.comma)) break;
+    }
+    _ = try self.expect(.rparen);
+    try items.append(.{ .star_except = try drop.toOwnedSlice() });
+
+    self.derived_n += 1;
+    const name = try std.fmt.allocPrint(self.arena, "__derived{d}_using", .{self.derived_n});
+    try self.let_names.append(name);
+    const st = try self.arena.alloc(ast.Stage, 2);
+    st[0] = .{ .node = .{ .ref = binding }, .hints = &.{}, .pos = jpos };
+    st[1] = .{ .node = .{ .select = try self.arena.dupe(ast.SelectItem, &.{.{ .star_rename = try renames.toOwnedSlice() }}) }, .hints = &.{}, .pos = jpos };
+    try self.pending_bindings.append(.{ .binding = .{ .name = name, .pipeline = .{ .stages = st, .pos = jpos }, .pos = jpos } });
+    return .{ .binding = name, .select = try items.toOwnedSlice() };
 }
