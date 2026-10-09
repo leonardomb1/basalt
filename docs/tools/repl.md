@@ -41,9 +41,14 @@ in any case, `!text` those that do not, and `>= 100`, `< 2026-01-01`, `= SP`,
 `!= 0` compare — by value on a number column. Filters on several columns all
 apply; the header marks a filtered column `≈` and the sorted one `↑`/`↓`. Enter
 keeps a filter, Esc while typing puts it back, Esc after clears the filters and
-then the sort. Both rearrange the rows kept and never run the query again — so
-on a result larger than 10,000 rows they see only the first 10,000, and the
-status line says so.
+then the sort. `f` finds text across every column: type the search and press
+Enter, and the rows narrow to those holding it, each match highlighted where it
+shows. Words are AND-ed and may be in any column, `-word` keeps the rows without
+it, `col:word` looks in that column only, and `"two words"` is one phrase — all in
+any case. Esc clears a find before the filters and the sort. Sorting, filtering
+and finding rearrange the rows kept and never run the query again — so on a
+result larger than 10,000 rows they see only the first 10,000, and the status
+line says so.
 
 ## Commands
 
